@@ -1,0 +1,14 @@
+[package]
+name        = "csrf"
+version     = "0.1.0"
+description = "mbun.csrf — Bun-compatible CSRF token generation and verification"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+[dependencies.crypto]
+path = "../crypto"
+
+[indices]
+mbun = { path = "../../mcpp" }

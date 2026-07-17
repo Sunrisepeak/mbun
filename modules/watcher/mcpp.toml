@@ -1,0 +1,11 @@
+[package]
+name        = "watcher"
+version     = "0.1.0"
+description = "mbun.watcher — cross-platform filesystem watcher state and event model"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+[indices]
+mbun = { path = "../../mcpp" }

@@ -1,0 +1,34 @@
+{
+  // Representative tsconfig/bun configuration shapes.
+  "name": "mbun-config-benchmark",
+  "enabled": true,
+  "target": "esnext",
+  "features": [
+    "typescript", "jsx", "decorators", "source-map", "tree-shaking",
+    "minify", "splitting", "macros", "plugins", "conditions",
+  ],
+  "nested": {
+    "path": "packages/application/src/entry.tsx",
+    "aliases": {
+      "@core/*": ["modules/core/src/*"],
+      "@runtime/*": ["modules/jsc/src/*"],
+      "@tests/*": ["test/js/bun/*"],
+    },
+    "compilerOptions": {
+      "strict": true,
+      "allowJs": false,
+      "moduleResolution": "bundler",
+      "lib": ["ESNext", "DOM", "DOM.Iterable"],
+    },
+  },
+  "matrix": [
+    { "os": "linux", "arch": "x64", "opt": 3 },
+    { "os": "darwin", "arch": "arm64", "opt": 3 },
+    { "os": "windows", "arch": "x64", "opt": 3 },
+    { "os": "linux", "arch": "arm64", "opt": 3 },
+    { "os": "darwin", "arch": "x64", "opt": 3 },
+    { "os": "windows", "arch": "arm64", "opt": 3 },
+  ],
+  "escapes": "quote=\" slash=\\ newline=\n latin=\u00e9 emoji=\ud83d\ude80",
+  "limits": { "small": 0, "negative": -42, "fraction": 1.25, "exponent": 1.25e12 },
+}

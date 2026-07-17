@@ -1,0 +1,20 @@
+[package]
+name        = "runtime_server"
+version     = "0.1.0"
+description = "mbun runtime server request dispatch, listener, and response backend seams"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+# Keep the member on the same local index boundary as its dependencies.
+
+# Cross-member: HTTP/1.1 server rides the epoll socket stack and the pure
+# http parser/decoder.
+[dependencies]
+event_loop = { path = "../event_loop" }
+runtime_socket = { path = "../runtime_socket" }
+http = { path = "../http" }
+
+[indices]
+mbun = { path = "../../mcpp" }

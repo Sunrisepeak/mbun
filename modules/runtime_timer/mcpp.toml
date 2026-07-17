@@ -1,0 +1,11 @@
+[package]
+name        = "runtime_timer"
+version     = "0.1.0"
+description = "mbun runtime timer wheel and cancellation seams"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+[indices]
+mbun = { path = "../../mcpp" }

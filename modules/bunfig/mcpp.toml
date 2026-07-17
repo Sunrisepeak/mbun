@@ -1,0 +1,14 @@
+[package]
+name        = "bunfig"
+version     = "0.1.0"
+description = "mbun.bunfig — bunfig.toml configuration model and parser skeleton"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+[dependencies]
+toml = { path = "../toml" }
+
+[indices]
+mbun = { path = "../../mcpp" }

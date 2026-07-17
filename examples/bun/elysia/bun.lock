@@ -1,0 +1,47 @@
+{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "mbun-elysia-example",
+      "dependencies": {
+        "elysia": "latest",
+      },
+    },
+  },
+  "packages": {
+    "@borewit/text-codec": ["@borewit/text-codec@0.2.2", "", {}, ""],
+
+    "@sinclair/typebox": ["@sinclair/typebox@0.34.52", "", {}, ""],
+
+    "@tokenizer/inflate": ["@tokenizer/inflate@0.4.1", "", {}, ""],
+
+    "@tokenizer/token": ["@tokenizer/token@0.3.0", "", {}, ""],
+
+    "cookie": ["cookie@1.1.1", "", {}, ""],
+
+    "debug": ["debug@4.4.3", "", {}, ""],
+
+    "elysia": ["elysia@1.4.29", "", {}, ""],
+
+    "exact-mirror": ["exact-mirror@0.2.7", "", {}, ""],
+
+    "fast-decode-uri-component": ["fast-decode-uri-component@1.0.1", "", {}, ""],
+
+    "file-type": ["file-type@22.0.1", "", {}, ""],
+
+    "ieee754": ["ieee754@1.2.1", "", {}, ""],
+
+    "memoirist": ["memoirist@0.4.0", "", {}, ""],
+
+    "ms": ["ms@2.1.3", "", {}, ""],
+
+    "openapi-types": ["openapi-types@12.1.3", "", {}, ""],
+
+    "strtok3": ["strtok3@10.3.5", "", {}, ""],
+
+    "token-types": ["token-types@6.1.2", "", {}, ""],
+
+    "uint8array-extras": ["uint8array-extras@1.5.0", "", {}, ""],
+  }
+}

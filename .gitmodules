@@ -1,0 +1,7 @@
+[submodule "compat/bun"]
+	path = compat/bun
+	url = https://github.com/oven-sh/bun.git
+	branch = main
+[submodule "compat/node"]
+	path = compat/node
+	url = https://github.com/nodejs/node.git

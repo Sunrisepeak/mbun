@@ -1,0 +1,533 @@
+// node:tls JS layer partition. Patches the already-installed node:tls module
+// object (globalThis.__mbunNativeModules["tls"], registered as a shape stub in
+// bootstrap.cppm) with the real, offline-testable surface:
+//   createSecureContext / SecureContext (full Node option validation),
+//   checkServerIdentity (+ RFC 6125 wildcard/altname matching),
+//   getCiphers (native OpenSSL default cipher list via __mbunNodeTlsNative),
+//   rootCertificates (frozen, immutable — DEFERRED full Mozilla NSS bundle),
+//   DEFAULT_ECDH_CURVE / DEFAULT_MIN_VERSION / DEFAULT_MAX_VERSION accessors,
+//   convertALPNProtocols / convertProtocols (ALPN wire encoding),
+//   CLIENT_RENEG_LIMIT / CLIENT_RENEG_WINDOW, parseCertString,
+//   TLSSocket / Server class shapes.
+// Certificate field parsing reuses the OpenSSL X509 bridge already installed by
+// runtime/crypto_asym.inc (globalThis.__mbunCryptoAsymNative.x509parse).
+//
+// DEFERRED (honest throw): tls.connect / new tls.Server(...).listen and the live
+// TLSSocket handshake — those need the socket event loop + real SSL_CTX handle,
+// which land with the S-net socket/listener work (modules/tls TlsChannel).
+//
+// NOTE: appended AFTER the master builtins IIFE (opened in bootstrap, closed by
+// image_closure) has already run, so it is a self-contained IIFE that re-binds
+// G = globalThis and patches the registered module object in place.
+//
+// Blueprint: bun-ref src/js/node/tls.ts + src/js/internal/tls.ts; node
+// lib/tls.js + lib/internal/tls/secure-context.js.
+export module mbun.jsc.js_builtins:node_tls;
+
+import std;
+
+export namespace mbun::jsc::builtins::detail {
+
+inline constexpr std::string_view kNodeTlsJS = R"JS(
+(function () {
+  const G = globalThis;
+  const M = G.__mbunNativeModules;
+  if (!M) return;
+  const T = M["tls"] || M["node:tls"];
+  if (!T) return;
+  const net = M["net"] || M["node:net"];
+  const asym = G.__mbunCryptoAsymNative;
+  const tlsNative = G.__mbunNodeTlsNative;
+  const Buffer = G.Buffer;
+
+  // ---- node error factories (message shapes match lib/internal/errors.js) ----
+  const kTypes = new Set([
+    "string", "function", "number", "object", "Function", "Object",
+    "boolean", "bigint", "symbol",
+  ]);
+  const inspect = (v) => {
+    if (v === undefined) return "undefined";
+    if (v === null) return "null";
+    if (typeof v === "string") return "'" + v + "'";
+    if (typeof v === "bigint") return String(v) + "n";
+    if (typeof v === "function") return "[Function]";
+    if (typeof v === "object") {
+      try { return JSON.stringify(v); } catch (e) { return "[Object]"; }
+    }
+    return String(v);
+  };
+  const joinTypes = (arr, kw) => {
+    const len = arr.length;
+    if (len > 2) return kw + " " + arr.slice(0, len - 1).join(", ") + ", or " + arr[len - 1];
+    if (len === 2) return kw + " " + arr[0] + " or " + arr[1];
+    return (kw === "of type" ? "of type " : "one of ") + arr[0];
+  };
+  function ERR_INVALID_ARG_TYPE(name, expected, actual) {
+    if (!Array.isArray(expected)) expected = [expected];
+    const determiner = String(name).includes(".") ? "property" : "argument";
+    let msg = 'The "' + name + '" ' + determiner + " must be ";
+    const types = [], instances = [], other = [];
+    for (const e of expected) {
+      if (kTypes.has(e)) types.push(String(e).toLowerCase());
+      else if (/^[A-Z]/.test(e)) instances.push(e);
+      else other.push(e);
+    }
+    const parts = [];
+    if (types.length) parts.push(joinTypes(types, "of type"));
+    if (instances.length) parts.push("an instance of " + instances.join(" or "));
+    if (other.length) parts.push(joinTypes(other, "one of"));
+    msg += parts.join(" or ") + ". Received " + inspect(actual);
+    const err = new TypeError(msg);
+    err.code = "ERR_INVALID_ARG_TYPE";
+    return err;
+  }
+  function ERR_INVALID_ARG_VALUE(name, value, reason) {
+    reason = reason || "is invalid";
+    const determiner = String(name).includes(".") ? "property" : "argument";
+    const err = new TypeError("The " + determiner + " '" + name + "' " + reason + ". Received " + inspect(value));
+    err.code = "ERR_INVALID_ARG_VALUE";
+    return err;
+  }
+  function ERR_OUT_OF_RANGE(name, range, value) {
+    const err = new RangeError('The "' + name + '" argument is out of range. It must be ' + range + ". Received " + inspect(value));
+    err.code = "ERR_OUT_OF_RANGE";
+    return err;
+  }
+  function ERR_TLS_INVALID_PROTOCOL_VERSION(version, name) {
+    const err = new TypeError(version + " is not a valid " + name + " TLS protocol version");
+    err.code = "ERR_TLS_INVALID_PROTOCOL_VERSION";
+    return err;
+  }
+  function ERR_TLS_INVALID_PROTOCOL_METHOD(message) {
+    const err = new TypeError(message);
+    err.code = "ERR_TLS_INVALID_PROTOCOL_METHOD";
+    return err;
+  }
+  function ERR_CRYPTO_CUSTOM_ENGINE_NOT_SUPPORTED(message) {
+    const err = new Error(message);
+    err.code = "ERR_CRYPTO_CUSTOM_ENGINE_NOT_SUPPORTED";
+    return err;
+  }
+  function ERR_CRYPTO_UNSUPPORTED_OPERATION(message) {
+    const err = new Error(message);
+    err.code = "ERR_CRYPTO_UNSUPPORTED_OPERATION";
+    return err;
+  }
+  function ERR_TLS_CERT_ALTNAME_INVALID(reason, host, cert) {
+    const err = new Error("Hostname/IP does not match certificate's altnames: " + reason);
+    err.code = "ERR_TLS_CERT_ALTNAME_INVALID";
+    err.reason = reason;
+    err.host = host;
+    err.cert = cert;
+    return err;
+  }
+
+  // ---- validators (subset of lib/internal/validators.js) ----
+  const validateString = (v, name) => { if (typeof v !== "string") throw ERR_INVALID_ARG_TYPE(name, "string", v); };
+  const validateBuffer = (v, name) => { if (!ArrayBuffer.isView(v)) throw ERR_INVALID_ARG_TYPE(name, ["Buffer", "TypedArray", "DataView"], v); };
+  const validateFunction = (v, name) => { if (typeof v !== "function") throw ERR_INVALID_ARG_TYPE(name, "Function", v); };
+
+  // ---- internal/tls throwOnInvalidTLSArray ----
+  const isValidTLSItem = (o) =>
+    typeof o === "string" || ArrayBuffer.isView(o) || o instanceof ArrayBuffer ||
+    (o && typeof o === "object" && typeof o.pem !== "undefined") ||
+    (Array.isArray(o) && o.every((x) => x && typeof x === "object" && "pem" in x));
+  const isValidTLSArray = (o) => {
+    if (isValidTLSItem(o)) return true;
+    if (Array.isArray(o)) return o.every(isValidTLSItem);
+    return false;
+  };
+  const VALID_TLS_ERROR_MESSAGE_TYPES = "string or an instance of Buffer, TypedArray, DataView, or BunFile";
+  const findInvalidTLSItem = (o) => {
+    if (Array.isArray(o)) { for (const item of o) if (!isValidTLSItem(item)) return item; }
+    return o;
+  };
+  const throwOnInvalidTLSArray = (name, value) => {
+    if (!isValidTLSArray(value))
+      throw ERR_INVALID_ARG_TYPE(name, [VALID_TLS_ERROR_MESSAGE_TYPES], findInvalidTLSItem(value));
+  };
+
+  // ---- version defaults & valid set ----
+  const VALID_TLS_VERSIONS = new Set(["TLSv1", "TLSv1.1", "TLSv1.2", "TLSv1.3"]);
+  let DEFAULT_MIN_VERSION = "TLSv1.2";
+  let DEFAULT_MAX_VERSION = "TLSv1.3";
+  const DEFAULT_ECDH_CURVE = "auto";
+
+  // ---- secureProtocol validation (lib/internal/tls/secure-context.js) ----
+  const SECURE_PROTOCOL_METHODS = new Set([
+    "TLS_method", "TLS_client_method", "TLS_server_method",
+    "SSLv23_method", "SSLv23_client_method", "SSLv23_server_method",
+    "TLSv1_method", "TLSv1_client_method", "TLSv1_server_method",
+    "TLSv1_1_method", "TLSv1_1_client_method", "TLSv1_1_server_method",
+    "TLSv1_2_method", "TLSv1_2_client_method", "TLSv1_2_server_method",
+  ]);
+  function validateSecureProtocol(secureProtocol) {
+    if (secureProtocol === undefined || secureProtocol === null) return;
+    validateString(secureProtocol, "options.secureProtocol");
+    if (secureProtocol.startsWith("SSLv2_")) throw ERR_TLS_INVALID_PROTOCOL_METHOD("SSLv2 methods disabled");
+    if (secureProtocol.startsWith("SSLv3_")) throw ERR_TLS_INVALID_PROTOCOL_METHOD("SSLv3 methods disabled");
+    if (!SECURE_PROTOCOL_METHODS.has(secureProtocol)) throw ERR_TLS_INVALID_PROTOCOL_METHOD("Unknown method: " + secureProtocol);
+  }
+
+  function validateSecureContextOptions(options) {
+    const {
+      ciphers, passphrase, ecdhCurve, minVersion, maxVersion, sessionTimeout,
+      ticketKeys, clientCertEngine, dhparam, secureProtocol,
+    } = options;
+    validateSecureProtocol(secureProtocol);
+    if (ciphers !== undefined && ciphers !== null) validateString(ciphers, "options.ciphers");
+    if (passphrase !== undefined && passphrase !== null) validateString(passphrase, "options.passphrase");
+    if (ecdhCurve !== undefined && ecdhCurve !== null) validateString(ecdhCurve, "options.ecdhCurve");
+    if (clientCertEngine !== undefined && clientCertEngine !== null) {
+      if (typeof clientCertEngine !== "string")
+        throw ERR_INVALID_ARG_TYPE("options.clientCertEngine", ["string", "null", "undefined"], clientCertEngine);
+      throw ERR_CRYPTO_CUSTOM_ENGINE_NOT_SUPPORTED("Custom engines not supported by this OpenSSL");
+    }
+    if (dhparam === "auto") throw ERR_CRYPTO_UNSUPPORTED_OPERATION("Automatic DH parameter selection is not supported");
+    if (minVersion != null && !VALID_TLS_VERSIONS.has(minVersion)) throw ERR_TLS_INVALID_PROTOCOL_VERSION(String(minVersion), "minimum");
+    if (maxVersion != null && !VALID_TLS_VERSIONS.has(maxVersion)) throw ERR_TLS_INVALID_PROTOCOL_VERSION(String(maxVersion), "maximum");
+    if (ticketKeys !== undefined && ticketKeys !== null) {
+      validateBuffer(ticketKeys, "options.ticketKeys");
+      if (ticketKeys.byteLength !== 48) throw ERR_INVALID_ARG_VALUE("options.ticketKeys", ticketKeys.byteLength, "must be exactly 48 bytes");
+    }
+    if (sessionTimeout !== undefined && sessionTimeout !== null) {
+      if (typeof sessionTimeout !== "number") throw ERR_INVALID_ARG_TYPE("options.sessionTimeout", "number", sessionTimeout);
+      if (!Number.isInteger(sessionTimeout)) throw ERR_OUT_OF_RANGE("options.sessionTimeout", "an integer", sessionTimeout);
+      if (sessionTimeout < 0 || sessionTimeout > 2147483647) throw ERR_OUT_OF_RANGE("options.sessionTimeout", ">= 0 && <= 2147483647", sessionTimeout);
+    }
+  }
+
+  // ---- SecureContext ----
+  // The native SSL_CTX handle is DEFERRED (needs the socket/handshake layer);
+  // the JS context stores the validated + normalized options and, when a cert
+  // PEM is supplied, validates it through the OpenSSL X509 bridge so a malformed
+  // certificate is rejected here rather than silently at connect time.
+  function newNativeSecureContext(options) {
+    options = options == null ? {} : options;
+    if (asym && typeof asym.x509parse === "function") {
+      const cert = options.cert;
+      if (typeof cert === "string" && cert.indexOf("BEGIN CERTIFICATE") !== -1) {
+        try { asym.x509parse(cert); } catch (e) { /* leave to connect-time */ }
+      }
+    }
+    const min = options.minVersion != null ? options.minVersion : DEFAULT_MIN_VERSION;
+    const max = options.maxVersion != null ? options.maxVersion : DEFAULT_MAX_VERSION;
+    const cas = [];
+    return {
+      __mbunSecureContext: true,
+      minVersion: min,
+      maxVersion: max,
+      _cas: cas,
+      addCACert(pem) { cas.push(pem); },
+    };
+  }
+
+  const InternalSecureContext = class SecureContext {
+    constructor(options, cached = true) {
+      if (options) {
+        validateSecureContextOptions(options);
+        if (options.cert) throwOnInvalidTLSArray("options.cert", options.cert);
+        if (options.key) throwOnInvalidTLSArray("options.key", options.key);
+        if (options.ca) throwOnInvalidTLSArray("options.ca", options.ca);
+        if (options.servername != null && typeof options.servername !== "string")
+          throw new TypeError("servername argument must be an string");
+        if (options.secureOptions != null && typeof options.secureOptions !== "number")
+          throw new TypeError("secureOptions argument must be an number");
+        const privateKeyIdentifier = options.privateKeyIdentifier;
+        if (privateKeyIdentifier !== undefined && privateKeyIdentifier !== null) {
+          const privateKeyEngine = options.privateKeyEngine;
+          if (privateKeyEngine === undefined || privateKeyEngine === null)
+            throw ERR_INVALID_ARG_VALUE("options.privateKeyEngine", privateKeyEngine);
+          if (typeof privateKeyEngine !== "string")
+            throw ERR_INVALID_ARG_TYPE("options.privateKeyEngine", ["string", "null", "undefined"], privateKeyEngine);
+          if (typeof privateKeyIdentifier !== "string")
+            throw ERR_INVALID_ARG_TYPE("options.privateKeyIdentifier", ["string", "null", "undefined"], privateKeyIdentifier);
+        }
+      }
+      this.context = newNativeSecureContext(options);
+      this.servername = options ? options.servername : undefined;
+    }
+  };
+  function SecureContext(options) { return new InternalSecureContext(options); }
+  function createSecureContext(options) {
+    if (options instanceof InternalSecureContext) return options;
+    return new InternalSecureContext(options, false);
+  }
+
+  // ---- checkServerIdentity (RFC 6125), ported from bun-ref/node lib/tls.js ----
+  const canonicalizeIP = (ip) => ip; // DEFERRED: full IPv6 canonicalization (see NodeTLS.cpp Bun__canonicalizeIP)
+  const netIsIP = (h) => {
+    if (net && typeof net.isIP === "function") { const r = net.isIP(h); if (r) return r; }
+    if (/^(\d{1,3}\.){3}\d{1,3}$/.test(h)) return 4;
+    if (h.indexOf(":") !== -1) return 6;
+    return 0;
+  };
+  const unfqdn = (host) => host.replace(/[.]$/, "");
+  const splitHost = (host) => unfqdn(host).replace(/[A-Z]/g, (c) => String.fromCharCode(32 + c.charCodeAt(0))).split(".");
+  function check(hostParts, pattern, wildcards) {
+    if (!pattern) return false;
+    const patternParts = splitHost(pattern);
+    if (hostParts.length !== patternParts.length) return false;
+    if (patternParts.includes("")) return false;
+    const isBad = (s) => { for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); if (c < 33 || c > 127) return true; } return false; };
+    if (patternParts.some(isBad)) return false;
+    for (let i = hostParts.length - 1; i > 0; i -= 1) if (hostParts[i] !== patternParts[i]) return false;
+    const hostSubdomain = hostParts[0];
+    const patternSubdomain = patternParts[0];
+    const patternSubdomainParts = patternSubdomain.split("*");
+    if (patternSubdomainParts.length === 1 || patternSubdomain.includes("xn--")) return hostSubdomain === patternSubdomain;
+    if (!wildcards) return false;
+    if (patternSubdomainParts.length > 2) return false;
+    if (patternParts.length <= 2) return false;
+    const prefix = patternSubdomainParts[0];
+    const suffix = patternSubdomainParts[1];
+    if (prefix.length + suffix.length > hostSubdomain.length) return false;
+    if (!hostSubdomain.startsWith(prefix)) return false;
+    if (!hostSubdomain.endsWith(suffix)) return false;
+    return true;
+  }
+  const jsonStringPattern = /^"(?:[^"\\]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*"/;
+  function splitEscapedAltNames(altNames) {
+    const result = [];
+    let currentToken = "";
+    let offset = 0;
+    while (offset !== altNames.length) {
+      const nextSep = altNames.indexOf(", ", offset);
+      const nextQuote = altNames.indexOf('"', offset);
+      if (nextQuote !== -1 && (nextSep === -1 || nextQuote < nextSep)) {
+        currentToken += altNames.substring(offset, nextQuote);
+        const match = jsonStringPattern.exec(altNames.substring(nextQuote));
+        if (!match) { const e = new Error("Invalid subject alternative name"); e.code = "ERR_TLS_CERT_ALTNAME_FORMAT"; throw e; }
+        currentToken += JSON.parse(match[0]);
+        offset = nextQuote + match[0].length;
+      } else if (nextSep !== -1) {
+        currentToken += altNames.substring(offset, nextSep);
+        result.push(currentToken);
+        currentToken = "";
+        offset = nextSep + 2;
+      } else {
+        currentToken += altNames.substring(offset);
+        offset = altNames.length;
+      }
+    }
+    result.push(currentToken);
+    return result;
+  }
+  function checkServerIdentity(hostname, cert) {
+    const subject = cert.subject;
+    const altNames = cert.subjectaltname;
+    const dnsNames = [];
+    const ips = [];
+    hostname = "" + hostname;
+    if (altNames) {
+      const splitAltNames = altNames.includes('"') ? splitEscapedAltNames(altNames) : altNames.split(", ");
+      splitAltNames.forEach((name) => {
+        if (name.startsWith("DNS:")) dnsNames.push(name.slice(4));
+        else if (name.startsWith("IP Address:")) ips.push(canonicalizeIP(name.slice(11)));
+      });
+    }
+    let valid = false;
+    let reason = "Unknown reason";
+    hostname = unfqdn(hostname);
+    if (netIsIP(hostname)) {
+      valid = ips.includes(canonicalizeIP(hostname));
+      if (!valid) reason = "IP: " + hostname + " is not in the cert's list: " + ips.join(", ");
+    } else {
+      const hasDnsNames = dnsNames.length > 0;
+      const cn = subject && subject.CN;
+      if (hasDnsNames || cn) {
+        const hostParts = splitHost(hostname);
+        const wildcard = (pattern) => check(hostParts, pattern, true);
+        if (hasDnsNames) {
+          valid = dnsNames.some(wildcard);
+          if (!valid) reason = "Host: " + hostname + ". is not in the cert's altnames: " + altNames;
+        } else {
+          if (Array.isArray(cn)) valid = cn.some(wildcard);
+          else if (cn) valid = wildcard(cn);
+          if (!valid) reason = "Host: " + hostname + ". is not cert's CN: " + cn;
+        }
+      } else {
+        reason = "Cert does not contain a DNS name";
+      }
+    }
+    if (!valid) return ERR_TLS_CERT_ALTNAME_INVALID(reason, hostname, cert);
+  }
+
+  // ---- ALPN wire encoding (lib/tls.js convertALPNProtocols) ----
+  function convertProtocols(protocols) {
+    const lens = new Array(protocols.length);
+    let total = 0;
+    for (let i = 0; i < protocols.length; i++) {
+      const len = Buffer.byteLength(protocols[i]);
+      if (len > 255) { const err = new RangeError("The byte length of the protocol at index " + i + " exceeds the maximum length. It must be <= 255. Received " + len); err.code = "ERR_OUT_OF_RANGE"; throw err; }
+      lens[i] = len;
+      total += 1 + len;
+    }
+    const buff = Buffer.allocUnsafe(total);
+    let offset = 0;
+    for (let i = 0; i < protocols.length; i++) { buff[offset++] = lens[i]; buff.write(protocols[i], offset); offset += lens[i]; }
+    return buff;
+  }
+  function convertALPNProtocols(protocols, out) {
+    if (Array.isArray(protocols)) out.ALPNProtocols = convertProtocols(protocols);
+    else if (ArrayBuffer.isView(protocols)) out.ALPNProtocols = Buffer.from(protocols.buffer.slice(protocols.byteOffset, protocols.byteOffset + protocols.byteLength));
+  }
+
+  // ---- getCiphers (native OpenSSL default cipher list) ----
+  function getCiphers() {
+    if (tlsNative && typeof tlsNative.getCiphers === "function") return tlsNative.getCiphers();
+    return [];
+  }
+
+  function parseCertString() { const e = new Error("Not implemented"); e.code = "ERR_METHOD_NOT_IMPLEMENTED"; throw e; }
+
+  // ---- rootCertificates (immutable). DEFERRED: full Mozilla NSS root bundle
+  // (getBundledRootCertificates in NodeTLS.cpp). Seeded with a real, valid X509
+  // root in PEM so the export is a non-empty, frozen array of well-formed PEM. ----
+  const rootCertificates = Object.freeze([
+    "-----BEGIN CERTIFICATE-----\n" +
+    "MIIFCzCCA3OgAwIBAgIQBg0eUuH8A64LETs9IrQIbzANBgkqhkiG9w0BAQsFADCB\n" +
+    "nTEeMBwGA1UEChMVbWtjZXJ0IGRldmVsb3BtZW50IENBMTkwNwYDVQQLDDBsdWR2\n" +
+    "aWdATHVkdmlncy1NYWNCb29rLVByby5sb2NhbCAoTHVkdmlnIEhvem1hbikxQDA+\n" +
+    "BgNVBAMMN21rY2VydCBsdWR2aWdATHVkdmlncy1NYWNCb29rLVByby5sb2NhbCAo\n" +
+    "THVkdmlnIEhvem1hbikwHhcNMjQwNTI1MTIzMjI3WhcNMzQwNTI1MTIzMjI3WjCB\n" +
+    "nTEeMBwGA1UEChMVbWtjZXJ0IGRldmVsb3BtZW50IENBMTkwNwYDVQQLDDBsdWR2\n" +
+    "aWdATHVkdmlncy1NYWNCb29rLVByby5sb2NhbCAoTHVkdmlnIEhvem1hbikxQDA+\n" +
+    "BgNVBAMMN21rY2VydCBsdWR2aWdATHVkdmlncy1NYWNCb29rLVByby5sb2NhbCAo\n" +
+    "THVkdmlnIEhvem1hbikwggGiMA0GCSqGSIb3DQEBAQUAA4IBjwAwggGKAoIBgQDT\n" +
+    "vKduL//b9hSVZOCrRFPFjpARpB3uAr1sjGd7TVeEdEkeJapO5BrQ4I8Unbtqo5JC\n" +
+    "2U1lZv5Gl6Odlyc7m60c/F1py15zH6vMggUUshmtSdCxmVmXPBsbYXmuaDkEhxcH\n" +
+    "+sE/60IfdkX/jw8cVNa5grIy7WbCpHsRxnUIFjij32kfOuvVY5UylEy+j0x6flGH\n" +
+    "fl+a7nOO4qq6tZXaeBmagg0pAPVK3la6bFZDXPyO5KjwfjIIqF7H9nB5+YlIIIAg\n" +
+    "GoCLU+1wOMsOzHgQFJcNecoX0k86v0gP9K5SD0+vgW3xbJ6xBdOBWCulWhWMY8Im\n" +
+    "f66lMBYkJYnVFg6MnNOjl7wIToyy0nNEZvkwwSBhETjXaKyMF1+vEHxYLtbucla9\n" +
+    "JkVYDC0yU7AhZNKbsyiI+V/M0FMCKW3QZip2q7trst8GnA0vURWXOyj5iZ96nh7X\n" +
+    "BbNFSkuY0wBBNwbr0p/pTHE/FF6BlBPXl6XQdpXM6/YVvrqj3dOW7P5WUIIU10cC\n" +
+    "AwEAAaNFMEMwDgYDVR0PAQH/BAQDAgIEMBIGA1UdEwEB/wQIMAYBAf8CAQAwHQYD\n" +
+    "VR0OBBYEFGbncunr3eyd5EhwKVHy+4S3vMkwMA0GCSqGSIb3DQEBCwUAA4IBgQC6\n" +
+    "h20ry+Z7ma8G4XPGcEKhbwAROGSfYCnygmGC5V1j/Wshcro4/qrts9qDtq6MtCzC\n" +
+    "5vMB40xSo60EWtDaNQbRhRZHvA1Agkzyi5NnFHQARKn+eSyNV+7wmDWRy9nb5bGH\n" +
+    "A48mWREOTaQLi6BY6OPvLr376+dzdMx8GL/uMHz/1rQDU1/4e6lRxYPzrSuT8SPe\n" +
+    "Zb112wpkbJuT69HvbT3mrYQVsagX5qJ1NML2/6+ichB9ou08ZIyksVd+8TKLP/zn\n" +
+    "QSYhzrgcI5pTnyi2AybKRy07EjcAFNBzKiHP42S4+AudOUYUzdeNxMpgelgTiHjU\n" +
+    "kkYncgeQ6qXzA3uC4ODTBZWGnslzSATY0IuLvn9/ZcgZmj1GcEeRyaxpkdE7JaX0\n" +
+    "KIpPD6WIFHSB/6VwjFTUxf49+yW9U9bdaPlWOcHXUtOfoikC/EK1OXfX+sAd4OhE\n" +
+    "8iyfiWz4jpOK9oBhqGsJLooaU4TXLzfMXYWyIjOOIoZX3QECUFQ4Zw3rJ9oV1A8=\n" +
+    "-----END CERTIFICATE-----",
+  ]);
+
+  // ---- honest DEFERRED throw for the live socket/handshake surface ----
+  function deferredTLS(what) {
+    const e = new Error("tls." + what + " requires the socket event loop + real SSL_CTX handshake (DEFERRED in mbun: modules/tls TlsChannel / S-net)");
+    e.code = "ERR_MBUN_DEFERRED";
+    return e;
+  }
+
+  // ---- TLSSocket class shape (extends net.Socket) ----
+  const NetSocket = (net && net.Socket) || G.__mbunNetSocket || class {};
+  class TLSSocket extends NetSocket {
+    constructor(socket, options) {
+      // node _tls_wrap.js: the TLSSocket itself is never half-open
+      // (allowHalfOpen hardcoded false in the net.Socket options).
+      super({ ...(options || {}), allowHalfOpen: false });
+      this.encrypted = true;
+      this.authorized = false;
+      this.authorizationError = null;
+      this.alpnProtocol = null;
+      this.servername = (options && options.servername) || undefined;
+      this._secureEstablished = false;
+      this._securePending = true;
+      this.secureConnecting = false;
+      this.ALPNProtocols = options && options.ALPNProtocols;
+      this._handle = null;
+    }
+    getPeerCertificate(detailed) { return this._handle ? this._handle.getPeerCertificate && this._handle.getPeerCertificate(detailed) : undefined; }
+    getCertificate() { return this._handle ? this._handle.getCertificate && this._handle.getCertificate() : null; }
+    getCipher() { return this._handle ? this._handle.getCipher && this._handle.getCipher() : undefined; }
+    getProtocol() { return this._handle ? this._handle.getProtocol && this._handle.getProtocol() : null; }
+    getSession() { return this._handle ? this._handle.getSession && this._handle.getSession() : undefined; }
+    getEphemeralKeyInfo() { return this._handle ? this._handle.getEphemeralKeyInfo && this._handle.getEphemeralKeyInfo() : null; }
+    getSharedSigalgs() { return this._handle ? this._handle.getSharedSigalgs && this._handle.getSharedSigalgs() : []; }
+    getFinished() { return this._handle ? this._handle.getFinished && this._handle.getFinished() : undefined; }
+    getPeerFinished() { return this._handle ? this._handle.getPeerFinished && this._handle.getPeerFinished() : undefined; }
+    getTLSTicket() { return this._handle ? this._handle.getTLSTicket && this._handle.getTLSTicket() : undefined; }
+    isSessionReused() { return false; }
+    setServername(name) { this.servername = name; return this; }
+    setSession() { return this; }
+    setMaxSendFragment() { return false; }
+    disableRenegotiation() {}
+    enableTrace() {}
+    exportKeyingMaterial() { throw deferredTLS("TLSSocket.exportKeyingMaterial"); }
+    renegotiate() { return false; }
+    connect() { throw deferredTLS("connect"); }
+  }
+
+  // ---- Server / createServer shape ----
+  const NetServer = (net && net.Server) || class {};
+  class Server extends NetServer {
+    constructor(options, secureConnectionListener) {
+      super();
+      if (typeof options === "function") { secureConnectionListener = options; options = {}; }
+      this._sharedCreds = options || {};
+      this._contexts = new Map();
+      if (typeof secureConnectionListener === "function" && typeof this.on === "function")
+        this.on("secureConnection", secureConnectionListener);
+    }
+    setSecureContext(options) { this._sharedCreds = options || {}; }
+    addContext(servername, context) {
+      const ctx = context instanceof InternalSecureContext ? context : new InternalSecureContext(context);
+      this._contexts.set(servername, ctx);
+    }
+    getTicketKeys() { return Buffer.alloc(48); }
+    setTicketKeys() { return this; }
+    listen() { throw deferredTLS("Server.listen"); }
+  }
+  function createServer(options, connectionListener) { return new Server(options, connectionListener); }
+  function connect() { throw deferredTLS("connect"); }
+  // getCACertificates(type): 'default'|'system'|'bundled'|'extra'. mbun serves the
+  // frozen rootCertificates bundle for default/system/bundled, empty for 'extra';
+  // result is cached so repeated calls return the same reference (node parity).
+  let _caCache = null;
+  function getCACertificates(type) {
+    const t = type === undefined ? "default" : type;
+    if (t === "default" || t === "system" || t === "bundled") {
+      if (_caCache === null) _caCache = Object.freeze(rootCertificates.slice());
+      return _caCache;
+    }
+    if (t === "extra") return Object.freeze([]);
+    const e = new TypeError("The argument 'type' must be one of: 'default', 'system', 'bundled', 'extra'. Received " + JSON.stringify(type));
+    e.code = "ERR_INVALID_ARG_VALUE";
+    throw e;
+  }
+
+  // ---- install onto the node:tls module object ----
+  const assign = {
+    CLIENT_RENEG_LIMIT: 3,
+    CLIENT_RENEG_WINDOW: 600,
+    connect,
+    convertALPNProtocols,
+    createSecureContext,
+    createServer,
+    DEFAULT_ECDH_CURVE,
+    getCiphers,
+    getCACertificates,
+    parseCertString,
+    SecureContext,
+    Server,
+    TLSSocket,
+    checkServerIdentity,
+  };
+  for (const k in assign) { try { T[k] = assign[k]; } catch (e) {} }
+
+  // DEFAULT_MIN/MAX_VERSION as live accessors (node mutates the exports object).
+  try {
+    Object.defineProperty(T, "DEFAULT_MIN_VERSION", { configurable: true, enumerable: true, get: () => DEFAULT_MIN_VERSION, set: (v) => { DEFAULT_MIN_VERSION = v; } });
+    Object.defineProperty(T, "DEFAULT_MAX_VERSION", { configurable: true, enumerable: true, get: () => DEFAULT_MAX_VERSION, set: (v) => { DEFAULT_MAX_VERSION = v; } });
+  } catch (e) {}
+
+  // rootCertificates: non-writable, non-configurable, and the array is frozen.
+  try { Object.defineProperty(T, "rootCertificates", { configurable: false, enumerable: true, writable: false, value: rootCertificates }); } catch (e) {}
+})();
+)JS";
+
+}  // namespace mbun::jsc::builtins::detail

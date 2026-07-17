@@ -1,0 +1,20 @@
+[package]
+name        = "ffi"
+version     = "0.1.0"
+description = "mbun.ffi — bun:ffi type, signature, library, and call API skeleton"
+license     = "MIT"
+standard    = "c++26"
+
+# Native FFI backend (mbun.ffi.native): the dlopen half of Bun.dlopen. The
+# argument marshalling / call path is self-implemented (a hand-rolled x86-64
+# System V trampoline in src/native.cppm) — NO third-party host library: bun's
+# libffi is replaced outright, so the build has zero /usr dependency and stays
+# reproducible across platforms/CI. The only link is -ldl for dlopen/dlsym,
+# which is part of glibc (folded into the default loader path), not a host lib.
+# The TCC/`cc` runtime-compile path is DEFERRED (see src/call.cppm).
+ldflags = ["-ldl"]
+
+
+
+[indices]
+mbun = { path = "../../mcpp" }

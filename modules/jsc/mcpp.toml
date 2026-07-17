@@ -1,0 +1,62 @@
+[package]
+name        = "jsc"
+version     = "0.1.0"
+description = "mbun.compat.jsc — JavaScriptCore embedding (isolates the JSC dep)"
+license     = "MIT"
+standard    = "c++26"
+
+[build]
+default-profile = "release"
+
+[profile.release]
+opt   = 3
+debug = false
+
+
+
+# The heavy (~1.1GB) JSC prebuilt static lib is scoped to THIS member only, so
+# no other module's build or test touches it. See docs/design/20260710-jsc-integration.md.
+
+# Cross-member deps: module_loader (core/resolver/js) + runtime Bun.* bindings (semver/toml/glob).
+[dependencies]
+core     = { path = "../core" }
+compress = { path = "../compress" }
+crypto   = { path = "../crypto" }
+resolver = { path = "../resolver" }
+js       = { path = "../js" }
+semver = { path = "../semver" }
+toml   = { path = "../toml" }
+glob   = { path = "../glob" }
+image  = { path = "../image" }
+shell  = { path = "../shell" }
+which  = { path = "../which" }
+dns    = { path = "../dns" }
+dotenv = { path = "../dotenv" }
+sqlite = { path = "../sqlite" }
+# CAP-WATCH: node:fs.watch rides the inotify backend (runtime/watch.inc).
+watcher = { path = "../watcher" }
+postgres = { path = "../postgres" }
+# T-CAP-BUILD: Bun.build in-memory bundler bridge (runtime/bun_build.inc).
+bundler = { path = "../bundler" }
+ffi    = { path = "../ffi" }
+sourcemap_jsc = { path = "../sourcemap_jsc" }
+tls    = { path = "../tls" }
+# T-LOOP: Bun.serve rides the native epoll event-loop stack (B1-B3).
+event_loop     = { path = "../event_loop" }
+runtime_socket = { path = "../runtime_socket" }
+runtime_server = { path = "../runtime_server" }
+http           = { path = "../http" }
+# CAP-S3: AWS SigV4 signing bridge for Bun.S3Client (runtime/s3_native.inc).
+s3_signing     = { path = "../s3_signing" }
+# CAP-HTMLREWRITER: dependency-free HTMLRewriter engine (runtime/html_rewriter.inc).
+html_rewriter  = { path = "../html_rewriter" }
+
+[dependencies.mbun]
+jsc-prebuilt = "20260706"
+# Vendored OpenSSL 3.1.5 static backend (no host libssl) for node:crypto's
+# asymmetric + cipher EVP bridge (src/runtime/crypto_asym.inc). Same local-index
+# package modules/tls links; -l:libssl.a/-l:libcrypto.a reach here via its ldflags.
+openssl = "3.1.5+mbun.3"
+
+[indices]
+mbun = { path = "../../mcpp" }

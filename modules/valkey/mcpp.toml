@@ -1,0 +1,15 @@
+[package]
+name        = "valkey"
+version     = "0.1.0"
+description = "mbun.valkey — Redis/Valkey RESP protocol and client data models (socket backend deferred)"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+# No external package is used by this pure data-model layer, so [indices] is
+# intentionally unnecessary. Add the local mbun index when a socket/TLS
+# backend introduces an indexed dependency.
+
+[indices]
+mbun = { path = "../../mcpp" }

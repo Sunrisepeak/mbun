@@ -1,0 +1,11 @@
+[package]
+name        = "sys_bindings"
+version     = "0.1.0"
+description = "mbun system binding seams translated from Bun sys crates"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+[indices]
+mbun = { path = "../../mcpp" }

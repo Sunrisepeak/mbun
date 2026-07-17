@@ -1,0 +1,11 @@
+[package]
+name        = "clap"
+version     = "0.1.0"
+description = "mbun.clap — command argument schema and parser seams"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+[indices]
+mbun = { path = "../../mcpp" }

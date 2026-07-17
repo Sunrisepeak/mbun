@@ -1,0 +1,26 @@
+[package]
+name        = "tls"
+version     = "0.1.0"
+description = "mbun.tls — uWS-compatible TLS/socket state and backend seams"
+license     = "MIT"
+standard    = "c++26"
+
+
+# Real TLS backend (src/openssl.cpp) links OpenSSL 3.1.5 via the vendored
+# local-index package mbun.openssl (see [dependencies.mbun] below), NOT the host
+# /usr or toolchain sysroot — project rule: the build must not depend on any host
+# library (mcpp-ecosystem / local-index / self-built only) so it is reproducible
+# cross-platform and in CI. mbun.openssl wraps the mcpp xim:openssl prebuilt
+# (libssl.a/libcrypto.a + headers) and exposes it as a static lib target; its
+# ldflags (-l:libssl.a -l:libcrypto.a from the package's own lib dir) reach here
+# transitively. bun links BoringSSL; OpenSSL is API-compatible for the
+# handshake/read/write surface used here.
+
+
+# Vendored OpenSSL 3.1.5 static backend (no host libssl). See
+# mcpp/pkgs/m/mbun.openssl.lua for the sourcing rationale.
+[dependencies.mbun]
+openssl = "3.1.5+mbun.3"
+
+[indices]
+mbun = { path = "../../mcpp" }

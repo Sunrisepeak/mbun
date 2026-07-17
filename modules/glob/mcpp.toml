@@ -1,0 +1,15 @@
+[package]
+name        = "glob"
+version     = "0.1.0"
+description = "mbun.glob — glob matcher"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+[targets.bench-glob]
+kind = "bin"
+main = "benches/bench_glob.cpp"
+
+[indices]
+mbun = { path = "../../mcpp" }

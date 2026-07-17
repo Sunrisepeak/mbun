@@ -1,0 +1,27 @@
+[package]
+name        = "image"
+version     = "0.1.0"
+description = "mbun.image — Bun.Image kernels and PNG/WebP codec seams"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+# Real libwebp codec (1.5.0, decode + encode + sharpyuv) compiled from upstream
+# source by the mbun local-index package — no host libwebp-dev, no hardcoded
+# /usr paths. Pulling in a system /usr/lib search path here also poisoned the
+# final CLI link (a -L/usr shadowed bun-webkit's bundled ICU 75, leaving
+# utext_setup_75 & friends undefined), so all /usr flags are gone. bun bundles
+# libwebp; mbun does the same via the index. mbun.image.webp.native (global
+# module fragment includes <webp/decode.h>/<webp/encode.h>) drives the live C
+# API; the index package propagates its include dirs and -lwebp/-lm/-lpthread
+# to consumers.
+
+[dependencies]
+core = { path = "../core" }
+
+[dependencies.mbun]
+libwebp = "1.5.0+mbun.1"
+
+[indices]
+mbun = { path = "../../mcpp" }

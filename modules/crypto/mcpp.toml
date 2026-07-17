@@ -1,0 +1,13 @@
+[package]
+name        = "crypto"
+version     = "0.1.0"
+description = "mbun.crypto — Bun.hash (wyhash/crc32/city/murmur/xxhash/adler32/rapidhash) + Bun.CryptoHasher digests (md5/sha) in pure C++"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+# lib (src/crypto.cppm aggregator) is inferred; tests are auto-discovered under tests/.
+
+[indices]
+mbun = { path = "../../mcpp" }

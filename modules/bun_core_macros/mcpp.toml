@@ -1,0 +1,11 @@
+[package]
+name        = "bun_core_macros"
+version     = "0.1.0"
+description = "mbun.bun_core_macros — attribute, schema, and compile-time dispatch seams"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+[indices]
+mbun = { path = "../../mcpp" }

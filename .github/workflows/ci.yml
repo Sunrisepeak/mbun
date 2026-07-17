@@ -1,0 +1,60 @@
+# T0.2 CI: 双工具链 (gcc16 / llvm22) 构建 + 测试
+# 跨平台矩阵 (macos / windows) 待 linux 稳定后跟进 (docs/plan T0.2)
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: ["gcc@16.1.0", "llvm@22.1.8"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache mcpp home (toolchains + BMI)
+        uses: actions/cache@v4
+        with:
+          path: ~/.mcpp
+          key: mcpp-v2-${{ runner.os }}-${{ matrix.toolchain }}-${{ hashFiles('**/mcpp.lock') }}
+          restore-keys: mcpp-v2-${{ runner.os }}-${{ matrix.toolchain }}-
+
+      - name: Install mcpp
+        run: |
+          curl -fsSL https://github.com/mcpp-community/mcpp/releases/latest/download/install.sh | bash
+          echo "$HOME/.mcpp/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install toolchain
+        run: |
+          mcpp --version
+          # gcc provides the base subos runtime (libstdc++.so.6 / libgcc_s.so.1)
+          # that the LLVM clang binary links against — without it clang exits 127.
+          mcpp toolchain install gcc 16
+          compiler="${TOOLCHAIN%@*}"; version="${TOOLCHAIN#*@}"
+          if [ "$compiler" != "gcc" ]; then
+            mcpp toolchain install "$compiler" "${version%%.*}"
+          fi
+          mcpp toolchain list
+        env:
+          TOOLCHAIN: ${{ matrix.toolchain }}
+
+      - name: Build
+        run: |
+          # Workspace root [toolchain] is inherited by all members.
+          printf '\n[toolchain]\ndefault = "%s"\n' "$TOOLCHAIN" >> mcpp.toml
+          mcpp build --workspace --verbose
+        env:
+          TOOLCHAIN: ${{ matrix.toolchain }}
+
+      - name: Test
+        run: mcpp test --workspace
+
+      - name: Smoke
+        working-directory: app/cli
+        run: mcpp run -- --version

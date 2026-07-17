@@ -1,0 +1,18 @@
+[package]
+name        = "sqlite"
+version     = "0.1.0"
+description = "mbun.sqlite — bun:sqlite SQL, statement, transaction, and row API skeleton"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+# Real SQLite3 native backend (amalgamation) from the mbun local index. The
+# pure-logic modules stay engine-agnostic; mbun.sqlite.native (global module
+# fragment includes sqlite3.h) links this to drive open/prepare/step/bind/exec.
+
+[dependencies.mbun]
+sqlite3 = "3.45.1+mbun.1"
+
+[indices]
+mbun = { path = "../../mcpp" }

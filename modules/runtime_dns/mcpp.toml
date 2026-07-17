@@ -1,0 +1,14 @@
+[package]
+name        = "runtime_dns"
+version     = "0.1.0"
+description = "mbun.runtime_dns — runtime DNS request/cache/backend seams"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+[dependencies]
+dns = { path = "../dns" }
+
+[indices]
+mbun = { path = "../../mcpp" }

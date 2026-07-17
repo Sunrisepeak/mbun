@@ -1,0 +1,16 @@
+[package]
+name        = "semver"
+version     = "0.1.0"
+description = "mbun.semver — SemVer parse/compare/satisfies"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+# lib (src/semver.cppm) is inferred; bench is an explicit bin target.
+[targets.bench-semver]
+kind = "bin"
+main = "benches/bench_semver.cpp"
+
+[indices]
+mbun = { path = "../../mcpp" }

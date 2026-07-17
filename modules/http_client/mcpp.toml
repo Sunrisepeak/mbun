@@ -1,0 +1,19 @@
+[package]
+name        = "http-client"
+version     = "0.1.0"
+description = "mbun.http_client — fetch request/response seam (TLS and socket backends deferred)"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+[lib]
+path = "src/http_client.cppm"
+
+# The local index is explicit per member; mcpp does not inherit indices.
+
+[dependencies]
+http = { path = "../http" }
+
+[indices]
+mbun = { path = "../../mcpp" }

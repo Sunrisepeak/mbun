@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# safe-test.sh — run a command inside a memory/process/time-bounded systemd scope
+# so a fork-deadlock, leak, or fork-bomb can NEVER freeze the whole machine.
+#
+# WHY: child_process/spawn tests can accumulate many hung heavyweight subprocesses
+# (e.g. an OpenSSL+fork deadlock). Left unbounded they exhaust RAM → swap thrash →
+# the machine locks up and reboots. A systemd --user scope caps the WHOLE process
+# tree's memory (cgroup OOM-kills inside the scope, not the box), its task count,
+# and its wall-clock runtime, then reaps the entire group.
+#
+# Usage:  tools/integration/safe-test.sh <timeout_sec> <cmd> [args...]
+#   e.g.  tools/integration/safe-test.sh 30 ./app/cli/target/.../mbun test <file>
+# Env overrides: SAFE_MEM (default 6G), SAFE_TASKS (default 128).
+#
+# ALWAYS use this (never a bare `mbun test <spawn-heavy-file>`) when a hang is
+# possible. Exit code is the command's, or 124 on timeout kill.
+set -u
+TO="${1:?usage: safe-test.sh <timeout_sec> <cmd...>}"; shift
+MEM="${SAFE_MEM:-6G}"
+# 512, not 128: the corpus has tests that legitimately spawn hundreds of children
+# (js/bun/spawn/spawn-many-teardown spawns 350), and a tight TasksMax fails them
+# with fork() errors that look like mbun bugs. The freeze protection is MemoryMax
+# + MemorySwapMax=0 + RuntimeMaxSec, which are unchanged: hung children now die by
+# OOM-kill inside the scope rather than being pre-empted by a task cap.
+TASKS="${SAFE_TASKS:-512}"
+# TimeoutStopSec: SIGKILL shortly after RuntimeMaxSec's SIGTERM, so children
+# that ignore SIGTERM (node child_process suites) still die. setsid: the
+# workload gets its own session, so a test that signals its whole process
+# group (kill(0, SIGABRT)) cannot kill this shell or the harness above it.
+setsid -w systemd-run --user --scope --quiet --collect \
+  -p MemoryMax="$MEM" -p MemorySwapMax=0 -p TasksMax="$TASKS" \
+  -p RuntimeMaxSec="$TO" -p TimeoutStopSec=3 \
+  -- "$@"
+rc=$?
+# systemd returns 143 (SIGTERM) when RuntimeMaxSec fires; normalize to 124 (timeout).
+[ "$rc" = 143 ] && rc=124
+exit $rc

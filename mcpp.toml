@@ -1,0 +1,157 @@
+# mbun - MC++ (modular C++26) rewrite of Bun. This is the single workspace
+# entry point. Members remain grouped by subsystem, while the CLI dependency
+# graph and local package index are declared here so `mcpp build` works from
+# the repository root.
+#
+# Inside a member, src/ follows the mcpp module-path convention
+# (directory path = module namespace, e.g. src/paths.cppm → module
+# mbun.core.paths; a member may hold several related modules).
+#
+# Layout:
+#   modules/core    mbun.core.*   (paths; + strings/collections/alloc as they land)
+#   modules/semver  mbun.semver
+#   modules/glob    mbun.glob
+#   modules/js      mbun.js_*     (js_lexer; + parser/printer/ast — transpiler)
+#   modules/jsc     mbun.compat.jsc / mbun.jsc.*   (JavaScriptCore-bound subsystem)
+#   src/            the root `mbun` binary package
+# Build everything:  mcpp build
+# Test everything:  mcpp test --workspace
+# Run the CLI:      mcpp run -- --version
+
+[package]
+name        = "mbun"
+version     = "0.1.0"
+description = "mbun CLI — an experimental rewrite of bun in MC++"
+license     = "MIT"
+standard    = "c++26"
+
+ldflags = ["-Wl,--export-dynamic"]
+
+[dependencies]
+jsc      = { path = "modules/jsc" }
+semver   = { path = "modules/semver" }
+crypto   = { path = "modules/crypto" }
+which    = { path = "modules/which" }
+dns      = { path = "modules/dns" }
+dotenv   = { path = "modules/dotenv" }
+install  = { path = "modules/install" }
+toml     = { path = "modules/toml" }
+bunfig   = { path = "modules/bunfig" }
+http     = { path = "modules/http" }
+bundler  = { path = "modules/bundler" }
+resolver = { path = "modules/resolver" }
+
+[targets.mbun]
+kind = "bin"
+main = "src/main.cpp"
+
+[indices]
+mbun = { path = "mcpp" }
+
+[build]
+default-profile = "release"
+
+[profile.release]
+opt   = 3
+debug = false
+
+[workspace]
+members = [
+    "modules/core",
+    "modules/semver",
+    "modules/semver_jsc",
+    "modules/glob",
+    "modules/image",
+    "modules/css",
+    "modules/css_derive",
+    "modules/css_jsc",
+    "modules/toml",
+    "modules/ini",
+    "modules/resolver",
+    "modules/patch",
+    "modules/which",
+    "modules/dns",
+    "modules/dotenv",
+    "modules/sourcemap",
+    "modules/sourcemap_jsc",
+    "modules/http",
+    "modules/http_types",
+    "modules/html_rewriter",
+    "modules/install",
+    "modules/js",
+    "modules/jsc",
+    "modules/jsc_macros",
+    "modules/shell",
+    "modules/bundler",
+    "modules/crypto",
+    "modules/compress",
+    "modules/md",
+    "modules/analytics",
+    "modules/api",
+    "modules/bun_alloc",
+    "modules/runtime_allocators",
+    "modules/bun_core",
+    "modules/bun_core_macros",
+    "modules/crash_handler",
+    "modules/dispatch",
+    "modules/exe_format",
+    "modules/logger",
+    "modules/napi",
+    "modules/opaque",
+    "modules/output",
+    "modules/parsers",
+    "modules/platform",
+    "modules/react_compiler",
+    "modules/resolve_builtins",
+    "modules/test_runner",
+    "modules/unicode",
+    "modules/bunfig",
+    "modules/router",
+    "modules/csrf",
+    "modules/s3_signing",
+    "modules/base64",
+    "modules/spawn",
+    "modules/postgres",
+    "modules/tls",
+    "modules/http_client",
+    "modules/http_jsc",
+    "modules/libarchive",
+    "modules/watcher",
+    "modules/sqlite",
+    "modules/event_loop",
+    "modules/ffi",
+    "modules/valkey",
+    "modules/bun_env",
+    "modules/runtime_timer",
+    "modules/runtime_server",
+    "modules/webcore",
+    "modules/runtime_bake",
+    "modules/runtime_socket",
+    "modules/runtime_webview",
+    "modules/runtime_ffi",
+    "modules/io",
+    "modules/sys",
+    "modules/sys_bindings",
+    "modules/options",
+    "modules/runtime_valkey",
+    "modules/runtime_image",
+    "modules/runtime_shell",
+    "modules/runtime_crypto",
+    "modules/runtime_api",
+    "modules/install_jsc",
+    "modules/runtime_napi",
+    "modules/url_jsc",
+    "modules/bun_bin",
+    "modules/safety",
+    "modules/ptr",
+    "modules/codegen",
+    "modules/bindgenv2",
+    "modules/meta",
+    "modules/clap",
+    "modules/windows_sys",
+    "modules/runtime_dns",
+    "modules/interchange",
+    "modules/patch_jsc",
+    "modules/runtime_test_runner",
+    "modules/runtime_cli",
+]

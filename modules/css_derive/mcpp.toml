@@ -1,0 +1,11 @@
+[package]
+name        = "css_derive"
+version     = "0.1.0"
+description = "mbun.css_derive — CSS property, rule, and selector derive metadata seams"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+[indices]
+mbun = { path = "../../mcpp" }

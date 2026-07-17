@@ -1,0 +1,30 @@
+# mbun.patch — git-style patch file parser + applier (pure logic).
+#
+# Ports bun's `src/patch/lib.rs` (used by `bun patch`): parse a unified-diff
+# patch file into a structured `PatchFile`, and apply it. Parsing is fully pure
+# (output string_views borrow the original patch text). Apply is pure logic too:
+# all real filesystem access is injected via a `FileSystem` callback struct
+# (same pattern as modules/resolver), so it stays unit-testable off a real disk.
+#
+# NOT ported here (DEFERRED — need subprocess/which/spawn infra):
+#   git_diff_internal / spawn_opts / git_diff_postprocess (the `bun patch` DIFF
+#   *generation* path). Only parse + apply are in scope.
+[package]
+name        = "patch"
+version     = "0.1.0"
+description = "mbun.patch — git-style patch parse/apply (pure logic, injected fs)"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+# core transitively links the local-index mimalloc package; indices don't
+# inherit across members, so declare the same local index here.
+# Minimal build checkpoint (2026-07-13): mcpp build passed; no first error.
+
+# Cross-member: reuse mbun.core.paths for posix dirname/is_absolute.
+[dependencies]
+core = { path = "../core" }
+
+[indices]
+mbun = { path = "../../mcpp" }

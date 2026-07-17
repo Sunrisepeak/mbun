@@ -1,0 +1,18 @@
+[package]
+name        = "which"
+version     = "0.1.0"
+description = "mbun.which — PATH executable lookup (Bun.which / spawn resolution), pure logic"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+# core transitively links the local-index mimalloc package; indices do not
+# inherit across members, so the consumer must know the same local index.
+
+# Cross-member: reuse mbun.core.paths for posix/win32 is_absolute + separators.
+[dependencies]
+core = { path = "../core" }
+
+[indices]
+mbun = { path = "../../mcpp" }

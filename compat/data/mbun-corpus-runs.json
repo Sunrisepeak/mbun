@@ -1,0 +1,28 @@
+{
+  "generated_at": "2026-07-18",
+  "binary": "mbun (source snapshot, branch codex/lexbor-html-rewriter)",
+  "runs": [
+    {
+      "corpus": "compat/bun/test",
+      "runner": "tools/integration/bun_corpus_runner.py --cwd compat/bun --sample-per-group 100000 --jobs 14 --timeout 30",
+      "files": 1902,
+      "categories": {
+        "green": 679,
+        "test-failure": 1082,
+        "all-skipped": 58,
+        "timeout": 57,
+        "load-error": 14,
+        "oom-kill": 12
+      },
+      "test_level": { "ran": 44250, "passed": 26853, "failed": 15350, "expects": 404560 },
+      "notes": "file-level green = every executed test in the file passed; skipped-only files are their own bucket"
+    },
+    {
+      "corpus": "compat/node/test/parallel",
+      "runner": "tools/integration/node_corpus_runner.py --jobs 10 --timeout 15",
+      "files": 4433,
+      "categories": { "pass": 1527, "fail": 2824, "timeout": 78, "oom-kill": 4 },
+      "notes": "direct execution (mbun <file>, exit 0 = pass); node's own harness services (// Flags:, internal bindings) are not emulated, so files needing them count as failures"
+    }
+  ]
+}

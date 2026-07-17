@@ -1,0 +1,86 @@
+{
+  "generated_at": "2026-07-11",
+  "runner_cwd": "compat/bun/test",
+  "runs": [
+    {
+      "command": "../../.mbun/bin/bun-zig test cli/install/semver.test.ts",
+      "engine": "bun-zig",
+      "version": "1.3.14 (0d9b296a)",
+      "file": "cli/install/semver.test.ts",
+      "status": "failed",
+      "pass": 24,
+      "fail": 2,
+      "error": 1,
+      "duration_ms": 31340,
+      "key_findings": [
+        "dangling '-' parser case crashes a spawned child process",
+        "very long 'v' / '= ' prefix adversarial input timed out at 30000ms"
+      ]
+    },
+    {
+      "command": "../../.mbun/bin/bun-rust test cli/install/semver.test.ts",
+      "engine": "bun-rust",
+      "version": "1.4.0-canary.1 (6bb513507)",
+      "file": "cli/install/semver.test.ts",
+      "status": "passed",
+      "pass": 26,
+      "fail": 0,
+      "error": 0,
+      "duration_ms": 292
+    },
+    {
+      "command": "../../.mbun/bin/bun-zig test js/bun/glob/match.test.ts",
+      "engine": "bun-zig",
+      "version": "1.3.14 (0d9b296a)",
+      "file": "js/bun/glob/match.test.ts",
+      "status": "failed",
+      "pass": 24,
+      "fail": 2,
+      "error": 0,
+      "duration_ms": 139,
+      "key_findings": [
+        "brace branch split on bracket-class comma regressed",
+        "deeply nested brace skipping regressed"
+      ]
+    },
+    {
+      "command": "../../.mbun/bin/bun-rust test js/bun/glob/match.test.ts",
+      "engine": "bun-rust",
+      "version": "1.4.0-canary.1 (6bb513507)",
+      "file": "js/bun/glob/match.test.ts",
+      "status": "passed",
+      "pass": 26,
+      "fail": 0,
+      "error": 0,
+      "duration_ms": 142
+    },
+    {
+      "command": "../../.mbun/bin/bun-zig test js/bun/util/toUTF16Alloc.test.ts",
+      "engine": "bun-zig",
+      "version": "1.3.14 (0d9b296a)",
+      "file": "js/bun/util/toUTF16Alloc.test.ts",
+      "status": "blocked",
+      "pass": 0,
+      "fail": 1,
+      "error": 1,
+      "duration_ms": 104,
+      "key_findings": [
+        "release binary cannot resolve bun:internal-for-testing"
+      ]
+    },
+    {
+      "command": "../../.mbun/bin/bun-rust test js/bun/util/toUTF16Alloc.test.ts",
+      "engine": "bun-rust",
+      "version": "1.4.0-canary.1 (6bb513507)",
+      "file": "js/bun/util/toUTF16Alloc.test.ts",
+      "status": "blocked",
+      "pass": 0,
+      "fail": 1,
+      "error": 1,
+      "duration_ms": 109,
+      "key_findings": [
+        "release binary cannot resolve bun:internal-for-testing"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,25 @@
+[package]
+name        = "toml"
+version     = "0.1.0"
+description = "mbun config parsers — TOML, JSONC, and INI"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+[profile.asan]
+inherits = "release"
+debug    = true
+cxxflags = ["-fsanitize=address", "-fno-omit-frame-pointer"]
+ldflags  = ["-fsanitize=address"]
+
+[targets.bench-toml]
+kind = "bin"
+main = "benches/bench_toml.cpp"
+
+[targets.bench-config]
+kind = "bin"
+main = "benches/bench_config.cpp"
+
+[indices]
+mbun = { path = "../../mcpp" }

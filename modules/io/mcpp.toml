@@ -1,0 +1,14 @@
+[package]
+name        = "io"
+version     = "0.1.0"
+description = "mbun.io — fd-relative file and buffered I/O contracts"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+[dependencies]
+sys = { path = "../sys" }
+
+[indices]
+mbun = { path = "../../mcpp" }

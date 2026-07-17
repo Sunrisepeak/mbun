@@ -1,0 +1,11 @@
+[package]
+name        = "sourcemap"
+version     = "0.1.0"
+description = "mbun.sourcemap — VLQ codec, source map generation/parsing/synthesis"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+[indices]
+mbun = { path = "../../mcpp" }

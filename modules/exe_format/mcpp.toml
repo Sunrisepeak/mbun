@@ -1,0 +1,11 @@
+[package]
+name        = "exe_format"
+version     = "0.1.0"
+description = "mbun.exe_format — executable format magic, headers, sections, and metadata"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+[indices]
+mbun = { path = "../../mcpp" }

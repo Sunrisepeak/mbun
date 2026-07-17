@@ -1,0 +1,50 @@
+[package]
+name        = "install"
+version     = "0.1.0"
+description = "mbun.install.core — bun.lock/bun.lockb parse + dependency graph (pure logic, no network)"
+license     = "MIT"
+standard    = "c++26"
+
+# The https executor path links mbun.tls, whose TlsChannel binds OpenSSL. mcpp
+# does not propagate a path dependency's ldflags to consumers, so this member
+# depends on the same vendored OpenSSL backend directly (mbun.openssl, via
+# [dependencies.mbun] below) instead of repeating host link flags — project rule:
+# no host library, mcpp-ecosystem / local-index only. See modules/tls/mcpp.toml
+# and mcpp/pkgs/m/mbun.openssl.lua.
+
+
+# core transitively links the local-index mimalloc package. mcpp resolves and
+# fetches path dependencies in each consuming member's sandbox, and indices do
+# not inherit across members, so the consumer must know the same local index.
+
+# Cross-member deps for the install subsystem port:
+#   semver — version-range satisfiability; toml — bunfig; glob — package patterns;
+#   core — gzip inflate (mbun.core.compress) for .tgz extraction;
+#   crypto — sha1/sha256/sha384/sha512 (mbun.crypto.hasher) for SRI verification;
+#   http — HTTP/1.1 response parse + chunked decode for http_executor;
+#   tls  — real OpenSSL TlsChannel for the https:// executor path.
+#
+# event_loop + runtime_socket back the concurrent executor in src/async_http/
+# (bun runs one "HTTP Client" thread over a uSockets epoll loop and multiplexes
+# every in-flight request on it — HTTPThread.rs:1247/1281). runtime_socket
+# already depends on event_loop, but mcpp does not propagate a path dependency
+# transitively, so both are listed explicitly (same reason as mbun.openssl below).
+[dependencies]
+semver         = { path = "../semver" }
+toml           = { path = "../toml" }
+bunfig         = { path = "../bunfig" }
+glob           = { path = "../glob" }
+core           = { path = "../core" }
+crypto         = { path = "../crypto" }
+http           = { path = "../http" }
+tls            = { path = "../tls" }
+event_loop     = { path = "../event_loop" }
+runtime_socket = { path = "../runtime_socket" }
+
+# Same vendored OpenSSL backend tls uses: mcpp does not propagate a path dep's
+# ldflags to consumers, so this member links mbun.openssl directly (no host libssl).
+[dependencies.mbun]
+openssl = "3.1.5+mbun.3"
+
+[indices]
+mbun = { path = "../../mcpp" }

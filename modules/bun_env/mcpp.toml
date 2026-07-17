@@ -1,0 +1,11 @@
+[package]
+name        = "bun_env"
+version     = "0.1.0"
+description = "mbun Bun environment, runtime configuration, and platform descriptors"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+[indices]
+mbun = { path = "../../mcpp" }

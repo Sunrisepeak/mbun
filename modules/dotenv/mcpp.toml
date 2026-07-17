@@ -1,0 +1,17 @@
+[package]
+name        = "dotenv"
+version     = "0.1.0"
+description = "mbun.dotenv — .env file parser (quotes, multiline, escapes, ${VAR} expansion; pure logic)"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+# Member manifests do not inherit indices. Keep the local mbun index here for
+# the core dependency used by the dotenv subsystem.
+
+[dependencies]
+core = { path = "../core" }
+
+[indices]
+mbun = { path = "../../mcpp" }

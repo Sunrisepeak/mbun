@@ -1,0 +1,11 @@
+[package]
+name        = "dns"
+version     = "0.1.0"
+description = "mbun.dns — node:dns / Bun.dns pure-logic layer (records, address family/options, ares error mapping). Real resolution (c-ares/system) is injected."
+license     = "MIT"
+standard    = "c++26"
+
+
+
+[indices]
+mbun = { path = "../../mcpp" }

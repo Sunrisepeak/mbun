@@ -1,0 +1,12 @@
+[package]
+name        = "postgres"
+version     = "0.1.0"
+description = "mbun.postgres — PostgreSQL protocol, parameter, row, and query API skeleton"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+
+[indices]
+mbun = { path = "../../mcpp" }

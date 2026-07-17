@@ -1,0 +1,117 @@
+{
+  "generated_at": "2026-07-11",
+  "native_only": true,
+  "note": "This file records bun-native benchmark data only. mbun-native reports remain under benchmarks/reports/.",
+  "environment": {
+    "os": "Linux 6.8.0 x86_64",
+    "cpu": "13th Gen Intel Core i9-13900K",
+    "bun_zig": "1.3.14 (0d9b296a)",
+    "bun_rust": "1.4.0-canary.1 (6bb513507)",
+    "mitata": "1.0.20",
+    "semver_package": "6.3.0"
+  },
+  "methodology": {
+    "repetitions_per_engine": 10,
+    "aggregate": "median of the 10 per-run mitata p50 values (mean of the two center values)",
+    "ops_per_second": "floor(1000000000 / aggregate_p50_ns)",
+    "tie_threshold": "absolute latency difference below 1% of the slower result",
+    "dependency_setup": "npm install --prefix .mcompat/bun/bench-deps --no-save mitata@1.0.20 semver@6.3.0; temporarily link compat/bun/bench/node_modules to .mcompat/bun/bench-deps/node_modules",
+    "command_template": "BENCHMARK_RUNNER=1 <bun-binary> --preload benchmarks/tools/mitata-json-preload.js <compat/bun/bench/script>"
+  },
+  "successful_runs": [
+    {
+      "source": "benchmarks/suites/semver/bench.mjs",
+      "kind": "external_native_driver",
+      "command": "./.mbun/bin/bun-zig benchmarks/suites/semver/bench.mjs 50",
+      "engine": "bun-zig",
+      "version": "1.3.14 (0d9b296af)",
+      "order_ops_per_s": 6475194,
+      "satisfies_ops_per_s": 7103331,
+      "checksum": 4747
+    },
+    {
+      "source": "benchmarks/suites/semver/bench.mjs",
+      "kind": "external_native_driver",
+      "command": "./.mbun/bin/bun-rust benchmarks/suites/semver/bench.mjs 50",
+      "engine": "bun-rust",
+      "version": "1.4.0 (6bb513507)",
+      "order_ops_per_s": 7224034,
+      "satisfies_ops_per_s": 7723689,
+      "checksum": 4747
+    },
+    {
+      "source": "compat/bun/bench/glob/match.mjs",
+      "kind": "vendored_bun_bench_suite",
+      "raw_p50_ns": {
+        "bun-zig": {
+          "max-depth": [368.632080078125, 386.56396484375, 368.896240234375, 393.9716796875, 369.78173828125, 374.621826171875, 373.1943359375, 369.02783203125, 375.044189453125, 382.49951171875],
+          "non-ascii": [147.74365234375, 149.447509765625, 150.43505859375, 149.382080078125, 142.448486328125, 142.5419921875, 142.623291015625, 148.04833984375, 149.46044921875, 150.592041015625],
+          "utf8": [135.036376953125, 136.1015625, 139.401123046875, 136.0, 135.308837890625, 136.75244140625, 134.308837890625, 135.258544921875, 139.851806640625, 139.3095703125],
+          "non-ascii+max-depth": [429.623291015625, 457.69140625, 428.978759765625, 416.894287109375, 436.687255859375, 416.163818359375, 410.497314453125, 422.7880859375, 436.417236328125, 432.110107421875],
+          "pretty-average": [111.2236328125, 106.484619140625, 110.668212890625, 111.22607421875, 110.50439453125, 110.0, 108.16845703125, 110.52001953125, 110.20849609375, 111.393798828125],
+          "pretty-average-2": [137.14208984375, 129.456298828125, 129.88623046875, 130.320556640625, 133.930908203125, 132.8916015625, 129.456298828125, 128.386474609375, 133.1689453125, 133.534423828125],
+          "pretty-average-3": [117.588134765625, 112.01318359375, 112.623046875, 112.583984375, 114.034912109375, 117.568603515625, 112.984130859375, 111.931884765625, 112.93994140625, 114.542236328125],
+          "pretty-average-4": [215.63671875, 215.177001953125, 207.9013671875, 210.772216796875, 209.532958984375, 215.3740234375, 208.54052734375, 211.538330078125, 210.40771484375, 209.198974609375],
+          "long-pretty-average": [184.711669921875, 177.785400390625, 184.574951171875, 177.746826171875, 180.24560546875, 181.11669921875, 179.792724609375, 176.454833984375, 176.591552734375, 180.615966796875],
+          "brackets-lots": [109.159912109375, 104.317626953125, 106.391845703125, 105.430419921875, 106.20458984375, 110.075439453125, 105.950927734375, 105.09423828125, 105.743408203125, 106.1103515625]
+        },
+        "bun-rust": {
+          "max-depth": [436.2490234375, 423.561279296875, 440.250732421875, 417.70361328125, 438.038818359375, 434.11767578125, 437.7763671875, 419.409423828125, 435.308349609375, 437.979736328125],
+          "non-ascii": [155.72607421875, 156.812744140625, 156.9521484375, 153.28955078125, 156.5322265625, 156.07080078125, 159.839111328125, 158.6552734375, 155.678466796875, 156.59716796875],
+          "utf8": [153.850830078125, 156.793212890625, 154.065185546875, 169.18212890625, 160.9404296875, 157.439697265625, 154.265380859375, 154.76611328125, 156.73828125, 156.517333984375],
+          "non-ascii+max-depth": [488.765625, 497.386962890625, 497.42724609375, 498.182861328125, 489.5546875, 496.755615234375, 489.729248046875, 467.80419921875, 498.086181640625, 481.243408203125],
+          "pretty-average": [113.155029296875, 112.79833984375, 113.198974609375, 118.486572265625, 113.94873046875, 112.90478515625, 110.739013671875, 111.02099609375, 113.569580078125, 113.4072265625],
+          "pretty-average-2": [129.85400390625, 129.64599609375, 134.4638671875, 129.20849609375, 139.65625, 131.306884765625, 129.47802734375, 129.32763671875, 131.30029296875, 131.539306640625],
+          "pretty-average-3": [113.434814453125, 114.184814453125, 116.667724609375, 113.01171875, 120.334228515625, 114.417236328125, 114.550048828125, 113.93798828125, 114.3037109375, 115.171142578125],
+          "pretty-average-4": [206.783447265625, 202.801025390625, 208.8671875, 205.78759765625, 214.4169921875, 207.78271484375, 210.193115234375, 205.517333984375, 209.2041015625, 211.0537109375],
+          "long-pretty-average": [184.0126953125, 180.12353515625, 185.351806640625, 184.812255859375, 190.864013671875, 184.594970703125, 188.061767578125, 186.073974609375, 188.165771484375, 187.592041015625],
+          "brackets-lots": [125.17626953125, 126.10986328125, 128.92041015625, 125.786376953125, 135.848388671875, 125.288330078125, 123.842041015625, 127.323974609375, 125.08154296875, 126.36083984375]
+        }
+      },
+      "summary": [
+        {"name": "max-depth", "bun_zig_p50_ns": 373.9080810546875, "bun_zig_ops_per_s": 2674454, "bun_rust_p50_ns": 435.7786865234375, "bun_rust_ops_per_s": 2294742, "difference_percent": 14.20, "winner": "bun-zig"},
+        {"name": "non-ascii", "bun_zig_p50_ns": 148.7152099609375, "bun_zig_ops_per_s": 6724261, "bun_rust_p50_ns": 156.564697265625, "bun_rust_ops_per_s": 6387135, "difference_percent": 5.01, "winner": "bun-zig"},
+        {"name": "utf8", "bun_zig_p50_ns": 136.05078125, "bun_zig_ops_per_s": 7350196, "bun_rust_p50_ns": 156.6278076171875, "bun_rust_ops_per_s": 6384562, "difference_percent": 13.14, "winner": "bun-zig"},
+        {"name": "non-ascii+max-depth", "bun_zig_p50_ns": 429.301025390625, "bun_zig_ops_per_s": 2329367, "bun_rust_p50_ns": 493.242431640625, "bun_rust_ops_per_s": 2027400, "difference_percent": 12.96, "winner": "bun-zig"},
+        {"name": "pretty-average", "bun_zig_p50_ns": 110.51220703125, "bun_zig_ops_per_s": 9048774, "bun_rust_p50_ns": 113.177001953125, "bun_rust_ops_per_s": 8835717, "difference_percent": 2.35, "winner": "bun-zig"},
+        {"name": "pretty-average-2", "bun_zig_p50_ns": 131.6060791015625, "bun_zig_ops_per_s": 7598433, "bun_rust_p50_ns": 130.5771484375, "bun_rust_ops_per_s": 7658307, "difference_percent": 0.78, "winner": "tie"},
+        {"name": "pretty-average-3", "bun_zig_p50_ns": 112.9620361328125, "bun_zig_ops_per_s": 8852531, "bun_rust_p50_ns": 114.3604736328125, "bun_rust_ops_per_s": 8744279, "difference_percent": 1.22, "winner": "bun-zig"},
+        {"name": "pretty-average-4", "bun_zig_p50_ns": 210.5899658203125, "bun_zig_ops_per_s": 4748564, "bun_rust_p50_ns": 208.324951171875, "bun_rust_ops_per_s": 4800193, "difference_percent": 1.08, "winner": "bun-rust"},
+        {"name": "long-pretty-average", "bun_zig_p50_ns": 180.0191650390625, "bun_zig_ops_per_s": 5554964, "bun_rust_p50_ns": 185.712890625, "bun_rust_ops_per_s": 5384655, "difference_percent": 3.07, "winner": "bun-zig"},
+        {"name": "brackets-lots", "bun_zig_p50_ns": 106.0306396484375, "bun_zig_ops_per_s": 9431236, "bun_rust_p50_ns": 125.9481201171875, "bun_rust_ops_per_s": 7939777, "difference_percent": 15.81, "winner": "bun-zig"}
+      ]
+    },
+    {
+      "source": "compat/bun/bench/snippets/semver.mjs",
+      "kind": "vendored_bun_bench_suite",
+      "raw_p50_ns": {
+        "bun-zig": {
+          "semver.satisfies x 88": [268106, 265863, 272381, 258063, 266092, 268723, 266148, 266312, 271380, 269322],
+          "Bun.semver.satisfies x 88": [10940.68994140625, 10911.659912109375, 10947.77978515625, 10582.355224609375, 10908.11083984375, 10960.645263671875, 10913.87060546875, 10929.672607421875, 10840.229736328125, 10924.816162109375],
+          "semver.satisfies": [2552.088623046875, 2531.3916015625, 2606.16162109375, 2562.4921875, 2527.9833984375, 2561.77880859375, 2542.921875, 2592.690185546875, 2581.002685546875, 2566.94775390625],
+          "Bun.semver.satisfies": [117.3466796875, 113.69287109375, 117.94140625, 117.757080078125, 117.8564453125, 117.71923828125, 117.944580078125, 117.7822265625, 117.9521484375, 117.741943359375]
+        },
+        "bun-rust": {
+          "semver.satisfies x 88": [241785, 244139, 241474, 240975, 248128, 247605, 242702, 241860, 243699, 241379],
+          "Bun.semver.satisfies x 88": [8212.504150390625, 8414.79638671875, 8412.103271484375, 8419.461669921875, 8475.496826171875, 8455.2060546875, 8459.6943359375, 8446.702880859375, 8545.053955078125, 8444.60498046875],
+          "semver.satisfies": [2327.7734375, 2334.9853515625, 2314.98486328125, 2352.284912109375, 2405.07861328125, 2350.976318359375, 2324.749267578125, 2317.725830078125, 2318.858642578125, 2317.884033203125],
+          "Bun.semver.satisfies": [76.236083984375, 76.490966796875, 76.54150390625, 77.26025390625, 75.986572265625, 83.243896484375, 76.31396484375, 76.46337890625, 77.42578125, 76.4150390625]
+        }
+      },
+      "summary": [
+        {"name": "semver.satisfies x 88", "bun_zig_p50_ns": 267209, "bun_zig_ops_per_s": 3742, "bun_rust_p50_ns": 242281, "bun_rust_ops_per_s": 4127, "difference_percent": 9.33, "winner": "bun-rust"},
+        {"name": "Bun.semver.satisfies x 88", "bun_zig_p50_ns": 10919.343383789062, "bun_zig_ops_per_s": 91580, "bun_rust_p50_ns": 8445.653930664062, "bun_rust_ops_per_s": 118404, "difference_percent": 22.65, "winner": "bun-rust"},
+        {"name": "semver.satisfies", "bun_zig_p50_ns": 2562.135498046875, "bun_zig_ops_per_s": 390299, "bun_rust_p50_ns": 2326.2613525390625, "bun_rust_ops_per_s": 429874, "difference_percent": 9.21, "winner": "bun-rust"},
+        {"name": "Bun.semver.satisfies", "bun_zig_p50_ns": 117.7696533203125, "bun_zig_ops_per_s": 8491151, "bun_rust_p50_ns": 76.4771728515625, "bun_rust_ops_per_s": 13075797, "difference_percent": 35.06, "winner": "bun-rust"}
+      ]
+    }
+  ],
+  "blocked_runs": [
+    {
+      "source": "compat/bun/bench/glob/match.mjs",
+      "kind": "vendored_bun_bench_suite",
+      "status": "clean_reinstall_blocked",
+      "blocking_reason": "The full compat/bun/bench/bun.lock pins some tarball URLs to a private Artifactory mirror. Clean full-suite bun install fails with HTTP 401; the recorded suites use only the exact public mitata and semver packages listed above."
+    }
+  ]
+}

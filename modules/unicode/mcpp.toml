@@ -1,0 +1,11 @@
+[package]
+name        = "unicode"
+version     = "0.1.0"
+description = "mbun.unicode — Unicode codepoint/category/case/width data seam"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+[indices]
+mbun = { path = "../../mcpp" }

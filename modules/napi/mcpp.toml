@@ -1,0 +1,11 @@
+[package]
+name        = "napi"
+version     = "0.1.0"
+description = "mbun.napi — ABI-neutral Node-API environment and registration seams"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+[indices]
+mbun = { path = "../../mcpp" }
