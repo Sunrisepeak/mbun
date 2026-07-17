@@ -29,7 +29,7 @@ xlings install mcpp -y
 Build mbun and run the smallest example:
 
 ```bash
-git clone <mbun-repository-url>
+git clone https://github.com/Sunrisepeak/mbun
 cd mbun
 git submodule update --init --recursive
 mcpp build
