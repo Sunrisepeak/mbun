@@ -38,6 +38,12 @@ public:
     virtual bool resume(NativeHandle) = 0;
     virtual bool shutdown(NativeHandle) = 0;
     virtual void close(NativeHandle) = 0;
+    // Server-initiated close with FIN semantics: half-close the write side and
+    // discard inbound until the peer closes. A plain close() with unread
+    // inbound bytes makes the kernel send RST, which the peer observes as
+    // ECONNRESET instead of EOF (the HTTP 431/error path promises a clean
+    // close). Not pure: synthetic backends have no kernel buffer to drain.
+    virtual void close_after_drain(NativeHandle handle) { close(handle); }
     // Not pure: a backend whose handles are not real fds (RecordingBackend) has
     // no peer to report, and every caller already treats "no peer" as valid
     // (a closed/synthetic connection). Mirrors bsd_remote_addr's -1 return.

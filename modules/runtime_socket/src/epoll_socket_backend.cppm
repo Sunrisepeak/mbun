@@ -59,6 +59,9 @@ private:
         bool readEnabled { true };
         bool writePending { false };
         bool inEpoll { false };
+        // close_after_drain: write side already shut, inbound is discarded
+        // until the peer's FIN/error, then the fd is reaped (no on_data).
+        bool draining { false };
         StreamBuffer writeBuffer {};
     };
 
@@ -287,6 +290,22 @@ public:  // SocketBackend
         cleanup_(static_cast<int>(handle));
 #else
         static_cast<void>(handle);
+#endif
+    }
+
+    void close_after_drain(NativeHandle handle) override {
+#if defined(__linux__)
+        const int fd { static_cast<int>(handle) };
+        const auto found { entries_.find(fd) };
+        if (found == entries_.end()) {
+            return;
+        }
+        ::shutdown(fd, SHUT_WR);  // FIN now; the peer reads EOF, not ECONNRESET
+        found->second.draining = true;
+        found->second.readEnabled = true;  // keep EPOLLIN so the drain progresses
+        drain_now_(fd);
+#else
+        close(handle);
 #endif
     }
 
@@ -563,7 +582,32 @@ private:
     }
 
     // Readable: recv until EAGAIN feeding on_data; recv == 0 is peer FIN.
+    // Discard inbound on a draining fd until the peer closes; reap on FIN or
+    // any hard error. Returns on EAGAIN (more readable events will follow).
+    void drain_now_(int fd) {
+        std::array<std::byte, READ_CHUNK> chunk {};
+        while (true) {
+            const ::ssize_t n { ::recv(fd, chunk.data(), chunk.size(), 0) };
+            if (n > 0) {
+                continue;
+            }
+            if (n < 0 && errno == EINTR) {
+                continue;
+            }
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                return;
+            }
+            cleanup_(fd);  // FIN (0) or hard error: the peer saw our FIN, reap
+            return;
+        }
+    }
+
     void read_ready_(int fd) {
+        if (const auto found { entries_.find(fd) };
+            found != entries_.end() && found->second.draining) {
+            drain_now_(fd);
+            return;
+        }
         std::array<std::byte, READ_CHUNK> chunk {};
         while (true) {
             const ::ssize_t n { ::recv(fd, chunk.data(), chunk.size(), 0) };

@@ -432,7 +432,11 @@ private:
 
     void close_now_(runtime_socket::NativeHandle handle) {
         scrub_pending_(handle);
-        backend_->close(handle);
+        // Drain-close: half-close (FIN) and discard leftover inbound. A plain
+        // close() with unread request bytes (the 431 oversized-header path)
+        // makes the kernel RST, and the client observes ECONNRESET instead of
+        // the clean EOF "connection: close" semantics promise.
+        backend_->close_after_drain(handle);
         conns_.erase(handle);
     }
 
