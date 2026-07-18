@@ -56,5 +56,4 @@ jobs:
         run: mcpp test --workspace
 
       - name: Smoke
-        working-directory: app/cli
         run: mcpp run -- --version
