@@ -155,7 +155,10 @@ void test_errors() {
     files["/dynamic-expr.js"] = "const n = '1'; import('./lazy' + n + '.js');";
     files["/lazy1.js"] = "export const lazy = true;";
     auto dynamicExpr{mbun::bundler::build("/dynamic-expr.js", files)};
-    check(!dynamicExpr, "computed dynamic import specifier is an explicit error");
+    // bun leaves a non-literal specifier as a runtime import (p.rs transpose_import
+    // only records string literals); js_parser lowers it to __mbun_dyn_import with a
+    // chunk-local fallback, so the build succeeds with no edge recorded.
+    check(dynamicExpr.has_value(), "computed dynamic import specifier defers to the runtime");
 
     files["/await.js"] = "await Promise.resolve(1);";
     auto topLevelAwait{mbun::bundler::build("/await.js", files)};
@@ -474,7 +477,7 @@ void test_plugin_hooks() {
             {"/actual-data.js", "export const value = \"from actual-data\";"},
         };
         BuildOptions options;
-        options.on_resolve = [&](std::string_view specifier, std::string_view, std::string_view)
+        options.on_resolve = [&](std::string_view specifier, std::string_view, std::string_view, std::string_view)
             -> std::expected<std::optional<PluginResolveResult>, BuildError> {
             if (specifier != "virtual:data") {
                 return std::nullopt;
@@ -491,7 +494,7 @@ void test_plugin_hooks() {
     {  // a virtual namespace is served entirely by on_load
         const Files virt{{"/entry.js", "import { v } from \"virtual:thing\"; console.log(v);"}};
         BuildOptions options;
-        options.on_resolve = [&](std::string_view specifier, std::string_view, std::string_view)
+        options.on_resolve = [&](std::string_view specifier, std::string_view, std::string_view, std::string_view)
             -> std::expected<std::optional<PluginResolveResult>, BuildError> {
             if (specifier != "virtual:thing") {
                 return std::nullopt;
@@ -531,7 +534,7 @@ void test_plugin_hooks() {
 
     {  // a throwing on_resolve fails the build with the plugin's message
         BuildOptions options;
-        options.on_resolve = [&](std::string_view specifier, std::string_view, std::string_view)
+        options.on_resolve = [&](std::string_view specifier, std::string_view, std::string_view, std::string_view)
             -> std::expected<std::optional<PluginResolveResult>, BuildError> {
             if (specifier != "./lib.js") {
                 return std::nullopt;
@@ -547,7 +550,7 @@ void test_plugin_hooks() {
 
     {  // a hook that matches nothing leaves the default pipeline untouched
         BuildOptions options;
-        options.on_resolve = [&](std::string_view, std::string_view, std::string_view)
+        options.on_resolve = [&](std::string_view, std::string_view, std::string_view, std::string_view)
             -> std::expected<std::optional<PluginResolveResult>, BuildError> { return std::nullopt; };
         options.on_load = [&](std::string_view, std::string_view)
             -> std::expected<std::optional<PluginLoadResult>, BuildError> { return std::nullopt; };

@@ -940,6 +940,30 @@ private:
         unresolved.reserve(8);
         std::unordered_set<std::string> seen;
         seen.reserve(8);
+        // A local binding named `require` (function parameter or let/var/const)
+        // means the file deliberately shadows the CJS require somewhere. Without
+        // a real binder the shadow cannot be scoped, so suppress require-edge
+        // discovery for the whole file: a missed edge degrades to a runtime
+        // require (bun's behaviour for bare specifiers), while a false edge
+        // fails the whole build on an unresolvable path.
+        bool requireShadowed{false};
+        for (std::size_t i{1}; i + 1 < tokens->size(); ++i) {
+            const auto& t{(*tokens)[i]};
+            if (t.kind != mbun::js_lexer::Token::Identifier || t.raw != "require") continue;
+            const auto next{(*tokens)[i + 1].kind};
+            if (next == mbun::js_lexer::Token::OpenParen) continue;  // a call, not a binding
+            const auto& prev{(*tokens)[i - 1]};
+            const bool declPosition{prev.kind == mbun::js_lexer::Token::OpenParen ||
+                                    prev.kind == mbun::js_lexer::Token::Comma ||
+                                    prev.raw == "let" || prev.raw == "var" || prev.raw == "const"};
+            const bool bindingShape{next == mbun::js_lexer::Token::Comma ||
+                                    next == mbun::js_lexer::Token::CloseParen ||
+                                    next == mbun::js_lexer::Token::Equals};
+            if (declPosition && bindingShape) {
+                requireShadowed = true;
+                break;
+            }
+        }
         for (std::size_t i{0}; i < tokens->size(); ++i) {
             const bool isImport{(*tokens)[i].kind == mbun::js_lexer::Token::Import};
             const bool isExport{(*tokens)[i].kind == mbun::js_lexer::Token::Export};
@@ -958,7 +982,7 @@ private:
             // correctly leave the call alone, so bare require() stays a runtime call
             // (DEFERRED: needs the same external handling as bare `import`).
             bool isRequireCall{false};
-            if (!isImport && !isExport &&
+            if (!isImport && !isExport && !requireShadowed &&
                 (*tokens)[i].kind == mbun::js_lexer::Token::Identifier &&
                 (*tokens)[i].raw == "require" && i + 3 < tokens->size() &&
                 (*tokens)[i + 1].kind == mbun::js_lexer::Token::OpenParen &&
