@@ -3,7 +3,7 @@ version = 2
 
 [package."mbun.openssl"]
 namespace = "mbun"
-version = "3.1.5+mbun.1"
-source  = "index+mbun@3.1.5+mbun.1"
-hash    = "fnv1a:41a939a53c3048ff"
+version = "3.1.5+mbun.3"
+source  = "index+mbun@3.1.5+mbun.3"
+hash    = "fnv1a:fa1c0b1f72cd6568"
 

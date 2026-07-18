@@ -415,7 +415,11 @@ inline std::optional<std::string> construct_registry_url(std::string_view regist
 
 } // namespace detail
 
-inline constexpr std::string_view DEFAULT_REGISTRY{"https://registry.npmjs.org/"};
+// NOT `inline`: an exported inline constexpr variable in a named module gets no
+// emitted definition for cross-TU odr-use under GCC 16 (the test TU's reference
+// to DEFAULT_REGISTRY link-failed). Plain constexpr is module-attached with one
+// definition in this unit — same shape as install.cppm's DEFAULT_REGISTRY_URL.
+constexpr std::string_view DEFAULT_REGISTRY{"https://registry.npmjs.org/"};
 
 struct IdMapValue {
     std::uint32_t old_json_index{0};

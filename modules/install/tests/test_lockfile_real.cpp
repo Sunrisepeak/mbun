@@ -57,7 +57,7 @@ std::optional<std::filesystem::path> find_repo_root() {
     auto probe = [](fs::path p) -> std::optional<fs::path> {
         std::error_code ec;
         for (int i{0}; i < 10; ++i) {
-            if (fs::exists(p / "bun" / "bench" / "postgres" / "bun.lockb", ec)) {
+            if (fs::exists(p / "compat" / "bun" / "bench" / "postgres" / "bun.lockb", ec)) {
                 return p;
             }
             if (!p.has_parent_path() || p.parent_path() == p) {
