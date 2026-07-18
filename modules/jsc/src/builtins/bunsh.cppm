@@ -24,8 +24,9 @@ inline constexpr std::string_view kBunShJS = R"JS(
   if (!SP || !SP.prototype || SP.prototype.__mbunNativeExec) return;
   SP.prototype.__mbunNativeExec = true;
 
-  // Output view over captured native bytes (mirrors the :shell ShellOutput shape).
-  class NativeShellOutput {
+  // Output view over captured native bytes. The class NAME is part of the
+  // Bun-compatible surface: bun reports output.constructor.name === "ShellOutput".
+  class ShellOutput {
     constructor(stdout, stderr, exitCode) {
       this.stdout = stdout;
       this.stderr = stderr;
@@ -63,7 +64,7 @@ inline constexpr std::string_view kBunShJS = R"JS(
     const stdout = Buffer.from(res.stdout || "", "base64");
     const stderr = Buffer.from(res.stderr || "", "base64");
     const exitCode = res.exitCode == null ? 1 : res.exitCode | 0;
-    const output = new NativeShellOutput(stdout, stderr, exitCode);
+    const output = new ShellOutput(stdout, stderr, exitCode);
     if (!this._quiet) {
       if (stdout.byteLength) G.process.stdout.write(stdout);
       if (stderr.byteLength) G.process.stderr.write(stderr);
