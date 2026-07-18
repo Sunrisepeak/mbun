@@ -53,7 +53,19 @@ jobs:
           TOOLCHAIN: ${{ matrix.toolchain }}
 
       - name: Test
-        run: mcpp test --workspace
+        run: |
+          if [ "${TOOLCHAIN%@*}" = "gcc" ]; then
+            mcpp test --workspace
+          else
+            # The prebuilt JavaScriptCore ships libstdc++-ABI symbols (std::span
+            # in WTF headers): a libc++ lane compiles everything but cannot LINK
+            # the JSC-binding test binaries, so modules/jsc tests are gcc-only.
+            SKIP_MEMBERS="modules/jsc" tools/integration/test_members.sh
+          fi
+        env:
+          TOOLCHAIN: ${{ matrix.toolchain }}
 
       - name: Smoke
+        # The root binary links the prebuilt JSC — gcc lane only (same ABI note).
+        if: startsWith(matrix.toolchain, 'gcc')
         run: mcpp run -- --version

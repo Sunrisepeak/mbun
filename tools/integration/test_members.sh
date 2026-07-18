@@ -29,10 +29,20 @@ fi
 [[ -n "$member_list" ]] || fail 'workspace has no parsed members'
 mapfile -t members <<<"$member_list"
 
+# SKIP_MEMBERS: space-separated member paths to skip (recorded as "skip" rows).
+# Used by the CI llvm lane: the prebuilt JavaScriptCore ships libstdc++-ABI
+# symbols (std::span in WTF headers), so a libc++ toolchain can compile but not
+# LINK the JSC-binding test binaries.
+skip_members=" ${SKIP_MEMBERS:-} "
+
 failed=0
 for member in "${members[@]}"; do
     name=${member//\//_}
     log="$log_dir/$name.log"
+    if [[ "$skip_members" == *" $member "* ]]; then
+        printf '%s\tmcpp test\tskip\t0\t-\n' "$member" >>"$result" || fail 'could not write result row'
+        continue
+    fi
     start=$(date +%s)
     if ! : >"$log"; then
         status=fail
