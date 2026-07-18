@@ -112,14 +112,17 @@ public:
             return Follow::Tagged;
         }
         // Ambiguous: `<`, any `>`-run, and unary +/- keep the relational reading.
-        // `=` too: it only appears here as the residual half of a split `>=`
-        // (eat_gt_ peels the `>` to close a candidate list); a lone `=` can never
-        // legally follow real type arguments (you cannot assign to a call/
-        // instantiation), so it must force the relational reading. Without this,
-        // `p<0||p>=l` erases `<0||p>` as bogus type args and drops the `p<0 ||`.
-        if (k == Token::LessThan || is_gt_family_(k) || k == Token::Plus || k == Token::Minus
-            || k == Token::Equals) {
+        if (k == Token::LessThan || is_gt_family_(k) || k == Token::Plus || k == Token::Minus) {
             return Follow::No;
+        }
+        // `=` splits on the SOURCE token shape (bun transpiler.test.js:547/560):
+        //  - the residual half of a split `>=`/`>>=`/`>>>=` (eat_gt_ peeled the
+        //    `>` that closed a candidate list) keeps the relational reading —
+        //    `p<0||p>=l` and `f<x>=g<y>` must not erase bogus type args;
+        //  - a STANDALONE `=` token is an instantiation-expression assignment:
+        //    `f<x> = g<y>;` erases to `f = g;`.
+        if (k == Token::Equals) {
+            return cur_().kind == Token::Equals ? Follow::Instantiation : Follow::No;
         }
         // If the token can begin a new expression, this was a comparison.
         if (can_start_expression_(k)) {

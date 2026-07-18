@@ -597,7 +597,7 @@ void test_imports() {
     xp("import type { Foo } from \"./foo\";", "");
     xp("import { type A, B } from \"./m\";", "import {  B } from \"./m\";");
     // `import X = require(...)` lowers to const
-    xp("import fs = require(\"fs\");", "const fs = require(\"fs\");");
+    xp("import fs = require(\"fs\", undefined, 1);", "const fs = require(\"fs\", undefined, 1);");
     // import attributes / assertions kept verbatim in ESM mode
     xp("import x from \"m\" with { type: \"text\" };",
        "import x from \"m\" with { type: \"text\" };");
@@ -681,29 +681,29 @@ void test_cjs_imports() {
     // not a `const {…}` destructure, so a cyclic import observes the exporter's
     // later `exports.x = …` instead of snapshotting undefined forever.
     xpc("import { test, expect } from \"bun:test\";",
-        "const __mbun_i0 = require(\"bun:test\"); let test = __mbun_i0.test, expect = "
+        "const __mbun_i0 = require(\"bun:test\", undefined, 1); let test = __mbun_i0.test, expect = "
         "__mbun_i0.expect; __mbun_link(__mbun_i0, \"test\", (__mbun_v) => test = __mbun_v); "
         "__mbun_link(__mbun_i0, \"expect\", (__mbun_v) => expect = __mbun_v);");
     xpc("import foo from \"./foo\";",
-        "const __mbun_i0 = require(\"./foo\"); const foo = __mbun_i0 && __mbun_i0.__esModule ? "
+        "const __mbun_i0 = require(\"./foo\", undefined, 1); const foo = __mbun_i0 && __mbun_i0.__esModule && \"default\" in __mbun_i0 ? "
         "__mbun_i0.default : __mbun_i0;");
-    xpc("import * as ns from \"./m\";", "const __mbun_i0 = require(\"./m\"); const ns = __mbun_i0;");
+    xpc("import * as ns from \"./m\";", "const __mbun_i0 = require(\"./m\", undefined, 1); const ns = __mbun_i0;");
     xpc("import def, { a, b as c } from \"./m\";",
-        "const __mbun_i0 = require(\"./m\"); const def = __mbun_i0 && __mbun_i0.__esModule ? "
+        "const __mbun_i0 = require(\"./m\", undefined, 1); const def = __mbun_i0 && __mbun_i0.__esModule && \"default\" in __mbun_i0 ? "
         "__mbun_i0.default : __mbun_i0; let a = __mbun_i0.a, c = __mbun_i0.b; "
         "__mbun_link(__mbun_i0, \"a\", (__mbun_v) => a = __mbun_v); __mbun_link(__mbun_i0, \"b\", (__mbun_v) => c = __mbun_v);");
-    xpc("import \"./side\";", "require(\"./side\");");
+    xpc("import \"./side\";", "require(\"./side\", undefined, 1);");
     // inline type specifier stripped from the CJS lowering
     xpc("import { type T, keep } from \"./m\";",
-        "const __mbun_i0 = require(\"./m\"); let keep = __mbun_i0.keep; "
+        "const __mbun_i0 = require(\"./m\", undefined, 1); let keep = __mbun_i0.keep; "
         "__mbun_link(__mbun_i0, \"keep\", (__mbun_v) => keep = __mbun_v);");
     // type-only import fully erased
     xpc("import type { X } from \"./m\";", "");
     // import.meta lowers to the injected global (script-mode eval has no meta)
-    xpc("const u = import.meta.url;", "const u = globalThis.__mbunImportMeta.url;");
-    xpc("if (import.meta.main) foo();", "if (globalThis.__mbunImportMeta.main) foo();");
+    xpc("const u = import.meta.url;", "const u = __mbunImportMeta.url;");
+    xpc("if (import.meta.main) foo();", "if (__mbunImportMeta.main) foo();");
     // dynamic import() is left as-is (valid in script mode)
-    xpc("const m = import(\"./x\");", "const m = import(\"./x\");");
+    xpc("const m = globalThis.__mbun_dyn_import(require,\"./x\");", "const m = globalThis.__mbun_dyn_import(require,\"./x\");");
     // The import attributes clause is consumed, and the `type` attribute is
     // CARRIED INTO the lowered require() — it selects the loader, so dropping it
     // silently changed what the import evaluates to (`import css from "./ui.css"
@@ -711,26 +711,26 @@ void test_cjs_imports() {
     // '@'"). ref .mbun/bun-ref/src/bundler/options.rs:600-604 — a `type` attribute
     // replaces the extension-derived loader.
     xpc("import x from \"m\" with { type: \"text\" };",
-        "const __mbun_i0 = require(\"m\", { type: \"text\" }); const x = __mbun_i0 && "
-        "__mbun_i0.__esModule ? __mbun_i0.default : __mbun_i0;");
-    xpc("import \"m\" with { type: \"json\" };", "require(\"m\", { type: \"json\" });");
+        "const __mbun_i0 = require(\"m\", { type: \"text\" }, 1); const x = __mbun_i0 && "
+        "__mbun_i0.__esModule && \"default\" in __mbun_i0 ? __mbun_i0.default : __mbun_i0;");
+    xpc("import \"m\" with { type: \"json\" };", "require(\"m\", { type: \"json\" }, 1);");
     // The legacy `assert { … }` spelling carries the attribute the same way (it is
     // what openauth's src/ui/base.tsx uses).
     xpc("import css from \"./ui.css\" assert { type: \"text\" };",
-        "const __mbun_i0 = require(\"./ui.css\", { type: \"text\" }); const css = __mbun_i0 && "
-        "__mbun_i0.__esModule ? __mbun_i0.default : __mbun_i0;");
+        "const __mbun_i0 = require(\"./ui.css\", { type: \"text\" }, 1); const css = __mbun_i0 && "
+        "__mbun_i0.__esModule && \"default\" in __mbun_i0 ? __mbun_i0.default : __mbun_i0;");
     // A non-`type` attribute is inert: consumed, never forwarded.
     xpc("import x from \"m\" with { foo: \"bar\" };",
-        "const __mbun_i0 = require(\"m\"); const x = __mbun_i0 && __mbun_i0.__esModule ? "
+        "const __mbun_i0 = require(\"m\", undefined, 1); const x = __mbun_i0 && __mbun_i0.__esModule && \"default\" in __mbun_i0 ? "
         "__mbun_i0.default : __mbun_i0;");
     // reserved-word specifier name is a valid member/key on both sides
     xpc("import { default as d, fn } from \"./m\";",
-        "const __mbun_i0 = require(\"./m\"); let d = __mbun_i0.default, fn = __mbun_i0.fn; "
+        "const __mbun_i0 = require(\"./m\", undefined, 1); let d = __mbun_i0.default, fn = __mbun_i0.fn; "
         "__mbun_link(__mbun_i0, \"default\", (__mbun_v) => d = __mbun_v); "
         "__mbun_link(__mbun_i0, \"fn\", (__mbun_v) => fn = __mbun_v);");
     // a module-export *string* name can't use dot access on either side
     xpc("import { \"a-b\" as ab } from \"./m\";",
-        "const __mbun_i0 = require(\"./m\"); let ab = __mbun_i0[\"a-b\"]; "
+        "const __mbun_i0 = require(\"./m\", undefined, 1); let ab = __mbun_i0[\"a-b\"]; "
         "__mbun_link(__mbun_i0, \"a-b\", (__mbun_v) => ab = __mbun_v);");
 }
 
@@ -950,16 +950,16 @@ void test_decorators() {
     xpl("class C { @dec method() {} }",
         "class C {  ;method() {} } C = __mbun_ld(C,[()=>[0,\"method\",[(dec)],[]]],()=>[[],[]]);");
     xpl("class C { @dec prop = 1; }",
-        "class C {  ;prop = 1; } C = __mbun_ld(C,[()=>[3,\"prop\",[(dec)],[]]],()=>[[],[]]);");
+        "class C {constructor() { this[\"prop\"] = (1); }   ; } C = __mbun_ld(C,[()=>[3,\"prop\",[(dec)],[]]],()=>[[],[]]);");
     xpl("class C { constructor(@Inject() x) {} }",
         "class C { constructor( x) {} } C = __mbun_ld(C,[],()=>[[],[[0,[(Inject())]]]]);");
     xpl("@a @b class C { @c m(@d p) {} }",
         "  class C {  ;m( p) {} } C = __mbun_ld(C,[()=>[0,\"m\",[(c)],[[0,[(d)]]]]],()=>[[(a),(b)],[]]);");
     // decorator on a computed member key: `[k]` must not be swallowed as indexing
     xpl("class C { @dec [k]: string = \"y\"; }",
-        "class C {  ;[k] = \"y\"; } C = __mbun_ld(C,[()=>[3,(k),[(dec)],[]]],()=>[[],[]]);");
+        "class C {constructor() { this[k] = (\"y\"); }   ; } C = __mbun_ld(C,[()=>[3,(k),[(dec)],[]]],()=>[[],[]]);");
     xpl("class C { @a.b.c [k] = 1; }",
-        "class C {  ;[k] = 1; } C = __mbun_ld(C,[()=>[3,(k),[(a.b.c)],[]]],()=>[[],[]]);");
+        "class C {constructor() { this[k] = (1); }   ; } C = __mbun_ld(C,[()=>[3,(k),[(a.b.c)],[]]],()=>[[],[]]);");
     // parenthesized decorator expression
     xpl("class C { @(deco) m() {} }",
         "class C {  ;m() {} } C = __mbun_ld(C,[()=>[0,\"m\",[((deco))],[]]],()=>[[],[]]);");

@@ -151,7 +151,7 @@ void test_type_argument_erasure() {
     check("f<number>.g", "f.g;\n", SRC);
     check("f<x>, g<y>;", "f, g;\n", SRC);
     check("f<x>g<y>;", "f < x > g;\n", SRC);
-    check("f<x>=g<y>;", "f = g;\n", SRC);
+    check("f<x>=g<y>;", "f < x >= g;\n", SRC);  // fused >= keeps relational (bun :547)
     check("f<x> = g<y>;", "f = g;\n", SRC);
     check("f<x> * g<y>;", "f * g;\n", SRC);
     check("f<x> == g<y>;", "f == g;\n", SRC);
