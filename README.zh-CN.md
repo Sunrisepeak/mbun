@@ -1,4 +1,4 @@
-# mbun | Rewrite Bun in MC++ - Just for Fun
+# mbun | [Rewrite Bun in MC++](https://github.com/Sunrisepeak/mbun/pull/1) - Just for Fun
 
 [English](README.md)
 
