@@ -68,6 +68,45 @@ mcpp run -- --cwd examples/bun/elysia server.ts
 
 打开 <http://127.0.0.1:3000/> 即可看到对应示例页面。
 
+## 贡献与协作 —— AI Agent 开源协作规范(hagent)
+
+mbun 的目标 #3 是探索 AI-agent 驱动的开发与协作。这套模式被成文为 **hagent** ——
+一套 **AI Agent 开源协作规范**(**h**uman + **agent**),位于 [`hagent/`](hagent/zh/README.md)
+并在本仓 dogfood。核心命题:**agent 是执行引擎,构建者(运行 agent 的人)负责创作
+与判断**(架构、决策、品位、规范)。所有操作归属到构建者,任何改动没有可复现证据不算
+「完成」。
+
+### 参与贡献
+
+一切都经你的编码 agent —— 在仓库根目录启动它,它会自动加载 `AGENTS.md` 与相关
+skill,已经知道本仓规范。选一个适合你的层级,开 PR 前务必 review agent 的产出。
+
+1. **报告与讨论** —— 遇到 bug 或有想法?让 agent 按提问 SOP 建 issue / 讨论:软件
+   版本、报错信息、初步分析、相关资料 —— 并去除本地隐私(用户名、token)。
+   → [`issue-reporting`](.agents/skills/issue-reporting/SKILL.md)
+2. **验证与审查** —— 复现已报告的 bug、确认是否真实并补充信息;参与 issue 与 PR 的
+   验证;review 他人的 PR。
+3. **开发** —— 选一个任务开发,issue 先行(bugfix / 优化 / 新功能 —— 新功能需经
+   issue 讨论并在 `.agents/docs/` 落地设计方案)。
+   → [`dev-process`](.agents/skills/dev-process/SKILL.md)、
+   [`tdd-workflow`](.agents/skills/tdd-workflow/SKILL.md)
+
+更多:[hagent 总览](hagent/zh/README.md) · [宪法](hagent/zh/charter.md) ·
+[贡献](hagent/zh/contributing.md) · [agents](hagent/zh/agents.md) ·
+[标签](hagent/zh/labels.md)。
+
+### 项目维护者
+
+信任是一条阶梯 —— 人与 agent 以同一规则获得(宪法
+[§4](hagent/zh/charter.md#4-权限层级))。committer 以上的层级仍在完善。
+
+| 角色 | 权限 | 如何申请 | 持有者 |
+| --- | --- | --- | --- |
+| **Triager 分诊** | 分诊、打标签、验证 issue 与 PR、跑 CI | 合入 ≥ 3 个 PR 后自助 | —— |
+| **Committer 提交者** | 写权限(push / merge) | 模块背景 + 重要贡献;维护者批准 | —— |
+| **模块维护者** | 某模块的审查与决策 | —— | —— |
+| **项目维护者** | 治理、受保护面 | —— | [@sunrisepeak](https://github.com/sunrisepeak) |
+
 ## 兼容性数据
 
 以下是源码快照（2026-07-18）针对 `compat/` 下 submodule 固定的上游测试集的测量结果，由 `tools/integration/` 中的 runner 产出。未支持项不会被伪造成通过，数据也不是 release 保证：

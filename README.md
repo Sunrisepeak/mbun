@@ -69,6 +69,51 @@ mcpp run -- --cwd examples/bun/elysia server.ts
 
 Open <http://127.0.0.1:3000/> to see each demo page.
 
+## Contributing & collaboration — AI Agent open-source spec (hagent)
+
+mbun's goal #3 is to explore AI-agent-driven development and collaboration. That
+model is written up as **hagent** — an AI Agent open-source collaboration spec
+(**h**uman + **agent**) that lives in [`hagent/`](hagent/) and is dogfooded here.
+Its core thesis: **agents are the execution engine; the builder — the human who
+runs them — creates and judges** (architecture, decisions, taste, norms). Every
+action is attributed to a builder, and no change is "done" without reproducible
+evidence.
+
+### Ways to contribute
+
+Everything goes through your coding agent — start it in the repo root and it
+auto-loads `AGENTS.md` and the relevant skills, so it already knows the spec.
+Pick the level that fits you, and always review what the agent produced before
+opening a PR.
+
+1. **Report & discuss** — hit a bug or have an idea? Have your agent file an
+   issue or discussion following the reporting SOP: software versions, error
+   output, initial analysis, and references — with local privacy scrubbed
+   (usernames, tokens). → [`issue-reporting`](.agents/skills/issue-reporting/SKILL.md)
+2. **Verify & review** — reproduce reported bugs and confirm whether they're
+   real, add findings; help verify issues and PRs; review others' PRs.
+3. **Develop** — pick a task and build it, issue-first (bugfix / refactor / new
+   feature — new features need an issue discussion and a design doc under
+   `.agents/docs/`). → [`dev-process`](.agents/skills/dev-process/SKILL.md),
+   [`tdd-workflow`](.agents/skills/tdd-workflow/SKILL.md)
+
+More: [hagent overview](hagent/README.md) · [charter](hagent/charter.md) ·
+[contributing](hagent/contributing.md) · [agents](hagent/agents.md) ·
+[labels](hagent/labels.md).
+
+### Project maintainers
+
+Elevated trust is a ladder — humans and agents earn it by the same rules
+(charter [§4](hagent/charter.md#4-permission-tiers)). Tiers above committer are
+still being defined.
+
+| Role | Permission | How to apply | Holders |
+| --- | --- | --- | --- |
+| **Triager** | Triage, label, verify issues & PRs, run CI | Self-apply after ≥ 3 merged PRs | — |
+| **Committer** | Write (push / merge) | Module background + significant contributions; maintainer approval | — |
+| **Module maintainer** | A module's review & decisions | — | — |
+| **Project maintainer** | Governance, protected surfaces | — | [@sunrisepeak](https://github.com/sunrisepeak) |
+
 ## Compatibility data
 
 Source-snapshot measurements (2026-07-18) against the upstream corpora pinned as submodules under `compat/`, produced by the runners in `tools/integration/`. Unsupported cases are never counted as passes, and these are not release guarantees:
