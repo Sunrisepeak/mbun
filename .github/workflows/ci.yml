@@ -60,7 +60,16 @@ jobs:
             # The prebuilt JavaScriptCore ships libstdc++-ABI symbols (std::span
             # in WTF headers): a libc++ lane compiles everything but cannot LINK
             # the JSC-binding test binaries, so modules/jsc tests are gcc-only.
-            SKIP_MEMBERS="modules/jsc" tools/integration/test_members.sh
+            # test_members.sh is silent by design (per-member logs); surface the
+            # failing members and their log tails when it fails.
+            if ! SKIP_MEMBERS="modules/jsc" tools/integration/test_members.sh; then
+              results="target/integration/member-results.tsv"
+              echo "failed members:"; awk -F'\t' '$3=="fail"{print "  " $1}' "$results"
+              awk -F'\t' '$3=="fail"{print $5}' "$results" | while read -r log; do
+                echo "::group::$log"; tail -60 "$log"; echo "::endgroup::"
+              done
+              exit 1
+            fi
           fi
         env:
           TOOLCHAIN: ${{ matrix.toolchain }}
