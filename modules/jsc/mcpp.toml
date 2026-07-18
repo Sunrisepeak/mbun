@@ -36,6 +36,7 @@ sqlite = { path = "../sqlite" }
 # CAP-WATCH: node:fs.watch rides the inotify backend (runtime/watch.inc).
 watcher = { path = "../watcher" }
 postgres = { path = "../postgres" }
+valkey = { path = "../valkey" }
 # T-CAP-BUILD: Bun.build in-memory bundler bridge (runtime/bun_build.inc).
 bundler = { path = "../bundler" }
 ffi    = { path = "../ffi" }

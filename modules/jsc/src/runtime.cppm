@@ -46,6 +46,8 @@ import mbun.ffi;
 import mbun.sqlite;
 import mbun.watcher;
 import mbun.postgres;
+// Bun.redis RESP codec (runtime/valkey_client.inc __mbunValkeyNative).
+import mbun.valkey;
 import mbun.sourcemap_jsc.internal_source_map;
 // T-LOOP native epoll event loop for Bun.serve (runtime/serve_native.inc).
 import mbun.event_loop;
@@ -117,11 +119,16 @@ namespace {
 // CAP-HTMLREWRITER: Bun's HTMLRewriter over mbun.html_rewriter
 // (__mbunHTMLRewriterNative.transform).
 #include "runtime/html_rewriter.inc"
+// Bun.redis RESP wire codec bridge (__mbunValkeyNative; offline codec only).
+#include "runtime/valkey_client.inc"
 // CAP-WORKER: real cross-thread Worker (second JSC VM per OS thread). Defines
 // the __mbunWorkerNative seam engine.inc install_bindings_ registers; the parent
 // event-loop pump drains it via globalThis.__mbunWorkerDrain.
 #include "runtime/worker.inc"
 // Engine owns binding installation and the child/microtask-aware event-loop pump.
+// The CommonJS require/module-environment JS prelude lives in its own slice
+// (engine.inc's 2000-line budget, enforced by test_runtime_structure).
+#include "runtime/engine_require_js.inc"
 #include "runtime/engine.inc"
 
 }  // namespace

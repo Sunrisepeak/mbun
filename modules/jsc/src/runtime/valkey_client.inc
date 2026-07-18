@@ -169,3 +169,15 @@ JSValueRef vk_decode_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t 
     }
     return out;
 }
+
+// Install the RESP codec bridge. The valkey builtin partition
+// (builtins/valkey_client.cppm) reads globalThis.__mbunValkeyNative and
+// re-exposes it as Bun.__valkeyWire; without this installer the whole
+// Bun.redis surface silently no-ops (the slice existed but was never wired
+// into runtime.cppm — caught by test_runtime_structure's dead-slice check).
+void install_valkey_native(JSContextRef ctx, JSObjectRef global) {
+    JSObjectRef n{JSObjectMake(ctx, nullptr, nullptr)};
+    set_fn(ctx, n, "encode", vk_encode_cb);
+    set_fn(ctx, n, "decode", vk_decode_cb);
+    set_prop(ctx, global, "__mbunValkeyNative", n);
+}
