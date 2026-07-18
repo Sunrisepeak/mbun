@@ -22,6 +22,7 @@ int main() {
     using mbun::cli::Action;
     using mbun::cli::parse;
     using mbun::cli::parse_build;
+    using mbun::cli::parse_test;
 
     // --version / -v → 裸版本号快速路径
     expect(parse({"--version"}).action == Action::Version, "--version → Version");
@@ -85,19 +86,23 @@ int main() {
     }
 
     // `mbun test <file>` → Test（T3.4 S1 解锁：直跑 bun 原生测试文件）
+    // 操作数/flag 现由 parse_test() 二次解析（parse() 只做子命令分发）。
     {
         auto p = parse({"test", "some/file.test.ts"});
         expect(p.action == Action::Test, "test <file> → Test");
-        expect(p.argument == "some/file.test.ts", "test 保留文件路径操作数");
+        auto t = parse_test({"some/file.test.ts"});
+        expect(t.filters.size() == 1 && t.filters[0] == "some/file.test.ts",
+               "test 保留文件路径操作数 (parse_test)");
     }
     {
-        // 跳过 flag，取第一个非 flag 操作数为文件
-        auto p = parse({"test", "--foo", "a.test.ts"});
-        expect(p.action == Action::Test && p.argument == "a.test.ts", "test 跳过 flag 取文件操作数");
+        // 跳过 flag，取非 flag 操作数为过滤器
+        auto t = parse_test({"--bail", "a.test.ts"});
+        expect(t.filters.size() == 1 && t.filters[0] == "a.test.ts", "test 跳过 flag 取文件操作数");
     }
     {
         auto p = parse({"test"});
-        expect(p.action == Action::Test && p.argument.empty(), "test 无文件 → Test 空操作数");
+        auto t = parse_test({});
+        expect(p.action == Action::Test && t.filters.empty(), "test 无文件 → 空过滤器");
     }
 
     // 未知命令 → Unknown + 保留输入
