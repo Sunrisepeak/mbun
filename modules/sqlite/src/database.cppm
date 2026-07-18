@@ -35,8 +35,29 @@ public:
         : filename_{std::move(filename)}, backend_{std::move(backend)} {}
     Database(const Database&) = delete;
     Database& operator=(const Database&) = delete;
-    Database(Database&&) noexcept = default;
-    Database& operator=(Database&&) noexcept = default;
+    // Explicit moves: the moved-from object must become INERT. The destructor
+    // calls close(), and libc++'s small-buffer std::function move leaves the
+    // source callable intact (libstdc++ empties it) — with the defaulted move,
+    // the temporary open() returns through closed the shared connection the
+    // moment it was destroyed (every later op failed SQLITE_MISUSE on clang).
+    Database(Database&& other) noexcept
+        : filename_{std::move(other.filename_)},
+          backend_{std::move(other.backend_)},
+          closed_{other.closed_} {
+        other.backend_ = {};
+        other.closed_ = true;
+    }
+    Database& operator=(Database&& other) noexcept {
+        if (this != &other) {
+            close();
+            filename_ = std::move(other.filename_);
+            backend_ = std::move(other.backend_);
+            closed_ = other.closed_;
+            other.backend_ = {};
+            other.closed_ = true;
+        }
+        return *this;
+    }
     ~Database() { close(); }
 
     const std::string& filename() const noexcept { return filename_; }
