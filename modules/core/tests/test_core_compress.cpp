@@ -173,6 +173,41 @@ void test_errors() {
     check(!compress::gzip_decompress(gcorrupt).has_value(), "gzip crc mismatch rejected");
 }
 
+// A bounded inflate must reject a stream that would grow past `maxOut` instead
+// of allocating it fully — this is the tarball-bomb cap bun applies as
+// max_output_size (extract_tarball.rs). The check lives inside inflate_block,
+// so a single oversized deflate block is caught mid-decode, not after.
+void test_size_cap() {
+    // Repetitive payload → one fixed-Huffman block full of length/distance
+    // copies: exercises the in-block bound (no per-symbol input to exhaust).
+    Bytes big{};
+    for (int i{0}; i < 200000; ++i) big.push_back(static_cast<std::uint8_t>('a' + (i % 5)));
+
+    // Raw DEFLATE has no ISIZE footer, so this can only be stopped by the bound
+    // *inside* inflate_block — the load-bearing case from the issue.
+    Bytes raw{compress::deflate_raw(big, 6)};
+    auto capped{compress::inflate_raw(raw, nullptr, std::size_t{1024})};
+    check(!capped.has_value(), "inflate_raw over cap rejected");
+    check(!capped.has_value() && capped.error() == compress::DECOMPRESS_LIMIT_ERROR,
+          "inflate_raw over cap returns DECOMPRESS_LIMIT_ERROR");
+    auto ok{compress::inflate_raw(raw, nullptr, big.size())};
+    check(ok.has_value() && *ok == big, "inflate_raw within cap succeeds");
+    auto unbounded{compress::inflate_raw(raw)};
+    check(unbounded.has_value() && *unbounded == big, "inflate_raw unbounded unaffected");
+
+    // gzip carries an ISIZE footer: an over-cap payload is rejected up front
+    // with zero inflate work, while an under-cap one decodes normally.
+    Bytes gz{compress::gzip_compress(big, 6)};
+    auto gzCapped{compress::gzip_decompress(gz, std::size_t{1024})};
+    check(!gzCapped.has_value() && gzCapped.error() == compress::DECOMPRESS_LIMIT_ERROR,
+          "gzip_decompress over cap rejected via ISIZE");
+    auto gzOk{compress::gzip_decompress(gz, big.size())};
+    check(gzOk.has_value() && *gzOk == big, "gzip_decompress within cap succeeds");
+    // A cap exactly at the payload size must still pass (boundary is inclusive).
+    auto gzExact{compress::gzip_decompress(compress::gzip_compress(ascii("hello"), 6), std::size_t{5})};
+    check(gzExact.has_value() && *gzExact == ascii("hello"), "gzip_decompress exact-fit cap succeeds");
+}
+
 }  // namespace
 
 int main() {
@@ -181,6 +216,7 @@ int main() {
     test_container_bytes();
     test_python_fixtures();
     test_errors();
+    test_size_cap();
     std::println("test_core_compress: {} checks, {} failures", gChecks, gFailures);
     return gFailures == 0 ? 0 : 1;
 }

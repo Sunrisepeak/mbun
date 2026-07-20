@@ -44,9 +44,16 @@ export enum class TarError {
     BadOctalField,    // a numeric field held a non-octal byte
     NameTooLong,      // a GNU long-name record exceeded a sane cap
     GzipError,        // gzip (.tgz) input failed to inflate (corrupt/truncated)
+    GzipTooLarge,     // gzip inflated past MAX_DECOMPRESSED_TARBALL_SIZE (bomb guard)
     PathEscape,       // an entry path escaped the destination root
     IoError,          // filesystem write failed (extract_tar_to_dir only)
 };
+
+// A downloaded registry tarball's gzip stream is fully attacker-controlled, so
+// its inflated size is capped. ref: bun MAX_DECOMPRESSED_TARBALL_SIZE = 2 GiB
+// (extract_tarball.rs:26), applied as zlib_entry.max_output_size (:343).
+export inline constexpr std::size_t MAX_DECOMPRESSED_TARBALL_SIZE{
+    std::size_t{2} * 1024 * 1024 * 1024};
 
 // ── entry model ─────────────────────────────────────────────────────────────
 
@@ -522,8 +529,12 @@ extract_tgz_to_dir(std::span<const std::byte> bytes,
                    const ExtractOptions& opts = {}) {
     if (looks_like_gzip(bytes)) {
         auto inflated{mbun::core::compress::gzip_decompress(
-            {reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size()})};
+            {reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size()},
+            MAX_DECOMPRESSED_TARBALL_SIZE)};
         if (!inflated) {
+            if (inflated.error() == mbun::core::compress::DECOMPRESS_LIMIT_ERROR) {
+                return std::unexpected(TarError::GzipTooLarge);
+            }
             return std::unexpected(TarError::GzipError);
         }
         return extract_tar_to_dir(

@@ -371,6 +371,7 @@ inline std::string_view tar_error_name(TarError e) {
         case TarError::BadOctalField: return "bad tar numeric field";
         case TarError::NameTooLong: return "tar entry name too long";
         case TarError::GzipError: return "gzip inflate failed";
+        case TarError::GzipTooLarge: return "decompressed size exceeds maximum allowed";
         case TarError::PathEscape: return "tar entry escapes destination";
         case TarError::IoError: return "filesystem write failed";
     }
@@ -1014,6 +1015,16 @@ private:
             {reinterpret_cast<const std::byte*>(bytes.data()), bytes.size()}, staging)};
         if (!extracted) {
             std::filesystem::remove_all(staging, ec);
+            // A gzip bomb gets bun's per-package wording so the failure reads as
+            // a decompression limit, not a generic extract error.
+            // ref: extract_tarball.rs:349 `{err} decompressing "{name}" to "{path}"`.
+            if (extracted.error() == TarError::GzipTooLarge) {
+                return detail::fail(
+                    ErrorCode::ExtractFailed,
+                    std::format("{} decompressing \"{}\" to \"{}\"",
+                                detail::tar_error_name(extracted.error()), installName,
+                                destination.string()));
+            }
             return detail::fail(ErrorCode::ExtractFailed,
                                 std::format("failed to extract tarball for '{}': {}",
                                             installName,

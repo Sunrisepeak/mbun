@@ -160,15 +160,36 @@ inline constexpr std::string_view kZlibStreamJS = R"JS(
   // Feed `bytes` through the native handle with the given flush mode. Pushes any
   // produced output, tracks consumed bytes and end-of-stream. Returns an Error
   // (to hand to a stream callback → 'error' event) or null.
-  proto._zRun = function (bytes, flushMode) {
-    if (this._zEnded || this._zErrored || this._h < 0) return null;
+  // Feed the native codec in bounded slices. The JS↔native bridge marshals
+  // payloads as base64, so passing a whole multi-MB write through in one call
+  // builds a huge transient string (and mbun's base64 encoder is memory-heavy);
+  // a 2 GiB streamed write would OOM the process. The native codec is stateful
+  // and format-agnostic to write boundaries under Z_NO_FLUSH, so slicing is
+  // semantically identical while keeping memory constant — real streaming.
+  const Z_SLICE = 1 << 20;  // 1 MiB in → ~1.4 MiB base64, bounded
+  proto._zStep = function (piece, flushMode) {
     let res;
-    try { res = ZN.streamProcess(this._h, bytes && bytes.length ? b64(bytes) : EMPTY, flushMode); }
+    try { res = ZN.streamProcess(this._h, piece && piece.length ? b64(piece) : EMPTY, flushMode); }
     catch (e) { return this._zMakeErr(String(e && e.message || e)); }
     if (!res || !res.ok) return this._zMakeErr((res && res.message) || "zlib stream error");
     this._bytesWritten += res.consumed | 0;
     if (res.b64) this._pushChunked(Buffer.from(res.b64, "base64"));
     if (res.streamEnd) { this._zEnded = true; this.push(null); }
+    return null;
+  };
+
+  proto._zRun = function (bytes, flushMode) {
+    if (this._zEnded || this._zErrored || this._h < 0) return null;
+    const total = bytes ? bytes.length : 0;
+    if (total <= Z_SLICE) return this._zStep(bytes, flushMode);
+    for (let off = 0; off < total; off += Z_SLICE) {
+      const end = Math.min(off + Z_SLICE, total);
+      // The requested flush mode applies only to the final slice; the rest feed
+      // through with Z_NO_FLUSH so no premature flush/finish is emitted.
+      const err = this._zStep(bytes.subarray(off, end), end >= total ? flushMode : F_NONE);
+      if (err) return err;
+      if (this._zEnded) break;  // decoder hit end-of-stream: ignore any trailing bytes
+    }
     return null;
   };
 
