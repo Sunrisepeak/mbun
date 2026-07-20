@@ -299,6 +299,21 @@ struct BuildFlags {
     // `transform_only` path, which prints one output per entry point.
     bool noBundle { false };
 
+    // ── `--compile`: a single-file executable ────────────────────────────────
+    // ref: Arguments.rs :506 (--compile), :513 (--compile-exec-argv) and
+    // build_command.rs, which links the bundle into a copy of the bun binary.
+    bool compile { false };
+    // `--compile-exec-argv="--smol --title=x"`: one space-separated string that
+    // becomes the compiled program's process.execArgv.
+    std::vector<std::string> compileExecArgv {};
+    // `--compile-autoload-*` / `--no-compile-autoload-*`: whether the compiled
+    // program still auto-loads .env / bunfig.toml / tsconfig.json / package.json
+    // from its working directory. All default on, matching bun.
+    bool compileAutoloadDotenv { true };
+    bool compileAutoloadBunfig { true };
+    bool compileAutoloadTsconfig { true };
+    bool compileAutoloadPackageJson { true };
+
     bool help { false };
 
     // Recognised-but-unimplemented flags, in command-line order (e.g. "--minify-syntax").
@@ -350,7 +365,7 @@ inline constexpr std::array BUILD_PAIR_FLAGS {
 // Boolean build flags mbun recognises but whose behaviour the bundler slice does
 // not implement yet. Passing any of these is an error (see main.cpp run_build).
 inline constexpr std::array BUILD_UNSUPPORTED_BOOL_FLAGS {
-    std::string_view { "--compile" },      std::string_view { "--bytecode" },
+    std::string_view { "--bytecode" },
     std::string_view { "--minify" },       std::string_view { "--minify-syntax" },
     std::string_view { "--minify-whitespace" },
     std::string_view { "--minify-identifiers" },
@@ -375,14 +390,6 @@ inline constexpr std::array BUILD_IGNORED_BOOL_FLAGS {
     std::string_view { "--no-clear-screen" },
     std::string_view { "--dump-environment-variables" },
     std::string_view { "--windows-hide-console" },
-    std::string_view { "--compile-autoload-dotenv" },
-    std::string_view { "--no-compile-autoload-dotenv" },
-    std::string_view { "--compile-autoload-bunfig" },
-    std::string_view { "--no-compile-autoload-bunfig" },
-    std::string_view { "--compile-autoload-tsconfig" },
-    std::string_view { "--no-compile-autoload-tsconfig" },
-    std::string_view { "--compile-autoload-package-json" },
-    std::string_view { "--no-compile-autoload-package-json" },
 };
 
 } // namespace detail
@@ -445,6 +452,29 @@ BuildFlags parse_build(std::span<const std::string_view> args) {
         }
         if (name == "--no-bundle") {
             out.noBundle = true;
+            continue;
+        }
+
+        // `--compile` and the four `--[no-]compile-autoload-*` switches. bun keeps
+        // the autoload switches independent of --compile (they are simply inert
+        // without it), so they are parsed the same way here.
+        // ref: Arguments.rs :506 / :519-527.
+        if (name == "--compile") {
+            out.compile = true;
+            continue;
+        }
+        if (name.starts_with("--compile-autoload-") || name.starts_with("--no-compile-autoload-")) {
+            const bool enable { !name.starts_with("--no-") };
+            const std::string_view what { name.substr(enable ? std::string_view { "--compile-autoload-" }.size()
+                                                            : std::string_view { "--no-compile-autoload-" }.size()) };
+            if (what == "dotenv") out.compileAutoloadDotenv = enable;
+            else if (what == "bunfig") out.compileAutoloadBunfig = enable;
+            else if (what == "tsconfig") out.compileAutoloadTsconfig = enable;
+            else if (what == "package-json") out.compileAutoloadPackageJson = enable;
+            else {
+                out.parseError = std::format("unrecognised flag \"{}\"", name);
+                return out;
+            }
             continue;
         }
 
@@ -572,6 +602,14 @@ BuildFlags parse_build(std::span<const std::string_view> args) {
                 out.external.emplace_back(value);
             } else if (name == "--conditions") {
                 out.conditions.emplace_back(value);
+            } else if (name == "--compile-exec-argv") {
+                // One space-separated string, exactly as bun stores it before
+                // splitting it into the compiled program's execArgv.
+                // ref: Arguments.rs :513 and build_command.rs (compile_exec_argv).
+                for (const auto part : std::views::split(value, ' ')) {
+                    const std::string_view token { part.begin(), part.end() };
+                    if (!token.empty()) out.compileExecArgv.emplace_back(token);
+                }
             } else {
                 // Recognised value flag whose behaviour is not implemented
                 // (--packages / --*-naming / --env / --compile-* / --windows-*).

@@ -18,6 +18,7 @@ export import mbun.bundler.chunk;
 export import mbun.bundler.output_file;
 export import mbun.bundler.bundle;
 export import mbun.bundler.standalone_graph;
+export import mbun.bundler.standalone_exe;
 export import mbun.bundler.bundler_jsc;
 export import mbun.bundler.ast_jsc;
 export import mbun.bundler.ascii_only;

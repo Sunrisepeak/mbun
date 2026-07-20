@@ -529,6 +529,105 @@ inline std::optional<std::string> bun_build_write_outdir(std::string_view outdir
     return out.string();
 }
 
+// ── Bun.build({ compile }) — the single-file executable ──────────────────────
+// The container itself is mbun.bundler.standalone_exe; this is the JSC-side
+// bridge, mirroring `bun build --compile` in src/app.cppm.
+// ref: bun-ref/src/runtime/api/JSBundler.rs (the `compile` config) →
+// StandaloneModuleGraph.inject().
+
+// `compile` as bun's config accepts it. `requested` false means the option was
+// absent, which is the ordinary chunk-emitting build.
+struct BunBuildCompileConfig {
+    bool requested{false};
+    std::string outfile;
+    std::vector<std::string> execArgv;
+    bool autoloadDotenv{true};
+    // The `target` string ("bun-linux-x64"): only validated, since mbun copies the
+    // running image and therefore always produces a host-native executable.
+    std::string target;
+};
+
+// The running mbun image, which `compile` copies. Read straight from
+// /proc/self/exe rather than argv[0]: argv[0] is whatever the parent chose and
+// need not be a path at all. (The CLI path uses mbun::platform, which this module
+// cannot import — jsc sits below the executable in the workspace graph.)
+inline std::optional<std::string> bun_build_self_image() {
+    std::error_code ec;
+    const std::filesystem::path self{std::filesystem::read_symlink("/proc/self/exe", ec)};
+    if (ec || self.empty()) {
+        return std::nullopt;
+    }
+    std::ifstream image{self, std::ios::binary};
+    if (!image) {
+        return std::nullopt;
+    }
+    std::ostringstream bytes;
+    bytes << image.rdbuf();
+    return bytes.str();
+}
+
+// Write the compiled executable for `code`, honouring `outdir` when the requested
+// outfile is relative. Returns the path written, or nullopt on failure.
+inline std::optional<std::string> bun_build_write_executable(
+    const BunBuildCompileConfig& compile, std::string_view outdir, std::string_view entryPath,
+    std::string_view code) {
+    const std::optional<std::string> image{bun_build_self_image()};
+    if (!image) {
+        return std::nullopt;
+    }
+    mbun::bundler::standalone_exe::Program program;
+    program.code = std::string{code};
+    program.entryName = std::filesystem::path{entryPath}.filename().string();
+    program.execArgv = compile.execArgv;
+    program.autoloadDotenv = compile.autoloadDotenv;
+
+    std::filesystem::path out{compile.outfile.empty()
+                                  ? std::filesystem::path{entryPath}.filename().replace_extension()
+                                  : std::filesystem::path{compile.outfile}};
+    // A relative outfile lands under outdir when one was given, else under the
+    // cwd — the same placement rule the chunk path uses.
+    if (!out.is_absolute()) {
+        std::error_code cwdEc;
+        const std::filesystem::path base{
+            outdir.empty() ? std::filesystem::current_path(cwdEc) : std::filesystem::path{outdir}};
+        out = base / out;
+    }
+    out = out.lexically_normal();
+
+    std::error_code ec;
+    if (const std::filesystem::path parent{out.parent_path()}; !parent.empty()) {
+        std::filesystem::create_directories(parent, ec);
+        if (ec) {
+            return std::nullopt;
+        }
+    }
+    const std::string packed{mbun::bundler::standalone_exe::pack(*image, program)};
+    {
+        // Unlink first: overwriting the image of a process that is still running
+        // fails with ETXTBSY, while recreating the file always works.
+        std::filesystem::remove(out, ec);
+        std::ofstream file{out, std::ios::binary | std::ios::trunc};
+        if (!file) {
+            return std::nullopt;
+        }
+        file.write(packed.data(), static_cast<std::streamsize>(packed.size()));
+        if (!file) {
+            return std::nullopt;
+        }
+    }
+    std::filesystem::permissions(out,
+                                 std::filesystem::perms::owner_all
+                                     | std::filesystem::perms::group_read
+                                     | std::filesystem::perms::group_exec
+                                     | std::filesystem::perms::others_read
+                                     | std::filesystem::perms::others_exec,
+                                 std::filesystem::perm_options::replace, ec);
+    if (ec) {
+        return std::nullopt;
+    }
+    return out.string();
+}
+
 // BuildArtifact.text(): returns the bundled code stashed as `__code`. The bundle
 // slice is synchronous, so a plain string (await-compatible) is returned rather
 // than a Promise.
@@ -745,8 +844,47 @@ inline JSValueRef bun_build_run(JSContextRef ctx, JSValueRef configVal) {
     // `define` / `env` compile-time substitutions; empty = the source reaches the
     // parser unchanged (the pre-existing behaviour).
     mbun::bundler::DefineTable defines{};
+    // `compile`: true | "<target>" | { outfile, target, execArgv, autoload* }.
+    BunBuildCompileConfig compile{};
     JSValueRef pluginsVal{nullptr};
     if (configObj != nullptr) {
+        if (JSValueRef compileVal{get_prop(ctx, configObj, "compile")};
+            compileVal != nullptr && !JSValueIsUndefined(ctx, compileVal)
+            && !JSValueIsNull(ctx, compileVal)) {
+            if (JSValueIsString(ctx, compileVal)) {
+                compile.requested = true;
+                compile.target = val_to_string(ctx, compileVal);
+            } else if (JSValueIsObject(ctx, compileVal)) {
+                compile.requested = true;
+                JSObjectRef compileObj{JSValueToObject(ctx, compileVal, nullptr)};
+                if (JSValueRef v{get_prop(ctx, compileObj, "outfile")};
+                    v != nullptr && JSValueIsString(ctx, v)) {
+                    compile.outfile = val_to_string(ctx, v);
+                }
+                if (JSValueRef v{get_prop(ctx, compileObj, "target")};
+                    v != nullptr && JSValueIsString(ctx, v)) {
+                    compile.target = val_to_string(ctx, v);
+                }
+                if (JSValueRef v{get_prop(ctx, compileObj, "execArgv")};
+                    v != nullptr && JSValueIsArray(ctx, v)) {
+                    JSObjectRef arr{JSValueToObject(ctx, v, nullptr)};
+                    const double n{JSValueToNumber(ctx, get_prop(ctx, arr, "length"), nullptr)};
+                    for (std::size_t i{0}; i < static_cast<std::size_t>(std::max(0.0, n)); ++i) {
+                        JSValueRef item{JSObjectGetPropertyAtIndex(ctx, arr,
+                                                                   static_cast<unsigned>(i), nullptr)};
+                        if (item != nullptr && JSValueIsString(ctx, item)) {
+                            compile.execArgv.push_back(val_to_string(ctx, item));
+                        }
+                    }
+                }
+                if (JSValueRef v{get_prop(ctx, compileObj, "autoloadDotenv")};
+                    v != nullptr && JSValueIsBoolean(ctx, v)) {
+                    compile.autoloadDotenv = JSValueToBoolean(ctx, v);
+                }
+            } else {
+                compile.requested = JSValueToBoolean(ctx, compileVal);
+            }
+        }
         pluginsVal = get_prop(ctx, configObj, "plugins");
         if (JSValueRef targetVal{get_prop(ctx, configObj, "target")};
             targetVal != nullptr && JSValueIsString(ctx, targetVal)) {
@@ -977,8 +1115,16 @@ inline JSValueRef bun_build_run(JSContextRef ctx, JSValueRef configVal) {
             bun_build_apply_banner_footer(built->code, banner, footer);
         }
         path = built->entryPaths.empty() ? std::string{} : built->entryPaths.front();
-        // With an outdir the artifact path is the file actually written to disk.
-        if (!outdir.empty() && built->entryPaths.size() == 1) {
+        // `compile` replaces the chunk output entirely: the bundle becomes the
+        // payload of a single-file executable and the artifact path names it.
+        if (compile.requested) {
+            if (auto written{bun_build_write_executable(compile, outdir, path, built->code)}) {
+                path = std::move(*written);
+            } else {
+                writeError = "failed to write the compiled executable";
+            }
+        } else if (!outdir.empty() && built->entryPaths.size() == 1) {
+            // With an outdir the artifact path is the file actually written to disk.
             // The output file is named after the entry as the CALLER wrote it, not
             // after what it resolved to: an onResolve plugin may rewrite the entry
             // record (`virtual-entry.ts` -> `actual-entry.ts`) and bun still emits

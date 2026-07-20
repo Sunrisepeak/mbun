@@ -1039,6 +1039,10 @@ public:
         g##CLS##Class = JSClassCreate(&d);                                          \
         JSObjectRef c{JSObjectMakeConstructor(ctx_, g##CLS##Class, CLS##_construct_cb)}; \
         set_native_fn(ctx_, c, "hash", 2, CLS##_static_hash_host);                  \
+        /* JSObjectMakeConstructor leaves `name` unset; bun's class-based ctors   \
+           carry it, and the corpus builds its expected "<name> hasher already    \
+           digested" messages out of `Class.name`. */                             \
+        set_prop(ctx_, c, "name", make_string(ctx_, #CLS));                        \
         set_prop(ctx_, bun, #CLS, c);                                               \
     } while (0)
         MBUN_REG_SHA(SHA1);
@@ -1048,6 +1052,7 @@ public:
         MBUN_REG_SHA(SHA512);
         MBUN_REG_SHA(SHA512_256);
         MBUN_REG_SHA(MD5);
+        MBUN_REG_SHA(MD4);
 #undef MBUN_REG_SHA
 
         set_fn(ctx_, bun, "which", bun_which_cb);
@@ -1170,6 +1175,19 @@ public:
         JSValueRef argvArr{build_argv_()};
         JSObjectRef process{JSObjectMake(ctx_, nullptr, nullptr)};
         set_prop(ctx_, process, "argv", argvArr);
+        // execArgv is installed here rather than defaulted in JS so a compiled
+        // executable's baked `--compile-exec-argv` flags survive; the JS layer
+        // (node_process_extra) only fills in an empty array when it is missing.
+        set_prop(ctx_, process, "execArgv", build_string_array_(gExecArgv));
+        // `--title=<name>` among the runtime's own flags renames the process.
+        // ref: bun src/cli/Arguments.rs (--title) — the JS layer below only
+        // defaults this when nothing set it.
+        for (const std::string& flag : gExecArgv) {
+            if (flag.starts_with("--title=")) {
+                set_prop(ctx_, process, "title",
+                         make_string(ctx_, flag.substr(std::string_view{"--title="}.size())));
+            }
+        }
         const std::string exe{exe_path()};
         set_prop(ctx_, process, "argv0", make_string(ctx_, exe));
         set_prop(ctx_, process, "execPath", make_string(ctx_, exe));
@@ -1221,7 +1239,10 @@ public:
   // process.revision === Bun.revision; verified against bun 1.3.14). Derived from
   // Bun.revision so the two can never drift.
   p.revision = (globalThis.Bun && Bun.revision) || "";
-  p.pid = 1; p.ppid = 0; p.exitCode = 0; p.title = "bun";
+  // `title` is installed natively above so a `--title=<name>` runtime flag (which
+  // a `--compile`d executable can carry in its baked execArgv) survives; the ??=
+  // keeps "bun" as the default for every ordinary run.
+  p.pid = 1; p.ppid = 0; p.exitCode = 0; p.title ??= "bun";
   p.nextTick = function (fn) { const a = Array.prototype.slice.call(arguments, 1); queueMicrotask(function () { fn.apply(null, a); }); };
   const nanos = () => (globalThis.Bun && Bun.nanoseconds ? Bun.nanoseconds() : 0);
   p.hrtime = function (prev) {
@@ -1649,12 +1670,14 @@ public:
         }
     }
 
-    JSValueRef build_argv_() {
+    JSValueRef build_string_array_(const std::vector<std::string>& values) {
         std::vector<JSValueRef> items;
-        items.reserve(gArgv.size());
-        for (const auto& a : gArgv) items.push_back(make_string(ctx_, a));
+        items.reserve(values.size());
+        for (const auto& v : values) items.push_back(make_string(ctx_, v));
         return JSObjectMakeArray(ctx_, items.size(), items.empty() ? nullptr : items.data(), nullptr);
     }
+
+    JSValueRef build_argv_() { return build_string_array_(gArgv); }
 };
 
 // arg `i` as a bool (absent → false). Used for the trailing `esm` flag that marks

@@ -222,6 +222,13 @@ const std::chrono::steady_clock::time_point gStart{std::chrono::steady_clock::no
 // Process argv exposed to scripts as process.argv / Bun.argv.
 std::vector<std::string> gArgv{};
 
+// process.execArgv — the runtime's own flags, which are NEVER part of argv.
+// Empty for an ordinary `mbun run`; a `bun build --compile --compile-exec-argv=…`
+// executable carries the flags that were baked into it.
+// ref: bun src/runtime/node/node_process.rs (execArgv) and
+// test/bundler/compile-argv.test.ts "CompileExecArgvNoLeak".
+std::vector<std::string> gExecArgv{};
+
 // `--no-env-file` / bunfig env=false: suppress default .env auto-loading.
 bool gDisableEnvFiles{false};
 

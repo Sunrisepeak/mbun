@@ -417,6 +417,35 @@ std::string_view loader_for_ext(std::string_view path) {
     return {};
 }
 
+// A specifier the runtime, not the bundler, resolves. bun never puts a node/bun
+// builtin in the module graph: it stays a `require()`/`import` the host answers,
+// which is why `builtinModules` exists in the first place (an `external` list is
+// documented as excluding them because they already are).
+// ref: bun-ref/src/resolver/resolver.rs (the builtin short-circuit before any
+// filesystem lookup) and modules/jsc/src/builtins/node_module.cppm, which owns
+// the same name list on the JS side.
+bool is_runtime_builtin(std::string_view specifier) {
+    // Every `node:`/`bun:` prefixed name is a builtin by construction — the
+    // prefixes exist precisely so a specifier can never be a file.
+    if (specifier.starts_with("node:") || specifier.starts_with("bun:")) {
+        return true;
+    }
+    static constexpr std::string_view kBuiltins[]{
+        "_http_agent", "_http_client", "_http_common", "_http_incoming", "_http_outgoing",
+        "_http_server", "_stream_duplex", "_stream_passthrough", "_stream_readable",
+        "_stream_transform", "_stream_wrap", "_stream_writable", "_tls_common", "_tls_wrap",
+        "assert", "assert/strict", "async_hooks", "buffer", "bun", "child_process", "cluster",
+        "console", "constants", "crypto", "dgram", "diagnostics_channel", "dns", "dns/promises",
+        "domain", "events", "fs", "fs/promises", "http", "http2", "https", "inspector",
+        "inspector/promises", "module", "net", "os", "path", "path/posix", "path/win32",
+        "perf_hooks", "process", "punycode", "querystring", "readline", "readline/promises",
+        "repl", "stream", "stream/consumers", "stream/promises", "stream/web", "string_decoder",
+        "sys", "timers", "timers/promises", "tls", "trace_events", "tty", "url", "util",
+        "util/types", "v8", "vm", "wasi", "worker_threads", "zlib",
+    };
+    return std::ranges::contains(kBuiltins, specifier);
+}
+
 // A JS IdentifierName usable as a named export. ASCII-only: a non-ASCII key is
 // valid JS but rare in config/JSON and only costs its (still-present) default
 // export, so it is conservatively rejected here. `default` is excluded because it
@@ -1140,6 +1169,14 @@ private:
             if (!specifier) {
                 return std::unexpected(BuildError{module.path, specifier.error(), specToken->start});
             }
+            // A node/bun builtin is not a graph node: it stays a specifier the
+            // host answers at run time (the emitted chunk's require() falls
+            // through to the runtime for anything not in __mbun_deps). Recording
+            // an edge here would instead fail the whole build on
+            // `cannot find package 'node:fs'`.
+            if (is_runtime_builtin(*specifier)) {
+                continue;
+            }
             if (seen.emplace(*specifier).second) {
                 unresolved.emplace_back(std::move(*specifier),
                                         isRequireCall ? "require-call"
@@ -1368,11 +1405,21 @@ private:
             "Object.defineProperty(ns,name,{configurable:true,enumerable:en,get,set:set_});"
             "set(cur);};");
         put(nl);
+        // A specifier with no graph edge is EXTERNAL — a node/bun builtin, or a
+        // bare package the build deliberately left alone — so it is handed back to
+        // the host runtime instead of failing. That is what makes a bundle that
+        // does `require("path")` or `import "node:fs"` actually run; throwing here
+        // was the old behaviour and it broke every bundle touching a builtin.
+        // ref: bun leaves externals as a runtime require in the emitted chunk
+        // (src/bundler/linker.rs, the ImportRecord::External arm).
+        put("const __mbun_external=(typeof require===\"function\"?require:"
+            "(s)=>{throw new Error(`Cannot find module ${s}`);});");
+        put(nl);
         put("const __mbun_cache={};const __mbun_require=id=>{let m=__mbun_cache[id];"
             "if(m)return m.exports;m=__mbun_cache[id]={exports:{}};const e=m.exports;"
             "Object.defineProperty(e,\"__mbun_pending\",{value:true,configurable:true});"
             "const require=specifier=>{const target=__mbun_deps[id][specifier];"
-            "if(target===void 0)throw new Error(`Cannot find module ${specifier}`);"
+            "if(target===void 0)return __mbun_external(specifier);"
             "return __mbun_require(target);};"
             "__mbun_modules[id](m,m.exports,require);delete e.__mbun_pending;return m.exports;};");
         put(nl);

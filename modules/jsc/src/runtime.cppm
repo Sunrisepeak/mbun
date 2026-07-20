@@ -31,6 +31,8 @@ import mbun.bundler.defines;
 // Target / target_is_bun + the JSC-facing `target` string decode: `target: "bun"`
 // drives the ASCII-only output pass.
 import mbun.bundler.options;
+// Bun.build({ compile }) — the single-file executable container (bun_build.inc).
+import mbun.bundler.standalone_exe;
 import mbun.bundler.bundler_jsc;
 import mbun.resolver;
 import mbun.jsc.module_loader;
