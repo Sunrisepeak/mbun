@@ -65,7 +65,19 @@ inline constexpr std::string_view kWebHeadersJS = R"JS(
     };
     // Strip leading/trailing HTTP whitespace, then require ISO-8859-1 without
     // NUL/CR/LF.
-    const normalizeValue = (value) => ("" + value).replace(/^[\t\n\r ]+|[\t\n\r ]+$/g, "");
+    // Hand-rolled rather than /^[\t\n\r ]+|[\t\n\r ]+$/g: the trailing-run
+    // alternative has no anchor JSC can use, so it retries at every index and
+    // the trim goes quadratic. The undici corpus feeds a 500k-tab value
+    // ("headers that might cause a ReDoS") that took ~60s through the regex.
+    const isHttpWs = (c) => c === 9 || c === 10 || c === 13 || c === 32;
+    const normalizeValue = (value) => {
+      const s = "" + value;
+      let a = 0;
+      let b = s.length;
+      while (a < b && isHttpWs(s.charCodeAt(a))) a++;
+      while (b > a && isHttpWs(s.charCodeAt(b - 1))) b--;
+      return a === 0 && b === s.length ? s : s.slice(a, b);
+    };
     const validateValue = (value, givenName) => {
       for (let i = 0; i < value.length; i++) {
         const c = value.charCodeAt(i);
