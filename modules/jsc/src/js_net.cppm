@@ -157,6 +157,23 @@ export constexpr std::string_view kNetJS = R"JS(
       return this;
     }
     connect(...a) {
+      // ---- node net.js argument validation (Socket.prototype.connect) ----
+      const nErr = (Ctor, code, msg) => { const e = new Ctor(msg); e.code = code; return e; };
+      const optArg = (typeof a[0] === "object" && a[0] !== null && !Array.isArray(a[0])) ? a[0] : null;
+      if (optArg) {
+        if (optArg.objectMode)
+          throw nErr(TypeError, "ERR_INVALID_ARG_VALUE", "The property 'options.objectMode' is not supported. Received " + (typeof optArg.objectMode === "string" ? "'" + optArg.objectMode + "'" : String(optArg.objectMode)));
+        if (optArg.readableObjectMode || optArg.writableObjectMode) {
+          const k = optArg.readableObjectMode ? "readableObjectMode" : "writableObjectMode";
+          throw nErr(TypeError, "ERR_INVALID_ARG_VALUE", "The property 'options." + k + "' is not supported. Received " + (typeof optArg[k] === "string" ? "'" + optArg[k] + "'" : String(optArg[k])));
+        }
+        if (optArg.host !== undefined && typeof optArg.host !== "string")
+          throw nErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "options.host" argument must be of type string. Received ' + (optArg.host === null ? "null" : Array.isArray(optArg.host) ? "an instance of Array" : "type " + typeof optArg.host));
+        if (optArg.path == null && optArg.port === undefined && optArg.fd === undefined)
+          throw nErr(TypeError, "ERR_MISSING_ARGS", 'The "options" or "port" or "path" argument must be specified');
+      } else if (a.length === 0 || a[0] === undefined || a[0] === null) {
+        throw nErr(TypeError, "ERR_MISSING_ARGS", 'The "options" or "port" or "path" argument must be specified');
+      }
       let port = 0, host = "localhost", cb = null, unixPath = null;
       if (typeof a[0] === "object" && a[0] !== null) { unixPath = a[0].path ? String(a[0].path) : null; port = a[0].port | 0; host = a[0].host || "localhost"; cb = typeof a[1] === "function" ? a[1] : null; }
       else { port = +a[0] | 0; if (typeof a[1] === "string") { host = a[1]; cb = typeof a[2] === "function" ? a[2] : null; } else if (typeof a[1] === "function") cb = a[1]; }
