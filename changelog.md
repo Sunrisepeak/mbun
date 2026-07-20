@@ -5,6 +5,12 @@
 
 ## 2026-07-20
 
+- **收官测量(同机安静轮,最终二进制):Bun 语料 668 → 850 / 1902 全绿(35.1% → 44.7%,测试级 26,648 → 30,790 通过 / 51,366 执行);Node `test/parallel` 1,527 → 1,774 / 4433 通过(34.4% → 40.0%)**。Bun 侧 +182 里有 +65 来自测量环境修复(语料 npm 依赖从未安装,264 个文件在求值阶段就死),其余 +117 是代码;Node 侧 +247 全部是代码。口径同时变严(新增 `no-tests`/`blocked-external` 两个非通过桶、带 out-of-test error 不再算绿、discovery 排除 `test/node_modules`),所以是在更严的尺子下量出来的。
+- **Node 语料首次系统攻关(+247 文件)**:根因都是「整块缺失」而非零星断言 —— ① **入口文件一直在全局作用域求值**,顶层 `const` 变成全局词法绑定,前一行 require 的模块随即撞 "Cannot access 'Buffer' before initialization"(~90 文件);② `const require = createRequire(...)` 与 CJS wrapper 的 `require` 形参同名,降级后第 1 行前就是 SyntaxError,`.mjs` 测试全灭(115 文件);③ `util.getCallSites()` 缺失(`common.mustNotCall()` 依赖它,702 文件引用);④ `node:test` 只在 `mbun test` 下可用(224 文件用它)→ 补独立 runner;⑤ `process.versions.openssl` 写成 `"3.0"`,node 的 `common/crypto.js` 三段式正则解析后直接解引用 `.groups`,46 个文件死在 `null.groups`;⑥ 无 `node:domain`(~59 文件)。
+- **`apply_dotenv` 用生成源码写 `process.env` 导致堆破坏**:每个变量拼一条语句,上游 50000 条 `.env` 用例因此产生约 3MB / 5 万语句的脚本,JSC 解析后 glibc 在 `free()` 中 abort(`munmap_chunk` → `__libc_free` → `apply_dotenv`)。沙箱下 **10 次崩 6 次**,裸跑多数能活,所以长期被误读为 flaky。改为直接走 JSC C API 逐个设属性(O(n)、无源码、无解析、无 MB 级分配),复现脚本 12/12 通过,`cli/run/env.test.ts` 连续三次 79/0。
+- **CI 修绿**:`modules/jsc` 的 `test_runtime_structure` 长期红 —— `engine.inc` 涨到 2407 行破了 2000 行硬预算。按既有做法把「specifier → 已加载模块」整条路径(blob:/data: 虚拟源 + `require_impl`)拆到 `runtime/module_loading.inc`,并清掉一个孤儿切片文件;97/97 成员测试通过。
+- **多 agent 并行的两条教训(已写入流程)**:① 陈旧基线的补丁会**回退别人的成果** —— 一次合入把 fake-timers 从 30/0 打回 3/27,必须让 agent 按当前 HEAD 重做补丁再合;② `mcpp` 不跟踪 `.inc` 的 include 依赖,只改 `.inc` 时 `mcpp build` 会报 "Finished in 0.01s" 并留下**陈旧二进制**,验证前必须确认 binary mtime。
+
 - **语料覆盖推进(同机安静轮,1902 文件,依赖齐备,`--timeout 30`):green 759 → 796(39.9% → 41.9%),测试级 30,111 → 30,525 通过 / 51,337 → 51,390 执行;timeout 63 → 60、oom-kill 10 → 8、load-error 4**。本段是纯代码增量(环境修复的 +65 已在下一条单列)。分三批:
   ① **js/sql 线协议十连修 + js/node 六项 + crypto**(见下方条目);
   ② **回归与近绿清扫**:`.only` 过滤此前完全没实现(`fn.only = fn`,聚焦测试等于跑全文件)、`describe.todo` 被当成 `describe.skip`、`toEqual` 会比较数组的额外字符串属性(bun 只枚举 symbol)、`toHaveLength` 只认 `.length`(ArrayBuffer 用 byteLength);网络侧:写入已 FIN 的 socket 应返回 -1 而非抛 `ERR_STREAM_WRITE_AFTER_END`、重定向缺 scheme 门禁(`Location: file:` 被跟随)、响应头解析接受裸控制字节、`server.url` 提前构造、`maxRequestBodySize` 被忽略、HTTP/1.0 未知长度响应错用 chunked 分帧、body 读完后 `locked` 被复位、UDP 无条件 `SO_REUSEADDR`;

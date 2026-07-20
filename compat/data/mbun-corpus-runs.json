@@ -9,32 +9,32 @@
       "categories": {
         "all-skipped": 72,
         "blocked-external": 25,
-        "green": 796,
+        "green": 850,
         "load-error": 4,
         "no-tests": 6,
-        "oom-kill": 8,
-        "test-failure": 931,
-        "timeout": 60
+        "oom-kill": 7,
+        "test-failure": 875,
+        "timeout": 63
       },
       "test_level": {
-        "ran": 51390,
-        "passed": 30525,
-        "failed": 18043,
-        "expects": 445674
+        "ran": 51366,
+        "passed": 30790,
+        "failed": 17755,
+        "expects": 423660
       },
       "notes": "file-level green = every executed test in the file passed and the file reported no out-of-test error; all-skipped / no-tests / blocked-external are separate buckets and are NOT passes. The corpus npm dependencies must be installed first (see compat/README.md) -- without them 264 files die at load; test/node_modules is excluded from discovery so third-party packages do not inflate the corpus"
     },
     {
       "corpus": "compat/node/test/parallel",
-      "runner": "tools/integration/node_corpus_runner.py --jobs 10 --timeout 15",
+      "runner": "tools/integration/node_corpus_runner.py --jobs 14 --timeout 15",
       "files": 4433,
       "categories": {
-        "pass": 1527,
-        "fail": 2824,
-        "timeout": 78,
-        "oom-kill": 4
+        "fail": 2070,
+        "oom-kill": 9,
+        "pass": 1774,
+        "timeout": 580
       },
-      "notes": "direct execution (mbun <file>, exit 0 = pass); node's own harness services (// Flags:, internal bindings) are not emulated, so files needing them count as failures"
+      "notes": "direct execution (mbun <file>, exit 0 = pass); node's own harness services (// Flags:, internal bindings) are not emulated, so files needing them count as failures — honest file-level coverage, not API completion"
     }
   ]
 }
