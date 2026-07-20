@@ -193,60 +193,198 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   // ---- win32 path (drive letters, \, UNC) — node's algorithm, simplified ----
   const isSepW = (c) => c === "/" || c === "\\";
   const isLetterW = (c) => c && ((c >= "A" && c <= "Z") || (c >= "a" && c <= "z"));
-  // Parse a win32 path into { device, isAbs, tail }.
-  const parseW = (p) => {
-    let device = "", isAbs = false, rootEnd = 0;
-    if (p.length >= 2 && isSepW(p[0]) && isSepW(p[1])) {  // UNC \\server\share
-      let j = 2; while (j < p.length && !isSepW(p[j])) j++;
-      if (j < p.length && j > 2) { const server = p.slice(2, j); let sepEnd = j; while (sepEnd < p.length && isSepW(p[sepEnd])) sepEnd++; if (sepEnd < p.length) { let k = sepEnd; while (k < p.length && !isSepW(p[k])) k++; device = "\\\\" + server + "\\" + p.slice(sepEnd, k); rootEnd = k; isAbs = true; } else { isAbs = true; rootEnd = 1; } }
-      else { isAbs = true; rootEnd = 1; }
-    } else if (isLetterW(p[0]) && p[1] === ":") {
-      device = p.slice(0, 2);
-      if (p.length > 2 && isSepW(p[2])) { isAbs = true; rootEnd = 3; } else rootEnd = 2;
-    } else if (isSepW(p[0])) { isAbs = true; rootEnd = 1; }
-    return { device, isAbs, tail: p.slice(rootEnd) };
+  // node lib/path.js char-code helpers (verbatim). isPathSepW: / or \; 46=. 47=/ 58=: 63=? 92=\
+  const isPathSepW = (code) => code === 47 || code === 92;
+  const isPosixSepW = (code) => code === 47;
+  const isWinDevRoot = (code) => (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
+  const WINDOWS_RESERVED_NAMES = ["CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9", "COM\xb9", "COM\xb2", "COM\xb3", "LPT\xb9", "LPT\xb2", "LPT\xb3"];
+  const isWindowsReservedName = (p, colonIndex) => WINDOWS_RESERVED_NAMES.includes(p.slice(0, colonIndex).toUpperCase());
+  // node lib/path.js normalizeString — resolves . and .. against a separator, verbatim.
+  const normalizeStringW = (p, allowAboveRoot, separator, isSep) => {
+    let res = ""; let lastSegmentLength = 0; let lastSlash = -1; let dots = 0; let code = 0;
+    for (let i = 0; i <= p.length; ++i) {
+      if (i < p.length) code = p.charCodeAt(i);
+      else if (isSep(code)) break;
+      else code = 47;
+      if (isSep(code)) {
+        if (lastSlash === i - 1 || dots === 1) { /* NOOP */ }
+        else if (dots === 2) {
+          if (res.length < 2 || lastSegmentLength !== 2 || res.charCodeAt(res.length - 1) !== 46 || res.charCodeAt(res.length - 2) !== 46) {
+            if (res.length > 2) {
+              const lastSlashIndex = res.length - lastSegmentLength - 1;
+              if (lastSlashIndex === -1) { res = ""; lastSegmentLength = 0; }
+              else { res = res.slice(0, lastSlashIndex); lastSegmentLength = res.length - 1 - res.lastIndexOf(separator); }
+              lastSlash = i; dots = 0; continue;
+            } else if (res.length !== 0) { res = ""; lastSegmentLength = 0; lastSlash = i; dots = 0; continue; }
+          }
+          if (allowAboveRoot) { res += res.length > 0 ? separator + ".." : ".."; lastSegmentLength = 2; }
+        } else {
+          if (res.length > 0) res += separator + p.slice(lastSlash + 1, i);
+          else res = p.slice(lastSlash + 1, i);
+          lastSegmentLength = i - lastSlash - 1;
+        }
+        lastSlash = i; dots = 0;
+      } else if (code === 46 && dots !== -1) { ++dots; }
+      else { dots = -1; }
+    }
+    return res;
   };
-  const normSegsW = (tail, isAbs) => { const segs = []; for (const s of tail.split(/[\\/]+/)) { if (s === "" || s === ".") continue; if (s === "..") { if (segs.length && segs[segs.length - 1] !== "..") segs.pop(); else if (!isAbs) segs.push(".."); } else segs.push(s); } return segs; };
   const win32 = {
     sep: "\\", delimiter: ";",
-    isAbsolute(p) { validatePathStr(p); if (!p.length) return false; if (isSepW(p[0])) return true; return !!(isLetterW(p[0]) && p[1] === ":" && p.length > 2 && isSepW(p[2])); },
-    normalize(p) { validatePathStr(p); if (p.length === 0) return "."; const { device, isAbs, tail } = parseW(p); const segs = normSegsW(tail, isAbs); let body = segs.join("\\"); if (body === "" && !isAbs) body = "."; let r = device + (isAbs ? "\\" : "") + body; if (body !== "" && isSepW(p[p.length - 1]) && r[r.length - 1] !== "\\") r += "\\"; return r; },
-    join(...a) {
-      const parts = a.filter((x) => { validatePathStr(x); return x.length; });
-      if (!parts.length) return ".";
+    isAbsolute(p) { validatePathStr(p); const len = p.length; if (len === 0) return false; const code = p.charCodeAt(0); return isPathSepW(code) || (len > 2 && isWinDevRoot(code) && p.charCodeAt(1) === 58 && isPathSepW(p.charCodeAt(2))); },
+    normalize(p) {
+      validatePathStr(p);
+      const len = p.length;
+      if (len === 0) return ".";
+      let rootEnd = 0; let device; let isAbsolute = false;
+      const code = p.charCodeAt(0);
+      if (len === 1) return isPosixSepW(code) ? "\\" : p;
+      if (isPathSepW(code)) {
+        isAbsolute = true;
+        if (isPathSepW(p.charCodeAt(1))) {
+          let j = 2; let last = j;
+          while (j < len && !isPathSepW(p.charCodeAt(j))) j++;
+          if (j < len && j !== last) {
+            const firstPart = p.slice(last, j); last = j;
+            while (j < len && isPathSepW(p.charCodeAt(j))) j++;
+            if (j < len && j !== last) {
+              last = j;
+              while (j < len && !isPathSepW(p.charCodeAt(j))) j++;
+              if (j === len || j !== last) {
+                if (firstPart === "." || firstPart === "?") {
+                  // Device root (e.g. \\.\PHYSICALDRIVE0)
+                  device = "\\\\" + firstPart; rootEnd = 4;
+                  const colonIndex = p.indexOf(":");
+                  const possibleDevice = p.slice(4, colonIndex + 1);
+                  if (isWindowsReservedName(possibleDevice, possibleDevice.length - 1)) {
+                    device = "\\\\?\\" + possibleDevice; rootEnd = 4 + possibleDevice.length;
+                  }
+                } else if (j === len) {
+                  return "\\\\" + firstPart + "\\" + p.slice(last) + "\\";
+                } else {
+                  device = "\\\\" + firstPart + "\\" + p.slice(last, j); rootEnd = j;
+                }
+              }
+            }
+          }
+        } else rootEnd = 1;
+      } else {
+        const colonIndex = p.indexOf(":");
+        if (colonIndex > 0) {
+          if (isWinDevRoot(code) && colonIndex === 1) {
+            device = p.slice(0, 2); rootEnd = 2;
+            if (len > 2 && isPathSepW(p.charCodeAt(2))) { isAbsolute = true; rootEnd = 3; }
+          } else if (isWindowsReservedName(p, colonIndex)) {
+            device = p.slice(0, colonIndex + 1); rootEnd = colonIndex + 1;
+          }
+        }
+      }
+      let tail = rootEnd < len ? normalizeStringW(p.slice(rootEnd), !isAbsolute, "\\", isPathSepW) : "";
+      if (tail.length === 0 && !isAbsolute) tail = ".";
+      if (tail.length > 0 && isPathSepW(p.charCodeAt(len - 1))) tail += "\\";
+      if (!isAbsolute && device === undefined && p.includes(":")) {
+        // CVE-2024-36139: a relative, device-less path must not normalize into
+        // something Windows would read as absolute (drive-letter or colon-run).
+        if (tail.length >= 2 && isWinDevRoot(tail.charCodeAt(0)) && tail.charCodeAt(1) === 58) return ".\\" + tail;
+        let index = p.indexOf(":");
+        do {
+          if (index === len - 1 || isPathSepW(p.charCodeAt(index + 1))) return ".\\" + tail;
+        } while ((index = p.indexOf(":", index + 1)) !== -1);
+      }
+      const cIdx = p.indexOf(":");
+      if (isWindowsReservedName(p, cIdx)) return ".\\" + (device ?? "") + tail;
+      if (device === undefined) return isAbsolute ? "\\" + tail : tail;
+      return isAbsolute ? device + "\\" + tail : device + tail;
+    },
+    join(...args) {
+      if (args.length === 0) return ".";
+      const parts = [];
+      for (let i = 0; i < args.length; ++i) { const arg = args[i]; validatePathStr(arg); if (arg.length > 0) parts.push(arg); }
+      if (parts.length === 0) return ".";
+      const firstPart = parts[0];
       let joined = parts.join("\\");
-      // node path.js win32 join: collapse a leading slash-run to one "\" unless
-      // the first part is a real UNC prefix (exactly two seps + non-sep).
-      const first = parts[0];
-      const isSep = (c) => c === "/" || c === "\\";
-      let needsReplace = true, slashCount = 0;
-      if (isSep(first[0])) {
-        ++slashCount;
-        if (first.length > 1 && isSep(first[1])) {
+      let needsReplace = true; let slashCount = 0;
+      if (isPathSepW(firstPart.charCodeAt(0))) {
+        ++slashCount; const firstLen = firstPart.length;
+        if (firstLen > 1 && isPathSepW(firstPart.charCodeAt(1))) {
           ++slashCount;
-          if (first.length > 2) { if (isSep(first[2])) ++slashCount; else needsReplace = false; }
+          if (firstLen > 2) { if (isPathSepW(firstPart.charCodeAt(2))) ++slashCount; else needsReplace = false; }
         }
       }
       if (needsReplace) {
-        while (slashCount < joined.length && isSep(joined[slashCount])) ++slashCount;
+        while (slashCount < joined.length && isPathSepW(joined.charCodeAt(slashCount))) slashCount++;
         if (slashCount >= 2) joined = "\\" + joined.slice(slashCount);
+      }
+      // Skip normalization when reserved device names are present (else the
+      // traversal that follows them would be collapsed, a CVE class node guards).
+      const jparts = []; let part = "";
+      for (let i = 0; i < joined.length; i++) {
+        if (joined[i] === "\\") { if (part) jparts.push(part); part = ""; while (i + 1 < joined.length && joined[i + 1] === "\\") i++; }
+        else part += joined[i];
+      }
+      if (part) jparts.push(part);
+      if (jparts.some((q) => { const ci = q.indexOf(":"); return ci !== -1 && isWindowsReservedName(q, ci); })) {
+        let result = "";
+        for (let i = 0; i < joined.length; i++) result += joined[i] === "/" ? "\\" : joined[i];
+        return result;
       }
       return win32.normalize(joined);
     },
-    resolve(...a) {
-      let rDev = "", rTail = "", rAbs = false;
-      for (let i = a.length - 1; i >= -1 && !(rDev && rAbs); i--) {
-        const p = i >= 0 ? a[i] : (globalThis.process && process.cwd ? process.cwd().replace(/\//g, "\\") : "C:\\");
-        validatePathsArg(p, i);
-        if (!p.length) continue;
-        const { device, isAbs, tail } = parseW(p);
-        if (device && rDev && device.toLowerCase() !== rDev.toLowerCase()) continue;
-        if (!rDev) rDev = device;
-        if (!rAbs) { rTail = tail + (rTail ? "\\" + rTail : ""); rAbs = isAbs; }
+    resolve(...args) {
+      let resolvedDevice = ""; let resolvedTail = ""; let resolvedAbsolute = false;
+      for (let i = args.length - 1; i >= -1; i--) {
+        let p;
+        if (i >= 0) {
+          p = args[i]; validatePathsArg(p, i);
+          if (p.length === 0) continue;
+        } else if (resolvedDevice.length === 0) {
+          p = (globalThis.process && process.cwd) ? process.cwd() : "";
+          // Fast path for current directory (mbun always runs non-Windows).
+          if (args.length === 0 || ((args.length === 1 && (args[0] === "" || args[0] === ".")) && isPathSepW(p.charCodeAt(0)))) {
+            return p.replace(/\//g, "\\");
+          }
+        } else {
+          p = ((globalThis.process && process.env) ? process.env["=" + resolvedDevice] : undefined) || ((globalThis.process && process.cwd) ? process.cwd() : "");
+          if (p === undefined || (p.slice(0, 2).toLowerCase() !== resolvedDevice.toLowerCase() && p.charCodeAt(2) === 92)) p = resolvedDevice + "\\";
+        }
+        const len = p.length; let rootEnd = 0; let device = ""; let isAbsolute = false;
+        const code = p.charCodeAt(0);
+        if (len === 1) { if (isPathSepW(code)) { rootEnd = 1; isAbsolute = true; } }
+        else if (isPathSepW(code)) {
+          isAbsolute = true;
+          if (isPathSepW(p.charCodeAt(1))) {
+            let j = 2; let last = j;
+            while (j < len && !isPathSepW(p.charCodeAt(j))) j++;
+            if (j < len && j !== last) {
+              const firstPart = p.slice(last, j); last = j;
+              while (j < len && isPathSepW(p.charCodeAt(j))) j++;
+              if (j < len && j !== last) {
+                last = j;
+                while (j < len && !isPathSepW(p.charCodeAt(j))) j++;
+                if (j === len || j !== last) {
+                  if (firstPart !== "." && firstPart !== "?") { device = "\\\\" + firstPart + "\\" + p.slice(last, j); rootEnd = j; }
+                  else { device = "\\\\" + firstPart; rootEnd = 4; }
+                }
+              }
+            }
+          } else rootEnd = 1;
+        } else if (isWinDevRoot(code) && p.charCodeAt(1) === 58) {
+          device = p.slice(0, 2); rootEnd = 2;
+          if (len > 2 && isPathSepW(p.charCodeAt(2))) { isAbsolute = true; rootEnd = 3; }
+        }
+        if (device.length > 0) {
+          if (resolvedDevice.length > 0) { if (device.toLowerCase() !== resolvedDevice.toLowerCase()) continue; }
+          else resolvedDevice = device;
+        }
+        if (resolvedAbsolute) { if (resolvedDevice.length > 0) break; }
+        else {
+          resolvedTail = p.slice(rootEnd) + "\\" + resolvedTail;
+          resolvedAbsolute = isAbsolute;
+          if (isAbsolute && resolvedDevice.length > 0) break;
+        }
       }
-      if (!rDev && !rAbs) { const cwd = parseW(globalThis.process && process.cwd ? process.cwd().replace(/\//g, "\\") : "C:\\"); rDev = cwd.device; rAbs = cwd.isAbs; }
-      const segs = normSegsW(rTail, rAbs); const body = segs.join("\\");
-      return rDev + (rAbs ? "\\" : "") + body || ".";
+      resolvedTail = normalizeStringW(resolvedTail, !resolvedAbsolute, "\\", isPathSepW);
+      return resolvedAbsolute ? resolvedDevice + "\\" + resolvedTail : (resolvedDevice + resolvedTail) || ".";
     },
     dirname(p) {
       validatePathStr(p);
@@ -344,6 +482,24 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       if (fromOrig === toOrig) return "";
       from = fromOrig.toLowerCase(); to = toOrig.toLowerCase();
       if (from === to) return "";
+      // Case-fold changed a code-unit count (e.g. Turkish İ → i̇): fall back to
+      // a segment-wise case-insensitive compare so index math stays aligned.
+      if (fromOrig.length !== from.length || toOrig.length !== to.length) {
+        const fromSplit = fromOrig.split("\\"); const toSplit = toOrig.split("\\");
+        if (fromSplit[fromSplit.length - 1] === "") fromSplit.pop();
+        if (toSplit[toSplit.length - 1] === "") toSplit.pop();
+        const fromLen = fromSplit.length; const toLen = toSplit.length;
+        const length = fromLen < toLen ? fromLen : toLen;
+        let k;
+        for (k = 0; k < length; k++) { if (fromSplit[k].toLowerCase() !== toSplit[k].toLowerCase()) break; }
+        if (k === 0) return toOrig;
+        else if (k === length) {
+          if (toLen > length) return toSplit.slice(k).join("\\");
+          if (fromLen > length) return "..\\".repeat(fromLen - 1 - k) + "..";
+          return "";
+        }
+        return "..\\".repeat(fromLen - k) + toSplit.slice(k).join("\\");
+      }
       let fromStart = 0; while (fromStart < from.length && from.charCodeAt(fromStart) === 92) fromStart++;
       let fromEnd = from.length; while (fromEnd - 1 > fromStart && from.charCodeAt(fromEnd - 1) === 92) fromEnd--;
       const fromLen = fromEnd - fromStart;
@@ -365,7 +521,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       if (toOrig.charCodeAt(toStart) === 92) ++toStart;
       return toOrig.slice(toStart, toEnd);
     },
-    toNamespacedPath(p) { if (typeof p !== "string" || p.length === 0) return p; const resolved = win32.resolve(p); if (resolved.length <= 2) return p; if (resolved.charCodeAt(0) === 92) { if (resolved.charCodeAt(1) === 92) { const c = resolved.charCodeAt(2); if (c !== 63 && c !== 46) return "\\\\?\\UNC\\" + resolved.slice(2); } } else if (isLetterW(resolved[0]) && resolved.charCodeAt(1) === 58 && resolved.charCodeAt(2) === 92) { return "\\\\?\\" + resolved; } return resolved; },
+    toNamespacedPath(p) { if (typeof p !== "string" || p.length === 0) return p; const resolvedPath = win32.resolve(p); if (resolvedPath.length <= 2) return p; if (resolvedPath.charCodeAt(0) === 92) { if (resolvedPath.charCodeAt(1) === 92) { const c = resolvedPath.charCodeAt(2); if (c !== 63 && c !== 46) return "\\\\?\\UNC\\" + resolvedPath.slice(2); } } else if (isWinDevRoot(resolvedPath.charCodeAt(0)) && resolvedPath.charCodeAt(1) === 58 && resolvedPath.charCodeAt(2) === 92) { return "\\\\?\\" + resolvedPath; } return resolvedPath; },
   };
   path.toNamespacedPath = (p) => p;
   path._makeLong = path.toNamespacedPath;
@@ -1925,6 +2081,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
         return id;
       }
       static revokeObjectURL(id) {
+        if (arguments.length < 1) { const e = new TypeError("Not enough arguments"); e.code = "ERR_MISSING_ARGS"; throw e; }
         const s = String(id);
         if (s.length < 41 || s.slice(0, 5) !== "blob:") return undefined;
         __objectURLRegistry.delete(s);
@@ -2260,12 +2417,9 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       const code = hostname.charCodeAt(i);
       const isValid = code !== 47 /* / */ && code !== 92 /* \ */ && code !== 35 /* # */ && code !== 63 /* ? */ && code !== 58 /* : */;
       if (!isValid) {
-        // leftover starting with ":" is an invalid port; url.parse() stays
-        // lenient about it (node DEP0170: warn once and keep going)
-        if (urlWarnInvalidPort && code === 58) {
-          if (G.process && typeof G.process.emitWarning === "function") G.process.emitWarning("The URL " + url + " is invalid. Future versions of Node.js will throw an error.", "DeprecationWarning", "DEP0170");
-          urlWarnInvalidPort = false;
-        }
+        // A leftover ":" here means an invalid (non-numeric) port — the valid
+        // trailing :port was already stripped by parseHost(); node throws.
+        if (code === 58) { const e = new TypeError("The argument 'url' Invalid port in url. Received " + JSON.stringify(url)); e.code = "ERR_INVALID_ARG_VALUE"; throw e; }
         self.hostname = hostname.slice(0, i);
         return "/" + hostname.slice(i) + rest;
       }
@@ -2273,7 +2427,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     return rest;
   };
   Url.prototype.parse = function parse(url, parseQueryString, slashesDenoteHost) {
-    if (typeof url !== "string") { const e = new TypeError('The "url" argument must be of type string. Received ' + (url === null ? "null" : typeof url)); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
+    if (typeof url !== "string") { const e = new TypeError('The "url" argument must be of type string.' + urlArgTypeReceived(url)); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
     // Copy chrome/IE/opera backslash-handling: backslashes before the query
     // string become forward slashes; also trim whitespace off both ends.
     let hasHash = false, hasAt = false, start = -1, end = -1, rest = "", lastPos = 0;
@@ -2561,26 +2715,98 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     if (u.username || u.password) o.auth = decodeURIComponent(u.username || "") + ":" + decodeURIComponent(u.password || "");
     return o;
   };
+  // node test/common invalidArgTypeHelper: builds the " Received ..." tail of an
+  // ERR_INVALID_ARG_TYPE message. url.parse asserts the exact message shape.
+  const urlArgTypeReceived = (input) => {
+    if (input === null) return " Received null";
+    if (input === undefined) return " Received undefined";
+    const t = typeof input;
+    if (t === "function") return input.name ? " Received function " + input.name : " Received type function ([Function (anonymous)])";
+    if (t === "object") { const c = input.constructor && input.constructor.name; return c ? " Received an instance of " + c : " Received [Object: null prototype] {}"; }
+    let ins;
+    if (t === "symbol") ins = input.toString();
+    else if (t === "bigint") ins = String(input) + "n";
+    else if (t === "string") ins = "'" + input + "'";
+    else ins = String(input);
+    if (ins.length > 25) ins = ins.slice(0, 25) + "...";
+    return " Received type " + t + " (" + ins + ")";
+  };
+  const __isWin = !!(G.process && G.process.platform === "win32");
+  const urlIsURLLike = (v) => v instanceof G.URL || (v && typeof v === "object" && typeof v.href === "string" && typeof v.protocol === "string" && "pathname" in v && "hostname" in v);
+  // WHATWG file-URL path percent-encode set (matches node's kCreateURLFrom*PathSymbol
+  // encoding). In windows mode "\" is the separator (→ "/"); in posix it is a literal
+  // (→ %5C). Non-ASCII code points are UTF-8 percent-encoded via encodeURIComponent.
+  const urlEncodeFilePath = (p, windows) => {
+    if (windows) p = p.replace(/\\/g, "/");
+    let out = "";
+    for (const ch of p) {
+      const cp = ch.codePointAt(0);
+      if (cp > 0x7F) { out += encodeURIComponent(ch); continue; }
+      const enc = cp <= 0x20 || cp === 0x7F || cp === 0x22 || cp === 0x23 || cp === 0x25 || cp === 0x3C || cp === 0x3E || cp === 0x3F || cp === 0x5B || cp === 0x5C || cp === 0x5D || cp === 0x5E || cp === 0x60 || cp === 0x7B || cp === 0x7C || cp === 0x7D || cp === 0x7E;
+      out += enc ? "%" + cp.toString(16).toUpperCase().padStart(2, "0") : ch;
+    }
+    return out;
+  };
   const urlMod = {
     URL: G.URL, URLSearchParams: G.URLSearchParams, Url,
-    fileURLToPath: (u) => {
-      u = String(u !== null && typeof u === "object" && "href" in u ? u.href : u);
-      if (!/^file:/i.test(u)) { const e = new TypeError("The URL must be of scheme file"); e.code = "ERR_INVALID_URL_SCHEME"; throw e; }
-      let p = u.replace(/^file:\/\//i, "").replace(/^file:/i, "");
-      const cut = p.search(/[?#]/); if (cut >= 0) p = p.slice(0, cut);
-      try { p = decodeURIComponent(p); } catch (e) {}
-      if (p[0] !== "/") p = "/" + p;
-      return p;
+    // faithful port of node lib/internal/url.js fileURLToPath / getPathFromURL{Win32,Posix}
+    fileURLToPath: (path, options) => {
+      const windows = options == null ? undefined : options.windows;
+      if (typeof path === "string") path = new G.URL(path);
+      else if (!urlIsURLLike(path)) { const e = new TypeError('The "path" argument must be of type string or an instance of URL.' + urlArgTypeReceived(path)); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
+      if (path.protocol !== "file:") { const e = new TypeError("The URL must be of scheme file"); e.code = "ERR_INVALID_URL_SCHEME"; throw e; }
+      const useWin = windows === undefined ? __isWin : windows;
+      if (useWin) {
+        const hostname = path.hostname; let pathname = path.pathname;
+        for (let n = 0; n < pathname.length; n++) {
+          if (pathname[n] === "%") {
+            const third = ((pathname.codePointAt(n + 2) | 0)) | 0x20;
+            if ((pathname[n + 1] === "2" && third === 102) || (pathname[n + 1] === "5" && third === 99)) { const e = new TypeError("File URL path must not include encoded \\ or / characters"); e.code = "ERR_INVALID_FILE_URL_PATH"; e.input = path; throw e; }
+          }
+        }
+        pathname = pathname.replace(/\//g, "\\");
+        if (pathname.indexOf("%") !== -1) pathname = decodeURIComponent(pathname);
+        if (hostname !== "") { let h = hostname; try { h = urlMod.domainToUnicode(hostname) || hostname; } catch (e) {} return "\\\\" + h + pathname; }
+        const letter = ((pathname.codePointAt(1) | 0)) | 0x20; const sep = pathname.charAt(2);
+        if (letter < 97 || letter > 122 || sep !== ":") { const e = new TypeError("File URL path must be absolute"); e.code = "ERR_INVALID_FILE_URL_PATH"; e.input = path; throw e; }
+        return pathname.slice(1);
+      }
+      if (path.hostname !== "") { const e = new TypeError('File URL host must be "localhost" or empty on ' + (G.process ? G.process.platform : "linux")); e.code = "ERR_INVALID_FILE_URL_HOST"; throw e; }
+      const pathname = path.pathname;
+      for (let n = 0; n < pathname.length; n++) {
+        if (pathname[n] === "%") {
+          const third = ((pathname.codePointAt(n + 2) | 0)) | 0x20;
+          if (pathname[n + 1] === "2" && third === 102) { const e = new TypeError("File URL path must not include encoded / characters"); e.code = "ERR_INVALID_FILE_URL_PATH"; e.input = path; throw e; }
+        }
+      }
+      return pathname.indexOf("%") !== -1 ? decodeURIComponent(pathname) : pathname;
     },
-    pathToFileURL: (p) => {
-      p = String(p);
-      // node: the path is resolved against cwd (normalizing . / ..); a trailing
-      // slash on the input stays on the resolved path.
-      let r = p;
-      try { r = M.path.resolve(p); } catch (e) {}
-      if (p[p.length - 1] === "/" && r[r.length - 1] !== "/") r += "/";
-      const s = "file://" + (r[0] === "/" ? "" : "/") + encodeURI(r.replace(/%/g, "%25")).replace(/[?#~]/g, (m) => (m === "?" ? "%3F" : m === "#" ? "%23" : "%7E"));
-      try { return new G.URL(s); } catch (e) { return { href: s, pathname: r, toString() { return s; } }; }
+    // faithful port of node lib/internal/url.js pathToFileURL (incl. { windows } option,
+    // UNC handling and the ERR_INVALID_ARG_* throws).
+    pathToFileURL: (filepath, options) => {
+      if (typeof filepath !== "string") { const e = new TypeError('The "path" argument must be of type string.' + urlArgTypeReceived(filepath)); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
+      const windows = (options === undefined || options === null) ? __isWin : options.windows;
+      const isUNC = windows && filepath.startsWith("\\\\");
+      let resolved = isUNC ? filepath : (windows ? win32.resolve(filepath) : path.resolve(filepath));
+      if (isUNC || (windows && resolved.startsWith("\\\\"))) {
+        if (resolved.startsWith("\\\\?\\") && !resolved.startsWith("\\\\?\\UNC\\")) {
+          resolved = resolved.slice(4); // \\?\C:\... device path → normal drive path
+        } else {
+          const isExtendedUNC = resolved.startsWith("\\\\?\\UNC\\");
+          const prefixLength = isExtendedUNC ? 8 : 2;
+          const hostnameEndIndex = resolved.indexOf("\\", prefixLength);
+          if (hostnameEndIndex === -1) { const e = new TypeError("The argument 'path' Missing UNC resource path. Received " + JSON.stringify(resolved)); e.code = "ERR_INVALID_ARG_VALUE"; throw e; }
+          if (hostnameEndIndex === 2) { const e = new TypeError("The argument 'path' Empty UNC servername. Received " + JSON.stringify(resolved)); e.code = "ERR_INVALID_ARG_VALUE"; throw e; }
+          const hostname = resolved.slice(prefixLength, hostnameEndIndex);
+          return new G.URL("file://" + hostname + urlEncodeFilePath(resolved.slice(hostnameEndIndex), true));
+        }
+      }
+      const filePathLast = filepath.charCodeAt(filepath.length - 1);
+      const rlast = resolved[resolved.length - 1];
+      if ((filePathLast === 0x2F || (windows && filePathLast === 0x5C)) && rlast !== "/" && rlast !== "\\") resolved += "/";
+      let encPath = urlEncodeFilePath(resolved, windows);
+      if (encPath[0] !== "/") encPath = "/" + encPath;
+      return new G.URL("file://" + encPath);
     },
     parse: urlParse,
     format: urlFormat,
@@ -2642,26 +2868,33 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   const zB64 = (u8) => { let s = ""; for (let i = 0; i < u8.length; i += 8192) s += String.fromCharCode.apply(null, u8.subarray(i, Math.min(i + 8192, u8.length))); return G.btoa(s); };
   const zErr = (e) => { const err = e instanceof Error ? e : new Error(String(e)); err.code = "Z_DATA_ERROR"; err.errno = -3; return err; };
   const zNum = (opts, k, d) => opts && typeof opts[k] === "number" ? opts[k] : d;
+  // node-style ERR_INVALID_ARG_TYPE builder (property vs argument by '.' in name).
+  const zFmtRecv = (v) => { if (v === null) return "null"; if (v === undefined) return "undefined"; const t = typeof v; if (t === "string") { let s = v; if (s.length > 25) s = s.slice(0, 25) + "..."; return "type string ('" + s + "')"; } if (t === "number" || t === "boolean" || t === "bigint") return "type " + t + " (" + String(v) + ")"; if (t === "function") return v.name ? "function " + v.name : "an instance of Function"; if (t === "object") { const cn = v.constructor && v.constructor.name; return "an instance of " + (cn || "Object"); } return "type " + t; };
+  const zArgType = (name, expected, v) => { const kind = name.indexOf(".") >= 0 ? "property" : "argument"; const e = new TypeError('The "' + name + '" ' + kind + " must be " + expected + ". Received " + zFmtRecv(v)); e.code = "ERR_INVALID_ARG_TYPE"; return e; };
+  // convenience-method info option: return { buffer, engine } where engine is an
+  // instance of the matching streaming class (zlib.Gzip/Inflate and friends).
+  const zEngine = (name) => { const C = (M["zlib"] || {})[name]; return C ? Object.create(C.prototype) : {}; };
+  const zInfo = (out, opts, engName) => (opts && opts.info) ? { buffer: out, engine: zEngine(engName) } : out;
   // node enforces kMaxLength across ALL codecs (lib/zlib.js → ERR_BUFFER_TOO_LARGE).
   const zCap = (out, opts) => { const maxLen = opts && typeof opts.maxOutputLength === "number" ? opts.maxOutputLength : (M.buffer && M.buffer.kMaxLength); if (maxLen && out.length > maxLen) { const e = new RangeError("Cannot create a Buffer larger than " + maxLen + " bytes"); e.code = "ERR_BUFFER_TOO_LARGE"; throw e; } return out; };
   // Bytes cross as a Uint8Array, not base64: the base64 bridge cost ~6x the
   // payload in transient strings per crossing and a 150 MB deflateRawSync was
   // OOM-killed. ZN.compress/decompress answer a Uint8Array for a typed-array
   // input (base64 string in, base64 string out is still supported).
-  const zSync = (op, fmt) => (data, opts) => { const level = zNum(opts, "level", -1), wbits = zNum(opts, "windowBits", 15), memLevel = zNum(opts, "memLevel", 8), strategy = zNum(opts, "strategy", 0); const inp = zToU8(data); let r; try { r = op === "c" ? ZN.compress(inp, fmt, level, wbits, memLevel, strategy) : ZN.decompress(inp, fmt, wbits); } catch (e) { throw zErr(e); } const out = typeof r === "string" ? G.Buffer.from(r, "base64") : G.Buffer.from(r.buffer, r.byteOffset, r.byteLength);const maxLen = opts && typeof opts.maxOutputLength === "number" ? opts.maxOutputLength : (M.buffer && M.buffer.kMaxLength); if (op === "d" && maxLen && out.length > maxLen) { const e = new RangeError("Cannot create a Buffer larger than " + maxLen + " bytes"); e.code = "ERR_BUFFER_TOO_LARGE"; throw e; } return out; };
-  const zAsync = (sync) => (data, opts, cb) => { if (typeof opts === "function") { cb = opts; opts = undefined; } if (typeof cb !== "function") throw new TypeError("The callback argument must be of type function"); G.queueMicrotask(() => { try { cb(null, sync(data, opts)); } catch (e) { cb(e); } }); };
-  const deflateSync = zSync("c", "zlib"), inflateSync = zSync("d", "zlib"), gzipSync = zSync("c", "gzip"), gunzipSync = zSync("d", "gzip"), deflateRawSync = zSync("c", "raw"), inflateRawSync = zSync("d", "raw"), unzipSync = zSync("d", "auto");
+  const zSync = (op, fmt, engName) => (data, opts) => { const level = zNum(opts, "level", -1), wbits = zNum(opts, "windowBits", 15), memLevel = zNum(opts, "memLevel", 8), strategy = zNum(opts, "strategy", 0); const inp = zToU8(data); let r; try { r = op === "c" ? ZN.compress(inp, fmt, level, wbits, memLevel, strategy) : ZN.decompress(inp, fmt, wbits); } catch (e) { throw zErr(e); } const out = typeof r === "string" ? G.Buffer.from(r, "base64") : G.Buffer.from(r.buffer, r.byteOffset, r.byteLength);const maxLen = opts && typeof opts.maxOutputLength === "number" ? opts.maxOutputLength : (M.buffer && M.buffer.kMaxLength); if (op === "d" && maxLen && out.length > maxLen) { const e = new RangeError("Cannot create a Buffer larger than " + maxLen + " bytes"); e.code = "ERR_BUFFER_TOO_LARGE"; throw e; } return zInfo(out, opts, engName); };
+  const zAsync = (sync) => (data, opts, cb) => { if (typeof opts === "function") { cb = opts; opts = undefined; } if (typeof cb !== "function") throw zArgType("callback", "of type function", cb); G.queueMicrotask(() => { try { cb(null, sync(data, opts)); } catch (e) { cb(e); } }); };
+  const deflateSync = zSync("c", "zlib", "Deflate"), inflateSync = zSync("d", "zlib", "Inflate"), gzipSync = zSync("c", "gzip", "Gzip"), gunzipSync = zSync("d", "gzip", "Gunzip"), deflateRawSync = zSync("c", "raw", "DeflateRaw"), inflateRawSync = zSync("d", "raw", "InflateRaw"), unzipSync = zSync("d", "auto", "Unzip");
   // brotli (native BrotliEncoder/Decoder via __mbunZlibNative). node forwards
   // quality/lgwin/mode through opts.params keyed by BROTLI_PARAM_* (MODE=0,
   // QUALITY=1, LGWIN=2). All return Buffer.
   const brP = (opts) => { const p = (opts && opts.params) || {}; return [typeof p[1] === "number" ? p[1] : -1, typeof p[2] === "number" ? p[2] : 0, typeof p[0] === "number" ? p[0] : 0]; };
-  const brotliCompressSync = (data, opts) => { const q = brP(opts); let r; try { r = ZN.brotliCompress(zB64(zToU8(data)), q[0], q[1], q[2]); } catch (e) { throw zErr(e); } return G.Buffer.from(r, "base64"); };
-  const brotliDecompressSync = (data, opts) => { let r; try { r = ZN.brotliDecompress(zB64(zToU8(data))); } catch (e) { throw zErr(e); } return zCap(G.Buffer.from(r, "base64"), opts); };
+  const brotliCompressSync = (data, opts) => { const q = brP(opts); let r; try { r = ZN.brotliCompress(zB64(zToU8(data)), q[0], q[1], q[2]); } catch (e) { throw zErr(e); } return zInfo(G.Buffer.from(r, "base64"), opts, "BrotliCompress"); };
+  const brotliDecompressSync = (data, opts) => { let r; try { r = ZN.brotliDecompress(zB64(zToU8(data))); } catch (e) { throw zErr(e); } return zInfo(zCap(G.Buffer.from(r, "base64"), opts), opts, "BrotliDecompress"); };
   // zstd (native ZSTD_compress/decompress). level via opts.level or
   // opts.params[ZSTD_c_compressionLevel=100]; default 3.
   const zstdLvl = (opts) => { const l = zNum(opts, "level", -2); if (l !== -2) return l; const p = opts && opts.params; return p && typeof p[100] === "number" ? p[100] : 3; };
-  const zstdCompressSync = (data, opts) => { let r; try { r = ZN.zstdCompress(zB64(zToU8(data)), zstdLvl(opts)); } catch (e) { throw zErr(e); } return G.Buffer.from(r, "base64"); };
-  const zstdDecompressSync = (data, opts) => { let r; try { r = ZN.zstdDecompress(zB64(zToU8(data))); } catch (e) { throw zErr(e); } return zCap(G.Buffer.from(r, "base64"), opts); };
+  const zstdCompressSync = (data, opts) => { let r; try { r = ZN.zstdCompress(zB64(zToU8(data)), zstdLvl(opts)); } catch (e) { throw zErr(e); } return zInfo(G.Buffer.from(r, "base64"), opts, "ZstdCompress"); };
+  const zstdDecompressSync = (data, opts) => { let r; try { r = ZN.zstdDecompress(zB64(zToU8(data))); } catch (e) { throw zErr(e); } return zInfo(zCap(G.Buffer.from(r, "base64"), opts), opts, "ZstdDecompress"); };
   // DEFERRED: streaming Transform classes (createGzip/createBrotliCompress/…,
   // and the zlib.Deflate/Brotli/Zstd class hierarchy). Real chunked streaming
   // needs the node threadpool _handle lifecycle AND a bounded native inflate
@@ -2677,7 +2910,23 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     BROTLI_MIN_INPUT_BLOCK_BITS: 16, BROTLI_MAX_INPUT_BLOCK_BITS: 24,
     BROTLI_DECODER_RESULT_ERROR: 0, BROTLI_DECODER_RESULT_SUCCESS: 1, BROTLI_DECODER_RESULT_NEEDS_MORE_INPUT: 2, BROTLI_DECODER_RESULT_NEEDS_MORE_OUTPUT: 3,
     ZSTD_e_continue: 0, ZSTD_e_flush: 1, ZSTD_e_end: 2, ZSTD_c_compressionLevel: 100, ZSTD_d_windowLogMax: 100, ZSTD_CLEVEL_DEFAULT: 3, ZSTD_MIN_CLEVEL: -131072, ZSTD_MAX_CLEVEL: 22 };
-  def(["zlib"], { deflateSync, inflateSync, gzipSync, gunzipSync, deflateRawSync, inflateRawSync, unzipSync, deflate: zAsync(deflateSync), inflate: zAsync(inflateSync), gzip: zAsync(gzipSync), gunzip: zAsync(gunzipSync), deflateRaw: zAsync(deflateRawSync), inflateRaw: zAsync(inflateRawSync), unzip: zAsync(unzipSync), crc32: (data, v) => ZN.crc32(zB64(zToU8(data)), (v || 0) >>> 0) >>> 0, createGzip: () => new Transform(), createGunzip: () => new Transform(), createDeflate: () => new Transform(), createInflate: () => new Transform(), createDeflateRaw: () => new Transform(), createInflateRaw: () => new Transform(), createUnzip: () => new Transform(), brotliCompressSync, brotliDecompressSync, brotliCompress: zAsync(brotliCompressSync), brotliDecompress: zAsync(brotliDecompressSync), zstdCompressSync, zstdDecompressSync, zstdCompress: zAsync(zstdCompressSync), zstdDecompress: zAsync(zstdDecompressSync), createBrotliCompress: () => new Transform(), createBrotliDecompress: () => new Transform(), createZstdCompress: () => new Transform(), createZstdDecompress: () => new Transform(), constants: zConstants, ...zConstants });
+  // node: zlib.codes maps the return codes both ways (name to num and num to
+  // name) and is frozen; zlib.constants is frozen (Z_OK etc. must be immutable).
+  const zCodes = { Z_OK: 0, Z_STREAM_END: 1, Z_NEED_DICT: 2, Z_ERRNO: -1, Z_STREAM_ERROR: -2, Z_DATA_ERROR: -3, Z_MEM_ERROR: -4, Z_BUF_ERROR: -5, Z_VERSION_ERROR: -6 };
+  for (const ck of Object.keys(zCodes)) zCodes[zCodes[ck]] = ck;
+  Object.freeze(zCodes);
+  Object.freeze(zConstants);
+  // crc32: first arg string|ArrayBufferView, optional value a uint32 (node
+  // validateUint32). Bad types throw ERR_INVALID_ARG_TYPE.
+  const zCrc32 = (data, value) => {
+    if (typeof data !== "string" && !ArrayBuffer.isView(data)) throw zArgType("data", "one of type string, Buffer, TypedArray, or DataView", data);
+    if (value === undefined) value = 0;
+    else if (typeof value !== "number") throw zArgType("value", "of type number", value);
+    return ZN.crc32(zB64(zToU8(data)), value >>> 0) >>> 0;
+  };
+  const zlibMod = { deflateSync, inflateSync, gzipSync, gunzipSync, deflateRawSync, inflateRawSync, unzipSync, deflate: zAsync(deflateSync), inflate: zAsync(inflateSync), gzip: zAsync(gzipSync), gunzip: zAsync(gunzipSync), deflateRaw: zAsync(deflateRawSync), inflateRaw: zAsync(inflateRawSync), unzip: zAsync(unzipSync), crc32: zCrc32, createGzip: () => new Transform(), createGunzip: () => new Transform(), createDeflate: () => new Transform(), createInflate: () => new Transform(), createDeflateRaw: () => new Transform(), createInflateRaw: () => new Transform(), createUnzip: () => new Transform(), brotliCompressSync, brotliDecompressSync, brotliCompress: zAsync(brotliCompressSync), brotliDecompress: zAsync(brotliDecompressSync), zstdCompressSync, zstdDecompressSync, zstdCompress: zAsync(zstdCompressSync), zstdDecompress: zAsync(zstdDecompressSync), createBrotliCompress: () => new Transform(), createBrotliDecompress: () => new Transform(), createZstdCompress: () => new Transform(), createZstdDecompress: () => new Transform(), constants: zConstants, ...zConstants };
+  Object.defineProperty(zlibMod, "codes", { value: zCodes, writable: false, enumerable: true, configurable: false });
+  def(["zlib"], zlibMod);
   if (G.Bun && typeof G.Bun.deflateSync === "undefined") {
     // bun semantics: Bun.deflateSync/inflateSync are RAW deflate (zlib.test.js
     // "deflate_with_headers" reaches for node:zlib instead); gzipSync is the
