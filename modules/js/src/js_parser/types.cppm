@@ -388,6 +388,13 @@ public:
     // type-argument lists the T2.4 vectors carry (refs with type args, tuples,
     // object/function types, unions/intersections, literal & template types).
     void parse_type_() {
+        // Nested tuple/union/function types recurse here (`type A = [[[…0…]]]`),
+        // so the type grammar needs the same recursion budget as the expression
+        // grammar — see TokenCursor::kMaxParseDepth.
+        DepthGuard depth{this};
+        if (!depth.ok) {
+            return;
+        }
         // TS type predicate: `asserts x [is T]` (assertion signature).
         if (ident_is_("asserts")) {
             advance_();

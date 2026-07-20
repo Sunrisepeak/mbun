@@ -448,6 +448,10 @@ private:
         if (!ok_) {
             return NONE;
         }
+        DepthGuard depth{this};  // nested blocks/loops recurse here (see kMaxParseDepth)
+        if (!depth.ok) {
+            return NONE;
+        }
         // Leading decorators on a class declaration (`@dec class C {}` and the
         // `@dec export class C {}` form): capture the decorator expressions and
         // hand them to parse_class_, which lowers TC39 stage-3 decorator
@@ -3974,6 +3978,10 @@ private:
     }
 
     NodeIndex parse_assign_(bool allowIn) {
+        DepthGuard depth{this};  // nested elements/arguments/conditionals recurse here
+        if (!depth.ok) {
+            return NONE;
+        }
         if (inGenerator_ && ident_is_("yield")) {
             return parse_yield_expr_();
         }
@@ -4219,6 +4227,10 @@ private:
     }
 
     NodeIndex parse_unary_() {
+        DepthGuard depth{this};  // `- - - …1` / `void void …` chains recurse here
+        if (!depth.ok) {
+            return NONE;
+        }
         // `await <expr>` (contextual keyword): treat as a unary operator when an
         // operand follows, otherwise it is a plain identifier.
         if (ident_is_("await") && token_starts_expr_(peek_kind_(1))) {
@@ -4604,6 +4616,10 @@ private:
     }
 
     NodeIndex parse_primary_() {
+        DepthGuard depth{this};  // `[[[…]]]` / `f(f(f(…)))` bottom out here
+        if (!depth.ok) {
+            return NONE;
+        }
         Token k = curk_();
         const Tok& t = cur_();
         switch (k) {

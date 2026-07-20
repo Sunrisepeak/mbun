@@ -357,6 +357,42 @@ public:
         }
     }
 
+    // ── recursion budget ─────────────────────────────────────────────────────
+    // The descent parser recurses once per nesting level, so source that nests
+    // deeply enough runs the NATIVE stack out before it runs out of tokens —
+    // a SIGSEGV that takes the whole process down (bun's
+    // `fixtures/lots-of-for-loop.js` nests ~90k `for` statements; the fuzzer
+    // shapes in the transpiler suite nest 100k brackets). bun caps the descent
+    // and reports the overflow as a catchable
+    // "Maximum call stack size exceeded" instead of crashing.
+    // ref: compat/bun/test/bundler/transpiler/transpiler.test.js
+    //      "runtime transpiler stack overflows" /
+    //      "deeply nested expressions error instead of crashing the process"
+    // The cap is a nesting count, not a byte budget: the worst-case chain
+    // (statement → expression → … → primary) is a few hundred bytes of frame
+    // per level, so 1000 levels stays ~1 MB deep — safe even on the smaller
+    // stacks of JSC's worker threads — while being far past anything real
+    // source nests.
+    static constexpr int kMaxParseDepth{1000};
+    int depth_{0};
+
+    // RAII: `DepthGuard g{this}; if (!g.ok) return NONE;` at every recursion hub.
+    // Unwinds on every exit path (including the early returns of a backtracking
+    // speculative parse), so the counter always tracks the live stack.
+    struct DepthGuard {
+        TokenCursor* p;
+        bool ok;
+        explicit DepthGuard(TokenCursor* self) : p{self} {
+            ok = ++p->depth_ <= kMaxParseDepth;
+            if (!ok) {
+                p->fail_("Maximum call stack size exceeded");
+            }
+        }
+        DepthGuard(const DepthGuard&) = delete;
+        DepthGuard& operator=(const DepthGuard&) = delete;
+        ~DepthGuard() { --p->depth_; }
+    };
+
     std::string_view token_text_() const {
         Token e = curk_();
         if (e == Token::EndOfFile) {
