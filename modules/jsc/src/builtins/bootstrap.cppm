@@ -3309,6 +3309,10 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     if (p && typeof p === "object") {
       if (ArrayBuffer.isView(p) || p instanceof ArrayBuffer) return; // Buffer
       if (p.href !== undefined && p.protocol === "file:" && typeof p.pathname === "string") return; // URL
+      // A String object / subclass (e.g. bun's DisposableString from tempDir())
+      // is a valid path — node's getValidatedPath coerces it. String.prototype
+      // .valueOf brand-checks the internal slot without invoking a user valueOf.
+      try { String.prototype.valueOf.call(p); return; } catch (e) {}
     }
     throw fsArgTypeErr(name || "path", "of type string or an instance of Buffer or URL", p);
   };
