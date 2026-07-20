@@ -108,6 +108,47 @@ inline constexpr std::string_view HARNESS = R"JS(
               timeoutReject: null, errors: [], asyncErr: undefined, todo: 0, pendingAsserts: [],
               sysTime: null, skippedLabel: 0, onlyTests: 0, onlyScopes: 0 };
   G.__mbunState = S;
+  // ── CI detection (`.only` is refused in CI) ────────────────────────────────
+  // PORT-SOURCE: bun src/cli/ci_info.rs:23-34 `is_ci_uncached` /
+  // `detect_uncached`, plus src/cli/mod.rs:39-49 `is_ci_uncached_generated`.
+  //   is_ci = CI(env, as boolean) ?? <generic vars set> || <vendor detected>
+  // and `detect_ci_name()` short-circuits to None when CI parses as false, so
+  // `CI=false` overrides even GITHUB_ACTIONS=true. Boolean parsing is bun's
+  // env_var.rs:364 `string_is_truthy` (falsy: "", "0", "false", "no", "off").
+  function __mbunEnvBool(v) {
+    if (v === undefined || v === null) return null;
+    const s = String(v).toLowerCase();
+    return !(s === "" || s === "0" || s === "false" || s === "no" || s === "off");
+  }
+  // Generic markers (cli/mod.rs:39) and the vendor variables of watson/ci-info
+  // that the corpus exercises; a vendor hit alone is enough (detect_ci_name).
+  const __MBUN_CI_GENERIC = ["BUILD_ID", "BUILD_NUMBER", "CI", "CI_APP_ID", "CI_BUILD_ID",
+                             "CI_BUILD_NUMBER", "CI_NAME", "CONTINUOUS_INTEGRATION", "RUN_ID"];
+  const __MBUN_CI_VENDOR = ["GITHUB_ACTIONS", "GITLAB_CI", "CIRCLECI", "TRAVIS", "BUILDKITE",
+                            "JENKINS_URL", "TEAMCITY_VERSION", "APPVEYOR", "DRONE", "TF_BUILD",
+                            "CODEBUILD_BUILD_ARN", "BITBUCKET_COMMIT", "SEMAPHORE", "NETLIFY",
+                            "VERCEL", "HEROKU_TEST_RUN_ID", "bamboo_planKey", "WERCKER",
+                            "MAGNUM", "SAILCI", "SCREWDRIVER", "CIRRUS_CI", "NOW_BUILDER"];
+  function __mbunIsCI() {
+    const e = (typeof process !== "undefined" && process.env) || {};
+    const explicit = __mbunEnvBool(e.CI);
+    // detect_uncached(): `CI=false` disables every vendor probe.
+    // cli/mod.rs:21 `env_set!` is presence, not truthiness.
+    const vendor = explicit === false
+      ? false
+      : __MBUN_CI_VENDOR.some((k) => e[k] !== undefined);
+    if (explicit !== null) return explicit || vendor;
+    return __MBUN_CI_GENERIC.some((k) => e[k] !== undefined) || vendor;
+  }
+  // ScopeFunctions.rs:511-521 `error_in_ci` — the message is asserted verbatim
+  // by test/js/bun/test/ci-restrictions.test.ts.
+  function __mbunErrorInCI(signature) {
+    if (__mbunIsCI()) {
+      throw new Error(signature + " is disabled in CI environments to prevent accidentally " +
+                      "skipping tests. To override, set the environment variable CI=false.");
+    }
+  }
+  G.__mbunIsCI = __mbunIsCI;
   // Attribute errors thrown from queueMicrotask/process.nextTick callbacks to the
   // currently-running test (bun: an async exception while a test is in flight
   // fails that test). Wrapped ONCE per process — the wrappers read the live state
@@ -642,6 +683,9 @@ inline constexpr std::string_view HARNESS = R"JS(
       if (fn === undefined && mode !== "todo" && mode !== "skip") throw new TypeError("test() expects a function");
       // .only narrows the run set; a todo-depth describe turns its runnable
       // tests into todos. The two are independent and both apply here.
+      // ScopeFunctions.rs:506-508 — a focused registrar is refused in CI before
+      // the scope config is even extended.
+      if (only) __mbunErrorInCI(".only");
       const isOnly = !!only && !(S.skipDepth > 0);
       if (isOnly) S.onlyTests++;
       S.current.items.push({ type: "test", name: String(name), fn: fn, opts: opts, only: isOnly,
@@ -725,6 +769,7 @@ inline constexpr std::string_view HARNESS = R"JS(
   // `test.only` anywhere narrows the run to exactly that test, even inside a
   // `describe.only` — test/js/bun/test/only-inside-only.fixture.ts).
   function onlyScope(name, fn) {
+    __mbunErrorInCI(".only");
     const at = S.current.items.length;
     describe(name, fn);
     const entry = S.current.items[at];
@@ -1549,6 +1594,20 @@ std::string prepare_source(std::string_view js) {
     return out;
 }
 
+// A registration-time CI refusal (`.only` under CI) is bun's own diagnostic,
+// thrown straight out of the scope function, so bun prints it bare:
+//   error: .only is disabled in CI environments to prevent accidentally ...
+// (ScopeFunctions.rs:511-521; asserted verbatim by js/bun/test/ci-restrictions).
+// Everything else keeps the `test file evaluation error:` framing.
+std::string strip_evaluation_wrapper(const std::string& message) {
+    constexpr std::string_view MARKER{".only is disabled in CI environments"};
+    if (const std::size_t at{message.find(MARKER)}; at != std::string::npos) {
+        const std::size_t eol{message.find('\n', at)};
+        return message.substr(at, eol == std::string::npos ? std::string::npos : eol - at);
+    }
+    return "test file evaluation error: " + message;
+}
+
 // Run a prepared/inline bun:test source in the shared runtime context. `dir` is
 // the test file's directory (for relative require()); inline sources pass ".".
 // `test_seed`, when set, is this file's --randomize shuffle seed (see run_file).
@@ -1747,7 +1806,7 @@ RunResult run_source(std::string_view js_source, std::string_view dir = ".", boo
         if (reg.error().find("SyntaxError") == std::string::npos &&
             reg.error().find("await is not defined") == std::string::npos &&
             reg.error().find("Can't find variable: await") == std::string::npos) {
-            r.error = "test file evaluation error: " + reg.error();
+            r.error = strip_evaluation_wrapper(reg.error());
             return r;
         }
         (void)rt::eval("globalThis.__mbun_collect_done=0;globalThis.__mbun_collect_err=undefined;");

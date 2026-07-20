@@ -1247,3 +1247,12 @@ JSValueRef http_set_max_header_size_cb(JSContextRef ctx, JSObjectRef, JSObjectRe
     mbun::http::set_max_http_header_size(static_cast<std::size_t>(num));
     return JSValueMakeNumber(ctx, static_cast<double>(mbun::http::max_http_header_size()));
 }
+
+// `--user-agent <STR>` override, or undefined when the flag was absent.
+// PORT-SOURCE: bun cli/Arguments.rs:1062-1066 → bun_http::OVERRIDDEN_DEFAULT_USER_AGENT
+// (read by the fetch client when the request carries no User-Agent header).
+JSValueRef http_get_user_agent_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t,
+                                  const JSValueRef[], JSValueRef*) {
+    if (gUserAgent.empty()) return JSValueMakeUndefined(ctx);
+    return make_string(ctx, gUserAgent);
+}

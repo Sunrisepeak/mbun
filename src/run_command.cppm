@@ -31,6 +31,7 @@
 module;
 
 #include <cerrno>
+#include <csignal>
 #include <spawn.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -437,6 +438,59 @@ std::optional<int> spawn_shell_(std::string_view shellBin, std::string_view scri
     return std::nullopt;
 }
 
+// `bun_sys::SignalCode::fmt` prints the mnemonic ("SIGKILL"), not the number.
+// ref: bun src/bun_sys (SignalCode) — the corpus greps stderr for the name.
+std::string_view signal_name_(int sig) {
+    switch (sig) {
+    case SIGHUP: return "SIGHUP";
+    case SIGINT: return "SIGINT";
+    case SIGQUIT: return "SIGQUIT";
+    case SIGILL: return "SIGILL";
+    case SIGTRAP: return "SIGTRAP";
+    case SIGABRT: return "SIGABRT";
+    case SIGBUS: return "SIGBUS";
+    case SIGFPE: return "SIGFPE";
+    case SIGKILL: return "SIGKILL";
+    case SIGUSR1: return "SIGUSR1";
+    case SIGSEGV: return "SIGSEGV";
+    case SIGUSR2: return "SIGUSR2";
+    case SIGPIPE: return "SIGPIPE";
+    case SIGALRM: return "SIGALRM";
+    case SIGTERM: return "SIGTERM";
+    case SIGCHLD: return "SIGCHLD";
+    case SIGCONT: return "SIGCONT";
+    case SIGSTOP: return "SIGSTOP";
+    case SIGTSTP: return "SIGTSTP";
+    case SIGTTIN: return "SIGTTIN";
+    case SIGTTOU: return "SIGTTOU";
+    case SIGURG: return "SIGURG";
+    case SIGXCPU: return "SIGXCPU";
+    case SIGXFSZ: return "SIGXFSZ";
+    case SIGVTALRM: return "SIGVTALRM";
+    case SIGPROF: return "SIGPROF";
+    case SIGWINCH: return "SIGWINCH";
+    case SIGSYS: return "SIGSYS";
+    default: return "SIGUNKNOWN";
+    }
+}
+
+// Port of bun's `Global::raise_ignoring_panic_handler`: restore the default
+// disposition, unblock the signal, and re-raise so the process dies exactly as
+// the child did. SIGKILL/SIGSTOP reject the sigaction with EINVAL — that is
+// expected and ignored (the whole point of the referenced bun fix), because
+// their default disposition can never have been changed anyway.
+void raise_ignoring_handlers_(int sig) {
+    struct ::sigaction sa{};
+    sa.sa_handler = SIG_DFL;
+    ::sigemptyset(&sa.sa_mask);
+    (void)::sigaction(sig, &sa, nullptr);
+    ::sigset_t set;
+    ::sigemptyset(&set);
+    ::sigaddset(&set, sig);
+    (void)::sigprocmask(SIG_UNBLOCK, &set, nullptr);
+    ::raise(sig);
+}
+
 // Build a null-delimited env from the current environ plus overrides.
 std::vector<std::string> build_env_(const std::vector<std::pair<std::string, std::string>>& overrides) {
     std::vector<std::string> out;
@@ -483,11 +537,17 @@ export std::optional<int> run_package_script(std::string_view script, std::strin
 
     if (!code) {
         if (signalNo != 0) {
-            // ref: run_command.rs:456-470 — SIGINT is silent; others report.
+            // ref: run_command.rs:456-470 — SIGINT is silent; others report, and
+            // then `Global::raise_ignoring_panic_handler(sig)` re-raises it so
+            // `bun run` DIES BY THE SAME SIGNAL rather than exiting 128+n (the
+            // observable contract of cli/run/run-propagate-sigkill.test.ts:
+            // `proc.signalCode === "SIGKILL"`). bun prints the signal NAME.
             constexpr int SIGINT_NO{2};
             if (signalNo != SIGINT_NO && !options.silent) {
                 std::println(std::cerr, "error: script \"{}\" was terminated by signal {}", name,
-                             signalNo);
+                             signal_name_(signalNo));
+                std::fflush(nullptr);
+                raise_ignoring_handlers_(signalNo);
             }
             return 128 + signalNo;
         }

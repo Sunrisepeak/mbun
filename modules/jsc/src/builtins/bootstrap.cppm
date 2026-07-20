@@ -3300,15 +3300,24 @@ inline constexpr std::string_view kBootstrapJS = R"JS(
     },
     // Binary data must NOT cross the C-API string boundary (NUL/UTF-8 mangling):
     // typed arrays / ArrayBuffers write through the fd native path byte-exact.
-    writeFileSync: (p, d) => {
+    writeFileSync: (p, d, o) => {
+      // node: options may be an encoding string or { encoding, mode, flag };
+      // `mode` is the creation mode (default 0o666) and must be applied even
+      // when the file already exists is false — a fresh file created with
+      // mode 0o777 has to come out executable (cli/run/run-extensionless).
+      const mode = (o && typeof o === "object" && o.mode != null)
+        ? (typeof o.mode === "string" ? parseInt(o.mode, 8) : (Number(o.mode) & 0o7777))
+        : null;
       if (ArrayBuffer.isView(d) || d instanceof ArrayBuffer) {
         const FD = globalThis.__mbunFdNative;
         const u = d instanceof ArrayBuffer ? new Uint8Array(d) : new Uint8Array(d.buffer, d.byteOffset, d.byteLength);
-        const fd = FD.open(toStr(p), "w", 0o666);
+        const fd = FD.open(toStr(p), "w", mode == null ? 0o666 : mode);
         try { FD.write(fd, u, 0, u.byteLength, -1); } finally { FD.close(fd); }
+        if (mode != null) { try { F.chmod(toStr(p), mode); } catch (e) {} }
         return;
       }
       F.writeFile(toStr(p), toStr(d));
+      if (mode != null) { try { F.chmod(toStr(p), mode); } catch (e) {} }
     },
     appendFileSync: (p, d) => F.appendFile(toStr(p), toStr(d)),
     existsSync: (p) => F.exists(toStr(p)),

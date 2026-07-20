@@ -224,3 +224,18 @@ std::vector<std::string> gArgv{};
 
 // `--no-env-file` / bunfig env=false: suppress default .env auto-loading.
 bool gDisableEnvFiles{false};
+
+// `--env-file <path>` — explicit dotenv files. ref: bun dotenv/env_loader.rs:657
+// `Loader::load`: a non-empty explicit list REPLACES the default-file scan
+// entirely (so `--no-env-file --env-file x` still loads x), and the list is
+// walked backwards with OVERWRITE=false so the LAST entry wins.
+std::vector<std::string> gEnvFiles{};
+
+// bunfig `preload = [...]` — modules imported before the entry point.
+// ref: bun runtime/jsc_hooks.rs:700-800 (resolve, then import, each in order;
+// a miss is fatal with `preload not found <json path>`).
+std::vector<std::string> gPreloads{};
+
+// `--user-agent <STR>` — overrides the default fetch User-Agent.
+// ref: bun cli/Arguments.rs:1062 → bun_http::OVERRIDDEN_DEFAULT_USER_AGENT.
+std::string gUserAgent{};

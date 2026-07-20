@@ -239,6 +239,17 @@ inline constexpr std::string_view kNodeStrDecJS = R"JS(
     this.lastChar = G.Buffer.alloc(4);
   }
 
+  // The native decoder reads the argument as raw bytes, so ANY TypedArray /
+  // DataView must behave like a Buffer here. Without this the decode path fell
+  // through to `Uint8Array.prototype.toString()`, which joins the bytes with
+  // commas ("76,111,97,..."), and `buf.copy` (Buffer-only) was missing entirely
+  // — see cli/hot/watch-many-dirs.test.ts, which decodes `proc.stdout` chunks
+  // (plain Uint8Array, not Buffer).
+  function asBuffer(buf) {
+    if (G.Buffer.isBuffer(buf)) return buf;
+    return G.Buffer.from(buf.buffer, buf.byteOffset, buf.byteLength);
+  }
+
   StringDecoder.prototype.write = function (buf) {
     if (typeof buf === "string") return buf;
     if (buf == null || typeof buf.byteLength !== "number") {
@@ -246,18 +257,18 @@ inline constexpr std::string_view kNodeStrDecJS = R"JS(
       e.code = "ERR_INVALID_ARG_TYPE";
       throw e;
     }
-    return decWrite(this, buf);
+    return decWrite(this, asBuffer(buf));
   };
 
   StringDecoder.prototype.end = function (buf) {
-    return decEnd(this, buf);
+    return decEnd(this, buf == null ? buf : asBuffer(buf));
   };
 
   StringDecoder.prototype.text = function (buf, offset) {
     offset = offset | 0;
     const byteLength = buf.byteLength;
     if (offset < 0 || offset > byteLength) return "";
-    return decWrite(this, buf.subarray(offset));
+    return decWrite(this, asBuffer(buf).subarray(offset));
   };
 
   reg("string_decoder", { StringDecoder });

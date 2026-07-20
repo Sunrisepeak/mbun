@@ -186,7 +186,9 @@ public:
     // .env.local (skipped under `bun test`), .env.{mode}, .env. `mode` =
     // NODE_ENV (or "development" when running, "test" under `bun test`).
     void apply_dotenv(bool isTest) {
-        if (gDisableEnvFiles) return;
+        // `--env-file` wins over `--no-env-file`: env_loader.rs:657 takes the
+        // explicit branch before it ever consults skip_default_env.
+        if (gDisableEnvFiles && gEnvFiles.empty()) return;
         std::error_code ec;
         const std::string cwd{std::filesystem::current_path(ec).string()};
         if (ec) return;
@@ -209,14 +211,36 @@ public:
         const std::size_t shellCount{map.count()};
 
         std::vector<std::string> files;
-        files.push_back(".env." + mode + ".local");
-        if (!isTest) files.push_back(".env.local");
-        files.push_back(".env." + mode);
-        files.emplace_back(".env");
+        if (!gEnvFiles.empty()) {
+            // env_loader.rs:678-699 `load_explicit_files`: walk the --env-file
+            // arguments backwards, and each comma-separated entry backwards too,
+            // so the last path named on the command line has highest priority
+            // under the shared OVERWRITE=false parse.
+            for (auto arg{gEnvFiles.rbegin()}; arg != gEnvFiles.rend(); ++arg) {
+                std::vector<std::string> parts;
+                std::string_view rest{*arg};
+                while (!rest.empty()) {
+                    const auto comma{rest.find(',')};
+                    parts.emplace_back(rest.substr(0, comma));
+                    if (comma == std::string_view::npos) break;
+                    rest.remove_prefix(comma + 1);
+                }
+                for (auto p{parts.rbegin()}; p != parts.rend(); ++p) {
+                    if (!p->empty()) files.push_back(*p);
+                }
+            }
+        } else {
+            files.push_back(".env." + mode + ".local");
+            if (!isTest) files.push_back(".env.local");
+            files.push_back(".env." + mode);
+            files.emplace_back(".env");
+        }
         const mbun::dotenv::ParseOptions opts{
             .override_existing = false, .is_process = false, .expand = true};
         for (const auto& f : files) {
-            auto content{read_file(cwd + "/" + f)};
+            const bool absolute{!f.empty() &&
+                                std::filesystem::path{f}.is_absolute()};
+            auto content{read_file(absolute ? f : cwd + "/" + f)};
             if (!content) continue;
             mbun::dotenv::parse_into(map, *content, opts);
         }
@@ -259,6 +283,26 @@ public:
         apply_dotenv(/*isTest=*/false);
         unhandledRejection_ = false;
         install_unhandled_rejection_hook_();
+        // bunfig `preload = [...]` runs before the entry point, in order, in the
+        // same context (its plugins/globals must be visible to the entry).
+        // jsc_hooks.rs:730-767: an unresolvable specifier is fatal and reported
+        // as `preload not found <json-quoted specifier>`; an exception thrown by
+        // a preload aborts the run before the entry is ever imported.
+        for (const std::string& spec : gPreloads) {
+            std::error_code pec{};
+            std::filesystem::path p{spec};
+            if (!p.is_absolute()) p = std::filesystem::current_path(pec) / spec;
+            if (!std::filesystem::exists(p, pec) || std::filesystem::is_directory(p, pec)) {
+                std::cerr << "error: preload not found " << json_quote_(spec) << '\n';
+                return 1;
+            }
+            if (auto r{eval_void("globalThis.require(" +
+                                 json_quote_(p.lexically_normal().string()) + ");")};
+                !r) {
+                std::cerr << "error: " << r.error() << '\n';
+                return 1;
+            }
+        }
         std::string js{source};
         bool tla{false};
         // `// @bun` pragma (after an optional hashbang line): the entry is already
@@ -311,6 +355,44 @@ public:
             if (t.cjs_esm_module) {
                 (void)use_esm_require(dir);
             }
+        }
+        // `// @bun @bun-cjs`: an already-bundled CommonJS entry whose whole body
+        // IS the `(function (exports, require, module, __filename, __dirname) {…})`
+        // wrapper expression. bun evaluates the source and requires the completion
+        // value to be callable, else it throws the fixed TypeError below.
+        // PORT-SOURCE: js_parser/parse/parse_entry.rs:2352 (AlreadyBundled::BunCjs)
+        // + jsc/bindings/JSCommonJSModule.cpp:191-201 (the wrapper check).
+        if (bunPragma && source.substr(0, source.find('\n')).find("@bun-cjs") != std::string::npos) {
+            JSValueRef exc{nullptr};
+            JSValueRef wrapper{eval_(js, &exc, absPath)};
+            if (exc != nullptr) {
+                std::cerr << "error: " << describe_exception_(exc) << '\n';
+                return 1;
+            }
+            JSObjectRef fn{JSValueIsObject(ctx_, wrapper)
+                               ? JSValueToObject(ctx_, wrapper, nullptr)
+                               : nullptr};
+            if (fn == nullptr || !JSObjectIsFunction(ctx_, fn)) {
+                std::cerr << "error: TypeError: Expected CommonJS module to have a function "
+                             "wrapper. If you weren't messing around with Bun's internals, this "
+                             "is a bug in Bun\n";
+                return 1;
+            }
+            set_prop(ctx_, JSContextGetGlobalObject(ctx_), "__mbunCjsWrapper", wrapper);
+            if (auto r{eval_void("globalThis.__mbunCjsWrapper(globalThis.exports, "
+                                 "globalThis.require, globalThis.module, globalThis.__filename, "
+                                 "globalThis.__dirname);",
+                                 absPath)};
+                !r) {
+                std::cerr << "error: " << r.error() << '\n';
+                return 1;
+            }
+            pump_event_loop("0");
+            if (unhandledRejection_) {
+                std::cerr << "error: Unhandled promise rejection\n";
+                return 1;
+            }
+            return 0;
         }
         std::string script{transform_module_(js)};
         // A top-level-await entry (flagged by the transpiler) goes straight to the
@@ -1817,6 +1899,7 @@ private:
         JSObjectRef htn{JSObjectMake(ctx_, nullptr, nullptr)};
         set_fn(ctx_, htn, "getMaxHeaderSize", http_get_max_header_size_cb);
         set_fn(ctx_, htn, "setMaxHeaderSize", http_set_max_header_size_cb);
+        set_fn(ctx_, htn, "userAgent", http_get_user_agent_cb);
         set_prop(ctx_, global, "__mbunHttpNative", htn);
         // CAP-S3: AWS SigV4 signing for Bun.S3Client (builtins/s3.cppm calls
         // __mbunS3Native.sign; algorithm is mbun.s3_signing, crypto is mbun.crypto).

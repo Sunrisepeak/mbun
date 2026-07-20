@@ -11,6 +11,8 @@ import mbun.install.command;
 import mbun.install.dependency;
 import mbun.install.npm.json;
 import mbun.install.package_json_editor;
+// `bun run --workspaces` — the root package.json `workspaces` glob expansion.
+import mbun.install.workspace_map;
 import mbun.jsc.module_loader;  // runtime_jsx_options — the JSX config sink
 import mbun.jsc.runtime;
 import mbun.jsc.test_runner;
@@ -165,10 +167,17 @@ int run_script(std::string_view script, std::span<const std::string_view> script
                             std::println(std::cerr, "error: {} in bunfig.toml", e.message);
                         else
                             std::println(std::cerr, "error: {} for \"{}\" in bunfig.toml", e.message, e.key);
-                    } else if (cfg->disable_default_env_files) {
-                        // bunfig env=false / env.file=false disables .env loading, like
-                        // --no-env-file. ref: bun bunfig.rs -> dotenv/env_loader.rs.
-                        mbun::jsc::runtime::set_disable_env_files(true);
+                    } else {
+                        if (cfg->disable_default_env_files) {
+                            // bunfig env=false / env.file=false disables .env loading, like
+                            // --no-env-file. ref: bun bunfig.rs -> dotenv/env_loader.rs.
+                            mbun::jsc::runtime::set_disable_env_files(true);
+                        }
+                        // `preload = [...]`: imported before the entry point
+                        // (jsc_hooks.rs `reload_entry_point`).
+                        if (!cfg->preloads.empty()) {
+                            mbun::jsc::runtime::set_preloads(cfg->preloads);
+                        }
                     }
                 }
             }
@@ -1490,6 +1499,28 @@ std::size_t take_max_http_header_size_flag(std::span<const std::string_view> arg
     return consumed;
 }
 
+// Generic `--flag <VALUE>` / `--flag=<VALUE>` reader: hands the value to `sink`
+// and returns how many tokens it consumed (0 when args[i] is a different flag).
+// bun's clap accepts both spellings for every value-taking option
+// (Arguments.rs `args.option(b"--x")`), so both must be recognised here or the
+// value token is mistaken for the run target ("Script not found \"--env-file\"").
+std::size_t take_valued_flag(std::span<const std::string_view> args, std::size_t i,
+                             std::string_view flag, void (*sink)(std::string)) {
+    const std::string_view a{args[i]};
+    if (a.starts_with(flag) && a.size() > flag.size() && a[flag.size()] == '=') {
+        sink(std::string{a.substr(flag.size() + 1)});
+        return 1;
+    }
+    if (a == flag && i + 1 < args.size()) {
+        sink(std::string{args[i + 1]});
+        return 2;
+    }
+    // A trailing valueless occurrence is still consumed (bun's clap reports a
+    // missing-value error rather than treating it as a positional).
+    if (a == flag) return 1;
+    return 0;
+}
+
 // ─── `mbun run <script>` — package.json scripts ─────────────────────────────
 // Port of bun's RunCommand::exec_with_cfg (ref: bun-ref/src/cli/run_command.rs
 // :2357). The target-priority rules below are bun's, verbatim:
@@ -1524,6 +1555,9 @@ struct RunFlags {
     // effect is planting the <BUN_NODE_DIR>/node shim at the front of PATH
     // (run_command.rs:1989 → install/lib.rs:565).
     bool forceUsingBun{false};
+    // `--workspaces`: "Run a script in all workspace packages" (Arguments.rs:336
+    // → ctx.workspaces at Arguments.rs:809).
+    bool workspaces{false};
 };
 
 // `--cwd <STR>`: "Absolute path to resolve files & entry points from. This just
@@ -1718,6 +1752,76 @@ int exec_run_target(std::string_view target, std::span<const std::string_view> p
     // ── 7. failure (run_command.rs:2726-2790) ──────────────────────────────
     if (flags.ifPresent) return 0;
     return report_run_target_not_found(target);
+}
+
+// `bun run --workspaces <script>` — run one package.json script in every
+// workspace package of the enclosing project, excluding the root itself.
+// PORT-SOURCE: bun cli/multi_run.rs:839-1001 (`ctx.workspaces` turns the filter
+// engine into "every workspace member") + runtime/cli/filter_run.rs:852-866
+// (empty match set → silent 0 under --if-present, else
+// `No workspace packages have script "<name>"` on stderr + exit 1).
+//
+// DIVERGENCE: bun runs the members concurrently and prefixes each line with the
+// package name; mbun runs them sequentially in workspace order. The scripts'
+// own stdout is what the corpus asserts on, and sequential execution keeps the
+// exit-code rule (first failure wins) deterministic.
+int exec_run_workspaces(std::string_view target, std::span<const std::string_view> passthrough,
+                        const RunFlags& flags) {
+    namespace run = mbun::cli::run;
+    namespace json = mbun::install::npm::json;
+    std::error_code ec{};
+    const std::filesystem::path cwd{std::filesystem::current_path(ec)};
+
+    // The workspace root is the nearest enclosing package.json (bun resolves
+    // `--workspaces` against the same root the run command resolved).
+    const auto rootJsonPath{find_package_json(cwd)};
+    std::vector<mbun::install::workspace_map::Entry> members;
+    std::filesystem::path root{cwd};
+    if (rootJsonPath) {
+        root = rootJsonPath->parent_path();
+        std::ifstream in{*rootJsonPath, std::ios::binary};
+        std::string source{std::istreambuf_iterator<char>{in}, std::istreambuf_iterator<char>{}};
+        auto doc{json::parse(source)};
+        if (doc && doc->root) {
+            auto collected{
+                mbun::install::workspace_map::collect(root, doc->root->get("workspaces"))};
+            if (!collected) {
+                std::println(std::cerr, "error: {}", collected.error().message);
+                return 1;
+            }
+            members = std::move(*collected);
+        }
+    }
+
+    // filter_run.rs builds the script list first, then decides; a member without
+    // the script is simply not in the list (it is never an error on its own).
+    int exitCode{0};
+    bool ran{false};
+    for (const auto& member : members) {
+        const std::filesystem::path dir{root / member.relPath};
+        // multi_run.rs:885 — the root package is excluded under --workspaces.
+        if (std::filesystem::equivalent(dir, root, ec)) continue;
+        run::PackageScripts pkg{run::load_nearest_package_scripts(dir)};
+        if (!pkg.found || pkg.packageJsonDir != dir || pkg.find(target) == nullptr) continue;
+        std::filesystem::current_path(dir, ec);
+        if (ec) continue;
+        ran = true;
+        // --if-present is a property of the *set* here, not of each member: the
+        // member is known to have the script, so a failure must still surface.
+        RunFlags memberFlags{flags};
+        memberFlags.ifPresent = false;
+        const int rc{exec_run_target(target, passthrough, memberFlags,
+                                     /*allowFastRunForExtensions=*/false, /*binDirsOnly=*/false)};
+        std::filesystem::current_path(cwd, ec);
+        if (rc != 0 && exitCode == 0) exitCode = rc;
+    }
+
+    if (!ran) {
+        if (flags.ifPresent) return 0;
+        std::println(std::cerr, "error: No workspace packages have script \"{}\"", target);
+        return 1;
+    }
+    return exitCode;
 }
 
 bool is_skippable_run_flag(std::string_view a) {

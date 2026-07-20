@@ -2427,7 +2427,11 @@ export constexpr std::string_view kNetJS = R"JS(
     const lines = [method + " " + pathq + " HTTP/1.1"];
     if (!haveHost) lines.push("Host: " + host + (port === 80 ? "" : ":" + port));
     if (!haveConn) lines.push("Connection: keep-alive");  // bun lib.rs:976 CONNECTION_HEADER
-    if (!haveUA) lines.push("User-Agent: Bun/" + ((G.Bun && G.Bun.version) || "1.0"));
+    // `--user-agent <STR>` overrides the built-in default (Arguments.rs:1062).
+    if (!haveUA) {
+      const ovUA = G.__mbunHttpNative && G.__mbunHttpNative.userAgent();
+      lines.push("User-Agent: " + (ovUA || ("Bun/" + ((G.Bun && G.Bun.version) || "1.0"))));
+    }
     if (!haveAccept) lines.push("Accept: */*");
     for (const kv of hdrs) lines.push(kv[0] + ": " + kv[1]);
     if (bodyBytes && !haveCL) lines.push("Content-Length: " + bodyBytes.length);
