@@ -203,6 +203,25 @@ inline constexpr std::string_view kNodeUtilExtraJS = R"JS(
     if (G.TextEncoder) util.TextEncoder = G.TextEncoder;
     if (G.TextDecoder) util.TextDecoder = G.TextDecoder;
 
+    // ------------------------------------------------------------- parseEnv
+    // node lib/util.js parseEnv(content) -> object, backed by the same .env
+    // loader `mbun.dotenv` already drives for process.env (bun does the same:
+    // src/runtime/node/node_util_binding.rs parse_env, OVERRIDE=true).
+    // validate_string accepts a String object, which is exactly what the corpus
+    // pins (util.test.js: util.parseEnv(new String("FOO=bar"))).
+    if (G.__mbunDotenvNative) {
+      util.parseEnv = function parseEnv(content) {
+        if (typeof content !== "string" && !isStringObject(content)) {
+          const err = new TypeError(
+            'The "content" argument must be of type string. Received ' +
+            (content === null ? "null" : typeof content));
+          err.code = "ERR_INVALID_ARG_TYPE";
+          throw err;
+        }
+        return G.__mbunDotenvNative.parse(String(content));
+      };
+    }
+
     // --------------------------- getSystemErrorName / getSystemErrorMap (uv)
     // libuv uv_errno_map for linux (identical to node's util.getSystemErrorMap()
     // output on linux; includes the UV__ fallback space entries EOF/UNKNOWN/

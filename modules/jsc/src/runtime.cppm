@@ -112,6 +112,7 @@ namespace {
 #include "runtime/node_vm.inc"
 // node:os / node:tty system-info bridge (uname/sysinfo/getpwuid/getifaddrs/…).
 #include "runtime/node_os.inc"
+#include "runtime/node_util.inc"
 // Bun.build in-memory bundler bridge → mbun.bundler.build_bundle (vertical slice).
 #include "runtime/bun_build.inc"
 // CAP-S3: AWS SigV4 request signing bridge (__mbunS3Native.sign → mbun.s3_signing).

@@ -1270,6 +1270,11 @@ private:
         set_fn(ctx_, toml, "parse", toml_parse_cb);
         set_prop(ctx_, bun, "TOML", toml);
 
+        // .env text -> object, for node's util.parseEnv (node:util partition).
+        JSObjectRef dotenv{JSObjectMake(ctx_, nullptr, nullptr)};
+        set_fn(ctx_, dotenv, "parse", dotenv_parse_cb);
+        set_prop(ctx_, global, "__mbunDotenvNative", dotenv);
+
 
         // Bun.build → in-memory bundler slice (runtime/bun_build.inc).
         set_native_fn(ctx_, bun, "build", 1, bun_build_host);
