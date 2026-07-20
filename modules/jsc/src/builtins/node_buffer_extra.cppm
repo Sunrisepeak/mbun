@@ -86,6 +86,16 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
       e.code = "ERR_UNKNOWN_ENCODING";
       return e;
     };
+    // WTF::String::MaxLength (== INT32_MAX). Decoding a buffer whose output
+    // would exceed it must throw ERR_STRING_TOO_LONG *before* any allocation
+    // (jsc/bindings/JSBuffer.cpp:jsBufferToStringFromBytes); otherwise a 2 GiB
+    // buffer drags the process into an OOM instead of a catchable error.
+    const MAX_STRING_LENGTH = 0x7fffffff;
+    const errStringTooLong = () => {
+      const e = new Error("Cannot create a string longer than " + MAX_STRING_LENGTH + " characters");
+      e.code = "ERR_STRING_TOO_LONG";
+      return e;
+    };
     const errInvalidBufferSize = (bits) => {
       const e = new RangeError(`Buffer size must be a multiple of ${bits}-bits`);
       e.code = "ERR_INVALID_BUFFER_SIZE";
@@ -344,14 +354,18 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
 
     // ------------------------------------------------- encoding dispatch
     const OPS = {};
-    const defOps = (names, write, slice) => { for (const n of names) OPS[n] = { write, slice }; };
+    // `cap` = the largest input byte count whose decoded output still fits in a
+    // JS string, mirroring jsBufferToStringFromBytes' per-encoding checks.
+    const defOps = (names, write, slice, cap) => {
+      for (const n of names) OPS[n] = { write, slice, cap: cap === undefined ? MAX_STRING_LENGTH : cap };
+    };
     defOps(["utf8", "utf-8"], "utf8Write", "utf8Slice");
     defOps(["ascii"], "asciiWrite", "asciiSlice");
     defOps(["latin1", "binary"], "latin1Write", "latin1Slice");
-    defOps(["base64"], "base64Write", "base64Slice");
-    defOps(["base64url"], "base64urlWrite", "base64urlSlice");
+    defOps(["base64"], "base64Write", "base64Slice", ((MAX_STRING_LENGTH / 4) | 0) * 3);
+    defOps(["base64url"], "base64urlWrite", "base64urlSlice", ((MAX_STRING_LENGTH / 4) | 0) * 3);
     defOps(["ucs2", "ucs-2", "utf16le", "utf-16le"], "ucs2Write", "ucs2Slice");
-    defOps(["hex"], "hexWrite", "hexSlice");
+    defOps(["hex"], "hexWrite", "hexSlice", (MAX_STRING_LENGTH / 2) | 0);
     // NB: no "utf16be" row. It is not an encoding: BufferEncodingType has no
     // such member, so bun and node both throw ERR_UNKNOWN_ENCODING from
     // write/toString/fill and report isEncoding("utf16be") === false.
@@ -497,6 +511,7 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
       let e = end === undefined ? len : trunc0(end);
       if (e > len) e = len;
       if (e <= s) return "";
+      if (e - s > ops.cap) throw errStringTooLong();
       return this[ops.slice](s, e);
     };
 
