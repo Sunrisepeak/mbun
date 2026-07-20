@@ -532,18 +532,34 @@ inline constexpr std::string_view HARNESS = R"JS(
     const scope = makeScope(describeLabel(name), S.current);
     scope.skipped = (S.skipDepth || 0) > 0;
     S.current.items.push({ type: "scope", scope: scope });
-    const prev = S.current; S.current = scope;
-    try { if (typeof fn === "function") fn(); }
-    catch (e) {
-      // bun (Collection.zig): a throw in a describe callback drops the scope —
-      // tests already enqueued in it never run — and is reported as a file-level
-      // error; siblings registered before/after still run.
+    // bun (Collection.zig): a throw in a describe callback drops the scope —
+    // tests already enqueued in it never run — and is reported as a file-level
+    // error; siblings registered before/after still run.
+    function dropScope(e) {
       scope.items.length = 0;
       scope.beforeAll.length = 0; scope.afterAll.length = 0;
       scope.beforeEach.length = 0; scope.afterEach.length = 0;
       S.errors.push((e && e.message !== undefined) ? String(e.message) : String(e));
     }
+    const prev = S.current; S.current = scope;
+    let ret;
+    try { if (typeof fn === "function") ret = fn(); }
+    catch (e) { dropScope(e); }
     finally { S.current = prev; }
+    // An async describe body registers its tests *after* an await and reports
+    // failure as a rejected promise, not a throw. Collection is a synchronous
+    // eval, so without tracking neither ever reaches the runner: the scope keeps
+    // only what was registered before the first await — usually nothing — and
+    // the file reports "0 tests" with a clean exit and no error anywhere
+    // (js/bun/util/mmap.test.js awaits gcTick(), a Bun.sleep(0) timer, and
+    // silently lost all 4 of its tests that way). The counter lets the host
+    // pump the event loop until every body settles; bun's Collection phase is
+    // async for the same reason.
+    if (ret && typeof ret.then === "function") {
+      G.__mbun_describe_pending = (G.__mbun_describe_pending || 0) + 1;
+      const settle = () => { G.__mbun_describe_pending -= 1; };
+      ret.then(settle, (e) => { dropScope(e); settle(); });
+    }
   }
   function makeTest(mode) {
     // Supports test(name, fn) and test(name, options, fn) (the options object —
@@ -1105,6 +1121,7 @@ inline constexpr std::string_view HARNESS = R"JS(
     S.out = []; S.customMatchers = {}; S.errors = []; S.pendingAsserts = [];
     S.timeoutReject = null; S.asyncErr = undefined; S.rand = null; S.skipDepth = 0;
     S.sysTime = null;  // a file's fake system time must not leak into the next
+    G.__mbun_describe_pending = 0;  // async describe bodies of the previous file
     ftUninstall();     // a file's fake timers must not leak into the next either
     __allMocks.length = 0;
   };
@@ -1536,6 +1553,13 @@ RunResult run_source(std::string_view js_source, std::string_view dir = ".", boo
             r.error = "test file evaluation error: " + *err;
             return r;
         }
+    }
+    // 3b. an async describe body registers its tests after an await, which the
+    //     synchronous collection eval above never waits for. Pump until every
+    //     pending body settles, or those tests silently never exist.
+    if (auto pending{rt::eval_to_string("String(globalThis.__mbun_describe_pending|0)")};
+        pending && *pending != "0") {
+        rt::pump_event_loop("(globalThis.__mbun_describe_pending|0)===0");
     }
     // 4. execution: start the async runner, then pump the virtual-time timer queue
     //    (setTimeout/setInterval) interleaved with JSC's end-of-script microtask
