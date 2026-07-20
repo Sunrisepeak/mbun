@@ -5,7 +5,11 @@ import std;
 
 export namespace mbun::jsc::builtins::detail {
 
-inline constexpr std::string_view kBootstrapJS = R"JS(
+// Stored as a sized char array so the string_view is built from {ptr, sizeof-1}
+// rather than char_traits::length — the latter is a constexpr loop that trips
+// -fconstexpr-loop-limit (262144) once this payload crosses ~256 KiB. sizeof is
+// a compile-time constant with no loop, so the payload can grow freely.
+inline constexpr char kBootstrapJS_[] = R"JS(
 (function () {
   "use strict";
   const G = globalThis;
@@ -3260,6 +3264,43 @@ inline constexpr std::string_view kBootstrapJS = R"JS(
     return x && x.toString ? x.toString() : String(x);
   };
   const recur = (o) => !!(o && (o === true || o.recursive));
+  // ---- node fs argument validators (ref lib/internal/fs/utils.js + validators.js) ----
+  // Received-tail mirrors node determineSpecificType / common.invalidArgTypeHelper so the
+  // fs corpus's { code, name, message } matchers (now enforced by the strict assert.throws)
+  // match byte-for-byte, not merely on code. These throw the exact ERR_* node throws.
+  const fsSpecType = (v) => {
+    if (v === null) return "null";
+    if (v === undefined) return "undefined";
+    if (typeof v === "function") return "function " + (v.name || "");
+    if (typeof v === "object") { const n = v.constructor && v.constructor.name; return n ? "an instance of " + n : "an object"; }
+    let ins;
+    if (typeof v === "string") ins = "'" + v + "'";
+    else if (typeof v === "bigint") ins = String(v) + "n";
+    else ins = String(v);
+    if (ins.length > 28) ins = ins.slice(0, 25) + "...";
+    return "type " + typeof v + " (" + ins + ")";
+  };
+  const fsArgTypeErr = (name, expected, value) => { const e = new TypeError('The "' + name + '" argument must be ' + expected + ". Received " + fsSpecType(value)); e.code = "ERR_INVALID_ARG_TYPE"; return e; };
+  const fsRangeErr = (name, range, value) => { const e = new RangeError('The value of "' + name + '" is out of range. It must be ' + range + ". Received " + (typeof value === "bigint" ? String(value) + "n" : String(value))); e.code = "ERR_OUT_OF_RANGE"; return e; };
+  const fsValidateInteger = (value, name, min, max) => {
+    if (typeof value !== "number") throw fsArgTypeErr(name, "of type number", value);
+    if (!Number.isInteger(value)) throw fsRangeErr(name, "an integer", value);
+    if ((min != null && value < min) || (max != null && value > max)) throw fsRangeErr(name, (min != null && max != null) ? ">= " + min + " && <= " + max : (min != null ? ">= " + min : "<= " + max), value);
+    return value;
+  };
+  const fsValidateFd = (fd, name) => fsValidateInteger(fd, name || "fd", 0, 2147483647);
+  const fsMakeCallback = (cb) => { if (typeof cb !== "function") throw fsArgTypeErr("cb", "of type function", cb); return cb; };
+  const fsValidateBuffer = (b) => { if (!ArrayBuffer.isView(b)) throw fsArgTypeErr("buffer", "an instance of Buffer, TypedArray, or DataView", b); return b; };
+  const fsValidatePosition = (position, name) => {
+    if (typeof position === "number") fsValidateInteger(position, name, -1, 0x1fffffffffffff);
+    else if (typeof position === "bigint") { if (position < -(2n ** 63n) || position > 2n ** 63n - 1n) throw fsRangeErr(name, ">= -(2n ** 63n) && <= 2n ** 63n - 1n", position); }
+    else throw fsArgTypeErr(name, "of type number or bigint", position);
+  };
+  const fsParseFileMode = (value, name, def) => {
+    if (value == null && def !== undefined) value = def;
+    if (typeof value === "string") { if (!/^[0-7]+$/.test(value)) { const e = new TypeError("The argument '" + name + "' must be a 32-bit unsigned integer or an octal string. Received " + fsSpecType(value)); e.code = "ERR_INVALID_ARG_VALUE"; throw e; } value = parseInt(value, 8); }
+    return fsValidateInteger(value, name, 0, 4294967295);
+  };
   // node getValidatedPath: a path must be a string, Buffer, or file: URL.
   // Anything else throws TypeError ERR_INVALID_ARG_TYPE *synchronously* (even
   // for the async fs.mkdir form). ref: lib/internal/fs/utils.js.
@@ -3269,9 +3310,7 @@ inline constexpr std::string_view kBootstrapJS = R"JS(
       if (ArrayBuffer.isView(p) || p instanceof ArrayBuffer) return; // Buffer
       if (p.href !== undefined && p.protocol === "file:" && typeof p.pathname === "string") return; // URL
     }
-    const e = new TypeError('The "' + (name || "path") + '" argument must be of type string or an instance of Buffer or URL. Received ' + (p === null ? "null" : typeof p));
-    e.code = "ERR_INVALID_ARG_TYPE";
-    throw e;
+    throw fsArgTypeErr(name || "path", "of type string or an instance of Buffer or URL", p);
   };
   // node mkdir options: number → mode; object → { recursive, mode }. recursive,
   // when present, must be a boolean (validateBoolean → TypeError). Returns the
@@ -3681,6 +3720,67 @@ inline constexpr std::string_view kBootstrapJS = R"JS(
     isCharacterDevice() { return this._type === 6; }
     isBlockDevice() { return this._type === 7; }
   };
+  // ===== node fs argument-validation layer (ref lib/internal/fs/utils.js, validators.js) =====
+  // Override / add the fd- and path-metadata ops so an invalid fd / path / mode / uid / gid
+  // throws the exact ERR_* node throws (now that assert.throws enforces the matcher). Where
+  // mbun has no fd->path map or permission model the syscall stays a no-op AFTER validation.
+  const fsIntU32 = (v, name) => fsValidateInteger(v, name, -1, 4294967295);
+  const fsAsyncOk = (fn) => { const cb = fsMakeCallback(fn); G.queueMicrotask(() => cb(null)); };
+  fsMod.fchmodSync = (fd, mode) => { fsValidateFd(fd); fsParseFileMode(mode, "mode"); };
+  fsMod.fchmod = (fd, mode, cb) => { fsValidateFd(fd); fsParseFileMode(mode, "mode"); fsAsyncOk(cb); };
+  fsMod.lchmodSync = (path, mode) => { validatePath(path); fsParseFileMode(mode, "mode"); };
+  fsMod.lchmod = (path, mode, cb) => { validatePath(path); fsParseFileMode(mode, "mode"); fsAsyncOk(cb); };
+  fsMod.fchownSync = (fd, uid, gid) => { fsValidateFd(fd); fsIntU32(uid, "uid"); fsIntU32(gid, "gid"); };
+  fsMod.fchown = (fd, uid, gid, cb) => { fsValidateFd(fd); fsIntU32(uid, "uid"); fsIntU32(gid, "gid"); fsAsyncOk(cb); };
+  fsMod.lchownSync = (path, uid, gid) => { validatePath(path); fsIntU32(uid, "uid"); fsIntU32(gid, "gid"); };
+  fsMod.lchown = (path, uid, gid, cb) => { validatePath(path); fsIntU32(uid, "uid"); fsIntU32(gid, "gid"); fsAsyncOk(cb); };
+  fsMod.chownSync = (path, uid, gid) => { validatePath(path); fsIntU32(uid, "uid"); fsIntU32(gid, "gid"); };
+  fsMod.chown = (path, uid, gid, cb) => { validatePath(path); fsIntU32(uid, "uid"); fsIntU32(gid, "gid"); fsAsyncOk(cb); };
+  fsMod.fsyncSync = (fd) => { fsValidateFd(fd); };
+  fsMod.fdatasyncSync = (fd) => { fsValidateFd(fd); };
+  fsMod.fsync = (fd, cb) => { fsValidateFd(fd); fsAsyncOk(cb); };
+  fsMod.fdatasync = (fd, cb) => { fsValidateFd(fd); fsAsyncOk(cb); };
+  fsMod.futimesSync = (fd) => { fsValidateFd(fd); };
+  fsMod.futimes = (fd, a, m, cb) => { fsValidateFd(fd); fsAsyncOk(typeof cb === "function" ? cb : m); };
+  fsMod.ftruncateSync = (fd, len) => { fsValidateFd(fd); if (len != null) fsValidateInteger(len, "len"); };
+  fsMod.ftruncate = (fd, len, cb) => { fsValidateFd(fd); if (typeof len === "number") fsValidateInteger(len, "len"); fsAsyncOk(typeof len === "function" ? len : cb); };
+  fsMod.linkSync = (a, b) => { validatePath(a, "existingPath"); validatePath(b, "newPath"); return F.copyFile(toStr(a), toStr(b)); };
+  fsMod.link = (a, b, cb) => { validatePath(a, "existingPath"); validatePath(b, "newPath"); const fn = fsMakeCallback(cb); try { F.copyFile(toStr(a), toStr(b)); G.queueMicrotask(() => fn(null)); } catch (e) { G.queueMicrotask(() => fn(e)); } };
+  fsMod.renameSync = (a, b) => { validatePath(a, "oldPath"); validatePath(b, "newPath"); return F.rename(toStr(a), toStr(b)); };
+  fsMod.rename = (a, b, cb) => { validatePath(a, "oldPath"); validatePath(b, "newPath"); const fn = fsMakeCallback(cb); try { F.rename(toStr(a), toStr(b)); G.queueMicrotask(() => fn(null)); } catch (e) { G.queueMicrotask(() => fn(e)); } };
+  fsMod.unlinkSync = (p) => { validatePath(p); return F.unlink(toStr(p)); };
+  fsMod.readlinkSync = (p) => { validatePath(p); return F.readlink(toStr(p)); };
+  fsMod.copyFileSync = (a, b, m) => { validatePath(a, "src"); validatePath(b, "dest"); return F.copyFile(toStr(a), toStr(b)); };
+  fsMod.stat = (p, a, b) => { validatePath(p); const cb = fsMakeCallback(typeof a === "function" ? a : b); try { cb(null, fsMod.statSync(p, typeof a === "object" ? a : undefined)); } catch (e) { cb(e); } };
+  fsMod.lstat = (p, a, b) => { validatePath(p); const cb = fsMakeCallback(typeof a === "function" ? a : b); try { cb(null, fsMod.lstatSync(p, typeof a === "object" ? a : undefined)); } catch (e) { cb(e); } };
+  fsMod.fstatSync = (fd, o) => { fsValidateFd(fd); const s = F.fstat(fd); return (o && o.bigint) ? mkBigIntStats(s) : Object.setPrototypeOf(s, Stats.prototype); };
+  fsMod.fstat = (fd, a, b) => { fsValidateFd(fd); const cb = fsMakeCallback(typeof a === "function" ? a : b); try { cb(null, fsMod.fstatSync(fd, typeof a === "object" ? a : undefined)); } catch (e) { cb(e); } };
+  // NOTE: fs.read / fs.readSync are intentionally NOT wrapped here. A validating
+  // rewrite regressed valid overloads (offset:null default, options-object form,
+  // promises optional-params) while yielding no net gain — test-fs-read-type /
+  // test-fs-read need exact byte-for-byte range messages that are out of scope.
+  // Left to the dedicated read-validation follow-up.
+  // Path-type validation for the content/dir ops — node validates the path
+  // synchronously (before the callback runs), so an invalid path type throws
+  // ERR_INVALID_ARG_TYPE rather than reaching the fs work. readFile/writeFile
+  // also accept a numeric fd, so those go through fsValidatePathOrFd. Wrapping
+  // keeps every existing behavior and only prepends the guard.
+  const fsValidatePathOrFd = (p) => { if (typeof p === "number") { fsValidateInteger(p, "fd", 0, 2147483647); return; } validatePath(p); };
+  const wrapPath = (orig, guard) => (p, ...rest) => { guard(p); return orig(p, ...rest); };
+  fsMod.readFileSync = wrapPath(fsMod.readFileSync, fsValidatePathOrFd);
+  fsMod.readFile = wrapPath(fsMod.readFile, fsValidatePathOrFd);
+  fsMod.writeFileSync = wrapPath(fsMod.writeFileSync, fsValidatePathOrFd);
+  fsMod.writeFile = wrapPath(fsMod.writeFile, fsValidatePathOrFd);
+  fsMod.appendFileSync = wrapPath(fsMod.appendFileSync, fsValidatePathOrFd);
+  fsMod.appendFile = wrapPath(fsMod.appendFile, fsValidatePathOrFd);
+  fsMod.readdirSync = wrapPath(fsMod.readdirSync, validatePath);
+  fsMod.readdir = wrapPath(fsMod.readdir, validatePath);
+  fsMod.accessSync = wrapPath(fsMod.accessSync, validatePath);
+  fsMod.access = wrapPath(fsMod.access, validatePath);
+  fsMod.realpathSync = wrapPath(fsMod.realpathSync, validatePath);
+  fsMod.realpath = wrapPath(fsMod.realpath, validatePath);
+  fsMod.realpathSync.native = fsMod.realpathSync;
+  fsMod.symlinkSync = wrapPath(fsMod.symlinkSync, validatePath);
   def(["fs"], fsMod);
 
   const P = (fn) => (...a) => { try { return Promise.resolve(fn(...a)); } catch (e) { return Promise.reject(e); } };
@@ -3835,5 +3935,7 @@ inline constexpr std::string_view kBootstrapJS = R"JS(
   def(["string_decoder"], { StringDecoder });
 
 )JS";
+
+inline constexpr std::string_view kBootstrapJS { kBootstrapJS_, sizeof(kBootstrapJS_) - 1 };
 
 }  // namespace mbun::jsc::builtins::detail
