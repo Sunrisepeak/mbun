@@ -106,7 +106,9 @@ inline constexpr std::string_view HARNESS = R"JS(
   const S = { root: root, current: root,
               pass: 0, fail: 0, skip: 0, expectCalls: 0, total: 0, out: [], customMatchers: {},
               timeoutReject: null, errors: [], asyncErr: undefined, todo: 0, pendingAsserts: [],
-              sysTime: null, skippedLabel: 0, onlyTests: 0, onlyScopes: 0 };
+              sysTime: null, skippedLabel: 0, onlyTests: 0, onlyScopes: 0,
+              assertExpected: null, assertHas: false,
+              snapshots: [], snapCounters: {}, curLabel: "" };
   G.__mbunState = S;
   // ── CI detection (`.only` is refused in CI) ────────────────────────────────
   // PORT-SOURCE: bun src/cli/ci_info.rs:23-34 `is_ci_uncached` /
@@ -477,8 +479,21 @@ inline constexpr std::string_view HARNESS = R"JS(
       toHaveLastReturnedWith(v) { const rs = received && received.mock ? received.mock.results : []; check(rs.length > 0 && rs[rs.length - 1].type === "return" && deepEqual(rs[rs.length - 1].value, v), () => "toHaveLastReturnedWith(" + fmt(v) + ")"); return m; },
       toHaveNthReturnedWith(n, v) { const rs = received && received.mock ? received.mock.results : []; check(rs.length >= n && rs[n - 1].type === "return" && deepEqual(rs[n - 1].value, v), () => "toHaveNthReturnedWith"); return m; },
       // snapshot matchers (best-effort: compare a jest-ish serialization when an
-      // inline snapshot is supplied; record-and-pass when none is — no snapshot file)
-      toMatchSnapshot() { return m; },
+      // inline snapshot is supplied; record-and-pass when none is). A recorded
+      // snapshot is flushed to `__snapshots__/<file>.snap` at end-of-file IF that
+      // file does not yet exist (bun writes new snapshots when they are missing;
+      // it does NOT rewrite an existing one unless --update). Comparison against an
+      // existing .snap is DEFERRED — record-and-pass keeps current semantics for
+      // files that already ship a snapshot. (issue: snapshot-tests/new-snapshot)
+      toMatchSnapshot() {
+        try {
+          const key = S.curLabel || "";
+          S.snapCounters = S.snapCounters || {};
+          const n = (S.snapCounters[key] = (S.snapCounters[key] || 0) + 1);
+          (S.snapshots || (S.snapshots = [])).push({ key: key + " " + n, value: snapSerialize(received, "") });
+        } catch (e) {}
+        return m;
+      },
       toMatchInlineSnapshot(snap) {
         if (snap === undefined) return m;  // no inline arg → record mode
         const ser = snapSerialize(received);
@@ -594,6 +609,23 @@ inline constexpr std::string_view HARNESS = R"JS(
         throw new TypeError("expect.extend: `" + name + "` is not a valid matcher. Received " + typeof obj[name]);
     }
     Object.assign(S.customMatchers, obj);
+    // bun (expect.rs makeAsymmetricMatchers / expect_static): every extended
+    // matcher is ALSO exposed statically on `expect` so `expect.myMatcher(...exp)`
+    // builds an asymmetric matcher whose asymmetricMatch(actual) runs the matcher
+    // against `actual`. Exceptions the matcher throws propagate out of
+    // asymmetricMatch unchanged (issue: _toThrowOnMatch). Registering the statics
+    // also makes `expect.<name>` defined for the "is my matcher installed?" probe
+    // (@testing-library/jest-dom, issue #16312).
+    for (const name of Object.keys(obj)) {
+      const matcherFn = obj[name];
+      expect[name] = function (...expected) {
+        return asym(name, function (actual) {
+          const ctx = { isNot: false, equals: deepEqual, promise: "", utils: { printReceived: fmt, printExpected: fmt, matcherHint: () => "", stringify: fmt, EXPECTED_COLOR: (s) => s, RECEIVED_COLOR: (s) => s } };
+          const res = matcherFn.call(ctx, actual, ...expected) || {};
+          return !!res.pass;
+        });
+      };
+    }
     return expect;
   };
   // Asymmetric matchers. Recognised by deepEqual via `instanceof AsymmetricMatcher`,
@@ -632,7 +664,11 @@ inline constexpr std::string_view HARNESS = R"JS(
   expect.stringMatching = (re) => asym("stringMatching", (v) => typeof v === "string" && (re instanceof RegExp ? re.test(v) : v.indexOf(String(re)) !== -1));
   expect.closeTo = (n, d) => asym("closeTo", (v) => typeof v === "number" && Math.abs(v - n) < Math.pow(10, -(d === undefined ? 2 : d)) / 2);
   expect.not = { objectContaining: (o) => asym("not.objectContaining", (v) => !expect.objectContaining(o).match(v)), arrayContaining: (a) => asym("not.arrayContaining", (v) => !expect.arrayContaining(a).match(v)), stringContaining: (s) => asym("not.stringContaining", (v) => !expect.stringContaining(s).match(v)), stringMatching: (r) => asym("not.stringMatching", (v) => !expect.stringMatching(r).match(v)) };
-  expect.assertions = () => {}; expect.hasAssertions = () => {};
+  // expect.assertions(n) / expect.hasAssertions() (expect.rs assertions/hasAssertions):
+  // record the expectation on the CURRENT test; runTest verifies the number of
+  // expect() calls made during the body once it settles. Reset per test in runTest.
+  expect.assertions = (n) => { S.assertExpected = (typeof n === "number") ? n : 0; };
+  expect.hasAssertions = () => { S.assertHas = true; };
 
   // bun ScopeFunctions.rs:557-597 get_description: a class/function first arg
   // labels the scope by its NAME (not its source); unnamed → throw.
@@ -1287,6 +1323,12 @@ inline constexpr std::string_view HARNESS = R"JS(
       else { S.skip++; S.out.push("(skip) " + label); }
       return;
     }
+    // expect.assertions(n)/hasAssertions() bookkeeping: reset the expectation for
+    // this test and snapshot the running expect()-call counter so we can measure
+    // how many the body makes (verified after it settles, below).
+    S.assertExpected = null; S.assertHas = false;
+    S.curLabel = t.name;  // toMatchSnapshot keys off the test's own name (not the full path)
+    const expectBaseline = S.expectCalls;
     // bun prints thrown (non-assertion) errors as "error: <message>"; assertion
     // failures print the expect() message directly.
     const errMsg = (e) => ((e && e.name === "AssertionError") ? "" : "error: ") +
@@ -1361,6 +1403,24 @@ inline constexpr std::string_view HARNESS = R"JS(
     } catch (e) { failed = true; msg = errMsg(e); }
     try { for (const h of ae) await callHook(h); }
     catch (e) { if (!failed) { failed = true; msg = errMsg(e); } }
+    // expect.assertions(n)/hasAssertions(): a body that settled without failing
+    // still fails if it did not make the promised number of expect() calls
+    // (expect.rs check_assertions, run after the body + afterEach). A timed-out or
+    // already-failed test keeps its original failure.
+    if (!failed) {
+      const made = S.expectCalls - expectBaseline;
+      const plural = (k) => k === 1 ? " assertion" : " assertions";
+      if (S.assertExpected !== null && made !== S.assertExpected) {
+        // bun expect.zig: "AssertionError: expected N assertion(s), but test ended
+        // with M assertion(s)" (bun_test.test.ts snapshot line 64).
+        failed = true;
+        msg = "AssertionError: expected " + S.assertExpected + plural(S.assertExpected) +
+              ", but test ended with " + made + plural(made);
+      } else if (S.assertHas && made === 0) {
+        failed = true;
+        msg = "AssertionError: expected at least one assertion to be called but received none";
+      }
+    }
     if (t.mode === "todo") {  // running under --todo
       if (failed) {
         S.todo++; S.out.push("(todo) " + label);
@@ -1408,10 +1468,32 @@ inline constexpr std::string_view HARNESS = R"JS(
     S.timeoutReject = null; S.asyncErr = undefined; S.rand = null; S.skipDepth = 0;
     S.todoDepth = 0;   // a describe.todo left open by a throwing body
     S.sysTime = null;  // a file's fake system time must not leak into the next
+    S.snapshots = []; S.snapCounters = {}; S.curLabel = "";  // snapshot state is per-file
     G.__mbun_describe_pending = 0;  // async describe bodies of the previous file
     ftUninstall();     // a file's fake timers must not leak into the next either
     __allMocks.length = 0;
   };
+
+  // Flush toMatchSnapshot() records to `__snapshots__/<file>.snap`, but only when
+  // that file does not already exist (bun writes new snapshots; it never rewrites
+  // an existing one without --update). Best-effort and fully guarded: any failure
+  // leaves the recorded snapshots as a no-op pass, so this can never fail a test.
+  function flushSnapshots() {
+    try {
+      if (!S.snapshots || !S.snapshots.length) return;
+      if (typeof G.require !== "function" || !G.__filename) return;
+      const fs = G.require("fs"), path = G.require("path");
+      const snapDir = path.join(path.dirname(G.__filename), "__snapshots__");
+      const snapFile = path.join(snapDir, path.basename(G.__filename) + ".snap");
+      if (fs.existsSync(snapFile)) return;   // never clobber an existing snapshot
+      fs.mkdirSync(snapDir, { recursive: true });
+      const esc = (s) => String(s).replace(/\\/g, "\\\\").replace(/`/g, "\\`").replace(/\$\{/g, "\\${");
+      const snaps = S.snapshots.slice().sort((a, b) => a.key < b.key ? -1 : a.key > b.key ? 1 : 0);
+      let body = "// Bun Snapshot v1, https://goo.gl/fbAQLP\n\n";
+      for (const s of snaps) body += "exports[`" + esc(s.key) + "`] = `\n" + esc(s.value) + "\n`;\n\n";
+      fs.writeFileSync(snapFile, body);
+    } catch (e) {}
+  }
 
   G.__mbun_run = async function () {
     G.__mbun_done = false;
@@ -1422,6 +1504,7 @@ inline constexpr std::string_view HARNESS = R"JS(
     if (S.onlyTests > 0 || S.onlyScopes > 0) pruneToOnly(S.root, false);
     try { await runScope(S.root, [], []); }
     catch (e) { S.fail++; S.out.push("(fail) <scope error> " + ((e && e.message) || e)); }
+    flushSnapshots();
     G.__mbun_pass = S.pass; G.__mbun_fail = S.fail; G.__mbun_skip = S.skip;
     G.__mbun_todo = S.todo; G.__mbun_skipped_label = S.skippedLabel;
     G.__mbun_expect = S.expectCalls; G.__mbun_total = S.total;
