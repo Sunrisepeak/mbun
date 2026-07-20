@@ -748,14 +748,33 @@ JSValueRef shell_parse_errors_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std
 
 // ── Bun.TOML.parse → real JS object tree ────────────────────────────────────
 
-JSValueRef toml_to_js(JSContextRef ctx, const mbun::toml::Value& v) {
+// Deepest table/array nesting Bun.TOML.parse materialises into JS. TOML's own
+// array/inline-table parse is depth-capped (toml.cppm MAX_DEPTH), but DOTTED
+// KEYS and headers are parsed ITERATIVELY — `a.a.a.…= 1` builds a Value tree as
+// deep as the key has segments with no parse-time limit, and the recursive
+// conversion below then runs the native stack out (SIGSEGV, whole process).
+// bun surfaces that as a catchable RangeError instead.
+// ref: compat/bun/test/js/bun/toml/toml.test.ts
+//      "extremely deep dotted keys and headers throw instead of crashing"
+// Well above the 1000-segment depth the suite requires to parse successfully
+// ("deep dotted keys parse beyond the old 512-segment cap"), well under what
+// either conversion can survive.
+constexpr int kTomlMaxJsDepth{4096};
+
+JSValueRef toml_to_js(JSContextRef ctx, const mbun::toml::Value& v, int depth, bool& tooDeep) {
     using Type = mbun::toml::Type;
+    if (depth > kTomlMaxJsDepth) [[unlikely]] {
+        tooDeep = true;
+        return JSValueMakeUndefined(ctx);
+    }
     switch (v.type()) {
     case Type::Table: {
         JSObjectRef o{JSObjectMake(ctx, nullptr, nullptr)};
         for (const auto& [k, child] : v.table().entries) {
+            JSValueRef cv{toml_to_js(ctx, child, depth + 1, tooDeep)};
+            if (tooDeep) return o;
             JSStringRef key{JSStringCreateWithUTF8CString(k.c_str())};
-            JSObjectSetProperty(ctx, o, key, toml_to_js(ctx, child), kJSPropertyAttributeNone, nullptr);
+            JSObjectSetProperty(ctx, o, key, cv, kJSPropertyAttributeNone, nullptr);
             JSStringRelease(key);
         }
         return o;
@@ -764,7 +783,10 @@ JSValueRef toml_to_js(JSContextRef ctx, const mbun::toml::Value& v) {
         const auto& arr{v.array()};
         std::vector<JSValueRef> elems;
         elems.reserve(arr.size());
-        for (const auto& e : arr) elems.push_back(toml_to_js(ctx, e));
+        for (const auto& e : arr) {
+            elems.push_back(toml_to_js(ctx, e, depth + 1, tooDeep));
+            if (tooDeep) return JSValueMakeUndefined(ctx);
+        }
         return JSObjectMakeArray(ctx, elems.size(), elems.empty() ? nullptr : elems.data(), nullptr);
     }
     case Type::String:
@@ -790,8 +812,12 @@ JSValueRef toml_to_js(JSContextRef ctx, const mbun::toml::Value& v) {
 // build the text + ONE JSC LiteralParser pass to build the object tree beats
 // thousands of per-node C API calls (JSStringCreateWithUTF8CString +
 // JSObjectSetProperty full property machinery per key).
-bool toml_json(const mbun::toml::Value& v, std::string& out) {
+bool toml_json(const mbun::toml::Value& v, std::string& out, int depth, bool& tooDeep) {
     using Type = mbun::toml::Type;
+    if (depth > kTomlMaxJsDepth) [[unlikely]] {
+        tooDeep = true;
+        return false;
+    }
     static constexpr auto escape{[](std::string_view s, std::string& o) {
         o.push_back('"');
         for (unsigned char c : s) {
@@ -825,7 +851,7 @@ bool toml_json(const mbun::toml::Value& v, std::string& out) {
             first = false;
             escape(k, out);
             out.push_back(':');
-            if (!toml_json(child, out)) return false;
+            if (!toml_json(child, out, depth + 1, tooDeep)) return false;
         }
         out.push_back('}');
         return true;
@@ -836,7 +862,7 @@ bool toml_json(const mbun::toml::Value& v, std::string& out) {
         for (const auto& e : v.array()) {
             if (!first) out.push_back(',');
             first = false;
-            if (!toml_json(e, out)) return false;
+            if (!toml_json(e, out, depth + 1, tooDeep)) return false;
         }
         out.push_back(']');
         return true;
@@ -871,7 +897,18 @@ JSValueRef toml_parse_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t
     JsStrArg src{ctx, argc > 0 ? args[0] : nullptr};
     auto r{mbun::toml::parse(src.view())};
     if (!r) {
-        if (exc != nullptr) *exc = make_string(ctx, "TOML parse error: " + r.error().message);
+        // bun: a parse failure is a `SyntaxError` instance whose message is
+        // "TOML Parse error: <detail>"; the depth guard's overflow is a
+        // `RangeError` ("Maximum call stack size exceeded") instead — the toml
+        // module marks that case with a "RangeError: " message prefix.
+        // ref: compat/bun/src/runtime/api/TOMLObject.rs:26-46
+        const std::string& msg{r.error().message};
+        constexpr std::string_view kOverflow{"RangeError: "};
+        if (exc != nullptr) {
+            *exc = msg.starts_with(kOverflow)
+                       ? make_range_error(ctx, "Maximum call stack size exceeded")
+                       : make_syntax_error(ctx, "TOML Parse error: " + msg);
+        }
         return JSValueMakeUndefined(ctx);
     }
     // Fast path: serialize to JSON text and let JSC's parser build the whole
@@ -880,14 +917,22 @@ JSValueRef toml_parse_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t
     // beats thousands of per-node JSObjectSetProperty calls.
     std::string json;
     json.reserve(src.view().size() + src.view().size() / 2);
-    if (toml_json(*r, json)) {
+    bool tooDeep{false};
+    if (toml_json(*r, json, 0, tooDeep)) {
         JSStringRef text{JSStringCreateWithUTF8CString(json.c_str())};
         JSValueRef val{JSValueMakeFromJSONString(ctx, text)};
         JSStringRelease(text);
         if (val != nullptr && !JSValueIsUndefined(ctx, val)) return val;
     }
-    // Fallback (non-finite floats / invalid UTF-8): per-node construction.
-    return toml_to_js(ctx, *r);
+    if (!tooDeep) {
+        // Fallback (non-finite floats / invalid UTF-8): per-node construction.
+        JSValueRef val{toml_to_js(ctx, *r, 0, tooDeep)};
+        if (!tooDeep) return val;
+    }
+    // Nesting past kTomlMaxJsDepth: report the overflow the way bun does rather
+    // than recursing the native stack to death.
+    if (exc != nullptr) *exc = make_range_error(ctx, "Maximum call stack size exceeded");
+    return JSValueMakeUndefined(ctx);
 }
 
 // ── Bun.Glob (JS class: instance stores pattern, .match(path) → bool) ─────────
