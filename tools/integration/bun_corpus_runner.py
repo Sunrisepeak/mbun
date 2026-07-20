@@ -152,6 +152,34 @@ def run_one(
                   duration_ms, str(relative_log))
 
 
+def ensure_corpus_dependencies(corpus_root: Path) -> None:
+    """Refuse to measure a corpus whose npm dependencies are not installed.
+
+    `node_modules/` is gitignored inside the bun submodule, so a fresh clone
+    starts empty -- and 264 of the 1902 files then die at file evaluation with
+    "Cannot find module" before a single assertion runs (esbuild alone accounts
+    for 76: test/bundler/expectBundled.ts imports it at the top of the shared
+    bundler harness). Those files look like one-assertion near-misses in the
+    results while actually being dead, which silently misdirects a whole round
+    of triage. Fail loudly instead.
+    """
+    missing = [
+        directory
+        for directory in (corpus_root, corpus_root / "test")
+        if not (directory / "node_modules").is_dir()
+    ]
+    if missing:
+        listed = "\n".join(f"  (cd {directory} && bun install --frozen-lockfile)"
+                            for directory in missing)
+        raise SystemExit(
+            "bun_corpus_runner: corpus dependencies are not installed, so hundreds "
+            "of files would fail as 'Cannot find module' instead of being "
+            f"measured. Install them first:\n{listed}\n"
+            "(pass --allow-missing-node-modules to measure the un-provisioned "
+            "state on purpose)"
+        )
+
+
 def read_list(path: Path) -> list[str]:
     values: list[str] = []
     for line in path.read_text(encoding="utf-8").splitlines():
@@ -236,6 +264,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--timeout", type=float, default=30.0)
     parser.add_argument(
+        "--allow-missing-node-modules", action="store_true",
+        help="measure even when the corpus npm dependencies are absent",
+    )
+    parser.add_argument(
         "--blocked-manifest", type=Path, default=DEFAULT_BLOCKED_MANIFEST,
         help="paths that time out only because a service/registry/toolchain is "
              "absent; they are reported as blocked-external instead of timeout",
@@ -266,6 +298,8 @@ def main() -> int:
     if not paths:
         raise SystemExit("no test files selected")
 
+    if not args.allow_missing_node_modules:
+        ensure_corpus_dependencies((args.cwd or root).resolve())
     blocked_patterns = load_patterns(args.blocked_manifest.resolve())
     output_dir.mkdir(parents=True, exist_ok=True)
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as executor:

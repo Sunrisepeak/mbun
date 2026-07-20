@@ -34,7 +34,7 @@ printf '%s\n' '# self-test manifest' 'blockedsvc.test.ts' >"$tmp/blocked.txt"
 
 python3 "$repo_root/tools/integration/bun_corpus_runner.py" \
   --bin "$tmp/fake-mbun" --root "$repo_root" --list "$tmp/list.txt" \
-  --blocked-manifest "$tmp/blocked.txt" \
+  --blocked-manifest "$tmp/blocked.txt" --allow-missing-node-modules \
   --out "$tmp/out" --jobs 2 --timeout 0.1 >/dev/null
 
 python3 - "$tmp/out" <<'PY'
@@ -64,7 +64,7 @@ touch "$tmp/corpus/a/b/one.test.ts" "$tmp/corpus/a/b/two.test.js" \
   "$tmp/corpus/a/b/not-a-test.ts" "$tmp/corpus/a/c/three.test.ts"
 
 python3 "$repo_root/tools/integration/bun_corpus_runner.py" \
-  --bin "$tmp/fake-mbun" --root "$tmp" --discover "$tmp/corpus" \
+  --bin "$tmp/fake-mbun" --root "$tmp" --discover "$tmp/corpus" --allow-missing-node-modules \
   --sample-per-group 1 --out "$tmp/discovered" --jobs 1 >/dev/null
 
 test "$(wc -l <"$tmp/discovered/selected-tests.txt")" -eq 2
@@ -72,7 +72,7 @@ grep -Eq '^corpus/a/b/(one\.test\.ts|two\.test\.js)$' "$tmp/discovered/selected-
 grep -Fxq 'corpus/a/c/three.test.ts' "$tmp/discovered/selected-tests.txt"
 
 python3 "$repo_root/tools/integration/bun_corpus_runner.py" \
-  --bin "$tmp/fake-mbun" --root "$tmp" --discover "$tmp/corpus" \
+  --bin "$tmp/fake-mbun" --root "$tmp" --discover "$tmp/corpus" --allow-missing-node-modules \
   --sample-per-group 1 --max-files 1 --out "$tmp/capped" --jobs 1 >/dev/null
 test "$(wc -l <"$tmp/capped/selected-tests.txt")" -eq 1
 
