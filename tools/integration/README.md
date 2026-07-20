@@ -42,6 +42,9 @@ frozen machine or a silently murdered harness.
   `http://127.0.0.1:3000/`, asserts a 2xx, then reaps the whole process tree
   (`bounded_run.BoundedServer`). Sequential by design: the demos all hardcode
   port 3000. `--app <name>` runs one; CI runs the full set on the gcc lane.
+  An app whose `node_modules` is missing is reported as `skipped-no-deps`
+  unless `--install` is passed (bootstrapping through `mbun install` does not
+  currently finish for the framework demos).
 
 ## Self-tests
 

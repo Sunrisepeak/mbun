@@ -40,7 +40,9 @@ cat >"$tmp/manifest.json" <<EOF
   {"name": "ok-app",     "args": ["serve-ok", "$port"]},
   {"name": "bad-app",    "args": ["serve-500", "$port"]},
   {"name": "crash-app",  "args": ["crash", "$port"]},
-  {"name": "silent-app", "args": ["silent", "$port"]}
+  {"name": "silent-app", "args": ["silent", "$port"]},
+  {"name": "needs-deps", "args": ["serve-ok", "$port"],
+   "install": ["install"], "node_modules": "no-such-node_modules"}
 ]
 EOF
 
@@ -57,18 +59,23 @@ python3 - "$tmp/out" <<'PY'
 import csv, json, pathlib, sys
 root = pathlib.Path(sys.argv[1])
 rows = list(csv.DictReader((root / "results.tsv").open(), delimiter="\t"))
-assert [row["name"] for row in rows] == ["ok-app", "bad-app", "crash-app", "silent-app"], rows
+assert [row["name"] for row in rows] == [
+    "ok-app", "bad-app", "crash-app", "silent-app", "needs-deps",
+], rows
 assert [row["classification"] for row in rows] == [
-    "ok", "bad-status", "start-error", "no-response",
+    "ok", "bad-status", "start-error", "no-response", "skipped-no-deps",
 ], [row["classification"] for row in rows]
 assert rows[0]["status"] == "200" and rows[1]["status"] == "500"
 summary = json.loads((root / "summary.json").read_text())
 assert summary == {
-    "apps": 4, "ok": 1,
-    "categories": {"bad-status": 1, "no-response": 1, "ok": 1, "start-error": 1},
+    "apps": 5, "ok": 1, "skipped": 1,
+    "categories": {"bad-status": 1, "no-response": 1, "ok": 1, "skipped-no-deps": 1,
+                   "start-error": 1},
 }, summary
 for row in rows:
-    assert (root / row["log"]).exists(), row
+    # A skipped app never launched, so it has no server log.
+    if row["classification"] != "skipped-no-deps":
+        assert (root / row["log"]).exists(), row
 print("test_smoke_examples: ok")
 PY
 

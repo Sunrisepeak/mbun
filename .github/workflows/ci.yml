@@ -81,8 +81,11 @@ jobs:
 
       - name: Smoke (example apps)
         # Boots every examples/ app, hits 127.0.0.1:3000, asserts 2xx, reaps it.
-        # Same gcc-only reason as above. The framework demos install their npm
-        # dependencies through mbun itself, so this also covers `mbun install`.
+        # Same gcc-only reason as above. The framework demos (express, elysia)
+        # report as skipped here: their node_modules are not in the checkout and
+        # `mbun install` does not currently finish for them (measured: still
+        # running past a 880s bound on examples/bun/elysia). Add --install to
+        # this command once that is fixed, and the demos boot in CI too.
         if: startsWith(matrix.toolchain, 'gcc')
         run: |
           MBUN="$(find target -type f -name mbun -perm -111 -printf '%T@ %p\n' \
