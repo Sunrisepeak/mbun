@@ -18,6 +18,8 @@ case "$2" in
   *outoftest*) printf '# Unhandled error between tests\nerror: boom\n  1 pass\n  0 fail\n  1 error\n  1 expect() calls\nRan 1 test across 1 file.\n' ;;
   # Loaded cleanly, declares no tests (comment-only / type-only corpus files).
   *notests*) printf '  0 pass\n  0 fail\nRan 0 tests across 1 file. [12.00ms]\n' ;;
+  # Ran a test, then a native fault -- the crash handler prints its banner.
+  *crash*) printf '  1 pass\n  1 fail\nRan 2 tests across 1 file.\n=== mbun crashed: SIGABRT (abort) ===\n--- raw backtrace ---\n=== end mbun crash report ===\n'; exit 134 ;;
   # Exits 0 too, but died before registering anything -- still a load error.
   *unhandled*) printf '# Unhandled error between tests\nerror: X is not a function\n  0 pass\n  0 fail\n  1 error\nRan 0 tests across 1 file. [9.00ms]\n' ;;
   *) printf 'error: test file evaluation error\nRan 0 tests (file did not load/run).\n'; exit 1 ;;
@@ -26,7 +28,7 @@ EOF
 chmod +x "$tmp/fake-mbun"
 printf '%s\n' green.test.ts red.test.ts load.test.ts timeout.test.ts \
   dependency.test.ts fixture.test.ts native-build.test.ts notests.test.ts \
-  unhandled.test.ts outoftest.test.ts blockedsvc.test.ts >"$tmp/list.txt"
+  unhandled.test.ts outoftest.test.ts blockedsvc.test.ts crash.test.ts >"$tmp/list.txt"
 
 # A file that only times out because a service is missing is reported as
 # blocked-external, and ONLY when it is on the manifest.
@@ -44,14 +46,14 @@ rows = list(csv.DictReader((root / "results.tsv").open(), delimiter="\t"))
 assert [row["classification"] for row in rows] == [
     "green", "test-failure", "load-error", "timeout", "missing-dependency",
     "missing-fixture", "fixture-build-error", "no-tests", "load-error", "test-failure",
-    "blocked-external",
+    "blocked-external", "crash",
 ], [row["classification"] for row in rows]
-assert [int(row["passed"]) for row in rows] == [2, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0]
+assert [int(row["passed"]) for row in rows] == [2, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1]
 summary = json.loads((root / "summary.json").read_text())
-assert summary["files"] == 11
-assert summary["passed"] == 4 and summary["failed"] == 1
+assert summary["files"] == 12
+assert summary["passed"] == 5 and summary["failed"] == 2
 assert summary["categories"] == {
-    "blocked-external": 1, "fixture-build-error": 1, "green": 1,
+    "blocked-external": 1, "crash": 1, "fixture-build-error": 1, "green": 1,
     "load-error": 2, "no-tests": 1, "missing-dependency": 1,
     "missing-fixture": 1, "test-failure": 2, "timeout": 1,
 }, summary["categories"]
