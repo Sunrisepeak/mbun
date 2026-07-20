@@ -13,6 +13,7 @@ export module mbun.jsc.runtime;
 import std;
 import mbun.semver;
 import mbun.toml;
+import mbun.ini;
 import mbun.glob;
 import mbun.which;
 import mbun.shell;

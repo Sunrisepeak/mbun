@@ -3143,6 +3143,7 @@ inline constexpr std::string_view kBootstrapJS = R"JS(
     },
     // xxHash3ForTesting(bytes, seed?) — full-u64-seed XXH3_64bits (native).
     xxHash3ForTesting: G.__mbunXxHash3ForTesting,
+    iniInternals:(N=>N?{parse:s=>N.parse(String(s))}:void 0)(G.__mbunIniNative),
     // bun internal-for-testing.ts:273 → socket_body.rs js_set_socket_options:
     // which 1=send(SO_SNDBUF)/2=recv(SO_RCVBUF), size in bytes.
     setSocketOptions: (socket, which, size) => {

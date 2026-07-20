@@ -1634,7 +1634,14 @@ std::string strip_evaluation_wrapper(const std::string& message) {
         const std::size_t eol{message.find('\n', at)};
         return message.substr(at, eol == std::string::npos ? std::string::npos : eol - at);
     }
-    return "test file evaluation error: " + message;
+    // bun surfaces an uncaught error thrown while evaluating a test file with a
+    // bare `error: <message>` line (test_command.rs) — no "test file evaluation
+    // error:" framing, and a base `Error` drops its class-name prefix (a typed
+    // error such as TypeError:/RangeError: keeps it). ref:
+    // compat/bun/test/js/bun/test/describe.test.ts "throws an error if two arguments".
+    std::string_view m{message};
+    if (m.starts_with("Error: ")) m.remove_prefix(std::string_view{"Error: "}.size());
+    return std::string{m};
 }
 
 // Run a prepared/inline bun:test source in the shared runtime context. `dir` is

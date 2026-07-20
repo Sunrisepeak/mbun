@@ -26,6 +26,7 @@ resolver = { path = "../resolver" }
 js       = { path = "../js" }
 semver = { path = "../semver" }
 toml   = { path = "../toml" }
+ini    = { path = "../ini" }
 glob   = { path = "../glob" }
 image  = { path = "../image" }
 shell  = { path = "../shell" }

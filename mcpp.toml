@@ -36,6 +36,7 @@ dns      = { path = "modules/dns" }
 dotenv   = { path = "modules/dotenv" }
 install  = { path = "modules/install" }
 toml     = { path = "modules/toml" }
+ini      = { path = "modules/ini" }
 bunfig   = { path = "modules/bunfig" }
 http     = { path = "modules/http" }
 bundler  = { path = "modules/bundler" }
