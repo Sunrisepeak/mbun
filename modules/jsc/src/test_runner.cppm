@@ -106,7 +106,7 @@ inline constexpr std::string_view HARNESS = R"JS(
   const S = { root: root, current: root,
               pass: 0, fail: 0, skip: 0, expectCalls: 0, total: 0, out: [], customMatchers: {},
               timeoutReject: null, errors: [], asyncErr: undefined, todo: 0, pendingAsserts: [],
-              sysTime: null, skippedLabel: 0 };
+              sysTime: null, skippedLabel: 0, onlyTests: 0, onlyScopes: 0 };
   G.__mbunState = S;
   // Attribute errors thrown from queueMicrotask/process.nextTick callbacks to the
   // currently-running test (bun: an async exception while a test is in flight
@@ -174,6 +174,9 @@ inline constexpr std::string_view HARNESS = R"JS(
   // bun/jest toEqual semantics: undefined-valued own keys are ignored (strictKeys
   //=false); toStrictEqual keeps them and compares prototypes. Cycle-safe via a
   // visited-pair map. Date/RegExp/Error/Map/Set/TypedArray/ArrayBuffer aware.
+  // Sentinel for an array slot that carries no data value (hole, accessor, or
+  // an index past the end) — bun's getIndexWithoutAccessors "empty".
+  const HOLE = { __mbunArrayHole: true };
   function deepEqualImpl(a, b, strictKeys, seen) {
     // asymmetric matcher on either side (expect.any / objectContaining / …)
     if (isAsym(b)) return b.match(a);
@@ -222,6 +225,34 @@ inline constexpr std::string_view HARNESS = R"JS(
         return true;
       }
       if (strictKeys && Object.getPrototypeOf(a) !== Object.getPrototypeOf(b)) return false;
+      // Arrays compare by index + length ONLY. bun's Bun__deepEquals
+      // (bindings.cpp) walks the array branch reading slots with
+      // getIndexWithoutAccessors — a hole, an out-of-range index and an accessor
+      // slot are all "empty" and none of them is `undefined` — and then
+      // enumerates own property names with PropertyNameMode::Symbols, so
+      // string-keyed extras are never compared. That is what makes
+      // expect(/x/.exec(s)).toEqual(["x"]) pass despite the match array's own
+      // `index`/`input`/`groups` (issue 15314).
+      if (Array.isArray(a) && Array.isArray(b)) {
+        const slot = (o, i) => {
+          const d = Object.getOwnPropertyDescriptor(o, i);
+          return (d === undefined || !("value" in d)) ? HOLE : d.value;
+        };
+        if (strictKeys && a.length !== b.length) return false;
+        const n = Math.max(a.length, b.length);
+        for (let i = 0; i < n; i++) {
+          const av = slot(a, i), bv = slot(b, i);
+          if (strictKeys) {
+            if ((av === HOLE) !== (bv === HOLE)) return false;
+            if (av === HOLE) continue;
+          } else if ((av === HOLE || bv === HOLE) && (av === undefined || bv === undefined)) {
+            continue;   // empty-vs-undefined is equal in the loose comparison
+          }
+          if (!deepEqualImpl(av === HOLE ? undefined : av, bv === HOLE ? undefined : bv,
+                             strictKeys, seen)) return false;
+        }
+        return true;
+      }
       const keep = (o) => (k) => strictKeys || o[k] !== undefined;
       const ak = Object.keys(a).filter(keep(a)), bk = Object.keys(b).filter(keep(b));
       if (ak.length !== bk.length) return false;
@@ -265,7 +296,30 @@ inline constexpr std::string_view HARNESS = R"JS(
         if (typeof received === "string") ok = received.indexOf(x) !== -1;
         else if (received && typeof received.length === "number") ok = Array.prototype.indexOf.call(received, x) !== -1;
         check(ok, () => "expect(received).toContain(" + fmt(x) + ")\n\nReceived: " + fmt(received)); return m; },
-      toHaveLength(n) { check(received != null && received.length === n, () => "expect(received).toHaveLength(" + fmt(n) + ")\n\nReceived length: " + (received == null ? "n/a" : received.length)); return m; },
+      // bun JSC__JSValue__getLengthIfPropertyExistsInternal (bindings.cpp:2404):
+      // toHaveLength reads a TYPE-specific length before falling back to the
+      // `length` property — byteLength for ArrayBuffer/DataView, size for
+      // Map/Set/WeakMap/Blob/Headers. `Bun.file(p).arrayBuffer()` hands back an
+      // ArrayBuffer, which has no `.length` at all.
+      toHaveLength(n) {
+        const lengthOf = (v) => {
+          if (v == null) return undefined;
+          if (typeof v === "string") return v.length;
+          if (typeof v.length === "number") return v.length;
+          if (typeof G.ArrayBuffer === "function" && v instanceof G.ArrayBuffer) return v.byteLength;
+          if (typeof G.SharedArrayBuffer === "function" && v instanceof G.SharedArrayBuffer) return v.byteLength;
+          if (typeof G.DataView === "function" && v instanceof G.DataView) return v.byteLength;
+          if (typeof v.size === "number" &&
+              ((typeof G.Map === "function" && v instanceof G.Map) ||
+               (typeof G.Set === "function" && v instanceof G.Set) ||
+               (typeof G.WeakMap === "function" && v instanceof G.WeakMap) ||
+               (typeof G.WeakSet === "function" && v instanceof G.WeakSet) ||
+               (typeof G.Blob === "function" && v instanceof G.Blob) ||
+               (typeof G.Headers === "function" && v instanceof G.Headers))) return v.size;
+          return v.length;
+        };
+        const len = lengthOf(received);
+        check(received != null && len === n, () => "expect(received).toHaveLength(" + fmt(n) + ")\n\nReceived length: " + (received == null ? "n/a" : len)); return m; },
       toMatch(re) { const rx = (re instanceof RegExp) ? re : new RegExp(re);
         check(typeof received === "string" && rx.test(received), () => "expect(received).toMatch(" + fmt(re) + ")\n\nReceived: " + fmt(received)); return m; },
       toThrow(x) { throwMatcher(received, isNot, x); return m; },
@@ -531,6 +585,7 @@ inline constexpr std::string_view HARNESS = R"JS(
     if (typeof fn !== "function" && typeof name === "function") { fn = name; name = ""; }
     const scope = makeScope(describeLabel(name), S.current);
     scope.skipped = (S.skipDepth || 0) > 0;
+    scope.todo = (S.todoDepth || 0) > 0;
     S.current.items.push({ type: "scope", scope: scope });
     // bun (Collection.zig): a throw in a describe callback drops the scope —
     // tests already enqueued in it never run — and is reported as a file-level
@@ -561,7 +616,7 @@ inline constexpr std::string_view HARNESS = R"JS(
       ret.then(settle, (e) => { dropScope(e); settle(); });
     }
   }
-  function makeTest(mode) {
+  function makeTest(mode, only) {
     // Supports test(name, fn) and test(name, options, fn) (the options object —
     // e.g. { timeout, retry } — is recorded but its knobs beyond selection are
     // not yet honored). fn is whichever argument is a function.
@@ -577,7 +632,13 @@ inline constexpr std::string_view HARNESS = R"JS(
       }
       // bun throws at REGISTRATION when a runnable test has no body (todo/skip may omit it).
       if (fn === undefined && mode !== "todo" && mode !== "skip") throw new TypeError("test() expects a function");
-      S.current.items.push({ type: "test", name: String(name), fn: fn, opts: opts, mode: (S.skipDepth > 0 ? "skip" : mode) });
+      // .only narrows the run set; a todo-depth describe turns its runnable
+      // tests into todos. The two are independent and both apply here.
+      const isOnly = !!only && !(S.skipDepth > 0);
+      if (isOnly) S.onlyTests++;
+      S.current.items.push({ type: "test", name: String(name), fn: fn, opts: opts, only: isOnly,
+                             mode: (S.skipDepth > 0 ? "skip"
+                                    : ((S.todoDepth > 0 && mode === "run") ? "todo" : mode)) });
     };
   }
   // %s/%d/%i/%o placeholder + %# index interpolation for test.each/describe.each.
@@ -609,11 +670,15 @@ inline constexpr std::string_view HARNESS = R"JS(
       bound.skip = eachRegistrar(() => makeTest("skip"), table);
       bound.todo = eachRegistrar(() => makeTest("todo"), table);
       bound.failing = eachRegistrar(() => makeTest("failing"), table);
-      bound.only = bound;
+      bound.only = eachRegistrar(() => makeTest("run", true), table);
       return bound;
     };
   }
   function skipScope(name, fn) { S.skipDepth = (S.skipDepth || 0) + 1; try { describe(name, fn); } finally { S.skipDepth--; } }
+  // describe.todo marks every runnable test inside as todo (bun: the scope is
+  // NOT skipped — under --todo its tests execute, and a passing one fails with
+  // "marked as todo but passes"; without --todo they report as `(todo)`).
+  function todoScope(name, fn) { S.todoDepth = (S.todoDepth || 0) + 1; try { describe(name, fn); } finally { S.todoDepth--; } }
 
   // Decorate a test() function with the full modifier chain (.skip/.todo/.only/
   // .failing/.concurrent + .each on each + .skipIf/.todoIf/.failingIf/.if, each of
@@ -625,7 +690,11 @@ inline constexpr std::string_view HARNESS = R"JS(
     fn.skip = makeTest("skip"); fn.skip.each = makeEach(() => makeTest("skip"));
     fn.todo = makeTest("todo"); fn.todo.each = makeEach(() => makeTest("todo"));
     fn.failing = makeTest("failing"); fn.failing.each = makeEach(() => makeTest("failing"));
-    fn.only = fn;                       // `.only` filtering DEFERRED → runs
+    // `.only`: a lazy memoized getter, like `.concurrent` below — decorating
+    // eagerly would recurse forever since the decorated child defines its own
+    // `.only`. Registration only TAGS the item; the pruning happens once the
+    // whole file has been collected (see pruneToOnly).
+    Object.defineProperty(fn, "only", { configurable: true, get() { const o = decorate(makeTest(mode, true), mode); Object.defineProperty(fn, "only", { value: o, configurable: true }); return o; } });
     fn.each = makeEach(() => makeTest(mode));
     fn.skipIf = (c) => decorate(makeTest(c ? "skip" : mode), c ? "skip" : mode);
     fn.todoIf = (c) => decorate(makeTest(c ? "todo" : mode), c ? "todo" : mode);
@@ -643,13 +712,27 @@ inline constexpr std::string_view HARNESS = R"JS(
   const test = decorate(makeTest("run"), "run");
   const it = test;
 
-  describe.skip = skipScope; describe.only = describe; describe.todo = skipScope;
+  // describe.only tags the scope it just created; a focused describe only
+  // decides the run set when the file has no focused TEST (bun/jest: a
+  // `test.only` anywhere narrows the run to exactly that test, even inside a
+  // `describe.only` — test/js/bun/test/only-inside-only.fixture.ts).
+  function onlyScope(name, fn) {
+    const at = S.current.items.length;
+    describe(name, fn);
+    const entry = S.current.items[at];
+    if (entry && entry.type === "scope") { entry.scope.only = true; S.onlyScopes++; }
+  }
+  describe.skip = skipScope; describe.only = onlyScope; describe.todo = todoScope;
   describe.concurrent = describe;       // concurrency DEFERRED → serial
   describe.serial = describe;           // serial is already the execution model
   describe.each = function (table) { return function (name, fn) { (Array.isArray(table) ? table : []).forEach((row, idx) => { const args = Array.isArray(row) ? row : [row]; describe(interpName(name, args, idx), function () { return fn.apply(null, args); }); }); }; };
   describe.skipIf = (c) => (c ? skipScope : describe);
-  describe.todoIf = (c) => (c ? skipScope : describe);
+  describe.todoIf = (c) => (c ? todoScope : describe);
   describe.if = (c) => (c ? describe : skipScope);
+  // describe.only used to BE describe, so it carried the whole modifier chain;
+  // keep the chain reachable on the focused registrar too.
+  onlyScope.each = describe.each; onlyScope.skip = skipScope; onlyScope.todo = skipScope;
+  onlyScope.concurrent = onlyScope; onlyScope.serial = onlyScope; onlyScope.only = onlyScope;
 
   function beforeEach(fn) { S.current.beforeEach.push(fn); }
   function afterEach(fn) { S.current.afterEach.push(fn); }
@@ -960,8 +1043,29 @@ inline constexpr std::string_view HARNESS = R"JS(
     const r = h();
     return (r && typeof r.then === "function") ? r : Promise.resolve();
   }
+  // `.only` filtering (bun does not need --only for it: test-only.test.ts).
+  // A file that registered at least one focused test runs EXACTLY those; with
+  // no focused test but a focused describe, its whole subtree runs. Unfocused
+  // entries are dropped from the tree, so they are not counted at all — bun
+  // reports "Ran 1 test across 1 file" for only-fixture-1.ts, not 1 pass +
+  // 2 skip. Ancestor scopes survive whenever their subtree still has a test,
+  // which keeps beforeAll/beforeEach chains intact.
+  function pruneToOnly(scope, inOnlyScope) {
+    const kept = [];
+    for (const item of scope.items) {
+      if (item.type === "test") {
+        if (S.onlyTests > 0 ? item.only : (inOnlyScope || item.only)) kept.push(item);
+      } else if (pruneToOnly(item.scope, inOnlyScope || !!item.scope.only)) {
+        kept.push(item);
+      }
+    }
+    scope.items = kept;
+    return kept.length > 0;
+  }
   async function runScope(scope, beChain, aeChain) {
-    if (scope.skipped) { skipAllIn(scope); return; }
+    // A todo scope only *runs* under --todo; otherwise its tests report as
+    // `(todo)` without executing any of the scope's hooks (same as describe.skip).
+    if (scope.skipped || (scope.todo && !G.__mbunRunTodo)) { skipAllIn(scope); return; }
     // --randomize: shuffle this scope's entries before running them. bun does it
     // at order-generation time (Order.rs:94-96); doing it on entry to the scope
     // yields the same visited order because generation walks scopes in the same
@@ -1117,9 +1221,10 @@ inline constexpr std::string_view HARNESS = R"JS(
     const fresh = makeScope(null, null);
     S.root = fresh; S.current = fresh;
     S.pass = 0; S.fail = 0; S.skip = 0; S.expectCalls = 0; S.total = 0; S.todo = 0;
-    S.skippedLabel = 0;
+    S.skippedLabel = 0; S.onlyTests = 0; S.onlyScopes = 0;
     S.out = []; S.customMatchers = {}; S.errors = []; S.pendingAsserts = [];
     S.timeoutReject = null; S.asyncErr = undefined; S.rand = null; S.skipDepth = 0;
+    S.todoDepth = 0;   // a describe.todo left open by a throwing body
     S.sysTime = null;  // a file's fake system time must not leak into the next
     G.__mbun_describe_pending = 0;  // async describe bodies of the previous file
     ftUninstall();     // a file's fake timers must not leak into the next either
@@ -1132,6 +1237,7 @@ inline constexpr std::string_view HARNESS = R"JS(
     // derived (see run_source). Null/absent == --randomize off → insertion order.
     S.rand = (G.__mbunTestSeed === null || G.__mbunTestSeed === undefined)
              ? null : makePrng(G.__mbunTestSeed);
+    if (S.onlyTests > 0 || S.onlyScopes > 0) pruneToOnly(S.root, false);
     try { await runScope(S.root, [], []); }
     catch (e) { S.fail++; S.out.push("(fail) <scope error> " + ((e && e.message) || e)); }
     G.__mbun_pass = S.pass; G.__mbun_fail = S.fail; G.__mbun_skip = S.skip;
