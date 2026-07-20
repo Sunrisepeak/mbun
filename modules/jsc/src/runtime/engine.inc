@@ -266,22 +266,37 @@ public:
         // Keys past `shellCount` were introduced by the .env files (each holding
         // its highest-priority value); apply them into JS process.env without
         // overwriting shell-set vars.
-        std::string js{"(function(){var e=process.env;"};
-        bool any{false};
+        // Set the properties through the C API rather than generating source.
+        // The generated form built one statement per variable, so upstream's
+        // 50 000-entry .env (cli/run/env.test.ts) produced a ~3 MB script with
+        // 50 000 statements: JSC parsed all of it, and glibc then aborted in
+        // free() while releasing the buffer — a ~60% crash rate under the test
+        // sandbox. Writing the properties directly is O(n) with no source, no
+        // parse, and no multi-megabyte allocation; process.env's proxy traps
+        // still see every write.
+        JSObjectRef globalObj{JSContextGetGlobalObject(ctx_)};
+        JSValueRef processVal{get_prop(ctx_, globalObj, "process")};
+        if (!JSValueIsObject(ctx_, processVal)) return;
+        JSObjectRef processObj{JSValueToObject(ctx_, processVal, nullptr)};
+        if (processObj == nullptr) return;
+        JSValueRef envVal{get_prop(ctx_, processObj, "env")};
+        if (!JSValueIsObject(ctx_, envVal)) return;
+        JSObjectRef envObj{JSValueToObject(ctx_, envVal, nullptr)};
+        if (envObj == nullptr) return;
+
+        const auto setIfUnset{[&](const std::string& key, const std::string& value) {
+            JSStringRef name{JSStringCreateWithUTF8CString(key.c_str())};
+            const JSValueRef current{JSObjectGetProperty(ctx_, envObj, name, nullptr)};
+            if (current == nullptr || JSValueIsUndefined(ctx_, current)) {
+                JSObjectSetProperty(ctx_, envObj, name, make_string(ctx_, value),
+                                    kJSPropertyAttributeNone, nullptr);
+            }
+            JSStringRelease(name);
+        }};
         for (std::size_t i{shellCount}; i < map.count(); ++i) {
-            const std::string k{map.key_at(i)};
-            const std::string v{map.value_at(i)};
-            js += "if(e[" + json_quote_(k) + "]===undefined)e[" + json_quote_(k) +
-                  "]=" + json_quote_(v) + ";";
-            any = true;
+            setIfUnset(std::string{map.key_at(i)}, std::string{map.value_at(i)});
         }
-        if (isTest && nodeEnv.empty()) {
-            js += "if(e.NODE_ENV===undefined)e.NODE_ENV='test';";
-            any = true;
-        }
-        if (!any) return;
-        js += "})();";
-        (void)eval_void(js);
+        if (isTest && nodeEnv.empty()) setIfUnset("NODE_ENV", "test");
     }
 
     int run_script(const std::string& absPath, const std::string& source) {
