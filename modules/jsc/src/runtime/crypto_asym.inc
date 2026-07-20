@@ -65,6 +65,10 @@ using MdCtxPtr = std::unique_ptr<EVP_MD_CTX, EvpMdCtxDel>;
 using CipherCtxPtr = std::unique_ptr<EVP_CIPHER_CTX, EvpCipherCtxDel>;
 using PkeyCtxPtr = std::unique_ptr<EVP_PKEY_CTX, EvpPkeyCtxDel>;
 
+// PEM passphrase callback for "we have no passphrase": returning 0 makes OpenSSL
+// fail the decode instead of prompting on the terminal.
+inline int asym_no_pass_cb(char*, int, int, void*) { return 0; }
+
 // Decode a key from PEM or DER (public or private), optional passphrase. Tries a
 // private-capable selection first, then public-only (SPKI). Returns nullptr on
 // failure. selection==0 lets OSSL decode whatever the input carries.
@@ -93,8 +97,12 @@ inline EVP_PKEY* asym_load_pkey(std::span<const std::uint8_t> data, std::string_
         std::string p{pass};
         BIO* pb{BIO_new_mem_buf(data.data(), static_cast<int>(data.size()))};
         if (pb != nullptr) {
-            EVP_PKEY* pk{PEM_read_bio_PrivateKey(pb, nullptr, nullptr,
-                                                 pass.empty() ? nullptr : p.data())};
+            // cb=nullptr would fall back to PEM_def_callback, which PROMPTS ON THE
+            // TERMINAL ("Enter PEM pass phrase:") for an encrypted key — a hang in
+            // any non-interactive run. With no passphrase, refuse instead.
+            EVP_PKEY* pk{pass.empty()
+                             ? PEM_read_bio_PrivateKey(pb, nullptr, asym_no_pass_cb, nullptr)
+                             : PEM_read_bio_PrivateKey(pb, nullptr, nullptr, p.data())};
             BIO_free(pb);
             if (pk != nullptr) { return pk; }
         }
@@ -689,6 +697,48 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_ecdh_convert_host,
     EC_GROUP_free(group);
     if (out.empty()) { return hasher_throw(global, "convertKey: invalid point"); }
     return JSC::JSValue::encode(toJS(global, static_cast<JSValueRef>(asym_u8(ctx, out))));
+}
+
+// __mbunCryptoAsymNative.okpDerive(privateKeyDer, peerPublicKeyDer) → Uint8Array
+//   raw X25519/X448 shared secret. Both arguments are DER key material (PKCS8 /
+//   SubjectPublicKeyInfo) exactly as webcrypto stores it, so no scalar ever
+//   crosses into JS. OpenSSL's X25519 derive fails on an all-zero output, which
+//   is the RFC 7748 §6.1 small-order-point rejection the spec requires.
+// ref: bun src/jsc/bindings/webcrypto/CryptoAlgorithmX25519.cpp platformDeriveBits.
+JSC_DEFINE_HOST_FUNCTION(node_asym_okp_derive_host,
+                         (JSC::JSGlobalObject* global, JSC::CallFrame* frame)) {
+    JSContextRef ctx{toRef(global)};
+    std::vector<std::uint8_t> priv;
+    std::vector<std::uint8_t> pub;
+    if (!asym_read(global, native_arg(frame, 0), priv) ||
+        !asym_read(global, native_arg(frame, 1), pub)) {
+        return hasher_throw(global, "deriveBits: private key and public key required");
+    }
+    PkeyPtr me{asym_load_pkey(priv, "")};
+    PkeyPtr peer{asym_load_pkey(pub, "")};
+    if (!me || !peer) { return hasher_throw(global, "deriveBits: invalid key material"); }
+    const int mine{EVP_PKEY_base_id(me.get())};
+    if (mine != EVP_PKEY_X25519 && mine != EVP_PKEY_X448) {
+        return hasher_throw(global, "deriveBits: not a key-agreement key");
+    }
+    if (mine != EVP_PKEY_base_id(peer.get())) {
+        return hasher_throw(global, "deriveBits: key type mismatch");
+    }
+    // Drain any error the decoder left behind so a later failure reports its own.
+    while (::ERR_get_error() != 0) {}
+    PkeyCtxPtr pctx{EVP_PKEY_CTX_new(me.get(), nullptr)};
+    if (!pctx || EVP_PKEY_derive_init(pctx.get()) <= 0 ||
+        EVP_PKEY_derive_set_peer(pctx.get(), peer.get()) <= 0) {
+        return hasher_throw(global, "deriveBits: derive setup failed");
+    }
+    std::size_t seclen{0};
+    EVP_PKEY_derive(pctx.get(), nullptr, &seclen);
+    std::vector<std::uint8_t> sec(seclen);
+    if (EVP_PKEY_derive(pctx.get(), sec.data(), &seclen) <= 0) {
+        return hasher_throw(global, "deriveBits failed: " + asym_ossl_err());
+    }
+    sec.resize(seclen);
+    return JSC::JSValue::encode(toJS(global, static_cast<JSValueRef>(asym_u8(ctx, sec))));
 }
 
 // __mbunCryptoAsymNative.keyType(key, passphrase, isPublic) → { type, curve,

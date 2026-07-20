@@ -152,22 +152,24 @@ JSC_DEFINE_HOST_FUNCTION(xxhash3_for_testing_host,
 // owns its running digest state in the C API private slot; update/digest/copy
 // are native host functions installed per instance (call-direct, no C API lock
 // churn), mirroring the Bun.Glob wiring. DEFERRED(S2): HMAC keying (2nd ctor
-// arg) and the boringssl-only digests (sha3/shake/blake2/md4/ripemd160) — an
-// unsupported algorithm or a supplied key throws rather than silently degrade.
+// arg) — an unsupported algorithm or a supplied key throws rather than silently
+// degrade.
 
 // Binding-level hasher that unifies the mbun.crypto backends Bun.CryptoHasher can
 // front: the CryptoHasher digest family (md5/sha1/sha2*), the Keccak sponge
 // (sha3-*/shake*), and BLAKE2b/2s. All backends are value-copyable so copy() is a
-// plain snapshot (mirrors CryptoHasher.rs copy before an EVP_DigestFinal).
-// DEFERRED: md4, ripemd160, sha512-224 (absent from mbun.crypto) still throw.
+// plain snapshot (mirrors CryptoHasher.rs copy before an EVP_DigestFinal), plus
+// the standalone MD4 / RIPEMD-160 streaming classes.
 struct NodeDigest {
-    enum class Kind : std::uint8_t { Crypto, Keccak, Blake2b, Blake2s };
+    enum class Kind : std::uint8_t { Crypto, Keccak, Blake2b, Blake2s, Md4, Ripemd160 };
     Kind kind{Kind::Crypto};
     std::size_t out_len{0};
     std::optional<mbun::crypto::CryptoHasher> crypto;
     std::optional<mbun::crypto::Keccak> keccak;
     std::optional<mbun::crypto::Blake2b> blake2b;
     std::optional<mbun::crypto::Blake2s> blake2s;
+    std::optional<mbun::crypto::Md4> md4;
+    std::optional<mbun::crypto::Ripemd160> ripemd160;
 
     void update(std::span<const std::uint8_t> data) {
         switch (kind) {
@@ -175,6 +177,8 @@ struct NodeDigest {
         case Kind::Keccak: keccak->update(data); break;
         case Kind::Blake2b: blake2b->update(data); break;
         case Kind::Blake2s: blake2s->update(data); break;
+        case Kind::Md4: md4->update(data); break;
+        case Kind::Ripemd160: ripemd160->update(data); break;
         }
     }
     std::vector<std::uint8_t> digest() {
@@ -184,6 +188,8 @@ struct NodeDigest {
         case Kind::Keccak: keccak->squeeze(out.data(), out_len); break;
         case Kind::Blake2b: blake2b->final_(out.data()); break;
         case Kind::Blake2s: blake2s->final_(out.data()); break;
+        case Kind::Md4: md4->final_(out.data()); break;
+        case Kind::Ripemd160: ripemd160->final_(out.data()); break;
         default: break;
         }
         return out;
@@ -234,6 +240,20 @@ inline std::optional<NodeDigest> node_digest_by_name(std::string_view name) {
         d.blake2s.emplace(32);
         return d;
     }
+    if (key == "md4") {
+        NodeDigest d;
+        d.kind = NodeDigest::Kind::Md4;
+        d.out_len = mbun::crypto::Md4::DIGEST_LENGTH;
+        d.md4.emplace();
+        return d;
+    }
+    if (key == "ripemd160" || key == "rmd160") {
+        NodeDigest d;
+        d.kind = NodeDigest::Kind::Ripemd160;
+        d.out_len = mbun::crypto::Ripemd160::DIGEST_LENGTH;
+        d.ripemd160.emplace();
+        return d;
+    }
     return std::nullopt;
 }
 
@@ -250,6 +270,12 @@ struct HasherState {
     NodeDigest hasher;
     std::string name;      // spelling used in messages + the `.algorithm` prop
     bool digested{false};
+    // Bun.SHA*/MD5 (StaticCryptoHasher) latch after digest(): a second digest /
+    // update / copy throws "already digested". Bun.CryptoHasher does NOT — its
+    // final_ resets the context, so it can be reused and copied afterwards.
+    // ref: src/runtime/crypto/CryptoHasher.rs (digested flag lives only on
+    // StaticCryptoHasher).
+    bool sticky{true};
 };
 
 JSClassRef gCryptoHasherClass{nullptr};
@@ -309,10 +335,37 @@ JSC::JSValue make_u8array(JSC::JSGlobalObject* global, std::span<const std::uint
     return toJS(global, static_cast<JSValueRef>(arr));
 }
 
+// Re-wrap a Uint8Array as a node Buffer via the JS `Buffer.from` (public C API
+// only, safe inside a host callback). Bun.CryptoHasher#digest() and
+// CryptoHasher.hash() hand back a Buffer, not a bare Uint8Array — only the
+// fixed-algorithm Bun.SHA*/MD5 classes return a plain Uint8Array. ref:
+// src/runtime/crypto/CryptoHasher.rs digest_to_bytes (ArrayBuffer::create_buffer)
+// vs StaticCryptoHasher::digest_to_bytes (create_uint8_array).
+JSC::JSValue as_buffer(JSC::JSGlobalObject* global, JSC::JSValue u8) {
+    JSContextRef ctx{toRef(global)};
+    JSValueRef bufV{get_prop(ctx, JSContextGetGlobalObject(ctx), "Buffer")};
+    if (bufV != nullptr && JSValueIsObject(ctx, bufV)) {
+        if (JSObjectRef bufObj{JSValueToObject(ctx, bufV, nullptr)}) {
+            JSValueRef fromV{get_prop(ctx, bufObj, "from")};
+            if (fromV != nullptr && JSValueIsObject(ctx, fromV)) {
+                JSObjectRef fromFn{JSValueToObject(ctx, fromV, nullptr)};
+                if (fromFn != nullptr && JSObjectIsFunction(ctx, fromFn)) {
+                    JSValueRef arg{toRef(global, u8)};
+                    if (JSValueRef r{JSObjectCallAsFunction(ctx, fromFn, bufObj, 1, &arg, nullptr)}) {
+                        return toJS(global, r);
+                    }
+                }
+            }
+        }
+    }
+    return u8;
+}
+
 // Encode a finalized digest per an optional encoding argument (string → hex/
-// base64/base64url; missing/"buffer"/other → Uint8Array).
+// base64/base64url; missing/"buffer"/other → Uint8Array, or a Buffer when
+// `bufferOut`).
 JSC::JSValue encode_digest(JSC::JSGlobalObject* global, std::span<const std::uint8_t> bytes,
-                           JSC::JSValue encArg) {
+                           JSC::JSValue encArg, bool bufferOut = false) {
     if (encArg && encArg.isString()) {
         JsStrArg e{global, encArg};
         if (auto enc{mbun::crypto::encoding_from(e.view())};
@@ -332,7 +385,8 @@ JSC::JSValue encode_digest(JSC::JSGlobalObject* global, std::span<const std::uin
             return encArg;
         }
     }
-    return make_u8array(global, bytes);
+    JSC::JSValue u8{make_u8array(global, bytes)};
+    return bufferOut ? as_buffer(global, u8) : u8;
 }
 
 HasherState* hasher_state(JSC::JSValue thisV) {
@@ -341,7 +395,7 @@ HasherState* hasher_state(JSC::JSValue thisV) {
 }
 
 JSObjectRef make_hasher_object(JSC::JSGlobalObject* global, JSClassRef cls,
-                               NodeDigest h, std::string name);
+                               NodeDigest h, std::string name, bool sticky = true);
 
 JSC_DEFINE_HOST_FUNCTION(crypto_hasher_update_host,
                          (JSC::JSGlobalObject* global, JSC::CallFrame* frame)) {
@@ -369,9 +423,15 @@ JSC_DEFINE_HOST_FUNCTION(crypto_hasher_digest_host,
         return hasher_throw(
             global, st->name + " hasher already digested, create a new instance to digest again");
     }
-    st->digested = true;
     auto bytes{st->hasher.digest()};
-    return JSC::JSValue::encode(encode_digest(global, bytes, native_arg(frame, 0)));
+    if (st->sticky) {
+        st->digested = true;
+    } else if (auto fresh{node_digest_by_name(st->name)}) {
+        // Bun.CryptoHasher's final_ resets the context: rebuild the same
+        // algorithm so update()/digest()/copy() keep working afterwards.
+        st->hasher = std::move(*fresh);
+    }
+    return JSC::JSValue::encode(encode_digest(global, bytes, native_arg(frame, 0), !st->sticky));
 }
 
 JSC_DEFINE_HOST_FUNCTION(crypto_hasher_copy_host,
@@ -382,14 +442,15 @@ JSC_DEFINE_HOST_FUNCTION(crypto_hasher_copy_host,
         return hasher_throw(global,
                             st->name + " hasher already digested, create a new instance to copy");
     }
-    JSObjectRef obj{make_hasher_object(global, gCryptoHasherClass, st->hasher.copy(), st->name)};
+    JSObjectRef obj{
+        make_hasher_object(global, gCryptoHasherClass, st->hasher.copy(), st->name, st->sticky)};
     return JSC::JSValue::encode(toJS(global, static_cast<JSValueRef>(obj)));
 }
 
 JSObjectRef make_hasher_object(JSC::JSGlobalObject* global, JSClassRef cls,
-                               NodeDigest h, std::string name) {
+                               NodeDigest h, std::string name, bool sticky) {
     JSContextRef ctx{toRef(global)};
-    auto* st{new HasherState{std::move(h), std::move(name), false}};
+    auto* st{new HasherState{std::move(h), std::move(name), false, sticky}};
     JSObjectRef obj{JSObjectMake(ctx, cls, st)};
     set_native_fn(ctx, obj, "update", 1, crypto_hasher_update_host);
     set_native_fn(ctx, obj, "digest", 1, crypto_hasher_digest_host);
@@ -425,7 +486,7 @@ JSObjectRef crypto_hasher_construct_cb(JSContextRef ctx, JSObjectRef, std::size_
     if (argc > 1 && !JSValueIsUndefined(ctx, args[1]) && !JSValueIsNull(ctx, args[1])) {
         return fail("HMAC keying is not yet supported");  // DEFERRED(S2)
     }
-    return make_hasher_object(global, gCryptoHasherClass, std::move(*h), std::move(algoName));
+    return make_hasher_object(global, gCryptoHasherClass, std::move(*h), std::move(algoName), false);
 }
 
 // Bun.CryptoHasher.hash(algorithm, data, encoding?) — one-shot static.
@@ -443,7 +504,7 @@ JSC_DEFINE_HOST_FUNCTION(crypto_hasher_static_hash_host,
                             "Buffer, TypedArray, DataView, or ArrayBuffer.");
     }
     auto bytes{h->digest()};
-    return JSC::JSValue::encode(encode_digest(global, bytes, native_arg(frame, 2)));
+    return JSC::JSValue::encode(encode_digest(global, bytes, native_arg(frame, 2), true));
 }
 
 // Fixed-algorithm classes Bun.SHA1/SHA224/SHA256/SHA384/SHA512/SHA512_256/MD5.
