@@ -2081,6 +2081,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
         return id;
       }
       static revokeObjectURL(id) {
+        if (arguments.length < 1) { const e = new TypeError("Not enough arguments"); e.code = "ERR_MISSING_ARGS"; throw e; }
         const s = String(id);
         if (s.length < 41 || s.slice(0, 5) !== "blob:") return undefined;
         __objectURLRegistry.delete(s);
@@ -2416,12 +2417,9 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       const code = hostname.charCodeAt(i);
       const isValid = code !== 47 /* / */ && code !== 92 /* \ */ && code !== 35 /* # */ && code !== 63 /* ? */ && code !== 58 /* : */;
       if (!isValid) {
-        // leftover starting with ":" is an invalid port; url.parse() stays
-        // lenient about it (node DEP0170: warn once and keep going)
-        if (urlWarnInvalidPort && code === 58) {
-          if (G.process && typeof G.process.emitWarning === "function") G.process.emitWarning("The URL " + url + " is invalid. Future versions of Node.js will throw an error.", "DeprecationWarning", "DEP0170");
-          urlWarnInvalidPort = false;
-        }
+        // A leftover ":" here means an invalid (non-numeric) port — the valid
+        // trailing :port was already stripped by parseHost(); node throws.
+        if (code === 58) { const e = new TypeError("The argument 'url' Invalid port in url. Received " + JSON.stringify(url)); e.code = "ERR_INVALID_ARG_VALUE"; throw e; }
         self.hostname = hostname.slice(0, i);
         return "/" + hostname.slice(i) + rest;
       }
@@ -2429,7 +2427,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     return rest;
   };
   Url.prototype.parse = function parse(url, parseQueryString, slashesDenoteHost) {
-    if (typeof url !== "string") { const e = new TypeError('The "url" argument must be of type string. Received ' + (url === null ? "null" : typeof url)); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
+    if (typeof url !== "string") { const e = new TypeError('The "url" argument must be of type string.' + urlArgTypeReceived(url)); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
     // Copy chrome/IE/opera backslash-handling: backslashes before the query
     // string become forward slashes; also trim whitespace off both ends.
     let hasHash = false, hasAt = false, start = -1, end = -1, rest = "", lastPos = 0;
@@ -2717,26 +2715,98 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     if (u.username || u.password) o.auth = decodeURIComponent(u.username || "") + ":" + decodeURIComponent(u.password || "");
     return o;
   };
+  // node test/common invalidArgTypeHelper: builds the " Received ..." tail of an
+  // ERR_INVALID_ARG_TYPE message. url.parse asserts the exact message shape.
+  const urlArgTypeReceived = (input) => {
+    if (input === null) return " Received null";
+    if (input === undefined) return " Received undefined";
+    const t = typeof input;
+    if (t === "function") return input.name ? " Received function " + input.name : " Received type function ([Function (anonymous)])";
+    if (t === "object") { const c = input.constructor && input.constructor.name; return c ? " Received an instance of " + c : " Received [Object: null prototype] {}"; }
+    let ins;
+    if (t === "symbol") ins = input.toString();
+    else if (t === "bigint") ins = String(input) + "n";
+    else if (t === "string") ins = "'" + input + "'";
+    else ins = String(input);
+    if (ins.length > 25) ins = ins.slice(0, 25) + "...";
+    return " Received type " + t + " (" + ins + ")";
+  };
+  const __isWin = !!(G.process && G.process.platform === "win32");
+  const urlIsURLLike = (v) => v instanceof G.URL || (v && typeof v === "object" && typeof v.href === "string" && typeof v.protocol === "string" && "pathname" in v && "hostname" in v);
+  // WHATWG file-URL path percent-encode set (matches node's kCreateURLFrom*PathSymbol
+  // encoding). In windows mode "\" is the separator (→ "/"); in posix it is a literal
+  // (→ %5C). Non-ASCII code points are UTF-8 percent-encoded via encodeURIComponent.
+  const urlEncodeFilePath = (p, windows) => {
+    if (windows) p = p.replace(/\\/g, "/");
+    let out = "";
+    for (const ch of p) {
+      const cp = ch.codePointAt(0);
+      if (cp > 0x7F) { out += encodeURIComponent(ch); continue; }
+      const enc = cp <= 0x20 || cp === 0x7F || cp === 0x22 || cp === 0x23 || cp === 0x25 || cp === 0x3C || cp === 0x3E || cp === 0x3F || cp === 0x5B || cp === 0x5C || cp === 0x5D || cp === 0x5E || cp === 0x60 || cp === 0x7B || cp === 0x7C || cp === 0x7D || cp === 0x7E;
+      out += enc ? "%" + cp.toString(16).toUpperCase().padStart(2, "0") : ch;
+    }
+    return out;
+  };
   const urlMod = {
     URL: G.URL, URLSearchParams: G.URLSearchParams, Url,
-    fileURLToPath: (u) => {
-      u = String(u !== null && typeof u === "object" && "href" in u ? u.href : u);
-      if (!/^file:/i.test(u)) { const e = new TypeError("The URL must be of scheme file"); e.code = "ERR_INVALID_URL_SCHEME"; throw e; }
-      let p = u.replace(/^file:\/\//i, "").replace(/^file:/i, "");
-      const cut = p.search(/[?#]/); if (cut >= 0) p = p.slice(0, cut);
-      try { p = decodeURIComponent(p); } catch (e) {}
-      if (p[0] !== "/") p = "/" + p;
-      return p;
+    // faithful port of node lib/internal/url.js fileURLToPath / getPathFromURL{Win32,Posix}
+    fileURLToPath: (path, options) => {
+      const windows = options == null ? undefined : options.windows;
+      if (typeof path === "string") path = new G.URL(path);
+      else if (!urlIsURLLike(path)) { const e = new TypeError('The "path" argument must be of type string or an instance of URL.' + urlArgTypeReceived(path)); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
+      if (path.protocol !== "file:") { const e = new TypeError("The URL must be of scheme file"); e.code = "ERR_INVALID_URL_SCHEME"; throw e; }
+      const useWin = windows === undefined ? __isWin : windows;
+      if (useWin) {
+        const hostname = path.hostname; let pathname = path.pathname;
+        for (let n = 0; n < pathname.length; n++) {
+          if (pathname[n] === "%") {
+            const third = ((pathname.codePointAt(n + 2) | 0)) | 0x20;
+            if ((pathname[n + 1] === "2" && third === 102) || (pathname[n + 1] === "5" && third === 99)) { const e = new TypeError("File URL path must not include encoded \\ or / characters"); e.code = "ERR_INVALID_FILE_URL_PATH"; e.input = path; throw e; }
+          }
+        }
+        pathname = pathname.replace(/\//g, "\\");
+        if (pathname.indexOf("%") !== -1) pathname = decodeURIComponent(pathname);
+        if (hostname !== "") { let h = hostname; try { h = urlMod.domainToUnicode(hostname) || hostname; } catch (e) {} return "\\\\" + h + pathname; }
+        const letter = ((pathname.codePointAt(1) | 0)) | 0x20; const sep = pathname.charAt(2);
+        if (letter < 97 || letter > 122 || sep !== ":") { const e = new TypeError("File URL path must be absolute"); e.code = "ERR_INVALID_FILE_URL_PATH"; e.input = path; throw e; }
+        return pathname.slice(1);
+      }
+      if (path.hostname !== "") { const e = new TypeError('File URL host must be "localhost" or empty on ' + (G.process ? G.process.platform : "linux")); e.code = "ERR_INVALID_FILE_URL_HOST"; throw e; }
+      const pathname = path.pathname;
+      for (let n = 0; n < pathname.length; n++) {
+        if (pathname[n] === "%") {
+          const third = ((pathname.codePointAt(n + 2) | 0)) | 0x20;
+          if (pathname[n + 1] === "2" && third === 102) { const e = new TypeError("File URL path must not include encoded / characters"); e.code = "ERR_INVALID_FILE_URL_PATH"; e.input = path; throw e; }
+        }
+      }
+      return pathname.indexOf("%") !== -1 ? decodeURIComponent(pathname) : pathname;
     },
-    pathToFileURL: (p) => {
-      p = String(p);
-      // node: the path is resolved against cwd (normalizing . / ..); a trailing
-      // slash on the input stays on the resolved path.
-      let r = p;
-      try { r = M.path.resolve(p); } catch (e) {}
-      if (p[p.length - 1] === "/" && r[r.length - 1] !== "/") r += "/";
-      const s = "file://" + (r[0] === "/" ? "" : "/") + encodeURI(r.replace(/%/g, "%25")).replace(/[?#~]/g, (m) => (m === "?" ? "%3F" : m === "#" ? "%23" : "%7E"));
-      try { return new G.URL(s); } catch (e) { return { href: s, pathname: r, toString() { return s; } }; }
+    // faithful port of node lib/internal/url.js pathToFileURL (incl. { windows } option,
+    // UNC handling and the ERR_INVALID_ARG_* throws).
+    pathToFileURL: (filepath, options) => {
+      if (typeof filepath !== "string") { const e = new TypeError('The "path" argument must be of type string.' + urlArgTypeReceived(filepath)); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
+      const windows = (options === undefined || options === null) ? __isWin : options.windows;
+      const isUNC = windows && filepath.startsWith("\\\\");
+      let resolved = isUNC ? filepath : (windows ? win32.resolve(filepath) : path.resolve(filepath));
+      if (isUNC || (windows && resolved.startsWith("\\\\"))) {
+        if (resolved.startsWith("\\\\?\\") && !resolved.startsWith("\\\\?\\UNC\\")) {
+          resolved = resolved.slice(4); // \\?\C:\... device path → normal drive path
+        } else {
+          const isExtendedUNC = resolved.startsWith("\\\\?\\UNC\\");
+          const prefixLength = isExtendedUNC ? 8 : 2;
+          const hostnameEndIndex = resolved.indexOf("\\", prefixLength);
+          if (hostnameEndIndex === -1) { const e = new TypeError("The argument 'path' Missing UNC resource path. Received " + JSON.stringify(resolved)); e.code = "ERR_INVALID_ARG_VALUE"; throw e; }
+          if (hostnameEndIndex === 2) { const e = new TypeError("The argument 'path' Empty UNC servername. Received " + JSON.stringify(resolved)); e.code = "ERR_INVALID_ARG_VALUE"; throw e; }
+          const hostname = resolved.slice(prefixLength, hostnameEndIndex);
+          return new G.URL("file://" + hostname + urlEncodeFilePath(resolved.slice(hostnameEndIndex), true));
+        }
+      }
+      const filePathLast = filepath.charCodeAt(filepath.length - 1);
+      const rlast = resolved[resolved.length - 1];
+      if ((filePathLast === 0x2F || (windows && filePathLast === 0x5C)) && rlast !== "/" && rlast !== "\\") resolved += "/";
+      let encPath = urlEncodeFilePath(resolved, windows);
+      if (encPath[0] !== "/") encPath = "/" + encPath;
+      return new G.URL("file://" + encPath);
     },
     parse: urlParse,
     format: urlFormat,
