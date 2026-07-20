@@ -727,7 +727,16 @@ JSValueRef fsn_readdir_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_
     for (const auto& e : std::filesystem::directory_iterator{std::filesystem::path{path}, ec}) {
         names.push_back(make_string(ctx, e.path().filename().string()));
     }
-    if (ec) return fs_throw(ctx, exc, "ENOENT: no such directory, scandir '" + path + "'");
+    // node surfaces the real errno here (readdirSync on a file is ENOTDIR, not
+    // ENOENT) — ref node test-fs-readdir-types.js:68.
+    if (ec) {
+        switch (ec.value()) {
+            case ENOTDIR: return fs_throw(ctx, exc, "ENOTDIR: not a directory, scandir '" + path + "'");
+            case EACCES:  return fs_throw(ctx, exc, "EACCES: permission denied, scandir '" + path + "'");
+            case ELOOP:   return fs_throw(ctx, exc, "ELOOP: too many symbolic links encountered, scandir '" + path + "'");
+            default: return fs_throw(ctx, exc, "ENOENT: no such file or directory, scandir '" + path + "'");
+        }
+    }
     return JSObjectMakeArray(ctx, names.size(), names.empty() ? nullptr : names.data(), nullptr);
 }
 // Numeric fields for a stat result, decoupled from the syscall source so stat /

@@ -606,7 +606,13 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       constructor(enc, opts) {
         const key = String(enc === undefined ? "utf-8" : enc).toLowerCase().trim();
         this.encoding = ENC_ALIAS[key] || SB_ALIAS[key];
-        if (!this.encoding || this.encoding === "replacement") throw new RangeError("The encoding label provided ('" + enc + "') is invalid.");
+        // bun TextDecoder.rs:588-600 — an unknown/replacement label is a
+        // RangeError carrying code ERR_ENCODING_NOT_SUPPORTED.
+        if (!this.encoding || this.encoding === "replacement") {
+          const e = new RangeError("Unsupported encoding label \"" + enc + "\"");
+          e.code = "ERR_ENCODING_NOT_SUPPORTED";
+          throw e;
+        }
         if (opts !== undefined && (opts === null || typeof opts !== "object")) throw new TypeError("TextDecoder(options) is invalid");
         this.fatal = !!(opts && opts.fatal);
         if (opts && opts.ignoreBOM !== undefined && typeof opts.ignoreBOM !== "boolean") throw new TypeError("TextDecoder(options) ignoreBOM is invalid. Expected boolean value");

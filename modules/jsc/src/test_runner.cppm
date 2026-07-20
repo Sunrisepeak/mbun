@@ -267,13 +267,21 @@ inline constexpr std::string_view HARNESS = R"JS(
   function deepEqualStrict(a, b) { return deepEqualImpl(a, b, true, new Map()); }
   function assertionError(msg) { const e = new Error(msg); e.name = "AssertionError"; return e; }
 
-  function makeMatchers(received, isNot) {
+  // `expect(received, label)` (bun expect.rs custom_label): the label REPLACES the
+  // matcher hint line of the failure message ("lol!\n\nExpected: ...").
+  function makeMatchers(received, isNot, label) {
     // The message is a thunk: bun/jest only format on failure. Building it eagerly
     // walked the whole received value on every passing assertion — a 40MB body
     // (Bun.file of a video) took minutes.
     function check(pass, message) {
       if (isNot) pass = !pass;
-      if (!pass) throw assertionError(typeof message === "function" ? message() : message);
+      if (pass) return;
+      let msg = typeof message === "function" ? message() : message;
+      if (typeof label === "string" && label.length > 0) {
+        const sep = msg.indexOf("\n\n");
+        msg = label + (sep === -1 ? "\n\n" + msg : msg.slice(sep));
+      }
+      throw assertionError(msg);
     }
     const m = {
       toBe(x) { check(Object.is(received, x), () => "expect(received).toBe(expected)\n\nExpected: " + fmt(x) + "\nReceived: " + fmt(received)); return m; },
@@ -433,8 +441,8 @@ inline constexpr std::string_view HARNESS = R"JS(
         if (expectedStdout !== undefined) check((r.stdout ? r.stdout.toString() : "") === expectedStdout, () => "toRun stdout mismatch"); return m;
       },
       // async matchers on a promise
-      get resolves() { return makeAsyncMatchers(received, isNot, false); },
-      get rejects() { return makeAsyncMatchers(received, isNot, true); },
+      get resolves() { return makeAsyncMatchers(received, isNot, false, label); },
+      get rejects() { return makeAsyncMatchers(received, isNot, true, label); },
     };
     // Custom matchers registered via expect.extend({ name(received, ...args) {...} }).
     for (const name of Object.keys(S.customMatchers)) {
@@ -446,10 +454,10 @@ inline constexpr std::string_view HARNESS = R"JS(
         return m;
       };
     }
-    Object.defineProperty(m, "not", { get() { return makeMatchers(received, !isNot); } });
+    Object.defineProperty(m, "not", { get() { return makeMatchers(received, !isNot, label); } });
     return m;
   }
-  function makeAsyncMatchers(promise, isNot, wantReject) {
+  function makeAsyncMatchers(promise, isNot, wantReject, label) {
     const build = (fnName) => async function (...a) {
       let val, threw = false, err;
       try { val = await promise; } catch (e) { threw = true; err = e; }
@@ -467,10 +475,10 @@ inline constexpr std::string_view HARNESS = R"JS(
           if (!pass) throw assertionError("expect(promise).rejects.toThrow\n\nReceived message: " + msg);
           return;
         }
-        return makeMatchers(err, isNot)[fnName](...a);
+        return makeMatchers(err, isNot, label)[fnName](...a);
       } else {
         if (threw) throw err;
-        return makeMatchers(val, isNot)[fnName](...a);
+        return makeMatchers(val, isNot, label)[fnName](...a);
       }
     };
     return new Proxy({}, { get(_, prop) { return build(prop); } });
@@ -516,7 +524,7 @@ inline constexpr std::string_view HARNESS = R"JS(
     }
     evalThrow(threw, err, isNot, expected);
   }
-  function expect(received) { S.expectCalls++; return makeMatchers(received, false); }
+  function expect(received, label) { S.expectCalls++; return makeMatchers(received, false, typeof label === "string" ? label : undefined); }
   expect.unreachable = function (msg) {
     if (msg instanceof Error) throw msg;
     throw new Error(msg === undefined ? "reached unreachable code" : String(msg));
@@ -758,6 +766,11 @@ inline constexpr std::string_view HARNESS = R"JS(
     f.mockClear = () => { f.mock.calls = []; f.mock.results = []; return f; };
     f.mockRestore = () => {};
     f.getMockName = () => "mock";
+    // bun: `using spy = spyOn(obj, "m")` / `mock(fn)[Symbol.dispose]()` —
+    // disposing restores the original (spies) and drops the call history
+    // (jest.rs mock_disposable). mockRestore is read late so spyOn's override
+    // below is the one that runs.
+    f[Symbol.dispose] = () => { f.mockReset(); f.mockRestore(); };
     return f;
   }
   // Static helpers on the bun:test `mock` function.
@@ -802,10 +815,16 @@ inline constexpr std::string_view HARNESS = R"JS(
     Object.setPrototypeOf(MbunDate, RD);      // inherit statics (UTC/parse/…)
     MbunDate.now = function () { const p = pinned(); return p === null ? RD.now() : p; };
     G.Date = MbunDate;
+    G.__mbunRealDate = RD;
   }
+  // Bun__FakeTimers__setSystemTime (FakeTimers.rs:96-108): while fake timers are
+  // active, jest.setSystemTime rebases the Date offset so subsequent ticks keep
+  // advancing from the newly set wall time instead of the activation offset.
   function setSystemTime(v) {
     if (v === undefined || v === null) { S.sysTime = null; return; }
-    S.sysTime = (typeof v === "number") ? v : Number(v.valueOf());
+    const ms = (typeof v === "number") ? v : Number(v.valueOf());
+    S.sysTime = ms;
+    if (FT.on) FT.dateOffset = ms - FT.now;
   }
 
   // --- Fake timers (jest.useFakeTimers) ------------------------------------
@@ -814,19 +833,70 @@ inline constexpr std::string_view HARNESS = R"JS(
   // fakes keyed off a fake `now` (start 0). advanceTimersByTime(ms) advances the
   // fake clock and fires due timers in (fireAt, id) order, re-arming intervals.
   // The per-test timeout stays on natSetTimeout (line 81), so it is unfakeable.
-  const FT = { on: false, now: 0, seq: 0, queue: [], saved: null };
+  //
+  // `FT.now` is the fake monotonic clock (ms since activation, what
+  // performance.now() reports — FakeTimers.rs CURRENT_TIME.offset_raw starts at
+  // Timespec::EPOCH); `FT.dateOffset` is the wall-clock base so that
+  // Date.now() === FT.dateOffset + FT.now (CurrentTime::set's date_now_offset).
+  const FT = { on: false, now: 0, dateOffset: 0, seq: 0, queue: [], saved: null, savedPerfNow: null };
+  // Mirror the fake clock onto the Date override installed above.
+  function ftSync() { S.sysTime = FT.dateOffset + FT.now; }
+  // FakeTimers.rs:234-242 error_unless_fake_timers — every accessor except
+  // useFakeTimers/useRealTimers/isFakeTimers throws while inactive.
+  function ftRequireActive() {
+    if (!FT.on) throw new Error("Fake timers are not active. Call useFakeTimers() first.");
+  }
   function ftRemoveById(id) {
     for (let i = 0; i < FT.queue.length; i++) { if (FT.queue[i].id === id) { FT.queue.splice(i, 1); return; } }
+  }
+  function ftHasId(id) {
+    for (const t of FT.queue) if (t.id === id) return true;
+    return false;
+  }
+  // Fake setTimeout/setInterval return the same Timeout-shaped handle the real
+  // ones do (node semantics: coerces to the numeric id, carries
+  // ref/unref/hasRef/refresh/close) — sinon's fake-timers suite calls
+  // `setTimeout(...).refresh()` (issue #187 / #368).
+  function ftHandle(rec) {
+    return { _id: rec.id,
+      [Symbol.toPrimitive]() { return rec.id; },
+      ref() { rec.refd = true; return this; },
+      unref() { rec.refd = false; return this; },
+      hasRef() { return !!rec.refd; },
+      refresh() {
+        rec.fireAt = FT.now + (rec.interval > 0 ? rec.interval : rec.delay);
+        if (!ftHasId(rec.id)) FT.queue.push(rec);
+        return this;
+      },
+      close() { ftRemoveById(rec.id); return this; },
+      [Symbol.dispose]() { ftRemoveById(rec.id); } };
   }
   function ftSchedule(fn, delay, args, interval) {
     const id = ++FT.seq;
     let d = Number(delay); if (!isFinite(d) || d < 0) d = 0;
-    FT.queue.push({ id: id, fireAt: FT.now + d, fn: fn, args: args, interval: interval });
-    return id;
+    const rec = { id: id, fireAt: FT.now + d, fn: fn, args: args, interval: interval, delay: d, refd: true };
+    FT.queue.push(rec);
+    return ftHandle(rec);
   }
-  function ftInstall() {
+  function ftTimerId(t) { return (t !== null && typeof t === "object") ? t._id : t; }
+  // useFakeTimers(options) — FakeTimers.rs:266-296: `now` may be a number or a
+  // Date; without it the fake wall clock starts at the current real time.
+  function ftInstall(opts) {
+    const RD = G.__mbunRealDate || G.Date;
+    let jsNow = RD.now();
+    if (opts !== undefined && opts !== null) {
+      if (typeof opts !== "object") throw new TypeError("useFakeTimers() expects an options object");
+      const n = opts.now;
+      if (n !== undefined && n !== null) {
+        if (typeof n === "number") jsNow = n;
+        else if (typeof n === "object" && typeof n.getTime === "function") jsNow = n.getTime();
+        else throw new TypeError("'now' must be a number or Date");
+      }
+    }
+    FT.now = 0; FT.seq = 0; FT.queue = []; FT.dateOffset = Math.floor(jsNow);
+    ftSync();
     if (FT.on) { try { G.setTimeout.clock = true; } catch (e) {} return; }
-    FT.on = true; FT.now = 0; FT.seq = 0; FT.queue = [];
+    FT.on = true;
     FT.saved = { setTimeout: G.setTimeout, clearTimeout: G.clearTimeout,
                  setInterval: G.setInterval, clearInterval: G.clearInterval };
     const fakeSetTimeout = function (fn, delay) {
@@ -841,8 +911,15 @@ inline constexpr std::string_view HARNESS = R"JS(
     };
     G.setTimeout = fakeSetTimeout;
     G.setInterval = fakeSetInterval;
-    G.clearTimeout = function (id) { if (id != null) ftRemoveById(id); };
-    G.clearInterval = function (id) { if (id != null) ftRemoveById(id); };
+    G.clearTimeout = function (t) { if (t != null) ftRemoveById(ftTimerId(t)); };
+    G.clearInterval = function (t) { if (t != null) ftRemoveById(ftTimerId(t)); };
+    // vm.overridden_performance_now (CurrentTime::set): performance.now() reads
+    // the fake monotonic clock, i.e. starts at 0 no matter what `now` is.
+    const perf = G.performance;
+    if (perf && typeof perf.now === "function") {
+      FT.savedPerfNow = perf.now;
+      perf.now = function () { return FT.now; };
+    }
   }
   function ftUninstall() {
     if (!FT.on) return;
@@ -851,6 +928,10 @@ inline constexpr std::string_view HARNESS = R"JS(
       G.setTimeout = FT.saved.setTimeout; G.clearTimeout = FT.saved.clearTimeout;
       G.setInterval = FT.saved.setInterval; G.clearInterval = FT.saved.clearInterval;
       FT.saved = null;
+    }
+    if (FT.savedPerfNow) {
+      try { G.performance.now = FT.savedPerfNow; } catch (e) {}
+      FT.savedPerfNow = null;
     }
     FT.queue = [];
   }
@@ -865,51 +946,78 @@ inline constexpr std::string_view HARNESS = R"JS(
             (next === null || t.fireAt < next.fireAt || (t.fireAt === next.fireAt && t.id < next.id))) next = t;
       }
       if (next === null) break;
-      FT.now = next.fireAt;
-      if (next.interval > 0) { next.fireAt = next.fireAt + next.interval; }
-      else { ftRemoveById(next.id); }
-      try { next.fn.apply(undefined, next.args || []); }
-      catch (e) { const st = G.__mbunState; if (st && st.asyncErr === undefined) st.asyncErr = e; else throw e; }
+      ftFire(next);
       if (++guard > 1000000) break;
     }
-    if (FT.now < target) FT.now = target;
+    if (FT.now < target) { FT.now = target; ftSync(); }
+  }
+  // FakeTimers::fire — the clock jumps to the timer's deadline BEFORE the
+  // callback runs, so Date.now()/performance.now() inside it see that instant.
+  function ftFire(next) {
+    FT.now = next.fireAt; ftSync();
+    if (next.interval > 0) { next.fireAt = next.fireAt + next.interval; }
+    else { ftRemoveById(next.id); }
+    try { next.fn.apply(undefined, next.args || []); }
+    catch (e) { const st = G.__mbunState; if (st && st.asyncErr === undefined) st.asyncErr = e; else throw e; }
+  }
+  function ftPeek() {
+    let next = null;
+    for (const t of FT.queue) { if (next === null || t.fireAt < next.fireAt || (t.fireAt === next.fireAt && t.id < next.id)) next = t; }
+    return next;
   }
   function ftAdvanceBy(ms) {
+    ftRequireActive();
     let n = Number(ms); if (!isFinite(n) || n < 0) n = 0;
     // advanceTimersByTime(0) advances 1ms so setTimeout(fn,0) fires — bun
     // FakeTimers.rs:449-452 (effective_advance = if arg==0 {1} else {arg}).
     const eff = (n === 0) ? 1 : n;
     ftExecuteUntil(FT.now + eff);
   }
+  // advanceTimersToNextTimer fires exactly ONE timer (FakeTimers::execute_next).
   function ftAdvanceToNext() {
-    let next = null;
-    for (const t of FT.queue) { if (next === null || t.fireAt < next.fireAt || (t.fireAt === next.fireAt && t.id < next.id)) next = t; }
-    if (next !== null) ftExecuteUntil(next.fireAt);
+    ftRequireActive();
+    const next = ftPeek();
+    if (next !== null) ftFire(next);
+  }
+  // runOnlyPendingTimers runs until the latest currently-scheduled deadline
+  // (FakeTimers::execute_only_pending_timers → find_max + execute_until).
+  function ftRunPending() {
+    ftRequireActive();
+    let max = null;
+    for (const t of FT.queue) if (max === null || t.fireAt > max) max = t.fireAt;
+    if (max !== null) ftExecuteUntil(max);
   }
   function ftRunAll() {
+    ftRequireActive();
     let guard = 0;
-    while (FT.queue.length && ++guard <= 100000) ftAdvanceToNext();
+    while (FT.queue.length && ++guard <= 100000) { const next = ftPeek(); if (next === null) break; ftFire(next); }
   }
+  function ftClearAll() { ftRequireActive(); FT.queue = []; }
+  function ftCount() { ftRequireActive(); return FT.queue.length; }
 
-  const jest = { fn: mock, spyOn: spyOn, mock: (m, f) => { if (typeof m !== "string") throw new TypeError("jest.mock() 1st argument must be a string"); if (typeof f !== "function") throw new TypeError("jest.mock() 2nd argument must be a function"); }, unmock: () => {}, useFakeTimers: () => { ftInstall(); return jest; }, useRealTimers: () => { setSystemTime(); ftUninstall(); return jest; }, setSystemTime: (v) => { setSystemTime(v); return jest; }, restoreAllMocks: () => mock.restoreAllMocks(), clearAllMocks: () => mock.clearAllMocks(), resetAllMocks: () => mock.resetAllMocks(), advanceTimersByTime: (ms) => { ftAdvanceBy(ms); return jest; }, advanceTimersToNextTimer: () => { ftAdvanceToNext(); return jest; }, runAllTimers: () => { ftRunAll(); return jest; }, runOnlyPendingTimers: () => { ftRunAll(); return jest; }, clearAllTimers: () => { FT.queue = []; return jest; }, getTimerCount: () => FT.queue.length };
+  const jest = { fn: mock, spyOn: spyOn, mock: (m, f) => { if (typeof m !== "string") throw new TypeError("jest.mock() 1st argument must be a string"); if (typeof f !== "function") throw new TypeError("jest.mock() 2nd argument must be a function"); }, unmock: () => {}, useFakeTimers: (o) => { ftInstall(o); return jest; }, useRealTimers: () => { ftUninstall(); setSystemTime(); return jest; }, setSystemTime: (v) => { setSystemTime(v); return jest; }, restoreAllMocks: () => mock.restoreAllMocks(), clearAllMocks: () => mock.clearAllMocks(), resetAllMocks: () => mock.resetAllMocks(), advanceTimersByTime: (ms) => { ftAdvanceBy(ms); return jest; }, advanceTimersToNextTimer: () => { ftAdvanceToNext(); return jest; }, runAllTimers: () => { ftRunAll(); return jest; }, runOnlyPendingTimers: () => { ftRunPending(); return jest; }, clearAllTimers: () => { ftClearAll(); return jest; }, getTimerCount: () => ftCount(), isFakeTimers: () => FT.on };
 
   // `vi` is bun:test's vitest-compat surface. It is NOT the same object as `jest`
   // (verified against bun 1.3.14: `vi === jest` is false) and carries its own key
-  // set; the timer helpers mirror the same stub level as `jest` above rather than
-  // pretending to fake timers.
+  // set — but the fake-timer entry points are the SAME native functions on both
+  // objects (FakeTimers.rs put_timers_fns: every FAKE_TIMERS_FNS entry is put on
+  // `vi` and `jest`), each returning `this`.
   const vi = { fn: mock, mock: function () {}, spyOn: spyOn,
                clearAllMocks: function () { mock.clearAllMocks(); },
                resetAllMocks: function () { mock.resetAllMocks(); },
                restoreAllMocks: function () { mock.restoreAllMocks(); },
-               useFakeTimers: function () { return vi; },
+               useFakeTimers: function (o) { ftInstall(o); return vi; },
                // No vi.setSystemTime: verified against bun 1.3.14, `vi` exposes
                // useRealTimers but leaves setSystemTime undefined (vitest suites
                // feature-detect on it). useRealTimers does clear the override.
-               useRealTimers: function () { setSystemTime(); return vi; },
-               isFakeTimers: function () { return false; }, clearAllTimers: function () {},
-               runAllTimers: function () {}, runOnlyPendingTimers: function () {},
-               advanceTimersByTime: function () {}, advanceTimersToNextTimer: function () {},
-               getTimerCount: function () { return 0; } };
+               useRealTimers: function () { ftUninstall(); setSystemTime(); return vi; },
+               isFakeTimers: function () { return FT.on; },
+               clearAllTimers: function () { ftClearAll(); return vi; },
+               runAllTimers: function () { ftRunAll(); return vi; },
+               runOnlyPendingTimers: function () { ftRunPending(); return vi; },
+               advanceTimersByTime: function (ms) { ftAdvanceBy(ms); return vi; },
+               advanceTimersToNextTimer: function () { ftAdvanceToNext(); return vi; },
+               getTimerCount: function () { return ftCount(); } };
 
   // bun:test expectTypeOf (expect.rs:2955): runtime no-op type-assertion chain —
   // callable (never new-able); every property access / call returns a fresh chain.

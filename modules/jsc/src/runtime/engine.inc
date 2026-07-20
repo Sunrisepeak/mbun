@@ -999,10 +999,18 @@ public:
             (blobModule || path.ends_with(".json") || path.ends_with(".jsonc") ||
              path.ends_with("bun.lock"))) {
             // An empty (or whitespace-only) `.json` module is a parse error in bun
-            // — "JSON Parse error: Unexpected EOF" — not `{}`. JSONC's empty→{}
-            // tolerance belongs to package.json/bun.lock parsing, not to the module
-            // loader (issue 17605). .jsonc / bun.lock keep the tolerant behaviour.
-            if (path.ends_with(".json") &&
+            // — "JSON Parse error: Unexpected EOF" — not `{}` (issue 17605).
+            // The tolerant JSONC loader (empty→{}) is selected by FILE NAME, not
+            // only by extension: package.json / bun.lock / *.jsonc /
+            // tsconfig*.json / jsconfig*.json (jsc_hooks.rs loader_for_path:3835).
+            const auto jsoncByName{[](std::string_view p) {
+                const auto slash{p.find_last_of('/')};
+                const std::string_view fn{slash == std::string_view::npos ? p : p.substr(slash + 1)};
+                if (fn == "package.json" || fn == "bun.lock" || fn.ends_with(".jsonc")) return true;
+                return (fn.starts_with("tsconfig.") || fn.starts_with("jsconfig.")) &&
+                       fn.ends_with(".json");
+            }};
+            if (path.ends_with(".json") && !jsoncByName(path) &&
                 source.find_first_not_of(" \t\r\n") == std::string::npos) {
                 source = "throw new SyntaxError(\"JSON Parse error: Unexpected EOF\");";
             } else {

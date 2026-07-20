@@ -620,6 +620,11 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
       // in generation order; it resets to 0 when the timestamp changes.
       let lastTs = -1, counter = 0;
       return (enc, ts) => {
+      // bun rejects an unknown encoding label with ERR_UNKNOWN_ENCODING
+      // (JSBufferEncodingType.cpp:91), it does not fall back to hex.
+      if (enc !== undefined && enc !== null && enc !== "hex" && enc !== "base64" && enc !== "base64url" && enc !== "buffer") {
+        const e = new TypeError("Invalid encoding"); e.code = "ERR_UNKNOWN_ENCODING"; throw e;
+      }
       let t = ts instanceof Date ? ts.getTime() : (typeof ts === "number" ? ts : (G.Date ? Date.now() : 0));
       t = t < 0 ? 0 : Math.floor(t);
       if (t !== lastTs) { lastTs = t; counter = 0; }

@@ -904,7 +904,9 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       X509Certificate: class X509Certificate { constructor() { this.subject = ""; this.issuer = ""; } },
       createECDH: () => ({ generateKeys: () => Buffer.alloc(0), computeSecret: () => Buffer.alloc(0), getPublicKey: () => Buffer.alloc(0), getPrivateKey: () => Buffer.alloc(0), setPrivateKey() {} }),
       createDiffieHellman: () => ({ generateKeys: () => Buffer.alloc(0), computeSecret: () => Buffer.alloc(0), getPrime: () => Buffer.alloc(0), getGenerator: () => Buffer.alloc(0) }),
-      timingSafeEqual: (a, b) => { a = toBytes(a); b = toBytes(b); if (a.length !== b.length) return false; let d = 0; for (let i = 0; i < a.length; i++) d |= a[i] ^ b[i]; return d === 0; },
+      // node/bun throw on a length mismatch (ErrorCode.cpp:1552
+      // CRYPTO_TIMING_SAFE_EQUAL_LENGTH), they do not return false.
+      timingSafeEqual: (a, b) => { a = toBytes(a); b = toBytes(b); if (a.length !== b.length) { const e = new RangeError("Input buffers must have the same byte length"); e.code = "ERR_CRYPTO_TIMING_SAFE_EQUAL_LENGTH"; throw e; } let d = 0; for (let i = 0; i < a.length; i++) d |= a[i] ^ b[i]; return d === 0; },
       constants: { RSA_PKCS1_PADDING: 1, RSA_PKCS1_OAEP_PADDING: 4 }, webcrypto: G.crypto,
     };
     // node's generateKeyPair has a custom promisify that resolves to an object
@@ -938,11 +940,14 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
     if (G.Bun && typeof G.Bun.randomUUIDv5 === "undefined") {
       const WELL_KNOWN_NS = { dns: "6ba7b810-9dad-11d1-80b4-00c04fd430c8", url: "6ba7b811-9dad-11d1-80b4-00c04fd430c8", oid: "6ba7b812-9dad-11d1-80b4-00c04fd430c8", x500: "6ba7b814-9dad-11d1-80b4-00c04fd430c8" };
       const nsBytes = (ns) => {
-        if (ns instanceof Uint8Array || ArrayBuffer.isView(ns)) { const u = new Uint8Array(ns.buffer, ns.byteOffset, ns.byteLength); if (u.length !== 16) throw new TypeError("namespace must be exactly 16 bytes"); return u; }
-        if (ns instanceof ArrayBuffer) { const u = new Uint8Array(ns); if (u.length !== 16) throw new TypeError("namespace must be exactly 16 bytes"); return u; }
+        // bun randomUUIDv5: a missing namespace is ERR_INVALID_ARG_TYPE, a
+        // malformed one ERR_INVALID_ARG_VALUE (both TypeError).
+        if (ns === undefined || ns === null) { const e = new TypeError('The "namespace" argument must be a string or an instance of ArrayBuffer, Buffer or TypedArray'); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
+        if (ns instanceof Uint8Array || ArrayBuffer.isView(ns)) { const u = new Uint8Array(ns.buffer, ns.byteOffset, ns.byteLength); if (u.length !== 16) { const e = new TypeError("namespace must be exactly 16 bytes"); e.code = "ERR_INVALID_ARG_VALUE"; throw e; } return u; }
+        if (ns instanceof ArrayBuffer) { const u = new Uint8Array(ns); if (u.length !== 16) { const e = new TypeError("namespace must be exactly 16 bytes"); e.code = "ERR_INVALID_ARG_VALUE"; throw e; } return u; }
         let s = String(ns); s = WELL_KNOWN_NS[s.toLowerCase()] || s;
         const hex = s.replace(/-/g, "");
-        if (!/^[0-9a-fA-F]{32}$/.test(hex)) throw new TypeError("namespace must be a valid UUID string or 16-byte buffer");
+        if (!/^[0-9a-fA-F]{32}$/.test(hex)) { const e = new TypeError("namespace must be a valid UUID string or 16-byte buffer"); e.code = "ERR_INVALID_ARG_VALUE"; throw e; }
         const u = new Uint8Array(16); for (let i = 0; i < 16; i++) u[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16); return u;
       };
       G.Bun.randomUUIDv5 = (name, namespace, enc) => {
@@ -955,7 +960,7 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
         if (enc === undefined || enc === "hex") { let s = ""; for (let i = 0; i < 16; i++) { s += d[i].toString(16).padStart(2, "0"); if (i === 3 || i === 5 || i === 7 || i === 9) s += "-"; } return s; }
         if (enc === "buffer") return Buffer.from(d);
         if (enc === "base64" || enc === "base64url") { let bin = ""; for (const b of d) bin += String.fromCharCode(b); const b64 = G.btoa(bin); return enc === "base64" ? b64 : b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""); }
-        throw new TypeError('encoding must be "hex", "buffer", "base64", or "base64url"');
+        { const e = new TypeError("Invalid encoding"); e.code = "ERR_UNKNOWN_ENCODING"; throw e; }
       };
     }
   }

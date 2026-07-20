@@ -2458,7 +2458,9 @@ export constexpr std::string_view kNetJS = R"JS(
         tls = pooled.tls ? 2 : 0;
       } else {
         try { fd = NN.connect(host, port); }
-        catch (e) { return reject(mkErr("Unable to connect. Is the computer able to access the url? (" + url + ")", "ConnectionRefused")); }
+        // The message is verbatim from bun's fetch error arm (FetchTasklet.rs:1345)
+        // — no URL suffix: tests pin the exact string.
+        catch (e) { return reject(mkErr("Unable to connect. Is the computer able to access the url?", "ConnectionRefused")); }
         if (secure) {
           try { NN.tlsWrap(fd, false, "", "", host, tlsVerify ? 1 : 0, tlsCa); tls = 1; }
           catch (e) { try { NN.close(fd); } catch (e2) {} return reject(mkErr("fetch: TLS setup failed (" + String((e && e.message) || e) + ")", "FailedToOpenSocket")); }
