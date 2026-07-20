@@ -102,8 +102,49 @@ inline std::string key_literal_(std::string_view name) {
 // require() (which never sees this argument) is unaffected. The value is a loader
 // name captured from a string literal (js_parser.cppm parse_import_attributes_),
 // so it needs no escaping beyond the quotes.
-inline std::string require_call_(std::string_view specRaw, std::string_view typeAttr) {
-    std::string s{"require(" + std::string{specRaw}};
+// Does the module declare a top-level binding named `require`? Line-anchored
+// scan (a nested declaration is indented, and a false positive only means the
+// lowering uses the alias the runtime binds anyway) over `const|let|var|
+// function|class require` followed by a non-identifier character.
+inline bool declares_top_level_require_(std::string_view src) {
+    static constexpr std::string_view kKeywords[]{"const ", "let ", "var ", "function ", "class "};
+    std::size_t pos{0};
+    while (pos < src.size()) {
+        const std::size_t eol{src.find('\n', pos)};
+        std::string_view line{src.substr(pos, eol == std::string_view::npos ? eol : eol - pos)};
+        for (std::string_view keyword : kKeywords) {
+            if (!line.starts_with(keyword)) continue;
+            std::string_view rest{line.substr(keyword.size())};
+            while (!rest.empty() && (rest.front() == ' ' || rest.front() == '\t')) {
+                rest.remove_prefix(1);
+            }
+            if (rest.starts_with("require")) {
+                const std::string_view after{rest.substr(7)};
+                if (after.empty() || (std::isalnum(static_cast<unsigned char>(after.front())) == 0 &&
+                                      after.front() != '_' && after.front() != '$')) {
+                    return true;
+                }
+            }
+        }
+        if (eol == std::string_view::npos) break;
+        pos = eol + 1;
+    }
+    return false;
+}
+
+// The identifier the ESM->CJS lowering calls for its OWN import statements.
+// Normally the plain `require` the CommonJS wrapper injects; a module that
+// itself declares a top-level `require` (node's test/common/index.mjs does:
+// `const require = createRequire(import.meta.url)`) collides with that wrapper
+// PARAMETER — "Cannot declare a const variable twice: 'require'", a hard
+// SyntaxError before a single statement runs — so those modules get lowered
+// against this reserved alias, which the runtime wrappers bind alongside
+// `require`.
+inline constexpr std::string_view kEsmRequireAlias{"__mbun_esm_require"};
+
+inline std::string require_call_(std::string_view specRaw, std::string_view typeAttr,
+                                 std::string_view requireName = "require") {
+    std::string s{std::string{requireName} + "(" + std::string{specRaw}};
     // The third argument (1) marks this require() as a lowered ESM *import
     // statement* (ImportKind::Stmt). It lets the runtime report the correct
     // Node error code on a resolution failure — ERR_MODULE_NOT_FOUND for an
@@ -126,12 +167,13 @@ inline std::string require_call_(std::string_view specRaw, std::string_view type
 // import's `type` attribute (empty when absent) — see require_call_.
 inline std::string build_cjs_import_(std::uint32_t uniq, std::string_view def, std::string_view ns,
                               const std::vector<NamedSpec>& named, std::string_view specRaw,
-                              bool sideEffect, std::string_view typeAttr = {}) {
+                              bool sideEffect, std::string_view typeAttr = {},
+                              std::string_view requireName = "require") {
     if (sideEffect && def.empty() && ns.empty() && named.empty()) {
-        return require_call_(specRaw, typeAttr) + ";";
+        return require_call_(specRaw, typeAttr, requireName) + ";";
     }
     const std::string g{"__mbun_i" + std::to_string(uniq)};
-    std::string s{"const " + g + " = " + require_call_(specRaw, typeAttr) + ";"};
+    std::string s{"const " + g + " = " + require_call_(specRaw, typeAttr, requireName) + ";"};
     if (!def.empty()) {
         // interop: an ESM module we transpiled sets __esModule → take .default;
         // a real CJS module has no __esModule → the module.exports itself is the

@@ -503,6 +503,14 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     return final(keys, values);
   };
   class Console { constructor(out) { const o = out && out.stdout ? out : { stdout: out }; Object.assign(this, G.console); const colorMode = o.colorMode === undefined ? "auto" : o.colorMode; const io = o.inspectOptions; const colorsFor = (s) => colorMode === "auto" ? !!(s && s.isTTY) : !!colorMode; const fmt = (s, a) => util.formatWithOptions(Object.assign({}, io, { colors: colorsFor(s) }), ...a) + "\n"; this.log = this.info = (...a) => { (o.stdout && o.stdout.write) ? o.stdout.write(fmt(o.stdout, a)) : G.console.log(...a); }; this.error = this.warn = (...a) => { (o.stderr && o.stderr.write) ? o.stderr.write(fmt(o.stderr, a)) : G.console.error(...a); }; this.table = (data, props) => consoleTableImpl((s) => this.log(s), Object.assign({}, io, { colors: colorsFor(o.stdout) }), data, props); } }
+  // console.clear() — node lib/internal/console/constructor.js: writes the
+  // terminal reset sequence when stdout is a TTY, and is a no-op otherwise.
+  if (typeof G.console.clear !== "function") {
+    G.console.clear = function clear() {
+      const out = G.process && G.process.stdout;
+      if (out && out.isTTY && typeof out.write === "function") out.write("\u001b[2J\u001b[0f");
+    };
+  }
   // console.write(...chunks) — raw (no newline/format) write to stdout, returns
   // bytes written. ref: bun src/js/builtins/ConsoleObject.ts write(): the private
   // "writer" slot lookup rejects a non-object `this` (surfaces as ERR_INVALID_THIS).

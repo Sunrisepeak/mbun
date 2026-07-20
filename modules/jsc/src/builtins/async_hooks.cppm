@@ -47,6 +47,15 @@ inline constexpr std::string_view kAsyncHooksJS = R"JS(
 
   class AsyncLocalStorage {
     #disabled = false;
+    // node >= 24 `new AsyncLocalStorage({ defaultValue })`: getStore() outside
+    // any run()/enterWith() reports this instead of undefined.
+    #defaultValue = undefined;
+
+    constructor(options) {
+      if (options !== null && options !== undefined && typeof options === "object") {
+        this.#defaultValue = options.defaultValue;
+      }
+    }
 
     static bind(fn, ...args) {
       if (typeof fn !== "function") throw new TypeError('The "fn" argument must be of type function');
@@ -95,10 +104,30 @@ inline constexpr std::string_view kAsyncHooksJS = R"JS(
     }
 
     getStore() {
-      if (this.#disabled) return undefined;
+      if (this.#disabled) return this.#defaultValue;
       const context = contextGet();
       const index = contextIndex(context, this);
-      return index < 0 ? undefined : context[index + 1];
+      return index < 0 ? this.#defaultValue : context[index + 1];
+    }
+
+    // node >= 24 `using scope = als.withScope(store)`: enters `store` and
+    // restores the whole previous context on dispose (so an enterWith() made
+    // inside the scope is undone too), idempotently.
+    withScope(store) {
+      const previous = contextGet();
+      const wasDisabled = this.#disabled;
+      this.#disabled = false;
+      contextSet(contextWith(previous, this, store));
+      let disposed = false;
+      const scope = {
+        dispose() {
+          if (disposed) return;
+          disposed = true;
+          if (!wasDisabled) contextSet(previous);
+        },
+      };
+      scope[Symbol.dispose] = scope.dispose;
+      return scope;
     }
 
     _enable() {}

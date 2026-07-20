@@ -456,6 +456,8 @@ std::expected<std::string, std::string> transpile(std::string_view source, Loade
     const bool jsx{loader == Loader::Tsx || loader == Loader::Jsx};
     mbun::js_parser::TranspileResult t{mbun::js_parser::transpile(
         source, {.cjs = cjs,
+                 // Runtime wrappers bind __mbun_esm_require; see kEsmRequireAlias.
+                 .cjs_require_alias = true,
                  .jsx = jsx,
                  .legacy_decorators = legacyDecorators,
                  .jsx_options = runtime_jsx_options(),
@@ -484,6 +486,11 @@ struct LoadResult {
     std::string message;  // diagnostic detail when not Success
     bool top_level_await{false};  // module awaits at top level (needs async wrapper)
     bool cjs_esm_module{false};   // CJS output came from ESM and must execute in strict mode
+    // The module declares its own top-level `require`, so its lowered imports
+    // were named against __mbun_esm_require and the CJS wrapper must NOT bind a
+    // `require` parameter (it would collide). See js_parser
+    // declares_top_level_require.
+    bool cjs_require_alias{false};
 };
 
 // The runtime's base ESM conditions. mbun's runtime is always target=bun, so it
@@ -614,6 +621,7 @@ public:
             const bool legacy{(out.loader == Loader::Ts || out.loader == Loader::Tsx) &&
                               experimental_decorators(
                                   fs_, mbun::core::paths::posix::dirname(resolved.path))};
+            out.cjs_require_alias = cjs_ && mbun::js_parser::declares_top_level_require(*src);
             std::expected<std::string, std::string> js{
                 transpile(*src, out.loader, cjs_, &out.top_level_await, legacy,
                           &out.cjs_esm_module)};

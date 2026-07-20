@@ -1691,6 +1691,9 @@ RunResult run_source(std::string_view js_source, std::string_view dir = ".", boo
     // needs its jsx-runtime import injected exactly like an imported module.
     mbun::js_parser::TranspileResult t{mbun::js_parser::transpile(
         js_source, {.cjs = true,
+                    // The wrapper below binds __mbun_esm_require and renames its
+                    // `require` parameter for a file that declares its own.
+                    .cjs_require_alias = true,
                     .jsx = jsx,
                     .jsx_options = mbun::jsc::module_loader::runtime_jsx_options(),
                     // A test file is transpiled by the same runtime transpiler as
@@ -1806,8 +1809,14 @@ RunResult run_source(std::string_view js_source, std::string_view dir = ".", boo
     const char* pdn{declares("__dirname") ? "__mbun_pdirname" : "__dirname"};
     const std::string callArgs{
         "globalThis.exports, globalThis.require, globalThis.module, "
-        "globalThis.__filename, globalThis.__dirname"};
-    const std::string params{std::string{"exports, require, module, "} + pfn + ", " + pdn};
+        "globalThis.__filename, globalThis.__dirname, globalThis.require"};
+    // Trailing `__mbun_esm_require`: the alias the ESM->CJS lowering uses for its
+    // own imports when the file declares its own `require` (js_parser
+    // kEsmRequireAlias).
+    const char* preq{mbun::js_parser::declares_top_level_require(js_source) ? "__mbun_prequire"
+                                                                           : "require"};
+    const std::string params{std::string{"exports, "} + preq + ", module, " + pfn + ", " + pdn +
+                             ", __mbun_esm_require"};
     const std::string strictPrefix{t.cjs_esm_module ? "\"use strict\";\n" : ""};
     std::string wrapped{"(function (" + params + ") {\n" + strictPrefix + prepared +
                         "\n}).call(globalThis, " + callArgs + ");"};

@@ -294,6 +294,7 @@
         std::string path;
         bool tla{false};  // module awaits at top level → async wrapper + pump
         bool strictMode{false};  // ESM lowered to CJS retains mandatory strict semantics
+        bool requireAlias{false};  // module declares its own `require` (see below)
         // The loader the module was actually loaded AS. The data-module wrapping
         // below keys off this rather than off the extension alone: a `type` import
         // attribute can override the extension (`./d.json` with { type: "text" }
@@ -303,6 +304,7 @@
         if (loaded.status == LoadStatus::Success) {
             tla = loaded.top_level_await;
             strictMode = loaded.cjs_esm_module;
+            requireAlias = loaded.cjs_require_alias;
             source = std::move(loaded.source);
             path = std::move(loaded.path);
         } else if (loaded.status == LoadStatus::TranspileFailed) {
@@ -538,7 +540,16 @@
         }};
         const char* pfn{declares("__filename") ? "__mbun_pfilename" : "__filename"};
         const char* pdn{declares("__dirname") ? "__mbun_pdirname" : "__dirname"};
-        const std::string params{std::string{"exports, require, module, "} + pfn + ", " + pdn};
+        // A module that declares its own top-level `require` must not get the
+        // wrapper's `require` PARAMETER — the two collide ("Cannot declare a
+        // const variable twice: 'require'", a SyntaxError before anything runs;
+        // node's own test/common/index.mjs is exactly this shape). Its lowered
+        // imports were emitted against `__mbun_esm_require` instead (js_parser
+        // kEsmRequireAlias), which the trailing parameter binds to the same
+        // require — inert for every module that does not declare one.
+        const char* preq{requireAlias ? "__mbun_prequire" : "require"};
+        const std::string params{std::string{"exports, "} + preq + ", module, " + pfn + ", " + pdn +
+                                 ", __mbun_esm_require"};
         // A module with top-level await gets the async wrapper up front (JSC's
         // script mode has no TLA); its promise is pumped to completion below so
         // requiring it is synchronous and a rejection propagates to the caller.
@@ -617,10 +628,10 @@
         JSValueRef dirArg{make_string(ctx, dir)};
         JSValueRef reqFn{JSObjectCallAsFunction(ctx, makeReq, nullptr, 1, &dirArg, exc)};
 
-        JSValueRef callArgs[5]{exportsObj, reqFn, moduleObj, make_string(ctx, path),
-                               make_string(ctx, dir)};
+        JSValueRef callArgs[6]{exportsObj, reqFn, moduleObj, make_string(ctx, path),
+                               make_string(ctx, dir), reqFn};
         JSValueRef callExc{nullptr};
-        JSValueRef callRet{JSObjectCallAsFunction(ctx, fn, nullptr, 5, callArgs, &callExc)};
+        JSValueRef callRet{JSObjectCallAsFunction(ctx, fn, nullptr, 6, callArgs, &callExc)};
         if (callExc == nullptr && asyncWrapped && callRet != nullptr) {
             // Pump the module's promise to completion so top-level awaits finish
             // before require() returns, and surface a rejection as the require

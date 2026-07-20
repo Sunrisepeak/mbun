@@ -110,9 +110,10 @@ class Parser : public TypeParser {
 public:
     explicit Parser(std::string_view src, bool cjs = false, bool jsx = false,
                     bool legacyDecorators = false, JsxOptions jsxOpts = {},
-                    bool trimUnusedImports = false)
+                    bool trimUnusedImports = false,
+                    std::string_view requireName = "require")
         : TypeParser{src, jsx, std::move(jsxOpts)}, cjs_{cjs},
-          legacyDecorators_{legacyDecorators} {
+          legacyDecorators_{legacyDecorators}, cjsRequireName_{requireName} {
         trim_.set_enabled(trimUnusedImports);
     }
 
@@ -206,7 +207,7 @@ private:
             // `using` frame's envId; see parse_program_.)
             arena_.add_edit(0, 0,
                             build_cjs_import_(static_cast<std::uint32_t>(src_.size() + 1), "", "",
-                                              named, spec, false));
+                                              named, spec, false, {}, cjsRequireName_));
             return;
         }
         std::string s{"import { "};
@@ -225,6 +226,8 @@ private:
     bool classHasSuper_{false};  // enclosing class has an `extends` clause (for param-property init placement)
     bool allowPrivateBrand_{false};
     bool cjs_{false};          // ESM → CommonJS lowering mode
+    // Identifier the lowering calls for its own imports; see kEsmRequireAlias.
+    std::string_view cjsRequireName_{"require"};
     bool legacyDecorators_{false};  // TS experimentalDecorators: erase, no stage-3 lowering
     // TS unused-import elision (bun `trim_unused_imports`). OFF unless the
     // caller asks: Bun.Transpiler leaves it off, the runtime loader turns it on.
@@ -1530,7 +1533,7 @@ private:
         } else if (cjs_) {
             arena_.add_edit(start, prev_end_(),
                             build_cjs_import_(start, defName, nsName, named, specRaw, sideEffect,
-                                              typeAttr));
+                                              typeAttr, cjsRequireName_));
         }
         NodeIndex n = arena_.make(NodeKind::ImportDecl, start, cur_().start);
         Node& in = arena_.at(n);
@@ -1910,8 +1913,10 @@ private:
                 cjsEsmExport_ = true;
                 std::string repl{
                     nsName.empty()
-                        ? std::string{kObjectAlias} + ".assign(exports, require(" + specRaw + "));"
-                        : "exports." + nsName + " = require(" + specRaw + ");"};
+                        ? std::string{kObjectAlias} + ".assign(exports, " +
+                              std::string{cjsRequireName_} + "(" + specRaw + "));"
+                        : "exports." + nsName + " = " + std::string{cjsRequireName_} + "(" +
+                              specRaw + ");"};
                 arena_.add_edit(start, prev_end_(), repl);
             }
             lastExForm_ = ExForm::Star;
@@ -1970,7 +1975,7 @@ private:
                 std::string repl;
                 if (hasFrom) {
                     const std::string g{"__mbun_e" + std::to_string(start)};
-                    repl = "const " + g + " = require(" + specRaw + ");";
+                    repl = "const " + g + " = " + std::string{cjsRequireName_} + "(" + specRaw + ");";
                     for (const NamedSpec& s : specs) {
                         repl += " exports." + s.alias + " = " + g + "." + s.name + ";";
                     }
@@ -5569,7 +5574,8 @@ private:
             }
             if (cjs_) {
                 arena_.add_edit(static_cast<std::uint32_t>(start), parenEnd,
-                                "globalThis.__mbun_dyn_import(require,");
+                                "globalThis.__mbun_dyn_import(" + std::string{cjsRequireName_} +
+                                    ",");
             }
             NodeIndex n = arena_.make(NodeKind::ImportCall, start, cur_().start);
             arena_.at(n).listStart = arena_.commit_list(args);
@@ -5600,11 +5606,30 @@ struct TranspileResult {
                                   // needs the async-IIFE wrapper + event-loop pump)
 };
 
+// Does this module declare a top-level `require` binding (`const require =
+// createRequire(import.meta.url)`, node's test/common/index.mjs:3)? Such a
+// module cannot take the CommonJS wrapper's `require` PARAMETER — the parameter
+// and the declaration collide ("Cannot declare a const variable twice"), a
+// SyntaxError before anything runs. The runtime wrapper therefore renames its
+// parameter, and this transpiler lowers the module's own imports against
+// `__mbun_esm_require` (kEsmRequireAlias) instead. Both sides MUST agree, which
+// is why they share this one predicate.
+inline bool declares_top_level_require(std::string_view src) {
+    return detail::declares_top_level_require_(src);
+}
+
 // Transpile options. `cjs` lowers ESM import/export to CommonJS require/exports
 // (for the script-mode JSC runtime, which cannot evaluate ES modules); when off,
 // import/export are kept verbatim (type-only forms still erased).
 struct TranspileOptions {
     bool cjs{false};
+    // Allow the ESM->CJS lowering to call `__mbun_esm_require` instead of
+    // `require` for its own imports, when the module itself declares a
+    // top-level `require` binding (which would otherwise collide with the CJS
+    // wrapper's `require` parameter — a SyntaxError before anything runs).
+    // ON for the runtime module loader, whose wrappers bind that alias; OFF for
+    // the bundler and Bun.Transpiler, whose output runs elsewhere.
+    bool cjs_require_alias{false};
     bool jsx{false};  // TSX/JSX input — lower JSX elements (see jsx_options)
     bool legacy_decorators{false};  // tsconfig experimentalDecorators: keep the TS
                                     // legacy behavior (decorators erased, no stage-3
@@ -5744,8 +5769,14 @@ TranspileResult transpile_(std::string_view src, const TranspileOptions& opts, b
             return bad;
         }
     }
+    // A module that declares its own top-level `require` gets its lowered
+    // imports named against the reserved alias — see kEsmRequireAlias.
+    const std::string_view requireName{
+        opts.cjs_require_alias && detail::declares_top_level_require_(src)
+            ? detail::kEsmRequireAlias
+            : std::string_view{"require"}};
     detail::Parser p{src, use_printer ? false : opts.cjs, opts.jsx, opts.legacy_decorators,
-                     std::move(jsxOpts), opts.trim_unused_imports};
+                     std::move(jsxOpts), opts.trim_unused_imports, requireName};
     ParseResult r = p.run();
     TranspileResult out;
     out.ok = r.ok;

@@ -351,6 +351,8 @@ public:
                                   os_fs(), parent_dir(absPath))};
             mbun::js_parser::TranspileResult t{mbun::js_parser::transpile(
                 source, {.cjs = true,
+                         // The entry wrapper binds __mbun_esm_require too.
+                         .cjs_require_alias = true,
                          .jsx = jsx,
                          .legacy_decorators = legacy,
                          // The entry file links like any other module, so it
@@ -413,12 +415,36 @@ public:
             return 0;
         }
         std::string script{transform_module_(js)};
+        // Node/bun evaluate the entry in a MODULE scope, never the global one: a
+        // top-level `const Buffer = …` there must stay module-local. Evaluated as
+        // a plain script it would instead create a *global lexical* binding that
+        // every other module resolves too — so a module required on an earlier
+        // line (before that const initializes) hit "Cannot access 'Buffer' before
+        // initialization" instead of seeing the real global. Wrap the entry in the
+        // same CommonJS function wrapper require() uses. The prefix stays on line
+        // 1 (and a hashbang is neutralized in place) so reported line numbers are
+        // unchanged; `this` is module.exports, as in node.
+        //
+        // An entry that declares its own top-level `require` gets that parameter
+        // renamed, its lowered imports having been emitted against
+        // __mbun_esm_require (js_parser kEsmRequireAlias) — the same collision
+        // rule the require() wrapper in module_loading.inc applies.
+        const std::string cjsParams{
+            std::string{"exports, "} +
+            (mbun::js_parser::declares_top_level_require(source) ? "__mbun_prequire" : "require") +
+            ", module, __filename, __dirname, __mbun_esm_require"};
+        const std::string cjsArgs{
+            ".call(globalThis.module.exports, globalThis.exports, globalThis.require, "
+            "globalThis.module, globalThis.__filename, globalThis.__dirname, globalThis.require)"};
+        if (script.starts_with("#!")) script.replace(0, 2, "//");
+        const std::string entryScript{"(function (" + cjsParams + ") {" + script + "\n})" +
+                                      cjsArgs + ";"};
         // A top-level-await entry (flagged by the transpiler) goes straight to the
         // async wrapper: in script mode `await (expr)` would otherwise PARSE as a
         // call to an `await` identifier and fail at run time, after side effects.
         if (auto r{tla ? std::expected<void, std::string>{std::unexpected{
                              std::string{"SyntaxError: top-level await"}}}
-                       : eval_void(script, absPath)};
+                       : eval_void(entryScript, absPath)};
             !r) {
             // JSC's C-API script mode has no top-level-await support, so a module
             // using TLA fails to PARSE (SyntaxError, before any execution). Retry it
@@ -431,8 +457,8 @@ public:
             }
             (void)eval_void("globalThis.__mbun_run_done=0;globalThis.__mbun_run_err=undefined;");
             const std::string wrapped{
-                "(async function(){\n" + script +
-                "\n})().then(function(){globalThis.__mbun_run_done=1;},"
+                "(async function (" + cjsParams + ") {" + script + "\n})" + cjsArgs +
+                ".then(function(){globalThis.__mbun_run_done=1;},"
                 // JSC's Error.stack omits the "Name: message" line, so build it
                 // explicitly (else an uncaught rejection prints only stack frames).
                 "function(e){var s=(e&&e.stack)||'';"
@@ -1171,7 +1197,11 @@ public:
   // process.versions.bun while reporting process.version = "v24.3.0". Nothing in the corpus
   // enumerates process.versions, so an extra key is additive-only.
   // `mbun` must match mbun::cli::MBUN_VERSION (cli.cppm).
-  p.versions = { node: "26.3.0", bun: (globalThis.Bun && Bun.version) || "1.3.14", mbun: "2026.07.18.0", v8: "12.4.0", modules: "127", uv: "1.0", openssl: "3.0" };
+  // `openssl` is the vendored mbun.openssl package's real version, and must keep
+  // node's three-component shape: node's own test/common/crypto.js parses it with
+  // /(?<m>\\d+)\\.(?<n>\\d+)\\.(?<p>\\d+)/ and dereferences `.groups` unguarded, so a
+  // two-component "3.0" made every hasOpenSSL() caller die on `null.groups`.
+  p.versions = { node: "26.3.0", bun: (globalThis.Bun && Bun.version) || "1.3.14", mbun: "2026.07.18.0", v8: "12.4.0", modules: "127", uv: "1.0", openssl: "3.1.5" };
   // bun mirrors Bun.revision onto process.revision (bun-test.test.ts asserts
   // process.revision === Bun.revision; verified against bun 1.3.14). Derived from
   // Bun.revision so the two can never drift.
@@ -1591,6 +1621,16 @@ public:
         eval_(mbun::jsc::js_dns::kDnsJS, &dexc);
         if (dexc != nullptr && std::getenv("MBUN_DEBUG_BUILTINS")) {
             std::cerr << "[js_dns error] " << describe_exception_(dexc) << '\n';
+        }
+        // LAST: node's legacy constructor call forms (`http.Server(fn)` with no
+        // `new`). It re-exports the affected classes through a callable stand-in,
+        // so it must run after the final owner of each module object — kNetJS
+        // REPLACES node:net/node:http wholesale, which would drop a patch applied
+        // inside the builtins blob.
+        JSValueRef lcexc{nullptr};
+        eval_(mbun::jsc::builtins::detail::kNodeLegacyCtorsJS, &lcexc);
+        if (lcexc != nullptr && std::getenv("MBUN_DEBUG_BUILTINS")) {
+            std::cerr << "[legacy ctors error] " << describe_exception_(lcexc) << '\n';
         }
     }
 
