@@ -130,8 +130,11 @@ export constexpr std::string_view kDnsJS = R"JS(
     },
     resolve(hostname, type) {
       const t = (type == null ? "A" : String(type));
-      if (RECORD_TYPES.indexOf(t) === -1) {
-        throw new TypeError('The property "record" is invalid. Expected one of: ' + RECORD_TYPES.join(", ") +
+      // Bun.dns.resolve validates against its own record map, which has NO NAPTR
+      // key (unlike node:dns's RECORD_TYPES); the thrown list and the accepted
+      // set both exclude it. ref: compat/bun/test/js/bun/dns/resolve-dns.test.ts.
+      if (BUN_DNS_RECORD_TYPES.indexOf(t) === -1) {
+        throw new TypeError('The property "record" is invalid. Expected one of: ' + BUN_DNS_RECORD_TYPES.join(", ") +
           ", received type " + typeof type + " (" + JSON.stringify(String(type)).replace(/"/g, "'") + ")");
       }
       if (t === "A" || t === "AAAA") {

@@ -20,6 +20,7 @@ import argparse
 import concurrent.futures
 import hashlib
 import json
+import os
 import re
 import time
 from dataclasses import asdict, dataclass
@@ -43,13 +44,19 @@ def log_name(path: str) -> str:
     return f"{digest}-{readable}.log"
 
 
-def run_one(binary: Path, root: Path, output_dir: Path, timeout: float, path: str) -> Result:
+def run_one(binary: Path, root: Path, output_dir: Path, timeout: float, path: str, thread_id: int) -> Result:
     started = time.monotonic()
     relative_log = Path("logs") / log_name(path)
+    # Node's own runner sets TEST_THREAD_ID per worker so per-file temp
+    # artifacts (common.tmpDir -> .tmp.<id>) never collide. We give each job a
+    # distinct id for the same reason, otherwise files that share one temp dir
+    # spuriously fail with EEXIST on `.tmp.0`.
+    env = dict(os.environ)
+    env["TEST_THREAD_ID"] = str(thread_id)
     bounded = BoundedRun(
         output_dir / relative_log,
         private_tmp=output_dir / "tmp" / log_name(path)[:12],
-    ).run([str(binary), str((root / path).resolve())], timeout=timeout, cwd=root)
+    ).run([str(binary), str((root / path).resolve())], timeout=timeout, cwd=root, env=env)
     duration_ms = round((time.monotonic() - started) * 1000)
     if bounded.timed_out:
         classification = "timeout"
@@ -100,15 +107,18 @@ def main() -> int:
     root = args.root.resolve()
     binary = args.bin.resolve()
     output_dir = args.out.resolve()
-    corpus_dir = (root / args.corpus).resolve()
+    # Do NOT resolve the corpus dir: compat/node may be a symlink (worktree
+    # setups point it at a sibling checkout). Resolving it would make the
+    # discovered files fall outside `root`, breaking relative_to(root).
+    corpus_dir = root / args.corpus
     paths = discover(root, corpus_dir)
     if not paths:
         raise SystemExit("no test files selected")
     output_dir.mkdir(parents=True, exist_ok=True)
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as executor:
         futures = [
-            executor.submit(run_one, binary, root, output_dir, args.timeout, path)
-            for path in paths
+            executor.submit(run_one, binary, root, output_dir, args.timeout, path, index % max(1, args.jobs))
+            for index, path in enumerate(paths)
         ]
         results = [future.result() for future in futures]
     write_outputs(output_dir, results)

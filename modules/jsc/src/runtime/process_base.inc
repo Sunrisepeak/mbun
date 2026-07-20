@@ -455,13 +455,16 @@ JSValueRef proc_kill_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t 
 // ── POSIX signal delivery to JS listeners ──────────────────────────────────
 // node/bun install a real handler for every signal that has a `process.on(SIG…)`
 // listener and drop back to SIG_DFL when the last one is removed. The handler
-// itself must be async-signal-safe, so it only flips a sig_atomic_t flag; the
-// event-loop pump drains the flags and emits from JS.
+// itself must be async-signal-safe, so it only bumps a sig_atomic_t counter;
+// the event-loop pump drains the counters and emits from JS. A *count* (not a
+// flag) is required so a burst of N synchronous deliveries — e.g. a tight loop
+// of process.kill(pid, "SIGINT") — fires the JS listener N times rather than
+// coalescing to one.
 #if !defined(_WIN32)
 volatile std::sig_atomic_t gSignalPending[NSIG]{};
 
 extern "C" void mbun_signal_handler(int sig) {
-    if (sig > 0 && sig < NSIG) gSignalPending[sig] = 1;
+    if (sig > 0 && sig < NSIG) gSignalPending[sig] += 1;
 }
 
 // proc.signalWatch(signum, on) — install (on) / restore the default (off).
@@ -486,14 +489,18 @@ JSValueRef proc_signal_watch_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std:
     return JSValueMakeBoolean(ctx, ::sigaction(sig, &sa, nullptr) == 0);
 }
 
-// proc.signalDrain() → [signum, …] delivered since the last drain.
+// proc.signalDrain() → [signum, …] delivered since the last drain. A signal
+// received N times appears N times, so the JS listener fires once per delivery.
 JSValueRef proc_signal_drain_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t,
                                 const JSValueRef[], JSValueRef* exc) {
     std::vector<JSValueRef> out;
     for (int s = 1; s < NSIG; ++s) {
-        if (gSignalPending[s] != 0) {
-            gSignalPending[s] = 0;
-            out.push_back(JSValueMakeNumber(ctx, s));
+        // Subtract (not zero) so a delivery racing between the read and the
+        // reset is carried to the next drain instead of being lost.
+        std::sig_atomic_t c{gSignalPending[s]};
+        if (c != 0) {
+            gSignalPending[s] -= c;
+            for (std::sig_atomic_t k{0}; k < c; ++k) out.push_back(JSValueMakeNumber(ctx, s));
         }
     }
     return JSObjectMakeArray(ctx, out.size(), out.empty() ? nullptr : out.data(), exc);

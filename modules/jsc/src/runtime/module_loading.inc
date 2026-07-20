@@ -704,6 +704,11 @@ private:
             JSC::Options::useShadowRealm() = true;
         });
         ctx_ = create_context_();
+        // issue #16: install the chained fault-signal handler now — AFTER JSC has
+        // created its context (and thus installed its own SIGSEGV handler), so we
+        // capture JSC's handler as `oldact` and chain to it rather than being
+        // clobbered by it. Prints a symbolized backtrace on SIGSEGV/SIGABRT/…
+        mbun::crash_handler::install();
 #if !defined(_WIN32)
         dnsAsync_ = std::make_unique<DnsAsyncState>(ctx_);
         gDnsAsyncState = dnsAsync_.get();

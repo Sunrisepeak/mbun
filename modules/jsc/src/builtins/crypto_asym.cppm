@@ -39,6 +39,24 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     RSA_X931_PADDING: 5, RSA_SSLV23_PADDING: 2,
   });
 
+  // ---- FIPS mode (non-FIPS OpenSSL build) ----
+  // node exposes getFips()/setFips()/`fips`. mbun links a stock (non-FIPS)
+  // OpenSSL, so FIPS is always off; enabling it is the documented hard error.
+  // ref: node lib/internal/crypto/util.js getFipsCrypto/setFipsCrypto.
+  if (typeof C.getFips !== "function") {
+    C.getFips = () => 0;
+    C.setFips = (v) => {
+      if (v) {
+        const e = new Error("Cannot set FIPS mode in a non-FIPS build.");
+        e.code = "ERR_CRYPTO_FIPS_UNAVAILABLE";
+        throw e;
+      }
+    };
+    Object.defineProperty(C, "fips", {
+      get: () => false, set: (v) => C.setFips(v), enumerable: true, configurable: true,
+    });
+  }
+
   const isView = (v) => ArrayBuffer.isView(v);
   const toBuf = (v, enc) => {
     if (v == null) return Buffer.alloc(0);
@@ -151,9 +169,18 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
       r.padding != null ? r.padding : RSA_PKCS1_PADDING));
   };
 
+  // node lib/internal/crypto/keys.js: dsaEncoding must be "der" or "ieee-p1363".
+  const validateDsaEncoding = (r) => {
+    if (r.dsaEncoding !== undefined && r.dsaEncoding !== "der" && r.dsaEncoding !== "ieee-p1363") {
+      const e = new TypeError("The property 'options.dsaEncoding' is invalid. Received '" + r.dsaEncoding + "'");
+      e.code = "ERR_INVALID_ARG_VALUE"; throw e;
+    }
+  };
+
   // ---- sign / verify (one-shot + streaming) ----
   const doSign = (algo, data, key) => {
     const r = resolveKey(key);
+    validateDsaEncoding(r);
     return Buffer.from(AN.sign(digestName(algo), toBuf(data), keyData(r), r.passphrase,
       r.padding != null ? r.padding : RSA_PKCS1_PADDING,
       r.saltLength != null ? r.saltLength : RSA_PSS_SALTLEN_MAX_SIGN,
@@ -166,6 +193,7 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     const dataBuf = Buffer.from(toBuf(data));
     const sigBuf = Buffer.from(toBuf(sig));
     const r = resolveKey(key);
+    validateDsaEncoding(r);
     return AN.verify(digestName(algo), dataBuf, keyData(r), r.passphrase, sigBuf,
       r.padding != null ? r.padding : RSA_PKCS1_PADDING,
       r.saltLength != null ? r.saltLength : RSA_PSS_SALTLEN_MAX_SIGN,
@@ -248,8 +276,17 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   };
 
   // ---- KeyObject / createPublicKey / createPrivateKey ----
+  // node's KeyObject constructor is internal: user code cannot mint one from raw
+  // material (it takes a native handle). We reproduce that with a private brand —
+  // internal construction goes through mkKO(); `new KeyObject(...)` from user code
+  // (missing/invalid handle) throws. The brand is shared with the structured-clone
+  // reconstructor via C.__koBrand.
+  const kKObrand = Symbol("mbun.node.KeyObject");
   class KeyObject {
-    constructor(kind, material, passphrase) { this._kind = kind; this._km = material; this._pass = passphrase || ""; }
+    constructor(brand, kind, material, passphrase) {
+      if (brand !== kKObrand) throw new TypeError("Illegal constructor");
+      this._kind = kind; this._km = material; this._pass = passphrase || "";
+    }
     get type() { return this._kind; }
     get [Symbol.toStringTag]() { return "KeyObject"; }
     get asymmetricKeyType() {
@@ -258,67 +295,139 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     }
     get asymmetricKeyDetails() {
       if (this._kind === "secret") return undefined;
-      try { const t = AN.keyType(this._km, this._pass, this._kind === "public"); const d = {}; if (t.modulusLength != null) d.modulusLength = t.modulusLength; if (t.namedCurve != null) d.namedCurve = t.namedCurve; return d; } catch { return {}; }
+      try {
+        const t = AN.keyType(this._km, this._pass, this._kind === "public");
+        const d = {};
+        if (t.modulusLength != null) d.modulusLength = t.modulusLength;
+        if (t.publicExponent != null) d.publicExponent = BigInt("0x" + Buffer.from(t.publicExponent).toString("hex"));
+        if (t.namedCurve != null) d.namedCurve = t.namedCurve;
+        return d;
+      } catch { return {}; }
     }
     get symmetricKeySize() { return this._kind === "secret" ? toBuf(this._km).length : undefined; }
     export(options) {
-      options = options || {};
-      // format:"jwk" is NOT a PEM/DER encoding — it returns a plain JWK object
-      // (node lib/internal/crypto/keys.js). It must be intercepted before the
-      // native encoder, whose `pem = format != "der"` would emit PEM for it.
-      if (options.format === "jwk") {
-        if (this._kind === "secret") {
+      // Secret keys: options are optional and default to a Buffer copy.
+      if (this._kind === "secret") {
+        if (options != null && typeof options === "object" && options.format === "jwk") {
           return { kty: "oct", k: Buffer.from(toBuf(this._km)).toString("base64url") };
+        }
+        return Buffer.from(toBuf(this._km));
+      }
+      // Asymmetric keys: node requires an options object (lib/internal/crypto/keys.js).
+      if (options === null || typeof options !== "object") {
+        const e = new TypeError('The "options" argument must be of type object. Received ' +
+          (options === null ? "null" : typeof options));
+        e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+      }
+      // format:"jwk" is NOT a PEM/DER encoding — it returns a plain JWK object and
+      // cannot carry encryption (cipher/passphrase).
+      if (options.format === "jwk") {
+        if (options.passphrase != null || options.cipher != null) {
+          const e = new Error("The selected key encoding jwk does not support encryption.");
+          e.code = "ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS"; throw e;
         }
         return jwkFromKey(this._km, this._pass, this._kind === "public");
       }
-      if (this._kind === "secret") return Buffer.from(toBuf(this._km));
       const type = options.type || (this._kind === "public" ? "spki" : "pkcs8");
       const format = options.format || "pem";
+      // Encrypting a private key requires a cipher; a passphrase alone throws.
+      if (this._kind === "private" && options.passphrase != null && options.cipher == null) {
+        const e = new TypeError("The property 'options.cipher' is invalid. Received undefined");
+        e.code = "ERR_INVALID_ARG_VALUE"; throw e;
+      }
       const cipher = options.cipher || "";
       const outPass = options.passphrase != null ? (typeof options.passphrase === "string" ? options.passphrase : toBuf(options.passphrase).toString("latin1")) : "";
-      return AN.keyExport(this._km, this._pass, this._kind === "public", type, format, cipher, outPass);
+      const out = AN.keyExport(this._km, this._pass, this._kind === "public", type, format, cipher, outPass);
+      // der format must be a Buffer (node returns Buffer, not a bare Uint8Array).
+      return format === "der" ? Buffer.from(out) : out;
     }
     equals(other) {
-      if (!(other instanceof KeyObject) || other._kind !== this._kind) return false;
+      if (!(other instanceof KeyObject)) {
+        const e = new TypeError('The "otherKeyObject" argument must be an instance of KeyObject. Received type ' +
+          typeof other + " (" + String(other) + ")");
+        e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+      }
+      if (other._kind !== this._kind) return false;
       try { return Buffer.compare(toBuf(this.export({ format: this._kind === "secret" ? undefined : "der", type: this._kind === "public" ? "spki" : "pkcs8" })), toBuf(other.export({ format: "der", type: this._kind === "public" ? "spki" : "pkcs8" }))) === 0; } catch { return false; }
     }
+    // node: KeyObject.from(cryptoKey) — only a WebCrypto CryptoKey is accepted.
+    static from(key) {
+      if (!(G.CryptoKey && key instanceof G.CryptoKey)) {
+        const e = new TypeError('The "key" argument must be an instance of CryptoKey. Received ' +
+          (key === null ? "null" : typeof key));
+        e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+      }
+      // Bridge into a node KeyObject via the WebCrypto raw export, when reachable.
+      const bridge = G.__mbunCryptoKeyToKeyObject;
+      if (typeof bridge === "function") { const r = bridge(key); if (r) return mkKO(r.kind, r.material, r.passphrase || ""); }
+      throw new TypeError("Converting this CryptoKey to a KeyObject is not supported yet in mbun");
+    }
   }
+  const mkKO = (kind, material, passphrase) => new KeyObject(kKObrand, kind, material, passphrase);
+  C.__koBrand = kKObrand;
   const makeKeyObject = (kind, key) => {
     if (key instanceof KeyObject) return key;
     // { key: <JWK object>, format: "jwk" } → materialize as DER up front so the
     // rest of the pipeline sees ordinary key material (node keys.js).
     if (key != null && typeof key === "object" && key.format === "jwk" && key.key != null) {
-      return new KeyObject(kind, jwkToDer(key.key, kind === "private"), "");
+      return mkKO(kind, jwkToDer(key.key, kind === "private"), "");
     }
     const r = resolveKey(key);
-    return new KeyObject(kind, r.data, r.passphrase);
+    return mkKO(kind, r.data, r.passphrase);
   };
   C.KeyObject = KeyObject;
+  // Map a native key-parse failure to the OpenSSL error node surfaces: PEM input
+  // (has a "-----BEGIN" header) keeps the native/passphrase error; binary DER that
+  // starts with a SEQUENCE tag (0x30) is a decode failure; anything else has no
+  // PEM start line.
+  const asymParseError = (ko, nativeErr) => {
+    const isStr = typeof ko._km === "string";
+    const bytes = toBuf(ko._km);
+    const head = isStr ? ko._km.slice(0, 64) : Buffer.from(bytes.slice(0, 64)).toString("latin1");
+    if (head.includes("-----BEGIN")) return nativeErr; // surface native parse/passphrase error
+    if (!isStr && bytes.length > 0 && bytes[0] === 0x30) {
+      const e = new Error("error:06000066:public key routines:OPENSSL_internal:DECODE_ERROR");
+      e.code = "ERR_OSSL_UNSUPPORTED"; return e;
+    }
+    const e = new Error("error:0900006e:PEM routines:OPENSSL_internal:NO_START_LINE");
+    e.code = "ERR_OSSL_NO_START_LINE"; return e;
+  };
   C.createPrivateKey = (key) => {
+    // node: passing an existing KeyObject to createPrivateKey is never allowed
+    // (getKeyObjectHandle, kCreatePrivate → ERR_INVALID_ARG_TYPE).
+    if (key instanceof KeyObject) {
+      const e = new TypeError('The "key" argument must be of type string or an instance of ' +
+        "ArrayBuffer, Buffer, TypedArray, DataView, Object, or CryptoKey. Received an instance of KeyObject");
+      e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+    }
     const ko = makeKeyObject("private", key);
     // node/bun validate the material at construction: non-key input throws
     // ERR_OSSL_NO_START_LINE (bun 1.4.0 verified). jsonwebtoken's sign()
     // relies on that throw to fall back to createSecretKey for HS* secrets.
+    let info;
     try {
-      AN.keyType(ko._km, ko._pass, false);
+      info = AN.keyType(ko._km, ko._pass, false);
     } catch (e) {
-      const head = typeof ko._km === "string"
-        ? ko._km.slice(0, 64)
-        : Buffer.from(toBuf(ko._km).slice(0, 64)).toString("latin1");
-      if (head.includes("-----BEGIN")) throw e; // PEM present: surface the native parse/passphrase error
-      const err = new Error("error:0900006e:PEM routines:OPENSSL_internal:NO_START_LINE");
-      err.code = "ERR_OSSL_NO_START_LINE";
-      throw err;
+      throw asymParseError(ko, e);
+    }
+    // The loader is intent-agnostic: it will parse public-only material (e.g. a
+    // PKCS#1 RSAPublicKey) as a pkey. node rejects that with a decode error.
+    if (info && info.private === false) {
+      const e = new Error("error:06000066:public key routines:OPENSSL_internal:DECODE_ERROR");
+      e.code = "ERR_OSSL_UNSUPPORTED"; throw e;
     }
     return ko;
   };
   C.createPublicKey = (key) => {
-    // Deriving a public key from a private one: re-export public SPKI so the
-    // KeyObject material is public-only (node semantics).
-    if (key instanceof KeyObject && key._kind === "private") {
-      const pem = AN.keyExport(key._km, key._pass, true, "spki", "pem", "", "");
-      return new KeyObject("public", pem, "");
+    // node getKeyObjectHandle(kCreatePublic): a private KeyObject derives its
+    // public half; any other KeyObject (public/secret) throws.
+    if (key instanceof KeyObject) {
+      if (key._kind === "private") {
+        const pem = AN.keyExport(key._km, key._pass, true, "spki", "pem", "", "");
+        return mkKO("public", pem, "");
+      }
+      const e = new TypeError("Invalid key object type " + key._kind + ", expected private.");
+      e.code = "ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE"; throw e;
     }
     const ko = makeKeyObject("public", key);
     // Same construction-time validation as createPrivateKey: jsonwebtoken's
@@ -335,10 +444,7 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
           ? ko._km.slice(0, 64)
           : Buffer.from(toBuf(ko._km).slice(0, 64)).toString("latin1");
         if (head.includes("-----BEGIN CERTIFICATE")) return ko;
-        if (head.includes("-----BEGIN")) throw ePub;
-        const err = new Error("error:0900006e:PEM routines:OPENSSL_internal:NO_START_LINE");
-        err.code = "ERR_OSSL_NO_START_LINE";
-        throw err;
+        throw asymParseError(ko, ePub);
       }
     }
     return ko;
@@ -356,7 +462,44 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
       err.code = "ERR_INVALID_ARG_TYPE";
       throw err;
     }
-    return new KeyObject("secret", toBuf(key, encoding), "");
+    return mkKO("secret", toBuf(key, encoding), "");
+  };
+
+  // ---- generateKey / generateKeySync (symmetric secret keys) ----
+  // node lib/internal/crypto/keygen.js SecretKeyGenTraits: 'hmac' length is in
+  // bits (8 .. 2**31-1), 'aes' length must be one of 128/192/256.
+  const genSecret = (type, options) => {
+    const t = String(type);
+    if (t !== "hmac" && t !== "aes") {
+      const e = new TypeError("The argument 'type' must be a supported key type. Received '" + t + "'");
+      e.code = "ERR_INVALID_ARG_VALUE"; throw e;
+    }
+    const length = options == null ? undefined : options.length;
+    if (typeof length !== "number" || !Number.isInteger(length)) {
+      const e = new TypeError('The "options.length" property must be of type number.');
+      e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+    }
+    if (t === "aes") {
+      if (length !== 128 && length !== 192 && length !== 256) {
+        const e = new TypeError("The property 'options.length' must be one of: 128, 192, 256. Received " + length);
+        e.code = "ERR_INVALID_ARG_VALUE"; throw e;
+      }
+    } else if (length < 8 || length > 2147483647) {
+      const e = new RangeError('The value of "options.length" is out of range. It must be >= 8 && <= 2147483647. Received ' + length);
+      e.code = "ERR_OUT_OF_RANGE"; throw e;
+    }
+    return mkKO("secret", Buffer.from(C.randomBytes(Math.ceil(length / 8))), "");
+  };
+  C.generateKeySync = (type, options) => genSecret(type, options);
+  C.generateKey = (type, options, callback) => {
+    if (typeof callback !== "function") {
+      const e = new TypeError('The "callback" argument must be of type function.');
+      e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+    }
+    queueMicrotask(() => {
+      try { const k = genSecret(type, options); callback(null, k); }
+      catch (e) { callback(e); }
+    });
   };
 
   // ---- generateKeyPair / generateKeyPairSync ----
@@ -382,10 +525,10 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     const curve = options.namedCurve || "";
     const res = AN.generateKeyPair(type, modLen, curve, pubType, pubFmt, privType, privFmt, cipher, pass);
     let publicKey = res.publicKey, privateKey = res.privateKey;
-    if (wantPubObj) publicKey = new KeyObject("public", publicKey, "");
+    if (wantPubObj) publicKey = mkKO("public", publicKey, "");
     else if (pubJwk) publicKey = jwkFromKey(publicKey, "", true);
     else if (pubFmt === "der") publicKey = Buffer.from(publicKey);
-    if (wantPrivObj) privateKey = new KeyObject("private", privateKey, pass);
+    if (wantPrivObj) privateKey = mkKO("private", privateKey, pass);
     else if (privJwk) privateKey = jwkFromKey(privateKey, "", false);
     else if (privFmt === "der") privateKey = Buffer.from(privateKey);
     return { publicKey, privateKey };
@@ -411,6 +554,8 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   function Cipher(isEncrypt, algorithm, key, iv, options) {
     if (typeof algorithm !== "string") throw new TypeError("The \"cipher\" argument must be of type string.");
     if (key == null) throw new TypeError("The \"key\" argument must be of type BufferSource. Received " + key);
+    // A secret KeyObject is accepted as the key (node cipher.js prepareSecretKey).
+    if (key instanceof KeyObject) key = key._km;
     options = options || {};
     const keyBuf = toBuf(key, options.encoding);
     const ivBuf = iv == null ? Buffer.alloc(0) : toBuf(iv);

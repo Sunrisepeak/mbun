@@ -3,6 +3,17 @@
 > 只记录**实质进展**（模块落地、测试集通过数变化、性能节点），倒序排列。
 > 格式：`## YYYY-MM-DD` + 条目（关联任务 ID / commit / 测试与性能数据）。
 
+## 2026-07-21
+
+- **第三批(fix/corpus-round3,5 路 worktree 并行):Bun green 850 → 874 / 1902(44.7% → 46.0%),测试级 30,790 → 31,818 通过 / 52,175 执行;Node pass 1,774 → 1,811 / 4433(40.0% → 40.9%)**。
+  ① **crypto `key-objects` 68/17 → 85/0 全绿**:KeyObject 构造器加私有 brand(此前 `new KeyObject("secret","")` 静默成功)、`generateKey`/`generateKeySync` 实现、`export()`/`equals()`/`dsaEncoding` 校验、`asymmetricKeyDetails.publicExponent`;**安全修复:`createPrivateKey` 曾把 PKCS#1 公钥当私钥接受**(缺 `asym_has_private` 检查)。
+  ② **ini/dns/test-runner 3 文件转绿**:`iniInternals` 未接线(`mbun.ini` 解析器已存在,只是没桥到 JS)→ ini.test 0/1 → 62/0;`Bun.dns.resolve` 错误列出 NAPTR;eval-error 包装剥离对齐 bun。
+  ③ **markdown 5 处 O(n²) 挂起 + 信号合并**:link-dest 括号嵌套/angle-dest/autolink/pushText 无界扫描,构造输入即无限挂起 → 全部有界,洪泛用例挂起→<200ms,md-spec 370 → 372;`gSignalPending[]` 0/1 标志改计数器,1024 次同步 SIGINT 只触发一次监听器的问题修复。
+  ④ **crash_handler 接线(调试基础工具,issue #16)**:此前 `modules/crash_handler` 存在但无人安装,SIGSEGV/SIGABRT 完全无栈(apport 吞 core、gdb 掩盖竞态)。在 Runtime 构造(create_context_ 之后)安装并**链式**挂到 JSC 自己的 handler,故障时打印符号化栈(fork+execv llvm-symbolizer);`MBUN_CRASH_SELFTEST` dev-only 自测钩子。用它把 #16 定性为 **JSC rope-string 的堆 use-after-free**(受害帧是 JSC 内部,元凶是异步野写,需 ASAN 抓源头,故未落修复,留作持续观测)。顺带修 #15 两个 body 缺陷(ArrayBuffer body 丢失、Response.clone 丢 body,body-stream reader 矩阵 80/160 → 192/48)。
+  ⑤ **Node 语料 +28**(1782 → 1810,自测量):diagnostics_channel `BoundedChannel`+`withStoreScope`(9 文件)、`perf_hooks.timerify`(9)、node-flag re-exec 路由(`Script not found` 62 → 6)、`crypto.getFips`/`Buffer.of`、runner 的 `TEST_THREAD_ID` 隔离。
+- **crash 分类桶**:crash handler 让崩溃显形后,13 个 `napi/node-napi-tests/**/do.test.ts`(跑一个测试后在 env teardown 时 abort)原被误判为 load-error/test-failure;runner 新增 `crash` 桶诚实归类(在 pass/fail 判定前检查崩溃横幅),带自测。这是 crash handler 的直接价值:这些崩溃此前混在普通失败里不可见。
+- **诚实记录(未落地,留作专门轨)**:`assert.throws`/`doesNotThrow` 当前接受**任意**异常,收严后 Node 语料 1782 → 1689(−93),暴露约 **104 个文件是假通过**(fs/buffer/crypto/net/events 缺参数校验)。因与 +files 目标冲突已回退(bootstrap.cppm 零净变更),但 Node 的真实通过数被高估约 104,记为「参数校验」专门轨的入口。
+
 ## 2026-07-20
 
 - **第二批(PR #17,CI 双 lane 绿):green 850 → 864 / 1902(44.7% → 45.4%),oom-kill 7 → 3(issue #5 达标),timeout 63 → 51,测试级 30,790 → 31,507 通过**。四条根因:

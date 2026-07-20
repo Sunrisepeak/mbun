@@ -2724,6 +2724,32 @@ export constexpr std::string_view kNetJS = R"JS(
         res.arrayBuffer = () => bodyU8().then((b) => b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength));
         res.bytes = () => bodyU8().then((b) => new Uint8Array(b));
         res.blob = () => bodyU8().then((b) => new G.Blob([b], { type: h.get("content-type") || "" }));
+        // A fetch Response carries its body in the buffered `bodyPr` and exposes
+        // a minimal streaming `_stream` (mkBodyStream) that the generic
+        // Response.clone() cannot tee — it would hand the clone an empty body, so
+        // `response.clone(); await clone.bytes()` read 0 while the original read
+        // the full payload (js/web/fetch/body-stream reader/streaming matrices,
+        // issue #15). bun clones a fetch Response by refcounting the same body
+        // store (Body.rs:1591); the equivalent here is a clone whose consume
+        // methods share the same immutable `bodyPr` buffer and whose `_stream` is
+        // an independent replay of it. Reads are non-destructive on a resolved
+        // buffer, so original and clone stay independently readable.
+        res.clone = () => {
+          const c = new G.Response(null, { status: parser.status, statusText: parser.statusText, headers: new G.Headers(h) });
+          c.url = url;
+          c.redirected = depth > 0;
+          const cs = mkBodyStream();
+          bodyPr.promise.then((b) => { try { if (b && b.length) cs.push(b); cs.close(); } catch (e) {} },
+                              (e) => { try { cs.error(e); } catch (e2) {} });
+          c._stream = cs.stream;
+          c.text = res.text;
+          c.json = res.json;
+          c.arrayBuffer = res.arrayBuffer;
+          c.bytes = res.bytes;
+          c.blob = res.blob;
+          c.clone = res.clone;
+          return c;
+        };
         resolve(res);
       };
       if (signal && typeof signal.addEventListener === "function") {

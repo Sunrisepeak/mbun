@@ -13,6 +13,7 @@ export module mbun.jsc.runtime;
 import std;
 import mbun.semver;
 import mbun.toml;
+import mbun.ini;
 import mbun.glob;
 import mbun.which;
 import mbun.shell;
@@ -57,6 +58,8 @@ import mbun.event_loop;
 import mbun.runtime_socket;
 import mbun.runtime_server;
 import mbun.http;
+// issue #16: chained fault-signal handler (installed after JSC init below).
+import mbun.crash_handler;
 // CAP-S3: AWS SigV4 signing for Bun.S3Client (runtime/s3_native.inc __mbunS3Native).
 import mbun.s3_signing;
 import mbun.s3_signing.backend;

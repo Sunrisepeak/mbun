@@ -26,6 +26,7 @@ resolver = { path = "../resolver" }
 js       = { path = "../js" }
 semver = { path = "../semver" }
 toml   = { path = "../toml" }
+ini    = { path = "../ini" }
 glob   = { path = "../glob" }
 image  = { path = "../image" }
 shell  = { path = "../shell" }
@@ -51,6 +52,9 @@ http           = { path = "../http" }
 s3_signing     = { path = "../s3_signing" }
 # CAP-HTMLREWRITER: dependency-free HTMLRewriter engine (runtime/html_rewriter.inc).
 html_rewriter  = { path = "../html_rewriter" }
+# issue #16: chained SIGSEGV/SIGABRT handler that prints a symbolized backtrace;
+# installed at the end of the Runtime constructor, after JSC has initialized.
+crash_handler  = { path = "../crash_handler" }
 
 [dependencies.mbun]
 jsc-prebuilt = "20260706"

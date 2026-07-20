@@ -1353,17 +1353,26 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
     while ((m = re.exec(text))) {
       if (m.index > last) nodes.push({ type: "text", value: text.slice(last, m.index) });
       let url = m[1];
-      // strip trailing punctuation
-      let trail = "";
-      while (url.length && /[!.,;:?)]/.test(url[url.length - 1])) {
-        if (url[url.length - 1] === ")") {
-          const opens = (url.match(/\(/g) || []).length;
-          const closes = (url.match(/\)/g) || []).length;
+      // Strip trailing punctuation with a single index walk. Paren counts are
+      // computed once and decremented as ')' are trimmed, so a URL ending in a
+      // long run of ')' stays linear instead of O(n^2) (rescanning per char).
+      let end = url.length;
+      let opens = -1, closes = -1;
+      while (end > 0) {
+        const ch = url[end - 1];
+        if (ch === ")") {
+          if (opens === -1) {
+            opens = 0; closes = 0;
+            for (let k = 0; k < end; k++) { const kc = url[k]; if (kc === "(") opens++; else if (kc === ")") closes++; }
+          }
           if (closes <= opens) break;
-        }
-        trail = url[url.length - 1] + trail;
-        url = url.slice(0, -1);
+          closes--; end--;
+        } else if (ch === "!" || ch === "." || ch === "," || ch === ";" || ch === ":" || ch === "?") {
+          end--;
+        } else break;
       }
+      const trail = url.slice(end);
+      url = url.slice(0, end);
       nodes.push({ type: "autolink", href: url, kind: "url", text: url, bare: true });
       if (trail) nodes.push({ type: "text", value: trail });
       last = m.index + m[1].length;
@@ -1393,12 +1402,22 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
     while (i < s.length && /[ \t]/.test(s[i])) i++;
     if (s[i] === "<") {
       i++;
-      while (i < s.length && s[i] !== ">") { href += s[i]; i++; }
-      if (s[i] === ">") i++;
+      // An angle destination ends at '>' and may not contain an unescaped
+      // '<' or line ending (cmark parity). The '<' bound also keeps a flood
+      // of "[a](<b" repeats linear instead of O(n^2).
+      while (i < s.length && s[i] !== ">" && s[i] !== "\n" && s[i] !== "<") {
+        if (s[i] === "\\" && i + 1 < s.length) { href += s[i + 1]; i += 2; continue; }
+        href += s[i]; i++;
+      }
+      if (s[i] !== ">") return null;
+      i++;
     } else {
       let pdepth = 0;
       while (i < s.length && !/[ \t]/.test(s[i]) && !(s[i] === ")" && pdepth === 0)) {
-        if (s[i] === "(") pdepth++;
+        // Parenthesis nesting is capped at 32 (cmark parity); past the cap the
+        // candidate is not a link. This also keeps a flood of "[a](b" repeats
+        // linear instead of O(n^2).
+        if (s[i] === "(") { if (++pdepth > 32) return null; }
         else if (s[i] === ")") pdepth--;
         href += s[i];
         i++;
@@ -1406,9 +1425,15 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
     }
     while (i < s.length && /[ \t]/.test(s[i])) i++;
     if (s[i] === '"' || s[i] === "'" || s[i] === "(") {
-      const close = s[i] === "(" ? ")" : s[i];
+      const openCh = s[i];
+      const close = openCh === "(" ? ")" : openCh;
       i++;
-      while (i < s.length && s[i] !== close) { title += s[i]; i++; }
+      while (i < s.length && s[i] !== close) {
+        // A '('-delimited title may not contain an unescaped '(' (cmark
+        // parity); this also bounds a "[ (](" flood.
+        if (openCh === "(" && s[i] === "(") return null;
+        title += s[i]; i++;
+      }
       if (s[i] === close) i++;
     }
     while (i < s.length && /[ \t]/.test(s[i])) i++;
@@ -1421,7 +1446,15 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
   }
 
   function parseAutolink(s, start) {
-    const end = s.indexOf(">", start + 1);
+    // Autolink content has no whitespace or unescaped '<', so bail at the
+    // first such char instead of scanning to EOF for a '>' that may never
+    // appear. This keeps a flood of unterminated "<!--" openers linear.
+    let end = -1;
+    for (let j = start + 1; j < s.length; j++) {
+      const ch = s[j];
+      if (ch === ">") { end = j; break; }
+      if (ch === "<" || ch === " " || ch === "\t" || ch === "\n") return null;
+    }
     if (end === -1) return null;
     const inner = s.slice(start + 1, end);
     if (/^[a-zA-Z][a-zA-Z0-9+.-]*:[^\s<>]*$/.test(inner)) {

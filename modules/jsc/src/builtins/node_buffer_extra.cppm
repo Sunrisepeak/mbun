@@ -918,6 +918,9 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
     // load time and constructs every parsed frame slice through it
     // (ws/lib/receiver.js consume()), which throws on an undefined species.
     Object.defineProperty(BufferW, Symbol.species, { get() { return this; }, configurable: true });
+    // Buffer.of(...items) — the %TypedArray%.of analogue, returns a Buffer of the
+    // given byte values. ref: node lib/buffer.js Buffer.of.
+    BufferW.of = function of(...items) { return newFrom(items); };
 
     G.Buffer = BufferW;
 

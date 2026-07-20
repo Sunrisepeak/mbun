@@ -25,6 +25,12 @@ TEST_FILE_RE = re.compile(r"\.test\.(?:[cm]?[jt]sx?)$")
 # loaded and simply declares no tests" from "the file died before declaring any".
 ERROR_MARK_RE = re.compile(r"(?m)^\s*\d+ error\s*$|^\s*error:|^# Unhandled error")
 ERROR_COUNT_RE = re.compile(r"(?m)^\s*(\d+) error\s*$")
+# The crash handler (modules/crash_handler) prints this banner on a fatal
+# signal. Before it was wired up, a crashing file was scored by whatever partial
+# output survived (usually test-failure, sometimes load-error) — now the crash
+# is visible and gets its own bucket, so a native fault is never miscounted as a
+# clean test failure or a load error.
+CRASH_RE = re.compile(r"^=== mbun crashed: ", re.M)
 
 
 @dataclass(frozen=True)
@@ -74,6 +80,13 @@ def classify(
         return "blocked-external" if blocked else "timeout"
     if oom_killed:
         return "oom-kill"
+    # A native fault (SIGSEGV/SIGABRT/…) is its own outcome: the crash handler
+    # printed a backtrace, so this is a real mbun bug, not a test that merely
+    # failed an assertion. Checked before the pass/fail branch because a file can
+    # crash *after* printing some results (the napi suites run a test, then abort
+    # during env teardown).
+    if CRASH_RE.search(output):
+        return "crash"
     if ran > 0 or passed > 0 or failed > 0:
         # An out-of-test error (a rejected describe body, an unhandled rejection
         # between tests) is a failed file for bun, which exits non-zero on it;

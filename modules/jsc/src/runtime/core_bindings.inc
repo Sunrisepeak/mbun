@@ -1012,6 +1012,59 @@ JSValueRef toml_parse_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t
     return JSValueMakeUndefined(ctx);
 }
 
+// ── bun:internal-for-testing iniInternals.parse → real JS object tree ────────
+// ref: compat/bun/src/ini/lib.rs IniTestingAPIs.parse (deleted *_jsc alias);
+//      compat/bun/test/js/bun/ini/ini.test.ts. `${VAR}` interpolation resolves
+//      against the process environment, mirroring bun's parse (which reads the
+//      loaded env). Undefined vars stay literal unless the `?` optional modifier
+//      is present, exactly as mbun.ini's parser encodes it.
+JSValueRef ini_to_js(JSContextRef ctx, const mbun::ini::Value& v) {
+    using Type = mbun::ini::Type;
+    switch (v.type()) {
+    case Type::Object: {
+        JSObjectRef o{JSObjectMake(ctx, nullptr, nullptr)};
+        for (const auto& [k, child] : v.object().properties) {
+            JSValueRef cv{ini_to_js(ctx, child)};
+            JSStringRef key{JSStringCreateWithUTF8CString(k.c_str())};
+            JSObjectSetProperty(ctx, o, key, cv, kJSPropertyAttributeNone, nullptr);
+            JSStringRelease(key);
+        }
+        return o;
+    }
+    case Type::Array: {
+        const auto& arr{v.array()};
+        std::vector<JSValueRef> elems;
+        elems.reserve(arr.size());
+        for (const auto& e : arr) elems.push_back(ini_to_js(ctx, e));
+        return JSObjectMakeArray(ctx, elems.size(), elems.empty() ? nullptr : elems.data(), nullptr);
+    }
+    case Type::String:
+        return make_string(ctx, v.as_string());
+    case Type::Number:
+        return JSValueMakeNumber(ctx, v.as_number());
+    case Type::Boolean:
+        return JSValueMakeBoolean(ctx, v.as_bool());
+    case Type::Null:
+        return JSValueMakeNull(ctx);
+    }
+    return JSValueMakeUndefined(ctx);
+}
+
+JSValueRef ini_parse_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                        const JSValueRef args[], JSValueRef*) {
+    JsStrArg src{ctx, argc > 0 ? args[0] : nullptr};
+    // Env lookup over the real process environment — matches bun, whose
+    // IniTestingAPIs.parse expands against the VM's loaded env.
+    auto env{[](std::string_view name) -> std::optional<std::string> {
+        const std::string key{name};
+        const char* val{std::getenv(key.c_str())};
+        if (val == nullptr) return std::nullopt;
+        return std::string{val};
+    }};
+    mbun::ini::Value root{mbun::ini::parse(src.view(), env)};
+    return ini_to_js(ctx, root);
+}
+
 // ── Bun.Glob (JS class: instance stores pattern, .match(path) → bool) ─────────
 
 JSClassRef gGlobClass{nullptr};

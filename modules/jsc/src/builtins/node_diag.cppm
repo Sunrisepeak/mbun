@@ -126,6 +126,24 @@ inline constexpr std::string_view kNodeDiagJS = R"JS(
         run = wrapStoreRun(store, data, run, transform);
       return run();
     }
+    // withStoreScope(data): enters every bound store (transform(data)) and
+    // publishes `data`, returning a disposable that restores the prior store
+    // values on `using` scope exit. A throwing transform reports asynchronously
+    // and leaves that store untouched (parity with runStores). ref: node
+    // lib/diagnostics_channel.js Channel.withStoreScope.
+    withStoreScope(data) {
+      const restores = [];
+      for (const [store, transform] of this._stores.entries()) {
+        let context;
+        try { context = (transform || defaultTransform)(data); }
+        catch (err) { reportError(err); continue; }
+        const prev = store.getStore();
+        restores.push(() => store.enterWith(prev));
+        store.enterWith(context);
+      }
+      this.publish(data);
+      return { [Symbol.dispose]() { for (let i = restores.length - 1; i >= 0; i--) restores[i](); } };
+    }
   }
 
   class Channel {
@@ -146,6 +164,7 @@ inline constexpr std::string_view kNodeDiagJS = R"JS(
     get hasSubscribers() { return false; }
     publish() {}
     runStores(data, fn, thisArg, ...args) { return fn.apply(thisArg, args); }
+    withStoreScope() { return { [Symbol.dispose]() {} }; }
   }
 
   const channels = new WeakRefMap();
@@ -274,8 +293,60 @@ inline constexpr std::string_view kNodeDiagJS = R"JS(
 
   const tracingChannel = (nameOrChannels) => new TracingChannel(nameOrChannels);
 
+  // BoundedChannel: a start/end channel pair for scoped tracing. `run` publishes
+  // start (binding start's stores) then end in a finally; `withScope` publishes
+  // start and returns a disposable that publishes end on `using` exit. ref: node
+  // lib/diagnostics_channel.js BoundedChannel.
+  class BoundedChannel {
+    constructor(nameOrChannels) {
+      if (typeof nameOrChannels === "string") {
+        this.start = channel("tracing:" + nameOrChannels + ":start");
+        this.end = channel("tracing:" + nameOrChannels + ":end");
+      } else if (nameOrChannels && typeof nameOrChannels === "object") {
+        const { start, end } = nameOrChannels;
+        assertChannel(start, "nameOrChannels.start");
+        assertChannel(end, "nameOrChannels.end");
+        this.start = start;
+        this.end = end;
+      } else {
+        throw argTypeError("nameOrChannels", "string, object, or Channel", nameOrChannels);
+      }
+    }
+    get hasSubscribers() { return this.start.hasSubscribers || this.end.hasSubscribers; }
+    subscribe(handlers) {
+      if (handlers.start) this.start.subscribe(handlers.start);
+      if (handlers.end) this.end.subscribe(handlers.end);
+    }
+    unsubscribe(handlers) {
+      let done = true;
+      if (handlers.start && !this.start.unsubscribe(handlers.start)) done = false;
+      if (handlers.end && !this.end.unsubscribe(handlers.end)) done = false;
+      return done;
+    }
+    run(context = {}, fn, thisArg, ...args) {
+      const end = this.end;
+      return this.start.runStores(context, () => {
+        try { return fn.apply(thisArg, args); }
+        finally { end.publish(context); }
+      });
+    }
+    withScope(context = {}) {
+      const scope = this.start.withStoreScope(context);
+      const end = this.end;
+      let disposed = false;
+      return { [Symbol.dispose]() {
+        if (disposed) return;  // double dispose is a no-op (node parity)
+        disposed = true;
+        end.publish(context);
+        scope[Symbol.dispose]();
+      } };
+    }
+  }
+  const boundedChannel = (nameOrChannels) => new BoundedChannel(nameOrChannels);
+
   const diagnostics_channel = {
     channel, hasSubscribers, subscribe, tracingChannel, unsubscribe, Channel,
+    boundedChannel, BoundedChannel,
   };
   M["diagnostics_channel"] = diagnostics_channel;
   M["node:diagnostics_channel"] = diagnostics_channel;

@@ -212,8 +212,37 @@ inline constexpr std::string_view kNodePerfJS = R"JS(
   };
   G.performance = performanceObj;
 
+  // ── performance.timerify (perf_hooks) ─────────────────────────────────────
+  // Wrap fn so each successful call publishes a "function" timeline entry
+  // (name = fn.name, entryType "function", startTime, duration). A throw
+  // bubbles without an entry. ref: node lib/internal/perf/timerify.js.
+  function timerify(fn, options) {
+    if (typeof fn !== "function") throw errArgType("fn", "function", fn);
+    let histogram;
+    if (options !== undefined) {
+      if (typeof options !== "object" || options === null) throw errArgType("options", "Object", options);
+      histogram = options.histogram;
+      if (histogram !== undefined &&
+          (typeof histogram !== "object" || histogram === null || typeof histogram.record !== "function")) {
+        throw errArgType("options.histogram", "RecordableHistogram", histogram);
+      }
+    }
+    function timerified(...args) {
+      const start = perfNow();
+      const result = new.target !== undefined ? Reflect.construct(fn, args) : fn.apply(this, args);
+      const duration = perfNow() - start;
+      if (histogram) histogram.record(Math.max(1, Math.round(duration * 1e6)));
+      addEntry(new PerformanceEntry(kConstruct, fn.name, "function", start, duration));
+      return result;
+    }
+    Object.defineProperty(timerified, "length", { value: fn.length, configurable: true });
+    Object.defineProperty(timerified, "name", { value: "timerified " + fn.name, configurable: true });
+    return timerified;
+  }
+  performanceObj.timerify = timerify;
+
   // ── PerformanceObserver ───────────────────────────────────────────────────
-  const SUPPORTED = ["mark", "measure"];
+  const SUPPORTED = ["mark", "measure", "function"];
   class PerformanceObserver {
     constructor(callback) {
       if (typeof callback !== "function") throw errArgType("callback", "function", callback);
@@ -455,6 +484,7 @@ inline constexpr std::string_view kNodePerfJS = R"JS(
     monitorEventLoopDelay,
     createHistogram,
     eventLoopUtilization,
+    timerify,
   };
   M["perf_hooks"] = mod;
   M["node:perf_hooks"] = mod;
