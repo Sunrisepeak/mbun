@@ -623,14 +623,10 @@ public:
     // require machinery. A miss deliberately falls back to the normal resolver so
     // an unknown blob URL still reports MODULE_NOT_FOUND — bun's
     // GetLoaderAndVirtualSourceErr::BlobNotFound (bundler/options.rs:590).
-    // `bridge` selects the JS side: __mbun_blob_module_source for `blob:`,
-    // __mbun_data_module_source for `data:` (RFC 2397 — the payload IS the
-    // source; both yield the same (MIME type, source) pair).
     std::optional<std::pair<std::string, std::string>> blob_module_source_(
-        JSContextRef ctx, const std::string& spec,
-        const char* bridge = "__mbun_blob_module_source") {
+        JSContextRef ctx, const std::string& spec) {
         JSObjectRef global{JSContextGetGlobalObject(ctx)};
-        JSValueRef fnVal{get_prop(ctx, global, bridge)};
+        JSValueRef fnVal{get_prop(ctx, global, "__mbun_blob_module_source")};
         if (fnVal == nullptr || !JSValueIsObject(ctx, fnVal)) return std::nullopt;
         JSObjectRef fn{JSValueToObject(ctx, fnVal, nullptr)};
         if (fn == nullptr || !JSObjectIsFunction(ctx, fn)) return std::nullopt;
@@ -792,16 +788,6 @@ public:
             if (auto blob{blob_module_source_(ctx, rspec)}) {
                 blobModule = true;
                 loaded = load_blob_module_(std::move(*blob), rspec, effTypeAttr);
-            }
-        }
-        // data: URL module — `import("data:text/javascript,export default 1")`.
-        // Same shape as the blob branch: RFC 2397 carries the source inline, so
-        // there is nothing for the path resolver to find (bun handles it in
-        // bundler/options.rs's virtual-source branch alongside blob:).
-        if (!blobModule && rspec.starts_with("data:")) {
-            if (auto data{blob_module_source_(ctx, rspec, "__mbun_data_module_source")}) {
-                blobModule = true;
-                loaded = load_blob_module_(std::move(*data), rspec, effTypeAttr);
             }
         }
         if (!blobModule) {
@@ -1742,38 +1728,10 @@ private:
             void* p{o != nullptr ? JSObjectGetTypedArrayBytesPtr(c, o, nullptr) : nullptr};
             return JSValueMakeNumber(c, static_cast<double>(reinterpret_cast<std::uintptr_t>(p)));
         });
-        // Bun.gc(force) / bun:jsc gcAndSweep|fullGC|edenGC. These were no-op
-        // stubs, so a suite that allocates a large blob per test and relies on
-        // the documented `Bun.gc(true)` in afterEach to reclaim it (bun's own
-        // js/web/fetch/blob-oom.test.ts) grew monotonically until the process was
-        // OOM-killed — every one of its OOM *guards* fired correctly, nothing
-        // ever freed the bytes. JSGarbageCollect is JSC's full collect+sweep.
-        set_fn(ctx_, global, "__mbunGcNative",
-               [](JSContextRef c, JSObjectRef, JSObjectRef, std::size_t n, const JSValueRef a[],
-                  JSValueRef*) -> JSValueRef {
-                   JSGarbageCollect(c);
-                   // Only the *forced* form scavenges. bmalloc's scavenge walks
-                   // every free range; leak tests call the unforced `Bun.gc()`
-                   // thousands of times inside a loop (js/web/request/
-                   // request-clone-leak does it 2000x per test), and doing a
-                   // full scavenge there is pure overhead — bun's unforced form
-                   // is `collect_async`, a hint (VirtualMachine.rs).
-                   if (n < 1 || !JSValueToBoolean(c, a[0])) return JSValueMakeNumber(c, 0);
-                   // Collecting alone is not enough: bmalloc caches the freed
-                   // large blocks, so a suite that churns hundreds of MB per
-                   // test keeps every one of them resident and still hits the
-                   // memory ceiling. bun's Bun.gc does the same thing one layer
-                   // down (VirtualMachine.rs garbage_collect →
-                   // bun_core::Global::mimalloc_cleanup).
-                   WTF::releaseFastMallocFreeMemory();
-                   return JSValueMakeNumber(c, 0);
-               });
         // JSC backing-width introspection used only by bun:internal-for-testing.
         JSObjectRef jscInternals{JSObjectMake(ctx_, nullptr, nullptr)};
         set_native_fn(ctx_, jscInternals, "isUTF16String", 1, is_utf16_string_host);
         set_native_fn(ctx_, jscInternals, "callerSourceOriginNative", 0, caller_source_origin_host);
-        set_native_fn(ctx_, jscInternals, "estimateShallowMemoryUsageOfNative", 1,
-                      estimate_shallow_memory_usage_host);
         set_prop(ctx_, global, "__mbunJscInternalsNative", jscInternals);
         // bun:internal-for-testing xxHash3ForTesting (full u64 seed; bootstrap
         // re-exports it on the module).

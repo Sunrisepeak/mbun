@@ -1050,7 +1050,15 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
         // source object is copied ONCE and the copy is shared by every part
         // that refers to it. Both suites lean on exactly that (8254 builds
         // 2049 parts out of 256 buffers).
-        const chunks = [];
+        //
+        // Collected into a NULL-PROTOTYPE object, not an array: `chunks.push(x)`
+        // stores through [[Set]], so a user-defined getter-only index accessor
+        // on Array.prototype (js/web/fetch/blob-array-fast-path installs one)
+        // makes the constructor throw "Attempted to assign to readonly
+        // property". bun's Blob.rs collects natively and never consults
+        // Array.prototype.
+        const chunks = { __proto__: null };
+        let count = 0;
         let total = 0;
         const seen = new Map();
         for (const p of (parts || [])) {
@@ -1063,15 +1071,19 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
             b = partBytes(p);
           }
           if (b.length === 0) continue;
-          chunks.push(b);
+          chunks[count++] = b;
           total += b.length;
         }
+        // Array.from(..., mapper) creates each element with CreateDataProperty,
+        // so the result is a real (iterable) array without ever going through
+        // [[Set]] and the hostile Array.prototype accessor.
+        const partList = Array.from({ length: count }, (_unused, i) => chunks[i]);
         // The backing store is not a WHATWG field: bun keeps a Blob's bytes off
         // the object entirely (`Object.keys(blob)` is [] there). Non-enumerable
         // so inspect/JSON.stringify/deep-equal don't walk the bytes one element
         // at a time — Bun.inspect(Bun.file("40mb.mp4")) built a 183MB string
         // and hung the process.
-        blobSlot(this, "__parts", chunks);
+        blobSlot(this, "__parts", partList);
         blobSlot(this, "__size", total);
         // Attributes live in non-enumerable slots behind Blob.prototype
         // accessors (see below); `size` is always derived from `__size`.
@@ -1826,6 +1838,11 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       // directly and applies it as its own timeout instead.
       static timeout(ms) { const s = new AbortSignal(); Object.defineProperty(s, "__mbunAbortAt", { value: Date.now() + (Number(ms) || 0), enumerable: false, configurable: true, writable: true }); if (G.setTimeout) G.setTimeout(() => { s.aborted = true; s.reason = new G.DOMException("The operation timed out", "TimeoutError"); s._fire(); }, ms); return s; }
       static any(signals) { const s = new AbortSignal(); for (const sig of signals) { if (sig.aborted) { s.aborted = true; s.reason = sig.reason; return s; } sig.addEventListener("abort", () => { if (!s.aborted) { s.aborted = true; s.reason = sig.reason; s._fire(); } }); } return s; }
+      // WebCore AbortSignal::memoryCost() includes m_algorithms.sizeInBytes();
+      // mbun's algorithm list is `_l` (std::pair<uint32_t, Function> ≈ 16 bytes
+      // per entry on 64-bit). Read by bun:jsc's estimateShallowMemoryUsageOf so
+      // an abort-algorithm leak is observable exactly as it is in bun.
+      [Symbol.for("mbun.memoryCost")]() { return this._l.length * 16; }
     }
     G.AbortSignal = AbortSignal;
   }

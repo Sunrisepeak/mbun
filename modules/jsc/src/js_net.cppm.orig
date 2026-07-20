@@ -2036,12 +2036,7 @@ export constexpr std::string_view kNetJS = R"JS(
         else if (!isHead && http10) this._meta.keepAlive = false;
       }
       lines.push("Connection: " + (this._meta.keepAlive ? "keep-alive" : "close"));
-      // node _http_outgoing writes the header block as LATIN1: a header value is
-      // a byte string, so U+0080..U+00FF must go out as one byte each. Encoding
-      // it as UTF-8 (the socket's default) doubles those bytes, which is exactly
-      // how a `Location: /<binary utf-8 bytes>` redirect ends up double-encoded.
-      const head = lines.join("\r\n") + "\r\n\r\n";
-      this.socket.write(G.Buffer ? G.Buffer.from(head, "latin1") : head);
+      this.socket.write(lines.join("\r\n") + "\r\n\r\n");
     }
     write(data, enc, cb) {
       if (typeof enc === "function") { cb = enc; enc = null; }
@@ -2170,9 +2165,6 @@ export constexpr std::string_view kNetJS = R"JS(
           const meta = { method: parser.method, keepAlive, onFinished: null,
                          httpVersion: parser.httpVersion };
           const res = new ServerResponse(sock, meta);
-          // node _http_server.ts: the response carries its IncomingMessage as
-          // `res.req` (handlers routinely switch on `res.req.url`).
-          res.req = im;
           activeRes = res;
           meta.onFinished = () => {
             activeRes = null;
@@ -2611,17 +2603,8 @@ export constexpr std::string_view kNetJS = R"JS(
           // cost correctness.
           cleanup();
           if (depth >= 20) return reject(mkErr("Too many redirects", "TooManyRedirects"));
-          // Location is a BYTE string (the parser hands header values back
-          // latin1-decoded). The URL parser must see those bytes, not their
-          // code points re-encoded as UTF-8 — otherwise a Location carrying
-          // UTF-8 bytes comes back doubly percent-encoded (%C3%AC… instead of
-          // %EC…). Percent-escape the high bytes up front, which is what bun's
-          // URL join over the raw header bytes produces.
-          const locBytes = typeof loc === "string" && !/[^\x00-\xff]/.test(loc)
-            ? loc.replace(/[\x80-\xff]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0"))
-            : loc;
           let nextUrl, nextProtocol;
-          try { const u = new G.URL(locBytes, url); nextUrl = String(u); nextProtocol = u.protocol; }
+          try { const u = new G.URL(loc, url); nextUrl = String(u); nextProtocol = u.protocol; }
           catch (e) { return reject(mkErr("InvalidRedirectURL", "InvalidRedirectURL")); }
           // bun lib.rs:5241/5374: the hop target must speak http(s); anything
           // else (file:, data:, ...) fails the fetch before the request goes

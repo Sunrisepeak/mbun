@@ -736,6 +736,20 @@ JSC_DEFINE_HOST_FUNCTION(caller_source_origin_host,
     return JSC::JSValue::encode(JSC::jsString(vm, s));
 }
 
+// ref: bun src/jsc/modules/BunJSCModule.h:931 functionEstimateDirectMemoryUsageOf
+// (exported as bun:jsc estimateShallowMemoryUsageOf) — the cell's own estimated
+// size, i.e. JSC's estimatedSizeInBytes(). A non-cell (number/bool/…) is 0.
+// Native by necessity: the C API exposes no per-cell size.
+JSC_DEFINE_HOST_FUNCTION(estimate_shallow_memory_usage_host,
+                         (JSC::JSGlobalObject* global, JSC::CallFrame* frame)) {
+    JSC::VM& vm{global->vm()};
+    JSC::JSValue value{frame->argument(0)};
+    if (!value || !value.isCell()) return JSC::JSValue::encode(JSC::jsNumber(0));
+    JSC::EnsureStillAliveScope alive{value};
+    return JSC::JSValue::encode(
+        JSC::jsNumber(static_cast<double>(alive.value().asCell()->estimatedSizeInBytes(vm))));
+}
+
 // ── Bun.peek: synchronously read a settled promise (blueprint src/js/builtins/
 // Peek.ts — $isPromise && status ? settledValue : value). Must be native: JSC's
 // C API has no way to read a promise's internal state without .then (which would

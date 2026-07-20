@@ -201,6 +201,14 @@ inline constexpr std::string_view kNodePerfJS = R"JS(
     onresourcetimingbufferfull: null,
     nodeTiming: new PerformanceNodeTiming(),
     toJSON() { return { timeOrigin, timing: {} }; },
+    // bun/WebCore Performance::memoryCost() counts the buffered entries the
+    // object owns. mbun keeps that buffer in this closure, so publish its cost
+    // through the hook bun:jsc's estimateShallowMemoryUsageOf consults.
+    [Symbol.for("mbun.memoryCost")]() {
+      let n = 0;
+      for (const e of buffer) n += 48 + (typeof e.name === "string" ? e.name.length * 2 : 0);
+      return n;
+    },
   };
   G.performance = performanceObj;
 

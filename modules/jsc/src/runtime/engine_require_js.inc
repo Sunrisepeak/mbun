@@ -31,6 +31,29 @@ globalThis.__mbun_blob_module_source = function (spec) {
   return { type: typeof blob.type === "string" ? blob.type : "",
            source: bytes ? new TextDecoder().decode(bytes) : "" };
 };
+// Bridge for `require("data:…")` / `import("data:…")` (RFC 2397): the payload is
+// the module source and the mediatype selects the loader, exactly like the blob:
+// case above — so this returns the same { type, source } shape. `;base64` means
+// the payload is base64, otherwise it is percent-encoded.
+globalThis.__mbun_data_module_source = function (spec) {
+  const s = String(spec);
+  const comma = s.indexOf(",");
+  if (comma === -1) return null;
+  const meta = s.slice(5, comma);
+  const payload = s.slice(comma + 1);
+  const isBase64 = /;base64\s*$/i.test(meta);
+  // RFC 2397 default when the mediatype is omitted.
+  const type = (meta.replace(/;base64\s*$/i, "").split(";")[0] || "text/plain").trim().toLowerCase();
+  let source;
+  if (isBase64) {
+    source = globalThis.Buffer
+      ? globalThis.Buffer.from(payload, "base64").toString("utf8")
+      : (globalThis.atob ? globalThis.atob(payload) : payload);
+  } else {
+    try { source = decodeURIComponent(payload); } catch (e) { source = payload; }
+  }
+  return { type: type, source: source };
+};
 globalThis.__mbun_make_require = function (dir) {
   // `k` (arg 3): truthy when this call is a lowered ESM import statement or a
   // dynamic import (ImportKind::Stmt/Dynamic) rather than a literal require() —

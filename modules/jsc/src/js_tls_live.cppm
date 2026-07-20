@@ -320,6 +320,11 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
     constructor(options, secureConnectionListener) {
       if (typeof options === "function") { secureConnectionListener = options; options = {}; }
       super();
+      // node tls.Server runs setSecureContext(options) → createSecureContext in
+      // the constructor, so an unusable option (a cipher list OpenSSL matches
+      // nothing to, a bad secureProtocol, …) throws from createServer() rather
+      // than at the first connection.
+      if (T && typeof T.createSecureContext === "function") T.createSecureContext(options || {});
       this._sharedCreds = options || {};
       this._contexts = new Map();
       if (typeof secureConnectionListener === "function" && typeof this.on === "function")

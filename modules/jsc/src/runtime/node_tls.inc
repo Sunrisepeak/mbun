@@ -81,10 +81,34 @@ inline JSValueRef node_tls_canonicalize_ip_cb(JSContextRef ctx, JSObjectRef, JSO
     return make_string(ctx, out.data());
 }
 
+// __mbunNodeTlsNative.checkCipherList(str) → does OpenSSL accept this cipher
+// list? node's SecureContext::SetCiphers throws ERR_SSL_NO_CIPHER_MATCH when
+// SSL_CTX_set_cipher_list() fails, which is the only way to learn that a list
+// like "aes256-sha" or "FOOBARBAZ" selects nothing. Missing/empty argument
+// answers true so only an explicit list is judged.
+inline JSValueRef node_tls_check_cipher_list_cb(JSContextRef ctx, JSObjectRef, JSObjectRef,
+                                                std::size_t argc, const JSValueRef argv[],
+                                                JSValueRef*) {
+    if (argc < 1) return JSValueMakeBoolean(ctx, true);
+    const std::string list{val_to_string(ctx, argv[0])};
+    bool ok{true};
+    if (const SSL_METHOD* method{TLS_method()}) {
+        if (SSL_CTX* c{SSL_CTX_new(method)}) {
+            ok = SSL_CTX_set_cipher_list(c, list.c_str()) == 1;
+            SSL_CTX_free(c);
+        }
+    }
+    // OpenSSL leaves the failure on the thread error queue; clear it so a later
+    // unrelated call does not report it.
+    if (!ok) ERR_clear_error();
+    return JSValueMakeBoolean(ctx, ok);
+}
+
 // Install globalThis.__mbunNodeTlsNative. Called once from engine init.
 inline void install_node_tls_native(JSContextRef ctx, JSObjectRef global) {
     JSObjectRef tn{JSObjectMake(ctx, nullptr, nullptr)};
     set_fn(ctx, tn, "getCiphers", node_tls_get_ciphers_cb);
+    set_fn(ctx, tn, "checkCipherList", node_tls_check_cipher_list_cb);
     set_fn(ctx, tn, "canonicalizeIP", node_tls_canonicalize_ip_cb);
     set_prop(ctx, global, "__mbunNodeTlsNative", tn);
 }

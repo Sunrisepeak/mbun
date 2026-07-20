@@ -543,21 +543,31 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       get [Symbol.toStringTag]() { return "TextEncoder"; }
       get encoding() { return "utf-8"; }
       encode(str = "") {
-        str = String(str); const out = [];
+        str = String(str);
+        // Encode straight into a typed array. A plain-array `out.push(...)`
+        // stores through [[Set]], so a user-defined getter-only index accessor
+        // on Array.prototype (blob-array-fast-path.test.ts installs one) makes
+        // every encode() throw "Attempted to assign to readonly property".
+        // bun's encoder is native and never consults Array.prototype.
+        // Worst case is 3 bytes per UTF-16 code unit (a surrogate pair is 4
+        // bytes for 2 units), so this buffer can never overflow.
+        const out = new Uint8Array(str.length * 3);
+        let n = 0;
         for (let i = 0; i < str.length; i++) {
           let c = str.charCodeAt(i);
-          if (c < 0x80) out.push(c);
-          else if (c < 0x800) out.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));
+          if (c < 0x80) out[n++] = c;
+          else if (c < 0x800) { out[n++] = 0xc0 | (c >> 6); out[n++] = 0x80 | (c & 0x3f); }
           else if (c >= 0xd800 && c <= 0xdbff) {
             const trail = i + 1 < str.length ? str.charCodeAt(i + 1) : 0;
             if (trail >= 0xdc00 && trail <= 0xdfff) {
               const cp = 0x10000 + ((c - 0xd800) << 10) + (trail - 0xdc00); i++;
-              out.push(0xf0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3f), 0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f));
-            } else out.push(0xef, 0xbf, 0xbd);
-          } else if (c >= 0xdc00 && c <= 0xdfff) out.push(0xef, 0xbf, 0xbd);
-          else out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
+              out[n++] = 0xf0 | (cp >> 18); out[n++] = 0x80 | ((cp >> 12) & 0x3f);
+              out[n++] = 0x80 | ((cp >> 6) & 0x3f); out[n++] = 0x80 | (cp & 0x3f);
+            } else { out[n++] = 0xef; out[n++] = 0xbf; out[n++] = 0xbd; }
+          } else if (c >= 0xdc00 && c <= 0xdfff) { out[n++] = 0xef; out[n++] = 0xbf; out[n++] = 0xbd; }
+          else { out[n++] = 0xe0 | (c >> 12); out[n++] = 0x80 | ((c >> 6) & 0x3f); out[n++] = 0x80 | (c & 0x3f); }
         }
-        return new Uint8Array(out);
+        return out.slice(0, n);
       }
       encodeInto(str, dest) {
         str = String(str);
@@ -1929,6 +1939,39 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
         };
       };
       Bun.stdin = makeStdinBlob(Infinity);
+    }
+    // Bun.stdout / Bun.stderr — write-only file handles over fd 1/2. bun exposes
+    // them as BunFile with a FileSink `.writer()` (write() returns the byte
+    // count, flush()/end() resolve it); writes go straight to the fd so binary
+    // payloads are not UTF-8 mangled.
+    if (PN && typeof Bun.stdout === "undefined") {
+      const makeStdioFile = (fd) => {
+        const toBytes = (chunk) =>
+          typeof chunk === "string" ? te.encode(chunk)
+            : (ArrayBuffer.isView(chunk) || chunk instanceof ArrayBuffer) ? anyToU8(chunk)
+            : te.encode(String(chunk));
+        const writeBytes = (chunk) => { const b = toBytes(chunk); if (b.length) PN.write(fd, u8ToB64(b)); return b.length; };
+        return {
+          get readable() { return false; },
+          get writable() { return true; },
+          size: Infinity,
+          type: "",
+          write(chunk) { return Promise.resolve(writeBytes(chunk)); },
+          writer() {
+            let written = 0;
+            return {
+              write(chunk) { const n = writeBytes(chunk); written += n; return n; },
+              // Unbuffered: every write already reached the fd, so a flush only
+              // reports what went through since the sink was created.
+              flush() { const n = written; written = 0; return n; },
+              end() { const n = written; written = 0; return n; },
+              start() {}, ref() {}, unref() {},
+            };
+          },
+        };
+      };
+      Bun.stdout = makeStdioFile(1);
+      Bun.stderr = makeStdioFile(2);
     }
     // Binary process.stdout/.stderr writes (Buffers must not be UTF-8 mangled).
     if (PN && G.process) {

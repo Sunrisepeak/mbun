@@ -2975,7 +2975,11 @@ inline constexpr std::string_view kBootstrapJS = R"JS(
     heapStats:() => ({ heapSize: 0, heapCapacity: 0, objectCount: 0, protectedObjectCount: 0,
                         globalObjectCount: 0, objectTypeCounts: {}, protectedObjectTypeCounts: {} }),
     memoryUsage: () => ({ current: 0, peak: 0 }),
-    getRandomSeed: () => 0, setRandomSeed: () => {}, gcAndSweep: () => 0, fullGC: () => 0, edenGC: () => 0,
+    getRandomSeed: () => 0, setRandomSeed: () => {},
+    // Real collect+sweep (JSGarbageCollect) — see runtime/engine.inc __mbunGcNative.
+    gcAndSweep: () => (G.__mbunGcNative ? G.__mbunGcNative(true) : 0),
+    fullGC: () => (G.__mbunGcNative ? G.__mbunGcNative(true) : 0),
+    edenGC: () => (G.__mbunGcNative ? G.__mbunGcNative(false) : 0),
     isRope: () => false, describe: (v) => String(v), describeArray: () => "",
     serialize: (v) => v, deserialize: (v) => v, drainMicrotasks: () => {},
     getProtectedObjects: () => [], totalCompileTime: () => 0,
@@ -2983,6 +2987,22 @@ inline constexpr std::string_view kBootstrapJS = R"JS(
     // Bound to the native directly: any JS wrapper would itself become the
     // "caller" (its source origin is the builtins blob, i.e. empty).
     callerSourceOrigin: G.__mbunJscInternalsNative.callerSourceOriginNative,
+    // bun BunJSCModule.h:931 — the cell's own estimated size. Objects whose
+    // native-equivalent storage lives in a builtins closure (Performance's
+    // entry buffer, AbortSignal's abort-algorithm list — WebCore members that
+    // bun accounts for in memoryCost()) publish it through the
+    // Symbol.for("mbun.memoryCost") hook, so the total stays comparable to
+    // bun's estimatedSizeInBytes() for the same object.
+    estimateShallowMemoryUsageOf: (value) => {
+      let n = G.__mbunJscInternalsNative.estimateShallowMemoryUsageOfNative(value);
+      if (value !== null && (typeof value === "object" || typeof value === "function")) {
+        try {
+          const cost = value[Symbol.for("mbun.memoryCost")];
+          if (typeof cost === "function") n += cost.call(value) || 0;
+        } catch (e) {}
+      }
+      return n;
+    },
   };
   M["bun:internal-for-testing"] = {
     isASANEnabled: () => false,
