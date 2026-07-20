@@ -462,7 +462,9 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
         // Same synthetic-allocation-limit cap as Response._consume; a Blob body
         // delegates so its own guard fires. arrayBuffer() stays exempt.
         if (kind === "text") { if (b == null) return Promise.resolve(""); if (b instanceof Uint8Array) { G.__mbunCheckAllocLimit(b.length, "text"); return Promise.resolve(td.decode(b)); } if (b && typeof b.text === "function") return b.text(); return Promise.resolve(String(b)); }
-        if (kind === "bytes") { if (b instanceof Uint8Array) { G.__mbunCheckAllocLimit(b.length, "bytes"); return Promise.resolve(new Uint8Array(b)); } if (b && b._u8 instanceof Uint8Array) { G.__mbunCheckAllocLimit(b._u8.length, "bytes"); return Promise.resolve(new Uint8Array(b._u8)); } return this._consume("text").then((t) => te.encode(t)); }
+        // Cap on `size` (a number) before touching `_u8`, which would otherwise
+        // join the whole part list to answer a call that is about to throw.
+        if (kind === "bytes") { if (b instanceof Uint8Array) { G.__mbunCheckAllocLimit(b.length, "bytes"); return Promise.resolve(new Uint8Array(b)); } if (b && G.Blob && b instanceof G.Blob) { G.__mbunCheckAllocLimit(b.size, "bytes"); return Promise.resolve(new Uint8Array(b._u8)); } if (b && b._u8 instanceof Uint8Array) { G.__mbunCheckAllocLimit(b._u8.length, "bytes"); return Promise.resolve(new Uint8Array(b._u8)); } return this._consume("text").then((t) => te.encode(t)); }
         if (kind === "arrayBuffer") {
           const u = b instanceof Uint8Array ? b : (b && b._u8 instanceof Uint8Array ? b._u8 : null);
           if (u) return Promise.resolve(u.buffer.slice(u.byteOffset, u.byteOffset + u.byteLength));
@@ -1034,31 +1036,84 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
         // bun Blob.rs:3515-3518 iterates the array (per-index [[Get]], consults
         // the prototype) and skips undefined/null — so a sparse array's holes
         // don't become "undefined"/"null" chunks.
+        //
+        // The parts are kept as a LIST and joined only when someone actually
+        // needs one contiguous buffer (see the `_u8` accessor below). Eagerly
+        // concatenating made `new Blob([buf, buf, …])` cost the sum of the
+        // parts even when every part is the same buffer: the 2 GiB blob in
+        // regression/issue/8254 and the 576 MiB one in js/web/fetch/blob-oom
+        // were both OOM-killed inside this constructor, before a single byte
+        // was ever read.
+        //
+        // `seen` gives the second half of that: parts are still COPIED (a Blob
+        // must not observe later mutations of its source), but each distinct
+        // source object is copied ONCE and the copy is shared by every part
+        // that refers to it. Both suites lean on exactly that (8254 builds
+        // 2049 parts out of 256 buffers).
         const chunks = [];
-        for (const p of (parts || [])) if (p !== undefined && p !== null) chunks.push(partBytes(p));
-        let total = 0; for (const c of chunks) total += c.length;
-        const u8 = new Uint8Array(total);
-        let off = 0; for (const c of chunks) { u8.set(c, off); off += c.length; }
-        // `_u8` is the backing store, not a WHATWG field: bun keeps a Blob's bytes
-        // off the object entirely (`Object.keys(blob)` is [] there). Make it
-        // non-enumerable so inspect/JSON.stringify/deep-equal don't walk the bytes
-        // one element at a time — Bun.inspect(Bun.file("40mb.mp4")) built a 183MB
-        // string and hung the process. writable+configurable so the later
-        // `b._u8 = …` assignments (slice(), Bun.file) keep this descriptor.
-        Object.defineProperty(this, "_u8", { value: u8, writable: true, enumerable: false, configurable: true });
+        let total = 0;
+        const seen = new Map();
+        for (const p of (parts || [])) {
+          if (p === undefined || p === null) continue;
+          let b;
+          if (typeof p === "object") {
+            b = seen.get(p);
+            if (b === undefined) { b = partBytes(p); seen.set(p, b); }
+          } else {
+            b = partBytes(p);
+          }
+          if (b.length === 0) continue;
+          chunks.push(b);
+          total += b.length;
+        }
+        // The backing store is not a WHATWG field: bun keeps a Blob's bytes off
+        // the object entirely (`Object.keys(blob)` is [] there). Non-enumerable
+        // so inspect/JSON.stringify/deep-equal don't walk the bytes one element
+        // at a time — Bun.inspect(Bun.file("40mb.mp4")) built a 183MB string
+        // and hung the process.
+        blobSlot(this, "__parts", chunks);
+        blobSlot(this, "__size", total);
         // Attributes live in non-enumerable slots behind Blob.prototype
-        // accessors (see below); `size` is always derived from `_u8`.
+        // accessors (see below); `size` is always derived from `__size`.
         blobSlot(this, "__type", normalizeMimeType(opts && opts.type));
       }
       // Blob.rs guards every string/typed-array materialization against the
       // synthetic allocation limit; arrayBuffer() is exempt (ArrayBuffer has no
       // such cap). Without this a multi-GB blob really decodes and the process
-      // is OOM-killed instead of throwing.
-      text() { G.__mbunCheckAllocLimit(this._u8.length, "text"); return Promise.resolve(td.decode(this._u8)); }
-      json() { G.__mbunCheckAllocLimit(this._u8.length, "json"); return Promise.resolve(JSON.parse(td.decode(this._u8))); }
+      // is OOM-killed instead of throwing. The guard reads `size` (cheap) so it
+      // fires BEFORE the part list is joined, not after.
+      text() { G.__mbunCheckAllocLimit(this.size, "text"); return Promise.resolve(td.decode(this._u8)); }
+      json() { G.__mbunCheckAllocLimit(this.size, "json"); return Promise.resolve(JSON.parse(td.decode(this._u8))); }
       arrayBuffer() { return Promise.resolve(this._u8.buffer.slice(this._u8.byteOffset, this._u8.byteOffset + this._u8.byteLength)); }
-      bytes() { G.__mbunCheckAllocLimit(this._u8.length, "bytes"); return Promise.resolve(new Uint8Array(this._u8)); }
-      slice(start, end, type) { const b = new G.Blob([], { type: type || "" }); b._u8 = this._u8.subarray(...[start, end].filter((x) => x !== undefined).map(Number)); return b; }
+      bytes() { G.__mbunCheckAllocLimit(this.size, "bytes"); return Promise.resolve(new Uint8Array(this._u8)); }
+      // Slicing walks the part list and keeps sub-views of the parts it
+      // overlaps, so `bigBlob.slice(n, n + 1)` costs one byte, not a join of
+      // the whole blob.
+      slice(start, end, type) {
+        const size = this.size;
+        const norm = (v, dflt) => {
+          if (v === undefined) return dflt;
+          let n = Number(v);
+          if (Number.isNaN(n)) n = 0;
+          n = Math.trunc(n);
+          return n < 0 ? Math.max(size + n, 0) : Math.min(n, size);
+        };
+        const s = norm(start, 0);
+        const e = Math.max(norm(end, size), s);
+        const out = [];
+        let off = 0;
+        for (const c of this.__parts || []) {
+          const cs = off, ce = off + c.length;
+          off = ce;
+          if (ce <= s) continue;
+          if (cs >= e) break;
+          out.push(c.subarray(Math.max(0, s - cs), Math.min(c.length, e - cs)));
+        }
+        const b = new G.Blob([], { type: type || "" });
+        blobSlot(b, "__parts", out);
+        blobSlot(b, "__size", e - s);
+        return b;
+      }
       // bun: a stream off a Blob carries the blob's type, so readableStreamToBlob
       // (and stream.blob()) round-trip it back onto the resulting Blob.
       stream() { const u8 = new Uint8Array(this._u8); const s = new G.ReadableStream({ start(c) { if (u8.length > 0) c.enqueue(u8); c.close(); } });
@@ -1088,8 +1143,38 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
         ? { get, set, enumerable: true, configurable: false }
         : { get, enumerable: true, configurable: false });
     };
+    // `_u8` — the one contiguous view of a Blob's bytes. Everything that wants
+    // "the whole blob as one Uint8Array" (Bun.build's file map, the websocket
+    // and socket senders, structuredClone, FormData) reads it, so it stays a
+    // plain property from the outside; it is an accessor only so the join is
+    // deferred to the first such read and then cached back into `__parts`.
+    // Assignment (`blob._u8 = bytes`, used by Bun.file and the loaders) still
+    // works and simply replaces the part list.
+    Object.defineProperty(G.Blob.prototype, "_u8", {
+      get() {
+        const parts = this.__parts;
+        if (!parts) return new Uint8Array(0);
+        if (parts.length === 1) return parts[0];
+        const out = new Uint8Array(this.__size || 0);
+        let o = 0;
+        for (const c of parts) { out.set(c, o); o += c.length; }
+        blobSlot(this, "__parts", [out]);
+        return out;
+      },
+      set(v) {
+        const u = v == null ? new Uint8Array(0)
+          : v instanceof Uint8Array ? v
+          : ArrayBuffer.isView(v) ? new Uint8Array(v.buffer, v.byteOffset, v.byteLength)
+          : v instanceof ArrayBuffer ? new Uint8Array(v)
+          : new Uint8Array(0);
+        blobSlot(this, "__parts", u.length ? [u] : []);
+        blobSlot(this, "__size", u.length);
+      },
+      enumerable: false,
+      configurable: true,
+    });
     attr("type", function () { return this.__type || ""; });
-    attr("size", function () { return this._u8 ? this._u8.length : 0; });
+    attr("size", function () { return this.__size || 0; });
     attr("name", function () { return this.__name; }, function (v) { blobSlot(this, "__name", v); });
     // A Blob that was never given an mtime reports bun's sentinel (2^52-1).
     attr("lastModified", function () {
@@ -1735,7 +1820,11 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       throwIfAborted() { if (this.aborted) throw this.reason || new G.DOMException("signal is aborted without reason", "AbortError"); }
       _fire() { const ev = { type: "abort", target: this }; if (typeof this.onabort === "function") this.onabort.call(this, ev); for (const cb of this._l.slice()) cb.call(this, ev); }
       static abort(reason) { const s = new AbortSignal(); s.aborted = true; s.reason = reason !== undefined ? reason : new G.DOMException("The operation was aborted.", "AbortError"); return s; }
-      static timeout(ms) { const s = new AbortSignal(); if (G.setTimeout) G.setTimeout(() => { s.aborted = true; s.reason = new G.DOMException("The operation timed out", "TimeoutError"); s._fire(); }, ms); return s; }
+      // `__mbunAbortAt` records the deadline as a wall-clock instant. A purely
+      // synchronous native that has to honour a signal (Bun.spawnSync) cannot
+      // run the timer that would fire this signal, so it reads the deadline
+      // directly and applies it as its own timeout instead.
+      static timeout(ms) { const s = new AbortSignal(); Object.defineProperty(s, "__mbunAbortAt", { value: Date.now() + (Number(ms) || 0), enumerable: false, configurable: true, writable: true }); if (G.setTimeout) G.setTimeout(() => { s.aborted = true; s.reason = new G.DOMException("The operation timed out", "TimeoutError"); s._fire(); }, ms); return s; }
       static any(signals) { const s = new AbortSignal(); for (const sig of signals) { if (sig.aborted) { s.aborted = true; s.reason = sig.reason; return s; } sig.addEventListener("abort", () => { if (!s.aborted) { s.aborted = true; s.reason = sig.reason; s._fire(); } }); } return s; }
     }
     G.AbortSignal = AbortSignal;

@@ -452,8 +452,17 @@ JSValueRef proc_kill_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t 
     return JSValueMakeBoolean(ctx, false);
 }
 
-// proc.spawnSyncB64(file, args, {cwd, env, inputB64}) → { status, signal, pid,
-// stdoutB64, stderrB64 } — like spawnSync but bytes cross as base64 both ways.
+// proc.spawnSyncB64(file, args, {cwd, env, inputB64, maxBuffer, timeoutMs,
+// killSignal}) → { status, signal, pid, stdoutB64, stderrB64,
+// exitedDueToMaxBuffer, exitedDueToTimeout } — like spawnSync but bytes cross
+// as base64 both ways.
+//
+// stdout and stderr are drained CONCURRENTLY through poll(2). The old
+// "drain(out) then drain(err)" order deadlocked whenever a child filled the
+// stderr pipe buffer before closing stdout, and — with no byte budget — a child
+// that never stops writing (`yes`) grew `outStr` until the process was
+// OOM-killed. maxBuffer/timeout are what bun uses to bound both cases
+// (bun-ref js_bun_spawn_bindings.rs: max_buffer / exited_due_to_maxbuf).
 JSValueRef proc_spawn_sync_b64_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                                   const JSValueRef args[], JSValueRef* exc) {
 #if defined(_WIN32)
@@ -463,10 +472,29 @@ JSValueRef proc_spawn_sync_b64_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, st
     std::vector<std::string> argvStr{parse_spawn_argv(ctx, argc, args, file)};
     SpawnOpts o{parse_spawn_opts(ctx, argc, args)};
     std::string input;
+    // No budget / no deadline unless the caller asks for one. `Infinity` on the
+    // JS side is passed through as absent (bun treats it as "unlimited").
+    double maxBuffer{-1};
+    double timeoutMs{-1};
+    int killSignal{SIGTERM};
     if (argc > 2 && JSValueIsObject(ctx, args[2])) {
         JSObjectRef opt{JSValueToObject(ctx, args[2], nullptr)};
         JSValueRef inV{get_prop(ctx, opt, "inputB64")};
         if (JSValueIsString(ctx, inV)) input = b64_decode(val_to_string(ctx, inV));
+        JSValueRef mbV{get_prop(ctx, opt, "maxBuffer")};
+        if (JSValueIsNumber(ctx, mbV)) {
+            const double v{JSValueToNumber(ctx, mbV, nullptr)};
+            if (std::isfinite(v) && v >= 0) maxBuffer = v;
+        }
+        JSValueRef toV{get_prop(ctx, opt, "timeoutMs")};
+        if (JSValueIsNumber(ctx, toV)) {
+            const double v{JSValueToNumber(ctx, toV, nullptr)};
+            // 0 is a real deadline ("kill now"): an already-aborted AbortSignal
+            // arrives as timeoutMs 0, not as "no timeout".
+            if (std::isfinite(v) && v >= 0) timeoutMs = v;
+        }
+        JSValueRef ksV{get_prop(ctx, opt, "killSignal")};
+        if (JSValueIsNumber(ctx, ksV)) killSignal = static_cast<int>(JSValueToNumber(ctx, ksV, nullptr));
     }
     int outPipe[2], errPipe[2], inPipe[2];
     if (pipe(outPipe) != 0 || pipe(errPipe) != 0 || pipe(inPipe) != 0) {
@@ -491,24 +519,90 @@ JSValueRef proc_spawn_sync_b64_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, st
         }
     }
     close(inPipe[1]);
-    auto drain{[](int fd) {
-        std::string out;
-        char buf[4096];
-        ssize_t n;
-        while ((n = read(fd, buf, sizeof buf)) > 0) out.append(buf, static_cast<std::size_t>(n));
-        close(fd);
-        return out;
-    }};
-    const std::string outStr{drain(outPipe[0])};
-    const std::string errStr{drain(errPipe[0])};
+
+    std::string outStr, errStr;
+    bool hitMaxBuffer{false}, hitTimeout{false};
+    {
+        // 64 KiB is node's stdio read size; it is also the overshoot bound the
+        // corpus asserts (result <= maxBuffer + 64 KiB): the read that trips the
+        // limit is still buffered, but no further read happens.
+        constexpr std::size_t kChunk{64u * 1024u};
+        std::vector<char> buf(kChunk);
+        int fds[2]{outPipe[0], errPipe[0]};
+        bool open_[2]{true, true};
+        std::string* sink[2]{&outStr, &errStr};
+        const auto start{std::chrono::steady_clock::now()};
+        auto elapsedMs{[&start] {
+            return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+                .count();
+        }};
+        while (open_[0] || open_[1]) {
+            pollfd pfd[2];
+            int n{0};
+            int slot[2]{-1, -1};
+            for (int i = 0; i < 2; ++i) {
+                if (!open_[i]) continue;
+                slot[n] = i;
+                pfd[n++] = pollfd{.fd = fds[i], .events = POLLIN, .revents = 0};
+            }
+            int waitMs{-1};
+            if (timeoutMs >= 0) {
+                const double left{timeoutMs - elapsedMs()};
+                waitMs = left <= 0 ? 0 : static_cast<int>(left) + 1;
+            }
+            const int pr{poll(pfd, static_cast<nfds_t>(n), waitMs)};
+            if (pr < 0) {
+                if (errno == EINTR) continue;
+                break;
+            }
+            if (timeoutMs >= 0 && !hitTimeout && elapsedMs() >= timeoutMs) {
+                hitTimeout = true;
+                if (killSignal != 0) kill(pid, killSignal);
+                // Keep draining until EOF so the post-kill output is reported.
+                timeoutMs = -1;
+                continue;
+            }
+            if (pr == 0) continue;
+            for (int k = 0; k < n; ++k) {
+                if ((pfd[k].revents & (POLLIN | POLLHUP | POLLERR)) == 0) continue;
+                const int i{slot[k]};
+                ssize_t rn;
+                do { rn = read(fds[i], buf.data(), kChunk); } while (rn < 0 && errno == EINTR);
+                if (rn > 0) {
+                    sink[i]->append(buf.data(), static_cast<std::size_t>(rn));
+                } else if (rn == 0) {
+                    open_[i] = false;
+                    close(fds[i]);
+                } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                    open_[i] = false;
+                    close(fds[i]);
+                }
+            }
+            if (maxBuffer >= 0 && !hitMaxBuffer &&
+                static_cast<double>(outStr.size() + errStr.size()) > maxBuffer) {
+                hitMaxBuffer = true;
+                if (killSignal != 0) kill(pid, killSignal);
+                // Stop reading entirely: closing our ends makes a child that
+                // ignored (or was never sent) the signal die of EPIPE instead of
+                // blocking forever on a full pipe.
+                for (int i = 0; i < 2; ++i) {
+                    if (open_[i]) { open_[i] = false; close(fds[i]); }
+                }
+            }
+        }
+    }
     int status{0};
     waitpid(pid, &status, 0);
     JSObjectRef r{JSObjectMake(ctx, nullptr, nullptr)};
-    set_prop(ctx, r, "status",
-             JSValueMakeNumber(ctx, WIFEXITED(status) ? WEXITSTATUS(status) : -1));
     const int sig{WIFSIGNALED(status) ? WTERMSIG(status) : 0};
+    // A signalled child has NO exit code (bun/node report exitCode === null).
+    set_prop(ctx, r, "status",
+             sig != 0 ? JSValueMakeNull(ctx)
+                      : JSValueMakeNumber(ctx, WIFEXITED(status) ? WEXITSTATUS(status) : -1));
     set_prop(ctx, r, "signal", sig ? make_string(ctx, std::to_string(sig)) : JSValueMakeNull(ctx));
     set_prop(ctx, r, "pid", JSValueMakeNumber(ctx, static_cast<double>(pid)));
+    set_prop(ctx, r, "exitedDueToMaxBuffer", JSValueMakeBoolean(ctx, hitMaxBuffer));
+    set_prop(ctx, r, "exitedDueToTimeout", JSValueMakeBoolean(ctx, hitTimeout));
     set_prop(ctx, r, "stdoutB64",
              make_string(ctx, b64_encode(reinterpret_cast<const unsigned char*>(outStr.data()), outStr.size())));
     set_prop(ctx, r, "stderrB64",
