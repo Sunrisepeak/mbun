@@ -1270,6 +1270,7 @@ private:
         set_fn(ctx_, toml, "parse", toml_parse_cb);
         set_prop(ctx_, bun, "TOML", toml);
 
+
         // Bun.build → in-memory bundler slice (runtime/bun_build.inc).
         set_native_fn(ctx_, bun, "build", 1, bun_build_host);
 
@@ -1629,6 +1630,7 @@ private:
         set_fn(ctx_, shn, "parse", shell_parse_cb);
         set_fn(ctx_, shn, "parseErrors", shell_parse_errors_cb);
         set_fn(ctx_, shn, "compile", shell_compile_cb);
+        set_fn(ctx_, shn, "escape", shell_escape_cb);
         set_fn(ctx_, shn, "exec", bunsh_exec_cb);
         set_prop(ctx_, global, "__mbunShellNative", shn);
         // Bun's private InternalSourceMap codec, exposed only through

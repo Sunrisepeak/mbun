@@ -85,6 +85,22 @@ bool shell_collect_words(JSContextRef context, JSValueRef value, std::uint32_t d
     return true;
 }
 
+// __mbunShellNative.escape(str) — backs Bun.$.escape. ref: BunObject.rs
+// shell_escape: a string that needs no escaping is returned unchanged (bun
+// hands back the very same JSValue), everything else comes back double-quoted.
+JSValueRef shell_escape_cb(JSContextRef context, JSObjectRef, JSObjectRef, std::size_t argc,
+                           const JSValueRef arguments[], JSValueRef* exception) {
+    if (argc < 1) {
+        return shell_throw(context, exception, "shell escape expected at least 1 argument");
+    }
+    std::string text;
+    if (!shell_value_to_string(context, arguments[0], text, exception)) {
+        return JSValueMakeUndefined(context);
+    }
+    if (!mbun::shell::needs_escape(text)) return arguments[0];
+    return make_string(context, mbun::shell::escape_string(text));
+}
+
 JSValueRef shell_compile_cb(JSContextRef context, JSObjectRef, JSObjectRef, std::size_t argc,
                             const JSValueRef arguments[], JSValueRef* exception) {
     if (argc < 2) {
