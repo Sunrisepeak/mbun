@@ -49,6 +49,17 @@ frozen machine or a silently murdered harness.
   `--perf` additionally flags files whose `duration_ms` grew past
   `--perf-threshold` (default 1.5×). Replaces the ad-hoc python one-liners that
   kept mis-diffing rounds via cwd-drift and stale baselines.
+- `cluster_finder.py` — turns a corpus run into a ranked, actionable work-list.
+  It does not execute anything; it reads a runner's output dir
+  (`node_corpus_runner.py --out <dir>`: `results.tsv` + `logs/*.log`) and buckets
+  the non-green, non-timeout files by `(subsystem, normalised-error-signature)`,
+  ranking subsystems by *fixable* density so a round targets the densest
+  single-root-cause cluster instead of a scattered guess. Volatile bits (paths,
+  numbers, quoted literals, hex) are scrubbed from each error line so one root
+  cause collapses into one bucket. Timeouts (usually child_process harness gaps)
+  are reported separately and never inflate a cluster. `--filter test-vm` scopes
+  to one subsystem; `--json` emits a machine summary. Analysis-only, so it needs
+  no bounded layer of its own — all execution stayed in the runner.
 - `smoke_examples.py` — boots each `examples/` app in turn, requests
   `http://127.0.0.1:3000/`, asserts a 2xx, then reaps the whole process tree
   (`bounded_run.BoundedServer`). Sequential by design: the demos all hardcode
@@ -65,6 +76,7 @@ Every tool has a self-test under `tests/`; run them after touching a runner:
 bash tools/integration/tests/test_bun_corpus_runner.sh
 bash tools/integration/tests/test_node_corpus_runner.sh
 bash tools/integration/tests/test_corpus_diff.sh
+bash tools/integration/tests/test_cluster_finder.sh
 bash tools/integration/tests/test_smoke_examples.sh
 bash benchmarks/tools/test-bench3.sh
 ```
