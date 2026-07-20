@@ -1995,6 +1995,10 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
           text() { return Promise.resolve().then(() => td.decode(drainAll())); },
           json() { return Promise.resolve().then(() => JSON.parse(td.decode(drainAll()))); },
           slice(start, end) { const s = start === undefined ? 0 : (Number(start) || 0); const e = end === undefined ? Infinity : Number(end); const nc = Math.max(0, e - s); return makeStdinBlob(Math.min(cap, nc)); },
+          // BunFile#exists(): fd 0 is always present. It must NOT consume or
+          // resolve the pipe's size (issue #27849: resolving size to 0 for a
+          // pipe made a subsequent read return empty), so it is a pure probe.
+          exists() { return Promise.resolve(true); },
         };
       };
       Bun.stdin = makeStdinBlob(Infinity);
