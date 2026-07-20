@@ -1453,6 +1453,89 @@ int run_build_no_bundle(const mbun::cli::BuildFlags& flags,
     return 0;
 }
 
+// `bun build --compile <entry>` — write the bundled program into a copy of the
+// running mbun image so the result runs on its own.
+// ref: bun src/cli/build_command.rs, which hands the linked bundle to
+// StandaloneModuleGraph.inject(): the payload is appended to the bun binary and
+// the file is made executable. mbun's container lives in
+// mbun.bundler.standalone_exe; startup finds it again in main.cpp.
+int emit_compiled_executable(const mbun::cli::BuildFlags& flags, const std::string& entryPoint,
+                             std::string code, std::uint32_t moduleCount,
+                             std::chrono::steady_clock::time_point start) {
+    const std::optional<std::filesystem::path> selfPath{mbun::platform::self_executable_path()};
+    if (!selfPath) {
+        std::println(std::cerr, "error: --compile could not locate the mbun executable to copy");
+        return 1;
+    }
+    std::ifstream self{*selfPath, std::ios::binary};
+    if (!self) {
+        std::println(std::cerr, "error: --compile could not read \"{}\"", selfPath->string());
+        return 1;
+    }
+    std::ostringstream selfBytes{};
+    selfBytes << self.rdbuf();
+    const std::string image{selfBytes.str()};
+
+    mbun::bundler::standalone_exe::Program program{};
+    program.code = std::move(code);
+    // The entry keeps its own file name inside the virtual filesystem, so a stack
+    // trace or import.meta.path from the compiled program still names the source
+    // the user wrote. ref: standalone_graph's `/$bunfs/root/` contract.
+    program.entryName = std::filesystem::path{entryPoint}.filename().string();
+    program.execArgv = flags.compileExecArgv;
+    program.autoloadDotenv = flags.compileAutoloadDotenv;
+    program.autoloadBunfig = flags.compileAutoloadBunfig;
+    program.autoloadTsconfig = flags.compileAutoloadTsconfig;
+    program.autoloadPackageJson = flags.compileAutoloadPackageJson;
+
+    // Without --outfile the executable takes the entry's base name with the
+    // extension dropped (`bun build --compile src/cli.ts` → `./cli`).
+    std::filesystem::path outPath{};
+    if (!flags.outfile.empty()) {
+        outPath = std::filesystem::path{flags.outfile};
+        if (!flags.outdir.empty()) outPath = std::filesystem::path{flags.outdir} / outPath.filename();
+    } else {
+        outPath = std::filesystem::path{entryPoint}.filename();
+        outPath.replace_extension();
+        if (!flags.outdir.empty()) outPath = std::filesystem::path{flags.outdir} / outPath;
+    }
+
+    std::error_code ec{};
+    if (const std::filesystem::path parent{outPath.parent_path()}; !parent.empty()) {
+        std::filesystem::create_directories(parent, ec);
+        if (ec) {
+            std::println(std::cerr, "error: could not open output directory \"{}\"", parent.string());
+            return 1;
+        }
+    }
+
+    const std::string packed{mbun::bundler::standalone_exe::pack(image, program)};
+    {
+        // Truncate through a separate scope so the stream is closed — and the
+        // bytes flushed — before the mode change and before anything spawns it.
+        // Removing first matters when the target is the executable of a process
+        // that is still running: overwriting a busy image fails with ETXTBSY,
+        // while unlinking and recreating always works.
+        std::filesystem::remove(outPath, ec);
+        std::ofstream out{outPath, std::ios::binary | std::ios::trunc};
+        out.write(packed.data(), static_cast<std::streamsize>(packed.size()));
+        if (!out) {
+            std::println(std::cerr, "error: failed to write file \"{}\"", outPath.string());
+            return 1;
+        }
+    }
+    if (!mbun::platform::make_executable(outPath)) {
+        std::println(std::cerr, "error: could not mark \"{}\" executable", outPath.string());
+        return 1;
+    }
+
+    const std::vector<BuildEmitted> emitted{
+        {outPath.string(), build_display_path(outPath, flags.outdir, flags.outfile), packed,
+         "compiled executable"}};
+    print_build_listing(emitted, moduleCount, start);
+    return 0;
+}
+
 int run_build(std::span<const std::string_view> buildArgs) {
     const auto start{std::chrono::steady_clock::now()};
     auto flags{mbun::cli::parse_build(buildArgs)};
@@ -1513,6 +1596,15 @@ int run_build(std::span<const std::string_view> buildArgs) {
         std::println(std::cerr, "error: Must use --outdir when specifying more than one entry point.");
         return 1;
     }
+    // ref: bun src/cli/build_command.rs — `--compile` links exactly one entry
+    // point into one executable, so more than one is rejected up front.
+    if (flags.compile && flags.entryPoints.size() > 1) {
+        std::println(std::cerr,
+                     "error: Cannot use --compile with multiple entry points. "
+                     "Only one entry point is supported.");
+        return 1;
+    }
+
     // `--no-bundle`: transpile each entry point on its own and emit it verbatim —
     // no resolution, no graph, no chunk. This is bun's `transform_only` build
     // (ref: src/cli/build_command.rs; the flag is documented as "Transpile file
@@ -1617,6 +1709,14 @@ int run_build(std::span<const std::string_view> buildArgs) {
             if (!built->code.empty() && built->code.back() != '\n') built->code.push_back('\n');
             built->code.append(flags.footer);
             built->code.push_back('\n');
+        }
+
+        // `--compile` never writes a .js chunk: the bundle becomes the payload of
+        // a single-file executable. Checked before the stdout path because a
+        // compiled build has a default output name even with no --outfile.
+        if (flags.compile) {
+            return emit_compiled_executable(flags, entryPoint, std::move(built->code), moduleCount,
+                                            start);
         }
 
         // ref: bun src/cli/build_command.rs :769-780 — with neither --outfile nor
@@ -2090,6 +2190,79 @@ bool is_skippable_run_flag(std::string_view a) {
 // ref: cli/mod.rs:854-863 `is_node` — a plain suffix test on the WHOLE argv[0]
 // (NOT the basename), ported verbatim including that looseness.
 bool is_node_argv0(std::string_view argv0) { return argv0.ends_with("node"); }
+
+// ── `--compile`d executables ────────────────────────────────────────────────
+// A standalone executable is this same binary with a program appended (see
+// emit_compiled_executable / mbun.bundler.standalone_exe). Everything below runs
+// before ANY flag parsing, because a compiled program owns its whole command
+// line: `./myapp --help` must reach the program, not mbun's CLI.
+// ref: bun src/cli/mod.rs, which checks StandaloneModuleGraph.fromExecutable()
+// first and dispatches straight to the run path when one is found.
+
+// The program embedded in the running executable, or nullopt for a plain mbun.
+//
+// EVERY mbun start runs this, and the mbun image is hundreds of megabytes, so it
+// reads the 24-byte trailer FIRST and touches the payload only once the magic
+// matches. Slurping the whole image to answer "am I compiled?" made every process
+// start pay a full-image read, which is a measurable stall for anything that
+// spawns mbun in a loop (test/regression/issue/32492 spawns 384 builds).
+std::optional<mbun::bundler::standalone_exe::Program> embedded_program() {
+    namespace exe = mbun::bundler::standalone_exe;
+    const std::optional<std::string> trailer{mbun::platform::read_self_tail(exe::TRAILER_SIZE)};
+    if (!trailer) return std::nullopt;
+    const std::optional<exe::TrailerSizes> sizes{exe::read_trailer(*trailer)};
+    if (!sizes) return std::nullopt;  // a plain mbun stops here, one pread in
+
+    const std::uint64_t payloadSize{sizes->programSize + sizes->metadataSize};
+    const std::optional<std::string> payload{
+        mbun::platform::read_self_tail(static_cast<std::size_t>(payloadSize) + exe::TRAILER_SIZE)};
+    if (!payload) return std::nullopt;
+    return exe::read_payload(
+        std::string_view{*payload}.substr(0, static_cast<std::size_t>(payloadSize)), *sizes);
+}
+
+// Run an embedded program. `args` is everything after argv[0].
+int run_embedded_program(const mbun::bundler::standalone_exe::Program& program,
+                         std::string_view argv0, std::span<const std::string_view> args) {
+    const std::string virtualPath{
+        std::string{mbun::bundler::standalone_graph::public_base_path_with_root(
+            mbun::bundler::standalone_graph::OperatingSystem::Posix)}
+        + program.entryName};
+
+    // argv is ["bun", script, ...user args]: the baked exec argv is deliberately
+    // absent, so `./app` with no arguments reports argv.length === 2. argv[0] is
+    // the literal runtime name rather than the executable's own path — a compiled
+    // program is "bun running an embedded script", and its own path is still
+    // reachable through process.execPath.
+    // ref: test/bundler/compile-argv.test.ts "CompileExecArgvNoLeak", which
+    // asserts both argv.length === 2 and argv[0] === "bun".
+    (void)argv0;
+    std::vector<std::string> jsArgv{"bun", virtualPath};
+    jsArgv.reserve(args.size() + 2);
+    for (const std::string_view a : args) jsArgv.emplace_back(a);
+    mbun::jsc::runtime::set_argv(std::move(jsArgv));
+
+    // BUN_OPTIONS carries runtime flags for any bun invocation, a compiled
+    // executable included; they join the baked flags in execArgv and, like them,
+    // never appear in argv. ref: bun src/cli/mod.rs, which splices BUN_OPTIONS
+    // into the argument list before parsing.
+    std::vector<std::string> execArgv{program.execArgv};
+    if (const char* bunOptions{std::getenv("BUN_OPTIONS")}; bunOptions != nullptr) {
+        for (const auto part : std::views::split(std::string_view{bunOptions}, ' ')) {
+            const std::string_view token{part.begin(), part.end()};
+            if (!token.empty()) execArgv.emplace_back(token);
+        }
+    }
+    mbun::jsc::runtime::set_exec_argv(std::move(execArgv));
+    // `--no-compile-autoload-dotenv` is the one autoload switch with a runtime
+    // effect today: the others select config files mbun's compiled programs do
+    // not consult (the bundle is already linked, so tsconfig/package.json cannot
+    // change it, and bunfig only configures commands a compiled program has none
+    // of). ref: test/bundler/bundler_compile_autoload.test.ts.
+    if (!program.autoloadDotenv) mbun::jsc::runtime::set_disable_env_files(true);
+
+    return mbun::jsc::runtime::run_source(virtualPath, program.code);
+}
 
 // Port of run_command.rs:2981-3040 `exec_as_if_node` (cli/mod.rs:952-958 routes
 // here when argv[0] is `node`). This is how EVERY `#!/usr/bin/env node` shebang

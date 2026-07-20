@@ -70,20 +70,14 @@ inline std::size_t crypto_hmac_block_size(const std::string& key) {
     return 0;
 }
 
-// Cryptographic RNG. std::random_device pulls the OS entropy source (getrandom /
-// /dev/urandom on POSIX, RtlGenRandom on Windows) — no vendored lib, no host path.
+// Cryptographic RNG. mbun::crypto::fill_random seeds ChaCha20 (RFC 8439) from
+// std::random_device — the OS entropy source (getrandom / /dev/urandom on POSIX,
+// RtlGenRandom on Windows) — with a fresh per-call key, so no vendored lib and no
+// host path. Draining random_device 4 bytes at a time (its whole 32-bit range per
+// call) cost one OS entropy read per word: filling 1 MB took ~450 ms and made
+// crypto.getRandomValues() the dominant cost of large-buffer body tests.
 inline void crypto_fill_random(std::uint8_t* p, std::size_t n) {
-    static thread_local std::random_device rd;
-    std::size_t i{0};
-    while (i + 4 <= n) {
-        std::uint32_t r{rd()};
-        std::memcpy(p + i, &r, 4);
-        i += 4;
-    }
-    if (i < n) {
-        std::uint32_t r{rd()};
-        for (std::size_t j{0}; i < n; ++i, ++j) { p[i] = static_cast<std::uint8_t>(r >> (8 * j)); }
-    }
+    mbun::crypto::fill_random(p, n);
 }
 
 // __mbunCryptoNative.digest(algorithm, data, outputLength?) → Uint8Array raw

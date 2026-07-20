@@ -6,6 +6,13 @@ void set_argv(std::vector<std::string> argv) {
     gArgv = std::move(argv);
 }
 
+// Set process.execArgv — the runtime's own flags, never part of process.argv.
+// Only a `--compile`d executable has any: it carries whatever
+// `--compile-exec-argv` baked in. Call before the runtime is first touched.
+void set_exec_argv(std::vector<std::string> execArgv) {
+    gExecArgv = std::move(execArgv);
+}
+
 // Disable auto-loading of default .env files (bun `--no-env-file`).
 void set_disable_env_files(bool v) { gDisableEnvFiles = v; }
 
@@ -146,6 +153,14 @@ int run_file(const std::string& path) {
     std::filesystem::path abs{std::filesystem::absolute(path, ec)};
     std::string absPath{ec ? path : abs.lexically_normal().string()};
     return Runtime::instance().run_script(absPath, *src);
+}
+
+// Run already-loaded JS source as the process entry point, under `path`. Used by
+// a `--compile`d executable, whose program lives inside the binary rather than on
+// disk: `path` is the virtual `/$bunfs/root/<entry>` name the embedded graph is
+// exposed under, and it is what stack traces and import.meta report.
+int run_source(const std::string& path, const std::string& source) {
+    return Runtime::instance().run_script(path, source);
 }
 
 // `mbun exec <script>`: run a shell script through mbun's shell interpreter on the

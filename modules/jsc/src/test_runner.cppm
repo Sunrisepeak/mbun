@@ -801,6 +801,20 @@ inline constexpr std::string_view HARNESS = R"JS(
   // keep the chain reachable on the focused registrar too.
   onlyScope.each = describe.each; onlyScope.skip = skipScope; onlyScope.todo = skipScope;
   onlyScope.concurrent = onlyScope; onlyScope.serial = onlyScope; onlyScope.only = onlyScope;
+  // The chain is bidirectional: describe.skipIf(c) hands back a registrar, and
+  // that registrar must still accept the remaining modifiers —
+  // `describe.skipIf(!isWindows).concurrent(...)` is how the corpus writes a
+  // platform-gated concurrent suite (test/bundler/compile-windows-metadata.test.ts).
+  // Every modifier on a skipped/todo scope stays skipped/todo: nothing can
+  // un-skip it.
+  for (const scope of [skipScope, todoScope]) {
+    // .each rows registered through a skipped scope stay skipped, so the rows are
+    // expanded against `scope` rather than the plain describe.
+    scope.each = function (table) { return function (name, fn) { (Array.isArray(table) ? table : []).forEach((row, idx) => { const args = Array.isArray(row) ? row : [row]; scope(interpName(name, args, idx), function () { return fn.apply(null, args); }); }); }; };
+    scope.skip = skipScope; scope.todo = todoScope;
+    scope.only = scope; scope.concurrent = scope; scope.serial = scope;
+    scope.skipIf = () => scope; scope.todoIf = () => scope; scope.if = () => scope;
+  }
 
   function beforeEach(fn) { S.current.beforeEach.push(fn); }
   function afterEach(fn) { S.current.afterEach.push(fn); }

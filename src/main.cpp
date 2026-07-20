@@ -38,6 +38,17 @@ int main(int argc, char* argv[]) {
         if (std::string_view{argv[i]} == "--no-addons") mbun::platform::set_no_addons_env();
     }
 
+    // ── a `bun build --compile` executable → run the embedded program.
+    //    Must come before EVERYTHING else, including the node-emulation check and
+    //    the global run-flag strip: a compiled program owns its whole command
+    //    line, so `./myapp --silent run` passes those through untouched.
+    //    ref: cli/mod.rs, which consults StandaloneModuleGraph.fromExecutable()
+    //    before any argument parsing.
+    if (const auto embedded{embedded_program()}) {
+        std::vector<std::string_view> embeddedArgs(argv + 1, argv + argc);
+        return run_embedded_program(*embedded, argc > 0 ? argv[0] : "mbun", embeddedArgs);
+    }
+
     // ── argv0 == `node` → node emulation (cli/mod.rs:952 → run_command.rs:2981).
     //    Must come before ANY bun-flag parsing: node's flags are not bun's.
     if (argc > 0 && is_node_argv0(argv[0])) {
