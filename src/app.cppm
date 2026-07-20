@@ -2274,9 +2274,39 @@ int run_embedded_program(const mbun::bundler::standalone_exe::Program& program,
 // (run_command.rs:3007-3028) and booted regardless of extension or shebang.
 // Unknown flags must not warn (cli/mod.rs:953-955 clears
 // WARN_ON_UNRECOGNIZED_FLAG) — node-mode must not reject node's own flags.
+// A node runtime flag whose value is a SEPARATE token (`--flag value`), not
+// `--flag=value`. Node's V8/bootstrap option table decides this per flag; the
+// corpus re-spawns `process.execPath` with the space form for these, so unless
+// we consume the value token too it is mistaken for the script to run (the
+// `test-*.js` re-exec cluster: `--snapshot-blob X`, `-r X`, `--test-reporter X`).
+// Everything not listed here is treated as a boolean flag (single token).
+bool node_flag_takes_value(std::string_view flag) {
+    static constexpr std::string_view kValued[]{
+        "-r", "--require", "--snapshot-blob", "--build-snapshot-config",
+        "--test-reporter", "--test-reporter-destination", "--test-name-pattern",
+        "--test-skip-pattern", "--test-shard", "--test-concurrency",
+        "--heap-prof-interval", "--heap-prof-dir", "--heap-prof-name",
+        "--cpu-prof-interval", "--cpu-prof-dir", "--cpu-prof-name",
+        "--trace-event-categories", "--trace-event-file-pattern",
+        "--localstorage-file", "--env-file", "--env-file-if-exists",
+        "--max-old-space-size", "--max-semi-space-size", "--stack-size",
+        "--stack-trace-limit", "--v8-pool-size", "--title", "--icu-data-dir",
+        "--openssl-config", "--tls-cipher-list", "--tls-keylog",
+        "--heapsnapshot-signal", "--heapsnapshot-near-heap-limit",
+        "--diagnostic-dir", "--redirect-warnings", "--disk-cache-dir",
+        "--experimental-policy", "--policy-integrity", "--conditions",
+        "-C", "--report-dir", "--report-directory", "--report-filename",
+        "--report-signal", "--secure-heap", "--secure-heap-min", "--dns-result-order"};
+    for (std::string_view f : kValued) {
+        if (flag == f) return true;
+    }
+    return false;
+}
+
 int exec_as_if_node(std::span<const std::string_view> args) {
     mbun::cli::run::set_pretend_to_be_node(true);
 
+    std::vector<std::string> preloads{};
     std::size_t i{0};
     for (; i < args.size(); ++i) {
         const std::string_view a{args[i]};
@@ -2301,12 +2331,34 @@ int exec_as_if_node(std::span<const std::string_view> args) {
             return 0;
         }
         if (!a.starts_with("-") || a == "-") break;  // first positional == the script
+        // `--require=x` / `-r x` / `--require x`: preload a module before the
+        // entry point, the same slot bunfig `preload` uses. run_command.rs feeds
+        // these through the module loader; set_preloads is the equivalent hook.
+        if (a == "--require" || a == "-r") {
+            if (i + 1 < args.size()) preloads.emplace_back(args[++i]);
+            continue;
+        }
+        if (a.starts_with("--require=")) { preloads.emplace_back(a.substr(10)); continue; }
+        if (a.starts_with("-r=")) { preloads.emplace_back(a.substr(3)); continue; }
+        // `--env-file[=X]` loads a dotenv file (run_command.rs:2581 path).
+        if (a == "--env-file" || a == "--env-file-if-exists") {
+            if (i + 1 < args.size()) mbun::jsc::runtime::add_env_file(std::string{args[++i]});
+            continue;
+        }
+        if (a.starts_with("--env-file=") || a.starts_with("--env-file-if-exists=")) {
+            mbun::jsc::runtime::add_env_file(std::string{a.substr(a.find('=') + 1)});
+            continue;
+        }
         // Any other leading `-…` is a node flag mbun does not model; drop it
-        // rather than mistake it for the script name.
-        // GAP: a two-token node flag (`--require x`) eats its value here and the
-        // value would be taken as the script. node accepts `--require=x` too, and
-        // nothing currently exercised hits the two-token form.
+        // (its `=value` rides along in the same token). A separate value token is
+        // skipped only for flags known to take one, so boolean flags do not
+        // accidentally swallow the script path.
+        if (a.find('=') == std::string_view::npos && node_flag_takes_value(a) &&
+            i + 1 < args.size()) {
+            ++i;  // consume the value token
+        }
     }
+    if (!preloads.empty()) mbun::jsc::runtime::set_preloads(preloads);
 
     if (i >= args.size()) {
         // run_command.rs:3046-3049 — wording is verbatim from the reference.

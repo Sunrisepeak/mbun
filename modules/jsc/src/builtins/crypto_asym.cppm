@@ -39,6 +39,24 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     RSA_X931_PADDING: 5, RSA_SSLV23_PADDING: 2,
   });
 
+  // ---- FIPS mode (non-FIPS OpenSSL build) ----
+  // node exposes getFips()/setFips()/`fips`. mbun links a stock (non-FIPS)
+  // OpenSSL, so FIPS is always off; enabling it is the documented hard error.
+  // ref: node lib/internal/crypto/util.js getFipsCrypto/setFipsCrypto.
+  if (typeof C.getFips !== "function") {
+    C.getFips = () => 0;
+    C.setFips = (v) => {
+      if (v) {
+        const e = new Error("Cannot set FIPS mode in a non-FIPS build.");
+        e.code = "ERR_CRYPTO_FIPS_UNAVAILABLE";
+        throw e;
+      }
+    };
+    Object.defineProperty(C, "fips", {
+      get: () => false, set: (v) => C.setFips(v), enumerable: true, configurable: true,
+    });
+  }
+
   const isView = (v) => ArrayBuffer.isView(v);
   const toBuf = (v, enc) => {
     if (v == null) return Buffer.alloc(0);

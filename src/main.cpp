@@ -128,6 +128,33 @@ int main(int argc, char* argv[]) {
         args.erase(args.begin());
     }
 
+    // Node-style re-exec: a leading `--flag` that is neither a bun run-flag nor
+    // an eval flag, followed later by a positional entry point, is how the Node
+    // corpus re-spawns `process.execPath` (`mbun --expose-gc file.js`,
+    // `mbun --snapshot-blob b --build-snapshot file.js`, `mbun -r m file.js`).
+    // bun's own CLI would reject the unknown flag; node-emulation (which already
+    // ignores unmodelled node flags and resolves the first positional as the
+    // script) is the correct handler, so route there instead of taking the flag
+    // itself as the run target ("Script not found \"--expose-gc\"").
+    if (!args.empty() && args[0].starts_with("-") && args[0] != "-" &&
+        args[0] != "-e" && args[0] != "--eval" && args[0] != "-p" && args[0] != "--print") {
+        bool hasPositional{false};
+        for (std::size_t k{0}; k < args.size(); ++k) {
+            if (!args[k].starts_with("-")) {
+                // Skip the value token of a known valued node flag so its value
+                // is not mistaken for the positional entry point.
+                if (k > 0 && args[k - 1].starts_with("-") &&
+                    args[k - 1].find('=') == std::string_view::npos &&
+                    node_flag_takes_value(args[k - 1])) {
+                    continue;
+                }
+                hasPositional = true;
+                break;
+            }
+        }
+        if (hasPositional) return exec_as_if_node(args);
+    }
+
     // `mbun run <script> [args...]` and bare `mbun <script.(m)js> [args...]`
     // execute a JS file through the JSC runtime with the Bun.* API in scope.
     if (!args.empty()) {
