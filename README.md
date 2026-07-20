@@ -120,8 +120,8 @@ Source-snapshot measurements (2026-07-21) against the upstream corpora pinned as
 
 | Target | Result | Rate |
 | --- | ---: | ---: |
-| Bun native test corpus (`compat/bun/test`) | 874 / 1,902 files fully green | 46.0% |
-| Bun native tests, test level | 31,818 pass / 17,501 fail of 52,175 run | 60.9% |
+| Bun native test corpus (`compat/bun/test`) | 880 / 1,902 files fully green | 46.3% |
+| Bun native tests, test level | 32,263 pass / 17,315 fail of 52,677 run | 61.2% |
 | Node.js native tests (`compat/node/test/parallel`) | 1,811 / 4,433 files pass (direct execution) | 40.9% |
 | Elysia test suite | 1,522 pass / 3 fail | 99.8% |
 
