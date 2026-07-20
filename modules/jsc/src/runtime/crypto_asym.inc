@@ -757,8 +757,31 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_okp_derive_host,
     return JSC::JSValue::encode(toJS(global, static_cast<JSValueRef>(asym_u8(ctx, sec))));
 }
 
+// Whether an EVP_PKEY carries a private component. Needed so createPrivateKey
+// rejects public-only material (the loader is intent-agnostic and will happily
+// parse an RSAPublicKey as a pkey). ref: node prepareAsymmetricKey rejects a
+// public key handed to createPrivateKey with a decode error.
+inline bool asym_has_private(EVP_PKEY* pkey) {
+    const int base{EVP_PKEY_base_id(pkey)};
+    const char* bnParam{(base == EVP_PKEY_RSA || base == EVP_PKEY_RSA_PSS) ? OSSL_PKEY_PARAM_RSA_D
+                        : (base == EVP_PKEY_EC)                            ? OSSL_PKEY_PARAM_PRIV_KEY
+                                                                           : nullptr};
+    if (bnParam != nullptr) {
+        BIGNUM* bn{nullptr};
+        if (EVP_PKEY_get_bn_param(pkey, bnParam, &bn) > 0 && bn != nullptr) {
+            BN_free(bn);
+            return true;
+        }
+        return false;
+    }
+    // Ed/X curves: the private key is an opaque octet string param.
+    std::size_t len{0};
+    return EVP_PKEY_get_octet_string_param(pkey, OSSL_PKEY_PARAM_PRIV_KEY, nullptr, 0, &len) > 0 &&
+           len > 0;
+}
+
 // __mbunCryptoAsymNative.keyType(key, passphrase, isPublic) → { type, curve,
-//   modulusLength } describing an asymmetric key (createPublicKey/PrivateKey).
+//   modulusLength, private } describing an asymmetric key (createPublicKey/PrivateKey).
 JSC_DEFINE_HOST_FUNCTION(node_asym_key_type_host,
                          (JSC::JSGlobalObject* global, JSC::CallFrame* frame)) {
     JSContextRef ctx{toRef(global)};
@@ -787,6 +810,7 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_key_type_host,
     }
     JSObjectRef obj{JSObjectMake(ctx, nullptr, nullptr)};
     set_prop(ctx, obj, "type", make_string(ctx, type));
+    set_prop(ctx, obj, "private", JSValueMakeBoolean(ctx, asym_has_private(pkey.get())));
     if (base == EVP_PKEY_EC) {
         char gname[80];
         std::size_t glen{0};
@@ -797,6 +821,17 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_key_type_host,
     } else if (base == EVP_PKEY_RSA || base == EVP_PKEY_RSA_PSS) {
         set_prop(ctx, obj, "modulusLength",
                  JSValueMakeNumber(ctx, static_cast<double>(EVP_PKEY_get_bits(pkey.get()))));
+        // publicExponent as big-endian bytes; the JS layer materializes the
+        // node-visible BigInt (asymmetricKeyDetails.publicExponent). Inlined
+        // (asym_set_bn_prop is defined further down this TU).
+        BIGNUM* e{nullptr};
+        if (EVP_PKEY_get_bn_param(pkey.get(), OSSL_PKEY_PARAM_RSA_E, &e) > 0 && e != nullptr) {
+            const int n{BN_num_bytes(e)};
+            std::vector<std::uint8_t> eb(n > 0 ? static_cast<std::size_t>(n) : 0, 0);
+            if (n > 0) { BN_bn2binpad(e, eb.data(), n); }
+            set_prop(ctx, obj, "publicExponent", static_cast<JSValueRef>(asym_u8(ctx, eb)));
+        }
+        if (e != nullptr) { BN_free(e); }
     }
     return JSC::JSValue::encode(toJS(global, static_cast<JSValueRef>(obj)));
 }
