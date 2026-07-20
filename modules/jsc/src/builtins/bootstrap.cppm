@@ -2868,26 +2868,33 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   const zB64 = (u8) => { let s = ""; for (let i = 0; i < u8.length; i += 8192) s += String.fromCharCode.apply(null, u8.subarray(i, Math.min(i + 8192, u8.length))); return G.btoa(s); };
   const zErr = (e) => { const err = e instanceof Error ? e : new Error(String(e)); err.code = "Z_DATA_ERROR"; err.errno = -3; return err; };
   const zNum = (opts, k, d) => opts && typeof opts[k] === "number" ? opts[k] : d;
+  // node-style ERR_INVALID_ARG_TYPE builder (property vs argument by '.' in name).
+  const zFmtRecv = (v) => { if (v === null) return "null"; if (v === undefined) return "undefined"; const t = typeof v; if (t === "string") { let s = v; if (s.length > 25) s = s.slice(0, 25) + "..."; return "type string ('" + s + "')"; } if (t === "number" || t === "boolean" || t === "bigint") return "type " + t + " (" + String(v) + ")"; if (t === "function") return v.name ? "function " + v.name : "an instance of Function"; if (t === "object") { const cn = v.constructor && v.constructor.name; return "an instance of " + (cn || "Object"); } return "type " + t; };
+  const zArgType = (name, expected, v) => { const kind = name.indexOf(".") >= 0 ? "property" : "argument"; const e = new TypeError('The "' + name + '" ' + kind + " must be " + expected + ". Received " + zFmtRecv(v)); e.code = "ERR_INVALID_ARG_TYPE"; return e; };
+  // convenience-method info option: return { buffer, engine } where engine is an
+  // instance of the matching streaming class (zlib.Gzip/Inflate and friends).
+  const zEngine = (name) => { const C = (M["zlib"] || {})[name]; return C ? Object.create(C.prototype) : {}; };
+  const zInfo = (out, opts, engName) => (opts && opts.info) ? { buffer: out, engine: zEngine(engName) } : out;
   // node enforces kMaxLength across ALL codecs (lib/zlib.js → ERR_BUFFER_TOO_LARGE).
   const zCap = (out, opts) => { const maxLen = opts && typeof opts.maxOutputLength === "number" ? opts.maxOutputLength : (M.buffer && M.buffer.kMaxLength); if (maxLen && out.length > maxLen) { const e = new RangeError("Cannot create a Buffer larger than " + maxLen + " bytes"); e.code = "ERR_BUFFER_TOO_LARGE"; throw e; } return out; };
   // Bytes cross as a Uint8Array, not base64: the base64 bridge cost ~6x the
   // payload in transient strings per crossing and a 150 MB deflateRawSync was
   // OOM-killed. ZN.compress/decompress answer a Uint8Array for a typed-array
   // input (base64 string in, base64 string out is still supported).
-  const zSync = (op, fmt) => (data, opts) => { const level = zNum(opts, "level", -1), wbits = zNum(opts, "windowBits", 15), memLevel = zNum(opts, "memLevel", 8), strategy = zNum(opts, "strategy", 0); const inp = zToU8(data); let r; try { r = op === "c" ? ZN.compress(inp, fmt, level, wbits, memLevel, strategy) : ZN.decompress(inp, fmt, wbits); } catch (e) { throw zErr(e); } const out = typeof r === "string" ? G.Buffer.from(r, "base64") : G.Buffer.from(r.buffer, r.byteOffset, r.byteLength);const maxLen = opts && typeof opts.maxOutputLength === "number" ? opts.maxOutputLength : (M.buffer && M.buffer.kMaxLength); if (op === "d" && maxLen && out.length > maxLen) { const e = new RangeError("Cannot create a Buffer larger than " + maxLen + " bytes"); e.code = "ERR_BUFFER_TOO_LARGE"; throw e; } return out; };
-  const zAsync = (sync) => (data, opts, cb) => { if (typeof opts === "function") { cb = opts; opts = undefined; } if (typeof cb !== "function") throw new TypeError("The callback argument must be of type function"); G.queueMicrotask(() => { try { cb(null, sync(data, opts)); } catch (e) { cb(e); } }); };
-  const deflateSync = zSync("c", "zlib"), inflateSync = zSync("d", "zlib"), gzipSync = zSync("c", "gzip"), gunzipSync = zSync("d", "gzip"), deflateRawSync = zSync("c", "raw"), inflateRawSync = zSync("d", "raw"), unzipSync = zSync("d", "auto");
+  const zSync = (op, fmt, engName) => (data, opts) => { const level = zNum(opts, "level", -1), wbits = zNum(opts, "windowBits", 15), memLevel = zNum(opts, "memLevel", 8), strategy = zNum(opts, "strategy", 0); const inp = zToU8(data); let r; try { r = op === "c" ? ZN.compress(inp, fmt, level, wbits, memLevel, strategy) : ZN.decompress(inp, fmt, wbits); } catch (e) { throw zErr(e); } const out = typeof r === "string" ? G.Buffer.from(r, "base64") : G.Buffer.from(r.buffer, r.byteOffset, r.byteLength);const maxLen = opts && typeof opts.maxOutputLength === "number" ? opts.maxOutputLength : (M.buffer && M.buffer.kMaxLength); if (op === "d" && maxLen && out.length > maxLen) { const e = new RangeError("Cannot create a Buffer larger than " + maxLen + " bytes"); e.code = "ERR_BUFFER_TOO_LARGE"; throw e; } return zInfo(out, opts, engName); };
+  const zAsync = (sync) => (data, opts, cb) => { if (typeof opts === "function") { cb = opts; opts = undefined; } if (typeof cb !== "function") throw zArgType("callback", "of type function", cb); G.queueMicrotask(() => { try { cb(null, sync(data, opts)); } catch (e) { cb(e); } }); };
+  const deflateSync = zSync("c", "zlib", "Deflate"), inflateSync = zSync("d", "zlib", "Inflate"), gzipSync = zSync("c", "gzip", "Gzip"), gunzipSync = zSync("d", "gzip", "Gunzip"), deflateRawSync = zSync("c", "raw", "DeflateRaw"), inflateRawSync = zSync("d", "raw", "InflateRaw"), unzipSync = zSync("d", "auto", "Unzip");
   // brotli (native BrotliEncoder/Decoder via __mbunZlibNative). node forwards
   // quality/lgwin/mode through opts.params keyed by BROTLI_PARAM_* (MODE=0,
   // QUALITY=1, LGWIN=2). All return Buffer.
   const brP = (opts) => { const p = (opts && opts.params) || {}; return [typeof p[1] === "number" ? p[1] : -1, typeof p[2] === "number" ? p[2] : 0, typeof p[0] === "number" ? p[0] : 0]; };
-  const brotliCompressSync = (data, opts) => { const q = brP(opts); let r; try { r = ZN.brotliCompress(zB64(zToU8(data)), q[0], q[1], q[2]); } catch (e) { throw zErr(e); } return G.Buffer.from(r, "base64"); };
-  const brotliDecompressSync = (data, opts) => { let r; try { r = ZN.brotliDecompress(zB64(zToU8(data))); } catch (e) { throw zErr(e); } return zCap(G.Buffer.from(r, "base64"), opts); };
+  const brotliCompressSync = (data, opts) => { const q = brP(opts); let r; try { r = ZN.brotliCompress(zB64(zToU8(data)), q[0], q[1], q[2]); } catch (e) { throw zErr(e); } return zInfo(G.Buffer.from(r, "base64"), opts, "BrotliCompress"); };
+  const brotliDecompressSync = (data, opts) => { let r; try { r = ZN.brotliDecompress(zB64(zToU8(data))); } catch (e) { throw zErr(e); } return zInfo(zCap(G.Buffer.from(r, "base64"), opts), opts, "BrotliDecompress"); };
   // zstd (native ZSTD_compress/decompress). level via opts.level or
   // opts.params[ZSTD_c_compressionLevel=100]; default 3.
   const zstdLvl = (opts) => { const l = zNum(opts, "level", -2); if (l !== -2) return l; const p = opts && opts.params; return p && typeof p[100] === "number" ? p[100] : 3; };
-  const zstdCompressSync = (data, opts) => { let r; try { r = ZN.zstdCompress(zB64(zToU8(data)), zstdLvl(opts)); } catch (e) { throw zErr(e); } return G.Buffer.from(r, "base64"); };
-  const zstdDecompressSync = (data, opts) => { let r; try { r = ZN.zstdDecompress(zB64(zToU8(data))); } catch (e) { throw zErr(e); } return zCap(G.Buffer.from(r, "base64"), opts); };
+  const zstdCompressSync = (data, opts) => { let r; try { r = ZN.zstdCompress(zB64(zToU8(data)), zstdLvl(opts)); } catch (e) { throw zErr(e); } return zInfo(G.Buffer.from(r, "base64"), opts, "ZstdCompress"); };
+  const zstdDecompressSync = (data, opts) => { let r; try { r = ZN.zstdDecompress(zB64(zToU8(data))); } catch (e) { throw zErr(e); } return zInfo(zCap(G.Buffer.from(r, "base64"), opts), opts, "ZstdDecompress"); };
   // DEFERRED: streaming Transform classes (createGzip/createBrotliCompress/…,
   // and the zlib.Deflate/Brotli/Zstd class hierarchy). Real chunked streaming
   // needs the node threadpool _handle lifecycle AND a bounded native inflate
@@ -2903,7 +2910,23 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     BROTLI_MIN_INPUT_BLOCK_BITS: 16, BROTLI_MAX_INPUT_BLOCK_BITS: 24,
     BROTLI_DECODER_RESULT_ERROR: 0, BROTLI_DECODER_RESULT_SUCCESS: 1, BROTLI_DECODER_RESULT_NEEDS_MORE_INPUT: 2, BROTLI_DECODER_RESULT_NEEDS_MORE_OUTPUT: 3,
     ZSTD_e_continue: 0, ZSTD_e_flush: 1, ZSTD_e_end: 2, ZSTD_c_compressionLevel: 100, ZSTD_d_windowLogMax: 100, ZSTD_CLEVEL_DEFAULT: 3, ZSTD_MIN_CLEVEL: -131072, ZSTD_MAX_CLEVEL: 22 };
-  def(["zlib"], { deflateSync, inflateSync, gzipSync, gunzipSync, deflateRawSync, inflateRawSync, unzipSync, deflate: zAsync(deflateSync), inflate: zAsync(inflateSync), gzip: zAsync(gzipSync), gunzip: zAsync(gunzipSync), deflateRaw: zAsync(deflateRawSync), inflateRaw: zAsync(inflateRawSync), unzip: zAsync(unzipSync), crc32: (data, v) => ZN.crc32(zB64(zToU8(data)), (v || 0) >>> 0) >>> 0, createGzip: () => new Transform(), createGunzip: () => new Transform(), createDeflate: () => new Transform(), createInflate: () => new Transform(), createDeflateRaw: () => new Transform(), createInflateRaw: () => new Transform(), createUnzip: () => new Transform(), brotliCompressSync, brotliDecompressSync, brotliCompress: zAsync(brotliCompressSync), brotliDecompress: zAsync(brotliDecompressSync), zstdCompressSync, zstdDecompressSync, zstdCompress: zAsync(zstdCompressSync), zstdDecompress: zAsync(zstdDecompressSync), createBrotliCompress: () => new Transform(), createBrotliDecompress: () => new Transform(), createZstdCompress: () => new Transform(), createZstdDecompress: () => new Transform(), constants: zConstants, ...zConstants });
+  // node: zlib.codes maps the return codes both ways (name to num and num to
+  // name) and is frozen; zlib.constants is frozen (Z_OK etc. must be immutable).
+  const zCodes = { Z_OK: 0, Z_STREAM_END: 1, Z_NEED_DICT: 2, Z_ERRNO: -1, Z_STREAM_ERROR: -2, Z_DATA_ERROR: -3, Z_MEM_ERROR: -4, Z_BUF_ERROR: -5, Z_VERSION_ERROR: -6 };
+  for (const ck of Object.keys(zCodes)) zCodes[zCodes[ck]] = ck;
+  Object.freeze(zCodes);
+  Object.freeze(zConstants);
+  // crc32: first arg string|ArrayBufferView, optional value a uint32 (node
+  // validateUint32). Bad types throw ERR_INVALID_ARG_TYPE.
+  const zCrc32 = (data, value) => {
+    if (typeof data !== "string" && !ArrayBuffer.isView(data)) throw zArgType("data", "one of type string, Buffer, TypedArray, or DataView", data);
+    if (value === undefined) value = 0;
+    else if (typeof value !== "number") throw zArgType("value", "of type number", value);
+    return ZN.crc32(zB64(zToU8(data)), value >>> 0) >>> 0;
+  };
+  const zlibMod = { deflateSync, inflateSync, gzipSync, gunzipSync, deflateRawSync, inflateRawSync, unzipSync, deflate: zAsync(deflateSync), inflate: zAsync(inflateSync), gzip: zAsync(gzipSync), gunzip: zAsync(gunzipSync), deflateRaw: zAsync(deflateRawSync), inflateRaw: zAsync(inflateRawSync), unzip: zAsync(unzipSync), crc32: zCrc32, createGzip: () => new Transform(), createGunzip: () => new Transform(), createDeflate: () => new Transform(), createInflate: () => new Transform(), createDeflateRaw: () => new Transform(), createInflateRaw: () => new Transform(), createUnzip: () => new Transform(), brotliCompressSync, brotliDecompressSync, brotliCompress: zAsync(brotliCompressSync), brotliDecompress: zAsync(brotliDecompressSync), zstdCompressSync, zstdDecompressSync, zstdCompress: zAsync(zstdCompressSync), zstdDecompress: zAsync(zstdDecompressSync), createBrotliCompress: () => new Transform(), createBrotliDecompress: () => new Transform(), createZstdCompress: () => new Transform(), createZstdDecompress: () => new Transform(), constants: zConstants, ...zConstants };
+  Object.defineProperty(zlibMod, "codes", { value: zCodes, writable: false, enumerable: true, configurable: false });
+  def(["zlib"], zlibMod);
   if (G.Bun && typeof G.Bun.deflateSync === "undefined") {
     // bun semantics: Bun.deflateSync/inflateSync are RAW deflate (zlib.test.js
     // "deflate_with_headers" reaches for node:zlib instead); gzipSync is the

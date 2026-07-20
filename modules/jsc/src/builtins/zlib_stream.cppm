@@ -52,23 +52,54 @@ inline constexpr std::string_view kZlibStreamJS = R"JS(
     return Buffer.from(chunk);
   };
 
-  // node option validation: non-number → TypeError, out-of-range/non-integer →
-  // RangeError, undefined → default (see checkRangeOrGetDefault in lib/zlib.js).
-  const vopt = (opts, name, min, max, def) => {
-    const v = opts ? opts[name] : undefined;
-    if (v === undefined) return def;
-    if (typeof v !== "number") {
-      const e = new TypeError('The "options.' + name + '" property must be of type number. Received ' + (typeof v === "object" ? "an instance of Object" : "type " + typeof v));
-      e.code = "ERR_INVALID_ARG_TYPE";
-      throw e;
-    }
-    if (!Number.isFinite(v) || Math.floor(v) !== v || v < min || v > max) {
-      const e = new RangeError('The value of "options.' + name + '" is out of range. It must be >= ' + min + " and <= " + max + ". Received " + v);
-      e.code = "ERR_OUT_OF_RANGE";
-      throw e;
-    }
+  // node-style option/arg validation, blueprint lib/zlib.js checkRangeOrGetDefault
+  // + internal/errors ERR_INVALID_ARG_TYPE / ERR_OUT_OF_RANGE.
+  //  - undefined/null  → default
+  //  - non-number      → TypeError  ERR_INVALID_ARG_TYPE  (property vs argument
+  //                      chosen by whether `name` contains a '.')
+  //  - ±Infinity       → RangeError "It must be a finite number"
+  //  - out of [min,max]→ RangeError "It must be >= min[ and <= max]"
+  //                      (upper omitted when max === Infinity)
+  const fmtRecv = (v) => {
+    if (v === null) return "null";
+    if (v === undefined) return "undefined";
+    const t = typeof v;
+    if (t === "string") { let s = v; if (s.length > 25) s = s.slice(0, 25) + "..."; return "type string ('" + s + "')"; }
+    if (t === "number" || t === "boolean" || t === "bigint") return "type " + t + " (" + String(v) + ")";
+    if (t === "function") return v.name ? "function " + v.name : "an instance of Function";
+    if (t === "object") { const cn = v.constructor && v.constructor.name; return "an instance of " + (cn || "Object"); }
+    return "type " + t;
+  };
+  const errType = (name, expected, v) => {
+    const kind = name.indexOf(".") >= 0 ? "property" : "argument";
+    const e = new TypeError('The "' + name + '" ' + kind + " must be " + expected + ". Received " + fmtRecv(v));
+    e.code = "ERR_INVALID_ARG_TYPE";
+    return e;
+  };
+  const errRange = (name, rangeMsg, v) => {
+    const e = new RangeError('The value of "' + name + '" is out of range. It must be ' + rangeMsg + ". Received " + String(v));
+    e.code = "ERR_OUT_OF_RANGE";
+    return e;
+  };
+  const rangeStr = (min, max) => max === Infinity ? ">= " + min : ">= " + min + " and <= " + max;
+  const checkNum = (v, name, min, max, def) => {
+    if (v === undefined || v === null) return def;
+    if (typeof v !== "number") throw errType(name, "of type number", v);
+    if (!Number.isFinite(v)) throw errRange(name, "a finite number", v);
+    if (v < min || v > max) throw errRange(name, rangeStr(min, max), v);
     return v;
   };
+  // level & strategy additionally treat NaN as "use default" (node behaviour:
+  // createGzip({level:NaN}) yields _level === Z_DEFAULT_COMPRESSION).
+  const checkLevel = (v, name, min, max, def) => {
+    if (v === undefined || v === null) return def;
+    if (typeof v !== "number") throw errType(name, "of type number", v);
+    if (Number.isNaN(v)) return def;
+    if (!Number.isFinite(v)) throw errRange(name, "a finite number", v);
+    if (v < min || v > max) throw errRange(name, rangeStr(min, max), v);
+    return v;
+  };
+  const vopt = (opts, name, min, max, def) => checkNum(opts ? opts[name] : undefined, "options." + name, min, max, def);
 
   // raw = -mag, zlib = mag, gzip = mag + 16, auto-detect (unzip) = mag + 32.
   const wbits = (fmt, mag, decompress) => {
@@ -102,14 +133,26 @@ inline constexpr std::string_view kZlibStreamJS = R"JS(
   proto._zOpen = function () {
     const c = this._zcfg, o = this._zopts;
     if (c.kind === K_DEFLATE || c.kind === K_INFLATE) {
-      const mag = vopt(o, "windowBits", 8, 15, 15);
-      const level = vopt(o, "level", -1, 9, -1);
-      const memLevel = vopt(o, "memLevel", 1, 9, 8);
-      const strategy = vopt(o, "strategy", 0, 7, 0);
-      return ZN.streamOpen(c.kind, wbits(c.fmt, mag, c.kind === K_INFLATE), level, memLevel, strategy, -1, 0, 0);
+      const isDec = c.kind === K_INFLATE;
+      // gzip requires windowBits >= 9; zlib/raw allow >= 8. On the decompression
+      // side windowBits 0 is special (auto-detect from the stream header).
+      const wbMin = c.fmt === "gzip" ? 9 : 8;
+      const wbRaw = o ? o.windowBits : undefined;
+      const mag = (isDec && wbRaw === 0) ? 15 : checkNum(wbRaw, "options.windowBits", wbMin, 15, 15);
+      const level = checkLevel(o ? o.level : undefined, "options.level", -1, 9, -1);
+      const memLevel = checkNum(o ? o.memLevel : undefined, "options.memLevel", 1, 9, 8);
+      const strategy = checkLevel(o ? o.strategy : undefined, "options.strategy", 0, 4, 0);
+      this._level = level;
+      this._strategy = strategy;
+      return ZN.streamOpen(c.kind, wbits(c.fmt, mag, isDec), level, memLevel, strategy, -1, 0, 0);
     }
     if (c.kind === K_BENC) {
       const p = (o && o.params) || {};
+      // Brotli param values must be numbers or booleans (node coerces booleans).
+      for (const k of Object.keys(p)) {
+        const pv = p[k];
+        if (typeof pv !== "number" && typeof pv !== "boolean") throw errType("options.params[" + k + "]", "of type number", pv);
+      }
       const q = typeof p[1] === "number" ? p[1] : -1;   // BROTLI_PARAM_QUALITY
       const lg = typeof p[2] === "number" ? p[2] : 0;    // BROTLI_PARAM_LGWIN
       const md = typeof p[0] === "number" ? p[0] : 0;    // BROTLI_PARAM_MODE
@@ -133,8 +176,17 @@ inline constexpr std::string_view kZlibStreamJS = R"JS(
     // raw-body reject any stream whose `_decoder` is truthy ("stream encoding
     // should not be set"). Use a private, non-colliding flag name instead.
     this._zIsDecoder = cfg.kind === K_INFLATE || cfg.kind === K_BDEC || cfg.kind === K_ZDEC;
-    this._chunkSize = vopt(opts, "chunkSize", 64, MAXS, 16384);
-    if (opts) vopt(opts, "maxOutputLength", 0, MAXS, undefined);  // validate only
+    this._chunkSize = vopt(opts, "chunkSize", 64, Infinity, 16384);
+    if (opts) {
+      vopt(opts, "maxOutputLength", 0, Infinity, undefined);   // validate only
+      vopt(opts, "flush", 0, 5, 0);                            // Z_NO_FLUSH..Z_BLOCK
+      vopt(opts, "finishFlush", 0, 5, 4);
+      if (opts.dictionary !== undefined && opts.dictionary !== null &&
+          !ArrayBuffer.isView(opts.dictionary) && !(opts.dictionary instanceof ArrayBuffer) &&
+          !(G.SharedArrayBuffer && opts.dictionary instanceof G.SharedArrayBuffer)) {
+        throw errType("options.dictionary", "an instance of Buffer, TypedArray, DataView, or ArrayBuffer", opts.dictionary);
+      }
+    }
     this._bytesWritten = 0;
     this._zEnded = false;
     this._zErrored = false;
@@ -219,12 +271,33 @@ inline constexpr std::string_view kZlibStreamJS = R"JS(
     cb();
   };
 
+  // node's synchronous internal: run the whole buffer through the codec with the
+  // given zlib flush flag and return the concatenated output (used by the sync
+  // convenience helpers and directly by consumers like test-zlib-sync-no-event).
+  proto._processChunk = function (chunk, flushFlag) {
+    const bytes = toBytes(chunk);
+    const out = [];
+    const savedPush = this.push;
+    this.push = function (b) { if (b != null) out.push(Buffer.isBuffer(b) ? b : Buffer.from(b)); return true; };
+    let err;
+    try { err = this._zRun(bytes, flushFlag === 4 ? F_FINISH : F_SYNC); }  // Z_FINISH === 4
+    finally { this.push = savedPush; }
+    if (err) throw err;
+    return out.length === 1 ? out[0] : Buffer.concat(out);
+  };
+
   // mbun's base Transform is a stub whose write()/end() do NOT drive the
   // _transform/_flush pipeline (see bootstrap Writable/Duplex). Implement the
   // pipeline here so writes are compressed/decompressed, output is emitted via
   // Readable.push ('data'), and the readable side ends (push(null) → 'end').
   proto.write = function (chunk, enc, cb) {
     if (typeof enc === "function") { cb = enc; enc = undefined; }
+    // node rejects non-buffer/string chunks synchronously (ERR_INVALID_ARG_TYPE),
+    // it does NOT emit an 'error' event for a bad write argument.
+    if (typeof chunk !== "string" && typeof chunk !== "number" &&
+        !ArrayBuffer.isView(chunk) && !(chunk instanceof ArrayBuffer)) {
+      throw errType("chunk", "of type string or an instance of Buffer, TypedArray, DataView, or ArrayBuffer", chunk);
+    }
     if (this._writableEnded) { if (typeof cb === "function") G.queueMicrotask(cb); return false; }
     const self = this;
     // The write completion callback fires asynchronously, matching node/bun's
@@ -297,6 +370,9 @@ inline constexpr std::string_view kZlibStreamJS = R"JS(
   };
 
   proto.params = function (level, strategy, cb) {
+    // node validates the bare `level`/`strategy` arguments (no "options." prefix).
+    checkNum(level, "level", -1, 9, undefined);
+    checkNum(strategy, "strategy", 0, 4, undefined);
     // Streaming param change: re-open honouring the new level/strategy.
     if (this._zopts) { this._zopts = Object.assign({}, this._zopts, { level: level, strategy: strategy }); }
     if (this._h >= 0) { ZN.streamClose(this._h); this._h = this._zOpen(); }
