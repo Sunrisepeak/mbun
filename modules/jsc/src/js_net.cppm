@@ -1285,6 +1285,17 @@ export constexpr std::string_view kNetJS = R"JS(
     NET.items.add(item);
   };
 
+  // The reactor item is shared by every native server, so it must be retired
+  // once the last one is gone. A member of NET.items counts as "held" work in
+  // process_web's park calculation, so a leaked item makes an otherwise idle
+  // process park for LONG_PARK (60s) per loop iteration instead of exiting --
+  // `Bun.serve(...); server.stop()` looked like a hang (bun exits immediately).
+  const maybeRetireServeReactor = () => {
+    if (!NSRV || !NSRV.item) return;
+    if (NSRV.servers.size !== 0) return;
+    NET.items.delete(NSRV.item);
+    NSRV.item = null;
+  };
 
   function serveNativeImpl(opts, compiledRoutes, hostname, displayHost, wantPort) {
     let lh;
@@ -1412,6 +1423,7 @@ export constexpr std::string_view kNetJS = R"JS(
           // on one of them is aborted if its entry is missing.
           NSRV.servers.delete(serverId);
         }
+        maybeRetireServeReactor();
         return Promise.resolve();
       },
     };
@@ -1569,6 +1581,7 @@ export constexpr std::string_view kNetJS = R"JS(
             try { SN.stop(serverId, false); } catch (e) {}
             if (serveConnections(serverId) === 0) {
               NSRV.servers.delete(serverId);
+              maybeRetireServeReactor();
             }
           }
         });
