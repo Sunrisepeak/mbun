@@ -1186,6 +1186,11 @@ JSC_DEFINE_HOST_FUNCTION(fdn_open_host, (JSC::JSGlobalObject* global, JSC::CallF
     if (flags.find('x') != std::string::npos) o.exclusive = true;
     JSC::JSValue modeV{native_arg(frame, 2)};
     if (modeV && modeV.isNumber()) o.mode = static_cast<std::uint32_t>(modeV.asNumber());
+    // Optional 4th arg: open in non-blocking mode (O_NONBLOCK). Used by the
+    // Bun.file() FIFO reader/writer path (a synchronous runtime cannot block a
+    // fifo open waiting for the peer — FileSink over a named pipe).
+    JSC::JSValue nbV{native_arg(frame, 3)};
+    if (nbV && nbV.toBoolean(global)) o.nonblock = true;
     auto file{io::File::open(std::filesystem::path{path}, o)};
     if (!file) return fd_throw_errno(global, file.error().nativeCode, "open", path);
     // Reuse the lowest free virtual fd (like the OS descriptor table) rather than
@@ -1261,7 +1266,13 @@ JSC_DEFINE_HOST_FUNCTION(fdn_read_host, (JSC::JSGlobalObject* global, JSC::CallF
     std::span<std::byte> out{a->base, a->len};
     auto r{a->pos >= 0 ? a->file->read_at(static_cast<std::uint64_t>(a->pos), out)
                        : a->file->read(out)};
-    if (!r) return fd_throw(global, "EIO: read failed");
+    if (!r) {
+        // A non-blocking fd with no data ready signals backpressure, not a hard
+        // error: report -1 so the JS FIFO reader can retry instead of throwing.
+        if (r.error().code == mbun::core::io::ErrorCode::WouldBlock)
+            return JSC::JSValue::encode(JSC::jsNumber(-1));
+        return fd_throw(global, "EIO: read failed");
+    }
     return JSC::JSValue::encode(JSC::jsNumber(static_cast<double>(*r)));
 }
 
@@ -1271,8 +1282,49 @@ JSC_DEFINE_HOST_FUNCTION(fdn_write_host, (JSC::JSGlobalObject* global, JSC::Call
     std::span<const std::byte> in{a->base, a->len};
     auto r{a->pos >= 0 ? a->file->write_at(static_cast<std::uint64_t>(a->pos), in)
                        : a->file->write(in)};
-    if (!r) return fd_throw(global, "EIO: write failed");
+    if (!r) {
+        // Non-blocking fd whose kernel buffer is full: report -1 (backpressure)
+        // so the JS FileSink buffers the remainder rather than throwing.
+        if (r.error().code == mbun::core::io::ErrorCode::WouldBlock)
+            return JSC::JSValue::encode(JSC::jsNumber(-1));
+        return fd_throw(global, "EIO: write failed");
+    }
     return JSC::JSValue::encode(JSC::jsNumber(static_cast<double>(*r)));
+}
+
+// bun:internal-for-testing createSocketPair() → [readFd, writeFd]. A connected
+// AF_UNIX SOCK_STREAM pair, both non-blocking and adopted into the virtual fd
+// table so FileSink (writer) and the streaming reader can drive real socket
+// backpressure on the single JS thread. POSIX only.
+JSC_DEFINE_HOST_FUNCTION(create_socket_pair_host,
+                         (JSC::JSGlobalObject* global, JSC::CallFrame* frame)) {
+    (void)frame;
+#if defined(_WIN32)
+    return fd_throw(global, "ENOSYS: createSocketPair is not supported on Windows");
+#else
+    int sv[2]{-1, -1};
+    if (::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+        return fd_throw(global, "EMFILE: socketpair failed");
+    }
+    for (int i = 0; i < 2; ++i) {
+        const int fl{::fcntl(sv[i], F_GETFL, 0)};
+        if (fl >= 0) (void)::fcntl(sv[i], F_SETFL, fl | O_NONBLOCK);
+    }
+    auto& tbl{fd_table()};
+    int vfds[2]{-1, -1};
+    for (int i = 0; i < 2; ++i) {
+        int fd{1000};
+        while (tbl.contains(fd)) ++fd;
+        tbl.emplace(fd, mbun::core::io::File::adopt(sv[i]));
+        vfds[i] = fd;
+    }
+    JSC::JSArray* arr{JSC::constructEmptyArray(global, nullptr, 2)};
+    if (arr != nullptr) {
+        arr->putDirectIndex(global, 0, JSC::jsNumber(vfds[0]));
+        arr->putDirectIndex(global, 1, JSC::jsNumber(vfds[1]));
+    }
+    return JSC::JSValue::encode(arr != nullptr ? JSC::JSValue{arr} : JSC::jsUndefined());
+#endif
 }
 
 // node:child_process.spawnSync(file, args, options) → { status, signal, pid,

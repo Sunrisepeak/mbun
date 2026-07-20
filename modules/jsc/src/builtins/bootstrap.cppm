@@ -3564,6 +3564,7 @@ inline constexpr std::string_view kBootstrapJS = R"JS(
     rmdir: (p, a, b) => { const cb = typeof a === "function" ? a : b; try { F.rm(toStr(p), recur(typeof a === "object" ? a : null), true); cb && cb(null); } catch (e) { cb && cb(e); } },
     exists: (p, cb) => { try { cb && cb(F.exists(toStr(p))); } catch (e) { cb && cb(false); } },
     truncate: (p, a, b) => { const cb = typeof a === "function" ? a : b; if (typeof cb === "function") cb(null); },
+    ftruncate: (fd, a, b) => { const cb = typeof a === "function" ? a : b; if (typeof cb === "function") cb(null); },
     open: (p, a, b, c) => { const args = [a, b, c]; const cb = args.reverse().find((x) => typeof x === "function"); try { const fd = globalThis.__mbunFdNative.open(toStr(p), typeof a === "string" ? a : "r", typeof b === "number" ? b : 0o666); cb && cb(null, fd); } catch (e) { cb && cb(e); } },
     close: (fd, cb) => { try { globalThis.__mbunFdNative.close(fd); cb && cb(null); } catch (e) { cb && cb(e); } },
     constants: { F_OK: 0, R_OK: 4, W_OK: 2, X_OK: 1, O_RDONLY: 0, O_WRONLY: 1, O_RDWR: 2, O_CREAT: 64, O_TRUNC: 512,
