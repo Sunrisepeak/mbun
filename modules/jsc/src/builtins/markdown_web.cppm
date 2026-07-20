@@ -427,7 +427,16 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
         const norm = G.__mbunNormalizeBody(init.body);
         const body = norm.body;
         if (norm.contentType && !this.headers.has("content-type")) this.headers.set("content-type", norm.contentType);
-        this._body = (body != null && !isStream(body) && (typeof body === "string" || body instanceof Uint8Array || (body && body._u8))) ? body : undefined;
+        // The `_body` slot is the synchronous raw-body fast path consumed by
+        // fetch(request) (js_net.cppm: `body: input._body`) and clone(). It must
+        // retain every buffer-like body that u8()/consume can replay from a raw
+        // reference, or a Request built from that body fetches EMPTY even though
+        // its `_stream` (and thus req.text()/clone().text()) reads it correctly.
+        // ArrayBuffer / ArrayBuffer views were omitted here, so
+        // `fetch(new Request({ body: <ArrayBuffer> }))` sent no body at all
+        // (js/web/fetch/body-stream reader matrix, issue #15). Streams stay out
+        // (fetch/clone fall back to the `_stream` tee path for those).
+        this._body = (body != null && !isStream(body) && (typeof body === "string" || body instanceof Uint8Array || ArrayBuffer.isView(body) || body instanceof ArrayBuffer || (body && body._u8))) ? body : undefined;
         // PERF: bodyToStream() allocates a ReadableStream and TextEncoder-encodes
         // the whole body on EVERY construction, which dominated `new Request(...)`
         // (js/web/request/request-clone-leak.test.ts builds 18M of them). A string
