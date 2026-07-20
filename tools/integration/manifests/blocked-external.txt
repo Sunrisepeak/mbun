@@ -1,0 +1,29 @@
+# Corpus files that cannot run here for a reason outside the runtime: they need
+# a service, a registry, or a toolchain this environment does not provide, and
+# they express that as a connect that never completes — i.e. as a timeout.
+#
+# A file listed here is classified `blocked-external` INSTEAD OF `timeout`, and
+# ONLY when it times out. It still runs, it is still not a pass, and nothing is
+# verified by it. The point is to stop a bucket named "mbun hangs" from hiding
+# the files where mbun actually hangs: 51 of the 107 timeouts in the 2026-07-20
+# baseline round were of this kind (see issue #4).
+#
+# Rules for this list:
+# - Only add a path after triaging it and naming the missing dependency below.
+# - Never add a file that hangs for a reason inside mbun.
+# - fnmatch patterns, matched against the repo-relative path.
+#
+# --- needs a live MySQL / PostgreSQL server ---------------------------------
+compat/bun/test/js/sql/*
+# --- needs a live Redis / Valkey server -------------------------------------
+compat/bun/test/js/valkey/*
+# --- needs the npm registry (install / autoinstall / real packages) ---------
+# See also #13: with no IPv4 fallback these hang in SYN-SENT instead of failing.
+compat/bun/test/cli/install/*
+compat/bun/test/cli/run/run-autoinstall.test.ts
+compat/bun/test/regression/malformed-integrity-base64.test.ts
+compat/bun/test/js/bun/shell/commands/ls.test.ts
+compat/bun/test/js/third_party/next-auth/*
+compat/bun/test/integration/*
+# --- needs a native addon toolchain (node-gyp / node ABI download) ----------
+compat/bun/test/bundler/native-plugin.test.ts

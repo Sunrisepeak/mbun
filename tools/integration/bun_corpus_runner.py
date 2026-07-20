@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import fnmatch
 import hashlib
 import json
 import re
@@ -44,6 +45,15 @@ def last_int(pattern: re.Pattern[str], output: str) -> int:
     return int(matches[-1]) if matches else 0
 
 
+DEFAULT_BLOCKED_MANIFEST = Path(__file__).resolve().parent / "manifests" / "blocked-external.txt"
+
+
+def load_patterns(path: Path) -> list[str]:
+    if not path.is_file():
+        return []
+    return read_list(path)
+
+
 def classify(
     exit_code: int,
     passed: int,
@@ -53,9 +63,15 @@ def classify(
     timed_out: bool,
     oom_killed: bool,
     output: str,
+    blocked: bool = False,
 ) -> str:
     if timed_out:
-        return "timeout"
+        # A file that needs MySQL/Redis/the npm registry expresses that as a
+        # connect that never completes, so it lands in `timeout` and buries the
+        # files where mbun itself hangs -- 51 of 107 in the 2026-07-20 round.
+        # The manifest is triaged by hand and only ever redirects a timeout;
+        # `blocked-external` is not a pass and verifies nothing (see #4).
+        return "blocked-external" if blocked else "timeout"
     if oom_killed:
         return "oom-kill"
     if ran > 0 or passed > 0 or failed > 0:
@@ -103,7 +119,8 @@ from bounded_run import BoundedRun, ensure_disk_headroom
 
 
 def run_one(
-    binary: Path, root: Path, output_dir: Path, timeout: float, path: str, spawn_cwd: Path
+    binary: Path, root: Path, output_dir: Path, timeout: float, path: str, spawn_cwd: Path,
+    blocked_patterns: list[str] | None = None,
 ) -> Result:
     started = time.monotonic()
     # All resource/safety bounding (systemd scope limits, own session, private
@@ -128,8 +145,9 @@ def run_one(
     expects = last_int(EXPECT_RE, output)
     ran = last_int(RAN_RE, output)
     skipped = last_int(SKIP_RE, output)
+    blocked = any(fnmatch.fnmatch(path, pattern) for pattern in (blocked_patterns or []))
     category = classify(bounded.exit_code, passed, failed, ran, skipped,
-                        bounded.timed_out, bounded.oom_killed, output)
+                        bounded.timed_out, bounded.oom_killed, output, blocked)
     return Result(path, bounded.exit_code, passed, failed, expects, ran, category,
                   duration_ms, str(relative_log))
 
@@ -217,6 +235,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--timeout", type=float, default=30.0)
+    parser.add_argument(
+        "--blocked-manifest", type=Path, default=DEFAULT_BLOCKED_MANIFEST,
+        help="paths that time out only because a service/registry/toolchain is "
+             "absent; they are reported as blocked-external instead of timeout",
+    )
     return parser.parse_args()
 
 
@@ -243,10 +266,12 @@ def main() -> int:
     if not paths:
         raise SystemExit("no test files selected")
 
+    blocked_patterns = load_patterns(args.blocked_manifest.resolve())
     output_dir.mkdir(parents=True, exist_ok=True)
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as executor:
         futures = [
-            executor.submit(run_one, binary, root, output_dir, args.timeout, path, spawn_cwd)
+            executor.submit(run_one, binary, root, output_dir, args.timeout, path, spawn_cwd,
+                            blocked_patterns)
             for path in paths
         ]
         results = [future.result() for future in futures]
