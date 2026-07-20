@@ -5,7 +5,8 @@
 
 ## 2026-07-20
 
-- **语料三桶分诊 + 分类诚实化：green 668 → 694，load-error 11 → 3，oom-kill 13 → 6，timeout 107 → 46（issue #3/#4/#5/#6/#7/#8）**。
+- **测量环境修正:语料 npm 依赖从未安装,264/1902 个文件在求值阶段就死于 `Cannot find module`**(esbuild 一个包废掉 76 个文件——`test/bundler/expectBundled.ts` 无条件 import 它;其后 jsonwebtoken 31、@grpc/grpc-js 18、ws/express/socket.io 各 11、verdaccio 10)。危害不只是压低绿数:这些文件在结果里显示为「1 failed / 0 passed」,**长得像只差一个断言的近绿文件**,而这正是分诊排序的依据——bundler 子树号称「69 个近绿」,其中 60 个是死文件。装好两处依赖(`compat/bun` 与 `compat/bun/test`)后同一二进制:**green 694 → 759**。runner 现在缺依赖直接拒跑并给出安装命令(`--allow-missing-node-modules` 可显式覆盖);同时 discovery 排除 `node_modules`——装完依赖后第三方包自带 785 个 `.test.*` 会把语料从 1902 灌水到 2687,把别的项目的套件混进 mbun 的兼容数字里。`compat/README.md` 补齐前置条件与非通过桶语义。
+- **语料三桶分诊 + 分类诚实化:green 668 → 694，load-error 11 → 3，oom-kill 13 → 6，timeout 107 → 46（issue #3/#4/#5/#6/#7/#8）**。
   全量 1902 文件、`--timeout 30`、同一台机器安静轮对照；测试级 26,648/43,689 → **27,485/46,893**（多跑 3,204 个测试、多过 837 个；通过率从 61.0% 降到 58.6% 是诚实结果——此前崩溃/被 OOM 杀掉的文件现在能跑完，把真实缺口暴露出来了）。
   ① **分类诚实化**：`load-error` 是「跑了 0 个测试」的兜底桶，混进 7 个上游本就没有可运行测试的文件（empty-file 纯注释、harness/svelte 全注释、expect-type-doctest 纯类型断言、issue-2086 的 setImmediate 门禁、handle-leak 无 test() 块）→ 新增 `no-tests` 桶（与 all-skipped 一样**不算通过**），判定收紧为「退出 0 + 有 runner 汇总 + 无 out-of-test error」；反向，bun 遇 out-of-test error 退出非 0 而 mbun 退 0，带 `N error` 的文件不再算 green。另新增 `blocked-external` 桶（手工分诊清单 `tools/integration/manifests/blocked-external.txt`）：需要真实 MySQL/Postgres/Redis/npm registry/node-gyp 的文件以「连不上→永远挂着」的形式落在 timeout 里，占了旧 timeout 桶的一半，掩盖了真正的运行时挂起。
   ② **两个段错误**：JS parser 全无递归预算（transpiler.test.js 的 9MB/9 万层嵌套 for fixture，87141 帧打爆栈）→ 游标 RAII DepthGuard（cap 1000）挂在 statement/assign/unary/primary/type 五个递归枢纽；`Bun.TOML.parse` 的 JS 转换层同样无预算，点号键不受解析器 MAX_DEPTH 约束（`"a."×25 万`）→ 4096 深度上限 + 真 RangeError，且解析失败从裸 JS 字符串改为真 `SyntaxError`（"TOML Parse error: …"，语料 526 处断言按此拼写），新增 `make_named_error` 走纯 C API 构造具名错误。

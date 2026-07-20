@@ -200,6 +200,12 @@ def discover(root: Path, corpus_root: Path, per_group: int) -> list[str]:
         if not candidate.is_file():
             continue
         relative_corpus = candidate.relative_to(corpus_root)
+        # Installed packages ship their own tests: once the corpus npm
+        # dependencies exist, test/node_modules adds 785 third-party .test.*
+        # files, inflating the corpus from 1902 to 2687 and mixing other
+        # projects' suites into mbun's compatibility numbers.
+        if "node_modules" in relative_corpus.parts:
+            continue
         if not TEST_FILE_RE.search(relative_corpus.as_posix()):
             continue
         relative_root = candidate.relative_to(root).as_posix()

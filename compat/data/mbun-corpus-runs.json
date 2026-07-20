@@ -7,22 +7,22 @@
       "runner": "tools/integration/bun_corpus_runner.py --cwd compat/bun --discover compat/bun/test --sample-per-group 100000 --jobs 14 --timeout 30",
       "files": 1902,
       "categories": {
-        "all-skipped": 58,
-        "blocked-external": 16,
-        "green": 694,
-        "load-error": 3,
+        "all-skipped": 72,
+        "blocked-external": 25,
+        "green": 759,
+        "load-error": 4,
         "no-tests": 6,
-        "oom-kill": 6,
-        "test-failure": 1073,
-        "timeout": 46
+        "oom-kill": 10,
+        "test-failure": 963,
+        "timeout": 63
       },
       "test_level": {
-        "ran": 46893,
-        "passed": 27485,
-        "failed": 17306,
-        "expects": 435137
+        "ran": 51337,
+        "passed": 30111,
+        "failed": 18403,
+        "expects": 440427
       },
-      "notes": "file-level green = every executed test in the file passed and the file reported no out-of-test error; skipped-only, no-tests (upstream file declares no runnable test) and blocked-external (needs a service/registry/toolchain this environment lacks) are their own buckets and are NOT passes"
+      "notes": "file-level green = every executed test in the file passed and the file reported no out-of-test error; all-skipped / no-tests / blocked-external are separate buckets and are NOT passes. The corpus npm dependencies must be installed first (see compat/README.md) -- without them 264 files die at load; test/node_modules is excluded from discovery so third-party packages do not inflate the corpus"
     },
     {
       "corpus": "compat/node/test/parallel",

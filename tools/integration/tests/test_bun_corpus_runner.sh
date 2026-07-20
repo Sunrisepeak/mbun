@@ -59,9 +59,10 @@ assert all((root / row["log"]).is_file() for row in rows)
 assert (root / "selected-tests.txt").read_text().splitlines() == [row["path"] for row in rows]
 PY
 
-mkdir -p "$tmp/corpus/a/b" "$tmp/corpus/a/c"
+mkdir -p "$tmp/corpus/a/b" "$tmp/corpus/a/c" "$tmp/corpus/node_modules/pkg"
 touch "$tmp/corpus/a/b/one.test.ts" "$tmp/corpus/a/b/two.test.js" \
-  "$tmp/corpus/a/b/not-a-test.ts" "$tmp/corpus/a/c/three.test.ts"
+  "$tmp/corpus/a/b/not-a-test.ts" "$tmp/corpus/a/c/three.test.ts" \
+  "$tmp/corpus/node_modules/pkg/vendor.test.ts"
 
 python3 "$repo_root/tools/integration/bun_corpus_runner.py" \
   --bin "$tmp/fake-mbun" --root "$tmp" --discover "$tmp/corpus" --allow-missing-node-modules \
@@ -70,6 +71,8 @@ python3 "$repo_root/tools/integration/bun_corpus_runner.py" \
 test "$(wc -l <"$tmp/discovered/selected-tests.txt")" -eq 2
 grep -Eq '^corpus/a/b/(one\.test\.ts|two\.test\.js)$' "$tmp/discovered/selected-tests.txt"
 grep -Fxq 'corpus/a/c/three.test.ts' "$tmp/discovered/selected-tests.txt"
+# An installed package's own tests are not part of the corpus.
+! grep -q node_modules "$tmp/discovered/selected-tests.txt"
 
 python3 "$repo_root/tools/integration/bun_corpus_runner.py" \
   --bin "$tmp/fake-mbun" --root "$tmp" --discover "$tmp/corpus" --allow-missing-node-modules \
