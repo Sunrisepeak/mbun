@@ -2466,7 +2466,10 @@ export constexpr std::string_view kNetJS = R"JS(
         // — no URL suffix: tests pin the exact string.
         catch (e) { return reject(mkErr("Unable to connect. Is the computer able to access the url?", "ConnectionRefused")); }
         if (secure) {
-          try { NN.tlsWrap(fd, false, "", "", host, tlsVerify ? 1 : 0, tlsCa); tls = 1; }
+          // bun's fetch never sends a ClientHello without ALPN (it offers h2 only
+          // when HTTP/2 is enabled; this client speaks HTTP/1.1). Servers and
+          // middleboxes key off the extension. ref: regression 29780.
+          try { NN.tlsWrap(fd, false, "", "", host, tlsVerify ? 1 : 0, tlsCa, "http/1.1"); tls = 1; }
           catch (e) { try { NN.close(fd); } catch (e2) {} return reject(mkErr("fetch: TLS setup failed (" + String((e && e.message) || e) + ")", "FailedToOpenSocket")); }
         }
       }

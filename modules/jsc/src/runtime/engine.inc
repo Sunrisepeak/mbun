@@ -118,6 +118,24 @@ public:
         return out;
     }
 
+    // bun wraps every entry point in a prelude that auto-starts a server when the
+    // module's default export looks like a Bun.serve config (ref: bun
+    // src/bundler/entry_points.rs — `isServerConfig(def)` is "has a fetch function
+    // or an app, and is not itself a Server (no .stop)"). The started server is
+    // announced with console.debug. mbun evaluates the entry as CJS, so the entry
+    // namespace is `globalThis.module.exports`; this runs the same check there,
+    // once the top level has finished.
+    std::expected<void, std::string> serve_default_export_() {
+        return eval_void(
+            "(function(){var ns=globalThis.module&&globalThis.module.exports;"
+            "var def=ns&&ns.default;"
+            "if(!(def&&def!==globalThis&&(typeof def.fetch==='function'||def.app!=undefined)"
+            "&&typeof def.stop!=='function'))return;"
+            "var server=Bun.serve(def);"
+            "console.debug('Started '+(server.development?'development ':'')+'server: '+"
+            "server.protocol+'://'+server.hostname+':'+server.port);})();");
+    }
+
     // Install the CommonJS environment for a top-level module evaluated in the
     // shared context: require bound to `dir`, plus module/exports/__dirname/
     // __filename. Used by both `mbun run` and the bun:test runner so test files
@@ -437,6 +455,10 @@ public:
             // top level that idled out unsettled keeps the legacy bailout
             // (draining it would turn a wedged await into an infinite hang).
             if (settled) {
+                if (auto s{serve_default_export_()}; !s) {
+                    std::cerr << "error: " << s.error() << '\n';
+                    return 1;
+                }
                 pump_event_loop("0");
                 if (unhandledRejection_) {
                     std::cerr << "error: Unhandled promise rejection\n";
@@ -450,6 +472,10 @@ public:
             // processes (async spawn's exit/close events are driven by
             // __mbun_io_tick from this pump). A never-true done-expr lets
             // pump_event_loop self-bound on "no timers, no network, no live child".
+            if (auto s{serve_default_export_()}; !s) {
+                std::cerr << "error: " << s.error() << '\n';
+                return 1;
+            }
             pump_event_loop("0");
             if (unhandledRejection_) {
                 std::cerr << "error: Unhandled promise rejection\n";
@@ -1368,7 +1394,19 @@ private:
 
     JSValueRef eval_(std::string_view source, JSValueRef* exc, const std::string& srcUrl = {}) {
         std::string src{source};
-        JSStringRef script{JSStringCreateWithUTF8CString(src.c_str())};
+        // A source file may legally contain a literal NUL (inside a string or a
+        // template literal — regression 27553). JSStringCreateWithUTF8CString stops
+        // at the first NUL, which truncates the script mid-token and surfaces as
+        // "SyntaxError: Unexpected EOF"; go through UTF-16 so the whole source
+        // reaches JSC. The C-string path stays for NUL-free sources (the norm).
+        JSStringRef script{nullptr};
+        if (src.find('\0') != std::string::npos) {
+            const std::u16string wide{mbun::core::strings::utf8_to_utf16(src)};
+            script = JSStringCreateWithCharacters(
+                reinterpret_cast<const JSChar*>(wide.data()), wide.size());
+        } else {
+            script = JSStringCreateWithUTF8CString(src.c_str());
+        }
         JSStringRef url{srcUrl.empty() ? nullptr : JSStringCreateWithUTF8CString(srcUrl.c_str())};
         JSValueRef result{JSEvaluateScript(ctx_, script, nullptr, url, 1, exc)};
         if (url != nullptr) JSStringRelease(url);
@@ -2205,8 +2243,10 @@ JSValueRef napi_dlopen_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_
     return JSValueMakeUndefined(ctx);
 }
 
-// __mbun_transpile(code, cjs, jsx) → transpiled JS (throws its error string on
-// failure). Backs Bun.Transpiler.transformSync.
+// __mbun_transpile(code, cjs, jsx) → transpiled JS. Backs
+// Bun.Transpiler.transformSync; a parse failure throws a SyntaxError carrying the
+// diagnostic, never a bare string — callers read `e.message` (bun throws an error
+// object here too, so a raw string leaves `.message` undefined).
 JSValueRef transpile_native_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                                const JSValueRef args[], JSValueRef* exc) {
     std::string code{arg_string(ctx, argc, args, 0)};
@@ -2214,7 +2254,9 @@ JSValueRef transpile_native_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::
     const bool jsx{argc > 2 && JSValueToBoolean(ctx, args[2])};
     mbun::js_parser::TranspileResult t{mbun::js_parser::transpile(code, {.cjs = cjs, .jsx = jsx})};
     if (!t.ok) {
-        if (exc != nullptr) *exc = make_string(ctx, t.error.empty() ? "transpile error" : t.error);
+        if (exc != nullptr) {
+            *exc = make_syntax_error(ctx, t.error.empty() ? "transpile error" : t.error);
+        }
         return JSValueMakeUndefined(ctx);
     }
     return make_string(ctx, t.code);

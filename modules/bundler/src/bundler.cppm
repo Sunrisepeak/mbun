@@ -21,4 +21,5 @@ export import mbun.bundler.standalone_graph;
 export import mbun.bundler.bundler_jsc;
 export import mbun.bundler.ast_jsc;
 export import mbun.bundler.ascii_only;
+export import mbun.bundler.defines;
 export import mbun.bundler.vertical_slice;

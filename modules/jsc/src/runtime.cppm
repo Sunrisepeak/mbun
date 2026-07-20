@@ -27,6 +27,7 @@ import mbun.core.strings;
 import mbun.js_parser;
 // T-CAP-BUILD: in-memory bundler engine backing Bun.build (runtime/bun_build.inc).
 import mbun.bundler.vertical_slice;
+import mbun.bundler.defines;
 // Target / target_is_bun + the JSC-facing `target` string decode: `target: "bun"`
 // drives the ASCII-only output pass.
 import mbun.bundler.options;

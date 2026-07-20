@@ -742,6 +742,9 @@ inline JSValueRef bun_build_run(JSContextRef ctx, JSValueRef configVal) {
     // JSX config from `Bun.build({ jsx })`. Defaults to bun's Pragma (automatic
     // runtime, "react"); only `.jsx`/`.tsx` modules consult it in the bundler.
     mbun::js_parser::detail::JsxOptions jsxOptions{};
+    // `define` / `env` compile-time substitutions; empty = the source reaches the
+    // parser unchanged (the pre-existing behaviour).
+    mbun::bundler::DefineTable defines{};
     JSValueRef pluginsVal{nullptr};
     if (configObj != nullptr) {
         pluginsVal = get_prop(ctx, configObj, "plugins");
@@ -817,6 +820,45 @@ inline JSValueRef bun_build_run(JSContextRef ctx, JSValueRef configVal) {
                 jsxOptions.import_source = val_to_string(ctx, srcVal);
             }
         }
+        // `define`: a plain object of dotted key -> replacement expression text,
+        // and `env`: "inline" | "disable" | "PREFIX*" — the JS spelling of the CLI's
+        // `--define` / `--env`. ref: bun-ref/src/runtime/api/JSBundler.rs
+        // Config::from_js (`define`, `env`) feeding options.rs `create_defines`.
+        if (JSValueRef defineVal{get_prop(ctx, configObj, "define")};
+            defineVal != nullptr && JSValueIsObject(ctx, defineVal)) {
+            JSObjectRef defineObj{JSValueToObject(ctx, defineVal, nullptr)};
+            JSPropertyNameArrayRef names{JSObjectCopyPropertyNames(ctx, defineObj)};
+            const std::size_t count{JSPropertyNameArrayGetCount(names)};
+            for (std::size_t i{0}; i < count; ++i) {
+                JSStringRef nameRef{JSPropertyNameArrayGetNameAtIndex(names, i)};
+                JSValueRef entryVal{JSObjectGetProperty(ctx, defineObj, nameRef, nullptr)};
+                defines.insert(to_utf8(nameRef), val_to_string(ctx, entryVal));
+            }
+            JSPropertyNameArrayRelease(names);
+        }
+        if (JSValueRef envVal{get_prop(ctx, configObj, "env")};
+            envVal != nullptr && JSValueIsString(ctx, envVal)) {
+            const std::string mode{val_to_string(ctx, envVal)};
+            // "disable" (and the default) inline nothing; "inline"/"*" take every
+            // variable; "PREFIX*" takes the matching ones.
+            std::optional<std::string> prefix;
+            if (const std::size_t star{mode.find('*')}; star != std::string::npos) {
+                prefix = mode.substr(0, star);
+            } else if (mode == "inline" || mode == "1") {
+                prefix = std::string{};
+            }
+            if (prefix) {
+                for (char** e{MBUN_ENVIRON}; e != nullptr && *e != nullptr; ++e) {
+                    const std::string_view entry{*e};
+                    const std::size_t eq{entry.find('=')};
+                    if (eq == 0 || eq == std::string_view::npos) continue;
+                    const std::string_view name{entry.substr(0, eq)};
+                    if (!prefix->empty() && !name.starts_with(*prefix)) continue;
+                    defines.insert(std::format("process.env.{}", name),
+                                   mbun::bundler::quote_js_string(entry.substr(eq + 1)));
+                }
+            }
+        }
         JSValueRef epVal{get_prop(ctx, configObj, "entrypoints")};
         if (epVal != nullptr && JSValueIsString(ctx, epVal)) {
             entryPoints.push_back(bun_build_absolute_entry(val_to_string(ctx, epVal)));
@@ -872,6 +914,7 @@ inline JSValueRef bun_build_run(JSContextRef ctx, JSValueRef configVal) {
     mbun::bundler::BuildOptions options{.ascii_only = mbun::bundler::target_is_bun(target),
                                         .fs = &fs,
                                         .jsx = jsxOptions,
+                                        .defines = std::move(defines),
                                         .metafile = wantMetafile};
     if (pluginHost != nullptr && !pluginError) {
         options.on_resolve =

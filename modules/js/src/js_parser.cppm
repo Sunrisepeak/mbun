@@ -2307,9 +2307,16 @@ private:
             }
             // TS parameter-property modifiers are erased. For a constructor, capture
             // the bound name so `constructor(private x)` also synthesizes `this.x = x`.
+            // `public`/`override`/... are contextual: they are modifiers only when a
+            // parameter binding (or another modifier) follows. `function f(a,
+            // override)` names its second parameter `override`, and TS agrees — a
+            // modifier must be followed by a binding start (TS parseParameter). Every
+            // one of these words is a perfectly legal JS identifier, so consuming it
+            // unconditionally broke plain-JS files (acorn's dist bundle, #17766).
             bool hadModifier = false;
-            while (ident_is_("public") || ident_is_("private") || ident_is_("protected") ||
-                   ident_is_("readonly") || ident_is_("override")) {
+            while ((ident_is_("public") || ident_is_("private") || ident_is_("protected") ||
+                    ident_is_("readonly") || ident_is_("override")) &&
+                   (is_binding_start_(peek_kind_(1)) || peek_kind_(1) == Token::DotDotDot)) {
                 hadModifier = true;
                 erase_current_token_();
             }

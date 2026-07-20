@@ -278,6 +278,27 @@ struct BuildFlags {
     std::vector<std::string> external {};    // -e/--external (ref: Arguments.rs :475)
     std::vector<std::string> conditions {};  // --conditions   (ref: Arguments.rs :515)
 
+    // ── the shared transpiler flags (TRANSPILER_PARAMS_, Arguments.rs :139-182) ──
+    // `--define K=V` / `-d K:V`. Both separators are accepted, first one wins, and
+    // the value is the raw text bun substitutes (parsed as JSON when it can be).
+    // ref: runtime/cli/colon_list_type.rs `ColonListType::load` :34-56.
+    std::vector<std::pair<std::string, std::string>> defines {};
+    // `--loader .ext:loader` / `-l`. Keys keep their leading dot, as bun stores them.
+    std::vector<std::pair<std::string, std::string>> loaders {};
+    // `--env <inline|disable|PREFIX*>` (ref: Arguments.rs :1946-1963). Empty = the
+    // default, which is "disable" — no environment variable is inlined.
+    std::string env {};
+    // JSX pragma overrides (Arguments.rs :166-178).
+    std::string jsxRuntime {};
+    std::string jsxFactory {};
+    std::string jsxFragment {};
+    std::string jsxImportSource {};
+    bool jsxSideEffects { false };
+    // `--no-bundle` — transpile each entry point in place, do not link a graph.
+    // ref: Arguments.rs :503 (BUILD_ONLY_PARAMS) and build_command.rs's
+    // `transform_only` path, which prints one output per entry point.
+    bool noBundle { false };
+
     bool help { false };
 
     // Recognised-but-unimplemented flags, in command-line order (e.g. "--minify-syntax").
@@ -307,6 +328,23 @@ inline constexpr std::array BUILD_VALUE_FLAGS {
     std::string_view { "--windows-publisher" }, std::string_view { "--windows-version" },
     std::string_view { "--windows-description" },
     std::string_view { "--windows-copyright" },
+    // TRANSPILER_PARAMS_ (Arguments.rs :139-181) — every `bun build` accepts these
+    // too, because BUILD_PARAMS concatenates them (Arguments.rs :545).
+    std::string_view { "--main-fields" },      std::string_view { "--extension-order" },
+    std::string_view { "--tsconfig-override" },
+    std::string_view { "--drop" },             std::string_view { "--feature" },
+    std::string_view { "--jsx-factory" },      std::string_view { "--jsx-fragment" },
+    std::string_view { "--jsx-import-source" },std::string_view { "--jsx-runtime" },
+    std::string_view { "--global-name" },
+};
+
+// The two `<STR>...` flags whose value is a `key<sep>value` pair; bun parses both
+// through ColonListType, which accepts ':' or '=' (whichever comes first) and
+// errors with a flag-specific message when neither is present.
+// ref: runtime/cli/colon_list_type.rs:34-56.
+inline constexpr std::array BUILD_PAIR_FLAGS {
+    std::string_view { "--define" }, std::string_view { "-d" },
+    std::string_view { "--loader" }, std::string_view { "-l" },
 };
 
 // Boolean build flags mbun recognises but whose behaviour the bundler slice does
@@ -317,7 +355,7 @@ inline constexpr std::array BUILD_UNSUPPORTED_BOOL_FLAGS {
     std::string_view { "--minify-whitespace" },
     std::string_view { "--minify-identifiers" },
     std::string_view { "--keep-names" },   std::string_view { "--splitting" },
-    std::string_view { "--no-bundle" },    std::string_view { "--production" },
+    std::string_view { "--production" },
     std::string_view { "--watch" },        std::string_view { "--app" },
     std::string_view { "--server-components" },
     std::string_view { "--react-fast-refresh" },
@@ -325,6 +363,10 @@ inline constexpr std::array BUILD_UNSUPPORTED_BOOL_FLAGS {
     std::string_view { "--css-chunking" },
     std::string_view { "--emit-dce-annotations" },
     std::string_view { "--reject-unresolved" },
+    std::string_view { "--ignore-dce-annotations" },
+    std::string_view { "--no-macros" },
+    std::string_view { "--preserve-symlinks" },
+    std::string_view { "--preserve-symlinks-main" },
 };
 
 // Boolean build flags that are accepted and safely ignored: each is a no-op for
@@ -396,6 +438,62 @@ BuildFlags parse_build(std::span<const std::string_view> args) {
             continue;
         }
 
+        // `--jsx-side-effects` is the only boolean among the JSX pragma flags.
+        if (name == "--jsx-side-effects") {
+            out.jsxSideEffects = true;
+            continue;
+        }
+        if (name == "--no-bundle") {
+            out.noBundle = true;
+            continue;
+        }
+
+        // `--define`/`-d` and `--loader`/`-l` take a `key<sep>value` operand. bun
+        // accepts ':' or '=' — whichever appears first — and reports a
+        // flag-specific error when neither does.
+        // ref: runtime/cli/colon_list_type.rs:34-56.
+        if (std::ranges::contains(detail::BUILD_PAIR_FLAGS, name)) {
+            std::string_view pair {};
+            if (hasInlineValue) {
+                pair = inlineValue;
+            } else if (i + 1 < args.size()) {
+                pair = args[++i];
+            } else {
+                out.parseError = std::format("Missing value for \"{}\"", name);
+                return out;
+            }
+            const bool isLoader { name == "--loader" || name == "-l" };
+            const std::size_t colon { pair.find(':') };
+            const std::size_t equals { pair.find('=') };
+            const std::size_t mid { std::min(colon, equals) };
+            if (mid == std::string_view::npos) {
+                out.parseError =
+                    isLoader
+                        ? std::format("--loader \"{}\" is missing a \":\" separator. Expected "
+                                      "--loader .ext:loader, for example --loader .md:text",
+                                      pair)
+                        : std::format("--define \"{}\" is missing a \":\" or \"=\" separator. "
+                                      "Expected --define key=value, for example "
+                                      "--define process.env.NODE_ENV='\"production\"'",
+                                      pair);
+                return out;
+            }
+            const std::string_view key { pair.substr(0, mid) };
+            const std::string_view value { pair.substr(mid + 1) };
+            if (isLoader) {
+                // ref: colon_list_type.rs:57-64 — an extension must start with '.'.
+                if (!key.empty() && !key.starts_with('.')) {
+                    out.parseError = std::format(
+                        "file extension must start with a '.' (while mapping loader \"{}\")", pair);
+                    return out;
+                }
+                out.loaders.emplace_back(std::string { key }, std::string { value });
+            } else {
+                out.defines.emplace_back(std::string { key }, std::string { value });
+            }
+            continue;
+        }
+
         if (std::ranges::contains(detail::BUILD_UNSUPPORTED_BOOL_FLAGS, name)) {
             out.unsupported.emplace_back(name);
             continue;
@@ -425,11 +523,43 @@ BuildFlags parse_build(std::span<const std::string_view> args) {
             } else if (name == "--outfile") {
                 out.outfile = value;
             } else if (name == "--format") {
+                // ref: Arguments.rs :2316-2319 — the message quotes the value and
+                // lists the three accepted formats.
                 if (value != "esm" && value != "cjs" && value != "iife") {
-                    out.parseError = std::format("Invalid format: \"{}\"", value);
+                    out.parseError = std::format(
+                        "Invalid value for --format: \"{}\". Must be 'esm', 'cjs', or 'iife'.",
+                        value);
                     return out;
                 }
                 out.format = value;
+            } else if (name == "--env") {
+                // ref: Arguments.rs :1946-1963 — a '*' at index 0 means "everything",
+                // a '*' later means "this prefix", else the literal words.
+                if (const std::size_t star { value.find('*') }; star != std::string_view::npos) {
+                    out.env = star == 0 ? std::string { "inline" }
+                                        : std::string { value.substr(0, star) } + "*";
+                } else if (value == "inline" || value == "1") {
+                    out.env = "inline";
+                } else if (value == "disable" || value == "0") {
+                    out.env = "disable";
+                } else {
+                    out.parseError =
+                        "Expected 'env' to be 'inline', 'disable', or a prefix with a '*' character";
+                    return out;
+                }
+            } else if (name == "--jsx-runtime") {
+                // ref: options_types/jsx.rs — only these two runtimes exist.
+                if (value != "automatic" && value != "classic") {
+                    out.parseError = std::format("Invalid jsx runtime: \"{}\"", value);
+                    return out;
+                }
+                out.jsxRuntime = value;
+            } else if (name == "--jsx-factory") {
+                out.jsxFactory = value;
+            } else if (name == "--jsx-fragment") {
+                out.jsxFragment = value;
+            } else if (name == "--jsx-import-source") {
+                out.jsxImportSource = value;
             } else if (name == "--root") {
                 out.root = value;
             } else if (name == "--public-path") {

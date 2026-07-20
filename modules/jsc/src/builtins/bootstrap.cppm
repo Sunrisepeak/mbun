@@ -626,10 +626,33 @@ inline constexpr std::string_view kBootstrapJS = R"JS(
       // JSC-native stacks use `fn@source` frames without it, dropping the message
       // (which is where e.g. ENOENT/path live). Prepend it when absent.
       const name = v.name || "Error";
-      const st = v.stack;
+      // `stack` can be an own accessor that throws (userland Object.defineProperty).
+      // Inspecting a value must never propagate that: node/bun both fall back to
+      // the header instead of letting console.log blow the process up.
+      // ref: regression circular-error-stack-edge-cases.
+      let st;
+      try { st = v.stack; } catch (e) { st = undefined; }
+      let head;
       if (typeof st === "string" && st.length)
-        return st.startsWith(name) ? st : ((v.message ? name + ": " + v.message : name) + "\n" + st);
-      return "[" + name + ": " + v.message + "]";
+        head = st.startsWith(name) ? st : ((v.message ? name + ": " + v.message : name) + "\n" + st);
+      else head = "[" + name + ": " + v.message + "]";
+      // Own enumerable extras ride after the stack, as node/bun print them
+      // (`Error: x\n  at …\n{\n  code: "E1",\n}`). A throwing getter is skipped,
+      // not rethrown.
+      const extraIndent = "  ".repeat(depth + 1);
+      const extras = [];
+      seen.add(v);
+      try {
+        for (const k of Object.keys(v)) {
+          if (k === "message" || k === "stack") continue;
+          let s;
+          try { s = inspectValue(v[k], opts, seen, depth + 1); } catch (e) { continue; }
+          extras.push(extraIndent +
+                      (/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(k) ? k : JSON.stringify(k)) + ": " + s + ",");
+        }
+      } finally { seen.delete(v); }
+      if (extras.length) head += " {\n" + extras.join("\n") + "\n" + "  ".repeat(depth) + "}";
+      return head;
     }
     if (G.Buffer && G.Buffer.isBuffer && G.Buffer.isBuffer(v)) return "<Buffer " + Array.from(v).map((x) => x.toString(16).padStart(2, "0")).join(" ") + ">";
     if (bun) {
@@ -1487,16 +1510,25 @@ inline constexpr std::string_view kBootstrapJS = R"JS(
     stdin.resume = () => { if (flowing !== true) { flowing = true; stdin.readableFlowing = true; attach(); if (!resumeScheduled) { resumeScheduled = true; G.process.nextTick(doResume); } } return stdin; };
     stdin.pause = () => { if (flowing !== false) { flowing = false; stdin.readableFlowing = false; detach(); stdin.emit("pause"); } return stdin; };
     stdin.setEncoding = (enc) => { stdin._enc = enc; return stdin; };
-    stdin.setRawMode = (flag) => {
-      flag = !!flag;
-      const O = osn();
-      if (O && typeof O.setRawMode === "function") {
-        const err = O.setRawMode(0, flag);
-        if (err) { stdin.emit("error", new Error("setRawMode failed with errno: " + err)); return stdin; }
-      }
-      stdin.isRaw = flag;
-      return stdin;
-    };
+    // setRawMode is a tty.ReadStream method: node/bun only give process.stdin a
+    // `setRawMode` when fd 0 IS a terminal (otherwise stdin is a pipe/file stream
+    // that never had one). Defining it unconditionally made every piped-stdin
+    // consumer that probes `typeof input.setRawMode === "function"` — readline
+    // with `terminal: true`, for one — call it and take an ENOTTY 'error' event
+    // that nothing listens for. ref: bun src/js/node/tty.ts (Prototype.setRawMode
+    // lives on the tty ReadStream prototype); regression 26411.
+    if (stdinIsatty()) {
+      stdin.setRawMode = (flag) => {
+        flag = !!flag;
+        const O = osn();
+        if (O && typeof O.setRawMode === "function") {
+          const err = O.setRawMode(0, flag);
+          if (err) { stdin.emit("error", new Error("setRawMode failed with errno: " + err)); return stdin; }
+        }
+        stdin.isRaw = flag;
+        return stdin;
+      };
+    }
     stdin.ref = () => stdin; stdin.unref = () => stdin;
     stdin.read = () => {
       if (!rbuf.length) return null;
@@ -1530,6 +1562,27 @@ inline constexpr std::string_view kBootstrapJS = R"JS(
       return stdin;
     };
     G.process.stdin = stdin;
+    // process.stdout/.stderr are tty.WriteStream/Socket in node & bun, i.e. real
+    // EventEmitters: consumers subscribe to "resize"/"error"/"close" on them
+    // (readline's terminal mode does `output.on("resize", ...)` unconditionally).
+    // The native objects installed by engine.inc only carry write/isTTY, so mix
+    // an EventEmitter surface in. ref: regression 26411.
+    for (const name of ["stdout", "stderr"]) {
+      const strm = G.process[name];
+      if (!strm || typeof strm.on === "function") continue;
+      const ee = new EventEmitter();
+      for (const k of ["on", "addListener", "prependListener", "once", "off", "removeListener",
+                       "removeAllListeners", "emit", "listeners", "listenerCount",
+                       "setMaxListeners", "eventNames"]) {
+        if (typeof ee[k] === "function") strm[k] = ee[k].bind(ee);
+      }
+      // Writable tail that never actually closes the descriptor (node keeps
+      // stdout/stderr open for the process lifetime).
+      strm.end = strm.end || (() => strm);
+      strm.destroy = strm.destroy || (() => strm);
+      strm.cork = strm.cork || (() => {});
+      strm.uncork = strm.uncork || (() => {});
+    }
   }
 
   // ---- URLSearchParams + URL (WHATWG-ish; runs in every context) ----
@@ -2584,8 +2637,13 @@ inline constexpr std::string_view kBootstrapJS = R"JS(
     G.Bun.inflateSync = (data) => { try { return asU8(inflateRawSync(data)); } catch (e) { return asU8(inflateSync(data)); } };
     G.Bun.gzipSync = (data, opts) => asU8(gzipSync(data, opts));
     G.Bun.gunzipSync = (data) => asU8(gunzipSync(data));
-    G.Bun.zstdCompressSync = (data, opts) => asU8(zstdCompressSync(data, opts));
-    G.Bun.zstdDecompressSync = (data) => asU8(zstdDecompressSync(data));
+    // zstd is the exception: bun's JSZstd::{compress,decompress}{,_sync} return a
+    // node Buffer (JSValue::create_buffer in src/runtime/api/BunObject.rs), not a
+    // plain Uint8Array, so `.toString()` decodes UTF-8 instead of joining bytes.
+    G.Bun.zstdCompressSync = (data, opts) => zstdCompressSync(data, opts);
+    G.Bun.zstdDecompressSync = (data, opts) => zstdDecompressSync(data, opts);
+    G.Bun.zstdCompress = async (data, opts) => zstdCompressSync(data, opts);
+    G.Bun.zstdDecompress = async (data, opts) => zstdDecompressSync(data, opts);
   }
   // ---- Bun.ArrayBufferSink (ref: src/runtime/webcore/ArrayBufferSink.rs) ----
   // A byte accumulator: write() appends string(UTF-8)/ArrayBuffer/TypedArray

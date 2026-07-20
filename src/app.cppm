@@ -1260,6 +1260,26 @@ mbun::resolver::FileSystem build_os_fs() {
     };
 }
 
+// The build-time environment as raw `NAME=VALUE` entries. `--env inline` turns
+// each one into a `process.env.NAME` define, exactly as bun's DotEnv loader feeds
+// `copy_env_for_define` (src/bundler/defines.rs:105).
+// The `environ` spelling matches modules/jsc/src/runtime/process_extended.inc:442.
+extern "C" {
+#if defined(_WIN32)
+extern char** _environ;
+#define MBUN_APP_ENVIRON _environ
+#else
+extern char** environ;
+#define MBUN_APP_ENVIRON environ
+#endif
+}
+
+std::vector<std::string> os_environment() {
+    std::vector<std::string> out{};
+    for (char** e{MBUN_APP_ENVIRON}; e != nullptr && *e != nullptr; ++e) out.emplace_back(*e);
+    return out;
+}
+
 std::string build_absolute_entry(std::string_view entry) {
     std::filesystem::path path{entry};
     if (path.is_absolute()) return path.string();
@@ -1267,6 +1287,170 @@ std::string build_absolute_entry(std::string_view entry) {
     const std::filesystem::path cwd{std::filesystem::current_path(ec)};
     if (ec) return path.string();
     return (cwd / path).string();
+}
+
+// bun's `root_dir` when `--root` is not given: the lowest directory that contains
+// every entry point, which is what `[dir]` in the entry-naming template is made
+// relative to. ref: bun src/bundler/options.rs (root_dir inference).
+std::filesystem::path build_common_ancestor(std::span<const std::string> entryPoints) {
+    if (entryPoints.empty()) return {};
+    std::filesystem::path common{std::filesystem::path{entryPoints.front()}.parent_path()};
+    for (const std::string& entry : entryPoints.subspan(1)) {
+        const std::filesystem::path dir{std::filesystem::path{entry}.parent_path()};
+        std::filesystem::path shared{};
+        auto a{common.begin()};
+        auto b{dir.begin()};
+        for (; a != common.end() && b != dir.end() && *a == *b; ++a, ++b) shared /= *a;
+        common = std::move(shared);
+    }
+    return common;
+}
+
+// Render the default entry-naming template `[dir]/[name].[ext]` for one entry:
+// `[dir]` is the entry's directory relative to the build root, `[name]` its stem
+// and `[ext]` the emitted extension (always `.js` for a JS chunk).
+// ref: bun src/bundler/options.rs:2671 (the default template).
+std::filesystem::path build_entry_relative_name(std::string_view entryPoint,
+                                                const std::filesystem::path& outbase) {
+    const std::filesystem::path entry{entryPoint};
+    std::filesystem::path name{entry.filename()};
+    name.replace_extension(".js");
+    if (outbase.empty()) return name;
+    std::error_code ec{};
+    const std::filesystem::path dir{std::filesystem::relative(entry.parent_path(), outbase, ec)};
+    if (ec || dir.empty() || dir == ".") return name;
+    return dir / name;
+}
+
+// One emitted build artifact, used by both the bundled and the `--no-bundle` path.
+struct BuildEmitted {
+    std::string path;      // where the bytes are written
+    std::string display;   // how the summary names it — relative to the output root
+    std::string contents;
+    std::string_view kind;
+};
+
+// bun writes every output *relative to the build's root directory* and prints
+// that same relative name in the summary (`debug_assert!(!is_absolute(dest_path))`
+// at build_command.rs:1057). The root is `--outdir` when given, else the
+// directory `--outfile` points into.
+// ref: bun src/cli/build_command.rs :1046-1078.
+std::string build_display_path(const std::filesystem::path& outPath, std::string_view outdir,
+                               std::string_view outfile) {
+    const std::filesystem::path root{outdir.empty() ? std::filesystem::path{outfile}.parent_path()
+                                                    : std::filesystem::path{outdir}};
+    if (root.empty()) return outPath.string();
+    std::error_code ec{};
+    const std::filesystem::path rel{std::filesystem::relative(outPath, root, ec)};
+    if (ec || rel.empty()) return outPath.string();
+    return rel.generic_string();
+}
+
+// The `Bundled N modules in Xms` header plus the two-space-indented artifact
+// listing bun prints after a successful build.
+// ref: bun src/cli/build_command.rs :1019-1035 then :1045-1129.
+void print_build_listing(std::span<const BuildEmitted> emitted, std::uint32_t moduleCount,
+                         std::chrono::steady_clock::time_point start) {
+    const auto elapsedMs{std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - start)
+                             .count()};
+    std::println("Bundled {} module{} in {}ms", moduleCount, moduleCount == 1 ? "" : "s", elapsedMs);
+    std::println("");
+
+    std::size_t maxPathLen{0};
+    std::size_t sizePadding{0};
+    for (const BuildEmitted& file : emitted) {
+        maxPathLen = std::max(maxPathLen, file.display.size());
+        sizePadding = std::max(sizePadding, format_size(file.contents.size()).size());
+    }
+    for (const BuildEmitted& file : emitted) {
+        const std::string size{format_size(file.contents.size())};
+        std::println("  {}{}{}  {}({})", file.display,
+                     std::string(std::max<std::size_t>(2, maxPathLen + 2 - file.display.size()), ' '),
+                     size, std::string(sizePadding - size.size(), ' '), file.kind);
+    }
+    std::println("");
+}
+
+// `bun build --no-bundle <entries...>` — transpile each entry point and emit it
+// as its own output. No resolver runs and no module graph is built: this is the
+// transform-only mode, so ESM stays ESM and an unresolvable import is simply
+// printed back out. ref: bun src/cli/Arguments.rs:503 ("Transpile file only, do
+// not bundle") and the transform path in src/cli/build_command.rs.
+int run_build_no_bundle(const mbun::cli::BuildFlags& flags,
+                        std::chrono::steady_clock::time_point start) {
+    mbun::js_parser::detail::JsxOptions jsx{};
+    if (flags.jsxRuntime == "classic") {
+        jsx.runtime = mbun::js_parser::detail::JsxRuntime::Classic;
+    } else if (flags.jsxRuntime == "automatic") {
+        jsx.runtime = mbun::js_parser::detail::JsxRuntime::Automatic;
+    }
+    if (!flags.jsxFactory.empty()) jsx.factory = flags.jsxFactory;
+    if (!flags.jsxFragment.empty()) jsx.fragment = flags.jsxFragment;
+    if (!flags.jsxImportSource.empty()) jsx.import_source = flags.jsxImportSource;
+
+    std::vector<BuildEmitted> emitted{};
+    emitted.reserve(flags.entryPoints.size());
+    for (const std::string& entry : flags.entryPoints) {
+        const std::string absolute{build_absolute_entry(entry)};
+        std::ifstream file{std::filesystem::path{absolute}, std::ios::binary};
+        if (!file) {
+            std::println(std::cerr, "error: could not read \"{}\"", entry);
+            return 1;
+        }
+        std::ostringstream buf{};
+        buf << file.rdbuf();
+        const std::string source{buf.str()};
+
+        const bool isJsx{absolute.ends_with(".jsx") || absolute.ends_with(".tsx")};
+        auto transpiled{mbun::js_parser::transpile(source,
+                                                   {.cjs = false, .jsx = isJsx, .jsx_options = jsx})};
+        if (!transpiled.ok) {
+            std::println(std::cerr, "error: {}", transpiled.error);
+            return 1;
+        }
+
+        std::filesystem::path outPath{};
+        if (!flags.outfile.empty()) {
+            outPath = std::filesystem::path{flags.outfile};
+            if (!flags.outdir.empty()) outPath = std::filesystem::path{flags.outdir} / outPath.filename();
+        } else if (!flags.outdir.empty()) {
+            outPath = std::filesystem::path{flags.outdir} / std::filesystem::path{absolute}.filename();
+            outPath.replace_extension(".js");
+        }
+        emitted.push_back({outPath.string(),
+                           build_display_path(outPath, flags.outdir, flags.outfile),
+                           std::move(transpiled.code), "entry point"});
+    }
+
+    // No --outfile/--outdir: the transpiled text goes to stdout, nothing else.
+    // ref: build_command.rs :769-780.
+    if (flags.outfile.empty() && flags.outdir.empty()) {
+        for (const BuildEmitted& file : emitted) std::print("{}", file.contents);
+        std::cout.flush();
+        return 0;
+    }
+
+    for (const BuildEmitted& file : emitted) {
+        std::error_code ec{};
+        if (const std::filesystem::path parent{std::filesystem::path{file.path}.parent_path()};
+            !parent.empty()) {
+            std::filesystem::create_directories(parent, ec);
+            if (ec) {
+                std::println(std::cerr, "error: could not open output directory \"{}\"",
+                             parent.string());
+                return 1;
+            }
+        }
+        std::ofstream out{file.path, std::ios::binary | std::ios::trunc};
+        out.write(file.contents.data(), static_cast<std::streamsize>(file.contents.size()));
+        if (!out) {
+            std::println(std::cerr, "error: failed to write file \"{}\"", file.path);
+            return 1;
+        }
+    }
+    print_build_listing(emitted, static_cast<std::uint32_t>(emitted.size()), start);
+    return 0;
 }
 
 int run_build(std::span<const std::string_view> buildArgs) {
@@ -1303,14 +1487,18 @@ int run_build(std::span<const std::string_view> buildArgs) {
         std::println(std::cerr, "error: --external is not implemented yet in mbun's bundler");
         return 1;
     }
+    if (!flags.loaders.empty()) {
+        std::println(std::cerr, "error: --loader is not implemented yet in mbun's bundler");
+        return 1;
+    }
     if (flags.format != "esm") {
         std::println(std::cerr, "error: --format={} is not implemented yet in mbun's bundler",
                      flags.format);
         return 1;
     }
-    if (!flags.publicPath.empty() || !flags.root.empty() || !flags.conditions.empty()) {
+    if (!flags.publicPath.empty() || !flags.conditions.empty()) {
         std::println(std::cerr,
-                     "error: --public-path/--root/--conditions are not "
+                     "error: --public-path/--conditions are not "
                      "implemented yet in mbun's bundler");
         return 1;
     }
@@ -1325,13 +1513,13 @@ int run_build(std::span<const std::string_view> buildArgs) {
         std::println(std::cerr, "error: Must use --outdir when specifying more than one entry point.");
         return 1;
     }
-    // mbun's slice emits ONE combined chunk for all entries, so it cannot name a
-    // per-entry output file the way bun does (one output per entry point). Reject
-    // rather than write a single file that pretends to be the whole build.
-    if (flags.entryPoints.size() > 1) {
-        std::println(std::cerr,
-                     "error: multiple entry points are not implemented yet in mbun's bundler");
-        return 1;
+    // `--no-bundle`: transpile each entry point on its own and emit it verbatim —
+    // no resolution, no graph, no chunk. This is bun's `transform_only` build
+    // (ref: src/cli/build_command.rs; the flag is documented as "Transpile file
+    // only, do not bundle" in Arguments.rs:503). Each entry produces exactly one
+    // output, so multiple entries are fine here.
+    if (flags.noBundle) {
+        return run_build_no_bundle(flags, start);
     }
 
     std::vector<std::string> entryPoints{};
@@ -1339,88 +1527,158 @@ int run_build(std::span<const std::string_view> buildArgs) {
 
     const mbun::resolver::FileSystem fs{build_os_fs()};
     const bool wantSourcemap{flags.sourcemap != "none"};
-    auto built{mbun::bundler::build_bundle(entryPoints, mbun::bundler::Files{},
-                                           {.sourcemap = wantSourcemap, .fs = &fs})};
-    if (!built) {
-        std::println(std::cerr, "error: {}", built.error().message);
-        return 1;
-    }
 
-    // ref: bun src/bundler/bundle_v2.zig — a --banner is prepended and a --footer is
-    // appended to each output chunk (after the hashbang, if any). expectBundled's CLI
-    // backend passes the value quoted (`--banner="<v>"`) with no shell to strip it, so
-    // `flags.banner`/`flags.footer` already carry the literal text bun writes verbatim.
-    if (!flags.banner.empty()) {
-        std::string_view code{built->code};
-        std::string prefixed{};
-        // Keep a leading hashbang (`#!...`) on line 1; the banner follows it.
-        if (code.starts_with("#!")) {
-            const std::size_t eol{code.find('\n')};
-            const std::size_t cut{eol == std::string_view::npos ? code.size() : eol + 1};
-            prefixed.append(code.substr(0, cut));
-            if (eol == std::string_view::npos) prefixed.push_back('\n');
-            prefixed.append(flags.banner);
-            prefixed.push_back('\n');
-            prefixed.append(code.substr(cut));
-        } else {
-            prefixed.append(flags.banner);
-            prefixed.push_back('\n');
-            prefixed.append(code);
-        }
-        built->code = std::move(prefixed);
-    }
-    if (!flags.footer.empty()) {
-        if (!built->code.empty() && built->code.back() != '\n') built->code.push_back('\n');
-        built->code.append(flags.footer);
-        built->code.push_back('\n');
-    }
-
-    // ref: bun src/cli/build_command.rs :769-780 — with neither --outfile nor
-    // --outdir and a single output file, the bundle goes to stdout and nothing else
-    // is printed.
-    if (flags.outfile.empty() && flags.outdir.empty()) {
-        std::print("{}", built->code);
-        std::cout.flush();
-        return 0;
-    }
-
-    // ref: bun src/cli/build_command.rs :750-768 — --outfile without --outdir puts
-    // the output in dirname(outfile) under basename(outfile).
-    std::filesystem::path outPath{};
-    if (!flags.outfile.empty()) {
-        outPath = std::filesystem::path{flags.outfile};
-        if (!flags.outdir.empty()) outPath = std::filesystem::path{flags.outdir} / outPath.filename();
-    } else {
-        // bun's default entry naming is "[dir]/[name].[ext]" (src/bundler/options.rs);
-        // with one entry "[dir]" is empty, so the chunk lands at <outdir>/<name>.js.
-        outPath = std::filesystem::path{flags.outdir} / std::filesystem::path{entryPoints.front()}.filename();
-        outPath.replace_extension(".js");
-    }
-
-    std::error_code ec{};
-    if (const std::filesystem::path parent{outPath.parent_path()}; !parent.empty()) {
-        std::filesystem::create_directories(parent, ec);
-        if (ec) {
-            std::println(std::cerr, "error: could not open output directory \"{}\"", parent.string());
+    // ── define table: `--define` first, then whatever `--env` inlines ─────────
+    // ref: bun src/bundler/options.rs `create_defines` — the user's `--define`
+    // entries seed the table and `copy_env_for_define` (src/bundler/defines.rs
+    // :105) adds one `process.env.<NAME>` entry per selected variable.
+    mbun::bundler::DefineTable defines{};
+    for (const auto& [key, value] : flags.defines) {
+        if (!defines.insert(key, value)) {
+            std::println(std::cerr, "error: invalid --define key \"{}\"", key);
             return 1;
         }
     }
-
-    struct Emitted {
-        std::string path;
-        std::string contents;
-        std::string_view kind;
-    };
-    std::vector<Emitted> emitted{};
-    emitted.push_back({outPath.string(), built->code, "entry point"});
-    if (wantSourcemap && !built->sourcemap.empty()) {
-        std::filesystem::path mapPath{outPath};
-        mapPath += ".map";
-        emitted.push_back({mapPath.string(), built->sourcemap, "source map"});
+    if (flags.env == "inline" || flags.env.ends_with('*')) {
+        const std::string_view prefix{flags.env == "inline"
+                                          ? std::string_view{}
+                                          : std::string_view{flags.env}.substr(
+                                                0, flags.env.size() - 1)};
+        for (const std::string& entry : os_environment()) {
+            const std::size_t eq{entry.find('=')};
+            if (eq == 0 || eq == std::string::npos) continue;
+            const std::string_view name{std::string_view{entry}.substr(0, eq)};
+            if (!prefix.empty() && !name.starts_with(prefix)) continue;
+            defines.insert(std::format("process.env.{}", name),
+                           mbun::bundler::quote_js_string(std::string_view{entry}.substr(eq + 1)));
+        }
     }
 
+    // ── JSX pragma overrides (--jsx-runtime/-factory/-fragment/-import-source) ─
+    // ref: bun src/cli/Arguments.rs :166-178; the defaults are bun's Pragma
+    // (automatic runtime, development, "react").
+    mbun::js_parser::detail::JsxOptions jsx{};
+    if (flags.jsxRuntime == "classic") {
+        jsx.runtime = mbun::js_parser::detail::JsxRuntime::Classic;
+    } else if (flags.jsxRuntime == "automatic") {
+        jsx.runtime = mbun::js_parser::detail::JsxRuntime::Automatic;
+    }
+    if (!flags.jsxFactory.empty()) jsx.factory = flags.jsxFactory;
+    if (!flags.jsxFragment.empty()) jsx.fragment = flags.jsxFragment;
+    if (!flags.jsxImportSource.empty()) jsx.import_source = flags.jsxImportSource;
+
+    // ── one output per entry point ───────────────────────────────────────────
+    // Without --splitting bun gives every entry point a self-contained chunk (no
+    // shared chunk is produced, so a module imported by two entries is emitted in
+    // both). The entry's output name is `[dir]/[name].[ext]` with `[dir]` taken
+    // relative to the build root — `--root`, or the entries' lowest common
+    // directory when it is not given.
+    // ref: bun src/bundler/options.rs (default entry naming, `root_dir` inference)
+    // and src/cli/build_command.rs :750-768 (--outfile placement).
+    const std::filesystem::path outbase{flags.root.empty()
+                                            ? build_common_ancestor(entryPoints)
+                                            : std::filesystem::path{build_absolute_entry(flags.root)}};
+
+    std::vector<BuildEmitted> emitted{};
+    std::uint32_t moduleCount{0};
+    for (const std::string& entryPoint : entryPoints) {
+        auto built{mbun::bundler::build_bundle(
+            {entryPoint}, mbun::bundler::Files{},
+            {.sourcemap = wantSourcemap, .fs = &fs, .jsx = jsx, .defines = defines})};
+        if (!built) {
+            std::println(std::cerr, "error: {}", built.error().message);
+            return 1;
+        }
+        moduleCount += built->moduleCount;
+
+        // ref: bun src/bundler/bundle_v2.zig — a --banner is prepended and a
+        // --footer appended to each output chunk (after the hashbang, if any).
+        // expectBundled's CLI backend passes the value quoted (`--banner="<v>"`)
+        // with no shell to strip it, so the flag already carries the literal text.
+        if (!flags.banner.empty()) {
+            std::string_view code{built->code};
+            std::string prefixed{};
+            if (code.starts_with("#!")) {
+                const std::size_t eol{code.find('\n')};
+                const std::size_t cut{eol == std::string_view::npos ? code.size() : eol + 1};
+                prefixed.append(code.substr(0, cut));
+                if (eol == std::string_view::npos) prefixed.push_back('\n');
+                prefixed.append(flags.banner);
+                prefixed.push_back('\n');
+                prefixed.append(code.substr(cut));
+            } else {
+                prefixed.append(flags.banner);
+                prefixed.push_back('\n');
+                prefixed.append(code);
+            }
+            built->code = std::move(prefixed);
+        }
+        if (!flags.footer.empty()) {
+            if (!built->code.empty() && built->code.back() != '\n') built->code.push_back('\n');
+            built->code.append(flags.footer);
+            built->code.push_back('\n');
+        }
+
+        // ref: bun src/cli/build_command.rs :769-780 — with neither --outfile nor
+        // --outdir the single chunk goes to stdout and nothing else is printed.
+        if (flags.outfile.empty() && flags.outdir.empty()) {
+            std::print("{}", built->code);
+            std::cout.flush();
+            continue;
+        }
+
+        std::filesystem::path outPath{};
+        if (!flags.outfile.empty()) {
+            outPath = std::filesystem::path{flags.outfile};
+            if (!flags.outdir.empty()) {
+                outPath = std::filesystem::path{flags.outdir} / outPath.filename();
+            }
+        } else {
+            outPath = std::filesystem::path{flags.outdir} /
+                      build_entry_relative_name(entryPoint, outbase);
+            // A CSS entry point emits a CSS chunk, so "[ext]" is "css" there —
+            // bun names it <outdir>/<name>.css
+            // (src/bundler/linker_context/postProcessCSSChunk.rs).
+            if (built->cssChunk) outPath.replace_extension(".css");
+        }
+
+        std::error_code ec{};
+        if (const std::filesystem::path parent{outPath.parent_path()}; !parent.empty()) {
+            std::filesystem::create_directories(parent, ec);
+            if (ec) {
+                std::println(std::cerr, "error: could not open output directory \"{}\"",
+                             parent.string());
+                return 1;
+            }
+        }
+
+        std::filesystem::path mapPath{outPath};
+        mapPath += ".map";
+        // `--sourcemap=linked` (and the bare `--sourcemap`) appends the
+        // `//# sourceMappingURL=` pragma naming the sibling .map file; `external`
+        // writes the map but deliberately leaves the chunk without a pragma.
+        // ref: bun src/bundler/options.rs SourceMapOption.
+        if (wantSourcemap && !built->sourcemap.empty() && flags.sourcemap == "linked") {
+            if (!built->code.empty() && built->code.back() != '\n') built->code.push_back('\n');
+            built->code.append("//# sourceMappingURL=")
+                .append(mapPath.filename().generic_string())
+                .push_back('\n');
+        }
+
+        emitted.push_back({outPath.string(),
+                           build_display_path(outPath, flags.outdir, flags.outfile),
+                           std::move(built->code), "entry point"});
+        if (wantSourcemap && !built->sourcemap.empty()) {
+            emitted.push_back({mapPath.string(),
+                               build_display_path(mapPath, flags.outdir, flags.outfile),
+                               std::move(built->sourcemap), "source map"});
+        }
+    }
+
+    if (emitted.empty()) return 0;  // stdout build: nothing was written to disk
+
     bool hadErr{false};
-    for (const Emitted& file : emitted) {
+    for (const BuildEmitted& file : emitted) {
         std::ofstream out{file.path, std::ios::binary | std::ios::trunc};
         out.write(file.contents.data(), static_cast<std::streamsize>(file.contents.size()));
         if (!out) {
@@ -1430,29 +1688,7 @@ int run_build(std::span<const std::string_view> buildArgs) {
     }
     if (hadErr) return 1;
 
-    // ref: bun src/cli/build_command.rs :1019-1035 then :1045-1129 — the "Bundled N
-    // modules in Xms" line, a blank line, then the two-space-indented listing of
-    // "<path><pad><size>  <pad>(<kind>)" and a trailing blank line.
-    const auto elapsedMs{std::chrono::duration_cast<std::chrono::milliseconds>(
-                             std::chrono::steady_clock::now() - start)
-                             .count()};
-    std::println("Bundled {} module{} in {}ms", built->moduleCount,
-                 built->moduleCount == 1 ? "" : "s", elapsedMs);
-    std::println("");
-
-    std::size_t maxPathLen{0};
-    std::size_t sizePadding{0};
-    for (const Emitted& file : emitted) {
-        maxPathLen = std::max(maxPathLen, file.path.size());
-        sizePadding = std::max(sizePadding, format_size(file.contents.size()).size());
-    }
-    for (const Emitted& file : emitted) {
-        const std::string size{format_size(file.contents.size())};
-        std::println("  {}{}{}  {}({})", file.path,
-                     std::string(std::max<std::size_t>(2, maxPathLen + 2 - file.path.size()), ' '), size,
-                     std::string(sizePadding - size.size(), ' '), file.kind);
-    }
-    std::println("");
+    print_build_listing(emitted, moduleCount, start);
     return 0;
 }
 

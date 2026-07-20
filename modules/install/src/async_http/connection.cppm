@@ -258,6 +258,11 @@ public:
         }
         mbun::tls::Config cfg{};
         cfg.serverName = hostname_;
+        // bun's HTTP client always advertises ALPN on the ClientHello (it offers
+        // "http/1.1", plus "h2" only when HTTP/2 is enabled). This slice speaks
+        // HTTP/1.1, so it offers exactly that — servers and middleboxes that key
+        // off ALPN otherwise see a protocol-less ClientHello. See regression 29780.
+        cfg.alpnProtocols = {"http/1.1"};
         cfg.ca = options_.tlsCaBundle;
         cfg.verify = options_.tlsVerifyPeer ? mbun::tls::VerifyMode::required
                                             : mbun::tls::VerifyMode::disabled;

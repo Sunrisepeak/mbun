@@ -30,6 +30,7 @@ export module mbun.bundler.vertical_slice;
 
 import std;
 import mbun.bundler.ascii_only;
+import mbun.bundler.defines;
 import mbun.core.strings;
 import mbun.css;
 import mbun.js_lexer;
@@ -107,6 +108,11 @@ struct BuildOptions {
     // `Bun.build({ jsx })`. `.js`/`.ts` inputs never see JSX lowering, so this is
     // backward-compatible for existing non-JSX builds.
     mbun::js_parser::detail::JsxOptions jsx{};
+    // Compile-time identifier substitution (`--define K=V`, and the
+    // `process.env.NAME` entries `--env inline` / `Bun.build({ env })` synthesise).
+    // Empty by default, in which case the source text reaches the parser byte for
+    // byte as before. ref: bun-ref/src/bundler/options.rs `create_defines`.
+    DefineTable defines{};
     // Collect esbuild-compatible metafile input records into
     // BundleResult::metafileInputs. Off by default so the common build path pays
     // nothing; the runtime bridge turns it on for `Bun.build({ metafile })`.
@@ -638,6 +644,7 @@ public:
         onResolve_ = options.on_resolve ? &options.on_resolve : nullptr;
         onLoad_ = options.on_load ? &options.on_load : nullptr;
         jsxOptions_ = options.jsx;
+        defines_ = options.defines;
 
         std::vector<ModuleId> entryIds;
         std::vector<std::string> entryPaths;
@@ -769,6 +776,8 @@ private:
     const OnLoadHook* onLoad_{nullptr};
     // JSX config (BuildOptions::jsx), applied to `.jsx`/`.tsx` modules only.
     mbun::js_parser::detail::JsxOptions jsxOptions_{};
+    // Define table (BuildOptions::defines); empty = no substitution pass runs.
+    DefineTable defines_{};
 
     // ── overlay filesystem: in-memory `files` shadow disk ────────────────────
     // ref: bun layers the JSBundler file map over the real resolver filesystem
@@ -951,6 +960,19 @@ private:
             return {};
         }
 
+        // Compile-time defines (`--define`, `--env inline`) are substituted into the
+        // source text before anything else reads it, so the lexer that extracts
+        // import records, the JSX lowering pass and the transpiler all observe the
+        // replaced expression — the same position bun's printer-level define
+        // resolution occupies. Non-JS loaders above are deliberately excluded: bun
+        // only resolves defines in JS-family ASTs.
+        std::string definedOwned;
+        std::string_view jsSource{source};
+        if (!defines_.empty()) {
+            definedOwned = apply_defines(source, defines_);
+            jsSource = definedOwned;
+        }
+
         // `.jsx`/`.tsx` inputs lower JSX; `.tsx` also carries TS, which transpile
         // erases regardless. `.js`/`.ts` never see JSX lowering, keeping non-JSX
         // builds byte-identical to before.
@@ -961,10 +983,10 @@ private:
         // we first lower JSX while KEEPING ESM (cjs=false) and lex that; non-JSX
         // inputs lex the raw source unchanged.
         std::string lexOwned;
-        std::string_view lexSource{source};
+        std::string_view lexSource{jsSource};
         if (is_jsx) {
             auto lowered{mbun::js_parser::transpile(
-                source, {.cjs = false, .jsx = true, .jsx_options = jsxOptions_})};
+                jsSource, {.cjs = false, .jsx = true, .jsx_options = jsxOptions_})};
             if (!lowered.ok) {
                 return std::unexpected(
                     BuildError{module.path, std::move(lowered.error), lowered.error_offset});
@@ -977,7 +999,7 @@ private:
             return std::unexpected(tokens.error());
         }
         auto transpiled{mbun::js_parser::transpile(
-            source, {.cjs = true, .jsx = is_jsx, .jsx_options = jsxOptions_})};
+            jsSource, {.cjs = true, .jsx = is_jsx, .jsx_options = jsxOptions_})};
         if (!transpiled.ok) {
             return std::unexpected(BuildError{module.path, std::move(transpiled.error), transpiled.error_offset});
         }

@@ -723,6 +723,10 @@ inline ExecuteResult perform_once(const nt::UrlParts& url, std::string_view rawU
     if (isHttps) {
         mbun::tls::Config cfg{};
         cfg.serverName = std::string{url.hostname};
+        // Same ALPN offer as the async client path (regression 29780): bun never
+        // sends a ClientHello without an application_layer_protocol_negotiation
+        // extension, and this executor speaks HTTP/1.1.
+        cfg.alpnProtocols = {"http/1.1"};
         cfg.ca = options.tlsCaBundle;
         cfg.verify = options.tlsVerifyPeer ? mbun::tls::VerifyMode::required
                                            : mbun::tls::VerifyMode::disabled;

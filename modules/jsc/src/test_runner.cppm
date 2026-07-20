@@ -188,7 +188,15 @@ inline constexpr std::string_view HARNESS = R"JS(
     if (v instanceof Date) return v.toISOString();   // bun pretty-format: unquoted ISO string
     if (v instanceof RegExp) return String(v);
     if (Array.isArray(v)) { if (v.length === 0) return "[]"; return "[\n" + v.map((x) => ni + snapSerialize(x, ni) + ",").join("\n") + "\n" + indent + "]"; }
-    if (typeof v === "object") { const ks = Object.keys(v).sort(); if (ks.length === 0) return "{}"; return "{\n" + ks.map((k) => ni + "\"" + k + "\": " + snapSerialize(v[k], ni) + ",").join("\n") + "\n" + indent + "}"; }
+    // pretty-format tags a class instance with its constructor name ("Node {…}");
+    // a plain object (or a null-prototype one) stays bare. ref: regression 17766.
+    if (typeof v === "object") {
+      const ctor = v.constructor;
+      const tag = (ctor && ctor !== Object && typeof ctor.name === "string" && ctor.name) ? ctor.name + " " : "";
+      const ks = Object.keys(v).sort();
+      if (ks.length === 0) return tag + "{}";
+      return tag + "{\n" + ks.map((k) => ni + "\"" + k + "\": " + snapSerialize(v[k], ni) + ",").join("\n") + "\n" + indent + "}";
+    }
     return String(v);
   }
 
