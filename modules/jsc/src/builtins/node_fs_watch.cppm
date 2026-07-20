@@ -137,23 +137,50 @@ inline constexpr std::string_view kNodeFsWatchJS = R"JS(
   // riding inotify, and reports (curr, prev) Stats -- matching node's StatWatcher.
   const statWatchers = new Map();
 
+  // An all-zero Stats/BigIntStats, which is what node/bun hand to the listener
+  // for a path that does not exist (`bun_core::ffi::zeroed::<PosixStat>()` in
+  // bun-ref/src/runtime/node/node_fs_stat_watcher.rs restat/initial-stat).
+  const zeroStats = (bigint) => {
+    if (bigint && fs.BigIntStats) {
+      return new fs.BigIntStats(0n, 0n, 0n, 0n, 0n, 0n, 0n, 0n, 0n, 0n, 0n, 0n, 0n, 0n, 0n, 0n, 0n, 0n);
+    }
+    return new fs.Stats(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+  };
+
   class StatWatcher extends EE {
     constructor(filename, options) {
       super();
       this._path = toStr(filename);
       this._interval = options.interval === undefined ? 5007 : options.interval;
       this._persistent = options.persistent === undefined ? true : !!options.persistent;
+      this._bigint = !!options.bigint;
       this._prev = this._stat();
       this._closed = false;
       this._timer = setInterval(() => this._check(), this._interval);
       if (!this._persistent && this._timer && this._timer.unref) this._timer.unref();
+      // bun fires the listener once with (zeroed, zeroed) when the *initial*
+      // stat fails, then keeps polling -- see initial_stat_error_on_main_thread
+      // in bun-ref/src/runtime/node/node_fs_stat_watcher.rs. Deferred to a tick
+      // because watchFile() attaches the listener after the constructor returns.
+      // A throwing listener must not stop the poll loop (the interval is
+      // already armed above), and surfaces as an uncaughtException.
+      if (this._missing) {
+        process.nextTick(() => {
+          if (this._closed) return;
+          this.emit("change", this._prev, this._prev);
+        });
+      }
     }
 
     _stat() {
-      try { return fs.statSync(this._path); }
-      catch (e) {
+      try {
+        const s = fs.statSync(this._path, this._bigint ? { bigint: true } : undefined);
+        this._missing = false;
+        return s;
+      } catch (e) {
         // node hands back a zeroed Stats for a missing file rather than throwing.
-        try { return fs.statSync("/"); } catch (e2) { return null; }
+        this._missing = true;
+        return zeroStats(this._bigint);
       }
     }
 
