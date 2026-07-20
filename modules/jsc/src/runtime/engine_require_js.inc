@@ -15,6 +15,22 @@ if (typeof Symbol.asyncDispose === "undefined") { Object.defineProperty(Symbol, 
 // `arg_string` stringifies an absent argument to the literal "undefined", which
 // would then be probed as a loader name. A plain user `require("m")` passes no
 // second argument and is unaffected.
+// Bridge for `require("blob:…")` / `import("blob:…")`: the object-URL registry is
+// a JS-side Map (URL.createObjectURL in the web bootstrap), so the native module
+// loader asks for the blob through this hook. Returns { type, source } — the
+// blob's MIME type (which selects the loader, bun Blob.rs:2178 get_loader) and its
+// bytes decoded as UTF-8 — or null when the id is not registered (revoked or
+// never created), which makes require() fall through to the normal resolver and
+// report MODULE_NOT_FOUND.
+globalThis.__mbun_blob_module_source = function (spec) {
+  const resolve = globalThis.__bunResolveObjectURL;
+  if (typeof resolve !== "function") return null;
+  const blob = resolve(spec);
+  if (blob === undefined || blob === null) return null;
+  const bytes = blob._u8;
+  return { type: typeof blob.type === "string" ? blob.type : "",
+           source: bytes ? new TextDecoder().decode(bytes) : "" };
+};
 globalThis.__mbun_make_require = function (dir) {
   // `k` (arg 3): truthy when this call is a lowered ESM import statement or a
   // dynamic import (ImportKind::Stmt/Dynamic) rather than a literal require() —

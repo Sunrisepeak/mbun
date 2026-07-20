@@ -111,6 +111,46 @@ struct DnsServerAddress {
     socklen_t length{0};
 };
 
+// One nameserver in node's `dns.Resolver#setServers` text form: "IP",
+// "IP:PORT", "[IPv6]:PORT" or a bare IPv6 literal. Port defaults to 53.
+// ref: node lib/internal/dns/utils.js setServers (the same four shapes; a
+// malformed entry is an ERR_INVALID_IP_ADDRESS thrown by the JS layer, so a
+// nullopt here simply drops the entry).
+std::optional<DnsServerAddress> dns_parse_server_(std::string_view text) {
+    std::string host{text};
+    std::uint16_t port{53};
+    if (!host.empty() && host.front() == '[') {
+        const auto close{host.find(']')};
+        if (close == std::string::npos) return std::nullopt;
+        std::string rest{host.substr(close + 1)};
+        host = host.substr(1, close - 1);
+        if (rest.starts_with(":")) port = static_cast<std::uint16_t>(std::atoi(rest.c_str() + 1));
+    } else if (const auto colon{host.rfind(':')};
+               colon != std::string::npos && host.find(':') == colon) {
+        // A single colon means IPv4:port; several mean a bare IPv6 literal.
+        port = static_cast<std::uint16_t>(std::atoi(host.c_str() + colon + 1));
+        host = host.substr(0, colon);
+    }
+    DnsServerAddress server;
+    sockaddr_in ipv4{};
+    if (inet_pton(AF_INET, host.c_str(), &ipv4.sin_addr) == 1) {
+        ipv4.sin_family = AF_INET;
+        ipv4.sin_port = htons(port);
+        std::memcpy(&server.address, &ipv4, sizeof(ipv4));
+        server.length = sizeof(ipv4);
+        return server;
+    }
+    sockaddr_in6 ipv6{};
+    if (inet_pton(AF_INET6, host.c_str(), &ipv6.sin6_addr) == 1) {
+        ipv6.sin6_family = AF_INET6;
+        ipv6.sin6_port = htons(port);
+        std::memcpy(&server.address, &ipv6, sizeof(ipv6));
+        server.length = sizeof(ipv6);
+        return server;
+    }
+    return std::nullopt;
+}
+
 std::vector<DnsServerAddress> dns_servers_() {
     std::ifstream input{"/etc/resolv.conf"};
     std::vector<DnsServerAddress> servers;
@@ -311,11 +351,18 @@ public:
     }
 };
 
-DnsResult dns_record_query_blocking_(std::string_view host, mbun::dns::RecordType type) {
+// `overrideServers` is a dns.Resolver's own nameserver list (setServers); empty
+// means "the system list" (/etc/resolv.conf), which is what module-level
+// dns.resolve* uses. `options` carries the Resolver's timeout/tries.
+DnsResult dns_record_query_blocking_(std::string_view host, mbun::dns::RecordType type,
+                                     const std::vector<DnsServerAddress>& overrideServers = {},
+                                     mbun::dns::RecordQueryOptions options = {}) {
     DnsResult result{.operation = DnsOperation::resolve, .recordType = type};
-    const auto servers{dns_servers_()};
+    const auto systemServers{overrideServers.empty() ? dns_servers_()
+                                                     : std::vector<DnsServerAddress>{}};
+    const auto& servers{overrideServers.empty() ? systemServers : overrideServers};
     DnsPosixRecordTransport transport{servers};
-    auto queried{mbun::dns::query_record(host, type, servers.size(), transport)};
+    auto queried{mbun::dns::query_record(host, type, servers.size(), transport, options)};
     if (!queried) result.error = dns_ares_code_(queried.error());
     else result.records = std::move(*queried);
     return result;
@@ -660,6 +707,9 @@ private:
         int nodeFlags{0};
         std::uint16_t port{0};
         mbun::dns::RecordType recordType{mbun::dns::RecordType::A};
+        // A dns.Resolver's own nameservers + query policy (empty → system list).
+        std::vector<DnsServerAddress> servers{};
+        mbun::dns::RecordQueryOptions queryOptions{};
     };
     struct Completion {
         std::uint64_t id{0};
@@ -720,7 +770,8 @@ private:
         }
         if (job.operation == DnsOperation::reverse) return dns_reverse_blocking_(job.host);
         if (job.operation == DnsOperation::resolve) {
-            return dns_record_query_blocking_(job.host, job.recordType);
+            return dns_record_query_blocking_(job.host, job.recordType, job.servers,
+                                              job.queryOptions);
         }
         return dns_lookup_service_blocking_(job.host, job.port);
     }
@@ -797,9 +848,11 @@ public:
     }
 
     void submit_resolve(std::string host, mbun::dns::RecordType recordType,
-                        JSObjectRef callback) {
+                        JSObjectRef callback, std::vector<DnsServerAddress> servers = {},
+                        mbun::dns::RecordQueryOptions queryOptions = {}) {
         submit_(Job{.operation = DnsOperation::resolve, .host = std::move(host),
-                    .recordType = recordType}, callback);
+                    .recordType = recordType, .servers = std::move(servers),
+                    .queryOptions = queryOptions}, callback);
     }
 
     std::size_t drain() {
@@ -903,7 +956,33 @@ JSValueRef dnsn_resolve_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size
     if (callback == nullptr) return JSValueMakeUndefined(ctx);
     const int rawType{argc > 1 ? static_cast<int>(JSValueToNumber(ctx, args[1], nullptr)) : 1};
     const auto recordType{static_cast<mbun::dns::RecordType>(rawType)};
-    gDnsAsyncState->submit_resolve(arg_string(ctx, argc, args, 0), recordType, callback);
+    // args[3..5] (optional): a dns.Resolver's own nameservers ("IP[:PORT]" /
+    // "[IPv6]:PORT" strings), per-query timeout in ms, and try count. Absent for
+    // the module-level dns.resolve*, which uses /etc/resolv.conf + the defaults.
+    std::vector<DnsServerAddress> servers;
+    if (argc > 3 && JSValueIsObject(ctx, args[3])) {
+        JSObjectRef list{JSValueToObject(ctx, args[3], nullptr)};
+        const auto count{static_cast<unsigned>(
+            JSValueToNumber(ctx, get_prop(ctx, list, "length"), nullptr))};
+        for (unsigned i{0}; i < count; ++i) {
+            JSValueRef entry{JSObjectGetPropertyAtIndex(ctx, list, i, nullptr)};
+            if (auto parsed{dns_parse_server_(val_to_string(ctx, entry))}) {
+                servers.push_back(*parsed);
+            }
+        }
+    }
+    mbun::dns::RecordQueryOptions queryOptions;
+    if (argc > 4 && JSValueIsNumber(ctx, args[4])) {
+        const double timeout{JSValueToNumber(ctx, args[4], nullptr)};
+        // node treats a negative/0 `timeout` as "use the default" (c-ares does).
+        if (timeout > 0) queryOptions.timeoutMs = static_cast<std::uint64_t>(timeout);
+    }
+    if (argc > 5 && JSValueIsNumber(ctx, args[5])) {
+        const double tries{JSValueToNumber(ctx, args[5], nullptr)};
+        if (tries >= 1) queryOptions.attempts = static_cast<std::size_t>(tries);
+    }
+    gDnsAsyncState->submit_resolve(arg_string(ctx, argc, args, 0), recordType, callback,
+                                   std::move(servers), queryOptions);
     return JSValueMakeUndefined(ctx);
 }
 

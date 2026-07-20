@@ -255,7 +255,16 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
   }
 
   // ---- checkServerIdentity (RFC 6125), ported from bun-ref/node lib/tls.js ----
-  const canonicalizeIP = (ip) => ip; // DEFERRED: full IPv6 canonicalization (see NodeTLS.cpp Bun__canonicalizeIP)
+  // Canonical text form of an IP literal (NodeTLS.cpp Bun__canonicalizeIP): both
+  // sides of the IP-SAN comparison below go through it, so "fe80:0:0:0:0:0:0:1"
+  // and "fe80::1" (or an uppercase-hex SAN) match. Non-IP input comes back
+  // unchanged — the caller has already established it IS an IP for the hostname
+  // side, and a malformed SAN must stay unequal rather than become undefined.
+  const canonicalizeIP = (ip) => {
+    const N = globalThis.__mbunNodeTlsNative;
+    if (N && typeof N.canonicalizeIP === "function") { const c = N.canonicalizeIP(ip); if (typeof c === "string") return c; }
+    return ip;
+  };
   const netIsIP = (h) => {
     if (net && typeof net.isIP === "function") { const r = net.isIP(h); if (r) return r; }
     if (/^(\d{1,3}\.){3}\d{1,3}$/.test(h)) return 4;

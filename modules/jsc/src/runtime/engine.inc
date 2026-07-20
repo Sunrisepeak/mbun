@@ -616,6 +616,92 @@ public:
         }
     }
 
+    // The blob behind a `blob:` specifier as (MIME type, bytes decoded as UTF-8),
+    // or nullopt when that object URL is not registered (never created, or already
+    // revoked). The registry lives in JS (URL.createObjectURL, bootstrap.cppm), so
+    // this goes through the __mbun_blob_module_source bridge installed with the
+    // require machinery. A miss deliberately falls back to the normal resolver so
+    // an unknown blob URL still reports MODULE_NOT_FOUND — bun's
+    // GetLoaderAndVirtualSourceErr::BlobNotFound (bundler/options.rs:590).
+    std::optional<std::pair<std::string, std::string>> blob_module_source_(
+        JSContextRef ctx, const std::string& spec) {
+        JSObjectRef global{JSContextGetGlobalObject(ctx)};
+        JSValueRef fnVal{get_prop(ctx, global, "__mbun_blob_module_source")};
+        if (fnVal == nullptr || !JSValueIsObject(ctx, fnVal)) return std::nullopt;
+        JSObjectRef fn{JSValueToObject(ctx, fnVal, nullptr)};
+        if (fn == nullptr || !JSObjectIsFunction(ctx, fn)) return std::nullopt;
+        JSValueRef arg{make_string(ctx, spec)};
+        JSValueRef res{JSObjectCallAsFunction(ctx, fn, nullptr, 1, &arg, nullptr)};
+        if (res == nullptr || !JSValueIsObject(ctx, res)) return std::nullopt;
+        JSObjectRef o{JSValueToObject(ctx, res, nullptr)};
+        return std::pair<std::string, std::string>{val_to_string(ctx, get_prop(ctx, o, "type")),
+                                                   val_to_string(ctx, get_prop(ctx, o, "source"))};
+    }
+
+    // A blob's MIME type → loader. Blueprint: bun Blob.rs:2178 get_loader (a Blob
+    // with no backing file answers off its MIME type) → bundler/options.rs:436
+    // Loader::from_mime_type. Note the last two arms: `text/javascript` — the
+    // canonical type of a `new Blob([...], { type: "application/javascript" })` —
+    // is MimeType::Category::Javascript, NOT Text (http_types/MimeType.rs:161,
+    // :292), so it does not take the Text arm and lands on the "be maximally
+    // permissive" Tsx default. That is what makes a JS/TS object-URL module get
+    // transpiled (and a syntax error in it surface as a BuildMessage) rather than
+    // exported as a string.
+    static mbun::jsc::module_loader::Loader blob_loader_from_mime_(std::string_view mime) {
+        using mbun::jsc::module_loader::Loader;
+        if (mime.starts_with("application/javascript-jsx")) return Loader::Jsx;
+        if (mime.starts_with("application/typescript-jsx")) return Loader::Tsx;
+        if (mime.starts_with("application/javascript")) return Loader::Js;
+        if (mime.starts_with("application/typescript")) return Loader::Ts;
+        if (mime.starts_with("application/json5")) return Loader::Json5;
+        if (mime.starts_with("application/jsonc")) return Loader::Json;
+        if (mime.starts_with("application/json")) return Loader::Json;
+        // MimeType::Category::Text — every `text/*` type except the javascript
+        // ones (which are Category::Javascript, see above).
+        if (mime.starts_with("text/") && !mime.starts_with("text/javascript") &&
+            !mime.starts_with("text/jsx")) {
+            return Loader::Text;
+        }
+        return Loader::Tsx;
+    }
+
+    // Build the LoadResult for a `blob:` module: the blob's bytes ARE the source
+    // (there is no file to read and no path to resolve), so this stands in for
+    // ModuleLoader::load. bun does the same by handing the module pipeline a
+    // virtual Source over the blob's shared view (bundler/options.rs:564-591).
+    mbun::jsc::module_loader::LoadResult load_blob_module_(
+        std::pair<std::string, std::string> blob, const std::string& spec,
+        const std::string& typeAttr) {
+        namespace ml = mbun::jsc::module_loader;
+        ml::LoadResult out;
+        out.path = spec;
+        out.loader = blob_loader_from_mime_(blob.first);
+        // An explicit `with { type: … }` still overrides the MIME-derived loader
+        // (options.rs:600-604 runs after the blob branch).
+        if (!typeAttr.empty()) {
+            if (const std::optional<ml::Loader> attr{ml::loader_from_string(typeAttr)}) {
+                out.loader = *attr;
+            }
+        }
+        if (ml::needs_transpile(out.loader)) {
+            std::expected<std::string, std::string> js{
+                ml::transpile(blob.second, out.loader, /*cjs=*/true, &out.top_level_await,
+                              /*legacyDecorators=*/false, &out.cjs_esm_module)};
+            if (!js) {
+                out.status = ml::LoadStatus::TranspileFailed;
+                out.message = std::move(js.error());
+                return out;
+            }
+            out.source = std::move(*js);
+        } else if (out.loader == ml::Loader::Text || out.loader == ml::Loader::File) {
+            out.source = ml::loader_source_for(out.loader, spec, blob.second);
+        } else {
+            out.source = std::move(blob.second);
+        }
+        out.status = ml::LoadStatus::Success;
+        return out;
+    }
+
     // `esm`: the *importing* module's source used ESM syntax, so this require()
     // is a lowered `import` and must resolve with the "import" condition (not
     // "require"). See __mbun_make_require_esm below for how it is threaded in.
@@ -689,12 +775,30 @@ public:
                 return JSValueMakeUndefined(ctx);
             }
         }
-        mbun::resolver::Options opts;
-        opts.kind = esm ? mbun::resolver::ResolveKind::Import : mbun::resolver::ResolveKind::Require;
-        opts.tsconfig = find_tsconfig_(fromDir);
-        opts.node_paths = node_paths_from_env();
-        mbun::jsc::module_loader::ModuleLoader loader{os_fs(), std::move(opts), /*cjs=*/true};
-        mbun::jsc::module_loader::LoadResult loaded{loader.load(rspec, fromDir, effTypeAttr)};
+        // blob: URL module — `require(URL.createObjectURL(new Blob([src])))`. There
+        // is no file behind an object URL, so it must bypass the path resolver
+        // entirely: bun substitutes a virtual Source built from the blob's bytes
+        // and a loader derived from its MIME type (bundler/options.rs:564-591).
+        // Without this the specifier reached the on-disk resolver and every blob
+        // module failed as "Cannot find module" (a ResolveMessage) — even one
+        // whose real fault was a syntax error, which bun reports as a BuildMessage.
+        mbun::jsc::module_loader::LoadResult loaded;
+        bool blobModule{false};
+        if (rspec.starts_with("blob:")) {
+            if (auto blob{blob_module_source_(ctx, rspec)}) {
+                blobModule = true;
+                loaded = load_blob_module_(std::move(*blob), rspec, effTypeAttr);
+            }
+        }
+        if (!blobModule) {
+            mbun::resolver::Options opts;
+            opts.kind =
+                esm ? mbun::resolver::ResolveKind::Import : mbun::resolver::ResolveKind::Require;
+            opts.tsconfig = find_tsconfig_(fromDir);
+            opts.node_paths = node_paths_from_env();
+            mbun::jsc::module_loader::ModuleLoader loader{os_fs(), std::move(opts), /*cjs=*/true};
+            loaded = loader.load(rspec, fromDir, effTypeAttr);
+        }
         using mbun::jsc::module_loader::LoadStatus;
 
         // package.json "imports" resolved `#spec` to a bare target (builtin or
@@ -874,8 +978,11 @@ public:
         // empty→{}), which matches JSON.parse exactly on escapes/surrogates. Note
         // ".jsonc" does not end with ".json", so both suffixes are checked. This
         // mirrors bun's .json/.jsonc loader (comment- and trailing-comma-tolerant).
+        // (`blobModule`: a blob: module has no extension at all — its loader came
+        // from the blob's MIME type — so the suffix guard would otherwise hand a
+        // JSON object URL's body to the JS evaluator.)
         if (loaderKind == mbun::jsc::module_loader::Loader::Json &&
-            (path.ends_with(".json") || path.ends_with(".jsonc") ||
+            (blobModule || path.ends_with(".json") || path.ends_with(".jsonc") ||
              path.ends_with("bun.lock"))) {
             source = "module.exports = Bun.JSONC.parse(\"" + escape_dq(source) + "\");";
         }

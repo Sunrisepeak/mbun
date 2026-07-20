@@ -389,7 +389,112 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   // inspected, %-specifiers honored) so objects render `{ foo: 'bar' }`, not
   // `[object Object]`. colorMode ('auto'|true|false) drives inspect colors; 'auto'
   // follows the target stream's isTTY. ref bun src/js/node/console.ts formatWithOptions.
-  class Console { constructor(out) { const o = out && out.stdout ? out : { stdout: out }; Object.assign(this, G.console); const colorMode = o.colorMode === undefined ? "auto" : o.colorMode; const io = o.inspectOptions; const colorsFor = (s) => colorMode === "auto" ? !!(s && s.isTTY) : !!colorMode; const fmt = (s, a) => util.formatWithOptions(Object.assign({}, io, { colors: colorsFor(s) }), ...a) + "\n"; this.log = this.info = (...a) => { (o.stdout && o.stdout.write) ? o.stdout.write(fmt(o.stdout, a)) : G.console.log(...a); }; this.error = this.warn = (...a) => { (o.stderr && o.stderr.write) ? o.stderr.write(fmt(o.stderr, a)) : G.console.error(...a); }; } }
+  // ---- Console#table (https://console.spec.whatwg.org/#table) --------------
+  // Blueprint: bun src/js/builtins/ConsoleObject.ts:180-250 (tableChars +
+  // renderRow/table, itself node's lib/internal/cli_table.js) and :645-739 (the
+  // `table` method). Cells are CENTER-padded: `" ".repeat(needed)` truncates a
+  // fractional count while the right pad ceils it, so an odd leftover space goes
+  // to the right — that asymmetry is load-bearing for the expected output.
+  const tableChars = { middleMiddle: "─", rowMiddle: "┼", topRight: "┐", topLeft: "┌", leftMiddle: "├",
+                       topMiddle: "┬", bottomRight: "┘", bottomLeft: "└", bottomMiddle: "┴",
+                       rightMiddle: "┤", left: "│ ", right: " │", middle: " │ " };
+  // Display width, not code-unit length: a CJK/emoji cell occupies two columns.
+  const tableCellWidth = (s) => (G.Bun && typeof G.Bun.stringWidth === "function" ? G.Bun.stringWidth(String(s)) : String(s).length);
+  const renderTableRow = (row, widths) => {
+    let out = tableChars.left;
+    for (let i = 0; i < row.length; i++) {
+      const cell = row[i];
+      const needed = (widths[i] - tableCellWidth(cell)) / 2;
+      out += " ".repeat(needed) + cell + " ".repeat(Math.ceil(needed));
+      if (i !== row.length - 1) out += tableChars.middle;
+    }
+    return out + tableChars.right;
+  };
+  const renderTable = (head, columns) => {
+    const widths = head.map(tableCellWidth);
+    const longest = columns.length === 0 ? 0 : Math.max(...columns.map((a) => a.length));
+    const rows = new Array(longest);
+    for (let i = 0; i < head.length; i++) {
+      const column = columns[i];
+      for (let j = 0; j < longest; j++) {
+        if (rows[j] === undefined) rows[j] = [];
+        const value = (rows[j][i] = Object.prototype.hasOwnProperty.call(column, j) ? column[j] : "");
+        widths[i] = Math.max(widths[i] || 0, tableCellWidth(value));
+      }
+    }
+    const divider = widths.map((w) => tableChars.middleMiddle.repeat(w + 2));
+    let result = tableChars.topLeft + divider.join(tableChars.topMiddle) + tableChars.topRight + "\n" +
+                 renderTableRow(head, widths) + "\n" +
+                 tableChars.leftMiddle + divider.join(tableChars.rowMiddle) + tableChars.rightMiddle + "\n";
+    for (const row of rows) result += renderTableRow(row, widths) + "\n";
+    return result + tableChars.bottomLeft + divider.join(tableChars.bottomMiddle) + tableChars.bottomRight;
+  };
+  // `logFn` is the console's own log (stream routing + formatting stay the
+  // instance's); `io` its inspect options.
+  const consoleTableImpl = (logFn, io, tabularData, properties) => {
+    if (properties !== undefined && !Array.isArray(properties)) {
+      const e = new TypeError('The "properties" argument must be an instance of Array. Received ' +
+        (properties === null ? "null" : typeof properties === "object" ? "an instance of " + ((properties.constructor && properties.constructor.name) || "Object") : "type " + typeof properties));
+      e.code = "ERR_INVALID_ARG_TYPE";
+      throw e;
+    }
+    if (tabularData === null || typeof tabularData !== "object") return logFn(tabularData);
+    const T = util.types;
+    const isArrayish = (v) => Array.isArray(v) || ArrayBuffer.isView(v);
+    const final = (k, v) => logFn(renderTable(k, v));
+    // depth -1 collapses an object with more than two keys to `[Object]` — the
+    // cell would otherwise blow the column out (ConsoleObject.ts:654).
+    const _inspect = (v) => {
+      const depth = v !== null && typeof v === "object" && !isArrayish(v) && Object.keys(v).length > 2 ? -1 : 0;
+      return util.inspect(v, Object.assign({ depth, maxArrayLength: 3, breakLength: Infinity }, io));
+    };
+    const getIndexArray = (length) => Array.from({ length }, (_, i) => _inspect(i));
+    const iterKey = "(iteration index)", keyKey = "Key", valuesKey = "Values", indexKey = "(index)";
+    const mapIter = T.isMapIterator(tabularData);
+    // NOTE: bun leaves node's `previewEntries(mapIter, true)` commented out
+    // (ConsoleObject.ts:747-751), so a Map ITERATOR is never split into
+    // Key/Values columns — it falls through to the set-like branch below and
+    // each entry renders as a whole `[ k, v ]` array. Only a live Map takes the
+    // three-column form.
+    if (T.isMap(tabularData)) {
+      const keys = [], values = [];
+      let length = 0;
+      for (const entry of tabularData) { keys.push(_inspect(entry[0])); values.push(_inspect(entry[1])); length++; }
+      return final([iterKey, keyKey, valuesKey], [getIndexArray(length), keys, values]);
+    }
+    if (T.isSetIterator(tabularData) || mapIter || T.isSet(tabularData)) {
+      const values = [];
+      let length = 0;
+      for (const v of tabularData) { values.push(_inspect(v)); length++; }
+      return final([iterKey, valuesKey], [getIndexArray(length), values]);
+    }
+    const map = Object.create(null);
+    let hasPrimitives = false;
+    const valuesKeyArray = [];
+    const indexKeyArray = Object.keys(tabularData);
+    for (let i = 0; i < indexKeyArray.length; i++) {
+      const item = tabularData[indexKeyArray[i]];
+      const primitive = item === null || (typeof item !== "function" && typeof item !== "object");
+      if (properties === undefined && primitive) {
+        hasPrimitives = true;
+        valuesKeyArray[i] = _inspect(item);
+      } else {
+        const keys = properties || Object.keys(item);
+        for (const key of keys) {
+          if (map[key] === undefined) map[key] = [];
+          if ((primitive && properties) || !Object.prototype.hasOwnProperty.call(item, key)) map[key][i] = "";
+          else map[key][i] = _inspect(item[key]);
+        }
+      }
+    }
+    const keys = Object.keys(map);
+    const values = Object.values(map);
+    if (hasPrimitives) { keys.push(valuesKey); values.push(valuesKeyArray); }
+    keys.unshift(indexKey);
+    values.unshift(indexKeyArray);
+    return final(keys, values);
+  };
+  class Console { constructor(out) { const o = out && out.stdout ? out : { stdout: out }; Object.assign(this, G.console); const colorMode = o.colorMode === undefined ? "auto" : o.colorMode; const io = o.inspectOptions; const colorsFor = (s) => colorMode === "auto" ? !!(s && s.isTTY) : !!colorMode; const fmt = (s, a) => util.formatWithOptions(Object.assign({}, io, { colors: colorsFor(s) }), ...a) + "\n"; this.log = this.info = (...a) => { (o.stdout && o.stdout.write) ? o.stdout.write(fmt(o.stdout, a)) : G.console.log(...a); }; this.error = this.warn = (...a) => { (o.stderr && o.stderr.write) ? o.stderr.write(fmt(o.stderr, a)) : G.console.error(...a); }; this.table = (data, props) => consoleTableImpl((s) => this.log(s), Object.assign({}, io, { colors: colorsFor(o.stdout) }), data, props); } }
   // console.write(...chunks) — raw (no newline/format) write to stdout, returns
   // bytes written. ref: bun src/js/builtins/ConsoleObject.ts write(): the private
   // "writer" slot lookup rejects a non-object `this` (surfaces as ERR_INVALID_THIS).

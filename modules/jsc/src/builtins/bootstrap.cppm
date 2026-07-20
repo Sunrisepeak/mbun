@@ -2986,6 +2986,14 @@ inline constexpr std::string_view kBootstrapJS = R"JS(
   };
   M["bun:internal-for-testing"] = {
     isASANEnabled: () => false,
+    // canonicalizeIP (src/js/internal-for-testing.ts:16 → NodeTLS.cpp
+    // Bun__canonicalizeIP): inet_pton/inet_ntop round trip; undefined for a
+    // non-IP literal or a CIDR. Same native the node:tls IP-SAN check uses.
+    canonicalizeIP: (...a) => {
+      const N = G.__mbunNodeTlsNative;
+      if (!N || typeof N.canonicalizeIP !== "function") return undefined;
+      return N.canonicalizeIP(...a);  // spread so a 0-arg call still throws
+    },
     // createStatsForIno(ino, bigint): builds a Stats whose .ino carries a u64
     // inode through the number path (static_cast<double>) or the bigint path
     // (static_cast<int64_t> == BigInt.asIntN(64, ino)). NFS inodes exceed
