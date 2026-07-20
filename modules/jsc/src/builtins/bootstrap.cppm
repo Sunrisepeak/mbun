@@ -3090,10 +3090,33 @@ inline constexpr std::string_view kBootstrapJS = R"JS(
     };
     expectStub.extend = () => {}; expectStub.any = (c) => ({ __any: c }); expectStub.anything = () => ({});
     const hook = () => {};
+    // setSystemTime IS live outside `bun test` (bun installs the native
+    // JSMock__jsSetSystemTime on the module regardless of the runner) — issue
+    // 32793 pins the clock from `bun -e`. The Date patch is installed lazily on
+    // the first call so an ordinary run keeps the untouched native Date.
+    let sysTime = null;
+    const setSystemTime = (v) => {
+      if (v === undefined || v === null) { sysTime = null; return; }
+      sysTime = (typeof v === "number") ? v : Number(v.valueOf());
+      if (G.__mbunRunDatePatched) return;
+      G.__mbunRunDatePatched = true;
+      const RD = G.Date;
+      const MbunDate = function Date(...args) {
+        if (!new.target) return RD();                       // Date() → string
+        const a = (args.length === 0 && sysTime !== null) ? [sysTime] : args;
+        return Reflect.construct(RD, a, new.target);        // keeps `class X extends Date`
+      };
+      MbunDate.prototype = RD.prototype;
+      Object.setPrototypeOf(MbunDate, RD);                  // UTC/parse/… statics
+      MbunDate.now = function () { return sysTime === null ? RD.now() : sysTime; };
+      G.Date = MbunDate;
+    };
     Object.defineProperty(M, "bun:test", { enumerable: true, configurable: true,
       get() { return G.__mbunBT || { test: noop, it: noop, xit: noop.skip, xtest: noop.skip,
-        describe: desc, xdescribe: desc, expect: expectStub, jest: { fn: (i) => i || (() => {}) },
+        describe: desc, xdescribe: desc, expect: expectStub,
+        jest: { fn: (i) => i || (() => {}), setSystemTime: (v) => { setSystemTime(v); } },
         mock: (i) => i || (() => {}), spyOn: () => ({ mockRestore() {} }),
+        setSystemTime: setSystemTime,
         beforeAll: hook, afterAll: hook, beforeEach: hook, afterEach: hook, setDefaultTimeout: hook }; } });
   }
 

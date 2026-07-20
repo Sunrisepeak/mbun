@@ -124,6 +124,12 @@ public:
             result.error_offset = errOff_;
             return result;
         }
+        if (!check_ts_enum_redeclaration_()) {
+            result.ok = false;
+            result.error = errMsg_;
+            result.error_offset = errOff_;
+            return result;
+        }
         NodeIndex prog = parse_program_();
         // Post-parse, because the decision is order-independent: `export {a}`
         // may precede the `import {a}` it keeps alive. Records erasure edits
@@ -396,6 +402,83 @@ private:
 
     // Record a deletion of the raw span of the current token, then advance.
     // ── program / statements ─────────────────────────────────────────────────
+    // ── TS: `enum X` over a non-mergeable binding is an error ────────────────
+    // A TypeScript enum MERGES with another enum (and with a namespace), but a
+    // `function`/`class`/`let`/`const`/`var` of the same name is a forbidden
+    // redeclaration. bun reports it as a parse error; mbun used to lower both
+    // declarations silently, emitting two `var X; (function (X) {…})(X || (X={}))`
+    // IIFEs for one binding. In bun the same shape additionally tripped an
+    // assertion in `ref_to_ts_namespace_member` (a repeated key), which is what
+    // this test file pins.
+    // ref: compat/bun/test/bundler/transpiler/ts-enum-redecl-panic.test.ts
+    //      (oven-sh/bun#32711)
+    //
+    // SCOPED TO THE FILE'S TOP LEVEL, deliberately. mbun's parser has no binder,
+    // so a nested `function X(){}` and a nested `enum X{}` in two DIFFERENT
+    // blocks cannot be told apart from a real collision. At bracket depth 0 there
+    // is exactly one scope, so a match there is always a genuine redeclaration —
+    // no false positive is possible. Deeper collisions are DEFERRED with the
+    // binder.
+    bool check_ts_enum_redeclaration_() {
+        // name -> true when every declaration so far was an enum (mergeable).
+        std::unordered_map<std::string_view, bool> declared;
+        int depth = 0;
+        auto name_at = [&](std::size_t i) -> std::string_view {
+            return (i < toks_.size() && toks_[i].kind == Token::Identifier)
+                       ? std::string_view{toks_[i].ident}
+                       : std::string_view{};
+        };
+        for (std::size_t i = 0; i < toks_.size(); ++i) {
+            const Token k = toks_[i].kind;
+            if (k == Token::OpenBrace || k == Token::OpenParen || k == Token::OpenBracket) {
+                ++depth;
+                continue;
+            }
+            if (k == Token::CloseBrace || k == Token::CloseParen || k == Token::CloseBracket) {
+                if (depth > 0) {
+                    --depth;
+                }
+                continue;
+            }
+            if (depth != 0) {
+                continue;
+            }
+            std::string_view name;
+            bool isEnum = false;
+            if (k == Token::Enum) {
+                name = name_at(i + 1);
+                isEnum = true;
+            } else if (k == Token::Function || k == Token::Class) {
+                name = name_at(i + 1);
+            } else if (k == Token::Var || k == Token::Const ||
+                       (k == Token::Identifier && toks_[i].ident == "let")) {
+                // `const enum X` is an enum, not a const binding.
+                if (i + 1 < toks_.size() && toks_[i + 1].kind == Token::Enum) {
+                    continue;
+                }
+                name = name_at(i + 1);
+            } else {
+                continue;
+            }
+            if (name.empty()) {
+                continue;
+            }
+            const auto found = declared.find(name);
+            if (found == declared.end()) {
+                declared.emplace(name, isEnum);
+                continue;
+            }
+            if (isEnum && !found->second) {
+                ok_ = false;
+                errMsg_ = std::format("\"{}\" has already been declared", name);
+                errOff_ = toks_[i + 1].start;
+                return false;
+            }
+            found->second = found->second && isEnum;
+        }
+        return true;
+    }
+
     NodeIndex parse_program_() {
         std::vector<NodeIndex> stmts;
         // ref: bun src/js_parser/parse/parse_entry.rs — a leading hashbang is

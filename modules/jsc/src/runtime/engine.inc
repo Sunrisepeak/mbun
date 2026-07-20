@@ -984,7 +984,16 @@ public:
         if (loaderKind == mbun::jsc::module_loader::Loader::Json &&
             (blobModule || path.ends_with(".json") || path.ends_with(".jsonc") ||
              path.ends_with("bun.lock"))) {
-            source = "module.exports = Bun.JSONC.parse(\"" + escape_dq(source) + "\");";
+            // An empty (or whitespace-only) `.json` module is a parse error in bun
+            // — "JSON Parse error: Unexpected EOF" — not `{}`. JSONC's empty→{}
+            // tolerance belongs to package.json/bun.lock parsing, not to the module
+            // loader (issue 17605). .jsonc / bun.lock keep the tolerant behaviour.
+            if (path.ends_with(".json") &&
+                source.find_first_not_of(" \t\r\n") == std::string::npos) {
+                source = "throw new SyntaxError(\"JSON Parse error: Unexpected EOF\");";
+            } else {
+                source = "module.exports = Bun.JSONC.parse(\"" + escape_dq(source) + "\");";
+            }
         }
 
         // YAML modules: parse with Bun.YAML; the document is the default export

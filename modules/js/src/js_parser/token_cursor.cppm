@@ -188,7 +188,11 @@ public:
                 std::size_t jsxEnd = jsxStart;
                 std::string lowered;
                 if (!jsxLower_.jsx_parse_element_(jsxEnd, lowered)) {
-                    errMsg_ = "Unexpected token in JSX";
+                    // A bail-out on the lowerer's nesting budget is an overflow,
+                    // not a syntax error: report it the way the parser's own
+                    // descent does so the caller sees one catchable message.
+                    errMsg_ = jsxLower_.overflowed() ? "Maximum call stack size exceeded"
+                                                     : "Unexpected token in JSX";
                     errOff_ = jsxStart;
                     return false;
                 }

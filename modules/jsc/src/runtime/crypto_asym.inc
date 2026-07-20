@@ -69,6 +69,22 @@ using PkeyCtxPtr = std::unique_ptr<EVP_PKEY_CTX, EvpPkeyCtxDel>;
 // fail the decode instead of prompting on the terminal.
 inline int asym_no_pass_cb(char*, int, int, void*) { return 0; }
 
+// True when the material is an ENCRYPTED private-key PEM and no passphrase was
+// supplied — the load then fails for a specific, reportable reason. bun surfaces
+// it as ERR_MISSING_PASSPHRASE "Passphrase required for encrypted key"
+// (CryptoUtil.cpp:172, the NEED_PASSPHRASE arm of TryParsePrivateKey) rather
+// than the generic "Invalid key" (issue 27445). Both spellings are covered:
+// PKCS#8 "BEGIN ENCRYPTED PRIVATE KEY" and legacy PKCS#1/SEC1 "Proc-Type:
+// 4,ENCRYPTED" + DEK-Info.
+inline bool asym_needs_passphrase(std::span<const std::uint8_t> data, std::string_view pass) {
+    if (!pass.empty()) { return false; }
+    const std::string_view text{reinterpret_cast<const char*>(data.data()), data.size()};
+    if (text.find("-----BEGIN ") == std::string_view::npos) { return false; }
+    return text.find("ENCRYPTED PRIVATE KEY-----") != std::string_view::npos ||
+           text.find("Proc-Type: 4,ENCRYPTED") != std::string_view::npos ||
+           text.find("Proc-Type:4,ENCRYPTED") != std::string_view::npos;
+}
+
 // Decode a key from PEM or DER (public or private), optional passphrase. Tries a
 // private-capable selection first, then public-only (SPKI). Returns nullptr on
 // failure. selection==0 lets OSSL decode whatever the input carries.
@@ -752,7 +768,11 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_key_type_host,
     }
     const std::string pass{asym_str(global, native_arg(frame, 1))};
     PkeyPtr pkey{asym_load_pkey(keyBytes, pass)};
-    if (!pkey) { return hasher_throw(global, "Invalid key"); }
+    if (!pkey) {
+        return hasher_throw(global, asym_needs_passphrase(keyBytes, pass)
+                                        ? "Passphrase required for encrypted key"
+                                        : "Invalid key");
+    }
     const int base{EVP_PKEY_base_id(pkey.get())};
     std::string type;
     switch (base) {
@@ -856,7 +876,11 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_jwk_export_host,
     const bool isPublic{[&] { JSC::JSValue v{native_arg(frame, 2)}; return v && v.toBoolean(global); }()};
 
     PkeyPtr pkey{asym_load_pkey(keyBytes, pass)};
-    if (!pkey) { return hasher_throw(global, "Invalid key"); }
+    if (!pkey) {
+        return hasher_throw(global, asym_needs_passphrase(keyBytes, pass)
+                                        ? "Passphrase required for encrypted key"
+                                        : "Invalid key");
+    }
     JSObjectRef obj{JSObjectMake(ctx, nullptr, nullptr)};
     const int base{EVP_PKEY_base_id(pkey.get())};
     if (base == EVP_PKEY_RSA || base == EVP_PKEY_RSA_PSS) {
@@ -1069,7 +1093,11 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_key_export_host,
     const std::string outPass{asym_str(global, native_arg(frame, 6))};
 
     PkeyPtr pkey{asym_load_pkey(keyBytes, pass)};
-    if (!pkey) { return hasher_throw(global, "Invalid key"); }
+    if (!pkey) {
+        return hasher_throw(global, asym_needs_passphrase(keyBytes, pass)
+                                        ? "Passphrase required for encrypted key"
+                                        : "Invalid key");
+    }
     int sel{0};
     const char* structure{nullptr};
     if (!asym_enc_map(type, !isPublic, sel, structure)) {

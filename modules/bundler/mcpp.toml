@@ -20,6 +20,10 @@ main = "../../benchmarks/suites/bundler/bench.cpp"
 # the bundler's disk-backed resolve path — reused, not reimplemented.
 [dependencies]
 core = { path = "../core" }
+# css: a `.css` entry point is printed through mbun.css (the port of bun's
+# lightningcss printer) rather than being handed to the JS parser, which used to
+# reject the very first `.` of a class selector.
+css = { path = "../css" }
 js = { path = "../js" }
 resolver = { path = "../resolver" }
 # toml: the .toml loader parses config into a JS object module (mbun.toml, the same
