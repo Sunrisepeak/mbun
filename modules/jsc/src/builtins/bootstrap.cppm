@@ -2540,7 +2540,11 @@ inline constexpr std::string_view kBootstrapJS = R"JS(
   const zNum = (opts, k, d) => opts && typeof opts[k] === "number" ? opts[k] : d;
   // node enforces kMaxLength across ALL codecs (lib/zlib.js → ERR_BUFFER_TOO_LARGE).
   const zCap = (out, opts) => { const maxLen = opts && typeof opts.maxOutputLength === "number" ? opts.maxOutputLength : (M.buffer && M.buffer.kMaxLength); if (maxLen && out.length > maxLen) { const e = new RangeError("Cannot create a Buffer larger than " + maxLen + " bytes"); e.code = "ERR_BUFFER_TOO_LARGE"; throw e; } return out; };
-  const zSync = (op, fmt) => (data, opts) => { const level = zNum(opts, "level", -1), wbits = zNum(opts, "windowBits", 15), memLevel = zNum(opts, "memLevel", 8), strategy = zNum(opts, "strategy", 0); let r; try { r = op === "c" ? ZN.compress(zB64(zToU8(data)), fmt, level, wbits, memLevel, strategy) : ZN.decompress(zB64(zToU8(data)), fmt, wbits); } catch (e) { throw zErr(e); } const out = G.Buffer.from(r, "base64"); const maxLen = opts && typeof opts.maxOutputLength === "number" ? opts.maxOutputLength : (M.buffer && M.buffer.kMaxLength); if (op === "d" && maxLen && out.length > maxLen) { const e = new RangeError("Cannot create a Buffer larger than " + maxLen + " bytes"); e.code = "ERR_BUFFER_TOO_LARGE"; throw e; } return out; };
+  // Bytes cross as a Uint8Array, not base64: the base64 bridge cost ~6x the
+  // payload in transient strings per crossing and a 150 MB deflateRawSync was
+  // OOM-killed. ZN.compress/decompress answer a Uint8Array for a typed-array
+  // input (base64 string in, base64 string out is still supported).
+  const zSync = (op, fmt) => (data, opts) => { const level = zNum(opts, "level", -1), wbits = zNum(opts, "windowBits", 15), memLevel = zNum(opts, "memLevel", 8), strategy = zNum(opts, "strategy", 0); const inp = zToU8(data); let r; try { r = op === "c" ? ZN.compress(inp, fmt, level, wbits, memLevel, strategy) : ZN.decompress(inp, fmt, wbits); } catch (e) { throw zErr(e); } const out = typeof r === "string" ? G.Buffer.from(r, "base64") : G.Buffer.from(r.buffer, r.byteOffset, r.byteLength);const maxLen = opts && typeof opts.maxOutputLength === "number" ? opts.maxOutputLength : (M.buffer && M.buffer.kMaxLength); if (op === "d" && maxLen && out.length > maxLen) { const e = new RangeError("Cannot create a Buffer larger than " + maxLen + " bytes"); e.code = "ERR_BUFFER_TOO_LARGE"; throw e; } return out; };
   const zAsync = (sync) => (data, opts, cb) => { if (typeof opts === "function") { cb = opts; opts = undefined; } if (typeof cb !== "function") throw new TypeError("The callback argument must be of type function"); G.queueMicrotask(() => { try { cb(null, sync(data, opts)); } catch (e) { cb(e); } }); };
   const deflateSync = zSync("c", "zlib"), inflateSync = zSync("d", "zlib"), gzipSync = zSync("c", "gzip"), gunzipSync = zSync("d", "gzip"), deflateRawSync = zSync("c", "raw"), inflateRawSync = zSync("d", "raw"), unzipSync = zSync("d", "auto");
   // brotli (native BrotliEncoder/Decoder via __mbunZlibNative). node forwards
@@ -2957,8 +2961,18 @@ inline constexpr std::string_view kBootstrapJS = R"JS(
   // Diagnostic/internal surfaces bun's test harness imports at load time. Real
   // semantics where knowable (isASANEnabled=false for this build); otherwise
   // best-effort so the harness loads (tests asserting internals fail honestly).
+  // Shared synthetic-allocation-limit guard (bun: jsc::virtual_machine::
+  // synthetic_allocation_limit / bun_core STRING_ALLOCATION_LIMIT). Surfaces
+  // that would materialize `byteLength` bytes as a JS string / typed array
+  // fail with the same message real bun/JSC produces instead of allocating.
+  G.__mbunCheckAllocLimit = (byteLength, kind) => {
+    if (byteLength <= (G.__mbunSyntheticAllocationLimit || 0xFFFFFFFF)) return;
+    if (kind === "text") throw new RangeError("Cannot create a string longer than 2^32-1 characters");
+    if (kind === "json") throw new RangeError("Cannot parse a JSON string longer than 2^32-1 characters");
+    throw new RangeError("Out of memory");
+  };
   M["bun:jsc"] = {
-    heapStats: () => ({ heapSize: 0, heapCapacity: 0, objectCount: 0, protectedObjectCount: 0,
+    heapStats:() => ({ heapSize: 0, heapCapacity: 0, objectCount: 0, protectedObjectCount: 0,
                         globalObjectCount: 0, objectTypeCounts: {}, protectedObjectTypeCounts: {} }),
     memoryUsage: () => ({ current: 0, peak: 0 }),
     getRandomSeed: () => 0, setRandomSeed: () => {}, gcAndSweep: () => 0, fullGC: () => 0, edenGC: () => 0,
@@ -2982,10 +2996,18 @@ inline constexpr std::string_view kBootstrapJS = R"JS(
         isFile: () => true, isDirectory: () => false, isSymbolicLink: () => false,
         isBlockDevice: () => false, isCharacterDevice: () => false, isFIFO: () => false, isSocket: () => false };
     },
-    // JSC synthetic allocation limit knob the fs-oom test flips to force an
-    // allocation-failure throw. No JSC hook wired yet, so it is a no-op (the
-    // test then asserts nothing OOMs — an honest degrade, not a false green).
-    setSyntheticAllocationLimitForTesting: () => {},
+    // Synthetic allocation limit (bun virtual_machine_exports.rs
+    // Bun__setSyntheticAllocationLimitForTesting): clamped to >= 1 MiB, returns
+    // the previous value. Read by the fs/Blob "would this allocation blow up?"
+    // guards via globalThis.__mbunSyntheticAllocationLimit, so a test can force
+    // a graceful ENOMEM/RangeError instead of a real multi-GB allocation.
+    setSyntheticAllocationLimitForTesting: (limit) => {
+      const prev = G.__mbunSyntheticAllocationLimit;
+      const n = Number(limit);
+      if (!Number.isFinite(n)) throw new TypeError("setSyntheticAllocationLimitForTesting expects a number");
+      G.__mbunSyntheticAllocationLimit = Math.max(Math.trunc(n), 1024 * 1024);
+      return prev;
+    },
     // xxHash3ForTesting(bytes, seed?) — full-u64-seed XXH3_64bits (native).
     xxHash3ForTesting: G.__mbunXxHash3ForTesting,
     // bun internal-for-testing.ts:273 → socket_body.rs js_set_socket_options:
@@ -3173,6 +3195,25 @@ inline constexpr std::string_view kBootstrapJS = R"JS(
     };
     walk(src, dest);
   };
+  // bun node_fs.rs should_throw_out_of_memory_early_for_javascript: a read whose
+  // *decoded* length would exceed the synthetic allocation limit fails with
+  // ENOMEM instead of really allocating. Without this, readFileSync("/dev/zero")
+  // (st_size 0 ⇒ read-to-EOF) grows forever and the process is OOM-killed.
+  // The divisor is the worst-case byte→code-unit expansion of each encoding.
+  const fsOomDivisor = (enc) => {
+    switch (enc) {
+      case "utf8": case "utf-8": case "utf16le": case "utf-16le": case "ucs2": case "ucs-2": return 4;
+      case "hex": return 2;
+      case "base64": case "base64url": return 3;
+      default: return 1;
+    }
+  };
+  const fsSynthLimit = () => G.__mbunSyntheticAllocationLimit || 0xFFFFFFFF;
+  // Largest byte count still under the limit once decoded; past it → ENOMEM.
+  const fsOomCap = (enc) => fsOomDivisor(enc) * (fsSynthLimit() + 1);
+  const fsOomError = (path2) =>
+    Object.assign(new Error("ENOMEM: not enough memory, read '" + path2 + "'"),
+                  { code: "ENOMEM", errno: -12, syscall: "read", path: path2 });
   const fsMod = {
     // node fs.readFileSync: no encoding → Buffer (was wrongly a String).
     // Reads real bytes via the native fd path (binary-correct; F.readFile
@@ -3180,21 +3221,31 @@ inline constexpr std::string_view kBootstrapJS = R"JS(
     // harness (which patches Buffer.prototype.toUnixString) needs this.
     readFileSync: (p, opts) => {
       const enc = typeof opts === "string" ? opts : (opts && opts.encoding);
-      const FD = globalThis.__mbunFdNative, path2 = toStr(p), fd = FD.open(path2, "r", 0o666);
+      const FD = globalThis.__mbunFdNative;
+      // node/bun accept a raw fd; it stays open (the caller owns it).
+      const isFd = typeof p === "number";
+      const path2 = isFd ? String(p) : toStr(p);
+      const fd = isFd ? p : FD.open(path2, "r", 0o666);
+      const cap = fsOomCap(enc);
       try {
-        let size = (F.stat(path2) && F.stat(path2).size) | 0;
+        let size = (!isFd && F.stat(path2) && F.stat(path2).size) | 0;
         if (size <= 0) size = 65536;  // procfs / char devices report st_size 0 — read to EOF
+        if (size > cap) throw fsOomError(path2);
         let u = new Uint8Array(size);
         let off = 0, n;
         for (;;) {
-          if (off >= u.length) { const g = new Uint8Array(u.length * 2); g.set(u); u = g; }
+          if (off >= u.length) {
+            if (u.length > cap) throw fsOomError(path2);
+            const g = new Uint8Array(Math.min(u.length * 2, cap + 8192)); g.set(u); u = g;
+          }
           n = FD.read(fd, u, off, u.length - off, -1);
           if (n <= 0) break;
           off += n;
+          if (off > cap) throw fsOomError(path2);
         }
         const buf = Buffer.from(u.buffer, 0, off);
         return enc ? buf.toString(enc) : buf;
-      } finally { FD.close(fd); }
+      } finally { if (!isFd) FD.close(fd); }
     },
     // Binary data must NOT cross the C-API string boundary (NUL/UTF-8 mangling):
     // typed arrays / ArrayBuffers write through the fd native path byte-exact.

@@ -555,7 +555,7 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
       // Semantics (per bun): parse line-by-line; on the first malformed line,
       // return the values collected so far (partial) — unless none were collected,
       // in which case the parse error propagates. Non-string input → TypeError.
-      const JSONL = { parse: (str) => { if (typeof str !== "string") { if (str && ArrayBuffer.isView(str)) str = new G.TextDecoder().decode(str); else throw new TypeError("The \"input\" argument must be of type string or an instance of TypedArray. Received " + (str === null ? "null" : typeof str)); } const out = []; for (const line of str.split("\n")) { const t = line.trim(); if (!t) continue; let v; try { v = JSON.parse(t); } catch (e) { if (out.length > 0) return out; throw e; } out.push(v); } return out; } };
+      const JSONL = { parse: (str) => { if (typeof str !== "string") { if (str && ArrayBuffer.isView(str)) { G.__mbunCheckAllocLimit(str.byteLength, "text"); str = new G.TextDecoder().decode(str); } else throw new TypeError("The \"input\" argument must be of type string or an instance of TypedArray. Received " + (str === null ? "null" : typeof str)); } const out = []; for (const line of str.split("\n")) { const t = line.trim(); if (!t) continue; let v; try { v = JSON.parse(t); } catch (e) { if (out.length > 0) return out; throw e; } out.push(v); } return out; } };
       Object.defineProperty(JSONL, Symbol.toStringTag, { value: "JSONL", configurable: true });
       Bun.JSONL = JSONL;
     }

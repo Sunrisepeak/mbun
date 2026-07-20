@@ -194,6 +194,16 @@ JSValueRef serven_write_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size
     auto* server{serve_native_server(ctx, argc, args)};
     if (server == nullptr || argc < 3) return JSValueMakeBoolean(ctx, false);
     const auto rid{static_cast<std::uint64_t>(JSValueToNumber(ctx, args[1], nullptr))};
+    // A Uint8Array body is read in place; base64 costs ~6x the payload in
+    // transient JS strings per response (a 36 MB body served 1000x by
+    // fetch-leak was OOM-killed). A string argument stays base64.
+    const std::uint8_t* vp{nullptr};
+    std::size_t vn{0};
+    if (arg_bytes_view(ctx, argc, args, 2, vp, vn)) {
+        std::string bytes;
+        if (vn != 0) bytes.assign(reinterpret_cast<const char*>(vp), vn);
+        return JSValueMakeBoolean(ctx, server->write_raw(rid, bytes));
+    }
     const std::string data{b64_decode(fs_arg(ctx, argc, args, 2))};
     return JSValueMakeBoolean(ctx, server->write_raw(rid, data));
 }

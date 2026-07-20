@@ -70,6 +70,41 @@ int zlibn_arg_int(JSContextRef ctx, std::size_t argc, const JSValueRef args[],
     return dflt;
 }
 
+// ── byte bridge: typed array instead of base64 ─────────────────────────────
+// Base64 costs ~6x the payload in transient JS strings on each crossing (encode
+// → UTF-16 copy → UTF-8 copy → decode), so a one-shot deflate/inflate of a
+// 150 MB buffer was OOM-killed. When the JS layer hands us a Uint8Array /
+// ArrayBuffer we read it in place and answer with a Uint8Array; the base64
+// signature stays for string callers.
+bool arg_bytes_view(JSContextRef ctx, std::size_t argc, const JSValueRef args[], std::size_t i,
+                   const std::uint8_t*& p, std::size_t& n) {
+    p = nullptr;
+    n = 0;
+    if (i >= argc) return false;
+    JSTypedArrayType tt{JSValueGetTypedArrayType(ctx, args[i], nullptr)};
+    if (tt == kJSTypedArrayTypeNone) return false;
+    JSObjectRef obj{JSValueToObject(ctx, args[i], nullptr)};
+    if (obj == nullptr) return false;
+    if (tt == kJSTypedArrayTypeArrayBuffer) {
+        p = static_cast<const std::uint8_t*>(JSObjectGetArrayBufferBytesPtr(ctx, obj, nullptr));
+        n = JSObjectGetArrayBufferByteLength(ctx, obj, nullptr);
+    } else {
+        p = static_cast<const std::uint8_t*>(JSObjectGetTypedArrayBytesPtr(ctx, obj, nullptr));
+        n = JSObjectGetTypedArrayByteLength(ctx, obj, nullptr);
+    }
+    if (p == nullptr) n = 0;
+    return true;
+}
+JSValueRef make_bytes_view(JSContextRef ctx, const std::vector<std::uint8_t>& bytes) {
+    JSObjectRef ta{JSObjectMakeTypedArray(ctx, kJSTypedArrayTypeUint8Array, bytes.size(), nullptr)};
+    if (ta != nullptr && !bytes.empty()) {
+        if (void* d{JSObjectGetTypedArrayBytesPtr(ctx, ta, nullptr)}) {
+            std::memcpy(d, bytes.data(), bytes.size());
+        }
+    }
+    return ta;
+}
+
 // Map (format, windowBits magnitude) → zlib windowBits. raw = -mag, zlib = mag,
 // gzip = mag + 16 (see zlib deflateInit2 / inflateInit2). "auto" (node unzip)
 // uses mag + 32 so inflate auto-detects a zlib vs gzip wrapper.
@@ -86,19 +121,25 @@ int zlibn_window_bits(std::string_view fmt, int mag, bool decompress) {
 // (mbun.compress.zlib_native); honours level/windowBits/memLevel/strategy.
 JSValueRef zlibn_compress_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                              const JSValueRef args[], JSValueRef* exc) {
-    std::vector<std::uint8_t> data{zlib_b64_decode(arg_string(ctx, argc, args, 0))};
+    const std::uint8_t* vp{nullptr};
+    std::size_t vn{0};
+    const bool view{arg_bytes_view(ctx, argc, args, 0, vp, vn)};
+    std::vector<std::uint8_t> data;
+    if (!view) data = zlib_b64_decode(arg_string(ctx, argc, args, 0));
     std::string fmt{arg_string(ctx, argc, args, 1)};
     const int level{zlibn_arg_int(ctx, argc, args, 2, -1)};
     const int mag{zlibn_arg_int(ctx, argc, args, 3, 15)};
     const int memLevel{zlibn_arg_int(ctx, argc, args, 4, 8)};
     const int strategy{zlibn_arg_int(ctx, argc, args, 5, 0)};
     const int wbits{zlibn_window_bits(fmt, mag, /*decompress=*/false)};
-    auto r{mbun::compress::zlib_deflate(mbun::compress::ByteView{data}, wbits, level,
-                                        memLevel, strategy)};
+    auto r{mbun::compress::zlib_deflate(
+        view ? mbun::compress::ByteView{vp, vn} : mbun::compress::ByteView{data}, wbits, level,
+        memLevel, strategy)};
     if (!r) {
         if (exc != nullptr) *exc = make_string(ctx, r.error().message);
         return JSValueMakeUndefined(ctx);
     }
+    if (view) return make_bytes_view(ctx, *r);
     return make_string(ctx, zlib_b64_encode(*r));
 }
 
@@ -106,15 +147,21 @@ JSValueRef zlibn_compress_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::si
 // "gzip" | "auto" ("auto" = node's unzip, auto-detecting zlib vs gzip framing).
 JSValueRef zlibn_decompress_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                                const JSValueRef args[], JSValueRef* exc) {
-    std::vector<std::uint8_t> data{zlib_b64_decode(arg_string(ctx, argc, args, 0))};
+    const std::uint8_t* vp{nullptr};
+    std::size_t vn{0};
+    const bool view{arg_bytes_view(ctx, argc, args, 0, vp, vn)};
+    std::vector<std::uint8_t> data;
+    if (!view) data = zlib_b64_decode(arg_string(ctx, argc, args, 0));
     std::string fmt{arg_string(ctx, argc, args, 1)};
     const int mag{zlibn_arg_int(ctx, argc, args, 2, 15)};
     const int wbits{zlibn_window_bits(fmt, mag, /*decompress=*/true)};
-    auto r{mbun::compress::zlib_inflate(mbun::compress::ByteView{data}, wbits)};
+    auto r{mbun::compress::zlib_inflate(
+        view ? mbun::compress::ByteView{vp, vn} : mbun::compress::ByteView{data}, wbits)};
     if (!r) {
         if (exc != nullptr) *exc = make_string(ctx, r.error().message);
         return JSValueMakeUndefined(ctx);
     }
+    if (view) return make_bytes_view(ctx, *r);
     return make_string(ctx, zlib_b64_encode(*r));
 }
 

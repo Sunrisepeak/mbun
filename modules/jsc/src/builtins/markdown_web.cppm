@@ -459,9 +459,15 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
           if (kind === "formData") return S.bytes(this._stream).then((u8) => formDataParseBody(u8, fdEncoding));
         }
         const b = this._body;
-        if (kind === "text") return Promise.resolve(b == null ? "" : (b instanceof Uint8Array ? td.decode(b) : String(b)));
-        if (kind === "bytes") return this._consume("text").then((t) => te.encode(t));
-        if (kind === "arrayBuffer") return this._consume("bytes").then((u8) => u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength));
+        // Same synthetic-allocation-limit cap as Response._consume; a Blob body
+        // delegates so its own guard fires. arrayBuffer() stays exempt.
+        if (kind === "text") { if (b == null) return Promise.resolve(""); if (b instanceof Uint8Array) { G.__mbunCheckAllocLimit(b.length, "text"); return Promise.resolve(td.decode(b)); } if (b && typeof b.text === "function") return b.text(); return Promise.resolve(String(b)); }
+        if (kind === "bytes") { if (b instanceof Uint8Array) { G.__mbunCheckAllocLimit(b.length, "bytes"); return Promise.resolve(new Uint8Array(b)); } if (b && b._u8 instanceof Uint8Array) { G.__mbunCheckAllocLimit(b._u8.length, "bytes"); return Promise.resolve(new Uint8Array(b._u8)); } return this._consume("text").then((t) => te.encode(t)); }
+        if (kind === "arrayBuffer") {
+          const u = b instanceof Uint8Array ? b : (b && b._u8 instanceof Uint8Array ? b._u8 : null);
+          if (u) return Promise.resolve(u.buffer.slice(u.byteOffset, u.byteOffset + u.byteLength));
+          return this._consume("bytes").then((u8) => u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength));
+        }
         if (kind === "blob") return Promise.resolve(new G.Blob([b == null ? "" : b]));
         if (kind === "formData") return this._consume("bytes").then((u8) => formDataParseBody(u8, fdEncoding));
       }
@@ -952,7 +958,10 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
     }
   }
   if (G.Bun && typeof G.Bun.wrapAnsi === "undefined") {
-    G.Bun.wrapAnsi = (s, width) => { s = String(s); if (!width || s.length <= width) return s; const out = []; for (let i = 0; i < s.length; i += width) out.push(s.slice(i, i + width)); return out.join("\n"); };
+    // A non-positive / non-finite `columns` returns the input unchanged (bun
+    // wrap_ansi). Without the guard `for (i += width)` with a negative width
+    // never terminates and the accumulator eats all memory.
+    G.Bun.wrapAnsi = (s, width) => { s = String(s); const w = Math.floor(Number(width)); if (!Number.isFinite(w) || w <= 0 || s.length <= w) return s; const out = []; for (let i = 0; i < s.length; i += w) out.push(s.slice(i, i + w)); return out.join("\n"); };
   }
   // Blob/File attribute backing store. bun keeps every Blob attribute in a
   // native slot and exposes it as a Blob.prototype accessor, so `Object.keys(blob)`
@@ -1041,10 +1050,14 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
         // accessors (see below); `size` is always derived from `_u8`.
         blobSlot(this, "__type", normalizeMimeType(opts && opts.type));
       }
-      text() { return Promise.resolve(td.decode(this._u8)); }
-      json() { return Promise.resolve(JSON.parse(td.decode(this._u8))); }
+      // Blob.rs guards every string/typed-array materialization against the
+      // synthetic allocation limit; arrayBuffer() is exempt (ArrayBuffer has no
+      // such cap). Without this a multi-GB blob really decodes and the process
+      // is OOM-killed instead of throwing.
+      text() { G.__mbunCheckAllocLimit(this._u8.length, "text"); return Promise.resolve(td.decode(this._u8)); }
+      json() { G.__mbunCheckAllocLimit(this._u8.length, "json"); return Promise.resolve(JSON.parse(td.decode(this._u8))); }
       arrayBuffer() { return Promise.resolve(this._u8.buffer.slice(this._u8.byteOffset, this._u8.byteOffset + this._u8.byteLength)); }
-      bytes() { return Promise.resolve(new Uint8Array(this._u8)); }
+      bytes() { G.__mbunCheckAllocLimit(this._u8.length, "bytes"); return Promise.resolve(new Uint8Array(this._u8)); }
       slice(start, end, type) { const b = new G.Blob([], { type: type || "" }); b._u8 = this._u8.subarray(...[start, end].filter((x) => x !== undefined).map(Number)); return b; }
       // bun: a stream off a Blob carries the blob's type, so readableStreamToBlob
       // (and stream.blob()) round-trip it back onto the resulting Blob.

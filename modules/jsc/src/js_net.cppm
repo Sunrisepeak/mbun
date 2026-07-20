@@ -49,6 +49,9 @@ export constexpr std::string_view kNetJS = R"JS(
   const u8 = (d) => (d == null ? new Uint8Array(0) : typeof d === "string" ? te.encode(d) : d instanceof Uint8Array ? d : ArrayBuffer.isView(d) ? new Uint8Array(d.buffer, d.byteOffset, d.byteLength) : d instanceof ArrayBuffer ? new Uint8Array(d) : d._u8 instanceof Uint8Array ? d._u8 : te.encode(String(d)));
   const toB64 = (b) => { let s = ""; for (let i = 0; i < b.length; i += 4096) s += String.fromCharCode.apply(null, b.subarray(i, i + 4096)); return G.btoa(s); };
   const fromB64 = (s) => { const t = G.atob(s); const o = new Uint8Array(t.length); for (let i = 0; i < t.length; i++) o[i] = t.charCodeAt(i); return o; };
+  // Max bytes handed to a single native write(); the kernel socket buffer is
+  // ~64 KB anyway, so encoding more than this per call is pure waste.
+  const WCHUNK = 65536;
   // ref bun src/http/Decompressor.rs: decode response content-encoding
   // (gzip/deflate/br/zstd; identity/unknown = passthrough). zstd multi-frame is
   // handled inside the native decoder (modules/compress/src/zstd.cppm loops).
@@ -244,15 +247,20 @@ export constexpr std::string_view kNetJS = R"JS(
       if (this._fd < 0) return 0;
       if (this._tls === 1) return 0;  // handshake still in flight (see _poll)
       let progress = 0;
+      // Encode at most WCHUNK bytes per write(): base64-ing the WHOLE pending
+      // buffer each pass is quadratic (the socket accepts ~64 KB, so a large
+      // queued payload was re-encoded once per 64 KB — a multi-MB write blew up
+      // in time and memory).
       while (this._wq.length) {
         const head = this._wq[0];
+        const piece = head.length > WCHUNK ? head.subarray(0, WCHUNK) : head;
         let n;
-        try { n = this._tls ? NN.tlsWrite(this._fd, toB64(head)) : NN.write(this._fd, toB64(head)); }
+        try { n = this._tls ? NN.tlsWrite(this._fd, toB64(piece)) : NN.write(this._fd, toB64(piece)); }
         catch (e) { this._fail(e); return progress; }
         if (n <= 0) break;
         progress++;
         this._wqLen -= n;
-        if (n < head.length) { this._wq[0] = head.subarray(n); break; }
+        if (n < head.length) { this._wq[0] = head.subarray(n); if (n < piece.length) break; continue; }
         this._wq.shift();
       }
       if (!this._wq.length && this._shutW && !this._shutSent && this._fd >= 0) {
@@ -1277,6 +1285,7 @@ export constexpr std::string_view kNetJS = R"JS(
     NET.items.add(item);
   };
 
+
   function serveNativeImpl(opts, compiledRoutes, hostname, displayHost, wantPort) {
     let lh;
     try { lh = SN.listen(hostname, wantPort); }
@@ -1354,7 +1363,7 @@ export constexpr std::string_view kNetJS = R"JS(
           // us_socket_remote_address on the upgraded socket).
           remoteAddress: req.__mbunRemote ? req.__mbunRemote.address : undefined,
           server: serverObj, handlers: handlerRef.ws,
-          write: (bytes) => { try { SN.write(serverId, id, toB64(u8(bytes))); } catch (e) {} },
+          write: (bytes) => { try { SN.write(serverId, id, u8(bytes)); } catch (e) {} },  // typed array: no base64 round-trip
           detach: () => { try { return SN.detach(serverId, id); } catch (e) { return false; } },
           abort: () => { try { SN.abort(serverId, id); } catch (e) {} },
           onCleanup: () => { conns.delete(id); serverObj.pendingWebSockets--; },
@@ -1421,7 +1430,7 @@ export constexpr std::string_view kNetJS = R"JS(
     // bytes + finish/abort on the request id.
     const mkSock = (id) => ({
       destroyed: false, _ended: false, _closeCbs: [],
-      write(d) { if (this.destroyed) return true; const b = u8(d); try { SN.write(serverId, id, toB64(b)); } catch (e) {} return true; },
+      write(d) { if (this.destroyed) return true; const b = u8(d); try { SN.write(serverId, id, b); } catch (e) {} return true; },
       end() { this._ended = true; return this; },
       destroy() { if (!this.destroyed) { this.destroyed = true; conns.delete(id); try { SN.abort(serverId, id); } catch (e) {} } return this; },
       once(n, cb) { if (n === "close") this._closeCbs.push(cb); return this; },
@@ -1558,7 +1567,9 @@ export constexpr std::string_view kNetJS = R"JS(
           // (bun defers teardown the same way — deinit_if_we_can, mod.rs:1584).
           if (stopped && conns.size === 0) {
             try { SN.stop(serverId, false); } catch (e) {}
-            if (serveConnections(serverId) === 0) NSRV.servers.delete(serverId);
+            if (serveConnections(serverId) === 0) {
+              NSRV.servers.delete(serverId);
+            }
           }
         });
       };
@@ -2384,13 +2395,17 @@ export constexpr std::string_view kNetJS = R"JS(
           }
           let progress = 0;
           while (this._wq.length) {
+            // Bounded per-write base64 (see Socket._flush): a 128 MB fetch()
+            // upload otherwise re-encoded the whole body on every 64 KB socket
+            // write and was OOM-killed.
             const head = this._wq[0];
+            const piece = head.length > WCHUNK ? head.subarray(0, WCHUNK) : head;
             let n;
-            try { n = tls ? NN.tlsWrite(this._fd, toB64(head)) : NN.write(this._fd, toB64(head)); }
+            try { n = tls ? NN.tlsWrite(this._fd, toB64(piece)) : NN.write(this._fd, toB64(piece)); }
             catch (e) { this._fail(e); return progress; }
             if (n <= 0) break;
             progress++;
-            if (n < head.length) { this._wq[0] = head.subarray(n); break; }
+            if (n < head.length) { this._wq[0] = head.subarray(n); if (n < piece.length) break; continue; }
             this._wq.shift();
           }
           if (!this._eof) {

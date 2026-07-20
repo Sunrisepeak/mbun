@@ -1278,9 +1278,18 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
           if (kind === "formData") return S.bytes(this._stream).then((u8) => formDataParseBody(u8, fdEncoding));
         }
         // non-stream bodies
-        if (kind === "text") { if (b == null) return Promise.resolve(""); if (typeof b === "string") return Promise.resolve(b); if (b instanceof Uint8Array) return Promise.resolve(td.decode(b)); if (typeof b.text === "function") return b.text(); return Promise.resolve(String(b)); }
-        if (kind === "bytes") { if (b instanceof Uint8Array) return Promise.resolve(new Uint8Array(b)); if (b && b._u8) return Promise.resolve(new Uint8Array(b._u8)); return this._consume("text").then((t) => te.encode(t)); }
-        if (kind === "arrayBuffer") return this._consume("bytes").then((u8) => u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength));
+        // Body.rs materializations are capped by the synthetic allocation limit
+        // (see G.__mbunCheckAllocLimit); arrayBuffer() goes through "bytes" in
+        // bun too but ArrayBuffer is exempt there, so it re-reads without a cap.
+        if (kind === "text") { if (b == null) return Promise.resolve(""); if (typeof b === "string") return Promise.resolve(b); if (b instanceof Uint8Array) { G.__mbunCheckAllocLimit(b.length, "text"); return Promise.resolve(td.decode(b)); } if (typeof b.text === "function") return b.text(); return Promise.resolve(String(b)); }
+        if (kind === "bytes") { if (b instanceof Uint8Array) { G.__mbunCheckAllocLimit(b.length, "bytes"); return Promise.resolve(new Uint8Array(b)); } if (b && b._u8) { G.__mbunCheckAllocLimit(b._u8.length, "bytes"); return Promise.resolve(new Uint8Array(b._u8)); } return this._consume("text").then((t) => te.encode(t)); }
+        if (kind === "arrayBuffer") {
+          // Exempt from the allocation cap (bun: ArrayBuffer has no such limit),
+          // so it must not route through the capped "bytes" branch.
+          const u = b instanceof Uint8Array ? b : (b && b._u8 instanceof Uint8Array ? b._u8 : null);
+          if (u) return Promise.resolve(u.buffer.slice(u.byteOffset, u.byteOffset + u.byteLength));
+          return this._consume("bytes").then((u8) => u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength));
+        }
         if (kind === "blob") return Promise.resolve(b instanceof G.Blob ? b : new G.Blob([b == null ? "" : b], { type: (this.headers.get && this.headers.get("content-type")) || "" }));
         if (kind === "formData") return this._consume("bytes").then((u8) => formDataParseBody(u8, fdEncoding));
       }
