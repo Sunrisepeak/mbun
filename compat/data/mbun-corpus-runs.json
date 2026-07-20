@@ -1,27 +1,39 @@
 {
-  "generated_at": "2026-07-18",
-  "binary": "mbun (source snapshot, branch codex/lexbor-html-rewriter)",
+  "generated_at": "2026-07-20",
+  "binary": "mbun 2026.07.18.0 (source snapshot, branch fix/corpus-triage-and-member-tests)",
   "runs": [
     {
       "corpus": "compat/bun/test",
-      "runner": "tools/integration/bun_corpus_runner.py --cwd compat/bun --sample-per-group 100000 --jobs 14 --timeout 30",
+      "runner": "tools/integration/bun_corpus_runner.py --cwd compat/bun --discover compat/bun/test --sample-per-group 100000 --jobs 14 --timeout 30",
       "files": 1902,
       "categories": {
-        "green": 679,
-        "test-failure": 1082,
         "all-skipped": 58,
-        "timeout": 57,
-        "load-error": 14,
-        "oom-kill": 12
+        "blocked-external": 16,
+        "green": 694,
+        "load-error": 3,
+        "no-tests": 6,
+        "oom-kill": 6,
+        "test-failure": 1073,
+        "timeout": 46
       },
-      "test_level": { "ran": 44250, "passed": 26853, "failed": 15350, "expects": 404560 },
-      "notes": "file-level green = every executed test in the file passed; skipped-only files are their own bucket"
+      "test_level": {
+        "ran": 46893,
+        "passed": 27485,
+        "failed": 17306,
+        "expects": 435137
+      },
+      "notes": "file-level green = every executed test in the file passed and the file reported no out-of-test error; skipped-only, no-tests (upstream file declares no runnable test) and blocked-external (needs a service/registry/toolchain this environment lacks) are their own buckets and are NOT passes"
     },
     {
       "corpus": "compat/node/test/parallel",
       "runner": "tools/integration/node_corpus_runner.py --jobs 10 --timeout 15",
       "files": 4433,
-      "categories": { "pass": 1527, "fail": 2824, "timeout": 78, "oom-kill": 4 },
+      "categories": {
+        "pass": 1527,
+        "fail": 2824,
+        "timeout": 78,
+        "oom-kill": 4
+      },
       "notes": "direct execution (mbun <file>, exit 0 = pass); node's own harness services (// Flags:, internal bindings) are not emulated, so files needing them count as failures"
     }
   ]
