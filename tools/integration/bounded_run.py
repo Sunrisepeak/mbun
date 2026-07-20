@@ -23,23 +23,59 @@ frozen this machine or killed a measurement run:
 6. Disk-space guard: refuse to launch when the disk is nearly full, so a
    runaway workload degrades into a clear error instead of a dead machine.
 
+Where a `systemd --user` scope cannot be created (CI runners have systemd but
+no session bus for the job user), protections 2-6 still apply and the workload
+degrades to a timeout-bounded subprocess rather than failing to launch at all.
+
 Usage:
     from bounded_run import BoundedRun, ensure_disk_headroom
     ensure_disk_headroom()                       # once, at harness startup
     result = BoundedRun(log_path).run(cmd, timeout=15.0)
     result.exit_code / result.timed_out / result.oom_killed
+
+A workload that never exits on its own (an example server under a smoke test)
+uses the same protections through `BoundedServer`:
+
+    with BoundedServer(log_path).start(cmd, max_lifetime=30.0) as server:
+        ...                                       # probe it
+    # the whole process tree is dead here, scope collected
 """
 
 from __future__ import annotations
 
+import contextlib
+import functools
 import os
 import shutil
 import signal
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
-HAVE_SYSTEMD_RUN = shutil.which("systemd-run") is not None
+
+@functools.cache
+def have_systemd_scope() -> bool:
+    """Whether a `systemd-run --user --scope` actually launches here.
+
+    The binary merely existing is not enough: CI runners ship systemd but give
+    the job user no session bus, where every scope launch dies with "Failed to
+    connect to bus" -- which would turn every bounded workload into a spurious
+    failure instead of degrading to a plain timeout-bounded subprocess. Probe
+    once, cache, and fall back when the probe fails.
+    """
+    if shutil.which("systemd-run") is None:
+        return False
+    try:
+        probe = subprocess.run(
+            ["systemd-run", "--user", "--scope", "--quiet", "--collect", "--", "true"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=30, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return probe.returncode == 0
+
 
 # Defaults shared by every harness; override per-call only with a reason.
 DEFAULT_MEMORY_MAX = "4G"
@@ -105,7 +141,7 @@ class BoundedRun:
             tmp = str(self.privateTmp)
             full_env.update({"TMPDIR": tmp, "TMP": tmp, "TEMP": tmp})
 
-        if HAVE_SYSTEMD_RUN:
+        if have_systemd_scope():
             cmd = [
                 "systemd-run", "--user", "--scope", "--quiet", "--collect",
                 "-p", f"MemoryMax={memory_max}", "-p", "MemorySwapMax=0",
@@ -134,7 +170,7 @@ class BoundedRun:
                 exit_code = completed.returncode
                 if exit_code in (-signal.SIGKILL, 137):
                     oom_killed = True
-                elif HAVE_SYSTEMD_RUN and exit_code in (-signal.SIGTERM, 143):
+                elif have_systemd_scope() and exit_code in (-signal.SIGTERM, 143):
                     timed_out = True
                     exit_code = 124
             except subprocess.TimeoutExpired:
@@ -154,4 +190,93 @@ class BoundedRun:
             log_stream.write(f"\n{note}\n")
 
     def read_output(self) -> str:
+        return self.logPath.read_text(encoding="utf-8", errors="replace")
+
+
+class BoundedServer:
+    """A bounded workload that is *supposed* to keep running while you probe it.
+
+    `BoundedRun.run()` is run-to-completion, which a server smoke test can never
+    be: the server only exits when we kill it. The protections are identical and
+    all still needed here:
+
+    - the systemd scope caps the tree's memory and reaps EVERY descendant on
+      exit -- a server that forks workers and then crashes otherwise leaves
+      children holding the listen port, and every later smoke run fails with
+      EADDRINUSE against a ghost;
+    - `RuntimeMaxSec` is the backstop for the harness itself dying (Ctrl-C, an
+      exception between start and stop): the scope still expires on its own;
+    - `start_new_session` keeps a server that signals its process group from
+      killing this harness;
+    - stdout goes straight to the log file, so a probe never blocks on a full
+      pipe buffer while the server waits to write.
+    """
+
+    def __init__(self, log_path: Path, private_tmp: Path | None = None) -> None:
+        self.logPath = log_path
+        self.privateTmp = private_tmp
+
+    @contextlib.contextmanager
+    def start(
+        self,
+        cmd: list[str],
+        max_lifetime: float,
+        cwd: Path | str | None = None,
+        env: dict[str, str] | None = None,
+        memory_max: str = DEFAULT_MEMORY_MAX,
+        tasks_max: int = DEFAULT_TASKS_MAX,
+    ):
+        """Launch `cmd` in the background; yield the Popen; always reap the tree."""
+        full_env = dict(env if env is not None else os.environ)
+        if self.privateTmp is not None:
+            self.privateTmp.mkdir(parents=True, exist_ok=True)
+            tmp = str(self.privateTmp)
+            full_env.update({"TMPDIR": tmp, "TMP": tmp, "TEMP": tmp})
+
+        if have_systemd_scope():
+            cmd = [
+                "systemd-run", "--user", "--scope", "--quiet", "--collect",
+                "-p", f"MemoryMax={memory_max}", "-p", "MemorySwapMax=0",
+                "-p", f"TasksMax={tasks_max}",
+                "-p", f"RuntimeMaxSec={int(max_lifetime) + DEFAULT_KILL_GRACE_SEC}",
+                "-p", f"TimeoutStopSec={DEFAULT_KILL_GRACE_SEC}", "--",
+            ] + cmd
+
+        self.logPath.parent.mkdir(parents=True, exist_ok=True)
+        log_stream = self.logPath.open("w", encoding="utf-8")
+        process = subprocess.Popen(
+            cmd,
+            cwd=cwd,
+            env=full_env,
+            stdin=subprocess.DEVNULL,
+            stdout=log_stream,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        try:
+            yield process
+        finally:
+            self.stop_(process)
+            log_stream.close()
+            if self.privateTmp is not None:
+                force_rmtree(self.privateTmp)
+
+    def stop_(self, process: subprocess.Popen) -> None:
+        """SIGTERM the whole session, then SIGKILL what ignored it."""
+        if process.poll() is not None:
+            return
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(os.getpgid(process.pid), sig)
+            deadline = time.monotonic() + DEFAULT_KILL_GRACE_SEC
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    return
+                time.sleep(0.05)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            process.wait(timeout=DEFAULT_KILL_GRACE_SEC)
+
+    def read_output(self) -> str:
+        if not self.logPath.exists():
+            return ""
         return self.logPath.read_text(encoding="utf-8", errors="replace")
