@@ -24,3 +24,4 @@ export import mbun.crypto.blake2;
 export import mbun.crypto.pbkdf2;
 export import mbun.crypto.bcrypt;
 export import mbun.crypto.argon2;
+export import mbun.crypto.random;

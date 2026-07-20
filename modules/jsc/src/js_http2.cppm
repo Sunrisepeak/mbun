@@ -467,6 +467,9 @@ export constexpr std::string_view kHttp2JS = R"JS(
   const FRAME = { DATA: 0, HEADERS: 1, PRIORITY: 2, RST_STREAM: 3, SETTINGS: 4, PUSH_PROMISE: 5, PING: 6, GOAWAY: 7, WINDOW_UPDATE: 8, CONTINUATION: 9 };
   const FLAG = { END_STREAM: 0x1, ACK: 0x1, END_HEADERS: 0x4, PADDED: 0x8, PRIORITY: 0x20 };
   const CLIENT_PREFACE = Buffer.from("505249202a20485454502f322e300d0a0d0a534d0d0a0d0a", "hex");
+  // RFC 7540 6.9.2: the connection-level flow-control window starts at 65535
+  // and, unlike the stream window, is NOT changed by SETTINGS_INITIAL_WINDOW_SIZE.
+  const DEFAULT_CONNECTION_WINDOW = 65535;
 
   function frameHeader(len, type, flags, streamId) {
     const h = Buffer.alloc(9);
@@ -496,6 +499,47 @@ export constexpr std::string_view kHttp2JS = R"JS(
     }
   }
 
+  // node exposes nghttp2's per-session bookkeeping as `session.state`
+  // (Http2SessionState). It is not decorative: @grpc/grpc-js reads
+  // `session.state.localWindowSize` on every call it starts (transport.js
+  // `createCall`), and an undefined `state` turns that into a synchronous
+  // throw which grpc retries forever — an unbounded allocation loop, not a
+  // test failure. The session tracks the connection-level flow-control
+  // windows (RFC 7540 6.9) so these are real numbers rather than constants.
+  // outboundQueueSize is 0 because _writeFrame hands every frame straight to
+  // the socket, and the header table sizes are 0 because encodeHeaders only
+  // emits literal-without-indexing representations (see the HPACK note above),
+  // so neither dynamic table ever holds an entry.
+  function sessionState(s, nextStreamID) {
+    const local = s._localWindow === undefined ? DEFAULT_CONNECTION_WINDOW : s._localWindow;
+    const remote = s._remoteWindow === undefined ? DEFAULT_CONNECTION_WINDOW : s._remoteWindow;
+    return {
+      effectiveLocalWindowSize: DEFAULT_CONNECTION_WINDOW,
+      effectiveRecvDataLength: DEFAULT_CONNECTION_WINDOW - local,
+      nextStreamID: nextStreamID,
+      localWindowSize: local,
+      lastProcStreamID: s._lastProcStreamId || 0,
+      remoteWindowSize: remote,
+      outboundQueueSize: 0,
+      deflateDynamicTableSize: 0,
+      inflateDynamicTableSize: 0,
+    };
+  }
+
+  // Http2StreamState (node docs `http2stream.state`). `state` is nghttp2's
+  // stream state enum; 1 = NGHTTP2_STREAM_STATE_OPEN, 7 = ..._CLOSED.
+  function streamState(st) {
+    const closed = st.destroyed || st.closed || st._ended === true;
+    return {
+      localWindowSize: DEFAULT_CONNECTION_WINDOW,
+      state: closed ? 7 : 1,
+      localClose: st.writable === false ? 1 : 0,
+      remoteClose: st.readable === false ? 1 : 0,
+      sumDependencyWeight: 0,
+      weight: 16,
+    };
+  }
+
   // === ClientHttp2Stream ===
   class ClientHttp2Stream extends EE {
     constructor(session, id, headers, options) {
@@ -518,6 +562,7 @@ export constexpr std::string_view kHttp2JS = R"JS(
       this._responseEmitted = false;
     }
     get closed() { return this._closed; }
+    get state() { return streamState(this); }
     setEncoding(enc) { this._enc = enc || "utf8"; return this; }
     write(chunk, enc, cb) {
       if (typeof enc === "function") { cb = enc; enc = null; }
@@ -610,6 +655,10 @@ export constexpr std::string_view kHttp2JS = R"JS(
       this._remoteSettings = null;
       this._localSettings = { headerTableSize: 4096, enablePush: 0, initialWindowSize: 65535, maxFrameSize: 16384, maxConcurrentStreams: 4294967295 };
       this._pendingHeaderBlock = null;   // { streamId, endStream, buf }
+      // connection-level flow control bookkeeping, surfaced through `state`
+      this._localWindow = DEFAULT_CONNECTION_WINDOW;    // what the peer may still send us
+      this._remoteWindow = DEFAULT_CONNECTION_WINDOW;   // what we may still send the peer
+      this._lastProcStreamId = 0;
       this.alpnProtocol = null;
       if (typeof listener === "function") this.once("connect", listener);
 
@@ -719,6 +768,7 @@ export constexpr std::string_view kHttp2JS = R"JS(
         this._writeFrame(FRAME.DATA, endStream ? FLAG.END_STREAM : 0, stream.id, Buffer.alloc(0));
         return;
       }
+      this._remoteWindow -= buf.length;
       while (off < buf.length) {
         const end = Math.min(off + max, buf.length);
         const isLast = end >= buf.length;
@@ -792,6 +842,8 @@ export constexpr std::string_view kHttp2JS = R"JS(
             if (pad >= payload.length) { this._connError(constants.NGHTTP2_PROTOCOL_ERROR); return false; }
             data = payload.subarray(1, payload.length - pad);
           }
+          this._lastProcStreamId = streamId;
+          this._localWindow -= len;
           if (stream) {
             if (data.length) stream._pushData(data);
             // maintain flow-control windows so large bodies keep flowing
@@ -835,7 +887,10 @@ export constexpr std::string_view kHttp2JS = R"JS(
         }
         case FRAME.WINDOW_UPDATE: {
           if (len !== 4) { this._connError(constants.NGHTTP2_FRAME_SIZE_ERROR); return false; }
-          return true;   // we do not throttle our own sends beyond max frame size
+          // we do not throttle our own sends beyond max frame size, but the
+          // connection window has to stay accurate for `state.remoteWindowSize`
+          if (streamId === 0) this._remoteWindow += payload.readUInt32BE(0) & 0x7fffffff;
+          return true;
         }
         case FRAME.PUSH_PROMISE: {
           // push disabled (we advertise ENABLE_PUSH=0); a server push is a error.
@@ -902,6 +957,7 @@ export constexpr std::string_view kHttp2JS = R"JS(
     }
 
     _windowUpdate(streamId, increment) {
+      if (streamId === 0) this._localWindow += increment;
       const p = Buffer.alloc(4); p.writeUInt32BE(increment >>> 0, 0);
       this._writeFrame(FRAME.WINDOW_UPDATE, 0, streamId, p);
     }
@@ -975,6 +1031,8 @@ export constexpr std::string_view kHttp2JS = R"JS(
     get connected() { return this._connected; }
     get remoteSettings() { return this._remoteSettings ? settingsToObject(this._remoteSettings) : undefined; }
     get localSettings() { return this._localSettings; }
+    // client streams are odd-numbered; _nextStreamId() advances _lastStreamId by 2
+    get state() { return sessionState(this, this._lastStreamId > 0 ? this._lastStreamId + 2 : 1); }
     settings(s, cb) { if (typeof cb === "function") this.once("localSettings", cb); return this; }
     ping(cb) { this._writeFrame(FRAME.PING, 0, 0, Buffer.alloc(8)); if (typeof cb === "function") G.queueMicrotask(() => cb(null, 0, Buffer.alloc(8))); return true; }
     goaway(code, lastStreamId, opaqueData) { const p = Buffer.alloc(8); p.writeUInt32BE((lastStreamId || 0) >>> 0, 0); p.writeUInt32BE((code || 0) >>> 0, 4); this._writeFrame(FRAME.GOAWAY, 0, 0, opaqueData ? Buffer.concat([p, Buffer.from(opaqueData)]) : p); }
@@ -1148,6 +1206,7 @@ export constexpr std::string_view kHttp2JS = R"JS(
       this.sentHeaders = undefined;
     }
     get closed() { return this._closed; }
+    get state() { return streamState(this); }
     setEncoding(enc) { this._enc = enc || "utf8"; return this; }
     resume() { this._paused = false; return this; }
     pause() { this._paused = true; return this; }
@@ -1270,6 +1329,10 @@ export constexpr std::string_view kHttp2JS = R"JS(
       this._localSettings = { headerTableSize: 4096, enablePush: 0, initialWindowSize: 65535, maxFrameSize: 16384, maxConcurrentStreams: 4294967295 };
       this._pendingHeaderBlock = null;
       this._lastStreamId = 0;
+      // connection-level flow control bookkeeping, surfaced through `state`
+      this._localWindow = DEFAULT_CONNECTION_WINDOW;
+      this._remoteWindow = DEFAULT_CONNECTION_WINDOW;
+      this._lastProcStreamId = 0;
       this.alpnProtocol = socket.alpnProtocol || null;
       const self = this;
       // A server may send its SETTINGS immediately (RFC 7540 3.5); the client's
@@ -1290,6 +1353,7 @@ export constexpr std::string_view kHttp2JS = R"JS(
       const max = (this._remoteSettings && this._remoteSettings.maxFrameSize) || 16384;
       if (buf.length === 0) { this._writeFrame(FRAME.DATA, endStream ? FLAG.END_STREAM : 0, stream.id, Buffer.alloc(0)); return; }
       let off = 0;
+      this._remoteWindow -= buf.length;
       while (off < buf.length) {
         const end = Math.min(off + max, buf.length);
         const isLast = end >= buf.length;
@@ -1298,7 +1362,7 @@ export constexpr std::string_view kHttp2JS = R"JS(
       }
     }
     _rstStream(stream, code) { const p = Buffer.alloc(4); p.writeUInt32BE(code >>> 0, 0); this._writeFrame(FRAME.RST_STREAM, 0, stream.id, p); }
-    _windowUpdate(streamId, increment) { const p = Buffer.alloc(4); p.writeUInt32BE(increment >>> 0, 0); this._writeFrame(FRAME.WINDOW_UPDATE, 0, streamId, p); }
+    _windowUpdate(streamId, increment) { if (streamId === 0) this._localWindow += increment; const p = Buffer.alloc(4); p.writeUInt32BE(increment >>> 0, 0); this._writeFrame(FRAME.WINDOW_UPDATE, 0, streamId, p); }
 
     _onData(chunk) {
       if (this.destroyed) return;
@@ -1361,6 +1425,8 @@ export constexpr std::string_view kHttp2JS = R"JS(
             if (pad >= payload.length) { this._connError(constants.NGHTTP2_PROTOCOL_ERROR); return false; }
             data = payload.subarray(1, payload.length - pad);
           }
+          this._lastProcStreamId = streamId;
+          this._localWindow -= len;
           if (stream) {
             // content-length accounting (RFC 9113 8.1.1): a body diverging from a
             // declared content-length is a stream PROTOCOL_ERROR.
@@ -1406,6 +1472,7 @@ export constexpr std::string_view kHttp2JS = R"JS(
           if (len !== 4) { this._connError(constants.NGHTTP2_FRAME_SIZE_ERROR); return false; }
           const inc = payload.readUInt32BE(0) & 0x7fffffff;
           if (inc === 0 && streamId === 0) { this._connError(constants.NGHTTP2_PROTOCOL_ERROR); return false; }  // §6.9
+          if (streamId === 0) this._remoteWindow += inc;
           return true;
         }
         case FRAME.PRIORITY: {
@@ -1502,6 +1569,9 @@ export constexpr std::string_view kHttp2JS = R"JS(
     get connected() { return !this.destroyed; }
     get remoteSettings() { return this._remoteSettings ? settingsToObject(this._remoteSettings) : undefined; }
     get localSettings() { return this._localSettings; }
+    // server-initiated streams are even-numbered; we never push, so the next id
+    // a server session would allocate stays 2 (node reports the same).
+    get state() { return sessionState(this, 2); }
     settings(s, cb) { if (typeof cb === "function") this.once("localSettings", cb); this._writeFrame(FRAME.SETTINGS, 0, 0, encodeSettings(s)); return this; }
     ping(payload, cb) { if (typeof payload === "function") { cb = payload; payload = null; } this._writeFrame(FRAME.PING, 0, 0, payload && isBufLike(payload) ? Buffer.from(payload) : Buffer.alloc(8)); if (typeof cb === "function") G.queueMicrotask(() => cb(null, 0, Buffer.alloc(8))); return true; }
     goaway(code, lastStreamID, opaqueData) {

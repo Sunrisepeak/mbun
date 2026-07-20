@@ -507,23 +507,22 @@ JSC_DEFINE_HOST_FUNCTION(crypto_hasher_static_hash_host,
     return JSC::JSValue::encode(encode_digest(global, bytes, native_arg(frame, 2), true));
 }
 
-// Fixed-algorithm classes Bun.SHA1/SHA224/SHA256/SHA384/SHA512/SHA512_256/MD5.
+// Fixed-algorithm classes Bun.SHA1/SHA224/SHA256/SHA384/SHA512/SHA512_256/MD5/MD4.
 // Each gets its own JSClass so the constructor's `.name` is the class name (used
-// verbatim in the "already digested" messages the tests assert on). MD4 and the
-// boringssl-only digests are DEFERRED and simply absent.
-#define MBUN_SHA_CLASS(CLS, ALGO)                                                                \
+// verbatim in the "already digested" messages the tests assert on). The backend is
+// a NodeDigest so the classes that are not in the CryptoHasher DigestAlgo family
+// (MD4 — bun routes it through BoringSSL's EVP_md4) can join the same shape.
+#define MBUN_SHA_CLASS(CLS, MAKE_DIGEST)                                                         \
     JSClassRef g##CLS##Class{nullptr};                                                           \
     JSObjectRef CLS##_construct_cb(JSContextRef ctx, JSObjectRef, std::size_t, const JSValueRef[],\
                                    JSValueRef*) {                                                 \
         JSC::JSGlobalObject* global{toJS(ctx)};                                                  \
         JSC::JSLockHolder locker{global}; /* ctor cbs run under DropAllLocks */                  \
-        return make_hasher_object(global, g##CLS##Class,                                         \
-                                  node_digest_from_algo(mbun::crypto::DigestAlgo::ALGO),          \
-                                  #CLS);                                                          \
+        return make_hasher_object(global, g##CLS##Class, (MAKE_DIGEST), #CLS);                   \
     }                                                                                            \
     JSC_DEFINE_HOST_FUNCTION(CLS##_static_hash_host,                                             \
                              (JSC::JSGlobalObject * global, JSC::CallFrame * frame)) {           \
-        mbun::crypto::CryptoHasher h{mbun::crypto::DigestAlgo::ALGO};                            \
+        NodeDigest h{MAKE_DIGEST};                                                               \
         bool ok{with_hasher_bytes(global, native_arg(frame, 0),                                  \
                                   [&](std::span<const std::uint8_t> b) { h.update(b); })};        \
         if (!ok) {                                                                                \
@@ -533,14 +532,17 @@ JSC_DEFINE_HOST_FUNCTION(crypto_hasher_static_hash_host,
         auto bytes{h.digest()};                                                                  \
         return JSC::JSValue::encode(encode_digest(global, bytes, native_arg(frame, 1)));         \
     }
+#define MBUN_ALGO(NAME) node_digest_from_algo(mbun::crypto::DigestAlgo::NAME)
 
-MBUN_SHA_CLASS(SHA1, Sha1)
-MBUN_SHA_CLASS(SHA224, Sha224)
-MBUN_SHA_CLASS(SHA256, Sha256)
-MBUN_SHA_CLASS(SHA384, Sha384)
-MBUN_SHA_CLASS(SHA512, Sha512)
-MBUN_SHA_CLASS(SHA512_256, Sha512_256)
-MBUN_SHA_CLASS(MD5, Md5)
+MBUN_SHA_CLASS(SHA1, MBUN_ALGO(Sha1))
+MBUN_SHA_CLASS(SHA224, MBUN_ALGO(Sha224))
+MBUN_SHA_CLASS(SHA256, MBUN_ALGO(Sha256))
+MBUN_SHA_CLASS(SHA384, MBUN_ALGO(Sha384))
+MBUN_SHA_CLASS(SHA512, MBUN_ALGO(Sha512))
+MBUN_SHA_CLASS(SHA512_256, MBUN_ALGO(Sha512_256))
+MBUN_SHA_CLASS(MD5, MBUN_ALGO(Md5))
+MBUN_SHA_CLASS(MD4, *node_digest_by_name("md4"))
+#undef MBUN_ALGO
 #undef MBUN_SHA_CLASS
 
 // ── Bun.which (mbun.which PATH executable lookup) ────────────────────────────

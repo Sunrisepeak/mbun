@@ -428,16 +428,35 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
         const body = norm.body;
         if (norm.contentType && !this.headers.has("content-type")) this.headers.set("content-type", norm.contentType);
         this._body = (body != null && !isStream(body) && (typeof body === "string" || body instanceof Uint8Array || (body && body._u8))) ? body : undefined;
-        this._stream = bodyToStream(body);
+        // PERF: bodyToStream() allocates a ReadableStream and TextEncoder-encodes
+        // the whole body on EVERY construction, which dominated `new Request(...)`
+        // (js/web/request/request-clone-leak.test.ts builds 18M of them). A string
+        // or Uint8Array body is byte-identical whether encoded now or on first
+        // `.body`/consume — `bodyToStream` enqueues the SAME Uint8Array reference,
+        // it does not snapshot — so defer it. Everything else (streams, which must
+        // be validated eagerly by Body.rs:1009, and FormData/URLSearchParams/
+        // ArrayBuffer views, which ARE snapshotted) keeps the eager path.
+        if (body != null && (typeof body === "string" || body instanceof Uint8Array)) {
+          this.__st = undefined;
+          this.__pendingBody = body;
+        } else {
+          this._stream = bodyToStream(body);
+        }
       }
+      // Lazily materialized companion of `__pendingBody` (see the constructor).
+      get _stream() { if (this.__st === undefined) { this.__st = this.__pendingBody === undefined ? null : bodyToStream(this.__pendingBody); this.__pendingBody = undefined; } return this.__st; }
+      set _stream(v) { this.__st = v === undefined ? null : v; this.__pendingBody = undefined; }
       get body() { return this._stream || null; }
-      get bodyUsed() { return bodyDisturbed(this._body, this._used, this._stream); }   // Body.rs:1860
+      // `__st` (not `_stream`) on the disturbed checks: an unmaterialized lazy body
+      // can be neither disturbed nor locked, so reading it through the getter would
+      // build the stream just to prove it is pristine.
+      get bodyUsed() { return bodyDisturbed(this._body, this._used, this.__st); }   // Body.rs:1860
       _consume(kind) {
         // Same body-before-stream ordering as Response._consume: Body.rs:1784
         // rejects with "Body already used" (ERR_BODY_ALREADY_USED) before the
         // stream is touched. Verified against bun-rust 1.4.0: a second
         // `request.text()` rejects with that message, not the stream-level one.
-        if (bodyDisturbed(this._body, this._used, this._stream) || (isStream(this._stream) && this._stream.locked))
+        if (bodyDisturbed(this._body, this._used, this.__st) || (isStream(this._stream) && this._stream.locked))
           return Promise.reject(bodyAlreadyUsed());
         // Same MIME gate as Response._consume (defined in the process_web
         // partition -- the partitions are concatenated into one script by
@@ -497,7 +516,7 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       // the same Body.rs:1591 clone_with_readable_stream (tee a Locked body,
       // refcount a byte body).
       clone() {
-        throwIfBodyUnusable(this._body, this._used, this._stream);   // spec step 1
+        throwIfBodyUnusable(this._body, this._used, this.__st);   // spec step 1
         const init = { method: this.method, headers: this.headers, signal: this.signal };
         if (this._body !== undefined) return new G.Request(this.url, Object.assign({}, init, { body: this._body }));
         if (!isStream(this._stream)) return new G.Request(this.url, init);
@@ -621,7 +640,27 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
     // Algorithms served by the native mbun.crypto backend, with digest byte length.
     const NATIVE_ALGOS = { md4:16, md5:16, sha1:20, sha128:20, sha224:28, sha256:32, sha384:48, sha512:64, sha512224:28, sha512256:32, ripemd160:20, rmd160:20, sha3224:28, sha3256:32, sha3384:48, sha3512:64, shake128:16, shake256:32, blake2b512:64, blake2b256:32, blake2s256:32 };
     const NORM = (a) => String(a).toLowerCase().replace(/[-_/.]/g, "");
-    const supported = (algo) => { const a = NORM(algo); return (CN && (a in NATIVE_ALGOS)) || (!!hashFns[a]); };
+    // OpenSSL signature-OID spellings that name a plain digest: `RSA-SHA256` is the
+    // "rsaEncryption with SHA-256" object, and EVP_get_digestbyname resolves it to
+    // SHA-256 itself. The `*WithRSAEncryption` long names are NOT resolvable (node
+    // rejects them), so only the short `rsa-*` forms alias here.
+    // ref node test/parallel + bun test/js/node/crypto/node-crypto.test.js algo table.
+    const DIGEST_ALIASES = { rsasha1: "sha1", rsasha224: "sha224", rsasha256: "sha256", rsasha384: "sha384", rsasha512: "sha512" };
+    // MD5-SHA1 (TLS 1.0/1.1 PRF digest) is literally MD5(m) || SHA1(m); OpenSSL
+    // ships it as one EVP_MD, mbun composes it from the two native digests.
+    const isMd5Sha1 = (algo) => NORM(algo) === "md5sha1";
+    const canonAlgo = (algo) => DIGEST_ALIASES[NORM(algo)] || algo;
+    const supported = (algo) => { const a = NORM(canonAlgo(algo)); return a === "md5sha1" || (CN && (a in NATIVE_ALGOS)) || (!!hashFns[a]); };
+    // One-shot digest over already-joined message bytes, honouring the composite.
+    const digestBytes = (algo, m, outLen) => {
+      if (isMd5Sha1(algo)) {
+        const a = CN ? CN.digest("md5", m, 0) : hashFns.md5(m);
+        const b = CN ? CN.digest("sha1", m, 0) : hashFns.sha1(m);
+        const out = new Uint8Array(a.length + b.length); out.set(a, 0); out.set(b, a.length); return out;
+      }
+      const c = canonAlgo(algo);
+      return CN ? CN.digest(c, m, outLen) : hashFns[NORM(c)](m);
+    };
     const toBytes = (data, enc) => {
       if (typeof data === "string") return (enc && enc !== "utf8" && enc !== "utf-8") ? new Uint8Array(Buffer.from(data, enc)) : te.encode(data);
       if (data instanceof Uint8Array) return data;
@@ -656,10 +695,12 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
     Object.setPrototypeOf(Hash, Transform);
     const joinChunks = function (chunks) { let t = 0; for (const c of chunks) t += c.length; const m = new Uint8Array(t); let o = 0; for (const c of chunks) { m.set(c, o); o += c.length; } return m; };
     Hash.prototype.update = function (data, enc) { if (this._done) throw new Error("Digest already called"); this._chunks.push(toBytes(data, enc)); return this; };
-    Hash.prototype.digest = function (enc) { if (this._done) throw new Error("Digest already called"); this._done = true; const m = joinChunks(this._chunks); const d = CN ? CN.digest(this._algo, m, this._out) : this._fn(m); return encode(d, enc); };
+    Hash.prototype.digest = function (enc) { if (this._done) throw new Error("Digest already called"); this._done = true; const m = joinChunks(this._chunks); const d = digestBytes(this._algo, m, this._out); return encode(d, enc); };
     Hash.prototype._transform = function (chunk, e, cb) { this.update(chunk); cb(); };
     Hash.prototype._flush = function (cb) { this.push(this.digest()); cb(); };
-    Hash.prototype.copy = function () { const h = new Hash(this._algo, { outputLength: this._out }); h._chunks = this._chunks.slice(); return h; };
+    // node's Hash#copy clones the EVP context, which is gone once digest() ran:
+    // copying a finalized hash throws, exactly like update() does.
+    Hash.prototype.copy = function () { if (this._done) throw new Error("Digest already called"); const h = new Hash(this._algo, { outputLength: this._out }); h._chunks = this._chunks.slice(); return h; };
     // node exposes the native context under a `kHandle` symbol whose methods must
     // reject a bad `this` with ERR_INVALID_THIS (rather than dereferencing a null
     // native pointer). We mirror that contract with a guarded handle object.
@@ -694,7 +735,7 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
     };
     Hmac.prototype._transform = function (chunk, e, cb) { this.update(chunk); cb(); };
     Hmac.prototype._flush = function (cb) { this.push(this.digest()); cb(); };
-    function createHash(algo, opts) { if (typeof algo !== "string") throw new TypeError('The "algorithm" argument must be of type string. Received ' + (algo === null ? "null" : typeof algo)); if (!supported(algo)) throw new Error("Digest method not supported: " + algo); return new Hash(algo, opts); }
+    function createHash(algo, opts) { if (typeof algo !== "string") throw new TypeError('The "algorithm" argument must be of type string. Received ' + (algo === null ? "null" : typeof algo)); if (!supported(algo)) throw new Error("Digest method not supported"); return new Hash(algo, opts); }
     function createHmac(algo, key, opts) { if (typeof algo !== "string") throw new TypeError('The "hmac" argument must be of type string. Received ' + (algo === null ? "null" : typeof algo)); if (!supported(algo)) throw new Error("Invalid digest: " + algo); if (key === null || key === undefined) throw new TypeError('The "key" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, DataView, KeyObject, or CryptoKey. Received ' + (key === null ? "null" : "undefined")); return new Hmac(algo, key, opts); }
     // node-style error helpers (message + .code, matching node:crypto).
     const mkErr = (Ctor, code, msg) => { const e = new Ctor(msg); e.code = code; return e; };
