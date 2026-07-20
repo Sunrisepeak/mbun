@@ -19,6 +19,11 @@ SKIP_RE = re.compile(r"(?m)^\s*(\d+) skip\s*$")
 EXPECT_RE = re.compile(r"(?m)^\s*(\d+) expect\(\) calls\s*$")
 RAN_RE = re.compile(r"Ran (\d+) tests?")
 TEST_FILE_RE = re.compile(r"\.test\.(?:[cm]?[jt]sx?)$")
+# An error the runner reported outside any test: an unhandled rejection, a
+# missing global, a module that threw while loading. Distinguishes "the file
+# loaded and simply declares no tests" from "the file died before declaring any".
+ERROR_MARK_RE = re.compile(r"(?m)^\s*\d+ error\s*$|^\s*error:|^# Unhandled error")
+ERROR_COUNT_RE = re.compile(r"(?m)^\s*(\d+) error\s*$")
 
 
 @dataclass(frozen=True)
@@ -54,7 +59,11 @@ def classify(
     if oom_killed:
         return "oom-kill"
     if ran > 0 or passed > 0 or failed > 0:
-        if exit_code != 0 or failed > 0:
+        # An out-of-test error (a rejected describe body, an unhandled rejection
+        # between tests) is a failed file for bun, which exits non-zero on it;
+        # mbun currently still exits 0, so exit code alone would score such a
+        # file as a full green even though a whole scope may have been dropped.
+        if exit_code != 0 or failed > 0 or last_int(ERROR_COUNT_RE, output) > 0:
             return "test-failure"
         # A file whose every test was skipped exits 0 with 0 failures and so used
         # to score as a full green -- ci-restrictions.test.ts reported 0 pass /
@@ -69,6 +78,18 @@ def classify(
         return "missing-fixture"
     if re.search(r"node-gyp build .* failed", output):
         return "fixture-build-error"
+    # "Loaded fine, declares no tests" is not a load error. Six corpus files are
+    # like this by design -- empty-file.test.ts is a comment-only regression
+    # guard, harness.test.js and svelte/server-side.test.ts are fully commented
+    # out, expect-type-doctest.test.ts only makes compile-time type assertions,
+    # issue-2086.test.ts guards its tests behind `typeof setImmediate ===
+    # "undefined"`, and net/handle-leak.test.ts is a top-level script with no
+    # test() blocks. Reporting them as load-error hid the files that genuinely
+    # fail to load. Requires a clean exit AND a runner summary AND no
+    # out-of-test error, so a file that dies before registering anything (an
+    # unhandled error, a missing global) still lands in load-error.
+    if exit_code == 0 and RAN_RE.search(output) and not ERROR_MARK_RE.search(output):
+        return "no-tests"
     return "load-error"
 
 

@@ -14,12 +14,19 @@ case "$2" in
   *dependency*) printf "Cannot find module 'x': cannot find package 'x'\n"; exit 1 ;;
   *fixture*) printf 'Docker Compose file not found at: fixture.yml\n'; exit 1 ;;
   *native-build*) printf 'node-gyp build in fixture failed:\n'; exit 1 ;;
+  # Ran tests and passed them, but also reported an out-of-test error.
+  *outoftest*) printf '# Unhandled error between tests\nerror: boom\n  1 pass\n  0 fail\n  1 error\n  1 expect() calls\nRan 1 test across 1 file.\n' ;;
+  # Loaded cleanly, declares no tests (comment-only / type-only corpus files).
+  *notests*) printf '  0 pass\n  0 fail\nRan 0 tests across 1 file. [12.00ms]\n' ;;
+  # Exits 0 too, but died before registering anything -- still a load error.
+  *unhandled*) printf '# Unhandled error between tests\nerror: X is not a function\n  0 pass\n  0 fail\n  1 error\nRan 0 tests across 1 file. [9.00ms]\n' ;;
   *) printf 'error: test file evaluation error\nRan 0 tests (file did not load/run).\n'; exit 1 ;;
 esac
 EOF
 chmod +x "$tmp/fake-mbun"
 printf '%s\n' green.test.ts red.test.ts load.test.ts timeout.test.ts \
-  dependency.test.ts fixture.test.ts native-build.test.ts >"$tmp/list.txt"
+  dependency.test.ts fixture.test.ts native-build.test.ts notests.test.ts \
+  unhandled.test.ts outoftest.test.ts >"$tmp/list.txt"
 
 python3 "$repo_root/tools/integration/bun_corpus_runner.py" \
   --bin "$tmp/fake-mbun" --root "$repo_root" --list "$tmp/list.txt" \
@@ -31,17 +38,17 @@ root = pathlib.Path(sys.argv[1])
 rows = list(csv.DictReader((root / "results.tsv").open(), delimiter="\t"))
 assert [row["classification"] for row in rows] == [
     "green", "test-failure", "load-error", "timeout", "missing-dependency",
-    "missing-fixture", "fixture-build-error",
-]
-assert [int(row["passed"]) for row in rows] == [2, 1, 0, 0, 0, 0, 0]
+    "missing-fixture", "fixture-build-error", "no-tests", "load-error", "test-failure",
+], [row["classification"] for row in rows]
+assert [int(row["passed"]) for row in rows] == [2, 1, 0, 0, 0, 0, 0, 0, 0, 1]
 summary = json.loads((root / "summary.json").read_text())
-assert summary["files"] == 7
-assert summary["passed"] == 3 and summary["failed"] == 1
+assert summary["files"] == 10
+assert summary["passed"] == 4 and summary["failed"] == 1
 assert summary["categories"] == {
-    "fixture-build-error": 1, "green": 1, "load-error": 1,
-    "missing-dependency": 1, "missing-fixture": 1, "test-failure": 1,
+    "fixture-build-error": 1, "green": 1, "load-error": 2, "no-tests": 1,
+    "missing-dependency": 1, "missing-fixture": 1, "test-failure": 2,
     "timeout": 1,
-}
+}, summary["categories"]
 assert all((root / row["log"]).is_file() for row in rows)
 assert (root / "selected-tests.txt").read_text().splitlines() == [row["path"] for row in rows]
 PY
