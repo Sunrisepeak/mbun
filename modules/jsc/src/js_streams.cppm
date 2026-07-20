@@ -1900,6 +1900,10 @@ constexpr std::string_view kStreamsJS_part2 = R"JS(
   // synchronously reject on a detached queued chunk (validated eagerly).
   function consumerUsableError(stream) {
     if (!isReadableStream(stream)) return new TypeError("Expected a ReadableStream");
+    // ByteBlobLoader.rs:223 to_buffered_value checks its store BEFORE anything
+    // else: once the owning Body consumed (and detached) the blob store, every
+    // stream-level consumer rejects with ERR_BODY_ALREADY_USED, not "locked".
+    if (stream.__mbunBodyStoreDetached) { const e = new TypeError("Body already used"); e.code = "ERR_BODY_ALREADY_USED"; return e; }
     if (stream.locked) return new TypeError("ReadableStream is locked");
     if (stream._disturbed) { const e = new Error("ReadableStream has already been used"); e.code = "ERR_BODY_ALREADY_USED"; return e; }
     return null;
@@ -1976,6 +1980,8 @@ constexpr std::string_view kStreamsJS_part2 = R"JS(
     // reader attached so `.locked` stays true after consumption, matching the
     // fetch spec (and bun) for Response/Request body consumers (issue 07001).
     retainLock(stream) { if (stream && typeof stream === "object") { try { stream.__mbunBodyRetainLock = true; } catch (e) {} } },
+    // Body.rs use_as_any_blob detached the blob store behind this body stream.
+    detachBodyStore(stream) { if (stream && typeof stream === "object") { try { stream.__mbunBodyStoreDetached = true; } catch (e) {} } },
     // The *Raw variants are the non-body consumers, so they pass no allocation
     // limit kind: only Response/Request body consumption is capped (bun caps
     // the body path, not every stream read).

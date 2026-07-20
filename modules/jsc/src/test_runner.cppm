@@ -418,11 +418,18 @@ inline constexpr std::string_view HARNESS = R"JS(
         let cur = received, ok = true; for (const k of path) { if (cur == null || !(k in Object(cur))) { ok = false; break; } cur = cur[k]; }
         if (ok && arguments.length > 1) ok = deepEqual(cur, val);
         check(ok, () => "toHaveProperty(" + fmt(key) + ")\n\nReceived: " + fmt(received)); return m; },
-      toMatchObject(obj) { const sub = (a, b) => { if (isAsym(b)) return b.match(a); if (typeof b !== "object" || b === null) return deepEqual(a, b); if (a == null) return false;
-          for (const k of Object.keys(b)) { if (!sub(a[k], b[k])) return false; } return true; };
+      toMatchObject(obj) { const sub = (a, b, seen) => {
+          // Identity first (jest/bun `equals` does the same): a self-referential
+          // graph such as a MessageChannel port pair (port._other._other ===
+          // port) otherwise recurses until the stack overflows.
+          if (a === b) return true;
+          if (isAsym(b)) return b.match(a); if (typeof b !== "object" || b === null) return deepEqual(a, b); if (a == null) return false;
+          let s = seen.get(a); if (s === undefined) seen.set(a, (s = new Set()));
+          if (s.has(b)) return true; s.add(b);
+          for (const k of Object.keys(b)) { if (!sub(a[k], b[k], seen)) return false; } return true; };
         // bun quirk (bug-compatible): a top-level asymmetric matcher (e.g.
         // expect.objectContaining(...)) is NOT applied — any object passes.
-        const pass = isAsym(obj) ? received !== null && typeof received === "object" : sub(received, obj);
+        const pass = isAsym(obj) ? received !== null && typeof received === "object" : sub(received, obj, new Map());
         check(pass, () => "toMatchObject(" + fmt(obj) + ")\n\nReceived: " + fmt(received)); return m; },
       toBeOneOf(list) { let ok = false; for (const x of list) if (deepEqual(received, x)) { ok = true; break; }
         check(ok, () => "toBeOneOf\n\nReceived: " + fmt(received)); return m; },

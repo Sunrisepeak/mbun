@@ -1403,17 +1403,42 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
           // Fully reading a body never releases the reader (fetch spec), so
           // `body.locked` stays true after .text()/.arrayBuffer()/… — issue 07001.
           if (S.retainLock) S.retainLock(this._stream);
-          if (kind === "text") return S.text(this._stream);
-          if (kind === "bytes") return S.bytes(this._stream);
-          if (kind === "arrayBuffer") return S.arrayBuffer(this._stream);
-          if (kind === "blob") return S.array(this._stream).then((cs) => new G.Blob(cs, { type: (this.headers.get && this.headers.get("content-type")) || "" }));
-          if (kind === "formData") return S.bytes(this._stream).then((u8) => formDataParseBody(u8, fdEncoding));
+          let p;
+          if (kind === "text") p = S.text(this._stream);
+          else if (kind === "json") p = S.json(this._stream);
+          else if (kind === "bytes") p = S.bytes(this._stream);
+          else if (kind === "arrayBuffer") p = S.arrayBuffer(this._stream);
+          else if (kind === "blob") p = S.array(this._stream).then((cs) => new G.Blob(cs, { type: (this.headers.get && this.headers.get("content-type")) || "" }));
+          else if (kind === "formData") p = S.bytes(this._stream).then((u8) => formDataParseBody(u8, fdEncoding));
+          // Body.rs use_as_any_blob detaches the body's blob store, so the
+          // ByteBlobLoader behind `response.body` loses its store: a later
+          // `response.body.blob()/.text()/…` hits ByteBlobLoader.rs:237
+          // to_buffered_value with store == null and rejects with
+          // ERR_BODY_ALREADY_USED ("Body already used") rather than the
+          // stream-level "ReadableStream is locked". Mark the detach here (after
+          // the read is dispatched, so this very read still sees a live store).
+          if (p !== undefined) { if (S.detachBodyStore) S.detachBodyStore(this._stream); return p; }
         }
         // non-stream bodies
         // Body.rs materializations are capped by the synthetic allocation limit
         // (see G.__mbunCheckAllocLimit); arrayBuffer() goes through "bytes" in
         // bun too but ArrayBuffer is exempt there, so it re-reads without a cap.
         if (kind === "text") { if (b == null) return Promise.resolve(""); if (typeof b === "string") return Promise.resolve(b); if (b instanceof Uint8Array) { G.__mbunCheckAllocLimit(b.length, "text"); return Promise.resolve(td.decode(b)); } if (typeof b.text === "function") return b.text(); return Promise.resolve(String(b)); }
+        // Body.rs:1884 get_json materializes through the SAME synthetic
+        // allocation limit as get_text, but reports the JSON-flavoured message
+        // ("Cannot parse a JSON string longer than 2^32-1 characters"). Routing
+        // json() through the "text" kind reported the string message instead.
+        if (kind === "json") {
+          let t;
+          if (b == null) t = Promise.resolve("");
+          else if (typeof b === "string") t = Promise.resolve(b);
+          else if (b instanceof Uint8Array) { G.__mbunCheckAllocLimit(b.length, "json"); t = Promise.resolve(td.decode(b)); }
+          else if (b && G.Blob && b instanceof G.Blob) { G.__mbunCheckAllocLimit(b.size, "json"); t = Promise.resolve(td.decode(b._u8)); }
+          else if (b && b._u8 instanceof Uint8Array) { G.__mbunCheckAllocLimit(b._u8.length, "json"); t = Promise.resolve(td.decode(b._u8)); }
+          else if (typeof b.text === "function") t = b.text();
+          else t = Promise.resolve(String(b));
+          return t.then((s) => JSON.parse(s));
+        }
         // The cap is checked against the Blob's `size` (a plain number) BEFORE
         // its bytes are touched — reading `_u8` first would join the whole
         // part list, i.e. do the very allocation the limit exists to refuse.
@@ -1429,7 +1454,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
         if (kind === "formData") return this._consume("bytes").then((u8) => formDataParseBody(u8, fdEncoding));
       }
       text() { return this._consume("text"); }
-      json() { return this._consume("text").then((t) => JSON.parse(t)); }
+      json() { return this._consume("json"); }
       arrayBuffer() { return this._consume("arrayBuffer"); }
       bytes() { return this._consume("bytes"); }
       blob() { return this._consume("blob"); }

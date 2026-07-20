@@ -361,7 +361,10 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
   Agent.prototype.keepSocketAlive = function () { return true; };
   Agent.prototype.reuseSocket = function () {};
   Agent.prototype.destroy = function () {};
-  const globalAgent = new Agent({ keepAlive: false });
+  // node >= 19 (and bun) default the global agent to keep-alive with a 5s
+  // idle timeout; `agent: false` still constructs a fresh keepAlive:false Agent.
+  // The socket-level SO_KEEPALIVE gate below reads this flag.
+  const globalAgent = new Agent({ keepAlive: true, keepAliveMsecs: 5000, timeout: 5000, scheduling: "lifo" });
 
   // -------------------------------------------------- ClientRequest (_http_client)
   // Network transport is DEFERRED: the request is fully shaped and buffers
@@ -577,7 +580,12 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
     const connOpts = self.socketPath
       ? { path: self.socketPath }
       : { host: self.host, port: self.port };
+    // node _http_agent.js: the agent arms SO_KEEPALIVE on every socket it keeps
+    // alive (`agent: false` builds a fresh keepAlive:false Agent, so it does
+    // not). fetch() applies the same gate through RequestInit.keepalive.
+    const kaAgent = self.agent && self.agent !== false && self.agent.keepAlive ? self.agent : null;
     const socket = net.connect(connOpts, () => {
+      if (kaAgent && typeof socket.setKeepAlive === "function") socket.setKeepAlive(true, kaAgent.keepAliveMsecs || 1000);
       self._connected = true;
       self.emit("socket", socket);
       ensureClientHeader(self); // bodyless requests may connect before end()
@@ -602,6 +610,12 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
     const parser = new Parser(true);
     parser.reqMethod = self.method;
     let res = null;
+    // node _http_client.js: once a 101 (or a 2xx answer to CONNECT) arrives the
+    // connection stops being HTTP — the parser is detached and the raw socket is
+    // handed to the 'upgrade'/'connect' listener together with the bytes that
+    // already arrived after the header block. Without this the `ws` client sees
+    // a plain 'response' and aborts with "Unexpected server response: 101".
+    let upgraded = false;
     parser.onHead = () => {
       res = new IncomingMessage(socket);
       res.statusCode = parser.status;
@@ -609,11 +623,25 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
       res.httpVersion = parser.httpVersion;
       res._addHeaderLines(parser.rawHeaders);
       self.res = res;
+      const isConnect = self.method === "CONNECT";
+      if (parser.status === 101 || (isConnect && parser.status >= 200 && parser.status < 300)) {
+        upgraded = true;
+        self.upgradeOrConnect = true;
+        res.upgrade = true;
+        // leftover() is exactly the pipelined bytes past the header block: at
+        // this point the parser has consumed the head and nothing else.
+        const head = G.Buffer.from(parser.leftover());
+        const ev = isConnect ? "connect" : "upgrade";
+        // node destroys the socket when nobody claims the upgrade.
+        if (self.listenerCount(ev) > 0) self.emit(ev, res, socket, head);
+        else socket.destroy();
+        return;
+      }
       self.emit("response", res);
     };
-    parser.onBody = (b) => { if (res) res.push(G.Buffer.from(b)); };
+    parser.onBody = (b) => { if (res && !upgraded) res.push(G.Buffer.from(b)); };
     parser.onDone = () => {
-      if (!res) return;
+      if (!res || upgraded) return;
       res.complete = true;
       res.push(null);
       // There is no connection pool here (every ClientRequest opens its own
@@ -626,9 +654,9 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
         G.queueMicrotask(() => { try { socket.destroy(); } catch (e) {} });
       }
     };
-    parser.onError = (e) => { if (!self.destroyed) self.emit("error", e); };
-    socket.on("data", (chunk) => parser.push(new Uint8Array(chunk.buffer || chunk, chunk.byteOffset || 0, chunk.byteLength !== undefined ? chunk.byteLength : chunk.length)));
-    socket.on("end", () => { try { parser.eof(); } catch (e) {} });
+    parser.onError = (e) => { if (!self.destroyed && !upgraded) self.emit("error", e); };
+    socket.on("data", (chunk) => { if (upgraded) return; parser.push(new Uint8Array(chunk.buffer || chunk, chunk.byteOffset || 0, chunk.byteLength !== undefined ? chunk.byteLength : chunk.length)); });
+    socket.on("end", () => { if (upgraded) return; try { parser.eof(); } catch (e) {} });
     socket.on("close", () => { self._closed = true; self.emit("close"); });
   }
 
@@ -775,7 +803,7 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
       this.maxCachedSessions = (options && options.maxCachedSessions) || 100;
     }
   }
-  const httpsGlobalAgent = new HttpsAgent({ keepAlive: false });
+  const httpsGlobalAgent = new HttpsAgent({ keepAlive: true, keepAliveMsecs: 5000, timeout: 5000, scheduling: "lifo" });
 
   const httpsExports = makeExports("https:", HttpsAgent, httpsGlobalAgent);
   // https.request/get inject the https agent + protocol so port defaults to 443.

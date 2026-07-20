@@ -329,6 +329,17 @@ JSValueRef netn_set_sockbuf_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::
     const int size{argc > 2 ? static_cast<int>(JSValueToNumber(ctx, args[2], nullptr)) : 0};
     if (fd >= 0 && which == 1) { (void)setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &size, sizeof size); }
     else if (fd >= 0 && which == 2) { (void)setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &size, sizeof size); }
+    // which == 3: SO_KEEPALIVE, with `size` = TCP_KEEPIDLE seconds (0 = leave
+    // the kernel default). node/undici arm both on every pooled client socket;
+    // Linux only reports the keepalive timer in /proc/net/tcp once SO_KEEPALIVE
+    // is on. Blueprint: bun src/runtime/socket (us_socket_keepalive).
+    else if (fd >= 0 && which == 3) {
+        const int on{size > 0 ? 1 : 0};
+        (void)setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof on);
+#if defined(TCP_KEEPIDLE)
+        if (size > 0) (void)setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &size, sizeof size);
+#endif
+    }
 #endif
     return JSValueMakeUndefined(ctx);
 }

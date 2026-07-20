@@ -143,6 +143,11 @@ export constexpr std::string_view kNetJS = R"JS(
       this.remoteAddress = "127.0.0.1"; this.remoteFamily = "IPv4"; this.remotePort = 0;
       this.localAddress = "127.0.0.1"; this.localPort = 0;
       this.bytesRead = 0; this.bytesWritten = 0;
+      // Minimal node stream.Readable state. This transport pushes straight to
+      // 'data' rather than running the Readable machinery, but consumers of a
+      // *socket* legitimately read it: npm `ws` socketOnClose gates its final
+      // drain on `socket._readableState.endEmitted` and then `socket.read()`.
+      this._readableState = { endEmitted: false, ended: false, destroyed: false, length: 0, flowing: true, readable: true, objectMode: false };
     }
     _adopt(fd) {
       this._fd = fd; this.pending = false; this.destroyed = false; this.connecting = false;
@@ -186,12 +191,59 @@ export constexpr std::string_view kNetJS = R"JS(
         this._timeoutTimer = G.setTimeout(() => { this._timeoutTimer = null; if (!this.destroyed) this.emit("timeout"); }, this._timeoutMs);
       }
     }
-    setNoDelay() { return this; } setKeepAlive() { return this; }
+    setNoDelay() { return this; }
+    // node net.Socket#setKeepAlive(enable, initialDelayMs): SO_KEEPALIVE plus
+    // TCP_KEEPIDLE (seconds). The agent arms this on every pooled socket.
+    setKeepAlive(enable, initialDelay) {
+      const on = enable === undefined ? true : !!enable;
+      if (this._fd >= 0 && NN && NN.setSockBuf) {
+        const secs = on ? Math.max(1, Math.round((+initialDelay || 0) / 1000) || 60) : 0;
+        try { NN.setSockBuf(this._fd, 3, secs); } catch (e) {}
+      }
+      return this;
+    }
     cork() { return this; } uncork() { return this; }
     ref() { return this; }
     unref() { return this; }
+    // stream.Readable#read: nothing is buffered by this transport (chunks go
+    // straight out as 'data'), except bytes handed back through unshift().
+    read(n) {
+      const q = this._unshiftQ;
+      if (q && q.length) { this._unshiftQ = null; return q.length === 1 ? q[0] : (G.Buffer ? G.Buffer.concat(q) : q[0]); }
+      return null;
+    }
     pause() { this._paused = true; return this; }
     resume() { this._paused = false; return this; }
+    // stream.Readable#unshift: push bytes back to the front of the read queue.
+    // node's HTTP client hands the bytes that followed a 101 header to the
+    // 'upgrade' listener, and every upgrade consumer (npm `ws`
+    // websocket.js setSocket) unshifts them so its own 'data' handler sees
+    // them ahead of anything still on the wire. Ordering is preserved by
+    // draining this queue before any freshly-read chunk (see _drain).
+    unshift(chunk) {
+      if (chunk == null) return true;
+      const b = typeof chunk === "string"
+        ? (G.Buffer ? G.Buffer.from(chunk, this._enc || "utf8") : chunk)
+        : (G.Buffer ? G.Buffer.from(chunk) : chunk);
+      if (!b.length) return true;
+      if (!this._unshiftQ) this._unshiftQ = [];
+      this._unshiftQ.unshift(b);
+      if (!this._unshiftPending) {
+        this._unshiftPending = true;
+        G.queueMicrotask(() => { this._unshiftPending = false; this._flushUnshift(); });
+      }
+      return true;
+    }
+    _flushUnshift() {
+      const q = this._unshiftQ;
+      if (!q || !q.length) return;
+      this._unshiftQ = null;
+      for (const c of q) {
+        if (this.destroyed) return;
+        if (this._onread) this._onread(c.length, c);
+        else this.emit("data", this._enc && G.Buffer ? c.toString(this._enc) : c);
+      }
+    }
     address() { return { port: this.localPort, address: this.localAddress, family: "IPv4" }; }
     get writableLength() { return this._wqLen; }
     get writableEnded() { return this._shutW; }
@@ -219,6 +271,7 @@ export constexpr std::string_view kNetJS = R"JS(
     destroy(err) {
       if (this.destroyed) return this;
       this.destroyed = true; this.readable = false; this.writable = false;
+      if (this._readableState) { this._readableState.destroyed = true; this._readableState.readable = false; }
       if (this._timeoutTimer) { G.clearTimeout(this._timeoutTimer); this._timeoutTimer = null; }
       if (this._fd >= 0) { try { NN.close(this._fd); } catch (e) {} this._fd = -1; }
       NET.items.delete(this);
@@ -307,6 +360,7 @@ export constexpr std::string_view kNetJS = R"JS(
           progress++;
           if (r === null) {
             this._eof = true; this.readable = false;
+            this._readableState.endEmitted = true;
             this.emit("end");
             // node net.js onReadableStreamEnd auto-ends the write side on the
             // NEXT tick, not inline, so data written synchronously right after
@@ -326,6 +380,7 @@ export constexpr std::string_view kNetJS = R"JS(
           this.bytesRead += bytes.length;
           if (this._timeoutMs) this._armTimeout();
           const chunk = G.Buffer ? G.Buffer.from(bytes) : bytes;
+          if (this._unshiftQ) this._flushUnshift();   // unshifted bytes come first
           if (this._onread) this._onread(bytes.length, chunk);
           else this.emit("data", this._enc ? (G.Buffer ? chunk.toString(this._enc) : latin1(bytes, 0, bytes.length)) : chunk);
           if (this.destroyed || this._paused) break;
@@ -2465,6 +2520,11 @@ export constexpr std::string_view kNetJS = R"JS(
         // The message is verbatim from bun's fetch error arm (FetchTasklet.rs:1345)
         // — no URL suffix: tests pin the exact string.
         catch (e) { return reject(mkErr("Unable to connect. Is the computer able to access the url?", "ConnectionRefused")); }
+        // undici/bun arm SO_KEEPALIVE (+TCP_KEEPIDLE) on every fetch client
+        // socket unless the request opts out with `keepalive: false` — the same
+        // flag that disables connection pooling. node:http forwards
+        // agent.keepAlive as this option.
+        if (!(init && init.keepalive === false) && NN.setSockBuf) { try { NN.setSockBuf(fd, 3, 60); } catch (e) {} }
         if (secure) {
           // bun's fetch never sends a ClientHello without ALPN (it offers h2 only
           // when HTTP/2 is enabled; this client speaks HTTP/1.1). Servers and

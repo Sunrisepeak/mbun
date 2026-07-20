@@ -58,7 +58,7 @@ inline constexpr std::string_view kWebEventsJS = R"JS(
           EventBase, [type, eventInitDict], new.target);
         const o = eventInitDict === null || eventInitDict === undefined
           ? {} : eventInitDict;
-        slots.set(self, init(o, self));
+        slots.set(self, init(o, self, eventInitDict));
         return self;
       };
 
@@ -101,31 +101,61 @@ inline constexpr std::string_view kWebEventsJS = R"JS(
     const toUint32 = function (v) { return Number(v) >>> 0; };
 
     // ------------------------------------------------------------ MessageEvent
+    // Bun renders the offending value into the TypeError the way its inspector
+    // would: 1 -> `1`, {} -> `{}`. JSON is the closest cheap equivalent for the
+    // shapes these messages can carry; anything JSON refuses falls back to
+    // ToString.
+    const fmtValue = function (v) {
+      if (typeof v === "string") return v;
+      try { const s = JSON.stringify(v); if (s !== undefined) return s; } catch (e) {}
+      return String(v);
+    };
     const isMessagePort = function (v) {
       return typeof G.MessagePort === "function" && v instanceof G.MessagePort;
     };
     const me = defineIface(
       "MessageEvent",
       ["data", "origin", "lastEventId", "source", "ports"],
-      function (o) {
+      function (o, self, raw) {
+        // WebIDL dictionary conversion: anything that is neither
+        // undefined/null nor an object is a TypeError before any member is
+        // read (MessageEvent.idl -> convert<IDLDictionary<MessageEventInit>>).
+        if (raw !== undefined && raw !== null &&
+            typeof raw !== "object" && typeof raw !== "function") {
+          throw new TypeError("MessageEvent constructor: The provided value " +
+            "is not of type 'MessageEventInit'.");
+        }
         let ports = orDefault(o.ports, undefined);
         if (ports === undefined) {
           ports = Object.freeze([]);
         } else {
+          // sequence<MessagePort>: a non-iterable is reported as such, then
+          // each item is brand-checked with its index in the message.
+          if (ports === null || typeof ports[Symbol.iterator] !== "function") {
+            throw new TypeError("MessageEvent constructor: eventInitDict.ports (" +
+              fmtValue(ports) + ") is not iterable.");
+          }
           ports = Array.from(ports);
-          for (const p of ports) {
-            if (!isMessagePort(p)) {
-              throw new TypeError("MessageEvent constructor: Expected every " +
-                "item of eventInitDict.ports to be an instance of MessagePort.");
+          for (let i = 0; i < ports.length; i++) {
+            if (!isMessagePort(ports[i])) {
+              throw new TypeError("MessageEvent constructor: Expected " +
+                "eventInitDict.ports[" + i + "] (\"" + fmtValue(ports[i]) +
+                "\") to be an instance of MessagePort.");
             }
           }
           Object.freeze(ports);
+        }
+        const source = orDefault(o.source, null);
+        if (source !== null && !isMessagePort(source)) {
+          throw new TypeError("MessageEvent constructor: Expected " +
+            "eventInitDict.source (\"" + fmtValue(source) +
+            "\") to be an instance of MessagePort.");
         }
         return {
           data: orDefault(o.data, null),
           origin: String(orDefault(o.origin, "")),
           lastEventId: String(orDefault(o.lastEventId, "")),
-          source: orDefault(o.source, null),
+          source,
           ports,
         };
       });

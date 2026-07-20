@@ -453,6 +453,7 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
         const S = G.__mbunStreams;
         if (this._stream && S && S.isReadableStream(this._stream)) {
           if (kind === "text") return S.text(this._stream);
+          if (kind === "json") return S.json(this._stream);
           if (kind === "bytes") return S.bytes(this._stream);
           if (kind === "arrayBuffer") return S.arrayBuffer(this._stream);
           if (kind === "blob") return S.array(this._stream).then((cs) => new G.Blob(cs, { type: (this.headers.get && this.headers.get("content-type")) || "" }));
@@ -462,6 +463,18 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
         // Same synthetic-allocation-limit cap as Response._consume; a Blob body
         // delegates so its own guard fires. arrayBuffer() stays exempt.
         if (kind === "text") { if (b == null) return Promise.resolve(""); if (b instanceof Uint8Array) { G.__mbunCheckAllocLimit(b.length, "text"); return Promise.resolve(td.decode(b)); } if (b && typeof b.text === "function") return b.text(); return Promise.resolve(String(b)); }
+        // Body.rs:1884 get_json shares get_text's cap but reports the JSON
+        // message ("Cannot parse a JSON string longer than 2^32-1 characters").
+        if (kind === "json") {
+          let t;
+          if (b == null) t = Promise.resolve("");
+          else if (b instanceof Uint8Array) { G.__mbunCheckAllocLimit(b.length, "json"); t = Promise.resolve(td.decode(b)); }
+          else if (b && G.Blob && b instanceof G.Blob) { G.__mbunCheckAllocLimit(b.size, "json"); t = Promise.resolve(td.decode(b._u8)); }
+          else if (b && b._u8 instanceof Uint8Array) { G.__mbunCheckAllocLimit(b._u8.length, "json"); t = Promise.resolve(td.decode(b._u8)); }
+          else if (b && typeof b.text === "function") t = b.text();
+          else t = Promise.resolve(String(b));
+          return t.then((s) => JSON.parse(s));
+        }
         // Cap on `size` (a number) before touching `_u8`, which would otherwise
         // join the whole part list to answer a call that is about to throw.
         if (kind === "bytes") { if (b instanceof Uint8Array) { G.__mbunCheckAllocLimit(b.length, "bytes"); return Promise.resolve(new Uint8Array(b)); } if (b && G.Blob && b instanceof G.Blob) { G.__mbunCheckAllocLimit(b.size, "bytes"); return Promise.resolve(new Uint8Array(b._u8)); } if (b && b._u8 instanceof Uint8Array) { G.__mbunCheckAllocLimit(b._u8.length, "bytes"); return Promise.resolve(new Uint8Array(b._u8)); } return this._consume("text").then((t) => te.encode(t)); }
@@ -474,7 +487,7 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
         if (kind === "formData") return this._consume("bytes").then((u8) => formDataParseBody(u8, fdEncoding));
       }
       text() { return this._consume("text"); }
-      json() { return this._consume("text").then((t) => JSON.parse(t)); }
+      json() { return this._consume("json"); }
       arrayBuffer() { return this._consume("arrayBuffer"); }
       bytes() { return this._consume("bytes"); }
       blob() { return this._consume("blob"); }

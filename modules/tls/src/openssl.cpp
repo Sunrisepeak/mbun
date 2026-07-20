@@ -93,6 +93,7 @@ struct TlsChannel::Impl {
     bool shutdownDone_ {false};
     std::string error_ {};
     std::string errorCode_ {}; // node-style error.code for the last SSL failure
+    std::string serverName_ {}; // client SNI / hostname under verification
     std::string alpnWire_ {}; // server: length-prefixed ALPN list for the select cb
 
     Impl() = default;
@@ -157,6 +158,21 @@ struct TlsChannel::Impl {
             }
         }
         std::string detail {drain_openssl_errors()};
+        // node runs the chain verification in OpenSSL but the *hostname* check
+        // in JS (tls.checkServerIdentity), so a SAN mismatch surfaces as
+        // ERR_TLS_CERT_ALTNAME_INVALID / "Hostname/IP does not match
+        // certificate's altnames: ...", not the generic
+        // "certificate verify failed". SSL_set1_host() folds that check into
+        // the verify result, so translate the code back to node's wording.
+        if (ssl_ != nullptr) {
+            const long vr {::SSL_get_verify_result(ssl_)};
+            if (vr == X509_V_ERR_HOSTNAME_MISMATCH || vr == X509_V_ERR_IP_ADDRESS_MISMATCH) {
+                errorCode_ = "ERR_TLS_CERT_ALTNAME_INVALID";
+                error_ = "Hostname/IP does not match certificate's altnames: Host: " +
+                         serverName_ + ". is not in the cert's altnames";
+                return;
+            }
+        }
         error_ = std::string {where};
         if (!detail.empty()) {
             error_ += ": ";
@@ -248,6 +264,7 @@ struct TlsChannel::Impl {
 
         if (role_ == TlsRole::client) {
             ::SSL_set_connect_state(ssl_);
+            serverName_ = config.serverName;
             if (!config.serverName.empty()) {
                 // SNI. The cast drops const per the historic macro signature.
                 ::SSL_set_tlsext_host_name(ssl_, config.serverName.c_str());

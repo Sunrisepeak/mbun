@@ -911,6 +911,13 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
       return out;
     };
     Object.defineProperty(BufferW, "name", { value: "Buffer", configurable: true });
+    // node's Buffer extends Uint8Array, so it inherits %TypedArray%'s
+    // `get [Symbol.species]() { return this; }` and `Buffer[Symbol.species] ===
+    // Buffer`. This wrapper is a plain function, so the accessor has to be
+    // restated — npm `ws` binds `const FastBuffer = Buffer[Symbol.species]` at
+    // load time and constructs every parsed frame slice through it
+    // (ws/lib/receiver.js consume()), which throws on an undefined species.
+    Object.defineProperty(BufferW, Symbol.species, { get() { return this; }, configurable: true });
 
     G.Buffer = BufferW;
 
