@@ -702,6 +702,12 @@ private:
         // customization callback -- assigning afterwards is silently ignored.
         JSC::initialize([] {
             JSC::Options::useShadowRealm() = true;
+            // Give SharedArrayBuffer a real, distinct constructor/prototype
+            // (disabled by default in this JSC build) so it is no longer aliased
+            // to ArrayBuffer. node:assert deepEqual and util.types.isSharedArrayBuffer
+            // depend on the two being distinguishable types. The runtime stays
+            // single-threaded; Atomics.wait is emulated in the web globals shim.
+            JSC::Options::useSharedArrayBuffer() = true;
         });
         ctx_ = create_context_();
         // issue #16: install the chained fault-signal handler now — AFTER JSC has
