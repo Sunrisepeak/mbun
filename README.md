@@ -116,13 +116,13 @@ still being defined.
 
 ## Compatibility data
 
-Source-snapshot measurements (2026-07-20) against the upstream corpora pinned as submodules under `compat/`, produced by the runners in `tools/integration/`. Unsupported cases are never counted as passes, and these are not release guarantees:
+Source-snapshot measurements (2026-07-21) against the upstream corpora pinned as submodules under `compat/`, produced by the runners in `tools/integration/`. Unsupported cases are never counted as passes, and these are not release guarantees:
 
 | Target | Result | Rate |
 | --- | ---: | ---: |
-| Bun native test corpus (`compat/bun/test`) | 850 / 1,902 files fully green | 44.7% |
-| Bun native tests, test level | 30,790 pass / 17,755 fail of 51,366 run | 59.9% |
-| Node.js native tests (`compat/node/test/parallel`) | 1,774 / 4,433 files pass (direct execution) | 40.0% |
+| Bun native test corpus (`compat/bun/test`) | 874 / 1,902 files fully green | 46.0% |
+| Bun native tests, test level | 31,818 pass / 17,501 fail of 52,175 run | 60.9% |
+| Node.js native tests (`compat/node/test/parallel`) | 1,811 / 4,433 files pass (direct execution) | 40.9% |
 | Elysia test suite | 1,522 pass / 3 fail | 99.8% |
 
 File-level "green" means every executed test in the file passed and the file reported no error outside a test; it is stricter than an API checklist and lower than test-level pass rates. Files that declare no runnable test, files whose every test is skipped, and files needing a service this environment lacks (MySQL, Redis, the npm registry) are separate buckets and never count as passes. Node.js files run directly through mbun (exit 0 = pass) without Node's own harness services, so that figure is honest file-level coverage, not API completion. The test-level rate moves down as crashes are fixed — a file that used to segfault or get OOM-killed now runs and reports its real failures. Details and how to reproduce: [`compat/README.md`](compat/README.md).
