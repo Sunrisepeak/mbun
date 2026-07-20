@@ -208,7 +208,9 @@ inline constexpr std::string_view kNodeNetJS = R"JS(
         this._counted = false;
       }
       _v6() { return this.type === "udp6"; }
-      _ensureFd() { if (this._fd < 0) this._fd = ND.create(this.type); }
+      // reuseAddr is an opt-in (node dgram.createSocket({ reuseAddr })): without
+      // it a duplicate bind must fail with EADDRINUSE (issue 24157).
+      _ensureFd() { if (this._fd < 0) this._fd = ND.create(this.type, !!this._opts.reuseAddr); }
       _reactor() { return G.__mbunNet; }
 
       bind(a1, a2, a3) {

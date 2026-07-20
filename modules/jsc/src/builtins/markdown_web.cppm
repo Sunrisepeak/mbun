@@ -453,20 +453,41 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
         const S = G.__mbunStreams;
         if (this._stream && S && S.isReadableStream(this._stream)) {
           if (kind === "text") return S.text(this._stream);
+          if (kind === "json") return S.json(this._stream);
           if (kind === "bytes") return S.bytes(this._stream);
           if (kind === "arrayBuffer") return S.arrayBuffer(this._stream);
           if (kind === "blob") return S.array(this._stream).then((cs) => new G.Blob(cs, { type: (this.headers.get && this.headers.get("content-type")) || "" }));
           if (kind === "formData") return S.bytes(this._stream).then((u8) => formDataParseBody(u8, fdEncoding));
         }
         const b = this._body;
-        if (kind === "text") return Promise.resolve(b == null ? "" : (b instanceof Uint8Array ? td.decode(b) : String(b)));
-        if (kind === "bytes") return this._consume("text").then((t) => te.encode(t));
-        if (kind === "arrayBuffer") return this._consume("bytes").then((u8) => u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength));
+        // Same synthetic-allocation-limit cap as Response._consume; a Blob body
+        // delegates so its own guard fires. arrayBuffer() stays exempt.
+        if (kind === "text") { if (b == null) return Promise.resolve(""); if (b instanceof Uint8Array) { G.__mbunCheckAllocLimit(b.length, "text"); return Promise.resolve(td.decode(b)); } if (b && typeof b.text === "function") return b.text(); return Promise.resolve(String(b)); }
+        // Body.rs:1884 get_json shares get_text's cap but reports the JSON
+        // message ("Cannot parse a JSON string longer than 2^32-1 characters").
+        if (kind === "json") {
+          let t;
+          if (b == null) t = Promise.resolve("");
+          else if (b instanceof Uint8Array) { G.__mbunCheckAllocLimit(b.length, "json"); t = Promise.resolve(td.decode(b)); }
+          else if (b && G.Blob && b instanceof G.Blob) { G.__mbunCheckAllocLimit(b.size, "json"); t = Promise.resolve(td.decode(b._u8)); }
+          else if (b && b._u8 instanceof Uint8Array) { G.__mbunCheckAllocLimit(b._u8.length, "json"); t = Promise.resolve(td.decode(b._u8)); }
+          else if (b && typeof b.text === "function") t = b.text();
+          else t = Promise.resolve(String(b));
+          return t.then((s) => JSON.parse(s));
+        }
+        // Cap on `size` (a number) before touching `_u8`, which would otherwise
+        // join the whole part list to answer a call that is about to throw.
+        if (kind === "bytes") { if (b instanceof Uint8Array) { G.__mbunCheckAllocLimit(b.length, "bytes"); return Promise.resolve(new Uint8Array(b)); } if (b && G.Blob && b instanceof G.Blob) { G.__mbunCheckAllocLimit(b.size, "bytes"); return Promise.resolve(new Uint8Array(b._u8)); } if (b && b._u8 instanceof Uint8Array) { G.__mbunCheckAllocLimit(b._u8.length, "bytes"); return Promise.resolve(new Uint8Array(b._u8)); } return this._consume("text").then((t) => te.encode(t)); }
+        if (kind === "arrayBuffer") {
+          const u = b instanceof Uint8Array ? b : (b && b._u8 instanceof Uint8Array ? b._u8 : null);
+          if (u) return Promise.resolve(u.buffer.slice(u.byteOffset, u.byteOffset + u.byteLength));
+          return this._consume("bytes").then((u8) => u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength));
+        }
         if (kind === "blob") return Promise.resolve(new G.Blob([b == null ? "" : b]));
         if (kind === "formData") return this._consume("bytes").then((u8) => formDataParseBody(u8, fdEncoding));
       }
       text() { return this._consume("text"); }
-      json() { return this._consume("text").then((t) => JSON.parse(t)); }
+      json() { return this._consume("json"); }
       arrayBuffer() { return this._consume("arrayBuffer"); }
       bytes() { return this._consume("bytes"); }
       blob() { return this._consume("blob"); }
@@ -896,7 +917,9 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       X509Certificate: class X509Certificate { constructor() { this.subject = ""; this.issuer = ""; } },
       createECDH: () => ({ generateKeys: () => Buffer.alloc(0), computeSecret: () => Buffer.alloc(0), getPublicKey: () => Buffer.alloc(0), getPrivateKey: () => Buffer.alloc(0), setPrivateKey() {} }),
       createDiffieHellman: () => ({ generateKeys: () => Buffer.alloc(0), computeSecret: () => Buffer.alloc(0), getPrime: () => Buffer.alloc(0), getGenerator: () => Buffer.alloc(0) }),
-      timingSafeEqual: (a, b) => { a = toBytes(a); b = toBytes(b); if (a.length !== b.length) return false; let d = 0; for (let i = 0; i < a.length; i++) d |= a[i] ^ b[i]; return d === 0; },
+      // node/bun throw on a length mismatch (ErrorCode.cpp:1552
+      // CRYPTO_TIMING_SAFE_EQUAL_LENGTH), they do not return false.
+      timingSafeEqual: (a, b) => { a = toBytes(a); b = toBytes(b); if (a.length !== b.length) { const e = new RangeError("Input buffers must have the same byte length"); e.code = "ERR_CRYPTO_TIMING_SAFE_EQUAL_LENGTH"; throw e; } let d = 0; for (let i = 0; i < a.length; i++) d |= a[i] ^ b[i]; return d === 0; },
       constants: { RSA_PKCS1_PADDING: 1, RSA_PKCS1_OAEP_PADDING: 4 }, webcrypto: G.crypto,
     };
     // node's generateKeyPair has a custom promisify that resolves to an object
@@ -930,11 +953,14 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
     if (G.Bun && typeof G.Bun.randomUUIDv5 === "undefined") {
       const WELL_KNOWN_NS = { dns: "6ba7b810-9dad-11d1-80b4-00c04fd430c8", url: "6ba7b811-9dad-11d1-80b4-00c04fd430c8", oid: "6ba7b812-9dad-11d1-80b4-00c04fd430c8", x500: "6ba7b814-9dad-11d1-80b4-00c04fd430c8" };
       const nsBytes = (ns) => {
-        if (ns instanceof Uint8Array || ArrayBuffer.isView(ns)) { const u = new Uint8Array(ns.buffer, ns.byteOffset, ns.byteLength); if (u.length !== 16) throw new TypeError("namespace must be exactly 16 bytes"); return u; }
-        if (ns instanceof ArrayBuffer) { const u = new Uint8Array(ns); if (u.length !== 16) throw new TypeError("namespace must be exactly 16 bytes"); return u; }
+        // bun randomUUIDv5: a missing namespace is ERR_INVALID_ARG_TYPE, a
+        // malformed one ERR_INVALID_ARG_VALUE (both TypeError).
+        if (ns === undefined || ns === null) { const e = new TypeError('The "namespace" argument must be a string or an instance of ArrayBuffer, Buffer or TypedArray'); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
+        if (ns instanceof Uint8Array || ArrayBuffer.isView(ns)) { const u = new Uint8Array(ns.buffer, ns.byteOffset, ns.byteLength); if (u.length !== 16) { const e = new TypeError("namespace must be exactly 16 bytes"); e.code = "ERR_INVALID_ARG_VALUE"; throw e; } return u; }
+        if (ns instanceof ArrayBuffer) { const u = new Uint8Array(ns); if (u.length !== 16) { const e = new TypeError("namespace must be exactly 16 bytes"); e.code = "ERR_INVALID_ARG_VALUE"; throw e; } return u; }
         let s = String(ns); s = WELL_KNOWN_NS[s.toLowerCase()] || s;
         const hex = s.replace(/-/g, "");
-        if (!/^[0-9a-fA-F]{32}$/.test(hex)) throw new TypeError("namespace must be a valid UUID string or 16-byte buffer");
+        if (!/^[0-9a-fA-F]{32}$/.test(hex)) { const e = new TypeError("namespace must be a valid UUID string or 16-byte buffer"); e.code = "ERR_INVALID_ARG_VALUE"; throw e; }
         const u = new Uint8Array(16); for (let i = 0; i < 16; i++) u[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16); return u;
       };
       G.Bun.randomUUIDv5 = (name, namespace, enc) => {
@@ -947,12 +973,15 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
         if (enc === undefined || enc === "hex") { let s = ""; for (let i = 0; i < 16; i++) { s += d[i].toString(16).padStart(2, "0"); if (i === 3 || i === 5 || i === 7 || i === 9) s += "-"; } return s; }
         if (enc === "buffer") return Buffer.from(d);
         if (enc === "base64" || enc === "base64url") { let bin = ""; for (const b of d) bin += String.fromCharCode(b); const b64 = G.btoa(bin); return enc === "base64" ? b64 : b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""); }
-        throw new TypeError('encoding must be "hex", "buffer", "base64", or "base64url"');
+        { const e = new TypeError("Invalid encoding"); e.code = "ERR_UNKNOWN_ENCODING"; throw e; }
       };
     }
   }
   if (G.Bun && typeof G.Bun.wrapAnsi === "undefined") {
-    G.Bun.wrapAnsi = (s, width) => { s = String(s); if (!width || s.length <= width) return s; const out = []; for (let i = 0; i < s.length; i += width) out.push(s.slice(i, i + width)); return out.join("\n"); };
+    // A non-positive / non-finite `columns` returns the input unchanged (bun
+    // wrap_ansi). Without the guard `for (i += width)` with a negative width
+    // never terminates and the accumulator eats all memory.
+    G.Bun.wrapAnsi = (s, width) => { s = String(s); const w = Math.floor(Number(width)); if (!Number.isFinite(w) || w <= 0 || s.length <= w) return s; const out = []; for (let i = 0; i < s.length; i += w) out.push(s.slice(i, i + w)); return out.join("\n"); };
   }
   // Blob/File attribute backing store. bun keeps every Blob attribute in a
   // native slot and exposes it as a Blob.prototype accessor, so `Object.keys(blob)`
@@ -1025,27 +1054,96 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
         // bun Blob.rs:3515-3518 iterates the array (per-index [[Get]], consults
         // the prototype) and skips undefined/null — so a sparse array's holes
         // don't become "undefined"/"null" chunks.
-        const chunks = [];
-        for (const p of (parts || [])) if (p !== undefined && p !== null) chunks.push(partBytes(p));
-        let total = 0; for (const c of chunks) total += c.length;
-        const u8 = new Uint8Array(total);
-        let off = 0; for (const c of chunks) { u8.set(c, off); off += c.length; }
-        // `_u8` is the backing store, not a WHATWG field: bun keeps a Blob's bytes
-        // off the object entirely (`Object.keys(blob)` is [] there). Make it
-        // non-enumerable so inspect/JSON.stringify/deep-equal don't walk the bytes
-        // one element at a time — Bun.inspect(Bun.file("40mb.mp4")) built a 183MB
-        // string and hung the process. writable+configurable so the later
-        // `b._u8 = …` assignments (slice(), Bun.file) keep this descriptor.
-        Object.defineProperty(this, "_u8", { value: u8, writable: true, enumerable: false, configurable: true });
+        //
+        // The parts are kept as a LIST and joined only when someone actually
+        // needs one contiguous buffer (see the `_u8` accessor below). Eagerly
+        // concatenating made `new Blob([buf, buf, …])` cost the sum of the
+        // parts even when every part is the same buffer: the 2 GiB blob in
+        // regression/issue/8254 and the 576 MiB one in js/web/fetch/blob-oom
+        // were both OOM-killed inside this constructor, before a single byte
+        // was ever read.
+        //
+        // `seen` gives the second half of that: parts are still COPIED (a Blob
+        // must not observe later mutations of its source), but each distinct
+        // source object is copied ONCE and the copy is shared by every part
+        // that refers to it. Both suites lean on exactly that (8254 builds
+        // 2049 parts out of 256 buffers).
+        //
+        // Collected into a NULL-PROTOTYPE object, not an array: `chunks.push(x)`
+        // stores through [[Set]], so a user-defined getter-only index accessor
+        // on Array.prototype (js/web/fetch/blob-array-fast-path installs one)
+        // makes the constructor throw "Attempted to assign to readonly
+        // property". bun's Blob.rs collects natively and never consults
+        // Array.prototype.
+        const chunks = { __proto__: null };
+        let count = 0;
+        let total = 0;
+        const seen = new Map();
+        for (const p of (parts || [])) {
+          if (p === undefined || p === null) continue;
+          let b;
+          if (typeof p === "object") {
+            b = seen.get(p);
+            if (b === undefined) { b = partBytes(p); seen.set(p, b); }
+          } else {
+            b = partBytes(p);
+          }
+          if (b.length === 0) continue;
+          chunks[count++] = b;
+          total += b.length;
+        }
+        // Array.from(..., mapper) creates each element with CreateDataProperty,
+        // so the result is a real (iterable) array without ever going through
+        // [[Set]] and the hostile Array.prototype accessor.
+        const partList = Array.from({ length: count }, (_unused, i) => chunks[i]);
+        // The backing store is not a WHATWG field: bun keeps a Blob's bytes off
+        // the object entirely (`Object.keys(blob)` is [] there). Non-enumerable
+        // so inspect/JSON.stringify/deep-equal don't walk the bytes one element
+        // at a time — Bun.inspect(Bun.file("40mb.mp4")) built a 183MB string
+        // and hung the process.
+        blobSlot(this, "__parts", partList);
+        blobSlot(this, "__size", total);
         // Attributes live in non-enumerable slots behind Blob.prototype
-        // accessors (see below); `size` is always derived from `_u8`.
+        // accessors (see below); `size` is always derived from `__size`.
         blobSlot(this, "__type", normalizeMimeType(opts && opts.type));
       }
-      text() { return Promise.resolve(td.decode(this._u8)); }
-      json() { return Promise.resolve(JSON.parse(td.decode(this._u8))); }
+      // Blob.rs guards every string/typed-array materialization against the
+      // synthetic allocation limit; arrayBuffer() is exempt (ArrayBuffer has no
+      // such cap). Without this a multi-GB blob really decodes and the process
+      // is OOM-killed instead of throwing. The guard reads `size` (cheap) so it
+      // fires BEFORE the part list is joined, not after.
+      text() { G.__mbunCheckAllocLimit(this.size, "text"); return Promise.resolve(td.decode(this._u8)); }
+      json() { G.__mbunCheckAllocLimit(this.size, "json"); return Promise.resolve(JSON.parse(td.decode(this._u8))); }
       arrayBuffer() { return Promise.resolve(this._u8.buffer.slice(this._u8.byteOffset, this._u8.byteOffset + this._u8.byteLength)); }
-      bytes() { return Promise.resolve(new Uint8Array(this._u8)); }
-      slice(start, end, type) { const b = new G.Blob([], { type: type || "" }); b._u8 = this._u8.subarray(...[start, end].filter((x) => x !== undefined).map(Number)); return b; }
+      bytes() { G.__mbunCheckAllocLimit(this.size, "bytes"); return Promise.resolve(new Uint8Array(this._u8)); }
+      // Slicing walks the part list and keeps sub-views of the parts it
+      // overlaps, so `bigBlob.slice(n, n + 1)` costs one byte, not a join of
+      // the whole blob.
+      slice(start, end, type) {
+        const size = this.size;
+        const norm = (v, dflt) => {
+          if (v === undefined) return dflt;
+          let n = Number(v);
+          if (Number.isNaN(n)) n = 0;
+          n = Math.trunc(n);
+          return n < 0 ? Math.max(size + n, 0) : Math.min(n, size);
+        };
+        const s = norm(start, 0);
+        const e = Math.max(norm(end, size), s);
+        const out = [];
+        let off = 0;
+        for (const c of this.__parts || []) {
+          const cs = off, ce = off + c.length;
+          off = ce;
+          if (ce <= s) continue;
+          if (cs >= e) break;
+          out.push(c.subarray(Math.max(0, s - cs), Math.min(c.length, e - cs)));
+        }
+        const b = new G.Blob([], { type: type || "" });
+        blobSlot(b, "__parts", out);
+        blobSlot(b, "__size", e - s);
+        return b;
+      }
       // bun: a stream off a Blob carries the blob's type, so readableStreamToBlob
       // (and stream.blob()) round-trip it back onto the resulting Blob.
       stream() { const u8 = new Uint8Array(this._u8); const s = new G.ReadableStream({ start(c) { if (u8.length > 0) c.enqueue(u8); c.close(); } });
@@ -1075,8 +1173,38 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
         ? { get, set, enumerable: true, configurable: false }
         : { get, enumerable: true, configurable: false });
     };
+    // `_u8` — the one contiguous view of a Blob's bytes. Everything that wants
+    // "the whole blob as one Uint8Array" (Bun.build's file map, the websocket
+    // and socket senders, structuredClone, FormData) reads it, so it stays a
+    // plain property from the outside; it is an accessor only so the join is
+    // deferred to the first such read and then cached back into `__parts`.
+    // Assignment (`blob._u8 = bytes`, used by Bun.file and the loaders) still
+    // works and simply replaces the part list.
+    Object.defineProperty(G.Blob.prototype, "_u8", {
+      get() {
+        const parts = this.__parts;
+        if (!parts) return new Uint8Array(0);
+        if (parts.length === 1) return parts[0];
+        const out = new Uint8Array(this.__size || 0);
+        let o = 0;
+        for (const c of parts) { out.set(c, o); o += c.length; }
+        blobSlot(this, "__parts", [out]);
+        return out;
+      },
+      set(v) {
+        const u = v == null ? new Uint8Array(0)
+          : v instanceof Uint8Array ? v
+          : ArrayBuffer.isView(v) ? new Uint8Array(v.buffer, v.byteOffset, v.byteLength)
+          : v instanceof ArrayBuffer ? new Uint8Array(v)
+          : new Uint8Array(0);
+        blobSlot(this, "__parts", u.length ? [u] : []);
+        blobSlot(this, "__size", u.length);
+      },
+      enumerable: false,
+      configurable: true,
+    });
     attr("type", function () { return this.__type || ""; });
-    attr("size", function () { return this._u8 ? this._u8.length : 0; });
+    attr("size", function () { return this.__size || 0; });
     attr("name", function () { return this.__name; }, function (v) { blobSlot(this, "__name", v); });
     // A Blob that was never given an mtime reports bun's sentinel (2^52-1).
     attr("lastModified", function () {
@@ -1716,15 +1844,33 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
     class AbortSignal {
       get [Symbol.toStringTag]() { return "AbortSignal"; }
       constructor() { this.aborted = false; this.reason = undefined; this._l = []; this.onabort = null; }
-      addEventListener(t, cb) { if (t === "abort") this._l.push(cb); }
-      removeEventListener(t, cb) { this._l = this._l.filter((x) => x !== cb); }
+      // `_l` holds {cb, once} records so `{ once: true }` registrations drop
+      // themselves after firing — events.getEventListeners(signal, "abort")
+      // must report 0 once the signal has been raised (node semantics).
+      addEventListener(t, cb, opts) { if (t !== "abort" || typeof cb !== "function") return; for (const r of this._l) if (r.cb === cb) return; this._l.push({ cb, once: !!(opts && opts.once) }); }
+      removeEventListener(t, cb) { if (t !== "abort") return; this._l = this._l.filter((x) => x.cb !== cb); }
       dispatchEvent(e) { if (e && e.type === "abort") this._fire(); return true; }
       throwIfAborted() { if (this.aborted) throw this.reason || new G.DOMException("signal is aborted without reason", "AbortError"); }
-      _fire() { const ev = { type: "abort", target: this }; if (typeof this.onabort === "function") this.onabort.call(this, ev); for (const cb of this._l.slice()) cb.call(this, ev); }
+      _fire() { const ev = { type: "abort", target: this }; if (typeof this.onabort === "function") this.onabort.call(this, ev); for (const r of this._l.slice()) { if (r.once) this.removeEventListener("abort", r.cb); r.cb.call(this, ev); } }
       static abort(reason) { const s = new AbortSignal(); s.aborted = true; s.reason = reason !== undefined ? reason : new G.DOMException("The operation was aborted.", "AbortError"); return s; }
-      static timeout(ms) { const s = new AbortSignal(); if (G.setTimeout) G.setTimeout(() => { s.aborted = true; s.reason = new G.DOMException("The operation timed out", "TimeoutError"); s._fire(); }, ms); return s; }
+      // `__mbunAbortAt` records the deadline as a wall-clock instant. A purely
+      // synchronous native that has to honour a signal (Bun.spawnSync) cannot
+      // run the timer that would fire this signal, so it reads the deadline
+      // directly and applies it as its own timeout instead.
+      static timeout(ms) { const s = new AbortSignal(); Object.defineProperty(s, "__mbunAbortAt", { value: Date.now() + (Number(ms) || 0), enumerable: false, configurable: true, writable: true }); if (G.setTimeout) G.setTimeout(() => { s.aborted = true; s.reason = new G.DOMException("The operation timed out", "TimeoutError"); s._fire(); }, ms); return s; }
       static any(signals) { const s = new AbortSignal(); for (const sig of signals) { if (sig.aborted) { s.aborted = true; s.reason = sig.reason; return s; } sig.addEventListener("abort", () => { if (!s.aborted) { s.aborted = true; s.reason = sig.reason; s._fire(); } }); } return s; }
+      // WebCore AbortSignal::memoryCost() includes m_algorithms.sizeInBytes();
+      // mbun's algorithm list is `_l` (std::pair<uint32_t, Function> ≈ 16 bytes
+      // per entry on 64-bit). Read by bun:jsc's estimateShallowMemoryUsageOf so
+      // an abort-algorithm leak is observable exactly as it is in bun.
+      [Symbol.for("mbun.memoryCost")]() { return this._l.length * 16; }
     }
+    // Non-enumerable introspection hook mirroring EventTarget.prototype.listeners:
+    // events.getEventListeners(signal, "abort") probes for a callable `listeners`.
+    Object.defineProperty(AbortSignal.prototype, "listeners", {
+      value: function listeners(type) { return String(type) === "abort" ? this._l.map((r) => r.cb) : []; },
+      writable: true, configurable: true, enumerable: false,
+    });
     G.AbortSignal = AbortSignal;
   }
   if (typeof G.AbortController === "undefined") {

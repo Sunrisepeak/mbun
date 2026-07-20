@@ -366,19 +366,27 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     const senc = options.privateKeyEncoding || {};
     const wantPubObj = !options.publicKeyEncoding;
     const wantPrivObj = !options.privateKeyEncoding;
-    const pubType = penc.type || "spki";
-    const pubFmt = wantPubObj ? "der" : (penc.format || "pem");
-    const privType = senc.type || "pkcs8";
-    const privFmt = wantPrivObj ? "der" : (senc.format || "pem");
-    const cipher = senc.cipher || "";
-    const pass = senc.passphrase != null ? (typeof senc.passphrase === "string" ? senc.passphrase : toBuf(senc.passphrase).toString("latin1")) : "";
+    // format:"jwk" is not a PEM/DER encoding: node emits a plain JWK object and
+    // ignores `type`/`cipher` (lib/internal/crypto/keygen.js). Ask the native
+    // encoder for DER and convert, exactly like KeyObject.export({format:"jwk"}).
+    const pubJwk = !wantPubObj && penc.format === "jwk";
+    const privJwk = !wantPrivObj && senc.format === "jwk";
+    const pubType = pubJwk ? "spki" : (penc.type || "spki");
+    const pubFmt = (wantPubObj || pubJwk) ? "der" : (penc.format || "pem");
+    const privType = privJwk ? "pkcs8" : (senc.type || "pkcs8");
+    const privFmt = (wantPrivObj || privJwk) ? "der" : (senc.format || "pem");
+    const cipher = privJwk ? "" : (senc.cipher || "");
+    const pass = privJwk || senc.passphrase == null ? ""
+      : (typeof senc.passphrase === "string" ? senc.passphrase : toBuf(senc.passphrase).toString("latin1"));
     const modLen = options.modulusLength || 2048;
     const curve = options.namedCurve || "";
     const res = AN.generateKeyPair(type, modLen, curve, pubType, pubFmt, privType, privFmt, cipher, pass);
     let publicKey = res.publicKey, privateKey = res.privateKey;
     if (wantPubObj) publicKey = new KeyObject("public", publicKey, "");
+    else if (pubJwk) publicKey = jwkFromKey(publicKey, "", true);
     else if (pubFmt === "der") publicKey = Buffer.from(publicKey);
     if (wantPrivObj) privateKey = new KeyObject("private", privateKey, pass);
+    else if (privJwk) privateKey = jwkFromKey(privateKey, "", false);
     else if (privFmt === "der") privateKey = Buffer.from(privateKey);
     return { publicKey, privateKey };
   };

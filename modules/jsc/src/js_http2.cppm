@@ -823,7 +823,14 @@ export constexpr std::string_view kHttp2JS = R"JS(
         }
         case FRAME.PING: {
           if (len !== 8) { this._connError(constants.NGHTTP2_FRAME_SIZE_ERROR); return false; }
-          if (!(flags & FLAG.ACK)) this._writeFrame(FRAME.PING, FLAG.ACK, 0, Buffer.from(payload));
+          if (!(flags & FLAG.ACK)) {
+            this._writeFrame(FRAME.PING, FLAG.ACK, 0, Buffer.from(payload));
+            // Http2Session 'ping' — emitted for a PING the PEER initiated, never
+            // for the ACK of one of ours (bun http2.ts:4213-4217 ping handler;
+            // node lib/internal/http2/core.js). The 8-byte opaque payload is the
+            // event argument.
+            this.emit("ping", Buffer.from(payload));
+          }
           return true;
         }
         case FRAME.WINDOW_UPDATE: {
@@ -1387,7 +1394,12 @@ export constexpr std::string_view kHttp2JS = R"JS(
         case FRAME.PING: {
           if (len !== 8) { this._connError(constants.NGHTTP2_FRAME_SIZE_ERROR); return false; }
           if (streamId !== 0) { this._connError(constants.NGHTTP2_PROTOCOL_ERROR); return false; }
-          if (!(flags & FLAG.ACK)) this._writeFrame(FRAME.PING, FLAG.ACK, 0, Buffer.from(payload));
+          if (!(flags & FLAG.ACK)) {
+            this._writeFrame(FRAME.PING, FLAG.ACK, 0, Buffer.from(payload));
+            // See the client session's PING case: 'ping' is emitted only for a
+            // peer-initiated PING (bun http2.ts:5173).
+            this.emit("ping", Buffer.from(payload));
+          }
           return true;
         }
         case FRAME.WINDOW_UPDATE: {

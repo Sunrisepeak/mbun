@@ -203,6 +203,25 @@ inline constexpr std::string_view kNodeUtilExtraJS = R"JS(
     if (G.TextEncoder) util.TextEncoder = G.TextEncoder;
     if (G.TextDecoder) util.TextDecoder = G.TextDecoder;
 
+    // ------------------------------------------------------------- parseEnv
+    // node lib/util.js parseEnv(content) -> object, backed by the same .env
+    // loader `mbun.dotenv` already drives for process.env (bun does the same:
+    // src/runtime/node/node_util_binding.rs parse_env, OVERRIDE=true).
+    // validate_string accepts a String object, which is exactly what the corpus
+    // pins (util.test.js: util.parseEnv(new String("FOO=bar"))).
+    if (G.__mbunDotenvNative) {
+      util.parseEnv = function parseEnv(content) {
+        if (typeof content !== "string" && !isStringObject(content)) {
+          const err = new TypeError(
+            'The "content" argument must be of type string. Received ' +
+            (content === null ? "null" : typeof content));
+          err.code = "ERR_INVALID_ARG_TYPE";
+          throw err;
+        }
+        return G.__mbunDotenvNative.parse(String(content));
+      };
+    }
+
     // --------------------------- getSystemErrorName / getSystemErrorMap (uv)
     // libuv uv_errno_map for linux (identical to node's util.getSystemErrorMap()
     // output on linux; includes the UV__ fallback space entries EOF/UNKNOWN/
@@ -331,6 +350,57 @@ inline constexpr std::string_view kNodeUtilExtraJS = R"JS(
     util.getSystemErrorMap = function getSystemErrorMap() {
       return new Map(uvMap);
     };
+
+    // ---- util.getCallSites (node >= 22.9) ---------------------------------
+    // node lib/internal/util.js: returns the current call stack as objects
+    // { functionName, scriptId, scriptName, lineNumber, column }, most recent
+    // first, EXCLUDING getCallSites' own frame. Built from JSC's stack string
+    // ("fn@file:line:col" / "global code@file:line:col" / "file:line:col"),
+    // which is the only structured stack this engine exposes.
+    if (typeof util.getCallSites !== "function") {
+      const parseFrame = (raw) => {
+        let text = String(raw).trim();
+        let functionName = "";
+        const at = text.lastIndexOf("@");
+        if (at >= 0) { functionName = text.slice(0, at); text = text.slice(at + 1); }
+        let scriptName = text;
+        let lineNumber = 0;
+        let column = 0;
+        const m = /^(.*):(\d+):(\d+)$/.exec(text);
+        if (m) { scriptName = m[1]; lineNumber = Number(m[2]); column = Number(m[3]); }
+        else {
+          const m2 = /^(.*):(\d+)$/.exec(text);
+          if (m2) { scriptName = m2[1]; lineNumber = Number(m2[2]); }
+        }
+        // node reports the top-level frame's functionName as "" (anonymous);
+        // JSC spells it "global code"/"module code".
+        if (functionName === "global code" || functionName === "module code" ||
+            functionName === "eval code") functionName = "";
+        return { functionName, scriptId: "0", scriptName, lineNumber, column,
+                 columnNumber: column };
+      };
+      util.getCallSites = function getCallSites(frames, options) {
+        if (frames !== null && typeof frames === "object") { options = frames; frames = undefined; }
+        if (frames === undefined) frames = 10;
+        if (typeof frames !== "number" || !Number.isInteger(frames) || frames < 1) {
+          const e = new RangeError('The value of "frameCount" is out of range. ' +
+                                   "It must be an integer. Received " + String(frames));
+          e.code = "ERR_OUT_OF_RANGE";
+          throw e;
+        }
+        let stack = "";
+        try { stack = String(new Error().stack || ""); } catch (e) { stack = ""; }
+        const lines = stack.split("\n").filter((l) => l.trim().length > 0);
+        // Drop this frame; tolerate a V8-style "Error" header line.
+        let start = 0;
+        if (lines.length && /^\s*(Error|[A-Za-z]*Error:)/.test(lines[0]) && lines[0].indexOf("@") < 0) start = 1;
+        const out = [];
+        for (let i = start + 1; i < lines.length && out.length < frames; i++) {
+          out.push(parseFrame(lines[i]));
+        }
+        return out;
+      };
+    }
   } catch (e) {}
 })();
 )JS";

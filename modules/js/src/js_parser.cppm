@@ -110,15 +110,22 @@ class Parser : public TypeParser {
 public:
     explicit Parser(std::string_view src, bool cjs = false, bool jsx = false,
                     bool legacyDecorators = false, JsxOptions jsxOpts = {},
-                    bool trimUnusedImports = false)
+                    bool trimUnusedImports = false,
+                    std::string_view requireName = "require")
         : TypeParser{src, jsx, std::move(jsxOpts)}, cjs_{cjs},
-          legacyDecorators_{legacyDecorators} {
+          legacyDecorators_{legacyDecorators}, cjsRequireName_{requireName} {
         trim_.set_enabled(trimUnusedImports);
     }
 
     ParseResult run() {
         ParseResult result;
         if (!pre_lex_()) {
+            result.ok = false;
+            result.error = errMsg_;
+            result.error_offset = errOff_;
+            return result;
+        }
+        if (!check_ts_enum_redeclaration_()) {
             result.ok = false;
             result.error = errMsg_;
             result.error_offset = errOff_;
@@ -200,7 +207,7 @@ private:
             // `using` frame's envId; see parse_program_.)
             arena_.add_edit(0, 0,
                             build_cjs_import_(static_cast<std::uint32_t>(src_.size() + 1), "", "",
-                                              named, spec, false));
+                                              named, spec, false, {}, cjsRequireName_));
             return;
         }
         std::string s{"import { "};
@@ -219,6 +226,8 @@ private:
     bool classHasSuper_{false};  // enclosing class has an `extends` clause (for param-property init placement)
     bool allowPrivateBrand_{false};
     bool cjs_{false};          // ESM → CommonJS lowering mode
+    // Identifier the lowering calls for its own imports; see kEsmRequireAlias.
+    std::string_view cjsRequireName_{"require"};
     bool legacyDecorators_{false};  // TS experimentalDecorators: erase, no stage-3 lowering
     // TS unused-import elision (bun `trim_unused_imports`). OFF unless the
     // caller asks: Bun.Transpiler leaves it off, the runtime loader turns it on.
@@ -396,6 +405,83 @@ private:
 
     // Record a deletion of the raw span of the current token, then advance.
     // ── program / statements ─────────────────────────────────────────────────
+    // ── TS: `enum X` over a non-mergeable binding is an error ────────────────
+    // A TypeScript enum MERGES with another enum (and with a namespace), but a
+    // `function`/`class`/`let`/`const`/`var` of the same name is a forbidden
+    // redeclaration. bun reports it as a parse error; mbun used to lower both
+    // declarations silently, emitting two `var X; (function (X) {…})(X || (X={}))`
+    // IIFEs for one binding. In bun the same shape additionally tripped an
+    // assertion in `ref_to_ts_namespace_member` (a repeated key), which is what
+    // this test file pins.
+    // ref: compat/bun/test/bundler/transpiler/ts-enum-redecl-panic.test.ts
+    //      (oven-sh/bun#32711)
+    //
+    // SCOPED TO THE FILE'S TOP LEVEL, deliberately. mbun's parser has no binder,
+    // so a nested `function X(){}` and a nested `enum X{}` in two DIFFERENT
+    // blocks cannot be told apart from a real collision. At bracket depth 0 there
+    // is exactly one scope, so a match there is always a genuine redeclaration —
+    // no false positive is possible. Deeper collisions are DEFERRED with the
+    // binder.
+    bool check_ts_enum_redeclaration_() {
+        // name -> true when every declaration so far was an enum (mergeable).
+        std::unordered_map<std::string_view, bool> declared;
+        int depth = 0;
+        auto name_at = [&](std::size_t i) -> std::string_view {
+            return (i < toks_.size() && toks_[i].kind == Token::Identifier)
+                       ? std::string_view{toks_[i].ident}
+                       : std::string_view{};
+        };
+        for (std::size_t i = 0; i < toks_.size(); ++i) {
+            const Token k = toks_[i].kind;
+            if (k == Token::OpenBrace || k == Token::OpenParen || k == Token::OpenBracket) {
+                ++depth;
+                continue;
+            }
+            if (k == Token::CloseBrace || k == Token::CloseParen || k == Token::CloseBracket) {
+                if (depth > 0) {
+                    --depth;
+                }
+                continue;
+            }
+            if (depth != 0) {
+                continue;
+            }
+            std::string_view name;
+            bool isEnum = false;
+            if (k == Token::Enum) {
+                name = name_at(i + 1);
+                isEnum = true;
+            } else if (k == Token::Function || k == Token::Class) {
+                name = name_at(i + 1);
+            } else if (k == Token::Var || k == Token::Const ||
+                       (k == Token::Identifier && toks_[i].ident == "let")) {
+                // `const enum X` is an enum, not a const binding.
+                if (i + 1 < toks_.size() && toks_[i + 1].kind == Token::Enum) {
+                    continue;
+                }
+                name = name_at(i + 1);
+            } else {
+                continue;
+            }
+            if (name.empty()) {
+                continue;
+            }
+            const auto found = declared.find(name);
+            if (found == declared.end()) {
+                declared.emplace(name, isEnum);
+                continue;
+            }
+            if (isEnum && !found->second) {
+                ok_ = false;
+                errMsg_ = std::format("\"{}\" has already been declared", name);
+                errOff_ = toks_[i + 1].start;
+                return false;
+            }
+            found->second = found->second && isEnum;
+        }
+        return true;
+    }
+
     NodeIndex parse_program_() {
         std::vector<NodeIndex> stmts;
         // ref: bun src/js_parser/parse/parse_entry.rs — a leading hashbang is
@@ -446,6 +532,10 @@ private:
 
     NodeIndex parse_statement_() {
         if (!ok_) {
+            return NONE;
+        }
+        DepthGuard depth{this};  // nested blocks/loops recurse here (see kMaxParseDepth)
+        if (!depth.ok) {
             return NONE;
         }
         // Leading decorators on a class declaration (`@dec class C {}` and the
@@ -1443,7 +1533,7 @@ private:
         } else if (cjs_) {
             arena_.add_edit(start, prev_end_(),
                             build_cjs_import_(start, defName, nsName, named, specRaw, sideEffect,
-                                              typeAttr));
+                                              typeAttr, cjsRequireName_));
         }
         NodeIndex n = arena_.make(NodeKind::ImportDecl, start, cur_().start);
         Node& in = arena_.at(n);
@@ -1823,8 +1913,10 @@ private:
                 cjsEsmExport_ = true;
                 std::string repl{
                     nsName.empty()
-                        ? std::string{kObjectAlias} + ".assign(exports, require(" + specRaw + "));"
-                        : "exports." + nsName + " = require(" + specRaw + ");"};
+                        ? std::string{kObjectAlias} + ".assign(exports, " +
+                              std::string{cjsRequireName_} + "(" + specRaw + "));"
+                        : "exports." + nsName + " = " + std::string{cjsRequireName_} + "(" +
+                              specRaw + ");"};
                 arena_.add_edit(start, prev_end_(), repl);
             }
             lastExForm_ = ExForm::Star;
@@ -1883,7 +1975,7 @@ private:
                 std::string repl;
                 if (hasFrom) {
                     const std::string g{"__mbun_e" + std::to_string(start)};
-                    repl = "const " + g + " = require(" + specRaw + ");";
+                    repl = "const " + g + " = " + std::string{cjsRequireName_} + "(" + specRaw + ");";
                     for (const NamedSpec& s : specs) {
                         repl += " exports." + s.alias + " = " + g + "." + s.name + ";";
                     }
@@ -2220,9 +2312,16 @@ private:
             }
             // TS parameter-property modifiers are erased. For a constructor, capture
             // the bound name so `constructor(private x)` also synthesizes `this.x = x`.
+            // `public`/`override`/... are contextual: they are modifiers only when a
+            // parameter binding (or another modifier) follows. `function f(a,
+            // override)` names its second parameter `override`, and TS agrees — a
+            // modifier must be followed by a binding start (TS parseParameter). Every
+            // one of these words is a perfectly legal JS identifier, so consuming it
+            // unconditionally broke plain-JS files (acorn's dist bundle, #17766).
             bool hadModifier = false;
-            while (ident_is_("public") || ident_is_("private") || ident_is_("protected") ||
-                   ident_is_("readonly") || ident_is_("override")) {
+            while ((ident_is_("public") || ident_is_("private") || ident_is_("protected") ||
+                    ident_is_("readonly") || ident_is_("override")) &&
+                   (is_binding_start_(peek_kind_(1)) || peek_kind_(1) == Token::DotDotDot)) {
                 hadModifier = true;
                 erase_current_token_();
             }
@@ -3974,6 +4073,10 @@ private:
     }
 
     NodeIndex parse_assign_(bool allowIn) {
+        DepthGuard depth{this};  // nested elements/arguments/conditionals recurse here
+        if (!depth.ok) {
+            return NONE;
+        }
         if (inGenerator_ && ident_is_("yield")) {
             return parse_yield_expr_();
         }
@@ -4219,6 +4322,10 @@ private:
     }
 
     NodeIndex parse_unary_() {
+        DepthGuard depth{this};  // `- - - …1` / `void void …` chains recurse here
+        if (!depth.ok) {
+            return NONE;
+        }
         // `await <expr>` (contextual keyword): treat as a unary operator when an
         // operand follows, otherwise it is a plain identifier.
         if (ident_is_("await") && token_starts_expr_(peek_kind_(1))) {
@@ -4604,6 +4711,10 @@ private:
     }
 
     NodeIndex parse_primary_() {
+        DepthGuard depth{this};  // `[[[…]]]` / `f(f(f(…)))` bottom out here
+        if (!depth.ok) {
+            return NONE;
+        }
         Token k = curk_();
         const Tok& t = cur_();
         switch (k) {
@@ -5463,7 +5574,8 @@ private:
             }
             if (cjs_) {
                 arena_.add_edit(static_cast<std::uint32_t>(start), parenEnd,
-                                "globalThis.__mbun_dyn_import(require,");
+                                "globalThis.__mbun_dyn_import(" + std::string{cjsRequireName_} +
+                                    ",");
             }
             NodeIndex n = arena_.make(NodeKind::ImportCall, start, cur_().start);
             arena_.at(n).listStart = arena_.commit_list(args);
@@ -5494,11 +5606,30 @@ struct TranspileResult {
                                   // needs the async-IIFE wrapper + event-loop pump)
 };
 
+// Does this module declare a top-level `require` binding (`const require =
+// createRequire(import.meta.url)`, node's test/common/index.mjs:3)? Such a
+// module cannot take the CommonJS wrapper's `require` PARAMETER — the parameter
+// and the declaration collide ("Cannot declare a const variable twice"), a
+// SyntaxError before anything runs. The runtime wrapper therefore renames its
+// parameter, and this transpiler lowers the module's own imports against
+// `__mbun_esm_require` (kEsmRequireAlias) instead. Both sides MUST agree, which
+// is why they share this one predicate.
+inline bool declares_top_level_require(std::string_view src) {
+    return detail::declares_top_level_require_(src);
+}
+
 // Transpile options. `cjs` lowers ESM import/export to CommonJS require/exports
 // (for the script-mode JSC runtime, which cannot evaluate ES modules); when off,
 // import/export are kept verbatim (type-only forms still erased).
 struct TranspileOptions {
     bool cjs{false};
+    // Allow the ESM->CJS lowering to call `__mbun_esm_require` instead of
+    // `require` for its own imports, when the module itself declares a
+    // top-level `require` binding (which would otherwise collide with the CJS
+    // wrapper's `require` parameter — a SyntaxError before anything runs).
+    // ON for the runtime module loader, whose wrappers bind that alias; OFF for
+    // the bundler and Bun.Transpiler, whose output runs elsewhere.
+    bool cjs_require_alias{false};
     bool jsx{false};  // TSX/JSX input — lower JSX elements (see jsx_options)
     bool legacy_decorators{false};  // tsconfig experimentalDecorators: keep the TS
                                     // legacy behavior (decorators erased, no stage-3
@@ -5638,8 +5769,14 @@ TranspileResult transpile_(std::string_view src, const TranspileOptions& opts, b
             return bad;
         }
     }
+    // A module that declares its own top-level `require` gets its lowered
+    // imports named against the reserved alias — see kEsmRequireAlias.
+    const std::string_view requireName{
+        opts.cjs_require_alias && detail::declares_top_level_require_(src)
+            ? detail::kEsmRequireAlias
+            : std::string_view{"require"}};
     detail::Parser p{src, use_printer ? false : opts.cjs, opts.jsx, opts.legacy_decorators,
-                     std::move(jsxOpts), opts.trim_unused_imports};
+                     std::move(jsxOpts), opts.trim_unused_imports, requireName};
     ParseResult r = p.run();
     TranspileResult out;
     out.ok = r.ok;

@@ -227,22 +227,110 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
     if (Bun.file && !Bun.file.__wrapped) {
       const nativeFile = Bun.file;
       const MIME = { md: "text/markdown", markdown: "text/markdown", css: "text/css;charset=utf-8", html: "text/html;charset=utf-8", htm: "text/html;charset=utf-8", js: "text/javascript;charset=utf-8", mjs: "text/javascript;charset=utf-8", cjs: "text/javascript;charset=utf-8", ts: "text/javascript;charset=utf-8", tsx: "text/javascript;charset=utf-8", mts: "text/javascript;charset=utf-8", cts: "text/javascript;charset=utf-8", json: "application/json;charset=utf-8", txt: "text/plain;charset=utf-8", xml: "text/xml;charset=utf-8", csv: "text/csv;charset=utf-8", svg: "image/svg+xml", png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp", ico: "image/vnd.microsoft.icon", wasm: "application/wasm", pdf: "application/pdf", zip: "application/zip", woff: "font/woff", woff2: "font/woff2", ttf: "font/ttf", mp3: "audio/mpeg", mp4: "video/mp4", wav: "audio/wav" };
+      let __fs;
+      const fsModule = () => (__fs || (__fs = require("fs")));
       const wrapped = function (path, options) {
         const p = String(path && path.href ? path.href : path);
-        const raw = nativeFile.call(Bun, p);
-        const ioerr = raw.__ioerror;
-        const bytes = raw.__bytes instanceof Uint8Array ? raw.__bytes : new Uint8Array(0);
+        // A BunFile is LAZY in bun: constructing one does no I/O, and `.size`
+        // comes from stat(2). mbun used to read the whole file here (through
+        // the native, into a std::string, then into a typed array — 2x the file
+        // in peak RSS), so merely naming a large file was enough to be
+        // OOM-killed: regression/issue/8254 reads back a 2 GiB file it just
+        // wrote, and only ever looks at three single bytes of it.
+        const fsm = fsModule();
+        // `p` is what .name reports (an href stays an href, as before); the
+        // syscalls need the filesystem path the native's file_url_to_path used
+        // to derive for us.
+        let fsPath = p;
+        if (fsPath.slice(0, 7) === "file://") {
+          const rest = fsPath.slice(7);
+          const slash = rest.indexOf("/");            // skip an authority ("localhost")
+          try { fsPath = decodeURIComponent(slash < 0 ? "/" + rest : rest.slice(slash)); }
+          catch (e) { fsPath = slash < 0 ? "/" + rest : rest.slice(slash); }
+        }
+        let size = 0;
+        let ioerr;
+        try {
+          const st = fsm.statSync(fsPath);
+          if (st.isDirectory()) ioerr = "EISDIR";
+          else size = Number(st.size) || 0;
+        } catch (e) { ioerr = "ENOENT"; }
         const ext = p.slice(p.lastIndexOf(".") + 1).toLowerCase();
         const type = (options && options.type) || MIME[ext] || "application/octet-stream";
-        // Adopt the native bytes rather than re-copying them through the Blob
-        // parts path — they are freshly allocated per call and unaliased.
         const f = new G.Blob([], { type });
-        f._u8 = bytes;   // Blob.prototype.size derives from _u8
         // name/lastModified are Blob.prototype accessors backed by these slots
         // (lastModified is getter-only, so it cannot be assigned).
         const slot = (k, v) => Object.defineProperty(f, k, { value: v, writable: true, enumerable: false, configurable: true });
+        slot("__size", size);
         slot("__name", p);
         slot("__lastModified", 0);
+        if (!ioerr) {
+          const protoU8 = Object.getOwnPropertyDescriptor(G.Blob.prototype, "_u8");
+          let loaded = false;   // has the file's content been pulled into __parts?
+          // Shadows Blob.prototype's `_u8`: the bytes are pulled off disk the
+          // first time anything actually needs them, then cached as the blob's
+          // single part (so a second read is free and `_u8 = …` still works).
+          Object.defineProperty(f, "_u8", {
+            get() {
+              if (!loaded) {
+                loaded = true;
+                // Raw fd read, NOT fs.readFileSync: readFileSync refuses at the
+                // synthetic allocation limit, but ArrayBuffer is exempt from
+                // that limit in bun, and text()/bytes()/json() are already
+                // capped on `size` by Blob.prototype before they get here.
+                const FD = G.__mbunFdNative;
+                const fd = FD.open(fsPath, "r", 0o666);
+                let u = new Uint8Array(size > 0 ? size : 65536);
+                let off = 0;
+                try {
+                  for (;;) {
+                    if (off >= u.length) { const g = new Uint8Array(u.length * 2); g.set(u); u = g; }
+                    const n = FD.read(fd, u, off, u.length - off, -1);
+                    if (!(n > 0)) break;
+                    off += n;
+                  }
+                } finally { FD.close(fd); }
+                if (off !== u.length) u = u.subarray(0, off);
+                slot("__parts", [u]);
+                slot("__size", off);
+                return u;
+              }
+              return protoU8.get.call(f);
+            },
+            set(v) { loaded = true; protoU8.set.call(f, v); },
+            enumerable: false, configurable: true,
+          });
+          // Range reads go through pread: slicing a file must not pull the
+          // whole file into memory just to hand back a few bytes.
+          slot("slice", (start, end, sliceType) => {
+            if (loaded) return G.Blob.prototype.slice.call(f, start, end, sliceType);
+            const norm = (v, dflt) => {
+              if (v === undefined) return dflt;
+              let n = Number(v);
+              if (Number.isNaN(n)) n = 0;
+              n = Math.trunc(n);
+              return n < 0 ? Math.max(size + n, 0) : Math.min(n, size);
+            };
+            const s = norm(start, 0);
+            const e = Math.max(norm(end, size), s);
+            const out = new Uint8Array(e - s);
+            if (out.length > 0) {
+              const fd = fsm.openSync(fsPath, "r");
+              try {
+                let got = 0;
+                while (got < out.length) {
+                  const n = fsm.readSync(fd, out, got, out.length - got, s + got);
+                  if (!(n > 0)) break;
+                  got += n;
+                }
+              } finally { fsm.closeSync(fd); }
+            }
+            const b = new G.Blob([], { type: sliceType || "" });
+            Object.defineProperty(b, "__parts", { value: out.length ? [out] : [], writable: true, enumerable: false, configurable: true });
+            Object.defineProperty(b, "__size", { value: out.length, writable: true, enumerable: false, configurable: true });
+            return b;
+          });
+        }
         if (ioerr) {
           // Missing/unreadable file: read methods reject with the errno (bun #26632).
           // These shadow Blob.prototype's resolving versions.
@@ -258,7 +346,7 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
         // come from Blob.prototype and are already byte-accurate.)
         // bun carries .exists on Blob.prototype, so it is never an own key of a
         // BunFile: keep it off Object.keys()/JSON.stringify().
-        slot("exists", () => { try { return Promise.resolve(require("fs").statSync(p).isFile()); } catch (e) { return Promise.resolve(false); } });
+        slot("exists", () => { try { return Promise.resolve(fsm.statSync(fsPath).isFile()); } catch (e) { return Promise.resolve(false); } });
         try { Object.defineProperty(f, "__isBunFile", { value: true, enumerable: false, configurable: true }); } catch (e) {}
         return f;
       };
@@ -479,7 +567,15 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
     const isBuildMessage = (v) =>
       v !== null && typeof v === "object" && v.name === "BuildMessage" &&
       typeof v.message === "string" && "position" in v && "level" in v;
-    if (typeof Bun.inspect === "undefined") Bun.inspect = (v, opts) => (isBuildMessage(v) ? inspectBuildMessage(v) : util.inspect(v, Object.assign({ __bunStyle: true }, opts)));
+    // bun accepts BOTH shapes: Bun.inspect(v, { ...options }) and the positional
+    // Bun.inspect(v, colors, depth) (ConsoleObject.rs `inspect`). A negative
+    // depth is a RangeError, not a silently clamped value.
+    if (typeof Bun.inspect === "undefined") Bun.inspect = (v, opts, depthArg) => {
+      let o = (opts !== null && typeof opts === "object") ? opts : { colors: opts === true };
+      if (depthArg !== undefined && depthArg !== null) o = Object.assign({}, o, { depth: depthArg });
+      if (typeof o.depth === "number" && o.depth < 0) throw new RangeError('The "depth" argument must be an integer >= 0');
+      return isBuildMessage(v) ? inspectBuildMessage(v) : util.inspect(v, Object.assign({ __bunStyle: true }, o));
+    };
     if (typeof Bun.inspect === "function" && Bun.inspect.custom === undefined && util.inspect && util.inspect.custom) Bun.inspect.custom = util.inspect.custom;
     if (typeof Bun.deepEquals === "undefined") Bun.deepEquals = (a, b, strict) => {
       const eq = (x, y, s, seen) => {
@@ -532,6 +628,11 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
       // in generation order; it resets to 0 when the timestamp changes.
       let lastTs = -1, counter = 0;
       return (enc, ts) => {
+      // bun rejects an unknown encoding label with ERR_UNKNOWN_ENCODING
+      // (JSBufferEncodingType.cpp:91), it does not fall back to hex.
+      if (enc !== undefined && enc !== null && enc !== "hex" && enc !== "base64" && enc !== "base64url" && enc !== "buffer") {
+        const e = new TypeError("Invalid encoding"); e.code = "ERR_UNKNOWN_ENCODING"; throw e;
+      }
       let t = ts instanceof Date ? ts.getTime() : (typeof ts === "number" ? ts : (G.Date ? Date.now() : 0));
       t = t < 0 ? 0 : Math.floor(t);
       if (t !== lastTs) { lastTs = t; counter = 0; }
@@ -555,7 +656,7 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
       // Semantics (per bun): parse line-by-line; on the first malformed line,
       // return the values collected so far (partial) — unless none were collected,
       // in which case the parse error propagates. Non-string input → TypeError.
-      const JSONL = { parse: (str) => { if (typeof str !== "string") { if (str && ArrayBuffer.isView(str)) str = new G.TextDecoder().decode(str); else throw new TypeError("The \"input\" argument must be of type string or an instance of TypedArray. Received " + (str === null ? "null" : typeof str)); } const out = []; for (const line of str.split("\n")) { const t = line.trim(); if (!t) continue; let v; try { v = JSON.parse(t); } catch (e) { if (out.length > 0) return out; throw e; } out.push(v); } return out; } };
+      const JSONL = { parse: (str) => { if (typeof str !== "string") { if (str && ArrayBuffer.isView(str)) { G.__mbunCheckAllocLimit(str.byteLength, "text"); str = new G.TextDecoder().decode(str); } else throw new TypeError("The \"input\" argument must be of type string or an instance of TypedArray. Received " + (str === null ? "null" : typeof str)); } const out = []; for (const line of str.split("\n")) { const t = line.trim(); if (!t) continue; let v; try { v = JSON.parse(t); } catch (e) { if (out.length > 0) return out; throw e; } out.push(v); } return out; } };
       Object.defineProperty(JSONL, Symbol.toStringTag, { value: "JSONL", configurable: true });
       Bun.JSONL = JSONL;
     }

@@ -38,6 +38,13 @@ frozen machine or a silently murdered harness.
   directly (`mbun <file>`, exit 0 = pass); node-harness-dependent files count
   as failures, keeping the number honest file-level coverage.
 - `test_members.sh` — `mcpp test` across every workspace member.
+- `smoke_examples.py` — boots each `examples/` app in turn, requests
+  `http://127.0.0.1:3000/`, asserts a 2xx, then reaps the whole process tree
+  (`bounded_run.BoundedServer`). Sequential by design: the demos all hardcode
+  port 3000. `--app <name>` runs one; CI runs the full set on the gcc lane.
+  An app whose `node_modules` is missing is reported as `skipped-no-deps`
+  unless `--install` is passed (bootstrapping through `mbun install` does not
+  currently finish for the framework demos).
 
 ## Self-tests
 
@@ -46,6 +53,7 @@ Every tool has a self-test under `tests/`; run them after touching a runner:
 ```bash
 bash tools/integration/tests/test_bun_corpus_runner.sh
 bash tools/integration/tests/test_node_corpus_runner.sh
+bash tools/integration/tests/test_smoke_examples.sh
 bash benchmarks/tools/test-bench3.sh
 ```
 

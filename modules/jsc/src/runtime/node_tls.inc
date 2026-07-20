@@ -39,9 +39,76 @@ inline JSValueRef node_tls_get_ciphers_cb(JSContextRef ctx, JSObjectRef, JSObjec
     return JSObjectMakeArray(ctx, out.size(), out.empty() ? nullptr : out.data(), nullptr);
 }
 
+// __mbunNodeTlsNative.canonicalizeIP(text) → the address's canonical text form,
+// or undefined when it is not an IP literal. Backs node:tls checkServerIdentity's
+// IP-SAN comparison (an `IP Address:` SAN and the hostname must be compared in
+// canonical form, else "fe80:0:0:0:0:0:0:1" and "fe80::1" read as different
+// hosts) and bun:internal-for-testing's canonicalizeIP.
+//
+// Blueprint: bun runtime/dns_jsc/cares_jsc.rs:822-853 Bun__canonicalizeIP →
+// boringssl/lib.rs:242-271 canonicalize_ip — reject anything at/over
+// INET6_ADDRSTRLEN, try inet_pton(AF_INET) first and fall back to AF_INET6, then
+// render with inet_ntop. A '/' (CIDR) is rejected up front (cares_jsc.rs:840).
+// The pton/ntop round trip — NOT the RFC 5952 formatter in mbun.dns.address — is
+// what produces the IPv4-mapped form "::ffff:192.168.1.1" for
+// "0:0:0:0:0:ffff:c0a8:101", so this deliberately uses the libc pair.
+inline JSValueRef node_tls_canonicalize_ip_cb(JSContextRef ctx, JSObjectRef, JSObjectRef,
+                                              std::size_t argc, const JSValueRef args[],
+                                              JSValueRef* exc) {
+    if (argc < 1) {
+        if (exc != nullptr) {
+            *exc = make_named_error(
+                ctx, "TypeError", "canonicalizeIP() expects a string but received no arguments.");
+        }
+        return JSValueMakeUndefined(ctx);
+    }
+    const std::string addr{arg_string(ctx, argc, args, 0)};
+    if (addr.empty() || addr.size() >= INET6_ADDRSTRLEN || addr.find('/') != std::string::npos) {
+        return JSValueMakeUndefined(ctx);
+    }
+    std::array<unsigned char, sizeof(in6_addr)> raw{};
+    int af{AF_INET};
+    if (::inet_pton(AF_INET, addr.c_str(), raw.data()) != 1) {
+        af = AF_INET6;
+        if (::inet_pton(AF_INET6, addr.c_str(), raw.data()) != 1) {
+            return JSValueMakeUndefined(ctx);
+        }
+    }
+    std::array<char, INET6_ADDRSTRLEN + 1> out{};
+    if (::inet_ntop(af, raw.data(), out.data(), out.size() - 1) == nullptr) {
+        return JSValueMakeUndefined(ctx);
+    }
+    return make_string(ctx, out.data());
+}
+
+// __mbunNodeTlsNative.checkCipherList(str) → does OpenSSL accept this cipher
+// list? node's SecureContext::SetCiphers throws ERR_SSL_NO_CIPHER_MATCH when
+// SSL_CTX_set_cipher_list() fails, which is the only way to learn that a list
+// like "aes256-sha" or "FOOBARBAZ" selects nothing. Missing/empty argument
+// answers true so only an explicit list is judged.
+inline JSValueRef node_tls_check_cipher_list_cb(JSContextRef ctx, JSObjectRef, JSObjectRef,
+                                                std::size_t argc, const JSValueRef argv[],
+                                                JSValueRef*) {
+    if (argc < 1) return JSValueMakeBoolean(ctx, true);
+    const std::string list{val_to_string(ctx, argv[0])};
+    bool ok{true};
+    if (const SSL_METHOD* method{TLS_method()}) {
+        if (SSL_CTX* c{SSL_CTX_new(method)}) {
+            ok = SSL_CTX_set_cipher_list(c, list.c_str()) == 1;
+            SSL_CTX_free(c);
+        }
+    }
+    // OpenSSL leaves the failure on the thread error queue; clear it so a later
+    // unrelated call does not report it.
+    if (!ok) ERR_clear_error();
+    return JSValueMakeBoolean(ctx, ok);
+}
+
 // Install globalThis.__mbunNodeTlsNative. Called once from engine init.
 inline void install_node_tls_native(JSContextRef ctx, JSObjectRef global) {
     JSObjectRef tn{JSObjectMake(ctx, nullptr, nullptr)};
     set_fn(ctx, tn, "getCiphers", node_tls_get_ciphers_cb);
+    set_fn(ctx, tn, "checkCipherList", node_tls_check_cipher_list_cb);
+    set_fn(ctx, tn, "canonicalizeIP", node_tls_canonicalize_ip_cb);
     set_prop(ctx, global, "__mbunNodeTlsNative", tn);
 }

@@ -65,7 +65,19 @@ inline constexpr std::string_view kWebHeadersJS = R"JS(
     };
     // Strip leading/trailing HTTP whitespace, then require ISO-8859-1 without
     // NUL/CR/LF.
-    const normalizeValue = (value) => ("" + value).replace(/^[\t\n\r ]+|[\t\n\r ]+$/g, "");
+    // Hand-rolled rather than /^[\t\n\r ]+|[\t\n\r ]+$/g: the trailing-run
+    // alternative has no anchor JSC can use, so it retries at every index and
+    // the trim goes quadratic. The undici corpus feeds a 500k-tab value
+    // ("headers that might cause a ReDoS") that took ~60s through the regex.
+    const isHttpWs = (c) => c === 9 || c === 10 || c === 13 || c === 32;
+    const normalizeValue = (value) => {
+      const s = "" + value;
+      let a = 0;
+      let b = s.length;
+      while (a < b && isHttpWs(s.charCodeAt(a))) a++;
+      while (b > a && isHttpWs(s.charCodeAt(b - 1))) b--;
+      return a === 0 && b === s.length ? s : s.slice(a, b);
+    };
     const validateValue = (value, givenName) => {
       for (let i = 0; i < value.length; i++) {
         const c = value.charCodeAt(i);
@@ -249,11 +261,13 @@ inline constexpr std::string_view kWebHeadersJS = R"JS(
     const util = M && (M["util"] || M["node:util"]);
     if (util && typeof util.inspect === "function") {
       const prev = util.inspect;
-      const wrapped = function inspect(value, options) {
+      // Forward EVERY argument: Bun.inspect also takes the positional
+      // (value, colors, depth) form, which a 2-parameter wrapper would drop.
+      const wrapped = function inspect(value, ...rest) {
         if (value !== null && typeof value === "object" && value instanceof OrigHeaders && value._m instanceof Map) {
           try { return headersInspect(value); } catch (_) {}
         }
-        return prev.call(this, value, options);
+        return prev.call(this, value, ...rest);
       };
       for (const k of Object.keys(prev)) { try { wrapped[k] = prev[k]; } catch (_) {} }
       util.inspect = wrapped;
@@ -266,11 +280,11 @@ inline constexpr std::string_view kWebHeadersJS = R"JS(
       } else if (G.Bun && typeof G.Bun.inspect === "function") {
         try {
           const bunPrev = G.Bun.inspect;
-          const bunWrapped = function inspect(value, options) {
+          const bunWrapped = function inspect(value, ...rest) {
             if (value !== null && typeof value === "object" && value instanceof OrigHeaders && value._m instanceof Map) {
               try { return headersInspect(value); } catch (_) {}
             }
-            return bunPrev.call(this, value, options);
+            return bunPrev.call(this, value, ...rest);
           };
           for (const k of Object.keys(bunPrev)) { try { bunWrapped[k] = bunPrev[k]; } catch (_) {} }
           G.Bun.inspect = bunWrapped;

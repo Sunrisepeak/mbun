@@ -179,7 +179,10 @@ export inline std::vector<std::byte> encode_sasl_response(std::span<const std::b
 export enum class DecodeStatus : std::uint8_t {
     Ok,          // one full message decoded
     Incomplete,  // need more bytes (message spans packets)
-    Invalid,     // malformed framing / length
+    Invalid,     // malformed framing / length field (ERR_POSTGRES_INVALID_MESSAGE_LENGTH)
+    InvalidBody, // framing ok, body overruns/contradicts the declared length
+                 // (libpq "insufficient data left in message" ->
+                 //  ERR_POSTGRES_INVALID_MESSAGE)
 };
 
 export enum class BackendTag : char {
@@ -188,6 +191,11 @@ export enum class BackendTag : char {
     NoticeResponse = 'N', ParseComplete = '1', BindComplete = '2', CloseComplete = '3',
     NoData = 'n', ParameterDescription = 't', EmptyQueryResponse = 'I', PortalSuspended = 's',
     NotificationResponse = 'A',
+    // COPY sub-protocol: the frames a `COPY ... TO STDOUT` statement produces
+    // between CommandComplete and the next result set. They carry no rows for
+    // the JS result, but must be framed (and skipped) rather than rejected.
+    CopyInResponse = 'G', CopyOutResponse = 'H', CopyBothResponse = 'W',
+    CopyData = 'd', CopyDone = 'c',
 };
 
 // Authentication request sub-kinds (the int32 that follows the 'R' header).
@@ -389,9 +397,12 @@ export inline DecodeResult decode_message(std::string_view buf) {
         m.tag = BackendTag::DataRow;
         DataRowMsg dr;
         auto n { c.i16() };
+        if (n < 0) c.bad = true;
         for (std::int16_t k { 0 }; k < n && !c.bad; ++k) {
             auto vlen { c.i32() };
-            if (vlen < 0) dr.columns.emplace_back(std::nullopt);
+            // -1 is SQL NULL; any other negative length would read ~4 GiB.
+            if (vlen == -1) dr.columns.emplace_back(std::nullopt);
+            else if (vlen < 0) { c.bad = true; }
             else dr.columns.emplace_back(c.bytes(static_cast<std::size_t>(vlen)));
         }
         m.payload = std::move(dr);
@@ -437,6 +448,13 @@ export inline DecodeResult decode_message(std::string_view buf) {
         m.payload = std::move(nr);
         break;
     }
+    // COPY frames: body content is not surfaced (no JS rows come from them), but
+    // the frame is consumed so the following result set still decodes.
+    case 'G': m.tag = BackendTag::CopyInResponse; break;
+    case 'H': m.tag = BackendTag::CopyOutResponse; break;
+    case 'W': m.tag = BackendTag::CopyBothResponse; break;
+    case 'd': m.tag = BackendTag::CopyData; break;
+    case 'c': m.tag = BackendTag::CopyDone; break;
     case '1': m.tag = BackendTag::ParseComplete; break;
     case '2': m.tag = BackendTag::BindComplete; break;
     case '3': m.tag = BackendTag::CloseComplete; break;
@@ -448,7 +466,9 @@ export inline DecodeResult decode_message(std::string_view buf) {
         return r;
     }
 
-    if (c.bad) { r.status = DecodeStatus::Invalid; return r; }
+    // A body that ran past its own (well-formed) length header is a protocol
+    // error distinct from a bad length field — bun maps it to InvalidMessage.
+    if (c.bad) { r.status = DecodeStatus::InvalidBody; return r; }
     r.status = DecodeStatus::Ok;
     r.bytes_read = total;
     r.message = std::move(m);
@@ -522,6 +542,64 @@ export inline std::optional<double> parse_float(std::span<const std::byte> v, st
 // and format code. text/varchar/etc. stay as strings. RowValue lives in
 // mbun.postgres.row, so return the primitive variant here to avoid a cycle.
 export using WireValue = std::variant<std::monostate, bool, std::int64_t, double, std::string, std::vector<std::byte>>;
+
+// ── binary single-dimension arrays (int4[] / float4[]) ──────────────────────
+//
+// PORT-SOURCE: bun-ref src/sql_jsc/postgres/DataCell.rs from_bytes_typed_array
+// (+ the header documentation in src/sql/postgres/types/Tag.rs). PostgreSQL
+// array_send() layout, one dimension:
+//   Int32 ndim, Int32 flags(has-nulls), Int32 elemtype,
+//   then per dimension: Int32 len, Int32 lbound,
+//   then `len` elements, each Int32 length-prefixed.
+// `len` is server-controlled, so it MUST be validated against the column byte
+// length before iterating — otherwise the element loop reads past the buffer.
+export struct BinaryArray {
+    bool ok { false };
+    ErrorCode error { ErrorCode::InvalidBinaryData };
+    std::size_t count { 0 };
+    // Element bytes in *native* order, `count * elem_size` long.
+    std::vector<std::byte> data {};
+};
+
+inline std::int32_t be_i32_at_(std::span<const std::byte> b, std::size_t at) {
+    std::uint32_t u { 0 };
+    for (std::size_t k { 0 }; k < 4; ++k) u = (u << 8) | std::to_integer<std::uint8_t>(b[at + k]);
+    return static_cast<std::int32_t>(u);
+}
+
+export inline BinaryArray decode_binary_array(std::span<const std::byte> bytes, std::size_t elem_size) {
+    BinaryArray out;
+    auto fail { [&](ErrorCode e) { out.ok = false; out.error = e; return out; } };
+    if (bytes.size() < 12) return fail(ErrorCode::InvalidBinaryData);
+    std::int32_t ndim { be_i32_at_(bytes, 0) };
+    std::int32_t has_nulls { be_i32_at_(bytes, 4) };
+    if (ndim > 1) return fail(ErrorCode::MultidimensionalArrayNotSupportedYet);
+    if (has_nulls != 0) return fail(ErrorCode::NullsInArrayNotSupportedYet);
+    if (ndim <= 0) { out.ok = true; return out; }  // zero-dimension array == empty
+    if (bytes.size() < 20) return fail(ErrorCode::InvalidBinaryData);
+    std::int32_t len { be_i32_at_(bytes, 12) };
+    if (len < 0) return fail(ErrorCode::InvalidBinaryData);
+    // Each element consumes an Int32 length prefix + elem_size value bytes.
+    std::size_t stride { elem_size * 2 };
+    std::size_t max_elements { (bytes.size() - 20) / stride };
+    if (static_cast<std::size_t>(len) > max_elements) return fail(ErrorCode::InvalidBinaryData);
+    out.count = static_cast<std::size_t>(len);
+    out.data.resize(out.count * elem_size);
+    for (std::size_t i { 0 }; i < out.count; ++i) {
+        std::size_t src { 20 + i * stride + (stride - elem_size) };
+        // wire is big-endian; emit native-order element bytes.
+        for (std::size_t k { 0 }; k < elem_size; ++k) {
+            std::size_t from { std::endian::native == std::endian::big ? k : elem_size - 1 - k };
+            out.data[i * elem_size + k] = bytes[src + from];
+        }
+    }
+    out.ok = true;
+    return out;
+}
+
+// OIDs of the binary array types bun decodes into JS typed arrays.
+export inline constexpr std::uint32_t OID_INT4_ARRAY { 1007 };
+export inline constexpr std::uint32_t OID_FLOAT4_ARRAY { 1021 };
 
 export inline WireValue decode_value(TypeId oid, std::span<const std::byte> v, std::int16_t format) {
     switch (oid) {

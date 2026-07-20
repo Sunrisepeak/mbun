@@ -229,6 +229,11 @@ void worker_thread_main(std::shared_ptr<WebWorker> w, std::string source, std::s
     };
 
     eval(kWorkerBootstrapJS);
+    // W3C Performance / PerformanceObserver are part of the WorkerGlobalScope in
+    // bun (and node exposes perf_hooks on every thread). The perf partition is a
+    // self-contained IIFE with no native dependency beyond an optional
+    // Bun.nanoseconds, so the worker VM gets the same surface as the main one.
+    eval(mbun::jsc::builtins::detail::kNodePerfJS);
     eval(source);  // user entry script (error already reported on throw)
 
     // Event loop: deliver inbound messages, drain microtasks, stay alive while a

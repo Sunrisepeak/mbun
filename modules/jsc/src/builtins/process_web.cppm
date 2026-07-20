@@ -61,7 +61,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       if (item.off >= item.data.length) { rec.stdinBuf.shift(); if (item.cb) try { item.cb(); } catch (e) {} }
       else return;
     }
-    if (rec.stdinEnded) { try { PROC.close(rec.stdinFd); } catch (e) {} rec.stdinClosed = true; if (rec.cp.stdin) rec.cp.stdin.destroyed = true; }
+    if (rec.stdinEnded) { try { PROC.close(rec.stdinFd); } catch (e) {} rec.stdinClosed = true; if (rec.cp.stdin) { rec.cp.stdin.destroyed = true; rec.cp.stdin.writable = false; } }
   };
 
   const drainOut = (o) => {
@@ -76,7 +76,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   const maybeClose = (rec) => {
     if (!rec.exited || rec.closed) return;
     for (const o of rec.outs) if (!o.ended) return;  // wait for all pipes to hit EOF
-    if (rec.stdinFd >= 0 && !rec.stdinClosed) { try { PROC.close(rec.stdinFd); } catch (e) {} rec.stdinClosed = true; if (rec.cp.stdin) rec.cp.stdin.destroyed = true; }
+    if (rec.stdinFd >= 0 && !rec.stdinClosed) { try { PROC.close(rec.stdinFd); } catch (e) {} rec.stdinClosed = true; if (rec.cp.stdin) { rec.cp.stdin.destroyed = true; rec.cp.stdin.writable = false; } }
     rec.closed = true; rec.done = true;
     rec.cp.emit("close", rec.code, rec.signal);
   };
@@ -118,7 +118,15 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     w.writable = true; w.destroyed = false;
     w.write = (chunk, enc, cb) => {
       if (typeof enc === "function") { cb = enc; enc = null; }
-      if (w.destroyed || rec.stdinEnded) { if (typeof cb === "function") nextTick(cb); return false; }
+      if (w.destroyed || rec.stdinEnded) {
+        // node: writing to a destroyed/ended stream returns false and calls back
+        // with ERR_STREAM_DESTROYED (Writable.write → writeAfterEnd/destroyed).
+        const e = new Error("Cannot call write after a stream was destroyed");
+        e.code = "ERR_STREAM_DESTROYED";
+        if (typeof cb === "function") nextTick(() => cb(e));
+        else nextTick(() => { try { if (w.listenerCount("error") > 0) w.emit("error", e); } catch (_) {} });
+        return false;
+      }
       const data = chunk == null ? new Uint8Array(0) : typeof chunk === "string" ? te.encode(chunk) : _u8(chunk);
       rec.stdinBuf.push({ data, off: 0, cb: typeof cb === "function" ? cb : null });
       flushStdin(rec);
@@ -133,7 +141,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       flushStdin(rec);
       return w;
     };
-    w.destroy = () => { w.destroyed = true; rec.stdinEnded = true; if (!rec.stdinClosed) { try { PROC.close(rec.stdinFd); } catch (e) {} rec.stdinClosed = true; } return w; };
+    w.destroy = () => { w.destroyed = true; w.writable = false; rec.stdinEnded = true; if (!rec.stdinClosed) { try { PROC.close(rec.stdinFd); } catch (e) {} rec.stdinClosed = true; } return w; };
     w.setDefaultEncoding = () => w; w.setEncoding = () => w; w.cork = () => {}; w.uncork = () => {};
     return w;
   };
@@ -389,7 +397,120 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   // inspected, %-specifiers honored) so objects render `{ foo: 'bar' }`, not
   // `[object Object]`. colorMode ('auto'|true|false) drives inspect colors; 'auto'
   // follows the target stream's isTTY. ref bun src/js/node/console.ts formatWithOptions.
-  class Console { constructor(out) { const o = out && out.stdout ? out : { stdout: out }; Object.assign(this, G.console); const colorMode = o.colorMode === undefined ? "auto" : o.colorMode; const io = o.inspectOptions; const colorsFor = (s) => colorMode === "auto" ? !!(s && s.isTTY) : !!colorMode; const fmt = (s, a) => util.formatWithOptions(Object.assign({}, io, { colors: colorsFor(s) }), ...a) + "\n"; this.log = this.info = (...a) => { (o.stdout && o.stdout.write) ? o.stdout.write(fmt(o.stdout, a)) : G.console.log(...a); }; this.error = this.warn = (...a) => { (o.stderr && o.stderr.write) ? o.stderr.write(fmt(o.stderr, a)) : G.console.error(...a); }; } }
+  // ---- Console#table (https://console.spec.whatwg.org/#table) --------------
+  // Blueprint: bun src/js/builtins/ConsoleObject.ts:180-250 (tableChars +
+  // renderRow/table, itself node's lib/internal/cli_table.js) and :645-739 (the
+  // `table` method). Cells are CENTER-padded: `" ".repeat(needed)` truncates a
+  // fractional count while the right pad ceils it, so an odd leftover space goes
+  // to the right — that asymmetry is load-bearing for the expected output.
+  const tableChars = { middleMiddle: "─", rowMiddle: "┼", topRight: "┐", topLeft: "┌", leftMiddle: "├",
+                       topMiddle: "┬", bottomRight: "┘", bottomLeft: "└", bottomMiddle: "┴",
+                       rightMiddle: "┤", left: "│ ", right: " │", middle: " │ " };
+  // Display width, not code-unit length: a CJK/emoji cell occupies two columns.
+  const tableCellWidth = (s) => (G.Bun && typeof G.Bun.stringWidth === "function" ? G.Bun.stringWidth(String(s)) : String(s).length);
+  const renderTableRow = (row, widths) => {
+    let out = tableChars.left;
+    for (let i = 0; i < row.length; i++) {
+      const cell = row[i];
+      const needed = (widths[i] - tableCellWidth(cell)) / 2;
+      out += " ".repeat(needed) + cell + " ".repeat(Math.ceil(needed));
+      if (i !== row.length - 1) out += tableChars.middle;
+    }
+    return out + tableChars.right;
+  };
+  const renderTable = (head, columns) => {
+    const widths = head.map(tableCellWidth);
+    const longest = columns.length === 0 ? 0 : Math.max(...columns.map((a) => a.length));
+    const rows = new Array(longest);
+    for (let i = 0; i < head.length; i++) {
+      const column = columns[i];
+      for (let j = 0; j < longest; j++) {
+        if (rows[j] === undefined) rows[j] = [];
+        const value = (rows[j][i] = Object.prototype.hasOwnProperty.call(column, j) ? column[j] : "");
+        widths[i] = Math.max(widths[i] || 0, tableCellWidth(value));
+      }
+    }
+    const divider = widths.map((w) => tableChars.middleMiddle.repeat(w + 2));
+    let result = tableChars.topLeft + divider.join(tableChars.topMiddle) + tableChars.topRight + "\n" +
+                 renderTableRow(head, widths) + "\n" +
+                 tableChars.leftMiddle + divider.join(tableChars.rowMiddle) + tableChars.rightMiddle + "\n";
+    for (const row of rows) result += renderTableRow(row, widths) + "\n";
+    return result + tableChars.bottomLeft + divider.join(tableChars.bottomMiddle) + tableChars.bottomRight;
+  };
+  // `logFn` is the console's own log (stream routing + formatting stay the
+  // instance's); `io` its inspect options.
+  const consoleTableImpl = (logFn, io, tabularData, properties) => {
+    if (properties !== undefined && !Array.isArray(properties)) {
+      const e = new TypeError('The "properties" argument must be an instance of Array. Received ' +
+        (properties === null ? "null" : typeof properties === "object" ? "an instance of " + ((properties.constructor && properties.constructor.name) || "Object") : "type " + typeof properties));
+      e.code = "ERR_INVALID_ARG_TYPE";
+      throw e;
+    }
+    if (tabularData === null || typeof tabularData !== "object") return logFn(tabularData);
+    const T = util.types;
+    const isArrayish = (v) => Array.isArray(v) || ArrayBuffer.isView(v);
+    const final = (k, v) => logFn(renderTable(k, v));
+    // depth -1 collapses an object with more than two keys to `[Object]` — the
+    // cell would otherwise blow the column out (ConsoleObject.ts:654).
+    const _inspect = (v) => {
+      const depth = v !== null && typeof v === "object" && !isArrayish(v) && Object.keys(v).length > 2 ? -1 : 0;
+      return util.inspect(v, Object.assign({ depth, maxArrayLength: 3, breakLength: Infinity }, io));
+    };
+    const getIndexArray = (length) => Array.from({ length }, (_, i) => _inspect(i));
+    const iterKey = "(iteration index)", keyKey = "Key", valuesKey = "Values", indexKey = "(index)";
+    const mapIter = T.isMapIterator(tabularData);
+    // NOTE: bun leaves node's `previewEntries(mapIter, true)` commented out
+    // (ConsoleObject.ts:747-751), so a Map ITERATOR is never split into
+    // Key/Values columns — it falls through to the set-like branch below and
+    // each entry renders as a whole `[ k, v ]` array. Only a live Map takes the
+    // three-column form.
+    if (T.isMap(tabularData)) {
+      const keys = [], values = [];
+      let length = 0;
+      for (const entry of tabularData) { keys.push(_inspect(entry[0])); values.push(_inspect(entry[1])); length++; }
+      return final([iterKey, keyKey, valuesKey], [getIndexArray(length), keys, values]);
+    }
+    if (T.isSetIterator(tabularData) || mapIter || T.isSet(tabularData)) {
+      const values = [];
+      let length = 0;
+      for (const v of tabularData) { values.push(_inspect(v)); length++; }
+      return final([iterKey, valuesKey], [getIndexArray(length), values]);
+    }
+    const map = Object.create(null);
+    let hasPrimitives = false;
+    const valuesKeyArray = [];
+    const indexKeyArray = Object.keys(tabularData);
+    for (let i = 0; i < indexKeyArray.length; i++) {
+      const item = tabularData[indexKeyArray[i]];
+      const primitive = item === null || (typeof item !== "function" && typeof item !== "object");
+      if (properties === undefined && primitive) {
+        hasPrimitives = true;
+        valuesKeyArray[i] = _inspect(item);
+      } else {
+        const keys = properties || Object.keys(item);
+        for (const key of keys) {
+          if (map[key] === undefined) map[key] = [];
+          if ((primitive && properties) || !Object.prototype.hasOwnProperty.call(item, key)) map[key][i] = "";
+          else map[key][i] = _inspect(item[key]);
+        }
+      }
+    }
+    const keys = Object.keys(map);
+    const values = Object.values(map);
+    if (hasPrimitives) { keys.push(valuesKey); values.push(valuesKeyArray); }
+    keys.unshift(indexKey);
+    values.unshift(indexKeyArray);
+    return final(keys, values);
+  };
+  class Console { constructor(out) { const o = out && out.stdout ? out : { stdout: out }; Object.assign(this, G.console); const colorMode = o.colorMode === undefined ? "auto" : o.colorMode; const io = o.inspectOptions; const colorsFor = (s) => colorMode === "auto" ? !!(s && s.isTTY) : !!colorMode; const fmt = (s, a) => util.formatWithOptions(Object.assign({}, io, { colors: colorsFor(s) }), ...a) + "\n"; this.log = this.info = (...a) => { (o.stdout && o.stdout.write) ? o.stdout.write(fmt(o.stdout, a)) : G.console.log(...a); }; this.error = this.warn = (...a) => { (o.stderr && o.stderr.write) ? o.stderr.write(fmt(o.stderr, a)) : G.console.error(...a); }; this.table = (data, props) => consoleTableImpl((s) => this.log(s), Object.assign({}, io, { colors: colorsFor(o.stdout) }), data, props); } }
+  // console.clear() — node lib/internal/console/constructor.js: writes the
+  // terminal reset sequence when stdout is a TTY, and is a no-op otherwise.
+  if (typeof G.console.clear !== "function") {
+    G.console.clear = function clear() {
+      const out = G.process && G.process.stdout;
+      if (out && out.isTTY && typeof out.write === "function") out.write("\u001b[2J\u001b[0f");
+    };
+  }
   // console.write(...chunks) — raw (no newline/format) write to stdout, returns
   // bytes written. ref: bun src/js/builtins/ConsoleObject.ts write(): the private
   // "writer" slot lookup rejects a non-object `this` (surfaces as ERR_INVALID_THIS).
@@ -438,21 +559,31 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       get [Symbol.toStringTag]() { return "TextEncoder"; }
       get encoding() { return "utf-8"; }
       encode(str = "") {
-        str = String(str); const out = [];
+        str = String(str);
+        // Encode straight into a typed array. A plain-array `out.push(...)`
+        // stores through [[Set]], so a user-defined getter-only index accessor
+        // on Array.prototype (blob-array-fast-path.test.ts installs one) makes
+        // every encode() throw "Attempted to assign to readonly property".
+        // bun's encoder is native and never consults Array.prototype.
+        // Worst case is 3 bytes per UTF-16 code unit (a surrogate pair is 4
+        // bytes for 2 units), so this buffer can never overflow.
+        const out = new Uint8Array(str.length * 3);
+        let n = 0;
         for (let i = 0; i < str.length; i++) {
           let c = str.charCodeAt(i);
-          if (c < 0x80) out.push(c);
-          else if (c < 0x800) out.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));
+          if (c < 0x80) out[n++] = c;
+          else if (c < 0x800) { out[n++] = 0xc0 | (c >> 6); out[n++] = 0x80 | (c & 0x3f); }
           else if (c >= 0xd800 && c <= 0xdbff) {
             const trail = i + 1 < str.length ? str.charCodeAt(i + 1) : 0;
             if (trail >= 0xdc00 && trail <= 0xdfff) {
               const cp = 0x10000 + ((c - 0xd800) << 10) + (trail - 0xdc00); i++;
-              out.push(0xf0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3f), 0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f));
-            } else out.push(0xef, 0xbf, 0xbd);
-          } else if (c >= 0xdc00 && c <= 0xdfff) out.push(0xef, 0xbf, 0xbd);
-          else out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
+              out[n++] = 0xf0 | (cp >> 18); out[n++] = 0x80 | ((cp >> 12) & 0x3f);
+              out[n++] = 0x80 | ((cp >> 6) & 0x3f); out[n++] = 0x80 | (cp & 0x3f);
+            } else { out[n++] = 0xef; out[n++] = 0xbf; out[n++] = 0xbd; }
+          } else if (c >= 0xdc00 && c <= 0xdfff) { out[n++] = 0xef; out[n++] = 0xbf; out[n++] = 0xbd; }
+          else { out[n++] = 0xe0 | (c >> 12); out[n++] = 0x80 | ((c >> 6) & 0x3f); out[n++] = 0x80 | (c & 0x3f); }
         }
-        return new Uint8Array(out);
+        return out.slice(0, n);
       }
       encodeInto(str, dest) {
         str = String(str);
@@ -491,7 +622,13 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       constructor(enc, opts) {
         const key = String(enc === undefined ? "utf-8" : enc).toLowerCase().trim();
         this.encoding = ENC_ALIAS[key] || SB_ALIAS[key];
-        if (!this.encoding || this.encoding === "replacement") throw new RangeError("The encoding label provided ('" + enc + "') is invalid.");
+        // bun TextDecoder.rs:588-600 — an unknown/replacement label is a
+        // RangeError carrying code ERR_ENCODING_NOT_SUPPORTED.
+        if (!this.encoding || this.encoding === "replacement") {
+          const e = new RangeError("Unsupported encoding label \"" + enc + "\"");
+          e.code = "ERR_ENCODING_NOT_SUPPORTED";
+          throw e;
+        }
         if (opts !== undefined && (opts === null || typeof opts !== "object")) throw new TypeError("TextDecoder(options) is invalid");
         this.fatal = !!(opts && opts.fatal);
         if (opts && opts.ignoreBOM !== undefined && typeof opts.ignoreBOM !== "boolean") throw new TypeError("TextDecoder(options) ignoreBOM is invalid. Expected boolean value");
@@ -1271,21 +1408,61 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
         const b = this._b;
         if (this._stream && isStream(this._stream)) {
           const S = G.__mbunStreams;
-          if (kind === "text") return S.text(this._stream);
-          if (kind === "bytes") return S.bytes(this._stream);
-          if (kind === "arrayBuffer") return S.arrayBuffer(this._stream);
-          if (kind === "blob") return S.array(this._stream).then((cs) => new G.Blob(cs, { type: (this.headers.get && this.headers.get("content-type")) || "" }));
-          if (kind === "formData") return S.bytes(this._stream).then((u8) => formDataParseBody(u8, fdEncoding));
+          // Fully reading a body never releases the reader (fetch spec), so
+          // `body.locked` stays true after .text()/.arrayBuffer()/… — issue 07001.
+          if (S.retainLock) S.retainLock(this._stream);
+          let p;
+          if (kind === "text") p = S.text(this._stream);
+          else if (kind === "json") p = S.json(this._stream);
+          else if (kind === "bytes") p = S.bytes(this._stream);
+          else if (kind === "arrayBuffer") p = S.arrayBuffer(this._stream);
+          else if (kind === "blob") p = S.array(this._stream).then((cs) => new G.Blob(cs, { type: (this.headers.get && this.headers.get("content-type")) || "" }));
+          else if (kind === "formData") p = S.bytes(this._stream).then((u8) => formDataParseBody(u8, fdEncoding));
+          // Body.rs use_as_any_blob detaches the body's blob store, so the
+          // ByteBlobLoader behind `response.body` loses its store: a later
+          // `response.body.blob()/.text()/…` hits ByteBlobLoader.rs:237
+          // to_buffered_value with store == null and rejects with
+          // ERR_BODY_ALREADY_USED ("Body already used") rather than the
+          // stream-level "ReadableStream is locked". Mark the detach here (after
+          // the read is dispatched, so this very read still sees a live store).
+          if (p !== undefined) { if (S.detachBodyStore) S.detachBodyStore(this._stream); return p; }
         }
         // non-stream bodies
-        if (kind === "text") { if (b == null) return Promise.resolve(""); if (typeof b === "string") return Promise.resolve(b); if (b instanceof Uint8Array) return Promise.resolve(td.decode(b)); if (typeof b.text === "function") return b.text(); return Promise.resolve(String(b)); }
-        if (kind === "bytes") { if (b instanceof Uint8Array) return Promise.resolve(new Uint8Array(b)); if (b && b._u8) return Promise.resolve(new Uint8Array(b._u8)); return this._consume("text").then((t) => te.encode(t)); }
-        if (kind === "arrayBuffer") return this._consume("bytes").then((u8) => u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength));
+        // Body.rs materializations are capped by the synthetic allocation limit
+        // (see G.__mbunCheckAllocLimit); arrayBuffer() goes through "bytes" in
+        // bun too but ArrayBuffer is exempt there, so it re-reads without a cap.
+        if (kind === "text") { if (b == null) return Promise.resolve(""); if (typeof b === "string") return Promise.resolve(b); if (b instanceof Uint8Array) { G.__mbunCheckAllocLimit(b.length, "text"); return Promise.resolve(td.decode(b)); } if (typeof b.text === "function") return b.text(); return Promise.resolve(String(b)); }
+        // Body.rs:1884 get_json materializes through the SAME synthetic
+        // allocation limit as get_text, but reports the JSON-flavoured message
+        // ("Cannot parse a JSON string longer than 2^32-1 characters"). Routing
+        // json() through the "text" kind reported the string message instead.
+        if (kind === "json") {
+          let t;
+          if (b == null) t = Promise.resolve("");
+          else if (typeof b === "string") t = Promise.resolve(b);
+          else if (b instanceof Uint8Array) { G.__mbunCheckAllocLimit(b.length, "json"); t = Promise.resolve(td.decode(b)); }
+          else if (b && G.Blob && b instanceof G.Blob) { G.__mbunCheckAllocLimit(b.size, "json"); t = Promise.resolve(td.decode(b._u8)); }
+          else if (b && b._u8 instanceof Uint8Array) { G.__mbunCheckAllocLimit(b._u8.length, "json"); t = Promise.resolve(td.decode(b._u8)); }
+          else if (typeof b.text === "function") t = b.text();
+          else t = Promise.resolve(String(b));
+          return t.then((s) => JSON.parse(s));
+        }
+        // The cap is checked against the Blob's `size` (a plain number) BEFORE
+        // its bytes are touched — reading `_u8` first would join the whole
+        // part list, i.e. do the very allocation the limit exists to refuse.
+        if (kind === "bytes") { if (b instanceof Uint8Array) { G.__mbunCheckAllocLimit(b.length, "bytes"); return Promise.resolve(new Uint8Array(b)); } if (b && G.Blob && b instanceof G.Blob) { G.__mbunCheckAllocLimit(b.size, "bytes"); return Promise.resolve(new Uint8Array(b._u8)); } if (b && b._u8) { G.__mbunCheckAllocLimit(b._u8.length, "bytes"); return Promise.resolve(new Uint8Array(b._u8)); } return this._consume("text").then((t) => te.encode(t)); }
+        if (kind === "arrayBuffer") {
+          // Exempt from the allocation cap (bun: ArrayBuffer has no such limit),
+          // so it must not route through the capped "bytes" branch.
+          const u = b instanceof Uint8Array ? b : (b && b._u8 instanceof Uint8Array ? b._u8 : null);
+          if (u) return Promise.resolve(u.buffer.slice(u.byteOffset, u.byteOffset + u.byteLength));
+          return this._consume("bytes").then((u8) => u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength));
+        }
         if (kind === "blob") return Promise.resolve(b instanceof G.Blob ? b : new G.Blob([b == null ? "" : b], { type: (this.headers.get && this.headers.get("content-type")) || "" }));
         if (kind === "formData") return this._consume("bytes").then((u8) => formDataParseBody(u8, fdEncoding));
       }
       text() { return this._consume("text"); }
-      json() { return this._consume("text").then((t) => JSON.parse(t)); }
+      json() { return this._consume("json"); }
       arrayBuffer() { return this._consume("arrayBuffer"); }
       bytes() { return this._consume("bytes"); }
       blob() { return this._consume("blob"); }
@@ -1506,11 +1683,17 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       if (typeof sig === "string") { if (SIGMAP[sig] == null) { const e = new TypeError("signal must be one of 'SIGHUP', 'SIGINT', 'SIGQUIT', 'SIGILL', 'SIGTRAP', 'SIGABRT', 'SIGBUS', 'SIGFPE', 'SIGKILL', 'SIGUSR1', 'SIGSEGV', 'SIGUSR2', 'SIGPIPE', 'SIGALRM', 'SIGTERM', 'SIG16', 'SIGCHLD', 'SIGCONT', 'SIGSTOP', 'SIGTSTP', 'SIGTTIN', 'SIGTTOU', 'SIGURG', 'SIGXCPU', 'SIGXFSZ', 'SIGVTALRM', 'SIGPROF', 'SIGWINCH', 'SIGIO', 'SIGPWR' or 'SIGSYS'"); e.code = "ERR_INVALID_ARG_TYPE"; throw e; } return SIGMAP[sig]; }
       throw new TypeError("Invalid signal: " + String(sig));
     };
-    const makeBunReadable = () => {
+    // `onData(byteLength)` (optional) is the maxBuffer accounting hook: it runs
+    // for every chunk the io_tick pump delivers, so the byte budget is checked
+    // as bytes arrive rather than after the child has already flooded us.
+    const makeBunReadable = (onData) => {
       // Incremental readable driven by __mbun_io_tick: __data/__end wake every
       // pending waiter, so getReader().read() and for-await yield each chunk as
       // it arrives (duplex pipe protocols), while text()/bytes() wait for EOF.
-      const chunks = []; let ended = false; const waiters = [];
+      // `cursor` is the SHARED read position: a WHATWG stream is consumed once,
+      // so a getReader().read() and a later for-await must continue from where
+      // the previous consumer stopped rather than each replaying from chunk 0.
+      const chunks = []; let ended = false; let cursor = 0; const waiters = [];
       const wake = () => { while (waiters.length) waiters.shift()(); };
       const waitEvent = () => new Promise((r) => waiters.push(r));
       const whenDone = async () => { while (!ended) await waitEvent(); };
@@ -1518,16 +1701,34 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       const all = () => { let t = 0; for (const c of chunks) t += c.length; const o = new Uint8Array(t); let p = 0; for (const c of chunks) { o.set(c, p); p += c.length; } return o; };
       const body = () => whenDone().then(all);
       return {
-        __data: (bytes) => { chunks.push(bytes); wake(); },
+        __data: (bytes) => { chunks.push(bytes); wake(); if (onData) onData(bytes.length); },
         __end: () => { ended = true; wake(); },
         text: () => body().then((u) => td.decode(u)),
         bytes: () => body(),
         arrayBuffer: () => body().then((u) => u.buffer),
         blob: () => body().then((u) => new G.Blob([u])),
         json: () => body().then((u) => JSON.parse(td.decode(u))),
-        getReader() { let i = 0; return { read: () => nextChunk(i).then((c) => (c === undefined ? { value: undefined, done: true } : (i++, { value: c, done: false }))), releaseLock() {}, cancel() { return Promise.resolve(); }, closed: whenDone() }; },
-        pipeTo() { return whenDone(); }, cancel() { return Promise.resolve(); },
-        async *[Symbol.asyncIterator]() { let i = 0; for (;;) { const c = await nextChunk(i); if (c === undefined) return; i++; yield c; } },
+        getReader() { return { read: () => nextChunk(cursor).then((c) => (c === undefined ? { value: undefined, done: true } : (cursor++, { value: c, done: false }))), releaseLock() {}, cancel() { return Promise.resolve(); }, closed: whenDone() }; },
+        // pipeTo must really MOVE the bytes: it used to only await EOF, so
+        // `proc.stdout.pipeTo(new TextDecoderStream().writable)` silently
+        // produced an empty readable instead of the child's output.
+        async pipeTo(dest) {
+          const w = dest && typeof dest.getWriter === "function" ? dest.getWriter() : null;
+          try {
+            for (;;) {
+              const c = await nextChunk(cursor);
+              if (c === undefined) break;
+              cursor++;
+              if (w) await w.write(c);
+              else if (dest && typeof dest.write === "function") await dest.write(c);
+            }
+          } finally {
+            if (w) { try { await w.close(); } catch (e) {} try { w.releaseLock(); } catch (e) {} }
+            else if (dest && typeof dest.close === "function") { try { dest.close(); } catch (e) {} }
+          }
+        },
+        cancel() { return Promise.resolve(); },
+        async *[Symbol.asyncIterator]() { for (;;) { const c = await nextChunk(cursor); if (c === undefined) return; cursor++; yield c; } },
       };
     };
     const spawnAsyncBun = (cmd, opts) => {
@@ -1541,15 +1742,40 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       const h = PN.spawnEx(cmd[0], cmd, { cwd: opts.cwd ? toStr(opts.cwd) : undefined, env: opts.env && typeof opts.env === "object" ? opts.env : (G.process && G.process.env) || undefined, stdio });
       if (h.errno != null) { const code = ERRNO[h.errno] || ("errno " + h.errno); const e = new Error("spawn " + cmd[0] + " " + code); e.code = code; e.errno = -1; e.syscall = "spawn " + cmd[0]; throw e; }
       let exitResolve; const exitedP = new Promise((r) => (exitResolve = r));
-      const proc = { pid: h.pid, exitCode: null, signalCode: null, killed: false, exited: exitedP, ref() {}, unref() {}, resourceUsage() { return {}; } };
+      const proc = { pid: h.pid, exitCode: null, signalCode: null, killed: false, exited: exitedP, exitedDueToMaxBuffer: false, exitedDueToTimeout: false, ref() {}, unref() {}, resourceUsage() { return {}; } };
       const rec = { cp: null, pid: h.pid, outs: [], stdinFd: -1, stdinBuf: [], stdinEnded: false, stdinClosed: false, exited: false, closed: false, done: false, code: null, signal: null };
       rec.cp = { emit: (ev, code, signal) => {
         if (ev === "exit") { proc.exitCode = signal ? null : code; proc.signalCode = signal || null; }
         else if (ev === "close") { proc.exitCode = signal ? null : code; proc.signalCode = signal || null; exitResolve(proc.exitCode); }
       }, stdin: null };
       const fds = h.fds || [];
-      const outStd = stdio[1] === "pipe" && fds[1] >= 0 ? makeBunReadable() : null;
-      const errStd = stdio[2] === "pipe" && fds[2] >= 0 ? makeBunReadable() : null;
+      // maxBuffer: bun caps the TOTAL bytes buffered across stdout+stderr; on
+      // overflow it signals the child with `killSignal` and stops reading
+      // (killSignal 0 sends nothing, so the child dies of EPIPE instead).
+      // Without this a child that never stops writing (`yes`) grows the chunk
+      // list until the process is OOM-killed.
+      const killSig = opts.killSignal === undefined ? 15 : bunMapSig(opts.killSignal);
+      const maxBuffer = typeof opts.maxBuffer === "number" && isFinite(opts.maxBuffer) && opts.maxBuffer >= 0
+        ? opts.maxBuffer : Infinity;
+      let bufTotal = 0;
+      const stopReading = () => {
+        for (const o of rec.outs) {
+          if (o.ended) continue;
+          o.ended = true;
+          const fd = o.fd; o.fd = -1;
+          try { PN.close(fd); } catch (e) {}
+          if (o.stream) o.stream.__end();
+        }
+      };
+      const onOutBytes = maxBuffer === Infinity ? null : (n) => {
+        bufTotal += n;
+        if (proc.exitedDueToMaxBuffer || bufTotal <= maxBuffer) return;
+        proc.exitedDueToMaxBuffer = true;
+        if (killSig !== 0) { try { PN.kill(h.pid, killSig); } catch (e) {} }
+        stopReading();
+      };
+      const outStd = stdio[1] === "pipe" && fds[1] >= 0 ? makeBunReadable(onOutBytes) : null;
+      const errStd = stdio[2] === "pipe" && fds[2] >= 0 ? makeBunReadable(onOutBytes) : null;
       // Same O_NONBLOCK requirement as the child_process driver above: drainOut's
       // readNB loop must see EAGAIN, not park the JS thread on a blocking read.
       if (outStd) { PN.setNonBlock(fds[1]); rec.outs.push({ fd: fds[1], stream: outStd, ended: false }); }
@@ -1579,6 +1805,24 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       proc[Symbol.dispose] = function () { try { this.kill(); } catch (e) {} };
       proc[Symbol.asyncDispose] = function () { try { this.kill(); } catch (e) {} return exitedP; };
       CHILDREN.add(rec);
+      // `signal` (an AbortSignal): aborting it kills the child. bun wires this
+      // up at spawn time, so a signal that is ALREADY aborted kills the child
+      // immediately rather than leaving it running forever.
+      if (opts.signal) {
+        const abortKill = () => { try { PN.kill(h.pid, killSig === 0 ? 15 : killSig); } catch (e) {} proc.killed = true; };
+        if (opts.signal.aborted) abortKill();
+        else if (typeof opts.signal.addEventListener === "function") opts.signal.addEventListener("abort", abortKill, { once: true });
+      }
+      // `timeout` (ms) kills the child with `killSignal` once it elapses; an
+      // Infinite/absent timeout never fires. Cleared on exit so a reaped pid
+      // can never be signalled by a stale timer.
+      if (typeof opts.timeout === "number" && isFinite(opts.timeout) && opts.timeout > 0) {
+        const timer = G.setTimeout(() => {
+          proc.exitedDueToTimeout = true;
+          if (killSig !== 0) { try { PN.kill(h.pid, killSig); } catch (e) {} }
+        }, opts.timeout);
+        exitedP.then(() => { try { G.clearTimeout(timer); } catch (e) {} }, () => {});
+      }
       return proc;
     };
     // Bun.spawn({terminal}) — run the child under a pseudo-terminal (Bun.Terminal).
@@ -1626,8 +1870,19 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       CHILDREN.add(rec);
       return proc;
     };
+    // `signal` must be an AbortSignal; bun rejects anything else up front
+    // (js/bun/spawn/spawn-signal "AbortSignal args validation").
+    const validateSignalOpt = (sg) => {
+      if (sg === undefined || sg === null) return;
+      if (typeof sg !== "object" || typeof sg.addEventListener !== "function" || typeof sg.aborted !== "boolean") {
+        const e = new TypeError('The "signal" option must be an instance of AbortSignal. Received ' + (typeof sg === "object" ? "an instance of " + ((sg && sg.constructor && sg.constructor.name) || "Object") : typeof sg));
+        e.code = "ERR_INVALID_ARG_TYPE";
+        throw e;
+      }
+    };
     Bun.spawn = function (a, b) {
       const s = spawnArgs(a, b);
+      validateSignalOpt(s.opts.signal);
       if (s.opts.terminal && PN && PN.spawnPty) return spawnTerminal(s.cmd, s.opts);
       // stdin: "pipe" rides the fully async spawnEx/io_tick path too — the old
       // spawnPipes path drains stdout/stderr with BLOCKING reads, which parks
@@ -1670,16 +1925,38 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
         const n = Number(r.signal);
         out.signalCode = Number.isNaN(n) ? r.signal : (SIGNAMES[n] || n);
       }
+      // bun surfaces WHY a sync child stopped early; both are plain booleans on
+      // the result (js_bun_spawn_bindings.rs exited_due_to_maxbuf/timeout).
+      out.exitedDueToMaxBuffer = r.exitedDueToMaxBuffer === true;
+      out.exitedDueToTimeout = r.exitedDueToTimeout === true;
       return out;
     };
+    // `maxBuffer`/`timeout` accept Infinity to mean "no limit"; the native takes
+    // "absent" for that, so only finite positive numbers are forwarded.
+    const finiteLimit = (v) => (typeof v === "number" && isFinite(v) && v >= 0 ? v : undefined);
     Bun.spawnSync = function (a, b) {
       const s = spawnArgs(a, b);
+      validateSignalOpt(s.opts.signal);
+      // An AbortSignal on the SYNC path can only act as a deadline: nothing can
+      // run the JS timer that would fire it while the native blocks. An already
+      // aborted signal is a zero-length deadline; AbortSignal.timeout(ms)
+      // carries its instant on __mbunAbortAt (see markdown_web AbortSignal).
+      let signalDeadline;
+      if (s.opts.signal) {
+        if (s.opts.signal.aborted) signalDeadline = 0;
+        else if (typeof s.opts.signal.__mbunAbortAt === "number") signalDeadline = Math.max(0, s.opts.signal.__mbunAbortAt - Date.now());
+      }
       // Binary-safe path: byte payload on stdin, exact bytes back from stdout.
       if (PN && PN.spawnSyncB64) {
         const stdin = s.opts.stdin;
         const r = PN.spawnSyncB64(s.cmd[0], s.cmd.slice(1), {
           cwd: s.opts.cwd ? toStr(s.opts.cwd) : undefined,
           env: s.opts.env && typeof s.opts.env === "object" ? s.opts.env : undefined,
+          maxBuffer: finiteLimit(s.opts.maxBuffer),
+          timeoutMs: signalDeadline !== undefined
+            ? Math.min(signalDeadline, finiteLimit(s.opts.timeout) === undefined ? Infinity : s.opts.timeout)
+            : finiteLimit(s.opts.timeout),
+          killSignal: s.opts.killSignal === undefined ? undefined : bunMapSig(s.opts.killSignal),
           inputB64: stdin != null && typeof stdin !== "string" && typeof stdin === "object" && (ArrayBuffer.isView(stdin) || stdin instanceof ArrayBuffer) ? u8ToB64(stdin) : typeof stdin === "string" && stdin !== "pipe" && stdin !== "inherit" && stdin !== "ignore" ? u8ToB64(stdin) : undefined,
         });
         return syncResult(r, Buffer.from(b64ToU8(r.stdoutB64)), Buffer.from(b64ToU8(r.stderrB64)));
@@ -1712,6 +1989,39 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       };
       Bun.stdin = makeStdinBlob(Infinity);
     }
+    // Bun.stdout / Bun.stderr — write-only file handles over fd 1/2. bun exposes
+    // them as BunFile with a FileSink `.writer()` (write() returns the byte
+    // count, flush()/end() resolve it); writes go straight to the fd so binary
+    // payloads are not UTF-8 mangled.
+    if (PN && typeof Bun.stdout === "undefined") {
+      const makeStdioFile = (fd) => {
+        const toBytes = (chunk) =>
+          typeof chunk === "string" ? te.encode(chunk)
+            : (ArrayBuffer.isView(chunk) || chunk instanceof ArrayBuffer) ? anyToU8(chunk)
+            : te.encode(String(chunk));
+        const writeBytes = (chunk) => { const b = toBytes(chunk); if (b.length) PN.write(fd, u8ToB64(b)); return b.length; };
+        return {
+          get readable() { return false; },
+          get writable() { return true; },
+          size: Infinity,
+          type: "",
+          write(chunk) { return Promise.resolve(writeBytes(chunk)); },
+          writer() {
+            let written = 0;
+            return {
+              write(chunk) { const n = writeBytes(chunk); written += n; return n; },
+              // Unbuffered: every write already reached the fd, so a flush only
+              // reports what went through since the sink was created.
+              flush() { const n = written; written = 0; return n; },
+              end() { const n = written; written = 0; return n; },
+              start() {}, ref() {}, unref() {},
+            };
+          },
+        };
+      };
+      Bun.stdout = makeStdioFile(1);
+      Bun.stderr = makeStdioFile(2);
+    }
     // Binary process.stdout/.stderr writes (Buffers must not be UTF-8 mangled).
     if (PN && G.process) {
       for (const [name, fd] of [["stdout", 1], ["stderr", 2]]) {
@@ -1729,8 +2039,16 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       }
     }
     if (typeof Bun.write === "undefined") {
-      Bun.write = function (dest, data, opts) {
-        const target = toStr(dest && dest.name ? dest.name : dest);
+      // Bytes go out through the fd native, one source chunk at a time.
+      //
+      // The old body did `F.writeFile(target, data instanceof Uint8Array ?
+      // td.decode(data) : toStr(data))`: a Blob stringified to "[object Blob]"
+      // (and the reported byte count was 0), and every binary payload was
+      // round-tripped through a UTF-8 JS string, which both mangles non-UTF-8
+      // bytes and doubles peak memory. Writing the Blob's part list straight to
+      // the descriptor also means a >2 GiB blob never has to exist as one
+      // contiguous buffer (regression/issue/8254).
+      const writeChunks = function (target, chunks, opts) {
         // bun aligns: createPath defaults to true -> recursively create missing
         // parent dirs before writing; { createPath: false } skips (write then
         // fails with ENOENT if the parent dir is absent).
@@ -1740,9 +2058,48 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
             try { F.mkdir(dir, true); } catch (e) {}
           }
         }
-        F.writeFile(target,
-                    data instanceof Uint8Array ? td.decode(data) : toStr(data));
-        return Promise.resolve((data && data.length) || 0);
+        const FD = G.__mbunFdNative;
+        const fd = FD.open(target, "w", 0o666);
+        let total = 0;
+        try {
+          for (const c of chunks) {
+            let off = 0;
+            while (off < c.byteLength) {
+              const n = FD.write(fd, c, off, c.byteLength - off, -1);
+              if (!(n > 0)) break;
+              off += n;
+            }
+            total += off;
+          }
+        } finally { FD.close(fd); }
+        return total;
+      };
+      const isBlob = (v) => !!(v && G.Blob && v instanceof G.Blob);
+      // The source's byte chunks WITHOUT joining them: a Blob hands over its
+      // part list as-is.
+      const writeParts = (data) => {
+        if (data == null) return [];
+        if (typeof data === "string") return [te.encode(data)];
+        if (data instanceof Uint8Array) return [data];
+        if (ArrayBuffer.isView(data)) return [new Uint8Array(data.buffer, data.byteOffset, data.byteLength)];
+        if (data instanceof ArrayBuffer) return [new Uint8Array(data)];
+        if (Array.isArray(data)) { const out = []; for (const d of data) for (const c of writeParts(d)) out.push(c); return out; }
+        // A lazy Bun.file has an empty part list until its bytes are pulled, so
+        // fall through to `_u8` (which loads it) rather than writing nothing.
+        if (isBlob(data)) return data.__parts && data.__parts.length ? data.__parts : [data._u8];
+        if (data._u8 instanceof Uint8Array) return [data._u8];
+        return [te.encode(String(data))];
+      };
+      Bun.write = function (dest, data, opts) {
+        const target = toStr(dest && dest.name ? dest.name : dest);
+        // A Response/Request (or anything else async) is resolved to bytes first.
+        if (data && typeof data === "object" && !isBlob(data) && !Array.isArray(data) &&
+            !ArrayBuffer.isView(data) && !(data instanceof ArrayBuffer) &&
+            typeof data.arrayBuffer === "function") {
+          return Promise.resolve(data.arrayBuffer()).then((ab) => writeChunks(target, [new Uint8Array(ab)], opts));
+        }
+        try { return Promise.resolve(writeChunks(target, writeParts(data), opts)); }
+        catch (e) { return Promise.reject(e); }
       };
     }
     if (typeof Bun.sleep === "undefined") Bun.sleep = (ms) => new Promise((r) => G.setTimeout(r, +ms || 0));

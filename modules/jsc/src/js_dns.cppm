@@ -78,8 +78,15 @@ export constexpr std::string_view kDnsJS = R"JS(
     if (DN && DN.lookupService) DN.lookupService(String(address), port | 0, callback);
     else soon(() => callback({ error: "ENOTFOUND" }));
   };
-  const rawResolve = (host, type, callback) => {
-    if (DN && DN.resolve) DN.resolve(String(host), TYPE_CODES[type] | 0, callback);
+  // `servers` (a dns.Resolver's own nameserver list, "IP[:PORT]"/"[IPv6]:PORT"
+  // strings) plus its timeout/tries are threaded to the native record transport;
+  // absent/empty means /etc/resolv.conf + the transport defaults, which is what
+  // the module-level dns.resolve* uses. ref: runtime/dns.inc dnsn_resolve_cb.
+  const rawResolve = (host, type, callback, servers, timeout, tries) => {
+    if (DN && DN.resolve) DN.resolve(String(host), TYPE_CODES[type] | 0, callback,
+                                     servers && servers.length ? servers : undefined,
+                                     typeof timeout === "number" ? timeout : undefined,
+                                     typeof tries === "number" ? tries : undefined);
     else soon(() => callback({ error: "ENOTIMP" }));
   };
 
@@ -224,12 +231,14 @@ export constexpr std::string_view kDnsJS = R"JS(
     });
   });
 
-  const promiseRecord = (hostname, type, rr) => new Promise((resolve, reject) => {
+  // `res` (optional) is the dns.Resolver whose servers/timeout/tries this query
+  // must use; undefined for the module-level dns.resolve*.
+  const promiseRecord = (hostname, type, rr, res) => new Promise((resolve, reject) => {
     const host = String(hostname == null ? "" : hostname);
     rawResolve(host, type, (r) => {
       if (r && r.error) reject(nodeError(r.error, rr, host));
       else resolve(r);
-    });
+    }, res && res._serverText, res && res._timeout, res && res._tries);
   });
 
   const promiseReverse = (ip) => new Promise((resolve, reject) => {
@@ -276,6 +285,123 @@ export constexpr std::string_view kDnsJS = R"JS(
   };
   const getResultOrder_ = () => defaultResultOrder_;
 
+  // ── dns.Resolver / dns.promises.Resolver ──────────────────────────────────
+  // An independent resolver: its own nameserver list plus timeout/tries, which
+  // ride along to the native RFC 1035 transport (rawResolve's extra arguments).
+  // Blueprint: node lib/internal/dns/utils.js (ResolverBase: setServers parsing
+  // + ERR_INVALID_IP_ADDRESS, getServers echoing "IP" or "IP:PORT") and
+  // lib/dns.js (the resolve* method table). bun keeps the same surface over
+  // c-ares (src/runtime/dns_jsc/dns.rs Resolver).
+  const invalidIPError = (value) => {
+    const e = new TypeError("Invalid IP address: " + value);
+    e.code = "ERR_INVALID_IP_ADDRESS";
+    return e;
+  };
+  // "1.2.3.4" | "1.2.3.4:5353" | "[::1]:5353" | "::1" → validated, echoed back
+  // verbatim (getServers returns what was set).
+  const parseServerEntry = (entry) => {
+    if (typeof entry !== "string") throw invalidIPError(entry);
+    let host = entry;
+    if (host.charCodeAt(0) === 91 /* [ */) {
+      const close = host.indexOf("]");
+      if (close === -1) throw invalidIPError(entry);
+      const rest = host.slice(close + 1);
+      host = host.slice(1, close);
+      if (rest !== "" && !(rest.charCodeAt(0) === 58 /* : */ && Number.isInteger(Number(rest.slice(1)))))
+        throw invalidIPError(entry);
+    } else {
+      const colon = host.lastIndexOf(":");
+      // One colon → IPv4:port; several → a bare IPv6 literal.
+      if (colon !== -1 && host.indexOf(":") === colon) host = host.slice(0, colon);
+    }
+    if (isIP(host) === 0) throw invalidIPError(entry);
+    return entry;
+  };
+  const RESOLVE_METHODS = {
+    resolveAny: ["ANY", "queryAny"], resolveCname: ["CNAME", "queryCname"],
+    resolveCaa: ["CAA", "queryCaa"], resolveMx: ["MX", "queryMx"],
+    resolveNs: ["NS", "queryNs"], resolvePtr: ["PTR", "queryPtr"],
+    resolveSoa: ["SOA", "querySoa"], resolveSrv: ["SRV", "querySrv"],
+    resolveTxt: ["TXT", "queryTxt"], resolveNaptr: ["NAPTR", "queryNaptr"],
+  };
+  // in-addr.arpa / ip6.arpa name for a PTR query — a Resolver's reverse() must
+  // go to ITS nameservers, so it cannot use the getnameinfo path.
+  const arpaName = (ip) => {
+    if (isIP(ip) === 4) return ip.split(".").reverse().join(".") + ".in-addr.arpa";
+    // Expand the IPv6 literal to 32 nibbles, reversed (RFC 3596 2.5).
+    const parts = ip.split("::");
+    const head = parts[0] ? parts[0].split(":") : [];
+    const tail = parts.length > 1 && parts[1] ? parts[1].split(":") : [];
+    const groups = head.concat(new Array(8 - head.length - tail.length).fill("0"), tail);
+    const nibbles = groups.map((g) => g.padStart(4, "0")).join("");
+    return nibbles.split("").reverse().join(".") + ".ip6.arpa";
+  };
+  const makeResolverClass = (promiseStyle) => {
+    // A promise-style method returns the promise; a callback-style one takes the
+    // node (err, result) callback as its last argument and returns undefined.
+    const adapt = (fn) => promiseStyle
+      ? fn
+      : function (...a) {
+          const cb = a[a.length - 1];
+          if (typeof cb !== "function") throw new TypeError('The "callback" argument must be of type function.');
+          fn.apply(this, a.slice(0, -1)).then((v) => cb(null, v), (e) => cb(e));
+          return undefined;
+        };
+    class Resolver {
+      constructor(options) {
+        const o = options && typeof options === "object" ? options : {};
+        const hide = (name, value) =>
+          Object.defineProperty(this, name, { value, writable: true, enumerable: false, configurable: true });
+        hide("_serverText", []);
+        // node's defaults: timeout -1 ("use the c-ares default") and 4 tries.
+        hide("_timeout", typeof o.timeout === "number" ? o.timeout : -1);
+        hide("_tries", typeof o.tries === "number" ? o.tries : 4);
+      }
+      getServers() { return this._serverText.length ? this._serverText.slice() : getServers_(); }
+      setServers(list) {
+        if (!Array.isArray(list)) {
+          const e = new TypeError('The "servers" argument must be an instance of Array.');
+          e.code = "ERR_INVALID_ARG_TYPE";
+          throw e;
+        }
+        this._serverText = list.map(parseServerEntry);
+      }
+      // DEFERRED: in-flight native queries run on the resolver worker and are not
+      // interruptible, so cancel() cannot abort them; it is a no-op rather than a
+      // lie about having cancelled.
+      cancel() {}
+      setLocalAddress() {}
+    }
+    const proto = Resolver.prototype;
+    for (const name of Object.keys(RESOLVE_METHODS)) {
+      const type = RESOLVE_METHODS[name][0], rr = RESOLVE_METHODS[name][1];
+      proto[name] = adapt(function (hostname) { return promiseRecord(hostname, type, rr, this); });
+    }
+    const addresses = (self, hostname, family, rr, options) =>
+      promiseRecord(hostname, family === 6 ? "AAAA" : "A", rr, self).then(
+        (rows) => (options && options.ttl ? rows : rows.map((row) => (row && row.address !== undefined ? row.address : row))));
+    proto.resolve4 = adapt(function (hostname, options) { return addresses(this, hostname, 4, "queryA", options); });
+    proto.resolve6 = adapt(function (hostname, options) { return addresses(this, hostname, 6, "queryAaaa", options); });
+    proto.resolve = adapt(function (hostname, rrtype) {
+      const t = (rrtype == null ? "A" : String(rrtype));
+      if (t === "A") return addresses(this, hostname, 4, "queryA");
+      if (t === "AAAA") return addresses(this, hostname, 6, "queryAaaa");
+      if (RECORD_TYPES.indexOf(t) === -1)
+        return Promise.reject(nodeError("EBADQUERY", "query" + t, String(hostname == null ? "" : hostname)));
+      return promiseRecord(hostname, t, "query" + t[0] + t.slice(1).toLowerCase(), this);
+    });
+    proto.reverse = adapt(function (ip) {
+      const address = String(ip);
+      if (isIP(address) === 0) return Promise.reject(nodeError("EINVAL", "getHostByAddr", address));
+      // No custom servers → the OS reverse path (getnameinfo), same as dns.reverse.
+      if (this._serverText.length === 0) return promiseReverse(address);
+      return promiseRecord(arpaName(address), "PTR", "getHostByAddr", this);
+    });
+    return Resolver;
+  };
+  const Resolver = makeResolverClass(false);
+  const PromiseResolver = makeResolverClass(true);
+
   const dnsPromises = {
     lookup: promiseLookup,
     lookupService: promiseLookupService,
@@ -297,7 +423,7 @@ export constexpr std::string_view kDnsJS = R"JS(
     setServers: () => {},
     setDefaultResultOrder: setResultOrder_,
     getDefaultResultOrder: getResultOrder_,
-    Resolver: class Resolver {},
+    Resolver: PromiseResolver,
   };
 
   // ── node:dns (callback style) — wraps the promise layer, links promisify ────
@@ -339,7 +465,7 @@ export constexpr std::string_view kDnsJS = R"JS(
     setDefaultResultOrder: setResultOrder_,
     getDefaultResultOrder: getResultOrder_,
     lookupService_: undefined,
-    Resolver: class Resolver {},
+    Resolver,
     promises: dnsPromises,
     ADDRCONFIG: 1024, V4MAPPED: 2048, ALL: 256,
     // node:dns error-code constants (subset used by tests / real callers).

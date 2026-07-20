@@ -106,8 +106,49 @@ inline constexpr std::string_view HARNESS = R"JS(
   const S = { root: root, current: root,
               pass: 0, fail: 0, skip: 0, expectCalls: 0, total: 0, out: [], customMatchers: {},
               timeoutReject: null, errors: [], asyncErr: undefined, todo: 0, pendingAsserts: [],
-              sysTime: null, skippedLabel: 0 };
+              sysTime: null, skippedLabel: 0, onlyTests: 0, onlyScopes: 0 };
   G.__mbunState = S;
+  // ── CI detection (`.only` is refused in CI) ────────────────────────────────
+  // PORT-SOURCE: bun src/cli/ci_info.rs:23-34 `is_ci_uncached` /
+  // `detect_uncached`, plus src/cli/mod.rs:39-49 `is_ci_uncached_generated`.
+  //   is_ci = CI(env, as boolean) ?? <generic vars set> || <vendor detected>
+  // and `detect_ci_name()` short-circuits to None when CI parses as false, so
+  // `CI=false` overrides even GITHUB_ACTIONS=true. Boolean parsing is bun's
+  // env_var.rs:364 `string_is_truthy` (falsy: "", "0", "false", "no", "off").
+  function __mbunEnvBool(v) {
+    if (v === undefined || v === null) return null;
+    const s = String(v).toLowerCase();
+    return !(s === "" || s === "0" || s === "false" || s === "no" || s === "off");
+  }
+  // Generic markers (cli/mod.rs:39) and the vendor variables of watson/ci-info
+  // that the corpus exercises; a vendor hit alone is enough (detect_ci_name).
+  const __MBUN_CI_GENERIC = ["BUILD_ID", "BUILD_NUMBER", "CI", "CI_APP_ID", "CI_BUILD_ID",
+                             "CI_BUILD_NUMBER", "CI_NAME", "CONTINUOUS_INTEGRATION", "RUN_ID"];
+  const __MBUN_CI_VENDOR = ["GITHUB_ACTIONS", "GITLAB_CI", "CIRCLECI", "TRAVIS", "BUILDKITE",
+                            "JENKINS_URL", "TEAMCITY_VERSION", "APPVEYOR", "DRONE", "TF_BUILD",
+                            "CODEBUILD_BUILD_ARN", "BITBUCKET_COMMIT", "SEMAPHORE", "NETLIFY",
+                            "VERCEL", "HEROKU_TEST_RUN_ID", "bamboo_planKey", "WERCKER",
+                            "MAGNUM", "SAILCI", "SCREWDRIVER", "CIRRUS_CI", "NOW_BUILDER"];
+  function __mbunIsCI() {
+    const e = (typeof process !== "undefined" && process.env) || {};
+    const explicit = __mbunEnvBool(e.CI);
+    // detect_uncached(): `CI=false` disables every vendor probe.
+    // cli/mod.rs:21 `env_set!` is presence, not truthiness.
+    const vendor = explicit === false
+      ? false
+      : __MBUN_CI_VENDOR.some((k) => e[k] !== undefined);
+    if (explicit !== null) return explicit || vendor;
+    return __MBUN_CI_GENERIC.some((k) => e[k] !== undefined) || vendor;
+  }
+  // ScopeFunctions.rs:511-521 `error_in_ci` — the message is asserted verbatim
+  // by test/js/bun/test/ci-restrictions.test.ts.
+  function __mbunErrorInCI(signature) {
+    if (__mbunIsCI()) {
+      throw new Error(signature + " is disabled in CI environments to prevent accidentally " +
+                      "skipping tests. To override, set the environment variable CI=false.");
+    }
+  }
+  G.__mbunIsCI = __mbunIsCI;
   // Attribute errors thrown from queueMicrotask/process.nextTick callbacks to the
   // currently-running test (bun: an async exception while a test is in flight
   // fails that test). Wrapped ONCE per process — the wrappers read the live state
@@ -147,7 +188,15 @@ inline constexpr std::string_view HARNESS = R"JS(
     if (v instanceof Date) return v.toISOString();   // bun pretty-format: unquoted ISO string
     if (v instanceof RegExp) return String(v);
     if (Array.isArray(v)) { if (v.length === 0) return "[]"; return "[\n" + v.map((x) => ni + snapSerialize(x, ni) + ",").join("\n") + "\n" + indent + "]"; }
-    if (typeof v === "object") { const ks = Object.keys(v).sort(); if (ks.length === 0) return "{}"; return "{\n" + ks.map((k) => ni + "\"" + k + "\": " + snapSerialize(v[k], ni) + ",").join("\n") + "\n" + indent + "}"; }
+    // pretty-format tags a class instance with its constructor name ("Node {…}");
+    // a plain object (or a null-prototype one) stays bare. ref: regression 17766.
+    if (typeof v === "object") {
+      const ctor = v.constructor;
+      const tag = (ctor && ctor !== Object && typeof ctor.name === "string" && ctor.name) ? ctor.name + " " : "";
+      const ks = Object.keys(v).sort();
+      if (ks.length === 0) return tag + "{}";
+      return tag + "{\n" + ks.map((k) => ni + "\"" + k + "\": " + snapSerialize(v[k], ni) + ",").join("\n") + "\n" + indent + "}";
+    }
     return String(v);
   }
 
@@ -174,6 +223,9 @@ inline constexpr std::string_view HARNESS = R"JS(
   // bun/jest toEqual semantics: undefined-valued own keys are ignored (strictKeys
   //=false); toStrictEqual keeps them and compares prototypes. Cycle-safe via a
   // visited-pair map. Date/RegExp/Error/Map/Set/TypedArray/ArrayBuffer aware.
+  // Sentinel for an array slot that carries no data value (hole, accessor, or
+  // an index past the end) — bun's getIndexWithoutAccessors "empty".
+  const HOLE = { __mbunArrayHole: true };
   function deepEqualImpl(a, b, strictKeys, seen) {
     // asymmetric matcher on either side (expect.any / objectContaining / …)
     if (isAsym(b)) return b.match(a);
@@ -222,6 +274,34 @@ inline constexpr std::string_view HARNESS = R"JS(
         return true;
       }
       if (strictKeys && Object.getPrototypeOf(a) !== Object.getPrototypeOf(b)) return false;
+      // Arrays compare by index + length ONLY. bun's Bun__deepEquals
+      // (bindings.cpp) walks the array branch reading slots with
+      // getIndexWithoutAccessors — a hole, an out-of-range index and an accessor
+      // slot are all "empty" and none of them is `undefined` — and then
+      // enumerates own property names with PropertyNameMode::Symbols, so
+      // string-keyed extras are never compared. That is what makes
+      // expect(/x/.exec(s)).toEqual(["x"]) pass despite the match array's own
+      // `index`/`input`/`groups` (issue 15314).
+      if (Array.isArray(a) && Array.isArray(b)) {
+        const slot = (o, i) => {
+          const d = Object.getOwnPropertyDescriptor(o, i);
+          return (d === undefined || !("value" in d)) ? HOLE : d.value;
+        };
+        if (strictKeys && a.length !== b.length) return false;
+        const n = Math.max(a.length, b.length);
+        for (let i = 0; i < n; i++) {
+          const av = slot(a, i), bv = slot(b, i);
+          if (strictKeys) {
+            if ((av === HOLE) !== (bv === HOLE)) return false;
+            if (av === HOLE) continue;
+          } else if ((av === HOLE || bv === HOLE) && (av === undefined || bv === undefined)) {
+            continue;   // empty-vs-undefined is equal in the loose comparison
+          }
+          if (!deepEqualImpl(av === HOLE ? undefined : av, bv === HOLE ? undefined : bv,
+                             strictKeys, seen)) return false;
+        }
+        return true;
+      }
       const keep = (o) => (k) => strictKeys || o[k] !== undefined;
       const ak = Object.keys(a).filter(keep(a)), bk = Object.keys(b).filter(keep(b));
       if (ak.length !== bk.length) return false;
@@ -236,13 +316,21 @@ inline constexpr std::string_view HARNESS = R"JS(
   function deepEqualStrict(a, b) { return deepEqualImpl(a, b, true, new Map()); }
   function assertionError(msg) { const e = new Error(msg); e.name = "AssertionError"; return e; }
 
-  function makeMatchers(received, isNot) {
+  // `expect(received, label)` (bun expect.rs custom_label): the label REPLACES the
+  // matcher hint line of the failure message ("lol!\n\nExpected: ...").
+  function makeMatchers(received, isNot, label) {
     // The message is a thunk: bun/jest only format on failure. Building it eagerly
     // walked the whole received value on every passing assertion — a 40MB body
     // (Bun.file of a video) took minutes.
     function check(pass, message) {
       if (isNot) pass = !pass;
-      if (!pass) throw assertionError(typeof message === "function" ? message() : message);
+      if (pass) return;
+      let msg = typeof message === "function" ? message() : message;
+      if (typeof label === "string" && label.length > 0) {
+        const sep = msg.indexOf("\n\n");
+        msg = label + (sep === -1 ? "\n\n" + msg : msg.slice(sep));
+      }
+      throw assertionError(msg);
     }
     const m = {
       toBe(x) { check(Object.is(received, x), () => "expect(received).toBe(expected)\n\nExpected: " + fmt(x) + "\nReceived: " + fmt(received)); return m; },
@@ -265,7 +353,30 @@ inline constexpr std::string_view HARNESS = R"JS(
         if (typeof received === "string") ok = received.indexOf(x) !== -1;
         else if (received && typeof received.length === "number") ok = Array.prototype.indexOf.call(received, x) !== -1;
         check(ok, () => "expect(received).toContain(" + fmt(x) + ")\n\nReceived: " + fmt(received)); return m; },
-      toHaveLength(n) { check(received != null && received.length === n, () => "expect(received).toHaveLength(" + fmt(n) + ")\n\nReceived length: " + (received == null ? "n/a" : received.length)); return m; },
+      // bun JSC__JSValue__getLengthIfPropertyExistsInternal (bindings.cpp:2404):
+      // toHaveLength reads a TYPE-specific length before falling back to the
+      // `length` property — byteLength for ArrayBuffer/DataView, size for
+      // Map/Set/WeakMap/Blob/Headers. `Bun.file(p).arrayBuffer()` hands back an
+      // ArrayBuffer, which has no `.length` at all.
+      toHaveLength(n) {
+        const lengthOf = (v) => {
+          if (v == null) return undefined;
+          if (typeof v === "string") return v.length;
+          if (typeof v.length === "number") return v.length;
+          if (typeof G.ArrayBuffer === "function" && v instanceof G.ArrayBuffer) return v.byteLength;
+          if (typeof G.SharedArrayBuffer === "function" && v instanceof G.SharedArrayBuffer) return v.byteLength;
+          if (typeof G.DataView === "function" && v instanceof G.DataView) return v.byteLength;
+          if (typeof v.size === "number" &&
+              ((typeof G.Map === "function" && v instanceof G.Map) ||
+               (typeof G.Set === "function" && v instanceof G.Set) ||
+               (typeof G.WeakMap === "function" && v instanceof G.WeakMap) ||
+               (typeof G.WeakSet === "function" && v instanceof G.WeakSet) ||
+               (typeof G.Blob === "function" && v instanceof G.Blob) ||
+               (typeof G.Headers === "function" && v instanceof G.Headers))) return v.size;
+          return v.length;
+        };
+        const len = lengthOf(received);
+        check(received != null && len === n, () => "expect(received).toHaveLength(" + fmt(n) + ")\n\nReceived length: " + (received == null ? "n/a" : len)); return m; },
       toMatch(re) { const rx = (re instanceof RegExp) ? re : new RegExp(re);
         check(typeof received === "string" && rx.test(received), () => "expect(received).toMatch(" + fmt(re) + ")\n\nReceived: " + fmt(received)); return m; },
       toThrow(x) { throwMatcher(received, isNot, x); return m; },
@@ -307,11 +418,18 @@ inline constexpr std::string_view HARNESS = R"JS(
         let cur = received, ok = true; for (const k of path) { if (cur == null || !(k in Object(cur))) { ok = false; break; } cur = cur[k]; }
         if (ok && arguments.length > 1) ok = deepEqual(cur, val);
         check(ok, () => "toHaveProperty(" + fmt(key) + ")\n\nReceived: " + fmt(received)); return m; },
-      toMatchObject(obj) { const sub = (a, b) => { if (isAsym(b)) return b.match(a); if (typeof b !== "object" || b === null) return deepEqual(a, b); if (a == null) return false;
-          for (const k of Object.keys(b)) { if (!sub(a[k], b[k])) return false; } return true; };
+      toMatchObject(obj) { const sub = (a, b, seen) => {
+          // Identity first (jest/bun `equals` does the same): a self-referential
+          // graph such as a MessageChannel port pair (port._other._other ===
+          // port) otherwise recurses until the stack overflows.
+          if (a === b) return true;
+          if (isAsym(b)) return b.match(a); if (typeof b !== "object" || b === null) return deepEqual(a, b); if (a == null) return false;
+          let s = seen.get(a); if (s === undefined) seen.set(a, (s = new Set()));
+          if (s.has(b)) return true; s.add(b);
+          for (const k of Object.keys(b)) { if (!sub(a[k], b[k], seen)) return false; } return true; };
         // bun quirk (bug-compatible): a top-level asymmetric matcher (e.g.
         // expect.objectContaining(...)) is NOT applied — any object passes.
-        const pass = isAsym(obj) ? received !== null && typeof received === "object" : sub(received, obj);
+        const pass = isAsym(obj) ? received !== null && typeof received === "object" : sub(received, obj, new Map());
         check(pass, () => "toMatchObject(" + fmt(obj) + ")\n\nReceived: " + fmt(received)); return m; },
       toBeOneOf(list) { let ok = false; for (const x of list) if (deepEqual(received, x)) { ok = true; break; }
         check(ok, () => "toBeOneOf\n\nReceived: " + fmt(received)); return m; },
@@ -379,8 +497,8 @@ inline constexpr std::string_view HARNESS = R"JS(
         if (expectedStdout !== undefined) check((r.stdout ? r.stdout.toString() : "") === expectedStdout, () => "toRun stdout mismatch"); return m;
       },
       // async matchers on a promise
-      get resolves() { return makeAsyncMatchers(received, isNot, false); },
-      get rejects() { return makeAsyncMatchers(received, isNot, true); },
+      get resolves() { return makeAsyncMatchers(received, isNot, false, label); },
+      get rejects() { return makeAsyncMatchers(received, isNot, true, label); },
     };
     // Custom matchers registered via expect.extend({ name(received, ...args) {...} }).
     for (const name of Object.keys(S.customMatchers)) {
@@ -392,10 +510,10 @@ inline constexpr std::string_view HARNESS = R"JS(
         return m;
       };
     }
-    Object.defineProperty(m, "not", { get() { return makeMatchers(received, !isNot); } });
+    Object.defineProperty(m, "not", { get() { return makeMatchers(received, !isNot, label); } });
     return m;
   }
-  function makeAsyncMatchers(promise, isNot, wantReject) {
+  function makeAsyncMatchers(promise, isNot, wantReject, label) {
     const build = (fnName) => async function (...a) {
       let val, threw = false, err;
       try { val = await promise; } catch (e) { threw = true; err = e; }
@@ -413,10 +531,10 @@ inline constexpr std::string_view HARNESS = R"JS(
           if (!pass) throw assertionError("expect(promise).rejects.toThrow\n\nReceived message: " + msg);
           return;
         }
-        return makeMatchers(err, isNot)[fnName](...a);
+        return makeMatchers(err, isNot, label)[fnName](...a);
       } else {
         if (threw) throw err;
-        return makeMatchers(val, isNot)[fnName](...a);
+        return makeMatchers(val, isNot, label)[fnName](...a);
       }
     };
     return new Proxy({}, { get(_, prop) { return build(prop); } });
@@ -462,7 +580,7 @@ inline constexpr std::string_view HARNESS = R"JS(
     }
     evalThrow(threw, err, isNot, expected);
   }
-  function expect(received) { S.expectCalls++; return makeMatchers(received, false); }
+  function expect(received, label) { S.expectCalls++; return makeMatchers(received, false, typeof label === "string" ? label : undefined); }
   expect.unreachable = function (msg) {
     if (msg instanceof Error) throw msg;
     throw new Error(msg === undefined ? "reached unreachable code" : String(msg));
@@ -531,21 +649,38 @@ inline constexpr std::string_view HARNESS = R"JS(
     if (typeof fn !== "function" && typeof name === "function") { fn = name; name = ""; }
     const scope = makeScope(describeLabel(name), S.current);
     scope.skipped = (S.skipDepth || 0) > 0;
+    scope.todo = (S.todoDepth || 0) > 0;
     S.current.items.push({ type: "scope", scope: scope });
-    const prev = S.current; S.current = scope;
-    try { if (typeof fn === "function") fn(); }
-    catch (e) {
-      // bun (Collection.zig): a throw in a describe callback drops the scope —
-      // tests already enqueued in it never run — and is reported as a file-level
-      // error; siblings registered before/after still run.
+    // bun (Collection.zig): a throw in a describe callback drops the scope —
+    // tests already enqueued in it never run — and is reported as a file-level
+    // error; siblings registered before/after still run.
+    function dropScope(e) {
       scope.items.length = 0;
       scope.beforeAll.length = 0; scope.afterAll.length = 0;
       scope.beforeEach.length = 0; scope.afterEach.length = 0;
       S.errors.push((e && e.message !== undefined) ? String(e.message) : String(e));
     }
+    const prev = S.current; S.current = scope;
+    let ret;
+    try { if (typeof fn === "function") ret = fn(); }
+    catch (e) { dropScope(e); }
     finally { S.current = prev; }
+    // An async describe body registers its tests *after* an await and reports
+    // failure as a rejected promise, not a throw. Collection is a synchronous
+    // eval, so without tracking neither ever reaches the runner: the scope keeps
+    // only what was registered before the first await — usually nothing — and
+    // the file reports "0 tests" with a clean exit and no error anywhere
+    // (js/bun/util/mmap.test.js awaits gcTick(), a Bun.sleep(0) timer, and
+    // silently lost all 4 of its tests that way). The counter lets the host
+    // pump the event loop until every body settles; bun's Collection phase is
+    // async for the same reason.
+    if (ret && typeof ret.then === "function") {
+      G.__mbun_describe_pending = (G.__mbun_describe_pending || 0) + 1;
+      const settle = () => { G.__mbun_describe_pending -= 1; };
+      ret.then(settle, (e) => { dropScope(e); settle(); });
+    }
   }
-  function makeTest(mode) {
+  function makeTest(mode, only) {
     // Supports test(name, fn) and test(name, options, fn) (the options object —
     // e.g. { timeout, retry } — is recorded but its knobs beyond selection are
     // not yet honored). fn is whichever argument is a function.
@@ -561,7 +696,16 @@ inline constexpr std::string_view HARNESS = R"JS(
       }
       // bun throws at REGISTRATION when a runnable test has no body (todo/skip may omit it).
       if (fn === undefined && mode !== "todo" && mode !== "skip") throw new TypeError("test() expects a function");
-      S.current.items.push({ type: "test", name: String(name), fn: fn, opts: opts, mode: (S.skipDepth > 0 ? "skip" : mode) });
+      // .only narrows the run set; a todo-depth describe turns its runnable
+      // tests into todos. The two are independent and both apply here.
+      // ScopeFunctions.rs:506-508 — a focused registrar is refused in CI before
+      // the scope config is even extended.
+      if (only) __mbunErrorInCI(".only");
+      const isOnly = !!only && !(S.skipDepth > 0);
+      if (isOnly) S.onlyTests++;
+      S.current.items.push({ type: "test", name: String(name), fn: fn, opts: opts, only: isOnly,
+                             mode: (S.skipDepth > 0 ? "skip"
+                                    : ((S.todoDepth > 0 && mode === "run") ? "todo" : mode)) });
     };
   }
   // %s/%d/%i/%o placeholder + %# index interpolation for test.each/describe.each.
@@ -593,11 +737,15 @@ inline constexpr std::string_view HARNESS = R"JS(
       bound.skip = eachRegistrar(() => makeTest("skip"), table);
       bound.todo = eachRegistrar(() => makeTest("todo"), table);
       bound.failing = eachRegistrar(() => makeTest("failing"), table);
-      bound.only = bound;
+      bound.only = eachRegistrar(() => makeTest("run", true), table);
       return bound;
     };
   }
   function skipScope(name, fn) { S.skipDepth = (S.skipDepth || 0) + 1; try { describe(name, fn); } finally { S.skipDepth--; } }
+  // describe.todo marks every runnable test inside as todo (bun: the scope is
+  // NOT skipped — under --todo its tests execute, and a passing one fails with
+  // "marked as todo but passes"; without --todo they report as `(todo)`).
+  function todoScope(name, fn) { S.todoDepth = (S.todoDepth || 0) + 1; try { describe(name, fn); } finally { S.todoDepth--; } }
 
   // Decorate a test() function with the full modifier chain (.skip/.todo/.only/
   // .failing/.concurrent + .each on each + .skipIf/.todoIf/.failingIf/.if, each of
@@ -609,7 +757,11 @@ inline constexpr std::string_view HARNESS = R"JS(
     fn.skip = makeTest("skip"); fn.skip.each = makeEach(() => makeTest("skip"));
     fn.todo = makeTest("todo"); fn.todo.each = makeEach(() => makeTest("todo"));
     fn.failing = makeTest("failing"); fn.failing.each = makeEach(() => makeTest("failing"));
-    fn.only = fn;                       // `.only` filtering DEFERRED → runs
+    // `.only`: a lazy memoized getter, like `.concurrent` below — decorating
+    // eagerly would recurse forever since the decorated child defines its own
+    // `.only`. Registration only TAGS the item; the pruning happens once the
+    // whole file has been collected (see pruneToOnly).
+    Object.defineProperty(fn, "only", { configurable: true, get() { const o = decorate(makeTest(mode, true), mode); Object.defineProperty(fn, "only", { value: o, configurable: true }); return o; } });
     fn.each = makeEach(() => makeTest(mode));
     fn.skipIf = (c) => decorate(makeTest(c ? "skip" : mode), c ? "skip" : mode);
     fn.todoIf = (c) => decorate(makeTest(c ? "todo" : mode), c ? "todo" : mode);
@@ -627,13 +779,28 @@ inline constexpr std::string_view HARNESS = R"JS(
   const test = decorate(makeTest("run"), "run");
   const it = test;
 
-  describe.skip = skipScope; describe.only = describe; describe.todo = skipScope;
+  // describe.only tags the scope it just created; a focused describe only
+  // decides the run set when the file has no focused TEST (bun/jest: a
+  // `test.only` anywhere narrows the run to exactly that test, even inside a
+  // `describe.only` — test/js/bun/test/only-inside-only.fixture.ts).
+  function onlyScope(name, fn) {
+    __mbunErrorInCI(".only");
+    const at = S.current.items.length;
+    describe(name, fn);
+    const entry = S.current.items[at];
+    if (entry && entry.type === "scope") { entry.scope.only = true; S.onlyScopes++; }
+  }
+  describe.skip = skipScope; describe.only = onlyScope; describe.todo = todoScope;
   describe.concurrent = describe;       // concurrency DEFERRED → serial
   describe.serial = describe;           // serial is already the execution model
   describe.each = function (table) { return function (name, fn) { (Array.isArray(table) ? table : []).forEach((row, idx) => { const args = Array.isArray(row) ? row : [row]; describe(interpName(name, args, idx), function () { return fn.apply(null, args); }); }); }; };
   describe.skipIf = (c) => (c ? skipScope : describe);
-  describe.todoIf = (c) => (c ? skipScope : describe);
+  describe.todoIf = (c) => (c ? todoScope : describe);
   describe.if = (c) => (c ? describe : skipScope);
+  // describe.only used to BE describe, so it carried the whole modifier chain;
+  // keep the chain reachable on the focused registrar too.
+  onlyScope.each = describe.each; onlyScope.skip = skipScope; onlyScope.todo = skipScope;
+  onlyScope.concurrent = onlyScope; onlyScope.serial = onlyScope; onlyScope.only = onlyScope;
 
   function beforeEach(fn) { S.current.beforeEach.push(fn); }
   function afterEach(fn) { S.current.afterEach.push(fn); }
@@ -659,6 +826,11 @@ inline constexpr std::string_view HARNESS = R"JS(
     f.mockClear = () => { f.mock.calls = []; f.mock.results = []; return f; };
     f.mockRestore = () => {};
     f.getMockName = () => "mock";
+    // bun: `using spy = spyOn(obj, "m")` / `mock(fn)[Symbol.dispose]()` —
+    // disposing restores the original (spies) and drops the call history
+    // (jest.rs mock_disposable). mockRestore is read late so spyOn's override
+    // below is the one that runs.
+    f[Symbol.dispose] = () => { f.mockReset(); f.mockRestore(); };
     return f;
   }
   // Static helpers on the bun:test `mock` function.
@@ -703,10 +875,16 @@ inline constexpr std::string_view HARNESS = R"JS(
     Object.setPrototypeOf(MbunDate, RD);      // inherit statics (UTC/parse/…)
     MbunDate.now = function () { const p = pinned(); return p === null ? RD.now() : p; };
     G.Date = MbunDate;
+    G.__mbunRealDate = RD;
   }
+  // Bun__FakeTimers__setSystemTime (FakeTimers.rs:96-108): while fake timers are
+  // active, jest.setSystemTime rebases the Date offset so subsequent ticks keep
+  // advancing from the newly set wall time instead of the activation offset.
   function setSystemTime(v) {
     if (v === undefined || v === null) { S.sysTime = null; return; }
-    S.sysTime = (typeof v === "number") ? v : Number(v.valueOf());
+    const ms = (typeof v === "number") ? v : Number(v.valueOf());
+    S.sysTime = ms;
+    if (FT.on) FT.dateOffset = ms - FT.now;
   }
 
   // --- Fake timers (jest.useFakeTimers) ------------------------------------
@@ -715,19 +893,70 @@ inline constexpr std::string_view HARNESS = R"JS(
   // fakes keyed off a fake `now` (start 0). advanceTimersByTime(ms) advances the
   // fake clock and fires due timers in (fireAt, id) order, re-arming intervals.
   // The per-test timeout stays on natSetTimeout (line 81), so it is unfakeable.
-  const FT = { on: false, now: 0, seq: 0, queue: [], saved: null };
+  //
+  // `FT.now` is the fake monotonic clock (ms since activation, what
+  // performance.now() reports — FakeTimers.rs CURRENT_TIME.offset_raw starts at
+  // Timespec::EPOCH); `FT.dateOffset` is the wall-clock base so that
+  // Date.now() === FT.dateOffset + FT.now (CurrentTime::set's date_now_offset).
+  const FT = { on: false, now: 0, dateOffset: 0, seq: 0, queue: [], saved: null, savedPerfNow: null };
+  // Mirror the fake clock onto the Date override installed above.
+  function ftSync() { S.sysTime = FT.dateOffset + FT.now; }
+  // FakeTimers.rs:234-242 error_unless_fake_timers — every accessor except
+  // useFakeTimers/useRealTimers/isFakeTimers throws while inactive.
+  function ftRequireActive() {
+    if (!FT.on) throw new Error("Fake timers are not active. Call useFakeTimers() first.");
+  }
   function ftRemoveById(id) {
     for (let i = 0; i < FT.queue.length; i++) { if (FT.queue[i].id === id) { FT.queue.splice(i, 1); return; } }
+  }
+  function ftHasId(id) {
+    for (const t of FT.queue) if (t.id === id) return true;
+    return false;
+  }
+  // Fake setTimeout/setInterval return the same Timeout-shaped handle the real
+  // ones do (node semantics: coerces to the numeric id, carries
+  // ref/unref/hasRef/refresh/close) — sinon's fake-timers suite calls
+  // `setTimeout(...).refresh()` (issue #187 / #368).
+  function ftHandle(rec) {
+    return { _id: rec.id,
+      [Symbol.toPrimitive]() { return rec.id; },
+      ref() { rec.refd = true; return this; },
+      unref() { rec.refd = false; return this; },
+      hasRef() { return !!rec.refd; },
+      refresh() {
+        rec.fireAt = FT.now + (rec.interval > 0 ? rec.interval : rec.delay);
+        if (!ftHasId(rec.id)) FT.queue.push(rec);
+        return this;
+      },
+      close() { ftRemoveById(rec.id); return this; },
+      [Symbol.dispose]() { ftRemoveById(rec.id); } };
   }
   function ftSchedule(fn, delay, args, interval) {
     const id = ++FT.seq;
     let d = Number(delay); if (!isFinite(d) || d < 0) d = 0;
-    FT.queue.push({ id: id, fireAt: FT.now + d, fn: fn, args: args, interval: interval });
-    return id;
+    const rec = { id: id, fireAt: FT.now + d, fn: fn, args: args, interval: interval, delay: d, refd: true };
+    FT.queue.push(rec);
+    return ftHandle(rec);
   }
-  function ftInstall() {
+  function ftTimerId(t) { return (t !== null && typeof t === "object") ? t._id : t; }
+  // useFakeTimers(options) — FakeTimers.rs:266-296: `now` may be a number or a
+  // Date; without it the fake wall clock starts at the current real time.
+  function ftInstall(opts) {
+    const RD = G.__mbunRealDate || G.Date;
+    let jsNow = RD.now();
+    if (opts !== undefined && opts !== null) {
+      if (typeof opts !== "object") throw new TypeError("useFakeTimers() expects an options object");
+      const n = opts.now;
+      if (n !== undefined && n !== null) {
+        if (typeof n === "number") jsNow = n;
+        else if (typeof n === "object" && typeof n.getTime === "function") jsNow = n.getTime();
+        else throw new TypeError("'now' must be a number or Date");
+      }
+    }
+    FT.now = 0; FT.seq = 0; FT.queue = []; FT.dateOffset = Math.floor(jsNow);
+    ftSync();
     if (FT.on) { try { G.setTimeout.clock = true; } catch (e) {} return; }
-    FT.on = true; FT.now = 0; FT.seq = 0; FT.queue = [];
+    FT.on = true;
     FT.saved = { setTimeout: G.setTimeout, clearTimeout: G.clearTimeout,
                  setInterval: G.setInterval, clearInterval: G.clearInterval };
     const fakeSetTimeout = function (fn, delay) {
@@ -742,8 +971,15 @@ inline constexpr std::string_view HARNESS = R"JS(
     };
     G.setTimeout = fakeSetTimeout;
     G.setInterval = fakeSetInterval;
-    G.clearTimeout = function (id) { if (id != null) ftRemoveById(id); };
-    G.clearInterval = function (id) { if (id != null) ftRemoveById(id); };
+    G.clearTimeout = function (t) { if (t != null) ftRemoveById(ftTimerId(t)); };
+    G.clearInterval = function (t) { if (t != null) ftRemoveById(ftTimerId(t)); };
+    // vm.overridden_performance_now (CurrentTime::set): performance.now() reads
+    // the fake monotonic clock, i.e. starts at 0 no matter what `now` is.
+    const perf = G.performance;
+    if (perf && typeof perf.now === "function") {
+      FT.savedPerfNow = perf.now;
+      perf.now = function () { return FT.now; };
+    }
   }
   function ftUninstall() {
     if (!FT.on) return;
@@ -752,6 +988,10 @@ inline constexpr std::string_view HARNESS = R"JS(
       G.setTimeout = FT.saved.setTimeout; G.clearTimeout = FT.saved.clearTimeout;
       G.setInterval = FT.saved.setInterval; G.clearInterval = FT.saved.clearInterval;
       FT.saved = null;
+    }
+    if (FT.savedPerfNow) {
+      try { G.performance.now = FT.savedPerfNow; } catch (e) {}
+      FT.savedPerfNow = null;
     }
     FT.queue = [];
   }
@@ -766,51 +1006,78 @@ inline constexpr std::string_view HARNESS = R"JS(
             (next === null || t.fireAt < next.fireAt || (t.fireAt === next.fireAt && t.id < next.id))) next = t;
       }
       if (next === null) break;
-      FT.now = next.fireAt;
-      if (next.interval > 0) { next.fireAt = next.fireAt + next.interval; }
-      else { ftRemoveById(next.id); }
-      try { next.fn.apply(undefined, next.args || []); }
-      catch (e) { const st = G.__mbunState; if (st && st.asyncErr === undefined) st.asyncErr = e; else throw e; }
+      ftFire(next);
       if (++guard > 1000000) break;
     }
-    if (FT.now < target) FT.now = target;
+    if (FT.now < target) { FT.now = target; ftSync(); }
+  }
+  // FakeTimers::fire — the clock jumps to the timer's deadline BEFORE the
+  // callback runs, so Date.now()/performance.now() inside it see that instant.
+  function ftFire(next) {
+    FT.now = next.fireAt; ftSync();
+    if (next.interval > 0) { next.fireAt = next.fireAt + next.interval; }
+    else { ftRemoveById(next.id); }
+    try { next.fn.apply(undefined, next.args || []); }
+    catch (e) { const st = G.__mbunState; if (st && st.asyncErr === undefined) st.asyncErr = e; else throw e; }
+  }
+  function ftPeek() {
+    let next = null;
+    for (const t of FT.queue) { if (next === null || t.fireAt < next.fireAt || (t.fireAt === next.fireAt && t.id < next.id)) next = t; }
+    return next;
   }
   function ftAdvanceBy(ms) {
+    ftRequireActive();
     let n = Number(ms); if (!isFinite(n) || n < 0) n = 0;
     // advanceTimersByTime(0) advances 1ms so setTimeout(fn,0) fires — bun
     // FakeTimers.rs:449-452 (effective_advance = if arg==0 {1} else {arg}).
     const eff = (n === 0) ? 1 : n;
     ftExecuteUntil(FT.now + eff);
   }
+  // advanceTimersToNextTimer fires exactly ONE timer (FakeTimers::execute_next).
   function ftAdvanceToNext() {
-    let next = null;
-    for (const t of FT.queue) { if (next === null || t.fireAt < next.fireAt || (t.fireAt === next.fireAt && t.id < next.id)) next = t; }
-    if (next !== null) ftExecuteUntil(next.fireAt);
+    ftRequireActive();
+    const next = ftPeek();
+    if (next !== null) ftFire(next);
+  }
+  // runOnlyPendingTimers runs until the latest currently-scheduled deadline
+  // (FakeTimers::execute_only_pending_timers → find_max + execute_until).
+  function ftRunPending() {
+    ftRequireActive();
+    let max = null;
+    for (const t of FT.queue) if (max === null || t.fireAt > max) max = t.fireAt;
+    if (max !== null) ftExecuteUntil(max);
   }
   function ftRunAll() {
+    ftRequireActive();
     let guard = 0;
-    while (FT.queue.length && ++guard <= 100000) ftAdvanceToNext();
+    while (FT.queue.length && ++guard <= 100000) { const next = ftPeek(); if (next === null) break; ftFire(next); }
   }
+  function ftClearAll() { ftRequireActive(); FT.queue = []; }
+  function ftCount() { ftRequireActive(); return FT.queue.length; }
 
-  const jest = { fn: mock, spyOn: spyOn, mock: (m, f) => { if (typeof m !== "string") throw new TypeError("jest.mock() 1st argument must be a string"); if (typeof f !== "function") throw new TypeError("jest.mock() 2nd argument must be a function"); }, unmock: () => {}, useFakeTimers: () => { ftInstall(); return jest; }, useRealTimers: () => { setSystemTime(); ftUninstall(); return jest; }, setSystemTime: (v) => { setSystemTime(v); return jest; }, restoreAllMocks: () => mock.restoreAllMocks(), clearAllMocks: () => mock.clearAllMocks(), resetAllMocks: () => mock.resetAllMocks(), advanceTimersByTime: (ms) => { ftAdvanceBy(ms); return jest; }, advanceTimersToNextTimer: () => { ftAdvanceToNext(); return jest; }, runAllTimers: () => { ftRunAll(); return jest; }, runOnlyPendingTimers: () => { ftRunAll(); return jest; }, clearAllTimers: () => { FT.queue = []; return jest; }, getTimerCount: () => FT.queue.length };
+  const jest = { fn: mock, spyOn: spyOn, mock: (m, f) => { if (typeof m !== "string") throw new TypeError("jest.mock() 1st argument must be a string"); if (typeof f !== "function") throw new TypeError("jest.mock() 2nd argument must be a function"); }, unmock: () => {}, useFakeTimers: (o) => { ftInstall(o); return jest; }, useRealTimers: () => { ftUninstall(); setSystemTime(); return jest; }, setSystemTime: (v) => { setSystemTime(v); return jest; }, restoreAllMocks: () => mock.restoreAllMocks(), clearAllMocks: () => mock.clearAllMocks(), resetAllMocks: () => mock.resetAllMocks(), advanceTimersByTime: (ms) => { ftAdvanceBy(ms); return jest; }, advanceTimersToNextTimer: () => { ftAdvanceToNext(); return jest; }, runAllTimers: () => { ftRunAll(); return jest; }, runOnlyPendingTimers: () => { ftRunPending(); return jest; }, clearAllTimers: () => { ftClearAll(); return jest; }, getTimerCount: () => ftCount(), isFakeTimers: () => FT.on };
 
   // `vi` is bun:test's vitest-compat surface. It is NOT the same object as `jest`
   // (verified against bun 1.3.14: `vi === jest` is false) and carries its own key
-  // set; the timer helpers mirror the same stub level as `jest` above rather than
-  // pretending to fake timers.
+  // set — but the fake-timer entry points are the SAME native functions on both
+  // objects (FakeTimers.rs put_timers_fns: every FAKE_TIMERS_FNS entry is put on
+  // `vi` and `jest`), each returning `this`.
   const vi = { fn: mock, mock: function () {}, spyOn: spyOn,
                clearAllMocks: function () { mock.clearAllMocks(); },
                resetAllMocks: function () { mock.resetAllMocks(); },
                restoreAllMocks: function () { mock.restoreAllMocks(); },
-               useFakeTimers: function () { return vi; },
+               useFakeTimers: function (o) { ftInstall(o); return vi; },
                // No vi.setSystemTime: verified against bun 1.3.14, `vi` exposes
                // useRealTimers but leaves setSystemTime undefined (vitest suites
                // feature-detect on it). useRealTimers does clear the override.
-               useRealTimers: function () { setSystemTime(); return vi; },
-               isFakeTimers: function () { return false; }, clearAllTimers: function () {},
-               runAllTimers: function () {}, runOnlyPendingTimers: function () {},
-               advanceTimersByTime: function () {}, advanceTimersToNextTimer: function () {},
-               getTimerCount: function () { return 0; } };
+               useRealTimers: function () { ftUninstall(); setSystemTime(); return vi; },
+               isFakeTimers: function () { return FT.on; },
+               clearAllTimers: function () { ftClearAll(); return vi; },
+               runAllTimers: function () { ftRunAll(); return vi; },
+               runOnlyPendingTimers: function () { ftRunPending(); return vi; },
+               advanceTimersByTime: function (ms) { ftAdvanceBy(ms); return vi; },
+               advanceTimersToNextTimer: function () { ftAdvanceToNext(); return vi; },
+               getTimerCount: function () { return ftCount(); } };
 
   // bun:test expectTypeOf (expect.rs:2955): runtime no-op type-assertion chain —
   // callable (never new-able); every property access / call returns a fresh chain.
@@ -944,8 +1211,29 @@ inline constexpr std::string_view HARNESS = R"JS(
     const r = h();
     return (r && typeof r.then === "function") ? r : Promise.resolve();
   }
+  // `.only` filtering (bun does not need --only for it: test-only.test.ts).
+  // A file that registered at least one focused test runs EXACTLY those; with
+  // no focused test but a focused describe, its whole subtree runs. Unfocused
+  // entries are dropped from the tree, so they are not counted at all — bun
+  // reports "Ran 1 test across 1 file" for only-fixture-1.ts, not 1 pass +
+  // 2 skip. Ancestor scopes survive whenever their subtree still has a test,
+  // which keeps beforeAll/beforeEach chains intact.
+  function pruneToOnly(scope, inOnlyScope) {
+    const kept = [];
+    for (const item of scope.items) {
+      if (item.type === "test") {
+        if (S.onlyTests > 0 ? item.only : (inOnlyScope || item.only)) kept.push(item);
+      } else if (pruneToOnly(item.scope, inOnlyScope || !!item.scope.only)) {
+        kept.push(item);
+      }
+    }
+    scope.items = kept;
+    return kept.length > 0;
+  }
   async function runScope(scope, beChain, aeChain) {
-    if (scope.skipped) { skipAllIn(scope); return; }
+    // A todo scope only *runs* under --todo; otherwise its tests report as
+    // `(todo)` without executing any of the scope's hooks (same as describe.skip).
+    if (scope.skipped || (scope.todo && !G.__mbunRunTodo)) { skipAllIn(scope); return; }
     // --randomize: shuffle this scope's entries before running them. bun does it
     // at order-generation time (Order.rs:94-96); doing it on entry to the scope
     // yields the same visited order because generation walks scopes in the same
@@ -1101,10 +1389,12 @@ inline constexpr std::string_view HARNESS = R"JS(
     const fresh = makeScope(null, null);
     S.root = fresh; S.current = fresh;
     S.pass = 0; S.fail = 0; S.skip = 0; S.expectCalls = 0; S.total = 0; S.todo = 0;
-    S.skippedLabel = 0;
+    S.skippedLabel = 0; S.onlyTests = 0; S.onlyScopes = 0;
     S.out = []; S.customMatchers = {}; S.errors = []; S.pendingAsserts = [];
     S.timeoutReject = null; S.asyncErr = undefined; S.rand = null; S.skipDepth = 0;
+    S.todoDepth = 0;   // a describe.todo left open by a throwing body
     S.sysTime = null;  // a file's fake system time must not leak into the next
+    G.__mbun_describe_pending = 0;  // async describe bodies of the previous file
     ftUninstall();     // a file's fake timers must not leak into the next either
     __allMocks.length = 0;
   };
@@ -1115,6 +1405,7 @@ inline constexpr std::string_view HARNESS = R"JS(
     // derived (see run_source). Null/absent == --randomize off → insertion order.
     S.rand = (G.__mbunTestSeed === null || G.__mbunTestSeed === undefined)
              ? null : makePrng(G.__mbunTestSeed);
+    if (S.onlyTests > 0 || S.onlyScopes > 0) pruneToOnly(S.root, false);
     try { await runScope(S.root, [], []); }
     catch (e) { S.fail++; S.out.push("(fail) <scope error> " + ((e && e.message) || e)); }
     G.__mbun_pass = S.pass; G.__mbun_fail = S.fail; G.__mbun_skip = S.skip;
@@ -1318,6 +1609,20 @@ std::string prepare_source(std::string_view js) {
     return out;
 }
 
+// A registration-time CI refusal (`.only` under CI) is bun's own diagnostic,
+// thrown straight out of the scope function, so bun prints it bare:
+//   error: .only is disabled in CI environments to prevent accidentally ...
+// (ScopeFunctions.rs:511-521; asserted verbatim by js/bun/test/ci-restrictions).
+// Everything else keeps the `test file evaluation error:` framing.
+std::string strip_evaluation_wrapper(const std::string& message) {
+    constexpr std::string_view MARKER{".only is disabled in CI environments"};
+    if (const std::size_t at{message.find(MARKER)}; at != std::string::npos) {
+        const std::size_t eol{message.find('\n', at)};
+        return message.substr(at, eol == std::string::npos ? std::string::npos : eol - at);
+    }
+    return "test file evaluation error: " + message;
+}
+
 // Run a prepared/inline bun:test source in the shared runtime context. `dir` is
 // the test file's directory (for relative require()); inline sources pass ".".
 // `test_seed`, when set, is this file's --randomize shuffle seed (see run_file).
@@ -1386,6 +1691,9 @@ RunResult run_source(std::string_view js_source, std::string_view dir = ".", boo
     // needs its jsx-runtime import injected exactly like an imported module.
     mbun::js_parser::TranspileResult t{mbun::js_parser::transpile(
         js_source, {.cjs = true,
+                    // The wrapper below binds __mbun_esm_require and renames its
+                    // `require` parameter for a file that declares its own.
+                    .cjs_require_alias = true,
                     .jsx = jsx,
                     .jsx_options = mbun::jsc::module_loader::runtime_jsx_options(),
                     // A test file is transpiled by the same runtime transpiler as
@@ -1501,8 +1809,14 @@ RunResult run_source(std::string_view js_source, std::string_view dir = ".", boo
     const char* pdn{declares("__dirname") ? "__mbun_pdirname" : "__dirname"};
     const std::string callArgs{
         "globalThis.exports, globalThis.require, globalThis.module, "
-        "globalThis.__filename, globalThis.__dirname"};
-    const std::string params{std::string{"exports, require, module, "} + pfn + ", " + pdn};
+        "globalThis.__filename, globalThis.__dirname, globalThis.require"};
+    // Trailing `__mbun_esm_require`: the alias the ESM->CJS lowering uses for its
+    // own imports when the file declares its own `require` (js_parser
+    // kEsmRequireAlias).
+    const char* preq{mbun::js_parser::declares_top_level_require(js_source) ? "__mbun_prequire"
+                                                                           : "require"};
+    const std::string params{std::string{"exports, "} + preq + ", module, " + pfn + ", " + pdn +
+                             ", __mbun_esm_require"};
     const std::string strictPrefix{t.cjs_esm_module ? "\"use strict\";\n" : ""};
     std::string wrapped{"(function (" + params + ") {\n" + strictPrefix + prepared +
                         "\n}).call(globalThis, " + callArgs + ");"};
@@ -1516,7 +1830,7 @@ RunResult run_source(std::string_view js_source, std::string_view dir = ".", boo
         if (reg.error().find("SyntaxError") == std::string::npos &&
             reg.error().find("await is not defined") == std::string::npos &&
             reg.error().find("Can't find variable: await") == std::string::npos) {
-            r.error = "test file evaluation error: " + reg.error();
+            r.error = strip_evaluation_wrapper(reg.error());
             return r;
         }
         (void)rt::eval("globalThis.__mbun_collect_done=0;globalThis.__mbun_collect_err=undefined;");
@@ -1536,6 +1850,13 @@ RunResult run_source(std::string_view js_source, std::string_view dir = ".", boo
             r.error = "test file evaluation error: " + *err;
             return r;
         }
+    }
+    // 3b. an async describe body registers its tests after an await, which the
+    //     synchronous collection eval above never waits for. Pump until every
+    //     pending body settles, or those tests silently never exist.
+    if (auto pending{rt::eval_to_string("String(globalThis.__mbun_describe_pending|0)")};
+        pending && *pending != "0") {
+        rt::pump_event_loop("(globalThis.__mbun_describe_pending|0)===0");
     }
     // 4. execution: start the async runner, then pump the virtual-time timer queue
     //    (setTimeout/setInterval) interleaved with JSC's end-of-script microtask

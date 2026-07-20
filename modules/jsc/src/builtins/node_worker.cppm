@@ -202,6 +202,25 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
     let p = filename;
     if (p && typeof p === "object" && typeof p.href === "string") p = p.href;  // URL
     p = String(p);
+    // data: URL entry point (node lib/internal/worker.js accepts one, and the
+    // web Worker constructor takes any URL): the source *is* the payload.
+    // RFC 2397 — `;base64` after the mediatype means base64, otherwise the
+    // payload is percent-encoded.
+    if (p.startsWith("data:")) {
+      const comma = p.indexOf(",");
+      if (comma === -1) {
+        const e = new TypeError("Invalid URL: " + p);
+        e.code = "ERR_INVALID_URL";
+        throw e;
+      }
+      const meta = p.slice(5, comma);
+      const payload = p.slice(comma + 1);
+      if (/;base64\s*$/i.test(meta)) {
+        if (G.Buffer) return G.Buffer.from(payload, "base64").toString("utf8");
+        return G.atob ? G.atob(payload) : payload;
+      }
+      try { return decodeURIComponent(payload); } catch (e) { return payload; }
+    }
     if (p.startsWith("file://")) {
       const u = M["url"] || M["node:url"];
       if (p.indexOf(":!:") !== -1 || /file:\/\/[^/]*:/.test(p)) {

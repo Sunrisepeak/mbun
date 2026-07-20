@@ -67,6 +67,34 @@ JSValueRef make_string(JSContextRef ctx, std::string_view s) {
     return v;
 }
 
+// An error of a SPECIFIC native subclass — `JSObjectMakeError` only ever builds
+// a plain `Error`, so `e instanceof SyntaxError` / `expect(fn).toThrow(RangeError)`
+// fails on the values it makes. Built by calling the global constructor through
+// the public C API only (no JSC internals), so it is safe inside a host
+// callback. Falls back to a plain Error if the global was shadowed/removed.
+JSValueRef make_named_error(JSContextRef ctx, const char* ctorName, std::string_view msg) {
+    JSValueRef m{make_string(ctx, msg)};
+    JSStringRef name{JSStringCreateWithUTF8CString(ctorName)};
+    JSValueRef ctor{JSObjectGetProperty(ctx, JSContextGetGlobalObject(ctx), name, nullptr)};
+    JSStringRelease(name);
+    if (ctor != nullptr && JSValueIsObject(ctx, ctor)) {
+        JSObjectRef ctorObj{JSValueToObject(ctx, ctor, nullptr)};
+        if (ctorObj != nullptr && JSObjectIsConstructor(ctx, ctorObj)) {
+            JSObjectRef err{JSObjectCallAsConstructor(ctx, ctorObj, 1, &m, nullptr)};
+            if (err != nullptr) return err;
+        }
+    }
+    return JSObjectMakeError(ctx, 1, &m, nullptr);
+}
+
+JSValueRef make_range_error(JSContextRef ctx, std::string_view msg) {
+    return make_named_error(ctx, "RangeError", msg);
+}
+
+JSValueRef make_syntax_error(JSContextRef ctx, std::string_view msg) {
+    return make_named_error(ctx, "SyntaxError", msg);
+}
+
 // WebIDL ByteString → JS string: each raw byte 0xNN maps to U+00NN (Latin-1),
 // never UTF-8 decoded. Used for HTTP header names/values (bytes ≥ 0x80 are
 // valid; JSStringCreateWithUTF8CString would drop the whole string on invalid
@@ -196,3 +224,18 @@ std::vector<std::string> gArgv{};
 
 // `--no-env-file` / bunfig env=false: suppress default .env auto-loading.
 bool gDisableEnvFiles{false};
+
+// `--env-file <path>` — explicit dotenv files. ref: bun dotenv/env_loader.rs:657
+// `Loader::load`: a non-empty explicit list REPLACES the default-file scan
+// entirely (so `--no-env-file --env-file x` still loads x), and the list is
+// walked backwards with OVERWRITE=false so the LAST entry wins.
+std::vector<std::string> gEnvFiles{};
+
+// bunfig `preload = [...]` — modules imported before the entry point.
+// ref: bun runtime/jsc_hooks.rs:700-800 (resolve, then import, each in order;
+// a miss is fatal with `preload not found <json path>`).
+std::vector<std::string> gPreloads{};
+
+// `--user-agent <STR>` — overrides the default fetch User-Agent.
+// ref: bun cli/Arguments.rs:1062 → bun_http::OVERRIDDEN_DEFAULT_USER_AGENT.
+std::string gUserAgent{};

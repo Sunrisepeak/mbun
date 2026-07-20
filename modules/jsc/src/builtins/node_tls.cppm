@@ -175,7 +175,22 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
       ticketKeys, clientCertEngine, dhparam, secureProtocol,
     } = options;
     validateSecureProtocol(secureProtocol);
-    if (ciphers !== undefined && ciphers !== null) validateString(ciphers, "options.ciphers");
+    if (ciphers !== undefined && ciphers !== null) {
+      validateString(ciphers, "options.ciphers");
+      // node SecureContext::SetCiphers: a list OpenSSL cannot match to any
+      // suite is rejected at context-creation time with the OpenSSL error
+      // shape (code/library/reason), not silently ignored.
+      // node SetCiphers returns early on an empty list (it leaves the context's
+      // TLS1.3 suites in place), so "" is legal and must not be rejected.
+      const TN = globalThis.__mbunNodeTlsNative;
+      if (ciphers !== "" && TN && typeof TN.checkCipherList === "function" && !TN.checkCipherList(ciphers)) {
+        const e = new Error("No cipher match");
+        e.code = "ERR_SSL_NO_CIPHER_MATCH";
+        e.library = "SSL routines";
+        e.reason = "no cipher match";
+        throw e;
+      }
+    }
     if (passphrase !== undefined && passphrase !== null) validateString(passphrase, "options.passphrase");
     if (ecdhCurve !== undefined && ecdhCurve !== null) validateString(ecdhCurve, "options.ecdhCurve");
     if (clientCertEngine !== undefined && clientCertEngine !== null) {
@@ -255,7 +270,16 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
   }
 
   // ---- checkServerIdentity (RFC 6125), ported from bun-ref/node lib/tls.js ----
-  const canonicalizeIP = (ip) => ip; // DEFERRED: full IPv6 canonicalization (see NodeTLS.cpp Bun__canonicalizeIP)
+  // Canonical text form of an IP literal (NodeTLS.cpp Bun__canonicalizeIP): both
+  // sides of the IP-SAN comparison below go through it, so "fe80:0:0:0:0:0:0:1"
+  // and "fe80::1" (or an uppercase-hex SAN) match. Non-IP input comes back
+  // unchanged — the caller has already established it IS an IP for the hostname
+  // side, and a malformed SAN must stay unequal rather than become undefined.
+  const canonicalizeIP = (ip) => {
+    const N = globalThis.__mbunNodeTlsNative;
+    if (N && typeof N.canonicalizeIP === "function") { const c = N.canonicalizeIP(ip); if (typeof c === "string") return c; }
+    return ip;
+  };
   const netIsIP = (h) => {
     if (net && typeof net.isIP === "function") { const r = net.isIP(h); if (r) return r; }
     if (/^(\d{1,3}\.){3}\d{1,3}$/.test(h)) return 4;
@@ -468,12 +492,16 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
     constructor(options, secureConnectionListener) {
       super();
       if (typeof options === "function") { secureConnectionListener = options; options = {}; }
+      // node tls.Server: the constructor runs setSecureContext(options), i.e.
+      // createSecureContext — so an unusable option (an unmatched cipher list,
+      // a bad secureProtocol, …) throws here, not at first connection.
+      validateSecureContextOptions(options || {});
       this._sharedCreds = options || {};
       this._contexts = new Map();
       if (typeof secureConnectionListener === "function" && typeof this.on === "function")
         this.on("secureConnection", secureConnectionListener);
     }
-    setSecureContext(options) { this._sharedCreds = options || {}; }
+    setSecureContext(options) { validateSecureContextOptions(options || {}); this._sharedCreds = options || {}; }
     addContext(servername, context) {
       const ctx = context instanceof InternalSecureContext ? context : new InternalSecureContext(context);
       this._contexts.set(servername, ctx);

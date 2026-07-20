@@ -241,8 +241,34 @@ inline JSObjectRef bun_build_plugin_host(JSContextRef ctx) {
     return JSValueToObject(ctx, value, nullptr);
 }
 
+// Stringify a value thrown out of the plugin host, the way the host script's own
+// `describe()` does: an Error's `message`, else String(value). Used for the
+// exception that escapes the host *function itself* (see bun_build_call), which
+// `describe()` never sees because it is thrown before any promise is created.
+inline std::string bun_build_describe_exception(JSContextRef ctx, JSValueRef thrown) {
+    if (thrown == nullptr) {
+        return {};
+    }
+    if (JSValueIsObject(ctx, thrown)) {
+        JSObjectRef obj{JSValueToObject(ctx, thrown, nullptr)};
+        if (JSValueRef message{get_prop(ctx, obj, "message")};
+            message != nullptr && JSValueIsString(ctx, message)) {
+            return val_to_string(ctx, message);
+        }
+    }
+    return val_to_string(ctx, thrown);
+}
+
+// Call a host-script entry point. `thrown` receives any exception that escaped
+// synchronously — which a plugin CAN force: the host builds its box with
+// `Promise.resolve(p).then(...)`, and user code that patches
+// `Promise.prototype.then` to throw makes that call itself raise before the box
+// exists. bun has the same window and handles it in the C++ TOP_EXCEPTION_SCOPE
+// fallback of JSBundlerPlugin__matchOnLoad/__matchOnResolve, which forwards the
+// thrown value to addError so the build fails with the plugin's own message.
+// ref: compat/bun/test/bundler/plugin-sync-exception-fallback.test.ts.
 inline JSValueRef bun_build_call(JSContextRef ctx, JSObjectRef host, const char* name,
-                                 std::span<const JSValueRef> args) {
+                                 std::span<const JSValueRef> args, JSValueRef* thrown = nullptr) {
     JSValueRef fnVal{get_prop(ctx, host, name)};
     if (fnVal == nullptr || !JSValueIsObject(ctx, fnVal)) {
         return nullptr;
@@ -251,7 +277,7 @@ inline JSValueRef bun_build_call(JSContextRef ctx, JSObjectRef host, const char*
     if (fn == nullptr || !JSObjectIsFunction(ctx, fn)) {
         return nullptr;
     }
-    return JSObjectCallAsFunction(ctx, fn, host, args.size(), args.data(), nullptr);
+    return JSObjectCallAsFunction(ctx, fn, host, args.size(), args.data(), thrown);
 }
 
 // Pump the microtask queue until a box settles. A plugin that only awaits
@@ -274,7 +300,14 @@ inline bool bun_build_settle(JSContextRef ctx, JSObjectRef box) {
 inline std::expected<JSValueRef, std::string> bun_build_hook(JSContextRef ctx, JSObjectRef host,
                                                              const char* name,
                                                              std::span<const JSValueRef> args) {
-    JSValueRef boxVal{bun_build_call(ctx, host, name, args)};
+    JSValueRef thrown{nullptr};
+    JSValueRef boxVal{bun_build_call(ctx, host, name, args, &thrown)};
+    if (thrown != nullptr) {
+        std::string message{bun_build_describe_exception(ctx, thrown)};
+        return std::unexpected(message.empty()
+                                   ? std::format("bundler plugin dispatch ({}) failed", name)
+                                   : std::move(message));
+    }
     if (boxVal == nullptr || !JSValueIsObject(ctx, boxVal)) {
         return std::unexpected(std::format("bundler plugin dispatch ({}) failed", name));
     }
@@ -369,9 +402,11 @@ inline std::string bun_build_absolute_entry(std::string_view entry) {
 // custom-hash entry template skips the on-disk existence check — see
 // expectBundled.ts:1494, `entryNaming === "[dir]/[name].[ext]"`). `dir` is the
 // entrypoint's directory relative to `outbaseAbs` ("" -> "." like bun); the
-// output `[ext]` is always "js" for the JS chunk this slice emits.
+// output `[ext]` comes from `ext` — "js" for a JS chunk, "css" for the CSS chunk
+// a `.css` entry point produces.
 inline std::string bun_build_render_naming(std::string_view tmpl, std::string_view entryAbs,
-                                           std::string_view outbaseAbs) {
+                                           std::string_view outbaseAbs,
+                                           std::string_view ext = "js") {
     const std::filesystem::path entry{entryAbs};
     const std::string name{entry.stem().string()};
     std::string dir;
@@ -417,7 +452,7 @@ inline std::string bun_build_render_naming(std::string_view tmpl, std::string_vi
         } else if (field == "name") {
             out.append(name);
         } else if (field == "ext") {
-            out.append("js");
+            out.append(ext);
         } else if (field == "hash" || field == "target") {
             // Rendered empty: see the header note on the existence-check skip.
         } else {
@@ -707,6 +742,9 @@ inline JSValueRef bun_build_run(JSContextRef ctx, JSValueRef configVal) {
     // JSX config from `Bun.build({ jsx })`. Defaults to bun's Pragma (automatic
     // runtime, "react"); only `.jsx`/`.tsx` modules consult it in the bundler.
     mbun::js_parser::detail::JsxOptions jsxOptions{};
+    // `define` / `env` compile-time substitutions; empty = the source reaches the
+    // parser unchanged (the pre-existing behaviour).
+    mbun::bundler::DefineTable defines{};
     JSValueRef pluginsVal{nullptr};
     if (configObj != nullptr) {
         pluginsVal = get_prop(ctx, configObj, "plugins");
@@ -782,6 +820,45 @@ inline JSValueRef bun_build_run(JSContextRef ctx, JSValueRef configVal) {
                 jsxOptions.import_source = val_to_string(ctx, srcVal);
             }
         }
+        // `define`: a plain object of dotted key -> replacement expression text,
+        // and `env`: "inline" | "disable" | "PREFIX*" — the JS spelling of the CLI's
+        // `--define` / `--env`. ref: bun-ref/src/runtime/api/JSBundler.rs
+        // Config::from_js (`define`, `env`) feeding options.rs `create_defines`.
+        if (JSValueRef defineVal{get_prop(ctx, configObj, "define")};
+            defineVal != nullptr && JSValueIsObject(ctx, defineVal)) {
+            JSObjectRef defineObj{JSValueToObject(ctx, defineVal, nullptr)};
+            JSPropertyNameArrayRef names{JSObjectCopyPropertyNames(ctx, defineObj)};
+            const std::size_t count{JSPropertyNameArrayGetCount(names)};
+            for (std::size_t i{0}; i < count; ++i) {
+                JSStringRef nameRef{JSPropertyNameArrayGetNameAtIndex(names, i)};
+                JSValueRef entryVal{JSObjectGetProperty(ctx, defineObj, nameRef, nullptr)};
+                defines.insert(to_utf8(nameRef), val_to_string(ctx, entryVal));
+            }
+            JSPropertyNameArrayRelease(names);
+        }
+        if (JSValueRef envVal{get_prop(ctx, configObj, "env")};
+            envVal != nullptr && JSValueIsString(ctx, envVal)) {
+            const std::string mode{val_to_string(ctx, envVal)};
+            // "disable" (and the default) inline nothing; "inline"/"*" take every
+            // variable; "PREFIX*" takes the matching ones.
+            std::optional<std::string> prefix;
+            if (const std::size_t star{mode.find('*')}; star != std::string::npos) {
+                prefix = mode.substr(0, star);
+            } else if (mode == "inline" || mode == "1") {
+                prefix = std::string{};
+            }
+            if (prefix) {
+                for (char** e{MBUN_ENVIRON}; e != nullptr && *e != nullptr; ++e) {
+                    const std::string_view entry{*e};
+                    const std::size_t eq{entry.find('=')};
+                    if (eq == 0 || eq == std::string_view::npos) continue;
+                    const std::string_view name{entry.substr(0, eq)};
+                    if (!prefix->empty() && !name.starts_with(*prefix)) continue;
+                    defines.insert(std::format("process.env.{}", name),
+                                   mbun::bundler::quote_js_string(entry.substr(eq + 1)));
+                }
+            }
+        }
         JSValueRef epVal{get_prop(ctx, configObj, "entrypoints")};
         if (epVal != nullptr && JSValueIsString(ctx, epVal)) {
             entryPoints.push_back(bun_build_absolute_entry(val_to_string(ctx, epVal)));
@@ -837,6 +914,7 @@ inline JSValueRef bun_build_run(JSContextRef ctx, JSValueRef configVal) {
     mbun::bundler::BuildOptions options{.ascii_only = mbun::bundler::target_is_bun(target),
                                         .fs = &fs,
                                         .jsx = jsxOptions,
+                                        .defines = std::move(defines),
                                         .metafile = wantMetafile};
     if (pluginHost != nullptr && !pluginError) {
         options.on_resolve =
@@ -901,12 +979,19 @@ inline JSValueRef bun_build_run(JSContextRef ctx, JSValueRef configVal) {
         path = built->entryPaths.empty() ? std::string{} : built->entryPaths.front();
         // With an outdir the artifact path is the file actually written to disk.
         if (!outdir.empty() && built->entryPaths.size() == 1) {
+            // The output file is named after the entry as the CALLER wrote it, not
+            // after what it resolved to: an onResolve plugin may rewrite the entry
+            // record (`virtual-entry.ts` -> `actual-entry.ts`) and bun still emits
+            // `out/virtual-entry.js`. See BundleResult::entryInputs.
+            const std::string nameSource{built->entryInputs.empty() ? path
+                                                                    : built->entryInputs.front()};
             // Default outbase to the entrypoint's directory so `[dir]` is "" for a
             // single entry, matching bun's common-source-root default.
             const std::string base{outbase.empty()
-                                       ? std::filesystem::path{path}.parent_path().string()
+                                       ? std::filesystem::path{nameSource}.parent_path().string()
                                        : outbase};
-            const std::string relName{bun_build_render_naming(entryNaming, path, base)};
+            const std::string relName{bun_build_render_naming(
+                entryNaming, nameSource, base, built->cssChunk ? "css" : "js")};
             if (auto written{bun_build_write_outdir(outdir, relName, built->code)}) {
                 path = std::move(*written);
             } else {
@@ -920,7 +1005,7 @@ inline JSValueRef bun_build_run(JSContextRef ctx, JSValueRef configVal) {
         set_prop(ctx, artifact, "__code", make_string(ctx, built->code));
         set_prop(ctx, artifact, "path", make_string(ctx, path));
         set_prop(ctx, artifact, "size", JSValueMakeNumber(ctx, static_cast<double>(built->code.size())));
-        set_prop(ctx, artifact, "loader", make_string(ctx, "js"));
+        set_prop(ctx, artifact, "loader", make_string(ctx, built->cssChunk ? "css" : "js"));
         set_prop(ctx, artifact, "kind", make_string(ctx, "entry-point"));
         set_prop(ctx, artifact, "hash", JSValueMakeNull(ctx));
         set_fn(ctx, artifact, "text", bun_build_artifact_text_cb);

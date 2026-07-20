@@ -187,11 +187,135 @@ private:
         return v;
     }
 
+    // ── Color minification ── ref: bun/lightningcss color.rs to_css ──────────
+    // An opaque `rgb()`/`rgba()` is re-serialized in its SHORTEST equivalent
+    // form, at every output mode (not only --minify): `rgb(255, 0, 0)` prints as
+    // `red`, `rgb(0, 0, 0)` as `#000`. lightningcss parses every color into a
+    // value and prints the shorter of the hex form and the CSS named color, so
+    // the source spelling never survives.
+    // ref: compat/bun/test/bundler/css/wpt/background-computed.test.ts
+    //      ("background-color: rgb(255, 0, 0)" -> "red").
+    //
+    // Only fully-opaque `rgb()`/`rgba()` is folded here. A translucent color's
+    // shortest form (`#rrggbbaa` vs `rgba()`) depends on the target browser set,
+    // which this slice does not model, so it is passed through unchanged rather
+    // than guessed at.
+    struct NamedColor {
+        unsigned rgb;
+        string_view name;
+    };
+    // Only the names that can ever WIN: a name is listed iff it is strictly
+    // shorter than the shortest hex spelling of the same color (so `black`
+    // (5) is absent — `#000` (4) beats it — while `red` (3) beats `#f00`).
+    static string_view named_color_(unsigned rgb) {
+        static constexpr NamedColor kNames[]{
+            {0x000080, "navy"},   {0x008000, "green"},  {0x008080, "teal"},
+            {0x4b0082, "indigo"}, {0x800000, "maroon"}, {0x800080, "purple"},
+            {0x808000, "olive"},  {0x808080, "gray"},   {0xa0522d, "sienna"},
+            {0xa52a2a, "brown"},  {0xc0c0c0, "silver"}, {0xcd853f, "peru"},
+            {0xd2b48c, "tan"},    {0xda70d6, "orchid"}, {0xdda0dd, "plum"},
+            {0xee82ee, "violet"}, {0xf0e68c, "khaki"},  {0xf0ffff, "azure"},
+            {0xf5deb3, "wheat"},  {0xf5f5dc, "beige"},  {0xfa8072, "salmon"},
+            {0xfaf0e6, "linen"},  {0xff0000, "red"},    {0xff6347, "tomato"},
+            {0xff7f50, "coral"},  {0xffa500, "orange"}, {0xffc0cb, "pink"},
+            {0xffd700, "gold"},   {0xffe4c4, "bisque"}, {0xfffafa, "snow"},
+            {0xfffff0, "ivory"},
+        };
+        for (const NamedColor& c : kNames) {
+            if (c.rgb == rgb) return c.name;
+        }
+        return {};
+    }
+
+    // Parse one rgb()/rgba() component: an integer 0-255 or a percentage.
+    // Returns false for anything else (a var(), calc(), `none`, …), which keeps
+    // the whole function un-folded.
+    static bool color_component_(string_view text, Tk kind, int& out) {
+        double value = 0;
+        const auto res = std::from_chars(text.data(), text.data() + text.size(), value);
+        if (res.ec != std::errc{}) return false;
+        const size_t used = static_cast<size_t>(res.ptr - text.data());
+        if (kind == Tk::Percentage) {
+            if (used + 1 != text.size() || text[used] != '%') return false;
+            value = value * 255.0 / 100.0;
+        } else if (used != text.size()) {
+            return false;  // a dimension (`10px`) is not a component
+        }
+        if (value < 0 || value > 255) return false;
+        out = static_cast<int>(value + 0.5);
+        return true;
+    }
+
+    // Fold v[i] (a `rgb(`/`rgba(` Function) if it is an opaque color. On success
+    // writes the shortest form and returns the index of its CloseParen.
+    std::optional<size_t> write_color_(const std::vector<ValItem>& v, size_t i) {
+        string_view fn = text_tok(v[i]);
+        if (!ieq(fn, "rgb(") && !ieq(fn, "rgba(")) return std::nullopt;
+        int depth = 1;
+        size_t j = i + 1;
+        int comps[4]{0, 0, 0, 255};
+        int count = 0;
+        for (; j < v.size(); j++) {
+            const Tk k = v[j].kind;
+            if (k == Tk::Function || k == Tk::OpenParen) { depth++; break; }  // nested: bail
+            if (k == Tk::CloseParen) { depth--; break; }
+            if (k == Tk::Whitespace || k == Tk::Comma) continue;
+            if (k == Tk::Delim && v[j].delim == '/') continue;
+            if (count == 4) return std::nullopt;
+            int value = 0;
+            if (k == Tk::Number || k == Tk::Percentage) {
+                // The 4th component is an alpha in 0-1 (or a percentage), not 0-255.
+                if (count == 3) {
+                    double alpha = 0;
+                    string_view text = text_tok(v[j]);
+                    const auto res =
+                        std::from_chars(text.data(), text.data() + text.size(), alpha);
+                    if (res.ec != std::errc{}) return std::nullopt;
+                    const bool pct = k == Tk::Percentage;
+                    if (pct) alpha /= 100.0;
+                    if (alpha < 1.0) return std::nullopt;  // translucent: leave alone
+                    value = 255;
+                } else if (!color_component_(text_tok(v[j]), k, value)) {
+                    return std::nullopt;
+                }
+            } else {
+                return std::nullopt;
+            }
+            comps[count++] = value;
+        }
+        if (depth != 0 || j >= v.size() || (count != 3 && count != 4)) return std::nullopt;
+
+        const unsigned rgb = (static_cast<unsigned>(comps[0]) << 16) |
+                             (static_cast<unsigned>(comps[1]) << 8) |
+                             static_cast<unsigned>(comps[2]);
+        static constexpr char kHex[] = "0123456789abcdef";
+        string hex{"#"};
+        if ((comps[0] >> 4) == (comps[0] & 0xf) && (comps[1] >> 4) == (comps[1] & 0xf) &&
+            (comps[2] >> 4) == (comps[2] & 0xf)) {
+            for (int c = 0; c < 3; c++) hex += kHex[comps[c] & 0xf];
+        } else {
+            for (int c = 0; c < 3; c++) {
+                hex += kHex[(comps[c] >> 4) & 0xf];
+                hex += kHex[comps[c] & 0xf];
+            }
+        }
+        const string_view name = named_color_(rgb);
+        w(!name.empty() && name.size() < hex.size() ? name : string_view{hex});
+        return j;
+    }
+
     // ── Serialize a value token list ── ref: custom.rs TokenList::to_css ──
     void write_value(const std::vector<ValItem>& v) {
         bool has_ws = false;
         for (size_t i = 0; i < v.size(); i++) {
             const ValItem& t = v[i];
+            if (t.kind == Tk::Function) {
+                if (auto folded = write_color_(v, i)) {
+                    i = *folded;
+                    has_ws = false;
+                    continue;
+                }
+            }
             switch (t.kind) {
                 case Tk::Delim: {
                     char d = t.delim;
@@ -239,6 +363,12 @@ private:
                     wc(' ');
                     has_ws = true;
                     break;
+                case Tk::Number:
+                case Tk::Percentage:
+                case Tk::Dimension:
+                    write_number_(text_tok(t));
+                    has_ws = false;
+                    break;
                 default:
                     w(text_tok(t));
                     has_ws = false;
@@ -249,6 +379,32 @@ private:
 
     string_view text_tok(const ValItem& t) const {
         return src_.substr(t.start, t.end - t.start);
+    }
+
+    // Numeric tokens are re-serialized, not echoed: CSS numbers are printed in
+    // their shortest equivalent form, so a leading integer zero before the
+    // decimal point is dropped (`0.5em` -> `.5em`, `-0.25` -> `-.25`). This is
+    // NOT a minify-only transform — it is how the value is serialized at every
+    // output mode. ref: bun/lightningcss serializes dimensions through
+    // `serialize_number`, which writes the fractional part without the redundant
+    // integer 0; exercised by
+    // compat/bun/test/bundler/css/wpt/background-computed.test.ts
+    // ("background-position-x: 0.5em" -> ".5em", including inside calc()).
+    // Only the redundant leading zero is removed; the rest of the token (unit,
+    // exponent, `%`) is passed through verbatim so no precision is invented.
+    void write_number_(string_view text) {
+        size_t i = 0;
+        if (i < text.size() && (text[i] == '+' || text[i] == '-')) {
+            i++;
+        }
+        // `0.<digit>` — a bare `0` or `0` before a unit/exponent must survive.
+        if (i + 2 < text.size() && text[i] == '0' && text[i + 1] == '.' &&
+            text[i + 2] >= '0' && text[i + 2] <= '9') {
+            w(text.substr(0, i));
+            w(text.substr(i + 1));
+            return;
+        }
+        w(text);
     }
 
     // ── Serialize a prelude (selector / at-rule prelude) ──
@@ -359,7 +515,10 @@ private:
             // block rule
             if (firstEmitted) {
                 if (top) {
-                    newline();
+                    // Blank separator line: a bare '\n' first, so the empty line
+                    // carries no trailing indentation (it would inside a nested
+                    // @media/@keyframes body, where indent_ > 0).
+                    if (!minify_) out_ += '\n';
                     newline();
                 } else {
                     newline();
@@ -376,7 +535,18 @@ private:
                     whitespace();
                     wc('{');
                     indent_ += 2;
-                    print_rule_list_(bodyBegin, bodyEnd, /*top=*/false);
+                    // A nested rule list is laid out exactly like the top level:
+                    // the first rule starts on its own indented line and rules are
+                    // separated by a blank line. ref: bun/lightningcss
+                    // printer.rs — the nested body goes through the same
+                    // newline()+`if !first { newline() }` path as the stylesheet
+                    // root, e.g.
+                    //   @keyframes k {\n  from {\n …\n  }\n\n  to {\n …\n  }\n}
+                    // Printing it flush against the `{` (`@keyframes k {from {`)
+                    // and with single newlines between was a divergence, exercised
+                    // by compat/bun/test/bundler/css/view-transition-23600.test.ts.
+                    newline();
+                    print_rule_list_(bodyBegin, bodyEnd, /*top=*/true);
                     indent_ -= 2;
                     newline();
                     wc('}');

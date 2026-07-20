@@ -107,7 +107,15 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
           if (options.signal && typeof options.signal.addEventListener === "function") {
             if (options.signal.aborted) return;
             const target = this;
-            options.signal.addEventListener("abort", () => target.removeEventListener(type, callback, { capture }), { once: true });
+            // The abort algorithm is owned by the *listener*: whichever path
+            // removes the listener (removeEventListener, `once` firing, abort
+            // itself) must also drop it from the signal, otherwise a long-lived
+            // signal accumulates dead closures forever
+            // (WebCore RegisteredEventListener::m_abortAlgorithm).
+            const onAbort = () => target.removeEventListener(type, callback, { capture });
+            rec.signal = options.signal;
+            rec.onAbort = onAbort;
+            options.signal.addEventListener("abort", onAbort, { once: true });
           }
           list.push(rec);
         }
@@ -118,7 +126,16 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
           const list = this[kListeners].get(type);
           if (!list) return;
           for (let i = 0; i < list.length; i++) {
-            if (list[i].callback === callback && list[i].capture === capture) { list.splice(i, 1); break; }
+            if (list[i].callback === callback && list[i].capture === capture) {
+              const rec = list[i];
+              list.splice(i, 1);
+              if (rec.signal && rec.onAbort) {
+                const sig = rec.signal, onAbort = rec.onAbort;
+                rec.signal = null; rec.onAbort = null;  // re-entrancy: abort → here
+                try { sig.removeEventListener("abort", onAbort); } catch (e) {}
+              }
+              break;
+            }
           }
           if (list.length === 0) this[kListeners].delete(type);
         }
@@ -329,7 +346,65 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
         let value = null;
         if (orig) { try { value = orig(name); } catch (e) { value = null; } }
         if (!value || typeof value !== "object" || Object.keys(value).length === 0) {
-          if (name === "constants") { try { value = G.require ? G.require("constants") : {}; } catch (e) { value = {}; } }
+          if (name === "constants") {
+            // node's process.binding("constants") is GROUPED (node_constants.cc,
+            // bun ProcessBindingConstants.cpp): { os, fs, crypto, zlib, trace }.
+            // The flat node:constants module is the *union* of those groups, so
+            // returning it here (what mbun used to do) has the wrong shape.
+            const req = (m) => { try { return G.require ? G.require(m) : null; } catch (e) { return null; } };
+            const os = req("os"), fs = req("fs"), cr = req("crypto"), zl = req("zlib");
+            const osc = (os && os.constants) || {};
+            value = {
+              os: {
+                // libuv's UV_UDP_REUSEADDR (bun ProcessBindingConstants.cpp:59).
+                UV_UDP_REUSEADDR: 4,
+                dlopen: osc.dlopen || {},
+                errno: osc.errno || {},
+                signals: osc.signals || {},
+                priority: osc.priority || {},
+              },
+              fs: Object.assign({ UV_FS_SYMLINK_DIR: 1, UV_FS_SYMLINK_JUNCTION: 2 }, (fs && fs.constants) || {}),
+              crypto: (cr && cr.constants) || {},
+              zlib: (zl && zl.constants) || {},
+              // node's trace-event phase codes (the ASCII letter of each phase).
+              trace: {
+                TRACE_EVENT_PHASE_BEGIN: 66, TRACE_EVENT_PHASE_END: 69,
+                TRACE_EVENT_PHASE_COMPLETE: 88, TRACE_EVENT_PHASE_INSTANT: 73,
+                TRACE_EVENT_PHASE_ASYNC_BEGIN: 83, TRACE_EVENT_PHASE_ASYNC_STEP_INTO: 84,
+                TRACE_EVENT_PHASE_ASYNC_STEP_PAST: 112, TRACE_EVENT_PHASE_ASYNC_END: 70,
+                TRACE_EVENT_PHASE_NESTABLE_ASYNC_BEGIN: 98, TRACE_EVENT_PHASE_NESTABLE_ASYNC_END: 101,
+                TRACE_EVENT_PHASE_NESTABLE_ASYNC_INSTANT: 110, TRACE_EVENT_PHASE_FLOW_BEGIN: 115,
+                TRACE_EVENT_PHASE_FLOW_STEP: 116, TRACE_EVENT_PHASE_FLOW_END: 102,
+                TRACE_EVENT_PHASE_METADATA: 77, TRACE_EVENT_PHASE_COUNTER: 67,
+                TRACE_EVENT_PHASE_SAMPLE: 80, TRACE_EVENT_PHASE_CREATE_OBJECT: 78,
+                TRACE_EVENT_PHASE_SNAPSHOT_OBJECT: 79, TRACE_EVENT_PHASE_DELETE_OBJECT: 68,
+                TRACE_EVENT_PHASE_MEMORY_DUMP: 118, TRACE_EVENT_PHASE_MARK: 82,
+                TRACE_EVENT_PHASE_CLOCK_SYNC: 99, TRACE_EVENT_PHASE_ENTER_CONTEXT: 40,
+                TRACE_EVENT_PHASE_LEAVE_CONTEXT: 41, TRACE_EVENT_PHASE_LINK_IDS: 61,
+              },
+            };
+          }
+          else if (name === "uv") {
+            // bun ProcessBindingUV.cpp: UV_<NAME> = -errno for every entry of
+            // libuv's error map, plus errname(err) and getErrorMap(). The map
+            // itself is util.getSystemErrorMap()'s (code → [name, message]),
+            // which mbun already derives from libuv's uv_errno_map.
+            const util = (() => { try { return G.require ? G.require("util") : null; } catch (e) { return null; } })();
+            const map = util && typeof util.getSystemErrorMap === "function" ? util.getSystemErrorMap() : new Map();
+            const uv = {};
+            for (const [code, entry] of map) uv["UV_" + entry[0]] = code;
+            uv.errname = function errname(err) {
+              // Never throws: a non-integer (or out-of-int32) argument yields the
+              // generic string rather than a TypeError (bun jsErrname).
+              if (typeof err !== "number" || !Number.isInteger(err) || err < -2147483648 || err > 2147483647)
+                return "Unknown system error";
+              const entry = map.get(err);
+              if (entry) return entry[0];
+              return "Unknown system error: " + err;
+            };
+            uv.getErrorMap = function getErrorMap() { return new Map(map); };
+            value = uv;
+          }
           else if (name === "tty_wrap") {
             // node tty_wrap binding shape: class TTY + isTTY(fd) (=isatty).
             const ttyMod = (() => { try { return G.require ? G.require("node:tty") : null; } catch (e) { return null; } })();
@@ -442,6 +517,44 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
         get() { return captureFn; }, configurable: true, enumerable: false,
       });
     }
+
+    // ---- unhandled promise rejection dispatch -------------------------------
+    // The runtime's JSC rejection hook calls this with (reason, promise). node's
+    // escalation order (lib/internal/process/promises.js, mode "throw" — the
+    // default since node 15): deliver to 'unhandledRejection' listeners, else
+    // raise it as an uncaught exception (capture callback, then
+    // 'uncaughtException' listeners). Returning false means nobody claimed it and
+    // the runtime falls back to its own fatal report.
+    //
+    // The message renders `reason` WITHOUT running user code: node formats it
+    // through v8's ToDetailString, so `{ toString() { ... } }` prints
+    // "[object Object]" rather than calling the method (js/node/promise/
+    // reject-tostring.test.ts asserts exactly that).
+    G.__mbunOnUnhandledRejection = function (reason, promise) {
+      try {
+        const p = G.process;
+        if (!p || typeof p.emit !== "function" || typeof p.listenerCount !== "function") return false;
+        if (p.listenerCount("unhandledRejection") > 0) { p.emit("unhandledRejection", reason, promise); return true; }
+        let err = reason;
+        if (!(reason instanceof Error)) {
+          const t = typeof reason;
+          let s;
+          if (t === "string") s = reason;
+          else if (t === "symbol") s = reason.toString();
+          else if (t === "bigint") s = String(reason);
+          else if (reason === null) s = "null";
+          else if (t === "undefined") s = "undefined";
+          else if (t === "object" || t === "function") { try { s = Object.prototype.toString.call(reason); } catch (e) { s = "[object Object]"; } }
+          else s = String(reason);
+          err = new Error("This error originated either by throwing inside of an async function without a catch block, or by rejecting a promise which was not handled with .catch(). The promise rejected with the reason \"" + s + "\".");
+          err.code = "ERR_UNHANDLED_REJECTION";
+        }
+        const cap = p._mbunUncaughtCaptureCallback;
+        if (typeof cap === "function") { cap(err); return true; }
+        if (p.listenerCount("uncaughtException") > 0) { p.emit("uncaughtException", err, "unhandledRejection"); return true; }
+      } catch (e) {}
+      return false;
+    };
 
     // ---- release / config / versions alignment (mirrors bun) ---------------
     try {

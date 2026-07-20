@@ -637,6 +637,90 @@ void test_ascii_only_token_fidelity() {
           "a lex error falls back to the original bytes");
 }
 
+// A `.css` entry point is printed through mbun.css into a CSS chunk instead of
+// being handed to the JS parser (which rejected the leading `.` of a class
+// selector: "Unexpected .").
+// Sources (assertion semantics preserved):
+//   test/bundler/css/mask-geometry-box.test.ts > css/mask-geometry-box-preserved
+//   test/bundler/css/view-transition-23600.test.ts > css/view-transition-class-selector-23600
+void test_css_entry_point() {
+    mbun::bundler::Files files{
+        {"/index.css",
+         ".test-a::after {\n"
+         "    mask: linear-gradient(#fff 0 0) padding-box, linear-gradient(#fff 0 0);\n"
+         "}\n"
+         ".test-b::after {\n"
+         "    mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);\n"
+         "}\n"},
+    };
+    auto built{mbun::bundler::build_bundle({"/index.css"}, files)};
+    check(built.has_value(), "a .css entry point bundles");
+    if (built) {
+        check(built->cssChunk, "a .css entry produces a CSS chunk, not a JS chunk");
+        check(built->code.starts_with("/* index.css */\n"),
+              "the CSS chunk carries its input's provenance comment");
+        check_contains(built->code, "padding-box", "css mask");
+        check_contains(built->code, "content-box", "css mask");
+        check(!built->code.contains("__mbun_modules"), "the CSS chunk has no JS module table");
+        check(!built->code.contains(".test-a:after, .test-b:after"),
+              "geometry-box masks are not merged into one selector list");
+    }
+
+    // A nested rule list (@keyframes/@media) is laid out like the top level: the
+    // first rule on its own indented line, a blank separator between rules.
+    mbun::bundler::Files frames{
+        {"/k.css",
+         "@keyframes slide-out {\n"
+         "  from { opacity: 1; }\n"
+         "  to { opacity: 0; }\n"
+         "}\n"},
+    };
+    auto keyframes{mbun::bundler::build_bundle({"/k.css"}, frames)};
+    check(keyframes.has_value(), "a @keyframes stylesheet bundles");
+    if (keyframes) {
+        check(keyframes->code ==
+                  "/* k.css */\n"
+                  "@keyframes slide-out {\n"
+                  "  from {\n    opacity: 1;\n  }\n"
+                  "\n"
+                  "  to {\n    opacity: 0;\n  }\n"
+                  "}\n",
+              "nested rules print one per indented line with a blank separator");
+    }
+
+    // Values are re-serialized in their shortest equivalent form: a redundant
+    // leading zero is dropped and an opaque rgb()/rgba() collapses to the
+    // shorter of its named colour and its hex spelling.
+    // Sources: test/bundler/css/wpt/background-computed.test.ts
+    //   ("background-position-x: 0.5em" -> ".5em",
+    //    "background-color: rgb(255, 0, 0)" -> "red")
+    struct Case {
+        std::string_view decl;
+        std::string_view expected;
+    };
+    static constexpr Case kValueCases[]{
+        {"background-position-x: 0.5em", "background-position-x: .5em"},
+        {"background-position-x: calc(10px - 0.5em)", "background-position-x: calc(10px - .5em)"},
+        {"background-color: rgb(255, 0, 0)", "background-color: red"},
+        {"background-color: rgb(0, 0, 0)", "background-color: #000"},
+        {"background-color: rgba(255, 0, 0, 1)", "background-color: red"},
+        // Translucent and non-numeric colours are passed through untouched.
+        {"background-color: rgba(255, 0, 0, 0.5)", "background-color: rgba(255, 0, 0, .5)"},
+        {"background-color: rgb(var(--c))", "background-color: rgb(var(--c))"},
+        // A bare `0` keeps its digit; only the redundant leading zero goes.
+        {"opacity: 0", "opacity: 0"},
+        {"margin: -0.25em", "margin: -.25em"},
+    };
+    for (const Case& c : kValueCases) {
+        mbun::bundler::Files one{{"/v.css", std::format("h1 {{ {}; }}\n", c.decl)}};
+        auto out{mbun::bundler::build_bundle({"/v.css"}, one)};
+        check(out.has_value(), std::format("value css builds: {}", c.decl));
+        if (out) {
+            check_contains(out->code, c.expected, std::format("css value {:?}", c.decl));
+        }
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -658,6 +742,7 @@ int main() {
     test_plugin_hooks();
     test_ascii_only_output();
     test_ascii_only_token_fidelity();
+    test_css_entry_point();
 
     if (gFailures != 0) {
         std::println("bundler: {}/{} checks failed", gFailures, gChecks);

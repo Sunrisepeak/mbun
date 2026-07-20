@@ -1787,7 +1787,14 @@ constexpr std::string_view kStreamsJS_part2 = R"JS(
   // =====================================================================
   function consumeStart(stream) {
     // acquire a reader (async so lock errors become rejections)
-    try { return Promise.resolve(new ReadableStreamDefaultReader(stream)); }
+    try {
+      const r = new ReadableStreamDefaultReader(stream);
+      // Body consumption (Response/Request .text()/.arrayBuffer()/…) keeps the
+      // reader attached: the fetch spec's "fully reading body as promise" never
+      // releases it, so `req.body.locked` stays true afterwards (issue 07001).
+      if (stream && stream.__mbunBodyRetainLock) r._keepLock = true;
+      return Promise.resolve(r);
+    }
     catch (e) { return Promise.reject(e); }
   }
   // Incremental WHATWG utf-8 decoder with U+FFFD replacement.
@@ -1826,8 +1833,11 @@ constexpr std::string_view kStreamsJS_part2 = R"JS(
       },
     };
   }
-  async function consumeText(reader) {
+  // `limitKind` applies bun's synthetic allocation limit to the string being
+  // built (Body.rs guards every string materialization). Null skips it.
+  async function consumeText(reader, limitKind) {
     let out = "";
+    let seen = 0;
     let dec = null;
     try {
       for (;;) {
@@ -1835,19 +1845,28 @@ constexpr std::string_view kStreamsJS_part2 = R"JS(
         if (done) break;
         if (typeof value === "string") {
           if (dec) { out += dec.decode(new Uint8Array(0), true); dec = null; }
+          seen += value.length;
+          // Check BEFORE appending/decoding: a body can arrive as a single
+          // multi-hundred-MB chunk, and decoding it first is exactly the
+          // allocation the limit exists to prevent.
+          if (limitKind) G.__mbunCheckAllocLimit(seen, limitKind);
           out += value.charCodeAt(0) === 0xfeff ? value.slice(1) : value;
         } else {
           const u8 = toU8(value);
           if (u8 === null) throw new TypeError("Received a chunk that is neither a string nor an ArrayBuffer/TypedArray");
+          seen += u8.byteLength;
+          if (limitKind) G.__mbunCheckAllocLimit(seen, limitKind);
           if (!dec) dec = makeUtf8Decoder();
           out += dec.decode(u8, false);
         }
       }
       if (dec) out += dec.decode(new Uint8Array(0), true);
       return out;
-    } finally { if (reader._stream !== undefined) reader.releaseLock(); }
+    } finally { if (reader._stream !== undefined && !reader._keepLock) reader.releaseLock(); }
   }
-  async function consumeBytes(reader) {
+  // `guard` applies the synthetic allocation limit; arrayBuffer() is exempt in
+  // bun (an ArrayBuffer has no 2^32-1 cap), so it passes false.
+  async function consumeBytes(reader, guard) {
     const parts = [];
     let total = 0;
     try {
@@ -1859,11 +1878,12 @@ constexpr std::string_view kStreamsJS_part2 = R"JS(
         parts.push(u8);
         total += u8.byteLength;
       }
+      if (guard) G.__mbunCheckAllocLimit(total, "bytes");
       const out = new Uint8Array(total);
       let off = 0;
       for (const p of parts) { out.set(p, off); off += p.byteLength; }
       return out;
-    } finally { if (reader._stream !== undefined) reader.releaseLock(); }
+    } finally { if (reader._stream !== undefined && !reader._keepLock) reader.releaseLock(); }
   }
   async function consumeArray(reader) {
     const out = [];
@@ -1874,12 +1894,16 @@ constexpr std::string_view kStreamsJS_part2 = R"JS(
         out.push(value);
       }
       return out;
-    } finally { if (reader._stream !== undefined) reader.releaseLock(); }
+    } finally { if (reader._stream !== undefined && !reader._keepLock) reader.releaseLock(); }
   }
   // Bun's usable-state checks: consumers reject on locked/used streams and
   // synchronously reject on a detached queued chunk (validated eagerly).
   function consumerUsableError(stream) {
     if (!isReadableStream(stream)) return new TypeError("Expected a ReadableStream");
+    // ByteBlobLoader.rs:223 to_buffered_value checks its store BEFORE anything
+    // else: once the owning Body consumed (and detached) the blob store, every
+    // stream-level consumer rejects with ERR_BODY_ALREADY_USED, not "locked".
+    if (stream.__mbunBodyStoreDetached) { const e = new TypeError("Body already used"); e.code = "ERR_BODY_ALREADY_USED"; return e; }
     if (stream.locked) return new TypeError("ReadableStream is locked");
     if (stream._disturbed) { const e = new Error("ReadableStream has already been used"); e.code = "ERR_BODY_ALREADY_USED"; return e; }
     return null;
@@ -1909,23 +1933,25 @@ constexpr std::string_view kStreamsJS_part2 = R"JS(
       const err = consumerUsableError(stream);
       if (err) return Promise.reject(err);
       const fb = takeBlobFastBytes(stream);
-      if (fb) return Promise.resolve(new G.TextDecoder().decode(fb));
-      return consumeStart(stream).then(consumeText);
+      if (fb) { try { G.__mbunCheckAllocLimit(fb.byteLength, "text"); } catch (e) { return Promise.reject(e); }
+        return Promise.resolve(new G.TextDecoder().decode(fb)); }
+      return consumeStart(stream).then((r) => consumeText(r, "text"));
     },
     json(stream) {
       const err = consumerUsableError(stream);
       if (err) return Promise.reject(err);
       const fb = takeBlobFastBytes(stream);
-      if (fb) { try { return Promise.resolve(JSON.parse(new G.TextDecoder().decode(fb))); } catch (e) { return Promise.reject(e); } }
-      return consumeStart(stream).then(consumeText).then((t) => JSON.parse(t));
+      if (fb) { try { G.__mbunCheckAllocLimit(fb.byteLength, "json"); return Promise.resolve(JSON.parse(new G.TextDecoder().decode(fb))); } catch (e) { return Promise.reject(e); } }
+      return consumeStart(stream).then((r) => consumeText(r, "json")).then((t) => JSON.parse(t));
     },
     bytes(stream) {
       const err = consumerUsableError(stream);
       if (err) return Promise.reject(err);
       const fb = takeBlobFastBytes(stream);
-      if (fb) return Promise.resolve(new Uint8Array(fb));
+      if (fb) { try { G.__mbunCheckAllocLimit(fb.byteLength, "bytes"); } catch (e) { return Promise.reject(e); }
+        return Promise.resolve(new Uint8Array(fb)); }
       validateQueuedChunksSync(stream);
-      return consumeStart(stream).then(consumeBytes);
+      return consumeStart(stream).then((r) => consumeBytes(r, true));
     },
     arrayBuffer(stream) {
       const err = consumerUsableError(stream);
@@ -1933,7 +1959,7 @@ constexpr std::string_view kStreamsJS_part2 = R"JS(
       const fb = takeBlobFastBytes(stream);
       if (fb) return Promise.resolve(fb.buffer.slice(fb.byteOffset, fb.byteOffset + fb.byteLength));
       validateQueuedChunksSync(stream);
-      return consumeStart(stream).then(consumeBytes).then((u8) => u8.buffer);
+      return consumeStart(stream).then((r) => consumeBytes(r, false)).then((u8) => u8.buffer);
     },
     array(stream) {
       const err = consumerUsableError(stream);
@@ -1950,8 +1976,17 @@ constexpr std::string_view kStreamsJS_part2 = R"JS(
       return consumeStart(stream).then(consumeArray).then((chunks) => new G.Blob(chunks, { type: t }));
     },
     // raw internals for Response/Request/builtins wiring
-    consumeTextRaw: (stream) => consumeStart(stream).then(consumeText),
-    consumeBytesRaw: (stream) => consumeStart(stream).then(consumeBytes),
+    // Mark a stream as a *body* being fully read: consumeStart then keeps the
+    // reader attached so `.locked` stays true after consumption, matching the
+    // fetch spec (and bun) for Response/Request body consumers (issue 07001).
+    retainLock(stream) { if (stream && typeof stream === "object") { try { stream.__mbunBodyRetainLock = true; } catch (e) {} } },
+    // Body.rs use_as_any_blob detached the blob store behind this body stream.
+    detachBodyStore(stream) { if (stream && typeof stream === "object") { try { stream.__mbunBodyStoreDetached = true; } catch (e) {} } },
+    // The *Raw variants are the non-body consumers, so they pass no allocation
+    // limit kind: only Response/Request body consumption is capped (bun caps
+    // the body path, not every stream read).
+    consumeTextRaw: (stream) => consumeStart(stream).then((r) => consumeText(r, null)),
+    consumeBytesRaw: (stream) => consumeStart(stream).then((r) => consumeBytes(r, false)),
     consumeArrayRaw: (stream) => consumeStart(stream).then(consumeArray),
     usableError: consumerUsableError,
     isReadableStream,

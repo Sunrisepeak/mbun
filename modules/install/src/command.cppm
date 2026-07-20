@@ -1275,7 +1275,18 @@ export InstallResult install_project(const std::filesystem::path& startDirectory
                 dependencyJson.error().code == ErrorCode::MissingDependencyPackageJson) {
                 continue;
             }
-            return std::unexpected(dependencyJson.error());
+            // A `file:` dependency whose target has no readable package.json is a
+            // resolution failure, and bun reports it as one: the dependency name
+            // and the literal spec the user wrote ("<name>@<spec> failed to
+            // resolve", PackageManagerResolution.rs:396-406), then the underlying
+            // package.json miss ('"package.json" for "<name>" failed to resolve',
+            // repository.rs:984). Reporting only the resolved absolute path left
+            // the reader with no way back to the offending dependency entry.
+            return detail::fail(
+                ErrorCode::MissingDependencyPackageJson,
+                std::format("{}@{} failed to resolve\n"
+                            "error: \"package.json\" for \"{}\" failed to resolve: {}",
+                            alias, specifier, alias, (source / "package.json").string()));
         }
         if (!options.ignoreScripts &&
             detail::has_lifecycle_scripts(*dependencyJson->document.root)) {

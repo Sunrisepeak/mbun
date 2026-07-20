@@ -245,10 +245,15 @@ JSValueRef psql_decode_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_
     while (consumed < buf.size()) {
         auto r{mbun::postgres::decode_message(buf.substr(consumed))};
         if (r.status == mbun::postgres::DecodeStatus::Incomplete) break;
-        if (r.status == mbun::postgres::DecodeStatus::Invalid) {
-            // surface the invalid framing so the JS layer can raise a protocol error
+        if (r.status == mbun::postgres::DecodeStatus::Invalid ||
+            r.status == mbun::postgres::DecodeStatus::InvalidBody) {
+            // Surface the invalid framing so the JS layer can raise a protocol
+            // error. "invalid" == bad length field (ERR_POSTGRES_INVALID_MESSAGE_LENGTH);
+            // "invalidBody" == body overran its own declared length
+            // (ERR_POSTGRES_INVALID_MESSAGE, libpq "insufficient data left in message").
             JSObjectRef bad{JSObjectMake(ctx, nullptr, nullptr)};
-            set_prop(ctx, bad, "tag", make_string(ctx, "invalid"));
+            bool body{r.status == mbun::postgres::DecodeStatus::InvalidBody};
+            set_prop(ctx, bad, "tag", make_string(ctx, body ? "invalidBody" : "invalid"));
             JSObjectSetPropertyAtIndex(ctx, arr, idx++, bad, nullptr);
             break;
         }
@@ -261,13 +266,50 @@ JSValueRef psql_decode_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_
     return out;
 }
 
+// A PostgresError-shaped JS Error carrying `code` (bun-ref ErrorCode.ts maps
+// every ERR_POSTGRES_* onto the PostgresError name).
+JSValueRef psql_make_error(JSContextRef ctx, std::string_view code, std::string_view message) {
+    JSValueRef m{make_string(ctx, message)};
+    JSObjectRef e{JSObjectMakeError(ctx, 1, &m, nullptr)};
+    if (e != nullptr) {
+        set_prop(ctx, e, "code", make_string(ctx, code));
+        set_prop(ctx, e, "name", make_string(ctx, "PostgresError"));
+    }
+    return e;
+}
+
 // decodeValue(typeOid, Uint8Array, formatCode) → bool | number | string | Uint8Array
-// | null. int8 outside the safe-integer range is returned as a BigInt.
+// | Int32Array | Float32Array | null. int8 outside the safe-integer range is
+// returned as a BigInt. Throws a PostgresError for malformed binary payloads.
 JSValueRef psql_decode_value_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
-                                const JSValueRef args[], JSValueRef*) {
+                                const JSValueRef args[], JSValueRef* exc) {
     auto oid{argc > 0 ? static_cast<std::uint32_t>(JSValueToNumber(ctx, args[0], nullptr)) : 0};
     auto bytes{psql_read_bytes(ctx, argc > 1 ? args[1] : nullptr)};
     auto format{argc > 2 ? static_cast<std::int16_t>(JSValueToNumber(ctx, args[2], nullptr)) : 0};
+
+    // Binary single-dimension int4[]/float4[] decode into JS typed arrays; the
+    // server-controlled element count is validated before iterating (bun-ref
+    // DataCell.rs from_bytes_typed_array).
+    if (format == 1 && (oid == mbun::postgres::OID_INT4_ARRAY || oid == mbun::postgres::OID_FLOAT4_ARRAY)) {
+        auto arr{mbun::postgres::decode_binary_array(bytes, 4)};
+        if (!arr.ok) {
+            if (exc != nullptr) {
+                *exc = psql_make_error(ctx, mbun::postgres::error_js_code(arr.error),
+                                       mbun::postgres::error_name(arr.error));
+            }
+            return JSValueMakeUndefined(ctx);
+        }
+        JSTypedArrayType kind{oid == mbun::postgres::OID_INT4_ARRAY ? kJSTypedArrayTypeInt32Array
+                                                                   : kJSTypedArrayTypeFloat32Array};
+        JSObjectRef ta{JSObjectMakeTypedArray(ctx, kind, arr.count, nullptr)};
+        if (ta != nullptr && !arr.data.empty()) {
+            if (void* p{JSObjectGetTypedArrayBytesPtr(ctx, ta, nullptr)}) {
+                std::copy(arr.data.begin(), arr.data.end(), static_cast<std::byte*>(p));
+            }
+        }
+        return ta;
+    }
+
     auto value{mbun::postgres::decode_value(static_cast<mbun::postgres::TypeId>(oid), bytes, format)};
     return std::visit([&](const auto& v) -> JSValueRef {
         using T = std::remove_cvref_t<decltype(v)>;

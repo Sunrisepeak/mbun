@@ -41,6 +41,9 @@ export import :node_fs_watch;
 export import :bun_password;
 export import :node_process_extra;
 export import :node_util_extra;
+export import :node_test_runner;
+export import :node_legacy_ctors;
+export import :node_domain;
 export import :node_timers;
 export import :node_buffer_extra;
 export import :node_assert_deepequal;
@@ -100,6 +103,9 @@ export inline const std::string kNodeBuiltinsJS =
         .append(detail::kNodeFsWatchJS)
         .append(detail::kBunPasswordJS)
         .append(detail::kNodeProcessExtraJS)
+        // node:test standalone runner (used when no bun:test harness is present);
+        // after bootstrap registered the delegating M["test"] it wraps.
+        .append(detail::kNodeTestRunnerJS)
         .append(detail::kNodeTimersJS)
         .append(detail::kNodeBufferExtraJS)
         .append(detail::kNodeAssertDeepEqualJS)
@@ -115,6 +121,8 @@ export inline const std::string kNodeBuiltinsJS =
         // CAP-HTMLREWRITER: new HTMLRewriter().on(...).transform(...) over the
         // vendored lol-html engine (__mbunHTMLRewriterNative).
         .append(detail::kHTMLRewriterJS)
+        // node:domain — needs node:events (EventEmitter) already registered.
+        .append(detail::kNodeDomainJS)
         // last: printer-normalizing Function.prototype.toString override —
         // every earlier partition must capture the native toString.
         .append(detail::kFnToStringPrinterJS);

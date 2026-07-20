@@ -583,6 +583,34 @@ void test_enum_lowering() {
        "var S; (function (S) { S[\"A\"] = \"a\"; S[\"B\"] = \"b\"; })(S || (S = {}));");
     xp("const enum CE { X, Y }",
        "var CE; (function (CE) { CE[CE[\"X\"] = 0] = \"X\"; CE[CE[\"Y\"] = 1] = \"Y\"; })(CE || (CE = {}));");
+
+    // A TS enum MERGES with another enum, but redeclaring one over a
+    // function/class/let/const/var binding of the same name is an error rather
+    // than two silently-emitted IIFEs for one binding.
+    // ref: compat/bun/test/bundler/transpiler/ts-enum-redecl-panic.test.ts
+    {
+        auto err = [](std::string_view src) {
+            ++gChecks;
+            auto r = transpile(src, {});
+            if (r.ok || !r.error.contains("has already been declared")) {
+                ++gFailures;
+                std::println("  FAIL enum redecl(\"{}\") expected \"has already been declared\", "
+                             "got ok={} err=[{}]",
+                             printable(src), r.ok, printable(r.error));
+            }
+        };
+        err("function X() {}\nenum X {}\nenum X {}\n");
+        err("class X {}\nenum X {}\nenum X {}\n");
+        err("let X = 1;\nenum X {}\nenum X {}\n");
+        err("const X = 1;\nenum X {}\nenum X {}\n");
+        err("function X() {}\nenum X {}\nenum X {}\nenum X {}\n");
+        err("function Reflect() {} // only)\r\nenum Reflect {} // collision\r\n"
+            "enum Reflect {} // collision\r\n");
+    }
+    // enum-over-enum merges, and a nested binding of the same name is a
+    // DIFFERENT scope, so neither is an error.
+    ok("enum M { A }\nenum M { B }\n");
+    ok("enum N { A }\nfunction f() { class N {} }\n");
 }
 
 void test_imports() {
@@ -1115,6 +1143,19 @@ void test_jsx_pragma() {
         "undefined, this);");
     // An unknown runtime is a hard error, not a shrug. ref oracle.
     xpx_err("/** @jsxRuntime bogus */\nconst a = <div/>;", "Unsupported JSX runtime: \"bogus\"");
+
+    // Deeply nested elements bound the JSX scanner's recursion instead of
+    // running the native stack out (a bare SIGSEGV on the guard page). Each
+    // `() => <div>` nests one more element — the `() => ` runs between them are
+    // JSX text — so this reaches the lowerer's depth cap.
+    // ref: compat/bun/test/bundler/transpiler/jsx-deep-nesting-stack-overflow.test.ts
+    {
+        std::string deep;
+        for (int i = 0; i < 5000; ++i) {
+            deep += "() => <div>";
+        }
+        xpx_err(deep, "Maximum call stack size exceeded");
+    }
     // `@jsxImportSource` only moves the IMPORT, which transformSync does not emit
     // (see TranspileOptions::jsx_options) — so the call is unchanged here. The
     // import it selects is covered by test_jsx_import_injection.

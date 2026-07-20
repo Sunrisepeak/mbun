@@ -194,6 +194,16 @@ JSValueRef serven_write_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size
     auto* server{serve_native_server(ctx, argc, args)};
     if (server == nullptr || argc < 3) return JSValueMakeBoolean(ctx, false);
     const auto rid{static_cast<std::uint64_t>(JSValueToNumber(ctx, args[1], nullptr))};
+    // A Uint8Array body is read in place; base64 costs ~6x the payload in
+    // transient JS strings per response (a 36 MB body served 1000x by
+    // fetch-leak was OOM-killed). A string argument stays base64.
+    const std::uint8_t* vp{nullptr};
+    std::size_t vn{0};
+    if (arg_bytes_view(ctx, argc, args, 2, vp, vn)) {
+        std::string bytes;
+        if (vn != 0) bytes.assign(reinterpret_cast<const char*>(vp), vn);
+        return JSValueMakeBoolean(ctx, server->write_raw(rid, bytes));
+    }
     const std::string data{b64_decode(fs_arg(ctx, argc, args, 2))};
     return JSValueMakeBoolean(ctx, server->write_raw(rid, data));
 }
@@ -241,6 +251,25 @@ JSValueRef serven_backpressure_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, st
 // serve.stop(server, force): force closes everything and frees the server;
 // soft stops the listener and reaps idle keep-alive connections (in-flight
 // requests keep their server alive until they finish).
+// Every server shares one `st.loop`, and a server's socket backend both holds
+// epoll registrations and posts closures that capture it. Destroying it with
+// work still queued leaves those closures pointing at freed memory; they then
+// fire on some LATER tick, so the crash lands far from its cause (a ~1-in-6
+// SIGSEGV in js/web/fetch/fetch-redirect once the shared reactor stopped
+// ticking continuously). Run the loop to quiescence first -- bounded, because
+// a peer that keeps sending must not turn stop() into an unbounded drain.
+void drain_before_destroy_(ServeNativeState& st) {
+    for (int round{0}; round < 8; ++round) {
+        // A zero-length timer bounds the wait, exactly as serven_tick_cb does:
+        // run_once() blocks until the loop has something to do, and a server
+        // with registered-but-idle watches has nothing — without this the drain
+        // turned stop() into a hang (js/web/fetch/fetch-redirect, issue 22353).
+        const auto now{std::chrono::steady_clock::now()};
+        static_cast<void>(st.loop.set_timeout(std::chrono::milliseconds{0}, [] {}, now));
+        if (st.loop.run_once(std::chrono::steady_clock::now()) == 0) return;
+    }
+}
+
 JSValueRef serven_stop_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                           const JSValueRef args[], JSValueRef*) {
     const int id{argc > 0 ? static_cast<int>(JSValueToNumber(ctx, args[0], nullptr)) : 0};
@@ -250,6 +279,7 @@ JSValueRef serven_stop_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_
     if (found == st.servers.end()) return JSValueMakeUndefined(ctx);
     if (force) {
         found->second->close();
+        drain_before_destroy_(st);
         st.servers.erase(found);
     } else {
         // ref bun src/runtime/server/mod.rs:1551 — a NON-abrupt stop closes only
@@ -260,8 +290,10 @@ JSValueRef serven_stop_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_
         // what `stop(false)` must not do: a client holding a pooled keep-alive
         // connection can still reach the server afterwards.
         found->second->stop_listening();
-        if (found->second->pending_requests() == 0 && found->second->connection_count() == 0)
+        if (found->second->pending_requests() == 0 && found->second->connection_count() == 0) {
+            drain_before_destroy_(st);
             st.servers.erase(found);
+        }
     }
     return JSValueMakeUndefined(ctx);
 }

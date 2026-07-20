@@ -73,6 +73,18 @@ int main(int argc, char* argv[]) {
             args.erase(args.begin());
             continue;
         }
+        if (const std::size_t n{take_valued_flag(args, 0, "--env-file",
+                                                 mbun::jsc::runtime::add_env_file)};
+            n > 0) {
+            args.erase(args.begin(), args.begin() + static_cast<std::ptrdiff_t>(n));
+            continue;
+        }
+        if (const std::size_t n{take_valued_flag(args, 0, "--user-agent",
+                                                 mbun::jsc::runtime::set_user_agent)};
+            n > 0) {
+            args.erase(args.begin(), args.begin() + static_cast<std::ptrdiff_t>(n));
+            continue;
+        }
         if (args[0] == "--bun" || args[0] == "-b") {
             globalFlags.forceUsingBun = true;
             args.erase(args.begin());
@@ -154,7 +166,22 @@ int main(int argc, char* argv[]) {
                 }
                 if (args[i] == "--silent") { flags.silent = true; ++i; continue; }
                 if (args[i] == "--no-env-file") { mbun::jsc::runtime::set_disable_env_files(true); ++i; continue; }
+                if (const std::size_t n{take_valued_flag(args, i, "--env-file",
+                                                         mbun::jsc::runtime::add_env_file)};
+                    n > 0) {
+                    args.erase(args.begin() + static_cast<std::ptrdiff_t>(i),
+                               args.begin() + static_cast<std::ptrdiff_t>(i + n));
+                    continue;
+                }
+                if (const std::size_t n{take_valued_flag(args, i, "--user-agent",
+                                                         mbun::jsc::runtime::set_user_agent)};
+                    n > 0) {
+                    args.erase(args.begin() + static_cast<std::ptrdiff_t>(i),
+                               args.begin() + static_cast<std::ptrdiff_t>(i + n));
+                    continue;
+                }
                 if (args[i] == "--if-present") { flags.ifPresent = true; ++i; continue; }
+                if (args[i] == "--workspaces") { flags.workspaces = true; ++i; continue; }
                 if (args[i] == "--bun" || args[i] == "-b") { flags.forceUsingBun = true; ++i; continue; }
                 // `--cwd <dir>` / `--cwd=<dir>` — chdir before resolving the target
                 // (Arguments.rs:773). Two-token form was previously unhandled, which
@@ -194,6 +221,11 @@ int main(int argc, char* argv[]) {
             // so `bun run args -- a b` forwards exactly ["a","b"].
             std::size_t firstArg{i + 1};
             if (firstArg < args.size() && args[firstArg] == "--") ++firstArg;
+            // `--workspaces` fans the script out over the workspace members
+            // instead of resolving it against the cwd (multi_run.rs:839).
+            if (flags.workspaces) {
+                return exec_run_workspaces(args[i], std::span{args}.subspan(firstArg), flags);
+            }
             // Tag::RunCommand — cli/mod.rs:1471-1473: bin_dirs_only=false,
             // allow_fast_run_for_extensions=false.
             return exec_run_target(args[i], std::span{args}.subspan(firstArg), flags,

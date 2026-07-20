@@ -174,6 +174,20 @@ Loader loader_for_path(std::string_view path) {
     if (ext == ".node") {
         return Loader::Napi;  // options.rs DEFAULT_LOADERS: ".node" → napi
     }
+    // Binary asset extensions. bun has no DEFAULT_LOADERS entry for these
+    // either; they land on jsc_hooks.rs:4265 `lr.loader.unwrap_or(Loader::File)`,
+    // so `import png from "./x.png"` binds the file's PATH. Evaluating the
+    // bytes as JS (the fallback below) throws instead. Kept as an explicit list
+    // rather than "any unknown extension → File" because mbun lowers ESM
+    // imports to require(), and bun's require() of an unknown extension goes to
+    // Ts (code), not File — see the module note above.
+    if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".gif" || ext == ".webp" ||
+        ext == ".avif" || ext == ".bmp" || ext == ".ico" || ext == ".svg" || ext == ".woff" ||
+        ext == ".woff2" || ext == ".ttf" || ext == ".otf" || ext == ".eot" || ext == ".mp3" ||
+        ext == ".mp4" || ext == ".wav" || ext == ".ogg" || ext == ".webm" || ext == ".pdf" ||
+        ext == ".zip") {
+        return Loader::File;
+    }
     return Loader::Js;  // `.file` → js fallback
 }
 
@@ -335,17 +349,31 @@ bool experimental_decorators(const mbun::resolver::FileSystem& fs, std::string d
         return it->second;
     }
     // `true`/`false` when the config states the key, nullopt when absent.
-    auto keyIn = [](const std::string& content) -> std::optional<bool> {
-        std::size_t p{content.find("\"experimentalDecorators\"")};
+    auto boolKey = [](const std::string& content,
+                      std::string_view key) -> std::optional<bool> {
+        std::size_t p{content.find(key)};
         if (p == std::string::npos) {
             return std::nullopt;
         }
-        p = content.find_first_not_of(" \t\r\n", p + 24);  // past `"experimentalDecorators"`
+        p = content.find_first_not_of(" \t\r\n", p + key.size());
         if (p == std::string::npos || content[p] != ':') {
             return std::nullopt;
         }
         p = content.find_first_not_of(" \t\r\n", p + 1);
         return p != std::string::npos && content.compare(p, 4, "true") == 0;
+    };
+    // `emitDecoratorMetadata: true` implies legacy decorators: the metadata
+    // emit only exists for TS's legacy transform, so tsc (and bun) treat it as
+    // turning experimentalDecorators on when that key is absent (issue 27526).
+    // An explicit experimentalDecorators always wins.
+    auto keyIn = [&boolKey](const std::string& content) -> std::optional<bool> {
+        if (auto v{boolKey(content, "\"experimentalDecorators\"")}) {
+            return v;
+        }
+        if (auto v{boolKey(content, "\"emitDecoratorMetadata\"")}; v && *v) {
+            return true;
+        }
+        return std::nullopt;
     };
     // The `extends` target (resolved to a tsconfig path), or empty.
     auto extendsIn = [](const std::string& content, const std::string& baseDir) -> std::string {
@@ -428,6 +456,8 @@ std::expected<std::string, std::string> transpile(std::string_view source, Loade
     const bool jsx{loader == Loader::Tsx || loader == Loader::Jsx};
     mbun::js_parser::TranspileResult t{mbun::js_parser::transpile(
         source, {.cjs = cjs,
+                 // Runtime wrappers bind __mbun_esm_require; see kEsmRequireAlias.
+                 .cjs_require_alias = true,
                  .jsx = jsx,
                  .legacy_decorators = legacyDecorators,
                  .jsx_options = runtime_jsx_options(),
@@ -456,6 +486,11 @@ struct LoadResult {
     std::string message;  // diagnostic detail when not Success
     bool top_level_await{false};  // module awaits at top level (needs async wrapper)
     bool cjs_esm_module{false};   // CJS output came from ESM and must execute in strict mode
+    // The module declares its own top-level `require`, so its lowered imports
+    // were named against __mbun_esm_require and the CJS wrapper must NOT bind a
+    // `require` parameter (it would collide). See js_parser
+    // declares_top_level_require.
+    bool cjs_require_alias{false};
 };
 
 // The runtime's base ESM conditions. mbun's runtime is always target=bun, so it
@@ -586,6 +621,7 @@ public:
             const bool legacy{(out.loader == Loader::Ts || out.loader == Loader::Tsx) &&
                               experimental_decorators(
                                   fs_, mbun::core::paths::posix::dirname(resolved.path))};
+            out.cjs_require_alias = cjs_ && mbun::js_parser::declares_top_level_require(*src);
             std::expected<std::string, std::string> js{
                 transpile(*src, out.loader, cjs_, &out.top_level_await, legacy,
                           &out.cjs_esm_module)};

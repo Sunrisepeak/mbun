@@ -9,6 +9,16 @@ void set_argv(std::vector<std::string> argv) {
 // Disable auto-loading of default .env files (bun `--no-env-file`).
 void set_disable_env_files(bool v) { gDisableEnvFiles = v; }
 
+// Append one `--env-file` argument (a comma-separated list is one argument, as
+// in bun's `load_explicit_files`). Explicit files replace the default scan.
+void add_env_file(std::string spec) { gEnvFiles.push_back(std::move(spec)); }
+
+// bunfig `preload`: modules to import before the entry point.
+void set_preloads(std::vector<std::string> paths) { gPreloads = std::move(paths); }
+
+// `--user-agent <STR>`: default User-Agent for fetch (bun Arguments.rs:1062).
+void set_user_agent(std::string ua) { gUserAgent = std::move(ua); }
+
 // Evaluate JS source, returning its numeric value or an error string. Bindings
 // are installed. Used by the smoke test (eval "Bun.semver.order(...)" == -1) and
 // reusable by the bun:test runner (T3.4).

@@ -49,6 +49,9 @@ export constexpr std::string_view kNetJS = R"JS(
   const u8 = (d) => (d == null ? new Uint8Array(0) : typeof d === "string" ? te.encode(d) : d instanceof Uint8Array ? d : ArrayBuffer.isView(d) ? new Uint8Array(d.buffer, d.byteOffset, d.byteLength) : d instanceof ArrayBuffer ? new Uint8Array(d) : d._u8 instanceof Uint8Array ? d._u8 : te.encode(String(d)));
   const toB64 = (b) => { let s = ""; for (let i = 0; i < b.length; i += 4096) s += String.fromCharCode.apply(null, b.subarray(i, i + 4096)); return G.btoa(s); };
   const fromB64 = (s) => { const t = G.atob(s); const o = new Uint8Array(t.length); for (let i = 0; i < t.length; i++) o[i] = t.charCodeAt(i); return o; };
+  // Max bytes handed to a single native write(); the kernel socket buffer is
+  // ~64 KB anyway, so encoding more than this per call is pure waste.
+  const WCHUNK = 65536;
   // ref bun src/http/Decompressor.rs: decode response content-encoding
   // (gzip/deflate/br/zstd; identity/unknown = passthrough). zstd multi-frame is
   // handled inside the native decoder (modules/compress/src/zstd.cppm loops).
@@ -140,6 +143,11 @@ export constexpr std::string_view kNetJS = R"JS(
       this.remoteAddress = "127.0.0.1"; this.remoteFamily = "IPv4"; this.remotePort = 0;
       this.localAddress = "127.0.0.1"; this.localPort = 0;
       this.bytesRead = 0; this.bytesWritten = 0;
+      // Minimal node stream.Readable state. This transport pushes straight to
+      // 'data' rather than running the Readable machinery, but consumers of a
+      // *socket* legitimately read it: npm `ws` socketOnClose gates its final
+      // drain on `socket._readableState.endEmitted` and then `socket.read()`.
+      this._readableState = { endEmitted: false, ended: false, destroyed: false, length: 0, flowing: true, readable: true, objectMode: false };
     }
     _adopt(fd) {
       this._fd = fd; this.pending = false; this.destroyed = false; this.connecting = false;
@@ -183,12 +191,59 @@ export constexpr std::string_view kNetJS = R"JS(
         this._timeoutTimer = G.setTimeout(() => { this._timeoutTimer = null; if (!this.destroyed) this.emit("timeout"); }, this._timeoutMs);
       }
     }
-    setNoDelay() { return this; } setKeepAlive() { return this; }
+    setNoDelay() { return this; }
+    // node net.Socket#setKeepAlive(enable, initialDelayMs): SO_KEEPALIVE plus
+    // TCP_KEEPIDLE (seconds). The agent arms this on every pooled socket.
+    setKeepAlive(enable, initialDelay) {
+      const on = enable === undefined ? true : !!enable;
+      if (this._fd >= 0 && NN && NN.setSockBuf) {
+        const secs = on ? Math.max(1, Math.round((+initialDelay || 0) / 1000) || 60) : 0;
+        try { NN.setSockBuf(this._fd, 3, secs); } catch (e) {}
+      }
+      return this;
+    }
     cork() { return this; } uncork() { return this; }
     ref() { return this; }
     unref() { return this; }
+    // stream.Readable#read: nothing is buffered by this transport (chunks go
+    // straight out as 'data'), except bytes handed back through unshift().
+    read(n) {
+      const q = this._unshiftQ;
+      if (q && q.length) { this._unshiftQ = null; return q.length === 1 ? q[0] : (G.Buffer ? G.Buffer.concat(q) : q[0]); }
+      return null;
+    }
     pause() { this._paused = true; return this; }
     resume() { this._paused = false; return this; }
+    // stream.Readable#unshift: push bytes back to the front of the read queue.
+    // node's HTTP client hands the bytes that followed a 101 header to the
+    // 'upgrade' listener, and every upgrade consumer (npm `ws`
+    // websocket.js setSocket) unshifts them so its own 'data' handler sees
+    // them ahead of anything still on the wire. Ordering is preserved by
+    // draining this queue before any freshly-read chunk (see _drain).
+    unshift(chunk) {
+      if (chunk == null) return true;
+      const b = typeof chunk === "string"
+        ? (G.Buffer ? G.Buffer.from(chunk, this._enc || "utf8") : chunk)
+        : (G.Buffer ? G.Buffer.from(chunk) : chunk);
+      if (!b.length) return true;
+      if (!this._unshiftQ) this._unshiftQ = [];
+      this._unshiftQ.unshift(b);
+      if (!this._unshiftPending) {
+        this._unshiftPending = true;
+        G.queueMicrotask(() => { this._unshiftPending = false; this._flushUnshift(); });
+      }
+      return true;
+    }
+    _flushUnshift() {
+      const q = this._unshiftQ;
+      if (!q || !q.length) return;
+      this._unshiftQ = null;
+      for (const c of q) {
+        if (this.destroyed) return;
+        if (this._onread) this._onread(c.length, c);
+        else this.emit("data", this._enc && G.Buffer ? c.toString(this._enc) : c);
+      }
+    }
     address() { return { port: this.localPort, address: this.localAddress, family: "IPv4" }; }
     get writableLength() { return this._wqLen; }
     get writableEnded() { return this._shutW; }
@@ -216,6 +271,7 @@ export constexpr std::string_view kNetJS = R"JS(
     destroy(err) {
       if (this.destroyed) return this;
       this.destroyed = true; this.readable = false; this.writable = false;
+      if (this._readableState) { this._readableState.destroyed = true; this._readableState.readable = false; }
       if (this._timeoutTimer) { G.clearTimeout(this._timeoutTimer); this._timeoutTimer = null; }
       if (this._fd >= 0) { try { NN.close(this._fd); } catch (e) {} this._fd = -1; }
       NET.items.delete(this);
@@ -244,15 +300,20 @@ export constexpr std::string_view kNetJS = R"JS(
       if (this._fd < 0) return 0;
       if (this._tls === 1) return 0;  // handshake still in flight (see _poll)
       let progress = 0;
+      // Encode at most WCHUNK bytes per write(): base64-ing the WHOLE pending
+      // buffer each pass is quadratic (the socket accepts ~64 KB, so a large
+      // queued payload was re-encoded once per 64 KB — a multi-MB write blew up
+      // in time and memory).
       while (this._wq.length) {
         const head = this._wq[0];
+        const piece = head.length > WCHUNK ? head.subarray(0, WCHUNK) : head;
         let n;
-        try { n = this._tls ? NN.tlsWrite(this._fd, toB64(head)) : NN.write(this._fd, toB64(head)); }
+        try { n = this._tls ? NN.tlsWrite(this._fd, toB64(piece)) : NN.write(this._fd, toB64(piece)); }
         catch (e) { this._fail(e); return progress; }
         if (n <= 0) break;
         progress++;
         this._wqLen -= n;
-        if (n < head.length) { this._wq[0] = head.subarray(n); break; }
+        if (n < head.length) { this._wq[0] = head.subarray(n); if (n < piece.length) break; continue; }
         this._wq.shift();
       }
       if (!this._wq.length && this._shutW && !this._shutSent && this._fd >= 0) {
@@ -299,6 +360,7 @@ export constexpr std::string_view kNetJS = R"JS(
           progress++;
           if (r === null) {
             this._eof = true; this.readable = false;
+            this._readableState.endEmitted = true;
             this.emit("end");
             // node net.js onReadableStreamEnd auto-ends the write side on the
             // NEXT tick, not inline, so data written synchronously right after
@@ -318,6 +380,7 @@ export constexpr std::string_view kNetJS = R"JS(
           this.bytesRead += bytes.length;
           if (this._timeoutMs) this._armTimeout();
           const chunk = G.Buffer ? G.Buffer.from(bytes) : bytes;
+          if (this._unshiftQ) this._flushUnshift();   // unshifted bytes come first
           if (this._onread) this._onread(bytes.length, chunk);
           else this.emit("data", this._enc ? (G.Buffer ? chunk.toString(this._enc) : latin1(bytes, 0, bytes.length)) : chunk);
           if (this.destroyed || this._paused) break;
@@ -600,12 +663,23 @@ export constexpr std::string_view kNetJS = R"JS(
         else G.queueMicrotask(() => { throw error; });
       }
     }
+    // bun's writeOrEnd (src/runtime/socket/socket_body.rs) returns -1 when the
+    // socket is already shut down or closed; it never surfaces node's
+    // ERR_STREAM_WRITE_AFTER_END. The echo tests write from a `data` callback
+    // that can land after the peer's FIN, so the node-level error must not leak
+    // into the Bun.listen/Bun.connect handlers.
+    get _writeShutdown() { return this._socket.destroyed || this._socket.writableEnded; }
     write(data, encoding) {
       const length = u8(typeof data === "string" && encoding && G.Buffer ? G.Buffer.from(data, encoding) : data).length;
+      if (this._writeShutdown) return -1;
       this._socket.write(data, encoding);
       return length;
     }
-    end(data, encoding) { this._socket.end(data, encoding); return this; }
+    end(data, encoding) {
+      if (this._writeShutdown) return this;
+      this._socket.end(data, encoding);
+      return this;
+    }
     close() { this._socket.destroy(); return this; }
     terminate() { this._socket.destroy(); return this; }
     pause() { this._socket.pause(); return this; }
@@ -732,6 +806,21 @@ export constexpr std::string_view kNetJS = R"JS(
           }
           const head = latin1(this.buf, this.off, at);
           this.off = at + 4;
+          // picohttpparser refuses any control byte inside the head: every byte
+          // below 0x20 except HTAB (and the CR/LF that end a line), plus DEL.
+          // bun surfaces that as Malformed_HTTP_Response / BadRequest
+          // (compat/bun/src/picohttp/lib.rs). Accepting them let a redirect
+          // Location carrying a raw \x0b / \x01 / \x7f be followed as a normal
+          // target instead of failing the exchange.
+          for (let i = 0; i < head.length; i++) {
+            const cc = head.charCodeAt(i);
+            if (cc === 9 || cc === 10 || cc === 13) continue;
+            if (cc < 32 || cc === 127) {
+              if (this.isResponse) this._err("Malformed_HTTP_Response", "Malformed_HTTP_Response");
+              else this._err("Invalid HTTP request", "InvalidHTTPRequest");
+              return events + 1;
+            }
+          }
           const lines = head.split("\r\n");
           const first = lines.shift() || "";
           if (this.isResponse) {
@@ -1277,6 +1366,18 @@ export constexpr std::string_view kNetJS = R"JS(
     NET.items.add(item);
   };
 
+  // The reactor item is shared by every native server, so it must be retired
+  // once the last one is gone. A member of NET.items counts as "held" work in
+  // process_web's park calculation, so a leaked item makes an otherwise idle
+  // process park for LONG_PARK (60s) per loop iteration instead of exiting --
+  // `Bun.serve(...); server.stop()` looked like a hang (bun exits immediately).
+  const maybeRetireServeReactor = () => {
+    if (!NSRV || !NSRV.item) return;
+    if (NSRV.servers.size !== 0) return;
+    NET.items.delete(NSRV.item);
+    NSRV.item = null;
+  };
+
   function serveNativeImpl(opts, compiledRoutes, hostname, displayHost, wantPort) {
     let lh;
     try { lh = SN.listen(hostname, wantPort); }
@@ -1287,7 +1388,9 @@ export constexpr std::string_view kNetJS = R"JS(
     // ref-count into NET.serveActive: a listening (ref'd) server holds the
     // event loop open (bun: process stays alive until stop()/unref()).
     let refd = true;
-    const handlerRef = { fetch: opts.fetch, error: opts.error, routes: compiledRoutes, ws: opts.websocket };
+    const handlerRef = { fetch: opts.fetch, error: opts.error, routes: compiledRoutes, ws: opts.websocket,
+                         maxRequestBodySize: (typeof opts.maxRequestBodySize === "number" && opts.maxRequestBodySize > 0)
+                                               ? opts.maxRequestBodySize : 0 };
     // A bare IPv6 literal must be bracketed inside a URL authority ("[::1]"),
     // but server.hostname stays the raw form ("::1"). ref bun ServerConfig.
     const urlHost = isIPv6(displayHost) ? "[" + displayHost + "]" : displayHost;
@@ -1354,7 +1457,7 @@ export constexpr std::string_view kNetJS = R"JS(
           // us_socket_remote_address on the upgraded socket).
           remoteAddress: req.__mbunRemote ? req.__mbunRemote.address : undefined,
           server: serverObj, handlers: handlerRef.ws,
-          write: (bytes) => { try { SN.write(serverId, id, toB64(u8(bytes))); } catch (e) {} },
+          write: (bytes) => { try { SN.write(serverId, id, u8(bytes)); } catch (e) {} },  // typed array: no base64 round-trip
           detach: () => { try { return SN.detach(serverId, id); } catch (e) { return false; } },
           abort: () => { try { SN.abort(serverId, id); } catch (e) {} },
           onCleanup: () => { conns.delete(id); serverObj.pendingWebSockets--; },
@@ -1403,6 +1506,7 @@ export constexpr std::string_view kNetJS = R"JS(
           // on one of them is aborted if its entry is missing.
           NSRV.servers.delete(serverId);
         }
+        maybeRetireServeReactor();
         return Promise.resolve();
       },
     };
@@ -1421,7 +1525,7 @@ export constexpr std::string_view kNetJS = R"JS(
     // bytes + finish/abort on the request id.
     const mkSock = (id) => ({
       destroyed: false, _ended: false, _closeCbs: [],
-      write(d) { if (this.destroyed) return true; const b = u8(d); try { SN.write(serverId, id, toB64(b)); } catch (e) {} return true; },
+      write(d) { if (this.destroyed) return true; const b = u8(d); try { SN.write(serverId, id, b); } catch (e) {} return true; },
       end() { this._ended = true; return this; },
       destroy() { if (!this.destroyed) { this.destroyed = true; conns.delete(id); try { SN.abort(serverId, id); } catch (e) {} } return this; },
       once(n, cb) { if (n === "close") this._closeCbs.push(cb); return this; },
@@ -1481,12 +1585,18 @@ export constexpr std::string_view kNetJS = R"JS(
       // body framing gets a live ReadableStream fed by subsequent body events;
       // bodiless requests keep body: null (req.body === null, bun semantics).
       let bodyStream = null;
+      // maxRequestBodySize: a declared Content-Length over the limit is refused
+      // with a bodiless 413 and the handler never runs (issue 22353).
+      let tooLarge = false;
       {
         let hasBody = false;
         for (let i = 0; i + 1 < hdrs.length; i += 2) {
           const lk = String(hdrs[i]).toLowerCase();
           if (lk === "transfer-encoding" && String(hdrs[i + 1]).toLowerCase().indexOf("chunked") !== -1) hasBody = true;
-          else if (lk === "content-length" && +hdrs[i + 1] > 0) hasBody = true;
+          else if (lk === "content-length" && +hdrs[i + 1] > 0) {
+            hasBody = true;
+            if (handlerRef.maxRequestBodySize > 0 && +hdrs[i + 1] > handlerRef.maxRequestBodySize) tooLarge = true;
+          }
         }
         if (hasBody) { bodyStream = mkBodyStream(); bodies.set(ev.id, bodyStream); }
       }
@@ -1524,7 +1634,9 @@ export constexpr std::string_view kNetJS = R"JS(
       const matched = handlerRef.routes ? handlerRef.routes.match(tgt.path, ev.method) : null;
       req.params = matched ? matched.params : {};
       let out;
-      if (matched) {
+      if (tooLarge) {
+        out = new G.Response(null, { status: 413 });
+      } else if (matched) {
         const h = matched.handler;
         if (typeof h === "function") { try { out = h.call(serverObj, req, serverObj); } catch (e) { out = handleError(e); } }
         else out = (h && typeof h.clone === "function") ? h.clone() : h;   // static Response (clone per request)
@@ -1558,7 +1670,10 @@ export constexpr std::string_view kNetJS = R"JS(
           // (bun defers teardown the same way — deinit_if_we_can, mod.rs:1584).
           if (stopped && conns.size === 0) {
             try { SN.stop(serverId, false); } catch (e) {}
-            if (serveConnections(serverId) === 0) NSRV.servers.delete(serverId);
+            if (serveConnections(serverId) === 0) {
+              NSRV.servers.delete(serverId);
+              maybeRetireServeReactor();
+            }
           }
         });
       };
@@ -1656,7 +1771,9 @@ export constexpr std::string_view kNetJS = R"JS(
       netServer.listening = true;
       NET.items.add(netServer);
       const proto = tlsCfg ? "https" : "http";
-      const handlerRef = { fetch: opts.fetch, error: opts.error, routes: compiledRoutes, ws: opts.websocket };
+      const handlerRef = { fetch: opts.fetch, error: opts.error, routes: compiledRoutes, ws: opts.websocket,
+                         maxRequestBodySize: (typeof opts.maxRequestBodySize === "number" && opts.maxRequestBodySize > 0)
+                                               ? opts.maxRequestBodySize : 0 };
       const urlHost = isIPv6(displayHost) ? "[" + displayHost + "]" : displayHost;
       // bun unlinks a unix socket file on stop (Node/libuv order: before closing
       // the fd) so a restart can re-bind the path. Abstract sockets (leading NUL)
@@ -1665,6 +1782,7 @@ export constexpr std::string_view kNetJS = R"JS(
         if (!unixPath || unixPath[0] === "\0") return;
         try { (M["fs"] || M["node:fs"]).unlinkSync(unixPath); } catch (e) {}
       };
+      let urlCache;
       const serverObj = {
         port: unixPath ? undefined : lh.port,
         hostname: unixPath ? undefined : displayHost,
@@ -1674,7 +1792,16 @@ export constexpr std::string_view kNetJS = R"JS(
         id: opts.id || "",
         pendingRequests: 0,
         pendingWebSockets: 0,
-        url: new G.URL(unixPath ? "unix://" + unixPath : proto + "://" + urlHost + ":" + lh.port + "/"),
+        // Lazy, like bun's Server.url getter (server.classes.ts): a unix path
+        // that does not make a parseable URL ("unix://[object Bun]") must throw
+        // when `.url` is READ, not blow up inside Bun.serve() itself.
+        get url() {
+          if (urlCache === undefined) {
+            urlCache = new G.URL(unixPath ? "unix://" + unixPath
+                                          : proto + "://" + urlHost + ":" + lh.port + "/");
+          }
+          return urlCache;
+        },
         protocol: proto,
         fetch(req) {
           if (typeof req !== "string" && (req === null || typeof req !== "object"))
@@ -1897,6 +2024,18 @@ export constexpr std::string_view kNetJS = R"JS(
       this.headersSent = false; this.finished = false; this.writableEnded = false; this.writableFinished = false;
       this.sendDate = true;
       this._h = {}; this._meta = meta; this._chunked = false;
+      this._needDrain = false;
+    }
+    // node _http_outgoing: writableNeedDrain is a *stream* state, false until a
+    // write() actually exceeds the socket's high-water mark (issue 19111 — a
+    // standalone `new ServerResponse(req)` reported true because bufferedAmount
+    // defaulted to 1). It clears once the socket's queue has drained.
+    get writableNeedDrain() {
+      if (this.writableEnded || this.finished) return false;
+      if (!this._needDrain) return false;
+      const s = this.socket;
+      if (!s || (s.writableLength | 0) === 0) this._needDrain = false;
+      return this._needDrain;
     }
     setHeader(k, v) { this._h[String(k).toLowerCase()] = { k: String(k), v }; return this; }
     getHeader(k) { const e = this._h[String(k).toLowerCase()]; return e ? e.v : undefined; }
@@ -1938,12 +2077,26 @@ export constexpr std::string_view kNetJS = R"JS(
       const noBodyStatus = st === 204 || st === 304 || (st >= 100 && st < 200);
       const isHead = this._meta.method === "HEAD";
       this._noBody = noBodyStatus || isHead;
+      // Transfer-Encoding: chunked is HTTP/1.1-only framing. An HTTP/1.0 client
+      // (nginx `proxy_http_version 1.0`) cannot parse it, so a body of unknown
+      // length must instead be close-delimited: no TE header, no chunk framing,
+      // and the connection is what marks the end (issue 34415 — node's
+      // _http_server does the same via `chunkedEncoding` requiring 1.1).
+      const http10 = this._meta.httpVersion !== undefined && this._meta.httpVersion !== "1.1";
       if (!haveCL && !haveTE && !noBodyStatus) {
         if (contentLength !== undefined) lines.push("Content-Length: " + contentLength);
-        else if (!isHead) { this._chunked = true; lines.push("Transfer-Encoding: chunked"); }
+        else if (!isHead && !http10) { this._chunked = true; lines.push("Transfer-Encoding: chunked"); }
+        // Close-delimited: an HTTP/1.0 client can only know the body ended when
+        // the connection does, so keep-alive is off no matter what it asked for.
+        else if (!isHead && http10) this._meta.keepAlive = false;
       }
       lines.push("Connection: " + (this._meta.keepAlive ? "keep-alive" : "close"));
-      this.socket.write(lines.join("\r\n") + "\r\n\r\n");
+      // node _http_outgoing writes the header block as LATIN1: a header value is
+      // a byte string, so U+0080..U+00FF must go out as one byte each. Encoding
+      // it as UTF-8 (the socket's default) doubles those bytes, which is exactly
+      // how a `Location: /<binary utf-8 bytes>` redirect ends up double-encoded.
+      const head = lines.join("\r\n") + "\r\n\r\n";
+      this.socket.write(G.Buffer ? G.Buffer.from(head, "latin1") : head);
     }
     write(data, enc, cb) {
       if (typeof enc === "function") { cb = enc; enc = null; }
@@ -1959,6 +2112,7 @@ export constexpr std::string_view kNetJS = R"JS(
       } else {
         ok = this.socket.write(b);
       }
+      if (!ok) this._needDrain = true;
       if (typeof cb === "function") G.queueMicrotask(cb);
       return ok;
     }
@@ -2068,8 +2222,12 @@ export constexpr std::string_view kNetJS = R"JS(
           im.headers = parser.headers; im.rawHeaders = parser.rawHeaders;
           const connHdr = String(parser.headers["connection"] || "").toLowerCase();
           const keepAlive = parser.httpVersion === "1.1" ? connHdr.indexOf("close") === -1 : connHdr.indexOf("keep-alive") !== -1;
-          const meta = { method: parser.method, keepAlive, onFinished: null };
+          const meta = { method: parser.method, keepAlive, onFinished: null,
+                         httpVersion: parser.httpVersion };
           const res = new ServerResponse(sock, meta);
+          // node _http_server.ts: the response carries its IncomingMessage as
+          // `res.req` (handlers routinely switch on `res.req.url`).
+          res.req = im;
           activeRes = res;
           meta.onFinished = () => {
             activeRes = null;
@@ -2324,7 +2482,11 @@ export constexpr std::string_view kNetJS = R"JS(
     const lines = [method + " " + pathq + " HTTP/1.1"];
     if (!haveHost) lines.push("Host: " + host + (port === 80 ? "" : ":" + port));
     if (!haveConn) lines.push("Connection: keep-alive");  // bun lib.rs:976 CONNECTION_HEADER
-    if (!haveUA) lines.push("User-Agent: Bun/" + ((G.Bun && G.Bun.version) || "1.0"));
+    // `--user-agent <STR>` overrides the built-in default (Arguments.rs:1062).
+    if (!haveUA) {
+      const ovUA = G.__mbunHttpNative && G.__mbunHttpNative.userAgent();
+      lines.push("User-Agent: " + (ovUA || ("Bun/" + ((G.Bun && G.Bun.version) || "1.0"))));
+    }
     if (!haveAccept) lines.push("Accept: */*");
     for (const kv of hdrs) lines.push(kv[0] + ": " + kv[1]);
     if (bodyBytes && !haveCL) lines.push("Content-Length: " + bodyBytes.length);
@@ -2355,9 +2517,19 @@ export constexpr std::string_view kNetJS = R"JS(
         tls = pooled.tls ? 2 : 0;
       } else {
         try { fd = NN.connect(host, port); }
-        catch (e) { return reject(mkErr("Unable to connect. Is the computer able to access the url? (" + url + ")", "ConnectionRefused")); }
+        // The message is verbatim from bun's fetch error arm (FetchTasklet.rs:1345)
+        // — no URL suffix: tests pin the exact string.
+        catch (e) { return reject(mkErr("Unable to connect. Is the computer able to access the url?", "ConnectionRefused")); }
+        // undici/bun arm SO_KEEPALIVE (+TCP_KEEPIDLE) on every fetch client
+        // socket unless the request opts out with `keepalive: false` — the same
+        // flag that disables connection pooling. node:http forwards
+        // agent.keepAlive as this option.
+        if (!(init && init.keepalive === false) && NN.setSockBuf) { try { NN.setSockBuf(fd, 3, 60); } catch (e) {} }
         if (secure) {
-          try { NN.tlsWrap(fd, false, "", "", host, tlsVerify ? 1 : 0, tlsCa); tls = 1; }
+          // bun's fetch never sends a ClientHello without ALPN (it offers h2 only
+          // when HTTP/2 is enabled; this client speaks HTTP/1.1). Servers and
+          // middleboxes key off the extension. ref: regression 29780.
+          try { NN.tlsWrap(fd, false, "", "", host, tlsVerify ? 1 : 0, tlsCa, "http/1.1"); tls = 1; }
           catch (e) { try { NN.close(fd); } catch (e2) {} return reject(mkErr("fetch: TLS setup failed (" + String((e && e.message) || e) + ")", "FailedToOpenSocket")); }
         }
       }
@@ -2384,13 +2556,17 @@ export constexpr std::string_view kNetJS = R"JS(
           }
           let progress = 0;
           while (this._wq.length) {
+            // Bounded per-write base64 (see Socket._flush): a 128 MB fetch()
+            // upload otherwise re-encoded the whole body on every 64 KB socket
+            // write and was OOM-killed.
             const head = this._wq[0];
+            const piece = head.length > WCHUNK ? head.subarray(0, WCHUNK) : head;
             let n;
-            try { n = tls ? NN.tlsWrite(this._fd, toB64(head)) : NN.write(this._fd, toB64(head)); }
+            try { n = tls ? NN.tlsWrite(this._fd, toB64(piece)) : NN.write(this._fd, toB64(piece)); }
             catch (e) { this._fail(e); return progress; }
             if (n <= 0) break;
             progress++;
-            if (n < head.length) { this._wq[0] = head.subarray(n); break; }
+            if (n < head.length) { this._wq[0] = head.subarray(n); if (n < piece.length) break; continue; }
             this._wq.shift();
           }
           if (!this._eof) {
@@ -2504,8 +2680,24 @@ export constexpr std::string_view kNetJS = R"JS(
           // cost correctness.
           cleanup();
           if (depth >= 20) return reject(mkErr("Too many redirects", "TooManyRedirects"));
-          let nextUrl;
-          try { nextUrl = String(new G.URL(loc, url)); } catch (e) { nextUrl = loc; }
+          // Location is a BYTE string (the parser hands header values back
+          // latin1-decoded). The URL parser must see those bytes, not their
+          // code points re-encoded as UTF-8 — otherwise a Location carrying
+          // UTF-8 bytes comes back doubly percent-encoded (%C3%AC… instead of
+          // %EC…). Percent-escape the high bytes up front, which is what bun's
+          // URL join over the raw header bytes produces.
+          const locBytes = typeof loc === "string" && !/[^\x00-\xff]/.test(loc)
+            ? loc.replace(/[\x80-\xff]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0"))
+            : loc;
+          let nextUrl, nextProtocol;
+          try { const u = new G.URL(locBytes, url); nextUrl = String(u); nextProtocol = u.protocol; }
+          catch (e) { return reject(mkErr("InvalidRedirectURL", "InvalidRedirectURL")); }
+          // bun lib.rs:5241/5374: the hop target must speak http(s); anything
+          // else (file:, data:, ...) fails the fetch before the request goes
+          // out, so the redirect chain never reaches the origin again.
+          if (nextProtocol !== "http:" && nextProtocol !== "https:") {
+            return reject(mkErr("UnsupportedRedirectProtocol", "UnsupportedRedirectProtocol"));
+          }
           let ninit = init;
           if (parser.status === 303 || ((parser.status === 301 || parser.status === 302) && method === "POST")) {
             ninit = Object.assign({}, init, { method: "GET", body: undefined });

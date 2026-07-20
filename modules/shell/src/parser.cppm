@@ -348,6 +348,39 @@ constexpr std::array<bool, 256> SPECIAL_CHARS_TABLE = make_special_table();
 
 constexpr std::uint8_t SPECIAL_JS_CHAR = 8;
 constexpr std::uint32_t MAX_SUBSHELL_DEPTH = 128;
+
+// ref: parse.rs needs_escape_utf8_ascii_latin1 — an empty string needs escaping
+// too, so `$.escape("")` yields `""` rather than a word that vanishes.
+constexpr bool needs_escape(std::string_view text) {
+    if (text.empty()) return true;
+    for (unsigned char c : text)
+        if (SPECIAL_CHARS_TABLE[c]) return true;
+    return false;
+}
+
+// ref: parse.rs escape_8bit<ADD_QUOTES, LATIN1=false> — the input here is already
+// UTF-8 (JS hands us a UTF-8 conversion), so bytes >= 0x80 are copied verbatim.
+// Only the four chars that keep their meaning inside double quotes are
+// backslashed; the JS-object marker keeps bun's `\x08""` spelling.
+inline std::string escape_string(std::string_view text, bool addQuotes = true) {
+    constexpr std::string_view BACKSLASHABLE_CHARS{"$`\"\\"};
+    std::string out;
+    out.reserve(text.size() + (addQuotes ? 2 : 0));
+    if (addQuotes) out.push_back('"');
+    for (char c : text) {
+        if (BACKSLASHABLE_CHARS.find(c) != std::string_view::npos) {
+            out.push_back('\\');
+            out.push_back(c);
+        } else if (static_cast<unsigned char>(c) == SPECIAL_JS_CHAR) {
+            out.push_back(static_cast<char>(SPECIAL_JS_CHAR));
+            out.append("\"\"");
+        } else {
+            out.push_back(c);
+        }
+    }
+    if (addQuotes) out.push_back('"');
+    return out;
+}
 constexpr std::string_view JS_OBJREF_BODY = "__bun_";  // prefix after \x08
 constexpr std::string_view JS_STRREF_BODY = "__bunstr_";
 

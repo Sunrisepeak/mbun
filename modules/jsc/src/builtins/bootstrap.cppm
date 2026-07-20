@@ -626,10 +626,33 @@ inline constexpr std::string_view kBootstrapJS = R"JS(
       // JSC-native stacks use `fn@source` frames without it, dropping the message
       // (which is where e.g. ENOENT/path live). Prepend it when absent.
       const name = v.name || "Error";
-      const st = v.stack;
+      // `stack` can be an own accessor that throws (userland Object.defineProperty).
+      // Inspecting a value must never propagate that: node/bun both fall back to
+      // the header instead of letting console.log blow the process up.
+      // ref: regression circular-error-stack-edge-cases.
+      let st;
+      try { st = v.stack; } catch (e) { st = undefined; }
+      let head;
       if (typeof st === "string" && st.length)
-        return st.startsWith(name) ? st : ((v.message ? name + ": " + v.message : name) + "\n" + st);
-      return "[" + name + ": " + v.message + "]";
+        head = st.startsWith(name) ? st : ((v.message ? name + ": " + v.message : name) + "\n" + st);
+      else head = "[" + name + ": " + v.message + "]";
+      // Own enumerable extras ride after the stack, as node/bun print them
+      // (`Error: x\n  at …\n{\n  code: "E1",\n}`). A throwing getter is skipped,
+      // not rethrown.
+      const extraIndent = "  ".repeat(depth + 1);
+      const extras = [];
+      seen.add(v);
+      try {
+        for (const k of Object.keys(v)) {
+          if (k === "message" || k === "stack") continue;
+          let s;
+          try { s = inspectValue(v[k], opts, seen, depth + 1); } catch (e) { continue; }
+          extras.push(extraIndent +
+                      (/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(k) ? k : JSON.stringify(k)) + ": " + s + ",");
+        }
+      } finally { seen.delete(v); }
+      if (extras.length) head += " {\n" + extras.join("\n") + "\n" + "  ".repeat(depth) + "}";
+      return head;
     }
     if (G.Buffer && G.Buffer.isBuffer && G.Buffer.isBuffer(v)) return "<Buffer " + Array.from(v).map((x) => x.toString(16).padStart(2, "0")).join(" ") + ">";
     if (bun) {
@@ -645,7 +668,22 @@ inline constexpr std::string_view kBootstrapJS = R"JS(
     // trailing comma per entry. ref bun ConsoleObject.zig / fmt writeObject.
     const bunKey = (k) => /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(k) ? k : JSON.stringify(k);
     const inner = "  ".repeat(depth + 1), outer = "  ".repeat(depth);
-    const bunBlock = (label, items) => items.length ? label + "{\n" + items.map((it) => inner + it + ",").join("\n") + "\n" + outer + "}" : label + "{}";
+    // `compact: true` collapses a bun-style block onto one line (Bun.inspect's
+    // documented option); the default stays the multi-line trailing-comma form.
+    const bunCompact = opts.compact === true;
+    const bunBlock = (label, items) => !items.length ? label + "{}"
+      : bunCompact ? label + "{ " + items.join(", ") + " }"
+      : label + "{\n" + items.map((it) => inner + it + ",").join("\n") + "\n" + outer + "}";
+    // node layout: entries share one line inside the delimiters, unless
+    // `compact: false` was requested — then every entry gets its own indented
+    // line and the closing delimiter its own line too (util.inspect's
+    // reduceToSingleString "compact === false" branch).
+    const noCompact = opts.compact === false;
+    const nodeBlock = (label, items, open, close) => {
+      if (!items.length) return label + open + close;
+      if (noCompact) return label + open + "\n" + items.map((it) => inner + it).join(",\n") + "\n" + outer + close;
+      return label + open + " " + items.join(", ") + " " + close;
+    };
     if (Array.isArray(v)) {
       const items = v.map((x) => inspectValue(x, opts, seen, depth + 1));
       if (!items.length) result = "[]";
@@ -653,18 +691,18 @@ inline constexpr std::string_view kBootstrapJS = R"JS(
         const oneLine = "[ " + items.join(", ") + " ]";
         const complex = v.some((x) => x !== null && typeof x === "object" && !Array.isArray(x));
         const hasNL = items.some((s) => s.indexOf("\n") >= 0);
-        result = (!complex && !hasNL && oneLine.length <= 72) ? oneLine : "[\n" + inner + items.join(", ") + "\n" + outer + "]";
-      } else result = "[ " + items.join(", ") + " ]";
+        result = (bunCompact || (!complex && !hasNL && oneLine.length <= 72)) ? oneLine : "[\n" + inner + items.join(", ") + "\n" + outer + "]";
+      } else result = nodeBlock("", items, "[", "]");
     }
     else if (v instanceof Map) {
       const items = []; for (const [k, val] of v) items.push(inspectValue(k, opts, seen, depth + 1) + (bun ? ": " : " => ") + inspectValue(val, opts, seen, depth + 1));
       if (bun) result = bunBlock(v.size ? "Map(" + v.size + ") " : "Map ", items);
-      else result = "Map(" + v.size + ") {" + (items.length ? " " + items.join(", ") + " " : "") + "}";
+      else result = nodeBlock("Map(" + v.size + ") ", items, "{", "}");
     }
     else if (v instanceof Set) {
       const items = []; for (const x of v) items.push(inspectValue(x, opts, seen, depth + 1));
       if (bun) result = bunBlock(v.size ? "Set(" + v.size + ") " : "Set ", items);
-      else result = "Set(" + v.size + ") {" + (items.length ? " " + items.join(", ") + " " : "") + "}";
+      else result = nodeBlock("Set(" + v.size + ") ", items, "{", "}");
     }
     else if (ArrayBuffer.isView(v) && !(v instanceof DataView)) { const nm = v.constructor ? v.constructor.name : "TypedArray"; const items = Array.from(v).map(String); result = nm + "(" + v.length + ") [" + (items.length ? " " + items.join(", ") + " " : "") + "]"; }
     else {
@@ -680,12 +718,14 @@ inline constexpr std::string_view kBootstrapJS = R"JS(
       } else {
         const items = keys.map((k) => { const kk = /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(k) ? k : "'" + k + "'"; return kk + ": " + inspectValue(v[k], opts, seen, depth + 1); });
         for (const s of syms) items.push(s.toString() + ": " + inspectValue(v[s], opts, seen, depth + 1));
-        result = ctor + (items.length ? "{ " + items.join(", ") + " }" : "{}");
+        result = nodeBlock(ctor, items, "{", "}");
       }
     }
     seen.delete(v);
     return result;
   }
+  // Lazily created by util.aborted(); one registry serves every call.
+  let utilAbortedRegistry = null;
   const util = {
     inspect(o, opts) { try { return inspectValue(o, opts, null, 0); } catch (e) { if (e && e.__inspectRethrow) throw e.__inspectOriginal; return String(o); } },
     format(f, ...a) {
@@ -758,7 +798,33 @@ inline constexpr std::string_view kBootstrapJS = R"JS(
     stripVTControlCharacters(s) { return String(s).replace(/\x1b\[[0-9;]*m/g, ""); },
     debuglog() { return () => {}; }, debug() { return () => {}; },
     _extend(a, b) { return Object.assign(a, b); },
-    aborted: () => Promise.resolve(),
+    // util.aborted(signal, resource): a promise that settles when `signal`
+    // fires, but which does NOT keep `resource` alive — once `resource` is
+    // collected the abort listener is unregistered so the signal stops
+    // retaining it. ref bun src/js/node/util.ts `aborted`.
+    aborted(signal, resource) {
+      const argErr = (name, expected, v) => { const e = new TypeError('The "' + name + '" argument must be of type ' + expected + ". Received " + (typeof v === "object" ? String(v) : typeof v)); e.code = "ERR_INVALID_ARG_TYPE"; return e; };
+      if (signal === null || typeof signal !== "object" || typeof signal.addEventListener !== "function" || typeof signal.aborted !== "boolean")
+        throw argErr("signal", "AbortSignal", signal);
+      if (resource === null || typeof resource !== "object")
+        throw argErr("resource", "object", resource);
+      if (signal.aborted) return Promise.resolve();
+      let resolveFn;
+      const promise = new Promise((res) => { resolveFn = res; });
+      // A fresh closure per call: it doubles as the FinalizationRegistry
+      // unregister token, so it must not capture the caller's scope.
+      const onAbort = function () { if (utilAbortedRegistry) utilAbortedRegistry.unregister(onAbort); resolveFn(); };
+      signal.addEventListener("abort", onAbort, { once: true });
+      if (!utilAbortedRegistry && typeof G.FinalizationRegistry === "function") {
+        utilAbortedRegistry = new G.FinalizationRegistry((held) => {
+          const s = held.ref.deref();
+          if (s) s.removeEventListener("abort", held.token);
+        });
+      }
+      if (utilAbortedRegistry && typeof G.WeakRef === "function")
+        utilAbortedRegistry.register(resource, { ref: new G.WeakRef(signal), token: onAbort }, onAbort);
+      return promise;
+    },
     parseArgs(config) {
       // Faithful port of node lib/internal/util/parse_args + bun src/runtime/node/util/parse_args.rs.
       const hasOwn = (o, k) => o != null && Object.prototype.hasOwnProperty.call(o, k);
@@ -1158,9 +1224,11 @@ inline constexpr std::string_view kBootstrapJS = R"JS(
         this._eventsCount = 0;
       }
       this._maxListeners ??= undefined;
-      if ((this[kCapture] = opts?.captureRejections ? Boolean(opts.captureRejections) : EventEmitterPrototype[kCapture])) {
-        this.emit = emitWithRejectionCapture;
-      }
+      // Only the flag is stamped — never an own `emit`. An own property would
+      // shadow a subclass's prototype emit (EventEmitterAsyncResource runs
+      // super.emit inside its async scope), so the prototype emit branches on
+      // this[kCapture] instead. ref node lib/events.js EventEmitter.init.
+      this[kCapture] = opts?.captureRejections ? Boolean(opts.captureRejections) : EventEmitterPrototype[kCapture];
     }
     const EventEmitterPrototype = (EventEmitter.prototype = {});
     EventEmitterPrototype._events = undefined;
@@ -1213,7 +1281,9 @@ inline constexpr std::string_view kBootstrapJS = R"JS(
       }
       return true;
     };
-    EventEmitterPrototype.emit = emitWithoutRejectionCapture;
+    EventEmitterPrototype.emit = function emit(type) {
+      return (this[kCapture] ? emitWithRejectionCapture : emitWithoutRejectionCapture).apply(this, arguments);
+    };
 
     function overflowWarning(emitter, type, handlers) {
       handlers.warned = true;
@@ -1487,16 +1557,25 @@ inline constexpr std::string_view kBootstrapJS = R"JS(
     stdin.resume = () => { if (flowing !== true) { flowing = true; stdin.readableFlowing = true; attach(); if (!resumeScheduled) { resumeScheduled = true; G.process.nextTick(doResume); } } return stdin; };
     stdin.pause = () => { if (flowing !== false) { flowing = false; stdin.readableFlowing = false; detach(); stdin.emit("pause"); } return stdin; };
     stdin.setEncoding = (enc) => { stdin._enc = enc; return stdin; };
-    stdin.setRawMode = (flag) => {
-      flag = !!flag;
-      const O = osn();
-      if (O && typeof O.setRawMode === "function") {
-        const err = O.setRawMode(0, flag);
-        if (err) { stdin.emit("error", new Error("setRawMode failed with errno: " + err)); return stdin; }
-      }
-      stdin.isRaw = flag;
-      return stdin;
-    };
+    // setRawMode is a tty.ReadStream method: node/bun only give process.stdin a
+    // `setRawMode` when fd 0 IS a terminal (otherwise stdin is a pipe/file stream
+    // that never had one). Defining it unconditionally made every piped-stdin
+    // consumer that probes `typeof input.setRawMode === "function"` — readline
+    // with `terminal: true`, for one — call it and take an ENOTTY 'error' event
+    // that nothing listens for. ref: bun src/js/node/tty.ts (Prototype.setRawMode
+    // lives on the tty ReadStream prototype); regression 26411.
+    if (stdinIsatty()) {
+      stdin.setRawMode = (flag) => {
+        flag = !!flag;
+        const O = osn();
+        if (O && typeof O.setRawMode === "function") {
+          const err = O.setRawMode(0, flag);
+          if (err) { stdin.emit("error", new Error("setRawMode failed with errno: " + err)); return stdin; }
+        }
+        stdin.isRaw = flag;
+        return stdin;
+      };
+    }
     stdin.ref = () => stdin; stdin.unref = () => stdin;
     stdin.read = () => {
       if (!rbuf.length) return null;
@@ -1530,6 +1609,27 @@ inline constexpr std::string_view kBootstrapJS = R"JS(
       return stdin;
     };
     G.process.stdin = stdin;
+    // process.stdout/.stderr are tty.WriteStream/Socket in node & bun, i.e. real
+    // EventEmitters: consumers subscribe to "resize"/"error"/"close" on them
+    // (readline's terminal mode does `output.on("resize", ...)` unconditionally).
+    // The native objects installed by engine.inc only carry write/isTTY, so mix
+    // an EventEmitter surface in. ref: regression 26411.
+    for (const name of ["stdout", "stderr"]) {
+      const strm = G.process[name];
+      if (!strm || typeof strm.on === "function") continue;
+      const ee = new EventEmitter();
+      for (const k of ["on", "addListener", "prependListener", "once", "off", "removeListener",
+                       "removeAllListeners", "emit", "listeners", "listenerCount",
+                       "setMaxListeners", "eventNames"]) {
+        if (typeof ee[k] === "function") strm[k] = ee[k].bind(ee);
+      }
+      // Writable tail that never actually closes the descriptor (node keeps
+      // stdout/stderr open for the process lifetime).
+      strm.end = strm.end || (() => strm);
+      strm.destroy = strm.destroy || (() => strm);
+      strm.cork = strm.cork || (() => {});
+      strm.uncork = strm.uncork || (() => {});
+    }
   }
 
   // ---- URLSearchParams + URL (WHATWG-ish; runs in every context) ----
@@ -2540,7 +2640,11 @@ inline constexpr std::string_view kBootstrapJS = R"JS(
   const zNum = (opts, k, d) => opts && typeof opts[k] === "number" ? opts[k] : d;
   // node enforces kMaxLength across ALL codecs (lib/zlib.js → ERR_BUFFER_TOO_LARGE).
   const zCap = (out, opts) => { const maxLen = opts && typeof opts.maxOutputLength === "number" ? opts.maxOutputLength : (M.buffer && M.buffer.kMaxLength); if (maxLen && out.length > maxLen) { const e = new RangeError("Cannot create a Buffer larger than " + maxLen + " bytes"); e.code = "ERR_BUFFER_TOO_LARGE"; throw e; } return out; };
-  const zSync = (op, fmt) => (data, opts) => { const level = zNum(opts, "level", -1), wbits = zNum(opts, "windowBits", 15), memLevel = zNum(opts, "memLevel", 8), strategy = zNum(opts, "strategy", 0); let r; try { r = op === "c" ? ZN.compress(zB64(zToU8(data)), fmt, level, wbits, memLevel, strategy) : ZN.decompress(zB64(zToU8(data)), fmt, wbits); } catch (e) { throw zErr(e); } const out = G.Buffer.from(r, "base64"); const maxLen = opts && typeof opts.maxOutputLength === "number" ? opts.maxOutputLength : (M.buffer && M.buffer.kMaxLength); if (op === "d" && maxLen && out.length > maxLen) { const e = new RangeError("Cannot create a Buffer larger than " + maxLen + " bytes"); e.code = "ERR_BUFFER_TOO_LARGE"; throw e; } return out; };
+  // Bytes cross as a Uint8Array, not base64: the base64 bridge cost ~6x the
+  // payload in transient strings per crossing and a 150 MB deflateRawSync was
+  // OOM-killed. ZN.compress/decompress answer a Uint8Array for a typed-array
+  // input (base64 string in, base64 string out is still supported).
+  const zSync = (op, fmt) => (data, opts) => { const level = zNum(opts, "level", -1), wbits = zNum(opts, "windowBits", 15), memLevel = zNum(opts, "memLevel", 8), strategy = zNum(opts, "strategy", 0); const inp = zToU8(data); let r; try { r = op === "c" ? ZN.compress(inp, fmt, level, wbits, memLevel, strategy) : ZN.decompress(inp, fmt, wbits); } catch (e) { throw zErr(e); } const out = typeof r === "string" ? G.Buffer.from(r, "base64") : G.Buffer.from(r.buffer, r.byteOffset, r.byteLength);const maxLen = opts && typeof opts.maxOutputLength === "number" ? opts.maxOutputLength : (M.buffer && M.buffer.kMaxLength); if (op === "d" && maxLen && out.length > maxLen) { const e = new RangeError("Cannot create a Buffer larger than " + maxLen + " bytes"); e.code = "ERR_BUFFER_TOO_LARGE"; throw e; } return out; };
   const zAsync = (sync) => (data, opts, cb) => { if (typeof opts === "function") { cb = opts; opts = undefined; } if (typeof cb !== "function") throw new TypeError("The callback argument must be of type function"); G.queueMicrotask(() => { try { cb(null, sync(data, opts)); } catch (e) { cb(e); } }); };
   const deflateSync = zSync("c", "zlib"), inflateSync = zSync("d", "zlib"), gzipSync = zSync("c", "gzip"), gunzipSync = zSync("d", "gzip"), deflateRawSync = zSync("c", "raw"), inflateRawSync = zSync("d", "raw"), unzipSync = zSync("d", "auto");
   // brotli (native BrotliEncoder/Decoder via __mbunZlibNative). node forwards
@@ -2580,8 +2684,13 @@ inline constexpr std::string_view kBootstrapJS = R"JS(
     G.Bun.inflateSync = (data) => { try { return asU8(inflateRawSync(data)); } catch (e) { return asU8(inflateSync(data)); } };
     G.Bun.gzipSync = (data, opts) => asU8(gzipSync(data, opts));
     G.Bun.gunzipSync = (data) => asU8(gunzipSync(data));
-    G.Bun.zstdCompressSync = (data, opts) => asU8(zstdCompressSync(data, opts));
-    G.Bun.zstdDecompressSync = (data) => asU8(zstdDecompressSync(data));
+    // zstd is the exception: bun's JSZstd::{compress,decompress}{,_sync} return a
+    // node Buffer (JSValue::create_buffer in src/runtime/api/BunObject.rs), not a
+    // plain Uint8Array, so `.toString()` decodes UTF-8 instead of joining bytes.
+    G.Bun.zstdCompressSync = (data, opts) => zstdCompressSync(data, opts);
+    G.Bun.zstdDecompressSync = (data, opts) => zstdDecompressSync(data, opts);
+    G.Bun.zstdCompress = async (data, opts) => zstdCompressSync(data, opts);
+    G.Bun.zstdDecompress = async (data, opts) => zstdDecompressSync(data, opts);
   }
   // ---- Bun.ArrayBufferSink (ref: src/runtime/webcore/ArrayBufferSink.rs) ----
   // A byte accumulator: write() appends string(UTF-8)/ArrayBuffer/TypedArray
@@ -2957,11 +3066,25 @@ inline constexpr std::string_view kBootstrapJS = R"JS(
   // Diagnostic/internal surfaces bun's test harness imports at load time. Real
   // semantics where knowable (isASANEnabled=false for this build); otherwise
   // best-effort so the harness loads (tests asserting internals fail honestly).
+  // Shared synthetic-allocation-limit guard (bun: jsc::virtual_machine::
+  // synthetic_allocation_limit / bun_core STRING_ALLOCATION_LIMIT). Surfaces
+  // that would materialize `byteLength` bytes as a JS string / typed array
+  // fail with the same message real bun/JSC produces instead of allocating.
+  G.__mbunCheckAllocLimit = (byteLength, kind) => {
+    if (byteLength <= (G.__mbunSyntheticAllocationLimit || 0xFFFFFFFF)) return;
+    if (kind === "text") throw new RangeError("Cannot create a string longer than 2^32-1 characters");
+    if (kind === "json") throw new RangeError("Cannot parse a JSON string longer than 2^32-1 characters");
+    throw new RangeError("Out of memory");
+  };
   M["bun:jsc"] = {
-    heapStats: () => ({ heapSize: 0, heapCapacity: 0, objectCount: 0, protectedObjectCount: 0,
+    heapStats:() => ({ heapSize: 0, heapCapacity: 0, objectCount: 0, protectedObjectCount: 0,
                         globalObjectCount: 0, objectTypeCounts: {}, protectedObjectTypeCounts: {} }),
     memoryUsage: () => ({ current: 0, peak: 0 }),
-    getRandomSeed: () => 0, setRandomSeed: () => {}, gcAndSweep: () => 0, fullGC: () => 0, edenGC: () => 0,
+    getRandomSeed: () => 0, setRandomSeed: () => {},
+    // Real collect+sweep (JSGarbageCollect) — see runtime/engine.inc __mbunGcNative.
+    gcAndSweep: () => (G.__mbunGcNative ? G.__mbunGcNative(true) : 0),
+    fullGC: () => (G.__mbunGcNative ? G.__mbunGcNative(true) : 0),
+    edenGC: () => (G.__mbunGcNative ? G.__mbunGcNative(false) : 0),
     isRope: () => false, describe: (v) => String(v), describeArray: () => "",
     serialize: (v) => v, deserialize: (v) => v, drainMicrotasks: () => {},
     getProtectedObjects: () => [], totalCompileTime: () => 0,
@@ -2969,9 +3092,33 @@ inline constexpr std::string_view kBootstrapJS = R"JS(
     // Bound to the native directly: any JS wrapper would itself become the
     // "caller" (its source origin is the builtins blob, i.e. empty).
     callerSourceOrigin: G.__mbunJscInternalsNative.callerSourceOriginNative,
+    // bun BunJSCModule.h:931 — the cell's own estimated size. Objects whose
+    // native-equivalent storage lives in a builtins closure (Performance's
+    // entry buffer, AbortSignal's abort-algorithm list — WebCore members that
+    // bun accounts for in memoryCost()) publish it through the
+    // Symbol.for("mbun.memoryCost") hook, so the total stays comparable to
+    // bun's estimatedSizeInBytes() for the same object.
+    estimateShallowMemoryUsageOf: (value) => {
+      let n = G.__mbunJscInternalsNative.estimateShallowMemoryUsageOfNative(value);
+      if (value !== null && (typeof value === "object" || typeof value === "function")) {
+        try {
+          const cost = value[Symbol.for("mbun.memoryCost")];
+          if (typeof cost === "function") n += cost.call(value) || 0;
+        } catch (e) {}
+      }
+      return n;
+    },
   };
   M["bun:internal-for-testing"] = {
     isASANEnabled: () => false,
+    // canonicalizeIP (src/js/internal-for-testing.ts:16 → NodeTLS.cpp
+    // Bun__canonicalizeIP): inet_pton/inet_ntop round trip; undefined for a
+    // non-IP literal or a CIDR. Same native the node:tls IP-SAN check uses.
+    canonicalizeIP: (...a) => {
+      const N = G.__mbunNodeTlsNative;
+      if (!N || typeof N.canonicalizeIP !== "function") return undefined;
+      return N.canonicalizeIP(...a);  // spread so a 0-arg call still throws
+    },
     // createStatsForIno(ino, bigint): builds a Stats whose .ino carries a u64
     // inode through the number path (static_cast<double>) or the bigint path
     // (static_cast<int64_t> == BigInt.asIntN(64, ino)). NFS inodes exceed
@@ -2982,10 +3129,18 @@ inline constexpr std::string_view kBootstrapJS = R"JS(
         isFile: () => true, isDirectory: () => false, isSymbolicLink: () => false,
         isBlockDevice: () => false, isCharacterDevice: () => false, isFIFO: () => false, isSocket: () => false };
     },
-    // JSC synthetic allocation limit knob the fs-oom test flips to force an
-    // allocation-failure throw. No JSC hook wired yet, so it is a no-op (the
-    // test then asserts nothing OOMs — an honest degrade, not a false green).
-    setSyntheticAllocationLimitForTesting: () => {},
+    // Synthetic allocation limit (bun virtual_machine_exports.rs
+    // Bun__setSyntheticAllocationLimitForTesting): clamped to >= 1 MiB, returns
+    // the previous value. Read by the fs/Blob "would this allocation blow up?"
+    // guards via globalThis.__mbunSyntheticAllocationLimit, so a test can force
+    // a graceful ENOMEM/RangeError instead of a real multi-GB allocation.
+    setSyntheticAllocationLimitForTesting: (limit) => {
+      const prev = G.__mbunSyntheticAllocationLimit;
+      const n = Number(limit);
+      if (!Number.isFinite(n)) throw new TypeError("setSyntheticAllocationLimitForTesting expects a number");
+      G.__mbunSyntheticAllocationLimit = Math.max(Math.trunc(n), 1024 * 1024);
+      return prev;
+    },
     // xxHash3ForTesting(bytes, seed?) — full-u64-seed XXH3_64bits (native).
     xxHash3ForTesting: G.__mbunXxHash3ForTesting,
     // bun internal-for-testing.ts:273 → socket_body.rs js_set_socket_options:
@@ -3060,10 +3215,33 @@ inline constexpr std::string_view kBootstrapJS = R"JS(
     };
     expectStub.extend = () => {}; expectStub.any = (c) => ({ __any: c }); expectStub.anything = () => ({});
     const hook = () => {};
+    // setSystemTime IS live outside `bun test` (bun installs the native
+    // JSMock__jsSetSystemTime on the module regardless of the runner) — issue
+    // 32793 pins the clock from `bun -e`. The Date patch is installed lazily on
+    // the first call so an ordinary run keeps the untouched native Date.
+    let sysTime = null;
+    const setSystemTime = (v) => {
+      if (v === undefined || v === null) { sysTime = null; return; }
+      sysTime = (typeof v === "number") ? v : Number(v.valueOf());
+      if (G.__mbunRunDatePatched) return;
+      G.__mbunRunDatePatched = true;
+      const RD = G.Date;
+      const MbunDate = function Date(...args) {
+        if (!new.target) return RD();                       // Date() → string
+        const a = (args.length === 0 && sysTime !== null) ? [sysTime] : args;
+        return Reflect.construct(RD, a, new.target);        // keeps `class X extends Date`
+      };
+      MbunDate.prototype = RD.prototype;
+      Object.setPrototypeOf(MbunDate, RD);                  // UTC/parse/… statics
+      MbunDate.now = function () { return sysTime === null ? RD.now() : sysTime; };
+      G.Date = MbunDate;
+    };
     Object.defineProperty(M, "bun:test", { enumerable: true, configurable: true,
       get() { return G.__mbunBT || { test: noop, it: noop, xit: noop.skip, xtest: noop.skip,
-        describe: desc, xdescribe: desc, expect: expectStub, jest: { fn: (i) => i || (() => {}) },
+        describe: desc, xdescribe: desc, expect: expectStub,
+        jest: { fn: (i) => i || (() => {}), setSystemTime: (v) => { setSystemTime(v); } },
         mock: (i) => i || (() => {}), spyOn: () => ({ mockRestore() {} }),
+        setSystemTime: setSystemTime,
         beforeAll: hook, afterAll: hook, beforeEach: hook, afterEach: hook, setDefaultTimeout: hook }; } });
   }
 
@@ -3173,6 +3351,25 @@ inline constexpr std::string_view kBootstrapJS = R"JS(
     };
     walk(src, dest);
   };
+  // bun node_fs.rs should_throw_out_of_memory_early_for_javascript: a read whose
+  // *decoded* length would exceed the synthetic allocation limit fails with
+  // ENOMEM instead of really allocating. Without this, readFileSync("/dev/zero")
+  // (st_size 0 ⇒ read-to-EOF) grows forever and the process is OOM-killed.
+  // The divisor is the worst-case byte→code-unit expansion of each encoding.
+  const fsOomDivisor = (enc) => {
+    switch (enc) {
+      case "utf8": case "utf-8": case "utf16le": case "utf-16le": case "ucs2": case "ucs-2": return 4;
+      case "hex": return 2;
+      case "base64": case "base64url": return 3;
+      default: return 1;
+    }
+  };
+  const fsSynthLimit = () => G.__mbunSyntheticAllocationLimit || 0xFFFFFFFF;
+  // Largest byte count still under the limit once decoded; past it → ENOMEM.
+  const fsOomCap = (enc) => fsOomDivisor(enc) * (fsSynthLimit() + 1);
+  const fsOomError = (path2) =>
+    Object.assign(new Error("ENOMEM: not enough memory, read '" + path2 + "'"),
+                  { code: "ENOMEM", errno: -12, syscall: "read", path: path2 });
   const fsMod = {
     // node fs.readFileSync: no encoding → Buffer (was wrongly a String).
     // Reads real bytes via the native fd path (binary-correct; F.readFile
@@ -3180,33 +3377,52 @@ inline constexpr std::string_view kBootstrapJS = R"JS(
     // harness (which patches Buffer.prototype.toUnixString) needs this.
     readFileSync: (p, opts) => {
       const enc = typeof opts === "string" ? opts : (opts && opts.encoding);
-      const FD = globalThis.__mbunFdNative, path2 = toStr(p), fd = FD.open(path2, "r", 0o666);
+      const FD = globalThis.__mbunFdNative;
+      // node/bun accept a raw fd; it stays open (the caller owns it).
+      const isFd = typeof p === "number";
+      const path2 = isFd ? String(p) : toStr(p);
+      const fd = isFd ? p : FD.open(path2, "r", 0o666);
+      const cap = fsOomCap(enc);
       try {
-        let size = (F.stat(path2) && F.stat(path2).size) | 0;
+        let size = (!isFd && F.stat(path2) && F.stat(path2).size) | 0;
         if (size <= 0) size = 65536;  // procfs / char devices report st_size 0 — read to EOF
+        if (size > cap) throw fsOomError(path2);
         let u = new Uint8Array(size);
         let off = 0, n;
         for (;;) {
-          if (off >= u.length) { const g = new Uint8Array(u.length * 2); g.set(u); u = g; }
+          if (off >= u.length) {
+            if (u.length > cap) throw fsOomError(path2);
+            const g = new Uint8Array(Math.min(u.length * 2, cap + 8192)); g.set(u); u = g;
+          }
           n = FD.read(fd, u, off, u.length - off, -1);
           if (n <= 0) break;
           off += n;
+          if (off > cap) throw fsOomError(path2);
         }
         const buf = Buffer.from(u.buffer, 0, off);
         return enc ? buf.toString(enc) : buf;
-      } finally { FD.close(fd); }
+      } finally { if (!isFd) FD.close(fd); }
     },
     // Binary data must NOT cross the C-API string boundary (NUL/UTF-8 mangling):
     // typed arrays / ArrayBuffers write through the fd native path byte-exact.
-    writeFileSync: (p, d) => {
+    writeFileSync: (p, d, o) => {
+      // node: options may be an encoding string or { encoding, mode, flag };
+      // `mode` is the creation mode (default 0o666) and must be applied even
+      // when the file already exists is false — a fresh file created with
+      // mode 0o777 has to come out executable (cli/run/run-extensionless).
+      const mode = (o && typeof o === "object" && o.mode != null)
+        ? (typeof o.mode === "string" ? parseInt(o.mode, 8) : (Number(o.mode) & 0o7777))
+        : null;
       if (ArrayBuffer.isView(d) || d instanceof ArrayBuffer) {
         const FD = globalThis.__mbunFdNative;
         const u = d instanceof ArrayBuffer ? new Uint8Array(d) : new Uint8Array(d.buffer, d.byteOffset, d.byteLength);
-        const fd = FD.open(toStr(p), "w", 0o666);
+        const fd = FD.open(toStr(p), "w", mode == null ? 0o666 : mode);
         try { FD.write(fd, u, 0, u.byteLength, -1); } finally { FD.close(fd); }
+        if (mode != null) { try { F.chmod(toStr(p), mode); } catch (e) {} }
         return;
       }
       F.writeFile(toStr(p), toStr(d));
+      if (mode != null) { try { F.chmod(toStr(p), mode); } catch (e) {} }
     },
     appendFileSync: (p, d) => F.appendFile(toStr(p), toStr(d)),
     existsSync: (p) => F.exists(toStr(p)),

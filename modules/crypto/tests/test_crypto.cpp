@@ -121,6 +121,39 @@ int main() {
                   "fb8e20fc2e4c3f248c60c39bd652f3c1347298bb977b8b4d5903b85055620603");
     }
 
+    // MD4 (RFC 1320 appendix A.5) / RIPEMD-160 (Dobbertin et al. test suite),
+    // one-shot and multi-part — the streaming classes back Bun.CryptoHasher's
+    // "md4"/"ripemd160" algorithms, so a split update must equal the one-shot.
+    check_hex("md4()", to_hex(md4(bytes(""))), "31d6cfe0d16ae931b73c59d7e0c089c0");
+    check_hex("md4(abc)", to_hex(md4(bytes("abc"))), "a448017aaf21d8525fc10ae87aa6729d");
+    check_hex("md4(message digest)", to_hex(md4(bytes("message digest"))),
+              "d9130a8164549fe818874806e1c7014b");
+    {
+        Md4 h;
+        h.update(bytes("mess"));
+        h.update(bytes("age dig"));
+        h.update(bytes("est"));
+        std::vector<std::uint8_t> out(Md4::DIGEST_LENGTH);
+        h.final_(out.data());
+        check_hex("md4 multi-part", to_hex(out), "d9130a8164549fe818874806e1c7014b");
+    }
+    check_hex("ripemd160()", to_hex(ripemd160(bytes(""))),
+              "9c1185a5c5e9fc54612808977ee8f548b2258d31");
+    check_hex("ripemd160(abc)", to_hex(ripemd160(bytes("abc"))),
+              "8eb208f7e05d987a9b044a8e98c6b087f15a0bfc");
+    check_hex("ripemd160(message digest)", to_hex(ripemd160(bytes("message digest"))),
+              "5d0689ef49d2fae572b881b123a85ffa21595f36");
+    {
+        Ripemd160 h;
+        h.update(bytes("mess"));
+        h.update(bytes("age dig"));
+        h.update(bytes("est"));
+        std::vector<std::uint8_t> out(Ripemd160::DIGEST_LENGTH);
+        h.final_(out.data());
+        check_hex("ripemd160 multi-part", to_hex(out),
+                  "5d0689ef49d2fae572b881b123a85ffa21595f36");
+    }
+
     // base64 digest of sha256("")
     check_hex("sha256 base64 empty", CryptoHasher::hash("sha256", bytes("")).and_then([](auto v) {
                   return std::optional<std::string>(to_base64(v));

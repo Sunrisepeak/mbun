@@ -118,6 +118,24 @@ public:
         return out;
     }
 
+    // bun wraps every entry point in a prelude that auto-starts a server when the
+    // module's default export looks like a Bun.serve config (ref: bun
+    // src/bundler/entry_points.rs — `isServerConfig(def)` is "has a fetch function
+    // or an app, and is not itself a Server (no .stop)"). The started server is
+    // announced with console.debug. mbun evaluates the entry as CJS, so the entry
+    // namespace is `globalThis.module.exports`; this runs the same check there,
+    // once the top level has finished.
+    std::expected<void, std::string> serve_default_export_() {
+        return eval_void(
+            "(function(){var ns=globalThis.module&&globalThis.module.exports;"
+            "var def=ns&&ns.default;"
+            "if(!(def&&def!==globalThis&&(typeof def.fetch==='function'||def.app!=undefined)"
+            "&&typeof def.stop!=='function'))return;"
+            "var server=Bun.serve(def);"
+            "console.debug('Started '+(server.development?'development ':'')+'server: '+"
+            "server.protocol+'://'+server.hostname+':'+server.port);})();");
+    }
+
     // Install the CommonJS environment for a top-level module evaluated in the
     // shared context: require bound to `dir`, plus module/exports/__dirname/
     // __filename. Used by both `mbun run` and the bun:test runner so test files
@@ -186,7 +204,9 @@ public:
     // .env.local (skipped under `bun test`), .env.{mode}, .env. `mode` =
     // NODE_ENV (or "development" when running, "test" under `bun test`).
     void apply_dotenv(bool isTest) {
-        if (gDisableEnvFiles) return;
+        // `--env-file` wins over `--no-env-file`: env_loader.rs:657 takes the
+        // explicit branch before it ever consults skip_default_env.
+        if (gDisableEnvFiles && gEnvFiles.empty()) return;
         std::error_code ec;
         const std::string cwd{std::filesystem::current_path(ec).string()};
         if (ec) return;
@@ -209,14 +229,36 @@ public:
         const std::size_t shellCount{map.count()};
 
         std::vector<std::string> files;
-        files.push_back(".env." + mode + ".local");
-        if (!isTest) files.push_back(".env.local");
-        files.push_back(".env." + mode);
-        files.emplace_back(".env");
+        if (!gEnvFiles.empty()) {
+            // env_loader.rs:678-699 `load_explicit_files`: walk the --env-file
+            // arguments backwards, and each comma-separated entry backwards too,
+            // so the last path named on the command line has highest priority
+            // under the shared OVERWRITE=false parse.
+            for (auto arg{gEnvFiles.rbegin()}; arg != gEnvFiles.rend(); ++arg) {
+                std::vector<std::string> parts;
+                std::string_view rest{*arg};
+                while (!rest.empty()) {
+                    const auto comma{rest.find(',')};
+                    parts.emplace_back(rest.substr(0, comma));
+                    if (comma == std::string_view::npos) break;
+                    rest.remove_prefix(comma + 1);
+                }
+                for (auto p{parts.rbegin()}; p != parts.rend(); ++p) {
+                    if (!p->empty()) files.push_back(*p);
+                }
+            }
+        } else {
+            files.push_back(".env." + mode + ".local");
+            if (!isTest) files.push_back(".env.local");
+            files.push_back(".env." + mode);
+            files.emplace_back(".env");
+        }
         const mbun::dotenv::ParseOptions opts{
             .override_existing = false, .is_process = false, .expand = true};
         for (const auto& f : files) {
-            auto content{read_file(cwd + "/" + f)};
+            const bool absolute{!f.empty() &&
+                                std::filesystem::path{f}.is_absolute()};
+            auto content{read_file(absolute ? f : cwd + "/" + f)};
             if (!content) continue;
             mbun::dotenv::parse_into(map, *content, opts);
         }
@@ -224,22 +266,37 @@ public:
         // Keys past `shellCount` were introduced by the .env files (each holding
         // its highest-priority value); apply them into JS process.env without
         // overwriting shell-set vars.
-        std::string js{"(function(){var e=process.env;"};
-        bool any{false};
+        // Set the properties through the C API rather than generating source.
+        // The generated form built one statement per variable, so upstream's
+        // 50 000-entry .env (cli/run/env.test.ts) produced a ~3 MB script with
+        // 50 000 statements: JSC parsed all of it, and glibc then aborted in
+        // free() while releasing the buffer — a ~60% crash rate under the test
+        // sandbox. Writing the properties directly is O(n) with no source, no
+        // parse, and no multi-megabyte allocation; process.env's proxy traps
+        // still see every write.
+        JSObjectRef globalObj{JSContextGetGlobalObject(ctx_)};
+        JSValueRef processVal{get_prop(ctx_, globalObj, "process")};
+        if (!JSValueIsObject(ctx_, processVal)) return;
+        JSObjectRef processObj{JSValueToObject(ctx_, processVal, nullptr)};
+        if (processObj == nullptr) return;
+        JSValueRef envVal{get_prop(ctx_, processObj, "env")};
+        if (!JSValueIsObject(ctx_, envVal)) return;
+        JSObjectRef envObj{JSValueToObject(ctx_, envVal, nullptr)};
+        if (envObj == nullptr) return;
+
+        const auto setIfUnset{[&](const std::string& key, const std::string& value) {
+            JSStringRef name{JSStringCreateWithUTF8CString(key.c_str())};
+            const JSValueRef current{JSObjectGetProperty(ctx_, envObj, name, nullptr)};
+            if (current == nullptr || JSValueIsUndefined(ctx_, current)) {
+                JSObjectSetProperty(ctx_, envObj, name, make_string(ctx_, value),
+                                    kJSPropertyAttributeNone, nullptr);
+            }
+            JSStringRelease(name);
+        }};
         for (std::size_t i{shellCount}; i < map.count(); ++i) {
-            const std::string k{map.key_at(i)};
-            const std::string v{map.value_at(i)};
-            js += "if(e[" + json_quote_(k) + "]===undefined)e[" + json_quote_(k) +
-                  "]=" + json_quote_(v) + ";";
-            any = true;
+            setIfUnset(std::string{map.key_at(i)}, std::string{map.value_at(i)});
         }
-        if (isTest && nodeEnv.empty()) {
-            js += "if(e.NODE_ENV===undefined)e.NODE_ENV='test';";
-            any = true;
-        }
-        if (!any) return;
-        js += "})();";
-        (void)eval_void(js);
+        if (isTest && nodeEnv.empty()) setIfUnset("NODE_ENV", "test");
     }
 
     int run_script(const std::string& absPath, const std::string& source) {
@@ -259,6 +316,26 @@ public:
         apply_dotenv(/*isTest=*/false);
         unhandledRejection_ = false;
         install_unhandled_rejection_hook_();
+        // bunfig `preload = [...]` runs before the entry point, in order, in the
+        // same context (its plugins/globals must be visible to the entry).
+        // jsc_hooks.rs:730-767: an unresolvable specifier is fatal and reported
+        // as `preload not found <json-quoted specifier>`; an exception thrown by
+        // a preload aborts the run before the entry is ever imported.
+        for (const std::string& spec : gPreloads) {
+            std::error_code pec{};
+            std::filesystem::path p{spec};
+            if (!p.is_absolute()) p = std::filesystem::current_path(pec) / spec;
+            if (!std::filesystem::exists(p, pec) || std::filesystem::is_directory(p, pec)) {
+                std::cerr << "error: preload not found " << json_quote_(spec) << '\n';
+                return 1;
+            }
+            if (auto r{eval_void("globalThis.require(" +
+                                 json_quote_(p.lexically_normal().string()) + ");")};
+                !r) {
+                std::cerr << "error: " << r.error() << '\n';
+                return 1;
+            }
+        }
         std::string js{source};
         bool tla{false};
         // `// @bun` pragma (after an optional hashbang line): the entry is already
@@ -289,6 +366,8 @@ public:
                                   os_fs(), parent_dir(absPath))};
             mbun::js_parser::TranspileResult t{mbun::js_parser::transpile(
                 source, {.cjs = true,
+                         // The entry wrapper binds __mbun_esm_require too.
+                         .cjs_require_alias = true,
                          .jsx = jsx,
                          .legacy_decorators = legacy,
                          // The entry file links like any other module, so it
@@ -312,13 +391,75 @@ public:
                 (void)use_esm_require(dir);
             }
         }
+        // `// @bun @bun-cjs`: an already-bundled CommonJS entry whose whole body
+        // IS the `(function (exports, require, module, __filename, __dirname) {…})`
+        // wrapper expression. bun evaluates the source and requires the completion
+        // value to be callable, else it throws the fixed TypeError below.
+        // PORT-SOURCE: js_parser/parse/parse_entry.rs:2352 (AlreadyBundled::BunCjs)
+        // + jsc/bindings/JSCommonJSModule.cpp:191-201 (the wrapper check).
+        if (bunPragma && source.substr(0, source.find('\n')).find("@bun-cjs") != std::string::npos) {
+            JSValueRef exc{nullptr};
+            JSValueRef wrapper{eval_(js, &exc, absPath)};
+            if (exc != nullptr) {
+                std::cerr << "error: " << describe_exception_(exc) << '\n';
+                return 1;
+            }
+            JSObjectRef fn{JSValueIsObject(ctx_, wrapper)
+                               ? JSValueToObject(ctx_, wrapper, nullptr)
+                               : nullptr};
+            if (fn == nullptr || !JSObjectIsFunction(ctx_, fn)) {
+                std::cerr << "error: TypeError: Expected CommonJS module to have a function "
+                             "wrapper. If you weren't messing around with Bun's internals, this "
+                             "is a bug in Bun\n";
+                return 1;
+            }
+            set_prop(ctx_, JSContextGetGlobalObject(ctx_), "__mbunCjsWrapper", wrapper);
+            if (auto r{eval_void("globalThis.__mbunCjsWrapper(globalThis.exports, "
+                                 "globalThis.require, globalThis.module, globalThis.__filename, "
+                                 "globalThis.__dirname);",
+                                 absPath)};
+                !r) {
+                std::cerr << "error: " << r.error() << '\n';
+                return 1;
+            }
+            pump_event_loop("0");
+            if (unhandledRejection_) {
+                std::cerr << "error: Unhandled promise rejection\n";
+                return 1;
+            }
+            return 0;
+        }
         std::string script{transform_module_(js)};
+        // Node/bun evaluate the entry in a MODULE scope, never the global one: a
+        // top-level `const Buffer = …` there must stay module-local. Evaluated as
+        // a plain script it would instead create a *global lexical* binding that
+        // every other module resolves too — so a module required on an earlier
+        // line (before that const initializes) hit "Cannot access 'Buffer' before
+        // initialization" instead of seeing the real global. Wrap the entry in the
+        // same CommonJS function wrapper require() uses. The prefix stays on line
+        // 1 (and a hashbang is neutralized in place) so reported line numbers are
+        // unchanged; `this` is module.exports, as in node.
+        //
+        // An entry that declares its own top-level `require` gets that parameter
+        // renamed, its lowered imports having been emitted against
+        // __mbun_esm_require (js_parser kEsmRequireAlias) — the same collision
+        // rule the require() wrapper in module_loading.inc applies.
+        const std::string cjsParams{
+            std::string{"exports, "} +
+            (mbun::js_parser::declares_top_level_require(source) ? "__mbun_prequire" : "require") +
+            ", module, __filename, __dirname, __mbun_esm_require"};
+        const std::string cjsArgs{
+            ".call(globalThis.module.exports, globalThis.exports, globalThis.require, "
+            "globalThis.module, globalThis.__filename, globalThis.__dirname, globalThis.require)"};
+        if (script.starts_with("#!")) script.replace(0, 2, "//");
+        const std::string entryScript{"(function (" + cjsParams + ") {" + script + "\n})" +
+                                      cjsArgs + ";"};
         // A top-level-await entry (flagged by the transpiler) goes straight to the
         // async wrapper: in script mode `await (expr)` would otherwise PARSE as a
         // call to an `await` identifier and fail at run time, after side effects.
         if (auto r{tla ? std::expected<void, std::string>{std::unexpected{
                              std::string{"SyntaxError: top-level await"}}}
-                       : eval_void(script, absPath)};
+                       : eval_void(entryScript, absPath)};
             !r) {
             // JSC's C-API script mode has no top-level-await support, so a module
             // using TLA fails to PARSE (SyntaxError, before any execution). Retry it
@@ -331,8 +472,8 @@ public:
             }
             (void)eval_void("globalThis.__mbun_run_done=0;globalThis.__mbun_run_err=undefined;");
             const std::string wrapped{
-                "(async function(){\n" + script +
-                "\n})().then(function(){globalThis.__mbun_run_done=1;},"
+                "(async function (" + cjsParams + ") {" + script + "\n})" + cjsArgs +
+                ".then(function(){globalThis.__mbun_run_done=1;},"
                 // JSC's Error.stack omits the "Name: message" line, so build it
                 // explicitly (else an uncaught rejection prints only stack frames).
                 "function(e){var s=(e&&e.stack)||'';"
@@ -355,6 +496,10 @@ public:
             // top level that idled out unsettled keeps the legacy bailout
             // (draining it would turn a wedged await into an infinite hang).
             if (settled) {
+                if (auto s{serve_default_export_()}; !s) {
+                    std::cerr << "error: " << s.error() << '\n';
+                    return 1;
+                }
                 pump_event_loop("0");
                 if (unhandledRejection_) {
                     std::cerr << "error: Unhandled promise rejection\n";
@@ -368,6 +513,10 @@ public:
             // processes (async spawn's exit/close events are driven by
             // __mbun_io_tick from this pump). A never-true done-expr lets
             // pump_event_loop self-bound on "no timers, no network, no live child".
+            if (auto s{serve_default_export_()}; !s) {
+                std::cerr << "error: " << s.error() << '\n';
+                return 1;
+            }
             pump_event_loop("0");
             if (unhandledRejection_) {
                 std::cerr << "error: Unhandled promise rejection\n";
@@ -403,9 +552,29 @@ public:
         if (g == nullptr) return;
         bool* flag{&unhandledRejection_};
         JSC::JSNativeStdFunction* cb{JSC::JSNativeStdFunction::create(
-            g->vm(), g, 1, WTF::String::fromLatin1("onUnhandledRejection"),
-            [flag](JSC::JSGlobalObject* gg, JSC::CallFrame*) -> JSC::EncodedJSValue {
-                *flag = true;
+            g->vm(), g, 2, WTF::String::fromLatin1("onUnhandledRejection"),
+            [flag](JSC::JSGlobalObject* gg, JSC::CallFrame* frame) -> JSC::EncodedJSValue {
+                // JSC invokes this with (promise, reason) (VM::callPromiseRejectionCallback).
+                // Hand both to the JS dispatcher, which mirrors node's
+                // 'unhandledRejection' → 'uncaughtException' escalation. Only when
+                // nothing claimed the rejection does the process-level flag arm.
+                JSContextRef ctx{toRef(gg)};
+                JSObjectRef global{JSContextGetGlobalObject(ctx)};
+                JSStringRef name{JSStringCreateWithUTF8CString("__mbunOnUnhandledRejection")};
+                JSValueRef disp{JSObjectGetProperty(ctx, global, name, nullptr)};
+                JSStringRelease(name);
+                bool handled{false};
+                if (disp != nullptr && JSValueIsObject(ctx, disp)) {
+                    JSObjectRef fn{JSValueToObject(ctx, disp, nullptr)};
+                    if (fn != nullptr && JSObjectIsFunction(ctx, fn)) {
+                        const JSValueRef args[2]{toRef(gg, frame->argument(1)),
+                                                 toRef(gg, frame->argument(0))};
+                        JSValueRef exc{nullptr};
+                        JSValueRef r{JSObjectCallAsFunction(ctx, fn, nullptr, 2, args, &exc)};
+                        handled = exc == nullptr && r != nullptr && JSValueToBoolean(ctx, r);
+                    }
+                }
+                if (!handled) *flag = true;
                 return JSC::JSValue::encode(JSC::jsUndefined());
             })};
         g->setUnhandledRejectionCallback(g->vm(), cb);
@@ -424,6 +593,9 @@ public:
             if (auto d{eval_number(doneCheck)}; d && *d == 1.0) return true;
             (void)eval_void("globalThis.__mbun_drain_timers && globalThis.__mbun_drain_timers(200);");
             (void)eval_void("globalThis.__mbunNetDrain && globalThis.__mbunNetDrain();");
+            // Deliver any POSIX signal that arrived since the last iteration to
+            // its process.on("SIG…") listeners (the handler itself only set a flag).
+            (void)eval_void("globalThis.__mbunSignalTick && globalThis.__mbunSignalTick();");
             drain_microtasks_();
             auto ioBusy{eval_number("globalThis.__mbun_io_tick ? __mbun_io_tick() : 0")};
             drain_microtasks_();
@@ -616,482 +788,7 @@ public:
         }
     }
 
-    // `esm`: the *importing* module's source used ESM syntax, so this require()
-    // is a lowered `import` and must resolve with the "import" condition (not
-    // "require"). See __mbun_make_require_esm below for how it is threaded in.
-    // `typeAttr`: the import's `type` attribute (`with { type: "text" }`), threaded
-    // from the lowered require() call; empty when absent. It overrides the
-    // extension-derived loader — see module_loader.cppm ModuleLoader::load.
-    JSValueRef require_impl(JSContextRef ctx, const std::string& spec,
-                            const std::string& fromDir, JSValueRef* exc, bool esm = false,
-                            const std::string& typeAttr = {}, bool importStmt = false) {
-        if (auto b{builtin_module(ctx, spec)}) {
-            return *b;
-        }
-        // data: URL import. bun parses the specifier as a DataURL
-        // (resolver/data_url.rs DataURL::parse_without_check): a data URL is valid
-        // only if it contains a literal ',' separating metadata from payload. A
-        // malformed one (e.g. "data:Hello%2C%20World!" — its comma is
-        // percent-encoded) yields ParseDataURLError::InvalidDataURL, which
-        // ResolveMessage.fmt (jsc/ResolveMessage.rs:177-188) renders as
-        // "Cannot resolve invalid data URL '<spec>' from '<referrer>'".
-        if (spec.starts_with("data:") && spec.find(',') == std::string::npos) {
-            if (exc) {
-                JSValueRef m{make_string(ctx, "Cannot resolve invalid data URL '" + spec +
-                                                  "' from '" + fromDir + "'")};
-                JSObjectRef e{JSObjectMakeError(ctx, 1, &m, nullptr)};
-                set_prop(ctx, e, "name", make_string(ctx, "ResolveMessage"));
-                set_prop(ctx, e, "code",
-                         make_string(ctx, importStmt ? "ERR_MODULE_NOT_FOUND" : "MODULE_NOT_FOUND"));
-                set_prop(ctx, e, "specifier", make_string(ctx, spec));
-                set_prop(ctx, e, "referrer", make_string(ctx, fromDir));
-                JSObjectRef rctor{JSObjectMake(ctx, nullptr, nullptr)};
-                set_prop(ctx, rctor, "name", make_string(ctx, "ResolveMessage"));
-                set_prop(ctx, e, "constructor", rctor);
-                *exc = e;
-            }
-            return JSValueMakeUndefined(ctx);
-        }
-        // file:// specifier (import/require of a WHATWG file URL, e.g. from
-        // pathToFileURL): decode %XX to a real path; a malformed URL (NUL) fails
-        // with the offending spec in the message (Node/bun behavior).
-        std::string rspec{spec};
-        // Split off a URL-style `?query` suffix from a path/file specifier: the
-        // on-disk resolve must see the bare path, but bun keeps the query as part
-        // of the module IDENTITY — `./m?a` and `./m?b` are distinct instances
-        // (each re-evaluated, and import.meta.url carries the query). Only
-        // path-like specifiers are split; a builtin/bare-package/data: spec never
-        // reaches here with a meaningful `?`. ref: bun resolver strips the query
-        // for resolution (ModuleLoader) while the module record key retains it.
-        std::string query;
-        if (rspec.starts_with("./") || rspec.starts_with("../") || rspec.starts_with("/") ||
-            rspec.starts_with("file://")) {
-            if (const auto qpos{rspec.find('?')}; qpos != std::string::npos) {
-                query = rspec.substr(qpos);
-                rspec.erase(qpos);
-            }
-        }
-        // `?raw` is the one query bun treats as a loader override: it forces the
-        // Text loader (raw file contents as the default export), regardless of the
-        // file's real extension. An explicit `with { type }` still wins.
-        std::string effTypeAttr{typeAttr};
-        if (effTypeAttr.empty() && query == "?raw") {
-            effTypeAttr = "text";
-        }
-        if (rspec.starts_with("file://")) {
-            if (auto decoded{file_url_to_path_checked(rspec)}) {
-                rspec = std::move(*decoded);
-            } else {
-                if (exc) {
-                    *exc = make_string(ctx, "Cannot find module '" + spec + "' (imported from '" +
-                                                fromDir + "'): invalid file URL");
-                }
-                return JSValueMakeUndefined(ctx);
-            }
-        }
-        mbun::resolver::Options opts;
-        opts.kind = esm ? mbun::resolver::ResolveKind::Import : mbun::resolver::ResolveKind::Require;
-        opts.tsconfig = find_tsconfig_(fromDir);
-        opts.node_paths = node_paths_from_env();
-        mbun::jsc::module_loader::ModuleLoader loader{os_fs(), std::move(opts), /*cjs=*/true};
-        mbun::jsc::module_loader::LoadResult loaded{loader.load(rspec, fromDir, effTypeAttr)};
-        using mbun::jsc::module_loader::LoadStatus;
-
-        // package.json "imports" resolved `#spec` to a bare target (builtin or
-        // package) — re-run resolution on it (checks the builtin table first).
-        if (loaded.status == LoadStatus::ReResolve) {
-            return require_impl(ctx, loaded.path, fromDir, exc, esm, effTypeAttr, importStmt);
-        }
-
-        std::string source;
-        std::string path;
-        bool tla{false};  // module awaits at top level → async wrapper + pump
-        bool strictMode{false};  // ESM lowered to CJS retains mandatory strict semantics
-        // The loader the module was actually loaded AS. The data-module wrapping
-        // below keys off this rather than off the extension alone: a `type` import
-        // attribute can override the extension (`./d.json` with { type: "text" }
-        // loads as Text), and re-deriving from ".json" would then hand the Text
-        // loader's own module source to Bun.JSONC.parse.
-        const mbun::jsc::module_loader::Loader loaderKind{loaded.loader};
-        if (loaded.status == LoadStatus::Success) {
-            tla = loaded.top_level_await;
-            strictMode = loaded.cjs_esm_module;
-            source = std::move(loaded.source);
-            path = std::move(loaded.path);
-        } else if (loaded.status == LoadStatus::TranspileFailed) {
-            // A transpile failure is a hard error, NOT a reason to evaluate the
-            // file's raw bytes. The old "plain-JS-in-.ts: fall back to raw
-            // contents" crutch had no legitimate trigger — plain JS *is* valid
-            // TS, so it transpiles — and so only ever fired on a transpiler gap,
-            // where it did active harm: the raw bytes are still TS/ESM, and this
-            // require() feeds a script-mode JSEvaluateScript with no ESM linker
-            // (module_loader.cppm:83), so `import { x } from "m"` re-parsed as a
-            // dynamic import CALL and surfaced as
-            //
-            //   SyntaxError: Unexpected token '{'. import call expects one or
-            //   two arguments.        req@ …
-            //
-            // i.e. every unported AST node was *disguised* as a syntax error in
-            // an innocent importer, naming a file and a coordinate that have
-            // nothing to do with the real cause. That disguise is what made a
-            // whole-corpus survey of elysia report "126x req@, 0x NamespaceDecl"
-            // when NamespaceDecl (one type-only `namespace` in sucrose.ts) was in
-            // fact the sole cause of all 126.
-            //
-            // Blueprint: bun has no such fallback — a transpile failure returns
-            // ParseError to the module loader and is thrown as a BuildMessage
-            // (runtime/jsc_hooks.rs:2488 and :2539-2541, both
-            // `return Err(bun_core::err!("ParseError"))` off `log.errors > 0`).
-            if (exc) {
-                // bun throws a real BuildMessage (Error subclass) on ParseError, not a
-                // bare string — util.types.isNativeError / constructor.name depend on it.
-                JSValueRef m{make_string(ctx, loaded.message.empty()
-                                                  ? "Failed to transpile '" + loaded.path + "'"
-                                                  : loaded.message)};
-                JSObjectRef e{JSObjectMakeError(ctx, 1, &m, nullptr)};
-                set_prop(ctx, e, "name", make_string(ctx, "BuildMessage"));
-                JSObjectRef bctor{JSObjectMake(ctx, nullptr, nullptr)};
-                set_prop(ctx, bctor, "name", make_string(ctx, "BuildMessage"));
-                set_prop(ctx, e, "constructor", bctor);
-                *exc = e;
-            }
-            return JSValueMakeUndefined(ctx);
-        } else {
-            if (exc) {
-                if (spec.starts_with("node:")) {
-                    // Unknown node: builtin — node/bun throw ERR_UNKNOWN_BUILTIN_MODULE
-                    // (a real Error with .code), not a bare "cannot find module" string.
-                    JSValueRef m{make_string(ctx, "No such built-in module: " + spec)};
-                    JSObjectRef e{JSObjectMakeError(ctx, 1, &m, nullptr)};
-                    set_prop(ctx, e, "code", make_string(ctx, "ERR_UNKNOWN_BUILTIN_MODULE"));
-                    *exc = e;
-                } else {
-                    // bun throws a real ResolveMessage (Error subclass), not a bare string
-                    // — util.types.isNativeError / constructor.name depend on it.
-                    JSValueRef m{make_string(ctx, "Cannot find module '" + spec + "' (imported from '" +
-                                                      fromDir + "'): " + loaded.message)};
-                    JSObjectRef e{JSObjectMakeError(ctx, 1, &m, nullptr)};
-                    set_prop(ctx, e, "name", make_string(ctx, "ResolveMessage"));
-                    // bun ResolveMessage.get_code (jsc/ResolveMessage.rs:76-98):
-                    // a ModuleNotFound via Require → "MODULE_NOT_FOUND", while an
-                    // ESM statement/dynamic import → "ERR_MODULE_NOT_FOUND" (Node
-                    // parity). `esm` distinguishes the lowered-import case.
-                    set_prop(ctx, e, "code",
-                             make_string(ctx, importStmt ? "ERR_MODULE_NOT_FOUND" : "MODULE_NOT_FOUND"));
-                    set_prop(ctx, e, "specifier", make_string(ctx, spec));
-                    set_prop(ctx, e, "referrer", make_string(ctx, fromDir));
-                    JSObjectRef rctor{JSObjectMake(ctx, nullptr, nullptr)};
-                    set_prop(ctx, rctor, "name", make_string(ctx, "ResolveMessage"));
-                    set_prop(ctx, e, "constructor", rctor);
-                    *exc = e;
-                }
-            }
-            return JSValueMakeUndefined(ctx);
-        }
-
-        // Module identity includes the `?query` suffix: `./m` and `./m?a` are
-        // distinct instances (each re-evaluated once, keyed separately), matching
-        // bun's module-record key. The bare `path` still drives __filename/dir and
-        // the on-disk read below; only the cache maps key on path+query.
-        const std::string cacheKey{query.empty() ? path : path + query};
-
-        if (auto inflight{moduleInFlight_.find(cacheKey)}; inflight != moduleInFlight_.end()) {
-            // Cycle re-entry: live-read module.exports (see moduleInFlight_).
-            return get_prop(ctx, inflight->second, "exports");
-        }
-        if (auto it{moduleCache_.find(cacheKey)}; it != moduleCache_.end()) {
-            return it->second;
-        }
-
-        // CAP-NAPI: require("./addon.node") → dlopen + Node-API registration
-        // (runtime/napi_objects.inc mbun_napi_require_module; blueprint
-        // BunProcess.cpp Process_functionDlopen). The addon's exports object
-        // is the module value; cached like any CJS module.
-        if (loaderKind == mbun::jsc::module_loader::Loader::Napi) {
-            // A Node-API addon reached through an `import` (static or dynamic) is a
-            // TypeError, not a load: napi modules can only be brought in via
-            // require()/process.dlopen. bun ZigGlobalObject.cpp:3648 / jsc_hooks.rs:3101
-            // reject with this exact message. `importStmt` is set for lowered import
-            // statements and dynamic import(); a literal require() leaves it 0 and
-            // falls through to dlopen. The query was already stripped from `path`,
-            // so `./x.node?v=1` behaves identically to `./x.node` here.
-            if (importStmt) {
-                if (exc) {
-                    JSValueRef m{make_string(
-                        ctx, "To load Node-API modules, use require() or process.dlopen instead of import.")};
-                    JSObjectRef e{JSObjectMakeError(ctx, 1, &m, nullptr)};
-                    set_prop(ctx, e, "name", make_string(ctx, "TypeError"));
-                    JSObjectRef tctor{JSObjectMake(ctx, nullptr, nullptr)};
-                    set_prop(ctx, tctor, "name", make_string(ctx, "TypeError"));
-                    set_prop(ctx, e, "constructor", tctor);
-                    *exc = e;
-                }
-                return JSValueMakeUndefined(ctx);
-            }
-            JSValueRef napiExc{nullptr};
-            JSValueRef napiExports{mbun_napi_require_module(ctx, path, &napiExc)};
-            if (napiExc != nullptr) {
-                if (exc) *exc = napiExc;
-                return JSValueMakeUndefined(ctx);
-            }
-            JSValueProtect(ctx, napiExports);
-            moduleCache_[cacheKey] = napiExports;
-            return napiExports;
-        }
-
-        // Escape a raw file body into a JS double-quoted string literal so it can
-        // be handed verbatim to a runtime parser (JSONC/YAML) instead of being
-        // eval'd as source (which mishandles comments, trailing commas, empty
-        // documents, and JSON escape/surrogate semantics).
-        auto escape_dq{[](std::string_view in) {
-            std::string escaped;
-            escaped.reserve(in.size() + 16);
-            constexpr std::string_view kHex{"0123456789abcdef"};
-            for (const char c : in) {
-                const auto uc{static_cast<unsigned char>(c)};
-                if (c == '\\') {
-                    escaped += "\\\\";
-                } else if (c == '"') {
-                    escaped += "\\\"";
-                } else if (c == '\n') {
-                    escaped += "\\n";
-                } else if (c == '\r') {
-                    escaped += "\\r";
-                } else if (c == '\t') {
-                    escaped += "\\t";
-                } else if (uc < 0x20) {
-                    escaped += "\\x";
-                    escaped += kHex[(uc >> 4) & 0xF];
-                    escaped += kHex[uc & 0xF];
-                } else {
-                    escaped += c;
-                }
-            }
-            return escaped;
-        }};
-
-        // JSON / JSONC modules: parse with Bun.JSONC (comments + trailing commas +
-        // empty→{}), which matches JSON.parse exactly on escapes/surrogates. Note
-        // ".jsonc" does not end with ".json", so both suffixes are checked. This
-        // mirrors bun's .json/.jsonc loader (comment- and trailing-comma-tolerant).
-        if (loaderKind == mbun::jsc::module_loader::Loader::Json &&
-            (path.ends_with(".json") || path.ends_with(".jsonc") ||
-             path.ends_with("bun.lock"))) {
-            source = "module.exports = Bun.JSONC.parse(\"" + escape_dq(source) + "\");";
-        }
-
-        // YAML modules: parse with Bun.YAML; the document is the default export
-        // (matching bun's .yaml loader). Keyed on the Yaml loader itself — not the
-        // path suffix — so a `with { type: "yaml" }` attribute on any extension
-        // (e.g. a `.yaml.txt` file) routes here just as a `.yaml` extension does.
-        if (loaderKind == mbun::jsc::module_loader::Loader::Yaml) {
-            source = "const __yamlDoc = Bun.YAML.parse(\"" + escape_dq(source) +
-                     "\"); module.exports = { default: __yamlDoc, __esModule: true };";
-        }
-
-        // TOML modules: parse with Bun.TOML. module.exports is the parsed table
-        // itself (like the JSON loader), so the default import is the whole object
-        // and each top-level key is also a named export — matching bun's .toml
-        // loader, which serializes to the same JSON AST (ast/loader.rs:273). Keyed
-        // on the Toml loader, so `with { type: "toml" }` on a `.toml.txt` file
-        // routes here just like a `.toml` extension.
-        if (loaderKind == mbun::jsc::module_loader::Loader::Toml) {
-            source = "module.exports = Bun.TOML.parse(\"" + escape_dq(source) + "\");";
-        }
-
-        // JSON5 modules: parse with Bun.JSON5 (JSON + comments, unquoted / single-
-        // quoted keys, trailing commas, ...). module.exports is the parsed value
-        // (ast/loader.rs:139/:276 — serialized to the JSON AST). Keyed on the
-        // Json5 loader so `with { type: "json5" }` overrides the extension.
-        if (loaderKind == mbun::jsc::module_loader::Loader::Json5) {
-            source = "module.exports = Bun.JSON5.parse(\"" + escape_dq(source) + "\");";
-        }
-
-        const std::string dir{parent_dir(path)};
-        // Wrap in the node CommonJS module function. The leading newline keeps the
-        // user source on its own line (offsets in errors stay ~aligned). If the
-        // module itself declares `const/let/var __filename|__dirname` (common in
-        // ESM-style files using fileURLToPath(import.meta.url)), rename that wrapper
-        // param so the module's own declaration doesn't collide ("Cannot declare a
-        // const variable twice").
-        auto declares{[&](std::string_view name) {
-            for (std::string_view kw : {"const ", "let ", "var "}) {
-                std::size_t pos = 0;
-                const std::string needle{std::string{kw} + std::string{name}};
-                while ((pos = source.find(needle, pos)) != std::string::npos) {
-                    const std::size_t after = pos + needle.size();
-                    const char c = after < source.size() ? source[after] : ' ';
-                    if (c == ' ' || c == '=' || c == ':' || c == ';' || c == ',' || c == '\n') {
-                        return true;
-                    }
-                    pos = after;
-                }
-            }
-            return false;
-        }};
-        const char* pfn{declares("__filename") ? "__mbun_pfilename" : "__filename"};
-        const char* pdn{declares("__dirname") ? "__mbun_pdirname" : "__dirname"};
-        const std::string params{std::string{"exports, require, module, "} + pfn + ", " + pdn};
-        // A module with top-level await gets the async wrapper up front (JSC's
-        // script mode has no TLA); its promise is pumped to completion below so
-        // requiring it is synchronous and a rejection propagates to the caller.
-        bool asyncWrapped{tla};
-        const std::string strictPrefix{strictMode ? "\"use strict\";\n" : ""};
-        // Per-module import.meta: the transpiler lowered `import.meta` to the bare
-        // `__mbunImportMeta`; bind it to this module's file/dir so a required module
-        // sees its own url/dir (not the global entry's). Only inject when used.
-        const std::string metaPrefix{
-            source.find("__mbunImportMeta") != std::string::npos
-                ? std::string{"var __mbunImportMeta = globalThis.__mbun_make_import_meta("} + pfn +
-                      ", " + pdn + ", " + json_quote_(query) + ");\n"
-                : std::string{}};
-        std::string wrapper{std::string{tla ? "(async function (" : "(function ("} + params +
-                            ") {\n" + strictPrefix + metaPrefix + source + "\n})"};
-
-        JSValueRef wrapExc{nullptr};
-        JSValueRef fnVal{eval_(wrapper, &wrapExc, path)};
-        if (wrapExc) {
-            // Possibly top-level await (JSC script mode has no TLA): retry with an
-            // async wrapper so it parses. A module that only awaits under an
-            // `import.meta.main`/`Bun.main` guard (the common helper pattern) still
-            // sets module.exports synchronously, so require() returns populated
-            // exports. Report the original error if the async form also fails.
-            JSValueRef wrapExc2{nullptr};
-            const std::string awrapper{"(async function (" + params + ") {\n" + strictPrefix +
-                                       source + "\n})"};
-            JSValueRef aFnVal{eval_(awrapper, &wrapExc2, path)};
-            if (wrapExc2 != nullptr) {
-                if (exc) *exc = wrapExc;
-                return JSValueMakeUndefined(ctx);
-            }
-            fnVal = aFnVal;
-            asyncWrapped = true;
-        }
-        JSObjectRef fn{JSValueToObject(ctx, fnVal, exc)};
-        if (fn == nullptr) {
-            return JSValueMakeUndefined(ctx);
-        }
-
-        JSObjectRef moduleObj{JSObjectMake(ctx, nullptr, nullptr)};
-        JSObjectRef exportsObj{JSObjectMake(ctx, nullptr, nullptr)};
-        set_prop(ctx, moduleObj, "exports", exportsObj);
-
-        // Cache module.exports BEFORE running the body so a circular require sees
-        // the (partial) exports object, matching CommonJS semantics. The
-        // in-flight entry additionally lets a cycle observe a wholesale
-        // `module.exports = …` reassignment made before it re-enters.
-        JSValueProtect(ctx, exportsObj);
-        moduleCache_[cacheKey] = exportsObj;
-        JSValueProtect(ctx, moduleObj);
-        moduleInFlight_[cacheKey] = moduleObj;
-
-        // Mark the module in-flight for the whole body. __mbun_link (the ESM
-        // live-binding helper installed above) only has to swap an export slot
-        // for an accessor while the exporter can still assign to it — i.e. when
-        // an importer reached it through a cycle. Every acyclic import sees no
-        // marker and stays on the plain fast path. Non-enumerable so it never
-        // leaks into Object.keys(exports) / `export *` / spread.
-        {
-            JSStringRef pend{JSStringCreateWithUTF8CString("__mbun_pending")};
-            JSObjectSetProperty(ctx, exportsObj, pend, JSValueMakeBoolean(ctx, true),
-                                kJSPropertyAttributeDontEnum, nullptr);
-            JSStringRelease(pend);
-        }
-
-        // Per-module require closure bound to this module's directory. A module
-        // whose source was ESM (strictMode == loaded.cjs_esm_module) had every one
-        // of its `import`s lowered to require(), so it gets the variant that
-        // resolves with the "import" condition.
-        JSObjectRef global{JSContextGetGlobalObject(ctx)};
-        JSObjectRef makeReq{JSValueToObject(
-            ctx, get_prop(ctx, global, strictMode ? "__mbun_make_require_esm"
-                                                  : "__mbun_make_require"),
-            nullptr)};
-        JSValueRef dirArg{make_string(ctx, dir)};
-        JSValueRef reqFn{JSObjectCallAsFunction(ctx, makeReq, nullptr, 1, &dirArg, exc)};
-
-        JSValueRef callArgs[5]{exportsObj, reqFn, moduleObj, make_string(ctx, path),
-                               make_string(ctx, dir)};
-        JSValueRef callExc{nullptr};
-        JSValueRef callRet{JSObjectCallAsFunction(ctx, fn, nullptr, 5, callArgs, &callExc)};
-        if (callExc == nullptr && asyncWrapped && callRet != nullptr) {
-            // Pump the module's promise to completion so top-level awaits finish
-            // before require() returns, and surface a rejection as the require
-            // error (dynamic import() then rejects, matching module semantics).
-            static int tlaSeq{0};
-            const std::string key{std::to_string(++tlaSeq)};
-            JSValueRef trackExc{nullptr};
-            JSObjectRef tracker{JSValueToObject(
-                ctx,
-                eval_("(function(p){globalThis.__mbun_req_done" + key +
-                          "=0;globalThis.__mbun_req_err" + key +
-                          "=undefined;p.then(function(){globalThis.__mbun_req_done" + key +
-                          "=1;},function(e){globalThis.__mbun_req_err" + key +
-                          "=e;globalThis.__mbun_req_done" + key + "=1;});})",
-                      &trackExc),
-                nullptr)};
-            if (tracker != nullptr && trackExc == nullptr) {
-                JSObjectCallAsFunction(ctx, tracker, nullptr, 1, &callRet, &trackExc);
-                pump_event_loop("globalThis.__mbun_req_done" + key);
-                JSValueRef errVal{eval_("globalThis.__mbun_req_err" + key, nullptr)};
-                (void)eval_("delete globalThis.__mbun_req_done" + key +
-                                ";delete globalThis.__mbun_req_err" + key + ";",
-                            nullptr);
-                if (errVal != nullptr && !JSValueIsUndefined(ctx, errVal)) {
-                    callExc = errVal;
-                }
-            }
-        }
-        // Body (and any top-level await) is done: the exports are settled, so
-        // later importers take __mbun_link's fast path.
-        {
-            JSStringRef pend{JSStringCreateWithUTF8CString("__mbun_pending")};
-            JSObjectDeleteProperty(ctx, exportsObj, pend, nullptr);
-            JSStringRelease(pend);
-        }
-        moduleInFlight_.erase(cacheKey);
-        JSValueUnprotect(ctx, moduleObj);
-
-        if (callExc) {
-            // Failed module: drop from cache (node re-throws on next require too).
-            JSValueUnprotect(ctx, exportsObj);
-            moduleCache_.erase(cacheKey);
-            if (exc) *exc = callExc;
-            return JSValueMakeUndefined(ctx);
-        }
-
-        // module.exports may have been reassigned wholesale; re-read + re-cache.
-        JSValueRef finalExports{get_prop(ctx, moduleObj, "exports")};
-        JSObjectRef finalObj{JSValueToObject(ctx, finalExports, nullptr)};
-        if (finalObj != exportsObj) {
-            JSValueProtect(ctx, finalExports);
-            JSValueUnprotect(ctx, exportsObj);
-            moduleCache_[cacheKey] = finalExports;
-            return finalExports;
-        }
-        return exportsObj;
-    }
-
-private:
-    Runtime() {
-#if !defined(_WIN32)
-        // Writing to a child pipe whose read end has closed must fail with EPIPE,
-        // not kill the runtime with SIGPIPE (async child_process stdin, Bun.spawn).
-        std::signal(SIGPIPE, SIG_IGN);
-#endif
-        // bun-style explicit init (idempotent). JSC freezes its option table at the
-        // end of initialize(), so options are only settable from inside the
-        // customization callback -- assigning afterwards is silently ignored.
-        JSC::initialize([] {
-            JSC::Options::useShadowRealm() = true;
-        });
-        ctx_ = create_context_();
-#if !defined(_WIN32)
-        dnsAsync_ = std::make_unique<DnsAsyncState>(ctx_);
-        gDnsAsyncState = dnsAsync_.get();
-#endif
-        install_bindings_();
-    }
+#include "module_loading.inc"
 
     // JSGlobalContextCreate hands back a JSC::JSAPIGlobalObject, whose method table
     // (JSAPIGlobalObject::globalObjectMethodTable) leaves deriveShadowRealmGlobalObject
@@ -1148,7 +845,19 @@ private:
 
     JSValueRef eval_(std::string_view source, JSValueRef* exc, const std::string& srcUrl = {}) {
         std::string src{source};
-        JSStringRef script{JSStringCreateWithUTF8CString(src.c_str())};
+        // A source file may legally contain a literal NUL (inside a string or a
+        // template literal — regression 27553). JSStringCreateWithUTF8CString stops
+        // at the first NUL, which truncates the script mid-token and surfaces as
+        // "SyntaxError: Unexpected EOF"; go through UTF-16 so the whole source
+        // reaches JSC. The C-string path stays for NUL-free sources (the norm).
+        JSStringRef script{nullptr};
+        if (src.find('\0') != std::string::npos) {
+            const std::u16string wide{mbun::core::strings::utf8_to_utf16(src)};
+            script = JSStringCreateWithCharacters(
+                reinterpret_cast<const JSChar*>(wide.data()), wide.size());
+        } else {
+            script = JSStringCreateWithUTF8CString(src.c_str());
+        }
         JSStringRef url{srcUrl.empty() ? nullptr : JSStringCreateWithUTF8CString(srcUrl.c_str())};
         JSValueRef result{JSEvaluateScript(ctx_, script, nullptr, url, 1, exc)};
         if (url != nullptr) JSStringRelease(url);
@@ -1269,6 +978,12 @@ private:
         JSObjectRef toml{JSObjectMake(ctx_, nullptr, nullptr)};
         set_fn(ctx_, toml, "parse", toml_parse_cb);
         set_prop(ctx_, bun, "TOML", toml);
+
+        // .env text -> object, for node's util.parseEnv (node:util partition).
+        JSObjectRef dotenv{JSObjectMake(ctx_, nullptr, nullptr)};
+        set_fn(ctx_, dotenv, "parse", dotenv_parse_cb);
+        set_prop(ctx_, global, "__mbunDotenvNative", dotenv);
+
 
         // Bun.build → in-memory bundler slice (runtime/bun_build.inc).
         set_native_fn(ctx_, bun, "build", 1, bun_build_host);
@@ -1433,6 +1148,7 @@ private:
         set_native_fn(ctx_, cryptoAsymNative, "ecdhComputeSecret", 3, node_asym_ecdh_compute_host);
         set_native_fn(ctx_, cryptoAsymNative, "ecdhPublicFromPrivate", 2, node_asym_ecdh_pub_from_priv_host);
         set_native_fn(ctx_, cryptoAsymNative, "ecdhConvertKey", 3, node_asym_ecdh_convert_host);
+        set_native_fn(ctx_, cryptoAsymNative, "okpDerive", 2, node_asym_okp_derive_host);
         set_native_fn(ctx_, cryptoAsymNative, "keyType", 3, node_asym_key_type_host);
         set_native_fn(ctx_, cryptoAsymNative, "keyExport", 7, node_asym_key_export_host);
         set_native_fn(ctx_, cryptoAsymNative, "jwkExport", 3, node_asym_jwk_export_host);
@@ -1496,7 +1212,11 @@ private:
   // process.versions.bun while reporting process.version = "v24.3.0". Nothing in the corpus
   // enumerates process.versions, so an extra key is additive-only.
   // `mbun` must match mbun::cli::MBUN_VERSION (cli.cppm).
-  p.versions = { node: "26.3.0", bun: (globalThis.Bun && Bun.version) || "1.3.14", mbun: "2026.07.18.0", v8: "12.4.0", modules: "127", uv: "1.0", openssl: "3.0" };
+  // `openssl` is the vendored mbun.openssl package's real version, and must keep
+  // node's three-component shape: node's own test/common/crypto.js parses it with
+  // /(?<m>\\d+)\\.(?<n>\\d+)\\.(?<p>\\d+)/ and dereferences `.groups` unguarded, so a
+  // two-component "3.0" made every hasOpenSSL() caller die on `null.groups`.
+  p.versions = { node: "26.3.0", bun: (globalThis.Bun && Bun.version) || "1.3.14", mbun: "2026.07.18.0", v8: "12.4.0", modules: "127", uv: "1.0", openssl: "3.1.5" };
   // bun mirrors Bun.revision onto process.revision (bun-test.test.ts asserts
   // process.revision === Bun.revision; verified against bun 1.3.14). Derived from
   // Bun.revision so the two can never drift.
@@ -1605,10 +1325,38 @@ private:
             void* p{o != nullptr ? JSObjectGetTypedArrayBytesPtr(c, o, nullptr) : nullptr};
             return JSValueMakeNumber(c, static_cast<double>(reinterpret_cast<std::uintptr_t>(p)));
         });
+        // Bun.gc(force) / bun:jsc gcAndSweep|fullGC|edenGC. These were no-op
+        // stubs, so a suite that allocates a large blob per test and relies on
+        // the documented `Bun.gc(true)` in afterEach to reclaim it (bun's own
+        // js/web/fetch/blob-oom.test.ts) grew monotonically until the process was
+        // OOM-killed — every one of its OOM *guards* fired correctly, nothing
+        // ever freed the bytes. JSGarbageCollect is JSC's full collect+sweep.
+        set_fn(ctx_, global, "__mbunGcNative",
+               [](JSContextRef c, JSObjectRef, JSObjectRef, std::size_t n, const JSValueRef a[],
+                  JSValueRef*) -> JSValueRef {
+                   JSGarbageCollect(c);
+                   // Only the *forced* form scavenges. bmalloc's scavenge walks
+                   // every free range; leak tests call the unforced `Bun.gc()`
+                   // thousands of times inside a loop (js/web/request/
+                   // request-clone-leak does it 2000x per test), and doing a
+                   // full scavenge there is pure overhead — bun's unforced form
+                   // is `collect_async`, a hint (VirtualMachine.rs).
+                   if (n < 1 || !JSValueToBoolean(c, a[0])) return JSValueMakeNumber(c, 0);
+                   // Collecting alone is not enough: bmalloc caches the freed
+                   // large blocks, so a suite that churns hundreds of MB per
+                   // test keeps every one of them resident and still hits the
+                   // memory ceiling. bun's Bun.gc does the same thing one layer
+                   // down (VirtualMachine.rs garbage_collect →
+                   // bun_core::Global::mimalloc_cleanup).
+                   WTF::releaseFastMallocFreeMemory();
+                   return JSValueMakeNumber(c, 0);
+               });
         // JSC backing-width introspection used only by bun:internal-for-testing.
         JSObjectRef jscInternals{JSObjectMake(ctx_, nullptr, nullptr)};
         set_native_fn(ctx_, jscInternals, "isUTF16String", 1, is_utf16_string_host);
         set_native_fn(ctx_, jscInternals, "callerSourceOriginNative", 0, caller_source_origin_host);
+        set_native_fn(ctx_, jscInternals, "estimateShallowMemoryUsageOfNative", 1,
+                      estimate_shallow_memory_usage_host);
         set_prop(ctx_, global, "__mbunJscInternalsNative", jscInternals);
         // bun:internal-for-testing xxHash3ForTesting (full u64 seed; bootstrap
         // re-exports it on the module).
@@ -1629,6 +1377,7 @@ private:
         set_fn(ctx_, shn, "parse", shell_parse_cb);
         set_fn(ctx_, shn, "parseErrors", shell_parse_errors_cb);
         set_fn(ctx_, shn, "compile", shell_compile_cb);
+        set_fn(ctx_, shn, "escape", shell_escape_cb);
         set_fn(ctx_, shn, "exec", bunsh_exec_cb);
         set_prop(ctx_, global, "__mbunShellNative", shn);
         // Bun's private InternalSourceMap codec, exposed only through
@@ -1643,6 +1392,7 @@ private:
         JSObjectRef htn{JSObjectMake(ctx_, nullptr, nullptr)};
         set_fn(ctx_, htn, "getMaxHeaderSize", http_get_max_header_size_cb);
         set_fn(ctx_, htn, "setMaxHeaderSize", http_set_max_header_size_cb);
+        set_fn(ctx_, htn, "userAgent", http_get_user_agent_cb);
         set_prop(ctx_, global, "__mbunHttpNative", htn);
         // CAP-S3: AWS SigV4 signing for Bun.S3Client (builtins/s3.cppm calls
         // __mbunS3Native.sign; algorithm is mbun.s3_signing, crypto is mbun.crypto).
@@ -1658,6 +1408,10 @@ private:
         set_fn(ctx_, pn, "close", proc_close_cb);
         set_fn(ctx_, pn, "wait", proc_wait_cb);
         set_fn(ctx_, pn, "kill", proc_kill_cb);
+#if !defined(_WIN32)
+        set_fn(ctx_, pn, "signalWatch", proc_signal_watch_cb);
+        set_fn(ctx_, pn, "signalDrain", proc_signal_drain_cb);
+#endif
         set_fn(ctx_, pn, "spawnSyncB64", proc_spawn_sync_b64_cb);
 #if !defined(_WIN32)
         set_fn(ctx_, pn, "spawnEx", proc_spawn_ex_cb);
@@ -1692,6 +1446,44 @@ private:
     if (!ok) { const e = new Error("kill ESRCH"); e.code = "ESRCH"; e.errno = -3; e.syscall = "kill"; throw e; }
     return true;
   };
+
+  // ---- process.on("SIG…") → real POSIX handlers -------------------------
+  // node installs a handler the moment a signal gains its first listener and
+  // restores SIG_DFL when the last one goes away (so `process.off` of ONE of
+  // several listeners must NOT uninstall it). The native side only flips a
+  // sig_atomic_t; delivery happens here, off the event-loop pump.
+  if (typeof PN.signalWatch === "function") {
+    const NAME = {}; for (const k of Object.keys(SIGMAP)) NAME[SIGMAP[k]] = k;
+    const isSignal = (ev) => typeof ev === "string" && SIGMAP[ev] != null;
+    const armed = new Set();
+    const sync = (ev) => {
+      if (!isSignal(ev)) return;
+      const want = p.listenerCount(ev) > 0;
+      if (want === armed.has(ev)) return;
+      if (PN.signalWatch(SIGMAP[ev], want)) { if (want) armed.add(ev); else armed.delete(ev); }
+    };
+    for (const m of ["on", "addListener", "once", "prependListener", "prependOnceListener",
+                     "off", "removeListener", "removeAllListeners"]) {
+      const orig = p[m];
+      if (typeof orig !== "function") continue;
+      p[m] = function (ev, ...rest) {
+        const r = orig.call(this, ev, ...rest);
+        if (ev === undefined && m === "removeAllListeners") { for (const s of Array.from(armed)) sync(s); }
+        else sync(ev);
+        return r;
+      };
+    }
+    globalThis.__mbunSignalTick = function () {
+      let sigs;
+      try { sigs = PN.signalDrain(); } catch (e) { return 0; }
+      if (!sigs || !sigs.length) return 0;
+      for (const n of sigs) {
+        const name = NAME[n];
+        if (name && p.listenerCount(name) > 0) { try { p.emit(name, name, n); } catch (e) {} }
+      }
+      return sigs.length;
+    };
+  }
 })();
 )JS",
                      nullptr);
@@ -1845,6 +1637,16 @@ private:
         if (dexc != nullptr && std::getenv("MBUN_DEBUG_BUILTINS")) {
             std::cerr << "[js_dns error] " << describe_exception_(dexc) << '\n';
         }
+        // LAST: node's legacy constructor call forms (`http.Server(fn)` with no
+        // `new`). It re-exports the affected classes through a callable stand-in,
+        // so it must run after the final owner of each module object — kNetJS
+        // REPLACES node:net/node:http wholesale, which would drop a patch applied
+        // inside the builtins blob.
+        JSValueRef lcexc{nullptr};
+        eval_(mbun::jsc::builtins::detail::kNodeLegacyCtorsJS, &lcexc);
+        if (lcexc != nullptr && std::getenv("MBUN_DEBUG_BUILTINS")) {
+            std::cerr << "[legacy ctors error] " << describe_exception_(lcexc) << '\n';
+        }
     }
 
     JSValueRef build_argv_() {
@@ -1948,8 +1750,10 @@ JSValueRef napi_dlopen_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_
     return JSValueMakeUndefined(ctx);
 }
 
-// __mbun_transpile(code, cjs, jsx) → transpiled JS (throws its error string on
-// failure). Backs Bun.Transpiler.transformSync.
+// __mbun_transpile(code, cjs, jsx) → transpiled JS. Backs
+// Bun.Transpiler.transformSync; a parse failure throws a SyntaxError carrying the
+// diagnostic, never a bare string — callers read `e.message` (bun throws an error
+// object here too, so a raw string leaves `.message` undefined).
 JSValueRef transpile_native_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                                const JSValueRef args[], JSValueRef* exc) {
     std::string code{arg_string(ctx, argc, args, 0)};
@@ -1957,7 +1761,9 @@ JSValueRef transpile_native_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::
     const bool jsx{argc > 2 && JSValueToBoolean(ctx, args[2])};
     mbun::js_parser::TranspileResult t{mbun::js_parser::transpile(code, {.cjs = cjs, .jsx = jsx})};
     if (!t.ok) {
-        if (exc != nullptr) *exc = make_string(ctx, t.error.empty() ? "transpile error" : t.error);
+        if (exc != nullptr) {
+            *exc = make_syntax_error(ctx, t.error.empty() ? "transpile error" : t.error);
+        }
         return JSValueMakeUndefined(ctx);
     }
     return make_string(ctx, t.code);

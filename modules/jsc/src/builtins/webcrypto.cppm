@@ -20,7 +20,6 @@
 //   AES-CTR with counter length != 128: EVP always increments the full 128-bit
 //     block, but the spec wraps only the low `length` bits.
 //   RSA publicExponent other than 65537: AN.generateKeyPair has no pubexp arg.
-//   X25519 deriveBits: no raw X25519 ECDH entry point on the native side.
 export module mbun.jsc.js_builtins:webcrypto;
 
 import std;
@@ -238,6 +237,25 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
       wrapKey: new Set(["RSA-OAEP", "AES-CTR", "AES-CBC", "AES-GCM", "AES-KW"]),
       unwrapKey: new Set(["RSA-OAEP", "AES-CTR", "AES-CBC", "AES-GCM", "AES-KW"]),
     };
+    // Per-operation wording of the InvalidAccessError messages, verbatim from
+    // bun src/jsc/bindings/webcrypto/SubtleCrypto.cpp (node's webcrypto tests
+    // match on these strings).
+    const usageSubject = {
+      encrypt: "CryptoKey", decrypt: "CryptoKey", sign: "CryptoKey", verify: "CryptoKey",
+      deriveBits: "CryptoKey", deriveKey: "CryptoKey",
+      wrapKey: "Wrapping CryptoKey", unwrapKey: "Unwrapping CryptoKey",
+    };
+    const usageMatchee = {
+      encrypt: "AlgorithmIdentifier", decrypt: "AlgorithmIdentifier",
+      sign: "AlgorithmIdentifier", verify: "AlgorithmIdentifier",
+      deriveBits: "AlgorithmIdentifier", deriveKey: "AlgorithmIdentifier",
+      wrapKey: "AlgorithmIdentifier", unwrapKey: "unwrap AlgorithmIdentifier",
+    };
+    const usageNoun = {
+      encrypt: "encryption", decrypt: "decryption", sign: "signing", verify: "verification",
+      deriveBits: "bits derivation", deriveKey: "CryptoKey derivation",
+      wrapKey: "wrapKey operation", unwrapKey: "unwrapKey operation",
+    };
     // A key of `name` usable for `usage`. Mirrors bun's layering:
     //   not a CryptoKey at all  → TypeError  (the IDL binding's brand check)
     //   algorithm lacks the op  → NotSupportedError
@@ -255,10 +273,12 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
           " must be an instance of CryptoKey");
       }
       if (metadata.algorithm.name !== name) {
-        throw domError("The key is not a valid " + name + " key", "InvalidAccessError");
+        throw domError(usageSubject[usage] + " doesn't match " + usageMatchee[usage],
+          "InvalidAccessError");
       }
       if (!metadata.usages.includes(usage)) {
-        throw domError("The requested operation is not valid for this key", "InvalidAccessError");
+        throw domError(usageSubject[usage] + " doesn't support " + usageNoun[usage],
+          "InvalidAccessError");
       }
       return metadata;
     };
@@ -681,6 +701,19 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
       }
       return okm.subarray(0, lengthBytes);
     };
+    // Spec "derive bits" tail shared by ECDH and X25519 (bun CryptoAlgorithm.cpp
+    // extractDerivedBits): a null length takes the whole secret, otherwise keep
+    // ceil(len/8) bytes and zero the unused low bits of the final byte. A length
+    // longer than the secret is an OperationError.
+    const extractDerivedBits = (secret, lengthBits) => {
+      if (lengthBits == null) return secret;
+      const nbytes = Math.ceil(lengthBits / 8);
+      if (nbytes > secret.length) throw operationError("Invalid derived length");
+      const out = secret.slice(0, nbytes);
+      const rem = lengthBits % 8;
+      if (rem !== 0 && nbytes > 0) out[nbytes - 1] &= (0xff << (8 - rem)) & 0xff;
+      return out;
+    };
     const deriveBytes = (alg, metadata, lengthBits) => {
       const name = metadata.algorithm.name;
       if (name === "PBKDF2") {
@@ -713,15 +746,25 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
         const priv = unb64u(jwkFromDer(metadata.material, false).d);
         const secret = new Uint8Array(AN().ecdhComputeSecret(curveToGroup[metadata.algorithm.namedCurve],
           priv, ecPointFromMaterial(peer.material)));
-        if (lengthBits == null) return secret;
-        // ECDH allows a bit length that is not byte-aligned: keep ceil(len/8) bytes
-        // and zero the unused low bits of the final byte (matches node/WebCrypto).
-        const nbytes = Math.ceil(lengthBits / 8);
-        if (nbytes > secret.length) throw operationError("Invalid derived length");
-        const out = secret.slice(0, nbytes);
-        const rem = lengthBits % 8;
-        if (rem !== 0 && nbytes > 0) out[nbytes - 1] &= (0xff << (8 - rem)) & 0xff;
-        return out;
+        return extractDerivedBits(secret, lengthBits);
+      }
+      if (name === "X25519") {
+        // The base key must be the private half and `public` the peer's public
+        // half; both are DER, so the scalar never surfaces in JS.
+        // ref: bun CryptoAlgorithmX25519.cpp deriveBits.
+        if (metadata.type !== "private") {
+          throw domError("baseKey must be an X25519 private key", "InvalidAccessError");
+        }
+        const peer = keyMetadata.get(alg.public);
+        if (!peer || peer.algorithm.name !== "X25519" || peer.type !== "public") {
+          throw domError("public must be an X25519 public key", "InvalidAccessError");
+        }
+        let secret;
+        // A small-order/all-zero peer point makes the native derive fail
+        // (RFC 7748 section 6.1) — that is an OperationError, not a crash.
+        try { secret = new Uint8Array(AN().okpDerive(metadata.material, peer.material)); }
+        catch (e) { throw operationError("X25519 derivation failed"); }
+        return extractDerivedBits(secret, lengthBits);
       }
       throw notSupported("Unsupported derivation algorithm");
     };

@@ -67,6 +67,26 @@ bool shell_collect_words(JSContextRef context, JSValueRef value, std::uint32_t d
     if (JSValueIsObject(context, value) && !JSValueIsArray(context, value)) {
         JSObjectRef obj{JSValueToObject(context, value, exception)};
         if (exception != nullptr && *exception != nullptr) return false;
+        // bun (shell_body.rs:785-805): a file-backed Blob — `Bun.file(path)` —
+        // interpolates as its PATH, not as its contents or "[object Blob]".
+        // mbun's Bun.file wrapper tags the Blob with __isBunFile/__name.
+        JSStringRef bunFileKey{JSStringCreateWithUTF8CString("__isBunFile")};
+        JSValueRef bunFileVal{JSObjectGetProperty(context, obj, bunFileKey, exception)};
+        JSStringRelease(bunFileKey);
+        if (exception != nullptr && *exception != nullptr) return false;
+        if (bunFileVal != nullptr && JSValueToBoolean(context, bunFileVal)) {
+            JSStringRef nameKey{JSStringCreateWithUTF8CString("__name")};
+            JSValueRef nameVal{JSObjectGetProperty(context, obj, nameKey, exception)};
+            JSStringRelease(nameKey);
+            if (exception != nullptr && *exception != nullptr) return false;
+            if (nameVal != nullptr && !JSValueIsUndefined(context, nameVal)
+                && !JSValueIsNull(context, nameVal)) {
+                std::string path;
+                if (!shell_value_to_string(context, nameVal, path, exception)) return false;
+                output.push_back(std::move(path));
+                return true;
+            }
+        }
         JSStringRef rawKey{JSStringCreateWithUTF8CString("raw")};
         JSValueRef rawVal{JSObjectGetProperty(context, obj, rawKey, exception)};
         JSStringRelease(rawKey);
@@ -83,6 +103,22 @@ bool shell_collect_words(JSContextRef context, JSValueRef value, std::uint32_t d
     if (!shell_value_to_string(context, value, word, exception)) return false;
     output.push_back(std::move(word));
     return true;
+}
+
+// __mbunShellNative.escape(str) — backs Bun.$.escape. ref: BunObject.rs
+// shell_escape: a string that needs no escaping is returned unchanged (bun
+// hands back the very same JSValue), everything else comes back double-quoted.
+JSValueRef shell_escape_cb(JSContextRef context, JSObjectRef, JSObjectRef, std::size_t argc,
+                           const JSValueRef arguments[], JSValueRef* exception) {
+    if (argc < 1) {
+        return shell_throw(context, exception, "shell escape expected at least 1 argument");
+    }
+    std::string text;
+    if (!shell_value_to_string(context, arguments[0], text, exception)) {
+        return JSValueMakeUndefined(context);
+    }
+    if (!mbun::shell::needs_escape(text)) return arguments[0];
+    return make_string(context, mbun::shell::escape_string(text));
 }
 
 JSValueRef shell_compile_cb(JSContextRef context, JSObjectRef, JSObjectRef, std::size_t argc,

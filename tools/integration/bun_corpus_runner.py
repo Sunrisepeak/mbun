@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import fnmatch
 import hashlib
 import json
 import re
@@ -19,6 +20,11 @@ SKIP_RE = re.compile(r"(?m)^\s*(\d+) skip\s*$")
 EXPECT_RE = re.compile(r"(?m)^\s*(\d+) expect\(\) calls\s*$")
 RAN_RE = re.compile(r"Ran (\d+) tests?")
 TEST_FILE_RE = re.compile(r"\.test\.(?:[cm]?[jt]sx?)$")
+# An error the runner reported outside any test: an unhandled rejection, a
+# missing global, a module that threw while loading. Distinguishes "the file
+# loaded and simply declares no tests" from "the file died before declaring any".
+ERROR_MARK_RE = re.compile(r"(?m)^\s*\d+ error\s*$|^\s*error:|^# Unhandled error")
+ERROR_COUNT_RE = re.compile(r"(?m)^\s*(\d+) error\s*$")
 
 
 @dataclass(frozen=True)
@@ -39,6 +45,15 @@ def last_int(pattern: re.Pattern[str], output: str) -> int:
     return int(matches[-1]) if matches else 0
 
 
+DEFAULT_BLOCKED_MANIFEST = Path(__file__).resolve().parent / "manifests" / "blocked-external.txt"
+
+
+def load_patterns(path: Path) -> list[str]:
+    if not path.is_file():
+        return []
+    return read_list(path)
+
+
 def classify(
     exit_code: int,
     passed: int,
@@ -48,13 +63,23 @@ def classify(
     timed_out: bool,
     oom_killed: bool,
     output: str,
+    blocked: bool = False,
 ) -> str:
     if timed_out:
-        return "timeout"
+        # A file that needs MySQL/Redis/the npm registry expresses that as a
+        # connect that never completes, so it lands in `timeout` and buries the
+        # files where mbun itself hangs -- 51 of 107 in the 2026-07-20 round.
+        # The manifest is triaged by hand and only ever redirects a timeout;
+        # `blocked-external` is not a pass and verifies nothing (see #4).
+        return "blocked-external" if blocked else "timeout"
     if oom_killed:
         return "oom-kill"
     if ran > 0 or passed > 0 or failed > 0:
-        if exit_code != 0 or failed > 0:
+        # An out-of-test error (a rejected describe body, an unhandled rejection
+        # between tests) is a failed file for bun, which exits non-zero on it;
+        # mbun currently still exits 0, so exit code alone would score such a
+        # file as a full green even though a whole scope may have been dropped.
+        if exit_code != 0 or failed > 0 or last_int(ERROR_COUNT_RE, output) > 0:
             return "test-failure"
         # A file whose every test was skipped exits 0 with 0 failures and so used
         # to score as a full green -- ci-restrictions.test.ts reported 0 pass /
@@ -69,6 +94,18 @@ def classify(
         return "missing-fixture"
     if re.search(r"node-gyp build .* failed", output):
         return "fixture-build-error"
+    # "Loaded fine, declares no tests" is not a load error. Six corpus files are
+    # like this by design -- empty-file.test.ts is a comment-only regression
+    # guard, harness.test.js and svelte/server-side.test.ts are fully commented
+    # out, expect-type-doctest.test.ts only makes compile-time type assertions,
+    # issue-2086.test.ts guards its tests behind `typeof setImmediate ===
+    # "undefined"`, and net/handle-leak.test.ts is a top-level script with no
+    # test() blocks. Reporting them as load-error hid the files that genuinely
+    # fail to load. Requires a clean exit AND a runner summary AND no
+    # out-of-test error, so a file that dies before registering anything (an
+    # unhandled error, a missing global) still lands in load-error.
+    if exit_code == 0 and RAN_RE.search(output) and not ERROR_MARK_RE.search(output):
+        return "no-tests"
     return "load-error"
 
 
@@ -82,7 +119,8 @@ from bounded_run import BoundedRun, ensure_disk_headroom
 
 
 def run_one(
-    binary: Path, root: Path, output_dir: Path, timeout: float, path: str, spawn_cwd: Path
+    binary: Path, root: Path, output_dir: Path, timeout: float, path: str, spawn_cwd: Path,
+    blocked_patterns: list[str] | None = None,
 ) -> Result:
     started = time.monotonic()
     # All resource/safety bounding (systemd scope limits, own session, private
@@ -107,10 +145,39 @@ def run_one(
     expects = last_int(EXPECT_RE, output)
     ran = last_int(RAN_RE, output)
     skipped = last_int(SKIP_RE, output)
+    blocked = any(fnmatch.fnmatch(path, pattern) for pattern in (blocked_patterns or []))
     category = classify(bounded.exit_code, passed, failed, ran, skipped,
-                        bounded.timed_out, bounded.oom_killed, output)
+                        bounded.timed_out, bounded.oom_killed, output, blocked)
     return Result(path, bounded.exit_code, passed, failed, expects, ran, category,
                   duration_ms, str(relative_log))
+
+
+def ensure_corpus_dependencies(corpus_root: Path) -> None:
+    """Refuse to measure a corpus whose npm dependencies are not installed.
+
+    `node_modules/` is gitignored inside the bun submodule, so a fresh clone
+    starts empty -- and 264 of the 1902 files then die at file evaluation with
+    "Cannot find module" before a single assertion runs (esbuild alone accounts
+    for 76: test/bundler/expectBundled.ts imports it at the top of the shared
+    bundler harness). Those files look like one-assertion near-misses in the
+    results while actually being dead, which silently misdirects a whole round
+    of triage. Fail loudly instead.
+    """
+    missing = [
+        directory
+        for directory in (corpus_root, corpus_root / "test")
+        if not (directory / "node_modules").is_dir()
+    ]
+    if missing:
+        listed = "\n".join(f"  (cd {directory} && bun install --frozen-lockfile)"
+                            for directory in missing)
+        raise SystemExit(
+            "bun_corpus_runner: corpus dependencies are not installed, so hundreds "
+            "of files would fail as 'Cannot find module' instead of being "
+            f"measured. Install them first:\n{listed}\n"
+            "(pass --allow-missing-node-modules to measure the un-provisioned "
+            "state on purpose)"
+        )
 
 
 def read_list(path: Path) -> list[str]:
@@ -133,6 +200,12 @@ def discover(root: Path, corpus_root: Path, per_group: int) -> list[str]:
         if not candidate.is_file():
             continue
         relative_corpus = candidate.relative_to(corpus_root)
+        # Installed packages ship their own tests: once the corpus npm
+        # dependencies exist, test/node_modules adds 785 third-party .test.*
+        # files, inflating the corpus from 1902 to 2687 and mixing other
+        # projects' suites into mbun's compatibility numbers.
+        if "node_modules" in relative_corpus.parts:
+            continue
         if not TEST_FILE_RE.search(relative_corpus.as_posix()):
             continue
         relative_root = candidate.relative_to(root).as_posix()
@@ -196,6 +269,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--timeout", type=float, default=30.0)
+    parser.add_argument(
+        "--allow-missing-node-modules", action="store_true",
+        help="measure even when the corpus npm dependencies are absent",
+    )
+    parser.add_argument(
+        "--blocked-manifest", type=Path, default=DEFAULT_BLOCKED_MANIFEST,
+        help="paths that time out only because a service/registry/toolchain is "
+             "absent; they are reported as blocked-external instead of timeout",
+    )
     return parser.parse_args()
 
 
@@ -222,10 +304,14 @@ def main() -> int:
     if not paths:
         raise SystemExit("no test files selected")
 
+    if not args.allow_missing_node_modules:
+        ensure_corpus_dependencies((args.cwd or root).resolve())
+    blocked_patterns = load_patterns(args.blocked_manifest.resolve())
     output_dir.mkdir(parents=True, exist_ok=True)
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as executor:
         futures = [
-            executor.submit(run_one, binary, root, output_dir, args.timeout, path, spawn_cwd)
+            executor.submit(run_one, binary, root, output_dir, args.timeout, path, spawn_cwd,
+                            blocked_patterns)
             for path in paths
         ]
         results = [future.result() for future in futures]

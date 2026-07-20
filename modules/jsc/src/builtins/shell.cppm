@@ -182,6 +182,9 @@ inline constexpr std::string_view kShellJS = R"JS(
 
     const BunShell = makeTag("BunShell");
     Object.defineProperties(BunShell, {
+      // bun exposes escape on `$` itself (BunObject.cpp: putDirectNativeFunction
+      // on the shell object), not on Shell instances.
+      escape: { value: (str) => SHN.escape(str), enumerable: true },
       Shell: { value: Shell, enumerable: true },
       ShellPromise: { value: ShellPromise, enumerable: true },
       ShellError: { value: ShellError, enumerable: true },

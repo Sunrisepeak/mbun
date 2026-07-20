@@ -134,9 +134,29 @@ private:
     // live one.
     std::vector<std::string> jsxRefs_;
 
+    // ── recursion budget ─────────────────────────────────────────────────────
+    // `jsx_parse_element_` and `jsx_parse_children_` recurse into each other once
+    // per nesting level, straight off the source bytes. Unlike the parser's own
+    // descent (token_cursor.cppm kMaxParseDepth) this scanner had no cap, so a
+    // source that nests thousands of elements — `("() => <div>").repeat(50_000)`
+    // parses the `() => ` runs as JSX text, nesting one `<div>` per repetition —
+    // ran the NATIVE stack out and died on the guard page with a bare SIGSEGV.
+    // bun bounds the same recursion and reports a catchable
+    // "Maximum call stack size exceeded" instead.
+    // ref: compat/bun/test/bundler/transpiler/jsx-deep-nesting-stack-overflow.test.ts
+    // The cap matches the parser's: a nesting count, not a byte budget, set far
+    // past anything real JSX nests.
+    static constexpr int kMaxJsxDepth{1000};
+    int depth_{0};
+    bool overflowed_{false};
+
 public:
     explicit JsxLowerer(std::string_view src, JsxOptions opts = {})
         : src_{src}, opts_{std::move(opts)} {}
+
+    // True when a scan bailed out on kMaxJsxDepth rather than on bad syntax, so
+    // the parser can report the overflow instead of "Unexpected token in JSX".
+    [[nodiscard]] bool overflowed() const { return overflowed_; }
 
     [[nodiscard]] const JsxUsed& used() const { return used_; }
     // The names above. Non-empty only for a JSX file that lowered an element.
@@ -751,6 +771,24 @@ public:
     bool jsx_parse_element_(std::size_t& p, std::string& out) {
         const std::size_t n = src_.size();
         if (p >= n || src_[p] != '<') {
+            return false;
+        }
+        // RAII depth budget: unwinds on every exit path below, so the counter
+        // always tracks the live recursion (see kMaxJsxDepth).
+        struct DepthGuard {
+            JsxLowerer* self;
+            bool ok;
+            explicit DepthGuard(JsxLowerer* s) : self{s} {
+                ok = ++self->depth_ <= kMaxJsxDepth;
+                if (!ok) {
+                    self->overflowed_ = true;
+                }
+            }
+            DepthGuard(const DepthGuard&) = delete;
+            DepthGuard& operator=(const DepthGuard&) = delete;
+            ~DepthGuard() { --self->depth_; }
+        } depth{this};
+        if (!depth.ok) {
             return false;
         }
         ++p;  // '<'

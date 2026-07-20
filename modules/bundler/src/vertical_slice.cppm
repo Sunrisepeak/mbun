@@ -30,7 +30,9 @@ export module mbun.bundler.vertical_slice;
 
 import std;
 import mbun.bundler.ascii_only;
+import mbun.bundler.defines;
 import mbun.core.strings;
+import mbun.css;
 import mbun.js_lexer;
 import mbun.js_parser;
 import mbun.resolver;
@@ -106,6 +108,11 @@ struct BuildOptions {
     // `Bun.build({ jsx })`. `.js`/`.ts` inputs never see JSX lowering, so this is
     // backward-compatible for existing non-JSX builds.
     mbun::js_parser::detail::JsxOptions jsx{};
+    // Compile-time identifier substitution (`--define K=V`, and the
+    // `process.env.NAME` entries `--env inline` / `Bun.build({ env })` synthesise).
+    // Empty by default, in which case the source text reaches the parser byte for
+    // byte as before. ref: bun-ref/src/bundler/options.rs `create_defines`.
+    DefineTable defines{};
     // Collect esbuild-compatible metafile input records into
     // BundleResult::metafileInputs. Off by default so the common build path pays
     // nothing; the runtime bridge turns it on for `Bun.build({ metafile })`.
@@ -147,9 +154,20 @@ struct BundleResult {
     std::uint32_t moduleCount{0};
     std::vector<std::uint32_t> entryModules;
     std::vector<std::string> entryPaths;
+    // The entry paths as the CALLER wrote them (normalized, pre-resolution),
+    // parallel to `entryPaths`. bun names an entry's output file after this, not
+    // after whatever the record resolved to: an onResolve plugin that rewrites
+    // `virtual-entry.ts` to `actual-entry.ts` still emits `out/virtual-entry.js`.
+    // ref: compat/bun/test/bundler/bundler_plugin_chain.test.ts
+    //      "plugin/EntryPointResolveChain" (run.file "/out/virtual-entry.js").
+    std::vector<std::string> entryInputs;
     // esbuild-compatible metafile inputs, populated only when BuildOptions::metafile
     // is set. One entry per bundled module, in emission order.
     std::vector<MetafileInput> metafileInputs;
+    // The emitted chunk is CSS, not JS: the caller names the output `.css` and
+    // reports the artifact's loader as "css". ref: bun emits one CSS chunk per
+    // CSS entry point (src/bundler/linker_context/postProcessCSSChunk.rs).
+    bool cssChunk{false};
 };
 
 using Files = std::unordered_map<std::string, std::string>;
@@ -187,6 +205,9 @@ struct Module {
     std::string source;
     std::string code;
     std::vector<ImportEdge> imports;
+    // A `.css` module: `code` is printed CSS, not JS, and it belongs in a CSS
+    // chunk rather than the JS module table.
+    bool css{false};
 };
 
 // Key for the module table. Plain paths stay unprefixed so the "file" namespace
@@ -378,6 +399,12 @@ void append_js_string(std::string& output, std::string_view value) {
 // Loader kind for a module path, from its extension. Empty = the default JS-family
 // loader (js/jsx/ts/tsx), which is parsed as source rather than wrapped.
 std::string_view loader_for_ext(std::string_view path) {
+    // css is NOT a JS-wrapping loader: a CSS module is printed through mbun.css
+    // and emitted into a CSS chunk of its own (see emit_css_), so it never
+    // reaches synthesize_loader_module.
+    if (path.ends_with(".css")) {
+        return "css";
+    }
     if (path.ends_with(".json")) {
         return "json";
     }
@@ -617,11 +644,14 @@ public:
         onResolve_ = options.on_resolve ? &options.on_resolve : nullptr;
         onLoad_ = options.on_load ? &options.on_load : nullptr;
         jsxOptions_ = options.jsx;
+        defines_ = options.defines;
 
         std::vector<ModuleId> entryIds;
         std::vector<std::string> entryPaths;
+        std::vector<std::string> entryInputs;
         entryIds.reserve(entryPoints.size());
         entryPaths.reserve(entryPoints.size());
+        entryInputs.reserve(entryPoints.size());
         for (const std::string& entryPoint : entryPoints) {
             auto normalizedEntry{normalize_absolute(entryPoint)};
             if (!normalizedEntry) {
@@ -641,6 +671,7 @@ public:
             // per-input-entry mapping for the caller.
             entryIds.push_back(*entry);
             entryPaths.push_back(modules_[*entry].path);
+            entryInputs.push_back(std::move(*normalizedEntry));
         }
 
         // Without tree-shaking, every input file is an implicit root so unreferenced
@@ -668,7 +699,31 @@ public:
         result.moduleCount = static_cast<std::uint32_t>(modules_.size());
         result.entryModules.assign(entryIds.begin(), entryIds.end());
         result.entryPaths = std::move(entryPaths);
-        if (options.sourcemap) {
+        result.entryInputs = std::move(entryInputs);
+        // A CSS entry produces a CSS chunk: `/* <name> */` + printed rules per
+        // input, in dependency-first order — no JS module table, no runtime.
+        // Mixed JS+CSS graphs (a `.js` that `import`s a `.css`) still go down the
+        // JS path, where the CSS module's printed text would be wrong; that is
+        // DEFERRED with `@import` edges, so only an all-CSS graph takes this
+        // branch.
+        const bool anyCss{std::any_of(modules_.begin(), modules_.end(),
+                                      [](const Module& m) { return m.css; })};
+        const bool cssOnly{!modules_.empty() &&
+                           std::all_of(modules_.begin(), modules_.end(),
+                                       [](const Module& m) { return m.css; })};
+        if (anyCss && !cssOnly) {
+            // Emitting the printed CSS into a JS module wrapper would produce a
+            // chunk that does not parse. Fail loudly instead.
+            const auto cssModule{std::find_if(modules_.begin(), modules_.end(),
+                                              [](const Module& m) { return m.css; })};
+            return std::unexpected(BuildError{
+                cssModule->path,
+                "a CSS import from a JS module is outside this bundler slice", 0});
+        }
+        result.cssChunk = cssOnly;
+        if (cssOnly) {
+            result.code = emit_css_(order, result.entryPaths);
+        } else if (options.sourcemap) {
             result.code = emit_(order, entryIds, result.entryPaths, &result.sourcemap);
         } else {
             result.code = emit_(order, entryIds, result.entryPaths, nullptr);
@@ -721,6 +776,8 @@ private:
     const OnLoadHook* onLoad_{nullptr};
     // JSX config (BuildOptions::jsx), applied to `.jsx`/`.tsx` modules only.
     mbun::js_parser::detail::JsxOptions jsxOptions_{};
+    // Define table (BuildOptions::defines); empty = no substitution pass runs.
+    DefineTable defines_{};
 
     // ── overlay filesystem: in-memory `files` shadow disk ────────────────────
     // ref: bun layers the JSBundler file map over the real resolver filesystem
@@ -880,6 +937,15 @@ private:
         // ordinary transpile below, so the CJS wrapper, linking and live-binding
         // exports are all reused. A loader module is a leaf (no import records).
         // ref: bun applies a loader by extension before parsing (options.rs Loader).
+        // A CSS module is not JS: it is printed through mbun.css (bun's
+        // lightningcss printer port) and concatenated into a CSS chunk. It is a
+        // leaf here — `@import` graph edges are DEFERRED — so no linking runs.
+        if (loader_for_ext(path) == "css") {
+            module.css = true;
+            module.code = mbun::css::print(source);
+            return {};
+        }
+
         if (const std::string_view loader{loader_for_ext(path)}; !loader.empty()) {
             auto synthesized{synthesize_loader_module(loader, path, source)};
             if (!synthesized) {
@@ -894,6 +960,19 @@ private:
             return {};
         }
 
+        // Compile-time defines (`--define`, `--env inline`) are substituted into the
+        // source text before anything else reads it, so the lexer that extracts
+        // import records, the JSX lowering pass and the transpiler all observe the
+        // replaced expression — the same position bun's printer-level define
+        // resolution occupies. Non-JS loaders above are deliberately excluded: bun
+        // only resolves defines in JS-family ASTs.
+        std::string definedOwned;
+        std::string_view jsSource{source};
+        if (!defines_.empty()) {
+            definedOwned = apply_defines(source, defines_);
+            jsSource = definedOwned;
+        }
+
         // `.jsx`/`.tsx` inputs lower JSX; `.tsx` also carries TS, which transpile
         // erases regardless. `.js`/`.ts` never see JSX lowering, keeping non-JSX
         // builds byte-identical to before.
@@ -904,10 +983,10 @@ private:
         // we first lower JSX while KEEPING ESM (cjs=false) and lex that; non-JSX
         // inputs lex the raw source unchanged.
         std::string lexOwned;
-        std::string_view lexSource{source};
+        std::string_view lexSource{jsSource};
         if (is_jsx) {
             auto lowered{mbun::js_parser::transpile(
-                source, {.cjs = false, .jsx = true, .jsx_options = jsxOptions_})};
+                jsSource, {.cjs = false, .jsx = true, .jsx_options = jsxOptions_})};
             if (!lowered.ok) {
                 return std::unexpected(
                     BuildError{module.path, std::move(lowered.error), lowered.error_offset});
@@ -920,7 +999,7 @@ private:
             return std::unexpected(tokens.error());
         }
         auto transpiled{mbun::js_parser::transpile(
-            source, {.cjs = true, .jsx = is_jsx, .jsx_options = jsxOptions_})};
+            jsSource, {.cjs = true, .jsx = is_jsx, .jsx_options = jsxOptions_})};
         if (!transpiled.ok) {
             return std::unexpected(BuildError{module.path, std::move(transpiled.error), transpiled.error_offset});
         }
@@ -1127,6 +1206,39 @@ private:
             }
         }
         return order;
+    }
+
+    // Emit one CSS chunk: every input's printed rules, each preceded by a
+    // `/* <name> */` provenance comment and separated by a blank line, in the
+    // same dependency-first order the JS chunk uses. `<name>` is the module path
+    // relative to the entry's directory (bun's default common source root), so a
+    // single `/root/index.css` entry prints `/* index.css */`.
+    // ref: bun src/bundler/linker_context/postProcessCSSChunk.rs — each rule
+    // block is preceded by its source's comment when not minifying.
+    std::string emit_css_(const std::vector<ModuleId>& order,
+                          const std::vector<std::string>& entryPaths) const {
+        const std::string base{entryPaths.empty() ? std::string{"/"}
+                                                  : std::string{dirname(entryPaths.front())}};
+        std::string out;
+        for (const ModuleId id : order) {
+            const Module& module{modules_[id]};
+            std::string_view name{module.path};
+            if (name.size() > base.size() + 1 && name.starts_with(base) &&
+                name[base.size()] == '/') {
+                name.remove_prefix(base.size() + 1);
+            } else if (const std::size_t slash{name.rfind('/')}; slash != std::string_view::npos) {
+                name.remove_prefix(slash + 1);
+            }
+            if (!out.empty()) {
+                out.push_back('\n');
+            }
+            out.append("/* ").append(name).append(" */\n");
+            out.append(module.code);
+            if (!module.code.empty() && module.code.back() != '\n') {
+                out.push_back('\n');
+            }
+        }
+        return out;
     }
 
     // Emit one CommonJS-style chunk. When `mapOut` is non-null a source-map v3 is

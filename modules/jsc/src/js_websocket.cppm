@@ -85,6 +85,14 @@ export constexpr std::string_view kWebSocketJS = R"JS(
         const b0 = buf[0], b1 = buf[1];
         const fin = (b0 & 0x80) !== 0, op = b0 & 0x0f, masked = (b1 & 0x80) !== 0;
         let len = b1 & 0x7f, off = 2;
+        // RFC 6455 5.5: a control frame (opcode >= 8) carries at most a 125
+        // byte payload — so it never uses the 126/127 extended-length forms —
+        // and MUST NOT be fragmented. Either violation fails the connection.
+        if ((op & 0x8) !== 0 && (len > 125 || !fin)) {
+          buf = new Uint8Array(0);
+          if (onError) onError(new Error("Received invalid control frame"));
+          return;
+        }
         if (len === 126) { if (buf.length < 4) return; len = (buf[2] << 8) | buf[3]; off = 4; }
         else if (len === 127) {
           if (buf.length < 10) return;
@@ -320,8 +328,11 @@ export constexpr std::string_view kWebSocketJS = R"JS(
       const NET = G.__mbunNet;
       if (NET) { NET.pending++; this._state.pending = true; }
       const sock = (this._sock = new netMod.Socket({ allowHalfOpen: false }));
-      sock.on("error", (e) => this._fail(e));
-      sock.on("close", () => { if (!this._state.done) this._finish(1006, "", false); });
+      // `failing` = failConnectingWebSocket() already scheduled the spec's
+      // error+close pair; the socket teardown it causes must not pre-empt it
+      // with a bare close event.
+      sock.on("error", (e) => { if (!this._state.failing) this._fail(e); });
+      sock.on("close", () => { if (!this._state.done && !this._state.failing) this._finish(1006, "", false); });
       sock.on("data", (chunk) => this._ingest(u8(chunk)));
       const sendHandshake = () => {
         let req = "GET " + target + " HTTP/1.1\r\nHost: " + host + (port === (secure ? 443 : 80) ? "" : ":" + port) +
@@ -356,7 +367,15 @@ export constexpr std::string_view kWebSocketJS = R"JS(
       let s = this._state.head;
       for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
       const at = s.indexOf("\r\n\r\n");
-      if (at === -1) { this._state.head = s; return; }
+      if (at === -1) {
+        // bun caps the buffered upgrade response at max_http_header_size
+        // (16 KiB) and fails with WebSocketErrorCode::invalid_response
+        // (WebSocket.cpp:1688) once an unterminated header exceeds it. Only
+        // bytes that are provably still header are counted — a pipelined frame
+        // arrives after the CRLFCRLF handled above.
+        if (s.length > 16384) { this._state.head = ""; this._fail(new Error("Invalid response")); return; }
+        this._state.head = s; return;
+      }
       const head = s.slice(0, at);
       if (head.indexOf(" 101") === -1) { this._fail(new Error("Unexpected server response: " + (head.split("\r\n")[0] || ""))); return; }
       const pm = /\r\nsec-websocket-protocol:\s*([^\r\n]+)/i.exec(head);
@@ -404,14 +423,33 @@ export constexpr std::string_view kWebSocketJS = R"JS(
     close(code, reason) {
       if (this.readyState === RS.CLOSED || this.readyState === RS.CLOSING) return;
       if (code !== undefined && code !== 1000 && !(code >= 3000 && code <= 4999)) throw new (G.DOMException || Error)("The close code must be either 1000 or in the range of 3000 to 4999", "InvalidAccessError");
-      if (this.readyState === RS.CONNECTING) { this._finish(1006, "", false); return; }
+      if (this.readyState === RS.CONNECTING) { this._failConnecting(); return; }
       this.readyState = RS.CLOSING;
       this._state.closeSent = true;
       try { this._wire.sendClose(code == null ? 1000 : code, reason); } catch (e) {}
       const t = G.setTimeout(() => this._finish(code == null ? 1000 : +code | 0, reason == null ? "" : String(reason), true), 300);
       if (t && typeof t.unref === "function") t.unref();
     }
-    terminate() { this._finish(1006, "", false); }
+    terminate() { if (this.readyState === RS.CONNECTING) { this._failConnecting(); return; } this._finish(1006, "", false); }
+    // WebSocket.cpp:938 failConnectingWebSocket — close()/terminate() while
+    // CONNECTING moves to CLOSING (NOT straight to CLOSED), cancels the pending
+    // upgrade, and posts a task that runs the spec's "fail the WebSocket
+    // connection": an error event followed by close(1006, wasClean=false).
+    _failConnecting() {
+      if (this._state.done || this._state.failing) return;
+      this._state.failing = true;
+      this.readyState = RS.CLOSING;
+      try { if (this._sock) this._sock.destroy(); } catch (e) {}
+      const run = () => {
+        if (this._state.done) return;
+        const reason = "WebSocket is closed before the connection is established";
+        this._state.failing = false;
+        this._emit("error", { error: new Error(reason), message: reason });
+        this._finish(1006, reason, false);
+      };
+      if (typeof G.setImmediate === "function") G.setImmediate(run);
+      else G.setTimeout(run, 0);
+    }
     addEventListener(type, cb) { (this._ls[type] || (this._ls[type] = [])).push(cb); }
     removeEventListener(type, cb) { const l = this._ls[type]; if (l) this._ls[type] = l.filter((x) => x !== cb); }
     dispatchEvent(ev) { this._emit(ev.type, ev); return true; }
