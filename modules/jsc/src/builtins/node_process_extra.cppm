@@ -200,6 +200,78 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
     }
   } catch (e) {}
 
+  // ---------------------------------- WHATWG global self + event handlers
+  // `self` is the global's self-reference (WorkerGlobalScope.self / Window.self);
+  // WebKit exposes it as a WRITABLE accessor on the global — web-globals.test.js
+  // asserts the descriptor is a configurable/enumerable get+set pair and that
+  // `globalThis.self = 123` sticks. onerror/onmessage/onmessageerror are the
+  // global event-handler IDL attributes: assigning one registers a single
+  // listener for the matching event on the global EventTarget, reassigning swaps
+  // it, nulling removes it (WHATWG "event handler IDL attributes").
+  try {
+    if (!Object.getOwnPropertyDescriptor(G, "self")) {
+      let selfValue, selfOverridden = false;
+      Object.defineProperty(G, "self", {
+        configurable: true, enumerable: true,
+        get() { return selfOverridden ? selfValue : G; },
+        set(v) { selfOverridden = true; selfValue = v; },
+      });
+    }
+    if (typeof G.addEventListener === "function") {
+      for (const [prop, evt] of [["onerror", "error"], ["onmessage", "message"], ["onmessageerror", "messageerror"]]) {
+        if (Object.getOwnPropertyDescriptor(G, prop)) continue;
+        let current = null;
+        Object.defineProperty(G, prop, {
+          configurable: true, enumerable: true,
+          get() { return current; },
+          set(cb) {
+            if (current) G.removeEventListener(evt, current);
+            current = typeof cb === "function" ? cb : null;
+            if (current) G.addEventListener(evt, current);
+          },
+        });
+      }
+    }
+  } catch (e) {}
+
+  // --------------------------------- alert() / confirm() / prompt() dialogs
+  // WHATWG simple dialogs backed by a synchronous stdin read (bun
+  // src/runtime/webcore/prompt.rs): confirm() prints "<msg> [y/N] " and returns
+  // true only for a bare "y"/"Y" line (LF or CRLF terminated); anything else is
+  // false. The read is one byte at a time off fd 0 via the native positioned-I/O
+  // seam, matching bun's BufferedStdin.take_byte loop.
+  try {
+    const NN = G.__mbunNetNative;
+    if (NN && typeof NN.readByteBlocking === "function" && typeof G.confirm !== "function") {
+      const writeOut = (s) => { try { const so = G.process && G.process.stdout; if (so && typeof so.write === "function") so.write(s); } catch (e) {} };
+      const readByte = () => { try { return NN.readByteBlocking(0) | 0; } catch (e) { return -1; } };
+      const drainLine = () => { for (;;) { const b = readByte(); if (b === -1 || b === 0x0a || b === 0x0d) break; } };
+      G.confirm = function confirm(message) {
+        if (arguments.length > 0) writeOut(String(message));
+        writeOut(arguments.length > 0 ? " [y/N] " : "Confirm [y/N] ");
+        const first = readByte();
+        if (first === 0x0a) return false;               // "\n"
+        if (first === 0x0d) { readByte(); return false; } // "\r" (CRLF)
+        if (first === 0x79 || first === 0x59) {          // "y" / "Y"
+          const next = readByte();
+          if (next === 0x0a) return true;
+          if (next === 0x0d && readByte() === 0x0a) return true;
+        }
+        drainLine();
+        return false;
+      };
+      if (typeof G.alert !== "function")
+        G.alert = function alert(message) { writeOut((arguments.length > 0 ? String(message) : "") + " [Enter] "); drainLine(); };
+      if (typeof G.prompt !== "function")
+        G.prompt = function prompt(message, def) {
+          if (arguments.length > 0) writeOut(String(message) + " ");
+          let s = "";
+          for (;;) { const b = readByte(); if (b === -1) { if (s === "") return def === undefined ? null : String(def); break; } if (b === 0x0a) break; if (b === 0x0d) continue; s += String.fromCharCode(b); }
+          return s;
+        };
+    }
+  } catch (e) {}
+
   // -------------------------------------------------------- process extras
   try {
     const proc = G.process;

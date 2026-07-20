@@ -158,13 +158,42 @@ inline constexpr std::string_view kWebHeadersJS = R"JS(
       }
       return out;
     };
-    proto.entries = function entries() { return sortedEntries(this)[Symbol.iterator](); };
-    proto.keys = function keys() { return sortedEntries(this).map((e) => e[0])[Symbol.iterator](); };
-    proto.values = function values() { return sortedEntries(this).map((e) => e[1])[Symbol.iterator](); };
+    // WHATWG maplike iterator: LIVE, not a snapshot. Each next() re-derives the
+    // sorted header list and returns the element at the running index, so a
+    // mutation inside a `for..of headers` loop is observed on the next step
+    // (headers.undici "should freeze values while iterating"). WebKit's
+    // JSFetchHeaders iterator has the same index-into-current-list behavior.
+    // A single shared iterator prototype so every Headers iterator's `next` is
+    // the same function object (headers.undici "always use the same prototype
+    // Iterator"): it reads its (headers, index, kind) state off `this`, never a
+    // per-instance closure.
+    const HeadersIteratorProto = {
+      next() {
+        const s = this && this.__hi;
+        if (!s) throw new TypeError("Headers Iterator.prototype.next called on an incompatible receiver");
+        const entries = sortedEntries(s.h);
+        if (s.i >= entries.length) return { value: undefined, done: true };
+        const e = entries[s.i++];
+        return { value: s.kind === "key" ? e[0] : s.kind === "value" ? e[1] : [e[0], e[1]], done: false };
+      },
+    };
+    HeadersIteratorProto[Symbol.iterator] = function () { return this; };
+    const makeHeadersIterator = (h, kind) => {
+      const it = Object.create(HeadersIteratorProto);
+      it.__hi = { h, i: 0, kind };
+      return it;
+    };
+    proto.entries = function entries() { return makeHeadersIterator(this, "entry"); };
+    proto.keys = function keys() { return makeHeadersIterator(this, "key"); };
+    proto.values = function values() { return makeHeadersIterator(this, "value"); };
     proto[Symbol.iterator] = proto.entries;
     proto.forEach = function forEach(callback, thisArg) {
+      // Callback type is validated BEFORE iterating, so an empty Headers still
+      // rejects a non-callable callback (WHATWG/undici arg validation).
+      if (typeof callback !== "function") throw new TypeError("Headers.forEach callback must be a function");
       for (const [k, v] of sortedEntries(this)) callback.call(thisArg, v, k, this);
     };
+    try { Object.defineProperty(proto, Symbol.toStringTag, { value: "Headers", writable: false, enumerable: false, configurable: true }); } catch (_) {}
     // toJSON: bun/WebKit HTTPHeaderMap order — well-known headers first (in
     // insertion order), then set-cookie, then custom headers (in insertion order).
     //
@@ -199,7 +228,12 @@ inline constexpr std::string_view kWebHeadersJS = R"JS(
       if (init === undefined) return;
       if (init === null || (typeof init !== "object" && typeof init !== "function"))
         throw new TypeError("Headers init must be an object, array, or Headers instance");
-      if (init._m instanceof Map && Array.isArray(init._sc)) {
+      // webidl HeadersInit union (sequence<sequence<ByteString>> or record):
+      // read @@iterator EXACTLY ONCE via GetMethod, then decide. `instanceof`
+      // uses [[GetPrototypeOf]] (no property Get), so the Headers-copy fast path
+      // does not count against "Symbol.iterator is only accessed once".
+      const iterFn = init[Symbol.iterator];
+      if (init instanceof OrigHeaders && init._m instanceof Map && Array.isArray(init._sc)) {
         // another Headers: exact copy incl. individual set-cookie values
         for (const [k, v] of init._m) h._m.set(k, v);
         h._sc = init._sc.slice();
@@ -207,14 +241,20 @@ inline constexpr std::string_view kWebHeadersJS = R"JS(
           for (const [lk, n] of init._names) h._names.set(lk, n);  // preserve wire-name case
         return;
       }
-      const iterFn = init[Symbol.iterator];
       if (typeof iterFn === "function") {
-        // sequence<sequence<ByteString>>
+        // sequence<sequence<ByteString>> — drive the iterator obtained from the
+        // SINGLE @@iterator read (no re-Get via a fresh for..of).
+        const iterator = iterFn.call(init);
+        if (iterator == null || typeof iterator.next !== "function")
+          throw new TypeError("Headers init is not iterable");
         const pairs = [];
-        for (const entry of init) {
-          if (entry === null || typeof entry !== "object" && typeof entry !== "string")
-            throw new TypeError("Headers init entry must be a two-element sequence");
-          if (typeof entry === "string" || typeof entry[Symbol.iterator] !== "function")
+        for (;;) {
+          const step = iterator.next();
+          if (step == null || typeof step !== "object") throw new TypeError("Iterator result is not an object");
+          if (step.done) break;
+          const entry = step.value;
+          if (entry === null || (typeof entry !== "object" && typeof entry !== "string") ||
+              typeof entry === "string" || typeof entry[Symbol.iterator] !== "function")
             throw new TypeError("Headers init entry must be a two-element sequence");
           const items = Array.from(entry);
           if (items.length !== 2) throw new TypeError("Headers init entry must have exactly two items");
@@ -226,6 +266,9 @@ inline constexpr std::string_view kWebHeadersJS = R"JS(
         }
         return;
       }
+      // A present-but-non-callable @@iterator is not iterable → TypeError
+      // (undici/bun: `new Headers({ [Symbol.iterator]: null })` throws).
+      if (Symbol.iterator in init) throw new TypeError("Headers init is not iterable");
       // record<ByteString, ByteString>: snapshot keys, then per key re-check
       // own enumerability, Get, ToString — in that interleaved order.
       const keys = Object.keys(init);

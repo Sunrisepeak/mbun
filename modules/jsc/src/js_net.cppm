@@ -2765,41 +2765,41 @@ export constexpr std::string_view kNetJS = R"JS(
   }
 
   G.fetch = function fetch(input, init) {
-    // fetch(url, { headers }) validates names/values synchronously (bun builds
-    // the request eagerly): a bad name/value THROWS here, not rejects. new
-    // Headers() carries bun's exact messages. The kNodeBuiltinsJS wrapper does
-    // this too but kNetJS overwrites G.fetch after it, so the check lives here.
-    if (init && init.headers !== undefined && init.headers !== null
-        && !(typeof G.Headers === "function" && init.headers instanceof G.Headers))
-      void new G.Headers(init.headers);
-    let url = input;
-    if (input && typeof input === "object" && input.url) {
-      url = input.url;
-      // The signal rides on the input Request unless `init` carries its own —
-      // bun fetch.rs:1141-1200 ('extract_signal): an `init.signal` that is present
-      // wins (a present `null` DETACHES, with no fallback to the Request), while an
-      // absent/undefined one falls back to the input Request's signal. Dropping it
-      // here made `fetch(new Request(url, { signal }))` unabortable.
-      const initHasSignal = init != null && typeof init === "object"
-        && "signal" in init && init.signal !== undefined;
-      // redirect mode rides on the input Request too (fetch.rs: the Request's
-      // mode is the effective one unless init overrides it) — without this
-      // fetch(new Request(url, { redirect: "manual" })) followed the redirect.
-      const initHasRedirect = init != null && typeof init === "object"
-        && "redirect" in init && init.redirect !== undefined;
-      init = Object.assign({ method: input.method, headers: input.headers, body: input._body }, init || {});
-      if (!initHasSignal) init.signal = input.signal;
-      if (!initHasRedirect && input.redirect !== undefined) init.redirect = input.redirect;
-    }
     try {
+      // Eagerly snapshot init up front so every documented option getter is read
+      // exactly once (bun fetch.rs reads the whole RequestInit before dispatch):
+      // a throwing getter — or a throwing `headers` iterable — must REJECT the
+      // returned promise, not throw synchronously and not connect first. Object
+      // spread pulls every own-enumerable value (incl. proxy/timeout/unix/verbose
+      // that doFetch ignores) so the throw surfaces here, inside the try.
+      if (init != null && typeof init === "object") init = Object.assign({}, init);
+      let url = input;
+      if (input && typeof input === "object" && input.url) {
+        url = input.url;
+        // The signal rides on the input Request unless `init` carries its own —
+        // bun fetch.rs:1141-1200 ('extract_signal): an `init.signal` that is present
+        // wins (a present `null` DETACHES, with no fallback to the Request), while an
+        // absent/undefined one falls back to the input Request's signal. Dropping it
+        // here made `fetch(new Request(url, { signal }))` unabortable.
+        const initHasSignal = init != null && typeof init === "object"
+          && "signal" in init && init.signal !== undefined;
+        // redirect mode rides on the input Request too (fetch.rs: the Request's
+        // mode is the effective one unless init overrides it) — without this
+        // fetch(new Request(url, { redirect: "manual" })) followed the redirect.
+        const initHasRedirect = init != null && typeof init === "object"
+          && "redirect" in init && init.redirect !== undefined;
+        init = Object.assign({ method: input.method, headers: input.headers, body: input._body }, init || {});
+        if (!initHasSignal) init.signal = input.signal;
+        if (!initHasRedirect && input.redirect !== undefined) init.redirect = input.redirect;
+      }
+      // fetch(url, { headers }) validates names/values synchronously (bun builds
+      // the request eagerly): a bad name/value or a throwing iterable rejects.
+      // A Headers instance was already validated.
+      if (init != null && typeof init === "object" && init.headers != null && !(init.headers instanceof G.Headers))
+        void new G.Headers(init.headers);
       // A present non-null init.signal must be an AbortSignal (Request.rs:1408-1414).
       if (init != null && typeof init === "object" && init.signal != null && !(init.signal instanceof G.AbortSignal))
         throw new TypeError("fetch() signal is not of type AbortSignal.");
-      // Re-validate the merged headers: a subclass Request's overridden get
-      // headers() (folded in above) may carry invalid names — reject here rather
-      // than put them on the wire. A Headers instance was already validated.
-      if (init != null && typeof init === "object" && init.headers != null && !(init.headers instanceof G.Headers))
-        void new G.Headers(init.headers);
       const __gbody = init != null ? init.body : undefined;
       if (__gbody !== undefined && __gbody !== null && __gbody !== "") {
         const __gm = (init != null && init.method != null) ? String(init.method).toUpperCase() : "GET";

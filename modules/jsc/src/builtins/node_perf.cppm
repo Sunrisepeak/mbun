@@ -470,6 +470,12 @@ inline constexpr std::string_view kNodePerfJS = R"JS(
   G.PerformanceMeasure = PerformanceMeasure;
   G.PerformanceObserver = PerformanceObserver;
   G.PerformanceObserverEntryList = PerformanceObserverEntryList;
+  // WebKit exposes the Resource Timing / legacy Navigation Timing interfaces as
+  // globals even in a server runtime (web-globals.test.js asserts they exist).
+  // We surface only the constructors — no live timing data is produced.
+  if (typeof G.PerformanceResourceTiming === "undefined") { class PerformanceResourceTiming extends PerformanceEntry {} G.PerformanceResourceTiming = PerformanceResourceTiming; }
+  if (typeof G.PerformanceServerTiming === "undefined") { class PerformanceServerTiming {} G.PerformanceServerTiming = PerformanceServerTiming; }
+  if (typeof G.PerformanceTiming === "undefined") { class PerformanceTiming {} G.PerformanceTiming = PerformanceTiming; }
 
   const mod = {
     performance: performanceObj,

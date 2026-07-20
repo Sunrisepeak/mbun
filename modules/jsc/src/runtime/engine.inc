@@ -1542,6 +1542,7 @@ public:
         set_fn(ctx_, nn, "connectUnix", netn_connect_unix_cb);
         set_fn(ctx_, nn, "read", netn_read_cb);
         set_fn(ctx_, nn, "readFd", netn_read_fd_cb);  // read(2) twin for process.stdin's fd 0
+        set_fn(ctx_, nn, "readByteBlocking", netn_read_byte_blocking_cb);  // blocking 1-byte read for alert/confirm/prompt
         set_fn(ctx_, nn, "write", netn_write_cb);
         set_fn(ctx_, nn, "shutdown", netn_shutdown_cb);
         set_fn(ctx_, nn, "close", netn_close_cb);

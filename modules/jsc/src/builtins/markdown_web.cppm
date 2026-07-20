@@ -969,7 +969,7 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       createDiffieHellman: () => ({ generateKeys: () => Buffer.alloc(0), computeSecret: () => Buffer.alloc(0), getPrime: () => Buffer.alloc(0), getGenerator: () => Buffer.alloc(0) }),
       // node/bun throw on a length mismatch (ErrorCode.cpp:1552
       // CRYPTO_TIMING_SAFE_EQUAL_LENGTH), they do not return false.
-      timingSafeEqual: (a, b) => { a = toBytes(a); b = toBytes(b); if (a.length !== b.length) { const e = new RangeError("Input buffers must have the same byte length"); e.code = "ERR_CRYPTO_TIMING_SAFE_EQUAL_LENGTH"; throw e; } let d = 0; for (let i = 0; i < a.length; i++) d |= a[i] ^ b[i]; return d === 0; },
+      timingSafeEqual: (a, b) => { const ok = (x) => ArrayBuffer.isView(x) || x instanceof ArrayBuffer; if (!ok(a) || !ok(b)) { const e = new TypeError('The "buf1" argument must be an instance of ArrayBuffer, Buffer, TypedArray, or DataView.'); e.code = "ERR_INVALID_ARG_TYPE"; throw e; } a = toBytes(a); b = toBytes(b); if (a.length !== b.length) { const e = new RangeError("Input buffers must have the same byte length"); e.code = "ERR_CRYPTO_TIMING_SAFE_EQUAL_LENGTH"; throw e; } let d = 0; for (let i = 0; i < a.length; i++) d |= a[i] ^ b[i]; return d === 0; },
       constants: { RSA_PKCS1_PADDING: 1, RSA_PKCS1_OAEP_PADDING: 4 }, webcrypto: G.crypto,
     };
     // node's generateKeyPair has a custom promisify that resolves to an object
