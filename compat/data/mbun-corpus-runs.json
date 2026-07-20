@@ -8,20 +8,20 @@
       "files": 1902,
       "categories": {
         "all-skipped": 73,
-        "blocked-external": 19,
+        "blocked-external": 18,
         "crash": 13,
-        "green": 880,
+        "green": 885,
         "load-error": 5,
         "no-tests": 6,
         "oom-kill": 2,
-        "test-failure": 861,
-        "timeout": 43
+        "test-failure": 856,
+        "timeout": 44
       },
       "test_level": {
-        "ran": 52677,
-        "passed": 32263,
-        "failed": 17553,
-        "expects": 488671
+        "ran": 52454,
+        "passed": 32190,
+        "failed": 17404,
+        "expects": 487285
       },
       "notes": "file-level green = every executed test in the file passed and the file reported no out-of-test error; all-skipped / no-tests / blocked-external are separate buckets and are NOT passes. The corpus npm dependencies must be installed first (see compat/README.md) -- without them 264 files die at load; test/node_modules is excluded from discovery so third-party packages do not inflate the corpus"
     },
