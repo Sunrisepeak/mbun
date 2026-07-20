@@ -67,6 +67,26 @@ bool shell_collect_words(JSContextRef context, JSValueRef value, std::uint32_t d
     if (JSValueIsObject(context, value) && !JSValueIsArray(context, value)) {
         JSObjectRef obj{JSValueToObject(context, value, exception)};
         if (exception != nullptr && *exception != nullptr) return false;
+        // bun (shell_body.rs:785-805): a file-backed Blob — `Bun.file(path)` —
+        // interpolates as its PATH, not as its contents or "[object Blob]".
+        // mbun's Bun.file wrapper tags the Blob with __isBunFile/__name.
+        JSStringRef bunFileKey{JSStringCreateWithUTF8CString("__isBunFile")};
+        JSValueRef bunFileVal{JSObjectGetProperty(context, obj, bunFileKey, exception)};
+        JSStringRelease(bunFileKey);
+        if (exception != nullptr && *exception != nullptr) return false;
+        if (bunFileVal != nullptr && JSValueToBoolean(context, bunFileVal)) {
+            JSStringRef nameKey{JSStringCreateWithUTF8CString("__name")};
+            JSValueRef nameVal{JSObjectGetProperty(context, obj, nameKey, exception)};
+            JSStringRelease(nameKey);
+            if (exception != nullptr && *exception != nullptr) return false;
+            if (nameVal != nullptr && !JSValueIsUndefined(context, nameVal)
+                && !JSValueIsNull(context, nameVal)) {
+                std::string path;
+                if (!shell_value_to_string(context, nameVal, path, exception)) return false;
+                output.push_back(std::move(path));
+                return true;
+            }
+        }
         JSStringRef rawKey{JSStringCreateWithUTF8CString("raw")};
         JSValueRef rawVal{JSObjectGetProperty(context, obj, rawKey, exception)};
         JSStringRelease(rawKey);

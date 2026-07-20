@@ -1787,7 +1787,14 @@ constexpr std::string_view kStreamsJS_part2 = R"JS(
   // =====================================================================
   function consumeStart(stream) {
     // acquire a reader (async so lock errors become rejections)
-    try { return Promise.resolve(new ReadableStreamDefaultReader(stream)); }
+    try {
+      const r = new ReadableStreamDefaultReader(stream);
+      // Body consumption (Response/Request .text()/.arrayBuffer()/…) keeps the
+      // reader attached: the fetch spec's "fully reading body as promise" never
+      // releases it, so `req.body.locked` stays true afterwards (issue 07001).
+      if (stream && stream.__mbunBodyRetainLock) r._keepLock = true;
+      return Promise.resolve(r);
+    }
     catch (e) { return Promise.reject(e); }
   }
   // Incremental WHATWG utf-8 decoder with U+FFFD replacement.
@@ -1845,7 +1852,7 @@ constexpr std::string_view kStreamsJS_part2 = R"JS(
       }
       if (dec) out += dec.decode(new Uint8Array(0), true);
       return out;
-    } finally { if (reader._stream !== undefined) reader.releaseLock(); }
+    } finally { if (reader._stream !== undefined && !reader._keepLock) reader.releaseLock(); }
   }
   async function consumeBytes(reader) {
     const parts = [];
@@ -1863,7 +1870,7 @@ constexpr std::string_view kStreamsJS_part2 = R"JS(
       let off = 0;
       for (const p of parts) { out.set(p, off); off += p.byteLength; }
       return out;
-    } finally { if (reader._stream !== undefined) reader.releaseLock(); }
+    } finally { if (reader._stream !== undefined && !reader._keepLock) reader.releaseLock(); }
   }
   async function consumeArray(reader) {
     const out = [];
@@ -1874,7 +1881,7 @@ constexpr std::string_view kStreamsJS_part2 = R"JS(
         out.push(value);
       }
       return out;
-    } finally { if (reader._stream !== undefined) reader.releaseLock(); }
+    } finally { if (reader._stream !== undefined && !reader._keepLock) reader.releaseLock(); }
   }
   // Bun's usable-state checks: consumers reject on locked/used streams and
   // synchronously reject on a detached queued chunk (validated eagerly).
@@ -1950,6 +1957,10 @@ constexpr std::string_view kStreamsJS_part2 = R"JS(
       return consumeStart(stream).then(consumeArray).then((chunks) => new G.Blob(chunks, { type: t }));
     },
     // raw internals for Response/Request/builtins wiring
+    // Mark a stream as a *body* being fully read: consumeStart then keeps the
+    // reader attached so `.locked` stays true after consumption, matching the
+    // fetch spec (and bun) for Response/Request body consumers (issue 07001).
+    retainLock(stream) { if (stream && typeof stream === "object") { try { stream.__mbunBodyRetainLock = true; } catch (e) {} } },
     consumeTextRaw: (stream) => consumeStart(stream).then(consumeText),
     consumeBytesRaw: (stream) => consumeStart(stream).then(consumeBytes),
     consumeArrayRaw: (stream) => consumeStart(stream).then(consumeArray),

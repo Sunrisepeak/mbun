@@ -608,12 +608,23 @@ export constexpr std::string_view kNetJS = R"JS(
         else G.queueMicrotask(() => { throw error; });
       }
     }
+    // bun's writeOrEnd (src/runtime/socket/socket_body.rs) returns -1 when the
+    // socket is already shut down or closed; it never surfaces node's
+    // ERR_STREAM_WRITE_AFTER_END. The echo tests write from a `data` callback
+    // that can land after the peer's FIN, so the node-level error must not leak
+    // into the Bun.listen/Bun.connect handlers.
+    get _writeShutdown() { return this._socket.destroyed || this._socket.writableEnded; }
     write(data, encoding) {
       const length = u8(typeof data === "string" && encoding && G.Buffer ? G.Buffer.from(data, encoding) : data).length;
+      if (this._writeShutdown) return -1;
       this._socket.write(data, encoding);
       return length;
     }
-    end(data, encoding) { this._socket.end(data, encoding); return this; }
+    end(data, encoding) {
+      if (this._writeShutdown) return this;
+      this._socket.end(data, encoding);
+      return this;
+    }
     close() { this._socket.destroy(); return this; }
     terminate() { this._socket.destroy(); return this; }
     pause() { this._socket.pause(); return this; }
@@ -740,6 +751,21 @@ export constexpr std::string_view kNetJS = R"JS(
           }
           const head = latin1(this.buf, this.off, at);
           this.off = at + 4;
+          // picohttpparser refuses any control byte inside the head: every byte
+          // below 0x20 except HTAB (and the CR/LF that end a line), plus DEL.
+          // bun surfaces that as Malformed_HTTP_Response / BadRequest
+          // (compat/bun/src/picohttp/lib.rs). Accepting them let a redirect
+          // Location carrying a raw \x0b / \x01 / \x7f be followed as a normal
+          // target instead of failing the exchange.
+          for (let i = 0; i < head.length; i++) {
+            const cc = head.charCodeAt(i);
+            if (cc === 9 || cc === 10 || cc === 13) continue;
+            if (cc < 32 || cc === 127) {
+              if (this.isResponse) this._err("Malformed_HTTP_Response", "Malformed_HTTP_Response");
+              else this._err("Invalid HTTP request", "InvalidHTTPRequest");
+              return events + 1;
+            }
+          }
           const lines = head.split("\r\n");
           const first = lines.shift() || "";
           if (this.isResponse) {
@@ -1307,7 +1333,9 @@ export constexpr std::string_view kNetJS = R"JS(
     // ref-count into NET.serveActive: a listening (ref'd) server holds the
     // event loop open (bun: process stays alive until stop()/unref()).
     let refd = true;
-    const handlerRef = { fetch: opts.fetch, error: opts.error, routes: compiledRoutes, ws: opts.websocket };
+    const handlerRef = { fetch: opts.fetch, error: opts.error, routes: compiledRoutes, ws: opts.websocket,
+                         maxRequestBodySize: (typeof opts.maxRequestBodySize === "number" && opts.maxRequestBodySize > 0)
+                                               ? opts.maxRequestBodySize : 0 };
     // A bare IPv6 literal must be bracketed inside a URL authority ("[::1]"),
     // but server.hostname stays the raw form ("::1"). ref bun ServerConfig.
     const urlHost = isIPv6(displayHost) ? "[" + displayHost + "]" : displayHost;
@@ -1502,12 +1530,18 @@ export constexpr std::string_view kNetJS = R"JS(
       // body framing gets a live ReadableStream fed by subsequent body events;
       // bodiless requests keep body: null (req.body === null, bun semantics).
       let bodyStream = null;
+      // maxRequestBodySize: a declared Content-Length over the limit is refused
+      // with a bodiless 413 and the handler never runs (issue 22353).
+      let tooLarge = false;
       {
         let hasBody = false;
         for (let i = 0; i + 1 < hdrs.length; i += 2) {
           const lk = String(hdrs[i]).toLowerCase();
           if (lk === "transfer-encoding" && String(hdrs[i + 1]).toLowerCase().indexOf("chunked") !== -1) hasBody = true;
-          else if (lk === "content-length" && +hdrs[i + 1] > 0) hasBody = true;
+          else if (lk === "content-length" && +hdrs[i + 1] > 0) {
+            hasBody = true;
+            if (handlerRef.maxRequestBodySize > 0 && +hdrs[i + 1] > handlerRef.maxRequestBodySize) tooLarge = true;
+          }
         }
         if (hasBody) { bodyStream = mkBodyStream(); bodies.set(ev.id, bodyStream); }
       }
@@ -1545,7 +1579,9 @@ export constexpr std::string_view kNetJS = R"JS(
       const matched = handlerRef.routes ? handlerRef.routes.match(tgt.path, ev.method) : null;
       req.params = matched ? matched.params : {};
       let out;
-      if (matched) {
+      if (tooLarge) {
+        out = new G.Response(null, { status: 413 });
+      } else if (matched) {
         const h = matched.handler;
         if (typeof h === "function") { try { out = h.call(serverObj, req, serverObj); } catch (e) { out = handleError(e); } }
         else out = (h && typeof h.clone === "function") ? h.clone() : h;   // static Response (clone per request)
@@ -1680,7 +1716,9 @@ export constexpr std::string_view kNetJS = R"JS(
       netServer.listening = true;
       NET.items.add(netServer);
       const proto = tlsCfg ? "https" : "http";
-      const handlerRef = { fetch: opts.fetch, error: opts.error, routes: compiledRoutes, ws: opts.websocket };
+      const handlerRef = { fetch: opts.fetch, error: opts.error, routes: compiledRoutes, ws: opts.websocket,
+                         maxRequestBodySize: (typeof opts.maxRequestBodySize === "number" && opts.maxRequestBodySize > 0)
+                                               ? opts.maxRequestBodySize : 0 };
       const urlHost = isIPv6(displayHost) ? "[" + displayHost + "]" : displayHost;
       // bun unlinks a unix socket file on stop (Node/libuv order: before closing
       // the fd) so a restart can re-bind the path. Abstract sockets (leading NUL)
@@ -1689,6 +1727,7 @@ export constexpr std::string_view kNetJS = R"JS(
         if (!unixPath || unixPath[0] === "\0") return;
         try { (M["fs"] || M["node:fs"]).unlinkSync(unixPath); } catch (e) {}
       };
+      let urlCache;
       const serverObj = {
         port: unixPath ? undefined : lh.port,
         hostname: unixPath ? undefined : displayHost,
@@ -1698,7 +1737,16 @@ export constexpr std::string_view kNetJS = R"JS(
         id: opts.id || "",
         pendingRequests: 0,
         pendingWebSockets: 0,
-        url: new G.URL(unixPath ? "unix://" + unixPath : proto + "://" + urlHost + ":" + lh.port + "/"),
+        // Lazy, like bun's Server.url getter (server.classes.ts): a unix path
+        // that does not make a parseable URL ("unix://[object Bun]") must throw
+        // when `.url` is READ, not blow up inside Bun.serve() itself.
+        get url() {
+          if (urlCache === undefined) {
+            urlCache = new G.URL(unixPath ? "unix://" + unixPath
+                                          : proto + "://" + urlHost + ":" + lh.port + "/");
+          }
+          return urlCache;
+        },
         protocol: proto,
         fetch(req) {
           if (typeof req !== "string" && (req === null || typeof req !== "object"))
@@ -1921,6 +1969,18 @@ export constexpr std::string_view kNetJS = R"JS(
       this.headersSent = false; this.finished = false; this.writableEnded = false; this.writableFinished = false;
       this.sendDate = true;
       this._h = {}; this._meta = meta; this._chunked = false;
+      this._needDrain = false;
+    }
+    // node _http_outgoing: writableNeedDrain is a *stream* state, false until a
+    // write() actually exceeds the socket's high-water mark (issue 19111 — a
+    // standalone `new ServerResponse(req)` reported true because bufferedAmount
+    // defaulted to 1). It clears once the socket's queue has drained.
+    get writableNeedDrain() {
+      if (this.writableEnded || this.finished) return false;
+      if (!this._needDrain) return false;
+      const s = this.socket;
+      if (!s || (s.writableLength | 0) === 0) this._needDrain = false;
+      return this._needDrain;
     }
     setHeader(k, v) { this._h[String(k).toLowerCase()] = { k: String(k), v }; return this; }
     getHeader(k) { const e = this._h[String(k).toLowerCase()]; return e ? e.v : undefined; }
@@ -1962,9 +2022,18 @@ export constexpr std::string_view kNetJS = R"JS(
       const noBodyStatus = st === 204 || st === 304 || (st >= 100 && st < 200);
       const isHead = this._meta.method === "HEAD";
       this._noBody = noBodyStatus || isHead;
+      // Transfer-Encoding: chunked is HTTP/1.1-only framing. An HTTP/1.0 client
+      // (nginx `proxy_http_version 1.0`) cannot parse it, so a body of unknown
+      // length must instead be close-delimited: no TE header, no chunk framing,
+      // and the connection is what marks the end (issue 34415 — node's
+      // _http_server does the same via `chunkedEncoding` requiring 1.1).
+      const http10 = this._meta.httpVersion !== undefined && this._meta.httpVersion !== "1.1";
       if (!haveCL && !haveTE && !noBodyStatus) {
         if (contentLength !== undefined) lines.push("Content-Length: " + contentLength);
-        else if (!isHead) { this._chunked = true; lines.push("Transfer-Encoding: chunked"); }
+        else if (!isHead && !http10) { this._chunked = true; lines.push("Transfer-Encoding: chunked"); }
+        // Close-delimited: an HTTP/1.0 client can only know the body ended when
+        // the connection does, so keep-alive is off no matter what it asked for.
+        else if (!isHead && http10) this._meta.keepAlive = false;
       }
       lines.push("Connection: " + (this._meta.keepAlive ? "keep-alive" : "close"));
       this.socket.write(lines.join("\r\n") + "\r\n\r\n");
@@ -1983,6 +2052,7 @@ export constexpr std::string_view kNetJS = R"JS(
       } else {
         ok = this.socket.write(b);
       }
+      if (!ok) this._needDrain = true;
       if (typeof cb === "function") G.queueMicrotask(cb);
       return ok;
     }
@@ -2092,7 +2162,8 @@ export constexpr std::string_view kNetJS = R"JS(
           im.headers = parser.headers; im.rawHeaders = parser.rawHeaders;
           const connHdr = String(parser.headers["connection"] || "").toLowerCase();
           const keepAlive = parser.httpVersion === "1.1" ? connHdr.indexOf("close") === -1 : connHdr.indexOf("keep-alive") !== -1;
-          const meta = { method: parser.method, keepAlive, onFinished: null };
+          const meta = { method: parser.method, keepAlive, onFinished: null,
+                         httpVersion: parser.httpVersion };
           const res = new ServerResponse(sock, meta);
           activeRes = res;
           meta.onFinished = () => {
@@ -2532,8 +2603,15 @@ export constexpr std::string_view kNetJS = R"JS(
           // cost correctness.
           cleanup();
           if (depth >= 20) return reject(mkErr("Too many redirects", "TooManyRedirects"));
-          let nextUrl;
-          try { nextUrl = String(new G.URL(loc, url)); } catch (e) { nextUrl = loc; }
+          let nextUrl, nextProtocol;
+          try { const u = new G.URL(loc, url); nextUrl = String(u); nextProtocol = u.protocol; }
+          catch (e) { return reject(mkErr("InvalidRedirectURL", "InvalidRedirectURL")); }
+          // bun lib.rs:5241/5374: the hop target must speak http(s); anything
+          // else (file:, data:, ...) fails the fetch before the request goes
+          // out, so the redirect chain never reaches the origin again.
+          if (nextProtocol !== "http:" && nextProtocol !== "https:") {
+            return reject(mkErr("UnsupportedRedirectProtocol", "UnsupportedRedirectProtocol"));
+          }
           let ninit = init;
           if (parser.status === 303 || ((parser.status === 301 || parser.status === 302) && method === "POST")) {
             ninit = Object.assign({}, init, { method: "GET", body: undefined });

@@ -74,8 +74,14 @@ JSValueRef dgramn_create_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
     const bool v6{type == "udp6"};
     const int fd{socket(v6 ? AF_INET6 : AF_INET, SOCK_DGRAM, 0)};
     if (fd < 0) return fs_throw(ctx, exc, std::string{"dgram: socket() failed ("} + std::strerror(errno) + ")");
-    const int one{1};
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    // SO_REUSEADDR ONLY when dgram.createSocket({ reuseAddr: true }) asked for
+    // it. Setting it unconditionally lets two processes bind the same UDP port,
+    // which masks the EADDRINUSE node reports and breaks addMembership's
+    // in-use detection (issue 24157 — bun had the same bug).
+    if (argc > 1 && JSValueToBoolean(ctx, args[1])) {
+        const int one{1};
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    }
     net_set_nonblock(fd);
     return JSValueMakeNumber(ctx, fd);
 #endif
@@ -101,7 +107,19 @@ JSValueRef dgramn_bind_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_
         setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &on, sizeof on);
     }
     if (bind(fd, reinterpret_cast<sockaddr*>(&ss), len) != 0) {
-        return fs_throw(ctx, exc, std::string{"dgram.bind: "} + std::strerror(errno));
+        // node surfaces bind failures with an errno `code` on the error object;
+        // the "CODE: msg" spelling is what fs_make_error keys off to attach
+        // .code/.errno (a dgram 'error' listener reads err.code — issue 24157).
+        const int e{errno};
+        const char* code{e == EADDRINUSE      ? "EADDRINUSE"
+                         : e == EACCES        ? "EACCES"
+                         : e == EADDRNOTAVAIL ? "EADDRNOTAVAIL"
+                         : e == EINVAL        ? "EINVAL"
+                                              : nullptr};
+        if (code != nullptr) {
+            return fs_throw(ctx, exc, std::string{code} + ": " + std::strerror(e) + ", bind");
+        }
+        return fs_throw(ctx, exc, std::string{"dgram.bind: "} + std::strerror(e));
     }
     sockaddr_storage bound{};
     socklen_t blen{sizeof bound};
