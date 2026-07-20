@@ -567,7 +567,15 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
     const isBuildMessage = (v) =>
       v !== null && typeof v === "object" && v.name === "BuildMessage" &&
       typeof v.message === "string" && "position" in v && "level" in v;
-    if (typeof Bun.inspect === "undefined") Bun.inspect = (v, opts) => (isBuildMessage(v) ? inspectBuildMessage(v) : util.inspect(v, Object.assign({ __bunStyle: true }, opts)));
+    // bun accepts BOTH shapes: Bun.inspect(v, { ...options }) and the positional
+    // Bun.inspect(v, colors, depth) (ConsoleObject.rs `inspect`). A negative
+    // depth is a RangeError, not a silently clamped value.
+    if (typeof Bun.inspect === "undefined") Bun.inspect = (v, opts, depthArg) => {
+      let o = (opts !== null && typeof opts === "object") ? opts : { colors: opts === true };
+      if (depthArg !== undefined && depthArg !== null) o = Object.assign({}, o, { depth: depthArg });
+      if (typeof o.depth === "number" && o.depth < 0) throw new RangeError('The "depth" argument must be an integer >= 0');
+      return isBuildMessage(v) ? inspectBuildMessage(v) : util.inspect(v, Object.assign({ __bunStyle: true }, o));
+    };
     if (typeof Bun.inspect === "function" && Bun.inspect.custom === undefined && util.inspect && util.inspect.custom) Bun.inspect.custom = util.inspect.custom;
     if (typeof Bun.deepEquals === "undefined") Bun.deepEquals = (a, b, strict) => {
       const eq = (x, y, s, seen) => {

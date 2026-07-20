@@ -31,29 +31,6 @@ globalThis.__mbun_blob_module_source = function (spec) {
   return { type: typeof blob.type === "string" ? blob.type : "",
            source: bytes ? new TextDecoder().decode(bytes) : "" };
 };
-// Bridge for `require("data:…")` / `import("data:…")` (RFC 2397): the payload is
-// the module source and the mediatype selects the loader, exactly like the blob:
-// case above — so this returns the same { type, source } shape. `;base64` means
-// the payload is base64, otherwise it is percent-encoded.
-globalThis.__mbun_data_module_source = function (spec) {
-  const s = String(spec);
-  const comma = s.indexOf(",");
-  if (comma === -1) return null;
-  const meta = s.slice(5, comma);
-  const payload = s.slice(comma + 1);
-  const isBase64 = /;base64\s*$/i.test(meta);
-  // RFC 2397 default when the mediatype is omitted.
-  const type = (meta.replace(/;base64\s*$/i, "").split(";")[0] || "text/plain").trim().toLowerCase();
-  let source;
-  if (isBase64) {
-    source = globalThis.Buffer
-      ? globalThis.Buffer.from(payload, "base64").toString("utf8")
-      : (globalThis.atob ? globalThis.atob(payload) : payload);
-  } else {
-    try { source = decodeURIComponent(payload); } catch (e) { source = payload; }
-  }
-  return { type: type, source: source };
-};
 globalThis.__mbun_make_require = function (dir) {
   // `k` (arg 3): truthy when this call is a lowered ESM import statement or a
   // dynamic import (ImportKind::Stmt/Dynamic) rather than a literal require() —
@@ -122,6 +99,13 @@ globalThis.__mbun_esm_namespace = function (m) {
   return ns;
 };
 globalThis.__mbun_dyn_import = function (req, spec, options) {
+  // A `data:` URL carries its own source — there is nothing to fetch, so bun
+  // decodes and compiles it eagerly and a malformed payload (bad base64) throws
+  // from the import() call site instead of rejecting later
+  // (js/node/string-module.test.js asserts the synchronous throw).
+  if (typeof spec === "string" && spec.startsWith("data:")) {
+    return Promise.resolve(globalThis.__mbun_esm_namespace(req(spec, undefined, 1)));
+  }
   return Promise.resolve().then(function () {
     // `import(spec, { with: { type } })` (and the legacy `{ assert: { type } }`)
     // — thread the type import attribute to require() as its 2nd arg so it

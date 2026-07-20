@@ -2075,7 +2075,10 @@ bool is_skippable_run_flag(std::string_view a) {
         // (it must reach resolve_entry_path, which run_script calls).
         "--preserve-symlinks-main"};
     if (a.starts_with("--install=") || a.starts_with("--conditions=") ||
-        a.starts_with("--cwd=") || a.starts_with("--config=")) {
+        a.starts_with("--cwd=") || a.starts_with("--config=") ||
+        // node's rejection mode selector: mbun always behaves as "throw" (node's
+        // own default since v15), so every mode value is accepted and dropped.
+        a.starts_with("--unhandled-rejections=")) {
         return true;
     }
     for (std::string_view f : kFlags) {

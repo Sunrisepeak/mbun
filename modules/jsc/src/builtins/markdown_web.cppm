@@ -1831,11 +1831,14 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
     class AbortSignal {
       get [Symbol.toStringTag]() { return "AbortSignal"; }
       constructor() { this.aborted = false; this.reason = undefined; this._l = []; this.onabort = null; }
-      addEventListener(t, cb) { if (t === "abort") this._l.push(cb); }
-      removeEventListener(t, cb) { this._l = this._l.filter((x) => x !== cb); }
+      // `_l` holds {cb, once} records so `{ once: true }` registrations drop
+      // themselves after firing — events.getEventListeners(signal, "abort")
+      // must report 0 once the signal has been raised (node semantics).
+      addEventListener(t, cb, opts) { if (t !== "abort" || typeof cb !== "function") return; for (const r of this._l) if (r.cb === cb) return; this._l.push({ cb, once: !!(opts && opts.once) }); }
+      removeEventListener(t, cb) { if (t !== "abort") return; this._l = this._l.filter((x) => x.cb !== cb); }
       dispatchEvent(e) { if (e && e.type === "abort") this._fire(); return true; }
       throwIfAborted() { if (this.aborted) throw this.reason || new G.DOMException("signal is aborted without reason", "AbortError"); }
-      _fire() { const ev = { type: "abort", target: this }; if (typeof this.onabort === "function") this.onabort.call(this, ev); for (const cb of this._l.slice()) cb.call(this, ev); }
+      _fire() { const ev = { type: "abort", target: this }; if (typeof this.onabort === "function") this.onabort.call(this, ev); for (const r of this._l.slice()) { if (r.once) this.removeEventListener("abort", r.cb); r.cb.call(this, ev); } }
       static abort(reason) { const s = new AbortSignal(); s.aborted = true; s.reason = reason !== undefined ? reason : new G.DOMException("The operation was aborted.", "AbortError"); return s; }
       // `__mbunAbortAt` records the deadline as a wall-clock instant. A purely
       // synchronous native that has to honour a signal (Bun.spawnSync) cannot
@@ -1849,6 +1852,12 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       // an abort-algorithm leak is observable exactly as it is in bun.
       [Symbol.for("mbun.memoryCost")]() { return this._l.length * 16; }
     }
+    // Non-enumerable introspection hook mirroring EventTarget.prototype.listeners:
+    // events.getEventListeners(signal, "abort") probes for a callable `listeners`.
+    Object.defineProperty(AbortSignal.prototype, "listeners", {
+      value: function listeners(type) { return String(type) === "abort" ? this._l.map((r) => r.cb) : []; },
+      writable: true, configurable: true, enumerable: false,
+    });
     G.AbortSignal = AbortSignal;
   }
   if (typeof G.AbortController === "undefined") {

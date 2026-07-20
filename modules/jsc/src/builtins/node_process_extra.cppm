@@ -518,6 +518,44 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
       });
     }
 
+    // ---- unhandled promise rejection dispatch -------------------------------
+    // The runtime's JSC rejection hook calls this with (reason, promise). node's
+    // escalation order (lib/internal/process/promises.js, mode "throw" — the
+    // default since node 15): deliver to 'unhandledRejection' listeners, else
+    // raise it as an uncaught exception (capture callback, then
+    // 'uncaughtException' listeners). Returning false means nobody claimed it and
+    // the runtime falls back to its own fatal report.
+    //
+    // The message renders `reason` WITHOUT running user code: node formats it
+    // through v8's ToDetailString, so `{ toString() { ... } }` prints
+    // "[object Object]" rather than calling the method (js/node/promise/
+    // reject-tostring.test.ts asserts exactly that).
+    G.__mbunOnUnhandledRejection = function (reason, promise) {
+      try {
+        const p = G.process;
+        if (!p || typeof p.emit !== "function" || typeof p.listenerCount !== "function") return false;
+        if (p.listenerCount("unhandledRejection") > 0) { p.emit("unhandledRejection", reason, promise); return true; }
+        let err = reason;
+        if (!(reason instanceof Error)) {
+          const t = typeof reason;
+          let s;
+          if (t === "string") s = reason;
+          else if (t === "symbol") s = reason.toString();
+          else if (t === "bigint") s = String(reason);
+          else if (reason === null) s = "null";
+          else if (t === "undefined") s = "undefined";
+          else if (t === "object" || t === "function") { try { s = Object.prototype.toString.call(reason); } catch (e) { s = "[object Object]"; } }
+          else s = String(reason);
+          err = new Error("This error originated either by throwing inside of an async function without a catch block, or by rejecting a promise which was not handled with .catch(). The promise rejected with the reason \"" + s + "\".");
+          err.code = "ERR_UNHANDLED_REJECTION";
+        }
+        const cap = p._mbunUncaughtCaptureCallback;
+        if (typeof cap === "function") { cap(err); return true; }
+        if (p.listenerCount("uncaughtException") > 0) { p.emit("uncaughtException", err, "unhandledRejection"); return true; }
+      } catch (e) {}
+      return false;
+    };
+
     // ---- release / config / versions alignment (mirrors bun) ---------------
     try {
       const release = proc.release || (proc.release = { name: "node" });

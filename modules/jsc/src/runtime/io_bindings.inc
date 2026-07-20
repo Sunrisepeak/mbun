@@ -673,6 +673,8 @@ JSValueRef fsn_mkdir_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t 
                 return fs_throw(ctx, exc, "EEXIST: file already exists, mkdir '" + path + "'");
             if (errno == ENOTDIR)
                 return fs_throw(ctx, exc, "ENOTDIR: not a directory, mkdir '" + path + "'");
+            if (errno == ENAMETOOLONG)
+                return fs_throw(ctx, exc, "ENAMETOOLONG: name too long, mkdir '" + path + "'");
             if (errno == ENOENT)
                 return fs_throw(ctx, exc, "ENOENT: no such file or directory, mkdir '" + path + "'");
             return fs_throw(ctx, exc, "EACCES: permission denied, mkdir '" + path + "'");
@@ -834,8 +836,16 @@ JSValueRef fsn_stat_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t a
 #else
     struct stat st{};
     const int rc{useLstat ? ::lstat(path.c_str(), &st) : ::stat(path.c_str(), &st)};
-    if (rc != 0)
+    if (rc != 0) {
+        // Report the syscall's own code: a path component longer than NAME_MAX
+        // (or a whole path past the kernel's PATH_MAX) fails ENAMETOOLONG, and
+        // node surfaces that rather than flattening every failure to ENOENT.
+        if (errno == ENAMETOOLONG)
+            return fs_throw(ctx, exc, "ENAMETOOLONG: name too long, stat '" + path + "'");
+        if (errno == ENOTDIR)
+            return fs_throw(ctx, exc, "ENOTDIR: not a directory, stat '" + path + "'");
         return fs_throw(ctx, exc, "ENOENT: no such file or directory, stat '" + path + "'");
+    }
     fs_fields_from_stat(st, f);
     // Linux struct stat has no st_birthtim; statx STATX_BTIME gives the real
     // creation time (node uses it — src/sys.rs). Fall back to ctime otherwise.

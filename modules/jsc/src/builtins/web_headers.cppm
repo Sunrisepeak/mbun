@@ -261,11 +261,13 @@ inline constexpr std::string_view kWebHeadersJS = R"JS(
     const util = M && (M["util"] || M["node:util"]);
     if (util && typeof util.inspect === "function") {
       const prev = util.inspect;
-      const wrapped = function inspect(value, options) {
+      // Forward EVERY argument: Bun.inspect also takes the positional
+      // (value, colors, depth) form, which a 2-parameter wrapper would drop.
+      const wrapped = function inspect(value, ...rest) {
         if (value !== null && typeof value === "object" && value instanceof OrigHeaders && value._m instanceof Map) {
           try { return headersInspect(value); } catch (_) {}
         }
-        return prev.call(this, value, options);
+        return prev.call(this, value, ...rest);
       };
       for (const k of Object.keys(prev)) { try { wrapped[k] = prev[k]; } catch (_) {} }
       util.inspect = wrapped;
@@ -278,11 +280,11 @@ inline constexpr std::string_view kWebHeadersJS = R"JS(
       } else if (G.Bun && typeof G.Bun.inspect === "function") {
         try {
           const bunPrev = G.Bun.inspect;
-          const bunWrapped = function inspect(value, options) {
+          const bunWrapped = function inspect(value, ...rest) {
             if (value !== null && typeof value === "object" && value instanceof OrigHeaders && value._m instanceof Map) {
               try { return headersInspect(value); } catch (_) {}
             }
-            return bunPrev.call(this, value, options);
+            return bunPrev.call(this, value, ...rest);
           };
           for (const k of Object.keys(bunPrev)) { try { bunWrapped[k] = bunPrev[k]; } catch (_) {} }
           G.Bun.inspect = bunWrapped;

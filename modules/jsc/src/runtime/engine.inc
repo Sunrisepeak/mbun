@@ -511,9 +511,29 @@ public:
         if (g == nullptr) return;
         bool* flag{&unhandledRejection_};
         JSC::JSNativeStdFunction* cb{JSC::JSNativeStdFunction::create(
-            g->vm(), g, 1, WTF::String::fromLatin1("onUnhandledRejection"),
-            [flag](JSC::JSGlobalObject* gg, JSC::CallFrame*) -> JSC::EncodedJSValue {
-                *flag = true;
+            g->vm(), g, 2, WTF::String::fromLatin1("onUnhandledRejection"),
+            [flag](JSC::JSGlobalObject* gg, JSC::CallFrame* frame) -> JSC::EncodedJSValue {
+                // JSC invokes this with (promise, reason) (VM::callPromiseRejectionCallback).
+                // Hand both to the JS dispatcher, which mirrors node's
+                // 'unhandledRejection' → 'uncaughtException' escalation. Only when
+                // nothing claimed the rejection does the process-level flag arm.
+                JSContextRef ctx{toRef(gg)};
+                JSObjectRef global{JSContextGetGlobalObject(ctx)};
+                JSStringRef name{JSStringCreateWithUTF8CString("__mbunOnUnhandledRejection")};
+                JSValueRef disp{JSObjectGetProperty(ctx, global, name, nullptr)};
+                JSStringRelease(name);
+                bool handled{false};
+                if (disp != nullptr && JSValueIsObject(ctx, disp)) {
+                    JSObjectRef fn{JSValueToObject(ctx, disp, nullptr)};
+                    if (fn != nullptr && JSObjectIsFunction(ctx, fn)) {
+                        const JSValueRef args[2]{toRef(gg, frame->argument(1)),
+                                                 toRef(gg, frame->argument(0))};
+                        JSValueRef exc{nullptr};
+                        JSValueRef r{JSObjectCallAsFunction(ctx, fn, nullptr, 2, args, &exc)};
+                        handled = exc == nullptr && r != nullptr && JSValueToBoolean(ctx, r);
+                    }
+                }
+                if (!handled) *flag = true;
                 return JSC::JSValue::encode(JSC::jsUndefined());
             })};
         g->setUnhandledRejectionCallback(g->vm(), cb);
@@ -532,6 +552,9 @@ public:
             if (auto d{eval_number(doneCheck)}; d && *d == 1.0) return true;
             (void)eval_void("globalThis.__mbun_drain_timers && globalThis.__mbun_drain_timers(200);");
             (void)eval_void("globalThis.__mbunNetDrain && globalThis.__mbunNetDrain();");
+            // Deliver any POSIX signal that arrived since the last iteration to
+            // its process.on("SIG…") listeners (the handler itself only set a flag).
+            (void)eval_void("globalThis.__mbunSignalTick && globalThis.__mbunSignalTick();");
             drain_microtasks_();
             auto ioBusy{eval_number("globalThis.__mbun_io_tick ? __mbun_io_tick() : 0")};
             drain_microtasks_();
@@ -732,7 +755,7 @@ public:
     // an unknown blob URL still reports MODULE_NOT_FOUND — bun's
     // GetLoaderAndVirtualSourceErr::BlobNotFound (bundler/options.rs:590).
     // `bridge` selects the JS side: __mbun_blob_module_source for `blob:`,
-    // __mbun_data_module_source for `data:` (RFC 2397 — the payload IS the
+    // (`data:` is decoded natively below — RFC 2397's payload IS the
     // source; both yield the same (MIME type, source) pair).
     std::optional<std::pair<std::string, std::string>> blob_module_source_(
         JSContextRef ctx, const std::string& spec,
@@ -748,6 +771,67 @@ public:
         JSObjectRef o{JSValueToObject(ctx, res, nullptr)};
         return std::pair<std::string, std::string>{val_to_string(ctx, get_prop(ctx, o, "type")),
                                                    val_to_string(ctx, get_prop(ctx, o, "source"))};
+    }
+
+    // RFC 3986 percent-decoding for a non-base64 data: URL payload. Malformed
+    // escapes are passed through literally (as browsers and node do).
+    static std::string percent_decode_(std::string_view in) {
+        const auto hex{[](char c) -> int {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            return -1;
+        }};
+        std::string out;
+        out.reserve(in.size());
+        for (std::size_t i{0}; i < in.size(); ++i) {
+            if (in[i] == '%' && i + 2 < in.size()) {
+                const int hi{hex(in[i + 1])}, lo{hex(in[i + 2])};
+                if (hi >= 0 && lo >= 0) {
+                    out.push_back(static_cast<char>((hi << 4) | lo));
+                    i += 2;
+                    continue;
+                }
+            }
+            out.push_back(in[i]);
+        }
+        return out;
+    }
+
+    // Strict base64 for a `;base64` data: URL payload — nullopt on any invalid
+    // character or length, which the caller reports as a Base64DecodeError.
+    static std::optional<std::string> data_url_base64_decode_(std::string_view in) {
+        std::string cleaned;
+        cleaned.reserve(in.size());
+        for (const char c : in) {
+            if (c == '\n' || c == '\r' || c == ' ' || c == '\t') continue;
+            cleaned.push_back(c);
+        }
+        while (!cleaned.empty() && cleaned.back() == '=') cleaned.pop_back();
+        if (cleaned.size() % 4 == 1) return std::nullopt;
+        const auto sextet{[](char c) -> int {
+            if (c >= 'A' && c <= 'Z') return c - 'A';
+            if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+            if (c >= '0' && c <= '9') return c - '0' + 52;
+            if (c == '+' || c == '-') return 62;
+            if (c == '/' || c == '_') return 63;
+            return -1;
+        }};
+        std::string out;
+        out.reserve(cleaned.size() / 4 * 3 + 3);
+        std::uint32_t acc{0};
+        int bits{0};
+        for (const char c : cleaned) {
+            const int v{sextet(c)};
+            if (v < 0) return std::nullopt;
+            acc = (acc << 6) | static_cast<std::uint32_t>(v);
+            bits += 6;
+            if (bits >= 8) {
+                bits -= 8;
+                out.push_back(static_cast<char>((acc >> bits) & 0xFF));
+            }
+        }
+        return out;
     }
 
     // A blob's MIME type → loader. Blueprint: bun Blob.rs:2178 get_loader (a Blob
@@ -902,14 +986,32 @@ public:
                 loaded = load_blob_module_(std::move(*blob), rspec, effTypeAttr);
             }
         }
-        // data: URL module — `import("data:text/javascript,export default 1")`.
-        // Same shape as the blob branch: RFC 2397 carries the source inline, so
-        // there is nothing for the path resolver to find (bun handles it in
-        // bundler/options.rs's virtual-source branch alongside blob:).
+        // data: URL module (RFC 2397) — the specifier carries its own source, so
+        // like blob: it bypasses the on-disk resolver entirely and reuses the
+        // virtual-source path (MIME type selects the loader). A malformed base64
+        // payload is a Base64DecodeError, not a resolve failure.
         if (!blobModule && rspec.starts_with("data:")) {
-            if (auto data{blob_module_source_(ctx, rspec, "__mbun_data_module_source")}) {
+            if (const std::size_t comma{rspec.find(',')}; comma != std::string::npos) {
+                const std::string meta{rspec.substr(5, comma - 5)};
+                const std::string payload{rspec.substr(comma + 1)};
+                const bool isB64{meta.ends_with(";base64")};
+                std::string mime{meta.substr(0, meta.find(';'))};
+                if (mime.empty()) mime = "text/plain";
+                std::optional<std::string> src{isB64 ? data_url_base64_decode_(payload)
+                                                     : std::optional<std::string>{
+                                                           percent_decode_(payload)}};
+                if (!src) {
+                    if (exc) {
+                        JSValueRef m{make_string(
+                            ctx, "Base64DecodeError: invalid base64 payload in data: URL")};
+                        JSObjectRef e{JSObjectMakeError(ctx, 1, &m, nullptr)};
+                        set_prop(ctx, e, "name", make_string(ctx, "Base64DecodeError"));
+                        *exc = e;
+                    }
+                    return JSValueMakeUndefined(ctx);
+                }
                 blobModule = true;
-                loaded = load_blob_module_(std::move(*data), rspec, effTypeAttr);
+                loaded = load_blob_module_({std::move(mime), std::move(*src)}, rspec, effTypeAttr);
             }
         }
         if (!blobModule) {
@@ -1953,6 +2055,10 @@ private:
         set_fn(ctx_, pn, "close", proc_close_cb);
         set_fn(ctx_, pn, "wait", proc_wait_cb);
         set_fn(ctx_, pn, "kill", proc_kill_cb);
+#if !defined(_WIN32)
+        set_fn(ctx_, pn, "signalWatch", proc_signal_watch_cb);
+        set_fn(ctx_, pn, "signalDrain", proc_signal_drain_cb);
+#endif
         set_fn(ctx_, pn, "spawnSyncB64", proc_spawn_sync_b64_cb);
 #if !defined(_WIN32)
         set_fn(ctx_, pn, "spawnEx", proc_spawn_ex_cb);
@@ -1987,6 +2093,44 @@ private:
     if (!ok) { const e = new Error("kill ESRCH"); e.code = "ESRCH"; e.errno = -3; e.syscall = "kill"; throw e; }
     return true;
   };
+
+  // ---- process.on("SIG…") → real POSIX handlers -------------------------
+  // node installs a handler the moment a signal gains its first listener and
+  // restores SIG_DFL when the last one goes away (so `process.off` of ONE of
+  // several listeners must NOT uninstall it). The native side only flips a
+  // sig_atomic_t; delivery happens here, off the event-loop pump.
+  if (typeof PN.signalWatch === "function") {
+    const NAME = {}; for (const k of Object.keys(SIGMAP)) NAME[SIGMAP[k]] = k;
+    const isSignal = (ev) => typeof ev === "string" && SIGMAP[ev] != null;
+    const armed = new Set();
+    const sync = (ev) => {
+      if (!isSignal(ev)) return;
+      const want = p.listenerCount(ev) > 0;
+      if (want === armed.has(ev)) return;
+      if (PN.signalWatch(SIGMAP[ev], want)) { if (want) armed.add(ev); else armed.delete(ev); }
+    };
+    for (const m of ["on", "addListener", "once", "prependListener", "prependOnceListener",
+                     "off", "removeListener", "removeAllListeners"]) {
+      const orig = p[m];
+      if (typeof orig !== "function") continue;
+      p[m] = function (ev, ...rest) {
+        const r = orig.call(this, ev, ...rest);
+        if (ev === undefined && m === "removeAllListeners") { for (const s of Array.from(armed)) sync(s); }
+        else sync(ev);
+        return r;
+      };
+    }
+    globalThis.__mbunSignalTick = function () {
+      let sigs;
+      try { sigs = PN.signalDrain(); } catch (e) { return 0; }
+      if (!sigs || !sigs.length) return 0;
+      for (const n of sigs) {
+        const name = NAME[n];
+        if (name && p.listenerCount(name) > 0) { try { p.emit(name, name, n); } catch (e) {} }
+      }
+      return sigs.length;
+    };
+  }
 })();
 )JS",
                      nullptr);

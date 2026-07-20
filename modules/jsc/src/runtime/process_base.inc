@@ -452,6 +452,54 @@ JSValueRef proc_kill_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t 
     return JSValueMakeBoolean(ctx, false);
 }
 
+// ── POSIX signal delivery to JS listeners ──────────────────────────────────
+// node/bun install a real handler for every signal that has a `process.on(SIG…)`
+// listener and drop back to SIG_DFL when the last one is removed. The handler
+// itself must be async-signal-safe, so it only flips a sig_atomic_t flag; the
+// event-loop pump drains the flags and emits from JS.
+#if !defined(_WIN32)
+volatile std::sig_atomic_t gSignalPending[NSIG]{};
+
+extern "C" void mbun_signal_handler(int sig) {
+    if (sig > 0 && sig < NSIG) gSignalPending[sig] = 1;
+}
+
+// proc.signalWatch(signum, on) — install (on) / restore the default (off).
+JSValueRef proc_signal_watch_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                                const JSValueRef args[], JSValueRef*) {
+    if (argc < 1) return JSValueMakeBoolean(ctx, false);
+    const int sig{static_cast<int>(JSValueToNumber(ctx, args[0], nullptr))};
+    if (sig <= 0 || sig >= NSIG) return JSValueMakeBoolean(ctx, false);
+    const bool on{argc > 1 && JSValueToBoolean(ctx, args[1])};
+    struct sigaction sa{};
+    if (on) {
+        sa.sa_handler = &mbun_signal_handler;
+        sigemptyset(&sa.sa_mask);
+        // SA_RESTART: a JS-observed signal must not turn every in-flight read()
+        // into EINTR (node installs its handlers the same way).
+        sa.sa_flags = SA_RESTART;
+    } else {
+        sa.sa_handler = SIG_DFL;
+        sigemptyset(&sa.sa_mask);
+        gSignalPending[sig] = 0;
+    }
+    return JSValueMakeBoolean(ctx, ::sigaction(sig, &sa, nullptr) == 0);
+}
+
+// proc.signalDrain() → [signum, …] delivered since the last drain.
+JSValueRef proc_signal_drain_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t,
+                                const JSValueRef[], JSValueRef* exc) {
+    std::vector<JSValueRef> out;
+    for (int s = 1; s < NSIG; ++s) {
+        if (gSignalPending[s] != 0) {
+            gSignalPending[s] = 0;
+            out.push_back(JSValueMakeNumber(ctx, s));
+        }
+    }
+    return JSObjectMakeArray(ctx, out.size(), out.empty() ? nullptr : out.data(), exc);
+}
+#endif
+
 // proc.spawnSyncB64(file, args, {cwd, env, inputB64, maxBuffer, timeoutMs,
 // killSignal}) → { status, signal, pid, stdoutB64, stderrB64,
 // exitedDueToMaxBuffer, exitedDueToTimeout } — like spawnSync but bytes cross

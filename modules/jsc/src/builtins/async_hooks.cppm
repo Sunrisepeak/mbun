@@ -107,6 +107,7 @@ inline constexpr std::string_view kAsyncHooksJS = R"JS(
 
   class AsyncResource {
     #snapshot;
+    #triggerAsyncId = 0;
 
     constructor(type, options) {
       if (typeof type !== "string") throw new TypeError('The "type" argument must be of type string');
@@ -118,13 +119,17 @@ inline constexpr std::string_view kAsyncHooksJS = R"JS(
         throw error;
       }
       this.type = type;
+      // node echoes the constructor's triggerAsyncId back from
+      // resource.triggerAsyncId(); with no option it is the current execution
+      // async id, which is always 0 in mbun.
+      this.#triggerAsyncId = (options == null || (typeof options !== "number" && options.triggerAsyncId === undefined)) ? 0 : triggerAsyncId;
       this.#snapshot = contextGet();
     }
 
     emitBefore() { return true; }
     emitAfter() { return true; }
     asyncId() { return 0; }
-    triggerAsyncId() { return 0; }
+    triggerAsyncId() { return this.#triggerAsyncId; }
     emitDestroy() {}
     runInAsyncScope(fn, thisArg, ...args) {
       if (typeof fn !== "function") throw new TypeError('The "fn" argument must be of type function');

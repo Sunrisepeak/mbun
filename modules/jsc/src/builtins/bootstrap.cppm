@@ -668,7 +668,22 @@ inline constexpr std::string_view kBootstrapJS = R"JS(
     // trailing comma per entry. ref bun ConsoleObject.zig / fmt writeObject.
     const bunKey = (k) => /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(k) ? k : JSON.stringify(k);
     const inner = "  ".repeat(depth + 1), outer = "  ".repeat(depth);
-    const bunBlock = (label, items) => items.length ? label + "{\n" + items.map((it) => inner + it + ",").join("\n") + "\n" + outer + "}" : label + "{}";
+    // `compact: true` collapses a bun-style block onto one line (Bun.inspect's
+    // documented option); the default stays the multi-line trailing-comma form.
+    const bunCompact = opts.compact === true;
+    const bunBlock = (label, items) => !items.length ? label + "{}"
+      : bunCompact ? label + "{ " + items.join(", ") + " }"
+      : label + "{\n" + items.map((it) => inner + it + ",").join("\n") + "\n" + outer + "}";
+    // node layout: entries share one line inside the delimiters, unless
+    // `compact: false` was requested — then every entry gets its own indented
+    // line and the closing delimiter its own line too (util.inspect's
+    // reduceToSingleString "compact === false" branch).
+    const noCompact = opts.compact === false;
+    const nodeBlock = (label, items, open, close) => {
+      if (!items.length) return label + open + close;
+      if (noCompact) return label + open + "\n" + items.map((it) => inner + it).join(",\n") + "\n" + outer + close;
+      return label + open + " " + items.join(", ") + " " + close;
+    };
     if (Array.isArray(v)) {
       const items = v.map((x) => inspectValue(x, opts, seen, depth + 1));
       if (!items.length) result = "[]";
@@ -676,18 +691,18 @@ inline constexpr std::string_view kBootstrapJS = R"JS(
         const oneLine = "[ " + items.join(", ") + " ]";
         const complex = v.some((x) => x !== null && typeof x === "object" && !Array.isArray(x));
         const hasNL = items.some((s) => s.indexOf("\n") >= 0);
-        result = (!complex && !hasNL && oneLine.length <= 72) ? oneLine : "[\n" + inner + items.join(", ") + "\n" + outer + "]";
-      } else result = "[ " + items.join(", ") + " ]";
+        result = (bunCompact || (!complex && !hasNL && oneLine.length <= 72)) ? oneLine : "[\n" + inner + items.join(", ") + "\n" + outer + "]";
+      } else result = nodeBlock("", items, "[", "]");
     }
     else if (v instanceof Map) {
       const items = []; for (const [k, val] of v) items.push(inspectValue(k, opts, seen, depth + 1) + (bun ? ": " : " => ") + inspectValue(val, opts, seen, depth + 1));
       if (bun) result = bunBlock(v.size ? "Map(" + v.size + ") " : "Map ", items);
-      else result = "Map(" + v.size + ") {" + (items.length ? " " + items.join(", ") + " " : "") + "}";
+      else result = nodeBlock("Map(" + v.size + ") ", items, "{", "}");
     }
     else if (v instanceof Set) {
       const items = []; for (const x of v) items.push(inspectValue(x, opts, seen, depth + 1));
       if (bun) result = bunBlock(v.size ? "Set(" + v.size + ") " : "Set ", items);
-      else result = "Set(" + v.size + ") {" + (items.length ? " " + items.join(", ") + " " : "") + "}";
+      else result = nodeBlock("Set(" + v.size + ") ", items, "{", "}");
     }
     else if (ArrayBuffer.isView(v) && !(v instanceof DataView)) { const nm = v.constructor ? v.constructor.name : "TypedArray"; const items = Array.from(v).map(String); result = nm + "(" + v.length + ") [" + (items.length ? " " + items.join(", ") + " " : "") + "]"; }
     else {
@@ -703,12 +718,14 @@ inline constexpr std::string_view kBootstrapJS = R"JS(
       } else {
         const items = keys.map((k) => { const kk = /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(k) ? k : "'" + k + "'"; return kk + ": " + inspectValue(v[k], opts, seen, depth + 1); });
         for (const s of syms) items.push(s.toString() + ": " + inspectValue(v[s], opts, seen, depth + 1));
-        result = ctor + (items.length ? "{ " + items.join(", ") + " }" : "{}");
+        result = nodeBlock(ctor, items, "{", "}");
       }
     }
     seen.delete(v);
     return result;
   }
+  // Lazily created by util.aborted(); one registry serves every call.
+  let utilAbortedRegistry = null;
   const util = {
     inspect(o, opts) { try { return inspectValue(o, opts, null, 0); } catch (e) { if (e && e.__inspectRethrow) throw e.__inspectOriginal; return String(o); } },
     format(f, ...a) {
@@ -781,7 +798,33 @@ inline constexpr std::string_view kBootstrapJS = R"JS(
     stripVTControlCharacters(s) { return String(s).replace(/\x1b\[[0-9;]*m/g, ""); },
     debuglog() { return () => {}; }, debug() { return () => {}; },
     _extend(a, b) { return Object.assign(a, b); },
-    aborted: () => Promise.resolve(),
+    // util.aborted(signal, resource): a promise that settles when `signal`
+    // fires, but which does NOT keep `resource` alive — once `resource` is
+    // collected the abort listener is unregistered so the signal stops
+    // retaining it. ref bun src/js/node/util.ts `aborted`.
+    aborted(signal, resource) {
+      const argErr = (name, expected, v) => { const e = new TypeError('The "' + name + '" argument must be of type ' + expected + ". Received " + (typeof v === "object" ? String(v) : typeof v)); e.code = "ERR_INVALID_ARG_TYPE"; return e; };
+      if (signal === null || typeof signal !== "object" || typeof signal.addEventListener !== "function" || typeof signal.aborted !== "boolean")
+        throw argErr("signal", "AbortSignal", signal);
+      if (resource === null || typeof resource !== "object")
+        throw argErr("resource", "object", resource);
+      if (signal.aborted) return Promise.resolve();
+      let resolveFn;
+      const promise = new Promise((res) => { resolveFn = res; });
+      // A fresh closure per call: it doubles as the FinalizationRegistry
+      // unregister token, so it must not capture the caller's scope.
+      const onAbort = function () { if (utilAbortedRegistry) utilAbortedRegistry.unregister(onAbort); resolveFn(); };
+      signal.addEventListener("abort", onAbort, { once: true });
+      if (!utilAbortedRegistry && typeof G.FinalizationRegistry === "function") {
+        utilAbortedRegistry = new G.FinalizationRegistry((held) => {
+          const s = held.ref.deref();
+          if (s) s.removeEventListener("abort", held.token);
+        });
+      }
+      if (utilAbortedRegistry && typeof G.WeakRef === "function")
+        utilAbortedRegistry.register(resource, { ref: new G.WeakRef(signal), token: onAbort }, onAbort);
+      return promise;
+    },
     parseArgs(config) {
       // Faithful port of node lib/internal/util/parse_args + bun src/runtime/node/util/parse_args.rs.
       const hasOwn = (o, k) => o != null && Object.prototype.hasOwnProperty.call(o, k);
@@ -1181,9 +1224,11 @@ inline constexpr std::string_view kBootstrapJS = R"JS(
         this._eventsCount = 0;
       }
       this._maxListeners ??= undefined;
-      if ((this[kCapture] = opts?.captureRejections ? Boolean(opts.captureRejections) : EventEmitterPrototype[kCapture])) {
-        this.emit = emitWithRejectionCapture;
-      }
+      // Only the flag is stamped — never an own `emit`. An own property would
+      // shadow a subclass's prototype emit (EventEmitterAsyncResource runs
+      // super.emit inside its async scope), so the prototype emit branches on
+      // this[kCapture] instead. ref node lib/events.js EventEmitter.init.
+      this[kCapture] = opts?.captureRejections ? Boolean(opts.captureRejections) : EventEmitterPrototype[kCapture];
     }
     const EventEmitterPrototype = (EventEmitter.prototype = {});
     EventEmitterPrototype._events = undefined;
@@ -1236,7 +1281,9 @@ inline constexpr std::string_view kBootstrapJS = R"JS(
       }
       return true;
     };
-    EventEmitterPrototype.emit = emitWithoutRejectionCapture;
+    EventEmitterPrototype.emit = function emit(type) {
+      return (this[kCapture] ? emitWithRejectionCapture : emitWithoutRejectionCapture).apply(this, arguments);
+    };
 
     function overflowWarning(emitter, type, handlers) {
       handlers.warned = true;

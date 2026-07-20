@@ -616,6 +616,15 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
       if (!res) return;
       res.complete = true;
       res.push(null);
+      // There is no connection pool here (every ClientRequest opens its own
+      // socket), so once the response is complete nothing will ever read from
+      // this socket again. node either destroys it (agent:false / Connection:
+      // close) or unrefs it into the agent's free list — either way an idle
+      // client socket must not keep the event loop alive, which is what
+      // js/node/http/node-http-res-settimeout-unref.test.ts asserts.
+      if (!self.upgrade && socket && !socket.destroyed) {
+        G.queueMicrotask(() => { try { socket.destroy(); } catch (e) {} });
+      }
     };
     parser.onError = (e) => { if (!self.destroyed) self.emit("error", e); };
     socket.on("data", (chunk) => parser.push(new Uint8Array(chunk.buffer || chunk, chunk.byteOffset || 0, chunk.byteLength !== undefined ? chunk.byteLength : chunk.length)));

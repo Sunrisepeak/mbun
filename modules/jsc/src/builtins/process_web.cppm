@@ -61,7 +61,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       if (item.off >= item.data.length) { rec.stdinBuf.shift(); if (item.cb) try { item.cb(); } catch (e) {} }
       else return;
     }
-    if (rec.stdinEnded) { try { PROC.close(rec.stdinFd); } catch (e) {} rec.stdinClosed = true; if (rec.cp.stdin) rec.cp.stdin.destroyed = true; }
+    if (rec.stdinEnded) { try { PROC.close(rec.stdinFd); } catch (e) {} rec.stdinClosed = true; if (rec.cp.stdin) { rec.cp.stdin.destroyed = true; rec.cp.stdin.writable = false; } }
   };
 
   const drainOut = (o) => {
@@ -76,7 +76,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   const maybeClose = (rec) => {
     if (!rec.exited || rec.closed) return;
     for (const o of rec.outs) if (!o.ended) return;  // wait for all pipes to hit EOF
-    if (rec.stdinFd >= 0 && !rec.stdinClosed) { try { PROC.close(rec.stdinFd); } catch (e) {} rec.stdinClosed = true; if (rec.cp.stdin) rec.cp.stdin.destroyed = true; }
+    if (rec.stdinFd >= 0 && !rec.stdinClosed) { try { PROC.close(rec.stdinFd); } catch (e) {} rec.stdinClosed = true; if (rec.cp.stdin) { rec.cp.stdin.destroyed = true; rec.cp.stdin.writable = false; } }
     rec.closed = true; rec.done = true;
     rec.cp.emit("close", rec.code, rec.signal);
   };
@@ -118,7 +118,15 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     w.writable = true; w.destroyed = false;
     w.write = (chunk, enc, cb) => {
       if (typeof enc === "function") { cb = enc; enc = null; }
-      if (w.destroyed || rec.stdinEnded) { if (typeof cb === "function") nextTick(cb); return false; }
+      if (w.destroyed || rec.stdinEnded) {
+        // node: writing to a destroyed/ended stream returns false and calls back
+        // with ERR_STREAM_DESTROYED (Writable.write → writeAfterEnd/destroyed).
+        const e = new Error("Cannot call write after a stream was destroyed");
+        e.code = "ERR_STREAM_DESTROYED";
+        if (typeof cb === "function") nextTick(() => cb(e));
+        else nextTick(() => { try { if (w.listenerCount("error") > 0) w.emit("error", e); } catch (_) {} });
+        return false;
+      }
       const data = chunk == null ? new Uint8Array(0) : typeof chunk === "string" ? te.encode(chunk) : _u8(chunk);
       rec.stdinBuf.push({ data, off: 0, cb: typeof cb === "function" ? cb : null });
       flushStdin(rec);
@@ -133,7 +141,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       flushStdin(rec);
       return w;
     };
-    w.destroy = () => { w.destroyed = true; rec.stdinEnded = true; if (!rec.stdinClosed) { try { PROC.close(rec.stdinFd); } catch (e) {} rec.stdinClosed = true; } return w; };
+    w.destroy = () => { w.destroyed = true; w.writable = false; rec.stdinEnded = true; if (!rec.stdinClosed) { try { PROC.close(rec.stdinFd); } catch (e) {} rec.stdinClosed = true; } return w; };
     w.setDefaultEncoding = () => w; w.setEncoding = () => w; w.cork = () => {}; w.uncork = () => {};
     return w;
   };
@@ -1649,7 +1657,10 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       // Incremental readable driven by __mbun_io_tick: __data/__end wake every
       // pending waiter, so getReader().read() and for-await yield each chunk as
       // it arrives (duplex pipe protocols), while text()/bytes() wait for EOF.
-      const chunks = []; let ended = false; const waiters = [];
+      // `cursor` is the SHARED read position: a WHATWG stream is consumed once,
+      // so a getReader().read() and a later for-await must continue from where
+      // the previous consumer stopped rather than each replaying from chunk 0.
+      const chunks = []; let ended = false; let cursor = 0; const waiters = [];
       const wake = () => { while (waiters.length) waiters.shift()(); };
       const waitEvent = () => new Promise((r) => waiters.push(r));
       const whenDone = async () => { while (!ended) await waitEvent(); };
@@ -1664,18 +1675,17 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
         arrayBuffer: () => body().then((u) => u.buffer),
         blob: () => body().then((u) => new G.Blob([u])),
         json: () => body().then((u) => JSON.parse(td.decode(u))),
-        getReader() { let i = 0; return { read: () => nextChunk(i).then((c) => (c === undefined ? { value: undefined, done: true } : (i++, { value: c, done: false }))), releaseLock() {}, cancel() { return Promise.resolve(); }, closed: whenDone() }; },
+        getReader() { return { read: () => nextChunk(cursor).then((c) => (c === undefined ? { value: undefined, done: true } : (cursor++, { value: c, done: false }))), releaseLock() {}, cancel() { return Promise.resolve(); }, closed: whenDone() }; },
         // pipeTo must really MOVE the bytes: it used to only await EOF, so
         // `proc.stdout.pipeTo(new TextDecoderStream().writable)` silently
         // produced an empty readable instead of the child's output.
         async pipeTo(dest) {
           const w = dest && typeof dest.getWriter === "function" ? dest.getWriter() : null;
-          let i = 0;
           try {
             for (;;) {
-              const c = await nextChunk(i);
+              const c = await nextChunk(cursor);
               if (c === undefined) break;
-              i++;
+              cursor++;
               if (w) await w.write(c);
               else if (dest && typeof dest.write === "function") await dest.write(c);
             }
@@ -1685,7 +1695,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
           }
         },
         cancel() { return Promise.resolve(); },
-        async *[Symbol.asyncIterator]() { let i = 0; for (;;) { const c = await nextChunk(i); if (c === undefined) return; i++; yield c; } },
+        async *[Symbol.asyncIterator]() { for (;;) { const c = await nextChunk(cursor); if (c === undefined) return; cursor++; yield c; } },
       };
     };
     const spawnAsyncBun = (cmd, opts) => {
