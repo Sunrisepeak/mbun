@@ -27,3 +27,9 @@ compat/bun/test/js/third_party/next-auth/*
 compat/bun/test/integration/*
 # --- needs a native addon toolchain (node-gyp / node ABI download) ----------
 compat/bun/test/bundler/native-plugin.test.ts
+# --- needs a docker-compose service (squid proxy, minio, …) -----------------
+# harness.isDockerEnabled spins a container up in beforeAll; without a working
+# docker the file hangs there. Triaged 2026-07-20: websocket-proxy prints
+# "Starting squid proxy container..." and never returns.
+compat/bun/test/js/web/websocket/websocket-proxy.test.ts
+compat/bun/test/js/bun/s3/s3.test.ts
