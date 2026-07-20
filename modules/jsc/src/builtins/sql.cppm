@@ -272,7 +272,11 @@ inline constexpr std::string_view kSqlJS = R"JS(
       bindParam(value, binding_values, index) { return pushBindParam(this, value, binding_values, index); },
       normalizeQuery(strings, values, idx) { return normalizeQuery(this, strings, values, idx); },
       // live execution over Bun.connect + __mbunPostgresNative (see makePgDriver).
-      execute(text, binds, flags) { return sqlObj.__pgDriver.execute(text, binds, flags); },
+      execute(text, binds, flags) {
+        const d = sqlObj.__driver();
+        if (!d) return Promise.reject(pgErr("Connection closed", PG_CODE.CLOSED));
+        return d.execute(text, binds, flags);
+      },
     });
 
     const makeMysqlAdapter = (sqlObj) => ({
@@ -287,7 +291,11 @@ inline constexpr std::string_view kSqlJS = R"JS(
       throwIfUpdateEmpty: baseThrowIfUpdateEmpty,
       bindParam(value, binding_values, index) { return pushBindParam(this, value, binding_values, index); },
       normalizeQuery(strings, values, idx) { return normalizeQuery(this, strings, values, idx); },
-      execute(text, binds, flags) { return sqlObj.__myDriver.execute(text, binds, flags); },
+      execute(text, binds, flags) {
+        const d = sqlObj.__driver();
+        if (!d) return Promise.reject(myErr("Connection closed", MY_CODE.CLOSED));
+        return d.execute(text, binds, flags);
+      },
     });
 
     const makeSqliteAdapter = (sqlObj) => ({
@@ -531,6 +539,12 @@ inline constexpr std::string_view kSqlJS = R"JS(
         o.database = pick(opts.database, opts.db, u.database, isPg ? env.PGDATABASE : undefined, isMy ? env.MYSQL_DATABASE : undefined, isMy ? "mysql" : o.username);
       }
       if (opts.max !== undefined) o.max = opts.max;
+      // bun-ref shared.ts: `prepare` defaults to true — parameterized queries go
+      // out as a named prepare exchange followed by Bind/Execute.
+      o.prepare = opts.prepare === undefined ? true : !!opts.prepare;
+      // `tls` selects the encrypted transport (mysql negotiates it in the
+      // handshake, postgres via SSLRequest); sslMode stays the postgres-only knob.
+      if (opts.tls !== undefined) o.tls = opts.tls;
       // connectionTimeout is in SECONDS at the API (bun-ref shared.ts:2004 *=1000);
       // the driver multiplies by 1000. 0 disables the connect timer / retry budget.
       o.connectionTimeout = pick(opts.connectionTimeout, opts.connection_timeout,
@@ -554,6 +568,7 @@ inline constexpr std::string_view kSqlJS = R"JS(
       CLOSED: "ERR_POSTGRES_CONNECTION_CLOSED",
       SERVER: "ERR_POSTGRES_SERVER_ERROR",
       INVALID_LEN: "ERR_POSTGRES_INVALID_MESSAGE_LENGTH",
+      INVALID_MESSAGE: "ERR_POSTGRES_INVALID_MESSAGE",
       UNSUPPORTED_AUTH: "ERR_POSTGRES_UNSUPPORTED_AUTHENTICATION_METHOD",
       TLS_NOT_AVAILABLE: "ERR_POSTGRES_TLS_NOT_AVAILABLE",
       TLS_UPGRADE_FAILED: "ERR_POSTGRES_TLS_UPGRADE_FAILED",
@@ -578,8 +593,21 @@ inline constexpr std::string_view kSqlJS = R"JS(
       let connectPromise = null;
       let retryTimer = null, retryWake = null;
       let connectStartedAt = 0, connectAttempts = 0;
-      let currentQuery = null;
       let closed = false, closeFired = false;
+
+      // ---- request queue --------------------------------------------------
+      // PORT-SOURCE: bun-ref src/sql_jsc/postgres/PostgresSQLConnection.rs —
+      // backend responses are attributed to `requests.peek_item(0)`, i.e. in
+      // strict enqueue order, so a query may only put frames on the wire once it
+      // is the head of the queue. mbun runs one exchange at a time (no
+      // pipelining), which makes attribution independent of how the inbound
+      // stream happens to be segmented (see
+      // compat/bun/test/js/sql/postgres-split-prepare-reorder.test.ts).
+      const queue = [];        // enqueued requests, FIFO
+      let inflight = null;     // the request whose frames are on the wire
+      let phase = "idle";      // idle | preparing | executing | draining
+      const statements = new Map();  // query text -> { name, prepared, fields }
+      let stmtSeq = 0;
 
       // onclose fires once per closed connection (not per retry attempt) —
       // bun-ref shared.ts handleClose / #finishClose.
@@ -622,6 +650,17 @@ inline constexpr std::string_view kSqlJS = R"JS(
       // FAILED while handshaking / CLOSED afterwards). The mbun Bun.connect shim
       // fires a bare "error" alongside connectError, so a not-yet-opened "error"
       // is ignored and connectError/close decides the outcome via `opened`.
+      // Reject every request that can no longer be answered (socket down /
+      // forced close / fatal protocol error).
+      const failAllRequests = (jsErr) => {
+        const q = inflight;
+        inflight = null;
+        phase = "idle";
+        const pending = queue.splice(0, queue.length);
+        for (const r of pending) { if (r !== q) { try { r.reject(jsErr); } catch (e) {} } }
+        if (q) { try { q.reject(jsErr); } catch (e) {} }
+      };
+
       const onSocketDown = (evt) => {
         if (downOnce) return;
         if (!opened && evt === "error") return;  // let connectError/close win
@@ -633,9 +672,8 @@ inline constexpr std::string_view kSqlJS = R"JS(
           settleDial(dialReject, pgErr("Failed to connect", PG_CODE.REFUSED));
         } else if (!wasConnected) {
           settleDial(dialReject, pgErr("Connection closed before the connection was established", PG_CODE.FAILED));
-        } else if (currentQuery) {
-          const q = currentQuery; currentQuery = null;
-          q.reject(pgErr("Connection closed", PG_CODE.CLOSED));
+        } else {
+          failAllRequests(pgErr("Connection closed", PG_CODE.CLOSED));
         }
         if (wasConnected) fireClose(pgErr("Connection closed", PG_CODE.CLOSED));
         connectPromise = null;
@@ -643,12 +681,8 @@ inline constexpr std::string_view kSqlJS = R"JS(
 
       const failFatal = (jsErr) => {
         // protocol / server error: reject the current phase, tear the socket down.
-        if (status === "connected" && currentQuery) {
-          const q = currentQuery; currentQuery = null;
-          q.reject(jsErr);
-        } else {
-          settleDial(dialReject, jsErr);
-        }
+        if (status === "connected") failAllRequests(jsErr);
+        else settleDial(dialReject, jsErr);
         downOnce = true;  // suppress the trailing close (bun: failed conn is not resurrected)
         status = "closed";
         const s = sock; sock = null;
@@ -657,31 +691,113 @@ inline constexpr std::string_view kSqlJS = R"JS(
       };
 
       const pushRow = (m) => {
-        const q = currentQuery, cols = m.columns || [], fields = q.fields || [];
+        const q = inflight, cols = m.columns || [], fields = q.fields || [];
         const wantRaw = q.flags && (q.flags.values || q.flags.raw);
+        const decode = (i) => {
+          const f = fields[i];
+          return cols[i] == null ? null : PGN.decodeValue(f ? f.typeOid : 0, cols[i], f ? f.formatCode : 0);
+        };
         if (wantRaw) {
           const row = new Array(cols.length);
-          for (let i = 0; i < cols.length; i++) {
-            const f = fields[i];
-            row[i] = cols[i] == null ? null : PGN.decodeValue(f ? f.typeOid : 0, cols[i], f ? f.formatCode : 0);
-          }
+          for (let i = 0; i < cols.length; i++) row[i] = decode(i);
           q.rows.push(row);
         } else {
           const obj = {};
-          for (let i = 0; i < cols.length; i++) {
+          // A DataRow may carry fewer cells than the RowDescription declared;
+          // the columns it omits read back as null (bun-ref DataCell fill).
+          const n = Math.max(cols.length, fields.length);
+          for (let i = 0; i < n; i++) {
             const f = fields[i];
-            obj[f ? f.name : i] = cols[i] == null ? null : PGN.decodeValue(f ? f.typeOid : 0, cols[i], f ? f.formatCode : 0);
+            obj[f ? f.name : i] = i < cols.length ? decode(i) : null;
           }
           q.rows.push(obj);
         }
       };
 
-      const finishQuery = () => {
-        const q = currentQuery; currentQuery = null;
-        const out = q.rows;
-        Object.defineProperty(out, "count", { value: q.rows.length, enumerable: false, configurable: true });
+      // One CommandComplete closes one result set. A simple query may carry
+      // several statements ("copy ...; select ..."), and bun then resolves with
+      // an array of result sets instead of a flat row array.
+      const endResultSet = () => {
+        inflight.results.push(inflight.rows);
+        inflight.rows = [];
+      };
+
+      const settleQuery = (err) => {
+        const q = inflight;
+        inflight = null;
+        if (queue[0] === q) queue.shift();
+        if (err) { q.reject(err); return; }
+        const out = q.results.length === 0 ? q.rows
+                  : q.results.length === 1 ? q.results[0]
+                  : q.results;
+        Object.defineProperty(out, "count", { value: out.length, enumerable: false, configurable: true });
         Object.defineProperty(out, "command", { value: q.command, enumerable: false, configurable: true });
         q.resolve(out);
+      };
+
+      // Drop the head request when its frames could not be written at all.
+      const abortHead = (jsErr) => {
+        const q = inflight;
+        inflight = null;
+        if (queue[0] === q) queue.shift();
+        if (q) q.reject(jsErr);
+      };
+
+      const writeFrames = (frame) => {
+        if (!sock) return false;
+        try { sock.write(frame); return true; } catch (e) { return false; }
+      };
+
+      const bindBytesOf = (binds) => binds.map((v) => (v == null ? null : pgEnc.encode(String(v))));
+
+      // Bind + Execute + Sync for a prepared statement (named) or the unnamed
+      // one-shot portal (which also needs Describe('P') for its RowDescription).
+      const writeBindExecute = (q, stmtName) => {
+        let frame = PGN.encodeBind("", stmtName, bindBytesOf(q.binds));
+        if (!stmtName) frame = catBytes(frame, PGN.encodeDescribe("P", ""));
+        frame = catBytes(frame, PGN.encodeExecute("", 0));
+        frame = catBytes(frame, PGN.encodeSync());
+        return writeFrames(frame);
+      };
+
+      const pumpQueue = () => {
+        if (inflight || phase === "draining") return;
+        if (status !== "connected" || !sock) return;
+        const q = queue[0];
+        if (!q) return;
+        inflight = q;
+        q.rows = []; q.results = []; q.command = ""; q.fields = null; q.error = null;
+        const extended = !q.flags.simple && q.binds && q.binds.length > 0;
+        if (extended && options.prepare !== false) {
+          // Named prepare is its own exchange (Parse + Describe('S') + Sync),
+          // answered by ParseComplete/ParameterDescription/RowDescription/
+          // ReadyForQuery before any Bind goes out.
+          let st = statements.get(q.text);
+          if (!st) { st = { name: "mbun_s" + (++stmtSeq), prepared: false, fields: null }; statements.set(q.text, st); }
+          q.stmt = st;
+          if (!st.prepared) {
+            phase = "preparing";
+            let frame = PGN.encodeParse(st.name, q.text, []);
+            frame = catBytes(frame, PGN.encodeDescribe("S", st.name));
+            frame = catBytes(frame, PGN.encodeSync());
+            if (!writeFrames(frame)) abortHead(pgErr("Connection closed", PG_CODE.CLOSED));
+            return;
+          }
+          phase = "executing";
+          q.fields = st.fields;
+          if (!writeBindExecute(q, st.name)) abortHead(pgErr("Connection closed", PG_CODE.CLOSED));
+          return;
+        }
+        phase = "executing";
+        let wrote;
+        if (!extended) wrote = writeFrames(PGN.encodeQuery(q.text));  // simple query protocol ('Q')
+        else wrote = writeFrames(catBytes(PGN.encodeParse("", q.text, []), (() => {
+          let f = PGN.encodeBind("", "", bindBytesOf(q.binds));
+          f = catBytes(f, PGN.encodeDescribe("P", ""));
+          f = catBytes(f, PGN.encodeExecute("", 0));
+          return catBytes(f, PGN.encodeSync());
+        })()));
+        if (!wrote) abortHead(pgErr("Connection closed", PG_CODE.CLOSED));
       };
 
       const handleAuth = (m, bs) => {
@@ -697,20 +813,58 @@ inline constexpr std::string_view kSqlJS = R"JS(
           case "invalid":
             failFatal(pgErr("Invalid message length", PG_CODE.INVALID_LEN));
             return;
+          case "invalidBody":
+            // The body ran past its own (well-formed) length header — libpq's
+            // "insufficient data left in message". Distinct from a bad length.
+            failFatal(pgErr("Invalid message", PG_CODE.INVALID_MESSAGE));
+            return;
           case "R": handleAuth(m, bs); return;
-          case "E": failFatal(pgErr(m.message || "server error", PG_CODE.SERVER, m.code)); return;
+          case "E": {
+            const err = pgErr(m.message || "server error", PG_CODE.SERVER, m.code);
+            if (status !== "connected" || !inflight) { failFatal(err); return; }
+            // A statement error does NOT close the connection: reject just this
+            // exchange, discard whatever else it still emits, and become idle
+            // again at its ReadyForQuery.
+            if (phase === "preparing") statements.delete(inflight.text);
+            const q = inflight;
+            inflight = null;
+            if (queue[0] === q) queue.shift();
+            phase = "draining";
+            q.reject(err);
+            return;
+          }
           case "Z":  // ReadyForQuery
             if (status === "connecting" || status === "sentStartup" || status === "sslNegotiate") {
               status = "connected";
               settleDial(dialResolve, undefined);
-            } else if (currentQuery) {
-              finishQuery();
+              pumpQueue();
+            } else if (inflight && phase === "preparing") {
+              const st = inflight.stmt;
+              st.prepared = true;
+              st.fields = inflight.fields;
+              phase = "executing";
+              if (!writeBindExecute(inflight, st.name)) abortHead(pgErr("Connection closed", PG_CODE.CLOSED));
+            } else if (inflight) {
+              settleQuery(inflight.error);
+              phase = "idle";
+              pumpQueue();
+            } else {
+              phase = "idle";
+              pumpQueue();
             }
             return;
-          case "T": if (currentQuery) currentQuery.fields = m.fields; return;
-          case "D": if (currentQuery) pushRow(m); return;
-          case "C": if (currentQuery) currentQuery.command = m.command || ""; return;
-          default: return;  // ParameterStatus / BackendKeyData / Notice / Notification
+          case "T": if (inflight) inflight.fields = m.fields; return;
+          case "D":
+            if (inflight && phase === "executing") {
+              // decodeValue throws a PostgresError on malformed binary payloads;
+              // hold it and reject at ReadyForQuery so the exchange still ends.
+              try { pushRow(m); } catch (e) { inflight.error = e; }
+            }
+            return;
+          case "C":
+            if (inflight && phase === "executing") { inflight.command = m.command || ""; endResultSet(); }
+            return;
+          default: return;  // ParameterStatus / BackendKeyData / Notice / Notification / COPY
         }
       };
 
@@ -821,30 +975,25 @@ inline constexpr std::string_view kSqlJS = R"JS(
         return connectPromise;
       };
 
-      const execute = (text, binds, flags) => ensureConnected().then(() => new Promise((resolve, reject) => {
-        if (status !== "connected" || !sock) { reject(pgErr("Connection closed", PG_CODE.CLOSED)); return; }
-        currentQuery = { resolve, reject, fields: null, rows: [], command: "", flags: flags || {} };
-        try {
-          if ((flags && flags.simple) || !binds || binds.length === 0) {
-            sock.write(PGN.encodeQuery(text));   // simple query protocol ('Q')
-          } else {
-            const bindBytes = binds.map((v) => (v == null ? null : pgEnc.encode(String(v))));
-            let frame = PGN.encodeParse("", text, []);
-            frame = catBytes(frame, PGN.encodeBind("", "", bindBytes));
-            frame = catBytes(frame, PGN.encodeDescribe("P", ""));
-            frame = catBytes(frame, PGN.encodeExecute("", 0));
-            frame = catBytes(frame, PGN.encodeSync());
-            sock.write(frame);
-          }
-        } catch (e) { currentQuery = null; reject(pgErr("Connection closed", PG_CODE.CLOSED)); }
-      }));
+      // Enqueue first, connect second: a query issued before the handshake
+      // completes keeps its place in the enqueue order.
+      const execute = (text, binds, flags) => new Promise((resolve, reject) => {
+        const q = { text, binds: binds || [], flags: flags || {}, resolve, reject,
+                    rows: [], results: [], fields: null, command: "", error: null, stmt: null };
+        queue.push(q);
+        ensureConnected().then(pumpQueue, (e) => {
+          const i = queue.indexOf(q);
+          if (i >= 0) { queue.splice(i, 1); reject(e); }
+          else if (inflight !== q) reject(e);
+        });
+      });
 
       const close = () => {
         closed = true;
         if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
         if (retryWake) { const w = retryWake; retryWake = null; w(); }
         settleDial(dialReject, pgErr("Connection closed", PG_CODE.CLOSED));
-        if (currentQuery) { const q = currentQuery; currentQuery = null; q.reject(pgErr("Connection closed", PG_CODE.CLOSED)); }
+        failAllRequests(pgErr("Connection closed", PG_CODE.CLOSED));
         const s = sock; sock = null;
         if (s) { try { s.end(); } catch (e) {} }
         status = "closed";
@@ -855,21 +1004,33 @@ inline constexpr std::string_view kSqlJS = R"JS(
       return { connect: () => ensureConnected(), execute, close };
     }
 
-    // ----- live MySQL transport driver (Bun.connect; connect-error subset) -----
-    // PORT-SOURCE: bun-ref src/sql_jsc/mysql/JSMySQLConnection.rs — on_connect_error
-    // ("Failed to connect" / ConnectionRefused), do_close + consume_on_connect
-    // (pre-handshake close -> "Connection closed before the connection was
-    // established" / ConnectionFailed; else "Connection closed" /
-    // ConnectionClosed) — plus src/js/internal/sql/shared.ts retry-with-backoff.
+    // ----- live MySQL transport driver (Bun.connect + a JS wire codec) -------
+    // PORT-SOURCE: bun-ref src/sql_jsc/mysql/JSMySQLConnection.rs (connect-error
+    // taxonomy: on_connect_error -> ConnectionRefused; do_close /
+    // consume_on_connect -> ConnectionFailed while handshaking, ConnectionClosed
+    // afterwards) + src/sql/mysql packet set, aligned to the MySQL client/server
+    // protocol reference (page_protocol_basic_packets.html and siblings).
+    //
     // MySQL is server-speaks-first: the client sends nothing on open and waits
-    // for HandshakeV10. The handshake/auth + query codec are DEFERRED (no MySQL
-    // wire bridge yet), so a server that actually answers is honestly rejected;
-    // the connect-error / retry / forced-close paths (mock TCP servers that
-    // refuse / drop / never answer) are fully wired.
+    // for HandshakeV10, answers with HandshakeResponse41, and then runs every
+    // query as COM_STMT_PREPARE + COM_STMT_EXECUTE (bun's default
+    // `prepare: true`); `.simple()` / `prepare: false` use COM_QUERY. A real
+    // STARTTLS upgrade of the pool socket is still DEFERRED(S-net).
     const MY_CODE = {
       REFUSED: "ERR_MYSQL_CONNECTION_REFUSED",
       FAILED: "ERR_MYSQL_CONNECTION_FAILED",
       CLOSED: "ERR_MYSQL_CONNECTION_CLOSED",
+      SERVER: "ERR_MYSQL_SERVER_ERROR",
+      UNEXPECTED_PACKET: "ERR_MYSQL_UNEXPECTED_PACKET",
+      MISSING_AUTH_DATA: "ERR_MYSQL_MISSING_AUTH_DATA",
+      INVALID_AUTH_SWITCH: "ERR_MYSQL_INVALID_AUTH_SWITCH_REQUEST",
+      INVALID_PREPARE_OK: "ERR_MYSQL_INVALID_PREPARE_OK_PACKET",
+      INVALID_RESULT_ROW: "ERR_MYSQL_INVALID_RESULT_ROW",
+      UNSUPPORTED_AUTH_PLUGIN: "ERR_MYSQL_UNSUPPORTED_AUTH_PLUGIN",
+      UNSUPPORTED_PROTOCOL: "ERR_MYSQL_UNSUPPORTED_PROTOCOL_VERSION",
+      PUBLIC_KEY_RETRIEVAL: "ERR_MYSQL_PUBLIC_KEY_RETRIEVAL_NOT_ALLOWED",
+      OVERFLOW: "ERR_MYSQL_OVERFLOW",
+      LOCAL_INFILE: "ERR_MYSQL_LOCAL_INFILE_NOT_SUPPORTED",
     };
     const myErr = (msg, code) => {
       const e = new Error(msg);
@@ -878,16 +1039,129 @@ inline constexpr std::string_view kSqlJS = R"JS(
       return e;
     };
 
+    // Capability flags — page_protocol_basic_capability_flags.html (subset used).
+    const MY_CAP = {
+      LONG_PASSWORD: 1, FOUND_ROWS: 2, LONG_FLAG: 4, CONNECT_WITH_DB: 8,
+      LOCAL_FILES: 128, PROTOCOL_41: 1 << 9, SSL: 1 << 11, TRANSACTIONS: 1 << 13,
+      SECURE_CONNECTION: 1 << 15, MULTI_RESULTS: 1 << 17, PS_MULTI_RESULTS: 1 << 18,
+      PLUGIN_AUTH: 1 << 19, PLUGIN_AUTH_LENENC_CLIENT_DATA: 1 << 21, DEPRECATE_EOF: 1 << 24,
+    };
+    const MY_CMD = { QUIT: 0x01, QUERY: 0x03, STMT_PREPARE: 0x16, STMT_EXECUTE: 0x17 };
+    const myEnc = new TextEncoder();
+    const myDec = new TextDecoder();
+
+    // Packet framing: Int<3>(payload_length) Int<1>(sequence_id) payload.
+    const myPacket = (seqId, payload) => {
+      const out = new Uint8Array(4 + payload.length);
+      out[0] = payload.length & 0xff;
+      out[1] = (payload.length >> 8) & 0xff;
+      out[2] = (payload.length >> 16) & 0xff;
+      out[3] = seqId & 0xff;
+      out.set(payload, 4);
+      return out;
+    };
+    // length-encoded integer — page_protocol_basic_dt_integers.html. Returns null
+    // when the buffer is too short; `.value` is null for the 0xfb NULL marker and
+    // NaN when the encoded value does not fit a JS safe integer.
+    const myLenenc = (b, o) => {
+      if (o >= b.length) return null;
+      const f = b[o];
+      if (f < 0xfb) return { value: f, width: 1 };
+      if (f === 0xfb) return { value: null, width: 1 };
+      if (f === 0xfc) return o + 3 > b.length ? null : { value: b[o + 1] | (b[o + 2] << 8), width: 3 };
+      if (f === 0xfd) return o + 4 > b.length ? null : { value: b[o + 1] | (b[o + 2] << 8) | (b[o + 3] << 16), width: 4 };
+      if (o + 9 > b.length) return null;
+      let v = 0;
+      for (let i = 7; i >= 0; i--) v = v * 256 + b[o + 1 + i];
+      return { value: Number.isSafeInteger(v) ? v : NaN, width: 9 };
+    };
+    const myPutLenenc = (out, n) => {
+      if (n < 0xfb) out.push(n);
+      else if (n < 0x10000) out.push(0xfc, n & 0xff, (n >> 8) & 0xff);
+      else out.push(0xfd, n & 0xff, (n >> 8) & 0xff, (n >> 16) & 0xff);
+    };
+    const myStr = (b, from, to) => myDec.decode(b.subarray(from, Math.min(to, b.length)));
+    const myCstrEnd = (b, from) => { let i = from; while (i < b.length && b[i] !== 0) i++; return i; };
+    const myDigest = (algo, bytes) => {
+      const h = new G.Bun.CryptoHasher(algo);
+      h.update(bytes);
+      return new Uint8Array(h.digest());
+    };
+    const myXor = (a, b) => {
+      const o = new Uint8Array(a.length);
+      for (let i = 0; i < a.length; i++) o[i] = a[i] ^ b[i % b.length];
+      return o;
+    };
+    // mysql_native_password: SHA1(pw) XOR SHA1(nonce + SHA1(SHA1(pw)))
+    const myNativeScramble = (pw, nonce) => {
+      if (!pw) return new Uint8Array(0);
+      const s1 = myDigest("sha1", myEnc.encode(String(pw)));
+      return myXor(s1, myDigest("sha1", catBytes(nonce, myDigest("sha1", s1))));
+    };
+    // caching_sha2_password: SHA256(pw) XOR SHA256(SHA256(SHA256(pw)) + nonce)
+    const mySha2Scramble = (pw, nonce) => {
+      if (!pw) return new Uint8Array(0);
+      const d1 = myDigest("sha256", myEnc.encode(String(pw)));
+      const d2 = myDigest("sha256", d1);
+      return myXor(d1, myDigest("sha256", catBytes(d2, nonce)));
+    };
+    const myAuthResponse = (plugin, pw, nonce) =>
+      plugin === "caching_sha2_password" ? mySha2Scramble(pw, nonce)
+      : plugin === "mysql_native_password" ? myNativeScramble(pw, nonce)
+      : null;
+
+    // ColumnDefinition41 — page_protocol_com_query_response_text_resultset_column_definition.html
+    const myParseColumnDef = (p) => {
+      let o = 0, name = "", type = 0xfd, flags = 0;
+      for (let i = 0; i < 6; i++) {
+        const le = myLenenc(p, o);
+        if (!le) return { name: String(i), type, flags };
+        o += le.width;
+        const end = o + (le.value || 0);
+        if (i === 4) name = myStr(p, o, end);
+        o = end;
+      }
+      const fixed = myLenenc(p, o);
+      if (fixed) {
+        o += fixed.width;
+        if (o + 10 <= p.length) { type = p[o + 6]; flags = p[o + 7] | (p[o + 8] << 8); }
+      }
+      return { name, type, flags };
+    };
+    const myParseOk = (p) => {
+      let o = 1;
+      const a = myLenenc(p, o); o += a ? a.width : 1;
+      const l = myLenenc(p, o);
+      return { affectedRows: a && a.value != null ? a.value : 0,
+               lastInsertId: l && l.value != null ? l.value : 0 };
+    };
+    // ERR_Packet: Int<1>(0xff) Int<2>(code) ['#' + 5-byte SQL state] String<EOF>(msg)
+    const myParseErr = (p) => {
+      const code = p.length >= 3 ? (p[1] | (p[2] << 8)) : 0;
+      const o = (p.length > 3 && p[3] === 0x23) ? 9 : 3;
+      return myErr(myStr(p, o, p.length) || ("MySQL error " + code), MY_CODE.SERVER);
+    };
+    const MY_NUMERIC_TYPES = [0x01, 0x02, 0x03, 0x04, 0x05, 0x08, 0x09, 0x0d];
+    const myCoerceText = (s, type) => (MY_NUMERIC_TYPES.indexOf(type) >= 0 ? Number(s) : s);
+
     function makeMysqlDriver(options) {
       let sock = null;
-      let status = "idle";  // idle | connecting | handshaking | closed
+      // idle | connecting | handshake | auth | connected | closed
+      let status = "idle";
+      let readBuf = new Uint8Array(0);
       let dialResolve = null, dialReject = null, dialSettled = true;
       let downOnce = false, opened = false;
       let connectPromise = null;
       let retryTimer = null, retryWake = null;
       let connectStartedAt = 0, connectAttempts = 0;
-      let currentQuery = null;
       let closed = false, closeFired = false;
+
+      // Same one-exchange-at-a-time discipline as the postgres driver: MySQL has
+      // no request id on the wire, so a reply belongs to the head of the queue.
+      const queue = [];
+      let inflight = null;
+      let step = "";   // prepareOk | prepareParams | prepareColumns | resultHeader | columns | rows
+      const statements = new Map();  // query text -> { id, columns }
 
       const fireClose = (err) => {
         if (closeFired) return;
@@ -895,6 +1169,15 @@ inline constexpr std::string_view kSqlJS = R"JS(
         if (typeof options.onclose === "function") { try { options.onclose(err); } catch (e) {} }
       };
       const settleDial = (fn, arg) => { if (dialSettled) return; dialSettled = true; dialResolve = null; dialReject = null; fn(arg); };
+
+      const failAllRequests = (jsErr) => {
+        const q = inflight;
+        inflight = null;
+        step = "";
+        const pending = queue.splice(0, queue.length);
+        for (const r of pending) { if (r !== q) { try { r.reject(jsErr); } catch (e) {} } }
+        if (q) { try { q.reject(jsErr); } catch (e) {} }
+      };
 
       const onSocketDown = (evt) => {
         if (downOnce) return;
@@ -907,16 +1190,348 @@ inline constexpr std::string_view kSqlJS = R"JS(
           settleDial(dialReject, myErr("Failed to connect", MY_CODE.REFUSED));
         } else if (!wasConnected) {
           settleDial(dialReject, myErr("Connection closed before the connection was established", MY_CODE.FAILED));
-        } else if (currentQuery) {
-          const q = currentQuery; currentQuery = null;
-          q.reject(myErr("Connection closed", MY_CODE.CLOSED));
+        } else {
+          failAllRequests(myErr("Connection closed", MY_CODE.CLOSED));
         }
         if (wasConnected) fireClose(myErr("Connection closed", MY_CODE.CLOSED));
         connectPromise = null;
       };
 
+      const failFatal = (jsErr) => {
+        if (status === "connected") failAllRequests(jsErr);
+        else { failAllRequests(jsErr); settleDial(dialReject, jsErr); }
+        downOnce = true;
+        status = "closed";
+        const s = sock; sock = null;
+        if (s) { try { s.end(); } catch (e) {} }
+        connectPromise = null;
+      };
+
+      const writePacket = (seqId, payload) => {
+        if (!sock) return false;
+        try { sock.write(myPacket(seqId, payload)); return true; } catch (e) { return false; }
+      };
+
+      const settleQuery = (err) => {
+        const q = inflight;
+        inflight = null;
+        step = "";
+        if (queue[0] === q) queue.shift();
+        if (!q) return;
+        if (err) { q.reject(err); return; }
+        const out = q.rows;
+        Object.defineProperty(out, "count", { value: out.length, enumerable: false, configurable: true });
+        Object.defineProperty(out, "lastInsertRowid", { value: q.lastInsertId || 0, enumerable: false, configurable: true });
+        Object.defineProperty(out, "affectedRows", { value: q.affectedRows || 0, enumerable: false, configurable: true });
+        q.resolve(out);
+      };
+      const abortHead = (jsErr) => {
+        const q = inflight;
+        inflight = null;
+        step = "";
+        if (queue[0] === q) queue.shift();
+        if (q) q.reject(jsErr);
+      };
+
+      const buildHandshakeResponse = (caps, authResp, plugin) => {
+        const body = [];
+        const user = myEnc.encode(String(options.username || "root"));
+        const db = options.database ? myEnc.encode(String(options.database)) : null;
+        let flags = MY_CAP.PROTOCOL_41 | MY_CAP.SECURE_CONNECTION | MY_CAP.PLUGIN_AUTH |
+                    MY_CAP.PLUGIN_AUTH_LENENC_CLIENT_DATA | MY_CAP.LONG_PASSWORD |
+                    MY_CAP.LONG_FLAG | MY_CAP.TRANSACTIONS | MY_CAP.MULTI_RESULTS |
+                    MY_CAP.PS_MULTI_RESULTS;
+        if (db) flags |= MY_CAP.CONNECT_WITH_DB;
+        if (caps & MY_CAP.DEPRECATE_EOF) flags |= MY_CAP.DEPRECATE_EOF;
+        flags = flags >>> 0;
+        body.push(flags & 0xff, (flags >> 8) & 0xff, (flags >> 16) & 0xff, (flags >>> 24) & 0xff);
+        body.push(0, 0, 0, 1);   // max packet size (16 MiB)
+        body.push(0x2d);         // utf8mb4_general_ci
+        for (let i = 0; i < 23; i++) body.push(0);
+        for (const b of user) body.push(b);
+        body.push(0);
+        myPutLenenc(body, authResp.length);
+        for (const b of authResp) body.push(b);
+        if (db) { for (const b of db) body.push(b); body.push(0); }
+        for (const b of myEnc.encode(plugin)) body.push(b);
+        body.push(0);
+        return new Uint8Array(body);
+      };
+
+      // Protocol::HandshakeV10 — page_protocol_connection_phase_packets_protocol_handshake_v10.html
+      const onHandshakePacket = (seqId, p) => {
+        if (p.length === 0) { failFatal(myErr("Empty handshake packet", MY_CODE.UNEXPECTED_PACKET)); return; }
+        if (p[0] === 0xff) { failFatal(myParseErr(p)); return; }
+        if (p[0] !== 10) { failFatal(myErr("Unsupported protocol version " + p[0], MY_CODE.UNSUPPORTED_PROTOCOL)); return; }
+        let o = myCstrEnd(p, 1) + 1;   // server_version
+        o += 4;                        // thread_id
+        const auth1 = p.subarray(o, o + 8); o += 8;
+        o += 1;                        // filler
+        let caps = p[o] | (p[o + 1] << 8); o += 2;
+        let auth2 = new Uint8Array(0);
+        let plugin = "mysql_native_password";
+        if (o < p.length) {
+          o += 1;                      // character_set
+          o += 2;                      // status_flags
+          caps = (caps | ((p[o] | (p[o + 1] << 8)) << 16)) >>> 0; o += 2;
+          const authLen = p[o]; o += 1;
+          o += 10;                     // reserved
+          const n = Math.max(13, authLen - 8);
+          auth2 = p.subarray(o, o + n); o += n;
+          const end = myCstrEnd(p, o);
+          if (end > o) plugin = myStr(p, o, end);
+        }
+        // The nonce every plugin scrambles against is part 1 + part 2 minus the
+        // trailing NUL filler that part 2 carries.
+        let nonce = catBytes(auth1, auth2);
+        if (nonce.length > 0 && nonce[nonce.length - 1] === 0) nonce = nonce.subarray(0, nonce.length - 1);
+
+        if (options.tls && (caps & MY_CAP.SSL)) {
+          // Once the handshake decides to upgrade, everything after the greeting
+          // must arrive over the encrypted channel: bytes already buffered in
+          // plaintext are an injection attempt and must never reach the auth or
+          // command handlers.
+          if (readBuf.length > 0) {
+            failFatal(myErr("Unexpected plaintext packet buffered behind the server greeting",
+                            MY_CODE.UNEXPECTED_PACKET));
+            return;
+          }
+          failFatal(myErr("MySQL TLS upgrade is not yet implemented in mbun (DEFERRED: needs STARTTLS on the pool socket)",
+                          MY_CODE.FAILED));
+          return;
+        }
+        const resp = myAuthResponse(plugin, options.password, nonce);
+        if (resp === null) { failFatal(myErr("Unsupported authentication plugin " + plugin, MY_CODE.UNSUPPORTED_AUTH_PLUGIN)); return; }
+        status = "auth";
+        if (!writePacket(seqId + 1, buildHandshakeResponse(caps, resp, plugin))) onSocketDown("closed");
+      };
+
+      const onAuthPacket = (seqId, p) => {
+        // A packet whose declared length is 0 cannot carry an auth status byte.
+        if (p.length === 0) { failFatal(myErr("Invalid AuthSwitchRequest", MY_CODE.INVALID_AUTH_SWITCH)); return; }
+        const h = p[0];
+        if (h === 0x00) {   // OK_Packet: authenticated
+          status = "connected";
+          settleDial(dialResolve, undefined);
+          pumpQueue();
+          return;
+        }
+        if (h === 0xff) { failFatal(myParseErr(p)); return; }
+        if (h === 0x01) {   // AuthMoreData
+          if (p.length > 1 && p[1] === 0x03) return;   // caching_sha2 fast_auth_success; OK follows
+          failFatal(myErr("caching_sha2_password full authentication requires TLS or the server public key",
+                          MY_CODE.PUBLIC_KEY_RETRIEVAL));
+          return;
+        }
+        if (h === 0xfe) {   // AuthSwitchRequest
+          const end = myCstrEnd(p, 1);
+          if (end >= p.length) { failFatal(myErr("Invalid AuthSwitchRequest", MY_CODE.INVALID_AUTH_SWITCH)); return; }
+          const plugin = myStr(p, 1, end);
+          let data = p.subarray(end + 1);
+          if (data.length > 0 && data[data.length - 1] === 0) data = data.subarray(0, data.length - 1);
+          // scramble() slices nonce[0..8] and nonce[8..20]; a server-controlled
+          // plugin_data shorter than that must be rejected, not read past.
+          if (data.length < 20) { failFatal(myErr("Missing auth data", MY_CODE.MISSING_AUTH_DATA)); return; }
+          const resp = myAuthResponse(plugin, options.password, data);
+          if (resp === null) { failFatal(myErr("Unsupported authentication plugin " + plugin, MY_CODE.UNSUPPORTED_AUTH_PLUGIN)); return; }
+          if (!writePacket(seqId + 1, resp)) onSocketDown("closed");
+          return;
+        }
+        failFatal(myErr("Unexpected packet during authentication", MY_CODE.UNEXPECTED_PACKET));
+      };
+
+      const sendExecute = (q) => {
+        const st = q.stmt;
+        step = "resultHeader";
+        q.columns = st.columns;
+        const binds = q.binds || [];
+        const body = [MY_CMD.STMT_EXECUTE,
+                      st.id & 0xff, (st.id >> 8) & 0xff, (st.id >> 16) & 0xff, (st.id >>> 24) & 0xff,
+                      0,             // flags: CURSOR_TYPE_NO_CURSOR
+                      1, 0, 0, 0];   // iteration_count
+        if (binds.length > 0) {
+          const nullBytes = (binds.length + 7) >> 3;
+          const nullMap = new Array(nullBytes).fill(0);
+          for (let i = 0; i < binds.length; i++) if (binds[i] == null) nullMap[i >> 3] |= 1 << (i & 7);
+          for (const b of nullMap) body.push(b);
+          body.push(1);   // new_params_bound_flag
+          for (let i = 0; i < binds.length; i++) body.push(0xfe, 0);   // MYSQL_TYPE_STRING
+          for (let i = 0; i < binds.length; i++) {
+            if (binds[i] == null) continue;
+            const v = myEnc.encode(String(binds[i]));
+            myPutLenenc(body, v.length);
+            for (const b of v) body.push(b);
+          }
+        }
+        if (!writePacket(0, new Uint8Array(body))) abortHead(myErr("Connection closed", MY_CODE.CLOSED));
+      };
+
+      const pumpQueue = () => {
+        if (inflight || status !== "connected" || !sock) return;
+        const q = queue[0];
+        if (!q) return;
+        inflight = q;
+        q.rows = []; q.columns = null; q.error = null; q.affectedRows = 0; q.lastInsertId = 0;
+        if (q.flags.simple || options.prepare === false) {
+          q.viaText = true;
+          step = "resultHeader";
+          const body = [MY_CMD.QUERY];
+          for (const b of myEnc.encode(q.text)) body.push(b);
+          if (!writePacket(0, new Uint8Array(body))) abortHead(myErr("Connection closed", MY_CODE.CLOSED));
+          return;
+        }
+        q.viaText = false;
+        const cached = statements.get(q.text);
+        if (cached) { q.stmt = cached; sendExecute(q); return; }
+        step = "prepareOk";
+        const body = [MY_CMD.STMT_PREPARE];
+        for (const b of myEnc.encode(q.text)) body.push(b);
+        if (!writePacket(0, new Uint8Array(body))) abortHead(myErr("Connection closed", MY_CODE.CLOSED));
+      };
+
+      const parseTextRow = (p, q) => {
+        const cols = q.columns || [];
+        const wantRaw = q.flags && (q.flags.values || q.flags.raw);
+        const out = wantRaw ? new Array(cols.length) : {};
+        let o = 0;
+        for (let i = 0; i < cols.length; i++) {
+          let v = null;
+          if (p[o] === 0xfb) { o += 1; }
+          else {
+            const le = myLenenc(p, o);
+            if (!le || le.value == null || !Number.isSafeInteger(le.value)) throw new Error("short row");
+            o += le.width;
+            v = myCoerceText(myStr(p, o, o + le.value), cols[i].type);
+            o += le.value;
+          }
+          if (wantRaw) out[i] = v; else out[cols[i].name] = v;
+        }
+        return out;
+      };
+
+      // Binary protocol row — page_protocol_binary_resultset_row.html: Int<1>(0x00),
+      // NULL bitmap of (n + 7 + 2) / 8 bytes (offset 2), then the packed values.
+      const parseBinaryRow = (p, q) => {
+        const cols = q.columns || [];
+        const wantRaw = q.flags && (q.flags.values || q.flags.raw);
+        const out = wantRaw ? new Array(cols.length) : {};
+        const nullBytes = (cols.length + 9) >> 3;
+        let o = 1 + nullBytes;
+        const dv = new DataView(p.buffer, p.byteOffset, p.byteLength);
+        for (let i = 0; i < cols.length; i++) {
+          const isNull = (p[1 + ((i + 2) >> 3)] & (1 << ((i + 2) & 7))) !== 0;
+          let v = null;
+          if (!isNull) {
+            const t = cols[i].type;
+            if (t === 0x01) { v = dv.getInt8(o); o += 1; }
+            else if (t === 0x02 || t === 0x0d) { v = dv.getInt16(o, true); o += 2; }
+            else if (t === 0x03 || t === 0x09) { v = dv.getInt32(o, true); o += 4; }
+            else if (t === 0x08) { v = Number(dv.getBigInt64(o, true)); o += 8; }
+            else if (t === 0x04) { v = dv.getFloat32(o, true); o += 4; }
+            else if (t === 0x05) { v = dv.getFloat64(o, true); o += 8; }
+            else {
+              const le = myLenenc(p, o);
+              if (!le || le.value == null || !Number.isSafeInteger(le.value)) throw new Error("short row");
+              o += le.width;
+              v = myStr(p, o, o + le.value);
+              o += le.value;
+            }
+          }
+          if (wantRaw) out[i] = v; else out[cols[i].name] = v;
+        }
+        return out;
+      };
+
+      const onQueryPacket = (seqId, p) => {
+        const q = inflight;
+        if (!q) return;   // stale bytes for an already-settled exchange
+        if (p.length === 0) { settleQuery(myErr("Empty packet", MY_CODE.UNEXPECTED_PACKET)); pumpQueue(); return; }
+        if (p[0] === 0xff) { settleQuery(myParseErr(p)); pumpQueue(); return; }
+        const isEof = (p[0] === 0xfe && p.length < 9);
+        switch (step) {
+          case "prepareOk": {
+            // COM_STMT_PREPARE_OK — page_protocol_com_stmt_prepare.html:
+            // Int<1>(0x00) Int<4>(statement_id) Int<2>(num_columns) Int<2>(num_params)
+            if (p[0] !== 0x00 || p.length < 12) {
+              failFatal(myErr("Invalid COM_STMT_PREPARE_OK packet", MY_CODE.INVALID_PREPARE_OK));
+              return;
+            }
+            const id = (p[1] | (p[2] << 8) | (p[3] << 16) | (p[4] << 24)) >>> 0;
+            const numColumns = p[5] | (p[6] << 8);
+            const numParams = p[7] | (p[8] << 8);
+            // statement_id 0 is reserved: a prepare-OK carrying it is a protocol
+            // error and must never reach COM_STMT_EXECUTE.
+            if (id === 0) {
+              failFatal(myErr("Invalid COM_STMT_PREPARE_OK packet: statement id 0", MY_CODE.INVALID_PREPARE_OK));
+              return;
+            }
+            q.stmt = { id, columns: [] };
+            q.pendingParams = numParams;
+            q.pendingColumns = numColumns;
+            if (numParams > 0) { step = "prepareParams"; return; }
+            if (numColumns > 0) { step = "prepareColumns"; return; }
+            statements.set(q.text, q.stmt);
+            sendExecute(q);
+            return;
+          }
+          case "prepareParams": {
+            if (isEof) return;   // EOF terminator when CLIENT_DEPRECATE_EOF is off
+            if (--q.pendingParams > 0) return;
+            if (q.pendingColumns > 0) { step = "prepareColumns"; return; }
+            statements.set(q.text, q.stmt);
+            sendExecute(q);
+            return;
+          }
+          case "prepareColumns": {
+            if (isEof) return;
+            q.stmt.columns.push(myParseColumnDef(p));
+            if (--q.pendingColumns > 0) return;
+            statements.set(q.text, q.stmt);
+            sendExecute(q);
+            return;
+          }
+          case "resultHeader": {
+            if (p[0] === 0x00 || isEof) {   // OK_Packet: no result set
+              const ok = myParseOk(p);
+              q.affectedRows = ok.affectedRows;
+              q.lastInsertId = ok.lastInsertId;
+              settleQuery(null);
+              pumpQueue();
+              return;
+            }
+            if (p[0] === 0xfb) { settleQuery(myErr("LOCAL INFILE is not supported", MY_CODE.LOCAL_INFILE)); pumpQueue(); return; }
+            const le = myLenenc(p, 0);
+            // A server-declared field count the client cannot represent must be
+            // rejected outright — never used to size an allocation.
+            if (!le || le.value == null || !Number.isSafeInteger(le.value) || le.value > 0xffff) {
+              failFatal(myErr("Invalid result set column count", MY_CODE.OVERFLOW));
+              return;
+            }
+            q.pendingColumns = le.value;
+            q.columns = [];
+            step = q.pendingColumns > 0 ? "columns" : "rows";
+            return;
+          }
+          case "columns": {
+            if (isEof) { step = "rows"; return; }
+            q.columns.push(myParseColumnDef(p));
+            if (--q.pendingColumns <= 0) step = "rows";
+            return;
+          }
+          case "rows": {
+            if (isEof) { settleQuery(q.error); pumpQueue(); return; }
+            try { q.rows.push(q.viaText ? parseTextRow(p, q) : parseBinaryRow(p, q)); }
+            catch (e) { q.error = myErr("Invalid result row", MY_CODE.INVALID_RESULT_ROW); }
+            return;
+          }
+          default:
+            return;
+        }
+      };
+
       const dialOnce = () => new Promise((resolve, reject) => {
         status = "connecting";
+        readBuf = new Uint8Array(0);
         downOnce = false;
         opened = false;
         dialSettled = false;
@@ -926,17 +1541,23 @@ inline constexpr std::string_view kSqlJS = R"JS(
           open(bs) {
             opened = true;
             if (status === "closed" || closed) { try { bs.end(); } catch (e) {} return; }
-            status = "handshaking";  // MySQL server speaks first; wait for HandshakeV10.
+            status = "handshake";  // MySQL server speaks first; wait for HandshakeV10.
             sock = bs;
           },
           data(bs, chunk) {
-            // A real server answered: the handshake/auth codec is not yet wired.
-            settleDial(dialReject, myErr(
-              "MySQL handshake over a live socket is not yet implemented in mbun (DEFERRED: needs the wire codec)",
-              MY_CODE.CLOSED));
-            downOnce = true; status = "closed"; const s = sock; sock = null;
-            if (s) { try { s.end(); } catch (e) {} }
-            connectPromise = null;
+            readBuf = catBytes(readBuf, chunk);
+            for (;;) {
+              if (readBuf.length < 4) break;
+              const len = readBuf[0] | (readBuf[1] << 8) | (readBuf[2] << 16);
+              if (readBuf.length < 4 + len) break;
+              const seqId = readBuf[3];
+              const payload = readBuf.slice(4, 4 + len);
+              readBuf = readBuf.slice(4 + len);
+              if (status === "handshake") onHandshakePacket(seqId, payload);
+              else if (status === "auth") onAuthPacket(seqId, payload);
+              else if (status === "connected") onQueryPacket(seqId, payload);
+              if (status === "closed") break;
+            }
           },
           close(bs) { onSocketDown("closed"); },
           error(bs, e) { onSocketDown("error"); },
@@ -982,19 +1603,24 @@ inline constexpr std::string_view kSqlJS = R"JS(
         return connectPromise;
       };
 
-      // Query execution needs the (deferred) MySQL wire codec; ensureConnected
-      // rejects first on the mock/error paths, so this only surfaces for a real
-      // server that completes the TCP connect.
-      const execute = (text, binds, flags) => ensureConnected().then(() => Promise.reject(myErr(
-        "MySQL query execution over a live socket is not yet implemented in mbun (DEFERRED: needs the wire codec)",
-        MY_CODE.CLOSED)));
+      const execute = (text, binds, flags) => new Promise((resolve, reject) => {
+        const q = { text, binds: binds || [], flags: flags || {}, resolve, reject,
+                    rows: [], columns: null, error: null, stmt: null, viaText: false,
+                    affectedRows: 0, lastInsertId: 0 };
+        queue.push(q);
+        ensureConnected().then(pumpQueue, (e) => {
+          const i = queue.indexOf(q);
+          if (i >= 0) { queue.splice(i, 1); reject(e); }
+          else if (inflight !== q) reject(e);
+        });
+      });
 
       const close = () => {
         closed = true;
         if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
         if (retryWake) { const w = retryWake; retryWake = null; w(); }
         settleDial(dialReject, myErr("Connection closed", MY_CODE.CLOSED));
-        if (currentQuery) { const q = currentQuery; currentQuery = null; q.reject(myErr("Connection closed", MY_CODE.CLOSED)); }
+        failAllRequests(myErr("Connection closed", MY_CODE.CLOSED));
         const s = sock; sock = null;
         if (s) { try { s.end(); } catch (e) {} }
         status = "closed";
@@ -1028,8 +1654,41 @@ inline constexpr std::string_view kSqlJS = R"JS(
         : options.adapter === "mysql" ? makeMysqlAdapter(sqlObj)
         : makePostgresAdapter(sqlObj);
       sqlObj.options = options;
-      if (options.adapter === "postgres") sqlObj.__pgDriver = makePgDriver(options);
-      if (options.adapter === "mysql") sqlObj.__myDriver = makeMysqlDriver(options);
+
+      // ---- connection pool -------------------------------------------------
+      // PORT-SOURCE: bun-ref src/js/internal/sql/shared.ts — the pool array is
+      // `new Array(max)` and is filled one slot at a time when the pool starts.
+      // A function-valued `password` is resolved per slot, synchronously, inside
+      // that fill loop, so pool methods re-entered from it must tolerate slots
+      // that have not been assigned yet (bun issue #32198).
+      const poolSize = options.adapter === "sqlite" ? 0 : Math.max(1, Number(options.max) || 1);
+      const drivers = new Array(poolSize).fill(null);
+      let filling = false, nextSlot = 0;
+      const slotOptions = () => {
+        if (typeof options.password !== "function") return options;
+        const o = Object.assign({}, options);
+        try { o.password = options.password(); } catch (e) { o.password = ""; }
+        return o;
+      };
+      const makeDriver = () => (options.adapter === "mysql" ? makeMysqlDriver(slotOptions())
+                                                            : makePgDriver(slotOptions()));
+      const startPool = () => {
+        if (filling) return;   // re-entered from password(): slots are still being filled
+        filling = true;
+        try { for (let i = 0; i < poolSize; i++) if (drivers[i] == null) drivers[i] = makeDriver(); }
+        finally { filling = false; }
+      };
+      const liveDrivers = () => drivers.filter((d) => d != null);
+      // Queries go to a live slot; with the common max:1 that is the single
+      // connection, so the pooled path is a no-op there.
+      sqlObj.__driver = () => {
+        startPool();
+        const live = liveDrivers();
+        if (live.length === 0) return null;
+        const d = live[nextSlot % live.length];
+        nextSlot++;
+        return d;
+      };
 
       // sqlite: lazily open the sqlite3 handle on first execution.
       let sqliteHandle = null;
@@ -1045,14 +1704,15 @@ inline constexpr std::string_view kSqlJS = R"JS(
 
       sqlObj.connect = () => {
         if (options.adapter === "sqlite") { try { sqlObj.__handle(); return Promise.resolve(sqlObj); } catch (e) { return Promise.reject(e); } }
-        if (options.adapter === "postgres") return sqlObj.__pgDriver.connect().then(() => sqlObj);
-        if (options.adapter === "mysql") return sqlObj.__myDriver.connect().then(() => sqlObj);
-        return Promise.reject(new Error("SQL connect over a live socket is not yet implemented in mbun"));
+        startPool();
+        const live = liveDrivers();
+        // Re-entered from the pool-start fill loop: no slot is assigned yet.
+        if (live.length === 0) return Promise.resolve(sqlObj);
+        return Promise.all(live.map((d) => d.connect())).then(() => sqlObj);
       };
       sqlObj.close = (_options) => {
         if (sqliteHandle != null && SQN) { try { SQN.close(sqliteHandle); } catch {} sqliteHandle = null; }
-        if (sqlObj.__pgDriver) { try { sqlObj.__pgDriver.close(); } catch {} }
-        if (sqlObj.__myDriver) { try { sqlObj.__myDriver.close(); } catch {} }
+        for (const d of liveDrivers()) { try { d.close(); } catch (e) {} }
         return Promise.resolve();
       };
       sqlObj.end = sqlObj.close;

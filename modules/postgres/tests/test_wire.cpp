@@ -321,6 +321,99 @@ void test_invalid() {
     ok(decode_message(as_sv(unk)).status == DecodeStatus::Invalid, "invalid.unknown-tag");
 }
 
+// ── body overrun (ERR_POSTGRES_INVALID_MESSAGE) + COPY frames ───────────────
+// Vectors mirror compat/bun/test/js/sql/postgres-datarow-overrun.test.ts.
+std::vector<std::byte> raw_frame(char tag, std::span<const std::byte> body, int len_override = -1) {
+    std::vector<std::byte> f;
+    f.push_back(static_cast<std::byte>(tag));
+    auto len { static_cast<std::uint32_t>(len_override >= 0 ? len_override : static_cast<int>(body.size() + 4)) };
+    for (int k { 3 }; k >= 0; --k) f.push_back(static_cast<std::byte>((len >> (k * 8)) & 0xFF));
+    f.insert(f.end(), body.begin(), body.end());
+    return f;
+}
+std::vector<std::byte> be32(std::int32_t v) {
+    std::vector<std::byte> b;
+    auto u { static_cast<std::uint32_t>(v) };
+    for (int k { 3 }; k >= 0; --k) b.push_back(static_cast<std::byte>((u >> (k * 8)) & 0xFF));
+    return b;
+}
+std::vector<std::byte> cat(std::initializer_list<std::vector<std::byte>> parts) {
+    std::vector<std::byte> out;
+    for (const auto& p : parts) out.insert(out.end(), p.begin(), p.end());
+    return out;
+}
+
+void test_body_overrun_and_copy() {
+    using B = std::vector<std::byte>;
+    const B count1 { std::byte { 0 }, std::byte { 1 } };
+    const B ab { std::byte { 'a' }, std::byte { 'b' } };
+
+    // DataRow: cell length 100 but only 2 bytes of payload.
+    auto d1 { raw_frame('D', cat({ count1, be32(100), ab })) };
+    ok(decode_message(as_sv(d1)).status == DecodeStatus::InvalidBody, "overrun.datarow.cell-len");
+    // DataRow: field count 3, one cell's worth of bytes.
+    auto d2 { raw_frame('D', cat({ B { std::byte { 0 }, std::byte { 3 } }, be32(2), ab })) };
+    ok(decode_message(as_sv(d2)).status == DecodeStatus::InvalidBody, "overrun.datarow.field-count");
+    // DataRow: negative cell length other than -1.
+    auto d3 { raw_frame('D', cat({ count1, be32(-2), ab })) };
+    ok(decode_message(as_sv(d3)).status == DecodeStatus::InvalidBody, "overrun.datarow.negative-len");
+    // DataRow: declared length leaves no room for the Int16 field count.
+    auto d4 { raw_frame('D', B { std::byte { 0 } }, 5) };
+    ok(decode_message(as_sv(d4)).status == DecodeStatus::InvalidBody, "overrun.datarow.short-count");
+    // -1 stays SQL NULL, and a cell that exactly fills the message decodes.
+    auto dn { raw_frame('D', cat({ count1, be32(-1) })) };
+    auto rn { decode_message(as_sv(dn)) };
+    ok(rn.status == DecodeStatus::Ok, "overrun.datarow.null-ok");
+    auto dok { raw_frame('D', cat({ count1, be32(2), ab })) };
+    ok(decode_message(as_sv(dok)).status == DecodeStatus::Ok, "overrun.datarow.exact-ok");
+    // ParameterDescription: count 1000 with no body.
+    auto pd { raw_frame('t', B { std::byte { 0x03 }, std::byte { 0xE8 } }) };
+    ok(decode_message(as_sv(pd)).status == DecodeStatus::InvalidBody, "overrun.paramdesc");
+
+    // COPY frames are framed and consumed rather than rejected.
+    auto copy_out { raw_frame('H', cat({ B { std::byte { 0 } }, B { std::byte { 0 }, std::byte { 0 } } })) };
+    auto rc { decode_message(as_sv(copy_out)) };
+    ok(rc.status == DecodeStatus::Ok && rc.message.tag == BackendTag::CopyOutResponse, "copy.out-response");
+    auto copy_data { raw_frame('d', ab) };
+    ok(decode_message(as_sv(copy_data)).status == DecodeStatus::Ok, "copy.data");
+    auto copy_done { raw_frame('c', B {}) };
+    ok(decode_message(as_sv(copy_done)).status == DecodeStatus::Ok, "copy.done");
+}
+
+// ── binary single-dimension arrays ─────────────────────────────────────────
+// Vectors mirror compat/bun/test/js/sql/postgres-binary-array-bounds.test.ts.
+void test_binary_array() {
+    auto header { [](std::int32_t ndim, std::int32_t flags, std::int32_t elemtype,
+                     std::int32_t len, std::int32_t lbound) {
+        return cat({ be32(ndim), be32(flags), be32(elemtype), be32(len), be32(lbound) });
+    } };
+    constexpr std::int32_t INT4 { 23 };
+
+    ok(!decode_binary_array(header(1, 0, INT4, 65536, 1), 4).ok, "binarr.len-exceeds");
+    ok(!decode_binary_array(cat({ header(1, 0, INT4, 65536, 1), be32(4), be32(42) }), 4).ok, "binarr.partial");
+    ok(!decode_binary_array(header(1, 0, INT4, -1, 1), 4).ok, "binarr.negative-len");
+    ok(!decode_binary_array(cat({ be32(1), be32(0), be32(INT4), be32(1) }), 4).ok, "binarr.truncated-header");
+    ok(!decode_binary_array(header(1, 0, INT4, 0x7FFFFFFF, 1), 4).ok, "binarr.int32-max");
+    ok(!decode_binary_array(header(1, 0, 700, 1 << 20, 1), 4).ok, "binarr.float4.len-exceeds");
+
+    auto good { decode_binary_array(
+        cat({ header(1, 0, INT4, 3, 1), be32(4), be32(1), be32(4), be32(2), be32(4), be32(3) }), 4) };
+    ok(good.ok && good.count == 3, "binarr.wellformed.count");
+    if (good.ok && good.data.size() == 12) {
+        auto elem { [&](std::size_t i) {
+            std::int32_t v {};
+            std::memcpy(&v, good.data.data() + i * 4, 4);
+            return v;
+        } };
+        ok(elem(0) == 1 && elem(1) == 2 && elem(2) == 3, "binarr.wellformed.values");
+    } else {
+        ok(false, "binarr.wellformed.values");
+    }
+    // ndim == 0 is an empty array, not an error.
+    auto empty { decode_binary_array(cat({ be32(0), be32(0), be32(INT4) }), 4) };
+    ok(empty.ok && empty.count == 0, "binarr.zero-dim");
+}
+
 // ── value helpers: text + binary ────────────────────────────────────────────
 void test_value_helpers() {
     // bool
@@ -361,6 +454,8 @@ int main() {
     test_row_description_and_data_row();
     test_incremental();
     test_invalid();
+    test_body_overrun_and_copy();
+    test_binary_array();
     test_value_helpers();
 
     std::println("mbun.postgres.wire: {} checks, {} failures", gChecks, gFailures);
