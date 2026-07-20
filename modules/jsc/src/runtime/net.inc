@@ -275,6 +275,35 @@ JSValueRef netn_read_fd_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size
 #endif
 }
 
+// net.readByteBlocking(fd) → byte (0-255) | -1 (EOF/error). The BLOCKING one-byte
+// twin of readFd, used by the WHATWG simple dialogs (alert/confirm/prompt): they
+// pause the whole program until the user answers, reading a line a byte at a time
+// (bun src/runtime/webcore/prompt.rs BufferedStdin.take_byte). fd 0 is normally
+// blocking until the stdin pump lazily flips it non-blocking; poll() on EAGAIN
+// covers the flipped case so a byte is still returned once input arrives.
+JSValueRef netn_read_byte_blocking_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                                      const JSValueRef args[], JSValueRef*) {
+#if defined(_WIN32)
+    return JSValueMakeNumber(ctx, -1);
+#else
+    const int fd{argc > 0 ? static_cast<int>(JSValueToNumber(ctx, args[0], nullptr)) : -1};
+    if (fd < 0) return JSValueMakeNumber(ctx, -1);
+    for (;;) {
+        unsigned char b;
+        const ssize_t n{read(fd, &b, 1)};
+        if (n == 1) return JSValueMakeNumber(ctx, static_cast<double>(b));
+        if (n == 0) return JSValueMakeNumber(ctx, -1);  // EOF
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            pollfd pfd{fd, POLLIN, 0};
+            poll(&pfd, 1, -1);  // block until readable (or hangup)
+            continue;
+        }
+        return JSValueMakeNumber(ctx, -1);
+    }
+#endif
+}
+
 // net.write(fd, b64) → bytes accepted (may be a partial write; 0 = would block).
 JSValueRef netn_write_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                          const JSValueRef args[], JSValueRef* exc) {

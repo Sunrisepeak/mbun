@@ -26,6 +26,14 @@ namespace mbun::core::compress {
 using Bytes = std::vector<std::uint8_t>;
 using ByteView = std::span<const std::uint8_t>;
 
+// Error text returned when a bounded inflate (`maxOut`) would exceed its cap.
+// Callers that thread a bound (e.g. the install tarball extractor) compare
+// against this to distinguish a size-cap rejection from a corrupt stream.
+// ref: bun caps the tarball inflate at MAX_DECOMPRESSED_TARBALL_SIZE and
+// surfaces the zlib error (extract_tarball.rs:343).
+export inline constexpr std::string_view DECOMPRESS_LIMIT_ERROR{
+    "decompressed size exceeds maximum allowed"};
+
 // ---------------------------------------------------------------------------
 // Checksums
 // ---------------------------------------------------------------------------
@@ -230,10 +238,14 @@ std::unexpected<std::string> inflate_error(std::string_view what) {
     return std::unexpected{std::string{what}};
 }
 
-// Decodes the compressed payload of one huffman-coded block into `out`.
+// Decodes the compressed payload of one huffman-coded block into `out`. When
+// `maxOut` is set the check lives HERE, inside the symbol loop: one deflate
+// block's output is unbounded for bounded input (a run of length/distance
+// copies), so a caller-level check after the block returns would be too late.
 std::optional<std::string> inflate_block(BitReader& br, const Huffman& litlen, const Huffman& dist,
-                                         Bytes& out) {
+                                         Bytes& out, std::optional<std::size_t> maxOut) {
     for (;;) {
+        if (maxOut && out.size() > *maxOut) return std::string{DECOMPRESS_LIMIT_ERROR};
         int sym{litlen.decode(br)};
         if (sym < 0) return "invalid literal/length code";
         if (sym < 256) {
@@ -265,7 +277,8 @@ std::optional<std::string> inflate_block(BitReader& br, const Huffman& litlen, c
 // Raw DEFLATE (RFC 1951) decompression. On success `consumed` (when non-null)
 // receives the number of input bytes the stream occupied — container formats
 // use it to locate their trailer.
-export std::expected<Bytes, std::string> inflate_raw(ByteView src, std::size_t* consumed = nullptr) {
+export std::expected<Bytes, std::string> inflate_raw(ByteView src, std::size_t* consumed = nullptr,
+                                                     std::optional<std::size_t> maxOut = std::nullopt) {
     BitReader br{src};
     Bytes out{};
     for (;;) {
@@ -280,12 +293,14 @@ export std::expected<Bytes, std::string> inflate_raw(ByteView src, std::size_t* 
                 if (!len || !nlen) return inflate_error("unexpected end of input");
                 if ((*len ^ 0xFFFFU) != *nlen) return inflate_error("invalid stored block lengths");
                 std::size_t old{out.size()};
+                if (maxOut && old + *len > *maxOut)
+                    return inflate_error(DECOMPRESS_LIMIT_ERROR);
                 out.resize(old + *len);
                 if (!br.read_bytes(out.data() + old, *len)) return inflate_error("unexpected end of input");
                 break;
             }
             case 1: {  // fixed Huffman
-                if (auto err{inflate_block(br, fixed_litlen_table(), fixed_dist_table(), out)})
+                if (auto err{inflate_block(br, fixed_litlen_table(), fixed_dist_table(), out, maxOut)})
                     return inflate_error(*err);
                 break;
             }
@@ -348,7 +363,7 @@ export std::expected<Bytes, std::string> inflate_raw(ByteView src, std::size_t* 
                     return inflate_error("invalid literal/lengths set");
                 if (!dist.build(std::span{lengths}.subspan(nlit)))
                     return inflate_error("invalid distances set");
-                if (auto err{inflate_block(br, litlen, dist, out)}) return inflate_error(*err);
+                if (auto err{inflate_block(br, litlen, dist, out, maxOut)}) return inflate_error(*err);
                 break;
             }
             default:
@@ -595,7 +610,22 @@ export Bytes gzip_compress(ByteView src, int level = 6) {
 }
 
 // Handles multi-member streams (concatenated gzip files), matching zlib/node.
-export std::expected<Bytes, std::string> gzip_decompress(ByteView src) {
+// `maxOut` bounds the total decompressed size (unset = unbounded); the bound is
+// enforced inside inflate_block. For a single-member stream the gzip ISIZE
+// footer (RFC 1952 §2.3.1, the trailing 4 bytes mod 2^32) lets us reject an
+// over-cap payload up front with zero allocation — the tarball-bomb fast path.
+export std::expected<Bytes, std::string> gzip_decompress(
+    ByteView src, std::optional<std::size_t> maxOut = std::nullopt) {
+    if (maxOut && src.size() >= 4) {
+        std::size_t isize{static_cast<std::size_t>(src[src.size() - 4])
+                          | static_cast<std::size_t>(src[src.size() - 3]) << 8
+                          | static_cast<std::size_t>(src[src.size() - 2]) << 16
+                          | static_cast<std::size_t>(src[src.size() - 1]) << 24};
+        // Sound as a pure fast path: the last member's ISIZE is a lower bound on
+        // the total, so isize > cap ⇒ total > cap. Under-cap falls through to
+        // the authoritative in-block bound below.
+        if (isize > *maxOut) return std::unexpected{std::string{DECOMPRESS_LIMIT_ERROR}};
+    }
     Bytes out{};
     ByteView rest{src};
     do {
@@ -618,7 +648,8 @@ export std::expected<Bytes, std::string> gzip_decompress(ByteView src) {
         if (off >= rest.size()) return std::unexpected{"unexpected end of file"};
 
         std::size_t consumed{0};
-        auto body{inflate_raw(rest.subspan(off), &consumed)};
+        auto remaining{maxOut ? std::optional<std::size_t>{*maxOut - out.size()} : std::nullopt};
+        auto body{inflate_raw(rest.subspan(off), &consumed, remaining)};
         if (!body) return body;
         ByteView trailer{rest.subspan(off + consumed)};
         if (trailer.size() < 8) return std::unexpected{"unexpected end of file"};

@@ -1393,11 +1393,13 @@ public:
         // Native fd-level positioned I/O (fs.openSync/readSync/writeSync/closeSync)
         // as direct host functions — no C API JSLock churn on the hot loop.
         JSObjectRef fdn{JSObjectMake(ctx_, nullptr, nullptr)};
-        set_native_fn(ctx_, fdn, "open", 3, fdn_open_host);
+        set_native_fn(ctx_, fdn, "open", 4, fdn_open_host);
         set_native_fn(ctx_, fdn, "close", 1, fdn_close_host);
         set_native_fn(ctx_, fdn, "read", 5, fdn_read_host);
         set_native_fn(ctx_, fdn, "write", 5, fdn_write_host);
         set_prop(ctx_, global, "__mbunFdNative", fdn);
+        // bun:internal-for-testing createSocketPair() → [readFd, writeFd].
+        set_native_fn(ctx_, global, "__mbunCreateSocketPair", 0, create_socket_pair_host);
         // Native shell parser for bun:internal-for-testing shellInternals.
         JSObjectRef shn{JSObjectMake(ctx_, nullptr, nullptr)};
         set_fn(ctx_, shn, "parse", shell_parse_cb);
@@ -1540,6 +1542,7 @@ public:
         set_fn(ctx_, nn, "connectUnix", netn_connect_unix_cb);
         set_fn(ctx_, nn, "read", netn_read_cb);
         set_fn(ctx_, nn, "readFd", netn_read_fd_cb);  // read(2) twin for process.stdin's fd 0
+        set_fn(ctx_, nn, "readByteBlocking", netn_read_byte_blocking_cb);  // blocking 1-byte read for alert/confirm/prompt
         set_fn(ctx_, nn, "write", netn_write_cb);
         set_fn(ctx_, nn, "shutdown", netn_shutdown_cb);
         set_fn(ctx_, nn, "close", netn_close_cb);

@@ -5,6 +5,19 @@
 
 ## 2026-07-21
 
+- **第五批(fix/corpus-round4 续,近绿池清扫 + 诚实分诊):Bun green 880 → 885 / 1902(46.3% → 46.5%),oom 2、timeout 44,测试级 32,190 通过 / 52,454**。
+  ① **node:fs 参数类型校验(+8 node/parallel 文件)**:fchmod/fchown/link/rename 等补齐 `ERR_INVALID_ARG_TYPE`/`ERR_OUT_OF_RANGE`。**收严 `assert.throws` 的另一半因只降绿数(约 60+ 文件假通过)未合入,立为 issue #20**。修一处自引入回归:path 校验拒了 String 子类(bun 的 `DisposableString`),node 是强转不是拒绝 → `String.prototype.valueOf` brand-check 接受(issue/30493 回绿)。
+  ② **js/web WHATWG 一致性(+3)**:`fetch()` 提前一次性读 RequestInit getter(抛错的 getter 应 reject 而非同步抛、未读选项让 fetch 先连接)、`Headers` 活的共享原型迭代器 + `Symbol.toStringTag`、web globals(Performance*、alert/confirm/prompt 走新的阻塞 1 字节 stdin 原语、self accessor、onerror/onmessage)。
+  ③ **regression(+3)**:`bun build --bundle`/`--production` flag 归类为 no-op、`Bun.stdin.exists()` 缺失(纯探针不消费管道)。
+  ④ **test-runner(+5,前一批)**:expect.extend 静态匹配器、expect.assertions、toMatchSnapshot 写 .snap、Subprocess.resourceUsage。
+- **方法论转折(本轮最重要的产出):近绿清扫在 js/node / js/web / regression 三大子树同时枯竭**。wt1 穷尽 js/node 的 fail≤3 池后交付 0(剩的全是子系统:真实 SharedArrayBuffer、util.inspect 重写、FinalizationRegistry 回收、worker_threads —— 立为 **issue #21** 路线图);wt2/wt3 在 js/web / regression 也只各拿 3(剩的是 CSS 逻辑属性、code-frame reporter、Bun.plugin 等子系统)。**下一轮转向具名子系统,不再派「+N 近绿」**。
+
+- **第四批(fix/corpus-round4,直击此前推迟的 #4/#5/#8 硬骨头):Bun green 874 → 880 / 1902(46.0% → 46.3%),测试级 31,818 → 32,263 通过 / 52,677 执行,oom 3 → 2,timeout 47 → 43**。
+  ① **FileSink 实现(#4)**:`Bun.file(path|fd).writer()` —— write/flush/end/start/ref/unref、非阻塞 fd 背压(EAGAIN 返回 -1、缓冲尾部 + Promise)、fifo/pipe 读端 `O_RDONLY|O_NONBLOCK` 持有以免单线程死锁。`filesink.test.ts` 永久 timeout → **46/0**。附带 `modules/core` 的 `OpenOptions.nonblock`+`File::adopt`、`create_socket_pair_host`、`fileSinkInternals.liveCount()`、`fs.ftruncate`。
+  ② **install 解压 2GiB 上限(#5)**:2.25GiB gzip 炸弹此前完全解压进单个 vector → 在 `inflate_block` 符号循环内加 `maxOut` 界 + gzip ISIZE 尾部零分配预检,`streaming-extract` 脱离 oom 桶。连带修一个更深的 bug:zlib 流桥接每次整块 base64(膨胀约 16×),测试自建 2.25GiB 载荷时在 install 前就 OOM → 改 1MiB 分片喂原生流式编解码器。新增 `test_core_compress::test_size_cap`。
+  ③ **test-runner 5 文件转绿(#8)**:`expect.extend` 未注册静态匹配器(`expect.<name>()`)、`expect.assertions()`/`hasAssertions()` 是空操作、`toMatchSnapshot()` 从不写 `.snap`、`Subprocess.resourceUsage()` 返回 `{}`。
+- **诚实记录**:参数校验轨(收严 `assert.throws`)因只降绿数、校验补得不够,未作为补丁合入,改走 FINDINGS 交专门轨 —— 不为诚实牺牲零回归指标。
+
 - **第三批(fix/corpus-round3,5 路 worktree 并行):Bun green 850 → 874 / 1902(44.7% → 46.0%),测试级 30,790 → 31,818 通过 / 52,175 执行;Node pass 1,774 → 1,811 / 4433(40.0% → 40.9%)**。
   ① **crypto `key-objects` 68/17 → 85/0 全绿**:KeyObject 构造器加私有 brand(此前 `new KeyObject("secret","")` 静默成功)、`generateKey`/`generateKeySync` 实现、`export()`/`equals()`/`dsaEncoding` 校验、`asymmetricKeyDetails.publicExponent`;**安全修复:`createPrivateKey` 曾把 PKCS#1 公钥当私钥接受**(缺 `asym_has_private` 检查)。
   ② **ini/dns/test-runner 3 文件转绿**:`iniInternals` 未接线(`mbun.ini` 解析器已存在,只是没桥到 JS)→ ini.test 0/1 → 62/0;`Bun.dns.resolve` 错误列出 NAPTR;eval-error 包装剥离对齐 bun。

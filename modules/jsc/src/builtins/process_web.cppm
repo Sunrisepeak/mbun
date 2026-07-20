@@ -1595,6 +1595,16 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   // ---- Bun.spawn / Bun.spawnSync (sync under the hood; correct final results.
   // Async streaming / kill-mid-run DEFERRED — no host loop) ----
   const CPN = globalThis.__mbunCpNative;
+  // Subprocess.resourceUsage() shape (Subprocess.zig createResourceUsageObject):
+  // cpuTime is in microseconds as BigInt (total = user + system). Real rusage
+  // accounting is DEFERRED — the fields are present and correctly typed so
+  // callers reading `.cpuTime.total` etc. see a plausible BigInt (issue #9404).
+  const __mbunResourceUsage = () => ({
+    contextSwitches: { voluntary: 0, involuntary: 0 },
+    cpuTime: { user: 0n, system: 0n, total: 0n },
+    maxRSS: 0, messages: { sent: 0, received: 0 }, ops: { in: 0, out: 0 },
+    shmSize: 0, signalCount: 0, swapCount: 0,
+  });
   const spawnArgs = (a, b) => {
     let cmd, opts;
     if (Array.isArray(a)) { cmd = a; opts = b || {}; }
@@ -1665,7 +1675,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
         exited: { then(res, rej) { try { proc._reap(false); return Promise.resolve(proc.exitCode).then(res, rej); } catch (e) { return Promise.reject(e).then(res, rej); } } },
         _reap(nohang) { if (st.done) return; const w = PN.wait(h.pid, !!nohang); if (w.exited) { st.done = true; proc.exitCode = w.code; proc.signalCode = w.signal ? SIGNAMES[w.signal] || "SIG" + w.signal : null; } },
         kill(sig) { try { PN.kill(h.pid, typeof sig === "number" ? sig : 15); } catch (e) {} try { PN.close(h.in); } catch (e) {} try { proc._reap(false); } catch (e) {} },
-        ref() {}, unref() {}, resourceUsage() { return {}; },
+        ref() {}, unref() {}, resourceUsage() { return __mbunResourceUsage(); },
         [Symbol.dispose]() { this.kill(); },
         [Symbol.asyncDispose]() { this.kill(); return Promise.resolve(); },
       };
@@ -1742,7 +1752,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       const h = PN.spawnEx(cmd[0], cmd, { cwd: opts.cwd ? toStr(opts.cwd) : undefined, env: opts.env && typeof opts.env === "object" ? opts.env : (G.process && G.process.env) || undefined, stdio });
       if (h.errno != null) { const code = ERRNO[h.errno] || ("errno " + h.errno); const e = new Error("spawn " + cmd[0] + " " + code); e.code = code; e.errno = -1; e.syscall = "spawn " + cmd[0]; throw e; }
       let exitResolve; const exitedP = new Promise((r) => (exitResolve = r));
-      const proc = { pid: h.pid, exitCode: null, signalCode: null, killed: false, exited: exitedP, exitedDueToMaxBuffer: false, exitedDueToTimeout: false, ref() {}, unref() {}, resourceUsage() { return {}; } };
+      const proc = { pid: h.pid, exitCode: null, signalCode: null, killed: false, exited: exitedP, exitedDueToMaxBuffer: false, exitedDueToTimeout: false, ref() {}, unref() {}, resourceUsage() { return __mbunResourceUsage(); } };
       const rec = { cp: null, pid: h.pid, outs: [], stdinFd: -1, stdinBuf: [], stdinEnded: false, stdinClosed: false, exited: false, closed: false, done: false, code: null, signal: null };
       rec.cp = { emit: (ev, code, signal) => {
         if (ev === "exit") { proc.exitCode = signal ? null : code; proc.signalCode = signal || null; }
@@ -1838,7 +1848,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       const h = PN.spawnPty(cmd[0], cmd, { cwd: opts.cwd ? toStr(opts.cwd) : undefined, env: opts.env && typeof opts.env === "object" ? opts.env : (G.process && G.process.env) || undefined, cols, rows });
       if (h.errno != null) { const code = ERRNO[h.errno] || ("errno " + h.errno); const e = new Error("spawn " + cmd[0] + " " + code); e.code = code; e.errno = -1; e.syscall = "spawn " + cmd[0]; throw e; }
       let exitResolve; const exitedP = new Promise((r) => (exitResolve = r));
-      const proc = { pid: h.pid, exitCode: null, signalCode: null, killed: false, exited: exitedP, ref() {}, unref() {}, resourceUsage() { return {}; } };
+      const proc = { pid: h.pid, exitCode: null, signalCode: null, killed: false, exited: exitedP, ref() {}, unref() {}, resourceUsage() { return __mbunResourceUsage(); } };
       const rec = { cp: null, pid: h.pid, outs: [], stdinFd: h.write, stdinBuf: [], stdinEnded: false, stdinClosed: false, exited: false, closed: false, done: false, code: null, signal: null };
       const terminalObj = {
         cols, rows,
@@ -1898,7 +1908,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
         exited: Promise.resolve(r.status),
         stdout: bunBody(r.stdout), stderr: bunBody(r.stderr),
         stdin: { write() {}, end() {}, flush() {}, close() {} },
-        kill() {}, ref() {}, unref() {}, resourceUsage() { return {}; },
+        kill() {}, ref() {}, unref() {}, resourceUsage() { return __mbunResourceUsage(); },
         [Symbol.dispose]() { this.kill(); },
         [Symbol.asyncDispose]() { this.kill(); return Promise.resolve(); },
       };
@@ -1915,7 +1925,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       const out = {
         pid: r.pid, exitCode: r.status, success: r.status === 0,
         stdout: stdout, stderr: stderr,
-        resourceUsage() { return {}; },
+        resourceUsage() { return __mbunResourceUsage(); },
       };
       // The signal is reported as its NAME when known ("SIGTERM"), falling back
       // to the raw number — get_signal_code returns `sys_sig.name()` and only
@@ -1985,6 +1995,10 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
           text() { return Promise.resolve().then(() => td.decode(drainAll())); },
           json() { return Promise.resolve().then(() => JSON.parse(td.decode(drainAll()))); },
           slice(start, end) { const s = start === undefined ? 0 : (Number(start) || 0); const e = end === undefined ? Infinity : Number(end); const nc = Math.max(0, e - s); return makeStdinBlob(Math.min(cap, nc)); },
+          // BunFile#exists(): fd 0 is always present. It must NOT consume or
+          // resolve the pipe's size (issue #27849: resolving size to 0 for a
+          // pipe made a subsequent read return empty), so it is a pure probe.
+          exists() { return Promise.resolve(true); },
         };
       };
       Bun.stdin = makeStdinBlob(Infinity);

@@ -229,7 +229,155 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
       const MIME = { md: "text/markdown", markdown: "text/markdown", css: "text/css;charset=utf-8", html: "text/html;charset=utf-8", htm: "text/html;charset=utf-8", js: "text/javascript;charset=utf-8", mjs: "text/javascript;charset=utf-8", cjs: "text/javascript;charset=utf-8", ts: "text/javascript;charset=utf-8", tsx: "text/javascript;charset=utf-8", mts: "text/javascript;charset=utf-8", cts: "text/javascript;charset=utf-8", json: "application/json;charset=utf-8", txt: "text/plain;charset=utf-8", xml: "text/xml;charset=utf-8", csv: "text/csv;charset=utf-8", svg: "image/svg+xml", png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp", ico: "image/vnd.microsoft.icon", wasm: "application/wasm", pdf: "application/pdf", zip: "application/zip", woff: "font/woff", woff2: "font/woff2", ttf: "font/ttf", mp3: "audio/mpeg", mp4: "video/mp4", wav: "audio/wav" };
       let __fs;
       const fsModule = () => (__fs || (__fs = require("fs")));
+      const FDN = G.__mbunFdNative;
+      const __te = new TextEncoder();
+      const toU8 = (chunk) => {
+        if (typeof chunk === "string") return __te.encode(chunk);
+        if (chunk instanceof Uint8Array) return chunk;
+        if (ArrayBuffer.isView(chunk)) return new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+        if (chunk instanceof ArrayBuffer) return new Uint8Array(chunk);
+        return __te.encode(String(chunk));
+      };
+      // Bun.file(path|fd).writer([opts]) → FileSink. mbun runs the JS on a single
+      // thread with synchronous fd I/O, so writes flush to the fd immediately.
+      // A partial write to a non-blocking fd (a full socket/pipe kernel buffer)
+      // leaves the tail buffered and the write()/flush()/end() call returns a
+      // Promise that resolves once the buffer drains — bun's backpressure shape.
+      const makeFileSink = (cfg) => {
+        const LIVE = (G.__mbunFileSinkLive || (G.__mbunFileSinkLive = { n: 0 }));
+        LIVE.n++;
+        let finished = false;
+        let fd = -1, ownFd = false, opened = false, closed = false, errored = null;
+        let hwm = (cfg.opts && cfg.opts.highWaterMark) ? (cfg.opts.highWaterMark | 0) : 65536;
+        let buffered = new Uint8Array(0);
+        const openIfNeeded = () => {
+          if (opened || closed) return;
+          if (cfg.fd != null && cfg.fd >= 0) { fd = cfg.fd | 0; ownFd = false; }
+          else { fd = FDN.open(cfg.path, "w", 0o666, cfg.isFifo ? true : false); ownFd = true; }
+          opened = true;
+        };
+        const appendBuf = (u8) => {
+          if (u8.length === 0) return;
+          if (buffered.length === 0) { buffered = u8.slice(); return; }
+          const g = new Uint8Array(buffered.length + u8.length);
+          g.set(buffered); g.set(u8, buffered.length); buffered = g;
+        };
+        // Push as much of `buffered` to the fd as it will take this tick.
+        const drainOnce = () => {
+          if (fd < 0) return 0;
+          let wrote = 0;
+          while (buffered.length > 0) {
+            let n;
+            try { n = FDN.write(fd, buffered, 0, buffered.length, -1); }
+            catch (e) { errored = e; break; }
+            if (n <= 0) break;                       // EAGAIN (-1) or nothing accepted
+            wrote += n;
+            buffered = buffered.length === n ? new Uint8Array(0) : buffered.slice(n);
+          }
+          return wrote;
+        };
+        const finish = () => {
+          if (ownFd && fd >= 0) { try { FDN.close(fd); } catch (e) {} }
+          fd = -1; closed = true; opened = false;
+          if (!finished) { finished = true; LIVE.n--; }
+        };
+        // Resolve `value` once the buffer fully drains, polling a non-blocking fd.
+        // The bounded retry count guarantees the promise always settles (a stalled
+        // peer resolves rather than hanging the single JS thread forever).
+        const drainToPromise = (value) => new Promise((resolve, reject) => {
+          let tries = 0;
+          const poll = () => {
+            drainOnce();
+            if (errored) { reject(errored); return; }
+            if (buffered.length === 0 || ++tries > 30000) { resolve(value); return; }
+            setTimeout(poll, 1);
+          };
+          setTimeout(poll, 1);
+        });
+        return {
+          write(chunk) {
+            if (closed || errored) return 0;               // post-close/-error: no-op, never throw
+            try { openIfNeeded(); } catch (e) { errored = e; return 0; }
+            const u8 = toU8(chunk); const len = u8.length;
+            appendBuf(u8); drainOnce();
+            if (errored || buffered.length === 0) return len;
+            return drainToPromise(len);
+          },
+          flush() {
+            if (closed || errored) return 0;
+            try { openIfNeeded(); } catch (e) { errored = e; return 0; }
+            const wrote = drainOnce();
+            if (errored || buffered.length === 0) return wrote;
+            return drainToPromise(wrote);
+          },
+          end() {
+            if (closed) return 0;
+            try { openIfNeeded(); } catch (e) { errored = e; }
+            drainOnce();
+            if (errored) { finish(); return Promise.reject(errored); }
+            if (buffered.length === 0) { finish(); return 0; }
+            return new Promise((resolve, reject) => {
+              let tries = 0;
+              const poll = () => {
+                drainOnce();
+                if (errored) { finish(); reject(errored); return; }
+                if (buffered.length === 0 || ++tries > 30000) { finish(); resolve(0); return; }
+                setTimeout(poll, 1);
+              };
+              setTimeout(poll, 1);
+            });
+          },
+          start(opts) {
+            opts = opts || {};
+            if (opts.highWaterMark != null) hwm = opts.highWaterMark | 0;
+            if (opts.fd != null && opts.fd >= 0) {
+              if (ownFd && fd >= 0) { try { FDN.close(fd); } catch (e) {} }
+              fd = opts.fd | 0; ownFd = false; opened = true; closed = false; errored = null;
+              cfg.fd = fd; cfg.path = null;
+            } else if (closed) {
+              closed = false; errored = null; opened = false; fd = -1; buffered = new Uint8Array(0);
+            }
+            return this;
+          },
+          ref() { return this; },
+          unref() { return this; },
+        };
+      };
+      // Non-blocking pull reader over an fd: retry EAGAIN on a timer, enqueue what
+      // arrives, and end on read→0 (peer closed). Defers the very first read one
+      // macrotask so a writer created after this stream can open/write first.
+      // `ownsFd` closes the fd on end (fifo we opened) vs leaving it (caller's fd).
+      const makeFdReadStream = (fd, chunkSize, ownsFd) => {
+        const CS = (chunkSize && chunkSize > 0) ? (chunkSize | 0) : 65536;
+        let done = false, firstPull = true;
+        const endStream = () => { done = true; if (ownsFd && fd >= 0) { try { FDN.close(fd); } catch (e) {} } fd = -1; };
+        return new G.ReadableStream({
+          pull(controller) {
+            return new Promise((resolve) => {
+              let tries = 0;
+              const attempt = () => {
+                if (done) { resolve(); return; }
+                const buf = new Uint8Array(CS);
+                let n;
+                try { n = FDN.read(fd, buf, 0, CS, -1); }
+                catch (e) { endStream(); try { controller.error(e); } catch (x) {} resolve(); return; }
+                if (n > 0) { try { controller.enqueue(buf.subarray(0, n)); } catch (x) {} resolve(); return; }
+                if (n === 0) { endStream(); try { controller.close(); } catch (x) {} resolve(); return; }
+                if (++tries > 60000) { endStream(); try { controller.close(); } catch (x) {} resolve(); return; }
+                setTimeout(attempt, 1);
+              };
+              if (firstPull) { firstPull = false; setTimeout(attempt, 0); } else attempt();
+            });
+          },
+          cancel() { endStream(); },
+        });
+      };
+      // Bun.file(fifoPath).stream(chunkSize): open the read end O_RDONLY|O_NONBLOCK
+      // (held so a writer's open(2) does not block) and stream it non-blocking.
+      const makeFifoReadStream = (path, chunkSize) => makeFdReadStream(FDN.open(path, "r", 0o666, true), chunkSize, true);
       const wrapped = function (path, options) {
+        const isFd = typeof path === "number" && Number.isFinite(path);
+        const fdArg = isFd ? (path | 0) : -1;
         const p = String(path && path.href ? path.href : path);
         // A BunFile is LAZY in bun: constructing one does no I/O, and `.size`
         // comes from stat(2). mbun used to read the whole file here (through
@@ -250,11 +398,14 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
         }
         let size = 0;
         let ioerr;
-        try {
-          const st = fsm.statSync(fsPath);
-          if (st.isDirectory()) ioerr = "EISDIR";
-          else size = Number(st.size) || 0;
-        } catch (e) { ioerr = "ENOENT"; }
+        let isFifo = false;
+        if (!isFd) {
+          try {
+            const st = fsm.statSync(fsPath);
+            if (st.isDirectory()) ioerr = "EISDIR";
+            else { size = Number(st.size) || 0; if (st.isFIFO && st.isFIFO()) isFifo = true; }
+          } catch (e) { ioerr = "ENOENT"; }
+        }
         const ext = p.slice(p.lastIndexOf(".") + 1).toLowerCase();
         const type = (options && options.type) || MIME[ext] || "application/octet-stream";
         const f = new G.Blob([], { type });
@@ -264,7 +415,7 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
         slot("__size", size);
         slot("__name", p);
         slot("__lastModified", 0);
-        if (!ioerr) {
+        if (!ioerr && !isFd) {
           const protoU8 = Object.getOwnPropertyDescriptor(G.Blob.prototype, "_u8");
           let loaded = false;   // has the file's content been pulled into __parts?
           // Shadows Blob.prototype's `_u8`: the bytes are pulled off disk the
@@ -347,6 +498,14 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
         // bun carries .exists on Blob.prototype, so it is never an own key of a
         // BunFile: keep it off Object.keys()/JSON.stringify().
         slot("exists", () => { try { return Promise.resolve(fsm.statSync(fsPath).isFile()); } catch (e) { return Promise.resolve(false); } });
+        // Bun.file(...).writer([opts]) → incremental FileSink over the fd.
+        slot("writer", (wopts) => makeFileSink({ path: isFd ? null : fsPath, fd: isFd ? fdArg : -1, isFifo: isFifo, opts: wopts }));
+        // A fifo cannot be read by the synchronous Blob loader (open(2)/read(2)
+        // would block on the peer); stream it non-blocking instead.
+        if (isFifo && !ioerr) slot("stream", (cs) => makeFifoReadStream(fsPath, cs));
+        // A raw fd (e.g. one end of a socket pair) has no synchronous Blob bytes;
+        // stream it non-blocking straight off the descriptor.
+        else if (isFd) slot("stream", (cs) => makeFdReadStream(fdArg, cs, false));
         try { Object.defineProperty(f, "__isBunFile", { value: true, enumerable: false, configurable: true }); } catch (e) {}
         return f;
       };
@@ -2295,6 +2454,15 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
   if (M["bun:internal-for-testing"]) {
     M["bun:internal-for-testing"].highlightJavaScript = (x) => highlightJs(String(x));
     M["bun:internal-for-testing"].highlightJavaScriptRedacted = (x) => highlightJs(redactSecrets(String(x)));
+    // createSocketPair() → [readFd, writeFd]: a connected non-blocking AF_UNIX
+    // stream pair (native), for the FileSink backpressure/leak tests.
+    M["bun:internal-for-testing"].createSocketPair = () => {
+      if (typeof G.__mbunCreateSocketPair !== "function") throw new Error("createSocketPair is not supported on this platform");
+      return G.__mbunCreateSocketPair();
+    };
+    // fileSinkInternals.liveCount(): live FileSink count (JS-tracked on a global
+    // by the Bun.file(...).writer() factory).
+    M["bun:internal-for-testing"].fileSinkInternals = { liveCount: () => (G.__mbunFileSinkLive ? G.__mbunFileSinkLive.n : 0) };
   }
   function highlightJs(text) {
     if (text.length > 2048 || text.length === 0 || /[^\x00-\x7f]/.test(text)) return text;

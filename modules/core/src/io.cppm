@@ -145,6 +145,7 @@ struct OpenOptions {
     bool truncate{false};
     bool exclusive{false};
     bool append{false};
+    bool nonblock{false};
     std::uint32_t mode{0664};
 };
 
@@ -912,6 +913,12 @@ public:
         close_discard_();
     }
 
+    // Take ownership of an already-open native descriptor (e.g. one end of a
+    // socketpair(2)). The handle is closed when the File is destroyed/closed.
+    [[nodiscard]] static File adopt(detail::NativeHandle handle) noexcept {
+        return File{handle, false};
+    }
+
     [[nodiscard]] static Result<File> open(const std::filesystem::path& path,
                                            OpenOptions options = {}) {
         if (auto valid{detail::validate_open_options(options, path)}; !valid) {
@@ -971,6 +978,9 @@ public:
         flags |= options.truncate ? O_TRUNC : 0;
         flags |= options.exclusive ? O_EXCL : 0;
         flags |= options.append ? O_APPEND : 0;
+#if defined(O_NONBLOCK)
+        flags |= options.nonblock ? O_NONBLOCK : 0;
+#endif
 #if defined(O_CLOEXEC)
         flags |= O_CLOEXEC;
 #endif

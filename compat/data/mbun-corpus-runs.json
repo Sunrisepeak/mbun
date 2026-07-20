@@ -1,6 +1,6 @@
 {
   "generated_at": "2026-07-21",
-  "binary": "mbun 2026.07.18.0 (source snapshot, branch fix/corpus-round3)",
+  "binary": "mbun 2026.07.18.0 (source snapshot, branch fix/corpus-round4)",
   "runs": [
     {
       "corpus": "compat/bun/test",
@@ -8,20 +8,20 @@
       "files": 1902,
       "categories": {
         "all-skipped": 73,
-        "blocked-external": 21,
+        "blocked-external": 18,
         "crash": 13,
-        "green": 874,
-        "load-error": 4,
+        "green": 885,
+        "load-error": 5,
         "no-tests": 6,
-        "oom-kill": 3,
-        "test-failure": 861,
-        "timeout": 47
+        "oom-kill": 2,
+        "test-failure": 856,
+        "timeout": 44
       },
       "test_level": {
-        "ran": 52175,
-        "passed": 31818,
-        "failed": 17501,
-        "expects": 464540
+        "ran": 52454,
+        "passed": 32190,
+        "failed": 17404,
+        "expects": 487285
       },
       "notes": "file-level green = every executed test in the file passed and the file reported no out-of-test error; all-skipped / no-tests / blocked-external are separate buckets and are NOT passes. The corpus npm dependencies must be installed first (see compat/README.md) -- without them 264 files die at load; test/node_modules is excluded from discovery so third-party packages do not inflate the corpus"
     },

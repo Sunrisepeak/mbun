@@ -63,6 +63,13 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
       e.code = "ERR_INVALID_ARG_TYPE";
       return e;
     };
+    // node phrases class-valued arg errors as "must be an instance of X".
+    const errArgInstance = (name, cls, value) => {
+      const e = new TypeError(`The "${name}" argument must be an instance of ${cls}. Received ` + received(value));
+      e.code = "ERR_INVALID_ARG_TYPE";
+      return e;
+    };
+    const isU8 = (v) => v instanceof Uint8Array;
     const errOutOfRange = (name, range, value) => {
       const v = typeof value === "bigint" ? value + "n" : String(value);
       const e = new RangeError(`The value of "${name}" is out of range. It must be ${range}. Received ` + v);
@@ -631,7 +638,7 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
     };
     proto.writeUIntLE = function writeUIntLE(value, offset, byteLength) {
       validateByteLength(byteLength);
-      value = +value; offset = offset === undefined ? 0 : offset;
+      value = +value;
       checkInt(value, 0, 2 ** (8 * byteLength) - 1, this, offset, byteLength - 1);
       let mul = 1;
       this[offset] = value & 0xff;
@@ -643,7 +650,7 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
     };
     proto.writeUIntBE = function writeUIntBE(value, offset, byteLength) {
       validateByteLength(byteLength);
-      value = +value; offset = offset === undefined ? 0 : offset;
+      value = +value;
       checkInt(value, 0, 2 ** (8 * byteLength) - 1, this, offset, byteLength - 1);
       let mul = 1;
       this[offset + byteLength - 1] = value & 0xff;
@@ -655,7 +662,7 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
     };
     proto.writeIntLE = function writeIntLE(value, offset, byteLength) {
       validateByteLength(byteLength);
-      value = +value; offset = offset === undefined ? 0 : offset;
+      value = +value;
       const limit = 2 ** (8 * byteLength - 1);
       checkInt(value, -limit, limit - 1, this, offset, byteLength - 1);
       let mul = 1, sub = 0;
@@ -669,7 +676,7 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
     };
     proto.writeIntBE = function writeIntBE(value, offset, byteLength) {
       validateByteLength(byteLength);
-      value = +value; offset = offset === undefined ? 0 : offset;
+      value = +value;
       const limit = 2 ** (8 * byteLength - 1);
       checkInt(value, -limit, limit - 1, this, offset, byteLength - 1);
       let mul = 1, sub = 0;
@@ -681,7 +688,7 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
       }
       return offset + byteLength;
     };
-    proto.readIntLE = function readIntLE(offset = 0, byteLength) {
+    proto.readIntLE = function readIntLE(offset, byteLength) {
       validateByteLength(byteLength);
       checkBounds(this, offset, byteLength - 1);
       let val = this[offset], mul = 1;
@@ -692,7 +699,7 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
       if (val >= mul * 0x80) val -= 2 ** (8 * byteLength);
       return val;
     };
-    proto.readIntBE = function readIntBE(offset = 0, byteLength) {
+    proto.readIntBE = function readIntBE(offset, byteLength) {
       validateByteLength(byteLength);
       checkBounds(this, offset, byteLength - 1);
       let val = this[offset + byteLength - 1], mul = 1;
@@ -705,6 +712,63 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
     };
     proto.writeUintLE = proto.writeUIntLE;
     proto.writeUintBE = proto.writeUIntBE;
+    // Variable-width unsigned reads: node validates byteLength + offset bounds
+    // before touching memory (process_web's naive versions did neither).
+    proto.readUIntLE = function readUIntLE(offset, byteLength) {
+      validateByteLength(byteLength);
+      checkBounds(this, offset, byteLength - 1);
+      let val = this[offset], mul = 1;
+      for (let i = 1; i < byteLength; i++) { mul *= 0x100; val += this[offset + i] * mul; }
+      return val;
+    };
+    proto.readUIntBE = function readUIntBE(offset, byteLength) {
+      validateByteLength(byteLength);
+      checkBounds(this, offset, byteLength - 1);
+      let val = this[offset + byteLength - 1], mul = 1;
+      for (let i = byteLength - 2; i >= 0; i--) { mul *= 0x100; val += this[offset + i] * mul; }
+      return val;
+    };
+    proto.readUintLE = proto.readUIntLE;
+    proto.readUintBE = proto.readUIntBE;
+
+    // ---------------------------------------- fixed-width integer/float I/O
+    // process_web installs naive fixed-width read/write accessors that skip
+    // node's ERR_INVALID_ARG_TYPE (non-number offset) / ERR_OUT_OF_RANGE /
+    // ERR_BUFFER_OUT_OF_BOUNDS argument validation. Re-install them here (this
+    // partition loads after process_web) with node internal/buffer.js checks.
+    const dvFixed = (buf) => new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+    proto.readUInt8 = function readUInt8(offset = 0) { checkBounds(this, offset, 0); return this[offset]; };
+    proto.readInt8 = function readInt8(offset = 0) { checkBounds(this, offset, 0); const v = this[offset]; return v < 128 ? v : v - 256; };
+    proto.readUInt16LE = function readUInt16LE(offset = 0) { checkBounds(this, offset, 1); return dvFixed(this).getUint16(offset, true); };
+    proto.readUInt16BE = function readUInt16BE(offset = 0) { checkBounds(this, offset, 1); return dvFixed(this).getUint16(offset, false); };
+    proto.readInt16LE = function readInt16LE(offset = 0) { checkBounds(this, offset, 1); return dvFixed(this).getInt16(offset, true); };
+    proto.readInt16BE = function readInt16BE(offset = 0) { checkBounds(this, offset, 1); return dvFixed(this).getInt16(offset, false); };
+    proto.readUInt32LE = function readUInt32LE(offset = 0) { checkBounds(this, offset, 3); return dvFixed(this).getUint32(offset, true); };
+    proto.readUInt32BE = function readUInt32BE(offset = 0) { checkBounds(this, offset, 3); return dvFixed(this).getUint32(offset, false); };
+    proto.readInt32LE = function readInt32LE(offset = 0) { checkBounds(this, offset, 3); return dvFixed(this).getInt32(offset, true); };
+    proto.readInt32BE = function readInt32BE(offset = 0) { checkBounds(this, offset, 3); return dvFixed(this).getInt32(offset, false); };
+    proto.readFloatLE = function readFloatLE(offset = 0) { checkBounds(this, offset, 3); return dvFixed(this).getFloat32(offset, true); };
+    proto.readFloatBE = function readFloatBE(offset = 0) { checkBounds(this, offset, 3); return dvFixed(this).getFloat32(offset, false); };
+    proto.readDoubleLE = function readDoubleLE(offset = 0) { checkBounds(this, offset, 7); return dvFixed(this).getFloat64(offset, true); };
+    proto.readDoubleBE = function readDoubleBE(offset = 0) { checkBounds(this, offset, 7); return dvFixed(this).getFloat64(offset, false); };
+    proto.writeUInt8 = function writeUInt8(value, offset = 0) { value = +value; checkInt(value, 0, 0xff, this, offset, 0); this[offset] = value; return offset + 1; };
+    proto.writeInt8 = function writeInt8(value, offset = 0) { value = +value; checkInt(value, -0x80, 0x7f, this, offset, 0); dvFixed(this).setInt8(offset, value); return offset + 1; };
+    proto.writeUInt16LE = function writeUInt16LE(value, offset = 0) { value = +value; checkInt(value, 0, 0xffff, this, offset, 1); dvFixed(this).setUint16(offset, value, true); return offset + 2; };
+    proto.writeUInt16BE = function writeUInt16BE(value, offset = 0) { value = +value; checkInt(value, 0, 0xffff, this, offset, 1); dvFixed(this).setUint16(offset, value, false); return offset + 2; };
+    proto.writeInt16LE = function writeInt16LE(value, offset = 0) { value = +value; checkInt(value, -0x8000, 0x7fff, this, offset, 1); dvFixed(this).setInt16(offset, value, true); return offset + 2; };
+    proto.writeInt16BE = function writeInt16BE(value, offset = 0) { value = +value; checkInt(value, -0x8000, 0x7fff, this, offset, 1); dvFixed(this).setInt16(offset, value, false); return offset + 2; };
+    proto.writeUInt32LE = function writeUInt32LE(value, offset = 0) { value = +value; checkInt(value, 0, 0xffffffff, this, offset, 3); dvFixed(this).setUint32(offset, value, true); return offset + 4; };
+    proto.writeUInt32BE = function writeUInt32BE(value, offset = 0) { value = +value; checkInt(value, 0, 0xffffffff, this, offset, 3); dvFixed(this).setUint32(offset, value, false); return offset + 4; };
+    proto.writeInt32LE = function writeInt32LE(value, offset = 0) { value = +value; checkInt(value, -0x80000000, 0x7fffffff, this, offset, 3); dvFixed(this).setInt32(offset, value, true); return offset + 4; };
+    proto.writeInt32BE = function writeInt32BE(value, offset = 0) { value = +value; checkInt(value, -0x80000000, 0x7fffffff, this, offset, 3); dvFixed(this).setInt32(offset, value, false); return offset + 4; };
+    proto.writeFloatLE = function writeFloatLE(value, offset = 0) { value = +value; checkBounds(this, offset, 3); dvFixed(this).setFloat32(offset, value, true); return offset + 4; };
+    proto.writeFloatBE = function writeFloatBE(value, offset = 0) { value = +value; checkBounds(this, offset, 3); dvFixed(this).setFloat32(offset, value, false); return offset + 4; };
+    proto.writeDoubleLE = function writeDoubleLE(value, offset = 0) { value = +value; checkBounds(this, offset, 7); dvFixed(this).setFloat64(offset, value, true); return offset + 8; };
+    proto.writeDoubleBE = function writeDoubleBE(value, offset = 0) { value = +value; checkBounds(this, offset, 7); dvFixed(this).setFloat64(offset, value, false); return offset + 8; };
+    // node exposes each unsigned accessor under both UInt and Uint spellings.
+    for (const m of ["readUInt8", "readUInt16LE", "readUInt16BE", "readUInt32LE", "readUInt32BE",
+                     "writeUInt8", "writeUInt16LE", "writeUInt16BE", "writeUInt32LE", "writeUInt32BE"])
+      proto[m.replace("UInt", "Uint")] = proto[m];
 
     // ---------------------------------------------------- BigInt accessors
     const dvOf = (buf) => new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
@@ -781,23 +845,34 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
     // no upper bound. process_web.cppm's base compare clamps via subarray and
     // never throws.
     proto.compare = function compare(target, targetStart, targetEnd, sourceStart, sourceEnd) {
-      if (target == null || !ArrayBuffer.isView(target))
-        throw errArgType("target", "Buffer or Uint8Array", target);
+      if (!isU8(target))
+        throw errArgInstance("target", "Buffer or Uint8Array", target);
       const src = this;
+      // node validateOffset: number + integer + range, NO coercion (a string or
+      // { valueOf } offset throws ERR_INVALID_ARG_TYPE / ERR_OUT_OF_RANGE).
       if (targetStart === undefined) targetStart = 0;
-      else { targetStart = Math.trunc(+targetStart) || 0; if (targetStart < 0) throw errOutOfRange("targetStart", ">= 0", targetStart); }
+      else validateOffset(targetStart, "targetStart", 0, 0x7fffffff);
       if (targetEnd === undefined) targetEnd = target.length;
-      else { targetEnd = Math.trunc(+targetEnd) || 0; if (targetEnd < 0 || targetEnd > target.length) throw errOutOfRange("targetEnd", ">= 0 and <= " + target.length, targetEnd); }
+      else validateOffset(targetEnd, "targetEnd", 0, target.length);
       if (sourceStart === undefined) sourceStart = 0;
-      else { sourceStart = Math.trunc(+sourceStart) || 0; if (sourceStart < 0) throw errOutOfRange("sourceStart", ">= 0", sourceStart); }
+      else validateOffset(sourceStart, "sourceStart", 0, 0x7fffffff);
       if (sourceEnd === undefined) sourceEnd = src.length;
-      else { sourceEnd = Math.trunc(+sourceEnd) || 0; if (sourceEnd < 0 || sourceEnd > src.length) throw errOutOfRange("sourceEnd", ">= 0 and <= " + src.length, sourceEnd); }
+      else validateOffset(sourceEnd, "sourceEnd", 0, src.length);
       if (sourceStart >= sourceEnd) return targetStart >= targetEnd ? 0 : -1;
       if (targetStart >= targetEnd) return 1;
       const a = src.subarray(sourceStart, sourceEnd), b = target.subarray(targetStart, targetEnd);
       const n = Math.min(a.length, b.length);
       for (let i = 0; i < n; i++) { if (a[i] < b[i]) return -1; if (a[i] > b[i]) return 1; }
       return a.length < b.length ? -1 : a.length > b.length ? 1 : 0;
+    };
+    // node validates the argument type; process_web's base equals did not.
+    proto.equals = function equals(otherBuffer) {
+      if (!isU8(otherBuffer))
+        throw errArgInstance("otherBuffer", "Buffer or Uint8Array", otherBuffer);
+      if (this === otherBuffer) return true;
+      if (this.length !== otherBuffer.length) return false;
+      for (let i = 0; i < this.length; i++) if (this[i] !== otherBuffer[i]) return false;
+      return true;
     };
     // ----------------------------------- Buffer.from(ab, byteOffset, length)
     const asBuf = (u8) => { Object.setPrototypeOf(u8, proto); return u8; };
@@ -921,6 +996,43 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
     // Buffer.of(...items) — the %TypedArray%.of analogue, returns a Buffer of the
     // given byte values. ref: node lib/buffer.js Buffer.of.
     BufferW.of = function of(...items) { return newFrom(items); };
+
+    // Buffer.compare(buf1, buf2): node type-checks both args (process_web's
+    // static coerced a non-Buffer via Buffer.from and never threw).
+    BufferW.compare = function compare(buf1, buf2) {
+      if (!isU8(buf1)) throw errArgInstance("buf1", "Buffer or Uint8Array", buf1);
+      if (!isU8(buf2)) throw errArgInstance("buf2", "Buffer or Uint8Array", buf2);
+      if (buf1 === buf2) return 0;
+      return proto.compare.call(buf1, buf2);
+    };
+    // Buffer.concat(list[, totalLength]): validate list is an Array and every
+    // entry a Buffer/Uint8Array; totalLength must be a non-negative integer.
+    // Sizes/copies use byteLength so a spoofed `.length` getter cannot expose
+    // uninitialized memory (test-buffer-concat).
+    const kMaxLength = 0x7fffffff;
+    BufferW.concat = function concat(list, length) {
+      if (!Array.isArray(list)) throw errArgInstance("list", "Array", list);
+      if (list.length === 0) return OrigBuffer.alloc(0);
+      let total;
+      if (length === undefined) {
+        total = 0;
+        for (let i = 0; i < list.length; i++) total += (list[i] && list[i].byteLength) || 0;
+      } else {
+        validateOffset(length, "length", 0, kMaxLength);
+        total = length;
+      }
+      const buffer = OrigBuffer.allocUnsafe(total);
+      let pos = 0;
+      for (let i = 0; i < list.length; i++) {
+        const buf = list[i];
+        if (!isU8(buf)) throw errArgInstance("list[" + i + "]", "Buffer or Uint8Array", buf);
+        if (pos >= total) continue;
+        const take = Math.min(buf.byteLength, total - pos);
+        if (take > 0) { buffer.set(buf.subarray(0, take), pos); pos += take; }
+      }
+      if (pos < total) buffer.fill(0, pos);
+      return buffer;
+    };
 
     G.Buffer = BufferW;
 

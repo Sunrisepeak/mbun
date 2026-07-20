@@ -969,7 +969,7 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       createDiffieHellman: () => ({ generateKeys: () => Buffer.alloc(0), computeSecret: () => Buffer.alloc(0), getPrime: () => Buffer.alloc(0), getGenerator: () => Buffer.alloc(0) }),
       // node/bun throw on a length mismatch (ErrorCode.cpp:1552
       // CRYPTO_TIMING_SAFE_EQUAL_LENGTH), they do not return false.
-      timingSafeEqual: (a, b) => { a = toBytes(a); b = toBytes(b); if (a.length !== b.length) { const e = new RangeError("Input buffers must have the same byte length"); e.code = "ERR_CRYPTO_TIMING_SAFE_EQUAL_LENGTH"; throw e; } let d = 0; for (let i = 0; i < a.length; i++) d |= a[i] ^ b[i]; return d === 0; },
+      timingSafeEqual: (a, b) => { const ok = (x) => ArrayBuffer.isView(x) || x instanceof ArrayBuffer; if (!ok(a) || !ok(b)) { const e = new TypeError('The "buf1" argument must be an instance of ArrayBuffer, Buffer, TypedArray, or DataView.'); e.code = "ERR_INVALID_ARG_TYPE"; throw e; } a = toBytes(a); b = toBytes(b); if (a.length !== b.length) { const e = new RangeError("Input buffers must have the same byte length"); e.code = "ERR_CRYPTO_TIMING_SAFE_EQUAL_LENGTH"; throw e; } let d = 0; for (let i = 0; i < a.length; i++) d |= a[i] ^ b[i]; return d === 0; },
       constants: { RSA_PKCS1_PADDING: 1, RSA_PKCS1_OAEP_PADDING: 4 }, webcrypto: G.crypto,
     };
     // node's generateKeyPair has a custom promisify that resolves to an object
@@ -1543,6 +1543,11 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
           out = transferSet && transferSet.has(v) ? v.transfer() : v.slice(0);
           memory.set(v, out); return out;
         }
+        if (G.SharedArrayBuffer && v instanceof G.SharedArrayBuffer) {
+          // SharedArrayBuffer is a distinct type; slice() yields a fresh SAB.
+          if (v.byteLength >= MAX_SERIALIZED) throw dce("Serialized ArrayBuffer is too large.");
+          out = v.slice(0); memory.set(v, out); return out;
+        }
         if (ArrayBuffer.isView(v)) {
           const buf = clone(v.buffer);
           if (v instanceof DataView) out = new DataView(buf, v.byteOffset, v.byteLength);
@@ -1686,8 +1691,8 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
           for (const k of extra) { str(k); write(v[k]); }
           return u32(0xffffffff);
         }
-        if (v instanceof ArrayBuffer) {
-          if (v.detached) throw dce("An ArrayBuffer is detached and could not be cloned.");
+        if (v instanceof ArrayBuffer || (G.SharedArrayBuffer && v instanceof G.SharedArrayBuffer)) {
+          if (v instanceof ArrayBuffer && v.detached) throw dce("An ArrayBuffer is detached and could not be cloned.");
           if (v.byteLength >= MAX_SERIALIZED) throw dce("Serialized ArrayBuffer is too large.");
           poolAdd(v); u8(T.ArrayBuffer); u32(v.byteLength); return bytes(new Uint8Array(v));
         }
@@ -1933,8 +1938,11 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
     };
   }
 
-  // SharedArrayBuffer: single-threaded runtime → alias ArrayBuffer (no real cross-
-  // thread sharing, but construction / typeof / views work). WeakRef/FinalizationRegistry stubs.
+  // SharedArrayBuffer: enabled as a real, distinct JSC type (useSharedArrayBuffer
+  // option, set at engine init) so it is no longer aliased to ArrayBuffer — node
+  // assert deepEqual and util.types can tell the two apart. The runtime is still
+  // single-threaded, so Atomics.wait is emulated below. The alias remains only as a
+  // fallback for a JSC build where the option is unavailable.
   if (typeof G.SharedArrayBuffer === "undefined") G.SharedArrayBuffer = G.ArrayBuffer;
   if (typeof G.Atomics !== "undefined" && typeof G.Atomics.waitAsync !== "function") { try { G.Atomics.waitAsync = (ta, index, value, timeout) => (ta[index] !== value ? { async: false, value: "not-equal" } : { async: true, value: Promise.resolve("ok") }); } catch (e) {} }
   // Atomics.wait: SharedArrayBuffer is aliased to ArrayBuffer (single-threaded), so native wait

@@ -38,6 +38,17 @@ frozen machine or a silently murdered harness.
   directly (`mbun <file>`, exit 0 = pass); node-harness-dependent files count
   as failures, keeping the number honest file-level coverage.
 - `test_members.sh` — `mcpp test` across every workspace member.
+- `corpus_diff.py` — compares two corpus rounds' `results.tsv` and **gates on
+  regressions**: `corpus_diff.py <before-dir> <after-dir>`. Prints per-bucket
+  before→after deltas, the files that went green→non-green (REGRESSIONS) and
+  non-green→green (gains), and the largest assertion-level moves among files
+  that stayed non-green. Exits non-zero on any green→non-green regression so it
+  can gate a merge; `--allow-regressions <manifest>` excuses known-flaky files
+  (fnmatch patterns, same shape as the runner's blocked manifest — e.g. the
+  network-dependent `hosted-git-info`). `--json` emits a machine summary;
+  `--perf` additionally flags files whose `duration_ms` grew past
+  `--perf-threshold` (default 1.5×). Replaces the ad-hoc python one-liners that
+  kept mis-diffing rounds via cwd-drift and stale baselines.
 - `smoke_examples.py` — boots each `examples/` app in turn, requests
   `http://127.0.0.1:3000/`, asserts a 2xx, then reaps the whole process tree
   (`bounded_run.BoundedServer`). Sequential by design: the demos all hardcode
@@ -53,6 +64,7 @@ Every tool has a self-test under `tests/`; run them after touching a runner:
 ```bash
 bash tools/integration/tests/test_bun_corpus_runner.sh
 bash tools/integration/tests/test_node_corpus_runner.sh
+bash tools/integration/tests/test_corpus_diff.sh
 bash tools/integration/tests/test_smoke_examples.sh
 bash benchmarks/tools/test-bench3.sh
 ```

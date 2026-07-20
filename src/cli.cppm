@@ -370,7 +370,6 @@ inline constexpr std::array BUILD_UNSUPPORTED_BOOL_FLAGS {
     std::string_view { "--minify-whitespace" },
     std::string_view { "--minify-identifiers" },
     std::string_view { "--keep-names" },   std::string_view { "--splitting" },
-    std::string_view { "--production" },
     std::string_view { "--watch" },        std::string_view { "--app" },
     std::string_view { "--server-components" },
     std::string_view { "--react-fast-refresh" },
@@ -387,6 +386,13 @@ inline constexpr std::array BUILD_UNSUPPORTED_BOOL_FLAGS {
 // Boolean build flags that are accepted and safely ignored: each is a no-op for
 // a bundle mbun already emits the same way with or without it.
 inline constexpr std::array BUILD_IGNORED_BOOL_FLAGS {
+    // `--bundle` is bun's legacy explicit-bundle switch; `bun build` always
+    // bundles, so mbun (which also always bundles) accepts it as a no-op.
+    // ref: Arguments.rs — `--bundle` is parsed but the bundle path is implied.
+    std::string_view { "--bundle" },
+    // `--production` enables minify + NODE_ENV=production in bun; mbun's bundler
+    // can't minify yet, so it is accepted as a no-op (bun never errors on it).
+    std::string_view { "--production" },
     std::string_view { "--no-clear-screen" },
     std::string_view { "--dump-environment-variables" },
     std::string_view { "--windows-hide-console" },
