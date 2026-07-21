@@ -130,6 +130,13 @@ export constexpr std::string_view kNetJS = R"JS(
 
   // ---- node:net — real Socket / Server over the reactor ----------------------
   const HWM = 64 * 1024;
+  // node net.js Happy-Eyeballs default (getDefault/setDefaultAutoSelectFamily*).
+  // mbun's connect is single-stack so the value is advisory, but the getter/
+  // setter contract (default 2500, floor 10, positive-int validation) is tested.
+  let autoSelectFamilyDefault = false;
+  // node's initial default is 500ms; the test harness (common/index.js) reads it,
+  // multiplies by 5 and re-sets it (→ 2500), which is what tests assert against.
+  let autoSelectFamilyAttemptTimeoutDefault = 500;
   class Socket extends EE {
     constructor(opts) {
       super();
@@ -171,6 +178,38 @@ export constexpr std::string_view kNetJS = R"JS(
           throw nErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "options.host" argument must be of type string. Received ' + (optArg.host === null ? "null" : Array.isArray(optArg.host) ? "an instance of Array" : "type " + typeof optArg.host));
         if (optArg.path == null && optArg.port === undefined && optArg.fd === undefined)
           throw nErr(TypeError, "ERR_MISSING_ARGS", 'The "options" or "port" or "path" argument must be specified');
+        // node net.js lookupAndConnect validation (options form). Types match
+        // validateBoolean / validateInt32(min 1) / isIP / validateNumber /
+        // ERR_INVALID_ARG_TYPE + validatePort, in node's order.
+        if (optArg.autoSelectFamily !== undefined && typeof optArg.autoSelectFamily !== "boolean")
+          throw nErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "options.autoSelectFamily" argument must be of type boolean. Received ' + (typeof optArg.autoSelectFamily === "string" ? "type string ('" + optArg.autoSelectFamily + "')" : "type " + typeof optArg.autoSelectFamily));
+        if (optArg.autoSelectFamilyAttemptTimeout !== undefined) {
+          const t = optArg.autoSelectFamilyAttemptTimeout;
+          if (typeof t !== "number" || !Number.isInteger(t) || t < 1)
+            throw nErr(RangeError, "ERR_OUT_OF_RANGE", 'The value of "options.autoSelectFamilyAttemptTimeout" is out of range. It must be a positive integer greater than 0. Received ' + String(t));
+        }
+        if (optArg.localAddress != null && !isIP(optArg.localAddress))
+          throw nErr(TypeError, "ERR_INVALID_IP_ADDRESS", "Invalid IP address: " + String(optArg.localAddress));
+        if (optArg.localPort != null && typeof optArg.localPort !== "number")
+          throw nErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "options.localPort" argument must be of type number. Received ' + (typeof optArg.localPort === "string" ? "type string ('" + optArg.localPort + "')" : "type " + typeof optArg.localPort));
+        if (optArg.lookup != null && typeof optArg.lookup !== "function")
+          throw nErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "options.lookup" argument must be of type function. Received ' + (typeof optArg.lookup === "object" ? "an instance of " + ((optArg.lookup && optArg.lookup.constructor && optArg.lookup.constructor.name) || "Object") : "type " + typeof optArg.lookup + " (" + String(optArg.lookup) + ")"));
+        if (optArg.hints !== undefined) {
+          const dnsMod = M["dns"] || M["node:dns"] || {};
+          const validMask = (dnsMod.ADDRCONFIG || 0) | (dnsMod.V4MAPPED || 0) | (dnsMod.ALL || 0);
+          const hints = optArg.hints;
+          if (typeof hints !== "number" || (validMask !== 0 && (hints & ~validMask) !== 0))
+            throw nErr(TypeError, "ERR_INVALID_ARG_VALUE", "The argument 'hints' is invalid. Received " + String(hints));
+        }
+        if (optArg.port !== undefined) {
+          const p = optArg.port;
+          if (typeof p !== "number" && typeof p !== "string")
+            throw nErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "options.port" argument must be one of type number or string. Received ' + (p === null ? "null" : Array.isArray(p) ? "an instance of Array" : typeof p === "object" ? "an instance of " + ((p.constructor && p.constructor.name) || "Object") : "type " + typeof p + " (" + String(p) + ")"));
+          if ((typeof p === "string" && p.trim().length === 0) || +p !== (+p >>> 0) || +p > 0xFFFF) {
+            const e = new RangeError('options.port should be >= 0 and < 65536. Received ' + String(p));
+            e.code = "ERR_SOCKET_BAD_PORT"; throw e;
+          }
+        }
       } else if (a.length === 0 || a[0] === undefined || a[0] === null) {
         throw nErr(TypeError, "ERR_MISSING_ARGS", 'The "options" or "port" or "path" argument must be specified');
       }
@@ -179,6 +218,46 @@ export constexpr std::string_view kNetJS = R"JS(
       else { port = +a[0] | 0; if (typeof a[1] === "string") { host = a[1]; cb = typeof a[2] === "function" ? a[2] : null; } else if (typeof a[1] === "function") cb = a[1]; }
       if (cb) this.once("connect", cb);
       this.connecting = true;
+      const self = this;
+      // node net.js blockList / custom-lookup pre-connect resolution. Isolated to
+      // the case where the caller actually passes options.blockList or
+      // options.lookup, so the normal (http/tls/numeric-host) path below is
+      // byte-for-byte unchanged. A resolved address that the BlockList rejects is
+      // ERR_IP_BLOCKED; a lookup that yields a non-4/6 family is
+      // ERR_INVALID_ADDRESS_FAMILY (both surfaced on 'error', as in node).
+      const _blockList = optArg && optArg.blockList;
+      const _lookup = optArg && optArg.lookup;
+      const _famOf = (v) => isIPv6(v) ? 6 : isIPv4(v) ? 4 : 0;
+      if (!unixPath && ((_blockList && _famOf(host)) || _lookup)) {
+        const failWith = (err) => { self.connecting = false; G.queueMicrotask(() => { self.emit("error", err); self.destroy(); }); return self; };
+        const dialResolved = (addr, fam) => {
+          if (fam !== 4 && fam !== 6) { const e = mkErr("Invalid address family: " + fam + " " + host + ":" + port, "ERR_INVALID_ADDRESS_FAMILY"); e.host = host; e.port = port; return failWith(e); }
+          if (_blockList && _blockList.check(addr, fam === 6 ? "ipv6" : "ipv4")) return failWith(mkErr("IP is blocked by net.BlockList", "ERR_IP_BLOCKED"));
+          const dh = (addr === "::1" || addr === "::" || addr === "::0") ? "127.0.0.1" : addr;
+          let fd2;
+          try { fd2 = NN.connect(dh, port); }
+          catch (e) { self.connecting = false; const err = connectError(e, addr, port); G.queueMicrotask(() => { self.emit("error", err); self.destroy(); }); return self; }
+          self._adopt(fd2); self.remotePort = port;
+          G.queueMicrotask(() => { self.emit("connect"); self.emit("ready"); });
+          return self;
+        };
+        const hf = _famOf(host);
+        if (hf) return dialResolved(host, hf);
+        // host needs resolution — drive the caller-supplied lookup (node passes
+        // { family, hints, all }; all is set under autoSelectFamily).
+        const lopts = { family: optArg.family || 0, hints: optArg.hints || 0, all: !!optArg.autoSelectFamily };
+        try {
+          _lookup(host, lopts, (err, address, family) => {
+            if (err) { if (!err.code) err.code = "ENOTFOUND"; return failWith(err); }
+            if (Array.isArray(address)) {
+              if (!address.length) { const e = mkErr("getaddrinfo ENOTFOUND " + host, "ENOTFOUND"); e.host = host; e.port = port; return failWith(e); }
+              return dialResolved(address[0].address, address[0].family);
+            }
+            return dialResolved(address, family);
+          });
+        } catch (e) { return failWith(e instanceof Error ? e : mkErr(String(e), "ERR_INVALID_ARG_TYPE")); }
+        return this;
+      }
       // The reactor's native connect is IPv4 (net.inc net_parse_addr); an IPv6
       // loopback/wildcard (as reported by an IPv6-defaulted server.address())
       // dials the v4 loopback, which the v4-mapped INADDR_ANY listener accepts.
@@ -267,6 +346,20 @@ export constexpr std::string_view kNetJS = R"JS(
     get writableFinished() { return this._shutSent && this._wq.length === 0; }
     write(data, enc, cb) {
       if (typeof enc === "function") { cb = enc; enc = null; }
+      // node stream.Writable chunk validation (test-net-write-arguments): only a
+      // string / Buffer / TypedArray / DataView is a legal chunk; null is a
+      // distinct ERR_STREAM_NULL_VALUES, everything else ERR_INVALID_ARG_TYPE.
+      if (data === null) {
+        const e = new TypeError("May not write null values to stream"); e.code = "ERR_STREAM_NULL_VALUES"; throw e;
+      }
+      if (typeof data !== "string" && !ArrayBuffer.isView(data) && !(data instanceof ArrayBuffer)) {
+        const recv = data === undefined ? ". Received undefined"
+          : (typeof data === "object")
+            ? ". Received an instance of " + ((data && data.constructor && data.constructor.name) || "Object")
+            : ". Received type " + typeof data + " (" + String(data) + ")";
+        const e = new TypeError('The "chunk" argument must be of type string or an instance of Buffer, TypedArray, or DataView.' + recv);
+        e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+      }
       if (this.destroyed || this._shutW) { const err = mkErr("write after end", "ERR_STREAM_WRITE_AFTER_END"); if (typeof cb === "function") G.queueMicrotask(() => cb(err)); else this.emit("error", err); return false; }
       const b = typeof data === "string" && enc && enc !== "utf8" && enc !== "utf-8" && G.Buffer ? u8(G.Buffer.from(data, enc)) : u8(data);
       this._wq.push(b); this._wqLen += b.length; this.bytesWritten += b.length;
@@ -414,6 +507,13 @@ export constexpr std::string_view kNetJS = R"JS(
     constructor(opts, cb) {
       super();
       if (typeof opts === "function") { cb = opts; opts = {}; }
+      // node net.js Server: options must be an object (or a connectionListener
+      // function, handled above). A string/number/etc. is ERR_INVALID_ARG_TYPE.
+      else if (opts != null && typeof opts !== "object") {
+        const e = new TypeError('The "options" argument must be of type object. Received ' +
+          (typeof opts === "string" ? "type string (" + JSON.stringify(opts) + ")" : "type " + typeof opts + " (" + String(opts) + ")"));
+        e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+      }
       this._opts = opts || {};
       if (typeof cb === "function") this.on("connection", cb);
       this._fd = -1; this._addr = null; this.listening = false; this._conns = new Set();
@@ -423,6 +523,18 @@ export constexpr std::string_view kNetJS = R"JS(
     _release() { if (this._refd) { this._refd = false; NET.serveActive--; } }
     listen(...a) {
       let port = 0, host = null, cb = null, unixPath = null;
+      // node lib/internal/validators validatePort (allowZero): every listen form
+      // routes its port through this, so an out-of-range value (e.g. -1>>>0) is a
+      // RangeError ERR_SOCKET_BAD_PORT rather than a silent `| 0` truncation.
+      const validateListenPort = (p) => {
+        if (p == null) return;
+        if ((typeof p !== "number" && typeof p !== "string") ||
+            (typeof p === "string" && p.trim().length === 0) ||
+            +p !== (+p >>> 0) || +p > 0xFFFF) {
+          const e = new RangeError('options.port should be >= 0 and < 65536. Received ' + String(p));
+          e.code = "ERR_SOCKET_BAD_PORT"; throw e;
+        }
+      };
       if (typeof a[0] === "object" && a[0] !== null && typeof a[0] !== "function") {
         const o = a[0];
         // node lib/net.js Server.listen: the options form must carry port/path/fd.
@@ -431,13 +543,13 @@ export constexpr std::string_view kNetJS = R"JS(
           throw new Error('The argument \'options\' must have the property "port" or "path". Received ' + recv);
         }
         if (o.path != null) unixPath = String(o.path);
-        port = o.port | 0;
+        if (o.port != null) { validateListenPort(o.port); port = o.port | 0; }
         if (o.host != null) host = String(o.host);
         if (typeof a[1] === "function") cb = a[1];
       } else {
         // node Server.listen(path[, backlog][, cb]): a non-numeric string first
         // arg is a unix/pipe path; a numeric one is a TCP port.
-        if (typeof a[0] === "number" || (typeof a[0] === "string" && /^\d+$/.test(a[0]))) port = +a[0];
+        if (typeof a[0] === "number" || (typeof a[0] === "string" && /^\d+$/.test(a[0]))) { validateListenPort(a[0]); port = +a[0]; }
         else if (typeof a[0] === "string") unixPath = a[0];
         else if (typeof a[0] === "function") cb = a[0];
         for (let i = 1; i < a.length; i++) { if (typeof a[i] === "string") host = a[i]; else if (typeof a[i] === "function") cb = a[i]; }
@@ -471,6 +583,10 @@ export constexpr std::string_view kNetJS = R"JS(
       this._fd = lh.fd;
       const reportAddr = host === "localhost" ? (isV6 ? "::1" : "127.0.0.1") : host;
       this._addr = { port: lh.port, address: reportAddr, family: isV6 ? "IPv6" : "IPv4" };
+      // node net.js Server: `${addressType}:${address}:${requestedPort}` — the
+      // port is the value passed to listen() (0 for an ephemeral bind), not the
+      // kernel-assigned one (test-net-listen-invalid-port).
+      this._connectionKey = (isV6 ? "6" : "4") + ":" + reportAddr + ":" + port;
       this.listening = true;
       NET.items.add(this);
       this._hold();
@@ -562,8 +678,26 @@ export constexpr std::string_view kNetJS = R"JS(
     }
     return out;
   }
-  const isIPv4 = (value) => parseIPv4(value) !== null;
-  const isIPv6 = (value) => parseIPv6(value) !== null;
+  // node lib/internal/net.js isIPv4/isIPv6 are regex tests: RegExp.test coerces
+  // its argument with String(), so isIP(123) / isIP({toString}) match node's
+  // stringifying behaviour, and the IPv6 form accepts a trailing %zone id
+  // ([0-9a-zA-Z-.:], so "%eth0.0" is valid but "%eth0@1" is not).
+  const v4Seg = "(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])";
+  const v4Str = "(?:" + v4Seg + "[.]){3}" + v4Seg;
+  const IPv4Reg = new RegExp("^" + v4Str + "$");
+  const v6Seg = "(?:[0-9a-fA-F]{1,4})";
+  const IPv6Reg = new RegExp("^(?:" +
+    "(?:" + v6Seg + ":){7}(?:" + v6Seg + "|:)|" +
+    "(?:" + v6Seg + ":){6}(?:" + v4Str + "|:" + v6Seg + "|:)|" +
+    "(?:" + v6Seg + ":){5}(?::" + v4Str + "|(?::" + v6Seg + "){1,2}|:)|" +
+    "(?:" + v6Seg + ":){4}(?:(?::" + v6Seg + "){0,1}:" + v4Str + "|(?::" + v6Seg + "){1,3}|:)|" +
+    "(?:" + v6Seg + ":){3}(?:(?::" + v6Seg + "){0,2}:" + v4Str + "|(?::" + v6Seg + "){1,4}|:)|" +
+    "(?:" + v6Seg + ":){2}(?:(?::" + v6Seg + "){0,3}:" + v4Str + "|(?::" + v6Seg + "){1,5}|:)|" +
+    "(?:" + v6Seg + ":){1}(?:(?::" + v6Seg + "){0,4}:" + v4Str + "|(?::" + v6Seg + "){1,6}|:)|" +
+    "(?::(?:(?::" + v6Seg + "){0,5}:" + v4Str + "|(?::" + v6Seg + "){1,7}|:))" +
+    ")(?:%[0-9a-zA-Z-.:]{1,})?$");
+  const isIPv4 = (value) => IPv4Reg.test(value);
+  const isIPv6 = (value) => IPv6Reg.test(value);
   const isIP = (value) => isIPv4(value) ? 4 : isIPv6(value) ? 6 : 0;
   const mappedV4 = (bytes) => {
     if (!bytes || bytes.length !== 16 || bytes[10] !== 255 || bytes[11] !== 255) return null;
@@ -758,12 +892,70 @@ export constexpr std::string_view kNetJS = R"JS(
 
   const BunObject = G.Bun || (G.Bun = {});
   BunObject.listen = bunListen;
+
+  // node's net.Server / net.Socket are pre-class constructors, so both
+  // `new net.Server()` and the bare factory call `net.Server()` are legal and
+  // its own corpus uses both (test-net-pipe-unref: `net.Server()`; the
+  // connect-buffer/binary/bytes-stats family: `net.Server(onconn)`). mbun
+  // implements them as ES classes, where a call without `new` is a hard
+  // "Cannot call a class constructor Server without |new|". Re-export each class
+  // through a plain-function stand-in that restores the factory form while
+  // keeping construct behaviour, prototype identity, statics and instanceof
+  // intact — the same proven shape used for node:http in node_legacy_ctors.
+  // The prototype's own `constructor` is re-pointed at the stand-in so instances
+  // (including those the reactor builds internally with `new Socket`) report the
+  // exported value as their constructor. Mirrors node lib/net.js.
+  const callable = (Cls) => {
+    const wrapper = function (...args) {
+      if (new.target !== undefined) return Reflect.construct(Cls, args, new.target);
+      // `Ctor.call(this, opts)` (util.inherits subclassing): the receiver's
+      // chain already reaches the class — initialise it in place.
+      if (this !== null && this !== undefined && typeof this === "object" && this instanceof Cls) {
+        Object.defineProperties(this, Object.getOwnPropertyDescriptors(Reflect.construct(Cls, args)));
+        return undefined;
+      }
+      return Reflect.construct(Cls, args);
+    };
+    try {
+      Object.setPrototypeOf(wrapper, Cls);
+      wrapper.prototype = Cls.prototype;
+      Object.defineProperty(wrapper, "name", { value: Cls.name, configurable: true });
+      Object.defineProperty(wrapper, "length", { value: Cls.length, configurable: true });
+      Object.defineProperty(Cls.prototype, "constructor", { value: wrapper, writable: true, configurable: true });
+    } catch (e) { return Cls; }
+    return wrapper;
+  };
+  const ServerW = callable(Server);
+  const SocketW = callable(Socket);
+
+  // node net.js Happy-Eyeballs default accessors. setDefault* runs
+  // validateInt32(value, 'value', 1) (a value < 1 is ERR_OUT_OF_RANGE) and then
+  // floors the attempt timeout at 10ms.
+  const setDefaultAutoSelectFamilyAttemptTimeout = (value) => {
+    if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
+      const e = new RangeError('The value of "value" is out of range. It must be a positive integer greater than 0. Received ' + String(value));
+      e.code = "ERR_OUT_OF_RANGE"; throw e;
+    }
+    autoSelectFamilyAttemptTimeoutDefault = value < 10 ? 10 : value;
+  };
+  const getDefaultAutoSelectFamilyAttemptTimeout = () => autoSelectFamilyAttemptTimeoutDefault;
+  const setDefaultAutoSelectFamily = (value) => {
+    if (typeof value !== "boolean") {
+      const e = new TypeError('The "value" argument must be of type boolean. Received ' + typeof value);
+      e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+    }
+    autoSelectFamilyDefault = value;
+  };
+  const getDefaultAutoSelectFamily = () => autoSelectFamilyDefault;
+
   def(["net"], Object.assign({}, M["net"] || {}, {
-    Socket, Stream: Socket, Server, BlockList,
+    Socket: SocketW, Stream: SocketW, Server: ServerW, BlockList,
     createServer: (o, cb) => new Server(o, cb),
     createConnection: (...a) => new Socket(typeof a[0] === "object" ? a[0] : undefined).connect(...a),
     connect: (...a) => new Socket(typeof a[0] === "object" ? a[0] : undefined).connect(...a),
     isIP, isIPv4, isIPv6,
+    setDefaultAutoSelectFamilyAttemptTimeout, getDefaultAutoSelectFamilyAttemptTimeout,
+    setDefaultAutoSelectFamily, getDefaultAutoSelectFamily,
   }));
 
   // ---- incremental HTTP/1.1 parser (requests and responses) ------------------
