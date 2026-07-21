@@ -97,10 +97,48 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
     // would exceed it must throw ERR_STRING_TOO_LONG *before* any allocation
     // (jsc/bindings/JSBuffer.cpp:jsBufferToStringFromBytes); otherwise a 2 GiB
     // buffer drags the process into an OOM instead of a catchable error.
-    const MAX_STRING_LENGTH = 0x7fffffff;
+    // node lib/buffer.js: kStringMaxLength (V8 String::kMaxLength on 64-bit) is
+    // strictly below kMaxLength, so a Buffer larger than a string is allocatable
+    // yet un-stringifiable (ERR_STRING_TOO_LONG). Our engine's real string max is
+    // INT32_MAX, but exposing the node value keeps toString's cap below the
+    // buffer cap so test-buffer-tostring-rangeerror can allocate-then-fail.
+    const MAX_STRING_LENGTH = 536870888;
     const errStringTooLong = () => {
       const e = new Error("Cannot create a string longer than " + MAX_STRING_LENGTH + " characters");
       e.code = "ERR_STRING_TOO_LONG";
+      return e;
+    };
+    // node's assertSize (lib/buffer.js): non-number -> ERR_INVALID_ARG_TYPE;
+    // negative / NaN / Infinity / > kMaxLength -> ERR_OUT_OF_RANGE.
+    const K_MAX_LENGTH = 0x7fffffff;
+    const assertSize = (size) => {
+      if (typeof size !== "number") throw errArgType("size", "number", size);
+      if (!(size >= 0 && size <= K_MAX_LENGTH))
+        throw errOutOfRange("size", `>= 0 and <= ${K_MAX_LENGTH}`, size);
+    };
+    // Mirrors common.invalidArgTypeHelper / node internal/errors.js so
+    // Buffer.from's "The first argument must be of type ..." message (which uses
+    // the bare-name form, no surrounding quotes) round-trips exactly.
+    const receivedHelper = (input) => {
+      if (input == null) return " Received " + input;
+      if (typeof input === "function") return " Received function " + (input.name || "");
+      if (typeof input === "object") {
+        const cn = input.constructor && input.constructor.name;
+        if (cn) return " Received an instance of " + cn;
+        return " Received [Object: null prototype] {}";
+      }
+      let ins = typeof input === "bigint" ? String(input) + "n"
+        : typeof input === "symbol" ? input.toString()
+        : typeof input === "string" ? "'" + input + "'"
+        : String(input);
+      if (ins.length > 28) ins = ins.slice(0, 25) + "...";
+      return " Received type " + typeof input + " (" + ins + ")";
+    };
+    const errFromArgType = (value) => {
+      const e = new TypeError(
+        "The first argument must be of type string or an instance of " +
+        "Buffer, ArrayBuffer, or Array or an Array-like Object." + receivedHelper(value));
+      e.code = "ERR_INVALID_ARG_TYPE";
       return e;
     };
     const errInvalidBufferSize = (bits) => {
@@ -344,7 +382,9 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
     proto.latin1Write = makeStrictWrite(rawLatin1Write, "latin1Write");
     proto.asciiWrite = makeStrictWrite(rawLatin1Write, "asciiWrite");
     proto.ucs2Write = makeClampWrite(rawUcs2Write, "ucs2Write");
-    proto.utf16leWrite = makeClampWrite(rawUcs2Write, "utf16leWrite");
+    // NB: no utf16leWrite/utf16leSlice own methods — node has none (utf16le is an
+    // encoding alias resolving to ucs2Write/ucs2Slice via OPS), and the extra
+    // properties break test-buffer-generic-methods' prototype-method census.
     proto.hexWrite = makeClampWrite(rawHexWrite, "hexWrite");
     proto.base64Write = makeClampWrite(rawBase64Write, "base64Write");
     proto.base64urlWrite = makeClampWrite(rawBase64Write, "base64urlWrite");
@@ -354,7 +394,6 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
     proto.asciiSlice = makeSlice(rawAsciiSlice, "asciiSlice");
     const rawUcs2SliceEven = (buf, s, e) => rawUcs2Slice(buf, s, s + (((e - s) >>> 1) << 1));
     proto.ucs2Slice = makeSlice(rawUcs2SliceEven, "ucs2Slice");
-    proto.utf16leSlice = makeSlice(rawUcs2SliceEven, "utf16leSlice");
     proto.hexSlice = makeSlice(rawHexSlice, "hexSlice");
     proto.base64Slice = makeSlice(rawBase64Slice, "base64Slice");
     proto.base64urlSlice = makeSlice(rawBase64urlSlice, "base64urlSlice");
@@ -363,8 +402,11 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
     const OPS = {};
     // `cap` = the largest input byte count whose decoded output still fits in a
     // JS string, mirroring jsBufferToStringFromBytes' per-encoding checks.
+    // Store the wrapper FUNCTIONS (writeFn/sliceFn) too, so write()/toString()
+    // can invoke them via .call(this) — a generic `write.call(u8, …)` on a plain
+    // Uint8Array has no `u8.ucs2Write` own method (test-buffer-generic-methods).
     const defOps = (names, write, slice, cap) => {
-      for (const n of names) OPS[n] = { write, slice, cap: cap === undefined ? MAX_STRING_LENGTH : cap };
+      for (const n of names) OPS[n] = { write, slice, writeFn: proto[write], sliceFn: proto[slice], cap: cap === undefined ? MAX_STRING_LENGTH : cap };
     };
     defOps(["utf8", "utf-8"], "utf8Write", "utf8Slice");
     defOps(["ascii"], "asciiWrite", "asciiSlice");
@@ -482,7 +524,7 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
     // ------------------------------------------------ write() / toString()
     proto.write = function write(string, offset, length, encoding) {
       if (offset === undefined) {
-        return this.utf8Write(string, 0, this.length);
+        return OPS.utf8.writeFn.call(this, string, 0, this.length);
       }
       if (length === undefined && typeof offset === "string") {
         encoding = offset;
@@ -500,16 +542,27 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
           if (length > remaining) length = remaining;
         }
       }
-      if (!encoding || encoding === "utf8") return this.utf8Write(string, offset, length);
-      if (encoding === "ascii") return this.asciiWrite(string, offset, length);
+      if (!encoding || encoding === "utf8") return OPS.utf8.writeFn.call(this, string, offset, length);
+      if (encoding === "ascii") return OPS.ascii.writeFn.call(this, string, offset, length);
       const ops = getOps(encoding);
       if (ops === undefined) throw errUnknownEncoding(encoding);
-      return this[ops.write](string, offset, length);
+      return ops.writeFn.call(this, string, offset, length);
     };
 
     proto.toString = function toString(encoding, start, end) {
       const len = this.length;
-      const ops = encoding === undefined ? OPS.utf8 : getOps(encoding);
+      // node slowToString coerces a non-string encoding via `${encoding}` and
+      // retries once, so { toString: () => 'ascii' } resolves; 0 -> "0" and
+      // null -> "null" still fail as ERR_UNKNOWN_ENCODING with the coerced text.
+      let ops;
+      if (encoding === undefined) ops = OPS.utf8;
+      else {
+        ops = getOps(encoding);
+        if (ops === undefined && typeof encoding !== "string") {
+          encoding = `${encoding}`;
+          ops = getOps(encoding);
+        }
+      }
       if (ops === undefined) throw errUnknownEncoding(encoding);
       if (len === 0) return "";
       let s = start === undefined ? 0 : trunc0(start);
@@ -519,7 +572,7 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
       if (e > len) e = len;
       if (e <= s) return "";
       if (e - s > ops.cap) throw errStringTooLong();
-      return this[ops.slice](s, e);
+      return ops.sliceFn.call(this, s, e);
     };
 
     // -------------------------------------------------------------- fill()
@@ -834,9 +887,189 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
     const INSPECT_MAX = { value: 50 };
     proto.inspect = function inspect() {
       const max = INSPECT_MAX.value;
-      let s = rawHexSlice(this, 0, Math.min(this.length, max)).replace(/(.{2})(?=.)/g, "$1 ");
-      if (this.length > max) s += " ... " + (this.length - max) + " more bytes";
-      return "<Buffer" + (s ? " " + s : "") + ">";
+      const n = this.length, shown = n < max ? n : max;
+      let body = rawHexSlice(this, 0, shown).replace(/(.{2})(?=.)/g, "$1 ");
+      if (n > max) { const more = n - max; body += (body ? " " : "") + "... " + more + " more byte" + (more > 1 ? "s" : ""); }
+      // node derives the tag from the receiver's constructor so a plain Uint8Array
+      // renders as "<Uint8Array ...>" (test-buffer-generic-methods custom inspect).
+      const tag = (this.constructor && this.constructor.name) || "Buffer";
+      return "<" + tag + " " + body + ">";
+    };
+    proto.toLocaleString = proto.toString;
+    // node registers the same fn under util.inspect.custom so util.inspect(buf)
+    // and buf.inspect() agree.
+    try { proto[Symbol.for("nodejs.util.inspect.custom")] = proto.inspect; } catch (_) {}
+
+    // node: Buffer.prototype.slice === subarray, both return a VIEW sharing the
+    // parent's memory (process_web's base copied, breaking in-place swap on a
+    // slice). Re-tag the Uint8Array view with the Buffer prototype.
+    proto.subarray = function subarray(start, end) {
+      const v = Uint8Array.prototype.subarray.call(this, start, end);
+      Object.setPrototypeOf(v, proto);
+      return v;
+    };
+    // node's slice delegates to `this.subarray` DYNAMICALLY: on a real Buffer it
+    // yields a Buffer view, but called generically on a plain Uint8Array it stays
+    // a Uint8Array (test-buffer-generic-methods relies on this distinction).
+    proto.slice = function slice(start, end) { return this.subarray(start, end); };
+
+    // node deprecated aliases: `.parent` -> underlying ArrayBuffer, `.offset` ->
+    // byteOffset. Exposed even for zero-length buffers (nodejs/node#8266).
+    // Defensive: the .buffer/.byteOffset getters throw when the receiver is the
+    // prototype itself (not a view); return undefined there so a prototype-method
+    // census (test-buffer-generic-methods) can probe `Buffer.prototype.parent`.
+    if (!Object.getOwnPropertyDescriptor(proto, "parent"))
+      Object.defineProperty(proto, "parent", { get() { try { return this.buffer; } catch (_) { return undefined; } }, configurable: true });
+    if (!Object.getOwnPropertyDescriptor(proto, "offset"))
+      Object.defineProperty(proto, "offset", { get() { try { return this.byteOffset; } catch (_) { return undefined; } }, configurable: true });
+
+    // ------------------------------------------------------ indexOf family
+    // node bidirectionalIndexOf (lib/buffer.js): coerce a string byteOffset slot
+    // to the encoding, then encode a string needle with that encoding (utf8
+    // default); a number needle masks to a byte. Search is byte-level. NaN/-0
+    // offsets fold to the scan start, Infinity lands past the end (no match).
+    const needleBytes = (val, encoding) => {
+      if (typeof val === "string") return fromString(val, encoding);
+      if (isU8(val)) return val;
+      return null;
+    };
+    // `lim` = exclusive upper byte bound on a match (i + needle.length <= lim);
+    // defaults to buf.length, or a caller-supplied clamped `end` (this corpus
+    // extends indexOf with an (value, byteOffset, end[, encoding]) range form).
+    const fwdSearch = (buf, ndl, ofs, lim) => {
+      const nlen = ndl.length;
+      if (ofs < 0) { ofs += buf.length; if (ofs < 0) ofs = 0; }
+      if (nlen === 0) return ofs > lim ? lim : ofs;
+      for (let i = ofs; i + nlen <= lim; i++) {
+        let m = true;
+        for (let j = 0; j < nlen; j++) if (buf[i + j] !== ndl[j]) { m = false; break; }
+        if (m) return i;
+      }
+      return -1;
+    };
+    const bwdSearch = (buf, ndl, ofs, lim) => {
+      const hlen = buf.length, nlen = ndl.length;
+      if (ofs < 0) ofs += hlen;
+      if (nlen === 0) { const p = ofs > lim ? lim : ofs; return p < 0 ? 0 : p; }
+      let start = ofs > lim - nlen ? lim - nlen : ofs;
+      if (start < 0) return -1;
+      for (let i = start; i >= 0; i--) {
+        let m = true;
+        for (let j = 0; j < nlen; j++) if (buf[i + j] !== ndl[j]) { m = false; break; }
+        if (m) return i;
+      }
+      return -1;
+    };
+    // node's C++ indexOfBuffer interprets a ucs2/utf16le search as 16-bit units:
+    // a sub-2-byte needle (or haystack) never matches, and matches land only on
+    // even byte boundaries. Every other encoding is a plain byte scan.
+    const isUcs2Enc = (encoding) => {
+      if (typeof encoding !== "string") return false;
+      const e = encoding.toLowerCase();
+      return e === "ucs2" || e === "ucs-2" || e === "utf16le" || e === "utf-16le";
+    };
+    const fwdSearch2 = (buf, ndl, ofs, lim) => {
+      const nlen = ndl.length;
+      if (ofs < 0) { ofs += buf.length; if (ofs < 0) ofs = 0; }
+      ofs -= ofs % 2; // align to a 16-bit boundary
+      for (let i = ofs; i + nlen <= lim; i += 2) {
+        let m = true;
+        for (let j = 0; j < nlen; j++) if (buf[i + j] !== ndl[j]) { m = false; break; }
+        if (m) return i;
+      }
+      return -1;
+    };
+    const bwdSearch2 = (buf, ndl, ofs, lim) => {
+      const hlen = buf.length, nlen = ndl.length;
+      if (ofs < 0) ofs += hlen;
+      let start = ofs > lim - nlen ? lim - nlen : ofs;
+      start -= ((start % 2) + 2) % 2;
+      if (start < 0) return -1;
+      for (let i = start; i >= 0; i -= 2) {
+        let m = true;
+        for (let j = 0; j < nlen; j++) if (buf[i + j] !== ndl[j]) { m = false; break; }
+        if (m) return i;
+      }
+      return -1;
+    };
+    const bidir = (buf, val, byteOffset, arg3, arg4, dir) => {
+      // node validateBuffer(this): guards against calling indexOf on a non-view
+      // receiver (e.g. `new Buffer.prototype.lastIndexOf(...)`, nodejs#32753).
+      if (!ArrayBuffer.isView(buf)) {
+        const e = new TypeError(
+          'The "buffer" argument must be an instance of Buffer, TypedArray, or DataView.' + receivedHelper(buf));
+        e.code = "ERR_INVALID_ARG_TYPE";
+        throw e;
+      }
+      // A string byteOffset slot IS the encoding (2-arg form). Otherwise arg3 is
+      // either a numeric `end` limit or a string `encoding`; arg4 (if present) is
+      // the encoding that follows a numeric end.
+      let encoding, end;
+      if (typeof byteOffset === "string") { encoding = byteOffset; byteOffset = undefined; }
+      else if (typeof arg3 === "number") { end = arg3; if (typeof arg4 === "string") encoding = arg4; }
+      else if (typeof arg3 === "string") encoding = arg3;
+      const hlen = buf.length;
+      let ofs = byteOffset === undefined ? (dir ? 0 : hlen) : +byteOffset;
+      if (ofs !== ofs) ofs = dir ? 0 : hlen; // NaN -> scan extent
+      let lim = hlen;
+      if (end !== undefined) { let e = +end; if (e !== e) e = hlen; if (e < 0) e = 0; else if (e > hlen) e = hlen; lim = e; }
+      if (typeof val === "number") {
+        const ndl = new Uint8Array([val & 0xff]);
+        return dir ? fwdSearch(buf, ndl, ofs, lim) : bwdSearch(buf, ndl, ofs, lim);
+      }
+      const ndl = needleBytes(val, encoding);
+      if (ndl !== null && isUcs2Enc(encoding)) {
+        if (ndl.length < 2 || hlen < 2) return -1;
+        return dir ? fwdSearch2(buf, ndl, ofs, lim) : bwdSearch2(buf, ndl, ofs, lim);
+      }
+      if (ndl === null) {
+        // node's multi-type ERR_INVALID_ARG_TYPE phrasing ("must be one of type").
+        const e = new TypeError(
+          'The "value" argument must be one of type number or string ' +
+          "or an instance of Buffer or Uint8Array." + receivedHelper(val));
+        e.code = "ERR_INVALID_ARG_TYPE";
+        throw e;
+      }
+      return dir ? fwdSearch(buf, ndl, ofs, lim) : bwdSearch(buf, ndl, ofs, lim);
+    };
+    proto.indexOf = function indexOf(val, byteOffset, arg3, arg4) {
+      return bidir(this, val, byteOffset, arg3, arg4, true);
+    };
+    proto.lastIndexOf = function lastIndexOf(val, byteOffset, arg3, arg4) {
+      return bidir(this, val, byteOffset, arg3, arg4, false);
+    };
+    proto.includes = function includes(val, byteOffset, arg3, arg4) {
+      // Call bidir directly (not this.indexOf) so a generic `includes.call(u8, ...)`
+      // uses the Buffer search, not Uint8Array.prototype.indexOf.
+      return bidir(this, val, byteOffset, arg3, arg4, true) !== -1;
+    };
+
+    // node Buffer.prototype.copy: BYTE-level into the target's underlying buffer
+    // (a Uint16Array target must receive packed bytes, not element-wise coercion;
+    // process_web's target.set coerced). offsets use toInteger (NaN -> 0, floats
+    // truncate, a throwing valueOf propagates). ref: lib/buffer.js _copyActual.
+    proto.copy = function copy(target, targetStart, sourceStart, sourceEnd) {
+      // node copies at the BYTE level into any ArrayBufferView target (a
+      // Uint16Array receives packed bytes), so accept any view, not just U8.
+      if (!ArrayBuffer.isView(this)) throw errArgType("source", "Buffer or Uint8Array", this);
+      if (!ArrayBuffer.isView(target)) throw errArgType("target", "Buffer or Uint8Array", target);
+      const source = this;
+      let ts = targetStart === undefined ? 0 : trunc0(targetStart);
+      if (ts < 0) throw errOutOfRange("targetStart", ">= 0", targetStart);
+      let ss = sourceStart === undefined ? 0 : trunc0(sourceStart);
+      if (ss < 0) throw errOutOfRange("sourceStart", ">= 0", sourceStart);
+      if (ss > source.length) throw errOutOfRange("sourceStart", `<= ${source.length}`, sourceStart);
+      let se = sourceEnd === undefined ? source.length : trunc0(sourceEnd);
+      if (se < 0) throw errOutOfRange("sourceEnd", ">= 0", sourceEnd);
+      if (se > source.length) se = source.length;
+      const targetLen = target.byteLength;
+      if (ts >= targetLen || ss >= se) return 0;
+      let nb = se - ss;
+      if (nb > targetLen - ts) nb = targetLen - ts;
+      const srcBytes = new Uint8Array(source.buffer, source.byteOffset + ss, nb);
+      const tgtBytes = new Uint8Array(target.buffer, target.byteOffset, targetLen);
+      tgtBytes.set(srcBytes, ts);
+      return nb;
     };
 
     // ---------------------------------------- Buffer.prototype.compare
@@ -906,27 +1139,47 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
     const newFrom = function from(value, encodingOrOffset, length) {
       if (typeof value === "string") return fromString(value, encodingOrOffset);
       if (isAnyArrayBuffer(value)) return fromArrayBuffer(value, encodingOrOffset, length);
-      // node lib/buffer.js Buffer.from(object): valueOf coercion, then (array-like
-      // handled by origFrom below), then Symbol.toPrimitive('string').
-      if (value !== null && typeof value === "object" &&
-          value.length === undefined && !ArrayBuffer.isView(value) &&
-          !(value.type === "Buffer" && Array.isArray(value.data))) {
-        const vo = typeof value.valueOf === "function" ? value.valueOf() : value;
-        if (vo !== null && vo !== value && (typeof vo === "string" || typeof vo === "object"))
+      // node lib/buffer.js Buffer.from(object) ORDER: valueOf coercion FIRST (so a
+      // boxed String/Number and a cross-realm String resolve), then the array-like
+      // / {type:'Buffer',data} object shapes, then Symbol.toPrimitive('string').
+      if (value !== null && typeof value === "object") {
+        // fromObject's array-like fast path takes priority over valueOf when the
+        // object is genuinely indexable (a real Uint8Array/Array/Buffer-view),
+        // but a boxed String is length-bearing too — node still prefers its
+        // string valueOf. Detect that by checking valueOf yields a *different*
+        // primitive/string/object first.
+        const vo = typeof value.valueOf === "function" ? value.valueOf() : undefined;
+        if (vo != null && vo !== value && (typeof vo === "string" || typeof vo === "object"))
           return from(vo, encodingOrOffset, length);
+        // node fromObject: array-like / {buffer:<AnyArrayBuffer>} first. A
+        // non-number length (e.g. { buffer: sab }) yields an empty buffer, NOT a
+        // throw (test-buffer-sharedarraybuffer's `Buffer.from({ buffer: sab })`).
+        if (value.length !== undefined || isAnyArrayBuffer(value.buffer)) {
+          if (typeof value.length !== "number") return OrigBuffer.alloc(0);
+          return origFrom.call(OrigBuffer, value, encodingOrOffset, length);
+        }
+        if (value.type === "Buffer" && Array.isArray(value.data))
+          return origFrom.call(OrigBuffer, value.data);
         const sp = value[Symbol.toPrimitive];
         if (typeof sp === "function") {
           const prim = sp.call(value, "string");
           if (typeof prim === "string") return fromString(prim, encodingOrOffset);
         }
       }
-      return origFrom.call(OrigBuffer, value, encodingOrOffset, length);
+      throw errFromArgType(value);
     };
 
     // Thin callable wrapper sharing OrigBuffer.prototype so the deprecated
     // `new Buffer(str, enc)` / `new Buffer(ab, offset, length)` forms take the
     // same paths as Buffer.from.
     const BufferW = function Buffer(value, encodingOrOffset, length) {
+      // node: Buffer(number) / new Buffer(number) === Buffer.alloc(number)
+      // (zero-filled, size-validated) since the unsafe-by-default era ended. A
+      // string 2nd arg alongside a numeric size is rejected (test-buffer-new).
+      if (typeof value === "number") {
+        if (typeof encodingOrOffset === "string") throw errArgType("string", "string", value);
+        assertSize(value); return OrigBuffer.alloc(value);
+      }
       if (typeof value === "string") return fromString(value, encodingOrOffset);
       if (isAnyArrayBuffer(value)) return fromArrayBuffer(value, encodingOrOffset, length);
       if (new.target) return Reflect.construct(OrigBuffer, [value, encodingOrOffset, length]);
@@ -953,7 +1206,22 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
       return byteLengthFor(string, enc === undefined ? "utf8" : enc);
     };
     BufferW.poolSize = 8192;
-    BufferW.allocUnsafeSlow = function allocUnsafeSlow(size) { return OrigBuffer.allocUnsafe(size); };
+    // node validates size on every allocator (assertSize). The underlying class
+    // coerces/ignores bad sizes silently, so re-wrap alloc/allocUnsafe here.
+    BufferW.alloc = function alloc(size, fill, encoding) {
+      assertSize(size);
+      return OrigBuffer.alloc(size, fill, encoding);
+    };
+    BufferW.allocUnsafe = function allocUnsafe(size) {
+      assertSize(size);
+      return OrigBuffer.allocUnsafe(size);
+    };
+    // allocUnsafeSlow: a STANDALONE (non-pooled) buffer, so buf.buffer.byteLength
+    // === size exactly (test-buffer-slow). node zero-init is fine here.
+    BufferW.allocUnsafeSlow = function allocUnsafeSlow(size) {
+      assertSize(size);
+      return asBuf(new Uint8Array(size));
+    };
     // Same resolver as from()/byteLength() -- bun's isEncoding is a bare
     // parseEnumeration<BufferEncodingType> null-check (JSBuffer.cpp).
     BufferW.isEncoding = function isEncoding(encoding) {
@@ -1070,10 +1338,23 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
         if (mod.INSPECT_MAX_BYTES === undefined) {
           Object.defineProperty(mod, "INSPECT_MAX_BYTES", {
             get: () => INSPECT_MAX.value,
-            set: (v) => { INSPECT_MAX.value = v; },
+            // node validates the assignment: non-number -> ERR_INVALID_ARG_TYPE,
+            // NaN / negative -> ERR_OUT_OF_RANGE (test-buffer-set-inspect-max-bytes).
+            set: (v) => {
+              if (typeof v !== "number") throw errArgType("INSPECT_MAX_BYTES", "number", v);
+              if (Number.isNaN(v) || v < 0) throw errOutOfRange("INSPECT_MAX_BYTES", ">= 0", v);
+              INSPECT_MAX.value = v;
+            },
             enumerable: true,
             configurable: true,
           });
+        }
+        // node buffer.constants.MAX_STRING_LENGTH / kStringMaxLength: the V8
+        // string cap, strictly below kMaxLength (test-buffer-constants /
+        // test-buffer-tostring-rangeerror). process_web seeds MAX_LENGTH only.
+        if (mod.kStringMaxLength === undefined) mod.kStringMaxLength = MAX_STRING_LENGTH;
+        if (mod.constants && typeof mod.constants === "object" && mod.constants.MAX_STRING_LENGTH === undefined) {
+          try { mod.constants.MAX_STRING_LENGTH = MAX_STRING_LENGTH; } catch (_) {}
         }
         M["buffer"] = M["node:buffer"] = mod;
       }
