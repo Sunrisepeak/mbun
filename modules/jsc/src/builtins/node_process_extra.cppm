@@ -303,6 +303,48 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
     // isBun marker (bun sets 1).
     if (!proc.isBun) proc.isBun = 1;
 
+    // ---- process.env special-object semantics (node lib/internal/*) ---------
+    // node's process.env is a proxy-like object: string keys/values only
+    // (assigning a Symbol key OR a Symbol value throws TypeError; every value is
+    // String()-coerced), and Object.defineProperty is restricted to a
+    // configurable+writable+enumerable *data* descriptor. All reads/enumeration
+    // stay transparent to the backing object, so only `set` and `defineProperty`
+    // need trapping (get/has/delete/ownKeys default to the target).
+    try {
+      if (proc.env && typeof proc.env === "object" && !proc.env.__mbunEnvProxy) {
+        const backing = proc.env;
+        const invalidDefine = (msg) => {
+          const e = new TypeError(msg);
+          e.code = "ERR_INVALID_OBJECT_DEFINE_PROPERTY";
+          return e;
+        };
+        const envProxy = new Proxy(backing, {
+          set(target, key, value) {
+            if (typeof key === "symbol") throw new TypeError("Cannot convert a Symbol value to a string");
+            if (typeof value === "symbol") throw new TypeError("Cannot convert a Symbol value to a string");
+            const k = String(key);
+            // node ignores an empty variable name (test-process-env).
+            if (k === "") return true;
+            target[k] = String(value);
+            return true;
+          },
+          defineProperty(target, key, desc) {
+            if ("get" in desc || "set" in desc)
+              throw invalidDefine("'process.env' does not accept an accessor(getter/setter) descriptor");
+            if (desc.configurable !== true || desc.writable !== true || desc.enumerable !== true)
+              throw invalidDefine("'process.env' only accepts a configurable, writable, and enumerable data descriptor");
+            if (typeof key === "symbol") throw new TypeError("Cannot convert a Symbol value to a string");
+            target[String(key)] = String(desc.value);
+            return true;
+          },
+        });
+        try {
+          Object.defineProperty(backing, "__mbunEnvProxy", { value: true, enumerable: false, configurable: true });
+        } catch (e) {}
+        proc.env = envProxy;
+      }
+    } catch (e) {}
+
     // uptime(): seconds since process start; the test asserts it tracks
     // performance.now()/1000, which shares the same origin.
     if (typeof proc.uptime !== "function")
@@ -507,6 +549,20 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
             }
             value = { TTY, isTTY: (fd) => { try { return !!(ttyMod && ttyMod.isatty(fd)); } catch (e) { return false; } } };
           }
+          else if (name === "util") {
+            // node process.binding("util") exposes the type predicates that
+            // util.types is built from (node_util.cc). The test asserts the
+            // binding's functions are IDENTICAL to util.types[k], so pull them
+            // straight from the util module rather than reimplementing.
+            const ut = (() => { try { return G.require ? G.require("util").types : null; } catch (e) { return null; } })();
+            const keys = ["isAnyArrayBuffer", "isArrayBuffer", "isArrayBufferView",
+              "isAsyncFunction", "isDataView", "isDate", "isExternal", "isMap",
+              "isMapIterator", "isNativeError", "isPromise", "isRegExp", "isSet",
+              "isSetIterator", "isTypedArray", "isUint8Array"];
+            const u = {};
+            if (ut) for (const k of keys) if (typeof ut[k] === "function") u[k] = ut[k];
+            value = u;
+          }
           else value = {};
         }
         return (cache[name] = value);
@@ -569,6 +625,73 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
     }
     if (!Array.isArray(proc.moduleLoadList)) proc.moduleLoadList = [];
     if (!Array.isArray(proc._preload_modules)) proc._preload_modules = [];
+
+    // ---- chdir arg-type validation (node ERR_INVALID_ARG_TYPE) --------------
+    // node validateString(directory, 'directory'); a non-string (or missing)
+    // argument throws before touching the filesystem (test-process-chdir).
+    try {
+      if (typeof proc.chdir === "function") {
+        const origChdir = proc.chdir.bind(proc);
+        proc.chdir = function chdir(directory) {
+          if (typeof directory !== "string") throw errInvalidArgType("directory", "string", directory);
+          return origChdir(directory);
+        };
+      }
+    } catch (e) {}
+
+    // ---- nextTick callback validation ---------------------------------------
+    // node: if the first argument is not a function, throw ERR_INVALID_ARG_TYPE
+    // synchronously (test-process-next-tick). Delegate to the real scheduler.
+    try {
+      if (typeof proc.nextTick === "function") {
+        const origNextTick = proc.nextTick;
+        proc.nextTick = function nextTick(callback) {
+          if (typeof callback !== "function") throw errInvalidArgType("callback", "function", callback);
+          return origNextTick.apply(this, arguments);
+        };
+      }
+    } catch (e) {}
+
+    // ---- setSourceMapsEnabled boolean validation ----------------------------
+    // node validateBoolean(val, 'val') (test-process-setsourcemapsenabled).
+    try {
+      let smEnabled = false;
+      proc.setSourceMapsEnabled = function setSourceMapsEnabled(val) {
+        if (typeof val !== "boolean") throw errInvalidArgType("val", "boolean", val);
+        smEnabled = val;
+      };
+      if (typeof proc.getSourceMapsEnabled !== "function")
+        proc.getSourceMapsEnabled = function getSourceMapsEnabled() { return smEnabled; };
+    } catch (e) {}
+
+    // ---- process.features shape (node lib/internal/bootstrap/node.js) -------
+    // test-process-features asserts EXACTLY these 13 keys, all booleans (quic
+    // may be undefined, typescript may be a string — booleans satisfy both).
+    try {
+      const f = proc.features || (proc.features = {});
+      const defaults = {
+        inspector: false, debug: false, uv: true, ipv6: true,
+        openssl_is_boringssl: false, quic: false, tls_alpn: true, tls_sni: true,
+        tls_ocsp: true, tls: true, cached_builtins: true, require_module: true,
+        typescript: false,
+      };
+      for (const k in defaults) if (typeof f[k] === "undefined") f[k] = defaults[k];
+    } catch (e) {}
+
+    // ---- process.abort ------------------------------------------------------
+    // A method-shorthand function has no `.prototype` and is non-constructable,
+    // matching node's C++ builtin (test-process-abort checks both). Never called
+    // by the test; the body is a best-effort SIGABRT.
+    if (typeof proc.abort !== "function") {
+      const abortImpl = {
+        abort() {
+          try { if (typeof proc.kill === "function" && typeof proc.pid === "number") proc.kill(proc.pid, "SIGABRT"); } catch (e) {}
+          try { if (typeof proc.reallyExit === "function") return proc.reallyExit(134); } catch (e) {}
+          try { return proc.exit(134); } catch (e) {}
+        },
+      };
+      proc.abort = abortImpl.abort;
+    }
 
     // ---- uncaughtException capture callback registry ------------------------
     if (typeof proc.setUncaughtExceptionCaptureCallback !== "function") {
@@ -648,6 +771,16 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
       if (variables.host_arch === undefined) variables.host_arch = proc.arch || "x64";
       if (variables.target_arch === undefined) variables.target_arch = proc.arch || "x64";
       if (config.target_defaults === undefined) config.target_defaults = {};
+      // node deep-freezes process.config (lib/internal/bootstrap/node.js): in
+      // strict mode `process.config.variables = 42` must throw a TypeError
+      // (test-process-config). Freeze after populating.
+      const deepFreeze = (o) => {
+        if (o && typeof o === "object" && !Object.isFrozen(o)) {
+          Object.freeze(o);
+          for (const k of Object.keys(o)) deepFreeze(o[k]);
+        }
+      };
+      deepFreeze(config);
     } catch (e) {}
 
     try {

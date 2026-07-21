@@ -814,7 +814,18 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       if (extras.length) head += " {\n" + extras.join("\n") + "\n" + "  ".repeat(depth) + "}";
       return head;
     }
-    if (G.Buffer && G.Buffer.isBuffer && G.Buffer.isBuffer(v)) return "<Buffer " + Array.from(v).map((x) => x.toString(16).padStart(2, "0")).join(" ") + ">";
+    if (G.Buffer && G.Buffer.isBuffer && G.Buffer.isBuffer(v)) {
+      // node lib/buffer.js: truncate the byte dump at buffer.INSPECT_MAX_BYTES
+      // (default 50) with a " ... N more byte(s)" tail (singular for 1). Empty
+      // buffer renders as "<Buffer >" (the space is part of the prefix).
+      let max = 50;
+      try { const bm = G.__mbunNativeModules && G.__mbunNativeModules.buffer; if (bm && typeof bm.INSPECT_MAX_BYTES === "number") max = bm.INSPECT_MAX_BYTES; } catch (_) {}
+      const n = v.length, shown = n < max ? n : max;
+      let body = "";
+      for (let i = 0; i < shown; i++) body += (i ? " " : "") + v[i].toString(16).padStart(2, "0");
+      if (n > max) { const more = n - max; body += (body ? " " : "") + "... " + more + " more byte" + (more > 1 ? "s" : ""); }
+      return "<Buffer " + body + ">";
+    }
     if (bun) {
       if (v instanceof Number) return "[Number: " + Number(v) + "]";
       if (v instanceof Boolean) return "[Boolean: " + Boolean(v) + "]";

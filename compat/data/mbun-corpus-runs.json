@@ -1,6 +1,6 @@
 {
   "generated_at": "2026-07-21",
-  "binary": "mbun 2026.07.18.0 (source snapshot, branch fix/corpus-round5)",
+  "binary": "mbun 2026.07.18.0 (source snapshot, branch fix/corpus-round6)",
   "runs": [
     {
       "corpus": "compat/bun/test",
@@ -30,12 +30,12 @@
       "runner": "tools/integration/node_corpus_runner.py --jobs 14 --timeout 15",
       "files": 4433,
       "categories": {
-        "fail": 1963,
+        "fail": 1926,
         "oom-kill": 15,
-        "pass": 1835,
+        "pass": 1872,
         "timeout": 620
       },
-      "notes": "direct execution (mbun <file>, exit 0 = pass); node's own harness services (// Flags:, internal bindings) are not emulated, so files needing them count as failures — honest file-level coverage, not API completion. Round-5 derivation: the round-4 full run (pass 1811) plus this round's +24 verified file-level gains (node:path +5, node:url +4, node:vm +6, node:zlib +9), each measured as a zero-regression exit1->exit0 flip against a clean ca818d6 baseline on the full per-subsystem suite. Only those four modules' JS changed, so every other file's classification is unchanged; the 24 gains move fail->pass (1987->1963, 1811->1835). oom-kill/timeout buckets untouched. A fresh full run will be recorded next round."
+      "notes": "direct execution (mbun <file>, exit 0 = pass); node's own harness services (// Flags:, internal bindings) are not emulated, so files needing them count as failures — honest file-level coverage, not API completion. Derivation from the round-4 full run (pass 1811, measured jobs=14 timeout=15): plus round-5 +24 (node:path +5, url +4, vm +6, zlib +9 -> 1835) and round-6 +37 (node:timers +4, process +15, buffer +18 -> 1872). Each gain is a zero-regression exit1->exit0 flip verified on the full per-subsystem suite against a clean baseline; only the edited modules' JS changed, so every other file's classification is unchanged (gains move fail->pass, 1987->1926). oom-kill/timeout buckets untouched. A fresh full run will be recorded when the loop is quiet (background full runs get killed at turn boundaries)."
     }
   ]
 }

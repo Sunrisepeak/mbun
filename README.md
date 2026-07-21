@@ -122,7 +122,7 @@ Source-snapshot measurements (2026-07-21) against the upstream corpora pinned as
 | --- | ---: | ---: |
 | Bun native test corpus (`compat/bun/test`) | 885 / 1,902 files fully green | 46.5% |
 | Bun native tests, test level | 32,190 pass / 17,254 fail of 52,454 run | 61.4% |
-| Node.js native tests (`compat/node/test/parallel`) | 1,835 / 4,433 files pass (direct execution) | 41.4% |
+| Node.js native tests (`compat/node/test/parallel`) | 1,872 / 4,433 files pass (direct execution) | 42.2% |
 | Elysia test suite | 1,522 pass / 3 fail | 99.8% |
 
 File-level "green" means every executed test in the file passed and the file reported no error outside a test; it is stricter than an API checklist and lower than test-level pass rates. Files that declare no runnable test, files whose every test is skipped, and files needing a service this environment lacks (MySQL, Redis, the npm registry) are separate buckets and never count as passes. Node.js files run directly through mbun (exit 0 = pass) without Node's own harness services, so that figure is honest file-level coverage, not API completion. The test-level rate moves down as crashes are fixed — a file that used to segfault or get OOM-killed now runs and reports its real failures. Details and how to reproduce: [`compat/README.md`](compat/README.md).

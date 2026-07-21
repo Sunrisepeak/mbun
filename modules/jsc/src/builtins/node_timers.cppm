@@ -39,9 +39,22 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
     const oSetImmediate = G.setImmediate, oClearImmediate = G.clearImmediate;
     if (typeof oSetTimeout !== "function" || typeof oSetInterval !== "function") return;
 
+    // node validateFunction(callback, "callback"): a non-function callback to
+    // setTimeout/setInterval/setImmediate throws ERR_INVALID_ARG_TYPE (a
+    // TypeError). See lib/timers.js.
+    const __recv = (v) => (v === null ? "null" : typeof v === "object" ? "an instance of " + ((v.constructor && v.constructor.name) || "Object") : typeof v === "string" ? "type string ('" + v + "')" : "type " + typeof v + " (" + String(v) + ")");
+    const __invalidCb = (v) => { const e = new TypeError('The "callback" argument must be of type function. Received ' + __recv(v)); e.code = "ERR_INVALID_ARG_TYPE"; return e; };
+
     const KIND = Symbol("mbun.timerKind");
     const STATE = Symbol("mbun.timerState");
     const registry = new Map(); // numeric id -> timer object (timeouts/intervals)
+    // process.getActiveResourcesInfo() tracking: node reports both setTimeout
+    // and setInterval handles as 'Timeout', and setImmediate as 'Immediate'.
+    // A timeout/interval stays active until it is destroyed (fires or cleared);
+    // an Immediate is dropped just before its callback runs (node semantics —
+    // test-process-getactiveresources-track-timer-lifetime asserts 0 inside).
+    const activeTimeouts = new Set();
+    const activeImmediates = new Set();
 
     const idOf = (t) => { try { const n = +t; return Number.isSafeInteger(n) ? n : null; } catch (_) { return null; } };
 
@@ -56,6 +69,9 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
       if (kind !== "immediate") {
         const id = idOf(t);
         if (id !== null) registry.set(id, t);
+        activeTimeouts.add(t);
+      } else {
+        activeImmediates.add(t);
       }
       // unref()/ref() must chain (node returns the timer).
       const oUnref = t.unref, oRef = t.ref;
@@ -72,6 +88,7 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
           t._destroyed = false;
           const id = idOf(t);
           if (id !== null) registry.set(id, t);
+          activeTimeouts.add(t);
           return t;
         };
       }
@@ -83,6 +100,8 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
       t._destroyed = true;
       const id = idOf(t);
       if (id !== null) registry.delete(id);
+      activeTimeouts.delete(t);
+      activeImmediates.delete(t);
     }
 
     function clearNative(t) {
@@ -109,7 +128,7 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
     };
 
     const mySetTimeout = function setTimeout(cb, ms, ...args) {
-      if (typeof cb !== "function") return oSetTimeout(cb, ms, ...args); // preserve native error behavior
+      if (typeof cb !== "function") throw __invalidCb(cb);
       _checkCountdown(ms);
       const state = { gen: 0, ms, args };
       state.run = function (...a) {
@@ -124,7 +143,8 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
       return initTimer(t, "timeout", state);
     };
     const mySetInterval = function setInterval(cb, ms, ...args) {
-      if (typeof cb !== "function") return oSetInterval(cb, ms, ...args);
+      if (typeof cb !== "function") throw __invalidCb(cb);
+      _checkCountdown(ms);
       const state = { gen: 0, ms, args };
       const t = oSetInterval(cb, ms, ...args);
       state.timer = t;
@@ -132,10 +152,12 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
       return initTimer(t, "interval", state);
     };
     const mySetImmediate = function setImmediate(cb, ...args) {
-      if (typeof cb !== "function") return oSetImmediate(cb, ...args);
+      if (typeof cb !== "function") throw __invalidCb(cb);
       const state = { gen: 0 };
       state.run = function (...a) {
         const g = state.gen;
+        // node drops the Immediate from the active set before its callback runs.
+        if (state.timer) activeImmediates.delete(state.timer);
         try { return cb.apply(this, a); }
         finally { if (state.gen === g && state.timer) destroyTimer(state.timer); }
       };
@@ -264,10 +286,17 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
         },
       };
     }
-    const scheduler = {
-      wait: (delay, options) => tpSetTimeout(delay, undefined, options),
-      yield: () => tpSetImmediate(),
-    };
+    // node exposes `scheduler` as an instance of an unconstructable Scheduler
+    // class: `new scheduler.constructor()` must throw ERR_ILLEGAL_CONSTRUCTOR.
+    let __schedAllow = false;
+    class Scheduler {
+      constructor() { if (!__schedAllow) { const e = new TypeError("Illegal constructor"); e.code = "ERR_ILLEGAL_CONSTRUCTOR"; throw e; } }
+      wait(delay, options) { return tpSetTimeout(delay, undefined, options); }
+      yield() { return tpSetImmediate(); }
+    }
+    __schedAllow = true;
+    const scheduler = new Scheduler();
+    __schedAllow = false;
 
     // Upgrade the existing timers/promises module object IN PLACE so any
     // captured references (timers.promises, prior imports) see the new impls.
@@ -293,6 +322,21 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
     G.clearTimeout = myClearTimeout;
     G.clearInterval = myClearInterval;
     G.clearImmediate = myClearImmediate;
+
+    // process.getActiveResourcesInfo(): report active timer resources (node
+    // groups setTimeout+setInterval as 'Timeout', setImmediate as 'Immediate').
+    // Installed unconditionally so it wins over the []-returning stub regardless
+    // of partition order.
+    try {
+      if (G.process) {
+        G.process.getActiveResourcesInfo = function getActiveResourcesInfo() {
+          const out = [];
+          for (let i = 0; i < activeTimeouts.size; i++) out.push("Timeout");
+          for (let i = 0; i < activeImmediates.size; i++) out.push("Immediate");
+          return out;
+        };
+      }
+    } catch (_) {}
 
     const timersMod = M["timers"] || M["node:timers"] || {};
     timersMod.setTimeout = mySetTimeout;
