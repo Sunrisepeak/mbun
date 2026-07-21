@@ -400,9 +400,9 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   // ---- Console#table (https://console.spec.whatwg.org/#table) --------------
   // Blueprint: bun src/js/builtins/ConsoleObject.ts:180-250 (tableChars +
   // renderRow/table, itself node's lib/internal/cli_table.js) and :645-739 (the
-  // `table` method). Cells are CENTER-padded: `" ".repeat(needed)` truncates a
-  // fractional count while the right pad ceils it, so an odd leftover space goes
-  // to the right — that asymmetry is load-bearing for the expected output.
+  // `table` method, itself node lib/internal/cli_table.js). Cells are LEFT-aligned:
+  // node pads each cell on the RIGHT to the column's display width (the leading/
+  // trailing single space come from tableChars.left/middle/right).
   const tableChars = { middleMiddle: "─", rowMiddle: "┼", topRight: "┐", topLeft: "┌", leftMiddle: "├",
                        topMiddle: "┬", bottomRight: "┘", bottomLeft: "└", bottomMiddle: "┴",
                        rightMiddle: "┤", left: "│ ", right: " │", middle: " │ " };
@@ -412,8 +412,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     let out = tableChars.left;
     for (let i = 0; i < row.length; i++) {
       const cell = row[i];
-      const needed = (widths[i] - tableCellWidth(cell)) / 2;
-      out += " ".repeat(needed) + cell + " ".repeat(Math.ceil(needed));
+      out += cell + " ".repeat(Math.max(0, widths[i] - tableCellWidth(cell)));
       if (i !== row.length - 1) out += tableChars.middle;
     }
     return out + tableChars.right;
@@ -502,7 +501,136 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     values.unshift(indexKeyArray);
     return final(keys, values);
   };
-  class Console { constructor(out) { const o = out && out.stdout ? out : { stdout: out }; Object.assign(this, G.console); const colorMode = o.colorMode === undefined ? "auto" : o.colorMode; const io = o.inspectOptions; const colorsFor = (s) => colorMode === "auto" ? !!(s && s.isTTY) : !!colorMode; const fmt = (s, a) => util.formatWithOptions(Object.assign({}, io, { colors: colorsFor(s) }), ...a) + "\n"; this.log = this.info = (...a) => { (o.stdout && o.stdout.write) ? o.stdout.write(fmt(o.stdout, a)) : G.console.log(...a); }; this.error = this.warn = (...a) => { (o.stderr && o.stderr.write) ? o.stderr.write(fmt(o.stderr, a)) : G.console.error(...a); }; this.table = (data, props) => consoleTableImpl((s) => this.log(s), Object.assign({}, io, { colors: colorsFor(o.stdout) }), data, props); } }
+  // node:console — faithful port of node lib/internal/console/constructor.js.
+  // Console instances own per-instance state (streams, group indent, count/time
+  // maps); their public methods live on Console.prototype as method shorthands
+  // (non-constructable + correctly named) and are bound to the instance in the
+  // constructor.
+  const kColorInspectOptions = { colors: true };
+  const kNoColorInspectOptions = {};
+  const kGroupIndent = Symbol("kGroupIndent");
+  const kGroupIndentWidth = Symbol("kGroupIndentWidth");
+  const kColorMode = Symbol("kColorMode");
+  const kInspectOptions = Symbol("kInspectOptions");
+  const kCounts = Symbol("counts");
+  const kTimes = Symbol("times");
+  const kWriteToConsole = Symbol("kWriteToConsole");
+  const kGetInspectOptions = Symbol("kGetInspectOptions");
+  const kUseStdout = Symbol("stdout");
+  const kUseStderr = Symbol("stderr");
+  const conNowNs = () => (G.Bun && Bun.nanoseconds ? Bun.nanoseconds() : (G.performance && G.performance.now ? G.performance.now() * 1e6 : 0));
+  const conFormatDur = (ns) => { const ms = ns / 1e6; if (ms >= 1000) return (ms / 1000).toFixed(3) + "s"; return ms.toFixed(3) + "ms"; };
+  // matches compat/node/test/common/index.js invalidArgTypeHelper.
+  const conArgTypeHelper = (input) => {
+    if (input == null) return " Received " + input;
+    if (typeof input === "function") return " Received function " + input.name;
+    if (typeof input === "object") { if (input.constructor && input.constructor.name) return " Received an instance of " + input.constructor.name; return " Received " + util.inspect(input, { depth: -1 }); }
+    let inspected = util.inspect(input, { colors: false });
+    if (inspected.length > 28) inspected = inspected.slice(0, 25) + "...";
+    return " Received type " + (typeof input) + " (" + inspected + ")";
+  };
+  const mkConErr = (Ctor, code, msg) => { const e = new Ctor(msg); e.code = code; return e; };
+  const conValidateInteger = (v, name, min, max) => {
+    if (typeof v !== "number") throw mkConErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "' + name + '" argument must be of type number.' + conArgTypeHelper(v));
+    if (!Number.isInteger(v)) throw mkConErr(RangeError, "ERR_OUT_OF_RANGE", 'The value of "' + name + '" is out of range. It must be an integer. Received ' + v);
+    if (v < min || v > max) throw mkConErr(RangeError, "ERR_OUT_OF_RANGE", 'The value of "' + name + '" is out of range. It must be >= ' + min + " && <= " + max + ". Received " + v);
+  };
+  const consoleMethods = {
+    log(...args) { this[kWriteToConsole](kUseStdout, util.formatWithOptions(this[kGetInspectOptions](this._stdout), ...args)); },
+    warn(...args) { this[kWriteToConsole](kUseStderr, util.formatWithOptions(this[kGetInspectOptions](this._stderr), ...args)); },
+    dir(object, options) { this[kWriteToConsole](kUseStdout, util.inspect(object, Object.assign({ customInspect: false }, this[kGetInspectOptions](this._stdout), options))); },
+    time(label = "default") { label = `${label}`; if (this[kTimes].has(label)) return; this[kTimes].set(label, conNowNs()); },
+    timeEnd(label = "default") { label = `${label}`; const t = this[kTimes].get(label); if (t === undefined) return; this[kWriteToConsole](kUseStdout, label + ": " + conFormatDur(conNowNs() - t)); this[kTimes].delete(label); },
+    timeLog(label = "default", ...data) { label = `${label}`; const t = this[kTimes].get(label); if (t === undefined) return; this.log(label + ": " + conFormatDur(conNowNs() - t), ...data); },
+    trace(...args) { this[kWriteToConsole](kUseStderr, "Trace: " + util.formatWithOptions(this[kGetInspectOptions](this._stderr), ...args)); },
+    assert(expression, ...args) { if (!expression) { args[0] = "Assertion failed" + (args.length === 0 ? "" : ": " + args[0]); this.warn(...args); } },
+    clear() { const s = this._stdout; if (s && s.isTTY && typeof s.write === "function") { s.write("[1;1H"); s.write("[0J"); } },
+    count(label = "default") { label = `${label}`; const counts = this[kCounts]; let count = counts.get(label); if (count === undefined) count = 1; else count++; counts.set(label, count); this[kWriteToConsole](kUseStdout, label + ": " + count); },
+    countReset(label = "default") { label = `${label}`; const counts = this[kCounts]; if (counts.has(label)) counts.delete(label); },
+    group(...data) { if (data.length > 0) this.log(...data); this[kGroupIndent] += " ".repeat(this[kGroupIndentWidth]); },
+    groupEnd() { this[kGroupIndent] = this[kGroupIndent].slice(0, this[kGroupIndent].length - this[kGroupIndentWidth]); },
+    table(tabularData, properties) { return consoleTableImpl((s) => this.log(s), this[kGetInspectOptions](this._stdout), tabularData, properties); },
+  };
+  consoleMethods.debug = consoleMethods.log;
+  consoleMethods.info = consoleMethods.log;
+  consoleMethods.dirxml = consoleMethods.log;
+  consoleMethods.error = consoleMethods.warn;
+  consoleMethods.groupCollapsed = consoleMethods.group;
+  function Console(options /* or: stdout, stderr, ignoreErrors */) {
+    if (!(this instanceof Console)) return Reflect.construct(Console, arguments);
+    if (!options || typeof options.write === "function") {
+      options = { stdout: options, stderr: arguments[1], ignoreErrors: arguments[2] };
+    }
+    let stdout = options.stdout, stderr = options.stderr, ignoreErrors = options.ignoreErrors,
+        colorMode = options.colorMode, inspectOptions = options.inspectOptions, groupIndentation = options.groupIndentation;
+    if (stderr === undefined) stderr = stdout;
+    if (ignoreErrors === undefined) ignoreErrors = true;
+    if (colorMode === undefined) colorMode = "auto";
+    if (!stdout || typeof stdout.write !== "function") throw mkConErr(TypeError, "ERR_CONSOLE_WRITABLE_STREAM", "Console expects a writable stream instance for stdout");
+    if (!stderr || typeof stderr.write !== "function") throw mkConErr(TypeError, "ERR_CONSOLE_WRITABLE_STREAM", "Console expects a writable stream instance for stderr");
+    if (typeof colorMode !== "boolean" && colorMode !== "auto") throw mkConErr(TypeError, "ERR_INVALID_ARG_VALUE", "The argument 'colorMode' must be one of: 'auto', true, false. Received " + util.inspect(colorMode));
+    if (groupIndentation !== undefined) conValidateInteger(groupIndentation, "groupIndentation", 0, 1000);
+    if (typeof inspectOptions === "object" && inspectOptions !== null) {
+      if (inspectOptions.colors !== undefined && options.colorMode !== undefined)
+        throw mkConErr(TypeError, "ERR_INCOMPATIBLE_OPTION_PAIR", 'Option "options.inspectOptions.color" cannot be used in combination with option "colorMode"');
+    } else if (inspectOptions !== undefined) {
+      throw mkConErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "options.inspectOptions" property must be of type object.' + conArgTypeHelper(inspectOptions));
+    }
+    const na = (value) => ({ writable: true, enumerable: false, configurable: true, value });
+    Object.defineProperties(this, {
+      "_stdout": na(stdout), "_stderr": na(stderr), "_ignoreErrors": na(Boolean(ignoreErrors)),
+      [kColorMode]: na(colorMode),
+      [kInspectOptions]: na((typeof inspectOptions === "object" && inspectOptions !== null) ? inspectOptions : undefined),
+      [kCounts]: na(new Map()), [kTimes]: na(new Map()),
+      [kGroupIndent]: na(""), [kGroupIndentWidth]: na(groupIndentation === undefined ? 2 : groupIndentation),
+    });
+    const keys = Object.keys(Console.prototype);
+    for (let i = 0; i < keys.length; i++) {
+      const key = keys[i];
+      this[key] = this[key].bind(this);
+      Object.defineProperty(this[key], "name", { value: key, configurable: true });
+    }
+  }
+  Object.assign(Console.prototype, consoleMethods);
+  Object.defineProperties(Console.prototype, {
+    [kGetInspectOptions]: { writable: true, configurable: true, value: function (stream) {
+      let color = this[kColorMode];
+      if (color === "auto") color = !!(stream && stream.isTTY && (typeof stream.getColorDepth !== "function" || stream.getColorDepth() > 2));
+      let opts = this[kInspectOptions];
+      if (opts) {
+        // Per-stream options: inspectOptions may be a Map from stream -> options.
+        if (opts instanceof Map) opts = opts.get(stream);
+        if (opts) {
+          if (opts.colors === undefined && color !== undefined) { const o = Object.assign({}, opts); o.colors = color; return o; }
+          return opts;
+        }
+      }
+      return color ? kColorInspectOptions : kNoColorInspectOptions;
+    } },
+    [kWriteToConsole]: { writable: true, configurable: true, value: function (streamSymbol, string) {
+      const ignoreErrors = this._ignoreErrors;
+      const groupIndent = this[kGroupIndent];
+      const useStdout = streamSymbol === kUseStdout;
+      const stream = useStdout ? this._stdout : this._stderr;
+      if (groupIndent && groupIndent.length !== 0) {
+        if (string.indexOf("\n") !== -1) string = string.replace(/\n/g, "\n" + groupIndent);
+        string = groupIndent + string;
+      }
+      string += "\n";
+      if (ignoreErrors === false) { stream.write(string); return; }
+      try {
+        // With ignoreErrors, swallow write failures. A Writable whose write
+        // reports an error (sync throw, or async via its callback / 'error'
+        // event) would otherwise surface as an unhandled rejection, so make sure
+        // an 'error' listener is present before writing. A stack-overflow
+        // RangeError is always rethrown — console must never hide it.
+        if (typeof stream.listenerCount === "function" && typeof stream.once === "function" && stream.listenerCount("error") === 0) stream.once("error", () => {});
+        stream.write(string);
+      } catch (e) {
+        if (e instanceof RangeError) throw e;
+      }
+    } },
+  });
   // console.clear() — node lib/internal/console/constructor.js: writes the
   // terminal reset sequence when stdout is a TTY, and is a no-op otherwise.
   if (typeof G.console.clear !== "function") {
@@ -540,17 +668,64 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       return wrote;
     };
   }
-  const consoleMod = Object.assign(Object.create(null), G.console, { Console });
   G.console.Console = Console;
-  M["console"] = M["node:console"] = consoleMod;
-  // The global console is a Console instance: its methods are own props, so
-  // re-parenting to Console.prototype keeps them and makes `console instanceof
-  // Console` true. _stdout/_stderr mirror process.stdout/stderr as non-enumerable
-  // data props. ref bun src/js/node/console.ts (global console = new Console).
+  // require('console') returns the global console object itself (node semantics:
+  // `require('console') === globalThis.console`).
+  M["console"] = M["node:console"] = G.console;
+  // The global console shares Console.prototype (so `console instanceof Console`
+  // holds and its inherited methods resolve), but keeps its OWN native
+  // log/warn/error/info/debug (which publish the console.* diagnostics channels
+  // and route through process.stdout/stderr) — we only correct their name/arity
+  // for the methods test. The auxiliary methods are taken from Console.prototype
+  // and bound to the global console so global and instances share one impl.
   try { Object.setPrototypeOf(G.console, Console.prototype); } catch (e) {}
+  const naGlobal = (value) => ({ writable: true, enumerable: false, configurable: true, value });
+  try {
+    Object.defineProperties(G.console, {
+      "_ignoreErrors": naGlobal(true),
+      [kColorMode]: naGlobal("auto"),
+      [kInspectOptions]: naGlobal(undefined),
+      [kCounts]: naGlobal(new Map()),
+      [kTimes]: naGlobal(new Map()),
+      [kGroupIndent]: naGlobal(""),
+      [kGroupIndentWidth]: naGlobal(2),
+    });
+  } catch (e) {}
   if (G.process) {
     try { Object.defineProperty(G.console, "_stdout", { value: G.process.stdout, writable: true, enumerable: false, configurable: true }); } catch (e) {}
     try { Object.defineProperty(G.console, "_stderr", { value: G.process.stderr, writable: true, enumerable: false, configurable: true }); } catch (e) {}
+  }
+  // Auxiliary methods: bind the prototype impls to the global console, correcting
+  // each function's name (bind() would otherwise yield "bound <name>").
+  const conAuxMethods = ["dir", "time", "timeEnd", "timeLog", "trace", "assert", "clear", "count", "countReset", "group", "groupEnd", "table", "dirxml", "groupCollapsed"];
+  for (const key of conAuxMethods) {
+    try {
+      const fn = Console.prototype[key].bind(G.console);
+      Object.defineProperty(fn, "name", { value: key, configurable: true });
+      Object.defineProperty(G.console, key, { value: fn, writable: true, enumerable: false, configurable: true });
+    } catch (e) {}
+  }
+  // Correct the name/constructability of the native log/warn/error/info/debug
+  // WITHOUT altering their behavior. The native console only owns some of these
+  // (log/error); the rest (info/debug → log, warn → error) must be aliased to the
+  // native OWN functions here so that markdown_web's later format-wrapper wraps a
+  // real native function — NOT the unbound Console.prototype method, which needs
+  // `this` and would crash when the wrapper invokes it bare. Each replacement is
+  // a computed-name method shorthand (non-constructable, correctly named) that
+  // delegates to the native impl bound to the global console.
+  {
+    const ownFn = (k) => { const d = Object.getOwnPropertyDescriptor(G.console, k); return d && typeof d.value === "function" ? d.value : null; };
+    const nativeLog = ownFn("log");
+    const nativeErr = ownFn("error") || nativeLog;
+    const aliasBase = { info: nativeLog, debug: nativeLog, warn: nativeErr };
+    for (const key of ["log", "error", "info", "warn", "debug"]) {
+      try {
+        const orig = ownFn(key) || aliasBase[key] || nativeLog;
+        if (typeof orig !== "function") continue;
+        const holder = { [key](...a) { return orig.apply(G.console, a); } };
+        Object.defineProperty(G.console, key, { value: holder[key], writable: true, enumerable: true, configurable: true });
+      } catch (e) {}
+    }
   }
 
   // ---- Web/node globals: TextEncoder/TextDecoder, Buffer, btoa/atob ----

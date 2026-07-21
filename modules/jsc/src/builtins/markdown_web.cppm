@@ -336,7 +336,11 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       // real bun's console.log output === Bun.inspect(x). util.inspect stays
       // node-style for node:util tests. ref bun ConsoleObject format path.
       const inspect1 = (x) => (typeof x === "string" ? x : (G.Bun && Bun.inspect ? Bun.inspect(x) : util.inspect(x)));
-      con[meth] = function (...a) { if (typeof a[0] === "string" && /%[sdifjoOc%]/.test(a[0])) native(util.format(...a)); else native(a.map(inspect1).join(" ")); };
+      // Computed-name method shorthand: keeps the correct `.name` (the test
+      // test-console-methods asserts console.log.name === 'log') and is
+      // non-constructable (`new console.log()` must throw), unlike a plain
+      // function expression.
+      con[meth] = ({ [meth](...a) { if (typeof a[0] === "string" && /%[sdifjoOc%]/.test(a[0])) native(util.format(...a)); else native(a.map(inspect1).join(" ")); } })[meth];
     }
   }
 

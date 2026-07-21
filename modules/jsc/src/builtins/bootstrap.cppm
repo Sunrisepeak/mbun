@@ -757,7 +757,10 @@ inline constexpr char kBootstrapJS_[] = R"JS(
         const kind = (cn === "AsyncFunction" || cn === "GeneratorFunction" || cn === "AsyncGeneratorFunction") ? cn : "Function";
         return n ? "[" + kind + ": " + n + "]" : "[" + kind + "]";
       }
-      const tag = v.toString().startsWith("class") ? "class" : "Function"; return n ? "[" + tag + ": " + n + "]" : "[" + tag + " (anonymous)]";
+      // Use Function.prototype.toString (not v.toString()) so a user-defined
+      // toString override is never invoked during inspection (test-console-not-
+      // call-toString / node util.inspect semantics).
+      const tag = Function.prototype.toString.call(v).startsWith("class") ? "class" : "Function"; return n ? "[" + tag + ": " + n + "]" : "[" + tag + " (anonymous)]";
     }
     if (seen.has(v)) return "[Circular *1]";
     // nodejs.util.inspect.custom dispatch: an object exposing a callable custom
