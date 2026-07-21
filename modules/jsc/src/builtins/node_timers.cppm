@@ -48,6 +48,13 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
     const KIND = Symbol("mbun.timerKind");
     const STATE = Symbol("mbun.timerState");
     const registry = new Map(); // numeric id -> timer object (timeouts/intervals)
+    // process.getActiveResourcesInfo() tracking: node reports both setTimeout
+    // and setInterval handles as 'Timeout', and setImmediate as 'Immediate'.
+    // A timeout/interval stays active until it is destroyed (fires or cleared);
+    // an Immediate is dropped just before its callback runs (node semantics —
+    // test-process-getactiveresources-track-timer-lifetime asserts 0 inside).
+    const activeTimeouts = new Set();
+    const activeImmediates = new Set();
 
     const idOf = (t) => { try { const n = +t; return Number.isSafeInteger(n) ? n : null; } catch (_) { return null; } };
 
@@ -62,6 +69,9 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
       if (kind !== "immediate") {
         const id = idOf(t);
         if (id !== null) registry.set(id, t);
+        activeTimeouts.add(t);
+      } else {
+        activeImmediates.add(t);
       }
       // unref()/ref() must chain (node returns the timer).
       const oUnref = t.unref, oRef = t.ref;
@@ -78,6 +88,7 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
           t._destroyed = false;
           const id = idOf(t);
           if (id !== null) registry.set(id, t);
+          activeTimeouts.add(t);
           return t;
         };
       }
@@ -89,6 +100,8 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
       t._destroyed = true;
       const id = idOf(t);
       if (id !== null) registry.delete(id);
+      activeTimeouts.delete(t);
+      activeImmediates.delete(t);
     }
 
     function clearNative(t) {
@@ -143,6 +156,8 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
       const state = { gen: 0 };
       state.run = function (...a) {
         const g = state.gen;
+        // node drops the Immediate from the active set before its callback runs.
+        if (state.timer) activeImmediates.delete(state.timer);
         try { return cb.apply(this, a); }
         finally { if (state.gen === g && state.timer) destroyTimer(state.timer); }
       };
@@ -307,6 +322,21 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
     G.clearTimeout = myClearTimeout;
     G.clearInterval = myClearInterval;
     G.clearImmediate = myClearImmediate;
+
+    // process.getActiveResourcesInfo(): report active timer resources (node
+    // groups setTimeout+setInterval as 'Timeout', setImmediate as 'Immediate').
+    // Installed unconditionally so it wins over the []-returning stub regardless
+    // of partition order.
+    try {
+      if (G.process) {
+        G.process.getActiveResourcesInfo = function getActiveResourcesInfo() {
+          const out = [];
+          for (let i = 0; i < activeTimeouts.size; i++) out.push("Timeout");
+          for (let i = 0; i < activeImmediates.size; i++) out.push("Immediate");
+          return out;
+        };
+      }
+    } catch (_) {}
 
     const timersMod = M["timers"] || M["node:timers"] || {};
     timersMod.setTimeout = mySetTimeout;
