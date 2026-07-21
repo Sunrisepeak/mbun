@@ -74,6 +74,33 @@ inline constexpr std::string_view kNodeOsJS = R"JS(
       return e;
     };
 
+    // node validateInt32 shape: ERR_INVALID_ARG_TYPE for non-numbers,
+    // ERR_OUT_OF_RANGE for non-integers or out-of-[min,max]. Messages match
+    // node's (only the leading clause is asserted by the corpus tests).
+    const osArgType = (name, actual) => {
+      let recv;
+      if (actual === null) recv = "null";
+      else if (typeof actual === "object") recv = "an instance of " + ((actual && actual.constructor && actual.constructor.name) || "Object");
+      else if (typeof actual === "string") recv = "type string ('" + actual + "')";
+      else recv = "type " + typeof actual + " (" + String(actual) + ")";
+      const e = new TypeError('The "' + name + '" argument must be of type number. Received ' + recv);
+      e.code = "ERR_INVALID_ARG_TYPE";
+      return e;
+    };
+    const osOutOfRange = (name, actual) => {
+      const e = new RangeError('The value of "' + name + '" is out of range. It must be an integer. Received ' + String(actual));
+      e.code = "ERR_OUT_OF_RANGE";
+      return e;
+    };
+    const validateInt32 = (value, name, min, max) => {
+      if (typeof value !== "number") throw osArgType(name, value);
+      if (!Number.isInteger(value)) throw osOutOfRange(name, value);
+      if (min === undefined) min = -2147483648;
+      if (max === undefined) max = 2147483647;
+      if (value < min || value > max) throw osOutOfRange(name, value);
+      return value;
+    };
+
     const prevOs = M["os"] || M["node:os"] || {};
     const constants = prevOs.constants || {};
 
@@ -84,7 +111,8 @@ inline constexpr std::string_view kNodeOsJS = R"JS(
       endianness: function () { return END; },
       freemem: function () { return ON.freemem(); },
       getPriority: function (pid) {
-        const r = ON.getPriority(pid === undefined ? 0 : pid | 0);
+        if (pid === undefined) pid = 0; else validateInt32(pid, "pid");
+        const r = ON.getPriority(pid);
         if (!r.ok) throw sysErr("uv_os_getpriority", r.errno | 0);
         return r.value;
       },
@@ -97,7 +125,10 @@ inline constexpr std::string_view kNodeOsJS = R"JS(
       release: function () { return U.release || ""; },
       setPriority: function (pid, prio) {
         if (prio === undefined) { prio = pid; pid = 0; }
-        const r = ON.setPriority(pid | 0, prio | 0);
+        validateInt32(pid, "pid");
+        const pr = constants.priority || {};
+        validateInt32(prio, "priority", pr.PRIORITY_HIGHEST, pr.PRIORITY_LOW);
+        const r = ON.setPriority(pid, prio);
         if (!r.ok) throw sysErr("uv_os_setpriority", r.errno | 0);
         return undefined;
       },
@@ -124,6 +155,13 @@ inline constexpr std::string_view kNodeOsJS = R"JS(
       devNull: platform() === "win32" ? "\\\\.\\nul" : "/dev/null",
       EOL: platform() === "win32" ? "\r\n" : "\n",
     };
+
+    // os.EOL is a non-writable (but configurable) data property: assigning to
+    // it throws TypeError in strict mode, while Object.defineProperty can still
+    // redefine it (node lib/os.js does exactly this).
+    Object.defineProperty(os, "EOL", {
+      value: os.EOL, writable: false, enumerable: true, configurable: true,
+    });
 
     // node implements Symbol.toPrimitive (not toString) on these getters so
     // `os.hostname + ""` coerces to the value instead of the function source.
