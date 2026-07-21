@@ -122,10 +122,11 @@ Source-snapshot measurements (2026-07-21) against the upstream corpora pinned as
 | --- | ---: | ---: |
 | Bun native test corpus (`compat/bun/test`) | 885 / 1,902 files fully green | 46.5% |
 | Bun native tests, test level | 32,190 pass / 17,254 fail of 52,454 run | 61.4% |
-| Node.js native tests (`compat/node/test/parallel`) | 1,912 / 4,433 files pass (direct execution) | 43.1% |
+| Node.js native tests (`compat/node/test/parallel`) | 1,974 / 4,433 files pass (direct execution) | 44.5% |
+| Node.js native tests, excluding node-private/harness files | 1,961 / 4,082 files pass | 48.0% |
 | Elysia test suite | 1,522 pass / 3 fail | 99.8% |
 
-File-level "green" means every executed test in the file passed and the file reported no error outside a test; it is stricter than an API checklist and lower than test-level pass rates. Files that declare no runnable test, files whose every test is skipped, and files needing a service this environment lacks (MySQL, Redis, the npm registry) are separate buckets and never count as passes. Node.js files run directly through mbun (exit 0 = pass) without Node's own harness services, so that figure is honest file-level coverage, not API completion. The test-level rate moves down as crashes are fixed — a file that used to segfault or get OOM-killed now runs and reports its real failures. Details and how to reproduce: [`compat/README.md`](compat/README.md).
+File-level "green" means every executed test in the file passed and the file reported no error outside a test; it is stricter than an API checklist and lower than test-level pass rates. Files that declare no runnable test, files whose every test is skipped, and files needing a service this environment lacks (MySQL, Redis, the npm registry) are separate buckets and never count as passes. Node.js files run directly through mbun (exit 0 = pass) without Node's own harness services, so that figure is honest file-level coverage, not API completion. The second Node.js row excludes the 351 files that require Node's **private internals** (`--expose-internals` / `require('internal/*')`) — those test Node's own implementation guts, are not a contract a runtime promises (no real package uses them), and Bun/Deno skip them too; the 44.5% headline still counts them as failures, and 48.0% is the contract-compat ceiling once they are set aside. The test-level rate moves down as crashes are fixed — a file that used to segfault or get OOM-killed now runs and reports its real failures. Details and how to reproduce: [`compat/README.md`](compat/README.md).
 
 ## Related projects
 
