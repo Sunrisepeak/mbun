@@ -336,7 +336,11 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       // real bun's console.log output === Bun.inspect(x). util.inspect stays
       // node-style for node:util tests. ref bun ConsoleObject format path.
       const inspect1 = (x) => (typeof x === "string" ? x : (G.Bun && Bun.inspect ? Bun.inspect(x) : util.inspect(x)));
-      con[meth] = function (...a) { if (typeof a[0] === "string" && /%[sdifjoOc%]/.test(a[0])) native(util.format(...a)); else native(a.map(inspect1).join(" ")); };
+      // Computed-name method shorthand: keeps the correct `.name` (the test
+      // test-console-methods asserts console.log.name === 'log') and is
+      // non-constructable (`new console.log()` must throw), unlike a plain
+      // function expression.
+      con[meth] = ({ [meth](...a) { if (typeof a[0] === "string" && /%[sdifjoOc%]/.test(a[0])) native(util.format(...a)); else native(a.map(inspect1).join(" ")); } })[meth];
     }
   }
 
@@ -675,6 +679,7 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       if (data instanceof Uint8Array) return data;
       if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
       if (data instanceof ArrayBuffer) return new Uint8Array(data);
+      if (typeof SharedArrayBuffer !== "undefined" && data instanceof SharedArrayBuffer) return new Uint8Array(data);
       if (data && data.type === "secret" && typeof data.export === "function") return toBytes(data.export());
       return te.encode(String(data));
     };
@@ -696,15 +701,30 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
     function Hash(algo, opts) {
       const self = Reflect.construct(streamTransform(), [], Hash);
       self._algo = algo; self._fn = hashFns[NORM(algo)];
-      self._out = opts && typeof opts.outputLength === "number" ? opts.outputLength : 0;
+      self._out = opts && typeof opts.outputLength === "number" ? opts.outputLength : -1;  // -1 = native default (XOF); 0 = explicit empty
       self._chunks = []; self._done = false;
       return self;
     }
     Object.setPrototypeOf(Hash.prototype, Transform.prototype);
     Object.setPrototypeOf(Hash, Transform);
     const joinChunks = function (chunks) { let t = 0; for (const c of chunks) t += c.length; const m = new Uint8Array(t); let o = 0; for (const c of chunks) { m.set(c, o); o += c.length; } return m; };
-    Hash.prototype.update = function (data, enc) { if (this._done) throw new Error("Digest already called"); this._chunks.push(toBytes(data, enc)); return this; };
-    Hash.prototype.digest = function (enc) { if (this._done) throw new Error("Digest already called"); this._done = true; const m = joinChunks(this._chunks); const d = digestBytes(this._algo, m, this._out); return encode(d, enc); };
+    Hash.prototype.update = function (data, enc) { if (this._done) throw new Error("Digest already called"); if (typeof data !== "string" && !ArrayBuffer.isView(data) && !(data instanceof ArrayBuffer)) throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "data" argument must be of type string or an instance of Buffer, TypedArray, or DataView.' + invalidArgType(data)); this._chunks.push(toBytes(data, enc)); return this; };
+    Hash.prototype.digest = function (enc) {
+      if (this._done) throw new Error("Digest already called");
+      this._done = true;
+      const m = joinChunks(this._chunks);
+      const isXof = NORM(this._algo).startsWith("shake");
+      let d;
+      if (isXof) {
+        d = this._out === 0 ? new Uint8Array(0) : digestBytes(this._algo, m, this._out < 0 ? 0 : this._out);
+      } else {
+        d = digestBytes(this._algo, m, 0);
+        // node: a non-XOF digest rejects an explicit outputLength that isn't its
+        // natural length ("Output length N is invalid for <algo>...").
+        if (this._out >= 0 && this._out !== d.length) throw new Error("Output length " + this._out + " is invalid for " + this._algo + ", which does not support XOF");
+      }
+      return encode(d, enc);
+    };
     Hash.prototype._transform = function (chunk, e, cb) { this.update(chunk); cb(); };
     Hash.prototype._flush = function (cb) { this.push(this.digest()); cb(); };
     // node's Hash#copy clones the EVP context, which is gone once digest() ran:
@@ -760,22 +780,57 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
     const cryptoHash = (algo, data, outputEncoding) => {
       if (typeof algo !== "string") throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "algorithm" argument must be of type string.' + invalidArgType(algo));
       if (!isDataInput(data)) throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "data" argument must be of type string or an instance of Buffer, TypedArray, or DataView.' + invalidArgType(data));
-      if (outputEncoding !== undefined && typeof outputEncoding !== "string") throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "outputEncoding" argument must be of type string.' + invalidArgType(outputEncoding));
-      const enc = outputEncoding === undefined ? "hex" : outputEncoding;
+      // node crypto.hash(algorithm, data[, outputEncoding|options]) — the 3rd arg
+      // is either an output-encoding string or an options object carrying
+      // { outputEncoding, outputLength } (XOF digest length).
+      let enc, outLen;
+      if (outputEncoding !== undefined && outputEncoding !== null && typeof outputEncoding === "object") {
+        const oe = outputEncoding.outputEncoding;
+        if (oe !== undefined && typeof oe !== "string") throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "options.outputEncoding" argument must be of type string.' + invalidArgType(oe));
+        enc = oe === undefined ? "hex" : oe;
+        if (typeof outputEncoding.outputLength === "number") outLen = outputEncoding.outputLength;
+      } else {
+        if (outputEncoding !== undefined && typeof outputEncoding !== "string") throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "outputEncoding" argument must be of type string.' + invalidArgType(outputEncoding));
+        enc = outputEncoding === undefined ? "hex" : outputEncoding;
+      }
       const VALID_ENC = { hex:1, base64:1, base64url:1, buffer:1, latin1:1, binary:1, ascii:1, utf8:1, "utf-8":1, ucs2:1, "ucs-2":1, utf16le:1, "utf-16le":1 };
       if (!(enc in VALID_ENC)) throw mkErr(TypeError, "ERR_INVALID_ARG_VALUE", "The argument 'options.outputEncoding' is invalid. Received " + JSON.stringify(enc));
-      return createHash(algo).update(data).digest(enc);
+      return createHash(algo, outLen !== undefined ? { outputLength: outLen } : undefined).update(data).digest(enc);
+    };
+    // pbkdf2 password/salt input validation (string | ArrayBuffer | TypedArray |
+    // DataView). node validates these before iterations/keylen/digest.
+    const validatePbkdf2Input = (password, salt) => {
+      const okBuf = (v) => typeof v === "string" || ArrayBuffer.isView(v) || v instanceof ArrayBuffer || (typeof SharedArrayBuffer !== "undefined" && v instanceof SharedArrayBuffer);
+      if (!okBuf(password)) throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "password" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView.' + invalidArgType(password));
+      if (!okBuf(salt)) throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "salt" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView.' + invalidArgType(salt));
     };
     // pbkdf2 shared parameter validation (node error codes/messages).
     const validatePbkdf2 = (iterations, keylen, digest) => {
       if (typeof iterations !== "number") throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "iterations" argument must be of type number.' + invalidArgType(iterations));
       if (!Number.isInteger(iterations)) throw mkErr(RangeError, "ERR_OUT_OF_RANGE", 'The value of "iterations" is out of range. It must be an integer. Received ' + iterations);
-      if (iterations < 1) throw mkErr(RangeError, "ERR_OUT_OF_RANGE", 'The value of "iterations" is out of range. It must be >= 1. Received ' + iterations);
+      if (iterations < 1 || iterations > 2147483647) throw mkErr(RangeError, "ERR_OUT_OF_RANGE", 'The value of "iterations" is out of range. It must be >= 1 && <= 2147483647. Received ' + iterations);
       if (typeof keylen !== "number") throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "keylen" argument must be of type number.' + invalidArgType(keylen));
       if (!Number.isInteger(keylen)) throw mkErr(RangeError, "ERR_OUT_OF_RANGE", 'The value of "keylen" is out of range. It must be an integer. Received ' + keylen);
       if (keylen < 0 || keylen > 2147483647) throw mkErr(RangeError, "ERR_OUT_OF_RANGE", 'The value of "keylen" is out of range. It must be >= 0 and <= 2147483647. Received ' + keylen);
-      const dg = digest == null ? "sha1" : digest;
-      if (typeof dg !== "string" || !supported(dg)) throw mkErr(Error, "ERR_CRYPTO_INVALID_DIGEST", "Invalid digest: " + digest);
+      // node requires an explicit string digest (no sha1 default): a missing digest
+      // is ERR_INVALID_ARG_TYPE, an unknown one ERR_CRYPTO_INVALID_DIGEST.
+      if (typeof digest !== "string") throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "digest" argument must be of type string.' + invalidArgType(digest));
+      if (!supported(digest)) throw mkErr(Error, "ERR_CRYPTO_INVALID_DIGEST", "Invalid digest: " + digest);
+    };
+    // hkdf/hkdfSync shared parameter validation (node lib/internal/crypto/hkdf.js).
+    // Order (matches node): digest type → ikm type → salt type → info type →
+    // info length (<=1024) → length type → length range → digest supported.
+    const isAnyAB = (v) => v instanceof ArrayBuffer || (typeof SharedArrayBuffer !== "undefined" && v instanceof SharedArrayBuffer);
+    const validateHkdf = (digest, ikm, salt, info, keylen) => {
+      if (typeof digest !== "string") throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "digest" argument must be of type string.' + invalidArgType(digest));
+      const isKO = ikm && typeof ikm === "object" && ikm.type !== undefined && typeof ikm.export === "function";
+      if (typeof ikm !== "string" && !ArrayBuffer.isView(ikm) && !isAnyAB(ikm) && !isKO) throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "ikm" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, DataView, KeyObject, or CryptoKey.' + invalidArgType(ikm));
+      if (typeof salt !== "string" && !ArrayBuffer.isView(salt) && !isAnyAB(salt)) throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "salt" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView.' + invalidArgType(salt));
+      if (typeof info !== "string" && !ArrayBuffer.isView(info) && !isAnyAB(info)) throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "info" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView.' + invalidArgType(info));
+      if (toBytes(info).length > 1024) throw mkErr(RangeError, "ERR_OUT_OF_RANGE", 'The value of "info" is out of range. It must be <= 1024 bytes. Received ' + toBytes(info).length);
+      if (typeof keylen !== "number") throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "length" argument must be of type number.' + invalidArgType(keylen));
+      if (!Number.isInteger(keylen) || keylen < 0 || keylen > 2147483647) throw mkErr(RangeError, "ERR_OUT_OF_RANGE", 'The value of "length" is out of range. It must be >= 0 && <= 2147483647. Received ' + keylen);
+      if (!supported(digest)) throw mkErr(Error, "ERR_CRYPTO_INVALID_DIGEST", "Invalid digest: " + digest);
     };
     const deferCb = (fn) => { (typeof queueMicrotask === "function" ? queueMicrotask : (f) => Promise.resolve().then(f))(fn); };
     // KeyObject instances (real class so instanceof + structured clone work).
@@ -826,7 +881,13 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       },
     });
     const nodeCrypto = {
-      randomUUID: () => G.crypto.randomUUID(),
+      randomUUID: (options) => {
+        if (options !== undefined) {
+          if (typeof options !== "object" || options === null) throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "options" argument must be of type object.' + invalidArgType(options));
+          if (options.disableEntropyCache !== undefined && typeof options.disableEntropyCache !== "boolean") throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "options.disableEntropyCache" property must be of type boolean.' + invalidArgType(options.disableEntropyCache));
+        }
+        return G.crypto.randomUUID();
+      },
       // crypto.randomBytes(size[, cb]) — sync return, or async when a callback is
       // given (node passes null as the error on success).
       randomBytes: (n, cb) => {
@@ -843,15 +904,44 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
         const off = (offset || 0) * elem;
         const len = size == null ? total - off : size * elem;
         if (off < 0 || len < 0 || off + len > total) throw mkErr(RangeError, "ERR_OUT_OF_RANGE", 'The value of "size + offset" is out of range. It must be <= ' + total + '. Received ' + (off + len));
-        const region = view.subarray(off, off + len);
-        if (CN) { CN.randomFillSync(region); } else { for (let i = 0; i < region.length; i++) region[i] = Math.floor(Math.random() * 256); }
+        // Write directly into `view` at [off, off+len): fill a fresh zero-offset
+        // buffer (native randomFillSync ignores a view's byteOffset) then copy
+        // element-wise. A subarray view can't be used here — it copies rather than
+        // aliases in this build, so writes to it would never reach the original.
+        const tmp = new Uint8Array(len);
+        if (CN) { CN.randomFillSync(tmp); } else { for (let i = 0; i < len; i++) tmp[i] = Math.floor(Math.random() * 256); }
+        for (let i = 0; i < len; i++) view[off + i] = tmp[i];
         return buf;
       },
       getRandomValues: (a) => G.crypto.getRandomValues(a),
+      // crypto.randomUUIDv7([options]) — RFC 9562 UUIDv7: 48-bit big-endian
+      // millisecond timestamp, version 7, variant 10xx, remaining bits random.
+      randomUUIDv7: (options) => {
+        if (options !== undefined) {
+          if (typeof options !== "object" || options === null) throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "options" argument must be of type object.' + invalidArgType(options));
+          if (options.disableEntropyCache !== undefined && typeof options.disableEntropyCache !== "boolean") throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "options.disableEntropyCache" property must be of type boolean.' + invalidArgType(options.disableEntropyCache));
+        }
+        const ts = Date.now();
+        const b = new Uint8Array(16);
+        b[0] = Math.floor(ts / 1099511627776) & 0xff;   // ts >> 40
+        b[1] = Math.floor(ts / 4294967296) & 0xff;       // ts >> 32
+        b[2] = Math.floor(ts / 16777216) & 0xff;         // ts >> 24
+        b[3] = Math.floor(ts / 65536) & 0xff;            // ts >> 16
+        b[4] = Math.floor(ts / 256) & 0xff;              // ts >> 8
+        b[5] = ts & 0xff;
+        const r = CN ? CN.randomBytes(10) : rb(10);
+        for (let i = 0; i < 10; i++) b[6 + i] = r[i];
+        b[6] = (b[6] & 0x0f) | 0x70;                     // version 7
+        b[8] = (b[8] & 0x3f) | 0x80;                     // variant 10xx
+        let s = "";
+        for (let i = 0; i < 16; i++) s += b[i].toString(16).padStart(2, "0");
+        return s.slice(0, 8) + "-" + s.slice(8, 12) + "-" + s.slice(12, 16) + "-" + s.slice(16, 20) + "-" + s.slice(20);
+      },
       createHash, createHmac, Hash, Hmac,
       getHashes: () => ["md5", "sha1", "sha224", "sha256", "sha384", "sha512", "sha512-256", "sha3-224", "sha3-256", "sha3-384", "sha3-512", "shake128", "shake256", "blake2b512", "blake2b256", "blake2s256"],
       // Real PBKDF2 (RFC 2898): native mbun.crypto for supported PRFs, JS otherwise.
       pbkdf2Sync: (password, salt, iterations, keylen, digest) => {
+        validatePbkdf2Input(password, salt);
         validatePbkdf2(iterations, keylen, digest);
         if (keylen === 0) throw new Error("PBKDF2 derivation failed");
         const dg = digest || "sha1";
@@ -872,6 +962,7 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       // ArrayBuffer. ref: bun crypto.ts getArrayBufferOrView (secret KeyObject
       // check) + ncrypto.cpp HKDF.
       hkdfSync: (digest, ikm, salt, info, keylen) => {
+        validateHkdf(digest, ikm, salt, info, keylen);
         if (ikm && typeof ikm === "object" && ikm.type !== undefined && typeof ikm.export === "function" && ikm.type !== "secret") {
           const e = new TypeError("Invalid key object type " + ikm.type + ", expected secret.");
           e.code = "ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE"; throw e;
@@ -880,7 +971,7 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
         const prk = new Uint8Array(createHmac(digest, saltB).update(ikmB).digest());
         const hashLen = prk.length;
         const n = Math.ceil(keylen / hashLen);
-        if (n > 255) { const e = new RangeError("Invalid key length"); e.code = "ERR_OUT_OF_RANGE"; throw e; }
+        if (n > 255) { const e = new RangeError("Invalid key length"); e.code = "ERR_CRYPTO_INVALID_KEYLEN"; throw e; }
         const okm = new Uint8Array(n * hashLen);
         let prev = new Uint8Array(0);
         for (let i = 1; i <= n; i++) {
@@ -901,9 +992,13 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       // a bad keylen/iterations must NOT reach the callback); derivation errors
       // (e.g. keylen 0) surface via the callback.
       pbkdf2: (password, salt, iterations, keylen, digest, cb) => {
-        const fn = typeof digest === "function" ? digest : cb;
-        const dg = typeof digest === "function" ? "sha1" : digest;
-        validatePbkdf2(iterations, keylen, dg);   // synchronous throw on invalid params
+        // A function in the `digest` slot is the callback; `digest` is then
+        // undefined and validation reports the missing-digest error (node).
+        let dg = digest, fn = cb;
+        if (typeof digest === "function") { fn = digest; dg = undefined; }
+        validatePbkdf2Input(password, salt);
+        validatePbkdf2(iterations, keylen, dg);   // synchronous throw on invalid params (incl. missing digest)
+        if (typeof fn !== "function") throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "callback" argument must be of type function.' + invalidArgType(fn));
         deferCb(() => { try { const r = nodeCrypto.pbkdf2Sync(password, salt, iterations, keylen, dg); fn(null, r); } catch (e) { fn(e); } });
       },
       hash: cryptoHash,

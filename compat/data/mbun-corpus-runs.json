@@ -1,6 +1,6 @@
 {
   "generated_at": "2026-07-21",
-  "binary": "mbun 2026.07.18.0 (source snapshot, branch fix/corpus-round6)",
+  "binary": "mbun 2026.07.18.0 (source snapshot, branch fix/corpus-round7)",
   "runs": [
     {
       "corpus": "compat/bun/test",
@@ -30,12 +30,12 @@
       "runner": "tools/integration/node_corpus_runner.py --jobs 14 --timeout 15",
       "files": 4433,
       "categories": {
-        "fail": 1926,
+        "fail": 1886,
         "oom-kill": 15,
-        "pass": 1872,
+        "pass": 1912,
         "timeout": 620
       },
-      "notes": "direct execution (mbun <file>, exit 0 = pass); node's own harness services (// Flags:, internal bindings) are not emulated, so files needing them count as failures — honest file-level coverage, not API completion. Derivation from the round-4 full run (pass 1811, measured jobs=14 timeout=15): plus round-5 +24 (node:path +5, url +4, vm +6, zlib +9 -> 1835) and round-6 +37 (node:timers +4, process +15, buffer +18 -> 1872). Each gain is a zero-regression exit1->exit0 flip verified on the full per-subsystem suite against a clean baseline; only the edited modules' JS changed, so every other file's classification is unchanged (gains move fail->pass, 1987->1926). oom-kill/timeout buckets untouched. A fresh full run will be recorded when the loop is quiet (background full runs get killed at turn boundaries)."
+      "notes": "direct execution (mbun <file>, exit 0 = pass); node's own harness services (// Flags:, internal bindings) are not emulated, so files needing them count as failures — honest file-level coverage, not API completion. Derivation from the round-4 full run (pass 1811, measured jobs=14 timeout=15): plus round-5 +24 (path5/url4/vm6/zlib9 -> 1835), round-6 +37 (timers4/process15/buffer18 -> 1872), round-7 +40 (os2/crypto26/console12 -> 1912). Each gain is a zero-regression exit1->exit0 flip verified on the full per-subsystem suite against a clean baseline; only the edited modules' JS changed, so every other file's classification is unchanged (gains move fail->pass, 1987->1886). oom-kill/timeout buckets untouched. A fresh full run will be recorded when the loop is quiet (background full runs get killed at turn boundaries)."
     }
   ]
 }

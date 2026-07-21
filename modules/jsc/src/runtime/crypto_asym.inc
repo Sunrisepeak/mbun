@@ -275,6 +275,8 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_generate_host,
         pkey.reset(EVP_PKEY_Q_keygen(nullptr, nullptr, "ED448"));
     } else if (type == "x25519") {
         pkey.reset(EVP_PKEY_Q_keygen(nullptr, nullptr, "X25519"));
+    } else if (type == "x448") {
+        pkey.reset(EVP_PKEY_Q_keygen(nullptr, nullptr, "X448"));
     } else {
         return hasher_throw(global, "Unsupported key type: " + type);
     }
@@ -554,8 +556,11 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_cipher_host,
     }
     int finl{0};
     if (EVP_CipherFinal_ex(cc.get(), out.data() + outl, &finl) <= 0) {
-        return hasher_throw(global, enc ? "cipher final failed"
-                                        : "Unsupported state or unable to authenticate data");
+        // GCM/AEAD decrypt failure is an authentication failure (node's fixed
+        // message); block-cipher failures surface the real OpenSSL error so the
+        // JS layer can recover code/library/reason (e.g. WRONG_FINAL_BLOCK_LENGTH).
+        if (!enc && gcm) { return hasher_throw(global, "Unsupported state or unable to authenticate data"); }
+        return hasher_throw(global, asym_ossl_err());
     }
     out.resize(static_cast<std::size_t>(outl + finl));
 
@@ -567,6 +572,105 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_cipher_host,
         set_prop(ctx, obj, "tag", static_cast<JSValueRef>(asym_u8(ctx, tag)));
     }
     return JSC::JSValue::encode(toJS(global, static_cast<JSValueRef>(obj)));
+}
+
+// __mbunCryptoAsymNative.cipherInfo(nameOrNid[, keyLength][, ivLength]) →
+//   { name, nid, blockSize, ivLength, keyLength, mode } or null when the cipher
+//   is unknown / the requested key or IV length is unsupported. Backs
+//   crypto.getCipherInfo and the createCipheriv construction-time validation.
+// ref: node lib/internal/crypto/util.js getCipherInfo + src/crypto/crypto_cipher.cc.
+JSC_DEFINE_HOST_FUNCTION(node_asym_cipher_info_host,
+                         (JSC::JSGlobalObject* global, JSC::CallFrame* frame)) {
+    JSContextRef ctx{toRef(global)};
+    JSC::JSValue arg{native_arg(frame, 0)};
+    const EVP_CIPHER* c{nullptr};
+    if (arg && arg.isNumber()) {
+        const char* sn{OBJ_nid2sn(static_cast<int>(arg.asNumber()))};
+        if (sn != nullptr) { c = EVP_get_cipherbyname(sn); }
+    } else if (arg && arg.isString()) {
+        const std::string name{asym_str(global, arg)};
+        c = EVP_get_cipherbyname(name.c_str());
+    }
+    if (c == nullptr) { return JSC::JSValue::encode(JSC::jsNull()); }
+
+    const int mode{EVP_CIPHER_mode(c)};
+    const int keyLen{EVP_CIPHER_key_length(c)};
+    const int ivLen{EVP_CIPHER_iv_length(c)};
+
+    // Optional key-length feasibility check (node: EVP_CIPHER_CTX_set_key_length).
+    if (JSC::JSValue kArg{native_arg(frame, 1)}; kArg && kArg.isNumber()) {
+        CipherCtxPtr cc{EVP_CIPHER_CTX_new()};
+        if (!cc || EVP_CipherInit_ex(cc.get(), c, nullptr, nullptr, nullptr, 1) <= 0 ||
+            EVP_CIPHER_CTX_set_key_length(cc.get(), static_cast<int>(kArg.asNumber())) <= 0) {
+            return JSC::JSValue::encode(JSC::jsNull());
+        }
+    }
+    // Optional IV-length feasibility check. AEAD modes (GCM/CCM/OCB) accept a
+    // settable range via EVP_CTRL_AEAD_SET_IVLEN; fixed-IV modes must match exactly.
+    if (JSC::JSValue ivArg{native_arg(frame, 2)}; ivArg && ivArg.isNumber()) {
+        const int want{static_cast<int>(ivArg.asNumber())};
+        const bool aead{mode == EVP_CIPH_GCM_MODE || mode == EVP_CIPH_CCM_MODE ||
+                        mode == EVP_CIPH_OCB_MODE};
+        if (aead) {
+            CipherCtxPtr cc{EVP_CIPHER_CTX_new()};
+            if (!cc || EVP_CipherInit_ex(cc.get(), c, nullptr, nullptr, nullptr, 1) <= 0 ||
+                EVP_CIPHER_CTX_ctrl(cc.get(), EVP_CTRL_AEAD_SET_IVLEN, want, nullptr) <= 0) {
+                return JSC::JSValue::encode(JSC::jsNull());
+            }
+        } else if (want != ivLen) {
+            return JSC::JSValue::encode(JSC::jsNull());
+        }
+    }
+
+    std::string name{EVP_CIPHER_get0_name(c) != nullptr ? EVP_CIPHER_get0_name(c) : std::string{}};
+    for (char& ch : name) { ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch))); }
+    const char* modeStr{[&]() -> const char* {
+        switch (mode) {
+            case EVP_CIPH_ECB_MODE: return "ecb";
+            case EVP_CIPH_CBC_MODE: return "cbc";
+            case EVP_CIPH_CFB_MODE: return "cfb";
+            case EVP_CIPH_OFB_MODE: return "ofb";
+            case EVP_CIPH_CTR_MODE: return "ctr";
+            case EVP_CIPH_GCM_MODE: return "gcm";
+            case EVP_CIPH_CCM_MODE: return "ccm";
+            case EVP_CIPH_XTS_MODE: return "xts";
+            case EVP_CIPH_WRAP_MODE: return "wrap";
+            case EVP_CIPH_OCB_MODE: return "ocb";
+            default: return "stream";
+        }
+    }()};
+
+    JSObjectRef obj{JSObjectMake(ctx, nullptr, nullptr)};
+    set_prop(ctx, obj, "name", make_string(ctx, name));
+    set_prop(ctx, obj, "nid", JSValueMakeNumber(ctx, static_cast<double>(EVP_CIPHER_nid(c))));
+    set_prop(ctx, obj, "blockSize",
+             JSValueMakeNumber(ctx, static_cast<double>(EVP_CIPHER_block_size(c))));
+    if (ivLen > 0) {
+        set_prop(ctx, obj, "ivLength", JSValueMakeNumber(ctx, static_cast<double>(ivLen)));
+    }
+    set_prop(ctx, obj, "keyLength", JSValueMakeNumber(ctx, static_cast<double>(keyLen)));
+    set_prop(ctx, obj, "mode", make_string(ctx, modeStr));
+    return JSC::JSValue::encode(toJS(global, static_cast<JSValueRef>(obj)));
+}
+
+// __mbunCryptoAsymNative.dhGeneratePrime(bits) → Uint8Array (big-endian probable
+// prime) for createDiffieHellman(<bitLength>). Uses BN_generate_prime_ex (fast,
+// non-safe: sufficient for DH key-agreement round-trips the JS layer performs).
+JSC_DEFINE_HOST_FUNCTION(node_asym_dh_prime_host,
+                         (JSC::JSGlobalObject* global, JSC::CallFrame* frame)) {
+    JSContextRef ctx{toRef(global)};
+    const int bits{asym_int(native_arg(frame, 0), 1024)};
+    if (bits < 8 || bits > 8192) { return hasher_throw(global, "Invalid prime length"); }
+    BIGNUM* p{BN_new()};
+    if (p == nullptr || BN_generate_prime_ex(p, bits, 0, nullptr, nullptr, nullptr) != 1) {
+        if (p != nullptr) { BN_free(p); }
+        return hasher_throw(global, "DH prime generation failed");
+    }
+    const int n{BN_num_bytes(p)};
+    std::vector<std::uint8_t> out(n > 0 ? static_cast<std::size_t>(n) : 0, 0);
+    if (n > 0) { BN_bn2bin(p, out.data()); }
+    BN_free(p);
+    return JSC::JSValue::encode(toJS(global, static_cast<JSValueRef>(asym_u8(ctx, out))));
 }
 
 // --- ECDH (provider API via OSSL_PARAM_BLD/fromdata) ---

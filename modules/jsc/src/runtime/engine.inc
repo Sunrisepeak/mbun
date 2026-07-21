@@ -1153,6 +1153,8 @@ public:
         set_native_fn(ctx_, cryptoAsymNative, "privateEncrypt", 4, node_asym_private_encrypt_host);
         set_native_fn(ctx_, cryptoAsymNative, "publicDecrypt", 4, node_asym_public_decrypt_host);
         set_native_fn(ctx_, cryptoAsymNative, "cipher", 8, node_asym_cipher_host);
+        set_native_fn(ctx_, cryptoAsymNative, "cipherInfo", 3, node_asym_cipher_info_host);
+        set_native_fn(ctx_, cryptoAsymNative, "dhGeneratePrime", 1, node_asym_dh_prime_host);
         set_native_fn(ctx_, cryptoAsymNative, "ecValidCurve", 1, node_asym_ec_valid_curve_host);
         set_native_fn(ctx_, cryptoAsymNative, "ecdhGenerate", 1, node_asym_ecdh_generate_host);
         set_native_fn(ctx_, cryptoAsymNative, "ecdhComputeSecret", 3, node_asym_ecdh_compute_host);
