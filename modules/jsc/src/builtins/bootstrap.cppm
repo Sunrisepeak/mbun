@@ -1392,7 +1392,17 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     const validateBoolean = (value, name) => { if (typeof value !== "boolean") throw ERR_INVALID_ARG_TYPE(name, "boolean", value); };
     class AbortError extends Error { constructor(message = "The operation was aborted.", options = undefined) { if (options !== undefined && typeof options !== "object") throw ERR_INVALID_ARG_TYPE("options", "Object", options); super(message, options); this.code = "ABORT_ERR"; this.name = "AbortError"; } }
 
+    // node lib/events.js: the constructor does nothing itself, it defers to the
+    // REPLACEABLE `EventEmitter.init`. That indirection is the documented seam
+    // node:domain patches (`const eventInit = EventEmitter.init; EventEmitter.init
+    // = function (opts) { …stamp this.domain…; return eventInit.call(this, opts); }`),
+    // so it has to be a dynamic lookup — `init` used to alias the constructor
+    // itself, which made the override unreachable and left every emitter without
+    // the domain it was created in.
     function EventEmitter(opts) {
+      EventEmitter.init.call(this, opts);
+    }
+    function eventInit(opts) {
       if (this._events === undefined || this._events === Object.getPrototypeOf(this)._events) {
         this._events = { __proto__: null };
         this._eventsCount = 0;
@@ -1655,7 +1665,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       emit(...args) { return this.asyncResource.runInAsyncScope(() => EventEmitterPrototype.emit.apply(this, args)); }
       emitDestroy() { this.asyncResource.emitDestroy(); }
     }
-    Object.assign(EventEmitter, { once, on, getEventListeners, getMaxListeners, setMaxListeners, EventEmitter, EventEmitterAsyncResource, usingDomains: false, captureRejectionSymbol, errorMonitor: kErrorMonitor, addAbortListener, init: EventEmitter, listenerCount });
+    Object.assign(EventEmitter, { once, on, getEventListeners, getMaxListeners, setMaxListeners, EventEmitter, EventEmitterAsyncResource, usingDomains: false, captureRejectionSymbol, errorMonitor: kErrorMonitor, addAbortListener, init: eventInit, listenerCount });
     return EventEmitter;
   })();
   def(["events"], EventEmitter);
