@@ -60,6 +60,16 @@ frozen machine or a silently murdered harness.
   are reported separately and never inflate a cluster. `--filter test-vm` scopes
   to one subsystem; `--json` emits a machine summary. Analysis-only, so it needs
   no bounded layer of its own — all execution stayed in the runner.
+  It also ranks signatures **across** subsystems and prints that section first:
+  the causes costing the most files are usually not subsystem-specific, and
+  per-subsystem grouping alone shreds them into shards that never reach the top
+  (node's harness flag re-spawn — 848 files, 19% of the corpus, one cause — hid
+  behind a `quic: 234` row for several rounds). `--min-subsystems` sets how wide
+  a cause must spread to count as cross-cutting. `--worklist <path>` writes the
+  chosen cluster out as a runner `--files` list (`--worklist-rank` /
+  `--worklist-from subsystem` select which), so picking a round's target and
+  scoring it before/after are the same set of files rather than two hand-copied
+  approximations.
 - `smoke_examples.py` — boots each `examples/` app in turn, requests
   `http://127.0.0.1:3000/`, asserts a 2xx, then reaps the whole process tree
   (`bounded_run.BoundedServer`). Sequential by design: the demos all hardcode
