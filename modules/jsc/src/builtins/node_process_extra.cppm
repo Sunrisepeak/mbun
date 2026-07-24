@@ -722,6 +722,41 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
       });
     }
 
+    // ---- shared uncaught-exception escalation -------------------------------
+    // node's process._fatalException, as far as the JS layer can express it: a
+    // capture callback registered through setUncaughtExceptionCaptureCallback
+    // wins (this is the seam node:domain drives), then 'uncaughtException'
+    // listeners. Returns whether anybody claimed the exception.
+    //
+    // Callers are the JS-side callback dispatchers that own a try/catch and so
+    // have to decide the fate of a throw themselves. The timer drain used to
+    // `catch (e) {}`, so an exception from a setTimeout/setInterval callback
+    // reached NEITHER of these and `process.domain` never saw it.
+    //
+    // DEFERRED (deliberately not done here): node also makes an unclaimed
+    // exception FATAL — print + exit(1). mbun currently swallows it, and a
+    // 200-file corpus sample shows at least two files whose "pass" today comes
+    // precisely from that swallow (test-async-wrap-promise-after-enabled and
+    // test-http2-compat-serverrequest-pause both assert inside a timer callback
+    // and fail the assertion). Turning it fatal is correct but is a corpus-wide
+    // accounting change, so it belongs in its own measured round rather than
+    // riding along with a streams/domain fix.
+    Object.defineProperty(G, "__mbunEmitUncaught", {
+      configurable: true, enumerable: false, writable: true,
+      value: function (err, origin) {
+        const p = G.process;
+        try {
+          const cap = p && p._mbunUncaughtCaptureCallback;
+          if (typeof cap === "function") { cap(err); return true; }
+          if (p && typeof p.listenerCount === "function" && p.listenerCount("uncaughtException") > 0) {
+            p.emit("uncaughtException", err, origin || "uncaughtException");
+            return true;
+          }
+        } catch (e) {}
+        return false;
+      },
+    });
+
     // ---- unhandled promise rejection dispatch -------------------------------
     // The runtime's JSC rejection hook calls this with (reason, promise). node's
     // escalation order (lib/internal/process/promises.js, mode "throw" — the

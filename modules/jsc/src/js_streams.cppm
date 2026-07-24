@@ -26,7 +26,25 @@ constexpr std::string_view kStreamsJS_part1 = R"JS(
   const deferred = () => { let resolve, reject; const promise = new Promise((res, rej) => { resolve = res; reject = rej; }); return { promise, resolve, reject }; };
   const markHandled = (p) => { if (p && typeof p.then === "function") p.then(noop, noop); };
   const promiseCall = (fn, thisArg, args) => { try { return Promise.resolve(fn.apply(thisArg, args)); } catch (e) { return Promise.reject(e); } };
+  // node's Symbol.for("nodejs.webstream.controllerErrorFunction"): node:stream's
+  // addAbortSignal() calls stream[kControllerErrorFunction](err) to error a web
+  // stream without acquiring a reader. Every stream that has a controller must
+  // carry it (internal/webstreams/{readable,writable}stream.js set it at
+  // controller setup) or addAbortSignal throws "is not a function".
+  const kControllerErrorFunction = Symbol.for("nodejs.webstream.controllerErrorFunction");
   const invalidState = (m) => { const e = new TypeError("Invalid state: " + m); e.code = "ERR_INVALID_STATE"; return e; };
+  // node's ERR_INVALID_ARG_TYPE / ERR_INVALID_ARG_VALUE.RangeError. The streams
+  // surface tests match on `code` + constructor name, so both have to be right.
+  const invalidArgType = (name, expected, actual) => {
+    const e = new TypeError(`The "${name}" argument must be of type ${[].concat(expected).join(" or ")}. Received ${typeof actual}`);
+    e.code = "ERR_INVALID_ARG_TYPE";
+    return e;
+  };
+  const invalidArgValueRange = (name, reason) => {
+    const e = new RangeError(`The argument '${name}' ${reason}`);
+    e.code = "ERR_INVALID_ARG_VALUE";
+    return e;
+  };
   let _te = null;
   const utf8Encode = (s) => { if (!_te) _te = new G.TextEncoder(); return _te.encode(s); };
   const isView = ArrayBuffer.isView;
@@ -101,9 +119,30 @@ constexpr std::string_view kStreamsJS_part1 = R"JS(
     else readIntoRequest.chunkSteps(chunk);
   }
 
+  // node's stream[kIsClosedPromise] (internal/webstreams/{readable,writable}stream.js):
+  // a per-STREAM settled-on-close promise that does NOT lock the stream. eosWeb
+  // (`stream.finished(webStream)`) waits on it; without it the node layer had to
+  // fall back to `stream.getReader().closed`, which locks the stream and made
+  // every `finished(rs)` + `for await (rs)` pair throw "ReadableStream is locked".
+  // Created on demand — a stream nobody asks about pays nothing — and settled
+  // straight away when the stream is already closed/errored by then.
+  function streamClosedPromise(stream) {
+    let d = stream._isClosedDeferred;
+    if (d === undefined) {
+      d = stream._isClosedDeferred = deferred();
+      markHandled(d.promise);
+      if (stream._state === "closed") d.resolve(undefined);
+      else if (stream._state === "errored") d.reject(stream._storedError);
+    }
+    return d.promise;
+  }
+  const resolveClosed = (stream) => { if (stream._isClosedDeferred) stream._isClosedDeferred.resolve(undefined); };
+  const rejectClosed = (stream, error) => { if (stream._isClosedDeferred) stream._isClosedDeferred.reject(error); };
+
   function readableStreamClose(stream) {
     if (stream._state !== "readable") return;
     stream._state = "closed";
+    resolveClosed(stream);
     const reader = stream._reader;
     if (reader === undefined) return;
     reader._closedDeferred.resolve(undefined);
@@ -117,6 +156,7 @@ constexpr std::string_view kStreamsJS_part1 = R"JS(
     if (stream._state !== "readable") return;
     stream._state = "errored";
     stream._storedError = e;
+    rejectClosed(stream, e);
     const reader = stream._reader;
     if (reader === undefined) return;
     reader._closedDeferred.reject(e);
@@ -266,9 +306,14 @@ constexpr std::string_view kStreamsJS_part1 = R"JS(
       return readableStreamCancel(this._stream, reason);
     }
     read(view, options) {
+      // Error CODES are observable here (test-whatwg-readablebytestream-bad-
+      // buffers-and-views asserts them): node reports a zero-length or detached
+      // view as ERR_INVALID_STATE/TypeError, not as a bare TypeError.
+      if (!isView(view))
+        return Promise.reject(invalidArgType("view", ["Buffer", "TypedArray", "DataView"], view));
+      if (view.byteLength === 0 || view.buffer.byteLength === 0)
+        return Promise.reject(invalidState("View or Viewed ArrayBuffer is zero-length or detached"));
       if (this._stream === undefined) return Promise.reject(invalidState("The reader is not attached to a stream"));
-      if (!isView(view) || view.byteLength === 0 || view.buffer.byteLength === 0)
-        return Promise.reject(new TypeError("read() requires a non-empty ArrayBufferView"));
       let min = 1;
       if (options && options.min !== undefined) {
         min = Number(options.min);
@@ -407,6 +452,7 @@ constexpr std::string_view kStreamsJS_part1 = R"JS(
     c._pullAlgorithm = typeof source.pull === "function" ? () => promiseCall(source.pull, source, [c]) : () => Promise.resolve();
     c._cancelAlgorithm = typeof source.cancel === "function" ? (reason) => promiseCall(source.cancel, source, [reason]) : () => Promise.resolve();
     stream._readableStreamController = c;
+    stream[kControllerErrorFunction] = (e) => c.error(e);
     const startResult = typeof source.start === "function" ? source.start.call(source, c) : undefined;
     Promise.resolve(startResult).then(
       () => { c._started = true; defaultControllerCallPullIfNeeded(c); },
@@ -561,8 +607,13 @@ constexpr std::string_view kStreamsJS_part1 = R"JS(
       byteControllerRespond(this._controller, Number(bytesWritten));
     }
     respondWithNewView(view) {
-      if (this._controller === undefined) throw new TypeError("This BYOB request has been invalidated");
-      if (!isView(view)) throw new TypeError("respondWithNewView() requires an ArrayBufferView");
+      // node internal/webstreams/readablestream.js ReadableStreamBYOBRequest#
+      // respondWithNewView: invalidated request and detached buffer are both
+      // ERR_INVALID_STATE/TypeError, checked BEFORE the controller-level
+      // geometry checks (which are ERR_INVALID_ARG_VALUE/RangeError).
+      if (this._controller === undefined) throw invalidState("This BYOB request has been invalidated");
+      if (!isView(view)) throw invalidArgType("view", ["Buffer", "TypedArray", "DataView"], view);
+      if (isDetachedBuffer(view.buffer)) throw invalidState("Viewed ArrayBuffer is detached");
       byteControllerRespondWithNewView(this._controller, view);
     }
   }
@@ -877,11 +928,15 @@ constexpr std::string_view kStreamsJS_part1 = R"JS(
   function byteControllerRespondWithNewView(c, view) {
     const firstDescriptor = c._pendingPullIntos[0];
     const state = c._stream._state;
-    if (state === "closed") { if (view.byteLength !== 0) throw new TypeError("The view's length must be 0 when calling respondWithNewView() on a closed stream"); }
-    else if (view.byteLength === 0) throw new TypeError("The view's length must be greater than 0 when calling respondWithNewView() on a readable stream");
-    if (firstDescriptor.byteOffset + firstDescriptor.bytesFilled !== view.byteOffset) throw new RangeError("The region specified by view does not match byobRequest");
-    if (firstDescriptor.bufferByteLength !== view.buffer.byteLength) throw new RangeError("The buffer of view has different capacity than byobRequest");
-    if (firstDescriptor.bytesFilled + view.byteLength > firstDescriptor.byteLength) throw new RangeError("The region specified by view is larger than byobRequest");
+    // Codes and ORDER are node's (readableByteStreamControllerRespondWithNewView):
+    // state mismatches are ERR_INVALID_STATE/TypeError, geometry mismatches are
+    // ERR_INVALID_ARG_VALUE/RangeError, and the length check precedes the
+    // buffer-capacity check.
+    if (state === "closed") { if (view.byteLength !== 0) throw invalidState("View is not zero-length"); }
+    else if (view.byteLength === 0) throw invalidState("View is zero-length");
+    if (firstDescriptor.byteOffset + firstDescriptor.bytesFilled !== view.byteOffset) throw invalidArgValueRange("view", "does not match byobRequest");
+    if (firstDescriptor.bytesFilled + view.byteLength > firstDescriptor.byteLength) throw invalidArgValueRange("view", "is larger than byobRequest");
+    if (firstDescriptor.bufferByteLength !== view.buffer.byteLength) throw invalidArgValueRange("view", "has a buffer of different capacity than byobRequest");
     const viewByteLength = view.byteLength;
     firstDescriptor.buffer = transferArrayBuffer(view.buffer);
     byteControllerRespondInternal(c, viewByteLength);
@@ -947,6 +1002,7 @@ constexpr std::string_view kStreamsJS_part1 = R"JS(
     c._autoAllocateChunkSize = autoAllocateChunkSize;
     c._pendingPullIntos = [];
     stream._readableStreamController = c;
+    stream[kControllerErrorFunction] = (e) => c.error(e);
     const startResult = typeof source.start === "function" ? source.start.call(source, c) : undefined;
     Promise.resolve(startResult).then(
       () => { c._started = true; byteControllerCallPullIfNeeded(c); },
@@ -1173,6 +1229,19 @@ constexpr std::string_view kStreamsJS_part2 = R"JS(
 
   class ReadableStream {
     constructor(underlyingSource, strategy) {
+      // AsyncLocalStorage seam: a stream retains its underlying-source
+      // algorithms and calls them later, so async_hooks needs to snapshot the
+      // constructing frame onto start/pull/cancel. It used to do that by
+      // REPLACING globalThis.ReadableStream with a subclass, which silently
+      // broke identity for every stream the spec algorithms build internally
+      // (tee branches, TransformStream.readable, pipeThrough results): they are
+      // created from ReadableStream.prototype, so `x instanceof
+      // globalThis.ReadableStream` was false and node's isReadableStream()
+      // rejected them ("Received an instance of ReadableStream"). Wrapping the
+      // source here instead keeps exactly one ReadableStream class.
+      if (G.__mbunWrapStreamSource !== undefined && underlyingSource != null) {
+        underlyingSource = G.__mbunWrapStreamSource(underlyingSource);
+      }
       const source = underlyingSource == null ? {} : underlyingSource;
       strategy = strategy == null ? {} : strategy;
       if (typeof source !== "object" && typeof source !== "function") throw new TypeError("underlyingSource must be an object");
@@ -1238,6 +1307,44 @@ constexpr std::string_view kStreamsJS_part2 = R"JS(
     bytes() { const e = consumerUsableError(this); return e ? Promise.reject(e) : consumeStart(this).then(consumeBytes); }
     arrayBuffer() { const e = consumerUsableError(this); return e ? Promise.reject(e) : consumeStart(this).then(consumeBytes).then((u8) => u8.buffer); }
     blob() { const e = consumerUsableError(this); const t = this.__mbunBlobType || ""; return e ? Promise.reject(e) : consumeStart(this).then(consumeArray).then((chunks) => new G.Blob(chunks, { type: t })); }
+    // ReadableStream.from(iterable) — streams spec / node
+    // internal/webstreams/readablestream.js readableStreamFromIterable().
+    // The two validation errors are observable (test-webstream-readable-from):
+    // a non-iterable is ERR_ARG_NOT_ITERABLE, an iterator method that returns a
+    // non-object is ERR_INVALID_STATE. Note a FUNCTION is a valid iterator here.
+    static from(iterable) {
+      let stream;
+      const iteratorGetter = iterable == null
+        ? undefined
+        : (iterable[Symbol.asyncIterator] ?? iterable[Symbol.iterator]);
+      if (iteratorGetter == null || typeof iteratorGetter !== "function") {
+        const e = new TypeError("The iterable argument must be iterable");
+        e.code = "ERR_ARG_NOT_ITERABLE";
+        throw e;
+      }
+      const iterator = iteratorGetter.call(iterable);
+      if (iterator === null || (typeof iterator !== "object" && typeof iterator !== "function")) {
+        throw invalidState("The iterator method must return an object");
+      }
+      const pullAlgorithm = async () => {
+        const iterResult = await iterator.next();
+        if (typeof iterResult !== "object" || iterResult === null) {
+          throw invalidState("The promise returned by the iterator.next() method must fulfill with an object");
+        }
+        if (iterResult.done) defaultControllerClose(stream._readableStreamController);
+        else defaultControllerEnqueue(stream._readableStreamController, await iterResult.value);
+      };
+      const cancelAlgorithm = async (reason) => {
+        const returnMethod = iterator.return;
+        if (returnMethod === undefined) return;
+        const iterResult = await returnMethod.call(iterator, reason);
+        if (typeof iterResult !== "object" || iterResult === null) {
+          throw invalidState("The promise returned by the iterator.return() method must fulfill with an object");
+        }
+      };
+      stream = createReadableStream(() => {}, pullAlgorithm, cancelAlgorithm, 0);
+      return stream;
+    }
   }
 
   // =====================================================================
@@ -1323,6 +1430,7 @@ constexpr std::string_view kStreamsJS_part2 = R"JS(
   }
   function writableStreamFinishErroring(stream) {
     stream._state = "errored";
+    rejectClosed(stream, stream._storedError);
     stream._writableStreamController._errorSteps();
     const storedError = stream._storedError;
     for (const writeRequest of stream._writeRequests) writeRequest.reject(storedError);
@@ -1381,6 +1489,7 @@ constexpr std::string_view kStreamsJS_part2 = R"JS(
       }
     }
     stream._state = "closed";
+    resolveClosed(stream);
     const writer = stream._writer;
     if (writer !== undefined) writer._closedDeferred.resolve(undefined);
   }
@@ -1530,6 +1639,7 @@ constexpr std::string_view kStreamsJS_part2 = R"JS(
     const c = Object.create(WritableStreamDefaultController.prototype);
     c._stream = stream;
     stream._writableStreamController = c;
+    stream[kControllerErrorFunction] = (e) => c.error(e);
     resetQueue(c);
     c._abortReason = undefined;
     c._abortController = undefined;
@@ -1991,6 +2101,9 @@ constexpr std::string_view kStreamsJS_part2 = R"JS(
     usableError: consumerUsableError,
     isReadableStream,
     isDisturbed: (s) => !!(s && s._disturbed),
+    // node's stream[kIsClosedPromise]: settles when the stream closes/errors
+    // WITHOUT acquiring a reader/writer. node:stream's eosWeb needs exactly this.
+    closedPromise: streamClosedPromise,
     // Bun `type: "direct"` serve path: hand the raw pull/cancel functions to the
     // HTTP layer so it can drive the source with an HTTPResponseSink controller
     // (write/flush map to the socket) instead of buffering through a reader.

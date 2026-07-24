@@ -215,24 +215,35 @@ inline constexpr std::string_view kAsyncHooksJS = R"JS(
     wrapCallbackApi(eventPrototype, "prependListener", 1);
   }
 
-  // Web streams retain their underlying-source algorithms and call them later.
-  const NativeReadableStream = G.ReadableStream;
-  if (typeof NativeReadableStream === "function") {
-    class ContextReadableStream extends NativeReadableStream {
-      constructor(source, strategy) {
-        if (source && typeof source === "object") {
-          const context = contextGet();
-          const wrapped = Object.create(Object.getPrototypeOf(source));
+  // Web streams retain their underlying-source algorithms and call them later,
+  // so the constructing frame has to be snapshotted onto start/pull/cancel.
+  //
+  // This used to install a `class ContextReadableStream extends ReadableStream`
+  // over globalThis.ReadableStream. That broke stream IDENTITY: the spec
+  // algorithms build streams internally from ReadableStream.prototype (tee
+  // branches, TransformStream.readable, pipeThrough results), so those were not
+  // `instanceof globalThis.ReadableStream` and node's isReadableStream()
+  // rejected them with "Received an instance of ReadableStream"; the subclass
+  // prototype also had no own `locked`/`getReader`/… descriptors, which the
+  // WHATWG surface tests inspect directly. Feed the wrapper through the one
+  // ReadableStream class's own constructor seam instead — one class, one
+  // prototype, identity preserved.
+  if (typeof G.ReadableStream === "function") {
+    Object.defineProperty(G, "__mbunWrapStreamSource", { configurable: true, enumerable: false, writable: true, value: (source) => {
+      if (!source || (typeof source !== "object" && typeof source !== "function")) return source;
+      const context = contextGet();
+      if (context === undefined) return source;
+      let wrapped = null;
+      for (const name of ["start", "pull", "cancel"]) {
+        if (typeof source[name] !== "function") continue;
+        if (wrapped === null) {
+          wrapped = Object.create(Object.getPrototypeOf(source));
           Object.defineProperties(wrapped, Object.getOwnPropertyDescriptors(source));
-          for (const name of ["start", "pull", "cancel"]) {
-            if (typeof source[name] === "function") Object.defineProperty(wrapped, name, { value: captureContext(source[name], context), configurable: true, writable: true });
-          }
-          super(wrapped, strategy);
-        } else super(source, strategy);
+        }
+        Object.defineProperty(wrapped, name, { value: captureContext(source[name], context), configurable: true, writable: true });
       }
-    }
-    Object.defineProperty(ContextReadableStream, "name", { value: "ReadableStream" });
-    G.ReadableStream = ContextReadableStream;
+      return wrapped === null ? source : wrapped;
+    } });
   }
 
   // Server callbacks are retained by the native network backend. Snapshot the

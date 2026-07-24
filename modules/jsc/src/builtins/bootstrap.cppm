@@ -1406,7 +1406,17 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     const validateBoolean = (value, name) => { if (typeof value !== "boolean") throw ERR_INVALID_ARG_TYPE(name, "boolean", value); };
     class AbortError extends Error { constructor(message = "The operation was aborted.", options = undefined) { if (options !== undefined && typeof options !== "object") throw ERR_INVALID_ARG_TYPE("options", "Object", options); super(message, options); this.code = "ABORT_ERR"; this.name = "AbortError"; } }
 
+    // node lib/events.js: the constructor does nothing itself, it defers to the
+    // REPLACEABLE `EventEmitter.init`. That indirection is the documented seam
+    // node:domain patches (`const eventInit = EventEmitter.init; EventEmitter.init
+    // = function (opts) { …stamp this.domain…; return eventInit.call(this, opts); }`),
+    // so it has to be a dynamic lookup — `init` used to alias the constructor
+    // itself, which made the override unreachable and left every emitter without
+    // the domain it was created in.
     function EventEmitter(opts) {
+      EventEmitter.init.call(this, opts);
+    }
+    function eventInit(opts) {
       if (this._events === undefined || this._events === Object.getPrototypeOf(this)._events) {
         this._events = { __proto__: null };
         this._eventsCount = 0;
@@ -1430,12 +1440,19 @@ inline constexpr char kBootstrapJS_[] = R"JS(
 
     function emitError(emitter, args) {
       const events = emitter._events;
-      args[0] ??= new Error("Unhandled error.");
-      if (!events) throw args[0];
+      // node substitutes a synthetic error ONLY on the no-listener throw path
+      // (lib/events.js: `throw new ERR_UNHANDLED_ERROR(...)`). A registered
+      // 'error' listener receives the emitted value verbatim, `null` and
+      // `undefined` included — overwriting args[0] up front handed the listener
+      // an "Unhandled error." Error instead, which node:domain then reported as
+      // the thrown value (test-domain-multiple-errors / -error-types emit every
+      // primitive and assert identity).
+      const unhandled = () => args[0] ?? new Error("Unhandled error.");
+      if (!events) throw unhandled();
       const errorMonitor = events[kErrorMonitor];
       if (errorMonitor) for (const handler of errorMonitor.slice()) handler.apply(emitter, args);
       const handlers = events.error;
-      if (!handlers) throw args[0];
+      if (!handlers) throw unhandled();
       for (const handler of handlers.slice()) handler.apply(emitter, args);
       return true;
     }
@@ -1662,7 +1679,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       emit(...args) { return this.asyncResource.runInAsyncScope(() => EventEmitterPrototype.emit.apply(this, args)); }
       emitDestroy() { this.asyncResource.emitDestroy(); }
     }
-    Object.assign(EventEmitter, { once, on, getEventListeners, getMaxListeners, setMaxListeners, EventEmitter, EventEmitterAsyncResource, usingDomains: false, captureRejectionSymbol, errorMonitor: kErrorMonitor, addAbortListener, init: EventEmitter, listenerCount });
+    Object.assign(EventEmitter, { once, on, getEventListeners, getMaxListeners, setMaxListeners, EventEmitter, EventEmitterAsyncResource, usingDomains: false, captureRejectionSymbol, errorMonitor: kErrorMonitor, addAbortListener, init: eventInit, listenerCount });
     return EventEmitter;
   })();
   def(["events"], EventEmitter);
