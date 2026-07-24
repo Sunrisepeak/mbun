@@ -505,6 +505,79 @@ inline constexpr std::string_view kZlibStreamJS = R"JS(
     try { Object.defineProperty(zmod, k, { value: patch[k], writable: true, enumerable: true, configurable: true }); }
     catch (e) { zmod[k] = patch[k]; }
   }
+
+  // ---- one-shot decompression with a non-default finishFlush ----------------
+  // node's convenience helpers are `zlibBuffer(new Ctor(opts), …)`, so
+  // `finishFlush: Z_SYNC_FLUSH` makes a truncated stream yield whatever decoded
+  // before the input ran out instead of erroring (test-zlib-truncated). The
+  // bootstrap one-shots call the whole-buffer natives, which have no such mode,
+  // so route just that case through the incremental handle here.
+  const decodeThroughHandle = (cfg, data, opts, finalFlush) => {
+    const isInflate = cfg.kind === K_INFLATE;
+    const mag = isInflate ? checkNum(opts ? opts.windowBits : undefined, "options.windowBits", cfg.fmt === "gzip" ? 9 : 8, 15, 15) : 0;
+    const h = ZN.streamOpen(cfg.kind, isInflate ? wbits(cfg.fmt, mag, true) : 0, -1, 8, 0, -1, 0, 0);
+    if (h < 0) throw errInitFailed("Initialization failed");
+    try {
+      const bytes = toBytes(data);
+      const out = [];
+      let off = 0, ended = false;
+      do {
+        const end = Math.min(off + Z_SLICE, bytes.length);
+        const res = ZN.streamProcess(h, end > off ? b64(bytes.subarray(off, end)) : EMPTY, end >= bytes.length ? finalFlush : F_NONE);
+        if (!res || !res.ok) { const e = new Error((res && res.message) || "zlib stream error"); e.errno = -3; e.code = "Z_DATA_ERROR"; throw e; }
+        if (res.b64) out.push(Buffer.from(res.b64, "base64"));
+        if (res.streamEnd) { ended = true; break; }
+        off = end;
+      } while (off < bytes.length);
+      // Same end-of-stream check _flush performs: a decoder that never reached
+      // the codec's stream end ran out of input mid-member.
+      if (finalFlush === F_FINISH && !ended) { const e = new Error("unexpected end of file"); e.errno = -5; e.code = "Z_BUF_ERROR"; throw e; }
+      return out.length === 1 ? out[0] : Buffer.concat(out);
+    } finally { try { ZN.streamClose(h); } catch (e) {} }
+  };
+  const decoderOneShots = {
+    inflateSync: { kind: K_INFLATE, fmt: "zlib", Engine: Inflate },
+    inflateRawSync: { kind: K_INFLATE, fmt: "raw", Engine: InflateRaw },
+    gunzipSync: { kind: K_INFLATE, fmt: "gzip", Engine: Gunzip },
+    unzipSync: { kind: K_INFLATE, fmt: "auto", Engine: Unzip },
+    brotliDecompressSync: { kind: K_BDEC, Engine: BrotliDecompress },
+    zstdDecompressSync: { kind: K_ZDEC, Engine: ZstdDecompress },
+  };
+  const asyncOf = { inflateSync: "inflate", inflateRawSync: "inflateRaw", gunzipSync: "gunzip", unzipSync: "unzip", brotliDecompressSync: "brotliDecompress", zstdDecompressSync: "zstdDecompress" };
+  for (const name of Object.keys(decoderOneShots)) {
+    const cfg = decoderOneShots[name];
+    const orig = zmod[name];
+    if (typeof orig !== "function") continue;
+    const finishDefault = Math.min(4, flushMax(cfg.kind));   // Z_FINISH / BROTLI_OPERATION_FINISH / ZSTD_e_end
+    const sync = function (data, opts) {
+      if (opts && typeof opts === "object" && typeof opts.finishFlush === "number" && opts.finishFlush !== finishDefault) {
+        const buf = decodeThroughHandle(cfg, data, opts, F_SYNC);
+        return opts.info ? { buffer: buf, engine: Object.create(cfg.Engine.prototype) } : buf;
+      }
+      try { return orig(data, opts); }
+      catch (e) {
+        // The whole-buffer natives collapse every decode failure into one generic
+        // message; node distinguishes truncated input ("unexpected end of file")
+        // from corrupt data. Re-run the failure through the incremental codec,
+        // which does report the distinction, purely to classify it. Only a codec
+        // error is reclassified — an ERR_BUFFER_TOO_LARGE cap is not.
+        if (!e || e.code !== "Z_DATA_ERROR") throw e;
+        try { decodeThroughHandle(cfg, data, opts, F_FINISH); }
+        catch (e2) { if (e2 && e2.message && e2.message !== e.message) throw e2; }
+        throw e;
+      }
+    };
+    const async = function (data, opts, cb) {
+      if (typeof opts === "function") { cb = opts; opts = undefined; }
+      if (typeof cb !== "function") throw errType("callback", "of type function", cb);
+      G.queueMicrotask(function () { let r; try { r = sync(data, opts); } catch (e) { cb(e); return; } cb(null, r); });
+    };
+    try { Object.defineProperty(zmod, name, { value: sync, writable: true, enumerable: true, configurable: true }); } catch (e) { zmod[name] = sync; }
+    const an = asyncOf[name];
+    if (an && typeof zmod[an] === "function") {
+      try { Object.defineProperty(zmod, an, { value: async, writable: true, enumerable: true, configurable: true }); } catch (e) { zmod[an] = async; }
+    }
+  }
 })();
 )JS";
 
