@@ -113,6 +113,44 @@ python3 "$repo_root/tools/integration/node_corpus_runner.py" \
 [ "$before" = "$(cat "$tmp/out-partial/results.tsv")" ] \
   || { echo "resume of a complete run must be a no-op" >&2; exit 1; }
 
+# A run KILLED mid-corpus must keep what it already measured. Writing results
+# only at the end made the whole run all-or-nothing, which is the very failure
+# --resume exists to prevent: a full corpus outlives an agent turn and the
+# SIGTERM at that boundary threw away everything.
+kill_corpus="$tmp/killcorpus/parallel"
+mkdir -p "$kill_corpus"
+for i in $(seq 1 12); do echo "// slow" >"$kill_corpus/test-slow$i.js"; done
+cat >"$tmp/slow-mbun" <<'EOF'
+#!/usr/bin/env bash
+sleep 0.4
+EOF
+chmod +x "$tmp/slow-mbun"
+
+timeout -s TERM 2 python3 "$repo_root/tools/integration/node_corpus_runner.py" \
+  --bin "$tmp/slow-mbun" --root "$tmp" --corpus killcorpus/parallel \
+  --out "$tmp/out-killed" --jobs 1 --timeout 5 >/dev/null 2>&1 || true
+
+partial="$tmp/out-killed/results.partial.tsv"
+[ -f "$partial" ] || { echo "killed run left no journal at all" >&2; exit 1; }
+rows=$(($(wc -l <"$partial") - 1))
+[ "$rows" -ge 1 ] || { echo "killed run journalled no results (rows=$rows)" >&2; exit 1; }
+[ "$rows" -lt 12 ] || { echo "expected the kill to interrupt the run, got all $rows" >&2; exit 1; }
+
+# ...and resuming from that journal finishes the rest without redoing them.
+python3 "$repo_root/tools/integration/node_corpus_runner.py" \
+  --bin "$tmp/slow-mbun" --root "$tmp" --corpus killcorpus/parallel \
+  --out "$tmp/out-killed" --jobs 4 --timeout 5 --resume >/dev/null
+
+python3 - "$tmp/out-killed" "$rows" <<'PY'
+import json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+s = json.loads((root / "summary.json").read_text())
+assert s["files"] == 12, s
+assert "incomplete" not in s, s
+# the journal is consumed once the sorted results.tsv is written
+assert not (root / "results.partial.tsv").exists()
+PY
+
 # A path that is not a file must fail loudly rather than silently shrink the run.
 echo "corpus/parallel/test-missing.js" >"$tmp/bad.txt"
 if python3 "$repo_root/tools/integration/node_corpus_runner.py" \

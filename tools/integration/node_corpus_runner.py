@@ -27,6 +27,7 @@ import hashlib
 import json
 import os
 import re
+import threading
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -67,8 +68,16 @@ def run_one(binary: Path, root: Path, output_dir: Path, timeout: float, path: st
     # artifacts (common.tmpDir -> .tmp.<id>) never collide. We give each job a
     # distinct id for the same reason, otherwise files that share one temp dir
     # spuriously fail with EEXIST on `.tmp.0`.
+    #
+    # The id must also be unique across *concurrent runner processes*. Parallel
+    # agent worktrees symlink one shared compat/node checkout, so `.tmp.<id>`
+    # resolves to the same directory for all of them: with a bare per-job index,
+    # two agents both running job 3 collide and one file fails with
+    # `EEXIST ... mkdir '.../.tmp.3'`. That looked like a code regression in two
+    # separate guard runs and was neither reproducible nor real -- both files
+    # passed standalone. The pid disambiguates the runs.
     env = dict(os.environ)
-    env["TEST_THREAD_ID"] = str(thread_id)
+    env["TEST_THREAD_ID"] = f"{os.getpid()}_{thread_id}"
     bounded = BoundedRun(
         output_dir / relative_log,
         private_tmp=output_dir / "tmp" / log_name(path)[:12],
@@ -130,6 +139,11 @@ def read_file_list(root: Path, list_path: Path) -> list[str]:
 COLUMNS = ("path", "exit_code", "classification", "duration_ms", "log")
 
 
+def row_of(result: Result) -> str:
+    values = asdict(result)
+    return "\t".join(str(values[column]) for column in COLUMNS)
+
+
 def read_existing(output_dir: Path) -> dict[str, Result]:
     """Load an earlier (possibly partial) run from `--out`, keyed by path.
 
@@ -139,10 +153,19 @@ def read_existing(output_dir: Path) -> dict[str, Result]:
     invocations, which is the only way a full honest measurement gets taken at
     all in this environment.
     """
-    tsv = output_dir / "results.tsv"
-    if not tsv.is_file():
-        return {}
     existing: dict[str, Result] = {}
+    # A killed run leaves results.partial.tsv (the append journal) and no
+    # rewritten results.tsv; a completed one leaves the reverse. Read both, so
+    # resuming works whether the previous invocation exited cleanly or was
+    # SIGKILLed mid-corpus.
+    for tsv in (output_dir / "results.tsv", output_dir / "results.partial.tsv"):
+        if not tsv.is_file():
+            continue
+        _load_rows(tsv, existing)
+    return existing
+
+
+def _load_rows(tsv: Path, existing: dict[str, Result]) -> None:
     with tsv.open(encoding="utf-8") as stream:
         header = stream.readline().rstrip("\n").split("\t")
         for line in stream:
@@ -158,7 +181,6 @@ def read_existing(output_dir: Path) -> dict[str, Result]:
                     int(row["duration_ms"]), row["log"])
             except (KeyError, ValueError):
                 continue
-    return existing
 
 
 def write_outputs(output_dir: Path, results: list[Result], remaining: int = 0) -> None:
@@ -236,21 +258,47 @@ def main() -> int:
     jobs = max(1, args.jobs)
     deadline = time.monotonic() + args.max_seconds if args.max_seconds > 0 else None
     results = list(done.values())
+
+    # Persist every result the moment it lands. Writing only at the end made the
+    # whole run all-or-nothing: a full corpus outlives an agent turn, and the
+    # SIGTERM at that boundary threw away everything already measured -- the very
+    # failure --resume exists to prevent. The append log is the durable record;
+    # results.tsv is rewritten sorted at the end for a stable diff.
+    journal_path = output_dir / "results.partial.tsv"
+    if not journal_path.exists() or not args.resume:
+        journal_path.write_text("\t".join(COLUMNS) + "\n", encoding="utf-8")
+        with journal_path.open("a", encoding="utf-8") as stream:
+            for result in results:
+                stream.write(row_of(result) + "\n")
+    journal_lock = threading.Lock()
+    journal = journal_path.open("a", encoding="utf-8")
+
     dispatched = 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as executor:
-        futures = []
-        for index, path in enumerate(pending):
-            # Check the budget before *dispatching*, never mid-file: a file that
-            # started must finish and be recorded, otherwise the budget itself
-            # would manufacture phantom timeouts.
-            if deadline is not None and time.monotonic() >= deadline:
-                break
-            futures.append(
-                executor.submit(run_one, binary, root, output_dir, args.timeout, path, index % jobs))
-            dispatched += 1
-        results.extend(future.result() for future in futures)
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as executor:
+            futures = []
+            for index, path in enumerate(pending):
+                # Check the budget before *dispatching*, never mid-file: a file
+                # that started must finish and be recorded, otherwise the budget
+                # itself would manufacture phantom timeouts.
+                if deadline is not None and time.monotonic() >= deadline:
+                    break
+                futures.append(
+                    executor.submit(run_one, binary, root, output_dir, args.timeout, path, index % jobs))
+                dispatched += 1
+            for future in concurrent.futures.as_completed(futures):
+                result = future.result()
+                results.append(result)
+                with journal_lock:
+                    journal.write(row_of(result) + "\n")
+                    journal.flush()
+                    os.fsync(journal.fileno())
+    finally:
+        journal.close()
+
     remaining = len(pending) - dispatched
     write_outputs(output_dir, results, remaining=remaining)
+    journal_path.unlink(missing_ok=True)
     if remaining:
         print(f"budget exhausted: {remaining} file(s) not run — re-invoke with --resume", flush=True)
     return 0

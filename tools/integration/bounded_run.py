@@ -84,6 +84,38 @@ DEFAULT_KILL_GRACE_SEC = 3
 MIN_DISK_HEADROOM_BYTES = 2 * 1024**3
 
 
+@functools.cache
+def suppress_core_dumps() -> bool:
+    """Set RLIMIT_CORE to 0 for this process and everything it spawns.
+
+    A corpus round runs thousands of files and a large minority abort or
+    segfault. This host pipes core_pattern into apport, so EVERY crash forks a
+    crash reporter that reads the whole core through a pipe -- during a run that
+    is a continuous tax in CPU, RAM and disk, on top of the cores themselves.
+    It also actively obstructs debugging: apport swallows the core, which is
+    already recorded in the changelog as the reason a heap use-after-free could
+    not be chased.
+
+    Cores are not this project's debugging path anyway -- modules/crash_handler
+    installs a chaining handler that prints a symbolised backtrace in-process,
+    which survives here because it runs *before* the kernel dumps.
+
+    Set once in the parent so children inherit it; preexec_fn would run per-fork
+    and is unsafe from the thread pools the runners use. Escape hatch:
+    MBUN_ALLOW_CORE=1 for someone deliberately collecting a core.
+    """
+    if os.environ.get("MBUN_ALLOW_CORE") == "1":
+        return False
+    try:
+        import resource
+
+        _, hard = resource.getrlimit(resource.RLIMIT_CORE)
+        resource.setrlimit(resource.RLIMIT_CORE, (0, hard))
+    except (ImportError, OSError, ValueError):
+        return False
+    return True
+
+
 def force_rmtree(path: Path) -> None:
     """rmtree that also removes chmod-000 debris left by permission tests.
 
@@ -135,6 +167,7 @@ class BoundedRun:
         memory_max: str = DEFAULT_MEMORY_MAX,
         tasks_max: int = DEFAULT_TASKS_MAX,
     ) -> BoundedResult:
+        suppress_core_dumps()
         full_env = dict(env if env is not None else os.environ)
         if self.privateTmp is not None:
             self.privateTmp.mkdir(parents=True, exist_ok=True)

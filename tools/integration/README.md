@@ -94,6 +94,18 @@ frozen machine or a silently murdered harness.
   previously mis-wired worktree, refuses to touch a populated one, preserves
   `target/` (the incremental build cache), and *proves* the wiring by resolving
   the corpus before it returns.
+- `build_lock.sh` — serialises expensive builds **across** parallel agent
+  worktrees: `build_lock.sh mcpp build`. `mcpp build`'s link phase spawns many
+  `ld` processes at ~1 GB RSS each; one build is fine on this box, three
+  overlapping ones are not (a measured round-9 peak hit load 41, drove available
+  memory from ~40 GB to 19 GB and filled the 2 GB swapfile — one step short of
+  the freeze the whole bounded layer exists to prevent, arriving through the
+  build rather than through a test). Per-agent discipline cannot fix it because
+  no agent can see the other worktrees; the lock lives in the shared
+  `--git-common-dir`, so it spans every linked worktree and every agent process.
+  `MBUN_BUILD_SLOTS` (default 1) sets how many may run at once,
+  `MBUN_BUILD_WAIT` how long to wait before giving up with exit 75 — it never
+  runs the command after giving up.
 - `smoke_examples.py` — boots each `examples/` app in turn, requests
   `http://127.0.0.1:3000/`, asserts a 2xx, then reaps the whole process tree
   (`bounded_run.BoundedServer`). Sequential by design: the demos all hardcode
@@ -113,6 +125,7 @@ bash tools/integration/tests/test_corpus_diff.sh
 bash tools/integration/tests/test_cluster_finder.sh
 bash tools/integration/tests/test_smoke_examples.sh
 bash tools/integration/tests/test_worktree_setup.sh
+bash tools/integration/tests/test_build_lock.sh
 bash benchmarks/tools/test-bench3.sh
 ```
 
