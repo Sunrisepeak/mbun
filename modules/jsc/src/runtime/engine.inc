@@ -1250,7 +1250,14 @@ public:
   // a `--compile`d executable can carry in its baked execArgv) survives; the ??=
   // keeps "bun" as the default for every ordinary run.
   p.pid = 1; p.ppid = 0; p.exitCode = 0; p.title ??= "bun";
-  p.nextTick = function (fn) { const a = Array.prototype.slice.call(arguments, 1); queueMicrotask(function () { fn.apply(null, a); }); };
+  // A throw out of a nextTick callback is an *uncaught exception* carrying the
+  // thrown value (node: processTicksAndRejections runs ticks outside any
+  // promise). Draining through queueMicrotask alone turned it into an
+  // ERR_UNHANDLED_REJECTION wrapping the value, so a listener saw an Error
+  // describing the rejection instead of the value itself — node:repl reports
+  // `Uncaught null` for `process.nextTick(() => { throw null; })`. With no
+  // listener the rethrow keeps the previous behaviour exactly.
+  p.nextTick = function (fn) { const a = Array.prototype.slice.call(arguments, 1); queueMicrotask(function () { try { fn.apply(null, a); } catch (e) { if (typeof p.listenerCount === "function" && p.listenerCount("uncaughtException") > 0) p.emit("uncaughtException", e); else throw e; } }); };
   const nanos = () => (globalThis.Bun && Bun.nanoseconds ? Bun.nanoseconds() : 0);
   p.hrtime = function (prev) {
     const t = nanos(); let s = Math.floor(t / 1e9), n = Math.floor(t % 1e9);
