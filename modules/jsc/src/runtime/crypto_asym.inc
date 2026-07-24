@@ -846,6 +846,58 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_ecdh_convert_host,
 //   crosses into JS. OpenSSL's X25519 derive fails on an all-zero output, which
 //   is the RFC 7748 §6.1 small-order-point rejection the spec requires.
 // ref: bun src/jsc/bindings/webcrypto/CryptoAlgorithmX25519.cpp platformDeriveBits.
+// __mbunCryptoAsymNative.kmac(name, key, data, customization, outLenBytes) →
+//   Uint8Array with the KMAC tag. `name` is OpenSSL's MAC name ("KMAC-128" /
+//   "KMAC-256"); `customization` is NIST SP 800-185's optional S string.
+//   Backs WebCrypto's KMAC128/KMAC256 sign & verify.
+// ref: node src/crypto/crypto_mac.cc (KmacJob) + OpenSSL EVP_MAC-KMAC(7).
+JSC_DEFINE_HOST_FUNCTION(node_asym_kmac_host,
+                         (JSC::JSGlobalObject* global, JSC::CallFrame* frame)) {
+    JSContextRef ctx{toRef(global)};
+    const std::string name{asym_str(global, native_arg(frame, 0))};
+    std::vector<std::uint8_t> key;
+    std::vector<std::uint8_t> data;
+    std::vector<std::uint8_t> custom;
+    if (!asym_read(global, native_arg(frame, 1), key)) {
+        return hasher_throw(global, "kmac: key required");
+    }
+    asym_read(global, native_arg(frame, 2), data);
+    asym_read(global, native_arg(frame, 3), custom);
+    const int outLen{asym_int(native_arg(frame, 4), 32)};
+    if (outLen < 0) { return hasher_throw(global, "kmac: invalid output length"); }
+
+    struct MacDel { void operator()(EVP_MAC* m) const { if (m) EVP_MAC_free(m); } };
+    struct MacCtxDel { void operator()(EVP_MAC_CTX* c) const { if (c) EVP_MAC_CTX_free(c); } };
+    std::unique_ptr<EVP_MAC, MacDel> mac{EVP_MAC_fetch(nullptr, name.c_str(), nullptr)};
+    if (!mac) { return hasher_throw(global, "kmac: unsupported MAC " + name); }
+    std::unique_ptr<EVP_MAC_CTX, MacCtxDel> mctx{EVP_MAC_CTX_new(mac.get())};
+    if (!mctx) { return hasher_throw(global, "kmac: context allocation failed"); }
+
+    std::size_t size{static_cast<std::size_t>(outLen)};
+    OSSL_PARAM params[3];
+    int n{0};
+    params[n++] = OSSL_PARAM_construct_size_t(OSSL_MAC_PARAM_SIZE, &size);
+    if (!custom.empty()) {
+        params[n++] = OSSL_PARAM_construct_octet_string(
+            OSSL_MAC_PARAM_CUSTOM, custom.data(), custom.size());
+    }
+    params[n] = OSSL_PARAM_construct_end();
+
+    if (EVP_MAC_init(mctx.get(), key.data(), key.size(), params) <= 0) {
+        return hasher_throw(global, "kmac init failed: " + asym_ossl_err());
+    }
+    if (!data.empty() && EVP_MAC_update(mctx.get(), data.data(), data.size()) <= 0) {
+        return hasher_throw(global, "kmac update failed: " + asym_ossl_err());
+    }
+    std::vector<std::uint8_t> out(size == 0 ? 1 : size);
+    std::size_t outl{0};
+    if (EVP_MAC_final(mctx.get(), out.data(), &outl, out.size()) <= 0) {
+        return hasher_throw(global, "kmac final failed: " + asym_ossl_err());
+    }
+    out.resize(outl);
+    return JSC::JSValue::encode(toJS(global, static_cast<JSValueRef>(asym_u8(ctx, out))));
+}
+
 JSC_DEFINE_HOST_FUNCTION(node_asym_okp_derive_host,
                          (JSC::JSGlobalObject* global, JSC::CallFrame* frame)) {
     JSContextRef ctx{toRef(global)};

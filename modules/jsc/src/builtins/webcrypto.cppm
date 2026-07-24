@@ -37,6 +37,13 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
       e.code = "ERR_ILLEGAL_CONSTRUCTOR";
       return e;
     };
+    // webidl.requiredArguments -> ERR_MISSING_ARGS.
+    const missingArgs = (need, got) => {
+      const e = new TypeError(need + " argument" + (need > 1 ? "s" : "") +
+        " required, but only " + got + " present.");
+      e.code = "ERR_MISSING_ARGS";
+      return e;
+    };
     const invalidThis = (what) => {
       const e = new TypeError('Value of "this" must be of type ' + what);
       e.code = "ERR_INVALID_THIS";
@@ -198,7 +205,7 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
 
     const algNames = ["RSASSA-PKCS1-v1_5", "RSA-PSS", "RSA-OAEP", "ECDSA", "ECDH", "AES-CTR",
       "AES-CBC", "AES-GCM", "AES-OCB", "AES-KW", "ChaCha20-Poly1305", "HMAC", "PBKDF2", "HKDF",
-      "Ed25519", "Ed448", "X25519", "X448"];
+      "Ed25519", "Ed448", "X25519", "X448", "KMAC128", "KMAC256"];
     const algByUpper = new Map(algNames.map((n) => [n.toUpperCase(), n]));
     const normalizeAlg = (algorithm) => {
       const value = normalizeAlgorithm(algorithm);
@@ -276,7 +283,11 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
       }
     };
 
-    const SIGN_ALGS = new Set(["RSASSA-PKCS1-v1_5", "RSA-PSS", "ECDSA", "Ed25519", "Ed448", "HMAC"]);
+    const SIGN_ALGS = new Set(["RSASSA-PKCS1-v1_5", "RSA-PSS", "ECDSA", "Ed25519", "Ed448",
+      "HMAC", "KMAC128", "KMAC256"]);
+    // NIST SP 800-185 KMAC. Like AES-OCB/ChaCha20-Poly1305 its raw secret only
+    // travels under the explicit "raw-secret" format.
+    const KMAC_ALGS = new Set(["KMAC128", "KMAC256"]);
     const DERIVE_ALGS = new Set(["ECDH", "X25519", "X448", "PBKDF2", "HKDF"]);
     const AES_ALGS = new Set(["AES-CTR", "AES-CBC", "AES-GCM", "AES-OCB", "AES-KW"]);
     // AEAD ciphers whose ciphertext carries an authentication tag (WebCrypto
@@ -285,13 +296,13 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
     const AEAD_ALGS = new Set(["AES-GCM", "AES-OCB", "ChaCha20-Poly1305"]);
     // Symmetric ciphers whose raw import/export only accepts the explicit
     // "raw-secret" format (node 24+ split "raw" per key kind).
-    const RAW_SECRET_ONLY = new Set(["AES-OCB", "ChaCha20-Poly1305"]);
+    const RAW_SECRET_ONLY = new Set(["AES-OCB", "ChaCha20-Poly1305", "KMAC128", "KMAC256"]);
     const RSA_ALGS = new Set(["RSASSA-PKCS1-v1_5", "RSA-PSS", "RSA-OAEP"]);
     const EC_ALGS = new Set(["ECDSA", "ECDH"]);
     const OKP_ALGS = new Set(["Ed25519", "Ed448", "X25519", "X448"]);
     // Legal usages per algorithm/key-type (spec operation tables).
     const allowedUsagesFor = (name, type) => {
-      if (name === "HMAC") return ["sign", "verify"];
+      if (name === "HMAC" || KMAC_ALGS.has(name)) return ["sign", "verify"];
       if (SIGN_ALGS.has(name)) return type === "public" ? ["verify"] : ["sign"];
       if (name === "RSA-OAEP") {
         return type === "public" ? ["encrypt", "wrapKey"] : ["decrypt", "unwrapKey"];
@@ -436,6 +447,8 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
       if (name === "AES-CBC") return "A" + algorithm.length + "CBC";
       if (name === "AES-CTR") return "A" + algorithm.length + "CTR";
       if (name === "AES-OCB") return "A" + algorithm.length + "OCB";
+      if (name === "KMAC128") return "K128";
+      if (name === "KMAC256") return "K256";
       if (name === "AES-KW") return "A" + algorithm.length + "KW";
       if (name === "ChaCha20-Poly1305") return "C20P";
       if (name === "Ed25519" || name === "Ed448") return name;
@@ -589,6 +602,19 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
         throw err;
       }
       return saltLength;
+    };
+    // KMAC(K, X, L, S) over the EVP_MAC binding. `outputLength` is required and
+    // must be a whole number of bytes; `customization` is the optional S string.
+    // ref: node lib/internal/crypto/{mac.js kmacSignVerify, webidl.js KmacParams}.
+    const kmacBytes = (alg, metadata, data) => {
+      requiredMember(alg.outputLength, "algorithm.outputLength");
+      const bits = Number(alg.outputLength);
+      if (!Number.isInteger(bits) || bits < 0 || bits % 8 !== 0) {
+        throw notSupported("Unsupported KmacParams outputLength");
+      }
+      const custom = alg.customization != null ? copyBytes(alg.customization) : new Uint8Array(0);
+      return new Uint8Array(AN().kmac(metadata.algorithm.name === "KMAC128" ? "KMAC-128" : "KMAC-256",
+        metadata.secret, data, custom, bits / 8));
     };
     const signBytes = (alg, metadata, data) => {
       const name = metadata.algorithm.name;
@@ -994,7 +1020,7 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
       }
 
       async generateKey(algorithm, extractable, keyUsages) {
-        if (arguments.length < 3) throw new TypeError("Not enough arguments");
+        if (arguments.length < 3) throw missingArgs(3, arguments.length);
         const alg = normalizeAlg(algorithm);
         const usages = normalizeUsages(keyUsages);
         const name = alg.name;
@@ -1009,6 +1035,16 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
             throw operationError("Invalid key length");
           }
           return importHmacKey(randomBytes(bits / 8), hash, extractable, usages, null);
+        }
+        if (KMAC_ALGS.has(name)) {
+          restrictUsages(usages, ["sign", "verify"], name);
+          requireUsages(usages);
+          const bits = alg.length == null ? (name === "KMAC128" ? 128 : 256) : Number(alg.length);
+          if (!Number.isInteger(bits) || bits === 0 || bits % 8 !== 0) {
+            throw operationError("Invalid key length");
+          }
+          return makeKey("secret", { name, length: bits }, extractable, usages,
+            { secret: randomBytes(bits / 8) });
         }
         if (name === "ChaCha20-Poly1305") {
           // A ChaCha20-Poly1305 key is always 256 bits and carries no `length`
@@ -1031,7 +1067,7 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
       // synchronous bridge into the same import steps, and the public wrapper
       // promisifies the result anyway.
       importKey(format, keyData, algorithm, extractable, keyUsages) {
-        if (arguments.length < 5) throw new TypeError("Not enough arguments");
+        if (arguments.length < 5) throw missingArgs(5, arguments.length);
         const convertedFormat = keyFormat(format);
         const alg = normalizeAlg(algorithm);
         const usages = normalizeUsages(keyUsages);
@@ -1079,6 +1115,19 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
           return importHmacKey(raw, hash, extractable, usages, alg.length);
         }
 
+        if (KMAC_ALGS.has(name)) {
+          if (!rawSecret && convertedFormat !== "jwk") throw unsupportedFormat();
+          restrictUsages(usages, ["sign", "verify"], name);
+          const raw = convertedFormat === "jwk" ? octFromJwk("sig") : copyBytes(keyData);
+          checkJwkAlg(name === "KMAC128" ? "K128" : "K256");
+          const bits = raw.byteLength * 8;
+          if (bits === 0) throw dataError("Zero-length key is not supported");
+          if (alg.length !== undefined && Number(alg.length) !== bits) {
+            throw dataError("Invalid key length");
+          }
+          requireImportUsages(usages, "secret");
+          return makeKey("secret", { name, length: bits }, extractable, usages, { secret: raw });
+        }
         if (name === "ChaCha20-Poly1305") {
           if (!rawSecret && convertedFormat !== "jwk") throw unsupportedFormat();
           const raw = convertedFormat === "jwk" ? octFromJwk("enc") : copyBytes(keyData);
@@ -1183,7 +1232,7 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
       }
 
       exportKey(format, key) {
-        if (arguments.length < 2) throw new TypeError("Not enough arguments");
+        if (arguments.length < 2) throw missingArgs(2, arguments.length);
         const convertedFormat = keyFormat(format);
         const metadata = keyMetadata.get(key);
         if (!metadata) throw invalidThis("CryptoKey");
@@ -1237,11 +1286,12 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
       }
 
       async sign(algorithm, key, data) {
-        if (arguments.length < 3) throw new TypeError("Not enough arguments");
+        if (arguments.length < 3) throw missingArgs(3, arguments.length);
         const alg = normalizeAlg(algorithm);
         const metadata = requireKey(key, alg.name, "sign");
         const bytes = copyBytes(data);
         if (alg.name === "HMAC") return arrayBuffer(hmacRaw(metadata.algorithm.hash.name, metadata.secret, bytes));
+        if (KMAC_ALGS.has(alg.name)) return arrayBuffer(kmacBytes(alg, metadata, bytes));
         if (metadata.type !== "private") {
           throw domError("Key must be a private key", "InvalidAccessError");
         }
@@ -1249,13 +1299,15 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
       }
 
       async verify(algorithm, key, signature, data) {
-        if (arguments.length < 4) throw new TypeError("Not enough arguments");
+        if (arguments.length < 4) throw missingArgs(4, arguments.length);
         const alg = normalizeAlg(algorithm);
         const metadata = requireKey(key, alg.name, "verify");
         const sig = copyBytes(signature);
         const bytes = copyBytes(data);
-        if (alg.name === "HMAC") {
-          const expected = hmacRaw(metadata.algorithm.hash.name, metadata.secret, bytes);
+        if (alg.name === "HMAC" || KMAC_ALGS.has(alg.name)) {
+          const expected = alg.name === "HMAC"
+            ? hmacRaw(metadata.algorithm.hash.name, metadata.secret, bytes)
+            : kmacBytes(alg, metadata, bytes);
           if (expected.length !== sig.length) return false;
           let diff = 0;
           for (let i = 0; i < expected.length; i++) diff |= expected[i] ^ sig[i];
@@ -1268,19 +1320,19 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
       }
 
       async encrypt(algorithm, key, data) {
-        if (arguments.length < 3) throw new TypeError("Not enough arguments");
+        if (arguments.length < 3) throw missingArgs(3, arguments.length);
         const alg = normalizeAlg(algorithm);
         return arrayBuffer(encryptBytes(alg, requireKey(key, alg.name, "encrypt"), copyBytes(data)));
       }
 
       async decrypt(algorithm, key, data) {
-        if (arguments.length < 3) throw new TypeError("Not enough arguments");
+        if (arguments.length < 3) throw missingArgs(3, arguments.length);
         const alg = normalizeAlg(algorithm);
         return arrayBuffer(decryptBytes(alg, requireKey(key, alg.name, "decrypt"), copyBytes(data)));
       }
 
       async deriveBits(algorithm, baseKey, length = null) {
-        if (arguments.length < 2) throw new TypeError("Not enough arguments");
+        if (arguments.length < 2) throw missingArgs(2, arguments.length);
         const alg = normalizeDeriveAlg(normalizeAlg(algorithm));
         const metadata = requireKey(baseKey, alg.name, "deriveBits");
         const bits = length == null ? null : Number(length);
@@ -1291,7 +1343,7 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
       }
 
       async deriveKey(algorithm, baseKey, derivedKeyType, extractable, keyUsages) {
-        if (arguments.length < 5) throw new TypeError("Not enough arguments");
+        if (arguments.length < 5) throw missingArgs(5, arguments.length);
         const alg = normalizeDeriveAlg(normalizeAlg(algorithm));
         const metadata = requireKey(baseKey, alg.name, "deriveKey");
         const derived = normalizeAlg(derivedKeyType);
@@ -1299,6 +1351,11 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
         let bits;
         if (AES_ALGS.has(derived.name)) bits = requireAesLength(derived.length);
         else if (derived.name === "ChaCha20-Poly1305") bits = 256;
+        else if (KMAC_ALGS.has(derived.name)) {
+          bits = derived.length == null ? (derived.name === "KMAC128" ? 128 : 256)
+                                        : Number(derived.length);
+          if (bits === 0) throw dataError("KmacImportParams.length cannot be 0");
+        }
         else if (derived.name === "HMAC") {
           const hash = memberHash(derived);
           bits = derived.length == null ? hashBlockBits[hash.name] : Number(derived.length);
@@ -1312,7 +1369,7 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
       }
 
       async wrapKey(format, key, wrappingKey, wrapAlgorithm) {
-        if (arguments.length < 4) throw new TypeError("Not enough arguments");
+        if (arguments.length < 4) throw missingArgs(4, arguments.length);
         const alg = normalizeAlg(wrapAlgorithm);
         const wrapper = requireKey(wrappingKey, alg.name, "wrapKey");
         const exported = await this.exportKey(format, key);
@@ -1332,7 +1389,7 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
 
       async unwrapKey(format, wrappedKey, unwrappingKey, unwrapAlgorithm, unwrappedKeyAlgorithm,
                       extractable, keyUsages) {
-        if (arguments.length < 7) throw new TypeError("Not enough arguments");
+        if (arguments.length < 7) throw missingArgs(7, arguments.length);
         const alg = normalizeAlg(unwrapAlgorithm);
         const wrapper = requireKey(unwrappingKey, alg.name, "unwrapKey");
         const bytes = decryptBytes(alg, wrapper, copyBytes(wrappedKey));
@@ -1384,7 +1441,7 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
       configurable: true, writable: true, enumerable: true,
       value: function supports(operation, algorithm) {
         if (this !== SubtleCrypto) throw invalidThis("SubtleCrypto constructor");
-        if (arguments.length < 2) throw new TypeError("Not enough arguments");
+        if (arguments.length < 2) throw missingArgs(2, arguments.length);
         try {
           const alg = normalizeAlg(algorithm);
           const table = opAlgs[String(operation)];
@@ -1439,7 +1496,7 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
       configurable: true, writable: true, enumerable: true,
       value: function getRandomValues(array) {
         requireCrypto(this);
-        if (arguments.length < 1) throw new TypeError("Not enough arguments");
+        if (arguments.length < 1) throw missingArgs(1, arguments.length);
         return webGetRandomValues(array);
       },
     });
