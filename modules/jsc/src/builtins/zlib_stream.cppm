@@ -127,6 +127,63 @@ inline constexpr std::string_view kZlibStreamJS = R"JS(
   const Brotli = makeAbstract("Brotli", ZlibBase.prototype, ZlibBase);
   const Zstd = makeAbstract("Zstd", ZlibBase.prototype, ZlibBase);
 
+  // ---- options.params validation (node lib/zlib.js Brotli/Zstd constructors) ----
+  // The accepted key space is derived from the exported constants exactly the way
+  // node derives kMaxBrotliParam / kMaxZstd{C,D}Param, so a key outside it (or a
+  // key seen twice, e.g. "0" and "00") is ERR_BROTLI_INVALID_PARAM /
+  // ERR_ZSTD_INVALID_PARAM. A key that is in range but carries a value the codec
+  // itself rejects surfaces as ERR_ZLIB_INITIALIZATION_FAILED, matching the
+  // failed BrotliEncoderSetParameter / ZSTD_CCtx_setParameter node reports.
+  const zc = (zmod.constants || {});
+  const maxParamWithPrefix = (prefix) => {
+    let max = 0;
+    for (const k of Object.keys(zc)) if (k.startsWith(prefix) && zc[k] > max) max = zc[k];
+    return max;
+  };
+  const maxBrotliParam = maxParamWithPrefix("BROTLI_PARAM_");
+  const maxZstdCParam = maxParamWithPrefix("ZSTD_c_");
+  const maxZstdDParam = maxParamWithPrefix("ZSTD_d_");
+  const errInvalidParam = (code, origKey, what) => {
+    const e = new RangeError(origKey + " is not a valid " + what + " parameter");
+    e.code = code;
+    return e;
+  };
+  const errInitFailed = (message) => {
+    const e = new Error(message);
+    e.code = "ERR_ZLIB_INITIALIZATION_FAILED";
+    return e;
+  };
+  // brotli encoder.c BrotliEncoderSetParameter: the two boolean flags and
+  // NPOSTFIX reject out-of-range values, which node reports as a failed init.
+  const brotliSetParam = (key, value) => {
+    if ((key === 4 || key === 6) && value !== 0 && value !== 1) throw errInitFailed("Initialization failed");
+    if (key === 7 && (value < 0 || value > 3)) throw errInitFailed("Initialization failed");
+  };
+  // ZSTD_CCtx_setParameter / ZSTD_DCtx_setParameter bounds (ZSTD_cParam_getBounds).
+  const zstdSetCParam = (key, value) => {
+    if (key === 107 && (value < 0 || value > 9)) throw errInitFailed("Setting parameter failed");   // ZSTD_c_strategy
+  };
+  const zstdSetDParam = (key, value) => {
+    if (key === 100 && (value < 10 || value > 31)) throw errInitFailed("Setting parameter failed"); // ZSTD_d_windowLogMax
+  };
+  const flushMax = (kind) => (kind === K_BENC || kind === K_BDEC) ? 3 : ((kind === K_ZENC || kind === K_ZDEC) ? 2 : 5);
+  const checkParams = (o, maxParam, code, what, setParam) => {
+    const p = (o && o.params) || {};
+    const seen = new Set();
+    const out = {};
+    for (const origKey of Object.keys(p)) {
+      const key = +origKey;
+      if (Number.isNaN(key) || key < 0 || key > maxParam || seen.has(key)) throw errInvalidParam(code, origKey, what);
+      seen.add(key);
+      const pv = p[origKey];
+      if (typeof pv !== "number" && typeof pv !== "boolean") throw errType("options.params[" + origKey + "]", "of type number", pv);
+      const value = typeof pv === "boolean" ? (pv ? 1 : 0) : pv;
+      setParam(key, value);
+      out[key] = value;
+    }
+    return out;
+  };
+
   // ---- shared behaviour on ZlibBase.prototype ----
   const proto = ZlibBase.prototype;
 
@@ -146,25 +203,23 @@ inline constexpr std::string_view kZlibStreamJS = R"JS(
       this._strategy = strategy;
       return ZN.streamOpen(c.kind, wbits(c.fmt, mag, isDec), level, memLevel, strategy, -1, 0, 0);
     }
-    if (c.kind === K_BENC) {
-      const p = (o && o.params) || {};
+    if (c.kind === K_BENC || c.kind === K_BDEC) {
       // Brotli param values must be numbers or booleans (node coerces booleans).
-      for (const k of Object.keys(p)) {
-        const pv = p[k];
-        if (typeof pv !== "number" && typeof pv !== "boolean") throw errType("options.params[" + k + "]", "of type number", pv);
-      }
+      const p = checkParams(o, maxBrotliParam, "ERR_BROTLI_INVALID_PARAM", "Brotli", brotliSetParam);
       const q = typeof p[1] === "number" ? p[1] : -1;   // BROTLI_PARAM_QUALITY
       const lg = typeof p[2] === "number" ? p[2] : 0;    // BROTLI_PARAM_LGWIN
       const md = typeof p[0] === "number" ? p[0] : 0;    // BROTLI_PARAM_MODE
+      if (c.kind === K_BDEC) return ZN.streamOpen(K_BDEC, 0, -1, 8, 0, -1, 0, 0);
       return ZN.streamOpen(K_BENC, 0, -1, 8, 0, q, lg, md);
     }
-    if (c.kind === K_BDEC) return ZN.streamOpen(K_BDEC, 0, -1, 8, 0, -1, 0, 0);
     if (c.kind === K_ZENC) {
+      const p = checkParams(o, maxZstdCParam, "ERR_ZSTD_INVALID_PARAM", "zstd", zstdSetCParam);
       let level = 3;
       if (o && typeof o.level === "number") level = o.level;
-      else { const p = (o && o.params) || {}; if (typeof p[100] === "number") level = p[100]; }
+      else if (typeof p[100] === "number") level = p[100];   // ZSTD_c_compressionLevel
       return ZN.streamOpen(K_ZENC, 0, level, 8, 0, -1, 0, 0);
     }
+    checkParams(o, maxZstdDParam, "ERR_ZSTD_INVALID_PARAM", "zstd", zstdSetDParam);
     return ZN.streamOpen(K_ZDEC, 0, -1, 8, 0, -1, 0, 0);
   };
 
@@ -179,8 +234,12 @@ inline constexpr std::string_view kZlibStreamJS = R"JS(
     this._chunkSize = vopt(opts, "chunkSize", 64, Infinity, 16384);
     if (opts) {
       vopt(opts, "maxOutputLength", 0, Infinity, undefined);   // validate only
-      vopt(opts, "flush", 0, 5, 0);                            // Z_NO_FLUSH..Z_BLOCK
-      vopt(opts, "finishFlush", 0, 5, 4);
+      // Each family has its own flush enum: zlib Z_NO_FLUSH..Z_BLOCK (0..5),
+      // brotli BROTLI_OPERATION_PROCESS..EMIT_METADATA (0..3), zstd
+      // ZSTD_e_continue..ZSTD_e_end (0..2).
+      const maxFlush = flushMax(cfg.kind);
+      vopt(opts, "flush", 0, maxFlush, 0);
+      vopt(opts, "finishFlush", 0, maxFlush, Math.min(4, maxFlush));
       if (opts.dictionary !== undefined && opts.dictionary !== null &&
           !ArrayBuffer.isView(opts.dictionary) && !(opts.dictionary instanceof ArrayBuffer) &&
           !(G.SharedArrayBuffer && opts.dictionary instanceof G.SharedArrayBuffer)) {

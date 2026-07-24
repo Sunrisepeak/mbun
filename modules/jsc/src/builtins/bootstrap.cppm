@@ -2923,6 +2923,11 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   const zToU8 = (d) => { if (typeof d === "string") return G.Buffer.from(d, "utf8"); if (d instanceof ArrayBuffer || (G.SharedArrayBuffer && d instanceof G.SharedArrayBuffer)) return new Uint8Array(d); if (ArrayBuffer.isView(d)) return new Uint8Array(d.buffer, d.byteOffset, d.byteLength); throw new TypeError("Received an instance of " + (d === null ? "null" : typeof d) + " where a buffer was expected"); };
   const zB64 = (u8) => { let s = ""; for (let i = 0; i < u8.length; i += 8192) s += String.fromCharCode.apply(null, u8.subarray(i, Math.min(i + 8192, u8.length))); return G.btoa(s); };
   const zErr = (e) => { const err = e instanceof Error ? e : new Error(String(e)); err.code = "Z_DATA_ERROR"; err.errno = -3; return err; };
+  // kMaxLength as captured by require('zlib') — see the module registration below.
+  let zKMaxSnap = null, zKMaxArmed = false;
+  const zKMaxLive = () => (M.buffer && typeof M.buffer.kMaxLength === "number" ? M.buffer.kMaxLength : 0x7fffffff);
+  const zKMax = () => (zKMaxSnap !== null ? zKMaxSnap : zKMaxLive());
+  try { Object.defineProperty(G, "__mbunZlibArmKMax", { value: () => { zKMaxArmed = true; }, enumerable: false, configurable: true }); } catch (e) {}
   const zNum = (opts, k, d) => opts && typeof opts[k] === "number" ? opts[k] : d;
   // node-style ERR_INVALID_ARG_TYPE builder (property vs argument by '.' in name).
   const zFmtRecv = (v) => { if (v === null) return "null"; if (v === undefined) return "undefined"; const t = typeof v; if (t === "string") { let s = v; if (s.length > 25) s = s.slice(0, 25) + "..."; return "type string ('" + s + "')"; } if (t === "number" || t === "boolean" || t === "bigint") return "type " + t + " (" + String(v) + ")"; if (t === "function") return v.name ? "function " + v.name : "an instance of Function"; if (t === "object") { const cn = v.constructor && v.constructor.name; return "an instance of " + (cn || "Object"); } return "type " + t; };
@@ -2932,25 +2937,38 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   const zEngine = (name) => { const C = (M["zlib"] || {})[name]; return C ? Object.create(C.prototype) : {}; };
   const zInfo = (out, opts, engName) => (opts && opts.info) ? { buffer: out, engine: zEngine(engName) } : out;
   // node enforces kMaxLength across ALL codecs (lib/zlib.js → ERR_BUFFER_TOO_LARGE).
-  const zCap = (out, opts) => { const maxLen = opts && typeof opts.maxOutputLength === "number" ? opts.maxOutputLength : (M.buffer && M.buffer.kMaxLength); if (maxLen && out.length > maxLen) { const e = new RangeError("Cannot create a Buffer larger than " + maxLen + " bytes"); e.code = "ERR_BUFFER_TOO_LARGE"; throw e; } return out; };
+  const zCap = (out, opts) => { const maxLen = opts && typeof opts.maxOutputLength === "number" ? opts.maxOutputLength : zKMax(); if (maxLen && out.length > maxLen) { const e = new RangeError("Cannot create a Buffer larger than " + maxLen + " bytes"); e.code = "ERR_BUFFER_TOO_LARGE"; throw e; } return out; };
   // Bytes cross as a Uint8Array, not base64: the base64 bridge cost ~6x the
   // payload in transient strings per crossing and a 150 MB deflateRawSync was
   // OOM-killed. ZN.compress/decompress answer a Uint8Array for a typed-array
   // input (base64 string in, base64 string out is still supported).
-  const zSync = (op, fmt, engName) => (data, opts) => { const level = zNum(opts, "level", -1), wbits = zNum(opts, "windowBits", 15), memLevel = zNum(opts, "memLevel", 8), strategy = zNum(opts, "strategy", 0); const inp = zToU8(data); let r; try { r = op === "c" ? ZN.compress(inp, fmt, level, wbits, memLevel, strategy) : ZN.decompress(inp, fmt, wbits); } catch (e) { throw zErr(e); } const out = typeof r === "string" ? G.Buffer.from(r, "base64") : G.Buffer.from(r.buffer, r.byteOffset, r.byteLength);const maxLen = opts && typeof opts.maxOutputLength === "number" ? opts.maxOutputLength : (M.buffer && M.buffer.kMaxLength); if (op === "d" && maxLen && out.length > maxLen) { const e = new RangeError("Cannot create a Buffer larger than " + maxLen + " bytes"); e.code = "ERR_BUFFER_TOO_LARGE"; throw e; } return zInfo(out, opts, engName); };
+  const zSync = (op, fmt, engName) => (data, opts) => { const level = zNum(opts, "level", -1), wbits = zNum(opts, "windowBits", 15), memLevel = zNum(opts, "memLevel", 8), strategy = zNum(opts, "strategy", 0); const inp = zToU8(data); let r; try { r = op === "c" ? ZN.compress(inp, fmt, level, wbits, memLevel, strategy) : ZN.decompress(inp, fmt, wbits); } catch (e) { throw zErr(e); } const out = typeof r === "string" ? G.Buffer.from(r, "base64") : G.Buffer.from(r.buffer, r.byteOffset, r.byteLength);const maxLen = opts && typeof opts.maxOutputLength === "number" ? opts.maxOutputLength : zKMax(); if (op === "d" && maxLen && out.length > maxLen) { const e = new RangeError("Cannot create a Buffer larger than " + maxLen + " bytes"); e.code = "ERR_BUFFER_TOO_LARGE"; throw e; } return zInfo(out, opts, engName); };
   const zAsync = (sync) => (data, opts, cb) => { if (typeof opts === "function") { cb = opts; opts = undefined; } if (typeof cb !== "function") throw zArgType("callback", "of type function", cb); G.queueMicrotask(() => { try { cb(null, sync(data, opts)); } catch (e) { cb(e); } }); };
   const deflateSync = zSync("c", "zlib", "Deflate"), inflateSync = zSync("d", "zlib", "Inflate"), gzipSync = zSync("c", "gzip", "Gzip"), gunzipSync = zSync("d", "gzip", "Gunzip"), deflateRawSync = zSync("c", "raw", "DeflateRaw"), inflateRawSync = zSync("d", "raw", "InflateRaw"), unzipSync = zSync("d", "auto", "Unzip");
   // brotli (native BrotliEncoder/Decoder via __mbunZlibNative). node forwards
   // quality/lgwin/mode through opts.params keyed by BROTLI_PARAM_* (MODE=0,
   // QUALITY=1, LGWIN=2). All return Buffer.
   const brP = (opts) => { const p = (opts && opts.params) || {}; return [typeof p[1] === "number" ? p[1] : -1, typeof p[2] === "number" ? p[2] : 0, typeof p[0] === "number" ? p[0] : 0]; };
-  const brotliCompressSync = (data, opts) => { const q = brP(opts); let r; try { r = ZN.brotliCompress(zB64(zToU8(data)), q[0], q[1], q[2]); } catch (e) { throw zErr(e); } return zInfo(G.Buffer.from(r, "base64"), opts, "BrotliCompress"); };
-  const brotliDecompressSync = (data, opts) => { let r; try { r = ZN.brotliDecompress(zB64(zToU8(data))); } catch (e) { throw zErr(e); } return zInfo(zCap(G.Buffer.from(r, "base64"), opts), opts, "BrotliDecompress"); };
+  // The one-shot helpers bypass the Transform classes, so they have to repeat the
+  // per-family flush range check node's ZlibBase constructor performs: brotli
+  // flushes are BROTLI_OPERATION_* (0..3), zstd flushes are ZSTD_e_* (0..2).
+  const zRange = (name, rangeMsg, v) => { const e = new RangeError('The value of "' + name + '" is out of range. It must be ' + rangeMsg + ". Received " + String(v)); e.code = "ERR_OUT_OF_RANGE"; return e; };
+  const zFlushRange = (opts, max) => {
+    for (const k of ["flush", "finishFlush"]) {
+      const v = opts ? opts[k] : undefined;
+      if (v === undefined || v === null) continue;
+      if (typeof v !== "number") throw zArgType("options." + k, "of type number", v);
+      if (!Number.isFinite(v)) throw zRange("options." + k, "a finite number", v);
+      if (v < 0 || v > max) throw zRange("options." + k, ">= 0 and <= " + max, v);
+    }
+  };
+  const brotliCompressSync = (data, opts) => { zFlushRange(opts, 3); const q = brP(opts); let r; try { r = ZN.brotliCompress(zB64(zToU8(data)), q[0], q[1], q[2]); } catch (e) { throw zErr(e); } return zInfo(G.Buffer.from(r, "base64"), opts, "BrotliCompress"); };
+  const brotliDecompressSync = (data, opts) => { zFlushRange(opts, 3); let r; try { r = ZN.brotliDecompress(zB64(zToU8(data))); } catch (e) { throw zErr(e); } return zInfo(zCap(G.Buffer.from(r, "base64"), opts), opts, "BrotliDecompress"); };
   // zstd (native ZSTD_compress/decompress). level via opts.level or
   // opts.params[ZSTD_c_compressionLevel=100]; default 3.
   const zstdLvl = (opts) => { const l = zNum(opts, "level", -2); if (l !== -2) return l; const p = opts && opts.params; return p && typeof p[100] === "number" ? p[100] : 3; };
-  const zstdCompressSync = (data, opts) => { let r; try { r = ZN.zstdCompress(zB64(zToU8(data)), zstdLvl(opts)); } catch (e) { throw zErr(e); } return zInfo(G.Buffer.from(r, "base64"), opts, "ZstdCompress"); };
-  const zstdDecompressSync = (data, opts) => { let r; try { r = ZN.zstdDecompress(zB64(zToU8(data))); } catch (e) { throw zErr(e); } return zInfo(zCap(G.Buffer.from(r, "base64"), opts), opts, "ZstdDecompress"); };
+  const zstdCompressSync = (data, opts) => { zFlushRange(opts, 2); let r; try { r = ZN.zstdCompress(zB64(zToU8(data)), zstdLvl(opts)); } catch (e) { throw zErr(e); } return zInfo(G.Buffer.from(r, "base64"), opts, "ZstdCompress"); };
+  const zstdDecompressSync = (data, opts) => { zFlushRange(opts, 2); let r; try { r = ZN.zstdDecompress(zB64(zToU8(data))); } catch (e) { throw zErr(e); } return zInfo(zCap(G.Buffer.from(r, "base64"), opts), opts, "ZstdDecompress"); };
   // DEFERRED: streaming Transform classes (createGzip/createBrotliCompress/…,
   // and the zlib.Deflate/Brotli/Zstd class hierarchy). Real chunked streaming
   // needs the node threadpool _handle lifecycle AND a bounded native inflate
@@ -2965,7 +2983,15 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     BROTLI_MIN_WINDOW_BITS: 10, BROTLI_MAX_WINDOW_BITS: 24, BROTLI_LARGE_MAX_WINDOW_BITS: 30, BROTLI_DEFAULT_WINDOW: 22,
     BROTLI_MIN_INPUT_BLOCK_BITS: 16, BROTLI_MAX_INPUT_BLOCK_BITS: 24,
     BROTLI_DECODER_RESULT_ERROR: 0, BROTLI_DECODER_RESULT_SUCCESS: 1, BROTLI_DECODER_RESULT_NEEDS_MORE_INPUT: 2, BROTLI_DECODER_RESULT_NEEDS_MORE_OUTPUT: 3,
-    ZSTD_e_continue: 0, ZSTD_e_flush: 1, ZSTD_e_end: 2, ZSTD_c_compressionLevel: 100, ZSTD_d_windowLogMax: 100, ZSTD_CLEVEL_DEFAULT: 3, ZSTD_MIN_CLEVEL: -131072, ZSTD_MAX_CLEVEL: 22 };
+    ZSTD_e_continue: 0, ZSTD_e_flush: 1, ZSTD_e_end: 2, ZSTD_CLEVEL_DEFAULT: 3, ZSTD_MIN_CLEVEL: -131072, ZSTD_MAX_CLEVEL: 22,
+    // ZSTD_cParameter / ZSTD_dParameter ordinals (zstd.h). node derives the
+    // accepted options.params key space from these prefixes, so the full set has
+    // to be exported even where the codec bridge ignores the parameter.
+    ZSTD_c_compressionLevel: 100, ZSTD_c_windowLog: 101, ZSTD_c_hashLog: 102, ZSTD_c_chainLog: 103, ZSTD_c_searchLog: 104, ZSTD_c_minMatch: 105, ZSTD_c_targetLength: 106, ZSTD_c_strategy: 107,
+    ZSTD_c_enableLongDistanceMatching: 160, ZSTD_c_ldmHashLog: 161, ZSTD_c_ldmMinMatch: 162, ZSTD_c_ldmBucketSizeLog: 163, ZSTD_c_ldmHashRateLog: 164,
+    ZSTD_c_contentSizeFlag: 200, ZSTD_c_checksumFlag: 201, ZSTD_c_dictIDFlag: 202,
+    ZSTD_c_nbWorkers: 400, ZSTD_c_jobSize: 401, ZSTD_c_overlapLog: 402,
+    ZSTD_d_windowLogMax: 100 };
   // node: zlib.codes maps the return codes both ways (name to num and num to
   // name) and is frozen; zlib.constants is frozen (Z_OK etc. must be immutable).
   const zCodes = { Z_OK: 0, Z_STREAM_END: 1, Z_NEED_DICT: 2, Z_ERRNO: -1, Z_STREAM_ERROR: -2, Z_DATA_ERROR: -3, Z_MEM_ERROR: -4, Z_BUF_ERROR: -5, Z_VERSION_ERROR: -6 };
@@ -2982,7 +3008,18 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   };
   const zlibMod = { deflateSync, inflateSync, gzipSync, gunzipSync, deflateRawSync, inflateRawSync, unzipSync, deflate: zAsync(deflateSync), inflate: zAsync(inflateSync), gzip: zAsync(gzipSync), gunzip: zAsync(gunzipSync), deflateRaw: zAsync(deflateRawSync), inflateRaw: zAsync(inflateRawSync), unzip: zAsync(unzipSync), crc32: zCrc32, createGzip: () => new Transform(), createGunzip: () => new Transform(), createDeflate: () => new Transform(), createInflate: () => new Transform(), createDeflateRaw: () => new Transform(), createInflateRaw: () => new Transform(), createUnzip: () => new Transform(), brotliCompressSync, brotliDecompressSync, brotliCompress: zAsync(brotliCompressSync), brotliDecompress: zAsync(brotliDecompressSync), zstdCompressSync, zstdDecompressSync, zstdCompress: zAsync(zstdCompressSync), zstdDecompress: zAsync(zstdDecompressSync), createBrotliCompress: () => new Transform(), createBrotliDecompress: () => new Transform(), createZstdCompress: () => new Transform(), createZstdDecompress: () => new Transform(), constants: zConstants, ...zConstants };
   Object.defineProperty(zlibMod, "codes", { value: zCodes, writable: false, enumerable: true, configurable: false });
-  def(["zlib"], zlibMod);
+  // node's lib/zlib.js destructures kMaxLength out of node:buffer at require()
+  // time, so a test that lowers buffer.kMaxLength across its `require('zlib')`
+  // keeps the lowered cap for the rest of the run (test-zlib-kmaxlength-rangeerror
+  // and its brotli/zstd siblings). Snapshot on the first module lookup made once
+  // the builtin partitions have finished loading — they reach for node:zlib
+  // themselves while booting, long before user code can touch kMaxLength.
+  for (const zn of ["zlib", "node:zlib"]) {
+    Object.defineProperty(M, zn, {
+      configurable: true, enumerable: true,
+      get() { if (zKMaxArmed && zKMaxSnap === null) zKMaxSnap = zKMaxLive(); return zlibMod; },
+    });
+  }
   if (G.Bun && typeof G.Bun.deflateSync === "undefined") {
     // bun semantics: Bun.deflateSync/inflateSync are RAW deflate (zlib.test.js
     // "deflate_with_headers" reaches for node:zlib instead); gzipSync is the
