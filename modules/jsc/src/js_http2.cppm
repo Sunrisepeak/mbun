@@ -633,7 +633,8 @@ export constexpr std::string_view kHttp2JS = R"JS(
       if (this._closed) return;
       this._closed = true;
       this.readable = false; this.writable = false;
-      G.queueMicrotask(() => this.emit("close"));
+      const self = this;
+      G.queueMicrotask(() => { self.emit("close"); const sess = self.session; if (sess && sess._endPending) sess._onSocketEnd(); });
     }
   }
 
@@ -970,7 +971,15 @@ export constexpr std::string_view kHttp2JS = R"JS(
       this._fatal(sessionErr(code));
     }
     _onSocketError(e) { if (!this.destroyed && !this.closed) this._fatal(e); }
-    _onSocketEnd() {}
+    // Peer half-close: same reasoning as the server session below — no further
+    // frames can arrive, so once the streams have finished the session (and its
+    // allowHalfOpen socket, which would otherwise hold the loop) must go.
+    _onSocketEnd() {
+      if (this.destroyed) return;
+      if (this.streams && this.streams.size > 0) { this._endPending = true; return; }
+      this._endPending = false;
+      this._teardown();
+    }
     _onSocketClose() { if (!this.destroyed && !this.closed) this._fatal(mkErr("Session closed with error code NGHTTP2_INTERNAL_ERROR", "ERR_HTTP2_SESSION_ERROR")); else this._teardown(); }
     _fatal(err) {
       if (this.destroyed) return;
@@ -1307,7 +1316,7 @@ export constexpr std::string_view kHttp2JS = R"JS(
       this.readable = false; this.writable = false;
       this.session.streams.delete(this.id);
       const self = this;
-      G.queueMicrotask(() => self.emit("close"));
+      G.queueMicrotask(() => { self.emit("close"); if (self.session._endPending) self.session._onSocketEnd(); });
     }
   }
 
@@ -1341,7 +1350,7 @@ export constexpr std::string_view kHttp2JS = R"JS(
       socket.on("data", (d) => self._onData(d));
       socket.on("error", (e) => self._onSocketError(e));
       socket.on("close", () => self._onSocketClose());
-      socket.on("end", () => {});
+      socket.on("end", () => self._onSocketEnd());
     }
     _writeFrame(type, flags, streamId, payload) {
       if (this.destroyed || !this.socket) return;
@@ -1556,6 +1565,18 @@ export constexpr std::string_view kHttp2JS = R"JS(
       G.queueMicrotask(() => self.emit("error", err));
     }
     _onSocketError(e) { if (!this.destroyed) { const self = this; this._teardown(); G.queueMicrotask(() => self.emit("error", e)); } }
+    // The peer half-closed: RFC 9113 sec. 5.4.1 — no further frames can arrive, so
+    // the session is over once its streams have finished. node reaches the same
+    // point through kMaybeDestroy (the last stream destroying a closed session
+    // destroys the session, and with it the socket). This was a no-op, and the
+    // http2 socket is allowHalfOpen, so the socket stayed open forever; once
+    // handles genuinely held the event loop that became a hang.
+    _onSocketEnd() {
+      if (this.destroyed) return;
+      if (this.streams && this.streams.size > 0) { this._endPending = true; return; }
+      this._endPending = false;
+      this._teardown();
+    }
     _onSocketClose() { this._teardown(); }
     _teardown() {
       if (this.destroyed) return;
