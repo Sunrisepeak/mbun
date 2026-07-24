@@ -41,6 +41,7 @@ export import :node_fs_watch;
 export import :node_fs_streams;
 export import :bun_password;
 export import :node_process_extra;
+export import :node_process_lifecycle;
 export import :node_util_extra;
 export import :node_test_runner;
 export import :node_legacy_ctors;
@@ -107,6 +108,9 @@ export inline const std::string kNodeBuiltinsJS =
         .append(detail::kNodeFsStreamsJS)
         .append(detail::kBunPasswordJS)
         .append(detail::kNodeProcessExtraJS)
+        // after node_process_extra: the uncaught-exception path consults the
+        // capture-callback registry installed there.
+        .append(detail::kNodeProcessLifecycleJS)
         // node:test standalone runner (used when no bun:test harness is present);
         // after bootstrap registered the delegating M["test"] it wraps.
         .append(detail::kNodeTestRunnerJS)

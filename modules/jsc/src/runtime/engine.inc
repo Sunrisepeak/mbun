@@ -320,6 +320,14 @@ public:
             return 1;
         }
         apply_dotenv(/*isTest=*/false);
+        // Last step before user code: everything mbun installed on globalThis
+        // becomes non-enumerable, as node's own globals are. node's
+        // test/common/index.js walks `for (const val in globalThis)` from an
+        // 'exit' listener and fails the file for anything it does not know, so
+        // mbun's 148 enumerable internals had to stop being enumerable the
+        // moment 'exit' started firing. Runs here (not at init) because the
+        // CommonJS env above installs the last of them.
+        (void)eval_void("globalThis.__mbun_hide_internal_globals&&__mbun_hide_internal_globals();");
         unhandledRejection_ = false;
         unhandledRejectionReason_.clear();
         install_unhandled_rejection_hook_();
@@ -426,19 +434,10 @@ public:
                                  "globalThis.__dirname);",
                                  absPath)};
                 !r) {
-                std::cerr << "error: " << r.error() << '\n';
-                return 1;
+                return fail_run_(r.error());
             }
             pump_event_loop("0");
-            if (unhandledRejection_) {
-                std::cerr << "error: Unhandled promise rejection"
-                          << (unhandledRejectionReason_.empty()
-                                  ? std::string{}
-                                  : ": " + unhandledRejectionReason_)
-                          << '\n';
-                return 1;
-            }
-            return 0;
+            return finish_run_(0);
         }
         std::string script{transform_module_(js)};
         // Node/bun evaluate the entry in a MODULE scope, never the global one: a
@@ -478,8 +477,7 @@ public:
             // Gated on SyntaxError so a runtime error isn't re-run (double side
             // effects); the original error is reported if the wrap doesn't help.
             if (r.error().find("SyntaxError") == std::string::npos) {
-                std::cerr << "error: " << r.error() << '\n';
-                return 1;
+                return fail_run_(r.error());
             }
             (void)eval_void("globalThis.__mbun_run_done=0;globalThis.__mbun_run_err=undefined;");
             const std::string wrapped{
@@ -491,15 +489,13 @@ public:
                 "var m=(e&&e.message!==undefined)?((e.name||'Error')+': '+e.message):String(e);"
                 "globalThis.__mbun_run_err=(s?(m+'\\n'+s):m);globalThis.__mbun_run_done=1;});"};
             if (auto r2{eval_void(wrapped, absPath)}; !r2) {
-                std::cerr << "error: " << r.error() << '\n';  // report the original parse error
-                return 1;
+                return fail_run_(r.error());  // report the original parse error
             }
             const bool settled{pump_event_loop("globalThis.__mbun_run_done")};
             if (auto err{eval_to_string(
                     "globalThis.__mbun_run_err===undefined?'':String(globalThis.__mbun_run_err)")};
                 err && !err->empty()) {
-                std::cerr << "error: " << *err << '\n';
-                return 1;
+                return fail_run_(*err);
             }
             // Top level settled: bun keeps the process alive while live
             // handles remain (ref'd timers, sockets, listening servers, child
@@ -508,18 +504,9 @@ public:
             // (draining it would turn a wedged await into an infinite hang).
             if (settled) {
                 if (auto s{serve_default_export_()}; !s) {
-                    std::cerr << "error: " << s.error() << '\n';
-                    return 1;
+                    return fail_run_(s.error());
                 }
                 pump_event_loop("0");
-                if (unhandledRejection_) {
-                    std::cerr << "error: Unhandled promise rejection"
-                          << (unhandledRejectionReason_.empty()
-                                  ? std::string{}
-                                  : ": " + unhandledRejectionReason_)
-                          << '\n';
-                    return 1;
-                }
             }
         } else {
             // Top level ran synchronously to completion. Node/bun keep the process
@@ -529,20 +516,13 @@ public:
             // __mbun_io_tick from this pump). A never-true done-expr lets
             // pump_event_loop self-bound on "no timers, no network, no live child".
             if (auto s{serve_default_export_()}; !s) {
-                std::cerr << "error: " << s.error() << '\n';
-                return 1;
+                return fail_run_(s.error());
             }
             pump_event_loop("0");
-            if (unhandledRejection_) {
-                std::cerr << "error: Unhandled promise rejection"
-                          << (unhandledRejectionReason_.empty()
-                                  ? std::string{}
-                                  : ": " + unhandledRejectionReason_)
-                          << '\n';
-                return 1;
-            }
         }
-        return 0;
+        // Natural drain: 'beforeExit' (re-armable), then 'exit', then whatever
+        // status process.exitCode ended up holding.
+        return finish_run_(0);
     }
 
     // Pump the virtual event loop (setTimeout/setInterval queue + JSC microtasks)
@@ -605,6 +585,79 @@ public:
         g->setUnhandledRejectionCallback(g->vm(), cb);
     }
 
+    // The child-process I/O tick, guarded the same way as the other pump
+    // phases: a throw from a 'exit'/'data' listener is an uncaught exception.
+    static constexpr std::string_view kIoTickJs{
+        "(function(){try{return globalThis.__mbun_io_tick?__mbun_io_tick():0;}"
+        "catch(e){globalThis.__mbun_uncaught&&globalThis.__mbun_uncaught(e);return 0;}})()"};
+
+    // Is an unclaimed uncaught exception waiting to kill the process? Every pump
+    // phase routes an escaping throw to node's 'uncaughtException' path
+    // (js_builtins :node_process_lifecycle); when nothing claims it the fatal
+    // channel arms and the pump must stop running callbacks at once.
+    bool fatal_pending_() {
+        auto f{eval_number("globalThis.__mbun_fatal_pending?__mbun_fatal_pending():0")};
+        return f && *f == 1.0;
+    }
+
+    // The unhandled-rejection report. It has exactly one caller — finish_run_,
+    // which every exit path now goes through — so anything the report should
+    // say (the rejection reason, the offending value, a stack) belongs HERE,
+    // not duplicated at the call sites it used to live at.
+    // The reason (name, message, code, stack) comes from the JSC rejection hook
+    // via describe_rejection_(). Without it every fs.promises corpus failure was
+    // a single un-diagnosable line, which is what made that cluster tractable.
+    void report_unhandled_rejection_() {
+        std::cerr << "error: Unhandled promise rejection"
+                  << (unhandledRejectionReason_.empty()
+                          ? std::string{}
+                          : ": " + unhandledRejectionReason_)
+                  << '\n';
+    }
+
+    // Run node's shutdown sequence: emit 'beforeExit' for as long as its
+    // listeners keep re-arming the loop, then emit 'exit' and report the status
+    // the process must leave with. `status` is the run's own verdict (0 for a
+    // clean drain), which a fatal error or `process.exitCode` may override.
+    //
+    // ref: node src/node.cc EmitProcessBeforeExit/EmitProcessExit — 'beforeExit'
+    // is skipped entirely for a fatal exit, and 'exit' listeners run
+    // synchronously with nothing they schedule ever getting a turn.
+    int finish_run_(int status) {
+        if (status == 0 && !unhandledRejection_) {
+            for (int round = 0; round < 100000; ++round) {
+                if (fatal_pending_()) break;
+                auto emitted{eval_number("globalThis.__mbun_before_exit?__mbun_before_exit(0):0")};
+                if (!emitted || *emitted == 0.0) break;
+                if (fatal_pending_()) break;
+                auto alive{eval_number("globalThis.__mbun_loop_alive?__mbun_loop_alive():0")};
+                if (!alive || *alive == 0.0) break;
+                pump_event_loop("0");
+            }
+        }
+        if (fatal_pending_()) {
+            if (auto m{eval_to_string("globalThis.__mbun_fatal_message()")}; m && !m->empty()) {
+                std::cerr << "error: " << *m << '\n';
+            }
+            status = 1;
+        } else if (unhandledRejection_) {
+            report_unhandled_rejection_();
+            status = 1;
+        }
+        const std::string arg{status == 0 ? std::string{"undefined"} : std::to_string(status)};
+        auto final{eval_number("globalThis.__mbun_run_exit?__mbun_run_exit(" + arg + "):" +
+                               std::to_string(status))};
+        return final ? static_cast<int>(*final) : status;
+    }
+
+    // A run that died on its entry point: report it the way node does (the
+    // error, then the 'exit' listeners with status 1) rather than returning
+    // straight to main.
+    int fail_run_(std::string_view message) {
+        std::cerr << "error: " << message << '\n';
+        return finish_run_(1);
+    }
+
     bool pump_event_loop(std::string_view doneExpr) {
         const std::string doneCheck{"(" + std::string{doneExpr} + ")?1:0"};
         // Liveness-drain mode ("0" = never done): the pump runs for as long as
@@ -616,19 +669,29 @@ public:
         int idleRounds{};
         for (int iter = 0; iter < 200000; ++iter) {
             if (auto d{eval_number(doneCheck)}; d && *d == 1.0) return true;
-            (void)eval_void("globalThis.__mbun_drain_timers && globalThis.__mbun_drain_timers(200);");
-            (void)eval_void("globalThis.__mbunNetDrain && globalThis.__mbunNetDrain();");
+            // Every phase is a node callback boundary: a throw escaping a timer,
+            // a socket poll or a signal handler is an uncaught exception, not
+            // something to drop. Swallowing it (which is what these phases used
+            // to do) left the throwing test's handles registered, so the loop
+            // never drained and the file hung instead of failing.
+            (void)eval_void("try{globalThis.__mbun_drain_timers&&globalThis.__mbun_drain_timers(200);}"
+                            "catch(e){globalThis.__mbun_uncaught&&globalThis.__mbun_uncaught(e);}");
+            (void)eval_void("try{globalThis.__mbunNetDrain&&globalThis.__mbunNetDrain();}"
+                            "catch(e){globalThis.__mbun_uncaught&&globalThis.__mbun_uncaught(e);}");
             // Deliver any POSIX signal that arrived since the last iteration to
             // its process.on("SIG…") listeners (the handler itself only set a flag).
-            (void)eval_void("globalThis.__mbunSignalTick && globalThis.__mbunSignalTick();");
+            (void)eval_void("try{globalThis.__mbunSignalTick&&globalThis.__mbunSignalTick();}"
+                            "catch(e){globalThis.__mbun_uncaught&&globalThis.__mbun_uncaught(e);}");
             drain_microtasks_();
-            auto ioBusy{eval_number("globalThis.__mbun_io_tick ? __mbun_io_tick() : 0")};
+            auto ioBusy{eval_number(kIoTickJs)};
             drain_microtasks_();
+            if (fatal_pending_()) return false;
             if (auto d{eval_number(doneCheck)}; d && *d == 1.0) return true;
             // The I/O tick can settle one promise whose continuation starts a
             // second child. Observe that child before deciding the loop is idle.
-            ioBusy = eval_number("globalThis.__mbun_io_tick ? __mbun_io_tick() : 0");
+            ioBusy = eval_number(kIoTickJs);
             drain_microtasks_();
+            if (fatal_pending_()) return false;
             if (auto d{eval_number(doneCheck)}; d && *d == 1.0) return true;
             // Ref'd timers (unref'd ones don't hold the loop — node semantics),
             // in-flight network ops (fetch/sockets), OR a live child process
@@ -637,14 +700,16 @@ public:
             auto rem{eval_number(
                 "(globalThis.__mbun_timers_refd?globalThis.__mbun_timers_refd():0)+"
                 "(globalThis.__mbunNet?globalThis.__mbunNet.pending:0)")};
-            // A ref'd listening server (Bun.serve) pins the loop indefinitely —
-            // bun keeps the process alive until stop()/unref(). It also disarms
-            // the runaway-iteration cap, which only guards wedged drains; the
-            // serve reactor's epoll tick paces each idle iteration. Liveness
-            // mode only (see above).
+            // A ref'd handle pins the loop indefinitely: a listening Bun.serve
+            // (serveActive) or a ref'd node handle — net.Server, net.Socket,
+            // dgram.Socket and everything layered on them (NET.handles). bun/node
+            // both keep the process alive until the last one is closed or
+            // unref'd. It also disarms the runaway-iteration cap, which only
+            // guards wedged drains; the park below paces each idle iteration.
+            // Liveness mode only (see above).
             const double srvLive{
-                livenessMode ? eval_number("(globalThis.__mbunNet?(globalThis.__mbunNet."
-                                           "serveActive>0?1:0):0)")
+                livenessMode ? eval_number("(globalThis.__mbunNet?((globalThis.__mbunNet."
+                                           "serveActive>0||globalThis.__mbunNet.handles>0)?1:0):0)")
                                    .value_or(0.0)
                              : 0.0};
             if (srvLive > 0.0) iter = 0;
@@ -673,6 +738,15 @@ public:
                     // wake source cuts the park short.
                     int parkMs{static_cast<int>(*idleMs)};
                     if (!livenessMode && parkMs > 25) parkMs = 25;
+                    // Same arithmetic applies to a liveness pump that is only
+                    // counting out its grace rounds: nothing holds the loop, so
+                    // the process is leaving and the park is pure shutdown
+                    // latency. __mbun_pump_idle_ms still reports a long park
+                    // whenever any pollable is registered (an unref'd listener
+                    // stays in NET.items so its fd keeps being polled), which
+                    // made `server.unref()` cost 32 x 60s — indistinguishable
+                    // from the hang it was meant to fix.
+                    if (idleRounds > 0 && parkMs > 1) parkMs = 1;
                     const auto parked{eval_number(
                         "globalThis.__mbunNetNative&&globalThis.__mbunNetNative.wait?"
                         "(__mbunNetNative.wait(" +
@@ -1253,6 +1327,7 @@ public:
         set_fn(ctx_, process, "cwd", process_cwd_cb);
         set_fn(ctx_, process, "chdir", process_chdir_cb);
         set_fn(ctx_, process, "exit", process_exit_cb);
+        set_fn(ctx_, process, "reallyExit", process_really_exit_cb);
         JSObjectRef stdout{JSObjectMake(ctx_, nullptr, nullptr)};
         set_fn(ctx_, stdout, "write", stdout_write_cb);
         // Node/bun: isTTY is `true` only when the fd is a terminal, otherwise
@@ -1299,7 +1374,12 @@ public:
   // a `--compile`d executable can carry in its baked execArgv) survives; the ??=
   // keeps "bun" as the default for every ordinary run.
   p.pid = 1; p.ppid = 0; p.exitCode = 0; p.title ??= "bun";
-  p.nextTick = function (fn) { const a = Array.prototype.slice.call(arguments, 1); queueMicrotask(function () { fn.apply(null, a); }); };
+  // Resolved at CALL time, never captured: neither queueMicrotask nor the
+  // uncaught-exception wrapper over it (js_builtins :node_process_lifecycle)
+  // exists yet at this point in startup, and a throw escaping a nextTick
+  // callback must reach node's 'uncaughtException' path rather than JSC's
+  // rejection tracker.
+  p.nextTick = function (fn) { const a = Array.prototype.slice.call(arguments, 1); globalThis.queueMicrotask(function () { fn.apply(null, a); }); };
   const nanos = () => (globalThis.Bun && Bun.nanoseconds ? Bun.nanoseconds() : 0);
   p.hrtime = function (prev) {
     const t = nanos(); let s = Math.floor(t / 1e9), n = Math.floor(t % 1e9);
@@ -1353,6 +1433,14 @@ public:
 })();
 )JS",
               &pexc);
+        // A throw here disables everything the prelude installs — process.on,
+        // process.nextTick, the whole event surface — and the process then
+        // limps on with a half-built `process`, failing far from the cause.
+        // (Hoisting one `queueMicrotask` reference above its own installation
+        // cost an entire build round exactly this way.) Report it.
+        if (pexc != nullptr) {
+            std::cerr << "mbun: process prelude error: " << describe_exception_(pexc) << '\n';
+        }
 
         // require (CommonJS): global fallback (built-ins only) + the real
         // path-resolving native require and the per-module require factory.

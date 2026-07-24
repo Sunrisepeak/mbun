@@ -503,8 +503,41 @@ JSValueRef process_chdir_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
     return JSValueMakeUndefined(ctx);
 }
 
+// process.exit([code]) — node lib/internal/process/per_thread.js: settle the
+// exit code, emit 'exit' synchronously, then leave. It used to std::exit()
+// straight away, so no 'exit' listener ever ran (and node's own test harness
+// verifies every common.mustCall from inside one). The whole sequence lives in
+// JS (__mbun_run_exit, js_builtins :node_process_lifecycle) and hands back the
+// status to leave with — process.exitCode assigned by a listener wins.
+int run_exit_sequence(JSContextRef ctx, JSValueRef codeArg) {
+    JSObjectRef global{JSContextGetGlobalObject(ctx)};
+    JSStringRef name{JSStringCreateWithUTF8CString("__mbun_run_exit")};
+    JSValueRef fnVal{JSObjectGetProperty(ctx, global, name, nullptr)};
+    JSStringRelease(name);
+    const JSValueRef fallback{codeArg};
+    const auto asStatus{[&](JSValueRef v) {
+        if (v == nullptr || JSValueIsUndefined(ctx, v) || JSValueIsNull(ctx, v)) return 0;
+        const double d{JSValueToNumber(ctx, v, nullptr)};
+        return std::isnan(d) ? 0 : static_cast<int>(d);
+    }};
+    if (fnVal == nullptr || !JSValueIsObject(ctx, fnVal)) return asStatus(fallback);
+    JSObjectRef fn{JSValueToObject(ctx, fnVal, nullptr)};
+    if (fn == nullptr || !JSObjectIsFunction(ctx, fn)) return asStatus(fallback);
+    const JSValueRef callArgs[1]{codeArg != nullptr ? codeArg : JSValueMakeUndefined(ctx)};
+    JSValueRef exc{nullptr};
+    JSValueRef result{JSObjectCallAsFunction(ctx, fn, nullptr, 1, callArgs, &exc)};
+    if (exc != nullptr) return 1;
+    return asStatus(result);
+}
+
 JSValueRef process_exit_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                            const JSValueRef args[], JSValueRef*) {
+    std::exit(run_exit_sequence(ctx, argc > 0 ? args[0] : nullptr));
+}
+
+// process.reallyExit(code) — node's raw exit: no 'exit' emission, no handlers.
+JSValueRef process_really_exit_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                                  const JSValueRef args[], JSValueRef*) {
     std::exit(argc > 0 ? static_cast<int>(JSValueToNumber(ctx, args[0], nullptr)) : 0);
 }
 
