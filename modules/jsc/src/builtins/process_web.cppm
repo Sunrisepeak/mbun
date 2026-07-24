@@ -291,8 +291,10 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   }
   function execSync(command, o) {
     const r = CP.spawnSync("/bin/sh", ["-c", toStr(command)], o || {});
-    if (r.status !== 0) { const e = new Error("Command failed: " + command + "\n" + r.stderr); e.status = r.status; e.stdout = r.stdout; e.stderr = r.stderr; throw e; }
+    if (r.status !== 0) { const e = new Error("Command failed: " + command + (r.stderr == null ? "" : "\n" + r.stderr)); e.status = r.status; e.stdout = r.stdout; e.stderr = r.stderr; throw e; }
     const enc = o && o.encoding;
+    // A non-piped stdout (stdio: 'inherit'/'ignore') is null in node, not "".
+    if (r.stdout == null) return null;
     return enc === "buffer" || enc == null ? Buffer.from(_u8(r.stdout)) : r.stdout;
   }
   function execFileSync(file, a, o) {
@@ -300,6 +302,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     const r = CP.spawnSync(toStr(file), n.args.map(toStr), n.opts);
     if (r.status !== 0) { const e = new Error("execFileSync failed: " + file); e.status = r.status; e.stderr = r.stderr; throw e; }
     const enc = n.opts && n.opts.encoding;
+    if (r.stdout == null) return null;
     return enc === "buffer" || enc == null ? Buffer.from(_u8(r.stdout)) : r.stdout;
   }
 

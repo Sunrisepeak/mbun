@@ -2274,35 +2274,6 @@ int run_embedded_program(const mbun::bundler::standalone_exe::Program& program,
 // (run_command.rs:3007-3028) and booted regardless of extension or shebang.
 // Unknown flags must not warn (cli/mod.rs:953-955 clears
 // WARN_ON_UNRECOGNIZED_FLAG) — node-mode must not reject node's own flags.
-// A node runtime flag whose value is a SEPARATE token (`--flag value`), not
-// `--flag=value`. Node's V8/bootstrap option table decides this per flag; the
-// corpus re-spawns `process.execPath` with the space form for these, so unless
-// we consume the value token too it is mistaken for the script to run (the
-// `test-*.js` re-exec cluster: `--snapshot-blob X`, `-r X`, `--test-reporter X`).
-// Everything not listed here is treated as a boolean flag (single token).
-bool node_flag_takes_value(std::string_view flag) {
-    static constexpr std::string_view kValued[]{
-        "-r", "--require", "--snapshot-blob", "--build-snapshot-config",
-        "--test-reporter", "--test-reporter-destination", "--test-name-pattern",
-        "--test-skip-pattern", "--test-shard", "--test-concurrency",
-        "--heap-prof-interval", "--heap-prof-dir", "--heap-prof-name",
-        "--cpu-prof-interval", "--cpu-prof-dir", "--cpu-prof-name",
-        "--trace-event-categories", "--trace-event-file-pattern",
-        "--localstorage-file", "--env-file", "--env-file-if-exists",
-        "--max-old-space-size", "--max-semi-space-size", "--stack-size",
-        "--stack-trace-limit", "--v8-pool-size", "--title", "--icu-data-dir",
-        "--openssl-config", "--tls-cipher-list", "--tls-keylog",
-        "--heapsnapshot-signal", "--heapsnapshot-near-heap-limit",
-        "--diagnostic-dir", "--redirect-warnings", "--disk-cache-dir",
-        "--experimental-policy", "--policy-integrity", "--conditions",
-        "-C", "--report-dir", "--report-directory", "--report-filename",
-        "--report-signal", "--secure-heap", "--secure-heap-min", "--dns-result-order"};
-    for (std::string_view f : kValued) {
-        if (flag == f) return true;
-    }
-    return false;
-}
-
 int exec_as_if_node(std::span<const std::string_view> args) {
     mbun::cli::run::set_pretend_to_be_node(true);
 
@@ -2353,7 +2324,7 @@ int exec_as_if_node(std::span<const std::string_view> args) {
         // (its `=value` rides along in the same token). A separate value token is
         // skipped only for flags known to take one, so boolean flags do not
         // accidentally swallow the script path.
-        if (a.find('=') == std::string_view::npos && node_flag_takes_value(a) &&
+        if (a.find('=') == std::string_view::npos && mbun::cli::node_flag_takes_value(a) &&
             i + 1 < args.size()) {
             ++i;  // consume the value token
         }

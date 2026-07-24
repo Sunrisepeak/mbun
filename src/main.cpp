@@ -49,6 +49,15 @@ int main(int argc, char* argv[]) {
         return run_embedded_program(*embedded, argc > 0 ? argv[0] : "mbun", embeddedArgs);
     }
 
+    // process.execArgv — derived from the raw command line before any flag loop
+    //    consumes it, exactly as bun does (node_process.rs create_exec_argv).
+    //    Every dispatch below (node emulation, `run`, bare script) shares it; a
+    //    compiled program overrides it above with its baked --compile-exec-argv.
+    {
+        std::vector<std::string_view> rawArgs(argv + 1, argv + argc);
+        mbun::jsc::runtime::set_exec_argv(mbun::cli::derive_exec_argv(rawArgs));
+    }
+
     // ── argv0 == `node` → node emulation (cli/mod.rs:952 → run_command.rs:2981).
     //    Must come before ANY bun-flag parsing: node's flags are not bun's.
     if (argc > 0 && is_node_argv0(argv[0])) {
@@ -145,7 +154,7 @@ int main(int argc, char* argv[]) {
                 // is not mistaken for the positional entry point.
                 if (k > 0 && args[k - 1].starts_with("-") &&
                     args[k - 1].find('=') == std::string_view::npos &&
-                    node_flag_takes_value(args[k - 1])) {
+                    mbun::cli::node_flag_takes_value(args[k - 1])) {
                     continue;
                 }
                 hasPositional = true;
