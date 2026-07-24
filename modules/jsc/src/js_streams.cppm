@@ -26,7 +26,25 @@ constexpr std::string_view kStreamsJS_part1 = R"JS(
   const deferred = () => { let resolve, reject; const promise = new Promise((res, rej) => { resolve = res; reject = rej; }); return { promise, resolve, reject }; };
   const markHandled = (p) => { if (p && typeof p.then === "function") p.then(noop, noop); };
   const promiseCall = (fn, thisArg, args) => { try { return Promise.resolve(fn.apply(thisArg, args)); } catch (e) { return Promise.reject(e); } };
+  // node's Symbol.for("nodejs.webstream.controllerErrorFunction"): node:stream's
+  // addAbortSignal() calls stream[kControllerErrorFunction](err) to error a web
+  // stream without acquiring a reader. Every stream that has a controller must
+  // carry it (internal/webstreams/{readable,writable}stream.js set it at
+  // controller setup) or addAbortSignal throws "is not a function".
+  const kControllerErrorFunction = Symbol.for("nodejs.webstream.controllerErrorFunction");
   const invalidState = (m) => { const e = new TypeError("Invalid state: " + m); e.code = "ERR_INVALID_STATE"; return e; };
+  // node's ERR_INVALID_ARG_TYPE / ERR_INVALID_ARG_VALUE.RangeError. The streams
+  // surface tests match on `code` + constructor name, so both have to be right.
+  const invalidArgType = (name, expected, actual) => {
+    const e = new TypeError(`The "${name}" argument must be of type ${[].concat(expected).join(" or ")}. Received ${typeof actual}`);
+    e.code = "ERR_INVALID_ARG_TYPE";
+    return e;
+  };
+  const invalidArgValueRange = (name, reason) => {
+    const e = new RangeError(`The argument '${name}' ${reason}`);
+    e.code = "ERR_INVALID_ARG_VALUE";
+    return e;
+  };
   let _te = null;
   const utf8Encode = (s) => { if (!_te) _te = new G.TextEncoder(); return _te.encode(s); };
   const isView = ArrayBuffer.isView;
@@ -288,9 +306,14 @@ constexpr std::string_view kStreamsJS_part1 = R"JS(
       return readableStreamCancel(this._stream, reason);
     }
     read(view, options) {
+      // Error CODES are observable here (test-whatwg-readablebytestream-bad-
+      // buffers-and-views asserts them): node reports a zero-length or detached
+      // view as ERR_INVALID_STATE/TypeError, not as a bare TypeError.
+      if (!isView(view))
+        return Promise.reject(invalidArgType("view", ["Buffer", "TypedArray", "DataView"], view));
+      if (view.byteLength === 0 || view.buffer.byteLength === 0)
+        return Promise.reject(invalidState("View or Viewed ArrayBuffer is zero-length or detached"));
       if (this._stream === undefined) return Promise.reject(invalidState("The reader is not attached to a stream"));
-      if (!isView(view) || view.byteLength === 0 || view.buffer.byteLength === 0)
-        return Promise.reject(new TypeError("read() requires a non-empty ArrayBufferView"));
       let min = 1;
       if (options && options.min !== undefined) {
         min = Number(options.min);
@@ -429,6 +452,7 @@ constexpr std::string_view kStreamsJS_part1 = R"JS(
     c._pullAlgorithm = typeof source.pull === "function" ? () => promiseCall(source.pull, source, [c]) : () => Promise.resolve();
     c._cancelAlgorithm = typeof source.cancel === "function" ? (reason) => promiseCall(source.cancel, source, [reason]) : () => Promise.resolve();
     stream._readableStreamController = c;
+    stream[kControllerErrorFunction] = (e) => c.error(e);
     const startResult = typeof source.start === "function" ? source.start.call(source, c) : undefined;
     Promise.resolve(startResult).then(
       () => { c._started = true; defaultControllerCallPullIfNeeded(c); },
@@ -583,8 +607,13 @@ constexpr std::string_view kStreamsJS_part1 = R"JS(
       byteControllerRespond(this._controller, Number(bytesWritten));
     }
     respondWithNewView(view) {
-      if (this._controller === undefined) throw new TypeError("This BYOB request has been invalidated");
-      if (!isView(view)) throw new TypeError("respondWithNewView() requires an ArrayBufferView");
+      // node internal/webstreams/readablestream.js ReadableStreamBYOBRequest#
+      // respondWithNewView: invalidated request and detached buffer are both
+      // ERR_INVALID_STATE/TypeError, checked BEFORE the controller-level
+      // geometry checks (which are ERR_INVALID_ARG_VALUE/RangeError).
+      if (this._controller === undefined) throw invalidState("This BYOB request has been invalidated");
+      if (!isView(view)) throw invalidArgType("view", ["Buffer", "TypedArray", "DataView"], view);
+      if (isDetachedBuffer(view.buffer)) throw invalidState("Viewed ArrayBuffer is detached");
       byteControllerRespondWithNewView(this._controller, view);
     }
   }
@@ -899,11 +928,15 @@ constexpr std::string_view kStreamsJS_part1 = R"JS(
   function byteControllerRespondWithNewView(c, view) {
     const firstDescriptor = c._pendingPullIntos[0];
     const state = c._stream._state;
-    if (state === "closed") { if (view.byteLength !== 0) throw new TypeError("The view's length must be 0 when calling respondWithNewView() on a closed stream"); }
-    else if (view.byteLength === 0) throw new TypeError("The view's length must be greater than 0 when calling respondWithNewView() on a readable stream");
-    if (firstDescriptor.byteOffset + firstDescriptor.bytesFilled !== view.byteOffset) throw new RangeError("The region specified by view does not match byobRequest");
-    if (firstDescriptor.bufferByteLength !== view.buffer.byteLength) throw new RangeError("The buffer of view has different capacity than byobRequest");
-    if (firstDescriptor.bytesFilled + view.byteLength > firstDescriptor.byteLength) throw new RangeError("The region specified by view is larger than byobRequest");
+    // Codes and ORDER are node's (readableByteStreamControllerRespondWithNewView):
+    // state mismatches are ERR_INVALID_STATE/TypeError, geometry mismatches are
+    // ERR_INVALID_ARG_VALUE/RangeError, and the length check precedes the
+    // buffer-capacity check.
+    if (state === "closed") { if (view.byteLength !== 0) throw invalidState("View is not zero-length"); }
+    else if (view.byteLength === 0) throw invalidState("View is zero-length");
+    if (firstDescriptor.byteOffset + firstDescriptor.bytesFilled !== view.byteOffset) throw invalidArgValueRange("view", "does not match byobRequest");
+    if (firstDescriptor.bytesFilled + view.byteLength > firstDescriptor.byteLength) throw invalidArgValueRange("view", "is larger than byobRequest");
+    if (firstDescriptor.bufferByteLength !== view.buffer.byteLength) throw invalidArgValueRange("view", "has a buffer of different capacity than byobRequest");
     const viewByteLength = view.byteLength;
     firstDescriptor.buffer = transferArrayBuffer(view.buffer);
     byteControllerRespondInternal(c, viewByteLength);
@@ -969,6 +1002,7 @@ constexpr std::string_view kStreamsJS_part1 = R"JS(
     c._autoAllocateChunkSize = autoAllocateChunkSize;
     c._pendingPullIntos = [];
     stream._readableStreamController = c;
+    stream[kControllerErrorFunction] = (e) => c.error(e);
     const startResult = typeof source.start === "function" ? source.start.call(source, c) : undefined;
     Promise.resolve(startResult).then(
       () => { c._started = true; byteControllerCallPullIfNeeded(c); },
@@ -1605,6 +1639,7 @@ constexpr std::string_view kStreamsJS_part2 = R"JS(
     const c = Object.create(WritableStreamDefaultController.prototype);
     c._stream = stream;
     stream._writableStreamController = c;
+    stream[kControllerErrorFunction] = (e) => c.error(e);
     resetQueue(c);
     c._abortReason = undefined;
     c._abortController = undefined;
