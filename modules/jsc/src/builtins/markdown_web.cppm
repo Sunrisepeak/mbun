@@ -894,6 +894,21 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
         if (typeof cb === "function") { const b = rb(n); deferCb(() => cb(null, b)); return; }
         return rb(n);
       },
+      // crypto.pseudoRandomBytes / prng / rng — node's deprecated aliases, all
+      // three literally randomBytes (lib/crypto.js `getRandomBytesAlias`).
+      // Still exported, and still called by the corpus (test-domain-crypto).
+      pseudoRandomBytes: (n, cb) => {
+        if (typeof cb === "function") { const b = rb(n); deferCb(() => cb(null, b)); return; }
+        return rb(n);
+      },
+      prng: (n, cb) => {
+        if (typeof cb === "function") { const b = rb(n); deferCb(() => cb(null, b)); return; }
+        return rb(n);
+      },
+      rng: (n, cb) => {
+        if (typeof cb === "function") { const b = rb(n); deferCb(() => cb(null, b)); return; }
+        return rb(n);
+      },
       randomFillSync: (buf, offset, size) => {
         // node scales offset/size by BYTES_PER_ELEMENT for TypedArrays (1 for
         // DataView / ArrayBuffer). Bounds are validated against the byte length so
