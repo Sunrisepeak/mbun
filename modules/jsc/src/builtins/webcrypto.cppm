@@ -85,7 +85,6 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
       configurable: false, value: "CryptoKey",
     });
     freeze(CryptoKey.prototype);
-    freeze(CryptoKey);
     // node instantiates InternalCryptoKey, a subclass whose prototype chains to
     // CryptoKey.prototype and whose `constructor` still reports CryptoKey.
     // test-webcrypto-cryptokey-brand-check walks exactly that chain.
@@ -261,8 +260,10 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
     const keyFormat = (format) => {
       const value = `${format}`;
       if (!KEY_FORMATS.includes(value)) {
-        throw new TypeError("The provided value '" + value +
+        const e = new TypeError("The provided value '" + value +
           "' is not a valid enum value of type KeyFormat.");
+        e.code = "ERR_INVALID_ARG_VALUE";
+        throw e;
       }
       return value;
     };
@@ -484,8 +485,9 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
       if (declaredLength != null && Number(declaredLength) !== raw.byteLength * 8) {
         throw dataError("HMAC key length does not match key data");
       }
-      const usageBits = (usages.includes("sign") ? 1 : 0) | (usages.includes("verify") ? 2 : 0);
-      if (usageBits === 0) throw domError("HMAC key usages are empty", "SyntaxError");
+      if (usages.length === 0) {
+        throw domError("Usages cannot be empty when importing a secret key.", "SyntaxError");
+      }
       const secret = new Uint8Array(raw);            // retained for sign/verify + export
       raw.fill(0);
       // HMAC runs through node:crypto's createHmac (which covers the SHA-2 and
@@ -1177,6 +1179,28 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
             : OKP_ALGS.has(name) ? "OKP" : null;
           if (typeof keyData.kty !== "string") throw dataError("Invalid keyData");
           if (wantKty && keyData.kty !== wantKty) throw dataError('Invalid JWK "kty" Parameter');
+          // "use" is checked against the algorithm's purpose whenever usages were
+          // requested. ref: node lib/internal/crypto/{rsa,ec,cfrg}.js expectedUse.
+          const expectedUse = (name === "RSA-OAEP" || name === "ECDH" ||
+            name === "X25519" || name === "X448") ? "enc" : "sig";
+          if (usages.length > 0 && keyData.use !== undefined && keyData.use !== expectedUse) {
+            throw dataError('Invalid JWK "use" Parameter');
+          }
+          // The JWK "alg" member, when present, must name the same primitive.
+          // ref: node lib/internal/crypto/{rsa,ec,cfrg}.js.
+          if (keyData.alg !== undefined) {
+            const jwkAlgMismatch = () =>
+              dataError('JWK "alg" does not match the requested algorithm');
+            if (RSA_ALGS.has(name)) {
+              const expected = jwkAlgFor({ name, hash: memberHash(alg) });
+              if (expected !== undefined && keyData.alg !== expected) throw jwkAlgMismatch();
+            } else if (name === "Ed25519" || name === "Ed448") {
+              if (keyData.alg !== name && keyData.alg !== "EdDSA") throw jwkAlgMismatch();
+            } else if (name === "ECDSA") {
+              const byAlg = { ES256: "P-256", ES384: "P-384", ES512: "P-521" }[keyData.alg];
+              if (byAlg !== normalizeCurve(alg.namedCurve)) throw jwkAlgMismatch();
+            }
+          }
           if (OKP_ALGS.has(name) && keyData.crv !== name) {
             throw dataError('JWK "crv" Parameter and algorithm name mismatch');
           }
