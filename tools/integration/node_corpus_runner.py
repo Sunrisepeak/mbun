@@ -127,17 +127,56 @@ def read_file_list(root: Path, list_path: Path) -> list[str]:
     return selected
 
 
-def write_outputs(output_dir: Path, results: list[Result]) -> None:
-    columns = ["path", "exit_code", "classification", "duration_ms", "log"]
+COLUMNS = ("path", "exit_code", "classification", "duration_ms", "log")
+
+
+def read_existing(output_dir: Path) -> dict[str, Result]:
+    """Load an earlier (possibly partial) run from `--out`, keyed by path.
+
+    A full 4433-file run takes far longer than one agent turn or CI step, and a
+    run killed at that boundary used to lose everything. Reloading what already
+    landed lets `--resume` finish the corpus across several bounded
+    invocations, which is the only way a full honest measurement gets taken at
+    all in this environment.
+    """
+    tsv = output_dir / "results.tsv"
+    if not tsv.is_file():
+        return {}
+    existing: dict[str, Result] = {}
+    with tsv.open(encoding="utf-8") as stream:
+        header = stream.readline().rstrip("\n").split("\t")
+        for line in stream:
+            values = line.rstrip("\n").split("\t")
+            # A run killed mid-write can leave a truncated final row; drop it
+            # rather than resurrecting a half-recorded result.
+            if len(values) != len(header):
+                continue
+            row = dict(zip(header, values))
+            try:
+                existing[row["path"]] = Result(
+                    row["path"], int(row["exit_code"]), row["classification"],
+                    int(row["duration_ms"]), row["log"])
+            except (KeyError, ValueError):
+                continue
+    return existing
+
+
+def write_outputs(output_dir: Path, results: list[Result], remaining: int = 0) -> None:
+    ordered = sorted(results, key=lambda result: result.path)
     with (output_dir / "results.tsv").open("w", encoding="utf-8") as stream:
-        stream.write("\t".join(columns) + "\n")
-        for result in results:
+        stream.write("\t".join(COLUMNS) + "\n")
+        for result in ordered:
             values = asdict(result)
-            stream.write("\t".join(str(values[column]) for column in columns) + "\n")
+            stream.write("\t".join(str(values[column]) for column in COLUMNS) + "\n")
     categories: dict[str, int] = {}
-    for result in results:
+    for result in ordered:
         categories[result.classification] = categories.get(result.classification, 0) + 1
-    summary = {"files": len(results), "categories": dict(sorted(categories.items()))}
+    summary = {"files": len(ordered), "categories": dict(sorted(categories.items()))}
+    if remaining:
+        # Loud, machine-readable: a partial round must never be mistaken for a
+        # full one when its numbers are quoted.
+        summary["incomplete"] = True
+        summary["remaining"] = remaining
     (output_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps(summary, sort_keys=True))
 
@@ -161,6 +200,18 @@ def main() -> int:
     )
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--timeout", type=float, default=15.0)
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="keep results already recorded in --out and run only the missing files",
+    )
+    parser.add_argument(
+        "--max-seconds",
+        type=float,
+        default=0.0,
+        help="stop dispatching new files after this wall-clock budget, write what finished, and "
+        "report the remainder — pair with --resume to complete a full corpus across several runs",
+    )
     args = parser.parse_args()
 
     ensure_disk_headroom()
@@ -177,13 +228,31 @@ def main() -> int:
     if not paths:
         raise SystemExit("no test files selected")
     output_dir.mkdir(parents=True, exist_ok=True)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as executor:
-        futures = [
-            executor.submit(run_one, binary, root, output_dir, args.timeout, path, index % max(1, args.jobs))
-            for index, path in enumerate(paths)
-        ]
-        results = [future.result() for future in futures]
-    write_outputs(output_dir, results)
+    done = read_existing(output_dir) if args.resume else {}
+    pending = [path for path in paths if path not in done]
+    if args.resume:
+        print(f"resume: {len(done)} already recorded, {len(pending)} to run", flush=True)
+
+    jobs = max(1, args.jobs)
+    deadline = time.monotonic() + args.max_seconds if args.max_seconds > 0 else None
+    results = list(done.values())
+    dispatched = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as executor:
+        futures = []
+        for index, path in enumerate(pending):
+            # Check the budget before *dispatching*, never mid-file: a file that
+            # started must finish and be recorded, otherwise the budget itself
+            # would manufacture phantom timeouts.
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+            futures.append(
+                executor.submit(run_one, binary, root, output_dir, args.timeout, path, index % jobs))
+            dispatched += 1
+        results.extend(future.result() for future in futures)
+    remaining = len(pending) - dispatched
+    write_outputs(output_dir, results, remaining=remaining)
+    if remaining:
+        print(f"budget exhausted: {remaining} file(s) not run — re-invoke with --resume", flush=True)
     return 0
 
 

@@ -36,7 +36,19 @@ frozen machine or a silently murdered harness.
   timeout / oom-kill / …). See `compat/README.md` for the measurement recipe.
 - `node_corpus_runner.py` — node's `compat/node/test/parallel` executed
   directly (`mbun <file>`, exit 0 = pass); node-harness-dependent files count
-  as failures, keeping the number honest file-level coverage.
+  as failures, keeping the number honest file-level coverage. A file that
+  skipped itself (`common.skip()` → `1..0 # Skipped:`, exit 0) is classified
+  `skipped`, never `pass`: it exits clean precisely because the runtime lacks
+  what it wanted to test, so counting it would reward the gap it reports (277
+  of the round-8 run's 1810 "passes" were skips; all 237 `test-quic-*` skip on
+  `!process.features.quic`). `--files` / `--filter` scope a run to one cluster.
+  `--resume` keeps what a previous `--out` already recorded and runs only the
+  rest; `--max-seconds` stops dispatching once a wall-clock budget is spent,
+  writes what finished, and marks the summary `incomplete` with a `remaining`
+  count. Together they complete a full 4433-file measurement across several
+  bounded invocations — a single run outlives an agent turn and used to lose
+  everything when killed at that boundary. The budget is checked before
+  dispatching a file, never mid-file, so it can never manufacture a timeout.
 - `test_members.sh` — `mcpp test` across every workspace member.
 - `corpus_diff.py` — compares two corpus rounds' `results.tsv` and **gates on
   regressions**: `corpus_diff.py <before-dir> <after-dir>`. Prints per-bucket

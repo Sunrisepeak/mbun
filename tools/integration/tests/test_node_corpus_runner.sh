@@ -79,6 +79,40 @@ filtered = rows(sys.argv[2])
 assert set(filtered) == {"corpus/parallel/test-fail.js"}, filtered
 PY
 
+# --resume + --max-seconds complete a corpus across several bounded invocations.
+# A zero budget must dispatch nothing and report the whole set as remaining;
+# resuming afterwards must keep what landed and run only the rest.
+python3 "$repo_root/tools/integration/node_corpus_runner.py" \
+  --bin "$tmp/fake-mbun" --root "$tmp" --corpus corpus/parallel \
+  --out "$tmp/out-partial" --jobs 1 --timeout 0.1 --max-seconds 0.0001 >/dev/null
+
+python3 - "$tmp/out-partial" <<'PY'
+import json, pathlib, sys
+s = json.loads((pathlib.Path(sys.argv[1]) / "summary.json").read_text())
+assert s["files"] == 0, s
+assert s["incomplete"] is True and s["remaining"] == 4, s
+PY
+
+python3 "$repo_root/tools/integration/node_corpus_runner.py" \
+  --bin "$tmp/fake-mbun" --root "$tmp" --corpus corpus/parallel \
+  --out "$tmp/out-partial" --jobs 2 --timeout 0.1 --resume >/dev/null
+
+python3 - "$tmp/out-partial" <<'PY'
+import json, pathlib, sys
+s = json.loads((pathlib.Path(sys.argv[1]) / "summary.json").read_text())
+assert s["files"] == 4, s
+assert "incomplete" not in s, s
+assert s["categories"] == {"fail": 1, "pass": 1, "skipped": 1, "timeout": 1}, s
+PY
+
+# Resuming a complete run re-runs nothing and preserves the recorded results.
+before=$(cat "$tmp/out-partial/results.tsv")
+python3 "$repo_root/tools/integration/node_corpus_runner.py" \
+  --bin /nonexistent-binary --root "$tmp" --corpus corpus/parallel \
+  --out "$tmp/out-partial" --jobs 2 --timeout 0.1 --resume >/dev/null
+[ "$before" = "$(cat "$tmp/out-partial/results.tsv")" ] \
+  || { echo "resume of a complete run must be a no-op" >&2; exit 1; }
+
 # A path that is not a file must fail loudly rather than silently shrink the run.
 echo "corpus/parallel/test-missing.js" >"$tmp/bad.txt"
 if python3 "$repo_root/tools/integration/node_corpus_runner.py" \
