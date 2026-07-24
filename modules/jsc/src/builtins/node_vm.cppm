@@ -7,9 +7,21 @@
 // isContext, runIn{This,New,}Context, compileFunction, and the string/options
 // forms (filename/lineOffset/timeout/displayErrors/contextObject). Blueprint:
 // bun-ref src/js/node/vm.ts (the JS shape; the native NodeVM.cpp is replaced by
-// the C-API bridge above). DEFERRED: vm.Module/SourceTextModule/SyntheticModule,
-// cachedData/bytecode (createCachedData/cachedDataRejected), real timeout
-// interruption, microtaskMode isolation, and DONT_CONTEXTIFY realm sharing.
+// the C-API bridge above).
+//
+// Contextify lives HERE rather than in the native layer: node installs V8
+// named/indexed property interceptors on the context's global proxy, and JSC's
+// C API has no equivalent, so the sandbox is mirrored onto the child realm's
+// global around every run. Doing that in JS (over the global object handed back
+// by __mbunNodeVMNative.getGlobal) is what makes the mirror carry FULL property
+// descriptors — accessors stay accessors, non-enumerable stays non-enumerable,
+// symbol keys travel, deletions propagate, and the sandbox's prototype chain is
+// reachable — none of which JSObjectCopyPropertyNames + JSObjectSetProperty
+// (enumerable string keys, values only) can express.
+//
+// DEFERRED: vm.Module/SourceTextModule/SyntheticModule, cachedData/bytecode
+// (createCachedData/cachedDataRejected), real timeout interruption,
+// microtaskMode isolation, and DONT_CONTEXTIFY realm identity.
 export module mbun.jsc.js_builtins:node_vm;
 
 import std;
@@ -26,16 +38,16 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
   const M = G.__mbunNativeModules;
   if (!NVM || !M) return;
 
-  // Objects that have been contextified, and their native context handles.
+  const ObjectDefineProperty = Object.defineProperty;
+  const gOPD = Object.getOwnPropertyDescriptor;
+  const ownKeys = Reflect.ownKeys;
+
   const contexts = new WeakSet();
-  const handles = new WeakMap();
+  const records = new WeakMap();
 
   const DONT_CONTEXTIFY = Symbol("vm_dont_contextify");
   const USE_MAIN_CONTEXT_DEFAULT_LOADER = Symbol("vm_use_main_context_default_loader");
 
-  // ── Argument validation (mirrors node lib/internal/validators + vm.js) ──────
-  // node throws ERR_INVALID_ARG_TYPE / ERR_OUT_OF_RANGE with these exact codes;
-  // the tests probe err.code / err.name, so match those precisely.
   const invalidArgTypeHelper = (input) => {
     if (input === undefined || input === null) return " Received " + String(input);
     if (typeof input === "function") return " Received function " + input.name;
@@ -80,8 +92,6 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
   };
   const isArrayBufferView = (v) => typeof ArrayBuffer.isView === "function" && ArrayBuffer.isView(v);
 
-  // isContext() as callers use it internally (never throws); the public vm.isContext
-  // validates its argument first (see below).
   function isContextInternal(object) {
     if ((typeof object !== "object" && typeof object !== "function") || object === null) return false;
     return contexts.has(object);
@@ -93,7 +103,115 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
     return contexts.has(object);
   }
 
-  // codeGeneration / contextCodeGeneration: validate shape, return normalized flags.
+  // ── contextify ────────────────────────────────────────────────────────────
+  // node contextifies through V8 named/indexed property interceptors installed
+  // on the context's global proxy, so the sandbox object stays the single
+  // source of truth. JSC's C API exposes no such interceptor, so the sandbox is
+  // mirrored onto the child realm's global object around every run — but with
+  // FULL property descriptors (accessors, non-enumerable data, symbol keys) in
+  // both directions, which is what makes the observable surface match:
+  // `Object.getOwnPropertyNames(this)` inside the context sees the sandbox's
+  // non-enumerable keys, an accessor defined on the sandbox keeps firing on the
+  // sandbox, and a property deleted on either side disappears on the other.
+  //
+  // A dedicated `raw` evaluation path keeps the native layer out of the copy so
+  // it cannot downgrade an accessor into a data property behind our back.
+  function newRecord(sandbox) {
+    const handle = NVM.createContext(NVM.getGlobal ? undefined : {});
+    const g = NVM.getGlobal ? NVM.getGlobal(handle)
+                            : NVM.runInContext(handle, "globalThis", undefined);
+    const rec = {
+      handle,
+      global: g,
+      nativeKeys: new Set(ownKeys(g)),
+      mirrored: new Set(),
+      proto: new Set(),
+      sandbox,
+    };
+    return rec;
+  }
+
+  function syncIn(rec) {
+    const { sandbox, global: g, mirrored, proto } = rec;
+    const seen = new Set();
+    for (const key of ownKeys(sandbox)) {
+      seen.add(key);
+      proto.delete(key);
+      let desc = gOPD(sandbox, key);
+      if (desc === undefined) continue;
+      if ("value" in desc && desc.value === sandbox) {
+        // node's PropertyGetterCallback maps the sandbox onto the global proxy,
+        // so `ctx.window = ctx` makes `window === this` inside the context.
+        desc = { ...desc, value: g };
+      }
+      try { ObjectDefineProperty(g, key, desc); mirrored.add(key); } catch { /* non-configurable */ }
+    }
+    // node resolves an in-context global lookup with GetRealNamedProperty on
+    // the sandbox, which walks its prototype chain; mirror inherited members
+    // too, but non-enumerably and marked so they never travel back as OWN
+    // properties of the sandbox. Object.prototype is skipped: the context realm
+    // already has its own, and copying it would add own keys to the global.
+    let src = sandbox;
+    try { src = Object.getPrototypeOf(sandbox); } catch { src = null; }
+    while (src !== null && src !== undefined && src !== Object.prototype) {
+      for (const key of ownKeys(src)) {
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const desc = gOPD(src, key);
+        if (desc === undefined) continue;
+        try {
+          ObjectDefineProperty(g, key, { ...desc, enumerable: false });
+          mirrored.add(key);
+          proto.add(key);
+        } catch { /* non-configurable */ }
+      }
+      try { src = Object.getPrototypeOf(src); } catch { break; }
+    }
+    // Properties dropped from the sandbox since the last run must disappear
+    // from the context global too.
+    for (const key of [...mirrored]) {
+      if (!seen.has(key)) {
+        try { delete g[key]; } catch { /* ignore */ }
+        mirrored.delete(key);
+        proto.delete(key);
+      }
+    }
+  }
+
+  function syncOut(rec) {
+    const { sandbox, global: g, nativeKeys, mirrored, proto } = rec;
+    const live = new Set();
+    for (const key of ownKeys(g)) {
+      if (nativeKeys.has(key) && !mirrored.has(key)) continue;
+      live.add(key);
+      const desc = gOPD(g, key);
+      if (desc === undefined) continue;
+      // An accessor mirrored in from the sandbox stays owned by the sandbox.
+      if ((desc.get !== undefined || desc.set !== undefined) && mirrored.has(key)) continue;
+      if (proto.has(key)) continue;
+      let d = desc;
+      if ("value" in d && d.value === g) d = { ...d, value: sandbox };
+      try { ObjectDefineProperty(sandbox, key, d); } catch { /* ignore */ }
+      mirrored.add(key);
+    }
+    for (const key of [...mirrored]) {
+      if (!live.has(key)) {
+        if (!proto.has(key)) { try { delete sandbox[key]; } catch { /* ignore */ } }
+        mirrored.delete(key);
+        proto.delete(key);
+      }
+    }
+  }
+
+  function evalInContext(rec, code, filename) {
+    syncIn(rec);
+    try {
+      return NVM.runInContext(rec.handle, code, filename, true);
+    } finally {
+      syncOut(rec);
+    }
+  }
+
   function validateCodegen(cg, name) {
     if (cg === undefined) return undefined;
     if (typeof cg !== "object" || cg === null) {
@@ -105,31 +223,26 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
     if (wasm !== undefined) validateBoolean(wasm, name + ".wasm");
     return { strings: strings, wasm: wasm };
   }
-  function applyCodegen(h, cg) {
+  function applyCodegen(rec, cg) {
     if (!cg) return;
     if (cg.strings === false) {
-      // Disallow code generation from strings for this context by replacing the
-      // realm's own `eval` with one that throws the context's EvalError (matching
-      // node's --disallow-code-generation-from-strings observable behaviour).
-      // Non-enumerable, so contextify-out never copies it back onto the sandbox.
-      NVM.runInContext(h,
+      NVM.runInContext(rec.handle,
         "Object.defineProperty(globalThis,'eval',{value:function(){throw new EvalError('Code generation from strings disallowed for this context');},writable:true,enumerable:false,configurable:true});",
-        undefined);
+        undefined, true);
     }
     if (cg.wasm === false) {
-      NVM.runInContext(h,
+      NVM.runInContext(rec.handle,
         "(function(){var CE=WebAssembly.CompileError;Object.defineProperty(WebAssembly,'Module',{value:function(){throw new CE('Wasm code generation disallowed in this context');},writable:true,enumerable:false,configurable:true});})();",
-        undefined);
+        undefined, true);
     }
   }
 
   function createContext(contextObject, options) {
     if (contextObject === DONT_CONTEXTIFY) {
-      // DEFERRED: a true uncontextified realm whose globalThis IS the returned
-      // object. Approximated with a fresh contextified object so basic use and
-      // isContext() still work; realm-identity tests remain unsupported.
-      const o = {};
-      handles.set(o, NVM.createContext({}));
+      const rec0 = newRecord({});
+      const o = rec0.global;
+      rec0.sandbox = o;
+      records.set(o, rec0);
       contexts.add(o);
       return o;
     }
@@ -142,23 +255,18 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
     }
     const codegen = validateCodegen(options ? options.codeGeneration : undefined, "options.codeGeneration");
     if (isContextInternal(contextObject)) return contextObject;
-    const h = NVM.createContext(contextObject);
-    handles.set(contextObject, h);
+    const rec = newRecord(contextObject);
+    records.set(contextObject, rec);
     contexts.add(contextObject);
-    applyCodegen(h, codegen);
+    applyCodegen(rec, codegen);
     return contextObject;
   }
 
   const normalizeOptions = (options) =>
     typeof options === "string" ? { filename: options } : (options || {});
-  // Top-level vm.runIn*() accept a bare filename string in the options slot;
-  // normalize it to { filename } before it reaches the Script/method layer, which
-  // (like node) requires an options object there.
   const toOptionsObject = (options) =>
     typeof options === "string" ? { filename: options } : options;
 
-  // Run-time options for the runIn* methods: node validates the whole object and
-  // the timeout / displayErrors / breakOnSigint members.
   function validateRunOptions(options) {
     if (options === undefined) return;
     if (typeof options !== "object" || options === null) {
@@ -181,7 +289,6 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
     }
   }
 
-  // //# sourceMappingURL=  /  //@ sourceMappingURL= magic comment (last wins).
   function parseSourceMapURL(code) {
     const re = /(?:^|\n)[ \t]*\/\/[#@][ \t]+sourceMappingURL=([^\s'"]+)[ \t]*(?=\n|$)/g;
     let m, last;
@@ -190,8 +297,6 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
   }
 
   function makeCachedDataBuffer() {
-    // DEFERRED: no genuine V8 bytecode cache; return an opaque, non-empty Buffer
-    // so `createCachedData() instanceof Buffer` and round-trips hold.
     const B = G.Buffer;
     return B ? B.from("mbun-vm-cache ") : new Uint8Array([1]);
   }
@@ -220,9 +325,6 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
 
       this.__filename = filename === undefined ? "evalmachine.<anonymous>" : `${filename}`;
       this.sourceMapURL = parseSourceMapURL(this.__code);
-      // cachedData/bytecode is DEFERRED (no real V8 bytecode). We expose the shape
-      // node scripts carry: a consumed Buffer is "accepted" (not rejected), and
-      // produceCachedData yields a Buffer so round-trip callers observe the contract.
       if (cachedData !== undefined) {
         this.cachedData = cachedData;
         this.cachedDataRejected = false;
@@ -233,6 +335,8 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
         this.cachedData = makeCachedDataBuffer();
         this.cachedDataProduced = true;
       }
+      // Surface syntax errors at construction time, like node does.
+      NVM.checkSyntax(this.__code, this.__filename);
     }
     runInThisContext(options) {
       validateRunOptions(options);
@@ -241,7 +345,7 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
     runInContext(contextifiedObject, options) {
       validateContextified(contextifiedObject);
       validateRunOptions(options);
-      return NVM.runInContext(handles.get(contextifiedObject), this.__code, this.__filename);
+      return evalInContext(records.get(contextifiedObject), this.__code, this.__filename);
     }
     runInNewContext(contextObject, options) {
       const o = normalizeOptions(options);
@@ -276,18 +380,15 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
 
   function compileFunction(code, params, options) {
     options = options || {};
-    // Build through the target realm's Function constructor: it parses the
-    // assembled `function anonymous(params){ body }` as one unit, so a body that
-    // tries to close the wrapper early (injection) is a SyntaxError, and the
-    // resulting function belongs to that realm (parsingContext → sandbox realm,
-    // so eval/with inside it cannot reach the host globals).
     const args = Array.isArray(params) ? params.slice() : [];
     args.push(`${code}`);
     const pc = options.parsingContext;
     let FunctionCtor;
     if (pc !== undefined && pc !== null) {
       if (!isContextInternal(pc)) throw argTypeError("options.parsingContext", "an vm.Context");
-      FunctionCtor = NVM.runInContext(handles.get(pc), "Function", undefined);
+      const rec = records.get(pc);
+      syncIn(rec);
+      FunctionCtor = NVM.runInContext(rec.handle, "Function", undefined, true);
     } else {
       FunctionCtor = Function;
     }
@@ -295,7 +396,6 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
   }
 
   function measureMemory() {
-    // DEFERRED: JSC has no per-context accounting; report an empty summary.
     return Promise.resolve({ total: { jsMemoryEstimate: 0, jsMemoryRange: [0, 0] } });
   }
 
