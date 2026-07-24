@@ -3,6 +3,15 @@
 > 只记录**实质进展**（模块落地、测试集通过数变化、性能节点），倒序排列。
 > 格式：`## YYYY-MM-DD` + 条目（关联任务 ID / commit / 测试与性能数据）。
 
+## 2026-07-25
+
+- **第九轮开工：先修「量表」，再修被量表藏住的最大闸门**。本轮开始前把测量链路自身当被测对象查了一遍，发现两个会让此前若干轮结论失真的缺陷，均已修复并带自测（`867e38c` `c1f0aac` `6ea865c` `7ef92e6`）：
+  ① **`corpus_diff.py` 对 node 语料从来没生效过**。`is_green` 只认 bun runner 的 `"green"`，而 node runner 写的是 `"pass"` → 任何 node 文件在前后两轮都被判为非绿，`green→非绿` 这个跃迁根本构造不出来，闸门恒不触发；同时 assertion-move 分支无条件索引 `passed` 列，而 node 的 TSV 没有该列 → 只要有一个「两轮都非绿」的文件就 `KeyError: 'passed'` 整体崩掉。**即 node 语料连续 8 轮没有回归闸门**。修复后用两次既有 round-8 全量跑对拍，当场抓到一个此前无声落地的回归：`test-fs-cp-sync-copy-file-to-file-path.mjs` green→非绿（另有 `test-fs-watch-file-enoent-after-deletion.js` 转绿），退出码 1。
+  ② **node runner 把「自我 skip」记成了 pass**。`common.skip()` 打印 `1..0 # Skipped:` 后 `process.exit(0)`，仅看退出码无法区分「全跑通」与「拒绝跑」。语料里 **1527 个文件**存在 skip 分支，闸的正是 `process.features.*`/`hasCrypto`/`hasInspector` 这些「运行时缺什么」。用 round-8 全量日志重判：**1810 个 "pass" 里有 277 个其实是 skip**（debugger 60、inspector 58、eslint 29、sqlite 14、tls 12…），诚实基线应为 `pass 1533 / skipped 277 / fail 2033 / timeout 580 / oom 10`（=34.6% 而非 40.8%）。bun runner 早有 `all-skipped` 桶，此次补齐 node 侧对应物；`skipped` 在 corpus_diff 里算非绿（停止运行改为跳过是回归，不是持平）。**这个洞马上要放大**：237 个 `test-quic-*` 全部 `if (!hasQuic) skip()`，一旦下述闸门修好就会凭空多出 +237 个「假通过」。
+  ③ **`cluster_finder.py` 只按 (子系统, 签名) 聚类**，于是「跨子系统的同一根因」被撕成几十个小桶，报告顶端排的是碎片最大的那个子系统。新增**跨子系统排名**并置于报告首位，`--worklist` 直接把选中的簇导出为 runner 的 `--files` 清单，把「选靶」和「前后计分」闭合成同一批文件。
+- **由此浮出本项目当前最大的单一闸门：node harness 的 flag 重启（848 文件 = 全语料 19%，一个根因）**。`test/common/index.js:131-176` 在 `// Flags:` 头部所列 flag 不出现在 `process.execArgv` 时，会把测试作为子进程重启；mbun 的 `process.execArgv` 恒空 → 无限自我重启 → `spawnSync` 返回的 `signal` 非空 → `process.kill(0, SIGABRT)` 把整个进程组打掉（退出码 -6）。旧报告把它显示成 `quic: 234`，读起来像「缺 QUIC 实现」，因此连着几轮没人动它。量化验证：对 611 个非 quic 文件随机抽 80，仅用 `NODE_SKIP_FLAG_CHECK=1` 短路同一处检查，**22/80 = 27.5% 当场转绿**（当前 round-8 二进制，未改任何运行时代码）。
+- 第九轮 4 条 worktree 并行在飞（`r9/agent-1..4`：execArgv/flag 重启、node:fs、buffer/zlib/url/net 参数校验、crypto/webcrypto），量化目标分别 +150 / +30 / +25 / +22 个真实 `pass`（不含 skipped）。结果与全量复测另行记账。
+
 ## 2026-07-21
 
 - **第五批(fix/corpus-round4 续,近绿池清扫 + 诚实分诊):Bun green 880 → 885 / 1902(46.3% → 46.5%),oom 2、timeout 44,测试级 32,190 通过 / 52,454**。
