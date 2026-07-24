@@ -27,10 +27,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
-# The single classification the runners score as a real pass. Kept as a module
-# constant so "what counts as green" has exactly one definition shared by the
-# regression gate, the gain list, and the JSON summary.
-GREEN = "green"
+# What the runners score as a real pass. Kept as a module constant so "what
+# counts as green" has exactly one definition shared by the regression gate, the
+# gain list, and the JSON summary.
+#
+# The two runners spell it differently -- bun_corpus_runner writes `green`,
+# node_corpus_runner writes `pass` -- and this set previously held only `green`.
+# Every node file therefore read as non-green in both rounds, so the gate could
+# never see a green->non-green transition and the node corpus went eight rounds
+# with no working regression gate at all. Note what is deliberately absent:
+# `skipped` / `all-skipped` exit clean without verifying anything, so a file
+# that stops running and starts skipping is a regression, not a hold.
+GREEN_CLASSIFICATIONS = frozenset({"green", "pass"})
 
 
 @dataclass(frozen=True)
@@ -142,7 +150,7 @@ def load_round(where: Path) -> dict[str, dict[str, str]]:
 
 
 def is_green(row: dict[str, str]) -> bool:
-    return row["classification"] == GREEN
+    return row["classification"] in GREEN_CLASSIFICATIONS
 
 
 def to_int(value: str) -> int:
@@ -203,11 +211,17 @@ def compute_diff(
             gains.append(path)
         elif not was_green and not now_green:
             # Stayed non-green: surface an assertion-level move if the passed
-            # count changed at all (0-deltas are dropped as noise).
-            delta = to_int(after[path]["passed"]) - to_int(before[path]["passed"])
-            if delta != 0:
-                moves.append(Move(path, to_int(before[path]["passed"]),
-                                  to_int(after[path]["passed"])))
+            # count changed at all (0-deltas are dropped as noise). Only the bun
+            # runner reports per-file assertion counts; node's TSV has no
+            # `passed` column, and indexing it unconditionally used to abort the
+            # whole diff with a KeyError -- so the gate crashed on exactly the
+            # corpus it was most needed for. Absent counts simply mean no
+            # assertion-level signal is available, not a broken round.
+            if "passed" in after[path] and "passed" in before[path]:
+                delta = to_int(after[path]["passed"]) - to_int(before[path]["passed"])
+                if delta != 0:
+                    moves.append(Move(path, to_int(before[path]["passed"]),
+                                      to_int(after[path]["passed"])))
 
         # Optional perf signal: a file whose wall-clock grew past the threshold.
         # Only files with a meaningful `after` runtime are considered, so 1ms
