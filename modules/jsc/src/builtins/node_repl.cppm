@@ -176,12 +176,27 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
     return `REPL${nextREPLResourceNumber++}`;
   }
 
-  const globalBuiltins = new Set(
-    vm.runInNewContext("Object.getOwnPropertyNames(globalThis)"));
+  // Lazy: node's internal/repl/utils computes this at module load, but this
+  // partition is part of the builtins image, so doing it eagerly would spin up
+  // a whole JSC global context on EVERY process start just in case a REPL is
+  // ever created.
+  let globalBuiltinsCache;
+  const globalBuiltinNames = () => {
+    if (globalBuiltinsCache === undefined) {
+      globalBuiltinsCache = new Set(
+        vm.runInNewContext("Object.getOwnPropertyNames(globalThis)"));
+    }
+    return globalBuiltinsCache;
+  };
 
   const builtinLibsFilter = (e) => e[0] !== "_" && !e.startsWith("node:");
-  let _builtinLibs = (CJSModule.builtinModules || []).filter(builtinLibsFilter);
-  const getReplBuiltinLibs = () => _builtinLibs;
+  let _builtinLibs;
+  const getReplBuiltinLibs = () => {
+    if (_builtinLibs === undefined) {
+      _builtinLibs = (CJSModule.builtinModules || []).filter(builtinLibsFilter);
+    }
+    return _builtinLibs;
+  };
   const setReplBuiltinLibs = (v) => { _builtinLibs = v; };
 
   // ── writer ────────────────────────────────────────────────────────────────
@@ -1012,7 +1027,7 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
       } else {
         context = vm.createContext();
         for (const name of Object.getOwnPropertyNames(G)) {
-          if (!globalBuiltins.has(name)) {
+          if (!globalBuiltinNames().has(name)) {
             try {
               Object.defineProperty(context, name,
                                     Object.getOwnPropertyDescriptor(G, name));
