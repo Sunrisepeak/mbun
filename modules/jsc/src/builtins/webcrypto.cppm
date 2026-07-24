@@ -481,9 +481,15 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
 
     // ---- HMAC (pre-existing native fast path) ----
     const importHmacKey = (raw, hash, extractable, usages, declaredLength) => {
-      if (raw.byteLength === 0) throw dataError("HMAC key is empty");
-      if (declaredLength != null && Number(declaredLength) !== raw.byteLength * 8) {
-        throw dataError("HMAC key length does not match key data");
+      if (raw.byteLength === 0) throw dataError("Zero-length key is not supported");
+      // HmacImportParams.length: 0 is a DataError, a non-multiple of 8 is a
+      // NotSupportedError, anything else must match the key data exactly.
+      // ref: node lib/internal/crypto/webidl.js validateMacKeyLength + mac.js.
+      if (declaredLength !== undefined && declaredLength !== null) {
+        const bits = Number(declaredLength);
+        if (bits === 0) throw dataError("HmacImportParams.length cannot be 0");
+        if (bits % 8 !== 0) throw notSupported("Unsupported HmacImportParams.length");
+        if (bits !== raw.byteLength * 8) throw dataError("Invalid key length");
       }
       if (usages.length === 0) {
         throw domError("Usages cannot be empty when importing a secret key.", "SyntaxError");
@@ -1071,6 +1077,10 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
       importKey(format, keyData, algorithm, extractable, keyUsages) {
         if (arguments.length < 5) throw missingArgs(5, arguments.length);
         const convertedFormat = keyFormat(format);
+        // node converts the arguments before normalizing the algorithm, so a
+        // non-BufferSource keyData is ERR_INVALID_ARG_TYPE even when the
+        // algorithm is unrecognized.
+        if (convertedFormat !== "jwk") copyBytes(keyData);
         const alg = normalizeAlg(algorithm);
         const usages = normalizeUsages(keyUsages);
         const name = alg.name;
@@ -1110,7 +1120,7 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
 
         if (name === "HMAC") {
           if (!rawSecret && convertedFormat !== "jwk") throw unsupportedFormat();
-          restrictUsages(usages, ["sign", "verify"], "an HMAC");
+          restrictUsages(usages, ["sign", "verify"], "HMAC");
           const hash = memberHash(alg);
           const raw = convertedFormat === "jwk" ? octFromJwk("sig") : copyBytes(keyData);
           checkJwkAlg(jwkAlgFor({ name: "HMAC", hash }));
@@ -1179,6 +1189,20 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
             : OKP_ALGS.has(name) ? "OKP" : null;
           if (typeof keyData.kty !== "string") throw dataError("Invalid keyData");
           if (wantKty && keyData.kty !== wantKty) throw dataError('Invalid JWK "kty" Parameter');
+          // Per-kty required members (node webcrypto_util.js validateJwk).
+          const str = (v) => typeof v === "string";
+          const optStr = (v) => v === undefined || typeof v === "string";
+          const badKeyData = () => dataError("Invalid keyData");
+          if (wantKty === "RSA") {
+            if (!str(keyData.n) || !str(keyData.e) || !optStr(keyData.d)) throw badKeyData();
+            if (str(keyData.d) && !(str(keyData.p) && str(keyData.q) && str(keyData.dp) &&
+                str(keyData.dq) && str(keyData.qi))) throw badKeyData();
+          } else if (wantKty === "EC") {
+            if (!str(keyData.crv) || !str(keyData.x) || !str(keyData.y) ||
+                !optStr(keyData.d)) throw badKeyData();
+          } else if (wantKty === "OKP") {
+            if (!str(keyData.crv) || !str(keyData.x) || !optStr(keyData.d)) throw badKeyData();
+          }
           // "use" is checked against the algorithm's purpose whenever usages were
           // requested. ref: node lib/internal/crypto/{rsa,ec,cfrg}.js expectedUse.
           const expectedUse = (name === "RSA-OAEP" || name === "ECDH" ||
