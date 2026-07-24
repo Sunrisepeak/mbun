@@ -30,7 +30,19 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
   {
     const WC = G.__mbunWebCryptoNative;
     const NativeCryptoKey = G.CryptoKey;
-    function CryptoKey() { throw new TypeError("Illegal constructor"); }
+    // node brands "cannot be constructed / wrong receiver" with these two codes
+    // (ERR_ILLEGAL_CONSTRUCTOR, ERR_INVALID_THIS); the corpus matches on them.
+    const illegalConstructor = () => {
+      const e = new TypeError("Illegal constructor");
+      e.code = "ERR_ILLEGAL_CONSTRUCTOR";
+      return e;
+    };
+    const invalidThis = (what) => {
+      const e = new TypeError('Value of "this" must be of type ' + what);
+      e.code = "ERR_INVALID_THIS";
+      return e;
+    };
+    function CryptoKey() { throw illegalConstructor(); }
     CryptoKey.prototype = NativeCryptoKey.prototype;
     const keyMetadata = new WeakMap();
     const freeze = Object.freeze;
@@ -44,7 +56,7 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
     const usageSet = new Set(usageNames);
     const metadataFor = (key) => {
       const metadata = keyMetadata.get(key);
-      if (!metadata) throw new TypeError("Illegal invocation");
+      if (!metadata) throw invalidThis("CryptoKey");
       return metadata;
     };
     defineProperty(CryptoKey.prototype, "constructor", {
@@ -67,6 +79,15 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
     });
     freeze(CryptoKey.prototype);
     freeze(CryptoKey);
+    // node instantiates InternalCryptoKey, a subclass whose prototype chains to
+    // CryptoKey.prototype and whose `constructor` still reports CryptoKey.
+    // test-webcrypto-cryptokey-brand-check walks exactly that chain.
+    const InternalCryptoKey = function InternalCryptoKey() {};
+    InternalCryptoKey.prototype = Object.create(CryptoKey.prototype);
+    defineProperty(InternalCryptoKey.prototype, "constructor", {
+      configurable: false, enumerable: false, writable: false, value: CryptoKey,
+    });
+    freeze(InternalCryptoKey.prototype);
     defineProperty(G, "CryptoKey", {
       configurable: false, enumerable: false, writable: false, value: CryptoKey,
     });
@@ -297,7 +318,7 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
     // ---- CryptoKey construction ----
     // `extra` carries the opaque material: { material } (DER) or { secret } (raw).
     const makeKey = (type, algorithm, extractable, usages, extra) => {
-      const key = Object.create(CryptoKey.prototype);
+      const key = Object.create(InternalCryptoKey.prototype);
       const metadata = Object.assign({
         type, algorithm: freeze(algorithm), extractable: !!extractable, usages: sortUsages(usages),
       }, extra);
@@ -331,10 +352,7 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
       const metadata = keyMetadata.get(key);
       // Object.create(CryptoKey.prototype) has the prototype but no material:
       // the IDL converter rejects it with a TypeError.
-      if (!metadata) {
-        throw new TypeError("Argument 2 ('key') to SubtleCrypto." + usage +
-          " must be an instance of CryptoKey");
-      }
+      if (!metadata) throw invalidThis("CryptoKey");
       const supported = opAlgs[usage];
       if (supported && !supported.has(name)) throw notSupported("Unrecognized algorithm name");
       const isDerive = usage === "deriveBits" || usage === "deriveKey";
@@ -857,6 +875,9 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
     // The `public` member of the ECDH/X25519/X448 algorithm dictionary is a
     // required CryptoKey: absent → ERR_MISSING_OPTION TypeError (webidl's
     // required-member step), present but not a CryptoKey → a plain TypeError.
+    // EcdhKeyDeriveParams.public is validated by the IDL dictionary converter,
+    // i.e. BEFORE the baseKey usage/algorithm checks. ref: node
+    // lib/internal/crypto/webidl.js converters.EcdhKeyDeriveParams.
     const requirePeerKey = (alg, name) => {
       requiredMember(alg.public, "algorithm.public");
       const peer = keyMetadata.get(alg.public);
@@ -866,11 +887,20 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
         err.code = "ERR_INVALID_ARG_TYPE";
         throw err;
       }
-      if (peer.algorithm.name !== name) {
-        throw domError("The public and private keys must be of the same type",
-          "InvalidAccessError");
+      if (peer.type !== "public") {
+        throw domError("algorithm.public must be a public key", "InvalidAccessError");
+      }
+      if (peer.algorithm.name.toLowerCase() !== String(name).toLowerCase()) {
+        throw domError("key algorithm mismatch", "InvalidAccessError");
       }
       return peer;
+    };
+    // Run that converter step up front for the algorithms that declare it.
+    const normalizeDeriveAlg = (alg) => {
+      if (alg.name === "ECDH" || alg.name === "X25519" || alg.name === "X448") {
+        requirePeerKey(alg, alg.name);
+      }
+      return alg;
     };
     const deriveBytes = (alg, metadata, lengthBits) => {
       const name = metadata.algorithm.name;
@@ -931,7 +961,13 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
       throw notSupported("Unrecognized algorithm name");
     };
 
-    class SubtleCrypto {
+    // The public SubtleCrypto methods are NOT async functions in node: each is a
+    // plain method that returns a Promise, so a bad receiver rejects rather than
+    // throws (test-webcrypto-methods-not-async asserts both). The algorithm
+    // bodies live on this internal object; the exposed wrappers add the
+    // ERR_INVALID_THIS brand check. Internal re-entry (deriveKey/unwrapKey ->
+    // importKey) goes through the impl, never through the user-visible method.
+    class SubtleCryptoImpl {
       async digest(algorithm, data) {
         // cSHAKE is an XOF: its output length is a required dictionary member,
         // and (per node) must be a whole number of bytes. Without a function
@@ -1021,7 +1057,8 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
           if (keyData.ext === false && extractable) {
             throw dataError('JWK "ext" Parameter and extractable mismatch');
           }
-          return unb64u(keyData.k);
+          try { return unb64u(keyData.k); }
+          catch (e) { throw dataError("Invalid keyData"); }
         };
         const checkJwkAlg = (expected) => {
           if (convertedFormat !== "jwk" || keyData.alg === undefined) return;
@@ -1139,15 +1176,14 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
         } else if (EC_ALGS.has(name)) {
           keyAlgorithm.namedCurve = info.namedCurve;
         }
-        return makeKey(type, keyAlgorithm, type === "public" ? true : extractable, usages,
-          { material });
+        return makeKey(type, keyAlgorithm, extractable, usages, { material });
       }
 
       async exportKey(format, key) {
         if (arguments.length < 2) throw new TypeError("Not enough arguments");
         const convertedFormat = keyFormat(format);
         const metadata = keyMetadata.get(key);
-        if (!metadata) throw new TypeError("Invalid CryptoKey");
+        if (!metadata) throw invalidThis("CryptoKey");
         const name = metadata.algorithm.name;
         const type = metadata.type;
         // PBKDF2/HKDF are not registered for the exportKey operation at all.
@@ -1242,7 +1278,7 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
 
       async deriveBits(algorithm, baseKey, length = null) {
         if (arguments.length < 2) throw new TypeError("Not enough arguments");
-        const alg = normalizeAlg(algorithm);
+        const alg = normalizeDeriveAlg(normalizeAlg(algorithm));
         const metadata = requireKey(baseKey, alg.name, "deriveBits");
         const bits = length == null ? null : Number(length);
         if (bits != null && (!Number.isInteger(bits) || bits < 0)) {
@@ -1253,7 +1289,7 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
 
       async deriveKey(algorithm, baseKey, derivedKeyType, extractable, keyUsages) {
         if (arguments.length < 5) throw new TypeError("Not enough arguments");
-        const alg = normalizeAlg(algorithm);
+        const alg = normalizeDeriveAlg(normalizeAlg(algorithm));
         const metadata = requireKey(baseKey, alg.name, "deriveKey");
         const derived = normalizeAlg(derivedKeyType);
         // The derived length comes from the target algorithm (spec "get key length").
@@ -1315,14 +1351,137 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
       }
     }
 
-    const subtle = new SubtleCrypto();
-    G.SubtleCrypto = SubtleCrypto;
-    Object.defineProperty(G.crypto, "subtle", {
-      configurable: true,
-      enumerable: true,
-      get: () => subtle,
-      set: () => {},
+    const impl = new SubtleCryptoImpl();
+
+    class SubtleCrypto { constructor() { throw illegalConstructor(); } }
+    // The full node method list; the post-quantum encapsulation family is
+    // present so the receiver check is observable, but mbun has no ML-KEM, so
+    // it reports NotSupportedError rather than a fabricated key.
+    const SUBTLE_METHODS = ["decrypt", "decapsulateBits", "decapsulateKey", "deriveBits",
+      "deriveKey", "digest", "encapsulateBits", "encapsulateKey", "encrypt", "exportKey",
+      "generateKey", "getPublicKey", "importKey", "sign", "unwrapKey", "verify", "wrapKey"];
+    for (const method of SUBTLE_METHODS) {
+      const body = impl[method];
+      const wrapper = { [method](...args) {
+        if (this !== subtle) return Promise.reject(invalidThis("SubtleCrypto"));
+        if (typeof body !== "function") {
+          return Promise.reject(notSupported("Unrecognized algorithm name"));
+        }
+        try { return Promise.resolve(body.apply(impl, args)); }
+        catch (e) { return Promise.reject(e); }
+      } }[method];
+      defineProperty(SubtleCrypto.prototype, method, {
+        configurable: true, writable: true, enumerable: true, value: wrapper,
+      });
+    }
+    defineProperty(SubtleCrypto.prototype, Symbol.toStringTag, {
+      configurable: true, value: "SubtleCrypto",
     });
+    defineProperty(SubtleCrypto, "supports", {
+      configurable: true, writable: true, enumerable: true,
+      value: function supports(operation, algorithm) {
+        if (this !== SubtleCrypto) throw invalidThis("SubtleCrypto constructor");
+        if (arguments.length < 2) throw new TypeError("Not enough arguments");
+        try {
+          const alg = normalizeAlg(algorithm);
+          const table = opAlgs[String(operation)];
+          if (table) return table.has(alg.name);
+          if (operation === "importKey" || operation === "exportKey" ||
+              operation === "generateKey" || operation === "getKeyLength") return true;
+          if (operation === "digest") return true;
+          return false;
+        } catch (e) { return false; }
+      },
+    });
+    const subtle = Object.create(SubtleCrypto.prototype);
+    G.SubtleCrypto = SubtleCrypto;
+
+    // ---- Crypto (the globalThis.crypto interface) ----
+    // globalThis.crypto is a plain object earlier in the bootstrap; give it the
+    // real interface so `Crypto`, the receiver checks and the getRandomValues
+    // argument validation behave as node's do.
+    const realCrypto = G.crypto;
+    const baseGetRandomValues = realCrypto.getRandomValues;
+    const baseRandomUUID = realCrypto.randomUUID;
+    // getRandomValues only accepts integer-typed views (no Float*/DataView) and
+    // caps the request at 65536 bytes. ref: WebCrypto §Crypto-method-getRandomValues.
+    const INT_TYPED_VIEWS = new Set(["Int8Array", "Int16Array", "Int32Array", "Uint8Array",
+      "Uint16Array", "Uint32Array", "Uint8ClampedArray", "BigInt64Array", "BigUint64Array"]);
+    const quotaExceeded = () => {
+      const Ctor = G.QuotaExceededError;
+      const err = typeof Ctor === "function"
+        ? new Ctor("The requested length exceeds 65,536 bytes")
+        : domError("The requested length exceeds 65,536 bytes", "QuotaExceededError");
+      return err;
+    };
+    const webGetRandomValues = (array) => {
+      const tag = ArrayBuffer.isView(array)
+        ? Object.prototype.toString.call(array).slice(8, -1) : "";
+      if (!INT_TYPED_VIEWS.has(tag)) {
+        throw domError("The provided ArrayBufferView is not an integer-typed array",
+          "TypeMismatchError");
+      }
+      if (array.byteLength > 65536) throw quotaExceeded();
+      baseGetRandomValues.call(realCrypto, array);
+      return array;
+    };
+    class Crypto { constructor() { throw illegalConstructor(); } }
+    const cryptoBrand = new WeakSet();
+    const requireCrypto = (self) => { if (!cryptoBrand.has(self)) throw invalidThis("Crypto"); };
+    defineProperty(Crypto.prototype, "subtle", {
+      configurable: true, enumerable: true,
+      get() { requireCrypto(this); return subtle; },
+    });
+    defineProperty(Crypto.prototype, "getRandomValues", {
+      configurable: true, writable: true, enumerable: true,
+      value: function getRandomValues(array) {
+        requireCrypto(this);
+        if (arguments.length < 1) throw new TypeError("Not enough arguments");
+        return webGetRandomValues(array);
+      },
+    });
+    defineProperty(Crypto.prototype, "randomUUID", {
+      configurable: true, writable: true, enumerable: true,
+      value: function randomUUID() {
+        requireCrypto(this);
+        return baseRandomUUID.call(realCrypto);
+      },
+    });
+    defineProperty(Crypto.prototype, Symbol.toStringTag, {
+      configurable: true, value: "Crypto",
+    });
+    try {
+      delete realCrypto.getRandomValues;
+      delete realCrypto.randomUUID;
+      delete realCrypto.subtle;
+      Object.setPrototypeOf(realCrypto, Crypto.prototype);
+      cryptoBrand.add(realCrypto);
+      G.Crypto = Crypto;
+    } catch (e) {
+      // A frozen/exotic host crypto object keeps the legacy own-property shape.
+      defineProperty(realCrypto, "subtle", {
+        configurable: true, enumerable: true, get: () => subtle, set: () => {},
+      });
+    }
+
+    // node:crypto <-> WebCrypto bridge: hand the raw key material of a CryptoKey
+    // to the node:crypto layer (builtins/crypto_asym.cppm), which owns KeyObject,
+    // and build a CryptoKey back from a KeyObject's DER/secret bytes.
+    G.__mbunCryptoKeyMaterial = (key) => {
+      const metadata = keyMetadata.get(key);
+      if (!metadata) return undefined;
+      return {
+        kind: metadata.secret ? "secret" : metadata.type,
+        material: metadata.secret ? metadata.secret : metadata.material,
+        algorithm: metadata.algorithm,
+        usages: metadata.usages,
+        extractable: metadata.extractable,
+      };
+    };
+    G.__mbunKeyObjectToCryptoKey = (kind, material, algorithm, extractable, keyUsages) =>
+      impl.importKey(kind === "secret" ? "raw-secret" : kind === "public" ? "spki" : "pkcs8",
+        material, algorithm, extractable, keyUsages);
+    G.__mbunIsCryptoKey = (value) => keyMetadata.has(value);
     delete G.__mbunWebCryptoNative;
   }
 )JS";
