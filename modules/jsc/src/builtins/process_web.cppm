@@ -795,7 +795,11 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     G.TextDecoder = class TextDecoder {
       get [Symbol.toStringTag]() { return "TextDecoder"; }
       constructor(enc, opts) {
-        const key = String(enc === undefined ? "utf-8" : enc).toLowerCase().trim();
+        // WHATWG Encoding "get an encoding" strips only ASCII whitespace
+        // (TAB/LF/FF/CR/SPACE). String.prototype.trim would also eat U+000B,
+        // U+00A0, U+2028 and U+2029, turning labels node rejects with
+        // ERR_ENCODING_NOT_SUPPORTED into valid ones.
+        const key = String(enc === undefined ? "utf-8" : enc).toLowerCase().replace(/^[\t\n\f\r ]+/, "").replace(/[\t\n\f\r ]+$/, "");
         this.encoding = ENC_ALIAS[key] || SB_ALIAS[key];
         // bun TextDecoder.rs:588-600 — an unknown/replacement label is a
         // RangeError carrying code ERR_ENCODING_NOT_SUPPORTED.

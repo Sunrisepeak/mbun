@@ -1823,6 +1823,10 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     // WTF::URLParser::{parseURLEncodedForm,serialize}.  URLSearchParams uses
     // application/x-www-form-urlencoded, not encodeURIComponent's encode set.
     const toUSVString = (value) => {
+      // node converts through `${value}`, which rejects symbols. JSC's own
+      // message ("Cannot convert a symbol to a string") differs from V8's, and
+      // test-whatwg-url-custom-searchparams-* match V8's wording exactly.
+      if (typeof value === "symbol") throw new TypeError("Cannot convert a Symbol value to a string");
       const input = String(value); let out = "";
       for (let i = 0; i < input.length; i++) {
         const code = input.charCodeAt(i);
@@ -1878,59 +1882,85 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     const formEncode = (value) => encodeURIComponent(toUSVString(value))
       .replace(/%20/g, "+")
       .replace(/[!'()~]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase());
-    const missingArgs = (name, required, actual) => {
-      if (actual >= required) return;
-      throw new TypeError(`${name} requires at least ${required} argument${required === 1 ? "" : "s"}`);
-    };
+    // node lib/internal/url.js throws typed errors from every URLSearchParams
+    // entry point: a Web IDL brand check (ERR_INVALID_THIS), an arity check
+    // (ERR_MISSING_ARGS) and the two constructor conversion failures
+    // (ERR_ARG_NOT_ITERABLE / ERR_INVALID_TUPLE). The messages are asserted
+    // verbatim by test-whatwg-url-custom-searchparams-*.
+    const spErr = (code, message) => { const e = new TypeError(message); e.code = code; return e; };
+    const missingArgs = (...names) =>
+      spErr("ERR_MISSING_ARGS", `The ${names.map((n) => `"${n}"`).join(" and ")} argument${names.length === 1 ? "" : "s"} must be specified`);
+    const invalidTuple = () => spErr("ERR_INVALID_TUPLE", "Each query pair must be an iterable [name, value] tuple");
     G.URLSearchParams = class URLSearchParams {
+      #brand;
+      // Web IDL brand check: `#brand in o` is true only for objects that ran
+      // this constructor, so `params.get.call(undefined)` throws like node's.
+      static #check(o) { if (o === null || (typeof o !== "object" && typeof o !== "function") || !(#brand in o)) throw spErr("ERR_INVALID_THIS", 'Value of "this" must be of type URLSearchParams'); }
       constructor(init) {
         this._e = [];
-        if (typeof init === "string") {
-          let s = init[0] === "?" ? init.slice(1) : init;
-          if (s) for (const p of s.split("&")) {
-            if (!p) continue;
-            const i = p.indexOf("=");
-            this._e.push([formDecode(i < 0 ? p : p.slice(0, i)), formDecode(i < 0 ? "" : p.slice(i + 1))]);
+        if (init == null) return;
+        if (typeof init === "object" || typeof init === "function") {
+          const method = init[Symbol.iterator];
+          if (method != null) {
+            // sequence<sequence<USVString>>
+            if (typeof method !== "function") throw spErr("ERR_ARG_NOT_ITERABLE", "Query pairs must be iterable");
+            // Web IDL sequence conversion uses the object's actual iterator, even
+            // for a URLSearchParams instance whose Symbol.iterator was replaced.
+            for (const pair of init) {
+              if (pair == null) throw invalidTuple();
+              if (Array.isArray(pair)) {
+                if (pair.length !== 2) throw invalidTuple();
+                this._e.push([toUSVString(pair[0]), toUSVString(pair[1])]);
+                continue;
+              }
+              if ((typeof pair !== "object" && typeof pair !== "function") || typeof pair[Symbol.iterator] !== "function") throw invalidTuple();
+              const values = [];
+              for (const element of pair) values.push(toUSVString(element));
+              if (values.length !== 2) throw invalidTuple();
+              this._e.push(values);
+            }
+            return;
           }
-        } else if (init != null && typeof init[Symbol.iterator] === "function") {
-          // Web IDL sequence conversion uses the object's actual iterator, even
-          // for a URLSearchParams instance whose Symbol.iterator was replaced.
-          for (const pair of init) {
-            if (pair == null || typeof pair[Symbol.iterator] !== "function") throw new TypeError("Each query pair must be an iterable");
-            const values = Array.from(pair);
-            if (values.length !== 2) throw new TypeError("Each query pair must contain exactly two items");
-            this._e.push([toUSVString(values[0]), toUSVString(values[1])]);
-          }
-        } else if (init && typeof init === "object") {
-          // A live own-property walk preserves Web IDL's interleaved Get/value
-          // conversion: deleting a later property while stringifying an earlier
+          // record<USVString, USVString>: own keys (symbols included, so a
+          // symbol key surfaces as the same TypeError node reports), taken
+          // live so deleting a later property while stringifying an earlier
           // value prevents the deleted property from becoming a pair.
-          for (const key in init) {
-            if (!Object.prototype.propertyIsEnumerable.call(init, key)) continue;
+          for (const key of Reflect.ownKeys(init)) {
+            const desc = Reflect.getOwnPropertyDescriptor(init, key);
+            if (desc === undefined || !desc.enumerable) continue;
             this._e.push([toUSVString(key), toUSVString(init[key])]);
           }
+          return;
+        }
+        const str = toUSVString(init);
+        let s = str[0] === "?" ? str.slice(1) : str;
+        if (s) for (const p of s.split("&")) {
+          if (!p) continue;
+          const i = p.indexOf("=");
+          this._e.push([formDecode(i < 0 ? p : p.slice(0, i)), formDecode(i < 0 ? "" : p.slice(i + 1))]);
         }
       }
       _updateURL() { if (this._url) { this._url._search = this._e.length ? "?" + this.toString() : ""; this._url._queryPresent = this._e.length !== 0; } }
-      append(k, v) { missingArgs("URLSearchParams.append", 2, arguments.length); this._e.push([toUSVString(k), toUSVString(v)]); this._updateURL(); }
+      append(k, v) { URLSearchParams.#check(this); if (arguments.length < 2) throw missingArgs("name", "value"); this._e.push([toUSVString(k), toUSVString(v)]); this._updateURL(); }
       set(k, v) {
-        missingArgs("URLSearchParams.set", 2, arguments.length); k = toUSVString(k); v = toUSVString(v);
+        URLSearchParams.#check(this); if (arguments.length < 2) throw missingArgs("name", "value");
+        k = toUSVString(k); v = toUSVString(v);
         const first = this._e.findIndex((x) => x[0] === k);
         if (first < 0) this._e.push([k, v]);
         else { this._e[first][1] = v; this._e = this._e.filter((x, i) => i === first || x[0] !== k); }
         this._updateURL();
       }
-      get(k) { missingArgs("URLSearchParams.get", 1, arguments.length); const e = this._e.find((x) => x[0] === toUSVString(k)); return e ? e[1] : null; }
-      getAll(k) { missingArgs("URLSearchParams.getAll", 1, arguments.length); k = toUSVString(k); return this._e.filter((x) => x[0] === k).map((x) => x[1]); }
-      has(k, v) { missingArgs("URLSearchParams.has", 1, arguments.length); k = toUSVString(k); return (arguments.length < 2 || v === undefined) ? this._e.some((x) => x[0] === k) : this._e.some((x) => x[0] === k && x[1] === toUSVString(v)); }
-      delete(k, v) { missingArgs("URLSearchParams.delete", 1, arguments.length); k = toUSVString(k); this._e = this._e.filter((x) => (arguments.length < 2 || v === undefined) ? x[0] !== k : !(x[0] === k && x[1] === toUSVString(v))); this._updateURL(); }
-      forEach(cb, t) { missingArgs("URLSearchParams.forEach", 1, arguments.length); for (let i = 0; i < this._e.length; i++) { const [k, v] = this._e[i]; cb.call(t, v, k, this); } }
-      keys() { return this._e.map((x) => x[0])[Symbol.iterator](); }
-      values() { return this._e.map((x) => x[1])[Symbol.iterator](); }
-      entries() { return this._e.map((x) => [x[0], x[1]])[Symbol.iterator](); }
+      get(k) { URLSearchParams.#check(this); if (arguments.length < 1) throw missingArgs("name"); k = toUSVString(k); const e = this._e.find((x) => x[0] === k); return e ? e[1] : null; }
+      getAll(k) { URLSearchParams.#check(this); if (arguments.length < 1) throw missingArgs("name"); k = toUSVString(k); return this._e.filter((x) => x[0] === k).map((x) => x[1]); }
+      has(k, v) { URLSearchParams.#check(this); if (arguments.length < 1) throw missingArgs("name"); k = toUSVString(k); return (arguments.length < 2 || v === undefined) ? this._e.some((x) => x[0] === k) : this._e.some((x) => x[0] === k && x[1] === toUSVString(v)); }
+      delete(k, v) { URLSearchParams.#check(this); if (arguments.length < 1) throw missingArgs("name"); k = toUSVString(k); this._e = this._e.filter((x) => (arguments.length < 2 || v === undefined) ? x[0] !== k : !(x[0] === k && x[1] === toUSVString(v))); this._updateURL(); }
+      forEach(cb, t) { URLSearchParams.#check(this); if (arguments.length < 1) throw missingArgs("callback"); for (let i = 0; i < this._e.length; i++) { const [k, v] = this._e[i]; cb.call(t, v, k, this); } }
+      keys() { URLSearchParams.#check(this); return this._e.map((x) => x[0])[Symbol.iterator](); }
+      values() { URLSearchParams.#check(this); return this._e.map((x) => x[1])[Symbol.iterator](); }
+      entries() { URLSearchParams.#check(this); return this._e.map((x) => [x[0], x[1]])[Symbol.iterator](); }
       [Symbol.iterator]() { return this.entries(); }
-      sort() { this._e.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)); this._updateURL(); }
-      get size() { return this._e.length; }
+      sort() { URLSearchParams.#check(this); this._e.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)); this._updateURL(); }
+      get size() { URLSearchParams.#check(this); return this._e.length; }
       get length() { return this._e.length; }
       toJSON() { const out = {}; for (const [k, v] of this._e) { if (Object.prototype.hasOwnProperty.call(out, k)) { if (Array.isArray(out[k])) out[k].push(v); else out[k] = [out[k], v]; } else out[k] = v; } return out; }
       toString() { return this._e.map(([k, v]) => formEncode(k) + "=" + formEncode(v)).join("&"); }
@@ -2179,7 +2209,19 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       set search(v) { const s = String(v), query = s.startsWith("?") ? s.slice(1) : s; this._queryPresent = s !== ""; this._search = s === "" ? "" : "?" + encodeQuery(query, !!specialProtocols[this._protocol]); const next = new G.URLSearchParams(query); this.searchParams._e = next._e; }
       get _authority() { const credentials = this._username || this._password ? this._username + (this._password ? ":" + this._password : "") + "@" : ""; return credentials + this.host; }
       get href() { return this._protocol + (this._hasAuthority || this._protocol === "file:" ? "//" + this._authority : "") + this._pathname + (this._queryPresent ? this._search : "") + this._hash; }
-      set href(v) { this._parse(String(v)); }
+      // node's href setter is atomic: an unparseable value throws and leaves the
+      // URL untouched (test-whatwg-url-custom-href-side-effect deepStrictEquals
+      // the object afterwards). Parse into a throwaway URL first, then adopt its
+      // state — _parse mutates field-by-field and would leave a half-written URL.
+      set href(v) {
+        const next = new G.URL(String(v));
+        this._protocol = next._protocol; this._username = next._username; this._password = next._password;
+        this._hostname = next._hostname; this._port = next._port; this._pathname = next._pathname;
+        this._search = next._search; this._hash = next._hash; this._queryPresent = next._queryPresent;
+        this._opaque = next._opaque; this._hasAuthority = next._hasAuthority;
+        if (this.searchParams) this.searchParams._e = next.searchParams._e;
+        else { this.searchParams = next.searchParams; Object.defineProperty(this.searchParams, "_url", { value: this, writable: true, configurable: true }); }
+      }
       get origin() {
         if (this._protocol === "blob:") {
           try {
