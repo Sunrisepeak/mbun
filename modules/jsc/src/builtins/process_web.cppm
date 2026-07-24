@@ -905,7 +905,22 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   class Buffer extends Uint8Array {
     static from(data, e) {
       if (typeof data === "string") {
-        if (e === "hex") { const a = []; for (let i = 0; i < data.length; i += 2) a.push(parseInt(data.substr(i, 2), 16)); return new Buffer(a); }
+        // node decodes hex PAIRWISE and stops at the first incomplete or
+        // non-hex pair: Buffer.from("abc", "hex") is <ab> (one byte), not
+        // <ab 0c>. Reading the trailing nibble as a whole byte corrupted every
+        // odd-length hex string — visible through node:stream, whose readable
+        // captured this Buffer before node_buffer_extra replaced the global
+        // (test-stream-readable-unshift unshifts "abc" as hex).
+        if (e === "hex") {
+          const a = [];
+          const nib = (c) => (c >= 48 && c <= 57) ? c - 48 : (c >= 97 && c <= 102) ? c - 87 : (c >= 65 && c <= 70) ? c - 55 : -1;
+          for (let i = 0; i + 1 < data.length; i += 2) {
+            const hi = nib(data.charCodeAt(i)), lo = nib(data.charCodeAt(i + 1));
+            if (hi < 0 || lo < 0) break;
+            a.push(hi * 16 + lo);
+          }
+          return new Buffer(a);
+        }
         if (e === "base64") { const s = G.atob(data); const a = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) a[i] = s.charCodeAt(i); return new Buffer(a); }
         // utf16le/ucs2: two little-endian bytes per UTF-16 code unit.
         if (e === "utf16le" || e === "ucs2" || e === "ucs-2" || e === "utf-16le") { const a = new Uint8Array(data.length * 2); for (let i = 0; i < data.length; i++) { const c = data.charCodeAt(i); a[i * 2] = c & 0xff; a[i * 2 + 1] = (c >> 8) & 0xff; } return new Buffer(a); }
