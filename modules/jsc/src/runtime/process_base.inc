@@ -15,14 +15,44 @@ JSValueRef cp_spawn_sync_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
             argvStr.push_back(val_to_string(ctx, el));
         }
     }
-    // options.cwd / options.input / options.env / options.detached
+    // options.cwd / options.input / options.env / options.detached / options.stdio
     std::string cwd, input;
     std::vector<std::string> envStr;  // "KEY=VALUE" pairs; empty ⇒ inherit environ
     bool haveEnv{false};
     bool detached{false};
     double uid{-1}, gid{-1};
+    // options.stdio, per slot: Pipe (capture, the default), Inherit (hand the
+    // parent's own fd to the child), Ignore (/dev/null). node returns `null` for a
+    // non-piped stdout/stderr, and `stdio: 'inherit'` is not a cosmetic detail: a
+    // child that writes more than a pipe buffer to the fd we drain LAST deadlocks
+    // against this synchronous reader, which is how `stdio: 'inherit'` spawns hung
+    // instead of streaming (test/common/index.js's flag re-exec does exactly this).
+    enum class Stdio { Pipe, Inherit, Ignore };
+    Stdio stdioMode[3]{Stdio::Pipe, Stdio::Pipe, Stdio::Pipe};
+    int stdioFd[3]{-1, -1, -1};  // numeric stdio entry: dup this parent fd
     if (argc > 2 && JSValueIsObject(ctx, args[2])) {
         JSObjectRef opt{JSValueToObject(ctx, args[2], nullptr)};
+        const auto readStdioSlot{[&](JSValueRef v, std::size_t slot) {
+            if (JSValueIsNumber(ctx, v)) {
+                stdioMode[slot] = Stdio::Inherit;
+                stdioFd[slot] = static_cast<int>(JSValueToNumber(ctx, v, nullptr));
+                return;
+            }
+            if (!JSValueIsString(ctx, v)) return;  // null/undefined/stream ⇒ pipe
+            const std::string s{val_to_string(ctx, v)};
+            if (s == "inherit") stdioMode[slot] = Stdio::Inherit;
+            else if (s == "ignore") stdioMode[slot] = Stdio::Ignore;
+            else stdioMode[slot] = Stdio::Pipe;
+        }};
+        JSValueRef stdioV{get_prop(ctx, opt, "stdio")};
+        if (JSValueIsArray(ctx, stdioV)) {
+            JSObjectRef arr{JSValueToObject(ctx, stdioV, nullptr)};
+            for (unsigned s = 0; s < 3; ++s) {
+                readStdioSlot(JSObjectGetPropertyAtIndex(ctx, arr, s, nullptr), s);
+            }
+        } else if (JSValueIsString(ctx, stdioV)) {
+            for (std::size_t s = 0; s < 3; ++s) readStdioSlot(stdioV, s);
+        }
         detached = JSValueToBoolean(ctx, get_prop(ctx, opt, "detached"));
         JSValueRef uidV{get_prop(ctx, opt, "uid")};
         if (JSValueIsNumber(ctx, uidV)) uid = JSValueToNumber(ctx, uidV, nullptr);
@@ -53,8 +83,16 @@ JSValueRef cp_spawn_sync_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
         }
     }
 
-    int outPipe[2], errPipe[2], inPipe[2], statPipe[2];
-    if (pipe(outPipe) != 0 || pipe(errPipe) != 0 || pipe(inPipe) != 0 || pipe(statPipe) != 0) {
+    // `input` forces a pipe on stdin whatever options.stdio asked for (node does
+    // the same: there is nowhere else to write it).
+    if (!input.empty()) stdioMode[0] = Stdio::Pipe;
+    const bool pipeIn{stdioMode[0] == Stdio::Pipe};
+    const bool pipeOut{stdioMode[1] == Stdio::Pipe};
+    const bool pipeErr{stdioMode[2] == Stdio::Pipe};
+
+    int outPipe[2]{-1, -1}, errPipe[2]{-1, -1}, inPipe[2]{-1, -1}, statPipe[2];
+    if ((pipeIn && pipe(inPipe) != 0) || (pipeOut && pipe(outPipe) != 0) ||
+        (pipeErr && pipe(errPipe) != 0) || pipe(statPipe) != 0) {
         return fs_throw(ctx, exc, "spawnSync: pipe() failed");
     }
     fcntl(statPipe[0], F_SETFD, FD_CLOEXEC);
@@ -71,12 +109,35 @@ JSValueRef cp_spawn_sync_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
             _exit(127);
         }};
         if (detached) (void)setsid();  // new session/process group (spawnSync detached)
-        dup2(inPipe[0], 0);
-        dup2(outPipe[1], 1);
-        dup2(errPipe[1], 2);
-        close(inPipe[0]); close(inPipe[1]);
-        close(outPipe[0]); close(outPipe[1]);
-        close(errPipe[0]); close(errPipe[1]);
+        // Wire each standard fd per its stdio mode. "inherit" is the no-op case:
+        // the parent's fd is already there (or is the numeric fd the caller named).
+        const auto wire{[&](int slot, int childEnd) {
+            switch (stdioMode[static_cast<std::size_t>(slot)]) {
+            case Stdio::Pipe:
+                if (childEnd >= 0) dup2(childEnd, slot);
+                break;
+            case Stdio::Inherit: {
+                const int from{stdioFd[static_cast<std::size_t>(slot)]};
+                if (from >= 0 && from != slot) dup2(from, slot);
+                break;
+            }
+            case Stdio::Ignore: {
+                const int devnull{open("/dev/null", slot == 0 ? O_RDONLY : O_WRONLY)};
+                if (devnull >= 0) {
+                    dup2(devnull, slot);
+                    close(devnull);
+                }
+                break;
+            }
+            }
+        }};
+        wire(0, inPipe[0]);
+        wire(1, outPipe[1]);
+        wire(2, errPipe[1]);
+        for (const int fd : {inPipe[0], inPipe[1], outPipe[0], outPipe[1],
+                             errPipe[0], errPipe[1]}) {
+            if (fd >= 3) close(fd);  // never the freshly wired 0/1/2
+        }
         if (!cwd.empty()) { if (chdir(cwd.c_str()) != 0) failStat(errno); }
         if (gid >= 0) {
             if (setgroups(0, nullptr) != 0 && errno == EPERM) failStat(EPERM);
@@ -98,9 +159,9 @@ JSValueRef cp_spawn_sync_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
     }
     // parent
     close(statPipe[1]);
-    close(inPipe[0]);
-    close(outPipe[1]);
-    close(errPipe[1]);
+    if (pipeIn) close(inPipe[0]);
+    if (pipeOut) close(outPipe[1]);
+    if (pipeErr) close(errPipe[1]);
     std::int32_t childErr{0};
     {
         ssize_t sn;
@@ -108,15 +169,17 @@ JSValueRef cp_spawn_sync_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
         if (sn != static_cast<ssize_t>(sizeof childErr)) childErr = 0;
     }
     close(statPipe[0]);
-    if (!input.empty()) {
-        ssize_t off = 0;
-        while (off < static_cast<ssize_t>(input.size())) {
-            ssize_t w{write(inPipe[1], input.data() + off, input.size() - off)};
-            if (w <= 0) break;
-            off += w;
+    if (pipeIn) {
+        if (!input.empty()) {
+            ssize_t off = 0;
+            while (off < static_cast<ssize_t>(input.size())) {
+                ssize_t w{write(inPipe[1], input.data() + off, input.size() - off)};
+                if (w <= 0) break;
+                off += w;
+            }
         }
+        close(inPipe[1]);
     }
-    close(inPipe[1]);
     auto drain{[](int fd) {
         std::string out;
         char buf[4096];
@@ -125,8 +188,8 @@ JSValueRef cp_spawn_sync_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
         close(fd);
         return out;
     }};
-    std::string outStr{drain(outPipe[0])};
-    std::string errStr{drain(errPipe[0])};
+    std::string outStr{pipeOut ? drain(outPipe[0]) : std::string{}};
+    std::string errStr{pipeErr ? drain(errPipe[0]) : std::string{}};
     int status{0};
     waitpid(pid, &status, 0);
     int code{WIFEXITED(status) ? WEXITSTATUS(status) : -1};
@@ -145,12 +208,18 @@ JSValueRef cp_spawn_sync_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
         set_prop(ctx, r, "stderr", JSValueMakeNull(ctx));
         return r;
     }
-    set_prop(ctx, r, "status", JSValueMakeNumber(ctx, code));
+    // node: exactly one of status/signal is non-null. A child killed by a signal
+    // has `status === null` (lib/child_process.js spawnSync), not -1 — callers
+    // branch on `result.signal` first and then trust `result.status` as an exit
+    // code, so a numeric -1 there reads as "exited with -1".
+    set_prop(ctx, r, "status", sig ? JSValueMakeNull(ctx) : JSValueMakeNumber(ctx, code));
     set_prop(ctx, r, "signal",
              sig ? make_string(ctx, std::to_string(sig)) : JSValueMakeNull(ctx));
     set_prop(ctx, r, "pid", JSValueMakeNumber(ctx, static_cast<double>(pid)));
-    set_prop(ctx, r, "stdout", make_string(ctx, outStr));
-    set_prop(ctx, r, "stderr", make_string(ctx, errStr));
+    // node reports a non-piped stdio slot as null, not "" — `stdio: 'inherit'`
+    // went straight to the parent's fd and there is nothing to hand back.
+    set_prop(ctx, r, "stdout", pipeOut ? make_string(ctx, outStr) : JSValueMakeNull(ctx));
+    set_prop(ctx, r, "stderr", pipeErr ? make_string(ctx, errStr) : JSValueMakeNull(ctx));
     return r;
 #endif
 }
