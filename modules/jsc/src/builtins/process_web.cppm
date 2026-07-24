@@ -196,7 +196,19 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
         this.flush();
       },
       flush() {
-        while (pending.length && target.listenerCount("message") > 0) target.emit("message", pending.shift());
+        while (pending.length && target.listenerCount("message") > 0) {
+          const msg = pending.shift();
+          // node dispatches each IPC message from its own tick, so a listener
+          // that throws hits 'uncaughtException' and the next message still
+          // arrives (test-child-process-ipc-next-tick).
+          try {
+            target.emit("message", msg);
+          } catch (e) {
+            const pr = G.process;
+            if (pr && typeof pr.listenerCount === "function" && pr.listenerCount("uncaughtException") > 0) pr.emit("uncaughtException", e);
+            else throw e;
+          }
+        }
       },
     };
   };
@@ -274,7 +286,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     if (SELF_IPC !== null && !SELF_IPC.ch.closed) { ipcFlush(SELF_IPC.ch); SELF_IPC.delivery.flush(); }
     for (const rec of recs) reap(rec);
     let active = 0;
-    for (const rec of recs) { if (rec.done) CHILDREN.delete(rec); else active++; }
+    for (const rec of recs) { if (rec.done) CHILDREN.delete(rec); else if (!rec.unrefd) active++; }
     // node ref-counts the child-side channel: it pins the loop only while a
     // 'message' or 'disconnect' listener is attached (setupChannel's
     // newListener/removeListener ref counting) — that is what lets
@@ -734,7 +746,12 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
           if (proc.connected && typeof proc.disconnect === "function") proc.disconnect();
         });
       },
-      pinned() { return proc.listenerCount("message") > 0 || proc.listenerCount("disconnect") > 0; },
+      // worker_threads installs a permanent process 'message' bridge, so it
+      // overrides the pin with its own parentPort-sink predicate.
+      pinned() {
+        if (typeof G.__mbunIpcPin === "function") { try { return !!G.__mbunIpcPin(); } catch (e) { return false; } }
+        return proc.listenerCount("message") > 0 || proc.listenerCount("disconnect") > 0;
+      },
     };
   };
 

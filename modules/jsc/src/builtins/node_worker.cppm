@@ -419,8 +419,7 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
     return BroadcastChannel;
   })();
 
-  // ---- Worker (DEFERRED: no real cross-thread execution) ------------------
-  let nextThreadId = 1;
+  // transferList validation shared by Worker#postMessage and the constructor.
   const validateTransferList = (transferList) => {
     if (transferList === undefined || transferList === null) return [];
     if (!Array.isArray(transferList)) {
@@ -439,165 +438,251 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
     return transferList;
   };
 
-  // ---- Worker (REAL cross-thread execution via the native seam) -----------
-  // globalThis.__mbunWorkerNative (runtime/worker.inc) spawns a second JSC VM on
-  // its own OS thread. Messages cross the thread boundary as the JSON subset of
-  // structured clone (the JSC C API exposes no SerializedScriptValue): the wire
-  // handles primitives / arrays / plain objects; transferables, Date/Map/Set and
-  // cyclic graphs are out of range and their tests stay honestly red.
-  const WN = G.__mbunWorkerNative;
-  const workerRegistry = new Map();  // threadId → Worker (parent side)
+  // ---- Worker (real execution: one mbun process per worker) ---------------
+  // A node Worker needs the FULL runtime — its own module loader, node
+  // builtins, process.env, __filename — because the corpus overwhelmingly does
+  // `new Worker(__filename)` and re-enters the same test file. mbun's runtime is
+  // a process-wide singleton (one JSC VM, one event-loop pump, process-global
+  // DNS/net/timer state), so a second in-process VM can only ever carry a
+  // hand-written subset of that surface. Running the entry in a CHILD mbun
+  // process over the fork() IPC channel gives it the real thing; messages are
+  // the same JSON structured-clone subset either way.
+  // DEFERRED, and honestly red: SharedArrayBuffer/Atomics shared between the
+  // two sides, transferring a MessagePort across the boundary, resourceLimits,
+  // heap snapshots/CPU profiles, and Worker.terminate()'s "stop mid-microtask"
+  // guarantee (the child is signalled instead).
+  const CPM = M["child_process"] || M["node:child_process"];
+  const pathM = M["path"] || M["node:path"];
+  const fsM = M["fs"] || M["node:fs"];
+  const osM = M["os"] || M["node:os"];
+  const workerRegistry = new Map();  // threadId -> Worker (parent side)
+  let nextThreadId = 1;
 
-  // Resolve an entry (URL/path/URL-object) to a source string the worker runs.
-  const readWorkerSource = (filename) => {
-    let p = filename;
-    if (p && typeof p === "object" && typeof p.href === "string") p = p.href;  // URL
-    p = String(p);
-    // data: URL entry point (node lib/internal/worker.js accepts one, and the
-    // web Worker constructor takes any URL): the source *is* the payload.
-    // RFC 2397 — `;base64` after the mediatype means base64, otherwise the
-    // payload is percent-encoded.
-    if (p.startsWith("data:")) {
-      const comma = p.indexOf(",");
-      if (comma === -1) {
-        const e = new TypeError("Invalid URL: " + p);
-        e.code = "ERR_INVALID_URL";
-        throw e;
-      }
-      const meta = p.slice(5, comma);
-      const payload = p.slice(comma + 1);
-      if (/;base64\s*$/i.test(meta)) {
-        if (G.Buffer) return G.Buffer.from(payload, "base64").toString("utf8");
-        return G.atob ? G.atob(payload) : payload;
-      }
-      try { return decodeURIComponent(payload); } catch (e) { return payload; }
+  const recvType = (v) => {
+    if (v === null) return "null";
+    if (v === undefined) return "undefined";
+    const t = typeof v;
+    if (t === "symbol") return "type symbol (" + String(v) + ")";
+    if (t === "string") return "type string ('" + v + "')";
+    if (t === "object") return "an instance of " + ((v.constructor && v.constructor.name) || "Object");
+    return "type " + t + " (" + String(v) + ")";
+  };
+
+  const dataUrlSource = (p) => {
+    const comma = p.indexOf(",");
+    if (comma === -1) { const e = new TypeError("Invalid URL: " + p); e.code = "ERR_INVALID_URL"; throw e; }
+    const meta = p.slice(5, comma);
+    const payload = p.slice(comma + 1);
+    if (/;base64\s*$/i.test(meta)) {
+      if (G.Buffer) return G.Buffer.from(payload, "base64").toString("utf8");
+      return G.atob ? G.atob(payload) : payload;
     }
+    try { return decodeURIComponent(payload); } catch (e) { return payload; }
+  };
+
+  // node ERR_WORKER_PATH: a bare specifier is not a worker entry point.
+  const workerEntryPath = (filename) => {
+    let p = filename;
+    if (p !== null && typeof p === "object" && typeof p.href === "string") {
+      if (p.protocol === "data:") return { source: dataUrlSource(p.href) };
+      if (p.protocol !== "file:") {
+        const e = new TypeError("The URL must be of scheme file: Received protocol '" + p.protocol + "'");
+        e.code = "ERR_UNSUPPORTED_ESM_URL_SCHEME"; throw e;
+      }
+      const u = M["url"] || M["node:url"];
+      return { path: u && u.fileURLToPath ? u.fileURLToPath(p) : p.pathname };
+    }
+    if (G.Buffer && typeof G.Buffer.isBuffer === "function" && G.Buffer.isBuffer(p)) p = p.toString();
+    if (typeof p !== "string") {
+      const e = new TypeError('The "filename" argument must be of type string or an instance of URL. Received ' + recvType(filename));
+      e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+    }
+    if (p.startsWith("data:")) return { source: dataUrlSource(p) };
     if (p.startsWith("file://")) {
       const u = M["url"] || M["node:url"];
-      if (p.indexOf(":!:") !== -1 || /file:\/\/[^/]*:/.test(p)) {
-        const e = new TypeError("Invalid file URL: " + p);
-        e.code = "ERR_INVALID_URL";
-        throw e;
-      }
-      try { p = u && u.fileURLToPath ? u.fileURLToPath(p) : p.slice(7); }
-      catch (e) { p = p.slice(7); }
+      try { return { path: u && u.fileURLToPath ? u.fileURLToPath(p) : p.slice(7) }; }
+      catch (e) { const err = new TypeError("Invalid file URL: " + p); err.code = "ERR_INVALID_URL"; throw err; }
     }
-    const fs = M["fs"] || M["node:fs"];
-    if (!fs || typeof fs.readFileSync !== "function") throw new Error("worker: fs unavailable");
-    return fs.readFileSync(p, "utf8");
+    if (!pathM.isAbsolute(p) && !/^\.\.?[/\\]/.test(p)) {
+      const e = new TypeError("The worker script or module filename must be an absolute path or a relative path starting with './' or '../'. Received \"" + p + "\"");
+      e.code = "ERR_WORKER_PATH"; throw e;
+    }
+    return { path: pathM.resolve(p) };
+  };
+
+  const writeTempWorker = (source, tid, ext) => {
+    const dir = osM && osM.tmpdir ? osM.tmpdir() : "/tmp";
+    const p = pathM.join(dir, "mbun-worker-" + (proc.pid || 0) + "-" + tid + (ext || ".js"));
+    fsM.writeFileSync(p, source);
+    return p;
   };
 
   class Worker extends EventEmitter {
     constructor(filename, options) {
       super();
       options = options || {};
-      const transferList = validateTransferList(options.transferList);
-      // Detach transferables + validate workerData exactly like node does before
-      // the thread starts (observable side effects), then marshal workerData.
-      let workerDataJson = null;
-      if (options.workerData !== undefined || transferList.length) {
-        try { G.structuredClone(options.workerData ?? null, { transfer: transferList }); }
-        catch (e) { /* clone failures surface as a non-detaching no-op */ }
+      validateTransferList(options.transferList);
+      if (options.env !== undefined && options.env !== null && options.env !== SHARE_ENV &&
+          (typeof options.env !== "object" || Array.isArray(options.env))) {
+        const e = new TypeError('The "options.env" property must be of type object or one of undefined, null, or worker_threads.SHARE_ENV. Received ' + recvType(options.env));
+        e.code = "ERR_INVALID_ARG_TYPE"; throw e;
       }
-      try { workerDataJson = JSON.stringify(options.workerData ?? null); }
-      catch (e) { workerDataJson = null; }
+      if (options.argv !== undefined && options.argv !== null && !Array.isArray(options.argv)) {
+        const e = new TypeError('The "options.argv" property must be an instance of Array. Received ' + recvType(options.argv));
+        e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+      }
+      if (options.execArgv !== undefined && options.execArgv !== null && !Array.isArray(options.execArgv)) {
+        const e = new TypeError('The "options.execArgv" property must be an instance of Array. Received ' + recvType(options.execArgv));
+        e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+      }
+      // node clones workerData up-front, so an unclonable value throws from the
+      // constructor instead of silently reaching the worker as null.
+      if (options.workerData !== undefined) G.structuredClone(options.workerData);
+      let workerDataJson = "null";
+      try { workerDataJson = JSON.stringify(options.workerData === undefined ? null : options.workerData); }
+      catch (e) { throw dataClone(String(options.workerData) + " could not be cloned."); }
+      if (workerDataJson === undefined) throw dataClone(String(options.workerData) + " could not be cloned.");
 
-      const source = options.eval ? String(filename) : readWorkerSource(filename);
+      const tid = nextThreadId++;
+      this.threadId = tid;
+      this._tempFile = null;
+      let entry;
+      if (options.eval) {
+        entry = writeTempWorker(String(filename), tid, ".js");
+        this._tempFile = entry;
+      } else {
+        const r = workerEntryPath(filename);
+        if (r.source !== undefined) { entry = writeTempWorker(r.source, tid, ".js"); this._tempFile = entry; }
+        else entry = r.path;
+      }
 
-      this.stdin = null;
-      this.stdout = null;
-      this.stderr = null;
-      this.performance = { eventLoopUtilization: () => ({ idle: 0, active: 0, utilization: 0 }) };
-      this.resourceLimits = {};
-      this.onmessage = null;
-      this.onmessageerror = null;
-      this.onerror = null;
-      this._refd = true;
+      // Env: SHARE_ENV and the default both inherit; an explicit object replaces.
+      const baseEnv = (options.env && options.env !== SHARE_ENV) ? options.env : (proc.env || {});
+      const env = {};
+      for (const k of Object.keys(baseEnv)) { const v = baseEnv[k]; if (v !== undefined && v !== null) env[k] = String(v); }
+      env.MBUN_WORKER_TID = String(tid);
+      env.MBUN_WORKER_DATA = workerDataJson;
+
+      const execArgv = Array.isArray(options.execArgv) ? options.execArgv.map(String)
+                                                       : ((proc.execArgv || []).map(String));
+      const argv = Array.isArray(options.argv) ? options.argv.map(String) : [];
+      const child = CPM.spawn(String(proc.execPath || "mbun"),
+                              execArgv.concat([entry], argv),
+                              { env, stdio: ["pipe", "pipe", "pipe", "ipc"] });
+      this._child = child;
       this._exited = false;
       this._exitCode = null;
       this._exitResolvers = [];
+      this._refd = true;
+      this.resourceLimits = {};
+      this.performance = { eventLoopUtilization: () => ({ idle: 0, active: 0, utilization: 0 }) };
+      this.onmessage = null;
+      this.onmessageerror = null;
+      this.onerror = null;
+      // node: the worker's stdio is piped into the parent's unless the caller
+      // asked for the streams (options.stdout / options.stderr / options.stdin).
+      this.stdin = options.stdin ? child.stdin : null;
+      if (!options.stdin && child.stdin) { try { child.stdin.end(); } catch (e) {} }
+      this.stdout = child.stdout;
+      this.stderr = child.stderr;
+      if (!options.stdout && child.stdout) child.stdout.on("data", (d) => { try { proc.stdout.write(d); } catch (e) {} });
+      if (!options.stderr && child.stderr) child.stderr.on("data", (d) => { try { proc.stderr.write(d); } catch (e) {} });
+      workerRegistry.set(tid, this);
 
-      this.threadId = WN.spawn(source, workerDataJson == null ? "" : workerDataJson) | 0;
-      workerRegistry.set(this.threadId, this);
-      armWorkerPump();  // start delivering worker→parent events via the timer loop
-
-      // node emits the process "worker" event on the next tick.
       const self = this;
-      const emitWorker = () => { const p = G.process; if (p && typeof p.emit === "function") p.emit("worker", self); };
+      child.on("spawn", () => self.emit("online"));
+      child.on("message", (m) => {
+        if (m === null || typeof m !== "object") return;
+        if (m.t === "m") {
+          const ev = { data: m.d, type: "message", ports: [], target: self };
+          if (typeof self.onmessage === "function") self.onmessage(ev);
+          self.emit("message", m.d);
+        } else if (m.t === "e") {
+          const err = new Error(m.d && m.d.message ? m.d.message : String(m.d));
+          if (m.d && m.d.name) err.name = m.d.name;
+          if (m.d && m.d.stack) err.stack = m.d.stack;
+          if (m.d && m.d.code) err.code = m.d.code;
+          if (typeof self.onerror === "function") self.onerror(err);
+          self.emit("error", err);
+        } else if (m.t === "me") {
+          self.emit("messageerror", new Error(String(m.d)));
+        }
+      });
+      child.on("error", (e) => self.emit("error", e));
+      child.on("exit", (code, signal) => {
+        self._exited = true;
+        self._exitCode = signal ? 1 : (code == null ? 1 : code);
+        workerRegistry.delete(tid);
+        if (self._tempFile) { try { fsM.unlinkSync(self._tempFile); } catch (e) {} self._tempFile = null; }
+        self.emit("exit", self._exitCode);
+        const rs = self._exitResolvers.splice(0);
+        for (const r of rs) r(self._exitCode);
+      });
+      const emitWorker = () => { if (proc && typeof proc.emit === "function") proc.emit("worker", self); };
       if (proc.nextTick) proc.nextTick(emitWorker); else G.queueMicrotask(emitWorker);
     }
-    postMessage(value) { WN.post(this.threadId, value); return undefined; }
+    postMessage(value, transferList) {
+      validateTransferList(transferList);
+      if (this._exited || !this._child.connected) return undefined;
+      // `{t:"m"}` with no `d` IS the undefined message: JSON drops the key.
+      try { this._child.send(value === undefined ? { t: "m" } : { t: "m", d: value }); } catch (e) {}
+      return undefined;
+    }
     terminate() {
-      WN.terminate(this.threadId);
-      if (this._exited) return Promise.resolve(this._exitCode == null ? 0 : this._exitCode);
+      if (this._exited) return Promise.resolve(this._exitCode == null ? 1 : this._exitCode);
+      try { this._child.kill("SIGTERM"); } catch (e) {}
       return new Promise((resolve) => { this._exitResolvers.push(resolve); });
     }
-    ref() { this._refd = true; return this; }
-    unref() { this._refd = false; return this; }
+    ref() { this._refd = true; if (this._child._rec) this._child._rec.unrefd = false; return this; }
+    unref() { this._refd = false; if (this._child._rec) this._child._rec.unrefd = true; return this; }
     addEventListener(type, cb) { this.on(type, cb); }
     removeEventListener(type, cb) { this.off(type, cb); }
     getHeapSnapshot() { return Promise.reject(new Error("Worker.getHeapSnapshot is not supported in this build")); }
     [Symbol.asyncDispose]() { return this.terminate().then(() => undefined); }
   }
 
-  // Deliver worker→parent events (drained natively) to the JS Worker instances.
-  // Invoked once per parent event-loop pump iteration (engine.inc pump).
-  G.__mbunWorkerDrain = () => {
-    if (!WN) return;
-    let events;
-    try { events = JSON.parse(WN.drain()); } catch (e) { return; }
-    for (const ev of events) {
-      const w = workerRegistry.get(ev.id);
-      if (!w) continue;
-      if (ev.t === "message") {
-        const msgEv = { data: ev.d, type: "message", ports: [], target: w };
-        if (typeof w.onmessage === "function") { try { w.onmessage(msgEv); } catch (e) {} }
-        w.emit("message", ev.d);
-      } else if (ev.t === "error") {
-        const err = new Error(String(ev.d));
-        if (typeof w.onerror === "function") { try { w.onerror(err); } catch (e) {} }
-        if (w.listenerCount("error") > 0) w.emit("error", err);
-      } else if (ev.t === "exit") {
-        w._exited = true;
-        w._exitCode = ev.d | 0;
-        workerRegistry.delete(ev.id);
-        w.emit("exit", w._exitCode);
-        const rs = w._exitResolvers.splice(0);
-        for (const r of rs) r(w._exitCode);
-      }
+  // ---- worker side: this process IS a worker (MBUN_WORKER_TID) ------------
+  const WENV = proc.env || {};
+  const MY_TID = WENV.MBUN_WORKER_TID;
+  let isMainThread = true;
+  let threadId = 0;
+  let parentPort = null;
+  let workerData = null;
+  if (MY_TID !== undefined && MY_TID !== null && MY_TID !== "") {
+    isMainThread = false;
+    threadId = Number(MY_TID) | 0;
+    try { workerData = JSON.parse(WENV.MBUN_WORKER_DATA || "null"); } catch (e) { workerData = null; }
+    try { delete proc.env.MBUN_WORKER_TID; delete proc.env.MBUN_WORKER_DATA; } catch (e) {}
+    const chan = new MessageChannel();
+    parentPort = chan.port1;
+    Object.defineProperty(parentPort, "postMessage", {
+      configurable: true, writable: true,
+      value: function (value) {
+        if (typeof proc.send !== "function") return undefined;
+        try { proc.send(value === undefined ? { t: "m" } : { t: "m", d: value }); } catch (e) {}
+        return undefined;
+      },
+    });
+    if (typeof proc.on === "function") {
+      proc.on("message", (m) => { if (m !== null && typeof m === "object" && m.t === "m") chan.port2.postMessage(m.d); });
+      // An uncaught throw inside a worker surfaces as an 'error' event on the
+      // parent's Worker handle, not as a bare non-zero exit (node worker.js).
+      proc.on("uncaughtException", (e) => {
+        try { proc.send({ t: "e", d: { message: e && e.message, name: e && e.name, stack: e && e.stack, code: e && e.code } }); } catch (_) {}
+        proc.exit(1);
+      });
     }
-  };
-  // A ref'd, still-running worker pins the parent event loop (engine.inc pump).
-  G.__mbunWorkerActiveRefd = () => {
-    let n = 0;
-    for (const w of workerRegistry.values()) if (w._refd && !w._exited) n++;
-    return n;
-  };
-
-  // Drive worker→parent delivery through the EXISTING timer system (setTimeout),
-  // which both the main engine pump AND the bun:test runner already drain — so a
-  // Worker message reaches an awaiting test without touching either hot loop
-  // (a direct test-runner drain hook wedged unrelated same-thread MessagePort
-  // tests). The self-rearming tick lives only while a Worker is registered, so a
-  // process/test file that never spawns a Worker is completely unaffected.
-  let workerPumpArmed = false;
-  const armWorkerPump = () => {
-    if (workerPumpArmed) return;
-    workerPumpArmed = true;
-    const tick = () => {
-      try { G.__mbunWorkerDrain(); } catch (e) {}
-      if (workerRegistry.size > 0) G.setTimeout(tick, 1);  // re-arm while workers live
-      else workerPumpArmed = false;                        // all workers done → stop
-    };
-    G.setTimeout(tick, 1);
-  };
+    // The channel pins this process's event loop only while parentPort has a
+    // sink — otherwise a worker that never listens would never exit.
+    G.__mbunIpcPin = () => portHasListener(parentPort);
+  }
 
   const mod = {
     Worker,
-    isMainThread: true,
-    parentPort: null,
-    threadId: 0,
-    workerData: null,
+    isMainThread,
+    parentPort,
+    threadId,
+    workerData,
     resourceLimits: {},
     MessageChannel,
     MessagePort,
@@ -616,7 +701,7 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
   // Expose the web-platform globals the worker tests use unqualified. Worker is
   // real; MessageChannel/MessagePort already exist as DOM globals (web layer),
   // so only fill Worker (and back-fill the others if a build lacks them).
-  if (WN && typeof G.Worker === "undefined") G.Worker = Worker;
+  if (typeof G.Worker === "undefined") G.Worker = Worker;
   // node's global MessageChannel/MessagePort ARE the worker_threads ones (they
   // are re-exported onto globalThis since v15), so the node-parity classes win
   // over the load-order web stubs.
