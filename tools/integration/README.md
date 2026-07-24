@@ -82,6 +82,18 @@ frozen machine or a silently murdered harness.
   `--worklist-from subsystem` select which), so picking a round's target and
   scoring it before/after are the same set of files rather than two hand-copied
   approximations.
+- `worktree_setup.sh` — creates or re-points a parallel-agent worktree with the
+  compat corpora wired: `worktree_setup.sh <path> <branch> [start-point]`.
+  `compat/{bun,node}` are multi-GB submodules a worktree must not re-materialise,
+  so they are symlinked at the main checkout's copies — and doing that by hand is
+  a trap. git leaves an **empty** submodule directory in a fresh worktree, so
+  `ln -sfn <target> <wt>/compat/node` silently links *inside* it
+  (`compat/node/node -> …`), the corpus path stops resolving, and the failure
+  surfaces far away as "no test files selected" or as a runner scoring a subset
+  it never ran. The script replaces symlinks and empty dirs, repairs a
+  previously mis-wired worktree, refuses to touch a populated one, preserves
+  `target/` (the incremental build cache), and *proves* the wiring by resolving
+  the corpus before it returns.
 - `smoke_examples.py` — boots each `examples/` app in turn, requests
   `http://127.0.0.1:3000/`, asserts a 2xx, then reaps the whole process tree
   (`bounded_run.BoundedServer`). Sequential by design: the demos all hardcode
@@ -100,6 +112,7 @@ bash tools/integration/tests/test_node_corpus_runner.sh
 bash tools/integration/tests/test_corpus_diff.sh
 bash tools/integration/tests/test_cluster_finder.sh
 bash tools/integration/tests/test_smoke_examples.sh
+bash tools/integration/tests/test_worktree_setup.sh
 bash benchmarks/tools/test-bench3.sh
 ```
 
