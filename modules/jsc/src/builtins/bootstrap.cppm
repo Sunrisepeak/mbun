@@ -3642,50 +3642,142 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   };
   const pDirname = (p) => { const i = p.lastIndexOf("/"); return i <= 0 ? (i === 0 ? "/" : ".") : p.slice(0, i); };
   const cpError = (code, msg, path2) => { const e = new Error(code + ": " + msg); e.code = code; e.path = path2; return e; };
-  // node fs.cp / fs.cpSync (blueprint src/js/internal/fs/cp): recursive copy with
-  // force/errorOnExist/filter/dereference options. Symlinks are preserved (raw
-  // target, relative targets resolved to absolute against dirname(src) so the
-  // copy never links back into the source tree). Modes are carried to the copy;
-  // directories require { recursive: true }; FIFOs/sockets are rejected.
+  // node fs.cp / fs.cpSync — a port of lib/internal/fs/cp/cp-sync.js
+  // (checkPaths + getStats/onFile/onDir/onLink) rather than the previous
+  // hand-rolled walker, which had no ERR_FS_CP_* surface at all: copying a
+  // directory into its own subtree recursed forever and a symlink whose target
+  // straddles src/dest was copied blindly.
+  const CP_DEFAULTS = { dereference: false, errorOnExist: false, filter: undefined, force: true,
+                        mode: 0, preserveTimestamps: false, recursive: false, verbatimSymlinks: false };
+  // ERR_FS_CP_* are SystemErrors: "<prefix>: cp returned <code> (<message>) <path>".
+  const cpSysErr = (key, prefix, code, errnoNum, message, path2, dest2) => {
+    let msg = prefix + ": cp returned " + code + " (" + message + ")";
+    if (path2 !== undefined) msg += " " + path2;
+    if (dest2 !== undefined) msg += " => " + dest2;
+    const e = new Error(msg);
+    e.code = key; e.errno = errnoNum; e.syscall = "cp"; e.path = path2;
+    if (dest2 !== undefined) e.dest = dest2;
+    e.name = "SystemError";
+    return e;
+  };
+  const cpEinval = (message, path2) => cpSysErr("ERR_FS_CP_EINVAL", "Invalid src or dest", "EINVAL", -22, message, path2);
+  const cpValidateOptions = (o) => {
+    if (o === undefined || o === null) return Object.assign({}, CP_DEFAULTS);
+    if (typeof o !== "object" || Array.isArray(o)) throw fsArgTypeErr("options", "of type object", o);
+    const out = Object.assign({}, CP_DEFAULTS, o);
+    for (const k of ["dereference", "errorOnExist", "force", "preserveTimestamps", "recursive", "verbatimSymlinks"])
+      if (typeof out[k] !== "boolean") throw fsArgTypeErr("options." + k, "of type boolean", out[k]);
+    // getValidMode(mode, "copyFile"): 0..COPYFILE_EXCL|FICLONE|FICLONE_FORCE.
+    out.mode = out.mode == null ? 0 : fsValidateInteger(out.mode, "mode", 0, 7);
+    if (out.dereference === true && out.verbatimSymlinks === true) {
+      const e = new TypeError('Option "dereference" cannot be used in combination with option "verbatimSymlinks"');
+      e.code = "ERR_INCOMPATIBLE_OPTION_PAIR";
+      throw e;
+    }
+    if (out.filter !== undefined && typeof out.filter !== "function")
+      throw fsArgTypeErr("options.filter", "of type function", out.filter);
+    return out;
+  };
+  const cpReturnErr = (value) => {
+    const e = new TypeError('Expected boolean to be returned for the filter function, got ' + typeof value);
+    e.code = "ERR_INVALID_RETURN_VALUE";
+    return e;
+  };
+  // node isSrcSubdir: dest is inside src (or equal) once both are normalised.
+  const isSrcSubdir = (src, dest) => {
+    const srcArr = pNormalize(src).split("/");
+    const destArr = pNormalize(dest).split("/");
+    return srcArr.every((cur, i) => destArr[i] === cur);
+  };
+  const cpStatOrNull = (p, lstat) => { try { return F.stat(p, !!lstat); } catch (e) { return null; } };
+  const cpCheckPaths = (src, dest, opts) => {
+    const srcStat = opts.dereference ? F.stat(src) : F.stat(src, true);
+    const destStat = cpStatOrNull(dest, !opts.dereference);
+    if (destStat) {
+      if (srcStat.ino === destStat.ino && srcStat.dev === destStat.dev)
+        throw cpEinval("src and dest cannot be the same", dest);
+      if (srcStat.isDirectory() && !destStat.isDirectory())
+        throw cpSysErr("ERR_FS_CP_DIR_TO_NON_DIR", "Cannot overwrite directory with non-directory",
+                       "EISDIR", -21, "cannot overwrite non-directory " + dest + " with directory " + src, dest);
+      if (!srcStat.isDirectory() && destStat.isDirectory())
+        throw cpSysErr("ERR_FS_CP_NON_DIR_TO_DIR", "Cannot overwrite non-directory with directory",
+                       "ENOTDIR", -20, "cannot overwrite directory " + dest + " with non-directory " + src, dest);
+    }
+    if (srcStat.isDirectory() && isSrcSubdir(src, dest))
+      throw cpEinval("cannot copy " + src + " to a subdirectory of self " + dest, dest);
+  };
+  const cpSetDestMode = (dest, srcMode) => { try { F.chmod(dest, srcMode & 0o7777); } catch (e) {} };
+  const cpOnFile = (srcStat, destStat, src, dest, opts) => {
+    if (!destStat) { F.copyFile(src, dest); cpSetDestMode(dest, srcStat.mode); return; }
+    if (opts.force) { F.copyFile(src, dest); cpSetDestMode(dest, srcStat.mode); return; }
+    if (opts.errorOnExist)
+      throw cpSysErr("ERR_FS_CP_EEXIST", "Target already exists", "EEXIST", -17, dest + " already exists", dest);
+  };
+  const cpOnLink = (destStat, src, dest, opts) => {
+    let resolvedSrc = F.readlink(src);
+    if (!opts.verbatimSymlinks && resolvedSrc[0] !== "/") resolvedSrc = pNormalize(pDirname(src) + "/" + resolvedSrc);
+    if (!destStat) { F.symlink(resolvedSrc, dest); return; }
+    let resolvedDest;
+    try { resolvedDest = F.readlink(dest); }
+    catch (err) {
+      // dest is a regular file/directory: symlink(2) then reports EEXIST, which
+      // is exactly what node surfaces here.
+      if (err && (err.code === "EINVAL" || err.code === "UNKNOWN")) { F.symlink(resolvedSrc, dest); return; }
+      throw err;
+    }
+    if (resolvedDest[0] !== "/") resolvedDest = pNormalize(pDirname(dest) + "/" + resolvedDest);
+    const srcTarget = cpStatOrNull(src, false);
+    if (srcTarget && srcTarget.isDirectory() && isSrcSubdir(resolvedSrc, resolvedDest))
+      throw cpEinval("cannot copy " + resolvedSrc + " to a subdirectory of self " + resolvedDest, dest);
+    const destTarget = cpStatOrNull(dest, false);
+    if (destTarget && destTarget.isDirectory() && isSrcSubdir(resolvedDest, resolvedSrc))
+      throw cpSysErr("ERR_FS_CP_SYMLINK_TO_SUBDIRECTORY", "Cannot overwrite symlink in subdirectory of self",
+                     "EINVAL", -22, "cannot overwrite " + resolvedDest + " with " + resolvedSrc, dest);
+    try { F.unlink(dest); } catch (e) {}
+    F.symlink(resolvedSrc, dest);
+  };
+  const cpCopyDir = (src, dest, opts, mkDir, srcMode) => {
+    if (mkDir) F.mkdir(dest, false, 0o777);
+    for (const name of F.readdir(src)) {
+      const srcItem = src + "/" + name;
+      const destItem = dest + "/" + name;
+      if (opts.filter) {
+        const shouldCopy = opts.filter(srcItem, destItem);
+        if (shouldCopy && typeof shouldCopy.then === "function") throw cpReturnErr(shouldCopy);
+        if (!shouldCopy) continue;
+      }
+      cpGetStats(srcItem, destItem, opts);
+    }
+    if (srcMode !== undefined) cpSetDestMode(dest, srcMode);
+  };
+  const cpGetStats = (src, dest, opts) => {
+    const srcStat = opts.dereference ? F.stat(src) : F.stat(src, true);
+    const destStat = cpStatOrNull(dest, !opts.dereference);
+    if (srcStat.isDirectory() && opts.recursive) {
+      if (!destStat) return cpCopyDir(src, dest, opts, true, srcStat.mode);
+      return cpCopyDir(src, dest, opts);
+    }
+    if (srcStat.isDirectory())
+      throw cpSysErr("ERR_FS_EISDIR", "Path is a directory", "EISDIR", -21,
+                     "recursive option not enabled, current path: " + src, src);
+    if (srcStat.isFile() || srcStat.isCharacterDevice() || srcStat.isBlockDevice())
+      return cpOnFile(srcStat, destStat, src, dest, opts);
+    if (srcStat.isSymbolicLink()) return cpOnLink(destStat, src, dest, opts);
+    if (srcStat.isSocket())
+      throw cpSysErr("ERR_FS_CP_SOCKET", "Cannot copy a socket file", "EINVAL", -22,
+                     "cannot copy a socket file: " + dest, src);
+    throw cpSysErr("ERR_FS_CP_FIFO_PIPE", "Cannot copy a FIFO pipe", "EINVAL", -22,
+                   "cannot copy a FIFO pipe: " + src, src);
+  };
   const cpRec = (src, dest, o) => {
-    o = o || {};
-    const recursive = !!o.recursive;
-    const force = o.force !== false;
-    const errorOnExist = !!o.errorOnExist;
-    const dereference = !!o.dereference;
-    const filter = typeof o.filter === "function" ? o.filter : null;
-    const walk = (s, d) => {
-      if (filter && !filter(s, d)) return;
-      const lst = F.stat(s, true); // lstat
-      if (!dereference && lst && lst.isSymbolicLink && lst.isSymbolicLink()) {
-        let target = F.readlink(s);
-        if (target[0] !== "/") target = pNormalize(pDirname(s) + "/" + target);
-        try { F.unlink(d); } catch (e) {}
-        F.symlink(target, d);
-        return;
-      }
-      if (lst && lst.isDirectory()) {
-        if (!recursive) throw cpError("ERR_FS_EISDIR", "recursive must be true to copy a directory", s);
-        F.mkdir(d, true, (lst.mode & 0o777) || 0o777);
-        try { F.chmod(d, lst.mode & 0o777); } catch (e) {}
-        for (const e of F.readdir(s)) walk(s + "/" + e, d + "/" + e);
-        return;
-      }
-      if (lst && (lst.isFIFO() || lst.isSocket() || lst.isBlockDevice() || lst.isCharacterDevice())) {
-        throw cpError("ERR_FS_CP_FIFO_PIPE", "cannot copy a FIFO", s);
-      }
-      if (F.exists(d)) {
-        const dst = F.stat(d, true);
-        if (dst && dst.isDirectory()) throw cpError("ERR_FS_CP_NON_DIR_TO_DIR", "cannot overwrite directory with non-directory", s);
-        if (!force) {
-          if (errorOnExist) throw cpError("ERR_FS_CP_EEXIST", "file already exists", d);
-          return;
-        }
-      }
-      F.copyFile(s, d);
-      try { if (lst) F.chmod(d, lst.mode & 0o777); } catch (e) {}
-    };
-    walk(src, dest);
+    const opts = cpValidateOptions(o);
+    if (opts.filter) {
+      const shouldCopy = opts.filter(src, dest);
+      if (shouldCopy && typeof shouldCopy.then === "function") throw cpReturnErr(shouldCopy);
+      if (!shouldCopy) return;
+    }
+    cpCheckPaths(src, dest, opts);
+    cpGetStats(src, dest, opts);
   };
   // bun node_fs.rs should_throw_out_of_memory_early_for_javascript: a read whose
   // *decoded* length would exceed the synthetic allocation limit fails with
@@ -3857,8 +3949,16 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     access: (p, m, cb) => { const fn = cb || m; try { if (!F.exists(toStr(p))) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" }); fn(null); } catch (e) { fn(e); } },
     symlink: (t, p2, a, cb) => { const fn = cb || (typeof a === "function" ? a : undefined); try { F.symlink(toStr(t), toStr(p2)); fn && fn(null); } catch (e) { fn && fn(e); } },
     symlinkSync: (target, path2) => F.symlink(toStr(target), toStr(path2)),
-    cpSync: (src, dest, o) => cpRec(toStr(src), toStr(dest), o),
-    cp: (src, dest, o, cb) => { const fn = typeof o === "function" ? o : cb; if (typeof fn !== "function") { const e = new TypeError('The "cb" argument must be of type function. Received ' + (fn === undefined ? "undefined" : typeof fn)); e.code = "ERR_INVALID_ARG_TYPE"; throw e; } try { cpRec(toStr(src), toStr(dest), typeof o === "object" ? o : undefined); fn(null); } catch (e) { fn(e); } },
+    cpSync: (src, dest, o) => { validatePath(src, "src"); validatePath(dest, "dest"); return cpRec(toStr(src), toStr(dest), o); },
+    // node fs.cp: the callback and the options are validated SYNCHRONOUSLY
+    // (ERR_INVALID_ARG_TYPE / ERR_OUT_OF_RANGE) before any copying starts.
+    cp: (src, dest, o, cb) => {
+      const fn = typeof o === "function" ? o : cb;
+      fsMakeCallback(fn);
+      const opts = cpValidateOptions(typeof o === "function" ? undefined : o);
+      validatePath(src, "src"); validatePath(dest, "dest");
+      G.queueMicrotask(() => { try { cpRec(toStr(src), toStr(dest), opts); fn(null); } catch (e) { fn(e); } });
+    },
     // node fs.globSync (blueprint bun-ref/src/js/internal/fs/glob.ts): yields
     // matched files AND directories, defaults cwd to process.cwd() (so it
     // tracks process.chdir), and — with withFileTypes — hands Dirents to both
@@ -4827,7 +4927,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     mkdtemp: P((pre) => F.mkdtemp(toStr(pre))),
     access: P((p) => { if (!F.exists(toStr(p))) throw Object.assign(new Error("ENOENT: no such file or directory, access '" + toStr(p) + "'"), { code: "ENOENT" }); }),
     exists: P((p) => F.exists(toStr(p))),
-    cp: P((src, dest, o) => cpRec(toStr(src), toStr(dest), o)),
+    cp: P((src, dest, o) => { validatePath(src, "src"); validatePath(dest, "dest"); return cpRec(toStr(src), toStr(dest), o); }),
     symlink: P((target, path2) => F.symlink(toStr(target), toStr(path2))),
     readlink: P((p) => F.readlink(toStr(p))),
     chmod: P((p, m) => F.chmod(toStr(p), typeof m === "string" ? parseInt(m, 8) : (Number(m) & 0o7777))), lchmod: P(() => {}), chown: P(() => {}), lchown: P(() => {}),

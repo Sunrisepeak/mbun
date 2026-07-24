@@ -1118,7 +1118,27 @@ JSValueRef fsn_symlink_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_
     std::error_code ec;
     std::filesystem::create_symlink(std::filesystem::path{target},
                                     std::filesystem::path{linkpath}, ec);
-    if (ec) return fs_throw(ctx, exc, "symlink '" + linkpath + "': " + ec.message());
+    // node-shaped errno: fs.cp's onLink relies on EEXIST when the link path is
+    // already taken (a symlink copied over a regular file).
+    if (ec) {
+        switch (ec.value()) {
+            case EEXIST:
+                return fs_throw(ctx, exc, "EEXIST: file already exists, symlink '" + target
+                                              + "' -> '" + linkpath + "'");
+            case ENOENT:
+                return fs_throw(ctx, exc, "ENOENT: no such file or directory, symlink '" + target
+                                              + "' -> '" + linkpath + "'");
+            case EACCES:
+                return fs_throw(ctx, exc, "EACCES: permission denied, symlink '" + target
+                                              + "' -> '" + linkpath + "'");
+            case ENOTDIR:
+                return fs_throw(ctx, exc, "ENOTDIR: not a directory, symlink '" + target
+                                              + "' -> '" + linkpath + "'");
+            default:
+                return fs_throw(ctx, exc, "EPERM: operation not permitted, symlink '" + target
+                                              + "' -> '" + linkpath + "'");
+        }
+    }
     return JSValueMakeUndefined(ctx);
 }
 // Recursive readdir walk (node readdirSync(path, { recursive: true })). Mirrors
