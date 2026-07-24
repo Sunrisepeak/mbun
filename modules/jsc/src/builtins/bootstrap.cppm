@@ -817,6 +817,20 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       if (extras.length) head += " {\n" + extras.join("\n") + "\n" + "  ".repeat(depth) + "}";
       return head;
     }
+    // node/bun both render a promise by state, never as a bare `Promise {}`:
+    // `Promise { <pending> }`, `Promise { <value> }`, `Promise { <rejected> e }`.
+    // Bun.peek.status is the only way to read the state from JS.
+    if (v instanceof Promise && G.Bun && typeof G.Bun.peek === "function" &&
+        typeof G.Bun.peek.status === "function") {
+      let state;
+      try { state = G.Bun.peek.status(v); } catch (e) { state = "pending"; }
+      if (state !== "fulfilled" && state !== "rejected") return "Promise { <pending> }";
+      let settled;
+      try { settled = inspectValue(G.Bun.peek(v), opts, seen, depth + 1); }
+      catch (e) { settled = "<unknown>"; }
+      return state === "rejected" ? "Promise { <rejected> " + settled + " }"
+                                  : "Promise { " + settled + " }";
+    }
     if (G.Buffer && G.Buffer.isBuffer && G.Buffer.isBuffer(v)) {
       // node lib/buffer.js: truncate the byte dump at buffer.INSPECT_MAX_BYTES
       // (default 50) with a " ... N more byte(s)" tail (singular for 1). Empty

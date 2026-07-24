@@ -824,6 +824,41 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
         if (versions.zig === undefined) versions.zig = "0.14.1";
       }
     } catch (e) {}
+
+    // ---- globalThis.gc under --expose-gc -----------------------------------
+    // node only defines the global `gc` when started with --expose-gc; tests
+    // that need it declare the flag in their `// Flags:` header and otherwise
+    // bail out with "Run this test with --expose-gc". The flag reaches JS via
+    // process.execArgv, which is only populated after the builtins image has
+    // been evaluated — hence an accessor that resolves on first read rather
+    // than a value installed here. Without the flag the getter yields
+    // undefined, so `typeof gc === "function"` stays false exactly as before.
+    try {
+      if (!("gc" in G)) {
+        const collect = (full) => {
+          try { if (G.Bun && typeof G.Bun.gc === "function") return G.Bun.gc(full !== false); } catch (e) {}
+          return undefined;
+        };
+        Object.defineProperty(G, "gc", {
+          configurable: true,
+          enumerable: false,
+          get() {
+            const argv = (G.process && G.process.execArgv) || [];
+            for (const a of argv) {
+              if (a === "--expose-gc" || (typeof a === "string" && a.startsWith("--expose-gc="))) {
+                return collect;
+              }
+            }
+            return undefined;
+          },
+          set(v) {
+            Object.defineProperty(G, "gc", {
+              value: v, writable: true, configurable: true, enumerable: false,
+            });
+          },
+        });
+      }
+    } catch (e) {}
   } catch (e) {}
 })();
 )JS";
