@@ -1273,6 +1273,44 @@ constexpr std::string_view kStreamsJS_part2 = R"JS(
     bytes() { const e = consumerUsableError(this); return e ? Promise.reject(e) : consumeStart(this).then(consumeBytes); }
     arrayBuffer() { const e = consumerUsableError(this); return e ? Promise.reject(e) : consumeStart(this).then(consumeBytes).then((u8) => u8.buffer); }
     blob() { const e = consumerUsableError(this); const t = this.__mbunBlobType || ""; return e ? Promise.reject(e) : consumeStart(this).then(consumeArray).then((chunks) => new G.Blob(chunks, { type: t })); }
+    // ReadableStream.from(iterable) — streams spec / node
+    // internal/webstreams/readablestream.js readableStreamFromIterable().
+    // The two validation errors are observable (test-webstream-readable-from):
+    // a non-iterable is ERR_ARG_NOT_ITERABLE, an iterator method that returns a
+    // non-object is ERR_INVALID_STATE. Note a FUNCTION is a valid iterator here.
+    static from(iterable) {
+      let stream;
+      const iteratorGetter = iterable == null
+        ? undefined
+        : (iterable[Symbol.asyncIterator] ?? iterable[Symbol.iterator]);
+      if (iteratorGetter == null || typeof iteratorGetter !== "function") {
+        const e = new TypeError("The iterable argument must be iterable");
+        e.code = "ERR_ARG_NOT_ITERABLE";
+        throw e;
+      }
+      const iterator = iteratorGetter.call(iterable);
+      if (iterator === null || (typeof iterator !== "object" && typeof iterator !== "function")) {
+        throw invalidState("The iterator method must return an object");
+      }
+      const pullAlgorithm = async () => {
+        const iterResult = await iterator.next();
+        if (typeof iterResult !== "object" || iterResult === null) {
+          throw invalidState("The promise returned by the iterator.next() method must fulfill with an object");
+        }
+        if (iterResult.done) defaultControllerClose(stream._readableStreamController);
+        else defaultControllerEnqueue(stream._readableStreamController, await iterResult.value);
+      };
+      const cancelAlgorithm = async (reason) => {
+        const returnMethod = iterator.return;
+        if (returnMethod === undefined) return;
+        const iterResult = await returnMethod.call(iterator, reason);
+        if (typeof iterResult !== "object" || iterResult === null) {
+          throw invalidState("The promise returned by the iterator.return() method must fulfill with an object");
+        }
+      };
+      stream = createReadableStream(() => {}, pullAlgorithm, cancelAlgorithm, 0);
+      return stream;
+    }
   }
 
   // =====================================================================

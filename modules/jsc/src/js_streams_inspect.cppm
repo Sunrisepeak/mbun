@@ -84,6 +84,23 @@ export inline constexpr std::string_view kStreamsJS_part3 = R"JS(
   defineStreamInspect(TransformStreamDefaultController, "TransformStreamDefaultController", (c) => ({
     stream: c._stream,
   }));
+
+  // ---- Symbol.toStringTag ----
+  // Every WebIDL interface carries a @@toStringTag equal to its interface name,
+  // as `{ configurable: true, enumerable: false, writable: false }`
+  // (webidl.js "Interface prototype object"). Without it `String(stream)` was
+  // "[object Object]" and the class-surface tests could not identify any of
+  // these; test-webstream-string-tag asserts the exact descriptor.
+  for (const Cls of [ReadableStream, ReadableStreamDefaultReader, ReadableStreamBYOBReader,
+                     ReadableStreamBYOBRequest, ReadableStreamDefaultController,
+                     ReadableByteStreamController, WritableStream, WritableStreamDefaultWriter,
+                     WritableStreamDefaultController, TransformStream,
+                     TransformStreamDefaultController, ByteLengthQueuingStrategy,
+                     CountQueuingStrategy]) {
+    Object.defineProperty(Cls.prototype, Symbol.toStringTag, {
+      value: Cls.name, writable: false, enumerable: false, configurable: true,
+    });
+  }
 })();
 )JS";
 
