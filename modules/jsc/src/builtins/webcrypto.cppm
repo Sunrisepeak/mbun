@@ -1027,7 +1027,10 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
         throw notSupported("Unrecognized algorithm name");
       }
 
-      async importKey(format, keyData, algorithm, extractable, keyUsages) {
+      // Deliberately NOT async: node's KeyObject.prototype.toCryptoKey is a
+      // synchronous bridge into the same import steps, and the public wrapper
+      // promisifies the result anyway.
+      importKey(format, keyData, algorithm, extractable, keyUsages) {
         if (arguments.length < 5) throw new TypeError("Not enough arguments");
         const convertedFormat = keyFormat(format);
         const alg = normalizeAlg(algorithm);
@@ -1179,7 +1182,7 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
         return makeKey(type, keyAlgorithm, extractable, usages, { material });
       }
 
-      async exportKey(format, key) {
+      exportKey(format, key) {
         if (arguments.length < 2) throw new TypeError("Not enough arguments");
         const convertedFormat = keyFormat(format);
         const metadata = keyMetadata.get(key);
@@ -1467,7 +1470,7 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
     // node:crypto <-> WebCrypto bridge: hand the raw key material of a CryptoKey
     // to the node:crypto layer (builtins/crypto_asym.cppm), which owns KeyObject,
     // and build a CryptoKey back from a KeyObject's DER/secret bytes.
-    G.__mbunCryptoKeyMaterial = (key) => {
+    G.__mbunCryptoKeyToKeyObject = (key) => {
       const metadata = keyMetadata.get(key);
       if (!metadata) return undefined;
       return {

@@ -356,9 +356,28 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
       if (other._kind !== this._kind) return false;
       try { return Buffer.compare(toBuf(this.export({ format: this._kind === "secret" ? undefined : "der", type: this._kind === "public" ? "spki" : "pkcs8" })), toBuf(other.export({ format: "der", type: this._kind === "public" ? "spki" : "pkcs8" }))) === 0; } catch { return false; }
     }
+    // node: keyObject.toCryptoKey(algorithm, extractable, keyUsages) — the
+    // reverse of KeyObject.from(). Synchronous, like node's.
+    // ref: node lib/internal/crypto/keys.js KeyObject.prototype.toCryptoKey.
+    toCryptoKey(algorithm, extractable, keyUsages) {
+      const bridge = G.__mbunKeyObjectToCryptoKey;
+      if (typeof bridge !== "function") {
+        throw new TypeError("WebCrypto is not available in this build");
+      }
+      if (this._kind === "secret") {
+        return bridge("secret", new Uint8Array(toBuf(this._km)), algorithm, extractable, keyUsages);
+      }
+      const isPublic = this._kind === "public";
+      const der = AN.keyExport(this._km, this._pass, isPublic,
+        isPublic ? "spki" : "pkcs8", "der", "", "");
+      return bridge(this._kind, new Uint8Array(der), algorithm, extractable, keyUsages);
+    }
     // node: KeyObject.from(cryptoKey) — only a WebCrypto CryptoKey is accepted.
     static from(key) {
-      if (!(G.CryptoKey && key instanceof G.CryptoKey)) {
+      const isCryptoKey = typeof G.__mbunIsCryptoKey === "function"
+        ? G.__mbunIsCryptoKey(key)
+        : !!(G.CryptoKey && key instanceof G.CryptoKey);
+      if (!isCryptoKey) {
         const e = new TypeError('The "key" argument must be an instance of CryptoKey. Received ' +
           (key === null ? "null" : typeof key));
         e.code = "ERR_INVALID_ARG_TYPE"; throw e;
