@@ -204,8 +204,14 @@ inline constexpr std::string_view kNodeNetJS = R"JS(
         this._fd = -1;
         this._bound = false;
         this._closed = false;
-        this._refed = true;
-        this._counted = false;
+        // Loop-reference state: `_refd` is the sticky user intent (node's
+        // uv_ref flag), `_held` whether the reactor's handle count carries this
+        // socket right now. dgram used to ride NET.pending, which is the
+        // in-flight-operation channel the fetch stall detector watches — a bound
+        // socket is a long-lived handle, not a bounded operation.
+        this._refd = true;
+        this._held = false;
+        this._loopOpen = false;
       }
       _v6() { return this.type === "udp6"; }
       // reuseAddr is an opt-in (node dgram.createSocket({ reuseAddr })): without
@@ -229,7 +235,7 @@ inline constexpr std::string_view kNodeNetJS = R"JS(
         this._bound = true;
         this._addr = info;
         const R = this._reactor();
-        if (R) { R.items.add(this); if (this._refed && !this._counted) { this._counted = true; R.pending++; } }
+        if (R) { R.items.add(this); this._loopOpen = true; R.hold(this); }
         if (cb) this.once("listening", cb);
         const self = this;
         G.queueMicrotask(() => { if (!self._closed) self.emit("listening"); });
@@ -280,7 +286,7 @@ inline constexpr std::string_view kNodeNetJS = R"JS(
         if (this._closed) { if (cb) G.queueMicrotask(cb); return this; }
         this._closed = true;
         const R = this._reactor();
-        if (R) { R.items.delete(this); if (this._counted) { this._counted = false; R.pending = Math.max(0, R.pending - 1); } }
+        if (R) { R.items.delete(this); this._loopOpen = false; R.release(this); }
         if (this._fd >= 0) { try { ND.close(this._fd); } catch (e) {} this._fd = -1; }
         if (cb) this.once("close", cb);
         const self = this;
@@ -293,8 +299,9 @@ inline constexpr std::string_view kNodeNetJS = R"JS(
       setMulticastLoopback(f) { this._ensureFd(); ND.setopt(this._fd, "multicastLoopback", f ? 1 : 0, this._v6()); return !!f; }
       addMembership(group, iface) { this._ensureFd(); ND.membership(this._fd, true, String(group), iface ? String(iface) : "", this._v6()); }
       dropMembership(group, iface) { this._ensureFd(); ND.membership(this._fd, false, String(group), iface ? String(iface) : "", this._v6()); }
-      ref() { if (!this._refed) { this._refed = true; const R = this._reactor(); if (R && this._bound && !this._counted) { this._counted = true; R.pending++; } } return this; }
-      unref() { if (this._refed) { this._refed = false; const R = this._reactor(); if (R && this._counted) { this._counted = false; R.pending = Math.max(0, R.pending - 1); } } return this; }
+      ref() { this._refd = true; const R = this._reactor(); if (R) R.hold(this); return this; }
+      unref() { this._refd = false; const R = this._reactor(); if (R) R.release(this); return this; }
+      hasRef() { return this._refd !== false; }
     }
 
     const createSocket = (type, cb) => {

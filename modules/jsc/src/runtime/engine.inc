@@ -612,14 +612,16 @@ public:
             auto rem{eval_number(
                 "(globalThis.__mbun_timers_refd?globalThis.__mbun_timers_refd():0)+"
                 "(globalThis.__mbunNet?globalThis.__mbunNet.pending:0)")};
-            // A ref'd listening server (Bun.serve) pins the loop indefinitely —
-            // bun keeps the process alive until stop()/unref(). It also disarms
-            // the runaway-iteration cap, which only guards wedged drains; the
-            // serve reactor's epoll tick paces each idle iteration. Liveness
-            // mode only (see above).
+            // A ref'd handle pins the loop indefinitely: a listening Bun.serve
+            // (serveActive) or a ref'd node handle — net.Server, net.Socket,
+            // dgram.Socket and everything layered on them (NET.handles). bun/node
+            // both keep the process alive until the last one is closed or
+            // unref'd. It also disarms the runaway-iteration cap, which only
+            // guards wedged drains; the park below paces each idle iteration.
+            // Liveness mode only (see above).
             const double srvLive{
-                livenessMode ? eval_number("(globalThis.__mbunNet?(globalThis.__mbunNet."
-                                           "serveActive>0?1:0):0)")
+                livenessMode ? eval_number("(globalThis.__mbunNet?((globalThis.__mbunNet."
+                                           "serveActive>0||globalThis.__mbunNet.handles>0)?1:0):0)")
                                    .value_or(0.0)
                              : 0.0};
             if (srvLive > 0.0) iter = 0;
@@ -648,6 +650,15 @@ public:
                     // wake source cuts the park short.
                     int parkMs{static_cast<int>(*idleMs)};
                     if (!livenessMode && parkMs > 25) parkMs = 25;
+                    // Same arithmetic applies to a liveness pump that is only
+                    // counting out its grace rounds: nothing holds the loop, so
+                    // the process is leaving and the park is pure shutdown
+                    // latency. __mbun_pump_idle_ms still reports a long park
+                    // whenever any pollable is registered (an unref'd listener
+                    // stays in NET.items so its fd keeps being polled), which
+                    // made `server.unref()` cost 32 x 60s — indistinguishable
+                    // from the hang it was meant to fix.
+                    if (idleRounds > 0 && parkMs > 1) parkMs = 1;
                     const auto parked{eval_number(
                         "globalThis.__mbunNetNative&&globalThis.__mbunNetNative.wait?"
                         "(__mbunNetNative.wait(" +

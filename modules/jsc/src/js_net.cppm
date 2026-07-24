@@ -82,9 +82,19 @@ export constexpr std::string_view kNetJS = R"JS(
   // pending counts bounded in-flight operations that MUST make progress for the
   // program to advance (currently fetch). Long-lived listeners are deliberately
   // not counted here: test_runner uses pending to decide whether a single test
-  // can time out, while process-level socket ref/unref needs a separate loop-ref
-  // channel. wait() blocks ≤2ms per idle drain so we never busy-spin.
-  const NET = (G.__mbunNet = { pending: 0, items: new Set(), stall: 0, serveActive: 0, gen: 0 });
+  // can time out. wait() blocks ≤2ms per idle drain so we never busy-spin.
+  //
+  // handles is the separate loop-ref channel that ref/unref act on: the count of
+  // ref'd, open node handles (net.Server, net.Socket, dgram.Socket, and the
+  // http/http2/tls layers built on them). The C++ pump keeps running while it is
+  // non-zero, so `server.unref()` really does let the process leave — it used to
+  // be a no-op that still pinned the loop, which hung 580 corpus files.
+  const NET = (G.__mbunNet = { pending: 0, items: new Set(), stall: 0, serveActive: 0, gen: 0, handles: 0 });
+  // A handle's loop reference. `refd` is the user's intent (sticky across
+  // open/close, as node's uv_ref/uv_unref flag is), `held` whether the count
+  // currently carries this handle.
+  NET.hold = (h) => { if (!h._held && h._refd !== false && h._loopOpen) { h._held = true; NET.handles++; } };
+  NET.release = (h) => { if (h._held) { h._held = false; NET.handles = Math.max(0, NET.handles - 1); } };
   G.__mbunNetDrain = function () {
     if (!NN) return 0;
     let total = 0;
@@ -146,6 +156,8 @@ export constexpr std::string_view kNetJS = R"JS(
       this._paused = false; this._enc = null;
       this._onread = opts.onread && typeof opts.onread.callback === "function" ? opts.onread.callback : null;
       this.destroyed = false; this.connecting = false; this.readable = true; this.writable = true; this.pending = true;
+      // Loop-reference state (see NET.hold): sticky intent + current hold.
+      this._refd = true; this._held = false; this._loopOpen = false;
       this.allowHalfOpen = !!opts.allowHalfOpen;
       this.remoteAddress = "127.0.0.1"; this.remoteFamily = "IPv4"; this.remotePort = 0;
       this.localAddress = "127.0.0.1"; this.localPort = 0;
@@ -161,6 +173,10 @@ export constexpr std::string_view kNetJS = R"JS(
       this.readable = true; this.writable = true;
       this._shutW = false; this._shutSent = false; this._eof = false; this._closeEmitted = false;
       NET.items.add(this);
+      // An open socket holds the event loop open (node: uv_tcp_t is ref'd until
+      // it closes), unless the user unref'd it. Without this the pump could
+      // decide the loop was idle while a request was still in flight.
+      this._loopOpen = true; NET.hold(this);
       return this;
     }
     connect(...a) {
@@ -299,8 +315,12 @@ export constexpr std::string_view kNetJS = R"JS(
       return this;
     }
     cork() { return this; } uncork() { return this; }
-    ref() { return this; }
-    unref() { return this; }
+    // node net.Socket#ref/unref: sticky user intent over the handle's loop
+    // reference. These were no-ops, so an unref'd keep-alive/agent socket still
+    // pinned the process.
+    ref() { this._refd = true; NET.hold(this); return this; }
+    unref() { this._refd = false; NET.release(this); return this; }
+    hasRef() { return this._refd !== false; }
     // stream.Readable#read: nothing is buffered by this transport (chunks go
     // straight out as 'data'), except bytes handed back through unshift().
     read(n) {
@@ -385,6 +405,7 @@ export constexpr std::string_view kNetJS = R"JS(
       if (this._timeoutTimer) { G.clearTimeout(this._timeoutTimer); this._timeoutTimer = null; }
       if (this._fd >= 0) { try { NN.close(this._fd); } catch (e) {} this._fd = -1; }
       NET.items.delete(this);
+      this._loopOpen = false; NET.release(this);
       if (err) this.emit("error", err);
       if (!this._closeEmitted) { this._closeEmitted = true; G.queueMicrotask(() => this.emit("close", !!err)); }
       return this;
@@ -517,10 +538,15 @@ export constexpr std::string_view kNetJS = R"JS(
       this._opts = opts || {};
       if (typeof cb === "function") this.on("connection", cb);
       this._fd = -1; this._addr = null; this.listening = false; this._conns = new Set();
-      this._refd = false;  // listening + ref'd holds the event loop (node semantics)
+      // node semantics: `_refd` is the sticky user intent (a handle unref'd
+      // BEFORE listen() must not hold the loop once it starts listening —
+      // `net.createServer().unref().listen()` used to hang forever because
+      // unref() was a no-op on a not-yet-listening server and listen() then
+      // took an unconditional hold); `_loopOpen` is whether the handle is live.
+      this._refd = true; this._held = false; this._loopOpen = false;
     }
-    _hold() { if (!this._refd) { this._refd = true; NET.serveActive++; } }
-    _release() { if (this._refd) { this._refd = false; NET.serveActive--; } }
+    _hold() { this._loopOpen = true; NET.hold(this); }
+    _release() { this._loopOpen = false; NET.release(this); }
     listen(...a) {
       let port = 0, host = null, cb = null, unixPath = null;
       // node lib/internal/validators validatePort (allowZero): every listen form
@@ -606,8 +632,9 @@ export constexpr std::string_view kNetJS = R"JS(
       G.queueMicrotask(() => this.emit("close"));
       return this;
     }
-    ref() { if (this.listening) this._hold(); return this; }
-    unref() { this._release(); return this; }
+    ref() { this._refd = true; NET.hold(this); return this; }
+    unref() { this._refd = false; NET.release(this); return this; }
+    hasRef() { return this._refd !== false; }
     setTimeout() { return this; }
     getConnections(cb) { if (typeof cb === "function") cb(null, this._conns.size); return this; }
     _poll() {
