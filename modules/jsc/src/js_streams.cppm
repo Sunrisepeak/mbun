@@ -1173,6 +1173,19 @@ constexpr std::string_view kStreamsJS_part2 = R"JS(
 
   class ReadableStream {
     constructor(underlyingSource, strategy) {
+      // AsyncLocalStorage seam: a stream retains its underlying-source
+      // algorithms and calls them later, so async_hooks needs to snapshot the
+      // constructing frame onto start/pull/cancel. It used to do that by
+      // REPLACING globalThis.ReadableStream with a subclass, which silently
+      // broke identity for every stream the spec algorithms build internally
+      // (tee branches, TransformStream.readable, pipeThrough results): they are
+      // created from ReadableStream.prototype, so `x instanceof
+      // globalThis.ReadableStream` was false and node's isReadableStream()
+      // rejected them ("Received an instance of ReadableStream"). Wrapping the
+      // source here instead keeps exactly one ReadableStream class.
+      if (G.__mbunWrapStreamSource !== undefined && underlyingSource != null) {
+        underlyingSource = G.__mbunWrapStreamSource(underlyingSource);
+      }
       const source = underlyingSource == null ? {} : underlyingSource;
       strategy = strategy == null ? {} : strategy;
       if (typeof source !== "object" && typeof source !== "function") throw new TypeError("underlyingSource must be an object");
