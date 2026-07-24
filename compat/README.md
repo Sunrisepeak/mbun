@@ -76,3 +76,47 @@ python3 tools/integration/node_corpus_runner.py \
 
 Measurement data is stored under [`compat/data/`](data/), including test and
 benchmark inventories and native run results.
+
+## Estimating a round target
+
+Targets used to be guesses. [`data/round-estimates.json`](data/round-estimates.json)
+records estimate-vs-actual per task so they stop being guesses; round 9's five
+tasks produced a clear and initially counter-intuitive signal.
+
+**Cluster homogeneity predicts the hit rate. Cluster size does not.** The two
+largest work-lists delivered 51% and **13%** of target; the three smallest
+delivered 132–187%.
+
+| work-list | homogeneity | target | actual | hit rate |
+| --- | --- | --- | --- | --- |
+| 611 files — harness flag re-spawn | low | +150 | +76 | 0.51 |
+| 580 files — the timeout bucket | low | +120 | **+15** | **0.13** |
+| 74 files — node:fs | high | +30 | +56 | 1.87 |
+| 78 files — buffer/zlib/url/net | high | +25 | +33 | 1.32 |
+| 70 files — crypto/webcrypto | high | +22 | +30 | 1.36 |
+
+A *homogeneous* cluster is one where the files fail for the same reason at the
+same layer — fix the layer, they all convert. A big cluster sharing only a
+*symptom* (one log line, one bucket) is not one root cause: unblocking it
+exposes each file's own unrelated second failure. Both large round-9 clusters
+were symptom-clusters and behaved accordingly.
+
+Rules this produces, in order of how much they cost when ignored:
+
+1. **Verify the cause before setting a target on it.** The 580-file timeout
+   target assumed handle ref-counting. The actual cause was every event-pump
+   phase swallowing thrown exceptions. Work on an unverified causal hypothesis
+   is exploration; give it an exploration budget, not a conversion target.
+2. **Score the probe the way the target is scored.** The 611-file target came
+   from a probe counting self-skips as conversions while the target counted only
+   real passes — a bias baked in before the work started.
+3. **Re-measure the baseline with the binary under test.** A work-list built
+   from an older run silently contained 38 already-green files out of 78.
+4. **For a symptom-cluster, target the diagnosis, not the pass count.** Moving
+   429 files from a 15-second hang to a sub-second diagnosable failure made the
+   corpus triageable and was worth doing — it is just not a pass count, and
+   reporting it as one would be dishonest.
+
+**Wall-clock:** one task runs 57–119 minutes (median 83). A coordination tick
+shorter than that cannot be a round boundary — it is a checkpoint. Plan a round
+as *dispatch → several checkpoints → integrate*, never as one tick.

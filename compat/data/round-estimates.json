@@ -1,0 +1,82 @@
+{
+  "generated_at": "2026-07-25",
+  "purpose": "Per-task estimate-vs-actual for compat rounds, so targets stop being guesses. Each entry records what a task was predicted to deliver, what it delivered, how long it took, and — when the estimate missed badly — the identified cause. Read compat/README.md#estimating-a-round-target before setting a new target.",
+  "units": {
+    "delta_pass": "net change in real `pass` files (node runner; `skipped` excluded)",
+    "wall_clock_min": "agent wall-clock minutes, dispatch to final report"
+  },
+  "rounds": [
+    {
+      "round": 9,
+      "corpus": "compat/node/test/parallel",
+      "baseline_binary": "round-8 HEAD (23217dd)",
+      "tasks": [
+        {
+          "id": "r9/agent-1",
+          "cluster": "node harness flag re-spawn (process.execArgv, spawnSync stdio)",
+          "worklist_files": 611,
+          "cluster_homogeneity": "low",
+          "target_delta_pass": 150,
+          "actual_delta_pass": 76,
+          "hit_rate": 0.51,
+          "wall_clock_min": 57,
+          "estimate_miss_cause": "Target extrapolated from an 80-file NODE_SKIP_FLAG_CHECK probe measuring 27.5% conversion; true population rate was 17% exit-0 of which only 12.4% real passes. Half the gap was skips counted as passes in the probe, half a ~2.5-sigma lucky sample. A one-line unblock exposes a long tail of unrelated second failures."
+        },
+        {
+          "id": "r9/agent-2",
+          "cluster": "node:fs validation + fs.promises/FileHandle",
+          "worklist_files": 74,
+          "cluster_homogeneity": "high",
+          "target_delta_pass": 30,
+          "actual_delta_pass": 56,
+          "hit_rate": 1.87,
+          "wall_clock_min": 114
+        },
+        {
+          "id": "r9/agent-3",
+          "cluster": "buffer/zlib/whatwg-url/net argument validation",
+          "worklist_files": 78,
+          "cluster_homogeneity": "high",
+          "target_delta_pass": 25,
+          "actual_delta_pass": 33,
+          "hit_rate": 1.32,
+          "wall_clock_min": 119,
+          "note": "Dispatched work-list was stale (derived from a pre-round-8 binary): 38 of 78 were already green. Delta is against a re-measured baseline."
+        },
+        {
+          "id": "r9/agent-4",
+          "cluster": "WebCrypto + node:crypto",
+          "worklist_files": 70,
+          "cluster_homogeneity": "high",
+          "target_delta_pass": 22,
+          "actual_delta_pass": 30,
+          "hit_rate": 1.36,
+          "wall_clock_min": 83
+        },
+        {
+          "id": "r9/agent-5",
+          "cluster": "process exit events + handle unref (the 580 timeouts)",
+          "worklist_files": 580,
+          "cluster_homogeneity": "low",
+          "target_delta_pass": 120,
+          "actual_delta_pass": 15,
+          "hit_rate": 0.13,
+          "wall_clock_min": 74,
+          "estimate_miss_cause": "The stated root cause was wrong. The hangs were not handle ref-counting but every event-pump phase swallowing thrown exceptions (`catch (e) {}`), leaving handles registered forever. Fixing it moved 429 files from a 15s hang to a sub-second diagnosable failure — real progress, but failures are not passes. A target was set on an unverified causal hypothesis."
+        }
+      ],
+      "calibration": {
+        "high_homogeneity_hit_rate_range": [1.32, 1.87],
+        "low_homogeneity_hit_rate_range": [0.13, 0.51],
+        "wall_clock_min_range": [57, 119],
+        "wall_clock_median_min": 83,
+        "conclusions": [
+          "Cluster homogeneity predicts hit rate; cluster SIZE does not. The two largest work-lists (611, 580) delivered 51% and 13% of target; the three smallest (70-78) delivered 132-187%.",
+          "A target derived from a causal hypothesis that has not itself been verified is not an estimate. Verify the cause on a handful of files first, then extrapolate.",
+          "A probe used for extrapolation must be scored the same way as the target metric. The agent-1 probe counted self-skips as conversions; the target did not.",
+          "One agent task takes 57-119 min (median 83). A 60-minute coordination tick is SHORTER than a single task, so a tick cannot be a round boundary."
+        ]
+      }
+    }
+  ]
+}
