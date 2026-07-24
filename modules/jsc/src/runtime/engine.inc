@@ -57,6 +57,12 @@ private:
     // microtask checkpoint with no handler attached. `mbun run` exits 1 then, like
     // node/bun. Reset per entry-script run; the callback captures its address.
     bool unhandledRejection_{false};
+    // The rejection reason that armed `unhandledRejection_`, rendered as
+    // "Name: message\nstack" the way node prints a fatal rejection. Without it
+    // the process only reported "Unhandled promise rejection" — a corpus run
+    // then gave no clue WHICH await rejected, which made every fs/promises
+    // failure an un-diagnosable log line.
+    std::string unhandledRejectionReason_;
 
 public:
     Runtime(const Runtime&) = delete;
@@ -315,6 +321,7 @@ public:
         }
         apply_dotenv(/*isTest=*/false);
         unhandledRejection_ = false;
+        unhandledRejectionReason_.clear();
         install_unhandled_rejection_hook_();
         // bunfig `preload = [...]` runs before the entry point, in order, in the
         // same context (its plugins/globals must be visible to the entry).
@@ -424,7 +431,11 @@ public:
             }
             pump_event_loop("0");
             if (unhandledRejection_) {
-                std::cerr << "error: Unhandled promise rejection\n";
+                std::cerr << "error: Unhandled promise rejection"
+                          << (unhandledRejectionReason_.empty()
+                                  ? std::string{}
+                                  : ": " + unhandledRejectionReason_)
+                          << '\n';
                 return 1;
             }
             return 0;
@@ -502,7 +513,11 @@ public:
                 }
                 pump_event_loop("0");
                 if (unhandledRejection_) {
-                    std::cerr << "error: Unhandled promise rejection\n";
+                    std::cerr << "error: Unhandled promise rejection"
+                          << (unhandledRejectionReason_.empty()
+                                  ? std::string{}
+                                  : ": " + unhandledRejectionReason_)
+                          << '\n';
                     return 1;
                 }
             }
@@ -519,7 +534,11 @@ public:
             }
             pump_event_loop("0");
             if (unhandledRejection_) {
-                std::cerr << "error: Unhandled promise rejection\n";
+                std::cerr << "error: Unhandled promise rejection"
+                          << (unhandledRejectionReason_.empty()
+                                  ? std::string{}
+                                  : ": " + unhandledRejectionReason_)
+                          << '\n';
                 return 1;
             }
         }
@@ -550,10 +569,10 @@ public:
     void install_unhandled_rejection_hook_() {
         JSC::JSGlobalObject* g{::toJS(ctx_)};
         if (g == nullptr) return;
-        bool* flag{&unhandledRejection_};
+        Runtime* self{this};
         JSC::JSNativeStdFunction* cb{JSC::JSNativeStdFunction::create(
             g->vm(), g, 2, WTF::String::fromLatin1("onUnhandledRejection"),
-            [flag](JSC::JSGlobalObject* gg, JSC::CallFrame* frame) -> JSC::EncodedJSValue {
+            [self](JSC::JSGlobalObject* gg, JSC::CallFrame* frame) -> JSC::EncodedJSValue {
                 // JSC invokes this with (promise, reason) (VM::callPromiseRejectionCallback).
                 // Hand both to the JS dispatcher, which mirrors node's
                 // 'unhandledRejection' → 'uncaughtException' escalation. Only when
@@ -574,7 +593,13 @@ public:
                         handled = exc == nullptr && r != nullptr && JSValueToBoolean(ctx, r);
                     }
                 }
-                if (!handled) *flag = true;
+                if (!handled) {
+                    self->unhandledRejection_ = true;
+                    if (self->unhandledRejectionReason_.empty()) {
+                        self->unhandledRejectionReason_ =
+                            self->describe_rejection_(toRef(gg, frame->argument(1)));
+                    }
+                }
                 return JSC::JSValue::encode(JSC::jsUndefined());
             })};
         g->setUnhandledRejectionCallback(g->vm(), cb);
@@ -863,6 +888,29 @@ public:
         if (url != nullptr) JSStringRelease(url);
         JSStringRelease(script);
         return result;
+    }
+
+    // Render a rejection reason the way node's fatal handler does: the
+    // "Name: message" header (JSC's Error.stack omits it) followed by the
+    // stack, plus the error `code` when the reason carries one — that code is
+    // what the node corpus asserts on, so it belongs in the log.
+    std::string describe_rejection_(JSValueRef reason) {
+        std::string text{describe_exception_(reason)};
+        if (reason == nullptr || !JSValueIsObject(ctx_, reason)) return text;
+        JSObjectRef obj{JSValueToObject(ctx_, reason, nullptr)};
+        if (obj == nullptr) return text;
+        const auto read{[&](const char* key) -> std::string {
+            JSStringRef name{JSStringCreateWithUTF8CString(key)};
+            JSValueRef value{JSObjectGetProperty(ctx_, obj, name, nullptr)};
+            JSStringRelease(name);
+            if (value == nullptr || JSValueIsUndefined(ctx_, value) ||
+                JSValueIsNull(ctx_, value))
+                return {};
+            return describe_exception_(value);
+        }};
+        if (std::string code{read("code")}; !code.empty()) text += " [" + code + "]";
+        if (std::string stack{read("stack")}; !stack.empty()) text += '\n' + stack;
+        return text;
     }
 
     std::string describe_exception_(JSValueRef exception) {
