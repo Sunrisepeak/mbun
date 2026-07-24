@@ -587,6 +587,12 @@ public:
         return f && *f == 1.0;
     }
 
+    // The unhandled-rejection report. It has exactly one caller — finish_run_,
+    // which every exit path now goes through — so anything the report should
+    // say (the rejection reason, the offending value, a stack) belongs HERE,
+    // not duplicated at the call sites it used to live at.
+    void report_unhandled_rejection_() { std::cerr << "error: Unhandled promise rejection\n"; }
+
     // Run node's shutdown sequence: emit 'beforeExit' for as long as its
     // listeners keep re-arming the loop, then emit 'exit' and report the status
     // the process must leave with. `status` is the run's own verdict (0 for a
@@ -613,7 +619,7 @@ public:
             }
             status = 1;
         } else if (unhandledRejection_) {
-            std::cerr << "error: Unhandled promise rejection\n";
+            report_unhandled_rejection_();
             status = 1;
         }
         const std::string arg{status == 0 ? std::string{"undefined"} : std::to_string(status)};
