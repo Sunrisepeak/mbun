@@ -39,6 +39,30 @@ inline constexpr std::string_view kNodeFsWatchJS = R"JS(
   const WN = G.__mbunWatchNative;
 
   const toStr = (p) => (typeof p === "string" ? p : p && p.pathname !== undefined ? p.pathname : String(p));
+  // Reuse bootstrap's node validators so watch/watchFile/unwatchFile reject a
+  // bad path / encoding / listener with the SAME ERR_* shapes the rest of fs
+  // does (ref test-fs-null-bytes, test-fs-assert-encoding-error,
+  // test-fs-watchfile, test-fs-watch-ignore-invalid).
+  const V = G.__mbunFsInternals || {};
+  const validatePath = V.validatePath || (() => {});
+  const validateEncoding = V.validateEncoding || (() => {});
+  const argTypeErr = V.argTypeErr || ((n, e, v) => Object.assign(new TypeError('The "' + n + '" argument must be ' + e), { code: "ERR_INVALID_ARG_TYPE" }));
+  const argValueErr = V.argValueErr || ((n, v, r) => Object.assign(new TypeError("The argument '" + n + "' " + r), { code: "ERR_INVALID_ARG_VALUE" }));
+  // node validateStringArray/`ignore` option: a string or an array of strings,
+  // each non-empty. ref lib/internal/fs/watchers.js.
+  function validateIgnore(ignore) {
+    if (ignore === undefined || ignore === null) return;
+    const one = (v) => {
+      if (typeof v === "string") {
+        if (v.length === 0) throw argValueErr("options.ignore", v, "must be a non-empty string");
+        return;
+      }
+      if (v instanceof RegExp || (v && typeof v.test === "function")) return;
+      throw argTypeErr("options.ignore", "of type string or an instance of RegExp", v);
+    };
+    if (Array.isArray(ignore)) { for (const v of ignore) one(v); return; }
+    one(ignore);
+  }
 
   function unavailable() {
     const e = new Error("The fs.watch API is not available on this platform");
@@ -206,12 +230,17 @@ inline constexpr std::string_view kNodeFsWatchJS = R"JS(
 
   fs.watch = function watch(filename, options, listener) {
     const a = normalizeArgs(options, listener);
+    validatePath(filename);
+    validateEncoding(a.options);
+    validateIgnore(a.options.ignore);
     return new FSWatcher(filename, a.options, a.listener);
   };
 
   fs.watchFile = function watchFile(filename, options, listener) {
     if (typeof options === "function") { listener = options; options = {}; }
     if (options == null) options = {};
+    validatePath(filename);
+    if (typeof listener !== "function") throw argTypeErr("listener", "of type function", listener);
     const path = toStr(filename);
     let w = statWatchers.get(path);
     if (!w) { w = new StatWatcher(path, options); statWatchers.set(path, w); }
@@ -220,6 +249,7 @@ inline constexpr std::string_view kNodeFsWatchJS = R"JS(
   };
 
   fs.unwatchFile = function unwatchFile(filename, listener) {
+    validatePath(filename);
     const path = toStr(filename);
     const w = statWatchers.get(path);
     if (!w) return;

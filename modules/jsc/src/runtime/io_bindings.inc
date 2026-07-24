@@ -725,6 +725,100 @@ JSValueRef fsn_rm_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t arg
     if (ec && !force) return fs_throw(ctx, exc, "rm '" + path + "': " + ec.message());
     return JSValueMakeUndefined(ctx);
 }
+// rmdir(2). std::filesystem::remove cannot express node's error surface —
+// it reports "directory not empty" as a generic error_code and a missing path
+// as `false` with no error at all — so fs.rmdirSync had no ENOENT / ENOTDIR /
+// ENOTEMPTY to report. Go straight to the syscall and format node's message.
+JSValueRef fsn_rmdir_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                        const JSValueRef args[], JSValueRef* exc) {
+    std::string path{fs_arg(ctx, argc, args, 0)};
+#if defined(_WIN32)
+    std::error_code ec;
+    if (!std::filesystem::is_directory(std::filesystem::path{path}, ec))
+        return fs_throw(ctx, exc, "ENOENT: no such file or directory, rmdir '" + path + "'");
+    std::filesystem::remove(std::filesystem::path{path}, ec);
+    if (ec) return fs_throw(ctx, exc, "ENOTEMPTY: directory not empty, rmdir '" + path + "'");
+#else
+    if (::rmdir(path.c_str()) != 0) {
+        switch (errno) {
+            case ENOENT:
+                return fs_throw(ctx, exc, "ENOENT: no such file or directory, rmdir '" + path + "'");
+            case ENOTDIR:
+                return fs_throw(ctx, exc, "ENOTDIR: not a directory, rmdir '" + path + "'");
+            case ENOTEMPTY:
+            case EEXIST:
+                return fs_throw(ctx, exc, "ENOTEMPTY: directory not empty, rmdir '" + path + "'");
+            case EINVAL:
+                return fs_throw(ctx, exc, "EINVAL: invalid argument, rmdir '" + path + "'");
+            case EBUSY:
+                return fs_throw(ctx, exc, "EBUSY: resource busy or locked, rmdir '" + path + "'");
+            default:
+                return fs_throw(ctx, exc, "EACCES: permission denied, rmdir '" + path + "'");
+        }
+    }
+#endif
+    return JSValueMakeUndefined(ctx);
+}
+// truncate(2) — fs.truncate/truncateSync were no-ops, so a corpus file that
+// truncated and then re-read the file saw the original bytes.
+JSValueRef fsn_truncate_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                           const JSValueRef args[], JSValueRef* exc) {
+    std::string path{fs_arg(ctx, argc, args, 0)};
+    const auto len{(argc > 1 && JSValueIsNumber(ctx, args[1]))
+                       ? JSValueToNumber(ctx, args[1], nullptr)
+                       : 0.0};
+#if defined(_WIN32)
+    std::error_code ec;
+    std::filesystem::resize_file(std::filesystem::path{path},
+                                 static_cast<std::uintmax_t>(len), ec);
+    if (ec) return fs_throw(ctx, exc, "ENOENT: no such file or directory, open '" + path + "'");
+#else
+    if (::truncate(path.c_str(), static_cast<off_t>(len)) != 0) {
+        if (errno == ENOENT)
+            return fs_throw(ctx, exc, "ENOENT: no such file or directory, open '" + path + "'");
+        if (errno == EISDIR)
+            return fs_throw(ctx, exc, "EISDIR: illegal operation on a directory, open '" + path + "'");
+        return fs_throw(ctx, exc, "EACCES: permission denied, open '" + path + "'");
+    }
+#endif
+    return JSValueMakeUndefined(ctx);
+}
+// statfs(2)/statvfs(3) — the JS layer previously returned a frozen fake row.
+JSValueRef fsn_statfs_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                         const JSValueRef args[], JSValueRef* exc) {
+    std::string path{fs_arg(ctx, argc, args, 0)};
+    double type{0}, bsize{4096}, blocks{0}, bfree{0}, bavail{0}, files{0}, ffree{0};
+#if !defined(_WIN32)
+    struct statvfs sv{};
+    if (::statvfs(path.c_str(), &sv) != 0)
+        return fs_throw(ctx, exc, "ENOENT: no such file or directory, statfs '" + path + "'");
+    bsize = static_cast<double>(sv.f_bsize);
+    blocks = static_cast<double>(sv.f_blocks);
+    bfree = static_cast<double>(sv.f_bfree);
+    bavail = static_cast<double>(sv.f_bavail);
+    files = static_cast<double>(sv.f_files);
+    ffree = static_cast<double>(sv.f_ffree);
+    type = static_cast<double>(sv.f_fsid);
+#else
+    std::error_code ec;
+    if (!std::filesystem::exists(std::filesystem::path{path}, ec))
+        return fs_throw(ctx, exc, "ENOENT: no such file or directory, statfs '" + path + "'");
+    const auto space{std::filesystem::space(std::filesystem::path{path}, ec)};
+    blocks = static_cast<double>(space.capacity / 4096);
+    bfree = static_cast<double>(space.free / 4096);
+    bavail = static_cast<double>(space.available / 4096);
+#endif
+    JSObjectRef out{JSObjectMake(ctx, nullptr, nullptr)};
+    set_prop(ctx, out, "type", JSValueMakeNumber(ctx, type));
+    set_prop(ctx, out, "bsize", JSValueMakeNumber(ctx, bsize));
+    set_prop(ctx, out, "blocks", JSValueMakeNumber(ctx, blocks));
+    set_prop(ctx, out, "bfree", JSValueMakeNumber(ctx, bfree));
+    set_prop(ctx, out, "bavail", JSValueMakeNumber(ctx, bavail));
+    set_prop(ctx, out, "files", JSValueMakeNumber(ctx, files));
+    set_prop(ctx, out, "ffree", JSValueMakeNumber(ctx, ffree));
+    (void)exc;
+    return out;
+}
 JSValueRef fsn_readdir_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                           const JSValueRef args[], JSValueRef* exc) {
     std::string path{fs_arg(ctx, argc, args, 0)};
@@ -1310,6 +1404,27 @@ JSC_DEFINE_HOST_FUNCTION(fdn_write_host, (JSC::JSGlobalObject* global, JSC::Call
         return fd_throw(global, "EIO: write failed");
     }
     return JSC::JSValue::encode(JSC::jsNumber(static_cast<double>(*r)));
+}
+
+// ftruncate(2) on a virtual fd. fs.ftruncateSync / filehandle.truncate() were
+// no-ops, so `await handle.truncate(5)` left the file at its original length.
+JSC_DEFINE_HOST_FUNCTION(fdn_ftruncate_host, (JSC::JSGlobalObject* global, JSC::CallFrame* frame)) {
+    if (frame->argumentCount() < 1) return JSC::JSValue::encode(JSC::jsUndefined());
+    const int fd{static_cast<int>(fd_num(global, frame->argument(0)))};
+    auto it{fd_table().find(fd)};
+    if (it == fd_table().end()) {
+        fd_throw(global, "EBADF: bad file descriptor " + std::to_string(fd));
+        return JSC::JSValue::encode(JSC::jsUndefined());
+    }
+    const double len{frame->argumentCount() > 1 ? fd_num(global, frame->argument(1)) : 0.0};
+#if defined(_WIN32)
+    (void)len;
+    return fd_throw(global, "ENOSYS: ftruncate is not supported on Windows");
+#else
+    if (::ftruncate(it->second.native_fd(), static_cast<off_t>(len)) != 0)
+        return fd_throw_errno(global, errno, "ftruncate", std::to_string(fd));
+    return JSC::JSValue::encode(JSC::jsUndefined());
+#endif
 }
 
 // bun:internal-for-testing createSocketPair() → [readFd, writeFd]. A connected

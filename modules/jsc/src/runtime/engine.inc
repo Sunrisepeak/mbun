@@ -1387,6 +1387,9 @@ public:
         set_fn(ctx_, fsn, "symlink", fsn_symlink_cb);
         set_fn(ctx_, fsn, "readdirRecursive", fsn_readdirRecursive_cb);
         set_fn(ctx_, fsn, "mkdtemp", fsn_mkdtemp_cb);
+        set_fn(ctx_, fsn, "rmdir", fsn_rmdir_cb);
+        set_fn(ctx_, fsn, "truncate", fsn_truncate_cb);
+        set_fn(ctx_, fsn, "statfs", fsn_statfs_cb);
         set_prop(ctx_, global, "__mbunFsNative", fsn);
         // Native subprocess ops for node:child_process (spawnSync/execSync).
         JSObjectRef cpn{JSObjectMake(ctx_, nullptr, nullptr)};
@@ -1447,6 +1450,7 @@ public:
         set_native_fn(ctx_, fdn, "close", 1, fdn_close_host);
         set_native_fn(ctx_, fdn, "read", 5, fdn_read_host);
         set_native_fn(ctx_, fdn, "write", 5, fdn_write_host);
+        set_native_fn(ctx_, fdn, "ftruncate", 2, fdn_ftruncate_host);
         set_prop(ctx_, global, "__mbunFdNative", fdn);
         // bun:internal-for-testing createSocketPair() → [readFd, writeFd].
         set_native_fn(ctx_, global, "__mbunCreateSocketPair", 0, create_socket_pair_host);
