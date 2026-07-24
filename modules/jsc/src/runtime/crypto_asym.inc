@@ -547,6 +547,11 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_cipher_host,
         if (enc) {
             EVP_CIPHER_CTX_ctrl(cc.get(), EVP_CTRL_AEAD_SET_TAG, tagLen, nullptr);
         } else if (!tagIn.empty()) {
+            // OCB's ctrl rejects a tag whose length differs from the context's
+            // (default 16), so declare the length first (ptr == nullptr) and only
+            // then hand over the bytes. ref: OpenSSL crypto/evp/e_aes.c aes_ocb_ctrl.
+            EVP_CIPHER_CTX_ctrl(cc.get(), EVP_CTRL_AEAD_SET_TAG, static_cast<int>(tagIn.size()),
+                                nullptr);
             EVP_CIPHER_CTX_ctrl(cc.get(), EVP_CTRL_AEAD_SET_TAG, static_cast<int>(tagIn.size()),
                                 tagIn.data());
         }

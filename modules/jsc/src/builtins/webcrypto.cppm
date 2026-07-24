@@ -36,8 +36,11 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
     const freeze = Object.freeze;
     const preventExtensions = Object.preventExtensions;
     const defineProperty = Object.defineProperty;
-    const usageNames = ["decrypt", "deriveBits", "deriveKey", "encrypt", "sign",
-      "unwrapKey", "verify", "wrapKey"];
+    // node's kCanonicalUsageOrder (lib/internal/crypto/util.js) — the order a
+    // CryptoKey's `usages` array is materialised in, which the corpus
+    // deepStrictEquals against.
+    const usageNames = ["encrypt", "decrypt", "sign", "verify",
+      "deriveKey", "deriveBits", "wrapKey", "unwrapKey"];
     const usageSet = new Set(usageNames);
     const metadataFor = (key) => {
       const metadata = keyMetadata.get(key);
@@ -82,6 +85,16 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
     };
 
     const domError = (message, name) => new G.DOMException(message, name);
+    // A required WebIDL dictionary member that was not supplied: node's
+    // createDictionaryConverter raises ERR_MISSING_OPTION ("%s is required").
+    const requiredMember = (value, name) => {
+      if (value === undefined) {
+        const err = new TypeError(name + " is required");
+        err.code = "ERR_MISSING_OPTION";
+        throw err;
+      }
+      return value;
+    };
     const notSupported = (message) => domError(message, "NotSupportedError");
     const dataError = (message) => domError(message, "DataError");
     const operationError = (message) => domError(message, "OperationError");
@@ -94,10 +107,14 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
     const copyBytes = (value) => {
       if (value instanceof ArrayBuffer) {
         if (value.byteLength > MAX_BUFFER_BYTES) throw operationError("Data is too large");
+        // A detached (transferred) buffer reads as zero bytes in node rather
+        // than throwing — the algorithm then fails with its own OperationError.
+        if (value.byteLength === 0) return new Uint8Array(0);
         return new Uint8Array(value.slice(0));
       }
       if (ArrayBuffer.isView(value)) {
         if (value.byteLength > MAX_BUFFER_BYTES) throw operationError("Data is too large");
+        if (value.byteLength === 0) return new Uint8Array(0);
         return new Uint8Array(value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength));
       }
       const err = new TypeError(
@@ -131,18 +148,23 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
     // ---- algorithm normalization ----
     const normalizeAlgorithm = (algorithm) =>
       typeof algorithm === "string" ? { name: algorithm } : Object.assign({}, algorithm || {});
-    const hashNames = { SHA1: "SHA-1", "SHA-1": "SHA-1", SHA224: "SHA-224", "SHA-224": "SHA-224",
-      SHA256: "SHA-256", "SHA-256": "SHA-256", SHA384: "SHA-384", "SHA-384": "SHA-384",
-      SHA512: "SHA-512", "SHA-512": "SHA-512",
-      "SHA3-256": "SHA3-256", SHA3256: "SHA3-256", "SHA3-384": "SHA3-384", SHA3384: "SHA3-384",
-      "SHA3-512": "SHA3-512", SHA3512: "SHA3-512" };
+    // Registered WebCrypto digest names, matched case-insensitively (node's
+    // normalizeAlgorithm lower-cases the name before the table lookup) but with
+    // NO extra aliases: "sha256" and "SHA-224" are not WebCrypto algorithms.
+    // ref: node lib/internal/crypto/hashnames.js.
+    const hashNames = { "SHA-1": "SHA-1", "SHA-256": "SHA-256", "SHA-384": "SHA-384",
+      "SHA-512": "SHA-512", "SHA3-256": "SHA3-256", "SHA3-384": "SHA3-384",
+      "SHA3-512": "SHA3-512" };
     const normalizeHash = (hash) => {
       const value = normalizeAlgorithm(hash);
-      const key = String(value.name || "").toUpperCase().replace(/_/g, "-");
-      const name = hashNames[key];
+      const name = hashNames[String(value.name || "").toUpperCase()];
       if (!name) throw notSupported("Unrecognized algorithm name");
       return { name };
     };
+    // `hash` as a required dictionary member (HmacKeyGenParams, EcdsaParams,
+    // RsaHashedKeyGenParams, HkdfParams, Pbkdf2Params, …) — absent is
+    // ERR_MISSING_OPTION, not "Unrecognized algorithm name".
+    const memberHash = (alg) => normalizeHash(requiredMember(alg.hash, "algorithm.hash"));
     // WebCrypto hash spelling → OpenSSL/mbun digest name ("SHA-256" → "sha256";
     // "SHA3-256" keeps the hyphen so OpenSSL/EVP recognizes it as "sha3-256").
     const mdName = (hash) => hash.name.startsWith("SHA3-") ? hash.name.toLowerCase()
@@ -217,6 +239,21 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
       return value;
     };
     const intersectUsages = (usages, allowed) => sortUsages(usages.filter((u) => allowed.includes(u)));
+    // JWK "key_ops" must be duplicate-free and cover every requested usage.
+    // ref: node lib/internal/crypto/util.js validateKeyOps.
+    const validateKeyOps = (keyOps, usages) => {
+      if (keyOps === undefined) return;
+      if (!Array.isArray(keyOps)) throw dataError("Invalid keyData");
+      const seen = new Set();
+      for (const op of keyOps) {
+        if (!usageSet.has(op)) continue;   // unknown ops are skipped, not rejected
+        if (seen.has(op)) throw dataError("Duplicate key operation");
+        seen.add(op);
+      }
+      for (const usage of usages) {
+        if (!seen.has(usage)) throw dataError("Key operations and usage mismatch");
+      }
+    };
 
     const SIGN_ALGS = new Set(["RSASSA-PKCS1-v1_5", "RSA-PSS", "ECDSA", "Ed25519", "Ed448", "HMAC"]);
     const DERIVE_ALGS = new Set(["ECDH", "X25519", "X448", "PBKDF2", "HKDF"]);
@@ -251,6 +288,7 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
     const groupToCurve = { prime256v1: "P-256", secp384r1: "P-384", secp521r1: "P-521" };
     const curveBytes = { "P-256": 32, "P-384": 48, "P-521": 66 };
     const normalizeCurve = (namedCurve) => {
+      requiredMember(namedCurve, "algorithm.namedCurve");
       const name = String(namedCurve);
       if (!curveToGroup[name]) throw notSupported("Unrecognized namedCurve");
       return name;
@@ -438,7 +476,9 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
 
     // ---- generateKey ----
     const generateRsa = (alg, name, extractable, usages) => {
-      const hash = normalizeHash(alg.hash);
+      const hash = memberHash(alg);
+      requiredMember(alg.modulusLength, "algorithm.modulusLength");
+      requiredMember(alg.publicExponent, "algorithm.publicExponent");
       const modulusLength = Number(alg.modulusLength);
       if (!Number.isInteger(modulusLength) || modulusLength < 256) {
         throw new TypeError("Invalid modulusLength");
@@ -502,12 +542,22 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
     };
 
     // ---- sign / verify ----
+    // EdDsaParams.context needs OpenSSL >= 3.2 (EVP_PKEY_CTX ed context params).
+    // mbun links 3.1.5, so a non-empty context is refused rather than silently
+    // ignored — signing with the wrong domain separator would be a wrong answer.
+    const requireNoEddsaContext = (alg) => {
+      if (alg.context == null) return;
+      const context = copyBytes(alg.context);
+      if (context.length === 0) return;
+      throw notSupported("EdDSA context is not supported by this OpenSSL build");
+    };
     const RSA_PKCS1_PADDING = 1, RSA_PKCS1_OAEP_PADDING = 4, RSA_PKCS1_PSS_PADDING = 6;
     const SALTLEN_DIGEST = -1;
     // RSA-PSS saltLength is an int32 bounded by the modulus and digest sizes.
     // node surfaces the range failure as an OperationError whose `cause` is the
     // original ERR_OUT_OF_RANGE (lib/internal/crypto/rsa.js rsaSignVerify).
     const pssSaltLength = (alg, algorithm) => {
+      requiredMember(alg.saltLength, "algorithm.saltLength");
       const max = Math.ceil((algorithm.modulusLength - 1) / 8) -
         hashOutBytes[algorithm.hash.name] - 2;
       const saltLength = Number(alg.saltLength);
@@ -534,10 +584,11 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
       }
       if (name === "ECDSA") {
         // WebCrypto ECDSA signatures are raw r||s (IEEE P1363), never DER.
-        return AN().sign(mdName(normalizeHash(alg.hash)), data, metadata.material, "",
+        return AN().sign(mdName(memberHash(alg)), data, metadata.material, "",
           RSA_PKCS1_PADDING, SALTLEN_DIGEST, "ieee-p1363");
       }
       if (name === "Ed25519" || name === "Ed448") {
+        requireNoEddsaContext(alg);
         return AN().sign("", data, metadata.material, "", RSA_PKCS1_PADDING, SALTLEN_DIGEST, "");
       }
       throw notSupported("Unrecognized algorithm name");
@@ -556,10 +607,11 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
         // A wrong-sized r||s is a plain `false`, never an exception (spec).
         const size = curveBytes[metadata.algorithm.namedCurve];
         if (size != null && signature.length !== size * 2) return false;
-        return AN().verify(mdName(normalizeHash(alg.hash)), data, metadata.material, "", signature,
+        return AN().verify(mdName(memberHash(alg)), data, metadata.material, "", signature,
           RSA_PKCS1_PADDING, SALTLEN_DIGEST, "ieee-p1363");
       }
       if (name === "Ed25519" || name === "Ed448") {
+        requireNoEddsaContext(alg);
         return AN().verify("", data, metadata.material, "", signature, RSA_PKCS1_PADDING,
           SALTLEN_DIGEST, "");
       }
@@ -585,6 +637,7 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
     // AeadParams.iv per algorithm: ChaCha20-Poly1305 is fixed at 12 bytes,
     // AES-OCB accepts 1..15, AES-GCM any non-empty length.
     const aeadIv = (alg, name) => {
+      requiredMember(alg.iv, "algorithm.iv");
       const iv = copyBytes(alg.iv);
       if (name === "ChaCha20-Poly1305" && iv.length !== 12) {
         throw operationError("algorithm.iv must contain exactly 12 bytes");
@@ -599,6 +652,7 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
       algorithm.name === "ChaCha20-Poly1305" ? "chacha20-poly1305"
                                              : aesCipherName(algorithm, "ocb");
     const aesCtrCounter = (alg) => {
+      requiredMember(alg.counter, "algorithm.counter");
       const counter = copyBytes(alg.counter);
       if (counter.length !== 16) {
         throw operationError("algorithm.counter must contain exactly 16 bytes");
@@ -622,6 +676,7 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
     };
     const aesCtrCrypt = (metadata, alg, data) => {
       const counter0 = aesCtrCounter(alg);
+      requiredMember(alg.length, "algorithm.length");
       const length = Number(alg.length);
       if (!Number.isInteger(length) || length < 1 || length > 128) {
         throw operationError("AES-CTR algorithm.length must be between 1 and 128");
@@ -803,14 +858,13 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
     // required CryptoKey: absent → ERR_MISSING_OPTION TypeError (webidl's
     // required-member step), present but not a CryptoKey → a plain TypeError.
     const requirePeerKey = (alg, name) => {
-      if (alg.public === undefined) {
-        const err = new TypeError("algorithm.public is required");
-        err.code = "ERR_MISSING_OPTION";
-        throw err;
-      }
+      requiredMember(alg.public, "algorithm.public");
       const peer = keyMetadata.get(alg.public);
       if (!peer) {
-        throw new TypeError("Failed to normalize algorithm: member public is not of type CryptoKey");
+        const err = new TypeError(
+          'The "algorithm.public" property must be an instance of CryptoKey.');
+        err.code = "ERR_INVALID_ARG_TYPE";
+        throw err;
       }
       if (peer.algorithm.name !== name) {
         throw domError("The public and private keys must be of the same type",
@@ -821,7 +875,9 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
     const deriveBytes = (alg, metadata, lengthBits) => {
       const name = metadata.algorithm.name;
       if (name === "PBKDF2") {
-        const hash = normalizeHash(alg.hash);
+        const hash = memberHash(alg);
+        requiredMember(alg.salt, "algorithm.salt");
+        requiredMember(alg.iterations, "algorithm.iterations");
         const iterations = Number(alg.iterations);
         if (!Number.isInteger(iterations) || iterations <= 0) {
           throw operationError("iterations must be a positive integer");
@@ -832,7 +888,9 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
           G.Buffer.from(copyBytes(alg.salt)), iterations, lengthBits / 8, mdName(hash)));
       }
       if (name === "HKDF") {
-        const hash = normalizeHash(alg.hash);
+        const hash = memberHash(alg);
+        requiredMember(alg.salt, "algorithm.salt");
+        requiredMember(alg.info, "algorithm.info");
         const info = copyBytes(alg.info);
         // OpenSSL's HKDF caps the info string at 1024 bytes; node validates it in
         // the HkdfParams converter, i.e. before the length checks below.
@@ -908,7 +966,7 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
         if (EC_ALGS.has(name)) return generateEc(alg, name, extractable, usages);
         if (OKP_ALGS.has(name)) return generateOkp(name, extractable, usages);
         if (name === "HMAC") {
-          const hash = normalizeHash(alg.hash);
+          const hash = memberHash(alg);
           restrictUsages(usages, ["sign", "verify"], "an HMAC");
           const bits = alg.length == null ? hashBlockBits[hash.name] : Number(alg.length);
           if (!Number.isInteger(bits) || bits === 0 || bits % 8 !== 0) {
@@ -949,25 +1007,42 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
           (convertedFormat === "raw" && !RAW_SECRET_ONLY.has(name));
         const rawPublic = convertedFormat === "raw" || convertedFormat === "raw-public";
 
-        const octFromJwk = (what) => {
-          if (keyData == null || keyData.kty !== "oct" || typeof keyData.k !== "string") {
-            throw dataError(keyData != null && typeof keyData.kty === "string"
-              ? 'Invalid JWK "kty" Parameter' : "Invalid keyData");
+        // node's validateJwk for symmetric ("oct") keys.
+        // ref: node lib/internal/crypto/webcrypto_util.js validateJwk.
+        const octFromJwk = (expectedUse) => {
+          if (keyData == null || typeof keyData !== "object" ||
+              typeof keyData.kty !== "string") throw dataError("Invalid keyData");
+          if (keyData.kty !== "oct") throw dataError('Invalid JWK "kty" Parameter');
+          if (typeof keyData.k !== "string") throw dataError("Invalid keyData");
+          if (usages.length > 0 && keyData.use !== undefined && keyData.use !== expectedUse) {
+            throw dataError('Invalid JWK "use" Parameter');
+          }
+          validateKeyOps(keyData.key_ops, usages);
+          if (keyData.ext === false && extractable) {
+            throw dataError('JWK "ext" Parameter and extractable mismatch');
           }
           return unb64u(keyData.k);
+        };
+        const checkJwkAlg = (expected) => {
+          if (convertedFormat !== "jwk" || keyData.alg === undefined) return;
+          if (expected !== undefined && keyData.alg !== expected) {
+            throw dataError('JWK "alg" does not match the requested algorithm');
+          }
         };
 
         if (name === "HMAC") {
           if (!rawSecret && convertedFormat !== "jwk") throw unsupportedFormat();
           restrictUsages(usages, ["sign", "verify"], "an HMAC");
-          const hash = normalizeHash(alg.hash);
-          const raw = convertedFormat === "jwk" ? octFromJwk("HMAC") : copyBytes(keyData);
+          const hash = memberHash(alg);
+          const raw = convertedFormat === "jwk" ? octFromJwk("sig") : copyBytes(keyData);
+          checkJwkAlg(jwkAlgFor({ name: "HMAC", hash }));
           return importHmacKey(raw, hash, extractable, usages, alg.length);
         }
 
         if (name === "ChaCha20-Poly1305") {
           if (!rawSecret && convertedFormat !== "jwk") throw unsupportedFormat();
-          const raw = convertedFormat === "jwk" ? octFromJwk(name) : copyBytes(keyData);
+          const raw = convertedFormat === "jwk" ? octFromJwk("enc") : copyBytes(keyData);
+          checkJwkAlg("C20P");
           if (raw.byteLength !== 32) throw dataError("Invalid key length");
           restrictUsages(usages, allowedUsagesFor(name, "secret"), "a " + name);
           requireImportUsages(usages, "secret");
@@ -976,12 +1051,13 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
 
         if (AES_ALGS.has(name)) {
           if (!rawSecret && convertedFormat !== "jwk") throw unsupportedFormat();
-          const raw = convertedFormat === "jwk" ? octFromJwk("AES") : copyBytes(keyData);
+          const raw = convertedFormat === "jwk" ? octFromJwk("enc") : copyBytes(keyData);
           // WebCrypto ignores alg.length on raw/jwk import — key length derives
           // from the data. A bad length is a DataError here (node aes.js
           // validateKeyLength), not the OperationError generateKey raises.
           const bits = raw.byteLength * 8;
           if (bits !== 128 && bits !== 192 && bits !== 256) throw dataError("Invalid key length");
+          checkJwkAlg(jwkAlgFor({ name, length: bits }));
           restrictUsages(usages, allowedUsagesFor(name, "secret"), "an AES");
           requireImportUsages(usages, "secret");
           return makeKey("secret", { name, length: bits }, extractable, usages, { secret: raw });
@@ -1015,11 +1091,7 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
           if (OKP_ALGS.has(name) && keyData.crv !== name) {
             throw dataError('JWK "crv" Parameter and algorithm name mismatch');
           }
-          if (Array.isArray(keyData.key_ops)) {
-            for (const u of usages) {
-              if (!keyData.key_ops.includes(u)) throw dataError('Invalid JWK "key_ops" Parameter');
-            }
-          }
+          validateKeyOps(keyData.key_ops, usages);
           if (keyData.ext === false && extractable) {
             throw dataError('JWK "ext" Parameter and extractable mismatch');
           }
@@ -1063,7 +1135,7 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
           }
           keyAlgorithm.modulusLength = info.modulusLength;
           keyAlgorithm.publicExponent = new Uint8Array([0x01, 0x00, 0x01]);
-          keyAlgorithm.hash = freeze({ name: normalizeHash(alg.hash).name });
+          keyAlgorithm.hash = freeze({ name: memberHash(alg).name });
         } else if (EC_ALGS.has(name)) {
           keyAlgorithm.namedCurve = info.namedCurve;
         }
@@ -1189,7 +1261,7 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
         if (AES_ALGS.has(derived.name)) bits = requireAesLength(derived.length);
         else if (derived.name === "ChaCha20-Poly1305") bits = 256;
         else if (derived.name === "HMAC") {
-          const hash = normalizeHash(derived.hash);
+          const hash = memberHash(derived);
           bits = derived.length == null ? hashBlockBits[hash.name] : Number(derived.length);
         } else if (derived.name === "HKDF" || derived.name === "PBKDF2") {
           bits = null;   // length-less key material types consume the whole secret
