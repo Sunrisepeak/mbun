@@ -515,12 +515,18 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_cipher_host,
     const EVP_CIPHER* c{EVP_get_cipherbyname(algo.c_str())};
     if (c == nullptr) { return hasher_throw(global, "Unknown cipher: " + algo); }
     const int mode{EVP_CIPHER_mode(c)};
+    // AEAD ciphers: a variable-length IV, associated data, and an authentication
+    // tag on top of the ciphertext. Enumerated explicitly rather than via
+    // EVP_CIPH_FLAG_AEAD_CIPHER, which OpenSSL also sets on the stitched
+    // aes-*-cbc-hmac-sha* ciphers (which are NOT tag-producing here).
+    const bool ocb{mode == EVP_CIPH_OCB_MODE};
     const bool gcm{mode == EVP_CIPH_GCM_MODE};
+    const bool aead{gcm || ocb || EVP_CIPHER_nid(c) == NID_chacha20_poly1305};
     // Key-length validation (node throws for a wrong-sized key/iv).
     if (key.size() != static_cast<std::size_t>(EVP_CIPHER_key_length(c))) {
         return hasher_throw(global, "Invalid key length");
     }
-    if (gcm) {
+    if (aead) {
         if (iv.empty()) { return hasher_throw(global, "Invalid IV length"); }
     } else if (mode == EVP_CIPH_ECB_MODE) {
         if (!iv.empty()) { return hasher_throw(global, "Invalid IV length"); }
@@ -532,20 +538,30 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_cipher_host,
     if (EVP_CipherInit_ex(cc.get(), c, nullptr, nullptr, nullptr, enc ? 1 : 0) <= 0) {
         return hasher_throw(global, "cipher init failed");
     }
-    if (gcm) {
+    if (aead) {
         EVP_CIPHER_CTX_ctrl(cc.get(), EVP_CTRL_AEAD_SET_IVLEN, static_cast<int>(iv.size()), nullptr);
+    }
+    // OCB is the one AEAD whose tag length must be fixed BEFORE the key is
+    // installed (EVP_EncryptInit_ex derives the L table from it).
+    if (ocb) {
+        if (enc) {
+            EVP_CIPHER_CTX_ctrl(cc.get(), EVP_CTRL_AEAD_SET_TAG, tagLen, nullptr);
+        } else if (!tagIn.empty()) {
+            EVP_CIPHER_CTX_ctrl(cc.get(), EVP_CTRL_AEAD_SET_TAG, static_cast<int>(tagIn.size()),
+                                tagIn.data());
+        }
     }
     if (EVP_CipherInit_ex(cc.get(), nullptr, nullptr, key.data(), iv.empty() ? nullptr : iv.data(),
                           enc ? 1 : 0) <= 0) {
         return hasher_throw(global, "cipher key/iv setup failed");
     }
-    if (!enc && gcm && !tagIn.empty()) {
+    if (!enc && aead && !ocb && !tagIn.empty()) {
         EVP_CIPHER_CTX_ctrl(cc.get(), EVP_CTRL_AEAD_SET_TAG, static_cast<int>(tagIn.size()),
                             tagIn.data());
     }
     if (noPad) { EVP_CIPHER_CTX_set_padding(cc.get(), 0); }
     int tmp{0};
-    if (gcm && !aad.empty()) {
+    if (aead && !aad.empty()) {
         EVP_CipherUpdate(cc.get(), nullptr, &tmp, aad.data(), static_cast<int>(aad.size()));
     }
     std::vector<std::uint8_t> out(data.size() + static_cast<std::size_t>(EVP_CIPHER_block_size(c)));
@@ -559,14 +575,14 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_cipher_host,
         // GCM/AEAD decrypt failure is an authentication failure (node's fixed
         // message); block-cipher failures surface the real OpenSSL error so the
         // JS layer can recover code/library/reason (e.g. WRONG_FINAL_BLOCK_LENGTH).
-        if (!enc && gcm) { return hasher_throw(global, "Unsupported state or unable to authenticate data"); }
+        if (!enc && aead) { return hasher_throw(global, "Unsupported state or unable to authenticate data"); }
         return hasher_throw(global, asym_ossl_err());
     }
     out.resize(static_cast<std::size_t>(outl + finl));
 
     JSObjectRef obj{JSObjectMake(ctx, nullptr, nullptr)};
     set_prop(ctx, obj, "data", static_cast<JSValueRef>(asym_u8(ctx, out)));
-    if (enc && gcm) {
+    if (enc && aead) {
         std::vector<std::uint8_t> tag(static_cast<std::size_t>(tagLen));
         EVP_CIPHER_CTX_ctrl(cc.get(), EVP_CTRL_AEAD_GET_TAG, tagLen, tag.data());
         set_prop(ctx, obj, "tag", static_cast<JSValueRef>(asym_u8(ctx, tag)));
