@@ -111,7 +111,15 @@ export constexpr std::string_view kNetJS = R"JS(
       let progress = 0;
       for (const it of Array.from(NET.items)) {
         try { progress += it._poll() | 0; }
-        catch (e) { NET.items.delete(it); try { if (it._fail) it._fail(e); } catch (e2) {} }
+        catch (e) {
+          // A poll is a node callback boundary: the native reads below already
+          // catch their own errors and route them to _fail, so what escapes here
+          // is a user listener throwing — node's 'uncaughtException', not a
+          // socket error. Only a bounded in-flight op (fetch) keeps the legacy
+          // rejection path, where the throw belongs to the operation.
+          if (it._pendingOp && it._fail) { NET.items.delete(it); try { it._fail(e); } catch (e2) {} }
+          else if (!(G.__mbun_uncaught && G.__mbun_uncaught(e))) { NET.items.delete(it); NET.release(it); }
+        }
       }
       total += progress;
       if (!progress) break;

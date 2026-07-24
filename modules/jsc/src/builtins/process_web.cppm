@@ -1161,7 +1161,14 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       if (mi === -1) break;  // nothing due yet — real time gates firing
       const t = T.q[mi]; T.now = now;
       if (t.iv > 0) t.at = now + t.iv; else T.q.splice(mi, 1);
-      try { t.fn.apply(null, t.a); } catch (e) {}
+      // node: an exception escaping a timer callback is an uncaught exception
+      // (libuv's callback boundary), not something to drop. Swallowing it here
+      // left the throwing test's sockets/servers registered, so the loop never
+      // drained and the file hung to its harness timeout instead of failing.
+      try { t.fn.apply(null, t.a); }
+      catch (e) {
+        if (G.__mbun_uncaught && !G.__mbun_uncaught(e)) { fired++; T.fired++; break; }
+      }
       fired++; T.fired++;
     }
     const now2 = Date.now();
