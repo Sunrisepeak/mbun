@@ -357,6 +357,14 @@ inline constexpr std::string_view kZlibStreamJS = R"JS(
         !ArrayBuffer.isView(chunk) && !(chunk instanceof ArrayBuffer)) {
       throw errType("chunk", "of type string or an instance of Buffer, TypedArray, DataView, or ArrayBuffer", chunk);
     }
+    // A destroyed stream (close() destroys, per node's ZlibBase.close) reports
+    // ERR_STREAM_DESTROYED to the write callback instead of silently succeeding.
+    if (this.destroyed) {
+      const de = new Error("Cannot call write after a stream was destroyed");
+      de.code = "ERR_STREAM_DESTROYED";
+      if (typeof cb === "function") G.queueMicrotask(function () { cb(de); });
+      return false;
+    }
     if (this._writableEnded) { if (typeof cb === "function") G.queueMicrotask(cb); return false; }
     const self = this;
     // The write completion callback fires asynchronously, matching node/bun's
@@ -422,9 +430,17 @@ inline constexpr std::string_view kZlibStreamJS = R"JS(
     return this;
   };
 
+  // node lib/zlib.js ZlibBase.close: `finished(this, callback)` then destroy() —
+  // closing a codec stream destroys it, so a later write() is ERR_STREAM_DESTROYED
+  // rather than a silent no-op.
   proto.close = function (cb) {
     if (this._h >= 0) { ZN.streamClose(this._h); this._h = -1; }
-    if (typeof cb === "function") G.queueMicrotask(cb);
+    this._zEnded = true;
+    if (typeof cb === "function") {
+      if (this.destroyed) G.queueMicrotask(cb);
+      else this.once("close", cb);
+    }
+    this.destroy();
     return this;
   };
 
