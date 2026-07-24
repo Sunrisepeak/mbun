@@ -3527,6 +3527,12 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     return x && x.toString ? x.toString() : String(x);
   };
   const recur = (o) => !!(o && (o === true || o.recursive));
+  // fd → path registry. mbun's descriptors are virtual (no procfs mapping), so
+  // fchmod/fchown/futimes — which take an fd but must touch the underlying inode
+  // — recover the path opened for that fd. Populated by open/openSync/promises.open.
+  const fdPathMap = new Map();
+  const fdRemember = (fd, p) => { if (typeof fd === "number") fdPathMap.set(fd, toStr(p)); return fd; };
+  const fdForget = (fd) => { fdPathMap.delete(fd); };
   // ---- node fs argument validators (ref lib/internal/fs/utils.js + validators.js) ----
   // Received-tail mirrors node determineSpecificType / common.invalidArgTypeHelper so the
   // fs corpus's { code, name, message } matchers (now enforced by the strict assert.throws)
@@ -3544,6 +3550,9 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     return "type " + typeof v + " (" + ins + ")";
   };
   const fsArgTypeErr = (name, expected, value) => { const e = new TypeError('The "' + name + '" argument must be ' + expected + ". Received " + fsSpecType(value)); e.code = "ERR_INVALID_ARG_TYPE"; return e; };
+  // node getValidatedPath rejects a path containing a NUL byte with
+  // ERR_INVALID_ARG_VALUE (a TypeError). ref lib/internal/fs/utils.js.
+  const fsNullErr = (name, value) => { const e = new TypeError("The argument '" + (name || "path") + "' must be a string, Buffer, or URL without null bytes. Received " + fsSpecType(value)); e.code = "ERR_INVALID_ARG_VALUE"; return e; };
   const fsRangeErr = (name, range, value) => { const e = new RangeError('The value of "' + name + '" is out of range. It must be ' + range + ". Received " + (typeof value === "bigint" ? String(value) + "n" : String(value))); e.code = "ERR_OUT_OF_RANGE"; return e; };
   const fsValidateInteger = (value, name, min, max) => {
     if (typeof value !== "number") throw fsArgTypeErr(name, "of type number", value);
@@ -3554,6 +3563,9 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   const fsValidateFd = (fd, name) => fsValidateInteger(fd, name || "fd", 0, 2147483647);
   const fsMakeCallback = (cb) => { if (typeof cb !== "function") throw fsArgTypeErr("cb", "of type function", cb); return cb; };
   const fsValidateBuffer = (b) => { if (!ArrayBuffer.isView(b)) throw fsArgTypeErr("buffer", "an instance of Buffer, TypedArray, or DataView", b); return b; };
+  // node write/appendFile data: string or ArrayBufferView (Buffer/TypedArray/
+  // DataView) / ArrayBuffer only. Anything else → ERR_INVALID_ARG_TYPE "data".
+  const fsValidateData = (d, name) => { if (typeof d !== "string" && !ArrayBuffer.isView(d) && !(d instanceof ArrayBuffer)) throw fsArgTypeErr(name || "data", "of type string or an instance of Buffer, TypedArray, or DataView", d); };
   const fsValidatePosition = (position, name) => {
     if (typeof position === "number") fsValidateInteger(position, name, -1, 0x1fffffffffffff);
     else if (typeof position === "bigint") { if (position < -(2n ** 63n) || position > 2n ** 63n - 1n) throw fsRangeErr(name, ">= -(2n ** 63n) && <= 2n ** 63n - 1n", position); }
@@ -3568,14 +3580,26 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   // Anything else throws TypeError ERR_INVALID_ARG_TYPE *synchronously* (even
   // for the async fs.mkdir form). ref: lib/internal/fs/utils.js.
   const validatePath = (p, name) => {
-    if (typeof p === "string") return;
-    if (p && typeof p === "object") {
-      if (ArrayBuffer.isView(p) || p instanceof ArrayBuffer) return; // Buffer
-      if (p.href !== undefined && p.protocol === "file:" && typeof p.pathname === "string") return; // URL
-      // A String object / subclass (e.g. bun's DisposableString from tempDir())
-      // is a valid path — node's getValidatedPath coerces it. String.prototype
-      // .valueOf brand-checks the internal slot without invoking a user valueOf.
-      try { String.prototype.valueOf.call(p); return; } catch (e) {}
+    let str = null;
+    if (typeof p === "string") str = p;
+    else if (p && typeof p === "object") {
+      if (ArrayBuffer.isView(p) || p instanceof ArrayBuffer) { // Buffer / TypedArray
+        const u = ArrayBuffer.isView(p) ? new Uint8Array(p.buffer, p.byteOffset, p.byteLength) : new Uint8Array(p);
+        for (let i = 0; i < u.length; ++i) if (u[i] === 0) throw fsNullErr(name, p);
+        return;
+      }
+      if (p.href !== undefined && p.protocol === "file:" && typeof p.pathname === "string") { // URL
+        try { str = decodeURIComponent(p.pathname); } catch (e) { str = p.pathname; }
+      } else {
+        // A String object / subclass (e.g. bun's DisposableString from tempDir())
+        // is a valid path — node's getValidatedPath coerces it. String.prototype
+        // .valueOf brand-checks the internal slot without invoking a user valueOf.
+        try { String.prototype.valueOf.call(p); str = String(p); } catch (e) {}
+      }
+    }
+    if (str !== null) {
+      if (str.indexOf(String.fromCharCode(0)) !== -1) throw fsNullErr(name, p);
+      return;
     }
     throw fsArgTypeErr(name || "path", "of type string or an instance of Buffer or URL", p);
   };
@@ -3585,6 +3609,9 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   const mkdirOpts = (o) => {
     let recursive = false, mode = 0o777;
     if (typeof o === "number") mode = o;
+    // node accepts an octal-string mode as the positional arg (kernel masks the
+    // high bits, e.g. "10644" → 0o644). ref test-fs-mkdir-mode-mask.
+    else if (typeof o === "string") mode = parseInt(o, 8);
     else if (o === true) recursive = true;
     else if (o && typeof o === "object") {
       if ("recursive" in o && o.recursive !== undefined) {
@@ -3677,6 +3704,15 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   const fsOomError = (path2) =>
     Object.assign(new Error("ENOMEM: not enough memory, read '" + path2 + "'"),
                   { code: "ENOMEM", errno: -12, syscall: "read", path: path2 });
+  // node readdir honors options.encoding: 'buffer' yields Buffer entries, any
+  // other non-utf8 encoding yields the names re-encoded (e.g. 'hex'). ref
+  // lib/fs.js readdir + test-fs-buffer.
+  const fsReaddirEncode = (names, o) => {
+    const enc = typeof o === "string" ? o : (o && o.encoding);
+    if (!enc || enc === "utf8" || enc === "utf-8") return names;
+    if (enc === "buffer") return names.map((n) => Buffer.from(n, "utf8"));
+    return names.map((n) => Buffer.from(n, "utf8").toString(enc));
+  };
   const fsMod = {
     // node fs.readFileSync: no encoding → Buffer (was wrongly a String).
     // Reads real bytes via the native fd path (binary-correct; F.readFile
@@ -3731,9 +3767,19 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       F.writeFile(toStr(p), toStr(d));
       if (mode != null) { try { F.chmod(toStr(p), mode); } catch (e) {} }
     },
-    appendFileSync: (p, d) => F.appendFile(toStr(p), toStr(d)),
+    appendFileSync: (p, d, o) => {
+      fsValidateData(d); fsValidateEncoding(o);
+      if (typeof p === "number") {
+        const FD = globalThis.__mbunFdNative;
+        const enc = typeof o === "string" ? o : (o && o.encoding) || "utf8";
+        const b = typeof d === "string" ? Buffer.from(d, enc) : Buffer.from(d);
+        FD.write(p, new Uint8Array(b.buffer, b.byteOffset, b.byteLength), 0, b.byteLength, -1);
+        return;
+      }
+      return F.appendFile(toStr(p), toStr(d));
+    },
     existsSync: (p) => F.exists(toStr(p)),
-    mkdirSync: (p, o) => { validatePath(p); const [rec, mode] = mkdirOpts(o); return F.mkdir(toStr(p), rec, mode); },
+    mkdirSync: (p, o) => { validatePath(p); const [rec, mode] = mkdirOpts(o); try { return F.mkdir(toStr(p), rec, mode); } catch (e) { e.path = toStr(p); throw e; } },
     rmSync: (p, o) => F.rm(toStr(p), recur(o), !!(o && o.force)),
     rmdirSync: (p, o) => F.rm(toStr(p), recur(o), true),
     readdirSync: (p, o) => {
@@ -3741,7 +3787,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       const wft = !!(o && typeof o === "object" && o.withFileTypes);
       if (o && typeof o === "object" && o.recursive) {
         const r = F.readdirRecursive(p);
-        if (!wft) return r.names;
+        if (!wft) return fsReaddirEncode(r.names, o);
         return r.names.map((rel, i) => {
           const slash = rel.lastIndexOf("/");
           const name = slash < 0 ? rel : rel.slice(slash + 1);
@@ -3750,7 +3796,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
         });
       }
       const names = F.readdir(p);
-      if (!wft) return names;
+      if (!wft) return fsReaddirEncode(names, o);
       return names.map((n) => { let t = 1; try { t = F.stat(p + "/" + n)._isDir ? 2 : 1; } catch (e) { t = 3; } return new fsMod.Dirent(n, t, p); });
     },
     // native stat builds a plain object; link it to fs.Stats.prototype so
@@ -3766,11 +3812,12 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     realpathSync: (p) => F.realpath(toStr(p)),
     renameSync: (a, b) => F.rename(toStr(a), toStr(b)),
     copyFileSync: (a, b) => F.copyFile(toStr(a), toStr(b)),
-    mkdtempSync: (pre) => F.mkdtemp(toStr(pre)),
+    mkdtempSync: (pre, o) => { validatePath(pre, "prefix"); fsValidateEncoding(o); return F.mkdtemp(toStr(pre)); },
+    mkdtemp: (pre, o, cb) => { validatePath(pre, "prefix"); const fn = typeof o === "function" ? o : cb; if (typeof fn !== "function") throw fsArgTypeErr("callback", "of type function", fn); fsValidateEncoding(typeof o === "object" || typeof o === "string" ? o : undefined); G.queueMicrotask(() => { try { fn(null, F.mkdtemp(toStr(pre))); } catch (e) { fn(e); } }); },
     // fd-level I/O: real descriptors over mbun.core.io (native pread/pwrite),
     // zero-copy typed-array boundary via __mbunFdNative.
-    openSync: (p, flags, mode) => globalThis.__mbunFdNative.open(toStr(p), flags == null ? "r" : toStr(flags), typeof mode === "number" ? mode : 0o666),
-    closeSync: (fd) => { globalThis.__mbunFdNative.close(fd); },
+    openSync: (p, flags, mode) => { validatePath(p); const md = mode == null ? 0o666 : fsParseFileMode(mode, "mode", 0o666); return fdRemember(globalThis.__mbunFdNative.open(toStr(p), flags == null ? "r" : toStr(flags), md), p); },
+    closeSync: (fd) => { fsValidateFd(fd); globalThis.__mbunFdNative.close(fd); fdForget(fd); },
     readSync: (fd, buf, off, len, pos) => {
       if (off !== null && typeof off === "object") { const o = off; off = o.offset || 0; len = o.length; pos = o.position; }
       return globalThis.__mbunFdNative.read(fd, buf, off || 0, len == null ? buf.byteLength : len, pos == null ? -1 : Number(pos));
@@ -3784,7 +3831,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     write: (fd, buf, off, len, pos, cb) => { let fn; const a = [off, len, pos, cb]; for (const x of a) if (typeof x === "function") { fn = x; break; } try { const n = fsMod.writeSync(fd, buf, typeof off === "function" ? undefined : off, typeof len === "function" ? undefined : len, typeof pos === "function" ? undefined : pos); if (fn) fn(null, n, buf); } catch (e) { if (fn) fn(e); } },
     // permission/owner/time metadata: no-ops (our fs has no perm model); access
     // checks existence; readlink resolves via realpath (we have no real symlinks).
-    chmodSync: (p, m) => F.chmod(toStr(p), typeof m === "string" ? parseInt(m, 8) : (Number(m) & 0o7777)), fchmodSync: () => {}, lchmodSync: () => {},
+    chmodSync: (p, m) => { validatePath(p); return F.chmod(toStr(p), typeof m === "string" ? parseInt(m, 8) : (Number(m) & 0o7777)); }, fchmodSync: () => {}, lchmodSync: () => {},
     chownSync: () => {}, fchownSync: () => {}, lchownSync: () => {},
     utimesSync: (p, a, m) => { const s = (v) => v instanceof Date ? v.getTime() / 1000 : Number(v); F.utimes(toStr(p), s(a), s(m)); }, futimesSync: () => {}, lutimesSync: () => {},
     truncateSync: () => {}, ftruncateSync: () => {},
@@ -3793,9 +3840,9 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     readlink: (p, o, cb) => { const fn = cb || o; try { fn(null, F.readlink(toStr(p))); } catch (e) { fn(e); } },
     // file streams: our fs I/O is synchronous, so read pushes the whole content on
     // a microtask and write accumulates then flushes on end/close.
-    createReadStream: (p, opts) => { const rs = new Readable(); rs.path = toStr(p); rs.bytesRead = 0; const enc = typeof opts === "string" ? opts : (opts && opts.encoding); G.queueMicrotask(() => { try { const data = F.readFile(toStr(p)); rs.emit("open", 3); rs.emit("ready"); const buf = Buffer.from(data); rs.bytesRead = buf.length; rs.push(enc ? buf.toString(enc) : buf); rs.push(null); rs.emit("close"); } catch (e) { e.code = e.code || "ENOENT"; rs.emit("error", e); } }); rs.close = (cb) => { if (cb) cb(); return rs; }; return rs; },
-    createWriteStream: (p, opts) => { const ws = new Writable(); ws.path = toStr(p); ws.bytesWritten = 0; const parts = []; const enc = (opts && opts.encoding) || "utf8"; ws._write = (chunk, e, cb) => { const s = typeof chunk === "string" ? chunk : Buffer.from(chunk).toString(enc); parts.push(s); ws.bytesWritten += s.length; if (typeof (cb || e) === "function") (cb || e)(); }; const flush = () => { try { F.writeFile(toStr(p), parts.join("")); } catch (er) { ws.emit("error", er); } }; const superEnd = ws.end.bind(ws); ws.end = (chunk, e, cb) => { if (chunk != null && typeof chunk !== "function") ws._write(chunk, enc, null); flush(); G.queueMicrotask(() => { ws.emit("finish"); ws.emit("close"); }); const f = cb || (typeof e === "function" ? e : typeof chunk === "function" ? chunk : null); if (f) f(); return ws; }; ws.close = (cb) => { if (cb) cb(); return ws; }; G.queueMicrotask(() => { ws.emit("open", 3); ws.emit("ready"); }); return ws; },
-    chmod: (p, m, cb) => { const fn = typeof m === "function" ? m : cb; try { if (typeof m !== "function") F.chmod(toStr(p), typeof m === "string" ? parseInt(m, 8) : (Number(m) & 0o7777)); if (typeof fn === "function") fn(null); } catch (e) { if (typeof fn === "function") fn(e); } },
+    createReadStream: (p, opts) => { const rs = new Readable(); rs.path = toStr(p); rs.bytesRead = 0; const enc = typeof opts === "string" ? opts : (opts && opts.encoding); const start = (opts && typeof opts === "object") ? opts.start : undefined; const end = (opts && typeof opts === "object") ? opts.end : undefined; if (start !== undefined && typeof start !== "number") throw fsArgTypeErr("start", "of type number", start); if (end !== undefined && typeof end !== "number") throw fsArgTypeErr("end", "of type number", end); G.queueMicrotask(() => { try { const data = F.readFile(toStr(p)); rs.emit("open", 3); rs.emit("ready"); let buf = Buffer.from(data); if (typeof start === "number" || typeof end === "number") { const s = typeof start === "number" ? start : 0; const e2 = typeof end === "number" ? end + 1 : buf.length; buf = buf.subarray(s, e2); } rs.bytesRead = buf.length; rs.push(enc ? buf.toString(enc) : buf); rs.push(null); rs.emit("close"); } catch (e) { e.code = e.code || "ENOENT"; rs.emit("error", e); } }); rs.close = (cb) => { if (cb) cb(); return rs; }; return rs; },
+    createWriteStream: (p, opts) => { const wstart = (opts && typeof opts === "object") ? opts.start : undefined; if (wstart !== undefined && typeof wstart !== "number") throw fsArgTypeErr("start", "of type number", wstart); const ws = new Writable(); ws.path = toStr(p); ws.bytesWritten = 0; const parts = []; const enc = (opts && opts.encoding) || "utf8"; ws._write = (chunk, e, cb) => { const s = typeof chunk === "string" ? chunk : Buffer.from(chunk).toString(enc); parts.push(s); ws.bytesWritten += s.length; if (typeof (cb || e) === "function") (cb || e)(); }; const flush = () => { try { F.writeFile(toStr(p), parts.join("")); } catch (er) { ws.emit("error", er); } }; const superEnd = ws.end.bind(ws); ws.end = (chunk, e, cb) => { if (chunk != null && typeof chunk !== "function") ws._write(chunk, enc, null); flush(); G.queueMicrotask(() => { ws.emit("finish"); ws.emit("close"); }); const f = cb || (typeof e === "function" ? e : typeof chunk === "function" ? chunk : null); if (f) f(); return ws; }; ws.close = (cb) => { if (cb) cb(); return ws; }; G.queueMicrotask(() => { ws.emit("open", 3); ws.emit("ready"); }); return ws; },
+    chmod: (p, m, cb) => { validatePath(p); const fn = typeof m === "function" ? m : cb; try { if (typeof m !== "function") F.chmod(toStr(p), typeof m === "string" ? parseInt(m, 8) : (Number(m) & 0o7777)); if (typeof fn === "function") fn(null); } catch (e) { if (typeof fn === "function") fn(e); } },
     chown: (p, u, g, cb) => { const fn = cb || g; if (typeof fn === "function") fn(null); },
     utimes: (p, a, m, cb) => { const fn = cb || m; try { const s = (v) => v instanceof Date ? v.getTime() / 1000 : Number(v); F.utimes(toStr(p), s(a), s(m)); if (typeof fn === "function") fn(null); } catch (e) { if (typeof fn === "function") fn(e); } },
     access: (p, m, cb) => { const fn = cb || m; try { if (!F.exists(toStr(p))) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" }); fn(null); } catch (e) { fn(e); } },
@@ -3856,24 +3903,64 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     glob: (pat, o, cb) => { const fn = typeof o === "function" ? o : cb; if (typeof fn !== "function") throw new TypeError("The \"callback\" argument must be of type function."); try { fn(null, fsMod.globSync(pat, typeof o === "object" ? o : undefined)); } catch (e) { fn(e); } },
     readFile: (p, a, b) => { const cb = b || a; try { cb(null, F.readFile(toStr(p))); } catch (e) { cb(e); } },
     writeFile: (p, d, a, b) => { const cb = b || a; try { F.writeFile(toStr(p), toStr(d)); cb(null); } catch (e) { cb(e); } },
-    mkdir: (p, a, b) => { validatePath(p); const cb = b || a; const [rec, mode] = mkdirOpts(typeof a === "object" || typeof a === "number" ? a : null); try { const __r = F.mkdir(toStr(p), rec, mode); cb(null, __r); } catch (e) { cb(e); } },
+    mkdir: (p, a, b) => { validatePath(p); const cb = b || a; const [rec, mode] = mkdirOpts(typeof a === "object" || typeof a === "number" || typeof a === "string" ? a : null); try { const __r = F.mkdir(toStr(p), rec, mode); cb(null, __r); } catch (e) { e.path = toStr(p); cb(e); } },
     // callback-style async (node passes (err, result); mirror the *Sync impls).
     stat: (p, a, b) => { const cb = typeof a === "function" ? a : b; try { cb(null, fsMod.statSync(toStr(p))); } catch (e) { cb(e); } },
     lstat: (p, a, b) => { const cb = typeof a === "function" ? a : b; try { cb(null, fsMod.lstatSync(toStr(p))); } catch (e) { cb(e); } },
-    readdir: (p, a, b) => { const cb = typeof a === "function" ? a : b; try { cb(null, F.readdir(toStr(p))); } catch (e) { cb(e); } },
+    readdir: (p, a, b) => { const cb = typeof a === "function" ? a : b; const o = (typeof a === "object" || typeof a === "string") ? a : undefined; try { cb(null, fsMod.readdirSync(p, o)); } catch (e) { cb(e); } },
     unlink: (p, cb) => { try { F.unlink(toStr(p)); cb && cb(null); } catch (e) { cb && cb(e); } },
     realpath: (p, a, b) => { const cb = typeof a === "function" ? a : b; try { cb(null, F.realpath(toStr(p))); } catch (e) { cb(e); } },
     rename: (a2, b2, cb) => { try { F.rename(toStr(a2), toStr(b2)); cb && cb(null); } catch (e) { cb && cb(e); } },
     copyFile: (a2, b2, m, cb) => { const fn = typeof m === "function" ? m : cb; try { F.copyFile(toStr(a2), toStr(b2)); fn && fn(null); } catch (e) { fn && fn(e); } },
-    appendFile: (p, d, a, b) => { const cb = typeof a === "function" ? a : b; try { F.appendFile(toStr(p), toStr(d)); cb && cb(null); } catch (e) { cb && cb(e); } },
+    appendFile: (p, d, a, b) => {
+      fsValidateData(d);
+      const o = (typeof a === "object" || typeof a === "string") ? a : undefined;
+      fsValidateEncoding(o);
+      const cb = typeof a === "function" ? a : b;
+      try {
+        if (typeof p === "number") {
+          const FD = globalThis.__mbunFdNative;
+          const enc = typeof o === "string" ? o : (o && o.encoding) || "utf8";
+          const bb = typeof d === "string" ? Buffer.from(d, enc) : Buffer.from(d);
+          FD.write(p, new Uint8Array(bb.buffer, bb.byteOffset, bb.byteLength), 0, bb.byteLength, -1);
+        } else { F.appendFile(toStr(p), toStr(d)); }
+        cb && cb(null);
+      } catch (e) { cb && cb(e); }
+    },
     rm: (p, a, b) => { const cb = typeof a === "function" ? a : b; const o = typeof a === "object" ? a : undefined; try { F.rm(toStr(p), recur(o), !!(o && o.force)); cb && cb(null); } catch (e) { cb && cb(e); } },
     rmdir: (p, a, b) => { const cb = typeof a === "function" ? a : b; try { F.rm(toStr(p), recur(typeof a === "object" ? a : null), true); cb && cb(null); } catch (e) { cb && cb(e); } },
     exists: (p, cb) => { try { cb && cb(F.exists(toStr(p))); } catch (e) { cb && cb(false); } },
     truncate: (p, a, b) => { const cb = typeof a === "function" ? a : b; if (typeof cb === "function") cb(null); },
     ftruncate: (fd, a, b) => { const cb = typeof a === "function" ? a : b; if (typeof cb === "function") cb(null); },
-    open: (p, a, b, c) => { const args = [a, b, c]; const cb = args.reverse().find((x) => typeof x === "function"); try { const fd = globalThis.__mbunFdNative.open(toStr(p), typeof a === "string" ? a : "r", typeof b === "number" ? b : 0o666); cb && cb(null, fd); } catch (e) { cb && cb(e); } },
-    close: (fd, cb) => { try { globalThis.__mbunFdNative.close(fd); cb && cb(null); } catch (e) { cb && cb(e); } },
-    constants: { F_OK: 0, R_OK: 4, W_OK: 2, X_OK: 1, O_RDONLY: 0, O_WRONLY: 1, O_RDWR: 2, O_CREAT: 64, O_TRUNC: 512,
+    // node fs.open(path[, flags[, mode]], callback): validate path + mode + the
+    // callback synchronously (ERR_INVALID_ARG_TYPE / ERR_INVALID_ARG_VALUE)
+    // before the async work. ref lib/fs.js open + test-fs-open.
+    open: (p, flags, mode, cb) => {
+      validatePath(p);
+      let callback = cb, m = mode, fl = flags;
+      if (typeof fl === "function") { callback = fl; fl = "r"; m = undefined; }
+      else if (typeof m === "function") { callback = m; m = undefined; }
+      if (typeof callback !== "function") throw fsArgTypeErr("cb", "of type function", callback);
+      if (fl == null) fl = "r";
+      const md = m == null ? 0o666 : fsParseFileMode(m, "mode", 0o666);
+      try { const fd = fdRemember(globalThis.__mbunFdNative.open(toStr(p), typeof fl === "number" ? fl : toStr(fl), md), p); callback(null, fd); } catch (e) { callback(e); }
+    },
+    close: (fd, cb) => { fsValidateFd(fd); if (cb !== undefined && typeof cb !== "function") throw fsArgTypeErr("callback", "of type function", cb); try { globalThis.__mbunFdNative.close(fd); fdForget(fd); cb && cb(null); } catch (e) { cb && cb(e); } },
+    // node fs.constants: a null-prototype object whose keys are drawn from the
+    // libuv/POSIX constant set (ref: lib/fs.js constants, test-fs-constants).
+    // Every name below is in node's known-constants allowlist.
+    constants: { __proto__: null,
+      F_OK: 0, R_OK: 4, W_OK: 2, X_OK: 1,
+      O_RDONLY: 0, O_WRONLY: 1, O_RDWR: 2, O_CREAT: 0o100, O_EXCL: 0o200, O_NOCTTY: 0o400,
+      O_TRUNC: 0o1000, O_APPEND: 0o2000, O_NONBLOCK: 0o4000, O_DSYNC: 0o10000,
+      O_DIRECTORY: 0o200000, O_NOFOLLOW: 0o400000, O_SYNC: 0o4010000, O_NOATIME: 0o1000000,
+      S_IFMT: 0o170000, S_IFREG: 0o100000, S_IFDIR: 0o040000, S_IFCHR: 0o020000,
+      S_IFBLK: 0o060000, S_IFIFO: 0o010000, S_IFLNK: 0o120000, S_IFSOCK: 0o140000,
+      S_IRWXU: 0o700, S_IRUSR: 0o400, S_IWUSR: 0o200, S_IXUSR: 0o100,
+      S_IRWXG: 0o070, S_IRGRP: 0o040, S_IWGRP: 0o020, S_IXGRP: 0o010,
+      S_IRWXO: 0o007, S_IROTH: 0o004, S_IWOTH: 0o002, S_IXOTH: 0o001,
+      COPYFILE_EXCL: 1, COPYFILE_FICLONE: 2, COPYFILE_FICLONE_FORCE: 4,
+      UV_FS_COPYFILE_EXCL: 1, UV_FS_COPYFILE_FICLONE: 2, UV_FS_COPYFILE_FICLONE_FORCE: 4,
       UV_DIRENT_UNKNOWN: 0, UV_DIRENT_FILE: 1, UV_DIRENT_DIR: 2, UV_DIRENT_LINK: 3, UV_DIRENT_FIFO: 4, UV_DIRENT_SOCKET: 5, UV_DIRENT_CHAR: 6, UV_DIRENT_BLOCK: 7 },
   };
   fsMod.realpathSync.native = fsMod.realpathSync;
@@ -3936,6 +4023,15 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   // synchronous TypeError. Symbol.dispose / asyncDispose compose with `using`.
   const VALID_ENCODINGS = { utf8: 1, "utf-8": 1, ascii: 1, latin1: 1, binary: 1, ucs2: 1, "ucs-2": 1,
     utf16le: 1, "utf-16le": 1, base64: 1, base64url: 1, hex: 1, buffer: 1 };
+  // node getOptions/getEncoding: a string option is the encoding, an object's
+  // .encoding is the encoding; an unknown encoding throws ERR_INVALID_ARG_VALUE
+  // (a TypeError). ref lib/internal/fs/utils.js, test-fs-assert-encoding-error.
+  const fsValidateEncoding = (opts) => {
+    if (opts == null) return;
+    const enc = typeof opts === "string" ? opts : (typeof opts === "object" ? opts.encoding : undefined);
+    if (enc == null) return;
+    if (!VALID_ENCODINGS[String(enc).toLowerCase()]) { const e = new TypeError("The argument 'encoding' is invalid. Received " + (typeof enc === "string" ? "'" + enc + "'" : String(enc))); e.code = "ERR_INVALID_ARG_VALUE"; throw e; }
+  };
   const cbTypeError = () => { const e = new TypeError('The "callback" argument must be of type function.'); e.code = "ERR_INVALID_ARG_TYPE"; throw e; };
   class Dir {
     constructor(path, entries, encoding) { this._path = path; this._entries = entries; this._i = 0; this._closed = false; this._encoding = encoding || "utf8"; }
@@ -3993,8 +4089,8 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   // mbun has no fd->path map or permission model the syscall stays a no-op AFTER validation.
   const fsIntU32 = (v, name) => fsValidateInteger(v, name, -1, 4294967295);
   const fsAsyncOk = (fn) => { const cb = fsMakeCallback(fn); G.queueMicrotask(() => cb(null)); };
-  fsMod.fchmodSync = (fd, mode) => { fsValidateFd(fd); fsParseFileMode(mode, "mode"); };
-  fsMod.fchmod = (fd, mode, cb) => { fsValidateFd(fd); fsParseFileMode(mode, "mode"); fsAsyncOk(cb); };
+  fsMod.fchmodSync = (fd, mode) => { fsValidateFd(fd); const m = fsParseFileMode(mode, "mode"); const p = fdPathMap.get(fd); if (p != null) F.chmod(p, m); };
+  fsMod.fchmod = (fd, mode, cb) => { fsValidateFd(fd); const m = fsParseFileMode(mode, "mode"); const p = fdPathMap.get(fd); try { if (p != null) F.chmod(p, m); } catch (e) {} fsAsyncOk(cb); };
   fsMod.lchmodSync = (path, mode) => { validatePath(path); fsParseFileMode(mode, "mode"); };
   fsMod.lchmod = (path, mode, cb) => { validatePath(path); fsParseFileMode(mode, "mode"); fsAsyncOk(cb); };
   fsMod.fchownSync = (fd, uid, gid) => { fsValidateFd(fd); fsIntU32(uid, "uid"); fsIntU32(gid, "gid"); };
@@ -4048,6 +4144,11 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   fsMod.realpath = wrapPath(fsMod.realpath, validatePath);
   fsMod.realpathSync.native = fsMod.realpathSync;
   fsMod.symlinkSync = wrapPath(fsMod.symlinkSync, validatePath);
+  // node only exposes lchmod/lchmodSync on platforms with the lchmod(2) syscall
+  // (macOS / constants.O_SYMLINK defined). On Linux they are undefined and the
+  // corpus guards on `if (fs.lchmod)`; a no-op stub would wrongly run those
+  // branches (a symlink's mode is always 0o777, so chmod-to-0o644 fails).
+  if (process.platform !== "darwin") { delete fsMod.lchmod; delete fsMod.lchmodSync; }
   def(["fs"], fsMod);
 
   const P = (fn) => (...a) => { try { return Promise.resolve(fn(...a)); } catch (e) { return Promise.reject(e); } };
@@ -4131,18 +4232,18 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       const b = typeof data === "string" ? Buffer.from(data, enc) : (ArrayBuffer.isView(data) ? data : Buffer.from(data));
       return Promise.resolve().then(() => { fsMod.writeSync(this._fd, b, 0, b.byteLength || b.length, null); });
     }
-    stat() { return Promise.resolve().then(() => fsMod.fstatSync(this._fd)); }
+    stat() { return Promise.resolve().then(() => { if (this._closed || this._fd === -1) { const e = new Error("EBADF: bad file descriptor, fstat"); e.code = "EBADF"; e.errno = -9; e.syscall = "fstat"; throw e; } return fsMod.fstatSync(this._fd); }); }
     sync() { return Promise.resolve(); }
     datasync() { return Promise.resolve(); }
     truncate(len) { return Promise.resolve().then(() => { try { fsMod.ftruncateSync(this._fd, len); } catch (e) {} }); }
     chmod(m) { return Promise.resolve(); }
     chown() { return Promise.resolve(); }
     utimes() { return Promise.resolve(); }
-    close() { if (this._closed) return Promise.resolve(); this._closed = true; return Promise.resolve().then(() => { fsMod.closeSync(this._fd); this.emit("close"); }); }
+    close() { if (this._closed) return Promise.resolve(); this._closed = true; const fd = this._fd; return Promise.resolve().then(() => { fsMod.closeSync(fd); this._fd = -1; this.emit("close"); }); }
     [Symbol.asyncDispose]() { return this.close(); }
   }
   const fsPromises = {
-    open: (p, flags, mode) => Promise.resolve().then(() => new FileHandle(globalThis.__mbunFdNative.open(toStr(p), flags == null ? "r" : (typeof flags === "number" ? flags : toStr(flags)), typeof mode === "number" ? mode : 0o666))),
+    open: (p, flags, mode) => Promise.resolve().then(() => { validatePath(p); const md = mode == null ? 0o666 : fsParseFileMode(mode, "mode", 0o666); return new FileHandle(fdRemember(globalThis.__mbunFdNative.open(toStr(p), flags == null ? "r" : (typeof flags === "number" ? flags : toStr(flags)), md), p)); }),
     readFile: P((p) => F.readFile(toStr(p))),
     writeFile: (p, d, o) => (async () => {
       const path2 = toStr(p);
@@ -4167,7 +4268,19 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       }
       return F.writeFile(path2, toStr(d));
     })(),
-    appendFile: P((p, d) => F.appendFile(toStr(p), toStr(d))),
+    appendFile: (p, d, o) => Promise.resolve().then(() => {
+      fsValidateData(d); fsValidateEncoding(o);
+      if (p && typeof p === "object" && typeof p.appendFile === "function") return p.appendFile(d, o);
+      const isFd = typeof p === "number";
+      if (isFd) {
+        const FD = globalThis.__mbunFdNative;
+        const enc = typeof o === "string" ? o : (o && o.encoding) || "utf8";
+        const b = typeof d === "string" ? Buffer.from(d, enc) : Buffer.from(d);
+        FD.write(p, new Uint8Array(b.buffer, b.byteOffset, b.byteLength), 0, b.byteLength, -1);
+        return;
+      }
+      return F.appendFile(toStr(p), toStr(d));
+    }),
     mkdir: P((p, o) => { validatePath(p); const [rec, mode] = mkdirOpts(o); return F.mkdir(toStr(p), rec, mode); }),
     rm: P((p, o) => F.rm(toStr(p), recur(o), !!(o && o.force))),
     rmdir: P((p) => F.rm(toStr(p), true, true)),
@@ -4189,6 +4302,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     glob: (pat, o) => { const arr = fsMod.globSync(pat, o); let i = 0; return { [Symbol.asyncIterator]() { return { next: () => Promise.resolve(i < arr.length ? { value: arr[i++], done: false } : { value: undefined, done: true }) }; } }; },
     opendir: (p, opts) => Promise.resolve().then(() => fsMod.opendirSync(p, opts)),
   };
+  if (process.platform !== "darwin") { delete fsPromises.lchmod; }
   fsMod.promises = fsPromises;
   M["fs/promises"] = fsPromises;
   M["node:fs/promises"] = fsPromises;

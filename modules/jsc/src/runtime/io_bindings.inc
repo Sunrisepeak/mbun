@@ -701,6 +701,10 @@ JSValueRef fsn_mkdir_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t 
         if (::mkdir(it->c_str(), static_cast<mode_t>(mode)) != 0 && errno != EEXIST) {
             if (errno == ENOTDIR)
                 return fs_throw(ctx, exc, "ENOTDIR: not a directory, mkdir '" + it->string() + "'");
+            if (errno == ENOENT)
+                return fs_throw(ctx, exc, "ENOENT: no such file or directory, mkdir '" + it->string() + "'");
+            if (errno == ENAMETOOLONG)
+                return fs_throw(ctx, exc, "ENAMETOOLONG: name too long, mkdir '" + it->string() + "'");
             return fs_throw(ctx, exc, "EACCES: permission denied, mkdir '" + it->string() + "'");
         }
     }
@@ -990,7 +994,23 @@ JSValueRef fsn_copyFile_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size
     std::filesystem::copy_file(std::filesystem::path{fs_arg(ctx, argc, args, 0)},
                                std::filesystem::path{fs_arg(ctx, argc, args, 1)},
                                std::filesystem::copy_options::overwrite_existing, ec);
-    if (ec) return fs_throw(ctx, exc, "copyFile: " + ec.message());
+    if (ec) {
+        // Map the std::error_code to a node-style E* code so error.code is set
+        // (test-fs-copyfile-respect-permissions asserts EACCES/EPERM). A
+        // read-only destination surfaces EACCES when it cannot be opened for write.
+        const int en{ec.value()};
+        const char* code{"EACCES"};
+        if (en == EPERM) code = "EPERM";
+        else if (en == EACCES) code = "EACCES";
+        else if (en == ENOENT) code = "ENOENT";
+        else if (en == EEXIST) code = "EEXIST";
+        else if (en == EISDIR) code = "EISDIR";
+        else if (en == ENOTDIR) code = "ENOTDIR";
+        else if (en == ENOSPC) code = "ENOSPC";
+        std::string src{fs_arg(ctx, argc, args, 0)};
+        std::string dst{fs_arg(ctx, argc, args, 1)};
+        return fs_throw(ctx, exc, std::string{code} + ": " + ec.message() + ", copyfile '" + src + "' -> '" + dst + "'");
+    }
     return JSValueMakeUndefined(ctx);
 }
 // Real symlink (node fs.symlinkSync(target, path) backing). `target` may be a

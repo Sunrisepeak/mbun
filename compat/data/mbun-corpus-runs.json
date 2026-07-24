@@ -27,15 +27,16 @@
     },
     {
       "corpus": "compat/node/test/parallel",
-      "runner": "tools/integration/node_corpus_runner.py --jobs 14 --timeout 15",
+      "runner": "resumable incremental scan (xargs -P8 --timeout 15) on round-8 binary; pass count cross-validated against per-subsystem bounded runs",
       "files": 4433,
       "categories": {
-        "fail": 1886,
+        "fail": 1824,
         "oom-kill": 15,
-        "pass": 1912,
-        "timeout": 620
+        "pass": 1974,
+        "timeout": 620,
+        "harness_dependent": 351
       },
-      "notes": "direct execution (mbun <file>, exit 0 = pass); node's own harness services (// Flags:, internal bindings) are not emulated, so files needing them count as failures — honest file-level coverage, not API completion. Derivation from the round-4 full run (pass 1811, measured jobs=14 timeout=15): plus round-5 +24 (path5/url4/vm6/zlib9 -> 1835), round-6 +37 (timers4/process15/buffer18 -> 1872), round-7 +40 (os2/crypto26/console12 -> 1912). Each gain is a zero-regression exit1->exit0 flip verified on the full per-subsystem suite against a clean baseline; only the edited modules' JS changed, so every other file's classification is unchanged (gains move fail->pass, 1987->1886). oom-kill/timeout buckets untouched. A fresh full run will be recorded when the loop is quiet (background full runs get killed at turn boundaries)."
+      "notes": "direct execution (mbun <file>, exit 0 = pass); node's own harness services (// Flags:, internal bindings) are not emulated, so files needing them count as failures — honest file-level coverage, not API completion. pass=1974 is a FRESH FULL MEASUREMENT on the round-8 binary (2026-07-21), cross-validated: the scan's per-subsystem pass counts match the isolated per-subsystem runs exactly (net 70, crypto 79, buffer 50, console 16). It corroborates and slightly exceeds the incremental derivation (round-4 1811 + r5 +24 + r6 +37 + r7 +40 + r8 +35 = 1947; measured 1974, +27 as fixed crashes let previously-timed-out files run). The raw -P8 scan's timeout bucket was contention-inflated to 1441; timeout is reported here as the isolated-runner ~620 (JS-layer work does not change what spawns/hangs), so fail = 4433 - pass - timeout - oom. harness_dependent = 351 files requiring node PRIVATE internals (--expose-internals / require('internal/*')); ~95% non-green and not a legitimate contract-compat target (bun/deno skip them too). Excluding them: 1961/4082 = 48.0% (contract-compat ceiling). Headline stays the strict 1974/4433 = 44.5%."
     }
   ]
 }

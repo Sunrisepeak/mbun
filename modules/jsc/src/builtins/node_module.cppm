@@ -272,7 +272,18 @@ inline constexpr std::string_view kNodeModuleJS = R"JS(
   }
 
   // ---- _nodeModulePaths(from) — Node's exact walk (skips node_modules segs).
+  // Node scans the path BACKWARD, so it matches each segment against the char
+  // codes of "node_modules" in REVERSE order (lib/internal/modules/cjs/loader.js
+  // uses the pre-reversed nmChars array). Comparing against the forward string
+  // never matches, which leaves the redundant .../node_modules/node_modules
+  // entries in the list — hence the reversed lookup table here.
   const NM = "node_modules";
+  const NM_LEN = NM.length;
+  const NM_CHARS_REV = (() => {
+    const a = [];
+    for (let k = NM_LEN - 1; k >= 0; --k) a.push(NM.charCodeAt(k));
+    return a;
+  })();
   function nodeModulePaths(from) {
     if (from === undefined) {
       throw invalidArgType("path", "string", from);
@@ -286,11 +297,11 @@ inline constexpr std::string_view kNodeModuleJS = R"JS(
     for (let i = from.length - 1; i >= 0; --i) {
       const code = from.charCodeAt(i);
       if (code === sep) {
-        if (p !== NM.length) paths.push(from.slice(0, last) + "/" + NM);
+        if (p !== NM_LEN) paths.push(from.slice(0, last) + "/" + NM);
         last = i;
         p = 0;
       } else if (p !== -1) {
-        if (NM.charCodeAt(p) === code) ++p;
+        if (NM_CHARS_REV[p] === code) ++p;
         else p = -1;
       }
     }
@@ -364,6 +375,18 @@ inline constexpr std::string_view kNodeModuleJS = R"JS(
   Module._nodeModulePaths = (from) => nodeModulePaths(from);
   Module._cache = {};
   Module._pathCache = {};
+
+  // _stat(path): node's internalModuleStat — 1 for a directory, 0 for a file,
+  // and a negative errno for anything else (missing path, etc.).
+  Module._stat = (filename) => {
+    const fs = M["node:fs"] || M["fs"];
+    try {
+      const s = fs.statSync(String(filename));
+      return s.isDirectory() ? 1 : 0;
+    } catch (e) {
+      return -2; // -ENOENT
+    }
+  };
 
   // require.extensions default loaders (stubs; the loader is native — custom
   // loaders are DEFERRED, but the shape/identity are correct).

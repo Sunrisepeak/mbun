@@ -770,6 +770,12 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
       if (typeof variables.clang !== "number") variables.clang = 1;
       if (variables.host_arch === undefined) variables.host_arch = proc.arch || "x64";
       if (variables.target_arch === undefined) variables.target_arch = proc.arch || "x64";
+      // node exposes the native ABI version here (test-module-version asserts it
+      // is an integer > 0). Mirror process.versions.modules (the same value).
+      if (variables.node_module_version === undefined) {
+        const nmv = parseInt(proc.versions && proc.versions.modules, 10);
+        variables.node_module_version = Number.isInteger(nmv) && nmv > 0 ? nmv : 127;
+      }
       if (config.target_defaults === undefined) config.target_defaults = {};
       // node deep-freezes process.config (lib/internal/bootstrap/node.js): in
       // strict mode `process.config.variables = 42` must throw a TypeError
