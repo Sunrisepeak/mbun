@@ -4150,23 +4150,72 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       // node's Dir constructor is not usable from userland: `new fs.Dir()`
       // throws ERR_MISSING_ARGS (lib/internal/fs/dir.js).
       if (path === undefined) { const e = new TypeError('The "handle" argument must be specified'); e.code = "ERR_MISSING_ARGS"; throw e; }
-      this._path = path; this._entries = entries; this._i = 0; this._closed = false; this._encoding = encoding || "utf8";
+      this._path = path; this._entries = entries; this._i = 0; this._closed = false; this._pending = 0; this._encoding = encoding || "utf8";
     }
-    get path() { return this._path; }
+    // node validateThisInternalField: reading `Dir.prototype.path` (no instance
+    // slots) is ERR_INVALID_THIS, not `undefined`.
+    get path() {
+      if (this._path === undefined) { const e = new TypeError("Value of \"this\" must be of type Dir"); e.code = "ERR_INVALID_THIS"; throw e; }
+      return this._path;
+    }
+    // for await (const dirent of dir) — closes the handle when iteration ends,
+    // breaks, returns or throws (node lib/internal/fs/dir.js).
+    [Symbol.asyncIterator]() {
+      const self = this;
+      return {
+        [Symbol.asyncIterator]() { return this; },
+        next() {
+          if (self._closed) return Promise.resolve({ value: undefined, done: true });
+          const ent = self._next();
+          if (ent === null) { self._closed = true; return Promise.resolve({ value: undefined, done: true }); }
+          return Promise.resolve({ value: ent, done: false });
+        },
+        return() { self._closed = true; return Promise.resolve({ value: undefined, done: true }); },
+        throw(err) { self._closed = true; return Promise.reject(err); },
+      };
+    }
     _guard() { if (this._closed) { const e = new Error("Directory handle was closed"); e.code = "ERR_DIR_CLOSED"; throw e; } }
     _decode(name) { const enc = this._encoding; if (enc === "utf8" || enc === "utf-8" || enc === "buffer") return name; return Buffer.from(name, "utf8").toString(enc); }
     _next() { if (this._i >= this._entries.length) return null; const e = this._entries[this._i++]; return new fsMod.Dirent(this._decode(e.name), e.type, this._path); }
-    readSync() { this._guard(); return this._next(); }
+    // node forbids a SYNC op while an async one is outstanding
+    // (ERR_DIR_CONCURRENT_OPERATION, lib/internal/fs/dir.js).
+    _busy() {
+      if (this._pending > 0) {
+        const e = new Error("Cannot do a synchronous work while an asynchronous operation is in progress");
+        e.code = "ERR_DIR_CONCURRENT_OPERATION";
+        throw e;
+      }
+    }
+    readSync() { this._busy(); this._guard(); return this._next(); }
     // The promise form REJECTS on a closed handle (node lib/internal/fs/dir.js);
     // only the sync/callback forms throw.
-    read(cb) { if (cb !== undefined && typeof cb !== "function") cbTypeError(); if (typeof cb === "function") { this._guard(); const ent = this._next(); G.queueMicrotask(() => cb(null, ent)); return; } try { this._guard(); } catch (e) { return Promise.reject(e); } return Promise.resolve(this._next()); }
-    closeSync() { this._guard(); this._closed = true; }
-    close(cb) { if (cb !== undefined && typeof cb !== "function") cbTypeError(); if (typeof cb === "function") { this._guard(); this._closed = true; G.queueMicrotask(() => cb(null)); return; } try { this._guard(); } catch (e) { return Promise.reject(e); } this._closed = true; return Promise.resolve(); }
+    read(cb) {
+      if (cb !== undefined && typeof cb !== "function") cbTypeError();
+      if (typeof cb === "function") { this._guard(); const ent = this._next(); G.queueMicrotask(() => cb(null, ent)); return; }
+      try { this._guard(); } catch (e) { return Promise.reject(e); }
+      this._pending++;
+      return Promise.resolve().then(() => { this._pending--; return this._next(); });
+    }
+    closeSync() { this._busy(); this._guard(); this._closed = true; }
+    close(cb) {
+      if (cb !== undefined && typeof cb !== "function") cbTypeError();
+      if (typeof cb === "function") {
+        // The callback form REPORTS a closed handle through the callback.
+        if (this._closed) { let e; try { this._guard(); } catch (err) { e = err; } G.queueMicrotask(() => cb(e)); return; }
+        this._closed = true; G.queueMicrotask(() => cb(null)); return;
+      }
+      try { this._guard(); } catch (e) { return Promise.reject(e); }
+      this._pending++;
+      return Promise.resolve().then(() => { this._pending--; this._closed = true; });
+    }
     [Symbol.dispose]() { this._closed = true; }
     [Symbol.asyncDispose]() { this._closed = true; return Promise.resolve(); }
   }
   fsMod.Dir = Dir;
   const openDirImpl = (p, opts) => {
+    validatePath(p);
+    if (opts && typeof opts === "object" && opts.bufferSize !== undefined)
+      fsValidateInteger(opts.bufferSize, "options.bufferSize", 1);
     const path2 = toStr(p);
     let encoding = "utf8";
     if (typeof opts === "string") encoding = opts;
@@ -4185,11 +4234,23 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     const entries = F.readdir(path2).map((n) => { let t = 1; try { t = F.stat(path2 + "/" + n)._isDir ? 2 : 1; } catch (e) { t = 3; } return { name: n, type: t }; });
     return new Dir(path2, entries, String(encoding).toLowerCase());
   };
+  fsMod.mkdtempDisposableSync = (prefix, o) => {
+    validatePath(prefix, "prefix"); fsValidateEncoding(o);
+    const dir = F.mkdtemp(toStr(prefix));
+    const abs = dir[0] === "/" ? dir : (G.process.cwd() + "/" + dir);
+    let removed = false;
+    const remove = () => { if (removed) return; F.rm(abs, true, false); removed = true; };
+    return { path: dir, remove, [Symbol.dispose]: remove };
+  };
   fsMod.opendirSync = (p, opts) => openDirImpl(p, opts);
   fsMod.opendir = (p, options, cb) => {
     const fn = typeof options === "function" ? options : cb;
     if (typeof fn !== "function") cbTypeError();
     const opts = typeof options === "object" || typeof options === "string" ? options : undefined;
+    // node validates the path (and bufferSize) SYNCHRONOUSLY, before the work.
+    validatePath(p);
+    if (opts && typeof opts === "object" && opts.bufferSize !== undefined)
+      fsValidateInteger(opts.bufferSize, "options.bufferSize", 1);
     G.queueMicrotask(() => { try { fn(null, openDirImpl(p, opts)); } catch (e) { fn(e); } });
   };
   fsMod.Dirent = class Dirent {
@@ -4232,7 +4293,11 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   fsMod.rename = (a, b, cb) => { validatePath(a, "oldPath"); validatePath(b, "newPath"); const fn = fsMakeCallback(cb); try { F.rename(toStr(a), toStr(b)); G.queueMicrotask(() => fn(null)); } catch (e) { G.queueMicrotask(() => fn(e)); } };
   fsMod.unlinkSync = (p) => { validatePath(p); return F.unlink(toStr(p)); };
   fsMod.readlinkSync = (p) => { validatePath(p); return F.readlink(toStr(p)); };
-  fsMod.copyFileSync = (a, b, m) => { validatePath(a, "src"); validatePath(b, "dest"); return F.copyFile(toStr(a), toStr(b)); };
+  // node getValidMode(mode, "copyFile") / ("access"): a non-integer mode is
+  // ERR_INVALID_ARG_TYPE, an out-of-range one ERR_OUT_OF_RANGE.
+  const fsValidCopyMode = (m) => (m == null ? 0 : fsValidateInteger(m, "mode", 0, 7));
+  const fsValidAccessMode = (m) => (m == null ? 0 : fsValidateInteger(m, "mode", 0, 7));
+  fsMod.copyFileSync = (a, b, m) => { validatePath(a, "src"); validatePath(b, "dest"); fsValidCopyMode(m); return F.copyFile(toStr(a), toStr(b)); };
   fsMod.stat = (p, a, b) => { validatePath(p); const cb = fsMakeCallback(typeof a === "function" ? a : b); try { cb(null, fsMod.statSync(p, typeof a === "object" ? a : undefined)); } catch (e) { cb(e); } };
   fsMod.lstat = (p, a, b) => { validatePath(p); const cb = fsMakeCallback(typeof a === "function" ? a : b); try { cb(null, fsMod.lstatSync(p, typeof a === "object" ? a : undefined)); } catch (e) { cb(e); } };
   fsMod.fstatSync = (fd, o) => { fsValidateFd(fd); const s = F.fstat(fd); return (o && o.bigint) ? mkBigIntStats(s) : Object.setPrototypeOf(s, Stats.prototype); };
@@ -4547,13 +4612,22 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   fsMod.chmodSync = wrapPath(fsMod.chmodSync, validatePath);
   fsMod.copyFile = (a, b, m, cb) => {
     validatePath(a, "src"); validatePath(b, "dest");
+    if (typeof m !== "function") fsValidCopyMode(m);
     const fn = typeof m === "function" ? m : cb;
     fsMakeCallback(fn);
     G.queueMicrotask(() => { try { F.copyFile(toStr(a), toStr(b)); fn(null); } catch (e) { fn(e); } });
   };
-  fsMod.symlinkSync = (t, p2, type) => { validatePath(t, "target"); validatePath(p2, "path"); return F.symlink(toStr(t), toStr(p2)); };
+  // node symlink type: "dir" | "file" | "junction" (or null/undefined).
+  // Anything else is ERR_INVALID_ARG_VALUE, checked after the two paths.
+  const fsValidateSymlinkType = (type) => {
+    if (type === undefined || type === null) return;
+    if (type !== "dir" && type !== "file" && type !== "junction")
+      throw fsArgValueErr("type", type, "must be one of 'dir', 'file', or 'junction'");
+  };
+  fsMod.symlinkSync = (t, p2, type) => { validatePath(t, "target"); validatePath(p2, "path"); fsValidateSymlinkType(type); return F.symlink(toStr(t), toStr(p2)); };
   fsMod.symlink = (t, p2, a, cb) => {
     validatePath(t, "target"); validatePath(p2, "path");
+    if (typeof a !== "function") fsValidateSymlinkType(a);
     const fn = typeof a === "function" ? a : cb;
     fsMakeCallback(fn);
     G.queueMicrotask(() => { try { F.symlink(toStr(t), toStr(p2)); fn(null); } catch (e) { fn(e); } });
@@ -4790,14 +4864,30 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     readFile(o) {
       const enc = typeof o === "string" ? o : (o && o.encoding);
       const signal = fsSignalOf(o);
-      return Promise.resolve().then(() => {
+      return Promise.resolve().then(async () => {
         fsThrowIfAborted(signal);
         const fd = this._use("read");
+        // node kIoMaxLength: a file larger than 2**31-1 cannot be read into one
+        // buffer (ERR_FS_FILE_TOO_LARGE, a RangeError).
+        try {
+          const size = fsMod.fstatSync(fd).size;
+          if (size > 2147483647) {
+            const e = new RangeError("File size (" + size + ") is greater than 2 GiB");
+            e.code = "ERR_FS_FILE_TOO_LARGE";
+            throw e;
+          }
+        } catch (e) { if (e && e.code === "ERR_FS_FILE_TOO_LARGE") throw e; }
         const chunks = []; const tmp = Buffer.alloc(65536); let n;
         while ((n = fsMod.readSync(fd, tmp, 0, tmp.length, null)) > 0) {
-          fsThrowIfAborted(signal);
           chunks.push(Buffer.from(tmp.subarray(0, n)));
+          // Yield a full loop turn between chunks: node reads through the
+          // thread pool, so an abort scheduled with process.nextTick OR
+          // setImmediate lands mid-read (common/tick.js uses setImmediate).
+          await new Promise((r) => G.setImmediate(r));
+          fsThrowIfAborted(signal);
         }
+        await new Promise((r) => G.setImmediate(r));
+        fsThrowIfAborted(signal);
         const all = Buffer.concat(chunks);
         return enc ? all.toString(enc) : all;
       });
@@ -4805,10 +4895,21 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     writeFile(data, o) {
       const enc = typeof o === "string" ? o : (o && o.encoding) || "utf8";
       const signal = fsSignalOf(o);
-      return Promise.resolve().then(() => {
+      return Promise.resolve().then(async () => {
         fsThrowIfAborted(signal);
-        fsValidateData(data);
         const fd = this._use("write");
+        // node consumes (async) iterables here too (a Readable is the common case).
+        if (data != null && typeof data !== "string" && !ArrayBuffer.isView(data) && !(data instanceof ArrayBuffer) &&
+            (typeof data[Symbol.asyncIterator] === "function" || typeof data[Symbol.iterator] === "function")) {
+          for await (const chunk of data) {
+            fsThrowIfAborted(signal);
+            fsValidateData(chunk, "chunk");
+            const c = typeof chunk === "string" ? Buffer.from(chunk, enc) : (ArrayBuffer.isView(chunk) ? chunk : Buffer.from(chunk));
+            if (c.byteLength) fsMod.writeSync(fd, c, 0, c.byteLength, null);
+          }
+          return;
+        }
+        fsValidateData(data);
         const b = typeof data === "string" ? Buffer.from(data, enc) : (ArrayBuffer.isView(data) ? data : Buffer.from(data));
         fsMod.writeSync(fd, b, 0, b.byteLength, null);
       });
@@ -4923,17 +5024,37 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     unlink: P((p) => F.unlink(toStr(p))),
     realpath: P((p) => F.realpath(toStr(p))),
     rename: P((a, b) => F.rename(toStr(a), toStr(b))),
-    copyFile: P((a, b) => F.copyFile(toStr(a), toStr(b))),
+    copyFile: P((a, b, m) => { validatePath(a, "src"); validatePath(b, "dest"); fsValidCopyMode(m); return F.copyFile(toStr(a), toStr(b)); }),
     mkdtemp: P((pre) => F.mkdtemp(toStr(pre))),
-    access: P((p) => { if (!F.exists(toStr(p))) throw Object.assign(new Error("ENOENT: no such file or directory, access '" + toStr(p) + "'"), { code: "ENOENT" }); }),
+    access: P((p, m) => { validatePath(p); fsValidAccessMode(m); if (!F.exists(toStr(p))) throw fsErr("ENOENT", "access", toStr(p)); }),
     exists: P((p) => F.exists(toStr(p))),
     cp: P((src, dest, o) => { validatePath(src, "src"); validatePath(dest, "dest"); return cpRec(toStr(src), toStr(dest), o); }),
-    symlink: P((target, path2) => F.symlink(toStr(target), toStr(path2))),
+    symlink: P((target, path2, type) => { validatePath(target, "target"); validatePath(path2, "path"); fsValidateSymlinkType(type); return F.symlink(toStr(target), toStr(path2)); }),
     readlink: P((p) => F.readlink(toStr(p))),
     chmod: P((p, m) => F.chmod(toStr(p), typeof m === "string" ? parseInt(m, 8) : (Number(m) & 0o7777))), lchmod: P(() => {}), chown: P(() => {}), lchown: P(() => {}),
     utimes: P((p, a, m) => { const s = (v) => v instanceof Date ? v.getTime() / 1000 : Number(v); F.utimes(toStr(p), s(a), s(m)); }), lutimes: P(() => {}),
     glob: (pat, o) => { const arr = fsMod.globSync(pat, o); let i = 0; return { [Symbol.asyncIterator]() { return { next: () => Promise.resolve(i < arr.length ? { value: arr[i++], done: false } : { value: undefined, done: true }) }; } }; },
     opendir: (p, opts) => Promise.resolve().then(() => fsMod.opendirSync(p, opts)),
+    // node fs.promises.mkdtempDisposable: an explicit-resource-management
+    // handle over mkdtemp whose remove()/[Symbol.asyncDispose]() rm -rf's the
+    // directory and is idempotent.
+    mkdtempDisposable: (prefix, o) => Promise.resolve().then(() => {
+      validatePath(prefix, "prefix"); fsValidateEncoding(o);
+      const dir = F.mkdtemp(toStr(prefix));
+      // Removal must not depend on the CWD at removal time (node resolves the
+      // directory up front) — a process.chdir() in between would otherwise make
+      // a relative prefix unremovable.
+      const abs = dir[0] === "/" ? dir : (G.process.cwd() + "/" + dir);
+      let removed = false;
+      const remove = () => Promise.resolve().then(() => {
+        if (removed) return;
+        // The flag flips only on SUCCESS: node re-throws a failed removal and a
+        // later retry (once permissions allow it) must still do the work.
+        F.rm(abs, true, false);
+        removed = true;
+      });
+      return { path: dir, remove, [Symbol.asyncDispose]: remove };
+    }),
     readv: (fd, buffers, position) => Promise.resolve().then(() => new FileHandle(fd).readv(buffers, position)),
     writev: (fd, buffers, position) => Promise.resolve().then(() => new FileHandle(fd).writev(buffers, position)),
     watchFile: undefined,

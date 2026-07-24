@@ -271,8 +271,20 @@ inline constexpr std::string_view kNodeFsWatchJS = R"JS(
   const fsp = M["fs/promises"] || M["node:fs/promises"] || fs.promises;
   if (fsp) {
     fsp.watch = function watch(filename, options) {
+      if (options !== undefined && options !== null && typeof options !== "object" && typeof options !== "string")
+        throw argTypeErr("options", "of type object", options);
       const a = normalizeArgs(options, undefined);
       const opts = a.options;
+      validatePath(filename);
+      if (opts.persistent !== undefined && typeof opts.persistent !== "boolean")
+        throw argTypeErr("options.persistent", "of type boolean", opts.persistent);
+      if (opts.recursive !== undefined && typeof opts.recursive !== "boolean")
+        throw argTypeErr("options.recursive", "of type boolean", opts.recursive);
+      validateEncoding(opts);
+      validateIgnore(opts.ignore);
+      if (opts.signal !== undefined && opts.signal !== null &&
+          (typeof opts.signal !== "object" || !("aborted" in opts.signal)))
+        throw argTypeErr("options.signal", "an instance of AbortSignal", opts.signal);
       const w = new FSWatcher(filename, opts, undefined);
       const queue = [];
       let waiter = null;

@@ -722,7 +722,24 @@ JSValueRef fsn_rm_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t arg
     } else {
         std::filesystem::remove(std::filesystem::path{path}, ec);
     }
-    if (ec && !force) return fs_throw(ctx, exc, "rm '" + path + "': " + ec.message());
+    if (ec && !force) {
+        // node-shaped errno so `err.code` is usable (a bare message left
+        // fs.rm/rmdir callers with `code: undefined`).
+        switch (ec.value()) {
+            case ENOENT:
+                return fs_throw(ctx, exc, "ENOENT: no such file or directory, unlink '" + path + "'");
+            case ENOTEMPTY:
+                return fs_throw(ctx, exc, "ENOTEMPTY: directory not empty, rmdir '" + path + "'");
+            case ENOTDIR:
+                return fs_throw(ctx, exc, "ENOTDIR: not a directory, rmdir '" + path + "'");
+            case EPERM:
+                return fs_throw(ctx, exc, "EPERM: operation not permitted, unlink '" + path + "'");
+            case EBUSY:
+                return fs_throw(ctx, exc, "EBUSY: resource busy or locked, unlink '" + path + "'");
+            default:
+                return fs_throw(ctx, exc, "EACCES: permission denied, unlink '" + path + "'");
+        }
+    }
     return JSValueMakeUndefined(ctx);
 }
 // rmdir(2). std::filesystem::remove cannot express node's error surface —
@@ -1206,9 +1223,15 @@ JSValueRef fsn_mkdtemp_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_
     // counter collides with directories left behind by previous runs.
     static std::atomic<std::uint64_t> counter{static_cast<std::uint64_t>(
         std::chrono::steady_clock::now().time_since_epoch().count())};
+    // node replaces a SIX-character XXXXXX template, so the result's basename is
+    // exactly prefix.length + 6 (test-fs-promises-mkdtempDisposable asserts it).
+    static constexpr char ALPHABET[]{"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"};
     std::error_code ec;
     for (int attempt = 0; attempt < 1000; ++attempt) {
-        std::string dir{prefix + std::to_string(counter.fetch_add(1) % 100000000) + "x"};
+        std::uint64_t v{counter.fetch_add(1)};
+        std::string suffix(6, '0');
+        for (int i = 0; i < 6; ++i) { suffix[i] = ALPHABET[v % 62]; v /= 62; }
+        std::string dir{prefix + suffix};
         if (std::filesystem::create_directory(std::filesystem::path{dir}, ec) && !ec) {
             return make_string(ctx, dir);
         }
