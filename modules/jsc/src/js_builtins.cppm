@@ -34,6 +34,7 @@ export import :node_v8;
 export import :node_perf;
 export import :node_strdec;
 export import :node_module;
+export import :node_repl;
 export import :node_http;
 export import :node_diag;
 export import :node_net;
@@ -123,6 +124,9 @@ export inline const std::string kNodeBuiltinsJS =
         .append(detail::kHTMLRewriterJS)
         // node:domain — needs node:events (EventEmitter) already registered.
         .append(detail::kNodeDomainJS)
+        // node:repl — last of the node modules: REPLServer extends readline's
+        // Interface and evaluates through node:vm, so both must be installed.
+        .append(detail::kNodeReplJS)
         // last: printer-normalizing Function.prototype.toString override —
         // every earlier partition must capture the native toString.
         .append(detail::kFnToStringPrinterJS);

@@ -125,6 +125,14 @@ inline constexpr std::string_view kNodeDomainJS = R"JS(
       // node marks the error with its domain context, emits it when the domain
       // has an "error" listener, and otherwise lets it escape as uncaught.
       __handle(error) {
+        // Counter read by node:repl. node's Domain.prototype.run neither
+        // catches nor exits on a throw, so the REPL's own eval catch finds
+        // `process.domain` still entered and hands the error to it — the
+        // evaluation never counts as a completed expression. mbun's run() does
+        // catch (removing that would strand every error raised through the
+        // scheduling hooks, which have no upstack handler at all), so the REPL
+        // instead observes that a domain consumed an error during the eval.
+        domainExports.__errorsHandled++;
         if (error !== null && typeof error === "object") {
           try {
             error.domain = this;
@@ -189,6 +197,7 @@ inline constexpr std::string_view kNodeDomainJS = R"JS(
       createDomain: create,
       active: null,
       _stack: stack,
+      __errorsHandled: 0,
     };
     M["domain"] = M["node:domain"] = domainExports;
     try { if (G.process.domain === undefined) G.process.domain = null; } catch (e) {}

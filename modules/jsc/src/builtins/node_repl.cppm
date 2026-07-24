@@ -577,6 +577,10 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
         self.isCompletionEnabled = tmpCompletionEnabled;
       }
 
+      const domainMod = req("domain");
+      const domainErrorsHandled = () =>
+        (domainMod && typeof domainMod.__errorsHandled === "number") ? domainMod.__errorsHandled : 0;
+
       function defaultEval(code, context, file, cb) {
         let result, script, wrappedErr;
         let err = null;
@@ -638,6 +642,7 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
         }
 
         if (!err) {
+          const domainErrorsBefore = domainErrorsHandled();
           try {
             const scriptOptions = { displayErrors: false };
             if (self.useGlobal) result = script.runInThisContext(scriptOptions);
@@ -651,6 +656,11 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
             self._handleError(err);
             return;
           }
+          // An active domain swallowed the error instead of letting it reach
+          // the catch above: node reaches the same state through
+          // `process.domain.emit('error')` and returns without calling cb, so
+          // the command is neither a value to print nor an error to report.
+          if (domainErrorsHandled() !== domainErrorsBefore) return;
 
           if (awaitPromise && !err) {
             pause();
