@@ -44,6 +44,9 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
 
   const contexts = new WeakSet();
   const records = new WeakMap();
+  // Weak handles on every contextified object, so measureMemory('detailed') can
+  // report one `other` entry per context that is still alive.
+  const liveContexts = [];
 
   const DONT_CONTEXTIFY = Symbol("vm_dont_contextify");
   const USE_MAIN_CONTEXT_DEFAULT_LOADER = Symbol("vm_use_main_context_default_loader");
@@ -129,6 +132,7 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
       const d = gOPD(g, key);
       if (d !== undefined && "value" in d) nativeVals.set(key, d.value);
     }
+    if (typeof WeakRef === "function") liveContexts.push(new WeakRef(sandbox));
     const rec = {
       handle,
       global: g,
@@ -428,8 +432,51 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
     return Reflect.apply(FunctionCtor, undefined, args);
   }
 
-  function measureMemory() {
-    return Promise.resolve({ total: { jsMemoryEstimate: 0, jsMemoryRange: [0, 0] } });
+  // node's vm.measureMemory resolves V8's per-context memory report. JSC has no
+  // per-context accounting, so the NUMBERS are a whole-heap estimate rather
+  // than a breakdown — but the argument validation, the experimental warning
+  // and the result shape (including one `other` entry per live context) are
+  // node's, because that is all a caller can branch on.
+  const measureError = (name, value) => {
+    const e = new TypeError("The argument '" + name + "' is invalid. Received '" + value + "'");
+    e.code = "ERR_INVALID_ARG_VALUE";
+    return e;
+  };
+  let measureWarned = false;
+  function measureMemory(options) {
+    if (options === undefined) options = { __proto__: null };
+    if (typeof options !== "object" || options === null || Array.isArray(options)) {
+      throw invArgType("options", "of type object", options);
+    }
+    const mode = options.mode === undefined ? "summary" : options.mode;
+    if (mode !== "summary" && mode !== "detailed") throw measureError("options.mode", mode);
+    const execution = options.execution === undefined ? "default" : options.execution;
+    if (execution !== "default" && execution !== "eager") {
+      throw measureError("options.execution", execution);
+    }
+    if (!measureWarned) {
+      measureWarned = true;
+      try {
+        G.process.emitWarning(
+          "vm.measureMemory is an experimental feature and might change at any time",
+          "ExperimentalWarning");
+      } catch (e) { /* ignore */ }
+    }
+    const estimate = () => {
+      let bytes = 0;
+      try {
+        if (G.process && typeof G.process.memoryUsage === "function") {
+          bytes = G.process.memoryUsage().heapUsed || 0;
+        }
+      } catch (e) { /* ignore */ }
+      return { jsMemoryEstimate: bytes, jsMemoryRange: [bytes, bytes] };
+    };
+    if (mode === "summary") return Promise.resolve({ total: estimate() });
+    const other = [];
+    for (const ref of liveContexts) {
+      if (ref.deref() !== undefined) other.push(estimate());
+    }
+    return Promise.resolve({ total: estimate(), current: estimate(), other });
   }
 
   const constants = Object.freeze({ __proto__: null, DONT_CONTEXTIFY, USE_MAIN_CONTEXT_DEFAULT_LOADER });
