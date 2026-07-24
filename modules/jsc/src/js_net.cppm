@@ -70,11 +70,24 @@ export constexpr std::string_view kNetJS = R"JS(
   const latin1 = (b, from, to) => { let s = ""; for (let i = from; i < to; i += 4096) s += String.fromCharCode.apply(null, b.subarray(i, Math.min(i + 4096, to))); return s; };
   const concatU8 = (list) => { let total = 0; for (const c of list) total += c.length; const out = new Uint8Array(total); let o = 0; for (const c of list) { out.set(c, o); o += c.length; } return out; };
   const mkErr = (msg, code) => { const e = new Error(msg); e.code = code; return e; };
-  const codeOf = (e) => { const m = String((e && e.message) || e); return m.indexOf("ECONNREFUSED") !== -1 ? "ECONNREFUSED" : m.indexOf("EPIPE") !== -1 ? "EPIPE" : "ECONNRESET"; };
+  // The reactor's natives report failures as messages, not errno numbers. Any
+  // errno name the message carries is the socket error node would surface; the
+  // ECONNRESET fallback keeps the previous behaviour for unrecognised strings.
+  const ERRNO_RE = /\b(ECONNREFUSED|ECONNRESET|ECONNABORTED|EPIPE|ENOENT|EACCES|EPERM|EADDRINUSE|EADDRNOTAVAIL|EAFNOSUPPORT|EHOSTUNREACH|ENETUNREACH|ENETDOWN|ETIMEDOUT|EINVAL|ENAMETOOLONG|EISDIR|ENOTDIR|ELOOP|EMFILE|ENFILE|ENOTSOCK|EAI_AGAIN|EAI_FAIL|ENOTFOUND)\b/;
+  const codeOf = (e) => { const m = String((e && e.message) || e); const hit = ERRNO_RE.exec(m); return hit ? hit[1] : "ECONNRESET"; };
   const connectError = (nativeError, host, port) => {
     const code = codeOf(nativeError);
-    const error = mkErr("connect " + code + " " + host + ":" + port, code);
-    error.syscall = "connect"; error.address = host; error.port = port;
+    // node formats a pipe/unix connect as `connect <code> <path>` — no port.
+    const error = mkErr("connect " + code + " " + host + (port === undefined ? "" : ":" + port), code);
+    error.syscall = "connect"; error.address = host; if (port !== undefined) error.port = port;
+    return error;
+  };
+  // node lib/net.js Server: a bind failure carries the requested address/port and
+  // syscall so `err.address`/`err.port` are usable (test-net-better-error-messages-*).
+  const listenError = (nativeError, address, port) => {
+    const code = codeOf(nativeError);
+    const error = mkErr("listen " + code + " " + address + (port === undefined ? "" : ":" + port), code);
+    error.syscall = "listen"; error.address = address; if (port !== undefined) error.port = port;
     return error;
   };
 
@@ -178,6 +191,10 @@ export constexpr std::string_view kNetJS = R"JS(
           throw nErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "options.host" argument must be of type string. Received ' + (optArg.host === null ? "null" : Array.isArray(optArg.host) ? "an instance of Array" : "type " + typeof optArg.host));
         if (optArg.path == null && optArg.port === undefined && optArg.fd === undefined)
           throw nErr(TypeError, "ERR_MISSING_ARGS", 'The "options" or "port" or "path" argument must be specified');
+        // node net.js: a pipe connect runs validateString(path, 'options.path').
+        if (optArg.path != null && typeof optArg.path !== "string")
+          throw nErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "options.path" argument must be of type string. Received ' +
+            (Array.isArray(optArg.path) ? "an instance of Array" : typeof optArg.path === "object" ? "an instance of " + ((optArg.path.constructor && optArg.path.constructor.name) || "Object") : "type " + typeof optArg.path));
         // node net.js lookupAndConnect validation (options form). Types match
         // validateBoolean / validateInt32(min 1) / isIP / validateNumber /
         // ERR_INVALID_ARG_TYPE + validatePort, in node's order.
@@ -236,9 +253,10 @@ export constexpr std::string_view kNetJS = R"JS(
           const dh = (addr === "::1" || addr === "::" || addr === "::0") ? "127.0.0.1" : addr;
           let fd2;
           try { fd2 = NN.connect(dh, port); }
-          catch (e) { self.connecting = false; const err = connectError(e, addr, port); G.queueMicrotask(() => { self.emit("error", err); self.destroy(); }); return self; }
+          catch (e) { self.connecting = false; const err = connectError(e, addr, port); G.queueMicrotask(() => { if (self.destroyed) return; self.emit("error", err); self.destroy(); }); return self; }
           self._adopt(fd2); self.remotePort = port;
-          G.queueMicrotask(() => { self.emit("connect"); self.emit("ready"); });
+          self.connecting = true;
+          G.queueMicrotask(() => { if (self.destroyed) { self.connecting = false; return; } self.connecting = false; self.emit("connect"); self.emit("ready"); });
           return self;
         };
         const hf = _famOf(host);
@@ -249,9 +267,16 @@ export constexpr std::string_view kNetJS = R"JS(
         try {
           _lookup(host, lopts, (err, address, family) => {
             if (err) { if (!err.code) err.code = "ENOTFOUND"; return failWith(err); }
-            if (Array.isArray(address)) {
+            // node lookupAndConnect: `all` selects the array form; otherwise the
+            // callback must hand back a plain IP string, and anything else is
+            // ERR_INVALID_IP_ADDRESS.
+            if (lopts.all && Array.isArray(address)) {
               if (!address.length) { const e = mkErr("getaddrinfo ENOTFOUND " + host, "ENOTFOUND"); e.host = host; e.port = port; return failWith(e); }
               return dialResolved(address[0].address, address[0].family);
+            }
+            if (typeof address !== "string" || !_famOf(address)) {
+              const e = mkErr("Invalid IP address: " + String(address), "ERR_INVALID_IP_ADDRESS");
+              return failWith(e);
             }
             return dialResolved(address, family);
           });
@@ -264,10 +289,15 @@ export constexpr std::string_view kNetJS = R"JS(
       const dialHost = (host === "::1" || host === "::" || host === "::0") ? "127.0.0.1" : host;
       let fd;
       try { fd = unixPath ? NN.connectUnix(unixPath) : NN.connect(dialHost, port); }
-      catch (e) { this.connecting = false; const err = connectError(e, unixPath || host, unixPath ? undefined : port); G.queueMicrotask(() => { this.emit("error", err); this.destroy(); }); return this; }
+      catch (e) { this.connecting = false; const err = connectError(e, unixPath || host, unixPath ? undefined : port); G.queueMicrotask(() => { if (this.destroyed) return; this.emit("error", err); this.destroy(); }); return this; }
       this._adopt(fd);
       this.remotePort = port;
-      G.queueMicrotask(() => { this.emit("connect"); this.emit("ready"); });
+      // node reports `connecting === true` from the moment connect() returns
+      // until the 'connect' event fires; _adopt cleared it because the reactor's
+      // connect() already completed synchronously. A destroy() in between must
+      // cancel the pending 'connect' rather than resurrect the socket.
+      this.connecting = true;
+      G.queueMicrotask(() => { if (this.destroyed) { this.connecting = false; return; } this.connecting = false; this.emit("connect"); this.emit("ready"); });
       return this;
     }
     setEncoding(enc) { this._enc = enc || "utf8"; return this; }
@@ -380,7 +410,7 @@ export constexpr std::string_view kNetJS = R"JS(
     }
     destroy(err) {
       if (this.destroyed) return this;
-      this.destroyed = true; this.readable = false; this.writable = false;
+      this.destroyed = true; this.connecting = false; this.readable = false; this.writable = false;
       if (this._readableState) { this._readableState.destroyed = true; this._readableState.readable = false; }
       if (this._timeoutTimer) { G.clearTimeout(this._timeoutTimer); this._timeoutTimer = null; }
       if (this._fd >= 0) { try { NN.close(this._fd); } catch (e) {} this._fd = -1; }
@@ -500,6 +530,12 @@ export constexpr std::string_view kNetJS = R"JS(
       return progress;
     }
   }
+  // node keeps the pre-io.js `_connecting` name as an alias of `connecting`.
+  Object.defineProperty(Socket.prototype, "_connecting", {
+    get() { return this.connecting; },
+    set(v) { this.connecting = v; },
+    configurable: true,
+  });
   Socket.prototype[Symbol.asyncDispose] = function () { this.destroy(); return Promise.resolve(); };
   Socket.prototype[Symbol.dispose] = function () { this.destroy(); };
 
@@ -546,6 +582,23 @@ export constexpr std::string_view kNetJS = R"JS(
         if (o.port != null) { validateListenPort(o.port); port = o.port | 0; }
         if (o.host != null) host = String(o.host);
         if (typeof a[1] === "function") cb = a[1];
+        // node lib/net.js Server.listen: options.signal is validated up front and
+        // closes the server when it aborts (an already-aborted signal closes on
+        // the next tick, so the caller still sees a 'close').
+        if (o.signal !== undefined && o.signal !== null) {
+          const sig = o.signal;
+          if (typeof sig !== "object" || typeof sig.addEventListener !== "function" || !("aborted" in sig)) {
+            const e = new TypeError('The "options.signal" argument must be an instance of AbortSignal. Received ' +
+              (typeof sig === "string" ? "type string ('" + sig + "')" : "type " + typeof sig));
+            e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+          }
+          if (sig.aborted) G.queueMicrotask(() => this.close());
+          else {
+            const onAborted = () => this.close();
+            sig.addEventListener("abort", onAborted, { once: true });
+            this.once("close", () => { try { sig.removeEventListener("abort", onAborted); } catch (e) {} });
+          }
+        }
       } else {
         // node Server.listen(path[, backlog][, cb]): a non-numeric string first
         // arg is a unix/pipe path; a numeric one is a TCP port.
@@ -559,13 +612,16 @@ export constexpr std::string_view kNetJS = R"JS(
         if (cb) this.once("listening", cb);
         let ulh;
         try { ulh = NN.listenUnix(unixPath); }
-        catch (e) { const err = mkErr(String((e && e.message) || e), "EADDRINUSE"); G.queueMicrotask(() => this.emit("error", err)); return this; }
+        catch (e) { const err = listenError(e, unixPath); G.queueMicrotask(() => this.emit("error", err)); return this; }
         this._fd = ulh.fd;
         this._addr = { address: unixPath, family: "unix", port: 0 };
         this.listening = true;
         NET.items.add(this);
         this._hold();
-        G.queueMicrotask(() => this.emit("listening"));
+        // node's bind/listen completes on a later loop turn, so a close() issued
+        // before then cancels the pending 'listening' (and its callback) instead
+        // of firing it against an already-closed server.
+        G.queueMicrotask(() => { if (this.listening) this.emit("listening"); });
         return this;
       }
       // node default with no host is the IPv6 wildcard "::" (dual-stack), NOT
@@ -579,7 +635,7 @@ export constexpr std::string_view kNetJS = R"JS(
       if (cb) this.once("listening", cb);
       let lh;
       try { lh = NN.listen(bindHost, port); }
-      catch (e) { const err = mkErr(String((e && e.message) || e), "EADDRINUSE"); G.queueMicrotask(() => this.emit("error", err)); return this; }
+      catch (e) { const err = listenError(e, host, port); G.queueMicrotask(() => this.emit("error", err)); return this; }
       this._fd = lh.fd;
       const reportAddr = host === "localhost" ? (isV6 ? "::1" : "127.0.0.1") : host;
       this._addr = { port: lh.port, address: reportAddr, family: isV6 ? "IPv6" : "IPv4" };
@@ -590,7 +646,7 @@ export constexpr std::string_view kNetJS = R"JS(
       this.listening = true;
       NET.items.add(this);
       this._hold();
-      G.queueMicrotask(() => this.emit("listening"));
+      G.queueMicrotask(() => { if (this.listening) this.emit("listening"); });
       return this;
     }
     address() { return this._addr; }
