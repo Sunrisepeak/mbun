@@ -17,13 +17,14 @@
 //     no-op stub, so the same job is done by wrapping the scheduling primitives
 //     (setTimeout/setInterval/setImmediate/queueMicrotask/process.nextTick):
 //     each captures the domain that was active when the callback was SCHEDULED
-//     and enters it around the call. The wrapper deliberately does not catch —
-//     node's `bound()` doesn't either, so a throw leaves the domain entered and
-//     reaches _errorHandler with `process.domain` still set, which is exactly
-//     what the stack assertions check.
-//   * node's process._fatalException is spelled here as the public
-//     `process.setUncaughtExceptionCaptureCallback`, which mbun's uncaught
-//     dispatch already consults first.
+//     and enters it around the call.
+//   * node lets a throw out of run()/bind()/a scheduled callback escape into
+//     process._fatalException, which calls `process.domain._errorHandler(er)`.
+//     mbun has no JS-visible _fatalException on the entry-script or microtask
+//     paths, so `fatal()` below does that routing at the same three sites: same
+//     receiver (the ACTIVE domain), same rethrow when nobody claimed the error.
+//     `process.setUncaughtExceptionCaptureCallback` — which mbun's uncaught
+//     dispatch consults first — covers the paths that do reach it.
 //
 // Everything is installed LAZILY, on the first `require('domain')`, because
 // node's is too: patching EventEmitter.init/emit and the timer functions for
@@ -215,9 +216,29 @@ inline constexpr std::string_view kNodeDomainJS = R"JS(
         if (index !== -1) this.members.splice(index, 1);
       };
 
+      // node lets a throw out of run()/bind() escape into process._fatalException,
+      // which then calls `process.domain._errorHandler(er)`. mbun's entry-script
+      // and microtask dispatch do not reach a JS-visible _fatalException, so the
+      // same routing is done right here — same receiver (the ACTIVE domain, not
+      // necessarily `this`), same "nobody caught it, so it stays fatal" rethrow.
+      // `process.domain` is null once a previous _errorHandler ran
+      // (domainUncaughtExceptionClear), which is what stops an outer run() from
+      // handling an error an inner domain already reported.
+      const fatal = (er) => {
+        const domain = process.domain;
+        if (domain === null || domain === undefined) throw er;
+        if (!domain._errorHandler(er)) throw er;
+      };
+
       Domain.prototype.run = function (fn) {
         this.enter();
-        const ret = Reflect.apply(fn, this, Array.prototype.slice.call(arguments, 1));
+        let ret;
+        try {
+          ret = Reflect.apply(fn, this, Array.prototype.slice.call(arguments, 1));
+        } catch (er) {
+          fatal(er);
+          return undefined;
+        }
         this.exit();
         return ret;
       };
@@ -244,7 +265,13 @@ inline constexpr std::string_view kNodeDomainJS = R"JS(
 
       function bound(_this, self, cb, fnargs) {
         self.enter();
-        const ret = Reflect.apply(cb, _this, fnargs);
+        let ret;
+        try {
+          ret = Reflect.apply(cb, _this, fnargs);
+        } catch (er) {
+          fatal(er);
+          return undefined;
+        }
         self.exit();
         return ret;
       }
@@ -357,18 +384,32 @@ inline constexpr std::string_view kNodeDomainJS = R"JS(
           try {
             ret = Reflect.apply(callback, this, arguments);
           } catch (er) {
-            if (!domain._errorHandler(er)) throw er;
+            fatal(er);
             return undefined;
           }
           domain.exit();
           return ret;
         };
       };
+      // One scheduling primitive may be built on another — mbun's
+      // process.nextTick IS queueMicrotask — and both are hooked here. Without
+      // this guard the callback got wrapped twice and the domain was entered
+      // twice per tick, so a nextTick scheduled from an error handler saw a
+      // domains stack of [d, d] where node has [d]
+      // (test-domain-thrown-error-handler-stack, -emit-error-handler-stack).
+      let scheduling = false;
       const hook = (holder, name) => {
         const original = holder && holder[name];
         if (typeof original !== "function") return;
         const hooked = function (callback, ...rest) {
-          return Reflect.apply(original, this, [wrap(callback), ...rest]);
+          if (scheduling) return Reflect.apply(original, this, [callback, ...rest]);
+          const wrapped = wrap(callback);
+          scheduling = true;
+          try {
+            return Reflect.apply(original, this, [wrapped, ...rest]);
+          } finally {
+            scheduling = false;
+          }
         };
         try {
           // Keep the original's own properties (util.promisify's
