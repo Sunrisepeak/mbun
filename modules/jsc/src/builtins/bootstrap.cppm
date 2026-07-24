@@ -4482,6 +4482,57 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   // resolves to { bytesRead, buffer } rather than the first callback value.
   // mbun's util.promisify has no such hook — attach the documented
   // nodejs.util.promisify.custom symbol instead (same observable result).
+  // fs.close must hand its callback back on a LATER turn (node/libuv): the fs
+  // stream state machine calls it from _destroy and re-enters otherwise.
+  const fsCloseSync0 = fsMod.closeSync;
+  fsMod.close = (fd, cb) => {
+    fsValidateFd(fd);
+    if (cb !== undefined && typeof cb !== "function") throw fsArgTypeErr("callback", "of type function", cb);
+    let err = null;
+    try { fsCloseSync0(fd); } catch (e) { err = e; }
+    if (cb) G.queueMicrotask(() => cb(err));
+  };
+  // fs.readv / fs.writev (node lib/fs.js) — the vectored fd ops. Backed by a
+  // loop over the positioned single-buffer path.
+  fsMod.readvSync = (fd, buffers, position) => {
+    fsValidateFd(fd);
+    let total = 0, pos = position == null ? null : Number(position);
+    for (const b of buffers) {
+      if (b.byteLength === 0) continue;
+      const n = fsMod.readSync(fd, b, 0, b.byteLength, pos);
+      total += n;
+      if (pos !== null) pos += n;
+      if (n < b.byteLength) break;
+    }
+    return total;
+  };
+  fsMod.writevSync = (fd, buffers, position) => {
+    fsValidateFd(fd);
+    let total = 0, pos = position == null ? null : Number(position);
+    for (const b of buffers) {
+      if (b.byteLength === 0) continue;
+      const n = fsMod.writeSync(fd, b, 0, b.byteLength, pos);
+      total += n;
+      if (pos !== null) pos += n;
+    }
+    return total;
+  };
+  fsMod.readv = (fd, buffers, position, cb) => {
+    const fn = typeof position === "function" ? position : cb;
+    const pos = typeof position === "function" ? null : position;
+    fsMakeCallback(fn);
+    let n = 0, err = null;
+    try { n = fsMod.readvSync(fd, buffers, pos); } catch (e) { err = e; }
+    G.queueMicrotask(() => fn(err, n, buffers));
+  };
+  fsMod.writev = (fd, buffers, position, cb) => {
+    const fn = typeof position === "function" ? position : cb;
+    const pos = typeof position === "function" ? null : position;
+    fsMakeCallback(fn);
+    let n = 0, err = null;
+    try { n = fsMod.writevSync(fd, buffers, pos); } catch (e) { err = e; }
+    G.queueMicrotask(() => fn(err, n, buffers));
+  };
   const kPromisifyCustom = Symbol.for("nodejs.util.promisify.custom");
   fsMod.read[kPromisifyCustom] = (...a) =>
     new Promise((resolve, reject) => {
