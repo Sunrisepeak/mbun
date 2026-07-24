@@ -62,68 +62,319 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
     return data;
   };
 
-  class MessagePort extends EventEmitter {
-    constructor() {
-      super();
-      this._other = null;
-      this._queue = [];
-      this._started = false;
-      this.onmessage = null;
-      this.onmessageerror = null;
+  const kOther = Symbol("mbun.port.other");
+  const kQueue = Symbol("mbun.port.queue");
+  const kDetached = Symbol("mbun.port.detached");
+  const kEvt = Symbol("mbun.port.domListeners");
+  const kOnMsg = Symbol("mbun.port.onmessage");
+  const kOnMsgErr = Symbol("mbun.port.onmessageerror");
+  const kRefed = Symbol("mbun.port.refed");
+  const kStarted = Symbol("mbun.port.started");
+  const INSPECT_SYM = Symbol.for("nodejs.util.inspect.custom");
+  // node throws a real DOMException("…", "DataCloneError") — .code === 25 and
+  // `err.constructor.name === 'DOMException'` are both asserted by the corpus.
+  const dataClone = (msg) => {
+    if (typeof G.DOMException === "function") {
+      try { return new G.DOMException(msg, "DataCloneError"); } catch (e) {}
     }
-    _hasSink() {
-      return this._started || typeof this.onmessage === "function" || this.listenerCount("message") > 0;
+    const e = new Error(msg); e.name = "DataCloneError"; e.code = 25; return e;
+  };
+  const UNCLONEABLE = new WeakSet();
+  const UNTRANSFERABLE = new WeakSet();
+
+  class MessagePortBase extends EventEmitter {
+    addEventListener(type, cb, opts) {
+      if (typeof cb !== "function") return;
+      let m = this[kEvt].get(type);
+      if (!m) { m = []; this[kEvt].set(type, m); }
+      m.push({ fn: cb, once: !!(opts && opts.once) });
+      if (type === "message") portStart(this);
     }
-    _flush() {
-      while (this._queue.length && this._hasSink()) {
-        const message = this._queue.shift();
-        const ev = { data: message, type: "message" };
-        if (typeof this.onmessage === "function") this.onmessage(ev);
-        this.emit("message", message);
+    removeEventListener(type, cb) {
+      const m = this[kEvt].get(type);
+      if (m) { const i = m.findIndex((l) => l.fn === cb); if (i >= 0) m.splice(i, 1); }
+      if (type === "message") portRecheck(this);
+    }
+    dispatchEvent(ev) { this.emit(ev && ev.type, ev); return true; }
+    on(type, cb) { const r = super.on(type, cb); if (type === "message") portStart(this); return r; }
+    addListener(type, cb) { return this.on(type, cb); }
+    once(type, cb) { const r = super.once(type, cb); if (type === "message") portStart(this); return r; }
+    prependListener(type, cb) { const r = super.prependListener(type, cb); if (type === "message") portStart(this); return r; }
+    prependOnceListener(type, cb) { const r = super.prependOnceListener(type, cb); if (type === "message") portStart(this); return r; }
+    removeListener(type, cb) { const r = super.removeListener(type, cb); if (type === "message") portRecheck(this); return r; }
+    off(type, cb) { return this.removeListener(type, cb); }
+    removeAllListeners(type) { const r = super.removeAllListeners(type); portRecheck(this); return r; }
+    // EventEmitter listeners get the raw payload; addEventListener listeners get
+    // an event object (a CustomEvent-shaped one for non-"message" types).
+    emit(type, ...args) {
+      const r = EventEmitter.prototype.emit.apply(this, [type].concat(args));
+      const m = this[kEvt].get(type);
+      if (m && m.length) {
+        const first = args[0];
+        const ev = (first !== null && typeof first === "object" && first.type === type)
+          ? first : { type, detail: first, target: this, currentTarget: this };
+        for (const l of m.slice()) { if (l.once) this.removeEventListener(type, l.fn); l.fn.call(this, ev); }
+      }
+      return r;
+    }
+  }
+  Object.defineProperty(MessagePortBase.prototype, INSPECT_SYM, {
+    configurable: true, writable: true,
+    value: function () {
+      return "MessagePort [EventTarget] { active: " + (this[kDetached] !== true) +
+             ", refed: " + (this[kRefed] === true) + " }";
+    },
+  });
+
+  // `MessagePort` is exposed but NOT constructible: both MessagePort() and
+  // new MessagePort() are ERR_CONSTRUCT_CALL_INVALID (node io.js).
+  let ALLOW_PORT_CTOR = false;
+  function MessagePort() {
+    if (!ALLOW_PORT_CTOR) {
+      const e = new TypeError("Illegal constructor");
+      e.code = "ERR_CONSTRUCT_CALL_INVALID";
+      throw e;
+    }
+  }
+  MessagePort.prototype = Object.create(MessagePortBase.prototype);
+  Object.setPrototypeOf(MessagePort, MessagePortBase);
+  Object.defineProperty(MessagePort.prototype, "constructor",
+                        { value: MessagePort, writable: true, configurable: true });
+
+  const newPort = () => {
+    const p = new MessagePortBase();
+    Object.setPrototypeOf(p, MessagePort.prototype);
+    p[kEvt] = new Map();
+    p[kQueue] = [];
+    p[kOther] = null;
+    p[kDetached] = false;
+    p[kOnMsg] = null;
+    p[kOnMsgErr] = null;
+    p[kRefed] = false;
+    p[kStarted] = false;
+    return p;
+  };
+
+  const isPort = (v) => v !== null && typeof v === "object" && v[kQueue] !== undefined;
+  const portHasListener = (p) => typeof p[kOnMsg] === "function" || p.listenerCount("message") > 0 ||
+                                 ((p[kEvt].get("message") || []).length > 0);
+  const portHasSink = (p) => p[kStarted] === true || portHasListener(p);
+  // node stops delivery again when the last 'message' listener is removed
+  // (setupPortReferencing's removeListener hook) — a message posted while no
+  // sink exists must stay queued for a listener attached later.
+  const portRecheck = (p) => { if (!portHasListener(p)) p[kStarted] = false; };
+  const portDeliver = (p, data, ports) => {
+    const ev = { data, type: "message", target: p, currentTarget: p, ports: ports || [] };
+    const on = p[kOnMsg];
+    if (typeof on === "function") on.call(p, ev);
+    const dom = p[kEvt].get("message");
+    if (dom && dom.length) for (const l of dom.slice()) { if (l.once) p.removeEventListener("message", l.fn); l.fn.call(p, ev); }
+    EventEmitter.prototype.emit.call(p, "message", data);
+  };
+  const portFlush = (p) => {
+    while (p[kQueue].length && portHasSink(p)) {
+      const item = p[kQueue].shift();
+      portDeliver(p, item.data, item.ports);
+    }
+  };
+  // Delivery is scheduled on the MACROtask queue (setImmediate), matching node:
+  // a port message arrives from the event loop, so an endless
+  // .on('message')/postMessage ping-pong cannot starve timers
+  // (test-worker-message-port-infinite-message-loop).
+  const scheduleFlush = (p) => {
+    if (typeof G.setImmediate === "function") G.setImmediate(() => portFlush(p));
+    else G.queueMicrotask(() => portFlush(p));
+  };
+  const portStart = (p) => { p[kStarted] = true; scheduleFlush(p); };
+
+  // ---- structured clone with a transfer list ------------------------------
+  const abDetached = (ab) => {
+    if (typeof ab.detached === "boolean") return ab.detached;
+    try { new Uint8Array(ab); return false; } catch (e) { return true; }
+  };
+  const errIterable = (which) => {
+    const e = new TypeError("Optional " + which + " argument must be an iterable");
+    e.code = "ERR_INVALID_ARG_TYPE";
+    return e;
+  };
+  const normTransfer = (t) => {
+    if (t === undefined || t === null) return [];
+    if (typeof t !== "object") throw errIterable("transferList");
+    if (typeof t[Symbol.iterator] === "function") {
+      try { return Array.from(t); } catch (e) { throw errIterable("transferList"); }
+    }
+    if ("transfer" in t) {
+      const x = t.transfer;
+      if (x === undefined) return [];
+      if (x !== null && typeof x === "object" && typeof x[Symbol.iterator] === "function") {
+        try { return Array.from(x); } catch (e) { throw errIterable("options.transfer"); }
+      }
+      throw errIterable("options.transfer");
+    }
+    return [];
+  };
+  const PORT_TOK = "__mbunTransferredPort__";
+  const subst = (v, ports, seen) => {
+    if (v === null || typeof v !== "object") return v;
+    const i = ports.indexOf(v);
+    if (i >= 0) { const o = {}; o[PORT_TOK] = i; return o; }
+    if (seen.has(v)) return seen.get(v);
+    if (Array.isArray(v)) { const out = []; seen.set(v, out); for (let k = 0; k < v.length; k++) out[k] = subst(v[k], ports, seen); return out; }
+    const proto = Object.getPrototypeOf(v);
+    if (proto !== Object.prototype && proto !== null) return v;
+    const out = {}; seen.set(v, out);
+    for (const k of Object.keys(v)) out[k] = subst(v[k], ports, seen);
+    return out;
+  };
+  const unsubst = (v, ports, seen) => {
+    if (v === null || typeof v !== "object") return v;
+    if (Object.prototype.hasOwnProperty.call(v, PORT_TOK) && typeof v[PORT_TOK] === "number") return ports[v[PORT_TOK]];
+    if (seen.has(v)) return seen.get(v);
+    if (Array.isArray(v)) { seen.set(v, v); for (let k = 0; k < v.length; k++) v[k] = unsubst(v[k], ports, seen); return v; }
+    const proto = Object.getPrototypeOf(v);
+    if (proto !== Object.prototype && proto !== null) return v;
+    seen.set(v, v);
+    for (const k of Object.keys(v)) v[k] = unsubst(v[k], ports, seen);
+    return v;
+  };
+  // Clone FIRST, detach after: a transferred ArrayBuffer is frequently also the
+  // backing store of the message itself (postMessage(typedArray, [ab])), and
+  // detaching before the copy would hand the receiver an empty view.
+  const cloneWithPorts = (value, ports, buffers) => {
+    const pre = ports.length ? subst(value, ports, new Map()) : value;
+    const c = G.structuredClone(pre);
+    for (const b of buffers) { try { G.structuredClone(b, { transfer: [b] }); } catch (e) {} }
+    return ports.length ? unsubst(c, ports, new Map()) : c;
+  };
+
+  const severPort = (p) => {
+    const o = p[kOther];
+    p[kDetached] = true; p[kOther] = null;
+    if (o) { o[kDetached] = true; o[kOther] = null; }
+  };
+
+  const defPortProp = (name, desc) => Object.defineProperty(MessagePort.prototype, name,
+      Object.assign({ configurable: true }, desc));
+
+  defPortProp("postMessage", { writable: true, value: function (value, transferList) {
+    const list = normTransfer(transferList);
+    const ports = [], buffers = [];
+    const seenPorts = new Set(), seenBufs = new Set();
+    // node validates the WHOLE list before detaching anything, so a bad entry
+    // late in the list leaves earlier ArrayBuffers untouched.
+    for (const item of list) {
+      if (isPort(item)) {
+        if (item === this) throw dataClone("Transfer list contains source port");
+        if (seenPorts.has(item)) throw dataClone("Transfer list contains duplicate MessagePort");
+        if (item[kDetached] === true) throw dataClone("MessagePort in transfer list is already detached");
+        seenPorts.add(item); ports.push(item);
+      } else if (item instanceof ArrayBuffer) {
+        if (seenBufs.has(item)) throw dataClone("Transfer list contains duplicate ArrayBuffer");
+        if (abDetached(item)) throw dataClone("ArrayBuffer at index " + buffers.length + " is already detached");
+        if (UNTRANSFERABLE.has(item)) continue;  // markAsUntransferable: clone, don't move
+        seenBufs.add(item); buffers.push(item);
+      } else if (item !== null && (typeof item === "object" || typeof item === "function")) {
+        if (UNTRANSFERABLE.has(item)) continue;
+        throw dataClone("Object that needs transfer was found in message but not listed in transferList");
+      } else {
+        throw dataClone("Value at index " + buffers.length + " is not transferable");
       }
     }
-    postMessage(value) {
-      const o = this._other;
-      if (!o) return;
-      o._queue.push(clone(value));
-      G.queueMicrotask(() => o._flush());
+    if (this[kDetached] === true) return;
+    const target = this[kOther];
+    const postedToTarget = target !== null && seenPorts.has(target);
+    const cloned = cloneWithPorts(value, ports, buffers);
+    if (postedToTarget) {
+      // node node_messaging.cc: the channel is lost and a process warning fires.
+      if (G.process && typeof G.process.emitWarning === "function") {
+        G.process.emitWarning("The target port was posted to itself, and the communication channel was lost");
+      }
+      severPort(this);
+      return;
     }
-    start() { this._started = true; G.queueMicrotask(() => this._flush()); }
-    close() { this._other = null; this.emit("close"); }
-    ref() { return this; }
-    unref() { return this; }
-    addEventListener(type, cb) { this.on(type, cb); if (type === "message") this.start(); }
-    removeEventListener(type, cb) { this.off(type, cb); }
-  }
-  // Attaching a "message" listener implicitly starts delivery (node/DOM parity).
-  const _origOn = MessagePort.prototype.on;
-  MessagePort.prototype.on = function (type, cb) {
-    const r = _origOn.call(this, type, cb);
-    if (type === "message") { this._started = true; G.queueMicrotask(() => this._flush()); }
-    return r;
-  };
-  MessagePort.prototype.addListener = MessagePort.prototype.on;
+    if (target === null) return;
+    target[kQueue].push({ data: cloned, ports: ports.slice() });
+    scheduleFlush(target);
+  } });
 
-  class MessageChannel {
-    constructor() {
-      this.port1 = new MessagePort();
-      this.port2 = new MessagePort();
-      this.port1._other = this.port2;
-      this.port2._other = this.port1;
+  // Detachment is synchronous and instant; the 'close' event lands on BOTH ends
+  // asynchronously (node node_messaging.cc MessagePort::Close).
+  defPortProp("close", { writable: true, value: function (cb) {
+    if (typeof cb === "function") this.once("close", cb);
+    if (this[kDetached] === true) return;
+    const other = this[kOther];
+    this[kDetached] = true;
+    this[kOther] = null;
+    const self = this;
+    G.queueMicrotask(() => self.emit("close"));
+    if (other) {
+      other[kOther] = null;
+      G.queueMicrotask(() => {
+        if (other[kDetached] === true) return;
+        other[kDetached] = true;
+        other.emit("close");
+      });
     }
+  } });
+  defPortProp("start", { writable: true, value: function () { portStart(this); } });
+  defPortProp("ref", { writable: true, value: function () { this[kRefed] = true; } });
+  defPortProp("unref", { writable: true, value: function () { this[kRefed] = false; } });
+  defPortProp("hasRef", { writable: true, value: function () { return this[kRefed] === true; } });
+  defPortProp("onmessage", {
+    get() { return this[kOnMsg]; },
+    set(v) { this[kOnMsg] = v; if (typeof v === "function") portStart(this); else portRecheck(this); },
+  });
+  defPortProp("onmessageerror", { get() { return this[kOnMsgErr]; }, set(v) { this[kOnMsgErr] = v; } });
+
+  function MessageChannel() {
+    if (new.target === undefined) {
+      const e = new TypeError("Cannot call constructor without `new`");
+      e.code = "ERR_CONSTRUCT_CALL_REQUIRED";
+      throw e;
+    }
+    const p1 = newPort(), p2 = newPort();
+    p1[kOther] = p2; p2[kOther] = p1;
+    this.port1 = p1;
+    this.port2 = p2;
   }
 
   const receiveMessageOnPort = function (port) {
-    if (port === null || typeof port !== "object" || !(port instanceof MessagePort)) {
+    if (!isPort(port)) {
       const e = new TypeError('The "port" argument must be a MessagePort instance');
       e.code = "ERR_INVALID_ARG_TYPE";
       throw e;
     }
-    if (port._queue && port._queue.length) return { message: port._queue.shift() };
+    if (port[kQueue].length) return { message: port[kQueue].shift().data };
     return undefined;
   };
 
-  const markAsUntransferable = function () { throw new Error("markAsUntransferable is not yet implemented in Bun"); };
+  // node marks an object so a later postMessage clones it instead of moving it;
+  // markAsUncloneable makes structured cloning of it fail with DataCloneError.
+  const markAsUntransferable = function (obj) {
+    if (obj !== null && (typeof obj === "object" || typeof obj === "function")) UNTRANSFERABLE.add(obj);
+    return undefined;
+  };
+  const markAsUncloneable = function (obj) {
+    if (obj !== null && (typeof obj === "object" || typeof obj === "function")) UNCLONEABLE.add(obj);
+    return undefined;
+  };
+  {
+    const nativeSC = G.structuredClone;
+    if (typeof nativeSC === "function" && !nativeSC.__mbunUncloneableAware) {
+      const wrapped = function structuredClone(value, options) {
+        // node: markAsUncloneable has no effect on (Shared)ArrayBuffer.
+        if (value !== null && (typeof value === "object" || typeof value === "function") &&
+            !(value instanceof ArrayBuffer) &&
+            !(typeof G.SharedArrayBuffer === "function" && value instanceof G.SharedArrayBuffer) &&
+            UNCLONEABLE.has(value)) {
+          throw dataClone(String(value) + " could not be cloned.");
+        }
+        return nativeSC.call(this, value, options);
+      };
+      wrapped.__mbunUncloneableAware = true;
+      G.structuredClone = wrapped;
+    }
+  }
   const moveMessagePortToContext = function () { throw new Error("moveMessagePortToContext is not yet implemented in Bun"); };
 
   // ---- BroadcastChannel (in-process fan-out) ------------------------------
@@ -353,6 +604,7 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
     BroadcastChannel,
     receiveMessageOnPort,
     markAsUntransferable,
+    markAsUncloneable,
     moveMessagePortToContext,
     setEnvironmentData,
     getEnvironmentData,
@@ -365,8 +617,11 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
   // real; MessageChannel/MessagePort already exist as DOM globals (web layer),
   // so only fill Worker (and back-fill the others if a build lacks them).
   if (WN && typeof G.Worker === "undefined") G.Worker = Worker;
-  if (typeof G.MessageChannel === "undefined") G.MessageChannel = MessageChannel;
-  if (typeof G.MessagePort === "undefined") G.MessagePort = MessagePort;
+  // node's global MessageChannel/MessagePort ARE the worker_threads ones (they
+  // are re-exported onto globalThis since v15), so the node-parity classes win
+  // over the load-order web stubs.
+  G.MessageChannel = MessageChannel;
+  G.MessagePort = MessagePort;
 })();
 )JS";
 
