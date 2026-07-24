@@ -92,6 +92,107 @@ Parsed parse(std::initializer_list<std::string_view> args) {
     return parse(std::span<const std::string_view> { args.begin(), args.size() });
 }
 
+// ─── node runtime flags / process.execArgv ─────────────────────────────────
+// Node-emulation (`mbun <flags> script.js`, argv[0] == node) must accept node's
+// own flag vocabulary without rejecting it, and must report exactly those flags
+// as process.execArgv. Both are pure command-line analysis, so they live here
+// rather than in mbun.app and are unit-tested without booting the runtime.
+
+// A node runtime flag whose value is a SEPARATE token (`--flag value`), not
+// `--flag=value`. Node's V8/bootstrap option table decides this per flag; the
+// corpus re-spawns `process.execPath` with the space form for these, so unless
+// we consume the value token too it is mistaken for the script to run (the
+// `test-*.js` re-exec cluster: `--snapshot-blob X`, `-r X`, `--test-reporter X`).
+// Everything not listed here is treated as a boolean flag (single token).
+bool node_flag_takes_value(std::string_view flag) {
+    static constexpr std::string_view kValued[]{
+        "-r", "--require", "--snapshot-blob", "--build-snapshot-config",
+        "--test-reporter", "--test-reporter-destination", "--test-name-pattern",
+        "--test-skip-pattern", "--test-shard", "--test-concurrency",
+        "--heap-prof-interval", "--heap-prof-dir", "--heap-prof-name",
+        "--cpu-prof-interval", "--cpu-prof-dir", "--cpu-prof-name",
+        "--trace-event-categories", "--trace-event-file-pattern",
+        "--localstorage-file", "--env-file", "--env-file-if-exists",
+        "--max-old-space-size", "--max-semi-space-size", "--stack-size",
+        "--stack-trace-limit", "--v8-pool-size", "--title", "--icu-data-dir",
+        "--openssl-config", "--tls-cipher-list", "--tls-keylog",
+        "--heapsnapshot-signal", "--heapsnapshot-near-heap-limit",
+        "--diagnostic-dir", "--redirect-warnings", "--disk-cache-dir",
+        "--experimental-policy", "--policy-integrity", "--conditions",
+        "-C", "--report-dir", "--report-directory", "--report-filename",
+        "--report-signal", "--secure-heap", "--secure-heap-min", "--dns-result-order"};
+    for (std::string_view f : kValued) {
+        if (flag == f) return true;
+    }
+    return false;
+}
+
+// ── process.execArgv ────────────────────────────────────────────────────────
+// The runtime flags that precede the entry point. They are NEVER part of
+// process.argv, and until now mbun reported an always-empty execArgv for every
+// non-compiled invocation, which is what made 19% of the node corpus unrunnable:
+// test/common/index.js re-execs the test through `process.execPath` whenever a
+// flag from the file's `// Flags:` header is missing from process.execArgv, so an
+// empty execArgv meant the child re-spawned itself, forever, until the group was
+// aborted (`process.kill(0, result.signal)`).
+//
+// Derivation is a straight port of bun's own re-parser
+// (src/runtime/node/node_process.rs `create_exec_argv`): walk the raw command
+// line, take every leading `-…` token as a runtime flag, skip one `run`
+// subcommand, keep the value token of a value-taking flag, and stop at the first
+// remaining positional (the script). bun deliberately re-parses argv here rather
+// than threading state out of the CLI, and so do we — the CLI's own flag loops
+// consume flags in several places, and execArgv must not depend on which one won.
+
+// A flag whose value is a SEPARATE token, for the execArgv re-parser: the union
+// of node's table (node_flag_takes_value) and bun's value-taking AUTO_PARAMS
+// (cli/Arguments.rs BASE_/TRANSPILER_/RUNTIME_PARAMS_), which is exactly the set
+// bun's create_exec_argv consults.
+bool exec_argv_flag_takes_value(std::string_view flag) {
+    if (node_flag_takes_value(flag)) return true;
+    static constexpr std::string_view kValued[]{
+        "-e",     "--eval",   "-p",       "--print",  "--preload", "--import",
+        "--cwd",  "-c",       "--config", "--shell",  "--install", "--port",
+        "-u",     "--origin", "-F",       "--filter", "--user-agent",
+        "--unhandled-rejections", "--console-depth",  "--elide-lines",
+        "--fetch-preconnect",     "--cron-period",    "--cron-title",
+        "--inspect", "--inspect-brk", "--inspect-wait",
+        "--main-fields", "--extension-order", "--tsconfig-override",
+        "-d", "--define", "--drop", "--feature", "-l", "--loader",
+        "--jsx-factory", "--jsx-fragment", "--jsx-import-source", "--jsx-runtime",
+        "--breakpoint-resolve", "--breakpoint-print"};
+    for (std::string_view f : kValued) {
+        if (flag == f) return true;
+    }
+    return false;
+}
+
+std::vector<std::string> derive_exec_argv(std::span<const std::string_view> args) {
+    std::vector<std::string> execArgv{};
+    bool seenRun{false};
+    std::string_view prev{};
+    for (const std::string_view a : args) {
+        if (!a.empty() && a[0] == '-') {
+            execArgv.emplace_back(a);
+            prev = a;
+            continue;
+        }
+        if (!seenRun && a == "run") {
+            seenRun = true;
+            prev = a;
+            continue;
+        }
+        // A value-taking flag owns the next token, so it is not the script.
+        if (!prev.empty() && exec_argv_flag_takes_value(prev)) {
+            execArgv.emplace_back(a);
+            prev = a;
+            continue;
+        }
+        break;  // the entry point — everything after it belongs to the script
+    }
+    return execArgv;
+}
+
 // ─── `mbun test` flags ──────────────────────────────────────────────────────
 // Flag names/arity are transcribed from bun's TEST_ONLY_PARAMS table
 // (ref: bun-ref/src/cli/Arguments.rs:560-615) and the semantics from the test
