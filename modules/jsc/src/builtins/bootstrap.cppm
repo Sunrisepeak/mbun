@@ -1416,12 +1416,19 @@ inline constexpr char kBootstrapJS_[] = R"JS(
 
     function emitError(emitter, args) {
       const events = emitter._events;
-      args[0] ??= new Error("Unhandled error.");
-      if (!events) throw args[0];
+      // node substitutes a synthetic error ONLY on the no-listener throw path
+      // (lib/events.js: `throw new ERR_UNHANDLED_ERROR(...)`). A registered
+      // 'error' listener receives the emitted value verbatim, `null` and
+      // `undefined` included — overwriting args[0] up front handed the listener
+      // an "Unhandled error." Error instead, which node:domain then reported as
+      // the thrown value (test-domain-multiple-errors / -error-types emit every
+      // primitive and assert identity).
+      const unhandled = () => args[0] ?? new Error("Unhandled error.");
+      if (!events) throw unhandled();
       const errorMonitor = events[kErrorMonitor];
       if (errorMonitor) for (const handler of errorMonitor.slice()) handler.apply(emitter, args);
       const handlers = events.error;
-      if (!handlers) throw args[0];
+      if (!handlers) throw unhandled();
       for (const handler of handlers.slice()) handler.apply(emitter, args);
       return true;
     }
