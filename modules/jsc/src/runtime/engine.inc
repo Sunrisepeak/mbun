@@ -1332,7 +1332,7 @@ public:
   // a listener registered after the emitWarning call in the same tick still sees
   // the warning. No default stderr print when unlistened (node/bun do print) —
   // that would inject noise into the snapshot tests; left for the node-compat track.
-  p.emitWarning = function (warning, opts) { const name = (opts && (typeof opts === 'string' ? opts : opts.type)) || 'Warning'; const e = warning instanceof Error ? warning : Object.assign(new Error(String(warning)), { name }); p.nextTick(function () { p.emit('warning', e); }); };
+  p.emitWarning = function (warning, opts, code, ctor) { let type = opts, c = code, detail; if (opts && typeof opts === 'object') { type = opts.type; c = opts.code; detail = opts.detail; } else if (typeof opts === 'function') { ctor = opts; type = undefined; } if (typeof c === 'function') { ctor = c; c = undefined; } const name = type || 'Warning'; const e = warning instanceof Error ? warning : Object.assign(new Error(String(warning)), { name }); if (c !== undefined) e.code = c; if (detail !== undefined) e.detail = detail; p.nextTick(function () { p.emit('warning', e); }); };
   p.emitMemoryPressure = function () {};
   p.isMemoryPressureWatcherInstalled = function () { return false; };
   p.getuid = function () { return 0; }; p.getgid = function () { return 0; };

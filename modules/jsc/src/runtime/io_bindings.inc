@@ -1241,6 +1241,10 @@ std::string fd_errno_code(int e) {
         case EBUSY: return "EBUSY";
         case ENOTEMPTY: return "ENOTEMPTY";
         case EAGAIN: return "EAGAIN";
+#if !defined(_WIN32)
+        case EOVERFLOW: return "EOVERFLOW";
+        case EFBIG: return "EFBIG";
+#endif
         default: return {};
     }
 }
@@ -1277,8 +1281,27 @@ JSC_DEFINE_HOST_FUNCTION(fdn_open_host, (JSC::JSGlobalObject* global, JSC::CallF
     std::string path{pathArg.view()};
     std::string flags{"r"};
     if (frame->argumentCount() > 1) {
-        JsStrArg f{global, frame->argument(1)};
-        flags.assign(f.view());
+        JSC::JSValue flagV{frame->argument(1)};
+        // node accepts the numeric O_* bitmask everywhere a flag string goes
+        // (fs.open(p, fs.constants.O_WRONLY | O_CREAT), writeFileSync flag).
+        // Stringifying it produced "577", whose first char selected the
+        // read-only default — the write silently went to a read-only fd.
+#if defined(_WIN32)
+        constexpr int O_APPEND{0x0008}, O_CREAT{0x0100}, O_TRUNC{0x0200}, O_EXCL{0x0400};
+#endif
+        if (flagV.isNumber()) {
+            const int bits{static_cast<int>(flagV.asNumber())};
+            const int access{bits & 3};
+            const bool plus{access == 2};
+            if ((bits & O_APPEND) != 0) flags = plus ? "a+" : "a";
+            else if (access == 0) flags = "r";
+            else if ((bits & (O_TRUNC | O_CREAT)) != 0) flags = plus ? "w+" : "w";
+            else flags = plus ? "r+" : "r+";
+            if ((bits & O_EXCL) != 0) flags += "x";
+        } else {
+            JsStrArg f{global, flagV};
+            flags.assign(f.view());
+        }
     }
     io::OpenOptions o{};
     const bool plus{flags.find('+') != std::string::npos};
@@ -1378,6 +1401,11 @@ JSC_DEFINE_HOST_FUNCTION(fdn_read_host, (JSC::JSGlobalObject* global, JSC::CallF
     // returned 0 alongside, which callers with a pending exception never see.
     if (!a) return JSC::JSValue::encode(JSC::jsNumber(0));
     std::span<std::byte> out{a->base, a->len};
+    // A position past 2^53 cannot round-trip through a JS double, so pread(2)
+    // would receive a wrapped (negative) off_t and report EINVAL. node's own
+    // corpus accepts EFBIG/EOVERFLOW for such positions — report EOVERFLOW
+    // rather than a bare EIO string with no `code` on it.
+    if (a->pos > 9007199254740992.0) return fd_throw_errno(global, EOVERFLOW, "read", "");
     auto r{a->pos >= 0 ? a->file->read_at(static_cast<std::uint64_t>(a->pos), out)
                        : a->file->read(out)};
     if (!r) {
@@ -1385,7 +1413,8 @@ JSC_DEFINE_HOST_FUNCTION(fdn_read_host, (JSC::JSGlobalObject* global, JSC::CallF
         // error: report -1 so the JS FIFO reader can retry instead of throwing.
         if (r.error().code == mbun::core::io::ErrorCode::WouldBlock)
             return JSC::JSValue::encode(JSC::jsNumber(-1));
-        return fd_throw(global, "EIO: read failed");
+        return fd_throw_errno(global, r.error().nativeCode != 0 ? r.error().nativeCode : EIO,
+                              "read", "");
     }
     return JSC::JSValue::encode(JSC::jsNumber(static_cast<double>(*r)));
 }
@@ -1394,6 +1423,7 @@ JSC_DEFINE_HOST_FUNCTION(fdn_write_host, (JSC::JSGlobalObject* global, JSC::Call
     auto a{fd_io_args(global, frame)};
     if (!a) return JSC::JSValue::encode(JSC::jsNumber(0));
     std::span<const std::byte> in{a->base, a->len};
+    if (a->pos > 9007199254740992.0) return fd_throw_errno(global, EOVERFLOW, "write", "");
     auto r{a->pos >= 0 ? a->file->write_at(static_cast<std::uint64_t>(a->pos), in)
                        : a->file->write(in)};
     if (!r) {
@@ -1401,7 +1431,8 @@ JSC_DEFINE_HOST_FUNCTION(fdn_write_host, (JSC::JSGlobalObject* global, JSC::Call
         // so the JS FileSink buffers the remainder rather than throwing.
         if (r.error().code == mbun::core::io::ErrorCode::WouldBlock)
             return JSC::JSValue::encode(JSC::jsNumber(-1));
-        return fd_throw(global, "EIO: write failed");
+        return fd_throw_errno(global, r.error().nativeCode != 0 ? r.error().nativeCode : EIO,
+                              "write", "");
     }
     return JSC::JSValue::encode(JSC::jsNumber(static_cast<double>(*r)));
 }
