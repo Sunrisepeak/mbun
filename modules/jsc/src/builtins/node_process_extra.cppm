@@ -103,8 +103,12 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
           let list = this[kListeners].get(type);
           if (!list) { list = []; this[kListeners].set(type, list); }
           for (const l of list) if (l.callback === callback && l.capture === capture) return;
-          const rec = { callback, capture, once: !!options.once, passive: !!options.passive };
-          if (options.signal && typeof options.signal.addEventListener === "function") {
+          const rec = { callback, capture, once: !!options.once, passive: !!options.passive, removed: false };
+          if (options.signal !== undefined) {
+            // WebIDL: `signal` is an AbortSignal, so anything else (including
+            // null and a bare object with the right shape) is a TypeError.
+            if (!(G.AbortSignal && options.signal instanceof G.AbortSignal))
+              throw new TypeError("The 'signal' option must be an AbortSignal");
             if (options.signal.aborted) return;
             const target = this;
             // The abort algorithm is owned by the *listener*: whichever path
@@ -129,6 +133,10 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
             if (list[i].callback === callback && list[i].capture === capture) {
               const rec = list[i];
               list.splice(i, 1);
+              // DOM dispatch iterates a snapshot of the listener list but must
+              // skip any entry removed while the event is in flight (a listener
+              // that aborts the shared signal must not let the next one run).
+              rec.removed = true;
               if (rec.signal && rec.onAbort) {
                 const sig = rec.signal, onAbort = rec.onAbort;
                 rec.signal = null; rec.onAbort = null;  // re-entrancy: abort → here
@@ -147,6 +155,7 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
           if (list) {
             for (const rec of list.slice()) {
               if (event[kStopImmediate]) break;
+              if (rec.removed) continue;
               if (rec.once) this.removeEventListener(event.type, rec.callback, { capture: rec.capture });
               try {
                 if (typeof rec.callback === "function") rec.callback.call(this, event);

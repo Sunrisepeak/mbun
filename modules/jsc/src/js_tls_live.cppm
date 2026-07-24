@@ -233,9 +233,10 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
           maxVersion: ver.max,
         });
       };
-      // A freshly-created client transport is still connecting; an accepted
-      // server socket or an upgrade target is already live — start immediately.
-      if (transport._fd >= 0 && !transport.connecting) start();
+      // A live fd means the reactor's connect() already returned, whether this is
+      // an accepted server socket, an upgrade target, or a client whose
+      // `connecting` flag is still set until its 'connect' event fires.
+      if (transport._fd >= 0) start();
       else transport.once("connect", start);
       return this;
     }
