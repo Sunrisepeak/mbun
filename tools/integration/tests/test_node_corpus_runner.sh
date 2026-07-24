@@ -9,6 +9,7 @@ trap 'rm -rf "$tmp"' EXIT
 cat >"$tmp/fake-mbun" <<'EOF'
 #!/usr/bin/env bash
 case "$1" in
+  *test-skip*) echo "1..0 # Skipped: QUIC is not enabled" ;;
   *test-pass*) echo ok ;;
   *test-fail*) echo boom >&2; exit 1 ;;
   *test-timeout*) sleep 10 ;;
@@ -21,6 +22,8 @@ mkdir -p "$corpus"
 echo "// pass" >"$corpus/test-pass.js"
 echo "// fail" >"$corpus/test-fail.js"
 echo "// hang" >"$corpus/test-timeout.js"
+# Exits 0, but only by declining to run: must NOT be counted as a pass.
+echo "// skip" >"$corpus/test-skip.js"
 echo "not a test" >"$corpus/other.txt"
 
 python3 "$repo_root/tools/integration/node_corpus_runner.py" \
@@ -31,13 +34,16 @@ python3 - "$tmp/out" <<'PY'
 import csv, json, pathlib, sys
 root = pathlib.Path(sys.argv[1])
 rows = {row["path"]: row for row in csv.DictReader((root / "results.tsv").open(), delimiter="\t")}
-assert len(rows) == 3, rows
+assert len(rows) == 4, rows
 assert rows["corpus/parallel/test-pass.js"]["classification"] == "pass"
 assert rows["corpus/parallel/test-fail.js"]["classification"] == "fail"
 assert rows["corpus/parallel/test-timeout.js"]["classification"] == "timeout"
+# exit 0 + a TAP zero-test plan is a skip, not coverage
+assert rows["corpus/parallel/test-skip.js"]["exit_code"] == "0"
+assert rows["corpus/parallel/test-skip.js"]["classification"] == "skipped"
 summary = json.loads((root / "summary.json").read_text())
-assert summary["files"] == 3
-assert summary["categories"] == {"fail": 1, "pass": 1, "timeout": 1}
+assert summary["files"] == 4
+assert summary["categories"] == {"fail": 1, "pass": 1, "skipped": 1, "timeout": 1}
 assert all((root / row["log"]).is_file() for row in rows.values())
 # The private TMPDIRs must have been cleaned up.
 tmp_dir = root / "tmp"

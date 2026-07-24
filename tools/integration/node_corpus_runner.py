@@ -8,6 +8,11 @@ bindings, python harness env) are NOT emulated — files needing them count as
 failures, which keeps the measurement honest file-level coverage, comparable
 across runs, rather than an API checklist.
 
+A file that skipped itself (`common.skip()` -> `1..0 # Skipped:`, exit 0) is
+classified `skipped`, never `pass`: it exits clean precisely because the
+runtime lacks the feature it wanted to test, so counting it as coverage would
+reward the gap it is reporting.
+
 Each test runs through bounded_run.BoundedRun — the shared safety layer
 (systemd scope limits, own session, file-backed output, private TMPDIR,
 disk-headroom guard) that keeps a hostile workload from freezing the machine
@@ -27,6 +32,17 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from bounded_run import BoundedRun, ensure_disk_headroom
+
+# node's common.skip() prints a TAP plan of zero tests and exits 0 (see
+# test/common/index.js printSkipMessage). Exit code alone therefore cannot tell
+# "ran everything and passed" from "declined to run anything", and 1527 corpus
+# files can take a skip path — gated on process.features.*, hasCrypto,
+# hasInspector, a missing service, or a platform. Counting those as passes
+# inflates the headline by whatever the runtime happens NOT to implement: the
+# 237 test-quic-* files all skip on `!process.features.quic`, so a runtime that
+# never adds QUIC would bank +237 "passes" for it. The bun runner already keeps
+# an `all-skipped` bucket for the same reason; this is its node counterpart.
+TAP_SKIP_RE = re.compile(r"(?m)^\s*1\.\.0\s*#\s*Skipped:")
 
 
 @dataclass(frozen=True)
@@ -63,10 +79,18 @@ def run_one(binary: Path, root: Path, output_dir: Path, timeout: float, path: st
     elif bounded.oom_killed:
         classification = "oom-kill"
     elif bounded.exit_code == 0:
-        classification = "pass"
+        classification = "skipped" if declared_skip(output_dir / relative_log) else "pass"
     else:
         classification = "fail"
     return Result(path, bounded.exit_code, classification, duration_ms, str(relative_log))
+
+
+def declared_skip(log_path: Path) -> bool:
+    """True when the file exited 0 only because it skipped itself."""
+    try:
+        return TAP_SKIP_RE.search(log_path.read_text(encoding="utf-8", errors="replace")) is not None
+    except OSError:
+        return False
 
 
 def discover(root: Path, corpus_dir: Path) -> list[str]:
