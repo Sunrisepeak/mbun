@@ -27,6 +27,7 @@ export import :zlib_stream;
 export import :crypto_asym;
 export import :node_os;
 export import :node_vm;
+export import :node_vm_modules;
 export import :node_tls;
 export import :node_worker;
 export import :node_readline;
@@ -92,6 +93,8 @@ export inline const std::string kNodeBuiltinsJS =
         .append(detail::kZlibStreamJS)
         .append(detail::kNodeOsJS)
         .append(detail::kNodeVmJS)
+        // vm.Module & friends — needs the vm namespace above already registered.
+        .append(detail::kNodeVmModulesJS)
         .append(detail::kNodeTlsJS)
         .append(detail::kNodeWorkerJS)
         .append(detail::kNodeReadlineJS)

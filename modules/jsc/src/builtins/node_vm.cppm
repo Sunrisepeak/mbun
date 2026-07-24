@@ -446,6 +446,29 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
     measureMemory,
     constants,
   };
+  // Internal seam for the node:vm.Module partition (node_vm_modules): it needs
+  // to evaluate a wrapper *in* a contextified realm and to reach that realm's
+  // global, both of which only this module knows how to do. Non-enumerable, so
+  // it never shows up in a `vm` namespace snapshot.
+  Object.defineProperty(vm, "__internal", {
+    value: {
+      runRaw(contextifiedObject, code, filename) {
+        const rec = records.get(contextifiedObject);
+        syncIn(rec);
+        try {
+          return NVM.runInContext(rec.handle, code, filename, true);
+        } finally {
+          syncOut(rec);
+        }
+      },
+      globalOf(contextifiedObject) {
+        const rec = records.get(contextifiedObject);
+        return rec === undefined ? undefined : rec.global;
+      },
+    },
+    enumerable: false,
+    configurable: true,
+  });
   M["vm"] = vm;
   M["node:vm"] = vm;
 })();
