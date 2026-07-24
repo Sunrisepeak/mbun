@@ -1161,7 +1161,15 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       if (mi === -1) break;  // nothing due yet — real time gates firing
       const t = T.q[mi]; T.now = now;
       if (t.iv > 0) t.at = now + t.iv; else T.q.splice(mi, 1);
-      try { t.fn.apply(null, t.a); } catch (e) {}
+      // A throw out of a timer callback is an UNCAUGHT EXCEPTION, exactly as in
+      // node — not something to discard. Swallowing it here meant
+      // `setTimeout(() => { throw new Error() })` printed nothing, skipped every
+      // 'uncaughtException' listener and still exited 0. Route it through the
+      // shared escalation (capture callback → listeners → fatal).
+      try { t.fn.apply(null, t.a); }
+      catch (e) {
+        if (typeof G.__mbunEmitUncaught === "function") G.__mbunEmitUncaught(e, "uncaughtException");
+      }
       fired++; T.fired++;
     }
     const now2 = Date.now();
