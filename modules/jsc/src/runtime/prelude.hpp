@@ -128,6 +128,7 @@
 #  include <sys/wait.h>
 #  include <sys/stat.h>  // stat() for Bun.which is_executable_file_path probe
 #  include <sys/syscall.h>  // SYS_close_range on Linux/musl
+#  include <sys/statvfs.h>  // statvfs() backing fs.statfs / fs.statfsSync
 #  include <unistd.h>
 // POSIX TCP sockets for __mbunNetNative (Bun.serve / real fetch / node:net).
 #  include <sys/socket.h>

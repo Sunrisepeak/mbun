@@ -38,6 +38,7 @@ export import :node_http;
 export import :node_diag;
 export import :node_net;
 export import :node_fs_watch;
+export import :node_fs_streams;
 export import :bun_password;
 export import :node_process_extra;
 export import :node_util_extra;
@@ -101,6 +102,9 @@ export inline const std::string kNodeBuiltinsJS =
         .append(detail::kNodeDiagJS)
         .append(detail::kNodeNetJS)
         .append(detail::kNodeFsWatchJS)
+        // fs.ReadStream/WriteStream: needs node:stream (Readable/Writable) and
+        // the fs module both already registered.
+        .append(detail::kNodeFsStreamsJS)
         .append(detail::kBunPasswordJS)
         .append(detail::kNodeProcessExtraJS)
         // node:test standalone runner (used when no bun:test harness is present);
