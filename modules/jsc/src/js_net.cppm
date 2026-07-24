@@ -2520,10 +2520,24 @@ export constexpr std::string_view kNetJS = R"JS(
   // Copy DESCRIPTORS, not values: node:http's `maxHeaderSize` is a live
   // accessor over the process-wide limit, and Object.assign would freeze it
   // into a plain data property (setter never reaching the native global).
+  // node http.Server is a constructor — `new http.Server([options][, requestListener])`
+  // — and its historical bare-factory form works too. What was exported here was
+  // net's Server class, so `http.Server(fn)` built a *net* server and fn became
+  // its 'connection' listener: the handler was called with (socket), and `res`
+  // was undefined. 27 corpus files died on res.write / res.statusCode /
+  // req.client._events for exactly this reason. Route both call forms through
+  // createHttpServer; `instanceof` keeps working because the object it returns
+  // is a Server and the stand-in shares that prototype.
+  function HttpServer(options, requestListener) { return createHttpServer(options, requestListener); }
+  try {
+    HttpServer.prototype = Server.prototype;
+    Object.defineProperty(HttpServer, "name", { value: "Server", configurable: true });
+    Object.defineProperty(HttpServer, "length", { value: 2, configurable: true });
+  } catch (e) {}
   def(["http"], Object.assign(
     Object.defineProperties({}, Object.getOwnPropertyDescriptors(M["http"] || {})), {
     createServer: createHttpServer,
-    Server, IncomingMessage, ServerResponse,
+    Server: HttpServer, IncomingMessage, ServerResponse,
   }));
 
   // ---- real network fetch() ---------------------------------------------------
