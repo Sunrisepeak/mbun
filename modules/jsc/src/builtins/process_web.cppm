@@ -64,6 +64,143 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     if (rec.stdinEnded) { try { PROC.close(rec.stdinFd); } catch (e) {} rec.stdinClosed = true; if (rec.cp.stdin) { rec.cp.stdin.destroyed = true; rec.cp.stdin.writable = false; } }
   };
 
+  // ---- IPC channel (node fork() / process.send) ---------------------------
+  // node frames each IPC message as one line of JSON over the AF_UNIX
+  // socketpair opened by the "ipc" stdio slot
+  // (lib/internal/child_process/serialization.js, `json` mode:
+  // `JSON.stringify(message) + "\n"`). The child locates its own end through
+  // NODE_CHANNEL_FD exactly as node's _forkChild does.
+  // DEFERRED: handle passing (SCM_RIGHTS / the NODE_HANDLE protocol) — send()'s
+  // `handle` argument is validated and rejected with ERR_INVALID_HANDLE_TYPE
+  // rather than silently dropping a socket, and 'advanced' (v8) serialization
+  // is not implemented.
+  const IPC_HIGH_WATER = 65536 * 2;
+  const recvDesc = (v) => {
+    if (v === null) return "null";
+    if (v === undefined) return "undefined";
+    const t = typeof v;
+    if (t === "symbol") return "type symbol (" + String(v) + ")";
+    if (t === "string") return "type string ('" + v + "')";
+    if (t === "function") return "function " + (v.name || "");
+    if (t === "object") return "an instance of " + ((v.constructor && v.constructor.name) || "Object");
+    return "type " + t + " (" + String(v) + ")";
+  };
+  const makeIpc = (fd) => { PROC.setNonBlock(fd); return { fd, buf: "", out: [], queued: 0, closed: false, refd: true }; };
+  const ipcClose = (ch) => { if (ch.closed) return; ch.closed = true; try { PROC.close(ch.fd); } catch (e) {} };
+  const ipcFlush = (ch) => {
+    while (ch.out.length && !ch.closed) {
+      const item = ch.out[0];
+      const w = PROC.writeNB(ch.fd, _b64(item.data.subarray(item.off)), 0);
+      if (w < 0) {  // peer gone — drop the rest, the 'disconnect' path reports it
+        ch.out.shift(); ch.queued -= item.data.length - item.off;
+        if (item.cb) { const cb = item.cb; nextTick(() => cb(null)); }
+        continue;
+      }
+      if (w === 0) return;  // EAGAIN — retry next tick
+      item.off += w; ch.queued -= w;
+      if (item.off >= item.data.length) { ch.out.shift(); if (item.cb) { const cb = item.cb; nextTick(() => cb(null)); } }
+      else return;
+    }
+  };
+  const ipcWrite = (ch, message, cb) => {
+    const data = te.encode(JSON.stringify(message === undefined ? null : message) + "\n");
+    ch.out.push({ data, off: 0, cb: cb || null });
+    ch.queued += data.length;
+    ipcFlush(ch);
+    return ch.queued < IPC_HIGH_WATER;
+  };
+  const ipcRead = (ch, onMessage, onEof) => {
+    for (;;) {
+      let b;
+      try { b = PROC.readNB(ch.fd, 65536); } catch (e) { onEof(); return; }
+      if (b === null) { onEof(); return; }
+      if (b === "") return;
+      ch.buf += Buffer.from(_unb64(b)).toString("utf8");
+      let idx;
+      while ((idx = ch.buf.indexOf("\n")) >= 0) {
+        const line = ch.buf.slice(0, idx);
+        ch.buf = ch.buf.slice(idx + 1);
+        if (!line) continue;
+        let msg;
+        try { msg = JSON.parse(line); } catch (e) { continue; }
+        onMessage(msg);
+      }
+    }
+  };
+  const isInternalIpc = (m) => m !== null && typeof m === "object" && typeof m.cmd === "string" && m.cmd.slice(0, 5) === "NODE_";
+
+  // The send()/disconnect()/connected surface shared by both ends of a channel
+  // (node lib/internal/child_process.js setupChannel): the parent's
+  // ChildProcess and, inside a forked child, `process` itself.
+  const attachIpc = (target, ch, onDisconnect) => {
+    target.channel = { fd: ch.fd, ref() { ch.refd = true; return this; }, unref() { ch.refd = false; return this; }, hasRef() { return ch.refd; } };
+    target.connected = true;
+    target.send = function (message, handle, options, callback) {
+      if (typeof handle === "function") { callback = handle; handle = undefined; options = undefined; }
+      else if (typeof options === "function") { callback = options; options = undefined; }
+      else if (options !== undefined) {
+        if (options === null || typeof options !== "object") {
+          const e = new TypeError('The "options" argument must be of type object. Received ' + recvDesc(options));
+          e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+        }
+      }
+      if (callback !== undefined && callback !== null && typeof callback !== "function") {
+        const e = new TypeError('The "callback" argument must be of type function. Received ' + recvDesc(callback));
+        e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+      }
+      if (message === undefined) { const e = new TypeError('The "message" argument must be specified'); e.code = "ERR_MISSING_ARGS"; throw e; }
+      const mt = typeof message;
+      if (mt !== "string" && mt !== "object" && mt !== "number" && mt !== "boolean") {
+        const e = new TypeError('The "message" argument must be one of type string, object, number, or boolean. Received ' + recvDesc(message));
+        e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+      }
+      if (handle !== undefined && handle !== null) {
+        const e = new TypeError("This handle type cannot be sent"); e.code = "ERR_INVALID_HANDLE_TYPE"; throw e;
+      }
+      if (!this.connected || ch.closed) {
+        const e = new Error("Channel closed"); e.code = "ERR_IPC_CHANNEL_CLOSED";
+        const self = this;
+        if (typeof callback === "function") nextTick(() => callback(e));
+        else nextTick(() => { self.emit("error", e); });
+        return false;
+      }
+      return ipcWrite(ch, message, typeof callback === "function" ? callback : null);
+    };
+    // node defers the 'disconnect' event to the next tick even when the local
+    // side initiated it (test-child-process-disconnect asserts exactly that).
+    target.disconnect = function () {
+      if (!this.connected) {
+        const e = new Error("IPC channel is already disconnected"); e.code = "ERR_IPC_DISCONNECTED";
+        this.emit("error", e);
+        return;
+      }
+      this.connected = false;
+      const self = this;
+      nextTick(() => {
+        ipcClose(ch);
+        self.channel = null;
+        if (onDisconnect) onDisconnect();
+        self.emit("disconnect");
+      });
+    };
+  };
+
+  // Messages that arrive before any 'message' listener exists are queued (node
+  // replays them from the channel's pending list once one is attached).
+  const makeIpcDelivery = (target) => {
+    const pending = [];
+    return {
+      deliver(msg) {
+        if (isInternalIpc(msg)) { target.emit("internalMessage", msg); return; }
+        pending.push(msg);
+        this.flush();
+      },
+      flush() {
+        while (pending.length && target.listenerCount("message") > 0) target.emit("message", pending.shift());
+      },
+    };
+  };
+
   const drainOut = (o) => {
     for (;;) {
       const b = PROC.readNB(o.fd, 65536);
@@ -76,6 +213,9 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   const maybeClose = (rec) => {
     if (!rec.exited || rec.closed) return;
     for (const o of rec.outs) if (!o.ended) return;  // wait for all pipes to hit EOF
+    // node counts the IPC channel as a live handle too: 'disconnect' must land
+    // before 'close' (lib/internal/child_process.js maybeClose).
+    if (rec.ipc && !rec.ipc.closed) return;
     if (rec.stdinFd >= 0 && !rec.stdinClosed) { try { PROC.close(rec.stdinFd); } catch (e) {} rec.stdinClosed = true; if (rec.cp.stdin) { rec.cp.stdin.destroyed = true; rec.cp.stdin.writable = false; } }
     rec.closed = true; rec.done = true;
     rec.cp.emit("close", rec.code, rec.signal);
@@ -95,21 +235,51 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     maybeClose(rec);
   };
 
+  // This process's own channel back to the parent when it was fork()ed
+  // (NODE_CHANNEL_FD). Serviced by the same tick as the children we spawned.
+  let SELF_IPC = null;
+
+  const drainChildIpc = (rec) => {
+    ipcRead(rec.ipc, (msg) => rec.ipcDelivery.deliver(msg), () => {
+      ipcClose(rec.ipc);
+      if (rec.cp.connected) {
+        rec.cp.connected = false;
+        rec.cp.channel = null;
+        nextTick(() => rec.cp.emit("disconnect"));
+      }
+    });
+  };
+
   G.__mbun_io_tick = function () {
-    if (!CHILDREN.size) return 0;
+    if (!CHILDREN.size && SELF_IPC === null) return 0;
     const recs = [...CHILDREN];
     const readFds = [], readObjs = [];
     for (const rec of recs) for (const o of rec.outs) if (!o.ended && o.fd >= 0) { readFds.push(o.fd); readObjs.push(o); }
+    for (const rec of recs) if (rec.ipc && !rec.ipc.closed) { readFds.push(rec.ipc.fd); readObjs.push({ ipcRec: rec }); }
+    if (SELF_IPC !== null && !SELF_IPC.ch.closed) { readFds.push(SELF_IPC.ch.fd); readObjs.push({ self: SELF_IPC }); }
     if (readFds.length) {
       const ready = PROC.poll(readFds, 5);
-      for (let i = 0; i < readObjs.length; i++) if (ready[i]) drainOut(readObjs[i]);
+      for (let i = 0; i < readObjs.length; i++) {
+        if (!ready[i]) continue;
+        const o = readObjs[i];
+        if (o.ipcRec) drainChildIpc(o.ipcRec);
+        else if (o.self) o.self.drain();
+        else drainOut(o);
+      }
     } else {
       PROC.poll([], 2);  // brief real wait while waiting for a child to exit
     }
     for (const rec of recs) flushStdin(rec);
+    for (const rec of recs) if (rec.ipc && !rec.ipc.closed) { ipcFlush(rec.ipc); rec.ipcDelivery.flush(); }
+    if (SELF_IPC !== null && !SELF_IPC.ch.closed) { ipcFlush(SELF_IPC.ch); SELF_IPC.delivery.flush(); }
     for (const rec of recs) reap(rec);
     let active = 0;
     for (const rec of recs) { if (rec.done) CHILDREN.delete(rec); else active++; }
+    // node ref-counts the child-side channel: it pins the loop only while a
+    // 'message' or 'disconnect' listener is attached (setupChannel's
+    // newListener/removeListener ref counting) — that is what lets
+    // fixtures/child-process-spawn-node.js exit after removing its listener.
+    if (SELF_IPC !== null && !SELF_IPC.ch.closed && SELF_IPC.ch.refd && SELF_IPC.pinned()) active++;
     return active;
   };
 
@@ -157,7 +327,9 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     if (typeof stdio === "string") stdio = [stdio, stdio, stdio];
     else stdio = stdio.slice();
     while (stdio.length < 3) stdio.push("pipe");
-    return stdio.map((s) => (s == null ? "pipe" : typeof s === "number" ? s : s === "overlapped" ? "pipe" : s === "ipc" ? "ignore" : s));
+    // "ipc" survives to the native layer, which opens an AF_UNIX socketpair for
+    // that slot (node's fork channel); everything else maps to a plain pipe.
+    return stdio.map((s) => (s == null ? "pipe" : typeof s === "number" ? s : s === "overlapped" ? "pipe" : s));
   };
 
   class ChildProcess extends EventEmitter {
@@ -180,12 +352,23 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       if (options.argv0 != null) args[0] = toStr(options.argv0);
       this.spawnfile = file; this.spawnargs = args;
       const stdio = normStdio(options.stdio);
+      const ipcIndex = stdio.indexOf("ipc");
       const sopts = { stdio };
       if (options.cwd != null) sopts.cwd = toStr(options.cwd);
       // node inherits process.env when env is unset (undefined/null); an explicit
       // {} means an empty environment. Snapshot process.env so the child sees the
       // JS-visible env (harness-injected vars), not just the raw OS environ.
-      sopts.env = options.env && typeof options.env === "object" ? options.env : (G.process && G.process.env) || {};
+      const baseEnv = options.env && typeof options.env === "object" ? options.env : (G.process && G.process.env) || {};
+      if (ipcIndex >= 0) {
+        // node advertises the child's end of the channel through NODE_CHANNEL_FD
+        // (lib/internal/child_process.js spawn()); the fd number is the slot index.
+        const e = {};
+        for (const k of Object.keys(baseEnv)) e[k] = baseEnv[k];
+        e.NODE_CHANNEL_FD = String(ipcIndex);
+        sopts.env = e;
+      } else {
+        sopts.env = baseEnv;
+      }
       if (options.detached) sopts.detached = true;
       if (typeof options.uid === "number") sopts.uid = options.uid;
       if (typeof options.gid === "number") sopts.gid = options.gid;
@@ -205,11 +388,16 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       }
       this.pid = h.pid;
       const fds = h.fds || [];
-      const rec = { cp: this, pid: h.pid, outs: [], stdinFd: -1, stdinBuf: [], stdinEnded: false, stdinClosed: false, exited: false, closed: false, done: false, code: null, signal: null };
+      const rec = { cp: this, pid: h.pid, outs: [], stdinFd: -1, stdinBuf: [], stdinEnded: false, stdinClosed: false, exited: false, closed: false, done: false, code: null, signal: null, ipc: null, ipcDelivery: null };
       const stdioArr = [];
       for (let i = 0; i < stdio.length; i++) {
         const fd = fds[i] != null ? fds[i] : -1;
-        if (stdio[i] === "pipe" && fd >= 0) {
+        if (stdio[i] === "ipc" && fd >= 0) {
+          rec.ipc = makeIpc(fd);
+          rec.ipcDelivery = makeIpcDelivery(this);
+          stdioArr[i] = null;  // node exposes the channel as .channel, not .stdio[n]
+          attachIpc(this, rec.ipc, null);
+        } else if (stdio[i] === "pipe" && fd >= 0) {
           if (i === 0) { PROC.setNonBlock(fd); rec.stdinFd = fd; const wr = makeStdin(fd, rec); this.stdin = wr; stdioArr[i] = wr; }
           // Out fds MUST be O_NONBLOCK: drainOut loops readNB until "" (EAGAIN);
           // on a blocking fd the read AFTER a partial chunk wedges the JS thread
@@ -234,7 +422,15 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
           }
         };
         if (sig.aborted) nextTick(doAbort);
-        else if (typeof sig.addEventListener === "function") sig.addEventListener("abort", doAbort, { once: true });
+        else if (typeof sig.addEventListener === "function") {
+          sig.addEventListener("abort", doAbort, { once: true });
+          // node removes the abort listener once the child is gone, so an
+          // AbortSignal shared across children does not accumulate handlers
+          // (child_process.ts abortChildProcess / onAbortListener cleanup).
+          this.once("exit", () => {
+            if (typeof sig.removeEventListener === "function") sig.removeEventListener("abort", doAbort);
+          });
+        }
       }
       // 'exit' clears any pending timeout so it cannot kill a reused pid.
       this.once("exit", () => { if (self._timeoutTimer) { G.clearTimeout(self._timeoutTimer); self._timeoutTimer = null; } });
@@ -262,9 +458,101 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     try { return G.Bun && Bun.which ? Bun.which(file) : file; } catch (e) { return file; }
   };
 
+  // ---- node normalizeSpawnArguments / normalizeExecFileArgs ---------------
+  // Ported from node lib/child_process.js + lib/internal/validators.js so that
+  // every entry point rejects the same shapes with the same error codes
+  // (ERR_INVALID_ARG_TYPE / ERR_INVALID_ARG_VALUE / ERR_OUT_OF_RANGE), including
+  // the embedded-NUL rejection added for CVE-2022-… (nodejs/node#44768).
+  const errArgType = (name, expected, actual) => {
+    const e = new TypeError('The "' + name + '" argument must be ' + expected + '. Received ' + recvDesc(actual));
+    e.code = "ERR_INVALID_ARG_TYPE"; return e;
+  };
+  const errPropType = (name, expected, actual) => {
+    const e = new TypeError('The "' + name + '" property must be ' + expected + '. Received ' + recvDesc(actual));
+    e.code = "ERR_INVALID_ARG_TYPE"; return e;
+  };
+  const errArgValue = (name, value, reason) => {
+    const e = new TypeError("The argument '" + name + "' " + (reason || "is invalid") + ". Received " + recvDesc(value));
+    e.code = "ERR_INVALID_ARG_VALUE"; return e;
+  };
+  const errOutOfRange = (name, range, value) => {
+    const e = new RangeError('The value of "' + name + '" is out of range. It must be ' + range + ". Received " + String(value));
+    e.code = "ERR_OUT_OF_RANGE"; return e;
+  };
+  const nullCheck = (v, name) => {
+    if (typeof v === "string" && v.indexOf("\u0000") !== -1) throw errArgValue(name, v, "must be a string without null bytes");
+  };
+  const validateObj = (v, name) => { if (v === null || typeof v !== "object" || Array.isArray(v)) throw errArgType(name, "of type object", v); };
+  const validateStr = (v, name) => { if (typeof v !== "string") throw errArgType(name, "of type string", v); };
+  const validateFn = (v, name) => { if (typeof v !== "function") throw errArgType(name, "of type function", v); };
+  const isInt32 = (v) => typeof v === "number" && Number.isInteger(v) && v >= -2147483648 && v <= 2147483647;
+  const toPathString = (p, name) => {
+    if (typeof p === "string") { nullCheck(p, name); return p; }
+    if (p !== null && typeof p === "object") {
+      if (G.Buffer && typeof G.Buffer.isBuffer === "function" && G.Buffer.isBuffer(p)) { const s = p.toString(); nullCheck(s, name); return s; }
+      if (typeof p.href === "string" && p.protocol === "file:") {
+        const u = M["url"] || M["node:url"];
+        const s = u && typeof u.fileURLToPath === "function" ? u.fileURLToPath(p) : String(p.pathname);
+        nullCheck(s, name);
+        return s;
+      }
+    }
+    throw errArgType(name, "of type string or an instance of Buffer or URL", p);
+  };
+  // The options members every entry point shares (cwd/argv0/shell must be
+  // NUL-free even on the sync paths that never reach normalizeSpawnArguments).
+  const validateCommonOpts = (o) => {
+    if (o == null) return;
+    if (o.cwd != null) toPathString(o.cwd, "options.cwd");
+    if (o.argv0 != null) { validateStr(o.argv0, "options.argv0"); nullCheck(o.argv0, "options.argv0"); }
+    if (o.shell != null && typeof o.shell !== "boolean" && typeof o.shell !== "string") throw errPropType("options.shell", "of type boolean or string", o.shell);
+    if (typeof o.shell === "string") nullCheck(o.shell, "options.shell");
+    if (o.detached != null && typeof o.detached !== "boolean") throw errPropType("options.detached", "of type boolean", o.detached);
+    // validateInt32: wrong type is ERR_INVALID_ARG_TYPE, wrong value (NaN,
+    // Infinity, 3.1, out of int32) is ERR_OUT_OF_RANGE.
+    for (const k of ["uid", "gid"]) {
+      const v = o[k];
+      if (v == null) continue;
+      if (typeof v !== "number") throw errPropType("options." + k, "of type number", v);
+      if (!isInt32(v)) throw errOutOfRange("options." + k, "an integer >= -2147483648 and <= 2147483647", v);
+    }
+    for (const k of ["windowsHide", "windowsVerbatimArguments"]) {
+      if (o[k] != null && typeof o[k] !== "boolean") throw errPropType("options." + k, "of type boolean", o[k]);
+    }
+    if (o.timeout !== undefined && o.timeout !== null && (typeof o.timeout !== "number" || Number.isNaN(o.timeout))) throw errPropType("options.timeout", "of type number", o.timeout);
+  };
+  const normalizeSpawnArgs = (file, args, options) => {
+    validateStr(file, "file");
+    nullCheck(file, "file");
+    if (file.length === 0) throw errArgValue("file", file, "cannot be empty");
+    if (Array.isArray(args)) args = args.slice();
+    else if (args == null) args = [];
+    else if (typeof args !== "object") throw errArgType("args", "of type object", args);
+    else { options = args; args = []; }
+    for (const a of args) nullCheck(a, "args");
+    if (options === undefined) options = {};
+    else validateObj(options, "options");
+    validateCommonOpts(options);
+    return { file, args, options };
+  };
+  // node normalizeExecFileArgs: (file[, args][, options][, callback]).
+  const normalizeExecFileArgs = (file, args, options, callback) => {
+    if (Array.isArray(args)) args = args.slice();
+    else if (args != null && typeof args === "object") { callback = options; options = args; args = null; }
+    else if (typeof args === "function") { callback = args; options = null; args = null; }
+    if (args == null) args = [];
+    if (typeof options === "function") callback = options;
+    else if (options != null) validateObj(options, "options");
+    if (options == null) options = {};
+    if (callback != null) validateFn(callback, "callback");
+    if (options.argv0 != null) validateStr(options.argv0, "options.argv0");
+    return { file, args, options, callback };
+  };
+
   function spawnSync(cmd, a, o) {
-    const n = normArgs(a, o);
-    cmd = toStr(cmd);
+    const nz = normalizeSpawnArgs(cmd, a, o);
+    cmd = nz.file;
+    const n = { args: nz.args, opts: nz.options };
     const exe = resolveExe(cmd);
     if (exe === null) {
       const err = new Error("spawnSync " + cmd + " ENOENT");
@@ -290,16 +578,20 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     return r;
   }
   function execSync(command, o) {
-    const r = CP.spawnSync("/bin/sh", ["-c", toStr(command)], o || {});
+    validateStr(command, "command");
+    nullCheck(command, "command");
+    if (o != null) { validateObj(o, "options"); validateCommonOpts(o); }
+    const r = CP.spawnSync("/bin/sh", ["-c", command], o || {});
     if (r.status !== 0) { const e = new Error("Command failed: " + command + "\n" + r.stderr); e.status = r.status; e.stdout = r.stdout; e.stderr = r.stderr; throw e; }
     const enc = o && o.encoding;
     return enc === "buffer" || enc == null ? Buffer.from(_u8(r.stdout)) : r.stdout;
   }
   function execFileSync(file, a, o) {
-    const n = normArgs(a, o);
-    const r = CP.spawnSync(toStr(file), n.args.map(toStr), n.opts);
-    if (r.status !== 0) { const e = new Error("execFileSync failed: " + file); e.status = r.status; e.stderr = r.stderr; throw e; }
-    const enc = n.opts && n.opts.encoding;
+    const nf = normalizeExecFileArgs(file, a, o, undefined);
+    const nz = normalizeSpawnArgs(nf.file, nf.args, typeof nf.options === "function" ? {} : nf.options);
+    const r = CP.spawnSync(nz.file, nz.args, nz.options);
+    if (r.status !== 0) { const e = new Error("execFileSync failed: " + nz.file); e.status = r.status; e.stderr = r.stderr; throw e; }
+    const enc = nz.options && nz.options.encoding;
     return enc === "buffer" || enc == null ? Buffer.from(_u8(r.stdout)) : r.stdout;
   }
 
@@ -336,12 +628,11 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   };
 
   function spawn(file, args, options) {
-    if (typeof file !== "string") { const e = new TypeError('The "file" argument must be of type string. Received type ' + typeof file + ' (' + file + ')'); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
-    if (!Array.isArray(args)) { options = args; args = []; }
-    options = options || {};
-    let cmd = file, argv = [file].concat((args || []).map(toStr));
+    const nz = normalizeSpawnArgs(file, args, options);
+    file = nz.file; args = nz.args; options = nz.options;
+    let cmd = file, argv = [file].concat(args.map(toStr));
     if (options.shell) {
-      const command = [file].concat((args || []).map(toStr)).join(" ");
+      const command = [file].concat(args.map(toStr)).join(" ");
       const sh = options.shell === true ? "/bin/sh" : toStr(options.shell);
       cmd = sh; argv = [sh, "-c", command];
     }
@@ -352,7 +643,11 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
 
   function exec(command, options, cb) {
     if (typeof options === "function") { cb = options; options = {}; }
+    validateStr(command, "command");
+    nullCheck(command, "command");
+    if (options != null) { validateObj(options, "options"); validateCommonOpts(options); }
     options = options || {};
+    if (cb != null) validateFn(cb, "callback");
     const sh = options.shell ? (options.shell === true ? "/bin/sh" : toStr(options.shell)) : "/bin/sh";
     const child = new ChildProcess();
     child.spawn({ file: sh, args: [sh, "-c", toStr(command)], cwd: options.cwd, env: options.env, stdio: ["pipe", "pipe", "pipe"], timeout: options.timeout, killSignal: options.killSignal, signal: options.signal });
@@ -364,12 +659,11 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   });
 
   function execFile(file, args, options, cb) {
-    if (typeof args === "function") { cb = args; args = []; options = {}; }
-    else if (!Array.isArray(args)) { cb = typeof options === "function" ? options : cb; options = args; args = []; }
-    if (typeof options === "function") { cb = options; options = {}; }
-    options = options || {};
+    const nf = normalizeExecFileArgs(file, args, options, cb);
+    const nz = normalizeSpawnArgs(nf.file, nf.args, typeof nf.options === "function" ? {} : nf.options);
+    file = nz.file; args = nz.args; options = nz.options; cb = nf.callback;
     const child = new ChildProcess();
-    child.spawn({ file: toStr(file), args: [toStr(file)].concat((args || []).map(toStr)), cwd: options.cwd, env: options.env, stdio: ["pipe", "pipe", "pipe"], timeout: options.timeout, killSignal: options.killSignal, signal: options.signal });
+    child.spawn({ file, args: [file].concat(args.map(toStr)), cwd: options.cwd, env: options.env, stdio: ["pipe", "pipe", "pipe"], timeout: options.timeout, killSignal: options.killSignal, signal: options.signal });
     collectExec(child, options, cb, file);
     return child;
   }
@@ -378,18 +672,71 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   });
 
   function fork(modulePath, args, options) {
-    if (typeof modulePath !== "string") { const e = new TypeError('The "modulePath" argument must be of type string or an instance of Buffer or URL. Received ' + (modulePath === null ? "null" : modulePath === undefined ? "undefined" : typeof modulePath === "object" ? "an instance of " + ((modulePath.constructor && modulePath.constructor.name) || "Object") : typeof modulePath === "symbol" ? "type symbol" : typeof modulePath)); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
-    if (!Array.isArray(args)) { options = args; args = []; }
-    if (options !== undefined && options !== null && typeof options !== "object") { const e = new TypeError('The "options" argument must be of type object. Received ' + (typeof options === "symbol" ? "type symbol" : typeof options)); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
+    modulePath = toPathString(modulePath, "modulePath");
+    if (args == null) args = [];
+    else if (typeof args === "object" && !Array.isArray(args)) { options = args; args = []; }
+    else if (!Array.isArray(args)) throw errArgType("args", "an instance of Array", args);
+    if (options != null) validateObj(options, "options");
     options = options || {};
+    validateCommonOpts(options);
+    for (const a of args) nullCheck(a, "args");
     const exe = toStr(options.execPath || (G.process && G.process.execPath) || "bun");
-    // IPC unimplemented → default stdio has no channel; stdin stays non-pipe so
-    // child.stdin === null (matches the fork() default-stdio expectation).
-    const stdio = options.stdio || (options.silent ? ["pipe", "pipe", "pipe"] : ["inherit", "inherit", "inherit"]);
+    // node fork(): the child always gets an "ipc" slot appended, stdio defaults
+    // to inherit (pipe when silent), and a user-supplied stdio ARRAY without an
+    // 'ipc' entry is an error (lib/child_process.js fork/stdioStringToArray).
+    let stdio = options.stdio;
+    if (typeof stdio === "string") {
+      if (stdio !== "pipe" && stdio !== "inherit" && stdio !== "ignore" && stdio !== "overlapped") {
+        const e = new TypeError("The argument 'stdio' is invalid. Received '" + stdio + "'");
+        e.code = "ERR_INVALID_ARG_VALUE"; throw e;
+      }
+      stdio = [stdio, stdio, stdio, "ipc"];
+    } else if (!Array.isArray(stdio)) {
+      const s = options.silent ? "pipe" : "inherit";
+      stdio = [s, s, s, "ipc"];
+    } else if (stdio.indexOf("ipc") < 0) {
+      const e = new Error("Forked processes must have an IPC channel, missing value 'ipc' in options.stdio");
+      e.code = "ERR_CHILD_PROCESS_IPC_REQUIRED"; throw e;
+    } else {
+      stdio = stdio.slice();
+    }
+    // node prepends the parent's execArgv (or options.execArgv) before the
+    // module path so the child inherits the same runtime flags.
+    const execArgv = options.execArgv !== undefined ? options.execArgv : ((G.process && G.process.execArgv) || []);
     const child = new ChildProcess();
-    child.spawn({ file: exe, args: [exe, toStr(modulePath)].concat((args || []).map(toStr)), cwd: options.cwd, env: options.env, stdio, detached: options.detached, timeout: options.timeout, killSignal: options.killSignal, signal: options.signal });
+    child.spawn({ file: exe, args: [exe].concat((execArgv || []).map(toStr), [toStr(modulePath)], (args || []).map(toStr)), cwd: options.cwd, env: options.env, stdio, detached: options.detached, timeout: options.timeout, killSignal: options.killSignal, signal: options.signal });
     return child;
   }
+
+  // ---- child side of a fork() channel (NODE_CHANNEL_FD) -------------------
+  // node's _forkChild: wire process.send / 'message' / disconnect onto the
+  // inherited socketpair end, then drop NODE_CHANNEL_FD so grandchildren do not
+  // inherit a channel that is not theirs. Invoked once, late in the builtins
+  // image (node_process_extra), when `process` is a full EventEmitter.
+  G.__mbunSetupIpcChild = function () {
+    if (SELF_IPC !== null) return;
+    const proc = G.process;
+    if (!proc || !proc.env || typeof proc.listenerCount !== "function") return;
+    const raw = proc.env.NODE_CHANNEL_FD;
+    if (raw == null || raw === "") return;
+    const fd = Number(raw);
+    if (!Number.isFinite(fd) || fd < 0) return;
+    try { delete proc.env.NODE_CHANNEL_FD; } catch (e) {}
+    const ch = makeIpc(fd);
+    const delivery = makeIpcDelivery(proc);
+    attachIpc(proc, ch, null);
+    SELF_IPC = {
+      ch,
+      delivery,
+      drain() {
+        ipcRead(ch, (m) => delivery.deliver(m), () => {
+          ipcClose(ch);
+          if (proc.connected && typeof proc.disconnect === "function") proc.disconnect();
+        });
+      },
+      pinned() { return proc.listenerCount("message") > 0 || proc.listenerCount("disconnect") > 0; },
+    };
+  };
 
   def(["child_process"], { spawnSync, execSync, execFileSync, execFile, exec, spawn, fork, ChildProcess });
   // node:console — the global console methods + a Console class over given streams.
