@@ -120,12 +120,22 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
     const handle = NVM.createContext(NVM.getGlobal ? undefined : {});
     const g = NVM.getGlobal ? NVM.getGlobal(handle)
                             : NVM.runInContext(handle, "globalThis", undefined);
+    // Snapshot of the realm's own globals, so a script that OVERWRITES one
+    // (`this.Symbol = Symbol`) is still seen as a user write on the way out,
+    // while the untouched builtins stay out of the sandbox.
+    const nativeKeys = new Set(ownKeys(g));
+    const nativeVals = new Map();
+    for (const key of nativeKeys) {
+      const d = gOPD(g, key);
+      if (d !== undefined && "value" in d) nativeVals.set(key, d.value);
+    }
     const rec = {
       handle,
       global: g,
-      nativeKeys: new Set(ownKeys(g)),
+      nativeKeys,
+      nativeVals,
       mirrored: new Set(),
-      proto: new Set(),
+      proto: new Map(),
       sandbox,
     };
     return rec;
@@ -162,7 +172,7 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
         try {
           ObjectDefineProperty(g, key, { ...desc, enumerable: false });
           mirrored.add(key);
-          proto.add(key);
+          proto.set(key, "value" in desc ? desc.value : proto);
         } catch { /* non-configurable */ }
       }
       try { src = Object.getPrototypeOf(src); } catch { break; }
@@ -179,16 +189,39 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
   }
 
   function syncOut(rec) {
-    const { sandbox, global: g, nativeKeys, mirrored, proto } = rec;
+    const { sandbox, global: g, nativeKeys, nativeVals, mirrored, proto } = rec;
     const live = new Set();
     for (const key of ownKeys(g)) {
-      if (nativeKeys.has(key) && !mirrored.has(key)) continue;
-      live.add(key);
       const desc = gOPD(g, key);
       if (desc === undefined) continue;
-      // An accessor mirrored in from the sandbox stays owned by the sandbox.
-      if ((desc.get !== undefined || desc.set !== undefined) && mirrored.has(key)) continue;
-      if (proto.has(key)) continue;
+      if (nativeKeys.has(key) && !mirrored.has(key)) {
+        // Only a builtin the script actually replaced travels out. An accessor
+        // among the realm's own globals is never one of those, so it stays put
+        // (defining it on the sandbox would be an extra, observable write).
+        if (!("value" in desc)) continue;
+        // SameValue, not ===: the realm's own `NaN` global would otherwise
+        // compare unequal to itself on every single run.
+        if (Object.is(desc.value, nativeVals.get(key))) continue;
+      } else if (proto.has(key)) {
+        // node's PropertySetterCallback always writes to the sandbox itself,
+        // so assigning to a name the sandbox merely INHERITS creates an own,
+        // enumerable property on it. A member left untouched must not.
+        if (!("value" in desc) || Object.is(desc.value, proto.get(key))) { live.add(key); continue; }
+        live.add(key);
+        proto.delete(key);
+        try {
+          ObjectDefineProperty(sandbox, key, {
+            value: desc.value === g ? sandbox : desc.value,
+            writable: true, enumerable: true, configurable: true,
+          });
+        } catch { /* ignore */ }
+        continue;
+      } else if ((desc.get !== undefined || desc.set !== undefined) && mirrored.has(key)) {
+        // An accessor mirrored in from the sandbox stays owned by the sandbox.
+        live.add(key);
+        continue;
+      }
+      live.add(key);
       let d = desc;
       if ("value" in d && d.value === g) d = { ...d, value: sandbox };
       try { ObjectDefineProperty(sandbox, key, d); } catch { /* ignore */ }
