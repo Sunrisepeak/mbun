@@ -1310,6 +1310,13 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_key_export_host,
                                         ? "Passphrase required for encrypted key"
                                         : "Invalid key");
     }
+    // An EC key decoded from a compressed SPKI keeps that point format, but
+    // node (and WebCrypto) always re-emit the uncompressed point.
+    // ref: nodejs/node#45859.
+    if (EVP_PKEY_base_id(pkey.get()) == EVP_PKEY_EC) {
+        EVP_PKEY_set_utf8_string_param(pkey.get(), OSSL_PKEY_PARAM_EC_POINT_CONVERSION_FORMAT,
+                                       "uncompressed");
+    }
     int sel{0};
     const char* structure{nullptr};
     if (!asym_enc_map(type, !isPublic, sel, structure)) {

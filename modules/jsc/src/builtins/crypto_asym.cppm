@@ -262,12 +262,27 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
     return out;
   };
+  // Only the JWK-registered EC curves can be serialized: RFC 7518's P-256 /
+  // P-384 / P-521 plus RFC 8812's secp256k1. node throws
+  // ERR_CRYPTO_JWK_UNSUPPORTED_CURVE for anything else (src/crypto/crypto_ec.cc
+  // ExportJWKEcKey).
+  const JWK_EC_CURVES = { prime256v1: "P-256", secp384r1: "P-384", secp521r1: "P-521",
+    "P-256": "P-256", "P-384": "P-384", "P-521": "P-521", secp256k1: "secp256k1" };
   const jwkFromKey = (material, pass, isPublic) => {
     const raw = AN.jwkExport(material, pass || "", !!isPublic);
     const out = {};
     for (const k of Object.keys(raw)) {
       const v = raw[k];
       out[k] = typeof v === "string" ? v : Buffer.from(v).toString("base64url");
+    }
+    if (out.kty === "EC") {
+      const mapped = JWK_EC_CURVES[out.crv];
+      if (!mapped) {
+        const e = new Error("Unsupported JWK EC curve: " + out.crv + ".");
+        e.code = "ERR_CRYPTO_JWK_UNSUPPORTED_CURVE";
+        throw e;
+      }
+      out.crv = mapped;
     }
     return out;
   };
