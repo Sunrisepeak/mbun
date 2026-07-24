@@ -70,6 +70,19 @@ frozen machine or a silently murdered harness.
   `--worklist-from subsystem` select which), so picking a round's target and
   scoring it before/after are the same set of files rather than two hand-copied
   approximations.
+- `process_lifecycle_probe.sh` — node-differential probe for the process
+  shutdown sequence: `'exit'` / `'beforeExit'` emission and ordering, exit-code
+  propagation (`process.exitCode`, `process.exit(code)`, a listener mutating the
+  code, a throwing listener), the uncaught-exception path (timer / socket /
+  `nextTick` callbacks), and handle `ref()`/`unref()`/`hasRef()`. Each case
+  states the stdout and exit status real node produces; pass a node binary as a
+  second argument to re-verify the expectations against it. These are whole-
+  process properties (did it leave, and with what status), so no in-corpus test
+  can observe them — the corpus could report 580 hangs without ever revealing
+  that `process.on('exit')` never fired, which is what let node's own
+  `common.mustCall` verifier go unrun across ~62% of the node corpus. Every case
+  runs through `safe-test.sh`, so a regression that hangs is killed and
+  reported. `tools/integration/process_lifecycle_probe.sh <mbun> [node]`.
 - `smoke_examples.py` — boots each `examples/` app in turn, requests
   `http://127.0.0.1:3000/`, asserts a 2xx, then reaps the whole process tree
   (`bounded_run.BoundedServer`). Sequential by design: the demos all hardcode
