@@ -143,7 +143,17 @@ inline constexpr std::string_view kNodeStreamCoreJS = R"JS(
   const __hasAsyncContext = () => false;
   // Only reached for a web stream lacking kIsClosedPromise. bun reads the
   // stream's internal closed promise; approximate with the reader's.
+  // node's `stream[kIsClosedPromise].promise` — a per-stream promise that
+  // settles on close/error and NEVER locks the stream. The old fallback here
+  // acquired a reader/writer just to read `.closed`, so `finished(webStream)`
+  // locked it and any later getReader()/getWriter()/`for await` threw
+  // "ReadableStream is locked" (test-webstreams-finished, -compose,
+  // -duplex-fromweb-*).
   const $webStreamClosedPromise = (stream) => {
+    try {
+      const S = G.__mbunStreams;
+      if (S && typeof S.closedPromise === "function") return S.closedPromise(stream);
+    } catch {}
     try {
       if (typeof stream.getReader === "function") return stream.getReader().closed;
       if (typeof stream.getWriter === "function") return stream.getWriter().closed;
