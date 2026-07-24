@@ -74,7 +74,7 @@ export constexpr std::string_view kNetJS = R"JS(
   // errno name the message carries is the socket error node would surface; the
   // ECONNRESET fallback keeps the previous behaviour for unrecognised strings.
   const ERRNO_RE = /\b(ECONNREFUSED|ECONNRESET|ECONNABORTED|EPIPE|ENOENT|EACCES|EPERM|EADDRINUSE|EADDRNOTAVAIL|EAFNOSUPPORT|EHOSTUNREACH|ENETUNREACH|ENETDOWN|ETIMEDOUT|EINVAL|ENAMETOOLONG|EISDIR|ENOTDIR|ELOOP|EMFILE|ENFILE|ENOTSOCK|EAI_AGAIN|EAI_FAIL|ENOTFOUND)\b/;
-  const codeOf = (e) => { const m = String((e && e.message) || e); const hit = ERRNO_RE.exec(m); return hit ? hit[1] : "ECONNRESET"; };
+  const codeOf = (e, fallback) => { const m = String((e && e.message) || e); const hit = ERRNO_RE.exec(m); return hit ? hit[1] : (fallback || "ECONNRESET"); };
   const connectError = (nativeError, host, port) => {
     const code = codeOf(nativeError);
     // node formats a pipe/unix connect as `connect <code> <path>` — no port.
@@ -82,10 +82,18 @@ export constexpr std::string_view kNetJS = R"JS(
     error.syscall = "connect"; error.address = host; if (port !== undefined) error.port = port;
     return error;
   };
+  // A unix socket path has to fit in sockaddr_un.sun_path (108 bytes incl. NUL);
+  // libuv reports a longer one as EINVAL rather than truncating it, and the
+  // natives here would otherwise fail with an unrecognised message.
+  const PIPE_PATH_MAX = 107;
+  const pipePathTooLong = (p) => (G.Buffer ? G.Buffer.byteLength(p) : p.length) > PIPE_PATH_MAX;
   // node lib/net.js Server: a bind failure carries the requested address/port and
   // syscall so `err.address`/`err.port` are usable (test-net-better-error-messages-*).
   const listenError = (nativeError, address, port) => {
-    const code = codeOf(nativeError);
+    // A bind failure the natives describe without an errno ("Is port N in use?")
+    // is the address-in-use case, which is what the previous hard-coded value
+    // covered — keep it as the fallback so EADDRINUSE detection is unchanged.
+    const code = codeOf(nativeError, "EADDRINUSE");
     const error = mkErr("listen " + code + " " + address + (port === undefined ? "" : ":" + port), code);
     error.syscall = "listen"; error.address = address; if (port !== undefined) error.port = port;
     return error;
@@ -232,6 +240,9 @@ export constexpr std::string_view kNetJS = R"JS(
       }
       let port = 0, host = "localhost", cb = null, unixPath = null;
       if (typeof a[0] === "object" && a[0] !== null) { unixPath = a[0].path ? String(a[0].path) : null; port = a[0].port | 0; host = a[0].host || "localhost"; cb = typeof a[1] === "function" ? a[1] : null; }
+      // node normalizeArgs/isPipeName: a non-numeric string first argument is a
+      // pipe/unix path, not a port.
+      else if (typeof a[0] === "string" && !/^\d+$/.test(a[0].trim())) { unixPath = a[0]; cb = typeof a[1] === "function" ? a[1] : null; }
       else { port = +a[0] | 0; if (typeof a[1] === "string") { host = a[1]; cb = typeof a[2] === "function" ? a[2] : null; } else if (typeof a[1] === "function") cb = a[1]; }
       if (cb) this.once("connect", cb);
       this.connecting = true;
@@ -288,7 +299,7 @@ export constexpr std::string_view kNetJS = R"JS(
       // dials the v4 loopback, which the v4-mapped INADDR_ANY listener accepts.
       const dialHost = (host === "::1" || host === "::" || host === "::0") ? "127.0.0.1" : host;
       let fd;
-      try { fd = unixPath ? NN.connectUnix(unixPath) : NN.connect(dialHost, port); }
+      try { if (unixPath && pipePathTooLong(unixPath)) throw new Error("EINVAL"); fd = unixPath ? NN.connectUnix(unixPath) : NN.connect(dialHost, port); }
       catch (e) { this.connecting = false; const err = connectError(e, unixPath || host, unixPath ? undefined : port); G.queueMicrotask(() => { if (this.destroyed) return; this.emit("error", err); this.destroy(); }); return this; }
       this._adopt(fd);
       this.remotePort = port;
@@ -611,7 +622,7 @@ export constexpr std::string_view kNetJS = R"JS(
         this._unixPath = unixPath;
         if (cb) this.once("listening", cb);
         let ulh;
-        try { ulh = NN.listenUnix(unixPath); }
+        try { if (pipePathTooLong(unixPath)) throw new Error("EINVAL"); ulh = NN.listenUnix(unixPath); }
         catch (e) { const err = listenError(e, unixPath); G.queueMicrotask(() => this.emit("error", err)); return this; }
         this._fd = ulh.fd;
         this._addr = { address: unixPath, family: "unix", port: 0 };
