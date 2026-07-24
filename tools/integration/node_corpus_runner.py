@@ -78,6 +78,31 @@ def discover(root: Path, corpus_dir: Path) -> list[str]:
     return paths
 
 
+def read_file_list(root: Path, list_path: Path) -> list[str]:
+    """Read a work-list of test paths (one per line, `#` comments allowed).
+
+    A round targets one cluster, not the whole corpus: re-running all 4433
+    files to score a 40-file fix costs ~30 minutes and buries the signal in
+    unrelated flakiness. Paths may be repo-relative or absolute; both are
+    normalised to the repo-relative form the TSV uses, so a cluster list and a
+    full run stay directly comparable by corpus_diff.py.
+    """
+    selected: list[str] = []
+    seen: set[str] = set()
+    for raw in list_path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        candidate = Path(line)
+        relative = candidate.resolve().relative_to(root).as_posix() if candidate.is_absolute() else candidate.as_posix()
+        if not (root / relative).is_file():
+            raise SystemExit(f"--files entry does not exist: {line}")
+        if relative not in seen:
+            seen.add(relative)
+            selected.append(relative)
+    return selected
+
+
 def write_outputs(output_dir: Path, results: list[Result]) -> None:
     columns = ["path", "exit_code", "classification", "duration_ms", "log"]
     with (output_dir / "results.tsv").open("w", encoding="utf-8") as stream:
@@ -99,6 +124,17 @@ def main() -> int:
     parser.add_argument("--root", default=Path.cwd(), type=Path, help="repository root")
     parser.add_argument("--corpus", default=Path("compat/node/test/parallel"), type=Path)
     parser.add_argument("--out", required=True, type=Path)
+    parser.add_argument(
+        "--files",
+        type=Path,
+        help="run only the test paths listed in this file (one per line, '#' comments allowed) "
+        "instead of discovering the whole corpus — use it to score one cluster",
+    )
+    parser.add_argument(
+        "--filter",
+        default="",
+        help="keep only selected paths whose name contains this substring (e.g. test-fs-)",
+    )
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--timeout", type=float, default=15.0)
     args = parser.parse_args()
@@ -111,7 +147,9 @@ def main() -> int:
     # setups point it at a sibling checkout). Resolving it would make the
     # discovered files fall outside `root`, breaking relative_to(root).
     corpus_dir = root / args.corpus
-    paths = discover(root, corpus_dir)
+    paths = read_file_list(root, args.files) if args.files else discover(root, corpus_dir)
+    if args.filter:
+        paths = [path for path in paths if args.filter in path]
     if not paths:
         raise SystemExit("no test files selected")
     output_dir.mkdir(parents=True, exist_ok=True)
