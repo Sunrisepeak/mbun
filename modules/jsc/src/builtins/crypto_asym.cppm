@@ -262,12 +262,27 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
     return out;
   };
+  // Only the JWK-registered EC curves can be serialized: RFC 7518's P-256 /
+  // P-384 / P-521 plus RFC 8812's secp256k1. node throws
+  // ERR_CRYPTO_JWK_UNSUPPORTED_CURVE for anything else (src/crypto/crypto_ec.cc
+  // ExportJWKEcKey).
+  const JWK_EC_CURVES = { prime256v1: "P-256", secp384r1: "P-384", secp521r1: "P-521",
+    "P-256": "P-256", "P-384": "P-384", "P-521": "P-521", secp256k1: "secp256k1" };
   const jwkFromKey = (material, pass, isPublic) => {
     const raw = AN.jwkExport(material, pass || "", !!isPublic);
     const out = {};
     for (const k of Object.keys(raw)) {
       const v = raw[k];
       out[k] = typeof v === "string" ? v : Buffer.from(v).toString("base64url");
+    }
+    if (out.kty === "EC") {
+      const mapped = JWK_EC_CURVES[out.crv];
+      if (!mapped) {
+        const e = new Error("Unsupported JWK EC curve: " + out.crv + ".");
+        e.code = "ERR_CRYPTO_JWK_UNSUPPORTED_CURVE";
+        throw e;
+      }
+      out.crv = mapped;
     }
     return out;
   };
@@ -356,9 +371,28 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
       if (other._kind !== this._kind) return false;
       try { return Buffer.compare(toBuf(this.export({ format: this._kind === "secret" ? undefined : "der", type: this._kind === "public" ? "spki" : "pkcs8" })), toBuf(other.export({ format: "der", type: this._kind === "public" ? "spki" : "pkcs8" }))) === 0; } catch { return false; }
     }
+    // node: keyObject.toCryptoKey(algorithm, extractable, keyUsages) — the
+    // reverse of KeyObject.from(). Synchronous, like node's.
+    // ref: node lib/internal/crypto/keys.js KeyObject.prototype.toCryptoKey.
+    toCryptoKey(algorithm, extractable, keyUsages) {
+      const bridge = G.__mbunKeyObjectToCryptoKey;
+      if (typeof bridge !== "function") {
+        throw new TypeError("WebCrypto is not available in this build");
+      }
+      if (this._kind === "secret") {
+        return bridge("secret", new Uint8Array(toBuf(this._km)), algorithm, extractable, keyUsages);
+      }
+      const isPublic = this._kind === "public";
+      const der = AN.keyExport(this._km, this._pass, isPublic,
+        isPublic ? "spki" : "pkcs8", "der", "", "");
+      return bridge(this._kind, new Uint8Array(der), algorithm, extractable, keyUsages);
+    }
     // node: KeyObject.from(cryptoKey) — only a WebCrypto CryptoKey is accepted.
     static from(key) {
-      if (!(G.CryptoKey && key instanceof G.CryptoKey)) {
+      const isCryptoKey = typeof G.__mbunIsCryptoKey === "function"
+        ? G.__mbunIsCryptoKey(key)
+        : !!(G.CryptoKey && key instanceof G.CryptoKey);
+      if (!isCryptoKey) {
         const e = new TypeError('The "key" argument must be an instance of CryptoKey. Received ' +
           (key === null ? "null" : typeof key));
         e.code = "ERR_INVALID_ARG_TYPE"; throw e;

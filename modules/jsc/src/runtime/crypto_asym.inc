@@ -515,12 +515,18 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_cipher_host,
     const EVP_CIPHER* c{EVP_get_cipherbyname(algo.c_str())};
     if (c == nullptr) { return hasher_throw(global, "Unknown cipher: " + algo); }
     const int mode{EVP_CIPHER_mode(c)};
+    // AEAD ciphers: a variable-length IV, associated data, and an authentication
+    // tag on top of the ciphertext. Enumerated explicitly rather than via
+    // EVP_CIPH_FLAG_AEAD_CIPHER, which OpenSSL also sets on the stitched
+    // aes-*-cbc-hmac-sha* ciphers (which are NOT tag-producing here).
+    const bool ocb{mode == EVP_CIPH_OCB_MODE};
     const bool gcm{mode == EVP_CIPH_GCM_MODE};
+    const bool aead{gcm || ocb || EVP_CIPHER_nid(c) == NID_chacha20_poly1305};
     // Key-length validation (node throws for a wrong-sized key/iv).
     if (key.size() != static_cast<std::size_t>(EVP_CIPHER_key_length(c))) {
         return hasher_throw(global, "Invalid key length");
     }
-    if (gcm) {
+    if (aead) {
         if (iv.empty()) { return hasher_throw(global, "Invalid IV length"); }
     } else if (mode == EVP_CIPH_ECB_MODE) {
         if (!iv.empty()) { return hasher_throw(global, "Invalid IV length"); }
@@ -532,20 +538,35 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_cipher_host,
     if (EVP_CipherInit_ex(cc.get(), c, nullptr, nullptr, nullptr, enc ? 1 : 0) <= 0) {
         return hasher_throw(global, "cipher init failed");
     }
-    if (gcm) {
+    if (aead) {
         EVP_CIPHER_CTX_ctrl(cc.get(), EVP_CTRL_AEAD_SET_IVLEN, static_cast<int>(iv.size()), nullptr);
+    }
+    // OCB is the one AEAD whose tag length must be fixed BEFORE the key is
+    // installed (EVP_EncryptInit_ex derives the L table from it).
+    if (ocb) {
+        if (enc) {
+            EVP_CIPHER_CTX_ctrl(cc.get(), EVP_CTRL_AEAD_SET_TAG, tagLen, nullptr);
+        } else if (!tagIn.empty()) {
+            // OCB's ctrl rejects a tag whose length differs from the context's
+            // (default 16), so declare the length first (ptr == nullptr) and only
+            // then hand over the bytes. ref: OpenSSL crypto/evp/e_aes.c aes_ocb_ctrl.
+            EVP_CIPHER_CTX_ctrl(cc.get(), EVP_CTRL_AEAD_SET_TAG, static_cast<int>(tagIn.size()),
+                                nullptr);
+            EVP_CIPHER_CTX_ctrl(cc.get(), EVP_CTRL_AEAD_SET_TAG, static_cast<int>(tagIn.size()),
+                                tagIn.data());
+        }
     }
     if (EVP_CipherInit_ex(cc.get(), nullptr, nullptr, key.data(), iv.empty() ? nullptr : iv.data(),
                           enc ? 1 : 0) <= 0) {
         return hasher_throw(global, "cipher key/iv setup failed");
     }
-    if (!enc && gcm && !tagIn.empty()) {
+    if (!enc && aead && !ocb && !tagIn.empty()) {
         EVP_CIPHER_CTX_ctrl(cc.get(), EVP_CTRL_AEAD_SET_TAG, static_cast<int>(tagIn.size()),
                             tagIn.data());
     }
     if (noPad) { EVP_CIPHER_CTX_set_padding(cc.get(), 0); }
     int tmp{0};
-    if (gcm && !aad.empty()) {
+    if (aead && !aad.empty()) {
         EVP_CipherUpdate(cc.get(), nullptr, &tmp, aad.data(), static_cast<int>(aad.size()));
     }
     std::vector<std::uint8_t> out(data.size() + static_cast<std::size_t>(EVP_CIPHER_block_size(c)));
@@ -559,14 +580,14 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_cipher_host,
         // GCM/AEAD decrypt failure is an authentication failure (node's fixed
         // message); block-cipher failures surface the real OpenSSL error so the
         // JS layer can recover code/library/reason (e.g. WRONG_FINAL_BLOCK_LENGTH).
-        if (!enc && gcm) { return hasher_throw(global, "Unsupported state or unable to authenticate data"); }
+        if (!enc && aead) { return hasher_throw(global, "Unsupported state or unable to authenticate data"); }
         return hasher_throw(global, asym_ossl_err());
     }
     out.resize(static_cast<std::size_t>(outl + finl));
 
     JSObjectRef obj{JSObjectMake(ctx, nullptr, nullptr)};
     set_prop(ctx, obj, "data", static_cast<JSValueRef>(asym_u8(ctx, out)));
-    if (enc && gcm) {
+    if (enc && aead) {
         std::vector<std::uint8_t> tag(static_cast<std::size_t>(tagLen));
         EVP_CIPHER_CTX_ctrl(cc.get(), EVP_CTRL_AEAD_GET_TAG, tagLen, tag.data());
         set_prop(ctx, obj, "tag", static_cast<JSValueRef>(asym_u8(ctx, tag)));
@@ -825,6 +846,58 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_ecdh_convert_host,
 //   crosses into JS. OpenSSL's X25519 derive fails on an all-zero output, which
 //   is the RFC 7748 §6.1 small-order-point rejection the spec requires.
 // ref: bun src/jsc/bindings/webcrypto/CryptoAlgorithmX25519.cpp platformDeriveBits.
+// __mbunCryptoAsymNative.kmac(name, key, data, customization, outLenBytes) →
+//   Uint8Array with the KMAC tag. `name` is OpenSSL's MAC name ("KMAC-128" /
+//   "KMAC-256"); `customization` is NIST SP 800-185's optional S string.
+//   Backs WebCrypto's KMAC128/KMAC256 sign & verify.
+// ref: node src/crypto/crypto_mac.cc (KmacJob) + OpenSSL EVP_MAC-KMAC(7).
+JSC_DEFINE_HOST_FUNCTION(node_asym_kmac_host,
+                         (JSC::JSGlobalObject* global, JSC::CallFrame* frame)) {
+    JSContextRef ctx{toRef(global)};
+    const std::string name{asym_str(global, native_arg(frame, 0))};
+    std::vector<std::uint8_t> key;
+    std::vector<std::uint8_t> data;
+    std::vector<std::uint8_t> custom;
+    if (!asym_read(global, native_arg(frame, 1), key)) {
+        return hasher_throw(global, "kmac: key required");
+    }
+    asym_read(global, native_arg(frame, 2), data);
+    asym_read(global, native_arg(frame, 3), custom);
+    const int outLen{asym_int(native_arg(frame, 4), 32)};
+    if (outLen < 0) { return hasher_throw(global, "kmac: invalid output length"); }
+
+    struct MacDel { void operator()(EVP_MAC* m) const { if (m) EVP_MAC_free(m); } };
+    struct MacCtxDel { void operator()(EVP_MAC_CTX* c) const { if (c) EVP_MAC_CTX_free(c); } };
+    std::unique_ptr<EVP_MAC, MacDel> mac{EVP_MAC_fetch(nullptr, name.c_str(), nullptr)};
+    if (!mac) { return hasher_throw(global, "kmac: unsupported MAC " + name); }
+    std::unique_ptr<EVP_MAC_CTX, MacCtxDel> mctx{EVP_MAC_CTX_new(mac.get())};
+    if (!mctx) { return hasher_throw(global, "kmac: context allocation failed"); }
+
+    std::size_t size{static_cast<std::size_t>(outLen)};
+    OSSL_PARAM params[3];
+    int n{0};
+    params[n++] = OSSL_PARAM_construct_size_t(OSSL_MAC_PARAM_SIZE, &size);
+    if (!custom.empty()) {
+        params[n++] = OSSL_PARAM_construct_octet_string(
+            OSSL_MAC_PARAM_CUSTOM, custom.data(), custom.size());
+    }
+    params[n] = OSSL_PARAM_construct_end();
+
+    if (EVP_MAC_init(mctx.get(), key.data(), key.size(), params) <= 0) {
+        return hasher_throw(global, "kmac init failed: " + asym_ossl_err());
+    }
+    if (!data.empty() && EVP_MAC_update(mctx.get(), data.data(), data.size()) <= 0) {
+        return hasher_throw(global, "kmac update failed: " + asym_ossl_err());
+    }
+    std::vector<std::uint8_t> out(size == 0 ? 1 : size);
+    std::size_t outl{0};
+    if (EVP_MAC_final(mctx.get(), out.data(), &outl, out.size()) <= 0) {
+        return hasher_throw(global, "kmac final failed: " + asym_ossl_err());
+    }
+    out.resize(outl);
+    return JSC::JSValue::encode(toJS(global, static_cast<JSValueRef>(asym_u8(ctx, out))));
+}
+
 JSC_DEFINE_HOST_FUNCTION(node_asym_okp_derive_host,
                          (JSC::JSGlobalObject* global, JSC::CallFrame* frame)) {
     JSContextRef ctx{toRef(global)};
@@ -1236,6 +1309,13 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_key_export_host,
         return hasher_throw(global, asym_needs_passphrase(keyBytes, pass)
                                         ? "Passphrase required for encrypted key"
                                         : "Invalid key");
+    }
+    // An EC key decoded from a compressed SPKI keeps that point format, but
+    // node (and WebCrypto) always re-emit the uncompressed point.
+    // ref: nodejs/node#45859.
+    if (EVP_PKEY_base_id(pkey.get()) == EVP_PKEY_EC) {
+        EVP_PKEY_set_utf8_string_param(pkey.get(), OSSL_PKEY_PARAM_EC_POINT_CONVERSION_FORMAT,
+                                       "uncompressed");
     }
     int sel{0};
     const char* structure{nullptr};

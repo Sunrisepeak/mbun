@@ -160,7 +160,11 @@ inline constexpr std::string_view kNodeUtilExtraJS = R"JS(
           return !!(c && c.KeyObject) && v instanceof c.KeyObject;
         } catch (_) { return false; }
       },
-      isCryptoKey: (v) => isObj(v) && typeof G.CryptoKey === "function" && v instanceof G.CryptoKey,
+      // A real CryptoKey is identified by its internal slots, never by
+      // `instanceof`: prototype spoofing (or a forged Symbol.hasInstance) must
+      // not fool it. ref: node test-webcrypto-cryptokey-brand-check.
+      isCryptoKey: (v) => isObj(v) && typeof G.__mbunIsCryptoKey === "function"
+        && G.__mbunIsCryptoKey(v),
       isEventTarget: (v) => isObj(v) && typeof G.EventTarget === "function" && v instanceof G.EventTarget,
     };
     for (const k of Object.keys(T)) {
