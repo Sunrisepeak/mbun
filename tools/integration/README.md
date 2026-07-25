@@ -106,6 +106,14 @@ frozen machine or a silently murdered harness.
   `MBUN_BUILD_SLOTS` (default 1) sets how many may run at once,
   `MBUN_BUILD_WAIT` how long to wait before giving up with exit 75 — it never
   runs the command after giving up.
+- `check_conflict_markers.sh` — fails if a tracked file still carries an
+  unresolved merge-conflict marker. **Not redundant with the compiler:** mbun's
+  builtins embed JavaScript inside C++ raw string literals, so a marker left in
+  that JS is ordinary text to the C++ compiler — it compiles clean, links clean,
+  and ships a binary whose `execSync` is broken at runtime. That happened during
+  the round-9 integration: `mcpp build` reported "Finished release [optimized]"
+  over a file holding four markers. A green build is not evidence a merge was
+  resolved; run this as the last step of any conflict resolution.
 - `smoke_examples.py` — boots each `examples/` app in turn, requests
   `http://127.0.0.1:3000/`, asserts a 2xx, then reaps the whole process tree
   (`bounded_run.BoundedServer`). Sequential by design: the demos all hardcode
@@ -126,6 +134,7 @@ bash tools/integration/tests/test_cluster_finder.sh
 bash tools/integration/tests/test_smoke_examples.sh
 bash tools/integration/tests/test_worktree_setup.sh
 bash tools/integration/tests/test_build_lock.sh
+bash tools/integration/tests/test_check_conflict_markers.sh
 bash benchmarks/tools/test-bench3.sh
 ```
 
