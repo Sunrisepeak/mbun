@@ -680,7 +680,31 @@ export constexpr std::string_view kNetJS = R"JS(
         if (this._eof) this.destroy();
       }
       if (this._needDrain && this._wqLen === 0 && !this.destroyed) { this._needDrain = false; progress++; this.emit("drain"); }
+      this._syncEofHold();
       return progress;
+    }
+    // libuv's liveness rule, which this reactor was missing. A stream handle is
+    // ACTIVE only while it has a read started or a write request pending;
+    // uv_loop_alive() counts active handles, not merely open ones. So once node
+    // has seen EOF it calls readStop(), and a socket that is still *open and
+    // writable* — the whole point of allowHalfOpen — stops holding the loop.
+    //
+    // Here every open socket held it unconditionally, so a half-open socket the
+    // peer had already FIN'd pinned the process forever even though nothing
+    // could ever read from it again. That is the `sockets outlive server`
+    // timeout shape: server closed, one or more EOF'd Sockets left with
+    // readable=false, writable=true, _wq=0.
+    //
+    // Deliberately narrow: only a socket that has ALREADY seen EOF is released,
+    // and only while its write queue is empty. Re-holding on a queued write is
+    // what keeps a later `socket.write()` on a half-open socket flushable —
+    // libuv's write request makes the handle active again in exactly the same
+    // way. Sockets that never see EOF, and non-half-open sockets (which shut
+    // and destroy on EOF anyway), are unaffected.
+    _syncEofHold() {
+      if (this.destroyed || !this._loopOpen) return;
+      if (this._eof && this._wq.length === 0) NET.release(this);
+      else NET.hold(this);
     }
     _poll() {
       if (this.destroyed || this._fd < 0) { NET.items.delete(this); return 0; }
@@ -731,6 +755,9 @@ export constexpr std::string_view kNetJS = R"JS(
               });
             }
             if (this._shutSent && this._wq.length === 0) this.destroy();
+            // EOF: the read side is stopped, so this handle is only active while
+            // a write is queued (see _syncEofHold).
+            this._syncEofHold();
             break;
           }
           const bytes = fromB64(r);
@@ -2903,6 +2930,9 @@ export constexpr std::string_view kNetJS = R"JS(
     const HI = G.__mbunHttpInternals || {};
     const freeParser = typeof HI.freeParser === "function" ? HI.freeParser : null;
     const clearIncoming = typeof HI.clearIncoming === "function" ? HI.clearIncoming : null;
+    const ConnResetException = typeof HI.ConnResetException === "function"
+      ? HI.ConnResetException
+      : (msg) => { const e = new Error(msg); e.code = "ECONNRESET"; return e; };
     const vInt = HI.validateInteger || (() => {});
     const vBool = HI.validateBoolean || (() => {});
     const oor = HI.ERR_OUT_OF_RANGE || ((name, range, v) => { const e = new RangeError(name); e.code = "ERR_OUT_OF_RANGE"; return e; });
@@ -2969,14 +2999,25 @@ export constexpr std::string_view kNetJS = R"JS(
       if (srv.emit("clientError", err, sock)) return;
       const res = sock._httpMessage;
       if (sock.writable && (!res || !res._headerSent)) {
-        // end(), not write()+destroy(): this reactor's destroy() drops the
-        // still-queued bytes, and every corpus file here observes the reply
-        // followed by a FIN on the peer.
-        try { sock.end(cannedResponse(err.code)); return; } catch (e) {}
+        // end(), not write(): this reactor's destroy() drops the still-queued
+        // bytes, and every corpus file here observes the reply followed by a FIN
+        // on the peer.
+        try { sock.end(cannedResponse(err.code)); } catch (e) {}
       }
-      // destroy() bare, not destroy(err): this reactor re-emits the argument as
-      // an 'error' on the socket, which reaches listeners node never shows it to.
-      try { sock.destroy(); } catch (e) {}
+      // node finishes socketOnError with `this.destroy(e)`, and it is destroy's
+      // error ARGUMENT that makes the connection socket emit 'error':
+      // test-http-server-destroy-socket-on-client-error grabs the socket from
+      // 'connection' and asserts that exact object ({ code:
+      // 'HPE_INVALID_METHOD', bytesParsed, rawPacket }). A previous revision
+      // passed no argument, reasoning that node never shows the error to socket
+      // listeners — node hides it only from a server that has NONE, which it
+      // arranges by installing its own noop handler first. The connection
+      // listener above already installs one, so passing the error cannot throw.
+      //
+      // Deferred while bytes are still queued: end() has armed the FIN, and
+      // closing the fd now would drop the canned reply the peer asserts on.
+      if (sock._wq && sock._wq.length) { try { sock.emit("error", err); } catch (e) {} }
+      else { try { sock.destroy(err); } catch (e) {} }
     };
     const onRequestTimeout = (sock) => {
       const err = new Error("Request timeout");
@@ -3076,13 +3117,37 @@ export constexpr std::string_view kNetJS = R"JS(
         // drained, and freeing eagerly would blank `req.socket.parser` out from
         // under a still-pending 'end' handler (test-http-server-keepalive-end
         // reads parser.incoming from exactly there).
-        if (freeParser && sock.parser) {
-          const p = sock.parser;
-          const later = () => freeParser(p, null, sock);
-          if (typeof G.setImmediate === "function") G.setImmediate(later);
-          else if (G.process && typeof G.process.nextTick === "function") G.process.nextTick(later);
-          else later();
-        }
+        //
+        // node lib/_http_server.js socketOnClose then does
+        // abortIncoming(state.incoming) + abortOutgoing(state.outgoing): a
+        // connection that dies mid-exchange must tear down every message still
+        // attached to it, and it is that teardown -- not the loop -- the corpus
+        // waits on. `req.on('aborted')`, `req.on('close')` and `req.signal`'s
+        // abort all originate in IncomingMessage._destroy, and a queued
+        // ServerResponse whose socket never arrived only emits 'close' when
+        // something destroys it. Without this the socket vanished from the
+        // reactor while the request object it carried stayed live forever, so
+        // the callback holding server.close() was never reached and the test
+        // timed out with a listening server and no sockets -- which reads like a
+        // handle leak and is not one.
+        //
+        // It shares freeParser's one-turn deferral, and for the same reason:
+        // destroying eagerly abandons a request whose body is fully buffered but
+        // whose 'end' has not been delivered yet, turning the FIN that ends a
+        // normal keep-alive exchange into a spurious abort. Measured: eager
+        // abort broke test-http-server-keep-alive-defaults,
+        // test-http-server-keep-alive-max-requests-null and
+        // test-http-keep-alive-pipeline-max-requests, all three on a `req.on
+        // ('end')` that stopped firing.
+        const parserAtClose = sock.parser;
+        const closeLater = () => {
+          if (freeParser && parserAtClose) { try { freeParser(parserAtClose, null, sock); } catch (e) {} }
+          abortIncoming();
+          abortOutgoing();
+        };
+        if (typeof G.setImmediate === "function") G.setImmediate(closeLater);
+        else if (G.process && typeof G.process.nextTick === "function") G.process.nextTick(closeLater);
+        else closeLater();
       });
       if (srv.timeout) { try { sock.setTimeout(srv.timeout); } catch (e) {} }
       sock.server = srv;
@@ -3108,6 +3173,26 @@ export constexpr std::string_view kNetJS = R"JS(
       let eofSeen = false;
       let requestsCount = 0;
       const outgoing = [];
+      // node lib/_http_server.js `state.incoming`: every request message
+      // dispatched on this connection that has not finished its response yet.
+      // A single `sock._httpIncoming` slot cannot stand in for it -- a pipeline
+      // has several live at once, and socketOnClose must abort all of them.
+      const incoming = [];
+      // lib/_http_server.js abortIncoming/abortOutgoing, verbatim: shift-and-
+      // destroy so a 'close' handler that re-enters (server.close() from inside
+      // one) cannot see a half-drained list.
+      const abortIncoming = () => {
+        while (incoming.length) {
+          const req = incoming.shift();
+          try { req.destroy(ConnResetException("aborted")); } catch (e) {}
+        }
+      };
+      const abortOutgoing = () => {
+        while (outgoing.length) {
+          const res = outgoing.shift();
+          try { res.destroy(ConnResetException("aborted")); } catch (e) {}
+        }
+      };
 
       // Pipelined intake. push() runs the request handler synchronously, so the
       // parser can complete (and be replaced) in the middle of this loop: the
@@ -3198,6 +3283,16 @@ export constexpr std::string_view kNetJS = R"JS(
           // further byte on it is HTTP, so nothing may re-arm a parser for it
           // (doing so re-parsed tunnel traffic as a new request).
           sock._httpUpgraded = true;
+          // node lib/_http_server.js onParserExecuteCommon drops state.onClose
+          // (along with onData/onEnd/onDrain) before handing the socket over, so
+          // an upgraded request is never abortIncoming()'d -- the socket is no
+          // longer the http server's to tear down. This listener still has the
+          // _httpConns bookkeeping to do, so forget the message instead of the
+          // listener.
+          if (im) {
+            const upAt = incoming.indexOf(im);
+            if (upAt !== -1) incoming.splice(upAt, 1);
+          }
           const ev = im && im.method === "CONNECT" ? "connect" : "upgrade";
           if (srv.listenerCount(ev) > 0) srv.emit(ev, im, sock, head);
           else sock.destroy();
@@ -3214,6 +3309,16 @@ export constexpr std::string_view kNetJS = R"JS(
           if (im && !im._consuming && !(im._readableState && im._readableState.resumeScheduled)) im._dump();
           if (sock._httpMessage === res) res.detachSocket(sock);
           sock._httpIncoming = null;
+          // node lib/_http_server.js resOnFinish: `state.incoming.shift()`, with
+          // an assert that the head IS this request -- except when
+          // abortIncoming() already emptied the list. Tolerate an out-of-order
+          // entry rather than assert: a pipelined response can finish before an
+          // earlier one here, and dropping the wrong element would leave a
+          // finished request to be "aborted" later.
+          if (im) {
+            const at = incoming.indexOf(im);
+            if (at !== -1) incoming.splice(at, 1);
+          }
           // node lib/_http_server.js resOnFinish -> clearIncoming(req): release
           // the parser's reference to the finished message, but only once the
           // message has actually ended (otherwise defer to its 'end').
@@ -3257,6 +3362,8 @@ export constexpr std::string_view kNetJS = R"JS(
           if (typeof sock.setTimeout === "function") { try { sock.setTimeout(srv.timeout || 0); } catch (e) {} }
           im = new RequestClass(sock);
           sock._httpIncoming = im;
+          // node lib/_http_server.js parserOnIncoming: `state.incoming.push(req)`.
+          incoming.push(im);
           if (sock.parser) { sock.parser.incoming = im; im.parser = sock.parser; }
           im.method = parser.method;
           im.url = parser.target;
