@@ -388,6 +388,9 @@ struct TlsChannel::Impl {
             if (!load_ca_pem_(config.ca)) {
                 return false;
             }
+        } else if (config.caIsComplete) {
+            // An explicitly EMPTY trust store. Nothing is loaded, so every chain
+            // fails verification — which is exactly what the caller asked for.
         } else if (config.verify != VerifyMode::disabled) {
             if (!configure_default_trust_()) {
                 fail_("configure_default_trust: no usable system CA store");

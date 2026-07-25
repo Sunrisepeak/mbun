@@ -596,6 +596,13 @@ JSValueRef netn_tls_wrap_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
     // (lib/internal/tls/secure-context.js processCiphers). Empty leaves the
     // engine's own TLS 1.3 suite selection in place.
     if (argc > 12) { cfg.cipherSuites = fs_arg(ctx, argc, args, 12); }
+    // arg 13: caIsComplete. `true` means arg 6 is the caller's ENTIRE trust
+    // store — tls.setDefaultCACertificates() replaced node's addRootCerts() —
+    // so the platform default store must not be consulted, not even when the
+    // supplied store is empty ("trust nothing" is a legitimate instruction).
+    if (argc > 13 && JSValueIsBoolean(ctx, args[13])) {
+        cfg.caIsComplete = JSValueToBoolean(ctx, args[13]);
+    }
     auto st{std::make_unique<NetTlsState>(
         isServer ? mbun::tls::TlsRole::server : mbun::tls::TlsRole::client, std::move(cfg))};
     if (!st->channel.valid()) {

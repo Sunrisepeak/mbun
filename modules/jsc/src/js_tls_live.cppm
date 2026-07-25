@@ -480,6 +480,18 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
           ? (options.requestCert ? (options.rejectUnauthorized !== false ? 1 : 2) : 0)
           : (options.rejectUnauthorized !== false ? 1 : 0);
         const ver = resolveVersions(options);
+        // node lib/internal/tls/secure-context.js configSecureContext: a context
+        // with no `ca` calls context.addRootCerts(), and
+        // tls.setDefaultCACertificates() REPLACES what that installs. mbun's
+        // engine falls back to the platform store when `ca` is empty, so the
+        // mutated default has to be handed over explicitly or it never takes
+        // effect (test-tls-set-default-ca-certificates-*-https-request).
+        let caPem = pemOf(options.ca);
+        let caComplete = false;
+        if (!caPem && options.ca == null && T && typeof T.__mbunDefaultCAPem === "function") {
+          const overridden = T.__mbunDefaultCAPem();
+          if (overridden !== null && overridden !== undefined) { caPem = overridden; caComplete = true; }
+        }
         // node processCiphers: TLS 1.3 suites go to SSL_CTX_set_ciphersuites,
         // everything else to SSL_CTX_set_cipher_list. An empty/absent option
         // still means "leave the engine's own defaults alone" on both slots.
@@ -501,7 +513,11 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
           isServer: !!options.isServer,
           cert: pemOf(options.cert),   // server: own cert; client: mutual-TLS cert
           key: pemOf(options.key),
-          ca: pemOf(options.ca),
+          ca: caPem,
+          // caComplete: `ca` is the WHOLE trust store, so do not fall back to
+          // the platform one — including when it is empty, which is how
+          // tls.setDefaultCACertificates([]) means "trust nothing".
+          caComplete: caComplete,
           servername: options.servername || "",
           verify,
           alpn: alpnCsv(options.ALPNProtocols),

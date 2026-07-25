@@ -888,7 +888,19 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
       out.push(pem);
     }
     _defaultCAs = Object.freeze(out);
+    // The mutated store has to reach the TLS engine, not just getCACertificates:
+    // node's setDefaultCACertificates replaces what addRootCerts() would have
+    // installed, so a client with no explicit `ca` verifies against THIS list and
+    // nothing else. Cache the concatenated PEM once — the list is typically the
+    // whole root bundle and a per-connection join would be quadratic.
+    _defaultCAPem = out.join("\n");
   }
+  // null until the process calls setDefaultCACertificates(); afterwards the
+  // complete trust store as PEM, "" meaning "trust nothing". js_tls_live reads it
+  // for any client that supplied no `ca` of its own. Never widens trust: it can
+  // only replace the platform store with what the caller explicitly handed over.
+  let _defaultCAPem = null;
+  function defaultCAPem() { return _defaultCAPem; }
 
   // ---- install onto the node:tls module object ----
   const assign = {
@@ -907,6 +919,7 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
     // Internal: js_tls_live needs the same split before it hands the two lists
     // to the native context. Not part of node's surface.
     __mbunProcessCiphers: processCiphers,
+    __mbunDefaultCAPem: defaultCAPem,
     SecureContext,
     Server,
     TLSSocket,

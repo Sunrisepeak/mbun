@@ -643,7 +643,10 @@ export constexpr std::string_view kNetJS = R"JS(
                    o.hostCheck === false ? false : true,
                    // TLS 1.3 suites (node SetCipherSuites); a separate OpenSSL
                    // slot from the <=TLS1.2 cipher list above.
-                   o.cipherSuites || "");
+                   o.cipherSuites || "",
+                   // caComplete: o.ca is the entire trust store; never fall back
+                   // to the platform one (an empty store must stay empty).
+                   o.caComplete === true);
         this._tls = 1;
       } catch (e) { this._fail(e); }
       return this;
