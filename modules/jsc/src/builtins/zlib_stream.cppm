@@ -232,8 +232,20 @@ inline constexpr std::string_view kZlibStreamJS = R"JS(
     // should not be set"). Use a private, non-colliding flag name instead.
     this._zIsDecoder = cfg.kind === K_INFLATE || cfg.kind === K_BDEC || cfg.kind === K_ZDEC;
     this._chunkSize = vopt(opts, "chunkSize", 64, Infinity, 16384);
+    this._maxOutputLength = undefined;   // no cap unless the option asks for one
     if (opts) {
-      vopt(opts, "maxOutputLength", 0, Infinity, undefined);   // validate only
+      // SECURITY: this used to be "validate only" — the option was range-checked
+      // and then thrown away, so every streaming decompressor
+      // (createGunzip/createInflate/createInflateRaw/createBrotliDecompress/
+      // createZstdDecompress/createUnzip) ignored the cap and expanded a zip bomb
+      // in full. maxOutputLength IS the documented defence for decompressing
+      // untrusted input, and the streaming API is where untrusted input arrives;
+      // only the one-shot sync/async helpers were enforcing it. A control that
+      // reports success while doing nothing is worse than an absent one, because
+      // code auditing as bounded was not.
+      // node lib/zlib.js: _maxOutputLength is checked against the running output
+      // total on every produced chunk and raises ERR_BUFFER_TOO_LARGE.
+      this._maxOutputLength = vopt(opts, "maxOutputLength", 0, Infinity, undefined);
       // Each family has its own flush enum: zlib Z_NO_FLUSH..Z_BLOCK (0..5),
       // brotli BROTLI_OPERATION_PROCESS..EMIT_METADATA (0..3), zstd
       // ZSTD_e_continue..ZSTD_e_end (0..2).
@@ -246,6 +258,7 @@ inline constexpr std::string_view kZlibStreamJS = R"JS(
         throw errType("options.dictionary", "an instance of Buffer, TypedArray, DataView, or ArrayBuffer", opts.dictionary);
       }
     }
+    this._zOutLen = 0;             // running decompressed-output total for the cap
     this._bytesWritten = 0;
     this._zEnded = false;
     this._zErrored = false;
@@ -284,7 +297,24 @@ inline constexpr std::string_view kZlibStreamJS = R"JS(
     catch (e) { return this._zMakeErr(String(e && e.message || e)); }
     if (!res || !res.ok) return this._zMakeErr((res && res.message) || "zlib stream error");
     this._bytesWritten += res.consumed | 0;
-    if (res.b64) this._pushChunked(Buffer.from(res.b64, "base64"));
+    if (res.b64) {
+      const produced = Buffer.from(res.b64, "base64");
+      // Enforce maxOutputLength on the running total BEFORE pushing, so a bomb is
+      // stopped at the cap instead of after the whole expansion is in memory.
+      // Decoders only: the cap exists to bound what a compressed input can expand
+      // to, which is also the direction mbun's one-shot helpers check.
+      if (this._zIsDecoder && this._maxOutputLength !== undefined) {
+        this._zOutLen += produced.length;
+        if (this._zOutLen > this._maxOutputLength) {
+          this._zErrored = true;
+          const e = new RangeError("Cannot create a Buffer larger than " +
+                                   this._maxOutputLength + " bytes");
+          e.code = "ERR_BUFFER_TOO_LARGE";
+          return e;
+        }
+      }
+      this._pushChunked(produced);
+    }
     if (res.streamEnd) { this._zEnded = true; this.push(null); }
     return null;
   };

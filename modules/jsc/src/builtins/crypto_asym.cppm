@@ -639,7 +639,13 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
       }
     }
     const info = AN.cipherInfo(nameOrNid, keyLength, ivLength);
-    return info == null ? undefined : info;
+    if (info == null) return undefined;
+    // `aead` is an mbun-internal field on the native result (used by initCipher to
+    // decide whether a cipher is authenticated). node's getCipherInfo returns only
+    // name/nid/blockSize/ivLength/keyLength/mode, so it must not leak onto the
+    // public object — the shape is observable.
+    delete info.aead;
+    return info;
   };
 
   // ---- createCipheriv / createDecipheriv ----
@@ -691,7 +697,10 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     const keyBuf = toBuf(key, options.encoding);
     const ivBuf = iv == null ? Buffer.alloc(0) : toBuf(iv);
     // Cipher existence + key/iv-length validation via the native EVP probe.
-    const info = C.getCipherInfo(algorithm.toLowerCase());
+    // Straight to AN.cipherInfo, not C.getCipherInfo: the public wrapper strips the
+    // internal `aead` field (node's getCipherInfo has no such property) and this is
+    // the consumer that needs it.
+    const info = AN.cipherInfo(algorithm.toLowerCase());
     if (!info) { const e = new Error("Unknown cipher"); e.code = "ERR_CRYPTO_UNKNOWN_CIPHER"; throw e; }
     if (keyBuf.length !== info.keyLength) throw new RangeError("Invalid key length");
     const mode = info.mode;
@@ -702,11 +711,28 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
         (typeof options.authTagLength !== "number" || !Number.isInteger(options.authTagLength) || options.authTagLength < 0)) {
       throw new TypeError("The property 'options.authTagLength' is invalid. Received " + String(options.authTagLength));
     }
+    // Poly1305 produces exactly 16 bytes and node refuses any other length for it
+    // (crypto_cipher.cc InitAuthenticated: the ChaCha20-Poly1305 arm pins
+    // auth_tag_len to 16). Accepting e.g. 4 would let a peer authenticate with a
+    // truncated tag — a 2^32 forgery instead of 2^128.
+    if (info.aead === true && mode === "stream" && options.authTagLength !== undefined &&
+        options.authTagLength !== 16) {
+      const e = new Error("Invalid authentication tag length: " + options.authTagLength);
+      e.code = "ERR_CRYPTO_INVALID_AUTH_TAG"; throw e;
+    }
     self._algo = algorithm.toLowerCase();
     self._enc = isEncrypt;
     self._key = keyBuf;
     self._iv = ivBuf;
-    self._auth = mode === "gcm" || mode === "ccm" || mode === "ocb";
+    // SECURITY: ask the cipher, do not infer from `mode`. ChaCha20-Poly1305 is an
+    // AEAD whose EVP mode is "stream", so the mode test alone left _auth false for
+    // it — and with _auth false setAuthTag() skipped its length validation, so a
+    // caller-supplied ZERO-LENGTH tag was accepted and then dropped, and
+    // decipher.final() returned tampered plaintext as if authenticated.
+    // `info.aead` comes from cipherInfo's EVP query (node:
+    // IsSupportedAuthenticatedMode); the mode test stays as a fallback for a
+    // native layer that predates the field.
+    self._auth = info.aead === true || mode === "gcm" || mode === "ccm" || mode === "ocb";
     self._chunks = [];
     self._aad = null;
     self._tag = null;              // encrypt: output tag; decrypt: expected tag

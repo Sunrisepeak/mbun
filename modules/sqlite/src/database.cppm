@@ -26,6 +26,12 @@ export struct DatabaseOptions {
     bool create{true};
     bool strict{false};
     bool safe_integers{false};
+    // Refuse `ATTACH DATABASE '<path>'`, which is a second file-open that bypasses
+    // whatever check the caller made on `filename`. Set by the bun:sqlite binding
+    // when node's permission model is active without a wholesale fs grant: the
+    // binding can gate the path it is handed, but not a path that arrives later
+    // inside a SQL string.
+    bool no_attach{false};
 };
 
 export class Database {

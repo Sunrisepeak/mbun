@@ -451,6 +451,28 @@ JSValueRef bunsh_exec_cb(JSContextRef context, JSObjectRef, JSObjectRef, std::si
     if (argc < 1 || !JSValueIsString(context, arguments[0])) {
         return JSValueMakeNull(context);
     }
+    // THE PERMISSION GATE FOR Bun.$.
+    //
+    // This is the single point at which the in-process shell interpreter is
+    // reached from JS, and it forks/execvpe's external commands, opens redirect
+    // targets, and runs file-touching builtins (cat/cp/rm/mv) — all through plain
+    // POSIX syscalls in mbun.shell, which is pure logic and knows nothing about
+    // the permission model. Without this check `--permission` was a no-op for
+    // Bun.$: `Bun.$`cat /etc/shadow`` read files, `> file` wrote them, and
+    // ``${process.execPath} -e ...`` re-entered the runtime with no sandbox at
+    // all, while fs.readFileSync / child_process / Bun.spawn were all being
+    // denied.
+    //
+    // Charged to ChildProcess, which is the scope node uses for every
+    // "run a program" capability (src/permission/child_process_permission.cc):
+    // Bun.$ is exactly that, and node's model already treats a granted
+    // ChildProcess as the end of the sandbox. Returning null here would make the
+    // JS layer fall back to its spawn-based path, so raise the error instead —
+    // the caller must see ERR_ACCESS_DENIED, not a silent fallback.
+    if (permission_deny_scope(context, exception, mbun::permission::Scope::ChildProcess,
+                              "Bun.$")) {
+        return JSValueMakeUndefined(context);
+    }
     std::string script;
     if (!shell_value_to_string(context, arguments[0], script, exception)) {
         return JSValueMakeNull(context);
