@@ -207,6 +207,9 @@ export constexpr std::string_view kDgramJS = R"JS(
   // node src/udp_wrap.cc. Failure is a negative libuv errno RETURN VALUE, never
   // a throw — lib/dgram.js relies on that everywhere.
   let nextAsyncId = 1000;
+  // Descriptors currently in the reactor's watch set (libuv's loop->watchers),
+  // which is what uv_udp_open checks before adopting one. See UDP#open.
+  const udpWatchedFds = new Set();
   class UDP {
     constructor() {
       this.fd = -1;
@@ -262,6 +265,14 @@ export constexpr std::string_view kDgramJS = R"JS(
     }
     open(fd) {
       if (this.fd >= 0) return uvOf("EEXIST");
+      // libuv uv_udp_open: UV_EBUSY when THIS handle already has a descriptor,
+      // UV_EEXIST when the descriptor is already in the loop's watcher list —
+      // i.e. some other live handle is actively receiving on it (libuv#1851).
+      // A handle that is merely bound is NOT watched, which is why
+      // _createSocketHandle may re-open a bound-but-idle UDP fd
+      // (test-dgram-create-socket-handle-fd) while binding onto a *receiving*
+      // socket's fd is EEXIST (test-dgram-bind-fd-error).
+      if (udpWatchedFds.has(fd | 0)) return uvOf("EEXIST");
       const r = ND.open(fd | 0);
       if (typeof r === "string") return uvOf(r);
       this.fd = fd | 0;
@@ -300,10 +311,12 @@ export constexpr std::string_view kDgramJS = R"JS(
       if (this.fd < 0 || this._receiving) return 0;
       this._receiving = true;
       this._loopOpen = true;
+      udpWatchedFds.add(this.fd);       // uv__io_start: the fd joins the loop
       if (NET) { NET.items.add(this); NET.hold(this); }
       return 0;
     }
     recvStop() {
+      if (this._receiving && this.fd >= 0) udpWatchedFds.delete(this.fd);
       this._receiving = false;
       this._loopOpen = false;
       if (NET) { NET.items.delete(this); NET.release(this); }
@@ -381,14 +394,22 @@ export constexpr std::string_view kDgramJS = R"JS(
       if (this.fd < 0) return uvOf("EBADF");
       return rc(ND.mcastiface(this.fd, iface == null ? "" : String(iface), this._family6));
     }
+    // uv_udp_set_membership runs uv__udp_maybe_deferred_bind FIRST, so an
+    // unbound socket gets its descriptor here rather than reporting EBADF —
+    // node's addMembership() on a fresh dgram.Socket has to reach setsockopt(2)
+    // and answer EINVAL for a bad group (test-dgram-membership). That is the
+    // opposite of uv_udp_set_broadcast/_ttl above, which really do return
+    // UV_EBADF while unbound.
     _membership_(add, group, iface) {
-      if (this.fd < 0) return uvOf("EBADF");
+      const e = this._ensureFd_(this._family6);
+      if (e !== 0) return e;
       return rc(ND.membership(this.fd, add, String(group), iface == null ? "" : String(iface), this._family6));
     }
     addMembership(group, iface) { return this._membership_(true, group, iface); }
     dropMembership(group, iface) { return this._membership_(false, group, iface); }
     _srcMembership_(add, source, group, iface) {
-      if (this.fd < 0) return uvOf("EBADF");
+      const e = this._ensureFd_(this._family6);  // uv__udp_maybe_deferred_bind
+      if (e !== 0) return e;
       return rc(ND.srcmembership(this.fd, add, String(source), String(group), iface == null ? "" : String(iface), this._family6));
     }
     addSourceSpecificMembership(source, group, iface) { return this._srcMembership_(true, source, group, iface); }

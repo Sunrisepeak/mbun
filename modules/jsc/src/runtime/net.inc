@@ -78,6 +78,17 @@ inline const char* net_errno_name(int e) {
     case EMFILE: return "EMFILE";
     case ENFILE: return "ENFILE";
     case ENOTSOCK: return "ENOTSOCK";
+    // connect(2) side. A unix-socket connect to a path that exists but is not a
+    // socket is ECONNREFUSED on Linux, and one whose mode denies access EACCES;
+    // both used to be reported as a flat ENOENT.
+    case ECONNREFUSED: return "ECONNREFUSED";
+    case ECONNRESET: return "ECONNRESET";
+    case ETIMEDOUT: return "ETIMEDOUT";
+    case EHOSTUNREACH: return "EHOSTUNREACH";
+    case ENETUNREACH: return "ENETUNREACH";
+    case ENETDOWN: return "ENETDOWN";
+    case EPIPE: return "EPIPE";
+    case EISDIR: return "EISDIR";
     default: return "UNKNOWN";
     }
 }
@@ -276,9 +287,15 @@ JSValueRef netn_connect_unix_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std:
     do { rc = connect(fd, reinterpret_cast<sockaddr*>(&addr), alen); }
     while (rc != 0 && errno == EINTR);
     if (rc != 0) {
+        // The errno NAME, not a hard-coded ENOENT: connecting to a path that
+        // exists but is not a socket is ECONNREFUSED (or ENOTSOCK), and one
+        // whose mode denies access is EACCES. The JS layer classifies the
+        // failure by scanning this message, so a fixed "ENOENT" reported every
+        // pipe connect failure as a missing file (test-net-pipe-connect-errors).
+        const int saved{errno};
         close(fd);
-        return fs_throw(ctx, exc, std::string{"ENOENT: connect to unix:"} + path +
-                                      " failed (" + std::strerror(errno) + ")");
+        return fs_throw(ctx, exc, std::string{net_errno_name(saved)} + ": connect to unix:" + path +
+                                      " failed (" + std::strerror(saved) + ")");
     }
     net_set_nonblock(fd);
     net_fds().insert(fd);
