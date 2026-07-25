@@ -895,6 +895,10 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
       }
     } catch (e) {}
   } catch (e) {}
+  // Last: if this process was fork()ed with an IPC channel, wire
+  // process.send/'message'/disconnect now that `process` is a full EventEmitter
+  // (the plumbing itself lives in the process_web partition).
+  try { if (typeof globalThis.__mbunSetupIpcChild === "function") globalThis.__mbunSetupIpcChild(); } catch (e) {}
 })();
 )JS";
 

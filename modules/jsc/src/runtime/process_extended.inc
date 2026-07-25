@@ -9,8 +9,13 @@
 // Exec/pre-exec failures (ENOENT, EPERM from setuid, EBADF from bad stdio fd…)
 // are reported through a CLOEXEC status pipe exactly like libuv: the parent
 // blocks on it until exec succeeds (EOF) or the child writes errno.
+// `Ipc` is node's fork() channel slot: a bidirectional AF_UNIX SOCK_STREAM
+// socketpair rather than a half-duplex pipe (node lib/internal/child_process.js
+// setupChannel + src/spawn_sync.cc UV_CREATE_PIPE|UV_READABLE|UV_WRITABLE). The
+// parent end comes back in `fds`; the child end is dup2'd into the slot index
+// and advertised to the child through NODE_CHANNEL_FD (added by the JS layer).
 struct StdioSlot {
-    enum class Kind : std::uint8_t { Pipe, Ignore, Inherit, Fd } kind{Kind::Pipe};
+    enum class Kind : std::uint8_t { Pipe, Ignore, Inherit, Fd, Ipc } kind{Kind::Pipe};
     int fd{-1};  // Fd: source fd number
 };
 
@@ -76,6 +81,7 @@ JSValueRef proc_spawn_ex_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
                     const std::string k{val_to_string(ctx, el)};
                     s.kind = k == "ignore"    ? StdioSlot::Kind::Ignore
                              : k == "inherit" ? StdioSlot::Kind::Inherit
+                             : k == "ipc"     ? StdioSlot::Kind::Ipc
                                               : StdioSlot::Kind::Pipe;
                 }
                 slots.push_back(s);
@@ -88,6 +94,13 @@ JSValueRef proc_spawn_ex_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
     // Parent/child pipe ends per slot (only Pipe slots use them).
     std::vector<std::array<int, 2>> pipes(slots.size(), {-1, -1});
     for (std::size_t i = 0; i < slots.size(); ++i) {
+        if (slots[i].kind == StdioSlot::Kind::Ipc) {
+            // [0] = parent end, [1] = child end (both directions on each).
+            if (::socketpair(AF_UNIX, SOCK_STREAM, 0, pipes[i].data()) != 0) {
+                return fs_throw(ctx, exc, "spawnEx: socketpair() failed");
+            }
+            continue;
+        }
         if (slots[i].kind != StdioSlot::Kind::Pipe) continue;
         if (pipe(pipes[i].data()) != 0) return fs_throw(ctx, exc, "spawnEx: pipe() failed");
     }
@@ -129,6 +142,9 @@ JSValueRef proc_spawn_ex_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
             switch (slots[i].kind) {
             case StdioSlot::Kind::Pipe:
                 src = i == 0 ? pipes[i][0] : pipes[i][1];
+                break;
+            case StdioSlot::Kind::Ipc:
+                src = pipes[i][1];
                 break;
             case StdioSlot::Kind::Inherit:
                 src = static_cast<int>(i);
@@ -193,6 +209,7 @@ JSValueRef proc_spawn_ex_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
     // ── parent ──
     close(errPipe[1]);
     for (std::size_t i = 0; i < slots.size(); ++i) {
+        if (slots[i].kind == StdioSlot::Kind::Ipc) { close(pipes[i][1]); continue; }
         if (slots[i].kind != StdioSlot::Kind::Pipe) continue;
         close(i == 0 ? pipes[i][0] : pipes[i][1]);
     }
@@ -205,6 +222,7 @@ JSValueRef proc_spawn_ex_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
         int status{0};
         waitpid(pid, &status, 0);
         for (std::size_t i = 0; i < slots.size(); ++i) {
+            if (slots[i].kind == StdioSlot::Kind::Ipc) { close(pipes[i][0]); continue; }
             if (slots[i].kind != StdioSlot::Kind::Pipe) continue;
             close(i == 0 ? pipes[i][1] : pipes[i][0]);
         }
@@ -216,7 +234,8 @@ JSValueRef proc_spawn_ex_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
     const std::size_t nf{std::min(slots.size(), std::size_t{64})};
     for (std::size_t i = 0; i < nf; ++i) {
         const int f{slots[i].kind == StdioSlot::Kind::Pipe ? (i == 0 ? pipes[i][1] : pipes[i][0])
-                                                           : -1};
+                    : slots[i].kind == StdioSlot::Kind::Ipc ? pipes[i][0]
+                                                            : -1};
         fdVals[i] = JSValueMakeNumber(ctx, f);
     }
     set_prop(ctx, r, "fds", JSObjectMakeArray(ctx, nf, fdVals, nullptr));
