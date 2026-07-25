@@ -998,6 +998,28 @@ export constexpr std::string_view kHttp2JS = R"JS(
   }
   // A graceful shutdown ends the write side (flushing whatever is queued and
   // sending FIN); an error shutdown destroys the fd right away.
+  // A transport EOF ends the session (RFC 9113 5.4.1): no further frames can
+  // arrive, so every stream still waiting for one is CANCELLED. node does the
+  // same thing on its socket's 'close'
+  // (socketOnClose: state.streams.forEach(s => s.close(NGHTTP2_CANCEL))), and its
+  // native session turns the read EOF into that close. mbun's http2 socket is
+  // allowHalfOpen — the FIN is all it ever gets — and it used to PARK on
+  // `_endPending` until the streams finished by themselves. They never did when
+  // they were the ones waiting for the peer, so the socket stayed ref'd and the
+  // file hung instead of reporting the abort (test-http2-compat-aborted asserts
+  // request.on('aborted') fires with `complete === true`).
+  function abortStreamsOnTransportEof(session) {
+    if (!session.streams || session.streams.size === 0) return;
+    for (const stream of Array.from(session.streams.values())) {
+      if (stream.destroyed || stream._closed) continue;
+      stream.rstCode = constants.NGHTTP2_CANCEL;
+      if (!stream.aborted && !stream.readableEnded) {
+        stream.aborted = true;
+        try { stream.emit("aborted"); } catch (e) {}
+      }
+    }
+  }
+
   function closeSessionSocket(socket, hard) {
     if (!socket) return;
     try {
@@ -1598,7 +1620,7 @@ export constexpr std::string_view kHttp2JS = R"JS(
     // allowHalfOpen socket, which would otherwise hold the loop) must go.
     _onSocketEnd() {
       if (this.destroyed) return;
-      if (this.streams && this.streams.size > 0) { this._endPending = true; return; }
+      abortStreamsOnTransportEof(this);
       this._endPending = false;
       this._teardown();
     }
@@ -2691,7 +2713,7 @@ export constexpr std::string_view kHttp2JS = R"JS(
     // handles genuinely held the event loop that became a hang.
     _onSocketEnd() {
       if (this.destroyed) return;
-      if (this.streams && this.streams.size > 0) { this._endPending = true; return; }
+      abortStreamsOnTransportEof(this);
       this._endPending = false;
       this._teardown();
     }
