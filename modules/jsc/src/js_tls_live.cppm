@@ -307,7 +307,25 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
       transport.on("drain", () => self.emit("drain"));
       transport.on("end", () => { self.readable = false; self.emit("end"); });
       transport.on("close", (hadErr) => { self.destroyed = true; self.emit("close", !!hadErr); });
-      transport.on("error", (e) => self.emit("error", e));
+      // node internal/tls/wrap.js onConnectEnd: a transport that disconnects
+      // BEFORE the handshake completes is reported as an ECONNRESET carrying the
+      // connect options, not as a bare read error — the corpus asserts path /
+      // host / port / localAddress on it (test-tls-wrap-econnreset*). The same
+      // logic lives in _http_client.js, so keep the shape identical.
+      transport.on("error", (e) => {
+        if (!self._secureEstablished && e && e.code === "ECONNRESET" && !self._hadError) {
+          self._hadError = true;
+          const o = self._connectOptions;
+          if (o) {
+            e.message = "Client network socket disconnected before secure TLS connection was established";
+            e.path = o.path;
+            e.host = o.host;
+            e.port = o.port;
+            e.localAddress = o.localAddress;
+          }
+        }
+        self.emit("error", e);
+      });
       // setTimeout() arms the timer on the transport, so the 'timeout' event
       // fires there — but every consumer (node:https' server keep-alive sweep,
       // socket.setTimeout(ms, cb), the corpus' own listeners) is attached to the
@@ -351,9 +369,11 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
           self.authorized = !!info.authorized;
           self._protocol = info.protocol || null;
           self._cipherName = info.cipher || "";
-          // node: alpnProtocol is the negotiated name, false when ALPN was
-          // attempted but nothing matched, null when ALPN was not offered.
-          self.alpnProtocol = info.alpnProtocol ? info.alpnProtocol : (self.ALPNProtocols ? false : null);
+          // node crypto_tls.cc TLSWrap::GetALPNNegotiatedProto: SSL_get0_alpn_
+          // selected yielding a zero-length protocol is reported as `false`,
+          // whether or not this side offered ALPN. `null` is only the
+          // constructor's initial value, i.e. "the handshake has not finished".
+          self.alpnProtocol = info.alpnProtocol ? info.alpnProtocol : false;
           if (info.peerCert) { self._peerCert = parseCert(info.peerCert); self._peerCertPem = info.peerCert; }
           if (info.servername) self.servername = self.servername || info.servername;
         } else {
@@ -550,6 +570,9 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
     const transport = new NetSocket({ allowHalfOpen: false, highWaterMark: opts.highWaterMark });
     const tlsOptsHwm = Object.assign({ highWaterMark: opts.highWaterMark }, tlsOpts);
     const tlsSock = new TLSSocket(transport, tlsOptsHwm);
+    // node stores the resolved connect options on the socket (kConnectOptions);
+    // onConnectEnd reads path/host/port/localAddress back off them.
+    tlsSock._connectOptions = opts;
     if (cb) tlsSock.once("secureConnect", cb);
     // node internal/tls/wrap.js connect(): only a socket this call created gets
     // the timeout armed — a caller-supplied socket stays the caller's business.
@@ -645,7 +668,8 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
       const hsTimeout = creds.handshakeTimeout === undefined ? 120000 : creds.handshakeTimeout;
       if (hsTimeout > 0) {
         const timer = G.setTimeout(() => {
-          if (tlsSock._secureEstablished || tlsSock.destroyed) return;
+          if (tlsSock._secureEstablished || tlsSock.destroyed || tlsSock._errorEmitted) return;
+          tlsSock._errorEmitted = true;
           const e = new Error("TLS handshake timeout");
           e.code = "ERR_TLS_HANDSHAKE_TIMEOUT";
           self.emit("tlsClientError", e, tlsSock);
@@ -661,8 +685,26 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
       // the server process down. The listener also has to live on the TLSSocket
       // rather than on the raw transport, because the transport forwards its
       // errors there and an unlistened 'error' re-emit is what threw.
+      // node internal/tls/wrap.js onSocketClose: a peer that goes away before the
+      // handshake completes is reported to the server as `tlsClientError` with
+      // ConnResetException('socket hang up') — test-tls-econnreset matches that
+      // message. Only one of this and the 'error' path may fire.
+      raw.on("close", () => {
+        if (tlsSock._secureEstablished || tlsSock._errorEmitted) return;
+        tlsSock._errorEmitted = true;
+        const e = new Error("socket hang up");
+        e.code = "ECONNRESET";
+        self.emit("tlsClientError", e, tlsSock);
+      });
       tlsSock.on("error", (e) => {
         if (!tlsSock._secureEstablished) {
+          if (tlsSock._errorEmitted) return;
+          tlsSock._errorEmitted = true;
+          // node reports a peer that vanished mid-handshake through
+          // onSocketClose, i.e. as ConnResetException('socket hang up') — never
+          // as the raw transport's "read ECONNRESET" (test-tls-econnreset
+          // matches the message). Normalise so both arrival orders agree.
+          if (e && e.code === "ECONNRESET") e.message = "socket hang up";
           self.emit("tlsClientError", e, tlsSock);
           try { tlsSock.destroy(); } catch (e2) {}
           return;
