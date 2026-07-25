@@ -357,6 +357,28 @@ export constexpr std::string_view kHttp2JS = R"JS(
   }
   const sessionErr = (code) => mkErr("Session closed with error code " + errName(code), "ERR_HTTP2_SESSION_ERROR");
   const streamErr = (code) => mkErr("Stream closed with error code " + errName(code), "ERR_HTTP2_STREAM_ERROR");
+  // ERR_HTTP2_SESSION_ERROR and ERR_HTTP2_ERROR are NOT interchangeable, and
+  // mbun used the first for both. node reserves ERR_HTTP2_SESSION_ERROR for a
+  // GOAWAY the PEER sent (core.js: `new ERR_HTTP2_SESSION_ERROR(code)`), while
+  // a violation the LOCAL endpoint detects is nghttp2's own error object —
+  // util.js `NghttpError`, code ERR_HTTP2_ERROR, message nghttp2_strerror(),
+  // e.g. 'Protocol error' (-505) or 'Received bad client magic byte string'
+  // (-903). Two corpus files assert on exactly that distinction.
+  //
+  // NghttpErrorCtor is node's real class, adopted alongside the other
+  // internal/http2/util.js identities so `constructor: NghttpError` compares
+  // equal; without it a shape-compatible plain Error is used.
+  let NghttpErrorCtor = null;
+  const NGHTTP2_ERR_PROTO = -505;
+  const nghttpErr = (errno) => {
+    if (typeof NghttpErrorCtor === "function") {
+      try { return new NghttpErrorCtor(errno); } catch (e) {}
+    }
+    const e = new Error(kNghttp2Strerror[String(errno)] || ("Unknown error code " + errno));
+    e.code = "ERR_HTTP2_ERROR";
+    e.errno = errno;
+    return e;
+  };
   // internal/errors.js AbortError: what request({ signal }) destroys the stream
   // with once the signal fires.
   const abortErr = (reason) => {
@@ -704,14 +726,18 @@ export constexpr std::string_view kHttp2JS = R"JS(
     if (typeof p.cb === "function") { try { p.cb(null, snapshot, Date.now() - p.start); } catch (e) {} }
     session.emit("localSettings", snapshot);
   }
+  // Returns false when the ACK matched no outstanding ping: an UNSOLICITED
+  // PING ACK, which nghttp2 treats as a connection protocol error (it is a
+  // cheap flood vector -- see test-http2-ping-unsolicited-ack).
   function resolvePing(session, payload) {
     const pings = session._pings;
-    if (!pings || !pings.length) return;
+    if (!pings || !pings.length) return false;
     const key = Buffer.from(payload).toString("hex");
     let idx = pings.findIndex((p) => p.key === key);
     if (idx < 0) idx = 0;   // a peer that echoes a different payload still acks
     const p = pings.splice(idx, 1)[0];
     try { p.cb(null, Date.now() - p.start, p.payload); } catch (e) {}
+    return true;
   }
 
   // Http2Session#altsvc / #origin (node lib/internal/http2/core.js). Shared by
@@ -941,7 +967,12 @@ export constexpr std::string_view kHttp2JS = R"JS(
     if (stream._endStreamSent) { cb(); bodySent(); maybeFinishHttp2Stream(stream); return; }
     if (waitForTrailers) {
       stream._trailersReady = true;
-      stream.emit("wantTrailers");
+      // node onStreamTrailers(): `if (!stream.emit('wantTrailers')) { // There
+      // are no listeners, send empty trailing HEADERS frame and close.
+      // stream.sendTrailers({}); }`. Without that fallback a
+      // respond(_, { waitForTrailers: true }) whose application never installs
+      // a handler never sends END_STREAM, and BOTH peers wait forever.
+      if (!stream.emit("wantTrailers")) { try { stream.sendTrailers({}); } catch (e) {} }
       cb();
       bodySent();
       return;
@@ -1004,8 +1035,14 @@ export constexpr std::string_view kHttp2JS = R"JS(
     const finish = () => {
       try { stream.session._rstStream(stream, code); } catch (e) {}
       try { stream.session.streams.delete(stream.id); } catch (e) {}
-      // node: an rst with a non-zero code surfaces as an 'error' on the stream.
-      if (code !== constants.NGHTTP2_NO_ERROR) {
+      // node Http2Stream#_destroy: "RST code 8 not emitted as an error as it is
+      // used by clients to signify abort and is already covered by the 'aborted'
+      // event" -- the guard is
+      // `code !== NGHTTP2_NO_ERROR && code !== NGHTTP2_CANCEL`
+      // (lib/internal/http2/core.js:2486). mbun tested only NO_ERROR, so a
+      // deliberate CANCEL surfaced as an uncaught 'Stream closed with error
+      // code NGHTTP2_CANCEL'.
+      if (code !== constants.NGHTTP2_NO_ERROR && code !== constants.NGHTTP2_CANCEL) {
         const err = streamErr(code);
         G.queueMicrotask(() => { if (!stream.destroyed) stream.destroy(err); else stream.emit("error", err); });
         return;
@@ -1235,6 +1272,17 @@ export constexpr std::string_view kHttp2JS = R"JS(
     _read() { this._didRead = true; http2StreamRead(this); }
     _destroy(err, cb) { http2StreamDestroy(this, err, cb); }
     sendTrailers(headers) {
+      // node lib/internal/http2/core.js sendTrailers() checks
+      // `destroyed || closed` FIRST; only then the already-sent / not-ready
+      // states. mbun had it the other way round, so sendTrailers() on a stream
+      // that had already closed reported ERR_HTTP2_TRAILERS_ALREADY_SENT where
+      // node reports ERR_HTTP2_INVALID_STREAM.
+      // `destroyed` only, NOT `_closed`: mbun's sendTrailers finishes the stream
+      // synchronously (http2StreamFinish sets _closed), while node's `closed`
+      // only turns true when nghttp2 reports the close. Including it here would
+      // make the very next sendTrailers() in the same 'wantTrailers' handler
+      // report INVALID_STREAM where node reports TRAILERS_ALREADY_SENT.
+      if (this.destroyed) throw mkErr("The stream has been destroyed", "ERR_HTTP2_INVALID_STREAM");
       if (this._trailersSent) throw mkErr("Trailers have already been sent", "ERR_HTTP2_TRAILERS_ALREADY_SENT");
       if (!this._trailersReady) throw mkErr("Trailers are not ready to send", "ERR_HTTP2_TRAILERS_NOT_READY");
       headers = headers || {};
@@ -1243,7 +1291,10 @@ export constexpr std::string_view kHttp2JS = R"JS(
       this._trailersSent = true;
       this.sentTrailers = headers;
       const built = buildNgHeaders(Object.assign({ __proto__: null }, headers), assertValidRequestPseudoHeader, this.session._options && this.session._options.strictSingleValueFields);
-      writeHeaderBlock(this.session, this.id, encodeHeaders(built.list, built.sensitive), FLAG.END_STREAM);
+      // See the server stream's sendTrailers: an empty trailer set ends the
+      // stream with DATA(END_STREAM), never a trailing HEADERS frame.
+      if (built.list.length === 0) this.session._sendData(this, Buffer.alloc(0), true);
+      else writeHeaderBlock(this.session, this.id, encodeHeaders(built.list, built.sensitive), FLAG.END_STREAM);
       this._endStreamSent = true;
     }
     close(code, cb) { http2StreamClose(this, code, cb); }
@@ -1421,6 +1472,18 @@ export constexpr std::string_view kHttp2JS = R"JS(
         ? buildHeaderListArray(headers, this._scheme, this._authorityName, this._options.strictSingleValueFields)
         : buildHeaderList(headers, this._scheme, this._authorityName, this._options.strictSingleValueFields);
       const streamId = this._nextStreamId();
+      if (streamId < 0) {
+        // node requestOnConnect: a negative id from nghttp2 becomes
+        // ERR_HTTP2_OUT_OF_STREAMS on the stream, asynchronously -- request()
+        // still hands back a stream object.
+        const stream = new ClientHttp2Stream(this, 0, headers, options);
+        stream.pending = false;
+        stream._closed = true;
+        G.queueMicrotask(() => {
+          if (!stream.destroyed) stream.destroy(mkErr("No stream ID is available because maximum stream ID has been reached", "ERR_HTTP2_OUT_OF_STREAMS"));
+        });
+        return stream;
+      }
       const stream = new ClientHttp2Stream(this, streamId, headers, options);
       this.streams.set(streamId, stream);
       const block = encodeHeaders(built.list, built.sensitive);
@@ -1481,9 +1544,13 @@ export constexpr std::string_view kHttp2JS = R"JS(
       return stream;
     }
 
+    // Returns -1 when the 31-bit stream-id space is exhausted (RFC 9113 5.1.1).
+    // It used to wrap back to 1, silently reusing a closed id.
     _nextStreamId() {
       if (!this._lastStreamId) this._lastStreamId = -1;
-      this._lastStreamId += 2;
+      const next = this._lastStreamId + 2;
+      if (next > 2147483647) return -1;
+      this._lastStreamId = next;
       if (this._lastStreamId < 1) this._lastStreamId = 1;
       return this._lastStreamId;
     }
@@ -1596,14 +1663,24 @@ export constexpr std::string_view kHttp2JS = R"JS(
             this.streams.delete(streamId);
             stream.rstCode = code;
             stream._closed = true;
+            // node abort(stream): a reset while the WRITABLE side is still open
+            // is an abort whatever the RST code, NGHTTP2_NO_ERROR included --
+            // the gate is `!(writableEnded || writableEnding)`, not the code and
+            // not the readable side. mbun emitted 'aborted' only for a non-zero
+            // code, so a clean RST on a still-open request never reported it.
+            const wOpen = !(stream.writableEnded === true ||
+                            (stream._writableState && stream._writableState.ending === true));
+            if (!stream.aborted && wOpen) G.queueMicrotask(() => stream.emit("aborted"));
             stream.aborted = true;
             if (code !== 0) {
-              const err = streamErr(code);
+              // NGHTTP2_CANCEL is 'aborted' only, never an 'error': node treats
+              // RST code 8 as the client's abort signal and explicitly excludes
+              // it from ERR_HTTP2_STREAM_ERROR (lib/internal/http2/core.js:2486).
+              const err = code === constants.NGHTTP2_CANCEL ? null : streamErr(code);
               // node abort(stream): a stream reset before its readable side ended
               // is 'aborted', and only then the error/close pair.
               G.queueMicrotask(() => {
-                if (!stream.readableEnded) stream.emit("aborted");
-                if (!stream.destroyed) stream.destroy(err);
+                if (!stream.destroyed) { if (err) stream.destroy(err); else stream.destroy(); }
               });
             }
             // node onStreamClose(): "Push a null so the stream can end whenever
@@ -1796,11 +1873,14 @@ export constexpr std::string_view kHttp2JS = R"JS(
     setLocalWindowSize(windowSize) { sessionSetLocalWindowSize(this, windowSize); }
 
     // ---- errors / lifecycle ----
-    _connError(code) {
-      // send GOAWAY then surface ERR_HTTP2_SESSION_ERROR (matches nghttp2).
+    // A protocol violation THIS endpoint detected: GOAWAY the peer, then
+    // surface nghttp2's own error (ERR_HTTP2_ERROR), not the received-GOAWAY
+    // form. `errno` names the nghttp2 error; -505 (Protocol error) covers every
+    // frame-level violation, and the connection-preface check passes -903.
+    _connError(code, errno) {
       const p = Buffer.alloc(8); p.writeUInt32BE(this._lastStreamId > 0 ? this._lastStreamId : 0, 0); p.writeUInt32BE(code >>> 0, 4);
       try { this._writeFrame(FRAME.GOAWAY, 0, 0, p); } catch (e) {}
-      this._fatal(sessionErr(code));
+      this._fatal(nghttpErr(errno === undefined ? NGHTTP2_ERR_PROTO : errno));
     }
     _onSocketError(e) { if (!this.destroyed && !this.closed) this._fatal(e); }
     // Peer half-close: same reasoning as the server session below — no further
@@ -2210,6 +2290,26 @@ export constexpr std::string_view kHttp2JS = R"JS(
     if (typeof options === "function") { listener = options; options = undefined; }
     return new ClientHttp2Session(authority, options || {}, listener);
   }
+  // node lib/internal/http2/core.js "Support util.promisify": connect()'s
+  // listener is called with the SESSION, not node's (err, value) callback
+  // shape, so a plain promisify would reject with the session. node ships a
+  // promisify.custom that resolves with it (and rejects on 'error') -- without
+  // it `util.promisify(http2.connect)(...)` never settled and the test hung.
+  // Symbol.for("nodejs.util.promisify.custom") is the registered symbol
+  // util.promisify looks up, so this needs no require of node:util here (which
+  // is not loadable yet at this module's own evaluation time).
+  Object.defineProperty(connect, Symbol.for("nodejs.util.promisify.custom"), {
+    value: function (authority, options) {
+      return new Promise((resolve, reject) => {
+        const session = connect(authority, options, () => {
+          session.removeListener("error", reject);
+          resolve(session);
+        });
+        session.once("error", reject);
+      });
+    },
+    configurable: true,
+  });
 
   function getDefaultSettings() {
     return { headerTableSize: 4096, enablePush: true, initialWindowSize: 65535, maxFrameSize: 16384, maxConcurrentStreams: 4294967295, maxHeaderListSize: 65535, enableConnectProtocol: false };
@@ -2421,8 +2521,12 @@ export constexpr std::string_view kHttp2JS = R"JS(
     _read() { this._didRead = true; http2StreamRead(this); }
     _destroy(err, cb) { http2StreamDestroy(this, err, cb); }
     respond(headers, options) {
-      if (this.headersSent) throw mkErr("Response has already been initiated.", "ERR_HTTP2_HEADERS_SENT");
+      // Order matters: node checks `destroyed || closed` before headersSent
+      // (lib/internal/http2/core.js Http2ServerStream#respond), so respond()
+      // on a destroyed stream that had already responded is
+      // ERR_HTTP2_INVALID_STREAM, not ERR_HTTP2_HEADERS_SENT.
       if (this.destroyed || this._closed) throw mkErr("The stream has been destroyed", "ERR_HTTP2_INVALID_STREAM");
+      if (this.headersSent) throw mkErr("Response has already been initiated.", "ERR_HTTP2_HEADERS_SENT");
       headers = headers || {};
       options = options || {};
       const strictSingle = this.session._options && this.session._options.strictSingleValueFields;
@@ -2462,6 +2566,17 @@ export constexpr std::string_view kHttp2JS = R"JS(
       return;
     }
     sendTrailers(headers) {
+      // node lib/internal/http2/core.js sendTrailers() checks
+      // `destroyed || closed` FIRST; only then the already-sent / not-ready
+      // states. mbun had it the other way round, so sendTrailers() on a stream
+      // that had already closed reported ERR_HTTP2_TRAILERS_ALREADY_SENT where
+      // node reports ERR_HTTP2_INVALID_STREAM.
+      // `destroyed` only, NOT `_closed`: mbun's sendTrailers finishes the stream
+      // synchronously (http2StreamFinish sets _closed), while node's `closed`
+      // only turns true when nghttp2 reports the close. Including it here would
+      // make the very next sendTrailers() in the same 'wantTrailers' handler
+      // report INVALID_STREAM where node reports TRAILERS_ALREADY_SENT.
+      if (this.destroyed) throw mkErr("The stream has been destroyed", "ERR_HTTP2_INVALID_STREAM");
       if (this._trailersSent) throw mkErr("Trailers have already been sent", "ERR_HTTP2_TRAILERS_ALREADY_SENT");
       if (!this._trailersReady) throw mkErr("Trailers are not ready to send", "ERR_HTTP2_TRAILERS_NOT_READY");
       headers = headers || {};
@@ -2473,8 +2588,17 @@ export constexpr std::string_view kHttp2JS = R"JS(
       const sensitive = sensitiveNamesOf(headers);
       const list = [];
       for (const k in headers) { if (!Object.prototype.hasOwnProperty.call(headers, k)) continue; const lk = String(k).toLowerCase(); list.push([lk, String(headers[k])]); }
-      const block = encodeHeaders(list, sensitive);
-      writeHeaderBlock(this.session, this.id, block, FLAG.END_STREAM);
+      // node Http2Stream::SubmitTrailers: an EMPTY trailer set is not a HEADERS
+      // frame at all -- it resumes the data provider, so the stream ends with an
+      // empty DATA(END_STREAM). Emitting a real (if empty) trailing HEADERS
+      // block instead made the peer raise a spurious 'trailers' event, which is
+      // what test-http2-no-wanttrailers-listener asserts must never happen.
+      if (list.length === 0) {
+        this.session._sendData(this, Buffer.alloc(0), true);
+      } else {
+        const block = encodeHeaders(list, sensitive);
+        writeHeaderBlock(this.session, this.id, block, FLAG.END_STREAM);
+      }
       this._endStreamSent = true;
       http2StreamFinish(this);
       return;
@@ -2724,10 +2848,13 @@ export constexpr std::string_view kHttp2JS = R"JS(
 
     _onData(chunk) {
       if (this.destroyed) return;
+      if (this._timeoutMs) this._armTimeout();   // inbound activity resets the idle timer
       this._recv = this._recv.length ? Buffer.concat([this._recv, chunk]) : Buffer.from(chunk);
       if (!this._prefaceRead) {
         if (this._recv.length < 24) return;
-        for (let i = 0; i < 24; i++) { if (this._recv[i] !== CLIENT_PREFACE[i]) { this._connError(constants.NGHTTP2_PROTOCOL_ERROR); return; } }
+        // -903 = NGHTTP2_ERR_BAD_CLIENT_MAGIC, "Received bad client magic byte
+        // string": what an HTTP/1 client talking to an http2 server produces.
+        for (let i = 0; i < 24; i++) { if (this._recv[i] !== CLIENT_PREFACE[i]) { this._connError(constants.NGHTTP2_PROTOCOL_ERROR, -903); return; } }
         this._prefaceRead = true;
         this._recv = this._recv.subarray(24);
       }
@@ -2829,14 +2956,25 @@ export constexpr std::string_view kHttp2JS = R"JS(
             // See the client session's PING case: 'ping' is emitted only for a
             // peer-initiated PING (bun http2.ts:5173).
             this.emit("ping", Buffer.from(payload));
-          } else resolvePing(this, payload);
+          } else if (!resolvePing(this, payload)) {
+            // A PING ACK nobody asked for. nghttp2 terminates the session, which
+            // is what stops a peer from using unmatched ACKs as a flood.
+            this._connError(constants.NGHTTP2_PROTOCOL_ERROR);
+            return false;
+          }
           return true;
         }
         case FRAME.WINDOW_UPDATE: {
           if (len !== 4) { this._connError(constants.NGHTTP2_FRAME_SIZE_ERROR); return false; }
           const inc = payload.readUInt32BE(0) & 0x7fffffff;
           if (inc === 0 && streamId === 0) { this._connError(constants.NGHTTP2_PROTOCOL_ERROR); return false; }  // §6.9
-          if (streamId === 0) this._remoteWindow += inc;
+          if (streamId === 0) {
+            // RFC 9113 6.9.1: a flow-control window that would grow past
+            // 2^31-1 is a connection-level FLOW_CONTROL_ERROR. Without this the
+            // session stayed alive but unusable after the overflow.
+            if (this._remoteWindow + inc > 2147483647) { this._connError(constants.NGHTTP2_FLOW_CONTROL_ERROR); return false; }
+            this._remoteWindow += inc;
+          }
           return true;
         }
         case FRAME.PRIORITY: {
@@ -2952,11 +3090,22 @@ export constexpr std::string_view kHttp2JS = R"JS(
       // before its 'stream' event has no listeners; emitting would throw).
       if (stream.listenerCount && stream.listenerCount("error") > 0) G.queueMicrotask(() => stream.emit("error", streamErr(code)));
       stream._finish();
+      // node maxSessionInvalidFrames (nghttp2's on_invalid_frame_recv budget,
+      // default 1000): a peer that keeps sending frames the server has to
+      // reject is torn down instead of being RST'd forever. Without the budget
+      // a client generating invalid streams in a loop kept the session -- and
+      // the event loop -- alive indefinitely.
+      const maxInvalid = this._options && this._options.maxSessionInvalidFrames !== undefined
+        ? this._options.maxSessionInvalidFrames : 1000;
+      this._invalidFrames = (this._invalidFrames | 0) + 1;
+      if (maxInvalid > 0 && this._invalidFrames >= maxInvalid) this._connError(constants.NGHTTP2_PROTOCOL_ERROR);
     }
-    _connError(code) {
+    // See the client session's _connError: a locally detected violation is
+    // ERR_HTTP2_ERROR (nghttp2_strerror), never ERR_HTTP2_SESSION_ERROR.
+    _connError(code, errno) {
       const p = Buffer.alloc(8); p.writeUInt32BE(this._lastStreamId > 0 ? this._lastStreamId : 0, 0); p.writeUInt32BE(code >>> 0, 4);
       try { this._writeFrame(FRAME.GOAWAY, 0, 0, p); } catch (e) {}
-      const err = sessionErr(code);
+      const err = nghttpErr(errno === undefined ? NGHTTP2_ERR_PROTO : errno);
       const self = this;
       this._teardown();
       G.queueMicrotask(() => self.emit("error", err));
@@ -2978,6 +3127,7 @@ export constexpr std::string_view kHttp2JS = R"JS(
     _teardown(hard) {
       if (this.destroyed) return;
       this.destroyed = true; this.closed = true;
+      if (this._timer != null) { try { G.clearTimeout(this._timer); } catch (e) {} this._timer = null; }
       closeSessionSocket(this.socket, hard !== false);
       const streams = Array.from(this.streams.values());
       const self = this;
@@ -3037,7 +3187,36 @@ export constexpr std::string_view kHttp2JS = R"JS(
     destroy(err, code) { if (this.destroyed) return; if (err) { const self = this; this._teardown(); G.queueMicrotask(() => self.emit("error", err)); } else this._teardown(); }
     ref() { if (this.socket && this.socket.ref) this.socket.ref(); return this; }
     unref() { if (this.socket && this.socket.unref) this.socket.unref(); return this; }
-    setTimeout() { return this; }
+    // node Http2Session#setTimeout is on BOTH halves (it lives on the shared
+    // Http2Session prototype); this one was a no-op stub, so an http2 SERVER
+    // could never reap an idle session and `server.setTimeout()` / `server.timeout`
+    // had nothing to arm. Same shape as ClientHttp2Session's: one UNREF'd timer,
+    // refreshed by inbound activity, emitting 'timeout' on the session and on
+    // every open stream.
+    setTimeout(ms, cb) {
+      if (typeof ms !== "number") throw argTypeErr("msecs", "of type number", ms);
+      if (ms < 0 || !Number.isFinite(ms)) throw outOfRangeErr("msecs", "a non-negative finite number", ms);
+      this.timeout = ms;
+      this._timeoutMs = ms | 0;
+      this._armTimeout();
+      if (cb !== undefined) {
+        if (typeof cb !== "function") throw argTypeErr("callback", "of type function", cb);
+        this.once("timeout", cb);
+      }
+      return this;
+    }
+    _armTimeout() {
+      if (this._timer != null) { try { G.clearTimeout(this._timer); } catch (e) {} this._timer = null; }
+      if (!this._timeoutMs || this.destroyed) return;
+      const self = this;
+      this._timer = G.setTimeout(() => {
+        self._timer = null;
+        if (self.destroyed) return;
+        self.emit("timeout");
+        for (const s of Array.from(self.streams.values())) { try { s.emit("timeout"); } catch (e) {} }
+      }, this._timeoutMs);
+      if (this._timer && this._timer.unref) this._timer.unref();
+    }
   }
 
   // RFC 7540 6.5.2 value-range validation for a peer SETTINGS payload. Returns a
@@ -3547,6 +3726,18 @@ export constexpr std::string_view kHttp2JS = R"JS(
       session.on("error", (e) => { if (self.listenerCount("sessionError") > 0) self.emit("sessionError", e, session); else if (self.listenerCount("session") === 0 && self.listenerCount("error") > 0) self.emit("error", e); });
       sessions.add(session);
       session.on("close", () => sessions.delete(session));
+      // node connectionListener: `if (this.timeout) session.setTimeout(this.timeout,
+      // sessionOnTimeout)`, and sessionOnTimeout re-raises 'timeout' on the
+      // SERVER with the session as its argument, falling back to a graceful
+      // session.close() when nothing is listening. `server.timeout` was recorded
+      // and then never used, so an idle session was never reaped and the server
+      // never emitted 'timeout'.
+      if (self.timeout) {
+        session.setTimeout(self.timeout, () => {
+          if (session.destroyed) return;
+          if (!self.emit("timeout", session)) { try { session.close(); } catch (e) {} }
+        });
+      }
       self.emit("session", session);
     };
     server.on(secure ? "secureConnection" : "connection", onSession);
@@ -3841,6 +4032,12 @@ export constexpr std::string_view kHttp2JS = R"JS(
     Object.defineProperty(ServerHttp2Session.prototype, u.kSocket, desc);
     if (typeof u.kSensitiveHeaders === "symbol" && sensitiveSymbols.indexOf(u.kSensitiveHeaders) < 0)
       sensitiveSymbols.push(u.kSensitiveHeaders);
+    // Same reasoning as the symbols: `NghttpError` is a class identity the
+    // corpus compares against (`common.expectsError({ constructor: NghttpError
+    // })` in test-http2-server-http1-client), and a structurally identical
+    // clone is not equal to it. Adopt the real one when node's util.js is
+    // loaded; nghttpErr() falls back to a plain ERR_HTTP2_ERROR otherwise.
+    if (typeof u.NghttpError === "function") NghttpErrorCtor = u.NghttpError;
   }
   if (typeof G.__mbunInternalBindingDefine === "function") {
     G.__mbunInternalBindingDefine("http2", () => {
