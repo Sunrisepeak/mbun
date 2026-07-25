@@ -1449,6 +1449,14 @@ export constexpr std::string_view kHttp2JS = R"JS(
                 if (!stream.destroyed) stream.destroy(err);
               });
             }
+            // node onStreamClose(): "Push a null so the stream can end whenever
+            // the client consumes it completely." A clean reset (NO_ERROR) is a
+            // normal end of the response, so the readable side has to END --
+            // destroying the Duplex outright swallowed 'end' entirely.
+            else if (!stream._readEnded) {
+              stream.once("end", () => http2StreamFinish(stream));
+              http2StreamEndReadable(stream);
+            }
             else http2StreamFinish(stream);
           }
           return true;
