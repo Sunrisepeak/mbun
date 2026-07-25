@@ -179,18 +179,115 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
       try { return await fn(); } finally { state.current = previous; }
     };
 
-    const fail = (name, error) => {
+    // `reported` = a test:fail event has already gone out for this failure. The
+    // paths that have no test node to report (a throwing describe() body, a
+    // failing root hook) pass false and get a synthetic top-level failure, so a
+    // TAP document never loses a failure it counted.
+    const fail = (name, error, reported) => {
       state.failures += 1;
-      out("not ok " + ++state.index + " - " + name);
-      const message = error && error.message !== undefined
-        ? (error.name || "Error") + ": " + error.message
-        : String(error);
-      out("  " + message);
-      if (error && error.stack) out(String(error.stack).split("\n").map((l) => "  " + l).join("\n"));
+      if (reported !== true) {
+        emit("test:fail", {
+          name, nesting: 0, testNumber: ++state.index, tags: [],
+          details: { duration_ms: 0, type: "test", error },
+        });
+      }
       if (ownExitCode) { try { G.process.exitCode = 1; } catch (e) {} }
     };
-    const ok = (name) => { out("ok " + ++state.index + " - " + name); };
-    const skipped = (name) => { out("ok " + ++state.index + " - " + name + " # SKIP"); };
+    const ok = (name) => {};
+    const skipped = (name) => {};
+
+    // ------------------------------------------------------- the TAP writer ---
+    // PORT-SOURCE: node lib/internal/test_runner/reporter/tap.js. A direct
+    // `mbun file.js` run gets node's TAP document: version line, `# Subtest:`
+    // banners, a YAML block per result and the counted trailer. The ad-hoc
+    // "ok N - name" lines this replaced carried none of it, and the corpus greps
+    // all three — `duration_ms` (test-runner-root-duration), `cancelled 1`
+    // (test-runner-misc), `failureType` (the error-reporter cluster).
+    //
+    // Written SYNCHRONOUSLY as the events arrive, not through the async-generator
+    // reporter :node_test_run exposes: the trailer has to go out from
+    // process.on('exit'), where nothing asynchronous can still be flushed.
+    const tap = {
+      counts: { tests: 0, suites: 0, pass: 0, fail: 0, cancelled: 0, skipped: 0, todo: 0 },
+      duration: 0, topLevel: 0, header: false, trailer: false,
+    };
+    const tapEscape = (text) => String(text).replace(/\\/g, "\\\\").replace(/#/g, "\\#");
+    const pad = (nesting) => "    ".repeat(nesting);
+    const tapHeader = () => {
+      if (tap.header) return;
+      tap.header = true;
+      out("TAP version 13");
+    };
+    const tapYaml = (nesting, data) => {
+      const p = pad(nesting);
+      const ms = data.details && data.details.duration_ms !== undefined ? data.details.duration_ms : 0;
+      out(p + "  ---");
+      out(p + "  duration_ms: " + ms);
+      if (data.file !== undefined && data.line !== undefined) {
+        out(p + "  location: '" + data.file + ":" + data.line + ":" + data.column + "'");
+      }
+      const error = data.details && data.details.error;
+      if (error) {
+        if (error.failureType !== undefined) out(p + "  failureType: '" + error.failureType + "'");
+        out(p + "  error: '" + String(error.message === undefined ? error : error.message).replace(/'/g, "''") + "'");
+        if (error.code !== undefined) out(p + "  code: '" + error.code + "'");
+        if (error.stack !== undefined) {
+          out(p + "  stack: |-");
+          for (const line of String(error.stack).split("\n")) out(p + "    " + line);
+        }
+      }
+      out(p + "  ...");
+    };
+    const tapResult = (type, data) => {
+      tapHeader();
+      const failed = type === "test:fail";
+      if (data.details && data.details.type === "suite") tap.counts.suites += 1;
+      else tap.counts.tests += 1;
+      if (data.skip !== undefined) tap.counts.skipped += 1;
+      else if (data.todo !== undefined) tap.counts.todo += 1;
+      else if (failed) {
+        if (data.details && data.details.error && data.details.error.failureType === "cancelledByParent") {
+          tap.counts.cancelled += 1;
+        } else tap.counts.fail += 1;
+      } else tap.counts.pass += 1;
+      const number = data.nesting === 0 ? ++tap.topLevel
+        : (data.testNumber === undefined ? 1 : data.testNumber);
+      const directive = data.skip !== undefined
+        ? " # SKIP" + (typeof data.skip === "string" ? " " + tapEscape(data.skip) : "")
+        : data.todo !== undefined
+          ? " # TODO" + (typeof data.todo === "string" ? " " + tapEscape(data.todo) : "")
+          : data.expectFailure !== undefined
+            ? " # EXPECTED FAILURE" +
+              (typeof data.expectFailure === "string" ? " " + tapEscape(data.expectFailure) : "")
+            : "";
+      out(pad(data.nesting) + (failed ? "not ok " : "ok ") + number + " - " +
+          tapEscape(data.name) + directive);
+      tapYaml(data.nesting, data);
+      if (data.nesting === 0) {
+        tap.duration += data.details && data.details.duration_ms !== undefined ? data.details.duration_ms : 0;
+      }
+    };
+    const tapTrailer = () => {
+      if (tap.trailer || !tap.header) return;
+      tap.trailer = true;
+      out("1.." + tap.topLevel);
+      out("# tests " + tap.counts.tests);
+      out("# suites " + tap.counts.suites);
+      out("# pass " + tap.counts.pass);
+      out("# fail " + tap.counts.fail);
+      out("# cancelled " + tap.counts.cancelled);
+      out("# skipped " + tap.counts.skipped);
+      out("# todo " + tap.counts.todo);
+      out("# duration_ms " + (Date.now() - tapStartedAt));
+    };
+    const tapStartedAt = Date.now();
+    subscribers.push((type, data) => {
+      if (!tapEnabled) return;
+      if (type === "test:start") { tapHeader(); out(pad(data.nesting) + "# Subtest: " + tapEscape(data.name)); }
+      else if (type === "test:pass" || type === "test:fail") tapResult(type, data);
+      else if (type === "test:diagnostic") { tapHeader(); out(pad(data.nesting || 0) + "# " + tapEscape(data.message)); }
+    });
+    try { G.process.on("exit", () => { if (tapEnabled) tapTrailer(); }); } catch (e) {}
 
     // ------------------------------------------------------- event shapes ----
     // node identifies a test instance by a number that is stable across its own
@@ -306,6 +403,7 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
           reported.code = "ERR_TEST_FAILURE";
           reported.failureType = "expectedFailure";
           passed = false;
+          e.expectFailure = expectation === true ? true : expectation;
         }
       }
       e.details = {
@@ -509,7 +607,7 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
           if (context.__skipped) skipped(node.name); else ok(node.name);
         } else {
           // expectFailure was set and the body did NOT throw.
-          fail(node.name, new Error("test was expected to fail but passed"));
+          fail(node.name, new Error("test was expected to fail but passed"), true);
         }
       } catch (error) {
         state.current = previousContext;
@@ -518,7 +616,7 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
         const directive = directiveOf(node, context);
         if (emitResult(node, error, context, startedAt)) ok(node.name);
         else if (directive.todo !== undefined) skipped(node.name);
-        else fail(node.name, error);
+        else fail(node.name, error, true);
       }
     };
 
@@ -539,7 +637,7 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
         emitResult(node, undefined, undefined, startedAt);
       } catch (error) {
         emitResult(node, error, undefined, startedAt);
-        fail(node.name, error);
+        fail(node.name, error, true);
       }
     };
 
