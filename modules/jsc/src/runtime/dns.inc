@@ -715,12 +715,26 @@ private:
         std::uint64_t id{0};
         DnsResult result;
     };
+    // A resolver query blocks its worker for the whole query budget
+    // (timeout x attempts — 8s at node's defaults). With a single worker that
+    // makes every OTHER dns job wait on it, and one shape of that wait is a
+    // deadlock rather than a delay: node's dgram resolves the destination
+    // through dns.lookup before every send(), so a test whose fake nameserver
+    // is a dgram socket in this same process cannot answer the query — the
+    // lookup for its reply sits behind the very resolve it would unblock.
+    // (Measured: dns.lookup("127.0.0.1") took 8011ms behind one resolveSrv.)
+    // So the pool grows on demand: a job that arrives with no idle worker
+    // spawns one, up to MAX_WORKERS. Node has the same shape (its dns jobs run
+    // on the libuv threadpool, not on one thread).
+    static constexpr std::size_t MAX_WORKERS{16};
     struct WorkerState {
         std::mutex mutex{};
         std::condition_variable condition{};
         std::deque<Job> jobs{};
         std::deque<Completion> completions{};
         std::shared_ptr<DnsDelayedBackend> delayedBackend{};
+        std::size_t idleWorkers{0};
+        std::size_t totalWorkers{0};
         bool stopping{false};
     };
 
@@ -782,7 +796,9 @@ private:
             std::shared_ptr<DnsDelayedBackend> backend;
             {
                 std::unique_lock lock{state->mutex};
+                ++state->idleWorkers;
                 state->condition.wait(lock, [&] { return state->stopping || !state->jobs.empty(); });
+                --state->idleWorkers;
                 if (state->stopping) {
                     backend = state->delayedBackend;
                     lock.unlock();
@@ -806,12 +822,17 @@ private:
         }
     }
 
+    static void spawn_worker_(const std::shared_ptr<WorkerState>& state) {
+        std::thread([state] { run_worker_(state); }).detach();
+    }
+
     void submit_(Job job, JSObjectRef callback) {
         auto state{workerState_};
         if (state == nullptr) return;
         job.id = nextId_++;
         dns_protect_(ctx_, callback);
         callbacks_.emplace(job.id, callback);
+        bool grow{false};
         {
             std::lock_guard lock{state->mutex};
             if (state->stopping) {
@@ -820,14 +841,24 @@ private:
                 return;
             }
             state->jobs.push_back(std::move(job));
+            // No idle worker to take this job (and the queue may already be
+            // backed up behind a multi-second resolve) → add one.
+            if (state->jobs.size() > state->idleWorkers && state->totalWorkers < MAX_WORKERS) {
+                ++state->totalWorkers;
+                grow = true;
+            }
         }
-        state->condition.notify_one();
+        if (grow) spawn_worker_(state);
+        // notify_all, not notify_one: drain() waits on this same condition, so a
+        // notify_one can be spent on the JS thread and leave every worker asleep.
+        state->condition.notify_all();
     }
 
 public:
     explicit DnsAsyncState(JSContextRef ctx)
         : ctx_{ctx}, workerState_{std::make_shared<WorkerState>()} {
-        std::thread([state = workerState_] { run_worker_(std::move(state)); }).detach();
+        workerState_->totalWorkers = 1;
+        spawn_worker_(workerState_);
     }
     DnsAsyncState(const DnsAsyncState&) = delete;
     DnsAsyncState& operator=(const DnsAsyncState&) = delete;
