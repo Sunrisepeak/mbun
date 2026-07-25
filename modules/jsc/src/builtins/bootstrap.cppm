@@ -5088,8 +5088,26 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     this.rdev = rdev; this.blksize = blksize; this.ino = ino; this.size = size; this.blocks = blocks;
     this.atimeMs = atimeMs; this.mtimeMs = mtimeMs; this.ctimeMs = ctimeMs; this.birthtimeMs = birthtimeMs;
     this.atimeNs = atimeNs; this.mtimeNs = mtimeNs; this.ctimeNs = ctimeNs; this.birthtimeNs = birthtimeNs;
-    this.atime = new Date(Number(atimeMs)); this.mtime = new Date(Number(mtimeMs));
-    this.ctime = new Date(Number(ctimeMs)); this.birthtime = new Date(Number(birthtimeMs));
+  }
+  // atime/mtime/ctime/birthtime are LAZY PROTOTYPE accessors, not own data
+  // properties — node defines them on StatsBase.prototype and materialises an
+  // own property only on first read (lib/internal/fs/utils.js dateFromMs +
+  // ObjectDefineProperties(StatsBase.prototype, ...)). The difference is
+  // observable: assert.deepStrictEqual compares OWN enumerable keys, so a
+  // freshly built BigIntStats that already carries four Date properties can
+  // never equal node's own freshly built one, which carries none
+  // (test-fs-watchfile-bigint compares an all-zero pair key-for-key).
+  for (const name of ["atime", "mtime", "ctime", "birthtime"]) {
+    const msKey = name + "Ms";
+    Object.defineProperty(BigIntStats.prototype, name, {
+      configurable: true, enumerable: true,
+      get() {
+        const d = new Date(Number(this[msKey]));
+        Object.defineProperty(this, name, { value: d, writable: true, enumerable: true, configurable: true });
+        return d;
+      },
+      set(v) { Object.defineProperty(this, name, { value: v, writable: true, enumerable: true, configurable: true }); },
+    });
   }
   BigIntStats.prototype.isFile = function () { return (this.mode & 0o170000n) === 0o100000n; };
   BigIntStats.prototype.isDirectory = function () { return (this.mode & 0o170000n) === 0o040000n; };
@@ -6301,11 +6319,25 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       const rl = M["readline"] || M["node:readline"];
       return rl.createInterface(Object.assign({ input: this.createReadStream(opts), crlfDelay: Infinity }, opts));
     }
+    // node emits "close" SYNCHRONOUSLY from close(), before the descriptor is
+    // actually closed and regardless of the ref count (lib/internal/fs/
+    // promises.js: `this.emit('close'); return this[kClosePromise];`). That is
+    // load-bearing, not cosmetic: fs.createReadStream(null, { fd: handle })
+    // registers `handle.on("close", () => stream.close())`, so a caller that
+    // does `createReadStream(...); return handle.close();` destroys the stream
+    // in the SAME turn and the stream never reads. Emitting from the deferred
+    // .then() instead let the stream issue its first read against a handle
+    // already flagged _closed, which _use() rejects with EBADF
+    // (test-fs-read-stream-file-handle, third block).
+    // Repeat calls return the same promise, as node returns kClosePromise.
     close() {
-      if (this._closed) return Promise.resolve();
+      if (this._closed) return this._closePromise || Promise.resolve();
       this._closed = true;
       const fd = this._fd;
-      return Promise.resolve().then(() => { try { fsMod.closeSync(fd); } finally { this._fd = -1; this.emit("close"); } });
+      const p = Promise.resolve().then(() => { try { fsMod.closeSync(fd); } finally { this._fd = -1; } });
+      this._closePromise = p;
+      this.emit("close");
+      return p;
     }
     [Symbol.asyncDispose]() { return this.close(); }
   }
