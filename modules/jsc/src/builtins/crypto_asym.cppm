@@ -119,7 +119,7 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     if (m === "Passphrase required for encrypted key") {
       const t = new TypeError(m); t.code = "ERR_MISSING_PASSPHRASE"; return t;
     }
-    return m.startsWith("error:") ? decorateOsslError(e) : e;
+    return OSSL_ERR_RE.test(m) ? decorateOsslError(e) : e;
   };
   // publicEncrypt/privateDecrypt accept { key, encoding } where key is a hex/etc
   // string; honor the encoding when converting to bytes.
@@ -687,21 +687,38 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   // Decipheriv` holds. All construction-time validation matches node cipher.js.
   // Decorate a native OpenSSL error ("error:CODE:library:function:reason") with
   // node's error surface: .code (ERR_OSSL_<REASON>), .reason, .library, .function.
-  // Libraries whose short name node folds into the code. Verified against node
-  // v24: "common libcrypto routines" + "interrupted or cancelled" yields
-  // ERR_OSSL_CRYPTO_INTERRUPTED_OR_CANCELLED, while "Provider routines" +
-  // "bad decrypt" yields a bare ERR_OSSL_BAD_DECRYPT.
-  const OSSL_LIB_CODE_PREFIX = { "common libcrypto routines": "CRYPTO_" };
+  // node derives .code from the NUMERIC OpenSSL error, not from the library
+  // string: ERR_ + "OSSL_" + <lib>_ + REASON, where <lib> comes from
+  // ERR_GET_LIB(err) through a fixed table and reasons only turn spaces into
+  // underscores. Libraries outside that table (notably ERR_LIB_PROV) contribute
+  // nothing, which is why a provider "bad decrypt" is a bare ERR_OSSL_BAD_DECRYPT
+  // while ERR_LIB_CRYPTO gives ERR_OSSL_CRYPTO_INTERRUPTED_OR_CANCELLED.
+  // ref: node v26 src/crypto/crypto_util.cc error::Decorate (OSSL_ERROR_CODES_MAP);
+  //      ERR_GET_LIB = (err >> 23) & 0xFF, openssl/err.h.
+  const OSSL_LIB_NAMES = {
+    2: "SYS", 3: "BN", 4: "RSA", 5: "DH", 6: "EVP", 7: "BUF", 8: "OBJ", 9: "PEM",
+    10: "DSA", 11: "X509", 13: "ASN1", 14: "CONF", 15: "CRYPTO", 16: "EC", 20: "SSL",
+    32: "BIO", 33: "PKCS7", 34: "X509V3", 35: "PKCS12", 36: "RAND", 37: "DSO",
+    38: "ENGINE", 39: "OCSP", 40: "UI", 41: "COMP", 42: "ECDSA", 43: "ECDH",
+    44: "OSSL_STORE", 45: "FIPS", 46: "CMS", 47: "TS", 48: "HMAC", 50: "CT",
+    51: "ASYNC", 52: "KDF", 53: "SM2", 128: "USER",
+  };
+  // The OpenSSL error may sit behind an mbun call-site prefix ("sign failed: ..."),
+  // so match it wherever it starts rather than only at position 0.
+  const OSSL_ERR_RE = /error:([0-9A-Fa-f]{8}):([^:]*):([^:]*):(.*)$/;
   const decorateOsslError = (e) => {
     const m = e && typeof e.message === "string" ? e.message : "";
-    const parts = m.split(":");
-    if (parts[0] === "error" && parts.length >= 5) {
-      const reason = parts.slice(4).join(":");
+    const hit = OSSL_ERR_RE.exec(m);
+    if (hit) {
+      const reason = hit[4];
       e.reason = reason;
-      e.library = parts[2];
-      e.function = parts[3];
-      e.code = "ERR_OSSL_" + (OSSL_LIB_CODE_PREFIX[parts[2]] || "") +
-        reason.toUpperCase().replace(/[^A-Z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+      e.library = hit[2];
+      e.function = hit[3];
+      const lib = OSSL_LIB_NAMES[(parseInt(hit[1], 16) >>> 23) & 0xff];
+      // node: "Don't generate codes like ERR_OSSL_SSL_".
+      const prefix = lib === "SSL" ? "" : "OSSL_";
+      e.code = "ERR_" + prefix + (lib ? lib + "_" : "") +
+        reason.toUpperCase().replaceAll(" ", "_");
     }
     return e;
   };

@@ -129,6 +129,12 @@ inline std::string asym_key_error(std::span<const std::uint8_t> data, bool hasPa
 // failure. An engaged-but-empty `pass` is an empty PASSWORD (node allows keys
 // encrypted under one); a disengaged `pass` means "never ask, never guess".
 inline EVP_PKEY* asym_load_pkey(std::span<const std::uint8_t> data, const AsymPass& pass) {
+    // Every decode below is speculative, so even a SUCCESSFUL load leaves the
+    // failed attempts sitting on OpenSSL's error queue. asym_ossl_err() pops the
+    // OLDEST entry, so without this the next genuine failure gets reported with a
+    // stale message — a leftover DECODER "unsupported" standing in for the EVP
+    // error that actually happened. Clear on the way out of every success path.
+    const auto loaded{[](EVP_PKEY* p) { ERR_clear_error(); return p; }};
     for (int sel : {EVP_PKEY_KEYPAIR, EVP_PKEY_PUBLIC_KEY}) {
         EVP_PKEY* pkey{nullptr};
         OSSL_DECODER_CTX* d{
@@ -143,7 +149,7 @@ inline EVP_PKEY* asym_load_pkey(std::span<const std::uint8_t> data, const AsymPa
             OSSL_DECODER_from_data(d, &p, &len);
             OSSL_DECODER_CTX_free(d);
         }
-        if (pkey != nullptr) { return pkey; }
+        if (pkey != nullptr) { return loaded(pkey); }
     }
     // OSSL_DECODER reads only the FIRST PEM block; a SEC1 EC key file that leads
     // with an "EC PARAMETERS" block makes it stop on the params and fail.
@@ -165,7 +171,7 @@ inline EVP_PKEY* asym_load_pkey(std::span<const std::uint8_t> data, const AsymPa
                              ? PEM_read_bio_PrivateKey(pb, nullptr, asym_no_pass_cb, nullptr)
                              : PEM_read_bio_PrivateKey(pb, nullptr, nullptr, p.data())};
             BIO_free(pb);
-            if (pk != nullptr) { return pk; }
+            if (pk != nullptr) { return loaded(pk); }
         }
     }
     // Fallback: the material may be an X.509 certificate (node's publicEncrypt /
@@ -180,7 +186,7 @@ inline EVP_PKEY* asym_load_pkey(std::span<const std::uint8_t> data, const AsymPa
     if (cert != nullptr) {
         EVP_PKEY* pub{X509_get_pubkey(cert)};
         X509_free(cert);
-        return pub;
+        return loaded(pub);
     }
     return nullptr;
 }
