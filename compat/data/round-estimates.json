@@ -550,5 +550,42 @@
         ]
       }
     }
+  ],
+  "post_mortems": [
+    {
+      "round": "goal round (tls/http/fs to 100%)",
+      "outcome": "tls 71->81 (+10), http 279->290 (+11), fs 227->266 (+39). 100% not reached on any.",
+      "mean_delta_per_task": 18.7,
+      "historical_mean_delta_per_task": 51.6,
+      "confound_stated": "The 2.8x drop is NOT attributable to method alone. These agents worked a tail that ten prior rounds had already stripped of cheap clusters, so diminishing returns is expected and real. Two data points bound it: a SECOND iterative pass over the http2 tail still returned +51, and a second iterative pass over tls returned +36 \u2014 so a hard tail does not by itself force single digits.",
+      "root_causes": [
+        {
+          "cause": "WORK ALLOCATION \u2014 mine, and the biggest one.",
+          "evidence": "Reclassifying the 299 remaining files by CAUSE rather than by subsystem shows every cause family spans all three subsystems: 45 timeouts (tls 16 / http 24 / fs 5), 31 re-spawn-needs-node-internals (13/8/10), 25 internalBinding namespaces (11/6/8). That is 101 files, 34% of the remainder, in three families that each cut across all three agents.",
+          "consequence": "Three subsystem agents each independently attacked the same three mechanisms, each seeing only a third of the evidence \u2014 so none of them could see the shared cause. Triple the work, a third of the signal. internalBinding + re-spawn are in fact ONE piece of work (provide node's internal modules and the bindings they need) worth 56 files across all three."
+        },
+        {
+          "cause": "THE 100% TARGET ITSELF MISALLOCATED EFFORT.",
+          "evidence": "'Guarantee 100%' pushes an agent to spread across every remaining file rather than go deep on the densest block. All three reported the same shape: budget consumed by the mechanical clusters, and the hard blocks never opened. The http agent: 'the timeouts each need individual teardown tracing and none was even opened.' The tls agent: the Duplex/memory-BIO transport was 'designed, not written \u2014 the round's build+measure cycles ate the budget.' The fs agent ran out before implementing internalBinding('fs').",
+          "consequence": "The single largest block in the remainder \u2014 45 hangs \u2014 received zero minutes across three agents and 300+ minutes of budget."
+        },
+        {
+          "cause": "MEASUREMENT OVERHEAD, estimated at 40-50% of each budget.",
+          "evidence": "Each agent ran its own baseline (a 4433-file run is ~9-10 min at jobs 8), then N build+measure cycles (~1 min build each plus the measure), then a guard-before and guard-after (a 1000-file guard is ~3 min). Estimated 40-50 of each 100-minute budget. This is an estimate from observed run times, not an instrumented measurement.",
+          "consequence": "I already HAD the baseline measured and did not hand it over, so three agents each re-derived a number I was holding."
+        },
+        {
+          "cause": "METHOD MISMATCH \u2014 but not the way it first looks.",
+          "evidence": "The one-sweep-then-fix method the maintainer asked for was RIGHT for the mechanical cluster: the http agent reported '9 of 13 spot-checked files passed on the first build'. It was wrong for the hangs, which need per-file tracing and cannot be batch-implemented. The agent's own conclusion: 'worth splitting those into their own round.'",
+          "consequence": "The fix is not to revert the method. It is to MATCH THE METHOD TO THE CAUSE FAMILY \u2014 one-sweep translation for a known missing layer or a binding surface, per-file tracing for hangs, per-file work for assertion divergences. Splitting by cause family is what makes that possible."
+        }
+      ],
+      "optimisations_applied": [
+        "Split by CAUSE FAMILY, not by subsystem: one agent on internalBinding+re-spawn (56 files, one-sweep suits it), one on all 45 timeouts across all three subsystems (per-file tracing, and the causes should cluster once seen together), one on the 151 assertion divergences (the irreducibly per-file block, given the largest budget).",
+        "Hand over the baseline I already hold (target/integration/goal-after) and forbid re-measuring it \u2014 recovers ~10-15 min per agent.",
+        "Scope guards to the diff-derived set with --files instead of full-corpus runs; I run the authoritative full corpus once at integration.",
+        "Replace 'guarantee 100%' with an explicit block ordering: open the assigned block FIRST, and report its result before touching anything else. No block can be starved by a queue behind it."
+      ]
+    }
   ]
 }
