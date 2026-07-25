@@ -82,17 +82,29 @@ inline constexpr std::string_view kNodeStreamCoreJS = R"JS(
     if (t.length === 2) return t[0] + " or " + t[1];
     return t.slice(0, -1).join(", ") + ", or " + t[t.length - 1];
   };
-  const $ERR_INVALID_ARG_TYPE = (name, type, val) =>
-    mk(TypeError, "ERR_INVALID_ARG_TYPE",
+  // Shared node-exact factory (bootstrap __mbunNodeErrors): the local form always
+  // says "of type X", so a class-valued expectation such as "Object" was never
+  // lower-cased ("of type Object" where node says "of type object") and never
+  // became "an instance of X".
+  const $ERR_INVALID_ARG_TYPE = (name, type, val) => {
+    const NE = globalThis.__mbunNodeErrors;
+    if (NE) return NE.ERR_INVALID_ARG_TYPE(name, type, val);
+    return mk(TypeError, "ERR_INVALID_ARG_TYPE",
       `The ${name.endsWith(" argument") ? name : `"${name}" ${name.includes(".") ? "property" : "argument"}`} must be of type ${joinTypes(type)}. Received ${specific(val)}`);
+  };
   // ERR_INVALID_ARG_VALUE inspects the value (numbers/booleans print bare).
   const inspectVal = (v) =>
     typeof v === "string" ? `'${v}'`
       : typeof v === "number" || typeof v === "boolean" ? String(v)
       : v === null ? "null" : v === undefined ? "undefined" : specific(v);
-  const $ERR_INVALID_ARG_VALUE = (name, value, reason = "is invalid") =>
-    mk(TypeError, "ERR_INVALID_ARG_VALUE",
+  // node's ERR_INVALID_ARG_VALUE reports util.inspect(value), so a plain object
+  // reads "{}" rather than "an instance of Object".
+  const $ERR_INVALID_ARG_VALUE = (name, value, reason = "is invalid") => {
+    const NE = globalThis.__mbunNodeErrors;
+    if (NE) return NE.ERR_INVALID_ARG_VALUE(name, value, reason);
+    return mk(TypeError, "ERR_INVALID_ARG_VALUE",
       `The ${name.includes(".") ? "property" : "argument"} '${name}' ${reason}. Received ${inspectVal(value)}`);
+  };
   const $ERR_INVALID_RETURN_VALUE = (input, name, value) =>
     mk(TypeError, "ERR_INVALID_RETURN_VALUE",
       `Expected ${input} to be returned from the "${name}" function but got ${specific(value)}.`);

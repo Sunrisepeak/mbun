@@ -69,6 +69,12 @@ export constexpr std::string_view kDgramJS = R"JS(
     : a.slice(0, -1).join(", ") + " or " + a[a.length - 1];
   const mk = (Ctor, code, msg) => { const e = new Ctor(msg); e.code = code; return e; };
   const ERR_INVALID_ARG_TYPE = (name, expected, actual) => {
+    // Shared node-exact factory (bootstrap __mbunNodeErrors): node's formatList
+    // puts an Oxford comma before the last class ("Buffer, TypedArray, or
+    // DataView") and always emits primitive types before class instances,
+    // independent of the order they were passed in.
+    const NE = globalThis.__mbunNodeErrors;
+    if (NE) return NE.ERR_INVALID_ARG_TYPE(name, expected, actual);
     if (!Array.isArray(expected)) expected = [expected];
     const types = [], instances = [], other = [];
     for (const v of expected) {

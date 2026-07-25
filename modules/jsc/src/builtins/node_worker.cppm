@@ -463,12 +463,18 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
   const workerRegistry = new Map();  // threadId -> Worker (parent side)
   let nextThreadId = 1;
 
+  // Shared node determineSpecificType (bootstrap __mbunNodeErrors); the local
+  // fallback below has no `function` case, so an anonymous function reported
+  // "type function (() => {})" where node says "function " (empty name).
   const recvType = (v) => {
+    const NE = globalThis.__mbunNodeErrors;
+    if (NE) return NE.determineSpecificType(v);
     if (v === null) return "null";
     if (v === undefined) return "undefined";
     const t = typeof v;
     if (t === "symbol") return "type symbol (" + String(v) + ")";
     if (t === "string") return "type string ('" + v + "')";
+    if (t === "function") return "function " + v.name;
     if (t === "object") return "an instance of " + ((v.constructor && v.constructor.name) || "Object");
     return "type " + t + " (" + String(v) + ")";
   };

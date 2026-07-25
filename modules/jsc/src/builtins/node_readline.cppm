@@ -31,15 +31,40 @@ inline constexpr std::string_view kNodeReadlineJS = R"JS(
 
   const ERR = (code, Ctor, msg) => { const e = new Ctor(msg); e.code = code; return e; };
   const recv = (v) => (typeof v === "object" ? (v === null ? "null" : "an instance of " + ((v && v.constructor && v.constructor.name) || "Object")) : (typeof v === "string" ? "type string ('" + v + "')" : "type " + typeof v + " (" + String(v) + ")"));
+  // Delegate to the shared node-exact factories (bootstrap __mbunNodeErrors);
+  // the local `recv`/`ERR` pair stays only as a pre-bootstrap fallback.
+  const NE = G.__mbunNodeErrors;
+  const argType = NE ? NE.ERR_INVALID_ARG_TYPE
+    : (name, expected, v) => ERR("ERR_INVALID_ARG_TYPE", TypeError,
+        `The "${name}" argument must be of type ${expected}. Received ${recv(v)}`);
+  const outOfRange = NE ? NE.ERR_OUT_OF_RANGE
+    : (name, range, v) => ERR("ERR_OUT_OF_RANGE", RangeError,
+        `The value of "${name}" is out of range. It must be ${range}. Received ${v}`);
+  // internal/validators.js, translated: every branch's `range` string is
+  // compared verbatim by the corpus (a missing "an integer" branch in
+  // validateUint32 cost test-readline-interface and its promises twin).
   const __validators = {
-    validateFunction(v, name) { if (typeof v !== "function") throw ERR("ERR_INVALID_ARG_TYPE", TypeError, `The "${name}" argument must be of type function. Received ${recv(v)}`); },
-    validateAbortSignal(signal, name) { if (signal !== undefined && (signal === null || typeof signal !== "object" || !("aborted" in signal))) throw ERR("ERR_INVALID_ARG_TYPE", TypeError, `The "${name}" argument must be of type AbortSignal. Received ${recv(signal)}`); },
-    validateArray(v, name) { if (!Array.isArray(v)) throw ERR("ERR_INVALID_ARG_TYPE", TypeError, `The "${name}" argument must be an instance of Array. Received ${recv(v)}`); },
-    validateString(v, name) { if (typeof v !== "string") throw ERR("ERR_INVALID_ARG_TYPE", TypeError, `The "${name}" argument must be of type string. Received ${recv(v)}`); },
-    validateBoolean(v, name) { if (typeof v !== "boolean") throw ERR("ERR_INVALID_ARG_TYPE", TypeError, `The "${name}" argument must be of type boolean. Received ${recv(v)}`); },
-    validateInteger(v, name, min = Number.MIN_SAFE_INTEGER, max = Number.MAX_SAFE_INTEGER) { if (typeof v !== "number") throw ERR("ERR_INVALID_ARG_TYPE", TypeError, `The "${name}" argument must be of type number. Received ${recv(v)}`); if (!Number.isInteger(v)) throw ERR("ERR_OUT_OF_RANGE", RangeError, `The value of "${name}" is out of range. It must be an integer. Received ${v}`); if (v < min || v > max) throw ERR("ERR_OUT_OF_RANGE", RangeError, `The value of "${name}" is out of range. Received ${v}`); },
-    validateUint32(v, name, positive) { if (typeof v !== "number") throw ERR("ERR_INVALID_ARG_TYPE", TypeError, `The "${name}" argument must be of type number. Received ${recv(v)}`); if (!Number.isInteger(v)) throw ERR("ERR_OUT_OF_RANGE", RangeError, `The value of "${name}" is out of range. Received ${v}`); const min = positive ? 1 : 0; if (v < min || v > 4294967295) throw ERR("ERR_OUT_OF_RANGE", RangeError, `The value of "${name}" is out of range. Received ${v}`); },
-    validateNumber(v, name, min, max) { if (typeof v !== "number") throw ERR("ERR_INVALID_ARG_TYPE", TypeError, `The "${name}" argument must be of type number. Received ${recv(v)}`); if ((min != null && v < min) || (max != null && v > max) || ((min != null || max != null) && Number.isNaN(v))) throw ERR("ERR_OUT_OF_RANGE", RangeError, `The value of "${name}" is out of range. Received ${v}`); },
+    validateFunction(v, name) { if (typeof v !== "function") throw argType(name, "function", v); },
+    validateAbortSignal(signal, name) { if (signal !== undefined && (signal === null || typeof signal !== "object" || !("aborted" in signal))) throw argType(name, "AbortSignal", signal); },
+    validateArray(v, name) { if (!Array.isArray(v)) throw argType(name, "Array", v); },
+    validateString(v, name) { if (typeof v !== "string") throw argType(name, "string", v); },
+    validateBoolean(v, name) { if (typeof v !== "boolean") throw argType(name, "boolean", v); },
+    validateInteger(v, name, min = Number.MIN_SAFE_INTEGER, max = Number.MAX_SAFE_INTEGER) {
+      if (typeof v !== "number") throw argType(name, "number", v);
+      if (!Number.isInteger(v)) throw outOfRange(name, "an integer", v);
+      if (v < min || v > max) throw outOfRange(name, `>= ${min} && <= ${max}`, v);
+    },
+    validateUint32(v, name, positive) {
+      if (typeof v !== "number") throw argType(name, "number", v);
+      if (!Number.isInteger(v)) throw outOfRange(name, "an integer", v);
+      const min = positive ? 1 : 0;
+      if (v < min || v > 4294967295) throw outOfRange(name, `>= ${min} && <= 4294967295`, v);
+    },
+    validateNumber(v, name, min, max) {
+      if (typeof v !== "number") throw argType(name, "number", v);
+      if ((min != null && v < min) || (max != null && v > max) || ((min != null || max != null) && Number.isNaN(v)))
+        throw outOfRange(name, `${min != null ? `>= ${min}` : ""}${min != null && max != null ? " && " : ""}${max != null ? `<= ${max}` : ""}`, v);
+    },
   };
   function __promisify() {}
   __promisify.custom = Symbol.for("nodejs.util.promisify.custom");
@@ -54,8 +79,12 @@ inline constexpr std::string_view kNodeReadlineJS = R"JS(
   function $toClass(fn, name, sup) { Object.setPrototypeOf(fn.prototype, sup.prototype); Object.setPrototypeOf(fn, sup); Object.defineProperty(fn, "name", { value: name, configurable: true }); return fn; }
   function $newPromiseCapability(P) { let resolve, reject; const promise = new P((res, rej) => { resolve = res; reject = rej; }); return { promise, resolve, reject }; }
   function $makeAbortError(msg, opts) { const e = new Error(msg || "The operation was aborted"); e.name = "AbortError"; e.code = "ABORT_ERR"; if (opts && ("cause" in opts)) e.cause = opts.cause; return e; }
-  function $ERR_INVALID_ARG_TYPE(name, type, val) { return ERR("ERR_INVALID_ARG_TYPE", TypeError, `The "${name}" argument must be of type ${type}. Received ${recv(val)}`); }
-  function $ERR_INVALID_ARG_VALUE(name, val) { return ERR("ERR_INVALID_ARG_VALUE", TypeError, `The argument '${name}' is invalid. Received ${String(val)}`); }
+  function $ERR_INVALID_ARG_TYPE(name, type, val) { return argType(name, type, val); }
+  function $ERR_INVALID_ARG_VALUE(name, val, reason) {
+    if (NE) return NE.ERR_INVALID_ARG_VALUE(name, val, reason);
+    return ERR("ERR_INVALID_ARG_VALUE", TypeError,
+      `The argument '${name}' ${reason || "is invalid"}. Received ${String(val)}`);
+  }
   function $ERR_USE_AFTER_CLOSE(name) { return ERR("ERR_USE_AFTER_CLOSE", Error, `${name} was closed`); }
   function $ERR_INVALID_CURSOR_POS() { return ERR("ERR_INVALID_CURSOR_POS", TypeError, "Cannot set cursor row without setting its column"); }
 

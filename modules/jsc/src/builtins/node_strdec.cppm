@@ -253,6 +253,10 @@ inline constexpr std::string_view kNodeStrDecJS = R"JS(
   StringDecoder.prototype.write = function (buf) {
     if (typeof buf === "string") return buf;
     if (buf == null || typeof buf.byteLength !== "number") {
+      // node appends determineSpecificType — the bare message dropped
+      // ". Received null" and could never match test-string-decoder.
+      const NE = globalThis.__mbunNodeErrors;
+      if (NE) throw NE.ERR_INVALID_ARG_TYPE("buf", ["Buffer", "TypedArray", "DataView"], buf);
       const e = new TypeError('The "buf" argument must be an instance of Buffer, TypedArray, or DataView.');
       e.code = "ERR_INVALID_ARG_TYPE";
       throw e;

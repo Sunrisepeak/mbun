@@ -298,12 +298,17 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
       if (t === "symbol") return "type symbol (" + v.toString() + ")";
       return "type " + t + " (" + String(v) + ")";
     };
-    const errInvalidArgType = (name, expected, value) => {
+    // Shared node-exact factories (bootstrap __mbunNodeErrors): they derive
+    // argument/property from a dotted name ("prevValue.user" is a *property*) and
+    // render a class-valued expectation as "an instance of Array" rather than
+    // "of type Array". The local fallbacks below do neither.
+    const NE = G.__mbunNodeErrors;
+    const errInvalidArgType = NE ? NE.ERR_INVALID_ARG_TYPE : (name, expected, value) => {
       const e = new TypeError(`The "${name}" argument must be of type ${expected}. Received ${specificType(value)}`);
       e.code = "ERR_INVALID_ARG_TYPE";
       return e;
     };
-    const errOutOfRange = (name, range, value) => {
+    const errOutOfRange = NE ? NE.ERR_OUT_OF_RANGE : (name, range, value) => {
       const e = new RangeError(`The value of "${name}" is out of range. It must be ${range}. Received ${value}`);
       e.code = "ERR_OUT_OF_RANGE";
       return e;

@@ -1010,30 +1010,164 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   ]);
   // internal/errors.js determineSpecificType — the "Received …" tail every
   // ERR_INVALID_ARG_TYPE carries. The corpus compares these messages verbatim.
+  // Translated case-for-case from node's determineSpecificType; every branch
+  // (bigint suffix, -0, NaN, ±Infinity, the 28-char string cap, the quote
+  // fallback to JSON.stringify, and the EMPTY-named function that must still
+  // read "function " with a trailing space) is load-bearing in the corpus.
   function determineSpecificType(value) {
-    if (value === null || value === undefined) return String(value);
-    if (typeof value === "function" && value.name) return "function " + value.name;
-    if (typeof value === "object") {
-      if (value.constructor && value.constructor.name) return "an instance of " + value.constructor.name;
-      try { return util.inspect(value, { depth: -1 }); } catch (e) { return "an instance of Object"; }
+    if (value === null) return "null";
+    if (value === undefined) return "undefined";
+    const type = typeof value;
+    switch (type) {
+      case "bigint": return "type bigint (" + value + "n)";
+      case "number":
+        if (value === 0) return 1 / value === -Infinity ? "type number (-0)" : "type number (0)";
+        if (value !== value) return "type number (NaN)";
+        if (value === Infinity) return "type number (Infinity)";
+        if (value === -Infinity) return "type number (-Infinity)";
+        return "type number (" + value + ")";
+      case "boolean": return value ? "type boolean (true)" : "type boolean (false)";
+      case "symbol": return "type symbol (" + String(value) + ")";
+      case "function": return "function " + value.name;
+      case "object":
+        if (value.constructor && "name" in value.constructor)
+          return "an instance of " + value.constructor.name;
+        try { return util.inspect(value, { depth: -1 }); } catch (e) { return "an instance of Object"; }
+      case "string": {
+        let s = value;
+        if (s.length > 28) s = s.slice(0, 25) + "...";
+        if (s.indexOf("'") === -1) return "type string ('" + s + "')";
+        return "type string (" + JSON.stringify(s) + ")";
+      }
+      default: {
+        let inspected;
+        try { inspected = util.inspect(value, { colors: false }); } catch (e) { inspected = String(value); }
+        if (inspected.length > 28) inspected = inspected.slice(0, 25) + "...";
+        return "type " + type + " (" + inspected + ")";
+      }
     }
-    let inspected;
-    try { inspected = util.inspect(value, { colors: false }); } catch (e) { inspected = String(value); }
-    if (inspected.length > 28) inspected = inspected.slice(0, 25) + "...";
-    return "type " + (typeof value) + " (" + inspected + ")";
   }
-  // internal/errors.js ERR_INVALID_ARG_TYPE for the single-type case: a dotted
-  // name reads "property", everything else "argument".
-  function nodeArgTypeError(name, expected, value) {
-    // node: a name that already ends in " argument" is used bare (no quotes, no
-    // second "argument"), a dotted name reads "property".
-    const head = name.endsWith(" argument") ? name + " "
-      : "\"" + name + "\" " + (name.indexOf(".") !== -1 ? "property" : "argument") + " ";
-    const e = new TypeError("The " + head +
-      "must be of type " + expected + ". Received " + determineSpecificType(value));
-    e.code = "ERR_INVALID_ARG_TYPE";
+  // internal/errors.js makeNodeErrorWithCode: every NodeError overrides
+  // toString() as `${name} [${code}]: ${message}` (name and stack keep the base
+  // name). `assert.throws(fn, /ERR_X/)` matches String(err), so without this the
+  // code is invisible to a regex matcher.
+  const nodeErrToString = (e, code) => {
+    const base = e.name;
+    Object.defineProperty(e, "toString", {
+      value() { return `${base} [${code}]${this.message ? ": " + this.message : ""}`; },
+      configurable: true, writable: true,
+    });
     return e;
+  };
+  // internal/errors.js formatList. NOTE the 3-element case carries an Oxford
+  // comma ("a, b, or c") — the corpus compares these verbatim and the
+  // hand-rolled per-subsystem copies got this wrong in both directions.
+  function nodeFormatList(array, type) {
+    type = type === undefined ? "and" : type;
+    switch (array.length) {
+      case 0: return "";
+      case 1: return "" + array[0];
+      case 2: return array[0] + " " + type + " " + array[1];
+      case 3: return array[0] + ", " + array[1] + ", " + type + " " + array[2];
+      default:
+        return array.slice(0, -1).join(", ") + ", " + type + " " + array[array.length - 1];
+    }
   }
+  const kNodeErrTypes = ["string", "function", "number", "object", "Function", "Object",
+                         "boolean", "bigint", "symbol"];
+  const kNodeClassRe = /^[A-Z][a-zA-Z0-9]*$/;
+  // internal/errors.js ERR_INVALID_ARG_TYPE, full multi-type form: `expected`
+  // may be a single string or a list, and node splits it into primitive types
+  // ("of type x"), classes ("an instance of X") and free-form alternatives
+  // ("one of …"). A dotted name reads "property", a name already ending in
+  // " argument" is used bare, everything else "argument".
+  function nodeArgTypeError(name, expected, value) {
+    if (!Array.isArray(expected)) expected = [expected];
+    let msg = "The ";
+    if (String(name).endsWith(" argument")) msg += name + " ";
+    else msg += "\"" + name + "\" " + (String(name).indexOf(".") !== -1 ? "property" : "argument") + " ";
+    msg += "must be ";
+    const types = [], instances = [], other = [];
+    for (const v of expected) {
+      if (kNodeErrTypes.indexOf(v) !== -1) types.push(String(v).toLowerCase());
+      else if (kNodeClassRe.exec(v) !== null) instances.push(v);
+      else other.push(v);
+    }
+    if (instances.length > 0) {
+      const pos = types.indexOf("object");
+      if (pos !== -1) { types.splice(pos, 1); instances.push("Object"); }
+    }
+    if (types.length > 0) {
+      msg += (types.length > 1 ? "one of type " : "of type ") + nodeFormatList(types, "or");
+      if (instances.length > 0 || other.length > 0) msg += " or ";
+    }
+    if (instances.length > 0) {
+      msg += "an instance of " + nodeFormatList(instances, "or");
+      if (other.length > 0) msg += " or ";
+    }
+    if (other.length > 0) {
+      if (other.length > 1) msg += "one of " + nodeFormatList(other, "or");
+      else {
+        if (String(other[0]).toLowerCase() !== other[0]) msg += "an ";
+        msg += other[0];
+      }
+    }
+    msg += ". Received " + determineSpecificType(value);
+    const e = new TypeError(msg);
+    e.code = "ERR_INVALID_ARG_TYPE";
+    return nodeErrToString(e, "ERR_INVALID_ARG_TYPE");
+  }
+  // internal/errors.js ERR_INVALID_ARG_VALUE: inspect(value) capped at 128,
+  // dotted name reads "property".
+  function nodeArgValueError(name, value, reason) {
+    reason = reason === undefined ? "is invalid" : reason;
+    let inspected;
+    try { inspected = util.inspect(value); } catch (e) { inspected = String(value); }
+    if (inspected.length > 128) inspected = inspected.slice(0, 128) + "...";
+    const type = String(name).indexOf(".") !== -1 ? "property" : "argument";
+    const e = new TypeError("The " + type + " '" + name + "' " + reason + ". Received " + inspected);
+    e.code = "ERR_INVALID_ARG_VALUE";
+    return nodeErrToString(e, "ERR_INVALID_ARG_VALUE");
+  }
+  // internal/errors.js ERR_OUT_OF_RANGE. The received value gets `_` numeric
+  // separators once |input| > 2**32 (2n**32n for bigint) — several buffer/fs
+  // range tests compare that formatting verbatim.
+  function nodeRangeError(str, range, input, replaceDefaultBoolean) {
+    let msg = replaceDefaultBoolean ? str : 'The value of "' + str + '" is out of range.';
+    let received;
+    if (Number.isInteger(input) && Math.abs(input) > 2 ** 32) {
+      received = addNumericalSeparator(String(input));
+    } else if (typeof input === "bigint") {
+      received = String(input);
+      if (input > 2n ** 32n || input < -(2n ** 32n)) received = addNumericalSeparator(received);
+      received += "n";
+    } else {
+      try { received = util.inspect(input); } catch (e) { received = String(input); }
+    }
+    msg += " It must be " + range + ". Received " + received;
+    const e = new RangeError(msg);
+    e.code = "ERR_OUT_OF_RANGE";
+    return nodeErrToString(e, "ERR_OUT_OF_RANGE");
+  }
+  // internal/errors.js addNumericalSeparator (distinct from inspect.js's
+  // addNumericSeparator below: no fractional handling, used for range text).
+  function addNumericalSeparator(val) {
+    let res = "";
+    let i = val.length;
+    const start = val[0] === "-" ? 1 : 0;
+    for (; i >= start + 4; i -= 3) res = "_" + val.slice(i - 3, i) + res;
+    return val.slice(0, i) + res;
+  }
+  // One shared surface so later builtins partitions stop hand-rolling their own
+  // (divergent) copies of node's error factories.
+  G.__mbunNodeErrors = {
+    determineSpecificType,
+    formatList: nodeFormatList,
+    addNumericalSeparator,
+    ERR_INVALID_ARG_TYPE: nodeArgTypeError,
+    ERR_INVALID_ARG_VALUE: nodeArgValueError,
+    ERR_OUT_OF_RANGE: nodeRangeError,
+  };
   // internal/util/inspect.js addNumericSeparator / addNumericSeparatorEnd.
   const addNumericSeparator = (s) => {
     let result = "";
@@ -3126,7 +3260,10 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     if (input === null) return " Received null";
     if (input === undefined) return " Received undefined";
     const t = typeof input;
-    if (t === "function") return input.name ? " Received function " + input.name : " Received type function ([Function (anonymous)])";
+    // node's determineSpecificType has no anonymous-function special case: it is
+    // always `function ${value.name}`, so an anonymous one reads "function "
+    // (trailing space, empty name).
+    if (t === "function") return " Received function " + input.name;
     if (t === "object") { const c = input.constructor && input.constructor.name; return c ? " Received an instance of " + c : " Received [Object: null prototype] {}"; }
     let ins;
     if (t === "symbol") ins = input.toString();
@@ -4045,11 +4182,8 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     else if (o === true) recursive = true;
     else if (o && typeof o === "object") {
       if ("recursive" in o && o.recursive !== undefined) {
-        if (typeof o.recursive !== "boolean") {
-          const e = new TypeError('The "options.recursive" argument must be of type boolean. Received ' + (o.recursive === null ? "null" : typeof o.recursive));
-          e.code = "ERR_INVALID_ARG_TYPE";
-          throw e;
-        }
+        if (typeof o.recursive !== "boolean")
+          throw nodeArgTypeError("options.recursive", "boolean", o.recursive);
         recursive = o.recursive;
       }
       if (o.mode != null) mode = typeof o.mode === "string" ? parseInt(o.mode, 8) : (Number(o.mode) & 0o7777);
@@ -4575,7 +4709,11 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     if (opts == null) return;
     const enc = typeof opts === "string" ? opts : (typeof opts === "object" ? opts.encoding : undefined);
     if (enc == null) return;
-    if (!VALID_ENCODINGS[String(enc).toLowerCase()]) { const e = new TypeError("The argument 'encoding' is invalid. Received " + (typeof enc === "string" ? "'" + enc + "'" : String(enc))); e.code = "ERR_INVALID_ARG_VALUE"; throw e; }
+    // node assertEncoding passes reason 'is invalid encoding' (not the default
+    // 'is invalid') to ERR_INVALID_ARG_VALUE, and the received value is
+    // inspect()-ed.
+    if (!VALID_ENCODINGS[String(enc).toLowerCase()])
+      throw nodeArgValueError("encoding", enc, "is invalid encoding");
   };
   const cbTypeError = () => { const e = new TypeError('The "callback" argument must be of type function.'); e.code = "ERR_INVALID_ARG_TYPE"; throw e; };
   class Dir {

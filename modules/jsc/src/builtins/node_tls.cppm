@@ -94,6 +94,10 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
     return (kw === "of type" ? "of type " : "one of ") + arr[0];
   };
   function ERR_INVALID_ARG_TYPE(name, expected, actual) {
+    // Prefer the shared node-exact factory (bootstrap __mbunNodeErrors); the
+    // local fallback below joins the class list without node's Oxford comma.
+    const NE = G.__mbunNodeErrors;
+    if (NE) return NE.ERR_INVALID_ARG_TYPE(name, expected, actual);
     if (!Array.isArray(expected)) expected = [expected];
     const determiner = String(name).includes(".") ? "property" : "argument";
     let msg = 'The "' + name + '" ' + determiner + " must be ";
@@ -119,8 +123,13 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
     err.code = "ERR_INVALID_ARG_VALUE";
     return err;
   }
+  // node's ERR_OUT_OF_RANGE reads 'The value of "x" is out of range.', NOT
+  // 'The "x" argument is out of range.' — delegate to the shared factory
+  // (bootstrap __mbunNodeErrors) so this copy cannot drift again.
   function ERR_OUT_OF_RANGE(name, range, value) {
-    const err = new RangeError('The "' + name + '" argument is out of range. It must be ' + range + ". Received " + inspect(value));
+    const NE = G.__mbunNodeErrors;
+    if (NE) return NE.ERR_OUT_OF_RANGE(name, range, value);
+    const err = new RangeError('The value of "' + name + '" is out of range. It must be ' + range + ". Received " + inspect(value));
     err.code = "ERR_OUT_OF_RANGE";
     return err;
   }
@@ -176,14 +185,18 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
     if (Array.isArray(o)) return o.every(isValidTLSItem);
     return false;
   };
-  const VALID_TLS_ERROR_MESSAGE_TYPES = "string or an instance of Buffer, TypedArray, DataView, or BunFile";
+  // node lib/internal/tls/secure-context.js validateKeyOrCertOption passes this
+  // exact list to ERR_INVALID_ARG_TYPE. mbun additionally *accepts* a BunFile,
+  // but the rejection message must be node's (no bun corpus test pins the
+  // "or BunFile" wording — it was invented here).
+  const VALID_TLS_ERROR_MESSAGE_TYPES = ["string", "Buffer", "TypedArray", "DataView"];
   const findInvalidTLSItem = (o) => {
     if (Array.isArray(o)) { for (const item of o) if (!isValidTLSItem(item)) return item; }
     return o;
   };
   const throwOnInvalidTLSArray = (name, value) => {
     if (!isValidTLSArray(value))
-      throw ERR_INVALID_ARG_TYPE(name, [VALID_TLS_ERROR_MESSAGE_TYPES], findInvalidTLSItem(value));
+      throw ERR_INVALID_ARG_TYPE(name, VALID_TLS_ERROR_MESSAGE_TYPES, findInvalidTLSItem(value));
   };
 
   // ---- DEFAULT_CIPHERS (node src/node_constants.h DEFAULT_CIPHER_LIST_CORE) ---
