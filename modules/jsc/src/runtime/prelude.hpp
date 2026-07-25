@@ -124,6 +124,9 @@
 // errno/SIG* macros (not exported by `import std`).
 #include <cerrno>
 #include <csignal>
+// <cstdlib> for ::realpath / ::free (fs.realpathSync.native's strict resolver in
+// io_bindings.inc). `import std` does not export the POSIX realpath overload.
+#include <cstdlib>
 #if !defined(_WIN32)
 #  include <sys/wait.h>
 #  include <sys/stat.h>  // stat() for Bun.which is_executable_file_path probe

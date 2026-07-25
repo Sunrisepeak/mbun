@@ -5223,7 +5223,10 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     ENOTEMPTY: [-39, "directory not empty"], EISDIR: [-21, "illegal operation on a directory"],
     EBADF: [-9, "bad file descriptor"], EEXIST: [-17, "file already exists"],
     EPERM: [-1, "operation not permitted"], EACCES: [-13, "permission denied"],
-    EINVAL: [-22, "invalid argument"], ENOSYS: [-38, "function not implemented"] };
+    EINVAL: [-22, "invalid argument"], ENOSYS: [-38, "function not implemented"],
+    // uv_strerror(UV_ELOOP). Reached by the realpath resolver's follow-stat on a
+    // symlink cycle, which is the only way node detects one.
+    ELOOP: [-40, "too many symbolic links encountered"] };
   const fsErr = (code, syscall, path2, dest) => {
     const info = FS_ERRNO[code] || [-1, "unknown error"];
     let msg = code + ": " + info[1] + ", " + syscall;
@@ -5530,8 +5533,8 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   fsMod.readdirSync = wrapEnc(fsMod.readdirSync, 1);
   fsMod.readdir = wrapEnc(fsMod.readdir, 1);
   fsMod.readlinkSync = wrapEnc(fsMod.readlinkSync, 1);
-  fsMod.realpathSync = wrapEnc(fsMod.realpathSync, 1);
-  fsMod.realpath = wrapEnc(fsMod.realpath, 1);
+  // realpath/realpathSync are NOT wrapped here: they are redefined below (node's
+  // JS resolver) and carry their own fsValidateEncoding call.
   // node getOptions(): the resolved path comes back in the *requested* encoding —
   // 'buffer' yields a Buffer, any other known encoding re-decodes the utf8 bytes
   // (fs.realpathSync(p, 'ucs2') is a re-interpretation, not a conversion).
@@ -5542,19 +5545,123 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     const buf = G.Buffer.from(String(str), "utf8");
     return enc === "buffer" ? buf : buf.toString(enc);
   };
-  const realpathSyncRaw = fsMod.realpathSync;
-  fsMod.realpathSync = (p2, o) => fsEncodePath(realpathSyncRaw(p2, o), o);
-  fsMod.realpathSync.native = fsMod.realpathSync;
-  const realpathRaw = fsMod.realpath;
+  // ---- fs.realpath / fs.realpathSync: node's NON-NATIVE JS resolver ----------
+  //
+  // A DIRECT TRANSLATION of lib/fs.js realpathSync (node's own comments kept
+  // where they explain a step). node does not call realpath(3) here — it walks
+  // the path component by component with lstat, reads each symlink with
+  // readlink, and restarts the walk from the resolved target. That is not an
+  // implementation detail: it is the observable contract.
+  //   • A cycle is reported as ELOOP with `path` set to the LINK, because the
+  //     detection is the follow-`stat` on the link failing that way — not a
+  //     depth counter (test-fs-realpath test_cyclic_link_protection).
+  //   • `seenLinks`, keyed by dev:ino, is what stops `folder/cycles` repeated ten
+  //     times from being ELOOP as well (test_cyclic_link_overprotection). A
+  //     resolver that just counted hops would reject that legal path.
+  //   • The walk STOPS at a FIFO or a socket, which is how '/dev/stdin' resolves
+  //     to '/proc/<pid>/fd/pipe:[N]' instead of failing ENOENT on a name no
+  //     directory contains (test-fs-realpath-pipe).
+  // mbun previously used std::filesystem::weakly_canonical for both, which fails
+  // none of these cases -- it resolves as far as it can and appends the rest, so
+  // '/this/path/does/not/exist' came back as itself with no error at all.
+  //
+  // node's `statValues` is a single shared array that only the FOLLOW-stat below
+  // writes, so by the time the walk revisits an already-known component it still
+  // holds the mode of the last link target that was stat'ed. `lastFollowMode`
+  // reproduces that exactly; the /dev/stdin case depends on it.
+  const S_IFMT_RP = 0o170000, S_IFIFO_RP = 0o010000, S_IFSOCK_RP = 0o140000;
+  const fsRealpathWalk = (input) => {
+    let p = path.resolve(input);
+    const seenLinks = new Map();
+    const knownHard = new Set();
+    let lastFollowMode = -1;
+    // Skip over roots. POSIX has a single-character root and (unlike Windows)
+    // needs no existence check on it.
+    let current = "/";
+    let base = "/";
+    let previous;
+    let pos = 1;
+    while (pos < p.length) {
+      const result = p.indexOf("/", pos);
+      previous = current;
+      if (result === -1) {
+        const last = p.slice(pos);
+        current += last;
+        base = previous + last;
+        pos = p.length;
+      } else {
+        current += p.slice(pos, result + 1);
+        base = previous + p.slice(pos, result);
+        pos = result + 1;
+      }
+      // Continue if not a symlink, break if a pipe/socket.
+      if (knownHard.has(base)) {
+        if (lastFollowMode >= 0 &&
+            ((lastFollowMode & S_IFMT_RP) === S_IFIFO_RP ||
+             (lastFollowMode & S_IFMT_RP) === S_IFSOCK_RP)) break;
+        continue;
+      }
+      const st = fsMod.lstatSync(base);
+      if (!st.isSymbolicLink()) { knownHard.add(base); continue; }
+      // Read the link if it wasn't read before.
+      const id = String(st.dev) + ":" + String(st.ino);
+      let linkTarget = seenLinks.has(id) ? seenLinks.get(id) : null;
+      if (linkTarget === null) {
+        lastFollowMode = Number(fsMod.statSync(base).mode);
+        linkTarget = fsMod.readlinkSync(base);
+        seenLinks.set(id, linkTarget);
+      }
+      // Resolve the link, then start over.
+      p = path.resolve(path.resolve(previous, linkTarget), p.slice(pos));
+      current = "/";
+      base = "/";
+      pos = 1;
+    }
+    return p;
+  };
+  fsMod.realpathSync = (p2, o) => {
+    fsValidateEncoding(o);
+    validatePath(p2);
+    return fsEncodePath(fsRealpathWalk(toStr(p2)), o);
+  };
   fsMod.realpath = (p2, a, b) => {
     const hasOpts = typeof a !== "function";
     const cb = hasOpts ? b : a;
+    if (hasOpts) fsValidateEncoding(a);
     fsMakeCallback(cb);
-    return realpathRaw(p2, hasOpts ? a : undefined, (err, res) => {
-      if (err) cb(err); else cb(null, fsEncodePath(res, hasOpts ? a : undefined));
+    validatePath(p2);
+    // node's async realpath interleaves fs.lstat/fs.stat/fs.readlink and hops
+    // through process.nextTick between components, so the callback NEVER runs
+    // before realpath() returns. Doing the walk synchronously and calling back
+    // inline (as this did) nested every subtest of test-fs-realpath inside its
+    // predecessor's stack. One deferred hop is enough to restore the contract
+    // that matters to callers.
+    process.nextTick(() => {
+      let res;
+      try { res = fsRealpathWalk(toStr(p2)); }
+      catch (e) { cb(e); return; }
+      cb(null, fsEncodePath(res, hasOpts ? a : undefined));
     });
   };
-  fsMod.realpath.native = fsMod.realpath;
+  // `.native` is uv_fs_realpath — realpath(3) — not the walk above.
+  fsMod.realpathSync.native = (p2, o) => {
+    fsValidateEncoding(o);
+    validatePath(p2);
+    return fsEncodePath(F.realpathNative(toStr(p2)), o);
+  };
+  fsMod.realpath.native = (p2, a, b) => {
+    const hasOpts = typeof a !== "function";
+    const cb = hasOpts ? b : a;
+    if (hasOpts) fsValidateEncoding(a);
+    fsMakeCallback(cb);
+    validatePath(p2);
+    process.nextTick(() => {
+      let res;
+      try { res = F.realpathNative(toStr(p2)); }
+      catch (e) { cb(e); return; }
+      cb(null, fsEncodePath(res, hasOpts ? a : undefined));
+    });
+  };
   fsMod.writeFileSync = wrapEnc(fsMod.writeFileSync, 2);
   fsMod.writeFile = wrapEnc(fsMod.writeFile, 2);
   // Shared validator seam for the fs partitions appended after this IIFE
