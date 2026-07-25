@@ -46,6 +46,7 @@ export import :node_process_extra;
 export import :node_process_lifecycle;
 export import :node_util_extra;
 export import :node_test_runner;
+export import :node_cluster;
 export import :node_legacy_ctors;
 export import :node_domain;
 export import :node_timers;
@@ -117,6 +118,10 @@ export inline const std::string kNodeBuiltinsJS =
         .append(detail::kNodeProcessLifecycleJS)
         // node:test standalone runner (used when no bun:test harness is present);
         // after bootstrap registered the delegating M["test"] it wraps.
+        // node:cluster — after node_process_extra (which wires the child-side
+        // IPC channel a worker's _setupWorker() sends 'online' over) and after
+        // node:child_process/node:net are registered.
+        .append(detail::kNodeClusterJS)
         .append(detail::kNodeTestRunnerJS)
         .append(detail::kNodeTimersJS)
         .append(detail::kNodeBufferExtraJS)
