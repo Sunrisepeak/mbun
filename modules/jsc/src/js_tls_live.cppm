@@ -77,6 +77,13 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
     return cert;
   };
 
+  const x509Of = (pem) => {
+    if (!pem) return undefined;
+    const crypto = M["crypto"] || M["node:crypto"];
+    if (!crypto || typeof crypto.X509Certificate !== "function") return undefined;
+    try { return new crypto.X509Certificate(pem); } catch (e) { return undefined; }
+  };
+
   const deferredTLS = (what) => {
     const e = new Error("tls." + what + " requires the socket event loop + real SSL_CTX handshake (DEFERRED in mbun: modules/tls TlsChannel / S-net)");
     e.code = "ERR_MBUN_DEFERRED";
@@ -146,9 +153,23 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
   // edge: write/read/pause/resume/backpressure delegate to the transport, which
   // surfaces already-decrypted "data" and, on handshake completion,
   // "secureConnect".
+  // node accepts the credentials either inline or wrapped in a SecureContext
+  // (`new tls.TLSSocket(sock, { isServer: true, secureContext })`, which the
+  // corpus uses whenever it drives a handshake over a socket it made itself).
+  // Fold the context's stored options in underneath the explicit ones; an
+  // explicitly-undefined key must not shadow the context's value.
+  const mergeSecureContext = (options) => {
+    const sc = options && options.secureContext;
+    const base = sc && sc._secureOptions;
+    if (!base) return options;
+    const out = Object.assign({}, base);
+    for (const k in options) if (options[k] !== undefined) out[k] = options[k];
+    return out;
+  };
+
   class TLSSocket extends NetSocket {
     constructor(socket, options) {
-      options = options || {};
+      options = mergeSecureContext(options || {});
       // node _tls_wrap.js: a TLSSocket is never half-open regardless of option.
       super({ allowHalfOpen: false });
       this.allowHalfOpen = false;
@@ -198,7 +219,7 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
           // node: alpnProtocol is the negotiated name, false when ALPN was
           // attempted but nothing matched, null when ALPN was not offered.
           self.alpnProtocol = info.alpnProtocol ? info.alpnProtocol : (self.ALPNProtocols ? false : null);
-          if (info.peerCert) self._peerCert = parseCert(info.peerCert);
+          if (info.peerCert) { self._peerCert = parseCert(info.peerCert); self._peerCertPem = info.peerCert; }
           if (info.servername) self.servername = self.servername || info.servername;
         } else {
           self.authorized = self._rejectUnauthorized;
@@ -221,6 +242,7 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
           ? (options.requestCert ? (options.rejectUnauthorized !== false ? 1 : 2) : 0)
           : (options.rejectUnauthorized !== false ? 1 : 0);
         const ver = resolveVersions(options);
+        self._ownCertPem = pemOf(options.cert) || null;
         transport._startTls({
           isServer: !!options.isServer,
           cert: pemOf(options.cert),   // server: own cert; client: mutual-TLS cert
@@ -255,6 +277,12 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
     address() { return this._transport ? this._transport.address() : {}; }
     getPeerCertificate(detailed) { return this._transport ? (this._peerCert || {}) : null; }
     getCertificate() { return null; }
+    // node getX509Certificate()/getPeerX509Certificate(): the same certificates
+    // getCertificate()/getPeerCertificate() report, as crypto.X509Certificate
+    // objects. DEFERRED: `issuerCertificate` chain walking (needs the verified
+    // chain out of the SSL*, not just the leaf).
+    getX509Certificate() { return x509Of(this._ownCertPem); }
+    getPeerX509Certificate() { return x509Of(this._peerCertPem); }
     getCipher() {
       const n = this._cipherName || "";
       if (!n) return {};
@@ -280,20 +308,34 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
   // ---- tls.connect(): open (or adopt) a socket and drive the client handshake -
   // Signatures: connect(options[,cb]) and connect(port[,host][,options][,cb]).
   function connect(...args) {
+    // node lib/internal/tls/wrap.js connect() -> normalizeConnectArgs: the
+    // signatures are connect(options[,cb]), connect(port[,host][,options][,cb])
+    // and connect(path[,options][,cb]) — host, options and cb are each
+    // independently optional, so the options object can sit at index 1 or 2.
+    // Reading it only from index 2 silently dropped `rejectUnauthorized:false`
+    // (and every other option) from the very common
+    // `tls.connect(port, { ... }, cb)` form, which then failed the handshake
+    // with a raw OpenSSL "certificate verify failed".
     let opts, cb = null;
-    if (typeof args[0] === "object" && args[0] !== null) { opts = args[0]; cb = typeof args[1] === "function" ? args[1] : null; }
-    else {
-      opts = (typeof args[2] === "object" && args[2] !== null) ? Object.assign({}, args[2]) : {};
-      opts.port = args[0];
-      if (typeof args[1] === "string") opts.host = args[1];
-      for (let i = 1; i < args.length; i++) if (typeof args[i] === "function") { cb = args[i]; break; }
+    const a = args.slice();
+    if (a.length && typeof a[a.length - 1] === "function") cb = a.pop();
+    if (typeof a[0] === "object" && a[0] !== null) {
+      opts = a[0];
+    } else {
+      let host, tail;
+      if (typeof a[1] === "string") { host = a[1]; tail = a[2]; }
+      else tail = a[1];
+      opts = (tail !== null && typeof tail === "object") ? Object.assign({}, tail) : {};
+      if (typeof a[0] === "string") opts.path = a[0];
+      else opts.port = a[0];
+      if (host !== undefined) opts.host = host;
     }
     const host = opts.host || opts.hostname || "localhost";
     const servername = opts.servername != null ? opts.servername
       : (typeof opts.host === "string" && !netIsIP(opts.host) ? opts.host : "");
     const transportOpt = opts.socket;
     const tlsOpts = { isServer: false, servername, ca: opts.ca, cert: opts.cert, key: opts.key, rejectUnauthorized: opts.rejectUnauthorized, ALPNProtocols: opts.ALPNProtocols,
-      minVersion: opts.minVersion, maxVersion: opts.maxVersion, secureProtocol: opts.secureProtocol };
+      minVersion: opts.minVersion, maxVersion: opts.maxVersion, secureProtocol: opts.secureProtocol, secureContext: opts.secureContext };
 
     if (isMbunNetSocket(transportOpt)) {
       const tlsSock = new TLSSocket(transportOpt, tlsOpts);
@@ -310,7 +352,10 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
     const transport = new NetSocket({ allowHalfOpen: false });
     const tlsSock = new TLSSocket(transport, tlsOpts);
     if (cb) tlsSock.once("secureConnect", cb);
-    transport.connect(opts.port | 0, String(host));
+    // A unix-socket/pipe target has a path instead of a port (node net.connect
+    // dispatches on the same distinction).
+    if (typeof opts.path === "string" && opts.path) transport.connect(opts.path);
+    else transport.connect(opts.port | 0, String(host));
     return tlsSock;
   }
 
@@ -339,10 +384,26 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
         requestCert: creds.requestCert, rejectUnauthorized: creds.rejectUnauthorized,
         ALPNProtocols: creds.ALPNProtocols,
         minVersion: creds.minVersion, maxVersion: creds.maxVersion, secureProtocol: creds.secureProtocol,
+        secureContext: creds.secureContext,
       });
       const self = this;
       tlsSock.once("secureConnect", () => self.emit("secureConnection", tlsSock));
-      raw.once("error", (e) => { if (!tlsSock._secureEstablished) self.emit("tlsClientError", e, tlsSock); });
+      // node _tls_wrap.js: a failure BEFORE the handshake completes is the
+      // server's 'tlsClientError' (with the socket), never an unhandled 'error'
+      // on the TLSSocket — a client that speaks junk at a TLS port must not take
+      // the server process down. The listener also has to live on the TLSSocket
+      // rather than on the raw transport, because the transport forwards its
+      // errors there and an unlistened 'error' re-emit is what threw.
+      tlsSock.on("error", (e) => {
+        if (!tlsSock._secureEstablished) {
+          self.emit("tlsClientError", e, tlsSock);
+          try { tlsSock.destroy(); } catch (e2) {}
+          return;
+        }
+        // Established connection: node routes to the socket's own listeners and
+        // treats none as an unhandled error. Preserve that.
+        if (tlsSock.listenerCount("error") <= 1) G.queueMicrotask(() => { throw e; });
+      });
     }
     setSecureContext(options) { this._sharedCreds = options || {}; }
     addContext(servername, context) { this._contexts.set(servername, context); }
@@ -351,9 +412,40 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
   }
   function createServer(options, connectionListener) { return new Server(options, connectionListener); }
 
+  // ---- pre-class constructor call form ---------------------------------------
+  // node's tls.Server / tls.TLSSocket predate ES classes, so `tls.Server(opts,
+  // cb)` and `tls.TLSSocket(sock)` without `new` are legal and the corpus uses
+  // them (test-tls-connect-simple, test-tls-pause, test-tls-passphrase, …).
+  // An ES class rejects that with "Cannot call a class constructor without
+  // |new|", so re-export each through a plain-function stand-in that keeps
+  // construct behaviour, prototype identity, statics and instanceof intact —
+  // the same shape js_net.cppm uses for net.Server/net.Socket.
+  const callable = (Cls) => {
+    const wrapper = function (...args) {
+      if (new.target !== undefined) return Reflect.construct(Cls, args, new.target);
+      // `Ctor.call(this, ...)` (util.inherits subclassing): the receiver's chain
+      // already reaches the class — initialise it in place.
+      if (this !== null && this !== undefined && typeof this === "object" && this instanceof Cls) {
+        Object.defineProperties(this, Object.getOwnPropertyDescriptors(Reflect.construct(Cls, args)));
+        return undefined;
+      }
+      return Reflect.construct(Cls, args);
+    };
+    try {
+      Object.setPrototypeOf(wrapper, Cls);
+      wrapper.prototype = Cls.prototype;
+      Object.defineProperty(wrapper, "name", { value: Cls.name, configurable: true });
+      Object.defineProperty(wrapper, "length", { value: Cls.length, configurable: true });
+      Object.defineProperty(Cls.prototype, "constructor", { value: wrapper, writable: true, configurable: true });
+    } catch (e) { return Cls; }
+    return wrapper;
+  };
+  const ServerW = callable(Server);
+  const TLSSocketW = callable(TLSSocket);
+
   // ---- overwrite the deferred stubs installed by builtins/node_tls.cppm -------
-  try { T.TLSSocket = TLSSocket; } catch (e) {}
-  try { T.Server = Server; } catch (e) {}
+  try { T.TLSSocket = TLSSocketW; } catch (e) {}
+  try { T.Server = ServerW; } catch (e) {}
   try { T.createServer = createServer; } catch (e) {}
   try { T.connect = connect; } catch (e) {}
 })();
