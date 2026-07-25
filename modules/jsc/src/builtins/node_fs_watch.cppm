@@ -48,20 +48,66 @@ inline constexpr std::string_view kNodeFsWatchJS = R"JS(
   const validateEncoding = V.validateEncoding || (() => {});
   const argTypeErr = V.argTypeErr || ((n, e, v) => Object.assign(new TypeError('The "' + n + '" argument must be ' + e), { code: "ERR_INVALID_ARG_TYPE" }));
   const argValueErr = V.argValueErr || ((n, v, r) => Object.assign(new TypeError("The argument '" + n + "' " + r), { code: "ERR_INVALID_ARG_VALUE" }));
-  // node validateStringArray/`ignore` option: a string or an array of strings,
-  // each non-empty. ref lib/internal/fs/watchers.js.
+  // node validateIgnoreOption (lib/internal/validators.js): `ignore` is a
+  // non-empty string glob, a RegExp, a Function, or an array of any of those.
+  // Functions were rejected outright before, and the value was validated then
+  // dropped — no event was ever filtered (test-fs-watch-ignore-*).
+  const isRe = (v) => v instanceof RegExp || Object.prototype.toString.call(v) === "[object RegExp]";
   function validateIgnore(ignore) {
     if (ignore === undefined || ignore === null) return;
-    const one = (v) => {
+    const one = (v, name) => {
       if (typeof v === "string") {
-        if (v.length === 0) throw argValueErr("options.ignore", v, "must be a non-empty string");
+        if (v.length === 0) throw argValueErr(name, v, "must be a non-empty string");
         return;
       }
-      if (v instanceof RegExp || (v && typeof v.test === "function")) return;
-      throw argTypeErr("options.ignore", "of type string or an instance of RegExp", v);
+      if (isRe(v) || typeof v === "function") return;
+      throw argTypeErr(name, "one of type string, RegExp, or Function", v);
     };
-    if (Array.isArray(ignore)) { for (const v of ignore) one(v); return; }
-    one(ignore);
+    if (Array.isArray(ignore)) {
+      for (let i = 0; i < ignore.length; ++i) one(ignore[i], "options.ignore[" + i + "]");
+      return;
+    }
+    one(ignore, "options.ignore");
+  }
+
+  // node compiles string patterns with minimatch({ matchBase: true }): a pattern
+  // with no "/" is also tried against the basename, so '*.log' ignores
+  // 'subdir/file.log' under a recursive watch. ref createIgnoreMatcher in
+  // lib/internal/fs/watchers.js. Only the "**", "*", "?" subset is needed.
+  function globToRegExp(pat) {
+    let re = "";
+    for (let i = 0; i < pat.length; ++i) {
+      const c = pat[i];
+      if (c === "*") {
+        if (pat[i + 1] === "*") {
+          ++i;
+          if (pat[i + 1] === "/") { ++i; re += "(?:.*\\/)?"; } else re += ".*";
+        } else re += "[^/]*";
+      } else if (c === "?") re += "[^/]";
+      else re += c.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+    }
+    return new RegExp("^" + re + "$");
+  }
+  function globPredicate(pat) {
+    const matchBase = pat.indexOf("/") === -1;
+    const re = globToRegExp(pat);
+    return (f) => re.test(f) ||
+      (matchBase && f.indexOf("/") !== -1 && re.test(f.slice(f.lastIndexOf("/") + 1)));
+  }
+  function createIgnoreMatcher(ignore) {
+    if (ignore === undefined || ignore === null) return null;
+    const list = Array.isArray(ignore) ? ignore : [ignore];
+    const compiled = [];
+    for (const m of list) {
+      if (typeof m === "string") compiled.push(globPredicate(m));
+      else if (isRe(m)) compiled.push((f) => { m.lastIndex = 0; return m.test(f); });
+      else compiled.push(m);
+    }
+    if (compiled.length === 0) return null;
+    return (filename) => {
+      for (const p of compiled) { if (p(filename)) return true; }
+      return false;
+    };
   }
 
   function unavailable() {
@@ -103,6 +149,7 @@ inline constexpr std::string_view kNodeFsWatchJS = R"JS(
       const path = toStr(filename);
       this._path = path;
       this._enc = options.encoding === undefined ? "utf8" : options.encoding;
+      this._ignoreMatcher = createIgnoreMatcher(options.ignore);
       this._persistent = options.persistent === undefined ? true : !!options.persistent;
       this._closed = false;
       this._refd = false;
@@ -126,6 +173,12 @@ inline constexpr std::string_view kNodeFsWatchJS = R"JS(
       try { events = WN.poll(this._handle); }
       catch (e) { this._closed = true; this._release(); this.emit("error", e); return 0; }
       for (const ev of events) {
+        // node: `if (filename != null && ignoreMatcher?.(filename)) return;`
+        // (watchers.js onchange / recursive_watch.js #watchFolder). ev.name is
+        // already relative to the watch root for a recursive watch and the bare
+        // basename otherwise — exactly what node hands the matcher — so it is
+        // matched as a string, before the encoding:"buffer" conversion.
+        if (this._ignoreMatcher && ev.name && this._ignoreMatcher(ev.name)) continue;
         this.emit("change", ev.kind, decodeName(ev.name, this._enc));
       }
       return events.length;
@@ -225,6 +278,19 @@ inline constexpr std::string_view kNodeFsWatchJS = R"JS(
       this._closed = true;
       clearInterval(this._timer);
       this.emit("close");
+    }
+
+    // node's StatWatcher exposes ref()/unref() (internal/fs/watchers.js); they
+    // proxy the poll timer's loop reference and return `this`.
+    // ref test-fs-watchfile-ref-unref.
+    ref() {
+      if (this._timer && this._timer.ref) this._timer.ref();
+      return this;
+    }
+
+    unref() {
+      if (this._timer && this._timer.unref) this._timer.unref();
+      return this;
     }
   }
 

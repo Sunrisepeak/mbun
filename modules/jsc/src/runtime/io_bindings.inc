@@ -831,12 +831,13 @@ JSValueRef fsn_statfs_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t
                          const JSValueRef args[], JSValueRef* exc) {
     std::string path{fs_arg(ctx, argc, args, 0)};
     if (permission_deny_fs(ctx, exc, path, false)) return JSValueMakeUndefined(ctx);
-    double type{0}, bsize{4096}, blocks{0}, bfree{0}, bavail{0}, files{0}, ffree{0};
+    double type{0}, bsize{4096}, frsize{4096}, blocks{0}, bfree{0}, bavail{0}, files{0}, ffree{0};
 #if !defined(_WIN32)
     struct statvfs sv{};
     if (::statvfs(path.c_str(), &sv) != 0)
         return fs_throw(ctx, exc, "ENOENT: no such file or directory, statfs '" + path + "'");
     bsize = static_cast<double>(sv.f_bsize);
+    frsize = static_cast<double>(sv.f_frsize);
     blocks = static_cast<double>(sv.f_blocks);
     bfree = static_cast<double>(sv.f_bfree);
     bavail = static_cast<double>(sv.f_bavail);
@@ -855,6 +856,9 @@ JSValueRef fsn_statfs_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t
     JSObjectRef out{JSObjectMake(ctx, nullptr, nullptr)};
     set_prop(ctx, out, "type", JSValueMakeNumber(ctx, type));
     set_prop(ctx, out, "bsize", JSValueMakeNumber(ctx, bsize));
+    // node's StatFs carries f_frsize as well (lib/internal/fs/utils.js
+    // getStatFsFromBinding); omitting it failed test-fs-statfs's Object.hasOwn.
+    set_prop(ctx, out, "frsize", JSValueMakeNumber(ctx, frsize));
     set_prop(ctx, out, "blocks", JSValueMakeNumber(ctx, blocks));
     set_prop(ctx, out, "bfree", JSValueMakeNumber(ctx, bfree));
     set_prop(ctx, out, "bavail", JSValueMakeNumber(ctx, bavail));
