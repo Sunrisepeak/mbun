@@ -129,6 +129,14 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
     err.code = "ERR_TLS_INVALID_PROTOCOL_VERSION";
     return err;
   }
+  // node lib/internal/errors.js: 'TLS protocol version %j conflicts with
+  // secureProtocol %j' (%j is JSON, hence the quotes).
+  function ERR_TLS_PROTOCOL_VERSION_CONFLICT(version, secureProtocol) {
+    const err = new TypeError("TLS protocol version " + JSON.stringify(version) +
+      " conflicts with secureProtocol " + JSON.stringify(secureProtocol));
+    err.code = "ERR_TLS_PROTOCOL_VERSION_CONFLICT";
+    return err;
+  }
   function ERR_TLS_INVALID_PROTOCOL_METHOD(message) {
     const err = new TypeError(message);
     err.code = "ERR_TLS_INVALID_PROTOCOL_METHOD";
@@ -216,6 +224,24 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
   let DEFAULT_MAX_VERSION = "TLSv1.3";
   const DEFAULT_ECDH_CURVE = "auto";
 
+  // node src/node_options.cc: --tls-min-v1.{0,1,2,3} / --tls-max-v1.{2,3} move
+  // the default protocol window, and a later flag overrides an earlier one
+  // (test-tls-cli-min-version-1.0 passes --tls-min-v1.0 --tls-min-v1.1 and
+  // expects TLSv1). These only ever RESTRICT or widen the default window on the
+  // operator's explicit instruction; nothing here changes the window when no
+  // flag is given.
+  {
+    const argv = (G.process && G.process.execArgv) || [];
+    const minFlags = { "--tls-min-v1.0": "TLSv1", "--tls-min-v1.1": "TLSv1.1",
+                       "--tls-min-v1.2": "TLSv1.2", "--tls-min-v1.3": "TLSv1.3" };
+    const maxFlags = { "--tls-max-v1.2": "TLSv1.2", "--tls-max-v1.3": "TLSv1.3" };
+    for (const a of argv) {
+      if (typeof a !== "string") continue;
+      if (minFlags[a] !== undefined) DEFAULT_MIN_VERSION = minFlags[a];
+      else if (maxFlags[a] !== undefined) DEFAULT_MAX_VERSION = maxFlags[a];
+    }
+  }
+
   // ---- secureProtocol validation (lib/internal/tls/secure-context.js) ----
   const SECURE_PROTOCOL_METHODS = new Set([
     "TLS_method", "TLS_client_method", "TLS_server_method",
@@ -237,6 +263,18 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
       ciphers, passphrase, ecdhCurve, minVersion, maxVersion, sessionTimeout,
       ticketKeys, clientCertEngine, dhparam, secureProtocol,
     } = options;
+    // node internal/tls/common.js SecureContext runs BEFORE configSecureContext,
+    // and inside it the order is: secureProtocol/minVersion+maxVersion conflict,
+    // then toV() version validity, then context.init() which is where an unknown
+    // method name becomes ERR_TLS_INVALID_PROTOCOL_METHOD. Checking the method
+    // name first reported the wrong error for `{ maxVersion, secureProtocol }`
+    // (test-tls-min-max-version expects the CONFLICT).
+    if (secureProtocol) {
+      if (minVersion != null) throw ERR_TLS_PROTOCOL_VERSION_CONFLICT(minVersion, secureProtocol);
+      if (maxVersion != null) throw ERR_TLS_PROTOCOL_VERSION_CONFLICT(maxVersion, secureProtocol);
+    }
+    if (minVersion != null && !VALID_TLS_VERSIONS.has(minVersion)) throw ERR_TLS_INVALID_PROTOCOL_VERSION(String(minVersion), "minimum");
+    if (maxVersion != null && !VALID_TLS_VERSIONS.has(maxVersion)) throw ERR_TLS_INVALID_PROTOCOL_VERSION(String(maxVersion), "maximum");
     validateSecureProtocol(secureProtocol);
     if (ciphers !== undefined && ciphers !== null) {
       validateString(ciphers, "options.ciphers");
@@ -262,8 +300,6 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
       throw ERR_CRYPTO_CUSTOM_ENGINE_NOT_SUPPORTED("Custom engines not supported by this OpenSSL");
     }
     if (dhparam === "auto") throw ERR_CRYPTO_UNSUPPORTED_OPERATION("Automatic DH parameter selection is not supported");
-    if (minVersion != null && !VALID_TLS_VERSIONS.has(minVersion)) throw ERR_TLS_INVALID_PROTOCOL_VERSION(String(minVersion), "minimum");
-    if (maxVersion != null && !VALID_TLS_VERSIONS.has(maxVersion)) throw ERR_TLS_INVALID_PROTOCOL_VERSION(String(maxVersion), "maximum");
     if (ticketKeys !== undefined && ticketKeys !== null) {
       validateBuffer(ticketKeys, "options.ticketKeys");
       if (ticketKeys.byteLength !== 48) throw ERR_INVALID_ARG_VALUE("options.ticketKeys", ticketKeys.byteLength, "must be exactly 48 bytes");

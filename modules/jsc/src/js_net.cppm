@@ -585,7 +585,8 @@ export constexpr std::string_view kNetJS = R"JS(
         // optional) or a bool (legacy fetch/https callers); coerce either.
         const vmode = typeof o.verify === "number" ? o.verify : (o.verify ? 1 : 0);
         NN.tlsWrap(this._fd, !!o.isServer, o.cert || "", o.key || "", o.servername || "",
-                   vmode, o.ca || "", o.alpn || "", o.minVersion || "", o.maxVersion || "");
+                   vmode, o.ca || "", o.alpn || "", o.minVersion || "", o.maxVersion || "",
+                   o.ciphers || "");
         this._tls = 1;
       } catch (e) { this._fail(e); }
       return this;

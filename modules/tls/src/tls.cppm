@@ -25,6 +25,13 @@ export struct Config {
     // options.minVersion / options.maxVersion (lib/internal/tls/secure-context).
     int minVersion {0};
     int maxVersion {0};
+    // OpenSSL cipher list string (node's options.ciphers, default
+    // tls.DEFAULT_CIPHERS). EMPTY MEANS "leave the context's default in place" —
+    // it must never be interpreted as "allow everything". A non-empty list that
+    // OpenSSL cannot parse is a hard construction failure, not a fallback to the
+    // default: silently ignoring a caller's cipher restriction is how a
+    // connection ends up weaker than the operator asked for.
+    std::string ciphers {};
 
     [[nodiscard]] bool has_credentials() const noexcept {
         return !certificate.empty() || !key.empty();

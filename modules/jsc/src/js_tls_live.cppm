@@ -409,6 +409,9 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
           alpn: alpnCsv(options.ALPNProtocols),
           minVersion: ver.min,
           maxVersion: ver.max,
+          // node SecureContext::SetCiphers. Only a caller-supplied list is sent;
+          // "" leaves the engine's default suite selection untouched.
+          ciphers: typeof options.ciphers === "string" ? options.ciphers : "",
         });
       };
       // A live fd means the reactor's connect() already returned, whether this is
@@ -550,7 +553,8 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
       : (typeof opts.host === "string" && !netIsIP(opts.host) ? opts.host : "");
     const transportOpt = opts.socket;
     const tlsOpts = { isServer: false, servername, ca: opts.ca, cert: opts.cert, key: opts.key, rejectUnauthorized: opts.rejectUnauthorized, ALPNProtocols: opts.ALPNProtocols,
-      minVersion: opts.minVersion, maxVersion: opts.maxVersion, secureProtocol: opts.secureProtocol, secureContext: opts.secureContext };
+      minVersion: opts.minVersion, maxVersion: opts.maxVersion, secureProtocol: opts.secureProtocol, secureContext: opts.secureContext,
+      ciphers: opts.ciphers };
 
     if (isMbunNetSocket(transportOpt)) {
       const tlsSock = new TLSSocket(transportOpt, tlsOpts);
@@ -656,7 +660,7 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
         requestCert: creds.requestCert, rejectUnauthorized: creds.rejectUnauthorized,
         ALPNProtocols: creds.ALPNProtocols,
         minVersion: creds.minVersion, maxVersion: creds.maxVersion, secureProtocol: creds.secureProtocol,
-        secureContext: creds.secureContext,
+        secureContext: creds.secureContext, ciphers: creds.ciphers,
       });
       const self = this;
       tlsSock.once("secureConnect", () => self.emit("secureConnection", tlsSock));
