@@ -699,3 +699,46 @@ native block three times, and dissolved under measurement three times:
 
 The rule: a missing dump means UNKNOWN. Check the exit code, grep the log for
 crash text, and only then name a layer.
+
+### A shared global config is contested state
+
+`~/.mcpp/config.toml`'s toolchain default was flipped from gcc 16.1.0 to 15.1.0
+**twice** during one round, by concurrent agents, and this repository does not
+build under 15.1. Worktrees isolate the repo; they do not isolate `$HOME`.
+
+The second flip was caught in five seconds instead of forty minutes, because
+`build_or_die.sh` now compares the project's declared `xim:gcc@<version>` against
+the configured default before building. That check earned its keep on the very
+next build after it was written.
+
+Two rules follow:
+
+- **Treat anything under `$HOME` as shared mutable state**, and re-check it
+  rather than assuming it survived. An agent that "restored" a global setting has
+  not made it stay restored.
+- **`worktree_setup.sh` deletes `build.ninja` to force a reconfigure**, which is
+  precisely when a bad global default gets picked up. So a broken toolchain
+  default does not break the worktree that set it — it breaks every worktree
+  created *afterwards*, which is why it presented as "wt1 and wt4 are both
+  mysteriously unbuildable".
+
+### A broken test facility hides as a passing test
+
+`node:test`'s mock had two dead features, both found while chasing an unrelated
+fs file:
+
+- `mockImplementationOnce` compared against `calls.length`, but the call record
+  is pushed *before* the implementation runs — off by one, so the
+  once-implementation was **never** selected.
+- `mock.getter` / `mock.setter` used plain assignment (`object[name] = fn`),
+  which cannot replace an accessor defined on a prototype.
+
+Any corpus file relying on either was silently exercising the **unmocked** path.
+That is the same shape as the `assert.throws` matcher that ignored its error
+argument — which, when fixed, removed 126 passes that had never been real.
+
+The pattern is worth naming: **a defect in the test facility is invisible in
+exactly the direction that flatters you.** When a harness feature is
+under-exercised, check that it works at all before trusting any file that uses
+it. Here the full-corpus guard showed no pass loss from the fix, so nothing had
+been leaning on it — but that was measured, not assumed.

@@ -640,6 +640,45 @@
      ],
      "my_wrong_public_diagnosis": "I published, in a commit message and on PR 32, that deleting build.ninja is not a safe reset because it left a worktree unable to build. False. The global ~/.mcpp/config.toml toolchain default had been flipped to gcc 15.1.0 and the project needs 16.1.0; the deletion merely forced a reconfigure that picked up the wrong default. Verified by restoring the default and rebuilding the same worktree with build.ninja still absent. build_or_die.sh now checks this before building.",
      "environment_hazard": "An agent modified ~/.mcpp/config.toml -- a GLOBAL user config outside the repo. Worktree isolation does not cover $HOME, so one agent's environment change is every concurrent agent's."
+    },
+    {
+     "id": "w4/agent-http",
+     "cluster": "http + http2 (wave 4, inventory-driven)",
+     "worklist_files": 112,
+     "target_delta_pass": 12,
+     "actual_delta_pass": 26,
+     "hit_rate": 2.17,
+     "wall_clock_min": 73,
+     "note": "Best rate of any agent so far. http filter 526->552 pass, 41->24 timeout; http2 alone 180->195 pass, 26->17 timeout. Guard 1124 files -- it WIDENED past the brief's filter because one of its changes (events.listenerCount) is global. It also caught a real regression of its own making and fixed it: self-removing the socketOnError listener left an https TLSSocket occupying the last 'error' slot, so a later write-after-end threw; node keeps a permanent noop underneath.",
+     "http2_timeout_histogram": {
+      "B stalled exchange": 18,
+      "B' + the test's own timer": 1,
+      "A dead client flow": 3,
+      "D no dump": 3,
+      "misclassified (exits 1, not 124)": 1
+     },
+     "leads_i_got_wrong": [
+      "http-destroySoon: the CAUSE was wrong. res._last is NOT set by maxRequestsOnConnectionReached -- node's _storeHeader writes 'Connection: close' there without touching _last, and mbun matches, so resOnFinish never called destroySoon() in those files at all. The real cause was the parser rejecting the stray CRLF the test writes between pipelined requests, which llhttp's s_start_req swallows per RFC 9112 2.2.",
+      "http-client-connect-ignores-options-signal: my caveat was wrong AND was refuted the right way -- the agent RAN the test against real node v24.15.0 and it passes. I had guessed a corpus expectation might be unsatisfiable and briefed an agent to be wary of it. node is installed; use it as an oracle.",
+      "reset-flood was filed as a native block and was nothing of the kind -- the server accepted a malformed HEADERS block instead of rejecting it. THIRD time a 'native crash/block' claim dissolved under measurement."
+     ]
+    },
+    {
+     "id": "w4/agent-fs",
+     "cluster": "fs to ceiling (wave 4, inventory-driven)",
+     "worklist_files": 37,
+     "target_delta_pass": 11,
+     "actual_delta_pass": 11,
+     "hit_rate": 1.0,
+     "wall_clock_min": 99,
+     "note": "Target hit exactly. fs 298->309 of 334 live (92.5%). Guarded with the FULL 4433-file corpus on both binaries -- the most rigorous guard any agent has run: baseline 2404, after 2417, one 'regression' that passes 3/3 standalone. Its baseline reading 2404 against my recorded 2403 for the same commit is a 1-file harness variance and is itself a useful calibration.",
+     "declined_item_2_correctly": "I briefed the nextTick-vs-microtask queue split as the highest-leverage item. It did not attempt it and said so plainly: 'I did not measure it, so I make no claim about it', judging a broad event-pump change plus a full re-guard worse value than banking 11 files. That is the right call and the right way to report it.",
+     "measurement_defect_it_found": "node:test's mock had TWO dead features: mockImplementationOnce compared against calls.length, which is incremented BEFORE the implementation runs, so the once-implementation was never selected; and mock.getter/setter used plain assignment, which cannot replace a prototype accessor. Any corpus file relying on either was silently testing the UNMOCKED path -- the same class as the assert.throws defect that removed 126 false passes in an earlier round. Its full-corpus guard shows no pass loss from the fix.",
+     "leads_i_got_wrong": [
+      "test-fs-error-messages' note ('needs fstat in the syscall slot') was stale: it was blocked on readlink ENOENT, and behind that a whole family (close/ftruncate/fdatasync/fsync/chown/utimes/mkdtemp/copyFile/read/write/fchmod/fchown/futimes) all had to raise node's EBADF/ENOENT.",
+      "fs-one-off UNDERCOUNTS AGAIN -- 7 of its 11 gains had no inventory row. Second wave running: the inventory's COVERAGE, not its accuracy, is now the binding constraint.",
+      "test-fs-cp-async-file-url is a HARNESS cause (relative-to-cwd fixture path, same as test-fs-realpath-native), not the 'import.meta.url/__dirname bug' I recorded."
+     ]
     }
    ],
    "verdicts": {
@@ -831,6 +870,23 @@
     "now": "test-fs-buffer.js + test-fs-readfile.js together at --jobs 6 crashes 1 of 3 attempts in JSRopeString::view at address 0x0. test-fs-buffer alone: 4/4 clean. The trigger is the memory pressure from test-fs-readfile's 2 GiB sparse file, which only appears now that the file survives instead of being OOM-killed.",
     "why_it_matters": "A 1-in-3 reproducer is enough to run under ASAN. The bug was parked for want of exactly this."
    }
+  },
+  {
+   "round": "wave 4 — inventory-driven, arithmetic targets",
+   "targets": {
+    "tls": 14,
+    "http": 12,
+    "fs": 11,
+    "total": 37
+   },
+   "actual": {
+    "tls": 16,
+    "http": 26,
+    "fs": 11,
+    "total": 53
+   },
+   "hit_rate": 1.43,
+   "verdict": "Third consecutive wave to beat target since triage moved out of the agents and into compat/data/unreached-inventory.json. Wave 2 (agents triage, target '100%') returned 3.7%; waves 3 and 4 returned 150% and 143%. The constraint has now MOVED: every wave-4 agent reported that the inventory UNDERCOUNTS -- 7 of agent-fs's 11 gains and several of agent-tls's had no row at all, and agent-tls found an 8-file cause (TLS session resumption) that was invisible because its files sat split across three existing buckets. Per-bucket ranking cannot see a cause that spans buckets. Next mechanism improvement: a periodic pass that asks 'what single change would close files in more than one bucket?', plus feeding failure_signature.py output back in so coverage stops depending on what an agent happened to trip over."
   }
  ]
 }
