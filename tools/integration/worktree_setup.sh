@@ -76,6 +76,17 @@ for name in bun node; do
   ln -s "$target" "$link"
 done
 
+# Drop the generated build graph. It is keyed on the module list at generation
+# time, so re-pointing a worktree at a commit that ADDS a module partition
+# leaves ninja unaware of it and `mcpp build` dies with
+#   failed to read compiled module: ... <partition>.gcm
+#   imports must be built before being imported
+# which reads like a source error and is not one. Deleting it forces a
+# regeneration on the next build and costs far less than the --no-cache full
+# rebuild people reach for instead. Object files under target/ are kept, so the
+# incremental cache survives. This bit three separate agents in round 9.
+find "$worktree/target" -name build.ninja -delete 2>/dev/null || true
+
 # Prove the wiring rather than assume it: the corpus path the runners use must
 # resolve to real files, here and now.
 for probe in "compat/node/test/parallel" "compat/node/test/common/index.js" "compat/bun/test"; do
