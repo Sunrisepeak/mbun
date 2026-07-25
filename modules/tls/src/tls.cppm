@@ -21,8 +21,17 @@ export struct Config {
     // offered to the server; server: the set it will select from. Empty = no ALPN.
     std::vector<std::string> alpnProtocols {};
     // Protocol-version pins as raw OpenSSL version constants (TLS1_2_VERSION,
-    // TLS1_3_VERSION, …); 0 = unset (backend keeps its default range). node's
-    // options.minVersion / options.maxVersion (lib/internal/tls/secure-context).
+    // TLS1_3_VERSION, …); 0 = unset (the backend imposes node's default floor of
+    // TLS 1.2). node's options.minVersion / options.maxVersion
+    // (lib/internal/tls/secure-context).
+    //
+    // -1 means EXPLICITLY UNPINNED — the caller passed `secureProtocol`, which in
+    // node hands min=max=0 to SecureContext::Init so the chosen SSL_METHOD's own
+    // range applies instead of tls.DEFAULT_MIN/MAX_VERSION
+    // (lib/internal/tls/common.js). This is reachable only from an explicit
+    // `secureProtocol` option; it does NOT widen the default window, and even
+    // then the linked OpenSSL still refuses a legacy version unless the caller's
+    // own cipher string lowers the security level (`@SECLEVEL=0`).
     int minVersion {0};
     int maxVersion {0};
     // OpenSSL cipher list string (node's options.ciphers, default

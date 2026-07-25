@@ -227,9 +227,27 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
     return null;
   };
   const resolveVersions = (options) => {
-    const pin = secureProtocolPin(options.secureProtocol);
-    let min = pin != null ? pin : options.minVersion;
-    let max = pin != null ? pin : options.maxVersion;
+    // node lib/internal/tls/common.js SecureContext:
+    //   if (secureProtocol) { ...conflict checks...; context.init(secureProtocol, 0, 0); }
+    //   else                 context.init(undefined, toV(minVersion, DEFAULT_MIN),
+    //                                                toV(maxVersion, DEFAULT_MAX));
+    // — an explicit secureProtocol replaces the default version WINDOW with the
+    // method's own range and passes min=max=0, i.e. no pin at all. Folding
+    // DEFAULT_MIN_VERSION in anyway pinned every `secureProtocol: 'TLS_method'`
+    // server at TLSv1.2, so a client that asked for TLSv1/TLSv1.1 (as
+    // test-tls-getprotocol and the test-tls-cli-*-version files do) was answered
+    // with `tlsv1 alert protocol version` by mbun's own server.
+    // This does NOT weaken anything by itself: whether the engine will actually
+    // negotiate a legacy version still depends on the security level, which only
+    // the caller's own `ciphers` string can lower (`@SECLEVEL=0`).
+    if (typeof options.secureProtocol === "string" && options.secureProtocol) {
+      const pinned = secureProtocolPin(options.secureProtocol);
+      // "none" is the native layer's explicit-unpinned marker (net.inc
+      // version_arg); "" would fall back to its TLS 1.2 default floor.
+      return pinned != null ? { min: pinned, max: pinned } : { min: "none", max: "none" };
+    }
+    let min = options.minVersion;
+    let max = options.maxVersion;
     if (min == null) min = T.DEFAULT_MIN_VERSION;
     if (max == null) max = T.DEFAULT_MAX_VERSION;
     return { min: min || "", max: max || "" };
@@ -375,6 +393,24 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
           // constructor's initial value, i.e. "the handshake has not finished".
           self.alpnProtocol = info.alpnProtocol ? info.alpnProtocol : false;
           if (info.peerCert) { self._peerCert = parseCert(info.peerCert); self._peerCertPem = info.peerCert; }
+          // The verified chain (leaf first) backs getPeerCertificate(true)'s
+          // `issuerCertificate` walk. node links each cert to its issuer and
+          // makes the root point at ITSELF, which is the loop terminator the
+          // corpus walks on (test-tls-cert-chains-*).
+          if (Array.isArray(info.peerChain) && info.peerChain.length) {
+            self._peerChainPem = info.peerChain;
+            const parsed = info.peerChain.map((p) => parseCert(p));
+            for (let i = 0; i < parsed.length; i++) {
+              parsed[i].issuerCertificate = i + 1 < parsed.length ? parsed[i + 1] : parsed[i];
+            }
+            // node's non-detailed getPeerCertificate() carries no
+            // issuerCertificate, so the flat leaf stays as parseCert produced it.
+            self._peerCertDetailed = parsed[0];
+          }
+          if (typeof info.finished === "string" && info.finished && Buffer)
+            self._finished = Buffer.from(info.finished, "base64");
+          if (typeof info.peerFinished === "string" && info.peerFinished && Buffer)
+            self._peerFinished = Buffer.from(info.peerFinished, "base64");
           if (info.servername) self.servername = self.servername || info.servername;
         } else {
           self.authorized = self._rejectUnauthorized;
@@ -448,7 +484,11 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
     ref() { if (this._transport) this._transport.ref(); return this; }
     unref() { if (this._transport) this._transport.unref(); return this; }
     address() { return this._transport ? this._transport.address() : {}; }
-    getPeerCertificate(detailed) { return this._transport ? (this._peerCert || {}) : null; }
+    getPeerCertificate(detailed) {
+      if (!this._transport) return null;
+      if (detailed && this._peerCertDetailed) return this._peerCertDetailed;
+      return this._peerCert || {};
+    }
     getCertificate() { return null; }
     // node getX509Certificate()/getPeerX509Certificate(): the same certificates
     // getCertificate()/getPeerCertificate() report, as crypto.X509Certificate
@@ -465,9 +505,19 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
     getSession() { return undefined; }
     getEphemeralKeyInfo() { return null; }
     getSharedSigalgs() { return []; }
-    getFinished() { return undefined; }
-    getPeerFinished() { return undefined; }
+    // node: undefined until the handshake completes, then a non-empty Buffer.
+    getFinished() { return this._finished; }
+    getPeerFinished() { return this._peerFinished; }
     getTLSTicket() { return undefined; }
+    // node internal/tls/wrap.js _destroySSL(): tears the SSL* down without
+    // touching the transport. mbun's channel lives with the transport fd, so the
+    // teardown is a no-op beyond dropping the cached negotiated state — the point
+    // of the corpus test is only that calling it does not crash.
+    _destroySSL() {
+      this._secureEstablished = false;
+      this._peerCert = null;
+      this._peerCertDetailed = null;
+    }
     isSessionReused() { return false; }
     // node internal/tls/wrap.js setServername: validateString, then refuse on a
     // server-side socket — SNI travels client→server only.
@@ -488,11 +538,31 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
     setMaxSendFragment(size) { validateInt32(size, "size"); return false; }
     disableRenegotiation() { this._renegotiationDisabled = true; }
     enableTrace() {}
+    // node internal/tls/wrap.js exportKeyingMaterial: arguments first, then the
+    // securely-established check, then SSL_export_keying_material (RFC 5705).
     exportKeyingMaterial(length, label, context) {
       validateUint32(length, "length", true);
       validateString(label, "label");
       if (context !== undefined) validateBuffer(context, "context");
-      throw deferredTLS("TLSSocket.exportKeyingMaterial");
+      if (!this._secureEstablished) {
+        const e = new Error("TLS socket connection must be securely established");
+        e.code = "ERR_TLS_INVALID_STATE";
+        throw e;
+      }
+      const fd = this._transport ? this._transport._fd : -1;
+      let b64 = null;
+      if (NN && typeof NN.tlsExportKeyingMaterial === "function" && fd >= 0) {
+        const ctxB64 = context === undefined ? null
+          : (Buffer ? Buffer.from(context.buffer ? context.buffer : context,
+                                  context.byteOffset || 0, context.byteLength).toString("base64") : null);
+        try { b64 = NN.tlsExportKeyingMaterial(fd, length, label, ctxB64); } catch (e) { b64 = null; }
+      }
+      if (typeof b64 !== "string") {
+        const e = new Error("TLS keying material export failed");
+        e.code = "ERR_TLS_RENEGOTIATION_FAILED";
+        throw e;
+      }
+      return Buffer ? Buffer.from(b64, "base64") : b64;
     }
     // node internal/tls/wrap.js renegotiate(options, callback): both arguments
     // are validated before anything is attempted, so a bare renegotiate() is an
@@ -534,8 +604,16 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
     // built through the tls module's own createSecureContext export (so a caller
     // that replaced it — as test-tls-client-default-ciphers does — is observed),
     // and only then is an IP servername refused.
+    // node lib/internal/tls/wrap.js connect() defaults:
+    //   rejectUnauthorized: !(process.env.NODE_TLS_REJECT_UNAUTHORIZED === '0')
+    // The bypass is opt-in by the operator, applies ONLY when the variable is
+    // literally the string '0' (not 'false', not '', not unset), is overridden by
+    // an explicit `rejectUnauthorized` in the options, and is announced by the
+    // one-time ProcessWarning installed at the bottom of this file — exactly
+    // node's behaviour, no wider.
     opts = Object.assign({
-      rejectUnauthorized: true,
+      rejectUnauthorized: !(G.process && G.process.env &&
+                            G.process.env.NODE_TLS_REJECT_UNAUTHORIZED === "0"),
       ciphers: T.DEFAULT_CIPHERS,
       checkServerIdentity: T.checkServerIdentity,
       minDHSize: 1024,
@@ -787,6 +865,22 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
   try { T.Server = ServerW; } catch (e) {}
   try { T.createServer = createServer; } catch (e) {}
   try { T.connect = connect; } catch (e) {}
+
+  // ---- NODE_TLS_REJECT_UNAUTHORIZED=0 warning ---------------------------------
+  // node lib/internal/process/pre_execution.js initializeReport/…: when the
+  // variable is set to '0', node emits this warning once at startup, before any
+  // connection is made, so the operator is told that verification is off. The
+  // wording is node's verbatim.
+  try {
+    if (G.process && G.process.env && G.process.env.NODE_TLS_REJECT_UNAUTHORIZED === "0" &&
+        typeof G.process.emitWarning === "function" && !G.__mbunTlsRejectUnauthorizedWarned) {
+      G.__mbunTlsRejectUnauthorizedWarned = true;
+      G.process.emitWarning(
+        "Setting the NODE_TLS_REJECT_UNAUTHORIZED environment variable to " +
+        "'0' makes TLS connections and HTTPS requests insecure by disabling " +
+        "certificate verification.");
+    }
+  } catch (e) {}
 })();
 )JS";
 

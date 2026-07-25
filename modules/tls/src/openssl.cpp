@@ -244,9 +244,16 @@ struct TlsChannel::Impl {
         // An impossible window (min > max) is not rejected here — SSL_do_handshake
         // surfaces it as SSL_R_NO_SUPPORTED_VERSIONS_ENABLED, which fail_()
         // translates to error.code for node parity.
-        ::SSL_CTX_set_min_proto_version(ctx_,
-                                        config.minVersion != 0 ? config.minVersion : TLS1_2_VERSION);
-        if (config.maxVersion != 0) {
+        // minVersion == -1 is "explicitly unpinned" (the caller passed
+        // secureProtocol): leave the method's own range alone, exactly as node's
+        // SecureContext::Init does when it is handed min=max=0. Anything else
+        // pins, with node's TLS 1.2 floor when nothing was requested.
+        if (config.minVersion > 0) {
+            ::SSL_CTX_set_min_proto_version(ctx_, config.minVersion);
+        } else if (config.minVersion == 0) {
+            ::SSL_CTX_set_min_proto_version(ctx_, TLS1_2_VERSION);
+        }
+        if (config.maxVersion > 0) {
             ::SSL_CTX_set_max_proto_version(ctx_, config.maxVersion);
         }
         // An impossible window (min > max) makes SSL_do_handshake fail. OpenSSL's
@@ -664,6 +671,219 @@ std::string TlsChannel::alpn_protocol() const {
     return (data != nullptr && len > 0)
                ? std::string {reinterpret_cast<const char*>(data), len}
                : std::string {};
+}
+
+std::vector<std::string> TlsChannel::peer_certificate_chain_pem() const {
+    std::vector<std::string> out {};
+    if (impl_->ssl_ == nullptr) {
+        return out;
+    }
+    const auto pem_of = [](X509* cert) -> std::string {
+        std::string s {};
+        if (BIO* bio {::BIO_new(::BIO_s_mem())}) {
+            if (::PEM_write_bio_X509(bio, cert) == 1) {
+                char* data {nullptr};
+                const long n {::BIO_get_mem_data(bio, &data)};
+                if (data != nullptr && n > 0) {
+                    s.assign(data, static_cast<std::size_t>(n));
+                }
+            }
+            ::BIO_free(bio);
+        }
+        return s;
+    };
+    // Client side: SSL_get_peer_cert_chain() does NOT include the leaf, so it is
+    // prepended from SSL_get_peer_certificate(). Server side it already does.
+    X509* leaf {::SSL_get_peer_certificate(impl_->ssl_)};
+    STACK_OF(X509)* chain {::SSL_get_peer_cert_chain(impl_->ssl_)};
+    const bool chainHasLeaf {
+        chain != nullptr && leaf != nullptr && sk_X509_num(chain) > 0
+        && ::X509_cmp(sk_X509_value(chain, 0), leaf) == 0};
+    if (leaf != nullptr && !chainHasLeaf) {
+        std::string s {pem_of(leaf)};
+        if (!s.empty()) {
+            out.push_back(std::move(s));
+        }
+    }
+    if (chain != nullptr) {
+        for (int i {0}; i < sk_X509_num(chain); ++i) {
+            X509* c {sk_X509_value(chain, i)};
+            if (c == nullptr) {
+                continue;
+            }
+            std::string s {pem_of(c)};
+            if (!s.empty()) {
+                out.push_back(std::move(s));
+            }
+        }
+    }
+    if (leaf != nullptr) {
+        ::X509_free(leaf);
+    }
+    return out;
+}
+
+std::vector<std::uint8_t> TlsChannel::finished() const {
+    std::vector<std::uint8_t> out {};
+    if (impl_->ssl_ == nullptr || !established()) {
+        return out;
+    }
+    // A zero-size call reports the length of the stored Finished message.
+    const std::size_t len {::SSL_get_finished(impl_->ssl_, nullptr, 0)};
+    if (len == 0) {
+        return out;
+    }
+    out.resize(len);
+    const std::size_t got {::SSL_get_finished(impl_->ssl_, out.data(), out.size())};
+    out.resize(got);
+    return out;
+}
+
+std::vector<std::uint8_t> TlsChannel::peer_finished() const {
+    std::vector<std::uint8_t> out {};
+    if (impl_->ssl_ == nullptr || !established()) {
+        return out;
+    }
+    const std::size_t len {::SSL_get_peer_finished(impl_->ssl_, nullptr, 0)};
+    if (len == 0) {
+        return out;
+    }
+    out.resize(len);
+    const std::size_t got {::SSL_get_peer_finished(impl_->ssl_, out.data(), out.size())};
+    out.resize(got);
+    return out;
+}
+
+std::vector<std::uint8_t> TlsChannel::export_keying_material(
+    std::size_t length, std::string_view label, std::span<const std::uint8_t> context,
+    bool useContext) const {
+    std::vector<std::uint8_t> out {};
+    if (impl_->ssl_ == nullptr || !established() || length == 0) {
+        return out;
+    }
+    out.resize(length);
+    const int rc {::SSL_export_keying_material(
+        impl_->ssl_, out.data(), out.size(), label.data(), label.size(),
+        context.empty() ? nullptr : context.data(), context.size(),
+        useContext ? 1 : 0)};
+    if (rc != 1) {
+        ::ERR_clear_error();
+        out.clear();
+    }
+    return out;
+}
+
+std::string check_key_cert_pair(std::string_view certPem, std::string_view keyPem,
+                                std::string_view passphrase) {
+    ensure_library();
+    ::ERR_clear_error();
+    SSL_CTX* ctx {::SSL_CTX_new(::TLS_server_method())};
+    if (ctx == nullptr) {
+        return "unable to create SSL context";
+    }
+    std::string reason {};
+    const auto finish = [&](std::string r) {
+        reason = std::move(r);
+        ::SSL_CTX_free(ctx);
+        ::ERR_clear_error();
+        return reason;
+    };
+    if (!certPem.empty()) {
+        BIO* bio {::BIO_new_mem_buf(certPem.data(), static_cast<int>(certPem.size()))};
+        X509* cert {bio != nullptr ? ::PEM_read_bio_X509(bio, nullptr, nullptr, nullptr) : nullptr};
+        const bool ok {cert != nullptr && ::SSL_CTX_use_certificate(ctx, cert) == 1};
+        if (cert != nullptr) {
+            ::X509_free(cert);
+        }
+        if (bio != nullptr) {
+            ::BIO_free(bio);
+        }
+        if (!ok) {
+            return finish(drain_openssl_errors());
+        }
+    }
+    if (!keyPem.empty()) {
+        BIO* bio {::BIO_new_mem_buf(keyPem.data(), static_cast<int>(keyPem.size()))};
+        std::string pass {passphrase};
+        EVP_PKEY* key {
+            bio != nullptr
+                ? ::PEM_read_bio_PrivateKey(bio, nullptr, nullptr,
+                                            pass.empty() ? nullptr : pass.data())
+                : nullptr};
+        const bool ok {key != nullptr && ::SSL_CTX_use_PrivateKey(ctx, key) == 1};
+        if (key != nullptr) {
+            ::EVP_PKEY_free(key);
+        }
+        if (bio != nullptr) {
+            ::BIO_free(bio);
+        }
+        if (!ok) {
+            return finish(drain_openssl_errors());
+        }
+    }
+    return finish({});
+}
+
+std::vector<std::string> platform_root_certificates() {
+    ensure_library();
+    static constexpr std::string_view bundleFiles[] {
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+        "/etc/ssl/ca-bundle.pem",
+        "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+        "/etc/ssl/cert.pem",
+    };
+    std::vector<std::string> out {};
+    std::string path {};
+    if (const char* file {std::getenv("SSL_CERT_FILE")}; file != nullptr && *file != '\0') {
+        path = file;
+    }
+    std::error_code ec {};
+    if (path.empty() || !std::filesystem::exists(path, ec)) {
+        path.clear();
+        for (std::string_view candidate : bundleFiles) {
+            if (std::filesystem::exists(candidate, ec)) {
+                path = std::string {candidate};
+                break;
+            }
+        }
+    }
+    if (path.empty()) {
+        return out;
+    }
+    BIO* bio {::BIO_new_file(path.c_str(), "r")};
+    if (bio == nullptr) {
+        ::ERR_clear_error();
+        return out;
+    }
+    X509* cert {nullptr};
+    while ((cert = ::PEM_read_bio_X509(bio, nullptr, nullptr, nullptr)) != nullptr) {
+        if (BIO* mem {::BIO_new(::BIO_s_mem())}) {
+            if (::PEM_write_bio_X509(mem, cert) == 1) {
+                char* data {nullptr};
+                const long n {::BIO_get_mem_data(mem, &data)};
+                if (data != nullptr && n > 0) {
+                    // node's rootCertificates entries carry no trailing newline
+                    // (test-tls-root-certificates asserts each ends with
+                    // "\n-----END CERTIFICATE-----").
+                    std::string pem {data, static_cast<std::size_t>(n)};
+                    while (!pem.empty() && (pem.back() == '\n' || pem.back() == '\r')) {
+                        pem.pop_back();
+                    }
+                    out.push_back(std::move(pem));
+                }
+            }
+            ::BIO_free(mem);
+        }
+        ::X509_free(cert);
+    }
+    ::BIO_free(bio);
+    ::ERR_clear_error();
+    // Duplicates must collapse: the store may list the same root twice and
+    // test-tls-root-certificates asserts length == new Set(...).size.
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
 }
 
 std::optional<CertKeyPem> make_self_signed(std::string_view commonName) {

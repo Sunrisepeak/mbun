@@ -329,6 +329,32 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
   // the JS context stores the validated + normalized options and, when a cert
   // PEM is supplied, validates it through the OpenSSL X509 bridge so a malformed
   // certificate is rejected here rather than silently at connect time.
+  // The native context object's shape. `_external` is node's accessor for the
+  // wrapped SSL_CTX pointer; node's accessor asserts on `this`, so reading it off
+  // an object that merely INHERITS from a context is a TypeError while reading it
+  // off the context itself is fine (test-tls-external-accessor).
+  const kContextBrand = Symbol("kNativeSecureContext");
+  const SecureContextHandle = {};
+  Object.defineProperty(SecureContextHandle, "_external", {
+    configurable: true,
+    enumerable: false,
+    get() {
+      if (this === null || this === undefined || !Object.hasOwn(this, kContextBrand))
+        throw new TypeError("Illegal invocation");
+      return null;
+    },
+  });
+  const pemText = (v) => {
+    if (v == null) return "";
+    if (Array.isArray(v)) return v.map(pemText).join("\n");
+    if (typeof v === "string") return v;
+    if (v && typeof v.pem === "string") return v.pem;
+    if (ArrayBuffer.isView(v) || v instanceof ArrayBuffer) {
+      try { return Buffer.from(v.buffer ? v.buffer : v, v.byteOffset || 0, v.byteLength).toString("utf8"); }
+      catch (e) { return ""; }
+    }
+    return "";
+  };
   function newNativeSecureContext(options) {
     options = options == null ? {} : options;
     if (asym && typeof asym.x509parse === "function") {
@@ -337,16 +363,46 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
         try { asym.x509parse(cert); } catch (e) { /* leave to connect-time */ }
       }
     }
+    // node SecureContext::SetCert/SetKey run at createSecureContext() time, so a
+    // certificate whose key does not match it — or an encrypted key with the
+    // wrong passphrase — throws HERE, carrying OpenSSL's own reason string.
+    // ref test-tls-key-mismatch, test-tls-passphrase.
+    const TN = globalThis.__mbunNodeTlsNative;
+    if (TN && typeof TN.checkKeyCert === "function" && (options.cert || options.key)) {
+      const certPem = pemText(options.cert);
+      const keyPem = pemText(options.key);
+      if (certPem.indexOf("BEGIN") !== -1 || keyPem.indexOf("BEGIN") !== -1) {
+        let reason = "";
+        try {
+          reason = TN.checkKeyCert(certPem, keyPem,
+                                   typeof options.passphrase === "string" ? options.passphrase : "");
+        } catch (e) { reason = ""; }
+        if (typeof reason === "string" && reason !== "") {
+          // OpenSSL's packed reason string is what node surfaces verbatim; the
+          // node-style code is derived from it the same way ThrowCryptoError does.
+          const first = reason.split("; ")[0];
+          const err = new Error(first);
+          const parts = first.split(":");
+          if (parts.length >= 5) {
+            err.library = parts[2];
+            err.reason = parts[4];
+            err.code = "ERR_OSSL_" + parts[4].replace(/[ .]/g, "_").toUpperCase();
+          }
+          throw err;
+        }
+      }
+    }
     const min = options.minVersion != null ? options.minVersion : DEFAULT_MIN_VERSION;
     const max = options.maxVersion != null ? options.maxVersion : DEFAULT_MAX_VERSION;
     const cas = [];
-    return {
-      __mbunSecureContext: true,
-      minVersion: min,
-      maxVersion: max,
-      _cas: cas,
-      addCACert(pem) { cas.push(pem); },
-    };
+    const handle = Object.create(SecureContextHandle);
+    Object.defineProperty(handle, kContextBrand, { value: true, enumerable: false });
+    handle.__mbunSecureContext = true;
+    handle.minVersion = min;
+    handle.maxVersion = max;
+    handle._cas = cas;
+    handle.addCACert = (pem) => { cas.push(pem); };
+    return handle;
   }
 
   const InternalSecureContext = class SecureContext {
@@ -526,7 +582,22 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
   // ---- rootCertificates (immutable). DEFERRED: full Mozilla NSS root bundle
   // (getBundledRootCertificates in NodeTLS.cpp). Seeded with a real, valid X509
   // root in PEM so the export is a non-empty, frozen array of well-formed PEM. ----
-  const rootCertificates = Object.freeze([
+  // node answers tls.rootCertificates from its vendored Mozilla NSS bundle
+  // (src/node_root_certs.h). mbun vendors no bundle, so it reports the platform
+  // trust store it actually verifies chains against (__mbunNodeTlsNative
+  // .rootCertificates reads the same file configure_default_trust_ loads). This
+  // only *reports* what is already trusted — it adds nothing to the store, and a
+  // store that cannot be read falls back to the single embedded PEM below rather
+  // than to an empty (and therefore silently permissive-looking) list.
+  const nativeRoots = (() => {
+    if (!tlsNative || typeof tlsNative.rootCertificates !== "function") return null;
+    try {
+      const r = tlsNative.rootCertificates();
+      if (Array.isArray(r) && r.length > 0) return Object.freeze(r);
+    } catch (e) {}
+    return null;
+  })();
+  const fallbackRootCertificates = Object.freeze([
     "-----BEGIN CERTIFICATE-----\n" +
     "MIIFCzCCA3OgAwIBAgIQBg0eUuH8A64LETs9IrQIbzANBgkqhkiG9w0BAQsFADCB\n" +
     "nTEeMBwGA1UEChMVbWtjZXJ0IGRldmVsb3BtZW50IENBMTkwNwYDVQQLDDBsdWR2\n" +
@@ -557,6 +628,7 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
     "8iyfiWz4jpOK9oBhqGsJLooaU4TXLzfMXYWyIjOOIoZX3QECUFQ4Zw3rJ9oV1A8=\n" +
     "-----END CERTIFICATE-----",
   ]);
+  const rootCertificates = nativeRoots || fallbackRootCertificates;
 
   // ---- honest DEFERRED throw for the live socket/handshake surface ----
   function deferredTLS(what) {
@@ -637,18 +709,44 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
   // tls.setDefaultCACertificates() replaces the 'default' store only; 'bundled'
   // and 'system' keep reporting the built-in bundle (node parity).
   let _defaultCAs = null;
+  // node's getCACertificates(type) runs validateString(type, 'type') FIRST, so a
+  // non-string is ERR_INVALID_ARG_TYPE and only an unrecognised *string* is
+  // ERR_INVALID_ARG_VALUE (test-tls-get-ca-certificates-error asserts both).
+  let _extraCAs = null;
   function getCACertificates(type) {
     const t = type === undefined ? "default" : type;
+    if (typeof t !== "string") throw ERR_INVALID_ARG_TYPE("type", "string", t);
     if (t === "default") {
       if (_defaultCAs !== null) return _defaultCAs;
       if (_caCache === null) _caCache = Object.freeze(rootCertificates.slice());
       return _caCache;
     }
-    if (t === "system" || t === "bundled") {
+    // 'bundled' is node's built-in store, and node asserts it is the very same
+    // array object as tls.rootCertificates (test-tls-get-ca-certificates-bundled
+    // compares by reference), so hand back the frozen bundle itself.
+    if (t === "bundled") return rootCertificates;
+    if (t === "system") {
       if (_caCache === null) _caCache = Object.freeze(rootCertificates.slice());
       return _caCache;
     }
-    if (t === "extra") return Object.freeze([]);
+    // 'extra' is what NODE_EXTRA_CA_CERTS added, i.e. nothing when it is unset.
+    if (t === "extra") {
+      if (_extraCAs === null) {
+        const blocks = [];
+        try {
+          const path = G.process && G.process.env && G.process.env.NODE_EXTRA_CA_CERTS;
+          if (path) {
+            const fs = M["fs"] || M["node:fs"];
+            const text = fs && typeof fs.readFileSync === "function"
+              ? String(fs.readFileSync(path, "utf8")) : "";
+            const found = text.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g);
+            if (found) for (const b of found) blocks.push(b);
+          }
+        } catch (e) {}
+        _extraCAs = Object.freeze(blocks);
+      }
+      return _extraCAs;
+    }
     const e = new TypeError("The argument 'type' must be one of: 'default', 'system', 'bundled', 'extra'. Received " + JSON.stringify(type));
     e.code = "ERR_INVALID_ARG_VALUE";
     throw e;

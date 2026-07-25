@@ -104,11 +104,44 @@ inline JSValueRef node_tls_check_cipher_list_cb(JSContextRef ctx, JSObjectRef, J
     return JSValueMakeBoolean(ctx, ok);
 }
 
+// __mbunNodeTlsNative.rootCertificates() → string[] of PEM certificates from the
+// platform trust store — the store mbun actually verifies chains against. node
+// answers tls.rootCertificates from its vendored Mozilla NSS bundle
+// (src/node_root_certs.h); mbun has no vendored bundle, so reporting the live
+// store is the only honest answer. This READS the store, it never adds to it, so
+// no chain becomes trusted that was not already.
+inline JSValueRef node_tls_root_certificates_cb(JSContextRef ctx, JSObjectRef, JSObjectRef,
+                                                std::size_t, const JSValueRef[], JSValueRef*) {
+    const std::vector<std::string> roots{mbun::tls::platform_root_certificates()};
+    std::vector<JSValueRef> out;
+    out.reserve(roots.size());
+    for (const std::string& pem : roots) out.push_back(make_string(ctx, pem));
+    return JSObjectMakeArray(ctx, out.size(), out.empty() ? nullptr : out.data(), nullptr);
+}
+
+// __mbunNodeTlsNative.checkKeyCert(certPem, keyPem, passphrase) → "" when the
+// pair loads, else the OpenSSL reason string. node's SecureContext::SetKey /
+// SetCert fail at createSecureContext() time on a mismatched pair or a wrong
+// passphrase (test-tls-key-mismatch, test-tls-passphrase); without this the
+// mismatch only surfaced as a handshake failure much later.
+inline JSValueRef node_tls_check_key_cert_cb(JSContextRef ctx, JSObjectRef, JSObjectRef,
+                                             std::size_t argc, const JSValueRef argv[],
+                                             JSValueRef*) {
+    const std::string cert{argc > 0 ? val_to_string(ctx, argv[0]) : std::string{}};
+    const std::string key{argc > 1 ? val_to_string(ctx, argv[1]) : std::string{}};
+    const std::string pass{argc > 2 && JSValueIsString(ctx, argv[2])
+                               ? val_to_string(ctx, argv[2])
+                               : std::string{}};
+    return make_string(ctx, mbun::tls::check_key_cert_pair(cert, key, pass));
+}
+
 // Install globalThis.__mbunNodeTlsNative. Called once from engine init.
 inline void install_node_tls_native(JSContextRef ctx, JSObjectRef global) {
     JSObjectRef tn{JSObjectMake(ctx, nullptr, nullptr)};
     set_fn(ctx, tn, "getCiphers", node_tls_get_ciphers_cb);
     set_fn(ctx, tn, "checkCipherList", node_tls_check_cipher_list_cb);
     set_fn(ctx, tn, "canonicalizeIP", node_tls_canonicalize_ip_cb);
+    set_fn(ctx, tn, "rootCertificates", node_tls_root_certificates_cb);
+    set_fn(ctx, tn, "checkKeyCert", node_tls_check_key_cert_cb);
     set_prop(ctx, global, "__mbunNodeTlsNative", tn);
 }
