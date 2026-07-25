@@ -2798,6 +2798,8 @@ export constexpr std::string_view kNetJS = R"JS(
     const RequestClass = typeof o.IncomingMessage === "function" ? o.IncomingMessage : IncomingMessage;
     // lib/_http_server.js storeHTTPOptions.
     const HI = G.__mbunHttpInternals || {};
+    const freeParser = typeof HI.freeParser === "function" ? HI.freeParser : null;
+    const clearIncoming = typeof HI.clearIncoming === "function" ? HI.clearIncoming : null;
     const vInt = HI.validateInteger || (() => {});
     const vBool = HI.validateBoolean || (() => {});
     const oor = HI.ERR_OUT_OF_RANGE || ((name, range, v) => { const e = new RangeError(name); e.code = "ERR_OUT_OF_RANGE"; return e; });
@@ -2852,12 +2854,23 @@ export constexpr std::string_view kNetJS = R"JS(
         sock.destroy();
       }
     };
-    srv.on("listening", () => {
-      if (srv._httpSweeper) G.clearInterval(srv._httpSweeper);
+    // node lib/_http_server.js setupConnectionsTracking is called from the
+    // 'listening' handler and parks the handle on the server under
+    // kConnectionsCheckingInterval; re-arming destroys the previous one, and
+    // close() destroys the live one. Three corpus files assert `_destroyed` on
+    // that exact handle, so it must be the published property, not a private
+    // field (test-http-server-clear-timer even emits 'listening' by hand twice
+    // on a server that never bound).
+    const kCCI = HI.kConnectionsCheckingInterval || Symbol("connectionsCheckingInterval");
+    const setupConnectionsTracking = () => {
+      if (srv[kCCI]) G.clearInterval(srv[kCCI]);
       const every = srv.connectionsCheckingInterval > 0 ? srv.connectionsCheckingInterval : 30000;
-      srv._httpSweeper = G.setInterval(sweep, every);
-      if (srv._httpSweeper && typeof srv._httpSweeper.unref === "function") srv._httpSweeper.unref();
-    });
+      const h = G.setInterval(sweep, every);
+      if (h && typeof h.unref === "function") h.unref();
+      srv[kCCI] = h;
+      srv._httpSweeper = h;
+    };
+    srv.on("listening", setupConnectionsTracking);
     srv.setTimeout = function (msecs, cb) {
       this.timeout = msecs;
       if (typeof cb === "function") this.on("timeout", cb);
@@ -2886,7 +2899,8 @@ export constexpr std::string_view kNetJS = R"JS(
     const netClose = srv.close;
     srv.close = function (...args) {
       this.closeIdleConnections();
-      if (this._httpSweeper) { G.clearInterval(this._httpSweeper); this._httpSweeper = null; }
+      if (this[kCCI]) G.clearInterval(this[kCCI]);
+      this._httpSweeper = null;
       return netClose.apply(this, args);
     };
     // node http.Server.listen fires its callback with (err, hostname, port),
@@ -2921,7 +2935,26 @@ export constexpr std::string_view kNetJS = R"JS(
       sock.server = srv;
       sock.on("error", () => {});
       srv._httpConns.add(sock);
-      sock.once("close", () => srv._httpConns.delete(sock));
+      sock.once("close", () => {
+        srv._httpConns.delete(sock);
+        // node lib/_http_server.js socketOnClose -> freeParser(parser, null,
+        // null). The corpus overwrites `parser.free` to observe exactly this
+        // (test-http-server-connection-list-when-close).
+        // Deferred one turn on purpose. node's socketOnClose reaches freeParser
+        // after the incoming message has already ended, because its socket-close
+        // and its readable-end orderings differ from this reactor's: here a peer
+        // FIN can close the socket before the buffered request body has been
+        // drained, and freeing eagerly would blank `req.socket.parser` out from
+        // under a still-pending 'end' handler (test-http-server-keepalive-end
+        // reads parser.incoming from exactly there).
+        if (freeParser && sock.parser) {
+          const p = sock.parser;
+          const later = () => freeParser(p, null, sock);
+          if (typeof G.setImmediate === "function") G.setImmediate(later);
+          else if (G.process && typeof G.process.nextTick === "function") G.process.nextTick(later);
+          else later();
+        }
+      });
       if (srv.timeout) { try { sock.setTimeout(srv.timeout); } catch (e) {} }
       sock.server = srv;
       sock._httpInFlight = 0;
@@ -2973,6 +3006,20 @@ export constexpr std::string_view kNetJS = R"JS(
         }
         if (typeof srv.maxHeaderSize === "number" && srv.maxHeaderSize > 0) parser.maxHeaderSize = srv.maxHeaderSize;
         sock._httpParser = parser;
+        // node keeps ONE parser per connection and republishes it as
+        // `socket.parser`; this translation re-arms a fresh parser per message,
+        // so the first one is pinned as the connection's public parser and the
+        // per-message `incoming`/`outgoing` slots are mirrored onto it. That
+        // keeps the identity the corpus depends on (`req.socket.parser` observed
+        // in one request must still be the object freeParser later touches).
+        if (!sock.parser) {
+          sock.parser = parser;
+          if (typeof parser.free !== "function") parser.free = function () {};
+          if (typeof parser.close !== "function") parser.close = function () {};
+          parser.socket = sock;
+          parser.incoming = null;
+          parser.outgoing = null;
+        }
         let im = null;
         let res = null;
         let upgraded = false;
@@ -2988,7 +3035,19 @@ export constexpr std::string_view kNetJS = R"JS(
           if (im && !im._consuming && !(im._readableState && im._readableState.resumeScheduled)) im._dump();
           if (sock._httpMessage === res) res.detachSocket(sock);
           sock._httpIncoming = null;
-          G.queueMicrotask(() => { if (!res._closed) { res._closed = true; res.emit("close"); } });
+          // node lib/_http_server.js resOnFinish -> clearIncoming(req): release
+          // the parser's reference to the finished message, but only once the
+          // message has actually ended (otherwise defer to its 'end').
+          if (clearIncoming && im) { try { clearIncoming(im); } catch (e) {} }
+          // node lib/_http_server.js emitCloseNT sets `destroyed` as well as
+          // `_closed`. That flag is load-bearing: OutgoingMessage.write() on a
+          // *destroyed* message reports ERR_STREAM_WRITE_AFTER_END through the
+          // write callback only, while on a merely-finished one it also emits
+          // 'error' — and test-http-server-write-{,end-}after-end installs
+          // res.on('error', mustNotCall()) and writes from a setImmediate.
+          const closeNT = () => { if (!res._closed) { res.destroyed = true; res._closed = true; res.emit("close"); } };
+          if (G.process && typeof G.process.nextTick === "function") G.process.nextTick(closeNT);
+          else G.queueMicrotask(closeNT);
           if (res._last) {
             if (typeof sock.destroySoon === "function") sock.destroySoon();
             else sock.end();
@@ -3019,6 +3078,7 @@ export constexpr std::string_view kNetJS = R"JS(
           if (typeof sock.setTimeout === "function") { try { sock.setTimeout(srv.timeout || 0); } catch (e) {} }
           im = new RequestClass(sock);
           sock._httpIncoming = im;
+          if (sock.parser) { sock.parser.incoming = im; im.parser = sock.parser; }
           im.method = parser.method;
           im.url = parser.target;
           im.httpVersion = parser.httpVersion;
@@ -3058,6 +3118,7 @@ export constexpr std::string_view kNetJS = R"JS(
           res._maxRequestsPerSocket = srv.maxRequestsPerSocket;
           res.shouldKeepAlive = keepAlive;
           res.req = im;
+          if (sock.parser) sock.parser.outgoing = res;
           if (sock._httpMessage) outgoing.push(res);
           else res.assignSocket(sock);
           res.on("finish", resOnFinish);
