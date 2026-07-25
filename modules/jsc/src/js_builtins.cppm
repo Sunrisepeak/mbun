@@ -30,6 +30,7 @@ export import :node_stream_iter_pull;
 export import :node_stream_iter_multi;
 export import :node_stream_iter_classic;
 export import :node_stream_iter_entry;
+export import :node_zlib_iter;
 export import :zlib_stream;
 export import :crypto_asym;
 export import :node_os;
@@ -114,6 +115,9 @@ export inline const std::string kNodeBuiltinsJS =
         .append(detail::kNodeStreamIterMultiJS)
         .append(detail::kNodeStreamIterClassicJS)
         .append(detail::kNodeStreamIterEntryJS)
+        // node:zlib/iter — same flag, same registry; needs node:zlib registered
+        // for process.binding("constants").zlib, which bootstrap already did.
+        .append(detail::kNodeZlibIterJS)
         .append(detail::kCryptoAsymJS)
         .append(detail::kZlibStreamJS)
         .append(detail::kNodeOsJS)

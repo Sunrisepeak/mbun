@@ -109,6 +109,11 @@ inline constexpr std::string_view kNodeStreamCoreJS = R"JS(
   // node errors.js:1646 `E('ERR_OPERATION_FAILED', 'Operation failed: %s', Error,
   // TypeError)`; stream/iter wraps a thrown non-Error in the TypeError variant.
   const $ERR_OPERATION_FAILED = (msg) => mk(TypeError, "ERR_OPERATION_FAILED", `Operation failed: ${msg}`);
+  // zlib/iter's option validation (internal/streams/iter/transform); text from
+  // node errors.js:1143 / :1959 and lib/zlib.js's initialization failure.
+  const $ERR_BROTLI_INVALID_PARAM = (key) => mk(RangeError, "ERR_BROTLI_INVALID_PARAM", `${key} is not a valid Brotli parameter`);
+  const $ERR_ZSTD_INVALID_PARAM = (key) => mk(RangeError, "ERR_ZSTD_INVALID_PARAM", `${key} is not a valid zstd parameter`);
+  const $ERR_ZLIB_INITIALIZATION_FAILED = () => mk(Error, "ERR_ZLIB_INITIALIZATION_FAILED", "Initialization failed");
   const $ERR_INVALID_RETURN_VALUE = (input, name, value) =>
     mk(TypeError, "ERR_INVALID_RETURN_VALUE",
       `Expected ${input} to be returned from the "${name}" function but got ${specific(value)}.`);
@@ -206,6 +211,8 @@ inline constexpr std::string_view kNodeStreamCoreJS = R"JS(
     // stream/iter (internal/streams/iter/*)
     $ERR_INVALID_ARG_VALUE_RangeError, $ERR_INVALID_STATE, $ERR_INVALID_STATE_TypeError,
     $ERR_INVALID_STATE_RangeError, $ERR_OPERATION_FAILED,
+    // zlib/iter (internal/streams/iter/transform)
+    $ERR_BROTLI_INVALID_PARAM, $ERR_ZSTD_INVALID_PARAM, $ERR_ZLIB_INITIALIZATION_FAILED,
   };
   G.__mbunStreamReg = { def: (id, fn) => { __mods[id] = fn; }, require: __req, H };
 
@@ -230,8 +237,23 @@ inline constexpr std::string_view kNodeStreamCoreJS = R"JS(
       throw $ERR_INVALID_ARG_VALUE(name, value, "must be one of: " + allowed);
     }
   };
+  // node validators.js:614 — false for undefined/NaN, true for a finite number,
+  // ERR_INVALID_ARG_TYPE for a non-number, ERR_OUT_OF_RANGE for ±Infinity.
+  const validateFiniteNumber = (number, name) => {
+    if (number === undefined) return false;
+    if (Number.isFinite(number)) return true;
+    if (Number.isNaN(number)) return false;
+    if (typeof number !== "number") throw $ERR_INVALID_ARG_TYPE(name, "number", number);
+    throw $ERR_OUT_OF_RANGE(name, "a finite number", number);
+  };
+  // node validators.js:639.
+  const checkRangesOrGetDefault = (number, name, lower, upper, def) => {
+    if (!validateFiniteNumber(number, name)) return def;
+    if (number < lower || number > upper) throw $ERR_OUT_OF_RANGE(name, `>= ${lower} and <= ${upper}`, number);
+    return number;
+  };
   __mods["internal/validators"] = (req, module) => {
-    module.exports = { validateFunction, validateAbortSignal, validateBoolean, validateObject, validateInteger, validateOneOf };
+    module.exports = { validateFunction, validateAbortSignal, validateBoolean, validateObject, validateInteger, validateOneOf, validateFiniteNumber, checkRangesOrGetDefault };
   };
   __mods["internal/shared"] = (req, module) => {
     const kEmptyObject = Object.freeze(Object.create(null));
