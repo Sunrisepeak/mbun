@@ -49,6 +49,21 @@ inline constexpr std::string_view kNodeFsStreamsJS = R"JS(
   const kIsPerformingIO = Symbol("kIsPerformingIO");
   const kIoDone = Symbol("kIoDone");
 
+  // node's ReadStream._read routes a read failure through errorOrDestroy, which
+  // only destroys when autoDestroy is set. Calling this.destroy(er) outright
+  // closed a stream created with { autoClose: false } — the corpus asserts the
+  // opposite (test-fs-read-stream, test-fs-read-stream-inherit: after the EBADF
+  // from { fd: 13337, autoClose: false } the stream must still hold its fd).
+  const streamErrorOrDestroy = (stream, er) => {
+    const st = stream._readableState || stream._writableState;
+    if (st && st.autoDestroy === false) {
+      if (st.errored == null) st.errored = er;
+      stream.emit("error", er);
+      return;
+    }
+    stream.destroy(er);
+  };
+
   const notImplemented = (what) => {
     const e = new Error("The " + what + " method is not implemented");
     e.code = "ERR_METHOD_NOT_IMPLEMENTED";
@@ -66,7 +81,13 @@ inline constexpr std::string_view kNodeFsStreamsJS = R"JS(
     if (options.signal !== undefined &&
         (options.signal === null || typeof options.signal !== "object" || !("aborted" in options.signal)))
       throw argTypeErr("options.signal", "an instance of AbortSignal", options.signal);
-    return Object.assign({}, options);
+    // node's copyObject is a `for (const key in source)` loop, which walks the
+    // prototype chain; Object.assign copies OWN properties only, so
+    // `createReadStream(f, { __proto__: { start: 1, end: 2 } })` silently lost
+    // start/end/encoding (test-fs-read-stream-inherit).
+    const copy = {};
+    for (const key in options) copy[key] = options[key];
+    return copy;
   }
 
   const getValidatedFd = (fd) => { validateInteger(fd, "fd", 0, 2147483647); return fd; };
@@ -184,9 +205,24 @@ inline constexpr std::string_view kNodeFsStreamsJS = R"JS(
   }
   Object.setPrototypeOf(ReadStream.prototype, Readable.prototype);
   Object.setPrototypeOf(ReadStream, Readable);
+  // node's autoClose accessors brand-check `this`: reading
+  // fs.WriteStream.prototype.autoClose (no instance state) is ERR_INVALID_THIS,
+  // not a bare "undefined is not an object" TypeError
+  // (test-fs-write-stream-autoclose-option).
+  const streamInvalidThis = (type) => {
+    const e = new TypeError('Value of "this" must be of type ' + type);
+    e.code = "ERR_INVALID_THIS";
+    return e;
+  };
   Object.defineProperty(ReadStream.prototype, "autoClose", {
-    get() { return this._readableState.autoDestroy; },
-    set(v) { this._readableState.autoDestroy = v; },
+    get() {
+      if (this == null || this._readableState == null) throw streamInvalidThis("ReadStream");
+      return this._readableState.autoDestroy;
+    },
+    set(v) {
+      if (this == null || this._readableState == null) throw streamInvalidThis("ReadStream");
+      this._readableState.autoDestroy = v;
+    },
     configurable: true,
   });
   ReadStream.prototype._construct = _construct;
@@ -199,7 +235,7 @@ inline constexpr std::string_view kNodeFsStreamsJS = R"JS(
     this[kFs].read(this.fd, buf, 0, n, this.pos, (er, bytesRead, b) => {
       this[kIsPerformingIO] = false;
       if (this.destroyed) { this.emit(kIoDone, er); return; }
-      if (er) { this.destroy(er); return; }
+      if (er) { streamErrorOrDestroy(this, er); return; }
       if (bytesRead > 0) {
         if (this.pos !== undefined) this.pos += bytesRead;
         this.bytesRead += bytesRead;
@@ -261,8 +297,14 @@ inline constexpr std::string_view kNodeFsStreamsJS = R"JS(
   Object.setPrototypeOf(WriteStream.prototype, Writable.prototype);
   Object.setPrototypeOf(WriteStream, Writable);
   Object.defineProperty(WriteStream.prototype, "autoClose", {
-    get() { return this._writableState.autoDestroy; },
-    set(v) { this._writableState.autoDestroy = v; },
+    get() {
+      if (this == null || this._writableState == null) throw streamInvalidThis("WriteStream");
+      return this._writableState.autoDestroy;
+    },
+    set(v) {
+      if (this == null || this._writableState == null) throw streamInvalidThis("WriteStream");
+      this._writableState.autoDestroy = v;
+    },
     configurable: true,
   });
   WriteStream.prototype._construct = _construct;
