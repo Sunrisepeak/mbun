@@ -1650,6 +1650,25 @@ export constexpr std::string_view kNetJS = R"JS(
   // ---- HTTP response serialization (shared by Bun.serve and node:http) -------
   const STATUS_TEXT = { 100: "Continue", 101: "Switching Protocols", 200: "OK", 201: "Created", 202: "Accepted", 204: "No Content", 206: "Partial Content", 301: "Moved Permanently", 302: "Found", 303: "See Other", 304: "Not Modified", 307: "Temporary Redirect", 308: "Permanent Redirect", 400: "Bad Request", 401: "Unauthorized", 403: "Forbidden", 404: "Not Found", 405: "Method Not Allowed", 408: "Request Timeout", 409: "Conflict", 413: "Payload Too Large", 418: "I'm a Teapot", 422: "Unprocessable Entity", 429: "Too Many Requests", 500: "Internal Server Error", 501: "Not Implemented", 502: "Bad Gateway", 503: "Service Unavailable" };
   const statusText = (code) => STATUS_TEXT[code] || "";
+  // The reason phrase actually written to the status line.
+  //
+  // SECURITY — HTTP response splitting. `Response`'s statusText is stored verbatim
+  // (bun Response.rs:1440 fast_get_truthy + to_bun_string, no validation), so
+  // interpolating it straight into "HTTP/1.1 <status> <text>" let a CR/LF in
+  // attacker-influenced data terminate the status line and inject headers, a body,
+  // and a whole second response:
+  //   new Response("body", { statusText: "OK\r\nX-Injected: yes\r\n\r\n<html>" })
+  // reached the wire as two responses. Real bun never has this exposure because
+  // RequestContext.do_write_status ignores statusText entirely and writes its own
+  // HTTPStatusText table entry. Keep mbun's ability to echo a custom reason phrase,
+  // but restrict it to the RFC 9112 §4.1 reason-phrase production
+  // (HTAB / SP / VCHAR / obs-text) so no octet can close the line. A value carrying
+  // anything else falls back to the canonical text rather than being half-written.
+  const REASON_OK = /^[\t\x20-\x7e\x80-\xff]*$/;
+  const reasonPhrase = (res, status) => {
+    const t = res && res.statusText;
+    return (typeof t === "string" && t !== "" && REASON_OK.test(t)) ? t : statusText(status);
+  };
 
   // Drain a body value into an array of Uint8Array chunks. Supports strings,
   // (typed) arrays, Blob, our minimal ReadableStream (_chunks + optional pull),
@@ -1689,7 +1708,7 @@ export constexpr std::string_view kNetJS = R"JS(
   // Build the response head lines (minus framing) shared by the buffered and
   // streaming paths. framing = { chunked } or { contentLength }.
   const responseHeadLines = (res, status, framing, keepAlive) => {
-    const lines = ["HTTP/1.1 " + status + " " + (res.statusText || statusText(status))];
+    const lines = ["HTTP/1.1 " + status + " " + reasonPhrase(res, status)];
     let haveCT = false, haveDate = false;
     if (res.headers && typeof res.headers.forEach === "function") {
       res.headers.forEach((v, k) => {
@@ -1865,7 +1884,7 @@ export constexpr std::string_view kNetJS = R"JS(
     bodyChunks.then((chunks) => {
       const total = concatU8(chunks);
       const noBody = reqMethod === "HEAD" || status === 204 || status === 304;
-      const lines = ["HTTP/1.1 " + status + " " + (res.statusText || statusText(status))];
+      const lines = ["HTTP/1.1 " + status + " " + reasonPhrase(res, status)];
       // For a bodiless response (HEAD/204/304) the handler-supplied framing
       // headers (Content-Length / Transfer-Encoding) describe what the body
       // WOULD be and must be echoed verbatim rather than recomputed to 0
