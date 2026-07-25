@@ -19,7 +19,17 @@ ending. This file is what makes that recoverable.
   excluding self-skips, at commit `9d70bbf`. Run dir:
   `.claude/worktrees/wt5/target/integration/r12b`.
 
-## FIRST TASK ON RESUME — three items, in this order
+## FIRST TASK ON RESUME — four items, in this order
+
+-1. **bun green 868 -> 612 (-256), diagnosed, one-place fix.** The bun test
+   runner's settle check is blind to the new nextTick queue:
+   `test_runner.cppm:1258` and `:1358` await eight promise ticks and then declare
+   the test finished if `__mbunTimers.q.length === 0`. This round moved
+   `process.nextTick` out of `queueMicrotask` into its own queue drained at
+   callback boundaries, so awaiting promise ticks no longer advances it and work
+   parked there is invisible. 108 of 120 sampled lost files report exactly
+   `test timed out (no pending timers / unresolved async)` — that check's own
+   message. Worth more than every other pending item combined.
 
 0. **A 17x setImmediate performance regression, measured.** A 10 000-link
    setImmediate chain: **12ms before this round, 209ms after; real node does it
