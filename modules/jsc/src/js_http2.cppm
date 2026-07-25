@@ -2808,7 +2808,21 @@ export constexpr std::string_view kHttp2JS = R"JS(
       const p = Buffer.alloc(8); p.writeUInt32BE(this._lastStreamId > 0 ? this._lastStreamId : 0, 0); p.writeUInt32BE(0, 4);
       try { this._writeFrame(FRAME.GOAWAY, 0, 0, p); } catch (e) {}
       const self = this;
-      G.queueMicrotask(() => self._teardown(false));
+      G.queueMicrotask(() => self._maybeDestroy());
+    }
+    // node kMaybeDestroy: a graceful close lets the OPEN streams complete on
+    // their own and destroys the session only once the last one is gone. The
+    // server used to tear down on the next microtask instead, which truncated
+    // the response of any stream still in flight when server.close() ran
+    // (test-http2-graceful-close writes 1 MB after calling server.close()).
+    // Unlike the client, the server's stream map is only ever cleared by a
+    // stream destroy, so it is a valid gate on its own.
+    _maybeDestroy() {
+      if (this.destroyed) return;
+      if (!this.closed) return;
+      if (this.streams.size > 0) { this._destroyPending = true; return; }
+      this._destroyPending = false;
+      this._teardown(false);
     }
     destroy(err, code) { if (this.destroyed) return; if (err) { const self = this; this._teardown(); G.queueMicrotask(() => self.emit("error", err)); } else this._teardown(); }
     ref() { if (this.socket && this.socket.ref) this.socket.ref(); return this; }
@@ -3294,6 +3308,18 @@ export constexpr std::string_view kHttp2JS = R"JS(
     server._h2options = options || {};
     if (typeof onRequest === "function") server.on("request", onRequest);
     const self = server;
+    // node Http2Server#close(): `NETServer.prototype.close` THEN
+    // closeAllSessions(this) — closing the listener is not enough, the live
+    // sessions have to be told to shut down gracefully too, or an idle client
+    // keeps the connection (and the loop) alive forever
+    // (test-http2-server-close-idle-connection).
+    const sessions = new Set();
+    const netClose = server.close.bind(server);
+    server.close = function (cb) {
+      const result = netClose(cb);
+      for (const session of Array.from(sessions)) { try { session.close(); } catch (e) {} }
+      return result;
+    };
     const onSession = (socket) => {
       // For an ALPN mismatch on a secure server (client spoke http/1.1) node
       // routes to the http1 path; here we only handle h2, so proceed if the
@@ -3309,6 +3335,8 @@ export constexpr std::string_view kHttp2JS = R"JS(
           onServerStream(self, stream, headers, flags, rawHeaders);
       });
       session.on("error", (e) => { if (self.listenerCount("sessionError") > 0) self.emit("sessionError", e, session); else if (self.listenerCount("session") === 0 && self.listenerCount("error") > 0) self.emit("error", e); });
+      sessions.add(session);
+      session.on("close", () => sessions.delete(session));
       self.emit("session", session);
     };
     server.on(secure ? "secureConnection" : "connection", onSession);
