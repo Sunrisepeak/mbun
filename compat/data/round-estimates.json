@@ -192,6 +192,38 @@
           "wall_clock_min": 111,
           "note": "Largest single-task result recorded. test-http-* 102 -> 272 pass; 0 regressions on all three guard sets. Also closed round 9's only confirmed real regression (test-http-write-empty-string) and the deeper bug behind it: net.Socket._flush stopped at the first zero-byte write, so an empty chunk parked every byte behind it forever \u2014 which silently lost the SECOND response on every keep-alive connection. Separately, pipelined intake dropped bytes because push() runs the handler synchronously and the parser could be replaced mid-loop; a 10,000-request pipeline stalled at exactly 1771 and now completes in 1.9s.",
           "estimate_miss_cause": "Under-estimated by 2.8x. The 76 bare `AssertionError` files in this cluster were not 76 causes, they were mostly ONE: node:http was a shape-only stand-in with a second, incompatible ServerResponse living in the transport layer. Translating node's five _http_*.js files instead of extending the stand-in converted 148 files in a single change. cluster_finder's signature view cannot see this, because a missing LAYER surfaces as many unrelated assertion texts rather than one repeated signature."
+        },
+        {
+          "id": "r10/agent-4",
+          "cluster": "primordials + internalBinding",
+          "worklist_files": 305,
+          "cluster_homogeneity": "high (one named wall, iterated)",
+          "target_delta_pass": 45,
+          "actual_delta_pass": 45,
+          "hit_rate": 1.0,
+          "wall_clock_min": 45,
+          "probe_result": {
+            "primordials_alone": "8/305 = 2.6%",
+            "primordials_plus_internalBinding": "45/305 = 14.8%",
+            "verdict": "Closes a question deferred twice. primordials alone reproduces the prior 2/60 (~3%) at 5x the sample; internalBinding does ~90% of the work (primordials contributes ~5 of the 45). The gate (>=10%) cleared on cycle 3 of 7."
+          },
+          "iterative_evidence": {
+            "per_cycle_delta": [
+              8,
+              13,
+              14,
+              4,
+              3,
+              1,
+              2
+            ],
+            "cycles": 7,
+            "single_blind_change_would_have_reached": 21,
+            "actual": 45,
+            "what_made_it_iterable": "internalBinding was stubbed to THROW with the missing binding's name, so each cycle's log histogram named the next densest wall exactly. The instrumentation, not the guesswork, drove the targeting."
+          },
+          "security_verified_independently": "primordials / internalBinding / getInternalBinding are wrapper parameters, never globals, gated on TWO independent conditions (bare `internal/...` specifier AND resolved path under a lib/internal/ directory). Coordinator re-verified on the composed binary: ordinary user code sees all three undefined; a package shipping node_modules/internal/foo.js resolves normally but receives undefined for both; a relative ./lib/internal/bar.js receives undefined; enumerable globals remain exactly 15 with no leak (checked deliberately against round 9's 265-file enumerable-globals incident).",
+          "fragility_found": "require('internal/x') resolves ONLY because node's own compat/node/tsconfig.json maps internal/* -> ./lib/internal/*, and mbun's resolver honours tsconfig `paths`. Nobody wired this deliberately. It works solely inside the node checkout \u2014 which is also what makes the gate safe \u2014 but the capability silently depends on a file in the read-only upstream corpus."
         }
       ],
       "verdicts": {
@@ -200,7 +232,8 @@
       },
       "calibration_addendum": {
         "signature_clustering_blind_spot": "A missing or stand-in LAYER is invisible to signature clustering. Each file asserts something different about the layer, so the logs share no signature and the cluster ranks as a heterogeneous tail \u2014 while the true fix is one translation. Two independent checks now recommended before believing a 'heterogeneous tail': (1) how much of the subsystem is green? http was 102/398 = 26% while its API surface is old and stable, which is itself the signal; (2) is the mbun implementation a translation of node's lib/, or a hand-written stand-in? A stand-in with many small assertion failures means translate the layer, do not extend the stand-in.",
-        "green_ratio_heuristic": "For a mature, stable node subsystem, a low green ratio is stronger evidence of a missing layer than the error signatures are. cluster 11/80 and runner 10/73 currently look the same way http did."
+        "green_ratio_heuristic": "For a mature, stable node subsystem, a low green ratio is stronger evidence of a missing layer than the error signatures are. cluster 11/80 and runner 10/73 currently look the same way http did.",
+        "instrumented_stub_pattern": "The strongest single technique observed so far for an unknown-depth wall: stub the missing capability so it FAILS LOUDLY WITH ITS OWN NAME, then let the log histogram pick the next target each cycle. On the internalBinding cluster this produced deltas of +8,+13,+14,+4,+3,+1,+2 over 7 cycles (45 total) where a single blind change would have reached ~21. It converts an open-ended 'implement internalBinding' into a measured, self-terminating work queue."
       }
     }
   ]
