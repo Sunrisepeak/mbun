@@ -628,6 +628,38 @@
       ],
       "what_it_fixed": "4 mechanisms, each translated from node's lib/: fs.watch delivering events after close() (the only reason 4 files reported a wrong value \u2014 it proved the C++ inotify mask was already correct with a standalone probe before touching anything); HTTP trailers having no verbatim form (parser kept only a lowercased last-wins object, server never populated rawTrailers); fs.Stats key set (native row carried isFile() as own-enumerable plus *Ns fields node lacks, so node's key-by-key walk landed a function in its numeric branch; promises stat/lstat were also returning a prototype-less row and ignoring {bigint:true}); and fs.realpath ignoring options.encoding.",
       "guard": "1315 files measured in full, 790 -> 799 pass, 0 regressions."
+    },
+    {
+      "round": "cause-family wave 1 \u2014 hangs agent, and the wave's combined verdict",
+      "id": "g2/agent-2",
+      "target_delta_pass": 20,
+      "actual_delta_pass": 3,
+      "timeout_to_fail": 2,
+      "hit_rate": 0.15,
+      "delivered_the_thing_that_was_asked_for_instead": "The survivor cause histogram, which no subsystem-split agent could assemble because each saw only a third of the hangs. It required building an instrument that did not exist.",
+      "THIRD_confirmation_of_the_same_classification_error": {
+        "my_premise": "I defined the family as 'hangs' and handed it every previously-found teardown/handle-lifetime mechanism, expecting the causes to cluster there.",
+        "measured_reality": "31 of 41 survivors are NOT event-loop bugs. 20 show a held server plus live sockets, empty write queues and no ref'd timer \u2014 a stalled exchange where the test is genuinely WAITING, and node would hold the loop identically. 11 show a server outliving a dead client flow with socket count 0. Those 31 are protocol-semantics gaps wearing a hang costume and need per-file http/tls work. Only 3 (a never-converging ref'd interval) and 2 (FSWatcher counted as pending but never progressing) are loop-shaped. 4 produce no dump at all \u2014 the pump is blocked inside native code, the most severe class.",
+        "the_pattern": "This is the THIRD independent confirmation in one wave that my classifier keys on MANIFESTATION rather than cause. (1) The 359-file `AssertionError` bucket was an artifact of an empty assertion message. (2) 20-36 of the 197 'value divergences' were TLS protocol failures surfacing through an assertion. (3) 31 of 41 'hangs' are protocol gaps that merely manifest as a hang. Manifestation is not cause, and grepping log text can only ever see manifestation."
+      },
+      "instrument_built": "tools/integration/hang_dump.js (promoted from the agent's scratchpad). require()s the target so its timer shares the loop, then dumps reactor pending/handles/serveActive/stall, every item's _fd/_refd/_held/destroyed/listening/_wq, and every timer with its source. Works because its timer is REF'D, bounding the pump's 60s poll() park so control returns to JS mid-hang. Exit 99 marks a dump. Coordinator-verified on a real hang.",
+      "what_it_fixed": "Three defects of one shape: work llhttp does CONTINUOUSLY was deferred to an event a stuck peer never produces. Leftover bytes past a completed message were only parsed when the current response finished (node keeps one parser per connection, so a handler that never ends its response left the peer's bytes unparsed forever); header overflow was only checked once \\r\\n\\r\\n arrived; and the method was validated by a regex over the completed head, so garbage pipelined behind a request was never rejected. It also found and fixed two self-inflicted regressions before committing.",
+      "side_finding_routed_and_fixed_by_coordinator": "process._rawDebug was in an 'undefinedStubs' list: callable, returned without throwing, wrote NOTHING. node's writes to stderr synchronously, bypassing the stream stack, because it is the diagnostic of last resort. A silent no-op swallows exactly the output someone reached for because nothing else worked \u2014 it cost this agent ~15 minutes. Now implemented and verified on fd 2.",
+      "wave_combined": {
+        "targets": [
+          35,
+          45,
+          20
+        ],
+        "actuals": [
+          3,
+          9,
+          3
+        ],
+        "corpus": "2329 -> 2358 pass (52.5% -> 53.2% strict, 60.0% -> 60.8% excluding self-skips), timeouts 132 -> 125, zero regressions across three independently-measured guards of 1322, 1315 and 1957 files",
+        "verdict": "The cause-family split was the right correction to the subsystem split, and it still under-delivered \u2014 for three separate and now-documented reasons: one family was a LAYER not a cause (bindings, whose value transfers to other families), one was over-scoped by ~4.5x against a measured ~10 min per mechanism (values), and one was defined by manifestation rather than cause (hangs, 31 of 41 misassigned). All three targets were wrong in a way the agents could measure and did.",
+        "what_the_next_round_should_do": "Split the 31 stalled-exchange hangs into the http and tls protocol families where they belong; give the values family mechanisms x 10 min of budget or cut its scope to the top mechanisms; treat binding/infrastructure work as enabling with a diagnosis target; and pre-split any family by grepping for protocol/transport signatures before dispatch."
+      }
     }
   ]
 }
