@@ -1560,7 +1560,80 @@ public:
   // exists yet at this point in startup, and a throw escaping a nextTick
   // callback must reach node's 'uncaughtException' path rather than JSC's
   // rejection tracker.
-  p.nextTick = function (fn) { const a = Array.prototype.slice.call(arguments, 1); globalThis.queueMicrotask(function () { fn.apply(null, a); }); };
+  // process.nextTick has STRICT PRIORITY over promise microtasks: node drains
+  // the whole tick queue -- including ticks pushed BY ticks -- before running a
+  // single promise continuation, and does so again after the microtask queue
+  // empties (internal/process/task_queues.js processTicksAndRejections). This
+  // used to be `queueMicrotask(...)`, which made the two ONE fifo, so
+  //   Promise.resolve().then(p1); process.nextTick(t1);
+  //   Promise.resolve().then(p2); process.nextTick(t2);
+  // ran p1,t1,p2,t2 where node runs t1,t2,p1,p2. The user-visible consequence
+  // was fs abort-signal tests: a queueMicrotask-deferred fs callback beat a
+  // nextTick-scheduled abort(), and two files had to be patched around it with
+  // setImmediate rather than fixed.
+  //
+  // So the queue lives here and __mbunRunTicks drains it. It is called
+  // SYNCHRONOUSLY at each callback boundary mbun owns -- the entry script's
+  // CommonJS wrapper (run_script), every timer/immediate callback
+  // (__mbun_drain_timers), and every pump phase (pump_event_loop) -- which is
+  // what buys the priority: those all run inside one JSC evaluation, and JSC
+  // only drains ITS microtask queue when that evaluation releases the lock, so
+  // anything drained here necessarily runs first.
+  //
+  // A promise reaction is also armed on the first push. That is node's other
+  // arm ("loop while the tick queue is non-empty" after runMicrotasks), and it
+  // is what runs a tick scheduled from inside a promise continuation. It is a
+  // raw reaction, NOT queueMicrotask: the queueMicrotask wrapper in
+  // js_builtins:node_process_lifecycle applies __mbunSchedHook, and hooking the
+  // drain rather than the callback would enter node:domain twice per tick --
+  // the [d, d] domain stack that test-domain-thrown-error-handler-stack pins.
+  //
+  // The two things nextTick DID inherit from that wrapper it must not lose, so
+  // they are done explicitly: __mbunSchedHook is applied per callback at PUSH
+  // time (node does this in async_hooks, at schedule time, not at run time),
+  // and a throw goes to node's 'uncaughtException' path instead of JSC's
+  // rejection tracker. __mbun_uncaught is resolved at call time -- it does not
+  // exist yet at this point in startup.
+  const _tickQ = [];
+  let _tickArmed = false;
+  let _tickDraining = false;
+  const _presolve = Promise.resolve.bind(Promise);
+  const _pthen = Promise.prototype.then;
+  const runTicks = function () {
+    // A drain reached from inside a tick callback must NOT start a second one:
+    // node's loop is flat, and a nested drain would run later ticks first.
+    if (_tickDraining) return;
+    _tickDraining = true;
+    try {
+      while (_tickQ.length > 0) {
+        const e = _tickQ.shift();
+        try {
+          e[0].apply(null, e[1]);
+        } catch (err) {
+          const u = globalThis.__mbun_uncaught;
+          if (u === undefined) throw err;
+          // Unclaimed => fatal: drop the rest, exactly as node abandons the
+          // tick queue on an uncaught exception.
+          if (!u(err)) { _tickQ.length = 0; return; }
+        }
+      }
+    } finally { _tickDraining = false; }
+  };
+  // Non-enumerable: node's test/common/index.js 'exit' listener enumerates
+  // globalThis and fails the file on anything it does not recognise.
+  Object.defineProperty(globalThis, "__mbunRunTicks",
+                        { value: runTicks, writable: true, configurable: true, enumerable: false });
+  p.nextTick = function (fn) {
+    const a = Array.prototype.slice.call(arguments, 1);
+    let cb = fn;
+    const h = globalThis.__mbunSchedHook;
+    if (h !== undefined && h !== null) cb = h(cb);
+    _tickQ.push([cb, a]);
+    if (!_tickArmed) {
+      _tickArmed = true;
+      _pthen.call(_presolve(), function () { _tickArmed = false; runTicks(); });
+    }
+  };
   const nanos = () => (globalThis.Bun && Bun.nanoseconds ? Bun.nanoseconds() : 0);
   p.hrtime = function (prev) {
     const t = nanos(); let s = Math.floor(t / 1e9), n = Math.floor(t % 1e9);
