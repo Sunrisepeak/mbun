@@ -1493,6 +1493,10 @@ export constexpr std::string_view kHttp2JS = R"JS(
         try { headers = Object.assign({ __proto__: null }, headers, { date: new Date().toUTCString() }); } catch (e) {}
       }
       const built = buildResponseHeaderList(headers, this.session._options && this.session._options.strictSingleValueFields);
+      // node ServerHttp2Stream.respond: DATA frames are forbidden for 204/205/304
+      // and for a HEAD request, so the HEADERS frame carries END_STREAM itself.
+      const st = parseInt(built.list[0] && built.list[0][1], 10);
+      if (st === 204 || st === 205 || st === 304 || this.headRequest === true) options = Object.assign({}, options, { endStream: true });
       this.headersSent = true;
       this.sentHeaders = headers;
       const block = encodeHeaders(built.list, built.sensitive);
@@ -2102,23 +2106,25 @@ export constexpr std::string_view kHttp2JS = R"JS(
   // node lib/internal/validators validateLinkHeaderValue: accepts a string or an
   // array of strings, each `<uri>; rel=…` shaped.
   const LINK_VALUE_RE = /^(?:<[^>]*>)(?:\s*;\s*[^;"\s]+(?:=(")?[^;"\s]*\1)?)*$/;
+  const LINK_FORMAT_REASON = "must be an array or string of format \"</styles.css>; rel=preload; as=style\"";
   function validateLinkHeaderValue(hints) {
     if (typeof hints === "string") {
-      if (!LINK_VALUE_RE.test(hints)) throw invalidArgValue("hints.link", hints, "must be an array or string of format \"</styles.css>; rel=preload; as=style\"");
+      if (!LINK_VALUE_RE.test(hints)) throw invalidArgValue("hints", hints, LINK_FORMAT_REASON);
       return hints;
     } else if (Array.isArray(hints)) {
       if (hints.length === 0) return "";
       let result = "";
       for (let i = 0; i < hints.length; i++) {
         const link = hints[i];
-        if (typeof link !== "string" || !LINK_VALUE_RE.test(link))
-          throw invalidArgValue("hints.link", link, "must be an array or string of format \"</styles.css>; rel=preload; as=style\"");
+        if (typeof link !== "string" || !LINK_VALUE_RE.test(link)) throw invalidArgValue("hints", link, LINK_FORMAT_REASON);
         result += link;
         if (i !== hints.length - 1) result += ", ";
       }
       return result;
     }
-    return "";
+    // Anything that is neither a string nor an array is rejected outright
+    // (node lib/internal/validators.js validateLinkHeaderValue).
+    throw invalidArgValue("hints", hints, LINK_FORMAT_REASON);
   }
   function http2StatusInvalid(code) {
     const e = new RangeError("Invalid status code: " + code); e.code = "ERR_HTTP2_STATUS_INVALID"; return e;
