@@ -209,6 +209,12 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
       // pinned and the process could not leave the loop (13 test-https-* files
       // hit the 15s corpus timeout on exactly that).
       transport.on("timeout", () => self.emit("timeout"));
+      // node's TLSSocket is a net.Socket over a real connection, so it emits
+      // 'connect' when the TCP leg lands (before the handshake) and 'ready'
+      // after. The corpus drives raw TLS clients from 'connect'
+      // (test-https-server-close-idle / -close-all write their request there);
+      // without the forward those callbacks never ran and the file hung.
+      transport.on("connect", () => { self.emit("connect"); self.emit("ready"); });
       // Byte counters, buffer levels and the local endpoint live on the
       // TRANSPORT — every write() and read() this class performs is delegated
       // there — so the plaintext edge must report the transport's values, not the
