@@ -621,6 +621,25 @@
      ],
      "tooling_defect_it_exposed_in_my_runner": "--max-seconds could not bound a fresh full run: the deadline was checked before each executor.submit(), but submit returns immediately, so all 4433 futures were queued within milliseconds against a clock that had barely moved. Fixed with a bounded feeder (~2x jobs in flight, deadline re-checked as real work completes). Verified: 600 files with --max-seconds 20 now stops at 82 and reports remaining=518 instead of running all 600.",
      "brief_error": "my brief said cd .claude/worktrees/wt1; worktree_setup.sh wt1 actually creates <repo>/wt1"
+    },
+    {
+     "id": "w4/agent-tls",
+     "cluster": "tls (wave 4, inventory-driven)",
+     "worklist_files": 135,
+     "target_delta_pass": 14,
+     "actual_delta_pass": 16,
+     "hit_rate": 1.14,
+     "wall_clock_min": 66,
+     "note": "tls+https 128/263 -> 144/263 (48.7% -> 54.8%). 0 regressions on a 280-file subsystem guard AND a 418-file cross-subsystem guard where every bucket was byte-identical -- it ran the second one because its keylog work touched js_net.cppm _poll, which every socket goes through. That is the right instinct: guard by what the diff TOUCHES, not by what it targets.",
+     "estimate_overrun": "Roughly 40 of its ~106 minutes went to a toolchain mismatch that names nothing (see below), so the delivered rate against ACTUAL working time is closer to 16 in 66 minutes.",
+     "found_a_cluster_the_inventory_did_not_have": "TLS session resumption is entirely absent (getSession returns undefined, setSession is a no-op, the reactor never emits 'session'). One mechanism covers 8 files that sat SPLIT ACROSS THREE existing buckets, so every previous brief under-budgeted all three. Lesson: per-bucket ranking cannot see a cause that spans buckets -- the inventory needs a periodic pass that asks 'what single change would close files in more than one bucket?'",
+     "leads_i_got_wrong": [
+      "tls-protocol-method-validation: the CAUSE was stale even though the SIZE was right. SSLv2/v3_method rejection already worked -- those subcases were passing. The real blockers were secureProtocol version-window semantics (node never passes min=max=0; SSLv23_method lowers only the ceiling) and the fact that --tls-min-v1.x is NOT last-flag-wins -- lib/tls.js is a fixed if/else chain so the WIDEST flag wins wherever it sits. I briefed last-flag-wins explicitly and it was wrong.",
+      "tls-connect-duplex-transport is 7 files, not 6: test-tls-socket-snicallback-without-server was filed under tls-mustcall-never-fired but drives a TLSSocket over stream.duplexPair().",
+      "The @SECLEVEL/ciphersuites lead was sized right but UNDERRATED -- SSL_CTX_set_ciphersuites was worth 2 files directly and unblocked a third that was hiding behind it."
+     ],
+     "my_wrong_public_diagnosis": "I published, in a commit message and on PR 32, that deleting build.ninja is not a safe reset because it left a worktree unable to build. False. The global ~/.mcpp/config.toml toolchain default had been flipped to gcc 15.1.0 and the project needs 16.1.0; the deletion merely forced a reconfigure that picked up the wrong default. Verified by restoring the default and rebuilding the same worktree with build.ninja still absent. build_or_die.sh now checks this before building.",
+     "environment_hazard": "An agent modified ~/.mcpp/config.toml -- a GLOBAL user config outside the repo. Worktree isolation does not cover $HOME, so one agent's environment change is every concurrent agent's."
     }
    ],
    "verdicts": {
