@@ -32,7 +32,30 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
     if (typeof delegate !== "function") return;
 
     const assertMod = () => M["assert"] || M["node:assert"];
-    const out = (line) => { try { G.console.log(line); } catch (e) {} };
+
+    // ------------------------------------------------- reporting surface ----
+    // node routes every runner observation through one event vocabulary
+    // (lib/internal/test_runner/tests_stream.js) and lets the consumers —
+    // TAP on stdout, a TestsStream handed back by run(), a child process
+    // reporting to its parent — subscribe to it. mbun's runner does the same so
+    // a test reports exactly once no matter who is listening, instead of the
+    // TAP writer being the only thing that ever sees a result.
+    //
+    // The `:node_test_run` partition is the second subscriber: it turns these
+    // events into run()'s TestsStream, and in a child process (NODE_TEST_CONTEXT
+    // set) forwards them over the IPC channel and turns TAP off.
+    const subscribers = [];
+    let tapEnabled = true;
+    // run({isolation:'none'}) evaluates OTHER files' tests in this process; their
+    // failures belong to the returned stream, not to this process's exit status
+    // (a runner script that reports a failing file still exits 0).
+    let ownExitCode = true;
+    const emit = (type, data) => {
+      for (let i = 0; i < subscribers.length; i++) {
+        try { subscribers[i](type, data); } catch (e) {}
+      }
+    };
+    const out = (line) => { if (tapEnabled) { try { G.console.log(line); } catch (e) {} } };
 
     // ------------------------------------------------------------- mocking
     const makeMock = () => {
@@ -98,6 +121,7 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
       kind, name: name === undefined ? "<anonymous>" : String(name),
       opts: opts || {}, fn: fn || null, parent: parent || null,
       children: [],
+      __loc: captureLoc(),
       hooks: { before: [], after: [], beforeEach: [], afterEach: [] },
     });
 
@@ -163,10 +187,136 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
         : String(error);
       out("  " + message);
       if (error && error.stack) out(String(error.stack).split("\n").map((l) => "  " + l).join("\n"));
-      try { G.process.exitCode = 1; } catch (e) {}
+      if (ownExitCode) { try { G.process.exitCode = 1; } catch (e) {} }
     };
     const ok = (name) => { out("ok " + ++state.index + " - " + name); };
     const skipped = (name) => { out("ok " + ++state.index + " - " + name + " # SKIP"); };
+
+    // ------------------------------------------------------- event shapes ----
+    // node identifies a test instance by a number that is stable across its own
+    // start/complete/pass/fail events, and reports where it was *declared*, not
+    // where it ran. Both are read straight back by the corpus
+    // (test-runner-test-id, test-runner-filetest-location).
+    let nextTestId = 1;
+    const idOf = (node) => (node.__id !== undefined ? node.__id : (node.__id = nextTestId++));
+    const nestingOf = (node) => {
+      let depth = -1;
+      for (let p = node; p && p !== root; p = p.parent) depth++;
+      return depth < 0 ? 0 : depth;
+    };
+    // The registration call site: the first stack frame carrying a real path.
+    // The runner itself is a builtin blob, so its own frames have none.
+    // (a function *declaration*: makeNode is defined above this block and
+    // `root` is built during that pass, so this has to be hoisted.)
+    function captureLoc() {
+      try {
+        const stack = new Error().stack;
+        if (typeof stack !== "string") return {};
+        const lines = stack.split("\n");
+        for (let i = 0; i < lines.length; i++) {
+          const m = /((?:\/|[A-Za-z]:\\)[^\s()]+?):(\d+):(\d+)/.exec(lines[i]);
+          if (m) return { file: m[1], line: +m[2], column: +m[3] };
+        }
+      } catch (e) {}
+      return {};
+    }
+    // node lib/internal/test_runner/tag_filter.js: a test's tag set is the
+    // union of its ancestors' and its own, lowercased, deduplicated, in
+    // parent-first declaration order (test-runner-tags-inheritance).
+    let warnedAboutTags = false;
+    const tagsOf = (node) => {
+      const chain = [];
+      for (let p = node; p && p !== root; p = p.parent) chain.unshift(p);
+      const seen = Object.create(null);
+      const list = [];
+      for (const n of chain) {
+        const own = Array.isArray(n.opts.tags) ? n.opts.tags : [];
+        if (own.length !== 0 && !warnedAboutTags) {
+          warnedAboutTags = true;
+          try {
+            G.process.emitWarning(
+              "Test tags is an experimental feature and might change at any time",
+              "ExperimentalWarning");
+          } catch (e) {}
+        }
+        for (const tag of own) {
+          if (typeof tag !== "string" || tag.length === 0) continue;
+          const lower = tag.toLowerCase();
+          if (seen[lower] === undefined) { seen[lower] = true; list.push(lower); }
+        }
+      }
+      return Object.freeze(list);
+    };
+    // node applies at most ONE directive and skip outranks todo, both when they
+    // come from the options bag and when they come from the context methods
+    // (test-runner-todo-skip-tests asserts `todo === undefined` for a test that
+    // asked for both).
+    const directiveOf = (node, ctx) => {
+      const optSkip = node.opts.skip;
+      const ctxSkip = ctx && ctx.__skipped ? (ctx.__skipReason === undefined ? true : ctx.__skipReason) : undefined;
+      const skip = (optSkip !== undefined && optSkip !== false) ? (optSkip === true ? true : optSkip) : ctxSkip;
+      if (skip !== undefined) return { skip };
+      const optTodo = node.opts.todo;
+      const ctxTodo = ctx && ctx.__todo !== undefined ? ctx.__todo : undefined;
+      const todo = (optTodo !== undefined && optTodo !== false) ? (optTodo === true ? true : optTodo) : ctxTodo;
+      if (todo !== undefined) return { todo };
+      return {};
+    };
+    const baseEvent = (node) => {
+      const loc = node.__loc || {};
+      const e = {
+        name: node.name,
+        nesting: nestingOf(node),
+        testId: idOf(node),
+        parentId: node.parent && node.parent !== root ? idOf(node.parent) : undefined,
+        tags: tagsOf(node),
+      };
+      if (loc.file !== undefined) { e.file = loc.file; e.line = loc.line; e.column = loc.column; }
+      return e;
+    };
+    const emitEnqueue = (node) => {
+      const e = baseEvent(node);
+      e.type = node.kind === "suite" ? "suite" : "test";
+      emit("test:enqueue", e);
+    };
+    const emitDequeue = (node) => {
+      const e = baseEvent(node);
+      e.type = node.kind === "suite" ? "suite" : "test";
+      emit("test:dequeue", e);
+      emit("test:start", baseEvent(node));
+    };
+    // `expectFailure` inverts the verdict: node reports a test that was expected
+    // to fail AND failed as a pass carrying the directive (test-runner-xfail).
+    const emitResult = (node, error, ctx, startedAt) => {
+      const parent = node.parent || root;
+      parent.__childNumber = (parent.__childNumber || 0) + 1;
+      const e = baseEvent(node);
+      e.testNumber = parent.__childNumber;
+      const directive = directiveOf(node, ctx);
+      if (directive.skip !== undefined) e.skip = directive.skip;
+      if (directive.todo !== undefined) e.todo = directive.todo;
+      const expectation = node.opts.expectFailure;
+      const expected = expectation !== undefined && expectation !== false;
+      let passed = error === undefined;
+      let reported = error;
+      if (expected) {
+        if (!passed) { passed = true; reported = undefined; e.expectFailure = expectation === true ? true : expectation; }
+        else {
+          reported = new Error("test was expected to fail but passed");
+          reported.code = "ERR_TEST_FAILURE";
+          reported.failureType = "expectedFailure";
+          passed = false;
+        }
+      }
+      e.details = {
+        duration_ms: startedAt === undefined ? 0 : Date.now() - startedAt,
+        type: node.kind === "suite" ? "suite" : "test",
+      };
+      if (!passed) e.details.error = reported;
+      emit(passed ? "test:pass" : "test:fail", e);
+      emit("test:complete", e);
+      return passed;
+    };
 
     // Each entry remembers the node that OWNS the hook: node reports that node's
     // context from getTestContext() while the hook runs, so a suite's beforeEach
@@ -201,15 +351,23 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
         name: node.name,
         fullName: fullNameOf(node),
         filePath: entryFile(),
+        tags: tagsOf(node),
         signal: controller ? controller.signal : undefined,
         __controller: controller,
         __skipped: false,
         __plan: null,
         __assertions: 0,
         __subs: [],
-        diagnostic: (message) => out("# " + message),
-        skip: (message) => { context.__skipped = true; if (message) out("# SKIP " + message); },
-        todo: (message) => { if (message) out("# TODO " + message); },
+        diagnostic: (message) => { out("# " + message); emit("test:diagnostic", { nesting: nestingOf(node), message, level: "info" }); },
+        skip: (message) => {
+          context.__skipped = true;
+          context.__skipReason = message === undefined ? true : message;
+          if (message) out("# SKIP " + message);
+        },
+        todo: (message) => {
+          context.__todo = message === undefined ? true : message;
+          if (message) out("# TODO " + message);
+        },
         runOnly: () => {},
         plan: (count) => { context.__plan = count; },
         mock: makeMock(),
@@ -288,6 +446,7 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
         name: node.name,
         get fullName() { return fullNameOf(node); },
         filePath: entryFile(),
+        tags: tagsOf(node),
         signal: controller ? controller.signal : undefined,
         passed: true,
         attempt: 0,
@@ -302,7 +461,17 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
     const runNode = async (node) => {
       if (node.kind === "suite") return runSuite(node);
       const opts = node.opts;
-      if (opts.skip || opts.todo || node.fn === null) { skipped(node.name); return; }
+      // node only lets `skip` prevent a body from running; a `todo` test still
+      // runs and its result is reported under the todo directive
+      // (test-runner-todo-skip-tests relies on t.skip() inside a todo test).
+      if (opts.skip || node.fn === null) {
+        emitDequeue(node);
+        emitResult(node, undefined, undefined, Date.now());
+        skipped(node.name);
+        return;
+      }
+      emitDequeue(node);
+      const startedAt = Date.now();
       const context = makeContext(node);
       const previousContext = state.current;
       state.current = context;
@@ -335,24 +504,41 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
         }
         if (context.__controller) context.__controller.abort();
         await runEachHooks(eachHooks(node, "afterEach"), context);
-        if (context.__skipped) skipped(node.name); else ok(node.name);
         state.current = previousContext;
+        if (emitResult(node, undefined, context, startedAt)) {
+          if (context.__skipped) skipped(node.name); else ok(node.name);
+        } else {
+          // expectFailure was set and the body did NOT throw.
+          fail(node.name, new Error("test was expected to fail but passed"));
+        }
       } catch (error) {
         state.current = previousContext;
         if (context.__controller) { try { context.__controller.abort(); } catch (e) {} }
         try { await runEachHooks(eachHooks(node, "afterEach"), context); } catch (e) {}
-        fail(node.name, error);
+        const directive = directiveOf(node, context);
+        if (emitResult(node, error, context, startedAt)) ok(node.name);
+        else if (directive.todo !== undefined) skipped(node.name);
+        else fail(node.name, error);
       }
     };
 
     const runSuite = async (node) => {
+      const startedAt = Date.now();
+      emitDequeue(node);
       try {
-        if (node.opts.skip || node.opts.todo) { skipped(node.name); return; }
+        if (node.opts.skip) {
+          emitResult(node, undefined, undefined, startedAt);
+          skipped(node.name);
+          return;
+        }
         const ctx = node.__ctx || (node.__ctx = makeSuiteContext(node));
         await withContext(ctx, () => runHooks(node.hooks.before, ctx));
         for (const child of node.children) await runNode(child);
         await withContext(ctx, () => runHooks(node.hooks.after, ctx));
+        emit("test:plan", { nesting: nestingOf(node) + 1, count: node.children.length });
+        emitResult(node, undefined, undefined, startedAt);
       } catch (error) {
+        emitResult(node, error, undefined, startedAt);
         fail(node.name, error);
       }
     };
@@ -402,14 +588,17 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
       const { name, opts, fn } = normalize(args);
       if (parent) {
         const node = makeNode("test", name, opts, fn, parent);
+        emitEnqueue(node);
         return runNode(node);
       }
       if (state.collecting) {
         const node = makeNode("test", name, opts, fn, state.collecting);
         state.collecting.children.push(node);
+        emitEnqueue(node);
         return Promise.resolve();
       }
       const node = makeNode("test", name, opts, fn, root);
+      emitEnqueue(node);
       return schedule(node);
     }
 
@@ -417,10 +606,14 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
       const { name, opts, fn } = normalize(args);
       const node = makeNode("suite", name, opts, fn, parent || state.collecting || root);
       if (node.parent !== root) node.parent.children.push(node);
+      emitEnqueue(node);
       const previous = state.collecting;
       state.collecting = node;
       try {
-        if (typeof fn === "function") {
+        // A skipped suite's body never runs — node reports the suite itself as
+        // skipped and never touches its children (test-runner-todo-skip-tests
+        // registers a mustNotCall() body on one).
+        if (typeof fn === "function" && !opts.skip) {
           const ctx = node.__ctx || (node.__ctx = makeSuiteContext(node));
           const produced = fn.call(ctx, ctx);
           if (produced && typeof produced.then === "function") {
@@ -490,6 +683,27 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
     M["node:test"] = nodeTest;
     M["test/reporters"] = { tap: () => {}, spec: function spec() {}, dot: () => {}, junit: () => {}, lcov: () => {} };
     M["node:test/reporters"] = M["test/reporters"];
+
+    // The seam the :node_test_run partition (run(), TestsStream, reporters,
+    // the child-process reporter) attaches to. Non-enumerable so node's
+    // leaked-globals check in test/common does not see it.
+    Object.defineProperty(G, "__mbunNodeTest", {
+      configurable: true, writable: true, enumerable: false,
+      value: {
+        subscribe(fn) { subscribers.push(fn); return () => {
+          const i = subscribers.indexOf(fn);
+          if (i >= 0) subscribers.splice(i, 1);
+        }; },
+        setTap(enabled) { tapEnabled = !!enabled; },
+        setOwnExitCode(enabled) { ownExitCode = !!enabled; },
+        nextId() { return nextTestId++; },
+        // Everything the standalone runner has queued, including the root
+        // after() hooks — run() waits on this for isolation:'none'.
+        drain() { return state.chain; },
+        counts() { return { failures: state.failures, total: state.index }; },
+        emit,
+      },
+    });
   } catch (e) {}
 })();
 )JS";

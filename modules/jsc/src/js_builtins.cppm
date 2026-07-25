@@ -46,6 +46,7 @@ export import :node_process_extra;
 export import :node_process_lifecycle;
 export import :node_util_extra;
 export import :node_test_runner;
+export import :node_test_run;
 export import :node_cluster;
 export import :node_legacy_ctors;
 export import :node_domain;
@@ -125,6 +126,10 @@ export inline const std::string kNodeBuiltinsJS =
         // node:child_process/node:net are registered.
         .append(detail::kNodeClusterJS)
         .append(detail::kNodeTestRunnerJS)
+        // node:test's run() / TestsStream / node:test/reporters, and the
+        // child-process reporter — consumes the event surface the partition
+        // above installs, so it must follow it.
+        .append(detail::kNodeTestRunJS)
         .append(detail::kNodeTimersJS)
         .append(detail::kNodeBufferExtraJS)
         .append(detail::kNodeAssertDeepEqualJS)
