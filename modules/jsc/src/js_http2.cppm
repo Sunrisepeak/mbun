@@ -2991,6 +2991,13 @@ export constexpr std::string_view kHttp2JS = R"JS(
       stream.on("aborted", () => { if (!self._state.closed) { self._aborted = true; self.emit("aborted"); } });
       stream.on("close", () => { self._state.closed = true; stream._proxySocket = null; self.emit("close"); });
       stream.on("timeout", () => self.emit("timeout"));
+      // node compat.js attaches onStreamError, a DELIBERATELY EMPTY handler:
+      // "errors in compatibility mode are not forwarded to the request and
+      // response objects". Without it the stream error a compat write-after-end
+      // raises (Http2ServerResponse#write destroys the stream with
+      // ERR_STREAM_WRITE_AFTER_END, exactly as node's does) has no listener and
+      // becomes an uncaught exception instead of just the callback's `err`.
+      stream.on("error", () => {});
     }
     get aborted() { return this._aborted; }
     get complete() { return this._aborted || this.readableEnded || this._state.closed || this._stream.destroyed; }
