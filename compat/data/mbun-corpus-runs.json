@@ -23,7 +23,10 @@
         "failed": 17404,
         "expects": 487285
       },
-      "notes": "file-level green = every executed test in the file passed and the file reported no out-of-test error; all-skipped / no-tests / blocked-external are separate buckets and are NOT passes. The corpus npm dependencies must be installed first (see compat/README.md) -- without them 264 files die at load; test/node_modules is excluded from discovery so third-party packages do not inflate the corpus"
+      "notes": "file-level green = every executed test in the file passed and the file reported no out-of-test error; all-skipped / no-tests / blocked-external are separate buckets and are NOT passes. The corpus npm dependencies must be installed first (see compat/README.md) -- without them 264 files die at load; test/node_modules is excluded from discovery so third-party packages do not inflate the corpus",
+      "binary": "round-7/8 era snapshot (branch fix/corpus-round7) \u2014 STALE",
+      "stale": true,
+      "staleness_note": "These figures predate rounds 9 and 10 (20+ tasks) and are NOT current. They are kept because they are the last full bun-corpus measurement taken, not because they still hold. There is direct evidence the number has moved: the deep-equality alignment deliberately reclassified 22 files in bun's own deep-equal suite to `ahead-of-reference` (mbun is more correct than bun there), and the request-smuggling fix took bun's own request-smuggling.test.ts from 53 to 61 passing. A full re-measure is owed; it costs ~30 minutes and has not been run because the machine has been continuously occupied by node-corpus work."
     },
     {
       "corpus": "compat/node/test/parallel",
@@ -57,5 +60,6 @@
       },
       "notes": "A file that skipped itself (common.skip() -> '1..0 # Skipped:', exit 0) is classified `skipped`, never `pass`. common.mustCall is enforced from this binary onward (node registers its verifier in process.on('exit'), which previously never fired). Both corrections lower the number relative to previously published figures; the 44.5% published against round 8 was a product of both defects and was never real. Full estimate-vs-actual and methodology: compat/data/round-estimates.json and compat/README.md. A third verification defect was fixed after the previous entry: assert.throws ignored its error argument, so any throw satisfied any matcher. That removed 126 passes (25 of 25 sampled confirmed vacuous), which is why this figure is LOWER than the previously recorded 47.9%/54.7%."
     }
-  ]
+  ],
+  "note": "generated_at applies to the node row only. The bun row is a stale round-7/8 snapshot; see its staleness_note. Do not read the two rows as contemporaneous."
 }
