@@ -182,6 +182,41 @@ request-smuggling fix took **bun's own** `request-smuggling.test.ts` from 53 to
    about a contract, not the contract itself. Read the upstream test's own
    statement of intent before treating its expectations as a requirement.
 
+## Classify by the failure's layer, not by its log text
+
+The value-divergence family was built by grepping failure logs: anything printing
+`AssertionError` or `Mismatched` went in. That was wrong in a way worth naming,
+because it is the **second** time the same mistake has been made here.
+
+**A protocol failure surfacing through an assertion reads exactly like a value
+bug.** Of the 197 files assigned to that family, a verified floor of **20** fail
+on `ssl: error`, `alert handshake failure`, `no ciphers available`,
+`key too small`, `UNABLE_TO_*`, `No cipher match`, or an honest deferred-transport
+throw — and the agent's own read of all 197 put it near **36**, i.e. ~18% of the
+family was not a value-semantics bug at all and could not be fixed in the JS
+layer. Another ~5 belonged to the timeouts owner.
+
+This is the same error as the earlier discovery that the 359-file `AssertionError`
+cluster was an artifact of an empty assertion message. Both times the grouping
+keyed on **symptom text**.
+
+**Rule: before assigning a file to a family, ask which layer actually failed.** A
+protocol failure, a missing capability, and a wrong value are three different
+owners even when all three print `AssertionError`. The cheap check that would have
+caught this — grep the family's logs for protocol/transport error signatures and
+split them out before dispatching — costs seconds and would have removed 20–36
+files from a 100-minute budget.
+
+### And a measured number for budgeting
+
+That agent counted **~60 distinct mechanisms** in its 197 files, largest
+mechanism 5 files, and measured the **fixed cost per mechanism at ~10 minutes**
+(read node's `lib/`, find mbun's site, verify). So the family represented roughly
+**600 minutes** of work and the +45 target inside 100 minutes was over-scoped by
+about **4.5×**. Use that figure: for an irreducibly per-file family, budget
+`mechanisms × 10 min`, and set the target from the budget rather than from the
+file count.
+
 ## A layered blocker is not a cause family
 
 The first correction — split by cause family instead of subsystem — was right, and
