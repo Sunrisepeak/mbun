@@ -1430,6 +1430,58 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_x509_parse_host,
     set_prop(ctx, obj, "fingerprint512", make_string(ctx, fingerprint(EVP_sha512())));
 
     // subjectAltName (node format: "DNS:a, DNS:b, IP Address:1.2.3.4").
+    //
+    // SECURITY: the textual form MUST NOT be produced by copying the raw ASN.1
+    // bytes. A DNS SAN may legally carry an embedded NUL, a comma or a quote,
+    // and every one of those lets a certificate's altname list be misread:
+    //   - an embedded NUL truncates the name in any C-string consumer, so a
+    //     certificate issued for "good.example.org\0.evil.example.com" reads
+    //     back as "good.example.org" and checkServerIdentity accepts it for the
+    //     victim host (the classic null-prefix spoof, CVE-2009-2408 class);
+    //   - a comma forges an extra list entry, because checkServerIdentity splits
+    //     the string on ", ".
+    // node therefore JSON-escapes any name that is not "safe", using the raw
+    // ASN1_STRING bytes (never ASN1_STRING_to_UTF8, which stops at the NUL).
+    // Translated from deps/ncrypto/ncrypto.cc IsSafeAltName / PrintAltName /
+    // PrintGeneralName. ref test-tls-0-dns-altname.
+    const auto is_safe_alt_name{[](const unsigned char* d, int n) {
+        for (int i = 0; i < n; ++i) {
+            const char c{static_cast<char>(d[i])};
+            if (c == '"' || c == '\\' || c == ',' || c == '\'') { return false; }
+            if (c < ' ' || c > '~') { return false; }
+        }
+        return true;
+    }};
+    // Appends the value, escaping it exactly as node does when it is not safe.
+    // The prefix ("DNS:", "email:", "URI:") is written by the caller and stays
+    // OUTSIDE the quotes, matching PrintGeneralName.
+    const auto append_alt_name{[&is_safe_alt_name](std::string& out,
+                                                   const unsigned char* d, int n) {
+        if (d == nullptr || n < 0) { return; }
+        if (is_safe_alt_name(d, n)) {
+            out.append(reinterpret_cast<const char*>(d), static_cast<std::size_t>(n));
+            return;
+        }
+        static constexpr char kHex[]{"0123456789abcdef"};
+        out.push_back('"');
+        for (int i = 0; i < n; ++i) {
+            const char c{static_cast<char>(d[i])};
+            if (c == '\\') {
+                out.append("\\\\");
+            } else if (c == '"') {
+                out.append("\\\"");
+            } else if (c >= ' ' && c != ',' && c <= '~') {
+                out.push_back(c);
+            } else {
+                // Everything else is treated as Latin-1 (the first 255 code
+                // points), which is what node emits.
+                out.append("\\u00");
+                out.push_back(kHex[(static_cast<unsigned char>(c) & 0xF0U) >> 4U]);
+                out.push_back(kHex[static_cast<unsigned char>(c) & 0x0FU]);
+            }
+        }
+        out.push_back('"');
+    }};
     std::string san;
     if (auto* names{static_cast<GENERAL_NAMES*>(
             X509_get_ext_d2i(cert, NID_subject_alt_name, nullptr, nullptr))}) {
@@ -1437,29 +1489,26 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_x509_parse_host,
         for (int i = 0; i < count; ++i) {
             GENERAL_NAME* gen{sk_GENERAL_NAME_value(names, i)};
             if (gen->type == GEN_DNS) {
-                unsigned char* utf8{nullptr};
-                const int len{ASN1_STRING_to_UTF8(&utf8, gen->d.dNSName)};
-                if (len > 0 && utf8 != nullptr) {
+                const ASN1_IA5STRING* nm{gen->d.dNSName};
+                if (nm != nullptr && ASN1_STRING_length(nm) > 0) {
                     if (!san.empty()) { san.append(", "); }
-                    san.append("DNS:").append(reinterpret_cast<char*>(utf8), len);
+                    san.append("DNS:");
+                    append_alt_name(san, ASN1_STRING_get0_data(nm), ASN1_STRING_length(nm));
                 }
-                if (utf8 != nullptr) { OPENSSL_free(utf8); }
             } else if (gen->type == GEN_EMAIL) {
-                unsigned char* utf8{nullptr};
-                const int len{ASN1_STRING_to_UTF8(&utf8, gen->d.rfc822Name)};
-                if (len > 0 && utf8 != nullptr) {
+                const ASN1_IA5STRING* nm{gen->d.rfc822Name};
+                if (nm != nullptr && ASN1_STRING_length(nm) > 0) {
                     if (!san.empty()) { san.append(", "); }
-                    san.append("email:").append(reinterpret_cast<char*>(utf8), len);
+                    san.append("email:");
+                    append_alt_name(san, ASN1_STRING_get0_data(nm), ASN1_STRING_length(nm));
                 }
-                if (utf8 != nullptr) { OPENSSL_free(utf8); }
             } else if (gen->type == GEN_URI) {
-                unsigned char* utf8{nullptr};
-                const int len{ASN1_STRING_to_UTF8(&utf8, gen->d.uniformResourceIdentifier)};
-                if (len > 0 && utf8 != nullptr) {
+                const ASN1_IA5STRING* nm{gen->d.uniformResourceIdentifier};
+                if (nm != nullptr && ASN1_STRING_length(nm) > 0) {
                     if (!san.empty()) { san.append(", "); }
-                    san.append("URI:").append(reinterpret_cast<char*>(utf8), len);
+                    san.append("URI:");
+                    append_alt_name(san, ASN1_STRING_get0_data(nm), ASN1_STRING_length(nm));
                 }
-                if (utf8 != nullptr) { OPENSSL_free(utf8); }
             } else if (gen->type == GEN_IPADD) {
                 // node prints "IP Address:<v4 dotted>" or the full 8-group IPv6
                 // form (no :: compression, lowercase hex) — lib/tls.js formats the

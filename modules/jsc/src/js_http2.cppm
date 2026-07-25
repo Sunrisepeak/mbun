@@ -1208,7 +1208,15 @@ export constexpr std::string_view kHttp2JS = R"JS(
         this.encrypted = true;
         if (!tls || !tls.connect) { this._fatal(mkErr("http2 https requires node:tls", "ERR_HTTP2_ERROR")); return; }
         const sock = tls.connect({
-          host, port, servername: options && options.servername ? options.servername : host,
+          // node internal/http2/core.js connect():
+          //   tls.connect(port, host, initializeTLSOptions(options,
+          //               net.isIP(host) ? undefined : host))
+          // — an IP authority must NOT become the SNI ServerName (tls.connect
+          // rejects that with ERR_INVALID_ARG_VALUE), so only a real hostname is
+          // promoted to servername.
+          host, port,
+          servername: options && options.servername ? options.servername
+            : (net && typeof net.isIP === "function" && net.isIP(host) ? undefined : host),
           ALPNProtocols: ["h2"], ca: options && options.ca, cert: options && options.cert,
           key: options && options.key, rejectUnauthorized: options && options.rejectUnauthorized !== undefined ? options.rejectUnauthorized : true,
         });

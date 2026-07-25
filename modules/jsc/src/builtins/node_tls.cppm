@@ -45,6 +45,7 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
     "string", "function", "number", "object", "Function", "Object",
     "boolean", "bigint", "symbol",
   ]);
+  // ERR_INVALID_ARG_VALUE / ERR_OUT_OF_RANGE report `inspect(value)`.
   const inspect = (v) => {
     if (v === undefined) return "undefined";
     if (v === null) return "null";
@@ -55,6 +56,36 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
       try { return JSON.stringify(v); } catch (e) { return "[Object]"; }
     }
     return String(v);
+  };
+  // ERR_INVALID_ARG_TYPE reports determineSpecificType(value), which is NOT the
+  // same as inspect: a primitive is rendered as "type <typeof> (<value>)" and an
+  // object as "an instance of <ctor>". Using inspect here produced
+  // "Received 1" where node says "Received type number (1)" — invisible while
+  // assert.throws ignored its expectation, and wrong the moment it does not.
+  // ref lib/internal/errors.js determineSpecificType.
+  const specificType = (v) => {
+    if (v === null) return "null";
+    if (v === undefined) return "undefined";
+    const t = typeof v;
+    if (t === "bigint") return "type bigint (" + String(v) + "n)";
+    if (t === "number") {
+      if (v === 0) return 1 / v === -Infinity ? "type number (-0)" : "type number (0)";
+      if (v !== v) return "type number (NaN)";
+      return "type number (" + String(v) + ")";
+    }
+    if (t === "boolean") return v ? "type boolean (true)" : "type boolean (false)";
+    if (t === "symbol") return "type symbol (" + String(v) + ")";
+    if (t === "function") return "function " + v.name;
+    if (t === "object") {
+      if (v.constructor && "name" in v.constructor) return "an instance of " + v.constructor.name;
+      return "[Object: null prototype] {}";
+    }
+    if (t === "string") {
+      let s = v;
+      if (s.length > 28) s = s.slice(0, 25) + "...";
+      return s.indexOf("'") === -1 ? "type string ('" + s + "')" : "type string (" + JSON.stringify(s) + ")";
+    }
+    return "type " + t + " (" + String(v) + ")";
   };
   const joinTypes = (arr, kw) => {
     const len = arr.length;
@@ -76,7 +107,7 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
     if (types.length) parts.push(joinTypes(types, "of type"));
     if (instances.length) parts.push("an instance of " + instances.join(" or "));
     if (other.length) parts.push(joinTypes(other, "one of"));
-    msg += parts.join(" or ") + ". Received " + inspect(actual);
+    msg += parts.join(" or ") + ". Received " + specificType(actual);
     const err = new TypeError(msg);
     err.code = "ERR_INVALID_ARG_TYPE";
     return err;
@@ -96,6 +127,14 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
   function ERR_TLS_INVALID_PROTOCOL_VERSION(version, name) {
     const err = new TypeError(version + " is not a valid " + name + " TLS protocol version");
     err.code = "ERR_TLS_INVALID_PROTOCOL_VERSION";
+    return err;
+  }
+  // node lib/internal/errors.js: 'TLS protocol version %j conflicts with
+  // secureProtocol %j' (%j is JSON, hence the quotes).
+  function ERR_TLS_PROTOCOL_VERSION_CONFLICT(version, secureProtocol) {
+    const err = new TypeError("TLS protocol version " + JSON.stringify(version) +
+      " conflicts with secureProtocol " + JSON.stringify(secureProtocol));
+    err.code = "ERR_TLS_PROTOCOL_VERSION_CONFLICT";
     return err;
   }
   function ERR_TLS_INVALID_PROTOCOL_METHOD(message) {
@@ -147,11 +186,61 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
       throw ERR_INVALID_ARG_TYPE(name, [VALID_TLS_ERROR_MESSAGE_TYPES], findInvalidTLSItem(value));
   };
 
+  // ---- DEFAULT_CIPHERS (node src/node_constants.h DEFAULT_CIPHER_LIST_CORE) ---
+  // The exact list node compiles in and exposes as both tls.DEFAULT_CIPHERS and
+  // crypto.constants.defaultCoreCipherList. It is strictly a *restriction* of
+  // OpenSSL's own default: the trailing !aNULL/!eNULL/!EXPORT/!DES/!RC4/!MD5/
+  // !PSK/!SRP/!CAMELLIA exclusions remove unauthenticated, unencrypted, export-
+  // grade and legacy suites. Copied verbatim so tests comparing the two agree.
+  const DEFAULT_CIPHERS =
+    "TLS_AES_256_GCM_SHA384:" +
+    "TLS_CHACHA20_POLY1305_SHA256:" +
+    "TLS_AES_128_GCM_SHA256:" +
+    "ECDHE-RSA-AES128-GCM-SHA256:" +
+    "ECDHE-ECDSA-AES128-GCM-SHA256:" +
+    "ECDHE-RSA-AES256-GCM-SHA384:" +
+    "ECDHE-ECDSA-AES256-GCM-SHA384:" +
+    "DHE-RSA-AES128-GCM-SHA256:" +
+    "ECDHE-RSA-AES128-SHA256:" +
+    "DHE-RSA-AES128-SHA256:" +
+    "ECDHE-RSA-AES256-SHA384:" +
+    "DHE-RSA-AES256-SHA384:" +
+    "ECDHE-RSA-AES256-SHA256:" +
+    "DHE-RSA-AES256-SHA256:" +
+    "HIGH:" +
+    "!aNULL:" +
+    "!eNULL:" +
+    "!EXPORT:" +
+    "!DES:" +
+    "!RC4:" +
+    "!MD5:" +
+    "!PSK:" +
+    "!SRP:" +
+    "!CAMELLIA";
+
   // ---- version defaults & valid set ----
   const VALID_TLS_VERSIONS = new Set(["TLSv1", "TLSv1.1", "TLSv1.2", "TLSv1.3"]);
   let DEFAULT_MIN_VERSION = "TLSv1.2";
   let DEFAULT_MAX_VERSION = "TLSv1.3";
   const DEFAULT_ECDH_CURVE = "auto";
+
+  // node src/node_options.cc: --tls-min-v1.{0,1,2,3} / --tls-max-v1.{2,3} move
+  // the default protocol window, and a later flag overrides an earlier one
+  // (test-tls-cli-min-version-1.0 passes --tls-min-v1.0 --tls-min-v1.1 and
+  // expects TLSv1). These only ever RESTRICT or widen the default window on the
+  // operator's explicit instruction; nothing here changes the window when no
+  // flag is given.
+  {
+    const argv = (G.process && G.process.execArgv) || [];
+    const minFlags = { "--tls-min-v1.0": "TLSv1", "--tls-min-v1.1": "TLSv1.1",
+                       "--tls-min-v1.2": "TLSv1.2", "--tls-min-v1.3": "TLSv1.3" };
+    const maxFlags = { "--tls-max-v1.2": "TLSv1.2", "--tls-max-v1.3": "TLSv1.3" };
+    for (const a of argv) {
+      if (typeof a !== "string") continue;
+      if (minFlags[a] !== undefined) DEFAULT_MIN_VERSION = minFlags[a];
+      else if (maxFlags[a] !== undefined) DEFAULT_MAX_VERSION = maxFlags[a];
+    }
+  }
 
   // ---- secureProtocol validation (lib/internal/tls/secure-context.js) ----
   const SECURE_PROTOCOL_METHODS = new Set([
@@ -174,6 +263,18 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
       ciphers, passphrase, ecdhCurve, minVersion, maxVersion, sessionTimeout,
       ticketKeys, clientCertEngine, dhparam, secureProtocol,
     } = options;
+    // node internal/tls/common.js SecureContext runs BEFORE configSecureContext,
+    // and inside it the order is: secureProtocol/minVersion+maxVersion conflict,
+    // then toV() version validity, then context.init() which is where an unknown
+    // method name becomes ERR_TLS_INVALID_PROTOCOL_METHOD. Checking the method
+    // name first reported the wrong error for `{ maxVersion, secureProtocol }`
+    // (test-tls-min-max-version expects the CONFLICT).
+    if (secureProtocol) {
+      if (minVersion != null) throw ERR_TLS_PROTOCOL_VERSION_CONFLICT(minVersion, secureProtocol);
+      if (maxVersion != null) throw ERR_TLS_PROTOCOL_VERSION_CONFLICT(maxVersion, secureProtocol);
+    }
+    if (minVersion != null && !VALID_TLS_VERSIONS.has(minVersion)) throw ERR_TLS_INVALID_PROTOCOL_VERSION(String(minVersion), "minimum");
+    if (maxVersion != null && !VALID_TLS_VERSIONS.has(maxVersion)) throw ERR_TLS_INVALID_PROTOCOL_VERSION(String(maxVersion), "maximum");
     validateSecureProtocol(secureProtocol);
     if (ciphers !== undefined && ciphers !== null) {
       validateString(ciphers, "options.ciphers");
@@ -199,8 +300,6 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
       throw ERR_CRYPTO_CUSTOM_ENGINE_NOT_SUPPORTED("Custom engines not supported by this OpenSSL");
     }
     if (dhparam === "auto") throw ERR_CRYPTO_UNSUPPORTED_OPERATION("Automatic DH parameter selection is not supported");
-    if (minVersion != null && !VALID_TLS_VERSIONS.has(minVersion)) throw ERR_TLS_INVALID_PROTOCOL_VERSION(String(minVersion), "minimum");
-    if (maxVersion != null && !VALID_TLS_VERSIONS.has(maxVersion)) throw ERR_TLS_INVALID_PROTOCOL_VERSION(String(maxVersion), "maximum");
     if (ticketKeys !== undefined && ticketKeys !== null) {
       validateBuffer(ticketKeys, "options.ticketKeys");
       if (ticketKeys.byteLength !== 48) throw ERR_INVALID_ARG_VALUE("options.ticketKeys", ticketKeys.byteLength, "must be exactly 48 bytes");
@@ -599,6 +698,7 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
   const assign = {
     CLIENT_RENEG_LIMIT: 3,
     CLIENT_RENEG_WINDOW: 600,
+    DEFAULT_CIPHERS,
     connect,
     convertALPNProtocols,
     createSecureContext,

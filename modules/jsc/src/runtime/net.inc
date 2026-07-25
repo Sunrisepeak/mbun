@@ -568,6 +568,10 @@ JSValueRef netn_tls_wrap_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
     // version constants. Empty/unknown leaves the backend default in place.
     if (argc > 8) { cfg.minVersion = mbun::tls::tls_version_from_name(fs_arg(ctx, argc, args, 8)); }
     if (argc > 9) { cfg.maxVersion = mbun::tls::tls_version_from_name(fs_arg(ctx, argc, args, 9)); }
+    // arg 10: node's options.ciphers, an OpenSSL cipher list string. Empty leaves
+    // the context default; a list OpenSSL matches nothing to fails the wrap
+    // rather than quietly widening the negotiated set.
+    if (argc > 10) { cfg.ciphers = fs_arg(ctx, argc, args, 10); }
     auto st{std::make_unique<NetTlsState>(
         isServer ? mbun::tls::TlsRole::server : mbun::tls::TlsRole::client, std::move(cfg))};
     if (!st->channel.valid()) {

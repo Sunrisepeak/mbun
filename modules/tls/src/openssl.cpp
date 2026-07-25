@@ -258,6 +258,19 @@ struct TlsChannel::Impl {
             && config.minVersion > config.maxVersion) {
             errorCode_ = "ERR_SSL_NO_SUPPORTED_VERSIONS_ENABLED";
         }
+        // Cipher list (node SecureContext::SetCiphers → SSL_CTX_set_cipher_list).
+        // Applied only when the caller asked for one; an unparsable list is a
+        // hard failure so the connection can never silently fall back to a
+        // broader default than was requested. node calls only set_cipher_list —
+        // the TLS 1.3 suites named in DEFAULT_CIPHERS are governed by
+        // SSL_CTX_set_ciphersuites and are deliberately left at their default.
+        if (!config.ciphers.empty()) {
+            if (::SSL_CTX_set_cipher_list(ctx_, config.ciphers.c_str()) != 1) {
+                errorCode_ = "ERR_SSL_NO_CIPHER_MATCH";
+                fail_("set_cipher_list: no cipher match for the requested list");
+                return false;
+            }
+        }
         ::SSL_CTX_set_verify(ctx_, verify_flags_for(role_, config.verify), nullptr);
 
         // Trust anchors for chain verification. An explicit PEM bundle in

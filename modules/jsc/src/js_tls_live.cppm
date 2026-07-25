@@ -84,6 +84,94 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
     try { return new crypto.X509Certificate(pem); } catch (e) { return undefined; }
   };
 
+  // ---- node argument validators (lib/internal/validators.js subset) ----------
+  // The live surface is where node runs most of its TLS option validation
+  // (internal/tls/wrap.js Server / TLSSocket / connect), and the corpus asserts
+  // the exact message, so determineSpecificType is translated from
+  // lib/internal/errors.js rather than approximated.
+  const specificType = (v) => {
+    if (v === null) return "null";
+    if (v === undefined) return "undefined";
+    const t = typeof v;
+    if (t === "bigint") return "type bigint (" + String(v) + "n)";
+    if (t === "number") {
+      if (v === 0) return 1 / v === -Infinity ? "type number (-0)" : "type number (0)";
+      if (v !== v) return "type number (NaN)";
+      return "type number (" + String(v) + ")";
+    }
+    if (t === "boolean") return v ? "type boolean (true)" : "type boolean (false)";
+    if (t === "symbol") return "type symbol (" + String(v) + ")";
+    if (t === "function") return "function " + v.name;
+    if (t === "object") {
+      if (v.constructor && "name" in v.constructor) return "an instance of " + v.constructor.name;
+      return "[Object: null prototype] {}";
+    }
+    if (t === "string") {
+      let s = v;
+      if (s.length > 28) s = s.slice(0, 25) + "...";
+      return s.indexOf("'") === -1 ? "type string ('" + s + "')" : "type string (" + JSON.stringify(s) + ")";
+    }
+    return "type " + t + " (" + String(v) + ")";
+  };
+  const argTypeError = (name, determinerText, actual) => {
+    const kind = String(name).indexOf(".") !== -1 ? "property" : "argument";
+    const e = new TypeError('The "' + name + '" ' + kind + " " + determinerText +
+      ". Received " + specificType(actual));
+    e.code = "ERR_INVALID_ARG_TYPE";
+    return e;
+  };
+  const outOfRange = (name, range, actual) => {
+    const e = new RangeError('The value of "' + name + '" is out of range. It must be ' +
+      range + ". Received " + specificType(actual));
+    e.code = "ERR_OUT_OF_RANGE";
+    return e;
+  };
+  // node's ERR_INVALID_ARG_VALUE reports `inspect(value)`, NOT
+  // determineSpecificType — so a string value comes back as 'x', not
+  // "type string ('x')". ref lib/internal/errors.js.
+  const invalidArgValue = (name, value, reason) => {
+    let shown;
+    if (typeof value === "string") shown = "'" + value + "'";
+    else if (typeof value === "bigint") shown = String(value) + "n";
+    else if (typeof value === "function") shown = "[Function: " + (value.name || "anonymous") + "]";
+    else if (value === null || typeof value !== "object") shown = String(value);
+    else { try { shown = JSON.stringify(value); } catch (e) { shown = String(value); } }
+    const e = new TypeError("The " + (String(name).indexOf(".") !== -1 ? "property" : "argument") +
+      " '" + name + "' " + reason + ". Received " + shown);
+    e.code = "ERR_INVALID_ARG_VALUE";
+    return e;
+  };
+  const validateString = (v, name) => {
+    if (typeof v !== "string") throw argTypeError(name, "must be of type string", v);
+  };
+  const validateNumber = (v, name, min, max) => {
+    if (typeof v !== "number") throw argTypeError(name, "must be of type number", v);
+    if ((min != null && v < min) || (max != null && v > max) || ((min != null || max != null) && v !== v))
+      throw outOfRange(name, (min != null ? ">= " + min : "") + (min != null && max != null ? " && " : "") + (max != null ? "<= " + max : ""), v);
+  };
+  const validateInt32 = (v, name, min, max) => {
+    if (min === undefined) min = -2147483648;
+    if (max === undefined) max = 2147483647;
+    if (typeof v !== "number") throw argTypeError(name, "must be of type number", v);
+    if (!Number.isInteger(v)) throw outOfRange(name, "an integer", v);
+    if (v < min || v > max) throw outOfRange(name, ">= " + min + " && <= " + max, v);
+  };
+  const validateUint32 = (v, name, positive) => {
+    if (typeof v !== "number") throw argTypeError(name, "must be of type number", v);
+    if (!Number.isInteger(v)) throw outOfRange(name, "an integer", v);
+    const min = positive ? 1 : 0;
+    if (v < min || v > 4294967295) throw outOfRange(name, ">= " + min + " && <= 4294967295", v);
+  };
+  const validateFunction = (v, name) => {
+    if (typeof v !== "function") throw argTypeError(name, "must be of type Function", v);
+  };
+  const validateObject = (v, name) => {
+    if (v === null || Array.isArray(v) || typeof v !== "object") throw argTypeError(name, "must be of type object", v);
+  };
+  const validateBuffer = (v, name) => {
+    if (!ArrayBuffer.isView(v)) throw argTypeError(name === undefined ? "buffer" : name, "must be an instance of Buffer, TypedArray, or DataView", v);
+  };
+
   const deferredTLS = (what) => {
     const e = new Error("tls." + what + " requires the socket event loop + real SSL_CTX handshake (DEFERRED in mbun: modules/tls TlsChannel / S-net)");
     e.code = "ERR_MBUN_DEFERRED";
@@ -170,9 +258,27 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
   class TLSSocket extends NetSocket {
     constructor(socket, options) {
       options = mergeSecureContext(options || {});
-      // node _tls_wrap.js: a TLSSocket is never half-open regardless of option.
-      super({ allowHalfOpen: false });
-      this.allowHalfOpen = false;
+      // node internal/tls/wrap.js TLSSocket: the transport must be a stream (it
+      // is wrapped in a JSStreamSocket otherwise), so a bare EventEmitter is a
+      // TypeError rather than a runtime error deep in the handshake.
+      // ref nodejs/node#3655, test-tls-wrap-event-emmiter.
+      if (socket != null && !isMbunNetSocket(socket) &&
+          !(typeof socket === "object" &&
+            (typeof socket.write === "function" || typeof socket.pipe === "function" ||
+             typeof socket._read === "function" || typeof socket._write === "function"))) {
+        throw argTypeError("socket", "must be an instance of net.Socket or stream.Duplex", socket);
+      }
+      if (options.SNICallback !== undefined && options.SNICallback !== null)
+        validateFunction(options.SNICallback, "options.SNICallback");
+      if (options.pskCallback !== undefined && options.pskCallback !== null)
+        validateFunction(options.pskCallback, "options.pskCallback");
+      // node internal/tls/wrap.js TLSSocket:
+      //   allowHalfOpen: socket ? socket.allowHalfOpen : tlsOptions.allowHalfOpen
+      // — when a transport is adopted the transport decides (a net.Socket
+      // defaults to false), and only a socket-less TLSSocket honours the option.
+      const halfOpen = socket ? !!socket.allowHalfOpen : !!options.allowHalfOpen;
+      super({ allowHalfOpen: halfOpen, highWaterMark: options.highWaterMark });
+      this.allowHalfOpen = halfOpen;
       this.encrypted = true;
       this.authorized = false;
       this.authorizationError = null;
@@ -181,6 +287,7 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
       this._secureEstablished = false;
       this._securePending = true;
       this.secureConnecting = !options.isServer;
+      this._isServer = !!options.isServer;
       this.ALPNProtocols = options.ALPNProtocols;
       this._rejectUnauthorized = options.rejectUnauthorized !== false;
       this._requestCert = !!options.requestCert || !options.isServer;
@@ -200,7 +307,25 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
       transport.on("drain", () => self.emit("drain"));
       transport.on("end", () => { self.readable = false; self.emit("end"); });
       transport.on("close", (hadErr) => { self.destroyed = true; self.emit("close", !!hadErr); });
-      transport.on("error", (e) => self.emit("error", e));
+      // node internal/tls/wrap.js onConnectEnd: a transport that disconnects
+      // BEFORE the handshake completes is reported as an ECONNRESET carrying the
+      // connect options, not as a bare read error — the corpus asserts path /
+      // host / port / localAddress on it (test-tls-wrap-econnreset*). The same
+      // logic lives in _http_client.js, so keep the shape identical.
+      transport.on("error", (e) => {
+        if (!self._secureEstablished && e && e.code === "ECONNRESET" && !self._hadError) {
+          self._hadError = true;
+          const o = self._connectOptions;
+          if (o) {
+            e.message = "Client network socket disconnected before secure TLS connection was established";
+            e.path = o.path;
+            e.host = o.host;
+            e.port = o.port;
+            e.localAddress = o.localAddress;
+          }
+        }
+        self.emit("error", e);
+      });
       // setTimeout() arms the timer on the transport, so the 'timeout' event
       // fires there — but every consumer (node:https' server keep-alive sweep,
       // socket.setTimeout(ms, cb), the corpus' own listeners) is attached to the
@@ -244,9 +369,11 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
           self.authorized = !!info.authorized;
           self._protocol = info.protocol || null;
           self._cipherName = info.cipher || "";
-          // node: alpnProtocol is the negotiated name, false when ALPN was
-          // attempted but nothing matched, null when ALPN was not offered.
-          self.alpnProtocol = info.alpnProtocol ? info.alpnProtocol : (self.ALPNProtocols ? false : null);
+          // node crypto_tls.cc TLSWrap::GetALPNNegotiatedProto: SSL_get0_alpn_
+          // selected yielding a zero-length protocol is reported as `false`,
+          // whether or not this side offered ALPN. `null` is only the
+          // constructor's initial value, i.e. "the handshake has not finished".
+          self.alpnProtocol = info.alpnProtocol ? info.alpnProtocol : false;
           if (info.peerCert) { self._peerCert = parseCert(info.peerCert); self._peerCertPem = info.peerCert; }
           if (info.servername) self.servername = self.servername || info.servername;
         } else {
@@ -282,6 +409,9 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
           alpn: alpnCsv(options.ALPNProtocols),
           minVersion: ver.min,
           maxVersion: ver.max,
+          // node SecureContext::SetCiphers. Only a caller-supplied list is sent;
+          // "" leaves the engine's default suite selection untouched.
+          ciphers: typeof options.ciphers === "string" ? options.ciphers : "",
         });
       };
       // A live fd means the reactor's connect() already returned, whether this is
@@ -307,6 +437,9 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
     // registering the callback on the transport too would fire it twice.
     setTimeout(ms, cb) {
       if (typeof cb === "function") this.once("timeout", cb);
+      // node net.Socket#setTimeout publishes the interval on the socket the
+      // caller holds, which for TLS is this plaintext edge.
+      this.timeout = (ms | 0) === 0 ? undefined : (ms | 0);
       if (this._transport) this._transport.setTimeout(ms);
       return this;
     }
@@ -336,13 +469,39 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
     getPeerFinished() { return undefined; }
     getTLSTicket() { return undefined; }
     isSessionReused() { return false; }
-    setServername(name) { this.servername = name; return this; }
+    // node internal/tls/wrap.js setServername: validateString, then refuse on a
+    // server-side socket — SNI travels client→server only.
+    setServername(name) {
+      validateString(name, "name");
+      if (this._isServer) {
+        const e = new Error("Cannot issue SNI from a TLS server-side socket");
+        e.code = "ERR_TLS_SNI_FROM_SERVER";
+        throw e;
+      }
+      this.servername = name;
+      return this;
+    }
     setSession() { return this; }
-    setMaxSendFragment() { return false; }
-    disableRenegotiation() {}
+    // node: validateInt32(size, 'size'), then SSL_set_max_send_fragment.
+    // DEFERRED: the fragment size is not yet threaded to the native TlsChannel,
+    // so the validated call reports failure rather than claiming success.
+    setMaxSendFragment(size) { validateInt32(size, "size"); return false; }
+    disableRenegotiation() { this._renegotiationDisabled = true; }
     enableTrace() {}
-    exportKeyingMaterial() { throw deferredTLS("TLSSocket.exportKeyingMaterial"); }
-    renegotiate() { return false; }
+    exportKeyingMaterial(length, label, context) {
+      validateUint32(length, "length", true);
+      validateString(label, "label");
+      if (context !== undefined) validateBuffer(context, "context");
+      throw deferredTLS("TLSSocket.exportKeyingMaterial");
+    }
+    // node internal/tls/wrap.js renegotiate(options, callback): both arguments
+    // are validated before anything is attempted, so a bare renegotiate() is an
+    // ERR_INVALID_ARG_TYPE rather than a silent false.
+    renegotiate(options, callback) {
+      validateObject(options, "options");
+      if (callback !== undefined) validateFunction(callback, "callback");
+      return false;
+    }
   }
 
   // ---- tls.connect(): open (or adopt) a socket and drive the client handshake -
@@ -370,12 +529,32 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
       else opts.port = a[0];
       if (host !== undefined) opts.host = host;
     }
+    // node internal/tls/wrap.js connect(): the defaults are folded in first, then
+    // checkServerIdentity / minDHSize are validated, then the secure context is
+    // built through the tls module's own createSecureContext export (so a caller
+    // that replaced it — as test-tls-client-default-ciphers does — is observed),
+    // and only then is an IP servername refused.
+    opts = Object.assign({
+      rejectUnauthorized: true,
+      ciphers: T.DEFAULT_CIPHERS,
+      checkServerIdentity: T.checkServerIdentity,
+      minDHSize: 1024,
+    }, opts);
+    validateFunction(opts.checkServerIdentity, "options.checkServerIdentity");
+    validateNumber(opts.minDHSize, "options.minDHSize", 1);
+    const secureContext = opts.secureContext || (typeof T.createSecureContext === "function"
+      ? T.createSecureContext(opts) : undefined);
+    if (opts.servername && netIsIP(opts.servername)) {
+      throw invalidArgValue("options.servername", opts.servername,
+        "Setting the TLS ServerName to an IP address is not permitted");
+    }
     const host = opts.host || opts.hostname || "localhost";
     const servername = opts.servername != null ? opts.servername
       : (typeof opts.host === "string" && !netIsIP(opts.host) ? opts.host : "");
     const transportOpt = opts.socket;
     const tlsOpts = { isServer: false, servername, ca: opts.ca, cert: opts.cert, key: opts.key, rejectUnauthorized: opts.rejectUnauthorized, ALPNProtocols: opts.ALPNProtocols,
-      minVersion: opts.minVersion, maxVersion: opts.maxVersion, secureProtocol: opts.secureProtocol, secureContext: opts.secureContext };
+      minVersion: opts.minVersion, maxVersion: opts.maxVersion, secureProtocol: opts.secureProtocol, secureContext: opts.secureContext,
+      ciphers: opts.ciphers };
 
     if (isMbunNetSocket(transportOpt)) {
       const tlsSock = new TLSSocket(transportOpt, tlsOpts);
@@ -389,13 +568,34 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
       G.queueMicrotask(() => tlsSock.emit("error", deferredTLS("connect (Duplex socket transport)")));
       return tlsSock;
     }
-    const transport = new NetSocket({ allowHalfOpen: false });
-    const tlsSock = new TLSSocket(transport, tlsOpts);
+    // The plaintext edge delegates every read/write to the transport, so the
+    // caller's highWaterMark has to reach the transport too — the TLSSocket
+    // aliases readableHighWaterMark/writableHighWaterMark onto it.
+    const transport = new NetSocket({ allowHalfOpen: false, highWaterMark: opts.highWaterMark });
+    const tlsOptsHwm = Object.assign({ highWaterMark: opts.highWaterMark }, tlsOpts);
+    const tlsSock = new TLSSocket(transport, tlsOptsHwm);
+    // node stores the resolved connect options on the socket (kConnectOptions);
+    // onConnectEnd reads path/host/port/localAddress back off them.
+    tlsSock._connectOptions = opts;
     if (cb) tlsSock.once("secureConnect", cb);
-    // A unix-socket/pipe target has a path instead of a port (node net.connect
-    // dispatches on the same distinction).
+    // node internal/tls/wrap.js connect(): only a socket this call created gets
+    // the timeout armed — a caller-supplied socket stays the caller's business.
+    if (opts.timeout) tlsSock.setTimeout(opts.timeout);
+    // node hands its whole options object to tlssock.connect(), so the net-level
+    // connect options reach net.Socket#connect — notably `lookup`, which
+    // test-tls-connect-timeout-option relies on to keep the socket from ever
+    // attempting the connection. A unix-socket/pipe target has a path instead of
+    // a port (node net.connect dispatches on the same distinction).
     if (typeof opts.path === "string" && opts.path) transport.connect(opts.path);
-    else transport.connect(opts.port | 0, String(host));
+    else {
+      const netOpts = { port: opts.port | 0, host: String(host) };
+      for (const k of ["lookup", "localAddress", "localPort", "family", "hints",
+                       "autoSelectFamily", "autoSelectFamilyAttemptTimeout",
+                       "blockList", "noDelay", "keepAlive", "keepAliveInitialDelay"]) {
+        if (opts[k] !== undefined) netOpts[k] = opts[k];
+      }
+      transport.connect(netOpts);
+    }
     return tlsSock;
   }
 
@@ -405,7 +605,19 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
   class Server extends NetServer {
     constructor(options, secureConnectionListener) {
       if (typeof options === "function") { secureConnectionListener = options; options = {}; }
-      super();
+      // node internal/tls/wrap.js Server: anything that is neither a function nor
+      // an object (nor nullish) is rejected before any option is read.
+      else if (options == null) options = {};
+      else if (typeof options !== "object") throw argTypeError("options", "must be of type object", options);
+      // node tls.Server runs net.Server.call(this, options, …), so the net-level
+      // construction options reach the parent and are published on the server.
+      // pauseOnConnect is deliberately NOT forwarded: this TLSSocket rides a
+      // separate transport socket whose readability drives the handshake, so
+      // pausing the transport would stall the ClientHello instead of merely
+      // deferring the first plaintext byte. DEFERRED until the plaintext edge
+      // owns its own read queue.
+      super({ allowHalfOpen: options.allowHalfOpen });
+      this.pauseOnConnect = !!options.pauseOnConnect;
       // node tls.Server runs setSecureContext(options) → createSecureContext in
       // the constructor, so an unusable option (a cipher list OpenSSL matches
       // nothing to, a bad secureProtocol, …) throws from createServer() rather
@@ -416,6 +628,24 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
       // which node:https then compares against (test-https-argument-of-creating).
       if (options && options.ALPNProtocols && T && typeof T.convertALPNProtocols === "function") {
         try { T.convertALPNProtocols(options.ALPNProtocols, this); } catch (e) {}
+      }
+      // node internal/tls/wrap.js Server, after setSecureContext: the
+      // Server-only options (the ones createSecureContext never sees) are
+      // validated here. handshakeTimeout defaults to 120s BEFORE the check, so
+      // `handshakeTimeout: 0` is legal and only a non-number is rejected.
+      const hsTimeoutOpt = options.handshakeTimeout || (120 * 1000);
+      validateNumber(hsTimeoutOpt, "options.handshakeTimeout");
+      if (options.SNICallback !== undefined && options.SNICallback !== null)
+        validateFunction(options.SNICallback, "options.SNICallback");
+      if (options.pskCallback !== undefined && options.pskCallback !== null)
+        validateFunction(options.pskCallback, "options.pskCallback");
+      if (options.ALPNCallback !== undefined && options.ALPNCallback !== null) {
+        validateFunction(options.ALPNCallback, "options.ALPNCallback");
+        if (options.ALPNProtocols) {
+          const e = new TypeError("The ALPNCallback and ALPNProtocols TLS options are mutually exclusive");
+          e.code = "ERR_TLS_ALPN_CALLBACK_WITH_PROTOCOLS";
+          throw e;
+        }
       }
       this._sharedCreds = options || {};
       this._contexts = new Map();
@@ -430,7 +660,7 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
         requestCert: creds.requestCert, rejectUnauthorized: creds.rejectUnauthorized,
         ALPNProtocols: creds.ALPNProtocols,
         minVersion: creds.minVersion, maxVersion: creds.maxVersion, secureProtocol: creds.secureProtocol,
-        secureContext: creds.secureContext,
+        secureContext: creds.secureContext, ciphers: creds.ciphers,
       });
       const self = this;
       tlsSock.once("secureConnect", () => self.emit("secureConnection", tlsSock));
@@ -442,7 +672,8 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
       const hsTimeout = creds.handshakeTimeout === undefined ? 120000 : creds.handshakeTimeout;
       if (hsTimeout > 0) {
         const timer = G.setTimeout(() => {
-          if (tlsSock._secureEstablished || tlsSock.destroyed) return;
+          if (tlsSock._secureEstablished || tlsSock.destroyed || tlsSock._errorEmitted) return;
+          tlsSock._errorEmitted = true;
           const e = new Error("TLS handshake timeout");
           e.code = "ERR_TLS_HANDSHAKE_TIMEOUT";
           self.emit("tlsClientError", e, tlsSock);
@@ -458,8 +689,26 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
       // the server process down. The listener also has to live on the TLSSocket
       // rather than on the raw transport, because the transport forwards its
       // errors there and an unlistened 'error' re-emit is what threw.
+      // node internal/tls/wrap.js onSocketClose: a peer that goes away before the
+      // handshake completes is reported to the server as `tlsClientError` with
+      // ConnResetException('socket hang up') — test-tls-econnreset matches that
+      // message. Only one of this and the 'error' path may fire.
+      raw.on("close", () => {
+        if (tlsSock._secureEstablished || tlsSock._errorEmitted) return;
+        tlsSock._errorEmitted = true;
+        const e = new Error("socket hang up");
+        e.code = "ECONNRESET";
+        self.emit("tlsClientError", e, tlsSock);
+      });
       tlsSock.on("error", (e) => {
         if (!tlsSock._secureEstablished) {
+          if (tlsSock._errorEmitted) return;
+          tlsSock._errorEmitted = true;
+          // node reports a peer that vanished mid-handshake through
+          // onSocketClose, i.e. as ConnResetException('socket hang up') — never
+          // as the raw transport's "read ECONNRESET" (test-tls-econnreset
+          // matches the message). Normalise so both arrival orders agree.
+          if (e && e.code === "ECONNRESET") e.message = "socket hang up";
           self.emit("tlsClientError", e, tlsSock);
           try { tlsSock.destroy(); } catch (e2) {}
           return;
@@ -470,9 +719,31 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
       });
     }
     setSecureContext(options) { this._sharedCreds = options || {}; }
-    addContext(servername, context) { this._contexts.set(servername, context); }
+    // node internal/tls/wrap.js addContext: an empty servername is refused (there
+    // would be nothing to match), and a plain options object is turned into a
+    // SecureContext first.
+    addContext(servername, context) {
+      if (!servername) {
+        const e = new Error('"Server name" is required for TLS server SNI context');
+        e.code = "ERR_TLS_REQUIRED_SERVER_NAME";
+        throw e;
+      }
+      this._contexts.set(servername, context);
+    }
     getTicketKeys() { return Buffer ? Buffer.alloc(48) : new Uint8Array(48); }
-    setTicketKeys() { return this; }
+    // node internal/tls/wrap.js setTicketKeys: validateBuffer, then assert the
+    // 48-byte length (16B name + 16B HMAC key + 16B AES key).
+    setTicketKeys(keys) {
+      validateBuffer(keys);
+      if (keys.byteLength !== 48) {
+        const e = new Error("Session ticket keys must be a 48-byte buffer");
+        e.code = "ERR_ASSERTION";
+        e.name = "AssertionError";
+        throw e;
+      }
+      this._ticketKeys = keys;
+      return this;
+    }
   }
   function createServer(options, connectionListener) { return new Server(options, connectionListener); }
 
