@@ -239,8 +239,25 @@ export constexpr std::string_view kNetJS = R"JS(
       opts = opts || {};
       this._fd = -1; this._wq = []; this._wqLen = 0; this._needDrain = false;
       this._shutW = false; this._shutSent = false; this._eof = false; this._closeEmitted = false;
-      this._paused = false; this._enc = null;
-      this._onread = opts.onread && typeof opts.onread.callback === "function" ? opts.onread.callback : null;
+      this._paused = false; this._enc = null; this._everRead = false;
+      // node net.Socket({ onread }): the socket reads INTO the caller's buffer
+      // and hands that exact object back, so `buf === sockBuf` holds and no
+      // per-chunk allocation happens (test-net-onread-static-buffer). `buffer`
+      // may also be a generator, which node calls once before the first read
+      // and again after every callback.
+      this._onread = null; this._onreadBuf = null; this._onreadGen = null; this._onreadPend = null;
+      {
+        const orOpt = opts.onread;
+        if (orOpt && typeof orOpt === "object" && typeof orOpt.callback === "function" &&
+            (typeof orOpt.buffer === "function" || ArrayBuffer.isView(orOpt.buffer))) {
+          this._onread = orOpt.callback;
+          if (typeof orOpt.buffer === "function") this._onreadGen = orOpt.buffer;
+          else this._onreadBuf = orOpt.buffer;
+        } else if (orOpt && typeof orOpt.callback === "function") {
+          // No usable buffer: keep the previous "hand the chunk over" shape.
+          this._onread = orOpt.callback;
+        }
+      }
       this.destroyed = false; this.connecting = false; this.readable = true; this.writable = true; this.pending = true;
       // Loop-reference state (see NET.hold): sticky intent + current hold.
       this._refd = true; this._held = false; this._loopOpen = false;
@@ -549,8 +566,52 @@ export constexpr std::string_view kNetJS = R"JS(
       if (q && q.length) { this._unshiftQ = null; return q.length === 1 ? q[0] : (G.Buffer ? G.Buffer.concat(q) : q[0]); }
       return null;
     }
-    pause() { this._paused = true; return this; }
-    resume() { this._paused = false; return this; }
+    // node net.js afterConnect: `if (readable && !self.isPaused()) self.read(0)`
+    // — a socket paused BEFORE it ever started reading never calls readStart,
+    // so libuv never makes the handle active and uv_loop_alive() ignores it.
+    // `net.connect(port).pause()` therefore lets the process exit
+    // (test-net-connect-paused-connection). A socket paused after data has
+    // already flowed keeps its hold: node only stops the read once the readable
+    // buffer fills, which this reactor cannot observe.
+    pause() { this._paused = true; this._syncEofHold(); return this; }
+    resume() { this._paused = false; this._syncEofHold(); if (this._onreadPend) this._onreadFeed(); return this; }
+    // node internal/stream_base_commons.js onStreamRead, kBuffer branch: each
+    // read fills the user buffer (never more than its length), the callback is
+    // invoked with (nread, thatSameBuffer), a `false` return stops the flow, and
+    // a buffer generator is re-run after every callback. Bytes that arrive
+    // faster than the buffer can carry them wait here rather than being dropped.
+    _onreadFeed() {
+      while (this._onreadPend && this._onreadPend.length > 0 && !this._paused && !this.destroyed) {
+        if (!this._onreadBuf) {
+          if (!this._onreadGen) {
+            // onread without a usable buffer (not node-reachable, but this
+            // runtime accepted it before): hand the whole chunk over as-is.
+            const all = this._onreadPend; this._onreadPend = null;
+            this._onread(all.length, G.Buffer ? G.Buffer.from(all) : all);
+            break;
+          }
+          const nb = this._onreadGen();
+          if (!ArrayBuffer.isView(nb)) { this._paused = true; break; }
+          this._onreadBuf = nb;
+        }
+        const buf = this._onreadBuf;
+        const n = Math.min(buf.length, this._onreadPend.length);
+        if (n <= 0) break;
+        buf.set(this._onreadPend.subarray(0, n), 0);
+        this._onreadPend = this._onreadPend.length > n ? this._onreadPend.subarray(n) : null;
+        let ok = this._onread(n, buf) !== false;
+        if (this._onreadGen) {
+          const nb = this._onreadGen();
+          if (ArrayBuffer.isView(nb)) this._onreadBuf = nb; else ok = false;
+        }
+        if (!ok) this._paused = true;
+      }
+    }
+    _onreadPush(bytes) {
+      this._onreadPend = (this._onreadPend && this._onreadPend.length)
+        ? concatU8([this._onreadPend, bytes]) : u8(bytes);
+      this._onreadFeed();
+    }
     // stream.Readable#pipe / #unpipe. node's net.Socket is a Duplex, so every
     // consumer that forwards a socket somewhere else uses pipe() — including
     // the corpus' own echo fixture (test/fixtures/tls-connect.js does
@@ -644,7 +705,7 @@ export constexpr std::string_view kNetJS = R"JS(
         : (G.Buffer ? G.Buffer.from(chunk) : chunk);
       if (!b.length) return true;
       this.bytesRead += b.length;
-      if (this._onread) this._onread(b.length, b);
+      if (this._onread) this._onreadPush(b);
       else this.emit("data", this._enc && G.Buffer ? b.toString(this._enc) : b);
       return true;
     }
@@ -654,7 +715,7 @@ export constexpr std::string_view kNetJS = R"JS(
       this._unshiftQ = null;
       for (const c of q) {
         if (this.destroyed) return;
-        if (this._onread) this._onread(c.length, c);
+        if (this._onread) this._onreadPush(c);
         else this.emit("data", this._enc && G.Buffer ? c.toString(this._enc) : c);
       }
     }
@@ -858,7 +919,7 @@ export constexpr std::string_view kNetJS = R"JS(
     // and destroy on EOF anyway), are unaffected.
     _syncEofHold() {
       if (this.destroyed || !this._loopOpen) return;
-      if (this._eof && this._wq.length === 0) NET.release(this);
+      if ((this._eof || (this._paused && !this._everRead)) && this._wq.length === 0) NET.release(this);
       else NET.hold(this);
     }
     // Hand OpenSSL's NSS keylog lines to whoever asked for them (node's
@@ -932,11 +993,12 @@ export constexpr std::string_view kNetJS = R"JS(
             break;
           }
           const bytes = fromB64(r);
+          this._everRead = true;
           this.bytesRead += bytes.length;
           if (this._timeoutMs) this._armTimeout();
           const chunk = G.Buffer ? G.Buffer.from(bytes) : bytes;
           if (this._unshiftQ) this._flushUnshift();   // unshifted bytes come first
-          if (this._onread) this._onread(bytes.length, chunk);
+          if (this._onread) this._onreadPush(bytes);
           else this.emit("data", this._enc ? (G.Buffer ? chunk.toString(this._enc) : latin1(bytes, 0, bytes.length)) : chunk);
           if (this.destroyed || this._paused) break;
         }

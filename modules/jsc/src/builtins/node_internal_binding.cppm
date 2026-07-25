@@ -1704,29 +1704,63 @@ inline constexpr std::string_view kNodeInternalBindingJS = R"JS(
   };
 
   // -------------------------------------------------------------- tcp_wrap ----
-  // node src/tcp_wrap.cc. This runtime's net is not built on a libuv handle
-  // reachable from JS, so `bind` reports EADDRNOTAVAIL rather than pretending
-  // an address is bindable — `common/net.js hasMultiLocalhost()` then reports
-  // "no second localhost", which makes the tests that need one skip themselves
-  // instead of failing on a false claim.
+  // node src/tcp_wrap.cc. `bind`/`listen` are real: they take a descriptor from
+  // the reactor's own native listener (__mbunNetNative.listen, which is where
+  // the Permission Model gate lives), so `handle.fd` is a genuine socket that
+  // guessHandleType(2) reports as TCP. That is what internal/dgram's
+  // _createSocketHandle has to reject when handed a non-UDP descriptor
+  // (test-dgram-create-socket-handle-fd), and it used to be unreachable because
+  // every method answered EADDRNOTAVAIL.
+  //
+  // NOTE: the native combines bind(2)+listen(2), so bind() here also starts
+  // listening. Nothing in node's JS uses a TCP wrap bound-but-not-listening
+  // except to read `fd`, so the difference is not observable from JS. It does
+  // make `common/net.js hasMultiLocalhost()` answer truthfully (127.0.0.2 IS
+  // bindable on Linux) rather than always claiming "no second localhost".
   factories["tcp_wrap"] = () => ({
     // node src/tcp_wrap.h SocketType
     constants: { SOCKET: 0, SERVER: 1, UV_TCP_IPV6ONLY: 1, UV_TCP_REUSEPORT: 4 },
     TCP: class TCP {
-      constructor(type) { this.type = type; this.reading = false; }
-      bind() { return -99; }
-      bind6() { return -99; }
-      listen() { return -99; }
+      constructor(type) { this.type = type; this.reading = false; this.fd = -1; this._port = 0; this._address = "0.0.0.0"; }
+      _bind_(address, port) {
+        const NN = globalThis.__mbunNetNative;
+        if (!NN || typeof NN.listen !== "function") return -99;
+        if (this.fd >= 0) return 0;
+        try {
+          const h = NN.listen(address || "0.0.0.0", port | 0, false);
+          this.fd = h.fd; this._port = h.port; this._address = address || "0.0.0.0";
+          return 0;
+        } catch (e) {
+          // libuv errno = -(POSIX errno) on Linux; the native reports the name.
+          const UV = { EACCES: -13, EADDRINUSE: -98, EADDRNOTAVAIL: -99, EAFNOSUPPORT: -97,
+                       EINVAL: -22, EMFILE: -24, ENFILE: -23, ENOENT: -2, EPERM: -1 };
+          const m = String((e && e.message) || e);
+          for (const k in UV) if (m.indexOf(k) !== -1) return UV[k];
+          return -99;
+        }
+      }
+      bind(address, port) { return this._bind_(address, port); }
+      bind6(address, port) { return this._bind_(address, port); }
+      listen() { return this._bind_("0.0.0.0", 0); }
       connect() { return -99; }
       connect6() { return -99; }
       open() { return -9; }
-      getsockname() { return -9; }
+      getsockname(out) {
+        if (this.fd < 0) return -9;
+        if (out) { out.address = this._address; out.port = this._port; out.family = "IPv4"; }
+        return 0;
+      }
       getpeername() { return -9; }
       setNoDelay() { return 0; }
       setKeepAlive() { return 0; }
       setSimultaneousAccepts() { return 0; }
       readStart() { return 0; } readStop() { return 0; }
-      close(cb) { if (typeof cb === "function") cb(); }
+      close(cb) {
+        const NN = globalThis.__mbunNetNative;
+        if (this.fd >= 0 && NN && typeof NN.close === "function") { try { NN.close(this.fd); } catch (e) {} }
+        this.fd = -1;
+        if (typeof cb === "function") cb();
+      }
       ref() {} unref() {}
     },
     TCPConnectWrap: class TCPConnectWrap {
