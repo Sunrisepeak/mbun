@@ -469,21 +469,33 @@ public:
             ".call(globalThis.module.exports, globalThis.exports, globalThis.require, "
             "globalThis.module, globalThis.__filename, globalThis.__dirname, globalThis.require)"};
         if (script.starts_with("#!")) script.replace(0, 2, "//");
-        // A throw escaping the ENTRY script is an uncaught exception like any
-        // other: node hands it to 'uncaughtExceptionMonitor', the capture
+        // Two requirements meet here, and BOTH are load-bearing.
+        //
+        // (1) A throw escaping the ENTRY script is an uncaught exception like
+        // any other: node hands it to 'uncaughtExceptionMonitor', the capture
         // callback and 'uncaughtException' before deciding the process's fate.
         // mbun used to let it fall out of eval_void into fail_run_, so a
-        // top-level throw bypassed every handler the script had installed —
-        // process.on('uncaughtException') simply did not work for the entry
-        // file. When nothing claims it, __mbun_uncaught arms the same fatal
-        // channel the pump uses, so the unclaimed case is unchanged (report +
-        // status 1). The wrapper stays on line 1, like the CommonJS prefix
-        // above, so reported line numbers do not move.
+        // top-level throw bypassed every handler the script installed. When
+        // nothing claims it, __mbun_uncaught arms the same fatal channel the
+        // pump uses, so the unclaimed case is unchanged (report + status 1).
+        //
+        // (2) The tick drain must ride in the SAME evaluation as the entry
+        // body: the synchronous top level is node's first callback boundary and
+        // its nextTick queue has to run before any promise continuation the top
+        // level queued. A separate eval_void would be too late — JSC drains its
+        // microtask queue when this evaluation releases the lock.
+        //
+        // The drain sits AFTER the catch, not inside the try: node runs the
+        // uncaughtException path first and the tick queue after it, and a throw
+        // in the body must not swallow ticks the body already queued. The
+        // wrapper stays on line 1, like the CommonJS prefix above, so reported
+        // line numbers do not move.
         const std::string entryScript{"try{(function (" + cjsParams + ") {" + script + "\n})" +
                                       cjsArgs + ";}catch(__mbun_entry_err){"
                                       "if(globalThis.__mbun_uncaught)"
                                       "globalThis.__mbun_uncaught(__mbun_entry_err);"
-                                      "else throw __mbun_entry_err;}"};
+                                      "else throw __mbun_entry_err;}"
+                                      "globalThis.__mbunRunTicks&&globalThis.__mbunRunTicks();"};
         // A top-level-await entry (flagged by the transpiler) goes straight to the
         // async wrapper: in script mode `await (expr)` would otherwise PARSE as a
         // call to an `await` identifier and fail at run time, after side effects.
@@ -625,9 +637,12 @@ public:
 
     // The child-process I/O tick, guarded the same way as the other pump
     // phases: a throw from a 'exit'/'data' listener is an uncaught exception.
+    // The trailing __mbunRunTicks is the nextTick drain for this phase; it must
+    // stay inside this evaluation (see pump_event_loop / p.nextTick).
     static constexpr std::string_view kIoTickJs{
-        "(function(){try{return globalThis.__mbun_io_tick?__mbun_io_tick():0;}"
-        "catch(e){globalThis.__mbun_uncaught&&globalThis.__mbun_uncaught(e);return 0;}})()"};
+        "(function(){let r=0;try{r=globalThis.__mbun_io_tick?__mbun_io_tick():0;}"
+        "catch(e){globalThis.__mbun_uncaught&&globalThis.__mbun_uncaught(e);}"
+        "globalThis.__mbunRunTicks&&globalThis.__mbunRunTicks();return r;})()"};
 
     // Is an unclaimed uncaught exception waiting to kill the process? Every pump
     // phase routes an escaping throw to node's 'uncaughtException' path
@@ -740,14 +755,25 @@ public:
             // something to drop. Swallowing it (which is what these phases used
             // to do) left the throwing test's handles registered, so the loop
             // never drained and the file hung instead of failing.
-            (void)eval_void("try{globalThis.__mbun_drain_timers&&globalThis.__mbun_drain_timers(200);}"
-                            "catch(e){globalThis.__mbun_uncaught&&globalThis.__mbun_uncaught(e);}");
-            (void)eval_void("try{globalThis.__mbunNetDrain&&globalThis.__mbunNetDrain();}"
-                            "catch(e){globalThis.__mbun_uncaught&&globalThis.__mbun_uncaught(e);}");
+            // Every phase ends by draining process.nextTick, in the phase's OWN
+            // evaluation. That is node's callback boundary rule (drain the tick
+            // queue after each callback, before promise microtasks), and it only
+            // holds if the drain shares the evaluation: JSC drains its microtask
+            // queue at this eval's lock release, so a drain in a later eval would
+            // run after the promise continuations it must precede.
+            constexpr std::string_view kRunTicks{
+                "globalThis.__mbunRunTicks&&globalThis.__mbunRunTicks();"};
+            (void)eval_void(std::string{"try{globalThis.__mbun_drain_timers&&globalThis.__mbun_drain_timers(200);}"
+                            "catch(e){globalThis.__mbun_uncaught&&globalThis.__mbun_uncaught(e);}"} +
+                            std::string{kRunTicks});
+            (void)eval_void(std::string{"try{globalThis.__mbunNetDrain&&globalThis.__mbunNetDrain();}"
+                            "catch(e){globalThis.__mbun_uncaught&&globalThis.__mbun_uncaught(e);}"} +
+                            std::string{kRunTicks});
             // Deliver any POSIX signal that arrived since the last iteration to
             // its process.on("SIG…") listeners (the handler itself only set a flag).
-            (void)eval_void("try{globalThis.__mbunSignalTick&&globalThis.__mbunSignalTick();}"
-                            "catch(e){globalThis.__mbun_uncaught&&globalThis.__mbun_uncaught(e);}");
+            (void)eval_void(std::string{"try{globalThis.__mbunSignalTick&&globalThis.__mbunSignalTick();}"
+                            "catch(e){globalThis.__mbun_uncaught&&globalThis.__mbun_uncaught(e);}"} +
+                            std::string{kRunTicks});
             drain_microtasks_();
             auto ioBusy{eval_number(kIoTickJs)};
             drain_microtasks_();
@@ -1776,6 +1802,21 @@ public:
                    // bun_core::Global::mimalloc_cleanup).
                    WTF::releaseFastMallocFreeMemory();
                    return JSValueMakeNumber(c, 0);
+               });
+        // A microtask CHECKPOINT callable from JS. JSC drains its microtask
+        // queue when an evaluation releases the lock, so any JS loop that runs
+        // several node callbacks inside ONE evaluation runs them all before a
+        // single promise continuation. __mbun_drain_timers is exactly that loop
+        // (it fires up to 200 due timers per call), so
+        //   setTimeout(() => { Promise.resolve().then(p); setTimeout(t, 0); })
+        // ran t before p, where node — which checkpoints after every timer
+        // callback (libuv timer phase -> processTicksAndRejections) — runs p
+        // first. This is the seam that lets that loop checkpoint.
+        set_fn(ctx_, global, "__mbunDrainMicrotasksNative",
+               [](JSContextRef c, JSObjectRef, JSObjectRef, std::size_t, const JSValueRef[],
+                  JSValueRef*) -> JSValueRef {
+                   if (JSC::JSGlobalObject* g{::toJS(c)}) g->vm().drainMicrotasks();
+                   return JSValueMakeUndefined(c);
                });
         // JSC backing-width introspection used only by bun:internal-for-testing.
         JSObjectRef jscInternals{JSObjectMake(ctx_, nullptr, nullptr)};

@@ -1994,20 +1994,34 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       // (libuv's callback boundary), not something to drop. Swallowing it here
       // left the throwing test's sockets/servers registered, so the loop never
       // drained and the file hung to its harness timeout instead of failing.
+      let bail = false;
       try { t.fn.apply(null, t.a); }
       catch (e) {
-        if (G.__mbun_uncaught && !G.__mbun_uncaught(e)) { fired++; T.fired++; break; }
+        if (G.__mbun_uncaught && !G.__mbun_uncaught(e)) bail = true;
       }
-      // node drains the nextTick/microtask queue after EVERY timer and
-      // immediate callback (lib/internal/timers.js runNextTicks). Without this
-      // a whole chain of setImmediates ran inside one drain call and every
-      // nextTick they scheduled was deferred behind the entire chain — so
-      // `emitWarning(x); setImmediate(next)` delivered x after `next`
-      // (test-process-warning). JSC only drains at a JSLock release, which
-      // never comes while this loop holds the lock; PN.drainMicrotasks is the
-      // VM's own drain (runtime/process_base.inc).
-      if (drainTicks !== null) { try { drainTicks(); } catch (e) {} }
+      // A timer callback is a node callback boundary. TWO drains, in this order,
+      // and the order is the whole point.
+      //
+      // First the nextTick queue. It must run before the next timer fires and
+      // before any promise continuation the callback queued. This loop fires up
+      // to `budget` timers inside ONE JSC evaluation and JSC only drains at a
+      // JSLock release, which never comes while the loop holds it — so without
+      // this, `setTimeout(() => { nextTick(t); ... })` ran t after every other
+      // due timer instead of immediately.
+      //
+      // Then the promise microtasks, for the same locking reason: a `.then()`
+      // queued by one timer must beat the next due timer, and node runs a
+      // microtask checkpoint after each timer callback.
+      //
+      // Note for anyone tempted to collapse these into one call: they were the
+      // same thing until process.nextTick stopped being queueMicrotask. Draining
+      // microtasks alone no longer drains the tick queue, and the visible
+      // symptom of getting it wrong is subtle — `emitWarning(x); setImmediate(next)`
+      // delivering x after `next`, which is what test-process-warning pins.
+      if (G.__mbunRunTicks) G.__mbunRunTicks();
+      if (G.__mbunDrainMicrotasksNative) G.__mbunDrainMicrotasksNative();
       fired++; T.fired++;
+      if (bail) break;
     }
     const now2 = Date.now();
     let due = 0; for (let i = 0; i < T.q.length; i++) if (T.q[i].at <= now2) due++;
