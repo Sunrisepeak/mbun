@@ -791,6 +791,7 @@ public:
             // counter so a dead peer cannot wedge the loop forever.
             auto rem{eval_number(
                 "(globalThis.__mbun_timers_refd?globalThis.__mbun_timers_refd():0)+"
+                "(globalThis.__mbunTickCount?globalThis.__mbunTickCount():0)+"
                 "(globalThis.__mbunNet?globalThis.__mbunNet.pending:0)")};
             // A ref'd handle pins the loop indefinitely: a listening Bun.serve
             // (serveActive) or a ref'd node handle — net.Server, net.Socket,
@@ -1623,6 +1624,18 @@ public:
   // globalThis and fails the file on anything it does not recognise.
   Object.defineProperty(globalThis, "__mbunRunTicks",
                         { value: runTicks, writable: true, configurable: true, enumerable: false });
+  // The pump's "does the loop still have work?" test has to see this queue.
+  // Before this existed it counted ref'd timers and in-flight net ops only, so a
+  // pending process.nextTick did not hold the loop: the pump declared the run
+  // stuck and the bun runner reported "test timed out (no pending timers /
+  // unresolved async)". That is exactly what splitting nextTick out of
+  // queueMicrotask cost -- 256 bun files, because as a microtask the work used
+  // to be invisible-but-already-drained, and as its own queue it became
+  // invisible-and-pending. Counting it is safe: ticks drain at every callback
+  // boundary the pump owns, so a counted tick always runs on the next phase.
+  Object.defineProperty(globalThis, "__mbunTickCount",
+                        { value: () => _tickQ.length, writable: true, configurable: true,
+                          enumerable: false });
   p.nextTick = function (fn) {
     const a = Array.prototype.slice.call(arguments, 1);
     let cb = fn;
