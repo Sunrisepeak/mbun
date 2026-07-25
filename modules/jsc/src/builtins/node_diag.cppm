@@ -472,9 +472,16 @@ inline constexpr std::string_view kNodeDiagJS = R"JS(
   M["diagnostics_channel"] = diagnostics_channel;
   M["node:diagnostics_channel"] = diagnostics_channel;
 
-  // ---- util.styleText back-fill (Node lib/util.js) ----
+  // ---- util.styleText (Node lib/util.js) ----
+  // Full translation, replacing a stand-in that (a) knew no hex colours and
+  // (b) closed a nested style with the plain reset code instead of re-opening
+  // the enclosing one, so `styleText('red', 'A' + styleText('blue','B') + 'C')`
+  // printed C uncoloured.
   const util = M["util"];
-  if (util && typeof util.styleText !== "function") {
+  if (util) {
+    const kEscape = "[";
+    const kEscapeEnd = "m";
+    const kBoldCode = 1, kDimCode = 2;
     const defaultFG = 39, defaultBG = 49;
     const colors = {
       reset: [0, 0], bold: [1, 22], dim: [2, 22], italic: [3, 23], underline: [4, 24],
@@ -495,33 +502,147 @@ inline constexpr std::string_view kNodeDiagJS = R"JS(
       bgCyanBright: [106, defaultBG], bgWhiteBright: [107, defaultBG],
     };
     const aliases = { grey: "gray", blackBright: "gray", swapColors: "inverse",
-      swapcolors: "inverse", conceal: "hidden", strikeThrough: "strikethrough",
+      swapcolors: "inverse", conceal: "hidden", faint: "dim", strikeThrough: "strikethrough",
       crossedout: "strikethrough", crossedOut: "strikethrough",
       doubleUnderline: "doubleunderline", bgGrey: "bgGray", bgBlackBright: "bgGray" };
     for (const a in aliases) colors[a] = colors[aliases[a]];
-    const validateFormat = (key) => {
-      if (colors[key] == null) {
-        const e = new TypeError('The argument \'format\' must be one of: ' +
-          Object.keys(colors).map((k) => "'" + k + "'").join(", ") + '. Received ' + String(key));
-        e.code = "ERR_INVALID_ARG_VALUE";
-        throw e;
-      }
+    // node exposes the palette as util.inspect.colors; validateOneOf reads its
+    // own property names to build the "must be one of: …" message.
+    if (typeof util.inspect === "function" && util.inspect.colors === undefined) {
+      try { util.inspect.colors = colors; } catch (e) {}
+    }
+    // getStyleCache: precomputed open/close sequences. `keepClose` marks the
+    // styles whose close code (22) is shared by bold and dim, so a nested one
+    // must keep its own reset AND re-open the outer style.
+    const styleCache = { __proto__: null };
+    for (const key of Object.keys(colors)) {
+      const codes = colors[key];
+      if (!codes) continue;
+      styleCache[key] = {
+        openSeq: kEscape + codes[0] + kEscapeEnd,
+        closeSeq: kEscape + codes[1] + kEscapeEnd,
+        keepClose: codes[0] === kDimCode || codes[0] === kBoldCode,
+      };
+    }
+    const hexColorRegExp = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/;
+    const hexStyleCache = new Map();
+    const getHexStyle = (hex) => {
+      const cached = hexStyleCache.get(hex);
+      if (cached !== undefined) return cached;
+      let h = hex.slice(1);
+      if (h.length === 3) h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2];
+      const r = parseInt(h.slice(0, 2), 16), g = parseInt(h.slice(2, 4), 16), b = parseInt(h.slice(4, 6), 16);
+      const style = {
+        openSeq: kEscape + "38;2;" + r + ";" + g + ";" + b + kEscapeEnd,
+        closeSeq: kEscape + "39" + kEscapeEnd,
+      };
+      if (hexStyleCache.size >= 100) hexStyleCache.delete(hexStyleCache.keys().next().value);
+      hexStyleCache.set(hex, style);
+      return style;
     };
-    util.styleText = function styleText(format, text) {
-      if (typeof text !== "string") throw argTypeError("text", "string", text);
-      if (Array.isArray(format)) {
-        let left = "", right = "";
-        for (const key of format) {
-          validateFormat(key);
-          const codes = colors[key];
-          left += "[" + codes[0] + "m";
-          right = "[" + codes[1] + "m" + right;
+    // node replaceCloseCode: every occurrence of the style's own close sequence
+    // inside `str` (i.e. where a nested styleText ended) is replaced by this
+    // style's OPEN sequence, so the enclosing colour resumes. A trailing close
+    // at the very end of the string is left alone.
+    const replaceCloseCode = (str, closeSeq, openSeq, keepClose) => {
+      const closeLen = closeSeq.length;
+      let index = str.indexOf(closeSeq);
+      if (index === -1) return str;
+      let result = "", lastIndex = 0;
+      const replacement = keepClose ? closeSeq + openSeq : openSeq;
+      do {
+        const afterClose = index + closeLen;
+        if (afterClose < str.length) { result += str.slice(lastIndex, index) + replacement; lastIndex = afterClose; }
+        else break;
+        index = str.indexOf(closeSeq, lastIndex);
+      } while (index !== -1);
+      return result + str.slice(lastIndex);
+    };
+    const inspectValueOf = (v) => {
+      try { return typeof util.inspect === "function" ? util.inspect(v) : String(v); }
+      catch (e) { return String(v); }
+    };
+    const invalidValue = (name, value, reason) => {
+      const e = new TypeError("The " + (String(name).indexOf(".") !== -1 ? "property" : "argument") +
+        " '" + name + "' " + reason + ". Received " + inspectValueOf(value));
+      e.code = "ERR_INVALID_ARG_VALUE";
+      return e;
+    };
+    const validateOneOfFormat = (key) => {
+      throw invalidValue("format", key, "must be one of: " +
+        Object.keys(colors).map((k) => "'" + k + "'").join(", "));
+    };
+    // isReadableStream / isWritableStream / isNodeStream, collapsed to the duck
+    // typing those three share.
+    const isStreamish = (s) =>
+      s !== null && typeof s === "object" &&
+      (typeof s.pipe === "function" || typeof s.write === "function" ||
+       typeof s.getReader === "function" || typeof s.getWriter === "function" ||
+       typeof s._read === "function" || typeof s._write === "function");
+    // internal/util/colors shouldColorize.
+    const shouldColorize = (stream) => {
+      const env = (G.process && G.process.env) || {};
+      if (env.FORCE_COLOR !== undefined) return env.FORCE_COLOR !== "0";
+      if (env.NODE_DISABLE_COLORS !== undefined || env.NO_COLOR !== undefined) return false;
+      return !!(stream && stream.isTTY &&
+        (typeof stream.getColorDepth !== "function" || stream.getColorDepth() > 2));
+    };
+    util.styleText = function styleText(format, text, options) {
+      const validateStream = (options === undefined || options === null || options.validateStream === undefined)
+        ? true : options.validateStream;
+      // Fast path: a single known format with stream validation turned off.
+      if (!validateStream && typeof format === "string" && typeof text === "string") {
+        if (format === "none") return text;
+        const style = styleCache[format];
+        if (style !== undefined) {
+          return style.openSeq + replaceCloseCode(text, style.closeSeq, style.openSeq, style.keepClose) + style.closeSeq;
         }
-        return left + text + right;
+        if (format[0] === "#") {
+          let hexStyle = hexStyleCache.get(format);
+          if (hexStyle === undefined && hexColorRegExp.exec(format) !== null) hexStyle = getHexStyle(format);
+          if (hexStyle !== undefined) {
+            return hexStyle.openSeq + replaceCloseCode(text, hexStyle.closeSeq, hexStyle.openSeq, false) + hexStyle.closeSeq;
+          }
+        }
       }
-      validateFormat(format);
-      const codes = colors[format];
-      return "[" + codes[0] + "m" + text + "[" + codes[1] + "m";
+      if (typeof text !== "string") throw argTypeError("text", "string", text);
+      if (options !== undefined && (options === null || typeof options !== "object" || Array.isArray(options)))
+        throw argTypeError("options", "object", options);
+      if (typeof validateStream !== "boolean") throw argTypeError("options.validateStream", "boolean", validateStream);
+
+      let skipColorize;
+      if (validateStream) {
+        const stream = (options && options.stream !== undefined) ? options.stream : (G.process && G.process.stdout);
+        if (!isStreamish(stream))
+          throw argTypeError("stream", ["ReadableStream", "WritableStream", "Stream"], stream);
+        skipColorize = !shouldColorize(stream);
+      }
+
+      const formatArray = Array.isArray(format) ? format : [format];
+      let openCodes = "", closeCodes = "", processedText = text;
+      for (const key of formatArray) {
+        if (key === "none") continue;
+        if (typeof key === "string" && key[0] === "#") {
+          let hexStyle = hexStyleCache.get(key);
+          if (hexStyle === undefined) {
+            if (hexColorRegExp.exec(key) === null)
+              throw invalidValue("format", key, "must be a valid hex color (#RGB or #RRGGBB)");
+            if (skipColorize) continue;
+            hexStyle = getHexStyle(key);
+          } else if (skipColorize) continue;
+          openCodes += hexStyle.openSeq;
+          closeCodes = hexStyle.closeSeq + closeCodes;
+          processedText = replaceCloseCode(processedText, hexStyle.closeSeq, hexStyle.openSeq, false);
+          continue;
+        }
+        const style = styleCache[key];
+        if (style === undefined) validateOneOfFormat(key);
+        openCodes += style.openSeq;
+        closeCodes = style.closeSeq + closeCodes;
+        processedText = replaceCloseCode(processedText, style.closeSeq, style.openSeq, style.keepClose);
+      }
+      if (skipColorize) return text;
+      return openCodes + processedText + closeCodes;
     };
   }
 })();
