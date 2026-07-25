@@ -45,6 +45,7 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
     "string", "function", "number", "object", "Function", "Object",
     "boolean", "bigint", "symbol",
   ]);
+  // ERR_INVALID_ARG_VALUE / ERR_OUT_OF_RANGE report `inspect(value)`.
   const inspect = (v) => {
     if (v === undefined) return "undefined";
     if (v === null) return "null";
@@ -55,6 +56,36 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
       try { return JSON.stringify(v); } catch (e) { return "[Object]"; }
     }
     return String(v);
+  };
+  // ERR_INVALID_ARG_TYPE reports determineSpecificType(value), which is NOT the
+  // same as inspect: a primitive is rendered as "type <typeof> (<value>)" and an
+  // object as "an instance of <ctor>". Using inspect here produced
+  // "Received 1" where node says "Received type number (1)" — invisible while
+  // assert.throws ignored its expectation, and wrong the moment it does not.
+  // ref lib/internal/errors.js determineSpecificType.
+  const specificType = (v) => {
+    if (v === null) return "null";
+    if (v === undefined) return "undefined";
+    const t = typeof v;
+    if (t === "bigint") return "type bigint (" + String(v) + "n)";
+    if (t === "number") {
+      if (v === 0) return 1 / v === -Infinity ? "type number (-0)" : "type number (0)";
+      if (v !== v) return "type number (NaN)";
+      return "type number (" + String(v) + ")";
+    }
+    if (t === "boolean") return v ? "type boolean (true)" : "type boolean (false)";
+    if (t === "symbol") return "type symbol (" + String(v) + ")";
+    if (t === "function") return "function " + v.name;
+    if (t === "object") {
+      if (v.constructor && "name" in v.constructor) return "an instance of " + v.constructor.name;
+      return "[Object: null prototype] {}";
+    }
+    if (t === "string") {
+      let s = v;
+      if (s.length > 28) s = s.slice(0, 25) + "...";
+      return s.indexOf("'") === -1 ? "type string ('" + s + "')" : "type string (" + JSON.stringify(s) + ")";
+    }
+    return "type " + t + " (" + String(v) + ")";
   };
   const joinTypes = (arr, kw) => {
     const len = arr.length;
@@ -76,7 +107,7 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
     if (types.length) parts.push(joinTypes(types, "of type"));
     if (instances.length) parts.push("an instance of " + instances.join(" or "));
     if (other.length) parts.push(joinTypes(other, "one of"));
-    msg += parts.join(" or ") + ". Received " + inspect(actual);
+    msg += parts.join(" or ") + ". Received " + specificType(actual);
     const err = new TypeError(msg);
     err.code = "ERR_INVALID_ARG_TYPE";
     return err;

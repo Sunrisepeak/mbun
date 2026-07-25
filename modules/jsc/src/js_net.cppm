@@ -195,11 +195,12 @@ export constexpr std::string_view kNetJS = R"JS(
       // 'data' rather than running the Readable machinery, but consumers of a
       // *socket* legitimately read it: npm `ws` socketOnClose gates its final
       // drain on `socket._readableState.endEmitted` and then `socket.read()`.
-      this._readableState = { endEmitted: false, ended: false, destroyed: false, length: 0, flowing: true, readable: true, objectMode: false };
+      this._hwm = typeof opts.highWaterMark === "number" ? opts.highWaterMark : HWM;
+      this._readableState = { endEmitted: false, ended: false, destroyed: false, length: 0, flowing: true, readable: true, objectMode: false, highWaterMark: this._hwm };
       // node:http's OutgoingMessage.end() sets _writableState.corked before its
       // final uncork(); keep the cork counter in one place.
       this._corked = 0;
-      this._writableState = { corked: 0, ended: false, finished: false, destroyed: false, length: 0, objectMode: false, highWaterMark: HWM };
+      this._writableState = { corked: 0, ended: false, finished: false, destroyed: false, length: 0, objectMode: false, highWaterMark: this._hwm };
     }
     _adopt(fd) {
       // A descriptor received over IPC (SCM_RIGHTS) never went through
@@ -351,6 +352,9 @@ export constexpr std::string_view kNetJS = R"JS(
       ms = ms | 0;
       if (typeof cb === "function") this.once("timeout", cb);
       this._timeoutMs = ms;
+      // node net.Socket#setTimeout publishes the interval as `socket.timeout`
+      // (0/undefined once cleared), which tls.connect({ timeout }) then reports.
+      this.timeout = ms === 0 ? undefined : ms;
       this._armTimeout();
       return this;
     }
@@ -382,8 +386,13 @@ export constexpr std::string_view kNetJS = R"JS(
     cork() { this._corked = (this._corked | 0) + 1; if (this._writableState) this._writableState.corked = this._corked; return this; }
     uncork() { if (this._corked > 0) this._corked--; if (this._writableState) this._writableState.corked = this._corked; return this; }
     get writableCorked() { return this._corked | 0; }
-    get writableHighWaterMark() { return HWM; }
-    get readableHighWaterMark() { return HWM; }
+    // node honours the `highWaterMark` construction option on both sides of the
+    // duplex (net.Socket passes it straight to stream.Duplex), so tls.connect
+    // ({ highWaterMark }) is observable on the socket it creates.
+    get writableHighWaterMark() { return this._hwm; }
+    get readableHighWaterMark() { return this._hwm; }
+    // node net.Socket#bufferSize: how much this socket still has queued to write.
+    get bufferSize() { return this.writableLength; }
     // node net.Socket#ref/unref: sticky user intent over the handle's loop
     // reference. These were no-ops, so an unref'd keep-alive/agent socket still
     // pinned the process.
@@ -704,6 +713,11 @@ export constexpr std::string_view kNetJS = R"JS(
         e.code = "ERR_INVALID_ARG_TYPE"; throw e;
       }
       this._opts = opts || {};
+      // node net.Server publishes both construction options as own properties;
+      // tls.Server inherits them through net.Server.call(this, options, …), and
+      // test-tls-server-parent-constructor-options reads them directly.
+      this.allowHalfOpen = !!this._opts.allowHalfOpen;
+      this.pauseOnConnect = !!this._opts.pauseOnConnect;
       if (typeof cb === "function") this.on("connection", cb);
       this._fd = -1; this._addr = null; this.listening = false; this._conns = new Set();
       // node semantics: `_refd` is the sticky user intent (a handle unref'd
@@ -877,6 +891,10 @@ export constexpr std::string_view kNetJS = R"JS(
             if (er || !clientHandle || typeof clientHandle.fd !== "number" || clientHandle.fd < 0) return;
             const sock = new Socket({ allowHalfOpen: !!this._opts.allowHalfOpen })._adopt(clientHandle.fd);
             sock.localPort = this._addr ? this._addr.port : 0;
+            // node net.js onconnection: with pauseOnConnect the accepted socket
+            // is handed to the listener already paused, so the consumer decides
+            // when the first byte is read (it may pass the fd elsewhere first).
+            if (this._opts.pauseOnConnect) sock.pause();
             this._conns.add(sock);
             sock.once("close", () => this._conns.delete(sock));
             this.emit("connection", sock);
@@ -950,6 +968,7 @@ export constexpr std::string_view kNetJS = R"JS(
         if (this._rawAccept) { this._rawAccept(cfd); progress++; continue; }
         const sock = new Socket({ allowHalfOpen: !!this._opts.allowHalfOpen })._adopt(cfd);
         sock.localPort = this._addr ? this._addr.port : 0;
+        if (this._opts.pauseOnConnect) sock.pause();
         this._conns.add(sock);
         sock.once("close", () => this._conns.delete(sock));
         progress++;

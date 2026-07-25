@@ -126,9 +126,18 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
     e.code = "ERR_OUT_OF_RANGE";
     return e;
   };
+  // node's ERR_INVALID_ARG_VALUE reports `inspect(value)`, NOT
+  // determineSpecificType — so a string value comes back as 'x', not
+  // "type string ('x')". ref lib/internal/errors.js.
   const invalidArgValue = (name, value, reason) => {
+    let shown;
+    if (typeof value === "string") shown = "'" + value + "'";
+    else if (typeof value === "bigint") shown = String(value) + "n";
+    else if (typeof value === "function") shown = "[Function: " + (value.name || "anonymous") + "]";
+    else if (value === null || typeof value !== "object") shown = String(value);
+    else { try { shown = JSON.stringify(value); } catch (e) { shown = String(value); } }
     const e = new TypeError("The " + (String(name).indexOf(".") !== -1 ? "property" : "argument") +
-      " '" + name + "' " + reason + ". Received " + specificType(value));
+      " '" + name + "' " + reason + ". Received " + shown);
     e.code = "ERR_INVALID_ARG_VALUE";
     return e;
   };
@@ -263,9 +272,13 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
         validateFunction(options.SNICallback, "options.SNICallback");
       if (options.pskCallback !== undefined && options.pskCallback !== null)
         validateFunction(options.pskCallback, "options.pskCallback");
-      // node _tls_wrap.js: a TLSSocket is never half-open regardless of option.
-      super({ allowHalfOpen: false });
-      this.allowHalfOpen = false;
+      // node internal/tls/wrap.js TLSSocket:
+      //   allowHalfOpen: socket ? socket.allowHalfOpen : tlsOptions.allowHalfOpen
+      // — when a transport is adopted the transport decides (a net.Socket
+      // defaults to false), and only a socket-less TLSSocket honours the option.
+      const halfOpen = socket ? !!socket.allowHalfOpen : !!options.allowHalfOpen;
+      super({ allowHalfOpen: halfOpen, highWaterMark: options.highWaterMark });
+      this.allowHalfOpen = halfOpen;
       this.encrypted = true;
       this.authorized = false;
       this.authorizationError = null;
@@ -401,6 +414,9 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
     // registering the callback on the transport too would fire it twice.
     setTimeout(ms, cb) {
       if (typeof cb === "function") this.once("timeout", cb);
+      // node net.Socket#setTimeout publishes the interval on the socket the
+      // caller holds, which for TLS is this plaintext edge.
+      this.timeout = (ms | 0) === 0 ? undefined : (ms | 0);
       if (this._transport) this._transport.setTimeout(ms);
       return this;
     }
@@ -528,13 +544,31 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
       G.queueMicrotask(() => tlsSock.emit("error", deferredTLS("connect (Duplex socket transport)")));
       return tlsSock;
     }
-    const transport = new NetSocket({ allowHalfOpen: false });
-    const tlsSock = new TLSSocket(transport, tlsOpts);
+    // The plaintext edge delegates every read/write to the transport, so the
+    // caller's highWaterMark has to reach the transport too — the TLSSocket
+    // aliases readableHighWaterMark/writableHighWaterMark onto it.
+    const transport = new NetSocket({ allowHalfOpen: false, highWaterMark: opts.highWaterMark });
+    const tlsOptsHwm = Object.assign({ highWaterMark: opts.highWaterMark }, tlsOpts);
+    const tlsSock = new TLSSocket(transport, tlsOptsHwm);
     if (cb) tlsSock.once("secureConnect", cb);
-    // A unix-socket/pipe target has a path instead of a port (node net.connect
-    // dispatches on the same distinction).
+    // node internal/tls/wrap.js connect(): only a socket this call created gets
+    // the timeout armed — a caller-supplied socket stays the caller's business.
+    if (opts.timeout) tlsSock.setTimeout(opts.timeout);
+    // node hands its whole options object to tlssock.connect(), so the net-level
+    // connect options reach net.Socket#connect — notably `lookup`, which
+    // test-tls-connect-timeout-option relies on to keep the socket from ever
+    // attempting the connection. A unix-socket/pipe target has a path instead of
+    // a port (node net.connect dispatches on the same distinction).
     if (typeof opts.path === "string" && opts.path) transport.connect(opts.path);
-    else transport.connect(opts.port | 0, String(host));
+    else {
+      const netOpts = { port: opts.port | 0, host: String(host) };
+      for (const k of ["lookup", "localAddress", "localPort", "family", "hints",
+                       "autoSelectFamily", "autoSelectFamilyAttemptTimeout",
+                       "blockList", "noDelay", "keepAlive", "keepAliveInitialDelay"]) {
+        if (opts[k] !== undefined) netOpts[k] = opts[k];
+      }
+      transport.connect(netOpts);
+    }
     return tlsSock;
   }
 
@@ -548,7 +582,15 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
       // an object (nor nullish) is rejected before any option is read.
       else if (options == null) options = {};
       else if (typeof options !== "object") throw argTypeError("options", "must be of type object", options);
-      super();
+      // node tls.Server runs net.Server.call(this, options, …), so the net-level
+      // construction options reach the parent and are published on the server.
+      // pauseOnConnect is deliberately NOT forwarded: this TLSSocket rides a
+      // separate transport socket whose readability drives the handshake, so
+      // pausing the transport would stall the ClientHello instead of merely
+      // deferring the first plaintext byte. DEFERRED until the plaintext edge
+      // owns its own read queue.
+      super({ allowHalfOpen: options.allowHalfOpen });
+      this.pauseOnConnect = !!options.pauseOnConnect;
       // node tls.Server runs setSecureContext(options) → createSecureContext in
       // the constructor, so an unusable option (a cipher list OpenSSL matches
       // nothing to, a bad secureProtocol, …) throws from createServer() rather
