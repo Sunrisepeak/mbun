@@ -1,6 +1,6 @@
 {
  "purpose": "Per-file named causes for corpus files that are NOT passing. Exists to remove the ~35min triage phase that every wave-2 agent paid independently and then threw away. A brief MUST draw its worklist from here rather than asking an agent to re-triage. Entries are what the agent that filed them measured; a stale entry is a bug -- re-derive before budgeting.",
- "provenance": "wave-2 agents w2/agent-1 (tls), w2/agent-2 (http), w2/agent-3 (fs), round 10",
+ "provenance": "wave-2 agents w2/agent-1 (tls), w2/agent-2 (http), w2/agent-3 (fs), round 10; tls per-file causes extracted from the r10-j6 full run logs at integration (155 non-pass tls/https: 119 fail, 19 timeout, 17 self-skip)",
  "how_to_use": "Group by `cause`, count files per cause, budget mechanisms x 10min + 55min overhead. Do NOT budget by subsystem -- see compat/README.md 'Allocate agents by cause family, not by subsystem'.",
  "caveat": "Coverage is uneven: the fs inventory is per-file and complete (58 files); tls and http are recorded at cause-shape granularity because that is the level their agents reported. Filling the tls/http per-file rows is itself a cheap, high-leverage task.",
  "causes": {
@@ -149,6 +149,170 @@
    "subsystem": "tls",
    "note": "CORRECTED LEAD: briefed as '@SECLEVEL=0 is never forwarded'. It IS forwarded, to SSL_CTX_set_cipher_list. Remaining gap is narrower: SSL_CTX_set_ciphersuites (TLS 1.3 suites use a different setter) plus --tls-min-v1.x last-flag-wins.",
    "action": "re-derive the file count from the narrower gap before budgeting"
+  },
+  "tls-verify-error-code-mapping": {
+   "corpus": "node",
+   "subsystem": "tls",
+   "files": [
+    "test-https-simple.js",
+    "test-tls-client-auth.js",
+    "test-tls-friendly-error-message.js",
+    "test-tls-set-default-ca-certificates-append-https-request.js",
+    "test-tls-set-default-ca-certificates-reset-https-request.js",
+    "test-tls-socket-default-options.js"
+   ],
+   "cause": "mbun surfaces OpenSSL verify code 20 (UNABLE_TO_GET_ISSUER_CERT_LOCALLY, 'issuer not found locally') where node surfaces 21 (UNABLE_TO_VERIFY_LEAF_SIGNATURE, 'chain has one non-self-signed cert'). One file surfaces null instead of any code. The two codes differ by how a one-cert chain is treated, so this is chain-depth / X509_STORE flag handling, not a trust-store contents problem.",
+   "confidence": "CAUSE named -- the actual/expected pair identifies it uniquely",
+   "action": "single mechanism; highest-value tls cluster found so far"
+  },
+  "tls-connect-duplex-transport-unimplemented": {
+   "corpus": "node",
+   "subsystem": "tls",
+   "files": [
+    "test-tls-connect-stream-writes.js",
+    "test-tls-destroy-whilst-write.js",
+    "test-tls-error-servername.js",
+    "test-tls-generic-stream.js",
+    "test-tls-js-stream.js",
+    "test-tls-streamwrap-buffersize.js"
+   ],
+   "cause": "mbun throws its own explicit error: 'tls.connect (Duplex socket transport) requires the socket event loop + real SSL_CTX handshake (DEFERRED)'. tls.connect over a caller-supplied Duplex/`socket:` option is simply not implemented.",
+   "confidence": "CAUSE named -- mbun says so itself",
+   "action": "architectural; a known-unimplemented path, not a bug hunt"
+  },
+  "tls-protocol-method-validation": {
+   "corpus": "node",
+   "subsystem": "tls",
+   "files": [
+    "test-tls-cli-max-version-1.2.js",
+    "test-tls-cli-max-version-1.3.js",
+    "test-tls-cli-min-version-1.1.js",
+    "test-tls-cli-min-version-1.2.js",
+    "test-tls-cli-min-version-1.3.js",
+    "test-tls-min-max-version.js"
+   ],
+   "cause": "SSLv2_method/SSLv3_method and friends must be rejected with ERR_TLS_INVALID_PROTOCOL_METHOD.",
+   "confidence": "CAUSE named",
+   "action": "pure validation; cheap"
+  },
+  "tls-mustcall-never-fired": {
+   "corpus": "node",
+   "subsystem": "tls",
+   "files": [
+    "test-https-agent-keylog.js",
+    "test-https-server-close-idle.js",
+    "test-https-server-connections-checking-leak.js",
+    "test-tls-client-reject-12.js",
+    "test-tls-client-reject.js",
+    "test-tls-keylog-tlsv13.js",
+    "test-tls-over-http-tunnel.js",
+    "test-tls-secure-context-usage-order.js",
+    "test-tls-socket-snicallback-without-server.js",
+    "test-tls-starttls-server.js"
+   ],
+   "cause": "node's common.mustCall reports 'Expected exactly N, actual 0' at exit: an expected event never fired. SAME CLASS as http-timeout-shape-A (a dead flow), but here the process exits rather than hanging. The specific missing event differs per file and must be read from the log's stack (e.g. test-https-agent-keylog wants a 'keylog' event 10x).",
+   "confidence": "CLASS named, per-file event NOT yet named",
+   "action": "read the named event out of each log before budgeting"
+  },
+  "tls-value-divergence-UNSPLIT": {
+   "corpus": "node",
+   "subsystem": "tls",
+   "files_sample": [
+    "test-tls-buffersize",
+    "test-tls-client-destroy-soon",
+    "test-tls-pause",
+    "test-https-drain",
+    "test-https-max-headers-count"
+   ],
+   "file_count_approx": 17,
+   "cause": "NOT A CAUSE -- this is the residue of the 'strictly equal' bucket whose actual/expected pair is a bare number or boolean (`5 !== 3`, `false !== true`), which identifies nothing on its own. Recorded as explicitly unsplit so nobody mistakes it for a mechanism. Calling a manifestation a cause has cost this project three separate rounds.",
+   "confidence": "MANIFESTATION ONLY -- do not budget as one family",
+   "action": "split per file by reading the assertion's surrounding test intent; do not hand this bucket to an agent whole"
+  },
+  "tls-small-clusters": {
+   "corpus": "node",
+   "subsystem": "tls",
+   "clusters": {
+    "address-family-selection (2)": [
+     "test-https-connect-address-family",
+     "test-tls-connect-address-family"
+    ],
+    "sni-callback-result-null (2)": [
+     "test-tls-sni-option",
+     "test-tls-sni-server-client"
+    ],
+    "session-ticket (2)": [
+     "test-tls-ticket",
+     "test-tls-ticket-12"
+    ],
+    "version-string-TLSv1.1-vs-TLSv1 (1)": [
+     "test-tls-cli-min-version-1.0"
+    ],
+    "ALPNCallback-undefined (1)": [
+     "test-https-argument-of-creating"
+    ],
+    "cipher-list-empty-vs-undefined (1)": [
+     "test-tls-cipher-list"
+    ],
+    "handshake-alert-failure (5)": "first error is `ssl: error:...:SSL routines::sslv3 alert handshake failure`",
+    "no-cipher-match (2)": "first error is `Error: No cipher match`"
+   },
+   "confidence": "each pair/triple is a plausible single mechanism; unverified",
+   "action": "batch only"
+  },
+  "tls-timeout-shape-B-stalled-exchange": {
+   "corpus": "node",
+   "subsystem": "tls",
+   "file_count": 12,
+   "files": [
+    "test-https-agent-abort-controller",
+    "test-tls-client-renegotiation-13",
+    "test-tls-connect-abort-controller",
+    "test-tls-delayed-attach-error",
+    "test-tls-delayed-attach",
+    "test-tls-destroy-stream-12",
+    "test-tls-destroy-stream",
+    "test-tls-inception",
+    "test-tls-interleave",
+    "test-tls-psk-alpn-callback-exception-handling",
+    "test-tls-retain-handle-no-abort",
+    "test-tls-socket-failed-handshake-emits-error"
+   ],
+   "signature": "Uniform across all 12: NET.pending=0, handles=3, items=3 -- one listening Server plus the client/server socket pair, and BOTH sockets readable=true writable=true destroyed=false _paused=false _wq=0. Nothing queued, nothing paused, both ends open and idle.",
+   "cause": "A genuinely stalled exchange: each side is waiting for bytes the other will never send. NOT an event-loop bug -- node would hold the loop here identically. This is the fifth independent confirmation that hangs in this project are protocol-semantics gaps rather than handle-lifetime bugs.",
+   "hypothesis_i_checked_and_REFUTED": "I read NET.pending=0 as 'no fd is in the poll set, so arriving bytes never wake the loop', which would have made all 12 one bug. js_net.cppm:138 says pending counts bounded in-flight operations (e.g. a fetch awaiting its response), NOT poll-set membership. What holds the loop is _held/_loopOpen, both true here. pending=0 is normal. Do not brief an agent on the poll-set theory.",
+   "confidence": "CLASS named and uniform; NOT a single mechanism",
+   "action": "largest tls block. Budget per file or per small group, not as one sweep -- and note it is dominated by abort/destroy/attach-timing cases, which suggests the shared theme is teardown DURING handshake rather than steady-state transfer"
+  },
+  "tls-timeout-shape-A-dead-client-flow": {
+   "corpus": "node",
+   "subsystem": "tls",
+   "file_count": 5,
+   "files": [
+    "test-https-client-resume",
+    "test-https-keep-alive-drop-requests",
+    "test-tls-add-context",
+    "test-tls-async-cb-after-socket-end",
+    "test-tls-secure-session"
+   ],
+   "signature": "Server listening, ZERO live sockets",
+   "cause": "Client flow died; server.close() sits in a callback that never fired. Same shape as http-timeout-shape-A (10 files) -- fix the client flow, not the loop.",
+   "confidence": "CLASS named",
+   "action": "share a mechanism with the http shape-A block; consider one agent for both (15 files total)"
+  },
+  "tls-timeout-shape-D-native-block": {
+   "corpus": "node",
+   "subsystem": "tls",
+   "file_count": 2,
+   "files": [
+    "test-tls-fast-writing",
+    "test-tls-handshake-exception"
+   ],
+   "signature": "hang_dump.js produces NO dump at all (rc=124) even with a ref'd timer bounding the pump's poll park",
+   "cause": "The pump is blocked inside native code and JS never regains control. Most severe shape: a JS-level fix cannot reach it.",
+   "confidence": "CLASS named, native frame NOT yet identified",
+   "action": "attach gdb or use modules/crash_handler; identify the blocking native call before budgeting"
   }
- }
+ },
+ "coverage_note": "tls timeouts are now triaged: 19 files -> 3 shapes (B:12, A:5, D:2), collapsed by running tools/integration/hang_dump.js over every one. This is the same collapse the http block underwent, and it reproduces the same headline: none of the 19 is an event-loop bug. Cost ~5 minutes total, which is the argument for triaging centrally rather than making each agent pay for it."
 }
