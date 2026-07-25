@@ -265,7 +265,13 @@ void worker_thread_main(std::shared_ptr<WebWorker> w, std::string source, std::s
 // ── main-VM host callbacks (globalThis.__mbunWorkerNative.*) ─────────────────
 // spawn(source, workerDataJson) → threadId
 JSValueRef worker_spawn_host(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
-                             const JSValueRef argv[], JSValueRef*) {
+                             const JSValueRef argv[], JSValueRef* exc) {
+    // Permission Model: node gates the WorkerThreads scope in
+    // src/node_worker.cc's Worker::New, before the thread is created — the same
+    // place, here. A JS-side check in node:worker_threads would be reachable
+    // around via this host function.
+    if (permission_deny_scope(ctx, exc, mbun::permission::Scope::WorkerThreads, ""))
+        return JSValueMakeUndefined(ctx);
     std::string source{arg_string(ctx, argc, argv, 0)};
     std::string workerDataJson{arg_string(ctx, argc, argv, 1)};
     int id;

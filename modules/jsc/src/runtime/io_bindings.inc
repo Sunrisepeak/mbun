@@ -602,9 +602,25 @@ bool fs_path_too_long(JSContextRef ctx, JSValueRef* exc, const std::string& path
     return false;
 }
 
+
+// ── the Permission Model gate ────────────────────────────────────────────────
+// node enforces --permission/--allow-fs-* inside src/node_file.cc, at the point
+// where the path reaches the syscall. THIS block is mbun's equivalent boundary:
+// `__mbunFsNative` / `__mbunFdNative` are the only ways any JS in this runtime
+// reaches the filesystem (node:fs, fs/promises, Bun.file, the module loader all
+// funnel here), so a check placed in the JS `fs` shim could be walked around by
+// calling these directly while a check placed HERE cannot.
+//
+// The read/write classification is taken function-for-function from node
+// (node_file.cc's THROW_IF_INSUFFICIENT_PERMISSIONS call sites); where node
+// gates two scopes for one call (rename, copyFile, symlink) both are gated here,
+// in node's order, because the ORDER decides which error a script sees.
+//
+// Every gate is a no-op unless the model is enabled — see permission_deny_fs.
 JSValueRef fsn_readFile_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                            const JSValueRef args[], JSValueRef* exc) {
     std::string path{fs_arg(ctx, argc, args, 0)};
+    if (permission_deny_fs(ctx, exc, path, false)) return JSValueMakeUndefined(ctx);
     if (fs_path_too_long(ctx, exc, path, "open")) return JSValueMakeUndefined(ctx);
     if (auto c{read_file(path)}) return make_string(ctx, *c);
     return fs_throw(ctx, exc, "ENOENT: no such file or directory, open '" + path + "'");
@@ -612,6 +628,7 @@ JSValueRef fsn_readFile_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size
 JSValueRef fsn_writeFile_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                             const JSValueRef args[], JSValueRef* exc) {
     std::string path{fs_arg(ctx, argc, args, 0)};
+    if (permission_deny_fs(ctx, exc, path, true)) return JSValueMakeUndefined(ctx);
     std::string data{fs_arg(ctx, argc, args, 1)};
     std::ofstream f{std::filesystem::path{path}, std::ios::binary | std::ios::trunc};
     if (!f) return fs_throw(ctx, exc, "EACCES: cannot write '" + path + "'");
@@ -621,6 +638,7 @@ JSValueRef fsn_writeFile_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
 JSValueRef fsn_appendFile_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                              const JSValueRef args[], JSValueRef* exc) {
     std::string path{fs_arg(ctx, argc, args, 0)};
+    if (permission_deny_fs(ctx, exc, path, true)) return JSValueMakeUndefined(ctx);
     std::string data{fs_arg(ctx, argc, args, 1)};
     std::ofstream f{std::filesystem::path{path}, std::ios::binary | std::ios::app};
     if (!f) return fs_throw(ctx, exc, "EACCES: cannot append '" + path + "'");
@@ -628,10 +646,14 @@ JSValueRef fsn_appendFile_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::si
     return JSValueMakeUndefined(ctx);
 }
 JSValueRef fsn_exists_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
-                         const JSValueRef args[], JSValueRef*) {
+                         const JSValueRef args[], JSValueRef* exc) {
+    const std::string path{fs_arg(ctx, argc, args, 0)};
+    // node ExistsSync gates fs.read. fs.existsSync swallows the throw and
+    // reports false; fs.accessSync (which is built on this probe in mbun) lets
+    // the ERR_ACCESS_DENIED out, which is what the corpus asserts.
+    if (permission_deny_fs(ctx, exc, path, false)) return JSValueMakeUndefined(ctx);
     std::error_code ec;
-    return JSValueMakeBoolean(
-        ctx, std::filesystem::exists(std::filesystem::path{fs_arg(ctx, argc, args, 0)}, ec));
+    return JSValueMakeBoolean(ctx, std::filesystem::exists(std::filesystem::path{path}, ec));
 }
 // node fs.mkdir(path, recursive, mode). `mode` is honored (default 0o777):
 // POSIX mkdir(2) applies the process umask and keeps the sticky/setgid bits, so
@@ -641,6 +663,7 @@ JSValueRef fsn_exists_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t
 JSValueRef fsn_mkdir_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                         const JSValueRef args[], JSValueRef* exc) {
     std::string path{fs_arg(ctx, argc, args, 0)};
+    if (permission_deny_fs(ctx, exc, path, true)) return JSValueMakeUndefined(ctx);
     bool recursive{argc > 1 && JSValueToBoolean(ctx, args[1])};
     const unsigned mode{(argc > 2 && JSValueIsNumber(ctx, args[2]))
                             ? (static_cast<unsigned>(JSValueToNumber(ctx, args[2], nullptr)) & 07777u)
@@ -714,6 +737,7 @@ JSValueRef fsn_mkdir_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t 
 JSValueRef fsn_rm_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                      const JSValueRef args[], JSValueRef* exc) {
     std::string path{fs_arg(ctx, argc, args, 0)};
+    if (permission_deny_fs(ctx, exc, path, true)) return JSValueMakeUndefined(ctx);
     bool recursive{argc > 1 && JSValueToBoolean(ctx, args[1])};
     bool force{argc > 2 && JSValueToBoolean(ctx, args[2])};
     std::error_code ec;
@@ -749,6 +773,7 @@ JSValueRef fsn_rm_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t arg
 JSValueRef fsn_rmdir_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                         const JSValueRef args[], JSValueRef* exc) {
     std::string path{fs_arg(ctx, argc, args, 0)};
+    if (permission_deny_fs(ctx, exc, path, true)) return JSValueMakeUndefined(ctx);
 #if defined(_WIN32)
     std::error_code ec;
     if (!std::filesystem::is_directory(std::filesystem::path{path}, ec))
@@ -781,6 +806,7 @@ JSValueRef fsn_rmdir_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t 
 JSValueRef fsn_truncate_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                            const JSValueRef args[], JSValueRef* exc) {
     std::string path{fs_arg(ctx, argc, args, 0)};
+    if (permission_deny_fs(ctx, exc, path, true)) return JSValueMakeUndefined(ctx);
     const auto len{(argc > 1 && JSValueIsNumber(ctx, args[1]))
                        ? JSValueToNumber(ctx, args[1], nullptr)
                        : 0.0};
@@ -804,6 +830,7 @@ JSValueRef fsn_truncate_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size
 JSValueRef fsn_statfs_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                          const JSValueRef args[], JSValueRef* exc) {
     std::string path{fs_arg(ctx, argc, args, 0)};
+    if (permission_deny_fs(ctx, exc, path, false)) return JSValueMakeUndefined(ctx);
     double type{0}, bsize{4096}, blocks{0}, bfree{0}, bavail{0}, files{0}, ffree{0};
 #if !defined(_WIN32)
     struct statvfs sv{};
@@ -839,6 +866,7 @@ JSValueRef fsn_statfs_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t
 JSValueRef fsn_readdir_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                           const JSValueRef args[], JSValueRef* exc) {
     std::string path{fs_arg(ctx, argc, args, 0)};
+    if (permission_deny_fs(ctx, exc, path, false)) return JSValueMakeUndefined(ctx);
     std::error_code ec;
     std::vector<JSValueRef> names;
     for (const auto& e : std::filesystem::directory_iterator{std::filesystem::path{path}, ec}) {
@@ -921,6 +949,7 @@ void fs_fields_from_stat(const struct stat& st, FsStatFields& f) {
 JSValueRef fsn_stat_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                        const JSValueRef args[], JSValueRef* exc) {
     std::string path{fs_arg(ctx, argc, args, 0)};
+    if (permission_deny_fs(ctx, exc, path, false)) return JSValueMakeUndefined(ctx);
     if (fs_path_too_long(ctx, exc, path, "stat")) return JSValueMakeUndefined(ctx);
     // 2nd arg true = lstat (do NOT follow symlink) — node/bun keep stat vs lstat
     // distinct; the shared JS shim passes the flag.
@@ -1011,6 +1040,7 @@ JSValueRef fsn_fstat_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t 
 JSValueRef fsn_readlink_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                            const JSValueRef args[], JSValueRef* exc) {
     std::string path{fs_arg(ctx, argc, args, 0)};
+    if (permission_deny_fs(ctx, exc, path, false)) return JSValueMakeUndefined(ctx);
     std::error_code ec;
     auto target{std::filesystem::read_symlink(std::filesystem::path{path}, ec)};
     if (ec) return fs_throw(ctx, exc, "EINVAL: invalid argument, readlink '" + path + "'");
@@ -1040,6 +1070,7 @@ JSValueRef fsn_umask_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t 
 JSValueRef fsn_utimes_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                          const JSValueRef args[], JSValueRef* exc) {
     std::string path{fs_arg(ctx, argc, args, 0)};
+    if (permission_deny_fs(ctx, exc, path, true)) return JSValueMakeUndefined(ctx);
 #if !defined(_WIN32)
     const double aSec{argc > 1 ? JSValueToNumber(ctx, args[1], nullptr) : 0.0};
     const double mSec{argc > 2 ? JSValueToNumber(ctx, args[2], nullptr) : 0.0};
@@ -1061,6 +1092,7 @@ JSValueRef fsn_utimes_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t
 JSValueRef fsn_unlink_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                          const JSValueRef args[], JSValueRef* exc) {
     std::string path{fs_arg(ctx, argc, args, 0)};
+    if (permission_deny_fs(ctx, exc, path, true)) return JSValueMakeUndefined(ctx);
     std::error_code ec;
     std::filesystem::remove(std::filesystem::path{path}, ec);
     if (ec) return fs_throw(ctx, exc, "unlink '" + path + "': " + ec.message());
@@ -1073,6 +1105,7 @@ JSValueRef fsn_unlink_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t
 JSValueRef fsn_chmod_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                         const JSValueRef args[], JSValueRef* exc) {
     std::string path{fs_arg(ctx, argc, args, 0)};
+    if (permission_deny_fs(ctx, exc, path, true)) return JSValueMakeUndefined(ctx);
     const auto modeNum{(argc > 1) ? JSValueToNumber(ctx, args[1], nullptr) : 0.0};
     const auto bits{static_cast<unsigned>(modeNum) & 07777u};
     std::error_code ec;
@@ -1085,6 +1118,7 @@ JSValueRef fsn_chmod_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t 
 JSValueRef fsn_realpath_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                            const JSValueRef args[], JSValueRef* exc) {
     std::string path{fs_arg(ctx, argc, args, 0)};
+    if (permission_deny_fs(ctx, exc, path, false)) return JSValueMakeUndefined(ctx);
     if (fs_path_too_long(ctx, exc, path, "lstat")) return JSValueMakeUndefined(ctx);
     std::error_code ec;
     auto r{std::filesystem::weakly_canonical(std::filesystem::path{path}, ec)};
@@ -1093,17 +1127,26 @@ JSValueRef fsn_realpath_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size
 }
 JSValueRef fsn_rename_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                          const JSValueRef args[], JSValueRef* exc) {
+    const std::string oldPath{fs_arg(ctx, argc, args, 0)};
+    const std::string newPath{fs_arg(ctx, argc, args, 1)};
+    // node Rename: read(old), write(old), write(new) — in that order.
+    if (permission_deny_fs(ctx, exc, oldPath, false)) return JSValueMakeUndefined(ctx);
+    if (permission_deny_fs(ctx, exc, oldPath, true)) return JSValueMakeUndefined(ctx);
+    if (permission_deny_fs(ctx, exc, newPath, true)) return JSValueMakeUndefined(ctx);
     std::error_code ec;
-    std::filesystem::rename(std::filesystem::path{fs_arg(ctx, argc, args, 0)},
-                            std::filesystem::path{fs_arg(ctx, argc, args, 1)}, ec);
+    std::filesystem::rename(std::filesystem::path{oldPath}, std::filesystem::path{newPath}, ec);
     if (ec) return fs_throw(ctx, exc, "rename: " + ec.message());
     return JSValueMakeUndefined(ctx);
 }
 JSValueRef fsn_copyFile_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                            const JSValueRef args[], JSValueRef* exc) {
+    const std::string src{fs_arg(ctx, argc, args, 0)};
+    const std::string dest{fs_arg(ctx, argc, args, 1)};
+    // node CopyFile: read(src) then write(dest).
+    if (permission_deny_fs(ctx, exc, src, false)) return JSValueMakeUndefined(ctx);
+    if (permission_deny_fs(ctx, exc, dest, true)) return JSValueMakeUndefined(ctx);
     std::error_code ec;
-    std::filesystem::copy_file(std::filesystem::path{fs_arg(ctx, argc, args, 0)},
-                               std::filesystem::path{fs_arg(ctx, argc, args, 1)},
+    std::filesystem::copy_file(std::filesystem::path{src}, std::filesystem::path{dest},
                                std::filesystem::copy_options::overwrite_existing, ec);
     if (ec) {
         // Map the std::error_code to a node-style E* code so error.code is set
@@ -1132,6 +1175,12 @@ JSValueRef fsn_symlink_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_
                           const JSValueRef args[], JSValueRef* exc) {
     std::string target{fs_arg(ctx, argc, args, 0)};
     std::string linkpath{fs_arg(ctx, argc, args, 1)};
+    // node Symlink: read(target), write(target), write(path). Gating the TARGET
+    // for write is what stops a symlink being used to smuggle a write into a
+    // read-only tree (test-permission-fs-symlink-target-write).
+    if (permission_deny_fs(ctx, exc, target, false)) return JSValueMakeUndefined(ctx);
+    if (permission_deny_fs(ctx, exc, target, true)) return JSValueMakeUndefined(ctx);
+    if (permission_deny_fs(ctx, exc, linkpath, true)) return JSValueMakeUndefined(ctx);
     std::error_code ec;
     std::filesystem::create_symlink(std::filesystem::path{target},
                                     std::filesystem::path{linkpath}, ec);
@@ -1204,6 +1253,7 @@ void fsn_readdir_recursive_walk(JSContextRef ctx, const std::filesystem::path& b
 JSValueRef fsn_readdirRecursive_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                                    const JSValueRef args[], JSValueRef* exc) {
     std::string path{fs_arg(ctx, argc, args, 0)};
+    if (permission_deny_fs(ctx, exc, path, false)) return JSValueMakeUndefined(ctx);
     std::vector<JSValueRef> names;
     std::vector<JSValueRef> types;
     bool threw{false};
@@ -1219,6 +1269,7 @@ JSValueRef fsn_readdirRecursive_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, s
 JSValueRef fsn_mkdtemp_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                           const JSValueRef args[], JSValueRef* exc) {
     std::string prefix{fs_arg(ctx, argc, args, 0)};
+    if (permission_deny_fs(ctx, exc, prefix, true)) return JSValueMakeUndefined(ctx);
     // create <prefix><suffix> with a clock-seeded counter — a plain 0-based
     // counter collides with directories left behind by previous runs.
     static std::atomic<std::uint64_t> counter{static_cast<std::uint64_t>(
@@ -1313,6 +1364,40 @@ JSC::EncodedJSValue fd_throw_errno(JSC::JSGlobalObject* global, int e,
     return JSC::encodedJSValue();
 }
 
+// ERR_ACCESS_DENIED on the native host-function path. Same error object as the
+// C-API gate (permission_denied_error), thrown through JSC's throw scope.
+JSC::EncodedJSValue fd_throw_access_denied(JSC::JSGlobalObject* global,
+                                          mbun::permission::Scope scope,
+                                          const std::string& path) {
+    JSValueRef err{permission_denied_error(toRef(global), scope, path)};
+    JSC::VM& vm{global->vm()};
+    auto throwScope{DECLARE_THROW_SCOPE(vm)};
+    throwScope.throwException(global, toJS(global, err));
+    return JSC::encodedJSValue();
+}
+
+// node node_file.cc CheckOpenPermissions: an open() needs fs.read unless it is
+// write-ONLY, and fs.write whenever it is not read-only OR carries a flag with a
+// write-like side effect (O_APPEND / O_CREAT / O_TRUNC). The second half is the
+// fix for nodejs/node#47090 — "extra flags should not enable trivially
+// bypassing all restrictions" — and the corpus asserts it directly.
+std::optional<mbun::permission::Scope> fd_open_denied_scope(const std::string& path,
+                                                            const mbun::core::io::OpenOptions& o) {
+    if (!gPermission.enabled()) return std::nullopt;
+    namespace io = mbun::core::io;
+    const bool writeOnly{o.access == io::Access::WriteOnly};
+    const bool readOnly{o.access == io::Access::ReadOnly};
+    const bool writeSideEffect{o.create || o.truncate || o.append};
+    if (!writeOnly && !gPermission.is_granted(mbun::permission::Scope::FileSystemRead, path)) {
+        if (!gPermission.warning_only()) return mbun::permission::Scope::FileSystemRead;
+    }
+    if ((!readOnly || writeSideEffect) &&
+        !gPermission.is_granted(mbun::permission::Scope::FileSystemWrite, path)) {
+        if (!gPermission.warning_only()) return mbun::permission::Scope::FileSystemWrite;
+    }
+    return std::nullopt;
+}
+
 // Number coercion matching JSValueToNumber (fast path: already a number).
 double fd_num(JSC::JSGlobalObject* global, JSC::JSValue v) {
     return v.isNumber() ? v.asNumber() : v.toNumber(global);
@@ -1371,6 +1456,12 @@ JSC_DEFINE_HOST_FUNCTION(fdn_open_host, (JSC::JSGlobalObject* global, JSC::CallF
     // fifo open waiting for the peer — FileSink over a named pipe).
     JSC::JSValue nbV{native_arg(frame, 3)};
     if (nbV && nbV.toBoolean(global)) o.nonblock = true;
+    // The Permission Model gate for the fd path. Everything downstream
+    // (fdn_read/write/ftruncate/close) takes an fd that can only have come from
+    // HERE, so gating the open gates the whole descriptor.
+    if (const auto denied{fd_open_denied_scope(path, o)}) {
+        return fd_throw_access_denied(global, *denied, path);
+    }
     auto file{io::File::open(std::filesystem::path{path}, o)};
     if (!file) return fd_throw_errno(global, file.error().nativeCode, "open", path);
     // Reuse the lowest free virtual fd (like the OS descriptor table) rather than

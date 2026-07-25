@@ -394,6 +394,16 @@
             return JSValueMakeUndefined(ctx);
         } else {
             if (exc) {
+                // A read the Permission Model refused is an access error, not a
+                // resolution error: the module was found, and reporting
+                // "Cannot find module" would hide the reason.
+                if (gPermissionDeniedModuleRead) {
+                    const std::string refused{*gPermissionDeniedModuleRead};
+                    gPermissionDeniedModuleRead.reset();
+                    *exc = permission_denied_error(
+                        ctx, mbun::permission::Scope::FileSystemRead, refused);
+                    return JSValueMakeUndefined(ctx);
+                }
                 if (spec.starts_with("node:")) {
                     // Unknown node: builtin — node/bun throw ERR_UNKNOWN_BUILTIN_MODULE
                     // (a real Error with .code), not a bare "cannot find module" string.

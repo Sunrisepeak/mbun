@@ -263,6 +263,10 @@ inline constexpr std::string_view kNodeFsWatchJS = R"JS(
 
   fs.FSWatcher = FSWatcher;
   fs.StatWatcher = StatWatcher;
+  // node's `fs` does not export either (they live in internal/fs/watchers and are
+  // only reachable through watch()/watchFile()). Keep them reachable but out of
+  // Object.keys(require("fs")) -- see bootstrap's hideFsExtras.
+  if (typeof fs.__mbunHideFsExtras === "function") fs.__mbunHideFsExtras();
 
   // fs.promises.watch: an async iterator of { eventType, filename }. Stays ref'd
   // while open -- a `for await` consumer holds the process alive in node, and an

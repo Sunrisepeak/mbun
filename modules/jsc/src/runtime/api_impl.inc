@@ -13,6 +13,25 @@ void set_exec_argv(std::vector<std::string> execArgv) {
     gExecArgv = std::move(execArgv);
 }
 
+// The Permission Model's command line (node --permission / --allow-*).
+//
+// `tokens` is NODE_OPTIONS' words followed by the process's own runtime flags —
+// node's precedence, and the reason a child spawned with its own `--permission`
+// is NOT widened by an inherited one. `entry` is node's argv_[1] and `preloads`
+// its --require list; both receive the implicit fs.read grant that lets a gated
+// process load its own entry point.
+//
+// MUST be called before the runtime is first touched: install_bindings_ applies
+// it before the fs natives exist, so nothing can run before the model is in
+// place. Called for every dispatch path from src/main.cpp.
+void set_permission_command_line(std::vector<std::string> tokens, bool hasEvalString,
+                                 std::string entry, std::vector<std::string> preloads) {
+    gPermissionTokens = std::move(tokens);
+    gPermissionHasEvalString = hasEvalString;
+    gPermissionEntry = std::move(entry);
+    gPermissionPreloads = std::move(preloads);
+}
+
 // Disable auto-loading of default .env files (bun `--no-env-file`).
 void set_disable_env_files(bool v) { gDisableEnvFiles = v; }
 

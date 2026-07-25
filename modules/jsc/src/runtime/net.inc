@@ -88,6 +88,12 @@ JSValueRef netn_listen_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_
     return fs_throw(ctx, exc, "net.listen: not supported on Windows yet");
 #else
     const std::string host{fs_arg(ctx, argc, args, 0)};
+    // Permission Model: node gates the Net scope in tcp_wrap.cc / pipe_wrap.cc /
+    // udp_wrap.cc — i.e. at the wrap's Bind/Connect/Listen, which is the syscall.
+    // Same place here. `--allow-net` is all-or-nothing in node; the resource is
+    // the address or socket path so the error names what was refused.
+    if (permission_deny_scope(ctx, exc, mbun::permission::Scope::Net, host))
+        return JSValueMakeUndefined(ctx);
     const auto port{static_cast<std::uint16_t>(
         argc > 1 ? JSValueToNumber(ctx, args[1], nullptr) : 0)};
     sockaddr_in addr{};
@@ -147,6 +153,12 @@ JSValueRef netn_listen_unix_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::
     return fs_throw(ctx, exc, "net.listenUnix: not supported on Windows yet");
 #else
     const std::string path{fs_arg(ctx, argc, args, 0)};
+    // Permission Model: node gates the Net scope in tcp_wrap.cc / pipe_wrap.cc /
+    // udp_wrap.cc — i.e. at the wrap's Bind/Connect/Listen, which is the syscall.
+    // Same place here. `--allow-net` is all-or-nothing in node; the resource is
+    // the address or socket path so the error names what was refused.
+    if (permission_deny_scope(ctx, exc, mbun::permission::Scope::Net, path))
+        return JSValueMakeUndefined(ctx);
     if (path.empty()) return fs_throw(ctx, exc, "net.listenUnix: empty socket path");
     sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
@@ -203,6 +215,12 @@ JSValueRef netn_connect_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size
     return fs_throw(ctx, exc, "net.connect: not supported on Windows yet");
 #else
     const std::string host{fs_arg(ctx, argc, args, 0)};
+    // Permission Model: node gates the Net scope in tcp_wrap.cc / pipe_wrap.cc /
+    // udp_wrap.cc — i.e. at the wrap's Bind/Connect/Listen, which is the syscall.
+    // Same place here. `--allow-net` is all-or-nothing in node; the resource is
+    // the address or socket path so the error names what was refused.
+    if (permission_deny_scope(ctx, exc, mbun::permission::Scope::Net, host))
+        return JSValueMakeUndefined(ctx);
     const auto port{static_cast<std::uint16_t>(
         argc > 1 ? JSValueToNumber(ctx, args[1], nullptr) : 0)};
     sockaddr_in addr{};
@@ -237,6 +255,12 @@ JSValueRef netn_connect_unix_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std:
     return fs_throw(ctx, exc, "net.connectUnix: not supported on Windows yet");
 #else
     const std::string path{fs_arg(ctx, argc, args, 0)};
+    // Permission Model: node gates the Net scope in tcp_wrap.cc / pipe_wrap.cc /
+    // udp_wrap.cc — i.e. at the wrap's Bind/Connect/Listen, which is the syscall.
+    // Same place here. `--allow-net` is all-or-nothing in node; the resource is
+    // the address or socket path so the error names what was refused.
+    if (permission_deny_scope(ctx, exc, mbun::permission::Scope::Net, path))
+        return JSValueMakeUndefined(ctx);
     if (path.empty()) return fs_throw(ctx, exc, "net.connectUnix: empty socket path");
     sockaddr_un addr{};
     addr.sun_family = AF_UNIX;

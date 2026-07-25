@@ -53,6 +53,12 @@ JSValueRef proc_spawn_ex_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
     }
     if (argvStr.empty()) argvStr.push_back(file);
     SpawnOpts o{parse_spawn_opts(ctx, argc, args)};
+    // Permission Model: node enforces the ChildProcess scope at the fork
+    // (src/spawn_sync.cc / process_wrap.cc), and so does this. `resource` is the
+    // executable, which is what test-permission-child-process-cli asserts on.
+    // permission_deny_spawn also handles mbun's worker-as-subprocess case.
+    if (permission_deny_spawn(ctx, exc, file, o.env)) return JSValueMakeUndefined(ctx);
+    permission_inject_child_env(o.env, o.haveEnv, argvStr);
     bool detached{false};
     double uid{-1}, gid{-1};
     std::vector<StdioSlot> slots{{StdioSlot::Kind::Pipe, -1},
@@ -309,6 +315,12 @@ JSValueRef proc_spawn_pty_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::si
     }
     if (argvStr.empty()) argvStr.push_back(file);
     SpawnOpts o{parse_spawn_opts(ctx, argc, args)};
+    // Permission Model: node enforces the ChildProcess scope at the fork
+    // (src/spawn_sync.cc / process_wrap.cc), and so does this. `resource` is the
+    // executable, which is what test-permission-child-process-cli asserts on.
+    // permission_deny_spawn also handles mbun's worker-as-subprocess case.
+    if (permission_deny_spawn(ctx, exc, file, o.env)) return JSValueMakeUndefined(ctx);
+    permission_inject_child_env(o.env, o.haveEnv, argvStr);
     unsigned short cols{80}, rows{24};
     if (argc > 2 && JSValueIsObject(ctx, args[2])) {
         JSObjectRef opt{JSValueToObject(ctx, args[2], nullptr)};
@@ -643,6 +655,17 @@ mbun::resolver::FileSystem os_fs() {
             return std::filesystem::is_directory(std::filesystem::path{p}, ec);
         },
         .read_file = [](std::string_view p) -> std::optional<std::string> {
+            // Permission Model: loading a module is an fs READ of that file, and
+            // node gates it the same way (an unlisted require() fails with
+            // ERR_ACCESS_DENIED, not MODULE_NOT_FOUND — test-permission-fs-require).
+            // Gating HERE, in the loader's own read hook, means the bytes are
+            // never even fetched; the require path turns the recorded denial into
+            // the right error.
+            if (gPermission.enabled() && !gPermission.warning_only() &&
+                !gPermission.is_granted(mbun::permission::Scope::FileSystemRead, p)) {
+                gPermissionDeniedModuleRead = std::string{p};
+                return std::nullopt;
+            }
             return read_file(std::string{p});
         },
         // node preserveSymlinks=false: bare-specifier walk-up starts at the

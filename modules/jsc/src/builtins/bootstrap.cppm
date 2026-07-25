@@ -553,8 +553,29 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   assert.notDeepEqual = (a, b, m) => { if (deepEq(a, b, false)) throw AErr(m); };
   assert.deepStrictEqual = (a, b, m) => { if (!deepEq(a, b, true)) throw AErr(m); };
   assert.notDeepStrictEqual = (a, b, m) => { if (deepEq(a, b, true)) throw AErr(m); };
-  assert.throws = (fn, e, m) => { try { fn(); } catch (_) { return; } throw AErr(m || "Missing expected exception"); };
-  assert.doesNotThrow = (fn) => { fn(); };
+  // assert.throws / assert.doesNotThrow — node lib/assert.js throws() +
+  // getActual(). These USED to ignore the `error` argument entirely:
+  //
+  //   assert.throws = (fn, e, m) => { try { fn(); } catch (_) { return; } ... }
+  //
+  // so `assert.throws(fn, { code: 'ERR_X' })` passed for ANY throw at all, and
+  // `assert.throws(fn, common.expectsError({...}))` never called the validator
+  // — which is how the corpus's most common negative assertion silently checked
+  // nothing. The validation machinery below (expectsError / expectedException /
+  // hasMatchingError, ported from bun's assert.ts) already existed and was
+  // reachable only from assert.rejects; both entry points now share it, so the
+  // sync and async forms agree.
+  const getActual = (fn) => {
+    if (typeof fn !== "function") throw argTypeErr("fn", "of type function", fn);
+    try { fn(); } catch (e) { return e; }
+    return NO_EXC;
+  };
+  assert.throws = function throws(fn, error, message) {
+    return expectsError("throws", getActual(fn), error, message);
+  };
+  assert.doesNotThrow = function doesNotThrow(fn, error, message) {
+    return expectsNoError("doesNotThrow", getActual(fn), error, message);
+  };
   // rejects / doesNotReject: ported from bun src/js/node/assert.ts
   // (waitForActual/expectsError/expectsNoError/expectedException). Enriched
   // AssertionError path via makeAErr is opt-in; other assert.* keep using AErr.
@@ -602,7 +623,17 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   }
   function compareExceptionKey(actual, expected, key, message, opName) {
     if (!(key in actual) || !deepEq(actual[key], expected[key], true)) {
-      throw makeAErr({ actual, expected, message, operator: opName, generatedMessage: !message });
+      // node builds a full deep-equal diff here. A NAMED key mismatch is the
+      // single most common negative-assertion failure in the corpus, and an
+      // AssertionError with an empty message is untriageable from a log — say
+      // which property disagreed and how.
+      const generated = !message;
+      if (generated) {
+        message = "Comparison of the '" + key + "' property failed: expected " +
+                  insp(expected[key]) + ", got " +
+                  (key in actual ? insp(actual[key]) : "undefined (property missing)");
+      }
+      throw makeAErr({ actual, expected, message, operator: opName, generatedMessage: generated });
     }
   }
   function expectedException(actual, expected, message, opName) {
@@ -2405,7 +2436,13 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   def(["cluster"], Object.assign(new EventEmitter(), { isPrimary: true, isMaster: true, isWorker: false, workers: {}, settings: {}, schedulingPolicy: 2, fork: () => new EventEmitter(), setupPrimary() {}, setupMaster() {}, disconnect(cb) { if (cb) cb(); }, worker: null }));
   def(["inspector"], { open() { throw new Error("node:inspector is not yet implemented in Bun. Track the status & thumbs up the issue: https://github.com/oven-sh/bun/issues/2445"); }, close() { throw new Error("node:inspector is not yet implemented in Bun. Track the status & thumbs up the issue: https://github.com/oven-sh/bun/issues/2445"); }, url: () => undefined, waitForDebugger() { throw new Error("node:inspector is not yet implemented in Bun. Track the status & thumbs up the issue: https://github.com/oven-sh/bun/issues/2445"); }, console: G.console, Session: class Session extends EventEmitter { connect() {} disconnect() {} post(m, p, cb) { if (typeof p === "function") p(null, {}); else if (cb) cb(null, {}); } } });
   def(["trace_events"], { createTracing: () => ({ enable() {}, disable() {}, get enabled() { return false; }, categories: "" }), getEnabledCategories: () => undefined });
-  def(["wasi"], { WASI: class WASI { constructor(o) { this.wasiImport = {}; this._opts = o || {}; } start() { return 0; } initialize() {} getImportObject() { return { wasi_snapshot_preview1: this.wasiImport }; } } });
+  def(["wasi"], { WASI: class WASI { constructor(o) {
+    // Permission Model: node gates the WASI scope in WASI::New
+    // (src/node_wasi.cc) — a WASI instance can preopen host directories, so it
+    // is a filesystem capability in its own right.
+    const PN = G.__mbunPermissionNative;
+    if (PN && PN.enabled && !PN.has("wasi")) throw PN.denyError("wasi", "");
+    this.wasiImport = {}; this._opts = o || {}; } start() { return 0; } initialize() {} getImportObject() { return { wasi_snapshot_preview1: this.wasiImport }; } } });
   def(["repl"], { start: () => new EventEmitter(), REPLServer: class REPLServer extends EventEmitter {}, Recoverable: class Recoverable extends Error {}, writer: (v) => String(v), REPL_MODE_SLOPPY: 0, REPL_MODE_STRICT: 1 });
   def(["_stream_wrap"], { StreamWrap: class StreamWrap extends EventEmitter {} });
   def(["test/reporters"], { tap: function* () {}, spec: class Spec {}, dot: function* () {}, junit: function* () {}, lcov: class Lcov {} });
@@ -4028,6 +4065,11 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     fstatSync: (fd, o) => { const s = F.fstat(fd); return (o && o.bigint) ? mkBigIntStats(s) : Object.setPrototypeOf(s, Stats.prototype); },
     fstat: (fd, o, cb) => { const fn = cb || o; if (typeof fn === "function") fn(null, fsMod.fstatSync(fd)); },
     statfsSync: () => ({ type: 0, bsize: 4096, blocks: 0, bfree: 0, bavail: 0, files: 0, ffree: 0 }),
+    // Not a node fs export: an mbun-internal helper. Left ENUMERABLE it showed
+    // up in Object.keys(require("fs")), which node's own
+    // test-permission-fs-supported reads to prove every exposed fs API is
+    // covered by the permission model — an mbun-only key fails that audit.
+    // Made non-enumerable right after this object literal (see below).
     createStatsForIno: (ino, mode) => ({ ino: ino || 0, mode: mode || 0o644, size: 0, isFile: () => (mode == null ? true : (mode & 0o170000) === 0o100000), isDirectory: () => (mode != null && (mode & 0o170000) === 0o040000), isSymbolicLink: () => false, isBlockDevice: () => false, isCharacterDevice: () => false, isFIFO: () => false, isSocket: () => false, mtime: new Date(0), atime: new Date(0), ctime: new Date(0), birthtime: new Date(0), mtimeMs: 0, atimeMs: 0, ctimeMs: 0, birthtimeMs: 0, uid: 0, gid: 0, dev: 0, nlink: 1, rdev: 0, blksize: 4096, blocks: 0 }),
     unlinkSync: (p) => F.unlink(toStr(p)),
     realpathSync: (p) => F.realpath(toStr(p)),
@@ -4838,6 +4880,28 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     });
   // fs.exists' callback takes (exists) with no error slot.
   fsMod.exists[kPromisifyCustom] = (p) => new Promise((resolve) => fsMod.exists(p, resolve));
+  // mbun-internal helpers must not appear in Object.keys(require("fs")): node's
+  // test-permission-fs-supported enumerates that list to prove every exposed fs
+  // API is covered by the permission model, and an extra key fails the audit.
+  // They stay reachable by name for the internal callers that use them.
+  // mbun-internal helpers must not appear in Object.keys(require("fs")). node's
+  // own test-permission-fs-supported enumerates that list to prove every exposed
+  // fs API is covered by the permission model, so an mbun-only key fails the
+  // audit outright. `hideFsExtras` is exported on the module object so the LAST
+  // writer of each key can call it — node_fs_watch installs fs.FSWatcher after
+  // this point, and a plain assignment there would re-create it as enumerable.
+  const hideFsExtras = () => {
+    for (const k of ["createStatsForIno", "BigIntStats", "FSWatcher", "StatWatcher"]) {
+      if (Object.prototype.hasOwnProperty.call(fsMod, k) &&
+          Object.getOwnPropertyDescriptor(fsMod, k).enumerable) {
+        Object.defineProperty(fsMod, k,
+          { value: fsMod[k], writable: true, configurable: true, enumerable: false });
+      }
+    }
+  };
+  Object.defineProperty(fsMod, "__mbunHideFsExtras",
+    { value: hideFsExtras, writable: true, configurable: true, enumerable: false });
+  hideFsExtras();
   def(["fs"], fsMod);
 
   const P = (fn) => (...a) => { try { return Promise.resolve(fn(...a)); } catch (e) { return Promise.reject(e); } };

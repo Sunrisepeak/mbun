@@ -525,6 +525,16 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
   class Worker extends EventEmitter {
     constructor(filename, options) {
       super();
+      // Permission Model: node gates the WorkerThreads scope in Worker::New
+      // (src/node_worker.cc), before anything is created. This check only decides
+      // WHICH error is reported: mbun runs a worker as a child mbun process, and
+      // that spawn is gated in C++ (permission_deny_spawn) whether or not this
+      // line exists — without it the caller would see the ChildProcess denial
+      // for what is really a worker.
+      {
+        const PN = G.__mbunPermissionNative;
+        if (PN && PN.enabled && !PN.has("worker")) throw PN.denyError("worker", "");
+      }
       options = options || {};
       validateTransferList(options.transferList);
       if (options.env !== undefined && options.env !== null && options.env !== SHARE_ENV &&

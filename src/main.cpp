@@ -56,6 +56,15 @@ int main(int argc, char* argv[]) {
     {
         std::vector<std::string_view> rawArgs(argv + 1, argv + argc);
         mbun::jsc::runtime::set_exec_argv(mbun::cli::derive_exec_argv(rawArgs));
+
+        // node's Permission Model (--permission / --allow-*). Derived from the
+        // same raw command line, before any dispatch, so every path below (node
+        // emulation, `run`, a bare script, -e) is gated identically. The model
+        // stays DISABLED unless a --permission flag is actually present, so this
+        // is inert for an ordinary invocation.
+        const mbun::cli::PermissionCommandLine perm{mbun::cli::derive_permission_cli(rawArgs)};
+        mbun::jsc::runtime::set_permission_command_line(perm.tokens, perm.hasEvalString,
+                                                        perm.entry, perm.preloads);
     }
 
     // ── argv0 == `node` → node emulation (cli/mod.rs:952 → run_command.rs:2981).

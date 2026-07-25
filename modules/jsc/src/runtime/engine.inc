@@ -1090,6 +1090,88 @@ public:
         return out;
     }
 
+    // ── the Permission Model bridge (__mbunPermissionNative) ───────────────
+    // node exposes the model to JS through internalBinding('permission'), whose
+    // only members are has() and drop(); everything else about the model lives
+    // in C++. Same split here: this object is a thin window onto gPermission,
+    // and the enforcement it reports on happens in the fs/spawn/worker gates,
+    // NOT in whatever JS reads this. Tampering with the object cannot grant
+    // anything — the gates never consult it.
+    static JSValueRef permission_has_cb(JSContextRef ctx, JSObjectRef, JSObjectRef,
+                                        std::size_t argc, const JSValueRef args[], JSValueRef*) {
+        // node permission.cc Has: an unknown scope is false, and an EMPTY
+        // reference (as distinct from an absent one) is false too.
+        if (argc < 1 || !JSValueIsString(ctx, args[0])) return JSValueMakeBoolean(ctx, false);
+        const std::string label{val_to_string(ctx, args[0])};
+        const auto scope{mbun::permission::scope_from_label(label)};
+        if (scope == mbun::permission::Scope::Root) return JSValueMakeBoolean(ctx, false);
+        if (argc > 1 && !JSValueIsUndefined(ctx, args[1]) && !JSValueIsNull(ctx, args[1])) {
+            const std::string ref{val_to_string(ctx, args[1])};
+            if (ref.empty()) return JSValueMakeBoolean(ctx, false);
+            return JSValueMakeBoolean(ctx, gPermission.is_granted(scope, ref));
+        }
+        return JSValueMakeBoolean(ctx, gPermission.is_granted(scope));
+    }
+
+    static JSValueRef permission_drop_cb(JSContextRef ctx, JSObjectRef, JSObjectRef,
+                                         std::size_t argc, const JSValueRef args[], JSValueRef*) {
+        if (argc < 1 || !JSValueIsString(ctx, args[0])) return JSValueMakeUndefined(ctx);
+        const auto scope{mbun::permission::scope_from_label(val_to_string(ctx, args[0]))};
+        if (scope == mbun::permission::Scope::Root) return JSValueMakeUndefined(ctx);
+        if (argc > 1 && !JSValueIsUndefined(ctx, args[1]) && !JSValueIsNull(ctx, args[1])) {
+            const std::string ref{val_to_string(ctx, args[1])};
+            if (!ref.empty()) {
+                gPermission.drop(scope, ref);
+                return JSValueMakeUndefined(ctx);
+            }
+        }
+        gPermission.drop(scope);
+        return JSValueMakeUndefined(ctx);
+    }
+
+    // Build the ERR_ACCESS_DENIED node itself raises from JS (lib/fs.js's
+    // symlink / fsync / fchmod refusals, process.report.writeReport,
+    // v8.writeHeapSnapshot). Those live in node's JS layer too, so mirroring
+    // them there is parity — the load-bearing gates stay in C++.
+    static JSValueRef permission_deny_error_cb(JSContextRef ctx, JSObjectRef, JSObjectRef,
+                                               std::size_t argc, const JSValueRef args[],
+                                               JSValueRef*) {
+        const auto scope{argc > 0 ? mbun::permission::scope_from_label(val_to_string(ctx, args[0]))
+                                  : mbun::permission::Scope::Root};
+        const std::string resource{argc > 1 && JSValueIsString(ctx, args[1])
+                                       ? val_to_string(ctx, args[1])
+                                       : std::string{}};
+        const std::string override{argc > 2 && JSValueIsString(ctx, args[2])
+                                       ? val_to_string(ctx, args[2])
+                                       : std::string{}};
+        return permission_denied_error(ctx, scope, resource, override);
+    }
+
+    // The parsed flags, so the JS layer can answer node's
+    // getOptionValue('--allow-…') without a second parser.
+    JSObjectRef build_permission_native_() {
+        JSObjectRef pn{JSObjectMake(ctx_, nullptr, nullptr)};
+        set_fn(ctx_, pn, "has", permission_has_cb);
+        set_fn(ctx_, pn, "drop", permission_drop_cb);
+        set_fn(ctx_, pn, "denyError", permission_deny_error_cb);
+        set_prop(ctx_, pn, "enabled", JSValueMakeBoolean(ctx_, gPermission.enabled()));
+        set_prop(ctx_, pn, "audit", JSValueMakeBoolean(ctx_, gPermission.warning_only()));
+        const auto& o{gPermissionOptions};
+        set_prop(ctx_, pn, "allowAddons", JSValueMakeBoolean(ctx_, o.allowAddons));
+        set_prop(ctx_, pn, "allowChildProcess", JSValueMakeBoolean(ctx_, o.allowChildProcess));
+        set_prop(ctx_, pn, "allowWorker", JSValueMakeBoolean(ctx_, o.allowWorker));
+        set_prop(ctx_, pn, "allowInspector", JSValueMakeBoolean(ctx_, o.allowInspector));
+        set_prop(ctx_, pn, "allowWasi", JSValueMakeBoolean(ctx_, o.allowWasi));
+        set_prop(ctx_, pn, "allowNet", JSValueMakeBoolean(ctx_, o.allowNet));
+        set_prop(ctx_, pn, "allowFfi", JSValueMakeBoolean(ctx_, o.allowFfi));
+        set_prop(ctx_, pn, "anyAllowFlag", JSValueMakeBoolean(ctx_, o.any_allow_flag()));
+        set_prop(ctx_, pn, "allowFsRead", build_string_array_(o.allowFsRead));
+        set_prop(ctx_, pn, "allowFsWrite", build_string_array_(o.allowFsWrite));
+        // The tokens a child process must inherit through NODE_OPTIONS.
+        set_prop(ctx_, pn, "flagsToInherit", build_string_array_(o.presentFlags));
+        return pn;
+    }
+
     void install_bindings_() {
         // Runs on the bare main thread (JSGlobalContextCreate released its lock
         // on return): hold the API lock for the whole installation so the
@@ -1481,6 +1563,69 @@ public:
         set_fn(ctx_, global, "__mbun_napi_dlopen", napi_dlopen_cb);
         JSValueRef facExc{nullptr};
         eval_(kRequireMachineryJs, &facExc);
+
+        // ── the Permission Model ───────────────────────────────────────────
+        // Applied HERE, before the fs natives are installed and long before any
+        // module is loaded, so nothing can run un-gated: the model is the first
+        // thing the very first fs call consults. When no --permission flag was
+        // given this leaves the model disabled and every gate is a no-op.
+        permission_bind_probes();
+        gPermissionOptions = mbun::permission::parse_options(gPermissionTokens);
+        mbun::permission::apply_options(gPermission, gPermissionOptions,
+                                        gPermissionHasEvalString, gPermissionEntry,
+                                        gPermissionPreloads);
+        // node pre_execution.js: an --allow-* flag with no --permission is a
+        // mistake, and node refuses to run rather than silently ignoring it —
+        // the caller believes they asked for a sandbox. mbun used to accept and
+        // ignore the flag, which is exactly the misplaced trust this change is
+        // about, so it fails closed here too.
+        if (!gPermission.enabled() && gPermissionOptions.any_allow_flag()) {
+            std::println(std::cerr, "TypeError [ERR_MISSING_OPTION]: --permission is required");
+            std::cerr.flush();
+            std::exit(1);
+        }
+        // node env.cc: the model without --allow-addons also clears
+        // allow_native_addons, which removes the "node-addons" ESM condition.
+        if (gPermission.enabled() && !gPermission.is_granted(mbun::permission::Scope::Addon)) {
+            mbun::jsc::module_loader::gAllowNativeAddons = false;
+        }
+        set_prop(ctx_, global, "__mbunPermissionNative", build_permission_native_());
+        // node pre_execution.js emits these through process.emitWarning, whose
+        // default handler prints "(node:PID) NAME: message" to stderr. mbun's
+        // emitWarning has no default printer (documented below at p.emitWarning),
+        // and a warning emitted while the builtins image is still evaluating is
+        // dropped anyway: its nextTick drains before the entry script exists, so
+        // no listener can be attached yet. Print here, at the point the flags are
+        // known; the JS partition separately replays them to a 'warning' listener
+        // so common.expectWarning still sees them.
+        if (gPermission.enabled()) {
+            const auto warn{[](std::string_view type, std::string_view msg) {
+                std::println(std::cerr, "(node:{}) {}: {}", ::getpid(), type, msg);
+            }};
+            for (const std::string_view flag : mbun::permission::kSecurityWarningFlags) {
+                bool on{false};
+                if (flag == "--allow-addons") on = gPermissionOptions.allowAddons;
+                else if (flag == "--allow-child-process") on = gPermissionOptions.allowChildProcess;
+                else if (flag == "--allow-inspector") on = gPermissionOptions.allowInspector;
+                else if (flag == "--allow-wasi") on = gPermissionOptions.allowWasi;
+                else if (flag == "--allow-worker") on = gPermissionOptions.allowWorker;
+                if (!on) continue;
+                warn("SecurityWarning",
+                     std::string{"The flag "} + std::string{flag} +
+                         " must be used with extreme caution. It could invalidate the "
+                         "permission model.");
+            }
+            if (gPermissionOptions.allowFfi) {
+                warn("SecurityWarning",
+                     "The flag --allow-ffi must be used with extreme caution. It could "
+                     "invalidate the permission model.");
+            }
+            if (gPermissionOptions.allowNet) {
+                warn("ExperimentalWarning",
+                     "The flag --allow-net is under experimental phase.");
+            }
+            std::cerr.flush();
+        }
 
         // Native filesystem ops (real) exposed for the JS node:fs / fs/promises
         // shapes to build on. Installed BEFORE kNodeBuiltinsJS (which references it).
@@ -1972,6 +2117,12 @@ JSValueRef napi_dlopen_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_
     if (filename.starts_with("file://")) {
         filename = file_url_to_path(filename);
     }
+    // Permission Model: node blocks native addons unless --allow-addons
+    // (env.cc also clears allow_native_addons). dlopen'ing a .node hands the
+    // process arbitrary native code, which would void every other gate, so the
+    // check sits at the dlopen itself.
+    if (permission_deny_scope(ctx, exc, mbun::permission::Scope::Addon, filename))
+        return JSValueMakeUndefined(ctx);
     mbun_napi_process_dlopen(ctx, moduleObj, filename, exc);
     return JSValueMakeUndefined(ctx);
 }

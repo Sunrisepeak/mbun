@@ -425,6 +425,13 @@ JSValueRef ffi_dlopen_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t
     if (argc < 2 || !JSValueIsObject(ctx, args[1])) {
         return ffi_throw(ctx, exc, "Expected an options object with symbol names");
     }
+    // Permission Model: node gates the FFI scope in its own ffi binding, and it
+    // must be gated here too — dlopen + an arbitrary call signature is arbitrary
+    // native code execution, which voids every other gate in the model. Reporting
+    // `process.permission.has("ffi") === false` while this still worked was the
+    // exact "believes it has a sandbox and has none" bug the model exists to fix.
+    if (permission_deny_scope(ctx, exc, mbun::permission::Scope::Ffi, path))
+        return JSValueMakeUndefined(ctx);
     auto lib{mbun::ffi::NativeLibrary::open(path)};
     if (!lib) {
         return ffi_throw(ctx, exc, "Failed to open library \"" + path + "\": " + lib.error());
@@ -465,6 +472,11 @@ JSValueRef ffi_dlopen_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t
 // (a native address) instead of a library+name. Mirrors bun's link error text.
 JSValueRef ffi_link_symbols_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                                const JSValueRef args[], JSValueRef* exc) {
+    // Permission Model: linkSymbols takes a RAW ADDRESS and a call signature, so
+    // it is the same arbitrary-native-code capability as dlopen and is gated the
+    // same way. Leaving it open would make the dlopen gate cosmetic.
+    if (permission_deny_scope(ctx, exc, mbun::permission::Scope::Ffi, "linkSymbols"))
+        return JSValueMakeUndefined(ctx);
     if (argc < 1 || !JSValueIsObject(ctx, args[0])) {
         return ffi_throw(ctx, exc, "Expected an options object with symbol names");
     }
