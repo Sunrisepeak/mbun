@@ -1349,6 +1349,35 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
     }
   }
 
+  // node lib/internal/repl.js createRepl(): the factory the CLI uses for
+  // `node -i` / `node --interactive`. It lives in this partition because
+  // kStandaloneREPL is module-private, and is attached to the module object
+  // non-enumerably below so `Object.keys(require("repl"))` still reports only
+  // node's public surface. Its one caller is the -i CLI path in src/app.cppm,
+  // which stands in for node's lib/internal/main/repl.js.
+  function createInternalRepl(env, opts, cb) {
+    if (typeof opts === "function") { cb = opts; opts = null; }
+    opts = Object.assign(
+      { ignoreUndefined: false, useGlobal: true, breakEvalOnSigint: true },
+      opts);
+    opts[kStandaloneREPL] = true;
+    if (parseInt(env.NODE_NO_READLINE, 10)) opts.terminal = false;
+    if (env.NODE_REPL_MODE) {
+      opts.replMode = { strict: REPL_MODE_STRICT, sloppy: REPL_MODE_SLOPPY }[
+        String(env.NODE_REPL_MODE).toLowerCase().trim()];
+    }
+    if (opts.replMode === undefined) opts.replMode = REPL_MODE_SLOPPY;
+    const size = Number(env.NODE_REPL_HISTORY_SIZE);
+    opts.size = (!Number.isNaN(size) && size > 0) ? size : 1000;
+    // No history file unless the session is a terminal — a piped stdin must not
+    // read or rewrite the user's ~/.node_repl_history.
+    const term = "terminal" in opts ? opts.terminal : process.stdout.isTTY;
+    opts.filePath = term ? env.NODE_REPL_HISTORY : "";
+    const repl = start(opts);
+    repl.setupHistory({ filePath: opts.filePath, size: opts.size, onHistoryFileLoaded: cb });
+    return repl;
+  }
+
   const replExports = {
     start,
     writer,
@@ -1358,6 +1387,10 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
     Recoverable,
     isValidSyntax,
   };
+
+  Object.defineProperty(replExports, "createInternalRepl", {
+    value: createInternalRepl, writable: true, configurable: true, enumerable: false,
+  });
 
   Object.defineProperty(replExports, "builtinModules", {
     get: () => getReplBuiltinLibs(),

@@ -62,10 +62,18 @@ int main(int argc, char* argv[]) {
     //    Must come before ANY bun-flag parsing: node's flags are not bun's.
     if (argc > 0 && is_node_argv0(argv[0])) {
         std::vector<std::string_view> nodeArgs(argv + 1, argv + argc);
+        // `node -i` is a REPL here too — the wrapper's "does not support a repl"
+        // message only covers the no-target case.
+        if (take_interactive_flag(nodeArgs)) return exec_interactive(nodeArgs);
         return exec_as_if_node(nodeArgs);
     }
 
     std::vector<std::string_view> args(argv + 1, argv + argc);
+
+    // `-i` / `--interactive` forces the REPL, before any other flag handling:
+    // it is not a run flag (there is no run target) and it must survive
+    // alongside `-e`/`--eval`, which the strip loop below stops at.
+    if (take_interactive_flag(args)) return exec_interactive(args);
 
     // Strip leading global run flags so `mbun [flags] <script>` runs the script,
     // but never past -e/-p/--eval/--print (those consume the next token as code).
