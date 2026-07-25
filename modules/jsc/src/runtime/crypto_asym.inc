@@ -541,26 +541,40 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_cipher_host,
     if (aead) {
         EVP_CIPHER_CTX_ctrl(cc.get(), EVP_CTRL_AEAD_SET_IVLEN, static_cast<int>(iv.size()), nullptr);
     }
-    // OCB is the one AEAD whose tag length must be fixed BEFORE the key is
-    // installed (EVP_EncryptInit_ex derives the L table from it).
-    if (ocb) {
-        if (enc) {
-            EVP_CIPHER_CTX_ctrl(cc.get(), EVP_CTRL_AEAD_SET_TAG, tagLen, nullptr);
-        } else if (!tagIn.empty()) {
-            // OCB's ctrl rejects a tag whose length differs from the context's
-            // (default 16), so declare the length first (ptr == nullptr) and only
-            // then hand over the bytes. ref: OpenSSL crypto/evp/e_aes.c aes_ocb_ctrl.
-            EVP_CIPHER_CTX_ctrl(cc.get(), EVP_CTRL_AEAD_SET_TAG, static_cast<int>(tagIn.size()),
-                                nullptr);
-            EVP_CIPHER_CTX_ctrl(cc.get(), EVP_CTRL_AEAD_SET_TAG, static_cast<int>(tagIn.size()),
-                                tagIn.data());
+    // GCM infers its tag length from the tag the caller hands over; every OTHER
+    // AEAD has it FIXED at init. node does this unconditionally in
+    // InitAuthenticated (src/crypto/crypto_cipher.cc: "In CCM and OCB mode, [the
+    // authentication tag length] must always be given by the user"), and for
+    // ChaCha20-Poly1305 it pins auth_tag_len to 16 before the EVP_CTRL_AEAD_SET_TAG
+    // declaration.
+    //
+    // SECURITY: this is what makes a decrypt with a MISSING tag fail. OpenSSL
+    // leaves chacha20-poly1305's taglen at 0 until told, and its final does
+    // `CRYPTO_memcmp(computed, ctx->buf, taglen)` — a 0-length compare is EQUAL,
+    // so EVP_CipherFinal_ex returned success and handed back tampered plaintext
+    // that was never authenticated. Declaring the length up front turns that into
+    // a 16-byte compare against a zeroed buffer, which fails as it must.
+    //
+    // OCB additionally *requires* the length before the key is installed
+    // (EVP_EncryptInit_ex derives the L table from it), so the whole block sits
+    // ahead of the key/iv init for every mode.
+    const bool fixedTagLen{aead && !gcm};
+    if (fixedTagLen) {
+        // On decrypt with a supplied tag, declare exactly that length: OCB's ctrl
+        // rejects a tag whose length differs from the context's, so the length has
+        // to be declared (ptr == nullptr) before the bytes are handed over.
+        // ref: OpenSSL crypto/evp/e_aes.c aes_ocb_ctrl.
+        const int declared{(!enc && !tagIn.empty()) ? static_cast<int>(tagIn.size()) : tagLen};
+        EVP_CIPHER_CTX_ctrl(cc.get(), EVP_CTRL_AEAD_SET_TAG, declared, nullptr);
+        if (!enc && !tagIn.empty()) {
+            EVP_CIPHER_CTX_ctrl(cc.get(), EVP_CTRL_AEAD_SET_TAG, declared, tagIn.data());
         }
     }
     if (EVP_CipherInit_ex(cc.get(), nullptr, nullptr, key.data(), iv.empty() ? nullptr : iv.data(),
                           enc ? 1 : 0) <= 0) {
         return hasher_throw(global, "cipher key/iv setup failed");
     }
-    if (!enc && aead && !ocb && !tagIn.empty()) {
+    if (!enc && gcm && !tagIn.empty()) {
         EVP_CIPHER_CTX_ctrl(cc.get(), EVP_CTRL_AEAD_SET_TAG, static_cast<int>(tagIn.size()),
                             tagIn.data());
     }
@@ -671,6 +685,22 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_cipher_info_host,
     }
     set_prop(ctx, obj, "keyLength", JSValueMakeNumber(ctx, static_cast<double>(keyLen)));
     set_prop(ctx, obj, "mode", make_string(ctx, modeStr));
+    // mbun extension (node's getCipherInfo has no such field): whether this cipher
+    // is AEAD, i.e. produces/consumes an authentication tag.
+    //
+    // SECURITY: the JS layer used to infer this from `mode`, and ChaCha20-Poly1305's
+    // mode is "stream" — so `_auth` came out FALSE for a real AEAD, setAuthTag()
+    // skipped its length check, and a zero-length tag sailed through unvalidated
+    // into a native path that then skipped EVP_CTRL_AEAD_SET_TAG entirely.
+    // node asks the cipher itself (IsSupportedAuthenticatedMode /
+    // ncrypto::Cipher::isSupportedAuthenticatedMode), which is what this mirrors.
+    // NID_chacha20_poly1305 is enumerated rather than using
+    // EVP_CIPHER_FLAG_AEAD_CIPHER because OpenSSL also sets that flag on the
+    // stitched aes-*-cbc-hmac-sha* ciphers, which are not tag-producing here.
+    const bool isAead{mode == EVP_CIPH_GCM_MODE || mode == EVP_CIPH_CCM_MODE ||
+                      mode == EVP_CIPH_OCB_MODE ||
+                      EVP_CIPHER_nid(c) == NID_chacha20_poly1305};
+    set_prop(ctx, obj, "aead", JSValueMakeBoolean(ctx, isAead));
     return JSC::JSValue::encode(toJS(global, static_cast<JSValueRef>(obj)));
 }
 
