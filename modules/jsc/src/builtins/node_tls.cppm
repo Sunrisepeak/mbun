@@ -175,14 +175,23 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
   const validateBuffer = (v, name) => { if (!ArrayBuffer.isView(v)) throw ERR_INVALID_ARG_TYPE(name, ["Buffer", "TypedArray", "DataView"], v); };
   const validateFunction = (v, name) => { if (typeof v !== "function") throw ERR_INVALID_ARG_TYPE(name, "Function", v); };
 
-  // ---- internal/tls throwOnInvalidTLSArray ----
+  // ---- internal/tls validateKeyOrCertOption / configSecureContext ----
+  // node validates every ca/cert/key value with validateKeyOrCertOption, which
+  // accepts ONLY a string or an ArrayBufferView. The `{ pem, passphrase }` form
+  // is not a value type: configSecureContext unwraps it (`val?.pem !== undefined
+  // ? val.pem : val`) for the ELEMENTS OF A KEY ARRAY only, and validates the
+  // unwrapped pem. So `key: [{ pem }]` is legal, while a bare `key: { pem }` —
+  // and any `{ pem }` under `cert`/`ca` — is ERR_INVALID_ARG_TYPE.
+  // Accepting the bare object made tls.createServer({ key: { pem } }) succeed
+  // where node throws (test-tls-options-boolean-check /
+  // test-https-options-boolean-check assert both key and cert).
   const isValidTLSItem = (o) =>
-    typeof o === "string" || ArrayBuffer.isView(o) || o instanceof ArrayBuffer ||
-    (o && typeof o === "object" && typeof o.pem !== "undefined") ||
-    (Array.isArray(o) && o.every((x) => x && typeof x === "object" && "pem" in x));
-  const isValidTLSArray = (o) => {
+    typeof o === "string" || ArrayBuffer.isView(o) || o instanceof ArrayBuffer;
+  // node's key-array element rule, returning the value the error must name.
+  const unwrapKeyPem = (x) => (x != null && typeof x === "object" && x.pem !== undefined ? x.pem : x);
+  const isValidTLSArray = (o, unwrapPem) => {
     if (isValidTLSItem(o)) return true;
-    if (Array.isArray(o)) return o.every(isValidTLSItem);
+    if (Array.isArray(o)) return o.every((x) => isValidTLSItem(unwrapPem ? unwrapKeyPem(x) : x));
     return false;
   };
   // node lib/internal/tls/secure-context.js validateKeyOrCertOption passes this
@@ -190,13 +199,19 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
   // but the rejection message must be node's (no bun corpus test pins the
   // "or BunFile" wording — it was invented here).
   const VALID_TLS_ERROR_MESSAGE_TYPES = ["string", "Buffer", "TypedArray", "DataView"];
-  const findInvalidTLSItem = (o) => {
-    if (Array.isArray(o)) { for (const item of o) if (!isValidTLSItem(item)) return item; }
+  const findInvalidTLSItem = (o, unwrapPem) => {
+    if (Array.isArray(o)) {
+      for (const item of o) {
+        const v = unwrapPem ? unwrapKeyPem(item) : item;
+        if (!isValidTLSItem(v)) return v;
+      }
+    }
     return o;
   };
-  const throwOnInvalidTLSArray = (name, value) => {
-    if (!isValidTLSArray(value))
-      throw ERR_INVALID_ARG_TYPE(name, VALID_TLS_ERROR_MESSAGE_TYPES, findInvalidTLSItem(value));
+  // `unwrapPem` is set only for options.key, matching where node unwraps.
+  const throwOnInvalidTLSArray = (name, value, unwrapPem) => {
+    if (!isValidTLSArray(value, unwrapPem))
+      throw ERR_INVALID_ARG_TYPE(name, VALID_TLS_ERROR_MESSAGE_TYPES, findInvalidTLSItem(value, unwrapPem));
   };
 
   // ---- DEFAULT_CIPHERS (node src/node_constants.h DEFAULT_CIPHER_LIST_CORE) ---
@@ -237,22 +252,23 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
   let DEFAULT_MAX_VERSION = "TLSv1.3";
   const DEFAULT_ECDH_CURVE = "auto";
 
-  // node src/node_options.cc: --tls-min-v1.{0,1,2,3} / --tls-max-v1.{2,3} move
-  // the default protocol window, and a later flag overrides an earlier one
-  // (test-tls-cli-min-version-1.0 passes --tls-min-v1.0 --tls-min-v1.1 and
-  // expects TLSv1). These only ever RESTRICT or widen the default window on the
-  // operator's explicit instruction; nothing here changes the window when no
-  // flag is given.
+  // node lib/tls.js: --tls-min-v1.{0,1,2,3} / --tls-max-v1.{2,3} move the default
+  // protocol window. The resolution is NOT last-flag-wins — it is a fixed
+  // if/else-if chain in a fixed order, so the WIDEST flag present wins no matter
+  // where it appears on the command line: min checks v1.0 first, then v1.1, v1.2,
+  // v1.3; max checks v1.3 first, then v1.2. test-tls-cli-min-version-1.0 passes
+  // `--tls-min-v1.0 --tls-min-v1.1` and expects TLSv1, which last-flag-wins got
+  // backwards. These only ever move the default window on the operator's explicit
+  // instruction; nothing here changes it when no flag is given.
   {
     const argv = (G.process && G.process.execArgv) || [];
-    const minFlags = { "--tls-min-v1.0": "TLSv1", "--tls-min-v1.1": "TLSv1.1",
-                       "--tls-min-v1.2": "TLSv1.2", "--tls-min-v1.3": "TLSv1.3" };
-    const maxFlags = { "--tls-max-v1.2": "TLSv1.2", "--tls-max-v1.3": "TLSv1.3" };
-    for (const a of argv) {
-      if (typeof a !== "string") continue;
-      if (minFlags[a] !== undefined) DEFAULT_MIN_VERSION = minFlags[a];
-      else if (maxFlags[a] !== undefined) DEFAULT_MAX_VERSION = maxFlags[a];
-    }
+    const has = (flag) => argv.some((a) => a === flag);
+    if (has("--tls-min-v1.0")) DEFAULT_MIN_VERSION = "TLSv1";
+    else if (has("--tls-min-v1.1")) DEFAULT_MIN_VERSION = "TLSv1.1";
+    else if (has("--tls-min-v1.2")) DEFAULT_MIN_VERSION = "TLSv1.2";
+    else if (has("--tls-min-v1.3")) DEFAULT_MIN_VERSION = "TLSv1.3";
+    if (has("--tls-max-v1.3")) DEFAULT_MAX_VERSION = "TLSv1.3";
+    else if (has("--tls-max-v1.2")) DEFAULT_MAX_VERSION = "TLSv1.2";
   }
 
   // ---- secureProtocol validation (lib/internal/tls/secure-context.js) ----
@@ -410,7 +426,7 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
       if (options) {
         validateSecureContextOptions(options);
         if (options.cert) throwOnInvalidTLSArray("options.cert", options.cert);
-        if (options.key) throwOnInvalidTLSArray("options.key", options.key);
+        if (options.key) throwOnInvalidTLSArray("options.key", options.key, true);
         if (options.ca) throwOnInvalidTLSArray("options.ca", options.ca);
         if (options.servername != null && typeof options.servername !== "string")
           throw new TypeError("servername argument must be an string");
