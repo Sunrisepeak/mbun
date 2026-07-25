@@ -489,6 +489,228 @@ inline constexpr std::string_view kNodeInternalBindingJS = R"JS(
     };
   };
 
+  // ----------------------------------------------------------------- url ----
+  // node src/node_url.cc (BindingData), expressed over the WHATWG URL this
+  // runtime already owns.
+  //
+  // node's lib/internal/url.js does not keep a parsed URL record: it keeps the
+  // serialized href plus the nine `ada::url_components` offsets into it, and
+  // re-reads the `urlComponents` accessor after every parse/update. So the
+  // binding has to (a) parse/mutate and (b) publish those offsets. (a) is
+  // `new URL()` and its setters; (b) is recovered arithmetically from the href,
+  // which is exact because a *serialized* URL only ever contains ':' '@' '?'
+  // '#' at component boundaries.
+  //
+  // Without this binding `internal/url` throws at load, and with it every
+  // module that requires it — `internal/fs/utils`, `internal/modules/helpers`,
+  // and the whole `internal/test_runner/*` tree — so node's own test runner
+  // could not be loaded at all.
+  factories["url"] = () => {
+    // ada spells "omitted" as uint32_t(-1); URLContext compares against it.
+    const OMITTED = 4294967295;
+    // ada::scheme::type — the order is load-bearing (URLContext.scheme_type).
+    const SCHEME_TYPE = {
+      __proto__: null,
+      "http:": 0, "https:": 2, "ws:": 3, "ftp:": 4, "wss:": 5, "file:": 6,
+    };
+    const urlMod = () => mod("url");
+
+    // The shared component buffer node reads back through `urlComponents`.
+    const buffer = [0, 0, 0, 0, OMITTED, 0, OMITTED, OMITTED, 1];
+
+    const invalidURL = (input, base) => {
+      const e = new TypeError("Invalid URL");
+      e.code = "ERR_INVALID_URL";
+      e.input = input;
+      if (base !== undefined) e.base = base;
+      return e;
+    };
+
+    // ada::url_components for `u`, as offsets into u.href.
+    const componentsOf = (u) => {
+      const href = u.href;
+      const protocolEnd = u.protocol.length;
+      const scheme = SCHEME_TYPE[u.protocol];
+      let usernameEnd, hostStart, hostEnd, pathnameStart;
+      // "//" after the scheme means an authority; an opaque path (mailto:,
+      // data:, javascript:) has none and ada collapses every host offset onto
+      // protocol_end.
+      if (href.charCodeAt(protocolEnd) === 47 && href.charCodeAt(protocolEnd + 1) === 47) {
+        const authStart = protocolEnd + 2;
+        const user = u.username;
+        const pass = u.password;
+        usernameEnd = authStart + user.length;
+        // With credentials host_start indexes the '@' (node's getters test
+        // href[host_start] for it); without, the first host character.
+        hostStart = usernameEnd + (pass.length !== 0 ? pass.length + 1 : 0);
+        const hostAt = (user.length !== 0 || pass.length !== 0) ? hostStart + 1 : hostStart;
+        hostEnd = hostAt + u.hostname.length;
+        pathnameStart = hostEnd + (u.port.length !== 0 ? u.port.length + 1 : 0);
+      } else {
+        usernameEnd = hostStart = hostEnd = pathnameStart = protocolEnd;
+      }
+      const hashStart = href.indexOf("#", pathnameStart);
+      const queryEnd = hashStart === -1 ? href.length : hashStart;
+      let searchStart = href.indexOf("?", pathnameStart);
+      if (searchStart === -1 || searchStart > queryEnd) searchStart = OMITTED;
+      return [
+        protocolEnd,
+        usernameEnd,
+        hostStart,
+        hostEnd,
+        u.port.length !== 0 ? +u.port : OMITTED,
+        pathnameStart,
+        searchStart,
+        hashStart === -1 ? OMITTED : hashStart,
+        scheme === undefined ? 1 : scheme,
+      ];
+    };
+
+    const publish = (u) => {
+      const c = componentsOf(u);
+      for (let i = 0; i < 9; i++) buffer[i] = c[i];
+      return u.href;
+    };
+
+    const construct = (input, base) => (
+      base === undefined || base === null ? new G.URL(input) : new G.URL(input, base)
+    );
+
+    // ---- RFC1738-unsafe chars node percent-encodes before parsing a path ----
+    // node src/node_url.cc EncodePathChars / lookup_table.
+    const PATH_ENCODE = { __proto__: null };
+    PATH_ENCODE["\0"] = "%00"; PATH_ENCODE["\t"] = "%09";
+    PATH_ENCODE["\n"] = "%0A"; PATH_ENCODE["\r"] = "%0D";
+    PATH_ENCODE[" "] = "%20"; PATH_ENCODE['"'] = "%22";
+    PATH_ENCODE["#"] = "%23"; PATH_ENCODE["%"] = "%25";
+    PATH_ENCODE["?"] = "%3F"; PATH_ENCODE["["] = "%5B";
+    PATH_ENCODE["\\"] = "%5C"; PATH_ENCODE["]"] = "%5D";
+    PATH_ENCODE["^"] = "%5E"; PATH_ENCODE["|"] = "%7C";
+    PATH_ENCODE["~"] = "%7E";
+
+    const encodePathChars = (input, windows) => {
+      let out = "file://";
+      for (let i = 0; i < input.length; i++) {
+        const ch = input[i];
+        if (input.charCodeAt(i) > 126) { out += ch; continue; }
+        if (windows && ch === "\\") { out += "/"; continue; }
+        out += PATH_ENCODE[ch] !== undefined ? PATH_ENCODE[ch] : ch;
+      }
+      return out;
+    };
+
+    // Special-scheme set per the URL Standard. A protocol setter may not cross
+    // the special/non-special boundary; JSC's URL applies the change anyway, so
+    // the guard lives here (ada reports it as a failed setter → `false`).
+    const isSpecial = (protocol) => SCHEME_TYPE[protocol] !== undefined;
+
+    // kProtocol..kHref, in lib/internal/url.js's `updateActions` order.
+    const applyUpdate = (u, action, value) => {
+      switch (action) {
+        case 0:
+          if (isSpecial(u.protocol) !== isSpecial(`${value}`.replace(/:*$/, "") + ":")) return false;
+          u.protocol = value; return true;
+        case 1: u.host = value; return true;
+        case 2: u.hostname = value; return true;
+        case 3: u.port = value; return true;
+        case 4: u.username = value; return true;
+        case 5: u.password = value; return true;
+        case 6: u.pathname = value; return true;
+        case 7: u.search = value; return true;
+        case 8: u.hash = value; return true;
+        case 9:
+          try { u.href = value; } catch { return false; }
+          // JSC ignores an unparseable href assignment instead of throwing.
+          return G.URL.canParse ? G.URL.canParse(value) : (() => {
+            try { new G.URL(value); return true; } catch { return false; }
+          })();
+        default: return false;
+      }
+    };
+
+    return {
+      // args: (input, base, raiseException)
+      parse(input, base, raiseException) {
+        const inputStr = `${input}`;
+        const baseStr = base === undefined || base === null ? undefined : `${base}`;
+        let u;
+        try { u = construct(inputStr, baseStr); } catch {
+          if (raiseException) throw invalidURL(inputStr, baseStr);
+          return undefined;
+        }
+        return publish(u);
+      },
+      // args: (href, action, value) -> new href, or false when the setter failed
+      update(href, action, value) {
+        let u;
+        try { u = new G.URL(`${href}`); } catch { return false; }
+        if (!applyUpdate(u, action, `${value}`)) return false;
+        return publish(u);
+      },
+      canParse(input, base) {
+        const inputStr = `${input}`;
+        if (typeof base === "string") {
+          if (G.URL.canParse) return G.URL.canParse(inputStr, base);
+          try { new G.URL(inputStr, base); return true; } catch { return false; }
+        }
+        if (G.URL.canParse) return G.URL.canParse(inputStr);
+        try { new G.URL(inputStr); return true; } catch { return false; }
+      },
+      getOrigin(input) {
+        let u;
+        try { u = new G.URL(`${input}`); } catch { throw invalidURL(`${input}`); }
+        return u.origin;
+      },
+      // node throws ERR_INVALID_URL when the encoded path will not parse.
+      pathToFileURL(input, windows, hostname) {
+        const inputStr = `${input}`;
+        let u;
+        try { u = new G.URL(encodePathChars(inputStr, windows === true)); } catch {
+          throw invalidURL(inputStr);
+        }
+        if (windows === true && hostname !== undefined) {
+          try { u.hostname = `${hostname}`; } catch {
+            throw invalidURL(inputStr, `${hostname}`);
+          }
+        }
+        return publish(u);
+      },
+      // NoSideEffect in node: must NOT touch the component buffer.
+      format(href, hash, unicode, search, auth) {
+        const hrefStr = `${href}`;
+        let u;
+        try { u = new G.URL(hrefStr); } catch { return hrefStr; }
+        if (!hash) u.hash = "";
+        if (!search) u.search = "";
+        if (!auth) { u.username = ""; u.password = ""; }
+        let out = u.href;
+        if (unicode && u.hostname.length !== 0) {
+          const toUnicode = urlMod().domainToUnicode;
+          const uni = typeof toUnicode === "function" ? toUnicode(u.hostname) : "";
+          if (uni.length !== 0) {
+            const c = componentsOf(u);
+            const hostAt = (u.username.length !== 0 || u.password.length !== 0) ? c[2] + 1 : c[2];
+            out = out.slice(0, hostAt) + uni + out.slice(c[3]);
+          }
+        }
+        return out;
+      },
+      domainToASCII(domain) {
+        const s = `${domain}`;
+        if (s.length === 0) return "";
+        const fn = urlMod().domainToASCII;
+        return typeof fn === "function" ? fn(s) : s;
+      },
+      domainToUnicode(domain) {
+        const s = `${domain}`;
+        if (s.length === 0) return "";
+        const fn = urlMod().domainToUnicode;
+        return typeof fn === "function" ? fn(s) : s;
+      },
+      get urlComponents() { return buffer; },
+    };
+  };
+
   // ---------------------------------------------------------- url_pattern ----
   factories["url_pattern"] = () => ({ URLPattern: G.URLPattern });
 
