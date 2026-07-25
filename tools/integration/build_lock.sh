@@ -39,6 +39,35 @@ common_dir=$(git rev-parse --git-common-dir 2>/dev/null) || {
 lock_dir="$(cd "$common_dir" && pwd)/mbun-build-locks"
 mkdir -p "$lock_dir"
 
+# A build that reports success is not proof the binary was rebuilt. `mcpp build`
+# has twice reported "Finished release in 0.01s" over edited .cppm sources, and a
+# brand-new module partition fails with "failed to read compiled module" instead
+# — both because the generated build.ninja is keyed on the module list at
+# generation time. A measurement taken after such a build silently scores the
+# PREVIOUS binary, which is the worst possible failure mode here: it looks like a
+# result. Warn loudly and say exactly how to fix it.
+warn_if_binary_is_stale() {
+  local root newest_src bin
+  root=$(git rev-parse --show-toplevel 2>/dev/null) || return 0
+  bin=$(find "$root/target" -type f -name mbun -perm -111 -printf '%T@ %p\n' 2>/dev/null \
+        | sort -rn | head -1 | cut -d' ' -f2-)
+  [ -n "$bin" ] || return 0
+  newest_src=$(find "$root/modules" "$root/src" -type f \
+                 \( -name '*.cppm' -o -name '*.cpp' -o -name '*.inc' -o -name '*.hpp' \) \
+                 -newer "$bin" -print 2>/dev/null | head -3)
+  [ -n "$newest_src" ] || return 0
+  {
+    echo
+    echo "$0: WARNING — sources are NEWER than the binary the build just produced:"
+    printf '  %s\n' $newest_src
+    echo "  binary: $bin"
+    echo
+    echo "  The build reported success but may not have rebuilt. Any measurement"
+    echo "  taken now would silently score the PREVIOUS binary. Fix with:"
+    echo "      find target -name build.ninja -delete && $0 mcpp build"
+  } >&2
+}
+
 start=$(date +%s)
 while :; do
   for slot in $(seq 1 "$slots"); do
@@ -54,6 +83,7 @@ while :; do
       rc=$?
       flock -u "$fd"
       exec {fd}>&-
+      [ "$rc" = 0 ] && warn_if_binary_is_stale
       exit "$rc"
     fi
     exec {fd}>&-

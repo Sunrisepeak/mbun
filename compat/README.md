@@ -145,8 +145,17 @@ like scattered work. Two checks catch it where the signatures cannot:
    unrelated assertion failures means *translate the layer* — do not extend the
    stand-in.
 
-By that heuristic, `cluster` (11/80 green) and `runner` (10/73) currently look
-exactly the way `http` did.
+By that heuristic, `cluster` (11/80 green) and `runner` (10/73) were picked as
+the next target — and it held. `node:cluster` was a **stub whose `fork()`
+returned a bare EventEmitter**; translating node's `lib/cluster.js` +
+`lib/internal/cluster/*` was +38 by itself, and the subsystem went **11/83 →
+76/83 green**. Signature clustering had shown those 45 files as a bare
+`global code@…` bucket — "a top-level throw" — which is no signal at all.
+
+**The green ratio is therefore the primary targeting input; signatures are for
+picking work *within* a subsystem.** Two independent confirmations in one round:
+`http` 26% green → stand-in → +170 (2.8× target); `cluster` 13.3% green → stub →
++73 (1.62×).
 
 The same task also fixed two transport bugs the port exposed, both of which had
 been silently corrupting correct-looking output: `net.Socket._flush()` stopped
