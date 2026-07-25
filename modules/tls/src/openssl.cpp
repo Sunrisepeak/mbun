@@ -217,9 +217,72 @@ struct TlsChannel::Impl {
             // the generic "certificate verify failed" the error queue carries.
             // Blueprint: node src/crypto/crypto_common.cc X509ErrorCode().
             // This changes the error's SHAPE only: the handshake still fails.
-            if (const char* verifyCode {x509_error_code(vr)}; verifyCode != nullptr) {
+            // node lets chain verification run to COMPLETION (its VerifyCallback
+            // returns 1 unconditionally and the result is inspected afterwards),
+            // so what it reports is OpenSSL's *final* verdict. mbun installs no
+            // callback, so SSL_VERIFY_PEER aborts at the FIRST error and
+            // SSL_get_verify_result() stops on an intermediate code. Measured
+            // against this very runtime with `openssl s_client -connect`, which
+            // does continue:
+            //
+            //   verify error:num=20:unable to get local issuer certificate
+            //   verify error:num=21:unable to verify the first certificate
+            //   Verify return code: 21
+            //
+            // Only code 20 loses information this way, and OpenSSL's own rule for
+            // which of the two is final is in build_chain() (x509_vfy.c): a peer
+            // chain of exactly one certificate that is not self-signed ends as 21,
+            // a longer one as 20. Reproducing that rule here recovers node's code
+            // for 9 corpus files across tls and http2.
+            //
+            // NOT done by switching to node's always-return-1 callback: with
+            // SSL_VERIFY_PEER and no callback, OpenSSL's abort IS mbun's
+            // enforcement of rejectUnauthorized. Making the callback continue
+            // would move that gate out of OpenSSL and into the JS layer, and
+            // proving the JS gate airtight on every path (server-side client-cert
+            // auth, SNI contexts, session resumption) is a far larger audit whose
+            // failure mode is a silent verification bypass. This branch changes
+            // the reported CODE only: the handshake still fails, at the same
+            // point, for the same reason.
+            long reported {vr};
+            if (vr == X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY) {
+                // OpenSSL asymmetry that matters here: SSL_get_peer_cert_chain()
+                // INCLUDES the peer's leaf for a client, but EXCLUDES it for a
+                // server (where the leaf is only reachable via
+                // SSL_get1_peer_certificate). Counting the stack alone therefore
+                // reads 1 for a leaf-only server cert and 0 for a leaf-only
+                // client cert, and an `== 1` test silently skips every
+                // client-certificate case (measured: test-tls-client-auth kept
+                // reporting code 20 until this was handled).
+                // Take the leaf from the stack for a client (it is element 0
+                // there) and only ask SSL_get1_peer_certificate() for a server.
+                // Gating the whole branch on that call regressed the client cases
+                // that already worked: on this failure path it returns nullptr,
+                // so every client file fell back to reporting code 20 again.
+                STACK_OF(X509)* chain {::SSL_get_peer_cert_chain(ssl_)};
+                const int stack {chain != nullptr ? sk_X509_num(chain) : 0};
+                X509* leaf {nullptr};
+                X509* owned {nullptr};
+                int total {stack};
+                if (role_ == TlsRole::server) {
+                    owned = ::SSL_get1_peer_certificate(ssl_);
+                    leaf = owned;
+                    total = stack + (owned != nullptr ? 1 : 0);
+                } else if (stack >= 1) {
+                    leaf = sk_X509_value(chain, 0);
+                }
+                if (leaf != nullptr && total == 1 &&
+                    ::X509_NAME_cmp(::X509_get_subject_name(leaf),
+                                    ::X509_get_issuer_name(leaf)) != 0) {
+                    reported = X509_V_ERR_UNABLE_TO_VERIFY_LEAF_SIGNATURE;
+                }
+                if (owned != nullptr) {
+                    ::X509_free(owned);
+                }
+            }
+            if (const char* verifyCode {x509_error_code(reported)}; verifyCode != nullptr) {
                 errorCode_ = verifyCode;
-                const char* reason {::X509_verify_cert_error_string(vr)};
+                const char* reason {::X509_verify_cert_error_string(reported)};
                 error_ = reason != nullptr ? reason : verifyCode;
                 return;
             }

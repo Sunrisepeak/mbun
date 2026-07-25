@@ -316,7 +316,26 @@
    "confidence": "CAUSE named -- the actual/expected pair identifies it uniquely",
    "action": "BEST cluster currently known: 9 files, one mechanism, and it is a correctness fix (chain verification), not a workaround",
    "file_count": 9,
-   "cross_subsystem_note": "Found separately in two subsystems and only recognised as one cause when the http logs were parsed the same way as the tls logs. tls shows it as 'UNABLE_TO_GET_ISSUER_CERT_LOCALLY vs UNABLE_TO_VERIFY_LEAF_SIGNATURE'; http2 shows it as the plain message 'unable to get local issuer certificate'. Same OpenSSL verify path. This is exactly what cluster_finder.py's cross-subsystem ranking exists to catch, and a per-subsystem brief would have split it and under-budgeted both halves."
+   "cross_subsystem_note": "Found separately in two subsystems and only recognised as one cause when the http logs were parsed the same way as the tls logs. tls shows it as 'UNABLE_TO_GET_ISSUER_CERT_LOCALLY vs UNABLE_TO_VERIFY_LEAF_SIGNATURE'; http2 shows it as the plain message 'unable to get local issuer certificate'. Same OpenSSL verify path. This is exactly what cluster_finder.py's cross-subsystem ranking exists to catch, and a per-subsystem brief would have split it and under-budgeted both halves.",
+   "status_after_fix": {
+    "fixed_in": "modules/tls/src/openssl.cpp -- report OpenSSL's FINAL verdict for code 20 by reproducing build_chain()'s rule locally",
+    "converted": [
+     "test-https-simple",
+     "test-tls-friendly-error-message",
+     "test-https-agent-create-connection (not predicted)"
+    ],
+    "still_failing_with_reasons": {
+     "test-tls-client-auth": "DISCRIMINATING test: line 188 expects code 21 AND line 223 expects code 20 in different subcases. The 21-expecting subcase still reports 20 -- neither the client stack path nor the server SSL_get1_peer_certificate path yields a leaf there. Needs the always-continue-verification approach, which was deliberately NOT taken (see below).",
+     "test-tls-set-default-ca-certificates-append-https-request": "ADVANCED -- now correctly reports UNABLE_TO_VERIFY_LEAF_SIGNATURE. Its real failure is separate: 'Should not error with correct CA added', i.e. an appended default CA does not take effect.",
+     "test-tls-set-default-ca-certificates-reset-https-request": "same family as the append case: default-CA mutation not taking effect",
+     "test-tls-socket-default-options": "ADVANCED then stalled: fail -> timeout, reproducible 3/3. hang_dump shows 5 listening Servers + TLSSockets, all readable/writable, _wq=0 -- an exact match for tls-timeout-shape-B. It now runs further before stopping, so it joined the stalled-exchange class.",
+     "test-http2-create-client-secure-session": "code now correct; fails on its own http2 secure-session logic",
+     "test-http2-https-fallback": "code now correct ('unable to verify the first certificate'); fails later",
+     "test-http2-serve-file": "code now correct; fails later"
+    },
+    "why_the_fuller_fix_was_declined": "node gets the right code by letting verification run to completion (VerifyCallback returns 1 unconditionally) and checking SSL_get_verify_result() afterwards. mbun passes nullptr to SSL_CTX_set_verify, so OpenSSL's abort IS the enforcement of rejectUnauthorized. Switching to an always-continue callback moves that gate out of OpenSSL into the JS layer, and proving the JS gate airtight on every path (server-side client-cert auth, SNI contexts, session resumption) is a much larger audit whose failure mode is a SILENT VERIFICATION BYPASS. Anyone taking that on must treat it as a security change with its own review, not as a corpus fix.",
+    "measured": "guard 681 files (all tls/https/http2/crypto): 0 green->non-green, +3, 1 fail->timeout characterised above"
+   }
   },
   "missing-internalBinding-stream_pipe": {
    "corpus": "node",
