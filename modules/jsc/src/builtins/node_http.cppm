@@ -1307,12 +1307,44 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
     if (options.socketPath) name += ":" + options.socketPath;
     return name;
   };
+  // _http_agent.js normalizeServerName / calculateServerName: the TLS server name
+  // a request verifies against is derived from the HOST HEADER, not from the
+  // connect target. node:https then hands that to tls.connect as `servername`, so
+  // `https.get({ host: undefined, headers: { host: "agent1" } })` verifies against
+  // CN=agent1 — without this the peer certificate is checked against the connect
+  // hostname ("localhost") and a perfectly valid fixture chain is rejected.
+  // Also part of the pool key (getName includes servername), so two requests to
+  // the same address with different Host headers cannot share a TLS socket.
+  function calculateServerName(options, req) {
+    let servername = options.host;
+    const hostHeader = req && typeof req.getHeader === "function" ? req.getHeader("host") : undefined;
+    if (hostHeader) {
+      validateString(hostHeader, "options.headers.host");
+      // abc => abc, abc:123 => abc, [::1] => ::1, [::1]:123 => ::1
+      if (hostHeader[0] === "[") {
+        const index = hostHeader.indexOf("]");
+        servername = index === -1 ? hostHeader : hostHeader.substring(1, index);
+      } else {
+        servername = hostHeader.split(":", 1)[0];
+      }
+    }
+    // Don't implicitly set invalid (IP) servernames.
+    const net = netModule();
+    if (typeof net.isIP === "function" && net.isIP(servername)) servername = "";
+    return servername;
+  }
+  function normalizeServerName(options, req) {
+    if (!options.servername && options.servername !== "") {
+      options.servername = calculateServerName(options, req);
+    }
+  }
   Agent.prototype.addRequest = function addRequest(request, options, port, localAddress) {
     if (typeof options === "string") {
       options = { __proto__: null, host: options, port, localAddress };
     }
     options = { __proto__: null, ...options, ...this.options };
     if (options.socketPath) options.path = options.socketPath;
+    normalizeServerName(options, request);
     const name = this.getName(options);
     if (!this.sockets[name]) this.sockets[name] = [];
     const freeSockets = this.freeSockets[name];
@@ -1343,6 +1375,7 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
   Agent.prototype.createSocket = function createSocket(request, options, cb) {
     options = { __proto__: null, ...options, ...this.options };
     if (options.socketPath) options.path = options.socketPath;
+    normalizeServerName(options, request);
     const timeout = request.timeout || this.options.timeout || undefined;
     if (timeout) options.timeout = timeout;
     const name = this.getName(options);
