@@ -1091,12 +1091,12 @@ export constexpr std::string_view kHttp2JS = R"JS(
     setTimeout(ms, cb) { return http2StreamSetTimeout(this, ms, cb); }
     priority(options) { streamPriority(this); }
     _pushData(bytes) { http2StreamPushData(this, bytes); }
-    _onResponse(headersObj, flags) {
+    _onResponse(headersObj, flags, rawHeaders) {
       if (this._responseEmitted) return;
       this._responseEmitted = true;
       this.pending = false;
       this.endAfterHeaders = !!(flags & FLAG.END_STREAM);
-      this.emit("response", headersObj, flags);
+      this.emit("response", headersObj, flags, rawHeaders || []);
     }
     _onEnd() { http2StreamEndReadable(this); }
     _onClose() { http2StreamFinish(this); }
@@ -1231,7 +1231,10 @@ export constexpr std::string_view kHttp2JS = R"JS(
       const optEndStream = options.endStream === true;
       // Header validation runs BEFORE the stream id is consumed: node throws
       // out of request() for a malformed header block and no stream is opened.
-      const built = buildHeaderList(headers, this._scheme, this._authorityName, this._options.strictSingleValueFields);
+      const rawForm = Array.isArray(headers);
+      const built = rawForm
+        ? buildHeaderListArray(headers, this._scheme, this._authorityName, this._options.strictSingleValueFields)
+        : buildHeaderList(headers, this._scheme, this._authorityName, this._options.strictSingleValueFields);
       const streamId = this._nextStreamId();
       const stream = new ClientHttp2Stream(this, streamId, headers, options);
       this.streams.set(streamId, stream);
@@ -1262,7 +1265,7 @@ export constexpr std::string_view kHttp2JS = R"JS(
       // node Http2Stream#sentHeaders is the prepared object, i.e. including the
       // :method/:authority/:scheme/:path defaults request() filled in.
       stream.sentHeaders = built.prepared || headers;
-      const method = headers[":method"] === undefined ? "GET" : String(headers[":method"]);
+      const method = built.method === undefined ? "GET" : String(built.method);
       const noBody = /^(GET|HEAD|DELETE)$/.test(method);
       const endStream = options.endStream === undefined ? noBody : options.endStream === true;
       writeHeaderBlock(this, streamId, block, endStream ? FLAG.END_STREAM : 0);
@@ -1514,11 +1517,15 @@ export constexpr std::string_view kHttp2JS = R"JS(
       const stream = this.streams.get(pb.streamId);
       if (!stream) return true;
       const headersObj = headerListToObject(list, this._hpack._sensitive, this._strictWs());
+      // node onSessionHeaders passes the decoded raw name/value array as the third
+      // argument of every header event, so a caller can see duplicates and order
+      // the collapsed object cannot express.
+      const rawHeaders = rawFromList(list);
       // The response HEADERS of a *pushed* stream are surfaced as 'push', not
       // 'response' (node ClientHttp2Stream: a push response is unsolicited).
       if (stream.pushed === true && !stream._responseEmitted) {
         stream._responseEmitted = true;
-        stream.emit("push", headersObj, flags);
+        stream.emit("push", headersObj, flags, rawHeaders);
         if (pb.endStream) { this.streams.delete(pb.streamId); stream._onEnd(); }
         return true;
       }
@@ -1527,14 +1534,14 @@ export constexpr std::string_view kHttp2JS = R"JS(
       // response is informational: node emits 'headers', and the real response
       // still follows (lib/internal/http2/core.js onSessionHeaders).
       const st = headersObj[":status"];
-      if (stream._responseEmitted) stream.emit("trailers", headersObj, flags);
+      if (stream._responseEmitted) stream.emit("trailers", headersObj, flags, rawHeaders);
       else if (typeof st === "number" && st >= 100 && st < 200) {
-        stream.emit("headers", headersObj, flags);
+        stream.emit("headers", headersObj, flags, rawHeaders);
         // node ClientHttp2Stream handleHeaderContinue: a 100 informational
         // response is additionally surfaced as 'continue'.
         if (st === 100) stream.emit("continue");
       }
-      else stream._onResponse(headersObj, flags);
+      else stream._onResponse(headersObj, flags, rawHeaders);
       if (pb.endStream) { this.streams.delete(pb.streamId); stream._onEnd(); }
       return true;
     }
@@ -1745,12 +1752,48 @@ export constexpr std::string_view kHttp2JS = R"JS(
       if (isArray) { for (const v of value) headers.push([key, String(v)]); return; }
       headers.push([key, value]);
     };
-    for (const key of Object.keys(map)) {
-      const value = map[key];
-      if (value === undefined || key === "") continue;
-      processHeader(key, value);
+    // node buildNgHeaderString takes EITHER a header object or a flat
+    // [name, value, name, value, …] array. The array form exists precisely to
+    // keep the caller's order and duplicate fields verbatim, so it must not be
+    // funnelled through Object.keys (which would turn `a,b … a,c` into one key
+    // and expose the indices as header names).
+    if (Array.isArray(map)) {
+      for (let i = 0; i < map.length; i += 2) {
+        const key = map[i];
+        const value = map[i + 1];
+        if (value === undefined || key === "") continue;
+        processHeader(key, value);
+      }
+    } else {
+      for (const key of Object.keys(map)) {
+        const value = map[key];
+        if (value === undefined || key === "") continue;
+        processHeader(key, value);
+      }
     }
     return { list: pseudoHeaders.concat(headers), sensitive };
+  }
+  // [[name, value], …] → node's flat raw-header array (the 3rd argument of
+  // 'response'/'headers'/'trailers'/'push' and the 4th of the server's 'stream').
+  function rawFromList(list) {
+    const raw = [];
+    for (let i = 0; i < list.length; i++) raw.push(list[i][0], list[i][1]);
+    return raw;
+  }
+  // node Http2Stream#sentHeaders getter for a stream whose headers were given as
+  // a raw array: the ORIGINAL key case is kept and a repeated field collapses
+  // into an array of its values, in order.
+  function rawToHeaderObject(rawHeaders) {
+    const obj = { __proto__: null };
+    for (let i = 0; i < rawHeaders.length; i += 2) {
+      const key = rawHeaders[i];
+      const value = rawHeaders[i + 1];
+      const existing = obj[key];
+      if (existing === undefined) obj[key] = value;
+      else if (Array.isArray(existing)) existing.push(value);
+      else obj[key] = [existing, value];
+    }
+    return copySensitiveTo(rawHeaders, obj);
   }
   // node prepareRequestHeadersObject: defaults :method/:authority/:scheme/:path
   // and enforces the CONNECT-specific pseudo-header rules.
@@ -1769,6 +1812,46 @@ export constexpr std::string_view kHttp2JS = R"JS(
     }
     const built = buildNgHeaders(obj, assertValidRequestPseudoHeader, strictSingleValueFields);
     built.prepared = obj;
+    built.method = obj[":method"];
+    return built;
+  }
+  // node prepareRequestHeadersArray: the same pseudo-header defaulting, except the
+  // defaults are PREPENDED to the caller's array instead of merged into an object,
+  // so the raw order the peer observes is `defaults… , caller's fields…`.
+  function buildHeaderListArray(headers, scheme, authorityName, strictSingleValueFields) {
+    let method, sch, authority, path, protocol;
+    for (let i = 0; i < headers.length; i += 2) {
+      const name = String(headers[i]);
+      if (name[0] !== ":") continue;
+      const h = name.toLowerCase();
+      const v = headers[i + 1];
+      if (h === ":method") method = v;
+      else if (h === ":scheme") sch = v;
+      else if (h === ":authority") authority = v;
+      else if (h === ":path") path = v;
+      else if (h === ":protocol") protocol = v;
+    }
+    const add = [];
+    if (method === undefined) { method = "GET"; add.push(":method", method); }
+    const connect = method === "CONNECT";
+    if (!connect || protocol !== undefined) {
+      // `headers["host"]` on an array is always undefined; node reads it anyway
+      // (lib/internal/http2/util.js), so the array form always adds :authority.
+      if (authority === undefined && headers["host"] === undefined) { authority = authorityName; add.push(":authority", authority); }
+      if (sch === undefined) { sch = scheme; add.push(":scheme", sch); }
+      if (path === undefined) add.push(":path", "/");
+    } else {
+      if (authority === undefined) throw H2_ERR(":authority header is required for CONNECT requests", "ERR_HTTP2_CONNECT_AUTHORITY", Error);
+      if (sch !== undefined) throw H2_ERR("The :scheme header is forbidden for CONNECT requests", "ERR_HTTP2_CONNECT_SCHEME", Error);
+      if (path !== undefined) throw H2_ERR("The :path header is forbidden for CONNECT requests", "ERR_HTTP2_CONNECT_PATH", Error);
+    }
+    // concat() drops symbol properties, so the sensitive-header marker has to be
+    // carried across explicitly.
+    const rawHeaders = add.length ? copySensitiveTo(headers, add.concat(headers)) : headers;
+    const built = buildNgHeaders(rawHeaders, assertValidRequestPseudoHeader, strictSingleValueFields);
+    built.rawHeaders = rawHeaders;
+    built.prepared = rawToHeaderObject(rawHeaders);
+    built.method = method;
     return built;
   }
   function headerListToObject(list, sensitive, dropPaddedFields) {
@@ -1795,8 +1878,20 @@ export constexpr std::string_view kHttp2JS = R"JS(
       if (name === "set-cookie") { obj[name].push(value); continue; }
       obj[name] = obj[name] + ", " + value;
     }
+    // node toHeaderObject ends with a plain `obj[kSensitiveHeaders] = …`, i.e. an
+    // ENUMERABLE own symbol — assert.deepStrictEqual compares own enumerable
+    // symbol keys, so a received header object that hides it can never deep-equal
+    // the `{ [sensitiveHeaders]: [] }` the corpus expects. Only the *effective*
+    // symbol (the one http2.sensitiveHeaders resolves to) is enumerable; the
+    // legacy alias stays hidden so exactly one symbol key is observable.
+    const effective = sensitiveSymbols[sensitiveSymbols.length - 1];
     for (let i = 0; i < sensitiveSymbols.length; i++)
-      try { Object.defineProperty(obj, sensitiveSymbols[i], { value: sensitive ? sensitive.slice() : [], enumerable: false, configurable: true }); } catch (e) {}
+      try {
+        Object.defineProperty(obj, sensitiveSymbols[i], {
+          value: sensitive ? sensitive.slice() : [],
+          enumerable: sensitiveSymbols[i] === effective, configurable: true, writable: true,
+        });
+      } catch (e) {}
     return obj;
   }
   function settingsToObject(s) {
@@ -1965,6 +2060,29 @@ export constexpr std::string_view kHttp2JS = R"JS(
     return built;
   }
 
+  // node prepareResponseHeadersArray: the raw form MUTATES the caller's array —
+  // a missing :status is unshifted (as the NUMBER, which is why sentHeaders[':status']
+  // is numeric here but a string when the caller supplied it) and the Date is
+  // appended.
+  function buildResponseHeaderListArray(headers, options, strictSingleValueFields) {
+    let statusCode;
+    let isDateSet = false;
+    for (let i = 0; i < headers.length; i += 2) {
+      const h = String(headers[i]).toLowerCase();
+      if (h === ":status") statusCode = headers[i + 1] | 0;
+      else if (h === "date") isDateSet = true;
+    }
+    if (!statusCode) { statusCode = 200; headers.unshift(":status", statusCode); }
+    if (!isDateSet && (options.sendDate == null || options.sendDate)) headers.push("date", new Date().toUTCString());
+    if (statusCode < 200 || statusCode > 599) {
+      const e = new RangeError("Invalid status code: " + statusCode); e.code = "ERR_HTTP2_STATUS_INVALID"; throw e;
+    }
+    const built = buildNgHeaders(headers, assertValidResponsePseudoHeader, strictSingleValueFields);
+    built.rawHeaders = headers;
+    built.prepared = rawToHeaderObject(headers);
+    return built;
+  }
+
   // === ServerHttp2Stream ===
   class ServerHttp2Stream extends H2StreamBase {
     constructor(session, id, headers) {
@@ -2000,12 +2118,18 @@ export constexpr std::string_view kHttp2JS = R"JS(
       if (this.destroyed || this._closed) throw mkErr("The stream has been destroyed", "ERR_HTTP2_INVALID_STREAM");
       headers = headers || {};
       options = options || {};
-      // node ServerHttp2Stream.respond({ sendDate }) stamps a Date header unless
-      // the response already carries one or sendDate was turned off.
-      if (options.sendDate !== false && headers["date"] === undefined && headers["Date"] === undefined) {
-        try { headers = Object.assign({ __proto__: null }, headers, { date: new Date().toUTCString() }); } catch (e) {}
+      const strictSingle = this.session._options && this.session._options.strictSingleValueFields;
+      let built;
+      if (Array.isArray(headers)) {
+        built = buildResponseHeaderListArray(headers, options, strictSingle);
+      } else {
+        // node ServerHttp2Stream.respond({ sendDate }) stamps a Date header unless
+        // the response already carries one or sendDate was turned off.
+        if (options.sendDate !== false && headers["date"] === undefined && headers["Date"] === undefined) {
+          try { headers = Object.assign({ __proto__: null }, headers, { date: new Date().toUTCString() }); } catch (e) {}
+        }
+        built = buildResponseHeaderList(headers, strictSingle);
       }
-      const built = buildResponseHeaderList(headers, this.session._options && this.session._options.strictSingleValueFields);
       // node ServerHttp2Stream.respond: DATA frames are forbidden for 204/205/304
       // and for a HEAD request, so the HEADERS frame carries END_STREAM itself.
       const st = parseInt(built.list[0] && built.list[0][1], 10);
