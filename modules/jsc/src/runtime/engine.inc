@@ -1838,6 +1838,15 @@ public:
         if (dexc != nullptr && std::getenv("MBUN_DEBUG_BUILTINS")) {
             std::cerr << "[js_dns error] " << describe_exception_(dexc) << '\n';
         }
+        // node:dgram — node's lib/dgram.js over a real `UDP` handle
+        // (internalBinding("udp_wrap")). After kNetJS (borrows the reactor for
+        // the recv poll and net.BlockList) and after kDnsJS (the handle's
+        // default lookup is dns.lookup).
+        JSValueRef dgexc{nullptr};
+        eval_(mbun::jsc::js_dgram::kDgramJS, &dgexc);
+        if (dgexc != nullptr && std::getenv("MBUN_DEBUG_BUILTINS")) {
+            std::cerr << "[js_dgram error] " << describe_exception_(dgexc) << '\n';
+        }
         // LAST: node's legacy constructor call forms (`http.Server(fn)` with no
         // `new`). It re-exports the affected classes through a callable stand-in,
         // so it must run after the final owner of each module object — kNetJS
