@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-07-21",
+  "generated_at": "2026-07-25",
   "binary": "mbun 2026.07.18.0 (source snapshot, branch fix/corpus-round7)",
   "runs": [
     {
@@ -27,16 +27,35 @@
     },
     {
       "corpus": "compat/node/test/parallel",
-      "runner": "resumable incremental scan (xargs -P8 --timeout 15) on round-8 binary; pass count cross-validated against per-subsystem bounded runs",
+      "runner": "tools/integration/node_corpus_runner.py --jobs 8 --timeout 15",
+      "binary": "r9/integration (round 9 + r10 repl/http2/tls)",
       "files": 4433,
       "categories": {
-        "fail": 1824,
-        "oom-kill": 15,
-        "pass": 1974,
-        "timeout": 620,
-        "harness_dependent": 351
+        "fail": 2015,
+        "oom-kill": 5,
+        "pass": 1705,
+        "skipped": 542,
+        "timeout": 166
       },
-      "notes": "direct execution (mbun <file>, exit 0 = pass); node's own harness services (// Flags:, internal bindings) are not emulated, so files needing them count as failures — honest file-level coverage, not API completion. pass=1974 is a FRESH FULL MEASUREMENT on the round-8 binary (2026-07-21), cross-validated: the scan's per-subsystem pass counts match the isolated per-subsystem runs exactly (net 70, crypto 79, buffer 50, console 16). It corroborates and slightly exceeds the incremental derivation (round-4 1811 + r5 +24 + r6 +37 + r7 +40 + r8 +35 = 1947; measured 1974, +27 as fixed crashes let previously-timed-out files run). The raw -P8 scan's timeout bucket was contention-inflated to 1441; timeout is reported here as the isolated-runner ~620 (JS-layer work does not change what spawns/hangs), so fail = 4433 - pass - timeout - oom. harness_dependent = 351 files requiring node PRIVATE internals (--expose-internals / require('internal/*')); ~95% non-green and not a legitimate contract-compat target (bun/deno skip them too). Excluding them: 1961/4082 = 48.0% (contract-compat ceiling). Headline stays the strict 1974/4433 = 44.5%."
+      "rates": {
+        "strict_pass": 0.385,
+        "excluding_self_skips": 0.438
+      },
+      "baseline_for_comparison": {
+        "binary": "round-8 HEAD (23217dd), measured with the SAME corrected runner",
+        "categories": {
+          "fail": 1862,
+          "oom-kill": 14,
+          "pass": 1695,
+          "skipped": 279,
+          "timeout": 583
+        },
+        "rates": {
+          "strict_pass": 0.382,
+          "excluding_self_skips": 0.408
+        }
+      },
+      "notes": "A file that skipped itself (common.skip() -> '1..0 # Skipped:', exit 0) is classified `skipped`, never `pass`. common.mustCall is enforced from this binary onward (node registers its verifier in process.on('exit'), which previously never fired). Both corrections lower the number relative to previously published figures; the 44.5% published against round 8 was a product of both defects and was never real. Full estimate-vs-actual and methodology: compat/data/round-estimates.json and compat/README.md."
     }
   ]
 }

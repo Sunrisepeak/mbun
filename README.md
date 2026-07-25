@@ -122,11 +122,18 @@ Source-snapshot measurements (2026-07-21) against the upstream corpora pinned as
 | --- | ---: | ---: |
 | Bun native test corpus (`compat/bun/test`) | 885 / 1,902 files fully green | 46.5% |
 | Bun native tests, test level | 32,190 pass / 17,254 fail of 52,454 run | 61.4% |
-| Node.js native tests (`compat/node/test/parallel`) | 1,974 / 4,433 files pass (direct execution) | 44.5% |
-| Node.js native tests, excluding node-private/harness files | 1,961 / 4,082 files pass | 48.0% |
+| Node.js native tests (`compat/node/test/parallel`) | 1,705 / 4,433 files pass (direct execution) | 38.5% |
+| Node.js native tests, excluding files that skip themselves | 1,705 / 3,891 files pass | 43.8% |
 | Elysia test suite | 1,522 pass / 3 fail | 99.8% |
 
-File-level "green" means every executed test in the file passed and the file reported no error outside a test; it is stricter than an API checklist and lower than test-level pass rates. Files that declare no runnable test, files whose every test is skipped, and files needing a service this environment lacks (MySQL, Redis, the npm registry) are separate buckets and never count as passes. Node.js files run directly through mbun (exit 0 = pass) without Node's own harness services, so that figure is honest file-level coverage, not API completion. The second Node.js row excludes the 351 files that require Node's **private internals** (`--expose-internals` / `require('internal/*')`) — those test Node's own implementation guts, are not a contract a runtime promises (no real package uses them), and Bun/Deno skip them too; the 44.5% headline still counts them as failures, and 48.0% is the contract-compat ceiling once they are set aside. The test-level rate moves down as crashes are fixed — a file that used to segfault or get OOM-killed now runs and reports its real failures. Details and how to reproduce: [`compat/README.md`](compat/README.md).
+File-level "green" means every executed test in the file passed and the file reported no error outside a test; it is stricter than an API checklist and lower than test-level pass rates. Files that declare no runnable test, files whose every test is skipped, and files needing a service this environment lacks (MySQL, Redis, the npm registry) are separate buckets and never count as passes. Node.js files run directly through mbun (exit 0 = pass) without Node's own harness services, so that figure is honest file-level coverage, not API completion.
+
+**The Node.js figures were previously overstated and have been corrected downward at the source.** Two measurement defects were found and fixed:
+
+- **Self-skips were counted as passes.** Node's `common.skip()` prints `1..0 # Skipped:` and exits 0, so exit-code-only classification could not tell "ran everything and passed" from "declined to run because this runtime lacks the feature". 1,527 of the 4,433 files can take a skip path. They now land in a `skipped` bucket and never count as passes — which is why the second row excludes 542 files rather than the 351 it used to.
+- **`common.mustCall` was never enforced.** Node registers its verifier inside `process.on('exit')`, which mbun did not fire, so an under-called `mustCall(fn, 2)` still exited 0. At the time, 946 of the then-1,533 passing files used `mustCall*` — their central assertion had never run. `process.on('exit')` now fires and the event loop no longer swallows exceptions thrown inside callbacks.
+
+The previously published 44.5% was a product of both defects and was never real. Measured with the corrected runner on the same machine, the comparable prior figure is **38.2%**, and the current figure is **38.5%** strict / **43.8%** excluding self-skips. Timeouts fell from 583 files to 166 over the same period, so a file that used to hang for 15 seconds now reports a real, diagnosable failure. Expect the strict rate to keep moving in both directions as more verification becomes real. Details, the full estimate-vs-actual record, and how to reproduce: [`compat/README.md`](compat/README.md).
 
 ## Related projects
 
