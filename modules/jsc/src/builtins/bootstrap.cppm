@@ -2105,6 +2105,15 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     }
     function listenerCount(emitter, type) {
       if (typeof emitter.listenerCount === "function") return emitter.listenerCount(type);
+      // node's events.listenerCount also works on an EventTarget -- its
+      // EventEmitter.prototype.listenerCount reaches into the target's own
+      // listener list. mbun's EventTarget-shaped objects (AbortSignal) keep
+      // theirs in `_l`, which the EventEmitter path cannot see, so
+      // `listenerCount(signal, 'abort')` read 0 no matter how many
+      // addEventListener('abort') calls had been made. The corpus asserts that
+      // count directly (test-http{,s}-agent-abort-controller).
+      if (emitter && typeof emitter.addEventListener === "function" && Array.isArray(emitter._l))
+        return type === "abort" ? emitter._l.length : 0;
       return EventEmitterPrototype.listenerCount.call(emitter, type);
     }
 
