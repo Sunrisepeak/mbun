@@ -700,9 +700,13 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
     if (typeof opts.path === "string" && opts.path) transport.connect(opts.path);
     else {
       const netOpts = { port: opts.port | 0, host: String(host) };
+      // `signal` rides along for the same reason as `lookup`: node's TLSSocket
+      // IS the connecting socket, so tls.connect({ signal }) aborts the pending
+      // connection. Here the transport owns the connect, and its 'error'
+      // reaches the TLSSocket the caller holds.
       for (const k of ["lookup", "localAddress", "localPort", "family", "hints",
                        "autoSelectFamily", "autoSelectFamilyAttemptTimeout",
-                       "blockList", "noDelay", "keepAlive", "keepAliveInitialDelay"]) {
+                       "blockList", "noDelay", "keepAlive", "keepAliveInitialDelay", "signal"]) {
         if (opts[k] !== undefined) netOpts[k] = opts[k];
       }
       transport.connect(netOpts);

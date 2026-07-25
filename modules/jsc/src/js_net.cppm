@@ -324,6 +324,40 @@ export constexpr std::string_view kNetJS = R"JS(
       if (cb) this.once("connect", cb);
       this.connecting = true;
       const self = this;
+      // node lib/net.js addClientAbortSignalOption: options.signal aborts the
+      // connection with an AbortError. Only Server.listen honoured a signal, so
+      // `agent.createConnection({ ..., signal })` ignored it entirely and the
+      // caller's `await once(connection, 'error')` never settled.
+      if (optArg && optArg.signal !== undefined && optArg.signal !== null) {
+        const sig = optArg.signal;
+        if (typeof sig !== "object" || typeof sig.addEventListener !== "function" || !("aborted" in sig)) {
+          const e = new TypeError('The "options.signal" argument must be an instance of AbortSignal. Received ' +
+            (typeof sig === "string" ? "type string ('" + sig + "')" : "type " + typeof sig));
+          e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+        }
+        // Always asynchronous, even when the abort arrives synchronously from
+        // the caller's own ac.abort(): the caller attaches its 'error' listener
+        // AFTER that call (`ac.abort(); await once(connection, 'error')`), so a
+        // synchronous emit would be an uncaught exception instead.
+        const abortNow = () => {
+          if (self.destroyed) return;
+          const e = new Error("The operation was aborted");
+          e.name = "AbortError"; e.code = "ABORT_ERR";
+          self.connecting = false;
+          const fire = () => { if (!self.destroyed) { self.emit("error", e); self.destroy(); } };
+          if (G.process && typeof G.process.nextTick === "function") G.process.nextTick(fire);
+          else G.queueMicrotask(fire);
+        };
+        // An ALREADY-aborted signal registers no listener at all -- the corpus
+        // asserts listenerCount(signal, 'abort') === 0 for that case and === 1
+        // for the live one, so the difference is observable.
+        if (sig.aborted) G.queueMicrotask(abortNow);
+        else {
+          const onAbort = () => abortNow();
+          sig.addEventListener("abort", onAbort, { once: true });
+          this.once("close", () => { try { sig.removeEventListener("abort", onAbort); } catch (e) {} });
+        }
+      }
       // node net.js blockList / custom-lookup pre-connect resolution. Isolated to
       // the case where the caller actually passes options.blockList or
       // options.lookup, so the normal (http/tls/numeric-host) path below is
@@ -621,7 +655,31 @@ export constexpr std::string_view kNetJS = R"JS(
       if (!this._closeEmitted) { this._closeEmitted = true; G.queueMicrotask(() => this.emit("close", !!err)); }
       return this;
     }
-    destroySoon() { return this.destroy(); }
+    // node lib/net.js Socket.prototype.destroySoon: end() first, then destroy on
+    // 'finish' -- NEVER in the same turn. This used to be a bare destroy(), and
+    // that one difference is visible from the protocol level: _http_server's
+    // resOnFinish calls destroySoon() when res._last, which for a
+    // maxRequestsPerSocket-capped connection runs synchronously inside the
+    // handler dispatched from parser.onHead. Closing the fd there discards the
+    // bytes of the request that was already pipelined behind it, so the second
+    // message is never parsed and 'dropRequest' never fires.
+    destroySoon() {
+      if (this.destroyed) return this;
+      if (!this._shutW) this.end();
+      this._destroySoon = true;
+      this._armDestroySoon();
+      return this;
+    }
+    // Fires once the write queue is empty (node's 'finish'), one tick later so
+    // whatever the parser still has buffered gets dispatched first.
+    _armDestroySoon() {
+      if (!this._destroySoon || this.destroyed || this._dsArmed) return;
+      if (this._wq && this._wq.length) return;   // retried from _flush
+      this._dsArmed = true;
+      const fin = () => { if (!this.destroyed) this.destroy(); };
+      if (G.process && typeof G.process.nextTick === "function") G.process.nextTick(fin);
+      else G.queueMicrotask(fin);
+    }
     resetAndDestroy() { return this.destroy(); }
     _fail(e) { this.destroy(e instanceof Error && e.code ? e : mkErr(String((e && e.message) || e), codeOf(e))); }
     // TLS mode (T-TLS.3): after _startTls, all IO rides the per-fd TLS channel
@@ -680,6 +738,7 @@ export constexpr std::string_view kNetJS = R"JS(
         if (this._eof) this.destroy();
       }
       if (this._needDrain && this._wqLen === 0 && !this.destroyed) { this._needDrain = false; progress++; this.emit("drain"); }
+      if (this._destroySoon) this._armDestroySoon();
       this._syncEofHold();
       return progress;
     }
@@ -1490,7 +1549,20 @@ export constexpr std::string_view kNetJS = R"JS(
       // connection that is already ending. One report per errored parser is
       // enough for the corpus (test-http-socket-error-listeners asserts
       // mustCallAtLeast(1)).
-      if (this.state === "error") return 0;
+      if (this.state === "error") {
+        // ...unless the server CLAIMED the previous error through a
+        // 'clientError' listener. That connection is deliberately still alive,
+        // and node reports one error per invalid byte on it -- which is the
+        // whole point of test-http-socket-error-listeners (21 errors on one
+        // socket). The three files above have no 'clientError' listener, so
+        // they keep the single-report behaviour.
+        if (this._repeatErrors && bytes && bytes.length) {
+          this._lastChunk = bytes;
+          if (this.onError) this.onError(this._mkErr(this._errMsg, this._errCode));
+          return 1;
+        }
+        return 0;
+      }
       if (bytes && bytes.length) {
         this._lastChunk = bytes;
         this.buf = this.off === this.buf.length ? bytes : concatU8([this.buf.subarray(this.off), bytes]);
@@ -1543,6 +1615,17 @@ export constexpr std::string_view kNetJS = R"JS(
       for (;;) {
         const avail = this.buf.length - this.off;
         if (this.state === "head") {
+          // llhttp's s_start_req swallows any CR/LF that precedes a request
+          // line, and RFC 9112 2.2 requires a server to ignore at least one
+          // empty line before the request-line. mbun did not, so a pipelined
+          // request separated from the previous message by a stray blank line
+          // parsed as an empty request line and became a 400 that destroyed the
+          // connection (test-http-keep-alive-drop-requests writes exactly that
+          // shape: `...Host: localhost\r\n` + `\r\n\r\n`). Requests only —
+          // _badMethod already applies the same skip.
+          if (!this.isResponse) {
+            while (this.off < this.buf.length && (this.buf[this.off] === 13 || this.buf[this.off] === 10)) this.off++;
+          }
           const at = findSeq(this.buf, this.off, CRLF2);
           const hardLimit = this.maxHeaderSize > 0 ? this.maxHeaderSize
             : (G.__mbunHttpNative && G.__mbunHttpNative.getMaxHeaderSize ? G.__mbunHttpNative.getMaxHeaderSize() | 0 : 0);
@@ -2996,7 +3079,27 @@ export constexpr std::string_view kNetJS = R"JS(
       }
     };
     const socketOnError = (sock, err) => {
-      if (srv.emit("clientError", err, sock)) return;
+      // node lib/_http_server.js socketOnError opens with
+      // `this.removeListener('error', socketOnError)` -- "ignore further
+      // errors". That removal is load-bearing rather than cosmetic: the parser
+      // path calls socketOnError DIRECTLY (onParserExecuteCommon does the
+      // same), and the destroy(err) below re-emits 'error' on the socket. With
+      // the event listener still armed, every parser error would claim
+      // 'clientError' twice. Later parser errors still reach here through the
+      // direct call, which is what lets test-http-socket-error-listeners see
+      // one 'clientError' per invalid byte.
+      if (sock._httpOnError) {
+        sock.removeListener("error", sock._httpOnError);
+        sock._httpOnError = null;
+        if (sock.listenerCount("error") === 0) sock.on("error", () => {});
+      }
+      if (srv.emit("clientError", err, sock)) {
+        // The server handled it and did not tear the socket down, so the parser
+        // must keep reporting: see HttpParser#push's _repeatErrors note.
+        const p = sock._httpParser || sock.parser;
+        if (p) p._repeatErrors = true;
+        return;
+      }
       const res = sock._httpMessage;
       if (sock.writable && (!res || !res._headerSent)) {
         // end(), not write(): this reactor's destroy() drops the still-queued
@@ -3103,7 +3206,19 @@ export constexpr std::string_view kNetJS = R"JS(
       // asserts it after handing a socket to a worker over IPC). connEvent is
       // 'secureConnection' for https, so this must stay on the dynamic name.
       sock.server = srv;
-      sock.on("error", () => {});
+      // node lib/_http_server.js connectionListenerInternal: `socket.on('error',
+      // socketOnError)`. This was a noop, which silently swallowed every error
+      // that reached the connection socket by the EVENT path rather than through
+      // the parser -- including a user's own `res.socket.emit('error', ...)`, so
+      // the response was never torn down. socketOnError is the same handler the
+      // parser's onError already uses; the only extra part is node's
+      // "ignore further errors" self-removal, which is what keeps
+      // socketOnError's own `sock.emit('error', err)` branch from recursing.
+      const onSockError = (e) => {
+        socketOnError(sock, e instanceof Error ? e : mkErr(String((e && e.message) || e), codeOf(e)));
+      };
+      sock._httpOnError = onSockError;
+      sock.on("error", onSockError);
       srv._httpConns.add(sock);
       sock.once("close", () => {
         srv._httpConns.delete(sock);
