@@ -348,6 +348,10 @@ export std::expected<Database, SqlError> open(std::string filename,
     }
     // Recommended defaults (bun enables extended result codes).
     sqlite3_extended_result_codes(raw, 1);
+    // A zero SQLITE_LIMIT_ATTACHED makes every ATTACH fail ("too many attached
+    // databases") without touching any other statement, which is the narrowest way
+    // to keep a permission-gated connection from opening a second file.
+    if (options.no_attach) { sqlite3_limit(raw, SQLITE_LIMIT_ATTACHED, 0); }
 
     auto conn = std::make_shared<NativeConnection>(raw);
 
