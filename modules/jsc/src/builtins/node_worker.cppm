@@ -1,30 +1,35 @@
 // node:worker_threads JS layer partition.
 //
-// Overwrites the pure-JS worker_threads stub registered in bootstrap with a
-// fuller node:worker_threads surface: isMainThread/threadId/parentPort/
-// workerData/resourceLimits/SHARE_ENV constants, node-style MessageChannel/
-// MessagePort with a FIFO message queue (so receiveMessageOnPort drains
-// synchronously without firing "message" listeners), BroadcastChannel,
-// setEnvironmentData/getEnvironmentData, and the markAsUntransferable/
-// moveMessagePortToContext "not yet implemented" throws that node exposes.
+// Provides the node:worker_threads surface: isMainThread/threadId/parentPort/
+// workerData/resourceLimits/SHARE_ENV, a node-parity MessageChannel/MessagePort
+// (transfer lists, DataCloneError DOMExceptions, synchronous detach with an
+// asynchronous 'close' on both ends, receiveMessageOnPort's FIFO contract),
+// BroadcastChannel, markAsUntransferable/markAsUncloneable,
+// setEnvironmentData/getEnvironmentData, and a real Worker.
 //
-// DEFERRED: real cross-thread Worker execution. A Worker in node:worker_threads
-// runs its entry module on a NEW OS thread inside an independent JSC context,
-// exchanging structured-cloned messages over the platform event loop. mbun's
-// runtime is a single main-thread event-loop pump (runtime/engine.inc), with no
-// per-thread JSC context / cross-thread message plumbing, so a Worker here only
-// validates its options (transferList type-checks + ArrayBuffer detach) and
-// emits the process "worker" event on the next tick; it never executes the
-// worker script. Message/exit-driven tests therefore stay failing (honestly),
-// pending a threaded event-loop seam in the engine.
+// Worker execution model: one CHILD mbun process per Worker, driven over the
+// node:child_process fork() IPC channel. A Worker needs the full runtime — its
+// own module loader, node builtins, process.env, __filename — because the
+// corpus overwhelmingly does `new Worker(__filename)` and re-enters the same
+// test file. mbun's runtime is a process-wide singleton (one JSC VM, one
+// event-loop pump, process-global DNS/net/timer state), so a second in-process
+// VM could only ever carry a hand-written subset of that surface; a child
+// process carries all of it, and the message wire is the same JSON
+// structured-clone subset either way.
+//
+// DEFERRED, and honestly red: SharedArrayBuffer/Atomics shared across the
+// boundary, transferring a MessagePort into a Worker, resourceLimits, heap
+// snapshots / CPU profiles, and terminate()'s "stop mid-microtask" guarantee
+// (the child is signalled instead). runtime/worker.inc still registers the old
+// second-VM-on-a-thread seam as __mbunWorkerNative; nothing consumes it now and
+// it should be retired once no branch in flight depends on it.
 //
 // NOTE: appended AFTER the master builtins IIFE (opened in bootstrap, closed by
 // image_closure), so this is a self-contained IIFE that re-binds G = globalThis
 // and must not rely on the outer IIFE's aliases.
 //
-// Blueprint: bun src/js/node/worker_threads.ts, src/bun.js/api/bun/subprocess
-// worker plumbing, node lib/internal/worker.js (transferList validation, the
-// environmentData Map, receiveMessageOnPort FIFO contract).
+// Blueprint: node lib/internal/worker.js + lib/internal/worker/io.js +
+// src/node_messaging.cc; bun src/js/node/worker_threads.ts.
 export module mbun.jsc.js_builtins:node_worker;
 
 import std;
