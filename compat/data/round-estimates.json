@@ -601,6 +601,33 @@
       },
       "verified_by_coordinator": "Gate re-probed independently on the merged binary: with node_modules/internal/{http,fs}.js present, the user package WINS in both flag states; internalBinding is undefined lexically and on globalThis; no enumerable leak; enumerable globals still exactly 15. Permission statement checked: every binding entry bottoms out in __mbunFsNative/__mbunFdNative, which is where the C++ --permission gate lives, so internalBinding('fs').open is gated identically to fs.openSync.",
       "design_point_worth_keeping": "Unimplemented members throw naming themselves (`No such binding member: fs.lchown`) \u2014 that is what converted 22 opaque logs into 49 attributable causes. BUT `crypto` is deliberately exempt: node's own lib/internal/crypto/util.js feature-detects optional algorithms by destructuring them and testing for undefined, so a throwing member would break the very code that handles their absence."
+    },
+    {
+      "round": "cause-family wave 1 \u2014 values agent",
+      "id": "g2/agent-3",
+      "target_delta_pass": 45,
+      "actual_delta_pass": 9,
+      "hit_rate": 0.2,
+      "triage_delivered_first_as_required": {
+        "distinct_mechanisms_counted": 60,
+        "largest_single_mechanism": "5 files (fs.watch recursive)",
+        "then": "4 (OpenSSL verify-code mapping), 4-5 (requestTimeout/headersTimeout never firing \u2014 the TIMEOUTS owner's family, not this one), then a tail of 1-2",
+        "measured_fixed_cost_per_mechanism_min": 10,
+        "why_the_target_was_over_scoped": "60 mechanisms x ~10 min measured fixed cost (read node's lib, find mbun's site, verify) = ~600 minutes of work. A +45 target inside a 100-minute budget was over-scoped by roughly 4.5x, and the agent produced the per-mechanism cost figure that proves it rather than just missing quietly."
+      },
+      "MY_CLASSIFIER_WAS_TOO_SHALLOW": {
+        "what_I_did": "I built the cause families by grepping the failure LOG TEXT. Anything containing AssertionError/Mismatched went into 'value divergence'.",
+        "what_that_got_wrong": "A TLS handshake, cipher or verify failure that surfaces THROUGH an assertion reads exactly like a value divergence in the log. Coordinator-verified floor: 20 of the 197 files in fam-values fail on `ssl: error`, `alert handshake failure`, `no ciphers available`, `key too small`, `UNABLE_TO_*`, `No cipher match` or the honest deferredTLS/Duplex-transport throw. The agent's own read of all 197 put it at ~36 (~30 protocol + 6 deferred), i.e. 18% of the family was not a value-semantics bug at all and could not be fixed in the JS layer. A further ~5 belonged to the timeouts owner.",
+        "the_rule": "Classify by the failure's LAYER, not by its log text. This is the SAME error as the earlier finding that the 359-file `AssertionError` bucket was an artifact of an empty assertion message \u2014 both times I keyed on symptom text. Before assigning a file to a family, ask which layer actually failed: a protocol failure, a missing capability and a wrong value are three different owners even when all three print `AssertionError`.",
+        "cheap_check_that_would_have_caught_it": "grep the family's logs for protocol/transport error signatures BEFORE dispatching, and split those out. It costs seconds and would have moved 20-36 files out of a 100-minute budget."
+      },
+      "brief_premises_refuted_by_measurement": [
+        "I told it to check for the lib/internal/errors.js message-builder drift layer that a sibling had found. Measured: only 1 of 197 fails on that shape.",
+        "I told it a ~25-file 'ERR_INVALID_ARG_TYPE code missing' cluster was in its set. Measured: only 3 fail on a wrong code. That cluster is NOT inside this work-list.",
+        "I flagged assert's Myers line diff as relevant. Measured: irrelevant here \u2014 every deep-equal failure in the set has a genuinely different VALUE, not different diff text."
+      ],
+      "what_it_fixed": "4 mechanisms, each translated from node's lib/: fs.watch delivering events after close() (the only reason 4 files reported a wrong value \u2014 it proved the C++ inotify mask was already correct with a standalone probe before touching anything); HTTP trailers having no verbatim form (parser kept only a lowercased last-wins object, server never populated rawTrailers); fs.Stats key set (native row carried isFile() as own-enumerable plus *Ns fields node lacks, so node's key-by-key walk landed a function in its numeric branch; promises stat/lstat were also returning a prototype-less row and ignoring {bigint:true}); and fs.realpath ignoring options.encoding.",
+      "guard": "1315 files measured in full, 790 -> 799 pass, 0 regressions."
     }
   ]
 }
