@@ -319,14 +319,20 @@ struct TlsChannel::Impl {
         if (config.maxVersion > 0) {
             ::SSL_CTX_set_max_proto_version(ctx_, config.maxVersion);
         }
-        // An impossible window (min > max) makes SSL_do_handshake fail. OpenSSL's
-        // reason there is "no protocols available"; node ships BoringSSL, whose
-        // reason is "no supported versions enabled". Pin the node/BoringSSL code
-        // up front so error.code matches node (the failure itself is genuine —
-        // the handshake still fails below). fail_() keeps this first code.
+        // An impossible window (min > max) makes SSL_do_handshake fail. Pin the
+        // code up front so error.code is stable regardless of which stage
+        // reports it (the failure itself is genuine — the handshake still fails
+        // below). fail_() keeps this first code.
+        //
+        // The code is OpenSSL's, not BoringSSL's: mbun links OpenSSL 3, and the
+        // corpus branches on exactly that — test-tls-min-max-version reads
+        // `hasOpenSSL3 ? 'ERR_SSL_NO_PROTOCOLS_AVAILABLE' : 'ERR_SSL_INTERNAL_ERROR'`
+        // and never mentions BoringSSL's SSL_R_NO_SUPPORTED_VERSIONS_ENABLED.
+        // Reporting a code the linked library cannot produce is a lie about
+        // which engine ran.
         if (config.minVersion != 0 && config.maxVersion != 0
             && config.minVersion > config.maxVersion) {
-            errorCode_ = "ERR_SSL_NO_SUPPORTED_VERSIONS_ENABLED";
+            errorCode_ = "ERR_SSL_NO_PROTOCOLS_AVAILABLE";
         }
         // Cipher list (node SecureContext::SetCiphers → SSL_CTX_set_cipher_list).
         // Applied only when the caller asked for one; an unparsable list is a

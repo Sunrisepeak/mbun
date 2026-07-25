@@ -215,36 +215,44 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
   };
 
   // ---- protocol version window (node lib/internal/tls/secure-context.js) ------
-  // A secureProtocol like "TLSv1_2_method" pins both bounds to a single version;
-  // "TLS_method"/"SSLv23_method" leave the window open. Otherwise the explicit
-  // minVersion/maxVersion win, falling back to tls.DEFAULT_MIN/MAX_VERSION.
-  const secureProtocolPin = (sp) => {
+  // node does NOT hand min=max=0 to SecureContext::Init when `secureProtocol` is
+  // set — lib/internal/tls/common.js always passes toV(minVersion,DEFAULT_MIN)
+  // and toV(maxVersion,DEFAULT_MAX), and src/crypto/crypto_context.cc
+  // SecureContext::Init then adjusts ONE OR BOTH bounds per method name:
+  //
+  //   TLS_method / _client_ / _server_   min = 0 (no floor), max = TLS1.3
+  //   SSLv23_method / _client_/_server_  max = TLS1.2, min LEFT AT DEFAULT_MIN
+  //   TLSv1_method   (+client/server)    min = max = TLS1.0
+  //   TLSv1_1_method (+client/server)    min = max = TLS1.1
+  //   TLSv1_2_method (+client/server)    min = max = TLS1.2
+  //
+  // The SSLv23 row is the one that matters: it is "any supported protocol at or
+  // above the default minimum", not "anything at all". Treating it as fully
+  // unpinned let an SSLv23 peer negotiate TLS 1.0/1.1 against a TLSv1_method
+  // peer, where node fails the handshake (test-tls-min-max-version, and through
+  // it all five test-tls-cli-{min,max}-version-* files, assert exactly that).
+  // Widening a version window is never a safe default, so the floor stays.
+  const SECURE_PROTOCOL_SUFFIXES = ["_method", "_client_method", "_server_method"];
+  const securePrefix = (sp) => {
     if (typeof sp !== "string") return null;
-    if (sp === "TLSv1_3_method") return "TLSv1.3";
-    if (sp === "TLSv1_2_method") return "TLSv1.2";
-    if (sp === "TLSv1_1_method") return "TLSv1.1";
-    if (sp === "TLSv1_method") return "TLSv1";
+    for (const suffix of SECURE_PROTOCOL_SUFFIXES) {
+      if (sp.endsWith(suffix)) return sp.slice(0, sp.length - suffix.length);
+    }
     return null;
   };
   const resolveVersions = (options) => {
-    // node lib/internal/tls/common.js SecureContext:
-    //   if (secureProtocol) { ...conflict checks...; context.init(secureProtocol, 0, 0); }
-    //   else                 context.init(undefined, toV(minVersion, DEFAULT_MIN),
-    //                                                toV(maxVersion, DEFAULT_MAX));
-    // — an explicit secureProtocol replaces the default version WINDOW with the
-    // method's own range and passes min=max=0, i.e. no pin at all. Folding
-    // DEFAULT_MIN_VERSION in anyway pinned every `secureProtocol: 'TLS_method'`
-    // server at TLSv1.2, so a client that asked for TLSv1/TLSv1.1 (as
-    // test-tls-getprotocol and the test-tls-cli-*-version files do) was answered
-    // with `tlsv1 alert protocol version` by mbun's own server.
-    // This does NOT weaken anything by itself: whether the engine will actually
-    // negotiate a legacy version still depends on the security level, which only
-    // the caller's own `ciphers` string can lower (`@SECLEVEL=0`).
     if (typeof options.secureProtocol === "string" && options.secureProtocol) {
-      const pinned = secureProtocolPin(options.secureProtocol);
       // "none" is the native layer's explicit-unpinned marker (net.inc
       // version_arg); "" would fall back to its TLS 1.2 default floor.
-      return pinned != null ? { min: pinned, max: pinned } : { min: "none", max: "none" };
+      switch (securePrefix(options.secureProtocol)) {
+        case "TLS": return { min: "none", max: "TLSv1.3" };
+        case "SSLv23": return { min: T.DEFAULT_MIN_VERSION || "", max: "TLSv1.2" };
+        case "TLSv1": return { min: "TLSv1", max: "TLSv1" };
+        case "TLSv1_1": return { min: "TLSv1.1", max: "TLSv1.1" };
+        case "TLSv1_2": return { min: "TLSv1.2", max: "TLSv1.2" };
+        case "TLSv1_3": return { min: "TLSv1.3", max: "TLSv1.3" };
+        default: return { min: "none", max: "none" };
+      }
     }
     let min = options.minVersion;
     let max = options.maxVersion;
