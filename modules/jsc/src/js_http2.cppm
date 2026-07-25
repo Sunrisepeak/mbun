@@ -293,6 +293,19 @@ export constexpr std::string_view kHttp2JS = R"JS(
   ];
   const errName = (code) => nameForErrorCode[code] || String(code);
   const mkErr = (msg, code) => { const e = new Error(msg); e.code = code; return e; };
+  // setEncoding() on an Http2Stream is stream.Readable's: a StringDecoder holds
+  // the tail of a multi-byte sequence that straddles two DATA frames. Decoding
+  // each frame independently corrupted every body larger than one max frame
+  // whose split landed inside a UTF-8 character (test-http2-respond-file's
+  // 30 kB ellipsis fixture is exactly that shape).
+  function decodeChunk(stream, bytes) {
+    const buf = Buffer.from(bytes);
+    if (stream._decoder === undefined) {
+      const SD = M["string_decoder"] || M["node:string_decoder"];
+      stream._decoder = (SD && SD.StringDecoder) ? new SD.StringDecoder(stream._enc) : null;
+    }
+    return stream._decoder ? stream._decoder.write(buf) : buf.toString(stream._enc);
+  }
   // ERR_HTTP2_SESSION_ERROR / ERR_HTTP2_STREAM_ERROR message templates:
   // ref bun-ref src/jsc/bindings/ErrorCode.cpp (ERR_HTTP2_SESSION_ERROR ->
   // "Session closed with error code " + name; ERR_HTTP2_STREAM_ERROR ->
@@ -514,7 +527,10 @@ export constexpr std::string_view kHttp2JS = R"JS(
     const local = s._localWindow === undefined ? DEFAULT_CONNECTION_WINDOW : s._localWindow;
     const remote = s._remoteWindow === undefined ? DEFAULT_CONNECTION_WINDOW : s._remoteWindow;
     return {
-      effectiveLocalWindowSize: DEFAULT_CONNECTION_WINDOW,
+      // nghttp2 keeps the *effective* local window (what setLocalWindowSize
+      // asks for) separate from the announced one: shrinking it below the
+      // already-announced window does not retract the announcement.
+      effectiveLocalWindowSize: s._effectiveLocalWindow === undefined ? DEFAULT_CONNECTION_WINDOW : s._effectiveLocalWindow,
       effectiveRecvDataLength: DEFAULT_CONNECTION_WINDOW - local,
       nextStreamID: nextStreamID,
       localWindowSize: local,
@@ -524,6 +540,23 @@ export constexpr std::string_view kHttp2JS = R"JS(
       deflateDynamicTableSize: 0,
       inflateDynamicTableSize: 0,
     };
+  }
+
+  // Http2Session.setLocalWindowSize (node lib/internal/http2/core.js ->
+  // nghttp2_session_set_local_window_size). Growing the window announces the
+  // delta with a connection-level WINDOW_UPDATE; shrinking only lowers the
+  // effective size (the peer keeps the credit it was already granted), which is
+  // why state.localWindowSize can stay above state.effectiveLocalWindowSize.
+  function sessionSetLocalWindowSize(session, windowSize) {
+    if (session.destroyed) throw mkErr("The session has been destroyed", "ERR_HTTP2_INVALID_SESSION");
+    if (typeof windowSize !== "number") throw argTypeErr("windowSize", "of type number", windowSize);
+    if (!Number.isInteger(windowSize)) throw outOfRangeErr("windowSize", "an integer", windowSize);
+    if (windowSize < 0 || windowSize > 2147483647) throw outOfRangeErr("windowSize", ">= 0 && <= 2147483647", windowSize);
+    if (session._localWindow === undefined) session._localWindow = DEFAULT_CONNECTION_WINDOW;
+    session._effectiveLocalWindow = windowSize;
+    // _windowUpdate(0, delta) is what credits session._localWindow, so the
+    // delta must not be added here as well.
+    if (windowSize > session._localWindow) session._windowUpdate(0, windowSize - session._localWindow);
   }
 
   // Http2StreamState (node docs `http2stream.state`). `state` is nghttp2's
@@ -563,7 +596,7 @@ export constexpr std::string_view kHttp2JS = R"JS(
     }
     get closed() { return this._closed; }
     get state() { return streamState(this); }
-    setEncoding(enc) { this._enc = enc || "utf8"; return this; }
+    setEncoding(enc) { this._enc = enc || "utf8"; this._decoder = undefined; return this; }
     write(chunk, enc, cb) {
       if (typeof enc === "function") { cb = enc; enc = null; }
       if (this._endStreamSent) { if (typeof cb === "function") G.queueMicrotask(cb); return true; }
@@ -577,11 +610,32 @@ export constexpr std::string_view kHttp2JS = R"JS(
       if (typeof enc === "function") { cb = enc; enc = null; }
       if (this._endStreamSent) { this.writable = false; if (typeof cb === "function") this.once("close", cb); return this; }
       const buf = chunk == null ? Buffer.alloc(0) : (typeof chunk === "string" ? Buffer.from(chunk, enc || "utf8") : Buffer.from(chunk));
+      // request(headers, { waitForTrailers }): hold END_STREAM back, flush the
+      // body, then let the user append a trailer block (node Http2Stream
+      // kWaitForTrailers -> 'wantTrailers' -> sendTrailers()).
+      if (this._options.waitForTrailers) {
+        if (buf.length) this.session._sendData(this, buf, false);
+        this.writable = false;
+        if (typeof cb === "function") this.once("close", cb);
+        G.queueMicrotask(() => { this._trailersReady = true; this.emit("wantTrailers"); });
+        return this;
+      }
       this.session._sendData(this, buf, true);
       this._endStreamSent = true;
       this.writable = false;
       if (typeof cb === "function") this.once("close", cb);
       return this;
+    }
+    sendTrailers(headers) {
+      if (this._trailersSent) throw mkErr("Trailers have already been sent", "ERR_HTTP2_TRAILERS_ALREADY_SENT");
+      if (!this._trailersReady) throw mkErr("Trailers are not ready to send", "ERR_HTTP2_TRAILERS_NOT_READY");
+      headers = headers || {};
+      for (const k of Object.keys(headers))
+        if (String(k)[0] === ":") throw mkErr('"' + k + '" is an invalid pseudoheader or is used incorrectly', "ERR_HTTP2_INVALID_PSEUDOHEADER");
+      this._trailersSent = true;
+      const built = buildNgHeaders(Object.assign({ __proto__: null }, headers), assertValidRequestPseudoHeader, this.session._options && this.session._options.strictSingleValueFields);
+      writeHeaderBlock(this.session, this.id, encodeHeaders(built.list, built.sensitive), FLAG.END_STREAM);
+      this._endStreamSent = true;
     }
     close(code, cb) {
       if (code === undefined) code = constants.NGHTTP2_NO_ERROR;
@@ -614,7 +668,7 @@ export constexpr std::string_view kHttp2JS = R"JS(
     pause() { this._paused = true; return this; }
     _pushData(bytes) {
       this.readable = true;
-      if (this._enc) { let s = ""; for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]); this.emit("data", Buffer.from(bytes).toString(this._enc)); }
+      if (this._enc) this.emit("data", decodeChunk(this, bytes));
       else this.emit("data", Buffer.from(bytes));
     }
     _onResponse(headersObj, flags) {
@@ -671,6 +725,22 @@ export constexpr std::string_view kHttp2JS = R"JS(
       const host = u.hostname;
 
       const self = this;
+      // node http2.connect({ createConnection }): the caller supplies the
+      // transport (a real socket, a tunnel, or a Duplex pair in the corpus) and
+      // the session must not dial out itself.
+      if (options && typeof options.createConnection === "function") {
+        const sock = options.createConnection(u, options);
+        this.socket = sock;
+        sock.on("data", (d) => self._onData(d));
+        sock.on("error", (e) => self._onSocketError(e));
+        sock.on("close", () => self._onSocketClose());
+        sock.on("end", () => self._onSocketEnd());
+        // A freshly-dialled socket announces itself with 'connect'; an
+        // already-open Duplex never will, so start on the next tick.
+        if (sock.connecting) sock.once("connect", () => self._onSocketReady());
+        else G.queueMicrotask(() => self._onSocketReady());
+        return;
+      }
       if (this._scheme === "https") {
         if (!tls || !tls.connect) { this._fatal(mkErr("http2 https requires node:tls", "ERR_HTTP2_ERROR")); return; }
         const sock = tls.connect({
@@ -732,11 +802,13 @@ export constexpr std::string_view kHttp2JS = R"JS(
       const optWeight = options.weight;
       const optWaitTrailers = options.waitForTrailers;
       const optEndStream = options.endStream === true;
+      // Header validation runs BEFORE the stream id is consumed: node throws
+      // out of request() for a malformed header block and no stream is opened.
+      const built = buildHeaderList(headers, this._scheme, this._authorityName, this._options.strictSingleValueFields);
       const streamId = this._nextStreamId();
-      const hlist = buildHeaderList(headers, this._scheme, this._authorityName);
       const stream = new ClientHttp2Stream(this, streamId, headers, options);
       this.streams.set(streamId, stream);
-      const block = encodeHeaders(hlist);
+      const block = encodeHeaders(built.list, built.sensitive);
       // A method with no body (GET/HEAD/DELETE) or an explicit endStream option
       // may close the stream on the HEADERS frame; otherwise req.end() sends the
       // trailing empty DATA(END_STREAM). HEADERS otherwise carry END_HEADERS only.
@@ -931,8 +1003,12 @@ export constexpr std::string_view kHttp2JS = R"JS(
       if (!stream) return true;
       const headersObj = headerListToObject(list, this._hpack._sensitive);
       // A header block after the response is a trailer block (RFC 9113 8.1):
-      // emit 'trailers' rather than a second 'response'.
+      // emit 'trailers' rather than a second 'response'. A 1xx block BEFORE the
+      // response is informational: node emits 'headers', and the real response
+      // still follows (lib/internal/http2/core.js onSessionHeaders).
+      const st = headersObj[":status"];
       if (stream._responseEmitted) stream.emit("trailers", headersObj, flags);
+      else if (typeof st === "number" && st >= 100 && st < 200) stream.emit("headers", headersObj, flags);
       else stream._onResponse(headersObj, flags);
       if (pb.endStream) { this.streams.delete(pb.streamId); stream._onEnd(); }
       return true;
@@ -962,6 +1038,7 @@ export constexpr std::string_view kHttp2JS = R"JS(
       const p = Buffer.alloc(4); p.writeUInt32BE(increment >>> 0, 0);
       this._writeFrame(FRAME.WINDOW_UPDATE, 0, streamId, p);
     }
+    setLocalWindowSize(windowSize) { sessionSetLocalWindowSize(this, windowSize); }
 
     // ---- errors / lifecycle ----
     _connError(code) {
@@ -1053,28 +1130,96 @@ export constexpr std::string_view kHttp2JS = R"JS(
     if (authority && authority.href) return authority;   // URL object
     return new G.URL(String(authority));
   }
-  function buildHeaderList(headers, scheme, authorityName) {
-    // pseudo-headers first, defaulting the required ones (node/nghttp2 order rule)
-    const pseudo = [];
-    const regular = [];
-    const has = {};
-    for (const k in headers) {
-      if (!Object.prototype.hasOwnProperty.call(headers, k)) continue;
-      const lk = String(k).toLowerCase();
-      has[lk] = true;
-      const v = headers[k];
-      const target = lk[0] === ":" ? pseudo : regular;
-      if (Array.isArray(v)) { for (let i = 0; i < v.length; i++) target.push([lk, String(v[i])]); }
-      else target.push([lk, String(v)]);
+  // ---- outgoing header validation (node lib/internal/http2/util.js) ----------
+  // buildNgHeaderString is what rejects a malformed outgoing header block before
+  // a frame is ever written: a non-token field name, an HTTP/1 connection-
+  // specific field, an unknown or misplaced pseudo-header, and (when the session
+  // opted into strictSingleValueFields) a repeated single-value field.
+  const H2_ERR = (msg, code, Ctor) => { const e = new (Ctor || TypeError)(msg); e.code = code; return e; };
+  const kValidRequestPseudoHeaders = new Set([":status", ":method", ":authority", ":scheme", ":path", ":protocol"]);
+  const kSingleValueFields = new Set([
+    ":status", ":method", ":authority", ":scheme", ":path", ":protocol",
+    "access-control-allow-credentials", "access-control-max-age", "access-control-request-method",
+    "age", "authorization", "content-encoding", "content-language", "content-length",
+    "content-location", "content-md5", "content-range", "content-type", "date", "dnt", "etag",
+    "expires", "from", "host", "if-match", "if-modified-since", "if-none-match", "if-range",
+    "if-unmodified-since", "last-modified", "location", "max-forwards", "proxy-authorization",
+    "range", "referer", "retry-after", "tk", "upgrade-insecure-requests", "user-agent",
+    "x-content-type-options",
+  ]);
+  const H2_TOKEN_RE = /^[\^_`a-zA-Z\-0-9!#$%&'*+.|~]+$/;
+  function isIllegalConnectionSpecificHeader(name, value) {
+    switch (name) {
+      case "connection": case "upgrade": case "http2-settings":
+      case "keep-alive": case "proxy-connection": case "transfer-encoding":
+        return true;
+      case "te": return value !== "trailers";
+      default: return false;
     }
-    // fill defaults
-    const front = [];
-    if (!has[":method"]) front.push([":method", "GET"]);
-    if (!has[":authority"] && !has["host"]) front.push([":authority", authorityName]);
-    if (!has[":scheme"]) front.push([":scheme", scheme]);
-    if (!has[":path"]) front.push([":path", "/"]);
-    // order: our defaults + provided pseudo (deduped) + regular
-    return front.concat(pseudo).concat(regular);
+  }
+  function assertValidRequestPseudoHeader(key) {
+    if (!kValidRequestPseudoHeaders.has(key))
+      throw H2_ERR('"' + key + '" is an invalid pseudoheader or is used incorrectly', "ERR_HTTP2_INVALID_PSEUDOHEADER");
+  }
+  function assertValidResponsePseudoHeader(key) {
+    if (key !== ":status")
+      throw H2_ERR('"' + key + '" is an invalid pseudoheader or is used incorrectly', "ERR_HTTP2_INVALID_PSEUDOHEADER");
+  }
+  function buildNgHeaders(map, validatePseudo, strictSingleValueFields) {
+    // node initializeOptions defaults options.strictSingleValueFields to true;
+    // only an explicit `false` turns the single-value check off.
+    if (strictSingleValueFields === undefined || strictSingleValueFields === null) strictSingleValueFields = true;
+    const pseudoHeaders = [];
+    const headers = [];
+    const singles = new Set();
+    const sensitive = new Set();
+    const sn = map[G.Symbol.for("nodejs.http2.sensitiveHeaders")];
+    if (Array.isArray(sn)) for (const s of sn) sensitive.add(String(s).toLowerCase());
+    const processHeader = (rawKey, value) => {
+      const key = String(rawKey).toLowerCase();
+      const isStrictSingleValueField = !!strictSingleValueFields && kSingleValueFields.has(key);
+      let isArray = Array.isArray(value);
+      if (isArray) {
+        if (value.length === 0) return;
+        if (value.length === 1) { value = String(value[0]); isArray = false; }
+        else if (isStrictSingleValueField) throw H2_ERR('Header field "' + key + '" must only have a single value', "ERR_HTTP2_HEADER_SINGLE_VALUE");
+      } else value = String(value);
+      if (isStrictSingleValueField) {
+        if (singles.has(key)) throw H2_ERR('Header field "' + key + '" must only have a single value', "ERR_HTTP2_HEADER_SINGLE_VALUE");
+        singles.add(key);
+      }
+      if (key[0] === ":") { validatePseudo(key); pseudoHeaders.push([key, value]); return; }
+      if (!H2_TOKEN_RE.test(key)) throw H2_ERR('Header name must be a valid HTTP token ["' + rawKey + '"]', "ERR_INVALID_HTTP_TOKEN");
+      if (isIllegalConnectionSpecificHeader(key, value))
+        throw H2_ERR('HTTP/1 Connection specific headers are forbidden: "' + key + '"', "ERR_HTTP2_INVALID_CONNECTION_HEADERS");
+      if (isArray) { for (const v of value) headers.push([key, String(v)]); return; }
+      headers.push([key, value]);
+    };
+    for (const key of Object.keys(map)) {
+      const value = map[key];
+      if (value === undefined || key === "") continue;
+      processHeader(key, value);
+    }
+    return { list: pseudoHeaders.concat(headers), sensitive };
+  }
+  // node prepareRequestHeadersObject: defaults :method/:authority/:scheme/:path
+  // and enforces the CONNECT-specific pseudo-header rules.
+  function buildHeaderList(headers, scheme, authorityName, strictSingleValueFields) {
+    const obj = Object.assign({ __proto__: null }, headers);
+    const sym = G.Symbol.for("nodejs.http2.sensitiveHeaders");
+    if (headers && headers[sym] !== undefined) obj[sym] = headers[sym];
+    if (obj[":method"] === undefined) obj[":method"] = "GET";
+    const connect = obj[":method"] === "CONNECT";
+    if (!connect || obj[":protocol"] !== undefined) {
+      if (obj[":authority"] === undefined && obj["host"] === undefined) obj[":authority"] = authorityName;
+      if (obj[":scheme"] === undefined) obj[":scheme"] = scheme;
+      if (obj[":path"] === undefined) obj[":path"] = "/";
+    } else {
+      if (obj[":authority"] === undefined) throw H2_ERR(":authority header is required for CONNECT requests", "ERR_HTTP2_CONNECT_AUTHORITY", Error);
+      if (obj[":scheme"] !== undefined) throw H2_ERR("The :scheme header is forbidden for CONNECT requests", "ERR_HTTP2_CONNECT_SCHEME", Error);
+      if (obj[":path"] !== undefined) throw H2_ERR("The :path header is forbidden for CONNECT requests", "ERR_HTTP2_CONNECT_PATH", Error);
+    }
+    return buildNgHeaders(obj, assertValidRequestPseudoHeader, strictSingleValueFields);
   }
   function headerListToObject(list, sensitive) {
     const obj = {};
@@ -1120,24 +1265,63 @@ export constexpr std::string_view kHttp2JS = R"JS(
   // ==========================================================================
 
   // node argument validators (message templates: node lib/internal/errors.js).
-  function recvType(input) {
-    if (input === null) return " Received null";
-    if (typeof input === "symbol") return " Received type symbol";
-    if (typeof input === "object") {
-      const t = Object.prototype.toString.call(input).split(" ")[1];
-      const name = t ? t.replace("]", "").replace("[", "") : "Object";
-      return " Received an instance of " + name;
+  // determineSpecificType() is translated verbatim from lib/internal/errors.js
+  // (and mirrored by test/common invalidArgTypeHelper, which the corpus uses to
+  // build the expected message): a function reports its NAME, undefined reports
+  // "undefined" (not "type undefined (undefined)"), an object reports its
+  // constructor name, and -0/NaN/±Infinity each have their own spelling.
+  function recvType(input) { return " Received " + determineSpecificType(input); }
+  function determineSpecificType(value) {
+    if (value === null) return "null";
+    if (value === undefined) return "undefined";
+    const type = typeof value;
+    switch (type) {
+      case "bigint": return "type bigint (" + value + "n)";
+      case "number":
+        if (value === 0) return 1 / value === -Infinity ? "type number (-0)" : "type number (0)";
+        if (value !== value) return "type number (NaN)";
+        if (value === Infinity) return "type number (Infinity)";
+        if (value === -Infinity) return "type number (-Infinity)";
+        return "type number (" + value + ")";
+      case "boolean": return value ? "type boolean (true)" : "type boolean (false)";
+      case "symbol": return "type symbol (" + String(value) + ")";
+      case "function": return "function " + value.name;
+      case "object":
+        if (value.constructor && "name" in value.constructor) return "an instance of " + value.constructor.name;
+        return inspectShallow(value);
+      case "string": {
+        let s = value;
+        if (s.length > 28) s = s.slice(0, 25) + "...";
+        if (s.indexOf("'") === -1) return "type string ('" + s + "')";
+        return "type string (" + JSON.stringify(s) + ")";
+      }
+      default: {
+        let s = String(value);
+        if (s.length > 28) s = s.slice(0, 25) + "...";
+        return "type " + type + " (" + s + ")";
+      }
     }
-    if (typeof input === "string") return " Received type string ('" + input + "')";
-    return " Received type " + (typeof input) + " (" + input + ")";
+  }
+  // util.inspect(value, { depth: -1 }) for the only case that reaches it: a
+  // null-prototype object, which node renders as "[Object: null prototype] {}".
+  function inspectShallow(value) {
+    if (Array.isArray(value)) return "[Array]";
+    return "[Object: null prototype] {}";
   }
   function argTypeErr(name, expected, value) {
-    const e = new TypeError('The "' + name + '" argument must be ' + expected + '.' + recvType(value));
+    // node lib/internal/errors.js: a dotted name is a *property*, not an argument.
+    const determiner = String(name).includes(".") ? "property" : "argument";
+    const e = new TypeError('The "' + name + '" ' + determiner + " must be " + expected + "." + recvType(value));
     e.code = "ERR_INVALID_ARG_TYPE"; return e;
   }
   function outOfRangeErr(name, range, value) {
     const e = new RangeError('The value of "' + name + '" is out of range. It must be ' + range + '. Received ' + value);
     e.code = "ERR_OUT_OF_RANGE"; return e;
+  }
+  function invalidArgValue(name, value, reason) {
+    const determiner = String(name).includes(".") ? "property" : "argument";
+    const e = new TypeError("The " + determiner + " '" + name + "' " + (reason || "is invalid") + ". Received " + determineSpecificType(value));
+    e.code = "ERR_INVALID_ARG_VALUE"; return e;
   }
   // RFC 9113 8.2/8.3 request-header validity for a server. Returns true if the
   // header list is malformed (CR/LF/NUL octet, a connection-specific field, or a
@@ -1173,24 +1357,32 @@ export constexpr std::string_view kHttp2JS = R"JS(
 
   // Build a server response header list (pseudo :status first). Returns
   // { list, sensitive:Set } — sensitive names flagged via http2.sensitiveHeaders.
-  function buildResponseHeaderList(headers) {
+  // node prepareResponseHeadersObject: a response may only carry the :status
+  // pseudo-header, the status must be a valid (non-informational) code, and the
+  // remaining fields go through the same buildNgHeaderString validation as a
+  // request's.
+  function buildResponseHeaderList(headers, strictSingleValueFields, informational) {
+    if (headers !== undefined && headers !== null && (typeof headers !== "object" || Array.isArray(headers)))
+      throw argTypeErr("headers", "an object", headers);
+    const obj = Object.assign({ __proto__: null }, headers);
     const sym = G.Symbol.for("nodejs.http2.sensitiveHeaders");
-    const sensitive = new Set();
-    const sn = headers && headers[sym];
-    if (Array.isArray(sn)) for (let i = 0; i < sn.length; i++) sensitive.add(String(sn[i]).toLowerCase());
-    let status = 200;
-    const regular = [];
-    for (const k in headers) {
-      if (!Object.prototype.hasOwnProperty.call(headers, k)) continue;
-      const lk = String(k).toLowerCase();
-      if (lk === ":status") { status = parseInt(headers[k], 10) || 200; continue; }
-      if (lk[0] === ":") continue;   // servers only emit :status
-      const v = headers[k];
-      if (Array.isArray(v)) { for (let i = 0; i < v.length; i++) regular.push([lk, String(v[i])]); }
-      else regular.push([lk, String(v)]);
+    if (headers && headers[sym] !== undefined) obj[sym] = headers[sym];
+    if (informational) {
+      // additionalHeaders(): only a 1xx (never 101) informational status.
+      if (obj[":status"] != null) {
+        const sc = obj[":status"] | 0;
+        if (sc === 101) { const e = new Error("HTTP status code 101 (Switching Protocols) is forbidden in HTTP/2"); e.code = "ERR_HTTP2_STATUS_101"; throw e; }
+        if (sc < 100 || sc >= 200) { const e = new RangeError("Invalid informational status code: " + obj[":status"]); e.code = "ERR_HTTP2_INVALID_INFO_STATUS"; throw e; }
+        obj[":status"] = String(sc);
+      }
+      return buildNgHeaders(obj, assertValidResponsePseudoHeader, strictSingleValueFields);
     }
-    const list = [[":status", String(status)]].concat(regular);
-    return { list, sensitive };
+    // node validatePreparedResponseHeaders is deliberately stricter than HTTP/1:
+    // a response status outside 200..599 is rejected outright.
+    const status = (obj[":status"] | 0) || 200;
+    if (status < 200 || status > 599) { const e = new RangeError("Invalid status code: " + status); e.code = "ERR_HTTP2_STATUS_INVALID"; throw e; }
+    obj[":status"] = String(status);
+    return buildNgHeaders(obj, assertValidResponsePseudoHeader, strictSingleValueFields);
   }
 
   // === ServerHttp2Stream ===
@@ -1213,10 +1405,13 @@ export constexpr std::string_view kHttp2JS = R"JS(
       this._wantTrailers = false;
       this._trailersSent = false;
       this.sentHeaders = undefined;
+      // node ServerHttp2Stream#headRequest: a HEAD request must not carry a
+      // payload, which respondWithFile/FD check before opening anything.
+      this.headRequest = !!(headers && typeof headers[":method"] === "string" && headers[":method"].toUpperCase() === "HEAD");
     }
     get closed() { return this._closed; }
     get state() { return streamState(this); }
-    setEncoding(enc) { this._enc = enc || "utf8"; return this; }
+    setEncoding(enc) { this._enc = enc || "utf8"; this._decoder = undefined; return this; }
     resume() { this._paused = false; return this; }
     pause() { this._paused = true; return this; }
     respond(headers, options) {
@@ -1224,7 +1419,12 @@ export constexpr std::string_view kHttp2JS = R"JS(
       if (this.destroyed || this._closed) throw mkErr("The stream has been destroyed", "ERR_HTTP2_INVALID_STREAM");
       headers = headers || {};
       options = options || {};
-      const built = buildResponseHeaderList(headers);
+      // node ServerHttp2Stream.respond({ sendDate }) stamps a Date header unless
+      // the response already carries one or sendDate was turned off.
+      if (options.sendDate !== false && headers["date"] === undefined && headers["Date"] === undefined) {
+        try { headers = Object.assign({ __proto__: null }, headers, { date: new Date().toUTCString() }); } catch (e) {}
+      }
+      const built = buildResponseHeaderList(headers, this.session._options && this.session._options.strictSingleValueFields);
       this.headersSent = true;
       this.sentHeaders = headers;
       const block = encodeHeaders(built.list, built.sensitive);
@@ -1254,7 +1454,10 @@ export constexpr std::string_view kHttp2JS = R"JS(
         // hold END_STREAM: flush body then let the user append trailers.
         if (buf.length) this.session._sendData(this, buf, false);
         this.writable = false;
-        G.queueMicrotask(() => this.emit("wantTrailers"));
+        // node only allows sendTrailers() once the 'wantTrailers' event has
+        // actually fired (kState.trailersReady); before that it is
+        // ERR_HTTP2_TRAILERS_NOT_READY even though waitForTrailers was set.
+        G.queueMicrotask(() => { this._trailersReady = true; this.emit("wantTrailers"); });
         if (typeof cb === "function") this.once("close", cb);
         return this;
       }
@@ -1267,7 +1470,7 @@ export constexpr std::string_view kHttp2JS = R"JS(
     }
     sendTrailers(headers) {
       if (this._trailersSent) throw mkErr("Trailers have already been sent", "ERR_HTTP2_TRAILERS_ALREADY_SENT");
-      if (!this._wantTrailers) throw mkErr("Trailers are not ready to send", "ERR_HTTP2_TRAILERS_NOT_READY");
+      if (!this._trailersReady) throw mkErr("Trailers are not ready to send", "ERR_HTTP2_TRAILERS_NOT_READY");
       headers = headers || {};
       // Validate BEFORE marking sent: a pseudo-header in a trailer block is an
       // ERR_HTTP2_INVALID_PSEUDOHEADER and must leave the stream retryable.
@@ -1285,9 +1488,118 @@ export constexpr std::string_view kHttp2JS = R"JS(
       this._finish();
       return;
     }
-    respondWithFD() { throw mkErr("respondWithFD is not supported", "ERR_HTTP2_ERROR"); }
-    respondWithFile() { throw mkErr("respondWithFile is not supported", "ERR_HTTP2_ERROR"); }
+    // respondWithFD / respondWithFile (node lib/internal/http2/core.js
+    // ServerHttp2Stream.respondWithFD / .respondWithFile -> afterOpen ->
+    // doSendFileFD -> processRespondWithFD). Both send the response HEADERS and
+    // then the file body as DATA frames; options.statCheck may amend the headers
+    // (and cancel the response by returning false), options.offset/length window
+    // the body, and options.onError receives an open/stat failure instead of the
+    // stream being destroyed. Content-Length is filled in from the stat size for
+    // a regular file, matching node.
+    respondWithFD(fd, headersParam, options) {
+      this._prepareFileResponse(options, headersParam, "fd");
+      options = options || {};
+      const fs = M["fs"] || M["node:fs"];
+      if (fd !== null && typeof fd === "object" && typeof fd.fd === "number") fd = fd.fd;
+      if (typeof fd !== "number") throw argTypeErr("fd", "one of type number or FileHandle", fd);
+      if (options.statCheck === undefined) { this._sendFd(fs, fd, headersParam, options, null, false); return; }
+      let stat = null;
+      try { stat = fs.fstatSync(fd); } catch (e) { this._fileError(options, e); return; }
+      this._sendFd(fs, fd, headersParam, options, stat, false);
+    }
+    respondWithFile(path, headersParam, options) {
+      this._prepareFileResponse(options, headersParam, "file");
+      options = options || {};
+      const fs = M["fs"] || M["node:fs"];
+      let fd;
+      try { fd = fs.openSync(path, "r"); } catch (e) { this._fileError(options, e); return; }
+      let stat;
+      try { stat = fs.fstatSync(fd); } catch (e) { try { fs.closeSync(fd); } catch (e2) {} this._fileError(options, e); return; }
+      if (!stat.isFile()) {
+        // node: a directory is ERR_HTTP2_SEND_FILE; anything else non-regular
+        // with an explicit offset/length window is ERR_HTTP2_SEND_FILE_NOSEEK.
+        const isDir = stat.isDirectory();
+        const e = isDir
+          ? mkErr("Directories cannot be sent", "ERR_HTTP2_SEND_FILE")
+          : mkErr("Offset or length can only be specified for regular files", "ERR_HTTP2_SEND_FILE_NOSEEK");
+        try { fs.closeSync(fd); } catch (e2) {}
+        this._fileError(options, e);
+        return;
+      }
+      this._sendFd(fs, fd, headersParam, options, stat, true);
+    }
+    _prepareFileResponse(options, headersParam, kind) {
+      if (this.destroyed || this._closed) throw mkErr("The stream has been destroyed", "ERR_HTTP2_INVALID_STREAM");
+      if (this.headersSent) throw mkErr("Response has already been initiated.", "ERR_HTTP2_HEADERS_SENT");
+      if (options !== undefined && (options === null || typeof options !== "object" || Array.isArray(options)))
+        throw argTypeErr("options", "an object", options);
+      const o = options || {};
+      if (o.offset !== undefined && typeof o.offset !== "number") throw invalidArgValue("options.offset", o.offset);
+      if (o.length !== undefined && typeof o.length !== "number") throw invalidArgValue("options.length", o.length);
+      if (o.statCheck !== undefined && typeof o.statCheck !== "function") throw invalidArgValue("options.statCheck", o.statCheck);
+      // DATA frames are forbidden for these statuses / for a HEAD request.
+      let status = 200;
+      if (headersParam && headersParam[":status"] !== undefined) status = parseInt(headersParam[":status"], 10) || 200;
+      if (status === 204 || status === 205 || status === 304 || this.headRequest)
+        throw mkErr("Responses with " + status + " status must not have a payload", "ERR_HTTP2_PAYLOAD_FORBIDDEN");
+    }
+    _fileError(options, err) {
+      if (options && typeof options.onError === "function") options.onError(err);
+      else this.destroy(err);
+    }
+    _sendFd(fs, fd, headersParam, options, stat, ownsFd) {
+      const headers = Object.assign({}, headersParam);
+      if (stat && typeof options.statCheck === "function") {
+        if (options.statCheck.call(this, stat, headers, { offset: options.offset !== undefined ? options.offset : 0, length: options.length !== undefined ? options.length : -1 }) === false) {
+          if (ownsFd) { try { fs.closeSync(fd); } catch (e) {} }
+          return;
+        }
+        if (this.headersSent) { if (ownsFd) { try { fs.closeSync(fd); } catch (e) {} } return; }
+      }
+      const offset = options.offset !== undefined ? (options.offset | 0) : 0;
+      let length = options.length !== undefined ? (options.length | 0) : -1;
+      if (stat) {
+        length = length < 0 ? stat.size - offset : Math.min(stat.size - offset, length);
+        headers["content-length"] = length;
+      }
+      let body;
+      try {
+        if (length < 0) {
+          const parts = []; const tmp = Buffer.alloc(65536);
+          let pos = offset, n;
+          while ((n = fs.readSync(fd, tmp, 0, tmp.length, pos)) > 0) { parts.push(Buffer.from(tmp.subarray(0, n))); pos += n; }
+          body = Buffer.concat(parts);
+        } else {
+          body = Buffer.alloc(length);
+          if (length > 0) {
+            const n = fs.readSync(fd, body, 0, length, offset);
+            if (n < length) body = body.subarray(0, n < 0 ? 0 : n);
+          }
+        }
+      } catch (e) { if (ownsFd) { try { fs.closeSync(fd); } catch (e2) {} } this._fileError(options, e); return; }
+      if (ownsFd) { try { fs.closeSync(fd); } catch (e) {} }
+      this.respond(headers, options.waitForTrailers ? { waitForTrailers: true } : undefined);
+      this.end(body);
+    }
     pushStream(headers, options, cb) { if (typeof options === "function") { cb = options; } if (typeof cb === "function") G.queueMicrotask(() => cb(mkErr("Push streams are not supported", "ERR_HTTP2_PUSH_DISABLED"))); }
+    // node ServerHttp2Stream.additionalHeaders: an informational (1xx) HEADERS
+    // block sent BEFORE the response headers; it does not open the response, so
+    // headersSent stays false.
+    additionalHeaders(headers) {
+      if (this.destroyed || this._closed) throw mkErr("The stream has been destroyed", "ERR_HTTP2_INVALID_STREAM");
+      if (this.headersSent) throw mkErr("Cannot specify additional headers after response initiated", "ERR_HTTP2_HEADERS_AFTER_RESPOND");
+      const built = buildResponseHeaderList(headers || {}, this.session._options && this.session._options.strictSingleValueFields, true);
+      writeHeaderBlock(this.session, this.id, encodeHeaders(built.list, built.sensitive), 0);
+    }
+    cork() { return this; }
+    uncork() { return this; }
+    get writableEnded() { return this._endStreamSent === true || this.writable === false; }
+    get writableFinished() { return this._closed === true; }
+    get writableCorked() { return 0; }
+    get writableHighWaterMark() { return 16384; }
+    get writableObjectMode() { return false; }
+    get writableLength() { return 0; }
+    get writableNeedDrain() { return false; }
     close(code, cb) {
       if (code === undefined) code = constants.NGHTTP2_NO_ERROR;
       validateUint32(code, "code");
@@ -1306,7 +1618,7 @@ export constexpr std::string_view kHttp2JS = R"JS(
     setTimeout() { return this; }
     _pushData(bytes) {
       this.readable = true;
-      if (this._enc) this.emit("data", Buffer.from(bytes).toString(this._enc));
+      if (this._enc) this.emit("data", decodeChunk(this, bytes));
       else this.emit("data", Buffer.from(bytes));
     }
     _onRequestEnd() { this.readable = false; this.emit("end"); }
@@ -1372,6 +1684,7 @@ export constexpr std::string_view kHttp2JS = R"JS(
     }
     _rstStream(stream, code) { const p = Buffer.alloc(4); p.writeUInt32BE(code >>> 0, 0); this._writeFrame(FRAME.RST_STREAM, 0, stream.id, p); }
     _windowUpdate(streamId, increment) { if (streamId === 0) this._localWindow += increment; const p = Buffer.alloc(4); p.writeUInt32BE(increment >>> 0, 0); this._writeFrame(FRAME.WINDOW_UPDATE, 0, streamId, p); }
+    setLocalWindowSize(windowSize) { sessionSetLocalWindowSize(this, windowSize); }
 
     _onData(chunk) {
       if (this.destroyed) return;
@@ -1516,6 +1829,11 @@ export constexpr std::string_view kHttp2JS = R"JS(
         if (!pb.endStream) { this._streamError(stream, constants.NGHTTP2_PROTOCOL_ERROR); return true; }
         for (let i = 0; i < list.length; i++) { if (list[i][0][0] === ":") { this._streamError(stream, constants.NGHTTP2_PROTOCOL_ERROR); return true; } }
         if (stream._expectLen != null && (stream._recvLen || 0) !== stream._expectLen) { this._streamError(stream, constants.NGHTTP2_PROTOCOL_ERROR); return true; }
+        // node surfaces the request trailer block on the stream before 'end'
+        // (compat.js onStreamTrailers feeds req.trailers / req.rawTrailers).
+        const rawTrailers = [];
+        for (let i = 0; i < list.length; i++) rawTrailers.push(list[i][0], list[i][1]);
+        stream.emit("trailers", headerListToObject(list, this._hpack._sensitive), flags, rawTrailers);
         stream._onRequestEnd();
         return true;
       }
@@ -1669,85 +1987,414 @@ export constexpr std::string_view kHttp2JS = R"JS(
   }
 
   // === Http2ServerRequest / Http2ServerResponse (createServer((req,res)) compat) ===
+  // Translated from node lib/internal/http2/compat.js. The request keeps the
+  // Http2Stream's flowing-mode 'data' relay rather than a real Readable (mbun's
+  // Http2Stream is an EventEmitter, not a stream), but every observable member
+  // node's compat layer defines — header validation and its error codes, the
+  // socket proxy, statusCode/statusMessage semantics, writeHead's array form,
+  // trailers, informational responses — is ported as written there.
+  const HTTP_STATUS_CONTINUE = 100, HTTP_STATUS_EARLY_HINTS = 103;
+  const HTTP_STATUS_EXPECTATION_FAILED = 417, HTTP_STATUS_METHOD_NOT_ALLOWED = 405;
+  const kValidPseudoHeaders = new Set([":status", ":method", ":path", ":authority", ":scheme"]);
+  const isPseudoHeader = (name) => kValidPseudoHeaders.has(name);
+  // _http_common checkIsHttpToken: RFC 7230 3.2.6 tchar.
+  const TOKEN_RE = /^[\^_`a-zA-Z\-0-9!#$%&'*+.|~]+$/;
+  const checkIsHttpToken = (s) => TOKEN_RE.test(s);
+  let statusMessageWarned = false, statusConnectionHeaderWarned = false;
+  function statusMessageWarn() {
+    if (statusMessageWarned) return;
+    statusMessageWarned = true;
+    try { G.process.emitWarning("Status message is not supported by HTTP/2 (RFC7540 8.1.2.4)", "UnsupportedWarning"); } catch (e) {}
+  }
+  function connectionHeaderMessageWarn() {
+    if (statusConnectionHeaderWarned) return;
+    statusConnectionHeaderWarned = true;
+    try { G.process.emitWarning("The provided connection header is not valid, the value will be dropped from the header and will never be in use.", "UnsupportedWarning"); } catch (e) {}
+  }
+  const isConnectionHeaderAllowed = (name, value) => name !== "connection" || value === "trailers";
+  function invalidHttpToken(what, value) {
+    const e = new TypeError(what + " must be a valid HTTP token" + (value === undefined ? "" : ' ["' + value + '"]'));
+    e.code = "ERR_INVALID_HTTP_TOKEN"; return e;
+  }
+  function assertValidHeader(name, value) {
+    if (name === "" || typeof name !== "string" || name.includes(" ")) throw invalidHttpToken("Header name", name);
+    if (isPseudoHeader(name)) { const e = new TypeError("Cannot set HTTP/2 pseudo-headers"); e.code = "ERR_HTTP2_PSEUDOHEADER_NOT_ALLOWED"; throw e; }
+    if (value === undefined || value === null) { const e = new TypeError("Invalid value \"" + value + '" for header "' + name + '"'); e.code = "ERR_HTTP2_INVALID_HEADER_VALUE"; throw e; }
+    if (!isConnectionHeaderAllowed(name, value)) connectionHeaderMessageWarn();
+  }
+  function assertValidPseudoHeader(key) {
+    if (!kValidPseudoHeaders.has(key)) { const e = new TypeError('"' + key + '" is an invalid pseudoheader or is used incorrectly'); e.code = "ERR_HTTP2_INVALID_PSEUDOHEADER"; throw e; }
+  }
+  const validateString = (v, name) => { if (typeof v !== "string") throw argTypeErr(name, "of type string", v); };
+  const validateFunction = (v, name) => { if (typeof v !== "function") throw argTypeErr(name, "of type function", v); };
+  const validateObject = (v, name) => { if (v === null || typeof v !== "object" || Array.isArray(v)) throw argTypeErr(name, "of type object", v); };
+  // node lib/internal/validators validateLinkHeaderValue: accepts a string or an
+  // array of strings, each `<uri>; rel=…` shaped.
+  const LINK_VALUE_RE = /^(?:<[^>]*>)(?:\s*;\s*[^;"\s]+(?:=(")?[^;"\s]*\1)?)*$/;
+  function validateLinkHeaderValue(hints) {
+    if (typeof hints === "string") {
+      if (!LINK_VALUE_RE.test(hints)) throw invalidArgValue("hints.link", hints, "must be an array or string of format \"</styles.css>; rel=preload; as=style\"");
+      return hints;
+    } else if (Array.isArray(hints)) {
+      if (hints.length === 0) return "";
+      let result = "";
+      for (let i = 0; i < hints.length; i++) {
+        const link = hints[i];
+        if (typeof link !== "string" || !LINK_VALUE_RE.test(link))
+          throw invalidArgValue("hints.link", link, "must be an array or string of format \"</styles.css>; rel=preload; as=style\"");
+        result += link;
+        if (i !== hints.length - 1) result += ", ";
+      }
+      return result;
+    }
+    return "";
+  }
+  function http2StatusInvalid(code) {
+    const e = new RangeError("Invalid status code: " + code); e.code = "ERR_HTTP2_STATUS_INVALID"; return e;
+  }
+  // node's socket proxy: the object a compat request/response calls `socket`.
+  // Reads/writes route to the session's real socket, but the stream-manipulating
+  // members are hard errors (ERR_HTTP2_NO_SOCKET_MANIPULATION) because touching
+  // them would desynchronise the multiplexed session.
+  function makeProxySocket(stream) {
+    const noManip = new Set(["write", "read", "pause", "resume"]);
+    const bindStream = new Set(["on", "once", "end", "emit", "destroy", "removeListener", "addListener", "off"]);
+    const refOf = () => (stream.session !== undefined && stream.session ? stream.session.socket : stream);
+    return new Proxy(stream, {
+      has(t, prop) { const ref = refOf(); return (prop in t) || (ref != null && prop in ref); },
+      get(t, prop) {
+        if (bindStream.has(prop)) { const f = t[prop]; return typeof f === "function" ? f.bind(t) : f; }
+        if (prop === "writable" || prop === "destroyed") return t[prop];
+        if (prop === "readable") { if (t.destroyed) return false; const req = t._compatRequest; return req ? req.readable : t.readable; }
+        if (prop === "setTimeout") { const s = t.session; if (s !== undefined && s) return s.setTimeout.bind(s); return t.setTimeout.bind(t); }
+        if (noManip.has(prop)) { const e = new Error("HTTP/2 sockets should not be directly manipulated (e.g. read and written)"); e.code = "ERR_HTTP2_NO_SOCKET_MANIPULATION"; throw e; }
+        const ref = refOf();
+        if (ref == null) return undefined;
+        const value = ref[prop];
+        return typeof value === "function" ? value.bind(ref) : value;
+      },
+      getPrototypeOf(t) { const ref = refOf(); return Object.getPrototypeOf(ref == null ? t : ref); },
+      set(t, prop, value) {
+        if (bindStream.has(prop) || prop === "writable" || prop === "readable" || prop === "destroyed") { t[prop] = value; return true; }
+        if (prop === "setTimeout") { const s = t.session; if (s !== undefined && s) s.setTimeout = value; else t.setTimeout = value; return true; }
+        if (noManip.has(prop)) { const e = new Error("HTTP/2 sockets should not be directly manipulated (e.g. read and written)"); e.code = "ERR_HTTP2_NO_SOCKET_MANIPULATION"; throw e; }
+        const ref = refOf();
+        if (ref != null) ref[prop] = value;
+        return true;
+      },
+    });
+  }
+  function proxySocketOf(stream) {
+    if (stream._proxySocket == null) stream._proxySocket = makeProxySocket(stream);
+    return stream._proxySocket;
+  }
+
   class Http2ServerRequest extends EE {
-    constructor(stream, headers) {
+    constructor(stream, headers, options, rawHeaders) {
       super();
-      this.stream = stream;
-      this.headers = headers || {};
-      this.rawHeaders = [];
-      this.httpVersion = "2.0";
-      this.httpVersionMajor = 2;
-      this.httpVersionMinor = 0;
-      this.method = headers && headers[":method"] ? headers[":method"] : "GET";
-      this.url = headers && headers[":path"] ? headers[":path"] : "/";
-      this.authority = headers ? headers[":authority"] : undefined;
-      this.scheme = headers ? headers[":scheme"] : undefined;
-      this.socket = stream.session ? stream.session.socket : undefined;
-      this.connection = this.socket;
-      this.aborted = false;
-      this.complete = false;
+      this._state = { closed: false, didRead: false };
+      this._headers = headers || {};
+      this._rawHeaders = rawHeaders || [];
+      this._trailers = {};
+      this._rawTrailers = [];
+      this._stream = stream;
+      this._aborted = false;
+      this.readable = true;
+      this.readableEnded = false;
+      this.destroyed = false;
+      stream._proxySocket = null;
+      stream._compatRequest = this;
       const self = this;
       stream.on("data", (d) => self.emit("data", d));
-      stream.on("end", () => { self.complete = true; self.emit("end"); });
-      stream.on("aborted", () => { self.aborted = true; self.emit("aborted"); });
-      stream.on("close", () => self.emit("close"));
-      stream.on("error", (e) => self.emit("error", e));
+      stream.on("trailers", (trailers, flags, raw) => {
+        Object.assign(self._trailers, trailers || {});
+        if (Array.isArray(raw)) for (const v of raw) self._rawTrailers.push(v);
+      });
+      stream.on("end", () => { self.readableEnded = true; self.readable = false; self.emit("end"); });
+      stream.on("aborted", () => { if (!self._state.closed) { self._aborted = true; self.emit("aborted"); } });
+      stream.on("close", () => { self._state.closed = true; stream._proxySocket = null; self.emit("close"); });
+      stream.on("timeout", () => self.emit("timeout"));
     }
-    setEncoding(enc) { this.stream.setEncoding(enc); return this; }
-    setTimeout(ms, cb) { if (typeof cb === "function") this.on("timeout", cb); return this; }
-    resume() { this.stream.resume(); return this; }
-    pause() { this.stream.pause(); return this; }
+    get aborted() { return this._aborted; }
+    get complete() { return this._aborted || this.readableEnded || this._state.closed || this._stream.destroyed; }
+    get stream() { return this._stream; }
+    get headers() { return this._headers; }
+    get rawHeaders() { return this._rawHeaders; }
+    get trailers() { return this._trailers; }
+    get rawTrailers() { return this._rawTrailers; }
+    get httpVersionMajor() { return 2; }
+    get httpVersionMinor() { return 0; }
+    get httpVersion() { return "2.0"; }
+    get socket() { return proxySocketOf(this._stream); }
+    get connection() { return this.socket; }
+    get method() { return this._headers[":method"]; }
+    set method(method) {
+      validateString(method, "method");
+      if (method.trim() === "") throw invalidArgValue("method", method);
+      this._headers[":method"] = method;
+    }
+    get authority() { return this._headers[":authority"] !== undefined ? this._headers[":authority"] : this._headers["host"]; }
+    get scheme() { return this._headers[":scheme"]; }
+    get url() { return this._headers[":path"]; }
+    set url(url) { this._headers[":path"] = url; }
+    setEncoding(enc) { this._stream.setEncoding(enc); return this; }
+    setTimeout(msecs, callback) { if (!this._state.closed) this._stream.setTimeout(msecs, callback); return this; }
+    resume() { this._stream.resume(); this.emit("resume"); return this; }
+    pause() { this._stream.pause(); this.emit("pause"); return this; }
     read() { return null; }
-    get trailers() { return {}; }
-    get rawTrailers() { return []; }
-  }
-  class Http2ServerResponse extends EE {
-    constructor(stream) {
-      super();
-      this.stream = stream;
-      this[Symbol.for("headers")] = {};
-      this._headers = {};
-      this.headersSent = false;
-      this.finished = false;
-      this.writableEnded = false;
-      this.sendDate = true;
-      this.statusCode = 200;
-      this.statusMessage = "";
-      this.socket = stream.session ? stream.session.socket : undefined;
-      this.connection = this.socket;
+    destroy(err) { if (this.destroyed) return this; this.destroyed = true; this._stream.destroy(err); return this; }
+    pipe(dest, options) {
       const self = this;
-      stream.on("close", () => { if (!self.finished) { self.finished = true; self.emit("finish"); } self.emit("close"); });
+      const endDest = !(options && options.end === false);
+      this.on("data", (chunk) => { dest.write(chunk); });
+      this.on("end", () => { if (endDest && typeof dest.end === "function") dest.end(); });
+      try { if (typeof dest.emit === "function") dest.emit("pipe", self); } catch (e) {}
+      return dest;
     }
-    setHeader(name, value) { this._headers[String(name).toLowerCase()] = value; return this; }
-    getHeader(name) { return this._headers[String(name).toLowerCase()]; }
-    getHeaders() { return Object.assign({}, this._headers); }
-    getHeaderNames() { return Object.keys(this._headers); }
-    hasHeader(name) { return Object.prototype.hasOwnProperty.call(this._headers, String(name).toLowerCase()); }
-    removeHeader(name) { delete this._headers[String(name).toLowerCase()]; return this; }
-    writeHead(status, statusMessage, headers) {
-      if (typeof statusMessage === "object" && statusMessage !== null) { headers = statusMessage; statusMessage = undefined; }
-      this.statusCode = status;
-      if (headers) for (const k in headers) { if (Object.prototype.hasOwnProperty.call(headers, k)) this._headers[String(k).toLowerCase()] = headers[k]; }
+  }
+
+  class Http2ServerResponse extends EE {
+    constructor(stream, options) {
+      super();
+      this._state = { closed: false, ending: false, destroyed: false, headRequest: false, sendDate: true, statusCode: 200 };
+      this._hdrs = { __proto__: null };
+      this._trailers = { __proto__: null };
+      this._stream = stream;
+      stream._proxySocket = null;
+      stream._compatResponse = this;
+      this.writable = true;
+      this.req = stream._compatRequest;
+      const self = this;
+      stream.on("drain", () => self.emit("drain"));
+      stream.on("close", () => {
+        if (self._state.closed) return;
+        self._state.closed = true;
+        stream._proxySocket = null;
+        self.emit("finish");
+        self.emit("close");
+      });
+      stream.on("wantTrailers", () => { try { stream.sendTrailers(self._trailers); } catch (e) {} });
+      stream.on("timeout", () => self.emit("timeout"));
+    }
+    get _header() { return this.headersSent; }
+    get writableEnded() { return this._state.ending; }
+    get finished() { return this._state.ending; }
+    get socket() { if (this._state.closed) return undefined; return proxySocketOf(this._stream); }
+    get connection() { return this.socket; }
+    get stream() { return this._stream; }
+    get headersSent() { return this._stream.headersSent; }
+    get sendDate() { return this._state.sendDate; }
+    set sendDate(bool) { this._state.sendDate = !!bool; }
+    get statusCode() { return this._state.statusCode; }
+    set statusCode(code) {
+      code |= 0;
+      if (code >= 100 && code < 200) { const e = new RangeError("Informational status codes cannot be used"); e.code = "ERR_HTTP2_INFO_STATUS_NOT_ALLOWED"; throw e; }
+      if (code < 100 || code > 599) throw http2StatusInvalid(code);
+      this._state.statusCode = code;
+    }
+    get writableCorked() { return 0; }
+    get writableHighWaterMark() { return 16384; }
+    get writableObjectMode() { return false; }
+    get writableFinished() { return this._state.closed; }
+    get writableLength() { return 0; }
+    get writableNeedDrain() { return false; }
+    get statusMessage() { statusMessageWarn(); return ""; }
+    set statusMessage(msg) { statusMessageWarn(); }
+    setTrailer(name, value) {
+      validateString(name, "name");
+      name = name.trim().toLowerCase();
+      assertValidHeader(name, value);
+      this._trailers[name] = value;
+    }
+    addTrailers(headers) { for (const key of Object.keys(headers)) this.setTrailer(key, headers[key]); }
+    getHeader(name) { validateString(name, "name"); return this._hdrs[name.trim().toLowerCase()]; }
+    getHeaderNames() { return Object.keys(this._hdrs); }
+    getHeaders() { return Object.assign({ __proto__: null }, this._hdrs); }
+    hasHeader(name) { validateString(name, "name"); return Object.prototype.hasOwnProperty.call(this._hdrs, name.trim().toLowerCase()); }
+    removeHeader(name) {
+      validateString(name, "name");
+      if (this._stream.headersSent) throw mkErr("Response has already been initiated.", "ERR_HTTP2_HEADERS_SENT");
+      name = name.trim().toLowerCase();
+      if (name === "date") { this._state.sendDate = false; return; }
+      delete this._hdrs[name];
+    }
+    setHeader(name, value) {
+      validateString(name, "name");
+      if (this._stream.headersSent) throw mkErr("Response has already been initiated.", "ERR_HTTP2_HEADERS_SENT");
+      this._setHeader(name, value);
       return this;
     }
-    _respondIfNeeded() {
-      if (this.headersSent) return;
-      this.headersSent = true;
-      const h = Object.assign({ ":status": this.statusCode }, this._headers);
-      this.stream.respond(h);
+    _setHeader(name, value) {
+      name = name.trim().toLowerCase();
+      assertValidHeader(name, value);
+      if (!isConnectionHeaderAllowed(name, value)) return;
+      if (name[0] === ":") assertValidPseudoHeader(name);
+      else if (!checkIsHttpToken(name)) this.destroy(invalidHttpToken("Header name", name));
+      this._hdrs[name] = value;
     }
-    write(chunk, enc, cb) { this._respondIfNeeded(); return this.stream.write(chunk, enc, cb); }
-    end(chunk, enc, cb) {
+    appendHeader(name, value) {
+      validateString(name, "name");
+      if (this._stream.headersSent) throw mkErr("Response has already been initiated.", "ERR_HTTP2_HEADERS_SENT");
+      this._appendHeader(name, value);
+      return this;
+    }
+    _appendHeader(name, value) {
+      name = name.trim().toLowerCase();
+      assertValidHeader(name, value);
+      if (!isConnectionHeaderAllowed(name, value)) return;
+      if (name[0] === ":") assertValidPseudoHeader(name);
+      else if (!checkIsHttpToken(name)) this.destroy(invalidHttpToken("Header name", name));
+      const headers = this._hdrs;
+      if (headers === null || !headers[name]) { this._hdrs[name] = value; return; }
+      if (!Array.isArray(headers[name])) headers[name] = [headers[name]];
+      const existing = headers[name];
+      if (Array.isArray(value)) { for (const v of value) existing.push(v); }
+      else existing.push(value);
+    }
+    flushHeaders() {
+      const state = this._state;
+      if (!state.closed && !this._stream.headersSent) this.writeHead(state.statusCode);
+    }
+    writeHead(statusCode, statusMessage, headers) {
+      const state = this._state;
+      if (state.closed || this._stream.destroyed || this._stream.closed) return this;
+      if (this._stream.headersSent) throw mkErr("Response has already been initiated.", "ERR_HTTP2_HEADERS_SENT");
+      if (typeof statusMessage === "string") statusMessageWarn();
+      if (headers === undefined && typeof statusMessage === "object") headers = statusMessage;
+      if (Array.isArray(headers)) {
+        // Array form overrides previously-set headers but keeps explicit
+        // duplicates: drop the conflicting names first, then append.
+        if (this._hdrs) {
+          if (headers.length && Array.isArray(headers[0])) { for (let n = 0; n < headers.length; n++) this.removeHeader(headers[n][0]); }
+          else { for (let n = 0; n < headers.length; n += 2) this.removeHeader(headers[n]); }
+        }
+        if (headers.length && Array.isArray(headers[0])) { for (const h of headers) this._appendHeader(h[0], h[1]); }
+        else {
+          if (headers.length % 2 !== 0) throw invalidArgValue("headers", headers);
+          for (let i = 0; i < headers.length; i += 2) this._appendHeader(headers[i], headers[i + 1]);
+        }
+      } else if (headers !== null && typeof headers === "object") {
+        for (const key of Object.keys(headers)) this._setHeader(key, headers[key]);
+      }
+      state.statusCode = statusCode;
+      this._beginSend();
+      return this;
+    }
+    cork() { return this; }
+    uncork() { return this; }
+    write(chunk, encoding, cb) {
+      const state = this._state;
+      if (typeof encoding === "function") { cb = encoding; encoding = "utf8"; }
+      let err;
+      if (state.ending) { err = mkErr("write after end", "ERR_STREAM_WRITE_AFTER_END"); }
+      else if (state.closed) { err = mkErr("The stream has been destroyed", "ERR_HTTP2_INVALID_STREAM"); }
+      else if (state.destroyed) return false;
+      if (err) {
+        if (typeof cb === "function") G.queueMicrotask(() => cb(err));
+        this.destroy(err);
+        return false;
+      }
+      const stream = this._stream;
+      if (!stream.headersSent) this.writeHead(state.statusCode);
+      return stream.write(chunk, encoding, cb);
+    }
+    end(chunk, encoding, cb) {
+      const stream = this._stream;
+      const state = this._state;
       if (typeof chunk === "function") { cb = chunk; chunk = null; }
-      this._respondIfNeeded();
-      this.finished = true; this.writableEnded = true;
-      this.stream.end(chunk, enc, cb);
+      else if (typeof encoding === "function") { cb = encoding; encoding = "utf8"; }
+      if ((state.closed || state.ending) && state.headRequest === stream.headRequest) {
+        if (typeof cb === "function") G.queueMicrotask(cb);
+        return this;
+      }
+      if (chunk !== null && chunk !== undefined) this.write(chunk, encoding);
+      state.headRequest = stream.headRequest;
+      state.ending = true;
+      if (typeof cb === "function") this.once("finish", cb);
+      if (!stream.headersSent) this.writeHead(state.statusCode);
+      if (state.closed || stream.destroyed) {
+        if (!state.closed) { state.closed = true; this.emit("finish"); this.emit("close"); }
+      } else stream.end();
       return this;
     }
-    writeContinue() { return this; }
-    setTimeout(ms, cb) { if (typeof cb === "function") this.on("timeout", cb); return this; }
-    createPushResponse(headers, cb) { if (typeof cb === "function") G.queueMicrotask(() => cb(mkErr("Push streams are not supported", "ERR_HTTP2_PUSH_DISABLED"))); }
-    get finished_() { return this.finished; }
+    destroy(err) {
+      if (this._state.destroyed) return;
+      this._state.destroyed = true;
+      this._stream.destroy(err);
+    }
+    setTimeout(msecs, callback) { if (this._state.closed) return this; this._stream.setTimeout(msecs, callback); return this; }
+    createPushResponse(headers, callback) {
+      validateFunction(callback, "callback");
+      if (this._state.closed) { G.queueMicrotask(() => callback(mkErr("The stream has been destroyed", "ERR_HTTP2_INVALID_STREAM"))); return; }
+      this._stream.pushStream(headers, {}, (err, stream) => {
+        if (err) { callback(err); return; }
+        callback(null, new Http2ServerResponse(stream));
+      });
+    }
+    _beginSend() {
+      const state = this._state;
+      const headers = this._hdrs;
+      headers[":status"] = state.statusCode;
+      this._stream.respond(headers, { endStream: state.ending, waitForTrailers: true, sendDate: state.sendDate });
+    }
+    writeInformation(statusCode, headers) {
+      if (typeof statusCode !== "number" || statusCode < 100 || statusCode > 199) throw http2StatusInvalid(statusCode);
+      if (statusCode === 101) throw http2StatusInvalid(statusCode);
+      const stream = this._stream;
+      if (stream.headersSent || this._state.closed) return false;
+      const outHeaders = { __proto__: null };
+      if (headers !== undefined && headers !== null) {
+        validateObject(headers, "headers");
+        for (const k of Object.keys(headers)) outHeaders[k] = headers[k];
+      }
+      outHeaders[":status"] = statusCode;
+      stream.additionalHeaders(outHeaders);
+      return true;
+    }
+    writeContinue() { return this.writeInformation(HTTP_STATUS_CONTINUE); }
+    writeEarlyHints(hints) {
+      validateObject(hints, "hints");
+      const headers = { __proto__: null };
+      const linkHeaderValue = validateLinkHeaderValue(hints.link);
+      for (const key of Object.keys(hints)) {
+        if (key === "link") continue;
+        const name = key.trim().toLowerCase();
+        assertValidHeader(name, hints[key]);
+        if (!checkIsHttpToken(name)) throw invalidHttpToken("Header name", name);
+        headers[name] = hints[key];
+      }
+      if (linkHeaderValue.length === 0) return false;
+      headers.Link = linkHeaderValue;
+      return this.writeInformation(HTTP_STATUS_EARLY_HINTS, headers);
+    }
+  }
+
+  // node compat.js onServerStream: CONNECT and Expect: 100-continue are routed
+  // to their own server events before the plain 'request' dispatch.
+  function onServerStream(server, stream, headers, flags, rawHeaders) {
+    const request = new Http2ServerRequest(stream, headers, undefined, rawHeaders);
+    const response = new Http2ServerResponse(stream);
+    const method = headers[":method"];
+    if (method === "CONNECT") {
+      if (!server.emit("connect", request, response)) {
+        response.statusCode = HTTP_STATUS_METHOD_NOT_ALLOWED;
+        response.end();
+      }
+      return;
+    }
+    if (headers.expect !== undefined) {
+      if (headers.expect === "100-continue") {
+        if (server.listenerCount("checkContinue")) server.emit("checkContinue", request, response);
+        else { response.writeContinue(); server.emit("request", request, response); }
+      } else if (server.listenerCount("checkExpectation")) {
+        server.emit("checkExpectation", request, response);
+      } else {
+        response.statusCode = HTTP_STATUS_EXPECTATION_FAILED;
+        response.end();
+      }
+      return;
+    }
+    server.emit("request", request, response);
   }
 
   // === Http2Server / Http2SecureServer ===
@@ -1762,39 +2409,199 @@ export constexpr std::string_view kHttp2JS = R"JS(
       const session = new ServerHttp2Session(self, socket, options);
       session.on("stream", (stream, headers, flags, rawHeaders) => {
         self.emit("stream", stream, headers, flags, rawHeaders);
-        if (self.listenerCount("request") > 0) {
-          const req = new Http2ServerRequest(stream, headers);
-          const res = new Http2ServerResponse(stream);
-          self.emit("request", req, res);
-        }
+        // node Http2Server routes every stream through compat.js onServerStream
+        // when any of the compat events is listened for, not only 'request':
+        // CONNECT and Expect: 100-continue have their own server events.
+        if (self.listenerCount("request") > 0 || self.listenerCount("checkContinue") > 0 ||
+            self.listenerCount("checkExpectation") > 0 || self.listenerCount("connect") > 0)
+          onServerStream(self, stream, headers, flags, rawHeaders);
       });
       session.on("error", (e) => { if (self.listenerCount("sessionError") > 0) self.emit("sessionError", e, session); else if (self.listenerCount("session") === 0 && self.listenerCount("error") > 0) self.emit("error", e); });
       self.emit("session", session);
     };
     server.on(secure ? "secureConnection" : "connection", onSession);
-    server.setTimeout = function (ms, cb) { if (typeof cb === "function") this.on("timeout", cb); return this; };
+    // node Http2Server#setTimeout(msecs, callback): validateFunction on the
+    // callback, and `server.timeout` records the value.
+    server.timeout = 0;
+    server.setTimeout = function (ms, cb) {
+      this.timeout = ms;
+      if (cb !== undefined) { if (typeof cb !== "function") throw argTypeErr("callback", "of type function", cb); this.on("timeout", cb); }
+      return this;
+    };
     server.updateSettings = function () { return this; };
     return server;
   }
+  // node Http2Server/Http2SecureServer constructor -> initializeOptions:
+  // `options` must be a plain object, `options.settings` too (and is validated
+  // as a settings object), and the session-limit counters must be non-negative
+  // integers.
+  function validateServerOptions(options, allowFunction) {
+    if (options === undefined) return {};
+    if (options === null || typeof options !== "object" || Array.isArray(options) || (!allowFunction && typeof options === "function"))
+      throw argTypeErr("options", "of type object", options);
+    if (options.settings !== undefined) {
+      const s = options.settings;
+      if (s === null || typeof s !== "object" || Array.isArray(s)) throw argTypeErr("options.settings", "of type object", s);
+      validateSettings(s);
+    }
+    for (const key of ["maxSessionInvalidFrames", "maxSessionRejectedStreams"]) {
+      const v = options[key];
+      if (v === undefined) continue;
+      if (typeof v !== "number") throw argTypeErr("options." + key, "of type number", v);
+      if (!Number.isInteger(v)) throw outOfRangeErr("options." + key, "an integer", v);
+      if (v < 0 || v > 4294967295) throw outOfRangeErr("options." + key, ">= 0 && <= 4294967295", v);
+    }
+    return options;
+  }
   function makeHttp2Server(options, onRequest) {
     if (typeof options === "function") { onRequest = options; options = {}; }
+    validateServerOptions(options);
     const server = net.createServer({ allowHalfOpen: true });
     return attachH2Server(server, options, onRequest, false);
   }
   function makeHttp2SecureServer(options, onRequest) {
-    if (typeof options === "function") { onRequest = options; options = {}; }
+    // Unlike createServer, createSecureServer has no options-less form: a
+    // function in the first position is an invalid `options`, not the handler.
+    validateServerOptions(options);
     if (!tls || !tls.createServer) throw mkErr("http2 createSecureServer requires node:tls", "ERR_HTTP2_ERROR");
     const alpn = (options && options.allowHTTP1) ? ["h2", "http/1.1"] : ["h2"];
     const server = tls.createServer(Object.assign({}, options, { ALPNProtocols: (options && options.ALPNProtocols) || alpn }));
     return attachH2Server(server, options, onRequest, true);
   }
 
+  // === settings validation / (un)packing =====================================
+  // Blueprint: node lib/internal/http2/core.js validateSettings +
+  // getPackedSettings/getUnpackedSettings and lib/internal/http2/util.js
+  // updateSettingsBuffer (which fixes the wire order: HEADER_TABLE_SIZE,
+  // ENABLE_PUSH, MAX_CONCURRENT_STREAMS, INITIAL_WINDOW_SIZE, MAX_FRAME_SIZE,
+  // MAX_HEADER_LIST_SIZE, ENABLE_CONNECT_PROTOCOL, then customSettings).
+  const kMaxInt = (2 ** 32) - 1;
+  const kMaxFrameSizeSetting = (2 ** 24) - 1;
+  const kMaxInitialWindowSize = (2 ** 31) - 1;
+  const kMaxStreams = (2 ** 32) - 1;
+  const MAX_ADDITIONAL_SETTINGS = 10;
+  function invalidSettingValue(name, value, range) {
+    const msg = 'Invalid value for setting "' + name + '": ' + value;
+    const e = range ? new RangeError(msg) : new TypeError(msg);
+    e.code = "ERR_HTTP2_INVALID_SETTING_VALUE";
+    e.actual = value;
+    return e;
+  }
+  function tooManyCustomSettings() {
+    const e = new Error("Number of custom settings exceeds MAX_ADDITIONAL_SETTINGS");
+    e.code = "ERR_HTTP2_TOO_MANY_CUSTOM_SETTINGS";
+    return e;
+  }
+  function assertWithinRange(name, value, min, max) {
+    if (value !== undefined && (typeof value !== "number" || value < min || value > max))
+      throw invalidSettingValue(name, value, true);
+  }
+  function assertIsObject(value, name, types) {
+    if (value !== undefined && (value === null || typeof value !== "object" || Array.isArray(value)))
+      throw argTypeErr(name, "an object" + (types ? " of " + types + "s" : ""), value);
+  }
+  function validateSettings(settings) {
+    if (settings === undefined) return;
+    assertIsObject(settings.customSettings, "customSettings", "Number");
+    if (settings.customSettings) {
+      const keys = Object.keys(settings.customSettings);
+      if (keys.length > MAX_ADDITIONAL_SETTINGS) throw tooManyCustomSettings();
+      for (const key of keys) {
+        assertWithinRange("customSettings:id", Number(key), 0, 0xffff);
+        assertWithinRange("customSettings:value", Number(settings.customSettings[key]), 0, kMaxInt);
+      }
+    }
+    assertWithinRange("headerTableSize", settings.headerTableSize, 0, kMaxInt);
+    assertWithinRange("initialWindowSize", settings.initialWindowSize, 0, kMaxInitialWindowSize);
+    assertWithinRange("maxFrameSize", settings.maxFrameSize, 16384, kMaxFrameSizeSetting);
+    assertWithinRange("maxConcurrentStreams", settings.maxConcurrentStreams, 0, kMaxStreams);
+    assertWithinRange("maxHeaderListSize", settings.maxHeaderListSize, 0, kMaxInt);
+    assertWithinRange("maxHeaderSize", settings.maxHeaderSize, 0, kMaxInt);
+    if (settings.enablePush !== undefined && typeof settings.enablePush !== "boolean")
+      throw invalidSettingValue("enablePush", settings.enablePush, false);
+    if (settings.enableConnectProtocol !== undefined && typeof settings.enableConnectProtocol !== "boolean")
+      throw invalidSettingValue("enableConnectProtocol", settings.enableConnectProtocol, false);
+  }
+  function getPackedSettings(settings) {
+    assertIsObject(settings, "settings");
+    validateSettings(settings);
+    const s = settings || {};
+    const entries = [];
+    if (typeof s.headerTableSize === "number") entries.push([1, s.headerTableSize]);
+    if (typeof s.enablePush === "boolean") entries.push([2, s.enablePush ? 1 : 0]);
+    if (typeof s.maxConcurrentStreams === "number") entries.push([3, s.maxConcurrentStreams]);
+    if (typeof s.initialWindowSize === "number") entries.push([4, s.initialWindowSize]);
+    if (typeof s.maxFrameSize === "number") entries.push([5, s.maxFrameSize]);
+    if (typeof s.maxHeaderListSize === "number" || typeof s.maxHeaderSize === "number")
+      entries.push([6, typeof s.maxHeaderSize === "number" ? s.maxHeaderSize : s.maxHeaderListSize]);
+    if (typeof s.enableConnectProtocol === "boolean") entries.push([8, s.enableConnectProtocol ? 1 : 0]);
+    if (s.customSettings && typeof s.customSettings === "object") {
+      let n = 0;
+      for (const key in s.customSettings) {
+        if (!Object.prototype.hasOwnProperty.call(s.customSettings, key)) continue;
+        const val = s.customSettings[key];
+        if (typeof val !== "number") continue;
+        const id = Number(key);
+        // updateSettingsBuffer rejects a non-numeric / out-of-range custom id or
+        // value here rather than at frame-serialisation time.
+        if (id !== id || id <= 0 || id > 0xffff) throw invalidSettingValue("customSettings:id", id, true);
+        if (val !== val || val <= 0 || val > kMaxInt) throw invalidSettingValue("customSettings:value", val, true);
+        if (n === MAX_ADDITIONAL_SETTINGS) throw tooManyCustomSettings();
+        n++;
+        entries.push([id, val]);
+      }
+    }
+    const out = Buffer.alloc(entries.length * 6);
+    for (let i = 0; i < entries.length; i++) {
+      out.writeUInt16BE(entries[i][0], i * 6);
+      out.writeUInt32BE(entries[i][1] >>> 0, i * 6 + 2);
+    }
+    return out;
+  }
+  function getUnpackedSettings(buf, options) {
+    // node requires a Buffer/TypedArray with a `length`: a DataView has
+    // byteLength but no length, so it is rejected.
+    if (!ArrayBuffer.isView(buf) || buf.length === undefined)
+      throw argTypeErr("buf", "an instance of Buffer or TypedArray", buf);
+    if (buf.length % 6 !== 0) {
+      const e = new RangeError("Packed settings length must be a multiple of six");
+      e.code = "ERR_HTTP2_INVALID_PACKED_SETTINGS_LENGTH";
+      throw e;
+    }
+    // A non-Uint8Array TypedArray is read byte-wise through its element values
+    // (node reads the same `buf[i]` indices), so mirror that with readUInt*.
+    const at = (i) => buf[i] & 0xff;
+    const u16 = (i) => (at(i) << 8) | at(i + 1);
+    const u32 = (i) => (at(i) * 0x1000000) + (at(i + 1) << 16) + (at(i + 2) << 8) + at(i + 3);
+    const settings = {};
+    let offset = 0;
+    while (offset < buf.length) {
+      const id = u16(offset);
+      const value = u32(offset + 2);
+      switch (id) {
+        case 1: settings.headerTableSize = value; break;
+        case 2: settings.enablePush = value !== 0; break;
+        case 3: settings.maxConcurrentStreams = value; break;
+        case 4: settings.initialWindowSize = value; break;
+        case 5: settings.maxFrameSize = value; break;
+        case 6: settings.maxHeaderListSize = settings.maxHeaderSize = value; break;
+        case 8: settings.enableConnectProtocol = value !== 0; break;
+        default:
+          if (!settings.customSettings) settings.customSettings = {};
+          settings.customSettings[id] = value;
+      }
+      offset += 6;
+    }
+    if (options != null && options.validate) validateSettings(settings);
+    return settings;
+  }
+
   // === install over the deferred stub (bootstrap.cppm def(["http2"], ...)) ===
   http2.constants = constants;
   http2.connect = connect;
   http2.getDefaultSettings = getDefaultSettings;
-  http2.getPackedSettings = () => Buffer.alloc(0);
-  http2.getUnpackedSettings = () => getDefaultSettings();
+  http2.getPackedSettings = getPackedSettings;
+  http2.getUnpackedSettings = getUnpackedSettings;
   http2.sensitiveHeaders = G.Symbol.for("nodejs.http2.sensitiveHeaders");
   http2.Http2Session = ClientHttp2Session;
   http2.ClientHttp2Session = ClientHttp2Session;
