@@ -15,9 +15,35 @@ ending. This file is what makes that recoverable.
 - **Integration branch**: `r9/integration`, pushed to origin. PR **32** targets `rewrite_bun_in_mcpp`.
 - **Integration worktree**: `.claude/worktrees/wt5` (git + docs + measurement).
   `wt3` is a spare build/measure worktree.
-- **Last authoritative node measurement**: `2459 / 4433` = 55.5% strict, 63.4%
-  excluding self-skips, at commit `2ec433d`. Run dir:
-  `.claude/worktrees/wt5/target/integration/r11-final`.
+- **Last authoritative node measurement**: `2566 / 4433` = 57.9% strict, 66.1%
+  excluding self-skips, at commit `9d70bbf`. Run dir:
+  `.claude/worktrees/wt5/target/integration/r12b`.
+
+## FIRST TASK ON RESUME — two items, in this order
+
+1. **Eleven real regressions from this round's runtime-wide changes.** Each
+   reproduces 3/3 standalone, so they are not guard artefacts. Four time out:
+   `test-async-hooks-stack-overflow-nested-async`,
+   `test-uncaught-exception-handler-stack-overflow`,
+   `-on-stack-overflow`, `test-runner-mock-timers-with-timeout`. Seven fail:
+   `test-web-locks`, `test-web-locks-query`, `test-crypto-worker-thread`,
+   `test-permission-fs-require`, `test-repl-tab-complete-nested-repls`,
+   `test-worker-process-env` (this last one the worker agent identified as a
+   pre-existing latent failure that the new error reporting stopped hiding).
+   Suspect the `process.nextTick` queue split (`engine.inc`, `__mbunRunTicks`)
+   and the entry-script try/catch, both landed this round.
+
+2. **`w5/agent-http` is UNMERGED and worth +18.** It conflicts with the merged
+   `w6/net-dgram` and `w6/child-cluster` work in `modules/jsc/src/js_net.cppm` —
+   7 hunks, and both sides restructure the socket read path (HEAD has `onread`
+   with a static buffer plus `_adopt(fd)`; the branch adds a read-side parking
+   queue, `_flowing`, `_dataSink` and `_deliver`). It must be COMPOSED, not
+   resolved by taking a side. Its headline fix is large: mbun's `net.Socket`
+   silently dropped every byte that arrived before a `'data'` listener existed,
+   which is why several "mustCall never fired" files were misattributed to http.
+   Verify both feature sets behaviourally afterwards — a merge that compiles and
+   has no conflict markers can still have lost one of them (that happened this
+   round with the tick queue).
 - **Last bun measurement**: green `868 / 1902`, at `8009cfc` — **stale**, predates
   waves 4-6. A fresh run is owed.
 - **Frozen baseline binary for the current wave**:
