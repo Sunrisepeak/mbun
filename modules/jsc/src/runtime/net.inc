@@ -379,6 +379,27 @@ JSValueRef netn_shutdown_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
     return JSValueMakeUndefined(ctx);
 }
 
+// net.track(fd) → join an EXTERNALLY acquired descriptor to the reactor's poll
+// set (and make it non-blocking). Descriptors that arrive over SCM_RIGHTS —
+// node's NODE_HANDLE protocol, i.e. every socket cluster hands to a worker —
+// never passed through accept()/connect(), so they were absent from net_fds()
+// and netn_wait_cb never polled them: the pump parked for up to 60s while a
+// readable byte or a FIN sat unnoticed on the socket, which is a hang for any
+// test with a 15s budget (test-cluster-worker-wait-server-close,
+// test-cluster-disconnect). Idempotent, so the accept()/connect() paths that
+// already registered their fd can call it too.
+JSValueRef netn_track_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                         const JSValueRef args[], JSValueRef*) {
+#if !defined(_WIN32)
+    const int fd{argc > 0 ? static_cast<int>(JSValueToNumber(ctx, args[0], nullptr)) : -1};
+    if (fd >= 0 && !net_fds().contains(fd)) {
+        net_set_nonblock(fd);
+        net_fds().insert(fd);
+    }
+#endif
+    return JSValueMakeUndefined(ctx);
+}
+
 JSValueRef netn_close_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                          const JSValueRef args[], JSValueRef*) {
 #if !defined(_WIN32)

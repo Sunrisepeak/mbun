@@ -198,6 +198,10 @@ export constexpr std::string_view kNetJS = R"JS(
       this._readableState = { endEmitted: false, ended: false, destroyed: false, length: 0, flowing: true, readable: true, objectMode: false };
     }
     _adopt(fd) {
+      // A descriptor received over IPC (SCM_RIGHTS) never went through
+      // accept()/connect(), so the reactor's poll set does not know it and the
+      // pump would park without watching it. Idempotent for our own fds.
+      if (NN && NN.track) { try { NN.track(fd); } catch (e) {} }
       this._fd = fd; this.pending = false; this.destroyed = false; this.connecting = false;
       this.readable = true; this.writable = true;
       this._shutW = false; this._shutSent = false; this._eof = false; this._closeEmitted = false;
@@ -793,6 +797,7 @@ export constexpr std::string_view kNetJS = R"JS(
         handle.owner = this;
         if (typeof handle.fd === "number" && handle.fd >= 0) {
           // Shared descriptor: accept locally, exactly like a normal listen().
+          if (NN && NN.track) { try { NN.track(handle.fd); } catch (e) {} }
           this._fd = handle.fd;
           const sn = handle.sockname;
           if (unixPath) this._addr = { address: unixPath, family: "unix", port: 0 };

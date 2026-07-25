@@ -248,6 +248,8 @@ inline constexpr std::string_view kNodeNetJS = R"JS(
               G.queueMicrotask(() => self.emit("error", mkE("bind " + (err || "EADDRINUSE"), typeof err === "string" ? err : "EADDRINUSE")));
               return;
             }
+            const NNAT = G.__mbunNetNative;
+            if (NNAT && NNAT.track) { try { NNAT.track(handle.fd); } catch (e) {} }
             self._fd = handle.fd;
             self._clusterHandle = handle;
             self._bound = true;

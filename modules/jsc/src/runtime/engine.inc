@@ -1717,6 +1717,7 @@ public:
         set_fn(ctx_, nn, "write", netn_write_cb);
         set_fn(ctx_, nn, "shutdown", netn_shutdown_cb);
         set_fn(ctx_, nn, "close", netn_close_cb);
+        set_fn(ctx_, nn, "track", netn_track_cb);  // adopt an SCM_RIGHTS descriptor
         set_fn(ctx_, nn, "setSockBuf", netn_set_sockbuf_cb);
         set_fn(ctx_, nn, "wait", netn_wait_cb);
         set_fn(ctx_, nn, "sleep", netn_sleep_cb);

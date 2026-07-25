@@ -297,7 +297,7 @@ inline constexpr std::string_view kNodeClusterJS = R"JS(
       const ownedFd = (fd) => ({
         fd,
         __ipcSendFd() { return { fd: this.fd, type: "net.Native" }; },
-        close() { closeFd(this.fd); this.fd = -1; },
+        close(cb) { closeFd(this.fd); this.fd = -1; if (typeof cb === "function") G.queueMicrotask(cb); },
       });
       // A descriptor the primary keeps: every worker gets a dup, the original is
       // closed only when the last worker drops it.

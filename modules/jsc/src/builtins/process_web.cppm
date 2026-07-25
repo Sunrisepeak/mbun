@@ -88,7 +88,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     if (t === "object") return "an instance of " + ((v.constructor && v.constructor.name) || "Object");
     return "type " + t + " (" + String(v) + ")";
   };
-  const makeIpc = (fd) => { PROC.setNonBlock(fd); return { fd, buf: "", out: [], queued: 0, closed: false, refd: true, rxFds: [] }; };
+  const makeIpc = (fd) => { PROC.setNonBlock(fd); return { fd, buf: "", out: [], queued: 0, closed: false, refd: true, rxFds: [], sent: [] }; };
   const ipcClose = (ch) => { if (ch.closed) return; ch.closed = true; try { PROC.close(ch.fd); } catch (e) {} };
   const canPassFd = () => typeof PROC.sendmsgFd === "function" && typeof PROC.recvmsgFd === "function";
   const ipcFlush = (ch) => {
@@ -151,9 +151,29 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     return {
       fd,
       __ipcSendFd() { return { fd: this.fd, type }; },
-      close() { if (this.fd >= 0) { try { PROC.close(this.fd); } catch (e) {} this.fd = -1; } },
+      // libuv's handle.close() takes an optional callback fired once the handle
+      // is really closed; cluster's worker relies on it when it hands a
+      // connection back (test-cluster-worker-handle-close).
+      close(cb) {
+        if (this.fd >= 0) { try { PROC.close(this.fd); } catch (e) {} this.fd = -1; }
+        if (typeof cb === "function") G.queueMicrotask(cb);
+      },
     };
   };
+  // node closes the sender's copy of a handle once the peer acknowledges it
+  // (lib/internal/child_process.js handleConversion[...].postSend, skipped for
+  // `options.keepOpen`). Without the ack the parent keeps the socket it handed
+  // over, which pins its event loop for good
+  // (test-cluster-send-socket-to-worker-http-server).
+  const closeSentHandle = (entry) => {
+    if (!entry || entry.keepOpen) return;
+    const h = entry.handle;
+    try {
+      if (h && typeof h.close === "function") h.close();
+      else if (h && typeof h.destroy === "function") h.destroy();
+    } catch (e) {}
+  };
+
   const ipcRead = (ch, onMessage, onEof) => {
     // node observes the channel's EOF on a LATER loop turn than the last frame
     // it delivered, so every nextTick/microtask the frame scheduled has run
@@ -188,10 +208,15 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
         let msg;
         try { msg = JSON.parse(line); } catch (e) { continue; }
         let handle;
+        if (msg !== null && typeof msg === "object" && msg.cmd === "NODE_HANDLE_ACK") {
+          closeSentHandle(ch.sent.shift());
+          continue;
+        }
         if (msg !== null && typeof msg === "object" && msg.cmd === "NODE_HANDLE") {
           const fd = ch.rxFds.length ? ch.rxFds.shift() : -1;
           handle = ipcRecvHandle(msg.type, fd);
           msg = msg.msg;
+          ipcWrite(ch, { cmd: "NODE_HANDLE_ACK" }, null);
         }
         delivered++;
         onMessage(msg, handle);
@@ -233,6 +258,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
         }
         sendFd = info.fd;
         message = { cmd: "NODE_HANDLE", type: info.type, msg: message };
+        ch.sent.push({ handle, keepOpen: !!(options && options.keepOpen) });
       }
       if (!this.connected || ch.closed) {
         const e = new Error("Channel closed"); e.code = "ERR_IPC_CHANNEL_CLOSED";
