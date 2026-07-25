@@ -58,6 +58,7 @@ export import :web_events;
 export import :valkey_client;
 export import :s3;
 export import :html_rewriter;
+export import :node_internal_binding;
 export import :fn_tostring_printer;
 
 namespace mbun::jsc::builtins {
@@ -138,6 +139,10 @@ export inline const std::string kNodeBuiltinsJS =
         // node:repl — last of the node modules: REPLServer extends readline's
         // Interface and evaluates through node:vm, so both must be installed.
         .append(detail::kNodeReplJS)
+        // internalBinding(): the accessor node's lib/internal/** modules are
+        // evaluated with. Handed to those modules as a wrapper parameter by the
+        // loader, never installed as an ambient global.
+        .append(detail::kNodeInternalBindingJS)
         // last: printer-normalizing Function.prototype.toString override —
         // every earlier partition must capture the native toString.
         .append(detail::kFnToStringPrinterJS);
