@@ -742,3 +742,58 @@ exactly the direction that flatters you.** When a harness feature is
 under-exercised, check that it works at all before trusting any file that uses
 it. Here the full-corpus guard showed no pass loss from the fix, so nothing had
 been leaning on it — but that was measured, not assumed.
+
+## Dispatch protocol — the long-tail phase
+
+The mechanism-hunting protocol (causes pre-named, one agent per subsystem, each
+running its own full guard) took a wave from 3.7% of target to 150%. It is now
+the wrong tool, and the measurement says why.
+
+On the round-11 node run, **1419 non-passing files carry 540 distinct failure
+signatures — 2.6 files each.** 41% sit in clusters of ≤4 files, 31% are
+singletons. Only ~20% sit in clusters large enough to brief as a mechanism, and
+even those two (`mustCall`, `timeout`) are umbrellas over many unrelated causes.
+An architectural push was the obvious next hypothesis and it is **refuted**: only
+223 of 1419 files (16%) need `internalBinding` or node's internal modules at all;
+**84% are pure public-API gaps**.
+
+So the search now costs more than the repair. What a long tail needs is
+throughput.
+
+### Division of labour
+
+| | who | why |
+|---|---|---|
+| Full-corpus measurement | **integration only** | ~50 min each. Nine agents paying it is nine times the same number. |
+| Cross-subsystem guard | **integration only** | Only meaningful once changes are composed. |
+| Build verification | **integration only** | One toolchain check, one composed build. |
+| Per-file repair + a subsystem-subset run | **agents** | Seconds to minutes, and the only part that is actually parallel. |
+
+An agent's guard is now `--files <its own worklist>` plus its subsystem filter —
+nothing wider. It is explicitly **not** asked to prove the absence of
+cross-subsystem regressions, because it cannot do that cheaply and integration
+can.
+
+### Worklists, not subsystems
+
+`make_worklists.py` cuts a run into small **disjoint** lists, round-robin across
+subsystems so concurrent agents edit different areas, each file carrying its
+extracted signature and confidence. A file whose signature is MANIFESTATION or
+UNSPLIT is included but flagged — a quarter of the corpus is in that state, and
+hiding it would only move the surprise.
+
+### Resource discipline at higher parallelism
+
+Ten agents is safe *only* because of what is already in place, and it is worth
+naming so nobody removes it:
+
+- `build_lock.sh` defaults to **one build slot**. Builds queue; they never storm.
+  A previous link storm drove this machine to load 41 and exhausted swap.
+- Corpus runs use `--jobs 3` at this parallelism, not 5. Ten agents × 3 ≈ 30
+  concurrent processes against 32 cores.
+- Every test goes through `safe-test.sh` / `bounded_run.py`, which bound memory
+  and kill hangs. A bare corpus file can fork-storm the machine.
+
+The failure mode to watch is not CPU, it is **swap**: it has been driven to 100%
+once in this session and stayed there. Load is recoverable; a machine in swap
+death is not.
