@@ -1700,7 +1700,8 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   // unref/ref follow node semantics: only ref'd timers keep the process alive
   // (__mbun_timers_refd feeds the pumps' exit conditions); unref'd timers still
   // fire while the loop runs for other reasons.
-  const T = (G.__mbunTimers = G.__mbunTimers || { q: [], id: 1, now: 0, fired: 0 });
+  const T = (G.__mbunTimers = G.__mbunTimers || { q: [], id: 1, now: 0, fired: 0, batch: 0 });
+  if (T.batch === undefined) T.batch = 0;
   // node returns a Timeout object (coerces to the numeric id for clear*) with
   // ref/unref/hasRef/refresh/close; many tests call setInterval(...).unref().
   const findT = (id) => T.q.find((x) => x.id === id);
@@ -1715,7 +1716,18 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   G.setInterval = function (fn, delay) { const a = Array.prototype.slice.call(arguments, 2); const id = T.id++; const d = +delay || 1; T.q.push({ id: id, fn: fn, at: Date.now() + d, d: d, a: a, iv: d, refd: true }); return mkTimer(id); };
   G.clearTimeout = function (t) { const id = timerId(t); for (let i = 0; i < T.q.length; i++) if (T.q[i].id === id) { T.q.splice(i, 1); return; } };
   G.clearInterval = G.clearTimeout;
-  G.setImmediate = function (fn) { const a = Array.prototype.slice.call(arguments, 1); const id = T.id++; T.q.push({ id: id, fn: fn, at: 0, d: 0, a: a, iv: 0, refd: true }); return mkTimer(id); };
+  // `imm` marks an Immediate; `b` stamps the drain batch it was queued in, so a
+  // setImmediate scheduled FROM an immediate callback waits for the next batch
+  // (node: the check phase runs the immediates present when the phase began,
+  // newly queued ones go to the next loop iteration). Without that stamp a
+  // self-reposting .on('message')/postMessage pair re-queued into the batch it
+  // was running in and starved every timer forever
+  // (test-worker-message-port-infinite-message-loop), and a chained setImmediate
+  // walked all its links inside ONE drain call, so the microtask checkpoint the
+  // pump performs between calls never landed in the middle of the chain
+  // (test-worker-message-port-transfer-self: a port closed from a message
+  // handler stayed "active" for all 10 ticks of common/tick.js).
+  G.setImmediate = function (fn) { const a = Array.prototype.slice.call(arguments, 1); const id = T.id++; T.q.push({ id: id, fn: fn, at: 0, d: 0, a: a, iv: 0, refd: true, imm: true, b: T.batch }); return mkTimer(id); };
   G.clearImmediate = G.clearTimeout;
   // Fire up to `budget` DUE timers (earliest deadline first); returns the count
   // of timers still due right now (0 → the pump may sleep). Intervals
@@ -1723,9 +1735,24 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   // budget plus a global fired cap bound runaway tight intervals.
   G.__mbun_drain_timers = function (budget) {
     let fired = 0; budget = budget || 100;
+    const b = ++T.batch;
+    // node checks uv__loop_alive() BEFORE each loop iteration, so once nothing
+    // ref'd is left the iteration never happens and an unref'd Immediate simply
+    // never runs (test-worker-message-port-transfer-closed relies on exactly
+    // that to prove the channel is gone). Real-deadline timers are untouched:
+    // only the always-due `at: 0` Immediates could otherwise keep firing for
+    // free while the pump counts out its idle grace rounds.
+    let alive = 1;
+    try { alive = G.__mbun_loop_alive ? G.__mbun_loop_alive() : 1; } catch (e) { alive = 1; }
     while (T.q.length && fired < budget && T.fired < 200000) {
       const now = Date.now();
-      let mi = -1; for (let i = 0; i < T.q.length; i++) if (T.q[i].at <= now && (mi === -1 || T.q[i].at < T.q[mi].at)) mi = i;
+      let mi = -1;
+      for (let i = 0; i < T.q.length; i++) {
+        const it = T.q[i];
+        if (it.at > now) continue;
+        if (it.imm && (it.b >= b || (!it.refd && !alive))) continue;
+        if (mi === -1 || it.at < T.q[mi].at) mi = i;
+      }
       if (mi === -1) break;  // nothing due yet — real time gates firing
       const t = T.q[mi]; T.now = now;
       if (t.iv > 0) t.at = now + t.iv; else T.q.splice(mi, 1);
@@ -1796,7 +1823,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     const cap = shortTick || LONG_PARK;
     return d > cap ? cap : d;
   };
-  G.__mbun_timers_reset = function () { T.q = []; T.now = 0; T.fired = 0; };
+  G.__mbun_timers_reset = function () { T.q = []; T.now = 0; T.fired = 0; T.batch = 0; };
 
   // ---- Headers (WHATWG, case-insensitive multi-map) ----
   if (typeof G.Headers === "undefined") {
