@@ -31,15 +31,15 @@
       "binary": "r9/integration (round 9 + round 10, assert.throws fixed, permission model)",
       "files": 4433,
       "categories": {
-        "fail": 1673,
+        "fail": 1633,
         "oom-kill": 3,
-        "pass": 2081,
+        "pass": 2120,
         "skipped": 546,
-        "timeout": 130
+        "timeout": 131
       },
       "rates": {
-        "strict_pass": 0.469,
-        "excluding_self_skips": 0.535
+        "strict_pass": 0.478,
+        "excluding_self_skips": 0.545
       },
       "baseline_for_comparison": {
         "binary": "round-8 HEAD (23217dd), measured with the SAME corrected runner",
