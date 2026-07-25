@@ -100,7 +100,9 @@
    "file_count": 10,
    "signature": "Server{listening} + zero sockets; server.close() sits in a client callback that never fired",
    "note": "NOT an event-loop bug. The client flow died; node would also hold the loop here. Fix the client-side flow, not the loop.",
-   "action": "one mechanism, highest file count in http"
+   "action": "one mechanism, highest file count in http",
+   "RESIZED": "Shape A is 10 files by DUMP SIGNATURE but only 5 by cause, and 5 of those 5 are now fixed (w3/agent-2). The other 5 share the signature, not the mechanism: 2 need --expose-gc/FinalizationRegistry (test-http-client-leaky-with-double-response, test-http-server-keepalive-req-gc), 2 are the destroySoon bug, 1 is cluster-layer. Budget a dump signature at its CAUSE count, never at its signature count.",
+   "status": "5 of 5 converted by w3/agent-2"
   },
   "http-timeout-shape-B-stalled-exchange": {
    "corpus": "node",
@@ -116,14 +118,6 @@
    "file_count": 3,
    "signature": "server closed, sockets still held",
    "action": "one mechanism"
-  },
-  "http-timeout-shape-D-actually-a-native-crash": {
-   "corpus": "node",
-   "subsystem": "http",
-   "file_count": 2,
-   "signature": "no hang dump at all; native WTFCrashWithInfo",
-   "note": "MISFILED as timeout -- these are crashes. Any 'sweep the hangs' brief that includes them is budgeting the wrong work.",
-   "action": "reclassify then treat as crashes"
   },
   "tls-pkcs12": {
    "corpus": "node",
@@ -385,6 +379,66 @@
    "cause": "A --permission check placed in the JS shim rather than at the native boundary. Verified on the pre-fix binary: fs.watch('/etc') was correctly DENIED, but the raw globalThis.__mbunWatchNative.start('/etc') returned a watch descriptor. Every test that went through fs.watch therefore made the runtime look correctly gated.",
    "why_it_is_a_class_not_an_incident": "__mbunWatchNative is reachable on globalThis, so the shim is not a boundary. Any other __mbun*Native global whose check lives only in its JS wrapper has the same hole. AUDIT ACTION: enumerate every __mbun*Native global and probe each raw method under --permission, not through its public wrapper.",
    "action": "standing audit item; the fs.watch instance is fixed and independently re-verified"
+  },
+  "http-timeout-shape-D-DELETED-DID-NOT-EXIST": {
+   "corpus": "node",
+   "subsystem": "http",
+   "file_count": 0,
+   "cause": "DELETED. This entry claimed 2 http files died in native WTFCrashWithInfo. Measured: all 49 remaining test-http* timeouts exit 124 (the harness timeout kill) and NOT ONE of their logs contains WTFCrash/SIGSEGV/SIGABRT/Segmentation text. The reasoning that settles it: a crashing process exits on a signal, so it never reaches the timeout kill at all -- a crash and a 124 are mutually exclusive classifications.",
+   "how_the_error_got_in": "A wave-2 agent reported 'no dump / native WTFCrashWithInfo (2)' and I recorded it as a cause without checking. 'hang_dump produced no dump' is not evidence of a crash; for http it turned out one of the two was hang_dump's own limitation (see below). This is the manifestation-as-cause error again, propagated by me from an agent report -- the same way the fs-watch entry went wrong.",
+   "action": "none -- do not budget"
+  },
+  "http-destroySoon-is-immediate-destroy": {
+   "corpus": "node",
+   "subsystem": "http",
+   "file_count": 2,
+   "files": [
+    "test-http-keep-alive-drop-requests",
+    "test-https-keep-alive-drop-requests"
+   ],
+   "cause": "Socket.destroySoon() is implemented as an immediate destroy(). Response 1 carries maxRequestsOnConnectionReached -> res._last -> destroySoon(), which closes the fd synchronously inside onHead, so the pipelined request 2 is never dispatched and dropRequest never fires. node's destroySoon is end() followed by destroy on 'finish'.",
+   "confidence": "CAUSE named",
+   "action": "2 files, one fix"
+  },
+  "http-client-connect-ignores-options-signal": {
+   "corpus": "node",
+   "subsystem": "http",
+   "file_count": 2,
+   "files": [
+    "test-http-agent-abort-controller",
+    "test-https-agent-abort-controller"
+   ],
+   "cause": "options.signal is honoured only by Server.listen (js_net.cppm:849); Socket.prototype.connect has no equivalent, so an aborted signal never produces the AbortError on the socket.",
+   "caveat": "The test asserts listenerCount(signal,'abort') === 1 SYNCHRONOUSLY, which node's own nextTick registration appears not to satisfy -- verify against real node before budgeting.",
+   "confidence": "CAUSE named",
+   "action": "2 files"
+  },
+  "http-server-socket-error-listener-is-a-noop": {
+   "corpus": "node",
+   "subsystem": "http",
+   "files": [
+    "test-http-header-badrequest",
+    "test-http-socket-error-listeners"
+   ],
+   "cause": "The server connection's 'error' listener is a noop (js_net.cppm:3068) instead of node's socketOnError, so a user's res.socket.emit('error', ...) is swallowed and the response is never torn down. Related: the parser is not re-armed after a clientError the server claimed, so only the first invalid byte errors where one test needs 21.",
+   "confidence": "CAUSE named",
+   "action": "Cheap but WIDE: routing all server-socket errors through socketOnError makes every ECONNRESET emit 'clientError', which is what node does. Guard broadly."
+  },
+  "http-misc-named": {
+   "corpus": "node",
+   "subsystem": "http",
+   "files_with_causes": {
+    "test-http-no-read-no-dump": "socket 'pause'/'resume' events are not emitted for read-flow backpressure; _paused exists but is not observable",
+    "test-http-outgoing-message-capture-rejection": "ServerResponse does not honour events.captureRejections -- no Symbol.for('nodejs.rejection') handler",
+    "test-http-upgrade-server-with-body-error.mjs": "UpgradeStream not implemented; node emits 'upgrade' before a pending body arrives and wraps the socket to withhold tunnel bytes (documented in the handover() comment)",
+    "test-http-client-leaky-with-double-response": "needs --expose-gc / real globalThis.gc({type:'major'}) + onGC finalization",
+    "test-http-server-keepalive-req-gc": "same GC requirement",
+    "test-http-server-drop-connections-in-cluster": "cluster worker never reaches its mustCall -- cluster layer, not http",
+    "test-http-incoming-pipelined-socket-destroy": "still shape A after the fix: needs res.destroy()/req.socket.destroy() mid-pipeline to fire requestDone for all 13 seeds",
+    "test-http-pipeline-flood": "needs read-flood prevention (socket._paused suppressing further 'data' once the write buffer fills). NOT a crash."
+   },
+   "confidence": "CAUSE named per file",
+   "action": "batch; each is 1 file"
   }
  },
  "coverage_note": "tls timeouts are now triaged: 19 files -> 3 shapes (B:12, A:5, D:2), collapsed by running tools/integration/hang_dump.js over every one. This is the same collapse the http block underwent, and it reproduces the same headline: none of the 19 is an event-loop bug. Cost ~5 minutes total, which is the argument for triaging centrally rather than making each agent pay for it."

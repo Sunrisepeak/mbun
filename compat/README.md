@@ -579,3 +579,47 @@ corrected leads, and a reproducer for a bug that had been parked for want of
 one. That is a **diagnosis round**, and diagnosis rounds are worth running —
 they are just not worth *scoring* against a conversion target. Label the round
 for what it is before dispatch, or its output looks like failure.
+
+### Never use a live integration worktree as an agent's baseline
+
+A wave-3 agent's first guard read −2 with three `pass → fail`. All three were
+artefacts, and the cause was mine. Agents were dispatched with base `e2bd37d`,
+but they took their *baseline binary* from the integration worktree — and I kept
+committing and rebuilding there while they worked. By the time the agent measured,
+that binary contained two of my later commits, so its own correctly-built binary
+looked like a regression against it. The three files map exactly onto those two
+commits: two on the tls verify-code fix, one on `testEnabled is not a function`
+from the debuglog fix.
+
+The agent diagnosed it as build-environment drift (fresh prebuilts pulled between
+two builds of the same commit). That is not what happened, and recording it would
+have sent the next round chasing something that does not exist. **Same commit was
+never the question — the integration worktree's binary is a moving target by
+construction.**
+
+Its remedy was still exactly right, and is now the rule:
+
+1. **Snapshot the base binary at dispatch** (`cp` it to a stable path) and hand
+   agents *that path*. A rebuild in the integration tree then cannot disturb
+   anyone's baseline. The same trick is what lets a multi-hour corpus run survive
+   integration work continuing around it.
+2. **An agent that suspects its baseline should rebuild its own control from its
+   own base commit in its own worktree** — which is what caught this — and diff
+   against that, not against a borrowed binary.
+
+The general form: a baseline is a *measurement*, not a file path. If you cannot
+say which source state produced a binary, it is not a baseline, and "it's the same
+commit" does not establish that when someone else is still building in that tree.
+
+### A dump signature is not a cause count
+
+Shape A of the http hangs was catalogued as 10 files sharing one signature
+(`Server{listening}` + zero sockets). Fixing the mechanism converted 5. The other
+5 share the *signature* and nothing else: two need `--expose-gc` and a real
+`FinalizationRegistry`, two are a `destroySoon()` that destroys immediately
+instead of `end()`-then-destroy-on-`'finish'`, one is a cluster-layer failure.
+
+So a dump signature groups files by *what the loop looks like when they stop*,
+which is downstream of the cause — the same trap as grouping by log text, in a
+more convincing disguise. Budget a signature at its cause count, and if you do not
+yet know that count, say the signature is unsplit rather than quoting its size.

@@ -569,6 +569,32 @@
       "test-fs-watchfile-bigint is not '4 Date properties node's zero-row omits'. mbun loads node's REAL internal/fs/utils, so deepStrictEqual fails on PROTOTYPE IDENTITY before comparing any key. Reaching it means having mbun's stats constructed by node's own Stats/BigIntStats -- architectural, adjacent to fs-not-routed-through-internalBinding. The agent deliberately left the date fields alone because the native stat row sets them as own props, so changing only the constructor would desynchronise statSync from new Stats() and risk currently-green test-fs-stat-* files.",
       "realpath-js-resolver is 2 files, not 3. test-fs-realpath-native requires cwd == the node checkout root; the corpus runner uses cwd=repo root. Pre-change it 'passed' that path silently because weakly_canonical invents non-existent tails; it now honestly throws ENOENT. This is a HARNESS cause, not an fs one, and fixing it means changing the shared runner's cwd -- which would move numbers for every agent mid-wave."
      ]
+    },
+    {
+     "id": "w3/agent-2",
+     "cluster": "http timeout shapes A and C (wave 3, inventory-driven)",
+     "worklist_files": 13,
+     "target_delta_pass": 6,
+     "actual_delta_pass": 9,
+     "hit_rate": 1.5,
+     "wall_clock_min": 77,
+     "note": "Second inventory-driven task, second overshoot: 150% of target, 0 regressions. pass 514->523, timeout 49->41 across 734 test-http*/test-https* files. Two mechanisms, both real reactor/protocol bugs: (1) node's socketOnClose -> abortIncoming/abortOutgoing was entirely absent, so req 'aborted'/'close'/signal never fired and the client callback holding server.close() never ran; needed node's per-connection state.incoming LIST because a pipeline has several live at once. (2) the reactor held the loop for every OPEN socket where libuv holds it for every ACTIVE one, so an allowHalfOpen socket that had seen EOF pinned the process forever.",
+     "traps_it_recorded": [
+      "The abort must share freeParser's existing one-turn deferral. Eager abort gained 5 and cost 3 (all on a req.on('end') that stopped firing) -- exactly what the freeParser comment already warned about. Net was +2 until deferred.",
+      "socketOnError ended in a bare destroy() under a comment asserting node hides the error from socket listeners. The comment's PREMISE was wrong: node ends with this.destroy(e), and that argument is what emits the socket 'error'; node hides it only from a server with no listener, via its own noop. Fixing it also flipped test-http-header-overflow."
+     ],
+     "my_process_error_it_exposed": {
+      "symptom": "its first guard read -2 with three pass->fail",
+      "agent_diagnosis": "build-environment drift -- fresh prebuilts pulled between two builds of the same commit",
+      "actual_cause": "MINE. Agents were dispatched at base e2bd37d but took their BASELINE BINARY from the integration worktree, and I kept committing and rebuilding there while they worked. By measurement time that binary carried 6acbb34 (tls verify) and 8009cfc (debuglog). The three files map exactly onto those two commits: test-tls-friendly-error-message and test-tls-socket-default-options on the verify code, test-repl-history-init-fail-leak on 'testEnabled is not a function'. Verified by commit ancestry: neither commit is in e2bd37d.",
+      "why_the_distinction_matters": "Recording 'prebuilts drift within a session' would have sent the next round chasing something that does not exist. The integration worktree's binary is a moving target BY CONSTRUCTION; same-commit was never the question.",
+      "fix_now_policy": "Snapshot the base binary at dispatch (cp to a stable path) and hand agents that path. Same trick already in use to let a multi-hour corpus run survive integration work. Recorded in compat/README.md.",
+      "credit": "The agent's remedy was right even though its diagnosis was not: it rebuilt its own control from its own base in its own worktree, which is what caught this at all."
+     },
+     "leads_i_got_wrong": [
+      "http-timeout-shape-D DID NOT EXIST. I recorded 2 files as dying in native WTFCrashWithInfo, inherited from a wave-2 agent report. Measured independently: all 49 remaining test-http* timeouts exit 124 and not one log contains WTFCrash/SIGSEGV/SIGABRT/Segmentation text. A crashing process exits on a signal and never reaches the timeout kill, so crash and 124 are mutually exclusive. One of the two 'no dump' cases was hang_dump.js's own limitation: it REQUIREs its target, so a process.argv[2]-dispatched re-exec test throws instead of running. Entry deleted; the limitation is now documented in the tool.",
+      "Shape A is 10 files by DUMP SIGNATURE but 5 by cause. The other 5 share the signature and nothing else (2 need --expose-gc/FinalizationRegistry, 2 are destroySoon, 1 is cluster). A dump signature groups files by what the loop looks like when they stop, which is downstream of the cause -- the log-text trap in a better disguise."
+     ]
     }
    ],
    "verdicts": {
