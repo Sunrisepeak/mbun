@@ -1378,19 +1378,31 @@ export constexpr std::string_view kHttp2JS = R"JS(
       if (this._scheme === "https") {
         this.encrypted = true;
         if (!tls || !tls.connect) { this._fatal(mkErr("http2 https requires node:tls", "ERR_HTTP2_ERROR")); return; }
-        const sock = tls.connect({
-          // node internal/http2/core.js connect():
-          //   tls.connect(port, host, initializeTLSOptions(options,
-          //               net.isIP(host) ? undefined : host))
-          // — an IP authority must NOT become the SNI ServerName (tls.connect
-          // rejects that with ERR_INVALID_ARG_VALUE), so only a real hostname is
-          // promoted to servername.
+        // node internal/http2/core.js connect():
+        //   tls.connect(port, host, initializeTLSOptions(options,
+        //               net.isIP(host) ? undefined : host))
+        // initializeTLSOptions hands tls.connect the CALLER'S WHOLE options
+        // object with ALPNProtocols/servername overwritten — it does not
+        // hand-pick ca/cert/key. Picking them by name silently dropped
+        // `secureContext`, `pfx`, `passphrase`, `ciphers`, `checkServerIdentity`
+        // and the rest: three corpus files pass their trust anchor only as
+        // `{ secureContext: tls.createSecureContext({ ca }) }` and so failed
+        // with "unable to verify the first certificate".
+        // — an IP authority must NOT become the SNI ServerName (tls.connect
+        // rejects that with ERR_INVALID_ARG_VALUE), so only a real hostname is
+        // promoted to servername.
+        const tlsOpts = Object.assign({}, options, {
           host, port,
           servername: options && options.servername ? options.servername
             : (net && typeof net.isIP === "function" && net.isIP(host) ? undefined : host),
-          ALPNProtocols: ["h2"], ca: options && options.ca, cert: options && options.cert,
-          key: options && options.key, rejectUnauthorized: options && options.rejectUnauthorized !== undefined ? options.rejectUnauthorized : true,
         });
+        // node initializeTLSOptions: the h2 ALPN list is only imposed when the
+        // caller did NOT supply an ALPNCallback (the two are mutually exclusive
+        // in tls.connect), and allowHTTP1 appends the fallback protocol.
+        if (!tlsOpts.ALPNCallback) {
+          tlsOpts.ALPNProtocols = options && options.allowHTTP1 === true ? ["h2", "http/1.1"] : ["h2"];
+        }
+        const sock = tls.connect(tlsOpts);
         this.socket = sock;
         sock.on("secureConnect", () => { self.alpnProtocol = sock.alpnProtocol || "h2"; self._onSocketReady(); });
         sock.on("data", (d) => self._onData(d));
@@ -1398,14 +1410,22 @@ export constexpr std::string_view kHttp2JS = R"JS(
         sock.on("close", () => self._onSocketClose());
         sock.on("end", () => self._onSocketEnd());
       } else {
-        const sock = new net.Socket();
+        // node internal/http2/core.js connect(): `net.connect({ port, host,
+        // ...options })`, where `port` is the STRING form of the authority port
+        // (`'' + (authority.port !== '' ? authority.port : 80)`). Building the
+        // socket by hand bypassed a `net.connect` the caller had replaced, and
+        // handed the port as a number — test-http2-client-port-80 asserts on
+        // both. Going through net.connect also lets localAddress/family/lookup
+        // reach the transport the way node's spread does.
+        const netOpts = Object.assign({ port: String(port), host }, options);
+        const sock = typeof net.connect === "function" ? net.connect(netOpts) : new net.Socket();
         this.socket = sock;
         sock.on("connect", () => { self.alpnProtocol = "h2c"; self._onSocketReady(); });
         sock.on("data", (d) => self._onData(d));
         sock.on("error", (e) => self._onSocketError(e));
         sock.on("close", () => self._onSocketClose());
         sock.on("end", () => self._onSocketEnd());
-        sock.connect(port, host);
+        if (typeof net.connect !== "function") sock.connect(port, host);
       }
     }
 
@@ -1522,6 +1542,18 @@ export constexpr std::string_view kHttp2JS = R"JS(
       // with an already-finished writable side.
       if (endStream) { stream._endStreamSent = true; stream.end(); }
       stream.pending = false;
+      // node Http2Stream[kInit] emits 'ready' the moment the stream is bound to
+      // an id/handle. For a session that is still connecting node runs kInit
+      // from requestOnConnect, i.e. AFTER request() returned and the caller
+      // attached its listener — mbun assigns the id inside request(), so the
+      // event has to be raised on the connect edge (or a microtask later for an
+      // already-connected session) or nobody can ever observe it.
+      {
+        const readyStream = stream;
+        const emitReady = () => { if (!readyStream.destroyed) readyStream.emit("ready"); };
+        if (this._connected) G.queueMicrotask(emitReady);
+        else this.once("connect", emitReady);
+      }
       // node ClientHttp2Session#request: 'created' is published with the
       // prepared header object (`sentHeaders`), 'start' once the HEADERS frame
       // has actually been submitted.
@@ -3756,7 +3788,27 @@ export constexpr std::string_view kHttp2JS = R"JS(
       if (cb !== undefined) { if (typeof cb !== "function") throw argTypeErr("callback", "of type function", cb); this.on("timeout", cb); }
       return this;
     };
-    server.updateSettings = function () { return this; };
+    // node Http2Server/Http2SecureServer keep their normalised construction
+    // options under a Symbol('options'); `settings` starts as a copy of
+    // options.settings and updateSettings() merges into it. The corpus reaches
+    // for that symbol by name (test-http2-update-settings), so it has to exist
+    // and it has to be the thing updateSettings writes to.
+    const kServerOptions = Symbol("options");
+    server[kServerOptions] = Object.assign({}, options, {
+      settings: Object.assign({}, options && options.settings),
+    });
+    server.updateSettings = function (settings) {
+      if (settings === undefined || settings === null || typeof settings !== "object" || Array.isArray(settings)) {
+        const e = new TypeError('The "settings" argument must be of type object. Received ' +
+          (settings === null ? "null" : Array.isArray(settings) ? "an instance of Array"
+            : typeof settings === "string" ? "type string ('" + settings + "')"
+            : "type " + typeof settings + " (" + String(settings) + ")"));
+        e.code = "ERR_INVALID_ARG_TYPE";
+        throw e;
+      }
+      validateSettings(settings);
+      this[kServerOptions].settings = Object.assign({}, this[kServerOptions].settings, settings);
+    };
     return server;
   }
   // node Http2Server/Http2SecureServer constructor -> initializeOptions:
@@ -3809,8 +3861,15 @@ export constexpr std::string_view kHttp2JS = R"JS(
     // function in the first position is an invalid `options`, not the handler.
     validateServerOptions(options);
     if (!tls || !tls.createServer) throw mkErr("http2 createSecureServer requires node:tls", "ERR_HTTP2_ERROR");
+    // node Http2SecureServer only imposes the h2 ALPN list when the caller did
+    // NOT bring an ALPNCallback — tls rejects the two together, so forcing the
+    // list turned a legal `{ ALPNCallback }` server into
+    // ERR_TLS_ALPN_CALLBACK_WITH_PROTOCOLS (test-http2-alpn). When the caller
+    // DID pass both, the rejection is correct and tls.createServer raises it.
     const alpn = (options && options.allowHTTP1) ? ["h2", "http/1.1"] : ["h2"];
-    const server = tls.createServer(Object.assign({}, options, { ALPNProtocols: (options && options.ALPNProtocols) || alpn }));
+    const tlsSrvOpts = Object.assign({}, options);
+    if (!(options && options.ALPNCallback)) tlsSrvOpts.ALPNProtocols = (options && options.ALPNProtocols) || alpn;
+    const server = tls.createServer(tlsSrvOpts);
     return attachH2Server(server, options, onRequest, true);
   }
 
