@@ -1263,6 +1263,9 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   }
   // Lazily created by util.aborted(); one registry serves every call.
   let utilAbortedRegistry = null;
+  // node internal/util.js `codesWarned`: a deprecation code warns once per
+  // process, no matter how many wrappers were created with it.
+  const deprecationCodesWarned = new Set();
   const util = {
     inspect(o, opts) {
       // util.inspect.defaultOptions overrides only when something has actually
@@ -1368,28 +1371,38 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     // node internal/util.js deprecate: the wrapper emits the deprecation warning
     // once (unless process.noDeprecation), keeps `fn`'s prototype chain and
     // `length`, and validates `code` as a string.
-    deprecate(fn, msg, code) {
+    deprecate(fn, msg, code, options) {
       if (code !== undefined && typeof code !== "string") throw nodeArgTypeError("code", "string", code);
+      // node lib/util.js: `deprecate(fn, msg, code, { modifyPrototype })`.
+      const modifyPrototype = !(options != null && typeof options === "object" && options.modifyPrototype === false);
       let warned = false;
       function deprecated(...args) {
         if (!(G.process && G.process.noDeprecation)) {
           if (!warned) {
             warned = true;
             if (G.process && typeof G.process.emitWarning === "function") {
-              if (code !== undefined) G.process.emitWarning(msg, "DeprecationWarning", code, deprecated);
-              else G.process.emitWarning(msg, "DeprecationWarning", deprecated);
+              // node internal/util.js getDeprecationWarningEmitter dedupes on
+              // `code` PROCESS-WIDE, so two wrappers sharing one code warn once.
+              if (code !== undefined) {
+                if (!deprecationCodesWarned.has(code)) {
+                  deprecationCodesWarned.add(code);
+                  G.process.emitWarning(msg, "DeprecationWarning", code, deprecated);
+                }
+              } else G.process.emitWarning(msg, "DeprecationWarning", deprecated);
             }
           }
         }
         if (new.target) return Reflect.construct(fn, args, new.target);
         return Reflect.apply(fn, this, args);
       }
-      try {
-        Object.setPrototypeOf(deprecated, fn);
-        if (fn.prototype) deprecated.prototype = fn.prototype;
-        const d = Object.getOwnPropertyDescriptor(fn, "length");
-        if (d) Object.defineProperty(deprecated, "length", d);
-      } catch (e) {}
+      if (modifyPrototype) {
+        try {
+          Object.setPrototypeOf(deprecated, fn);
+          if (fn.prototype) deprecated.prototype = fn.prototype;
+          const d = Object.getOwnPropertyDescriptor(fn, "length");
+          if (d) Object.defineProperty(deprecated, "length", d);
+        } catch (e) {}
+      }
       return deprecated;
     },
     // node internal/util.js convertProcessSignalToExitCode: POSIX 128 + signo.
@@ -2510,6 +2523,10 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       [Symbol.for("nodejs.util.inspect.custom")]() { return inspectURLSearchParams(this, false); }
     };
     Object.defineProperty(G.URLSearchParams.prototype, "size", { get: Object.getOwnPropertyDescriptor(G.URLSearchParams.prototype, "size").get, enumerable: true, configurable: true });
+    // Web IDL interfaces carry a non-enumerable, non-writable, configurable
+    // Symbol.toStringTag data property, so Object.prototype.toString.call(sp)
+    // reports "[object URLSearchParams]" (test-whatwg-url-custom-tostringtag).
+    Object.defineProperty(G.URLSearchParams.prototype, Symbol.toStringTag, { value: "URLSearchParams", writable: false, enumerable: false, configurable: true });
   }
   if (typeof G.URL === "undefined" || typeof new G.URL("http://x/").hostname === "undefined") {
     // ref: bun src/jsc/bindings/{DOMURL,URLDecomposition}.cpp and the
@@ -3357,6 +3374,10 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   };
   const urlMod = {
     URL: G.URL, URLSearchParams: G.URLSearchParams, Url,
+    // node lib/url.js re-exports URLPattern. It is installed by the
+    // web_urlpattern partition, which runs long after bootstrap, so read it
+    // lazily off the global instead of snapshotting `undefined` here.
+    get URLPattern() { return G.URLPattern; },
     // faithful port of node lib/internal/url.js fileURLToPath / getPathFromURL{Win32,Posix}
     fileURLToPath: (path, options) => {
       const windows = options == null ? undefined : options.windows;
