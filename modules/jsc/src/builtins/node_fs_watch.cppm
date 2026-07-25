@@ -172,16 +172,26 @@ inline constexpr std::string_view kNodeFsWatchJS = R"JS(
       let events;
       try { events = WN.poll(this._handle); }
       catch (e) { this._closed = true; this._release(); this.emit("error", e); return 0; }
+      let delivered = 0;
       for (const ev of events) {
+        // A listener may close() (or the watcher may be aborted) while we are
+        // still walking a batch inotify handed us in one read. node cannot
+        // deliver those: closing frees the uv handle, so every event still
+        // queued behind the current one is dropped. Draining the rest here
+        // instead surfaced as wrong *values* — test-fs-watch-recursive-add-file
+        // asserts the first event for a created file is "rename", closes, and
+        // then saw the trailing "change" from the same batch.
+        if (this._closed) break;
         // node: `if (filename != null && ignoreMatcher?.(filename)) return;`
         // (watchers.js onchange / recursive_watch.js #watchFolder). ev.name is
         // already relative to the watch root for a recursive watch and the bare
         // basename otherwise — exactly what node hands the matcher — so it is
         // matched as a string, before the encoding:"buffer" conversion.
         if (this._ignoreMatcher && ev.name && this._ignoreMatcher(ev.name)) continue;
+        delivered += 1;
         this.emit("change", ev.kind, decodeName(ev.name, this._enc));
       }
-      return events.length;
+      return delivered;
     }
 
     _release() {

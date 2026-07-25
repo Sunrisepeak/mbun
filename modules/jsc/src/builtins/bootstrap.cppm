@@ -4534,8 +4534,27 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   // and node's own key-by-key Stats/BigIntStats comparison reports
   // "_isFile is not a safe integer" (test-fs-stat-bigint). Keep them readable,
   // hide them from enumeration.
+  // Same story for the isX() methods the native row carries as OWN properties
+  // and for the *Ns fields: node's non-bigint Stats has neither in
+  // Object.keys() (the predicates live on Stats.prototype and the nanosecond
+  // fields only exist on BigIntStats), and test-fs-stat-bigint walks
+  // Object.keys(numStats) key-by-key against the BigInt twin — a function-valued
+  // key lands in its numeric branch ("isFile is not a safe integer").
+  // Non-enumerable, not deleted: the bigint builder still reads s.atimeNs and
+  // readdir still reads s._isDir.
+  const fsStatsHiddenKeys = ["_isFile", "_isDir",
+                             "isFile", "isDirectory", "isSymbolicLink", "isBlockDevice",
+                             "isCharacterDevice", "isFIFO", "isSocket",
+                             "atimeNs", "mtimeNs", "ctimeNs", "birthtimeNs"];
+  const fsStatOrNoEntry = (get, o) => {
+    if (o && typeof o === "object" && o.throwIfNoEntry === false) {
+      try { return get(); }
+      catch (e) { if (e && (e.code === "ENOENT" || e.code === "ENOTDIR")) return undefined; throw e; }
+    }
+    return get();
+  };
   const fsAsStats = (s) => {
-    for (const k of ["_isFile", "_isDir"]) {
+    for (const k of fsStatsHiddenKeys) {
       if (Object.prototype.hasOwnProperty.call(s, k) &&
           Object.getOwnPropertyDescriptor(s, k).enumerable)
         Object.defineProperty(s, k, { value: s[k], enumerable: false, writable: true, configurable: true });
@@ -4644,8 +4663,12 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     // native stat builds a plain object; link it to fs.Stats.prototype so
     // `statSync(x) instanceof Stats` holds (node/bun: statSync shares the
     // Stats prototype). Own isFile()/mtimeMs/… still shadow.
-    statSync: (p, o) => { validatePath(p); const s = F.stat(toStr(p)); return (o && o.bigint) ? mkBigIntStats(s) : fsAsStats(s); },
-    lstatSync: (p, o) => { validatePath(p); const s = F.stat(toStr(p), true); return (o && o.bigint) ? mkBigIntStats(s) : fsAsStats(s); },
+    // options.throwIfNoEntry === false: node answers a missing path with
+    // `undefined` instead of throwing ENOENT (lib/fs.js statSync →
+    // handleErrorFromBinding is skipped). Only ENOENT/ENOTDIR are swallowed —
+    // every other errno still throws, as node's binding does.
+    statSync: (p, o) => { validatePath(p); const s = fsStatOrNoEntry(() => F.stat(toStr(p)), o); return s === undefined ? undefined : ((o && o.bigint) ? mkBigIntStats(s) : fsAsStats(s)); },
+    lstatSync: (p, o) => { validatePath(p); const s = fsStatOrNoEntry(() => F.stat(toStr(p), true), o); return s === undefined ? undefined : ((o && o.bigint) ? mkBigIntStats(s) : fsAsStats(s)); },
     fstatSync: (fd, o) => { const s = F.fstat(fd); return (o && o.bigint) ? mkBigIntStats(s) : fsAsStats(s); },
     fstat: (fd, o, cb) => { const fn = cb || o; if (typeof fn === "function") fn(null, fsMod.fstatSync(fd)); },
     statfsSync: () => ({ type: 0, bsize: 4096, blocks: 0, bfree: 0, bavail: 0, files: 0, ffree: 0 }),
@@ -5076,7 +5099,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   fsMod.copyFileSync = (a, b, m) => { validatePath(a, "src"); validatePath(b, "dest"); fsValidCopyMode(m); return F.copyFile(toStr(a), toStr(b)); };
   fsMod.stat = (p, a, b) => { validatePath(p); const cb = fsMakeCallback(typeof a === "function" ? a : b); try { cb(null, fsMod.statSync(p, typeof a === "object" ? a : undefined)); } catch (e) { cb(e); } };
   fsMod.lstat = (p, a, b) => { validatePath(p); const cb = fsMakeCallback(typeof a === "function" ? a : b); try { cb(null, fsMod.lstatSync(p, typeof a === "object" ? a : undefined)); } catch (e) { cb(e); } };
-  fsMod.fstatSync = (fd, o) => { fsValidateFd(fd); const s = F.fstat(fd); return (o && o.bigint) ? mkBigIntStats(s) : Object.setPrototypeOf(s, Stats.prototype); };
+  fsMod.fstatSync = (fd, o) => { fsValidateFd(fd); const s = fsStatOrNoEntry(() => F.fstat(fd), o); return s === undefined ? undefined : ((o && o.bigint) ? mkBigIntStats(s) : fsAsStats(s)); };
   fsMod.fstat = (fd, a, b) => { fsValidateFd(fd); const cb = fsMakeCallback(typeof a === "function" ? a : b); try { cb(null, fsMod.fstatSync(fd, typeof a === "object" ? a : undefined)); } catch (e) { cb(e); } };
   // Path-type validation for the content/dir ops — node validates the path
   // synchronously (before the callback runs), so an invalid path type throws
@@ -5421,8 +5444,29 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   fsMod.readdir = wrapEnc(fsMod.readdir, 1);
   fsMod.readlinkSync = wrapEnc(fsMod.readlinkSync, 1);
   fsMod.realpathSync = wrapEnc(fsMod.realpathSync, 1);
-  fsMod.realpathSync.native = fsMod.realpathSync;
   fsMod.realpath = wrapEnc(fsMod.realpath, 1);
+  // node getOptions(): the resolved path comes back in the *requested* encoding —
+  // 'buffer' yields a Buffer, any other known encoding re-decodes the utf8 bytes
+  // (fs.realpathSync(p, 'ucs2') is a re-interpretation, not a conversion).
+  // ref test-fs-realpath-buffer-encoding, lib/fs.js realpathSync/realpath.
+  const fsEncodePath = (str, o) => {
+    const enc = typeof o === "string" ? o : (o && typeof o === "object" ? o.encoding : undefined);
+    if (enc == null || enc === "utf8" || enc === "utf-8") return str;
+    const buf = G.Buffer.from(String(str), "utf8");
+    return enc === "buffer" ? buf : buf.toString(enc);
+  };
+  const realpathSyncRaw = fsMod.realpathSync;
+  fsMod.realpathSync = (p2, o) => fsEncodePath(realpathSyncRaw(p2, o), o);
+  fsMod.realpathSync.native = fsMod.realpathSync;
+  const realpathRaw = fsMod.realpath;
+  fsMod.realpath = (p2, a, b) => {
+    const hasOpts = typeof a !== "function";
+    const cb = hasOpts ? b : a;
+    fsMakeCallback(cb);
+    return realpathRaw(p2, hasOpts ? a : undefined, (err, res) => {
+      if (err) cb(err); else cb(null, fsEncodePath(res, hasOpts ? a : undefined));
+    });
+  };
   fsMod.realpath.native = fsMod.realpath;
   fsMod.writeFileSync = wrapEnc(fsMod.writeFileSync, 2);
   fsMod.writeFile = wrapEnc(fsMod.writeFile, 2);
@@ -5892,10 +5936,14 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     truncate: P((p, len) => fsMod.truncateSync(p, len)),
     statfs: P((p, o) => fsMod.statfsSync(p, o)),
     readdir: P((p) => F.readdir(toStr(p))),
-    stat: P((p) => F.stat(toStr(p))),
-    lstat: P((p) => F.stat(toStr(p), true)),
+    // Route through statSync/lstatSync, not F.stat: the raw native row has no
+    // Stats prototype and ignores `{ bigint: true }` (fs.promises.stat must
+    // return the same shape as its sync twin — test-fs-stat-bigint compares
+    // both, and the mbun-only own keys must stay non-enumerable).
+    stat: P((p, o) => fsMod.statSync(p, o)),
+    lstat: P((p, o) => fsMod.lstatSync(p, o)),
     unlink: P((p) => F.unlink(toStr(p))),
-    realpath: P((p) => F.realpath(toStr(p))),
+    realpath: P((p, o) => fsMod.realpathSync(p, o)),
     rename: P((a, b) => F.rename(toStr(a), toStr(b))),
     copyFile: P((a, b, m) => { validatePath(a, "src"); validatePath(b, "dest"); fsValidCopyMode(m); return F.copyFile(toStr(a), toStr(b)); }),
     mkdtemp: P((pre) => F.mkdtemp(toStr(pre))),
