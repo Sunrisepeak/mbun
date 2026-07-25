@@ -76,6 +76,19 @@ class Signature:
     confidence: str  # CAUSE | CLASS | MANIFESTATION | UNSPLIT
 
 
+# A timeout has no failure text BY CONSTRUCTION — the process was killed, it did
+# not assert. Filing it as "no recognised failure form" made the unsplit bucket
+# the largest in three subsystems and read as "a quarter of this is unexplained",
+# when those files are in fact already triaged by DUMP SHAPE (hang_dump.js) and
+# recorded in the inventory. Measured on the round-11 run: of 55 files the
+# extractor could not explain across tls/http/http2/fs, 43 were timeouts and only
+# 12 were genuinely unexplained failures.
+def timeout_signature() -> Signature:
+    return Signature("timeout — no failure text to extract",
+                     "triage by dump shape with hang_dump.js, not by log text",
+                     "CLASS")
+
+
 def bun_signature(output: str) -> Signature:
     """Order matters: the most specific, most explanatory form wins."""
     if (m := DESTRUCTURE_RE.search(output)) is not None:
@@ -193,7 +206,8 @@ def main() -> int:
         if not log_path.exists():
             unreadable += 1
             continue
-        sig = sign(log_path.read_text(encoding="utf-8", errors="replace"))
+        sig = (timeout_signature() if _cls in ("timeout", "oom-kill")
+               else sign(log_path.read_text(encoding="utf-8", errors="replace")))
         groups[sig.key].append(path)
         confidence.setdefault(sig.key, sig.confidence)
         details.setdefault(sig.key, sig.detail)
