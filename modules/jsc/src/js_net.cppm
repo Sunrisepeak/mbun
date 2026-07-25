@@ -640,7 +640,10 @@ export constexpr std::string_view kNetJS = R"JS(
                    // tls.connect({ checkServerIdentity }), which node runs in JS
                    // INSTEAD of the default. Default true — omitting the flag must
                    // never be the same as switching the check off.
-                   o.hostCheck === false ? false : true);
+                   o.hostCheck === false ? false : true,
+                   // TLS 1.3 suites (node SetCipherSuites); a separate OpenSSL
+                   // slot from the <=TLS1.2 cipher list above.
+                   o.cipherSuites || "");
         this._tls = 1;
       } catch (e) { this._fail(e); }
       return this;

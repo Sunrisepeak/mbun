@@ -356,13 +356,23 @@ struct TlsChannel::Impl {
         // Cipher list (node SecureContext::SetCiphers → SSL_CTX_set_cipher_list).
         // Applied only when the caller asked for one; an unparsable list is a
         // hard failure so the connection can never silently fall back to a
-        // broader default than was requested. node calls only set_cipher_list —
-        // the TLS 1.3 suites named in DEFAULT_CIPHERS are governed by
-        // SSL_CTX_set_ciphersuites and are deliberately left at their default.
+        // broader default than was requested. The caller's option has already
+        // been split by node's processCiphers rule: `ciphers` holds the <=TLS1.2
+        // entries and `cipherSuites` the TLS_-prefixed TLS 1.3 ones, because
+        // OpenSSL keeps them in two different slots. A TLS 1.3 suite name handed
+        // to set_cipher_list matches nothing and fails the whole context — which
+        // is how every TLS_AES_* cipher option used to become "No cipher match".
         if (!config.ciphers.empty()) {
             if (::SSL_CTX_set_cipher_list(ctx_, config.ciphers.c_str()) != 1) {
                 errorCode_ = "ERR_SSL_NO_CIPHER_MATCH";
                 fail_("set_cipher_list: no cipher match for the requested list");
+                return false;
+            }
+        }
+        if (!config.cipherSuites.empty()) {
+            if (::SSL_CTX_set_ciphersuites(ctx_, config.cipherSuites.c_str()) != 1) {
+                errorCode_ = "ERR_SSL_NO_CIPHER_MATCH";
+                fail_("set_ciphersuites: no TLS 1.3 suite match for the requested list");
                 return false;
             }
         }
@@ -756,6 +766,15 @@ std::string TlsChannel::cipher() const {
     }
     const SSL_CIPHER* c {::SSL_get_current_cipher(impl_->ssl_)};
     const char* name {c != nullptr ? ::SSL_CIPHER_get_name(c) : nullptr};
+    return name != nullptr ? std::string {name} : std::string {};
+}
+
+std::string TlsChannel::cipher_standard_name() const {
+    if (impl_->ssl_ == nullptr) {
+        return {};
+    }
+    const SSL_CIPHER* c {::SSL_get_current_cipher(impl_->ssl_)};
+    const char* name {c != nullptr ? ::SSL_CIPHER_standard_name(c) : nullptr};
     return name != nullptr ? std::string {name} : std::string {};
 }
 

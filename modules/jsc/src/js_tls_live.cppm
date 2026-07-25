@@ -413,6 +413,7 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
           self.authorized = !!info.authorized;
           self._protocol = info.protocol || null;
           self._cipherName = info.cipher || "";
+          self._cipherStandardName = info.cipherStandardName || "";
           // node crypto_tls.cc TLSWrap::GetALPNNegotiatedProto: SSL_get0_alpn_
           // selected yielding a zero-length protocol is reported as `false`,
           // whether or not this side offered ALPN. `null` is only the
@@ -479,6 +480,22 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
           ? (options.requestCert ? (options.rejectUnauthorized !== false ? 1 : 2) : 0)
           : (options.rejectUnauthorized !== false ? 1 : 0);
         const ver = resolveVersions(options);
+        // node processCiphers: TLS 1.3 suites go to SSL_CTX_set_ciphersuites,
+        // everything else to SSL_CTX_set_cipher_list. An empty/absent option
+        // still means "leave the engine's own defaults alone" on both slots.
+        const ciphers = typeof options.ciphers === "string" && options.ciphers
+          ? (T && typeof T.__mbunProcessCiphers === "function"
+              ? T.__mbunProcessCiphers(options.ciphers)
+              : { cipherList: options.ciphers, cipherSuites: "" })
+          : { cipherList: "", cipherSuites: "" };
+        // node configSecureContext: a caller who named ONLY TLS 1.3 suites has no
+        // <=TLS1.2 cipher at all, so the context floor is raised to TLS 1.3
+        // rather than left to fail the handshake with "no shared cipher".
+        if (typeof options.ciphers === "string" && options.ciphers
+            && ciphers.cipherList === "" && ciphers.cipherSuites !== ""
+            && ver.min !== "TLSv1.3" && ver.max !== "TLSv1.2") {
+          ver.min = "TLSv1.3";
+        }
         self._ownCertPem = pemOf(options.cert) || null;
         transport._startTls({
           isServer: !!options.isServer,
@@ -490,9 +507,11 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
           alpn: alpnCsv(options.ALPNProtocols),
           minVersion: ver.min,
           maxVersion: ver.max,
-          // node SecureContext::SetCiphers. Only a caller-supplied list is sent;
-          // "" leaves the engine's default suite selection untouched.
-          ciphers: typeof options.ciphers === "string" ? options.ciphers : "",
+          // node SecureContext::SetCiphers / SetCipherSuites. Only a
+          // caller-supplied list is sent; "" leaves that slot's engine default
+          // untouched.
+          ciphers: ciphers.cipherList,
+          cipherSuites: ciphers.cipherSuites,
           hostCheck: !(typeof options.checkServerIdentity === "function"),
         });
       };
@@ -545,7 +564,7 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
     getCipher() {
       const n = this._cipherName || "";
       if (!n) return {};
-      return { name: n, standardName: n, version: this._protocol || "TLSv1.3" };
+      return { name: n, standardName: this._cipherStandardName || n, version: this._protocol || "TLSv1.3" };
     }
     getProtocol() { return this._secureEstablished ? (this._protocol || "TLSv1.3") : null; }
     getSession() { return undefined; }

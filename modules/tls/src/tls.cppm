@@ -41,6 +41,12 @@ export struct Config {
     // default: silently ignoring a caller's cipher restriction is how a
     // connection ends up weaker than the operator asked for.
     std::string ciphers {};
+    // The TLS 1.3 half of node's `ciphers` option (the TLS_-prefixed entries),
+    // which OpenSSL keeps in a SEPARATE slot reached through
+    // SSL_CTX_set_ciphersuites. Same rule as `ciphers`: empty means "leave the
+    // engine's default suites in place", never "allow everything", and a list
+    // OpenSSL rejects is a hard construction failure.
+    std::string cipherSuites {};
     // Fold the peer-name check into OpenSSL's chain verification
     // (SSL_set1_host). node has no equivalent: it verifies the chain in OpenSSL
     // and the NAME in JS (tls.checkServerIdentity), which a caller may replace.

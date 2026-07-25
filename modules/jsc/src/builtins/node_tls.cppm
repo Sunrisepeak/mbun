@@ -246,6 +246,22 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
     "!SRP:" +
     "!CAMELLIA";
 
+  // ---- processCiphers (lib/internal/tls/secure-context.js) -------------------
+  // OpenSSL keeps the TLS 1.3 suites in a separate slot from the <=TLS 1.2
+  // cipher list, reached through SSL_CTX_set_ciphersuites rather than
+  // SSL_CTX_set_cipher_list. node splits the caller's `ciphers` string on ':'
+  // and routes each entry by its TLS_ prefix. An empty entry is dropped; if
+  // BOTH halves end up empty the option is ERR_INVALID_ARG_VALUE, because a
+  // handshake with no suites at all is impossible.
+  const processCiphers = (ciphers) => {
+    const parts = String(ciphers == null || ciphers === "" ? DEFAULT_CIPHERS : ciphers).split(":");
+    const isSuite = (c) => c.startsWith("TLS_") || c.startsWith("!TLS_");
+    return {
+      cipherList: parts.filter((c) => c.length !== 0 && !isSuite(c)).join(":"),
+      cipherSuites: parts.filter((c) => c.length !== 0 && isSuite(c)).join(":"),
+    };
+  };
+
   // ---- version defaults & valid set ----
   const VALID_TLS_VERSIONS = new Set(["TLSv1", "TLSv1.1", "TLSv1.2", "TLSv1.3"]);
   let DEFAULT_MIN_VERSION = "TLSv1.2";
@@ -307,19 +323,34 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
     validateSecureProtocol(secureProtocol);
     if (ciphers !== undefined && ciphers !== null) {
       validateString(ciphers, "options.ciphers");
+      // node lib/internal/tls/secure-context.js processCiphers: the TLS 1.3
+      // suites live behind a DIFFERENT OpenSSL setter, so the list is split on
+      // ':' and the TLS_-prefixed entries go to setCipherSuites while the rest go
+      // to setCiphers. Handing the whole string to SSL_CTX_set_cipher_list, as
+      // mbun did, made every TLS 1.3 suite name a "No cipher match" error.
+      const split = processCiphers(ciphers);
+      if (split.cipherList === "" && split.cipherSuites === "") {
+        const e = new TypeError("The argument 'options.ciphers' is invalid. Received " + JSON.stringify(ciphers));
+        e.code = "ERR_INVALID_ARG_VALUE";
+        throw e;
+      }
       // node SecureContext::SetCiphers: a list OpenSSL cannot match to any
       // suite is rejected at context-creation time with the OpenSSL error
       // shape (code/library/reason), not silently ignored.
       // node SetCiphers returns early on an empty list (it leaves the context's
       // TLS1.3 suites in place), so "" is legal and must not be rejected.
       const TN = globalThis.__mbunNodeTlsNative;
-      if (ciphers !== "" && TN && typeof TN.checkCipherList === "function" && !TN.checkCipherList(ciphers)) {
+      const noMatch = () => {
         const e = new Error("No cipher match");
         e.code = "ERR_SSL_NO_CIPHER_MATCH";
         e.library = "SSL routines";
         e.reason = "no cipher match";
-        throw e;
-      }
+        return e;
+      };
+      if (split.cipherList !== "" && TN && typeof TN.checkCipherList === "function"
+          && !TN.checkCipherList(split.cipherList)) throw noMatch();
+      if (split.cipherSuites !== "" && TN && typeof TN.checkCipherSuites === "function"
+          && !TN.checkCipherSuites(split.cipherSuites)) throw noMatch();
     }
     if (passphrase !== undefined && passphrase !== null) validateString(passphrase, "options.passphrase");
     if (ecdhCurve !== undefined && ecdhCurve !== null) validateString(ecdhCurve, "options.ecdhCurve");
@@ -873,6 +904,9 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
     getCACertificates,
     setDefaultCACertificates,
     parseCertString,
+    // Internal: js_tls_live needs the same split before it hands the two lists
+    // to the native context. Not part of node's surface.
+    __mbunProcessCiphers: processCiphers,
     SecureContext,
     Server,
     TLSSocket,

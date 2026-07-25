@@ -73,6 +73,11 @@ public:
     // Negotiated parameters (empty until the handshake completes).
     [[nodiscard]] std::string tls_version() const;
     [[nodiscard]] std::string cipher() const;
+    // The IANA/RFC name of the negotiated suite (SSL_CIPHER_standard_name), e.g.
+    // "TLS_RSA_WITH_AES_256_CBC_SHA256" for the OpenSSL name "AES256-SHA256".
+    // node's TLSSocket.getCipher().standardName; it is a DIFFERENT string from
+    // cipher() for every <=TLS1.2 suite, so it cannot be derived from it.
+    [[nodiscard]] std::string cipher_standard_name() const;
     [[nodiscard]] std::string peer_server_name() const; // server side: SNI seen
     // The peer's leaf certificate as PEM (client side: the server cert; server
     // side: the client cert when one was requested+sent). Empty when there is no

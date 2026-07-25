@@ -590,6 +590,12 @@ JSValueRef netn_tls_wrap_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
     if (argc > 11 && JSValueIsBoolean(ctx, args[11])) {
         cfg.hostCheck = JSValueToBoolean(ctx, args[11]);
     }
+    // arg 12: the TLS 1.3 half of node's `ciphers` option. OpenSSL keeps the 1.3
+    // suites behind SSL_CTX_set_ciphersuites, a different slot from the cipher
+    // list in arg 10, and node splits the caller's string across the two
+    // (lib/internal/tls/secure-context.js processCiphers). Empty leaves the
+    // engine's own TLS 1.3 suite selection in place.
+    if (argc > 12) { cfg.cipherSuites = fs_arg(ctx, argc, args, 12); }
     auto st{std::make_unique<NetTlsState>(
         isServer ? mbun::tls::TlsRole::server : mbun::tls::TlsRole::client, std::move(cfg))};
     if (!st->channel.valid()) {
@@ -752,6 +758,10 @@ JSValueRef netn_tls_info_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
     set_prop(ctx, r, "established", JSValueMakeBoolean(ctx, est));
     set_prop(ctx, r, "protocol", make_string(ctx, est ? st.channel.tls_version() : std::string{}));
     set_prop(ctx, r, "cipher", make_string(ctx, est ? st.channel.cipher() : std::string{}));
+    // getCipher().standardName — the IANA name, which is not derivable from the
+    // OpenSSL name ("AES256-SHA256" -> "TLS_RSA_WITH_AES_256_CBC_SHA256").
+    set_prop(ctx, r, "cipherStandardName",
+             make_string(ctx, est ? st.channel.cipher_standard_name() : std::string{}));
     set_prop(ctx, r, "servername", make_string(ctx, st.channel.peer_server_name()));
     set_prop(ctx, r, "authorized", JSValueMakeBoolean(ctx, est && st.channel.verify_ok()));
     set_prop(ctx, r, "alpnProtocol", make_string(ctx, est ? st.channel.alpn_protocol() : std::string{}));
