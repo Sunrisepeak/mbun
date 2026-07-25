@@ -2116,6 +2116,21 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
   };
   M["https"] = M["node:https"] = httpsExports;
 
+  // node's `_http_common` is what lib/internal/** reaches for when it needs the
+  // RFC 7230 token/field-value validators — `internal/http2/util.js` opens with
+  // `const { _checkIsHttpToken: checkIsHttpToken } = require('_http_common')`
+  // and then calls it for every outgoing header name. The bootstrap stub had
+  // only HTTPParser/methods, so the destructured binding was `undefined` and
+  // node's own util.js died mid-header-build instead of at load, which read as
+  // an unrelated TypeError in 20+ http2 corpus files.
+  {
+    const hc = M["_http_common"] || (M["_http_common"] = {});
+    hc._checkIsHttpToken = hc.checkIsHttpToken = checkIsHttpToken;
+    hc._checkInvalidHeaderChar = hc.checkInvalidHeaderChar = checkInvalidHeaderChar;
+    hc.chunkExpression = chunkExpression;
+    M["node:_http_common"] = hc;
+  }
+
   // Shared with js_net.cppm (which owns the server transport) and with the
   // internal/http shim: one process, one set of these symbols and classes.
   G.__mbunHttpInternals = {
