@@ -748,6 +748,34 @@ inline constexpr std::string_view kNodeInternalBindingJS = R"JS(
   // ---------------------------------------------------------- url_pattern ----
   factories["url_pattern"] = () => ({ URLPattern: G.URLPattern });
 
+  // ------------------------------------------------------------ contextify ----
+  // node src/node_contextify.cc exposes the SIGINT watchdog next to the vm
+  // machinery. Only the watchdog is expressed here: node's SigintWatchdog
+  // installs a handler that swallows SIGINT and merely records that one was
+  // seen, so a nested start/stop pair reports whether a signal arrived while it
+  // was armed. A JS SIGINT listener has the same observable effect (it also
+  // suppresses the default terminate), which is all the watchdog contract is.
+  // ref node src/node_watchdog.cc SigintWatchdog / HasPendingSignal.
+  factories["contextify"] = () => {
+    let armed = 0;
+    let pending = false;
+    const onSigint = () => { pending = true; };
+    return {
+      startSigintWatchdog() {
+        if (armed++ === 0) { pending = false; G.process.on("SIGINT", onSigint); }
+      },
+      // Returns whether a SIGINT arrived while armed, and consumes it — node's
+      // stop_sigint_watchdog() reports has_pending_signal_ and resets it.
+      stopSigintWatchdog() {
+        const had = pending;
+        pending = false;
+        if (armed > 0 && --armed === 0) G.process.removeListener("SIGINT", onSigint);
+        return had;
+      },
+      watchdogHasPendingSigint() { return pending; },
+    };
+  };
+
   // ------------------------------------------------------------------ os ----
   // node src/node_os.cc, expressed over the public node:os this runtime ships.
   factories["os"] = () => {

@@ -1279,10 +1279,26 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
 
   // ---- Web/node globals: TextEncoder/TextDecoder, Buffer, btoa/atob ----
   if (typeof G.TextEncoder === "undefined") {
+    // node's TextEncoder keeps `#encoding` in a private field, so calling its
+    // accessors/methods with a foreign receiver surfaces the engine's private-
+    // brand TypeErrors. JSC words those differently, so reproduce node's
+    // observable messages explicitly (test-whatwg-encoding-custom-interop).
+    const kTEBrand = Symbol("kTextEncoderBrand");
+    const teIsInstance = (self) => self !== null && self !== undefined && self[kTEBrand] === true;
+    const tePrivateBrand = (self) => {
+      if (!teIsInstance(self)) throw new TypeError("Cannot read private member #encoding from an object whose class did not declare it");
+    };
+    const teReceiverBrand = (self) => {
+      if (!teIsInstance(self)) throw new TypeError("Receiver must be an instance of class TextEncoder");
+    };
     G.TextEncoder = class TextEncoder {
+      constructor() {
+        Object.defineProperty(this, kTEBrand, { value: true, enumerable: false, writable: false, configurable: false });
+      }
       get [Symbol.toStringTag]() { return "TextEncoder"; }
-      get encoding() { return "utf-8"; }
+      get encoding() { tePrivateBrand(this); return "utf-8"; }
       encode(str = "") {
+        teReceiverBrand(this);
         str = String(str);
         // Encode straight into a typed array. A plain-array `out.push(...)`
         // stores through [[Set]], so a user-defined getter-only index accessor
@@ -1330,6 +1346,15 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
         return { read, written };
       }
     };
+    Object.defineProperty(G.TextEncoder.prototype, Symbol.for("nodejs.util.inspect.custom"), {
+      value: function (depth, opts, inspectFn) {
+        if (typeof depth === "number" && depth < 0) return this;
+        tePrivateBrand(this);
+        const obj = { encoding: "utf-8" };
+        return typeof inspectFn === "function" ? inspectFn(obj, opts) : "{ encoding: 'utf-8' }";
+      },
+      enumerable: false, configurable: true, writable: true,
+    });
   }
   if (typeof G.TextDecoder === "undefined") {
     // encoding label → canonical name (WHATWG Encoding standard subset).
@@ -1341,29 +1366,51 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     const SBT = {"ibm866":"\u0410\u0411\u0412\u0413\u0414\u0415\u0416\u0417\u0418\u0419\u041a\u041b\u041c\u041d\u041e\u041f\u0420\u0421\u0422\u0423\u0424\u0425\u0426\u0427\u0428\u0429\u042a\u042b\u042c\u042d\u042e\u042f\u0430\u0431\u0432\u0433\u0434\u0435\u0436\u0437\u0438\u0439\u043a\u043b\u043c\u043d\u043e\u043f\u2591\u2592\u2593\u2502\u2524\u2561\u2562\u2556\u2555\u2563\u2551\u2557\u255d\u255c\u255b\u2510\u2514\u2534\u252c\u251c\u2500\u253c\u255e\u255f\u255a\u2554\u2569\u2566\u2560\u2550\u256c\u2567\u2568\u2564\u2565\u2559\u2558\u2552\u2553\u256b\u256a\u2518\u250c\u2588\u2584\u258c\u2590\u2580\u0440\u0441\u0442\u0443\u0444\u0445\u0446\u0447\u0448\u0449\u044a\u044b\u044c\u044d\u044e\u044f\u0401\u0451\u0404\u0454\u0407\u0457\u040e\u045e\u00b0\u2219\u00b7\u221a\u2116\u00a4\u25a0\u00a0","iso-8859-3":"\u0080\u0081\u0082\u0083\u0084\u0085\u0086\u0087\u0088\u0089\u008a\u008b\u008c\u008d\u008e\u008f\u0090\u0091\u0092\u0093\u0094\u0095\u0096\u0097\u0098\u0099\u009a\u009b\u009c\u009d\u009e\u009f\u00a0\u0126\u02d8\u00a3\u00a4\ufffd\u0124\u00a7\u00a8\u0130\u015e\u011e\u0134\u00ad\ufffd\u017b\u00b0\u0127\u00b2\u00b3\u00b4\u00b5\u0125\u00b7\u00b8\u0131\u015f\u011f\u0135\u00bd\ufffd\u017c\u00c0\u00c1\u00c2\ufffd\u00c4\u010a\u0108\u00c7\u00c8\u00c9\u00ca\u00cb\u00cc\u00cd\u00ce\u00cf\ufffd\u00d1\u00d2\u00d3\u00d4\u0120\u00d6\u00d7\u011c\u00d9\u00da\u00db\u00dc\u016c\u015c\u00df\u00e0\u00e1\u00e2\ufffd\u00e4\u010b\u0109\u00e7\u00e8\u00e9\u00ea\u00eb\u00ec\u00ed\u00ee\u00ef\ufffd\u00f1\u00f2\u00f3\u00f4\u0121\u00f6\u00f7\u011d\u00f9\u00fa\u00fb\u00fc\u016d\u015d\u02d9","iso-8859-5":"\u0080\u0081\u0082\u0083\u0084\u0085\u0086\u0087\u0088\u0089\u008a\u008b\u008c\u008d\u008e\u008f\u0090\u0091\u0092\u0093\u0094\u0095\u0096\u0097\u0098\u0099\u009a\u009b\u009c\u009d\u009e\u009f\u00a0\u0401\u0402\u0403\u0404\u0405\u0406\u0407\u0408\u0409\u040a\u040b\u040c\u00ad\u040e\u040f\u0410\u0411\u0412\u0413\u0414\u0415\u0416\u0417\u0418\u0419\u041a\u041b\u041c\u041d\u041e\u041f\u0420\u0421\u0422\u0423\u0424\u0425\u0426\u0427\u0428\u0429\u042a\u042b\u042c\u042d\u042e\u042f\u0430\u0431\u0432\u0433\u0434\u0435\u0436\u0437\u0438\u0439\u043a\u043b\u043c\u043d\u043e\u043f\u0440\u0441\u0442\u0443\u0444\u0445\u0446\u0447\u0448\u0449\u044a\u044b\u044c\u044d\u044e\u044f\u2116\u0451\u0452\u0453\u0454\u0455\u0456\u0457\u0458\u0459\u045a\u045b\u045c\u00a7\u045e\u045f","iso-8859-6":"\u0080\u0081\u0082\u0083\u0084\u0085\u0086\u0087\u0088\u0089\u008a\u008b\u008c\u008d\u008e\u008f\u0090\u0091\u0092\u0093\u0094\u0095\u0096\u0097\u0098\u0099\u009a\u009b\u009c\u009d\u009e\u009f\u00a0\ufffd\ufffd\ufffd\u00a4\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u060c\u00ad\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u061b\ufffd\ufffd\ufffd\u061f\ufffd\u0621\u0622\u0623\u0624\u0625\u0626\u0627\u0628\u0629\u062a\u062b\u062c\u062d\u062e\u062f\u0630\u0631\u0632\u0633\u0634\u0635\u0636\u0637\u0638\u0639\u063a\ufffd\ufffd\ufffd\ufffd\ufffd\u0640\u0641\u0642\u0643\u0644\u0645\u0646\u0647\u0648\u0649\u064a\u064b\u064c\u064d\u064e\u064f\u0650\u0651\u0652\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd","iso-8859-7":"\u0080\u0081\u0082\u0083\u0084\u0085\u0086\u0087\u0088\u0089\u008a\u008b\u008c\u008d\u008e\u008f\u0090\u0091\u0092\u0093\u0094\u0095\u0096\u0097\u0098\u0099\u009a\u009b\u009c\u009d\u009e\u009f\u00a0\u2018\u2019\u00a3\u20ac\u20af\u00a6\u00a7\u00a8\u00a9\u037a\u00ab\u00ac\u00ad\ufffd\u2015\u00b0\u00b1\u00b2\u00b3\u0384\u0385\u0386\u00b7\u0388\u0389\u038a\u00bb\u038c\u00bd\u038e\u038f\u0390\u0391\u0392\u0393\u0394\u0395\u0396\u0397\u0398\u0399\u039a\u039b\u039c\u039d\u039e\u039f\u03a0\u03a1\ufffd\u03a3\u03a4\u03a5\u03a6\u03a7\u03a8\u03a9\u03aa\u03ab\u03ac\u03ad\u03ae\u03af\u03b0\u03b1\u03b2\u03b3\u03b4\u03b5\u03b6\u03b7\u03b8\u03b9\u03ba\u03bb\u03bc\u03bd\u03be\u03bf\u03c0\u03c1\u03c2\u03c3\u03c4\u03c5\u03c6\u03c7\u03c8\u03c9\u03ca\u03cb\u03cc\u03cd\u03ce\ufffd","iso-8859-8":"\u0080\u0081\u0082\u0083\u0084\u0085\u0086\u0087\u0088\u0089\u008a\u008b\u008c\u008d\u008e\u008f\u0090\u0091\u0092\u0093\u0094\u0095\u0096\u0097\u0098\u0099\u009a\u009b\u009c\u009d\u009e\u009f\u00a0\ufffd\u00a2\u00a3\u00a4\u00a5\u00a6\u00a7\u00a8\u00a9\u00d7\u00ab\u00ac\u00ad\u00ae\u00af\u00b0\u00b1\u00b2\u00b3\u00b4\u00b5\u00b6\u00b7\u00b8\u00b9\u00f7\u00bb\u00bc\u00bd\u00be\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u2017\u05d0\u05d1\u05d2\u05d3\u05d4\u05d5\u05d6\u05d7\u05d8\u05d9\u05da\u05db\u05dc\u05dd\u05de\u05df\u05e0\u05e1\u05e2\u05e3\u05e4\u05e5\u05e6\u05e7\u05e8\u05e9\u05ea\ufffd\ufffd\u200e\u200f\ufffd","koi8-u":"\u2500\u2502\u250c\u2510\u2514\u2518\u251c\u2524\u252c\u2534\u253c\u2580\u2584\u2588\u258c\u2590\u2591\u2592\u2593\u2320\u25a0\u2219\u221a\u2248\u2264\u2265\u00a0\u2321\u00b0\u00b2\u00b7\u00f7\u2550\u2551\u2552\u0451\u0454\u2554\u0456\u0457\u2557\u2558\u2559\u255a\u255b\u0491\u255d\u255e\u255f\u2560\u2561\u0401\u0404\u2563\u0406\u0407\u2566\u2567\u2568\u2569\u256a\u0490\u256c\u00a9\u044e\u0430\u0431\u0446\u0434\u0435\u0444\u0433\u0445\u0438\u0439\u043a\u043b\u043c\u043d\u043e\u043f\u044f\u0440\u0441\u0442\u0443\u0436\u0432\u044c\u044b\u0437\u0448\u044d\u0449\u0447\u044a\u042e\u0410\u0411\u0426\u0414\u0415\u0424\u0413\u0425\u0418\u0419\u041a\u041b\u041c\u041d\u041e\u041f\u042f\u0420\u0421\u0422\u0423\u0416\u0412\u042c\u042b\u0417\u0428\u042d\u0429\u0427\u042a","windows-1253":"\u20ac\ufffd\u201a\u0192\u201e\u2026\u2020\u2021\ufffd\u2030\ufffd\u2039\ufffd\ufffd\ufffd\ufffd\ufffd\u2018\u2019\u201c\u201d\u2022\u2013\u2014\ufffd\u2122\ufffd\u203a\ufffd\ufffd\ufffd\ufffd\u00a0\u0385\u0386\u00a3\u00a4\u00a5\u00a6\u00a7\u00a8\u00a9\ufffd\u00ab\u00ac\u00ad\u00ae\u2015\u00b0\u00b1\u00b2\u00b3\u0384\u00b5\u00b6\u00b7\u0388\u0389\u038a\u00bb\u038c\u00bd\u038e\u038f\u0390\u0391\u0392\u0393\u0394\u0395\u0396\u0397\u0398\u0399\u039a\u039b\u039c\u039d\u039e\u039f\u03a0\u03a1\ufffd\u03a3\u03a4\u03a5\u03a6\u03a7\u03a8\u03a9\u03aa\u03ab\u03ac\u03ad\u03ae\u03af\u03b0\u03b1\u03b2\u03b3\u03b4\u03b5\u03b6\u03b7\u03b8\u03b9\u03ba\u03bb\u03bc\u03bd\u03be\u03bf\u03c0\u03c1\u03c2\u03c3\u03c4\u03c5\u03c6\u03c7\u03c8\u03c9\u03ca\u03cb\u03cc\u03cd\u03ce\ufffd","windows-1255":"\u20ac\ufffd\u201a\u0192\u201e\u2026\u2020\u2021\u02c6\u2030\ufffd\u2039\ufffd\ufffd\ufffd\ufffd\ufffd\u2018\u2019\u201c\u201d\u2022\u2013\u2014\u02dc\u2122\ufffd\u203a\ufffd\ufffd\ufffd\ufffd\u00a0\u00a1\u00a2\u00a3\u20aa\u00a5\u00a6\u00a7\u00a8\u00a9\u00d7\u00ab\u00ac\u00ad\u00ae\u00af\u00b0\u00b1\u00b2\u00b3\u00b4\u00b5\u00b6\u00b7\u00b8\u00b9\u00f7\u00bb\u00bc\u00bd\u00be\u00bf\u05b0\u05b1\u05b2\u05b3\u05b4\u05b5\u05b6\u05b7\u05b8\u05b9\ufffd\u05bb\u05bc\u05bd\u05be\u05bf\u05c0\u05c1\u05c2\u05c3\u05f0\u05f1\u05f2\u05f3\u05f4\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u05d0\u05d1\u05d2\u05d3\u05d4\u05d5\u05d6\u05d7\u05d8\u05d9\u05da\u05db\u05dc\u05dd\u05de\u05df\u05e0\u05e1\u05e2\u05e3\u05e4\u05e5\u05e6\u05e7\u05e8\u05e9\u05ea\ufffd\ufffd\u200e\u200f\ufffd","windows-1257":"\u20ac\ufffd\u201a\ufffd\u201e\u2026\u2020\u2021\ufffd\u2030\ufffd\u2039\ufffd\u00a8\u02c7\u00b8\ufffd\u2018\u2019\u201c\u201d\u2022\u2013\u2014\ufffd\u2122\ufffd\u203a\ufffd\u00af\u02db\ufffd\u00a0\ufffd\u00a2\u00a3\u00a4\ufffd\u00a6\u00a7\u00d8\u00a9\u0156\u00ab\u00ac\u00ad\u00ae\u00c6\u00b0\u00b1\u00b2\u00b3\u00b4\u00b5\u00b6\u00b7\u00f8\u00b9\u0157\u00bb\u00bc\u00bd\u00be\u00e6\u0104\u012e\u0100\u0106\u00c4\u00c5\u0118\u0112\u010c\u00c9\u0179\u0116\u0122\u0136\u012a\u013b\u0160\u0143\u0145\u00d3\u014c\u00d5\u00d6\u00d7\u0172\u0141\u015a\u016a\u00dc\u017b\u017d\u00df\u0105\u012f\u0101\u0107\u00e4\u00e5\u0119\u0113\u010d\u00e9\u017a\u0117\u0123\u0137\u012b\u013c\u0161\u0144\u0146\u00f3\u014d\u00f5\u00f6\u00f7\u0173\u0142\u015b\u016b\u00fc\u017c\u017e\u02d9","windows-874":"\u20ac\ufffd\ufffd\ufffd\ufffd\u2026\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u2018\u2019\u201c\u201d\u2022\u2013\u2014\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u00a0\u0e01\u0e02\u0e03\u0e04\u0e05\u0e06\u0e07\u0e08\u0e09\u0e0a\u0e0b\u0e0c\u0e0d\u0e0e\u0e0f\u0e10\u0e11\u0e12\u0e13\u0e14\u0e15\u0e16\u0e17\u0e18\u0e19\u0e1a\u0e1b\u0e1c\u0e1d\u0e1e\u0e1f\u0e20\u0e21\u0e22\u0e23\u0e24\u0e25\u0e26\u0e27\u0e28\u0e29\u0e2a\u0e2b\u0e2c\u0e2d\u0e2e\u0e2f\u0e30\u0e31\u0e32\u0e33\u0e34\u0e35\u0e36\u0e37\u0e38\u0e39\u0e3a\ufffd\ufffd\ufffd\ufffd\u0e3f\u0e40\u0e41\u0e42\u0e43\u0e44\u0e45\u0e46\u0e47\u0e48\u0e49\u0e4a\u0e4b\u0e4c\u0e4d\u0e4e\u0e4f\u0e50\u0e51\u0e52\u0e53\u0e54\u0e55\u0e56\u0e57\u0e58\u0e59\u0e5a\u0e5b\ufffd\ufffd\ufffd\ufffd"};
     SBT["iso-8859-8-i"] = SBT["iso-8859-8"];
     const SB_ALIAS = { "ibm866":"ibm866","866":"ibm866","cp866":"ibm866","csibm866":"ibm866", "iso-8859-3":"iso-8859-3","iso8859-3":"iso-8859-3","iso88593":"iso-8859-3","latin3":"iso-8859-3","l3":"iso-8859-3","csisolatin3":"iso-8859-3","iso-ir-109":"iso-8859-3","iso_8859-3":"iso-8859-3","iso_8859-3:1988":"iso-8859-3", "iso-8859-5":"iso-8859-5","iso8859-5":"iso-8859-5","iso88595":"iso-8859-5","cyrillic":"iso-8859-5","csisolatincyrillic":"iso-8859-5","iso-ir-144":"iso-8859-5","iso_8859-5":"iso-8859-5","iso_8859-5:1988":"iso-8859-5", "iso-8859-6":"iso-8859-6","iso8859-6":"iso-8859-6","iso88596":"iso-8859-6","arabic":"iso-8859-6","csisolatinarabic":"iso-8859-6","ecma-114":"iso-8859-6","asmo-708":"iso-8859-6","iso-ir-127":"iso-8859-6","iso_8859-6":"iso-8859-6","iso_8859-6:1987":"iso-8859-6", "iso-8859-7":"iso-8859-7","iso8859-7":"iso-8859-7","iso88597":"iso-8859-7","greek":"iso-8859-7","greek8":"iso-8859-7","ecma-118":"iso-8859-7","elot_928":"iso-8859-7","csisolatingreek":"iso-8859-7","iso-ir-126":"iso-8859-7","iso_8859-7":"iso-8859-7","iso_8859-7:1987":"iso-8859-7","sun_eu_greek":"iso-8859-7", "iso-8859-8":"iso-8859-8","iso8859-8":"iso-8859-8","iso88598":"iso-8859-8","hebrew":"iso-8859-8","visual":"iso-8859-8","csisolatinhebrew":"iso-8859-8","iso-ir-138":"iso-8859-8","iso_8859-8":"iso-8859-8","iso_8859-8:1988":"iso-8859-8","csiso88598e":"iso-8859-8","iso-8859-8-e":"iso-8859-8", "iso-8859-8-i":"iso-8859-8-i","csiso88598i":"iso-8859-8-i","logical":"iso-8859-8-i", "koi8-u":"koi8-u","koi8-ru":"koi8-u", "windows-1253":"windows-1253","cp1253":"windows-1253","x-cp1253":"windows-1253", "windows-1255":"windows-1255","cp1255":"windows-1255","x-cp1255":"windows-1255", "windows-1257":"windows-1257","cp1257":"windows-1257","x-cp1257":"windows-1257", "windows-874":"windows-874","cp874":"windows-874","dos-874":"windows-874","iso-8859-11":"windows-874","iso8859-11":"windows-874","iso885911":"windows-874","tis-620":"windows-874", "x-user-defined":"x-user-defined", "replacement":"replacement","csiso2022kr":"replacement","hz-gb-2312":"replacement","iso-2022-cn":"replacement","iso-2022-cn-ext":"replacement","iso-2022-kr":"replacement" };
+    // node internal/encoding.js keeps the decoder's observable state in
+    // internal slots and exposes it through PROTOTYPE getters that brand-check
+    // `this` (test-whatwg-encoding-custom-textdecoder calls the raw getters
+    // with a foreign receiver and expects ERR_INVALID_THIS, not a crash).
+    const kTDEncoding = Symbol("kEncoding"), kTDFatal = Symbol("kFatal"), kTDIgnoreBOM = Symbol("kIgnoreBOM");
+    const tdInvalidThis = () => { const e = new TypeError('Value of "this" must be of type TextDecoder'); e.code = "ERR_INVALID_THIS"; return e; };
+    const validateDecoder = (self) => {
+      if (self === null || self === undefined || self[kTDEncoding] === undefined) throw tdInvalidThis();
+      return self;
+    };
+    // node validateObject(..., kValidateObjectAllowObjectsAndNull): `null` is
+    // accepted (and means "no options"); every other non-object is a TypeError.
+    const tdValidateOptions = (opts, name) => {
+      if (opts === undefined || opts === null) return null;
+      if (typeof opts !== "object") {
+        const e = new TypeError('The "' + name + '" argument must be of type object. Received ' + (typeof opts === "string" ? "type string (" + JSON.stringify(opts) + ")" : "type " + typeof opts + " (" + String(opts) + ")"));
+        e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+      }
+      return opts;
+    };
     G.TextDecoder = class TextDecoder {
-      get [Symbol.toStringTag]() { return "TextDecoder"; }
       constructor(enc, opts) {
         // WHATWG Encoding "get an encoding" strips only ASCII whitespace
         // (TAB/LF/FF/CR/SPACE). String.prototype.trim would also eat U+000B,
         // U+00A0, U+2028 and U+2029, turning labels node rejects with
         // ERR_ENCODING_NOT_SUPPORTED into valid ones.
         const key = String(enc === undefined ? "utf-8" : enc).toLowerCase().replace(/^[\t\n\f\r ]+/, "").replace(/[\t\n\f\r ]+$/, "");
-        this.encoding = ENC_ALIAS[key] || SB_ALIAS[key];
+        opts = tdValidateOptions(opts, "options");
+        const encoding = ENC_ALIAS[key] || SB_ALIAS[key];
         // bun TextDecoder.rs:588-600 — an unknown/replacement label is a
         // RangeError carrying code ERR_ENCODING_NOT_SUPPORTED.
-        if (!this.encoding || this.encoding === "replacement") {
+        if (!encoding || encoding === "replacement") {
           const e = new RangeError("Unsupported encoding label \"" + enc + "\"");
           e.code = "ERR_ENCODING_NOT_SUPPORTED";
           throw e;
         }
-        if (opts !== undefined && (opts === null || typeof opts !== "object")) throw new TypeError("TextDecoder(options) is invalid");
-        this.fatal = !!(opts && opts.fatal);
         if (opts && opts.ignoreBOM !== undefined && typeof opts.ignoreBOM !== "boolean") throw new TypeError("TextDecoder(options) ignoreBOM is invalid. Expected boolean value");
-        this.ignoreBOM = !!(opts && opts.ignoreBOM);
+        Object.defineProperty(this, kTDEncoding, { value: encoding, enumerable: false, writable: false, configurable: true });
+        Object.defineProperty(this, kTDFatal, { value: !!(opts && opts.fatal), enumerable: false, writable: false, configurable: true });
+        Object.defineProperty(this, kTDIgnoreBOM, { value: !!(opts && opts.ignoreBOM), enumerable: false, writable: false, configurable: true });
         this._doNotFlush = false;
       }
       decode(input, opts) {
+        validateDecoder(this);
+        opts = tdValidateOptions(opts, "options");
         const stream = !!(opts && opts.stream);
         let b;
         if (input == null) b = new Uint8Array(0);
@@ -1448,6 +1495,44 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
         return "";
       }
     };
+    // ref node internal/encoding.js `sharedProperties`: encoding/fatal/ignoreBOM
+    // are enumerable prototype accessors, the custom-inspect method is
+    // non-enumerable, and Symbol.toStringTag is a data property — each of them
+    // validating the receiver first.
+    Object.defineProperties(G.TextDecoder.prototype, {
+      encoding: { get() { return validateDecoder(this)[kTDEncoding]; }, enumerable: true, configurable: true },
+      fatal: { get() { return validateDecoder(this)[kTDFatal]; }, enumerable: true, configurable: true },
+      ignoreBOM: { get() { return validateDecoder(this)[kTDIgnoreBOM]; }, enumerable: true, configurable: true },
+      [Symbol.toStringTag]: { value: "TextDecoder", writable: false, enumerable: false, configurable: true },
+      [Symbol.for("nodejs.util.inspect.custom")]: {
+        value: function (depth, opts) {
+          validateDecoder(this);
+          // node returns `this` for a negative depth; util.inspect turns that
+          // into "[TextDecoder]".
+          if (typeof depth === "number" && depth < 0) return this;
+          const name = (this.constructor && this.constructor.name) || "TextDecoder";
+          const items = [
+            "encoding: '" + this[kTDEncoding] + "'",
+            "fatal: " + this[kTDFatal],
+            "ignoreBOM: " + this[kTDIgnoreBOM],
+          ];
+          if (opts && opts.showHidden) {
+            // node's internal slots: CONVERTER_FLAGS_FATAL 0x2 | IGNORE_BOM 0x4,
+            // and the ICU converter handle (never materialised here).
+            items.push("Symbol(flags): " + ((this[kTDFatal] ? 2 : 0) | (this[kTDIgnoreBOM] ? 4 : 0)));
+            items.push("Symbol(handle): undefined");
+          }
+          // node reduceToSingleString: entries share one line only while they fit
+          // inside breakLength (80); mbun's generic object layout never wraps, so
+          // reproduce the rule here rather than change it for every inspected value.
+          let total = items.length + (items.length + 1 + 10);
+          for (const it of items) total += it.length;
+          if (total <= 80) return name + " { " + items.join(", ") + " }";
+          return name + " {\n  " + items.join(",\n  ") + "\n}";
+        },
+        enumerable: false, configurable: true, writable: true,
+      },
+    });
   }
   const B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
   if (typeof G.btoa === "undefined") {
