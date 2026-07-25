@@ -121,6 +121,37 @@ Rules this produces, in order of how much they cost when ignored:
 shorter than that cannot be a round boundary — it is a checkpoint. Plan a round
 as *dispatch → several checkpoints → integrate*, never as one tick.
 
+### Iteration count matters as much as cluster shape (round 10)
+
+Round 9 concluded that homogeneity predicts the hit rate. Round 10 partly
+overturns that: a **400-file, medium-homogeneity** http2/tls list delivered
+**1.50×** its target — a shape round 9 would have predicted to under-deliver.
+
+The difference was method, not the cluster. That task ran **eight
+build→measure cycles**, re-clustering the remaining failures after every one and
+holding a zero-regression gate at each, instead of making one large change and
+measuring at the end. Each cycle retargeted the next-densest surviving cause, so
+the work-list effectively became homogeneous *during* the round rather than
+having to be homogeneous at dispatch. It stopped when re-clustering showed no
+remaining cause above 5 files — an evidence-based stop, not a budget one.
+
+So the rule is now two-part:
+
+- Homogeneity at dispatch predicts the hit rate **for a single-pass task**.
+- An **iterative** task can manufacture homogeneity, so a large heterogeneous
+  cluster is worth attempting *if* the agent re-clusters between cycles. Ask for
+  that explicitly; it is not the default behaviour.
+
+Corollary for briefs: naming a *suspected* root cause does not bias a good
+agent. Round 10's repl brief named a suspect that was directionally right and
+wrong in detail (it blamed "something" replacing the global timers; the culprit
+was `node:domain` doing so on first `require`, to stand in for missing
+`async_hooks`). The agent re-derived the real cause and hit its target exactly.
+
+Also: **do not record an agent's self-reported elapsed time.** One task reported
+"~3h15m" for work that took 77–80 minutes by both wall clock and the harness
+timer. Use the measured value.
+
 ### Isolated deltas are not additive
 
 Round 9's eight tasks each measured a gain against their own cluster, each with
