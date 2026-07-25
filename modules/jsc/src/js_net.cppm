@@ -3091,7 +3091,6 @@ export constexpr std::string_view kNetJS = R"JS(
       if (sock._httpOnError) {
         sock.removeListener("error", sock._httpOnError);
         sock._httpOnError = null;
-        if (sock.listenerCount("error") === 0) sock.on("error", () => {});
       }
       if (srv.emit("clientError", err, sock)) {
         // The server handled it and did not tear the socket down, so the parser
@@ -3214,6 +3213,15 @@ export constexpr std::string_view kNetJS = R"JS(
       // parser's onError already uses; the only extra part is node's
       // "ignore further errors" self-removal, which is what keeps
       // socketOnError's own `sock.emit('error', err)` branch from recursing.
+      // The noop stays, UNDERNEATH socketOnError and for the whole life of the
+      // socket: node keeps one too (`if (this.listenerCount('error',
+      // socketOnError) === 0) this.on('error', noop)`), and it is what stops an
+      // error emitted on the connection after socketOnError has disarmed itself
+      // from becoming an uncaught throw. Re-installing it conditionally instead
+      // is not equivalent -- it leaves a window where another layer's listener
+      // (a TLSSocket's) is the only one, and a later 'write after end' on a
+      // pipelined response threw (test-tls-use-after-free-regression).
+      sock.on("error", () => {});
       const onSockError = (e) => {
         socketOnError(sock, e instanceof Error ? e : mkErr(String((e && e.message) || e), codeOf(e)));
       };

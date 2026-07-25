@@ -2412,6 +2412,13 @@ export constexpr std::string_view kHttp2JS = R"JS(
       if (name[0] === ":") {
         if (sawRegular) return true;              // pseudo after a regular field
         if (seenPseudo[name]) return true;        // repeated pseudo-header
+        // RFC 9113 8.3.1 / nghttp2 http_request_on_header: a REQUEST may carry
+        // only the request pseudo-headers. `:status` is a response one and
+        // anything else is undefined; both are a malformed request. Accepting
+        // them opened a normal stream for a header block that should have been
+        // rejected outright.
+        if (name !== ":method" && name !== ":scheme" && name !== ":path" &&
+            name !== ":authority" && name !== ":protocol") return true;
         seenPseudo[name] = true;
       } else {
         sawRegular = true;
