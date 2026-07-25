@@ -1954,6 +1954,93 @@ inline constexpr std::string_view kNodeInternalBindingJS = R"JS(
     });
   };
 
+  // ------------------------------------------------------------ signal_wrap ----
+  // node src/signal_wrap.cc. The handle is a real one: start(signum) arms the
+  // POSIX handler through the same seam process.on("SIG…") uses (engine.inc
+  // signalWatch + __mbunSignalTick), so a Signal that reports success actually
+  // delivers. Every method is brand-checked — node's C++ methods unwrap `this`
+  // and throw "Illegal invocation" for a foreign receiver, which is the whole
+  // point of test-signal-safety.
+  factories["signal_wrap"] = () => {
+    const BRAND = new WeakSet();
+    const P = G.process;
+    const nameOf = (signum) => {
+      try {
+        const sigs = (mod("os").constants || {}).signals || {};
+        for (const k of Object.keys(sigs)) if (sigs[k] === signum) return k;
+      } catch (e) {}
+      return null;
+    };
+    const self = (o) => { if (!BRAND.has(o)) throw new TypeError("Illegal invocation"); return o; };
+    return {
+      Signal: class Signal {
+        constructor() {
+          BRAND.add(this);
+          this.onsignal = undefined;
+          this._name = null;
+          this._listener = null;
+        }
+        start(signum) {
+          self(this);
+          const name = nameOf(signum);
+          if (name === null || !P || typeof P.on !== "function") return -22;  // UV_EINVAL
+          if (this._listener) this.stop();
+          const handle = this;
+          this._name = name;
+          this._listener = function () {
+            if (typeof handle.onsignal === "function") handle.onsignal(signum);
+          };
+          P.on(name, this._listener);
+          return 0;
+        }
+        stop() {
+          self(this);
+          if (this._listener && P && typeof P.removeListener === "function") {
+            P.removeListener(this._name, this._listener);
+          }
+          this._listener = null;
+          this._name = null;
+          return 0;
+        }
+        close(cb) { self(this); this.stop(); if (typeof cb === "function") cb(); }
+        ref() { self(this); }
+        unref() { self(this); }
+        hasRef() { self(this); return this._listener !== null; }
+      },
+    };
+  };
+
+  // ------------------------------------------------------------- cares_wrap ----
+  // node src/cares_wrap.cc, as far as node:dns needs it here. mbun resolves
+  // through its own DNS layer rather than c-ares, so this exposes the constants
+  // and the GetAddrInfoReqWrap/ChannelWrap shells the corpus reaches for; the
+  // query methods report UV_ENOSYS rather than silently succeeding.
+  factories["cares_wrap"] = () => ({
+    // node dns.constants (ADDRCONFIG/V4MAPPED/ALL) + the ai_family codes.
+    AI_ADDRCONFIG: 1024, AI_ALL: 256, AI_V4MAPPED: 8,
+    GetAddrInfoReqWrap: class GetAddrInfoReqWrap { constructor() { this.oncomplete = undefined; } },
+    GetNameInfoReqWrap: class GetNameInfoReqWrap { constructor() { this.oncomplete = undefined; } },
+    QueryReqWrap: class QueryReqWrap { constructor() { this.oncomplete = undefined; } },
+    ChannelWrap: class ChannelWrap {
+      constructor() { this._servers = []; }
+      getServers() { return this._servers.slice(); }
+      setServers(list) { this._servers = Array.isArray(list) ? list.slice() : []; return 0; }
+      setLocalAddress() { return 0; }
+      cancel() {}
+      // Every resolve* is a c-ares query mbun does not implement; UV_ENOSYS is
+      // the honest answer (a 0 here would report success with no result).
+      queryAny() { return -38; } queryA() { return -38; } queryAaaa() { return -38; }
+      queryCaa() { return -38; } queryCname() { return -38; } queryMx() { return -38; }
+      queryNs() { return -38; } queryTxt() { return -38; } querySrv() { return -38; }
+      queryPtr() { return -38; } queryNaptr() { return -38; } querySoa() { return -38; }
+      getHostByAddr() { return -38; }
+    },
+    isIP: (s) => { try { return mod("net").isIP(s) | 0; } catch (e) { return 0; } },
+    isIPv4: (s) => { try { return !!mod("net").isIPv4(s); } catch (e) { return false; } },
+    isIPv6: (s) => { try { return !!mod("net").isIPv6(s); } catch (e) { return false; } },
+    strerror: (code) => "Unknown system error " + code,
+  });
+
   Object.defineProperty(G, "__mbunInternalBinding", {
     value: internalBinding, writable: true, configurable: true, enumerable: false,
   });

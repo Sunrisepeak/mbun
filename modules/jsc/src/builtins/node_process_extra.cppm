@@ -332,6 +332,17 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
           e.code = "ERR_INVALID_OBJECT_DEFINE_PROPERTY";
           return e;
         };
+        // node's env setter has native side effects for a few names; TZ is the
+        // one the corpus asserts (test-process-env-tz): assigning it re-points
+        // the engine's local timezone, deleting it restores the system zone.
+        // The C++ half (__mbunProcNative.setTimeZone) also keeps the real
+        // environ in sync so a child process inherits the new TZ.
+        const applyTZ = (value) => {
+          try {
+            const PN = G.__mbunProcNative;
+            if (PN && typeof PN.setTimeZone === "function") PN.setTimeZone(value);
+          } catch (e) {}
+        };
         const envProxy = new Proxy(backing, {
           set(target, key, value) {
             if (typeof key === "symbol") throw new TypeError("Cannot convert a Symbol value to a string");
@@ -340,6 +351,13 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
             // node ignores an empty variable name (test-process-env).
             if (k === "") return true;
             target[k] = String(value);
+            if (k === "TZ") applyTZ(target[k]);
+            return true;
+          },
+          deleteProperty(target, key) {
+            const k = typeof key === "symbol" ? key : String(key);
+            delete target[k];
+            if (k === "TZ") applyTZ(null);
             return true;
           },
           defineProperty(target, key, desc) {
@@ -349,6 +367,7 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
               throw invalidDefine("'process.env' only accepts a configurable, writable, and enumerable data descriptor");
             if (typeof key === "symbol") throw new TypeError("Cannot convert a Symbol value to a string");
             target[String(key)] = String(desc.value);
+            if (String(key) === "TZ") applyTZ(target.TZ);
             return true;
           },
         });
@@ -459,9 +478,18 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
     // ---- process.binding allow/deny list (bun's ProcessBindingMap) ---------
     {
       const orig = typeof proc.binding === "function" ? proc.binding.bind(proc) : null;
+      // node lib/internal/bootstrap/realm.js processBindingAllowList (+ the
+      // legacyWrapperList entries `natives`/`util`), unioned with the two extra
+      // names bun's ProcessBindingMap keeps ("crypto/x509", "http_parser").
+      // mbun previously shipped only bun's ten, so process.binding('cares_wrap')
+      // and half the list threw "No such module"
+      // (test-process-binding-internalbinding-allowlist).
       const allowed = {
-        buffer: 1, config: 1, constants: 1, "crypto/x509": 1, fs: 1,
-        http_parser: 1, natives: 1, tty_wrap: 1, util: 1, uv: 1,
+        buffer: 1, cares_wrap: 1, config: 1, constants: 1, contextify: 1,
+        "crypto/x509": 1, fs: 1, fs_event_wrap: 1, http_parser: 1, icu: 1,
+        inspector: 1, js_stream: 1, natives: 1, os: 1, pipe_wrap: 1,
+        process_wrap: 1, spawn_sync: 1, stream_wrap: 1, tcp_wrap: 1,
+        tls_wrap: 1, tty_wrap: 1, udp_wrap: 1, util: 1, uv: 1, zlib: 1,
       };
       const cache = { __proto__: null };
       proc.binding = function binding(name) {
@@ -577,7 +605,17 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
             if (ut) for (const k of keys) if (typeof ut[k] === "function") u[k] = ut[k];
             value = u;
           }
-          else value = {};
+          else {
+            // node's process.binding() for the rest of the allow list is just
+            // internalBinding() (realm.js). Use the real namespace when this
+            // runtime has one; an empty object only when it does not, which is
+            // still what the caller gets today.
+            value = null;
+            if (typeof G.__mbunInternalBinding === "function") {
+              try { value = G.__mbunInternalBinding(name); } catch (e) { value = null; }
+            }
+            if (!value || typeof value !== "object") value = {};
+          }
         }
         return (cache[name] = value);
       };
@@ -642,6 +680,239 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
       Object.defineProperty(rawDebug, "name", { value: "_rawDebug" });
       proc._rawDebug = rawDebug;
     }
+
+    // ---- process.emitWarning + the default 'warning' printer ----------------
+    // node lib/internal/process/warning.js, reproduced in full because the
+    // engine prelude's emitWarning implemented only the object shaping:
+    //   * process.noDeprecation suppresses a DeprecationWarning ENTIRELY — the
+    //     'warning' event never fires (test-process-no-deprecation asserts the
+    //     listener is not called, not merely that nothing printed);
+    //   * process.throwDeprecation turns it into an uncaught throw on the next
+    //     tick, so `try { emitWarning(...) } catch {}` around the call must NOT
+    //     see it (test-process-warning test4);
+    //   * an unclaimed warning is PRINTED — node registers onWarning as a real
+    //     'warning' listener during bootstrap, which is what makes
+    //     `--redirect-warnings` / NODE_REDIRECT_WARNINGS observable at all
+    //     (test-process-redirect-warnings{,-env} read the file back).
+    // The printer is installed as an ordinary listener exactly as node does, so
+    // process.listenerCount('warning') is 1 at startup in both runtimes.
+    try {
+      const flagValue = (name) => {
+        const argv = (proc.execArgv && proc.execArgv.length ? proc.execArgv : []) || [];
+        for (const a of argv) {
+          if (typeof a !== "string") continue;
+          if (a === name) return "";
+          if (a.startsWith(name + "=")) return a.slice(name.length + 1);
+        }
+        return undefined;
+      };
+      const hasFlag = (name) => flagValue(name) !== undefined;
+      // Resolved lazily and once, like node's lazyOption(): execArgv is filled
+      // in after this partition is evaluated.
+      let warningFile;
+      const warningTarget = () => {
+        if (warningFile === undefined) {
+          warningFile = flagValue("--diagnostic-dir") || flagValue("--redirect-warnings") ||
+                        (proc.env && proc.env.NODE_REDIRECT_WARNINGS) || "";
+        }
+        return warningFile;
+      };
+      let traceHelperShown = false;
+      let disableSet = null;
+      const onWarning = function onWarning(warning) {
+        // --no-warnings suppresses the printer only; the event still fires.
+        // Checked HERE rather than at install time because process.execArgv is
+        // filled in after this partition runs (same ordering the `gc` accessor
+        // below documents).
+        if (hasFlag("--no-warnings")) return;
+        if (disableSet === null) {
+          disableSet = new Set();
+          const argv = (proc.execArgv || []);
+          for (const a of argv)
+            if (typeof a === "string" && a.startsWith("--disable-warning="))
+              disableSet.add(a.slice(18));
+        }
+        if (warning && ((warning.code && disableSet.has(warning.code)) ||
+                        (warning.name && disableSet.has(warning.name)))) return;
+        if (!(warning instanceof Error)) return;
+        const isDeprecation = warning.name === "DeprecationWarning";
+        if (isDeprecation && proc.noDeprecation) return;
+        const trace = !!(proc.traceProcessWarnings || (isDeprecation && proc.traceDeprecation));
+        let msg = "(" + ((proc.release && proc.release.name) || "node") + ":" + proc.pid + ") ";
+        if (warning.code) msg += "[" + warning.code + "] ";
+        // node falls back to Error.prototype.toString when the instance's own
+        // toString is not callable (test-process-warning test5 sets it to 1).
+        if (trace && warning.stack) msg += String(warning.stack);
+        else if (typeof warning.toString === "function") msg += String(warning.toString());
+        else msg += Error.prototype.toString.call(warning);
+        if (typeof warning.detail === "string") msg += "\n" + warning.detail;
+        if (!trace && !traceHelperShown) {
+          const flag = isDeprecation ? "--trace-deprecation" : "--trace-warnings";
+          msg += "\n(Use `" + ((proc.release && proc.release.name) || "node") + " " + flag +
+                 " ...` to show where the warning was created)";
+          traceHelperShown = true;
+        }
+        const file = warningTarget();
+        if (file) {
+          try {
+            const fs = G.__mbunNativeModules && G.__mbunNativeModules["fs"];
+            if (fs && typeof fs.appendFileSync === "function") { fs.appendFileSync(file, msg + "\n"); return; }
+          } catch (e) {}
+        }
+        try { G.console.error(msg); } catch (e) {}
+      };
+
+      const createWarning = (message, type, code, ctor, detail) => {
+        const e = new Error(message);
+        e.name = String(type || "Warning");
+        if (code !== undefined) e.code = code;
+        if (detail !== undefined) e.detail = detail;
+        return e;
+      };
+      proc.emitWarning = function emitWarning(warning, type, code, ctor) {
+        if (proc.noDeprecation && type === "DeprecationWarning") return;
+        let detail;
+        if (type !== null && typeof type === "object" && !Array.isArray(type)) {
+          ctor = type.ctor;
+          code = type.code;
+          if (typeof type.detail === "string") detail = type.detail;
+          type = type.type || "Warning";
+        } else if (typeof type === "function") {
+          ctor = type; code = undefined; type = "Warning";
+        }
+        if (type !== undefined && typeof type !== "string") throw errInvalidArgType("type", "string", type);
+        if (typeof code === "function") { ctor = code; code = undefined; }
+        else if (code !== undefined && typeof code !== "string") throw errInvalidArgType("code", "string", code);
+        if (typeof warning === "string") warning = createWarning(warning, type, code, ctor, detail);
+        else if (!(warning instanceof Error)) throw errInvalidArgType("warning", ["Error", "string"], warning);
+        if (warning.name === "DeprecationWarning") {
+          if (proc.noDeprecation) return;
+          if (proc.throwDeprecation) {
+            // Deferred, so warnings emitted earlier in this tick still print —
+            // and so the emitWarning CALL does not throw synchronously.
+            return proc.nextTick(() => { throw warning; });
+          }
+        }
+        proc.nextTick(() => { proc.emit("warning", warning); });
+      };
+      if (typeof proc.on === "function" && proc.listenerCount("warning") === 0) {
+        proc.on("warning", onWarning);
+      }
+    } catch (e) {}
+
+    // ---- process.allowedNodeEnvironmentFlags --------------------------------
+    // node lib/internal/process/per_thread.js buildAllowedFlags(): the set of
+    // options node accepts inside NODE_OPTIONS, wrapped in a frozen Set whose
+    // mutators are no-ops and whose has() normalises the many spellings a user
+    // may pass (leading dashes optional, "_" interchangeable with "-", a
+    // trailing "=value" ignored). It was an empty Set, so every membership
+    // question answered "no" (test-process-env-allowed-flags).
+    //
+    // The list is node's own NODE_OPTIONS table, extracted from
+    // compat/node/doc/api/cli.md's node-options-{node,v8} sections plus the
+    // options node keeps allowed but deliberately undocumented. Entries gated
+    // on a build feature mbun does not have (the inspector, and the profilers
+    // that depend on it) are added only when the feature reports present, which
+    // is the same condition test-process-env-allowed-flags applies.
+    try {
+      const FLAGS = [
+      "--allow-addons", "--allow-child-process", "--allow-fs-read", "--allow-fs-write",
+      "--allow-inspector", "--allow-net", "--allow-wasi", "--allow-worker", "--conditions", "-C",
+      "--diagnostic-dir", "--disable-proto", "--disable-sigusr1", "--disable-warning",
+      "--disable-wasm-trap-handler", "--dns-result-order", "--enable-fips",
+      "--enable-network-family-autoselection", "--enable-source-maps", "--entry-url",
+      "--experimental-abortcontroller", "--experimental-addon-modules",
+      "--experimental-detect-module", "--experimental-eventsource",
+      "--experimental-import-meta-resolve", "--experimental-json-modules",
+      "--experimental-loader", "--experimental-modules", "--experimental-print-required-tla",
+      "--experimental-quic", "--experimental-require-module", "--experimental-shadow-realm",
+      "--experimental-specifier-resolution", "--experimental-stream-iter",
+      "--experimental-test-isolation", "--experimental-top-level-await",
+      "--experimental-vm-modules", "--experimental-wasi-unstable-preview1",
+      "--force-context-aware", "--force-fips", "--force-node-api-uncaught-exceptions-policy",
+      "--frozen-intrinsics", "--heapsnapshot-near-heap-limit", "--heapsnapshot-signal",
+      "--http-parser", "--import", "--input-type", "--insecure-http-parser",
+      "--localstorage-file", "--max-http-header-size", "--max-old-space-size-percentage",
+      "--napi-modules", "--network-family-autoselection-attempt-timeout", "--addons",
+      "--async-context-frame", "--deprecation", "--experimental-global-navigator",
+      "--experimental-repl-await", "--experimental-sqlite", "--experimental-strip-types",
+      "--experimental-websocket", "--experimental-webstorage", "--extra-info-on-fatal-exception",
+      "--force-async-hooks-checks", "--global-search-paths", "--network-family-autoselection",
+      "--strip-types", "--warnings", "--webstorage", "--node-memory-debug", "--openssl-config",
+      "--openssl-legacy-provider", "--openssl-shared-config", "--pending-deprecation",
+      "--permission-audit", "--permission", "--preserve-symlinks-main", "--preserve-symlinks",
+      "--prof-process", "--redirect-warnings", "--report-compact", "--report-dir",
+      "--report-directory", "--report-exclude-env", "--report-exclude-network",
+      "--report-filename", "--report-on-fatalerror", "--report-on-signal", "--report-signal",
+      "--report-uncaught-exception", "--require-module", "--require", "-r", "--secure-heap-min",
+      "--secure-heap", "--snapshot-blob", "--test-coverage-branches", "--test-coverage-exclude",
+      "--test-coverage-functions", "--test-coverage-include", "--test-coverage-lines",
+      "--test-global-setup", "--test-isolation", "--test-name-pattern", "--test-only",
+      "--test-random-seed", "--test-randomize", "--test-reporter-destination", "--test-reporter",
+      "--test-rerun-failures", "--test-shard", "--test-skip-pattern", "--throw-deprecation",
+      "--title", "--tls-cipher-list", "--tls-keylog", "--tls-max-v1.2", "--tls-max-v1.3",
+      "--tls-min-v1.0", "--tls-min-v1.1", "--tls-min-v1.2", "--tls-min-v1.3",
+      "--trace-deprecation", "--trace-env-js-stack", "--trace-env-native-stack", "--trace-env",
+      "--trace-event-categories", "--trace-event-file-pattern", "--trace-events-enabled",
+      "--trace-exit", "--trace-require-module", "--trace-sigint", "--trace-sync-io",
+      "--trace-tls", "--trace-uncaught", "--trace-warnings", "--track-heap-objects",
+      "--unhandled-rejections", "--use-bundled-ca", "--use-env-proxy", "--use-largepages",
+      "--use-openssl-ca", "--use-system-ca", "--v8-pool-size", "--watch-kill-signal",
+      "--watch-path", "--watch-preserve-output", "--watch", "--zero-fill-buffers",
+      "--abort-on-uncaught-exception", "--disallow-code-generation-from-strings",
+      "--enable-etw-stack-walking", "--expose-gc", "--interpreted-frames-native-stack",
+      "--jitless", "--max-heap-size", "--max-old-space-size", "--max-semi-space-size",
+      "--perf-basic-prof-only-functions", "--perf-basic-prof", "--perf-prof-unwinding-info",
+      "--perf-prof", "--stack-trace-limit", "--no-addons", "--no-async-context-frame",
+      "--no-deprecation", "--no-experimental-global-navigator", "--no-experimental-repl-await",
+      "--no-experimental-sqlite", "--no-experimental-strip-types", "--no-experimental-websocket",
+      "--no-experimental-webstorage", "--no-extra-info-on-fatal-exception",
+      "--no-force-async-hooks-checks", "--no-global-search-paths",
+      "--no-network-family-autoselection", "--no-strip-types", "--no-warnings", "--no-webstorage",
+      "--debug-arraybuffer-allocations", "--no-debug-arraybuffer-allocations",
+      "--es-module-specifier-resolution", "--experimental-fetch", "--experimental-wasm-modules",
+      "--experimental-global-customevent", "--experimental-global-webcrypto",
+      "--experimental-report", "--experimental-worker", "--node-snapshot", "--no-node-snapshot",
+      "--loader", "--verify-base-objects", "--no-verify-base-objects", "--trace-promises",
+      "--no-trace-promises",
+    ];
+      const INSPECTOR_FLAGS = [
+      "--inspect-brk", "--inspect-port", "--debug-port", "--inspect-publish-uid",
+      "--inspect-wait", "--inspect", "--cpu-prof-dir", "--cpu-prof-interval", "--cpu-prof-name",
+      "--cpu-prof", "--heap-prof-dir", "--heap-prof-interval", "--heap-prof-name", "--heap-prof",
+    ];
+      const array = proc.features && proc.features.inspector
+        ? FLAGS.concat(INSPECTOR_FLAGS) : FLAGS.slice();
+      const bare = array.map((f) => f.replace(/^--?/, ""));
+      // Kept OUT of the instance: the object is frozen (and class bodies are
+      // strict), so caching on `this` would throw on first use.
+      let cached = null;
+      const cache = () => (cached || (cached = new Set(array)));
+      class NodeEnvironmentFlagsSet extends Set {
+        add() { return this; }
+        delete() { return false; }
+        clear() {}
+        has(key) {
+          if (typeof key !== "string") return false;
+          key = key.replace(/_/g, "-");
+          if (/^--?/.test(key)) return array.includes(key.replace(/=.*$/, ""));
+          return bare.includes(key);
+        }
+        entries() { return cache().entries(); }
+        forEach(cb, thisArg) { for (const v of array) cb.call(thisArg, v, v, this); }
+        get size() { return array.length; }
+        values() { return cache().values(); }
+      }
+      const values = NodeEnvironmentFlagsSet.prototype.values;
+      Object.defineProperty(NodeEnvironmentFlagsSet.prototype, Symbol.iterator, { value: values });
+      Object.defineProperty(NodeEnvironmentFlagsSet.prototype, "keys", { value: values });
+      Object.freeze(NodeEnvironmentFlagsSet.prototype.constructor);
+      Object.freeze(NodeEnvironmentFlagsSet.prototype);
+      Object.defineProperty(proc, "allowedNodeEnvironmentFlags", {
+        value: Object.freeze(new NodeEnvironmentFlagsSet()),
+        writable: true, enumerable: true, configurable: true,
+      });
+    } catch (e) {}
 
     const undefinedStubs = [
       "_debugEnd", "_debugProcess", "_fatalException", "_linkedBinding",

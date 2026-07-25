@@ -703,6 +703,20 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
         proc.exit(1);
       });
     }
+    // node src/node_process_methods.cc: process.execve refuses to run off the
+    // main thread — replacing the process image would take every other thread
+    // with it — and throws ERR_WORKER_UNSUPPORTED_OPERATION (a TypeError,
+    // lib/internal/errors.js '%s is not supported in workers').
+    // test-process-execve-worker-threads asserts exactly that. Defined only
+    // here: on the main thread mbun has no execve, and an undefined property is
+    // the honest report of that.
+    if (typeof proc.execve !== "function") {
+      proc.execve = function execve() {
+        const e = new TypeError("process.execve() is not supported in workers");
+        e.code = "ERR_WORKER_UNSUPPORTED_OPERATION";
+        throw e;
+      };
+    }
     // The channel pins this process's event loop only while parentPort has a
     // sink — otherwise a worker that never listens would never exit.
     G.__mbunIpcPin = () => portHasListener(parentPort);

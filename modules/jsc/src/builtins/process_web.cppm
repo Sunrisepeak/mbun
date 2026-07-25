@@ -1863,7 +1863,14 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   // of timers still due right now (0 → the pump may sleep). Intervals
   // reschedule from the current time (bun Timer.zig update()). A per-call fire
   // budget plus a global fired cap bound runaway tight intervals.
+  // Resolved on first drain: __mbunProcNative is installed by the C++ runtime
+  // AFTER this builtins image is evaluated, so it cannot be captured here.
+  let drainTicks;
   G.__mbun_drain_timers = function (budget) {
+    if (drainTicks === undefined) {
+      const PN = G.__mbunProcNative;
+      drainTicks = PN && typeof PN.drainMicrotasks === "function" ? PN.drainMicrotasks : null;
+    }
     let fired = 0; budget = budget || 100;
     while (T.q.length && fired < budget && T.fired < 200000) {
       const now = Date.now();
@@ -1879,6 +1886,15 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       catch (e) {
         if (G.__mbun_uncaught && !G.__mbun_uncaught(e)) { fired++; T.fired++; break; }
       }
+      // node drains the nextTick/microtask queue after EVERY timer and
+      // immediate callback (lib/internal/timers.js runNextTicks). Without this
+      // a whole chain of setImmediates ran inside one drain call and every
+      // nextTick they scheduled was deferred behind the entire chain — so
+      // `emitWarning(x); setImmediate(next)` delivered x after `next`
+      // (test-process-warning). JSC only drains at a JSLock release, which
+      // never comes while this loop holds the lock; PN.drainMicrotasks is the
+      // VM's own drain (runtime/process_base.inc).
+      if (drainTicks !== null) { try { drainTicks(); } catch (e) {} }
       fired++; T.fired++;
     }
     const now2 = Date.now();

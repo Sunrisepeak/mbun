@@ -637,6 +637,46 @@ JSValueRef proc_setenv_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_
     return JSValueMakeUndefined(ctx);
 }
 
+// proc.drainMicrotasks() — run JSC's microtask queue to exhaustion right now.
+// node drains the process.nextTick queue BETWEEN callbacks (runNextTicks after
+// every immediate / timer in lib/internal/timers.js), so a nextTick scheduled
+// by one callback runs before the next callback starts. mbun's nextTick rides
+// on queueMicrotask, and JSC only drains at a JSLock release — which never
+// happens inside the timer drain, since the whole drain runs under one lock.
+// The observable difference: `emitWarning(x); setImmediate(next)` delivered the
+// warning AFTER `next` had run (test-process-warning). Exposing the VM's own
+// drain lets the timer loop restore node's ordering without splitting the drain
+// across pump iterations.
+JSValueRef proc_drain_microtasks_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t,
+                                    const JSValueRef[], JSValueRef*) {
+    if (JSC::JSGlobalObject* g = toJS(ctx); g != nullptr) JSC::getVM(g).drainMicrotasks();
+    return JSValueMakeUndefined(ctx);
+}
+
+// proc.setTimeZone(name) → apply an IANA zone to the engine's date cache, the
+// native half of node's "assigning process.env.TZ changes the local timezone"
+// contract (test-process-env-tz). JSC caches the resolved zone per-VM, so a bare
+// setenv("TZ") is invisible to Date.prototype.toString — the cache has to be
+// invalidated explicitly. Same mechanism bun uses (JSEnvironmentVariableMap.cpp
+// applyTZFromString): WTF::setTimeZoneOverride + DateCache::resetIfNecessarySlow.
+// A missing/empty/null argument drops the override back to the system zone, so
+// `delete process.env.TZ` restores the startup behaviour instead of freezing the
+// last assigned zone. Returns true when the zone was accepted.
+JSValueRef proc_set_timezone_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                                const JSValueRef args[], JSValueRef*) {
+    const bool clear{argc == 0 || JSValueIsNull(ctx, args[0]) || JSValueIsUndefined(ctx, args[0])};
+    const std::string name{clear ? std::string{} : fs_arg(ctx, argc, args, 0)};
+    // bun caps the accepted name at 32 chars; longer input is never a zone id and
+    // WTF would scan it against the whole ICU table for nothing.
+    if (!clear && (name.empty() || name.size() >= 32)) return JSValueMakeBoolean(ctx, false);
+    if (clear) ::unsetenv("TZ"); else ::setenv("TZ", name.c_str(), 1);
+    const WTF::String wtfName{WTF::String::fromUTF8(name)};
+    if (!WTF::setTimeZoneOverride(WTF::StringView{wtfName})) return JSValueMakeBoolean(ctx, false);
+    if (JSC::JSGlobalObject* g = toJS(ctx); g != nullptr)
+        JSC::getVM(g).dateCache.resetIfNecessarySlow();
+    return JSValueMakeBoolean(ctx, true);
+}
+
 // ── SCM_RIGHTS descriptor passing over the fork() IPC socketpair ─────────────
 // node's NODE_HANDLE protocol hands a listening/accepted socket from one process
 // to another; on POSIX that is an AF_UNIX ancillary message carrying the
