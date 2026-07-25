@@ -872,10 +872,20 @@ JSValueRef fsn_readdir_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_
     std::string path{fs_arg(ctx, argc, args, 0)};
     if (permission_deny_fs(ctx, exc, path, false)) return JSValueMakeUndefined(ctx);
     std::error_code ec;
-    std::vector<JSValueRef> names;
+    // libuv's uv_fs_scandir sorts with alphasort (deps/uv/src/unix/fs.c), so
+    // node's readdir order is deterministic and every corpus test that indexes
+    // the result positionally relies on it (test-fs-readdir-types compares
+    // dirents[i].name against a sorted literal). directory_iterator yields raw
+    // getdents order, so the sort has to happen here — this is the one place
+    // both node:fs and internalBinding('fs').readdir read the directory from.
+    std::vector<std::string> raw;
     for (const auto& e : std::filesystem::directory_iterator{std::filesystem::path{path}, ec}) {
-        names.push_back(make_string(ctx, e.path().filename().string()));
+        raw.push_back(e.path().filename().string());
     }
+    std::ranges::sort(raw);
+    std::vector<JSValueRef> names;
+    names.reserve(raw.size());
+    for (const auto& n : raw) names.push_back(make_string(ctx, n));
     // node surfaces the real errno here (readdirSync on a file is ENOTDIR, not
     // ENOENT) — ref node test-fs-readdir-types.js:68.
     if (ec) {
@@ -1228,7 +1238,14 @@ void fsn_readdir_recursive_walk(JSContextRef ctx, const std::filesystem::path& b
         threw = true;
         return;
     }
-    for (const auto& e : it) {
+    // Same alphasort parity as the non-recursive readdir above: libuv's scandir
+    // sorts each directory level, and node's recursive readdir inherits that
+    // order level by level.
+    std::vector<std::filesystem::directory_entry> level{it, std::filesystem::directory_iterator{}};
+    std::ranges::sort(level, {}, [](const std::filesystem::directory_entry& e) {
+        return e.path().filename().string();
+    });
+    for (const auto& e : level) {
         if (threw) return;
         const std::string name{e.path().filename().string()};
         const std::string relPath{rel.empty() ? name : rel + "/" + name};
