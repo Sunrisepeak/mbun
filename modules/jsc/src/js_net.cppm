@@ -1118,6 +1118,9 @@ export constexpr std::string_view kNetJS = R"JS(
     }
     return -1;
   }
+  // RFC 7230 field-name (tchar+); anything else in a header name is a parse
+  // error, not something to normalise away.
+  const HEADER_TOKEN_RE = /^[\^_`a-zA-Z\-0-9!#$%&'*+.|~]+$/;
   function findCRLF(buf, off) {
     for (let i = off; i + 1 < buf.length; i++) if (buf[i] === 13 && buf[i + 1] === 10) return i;
     return -1;
@@ -1131,6 +1134,10 @@ export constexpr std::string_view kNetJS = R"JS(
       this.headers = {}; this.rawHeaders = []; this.trailers = {};
       this.remaining = 0; this.chunked = false; this.toEof = false;
       this.reqMethod = "GET";
+      // node: parser.maxHeaderPairs = server.maxHeadersCount << 1 (0 = no cap);
+      // maxHeaderSize caps the whole head block (--max-http-header-size).
+      this.maxHeaderPairs = 0;
+      this.maxHeaderSize = 0;
       this.onHead = null; this.onBody = null; this.onDone = null; this.onError = null;
       // 1xx interim heads are not the final response: node re-arms the parser
       // and raises 'continue'/'information' on the ClientRequest instead
@@ -1162,6 +1169,14 @@ export constexpr std::string_view kNetJS = R"JS(
             this._err("The socket connection was closed unexpectedly", "ECONNRESET");
             return events + 1;
           }
+          const headLen = at + 4 - this.off;
+          const hardLimit = this.maxHeaderSize > 0 ? this.maxHeaderSize
+            : (G.__mbunHttpNative && G.__mbunHttpNative.getMaxHeaderSize ? G.__mbunHttpNative.getMaxHeaderSize() | 0 : 0);
+          if (hardLimit > 0 && headLen > hardLimit) {
+            this.off = at + 4;
+            this._err("Parse Error: Header overflow", "HPE_HEADER_OVERFLOW");
+            return events + 1;
+          }
           const head = latin1(this.buf, this.off, at);
           this.off = at + 4;
           // picohttpparser refuses any control byte inside the head: every byte
@@ -1190,15 +1205,66 @@ export constexpr std::string_view kNetJS = R"JS(
             if (!m) { this._err("Invalid HTTP request", "InvalidHTTPRequest"); return events + 1; }
             this.method = m[1].toUpperCase(); this.target = m[2]; this.httpVersion = m[3];
           }
+          // ---- header-block validation (llhttp strictness) ----------------
+          // Everything below is a request-smuggling vector when it is merely
+          // tolerated, so each one is a hard parse error with llhttp's own
+          // code (node surfaces them through 'clientError' / the request's
+          // 'error', and the default server answer is 400 Bad Request).
           this.headers = {}; this.rawHeaders = [];
+          let sawCL = false, sawTE = false, teChunked = false, clValue = null;
           for (const line of lines) {
             if (!line) continue;
+            // A CR or LF that did not terminate a line: the header block was
+            // framed with a bare CR/LF, which two parsers can disagree about.
+            if (line.indexOf("\r") !== -1 || line.indexOf("\n") !== -1) {
+              this._err("Parse Error: Expected LF after CR", "HPE_LF_EXPECTED");
+              return events + 1;
+            }
             const c = line.indexOf(":");
-            if (c < 0) continue;
-            const k = line.slice(0, c).trim(), v = line.slice(c + 1).trim();
+            // No separator at all, an empty name, or whitespace between the
+            // name and the colon (obs-fold / "Name : value") is invalid.
+            if (c <= 0 || /[ \t]$/.test(line.slice(0, c))) {
+              this._err("Parse Error: Invalid header token", "HPE_INVALID_HEADER_TOKEN");
+              return events + 1;
+            }
+            const k = line.slice(0, c), v = line.slice(c + 1).trim();
+            if (!HEADER_TOKEN_RE.test(k)) {
+              this._err("Parse Error: Invalid header token", "HPE_INVALID_HEADER_TOKEN");
+              return events + 1;
+            }
             const lk = k.toLowerCase();
+            if (lk === "content-length") {
+              if (!/^\d+$/.test(v)) {
+                this._err("Parse Error: Invalid content length", "HPE_UNEXPECTED_CONTENT_LENGTH");
+                return events + 1;
+              }
+              // Two Content-Lengths (or one folded "1, 2") let a proxy and an
+              // origin frame the same bytes differently.
+              if (sawCL && clValue !== v) {
+                this._err("Parse Error: Duplicate Content-Length", "HPE_UNEXPECTED_CONTENT_LENGTH");
+                return events + 1;
+              }
+              sawCL = true; clValue = v;
+            } else if (lk === "transfer-encoding") {
+              const codings = v.toLowerCase().split(",").map((t) => t.trim()).filter((t) => t.length);
+              const chunkedAt = codings.indexOf("chunked");
+              // chunked must be the final coding and appear exactly once; any
+              // other shape leaves the body length undefined.
+              teChunked = !sawTE && codings.length > 0 && chunkedAt === codings.length - 1 &&
+                          codings.lastIndexOf("chunked") === chunkedAt;
+              sawTE = true;
+            }
+            if (this.maxHeaderPairs > 0 && this.rawHeaders.length >= this.maxHeaderPairs) continue;
             this.rawHeaders.push(k, v);
             this.headers[lk] = lk in this.headers ? this.headers[lk] + ", " + v : v;
+          }
+          // Transfer-Encoding together with Content-Length is the classic
+          // desync: llhttp refuses the combination outright, before the message
+          // is ever handed to the application.
+          if (sawTE && sawCL) {
+            this._err("Parse Error: Content-Length can't be present with Transfer-Encoding",
+                      "HPE_INVALID_TRANSFER_ENCODING");
+            return events + 1;
           }
           if (this.isResponse && this.status >= 100 && this.status < 200 && this.status !== 101) {
             if (this.onInterim) {
@@ -1209,18 +1275,24 @@ export constexpr std::string_view kNetJS = R"JS(
             continue;  // 1xx interim: the final response follows on this connection
           }
           this.headDone = true;
-          const teHdr = String(this.headers["transfer-encoding"] || "").toLowerCase();
-          const cl = this.headers["content-length"];
           const noBody = this.isResponse
             ? (this.reqMethod === "HEAD" || this.status === 204 || this.status === 304)
             : false;
           if (noBody) { this.state = "done"; }
-          else if (teHdr.indexOf("chunked") !== -1) { this.chunked = true; this.state = "chunk-size"; }
-          else if (cl !== undefined) { this.remaining = parseInt(cl, 10) || 0; this.state = this.remaining > 0 ? "body-cl" : "done"; }
+          else if (sawTE && teChunked) { this.chunked = true; this.state = "chunk-size"; }
+          else if (sawTE) { this.state = "te-invalid"; }
+          else if (sawCL) { this.remaining = parseInt(clValue, 10) || 0; this.state = this.remaining > 0 ? "body-cl" : "done"; }
           else if (this.isResponse) { this.toEof = true; this.state = "body-eof"; }
           else { this.state = "done"; }
           events++;
           if (this.onHead) this.onHead();
+          // llhttp raises on_headers_complete first and only then rejects a
+          // Transfer-Encoding it cannot frame, so the request is observed once
+          // and its body never is (test-http-transfer-encoding-repeated-chunked).
+          if (this.state === "te-invalid") {
+            this._err("Parse Error: Invalid transfer encoding", "HPE_INVALID_TRANSFER_ENCODING");
+            return events + 1;
+          }
           if (this.state === "done") { this._finish(); return events + 1; }
           continue;
         }
@@ -1248,10 +1320,17 @@ export constexpr std::string_view kNetJS = R"JS(
           }
           let line = latin1(this.buf, this.off, at);
           this.off = at + 2;
+          // A chunk-size line is hex digits plus an optional extension, and
+          // nothing else -- a stray CR/LF inside it is how a chunk-extension
+          // smuggling payload hides a second request
+          // (test-http-chunked-smuggling, test-http-dummy-characters-smuggling).
+          if (!/^[0-9a-fA-F]+[ \t]*(;[^\r\n]*)?$/.test(line)) {
+            this._err("Parse Error: Invalid chunk size", "HPE_INVALID_CHUNK_SIZE");
+            return events + 1;
+          }
           const semi = line.indexOf(";");
-          if (semi !== -1) line = line.slice(0, semi);  // chunk extensions tolerated
+          if (semi !== -1) line = line.slice(0, semi);
           line = line.trim();
-          if (!/^[0-9a-fA-F]+$/.test(line)) { this._err("Invalid HTTP response (bad chunk size)", "InvalidHTTPResponse"); return events + 1; }
           const size = parseInt(line, 16);
           events++;
           if (size === 0) { this.state = "trailers"; continue; }
@@ -1314,6 +1393,7 @@ export constexpr std::string_view kNetJS = R"JS(
     this.headers = {}; this.rawHeaders = []; this.trailers = {};
     this.remaining = 0; this.chunked = false; this.toEof = false;
     this.reqMethod = "GET";
+    this.maxHeaderPairs = 0; this.maxHeaderSize = 0;
     this.onHead = this.onBody = this.onDone = this.onError = this.onInterim = null;
     this._afterDone = null; this.socket = null; this.outgoing = null;
     this._pooled = false;
@@ -2499,6 +2579,10 @@ export constexpr std::string_view kNetJS = R"JS(
 
       const startParser = () => {
         const parser = new HttpParser(false);
+        if (typeof srv.maxHeadersCount === "number" && srv.maxHeadersCount > 0) {
+          parser.maxHeaderPairs = srv.maxHeadersCount << 1;
+        }
+        if (typeof o.maxHeaderSize === "number" && o.maxHeaderSize > 0) parser.maxHeaderSize = o.maxHeaderSize;
         sock._httpParser = parser;
         let im = null;
         let res = null;
@@ -2637,8 +2721,20 @@ export constexpr std::string_view kNetJS = R"JS(
           if (parser._afterDone) { const f = parser._afterDone; parser._afterDone = null; f(); }
         };
         parser.onError = (e) => {
-          if (srv.listenerCount("clientError") > 0) srv.emit("clientError", e || mkErr("Parse Error", "HPE_INVALID_CONSTANT"), sock);
-          sock.destroy();
+          const err = e || mkErr("Parse Error", "HPE_INVALID_CONSTANT");
+          // lib/_http_server.js socketOnError: the server's own answer to a
+          // malformed request is a canned 400 (431 when the head overflowed),
+          // and only when nobody claimed 'clientError'.
+          if (!srv.emit("clientError", err, sock)) {
+            if (sock.writable && sock.bytesWritten === 0) {
+              const body = err.code === "HPE_HEADER_OVERFLOW"
+                ? "HTTP/1.1 431 Request Header Fields Too Large\r\nConnection: close\r\n\r\n"
+                : "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n";
+              try { sock.end(body); } catch (e2) { try { sock.destroy(); } catch (e3) {} }
+            } else {
+              sock.destroy();
+            }
+          }
         };
       };
 
