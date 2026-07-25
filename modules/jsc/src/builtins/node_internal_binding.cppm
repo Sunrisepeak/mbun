@@ -759,6 +759,23 @@ inline constexpr std::string_view kNodeInternalBindingJS = R"JS(
     };
   };
 
+  // -------------------------------------------------------------- timers ----
+  // node src/timers.cc. `lib/internal/timers.js` reads `immediateInfo` /
+  // `timeoutInfo` as shared counter arrays and calls the four scheduling
+  // methods; this runtime owns its own timer wheel, so the methods are no-ops
+  // and the arrays are real (so node's ref-counting arithmetic still balances).
+  // What this buys is that the module *loads* — the corpus reaches into it for
+  // the `kTimeout` symbol.
+  factories["timers"] = () => ({
+    immediateInfo: new Uint32Array(3),
+    timeoutInfo: new Int32Array(1),
+    setupTimers() {},
+    getLibuvNow: () => Math.trunc(G.performance ? G.performance.now() : Date.now()),
+    scheduleTimer() {},
+    toggleTimerRef() {},
+    toggleImmediateRef() {},
+  });
+
   // ----------------------------------------------------------------- icu ----
   factories["icu"] = () => ({
     icuErrName: (n) => "U_ERROR_" + n,
