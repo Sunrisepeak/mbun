@@ -41,6 +41,37 @@ export constexpr std::string_view kHttp2JS = R"JS(
     Promise.withResolvers = function () { let resolve, reject; const promise = new Promise((res, rej) => { resolve = res; reject = rej; }); return { promise, resolve, reject }; };
   }
 
+  // === built-in HTTP/2 diagnostics channels ===
+  // node lib/internal/http2/core.js resolves these twelve channels once at module
+  // load and gates every publish on `hasSubscribers`, so an unsubscribed channel
+  // costs one property read on the hot path. kNodeDiagJS ships inside the master
+  // builtins blob, which is evaluated before this partition, so the module is
+  // already there; the kNoDC fallback only matters if it ever is not.
+  const dc = M["diagnostics_channel"] || M["node:diagnostics_channel"];
+  const kNoDC = { hasSubscribers: false, publish() {} };
+  const dcChan = (name) => (dc && typeof dc.channel === "function" ? dc.channel(name) : kNoDC);
+  const onClientStreamCreatedChannel = dcChan("http2.client.stream.created");
+  const onClientStreamStartChannel = dcChan("http2.client.stream.start");
+  const onClientStreamErrorChannel = dcChan("http2.client.stream.error");
+  const onClientStreamBodyChunkSentChannel = dcChan("http2.client.stream.bodyChunkSent");
+  const onClientStreamBodySentChannel = dcChan("http2.client.stream.bodySent");
+  const onClientStreamFinishChannel = dcChan("http2.client.stream.finish");
+  const onClientStreamCloseChannel = dcChan("http2.client.stream.close");
+  const onServerStreamCreatedChannel = dcChan("http2.server.stream.created");
+  const onServerStreamStartChannel = dcChan("http2.server.stream.start");
+  const onServerStreamErrorChannel = dcChan("http2.server.stream.error");
+  const onServerStreamFinishChannel = dcChan("http2.server.stream.finish");
+  const onServerStreamCloseChannel = dcChan("http2.server.stream.close");
+  // node publishes 'close' exactly once per stream, from nghttp2's onStreamClose.
+  // mbun reaches the same point from two directions (a graceful finish and a
+  // destroy), so the publish is latched.
+  function dcPublishStreamClose(stream) {
+    if (stream._dcClosePublished) return;
+    stream._dcClosePublished = true;
+    const ch = stream._serverSide === true ? onServerStreamCloseChannel : onClientStreamCloseChannel;
+    if (ch.hasSubscribers) ch.publish({ stream });
+  }
+
   // === constants (blueprint: bun-ref src/js/node/http2.ts) ===
   const constants = {
   NGHTTP2_ERR_FRAME_SIZE_ERROR: -522,
@@ -326,6 +357,15 @@ export constexpr std::string_view kHttp2JS = R"JS(
   }
   const sessionErr = (code) => mkErr("Session closed with error code " + errName(code), "ERR_HTTP2_SESSION_ERROR");
   const streamErr = (code) => mkErr("Stream closed with error code " + errName(code), "ERR_HTTP2_STREAM_ERROR");
+  // internal/errors.js AbortError: what request({ signal }) destroys the stream
+  // with once the signal fires.
+  const abortErr = (reason) => {
+    const e = new Error("This operation was aborted");
+    e.name = "AbortError";
+    e.code = "ABORT_ERR";
+    if (reason !== undefined) e.cause = reason;
+    return e;
+  };
   // internal/errors.js ERR_HTTP2_STREAM_CANCEL: the error a session destroy hands
   // to a stream that never got a stream id (node's `pendingStreams`).
   const streamCancelErr = (cause) => {
@@ -863,6 +903,11 @@ export constexpr std::string_view kHttp2JS = R"JS(
     if (stream._endStreamSent) { G.queueMicrotask(cb); return; }
     const buf = bufFromChunk(chunk, enc);
     stream.session._sendData(stream, buf, false);
+    // node Http2Stream[kWriteGeneric]: the client publishes every outbound body
+    // chunk AFTER it has been handed to the transport.
+    if (stream._serverSide !== true && onClientStreamBodyChunkSentChannel.hasSubscribers) {
+      onClientStreamBodyChunkSentChannel.publish({ stream, writev: false, data: chunk, encoding: enc });
+    }
     G.queueMicrotask(cb);
   }
   function http2StreamWritev(stream, chunks, cb) {
@@ -870,22 +915,41 @@ export constexpr std::string_view kHttp2JS = R"JS(
     const parts = [];
     for (let i = 0; i < chunks.length; i++) parts.push(bufFromChunk(chunks[i].chunk, chunks[i].encoding));
     stream.session._sendData(stream, Buffer.concat(parts), false);
+    // node routes the writev batch through writevGeneric, which — when every
+    // entry is already a Buffer — REPLACES each `{chunk, encoding}` entry with
+    // its bare chunk in place before the publish runs. A mixed batch keeps the
+    // entry objects. The published `data` has to have that same shape, and
+    // `encoding` is the empty string node's _writev passes through.
+    if (stream._serverSide !== true && onClientStreamBodyChunkSentChannel.hasSubscribers) {
+      let data = chunks;
+      if (chunks.allBuffers) { data = []; for (let i = 0; i < chunks.length; i++) data.push(chunks[i].chunk); }
+      onClientStreamBodyChunkSentChannel.publish({ stream, writev: true, data, encoding: "" });
+    }
     G.queueMicrotask(cb);
   }
   // The writable side finished. Without waitForTrailers that is an empty
   // DATA(END_STREAM); with it, END_STREAM is held back until sendTrailers()
   // (node kWaitForTrailers -> 'wantTrailers' -> sendTrailers()).
   function http2StreamFinal(stream, waitForTrailers, cb) {
-    if (stream._endStreamSent) { cb(); maybeFinishHttp2Stream(stream); return; }
+    // node Http2Stream#_final publishes bodySent on every path it takes (the
+    // writable side is done regardless of whether END_STREAM rode on HEADERS).
+    const bodySent = () => {
+      if (stream._serverSide !== true && onClientStreamBodySentChannel.hasSubscribers) {
+        onClientStreamBodySentChannel.publish({ stream });
+      }
+    };
+    if (stream._endStreamSent) { cb(); bodySent(); maybeFinishHttp2Stream(stream); return; }
     if (waitForTrailers) {
       stream._trailersReady = true;
       stream.emit("wantTrailers");
       cb();
+      bodySent();
       return;
     }
     stream.session._sendData(stream, Buffer.alloc(0), true);
     stream._endStreamSent = true;
     cb();
+    bodySent();
     maybeFinishHttp2Stream(stream);
   }
   function http2StreamRead(stream) {
@@ -966,8 +1030,19 @@ export constexpr std::string_view kHttp2JS = R"JS(
   function http2StreamDestroy(stream, err, cb) {
     if (!stream._closed) {
       stream._closed = true;
-      stream.rstCode = err ? constants.NGHTTP2_INTERNAL_ERROR : (stream.rstCode || constants.NGHTTP2_NO_ERROR);
+      // node Http2Stream#_destroy: "Enables using AbortController to cancel
+      // requests with RST code 8" — an AbortError resets with CANCEL, any other
+      // error with INTERNAL_ERROR. mbun has no AbortError class, so the name is
+      // the discriminator.
+      stream.rstCode = err
+        ? (err.name === "AbortError" ? constants.NGHTTP2_CANCEL : constants.NGHTTP2_INTERNAL_ERROR)
+        : (stream.rstCode || constants.NGHTTP2_NO_ERROR);
       try { stream.session._rstStream(stream, stream.rstCode); } catch (e) {}
+    }
+    dcPublishStreamClose(stream);
+    if (err) {
+      const ch = stream._serverSide === true ? onServerStreamErrorChannel : onClientStreamErrorChannel;
+      if (ch.hasSubscribers) ch.publish({ stream, error: err });
     }
     try { stream.session.streams.delete(stream.id); } catch (e) {}
     const sess = stream.session;
@@ -991,12 +1066,22 @@ export constexpr std::string_view kHttp2JS = R"JS(
     if (!kHaveDuplex || stream.destroyed) return;
     if (!stream._endStreamSent) return;
     if (!stream.readableEnded) return;
+    // Both halves are done — nghttp2's onStreamClose point. node marks the
+    // stream closed (rstCode NO_ERROR, no RST_STREAM on the wire) and publishes
+    // the close channel *before* deferring the destroy, so a subscriber sees
+    // `closed === true, destroyed === false`.
+    stream._closed = true;
+    dcPublishStreamClose(stream);
     G.queueMicrotask(() => { if (!stream.destroyed) stream.destroy(); });
   }
   function http2StreamFinish(stream) {
     if (stream._finished) return;
     stream._finished = true;
     stream._closed = true;
+    // node's onStreamClose runs while the stream is closed but not yet
+    // destroyed, and the corpus asserts exactly that (`closed === true`,
+    // `destroyed === false`) inside the close-channel subscriber.
+    dcPublishStreamClose(stream);
     if (kHaveDuplex) {
       G.queueMicrotask(() => { if (!stream.destroyed) stream.destroy(); });
       return;
@@ -1100,6 +1185,17 @@ export constexpr std::string_view kHttp2JS = R"JS(
       // node ClientHttp2Stream: `endAfterHeaders` is false until the peer's
       // response HEADERS arrive carrying END_STREAM.
       this.endAfterHeaders = false;
+      // node's Http2Stream constructor corks the stream ("ensures that those are
+      // buffered until the handle has been assigned") and uncorks in kInit. The
+      // handle only exists once the session has connected, so every write issued
+      // between http2.connect() and the TCP handshake lands as ONE _writev batch
+      // instead of a series of _write calls — which is exactly what the
+      // bodyChunkSent diagnostics channel reports (writev: true, data: [...]).
+      if (kHaveDuplex && session && session._connected !== true) {
+        this.cork();
+        const self = this;
+        session.once("connect", () => { try { self.uncork(); } catch (e) {} });
+      }
     }
     get closed() { return this._closed; }
     get state() { return streamState(this); }
@@ -1321,6 +1417,25 @@ export constexpr std::string_view kHttp2JS = R"JS(
       // with an already-finished writable side.
       if (endStream) { stream._endStreamSent = true; stream.end(); }
       stream.pending = false;
+      // node ClientHttp2Session#request: 'created' is published with the
+      // prepared header object (`sentHeaders`), 'start' once the HEADERS frame
+      // has actually been submitted.
+      if (onClientStreamCreatedChannel.hasSubscribers) onClientStreamCreatedChannel.publish({ stream, headers: stream.sentHeaders });
+      if (onClientStreamStartChannel.hasSubscribers) onClientStreamStartChannel.publish({ stream, headers: stream.sentHeaders });
+      // node ClientHttp2Session#request options.signal: an aborted signal
+      // destroys the stream with an AbortError (which resets with CANCEL, see
+      // http2StreamDestroy).
+      const signal = options.signal;
+      if (signal !== undefined && signal !== null) {
+        if (typeof signal !== "object" || typeof signal.aborted !== "boolean" || typeof signal.addEventListener !== "function")
+          throw argTypeErr("options.signal", "an instance of AbortSignal", signal);
+        const aborter = () => { if (!stream.destroyed) stream.destroy(abortErr(signal.reason)); };
+        if (signal.aborted) aborter();
+        else {
+          signal.addEventListener("abort", aborter, { once: true });
+          stream.once("close", () => { try { signal.removeEventListener("abort", aborter); } catch (e) {} });
+        }
+      }
       return stream;
     }
 
@@ -1540,6 +1655,10 @@ export constexpr std::string_view kHttp2JS = R"JS(
       push._endStreamSent = true;
       push.end();
       this.streams.set(pb.promisedId, push);
+      // node onStreamHeaders (client + push promise): the promised stream is
+      // announced on the same two channels a request() stream is.
+      if (onClientStreamCreatedChannel.hasSubscribers) onClientStreamCreatedChannel.publish({ stream: push, headers: headersObj });
+      if (onClientStreamStartChannel.hasSubscribers) onClientStreamStartChannel.publish({ stream: push, headers: headersObj });
       this.emit("stream", push, headersObj, flags);
       return true;
     }
@@ -1581,6 +1700,9 @@ export constexpr std::string_view kHttp2JS = R"JS(
       if (stream.pushed === true && !stream._responseEmitted) {
         stream._responseEmitted = true;
         stream.emit("push", headersObj, flags, rawHeaders);
+        // node onStreamHeaders: the 'finish' channel covers the 'response' and
+        // 'push' events only — an informational or trailer block is not a finish.
+        if (onClientStreamFinishChannel.hasSubscribers) onClientStreamFinishChannel.publish({ stream, headers: headersObj, flags });
         if (pb.endStream) { this.streams.delete(pb.streamId); stream._onEnd(); }
         return true;
       }
@@ -1596,7 +1718,10 @@ export constexpr std::string_view kHttp2JS = R"JS(
         // response is additionally surfaced as 'continue'.
         if (st === 100) stream.emit("continue");
       }
-      else stream._onResponse(headersObj, flags, rawHeaders);
+      else {
+        stream._onResponse(headersObj, flags, rawHeaders);
+        if (onClientStreamFinishChannel.hasSubscribers) onClientStreamFinishChannel.publish({ stream, headers: headersObj, flags });
+      }
       if (pb.endStream) { this.streams.delete(pb.streamId); stream._onEnd(); }
       return true;
     }
@@ -2276,6 +2401,9 @@ export constexpr std::string_view kHttp2JS = R"JS(
       if (endStream) { flags = FLAG.END_STREAM; this._endStreamSent = true; }
       else if (options.waitForTrailers) this._wantTrailers = true;
       writeHeaderBlock(this.session, this.id, block, flags);
+      // node ServerHttp2Stream#respond: 'finish' fires once the response HEADERS
+      // have been submitted (never when the submit itself failed).
+      if (onServerStreamFinishChannel.hasSubscribers) onServerStreamFinishChannel.publish({ stream: this, headers: this.sentHeaders, flags });
       if (endStream) { this.end(); http2StreamFinish(this); }
       return;
     }
@@ -2441,7 +2569,12 @@ export constexpr std::string_view kHttp2JS = R"JS(
       // EOF and `endAfterHeaders` is true.
       push.endAfterHeaders = true;
       session.streams.set(id, push);
+      // node ServerHttp2Stream#pushStream publishes 'created' synchronously and
+      // defers 'start' to the tick that invokes the callback, so createdTime is
+      // strictly before startTime here too.
+      if (onServerStreamCreatedChannel.hasSubscribers) onServerStreamCreatedChannel.publish({ stream: push, headers: h });
       G.queueMicrotask(() => {
+        if (onServerStreamStartChannel.hasSubscribers) onServerStreamStartChannel.publish({ stream: push, headers: h });
         push._onRequestEnd();
         callback(null, push, h);
       });
@@ -2737,6 +2870,12 @@ export constexpr std::string_view kHttp2JS = R"JS(
       // only learns them here. Left unset, respond() never applied the implicit
       // END_STREAM a HEAD response requires (the peer saw flags 4, not 5).
       stream.headRequest = typeof headersObj[":method"] === "string" && headersObj[":method"].toUpperCase() === "HEAD";
+      // node onStreamHeaders (server): 'created' then 'start', both before the
+      // application sees the 'stream' event. The order is observable —
+      // test-diagnostics-channel-http2-server-stream-created-start-timing
+      // asserts createdTime < startTime for every stream.
+      if (onServerStreamCreatedChannel.hasSubscribers) onServerStreamCreatedChannel.publish({ stream, headers: headersObj });
+      if (onServerStreamStartChannel.hasSubscribers) onServerStreamStartChannel.publish({ stream, headers: headersObj });
       const rawHeaders = [];
       for (let i = 0; i < list.length; i++) { rawHeaders.push(list[i][0], list[i][1]); }
       this.emit("stream", stream, headersObj, flags, rawHeaders);
