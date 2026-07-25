@@ -3,6 +3,21 @@
 > 只记录**实质进展**（模块落地、测试集通过数变化、性能节点），倒序排列。
 > 格式：`## YYYY-MM-DD` + 条目（关联任务 ID / commit / 测试与性能数据）。
 
+## 2026-07-26
+
+### 第十二轮 w4/agent-tls：TLS 选项层与密码套件（tls+https 128/263 → 144/263，实得 +16）
+
+`--filter test-tls --jobs 5 --timeout 15` 与 `--filter test-https` 实测：tls `pass 90 → 104`、`fail 95 → 81`；https `pass 38 → 40`、`fail 20 → 18`；**timeout 两边都是 17 / 3 不变**，`green→non-green` 回归 0。转绿 16 个：`cli-min-version-{1.0,1.1,1.2,1.3}`、`cli-max-version-{1.2,1.3}`、`min-max-version`、`options-boolean-check`(tls+https)、`keylog-tlsv13`、`https-agent-keylog`、`getcipher`、`set-ciphers`、`getprotocol`、`set-default-ca-certificates-{append,reset}-https-request`。
+
+- **`secureProtocol` 不是「取消版本窗口」**。此前按「node 传 min=max=0」实现，实际 `lib/internal/tls/common.js` **永远**传 `toV(minVersion, DEFAULT_MIN)`，再由 `crypto_context.cc` 按方法名逐条调整：只有 `TLS_method` 清掉下限，`SSLv23_method` 是**压低上限到 TLS1.2、保留默认下限**。当成完全放开后，SSLv23 端会跟 `TLSv1_method` 端协商出 TLS1.0/1.1，而 node 在这里是握手失败。同时补齐从未匹配过的 `_client_method` / `_server_method` 变体。
+- **`--tls-min-v1.x` 不是后者覆盖前者**，是 `lib/tls.js` 里固定顺序的 if/else 链：min 先看 v1.0、max 先看 v1.3，所以**最宽的那个赢**，与命令行位置无关。`--tls-min-v1.0 --tls-min-v1.1` 应得 TLSv1，此前得 TLSv1.1。
+- **TLS 1.3 套件走的是另一个 OpenSSL 槽位**。node `processCiphers` 按 `TLS_` 前缀把 `ciphers` 拆成两半，分别喂 `SSL_CTX_set_cipher_list` 与 `SSL_CTX_set_ciphersuites`；mbun 整串喂前者，于是每个 `TLS_AES_*` 都被判成 `ERR_SSL_NO_CIPHER_MATCH`。附带补上「只给了 1.3 套件时把版本下限抬到 TLS1.3」以及 `getCipher().standardName`（IANA 名，`AES256-SHA256` → `TLS_RSA_WITH_AES_256_CBC_SHA256`，无法从 OpenSSL 名推导，此前是原样重复）。
+- **`keylog` 事件从零实现**：引擎侧装 `SSL_CTX_set_keylog_callback` 并缓存（上限 64 行），`net.tlsKeylog(fd)` 破坏性抽取。**抽取只在有监听者时发生** —— TLSSocket 的 `newListener` 置位 `_keylogWanted`，tls.Server 仅在自身有 `keylog` 监听时才挂每连接转发，所以没有监听者的进程不会把密钥材料移出引擎，常规路径上也没有每次 poll 的原生调用。
+- **`tls.setDefaultCACertificates()` 此前只改 `getCACertificates()` 的返回值**，没有到达引擎。现在把变更后的信任库作为连接的 `ca` 交下去，并新增 `caIsComplete` 表示「这就是全部信任库」——空库也不得回落到平台库，因为 `setDefaultCACertificates([])` 的语义就是「谁都不信」。该标志**只会收窄信任**。
+- **空版本窗口的错误码此前报的是 BoringSSL 的** `ERR_SSL_NO_SUPPORTED_VERSIONS_ENABLED`；mbun 链接的是 OpenSSL 3，语料也正是按 `hasOpenSSL3` 分支期待 `ERR_SSL_NO_PROTOCOLS_AVAILABLE`。
+
+守卫集：tls 217 + https 63 全量（改动前后各一次），外加 418 文件跨子系统抽样（`test-net-` 全量 148 + 种子 20260726 的 http/http2 120 与其余 150），**三处回归均为 0，跨子系统抽样前后逐桶完全一致**。
+
 ## 2026-07-25
 
 ### 第十一轮整合：node 语料 2,369 → **2,403 / 4,433**（54.2% 严格 / 62.0% 排除自我跳过），组合回归 0
