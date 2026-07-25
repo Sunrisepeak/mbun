@@ -1847,6 +1847,15 @@ public:
         if (dgexc != nullptr && std::getenv("MBUN_DEBUG_BUILTINS")) {
             std::cerr << "[js_dgram error] " << describe_exception_(dgexc) << '\n';
         }
+        // node:https — node's lib/https.js: a tls.Server carrying the http
+        // server's _connectionListener, and an _http_agent Agent whose
+        // createConnection is tls.connect. Needs kNetJS (the http server
+        // factory) and kTlsLiveJS (the LIVE tls.Server / tls.connect).
+        JSValueRef hsexc{nullptr};
+        eval_(mbun::jsc::js_https_live::kHttpsLiveJS, &hsexc);
+        if (hsexc != nullptr && std::getenv("MBUN_DEBUG_BUILTINS")) {
+            std::cerr << "[js_https_live error] " << describe_exception_(hsexc) << '\n';
+        }
         // LAST: node's legacy constructor call forms (`http.Server(fn)` with no
         // `new`). It re-exports the affected classes through a callable stand-in,
         // so it must run after the final owner of each module object — kNetJS

@@ -580,6 +580,13 @@ export constexpr std::string_view kNetJS = R"JS(
     _flush() {
       if (this._fd < 0) return 0;
       if (this._tls === 1) return 0;  // handshake still in flight (see _poll)
+      // A TLS upgrade is scheduled but _startTls has not run yet (js_tls_live
+      // arms it on the transport's 'connect'). Anything queued in that window
+      // belongs INSIDE the TLS record layer: flushing it as cleartext would put
+      // the request bytes on the wire in front of the ClientHello. node:https
+      // hits this window on every request, because ClientRequest writes its
+      // header the moment tls.connect() returns the socket.
+      if (this._tlsPending) return 0;
       let progress = 0;
       // Encode at most WCHUNK bytes per write(): base64-ing the WHOLE pending
       // buffer each pass is quadratic (the socket accepts ~64 KB, so a large
@@ -2527,10 +2534,22 @@ export constexpr std::string_view kNetJS = R"JS(
   const ServerResponse = HTTPMOD.ServerResponse;
   const continueExpression = /(?:^|\W)100-continue(?:$|\W)/i;
 
-  function createHttpServer(o, handler) {
+  // `baseSrv` lets node:https reuse this whole layer: https.Server is a
+  // tls.Server carrying lib/_http_server.js's _connectionListener, so the only
+  // differences are which object is decorated and whether the message stream
+  // arrives as 'connection' (plaintext) or 'secureConnection' (a TLSSocket).
+  // Every per-connection http bookkeeping therefore hangs off `srv._httpConns`
+  // rather than net.Server's `_conns`: for https those are two different objects
+  // (the TLSSocket vs. the raw transport), and sweeping `_conns` would inspect
+  // sockets that carry none of the http state — closeIdleConnections() would
+  // read `_httpInFlight === undefined` on every raw socket and destroy the
+  // in-flight connection out from under a handler that called close().
+  function createHttpServer(o, handler, baseSrv) {
     if (typeof o === "function") { handler = o; o = {}; }
     o = o || {};
-    const srv = new Server({ allowHalfOpen: false });
+    const srv = baseSrv || new Server({ allowHalfOpen: false });
+    const connEvent = baseSrv ? "secureConnection" : "connection";
+    srv._httpConns = new Set();
     const ResponseClass = typeof o.ServerResponse === "function" ? o.ServerResponse : ServerResponse;
     const RequestClass = typeof o.IncomingMessage === "function" ? o.IncomingMessage : IncomingMessage;
     // lib/_http_server.js storeHTTPOptions.
@@ -2566,7 +2585,7 @@ export constexpr std::string_view kNetJS = R"JS(
     const sweep = () => {
       if (srv.headersTimeout === 0 && srv.requestTimeout === 0) return;
       const now = Date.now();
-      for (const s of Array.from(srv._conns)) {
+      for (const s of Array.from(srv._httpConns)) {
         // An idle keep-alive connection has no message in flight, so neither
         // clock is running (llhttp starts them at on_message_begin).
         if (s.destroyed || s._httpMsgIdle) continue;
@@ -2598,14 +2617,14 @@ export constexpr std::string_view kNetJS = R"JS(
     srv.setTimeout = function (msecs, cb) {
       this.timeout = msecs;
       if (typeof cb === "function") this.on("timeout", cb);
-      for (const s of Array.from(this._conns)) { try { s.setTimeout(msecs); } catch (e) {} }
+      for (const s of Array.from(this._httpConns)) { try { s.setTimeout(msecs); } catch (e) {} }
       return this;
     };
     // node http.Server surface (bun _http_server.ts:364 server.stop(true) /
     // :386 closeIdleConnections): destroy every / every idle tracked socket.
-    srv.closeAllConnections = function () { for (const s of Array.from(this._conns)) { try { s.destroy(); } catch (e) {} } };
+    srv.closeAllConnections = function () { for (const s of Array.from(this._httpConns)) { try { s.destroy(); } catch (e) {} } };
     srv.closeIdleConnections = function () {
-      for (const s of Array.from(this._conns)) {
+      for (const s of Array.from(this._httpConns)) {
         // Idle = the incoming request message has completed, which is what
         // node's native ConnectionsList tracks (last_message_start <=
         // last_message_end, driven by llhttp). Deliberately NOT keyed on the
@@ -2620,7 +2639,7 @@ export constexpr std::string_view kNetJS = R"JS(
     // closeIdleConnections(). Without it a keep-alive connection outlives
     // close() and pins the event loop until the keep-alive timer fires, which
     // is the difference between a test finishing and a test timing out.
-    const netClose = Server.prototype.close;
+    const netClose = srv.close;
     srv.close = function (...args) {
       this.closeIdleConnections();
       if (this._httpSweeper) { G.clearInterval(this._httpSweeper); this._httpSweeper = null; }
@@ -2631,7 +2650,7 @@ export constexpr std::string_view kNetJS = R"JS(
     // emitListeningNextTick -> emit("listening", null, hostname, port)). The
     // hostname is the bind host, defaulting to "localhost" (bun's Bun.serve
     // default), while address() keeps the wildcard "::" it actually bound.
-    const netListen = Server.prototype.listen;
+    const netListen = srv.listen;
     srv.listen = function (...args) {
       let host = "localhost", cb = null;
       const a0 = args[0];
@@ -2650,8 +2669,10 @@ export constexpr std::string_view kNetJS = R"JS(
     };
     if (typeof handler === "function") srv.on("request", handler);
 
-    srv.on("connection", (sock) => {
+    srv.on(connEvent, (sock) => {
       sock.on("error", () => {});
+      srv._httpConns.add(sock);
+      sock.once("close", () => srv._httpConns.delete(sock));
       if (srv.timeout) { try { sock.setTimeout(srv.timeout); } catch (e) {} }
       sock.server = srv;
       sock._httpInFlight = 0;
@@ -2900,6 +2921,10 @@ export constexpr std::string_view kNetJS = R"JS(
     createServer: createHttpServer,
     Server: HttpServer, IncomingMessage, ServerResponse,
   }));
+  // js_https_live.cppm builds https.Server out of this: an https.Server is a
+  // tls.Server carrying lib/_http_server.js's _connectionListener, and the
+  // listener is exactly what createHttpServer installs.
+  G.__mbunHttpServerFactory = createHttpServer;
 
   // ---- real network fetch() ---------------------------------------------------
   // data:/blob: resolve locally; http:// goes over a real socket (Connection:
