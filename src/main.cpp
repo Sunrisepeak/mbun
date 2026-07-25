@@ -79,6 +79,12 @@ int main(int argc, char* argv[]) {
 
     std::vector<std::string_view> args(argv + 1, argv + argc);
 
+    // node's `--test` CLI: the positionals are test files for node:test's
+    // runner, not an entry point to execute. Checked before every bun flag loop
+    // because `--test` is not a bun flag and the node-emulation fallback below
+    // would boot the first positional as an ordinary script.
+    if (has_node_test_flag(args)) return exec_node_test_cli(args);
+
     // `-i` / `--interactive` forces the REPL, before any other flag handling:
     // it is not a run flag (there is no run target) and it must survive
     // alongside `-e`/`--eval`, which the strip loop below stops at.

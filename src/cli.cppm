@@ -109,6 +109,14 @@ bool node_flag_takes_value(std::string_view flag) {
         "-r", "--require", "--snapshot-blob", "--build-snapshot-config",
         "--test-reporter", "--test-reporter-destination", "--test-name-pattern",
         "--test-skip-pattern", "--test-shard", "--test-concurrency",
+        // node's remaining valued --test* flags. The corpus passes several of
+        // them in the space form (`--test-timeout 10`), and without this the
+        // value token is mistaken for a test file / the script to run.
+        "--test-timeout", "--test-isolation", "--experimental-test-isolation",
+        "--test-global-setup", "--experimental-test-global-setup",
+        "--test-tag-filter", "--experimental-test-tag-filter",
+        "--test-rerun-failures", "--test-random-seed", "--test-coverage-include",
+        "--test-coverage-exclude",
         "--heap-prof-interval", "--heap-prof-dir", "--heap-prof-name",
         "--cpu-prof-interval", "--cpu-prof-dir", "--cpu-prof-name",
         "--trace-event-categories", "--trace-event-file-pattern",

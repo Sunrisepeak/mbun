@@ -130,13 +130,18 @@ inline constexpr std::string_view kNodeTestRunJS = R"JS(
           else if (data.todo !== undefined) counts.todo++;
           else if (failed) counts.fail++;
           else counts.pass++;
-          if (data.nesting === 0) topLevel++;
           const directive = data.skip !== undefined
             ? " # SKIP" + (typeof data.skip === "string" ? " " + tapEscape(data.skip) : "")
             : data.todo !== undefined
               ? " # TODO" + (typeof data.todo === "string" ? " " + tapEscape(data.todo) : "")
-              : "";
-          const number = data.testNumber === undefined ? 1 : data.testNumber;
+              : data.expectFailure !== undefined
+                ? " # EXPECTED FAILURE" +
+                  (typeof data.expectFailure === "string" ? " " + tapEscape(data.expectFailure) : "")
+                : "";
+          // node's parent renumbers the top level: a run over several files is
+          // one TAP document, and each child restarts its own numbering at 1.
+          const number = data.nesting === 0 ? ++topLevel
+            : (data.testNumber === undefined ? 1 : data.testNumber);
           yield indent(data.nesting) + (failed ? "not ok " : "ok ") + number + " - " +
                 tapEscape(data.name) + directive + "\n";
           const ms = data.details && data.details.duration_ms !== undefined ? data.details.duration_ms : 0;
@@ -411,6 +416,22 @@ inline constexpr std::string_view kNodeTestRunJS = R"JS(
       // `given` is what the caller wrote (node names the file test with it);
       // `files` is what gets executed.
       const files = given.map((f) => (path.isAbsolute(f) ? f : path.resolve(cwd, f)));
+      // node lib/internal/test_runner/runner.js createTestFileList: an explicit,
+      // magic-free pattern that matches nothing is a user error, reported on
+      // stderr with nothing on stdout.
+      if (options.files !== undefined && files.length !== 0) {
+        const fs = fsMod();
+        const missing = files.filter((f) => {
+          if (/[*?[\]{}]/.test(f)) return false;
+          try { fs.statSync(f); return false; } catch (e) { return true; }
+        });
+        if (missing.length === files.length) {
+          const e = new Error("Could not find '" + given.join(", ") + "'");
+          e.code = "ERR_TEST_FILES_NOT_FOUND";
+          e.__mbunUserError = true;
+          throw e;
+        }
+      }
 
       // node lib/internal/test_runner/tag_filter.js: an include filter keeps a
       // test whose flattened tag set matches any filter (`db:*` is a prefix
@@ -487,6 +508,12 @@ inline constexpr std::string_view kNodeTestRunJS = R"JS(
           else await runIsolated(files, given, forward, options, cwd, aborted);
           if (options.watch) stream.emitMessage("test:watch:drained", {});
         } catch (error) {
+          if (error && error.__mbunUserError) {
+            // node prints these itself and exits; nothing reaches the stream.
+            try { G.console.error(error.message); } catch (e) {}
+            try { G.process.exit(1); } catch (e) {}
+            return;
+          }
           stream.emitMessage("test:fail", {
             name: "run()", nesting: 0, testNumber: 1, tags: [],
             details: { duration_ms: 0, type: "test", error },
@@ -632,6 +659,14 @@ inline constexpr std::string_view kNodeTestRunJS = R"JS(
         // node reports the FILE itself as a failing test when the process could
         // not produce results (missing file, syntax error, non-zero exit with
         // nothing reported) — that is the only way those become visible.
+        if (code === 0 && !signal && !sawResult) {
+          // A test file with no tests is itself reported as a passing test
+          // (node's FileTest); `--test` over a tree relies on it.
+          const e = fileEvent(given, file, internals.nextId());
+          e.testNumber = ordinal;
+          e.details = { duration_ms: Date.now() - startedAt, type: "test" };
+          forward("test:pass", e);
+        }
         if ((code !== 0 || signal) && !sawResult) {
           const error = new Error("test failed");
           error.code = "ERR_TEST_FAILURE";
@@ -645,6 +680,218 @@ inline constexpr std::string_view kNodeTestRunJS = R"JS(
         resolve();
       });
     });
+
+    // ------------------------------------------------------ the --test CLI ----
+    // PORT-SOURCE: node lib/internal/main/test_runner.js + the `--test*` half of
+    // lib/internal/test_runner/utils.js (parseCommandLine / reporter selection).
+    // The C++ side (src/app.cppm exec_node_test_cli) only forwards the raw
+    // command line here, so node's option table stays in one place.
+    const parseTestFlags = (flags) => {
+        const opts = {};
+        const reporterNames = [];
+        const destinations = [];
+        const patterns = [];
+        const skipPatterns = [];
+        const tagFilters = [];
+        const take = (i, inline) => (inline !== undefined ? inline : flags[i + 1]);
+        for (let i = 0; i < flags.length; i++) {
+            const raw = flags[i];
+            const eq = raw.indexOf("=");
+            const name = eq === -1 ? raw : raw.slice(0, eq);
+            const inline = eq === -1 ? undefined : raw.slice(eq + 1);
+            switch (name) {
+                case "--test": break;
+                case "--test-only": opts.only = true; break;
+                case "--test-force-exit": opts.forceExit = true; break;
+                case "--test-update-snapshots": opts.updateSnapshots = true; break;
+                case "--watch": case "--test-watch": opts.watch = true; break;
+                case "--test-reporter": { const v = take(i, inline); if (v !== undefined) { reporterNames.push(v); if (inline === undefined) i++; } break; }
+                case "--test-reporter-destination": { const v = take(i, inline); if (v !== undefined) { destinations.push(v); if (inline === undefined) i++; } break; }
+                case "--test-name-pattern": { const v = take(i, inline); if (v !== undefined) { patterns.push(v); if (inline === undefined) i++; } break; }
+                case "--test-skip-pattern": { const v = take(i, inline); if (v !== undefined) { skipPatterns.push(v); if (inline === undefined) i++; } break; }
+                case "--test-tag-filter": case "--experimental-test-tag-filter":
+                    { const v = take(i, inline); if (v !== undefined) { tagFilters.push(v); if (inline === undefined) i++; } break; }
+                case "--test-concurrency": { const v = take(i, inline); if (v !== undefined) { opts.concurrency = +v; if (inline === undefined) i++; } break; }
+                case "--test-timeout": { const v = take(i, inline); if (v !== undefined) { opts.timeout = +v; if (inline === undefined) i++; } break; }
+                case "--test-shard": {
+                    const v = take(i, inline);
+                    if (v !== undefined) {
+                        const parts = String(v).split("/");
+                        opts.shard = { index: +parts[0], total: +parts[1] };
+                        if (inline === undefined) i++;
+                    }
+                    break;
+                }
+                case "--test-isolation": case "--experimental-test-isolation": {
+                    const v = take(i, inline);
+                    if (v !== undefined) { opts.isolation = v; if (inline === undefined) i++; }
+                    break;
+                }
+                case "--test-global-setup": case "--experimental-test-global-setup": {
+                    const v = take(i, inline);
+                    if (v !== undefined) { opts.globalSetupPath = v; if (inline === undefined) i++; }
+                    break;
+                }
+                default:
+                    // Any other node flag is a child execArgv concern: forward it
+                    // so `--test --expose-gc x.js` still exposes gc in the child.
+                    if (name !== "--test") (opts.execArgv || (opts.execArgv = [])).push(raw);
+                    break;
+            }
+        }
+        if (patterns.length !== 0) opts.testNamePatterns = patterns;
+        if (skipPatterns.length !== 0) opts.testSkipPatterns = skipPatterns;
+        if (tagFilters.length !== 0) opts.testTagFilters = tagFilters;
+        return { opts, reporterNames, destinations };
+    };
+
+    // node's default is `spec` on a TTY and `tap` otherwise
+    // (lib/internal/test_runner/utils.js kDefaultReporter).
+    const resolveReporter = (name) => {
+        if (name === undefined) {
+            let tty = false;
+            try { tty = !!(G.process.stdout && G.process.stdout.isTTY); } catch (e) {}
+            return tty ? reporters.spec : reporters.tap;
+        }
+        if (reporters[name] !== undefined) return reporters[name];
+        // A custom reporter is a module specifier.
+        try {
+            const createRequire = mod("module").createRequire;
+            const req = createRequire(pathMod().join(G.process.cwd(), "index.js"));
+            const loaded = req(name);
+            return loaded && loaded.default !== undefined ? loaded.default : loaded;
+        } catch (e) {
+            const err = new Error("Cannot find module '" + name + "'");
+            err.code = "ERR_MODULE_NOT_FOUND";
+            throw err;
+        }
+    };
+
+    const pipeReporter = async (source, reporter, destination) => {
+        let sink = null;
+        if (destination !== undefined && destination !== "stdout" && destination !== "stderr") {
+            sink = fsMod().createWriteStream(destination);
+        }
+        const write = (chunk) => {
+            const text = typeof chunk === "string" ? chunk : String(chunk);
+            if (sink !== null) sink.write(text);
+            else if (destination === "stderr") G.process.stderr.write(text);
+            else G.process.stdout.write(text);
+        };
+        try {
+            let piped;
+            if (typeof reporter === "function" && reporter.prototype !== undefined &&
+                typeof reporter.prototype._transform === "function") {
+                piped = source.compose(new reporter());
+            } else {
+                piped = reporter(source);
+            }
+            for await (const chunk of piped) write(chunk);
+        } catch (e) { /* a reporter crash must not lose the exit code */ }
+        if (sink !== null) { try { sink.end(); } catch (e) {} }
+    };
+
+    // node's lib/internal/main/test_runner.js dumps the resolved configuration
+    // under NODE_DEBUG=test_runner, and the corpus greps stderr for individual
+    // fields of it (`concurrency: true,`, `timeout: Infinity,`).
+    const debugConfiguration = (cfg) => {
+        let spec = "";
+        try { spec = String(G.process.env.NODE_DEBUG || ""); } catch (e) { return; }
+        if (!/(^|[,\s])(test_runner|\*)([,\s]|$)/i.test(spec)) return;
+        try {
+            const inspect = mod("util").inspect;
+            G.process.stderr.write("TEST_RUNNER " + G.process.pid + ": test runner configuration: " +
+                                   (typeof inspect === "function" ? inspect(cfg, { depth: 2 }) : String(cfg)) + "\n");
+        } catch (e) {}
+    };
+
+    G.__mbunNodeTestCli = (files, flags) => {
+        const { opts, reporterNames, destinations } = parseTestFlags(flags || []);
+        // The shape node reports (utils.js globalTestOptions), in its order.
+        debugConfiguration({
+            isTestRunner: true,
+            concurrency: opts.isolation === "none" ? 1
+              : (opts.concurrency === undefined ? true : opts.concurrency),
+            coverage: false,
+            coverageExcludeGlobs: undefined,
+            coverageIncludeGlobs: undefined,
+            destinations,
+            forceExit: opts.forceExit === true,
+            isolation: opts.isolation === undefined ? "process" : opts.isolation,
+            branchCoverage: 0,
+            functionCoverage: 0,
+            lineCoverage: 0,
+            only: opts.only === true,
+            reporters: reporterNames,
+            globalSetupPath: opts.globalSetupPath,
+            shard: opts.shard,
+            sourceMaps: false,
+            testNamePatterns: opts.testNamePatterns === undefined ? null : opts.testNamePatterns,
+            testSkipPatterns: opts.testSkipPatterns === undefined ? null : opts.testSkipPatterns,
+            testTagFilterExpressions: opts.testTagFilters === undefined ? null : opts.testTagFilters,
+            testTagFilters: opts.testTagFilters === undefined ? null : opts.testTagFilters,
+            timeout: opts.timeout === undefined ? Infinity : opts.timeout,
+            updateSnapshots: opts.updateSnapshots === true,
+            watch: opts.watch === true,
+            randomize: opts.randomize === true,
+            randomSeed: opts.randomSeed,
+        });
+        const stream = run(Object.assign({}, opts, {
+            files: files !== undefined && files.length !== 0 ? files : undefined,
+        }));
+
+        let failed = false;
+        stream.on("test:fail", (data) => {
+            if (data && (data.todo !== undefined || data.skip !== undefined)) return;
+            failed = true;
+        });
+        // node prints which test was running when it is interrupted, then exits 1.
+        const onInterrupt = () => {
+            let running = "";
+            try { running = interruptedName; } catch (e) {}
+            try { G.process.stdout.write("# Interrupted while running: " + running + "\n"); } catch (e) {}
+            failed = true;
+            try { G.process.exit(1); } catch (e) {}
+        };
+        let interruptedName = "";
+        stream.on("test:start", (data) => { if (data && data.name) interruptedName = data.name; });
+        try { G.process.on("SIGINT", onInterrupt); } catch (e) {}
+
+        const list = reporterNames.length === 0 ? [undefined] : reporterNames;
+        const pipes = [];
+        for (let i = 0; i < list.length; i++) {
+            let reporter;
+            try { reporter = resolveReporter(list[i]); }
+            catch (e) {
+                try { G.process.stderr.write(String(e && e.message) + "\n"); } catch (e2) {}
+                G.process.exitCode = 1;
+                return;
+            }
+            // Several reporters need independent copies of the event stream.
+            pipes.push(pipeReporter(list.length === 1 ? stream : forkStream(stream, i), reporter,
+                                    destinations[i]));
+        }
+        Promise.all(pipes).then(() => {
+            if (failed) G.process.exitCode = 1;
+            if (opts.forceExit) { try { G.process.exit(failed ? 1 : 0); } catch (e) {} }
+        }, () => { G.process.exitCode = 1; });
+    };
+
+    // A second reporter cannot consume the same Readable; mirror the events into
+    // a fresh TestsStream per extra reporter.
+    const forks = new Map();
+    const forkStream = (stream, index) => {
+        let list = forks.get(stream);
+        if (list === undefined) {
+            list = [];
+            forks.set(stream, list);
+            stream.on("data", (message) => { for (const s of list) s.emitMessage(message.type, message.data); });
+            stream.on("end", () => { for (const s of list) s.finish(); });
+        }
+        const copy = new TestsStream();
+        list.push(copy);
+        return copy;
+    };
 
     // Under `mbun test` the bun:test harness owns node:test and its own run();
     // only a plain script run (no harness) gets the programmatic runner.
