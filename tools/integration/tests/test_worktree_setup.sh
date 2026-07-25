@@ -68,6 +68,19 @@ out=$(cd "$main" && bash "$script" "$tmp/wt1" feature/y "$base")
 [ "$(git -C "$tmp/wt1" branch --show-current)" = "feature/y" ] \
   && pass "re-point switches branch" || fail "branch not switched"
 
+# --- the generated build graph is dropped, object files are kept ------------
+# A stale build.ninja does not know about a module partition added by the new
+# start-point and makes mcpp build fail with a misleading "imports must be built
+# before being imported". Re-pointing must clear it without nuking the cache.
+mkdir -p "$tmp/wt1/target/abc"
+echo stale >"$tmp/wt1/target/abc/build.ninja"
+echo cached >"$tmp/wt1/target/abc/object.o"
+out=$(cd "$main" && bash "$script" "$tmp/wt1" feature/y "$base")
+[ ! -e "$tmp/wt1/target/abc/build.ninja" ] \
+  && pass "stale build.ninja removed on re-point" || fail "build.ninja survived"
+[ -f "$tmp/wt1/target/abc/object.o" ] \
+  && pass "object files kept (incremental cache survives)" || fail "object files were deleted"
+
 # --- a populated non-submodule directory is never destroyed -----------------
 rm "$tmp/wt1/compat/bun"
 mkdir -p "$tmp/wt1/compat/bun/precious"; echo keep >"$tmp/wt1/compat/bun/precious/data"
