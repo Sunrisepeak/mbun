@@ -1052,7 +1052,11 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
     constructor(socket) {
       super(socket ? { highWaterMark: socket.readableHighWaterMark } : undefined);
       this._readableState.readingMore = true;
-      this.socket = socket || null;
+      // `socket`, not `socket || null`: lib/_http_incoming.js assigns the
+      // argument straight through, so `new IncomingMessage()` leaves .socket /
+      // .connection *undefined* (test-http-incoming-message-connection-setter
+      // asserts exactly that before exercising the connection setter).
+      this.socket = socket;
       this.httpVersionMajor = null;
       this.httpVersionMinor = null;
       this.httpVersion = null;
@@ -1070,7 +1074,7 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
       this.method = null;
       this.statusCode = null;
       this.statusMessage = null;
-      this.client = socket || null;
+      this.client = socket;
       this._consuming = false;
       this._dumped = false;
       this[kAbortController] = null;
@@ -2001,11 +2005,19 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
     parser.onDone = () => {
       if (!res || upgraded) return;
       res.complete = true;
-      const tr = parser.trailers;
-      if (tr) {
-        const raw = [];
-        for (const k of Object.keys(tr)) raw.push(k, tr[k]);
-        if (raw.length) res._addHeaderLines(raw, raw.length);
+      // Prefer the parser's verbatim pairs: rebuilding them from the folded
+      // map lowercases every name and drops duplicates, which node's
+      // res.rawTrailers keeps.
+      const rawTr = parser.rawTrailers;
+      if (rawTr && rawTr.length) {
+        res._addHeaderLines(rawTr, rawTr.length);
+      } else {
+        const tr = parser.trailers;
+        if (tr) {
+          const raw = [];
+          for (const k of Object.keys(tr)) raw.push(k, tr[k]);
+          if (raw.length) res._addHeaderLines(raw, raw.length);
+        }
       }
       detach();
       res.push(null);
@@ -2224,7 +2236,7 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
         parser.socket = null;
         parser.buf = new Uint8Array(0);
         parser.off = 0;
-        parser.headers = {}; parser.rawHeaders = []; parser.trailers = {};
+        parser.headers = {}; parser.rawHeaders = []; parser.trailers = {}; parser.rawTrailers = [];
       } catch (e) {}
       if (parsersFreeList.free(parser) === false) {
         nextTick(() => { if (typeof parser.close === "function") parser.close(); });

@@ -1422,7 +1422,7 @@ export constexpr std::string_view kNetJS = R"JS(
       this.buf = new Uint8Array(0); this.off = 0;
       this.state = "head"; this.done = false; this.headDone = false;
       this.method = ""; this.target = ""; this.status = 0; this.statusText = ""; this.httpVersion = "1.1";
-      this.headers = {}; this.rawHeaders = []; this.trailers = {};
+      this.headers = {}; this.rawHeaders = []; this.trailers = {}; this.rawTrailers = [];
       this.remaining = 0; this.chunked = false; this.toEof = false;
       this.reqMethod = "GET";
       // node: parser.maxHeaderPairs = server.maxHeadersCount << 1 (0 = no cap);
@@ -1661,7 +1661,18 @@ export constexpr std::string_view kNetJS = R"JS(
           this.off = at + 2;
           if (line === "") { this._finish(); return events + 1; }
           const c = line.indexOf(":");
-          if (c > 0) this.trailers[line.slice(0, c).trim().toLowerCase()] = line.slice(c + 1).trim();
+          if (c > 0) {
+            // Keep the wire form as well as the folded map: node exposes
+            // rawTrailers verbatim (original case, duplicates preserved, in
+            // arrival order) and derives .trailers/.trailersDistinct from it,
+            // so a lowercased last-wins object cannot reconstruct it
+            // (test-http-raw-headers / test-http-multiple-headers send the same
+            // trailer name twice with different case).
+            const tname = line.slice(0, c).trim();
+            const tval = line.slice(c + 1).trim();
+            this.rawTrailers.push(tname, tval);
+            this.trailers[tname.toLowerCase()] = tval;
+          }
           events++;
           continue;
         }
@@ -1681,7 +1692,7 @@ export constexpr std::string_view kNetJS = R"JS(
     this.buf = new Uint8Array(0); this.off = 0;
     this.state = "head"; this.done = false; this.headDone = false;
     this.method = ""; this.target = ""; this.status = 0; this.statusText = ""; this.httpVersion = "1.1";
-    this.headers = {}; this.rawHeaders = []; this.trailers = {};
+    this.headers = {}; this.rawHeaders = []; this.trailers = {}; this.rawTrailers = [];
     this.remaining = 0; this.chunked = false; this.toEof = false;
     this.reqMethod = "GET";
     this.maxHeaderPairs = 0; this.maxHeaderSize = 0;
@@ -3187,7 +3198,15 @@ export constexpr std::string_view kNetJS = R"JS(
           // in-flight for closeIdleConnections (llhttp on_message_complete).
           if (sock._httpInFlight > 0) sock._httpInFlight--;
           // EOF: bun internal/http.ts:187 `self.push(null); self.complete = true`.
-          if (im) { im.complete = true; im.push(null); }
+          if (im) {
+            im.complete = true;
+            // _addHeaderLines routes to rawTrailers once `complete` is set —
+            // the same order lib/_http_server.js uses (parserOnMessageComplete
+            // stores the trailers on the already-complete message).
+            const rawTr = parser.rawTrailers;
+            if (rawTr && rawTr.length) im._addHeaderLines(rawTr, rawTr.length);
+            im.push(null);
+          }
           if (parser._afterDone) { const f = parser._afterDone; parser._afterDone = null; f(); }
         };
         parser.onError = (e) => {
