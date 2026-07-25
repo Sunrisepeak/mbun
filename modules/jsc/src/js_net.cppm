@@ -1421,6 +1421,8 @@ export constexpr std::string_view kNetJS = R"JS(
   // RFC 7230 field-name (tchar+); anything else in a header name is a parse
   // error, not something to normalise away.
   const HEADER_TOKEN_RE = /^[\^_`a-zA-Z\-0-9!#$%&'*+.|~]+$/;
+  // src/node_http_parser.cc kMaxChunkExtensionsSize.
+  const MAX_CHUNK_EXTENSIONS_SIZE = 16384;
   function findCRLF(buf, off) {
     for (let i = off; i + 1 < buf.length; i++) if (buf[i] === 13 && buf[i + 1] === 10) return i;
     return -1;
@@ -1443,18 +1445,42 @@ export constexpr std::string_view kNetJS = R"JS(
       // and raises 'continue'/'information' on the ClientRequest instead
       // (_http_client.js parserOnIncomingClient -> `return 1`).
       this.onInterim = null;
+      this._lastChunk = null; this._errMsg = null; this._errCode = null;
     }
     leftover() { return this.buf.subarray(this.off); }
     push(bytes) {
-      if (this.done || this.state === "error") return 0;
+      if (this.done) return 0;
+      // Deliberately NOT re-reporting the error for every further chunk the way
+      // llhttp's execute() does. Measured: re-delivery turned
+      // test-http-{blank-header,response-splitting,pipeline-socket-parser-typeerror}
+      // from pass into a hang, because each repeat re-enters socketOnError on a
+      // connection that is already ending. One report per errored parser is
+      // enough for the corpus (test-http-socket-error-listeners asserts
+      // mustCallAtLeast(1)).
+      if (this.state === "error") return 0;
       if (bytes && bytes.length) {
+        this._lastChunk = bytes;
         this.buf = this.off === this.buf.length ? bytes : concatU8([this.buf.subarray(this.off), bytes]);
         this.off = 0;
       }
       return this._process(false);
     }
     eof() { if (this.done || this.state === "error") return 0; return this._process(true); }
-    _err(msg, code) { this.state = "error"; if (this.onError) this.onError(mkErr(msg, code)); }
+    // _http_common.js prepareError: every parse error carries the bytes it
+    // choked on. The corpus reads it directly (`err.rawPacket.toString()`), and
+    // `bytesParsed` is what node's own 400/431 path reports.
+    _mkErr(msg, code) {
+      const e = mkErr(msg, code);
+      e.bytesParsed = this.off;
+      const raw = this._lastChunk && this._lastChunk.length ? this._lastChunk : this.buf;
+      try { e.rawPacket = G.Buffer ? G.Buffer.from(raw.slice ? raw.slice() : raw) : raw; } catch (x) {}
+      return e;
+    }
+    _err(msg, code) {
+      this.state = "error";
+      this._errMsg = msg; this._errCode = code;
+      if (this.onError) this.onError(this._mkErr(msg, code));
+    }
     // Is the request-line method already known to be bad? llhttp matches the
     // method against its METHOD_MAP one byte at a time, so an unknown token
     // fails at the first character that cannot continue any known method — it
@@ -1599,7 +1625,10 @@ export constexpr std::string_view kNetJS = R"JS(
           // desync: llhttp refuses the combination outright, before the message
           // is ever handed to the application.
           if (sawTE && sawCL) {
-            this._err("Parse Error: Content-Length can't be present with Transfer-Encoding",
+            // llhttp's own wording, which the corpus compares verbatim
+            // (test-http-client-error-rawbytes). The rejection itself is
+            // unchanged: CL+TE is still a hard parse error.
+            this._err("Parse Error: Transfer-Encoding can't be present with Content-Length",
                       "HPE_INVALID_TRANSFER_ENCODING");
             return events + 1;
           }
@@ -1666,6 +1695,16 @@ export constexpr std::string_view kNetJS = R"JS(
             return events + 1;
           }
           const semi = line.indexOf(";");
+          // src/node_http_parser.cc caps the chunk-extension bytes of one
+          // chunk at 16 KiB; past that llhttp raises
+          // HPE_CHUNK_EXTENSIONS_OVERFLOW and node answers 413
+          // (test-http-chunk-extensions-limit). This only ADDS a rejection —
+          // an over-long extension that used to be accepted is now an error,
+          // so it cannot loosen any smuggling check.
+          if (semi !== -1 && (line.length - semi) > MAX_CHUNK_EXTENSIONS_SIZE) {
+            this._err("Parse Error: Chunk extensions overflow", "HPE_CHUNK_EXTENSIONS_OVERFLOW");
+            return events + 1;
+          }
           if (semi !== -1) line = line.slice(0, semi);
           line = line.trim();
           const size = parseInt(line, 16);
@@ -1743,6 +1782,7 @@ export constexpr std::string_view kNetJS = R"JS(
     this.reqMethod = "GET";
     this.maxHeaderPairs = 0; this.maxHeaderSize = 0;
     this.onHead = this.onBody = this.onDone = this.onError = this.onInterim = null;
+    this._lastChunk = null; this._errMsg = null; this._errCode = null;
     this._afterDone = null; this.socket = null; this.outgoing = null;
     this._pooled = false;
     return this;
@@ -2901,15 +2941,41 @@ export constexpr std::string_view kNetJS = R"JS(
         if (headersLate || requestLate) onRequestTimeout(s);
       }
     };
+    // lib/_http_server.js socketOnError. The canned reply is gated on
+    // "nothing of an in-flight response has reached the wire yet", NOT on
+    // "this socket has never been written to": a keep-alive connection whose
+    // previous response completed has bytesWritten > 0 and must still get its
+    // 408 (test-http-server-{headers,request}-timeout-{keepalive,pipelining}
+    // all assert exactly that reply after a first successful response).
+    const cannedResponse = (code) => {
+      switch (code) {
+        case "HPE_HEADER_OVERFLOW":
+          return "HTTP/1.1 431 Request Header Fields Too Large\r\nConnection: close\r\n\r\n";
+        case "HPE_CHUNK_EXTENSIONS_OVERFLOW":
+          return "HTTP/1.1 413 Payload Too Large\r\nConnection: close\r\n\r\n";
+        case "ERR_HTTP_REQUEST_TIMEOUT":
+          return "HTTP/1.1 408 Request Timeout\r\nConnection: close\r\n\r\n";
+        default:
+          return "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n";
+      }
+    };
+    const socketOnError = (sock, err) => {
+      if (srv.emit("clientError", err, sock)) return;
+      const res = sock._httpMessage;
+      if (sock.writable && (!res || !res._headerSent)) {
+        // end(), not write()+destroy(): this reactor's destroy() drops the
+        // still-queued bytes, and every corpus file here observes the reply
+        // followed by a FIN on the peer.
+        try { sock.end(cannedResponse(err.code)); return; } catch (e) {}
+      }
+      // destroy() bare, not destroy(err): this reactor re-emits the argument as
+      // an 'error' on the socket, which reaches listeners node never shows it to.
+      try { sock.destroy(); } catch (e) {}
+    };
     const onRequestTimeout = (sock) => {
       const err = new Error("Request timeout");
       err.code = "ERR_HTTP_REQUEST_TIMEOUT";
-      if (!srv.emit("clientError", err, sock)) {
-        if (sock.writable && sock.bytesWritten === 0) {
-          try { sock.end("HTTP/1.1 408 Request Timeout\r\nConnection: close\r\n\r\n"); return; } catch (e) {}
-        }
-        sock.destroy();
-      }
+      socketOnError(sock, err);
     };
     // node lib/_http_server.js setupConnectionsTracking is called from the
     // 'listening' handler and parks the handle on the server under
@@ -3115,6 +3181,21 @@ export constexpr std::string_view kNetJS = R"JS(
         let im = null;
         let res = null;
         let upgraded = false;
+        // Set at head-complete, consumed exactly once by handover().
+        let doUpgrade = false;
+        const handover = () => {
+          if (!doUpgrade) return;
+          doUpgrade = false;
+          const head = G.Buffer ? G.Buffer.from(parser.leftover()) : parser.leftover();
+          sock._httpParser = null;
+          // The raw socket now belongs to the upgrade/CONNECT listener: no
+          // further byte on it is HTTP, so nothing may re-arm a parser for it
+          // (doing so re-parsed tunnel traffic as a new request).
+          sock._httpUpgraded = true;
+          const ev = im && im.method === "CONNECT" ? "connect" : "upgrade";
+          if (srv.listenerCount(ev) > 0) srv.emit(ev, im, sock, head);
+          else sock.destroy();
+        };
 
         // lib/_http_server.js resOnFinish: dump an unread body, hand the socket
         // to the next queued response, and either close or re-arm the parser.
@@ -3190,15 +3271,25 @@ export constexpr std::string_view kNetJS = R"JS(
           if (isConnect || (hdrs["upgrade"] !== undefined && connTokens.indexOf("upgrade") !== -1)) {
             upgraded = true;
             im.upgrade = true;
-            const head = G.Buffer ? G.Buffer.from(parser.leftover()) : parser.leftover();
-            sock._httpParser = null;
-            // The raw socket now belongs to the upgrade/CONNECT listener: no
-            // further byte on it is HTTP, so nothing may re-arm a parser for it
-            // (doing so re-parsed tunnel traffic as a new request).
-            sock._httpUpgraded = true;
-            const ev = isConnect ? "connect" : "upgrade";
-            if (srv.listenerCount(ev) > 0) srv.emit(ev, im, sock, head);
-            else sock.destroy();
+            // The handover is deferred to on_message_complete, which is where
+            // llhttp actually pauses an upgrade (HPE_PAUSED_UPGRADE): a request
+            // that carries a body — `Upgrade:` plus Content-Length or chunked —
+            // has that body parsed FIRST and delivered to `req`, and only the
+            // bytes past it are the upgrade head. Handing the socket over at
+            // head-complete instead made `head` the unparsed request body, so
+            // `req` never emitted 'data'/'end' and the tunnel saw the body
+            // (test-http-upgrade-server-with-body{,-and-extras}).
+            //
+            // node emits 'upgrade' immediately for a body that has NOT arrived
+            // yet, wrapping the socket in an UpgradeStream that withholds
+            // tunnel bytes until the body ends. That wrapper is not implemented
+            // here; the fallback below keeps the old timing for that shape so a
+            // slow body cannot strand the connection.
+            if (parser.state === "done") { doUpgrade = true; return; }
+            doUpgrade = true;
+            if (G.process && typeof G.process.nextTick === "function") {
+              G.process.nextTick(() => { if (doUpgrade && !sock.destroyed) handover(); });
+            }
             return;
           }
 
@@ -3273,7 +3364,21 @@ export constexpr std::string_view kNetJS = R"JS(
         // (_http_incoming.ts:381 `if (chunk && !this._dumped) this.push(chunk)`).
         parser.onBody = (b) => { if (im && !im._dumped) im.push(G.Buffer ? G.Buffer.from(b.slice()) : b.slice()); };
         parser.onDone = () => {
-          if (upgraded) return;
+          if (upgraded) {
+            // The request message is complete before the socket becomes a
+            // tunnel, so `req` ends exactly as node's does (its trailers are
+            // stored on the already-complete message, then EOF), and only then
+            // do the leftover bytes become the upgrade head.
+            if (im) {
+              im.complete = true;
+              const rawTr0 = parser.rawTrailers;
+              if (rawTr0 && rawTr0.length) im._addHeaderLines(rawTr0, rawTr0.length);
+              im.push(null);
+            }
+            if (sock._httpInFlight > 0) sock._httpInFlight--;
+            handover();
+            return;
+          }
           if (!parser.headDone) { sock.destroy(); return; }
           sock._httpParser = null;
           // leftover() is a view over a parser we are about to drop; copying it
@@ -3299,20 +3404,10 @@ export constexpr std::string_view kNetJS = R"JS(
           rearm();
         };
         parser.onError = (e) => {
-          const err = e || mkErr("Parse Error", "HPE_INVALID_CONSTANT");
           // lib/_http_server.js socketOnError: the server's own answer to a
-          // malformed request is a canned 400 (431 when the head overflowed),
-          // and only when nobody claimed 'clientError'.
-          if (!srv.emit("clientError", err, sock)) {
-            if (sock.writable && sock.bytesWritten === 0) {
-              const body = err.code === "HPE_HEADER_OVERFLOW"
-                ? "HTTP/1.1 431 Request Header Fields Too Large\r\nConnection: close\r\n\r\n"
-                : "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n";
-              try { sock.end(body); } catch (e2) { try { sock.destroy(); } catch (e3) {} }
-            } else {
-              sock.destroy();
-            }
-          }
+          // malformed request is a canned 400 (431 head overflow, 413 chunk
+          // extensions overflow), and only when nobody claimed 'clientError'.
+          socketOnError(sock, e || mkErr("Parse Error", "HPE_INVALID_CONSTANT"));
         };
       };
 
