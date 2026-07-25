@@ -66,16 +66,36 @@ export constexpr std::string_view kDnsJS = R"JS(
 
   // Native lookup completes on the JS thread through DN.drain(), which is
   // composed into the runtime's existing IO pump below.
+  //
+  // A resolver request in flight is a BOUNDED in-flight operation, so it belongs
+  // in the reactor's `pending` channel: without it, a program whose only
+  // outstanding work is a getaddrinfo has rem == 0 and NET.items empty-or-parked,
+  // and __mbun_pump_idle_ms hands the pump a 60-SECOND park in poll() over the
+  // net fds — a set the resolver's completion is not in. The callback then lands
+  // a minute late or never (the pump's idle-grace bail fires first). This was
+  // invisible while every resolver caller also owned a registered socket whose
+  // readability woke the park; node:dgram resolves the bind/send address BEFORE
+  // there is any socket to poll, which is what exposed it.
+  const inflight = (callback) => {
+    const NET = G.__mbunNet;
+    if (!NET) return callback;
+    NET.pending++;
+    let done = false;
+    return (r) => {
+      if (!done) { done = true; NET.pending = Math.max(0, NET.pending - 1); }
+      return callback(r);
+    };
+  };
   const rawLookup = (host, family, flags, callback) => {
-    if (DN && DN.lookup) DN.lookup(String(host), family | 0, flags | 0, callback);
+    if (DN && DN.lookup) DN.lookup(String(host), family | 0, flags | 0, inflight(callback));
     else soon(() => callback({ error: "ENOTFOUND" }));
   };
   const rawReverse = (ip, callback) => {
-    if (DN && DN.reverse) DN.reverse(String(ip), callback);
+    if (DN && DN.reverse) DN.reverse(String(ip), inflight(callback));
     else soon(() => callback({ error: "ENOTFOUND" }));
   };
   const rawLookupService = (address, port, callback) => {
-    if (DN && DN.lookupService) DN.lookupService(String(address), port | 0, callback);
+    if (DN && DN.lookupService) DN.lookupService(String(address), port | 0, inflight(callback));
     else soon(() => callback({ error: "ENOTFOUND" }));
   };
   // `servers` (a dns.Resolver's own nameserver list, "IP[:PORT]"/"[IPv6]:PORT"

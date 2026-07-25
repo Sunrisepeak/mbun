@@ -201,6 +201,34 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
       transport.on("end", () => { self.readable = false; self.emit("end"); });
       transport.on("close", (hadErr) => { self.destroyed = true; self.emit("close", !!hadErr); });
       transport.on("error", (e) => self.emit("error", e));
+      // setTimeout() arms the timer on the transport, so the 'timeout' event
+      // fires there — but every consumer (node:https' server keep-alive sweep,
+      // socket.setTimeout(ms, cb), the corpus' own listeners) is attached to the
+      // TLSSocket. Without this forward, `server.keepAliveTimeout` silently never
+      // expired an https connection: server.close() left the accepted socket
+      // pinned and the process could not leave the loop (13 test-https-* files
+      // hit the 15s corpus timeout on exactly that).
+      transport.on("timeout", () => self.emit("timeout"));
+      // node's TLSSocket is a net.Socket over a real connection, so it emits
+      // 'connect' when the TCP leg lands (before the handshake) and 'ready'
+      // after. The corpus drives raw TLS clients from 'connect'
+      // (test-https-server-close-idle / -close-all write their request there);
+      // without the forward those callbacks never ran and the file hung.
+      transport.on("connect", () => { self.emit("connect"); self.emit("ready"); });
+      // Byte counters, buffer levels and the local endpoint live on the
+      // TRANSPORT — every write() and read() this class performs is delegated
+      // there — so the plaintext edge must report the transport's values, not the
+      // zeros net.Socket's constructor left on it. defineProperty (not a
+      // prototype getter) because super() already installed bytesRead /
+      // bytesWritten as own data properties, which would shadow one.
+      const alias = (name) => {
+        try { Object.defineProperty(self, name, { get: () => transport[name], configurable: true, enumerable: true }); }
+        catch (e) {}
+      };
+      alias("bytesWritten"); alias("bytesRead");
+      alias("bufferSize"); alias("writableLength");
+      alias("readableHighWaterMark"); alias("writableHighWaterMark");
+      alias("localAddress"); alias("localPort");
       transport.on("secureConnect", () => {
         self._secureEstablished = true;
         self._securePending = false;
@@ -233,6 +261,7 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
         self.emit("secureConnect");
       });
       const start = () => {
+        transport._tlsPending = false;
         if (transport.destroyed) return;
         // verify tri-state (net.inc): client verifies the server unless
         // rejectUnauthorized:false; a server only requests a client cert when
@@ -258,8 +287,12 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
       // A live fd means the reactor's connect() already returned, whether this is
       // an accepted server socket, an upgrade target, or a client whose
       // `connecting` flag is still set until its 'connect' event fires.
+      // Until start() runs, the transport must not flush anything as cleartext
+      // (js_net.cppm _flush reads _tlsPending) — a caller that writes before the
+      // handshake begins, as node:https ClientRequest does, would otherwise put
+      // its request in front of the ClientHello.
       if (transport._fd >= 0) start();
-      else transport.once("connect", start);
+      else { transport._tlsPending = true; transport.once("connect", start); }
       return this;
     }
     write(data, enc, cb) { return this._transport ? this._transport.write(data, enc, cb) : false; }
@@ -269,7 +302,14 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
     isPaused() { return this._transport ? !!this._transport._paused : !!this._paused; }
     destroy(err) { if (this._transport) this._transport.destroy(err); else { this.destroyed = true; this.emit("close", !!err); } return this; }
     setEncoding(enc) { if (this._transport) this._transport.setEncoding(enc); return this; }
-    setTimeout(ms, cb) { if (this._transport) this._transport.setTimeout(ms, cb); return this; }
+    // node attaches the callback to THIS socket's 'timeout' (the transport merely
+    // owns the timer); the forward installed in _wrapTransport re-emits here, so
+    // registering the callback on the transport too would fire it twice.
+    setTimeout(ms, cb) {
+      if (typeof cb === "function") this.once("timeout", cb);
+      if (this._transport) this._transport.setTimeout(ms);
+      return this;
+    }
     setNoDelay() { return this; }
     setKeepAlive() { return this; }
     ref() { if (this._transport) this._transport.ref(); return this; }
@@ -371,6 +411,12 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
       // nothing to, a bad secureProtocol, …) throws from createServer() rather
       // than at the first connection.
       if (T && typeof T.createSecureContext === "function") T.createSecureContext(options || {});
+      // node internal/tls/wrap.js Server: the negotiated ALPN list is published on
+      // the server in its length-prefixed wire form (tls.convertALPNProtocols),
+      // which node:https then compares against (test-https-argument-of-creating).
+      if (options && options.ALPNProtocols && T && typeof T.convertALPNProtocols === "function") {
+        try { T.convertALPNProtocols(options.ALPNProtocols, this); } catch (e) {}
+      }
       this._sharedCreds = options || {};
       this._contexts = new Map();
       if (typeof secureConnectionListener === "function" && typeof this.on === "function")
@@ -388,6 +434,24 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
       });
       const self = this;
       tlsSock.once("secureConnect", () => self.emit("secureConnection", tlsSock));
+      // node _tls_wrap.js onServerSocketSecure/handshakeTimeout: a connection that
+      // does not finish its handshake within options.handshakeTimeout (default
+      // 120s) is destroyed and reported as 'tlsClientError'. Without it a peer
+      // that opens a TCP connection to a TLS port and then says nothing pins the
+      // server forever — a hang rather than the error node reports.
+      const hsTimeout = creds.handshakeTimeout === undefined ? 120000 : creds.handshakeTimeout;
+      if (hsTimeout > 0) {
+        const timer = G.setTimeout(() => {
+          if (tlsSock._secureEstablished || tlsSock.destroyed) return;
+          const e = new Error("TLS handshake timeout");
+          e.code = "ERR_TLS_HANDSHAKE_TIMEOUT";
+          self.emit("tlsClientError", e, tlsSock);
+          try { tlsSock.destroy(); } catch (e2) {}
+        }, hsTimeout);
+        const clear = () => { try { G.clearTimeout(timer); } catch (e) {} };
+        tlsSock.once("secureConnect", clear);
+        tlsSock.once("close", clear);
+      }
       // node _tls_wrap.js: a failure BEFORE the handshake completes is the
       // server's 'tlsClientError' (with the socket), never an unhandled 'error'
       // on the TLSSocket — a client that speaks junk at a TLS port must not take

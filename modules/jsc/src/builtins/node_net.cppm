@@ -1,9 +1,7 @@
-// node:net SocketAddress + node:dgram JS layer partition.
+// node:net SocketAddress JS layer partition.
 //
 // Augments the node:net module (real Socket/Server/isIP/BlockList live in
-// js_net.cppm) with the SocketAddress value class, and installs node:dgram over
-// the __mbunDgramNative UDP primitives (runtime/node_net.inc), driven by the same
-// event-loop reactor (globalThis.__mbunNet) that js_net.cppm creates.
+// js_net.cppm) with the SocketAddress value class.
 //
 // NOTE: appended AFTER the master builtins IIFE (opened in bootstrap, closed by
 // image_closure) AND before kNetJS runs, so this is a self-contained IIFE that
@@ -11,7 +9,7 @@
 // kNetJS has created globalThis.__mbunNet). SocketAddress set on M["net"] before
 // kNetJS survives because kNetJS rebuilds net via Object.assign spreading M["net"].
 //
-// Blueprints: bun src/runtime/socket/SocketAddress.rs, src/js/node/dgram.ts.
+// Blueprint: bun src/runtime/socket/SocketAddress.rs.
 export module mbun.jsc.js_builtins:node_net;
 
 import std;
@@ -182,187 +180,12 @@ inline constexpr std::string_view kNodeNetJS = R"JS(
 
   for (const k of ["net", "node:net"]) { const m = M[k] || (M[k] = {}); m.SocketAddress = SocketAddress; }
 
-  // ==================================================================== node:dgram
-  const ND = G.__mbunDgramNative;
-  const EE = (M["events"] && M["events"].EventEmitter) || (M["node:events"] && M["node:events"].EventEmitter);
-  const B = G.Buffer;
-  const te = new G.TextEncoder();
-  const toBytes = (d) => (typeof d === "string" ? te.encode(d)
-    : d instanceof Uint8Array ? d
-    : ArrayBuffer.isView(d) ? new Uint8Array(d.buffer, d.byteOffset, d.byteLength)
-    : d instanceof ArrayBuffer ? new Uint8Array(d) : te.encode(String(d)));
-  const toB64 = (b) => { let s = ""; for (let i = 0; i < b.length; i += 4096) s += String.fromCharCode.apply(null, b.subarray(i, i + 4096)); return G.btoa(s); };
-  const fromB64 = (s) => { const t = G.atob(s); const o = new Uint8Array(t.length); for (let i = 0; i < t.length; i++) o[i] = t.charCodeAt(i); return o; };
-
-  if (ND && EE) {
-    class DgramSocket extends EE {
-      constructor(type) {
-        super();
-        const isObj = typeof type === "object" && type !== null;
-        this.type = isObj ? (type.type || "udp4") : (type || "udp4");
-        this._opts = isObj ? type : {};
-        this._fd = -1;
-        this._bound = false;
-        this._closed = false;
-        // Loop-reference state: `_refd` is the sticky user intent (node's
-        // uv_ref flag), `_held` whether the reactor's handle count carries this
-        // socket right now. dgram used to ride NET.pending, which is the
-        // in-flight-operation channel the fetch stall detector watches — a bound
-        // socket is a long-lived handle, not a bounded operation.
-        this._refd = true;
-        this._held = false;
-        this._loopOpen = false;
-      }
-      _v6() { return this.type === "udp6"; }
-      // reuseAddr is an opt-in (node dgram.createSocket({ reuseAddr })): without
-      // it a duplicate bind must fail with EADDRINUSE (issue 24157).
-      _ensureFd() { if (this._fd < 0) this._fd = ND.create(this.type, !!this._opts.reuseAddr, !!this._opts.reusePort); }
-      _reactor() { return G.__mbunNet; }
-
-      bind(a1, a2, a3) {
-        let opts, port, addr, cb;
-        if (typeof a1 === "function") { cb = a1; }
-        else if (typeof a1 === "object" && a1 !== null) { opts = a1; if (typeof a2 === "function") cb = a2; }
-        else { port = a1; if (typeof a2 === "function") { cb = a2; } else { addr = a2; if (typeof a3 === "function") cb = a3; } }
-        const p = (opts ? opts.port : port) | 0;
-        let ad = opts ? opts.address : addr;
-        if (ad === undefined || ad === null) ad = "";
-        const ipv6Only = !!((opts && opts.ipv6Only) || this._opts.ipv6Only);
-        // node lib/dgram.js Socket.prototype.bind → cluster._getServer: a bound
-        // UDP socket inside a cluster worker is the primary's socket, shared
-        // over IPC (internal/cluster/shared_handle.js). UDP is exempt from
-        // round-robin — there is nothing to distribute but raw datagrams.
-        // node lib/dgram.js bind: `reusePort` implies exclusive, so the worker
-        // binds its own socket (test-cluster-dgram-reuseport).
-        const wantsOwnSocket = !!((opts && (opts.exclusive || opts.reusePort)) || this._opts.reusePort);
-        const clusterMod = G.__mbunCluster;
-        if (clusterMod && clusterMod.isWorker && !wantsOwnSocket &&
-            typeof clusterMod._getServer === "function") {
-          if (cb) this.once("listening", cb);
-          const self = this;
-          clusterMod._getServer(this, {
-            address: String(ad), port: p, addressType: this.type, fd: undefined,
-            flags: ipv6Only ? 1 : 0,
-          }, (err, handle) => {
-            // node lib/dgram.js: a socket closed while the bind was in flight no
-            // longer needs the handle the primary just sent — close it and stop
-            // (test-dgram-cluster-close-during-bind).
-            if (self._closed) {
-              if (handle && typeof handle.close === "function") { try { handle.close(); } catch (e) {} }
-              return;
-            }
-            if (err || !handle || typeof handle.fd !== "number" || handle.fd < 0) {
-              G.queueMicrotask(() => self.emit("error", mkE("bind " + (err || "EADDRINUSE"), typeof err === "string" ? err : "EADDRINUSE")));
-              return;
-            }
-            const NNAT = G.__mbunNetNative;
-            if (NNAT && NNAT.track) { try { NNAT.track(handle.fd); } catch (e) {} }
-            self._fd = handle.fd;
-            self._clusterHandle = handle;
-            self._bound = true;
-            try { self._addr = ND.address(self._fd); } catch (e) { self._addr = handle.sockname || null; }
-            const R2 = self._reactor();
-            if (R2) { R2.items.add(self); self._loopOpen = true; R2.hold(self); }
-            G.queueMicrotask(() => { if (!self._closed) self.emit("listening"); });
-          });
-          return this;
-        }
-        this._ensureFd();
-        let info;
-        try { info = ND.bind(this._fd, String(ad), p, this._v6(), ipv6Only); }
-        catch (e) { const self = this; G.queueMicrotask(() => self.emit("error", e)); return this; }
-        this._bound = true;
-        this._addr = info;
-        const R = this._reactor();
-        if (R) { R.items.add(this); this._loopOpen = true; R.hold(this); }
-        if (cb) this.once("listening", cb);
-        const self = this;
-        G.queueMicrotask(() => { if (!self._closed) self.emit("listening"); });
-        return this;
-      }
-
-      _poll() {
-        if (this._closed || this._fd < 0) return 0;
-        let n = 0;
-        while (!this._closed) {
-          let d;
-          try { d = ND.recv(this._fd); }
-          catch (e) { const self = this; G.queueMicrotask(() => self.emit("error", e)); break; }
-          if (!d) break;
-          n++;
-          const buf = B ? B.from(d.data, "base64") : fromB64(d.data);
-          this.emit("message", buf, { address: d.address, family: d.family, port: d.port, size: d.size });
-        }
-        return n;
-      }
-
-      send(msg, a2, a3, a4, a5, a6) {
-        const bytes = toBytes(msg);
-        let buf, p, addr, cb;
-        if (typeof a3 === "number") { buf = bytes.subarray(a2, a2 + a3); p = a4; addr = a5; cb = a6; }
-        else { buf = bytes; p = a2; addr = a3; cb = a4; }
-        if (typeof addr === "function") { cb = addr; addr = undefined; }
-        if (typeof p === "function") { cb = p; p = undefined; }
-        // send() implicitly binds an unbound socket (address(), the `listening`
-        // event, and reactor registration for replies). ref: bun dgram.ts:583.
-        if (!this._bound) this.bind(0);
-        this._ensureFd();
-        const host = addr ? String(addr) : (this._v6() ? "::1" : "127.0.0.1");
-        let sent = 0, err = null;
-        try { sent = ND.send(this._fd, toB64(buf), p | 0, host, this._v6()); }
-        catch (e) { err = e; }
-        const self = this;
-        if (cb) G.queueMicrotask(() => cb(err, err ? 0 : sent));
-        else if (err) G.queueMicrotask(() => self.emit("error", err));
-        return undefined;
-      }
-
-      address() {
-        if (this._fd < 0 || !this._bound) throw mkE("Not running", "ERR_SOCKET_DGRAM_NOT_RUNNING");
-        return ND.address(this._fd);
-      }
-      close(cb) {
-        if (this._closed) { if (cb) G.queueMicrotask(cb); return this; }
-        this._closed = true;
-        const R = this._reactor();
-        if (R) { R.items.delete(this); this._loopOpen = false; R.release(this); }
-        // A shared (cluster) descriptor is owned by the handle the primary sent:
-        // its patched close() sends `{ act: "close" }` (so the primary can drop
-        // the SharedHandle — without which cluster.disconnect() never completes)
-        // AND closes the descriptor, so this must not close it a second time.
-        if (this._clusterHandle) {
-          const h = this._clusterHandle; this._clusterHandle = null; this._fd = -1;
-          try { h.close(); } catch (e) {}
-        } else if (this._fd >= 0) { try { ND.close(this._fd); } catch (e) {} this._fd = -1; }
-        if (cb) this.once("close", cb);
-        const self = this;
-        G.queueMicrotask(() => self.emit("close"));
-        return this;
-      }
-      setBroadcast(f) { this._ensureFd(); ND.setopt(this._fd, "broadcast", f ? 1 : 0, this._v6()); return this; }
-      setTTL(n) { this._ensureFd(); ND.setopt(this._fd, "ttl", n | 0, this._v6()); return n | 0; }
-      setMulticastTTL(n) { this._ensureFd(); ND.setopt(this._fd, "multicastTTL", n | 0, this._v6()); return n | 0; }
-      setMulticastLoopback(f) { this._ensureFd(); ND.setopt(this._fd, "multicastLoopback", f ? 1 : 0, this._v6()); return !!f; }
-      addMembership(group, iface) { this._ensureFd(); ND.membership(this._fd, true, String(group), iface ? String(iface) : "", this._v6()); }
-      dropMembership(group, iface) { this._ensureFd(); ND.membership(this._fd, false, String(group), iface ? String(iface) : "", this._v6()); }
-      ref() { this._refd = true; const R = this._reactor(); if (R) R.hold(this); return this; }
-      unref() { this._refd = false; const R = this._reactor(); if (R) R.release(this); return this; }
-      hasRef() { return this._refd !== false; }
-    }
-
-    const createSocket = (type, cb) => {
-      const s = new DgramSocket(type);
-      if (typeof cb === "function") s.on("message", cb);
-      return s;
-    };
-
-    const dgram = { createSocket, Socket: DgramSocket };
-    M["dgram"] = M["node:dgram"] = dgram;
-  } else {
-    // Native UDP unavailable (Windows): honest DEFERRED module.
-    const deferred = () => { throw mkE("node:dgram is not supported on this platform", "ERR_DGRAM_UNSUPPORTED"); };
-    M["dgram"] = M["node:dgram"] = { createSocket: deferred, Socket: deferred };
-  }
+  // node:dgram now lives in modules/jsc/src/js_dgram.cppm (module
+  // mbun.jsc.js_dgram, evaluated after kNetJS + kDnsJS): it is a translation of
+  // node's lib/dgram.js over a real `UDP` handle, which needs the reactor and
+  // dns.lookup in scope at install time. The stand-in that used to sit here
+  // owned the fd on the Socket itself and could not express node's
+  // handle/Socket split at all.
 })();
 )JS";
 
