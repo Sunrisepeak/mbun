@@ -224,6 +224,32 @@ sample), while `primordials` + `internalBinding` converts 45/305 = **14.8%**.
 `internalBinding` does roughly 90% of the work. Deferring on the primordials-only
 number had been correct; the missing measurement was the combined one.
 
+### Before optimising a metric, audit the metric
+
+Round 10 found **three independent defects in how the corpus was verified**, each
+of which had been inflating the number for an unknown length of time:
+
+1. **Self-skips counted as passes.** `common.skip()` exits 0; 277 files of one run
+   were skips reported as coverage.
+2. **`common.mustCall` was never enforced**, because node registers its verifier
+   inside `process.on('exit')` and that never fired. 946 of the then-1,533
+   passing files used `mustCall*`.
+3. **`assert.throws` ignored its error argument.**
+   `assert.throws(fn, {code:'ERR_X'})` passed for *any* throw, and
+   `assert.throws(fn, common.expectsError({…}))` never called the validator. 48
+   verified vacuous passes on the guard sets alone.
+
+All three were found by agents doing unrelated work who stopped to ask *why* a
+test passed. None would have been found by pushing the number up.
+
+**A verification-mechanism fix must be sequenced FIRST in a round.** It
+invalidates every other task's baseline corpus-wide, not just inside its own
+work-list. This was recorded after defect 2 and then violated with defect 3 — two
+agents were already running on a pre-fix base when it landed, so their reported
+numbers include vacuous passes and had to be re-measured after integration. When
+a task's diff touches `assert`, `common`, the exit path, or the classifier, land
+it alone and re-baseline before dispatching anything else.
+
 ### Derive the guard set from the diff, not from the brief
 
 A zero-regression gate is only as wide as the files it runs. Round 10 lost three
