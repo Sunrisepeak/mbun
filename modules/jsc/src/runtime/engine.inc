@@ -434,9 +434,11 @@ public:
                 return 1;
             }
             set_prop(ctx_, JSContextGetGlobalObject(ctx_), "__mbunCjsWrapper", wrapper);
-            if (auto r{eval_void("globalThis.__mbunCjsWrapper(globalThis.exports, "
-                                 "globalThis.require, globalThis.module, globalThis.__filename, "
-                                 "globalThis.__dirname);",
+            if (auto r{eval_void(std::string{kEntryCatchOpen} +
+                                     "globalThis.__mbunCjsWrapper(globalThis.exports, "
+                                     "globalThis.require, globalThis.module, globalThis.__filename, "
+                                     "globalThis.__dirname);" +
+                                     std::string{kEntryCatchClose},
                                  absPath)};
                 !r) {
                 return fail_run_(r.error());
@@ -487,7 +489,9 @@ public:
         // call to an `await` identifier and fail at run time, after side effects.
         if (auto r{tla ? std::expected<void, std::string>{std::unexpected{
                              std::string{"SyntaxError: top-level await"}}}
-                       : eval_void(entryScript, absPath)};
+                       : eval_void(std::string{kEntryCatchOpen} + entryScript +
+                                       std::string{kEntryCatchClose},
+                                   absPath)};
             !r) {
             // JSC's C-API script mode has no top-level-await support, so a module
             // using TLA fails to PARSE (SyntaxError, before any execution). Retry it
@@ -519,6 +523,8 @@ public:
                 // explicitly (else an uncaught rejection prints only stack frames).
                 "function(e){var s=(e&&e.stack)||'';"
                 "var m=(e&&e.message!==undefined)?((e.name||'Error')+': '+e.message):String(e);"
+                "try{Object.defineProperty(globalThis,'__mbun_entry_error',"
+                "{value:e,writable:true,configurable:true,enumerable:false});}catch(_e){}"
                 "globalThis.__mbun_run_err=(s?(m+'\\n'+s):m);globalThis.__mbun_run_done=1;});"};
             if (auto r2{eval_void(wrapped, absPath)}; !r2) {
                 return fail_run_(r.error());  // report the original parse error
@@ -690,10 +696,30 @@ public:
         return final ? static_cast<int>(*final) : status;
     }
 
+    // The entry point is evaluated inside these so the thrown VALUE survives,
+    // not just its rendering: fail_run_ hands it to __mbunWorkerFatal, and a
+    // worker child needs the error's .code (ERR_UNKNOWN_BUILTIN_MODULE and
+    // friends) to report the 'error' event node's Worker reports. The open
+    // brace stays on line 1 — the entry's own wrapper prefix already lives
+    // there — so reported line numbers are unchanged, and the rethrow keeps
+    // every existing failure path identical. Non-enumerable: an enumerable
+    // global would trip node common/index.js's "Unexpected global(s) found".
+    static constexpr std::string_view kEntryCatchOpen{"try{"};
+    static constexpr std::string_view kEntryCatchClose{
+        "}catch(__mbun_ee){try{Object.defineProperty(globalThis,'__mbun_entry_error',"
+        "{value:__mbun_ee,writable:true,configurable:true,enumerable:false});}catch(__mbun_e2){}"
+        "throw __mbun_ee;}"};
+
     // A run that died on its entry point: report it the way node does (the
     // error, then the 'exit' listeners with status 1) rather than returning
     // straight to main.
     int fail_run_(std::string_view message) {
+        // A worker child forwards a fatal entry-point error to its parent as an
+        // 'error' event (node internal/worker.js). The hook exists only in a
+        // worker process, so a normal run evaluates to a no-op here.
+        (void)eval_void("try{globalThis.__mbunWorkerFatal&&"
+                        "globalThis.__mbunWorkerFatal(globalThis.__mbun_entry_error);}"
+                        "catch(e){}");
         std::cerr << "error: " << message << '\n';
         return finish_run_(1);
     }
@@ -1498,9 +1524,10 @@ public:
   // exitCode starts UNDEFINED, not 0: node's per_thread.js leaves the slot
   // unset until something assigns it, and the corpus reads that difference
   // directly ('exit' listeners assert `process.exitCode === undefined` when the
-  // process is leaving cleanly — test/common/process-exit-code-cases.js
+  // process is leaving cleanly — test/common/process-exit-code-cases.js:68,
   // zeroExitWithUncaughtHandler). A 0 here also makes `process.exitCode ?? x`
-  // and `if (process.exitCode)` disagree with node.
+  // and `if (process.exitCode)` disagree with node. Two agents reached this
+  // same change independently in one round, from different corpus files.
   p.pid = 1; p.ppid = 0; p.exitCode = undefined; p.title ??= "bun";
   // Resolved at CALL time, never captured: neither queueMicrotask nor the
   // uncaught-exception wrapper over it (js_builtins :node_process_lifecycle)
@@ -1544,8 +1571,31 @@ public:
   p.eventNames = function () { return Object.keys(_ev); };
   p.emit = function (n, ...a) { const l = _ev[String(n)]; if (!l || !l.length) return false; for (const f of l.slice()) f.apply(p, a); return true; };
   p.cpuUsage = function () { return { user: 0, system: 0 }; };
-  p.memoryUsage = function () { return { rss: 0, heapTotal: 0, heapUsed: 0, external: 0, arrayBuffers: 0 }; };
-  p.memoryUsage.rss = function () { return 0; };
+  // rss is REAL (Linux /proc/self/statm field 2 = resident pages): a flat 0 made
+  // every ratio a test takes over two samples NaN, and `NaN < 5` is false — that
+  // is the whole of test-worker-memory's "Unexpected memory overhead". The JSC
+  // heap has no size accessor exposed here yet, so heapTotal/heapUsed stay 0
+  // rather than being invented. Read lazily through __mbunFdNative so the
+  // prelude keeps no dependency on node:fs being registered.
+  p.memoryUsage = function () {
+    let rss = 0;
+    try {
+      const FD = globalThis.__mbunFdNative;
+      if (FD && typeof FD.open === 'function') {
+        const fd = FD.open('/proc/self/statm', 'r', 0o666);
+        try {
+          const buf = new Uint8Array(128);
+          const n = FD.read(fd, buf, 0, 128, -1);
+          let s = '';
+          for (let i = 0; i < n; i++) s += String.fromCharCode(buf[i]);
+          const parts = s.split(' ');
+          rss = (Number(parts[1]) || 0) * 4096;
+        } finally { try { FD.close(fd); } catch (e) {} }
+      }
+    } catch (e) {}
+    return { rss: rss, heapTotal: 0, heapUsed: 0, external: 0, arrayBuffers: 0 };
+  };
+  p.memoryUsage.rss = function () { return p.memoryUsage().rss; };
   p.umask = function () { return 0; };
   // Async via nextTick, as bun does (BunProcess.cpp emitWarningErrorInstance):
   // a listener registered after the emitWarning call in the same tick still sees

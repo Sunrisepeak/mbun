@@ -176,11 +176,21 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
     if (dom && dom.length) for (const l of dom.slice()) { if (l.once) p.removeEventListener("message", l.fn); l.fn.call(p, ev); }
     EventEmitter.prototype.emit.call(p, "message", data);
   };
+  // Deliver only what was ALREADY queued when this turn began, then hand the
+  // rest to the next turn. A handler that posts straight back to the port it is
+  // draining (`port1.on('message', () => port2.postMessage(0))`) re-queues into
+  // the very array this loop is testing, so an unbounded `while` never returned
+  // to the event loop: 10001 iterations inside one setImmediate, and the 0 ms
+  // timeout meant to break the cycle never got a turn
+  // (test-worker-message-port-infinite-message-loop). node gives each round trip
+  // its own loop turn.
   const portFlush = (p) => {
-    while (p[kQueue].length && portHasSink(p)) {
+    let n = p[kQueue].length;
+    while (n-- > 0 && p[kQueue].length && portHasSink(p)) {
       const item = p[kQueue].shift();
       portDeliver(p, item.data, item.ports);
     }
+    if (p[kQueue].length && portHasSink(p)) scheduleFlush(p);
   };
   // Delivery is scheduled on the MACROtask queue (setImmediate), matching node:
   // a port message arrives from the event loop, so an endless
@@ -380,7 +390,101 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
       G.structuredClone = wrapped;
     }
   }
-  const moveMessagePortToContext = function () { throw new Error("moveMessagePortToContext is not yet implemented in Bun"); };
+  // ---- moveMessagePortToContext -------------------------------------------
+  // node node_messaging.cc: the returned handle belongs to the TARGET vm
+  // context — its methods, the message event, its `data`/`ports` payload and any
+  // DataCloneError it throws are all objects of that context's realm, and it is
+  // deliberately NOT an instanceof the calling realm's MessagePort. So the
+  // handle has to be *constructed inside* the context (vm.runInContext), with
+  // this realm's real port kept on the outside and reached only through a plain
+  // helper table. Transferred ports arrive wrapped the same way, and the wrapper
+  // is memoised per port so `ports[0] === data.p` holds.
+  const kMoveCtxSrc = "(function (h) {\n" +
+    "  const DE = (typeof DOMException === 'function') ? DOMException : (function () {\n" +
+    "    class DOMException extends Error {\n" +
+    "      constructor(message, name) { super(message); this.name = name || 'Error'; this.code = 25; }\n" +
+    "    }\n" +
+    "    return DOMException;\n" +
+    "  })();\n" +
+    // Rebuild the payload with this realm's Object/Array so `data instanceof
+    // Object` holds inside the context; a port maps to its context-side handle.
+    "  const copy = function copy(v) {\n" +
+    "    if (v === null || typeof v !== 'object') return v;\n" +
+    "    const w = h.wrapOf(v); if (w !== undefined) return w;\n" +
+    "    if (h.isArray(v)) { const a = []; const n = h.len(v); for (let i = 0; i < n; i++) a[i] = copy(h.get(v, i)); return a; }\n" +
+    "    const o = {}; const ks = h.keys(v); for (let i = 0; i < ks.length; i++) o[ks[i]] = copy(h.get(v, ks[i]));\n" +
+    "    return o;\n" +
+    "  };\n" +
+    "  return { make: function (id) {\n" +
+    "    let onmsg;\n" +
+    "    const port = {\n" +
+    "      postMessage: function (value, transferList) {\n" +
+    "        const e = h.post(id, value, transferList);\n" +
+    "        if (e !== undefined) throw new DE(e.message, e.name);\n" +
+    "      },\n" +
+    "      start: function () { h.start(id); },\n" +
+    "      close: function () { h.close(id); },\n" +
+    "      ref: function () { h.ref(id); return this; },\n" +
+    "      unref: function () { h.unref(id); return this; },\n" +
+    "      hasRef: function () { return h.hasRef(id); },\n" +
+    "    };\n" +
+    "    Object.defineProperty(port, 'onmessage', {\n" +
+    "      configurable: true, get() { return onmsg; }, set(v) { onmsg = v; },\n" +
+    "    });\n" +
+    "    h.deliverTo(id, function (data, ports) {\n" +
+    "      if (typeof onmsg === 'function') onmsg.call(port, { data: copy(data), ports: copy(ports) });\n" +
+    "    });\n" +
+    "    return port;\n" +
+    "  } };\n" +
+    "})";
+  const moveMessagePortToContext = function (port, context) {
+    const vmM = M["vm"] || M["node:vm"];
+    if (!isPort(port)) {
+      const e = new TypeError('The "port" argument must be a MessagePort instance');
+      e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+    }
+    if (!vmM || typeof vmM.runInContext !== "function" || context === null ||
+        typeof context !== "object") {
+      const e = new TypeError('The "contextifiedSandbox" argument must be a vm.Context');
+      e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+    }
+    const st = { seq: 0, byId: new Map(), wrapOf: new Map(), deliver: new Map() };
+    const h = {
+      post: (id, value, tl) => {
+        try { st.byId.get(id).postMessage(value, tl); }
+        catch (e) { return { message: e && e.message, name: e && e.name }; }
+        return undefined;
+      },
+      start: (id) => { st.byId.get(id).start(); },
+      close: (id) => { st.byId.get(id).close(); },
+      ref: (id) => { st.byId.get(id).ref(); },
+      unref: (id) => { st.byId.get(id).unref(); },
+      hasRef: (id) => st.byId.get(id).hasRef(),
+      keys: (o) => Object.keys(o),
+      get: (o, k) => o[k],
+      len: (o) => o.length,
+      isArray: (o) => Array.isArray(o),
+      wrapOf: (v) => st.wrapOf.get(v),
+      deliverTo: (id, fn) => { st.deliver.set(id, fn); },
+    };
+    const factory = vmM.runInContext(kMoveCtxSrc, context)(h);
+    const mk = (p) => {
+      const seen = st.wrapOf.get(p);
+      if (seen !== undefined) return seen;
+      const id = ++st.seq;
+      st.byId.set(id, p);
+      const w = factory.make(id);
+      st.wrapOf.set(p, w);
+      p.onmessage = (ev) => {
+        const raw = (ev && ev.ports) || [];
+        for (const sp of raw) mk(sp);
+        const fn = st.deliver.get(id);
+        if (fn) fn(ev && ev.data, raw);
+      };
+      return w;
+    };
+    return mk(port);
+  };
 
   // ---- BroadcastChannel (in-process fan-out) ------------------------------
   const BroadcastChannel = G.BroadcastChannel || (function () {
@@ -583,6 +687,12 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
       for (const k of Object.keys(baseEnv)) { const v = baseEnv[k]; if (v !== undefined && v !== null) env[k] = String(v); }
       env.MBUN_WORKER_TID = String(tid);
       env.MBUN_WORKER_DATA = workerDataJson;
+      // environmentData is inherited by every worker STARTED FROM HERE, as a
+      // snapshot: node clones the parent's store into the new thread at spawn
+      // time, so a later setEnvironmentData in the parent must not reach it.
+      // Entry pairs (not an object) so non-string keys survive.
+      try { env.MBUN_WORKER_ENVDATA = JSON.stringify(Array.from(environmentData)); }
+      catch (e) { env.MBUN_WORKER_ENVDATA = "[]"; }
 
       const execArgv = Array.isArray(options.execArgv) ? options.execArgv.map(String)
                                                        : ((proc.execArgv || []).map(String));
@@ -683,25 +793,99 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
     isMainThread = false;
     threadId = Number(MY_TID) | 0;
     try { workerData = JSON.parse(WENV.MBUN_WORKER_DATA || "null"); } catch (e) { workerData = null; }
-    try { delete proc.env.MBUN_WORKER_TID; delete proc.env.MBUN_WORKER_DATA; } catch (e) {}
+    try {
+      const ed = JSON.parse(WENV.MBUN_WORKER_ENVDATA || "[]");
+      if (Array.isArray(ed)) for (const kv of ed) environmentData.set(kv[0], kv[1]);
+    } catch (e) {}
+    // Removed before user code runs: these are mbun's transport, not the
+    // worker's environment (test-worker-process-env inspects Object.keys(env)).
+    try {
+      delete proc.env.MBUN_WORKER_TID; delete proc.env.MBUN_WORKER_DATA;
+      delete proc.env.MBUN_WORKER_ENVDATA;
+    } catch (e) {}
     const chan = new MessageChannel();
     parentPort = chan.port1;
     Object.defineProperty(parentPort, "postMessage", {
       configurable: true, writable: true,
-      value: function (value) {
+      value: function (value, transferList) {
         if (typeof proc.send !== "function") return undefined;
         try { proc.send(value === undefined ? { t: "m" } : { t: "m", d: value }); } catch (e) {}
+        // node detaches every ArrayBuffer in the transfer list; the message is
+        // already on the wire, so the parent's copy is unaffected. Ignoring the
+        // list left `crypto.sign()`'s buffer alive in the worker after
+        // `postMessage(buf, [buf.buffer])`
+        // (test-worker-crypto-sign-transfer-result asserts byteLength === 0).
+        try {
+          for (const item of (normTransfer(transferList) || [])) {
+            if (item instanceof ArrayBuffer && !UNTRANSFERABLE.has(item)) {
+              try { G.structuredClone(item, { transfer: [item] }); } catch (e) {}
+            }
+          }
+        } catch (e) {}
         return undefined;
       },
     });
+    // node makes process.execve main-thread only: inside a worker it throws
+    // TypeError ERR_WORKER_UNSUPPORTED_OPERATION rather than replacing the
+    // process image out from under the other threads.
+    try {
+      proc.execve = function execve() {
+        const e = new TypeError("process.execve() is not available in workers");
+        e.code = "ERR_WORKER_UNSUPPORTED_OPERATION";
+        throw e;
+      };
+    } catch (e) {}
+    const reportFatal = (e) => {
+      if (typeof proc.send !== "function") return;
+      try { proc.send({ t: "e", d: { message: e && e.message, name: e && e.name, stack: e && e.stack, code: e && e.code } }); } catch (_) {}
+    };
+    // A fatal error in the worker's ENTRY POINT (a bad specifier, a throw at
+    // module scope) reaches the parent as an 'error' event too — node
+    // internal/worker.js reports it the same way it reports a later throw. The
+    // hook is only defined in a worker process; a normal run never calls it.
+    G.__mbunWorkerFatal = (e) => { if (e !== undefined) reportFatal(e); };
     if (typeof proc.on === "function") {
       proc.on("message", (m) => { if (m !== null && typeof m === "object" && m.t === "m") chan.port2.postMessage(m.d); });
-      // An uncaught throw inside a worker surfaces as an 'error' event on the
-      // parent's Worker handle, not as a bare non-zero exit (node worker.js).
-      proc.on("uncaughtException", (e) => {
-        try { proc.send({ t: "e", d: { message: e && e.message, name: e && e.name, stack: e && e.stack, code: e && e.code } }); } catch (_) {}
-        proc.exit(1);
-      });
+    }
+    // An uncaught throw inside a worker surfaces as an 'error' event on the
+    // parent's Worker handle, not as a bare non-zero exit (node worker.js) —
+    // but ONLY when nothing in the worker claimed it. Hooking the runtime's
+    // uncaught dispatch instead of registering a plain 'uncaughtException'
+    // listener is what makes that distinction possible: a listener would itself
+    // count as a claim, so a worker with its own handler (and its own
+    // process.exitCode) still died with the forced exit(1) this used to do, and
+    // the error the handler ITSELF threw was replaced by the original.
+    // This partition is assembled BEFORE node_process_lifecycle installs
+    // __mbun_uncaught, so wrap the SLOT, not the value: reads always yield the
+    // worker hook and the later plain assignment lands in `base`.
+    {
+      let base = G.__mbun_uncaught;
+      const hook = function (err) {
+        // node exits 6 ("Non-function Internal Exception Handler") when
+        // process._fatalException has been replaced by a non-function. Guarded
+        // on the property EXISTING so a build that never installs the stub
+        // keeps the ordinary path instead of turning every throw into a 6.
+        if ("_fatalException" in proc && typeof proc._fatalException !== "function") {
+          try { proc.exit(6); } catch (_) {}
+          return true;
+        }
+        let claimed = false;
+        if (typeof base === "function" && base !== hook) claimed = !!base.call(this, err);
+        if (!claimed) {
+          // The error the 'uncaughtException' handler ITSELF threw is the one
+          // node reports (__mbun_uncaught parks it in __mbun_fatal).
+          const f = G.__mbun_fatal;
+          reportFatal(f && f.length ? f[0] : err);
+        }
+        return claimed;
+      };
+      try {
+        Object.defineProperty(G, "__mbun_uncaught", {
+          configurable: true, enumerable: false,
+          get() { return hook; },
+          set(v) { base = v; },
+        });
+      } catch (e) {}
     }
     // node src/node_process_methods.cc: process.execve refuses to run off the
     // main thread — replacing the process image would take every other thread
