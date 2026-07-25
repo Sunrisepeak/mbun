@@ -35,37 +35,36 @@ ending. This file is what makes that recoverable.
    `latency_probe.py --only setImmediate` (400ms threshold; current build 565ms
    FAILS, pre-round baseline 114ms passes).
 
-1. **Ten remaining regressions — and three obvious mechanisms are already RULED OUT.**
+1. **The eleven "regressions" resolve into three groups. Two remain open.**
 
-   `test-permission-fs-require` is **fixed** (the fatal reporter was synthesizing
-   `Name [CODE]`, which no ordinary node error does).
+   **Fixed (5).** Four were ONE bug, and not in the child:
+   `spawnSync`'s drain loop kept `(timeoutMs >= 0 && !timedOut)` as a disjunct,
+   so once both pipes hit EOF it spun with zero fds until the deadline and then
+   killed an already-exited child — a 25ms child cost the full 30s timeout
+   (node 31ms, mbun now 92ms). That closed
+   `test-uncaught-exception-handler-stack-overflow`, `-on-stack-overflow`,
+   `test-async-hooks-stack-overflow-nested-async` and
+   `test-runner-mock-timers-with-timeout`. The fifth,
+   `test-permission-fs-require`, was the fatal reporter synthesizing
+   `Name [CODE]` — no ordinary node error prints that.
 
-   For the four stack-overflow / uncaught-exception timeouts, do NOT re-derive
-   these — each was probed against baseline and real node and each came back
-   *improved*, not broken:
-   - a throwing `uncaughtException` handler: base exit 1, now exit 7, **node exit
-     7** — correct now;
-   - a stack overflow reaching an `uncaughtException` handler: base never reached
-     the handler, now `handler:RangeError`, **same as node**;
-   - a plain caught stack overflow: identical on both.
+   **Never regressions (3).** `test-web-locks`, `test-web-locks-query` and
+   `test-worker-process-env` were FALSE PASSES at baseline. `navigator.locks` is
+   undefined inside a worker on BOTH binaries; what changed is that worker errors
+   now reach the parent instead of being swallowed, so the parent no longer exits
+   0 over a failed worker assertion. Same class as the `assert.throws` fix that
+   removed 126 unreal passes — the count went down because the measurement got
+   honest. The underlying gaps are real work, but they are not new.
 
-   So the hang is something narrower inside those specific files. Bisect the file
-   itself — run it on both binaries and read the output — rather than reasoning
-   from the tick queue or the entry try/catch. Three hypotheses derived that way
-   were wrong today, and the bisect-one-file approach found the real cause of a
-   256-file regression in minutes.
+   **Still open (2).** `test-crypto-worker-thread` (a KeyObject appears to
+   survive worker structured clone as a plain object dump) and
+   `test-repl-tab-complete-nested-repls`. Untriaged.
 
-   Original list, for reference: Each
-   reproduces 3/3 standalone, so they are not guard artefacts. Four time out:
-   `test-async-hooks-stack-overflow-nested-async`,
-   `test-uncaught-exception-handler-stack-overflow`,
-   `-on-stack-overflow`, `test-runner-mock-timers-with-timeout`. Seven fail:
-   `test-web-locks`, `test-web-locks-query`, `test-crypto-worker-thread`,
-   `test-permission-fs-require`, `test-repl-tab-complete-nested-repls`,
-   `test-worker-process-env` (this last one the worker agent identified as a
-   pre-existing latent failure that the new error reporting stopped hiding).
-   Suspect the `process.nextTick` queue split (`engine.inc`, `__mbunRunTicks`)
-   and the entry-script try/catch, both landed this round.
+   Method note that cost real time: for the four spawnSync files I probed the
+   CHILD three times — a throwing `uncaughtException` handler, a stack overflow
+   reaching the handler, a plain caught overflow — and all three came back
+   *better* than baseline and matching node. The tests are about the PARENT.
+   Read the failing file before probing the mechanism its name suggests.
 
 2. **`w5/agent-http` is UNMERGED and worth +18.** It conflicts with the merged
    `w6/net-dgram` and `w6/child-cluster` work in `modules/jsc/src/js_net.cppm` —
