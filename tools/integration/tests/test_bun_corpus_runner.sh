@@ -81,4 +81,46 @@ python3 "$repo_root/tools/integration/bun_corpus_runner.py" \
   --sample-per-group 1 --max-files 1 --out "$tmp/capped" --jobs 1 >/dev/null
 test "$(wc -l <"$tmp/capped/selected-tests.txt")" -eq 1
 
+# --- being MORE correct than bun is not a failure ----------------------------
+# bun marks cases bun itself gets wrong with `test.failing`. When mbun is more
+# correct, that marker passes and the runner prints
+#   (fail) <name> - expected to fail but passed
+# Scoring that as `test-failure` made advancing node compatibility look like a
+# bun REGRESSION, and manufactured a corpus trade-off that does not exist.
+python3 - "$repo_root" <<'AHEADPY'
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path(sys.argv[1]) / "tools/integration"))
+from bun_corpus_runner import classify
+
+
+def c(**kw):
+    base = dict(exit_code=0, passed=0, failed=0, ran=0, skipped=0,
+                timed_out=False, oom_killed=False, output="", blocked=False)
+    base.update(kw)
+    return classify(**base)
+
+
+stale = "(fail) x - expected to fail but passed\n 2 pass\n 1 fail\n"
+got = c(passed=2, failed=1, ran=3, output=stale)
+assert got == "ahead-of-reference", got
+
+mixed = ("(fail) x - expected to fail but passed\n"
+         "(fail) y - assertion failed\n 1 pass\n 2 fail\n")
+got = c(passed=1, failed=2, ran=3, output=mixed)
+assert got == "test-failure", got
+
+got = c(passed=3, failed=0, ran=3, output=" 3 pass\n 0 fail\n")
+assert got == "green", got
+
+got = c(passed=1, failed=1, ran=2, output=" 1 pass\n 1 fail\n")
+assert got == "test-failure", got
+
+got = c(exit_code=1, passed=2, failed=1, ran=3, output=stale)
+assert got == "test-failure", got
+
+print("ok   - a stale test.failing marker is ahead-of-reference, not a failure")
+print("ok   - a real failure alongside a stale marker is still test-failure")
+print("ok   - green, plain failure and non-zero exit are unaffected")
+AHEADPY
+
 echo "test_bun_corpus_runner: ok"
