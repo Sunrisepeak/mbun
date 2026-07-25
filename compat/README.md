@@ -662,9 +662,28 @@ Two things worth keeping from it:
 The general form, and it is the same lesson as the phantom-regression rule: when
 several independent things break at once in a way that does not name a common
 cause, suspect the shared environment before suspecting the code.
-### Real node is installed — stop theorising about what node does
+### Real node is installed — but it is a DIFFERENT VERSION from the corpus
 
-`node v24.15.0` is on PATH. Every question of the form "does node really behave
+**Correction to the rule as it was first written here.** `node v24.15.0` is on
+PATH; the corpus is **node v26.3.0** (`compat/node/src/node_version.h`,
+`NODE_MAJOR_VERSION 26`). Judging a v26 corpus expectation with a v24 binary
+gives a confidently wrong answer, and the first version of this section told
+agents to do exactly that.
+
+Measured: real node v24 **fails** the corpus file
+`test-child-process-spawn-timeout-kill-signal.js`, because `validateTimeout`
+changed between the releases — v24 throws `ERR_OUT_OF_RANGE` for a string
+timeout, v26 throws `ERR_INVALID_ARG_TYPE`. An agent caught this, went by
+`compat/node/lib/` instead, and was right to.
+
+**The authority is `compat/node/lib/` — the vendored v26 JavaScript source.**
+Read it. The on-PATH binary is a *sanity check*, useful only where you have
+reason to believe the behaviour did not move between 24 and 26; when they
+disagree, the vendored source wins and the oracle is simply out of date. Error
+codes and `NodeError` message text are exactly what moves most between releases,
+and they are what corpus files assert on most.
+
+With that qualification, the original point stands: Every question of the form "does node really behave
 that way?" is one command away, and answering it by reasoning instead has now
 cost this project several times over.
 
