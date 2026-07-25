@@ -337,7 +337,47 @@
         "green_ratio_heuristic": "For a mature, stable node subsystem, a low green ratio is stronger evidence of a missing layer than the error signatures are. cluster 11/80 and runner 10/73 currently look the same way http did.",
         "instrumented_stub_pattern": "The strongest single technique observed so far for an unknown-depth wall: stub the missing capability so it FAILS LOUDLY WITH ITS OWN NAME, then let the log histogram pick the next target each cycle. On the internalBinding cluster this produced deltas of +8,+13,+14,+4,+3,+1,+2 over 7 cycles (45 total) where a single blind change would have reached ~21. It converts an open-ended 'implement internalBinding' into a measured, self-terminating work queue.",
         "green_ratio_heuristic_validated": "Confirmed twice in one round. http: 26% green -> stand-in -> +170 (2.8x target). cluster: 13.3% green -> stub -> +65 on that subsystem (+73 task, 1.62x target). In both cases signature clustering gave no usable signal (a bare AssertionError tail, and a bare `global code@...` bucket respectively). The green ratio of a mature subsystem is now the primary targeting input; signatures are for picking work WITHIN a subsystem.",
-        "second_pass_is_worth_it": "A cluster declared 'no cause above 5 files' by a previous pass is NOT necessarily exhausted. The http2 tail yielded +51 on a second pass, +15 of it from a single missing layer (Http2Stream as a stream.Duplex). The earlier verdict was true of the SIGNATURES and false of the CAUSES \u2014 the same blind spot as the green-ratio finding. Treat 'no dominant signature' as 'no more cheap wins by signature', not as 'subsystem done', and re-check the green ratio."
+        "second_pass_is_worth_it": "A cluster declared 'no cause above 5 files' by a previous pass is NOT necessarily exhausted. The http2 tail yielded +51 on a second pass, +15 of it from a single missing layer (Http2Stream as a stream.Duplex). The earlier verdict was true of the SIGNATURES and false of the CAUSES \u2014 the same blind spot as the green-ratio finding. Treat 'no dominant signature' as 'no more cheap wins by signature', not as 'subsystem done', and re-check the green ratio.",
+        "guard_must_cover_what_you_edited": "A guard set scoped to the TARGET subsystems is not enough \u2014 it must cover every subsystem the change touched. The dns regression escaped because the task guarded http/https/tls/net/dgram (its targets) while also editing dns. Rule: derive the guard from the DIFF, not from the brief. `git diff --name-only` -> which builtins/modules changed -> guard every corpus subsystem that loads them."
+      },
+      "open_regressions": {
+        "total": 10,
+        "note": "All named, all measured, none absorbed. Bundled into a single repair task rather than left in the tail.",
+        "groups": [
+          {
+            "cause": "dns: in-flight resolver requests now count in the reactor's pending channel (needed so a dgram lookup does not let the pump take a 60s poll() park), but a request whose completion never decrements the count holds the loop open forever.",
+            "files": [
+              "test-dns-multi-channel.js",
+              "test-dns-resolvesrv-econnrefused.js",
+              "test-dns-resolvesrv.js"
+            ],
+            "was": "pass",
+            "now": "timeout",
+            "why_it_escaped": "The task's guard sets covered http/https/tls/net/dgram \u2014 its TARGET subsystems \u2014 but not dns, which it also edited."
+          },
+          {
+            "cause": "agent-6's cluster integration lived inside the dgram stand-in that agent-7's translation replaced.",
+            "files": [
+              "test-cluster-dgram-1.js",
+              "test-cluster-dgram-2.js",
+              "test-cluster-disconnect-unshared-udp.js",
+              "test-dgram-bind-socket-close-before-cluster-reply.js",
+              "test-dgram-cluster-bind-error.js",
+              "test-dgram-cluster-close-during-bind.js"
+            ],
+            "was": "pass",
+            "now": "timeout"
+          },
+          {
+            "cause": "http2 compat response 'finish' now arrives after the client's 'end', so session.close()'s GOAWAY is written too late.",
+            "files": [
+              "test-http2-session-graceful-close.js"
+            ],
+            "was": "pass",
+            "now": "fail",
+            "note": "Disclosed by the task itself; three fixes attempted and reverted because each traded it for 2-3 other files."
+          }
+        ]
       }
     }
   ]
