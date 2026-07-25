@@ -714,10 +714,15 @@ export constexpr std::string_view kHttp2JS = R"JS(
       this._localWindow = DEFAULT_CONNECTION_WINDOW;    // what the peer may still send us
       this._remoteWindow = DEFAULT_CONNECTION_WINDOW;   // what we may still send the peer
       this._lastProcStreamId = 0;
+      // node Http2Session: `encrypted` reflects the transport, `alpnProtocol` is
+      // "h2c" for a cleartext session, and `originSet` stays undefined until an
+      // ORIGIN frame arrives (DEFERRED).
       this.alpnProtocol = null;
+      this.encrypted = false;
+      this.originSet = undefined;
       if (typeof listener === "function") this.once("connect", listener);
 
-      const u = parseAuthority(authority);
+      const u = parseAuthority(authority, options);
       this._url = u.origin;
       this._authorityName = u.host;
       this._scheme = u.protocol === "https:" ? "https" : "http";
@@ -742,6 +747,7 @@ export constexpr std::string_view kHttp2JS = R"JS(
         return;
       }
       if (this._scheme === "https") {
+        this.encrypted = true;
         if (!tls || !tls.connect) { this._fatal(mkErr("http2 https requires node:tls", "ERR_HTTP2_ERROR")); return; }
         const sock = tls.connect({
           host, port, servername: options && options.servername ? options.servername : host,
@@ -757,7 +763,7 @@ export constexpr std::string_view kHttp2JS = R"JS(
       } else {
         const sock = new net.Socket();
         this.socket = sock;
-        sock.on("connect", () => self._onSocketReady());
+        sock.on("connect", () => { self.alpnProtocol = "h2c"; self._onSocketReady(); });
         sock.on("data", (d) => self._onData(d));
         sock.on("error", (e) => self._onSocketError(e));
         sock.on("close", () => self._onSocketClose());
@@ -1008,7 +1014,12 @@ export constexpr std::string_view kHttp2JS = R"JS(
       // still follows (lib/internal/http2/core.js onSessionHeaders).
       const st = headersObj[":status"];
       if (stream._responseEmitted) stream.emit("trailers", headersObj, flags);
-      else if (typeof st === "number" && st >= 100 && st < 200) stream.emit("headers", headersObj, flags);
+      else if (typeof st === "number" && st >= 100 && st < 200) {
+        stream.emit("headers", headersObj, flags);
+        // node ClientHttp2Stream handleHeaderContinue: a 100 informational
+        // response is additionally surfaced as 'continue'.
+        if (st === 100) stream.emit("continue");
+      }
       else stream._onResponse(headersObj, flags);
       if (pb.endStream) { this.streams.delete(pb.streamId); stream._onEnd(); }
       return true;
@@ -1125,9 +1136,23 @@ export constexpr std::string_view kHttp2JS = R"JS(
   }
 
   // === helpers ===
-  function parseAuthority(authority) {
+  // node http2.connect(): `authority` is a string, a URL, or any object
+  // exposing protocol / hostname|host / port. The plain-object form has no
+  // href, so passing it to `new URL()` produced "[object Object]" cannot be
+  // parsed as a URL; read the fields the way node's connect() does instead.
+  function parseAuthority(authority, options) {
     if (typeof authority === "string") { try { return new G.URL(authority); } catch (e) { return new G.URL("http://" + authority); } }
-    if (authority && authority.href) return authority;   // URL object
+    if (authority && typeof authority.href === "string") return authority;   // URL object
+    if (authority && typeof authority === "object") {
+      const protocol = authority.protocol || (options && options.protocol) || "https:";
+      let hostname = "localhost";
+      if (authority.hostname) { hostname = String(authority.hostname); if (hostname[0] === "[") hostname = hostname.slice(1, -1); }
+      else if (authority.host) hostname = String(authority.host);
+      const port = authority.port !== undefined && authority.port !== "" ? String(authority.port)
+        : (protocol === "http:" ? "80" : "443");
+      const brack = hostname.includes(":") ? "[" + hostname + "]" : hostname;
+      return new G.URL(protocol + "//" + brack + ":" + port);
+    }
     return new G.URL(String(authority));
   }
   // ---- outgoing header validation (node lib/internal/http2/util.js) ----------
@@ -1228,10 +1253,14 @@ export constexpr std::string_view kHttp2JS = R"JS(
       let name = list[i][0]; const value = list[i][1];
       raw.push(name, value);
       if (name === ":status") { obj[name] = parseInt(value, 10); continue; }
-      if (obj[name] === undefined) obj[name] = value;
-      else if (Array.isArray(obj[name])) obj[name].push(value);
-      else if (name === "set-cookie") obj[name] = [obj[name], value];
-      else obj[name] = obj[name] + ", " + value;
+      // node toHeaderObject: set-cookie is always an array, a repeated cookie
+      // field is joined with "; " (RFC 7540 8.1.2.5), any other repeated field
+      // with ", ", and a repeated single-value field keeps the first value.
+      if (obj[name] === undefined) { obj[name] = name === "set-cookie" ? [value] : value; continue; }
+      if (kSingleValueFields.has(name)) continue;
+      if (name === "cookie") { obj[name] = obj[name] + "; " + value; continue; }
+      if (name === "set-cookie") { obj[name].push(value); continue; }
+      obj[name] = obj[name] + ", " + value;
     }
     try { Object.defineProperty(obj, G.Symbol.for("nodejs.http2.sensitiveHeaders"), { value: sensitive ? sensitive.slice() : [], enumerable: false }); } catch (e) {}
     return obj;
@@ -1850,6 +1879,9 @@ export constexpr std::string_view kHttp2JS = R"JS(
         }
       }
       stream = new ServerHttp2Stream(this, pb.streamId, null);
+      // node Http2Stream#endAfterHeaders: the request carried END_STREAM on its
+      // HEADERS frame, i.e. there is no request body to wait for.
+      stream.endAfterHeaders = !!pb.endStream;
       this.streams.set(pb.streamId, stream);
       if (pb.streamId > this._lastStreamId) this._lastStreamId = pb.streamId;
       if (requestHeadersMalformed(list)) { this._streamError(stream, constants.NGHTTP2_PROTOCOL_ERROR); return true; }
