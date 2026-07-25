@@ -404,7 +404,9 @@
    ],
    "cause": "Socket.destroySoon() is implemented as an immediate destroy(). Response 1 carries maxRequestsOnConnectionReached -> res._last -> destroySoon(), which closes the fd synchronously inside onHead, so the pipelined request 2 is never dispatched and dropRequest never fires. node's destroySoon is end() followed by destroy on 'finish'.",
    "confidence": "CAUSE named",
-   "action": "2 files, one fix"
+   "action": "2 files, one fix",
+   "STATUS": "RESOLVED by w4/agent-http (2 of 2)",
+   "CORRECTION": "My named cause was WRONG. res._last is NOT set by maxRequestsOnConnectionReached -- node's _storeHeader writes 'Connection: close' in that branch without touching _last, and mbun matches, so resOnFinish never called destroySoon() in these files at all. The real cause: the parser rejected the stray CRLF the test writes between pipelined requests (socket.write('\\r\\n\\r\\n')), so request 2 became a 400 that destroyed the connection. llhttp's s_start_req swallows leading CR/LF per RFC 9112 2.2. destroySoon WAS an immediate destroy() and that was fixed too, but it was not what these files needed."
   },
   "http-client-connect-ignores-options-signal": {
    "corpus": "node",
@@ -417,7 +419,9 @@
    "cause": "options.signal is honoured only by Server.listen (js_net.cppm:849); Socket.prototype.connect has no equivalent, so an aborted signal never produces the AbortError on the socket.",
    "caveat": "The test asserts listenerCount(signal,'abort') === 1 SYNCHRONOUSLY, which node's own nextTick registration appears not to satisfy -- verify against real node before budgeting.",
    "confidence": "CAUSE named",
-   "action": "2 files"
+   "action": "2 files",
+   "STATUS": "RESOLVED by w4/agent-http (2 of 2)",
+   "CORRECTION": "My caveat -- 'the test asserts listenerCount(signal,\"abort\") === 1 synchronously, which node's own nextTick registration appears not to satisfy' -- was WRONG, and was refuted the right way: the agent RAN the test against real node v24.15.0 and it passes. The mbun gap was two-part: Socket#connect ignored `signal`, AND events.listenerCount() could not see EventTarget listeners (mbun's AbortSignal keeps them in _l)."
   },
   "http-server-socket-error-listener-is-a-noop": {
    "corpus": "node",
@@ -428,7 +432,9 @@
    ],
    "cause": "The server connection's 'error' listener is a noop (js_net.cppm:3068) instead of node's socketOnError, so a user's res.socket.emit('error', ...) is swallowed and the response is never torn down. Related: the parser is not re-armed after a clientError the server claimed, so only the first invalid byte errors where one test needs 21.",
    "confidence": "CAUSE named",
-   "action": "Cheap but WIDE: routing all server-socket errors through socketOnError makes every ECONNRESET emit 'clientError', which is what node does. Guard broadly."
+   "action": "Cheap but WIDE: routing all server-socket errors through socketOnError makes every ECONNRESET emit 'clientError', which is what node does. Guard broadly.",
+   "STATUS": "RESOLVED by w4/agent-http (2 of 2)",
+   "CORRECTION": "Sized right, but the fix is wider and sharper than described. Routing through socketOnError alone is not enough: the parser must be re-armed after a clientError the server CLAIMED (gate on 'claimed' or the 3 files that depend on single-report behaviour break), and the 'ignore further errors' self-removal must keep a permanent noop underneath -- without it, an https TLSSocket occupies the last 'error' slot and a later write-after-end throws. The agent caught that as a real regression in its own guard and fixed it."
   },
   "http-misc-named": {
    "corpus": "node",
@@ -475,6 +481,49 @@
    "cause": "net_parse_addr (modules/jsc/src/runtime/net.inc:45) only ever builds a sockaddr_in and MAPS '::' and '::1' onto IPv4 ANY/loopback, so listen(0, '::1') silently binds IPv4. Blocks test-tls-connect-address-family and test-https-connect-address-family, and almost certainly several test-net-* files.",
    "confidence": "CAUSE named",
    "action": "NOT a TLS bug -- do not budget it to a tls agent. Needs a net-layer round that measures its own reach first."
+  },
+  "http2-timeout-shapes": {
+   "corpus": "node",
+   "subsystem": "http2",
+   "file_count": 26,
+   "histogram": {
+    "B stalled exchange": 18,
+    "B' stalled + the test's own ref'd timer": 1,
+    "A server outlives dead client": 3,
+    "D no dump / native block": 3,
+    "MISCLASSIFIED not a timeout": 1
+   },
+   "cause": "Triaged with hang_dump.js at 8s against the frozen baseline. B: Server{listening} plus live socket pair(s), nothing destroyed, _wq=0, and NO TIMERS AT ALL. Same headline as tls and http1: 25 of 26 are not event-loop bugs. 8 of the 26 are already converted.",
+   "the_D_bucket_keeps_dissolving": "reset-flood was filed as a native block and was nothing of the kind -- the server was accepting a malformed HEADERS block instead of rejecting it, so the flood never terminated. That is the THIRD time a 'native crash/block' claim has dissolved under measurement (http shape-D never existed; one tls 'no dump' was hang_dump's own re-exec limitation). Treat 'no dump' as UNKNOWN, never as 'native'.",
+   "misclassified": "client-socket-destroy exits 1, not 124: client[kSocket] is undefined because the kSocket prototype property is installed by adoptNodeHttp2Internals(), gated on internalBinding('http2') having been requested",
+   "action": "the remaining 2 genuine native blocks are respond-file-with-pipe and respond-file-error-pipe-offset"
+  },
+  "http2-flow-control-TRAP": {
+   "corpus": "node",
+   "subsystem": "http2",
+   "file_count": 2,
+   "files": [
+    "test-http2-misbehaving-flow-control",
+    "test-http2-misbehaving-flow-control-paused"
+   ],
+   "cause": "the server never enforces its LOCAL receive window",
+   "DO_NOT_BUDGET_AS_CHEAP": "mbun's own http2 CLIENT does not respect the peer's send window either (js_http2.cppm:1686 says outright 'we do not throttle our own sends beyond max frame size'). Adding the server-side check first would kill same-runtime transfers -- the client would flood its own server. Fix the client's send-window accounting FIRST, then the server check.",
+   "action": "two-step, in that order"
+  },
+  "http2-misc-named": {
+   "corpus": "node",
+   "subsystem": "http2",
+   "files_with_causes": {
+    "test-http2-info-headers-errors": "monkey-patches Http2Stream.prototype off internalBinding('http2'); mbun's http2 is pure JS and never calls the binding (documented DEFERRED)",
+    "test-http2-respond-nghttperrors": "same binding-identity cause",
+    "test-http2-too-many-settings": "maxOutstandingSettings does not count the session's own initial SETTINGS, so max:2 never trips",
+    "test-http2-exceeds-server-trailer-size": "needs 'frameError' when a header block exceeds maxSendHeaderBlockLength",
+    "test-http2-server-unknown-protocol": "unknownProtocolTimeout option unimplemented",
+    "test-http2-autoselect-protocol": "needs h2Server.emit('connection', socket) after socket.unshift(data)",
+    "test-http2-compat-socket + test-http2-socket-proxy": "session[kTimeout] must be a real internal Timeout (with _idlePrev/_idleNext and node's util.inspect indentation) PLUS a socket proxy that throws on destroy/emit/end/pause/read/resume -- deeper than the one-line _idleTimeout the log suggests",
+    "capture-rejection (http + http2)": "ONE mechanism, two files: Symbol.for('nodejs.rejection') handlers on ServerResponse, Http2Stream and Http2Server. The inventory files them separately and should not"
+   },
+   "action": "batch"
   }
  },
  "coverage_note": "tls timeouts are now triaged: 19 files -> 3 shapes (B:12, A:5, D:2), collapsed by running tools/integration/hang_dump.js over every one. This is the same collapse the http block underwent, and it reproduces the same headline: none of the 19 is an event-loop bug. Cost ~5 minutes total, which is the argument for triaging centrally rather than making each agent pay for it."

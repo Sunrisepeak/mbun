@@ -662,3 +662,40 @@ Two things worth keeping from it:
 The general form, and it is the same lesson as the phantom-regression rule: when
 several independent things break at once in a way that does not name a common
 cause, suspect the shared environment before suspecting the code.
+### Real node is installed — stop theorising about what node does
+
+`node v24.15.0` is on PATH. Every question of the form "does node really behave
+that way?" is one command away, and answering it by reasoning instead has now
+cost this project several times over.
+
+The clearest case: an inventory entry carried my caveat that
+`test-http-agent-abort-controller` asserts `listenerCount(signal, 'abort') === 1`
+*synchronously*, "which node's own nextTick registration appears not to satisfy"
+— i.e. I had guessed the test might be unsatisfiable and told an agent to be
+wary of it. The agent ran the file against real node. **It passes.** The mbun gap
+was elsewhere entirely and two-part: `Socket#connect` ignored `signal`, and
+`events.listenerCount()` could not see EventTarget listeners because mbun's
+`AbortSignal` keeps them in `_l`. Both files converted.
+
+Use it as an oracle before recording a cause, and especially before telling
+anyone a corpus expectation might be wrong. The corpus is not the specification;
+the reference implementation is, and it is right there.
+
+### "No dump" is not "native crash" — the third time
+
+A hang with no `hang_dump.js` output has now been filed as a native crash or
+native block three times, and dissolved under measurement three times:
+
+1. `http-timeout-shape-D`, "2 files die in native `WTFCrashWithInfo`" — never
+   existed. All 49 http timeouts exit 124, and a crashing process dies on a
+   signal and never reaches the timeout kill, so a crash and a 124 are mutually
+   exclusive classifications.
+2. One tls "no dump" case was `hang_dump.js`'s own limitation: it `require`s its
+   target, so a `process.argv[2]`-dispatched re-exec test throws instead of
+   running.
+3. `test-http2-reset-flood`, filed under "native block", was the server
+   **accepting a malformed HEADERS block instead of rejecting it**, so the flood
+   never terminated. It is now green.
+
+The rule: a missing dump means UNKNOWN. Check the exit code, grep the log for
+crash text, and only then name a layer.
