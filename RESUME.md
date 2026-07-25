@@ -35,7 +35,27 @@ ending. This file is what makes that recoverable.
    `latency_probe.py --only setImmediate` (400ms threshold; current build 565ms
    FAILS, pre-round baseline 114ms passes).
 
-1. **Eleven real regressions from this round's runtime-wide changes.** Each
+1. **Ten remaining regressions — and three obvious mechanisms are already RULED OUT.**
+
+   `test-permission-fs-require` is **fixed** (the fatal reporter was synthesizing
+   `Name [CODE]`, which no ordinary node error does).
+
+   For the four stack-overflow / uncaught-exception timeouts, do NOT re-derive
+   these — each was probed against baseline and real node and each came back
+   *improved*, not broken:
+   - a throwing `uncaughtException` handler: base exit 1, now exit 7, **node exit
+     7** — correct now;
+   - a stack overflow reaching an `uncaughtException` handler: base never reached
+     the handler, now `handler:RangeError`, **same as node**;
+   - a plain caught stack overflow: identical on both.
+
+   So the hang is something narrower inside those specific files. Bisect the file
+   itself — run it on both binaries and read the output — rather than reasoning
+   from the tick queue or the entry try/catch. Three hypotheses derived that way
+   were wrong today, and the bisect-one-file approach found the real cause of a
+   256-file regression in minutes.
+
+   Original list, for reference: Each
    reproduces 3/3 standalone, so they are not guard artefacts. Four time out:
    `test-async-hooks-stack-overflow-nested-async`,
    `test-uncaught-exception-handler-stack-overflow`,
