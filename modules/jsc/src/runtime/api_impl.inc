@@ -196,7 +196,36 @@ int run_eval(const std::string& code) {
     std::error_code ec{};
     std::string dir{std::filesystem::current_path(ec).string()};
     if (ec) dir = ".";
-    return Runtime::instance().run_script(dir + "/[eval].ts", code);
+    // node lib/internal/modules/cjs/helpers.js addBuiltinLibsToObject(), which
+    // node's evalScript applies to --eval / --print: every public builtin module
+    // becomes a LAZY global, which is why `node -p "os.cpus().length"` and
+    // `node -e "assert.ok(x)"` work with no require. Without it those are a bare
+    // ReferenceError, and the corpus drives a lot of its child processes exactly
+    // that way (`spawn(process.execPath, [..., '-pe', 'tls.DEFAULT_CIPHERS'])`).
+    //
+    // Exclusions: '_'-prefixed internals, sub-paths ('fs/promises', 'bun:ffi'),
+    // and names globalThis already owns — with one measured exception. node's
+    // helper skips owned names too, yet `node -pe "crypto === require('crypto')"`
+    // prints true and `crypto.constants` is node:crypto's, not WebCrypto's, so
+    // `crypto` is deliberately let through. It is the ONLY one: letting the rest
+    // through replaced globalThis.process with a require('process') that is not
+    // the live process object here, and every eval died on `process._eval=`.
+    // The getter replaces itself with the loaded module, and
+    // assigning to the name defines a plain property, so user code can still
+    // overwrite it. It sits on ONE line so it cannot shift the line numbers of
+    // the user's source, and here rather than in the CLI so both entry points
+    // (`mbun -e` and the `node`-argv0 emulation) get it from one place.
+    static constexpr std::string_view kBuiltinGlobals{
+        "(function(g){try{var B=require('module').builtinModules||[];}catch(e){return;}"
+        "for(var i=0;i<B.length;i++){var n=B[i];"
+        "if(n[0]==='_'||n.indexOf('/')>=0||n.indexOf(':')>=0)continue;"
+        "if(n!=='crypto'&&Object.prototype.hasOwnProperty.call(g,n))continue;"
+        "(function(name){try{Object.defineProperty(g,name,{configurable:true,enumerable:false,"
+        "get:function(){var m;try{m=require(name);}catch(e){return undefined;}"
+        "Object.defineProperty(g,name,{configurable:true,enumerable:false,writable:true,value:m});"
+        "return m;},set:function(v){Object.defineProperty(g,name,{configurable:true,"
+        "enumerable:false,writable:true,value:v});}});}catch(e){}})(n);}})(globalThis);"};
+    return Runtime::instance().run_script(dir + "/[eval].ts", std::string{kBuiltinGlobals} + code);
 }
 
 }  // namespace mbun::jsc::runtime

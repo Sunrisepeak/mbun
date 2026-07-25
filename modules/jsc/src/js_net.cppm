@@ -879,6 +879,20 @@ export constexpr std::string_view kNetJS = R"JS(
       return progress;
     }
   }
+  // node net.js Socket.prototype.readyState: a deprecated but still-asserted
+  // view of the two stream flags — 'opening' while connecting, then 'open' /
+  // 'readOnly' / 'writeOnly' by which half is still live, and 'closed' once
+  // neither is. Purely derived, so it costs nothing until read.
+  Object.defineProperty(Socket.prototype, "readyState", {
+    configurable: true,
+    get() {
+      if (this.connecting) return "opening";
+      if (this.readable && this.writable) return "open";
+      if (this.readable) return "readOnly";
+      if (this.writable) return "writeOnly";
+      return "closed";
+    },
+  });
   // node keeps the pre-io.js `_connecting` name as an alias of `connecting`.
   Object.defineProperty(Socket.prototype, "_connecting", {
     get() { return this.connecting; },

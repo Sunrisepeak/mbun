@@ -220,7 +220,7 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
   // OpenSSL's own default: the trailing !aNULL/!eNULL/!EXPORT/!DES/!RC4/!MD5/
   // !PSK/!SRP/!CAMELLIA exclusions remove unauthenticated, unencrypted, export-
   // grade and legacy suites. Copied verbatim so tests comparing the two agree.
-  const DEFAULT_CIPHERS =
+  const DEFAULT_CORE_CIPHERS =
     "TLS_AES_256_GCM_SHA384:" +
     "TLS_CHACHA20_POLY1305_SHA256:" +
     "TLS_AES_128_GCM_SHA256:" +
@@ -245,6 +245,23 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
     "!PSK:" +
     "!SRP:" +
     "!CAMELLIA";
+
+  // node src/node_options.cc --tls-cipher-list=<list>: the operator replaces the
+  // compiled-in default outright. node then reports the REPLACEMENT as both
+  // tls.DEFAULT_CIPHERS and crypto.constants.defaultCipherList, while
+  // crypto.constants.defaultCoreCipherList keeps naming the compiled-in one, so
+  // a program can still tell what it was overridden from
+  // (test-tls-cipher-list asserts exactly that pair). Only ever applied on the
+  // operator's explicit instruction; with no flag the core list stands.
+  let DEFAULT_CIPHERS = DEFAULT_CORE_CIPHERS;
+  {
+    const argv = (G.process && G.process.execArgv) || [];
+    for (const a of argv) {
+      if (typeof a === "string" && a.startsWith("--tls-cipher-list=")) {
+        DEFAULT_CIPHERS = a.slice("--tls-cipher-list=".length);
+      }
+    }
+  }
 
   // ---- processCiphers (lib/internal/tls/secure-context.js) -------------------
   // OpenSSL keeps the TLS 1.3 suites in a separate slot from the <=TLS 1.2
@@ -907,6 +924,10 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
     CLIENT_RENEG_LIMIT: 3,
     CLIENT_RENEG_WINDOW: 600,
     DEFAULT_CIPHERS,
+    // The compiled-in list, before any --tls-cipher-list override. Not a node
+    // export: it is how js_tls_live populates crypto.constants.defaultCoreCipherList
+    // without duplicating the literal.
+    __mbunCoreCiphers: DEFAULT_CORE_CIPHERS,
     connect,
     convertALPNProtocols,
     createSecureContext,
