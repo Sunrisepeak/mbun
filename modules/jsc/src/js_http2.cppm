@@ -833,6 +833,8 @@ export constexpr std::string_view kHttp2JS = R"JS(
   function initHttp2Stream(stream, session, id) {
     stream.session = session;
     stream.id = id;
+    // Only the client session maintains this (see ClientHttp2Session#_maybeDestroy).
+    if (session && typeof session._liveStreams === "number") { session._liveStreams++; stream._counted = true; }
     stream._endStreamSent = false;
     stream._closed = false;
     stream._finished = false;
@@ -960,9 +962,15 @@ export constexpr std::string_view kHttp2JS = R"JS(
     }
     try { stream.session.streams.delete(stream.id); } catch (e) {}
     const sess = stream.session;
+    if (stream._counted === true) {
+      stream._counted = false;
+      if (sess && typeof sess._liveStreams === "number" && sess._liveStreams > 0) sess._liveStreams--;
+    }
     G.queueMicrotask(() => {
       if (!sess) return;
       if (sess._endPending) sess._onSocketEnd();
+      // The last live stream releases a graceful close() that was waiting on it.
+      if (sess._destroyPending && typeof sess._maybeDestroy === "function") sess._maybeDestroy();
     });
     cb(err || null);
   }
@@ -1129,6 +1137,10 @@ export constexpr std::string_view kHttp2JS = R"JS(
       this._localWindow = DEFAULT_CONNECTION_WINDOW;    // what the peer may still send us
       this._remoteWindow = DEFAULT_CONNECTION_WINDOW;   // what we may still send the peer
       this._lastProcStreamId = 0;
+      // node kMaybeDestroy's gate — see _maybeDestroy(). A stream that is open
+      // (created, not yet destroyed) holds a graceful close() open.
+      this._liveStreams = 0;
+      this._destroyPending = false;
       // node Http2Session: `encrypted` reflects the transport, `alpnProtocol` is
       // "h2c" for a cleartext session, and `originSet` stays undefined until an
       // ORIGIN frame arrives (DEFERRED).
@@ -1607,6 +1619,20 @@ export constexpr std::string_view kHttp2JS = R"JS(
     // instead, so the frame reaches the peer.
     _teardown(hard) {
       if (this.destroyed) return;
+      // A GRACEFUL teardown must not discard frames the peer has already
+      // delivered. After close() the peer answers with its own GOAWAY, and those
+      // bytes can be sitting in the socket's receive buffer unread — closing the
+      // fd here would drop them and 'goaway' would never fire
+      // (test-http2-session-graceful-close). node never loses them because its
+      // read callback runs before the destroy; drain the socket once instead.
+      // Must happen BEFORE `destroyed` is set: _onData ignores a destroyed session.
+      if (hard === false && this._drainingSocket !== true) {
+        this._drainingSocket = true;
+        try { if (this.socket && typeof this.socket._poll === "function") this.socket._poll(); } catch (e) {}
+        this._drainingSocket = false;
+        // A drained GOAWAY/FIN can have torn the session down already.
+        if (this.destroyed) return;
+      }
       this.destroyed = true; this.closed = true;
       if (this._timer != null) { try { G.clearTimeout(this._timer); } catch (e) {} this._timer = null; }
       closeSessionSocket(this.socket, hard !== false);
@@ -1625,7 +1651,36 @@ export constexpr std::string_view kHttp2JS = R"JS(
       const p = Buffer.alloc(8); p.writeUInt32BE(this._lastStreamId > 0 ? this._lastStreamId : 0, 0); p.writeUInt32BE(0, 4);
       try { this._writeFrame(FRAME.GOAWAY, 0, 0, p); } catch (e) {}
       const self = this;
-      G.queueMicrotask(() => self._teardown(false));
+      G.queueMicrotask(() => self._maybeDestroy());
+    }
+    // node Http2Session#close() is goaway() + kMaybeDestroy(), and kMaybeDestroy
+    // returns without destroying while `state.streams.size > 0`. That wait is
+    // OBSERVABLE: a client that closes from its request's 'end' handler has to
+    // stay readable long enough to see the peer's own GOAWAY, which the server
+    // only sends once its response has finished (test-http2-session-graceful-
+    // close). Tearing the socket down on the next microtask instead dropped
+    // every frame still in flight.
+    // node's gate is the stream map; mbun's cannot be, because it removes a
+    // stream from the routing map the moment END_STREAM arrives (node keeps it
+    // until [kDestroy]) — so by the time 'end' runs the map is already empty.
+    // `_liveStreams` is the node-equivalent count: it drops on stream destroy.
+    _maybeDestroy() {
+      if (this.destroyed || this._destroyScheduled) return;
+      if (!this.closed) return;
+      if (this.streams.size > 0 || this._liveStreams > 0) { this._destroyPending = true; return; }
+      this._destroyPending = false;
+      this._destroyScheduled = true;
+      // One I/O turn of grace, not a microtask. node's peer answers a graceful
+      // close inside the same read batch (its stream closes synchronously in
+      // nghttp2), so its GOAWAY is already parsed by the time close() destroys.
+      // mbun's server reaches that point one microtask drain later, and the
+      // pump's *second* io_tick of the same iteration is what picks the frame
+      // up — a microtask teardown ran before it and dropped the socket with the
+      // peer's GOAWAY still unread.
+      const self = this;
+      const nextTurn = typeof G.setImmediate === "function" ? G.setImmediate : (fn) => G.setTimeout(fn, 0);
+      const h = nextTurn(() => self._teardown(false));
+      if (h && typeof h.unref === "function") h.unref();
     }
     destroy(err, code) {
       if (this.destroyed) return;
