@@ -245,7 +245,13 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
   const headerCharRegex = /[^\t\x20-\x7e\x80-\xff]/;
   const chunkExpression = /(?:^|\W)chunked(?:$|\W)/i;
   const checkIsHttpToken = (val) => tokenRegExp.exec(val) !== null;
-  const checkInvalidHeaderChar = (val) => headerCharRegex.exec(String(val)) !== null;
+  // node lib/_http_common.js keeps two field-value alphabets: the RFC 7230
+  // strict one (default) and a Fetch-spec lenient one used only when the caller
+  // opted into --insecure-http-parser. `lenient` defaults to false, so every
+  // existing call site keeps the strict alphabet — this widens nothing.
+  const lenientHeaderCharRegex = /[\x00\x0a\x0d]|[^\x00-\xff]/;
+  const checkInvalidHeaderChar = (val, lenient) =>
+    (lenient ? lenientHeaderCharRegex : headerCharRegex).exec(String(val)) !== null;
   const validateHeaderName = (name, label) => {
     if (typeof name !== "string" || !name || !checkIsHttpToken(name)) {
       throw ERR_INVALID_HTTP_TOKEN(label || "Header name", name);
@@ -2157,6 +2163,82 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
   Server.prototype.closeAllConnections = function () {};
   Server.prototype.closeIdleConnections = function () {};
 
+  // -------------------------------------------------- parser free list
+  // node lib/internal/freelist.js FreeList, instantiated by _http_common.js as
+  // `new FreeList('parsers', 1000, parsersCb)`. `http.setMaxIdleHTTPParsers`
+  // writes `parsers.max` and test-http-set-max-idle-http-parser reads it back,
+  // so this has to be the same object both sides see, not a private copy.
+  const parsersFreeList = {
+    name: "parsers",
+    max: 1000,
+    list: [],
+    get length() { return this.list.length; },
+    alloc() {
+      const p = this.list.length ? this.list.pop() : null;
+      if (p) return p;
+      const HP = G.__mbunHttpParser;
+      return HP ? new HP(false) : null;
+    },
+    free(obj) {
+      if (this.list.length < this.max) { this.list.push(obj); return true; }
+      return false;
+    },
+  };
+  // node lib/_http_common.js kConnectionsCheckingInterval — the server's
+  // headersTimeout/requestTimeout sweeper handle, asserted directly by
+  // test-http-server-{clear-timer,async-dispose,close-destroy-timeout}.
+  const kConnectionsCheckingInterval = Symbol("http.server.connectionsCheckingInterval");
+  const kServerResponse = Symbol("ServerResponse");
+  const kServerResponseStatistics = Symbol("ServerResponseStatistics");
+  const kIncomingMessage = Symbol("IncomingMessage");
+
+  // node lib/_http_common.js freeParser + clearIncoming. `parser.incoming` is
+  // what keeps a finished IncomingMessage alive; clearing it is observable
+  // (test-http-server-keepalive-end asserts parser.incoming === req inside the
+  // request's own 'end' handler and null on the next tick, which only works if
+  // the clear is *deferred to a later 'end' listener* rather than done eagerly).
+  function clearIncoming(reqArg) {
+    const r = reqArg || this;
+    const sock = r && r.socket;
+    const parser = sock && sock.parser;
+    if (parser && parser.incoming === r) {
+      if (r.readableEnded) {
+        parser.incoming = null;
+        r.parser = null;
+      } else {
+        r.on("end", clearIncoming);
+      }
+    }
+  }
+  function freeParser(parser, reqArg, socket) {
+    if (parser && !parser._freed) {
+      parser._freed = true;
+      parser.incoming = null;
+      parser.outgoing = null;
+      // Drop everything the parser was holding before it is parked: the free
+      // list is process-wide, so a retained body buffer or closure would be a
+      // per-connection leak (test-http-parser-memory-retention watches for it).
+      try {
+        parser.onHead = parser.onBody = parser.onDone = parser.onError = parser.onInterim = null;
+        parser._afterDone = null;
+        parser.socket = null;
+        parser.buf = new Uint8Array(0);
+        parser.off = 0;
+        parser.headers = {}; parser.rawHeaders = []; parser.trailers = {};
+      } catch (e) {}
+      if (parsersFreeList.free(parser) === false) {
+        nextTick(() => { if (typeof parser.close === "function") parser.close(); });
+      } else if (typeof parser.free === "function") {
+        // A user-installed `parser.free` is exactly the hook
+        // test-http-server-connection-list-when-close overwrites to observe
+        // that the parser left the server's connection list.
+        parser.free();
+      }
+    }
+    if (reqArg) reqArg.parser = null;
+    if (socket) socket.parser = null;
+  }
+
   // -------------------------------------------------- module assembly
   function makeExports(AgentClass, defaultGlobalAgent) {
     const createServer = (options, listener) => new Server(options, listener);
@@ -2172,7 +2254,7 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
       Server, ServerResponse, IncomingMessage, OutgoingMessage, ClientRequest,
       createServer, request, get,
       validateHeaderName, validateHeaderValue,
-      setMaxIdleHTTPParsers(max) { validateInteger(max, "max", 1); },
+      setMaxIdleHTTPParsers(max) { validateInteger(max, "max", 1); parsersFreeList.max = max; },
       setGlobalProxyFromEnv() { return function restore() {}; },
       globalAgent: defaultGlobalAgent,
       // Process-wide, read by every server per request (bun src/js/node/http.ts
@@ -2234,7 +2316,46 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
     hc._checkIsHttpToken = hc.checkIsHttpToken = checkIsHttpToken;
     hc._checkInvalidHeaderChar = hc.checkInvalidHeaderChar = checkInvalidHeaderChar;
     hc.chunkExpression = chunkExpression;
+    hc.parsers = parsersFreeList;
+    hc.freeParser = freeParser;
+    hc.prepareError = function (err) { err.rawPacket = err.rawPacket || undefined; };
+    hc.kIncomingMessage = kIncomingMessage;
+    hc.methods = hc.methods || METHODS;
     M["node:_http_common"] = hc;
+  }
+
+  // node splits http across `_http_agent`, `_http_client`, `_http_incoming`,
+  // `_http_outgoing` and `_http_server`; its own tests require those directly
+  // (`const { Agent } = require('_http_agent')`,
+  // `const { kConnectionsCheckingInterval } = require('_http_server')`), and the
+  // bootstrap registered them as empty objects, so the destructured binding was
+  // `undefined` and `new Agent(...)` died as "not a constructor". Publish the
+  // real objects. `Server`/`ServerResponse` are read through `M["http"]` because
+  // js_net.cppm replaces them later with the transport-capable versions.
+  {
+    const pub = (name, obj) => { M[name] = M["node:" + name] = obj; };
+    const httpMod = () => M["http"] || M["node:http"] || {};
+    pub("_http_agent", { Agent, globalAgent });
+    pub("_http_client", { ClientRequest, get parsers() { return parsersFreeList; } });
+    pub("_http_incoming", {
+      IncomingMessage,
+      readStart(socket) { if (socket && !socket._paused && socket.readable) socket.resume(); },
+      readStop(socket) { if (socket) socket.pause(); },
+    });
+    pub("_http_outgoing", {
+      OutgoingMessage, kOutHeaders, kHighWaterMark, kUniqueHeaders,
+      parseUniqueHeadersOption, validateHeaderName, validateHeaderValue,
+    });
+    pub("_http_server", {
+      STATUS_CODES,
+      get Server() { return httpMod().Server; },
+      get ServerResponse() { return httpMod().ServerResponse; },
+      kServerResponse, kServerResponseStatistics, kConnectionsCheckingInterval,
+      storeHTTPOptions() {},
+      setupConnectionsTracking() {},
+      httpServerPreClose(server) { if (server && typeof server.closeIdleConnections === "function") server.closeIdleConnections(); },
+      _connectionListener() {},
+    });
   }
 
   // Shared with js_net.cppm (which owns the server transport) and with the
@@ -2249,6 +2370,8 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
     ERR_HTTP_INVALID_STATUS_CODE, ERR_INVALID_CHAR, ERR_OUT_OF_RANGE,
     validateInteger, validateNumber, validateBoolean, validateObject, validateString,
     getTimerDuration,
+    kConnectionsCheckingInterval, kServerResponse, kIncomingMessage,
+    parsersFreeList, freeParser, clearIncoming,
   };
 })();
 )JS";
