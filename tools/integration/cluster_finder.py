@@ -14,12 +14,12 @@ per-file `logs/*.log`). All bounded/systemd-scoped execution stays in the
 runner (see bounded_run.py); this is pure post-hoc analysis, so it can never
 freeze the machine and needs no safety layer of its own.
 
-For each non-green, non-timeout file it distils the log into a normalised
+For each non-green, non-timeout, non-skipped file it distils the log into a normalised
 *signature* (the error class + message with volatile bits — paths, numbers,
 quoted literals, hex — replaced by placeholders) so that "cannot find module
 /abs/a" and "cannot find module /abs/b" collapse to one bucket. Files are then
 grouped by (subsystem, signature) and subsystems ranked by how many *fixable*
-(non-timeout, non-oom) files they carry — timeouts are usually child_process
+(non-timeout, non-oom, non-skipped) files they carry — timeouts are usually child_process
 harness gaps, not a shared code bug, so they are reported separately and never
 inflate a cluster's fixable score.
 
@@ -136,7 +136,8 @@ class CrossCluster:
 class SubsystemStat:
     subsystem: str
     green: int = 0
-    fixable: int = 0        # fail (not timeout/oom)
+    fixable: int = 0        # fail (not timeout/oom/skipped)
+    skipped: int = 0
     timeout: int = 0
     oom: int = 0
     files: list[str] = field(default_factory=list)
@@ -175,6 +176,15 @@ def analyze(
         stat.files.append(name)
         if classification == "pass":
             stat.green += 1
+            continue
+        # A self-skip is an HONEST outcome, not work: the file exited 0 because
+        # the runtime lacks the feature it wanted to test. Counting it as
+        # fixable made the corpus's largest apparent "cluster" 542 skipped
+        # files (quic 234, inspector 71, debugger 60 ...) whose shared
+        # "signature" is just their skip line — pure noise that would have
+        # aimed a whole round at nothing.
+        if classification == "skipped":
+            stat.skipped += 1
             continue
         if classification == "timeout":
             stat.timeout += 1
@@ -225,12 +235,13 @@ def print_report(
             print(f"[{len(cluster.paths):>4}] across {len(cluster.subsystems):>3} subsystems: {cluster.signature}")
             print(f"       {head}{extra}")
         print()
-    print("== subsystems by fixable-fail density (fixable excludes timeouts/oom) ==")
-    print(f"{'subsystem':16} {'green':>6} {'fixable':>8} {'timeout':>8} {'oom':>5}")
+    print("== subsystems by fixable-fail density (fixable excludes timeouts/oom/skipped) ==")
+    print(f"{'subsystem':16} {'green':>6} {'fixable':>8} {'skipped':>8} {'timeout':>8} {'oom':>5}")
     for stat in subsystems:
         if stat.fixable == 0 and stat.timeout == 0 and stat.oom == 0:
             continue
-        print(f"{stat.subsystem:16} {stat.green:>6} {stat.fixable:>8} {stat.timeout:>8} {stat.oom:>5}")
+        print(f"{stat.subsystem:16} {stat.green:>6} {stat.fixable:>8} {stat.skipped:>8} "
+              f"{stat.timeout:>8} {stat.oom:>5}")
     print()
     print(f"== top {top} single-root-cause clusters (same subsystem + error signature) ==")
     for cluster in clusters[:top]:
@@ -251,7 +262,7 @@ def to_json(
     return json.dumps({
         "subsystems": [
             {"subsystem": s.subsystem, "green": s.green, "fixable": s.fixable,
-             "timeout": s.timeout, "oom": s.oom}
+             "skipped": s.skipped, "timeout": s.timeout, "oom": s.oom}
             for s in subsystems if (s.fixable or s.timeout or s.oom)
         ],
         "clusters": [
