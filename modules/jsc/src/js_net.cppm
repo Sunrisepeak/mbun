@@ -196,6 +196,10 @@ export constexpr std::string_view kNetJS = R"JS(
       // *socket* legitimately read it: npm `ws` socketOnClose gates its final
       // drain on `socket._readableState.endEmitted` and then `socket.read()`.
       this._readableState = { endEmitted: false, ended: false, destroyed: false, length: 0, flowing: true, readable: true, objectMode: false };
+      // node:http's OutgoingMessage.end() sets _writableState.corked before its
+      // final uncork(); keep the cork counter in one place.
+      this._corked = 0;
+      this._writableState = { corked: 0, ended: false, finished: false, destroyed: false, length: 0, objectMode: false, highWaterMark: HWM };
     }
     _adopt(fd) {
       this._fd = fd; this.pending = false; this.destroyed = false; this.connecting = false;
@@ -363,7 +367,14 @@ export constexpr std::string_view kNetJS = R"JS(
       }
       return this;
     }
-    cork() { return this; } uncork() { return this; }
+    // This transport writes through immediately, so corking is bookkeeping
+    // only -- but node:http's OutgoingMessage reads writableCorked and pokes
+    // _writableState.corked on end(), so both must exist and stay consistent.
+    cork() { this._corked = (this._corked | 0) + 1; if (this._writableState) this._writableState.corked = this._corked; return this; }
+    uncork() { if (this._corked > 0) this._corked--; if (this._writableState) this._writableState.corked = this._corked; return this; }
+    get writableCorked() { return this._corked | 0; }
+    get writableHighWaterMark() { return HWM; }
+    get readableHighWaterMark() { return HWM; }
     // node net.Socket#ref/unref: sticky user intent over the handle's loop
     // reference. These were no-ops, so an unref'd keep-alive/agent socket still
     // pinned the process.
@@ -431,6 +442,14 @@ export constexpr std::string_view kNetJS = R"JS(
       }
       if (this.destroyed || this._shutW) { const err = mkErr("write after end", "ERR_STREAM_WRITE_AFTER_END"); if (typeof cb === "function") G.queueMicrotask(() => cb(err)); else this.emit("error", err); return false; }
       const b = typeof data === "string" && enc && enc !== "utf8" && enc !== "utf-8" && G.Buffer ? u8(G.Buffer.from(data, enc)) : u8(data);
+      // A zero-length chunk must never enter the queue: _flush() stops on the
+      // first write() that reports 0 bytes, so an empty head parks every byte
+      // behind it forever. node:http's end() flushes with `_send("")`, so this
+      // wedged the *second* response on any keep-alive connection.
+      if (b.length === 0) {
+        if (typeof cb === "function") G.queueMicrotask(cb);
+        return this._wqLen < HWM;
+      }
       this._wq.push(b); this._wqLen += b.length; this.bytesWritten += b.length;
       if (this._timeoutMs) this._armTimeout();
       this._flush();
@@ -486,6 +505,7 @@ export constexpr std::string_view kNetJS = R"JS(
       // in time and memory).
       while (this._wq.length) {
         const head = this._wq[0];
+        if (head.length === 0) { this._wq.shift(); continue; }  // never stall on an empty chunk
         const piece = head.length > WCHUNK ? head.subarray(0, WCHUNK) : head;
         let n;
         try { n = this._tls ? NN.tlsWrite(this._fd, toB64(piece)) : NN.write(this._fd, toB64(piece)); }
@@ -1089,6 +1109,10 @@ export constexpr std::string_view kNetJS = R"JS(
       this.remaining = 0; this.chunked = false; this.toEof = false;
       this.reqMethod = "GET";
       this.onHead = null; this.onBody = null; this.onDone = null; this.onError = null;
+      // 1xx interim heads are not the final response: node re-arms the parser
+      // and raises 'continue'/'information' on the ClientRequest instead
+      // (_http_client.js parserOnIncomingClient -> `return 1`).
+      this.onInterim = null;
     }
     leftover() { return this.buf.subarray(this.off); }
     push(bytes) {
@@ -1153,7 +1177,14 @@ export constexpr std::string_view kNetJS = R"JS(
             this.rawHeaders.push(k, v);
             this.headers[lk] = lk in this.headers ? this.headers[lk] + ", " + v : v;
           }
-          if (this.isResponse && this.status >= 100 && this.status < 200 && this.status !== 101) continue;  // 1xx interim: skip
+          if (this.isResponse && this.status >= 100 && this.status < 200 && this.status !== 101) {
+            if (this.onInterim) {
+              this.onInterim({ status: this.status, statusText: this.statusText, httpVersion: this.httpVersion,
+                               headers: this.headers, rawHeaders: this.rawHeaders });
+            }
+            events++;
+            continue;  // 1xx interim: the final response follows on this connection
+          }
           this.headDone = true;
           const teHdr = String(this.headers["transfer-encoding"] || "").toLowerCase();
           const cl = this.headers["content-length"];
@@ -2290,209 +2321,58 @@ export constexpr std::string_view kNetJS = R"JS(
     };
   }
 
-  // ---- node:http server (createServer / IncomingMessage / ServerResponse) ----
-  // The request object is node:http's own IncomingMessage (builtins/node_http),
-  // which derives from the real node:stream Readable exactly like bun does in
-  // src/js/node/_http_incoming.ts:154 -- `$toClass(IncomingMessage,
-  // "IncomingMessage", Readable)`. Reuse it rather than redeclare it: a local
-  // subclass would put an extra hop in the prototype chain (bun's is exactly
-  // IncomingMessage -> Readable -> Stream -> EventEmitter -> Object), and a
-  // bare-EventEmitter stand-in silently strips the Readable half of the
-  // contract -- no push/read/pipe/async-iteration, so body-parser and every
-  // other `req.pipe(...)`/`for await (const c of req)` consumer sees no body.
-  // node_http declares the shapes but parks its transport (its Server never
-  // accepts a live socket); this file owns the transport. Together they are one
-  // working class, so the split has to stay a split of *duties*, not a shadow.
-  const IncomingMessage = (M["http"] || {}).IncomingMessage;
-  // _http_common header validation regexes (bun _http_common.ts / internal
-  // validators.ts) reused by writeEarlyHints.
-  const headerTokenRegex = /^[\^_`a-zA-Z\-0-9!#$%&'*+.|~]+$/;
-  const headerCharRegex = /[^\t\x20-\x7e\x80-\xff]/;
-  const linkValueRegExp = /^(?:<[^>]*>)(?:\s*;\s*[^;"\s=]+(?:=(")?[^;"\s]*\1)?)*$/;
-  const linkForbiddenChars = /[\r\n]/;
-  function validateLinkHeaderFormat(value) {
-    if (typeof value === "undefined" || !linkValueRegExp.exec(value) || linkForbiddenChars.exec(value) !== null) {
-      const e = new TypeError('The argument \'hints\' must be an array or string of format "</styles.css>; rel=preload; as=style". Received ' + JSON.stringify(value));
-      e.code = "ERR_INVALID_ARG_VALUE"; throw e;
-    }
-  }
-  function validateLinkHeaderValue(hints) {
-    if (typeof hints === "string") { validateLinkHeaderFormat(hints); return hints; }
-    if (Array.isArray(hints)) {
-      if (hints.length === 0) return "";
-      let result = "";
-      for (let i = 0; i < hints.length; i++) { validateLinkHeaderFormat(hints[i]); result += hints[i]; if (i !== hints.length - 1) result += ", "; }
-      return result;
-    }
-    const e = new TypeError('The argument \'hints\' must be an array or string of format "</styles.css>; rel=preload; as=style".');
-    e.code = "ERR_INVALID_ARG_VALUE"; throw e;
-  }
-  class ServerResponse extends EE {
-    constructor(sock, meta) {
-      super();
-      this.socket = this.connection = sock;
-      this.statusCode = 200; this.statusMessage = "";
-      this.headersSent = false; this.finished = false; this.writableEnded = false; this.writableFinished = false;
-      this.sendDate = true;
-      this._h = {}; this._meta = meta; this._chunked = false;
-      this._needDrain = false;
-    }
-    // node _http_outgoing: writableNeedDrain is a *stream* state, false until a
-    // write() actually exceeds the socket's high-water mark (issue 19111 — a
-    // standalone `new ServerResponse(req)` reported true because bufferedAmount
-    // defaulted to 1). It clears once the socket's queue has drained.
-    get writableNeedDrain() {
-      if (this.writableEnded || this.finished) return false;
-      if (!this._needDrain) return false;
-      const s = this.socket;
-      if (!s || (s.writableLength | 0) === 0) this._needDrain = false;
-      return this._needDrain;
-    }
-    setHeader(k, v) { this._h[String(k).toLowerCase()] = { k: String(k), v }; return this; }
-    getHeader(k) { const e = this._h[String(k).toLowerCase()]; return e ? e.v : undefined; }
-    getHeaders() { const o = {}; for (const lk in this._h) o[lk] = this._h[lk].v; return o; }
-    getHeaderNames() { return Object.keys(this._h); }
-    hasHeader(k) { return String(k).toLowerCase() in this._h; }
-    removeHeader(k) { delete this._h[String(k).toLowerCase()]; }
-    writeHead(status, msg, headers) {
-      this.statusCode = status;
-      if (msg !== null && typeof msg === "object") { headers = msg; msg = undefined; }
-      if (msg) this.statusMessage = String(msg);
-      if (headers) {
-        if (Array.isArray(headers)) { for (let i = 0; i + 1 < headers.length; i += 2) this.setHeader(headers[i], headers[i + 1]); }
-        else { for (const k of Object.keys(headers)) this.setHeader(k, headers[k]); }
-      }
-      return this;
-    }
-    flushHeaders() { this._sendHead(undefined); }
-    _sendHead(contentLength) {
-      if (this.headersSent) return;
-      this.headersSent = true;
-      const lines = ["HTTP/1.1 " + this.statusCode + " " + (this.statusMessage || statusText(this.statusCode))];
-      let haveCL = false, haveTE = false, haveDate = false;
-      for (const lk in this._h) {
-        const e = this._h[lk];
-        if (lk === "content-length") haveCL = true;
-        if (lk === "transfer-encoding") haveTE = true;
-        if (lk === "date") haveDate = true;
-        if (lk === "connection") continue;
-        if (Array.isArray(e.v)) { for (const vv of e.v) lines.push(e.k + ": " + vv); }
-        else lines.push(e.k + ": " + e.v);
-      }
-      if (!haveDate && this.sendDate) lines.push("Date: " + new Date().toUTCString());
-      // node _http_outgoing _hasBody: 204/304/1xx and HEAD carry no message
-      // body, so no Content-Length/Transfer-Encoding is auto-added (and body
-      // writes are discarded — see write()/end()). HEAD still reports an
-      // explicit Content-Length; only the auto-chunked fallback is suppressed.
-      const st = this.statusCode | 0;
-      const noBodyStatus = st === 204 || st === 304 || (st >= 100 && st < 200);
-      const isHead = this._meta.method === "HEAD";
-      this._noBody = noBodyStatus || isHead;
-      // Transfer-Encoding: chunked is HTTP/1.1-only framing. An HTTP/1.0 client
-      // (nginx `proxy_http_version 1.0`) cannot parse it, so a body of unknown
-      // length must instead be close-delimited: no TE header, no chunk framing,
-      // and the connection is what marks the end (issue 34415 — node's
-      // _http_server does the same via `chunkedEncoding` requiring 1.1).
-      const http10 = this._meta.httpVersion !== undefined && this._meta.httpVersion !== "1.1";
-      if (!haveCL && !haveTE && !noBodyStatus) {
-        if (contentLength !== undefined) lines.push("Content-Length: " + contentLength);
-        else if (!isHead && !http10) { this._chunked = true; lines.push("Transfer-Encoding: chunked"); }
-        // Close-delimited: an HTTP/1.0 client can only know the body ended when
-        // the connection does, so keep-alive is off no matter what it asked for.
-        else if (!isHead && http10) this._meta.keepAlive = false;
-      }
-      lines.push("Connection: " + (this._meta.keepAlive ? "keep-alive" : "close"));
-      // node _http_outgoing writes the header block as LATIN1: a header value is
-      // a byte string, so U+0080..U+00FF must go out as one byte each. Encoding
-      // it as UTF-8 (the socket's default) doubles those bytes, which is exactly
-      // how a `Location: /<binary utf-8 bytes>` redirect ends up double-encoded.
-      const head = lines.join("\r\n") + "\r\n\r\n";
-      this.socket.write(G.Buffer ? G.Buffer.from(head, "latin1") : head);
-    }
-    write(data, enc, cb) {
-      if (typeof enc === "function") { cb = enc; enc = null; }
-      if (!this.headersSent) this._sendHead(undefined);
-      // No-body responses (204/304/1xx/HEAD) silently discard body writes.
-      if (this._noBody) { if (typeof cb === "function") G.queueMicrotask(cb); return true; }
-      const b = typeof data === "string" && enc && G.Buffer ? u8(G.Buffer.from(data, enc)) : u8(data);
-      let ok = true;
-      if (this._chunked) {
-        this.socket.write(b.length.toString(16) + "\r\n");
-        this.socket.write(b);
-        ok = this.socket.write("\r\n");
-      } else {
-        ok = this.socket.write(b);
-      }
-      if (!ok) this._needDrain = true;
-      if (typeof cb === "function") G.queueMicrotask(cb);
-      return ok;
-    }
-    end(data, enc, cb) {
-      if (typeof data === "function") { cb = data; data = null; }
-      if (typeof enc === "function") { cb = enc; enc = null; }
-      if (this.finished) { if (typeof cb === "function") G.queueMicrotask(cb); return this; }
-      if (!this.headersSent) {
-        const b = data != null ? (typeof data === "string" && enc && G.Buffer ? u8(G.Buffer.from(data, enc)) : u8(data)) : new Uint8Array(0);
-        this._sendHead(b.length);
-        if (b.length && !this._noBody) this.socket.write(b);
-      } else {
-        if (data != null) this.write(data, enc);
-        if (this._chunked) this.socket.write("0\r\n\r\n");
-      }
-      this.finished = true; this.writableEnded = true; this.writableFinished = true;
-      if (!this._meta.keepAlive) this.socket.end();
-      if (typeof cb === "function") G.queueMicrotask(cb);
-      this.emit("finish");
-      if (this._meta.onFinished) this._meta.onFinished();
-      return this;
-    }
-    writeContinue() {}
-    // node ServerResponse.writeEarlyHints (bun _http_server.ts:1871): validate
-    // the Link value + every extra header BEFORE emitting the 103, so a CRLF or
-    // malformed link throws synchronously. The 103 interim response itself is
-    // not put on the wire here — our client HTTP/1.1 parser does not skip
-    // interim 1xx heads, so writing it would derail the following 200. The
-    // security-relevant surface (header/link validation) is fully enforced.
-    writeEarlyHints(hints, cb) {
-      if (!hints || typeof hints !== "object") {
-        const e = new TypeError('The "hints" argument must be of type object. Received ' + typeof hints);
-        e.code = "ERR_INVALID_ARG_TYPE"; throw e;
-      }
-      if (hints.link === null || hints.link === undefined) { if (typeof cb === "function") cb(); return this; }
-      const link = validateLinkHeaderValue(hints.link);
-      if (link.length === 0) { if (typeof cb === "function") cb(); return this; }
-      if (headerCharRegex.test(link)) {
-        const e = new TypeError('Invalid character in header content ["Link"]'); e.code = "ERR_INVALID_CHAR"; throw e;
-      }
-      for (const key of Object.keys(hints)) {
-        if (key === "link") continue;
-        if (typeof key !== "string" || !key || !headerTokenRegex.test(key)) {
-          const e = new TypeError('Header name must be a valid HTTP token ["' + key + '"]'); e.code = "ERR_INVALID_HTTP_TOKEN"; throw e;
-        }
-        const v = hints[key];
-        if (v === undefined) { const e = new TypeError('Invalid value "undefined" for header "' + key + '"'); e.code = "ERR_HTTP_INVALID_HEADER_VALUE"; throw e; }
-        if (headerCharRegex.test(String(v))) { const e = new TypeError('Invalid character in header content ["' + key + '"]'); e.code = "ERR_INVALID_CHAR"; throw e; }
-      }
-      if (typeof cb === "function") cb();
-      return this;
-    }
-    writeProcessing(cb) { if (typeof cb === "function") cb(); return this; }
-    setTimeout() { return this; }
-    cork() {} uncork() {}
-    destroy() { this.socket.destroy(); return this; }
-  }
+  // ---- node:http server transport (createServer over net.Server) -------------
+  // The message classes are node's own ports in builtins/node_http.cppm. That
+  // partition is evaluated before this file installs net, so it cannot make its
+  // Server a net.Server -- the split is one of duties, not a shadow copy:
+  // node_http owns the IncomingMessage / ServerResponse / OutgoingMessage
+  // contract (header store, _storeHeader framing, writeHead validation,
+  // trailers, write-after-end errors), this file owns the socket and the parser
+  // loop. There is exactly one ServerResponse class in the process, so `res`
+  // here is a real OutgoingMessage rather than a look-alike.
+  const HTTPMOD = M["http"] || {};
+  const IncomingMessage = HTTPMOD.IncomingMessage;
+  const ServerResponse = HTTPMOD.ServerResponse;
+  const continueExpression = /(?:^|\W)100-continue(?:$|\W)/i;
 
   function createHttpServer(o, handler) {
     if (typeof o === "function") { handler = o; o = {}; }
+    o = o || {};
     const srv = new Server({ allowHalfOpen: false });
+    const ResponseClass = typeof o.ServerResponse === "function" ? o.ServerResponse : ServerResponse;
+    const RequestClass = typeof o.IncomingMessage === "function" ? o.IncomingMessage : IncomingMessage;
+    srv.timeout = 0;
+    srv.keepAliveTimeout = 5000;
+    srv.keepAliveTimeoutBuffer = 1000;
+    srv.headersTimeout = 60000;
+    srv.requestTimeout = 300000;
+    srv.maxHeadersCount = null;
+    srv.maxRequestsPerSocket = 0;
+    srv.requireHostHeader = o.requireHostHeader !== false;
+    srv.rejectNonStandardBodyWrites = !!o.rejectNonStandardBodyWrites;
+    srv.setTimeout = function (msecs, cb) {
+      this.timeout = msecs;
+      if (typeof cb === "function") this.on("timeout", cb);
+      for (const s of Array.from(this._conns)) { try { s.setTimeout(msecs); } catch (e) {} }
+      return this;
+    };
     // node http.Server surface (bun _http_server.ts:364 server.stop(true) /
     // :386 closeIdleConnections): destroy every / every idle tracked socket.
     srv.closeAllConnections = function () { for (const s of Array.from(this._conns)) { try { s.destroy(); } catch (e) {} } };
     srv.closeIdleConnections = function () {
       for (const s of Array.from(this._conns)) {
-        const p = s._httpParser; // in-flight = head parsed and not finished
-        if (!p || !p.headDone || p.done) { try { s.destroy(); } catch (e) {} }
+        // idle = no request between its head and its response's finish
+        if (!s._httpInFlight) { try { s.destroy(); } catch (e) {} }
       }
+    };
+    // lib/_http_server.js Server.prototype.close -> httpServerPreClose ->
+    // closeIdleConnections(). Without it a keep-alive connection outlives
+    // close() and pins the event loop until the keep-alive timer fires, which
+    // is the difference between a test finishing and a test timing out.
+    const netClose = Server.prototype.close;
+    srv.close = function (...args) {
+      this.closeIdleConnections();
+      return netClose.apply(this, args);
     };
     // node http.Server.listen fires its callback with (err, hostname, port),
     // not net.Server's zero-arg 'listening' (bun _http_server.ts:233
@@ -2517,53 +2397,28 @@ export constexpr std::string_view kNetJS = R"JS(
       return netListen.apply(this, args);
     };
     if (typeof handler === "function") srv.on("request", handler);
+
     srv.on("connection", (sock) => {
       sock.on("error", () => {});
+      if (srv.timeout) { try { sock.setTimeout(srv.timeout); } catch (e) {} }
+      sock.server = srv;
+      sock._httpInFlight = 0;
+      // lib/_http_server.js socketOnTimeout: the request, the response and the
+      // server each get a say; only if none of them claims the event does the
+      // connection go away.
+      sock.on("timeout", () => {
+        const inFlightReq = sock._httpIncoming;
+        const reqTimeout = inFlightReq && !inFlightReq.complete && inFlightReq.emit("timeout", sock);
+        const res = sock._httpMessage;
+        const resTimeout = res && res.emit("timeout", sock);
+        const serverTimeout = srv.emit("timeout", sock);
+        if (!reqTimeout && !resTimeout && !serverTimeout) sock.destroy();
+      });
       let carry = [];
       let eofSeen = false;
-      let activeRes = null;
-      sock.on("drain", () => { if (activeRes) activeRes.emit("drain"); });
-      const startParser = () => {
-        const parser = new HttpParser(false);
-        sock._httpParser = parser;
-        let im = null;
-        parser.onHead = () => {
-          im = new IncomingMessage(sock);
-          im.method = parser.method; im.url = parser.target; im.httpVersion = parser.httpVersion;
-          im.headers = parser.headers; im.rawHeaders = parser.rawHeaders;
-          const connHdr = String(parser.headers["connection"] || "").toLowerCase();
-          const keepAlive = parser.httpVersion === "1.1" ? connHdr.indexOf("close") === -1 : connHdr.indexOf("keep-alive") !== -1;
-          const meta = { method: parser.method, keepAlive, onFinished: null,
-                         httpVersion: parser.httpVersion };
-          const res = new ServerResponse(sock, meta);
-          // node _http_server.ts: the response carries its IncomingMessage as
-          // `res.req` (handlers routinely switch on `res.req.url`).
-          res.req = im;
-          activeRes = res;
-          meta.onFinished = () => {
-            activeRes = null;
-            if (meta.keepAlive && !sock.destroyed) {
-              if (parser.done) { startParser(); pumpCarry(); }
-              else parser._afterDone = () => { startParser(); pumpCarry(); };
-            }
-          };
-          srv.emit("request", im, res);
-        };
-        // Feed the readable buffer, don't fake the events: Readable turns these
-        // into "data"/"end" once something actually reads, and until then the
-        // body is buffered instead of dropped on the floor. bun does the same
-        // (_http_incoming.ts:381 `if (chunk && !this._dumped) this.push(chunk)`).
-        parser.onBody = (b) => { if (im) im.push(G.Buffer ? G.Buffer.from(b.slice()) : b.slice()); };
-        parser.onDone = () => {
-          if (!parser.headDone) { sock.destroy(); return; }
-          sock._httpParser = null;
-          carry = [parser.leftover().slice()];
-          // EOF: bun internal/http.ts:187 `self.push(null); self.complete = true`.
-          if (im) { im.complete = true; im.push(null); }
-          if (parser._afterDone) parser._afterDone();
-        };
-        parser.onError = () => sock.destroy();
-      };
+      let requestsCount = 0;
+      const outgoing = [];
+
       const pumpCarry = () => {
         const p = sock._httpParser;
         if (!p) return;
@@ -2572,6 +2427,148 @@ export constexpr std::string_view kNetJS = R"JS(
         for (const c of pend) if (c.length) p.push(c);
         if (eofSeen && sock._httpParser === p && !p.done) p.eof();
       };
+
+      const startParser = () => {
+        const parser = new HttpParser(false);
+        sock._httpParser = parser;
+        let im = null;
+        let res = null;
+        let upgraded = false;
+
+        // lib/_http_server.js resOnFinish: dump an unread body, hand the socket
+        // to the next queued response, and either close or re-arm the parser.
+        const resOnFinish = () => {
+          if (im && !im._consuming && !(im._readableState && im._readableState.resumeScheduled)) im._dump();
+          if (sock._httpMessage === res) res.detachSocket(sock);
+          if (sock._httpInFlight > 0) sock._httpInFlight--;
+          sock._httpIncoming = null;
+          G.queueMicrotask(() => { if (!res._closed) { res._closed = true; res.emit("close"); } });
+          if (res._last) {
+            if (typeof sock.destroySoon === "function") sock.destroySoon();
+            else sock.end();
+          } else if (outgoing.length) {
+            const m = outgoing.shift();
+            if (m) m.assignSocket(sock);
+          } else if (!sock.destroyed) {
+            // Idle keep-alive connection: arm the advertised keep-alive timeout
+            // (plus node's buffer) so it cannot pin the loop forever.
+            if (srv.keepAliveTimeout > 0 && typeof sock.setTimeout === "function") {
+              try { sock.setTimeout(srv.keepAliveTimeout + srv.keepAliveTimeoutBuffer); } catch (e) {}
+            }
+            if (parser.done) { startParser(); pumpCarry(); }
+            else parser._afterDone = () => { startParser(); pumpCarry(); };
+          }
+        };
+
+        parser.onHead = () => {
+          sock._httpInFlight = (sock._httpInFlight | 0) + 1;
+          // A request is in flight: clear any armed keep-alive timeout, node
+          // re-arms server.timeout instead (resetSocketTimeout).
+          if (typeof sock.setTimeout === "function") { try { sock.setTimeout(srv.timeout || 0); } catch (e) {} }
+          im = new RequestClass(sock);
+          sock._httpIncoming = im;
+          im.method = parser.method;
+          im.url = parser.target;
+          im.httpVersion = parser.httpVersion;
+          const vp = String(parser.httpVersion).split(".");
+          im.httpVersionMajor = +vp[0];
+          im.httpVersionMinor = +vp[1];
+          im.joinDuplicateHeaders = !!o.joinDuplicateHeaders;
+          im._addHeaderLines(parser.rawHeaders, parser.rawHeaders.length);
+
+          const hdrs = im.headers;
+          const connTokens = String(hdrs["connection"] || "").toLowerCase().split(",").map((t) => t.trim());
+          const isConnect = im.method === "CONNECT";
+          // llhttp flags a request as an upgrade when it is a CONNECT or when
+          // it carries both `Upgrade:` and `Connection: upgrade`; node then
+          // hands the raw socket plus the bytes already past the head to the
+          // 'upgrade'/'connect' listener and stops parsing this connection.
+          if (isConnect || (hdrs["upgrade"] !== undefined && connTokens.indexOf("upgrade") !== -1)) {
+            upgraded = true;
+            im.upgrade = true;
+            const head = G.Buffer ? G.Buffer.from(parser.leftover()) : parser.leftover();
+            sock._httpParser = null;
+            const ev = isConnect ? "connect" : "upgrade";
+            if (srv.listenerCount(ev) > 0) srv.emit(ev, im, sock, head);
+            else sock.destroy();
+            return;
+          }
+
+          const keepAlive = (im.httpVersionMajor === 1 && im.httpVersionMinor === 1)
+            ? connTokens.indexOf("close") === -1
+            : connTokens.indexOf("keep-alive") !== -1;
+
+          res = new ResponseClass(im, {
+            highWaterMark: sock.writableHighWaterMark,
+            rejectNonStandardBodyWrites: srv.rejectNonStandardBodyWrites,
+          });
+          res._keepAliveTimeout = srv.keepAliveTimeout;
+          res._maxRequestsPerSocket = srv.maxRequestsPerSocket;
+          res.shouldKeepAlive = keepAlive;
+          res.req = im;
+          if (sock._httpMessage) outgoing.push(res);
+          else res.assignSocket(sock);
+          res.on("finish", resOnFinish);
+
+          let handled = false;
+          if (im.httpVersionMajor === 1 && im.httpVersionMinor === 1) {
+            // RFC 7230 5.4: an HTTP/1.1 request without Host is a 400.
+            if (srv.requireHostHeader && hdrs.host === undefined) {
+              res.writeHead(400, ["Connection", "close"]);
+              res.end();
+              return;
+            }
+            const limitSet = typeof srv.maxRequestsPerSocket === "number" && srv.maxRequestsPerSocket > 0;
+            if (limitSet) {
+              requestsCount++;
+              res.maxRequestsOnConnectionReached = srv.maxRequestsPerSocket <= requestsCount;
+            }
+            if (limitSet && srv.maxRequestsPerSocket < requestsCount) {
+              handled = true;
+              srv.emit("dropRequest", im, sock);
+              res.writeHead(503);
+              res.end();
+            } else if (hdrs.expect !== undefined) {
+              handled = true;
+              if (continueExpression.test(hdrs.expect)) {
+                res._expect_continue = true;
+                if (srv.listenerCount("checkContinue") > 0) {
+                  srv.emit("checkContinue", im, res);
+                } else {
+                  res.writeContinue();
+                  srv.emit("request", im, res);
+                }
+              } else if (srv.listenerCount("checkExpectation") > 0) {
+                srv.emit("checkExpectation", im, res);
+              } else {
+                res.writeHead(417);
+                res.end();
+              }
+            }
+          }
+          if (!handled) srv.emit("request", im, res);
+        };
+
+        // Feed the readable buffer, don't fake the events: Readable turns these
+        // into "data"/"end" once something actually reads, and until then the
+        // body is buffered instead of dropped on the floor. bun does the same
+        // (_http_incoming.ts:381 `if (chunk && !this._dumped) this.push(chunk)`).
+        parser.onBody = (b) => { if (im && !im._dumped) im.push(G.Buffer ? G.Buffer.from(b.slice()) : b.slice()); };
+        parser.onDone = () => {
+          if (upgraded) return;
+          if (!parser.headDone) { sock.destroy(); return; }
+          sock._httpParser = null;
+          carry = [parser.leftover().slice()];
+          // EOF: bun internal/http.ts:187 `self.push(null); self.complete = true`.
+          if (im) { im.complete = true; im.push(null); }
+          if (parser._afterDone) { const f = parser._afterDone; parser._afterDone = null; f(); }
+        };
+        parser.onError = (e) => {
+          if (srv.listenerCount("clientError") > 0) srv.emit("clientError", e || mkErr("Parse Error", "HPE_INVALID_CONSTANT"), sock);
+          sock.destroy();
+        };
+      };
+
       sock.on("data", (chunk) => {
         const b = u8(chunk);
         const p = sock._httpParser;
