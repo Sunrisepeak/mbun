@@ -43,7 +43,14 @@ if [ -n "$required" ] && [ -n "$configured" ] && [ "$required" != "$configured" 
   exit 1
 fi
 
-build_output=$(bash "$root/tools/integration/build_lock.sh" mcpp build 2>&1)
+# Pin the target triple rather than inheriting ~/.mcpp/config.toml's default.
+# That global file is shared by every concurrent agent and has been flipped
+# under a running build more than once; a flip to x86_64-linux-musl fails as
+# "execinfo.h: No such file or directory" in modules/crash_handler, which reads
+# like a missing system header and is not one. Callers may override with
+# MBUN_TARGET, or pass extra `mcpp build` flags as arguments.
+target="${MBUN_TARGET:-x86_64-linux-gnu}"
+build_output=$(bash "$root/tools/integration/build_lock.sh" mcpp build --target "$target" "$@" 2>&1)
 status=$?
 
 if [ "$status" != 0 ]; then
