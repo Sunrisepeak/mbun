@@ -680,7 +680,31 @@ export constexpr std::string_view kNetJS = R"JS(
         if (this._eof) this.destroy();
       }
       if (this._needDrain && this._wqLen === 0 && !this.destroyed) { this._needDrain = false; progress++; this.emit("drain"); }
+      this._syncEofHold();
       return progress;
+    }
+    // libuv's liveness rule, which this reactor was missing. A stream handle is
+    // ACTIVE only while it has a read started or a write request pending;
+    // uv_loop_alive() counts active handles, not merely open ones. So once node
+    // has seen EOF it calls readStop(), and a socket that is still *open and
+    // writable* — the whole point of allowHalfOpen — stops holding the loop.
+    //
+    // Here every open socket held it unconditionally, so a half-open socket the
+    // peer had already FIN'd pinned the process forever even though nothing
+    // could ever read from it again. That is the `sockets outlive server`
+    // timeout shape: server closed, one or more EOF'd Sockets left with
+    // readable=false, writable=true, _wq=0.
+    //
+    // Deliberately narrow: only a socket that has ALREADY seen EOF is released,
+    // and only while its write queue is empty. Re-holding on a queued write is
+    // what keeps a later `socket.write()` on a half-open socket flushable —
+    // libuv's write request makes the handle active again in exactly the same
+    // way. Sockets that never see EOF, and non-half-open sockets (which shut
+    // and destroy on EOF anyway), are unaffected.
+    _syncEofHold() {
+      if (this.destroyed || !this._loopOpen) return;
+      if (this._eof && this._wq.length === 0) NET.release(this);
+      else NET.hold(this);
     }
     _poll() {
       if (this.destroyed || this._fd < 0) { NET.items.delete(this); return 0; }
@@ -731,6 +755,9 @@ export constexpr std::string_view kNetJS = R"JS(
               });
             }
             if (this._shutSent && this._wq.length === 0) this.destroy();
+            // EOF: the read side is stopped, so this handle is only active while
+            // a write is queued (see _syncEofHold).
+            this._syncEofHold();
             break;
           }
           const bytes = fromB64(r);
@@ -2972,14 +2999,25 @@ export constexpr std::string_view kNetJS = R"JS(
       if (srv.emit("clientError", err, sock)) return;
       const res = sock._httpMessage;
       if (sock.writable && (!res || !res._headerSent)) {
-        // end(), not write()+destroy(): this reactor's destroy() drops the
-        // still-queued bytes, and every corpus file here observes the reply
-        // followed by a FIN on the peer.
-        try { sock.end(cannedResponse(err.code)); return; } catch (e) {}
+        // end(), not write(): this reactor's destroy() drops the still-queued
+        // bytes, and every corpus file here observes the reply followed by a FIN
+        // on the peer.
+        try { sock.end(cannedResponse(err.code)); } catch (e) {}
       }
-      // destroy() bare, not destroy(err): this reactor re-emits the argument as
-      // an 'error' on the socket, which reaches listeners node never shows it to.
-      try { sock.destroy(); } catch (e) {}
+      // node finishes socketOnError with `this.destroy(e)`, and it is destroy's
+      // error ARGUMENT that makes the connection socket emit 'error':
+      // test-http-server-destroy-socket-on-client-error grabs the socket from
+      // 'connection' and asserts that exact object ({ code:
+      // 'HPE_INVALID_METHOD', bytesParsed, rawPacket }). A previous revision
+      // passed no argument, reasoning that node never shows the error to socket
+      // listeners — node hides it only from a server that has NONE, which it
+      // arranges by installing its own noop handler first. The connection
+      // listener above already installs one, so passing the error cannot throw.
+      //
+      // Deferred while bytes are still queued: end() has armed the FIN, and
+      // closing the fd now would drop the canned reply the peer asserts on.
+      if (sock._wq && sock._wq.length) { try { sock.emit("error", err); } catch (e) {} }
+      else { try { sock.destroy(err); } catch (e) {} }
     };
     const onRequestTimeout = (sock) => {
       const err = new Error("Request timeout");
