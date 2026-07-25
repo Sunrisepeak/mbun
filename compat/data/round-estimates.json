@@ -536,6 +536,19 @@
       "'fs.ReadStream/WriteStream translation is your best single move' was STALE: node_fs_streams.cppm (e0ca19c) was already merged in the base two rounds earlier. The remaining stream files are semantics, not absence. I did not check the base before writing the brief."
      ],
      "densest_remaining": "FileHandle lock/ref protocol (kLocked/kCloseSync/kClosePromise), 6 files, ~570 lines of fs.promises.ts"
+    },
+    {
+     "id": "r10/self-verify-cluster",
+     "cluster": "verify-error-code mapping (cross-subsystem tls+http2)",
+     "worklist_files": 9,
+     "target_delta_pass": 9,
+     "actual_delta_pass": 3,
+     "hit_rate": 0.33,
+     "wall_clock_min": 40,
+     "executed_by": "me, not an agent (three agents were already at the 1-3 worktree limit)",
+     "miss_cause": "The cluster was correctly identified as ONE cause and the fix did land it -- 7 of 9 files now report node's code. But 'the code is now correct' is not 'the file passes': 6 of them had the wrong code as their FIRST failure and have further ones behind it. I budgeted the cluster by counting files whose log mentioned the code, which measures how many files TOUCH a cause, not how many are BLOCKED ONLY by it. Same shape as the internalBinding lesson: clearing a cause transfers files to the next cause. Budget a cause family by asking 'is this the file's LAST wall?', which the log alone cannot answer.",
+     "what_went_right": "Root cause was measured, not theorised: `openssl s_client` against mbun's own server showed OpenSSL emitting 20 then 21 and returning 21, which named the mechanism in one command. Two of my theories died first -- 'mbun sends a longer chain' (it sends exactly 1 cert) and gating on SSL_get1_peer_certificate (nullptr on this path, and it regressed the working files until I noticed).",
+     "estimate_overrun": "40 min against a ~25 min estimate. The overrun was entirely the two failed attempts plus the 681-file guard, i.e. exactly the 'budget the guard inside the estimate' lesson applied to myself."
     }
    ],
    "verdicts": {
