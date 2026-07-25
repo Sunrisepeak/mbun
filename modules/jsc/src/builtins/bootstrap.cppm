@@ -4120,6 +4120,36 @@ inline constexpr char kBootstrapJS_[] = R"JS(
 
   // ---- fs (real, via __mbunFsNative) ----
   const F = globalThis.__mbunFsNative;
+  // node getPathFromURLPosix / getPathFromURLWin32 (lib/internal/url.js): a
+  // file: URL handed to an fs API is NOT merely percent-decoded. A non-empty
+  // host is ERR_INVALID_FILE_URL_HOST, and an encoded separator (%2f, plus %5c
+  // on Windows) is ERR_INVALID_FILE_URL_PATH — decoding those would silently
+  // change the path's structure. mbun decoded blindly, so
+  // `file:///c:/tmp/%2f` resolved to "/c:/tmp//" and surfaced as ENOENT.
+  // ref test-fs-whatwg-url.
+  const fsPathFromURL = (u) => {
+    if (!__isWin && u.hostname !== "" && u.hostname !== "localhost") {
+      const e = new TypeError('File URL host must be "localhost" or empty on ' +
+                              (G.process ? G.process.platform : "linux"));
+      e.code = "ERR_INVALID_FILE_URL_HOST"; e.input = u;
+      throw nodeErrToString(e, "ERR_INVALID_FILE_URL_HOST");
+    }
+    const pathname = u.pathname;
+    for (let n = 0; n < pathname.length; n++) {
+      if (pathname[n] === "%") {
+        const third = (pathname.codePointAt(n + 2) | 0) | 0x20;
+        if ((pathname[n + 1] === "2" && third === 102) ||
+            (__isWin && pathname[n + 1] === "5" && third === 99)) {
+          const e = new TypeError(__isWin
+            ? "File URL path must not include encoded \\ or / characters"
+            : "File URL path must not include encoded / characters");
+          e.code = "ERR_INVALID_FILE_URL_PATH"; e.input = u;
+          throw nodeErrToString(e, "ERR_INVALID_FILE_URL_PATH");
+        }
+      }
+    }
+    try { return decodeURIComponent(pathname); } catch (e) { return pathname; }
+  };
   const toStr = (x) => {
     if (typeof x === "string") return x;
     // node accepts file:// URL *instances* everywhere a path goes
@@ -4127,7 +4157,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     // pglite et al. pass `new URL("./x.data", import.meta.url)` into fs.
     if (x && typeof x === "object" && x.href !== undefined && x.protocol === "file:" &&
         typeof x.pathname === "string") {
-      try { return decodeURIComponent(x.pathname); } catch { return x.pathname; }
+      return fsPathFromURL(x);
     }
     // node's getValidatedPath accepts a Buffer *or any TypedArray* and decodes
     // it as UTF-8 (lib/internal/fs/utils.js). A TypedArray inherits
@@ -4212,7 +4242,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
         return;
       }
       if (p.href !== undefined && p.protocol === "file:" && typeof p.pathname === "string") { // URL
-        try { str = decodeURIComponent(p.pathname); } catch (e) { str = p.pathname; }
+        str = fsPathFromURL(p);
       } else if (p.href !== undefined && typeof p.protocol === "string" && typeof p.pathname === "string"
                  && typeof p.searchParams === "object") { // a URL of some other scheme
         throw fsUrlSchemeErr();
@@ -5454,29 +5484,34 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   // explicit null/''/{}/[] is a validateInteger failure, and `len` is validated
   // before the callback so the ERR_INVALID_ARG_TYPE names "len", not "cb"
   // (ref lib/fs.js truncate/ftruncate, test-fs-truncate).
+  // node clamps the validated length with `len = MathMax(0, len)` — a negative
+  // `len` is coerced to 0 and truncates the file to empty, it is NOT an error.
+  // Passing -1 straight to (f)truncate(2) surfaced EINVAL, which the native
+  // errno map then reported as EACCES (test-fs-truncate).
+  const fsTruncLen = (len) => Math.max(0, len === undefined ? 0 : fsValidateInteger(len, "len"));
   fsMod.ftruncateSync = (fd, len) => {
     fsValidateFd(fd);
-    const l = len === undefined ? 0 : fsValidateInteger(len, "len");
+    const l = fsTruncLen(len);
     globalThis.__mbunFdNative.ftruncate(fd, l);
   };
   fsMod.ftruncate = (fd, len, cb) => {
     const fn = typeof len === "function" ? len : cb;
     fsValidateFd(fd);
-    const l = typeof len === "function" || len === undefined ? 0 : fsValidateInteger(len, "len");
+    const l = fsTruncLen(typeof len === "function" ? undefined : len);
     fsMakeCallback(fn);
     G.queueMicrotask(() => { try { globalThis.__mbunFdNative.ftruncate(fd, l); fn(null); } catch (e) { fn(e); } });
   };
   fsMod.truncateSync = (p, len) => {
     if (typeof p === "number") return fsMod.ftruncateSync(p, len);
     validatePath(p);
-    const l = len === undefined ? 0 : fsValidateInteger(len, "len");
+    const l = fsTruncLen(len);
     F.truncate(toStr(p), l);
   };
   fsMod.truncate = (p, len, cb) => {
     const fn = typeof len === "function" ? len : cb;
     if (typeof p === "number") return fsMod.ftruncate(p, len, cb);
     validatePath(p);
-    const l = typeof len === "function" || len === undefined ? 0 : fsValidateInteger(len, "len");
+    const l = fsTruncLen(typeof len === "function" ? undefined : len);
     fsMakeCallback(fn);
     G.queueMicrotask(() => { try { F.truncate(toStr(p), l); fn(null); } catch (e) { fn(e); } });
   };
@@ -5668,8 +5703,11 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   fsMod.lutimesSync = (p, atime, mtime) => {
     validatePath(p);
     const a = fsToUnixTimestamp(atime, "atime"), m = fsToUnixTimestamp(mtime, "mtime");
-    if (typeof F.lutimes === "function") F.lutimes(toStr(p), a, m);
-    else F.utimes(toStr(p), a, m);
+    // lutimes must stamp the SYMLINK, never its target: F.lutimes is
+    // utimensat(AT_SYMLINK_NOFOLLOW). Falling back to F.utimes followed the
+    // link, so a dangling symlink reported ENOENT and a live one moved the
+    // target's times (test-fs-utimes).
+    F.lutimes(toStr(p), a, m);
   };
   fsMod.lutimes = (p, atime, mtime, cb) => {
     validatePath(p);
@@ -6051,8 +6089,13 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     cp: P((src, dest, o) => { validatePath(src, "src"); validatePath(dest, "dest"); return cpRecAsync(toStr(src), toStr(dest), cpValidateOptions(o)); }),
     symlink: P((target, path2, type) => { validatePath(target, "target"); validatePath(path2, "path"); fsValidateSymlinkType(type); return F.symlink(toStr(target), toStr(path2)); }),
     readlink: P((p) => F.readlink(toStr(p))),
-    chmod: P((p, m) => F.chmod(toStr(p), typeof m === "string" ? parseInt(m, 8) : (Number(m) & 0o7777))), lchmod: P(() => {}), chown: P(() => {}), lchown: P(() => {}),
-    utimes: P((p, a, m) => { const s = (v) => v instanceof Date ? v.getTime() / 1000 : Number(v); F.utimes(toStr(p), s(a), s(m)); }), lutimes: P(() => {}),
+    chmod: P((p, m) => F.chmod(toStr(p), typeof m === "string" ? parseInt(m, 8) : (Number(m) & 0o7777))), lchmod: P(() => {}),
+    // The promise forms validate exactly like their callback twins: a bare
+    // `() => {}` resolved for every invalid path/uid/gid (test-fs-lchown).
+    chown: P((p, uid, gid) => fsMod.chownSync(p, uid, gid)),
+    lchown: P((p, uid, gid) => fsMod.lchownSync(p, uid, gid)),
+    utimes: P((p, a, m) => { const s = (v) => v instanceof Date ? v.getTime() / 1000 : Number(v); F.utimes(toStr(p), s(a), s(m)); }),
+    lutimes: P((p, a, m) => fsMod.lutimesSync(p, a, m)),
     glob: (pat, o) => { const arr = fsMod.globSync(pat, o); let i = 0; return { [Symbol.asyncIterator]() { return { next: () => Promise.resolve(i < arr.length ? { value: arr[i++], done: false } : { value: undefined, done: true }) }; } }; },
     opendir: (p, opts) => Promise.resolve().then(() => fsMod.opendirSync(p, opts)),
     // node fs.promises.mkdtempDisposable: an explicit-resource-management
