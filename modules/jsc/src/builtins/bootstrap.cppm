@@ -784,7 +784,15 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     }
     if (v instanceof Date) return isNaN(v.getTime()) ? "Invalid Date" : v.toISOString();
     if (v instanceof RegExp) return v.toString();
-    if (v instanceof Error) {
+    // `instanceof Error` alone misses an error from ANOTHER realm: a vm context
+    // (node:repl's default evaluator runs there) has its own Error intrinsic, so
+    // its errors inspected as a plain object — the REPL printed "Uncaught
+    // Error {}" where node prints "Uncaught ReferenceError: x is not defined".
+    // node uses the internal-class check (util.types.isNativeError); the
+    // Symbol.toStringTag guard keeps `{[Symbol.toStringTag]: "Error"}` — a plain
+    // object wearing the tag — out of the error branch.
+    if (v instanceof Error ||
+        (Object.prototype.toString.call(v) === "[object Error]" && !(Symbol.toStringTag in v))) {
       // bun/node error inspect starts with the "Name: message" header; mbun's
       // JSC-native stacks use `fn@source` frames without it, dropping the message
       // (which is where e.g. ENOENT/path live). Prepend it when absent.

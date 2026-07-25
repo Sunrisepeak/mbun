@@ -96,6 +96,14 @@ inline constexpr std::string_view kNodeProcessLifecycleJS = R"JS(
   if (typeof rawQueueMicrotask === "function") {
     G.queueMicrotask = function queueMicrotask(fn) {
       if (typeof fn !== "function") return rawQueueMicrotask(fn);  // native raises node's error
+      // Same scheduling seam node_timers installs on setTimeout & friends: a
+      // per-call slot, so node:domain can re-enter the scheduling domain
+      // WITHOUT replacing globalThis.queueMicrotask (whose identity node's
+      // test/common leak check pins at load time). process.nextTick rides on
+      // this function, so hooking here covers nextTick too — and covers it
+      // exactly once, which is what the removed double-wrap guard was for.
+      const h = G.__mbunSchedHook;
+      if (h !== undefined && h !== null) fn = h(fn);
       rawQueueMicrotask(function () { try { fn(); } catch (e) { G.__mbun_uncaught(e); } });
     };
   }

@@ -225,6 +225,9 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
 
   let processNewListenerUseCount = 0;
   let activeReplServer = null;
+  // The most recent REPLServer to run a command — the owner of any async throw
+  // its commands scheduled, once every live server has closed.
+  let lastEvaluatingServer = null;
   // Live (not yet closed) REPL servers, newest last. node routes an async
   // uncaught exception to the REPL that owns the current async context via
   // AsyncLocalStorage + addUncaughtExceptionCaptureCallback; the innermost live
@@ -232,19 +235,41 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
   const liveServers = [];
   let installingCapture = false;
   let captureInstalled = false;
+  let captureHandler = null;
   function setupExceptionCapture() {
     if (captureInstalled) return;
     captureInstalled = true;
     installingCapture = true;
     try {
-      process.on("uncaughtException", (err) => {
-        const server = liveServers[liveServers.length - 1];
-        if (server === undefined) throw err;
+      captureHandler = (err) => {
+        // A REPL that has evaluated something owns the async throws its
+        // commands scheduled, even after it closed: node reaches the same
+        // answer through the AsyncLocalStorage store captured when the command
+        // ran, which a closed REPL still carries. Ending stdin closes the REPL
+        // before a setImmediate scheduled by the last command fires, and
+        // rethrowing there killed the process instead of reporting through the
+        // REPL's output (test-repl-uncaught-exception-after-input-ended).
+        const server = liveServers[liveServers.length - 1] || lastEvaluatingServer;
+        if (server === undefined || server === null) throw err;
         server._handleError(err);
-      });
+      };
+      process.on("uncaughtException", captureHandler);
     } finally {
       installingCapture = false;
     }
+  }
+  // node registers this capture through process.addUncaughtExceptionCaptureCallback
+  // (repl.js:195), which is NOT an 'uncaughtException' listener. mbun's runtime
+  // only offers the event, so the REPL's own handler has to be discounted
+  // wherever node counts listeners: a standalone REPL otherwise reads its own
+  // capture as a user handler, re-emits every eval error into itself instead of
+  // printing it, and `mbun -i` reported nothing at all for a throw.
+  function userUncaughtExceptionListeners() {
+    let n = 0;
+    for (const fn of process.listeners("uncaughtException")) {
+      if (fn !== captureHandler) n++;
+    }
+    return n;
   }
   function processNewListener(event) {
     if (event === "uncaughtException" && activeReplServer !== null && !installingCapture) {
@@ -592,9 +617,24 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
         self.isCompletionEnabled = tmpCompletionEnabled;
       }
 
-      const domainMod = req("domain");
-      const domainErrorsHandled = () =>
-        (domainMod && typeof domainMod.__errorsHandled === "number") ? domainMod.__errorsHandled : 0;
+      // node's repl.js never requires node:domain — it only reads
+      // `process.domain` (repl.js:629). Requiring it eagerly here loaded the
+      // whole module for every REPL, and node:domain installs a permanent
+      // process 'newListener' listener of its own, so
+      // test-repl-no-terminal-restore-process-listeners counted two listeners
+      // added by one REPLServer and one removed on close. Consult the module
+      // only once a domain is actually active, which cannot happen before
+      // something else required it.
+      // M["domain"] is a lazy accessor, so merely READING it builds the module —
+      // hence the guard, which must also hold after the eval returned and
+      // process.domain is null again. node:domain installs the runtime's
+      // scheduling seam when it builds, so the seam answers "has anything loaded
+      // node:domain?" without forcing that build.
+      const domainErrorsHandled = () => {
+        if (!G.__mbunSchedHook) return 0;
+        const mod = M["domain"] || M["node:domain"];
+        return (mod && typeof mod.__errorsHandled === "number") ? mod.__errorsHandled : 0;
+      };
 
       function defaultEval(code, context, file, cb) {
         let result, script, wrappedErr;
@@ -704,6 +744,7 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
       self.eval = function REPLEval(code, context, file, cb) {
         const prev = activeReplServer;
         activeReplServer = self;
+        lastEvaluatingServer = self;
         try {
           originalEval.call(self, code, context, file, cb);
         } finally {
@@ -956,6 +997,21 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
       let errStack = "";
 
       if (typeof e === "object" && e !== null) {
+        // node's repl.js installs an overrideStackTrace hook that drops every
+        // frame from the bottom of the stack up to and including the first one
+        // with a null function name. For a throw at the REPL's top level that is
+        // the whole stack, which is why node prints just
+        // "Uncaught ReferenceError: x is not defined" with no frames, while
+        // frames from functions the user defined stay (test-repl-pretty-stack).
+        // JSC's textual frames name that same frame "global code"; everything
+        // below it is the REPL's own machinery (defaultEval/onLine/emit/…).
+        try {
+          const st = e.stack;
+          if (typeof st === "string" && st.length) {
+            const cut = st.search(/^global code@/m);
+            if (cut !== -1) e.stack = st.slice(0, cut).replace(/\n+$/, "");
+          }
+        } catch { /* a throwing/readonly `stack` accessor is not fatal */ }
         if (isError(e)) {
           if (e.stack) {
             if (e.name === "SyntaxError") {
@@ -983,7 +1039,7 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
 
       if (!this.underscoreErrAssigned) this.lastError = e;
 
-      if (this._isStandalone && process.listenerCount("uncaughtException") !== 0) {
+      if (this._isStandalone && userUncaughtExceptionListeners() !== 0) {
         process.nextTick(() => {
           process.emit("uncaughtException", e);
           this.clearBufferedCommand();
@@ -1349,6 +1405,35 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
     }
   }
 
+  // node lib/internal/repl.js createRepl(): the factory the CLI uses for
+  // `node -i` / `node --interactive`. It lives in this partition because
+  // kStandaloneREPL is module-private, and is attached to the module object
+  // non-enumerably below so `Object.keys(require("repl"))` still reports only
+  // node's public surface. Its one caller is the -i CLI path in src/app.cppm,
+  // which stands in for node's lib/internal/main/repl.js.
+  function createInternalRepl(env, opts, cb) {
+    if (typeof opts === "function") { cb = opts; opts = null; }
+    opts = Object.assign(
+      { ignoreUndefined: false, useGlobal: true, breakEvalOnSigint: true },
+      opts);
+    opts[kStandaloneREPL] = true;
+    if (parseInt(env.NODE_NO_READLINE, 10)) opts.terminal = false;
+    if (env.NODE_REPL_MODE) {
+      opts.replMode = { strict: REPL_MODE_STRICT, sloppy: REPL_MODE_SLOPPY }[
+        String(env.NODE_REPL_MODE).toLowerCase().trim()];
+    }
+    if (opts.replMode === undefined) opts.replMode = REPL_MODE_SLOPPY;
+    const size = Number(env.NODE_REPL_HISTORY_SIZE);
+    opts.size = (!Number.isNaN(size) && size > 0) ? size : 1000;
+    // No history file unless the session is a terminal — a piped stdin must not
+    // read or rewrite the user's ~/.node_repl_history.
+    const term = "terminal" in opts ? opts.terminal : process.stdout.isTTY;
+    opts.filePath = term ? env.NODE_REPL_HISTORY : "";
+    const repl = start(opts);
+    repl.setupHistory({ filePath: opts.filePath, size: opts.size, onHistoryFileLoaded: cb });
+    return repl;
+  }
+
   const replExports = {
     start,
     writer,
@@ -1358,6 +1443,10 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
     Recoverable,
     isValidSyntax,
   };
+
+  Object.defineProperty(replExports, "createInternalRepl", {
+    value: createInternalRepl, writable: true, configurable: true, enumerable: false,
+  });
 
   Object.defineProperty(replExports, "builtinModules", {
     get: () => getReplBuiltinLibs(),

@@ -1408,11 +1408,21 @@ public:
   // table exists. _ev is null-prototype so an event named e.g. "toString" cannot
   // collide with Object.prototype.
   const _ev = Object.create(null);
-  const _add = (n, f, pre) => { const l = _ev[n] || (_ev[n] = []); pre ? l.unshift(f) : l.push(f); return p; };
+  // node's EventEmitter contract, which this hand-rolled surface was missing
+  // entirely: 'newListener' fires BEFORE the listener is stored (so a handler
+  // can veto the add by throwing) and carries the user-visible function, and
+  // 'removeListener' fires after a successful removal. Two subsystems depend on
+  // it and silently did nothing without it — node:domain reorders the
+  // 'uncaughtException' listeners from a 'newListener' hook, and node:repl
+  // throws ERR_INVALID_REPL_INPUT when a REPL command adds an
+  // 'uncaughtException' listener.
+  const _emitIfListened = (n, ...a) => { const l = _ev[n]; if (l && l.length) p.emit(n, ...a); };
+  const _pub = (f) => (f && f.listener) || f;
+  const _add = (n, f, pre) => { _emitIfListened("newListener", n, _pub(f)); const l = _ev[n] || (_ev[n] = []); pre ? l.unshift(f) : l.push(f); return p; };
   p.on = p.addListener = function (n, f) { return _add(String(n), f, false); };
   p.prependListener = function (n, f) { return _add(String(n), f, true); };
   p.once = function (n, f) { const w = function (...a) { p.off(n, w); return f.apply(p, a); }; w.listener = f; return _add(String(n), w, false); };
-  p.off = p.removeListener = function (n, f) { const l = _ev[String(n)]; if (l) { const i = l.findIndex((x) => x === f || x.listener === f); if (i >= 0) l.splice(i, 1); } return p; };
+  p.off = p.removeListener = function (n, f) { const k = String(n); const l = _ev[k]; if (l) { const i = l.findIndex((x) => x === f || x.listener === f); if (i >= 0) { const rm = l.splice(i, 1)[0]; _emitIfListened("removeListener", k, _pub(rm)); } } return p; };
   p.removeAllListeners = function (n) { if (n === undefined) { for (const k of Object.keys(_ev)) delete _ev[k]; } else delete _ev[String(n)]; return p; };
   p.listeners = function (n) { return (_ev[String(n)] || []).map((x) => x.listener || x); };
   p.rawListeners = function (n) { return (_ev[String(n)] || []).slice(); };

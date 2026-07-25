@@ -2264,6 +2264,86 @@ int run_embedded_program(const mbun::bundler::standalone_exe::Program& program,
     return mbun::jsc::runtime::run_source(virtualPath, program.code);
 }
 
+// ─── `-i` / `--interactive` — force the REPL ─────────────────────────────────
+// Port of node lib/internal/main/repl.js. bun has no REPL at all (its `node`
+// wrapper prints "does not support a repl"), so this is node's shape driven by
+// mbun's node:repl REPLServer, and node's ORDER is observable:
+//
+//   1. the welcome banner, via console.log;
+//   2. the REPL (repl.createInternalRepl → the first `> ` prompt);
+//   3. only THEN the `-e`/`--eval` string, "in the current context".
+//
+// test-force-repl asserts stdout is exactly the banner plus `> `, and
+// test-force-repl-with-eval asserts the eval's output arrives AFTER that
+// prompt (`output.endsWith('> 42\n')`) — so neither the banner nor the ordering
+// is cosmetic. `-i` also forces the REPL when stdin is NOT a tty, which is the
+// only way the corpus can drive it (17 test-repl-* files spawn `mbun -i` /
+// `mbun --interactive` with piped stdio).
+int exec_interactive(std::span<const std::string_view> args) {
+    // node lib/internal/main/repl.js: `--input-type` selects a module kind for
+    // the entry point, and a REPL has none — node prints this on stderr and
+    // exits kInvalidCommandLineArgument (9). test-repl-unsupported-option
+    // asserts the message byte-for-byte and a non-zero status.
+    for (const std::string_view a : args) {
+        if (a == "--input-type" || a.starts_with("--input-type=")) {
+            std::println(std::cerr, "Cannot specify --input-type for REPL");
+            return 9;
+        }
+    }
+    // `-i -e <code>` / `-i -p <code>`: the eval string rides along; anything
+    // after it is user argv, exactly as in the plain eval path.
+    std::string evalCode{};
+    bool print{false};
+    std::vector<std::string> jsArgv{"mbun"};
+    for (std::size_t i{0}; i < args.size(); ++i) {
+        const std::string_view a{args[i]};
+        if (a != "-e" && a != "--eval" && a != "-p" && a != "--print") continue;
+        if (i + 1 >= args.size()) {
+            std::println(std::cerr, "error: Missing code to evaluate");
+            return 1;
+        }
+        print = (a == "-p" || a == "--print");
+        evalCode = std::string{args[i + 1]};
+        for (const std::string_view rest : args.subspan(i + 2)) jsArgv.emplace_back(rest);
+        break;
+    }
+    mbun::jsc::runtime::set_argv(std::move(jsArgv));
+
+    std::string code{
+        "console.log(\"Welcome to Node.js \" + process.version + \".\\n\" + "
+        "'Type \".help\" for more information.');"
+        "require(\"repl\").createInternalRepl(process.env, function (err, r) {"
+        "  if (err) throw err;"
+        "  r.on(\"exit\", function () { process.exit(); });"
+        "});"};
+    if (!evalCode.empty()) {
+        // process._eval is the ORIGINAL source, as in the plain eval path.
+        code += "process._eval=" + js_quote(evalCode) + ";";
+        code += print ? ("console.log((() => (" + evalCode + "))())") : evalCode;
+    }
+    return mbun::jsc::runtime::run_eval(code);
+}
+
+// Strip every leading `-i` / `--interactive` out of `args`, reporting whether
+// one was there. Stops at the first positional so a script or script argument
+// literally named `-i` is never eaten; the value token of an eval flag is
+// skipped for the same reason.
+bool take_interactive_flag(std::vector<std::string_view>& args) {
+    bool interactive{false};
+    for (std::size_t i{0}; i < args.size();) {
+        const std::string_view a{args[i]};
+        if (a == "-i" || a == "--interactive") {
+            interactive = true;
+            args.erase(args.begin() + static_cast<std::ptrdiff_t>(i));
+            continue;
+        }
+        if (a == "-e" || a == "--eval" || a == "-p" || a == "--print") { i += 2; continue; }
+        if (a.starts_with("-") && a != "-") { ++i; continue; }
+        break;
+    }
+    return interactive;
+}
+
 // Port of run_command.rs:2981-3040 `exec_as_if_node` (cli/mod.rs:952-958 routes
 // here when argv[0] is `node`). This is how EVERY `#!/usr/bin/env node` shebang
 // enters this binary once `--bun` has put <BUN_NODE_DIR>/node at the front of
