@@ -121,6 +121,41 @@ Rules this produces, in order of how much they cost when ignored:
 shorter than that cannot be a round boundary — it is a checkpoint. Plan a round
 as *dispatch → several checkpoints → integrate*, never as one tick.
 
+### Signature clustering is blind to a missing layer (round 10)
+
+The `node:http` list was 295 files that `cluster_finder` showed as a
+heterogeneous tail — 76 of them under a bare `AssertionError` with no shared
+text. Target +60. **Actual +170 (2.8×), `test-http-*` 102 → 272 green.**
+
+Those 76 were not 76 causes. They were mostly *one*: `node:http` was a
+shape-only stand-in, with a second, incompatible `ServerResponse` living in the
+transport layer. Translating node's own five `_http_*.js` files instead of
+extending the stand-in converted **148 files in a single change**.
+
+**Signature clustering cannot see this.** Every file asserts something different
+about the missing layer, so the logs share no signature and the cluster looks
+like scattered work. Two checks catch it where the signatures cannot:
+
+1. **Green ratio.** For a mature, stable node subsystem, a low green ratio is
+   stronger evidence of a missing layer than the error texts are. `http` was
+   102/398 = 26% on an API that has been stable for a decade — that fact alone
+   was the signal, and it was sitting in the report the whole time.
+2. **Stand-in or translation?** Check whether mbun's implementation is a port of
+   node's `lib/`, or hand-written to shape. A stand-in producing many small,
+   unrelated assertion failures means *translate the layer* — do not extend the
+   stand-in.
+
+By that heuristic, `cluster` (11/80 green) and `runner` (10/73) currently look
+exactly the way `http` did.
+
+The same task also fixed two transport bugs the port exposed, both of which had
+been silently corrupting correct-looking output: `net.Socket._flush()` stopped
+at the first zero-byte write, so a single empty chunk parked every byte behind
+it forever — which **silently lost the second response on every keep-alive
+connection** — and pipelined intake dropped bytes because `push()` runs the
+request handler synchronously and the parser could be replaced mid-loop, so a
+10,000-request pipeline stalled dead at exactly 1,771.
+
 ### Iteration count matters as much as cluster shape (round 10)
 
 Round 9 concluded that homogeneity predicts the hit rate. Round 10 partly

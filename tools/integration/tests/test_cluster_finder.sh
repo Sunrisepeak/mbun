@@ -25,6 +25,7 @@ mkdir -p "$tmp/logs"
   printf 'test-vm-ok.js\t0\tpass\t100\tlogs/vm4.log\n'
   printf 'test-vm-slow.js\t124\ttimeout\t15000\tlogs/vm5.log\n'
   printf 'test-url-parse.js\t1\tfail\t100\tlogs/url1.log\n'
+  printf 'test-vm-gated.js\t0\tskipped\t100\tlogs/vm6.log\n'
 } >"$tmp/results.tsv"
 
 # Two vm logs with the SAME root cause but different volatile substrings.
@@ -34,6 +35,7 @@ printf 'error: AssertionError: Missing expected exception\n' >"$tmp/logs/vm3.log
 : >"$tmp/logs/vm4.log"
 : >"$tmp/logs/vm5.log"
 printf 'error: AssertionError: Missing expected exception\n' >"$tmp/logs/url1.log"
+printf '1..0 # Skipped: no QUIC\n' >"$tmp/logs/vm6.log"
 
 pass() { printf 'ok   - %s\n' "$1"; }
 fail() { printf 'FAIL - %s\n' "$1"; exit 1; }
@@ -88,6 +90,21 @@ if python3 "$tool" --results "$tmp" --worklist "$tmp/wl3.txt" --worklist-rank 99
   fail "--worklist-rank out of range should exit non-zero"
 fi
 pass "--worklist-rank out of range rejected"
+
+# --- a self-skip is NOT fixable work ----------------------------------------
+# A skipped file exited 0 because the runtime lacks the feature; counting it as
+# fixable made 542 skipped files the corpus's largest apparent "cluster", whose
+# only shared signature was the skip line itself.
+vm_fixable2=$(printf '%s' "$out" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(next(s["fixable"] for s in d["subsystems"] if s["subsystem"]=="vm"))')
+[ "$vm_fixable2" = "3" ] && pass "skipped file excluded from fixable" || fail "fixable should stay 3, got $vm_fixable2"
+
+vm_skipped=$(printf '%s' "$out" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(next(s["skipped"] for s in d["subsystems"] if s["subsystem"]=="vm"))')
+[ "$vm_skipped" = "1" ] && pass "skipped counted in its own bucket" || fail "skipped expected 1, got $vm_skipped"
+
+if printf '%s' "$out" | grep -q 'Skipped: no QUIC'; then
+  fail "a skip line leaked into the cluster signatures"
+fi
+pass "skip lines never become cluster signatures"
 
 # --- human report renders without error ------------------------------------
 python3 "$tool" --results "$tmp" >/dev/null && pass "human report renders" || fail "human report crashed"
