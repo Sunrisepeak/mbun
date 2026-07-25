@@ -50,6 +50,11 @@ private:
     // `module.exports = …` before the cycle re-enters (semver@7's
     // Range/Comparator bottom-requires are the canonical case).
     std::unordered_map<std::string, JSObjectRef> moduleInFlight_;
+    // node's `primordials` object, built on first use from node's own
+    // lib/internal/per_context/primordials.js and handed to node-internal
+    // modules as a wrapper parameter (see node_primordials_ in
+    // module_loading.inc). GC-protected; the context is process-lived.
+    JSObjectRef primordials_{nullptr};
     // Parsed tsconfig.json paths cached by config file path (for `harness`,
     // `_util/*`, … bare-specifier resolution in the vendored bun test suite).
     std::unordered_map<std::string, std::optional<mbun::resolver::TsconfigPaths>> tsconfigCache_;
