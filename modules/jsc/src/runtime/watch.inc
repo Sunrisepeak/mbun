@@ -53,6 +53,14 @@ JSValueRef watch_throw(JSContextRef ctx, JSValueRef* exc, const mbun::watcher::B
 JSValueRef watchn_start_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                            const JSValueRef args[], JSValueRef* exc) {
     std::string path{arg_string(ctx, argc, args, 0)};
+    // THE PERMISSION GATE. inotify_add_watch reads directory contents and file
+    // metadata, so node classifies fs.watch as a FileSystemRead operation
+    // (src/fs_event_wrap.cc FSEventWrap::Start →
+    // THROW_IF_INSUFFICIENT_PERMISSIONS(kFileSystemRead)). Without this check
+    // __mbunWatchNative.start was a way to observe any path in the filesystem
+    // — including names of files under a directory the model never granted —
+    // from inside a --permission sandbox.
+    if (permission_deny_fs(ctx, exc, path, false)) return JSValueMakeUndefined(ctx);
     const bool recursive{argc > 1 && JSValueToBoolean(ctx, args[1])};
     mbun::watcher::FsWatcher w{};
     if (auto ok{w.watch(path, recursive)}; !ok) {
