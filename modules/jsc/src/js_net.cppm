@@ -892,6 +892,9 @@ export constexpr std::string_view kNetJS = R"JS(
             if (er || !clientHandle || typeof clientHandle.fd !== "number" || clientHandle.fd < 0) return;
             const sock = new Socket({ allowHalfOpen: !!this._opts.allowHalfOpen })._adopt(clientHandle.fd);
             sock.localPort = this._addr ? this._addr.port : 0;
+            // node net.js onconnection: `socket.server` is the listener that
+            // accepted it (and `_server` its internal alias).
+            sock.server = this; sock._server = this;
             // node net.js onconnection: with pauseOnConnect the accepted socket
             // is handed to the listener already paused, so the consumer decides
             // when the first byte is read (it may pass the fd elsewhere first).
@@ -969,6 +972,7 @@ export constexpr std::string_view kNetJS = R"JS(
         if (this._rawAccept) { this._rawAccept(cfd); progress++; continue; }
         const sock = new Socket({ allowHalfOpen: !!this._opts.allowHalfOpen })._adopt(cfd);
         sock.localPort = this._addr ? this._addr.port : 0;
+        sock.server = this; sock._server = this;
         if (this._opts.pauseOnConnect) sock.pause();
         this._conns.add(sock);
         sock.once("close", () => this._conns.delete(sock));
