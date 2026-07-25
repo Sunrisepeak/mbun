@@ -392,6 +392,46 @@
           "guard_derived_from_diff": "Followed the new rule: diff touched runtime/dns.inc, js_dgram.cppm, js_http2.cppm, builtins/node_cluster.cppm and builtins/process_web.cppm, so it widened the guard by 283 test-child-process/process/worker files AND measured a true baseline for them by reverting the five files and rebuilding, rather than assuming. Total guard 1809 files, 1160 -> 1181, REGRESSIONS 0.",
           "measured_negative_recorded": "Force-finishing a client session's OPEN streams on teardown (rather than only pending ones) cost 5 files; reverted, and the commit message names which 5 so nobody retries it.",
           "stop_condition": "Both conditions met: cycle 6 delivered +0, cycle 5 delivered +1, and it verified by opening each assertion site that the remaining 9-file AssertionError bucket is 9 unrelated causes."
+        },
+        {
+          "id": "r10/agent-11",
+          "cluster": "node:tls + node:dns",
+          "worklist_files": 172,
+          "cluster_homogeneity": "medium (second pass over tls)",
+          "target_delta_pass": 45,
+          "actual_delta_pass": 36,
+          "hit_rate": 0.8,
+          "wall_clock_min": 114,
+          "split": {
+            "tls": "56/215 -> 74/215 (+18)",
+            "dns": "2/29 -> 12/29 (+10)",
+            "free_elsewhere": "https +3, net +3, http +2",
+            "guard_1370": "708 -> 744, 0 regressions"
+          },
+          "shortfall_stated": "62% of target in-cluster, reported as a shortfall rather than padded. Both stop conditions were met (no homogeneous cause above 5 files; last two cycles +3 and +2) over 8 cycles.",
+          "SECURITY_VULNERABILITY_FOUND": {
+            "severity": "high \u2014 certificate validation bypass",
+            "class": "null-prefix certificate spoofing, CVE-2009-2408 class",
+            "defect": "subjectAltName was read with ASN1_STRING_to_UTF8 and handed over as a C string, so a DNS altname TRUNCATED AT AN EMBEDDED NUL. A certificate for `good.example.org\\0.evil.example.com` read back as plain `good.example.org`, and checkServerIdentity then matched it against the victim host. An embedded comma likewise forged an extra list entry.",
+            "impact": "An attacker holding a certificate for a domain they control could have it accepted as valid for a domain they do not, over TLS, with verification enabled. This is a real exploitable bypass, not a compatibility gap.",
+            "fix": "Translated from node's deps/ncrypto/ncrypto.cc IsSafeAltName / PrintAltName / PrintGeneralName: raw ASN1_STRING_get0_data + ASN1_STRING_length (never ASN1_STRING_to_UTF8), rejecting '\"', '\\\\', ',', '\\'' and anything outside printable ASCII (which catches NUL), with node's exact quoting/escaping for unsafe values.",
+            "verification": "Coordinator-verified independently: node's OWN regression test for this CVE, test-tls-0-dns-altname.js \u2014 whose header comment reads \"Check getPeerCertificate can properly handle '\\0' for fix CVE-2009-2408\" \u2014 now passes (exit 0). I also inspected the implementation and confirmed it uses raw bytes with an explicit length rather than a NUL-terminated string. My own attempt to hand-craft a malicious certificate did NOT reproduce the injection, because openssl's config parser sanitises the input into legitimate separate SAN entries; the corpus test is the reliable oracle here and it is the one node ships for exactly this."
+          },
+          "second_security_defect": {
+            "defect": "options.ciphers was validated and then DROPPED \u2014 a caller's cipher restriction had no effect at all.",
+            "impact": "A security control that silently does nothing is worse than an absent one: code auditing as hardened was not.",
+            "fix": "SSL_CTX_set_cipher_list where node does it, and an unmatchable list is a HARD failure (ERR_SSL_NO_CIPHER_MATCH) rather than a silent fallback to a broader default.",
+            "also": "tls.DEFAULT_CIPHERS copied verbatim from node \u2014 a restriction of OpenSSL's default, preserving !aNULL:!eNULL:!EXPORT:!DES:!RC4:!MD5:!PSK:!SRP:!CAMELLIA."
+          },
+          "declined_rather_than_weaken": [
+            "NODE_TLS_REJECT_UNAUTHORIZED=0 (per instruction; still pending a maintainer decision)",
+            "NODE_EXTRA_CA_CERTS \u2014 2 files, extends the trust store",
+            "padding tls.rootCertificates so sort() throws \u2014 2 files, would add CAs to satisfy a test",
+            "remapping UNABLE_TO_GET_ISSUER_CERT_LOCALLY -> UNABLE_TO_VERIFY_LEAF_SIGNATURE \u2014 4 files; the code reflects what the verifier actually concluded"
+          ],
+          "assert_throws_discipline": "Acted on the warning: hand-verified 32 error shapes (code + name + exact message) with standalone probes, which caught a genuine vacuous pass \u2014 test-tls-basic-validations asserts `Received type number (1)` while mbun emitted `Received 1`, using inspect where node uses determineSpecificType. Fixed and re-verified 32/32.",
+          "guard_derived_from_diff": "Followed the rule and it paid: the diff touched crypto_asym.inc, which also feeds crypto.X509Certificate \u2014 a subsystem the brief's guard list did NOT name. It extended the guard by 342 diff-derived files (crypto 129, cluster 80, dgram 76, webcrypto 47) and built a true f628517 binary to baseline them. 236 -> 236, 0 regressions.",
+          "environmental_flag": "test-tls-min-max-version + 6 test-tls-cli-*-version dependents now reach the TLSv1/TLSv1.1 rows, where the peer answers `tlsv1 alert protocol version` despite ciphers ALL@SECLEVEL=0 and an explicit floor. Looks like the linked OpenSSL 3.1.5 refusing legacy protocols below its configured policy \u2014 flagged as possibly environmental rather than fixable in mbun."
         }
       ],
       "verdicts": {
@@ -406,7 +446,8 @@
         "second_pass_is_worth_it": "A cluster declared 'no cause above 5 files' by a previous pass is NOT necessarily exhausted. The http2 tail yielded +51 on a second pass, +15 of it from a single missing layer (Http2Stream as a stream.Duplex). The earlier verdict was true of the SIGNATURES and false of the CAUSES \u2014 the same blind spot as the green-ratio finding. Treat 'no dominant signature' as 'no more cheap wins by signature', not as 'subsystem done', and re-check the green ratio.",
         "guard_must_cover_what_you_edited": "A guard set scoped to the TARGET subsystems is not enough \u2014 it must cover every subsystem the change touched. The dns regression escaped because the task guarded http/https/tls/net/dgram (its targets) while also editing dns. Rule: derive the guard from the DIFF, not from the brief. `git diff --name-only` -> which builtins/modules changed -> guard every corpus subsystem that loads them.",
         "three_verification_defects": "Round 10 found THREE independent defects in how the corpus was verified, each of which had been inflating the number for an unknown time: self-skips counted as passes (277 files), common.mustCall unenforced because process.on('exit') never fired (946 of 1533 passing files used it), and assert.throws ignoring its error argument so any throw satisfied any matcher (48 verified vacuous passes on the guard sets alone). Lesson: before optimising a metric, audit the metric. All three were found by agents doing unrelated work who stopped to ask why a test passed.",
-        "coordinator_hypotheses_are_hints": "A cause stated in a brief must be labelled as a hypothesis, and agents must be told to measure rather than implement it. Two cases this round: the 580-file timeout target assumed handle ref-counting (real cause: the event pump swallowing exceptions), and the dns regression brief assumed a leaked pending count (real cause: a single-threaded resolver deadlocking against dgram's own pre-send lookup, 8011ms -> 3ms once the pool could grow). Both agents measured their way to the real cause. A brief that states a cause as fact would have produced the wrong fix twice."
+        "coordinator_hypotheses_are_hints": "A cause stated in a brief must be labelled as a hypothesis, and agents must be told to measure rather than implement it. Two cases this round: the 580-file timeout target assumed handle ref-counting (real cause: the event pump swallowing exceptions), and the dns regression brief assumed a leaked pending count (real cause: a single-threaded resolver deadlocking against dgram's own pre-send lookup, 8011ms -> 3ms once the pool could grow). Both agents measured their way to the real cause. A brief that states a cause as fact would have produced the wrong fix twice.",
+        "security_findings_outrank_counts": "This task delivered 80% of its file target and was still the most valuable of the round: it found a certificate-validation bypass of the CVE-2009-2408 class (subjectAltName truncated at an embedded NUL, so a cert for `good.example.org\\0.evil.example.com` was accepted as good.example.org) and a silently-ignored options.ciphers. Neither was visible as a failing count \u2014 the SAN bug's corpus test was one file. Briefs for security-adjacent subsystems should ask explicitly for an audit of what the code CLAIMS to enforce versus what it does, and should say that such a finding outranks the file target."
       },
       "open_regressions": {
         "total": 10,
