@@ -354,6 +354,11 @@ export constexpr std::string_view kNetJS = R"JS(
       if (this._timeoutTimer) { G.clearTimeout(this._timeoutTimer); this._timeoutTimer = null; }
       if (this._timeoutMs > 0 && !this.destroyed) {
         this._timeoutTimer = G.setTimeout(() => { this._timeoutTimer = null; if (!this.destroyed) this.emit("timeout"); }, this._timeoutMs);
+        // node arms socket timeouts on the handle's own timer list, so an idle
+        // (agent-pooled, unref'd) socket's timeout never keeps the process
+        // alive by itself -- the socket handle does. A ref'd G.setTimeout here
+        // kept every pooled connection's 5s timer holding the loop open.
+        if (this._timeoutTimer && typeof this._timeoutTimer.unref === "function") this._timeoutTimer.unref();
       }
     }
     setNoDelay() { return this; }
@@ -408,6 +413,24 @@ export constexpr std::string_view kNetJS = R"JS(
         this._unshiftPending = true;
         G.queueMicrotask(() => { this._unshiftPending = false; this._flushUnshift(); });
       }
+      return true;
+    }
+    // stream.Duplex#push: feed bytes to this socket's readable side. node's
+    // net.Socket is a Duplex, and http tests drive fake/broken responses by
+    // pushing straight into it (test-http-client-read-in-error,
+    // test-http-header-overflow).
+    push(chunk, enc) {
+      if (chunk === null || chunk === undefined) {
+        if (!this._eof) { this._eof = true; this.readable = false; this._readableState.endEmitted = true; this.emit("end"); }
+        return false;
+      }
+      const b = typeof chunk === "string"
+        ? (G.Buffer ? G.Buffer.from(chunk, enc || this._enc || "utf8") : chunk)
+        : (G.Buffer ? G.Buffer.from(chunk) : chunk);
+      if (!b.length) return true;
+      this.bytesRead += b.length;
+      if (this._onread) this._onread(b.length, b);
+      else this.emit("data", this._enc && G.Buffer ? b.toString(this._enc) : b);
       return true;
     }
     _flushUnshift() {
@@ -1279,6 +1302,36 @@ export constexpr std::string_view kNetJS = R"JS(
 
   // node:http's ClientRequest parses its responses with this same incremental
   // parser rather than carrying a second HTTP/1.1 implementation.
+  // _http_common.js keeps a parser free list and asserts the identity of the
+  // recycled object (test-http-parser-free walks 100 keep-alive requests over
+  // one socket and requires req.parser to be the *same* parser every time), so
+  // expose the same alloc/free pair rather than minting one per request.
+  HttpParser.prototype._reset = function (isResponse) {
+    this.isResponse = !!isResponse;
+    this.buf = new Uint8Array(0); this.off = 0;
+    this.state = "head"; this.done = false; this.headDone = false;
+    this.method = ""; this.target = ""; this.status = 0; this.statusText = ""; this.httpVersion = "1.1";
+    this.headers = {}; this.rawHeaders = []; this.trailers = {};
+    this.remaining = 0; this.chunked = false; this.toEof = false;
+    this.reqMethod = "GET";
+    this.onHead = this.onBody = this.onDone = this.onError = this.onInterim = null;
+    this._afterDone = null; this.socket = null; this.outgoing = null;
+    this._pooled = false;
+    return this;
+  };
+  const parserFreeList = [];
+  HttpParser.alloc = function (isResponse) {
+    const p = parserFreeList.pop();
+    return p ? p._reset(isResponse) : new HttpParser(isResponse);
+  };
+  HttpParser.free = function (p) {
+    if (!p || p._pooled) return;
+    if (parserFreeList.length >= 1000) return;
+    p._pooled = true;
+    p.onHead = p.onBody = p.onDone = p.onError = p.onInterim = null;
+    p.buf = new Uint8Array(0); p.off = 0;
+    parserFreeList.push(p);
+  };
   G.__mbunHttpParser = HttpParser;
 
   // ---- HTTP response serialization (shared by Bun.serve and node:http) -------
@@ -2240,7 +2293,7 @@ export constexpr std::string_view kNetJS = R"JS(
           parser.onDone = () => {
             if (!parser.headDone) { sock.destroy(); return; }  // idle close
             sock._httpParser = null;
-            carry = [parser.leftover().slice()];
+            carry = [parser.leftover()];
             const hostHdr = parser.headers["host"] || displayHost + ":" + serverObj.port;
             // Derive request.url from the Host header + the target's path/query,
             // dropping any spoofed authority from an absolute-form request target.
@@ -2361,7 +2414,13 @@ export constexpr std::string_view kNetJS = R"JS(
     srv.closeAllConnections = function () { for (const s of Array.from(this._conns)) { try { s.destroy(); } catch (e) {} } };
     srv.closeIdleConnections = function () {
       for (const s of Array.from(this._conns)) {
-        // idle = no request between its head and its response's finish
+        // Idle = the incoming request message has completed, which is what
+        // node's native ConnectionsList tracks (last_message_start <=
+        // last_message_end, driven by llhttp). Deliberately NOT keyed on the
+        // response: a handler calling server.close() right after res.end()
+        // still runs inside on_headers_complete, before its own request
+        // message completes, and must keep that connection alive
+        // (test-http-server-unconsume).
         if (!s._httpInFlight) { try { s.destroy(); } catch (e) {} }
       }
     };
@@ -2419,12 +2478,22 @@ export constexpr std::string_view kNetJS = R"JS(
       let requestsCount = 0;
       const outgoing = [];
 
+      // Pipelined intake. push() runs the request handler synchronously, so the
+      // parser can complete (and be replaced) in the middle of this loop: the
+      // remaining chunks belong to the NEXT message and must be re-queued
+      // behind the leftover onDone just put back, not fed to a finished parser
+      // that drops them. (Feeding them was a silent byte loss that stalled a
+      // long pipeline after ~1.7k requests.)
       const pumpCarry = () => {
         const p = sock._httpParser;
         if (!p) return;
         const pend = carry;
         carry = [];
-        for (const c of pend) if (c.length) p.push(c);
+        for (let i = 0; i < pend.length; i++) {
+          const cur = sock._httpParser;
+          if (!cur || cur.done) { carry = carry.concat(pend.slice(i)); return; }
+          if (pend[i].length) cur.push(pend[i]);
+        }
         if (eofSeen && sock._httpParser === p && !p.done) p.eof();
       };
 
@@ -2440,7 +2509,6 @@ export constexpr std::string_view kNetJS = R"JS(
         const resOnFinish = () => {
           if (im && !im._consuming && !(im._readableState && im._readableState.resumeScheduled)) im._dump();
           if (sock._httpMessage === res) res.detachSocket(sock);
-          if (sock._httpInFlight > 0) sock._httpInFlight--;
           sock._httpIncoming = null;
           G.queueMicrotask(() => { if (!res._closed) { res._closed = true; res.emit("close"); } });
           if (res._last) {
@@ -2558,7 +2626,12 @@ export constexpr std::string_view kNetJS = R"JS(
           if (upgraded) return;
           if (!parser.headDone) { sock.destroy(); return; }
           sock._httpParser = null;
-          carry = [parser.leftover().slice()];
+          // leftover() is a view over a parser we are about to drop; copying it
+          // once per pipelined request made intake quadratic.
+          carry.unshift(parser.leftover());
+          // Request message complete -> this connection stops counting as
+          // in-flight for closeIdleConnections (llhttp on_message_complete).
+          if (sock._httpInFlight > 0) sock._httpInFlight--;
           // EOF: bun internal/http.ts:187 `self.push(null); self.complete = true`.
           if (im) { im.complete = true; im.push(null); }
           if (parser._afterDone) { const f = parser._afterDone; parser._afterDone = null; f(); }

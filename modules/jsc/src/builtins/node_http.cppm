@@ -1745,7 +1745,10 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
   function socketErrorListener(err) {
     const socket = this;
     const request = socket._httpMessage;
-    if (request) {
+    // One error per socket: 'end' and 'error' can both fire for the same
+    // failure (a peer RST reads as EOF then ECONNRESET), and node's tests count
+    // the request's 'error' events exactly (test-http-set-timeout).
+    if (request && !socket._hadError) {
       socket._hadError = true;
       emitErrorEvent(request, err);
     }
@@ -1757,7 +1760,9 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
     request.socket = socket;
     socket._httpMessage = request;
     if (!Parser) { request.emit("socket", socket); return; }
-    const parser = new Parser(true);
+    // _http_common.js parsers.alloc(): one recycled parser per connection, not
+    // one per request (test-http-parser-free asserts the identity).
+    const parser = typeof Parser.alloc === "function" ? Parser.alloc(true) : new Parser(true);
     parser.reqMethod = request.method;
     parser.socket = socket;
     parser.outgoing = request;
@@ -1776,6 +1781,7 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
       socket.removeListener("drain", ondrain);
       if (socket.parser === parser) socket.parser = null;
       request.parser = null;
+      if (typeof Parser.free === "function") Parser.free(parser);
     };
     const hardDetach = () => {
       detach();
@@ -1893,10 +1899,13 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
       res.push(null);
     };
     parser.onError = (e) => {
+      // A peer RST reads as EOF first: onEnd already raised 'socket hang up'
+      // and the parser's own eof() error is the same failure seen twice.
+      const already = socket._hadError;
       detach();
       socket._hadError = true;
       socket.destroy();
-      if (!request.destroyed && !upgraded) emitErrorEvent(request, e);
+      if (!already && !request.destroyed && !upgraded) emitErrorEvent(request, e);
     };
 
     function onData(chunk) {
