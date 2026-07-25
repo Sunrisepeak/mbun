@@ -2368,6 +2368,43 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     const missingArgs = (...names) =>
       spErr("ERR_MISSING_ARGS", `The ${names.map((n) => `"${n}"`).join(" and ")} argument${names.length === 1 ? "" : "s"} must be specified`);
     const invalidTuple = () => spErr("ERR_INVALID_TUPLE", "Each query pair must be an iterable [name, value] tuple");
+    // node lib/internal/url.js createSearchParamsIterator: keys()/values()/
+    // entries() return a distinct URLSearchParamsIterator, not a bare Array
+    // iterator. It brand-checks `this` on `next` (ERR_INVALID_THIS naming
+    // URLSearchParamsIterator, a different type name from URLSearchParams),
+    // carries the "URLSearchParams Iterator" toStringTag, and is LIVE over the
+    // parameter list rather than a snapshot of it.
+    const kSPIterTarget = Symbol("SearchParamsIteratorTarget");
+    const kSPIterKind = Symbol("SearchParamsIteratorKind");
+    const kSPIterIndex = Symbol("SearchParamsIteratorIndex");
+    const spIterProto = Object.create(
+      Object.getPrototypeOf(Object.getPrototypeOf([][Symbol.iterator]())));
+    Object.defineProperty(spIterProto, "next", {
+      configurable: true, writable: true,
+      value: function next() {
+        if (this === null || (typeof this !== "object" && typeof this !== "function") ||
+            !(kSPIterTarget in this))
+          throw spErr("ERR_INVALID_THIS", 'Value of "this" must be of type URLSearchParamsIterator');
+        const entries = this[kSPIterTarget]._e;
+        const index = this[kSPIterIndex];
+        if (index >= entries.length) return { value: undefined, done: true };
+        this[kSPIterIndex] = index + 1;
+        const pair = entries[index];
+        const kind = this[kSPIterKind];
+        return { value: kind === "key" ? pair[0] : kind === "value" ? pair[1] : [pair[0], pair[1]],
+                 done: false };
+      },
+    });
+    Object.defineProperty(spIterProto, Symbol.toStringTag, {
+      configurable: true, value: "URLSearchParams Iterator",
+    });
+    const makeSPIter = (target, kind) => {
+      const it = Object.create(spIterProto);
+      it[kSPIterTarget] = target;
+      it[kSPIterKind] = kind;
+      it[kSPIterIndex] = 0;
+      return it;
+    };
     G.URLSearchParams = class URLSearchParams {
       #brand;
       // Web IDL brand check: `#brand in o` is true only for objects that ran
@@ -2432,9 +2469,9 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       has(k, v) { URLSearchParams.#check(this); if (arguments.length < 1) throw missingArgs("name"); k = toUSVString(k); return (arguments.length < 2 || v === undefined) ? this._e.some((x) => x[0] === k) : this._e.some((x) => x[0] === k && x[1] === toUSVString(v)); }
       delete(k, v) { URLSearchParams.#check(this); if (arguments.length < 1) throw missingArgs("name"); k = toUSVString(k); this._e = this._e.filter((x) => (arguments.length < 2 || v === undefined) ? x[0] !== k : !(x[0] === k && x[1] === toUSVString(v))); this._updateURL(); }
       forEach(cb, t) { URLSearchParams.#check(this); if (arguments.length < 1) throw missingArgs("callback"); for (let i = 0; i < this._e.length; i++) { const [k, v] = this._e[i]; cb.call(t, v, k, this); } }
-      keys() { URLSearchParams.#check(this); return this._e.map((x) => x[0])[Symbol.iterator](); }
-      values() { URLSearchParams.#check(this); return this._e.map((x) => x[1])[Symbol.iterator](); }
-      entries() { URLSearchParams.#check(this); return this._e.map((x) => [x[0], x[1]])[Symbol.iterator](); }
+      keys() { URLSearchParams.#check(this); return makeSPIter(this, "key"); }
+      values() { URLSearchParams.#check(this); return makeSPIter(this, "value"); }
+      entries() { URLSearchParams.#check(this); return makeSPIter(this, "key+value"); }
       [Symbol.iterator]() { return this.entries(); }
       sort() { URLSearchParams.#check(this); this._e.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)); this._updateURL(); }
       get size() { URLSearchParams.#check(this); return this._e.length; }
