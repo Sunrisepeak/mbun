@@ -163,6 +163,11 @@ inline constexpr std::string_view kNodeFsStreamsJS = R"JS(
       this.fd = getValidatedFd(importFd(this, options));
     }
     options.autoDestroy = options.autoClose === undefined ? true : options.autoClose;
+    // node validateFunction(this[kFs].read | .close) — every operation the
+    // stream will reach for must be a function up front, not at first use
+    // (test-fs-stream-fs-options).
+    if (typeof this[kFs].read !== "function") throw argTypeErr("options.fs.read", "of type function", this[kFs].read);
+    if (typeof this[kFs].close !== "function") throw argTypeErr("options.fs.close", "of type function", this[kFs].close);
     this.start = options.start;
     this.end = options.end;
     this.pos = undefined;
@@ -223,6 +228,7 @@ inline constexpr std::string_view kNodeFsStreamsJS = R"JS(
     if (options.fd == null) {
       this.fd = null;
       this[kFs] = options.fs || nodeFsOps;
+      if (typeof this[kFs].open !== "function") throw argTypeErr("options.fs.open", "of type function", this[kFs].open);
       this.path = path;
       this.flags = options.flags === undefined ? "w" : options.flags;
       this.mode = options.mode === undefined ? 0o666 : options.mode;
@@ -231,14 +237,19 @@ inline constexpr std::string_view kNodeFsStreamsJS = R"JS(
       this.fd = getValidatedFd(importFd(this, options));
     }
     options.autoDestroy = options.autoClose === undefined ? true : options.autoClose;
+    if (typeof this[kFs].close !== "function") throw argTypeErr("options.fs.close", "of type function", this[kFs].close);
     this.flush = options.flush == null ? false : options.flush;
     if (typeof this.flush !== "boolean") throw argTypeErr("options.flush", "of type boolean", this.flush);
     if (this.flush && typeof this[kFs].fsync !== "function")
       throw argTypeErr("options.fs.fsync", "of type function", this[kFs].fsync);
     if (typeof this[kFs].write !== "function" && typeof this[kFs].writev !== "function")
       throw argTypeErr("options.fs.write", "of type function", this[kFs].write);
-    if (typeof this[kFs].writev !== "function") this._writev = null;
-    if (typeof this[kFs].write !== "function") this._write = null;
+    // node: a PRESENT-but-not-callable write/writev is an error; only an absent
+    // one disables the corresponding path.
+    if (this[kFs].writev == null) this._writev = null;
+    else if (typeof this[kFs].writev !== "function") throw argTypeErr("options.fs.writev", "of type function", this[kFs].writev);
+    if (this[kFs].write == null) this._write = null;
+    else if (typeof this[kFs].write !== "function") throw argTypeErr("options.fs.write", "of type function", this[kFs].write);
     this.start = options.start;
     this.pos = undefined;
     this.bytesWritten = 0;
