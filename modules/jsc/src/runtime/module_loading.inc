@@ -641,8 +641,29 @@
                 ? std::string{"var __mbunImportMeta = globalThis.__mbun_make_import_meta("} + pfn +
                       ", " + pdn + ", " + json_quote_(query) + ");\n"
                 : std::string{}};
+        // node's internal/util/debuglog leaves `testEnabled` and `debugImpls`
+        // DELIBERATELY uninitialised ("so any call to debuglog() before
+        // initializeDebugEnv() is called will throw" — its own comment) and calls
+        // initializeDebugEnv from internal/process/pre_execution.js:488, a
+        // bootstrap phase mbun does not run. The result was that every lazily
+        // created debug function threw "testEnabled is not a function" the first
+        // time it was actually invoked, and 42 files of node's own lib call
+        // debuglog(). Appending the call to the module's own body is the only
+        // point that is guaranteed to run before first use without paying a
+        // startup cost on every process.
+        //
+        // The `process` guard matters: this module can be pulled in very early,
+        // before process/env exist. Initialising with an empty env then matches
+        // node's own behaviour for an unset NODE_DEBUG (testEnabled returns
+        // false, debug functions become no-ops) rather than throwing — at the
+        // cost that NODE_DEBUG would not take effect for so early a load.
+        const std::string debugEnvSuffix{
+            spec == "internal/util/debuglog"
+                ? std::string{"\ninitializeDebugEnv(typeof process !== \"undefined\" && process.env"
+                              " ? process.env.NODE_DEBUG : \"\");\n"}
+                : std::string{}};
         std::string wrapper{std::string{tla ? "(async function (" : "(function ("} + params +
-                            ") {\n" + strictPrefix + metaPrefix + source + "\n})"};
+                            ") {\n" + strictPrefix + metaPrefix + source + debugEnvSuffix + "\n})"};
 
         JSValueRef wrapExc{nullptr};
         JSValueRef fnVal{eval_(wrapper, &wrapExc, path)};

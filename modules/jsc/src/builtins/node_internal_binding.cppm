@@ -1604,6 +1604,32 @@ inline constexpr std::string_view kNodeInternalBindingJS = R"JS(
     wrap: () => { throw new Error("tls_wrap.wrap is not supported"); },
   });
 
+  // ----------------------------------------------------------- stream_pipe ----
+  // node src/stream_pipe.cc. internal/http2/core.js:192 destructures StreamPipe
+  // from this binding at MODULE LOAD time, so an unregistered binding made
+  // `require('node:http2')` itself throw "No such binding: stream_pipe" — three
+  // corpus files failed there without ever touching a pipe.
+  //
+  // StreamPipe here THROWS when constructed rather than resolving to a no-op.
+  // That is deliberate: mbun has no stream-to-stream pipe, and the only caller
+  // is http2's respondWithFile/respondWithFD. A silently-succeeding stub would
+  // make respondWithFile "work" while sending nothing, and this project has
+  // already found four defects of exactly that shape (a dead-code resolver gate,
+  // a validated-then-dropped `ciphers` option, an accepted-then-unenforced
+  // --permission flag, and a process._rawDebug that wrote nowhere). Failing at
+  // the point of use keeps the unimplemented path honest and visible.
+  factories["stream_pipe"] = () => strictNs("stream_pipe", {
+    StreamPipe: class StreamPipe {
+      constructor() {
+        const err = new Error(
+          "StreamPipe is not implemented in mbun (internalBinding('stream_pipe')); " +
+          "http2 respondWithFile/respondWithFD needs a native stream-to-stream pipe");
+        err.code = "ERR_METHOD_NOT_IMPLEMENTED";
+        throw err;
+      }
+    },
+  });
+
   // ----------------------------------------------------------- stream_wrap ----
   // node src/stream_base.cc / src/stream_wrap.cc. `streamBaseState` is the
   // shared out-parameter array internal/stream_base_commons.js reads after
