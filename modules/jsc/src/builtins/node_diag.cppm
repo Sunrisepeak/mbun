@@ -32,10 +32,65 @@ inline constexpr std::string_view kNodeDiagJS = R"JS(
     else queueMicrotask(emit);
   };
 
+  // internal/errors.js ERR_INVALID_ARG_TYPE. `expected` is node's list of
+  // acceptable types: entries in kTypes read as "of type x", CamelCase entries as
+  // "an instance of X", and a lone "object" is promoted to the instance list when
+  // there is another instance type (so `['string','object','TracingChannel']`
+  // reads "of type string or an instance of TracingChannel or Object" — asserted
+  // verbatim by test-diagnostics-channel-tracing-channel-args-types).
+  const kTypes = ["string", "function", "number", "object", "Function", "Object", "boolean", "bigint", "symbol"];
+  const classRegExp = /^([A-Z][a-z0-9]*)+$/;
+  const formatList = (list, sep) => {
+    if (list.length < 2) return list[0];
+    if (list.length === 2) return list[0] + " " + sep + " " + list[1];
+    return list.slice(0, -1).join(", ") + ", " + sep + " " + list[list.length - 1];
+  };
+  const determineSpecificType = (value) => {
+    if (value === null) return "null";
+    if (value === undefined) return "undefined";
+    const t = typeof value;
+    if (t === "object") {
+      const ctor = value.constructor;
+      return "an instance of " + ((ctor && ctor.name) || "Object");
+    }
+    if (t === "function") return "function " + (value.name || "");
+    let repr;
+    try { repr = t === "string" ? "'" + value + "'" : String(value); } catch (e) { repr = "..."; }
+    if (repr.length > 28) repr = repr.slice(0, 25) + "...";
+    return "type " + t + " (" + repr + ")";
+  };
   const argTypeError = (name, expected, value) => {
-    const e = new TypeError('The "' + name + '" argument must be of type ' + expected +
-      ". Received " + (value === null ? "null" : typeof value));
+    const list = Array.isArray(expected) ? expected : [expected];
+    const types = [], instances = [], other = [];
+    for (const v of list) {
+      if (kTypes.indexOf(v) !== -1) types.push(String(v).toLowerCase());
+      else if (classRegExp.exec(v) !== null) instances.push(v);
+      else other.push(v);
+    }
+    if (instances.length > 0) {
+      const pos = types.indexOf("object");
+      if (pos !== -1) { types.splice(pos, 1); instances.push("Object"); }
+    }
+    let msg = "The " + (name.indexOf(".") !== -1 ? "\"" + name + "\" property " : "\"" + name + "\" argument ") + "must be ";
+    if (types.length > 0) {
+      msg += (types.length > 1 ? "one of type " : "of type ") + formatList(types, "or");
+      if (instances.length > 0 || other.length > 0) msg += " or ";
+    }
+    if (instances.length > 0) {
+      msg += "an instance of " + formatList(instances, "or");
+      if (other.length > 0) msg += " or ";
+    }
+    if (other.length > 0) msg += other.length > 1 ? "one of " + formatList(other, "or") : other[0];
+    msg += ". Received " + determineSpecificType(value);
+    const e = new TypeError(msg);
     e.code = "ERR_INVALID_ARG_TYPE";
+    // node's E()-generated errors carry the code in toString(), which is what
+    // assert.throws(fn, /ERR_INVALID_ARG_TYPE/) matches against (assert compares
+    // the RegExp with String(err)).
+    Object.defineProperty(e, "toString", {
+      value: function () { return this.name + " [ERR_INVALID_ARG_TYPE]: " + this.message; },
+      writable: true, enumerable: false, configurable: true,
+    });
     return e;
   };
   const validateFunction = (value, name) => {
@@ -88,15 +143,21 @@ inline constexpr std::string_view kNodeDiagJS = R"JS(
   };
 
   class ActiveChannel {
+    // node ActiveChannel: the subscriber list is copy-on-write. publish() walks
+    // the array it captured, so a handler that unsubscribes itself (or anyone
+    // else) must not mutate the list being iterated — an in-place splice made
+    // publish() skip the following subscriber
+    // (test-diagnostics-channel-sync-unsubscribe).
     subscribe(subscription) {
       validateFunction(subscription, "subscription");
+      this._subscribers = this._subscribers.slice();
       this._subscribers.push(subscription);
       channels.incRef(this.name);
     }
     unsubscribe(subscription) {
       const index = this._subscribers.indexOf(subscription);
       if (index === -1) return false;
-      this._subscribers.splice(index, 1);
+      this._subscribers = this._subscribers.slice(0, index).concat(this._subscribers.slice(index + 1));
       channels.decRef(this.name);
       maybeMarkInactive(this);
       return true;
@@ -115,8 +176,9 @@ inline constexpr std::string_view kNodeDiagJS = R"JS(
     }
     get hasSubscribers() { return true; }
     publish(data) {
-      for (let i = 0; i < (this._subscribers ? this._subscribers.length : 0); i++) {
-        try { this._subscribers[i](data, this.name); }
+      const subscribers = this._subscribers;
+      for (let i = 0; i < (subscribers ? subscribers.length : 0); i++) {
+        try { subscribers[i](data, this.name); }
         catch (err) { reportError(err); }
       }
     }
@@ -154,6 +216,13 @@ inline constexpr std::string_view kNodeDiagJS = R"JS(
       channels.set(name, this);
     }
     static [Symbol.hasInstance](instance) {
+      // node reaches ObjectGetPrototypeOf(undefined) here and lets V8's TypeError
+      // out; the corpus matches that message verbatim
+      // (test-diagnostics-channel-tracing-channel-args-types checks
+      // `dc.tracingChannel({})`), and JSC words its own differently, so raise
+      // node's text explicitly.
+      if (instance === null || instance === undefined)
+        throw new TypeError("Cannot convert undefined or null to object");
       const prototype = Object.getPrototypeOf(instance);
       return prototype === Channel.prototype || prototype === ActiveChannel.prototype;
     }
@@ -173,7 +242,7 @@ inline constexpr std::string_view kNodeDiagJS = R"JS(
     const existing = channels.get(name);
     if (existing) return existing;
     if (typeof name !== "string" && typeof name !== "symbol")
-      throw argTypeError("channel", "string or symbol", name);
+      throw argTypeError("channel", ["string", "symbol"], name);
     return new Channel(name);
   };
   const subscribe = (name, subscription) => channel(name).subscribe(subscription);
@@ -183,156 +252,67 @@ inline constexpr std::string_view kNodeDiagJS = R"JS(
     return c ? c.hasSubscribers : false;
   };
 
-  const traceEvents = ["start", "end", "asyncStart", "asyncEnd", "error"];
+  const boundedEvents = ["start", "end"];
   const assertChannel = (value, name) => {
-    if (!(value instanceof Channel)) throw argTypeError(name, "Channel", value);
+    if (!(value instanceof Channel)) throw argTypeError(name, ["Channel"], value);
+  };
+  // node lib/diagnostics_channel.js channelFromMap: a name builds the
+  // `tracing:<name>:<event>` channel, an object supplies the Channel directly.
+  const channelFromMap = (nameOrChannels, name, className) => {
+    if (typeof nameOrChannels === "string") return channel("tracing:" + nameOrChannels + ":" + name);
+    if (typeof nameOrChannels === "object" && nameOrChannels !== null) {
+      const c = nameOrChannels[name];
+      assertChannel(c, "nameOrChannels." + name);
+      return c;
+    }
+    throw argTypeError("nameOrChannels", ["string", "object", className], nameOrChannels);
+  };
+  const emitNonThenableWarning = (fn) => {
+    const p = G.process;
+    const msg = "tracePromise was called with the function '" + ((fn && fn.name) || "<anonymous>") +
+      "', which returned a non-thenable.";
+    if (p && typeof p.emitWarning === "function") p.emitWarning(msg);
   };
 
-  class TracingChannel {
+  // BoundedChannel: a start/end channel pair for scoped tracing. `withScope`
+  // publishes start (binding start's stores) and returns a disposable that
+  // publishes end; `run` wraps a call in one. ref: node
+  // lib/diagnostics_channel.js BoundedChannel / BoundedChannelScope.
+  class BoundedChannel {
     constructor(nameOrChannels) {
-      if (typeof nameOrChannels === "string") {
-        this.start = channel("tracing:" + nameOrChannels + ":start");
-        this.end = channel("tracing:" + nameOrChannels + ":end");
-        this.asyncStart = channel("tracing:" + nameOrChannels + ":asyncStart");
-        this.asyncEnd = channel("tracing:" + nameOrChannels + ":asyncEnd");
-        this.error = channel("tracing:" + nameOrChannels + ":error");
-      } else if (nameOrChannels && typeof nameOrChannels === "object") {
-        const { start, end, asyncStart, asyncEnd, error } = nameOrChannels;
-        assertChannel(start, "nameOrChannels.start");
-        assertChannel(end, "nameOrChannels.end");
-        assertChannel(asyncStart, "nameOrChannels.asyncStart");
-        assertChannel(asyncEnd, "nameOrChannels.asyncEnd");
-        assertChannel(error, "nameOrChannels.error");
-        this.start = start; this.end = end; this.asyncStart = asyncStart;
-        this.asyncEnd = asyncEnd; this.error = error;
-      } else {
-        throw argTypeError("nameOrChannels", "string, object, or Channel", nameOrChannels);
+      for (let i = 0; i < boundedEvents.length; i++) {
+        const eventName = boundedEvents[i];
+        Object.defineProperty(this, eventName, {
+          value: channelFromMap(nameOrChannels, eventName, "BoundedChannel"),
+        });
       }
     }
+    get hasSubscribers() { return this.start.hasSubscribers || this.end.hasSubscribers; }
     subscribe(handlers) {
-      for (const name of traceEvents) {
+      for (let i = 0; i < boundedEvents.length; i++) {
+        const name = boundedEvents[i];
         if (!handlers[name]) continue;
         if (this[name]) this[name].subscribe(handlers[name]);
       }
     }
     unsubscribe(handlers) {
       let done = true;
-      for (const name of traceEvents) {
+      for (let i = 0; i < boundedEvents.length; i++) {
+        const name = boundedEvents[i];
         if (!handlers[name]) continue;
         if (!(this[name] && this[name].unsubscribe(handlers[name]))) done = false;
       }
       return done;
     }
-    traceSync(fn, context = {}, thisArg, ...args) {
-      const { start, end, error } = this;
-      return start.runStores(context, () => {
-        try {
-          const result = fn.apply(thisArg, args);
-          context.result = result;
-          return result;
-        } catch (err) {
-          context.error = err;
-          error.publish(context);
-          throw err;
-        } finally {
-          end.publish(context);
-        }
-      });
-    }
-    tracePromise(fn, context = {}, thisArg, ...args) {
-      const { start, end, asyncStart, asyncEnd, error } = this;
-      const reject = (err) => {
-        context.error = err;
-        error.publish(context);
-        asyncStart.publish(context);
-        asyncEnd.publish(context);
-        return Promise.reject(err);
-      };
-      const resolve = (result) => {
-        context.result = result;
-        asyncStart.publish(context);
-        asyncEnd.publish(context);
-        return result;
-      };
-      return start.runStores(context, () => {
-        try {
-          let promise = fn.apply(thisArg, args);
-          if (!(promise instanceof Promise)) promise = Promise.resolve(promise);
-          return promise.then(resolve, reject);
-        } catch (err) {
-          context.error = err;
-          error.publish(context);
-          throw err;
-        } finally {
-          end.publish(context);
-        }
-      });
-    }
-    traceCallback(fn, position = -1, context = {}, thisArg, ...args) {
-      const { start, end, asyncStart, asyncEnd, error } = this;
-      function wrappedCallback(err, res) {
-        if (err) { context.error = err; error.publish(context); }
-        else { context.result = res; }
-        const cbArgs = arguments;
-        const self = this;
-        asyncStart.runStores(context, function () {
-          try { if (callback) return callback.apply(self, cbArgs); }
-          finally { asyncEnd.publish(context); }
-        });
-      }
-      const callback = args.at(position);
-      validateFunction(callback, "callback");
-      args.splice(position, 1, wrappedCallback);
-      return start.runStores(context, () => {
-        try { return fn.apply(thisArg, args); }
-        catch (err) { context.error = err; error.publish(context); throw err; }
-        finally { end.publish(context); }
-      });
-    }
-  }
-
-  const tracingChannel = (nameOrChannels) => new TracingChannel(nameOrChannels);
-
-  // BoundedChannel: a start/end channel pair for scoped tracing. `run` publishes
-  // start (binding start's stores) then end in a finally; `withScope` publishes
-  // start and returns a disposable that publishes end on `using` exit. ref: node
-  // lib/diagnostics_channel.js BoundedChannel.
-  class BoundedChannel {
-    constructor(nameOrChannels) {
-      if (typeof nameOrChannels === "string") {
-        this.start = channel("tracing:" + nameOrChannels + ":start");
-        this.end = channel("tracing:" + nameOrChannels + ":end");
-      } else if (nameOrChannels && typeof nameOrChannels === "object") {
-        const { start, end } = nameOrChannels;
-        assertChannel(start, "nameOrChannels.start");
-        assertChannel(end, "nameOrChannels.end");
-        this.start = start;
-        this.end = end;
-      } else {
-        throw argTypeError("nameOrChannels", "string, object, or Channel", nameOrChannels);
-      }
-    }
-    get hasSubscribers() { return this.start.hasSubscribers || this.end.hasSubscribers; }
-    subscribe(handlers) {
-      if (handlers.start) this.start.subscribe(handlers.start);
-      if (handlers.end) this.end.subscribe(handlers.end);
-    }
-    unsubscribe(handlers) {
-      let done = true;
-      if (handlers.start && !this.start.unsubscribe(handlers.start)) done = false;
-      if (handlers.end && !this.end.unsubscribe(handlers.end)) done = false;
-      return done;
-    }
-    run(context = {}, fn, thisArg, ...args) {
-      const end = this.end;
-      return this.start.runStores(context, () => {
-        try { return fn.apply(thisArg, args); }
-        finally { end.publish(context); }
-      });
-    }
+    // node BoundedChannelScope decides ONCE, at construction, whether the pair
+    // has subscribers. A scope opened on an unsubscribed pair is inert: it
+    // publishes neither start nor end, so a subscriber that arrives while the
+    // scope is open sees nothing. That is the "early exit" the corpus asserts
+    // for traceSync / tracePromise / traceCallback.
     withScope(context = {}) {
-      const scope = this.start.withStoreScope(context);
+      if (!this.hasSubscribers) return { [Symbol.dispose]() {} };
       const end = this.end;
+      const scope = this.start.withStoreScope(context);
       let disposed = false;
       return { [Symbol.dispose]() {
         if (disposed) return;  // double dispose is a no-op (node parity)
@@ -341,8 +321,149 @@ inline constexpr std::string_view kNodeDiagJS = R"JS(
         scope[Symbol.dispose]();
       } };
     }
+    run(context = {}, fn, thisArg, ...args) {
+      const scope = this.withScope(context);
+      try { return fn.apply(thisArg, args); }
+      finally { scope[Symbol.dispose](); }
+    }
   }
   const boundedChannel = (nameOrChannels) => new BoundedChannel(nameOrChannels);
+
+  // TracingChannel is two BoundedChannels — the call window (start/end) and the
+  // continuation window (asyncStart/asyncEnd) — plus a plain error channel.
+  // ref: node lib/diagnostics_channel.js TracingChannel.
+  class TracingChannel {
+    #callWindow;
+    #continuationWindow;
+    constructor(nameOrChannels) {
+      if (typeof nameOrChannels === "string") {
+        this.#callWindow = new BoundedChannel(nameOrChannels);
+        this.#continuationWindow = new BoundedChannel({
+          start: channel("tracing:" + nameOrChannels + ":asyncStart"),
+          end: channel("tracing:" + nameOrChannels + ":asyncEnd"),
+        });
+      } else if (typeof nameOrChannels === "object") {
+        this.#callWindow = new BoundedChannel({ start: nameOrChannels.start, end: nameOrChannels.end });
+        this.#continuationWindow = new BoundedChannel({ start: nameOrChannels.asyncStart, end: nameOrChannels.asyncEnd });
+      }
+      Object.defineProperty(this, "error", {
+        value: channelFromMap(nameOrChannels, "error", "TracingChannel"),
+      });
+    }
+    get start() { return this.#callWindow.start; }
+    get end() { return this.#callWindow.end; }
+    get asyncStart() { return this.#continuationWindow.start; }
+    get asyncEnd() { return this.#continuationWindow.end; }
+    // Any of the five channels counts. Reporting only start/end made every
+    // asyncStart-only subscriber invisible to the `hasSubscribers` gate the
+    // built-in publishers (node:net, node:http) use.
+    get hasSubscribers() {
+      return this.#callWindow.hasSubscribers || this.#continuationWindow.hasSubscribers ||
+        (this.error ? this.error.hasSubscribers : false);
+    }
+    subscribe(handlers) {
+      if (handlers.start || handlers.end) {
+        this.#callWindow.subscribe({ start: handlers.start, end: handlers.end });
+      }
+      if (handlers.asyncStart || handlers.asyncEnd) {
+        this.#continuationWindow.subscribe({ start: handlers.asyncStart, end: handlers.asyncEnd });
+      }
+      if (handlers.error) this.error.subscribe(handlers.error);
+    }
+    unsubscribe(handlers) {
+      let done = true;
+      if (handlers.start || handlers.end) {
+        if (!this.#callWindow.unsubscribe({ start: handlers.start, end: handlers.end })) done = false;
+      }
+      if (handlers.asyncStart || handlers.asyncEnd) {
+        if (!this.#continuationWindow.unsubscribe({ start: handlers.asyncStart, end: handlers.asyncEnd })) done = false;
+      }
+      if (handlers.error) { if (!this.error.unsubscribe(handlers.error)) done = false; }
+      return done;
+    }
+    traceSync(fn, context = {}, thisArg, ...args) {
+      if (!this.hasSubscribers) return fn.apply(thisArg, args);
+      const error = this.error;
+      const scope = this.#callWindow.withScope(context);
+      try {
+        const result = fn.apply(thisArg, args);
+        context.result = result;
+        return result;
+      } catch (err) {
+        context.error = err;
+        error.publish(context);
+        throw err;
+      } finally {
+        scope[Symbol.dispose]();
+      }
+    }
+    tracePromise(fn, context = {}, thisArg, ...args) {
+      if (!this.hasSubscribers) {
+        const bare = fn.apply(thisArg, args);
+        if (bare == null || typeof bare.then !== "function") emitNonThenableWarning(fn);
+        return bare;
+      }
+      const error = this.error;
+      const continuationWindow = this.#continuationWindow;
+      const reject = (err) => {
+        context.error = err;
+        error.publish(context);
+        const s = continuationWindow.withScope(context);
+        try { return Promise.reject(err); } finally { s[Symbol.dispose](); }
+      };
+      const resolve = (result) => {
+        context.result = result;
+        const s = continuationWindow.withScope(context);
+        try { return result; } finally { s[Symbol.dispose](); }
+      };
+      const scope = this.#callWindow.withScope(context);
+      try {
+        const result = fn.apply(thisArg, args);
+        // A non-thenable return is handed straight back (with a warning) and
+        // never reaches the continuation window: there is no "after" point.
+        if (result == null || typeof result.then !== "function") {
+          emitNonThenableWarning(fn);
+          context.result = result;
+          return result;
+        }
+        // Custom thenables keep their own type: call .then() on the value.
+        return result.then(resolve, reject);
+      } catch (err) {
+        context.error = err;
+        error.publish(context);
+        throw err;
+      } finally {
+        scope[Symbol.dispose]();
+      }
+    }
+    traceCallback(fn, position = -1, context = {}, thisArg, ...args) {
+      if (!this.hasSubscribers) return fn.apply(thisArg, args);
+      const error = this.error;
+      const continuationWindow = this.#continuationWindow;
+      function wrappedCallback(err, res) {
+        if (err) { context.error = err; error.publish(context); }
+        else { context.result = res; }
+        const s = continuationWindow.withScope(context);
+        try { return callback.apply(this, arguments); }
+        finally { s[Symbol.dispose](); }
+      }
+      const callback = args.at(position);
+      validateFunction(callback, "callback");
+      args.splice(position, 1, wrappedCallback);
+      const scope = this.#callWindow.withScope(context);
+      try {
+        return fn.apply(thisArg, args);
+      } catch (err) {
+        context.error = err;
+        error.publish(context);
+        throw err;
+      } finally {
+        scope[Symbol.dispose]();
+      }
+    }
+  }
+
+  const tracingChannel = (nameOrChannels) => new TracingChannel(nameOrChannels);
 
   const diagnostics_channel = {
     channel, hasSubscribers, subscribe, tracingChannel, unsubscribe, Channel,
