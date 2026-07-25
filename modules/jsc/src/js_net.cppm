@@ -868,7 +868,12 @@ export constexpr std::string_view kNetJS = R"JS(
                    o.cipherSuites || "",
                    // caComplete: o.ca is the entire trust store; never fall back
                    // to the platform one (an empty store must stay empty).
-                   o.caComplete === true);
+                   o.caComplete === true,
+                   // session: base64 DER of a session to resume (client), and
+                   // ticketKeys: base64 of the server's stable 48-byte session
+                   // ticket key. Both are "" when the caller wants a full
+                   // handshake / OpenSSL's own per-context random ticket key.
+                   o.session || "", o.ticketKeys || "");
         this._tls = 1;
       } catch (e) { this._fail(e); }
       return this;
@@ -946,9 +951,24 @@ export constexpr std::string_view kNetJS = R"JS(
       if (!lines || lines.length === 0) return;
       for (const line of lines) this.emit("keylog", G.Buffer ? G.Buffer.from(line + "\n") : line + "\n");
     }
+    // Hand OpenSSL's newly-issued TLS sessions to node's 'session' event. Gated
+    // on a listener for the same reason as keylog: it is a per-poll native call.
+    // TLS 1.2 queues its session DURING the handshake, TLS 1.3 only once the
+    // post-handshake NewSessionTicket has been read — so this is called both at
+    // the top of the poll and inside the read loop, because a peer that FINs
+    // immediately after its ticket (the common `socket.end('x')` server shape in
+    // the corpus) destroys this socket before another poll ever runs.
+    _drainSessions() {
+      if (!this._sessionWanted || this._tls !== 2 || this._fd < 0 || !NN.tlsNewSessions) return;
+      let blobs;
+      try { blobs = NN.tlsNewSessions(this._fd); } catch (e) { return; }
+      if (!blobs || blobs.length === 0) return;
+      for (const b64 of blobs) this.emit("session", G.Buffer ? G.Buffer.from(b64, "base64") : b64);
+    }
     _poll() {
       if (this.destroyed || this._fd < 0) { NET.items.delete(this); return 0; }
       if (this._keylogWanted) this._drainKeylog();
+      if (this._sessionWanted) this._drainSessions();
       if (this._tls === 1) {  // drive the TLS handshake before any app IO
         let st;
         try { st = NN.tlsStep(this._fd); } catch (e) { st = -1; }
@@ -982,6 +1002,10 @@ export constexpr std::string_view kNetJS = R"JS(
           let r;
           try { r = this._tls ? NN.tlsRead(this._fd) : NN.read(this._fd); }
           catch (e) { this._fail(e); return progress; }
+          // tlsRead is what pumps TLS 1.3's post-handshake NewSessionTicket into
+          // the engine, so the session it produces has to be picked up here —
+          // the EOF branch below can destroy this socket before the next poll.
+          if (this._sessionWanted) this._drainSessions();
           if (r === "") break;
           progress++;
           if (r === null) {

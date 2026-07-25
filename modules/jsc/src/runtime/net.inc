@@ -620,6 +620,15 @@ JSValueRef netn_tls_wrap_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
     if (argc > 13 && JSValueIsBoolean(ctx, args[13])) {
         cfg.caIsComplete = JSValueToBoolean(ctx, args[13]);
     }
+    // arg 14: base64 of a previously serialised SSL_SESSION to resume with
+    // (node's tls.connect({ session }) / socket.setSession()). Client only.
+    if (argc > 14) { cfg.sessionDer = b64_decode(fs_arg(ctx, argc, args, 14)); }
+    // arg 15: base64 of the server's 48-byte session-ticket key (node's
+    // tls.createServer({ ticketKeys }) / server.setTicketKeys()). This is what
+    // lets a ticket issued by one accepted connection be resumed by the next —
+    // every connection here owns its own SSL_CTX, so without a stable key the
+    // ticket is undecryptable by design.
+    if (argc > 15) { cfg.ticketKeys = b64_decode(fs_arg(ctx, argc, args, 15)); }
     auto st{std::make_unique<NetTlsState>(
         isServer ? mbun::tls::TlsRole::server : mbun::tls::TlsRole::client, std::move(cfg))};
     if (!st->channel.valid()) {
@@ -789,6 +798,10 @@ JSValueRef netn_tls_info_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
     set_prop(ctx, r, "servername", make_string(ctx, st.channel.peer_server_name()));
     set_prop(ctx, r, "authorized", JSValueMakeBoolean(ctx, est && st.channel.verify_ok()));
     set_prop(ctx, r, "alpnProtocol", make_string(ctx, est ? st.channel.alpn_protocol() : std::string{}));
+    // node's TLSSocket.isSessionReused() — SSL_session_reused. Meaningful on
+    // both roles: the client learns its offered session was accepted, the
+    // server learns the peer arrived with a valid ticket.
+    set_prop(ctx, r, "sessionReused", JSValueMakeBoolean(ctx, est && st.channel.session_reused()));
     if (est) {
         const std::string peer{st.channel.peer_certificate_pem()};
         if (!peer.empty()) set_prop(ctx, r, "peerCert", make_string(ctx, peer));
@@ -834,6 +847,68 @@ JSValueRef netn_tls_keylog_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::s
     (void)args;
 #endif
     return JSObjectMakeArray(ctx, items.size(), items.empty() ? nullptr : items.data(), nullptr);
+}
+
+// net.tlsNewSessions(fd) → array of base64 SSL_SESSION DER blobs delivered by
+// OpenSSL since the last call (empty when there is nothing, or no channel).
+// Destructive, like tlsKeylog: a polling reactor must not emit the same session
+// twice. Feeds node's TLSSocket 'session' event, which for TLS 1.3 fires only
+// once the post-handshake NewSessionTicket has been read — which is why this is
+// polled from the read path rather than read once at handshake completion.
+JSValueRef netn_tls_new_sessions_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                                    const JSValueRef args[], JSValueRef*) {
+    std::vector<JSValueRef> items;
+#if !defined(_WIN32)
+    const int fd{argc > 0 ? static_cast<int>(JSValueToNumber(ctx, args[0], nullptr)) : -1};
+    const auto found{net_tls().find(fd)};
+    if (found != net_tls().end()) {
+        for (const std::vector<std::uint8_t>& der : found->second->channel.take_new_sessions()) {
+            items.push_back(make_string(ctx, b64_encode(der.data(), der.size())));
+        }
+    }
+#else
+    (void)argc;
+    (void)args;
+#endif
+    return JSObjectMakeArray(ctx, items.size(), items.empty() ? nullptr : items.data(), nullptr);
+}
+
+// net.tlsSession(fd) → base64 of the CURRENT session (node's getSession()), or
+// "" when there is none. For TLS 1.3 this is the unresumable placeholder node
+// documents right after the handshake; the resumable one arrives through
+// tlsNewSessions.
+JSValueRef netn_tls_session_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                               const JSValueRef args[], JSValueRef*) {
+#if !defined(_WIN32)
+    const int fd{argc > 0 ? static_cast<int>(JSValueToNumber(ctx, args[0], nullptr)) : -1};
+    const auto found{net_tls().find(fd)};
+    if (found != net_tls().end()) {
+        const std::vector<std::uint8_t> der{found->second->channel.session_der()};
+        if (!der.empty()) return make_string(ctx, b64_encode(der.data(), der.size()));
+    }
+#else
+    (void)argc;
+    (void)args;
+#endif
+    return make_string(ctx, std::string{});
+}
+
+// net.tlsTicket(fd) → base64 of the current session's ticket (node's
+// getTLSTicket()), or "" when the session carries none.
+JSValueRef netn_tls_ticket_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                              const JSValueRef args[], JSValueRef*) {
+#if !defined(_WIN32)
+    const int fd{argc > 0 ? static_cast<int>(JSValueToNumber(ctx, args[0], nullptr)) : -1};
+    const auto found{net_tls().find(fd)};
+    if (found != net_tls().end()) {
+        const std::vector<std::uint8_t> tick{found->second->channel.tls_ticket()};
+        if (!tick.empty()) return make_string(ctx, b64_encode(tick.data(), tick.size()));
+    }
+#else
+    (void)argc;
+    (void)args;
+#endif
+    return make_string(ctx, std::string{});
 }
 
 // net.tlsExportKeyingMaterial(fd, length, label, contextB64|null) → base64 of

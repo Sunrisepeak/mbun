@@ -9,6 +9,7 @@ module;
 #include <cctype>
 #include <cstring>
 #include <openssl/bio.h>
+#include <openssl/crypto.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
@@ -142,8 +143,35 @@ struct TlsChannel::Impl {
     // renegotiation a few more.
     std::vector<std::string> keylog_ {};
     static constexpr std::size_t kKeylogMax {64};
+    // Sessions OpenSSL delivered through SSL_CTX_sess_set_new_cb, already
+    // serialised, waiting for take_new_sessions(). Bounded for the same reason
+    // as keylog_: a client that never drains must not grow without limit. A
+    // TLS 1.3 server issues 2 tickets by default and a TLS 1.2 server 1, so this
+    // ceiling is only ever reached by a peer issuing tickets in a loop.
+    std::vector<std::vector<std::uint8_t>> newSessions_ {};
+    static constexpr std::size_t kNewSessionMax {16};
 
     Impl() = default;
+
+    // SSL_CTX_sess_set_new_cb. Installed on the CLIENT only: it is how node's
+    // TLSSocket learns that a resumable session exists ('session' event), which
+    // for TLS 1.3 is strictly after the handshake completed. Returning 0 tells
+    // OpenSSL we did not take a reference — we copied the DER encoding instead,
+    // so the SSL_SESSION stays OpenSSL's to free.
+    static int new_session_cb_(SSL* ssl, SSL_SESSION* session) {
+        if (ssl == nullptr || session == nullptr) return 0;
+        SSL_CTX* ctx {::SSL_get_SSL_CTX(ssl)};
+        if (ctx == nullptr) return 0;
+        auto* self {static_cast<Impl*>(SSL_CTX_get_app_data(ctx))};
+        if (self == nullptr || self->newSessions_.size() >= kNewSessionMax) return 0;
+        const int len {::i2d_SSL_SESSION(session, nullptr)};
+        if (len <= 0) return 0;
+        std::vector<std::uint8_t> der(static_cast<std::size_t>(len));
+        unsigned char* out {der.data()};
+        if (::i2d_SSL_SESSION(session, &out) <= 0) return 0;
+        self->newSessions_.push_back(std::move(der));
+        return 0;
+    }
 
     // SSL_CTX_set_keylog_callback. `line` is one NSS keylog entry WITHOUT a
     // trailing newline; node passes exactly the same bytes plus '\n' to JS.
@@ -313,6 +341,58 @@ struct TlsChannel::Impl {
         }
     }
 
+    // Install node's 48-byte session-ticket key on this context.
+    //
+    // node's `ticketKeys` is defined as 48 bytes — 16 key name, 16 HMAC key,
+    // 16 AES key — because that is the layout OpenSSL 1.1.x used. OpenSSL 3.x
+    // widened the two key halves to 32 bytes each, so THIS build wants 80 and
+    // rejects a 48-byte call outright (SSL_R_INVALID_TICKET_KEYS_LENGTH). That
+    // rejection is silent unless the return value is read: the context simply
+    // keeps its own random key, every connection issues tickets under a
+    // different key, and resumption fails with no error anywhere. Measured
+    // against this exact package (mbun.openssl 3.1.5): the ctrl reports 80.
+    //
+    // So ask the library how many bytes it wants and adapt:
+    //   48 → node's layout verbatim.
+    //   80 → the key NAME is copied verbatim (it is only an identifier, and it
+    //        must stay bit-identical or a ticket issued under a rotated-back key
+    //        would no longer be recognised), and each 16-byte secret is expanded
+    //        to 32 with SHA-256. The expansion is deterministic, so the same
+    //        `ticketKeys` always yields the same context key — which is the
+    //        whole point — and it neither adds nor removes entropy: 128 bits in,
+    //        128 bits of key material, exactly what node has with the same input.
+    //   anything else → leave OpenSSL's own random key in place. Guessing at an
+    //        unknown layout would mean writing attacker-influenced bytes into
+    //        key slots we do not understand; losing resumption is the safe loss.
+    bool install_ticket_keys_(const std::string& keys) {
+        const long want {::SSL_CTX_set_tlsext_ticket_keys(ctx_, nullptr, 0)};
+        if (want == 48) {
+            return ::SSL_CTX_set_tlsext_ticket_keys(
+                       ctx_, const_cast<char*>(keys.data()), 48) == 1;
+        }
+        if (want != 80) {
+            return false;
+        }
+        const auto expand = [](const unsigned char* in, unsigned char* out) {
+            unsigned int len {0};
+            return ::EVP_Digest(in, 16, out, &len, ::EVP_sha256(), nullptr) == 1 && len == 32;
+        };
+        unsigned char material[80] {};
+        const auto* src {reinterpret_cast<const unsigned char*>(keys.data())};
+        std::memcpy(material, src, 16);
+        if (!expand(src + 16, material + 16) || !expand(src + 32, material + 48)) {
+            ::OPENSSL_cleanse(material, sizeof material);
+            ::ERR_clear_error();
+            return false;
+        }
+        const bool ok {::SSL_CTX_set_tlsext_ticket_keys(ctx_, material, 80) == 1};
+        ::OPENSSL_cleanse(material, sizeof material);
+        if (!ok) {
+            ::ERR_clear_error();
+        }
+        return ok;
+    }
+
     bool setup_(Config config) {
         ensure_library();
         ctx_ = ::SSL_CTX_new(role_ == TlsRole::client ? ::TLS_client_method()
@@ -429,6 +509,29 @@ struct TlsChannel::Impl {
         SSL_CTX_set_app_data(ctx_, this);
         ::SSL_CTX_set_keylog_callback(ctx_, &Impl::keylog_cb_);
 
+        // Session resumption. Two independent halves, one per role:
+        //
+        //  CLIENT — ask OpenSSL to hand us each new session as it arrives
+        //  (SSL_CTX_sess_set_new_cb) so the JS layer can emit node's 'session'
+        //  event. The cache mode has to say SSL_SESS_CACHE_CLIENT or the
+        //  callback is never invoked; NO_INTERNAL_STORE keeps OpenSSL from also
+        //  retaining the session in a per-context cache that nothing here would
+        //  ever consult. Same combination node uses (crypto_context.cc).
+        //
+        //  SERVER — pin the session-ticket key. Every connection in this engine
+        //  builds its own SSL_CTX, so OpenSSL's default per-context random
+        //  ticket key means a ticket issued on one connection can never be
+        //  decrypted on the next, i.e. resumption could not work no matter what
+        //  the client offered. A caller-stable key (node's `ticketKeys`, which
+        //  node itself defaults to random-per-Server) is the whole mechanism.
+        if (role_ == TlsRole::client) {
+            ::SSL_CTX_set_session_cache_mode(
+                ctx_, SSL_SESS_CACHE_CLIENT | SSL_SESS_CACHE_NO_INTERNAL_STORE);
+            ::SSL_CTX_sess_set_new_cb(ctx_, &Impl::new_session_cb_);
+        } else if (config.ticketKeys.size() == 48) {
+            install_ticket_keys_(config.ticketKeys);
+        }
+
         ssl_ = ::SSL_new(ctx_);
         if (ssl_ == nullptr) {
             fail_("SSL_new");
@@ -450,6 +553,22 @@ struct TlsChannel::Impl {
                 ::SSL_set_tlsext_host_name(ssl_, config.serverName.c_str());
                 if (config.verify != VerifyMode::disabled && config.hostCheck) {
                     ::SSL_set1_host(ssl_, config.serverName.c_str());
+                }
+            }
+            // Offer a previously obtained session for resumption. A blob that
+            // does not parse is dropped and the handshake proceeds in full —
+            // node's SetSession behaves the same way, and failing open here
+            // would only be a denial of service, never a downgrade: whatever
+            // OpenSSL negotiates afterwards is still verified normally.
+            if (!config.sessionDer.empty()) {
+                const auto* p {reinterpret_cast<const unsigned char*>(config.sessionDer.data())};
+                SSL_SESSION* prior {::d2i_SSL_SESSION(
+                    nullptr, &p, static_cast<long>(config.sessionDer.size()))};
+                if (prior != nullptr) {
+                    ::SSL_set_session(ssl_, prior);
+                    ::SSL_SESSION_free(prior);
+                } else {
+                    ::ERR_clear_error();
                 }
             }
         } else {
@@ -934,6 +1053,59 @@ std::vector<std::uint8_t> TlsChannel::export_keying_material(
     if (rc != 1) {
         ::ERR_clear_error();
         out.clear();
+    }
+    return out;
+}
+
+std::vector<std::vector<std::uint8_t>> TlsChannel::take_new_sessions() {
+    std::vector<std::vector<std::uint8_t>> out {};
+    out.swap(impl_->newSessions_);
+    return out;
+}
+
+std::vector<std::uint8_t> TlsChannel::session_der() const {
+    std::vector<std::uint8_t> out {};
+    if (impl_->ssl_ == nullptr) {
+        return out;
+    }
+    // SSL_get_session does not take a reference, which is what we want: the
+    // encoding is copied out immediately and nothing here outlives the call.
+    SSL_SESSION* session {::SSL_get_session(impl_->ssl_)};
+    if (session == nullptr) {
+        return out;
+    }
+    const int len {::i2d_SSL_SESSION(session, nullptr)};
+    if (len <= 0) {
+        ::ERR_clear_error();
+        return out;
+    }
+    out.resize(static_cast<std::size_t>(len));
+    unsigned char* p {out.data()};
+    if (::i2d_SSL_SESSION(session, &p) <= 0) {
+        ::ERR_clear_error();
+        out.clear();
+    }
+    return out;
+}
+
+bool TlsChannel::session_reused() const noexcept {
+    return impl_->ssl_ != nullptr && ::SSL_session_reused(impl_->ssl_) == 1;
+}
+
+std::vector<std::uint8_t> TlsChannel::tls_ticket() const {
+    std::vector<std::uint8_t> out {};
+    if (impl_->ssl_ == nullptr) {
+        return out;
+    }
+    SSL_SESSION* session {::SSL_get_session(impl_->ssl_)};
+    if (session == nullptr) {
+        return out;
+    }
+    const unsigned char* ticket {nullptr};
+    std::size_t len {0};
+    ::SSL_SESSION_get0_ticket(session, &ticket, &len);
+    if (ticket != nullptr && len > 0) {
+        out.assign(ticket, ticket + len);
     }
     return out;
 }

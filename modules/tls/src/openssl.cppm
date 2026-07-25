@@ -108,6 +108,25 @@ public:
     [[nodiscard]] std::vector<std::uint8_t> export_keying_material(
         std::size_t length, std::string_view label,
         std::span<const std::uint8_t> context, bool useContext) const;
+
+    // ---- session resumption (node's 'session' event / tls.connect({session})) --
+    // Sessions OpenSSL handed us through SSL_CTX_sess_set_new_cb since the last
+    // call, each already serialised with i2d_SSL_SESSION, oldest first. Draining
+    // is destructive so a polling caller cannot emit the same session twice.
+    // TLS 1.2 delivers its one session during the handshake; TLS 1.3 delivers
+    // NewSessionTicket messages AFTER it, so this must keep being polled while
+    // the connection reads. Client role only — a server issues tickets, it does
+    // not receive them.
+    [[nodiscard]] std::vector<std::vector<std::uint8_t>> take_new_sessions();
+    // The CURRENT session as DER (node's TLSSocket.getSession()). For TLS 1.3
+    // the session available immediately after the handshake is the unresumable
+    // placeholder node documents; the resumable one arrives via take_new_sessions.
+    [[nodiscard]] std::vector<std::uint8_t> session_der() const;
+    // SSL_session_reused — node's TLSSocket.isSessionReused().
+    [[nodiscard]] bool session_reused() const noexcept;
+    // The raw session ticket of the current session (SSL_SESSION_get0_ticket) —
+    // node's TLSSocket.getTLSTicket(). Empty when the session carries none.
+    [[nodiscard]] std::vector<std::uint8_t> tls_ticket() const;
 };
 
 // Does this private key belong to this certificate? node's

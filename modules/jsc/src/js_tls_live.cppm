@@ -198,6 +198,37 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
     return typeof v.toString === "function" ? v.toString() : String(v);
   };
   const isMbunNetSocket = (s) => !!s && typeof s._startTls === "function" && typeof s.on === "function";
+  // Session material (a serialised SSL_SESSION, a 48-byte ticket key) crosses to
+  // the native layer base64-encoded, the same way every other opaque byte string
+  // in this reactor does. A non-buffer is dropped rather than coerced: handing
+  // the engine a mangled session would silently turn a resumption into a full
+  // handshake with no way to tell the two apart.
+  const b64Of = (v) => {
+    if (v == null || !Buffer) return "";
+    try {
+      if (Buffer.isBuffer(v)) return v.toString("base64");
+      if (ArrayBuffer.isView(v)) return Buffer.from(v.buffer, v.byteOffset, v.byteLength).toString("base64");
+      if (v instanceof ArrayBuffer) return Buffer.from(v).toString("base64");
+    } catch (e) {}
+    return "";
+  };
+  // node's tls.Server picks a random session-ticket key per Server when the
+  // caller gave none (src/crypto/crypto_context.cc SecureContext::Init →
+  // RandBytes). It must be a CSPRNG: the ticket key is what authenticates and
+  // encrypts every resumable session this server hands out, so a predictable one
+  // would be a straight session-forgery hole. If no CSPRNG is reachable, return
+  // null and leave OpenSSL's own per-context random key in place — that costs
+  // resumption, which is the safe way to fail.
+  const randomTicketKeys = () => {
+    const crypto = M["crypto"] || M["node:crypto"];
+    if (crypto && typeof crypto.randomBytes === "function") {
+      try { return crypto.randomBytes(48); } catch (e) {}
+    }
+    if (G.crypto && typeof G.crypto.getRandomValues === "function" && Buffer) {
+      try { return Buffer.from(G.crypto.getRandomValues(new Uint8Array(48))); } catch (e) {}
+    }
+    return null;
+  };
   // ALPNProtocols may be an array of names, a comma string, or a length-prefixed
   // wire Buffer (node convertALPNProtocols). Normalize to comma-joined names for
   // the native tlsWrap. Blueprint: node lib/tls.js convertALPNProtocols.
@@ -327,7 +358,21 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
       // semantics. Watching 'newListener' catches on/once/addListener/prepend*
       // alike, including the https.Agent's own onkeylog forward.
       this._keylogWanted = false;
+      // Same deal for 'session': the reactor only asks OpenSSL for the sessions
+      // it issued once something wants them. getSession()/isSessionReused() read
+      // the SSL* directly and do not need this, so the flag tracks the EVENT.
+      this._sessionWanted = false;
+      this._sessionReused = false;
+      // node's tls.connect({ session }) / socket.setSession(): the session is
+      // offered when the handshake starts, which for a client whose TCP leg is
+      // still in flight is after the caller has had a chance to call setSession.
+      this._sessionToResume = options.session != null ? options.session : null;
       this.on("newListener", (ev) => {
+        if (ev === "session" && !this._sessionWanted) {
+          this._sessionWanted = true;
+          if (this._transport) this._transport._sessionWanted = true;
+          return;
+        }
         if (ev !== "keylog" || this._keylogWanted) return;
         this._keylogWanted = true;
         if (this._transport) this._transport._keylogWanted = true;
@@ -378,6 +423,11 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
       // with no listener never moves key material out of the engine.
       transport.on("keylog", (line) => self.emit("keylog", line));
       if (self._keylogWanted) transport._keylogWanted = true;
+      // node internal/tls/wrap.js onnewsession: each session OpenSSL issues (one
+      // for TLS 1.2, one per NewSessionTicket for TLS 1.3) reaches the TLSSocket
+      // as a Buffer the caller can hand back to tls.connect({ session }).
+      transport.on("session", (session) => self.emit("session", session));
+      if (self._sessionWanted) transport._sessionWanted = true;
       // node's TLSSocket is a net.Socket over a real connection, so it emits
       // 'connect' when the TCP leg lands (before the handshake) and 'ready'
       // after. The corpus drives raw TLS clients from 'connect'
@@ -419,6 +469,7 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
           // whether or not this side offered ALPN. `null` is only the
           // constructor's initial value, i.e. "the handshake has not finished".
           self.alpnProtocol = info.alpnProtocol ? info.alpnProtocol : false;
+          self._sessionReused = !!info.sessionReused;
           if (info.peerCert) { self._peerCert = parseCert(info.peerCert); self._peerCertPem = info.peerCert; }
           // The verified chain (leaf first) backs getPeerCertificate(true)'s
           // `issuerCertificate` walk. node links each cert to its issuer and
@@ -529,6 +580,13 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
           ciphers: ciphers.cipherList,
           cipherSuites: ciphers.cipherSuites,
           hostCheck: !(typeof options.checkServerIdentity === "function"),
+          // Client: the session to resume, read at handshake-start time so a
+          // setSession() between tls.connect() and the TCP 'connect' still
+          // counts. Server: the Server's stable session-ticket key, without
+          // which a ticket issued here could never be decrypted by the next
+          // connection (each one builds its own SSL_CTX).
+          session: options.isServer ? "" : b64Of(self._sessionToResume),
+          ticketKeys: options.isServer ? b64Of(options.ticketKeys) : "",
         });
       };
       // A live fd means the reactor's connect() already returned, whether this is
@@ -590,13 +648,34 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
       if (!this._secureEstablished || this.destroyed) return null;
       return this._protocol || "TLSv1.3";
     }
-    getSession() { return undefined; }
+    // node crypto_tls.cc TLSWrap::GetSession: i2d_SSL_SESSION of the SSL*'s
+    // CURRENT session, read live rather than cached — for TLS 1.3 the session
+    // available the instant the handshake finishes is the unresumable
+    // placeholder, and the resumable one only appears later (the 'session'
+    // event). undefined when there is no session at all, as node returns.
+    getSession() {
+      const fd = this._transport ? this._transport._fd : -1;
+      if (!NN || typeof NN.tlsSession !== "function" || !(fd >= 0)) return undefined;
+      let b64;
+      try { b64 = NN.tlsSession(fd); } catch (e) { return undefined; }
+      if (typeof b64 !== "string" || b64 === "") return undefined;
+      return Buffer ? Buffer.from(b64, "base64") : b64;
+    }
     getEphemeralKeyInfo() { return null; }
     getSharedSigalgs() { return []; }
     // node: undefined until the handshake completes, then a non-empty Buffer.
     getFinished() { return this._finished; }
     getPeerFinished() { return this._peerFinished; }
-    getTLSTicket() { return undefined; }
+    // node crypto_tls.cc TLSWrap::GetTLSTicket: SSL_SESSION_get0_ticket of the
+    // current session. undefined when the session carries no ticket.
+    getTLSTicket() {
+      const fd = this._transport ? this._transport._fd : -1;
+      if (!NN || typeof NN.tlsTicket !== "function" || !(fd >= 0)) return undefined;
+      let b64;
+      try { b64 = NN.tlsTicket(fd); } catch (e) { return undefined; }
+      if (typeof b64 !== "string" || b64 === "") return undefined;
+      return Buffer ? Buffer.from(b64, "base64") : b64;
+    }
     // node internal/tls/wrap.js _destroySSL(): tears the SSL* down without
     // touching the transport. mbun's channel lives with the transport fd, so the
     // teardown is a no-op beyond dropping the cached negotiated state — the point
@@ -606,7 +685,10 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
       this._peerCert = null;
       this._peerCertDetailed = null;
     }
-    isSessionReused() { return false; }
+    // node crypto_tls.cc TLSWrap::IsSessionReused — SSL_session_reused, captured
+    // when the handshake landed (the SSL* is gone once the fd is closed, and the
+    // corpus asks inside 'close' handlers).
+    isSessionReused() { return !!this._sessionReused; }
     // node internal/tls/wrap.js setServername: validateString, then refuse on a
     // server-side socket — SNI travels client→server only.
     setServername(name) {
@@ -619,7 +701,16 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
       this.servername = name;
       return this;
     }
-    setSession() { return this; }
+    // node internal/tls/wrap.js setSession(session): validateBuffer, then hand
+    // it to the SSL* before the handshake. Here the handshake starts when the
+    // transport connects, so the session is recorded and read by start(); a call
+    // after the handshake has begun is a no-op, exactly as node's SSL_set_session
+    // on an already-connected SSL is.
+    setSession(session) {
+      validateBuffer(session, "session");
+      this._sessionToResume = session;
+      return this;
+    }
     // node: validateInt32(size, 'size'), then SSL_set_max_send_fragment.
     // DEFERRED: the fragment size is not yet threaded to the native TlsChannel,
     // so the validated call reports failure rather than claiming success.
@@ -729,7 +820,10 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
       opts.checkServerIdentity !== T.checkServerIdentity ? opts.checkServerIdentity : null;
     const tlsOpts = { isServer: false, servername, ca: opts.ca, cert: opts.cert, key: opts.key, rejectUnauthorized: opts.rejectUnauthorized, ALPNProtocols: opts.ALPNProtocols,
       minVersion: opts.minVersion, maxVersion: opts.maxVersion, secureProtocol: opts.secureProtocol, secureContext: opts.secureContext,
-      ciphers: opts.ciphers, checkServerIdentity: customIdentity, identityHost: servername || host };
+      ciphers: opts.ciphers, checkServerIdentity: customIdentity, identityHost: servername || host,
+      // node internal/tls/wrap.js connect(): `session` is handed to
+      // tlssock.setSession() before the socket connects.
+      session: opts.session };
 
     if (isMbunNetSocket(transportOpt)) {
       const tlsSock = new TLSSocket(transportOpt, tlsOpts);
@@ -831,6 +925,14 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
         }
       }
       this._sharedCreds = options || {};
+      // node tls.createServer({ ticketKeys }) — and, when the caller gave none,
+      // node's own per-Server random key (crypto_context.cc SecureContext::Init).
+      // It has to live on the SERVER rather than on each connection: it is the
+      // only thing shared between the SSL_CTX of one accepted connection and the
+      // next, and therefore the only thing that can make a ticket issued by one
+      // resumable by the other. null (no CSPRNG) means OpenSSL keeps its own
+      // per-context key and resumption simply does not happen.
+      this._ticketKeys = (options && options.ticketKeys) || randomTicketKeys();
       this._contexts = new Map();
       if (typeof secureConnectionListener === "function" && typeof this.on === "function")
         this.on("secureConnection", secureConnectionListener);
@@ -844,6 +946,11 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
         ALPNProtocols: creds.ALPNProtocols,
         minVersion: creds.minVersion, maxVersion: creds.maxVersion, secureProtocol: creds.secureProtocol,
         secureContext: creds.secureContext, ciphers: creds.ciphers,
+        // Read off the Server at ACCEPT time, not at construction: node's
+        // server.setTicketKeys() rotates the key for connections accepted after
+        // the call and the corpus (test-tls-ticket) turns exactly that into an
+        // assertion about which tickets stay resumable.
+        ticketKeys: this._ticketKeys,
       });
       const self = this;
       // node internal/tls/wrap.js: the server re-emits each connection's keylog
@@ -917,7 +1024,14 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
       }
       this._contexts.set(servername, context);
     }
-    getTicketKeys() { return Buffer ? Buffer.alloc(48) : new Uint8Array(48); }
+    // node internal/tls/wrap.js getTicketKeys → SecureContext::GetTicketKeys: a
+    // COPY of the 48 bytes in force, so a caller mutating the returned buffer
+    // cannot change what the server encrypts tickets with.
+    getTicketKeys() {
+      const k = this._ticketKeys;
+      if (!k) return Buffer ? Buffer.alloc(48) : new Uint8Array(48);
+      return Buffer ? Buffer.from(k) : k;
+    }
     // node internal/tls/wrap.js setTicketKeys: validateBuffer, then assert the
     // 48-byte length (16B name + 16B HMAC key + 16B AES key).
     setTicketKeys(keys) {
@@ -928,7 +1042,7 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
         e.name = "AssertionError";
         throw e;
       }
-      this._ticketKeys = keys;
+      this._ticketKeys = Buffer ? Buffer.from(keys) : keys;
       return this;
     }
   }
