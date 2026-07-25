@@ -115,7 +115,13 @@ inline constexpr std::string_view kNodeStreamCoreJS = R"JS(
   const $ERR_METHOD_NOT_IMPLEMENTED = (name) => mk(Error, "ERR_METHOD_NOT_IMPLEMENTED", `The ${name} method is not implemented`);
   const $ERR_ILLEGAL_CONSTRUCTOR = () => mk(TypeError, "ERR_ILLEGAL_CONSTRUCTOR", "Illegal constructor");
   const $ERR_MULTIPLE_CALLBACK = () => mk(Error, "ERR_MULTIPLE_CALLBACK", "Callback called multiple times");
-  const $ERR_UNKNOWN_ENCODING = (enc) => mk(TypeError, "ERR_UNKNOWN_ENCODING", `Unknown encoding: ${enc}`);
+  // node builds this through util.format('%s'), which inspects a non-primitive
+  // ("{}") rather than String()-ing it ("[object Object]").
+  const $ERR_UNKNOWN_ENCODING = (enc) => mk(TypeError, "ERR_UNKNOWN_ENCODING",
+    `Unknown encoding: ${enc === null || typeof enc !== "object" ? String(enc) : (() => {
+      const u = globalThis.__mbunNativeModules && (globalThis.__mbunNativeModules["util"] || globalThis.__mbunNativeModules["node:util"]);
+      try { return u && u.inspect ? u.inspect(enc, { depth: 0 }) : String(enc); } catch (e) { return String(enc); }
+    })()}`);
   const $ERR_STREAM_DESTROYED = (name) => mk(Error, "ERR_STREAM_DESTROYED", `Cannot call ${name} after a stream was destroyed`);
   const $ERR_STREAM_ALREADY_FINISHED = (name) => mk(Error, "ERR_STREAM_ALREADY_FINISHED", `Cannot call ${name} after a stream was finished`);
   const $ERR_STREAM_WRITE_AFTER_END = () => mk(Error, "ERR_STREAM_WRITE_AFTER_END", "write after end");

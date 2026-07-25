@@ -2024,7 +2024,7 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       // synchronous native that has to honour a signal (Bun.spawnSync) cannot
       // run the timer that would fire this signal, so it reads the deadline
       // directly and applies it as its own timeout instead.
-      static timeout(ms) { const s = new AbortSignal(); Object.defineProperty(s, "__mbunAbortAt", { value: Date.now() + (Number(ms) || 0), enumerable: false, configurable: true, writable: true }); if (G.setTimeout) G.setTimeout(() => { s.aborted = true; s.reason = new G.DOMException("The operation timed out", "TimeoutError"); s._fire(); }, ms); return s; }
+      static timeout(ms) { const s = new AbortSignal(); Object.defineProperty(s, "__mbunAbortAt", { value: Date.now() + (Number(ms) || 0), enumerable: false, configurable: true, writable: true }); if (G.setTimeout) G.setTimeout(() => { s.aborted = true; s.reason = new G.DOMException("The operation was aborted due to timeout", "TimeoutError"); s._fire(); }, ms); return s; }
       static any(signals) { const s = new AbortSignal(); for (const sig of signals) { if (sig.aborted) { s.aborted = true; s.reason = sig.reason; return s; } sig.addEventListener("abort", () => { if (!s.aborted) { s.aborted = true; s.reason = sig.reason; s._fire(); } }); } return s; }
       // WebCore AbortSignal::memoryCost() includes m_algorithms.sizeInBytes();
       // mbun's algorithm list is `_l` (std::pair<uint32_t, Function> ≈ 16 bytes

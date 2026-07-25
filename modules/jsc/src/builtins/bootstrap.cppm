@@ -60,7 +60,9 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   // still rejected; message reports typeof for the simplified template.
   const validatePathObject = (o) => {
     if (o === null || typeof o !== "object") {
-      const e = new TypeError('The "pathObject" property must be of type object, got ' + typeof o);
+      // node path._format calls validateObject(pathObject, 'pathObject') ->
+      // ERR_INVALID_ARG_TYPE(name, 'Object', value).
+      const e = nodeArgTypeError("pathObject", "Object", o);
       e.code = "ERR_INVALID_ARG_TYPE";
       throw e;
     }
@@ -612,11 +614,12 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     let resultPromise;
     if (typeof promiseFn === "function") {
       resultPromise = promiseFn();
-      if (!isPromiseLike(resultPromise)) { const e = new TypeError('Expected instance of Promise to be returned from the "promiseFn" function but got ' + insp(resultPromise) + "."); e.code = "ERR_INVALID_RETURN_VALUE"; throw e; }
+      // node ERR_INVALID_RETURN_VALUE reports determineSpecificType(value).
+      if (!isPromiseLike(resultPromise)) { const e = new TypeError('Expected instance of Promise to be returned from the "promiseFn" function but got ' + determineSpecificType(resultPromise) + "."); e.code = "ERR_INVALID_RETURN_VALUE"; throw e; }
     } else if (isPromiseLike(promiseFn)) {
       resultPromise = promiseFn;
     } else {
-      throw argTypeErr("promiseFn", "of type function or an instance of Promise", promiseFn);
+      throw nodeArgTypeError("promiseFn", ["function", "Promise"], promiseFn);
     }
     try { await resultPromise; } catch (e) { return e; }
     return NO_EXC;
@@ -4155,7 +4158,9 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   // node getValidatedPath rejects a path containing a NUL byte with
   // ERR_INVALID_ARG_VALUE (a TypeError). ref lib/internal/fs/utils.js.
   const fsNullErr = (name, value) => { const e = new TypeError("The argument '" + (name || "path") + "' must be a string, Buffer, or URL without null bytes. Received " + fsSpecType(value)); e.code = "ERR_INVALID_ARG_VALUE"; return e; };
-  const fsRangeErr = (name, range, value) => { const e = new RangeError('The value of "' + name + '" is out of range. It must be ' + range + ". Received " + (typeof value === "bigint" ? String(value) + "n" : String(value))); e.code = "ERR_OUT_OF_RANGE"; return e; };
+  // Shared node-exact ERR_OUT_OF_RANGE: the received value picks up node's `_`
+  // numeric separators once |value| > 2**32.
+  const fsRangeErr = (name, range, value) => nodeRangeError(name, range, value);
   // node validateInteger defaults min/max to ±Number.MAX_SAFE_INTEGER — without
   // the upper bound, position = MAX_SAFE_INTEGER + 1 slipped through.
   const fsValidateInteger = (value, name, min = -9007199254740991, max = 9007199254740991) => {
@@ -4828,11 +4833,9 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     let encoding = "utf8";
     if (typeof opts === "string") encoding = opts;
     else if (opts && typeof opts === "object" && opts.encoding != null) encoding = opts.encoding;
-    if (!VALID_ENCODINGS[String(encoding).toLowerCase()]) {
-      const e = new TypeError("The argument 'encoding' is invalid. Received " + JSON.stringify(encoding));
-      e.code = "ERR_INVALID_ARG_VALUE";
-      throw e;
-    }
+    // node assertEncoding: reason 'is invalid encoding', value inspect()-ed.
+    if (!VALID_ENCODINGS[String(encoding).toLowerCase()])
+      throw nodeArgValueError("encoding", encoding, "is invalid encoding");
     const st = F.stat(path2, true); // throws ENOENT (Error) when missing
     if (!(st && st.isDirectory && st.isDirectory())) {
       const e = new Error("ENOTDIR: not a directory, opendir '" + path2 + "'");

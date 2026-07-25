@@ -1387,7 +1387,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
         if (enc === "utf-8" || enc === "utf-16le" || enc === "utf-16be") {
           let i = 0;
           let out = "";
-          const F = () => { const error = new TypeError("The encoded data was not valid for encoding " + enc + "."); error.code = "ERR_ENCODING_INVALID_ENCODED_DATA"; throw error; };
+          const F = () => { const error = new TypeError("The encoded data was not valid for encoding " + enc); error.code = "ERR_ENCODING_INVALID_ENCODED_DATA"; throw error; };
           const serialize = () => {
             if (!this.ignoreBOM && !this._bomSeen && out.length) {
               this._bomSeen = true;
