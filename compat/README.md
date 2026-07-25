@@ -77,6 +77,48 @@ python3 tools/integration/node_corpus_runner.py \
 Measurement data is stored under [`compat/data/`](data/), including test and
 benchmark inventories and native run results.
 
+## Security audit findings (round 10)
+
+A dedicated audit repeated one question across 15 surfaces — *what does this code
+CLAIM to enforce, and what does it actually do?* — and found **six defects
+sharing that shape: a control that reports success while not being applied**.
+**None of them moved a compatibility count**, which is why ordinary corpus work
+would never have surfaced them.
+
+| # | Finding | Severity |
+| --- | --- | --- |
+| 1 | **`Bun.$` was a complete `--permission` sandbox escape** — `Bun.$\`cat /etc/passwd\`` read files, `>` wrote them, and re-exec dropped the sandbox entirely, all while `fs.readFileSync`/`execSync`/`Bun.spawn` were correctly denied | **critical** |
+| 2 | **ChaCha20-Poly1305 accepted a zero-length auth tag** and returned tampered plaintext. Two defects composed: the JS layer read `mode` as `"stream"` so `setAuthTag` skipped its length check, and the native layer skipped `EVP_CTRL_AEAD_SET_TAG` for an empty tag, leaving OpenSSL's taglen at 0 — and `CRYPTO_memcmp(a, b, 0)` compares equal | high |
+| 3 | **`Bun.serve` HTTP request smuggling** — `Content-Length` + `Transfer-Encoding` produced *two* handler invocations on one connection | high |
+| 4 | **Response splitting via `Response.statusText`** — it reached the wire verbatim | high |
+| 5 | **`bun:sqlite` bypassed the fs gates**, including `ATTACH DATABASE` opening a second file from inside a SQL string where a path gate cannot see it | medium-high |
+| 6 | **`Bun.Glob` bypassed the fs read gate** | medium |
+| 7 | **`zlib` `maxOutputLength` did nothing on streams** — the documented defence for untrusted input, unenforced exactly where untrusted input arrives | medium |
+| 8 | **CSPRNG failed open** to `Math.random()` if the native binding were absent | low |
+
+Nine surfaces were checked and found **sound**, with their probes kept so the
+next audit does not redo them: `timingSafeEqual` (measured constant-time),
+`checkServerIdentity` (25/25 RFC 6125 cases), `rejectUnauthorized` (15 live
+bypass attempts against an untrusted CA, all rejected), `vm` realm isolation (17
+escape attempts), `execFile`/`spawn` shell avoidance, path-NUL rejection across
+19 fs APIs, key-class confusion, `structuredClone` detach, and the CSPRNG engine
+itself.
+
+**Two things the audit got right that are worth imitating.** It used bun's own
+`request-smuggling.test.ts` as an independent oracle, and that suite caught its
+first fix being *over-strict* — RFC 9112 §6.3 permits duplicate `Content-Length`
+with identical values, and multiple TE field-lines that combine to a valid list.
+It corrected rather than banking the stricter version. And its first before/after
+used a pre-existing binary from a different `target/<fingerprint>/` and reported
+**64 phantom regressions**; a stale-fingerprint binary is not a baseline.
+
+Left open with reasons: WHATWG IPv4 literal parsing (`0177.0.0.1` →
+`177.0.0.1` where node gives `127.0.0.1`, while `dns.lookup` resolves it to
+loopback — SSRF-relevant, but no end-to-end connect was demonstrated), UTS46
+mapping of U+3002, `aes-*-ccm` being non-functional (fails closed and loudly, so
+a gap rather than a hole), and `tls.rootCertificates` carrying one entry against
+node's ~150.
+
 ## Two corpora, one contract
 
 mbun is measured against **two** upstream corpora: bun's and node's. That
@@ -122,6 +164,13 @@ failure. A real failure alongside a stale marker is still `test-failure`, and a
 non-zero exit still dominates.
 
 ### The rule this gives us
+
+**Maintainer decision (recorded):** where the divergence is a **bun bug**, mbun
+fixes it rather than reproducing it. Compatibility means matching the documented
+contract, not replicating a defect. If fixing it also fixes bun's own test, so
+much the better — that has already happened: the round-10 security audit's
+request-smuggling fix took **bun's own** `request-smuggling.test.ts` from 53 to
+61 passing, the 8 gained being exactly its security assertions.
 
 1. **Node's documented semantics are the blueprint for any `node:*` API**, on
    both corpora. Where bun differs and marks it a bug, mbun follows node.
