@@ -139,6 +139,18 @@ like success:
 warns when sources are newer — **if you see that warning, do not measure**, because
 the run would score the previous binary.
 
+- `latency_probe.py` — asserts an *order of magnitude* on calls that should be
+  trivially fast, so a catastrophic slowdown fails a check instead of hiding in
+  the corpus's timeout bucket. Written after `dns.lookup` was found taking
+  **8011 ms** (3 ms after the fix) — a 2670x defect that moved no compatibility
+  number, because the runner reports pass/fail and an 8-second call only shows up
+  once it crosses a 15-second timeout, where it reads as a hang rather than as
+  latency. `--save` records a baseline; `--baseline` gates on a multiple-x
+  slowdown, which catches regressions while the absolute number is still small
+  and a fixed threshold is blind. Exit 1 = too slow, exit 2 = a probe could not
+  run at all. **Documented limit:** it does not reproduce that dns case itself —
+  see the module docstring for the two probe designs that failed to discriminate
+  and why; those corpus files guard it instead.
 - `smoke_examples.py` — boots each `examples/` app in turn, requests
   `http://127.0.0.1:3000/`, asserts a 2xx, then reaps the whole process tree
   (`bounded_run.BoundedServer`). Sequential by design: the demos all hardcode
@@ -160,6 +172,7 @@ bash tools/integration/tests/test_smoke_examples.sh
 bash tools/integration/tests/test_worktree_setup.sh
 bash tools/integration/tests/test_build_lock.sh
 bash tools/integration/tests/test_check_conflict_markers.sh
+bash tools/integration/tests/test_latency_probe.sh
 bash benchmarks/tools/test-bench3.sh
 ```
 
