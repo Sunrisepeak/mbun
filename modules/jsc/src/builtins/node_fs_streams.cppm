@@ -308,13 +308,34 @@ inline constexpr std::string_view kNodeFsStreamsJS = R"JS(
     configurable: true,
   });
   WriteStream.prototype._construct = _construct;
-  function writeAll(data, size, pos, cb) {
+  // node lib/internal/fs/streams.js writeAll: EAGAIN means "nothing written
+  // yet, try again", NOT a failure — the write is retried (bounded, so a
+  // permanently unready fd cannot spin forever). Reporting it as an error made
+  // a mocked-EAGAIN write stream emit 'error' after ONE call where node calls
+  // write twice and finishes cleanly (test-fs-write-stream-eagain). A write that
+  // lands on an already-destroyed stream is ERR_STREAM_DESTROYED, not a silent
+  // success.
+  const streamDestroyedErr = () => {
+    const e = new Error("Cannot call write after a stream was destroyed");
+    e.code = "ERR_STREAM_DESTROYED";
+    return e;
+  };
+  function writeAll(data, size, pos, cb, retries) {
+    retries = retries || 0;
     this[kFs].write(this.fd, data, 0, size, pos, (er, bytesWritten, buffer) => {
-      if (this.destroyed || er) { cb(er || null); return; }
+      if (er && er.code === "EAGAIN") { er = null; bytesWritten = 0; }
+      if (this.destroyed || er) { cb(er || streamDestroyedErr()); return; }
       this.bytesWritten += bytesWritten;
       if (bytesWritten < size) {
+        const retriesCount = bytesWritten === 0 ? retries + 1 : 0;
+        if (retriesCount > 5) {
+          const e = new Error("write failed");
+          e.code = "ERR_SYSTEM_ERROR";
+          cb(e);
+          return;
+        }
         writeAll.call(this, buffer.subarray(bytesWritten), size - bytesWritten,
-                      pos == null ? null : pos + bytesWritten, cb);
+                      pos == null ? null : pos + bytesWritten, cb, retriesCount);
         return;
       }
       cb();

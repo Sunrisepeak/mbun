@@ -88,7 +88,12 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
             const once = f;
             const prev = impl;
             const index = typeof at === "number" ? at : calls.length;
-            impl = function (...a) { return (calls.length === index ? once : prev).apply(this, a); };
+            // The call record is pushed BEFORE the implementation runs, so the
+            // index of the call in progress is calls.length - 1. Comparing
+            // against calls.length meant the once-implementation was never the
+            // one selected (test-fs-write-stream-eagain's mocked EAGAIN write
+            // silently ran the real fs.write instead).
+            impl = function (...a) { return (calls.length - 1 === index ? once : prev).apply(this, a); };
           },
           resetCalls: () => { calls.length = 0; },
           restore: () => { impl = base; },
@@ -104,11 +109,53 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
         object[name] = fn;
         return fn;
       };
+      // Find the descriptor wherever it actually lives — a stream's `destroyed`
+      // is defined on the prototype, not on the instance.
+      const findDescriptor = (object, name) => {
+        let o = object;
+        while (o != null) {
+          const d = Object.getOwnPropertyDescriptor(o, name);
+          if (d) return d;
+          o = Object.getPrototypeOf(o);
+        }
+        return undefined;
+      };
+      const accessor = (object, name, kind, implementation, options) => {
+        const desc = findDescriptor(object, name);
+        const original = desc && typeof desc[kind] === "function"
+          ? desc[kind]
+          : (kind === "get" ? function () { return desc ? desc.value : undefined; } : function () {});
+        const fn = mockFn(original, implementation, options);
+        const next = {
+          configurable: true,
+          enumerable: desc ? desc.enumerable !== false : true,
+          get: kind === "get" ? fn : (desc && desc.get),
+          set: kind === "set" ? fn : (desc && desc.set),
+        };
+        if (next.get === undefined) delete next.get;
+        if (next.set === undefined) delete next.set;
+        Object.defineProperty(object, name, next);
+        fn.mock.restore = () => {
+          if (desc && Object.getOwnPropertyDescriptor(object, name)) {
+            try { Object.defineProperty(object, name, desc); } catch (e) {}
+          } else {
+            try { delete object[name]; } catch (e) {}
+          }
+        };
+        tracked.push(fn.mock);
+        return fn;
+      };
       return {
         fn: mockFn,
         method,
-        getter: (object, name, implementation, options) => method(object, name, implementation, options),
-        setter: (object, name, implementation, options) => method(object, name, implementation, options),
+        // mock.getter/setter replace an ACCESSOR, so they must go through
+        // defineProperty — assigning object[name] = fn (what `method` does)
+        // either silently fails against a prototype getter or turns the
+        // property into a plain function value. `mock.getter(stream,
+        // 'destroyed', () => true)` was a no-op for exactly that reason
+        // (test-fs-write-stream-eagain).
+        getter: (object, name, implementation, options) => accessor(object, name, "get", implementation, options),
+        setter: (object, name, implementation, options) => accessor(object, name, "set", implementation, options),
         reset: () => { for (const m of tracked) { try { m.resetCalls(); } catch (e) {} } tracked.length = 0; },
         restoreAll: () => { for (const m of tracked) { try { m.restore(); } catch (e) {} } },
         timers: { enable() {}, reset() {}, tick() {}, runAll() {}, setTime() {} },

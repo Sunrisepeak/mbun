@@ -4925,7 +4925,11 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       if (typeof fn !== "function") cbTypeError();
       let res, err = null;
       try { res = fsMod.globSync(pat, (o !== null && typeof o === "object") ? o : undefined); } catch (e) { err = e; }
-      if (err) fn(err); else fn(null, res);
+      // …and it must run on a LATER turn. Called inline it threw straight out
+      // of the caller — at module scope that is a fatal evaluation error, where
+      // node's async glob turns it into an uncaughtException the test is
+      // listening for (test-fs-glob-throw).
+      G.queueMicrotask(() => { if (err) fn(err); else fn(null, res); });
     },
     // fs.readFile went through F.readFile, which UTF-8-decodes and takes only a
     // path: a numeric fd was stringified into a *path* (open '1000'), the

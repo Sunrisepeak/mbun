@@ -82,7 +82,18 @@ JSValueRef proc_spawn_ex_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
                 JSValueRef el{JSObjectGetPropertyAtIndex(ctx, arr, i, nullptr)};
                 StdioSlot s;
                 if (JSValueIsNumber(ctx, el)) {
-                    s = {StdioSlot::Kind::Fd, static_cast<int>(JSValueToNumber(ctx, el, nullptr))};
+                    int rawFd{static_cast<int>(JSValueToNumber(ctx, el, nullptr))};
+                    // A descriptor that came from fs.openSync is one of mbun's
+                    // VIRTUAL fds (numbered from 1000); handing that number to
+                    // dup2 in the child is EBADF. Translate it to the real OS
+                    // descriptor the same way every other fd binding does
+                    // (test-fs-syncwritestream spawns a child with
+                    // stdio: ['inherit', fd, fd]).
+                    if (auto it{fd_table().find(rawFd)};
+                        it != fd_table().end() && it->second.is_open()) {
+                        rawFd = it->second.native_fd();
+                    }
+                    s = {StdioSlot::Kind::Fd, rawFd};
                 } else {
                     const std::string k{val_to_string(ctx, el)};
                     s.kind = k == "ignore"    ? StdioSlot::Kind::Ignore
