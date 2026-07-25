@@ -2384,6 +2384,9 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
     getTimerDuration,
     kConnectionsCheckingInterval, kServerResponse, kIncomingMessage,
     parsersFreeList, freeParser, clearIncoming,
+    // js_net's server transport needs node's exact abort error for
+    // socketOnClose -> abortIncoming/abortOutgoing.
+    ConnResetException,
   };
 })();
 )JS";
