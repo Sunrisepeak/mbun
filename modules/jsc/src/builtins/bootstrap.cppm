@@ -4160,10 +4160,18 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     if (ins.length > 28) ins = ins.slice(0, 25) + "...";
     return "type " + typeof v + " (" + ins + ")";
   };
-  const fsArgTypeErr = (name, expected, value) => { const e = new TypeError('The "' + name + '" argument must be ' + expected + ". Received " + fsSpecType(value)); e.code = "ERR_INVALID_ARG_TYPE"; return e; };
+  // A dotted name reads "property", not "argument" (node validateFunction on
+  // options.fs.open et al.) — ref internal/errors.js ERR_INVALID_ARG_TYPE.
+  // nodeErrToString is what makes `assert.throws(fn, /TypeError \[ERR_…\]/)`
+  // match: every NodeError overrides toString() as `${name} [${code}]: ${msg}`.
+  const fsArgTypeErr = (name, expected, value) => { const e = new TypeError('The "' + name + '" ' + (String(name).indexOf(".") !== -1 ? "property" : "argument") + " must be " + expected + ". Received " + fsSpecType(value)); e.code = "ERR_INVALID_ARG_TYPE"; return nodeErrToString(e, "ERR_INVALID_ARG_TYPE"); };
   // node getValidatedPath rejects a path containing a NUL byte with
   // ERR_INVALID_ARG_VALUE (a TypeError). ref lib/internal/fs/utils.js.
-  const fsNullErr = (name, value) => { const e = new TypeError("The argument '" + (name || "path") + "' must be a string, Buffer, or URL without null bytes. Received " + fsSpecType(value)); e.code = "ERR_INVALID_ARG_VALUE"; return e; };
+  const fsNullErr = (name, value) => { const e = new TypeError("The argument '" + (name || "path") + "' must be a string, Buffer, or URL without null bytes. Received " + fsSpecType(value)); e.code = "ERR_INVALID_ARG_VALUE"; return nodeErrToString(e, "ERR_INVALID_ARG_VALUE"); };
+  // node ERR_INVALID_URL_SCHEME (internal/url.js fileURLToPath): a URL handed to
+  // an fs API must be a file: URL. Before this a http: URL fell through to the
+  // String-coercion branch and surfaced as ERR_INVALID_ARG_TYPE.
+  const fsUrlSchemeErr = () => { const e = new TypeError("The URL must be of scheme file"); e.code = "ERR_INVALID_URL_SCHEME"; return nodeErrToString(e, "ERR_INVALID_URL_SCHEME"); };
   // Shared node-exact ERR_OUT_OF_RANGE: the received value picks up node's `_`
   // numeric separators once |value| > 2**32.
   const fsRangeErr = (name, range, value) => nodeRangeError(name, range, value);
@@ -4205,6 +4213,9 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       }
       if (p.href !== undefined && p.protocol === "file:" && typeof p.pathname === "string") { // URL
         try { str = decodeURIComponent(p.pathname); } catch (e) { str = p.pathname; }
+      } else if (p.href !== undefined && typeof p.protocol === "string" && typeof p.pathname === "string"
+                 && typeof p.searchParams === "object") { // a URL of some other scheme
+        throw fsUrlSchemeErr();
       } else {
         // A String object / subclass (e.g. bun's DisposableString from tempDir())
         // is a valid path — node's getValidatedPath coerces it. String.prototype
@@ -4496,6 +4507,16 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   const fsOomError = (path2) =>
     Object.assign(new Error("ENOMEM: not enough memory, read '" + path2 + "'"),
                   { code: "ENOMEM", errno: -12, syscall: "read", path: path2 });
+  // node kIoMaxLength (2**31-1): readFile/readFileSync refuse a file larger than
+  // that with ERR_FS_FILE_TOO_LARGE *before* allocating anything. Without it the
+  // read-to-EOF growth loop tried to buffer the whole file and was OOM-killed
+  // (test-fs-readfile).
+  const kIoMaxLength = 2147483647;
+  const fsFileTooLarge = (size) => {
+    const e = new RangeError("File size (" + size + ") is greater than 2 GiB");
+    e.code = "ERR_FS_FILE_TOO_LARGE";
+    return nodeErrToString(e, "ERR_FS_FILE_TOO_LARGE");
+  };
   // node readdir honors options.encoding: 'buffer' yields Buffer entries, any
   // other non-utf8 encoding yields the names re-encoded (e.g. 'hex'). ref
   // lib/fs.js readdir + test-fs-buffer.
@@ -4580,7 +4601,12 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       const fd = isFd ? p : FD.open(path2, flag, 0o666);
       const cap = fsOomCap(enc);
       try {
-        let size = (!isFd && F.stat(path2) && F.stat(path2).size) | 0;
+        let size = 0;
+        if (!isFd) { const st0 = F.stat(path2); size = st0 ? Number(st0.size) : 0; }
+        // The check must precede the `| 0` truncation below: a 2 GiB + 1 file
+        // wrapped to a small (or negative) int32 and read to EOF instead.
+        if (size > kIoMaxLength) throw fsFileTooLarge(size);
+        size = size | 0;
         if (size <= 0) size = 65536;  // procfs / char devices report st_size 0 — read to EOF
         if (size > cap) throw fsOomError(path2);
         let u = new Uint8Array(size);
@@ -4668,7 +4694,10 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     // handleErrorFromBinding is skipped). Only ENOENT/ENOTDIR are swallowed —
     // every other errno still throws, as node's binding does.
     statSync: (p, o) => { validatePath(p); const s = fsStatOrNoEntry(() => F.stat(toStr(p)), o); return s === undefined ? undefined : ((o && o.bigint) ? mkBigIntStats(s) : fsAsStats(s)); },
-    lstatSync: (p, o) => { validatePath(p); const s = fsStatOrNoEntry(() => F.stat(toStr(p), true), o); return s === undefined ? undefined : ((o && o.bigint) ? mkBigIntStats(s) : fsAsStats(s)); },
+    // The native row is one `stat(path, lstat)` entry, so its errors name the
+    // syscall "stat" even for lstat. node reports the syscall the caller asked
+    // for (test-fs-error-messages compares the whole message), so relabel it.
+    lstatSync: (p, o) => { validatePath(p); const s = fsStatOrNoEntry(() => { try { return F.stat(toStr(p), true); } catch (e) { throw (e && e.code && e.syscall === "stat" && FS_ERRNO[e.code]) ? fsErr(e.code, "lstat", toStr(p)) : e; } }, o); return s === undefined ? undefined : ((o && o.bigint) ? mkBigIntStats(s) : fsAsStats(s)); },
     fstatSync: (fd, o) => { const s = F.fstat(fd); return (o && o.bigint) ? mkBigIntStats(s) : fsAsStats(s); },
     fstat: (fd, o, cb) => { const fn = cb || o; if (typeof fn === "function") fn(null, fsMod.fstatSync(fd)); },
     statfsSync: () => ({ type: 0, bsize: 4096, blocks: 0, bfree: 0, bavail: 0, files: 0, ffree: 0 }),
@@ -4781,7 +4810,17 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       }
       return out;
     },
-    glob: (pat, o, cb) => { const fn = typeof o === "function" ? o : cb; if (typeof fn !== "function") throw new TypeError("The \"callback\" argument must be of type function."); try { fn(null, fsMod.globSync(pat, typeof o === "object" ? o : undefined)); } catch (e) { fn(e); } },
+    // The callback must be invoked EXACTLY once: it used to run inside the try
+    // that also wrapped globSync, so a callback that threw was called a second
+    // time with its own error instead of the throw reaching uncaughtException
+    // (test-fs-glob-throw).
+    glob: (pat, o, cb) => {
+      const fn = typeof o === "function" ? o : cb;
+      if (typeof fn !== "function") cbTypeError();
+      let res, err = null;
+      try { res = fsMod.globSync(pat, (o !== null && typeof o === "object") ? o : undefined); } catch (e) { err = e; }
+      if (err) fn(err); else fn(null, res);
+    },
     // fs.readFile went through F.readFile, which UTF-8-decodes and takes only a
     // path: a numeric fd was stringified into a *path* (open '1000'), the
     // encoding option was ignored, and the callback ran synchronously. Now it
@@ -4945,7 +4984,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     if (!VALID_ENCODINGS[String(enc).toLowerCase()])
       throw nodeArgValueError("encoding", enc, "is invalid encoding");
   };
-  const cbTypeError = () => { const e = new TypeError('The "callback" argument must be of type function.'); e.code = "ERR_INVALID_ARG_TYPE"; throw e; };
+  const cbTypeError = () => { const e = new TypeError('The "callback" argument must be of type function.'); e.code = "ERR_INVALID_ARG_TYPE"; throw nodeErrToString(e, "ERR_INVALID_ARG_TYPE"); };
   class Dir {
     constructor(path, entries, encoding) {
       // node's Dir constructor is not usable from userland: `new fs.Dir()`
@@ -5096,7 +5135,18 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   // ERR_INVALID_ARG_TYPE, an out-of-range one ERR_OUT_OF_RANGE.
   const fsValidCopyMode = (m) => (m == null ? 0 : fsValidateInteger(m, "mode", 0, 7));
   const fsValidAccessMode = (m) => (m == null ? 0 : fsValidateInteger(m, "mode", 0, 7));
-  fsMod.copyFileSync = (a, b, m) => { validatePath(a, "src"); validatePath(b, "dest"); fsValidCopyMode(m); return F.copyFile(toStr(a), toStr(b)); };
+  // node CopyFile honours the mode flags: COPYFILE_EXCL (1) fails EEXIST when
+  // dest exists. The native row takes no mode, so the flag is enforced here and
+  // every native failure is re-shaped with syscall 'copyfile' + path/dest (the
+  // corpus compares "EEXIST: file already exists, copyfile 'src' -> 'dest'").
+  const fsCopyFileImpl = (a, b, m) => {
+    const mode = fsValidCopyMode(m);
+    const s = toStr(a), d = toStr(b);
+    if ((mode & 1) !== 0 && F.exists(d)) throw fsErr("EEXIST", "copyfile", s, d);
+    try { return F.copyFile(s, d); }
+    catch (e) { throw (e && e.code && FS_ERRNO[e.code]) ? fsErr(e.code, "copyfile", s, d) : e; }
+  };
+  fsMod.copyFileSync = (a, b, m) => { validatePath(a, "src"); validatePath(b, "dest"); return fsCopyFileImpl(a, b, m); };
   fsMod.stat = (p, a, b) => { validatePath(p); const cb = fsMakeCallback(typeof a === "function" ? a : b); try { cb(null, fsMod.statSync(p, typeof a === "object" ? a : undefined)); } catch (e) { cb(e); } };
   fsMod.lstat = (p, a, b) => { validatePath(p); const cb = fsMakeCallback(typeof a === "function" ? a : b); try { cb(null, fsMod.lstatSync(p, typeof a === "object" ? a : undefined)); } catch (e) { cb(e); } };
   fsMod.fstatSync = (fd, o) => { fsValidateFd(fd); const s = fsStatOrNoEntry(() => F.fstat(fd), o); return s === undefined ? undefined : ((o && o.bigint) ? mkBigIntStats(s) : fsAsStats(s)); };
@@ -5122,6 +5172,42 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   fsMod.realpath = wrapPath(fsMod.realpath, validatePath);
   fsMod.realpathSync.native = fsMod.realpathSync;
   fsMod.symlinkSync = wrapPath(fsMod.symlinkSync, validatePath);
+  // ---- fs.access / fs.accessSync (node lib/fs.js access, uv_fs_access) ----
+  // The old shim only asked "does the path exist?", so W_OK on a 0o444 file
+  // succeeded and the reported error carried neither syscall nor path
+  // (test-fs-access). R_OK/W_OK/X_OK are exactly the POSIX rwx bits, so the
+  // check is the stat mode triad selected by euid/egid — the same answer
+  // access(2) gives for the single-group case.
+  const fsAccessCheck = (p, mode) => {
+    const path2 = toStr(p);
+    let st;
+    try { st = F.stat(path2); } catch (e) { throw (e && e.code && FS_ERRNO[e.code]) ? fsErr(e.code, "access", path2) : fsErr("ENOENT", "access", path2); }
+    const m = mode == null ? 0 : Number(mode);
+    if (m === 0) return;
+    const stMode = Number(st.mode);
+    const uid = (G.process && typeof G.process.getuid === "function") ? G.process.getuid() : -1;
+    const gid = (G.process && typeof G.process.getgid === "function") ? G.process.getgid() : -1;
+    if (uid === 0) {
+      // root bypasses r/w; x still needs at least one execute bit set.
+      if ((m & 1) !== 0 && (stMode & 0o111) === 0) throw fsErr("EACCES", "access", path2);
+      return;
+    }
+    let bits;
+    if (Number(st.uid) === uid) bits = (stMode >> 6) & 7;
+    else if (Number(st.gid) === gid) bits = (stMode >> 3) & 7;
+    else bits = stMode & 7;
+    if ((m & ~bits) !== 0) throw fsErr("EACCES", "access", path2);
+  };
+  fsMod.accessSync = (p, mode) => { validatePath(p); fsValidAccessMode(mode); fsAccessCheck(p, mode); };
+  fsMod.access = (p, mode, cb) => {
+    validatePath(p);
+    const fn = fsMakeCallback(typeof mode === "function" ? mode : cb);
+    const m = typeof mode === "function" ? 0 : mode;
+    fsValidAccessMode(m);
+    let err = null;
+    try { fsAccessCheck(p, m); } catch (e) { err = e; }
+    G.queueMicrotask(() => fn(err));
+  };
   // node only exposes lchmod/lchmodSync on platforms with the lchmod(2) syscall
   // (macOS / constants.O_SYMLINK defined). On Linux they are undefined and the
   // corpus guards on `if (fs.lchmod)`; a no-op stub would wrongly run those
@@ -5161,7 +5247,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     if (ins === undefined) ins = String(value);
     const e = new TypeError("The argument '" + name + "' " + reason + ". Received " + ins);
     e.code = "ERR_INVALID_ARG_VALUE";
-    return e;
+    return nodeErrToString(e, "ERR_INVALID_ARG_VALUE");
   };
   // node validatePosition / validateOffsetLengthRead|Write (lib/internal/fs/utils.js).
   const fsValidatePositionRead = (position, name, length) => {
@@ -5418,7 +5504,8 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     if (typeof m !== "function") fsValidCopyMode(m);
     const fn = typeof m === "function" ? m : cb;
     fsMakeCallback(fn);
-    G.queueMicrotask(() => { try { F.copyFile(toStr(a), toStr(b)); fn(null); } catch (e) { fn(e); } });
+    const mode = typeof m === "function" ? 0 : m;
+    G.queueMicrotask(() => { try { fsCopyFileImpl(a, b, mode); fn(null); } catch (e) { fn(e); } });
   };
   // node symlink type: "dir" | "file" | "junction" (or null/undefined).
   // Anything else is ERR_INVALID_ARG_VALUE, checked after the two paths.
@@ -5612,6 +5699,18 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     new Promise((resolve, reject) => {
       fsMod.write(...a, (err, bytesWritten, buf) =>
         err ? reject(err) : resolve({ bytesWritten, buffer: buf }));
+    });
+  // fs.readv/fs.writev carry kCustomPromisifyArgs too (['bytesRead','buffers'] /
+  // ['bytesWritten','buffers']) — ref lib/fs.js (test-fs-readv-promisify).
+  fsMod.readv[kPromisifyCustom] = (...a) =>
+    new Promise((resolve, reject) => {
+      fsMod.readv(...a, (err, bytesRead, buffers) =>
+        err ? reject(err) : resolve({ bytesRead, buffers }));
+    });
+  fsMod.writev[kPromisifyCustom] = (...a) =>
+    new Promise((resolve, reject) => {
+      fsMod.writev(...a, (err, bytesWritten, buffers) =>
+        err ? reject(err) : resolve({ bytesWritten, buffers }));
     });
   // fs.exists' callback takes (exists) with no error slot.
   fsMod.exists[kPromisifyCustom] = (p) => new Promise((resolve) => fsMod.exists(p, resolve));
