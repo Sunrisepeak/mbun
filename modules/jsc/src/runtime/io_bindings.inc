@@ -681,25 +681,63 @@ JSValueRef fsn_readFile_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size
     if (auto c{read_file(path)}) return make_string(ctx, *c);
     return fs_throw(ctx, exc, "ENOENT: no such file or directory, open '" + path + "'");
 }
+// Whole-file write behind fs.writeFileSync / fs.appendFileSync. It used to be a
+// std::ofstream whose write() result was never inspected, so a SHORT write was
+// silently reported as success: with RLIMIT_FSIZE set, writeFileSync wrote as
+// many bytes as the limit allowed and returned normally, where node throws
+// "EFBIG: file too large, write" (test-fs-write-sigxfsz). open/write also give
+// the real errno for the open failure, instead of a blanket EACCES.
+JSValueRef fs_write_whole(JSContextRef ctx, JSValueRef* exc, const std::string& path,
+                          const std::string& data, bool append) {
+#if defined(_WIN32)
+    std::ofstream f{std::filesystem::path{path},
+                    std::ios::binary | (append ? std::ios::app : std::ios::trunc)};
+    if (!f) return fs_throw(ctx, exc, "EACCES: permission denied, open '" + path + "'");
+    f.write(data.data(), static_cast<std::streamsize>(data.size()));
+    f.flush();
+    if (!f) return fs_throw(ctx, exc, "EIO: i/o error, write");
+    return JSValueMakeUndefined(ctx);
+#else
+    const int flags{O_WRONLY | O_CREAT | (append ? O_APPEND : O_TRUNC)};
+    const int fd{::open(path.c_str(), flags, 0666)};
+    if (fd < 0) {
+        const int e{errno};
+        const std::string code{fd_errno_code(e)};
+        return fs_throw(ctx, exc, (code.empty() ? std::string{"EACCES"} : code) + ": "
+                                      + fd_errno_message(e) + ", open '" + path + "'");
+    }
+    std::size_t off{0};
+    while (off < data.size()) {
+        const ssize_t n{::write(fd, data.data() + off, data.size() - off)};
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            const int e{errno};
+            ::close(fd);
+            const std::string code{fd_errno_code(e)};
+            // node's write error names no path (uv_fs_write is fd-level).
+            return fs_throw(ctx, exc, (code.empty() ? std::string{"EIO"} : code) + ": "
+                                          + fd_errno_message(e) + ", write");
+        }
+        if (n == 0) break;
+        off += static_cast<std::size_t>(n);
+    }
+    ::close(fd);
+    return JSValueMakeUndefined(ctx);
+#endif
+}
 JSValueRef fsn_writeFile_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                             const JSValueRef args[], JSValueRef* exc) {
     std::string path{fs_arg(ctx, argc, args, 0)};
     if (permission_deny_fs(ctx, exc, path, true)) return JSValueMakeUndefined(ctx);
     std::string data{fs_arg(ctx, argc, args, 1)};
-    std::ofstream f{std::filesystem::path{path}, std::ios::binary | std::ios::trunc};
-    if (!f) return fs_throw(ctx, exc, "EACCES: cannot write '" + path + "'");
-    f.write(data.data(), static_cast<std::streamsize>(data.size()));
-    return JSValueMakeUndefined(ctx);
+    return fs_write_whole(ctx, exc, path, data, /*append=*/false);
 }
 JSValueRef fsn_appendFile_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                              const JSValueRef args[], JSValueRef* exc) {
     std::string path{fs_arg(ctx, argc, args, 0)};
     if (permission_deny_fs(ctx, exc, path, true)) return JSValueMakeUndefined(ctx);
     std::string data{fs_arg(ctx, argc, args, 1)};
-    std::ofstream f{std::filesystem::path{path}, std::ios::binary | std::ios::app};
-    if (!f) return fs_throw(ctx, exc, "EACCES: cannot append '" + path + "'");
-    f.write(data.data(), static_cast<std::streamsize>(data.size()));
-    return JSValueMakeUndefined(ctx);
+    return fs_write_whole(ctx, exc, path, data, /*append=*/true);
 }
 JSValueRef fsn_exists_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                          const JSValueRef args[], JSValueRef* exc) {

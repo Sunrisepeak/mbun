@@ -4720,8 +4720,21 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       if (ArrayBuffer.isView(d)) u = new Uint8Array(d.buffer, d.byteOffset, d.byteLength);
       else if (d instanceof ArrayBuffer) u = new Uint8Array(d);
       else { const b = Buffer.from(toStr(d), enc === "buffer" ? "utf8" : enc); u = new Uint8Array(b.buffer, b.byteOffset, b.byteLength); }
+      // node's writeFileSync LOOPS until every byte is out (lib/fs.js
+      // writeFileSync: `while (remaining > 0)`). A single FD.write whose short
+      // return value is discarded reports success after a partial write — with
+      // RLIMIT_FSIZE set it wrote what fit and returned normally, where node
+      // throws EFBIG on the next write (test-fs-write-sigxfsz).
+      const writeAll = (dfd) => {
+        let woff = 0;
+        while (woff < u.byteLength) {
+          const n = FD.write(dfd, u, woff, u.byteLength - woff, -1);
+          if (!(n > 0)) break;
+          woff += n;
+        }
+      };
       if (typeof p === "number") {
-        if (u.byteLength) FD.write(p, u, 0, u.byteLength, -1);
+        if (u.byteLength) writeAll(p);
         // A caller-supplied descriptor is never ours to close (second argument
         // false), so the flush hook must not close it either.
         if (__onFd !== undefined) __onFd(p, false);
@@ -4732,7 +4745,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       const fd = FD.open(path2, flag, mode == null ? 0o666 : mode);
       let keep = false;
       try {
-        if (u.byteLength) FD.write(fd, u, 0, u.byteLength, -1);
+        if (u.byteLength) writeAll(fd);
         // Dispatch through fsMod so `t.mock.method(fs, 'fsyncSync')` sees the
         // call (node's writeFileSync flushes through the same public binding).
         if (__onFd !== undefined) keep = __onFd(fd, true) === true;
@@ -5501,6 +5514,13 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     catch (e) { err = e; n = 0; }
     G.queueMicrotask(() => callback(err, n, buffer));
   };
+  // node lib/fs.js write/writeSync: a hex-encoded string of odd length cannot
+  // be decoded, and node rejects it up front rather than writing half of it
+  // (ERR_INVALID_ARG_VALUE, nodejs/node#38168).
+  const fsValidateStringEncoding = (data, encoding) => {
+    if (encoding === "hex" && typeof data === "string" && data.length % 2 !== 0)
+      throw fsArgValueErr("encoding", encoding, "is invalid for data of length " + data.length);
+  };
   fsMod.writeSync = function writeSync(fd, buffer, offsetOrOptions, length, position) {
     fsValidateFd(fd);
     let offset = offsetOrOptions;
@@ -5523,6 +5543,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       throw fsArgTypeErr("buffer", "of type string or an instance of Buffer, TypedArray, or DataView", buffer);
     const enc = typeof length === "string" ? length : "utf8";
     fsValidateEncoding(enc);
+    fsValidateStringEncoding(buffer, enc);
     const b = Buffer.from(buffer, enc);
     const pos = typeof offset === "number" ? offset : null;
     return globalThis.__mbunFdNative.write(fd, b, 0, b.byteLength, pos == null ? -1 : pos);
@@ -5557,6 +5578,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     fsMakeCallback(cb);
     if (typeof buffer !== "string")
       throw fsArgTypeErr("buffer", "of type string or an instance of Buffer, TypedArray, or DataView", buffer);
+    fsValidateStringEncoding(buffer, typeof enc === "string" ? enc : "utf8");
     const b = Buffer.from(buffer, typeof enc === "string" ? enc : "utf8");
     let n = 0, err = null;
     try { n = globalThis.__mbunFdNative.write(fd, b, 0, b.byteLength, spos == null ? -1 : spos); }
