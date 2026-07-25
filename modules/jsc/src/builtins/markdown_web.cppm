@@ -2018,7 +2018,23 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       removeEventListener(t, cb) { if (t !== "abort") return; this._l = this._l.filter((x) => x.cb !== cb); }
       dispatchEvent(e) { if (e && e.type === "abort") this._fire(); return true; }
       throwIfAborted() { if (this.aborted) throw this.reason || new G.DOMException("signal is aborted without reason", "AbortError"); }
-      _fire() { const ev = { type: "abort", target: this }; if (typeof this.onabort === "function") this.onabort.call(this, ev); for (const r of this._l.slice()) { if (r.once) this.removeEventListener("abort", r.cb); r.cb.call(this, ev); } }
+      // A listener that throws must NOT abort the dispatch or escape into
+      // abort()'s caller: node's EventTarget reports it as an uncaught
+      // exception on the next tick and carries on with the remaining
+      // listeners (internal/event_target.js emitUncaughtException).
+      _fire() {
+        const ev = { type: "abort", target: this };
+        const report = (err) => {
+          const p = G.process;
+          if (p && typeof p.nextTick === "function") p.nextTick(() => { throw err; });
+          else throw err;
+        };
+        if (typeof this.onabort === "function") { try { this.onabort.call(this, ev); } catch (err) { report(err); } }
+        for (const r of this._l.slice()) {
+          if (r.once) this.removeEventListener("abort", r.cb);
+          try { r.cb.call(this, ev); } catch (err) { report(err); }
+        }
+      }
       static abort(reason) { const s = new AbortSignal(); s.aborted = true; s.reason = reason !== undefined ? reason : new G.DOMException("The operation was aborted.", "AbortError"); return s; }
       // `__mbunAbortAt` records the deadline as a wall-clock instant. A purely
       // synchronous native that has to honour a signal (Bun.spawnSync) cannot
