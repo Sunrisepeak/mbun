@@ -244,6 +244,13 @@ inline constexpr std::string_view kNodeNetJS = R"JS(
             address: String(ad), port: p, addressType: this.type, fd: undefined,
             flags: ipv6Only ? 1 : 0,
           }, (err, handle) => {
+            // node lib/dgram.js: a socket closed while the bind was in flight no
+            // longer needs the handle the primary just sent — close it and stop
+            // (test-dgram-cluster-close-during-bind).
+            if (self._closed) {
+              if (handle && typeof handle.close === "function") { try { handle.close(); } catch (e) {} }
+              return;
+            }
             if (err || !handle || typeof handle.fd !== "number" || handle.fd < 0) {
               G.queueMicrotask(() => self.emit("error", mkE("bind " + (err || "EADDRINUSE"), typeof err === "string" ? err : "EADDRINUSE")));
               return;
