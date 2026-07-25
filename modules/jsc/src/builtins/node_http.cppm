@@ -52,6 +52,30 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
   const nextTick = (fn, ...a) => (G.process && G.process.nextTick)
     ? G.process.nextTick(fn, ...a) : G.queueMicrotask(() => fn(...a));
 
+  // ---- built-in http diagnostics channels ----
+  // node lib/_http_client.js / lib/_http_server.js resolve these once at module
+  // load, but this partition is assembled BEFORE node:diagnostics_channel is
+  // registered, so the lookup is memoised on first use instead. Everything that
+  // reads it runs per-request, long after the whole image has loaded.
+  const kNoDC = { hasSubscribers: false, publish() {} };
+  let httpDCCache = null;
+  const httpDC = () => {
+    if (httpDCCache !== null) return httpDCCache;
+    const d = M["diagnostics_channel"] || M["node:diagnostics_channel"];
+    if (!d || typeof d.channel !== "function") {
+      return { clientRequestCreated: kNoDC, clientRequestStart: kNoDC, clientRequestError: kNoDC,
+               clientResponseFinish: kNoDC, serverResponseCreated: kNoDC };
+    }
+    httpDCCache = {
+      clientRequestCreated: d.channel("http.client.request.created"),
+      clientRequestStart: d.channel("http.client.request.start"),
+      clientRequestError: d.channel("http.client.request.error"),
+      clientResponseFinish: d.channel("http.client.response.finish"),
+      serverResponseCreated: d.channel("http.server.response.created"),
+    };
+    return httpDCCache;
+  };
+
   // -------------------------------------------------- node error factories
   // internal/errors.js message templates, reproduced verbatim so assert.throws
   // shapes ({ code, name, message }) match upstream.
@@ -858,6 +882,10 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
       this.useChunkedEncodingByDefault = chunkExpression.test(reqMsg.headers.te);
       this.shouldKeepAlive = false;
     }
+    // node lib/_http_server.js: the ServerResponse constructor's last act is to
+    // publish 'http.server.response.created' with the request it answers.
+    const ch = httpDC().serverResponseCreated;
+    if (ch.hasSubscribers) ch.publish({ request: reqMsg, response: this });
   }
   Object.setPrototypeOf(ServerResponse.prototype, OutgoingMessage.prototype);
   Object.setPrototypeOf(ServerResponse, OutgoingMessage);
@@ -1714,11 +1742,34 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
         }
       }
     }
+    // node lib/_http_client.js: the last statement of the ClientRequest
+    // constructor announces the request on 'http.client.request.created'.
+    {
+      const ch = httpDC().clientRequestCreated;
+      if (ch.hasSubscribers) ch.publish({ request: this });
+    }
   }
   Object.setPrototypeOf(ClientRequest.prototype, OutgoingMessage.prototype);
   Object.setPrototypeOf(ClientRequest, OutgoingMessage);
+  // node ClientRequest.prototype._finish: the request message is complete and on
+  // its way, which is what 'http.client.request.start' reports.
+  ClientRequest.prototype._finish = function _finish() {
+    OutgoingMessage.prototype._finish.call(this);
+    // _flush() re-enters _finish for an already-finished message, so the publish
+    // is latched: node reports one 'start' per request, not per flush.
+    if (this._dcStartPublished) return;
+    this._dcStartPublished = true;
+    const ch = httpDC().clientRequestStart;
+    if (ch.hasSubscribers) ch.publish({ request: this });
+  };
 
-  function emitErrorEvent(request, error) { request.emit("error", error); }
+  // node lib/_http_client.js emitErrorEvent: 'http.client.request.error' is
+  // published for every client-side request error, ahead of the 'error' event.
+  function emitErrorEvent(request, error) {
+    const ch = httpDC().clientRequestError;
+    if (ch.hasSubscribers) ch.publish({ request, error });
+    request.emit("error", error);
+  }
 
   Object.defineProperty(ClientRequest.prototype, "path", {
     get() { return this[kPath]; },
@@ -1877,6 +1928,12 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
         ? connHdr.indexOf("close") === -1 : connHdr.indexOf("keep-alive") !== -1;
       if (request.shouldKeepAlive && !peerKeepAlive && !request.upgradeOrConnect) {
         request.shouldKeepAlive = false;
+      }
+      // node parserOnIncomingClient: 'http.client.response.finish' fires once the
+      // response head has been parsed, before the 'response' event.
+      {
+        const ch = httpDC().clientResponseFinish;
+        if (ch.hasSubscribers) ch.publish({ request, response: res });
       }
       res.req = request;
       res.on("end", responseOnEnd);

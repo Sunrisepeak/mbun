@@ -391,6 +391,10 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
     }
     const transport = new NetSocket({ allowHalfOpen: false });
     const tlsSock = new TLSSocket(transport, tlsOpts);
+    // node's TLSSocket is itself the socket that connects, so the
+    // 'net.client.socket' diagnostics channel reports the TLSSocket. mbun keeps
+    // the transport Socket separate; point the channel at the TLSSocket.
+    transport._dcClientSocket = tlsSock;
     if (cb) tlsSock.once("secureConnect", cb);
     // A unix-socket/pipe target has a path instead of a port (node net.connect
     // dispatches on the same distinction).

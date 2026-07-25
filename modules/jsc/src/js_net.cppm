@@ -45,6 +45,21 @@ export constexpr std::string_view kNetJS = R"JS(
     Promise.withResolvers = function () { let resolve, reject; const promise = new Promise((res, rej) => { resolve = res; reject = rej; }); return { promise, resolve, reject }; };
   }
 
+  // ---- built-in net diagnostics channels (node lib/net.js) ----
+  // Resolved once at module load; every publish is gated on hasSubscribers so an
+  // unsubscribed channel costs one property read per connection.
+  const __dc = M["diagnostics_channel"] || M["node:diagnostics_channel"];
+  const kNoDC = { hasSubscribers: false, publish() {} };
+  const netClientSocketChannel = (__dc && typeof __dc.channel === "function") ? __dc.channel("net.client.socket") : kNoDC;
+  const netServerSocketChannel = (__dc && typeof __dc.channel === "function") ? __dc.channel("net.server.socket") : kNoDC;
+  const netServerListen = (__dc && typeof __dc.tracingChannel === "function")
+    ? __dc.tracingChannel("net.server.listen")
+    : { hasSubscribers: false, asyncStart: kNoDC, asyncEnd: kNoDC, error: kNoDC };
+  // node lib/_http_server.js: the server half of the http diagnostics channels
+  // (the client half lives with ClientRequest in the node_http partition).
+  const onRequestStartChannel = (__dc && typeof __dc.channel === "function") ? __dc.channel("http.server.request.start") : kNoDC;
+  const onResponseFinishChannel = (__dc && typeof __dc.channel === "function") ? __dc.channel("http.server.response.finish") : kNoDC;
+
   // ---- byte helpers (bytes cross the native boundary as base64) ----
   const u8 = (d) => (d == null ? new Uint8Array(0) : typeof d === "string" ? te.encode(d) : d instanceof Uint8Array ? d : ArrayBuffer.isView(d) ? new Uint8Array(d.buffer, d.byteOffset, d.byteLength) : d instanceof ArrayBuffer ? new Uint8Array(d) : d._u8 instanceof Uint8Array ? d._u8 : te.encode(String(d)));
   const toB64 = (b) => { let s = ""; for (let i = 0; i < b.length; i += 4096) s += String.fromCharCode.apply(null, b.subarray(i, i + 4096)); return G.btoa(s); };
@@ -237,6 +252,15 @@ export constexpr std::string_view kNetJS = R"JS(
       return this;
     }
     connect(...a) {
+      // node Socket.prototype.connect announces the socket on
+      // 'net.client.socket' before it does anything else with the arguments, so
+      // every creation path (net.connect / net.createConnection / new
+      // net.Socket().connect / tls.connect) reports. node's TLSSocket *is* the
+      // connecting socket; mbun's wraps a hidden transport Socket, so tls.connect
+      // points `_dcClientSocket` at the TLSSocket the caller actually holds
+      // (test-diagnostics-channel-net-client-socket-tls asserts
+      // `socket instanceof tls.TLSSocket`).
+      if (netClientSocketChannel.hasSubscribers) netClientSocketChannel.publish({ socket: this._dcClientSocket || this });
       // ---- node net.js argument validation (Socket.prototype.connect) ----
       const nErr = (Ctor, code, msg) => { const e = new Ctor(msg); e.code = code; return e; };
       const optArg = (typeof a[0] === "object" && a[0] !== null && !Array.isArray(a[0])) ? a[0] : null;
@@ -792,6 +816,18 @@ export constexpr std::string_view kNetJS = R"JS(
         else if (typeof a[0] === "function") cb = a[0];
         for (let i = 1; i < a.length; i++) { if (typeof a[i] === "string") host = a[i]; else if (typeof a[i] === "function") cb = a[i]; }
       }
+      // node Server.prototype.listen publishes the 'net.server.listen' tracing
+      // channel's asyncStart with the NORMALIZED options object — for the
+      // options form that is the caller's own object, so a subscriber sees any
+      // extra property it carried (test-diagnostics-channel-net reads
+      // `options.customOption`). asyncEnd follows a successful bind+listen and
+      // error a failed one (both below, per bind path).
+      if (netServerListen.hasSubscribers) {
+        const dcOptions = (typeof a[0] === "object" && a[0] !== null && typeof a[0] !== "function")
+          ? a[0]
+          : (unixPath != null ? { path: unixPath } : (host != null ? { port, host } : { port }));
+        netServerListen.asyncStart.publish({ server: this, options: dcOptions });
+      }
       // node lib/net.js listenInCluster: inside a cluster worker the bind is
       // delegated to the primary (which owns the listening socket) unless the
       // caller asked for an exclusive one. `cluster._getServer` answers with
@@ -810,8 +846,15 @@ export constexpr std::string_view kNetJS = R"JS(
         // node's pipe_wrap Bind raises ERR_ACCESS_DENIED synchronously, so
         // `assert.throws(() => server.listen(path))` sees it — an async 'error'
         // event would not be catchable there.
-        catch (e) { if (isAccessDenied(e)) throw e; const err = listenError(e, unixPath); G.queueMicrotask(() => this.emit("error", err)); return this; }
+        catch (e) {
+          if (isAccessDenied(e)) throw e;
+          const err = listenError(e, unixPath);
+          if (netServerListen.hasSubscribers) netServerListen.error.publish({ server: this, error: err });
+          G.queueMicrotask(() => this.emit("error", err));
+          return this;
+        }
         this._fd = ulh.fd;
+        if (netServerListen.hasSubscribers) netServerListen.asyncEnd.publish({ server: this });
         this._addr = { address: unixPath, family: "unix", port: 0 };
         this.listening = true;
         NET.items.add(this);
@@ -833,8 +876,15 @@ export constexpr std::string_view kNetJS = R"JS(
       if (cb) this.once("listening", cb);
       let lh;
       try { lh = NN.listen(bindHost, port, !!this._reusePort); }
-      catch (e) { if (isAccessDenied(e)) throw e; const err = listenError(e, host, port); G.queueMicrotask(() => this.emit("error", err)); return this; }
+      catch (e) {
+        if (isAccessDenied(e)) throw e;
+        const err = listenError(e, host, port);
+        if (netServerListen.hasSubscribers) netServerListen.error.publish({ server: this, error: err });
+        G.queueMicrotask(() => this.emit("error", err));
+        return this;
+      }
       this._fd = lh.fd;
+      if (netServerListen.hasSubscribers) netServerListen.asyncEnd.publish({ server: this });
       const reportAddr = host === "localhost" ? (isV6 ? "::1" : "127.0.0.1") : host;
       this._addr = { port: lh.port, address: reportAddr, family: isV6 ? "IPv6" : "IPv4" };
       // node net.js Server: `${addressType}:${address}:${requestedPort}` — the
@@ -903,6 +953,7 @@ export constexpr std::string_view kNetJS = R"JS(
             this._conns.add(sock);
             sock.once("close", () => this._conns.delete(sock));
             this.emit("connection", sock);
+            if (netServerSocketChannel.hasSubscribers) netServerSocketChannel.publish({ socket: sock });
           };
           const out = {};
           if (typeof handle.getsockname === "function") handle.getsockname(out);
@@ -977,6 +1028,9 @@ export constexpr std::string_view kNetJS = R"JS(
         sock.once("close", () => this._conns.delete(sock));
         progress++;
         this.emit("connection", sock);
+        // node onconnection() publishes 'net.server.socket' right after the
+        // 'connection' event.
+        if (netServerSocketChannel.hasSubscribers) netServerSocketChannel.publish({ socket: sock });
       }
       return progress;
     }
@@ -2879,6 +2933,11 @@ export constexpr std::string_view kNetJS = R"JS(
         // lib/_http_server.js resOnFinish: dump an unread body, hand the socket
         // to the next queued response, and either close or re-arm the parser.
         const resOnFinish = () => {
+          // node lib/_http_server.js resOnFinish publishes
+          // 'http.server.response.finish' as its very first statement.
+          if (onResponseFinishChannel.hasSubscribers) {
+            onResponseFinishChannel.publish({ request: im, response: res, socket: sock, server: srv });
+          }
           if (im && !im._consuming && !(im._readableState && im._readableState.resumeScheduled)) im._dump();
           if (sock._httpMessage === res) res.detachSocket(sock);
           sock._httpIncoming = null;
@@ -2955,6 +3014,15 @@ export constexpr std::string_view kNetJS = R"JS(
           if (sock._httpMessage) outgoing.push(res);
           else res.assignSocket(sock);
           res.on("finish", resOnFinish);
+
+          // node lib/_http_server.js parserOnIncoming: 'http.server.request.start'
+          // is published once the response object exists and before the request
+          // is dispatched, so a subscriber can bind an AsyncLocalStorage context
+          // that the handler then runs inside
+          // (test-diagnostics-channel-http-server-start).
+          if (onRequestStartChannel.hasSubscribers) {
+            onRequestStartChannel.publish({ request: im, response: res, socket: sock, server: srv });
+          }
 
           let handled = false;
           if (im.httpVersionMajor === 1 && im.httpVersionMinor === 1) {

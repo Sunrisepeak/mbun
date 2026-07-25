@@ -460,6 +460,18 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     return stdio.map((s) => (s == null ? "pipe" : typeof s === "number" ? s : s === "overlapped" ? "pipe" : s));
   };
 
+  // node internal/child_process.js resolves the 'child_process' channel and the
+  // 'child_process.spawn' tracing channel at module load. This partition is
+  // assembled before node:diagnostics_channel, so the lookup is deferred to
+  // first use (spawn time, long after the image is complete).
+  const kCpNoDC = { hasSubscribers: false, publish() {} };
+  const kCpNoTraceDC = { hasSubscribers: false, start: kCpNoDC, end: kCpNoDC, error: kCpNoDC };
+  const cpDC = () => {
+    const d = M["diagnostics_channel"] || M["node:diagnostics_channel"];
+    if (!d || typeof d.channel !== "function") return { channel: kCpNoDC, spawn: kCpNoTraceDC };
+    return { channel: d.channel("child_process"), spawn: d.tracingChannel("child_process.spawn") };
+  };
+
   class ChildProcess extends EventEmitter {
     constructor() {
       super();
@@ -467,6 +479,10 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       this.stdio = [null, null, null]; this.exitCode = null; this.signalCode = null;
       this.killed = false; this.connected = false; this.spawnfile = undefined; this.spawnargs = [];
       this._rec = null; this._timeoutTimer = null;
+      // node's ChildProcess constructor announces the instance on the plain
+      // 'child_process' channel (the spawn tracing channel is separate).
+      const ch = cpDC().channel;
+      if (ch.hasSubscribers) ch.publish({ process: this });
     }
     spawn(options) {
       // node child_process.ts:1346-1396 validators (ERR_INVALID_ARG_TYPE).
@@ -501,11 +517,16 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       if (typeof options.uid === "number") sopts.uid = options.uid;
       if (typeof options.gid === "number") sopts.gid = options.gid;
       const self = this;
+      // node ChildProcess.prototype.spawn: start is published just before the
+      // handle spawn, then either error (a run-time spawn failure) or end.
+      const spawnDC = cpDC().spawn;
+      if (spawnDC.hasSubscribers) spawnDC.start.publish({ process: this, options });
       const h = PROC.spawnEx(file, args, sopts);
       if (h.errno != null) {
         const code = ERRNO[h.errno] || ("errno " + h.errno);
         const err = new Error("spawn " + file + " " + code);
         err.errno = -1; err.code = code; err.path = file; err.spawnargs = args.slice(1);
+        if (spawnDC.hasSubscribers) spawnDC.error.publish({ process: this, error: err });
         if (DELAYED[code]) {
           err.syscall = "spawn " + file;
           nextTick(() => { self.emit("error", err); self.emit("close", null, null); });
@@ -514,6 +535,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
         err.syscall = "spawn";
         throw err;
       }
+      if (spawnDC.hasSubscribers) spawnDC.end.publish({ process: this });
       this.pid = h.pid;
       const fds = h.fds || [];
       const rec = { cp: this, pid: h.pid, outs: [], stdinFd: -1, stdinBuf: [], stdinEnded: false, stdinClosed: false, exited: false, closed: false, done: false, code: null, signal: null, ipc: null, ipcDelivery: null };
