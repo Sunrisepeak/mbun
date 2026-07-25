@@ -72,10 +72,11 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   // (lib/internal/child_process/serialization.js, `json` mode:
   // `JSON.stringify(message) + "\n"`). The child locates its own end through
   // NODE_CHANNEL_FD exactly as node's _forkChild does.
-  // DEFERRED: handle passing (SCM_RIGHTS / the NODE_HANDLE protocol) — send()'s
-  // `handle` argument is validated and rejected with ERR_INVALID_HANDLE_TYPE
-  // rather than silently dropping a socket, and 'advanced' (v8) serialization
-  // is not implemented.
+  // send()'s `handle` argument implements node's NODE_HANDLE protocol: the frame
+  // becomes `{ cmd: "NODE_HANDLE", type, msg }` and the descriptor travels as
+  // SCM_RIGHTS on the same sendmsg (__mbunProcNative.sendmsgFd/recvmsgFd). A
+  // value with no descriptor behind it is still rejected with
+  // ERR_INVALID_HANDLE_TYPE. DEFERRED: 'advanced' (v8) serialization.
   const IPC_HIGH_WATER = 65536 * 2;
   const recvDesc = (v) => {
     if (v === null) return "null";
@@ -87,12 +88,21 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     if (t === "object") return "an instance of " + ((v.constructor && v.constructor.name) || "Object");
     return "type " + t + " (" + String(v) + ")";
   };
-  const makeIpc = (fd) => { PROC.setNonBlock(fd); return { fd, buf: "", out: [], queued: 0, closed: false, refd: true }; };
+  const makeIpc = (fd) => { PROC.setNonBlock(fd); return { fd, buf: "", out: [], queued: 0, closed: false, refd: true, rxFds: [] }; };
   const ipcClose = (ch) => { if (ch.closed) return; ch.closed = true; try { PROC.close(ch.fd); } catch (e) {} };
+  const canPassFd = () => typeof PROC.sendmsgFd === "function" && typeof PROC.recvmsgFd === "function";
   const ipcFlush = (ch) => {
     while (ch.out.length && !ch.closed) {
       const item = ch.out[0];
-      const w = PROC.writeNB(ch.fd, _b64(item.data.subarray(item.off)), 0);
+      let w;
+      if (item.fd >= 0 && canPassFd()) {
+        // The descriptor rides on the FIRST byte of this frame; once any byte
+        // of it has gone out the fd is delivered and must not be re-sent.
+        w = PROC.sendmsgFd(ch.fd, _b64(item.data), item.off, item.fd);
+        if (w > 0) item.fd = -1;
+      } else {
+        w = PROC.writeNB(ch.fd, _b64(item.data.subarray(item.off)), 0);
+      }
       if (w < 0) {  // peer gone — drop the rest, the 'disconnect' path reports it
         ch.out.shift(); ch.queued -= item.data.length - item.off;
         if (item.cb) { const cb = item.cb; nextTick(() => cb(null)); }
@@ -104,18 +114,60 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       else return;
     }
   };
-  const ipcWrite = (ch, message, cb) => {
+  const ipcWrite = (ch, message, cb, sendFd) => {
     const data = te.encode(JSON.stringify(message === undefined ? null : message) + "\n");
-    ch.out.push({ data, off: 0, cb: cb || null });
+    ch.out.push({ data, off: 0, cb: cb || null, fd: typeof sendFd === "number" ? sendFd : -1 });
     ch.queued += data.length;
     ipcFlush(ch);
     return ch.queued < IPC_HIGH_WATER;
   };
+  // ---- node's NODE_HANDLE protocol ----------------------------------------
+  // A message sent with a `handle` argument travels as
+  // `{ cmd: "NODE_HANDLE", type, msg }` while the descriptor itself goes out as
+  // SCM_RIGHTS on the same sendmsg. Descriptors therefore arrive in frame order
+  // and never later than their frame, so the reader can pair the Nth
+  // NODE_HANDLE frame with the Nth received descriptor.
+  const ipcHandleInfo = (h) => {
+    if (h === null || typeof h !== "object") return null;
+    if (typeof h.__ipcSendFd === "function") { try { return h.__ipcSendFd(); } catch (e) { return null; } }
+    const fd = h._fd;
+    if (typeof fd !== "number" || fd < 0) return null;
+    if (typeof h.listen === "function") return { fd, type: "net.Server" };
+    if (typeof h.connect === "function" && typeof h.write === "function") return { fd, type: "net.Socket" };
+    if (typeof h.bind === "function" && typeof h.send === "function") return { fd, type: "dgram.Native" };
+    return { fd, type: "net.Native" };
+  };
+  const ipcRecvHandle = (type, fd) => {
+    if (typeof fd !== "number" || fd < 0) return null;
+    const netmod = M["net"] || M["node:net"];
+    try {
+      if (type === "net.Socket" && netmod && typeof netmod.Socket === "function") {
+        const s = new netmod.Socket();
+        if (typeof s._adopt === "function") { s._adopt(fd); return s; }
+      }
+    } catch (e) {}
+    // Raw descriptor wrapper: what cluster's round-robin `newconn` hands to
+    // net.Server, and the fallback for anything with no richer JS shape.
+    return {
+      fd,
+      __ipcSendFd() { return { fd: this.fd, type }; },
+      close() { if (this.fd >= 0) { try { PROC.close(this.fd); } catch (e) {} this.fd = -1; } },
+    };
+  };
   const ipcRead = (ch, onMessage, onEof) => {
     for (;;) {
       let b;
-      try { b = PROC.readNB(ch.fd, 65536); } catch (e) { onEof(); return; }
-      if (b === null) { onEof(); return; }
+      if (canPassFd()) {
+        let r;
+        try { r = PROC.recvmsgFd(ch.fd, 65536); } catch (e) { onEof(); return; }
+        if (r === null) { onEof(); return; }
+        if (r.fds && r.fds.length) for (let i = 0; i < r.fds.length; i++) ch.rxFds.push(r.fds[i]);
+        if (r.eof) { onEof(); return; }
+        b = r.data;
+      } else {
+        try { b = PROC.readNB(ch.fd, 65536); } catch (e) { onEof(); return; }
+        if (b === null) { onEof(); return; }
+      }
       if (b === "") return;
       ch.buf += Buffer.from(_unb64(b)).toString("utf8");
       let idx;
@@ -125,7 +177,13 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
         if (!line) continue;
         let msg;
         try { msg = JSON.parse(line); } catch (e) { continue; }
-        onMessage(msg);
+        let handle;
+        if (msg !== null && typeof msg === "object" && msg.cmd === "NODE_HANDLE") {
+          const fd = ch.rxFds.length ? ch.rxFds.shift() : -1;
+          handle = ipcRecvHandle(msg.type, fd);
+          msg = msg.msg;
+        }
+        onMessage(msg, handle);
       }
     }
   };
@@ -156,8 +214,14 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
         const e = new TypeError('The "message" argument must be one of type string, object, number, or boolean. Received ' + recvDesc(message));
         e.code = "ERR_INVALID_ARG_TYPE"; throw e;
       }
+      let sendFd = -1;
       if (handle !== undefined && handle !== null) {
-        const e = new TypeError("This handle type cannot be sent"); e.code = "ERR_INVALID_HANDLE_TYPE"; throw e;
+        const info = canPassFd() ? ipcHandleInfo(handle) : null;
+        if (info === null) {
+          const e = new TypeError("This handle type cannot be sent"); e.code = "ERR_INVALID_HANDLE_TYPE"; throw e;
+        }
+        sendFd = info.fd;
+        message = { cmd: "NODE_HANDLE", type: info.type, msg: message };
       }
       if (!this.connected || ch.closed) {
         const e = new Error("Channel closed"); e.code = "ERR_IPC_CHANNEL_CLOSED";
@@ -166,7 +230,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
         else nextTick(() => { self.emit("error", e); });
         return false;
       }
-      return ipcWrite(ch, message, typeof callback === "function" ? callback : null);
+      return ipcWrite(ch, message, typeof callback === "function" ? callback : null, sendFd);
     };
     // node defers the 'disconnect' event to the next tick even when the local
     // side initiated it (test-child-process-disconnect asserts exactly that).
@@ -192,19 +256,20 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   const makeIpcDelivery = (target) => {
     const pending = [];
     return {
-      deliver(msg) {
-        if (isInternalIpc(msg)) { target.emit("internalMessage", msg); return; }
-        pending.push(msg);
+      deliver(msg, handle) {
+        if (isInternalIpc(msg)) { target.emit("internalMessage", msg, handle); return; }
+        pending.push([msg, handle]);
         this.flush();
       },
       flush() {
         while (pending.length && target.listenerCount("message") > 0) {
-          const msg = pending.shift();
+          const entry = pending.shift();
+          const msg = entry[0], handle = entry[1];
           // node dispatches each IPC message from its own tick, so a listener
           // that throws hits 'uncaughtException' and the next message still
           // arrives (test-child-process-ipc-next-tick).
           try {
-            target.emit("message", msg);
+            target.emit("message", msg, handle);
           } catch (e) {
             const pr = G.process;
             if (pr && typeof pr.listenerCount === "function" && pr.listenerCount("uncaughtException") > 0) pr.emit("uncaughtException", e);
@@ -254,7 +319,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   let SELF_IPC = null;
 
   const drainChildIpc = (rec) => {
-    ipcRead(rec.ipc, (msg) => rec.ipcDelivery.deliver(msg), () => {
+    ipcRead(rec.ipc, (msg, handle) => rec.ipcDelivery.deliver(msg, handle), () => {
       ipcClose(rec.ipc);
       if (rec.cp.connected) {
         rec.cp.connected = false;
@@ -781,7 +846,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       ch,
       delivery,
       drain() {
-        ipcRead(ch, (m) => delivery.deliver(m), () => {
+        ipcRead(ch, (m, handle) => delivery.deliver(m, handle), () => {
           ipcClose(ch);
           if (proc.connected && typeof proc.disconnect === "function") proc.disconnect();
         });

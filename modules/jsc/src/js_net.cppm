@@ -672,6 +672,9 @@ export constexpr std::string_view kNetJS = R"JS(
         if (o.path != null) unixPath = String(o.path);
         if (o.port != null) { validateListenPort(o.port); port = o.port | 0; }
         if (o.host != null) host = String(o.host);
+        if (o.exclusive != null) this._exclusive = !!o.exclusive;
+        if (o.backlog != null) this._backlog = o.backlog | 0;
+        if (o.ipv6Only) this._ipv6Only = true;
         if (typeof a[1] === "function") cb = a[1];
         // node lib/net.js Server.listen: options.signal is validated up front and
         // closes the server when it aborts (an already-aborted signal closes on
@@ -697,6 +700,16 @@ export constexpr std::string_view kNetJS = R"JS(
         else if (typeof a[0] === "string") unixPath = a[0];
         else if (typeof a[0] === "function") cb = a[0];
         for (let i = 1; i < a.length; i++) { if (typeof a[i] === "string") host = a[i]; else if (typeof a[i] === "function") cb = a[i]; }
+      }
+      // node lib/net.js listenInCluster: inside a cluster worker the bind is
+      // delegated to the primary (which owns the listening socket) unless the
+      // caller asked for an exclusive one. `cluster._getServer` answers with
+      // either a shared listening descriptor (SCHED_NONE / dgram) or a faux
+      // round-robin handle that receives accepted descriptors over IPC.
+      const clusterMod = G.__mbunCluster;
+      if (clusterMod && clusterMod.isWorker && !this._exclusive &&
+          typeof clusterMod._getServer === "function") {
+        return this._listenInCluster(clusterMod, unixPath, host, port, cb);
       }
       if (unixPath) {
         this._unixPath = unixPath;
@@ -740,8 +753,86 @@ export constexpr std::string_view kNetJS = R"JS(
       G.queueMicrotask(() => { if (this.listening) this.emit("listening"); });
       return this;
     }
+    // node lib/net.js Server._listen2 for a cluster worker: ask the primary for
+    // the server, then adopt whichever kind of handle it answers with.
+    //   * a handle carrying a real descriptor (SCHED_NONE / a shared listening
+    //     socket) is bound straight onto this server's own accept loop;
+    //   * the faux round-robin handle has no descriptor — connections arrive as
+    //     `newconn` IPC frames and land in onconnection().
+    _listenInCluster(clusterMod, unixPath, host, port, cb) {
+      if (cb) this.once("listening", cb);
+      const addressType = unixPath ? -1 : ((host || "").indexOf(":") !== -1 ? 6 : 4);
+      const address = unixPath ? unixPath : (host == null ? (addressType === 6 ? "::" : "0.0.0.0") : host);
+      const options = {
+        address,
+        port: unixPath ? -1 : port,
+        addressType,
+        // node passes `undefined` (not -1) when not listening on a descriptor;
+        // the primary echoes it back in the 'listening' info object, which
+        // test-cluster-basic reads as `hasOwn(info,'fd') && info.fd === undefined`.
+        fd: undefined,
+        flags: this._ipv6Only ? 1 : 0,
+        backlog: this._backlog === undefined ? 511 : this._backlog,
+      };
+      clusterMod._getServer(this, options, (err, handle) => {
+        if (err) {
+          const e = listenError({ message: String(err) }, address, unixPath ? undefined : port);
+          if (typeof err === "number") { e.errno = err; }
+          this.emit("error", e);
+          return;
+        }
+        this._clusterHandle = handle;
+        handle.owner = this;
+        if (typeof handle.fd === "number" && handle.fd >= 0) {
+          // Shared descriptor: accept locally, exactly like a normal listen().
+          this._fd = handle.fd;
+          const sn = handle.sockname;
+          if (unixPath) this._addr = { address: unixPath, family: "unix", port: 0 };
+          else this._addr = {
+            port: sn && sn.port !== undefined ? sn.port : port,
+            address: sn && sn.address !== undefined ? sn.address : address,
+            family: sn && sn.family !== undefined ? sn.family : (addressType === 6 ? "IPv6" : "IPv4"),
+          };
+          this.listening = true;
+          NET.items.add(this);
+          this._hold();
+        } else {
+          handle.onconnection = (er, clientHandle) => {
+            if (er || !clientHandle || typeof clientHandle.fd !== "number" || clientHandle.fd < 0) return;
+            const sock = new Socket({ allowHalfOpen: !!this._opts.allowHalfOpen })._adopt(clientHandle.fd);
+            sock.localPort = this._addr ? this._addr.port : 0;
+            this._conns.add(sock);
+            sock.once("close", () => this._conns.delete(sock));
+            this.emit("connection", sock);
+          };
+          const out = {};
+          if (typeof handle.getsockname === "function") handle.getsockname(out);
+          if (unixPath) this._addr = { address: unixPath, family: "unix", port: 0 };
+          else this._addr = {
+            port: out.port === undefined ? port : out.port,
+            address: out.address === undefined ? address : out.address,
+            family: out.family === undefined ? (addressType === 6 ? "IPv6" : "IPv4") : out.family,
+          };
+          this.listening = true;
+        }
+        G.queueMicrotask(() => { if (this.listening) this.emit("listening"); });
+      });
+      return this;
+    }
     address() { return this._addr; }
     close(cb) {
+      if (this._clusterHandle) {
+        // The handle owns the descriptor (shared case) and the primary-side
+        // bookkeeping (round-robin case); closing this._fd here too would be a
+        // double close of a number the runtime may have already re-used.
+        const h = this._clusterHandle; this._clusterHandle = null;
+        this.listening = false;
+        if (this._fd >= 0) { this._fd = -1; NET.items.delete(this); this._release(); }
+        try { h.close(); } catch (e) {}
+        if (typeof cb === "function") G.queueMicrotask(() => cb(null));
+        G.queueMicrotask(() => this.emit("close"));
+        return this;
+      }
       if (this._fd >= 0) {
         try { NN.close(this._fd); } catch (e) {} this._fd = -1; NET.items.delete(this); this.listening = false;
         this._release();
@@ -753,8 +844,20 @@ export constexpr std::string_view kNetJS = R"JS(
       G.queueMicrotask(() => this.emit("close"));
       return this;
     }
-    ref() { this._refd = true; NET.hold(this); return this; }
-    unref() { this._refd = false; NET.release(this); return this; }
+    ref() {
+      this._refd = true;
+      // A round-robin server has no descriptor of its own: the faux handle's
+      // ref()/unref() (a keep-alive interval) is what holds the worker's loop.
+      if (this._clusterHandle && typeof this._clusterHandle.ref === "function") this._clusterHandle.ref();
+      NET.hold(this);
+      return this;
+    }
+    unref() {
+      this._refd = false;
+      if (this._clusterHandle && typeof this._clusterHandle.unref === "function") this._clusterHandle.unref();
+      NET.release(this);
+      return this;
+    }
     hasRef() { return this._refd !== false; }
     setTimeout() { return this; }
     getConnections(cb) { if (typeof cb === "function") cb(null, this._conns.size); return this; }
@@ -765,6 +868,10 @@ export constexpr std::string_view kNetJS = R"JS(
         let cfd;
         try { cfd = NN.accept(this._fd); } catch (e) { break; }
         if (cfd < 0) break;
+        // cluster's round-robin primary owns the listening socket but never
+        // builds a Socket for the connection: the raw descriptor is handed to a
+        // worker over IPC instead (internal/cluster/round_robin_handle.js).
+        if (this._rawAccept) { this._rawAccept(cfd); progress++; continue; }
         const sock = new Socket({ allowHalfOpen: !!this._opts.allowHalfOpen })._adopt(cfd);
         sock.localPort = this._addr ? this._addr.port : 0;
         this._conns.add(sock);

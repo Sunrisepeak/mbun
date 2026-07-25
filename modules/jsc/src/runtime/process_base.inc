@@ -483,6 +483,135 @@ JSValueRef proc_read_nb_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size
     return make_string(ctx, b64_encode(reinterpret_cast<const unsigned char*>(buf.data()),
                                        static_cast<std::size_t>(n)));
 }
+
+// proc.setenv(name, value) → write the REAL process environment; value null or
+// undefined unsets. node's process.env is a live view of environ, mbun's is a
+// snapshot taken at startup, so a JS-level `delete process.env.X` is invisible
+// to a child spawned afterwards. Callers that need the real thing (cluster's
+// worker dropping NODE_UNIQUE_ID so grandchildren do not inherit it — node's
+// test-cluster-basic asserts exactly that) go through here.
+JSValueRef proc_setenv_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                          const JSValueRef args[], JSValueRef*) {
+    if (argc == 0) return JSValueMakeUndefined(ctx);
+    const std::string name{fs_arg(ctx, argc, args, 0)};
+    if (name.empty() || name.find('=') != std::string::npos) return JSValueMakeUndefined(ctx);
+    if (argc < 2 || JSValueIsNull(ctx, args[1]) || JSValueIsUndefined(ctx, args[1])) {
+        ::unsetenv(name.c_str());
+        return JSValueMakeUndefined(ctx);
+    }
+    const std::string value{fs_arg(ctx, argc, args, 1)};
+    ::setenv(name.c_str(), value.c_str(), 1);
+    return JSValueMakeUndefined(ctx);
+}
+
+// ── SCM_RIGHTS descriptor passing over the fork() IPC socketpair ─────────────
+// node's NODE_HANDLE protocol hands a listening/accepted socket from one process
+// to another; on POSIX that is an AF_UNIX ancillary message carrying the
+// descriptor alongside the JSON frame. Both halves are exposed as non-blocking
+// twins of writeNB/readNB so the JS IPC driver can keep one code path.
+//
+// Ordering contract that makes the JS side simple: Linux attaches ancillary data
+// to the FIRST byte of the sendmsg that carried it and never merges a later
+// segment past that boundary into an earlier recvmsg, so descriptors arrive in
+// the same order as the frames that carry them, never after. The JS layer can
+// therefore queue received fds and pair the Nth NODE_HANDLE frame with the Nth
+// descriptor.
+
+// proc.sendmsgFd(fd, b64, offset, sendFd) → bytes written (0 EAGAIN, -1 error).
+// When sendFd >= 0 the descriptor rides along as SCM_RIGHTS on this write.
+JSValueRef proc_sendmsg_fd_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                              const JSValueRef args[], JSValueRef*) {
+    const int fd{argc > 0 ? static_cast<int>(JSValueToNumber(ctx, args[0], nullptr)) : -1};
+    std::string data{b64_decode(fs_arg(ctx, argc, args, 1))};
+    const std::size_t off{argc > 2 ? static_cast<std::size_t>(JSValueToNumber(ctx, args[2], nullptr))
+                                   : 0};
+    const int sendFd{argc > 3 ? static_cast<int>(JSValueToNumber(ctx, args[3], nullptr)) : -1};
+    if (off >= data.size()) return JSValueMakeNumber(ctx, 0);
+
+    iovec iov{};
+    iov.iov_base = data.data() + off;
+    iov.iov_len = data.size() - off;
+    msghdr msg{};
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+
+    union {
+        char buf[CMSG_SPACE(sizeof(int))];
+        cmsghdr align;
+    } control{};
+    if (sendFd >= 0) {
+        msg.msg_control = control.buf;
+        msg.msg_controllen = sizeof(control.buf);
+        cmsghdr* cm{CMSG_FIRSTHDR(&msg)};
+        cm->cmsg_level = SOL_SOCKET;
+        cm->cmsg_type = SCM_RIGHTS;
+        cm->cmsg_len = CMSG_LEN(sizeof(int));
+        std::memcpy(CMSG_DATA(cm), &sendFd, sizeof(int));
+    }
+
+    ssize_t w;
+    do { w = sendmsg(fd, &msg, MSG_NOSIGNAL); } while (w < 0 && errno == EINTR);
+    if (w < 0) return JSValueMakeNumber(ctx, (errno == EAGAIN || errno == EWOULDBLOCK) ? 0 : -1);
+    return JSValueMakeNumber(ctx, static_cast<double>(w));
+}
+
+// proc.recvmsgFd(fd, max) → { data: b64|"" , fds: [int], eof: bool }.
+// data "" means EAGAIN (nothing ready); eof true means the peer closed.
+JSValueRef proc_recvmsg_fd_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                              const JSValueRef args[], JSValueRef*) {
+    const int fd{argc > 0 ? static_cast<int>(JSValueToNumber(ctx, args[0], nullptr)) : -1};
+    std::size_t max{argc > 1 ? static_cast<std::size_t>(JSValueToNumber(ctx, args[1], nullptr)) : 65536};
+    if (max == 0 || max > (1u << 24)) max = 65536;
+    std::string buf(max, '\0');
+
+    iovec iov{};
+    iov.iov_base = buf.data();
+    iov.iov_len = max;
+    msghdr msg{};
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    union {
+        char buf[CMSG_SPACE(sizeof(int) * 8)];
+        cmsghdr align;
+    } control{};
+    msg.msg_control = control.buf;
+    msg.msg_controllen = sizeof(control.buf);
+
+    ssize_t n;
+    do { n = recvmsg(fd, &msg, 0); } while (n < 0 && errno == EINTR);
+
+    JSObjectRef out{JSObjectMake(ctx, nullptr, nullptr)};
+    JSObjectRef fds{JSObjectMakeArray(ctx, 0, nullptr, nullptr)};
+    unsigned fdCount{0};
+    if (n >= 0) {
+        for (cmsghdr* cm{CMSG_FIRSTHDR(&msg)}; cm != nullptr; cm = CMSG_NXTHDR(&msg, cm)) {
+            if (cm->cmsg_level != SOL_SOCKET || cm->cmsg_type != SCM_RIGHTS) continue;
+            const std::size_t payload{cm->cmsg_len - CMSG_LEN(0)};
+            for (std::size_t i = 0; i + sizeof(int) <= payload; i += sizeof(int)) {
+                int got{-1};
+                std::memcpy(&got, CMSG_DATA(cm) + i, sizeof(int));
+                JSObjectSetPropertyAtIndex(ctx, fds, fdCount++, JSValueMakeNumber(ctx, got), nullptr);
+            }
+        }
+    }
+    set_prop(ctx, out, "fds", fds);
+    if (n < 0) {
+        const bool again{errno == EAGAIN || errno == EWOULDBLOCK};
+        set_prop(ctx, out, "data", make_string(ctx, ""));
+        set_prop(ctx, out, "eof", JSValueMakeBoolean(ctx, !again));
+        return out;
+    }
+    if (n == 0 && fdCount == 0) {
+        set_prop(ctx, out, "data", make_string(ctx, ""));
+        set_prop(ctx, out, "eof", JSValueMakeBoolean(ctx, true));
+        return out;
+    }
+    set_prop(ctx, out, "data",
+             make_string(ctx, b64_encode(reinterpret_cast<const unsigned char*>(buf.data()),
+                                         static_cast<std::size_t>(n))));
+    set_prop(ctx, out, "eof", JSValueMakeBoolean(ctx, false));
+    return out;
+}
 #endif
 
 // proc.wait(pid, nohang) → { exited, code, signal } (signal name numeric).

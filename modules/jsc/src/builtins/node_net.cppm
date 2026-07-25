@@ -228,6 +228,33 @@ inline constexpr std::string_view kNodeNetJS = R"JS(
         let ad = opts ? opts.address : addr;
         if (ad === undefined || ad === null) ad = "";
         const ipv6Only = !!((opts && opts.ipv6Only) || this._opts.ipv6Only);
+        // node lib/dgram.js Socket.prototype.bind → cluster._getServer: a bound
+        // UDP socket inside a cluster worker is the primary's socket, shared
+        // over IPC (internal/cluster/shared_handle.js). UDP is exempt from
+        // round-robin — there is nothing to distribute but raw datagrams.
+        const clusterMod = G.__mbunCluster;
+        if (clusterMod && clusterMod.isWorker && !(opts && opts.exclusive) &&
+            typeof clusterMod._getServer === "function") {
+          if (cb) this.once("listening", cb);
+          const self = this;
+          clusterMod._getServer(this, {
+            address: String(ad), port: p, addressType: this.type, fd: undefined,
+            flags: ipv6Only ? 1 : 0,
+          }, (err, handle) => {
+            if (err || !handle || typeof handle.fd !== "number" || handle.fd < 0) {
+              G.queueMicrotask(() => self.emit("error", mkE("bind " + (err || "EADDRINUSE"), typeof err === "string" ? err : "EADDRINUSE")));
+              return;
+            }
+            self._fd = handle.fd;
+            self._clusterHandle = handle;
+            self._bound = true;
+            try { self._addr = ND.address(self._fd); } catch (e) { self._addr = handle.sockname || null; }
+            const R2 = self._reactor();
+            if (R2) { R2.items.add(self); self._loopOpen = true; R2.hold(self); }
+            G.queueMicrotask(() => { if (!self._closed) self.emit("listening"); });
+          });
+          return this;
+        }
         this._ensureFd();
         let info;
         try { info = ND.bind(this._fd, String(ad), p, this._v6(), ipv6Only); }
@@ -287,7 +314,14 @@ inline constexpr std::string_view kNodeNetJS = R"JS(
         this._closed = true;
         const R = this._reactor();
         if (R) { R.items.delete(this); this._loopOpen = false; R.release(this); }
-        if (this._fd >= 0) { try { ND.close(this._fd); } catch (e) {} this._fd = -1; }
+        // A shared (cluster) descriptor is owned by the handle the primary sent:
+        // its patched close() sends `{ act: "close" }` (so the primary can drop
+        // the SharedHandle — without which cluster.disconnect() never completes)
+        // AND closes the descriptor, so this must not close it a second time.
+        if (this._clusterHandle) {
+          const h = this._clusterHandle; this._clusterHandle = null; this._fd = -1;
+          try { h.close(); } catch (e) {}
+        } else if (this._fd >= 0) { try { ND.close(this._fd); } catch (e) {} this._fd = -1; }
         if (cb) this.once("close", cb);
         const self = this;
         G.queueMicrotask(() => self.emit("close"));
