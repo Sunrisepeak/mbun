@@ -839,26 +839,27 @@ export constexpr std::string_view kHttp2JS = R"JS(
     stream.rstCode = constants.NGHTTP2_NO_ERROR;
     stream.aborted = false;
     stream._writeQueueSize = 0;
+    stream.sentInfoHeaders = [];
+    stream.sentTrailers = undefined;
     if (!kHaveDuplex) { stream.readable = true; stream.writable = true; stream.destroyed = false; }
   }
   const bufFromChunk = (chunk, enc) => (typeof chunk === "string" ? Buffer.from(chunk, enc || "utf8") : Buffer.from(chunk));
+  // The frame goes out synchronously (wire order must not change) but the write
+  // callback is deferred a microtask: node's writes land in the handle's queue,
+  // so `writableLength` / `bufferSize` report bytes still in flight, and a
+  // synchronous `cb()` made both of them read 0 always.
   function http2StreamWrite(stream, chunk, enc, cb) {
-    if (stream._endStreamSent) { cb(); return; }
+    if (stream._endStreamSent) { G.queueMicrotask(cb); return; }
     const buf = bufFromChunk(chunk, enc);
-    stream._writeQueueSize += buf.length;
     stream.session._sendData(stream, buf, false);
-    stream._writeQueueSize -= buf.length;
-    cb();
+    G.queueMicrotask(cb);
   }
   function http2StreamWritev(stream, chunks, cb) {
-    if (stream._endStreamSent) { cb(); return; }
+    if (stream._endStreamSent) { G.queueMicrotask(cb); return; }
     const parts = [];
     for (let i = 0; i < chunks.length; i++) parts.push(bufFromChunk(chunks[i].chunk, chunks[i].encoding));
-    const buf = Buffer.concat(parts);
-    stream._writeQueueSize += buf.length;
-    stream.session._sendData(stream, buf, false);
-    stream._writeQueueSize -= buf.length;
-    cb();
+    stream.session._sendData(stream, Buffer.concat(parts), false);
+    G.queueMicrotask(cb);
   }
   // The writable side finished. Without waitForTrailers that is an empty
   // DATA(END_STREAM); with it, END_STREAM is held back until sendTrailers()
@@ -895,16 +896,27 @@ export constexpr std::string_view kHttp2JS = R"JS(
     if (stream._readBacklog && stream._readBacklog.length) { stream._readBacklog.push(buf); return; }
     if (!stream.push(buf)) { if (!stream._readBacklog) stream._readBacklog = []; }
   }
-  // The peer sent END_STREAM: EOF the readable side. node lets the Duplex emit
-  // 'end' when the consumer has drained it, which is why a test that never
-  // reads never sees 'end' — that is the contract, not a bug.
+  // The peer sent END_STREAM: EOF the readable side.
+  //
+  // Pushing null is not enough. node's `onStreamClose` (lib/internal/http2/
+  // core.js) additionally *pokes* the readable side, and skipping that is the
+  // difference between a clean exit and a 15-second hang: a Duplex only runs its
+  // end-of-stream check from `read()`, so a stream nobody ever read would sit
+  // with `ended` set and never emit 'end'. node calls `read(0)` to force the
+  // check — and on a server session that was never read at all it `resume()`s
+  // instead, dumping the request body so the stream can be destroyed. Destroy is
+  // deferred until 'end' has actually fired ("Defer destroy we actually emit
+  // end", same function).
   function http2StreamEndReadable(stream) {
     if (stream._readEnded) return;
     if (kHaveDuplex && stream._readBacklog && stream._readBacklog.length) { stream._readEofPending = true; return; }
     stream._readEnded = true;
-    if (kHaveDuplex) stream.push(null);
-    else { stream.readable = false; stream.emit("end"); }
-    maybeFinishHttp2Stream(stream);
+    if (!kHaveDuplex) { stream.readable = false; stream.emit("end"); maybeFinishHttp2Stream(stream); return; }
+    stream.once("end", () => maybeFinishHttp2Stream(stream));
+    stream.push(null);
+    if (stream.destroyed) return;
+    if (stream._serverSide === true && stream._didRead !== true && stream.readableFlowing === null) stream.resume();
+    else stream.read(0);
   }
   function http2StreamClose(stream, code, cb) {
     if (code === undefined) code = constants.NGHTTP2_NO_ERROR;
@@ -934,14 +946,20 @@ export constexpr std::string_view kHttp2JS = R"JS(
     }
     try { stream.session.streams.delete(stream.id); } catch (e) {}
     const sess = stream.session;
-    G.queueMicrotask(() => { if (sess && sess._endPending) sess._onSocketEnd(); });
+    G.queueMicrotask(() => {
+      if (!sess) return;
+      if (sess._endPending) sess._onSocketEnd();
+    });
     cb(err || null);
   }
   // Both directions are done: destroy so 'close' fires exactly once, the way
-  // node's kMaybeDestroy does.
+  // node's kMaybeDestroy does. `readableEnded` (not `_readEnded`) is the gate —
+  // it only turns true once 'end' has been emitted, i.e. once the consumer has
+  // actually seen the body.
   function maybeFinishHttp2Stream(stream) {
     if (!kHaveDuplex || stream.destroyed) return;
-    if (!stream._readEnded || !stream._endStreamSent) return;
+    if (!stream._endStreamSent) return;
+    if (!stream.readableEnded) return;
     G.queueMicrotask(() => { if (!stream.destroyed) stream.destroy(); });
   }
   function http2StreamFinish(stream) {
@@ -956,6 +974,15 @@ export constexpr std::string_view kHttp2JS = R"JS(
     const sess = stream.session;
     G.queueMicrotask(() => { stream.emit("close"); if (sess && sess._endPending) sess._onSocketEnd(); });
   }
+  // A graceful shutdown ends the write side (flushing whatever is queued and
+  // sending FIN); an error shutdown destroys the fd right away.
+  function closeSessionSocket(socket, hard) {
+    if (!socket) return;
+    try {
+      if (!hard && socket.writable && !socket.destroyed && typeof socket.end === "function") socket.end();
+      else socket.destroy();
+    } catch (e) { try { socket.destroy(); } catch (e2) {} }
+  }
   function http2StreamSetTimeout(stream, ms, cb) {
     if (typeof cb === "function") stream.once("timeout", cb);
     return stream;
@@ -964,6 +991,47 @@ export constexpr std::string_view kHttp2JS = R"JS(
   // handle's write queue plus the writable buffer).
   function http2StreamBufferSize(stream) {
     return stream._writeQueueSize + (kHaveDuplex ? stream.writableLength : 0);
+  }
+  // node Http2Stream[kInspect] / Http2Session[kInspect]. The shape is asserted
+  // directly (test-http2-stream-client matches /Http2Stream {/, / {2}state:/,
+  // / {2}readableState:/, / {2}writableState:/), and the default inspector shows
+  // none of those because they are prototype getters.
+  const kCustomInspect = G.Symbol.for("nodejs.util.inspect.custom");
+  function installStreamInspect(cls) {
+    Object.defineProperty(cls.prototype, kCustomInspect, {
+      value: function (depth, opts) {
+        if (typeof depth === "number" && depth < 0) return this;
+        const util = M["util"] || M["node:util"];
+        const obj = {
+          id: this.id || "<pending>",
+          closed: this.closed,
+          destroyed: this.destroyed,
+          state: this.state,
+          readableState: this._readableState,
+          writableState: this._writableState,
+        };
+        return "Http2Stream " + (util && util.inspect ? util.inspect(obj) : String(obj));
+      },
+      writable: true, configurable: true, enumerable: false,
+    });
+  }
+  function installSessionInspect(cls, type) {
+    Object.defineProperty(cls.prototype, kCustomInspect, {
+      value: function (depth, opts) {
+        if (typeof depth === "number" && depth < 0) return this;
+        const util = M["util"] || M["node:util"];
+        const obj = {
+          type: this.type,
+          closed: this.closed,
+          destroyed: this.destroyed,
+          state: this.state,
+          localSettings: this.localSettings,
+          remoteSettings: this.remoteSettings,
+        };
+        return "Http2Session " + (util && util.inspect ? util.inspect(obj) : String(obj));
+      },
+      writable: true, configurable: true, enumerable: false,
+    });
   }
 
   // === ClientHttp2Stream ===
@@ -991,7 +1059,7 @@ export constexpr std::string_view kHttp2JS = R"JS(
     _write(chunk, enc, cb) { http2StreamWrite(this, chunk, enc, cb); }
     _writev(chunks, cb) { http2StreamWritev(this, chunks, cb); }
     _final(cb) { http2StreamFinal(this, this._options.waitForTrailers, cb); }
-    _read() { http2StreamRead(this); }
+    _read() { this._didRead = true; http2StreamRead(this); }
     _destroy(err, cb) { http2StreamDestroy(this, err, cb); }
     sendTrailers(headers) {
       if (this._trailersSent) throw mkErr("Trailers have already been sent", "ERR_HTTP2_TRAILERS_ALREADY_SENT");
@@ -1000,6 +1068,7 @@ export constexpr std::string_view kHttp2JS = R"JS(
       for (const k of Object.keys(headers))
         if (String(k)[0] === ":") throw mkErr('"' + k + '" is an invalid pseudoheader or is used incorrectly', "ERR_HTTP2_INVALID_PSEUDOHEADER");
       this._trailersSent = true;
+      this.sentTrailers = headers;
       const built = buildNgHeaders(Object.assign({ __proto__: null }, headers), assertValidRequestPseudoHeader, this.session._options && this.session._options.strictSingleValueFields);
       writeHeaderBlock(this.session, this.id, encodeHeaders(built.list, built.sensitive), FLAG.END_STREAM);
       this._endStreamSent = true;
@@ -1035,8 +1104,13 @@ export constexpr std::string_view kHttp2JS = R"JS(
       this._hpack = new HpackDecoder();
       this._maxFrameSize = constants.DEFAULT_SETTINGS_MAX_FRAME_SIZE;  // our advertised max (16384)
       this._remoteSettings = null;
-      this._localSettings = { headerTableSize: 4096, enablePush: 0, initialWindowSize: 65535, maxFrameSize: 16384, maxConcurrentStreams: 4294967295 };
+      this._localSettings = { headerTableSize: 4096, enablePush: true, initialWindowSize: 65535, maxFrameSize: 16384, maxConcurrentStreams: 4294967295, maxHeaderListSize: 65535, enableConnectProtocol: false };
+      if (this._options.settings) Object.assign(this._localSettings, this._options.settings);
       this._pendingHeaderBlock = null;   // { streamId, endStream, buf }
+      // node kMaxReservedRemoteStreams (default 200): a peer that reserves more
+      // push streams than this gets them RST_STREAM'd with CANCEL.
+      this._maxReservedRemoteStreams = (this._options.maxReservedRemoteStreams === undefined) ? 200 : (this._options.maxReservedRemoteStreams | 0);
+      this._reservedRemoteStreams = 0;
       // connection-level flow control bookkeeping, surfaced through `state`
       this._localWindow = DEFAULT_CONNECTION_WINDOW;    // what the peer may still send us
       this._remoteWindow = DEFAULT_CONNECTION_WINDOW;   // what we may still send the peer
@@ -1108,7 +1182,13 @@ export constexpr std::string_view kHttp2JS = R"JS(
       // HEADERS it produced were buffered in _preConnectQ; flush them AFTER the
       // preface + our SETTINGS.
       this.socket.write(CLIENT_PREFACE);
-      this._writeFrame(FRAME.SETTINGS, 0, 0, Buffer.alloc(0));
+      // http2.connect(authority, { settings }) has to reach the wire: the peer
+      // reads ENABLE_PUSH from it to decide whether it may push at all, and the
+      // corpus asserts the server sees `remoteSettings.enablePush === false`.
+      // This was an unconditionally empty payload, so every configured client
+      // setting was silently dropped.
+      const initial = Object.assign({}, this._localSettings, this._options && this._options.settings);
+      this._writeFrame(FRAME.SETTINGS, 0, 0, encodeSettings(initial));
       const q = this._preConnectQ; this._preConnectQ = [];
       for (let i = 0; i < q.length; i++) this.socket.write(q[i]);
       this.emit("connect", this, this.socket);
@@ -1142,12 +1222,32 @@ export constexpr std::string_view kHttp2JS = R"JS(
       const stream = new ClientHttp2Stream(this, streamId, headers, options);
       this.streams.set(streamId, stream);
       const block = encodeHeaders(built.list, built.sensitive);
+      // node maxSendHeaderBlockLength: nghttp2 refuses to serialise a header
+      // block over the limit, which surfaces as 'frameError' on the stream plus
+      // a REFUSED_STREAM stream error — nothing goes on the wire.
+      const maxBlock = this._options.maxSendHeaderBlockLength;
+      if (maxBlock !== undefined && block.length > maxBlock) {
+        stream.pending = false;
+        this.streams.delete(streamId);
+        stream.rstCode = constants.NGHTTP2_REFUSED_STREAM;
+        stream._closed = true;
+        const self = this;
+        G.queueMicrotask(() => {
+          stream.emit("frameError", FRAME.HEADERS, constants.NGHTTP2_FRAME_SIZE_ERROR, streamId);
+          stream.destroy(streamErr(constants.NGHTTP2_REFUSED_STREAM));
+          self._fatal(sessionErr(constants.NGHTTP2_FRAME_SIZE_ERROR));
+        });
+        return stream;
+      }
       // A method with no body (GET/HEAD/DELETE) or an explicit endStream option
       // may close the stream on the HEADERS frame; otherwise req.end() sends the
       // trailing empty DATA(END_STREAM). HEADERS otherwise carry END_HEADERS only.
       // node kNoPayloadMethods: GET/HEAD/DELETE assign no meaning to a request
       // payload, so endStream defaults to true for them unless the caller says
       // otherwise. The peer then sees endAfterHeaders on its request stream.
+      // node Http2Stream#sentHeaders is the prepared object, i.e. including the
+      // :method/:authority/:scheme/:path defaults request() filled in.
+      stream.sentHeaders = built.prepared || headers;
       const method = headers[":method"] === undefined ? "GET" : String(headers[":method"]);
       const noBody = /^(GET|HEAD|DELETE)$/.test(method);
       const endStream = options.endStream === undefined ? noBody : options.endStream === true;
@@ -1276,7 +1376,15 @@ export constexpr std::string_view kHttp2JS = R"JS(
             stream.rstCode = code;
             stream._closed = true;
             stream.aborted = true;
-            if (code !== 0) { const err = streamErr(code); G.queueMicrotask(() => { if (!stream.destroyed) stream.destroy(err); }); }
+            if (code !== 0) {
+              const err = streamErr(code);
+              // node abort(stream): a stream reset before its readable side ended
+              // is 'aborted', and only then the error/close pair.
+              G.queueMicrotask(() => {
+                if (!stream.readableEnded) stream.emit("aborted");
+                if (!stream.destroyed) stream.destroy(err);
+              });
+            }
             else http2StreamFinish(stream);
           }
           return true;
@@ -1313,10 +1421,7 @@ export constexpr std::string_view kHttp2JS = R"JS(
           if (streamId === 0) this._remoteWindow += payload.readUInt32BE(0) & 0x7fffffff;
           return true;
         }
-        case FRAME.PUSH_PROMISE: {
-          // push disabled (we advertise ENABLE_PUSH=0); a server push is a error.
-          this._connError(constants.NGHTTP2_PROTOCOL_ERROR); return false;
-        }
+        case FRAME.PUSH_PROMISE: return this._handlePushPromise(flags, streamId, payload);
         case FRAME.ALTSVC: return handleAltsvcFrame(this, streamId, payload);
         case FRAME.ORIGIN: return handleOriginFrame(this, payload);
         default:
@@ -1324,6 +1429,48 @@ export constexpr std::string_view kHttp2JS = R"JS(
       }
     }
 
+    // RFC 9113 6.6: PUSH_PROMISE = [Pad Length?][Promised Stream ID (31 bits)]
+    // [Header Block][Padding]. A push arriving after we advertised ENABLE_PUSH=0
+    // is a connection error; otherwise the promised (even) id is reserved and
+    // surfaces as a session 'stream' event carrying the *request* headers the
+    // server is answering on our behalf.
+    _handlePushPromise(flags, streamId, payload) {
+      if (!this._localSettings.enablePush) { this._connError(constants.NGHTTP2_PROTOCOL_ERROR); return false; }
+      if (streamId === 0) { this._connError(constants.NGHTTP2_PROTOCOL_ERROR); return false; }
+      let off = 0, padLen = 0;
+      if (flags & FLAG.PADDED) {
+        if (payload.length < 1) { this._connError(constants.NGHTTP2_FRAME_SIZE_ERROR); return false; }
+        padLen = payload[0]; off = 1;
+      }
+      if (payload.length < off + 4) { this._connError(constants.NGHTTP2_FRAME_SIZE_ERROR); return false; }
+      const promisedId = payload.readUInt32BE(off) & 0x7fffffff;
+      off += 4;
+      if (off + padLen > payload.length) { this._connError(constants.NGHTTP2_PROTOCOL_ERROR); return false; }
+      const block = payload.subarray(off, payload.length - padLen);
+      this._pendingHeaderBlock = { streamId, promisedId, push: true, endStream: false, buf: Buffer.from(block) };
+      if (flags & FLAG.END_HEADERS) return this._finishHeaders(flags);
+      return true;
+    }
+    _finishPushPromise(pb, list, flags) {
+      const headersObj = headerListToObject(list, this._hpack._sensitive, this._strictWs());
+      // node kMaxReservedRemoteStreams: over the limit the promise is refused
+      // with RST_STREAM(CANCEL) and never surfaces to the application.
+      if (this._reservedRemoteStreams >= this._maxReservedRemoteStreams) {
+        const p = Buffer.alloc(4); p.writeUInt32BE(constants.NGHTTP2_CANCEL, 0);
+        this._writeFrame(FRAME.RST_STREAM, 0, pb.promisedId, p);
+        return true;
+      }
+      this._reservedRemoteStreams++;
+      const push = new ClientHttp2Stream(this, pb.promisedId, headersObj, {});
+      push.pushed = true;
+      push.pending = false;
+      // A pushed stream carries no request body: its writable side starts closed.
+      push._endStreamSent = true;
+      push.end();
+      this.streams.set(pb.promisedId, push);
+      this.emit("stream", push, headersObj, flags);
+      return true;
+    }
     _handleHeaders(flags, streamId, payload) {
       // RFC 7540 6.2: payload = [Pad Length?][Priority(5)?][Header Block][Padding].
       const data = payload;
@@ -1349,9 +1496,18 @@ export constexpr std::string_view kHttp2JS = R"JS(
       let list;
       try { list = this._hpack.decode(pb.buf); }
       catch (e) { this._connError(constants.NGHTTP2_COMPRESSION_ERROR); return false; }
+      if (pb.push) return this._finishPushPromise(pb, list, flags);
       const stream = this.streams.get(pb.streamId);
       if (!stream) return true;
-      const headersObj = headerListToObject(list, this._hpack._sensitive);
+      const headersObj = headerListToObject(list, this._hpack._sensitive, this._strictWs());
+      // The response HEADERS of a *pushed* stream are surfaced as 'push', not
+      // 'response' (node ClientHttp2Stream: a push response is unsolicited).
+      if (stream.pushed === true && !stream._responseEmitted) {
+        stream._responseEmitted = true;
+        stream.emit("push", headersObj, flags);
+        if (pb.endStream) { this.streams.delete(pb.streamId); stream._onEnd(); }
+        return true;
+      }
       // A header block after the response is a trailer block (RFC 9113 8.1):
       // emit 'trailers' rather than a second 'response'. A 1xx block BEFORE the
       // response is informational: node emits 'headers', and the real response
@@ -1393,6 +1549,7 @@ export constexpr std::string_view kHttp2JS = R"JS(
       const p = Buffer.alloc(4); p.writeUInt32BE(increment >>> 0, 0);
       this._writeFrame(FRAME.WINDOW_UPDATE, 0, streamId, p);
     }
+    _strictWs() { return this._options.strictFieldWhitespaceValidation !== false; }
     setLocalWindowSize(windowSize) { sessionSetLocalWindowSize(this, windowSize); }
 
     // ---- errors / lifecycle ----
@@ -1422,24 +1579,32 @@ export constexpr std::string_view kHttp2JS = R"JS(
         for (const s of streams) { s.rstCode = constants.NGHTTP2_INTERNAL_ERROR; s._closed = true; if (!s.destroyed) s.destroy(err); else s.emit("error", err); }
       });
     }
-    _teardown() {
+    // `hard` distinguishes an error teardown from a graceful one. net.Socket's
+    // destroy() closes the fd immediately and drops anything still in its write
+    // queue — including a GOAWAY frame written microseconds earlier, which is
+    // exactly what close() does. A graceful teardown shuts the write side down
+    // instead, so the frame reaches the peer.
+    _teardown(hard) {
       if (this.destroyed) return;
       this.destroyed = true; this.closed = true;
       if (this._timer != null) { try { G.clearTimeout(this._timer); } catch (e) {} this._timer = null; }
-      if (this.socket) { try { this.socket.destroy(); } catch (e) {} }
+      closeSessionSocket(this.socket, hard !== false);
       G.queueMicrotask(() => this.emit("close"));
     }
     _shutdown() { this._teardown(); }
 
     close(cb) {
       if (typeof cb === "function") this.once("close", cb);
-      if (this.destroyed) return;
+      if (this.destroyed || this.closed) return;
       this.closed = true;
-      // graceful: GOAWAY(NO_ERROR) then close socket once streams drain
+      // graceful: GOAWAY(NO_ERROR), then tear down only once the open streams
+      // have drained (node close() -> kMaybeDestroy). Tearing the socket down on
+      // the next microtask instead destroyed in-flight frames — including the
+      // GOAWAY we had just queued.
       const p = Buffer.alloc(8); p.writeUInt32BE(this._lastStreamId > 0 ? this._lastStreamId : 0, 0); p.writeUInt32BE(0, 4);
       try { this._writeFrame(FRAME.GOAWAY, 0, 0, p); } catch (e) {}
       const self = this;
-      G.queueMicrotask(() => self._teardown());
+      G.queueMicrotask(() => self._teardown(false));
     }
     destroy(err, code) {
       if (this.destroyed) return;
@@ -1588,14 +1753,24 @@ export constexpr std::string_view kHttp2JS = R"JS(
       if (obj[":scheme"] !== undefined) throw H2_ERR("The :scheme header is forbidden for CONNECT requests", "ERR_HTTP2_CONNECT_SCHEME", Error);
       if (obj[":path"] !== undefined) throw H2_ERR("The :path header is forbidden for CONNECT requests", "ERR_HTTP2_CONNECT_PATH", Error);
     }
-    return buildNgHeaders(obj, assertValidRequestPseudoHeader, strictSingleValueFields);
+    const built = buildNgHeaders(obj, assertValidRequestPseudoHeader, strictSingleValueFields);
+    built.prepared = obj;
+    return built;
   }
-  function headerListToObject(list, sensitive) {
-    const obj = {};
+  function headerListToObject(list, sensitive, dropPaddedFields) {
+    // node toHeaderObject(): `ObjectCreate(null)`. It is not cosmetic — a peer
+    // may legitimately send `constructor:` or `__proto__:` header fields, and on
+    // an ordinary object the first reads back Object's constructor and the second
+    // is swallowed by the prototype setter (test-http2-multiheaders asserts both).
+    const obj = { __proto__: null };
     const raw = [];
     for (let i = 0; i < list.length; i++) {
       let name = list[i][0]; const value = list[i][1];
       raw.push(name, value);
+      // strictFieldWhitespaceValidation (default on): a field value padded with
+      // SP/HTAB is invalid per RFC 9113 8.2.1 and is dropped rather than
+      // delivered (node's option turns the drop off, not the validity).
+      if (dropPaddedFields && name[0] !== ":" && kPaddedFieldValue.test(value)) continue;
       if (name === ":status") { obj[name] = parseInt(value, 10); continue; }
       // node toHeaderObject: set-cookie is always an array, a repeated cookie
       // field is joined with "; " (RFC 7540 8.1.2.5), any other repeated field
@@ -1700,12 +1875,24 @@ export constexpr std::string_view kHttp2JS = R"JS(
   // RFC 9113 8.2/8.3 request-header validity for a server. Returns true if the
   // header list is malformed (CR/LF/NUL octet, a connection-specific field, or a
   // repeated / misplaced pseudo-header) and the stream must be reset.
+  // RFC 9113 8.2.1: a field value must not contain any control character other
+  // than HTAB, and a *pseudo*-header value must not contain SP either (nghttp2
+  // rejects `:path` containing any byte <= 0x20, which is what
+  // test-http2-client-unescaped-path walks through). A violation is a stream
+  // PROTOCOL_ERROR, not something to pass to the application.
+  const kBadFieldValue = /[\x00-\x08\x0a-\x1f\x7f]/;
+  const kBadPseudoValue = /[\x00-\x20\x7f]/;
+  // Leading or trailing SP/HTAB in a field value is invalid (RFC 9113 8.2.1).
+  // node's `strictFieldWhitespaceValidation` (default on) drops such a field
+  // instead of delivering it; turning it off keeps the raw value.
+  const kPaddedFieldValue = /^[ \t]|[ \t]$/;
   function requestHeadersMalformed(list) {
     const seenPseudo = {};
     let sawRegular = false;
     for (let i = 0; i < list.length; i++) {
       const name = list[i][0], value = list[i][1];
       if (/[\r\n\0]/.test(name) || /[\r\n\0]/.test(value)) return true;
+      if (name[0] === ":" ? kBadPseudoValue.test(value) : kBadFieldValue.test(value)) return true;
       if (name[0] === ":") {
         if (sawRegular) return true;              // pseudo after a regular field
         if (seenPseudo[name]) return true;        // repeated pseudo-header
@@ -1747,14 +1934,21 @@ export constexpr std::string_view kHttp2JS = R"JS(
         if (sc < 100 || sc >= 200) { const e = new RangeError("Invalid informational status code: " + obj[":status"]); e.code = "ERR_HTTP2_INVALID_INFO_STATUS"; throw e; }
         obj[":status"] = String(sc);
       }
-      return buildNgHeaders(obj, assertValidResponsePseudoHeader, strictSingleValueFields);
+      const infoBuilt = buildNgHeaders(obj, assertValidResponsePseudoHeader, strictSingleValueFields);
+      infoBuilt.prepared = Object.assign({ __proto__: null }, obj);
+      if (infoBuilt.prepared[":status"] !== undefined) infoBuilt.prepared[":status"] = parseInt(infoBuilt.prepared[":status"], 10);
+      return infoBuilt;
     }
     // node validatePreparedResponseHeaders is deliberately stricter than HTTP/1:
     // a response status outside 200..599 is rejected outright.
     const status = (obj[":status"] | 0) || 200;
     if (status < 200 || status > 599) { const e = new RangeError("Invalid status code: " + status); e.code = "ERR_HTTP2_STATUS_INVALID"; throw e; }
     obj[":status"] = String(status);
-    return buildNgHeaders(obj, assertValidResponsePseudoHeader, strictSingleValueFields);
+    const built = buildNgHeaders(obj, assertValidResponsePseudoHeader, strictSingleValueFields);
+    // node ServerHttp2Stream#sentHeaders reports the *numeric* status alongside
+    // the fields the response actually carried.
+    built.prepared = Object.assign({ __proto__: null }, obj, { ":status": status });
+    return built;
   }
 
   // === ServerHttp2Stream ===
@@ -1762,6 +1956,7 @@ export constexpr std::string_view kHttp2JS = R"JS(
     constructor(session, id, headers) {
       super(kStreamDuplexOptions);
       initHttp2Stream(this, session, id);
+      this._serverSide = true;
       this._reqHeaders = headers;
       this.pending = false;
       this.headersSent = false;
@@ -1784,7 +1979,7 @@ export constexpr std::string_view kHttp2JS = R"JS(
     _write(chunk, enc, cb) { if (!this.headersSent) this.respond(); http2StreamWrite(this, chunk, enc, cb); }
     _writev(chunks, cb) { if (!this.headersSent) this.respond(); http2StreamWritev(this, chunks, cb); }
     _final(cb) { if (!this.headersSent) this.respond(); http2StreamFinal(this, this._wantTrailers, cb); }
-    _read() { http2StreamRead(this); }
+    _read() { this._didRead = true; http2StreamRead(this); }
     _destroy(err, cb) { http2StreamDestroy(this, err, cb); }
     respond(headers, options) {
       if (this.headersSent) throw mkErr("Response has already been initiated.", "ERR_HTTP2_HEADERS_SENT");
@@ -1802,14 +1997,20 @@ export constexpr std::string_view kHttp2JS = R"JS(
       const st = parseInt(built.list[0] && built.list[0][1], 10);
       if (st === 204 || st === 205 || st === 304 || this.headRequest === true) options = Object.assign({}, options, { endStream: true });
       this.headersSent = true;
-      this.sentHeaders = headers;
+      this.sentHeaders = built.prepared || headers;
       const block = encodeHeaders(built.list, built.sensitive);
       let flags = 0;
       const endStream = !!options.endStream;
-      if (endStream && !options.waitForTrailers) { flags = FLAG.END_STREAM; this._endStreamSent = true; }
-      if (options.waitForTrailers) this._wantTrailers = true;
+      // node ServerHttp2Stream.respond passes STREAM_OPTION_EMPTY_PAYLOAD *and*
+      // STREAM_OPTION_GET_TRAILERS, and nghttp2 lets the empty payload win: with
+      // no data provider the HEADERS frame carries END_STREAM and 'wantTrailers'
+      // never fires. The compat layer always asks for trailers, so treating
+      // waitForTrailers as the stronger option left the response HEADERS without
+      // END_STREAM — a HEAD/204/304 response then reported flags 4 instead of 5.
+      if (endStream) { flags = FLAG.END_STREAM; this._endStreamSent = true; }
+      else if (options.waitForTrailers) this._wantTrailers = true;
       writeHeaderBlock(this.session, this.id, block, flags);
-      if (endStream && !options.waitForTrailers) { this.end(); http2StreamFinish(this); }
+      if (endStream) { this.end(); http2StreamFinish(this); }
       return;
     }
     sendTrailers(headers) {
@@ -1820,6 +2021,7 @@ export constexpr std::string_view kHttp2JS = R"JS(
       // ERR_HTTP2_INVALID_PSEUDOHEADER and must leave the stream retryable.
       for (const k in headers) { if (Object.prototype.hasOwnProperty.call(headers, k) && String(k)[0] === ":") throw mkErr('"' + k + '" is an invalid pseudoheader or is used incorrectly', "ERR_HTTP2_INVALID_PSEUDOHEADER"); }
       this._trailersSent = true;
+      this.sentTrailers = headers;
       const sensitive = sensitiveNamesOf(headers);
       const list = [];
       for (const k in headers) { if (!Object.prototype.hasOwnProperty.call(headers, k)) continue; const lk = String(k).toLowerCase(); list.push([lk, String(headers[k])]); }
@@ -1922,7 +2124,62 @@ export constexpr std::string_view kHttp2JS = R"JS(
       this.respond(headers, options.waitForTrailers ? { waitForTrailers: true } : undefined);
       this.end(body);
     }
-    pushStream(headers, options, cb) { if (typeof options === "function") { cb = options; } if (typeof cb === "function") G.queueMicrotask(() => cb(mkErr("Push streams are not supported", "ERR_HTTP2_PUSH_DISABLED"))); }
+    // node ServerHttp2Stream#pushStream (lib/internal/http2/core.js). The
+    // PUSH_PROMISE frame (RFC 9113 6.6) is sent on THIS stream and announces an
+    // even-numbered server-initiated stream carrying the request the server is
+    // answering unasked; the callback receives that new stream, on which the
+    // application then calls respond()/end() exactly as for a normal one.
+    pushStream(headers, options, callback) {
+      if (typeof options === "function") { callback = options; options = undefined; }
+      if (!this.pushAllowed) throw mkErr("Push stream is not allowed", "ERR_HTTP2_PUSH_DISABLED");
+      if ((this.id % 2) === 0) throw mkErr("A push stream cannot initiate another push stream.", "ERR_HTTP2_NESTED_PUSH");
+      if (typeof callback !== "function") throw argTypeErr("callback", "of type function", callback);
+      assertIsObject(options, "options");
+      const opts = Object.assign({}, options);
+      opts.endStream = !!opts.endStream;
+      assertIsObject(headers, "headers");
+      const h = Object.assign({ __proto__: null }, headers);
+      const parent = this._reqHeaders || {};
+      if (h[":method"] === undefined) h[":method"] = constants.HTTP2_METHOD_GET;
+      if (h[":authority"] === undefined && h["host"] === undefined) h[":authority"] = parent[":authority"] !== undefined ? parent[":authority"] : parent["host"];
+      if (h[":scheme"] === undefined) h[":scheme"] = parent[":scheme"];
+      if (h[":path"] === undefined) h[":path"] = "/";
+      let headRequest = false;
+      if (String(h[":method"]).toUpperCase() === "HEAD") headRequest = opts.endStream = true;
+      const strict = this.session._options && this.session._options.strictSingleValueFields;
+      const built = buildNgHeaders(h, assertValidRequestPseudoHeader, strict);
+      const session = this.session;
+      const id = session._nextPushId();
+      if (id === 0) { G.queueMicrotask(() => callback(mkErr("Out of streams", "ERR_HTTP2_OUT_OF_STREAMS"))); return; }
+      const block = encodeHeaders(built.list, built.sensitive);
+      const promised = Buffer.alloc(4); promised.writeUInt32BE(id, 0);
+      // PUSH_PROMISE splits into PUSH_PROMISE + CONTINUATION the same way
+      // HEADERS does; the promised-id prefix rides on the first frame only.
+      const max = (session._remoteSettings && session._remoteSettings.maxFrameSize) || 16384;
+      if (4 + block.length <= max) {
+        session._writeFrame(FRAME.PUSH_PROMISE, FLAG.END_HEADERS, this.id, Buffer.concat([promised, block]));
+      } else {
+        const first = block.subarray(0, max - 4);
+        session._writeFrame(FRAME.PUSH_PROMISE, 0, this.id, Buffer.concat([promised, first]));
+        let off = max - 4;
+        while (off < block.length) {
+          const end = Math.min(off + max, block.length);
+          session._writeFrame(FRAME.CONTINUATION, end >= block.length ? FLAG.END_HEADERS : 0, this.id, block.subarray(off, end));
+          off = end;
+        }
+      }
+      const push = new ServerHttp2Stream(session, id, h);
+      push.pushed = true;
+      push.headRequest = headRequest;
+      // A pushed stream has no request body, so its readable side is already at
+      // EOF and `endAfterHeaders` is true.
+      push.endAfterHeaders = true;
+      session.streams.set(id, push);
+      G.queueMicrotask(() => {
+        push._onRequestEnd();
+        callback(null, push, h);
+      });
+    }
     // node ServerHttp2Stream.additionalHeaders: an informational (1xx) HEADERS
     // block sent BEFORE the response headers; it does not open the response, so
     // headersSent stays false.
@@ -1931,6 +2188,8 @@ export constexpr std::string_view kHttp2JS = R"JS(
       if (this.headersSent) throw mkErr("Cannot specify additional headers after response initiated", "ERR_HTTP2_HEADERS_AFTER_RESPOND");
       const built = buildResponseHeaderList(headers || {}, this.session._options && this.session._options.strictSingleValueFields, true);
       writeHeaderBlock(this.session, this.id, encodeHeaders(built.list, built.sensitive), 0);
+      // node Http2Stream#sentInfoHeaders: every 1xx block sent so far, in order.
+      this.sentInfoHeaders.push(built.prepared || headers || {});
     }
     priority(options) { streamPriority(this); }
     close(code, cb) { http2StreamClose(this, code, cb); }
@@ -1991,7 +2250,10 @@ export constexpr std::string_view kHttp2JS = R"JS(
       }
     }
     _rstStream(stream, code) { const p = Buffer.alloc(4); p.writeUInt32BE(code >>> 0, 0); this._writeFrame(FRAME.RST_STREAM, 0, stream.id, p); }
+    // Server-initiated (push) streams use even ids starting at 2 (RFC 9113 5.1.1).
+    _nextPushId() { this._lastPushId = (this._lastPushId || 0) + 2; return this._lastPushId > 2147483647 ? 0 : this._lastPushId; }
     _windowUpdate(streamId, increment) { if (streamId === 0) this._localWindow += increment; const p = Buffer.alloc(4); p.writeUInt32BE(increment >>> 0, 0); this._writeFrame(FRAME.WINDOW_UPDATE, 0, streamId, p); }
+    _strictWs() { return this._options.strictFieldWhitespaceValidation !== false; }
     setLocalWindowSize(windowSize) { sessionSetLocalWindowSize(this, windowSize); }
 
     _onData(chunk) {
@@ -2083,6 +2345,7 @@ export constexpr std::string_view kHttp2JS = R"JS(
             http2StreamFinish(stream);
           }
           else if ((streamId & 1) === 1 && streamId > this._lastStreamId) { this._connError(constants.NGHTTP2_PROTOCOL_ERROR); return false; }  // RST on an idle stream (§5.1)
+          else if ((streamId & 1) === 0 && streamId > (this._lastPushId || 0)) { this._connError(constants.NGHTTP2_PROTOCOL_ERROR); return false; }
           return true;
         }
         case FRAME.GOAWAY: {
@@ -2148,7 +2411,7 @@ export constexpr std::string_view kHttp2JS = R"JS(
         // (compat.js onStreamTrailers feeds req.trailers / req.rawTrailers).
         const rawTrailers = [];
         for (let i = 0; i < list.length; i++) rawTrailers.push(list[i][0], list[i][1]);
-        stream.emit("trailers", headerListToObject(list, this._hpack._sensitive), flags, rawTrailers);
+        stream.emit("trailers", headerListToObject(list, this._hpack._sensitive, this._strictWs()), flags, rawTrailers);
         stream._onRequestEnd();
         return true;
       }
@@ -2164,18 +2427,44 @@ export constexpr std::string_view kHttp2JS = R"JS(
           expectLen = isNaN(n) ? null : n;
         }
       }
+      // Inbound resource limits, checked BEFORE the application is told the
+      // stream exists (node hands these to nghttp2 as session options, so the
+      // 'stream' event never fires for a request that trips one):
+      //   * maxHeaderListPairs — nghttp2 max_header_pairs,
+      //   * SETTINGS_MAX_HEADER_LIST_SIZE — the RFC 7541 4.1 header-list size,
+      //     i.e. sum(name.length + value.length + 32),
+      //   * SETTINGS_MAX_CONCURRENT_STREAMS.
+      // The first two are ENHANCE_YOUR_CALM, the third REFUSED_STREAM.
+      const openStreams = this.streams.size;
+      const settings = this._options.settings || {};
+      const maxPairs = this._options.maxHeaderListPairs;
+      const maxListSize = settings.maxHeaderListSize !== undefined ? settings.maxHeaderListSize : settings.maxHeaderSize;
+      const maxConcurrent = settings.maxConcurrentStreams;
+      let limitCode = 0;
+      if (maxPairs !== undefined && list.length > maxPairs) limitCode = constants.NGHTTP2_ENHANCE_YOUR_CALM;
+      if (limitCode === 0 && maxListSize !== undefined) {
+        let listSize = 0;
+        for (let i = 0; i < list.length; i++) listSize += list[i][0].length + list[i][1].length + 32;
+        if (listSize > maxListSize) limitCode = constants.NGHTTP2_ENHANCE_YOUR_CALM;
+      }
+      if (limitCode === 0 && maxConcurrent !== undefined && openStreams >= maxConcurrent) limitCode = constants.NGHTTP2_REFUSED_STREAM;
       stream = new ServerHttp2Stream(this, pb.streamId, null);
       // node Http2Stream#endAfterHeaders: the request carried END_STREAM on its
       // HEADERS frame, i.e. there is no request body to wait for.
       stream.endAfterHeaders = !!pb.endStream;
       this.streams.set(pb.streamId, stream);
       if (pb.streamId > this._lastStreamId) this._lastStreamId = pb.streamId;
+      if (limitCode !== 0) { this._streamError(stream, limitCode); return true; }
       if (requestHeadersMalformed(list)) { this._streamError(stream, constants.NGHTTP2_PROTOCOL_ERROR); return true; }
       if (dupClen) { this._streamError(stream, constants.NGHTTP2_PROTOCOL_ERROR); return true; }
       if (pb.endStream && expectLen != null && expectLen !== 0) { this._streamError(stream, constants.NGHTTP2_PROTOCOL_ERROR); return true; }
       if (!pb.endStream && expectLen != null) stream._expectLen = expectLen;
-      const headersObj = headerListToObject(list, this._hpack._sensitive);
+      const headersObj = headerListToObject(list, this._hpack._sensitive, this._strictWs());
       stream._reqHeaders = headersObj;
+      // The constructor cannot compute this: it is handed `null` for headers and
+      // only learns them here. Left unset, respond() never applied the implicit
+      // END_STREAM a HEAD response requires (the peer saw flags 4, not 5).
+      stream.headRequest = typeof headersObj[":method"] === "string" && headersObj[":method"].toUpperCase() === "HEAD";
       const rawHeaders = [];
       for (let i = 0; i < list.length; i++) { rawHeaders.push(list[i][0], list[i][1]); }
       this.emit("stream", stream, headersObj, flags, rawHeaders);
@@ -2214,10 +2503,10 @@ export constexpr std::string_view kHttp2JS = R"JS(
       this._teardown();
     }
     _onSocketClose() { this._teardown(); }
-    _teardown() {
+    _teardown(hard) {
       if (this.destroyed) return;
       this.destroyed = true; this.closed = true;
-      if (this.socket) { try { this.socket.destroy(); } catch (e) {} }
+      closeSessionSocket(this.socket, hard !== false);
       const streams = Array.from(this.streams.values());
       const self = this;
       G.queueMicrotask(() => { for (const s of streams) s._finish(); self.emit("close"); });
@@ -2228,7 +2517,7 @@ export constexpr std::string_view kHttp2JS = R"JS(
     get localSettings() { return this._localSettings; }
     // server-initiated streams are even-numbered; we never push, so the next id
     // a server session would allocate stays 2 (node reports the same).
-    get state() { return sessionState(this, 2); }
+    get state() { return sessionState(this, (this._lastPushId || 0) + 2); }
     get pendingSettingsAck() { return sessionPendingAck(this); }
     get type() { return constants.NGHTTP2_SESSION_SERVER; }
     settings(s, cb) { return sessionSubmitSettings(this, s, cb); }
@@ -2250,12 +2539,12 @@ export constexpr std::string_view kHttp2JS = R"JS(
     }
     close(cb) {
       if (typeof cb === "function") this.once("close", cb);
-      if (this.destroyed) return;
+      if (this.destroyed || this.closed) return;
       this.closed = true;
       const p = Buffer.alloc(8); p.writeUInt32BE(this._lastStreamId > 0 ? this._lastStreamId : 0, 0); p.writeUInt32BE(0, 4);
       try { this._writeFrame(FRAME.GOAWAY, 0, 0, p); } catch (e) {}
       const self = this;
-      G.queueMicrotask(() => self._teardown());
+      G.queueMicrotask(() => self._teardown(false));
     }
     destroy(err, code) { if (this.destroyed) return; if (err) { const self = this; this._teardown(); G.queueMicrotask(() => self.emit("error", err)); } else this._teardown(); }
     ref() { if (this.socket && this.socket.ref) this.socket.ref(); return this; }
@@ -3163,6 +3452,10 @@ export constexpr std::string_view kHttp2JS = R"JS(
   http2.createServer = makeHttp2Server;
   http2.createSecureServer = makeHttp2SecureServer;
   http2.performServerHandshake = performServerHandshake;
+  installStreamInspect(ClientHttp2Stream);
+  installStreamInspect(ServerHttp2Stream);
+  installSessionInspect(ClientHttp2Session);
+  installSessionInspect(ServerHttp2Session);
   http2.ServerHttp2Session = ServerHttp2Session;
   http2.ServerHttp2Stream = ServerHttp2Stream;
   http2.Http2ServerRequest = Http2ServerRequest;
