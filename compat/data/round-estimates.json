@@ -1,6 +1,6 @@
 {
   "generated_at": "2026-07-25",
-  "purpose": "Per-task estimate-vs-actual for compat rounds, so targets stop being guesses. Each entry records what a task was predicted to deliver, what it delivered, how long it took, and — when the estimate missed badly — the identified cause. Read compat/README.md#estimating-a-round-target before setting a new target.",
+  "purpose": "Per-task estimate-vs-actual for compat rounds, so targets stop being guesses. Each entry records what a task was predicted to deliver, what it delivered, how long it took, and \u2014 when the estimate missed badly \u2014 the identified cause. Read compat/README.md#estimating-a-round-target before setting a new target.",
   "units": {
     "delta_pass": "net change in real `pass` files (node runner; `skipped` excluded)",
     "wall_clock_min": "agent wall-clock minutes, dispatch to final report"
@@ -62,20 +62,93 @@
           "actual_delta_pass": 15,
           "hit_rate": 0.13,
           "wall_clock_min": 74,
-          "estimate_miss_cause": "The stated root cause was wrong. The hangs were not handle ref-counting but every event-pump phase swallowing thrown exceptions (`catch (e) {}`), leaving handles registered forever. Fixing it moved 429 files from a 15s hang to a sub-second diagnosable failure — real progress, but failures are not passes. A target was set on an unverified causal hypothesis."
+          "estimate_miss_cause": "The stated root cause was wrong. The hangs were not handle ref-counting but every event-pump phase swallowing thrown exceptions (`catch (e) {}`), leaving handles registered forever. Fixing it moved 429 files from a 15s hang to a sub-second diagnosable failure \u2014 real progress, but failures are not passes. A target was set on an unverified causal hypothesis."
+        },
+        {
+          "id": "r9/agent-6",
+          "cluster": "vm / repl / module / require",
+          "worklist_files": 161,
+          "cluster_homogeneity": "high",
+          "target_delta_pass": 45,
+          "actual_delta_pass": 59,
+          "hit_rate": 1.31,
+          "wall_clock_min": 97,
+          "note": "Baseline was 19, not the 0 the brief assumed: two inherited commits (execArgv, spawnSync stdio) had already unblocked them. Delta measured from the re-taken baseline."
+        },
+        {
+          "id": "r9/agent-7",
+          "cluster": "worker_threads + child_process",
+          "worklist_files": 138,
+          "cluster_homogeneity": "high",
+          "target_delta_pass": 40,
+          "actual_delta_pass": 53,
+          "hit_rate": 1.33,
+          "wall_clock_min": 108
+        },
+        {
+          "id": "r9/agent-8",
+          "cluster": "streams / web streams / domain",
+          "worklist_files": 102,
+          "cluster_homogeneity": "medium",
+          "target_delta_pass": 30,
+          "actual_delta_pass": 17,
+          "hit_rate": 0.57,
+          "wall_clock_min": 72,
+          "estimate_miss_cause": "Only 33 of the 102 files were reachable at all; the other 69 carry a `// Flags:` header and were gated behind a fix living on a branch this one was not based on. Of the 33 reachable, 17 passed (52%). The work-list was built without checking reachability, so the target was set against a file count two-thirds of which no agent on that base could move."
         }
       ],
       "calibration": {
-        "high_homogeneity_hit_rate_range": [1.32, 1.87],
-        "low_homogeneity_hit_rate_range": [0.13, 0.51],
-        "wall_clock_min_range": [57, 119],
-        "wall_clock_median_min": 83,
+        "high_homogeneity_hit_rate_range": [
+          1.31,
+          1.87
+        ],
+        "low_homogeneity_hit_rate_range": [
+          0.13,
+          0.57
+        ],
+        "wall_clock_min_range": [
+          57,
+          119
+        ],
+        "wall_clock_median_min": 90,
         "conclusions": [
           "Cluster homogeneity predicts hit rate; cluster SIZE does not. The two largest work-lists (611, 580) delivered 51% and 13% of target; the three smallest (70-78) delivered 132-187%.",
           "A target derived from a causal hypothesis that has not itself been verified is not an estimate. Verify the cause on a handful of files first, then extrapolate.",
           "A probe used for extrapolation must be scored the same way as the target metric. The agent-1 probe counted self-skips as conversions; the target did not.",
-          "One agent task takes 57-119 min (median 83). A 60-minute coordination tick is SHORTER than a single task, so a tick cannot be a round boundary."
+          "One agent task takes 57-119 min (median 83). A 60-minute coordination tick is SHORTER than a single task, so a tick cannot be a round boundary.",
+          "Check REACHABILITY before setting a target, not just file count. agent-8's list was 102 files of which only 33 could be moved from its base; the rest were gated behind a fix on a sibling branch. Target per reachable file, and say which files are excluded and why."
         ]
+      },
+      "outcome": {
+        "full_corpus_before": {
+          "binary": "round-8 HEAD (23217dd)",
+          "pass": 1695,
+          "skipped": 279,
+          "fail": 1862,
+          "timeout": 583,
+          "oom_kill": 14,
+          "files": 4433,
+          "pass_rate": 0.382
+        },
+        "full_corpus_after": {
+          "binary": "r9/integration (pre globals fix)",
+          "pass": 1463,
+          "skipped": 296,
+          "fail": 2499,
+          "timeout": 169,
+          "oom_kill": 6,
+          "files": 4433,
+          "pass_rate": 0.33
+        },
+        "sum_of_isolated_task_deltas": 339,
+        "actual_net_delta_pass": -232,
+        "why_the_sum_does_not_match": "Task deltas were each measured in isolation against that task's own cluster. Composed, one change (process.on('exit') firing, which makes common.mustCall enforceable, plus the event pump no longer swallowing thrown exceptions) invalidated passes across the WHOLE corpus, not just its own work-list. 496 files went green->non-green; all 496 were classified from their logs and 495 are files that had been passing without verifying anything. Isolated per-cluster deltas are not additive when a task changes a global verification mechanism.",
+        "confirmed_real_regressions": 1,
+        "confirmed_real_regression_files": [
+          "compat/node/test/parallel/test-http-write-empty-string.js"
+        ],
+        "timeout_reduction": 414,
+        "note": "The published 44.5% headline was never real: it counted ~300 self-skips as passes on top of unenforced mustCall. 38.2% is the honest round-8 figure measured with the corrected runner."
       }
     }
   ]

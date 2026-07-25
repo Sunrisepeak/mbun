@@ -117,6 +117,39 @@ Rules this produces, in order of how much they cost when ignored:
    corpus triageable and was worth doing — it is just not a pass count, and
    reporting it as one would be dishonest.
 
-**Wall-clock:** one task runs 57–119 minutes (median 83). A coordination tick
+**Wall-clock:** one task runs 57–119 minutes (median 90). A coordination tick
 shorter than that cannot be a round boundary — it is a checkpoint. Plan a round
 as *dispatch → several checkpoints → integrate*, never as one tick.
+
+### Isolated deltas are not additive
+
+Round 9's eight tasks each measured a gain against their own cluster, each with
+a zero-regression gate. They summed to **+339**. The composed branch measured
+**−232**.
+
+Nothing was faked and no task was wrong. One task made `process.on('exit')`
+fire, which is where node registers `common.mustCall`'s verifier, and stopped
+the event pump swallowing thrown exceptions. That turned a *global verification
+mechanism* on. 496 files went green→non-green; all 496 were classified from
+their logs and **495 had been passing without verifying anything** — 275
+assertions that now actually run, 176 `mustCall`/`mustNotCall` violations, 19
+verified vacuous passes, 26 whose round-8 logs were empty (the signature of a
+swallowed throw). Exactly one was a real regression.
+
+So:
+
+- **Per-cluster deltas only add up while every task is a local fix.** The moment
+  one task changes how the corpus is *verified*, every other task's baseline is
+  invalidated corpus-wide, not just inside its own work-list.
+- **Sequence such a task first, or measure it last.** Landing the verification
+  change before the others would have given every other task an honest baseline
+  to work against, at the cost of making their targets look smaller.
+- **A round that lowers the headline can still be the most valuable one.**
+  Timeouts fell 583 → 169 and the number finally means what it says. Report the
+  drop and its classification; do not report the sum of the parts.
+- **Re-rank clusters against the composed binary, never the pre-round one.**
+  Doing so immediately surfaced a self-inflicted bug that had become the corpus's
+  largest single cluster (265 files across 79 subsystems: two internal globals
+  left enumerable, which node's `common` reports as leaked — and which fired
+  *before* ~300 files could reach `common.skip()`, so they reported `fail`
+  instead of `skipped`).
