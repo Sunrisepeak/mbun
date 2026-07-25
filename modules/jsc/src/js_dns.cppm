@@ -131,6 +131,22 @@ export constexpr std::string_view kDnsJS = R"JS(
     const min = positive ? 1 : 0;
     if (v < min || v > 4294967295) throw outOfRange(name, ">= " + min + " && <= 4294967295", v);
   };
+  // ERR_INVALID_ARG_VALUE reports inspect(value), not determineSpecificType.
+  const inspectValue = (v) => {
+    if (typeof v === "string") return "'" + v + "'";
+    if (typeof v === "bigint") return String(v) + "n";
+    if (v === null || typeof v !== "object") return String(v);
+    try { return JSON.stringify(v); } catch (e) { return String(v); }
+  };
+  const validateOneOf = (v, name, allowed) => {
+    if (allowed.indexOf(v) !== -1) return;
+    const list = allowed.map((x) => (typeof x === "string" ? "'" + x + "'" : String(x))).join(", ");
+    const e = new TypeError("The " + (String(name).indexOf(".") !== -1 ? "property" : "argument") +
+      " '" + name + "' must be one of: " + list + ". Received " + inspectValue(v));
+    e.code = "ERR_INVALID_ARG_VALUE";
+    throw e;
+  };
+  const VALID_DNS_ORDERS = ["verbatim", "ipv4first", "ipv6first"];
 
   // Native lookup completes on the JS thread through DN.drain(), which is
   // composed into the runtime's existing IO pump below.
@@ -154,9 +170,110 @@ export constexpr std::string_view kDnsJS = R"JS(
       return callback(r);
     };
   };
-  const rawLookup = (host, family, flags, callback) => {
-    if (DN && DN.lookup) DN.lookup(String(host), family | 0, flags | 0, inflight(callback));
-    else soon(() => callback({ error: "ENOTFOUND" }));
+  // ── internalBinding('cares_wrap') ──────────────────────────────────────────
+  // node's dns layer never calls the OS resolver directly: every lookup goes
+  // through `cares.getaddrinfo(req, hostname, family, hints, order)` on the
+  // cares_wrap binding. Several corpus files replace that one function before
+  // requiring node:dns — to observe the arguments dns.lookup computed, or to
+  // force a failure — so the indirection is part of the observable contract and
+  // not an implementation detail. Registered through the extension point in
+  // builtins/node_internal_binding.cppm; the binding object is cached there, so
+  // a test's monkey-patch is seen by every later lookup.
+  // Blueprint: src/cares_wrap.{h,cc} (the DNS_ORDER_* constants, GetAddrInfo's
+  // argument order, sort_addresses) and lib/dns.js (onlookup/onlookupall, which
+  // receive an array of address STRINGS and derive the family with isIP).
+  const DNS_ORDER_VERBATIM = 0, DNS_ORDER_IPV4_FIRST = 1, DNS_ORDER_IPV6_FIRST = 2;
+  // node sorts in C++ (sort_addresses): a stable partition by family, leaving the
+  // resolver's relative order intact inside each family.
+  const sortByOrder = (rows, order) => {
+    if (order !== DNS_ORDER_IPV4_FIRST && order !== DNS_ORDER_IPV6_FIRST) return rows;
+    const first = order === DNS_ORDER_IPV4_FIRST ? 4 : 6;
+    const head = [], tail = [];
+    for (const row of rows) (row && row.family === first ? head : tail).push(row);
+    return head.concat(tail);
+  };
+  // A stubbed cares.getaddrinfo hands back a NUMERIC uv errno
+  // (internalBinding('uv').UV_ENOMEM), which node turns into the code string via
+  // uv.errname before building the DNSException. Accept both forms.
+  const uvName = (err) => {
+    if (typeof err === "string") return err;
+    if (typeof err === "number" && err !== 0) {
+      const ib = G.__mbunInternalBinding;
+      if (typeof ib === "function") {
+        try { return ib("uv").errname(err); } catch (e) { /* fall through */ }
+      }
+    }
+    return "ENOTFOUND";
+  };
+  const uvErrno = (code) => {
+    // node hands the uv/ares error number to DNSException, which turns it back
+    // into a string via uv.errname. Keep the code string itself: the surrounding
+    // layer already maps codes, and inventing a wrong number would mislabel it.
+    return code || "ENOTFOUND";
+  };
+  const caresWrap = {
+    DNS_ORDER_VERBATIM, DNS_ORDER_IPV4_FIRST, DNS_ORDER_IPV6_FIRST,
+    // Legacy aliases node kept for the pre-`order` API.
+    AI_ADDRCONFIG: 1024, AI_ALL: 256, AI_V4MAPPED: 2048,
+    getaddrinfo(req, hostname, family, hints, order) {
+      if (!DN || !DN.lookup) { soon(() => req.oncomplete(uvErrno("ENOTFOUND"))); return 0; }
+      DN.lookup(String(hostname), family | 0, hints | 0, inflight((r) => {
+        if (!Array.isArray(r)) { req.oncomplete(uvErrno(r && r.error)); return; }
+        // node's oncomplete takes address strings; the family is recovered with
+        // isIP, exactly as lib/dns.js onlookup/onlookupall do.
+        req.oncomplete(0, sortByOrder(r, order | 0).map((x) => x.address));
+      }));
+      return 0;
+    },
+    getnameinfo(req, ip, port) {
+      if (!DN || !DN.lookupService) { soon(() => req.oncomplete(uvErrno("ENOTFOUND"))); return 0; }
+      DN.lookupService(String(ip), port | 0, inflight((r) => {
+        if (r && r.error) { req.oncomplete(uvErrno(r.error)); return; }
+        req.oncomplete(0, r.hostname, r.service);
+      }));
+      return 0;
+    },
+    strerror: (code) => String(code),
+    // The request/channel wrappers node's dns layer allocates. They carry no
+    // native state here — the callback closure does — but they must exist and be
+    // constructible, and a Resolver's _handle must answer getServers/setServers.
+    GetAddrInfoReqWrap: function GetAddrInfoReqWrap() {},
+    GetNameInfoReqWrap: function GetNameInfoReqWrap() {},
+    QueryReqWrap: function QueryReqWrap() {},
+    ChannelWrap: function ChannelWrap(timeout, tries, maxTimeout) {
+      this._timeout = timeout; this._tries = tries; this._maxTimeout = maxTimeout;
+      this._servers = [];
+    },
+  };
+  caresWrap.ChannelWrap.prototype.getServers = function () { return this._servers.slice(); };
+  caresWrap.ChannelWrap.prototype.setServers = function (list) { this._servers = list ? list.slice() : []; return 0; };
+  caresWrap.ChannelWrap.prototype.setLocalAddress = function () {};
+  caresWrap.ChannelWrap.prototype.cancel = function () {};
+  if (typeof G.__mbunInternalBindingDefine === "function") {
+    G.__mbunInternalBindingDefine("cares_wrap", () => caresWrap);
+  }
+  // Resolved at CALL time, never captured: a corpus file replaces
+  // cares.getaddrinfo after this partition has already run.
+  const cares = () => {
+    const ib = G.__mbunInternalBinding;
+    if (typeof ib !== "function") return caresWrap;
+    try { return ib("cares_wrap"); } catch (e) { return caresWrap; }
+  };
+  const rawLookup = (host, family, flags, callback, order) => {
+    const CW = cares();
+    if (typeof CW.getaddrinfo !== "function") { soon(() => callback({ error: "ENOTFOUND" })); return; }
+    const req = new CW.GetAddrInfoReqWrap();
+    req.hostname = String(host);
+    req.family = family | 0;
+    // Translate node's (err, addressStrings) back into this layer's
+    // [{ address, family }] rows.
+    req.oncomplete = (err, addresses) => {
+      if (err || !Array.isArray(addresses)) { callback({ error: uvErrno(err) }); return; }
+      callback(addresses.map((a) => ({ address: a, family: (family | 0) || isIP(a) })));
+    };
+    const err = CW.getaddrinfo(req, req.hostname, family | 0, flags | 0,
+                               order === undefined ? DNS_ORDER_VERBATIM : order | 0);
+    if (err) soon(() => callback({ error: uvErrno(err) }));
   };
   const rawReverse = (ip, callback) => {
     if (DN && DN.reverse) DN.reverse(String(ip), inflight(callback));
@@ -291,40 +408,86 @@ export constexpr std::string_view kDnsJS = R"JS(
   };
 
   // ── node:dns/promises ──────────────────────────────────────────────────────
-  // Bun coalesces/reuses recent resolver answers. A short raw-row cache keeps
-  // callback, promise and util.promisify views consistent when an upstream DNS
-  // server rotates equally-ranked addresses between consecutive requests.
-  const lookupCache = new Map();
-  const LOOKUP_CACHE_MS = 30_000;
-  const promiseLookup = (hostname, options) => {
-    // node lib/dns.js lookup(): a truthy hostname must be a string, and the
-    // check is synchronous (dns.lookup(1, {}) throws, it does not reject).
+  // NOTE: there is deliberately no result cache here. bun coalesces recent
+  // resolver answers, but node:dns does not: every dns.lookup is one
+  // cares.getaddrinfo call, and the corpus counts those calls to check the
+  // arguments dns.lookup computed (test-dns-default-order-*, which replace
+  // cares.getaddrinfo and assert one entry per lookup). A cache silently
+  // swallowed every repeat lookup and made those files unfixable.
+  // node lib/dns.js lookup() / internal/dns/promises.js lookup(): parse and
+  // validate the arguments, in node's order, and return the numbers the
+  // cares_wrap binding takes. Shared by the callback and promise entry points so
+  // both reject identically.
+  const AI_MASK = 1024 | 256 | 2048;  // AI_ADDRCONFIG | AI_ALL | AI_V4MAPPED
+  const parseLookupOptions = (hostname, options) => {
     if (hostname) validateString(hostname, "hostname");
-    return promiseLookup_(hostname, options);
-  };
-  const promiseLookup_ = (hostname, options) => new Promise((resolve, reject) => {
-    let family = 0, all = false, flags = 0;
-    if (typeof options === "number") family = normFamily(options);
-    else if (options && typeof options === "object") {
-      family = normFamily(options.family); all = !!options.all;
-      if (typeof options.hints === "number") flags = options.hints;
+    let family = 0, all = false, hints = 0;
+    let orderName = getResultOrder_();
+    if (typeof options === "number") {
+      validateOneOf(options, "family", [0, 4, 6]);
+      family = options;
+    } else if (options !== undefined && options !== null && typeof options !== "object") {
+      throw argTypeError("options", "must be one of type integer or object", options);
+    } else if (options) {
+      if (options.hints !== undefined && options.hints !== null) {
+        if (typeof options.hints !== "number") throw argTypeError("options.hints", "must be of type number", options.hints);
+        hints = options.hints >>> 0;
+        // node validateHints: anything outside the AI_* mask is refused.
+        if ((hints & ~AI_MASK) !== 0) {
+          const e = new TypeError("The argument 'hints' is invalid. Received " + inspectValue(options.hints));
+          e.code = "ERR_INVALID_ARG_VALUE";
+          throw e;
+        }
+      }
+      if (options.family !== undefined && options.family !== null) {
+        if (options.family === "IPv4") family = 4;
+        else if (options.family === "IPv6") family = 6;
+        else { validateOneOf(options.family, "options.family", [0, 4, 6]); family = options.family; }
+      }
+      if (options.all !== undefined && options.all !== null) all = options.all === true;
+      if (options.verbatim !== undefined) orderName = options.verbatim ? "verbatim" : "ipv4first";
+      if (options.order !== undefined) {
+        validateOneOf(options.order, "order", VALID_DNS_ORDERS);
+        orderName = options.order;
+      }
     }
-    if (!hostname) { resolve(all ? [] : { address: null, family: 4 }); return; }
+    const order = orderName === "ipv4first" ? DNS_ORDER_IPV4_FIRST
+      : orderName === "ipv6first" ? DNS_ORDER_IPV6_FIRST : DNS_ORDER_VERBATIM;
+    return { family, all, hints, order };
+  };
+  const promiseLookup = (hostname, options) => {
+    // Validation is synchronous: dns.lookup(1, {}) throws, it does not reject.
+    const o = parseLookupOptions(hostname, options);
+    return promiseLookup_(hostname, o);
+  };
+  // Mirrors internal/dns/promises.js createLookupPromise: the request object
+  // carries `resolve`/`reject` and node's onlookup/onlookupall read them off
+  // `this`. Corpus files stub cares.getaddrinfo and wrap exactly those two
+  // properties, so the protocol — not just the result — is observable.
+  const promiseLookup_ = (hostname, o) => new Promise((resolve, reject) => {
+    if (!hostname) { resolve(o.all ? [] : { address: null, family: 4 }); return; }
     const host = String(hostname);
     if (host.indexOf("\0") !== -1) { reject(nodeError("ENOTFOUND", "getaddrinfo", host)); return; }
-    const key = host + "\0" + family + "\0" + flags;
-    const cacheable = host !== "localhost" && isIP(host) === 0;
-    const finish = (rows) => {
-      if (all) resolve(rows.map((x) => ({ address: x.address, family: x.family })));
-      else resolve({ address: rows[0].address, family: rows[0].family });
-    };
-    const cached = cacheable ? lookupCache.get(key) : undefined;
-    if (cached && Date.now() - cached.at < LOOKUP_CACHE_MS) { finish(cached.rows); return; }
-    rawLookup(host, family, flags, (r) => {
-      if (!Array.isArray(r)) { reject(nodeError(r.error || "ENOTFOUND", "getaddrinfo", host)); return; }
-      if (cacheable) lookupCache.set(key, { at: Date.now(), rows: r });
-      finish(r);
-    });
+    const CW = cares();
+    if (typeof CW.getaddrinfo !== "function") { reject(nodeError("ENOTFOUND", "getaddrinfo", host)); return; }
+    const req = new CW.GetAddrInfoReqWrap();
+    req.family = o.family;
+    req.hostname = host;
+    req.resolve = resolve;
+    req.reject = reject;
+    req.oncomplete = o.all
+      ? function onlookupall(err, addresses) {
+          if (err) { this.reject(nodeError(uvName(err), "getaddrinfo", this.hostname)); return; }
+          const fam = this.family;
+          this.resolve(addresses.map((a) => ({ address: a, family: fam || isIP(a) })));
+        }
+      : function onlookup(err, addresses) {
+          if (err) { this.reject(nodeError(uvName(err), "getaddrinfo", this.hostname)); return; }
+          if (!addresses || addresses.length === 0) { this.reject(nodeError("ENOTFOUND", "getaddrinfo", this.hostname)); return; }
+          this.resolve({ address: addresses[0], family: this.family || isIP(addresses[0]) });
+        };
+    const err = CW.getaddrinfo(req, host, o.family, o.hints, o.order);
+    if (err) reject(nodeError(uvName(err), "getaddrinfo", host));
   });
 
   // The record queries validate their hostname OUTSIDE the Promise executor:
@@ -374,15 +537,56 @@ export constexpr std::string_view kDnsJS = R"JS(
     if (isIP(address) === 0)
       throw new TypeError('The "address" argument is invalid. Received type string (' + JSON.stringify(String(address)).replace(/"/g, "'") + ")");
   };
+  // node lib/dns.js lookupService / internal/dns/promises.js
+  // createLookupServicePromise both go through cares.getnameinfo and surface a
+  // binding error IMMEDIATELY — the callback form throws, the promise form
+  // rejects. test-dns-lookupService stubs getnameinfo to return UV_ENOENT and
+  // asserts both shapes, so the split matters.
+  const nodeValidateService = (address, port) => {
+    if (isIP(address) === 0) {
+      const e = new TypeError("The argument 'address' is invalid. Received " + inspectValue(address));
+      e.code = "ERR_INVALID_ARG_VALUE";
+      throw e;
+    }
+    if (typeof port !== "number" || !Number.isInteger(port) || port < 0 || port > 65535) {
+      const e = new RangeError('The value of "port" is out of range. It must be >= 0 && <= 65535. Received ' + inspectValue(port));
+      e.code = "ERR_SOCKET_BAD_PORT";
+      throw e;
+    }
+  };
+  // Starts the request; `onDone(err, result)` receives the async completion.
+  // Returns a synchronous error from the binding (never throws it itself) so each
+  // caller can throw or reject as node does.
+  const startLookupService = (address, port, onDone) => {
+    const CW = cares();
+    if (typeof CW.getnameinfo !== "function") return "ENOTFOUND";
+    const req = new CW.GetNameInfoReqWrap();
+    req.hostname = String(address);
+    req.port = port | 0;
+    req.oncomplete = function onlookupservice(err, hostname, service) {
+      if (err) { onDone(nodeError(uvName(err), "getnameinfo", this.hostname)); return; }
+      onDone(null, { hostname, service });
+    };
+    const err = CW.getnameinfo(req, req.hostname, port | 0);
+    return err ? uvName(err) : null;
+  };
   const promiseLookupService = (address, port) => {
-    validateService(address);
+    nodeValidateService(address, port);
     return new Promise((resolve, reject) => {
-      rawLookupService(address, port, (r) => {
-        if (r && r.error) reject(nodeError(r.error, "getnameinfo", address));
-        else resolve(r);
-      });
+      const err = startLookupService(address, port, (e, r) => (e ? reject(e) : resolve(r)));
+      if (err) reject(nodeError(err, "getnameinfo", String(address)));
     });
   };
+  // The callback form validates, then throws a binding error synchronously.
+  const cbLookupService = function lookupService(address, port, callback) {
+    nodeValidateService(address, port);
+    validateFunction(callback, "callback");
+    const err = startLookupService(address, port,
+      (e, r) => (e ? callback(e) : callback(null, r.hostname, r.service)));
+    if (err) throw nodeError(err, "getnameinfo", String(address));
+    return undefined;
+  };
+  cbLookupService[promisifyCustom] = promiseLookupService;
 
   const promiseResolve = (hostname, rrtype) => {
     const t = (rrtype == null ? "A" : String(rrtype));
@@ -395,10 +599,24 @@ export constexpr std::string_view kDnsJS = R"JS(
 
   // Shared default result order (node:dns, dns.promises and dns/promises all
   // observe the same setting — see issue #28948).
+  // node internal/dns/utils.js initializeDns(): --dns-result-order seeds the
+  // module default, and validateOneOf rejects a bad value at startup.
   let defaultResultOrder_ = "verbatim";
+  {
+    const argv = (G.process && G.process.execArgv) || [];
+    for (const a of argv) {
+      if (typeof a === "string" && a.startsWith("--dns-result-order=")) {
+        const v = a.slice("--dns-result-order=".length);
+        validateOneOf(v, "--dns-result-order", VALID_DNS_ORDERS);
+        defaultResultOrder_ = v;
+      }
+    }
+  }
+  // node internal/dns/utils.js setDefaultResultOrder runs
+  // validateOneOf(value, 'dnsOrder', validDnsOrders), i.e. ERR_INVALID_ARG_VALUE
+  // — not a bare TypeError (test-dns-set-default-order asserts the code).
   const setResultOrder_ = (order) => {
-    if (order !== "ipv4first" && order !== "ipv6first" && order !== "verbatim")
-      throw new TypeError("The argument 'order' must be one of: 'verbatim', 'ipv4first', 'ipv6first'. Received " + JSON.stringify(order));
+    validateOneOf(order, "dnsOrder", VALID_DNS_ORDERS);
     defaultResultOrder_ = order;
   };
   const getResultOrder_ = () => defaultResultOrder_;
@@ -602,9 +820,13 @@ export constexpr std::string_view kDnsJS = R"JS(
   // `nameArg`, when given, is validated BEFORE the callback — node's
   // internal/dns/callback_resolver.js query() runs validateString(name) first, so
   // `dns.resolveNs([])` (one argument, no callback) must report the name error.
+  // `nameArg` may also be a function, for an entry point whose leading argument
+  // is validated conditionally (lib/dns.js lookup only checks a *truthy*
+  // hostname, so dns.lookup(undefined, cb) is legal).
   const cbify = (promiseFn, spread, nameArg) => {
     const fn = function (...a) {
-      if (nameArg) validateString(a[0], nameArg);
+      if (typeof nameArg === "function") nameArg(a);
+      else if (nameArg) validateString(a[0], nameArg);
       const cb = a[a.length - 1];
       validateFunction(cb, "callback");
       const args = a.slice(0, -1);
@@ -617,8 +839,12 @@ export constexpr std::string_view kDnsJS = R"JS(
   };
 
   const dns = {
-    lookup: cbify(promiseLookup, (v) => (v && v.address !== undefined && !Array.isArray(v) ? [v.address, v.family] : [v])),
-    lookupService: cbify(promiseLookupService, (v) => [v.hostname, v.service]),
+    // node lib/dns.js lookup() validates the hostname and the options BEFORE the
+    // callback, so `dns.lookup(false, 'options', 'cb')` reports the options
+    // error rather than a callback one.
+    lookup: cbify(promiseLookup, (v) => (v && v.address !== undefined && !Array.isArray(v) ? [v.address, v.family] : [v]),
+      (a) => { parseLookupOptions(a[0], typeof a[1] === "function" ? undefined : a[1]); }),
+    lookupService: cbLookupService,
     resolve: cbify(promiseResolve, undefined, "name"),
     resolve4: cbify(dnsPromises.resolve4, undefined, "name"),
     resolve6: cbify(dnsPromises.resolve6, undefined, "name"),
