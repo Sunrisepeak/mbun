@@ -23,6 +23,13 @@ export import :node_stream_readable;
 export import :node_stream_writable;
 export import :node_stream_pipeline;
 export import :node_stream_webadapters;
+export import :node_stream_iter_core;
+export import :node_stream_iter_push;
+export import :node_stream_iter_consumers;
+export import :node_stream_iter_pull;
+export import :node_stream_iter_multi;
+export import :node_stream_iter_classic;
+export import :node_stream_iter_entry;
 export import :zlib_stream;
 export import :crypto_asym;
 export import :node_os;
@@ -95,6 +102,18 @@ export inline const std::string kNodeBuiltinsJS =
         .append(detail::kNodeStreamWritableJS)
         .append(detail::kNodeStreamPipelineJS)
         .append(detail::kNodeStreamWebAdaptersJS)
+        // node:stream/iter — registered on the same CJS registry as the
+        // node:stream partitions above (which must therefore precede them), and
+        // only reachable under --experimental-stream-iter. Every module is
+        // require()d lazily by the entry partition, so the order among these
+        // seven is irrelevant; the entry goes last only for readability.
+        .append(detail::kNodeStreamIterCoreJS)
+        .append(detail::kNodeStreamIterPushJS)
+        .append(detail::kNodeStreamIterConsumersJS)
+        .append(detail::kNodeStreamIterPullJS)
+        .append(detail::kNodeStreamIterMultiJS)
+        .append(detail::kNodeStreamIterClassicJS)
+        .append(detail::kNodeStreamIterEntryJS)
         .append(detail::kCryptoAsymJS)
         .append(detail::kZlibStreamJS)
         .append(detail::kNodeOsJS)

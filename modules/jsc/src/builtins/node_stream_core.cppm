@@ -93,6 +93,22 @@ inline constexpr std::string_view kNodeStreamCoreJS = R"JS(
   const $ERR_INVALID_ARG_VALUE = (name, value, reason = "is invalid") =>
     mk(TypeError, "ERR_INVALID_ARG_VALUE",
       `The ${name.includes(".") ? "property" : "argument"} '${name}' ${reason}. Received ${inspectVal(value)}`);
+  // node errors.js:1471 declares ERR_INVALID_ARG_VALUE with a RangeError variant
+  // (`E(..., TypeError, RangeError)`); stream/iter's consumers use it for an
+  // out-of-domain options.encoding.
+  const $ERR_INVALID_ARG_VALUE_RangeError = (name, value, reason = "is invalid") =>
+    mk(RangeError, "ERR_INVALID_ARG_VALUE",
+      `The ${name.includes(".") ? "property" : "argument"} '${name}' ${reason}. Received ${inspectVal(value)}`);
+  // node errors.js:1554 `E('ERR_INVALID_STATE', 'Invalid state: %s', Error,
+  // TypeError, RangeError)` — one code, three constructors, which stream/iter
+  // uses to distinguish a protocol misuse (TypeError) from an out-of-range
+  // backpressure decision (RangeError).
+  const $ERR_INVALID_STATE = (msg) => mk(Error, "ERR_INVALID_STATE", `Invalid state: ${msg}`);
+  const $ERR_INVALID_STATE_TypeError = (msg) => mk(TypeError, "ERR_INVALID_STATE", `Invalid state: ${msg}`);
+  const $ERR_INVALID_STATE_RangeError = (msg) => mk(RangeError, "ERR_INVALID_STATE", `Invalid state: ${msg}`);
+  // node errors.js:1646 `E('ERR_OPERATION_FAILED', 'Operation failed: %s', Error,
+  // TypeError)`; stream/iter wraps a thrown non-Error in the TypeError variant.
+  const $ERR_OPERATION_FAILED = (msg) => mk(TypeError, "ERR_OPERATION_FAILED", `Operation failed: ${msg}`);
   const $ERR_INVALID_RETURN_VALUE = (input, name, value) =>
     mk(TypeError, "ERR_INVALID_RETURN_VALUE",
       `Expected ${input} to be returned from the "${name}" function but got ${specific(value)}.`);
@@ -160,9 +176,23 @@ inline constexpr std::string_view kNodeStreamCoreJS = R"JS(
     } catch {}
     return new Promise(() => {});
   };
-  // $cpp("NodeModuleModule.cpp", "createStreamIterEnabledFlag") gates the
-  // experimental Symbol.for("Stream.toAsyncStreamable") path only.
-  const $cpp = () => false;
+  // $cpp("NodeModuleModule.cpp", "createStreamIterEnabledFlag") is bun's
+  // write-once CLI bit for --experimental-stream-iter. It gates both the
+  // Symbol.for("Stream.toAsyncStreamable") interop path on Readable and the
+  // node:stream/iter + node:zlib/iter entry points (node_stream_iter_entry).
+  // It cannot be resolved at image-evaluation time — process.execArgv does not
+  // exist yet — which is exactly why node defers the check too
+  // (internal/streams/readable.js:1819), so read execArgv on each call and let
+  // the callers cache. Not a mutable seam: mbun derives execArgv from the raw
+  // command line at startup (src/cli.cppm derive_exec_argv).
+  const $cpp = (file, name) => {
+    if (name !== "createStreamIterEnabledFlag") return false;
+    const argv = (G.process && G.process.execArgv) || [];
+    for (let i = 0; i < argv.length; i++) {
+      if (argv[i] === "--experimental-stream-iter") return true;
+    }
+    return false;
+  };
 
   const H = {
     $ERR_INVALID_ARG_TYPE, $ERR_INVALID_ARG_VALUE, $ERR_INVALID_RETURN_VALUE, $ERR_OUT_OF_RANGE,
@@ -173,6 +203,9 @@ inline constexpr std::string_view kNodeStreamCoreJS = R"JS(
     $ERR_STREAM_ITER_MISSING_FLAG, $makeAbortError, $toClass, __isCallable, __debug, __assert,
     $inheritsReadableStream, $inheritsWritableStream, $inheritsTransformStream, $inheritsBlob,
     __hasAsyncContext, $webStreamClosedPromise, $cpp,
+    // stream/iter (internal/streams/iter/*)
+    $ERR_INVALID_ARG_VALUE_RangeError, $ERR_INVALID_STATE, $ERR_INVALID_STATE_TypeError,
+    $ERR_INVALID_STATE_RangeError, $ERR_OPERATION_FAILED,
   };
   G.__mbunStreamReg = { def: (id, fn) => { __mods[id] = fn; }, require: __req, H };
 
