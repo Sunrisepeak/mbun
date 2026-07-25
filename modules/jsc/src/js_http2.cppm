@@ -559,6 +559,40 @@ export constexpr std::string_view kHttp2JS = R"JS(
     if (windowSize > session._localWindow) session._windowUpdate(0, windowSize - session._localWindow);
   }
 
+  // Http2Session#ping (node lib/internal/http2/core.js): an 8-byte opaque
+  // payload (random when omitted) whose callback fires on the peer's PING ACK
+  // with (err, durationMs, payload) — not immediately, and not with a
+  // fabricated payload. A ping issued while still connecting or after close()
+  // is cancelled with ERR_HTTP2_PING_CANCEL.
+  function sessionPing(session, payload, cb) {
+    if (session.destroyed) throw mkErr("The session has been destroyed", "ERR_HTTP2_INVALID_SESSION");
+    if (typeof payload === "function") { cb = payload; payload = undefined; }
+    if (payload) {
+      if (!Buffer.isBuffer(payload) && !ArrayBuffer.isView(payload)) throw argTypeErr("payload", "an instance of Buffer, TypedArray, or DataView", payload);
+      if (payload.byteLength !== 8) { const e = new RangeError("HTTP2 ping payload must be 8 bytes"); e.code = "ERR_HTTP2_PING_LENGTH"; throw e; }
+    }
+    if (typeof cb !== "function") throw argTypeErr("callback", "of type function", cb);
+    const buf = payload ? Buffer.from(payload) : Buffer.alloc(8);
+    if (!payload) for (let i = 0; i < 8; i++) buf[i] = (Math.random() * 256) | 0;
+    if (session.connecting || session.closed) {
+      G.queueMicrotask(() => cb(mkErr("HTTP2 ping cancelled", "ERR_HTTP2_PING_CANCEL")));
+      return;
+    }
+    if (!session._pings) session._pings = [];
+    session._pings.push({ key: buf.toString("hex"), cb, start: Date.now(), payload: buf });
+    session._writeFrame(FRAME.PING, 0, 0, buf);
+    return true;
+  }
+  function resolvePing(session, payload) {
+    const pings = session._pings;
+    if (!pings || !pings.length) return;
+    const key = Buffer.from(payload).toString("hex");
+    let idx = pings.findIndex((p) => p.key === key);
+    if (idx < 0) idx = 0;   // a peer that echoes a different payload still acks
+    const p = pings.splice(idx, 1)[0];
+    try { p.cb(null, Date.now() - p.start, p.payload); } catch (e) {}
+  }
+
   // Http2StreamState (node docs `http2stream.state`). `state` is nghttp2's
   // stream state enum; 1 = NGHTTP2_STREAM_STATE_OPEN, 7 = ..._CLOSED.
   function streamState(st) {
@@ -818,9 +852,14 @@ export constexpr std::string_view kHttp2JS = R"JS(
       // A method with no body (GET/HEAD/DELETE) or an explicit endStream option
       // may close the stream on the HEADERS frame; otherwise req.end() sends the
       // trailing empty DATA(END_STREAM). HEADERS otherwise carry END_HEADERS only.
-      const noBody = headers[":method"] && /^(GET|HEAD|DELETE)$/i.test(headers[":method"]);
-      writeHeaderBlock(this, streamId, block, optEndStream ? FLAG.END_STREAM : 0);
-      if (optEndStream) { stream._endStreamSent = true; stream.writable = false; }
+      // node kNoPayloadMethods: GET/HEAD/DELETE assign no meaning to a request
+      // payload, so endStream defaults to true for them unless the caller says
+      // otherwise. The peer then sees endAfterHeaders on its request stream.
+      const method = headers[":method"] === undefined ? "GET" : String(headers[":method"]);
+      const noBody = /^(GET|HEAD|DELETE)$/.test(method);
+      const endStream = options.endStream === undefined ? noBody : options.endStream === true;
+      writeHeaderBlock(this, streamId, block, endStream ? FLAG.END_STREAM : 0);
+      if (endStream) { stream._endStreamSent = true; stream.writable = false; }
       stream.pending = false;
       return stream;
     }
@@ -961,7 +1000,7 @@ export constexpr std::string_view kHttp2JS = R"JS(
             // node lib/internal/http2/core.js). The 8-byte opaque payload is the
             // event argument.
             this.emit("ping", Buffer.from(payload));
-          }
+          } else resolvePing(this, payload);
           return true;
         }
         case FRAME.WINDOW_UPDATE: {
@@ -1131,7 +1170,7 @@ export constexpr std::string_view kHttp2JS = R"JS(
     // client streams are odd-numbered; _nextStreamId() advances _lastStreamId by 2
     get state() { return sessionState(this, this._lastStreamId > 0 ? this._lastStreamId + 2 : 1); }
     settings(s, cb) { if (typeof cb === "function") this.once("localSettings", cb); return this; }
-    ping(cb) { this._writeFrame(FRAME.PING, 0, 0, Buffer.alloc(8)); if (typeof cb === "function") G.queueMicrotask(() => cb(null, 0, Buffer.alloc(8))); return true; }
+    ping(payload, cb) { return sessionPing(this, payload, cb); }
     goaway(code, lastStreamId, opaqueData) { const p = Buffer.alloc(8); p.writeUInt32BE((lastStreamId || 0) >>> 0, 0); p.writeUInt32BE((code || 0) >>> 0, 4); this._writeFrame(FRAME.GOAWAY, 0, 0, opaqueData ? Buffer.concat([p, Buffer.from(opaqueData)]) : p); }
   }
 
@@ -1816,7 +1855,7 @@ export constexpr std::string_view kHttp2JS = R"JS(
             // See the client session's PING case: 'ping' is emitted only for a
             // peer-initiated PING (bun http2.ts:5173).
             this.emit("ping", Buffer.from(payload));
-          }
+          } else resolvePing(this, payload);
           return true;
         }
         case FRAME.WINDOW_UPDATE: {
@@ -1944,7 +1983,7 @@ export constexpr std::string_view kHttp2JS = R"JS(
     // a server session would allocate stays 2 (node reports the same).
     get state() { return sessionState(this, 2); }
     settings(s, cb) { if (typeof cb === "function") this.once("localSettings", cb); this._writeFrame(FRAME.SETTINGS, 0, 0, encodeSettings(s)); return this; }
-    ping(payload, cb) { if (typeof payload === "function") { cb = payload; payload = null; } this._writeFrame(FRAME.PING, 0, 0, payload && isBufLike(payload) ? Buffer.from(payload) : Buffer.alloc(8)); if (typeof cb === "function") G.queueMicrotask(() => cb(null, 0, Buffer.alloc(8))); return true; }
+    ping(payload, cb) { return sessionPing(this, payload, cb); }
     goaway(code, lastStreamID, opaqueData) {
       if (code === undefined) code = 0;
       validateNumber(code, "code");
