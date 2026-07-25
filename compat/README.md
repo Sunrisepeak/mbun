@@ -77,6 +77,62 @@ python3 tools/integration/node_corpus_runner.py \
 Measurement data is stored under [`compat/data/`](data/), including test and
 benchmark inventories and native run results.
 
+## Two corpora, one contract
+
+mbun is measured against **two** upstream corpora: bun's and node's. That
+invites a wrong conclusion — that advancing one must cost the other, and that
+someone has to keep choosing. **On the evidence so far, that trade is almost
+entirely an artefact of measurement, not a real conflict of contracts.**
+
+The case that exposed it was `assert.deepStrictEqual`. mbun deliberately
+implemented **bun's** semantics; a comment in
+`modules/jsc/src/builtins/node_assert_deepequal.cppm` stated that "bun's
+contract — not vanilla node — is the blueprint". But the bun file it was pinned
+to, `compat/bun/test/js/node/assert/deep-equal.test.ts`, says in its own header:
+
+> Expectations come from the documented semantics of
+> `assert.deepStrictEqual`/`deepEqual`, **cross-checked against Node.js**. Cases
+> **Bun gets wrong today** are marked `test.failing`.
+
+and its case type has `strictBug?: string` — *"Set when **Bun disagrees** with
+`strict`; the text says **what Bun does instead**."*
+
+So bun's corpus encodes **node's** semantics and labels bun's own deviations as
+bugs. There was never a conflict to arbitrate. mbun had implemented bun's known
+bugs on purpose, because of how the corpus scored them.
+
+### Why it looked like a conflict: the runner scored correctness as regression
+
+`mbun test` implements `test.failing` and reports a marker that starts passing as
+
+```
+(fail) a known bug that is now FIXED — expected to fail but passed
+ 2 pass
+ 1 fail
+```
+
+and `bun_corpus_runner.py` mapped any `failed > 0` to `test-failure`. **Being
+more correct than the reference implementation was scored as a compatibility
+failure**, so every step toward node looked like a step away from bun. That is
+what manufactured the "which corpus do we serve?" dilemma.
+
+Fixed: a file whose only failures are stale `test.failing` markers is now
+classified **`ahead-of-reference`** — its own bucket, neither a pass nor a
+failure. A real failure alongside a stale marker is still `test-failure`, and a
+non-zero exit still dominates.
+
+### The rule this gives us
+
+1. **Node's documented semantics are the blueprint for any `node:*` API**, on
+   both corpora. Where bun differs and marks it a bug, mbun follows node.
+2. **A genuine conflict is one where bun deviates and does *not* call it a
+   bug.** Those exist in principle and must be escalated to the maintainer with
+   both contracts and the file counts on each side — never resolved silently by
+   an agent.
+3. **Never let a measurement artefact define a policy.** A corpus is evidence
+   about a contract, not the contract itself. Read the upstream test's own
+   statement of intent before treating its expectations as a requirement.
+
 ## Estimating a round target
 
 Targets used to be guesses. [`data/round-estimates.json`](data/round-estimates.json)

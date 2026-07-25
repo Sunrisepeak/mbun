@@ -17,6 +17,20 @@ from pathlib import Path
 PASS_RE = re.compile(r"(?m)^\s*(\d+) pass\s*$")
 FAIL_RE = re.compile(r"(?m)^\s*(\d+) fail\s*$")
 SKIP_RE = re.compile(r"(?m)^\s*(\d+) skip\s*$")
+# bun's corpus marks cases bun itself gets wrong with `test.failing`. When mbun
+# is MORE correct than bun, that marker passes, and bun's runner reports it as
+# a failure: "(fail) <name> — expected to fail but passed".
+#
+# Scoring that as `test-failure` is a measurement bug with real consequences: it
+# makes advancing node compatibility look like a bun-compatibility REGRESSION,
+# which is exactly backwards, and it manufactures a "which corpus do we serve?"
+# trade-off that does not exist. The deep-equality work hit this — bun's
+# deep-equal suite states outright that its expectations are node's semantics
+# and that deviations are "cases Bun gets wrong today", yet mbun had implemented
+# bun's bugs on purpose because the corpus scored them as required behaviour.
+#
+# Being ahead of the reference implementation is its own outcome, not a failure.
+AHEAD_RE = re.compile(r"expected to fail but passed")
 EXPECT_RE = re.compile(r"(?m)^\s*(\d+) expect\(\) calls\s*$")
 RAN_RE = re.compile(r"Ran (\d+) tests?")
 TEST_FILE_RE = re.compile(r"\.test\.(?:[cm]?[jt]sx?)$")
@@ -92,8 +106,15 @@ def classify(
         # between tests) is a failed file for bun, which exits non-zero on it;
         # mbun currently still exits 0, so exit code alone would score such a
         # file as a full green even though a whole scope may have been dropped.
-        if exit_code != 0 or failed > 0 or last_int(ERROR_COUNT_RE, output) > 0:
+        # Count the failures that are only "we are more correct than bun".
+        ahead = len(AHEAD_RE.findall(output))
+        real_failed = max(0, failed - ahead)
+        if exit_code != 0 or real_failed > 0 or last_int(ERROR_COUNT_RE, output) > 0:
             return "test-failure"
+        if ahead > 0:
+            # Every failure in this file is a `test.failing` marker that now
+            # passes. Nothing regressed; bun's own expectation is stale.
+            return "ahead-of-reference"
         # A file whose every test was skipped exits 0 with 0 failures and so used
         # to score as a full green -- ci-restrictions.test.ts reported 0 pass /
         # 12 skip / 0 fail and counted as one. 25 corpus files gate on Bun.version,
