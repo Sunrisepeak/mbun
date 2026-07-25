@@ -553,8 +553,29 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   assert.notDeepEqual = (a, b, m) => { if (deepEq(a, b, false)) throw AErr(m); };
   assert.deepStrictEqual = (a, b, m) => { if (!deepEq(a, b, true)) throw AErr(m); };
   assert.notDeepStrictEqual = (a, b, m) => { if (deepEq(a, b, true)) throw AErr(m); };
-  assert.throws = (fn, e, m) => { try { fn(); } catch (_) { return; } throw AErr(m || "Missing expected exception"); };
-  assert.doesNotThrow = (fn) => { fn(); };
+  // assert.throws / assert.doesNotThrow — node lib/assert.js throws() +
+  // getActual(). These USED to ignore the `error` argument entirely:
+  //
+  //   assert.throws = (fn, e, m) => { try { fn(); } catch (_) { return; } ... }
+  //
+  // so `assert.throws(fn, { code: 'ERR_X' })` passed for ANY throw at all, and
+  // `assert.throws(fn, common.expectsError({...}))` never called the validator
+  // — which is how the corpus's most common negative assertion silently checked
+  // nothing. The validation machinery below (expectsError / expectedException /
+  // hasMatchingError, ported from bun's assert.ts) already existed and was
+  // reachable only from assert.rejects; both entry points now share it, so the
+  // sync and async forms agree.
+  const getActual = (fn) => {
+    if (typeof fn !== "function") throw argTypeErr("fn", "of type function", fn);
+    try { fn(); } catch (e) { return e; }
+    return NO_EXC;
+  };
+  assert.throws = function throws(fn, error, message) {
+    return expectsError("throws", getActual(fn), error, message);
+  };
+  assert.doesNotThrow = function doesNotThrow(fn, error, message) {
+    return expectsNoError("doesNotThrow", getActual(fn), error, message);
+  };
   // rejects / doesNotReject: ported from bun src/js/node/assert.ts
   // (waitForActual/expectsError/expectsNoError/expectedException). Enriched
   // AssertionError path via makeAErr is opt-in; other assert.* keep using AErr.
@@ -602,7 +623,17 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   }
   function compareExceptionKey(actual, expected, key, message, opName) {
     if (!(key in actual) || !deepEq(actual[key], expected[key], true)) {
-      throw makeAErr({ actual, expected, message, operator: opName, generatedMessage: !message });
+      // node builds a full deep-equal diff here. A NAMED key mismatch is the
+      // single most common negative-assertion failure in the corpus, and an
+      // AssertionError with an empty message is untriageable from a log — say
+      // which property disagreed and how.
+      const generated = !message;
+      if (generated) {
+        message = "Comparison of the '" + key + "' property failed: expected " +
+                  insp(expected[key]) + ", got " +
+                  (key in actual ? insp(actual[key]) : "undefined (property missing)");
+      }
+      throw makeAErr({ actual, expected, message, operator: opName, generatedMessage: generated });
     }
   }
   function expectedException(actual, expected, message, opName) {
