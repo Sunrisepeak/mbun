@@ -254,6 +254,42 @@
           "runtime_bug_found": "A descriptor received over SCM_RIGHTS never went through accept()/connect(), so it was absent from the net reactor's poll set: netn_wait_cb never watched it and the pump parked up to 60s with a FIN sitting unnoticed. Non-deterministic, so it had been reading as flakiness rather than a bug. Also NODE_HANDLE_ACK was missing, so a parent that handed over a socket never exited.",
           "stop_condition": "Met: re-clustering showed no remaining cause above 2 files. 7 named survivors.",
           "ceiling_identified": "node:test runner, 55 files, is subsystem-scale not cleanup. Two causes hold 23: node's --test CLI (18) and run() returning a TestsStream of test:pass/test:fail events with per-file child processes (5+). Neither is reachable by patching the current in-process runner; both need lib/internal/test_runner/* ported."
+        },
+        {
+          "id": "r10/agent-7",
+          "cluster": "node:https + node:dgram",
+          "worklist_files": 106,
+          "cluster_homogeneity": "selected by the green-ratio heuristic",
+          "target_delta_pass": 50,
+          "actual_delta_pass": 63,
+          "hit_rate": 1.26,
+          "wall_clock_min": 90,
+          "split": {
+            "dgram": "29/76 -> 69/76 green (+40)",
+            "https": "4/63 -> 27/63 green (+23)",
+            "tls_side_effect": "46 -> 56 (+10)",
+            "guard_total": "432/904 -> 509/904 (+77)"
+          },
+          "note": "THIRD confirmation of the green-ratio heuristic in one round. Both were stand-ins: node:https did not exist at all (node_http.cppm built the https module from the SAME makeExports() as http, so https.createServer() returned http's shape-only EventEmitter with no listen() and no TLS - 21 files died on `server.listen is not a function` alone), and node:dgram was a ~120-line stand-in whose Socket owned the fd directly instead of node's UDP-handle/Socket split.",
+          "iterative_evidence": {
+            "cycles": 9,
+            "note": "Cycle 2 REGRESSED dgram 63->48 and that regression is what found the real bug. Routing the handle's default lookup through dns.lookup (node parity) exposed that an in-flight resolver request held nothing in the loop, so the pump took a 60s poll() park. Chasing that revealed dgram fds were never in net_fds() at all - the set the pump parks on - so EVERY dgram receive had been riding luck about pump ordering, completing only when an unrelated timer cut a park short. Registering them was +18 in one change. Without the regression forcing the question, that latent bug would have shipped."
+          },
+          "refused_on_security_grounds": "NODE_TLS_REJECT_UNAUTHORIZED=0 deliberately NOT implemented. It is the sole cause for 3 files (test-https-{client-get-url,client-override-global-agent,strict}) and is documented node behaviour, but it is an env-var TLS verification bypass and the agent declined to add one unilaterally. Needs a maintainer decision; one-line change if green-lit.",
+          "merge_debt": {
+            "files": 6,
+            "cost": "cluster 76/83 -> 73/83",
+            "names": [
+              "test-cluster-dgram-1.js",
+              "test-cluster-dgram-2.js",
+              "test-cluster-disconnect-unshared-udp.js",
+              "test-dgram-bind-socket-close-before-cluster-reply.js",
+              "test-dgram-cluster-bind-error.js",
+              "test-dgram-cluster-close-during-bind.js"
+            ],
+            "cause": "agent-6 had added cluster integration (cluster._getServer for a worker's shared UDP handle; closing a handle handed over after the socket already closed) INSIDE the dgram stand-in. agent-7 branched before that landed, so its translation does not carry it, and taking the translation dropped it. Hand-writing the port into 1028 lines of unfamiliar translated code risked a subtle break, so the cost was MEASURED (6 files, all timeout) rather than guessed. Well-scoped follow-up: port the cluster._getServer path into js_dgram.cppm's Socket.prototype.bind, inside the lookup callback where node puts it.",
+            "net_effect": "72 gained, 6 lost on the same four subsystems = +66 net"
+          }
         }
       ],
       "verdicts": {

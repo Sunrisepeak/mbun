@@ -114,6 +114,31 @@ frozen machine or a silently murdered harness.
   the round-9 integration: `mcpp build` reported "Finished release [optimized]"
   over a file holding four markers. A green build is not evidence a merge was
   resolved; run this as the last step of any conflict resolution.
+### Build hazards that silently produce a stale binary
+
+Three separate failure modes have now cost measurement time. All of them look
+like success:
+
+- **A new or edited `.cppm` is not always picked up.** `mcpp build` reports
+  `Finished release in 0.01s` over changed sources; a brand-new module partition
+  instead fails with `failed to read compiled module: <partition>.gcm`. Cause:
+  the generated `build.ninja` is keyed on the module list at generation time.
+  Cheap fix: `touch mcpp.toml modules/<member>/mcpp.toml`, or
+  `find target -name build.ninja -delete`. `worktree_setup.sh` does the latter
+  on every re-point.
+- **The root build does not notice a dependency member's `.cpp`** (only its
+  `.cppm`). Editing `modules/tls/src/openssl.cpp` produced `Finished in 2.66s`
+  with nothing recompiled — caught only because the measurement came back
+  byte-identical. Touch the member's `.cppm` to force it.
+- **`mcpp clean --bmi-cache` is not local.** It wipes the worktree's whole
+  `target/` *and* the **shared `~/.mcpp/bmi`**, so every other worktree on the
+  machine eats a cold rebuild. Never use it while other agents are running;
+  prefer the `touch` above.
+
+`build_lock.sh` compares source mtimes against the binary it just produced and
+warns when sources are newer — **if you see that warning, do not measure**, because
+the run would score the previous binary.
+
 - `smoke_examples.py` — boots each `examples/` app in turn, requests
   `http://127.0.0.1:3000/`, asserts a 2xx, then reaps the whole process tree
   (`bounded_run.BoundedServer`). Sequential by design: the demos all hardcode
