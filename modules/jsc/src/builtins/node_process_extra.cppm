@@ -617,9 +617,35 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
     }
 
     // ---- node stub surface --------------------------------------------------
+    // node src/node.cc RawDebug: writes its formatted arguments to stderr
+    // SYNCHRONOUSLY, deliberately bypassing the stream stack — that is the whole
+    // point of it, it is the diagnostic of last resort when streams are broken or
+    // the loop is wedged. A silent no-op is therefore the worst possible stub: it
+    // reports success while swallowing exactly the output someone reached for
+    // because nothing else was working. 5 corpus files use it, and it cost an
+    // agent ~15 minutes when its hang-watchdog printed nothing.
+    if (typeof proc._rawDebug !== "function") {
+      const rawDebug = function _rawDebug(...args) {
+        const U = G.__mbunNativeModules && G.__mbunNativeModules["util"];
+        const text = U && typeof U.format === "function"
+          ? U.format(...args)
+          : args.map((a) => (typeof a === "string" ? a : String(a))).join(" ");
+        // Straight at fd 2, not through process.stderr: node's does not go
+        // through the stream either.
+        const FD = G.__mbunFdNative;
+        if (FD && typeof FD.writeSync === "function") {
+          try { FD.writeSync(2, text + "\n"); return undefined; } catch (e) {}
+        }
+        try { G.console.error(text); } catch (e) {}
+        return undefined;
+      };
+      Object.defineProperty(rawDebug, "name", { value: "_rawDebug" });
+      proc._rawDebug = rawDebug;
+    }
+
     const undefinedStubs = [
       "_debugEnd", "_debugProcess", "_fatalException", "_linkedBinding",
-      "_rawDebug", "_startProfilerIdleNotifier", "_stopProfilerIdleNotifier",
+      "_startProfilerIdleNotifier", "_stopProfilerIdleNotifier",
       "_tickCallback",
     ];
     for (const name of undefinedStubs) {
