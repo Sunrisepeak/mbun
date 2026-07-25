@@ -182,6 +182,43 @@ request-smuggling fix took **bun's own** `request-smuggling.test.ts` from 53 to
    about a contract, not the contract itself. Read the upstream test's own
    statement of intent before treating its expectations as a requirement.
 
+## A layered blocker is not a cause family
+
+The first correction — split by cause family instead of subsystem — was right, and
+then it was applied wrongly. One of the three families was *"blocked on
+`internalBinding`"*, given a +35 target. It returned **+3**.
+
+The reason is structural, not effort: **`internalBinding` is not a cause, it is a
+layer.** Clearing it did not convert files, it *transferred* them. All 22
+`No such binding: X` files stopped failing at module load and every one then
+failed **past** load, on a real behaviour gap in mbun's own fs/http/tls JS layers
+— which belonged to the other two agents. The target assumed load-blocking was
+the whole cause; it was one layer of several.
+
+**Rule: a cause family must be a family of causes, not a family of symptoms at
+one depth.** Before assigning a layer as a block, take five of its files, remove
+the layer by hand, and look at what is underneath. If the answer is "another
+family's problem", the work is **enabling infrastructure**: budget and credit it
+as such, because its value appears in *other* agents' numbers and giving it a pass
+target is a category error.
+
+What it should have been given is a **diagnosis target**, which is what it
+actually delivered and is worth more than the 3 passes: 22 opaque
+`No such binding: fs` logs became **49 specific causes, each attributed to a named
+owner** — 2 need mbun's fs to route *through* the binding, 4 need GC/heap
+introspection, 4 need node's internal symbols to be the *same* symbols mbun's
+http/net use, 4 need a JS-visible parser or stream handle, 2 need
+`createSecureContext` to route through `binding.SecureContext`, 28 are behaviour
+gaps in their own families, 1 is impossible on JSC, and 4 are honest
+feature-absence skips.
+
+One technique to keep and one exception to it: **unimplemented binding members
+throw naming themselves** (`No such binding member: fs.lchown`), which is exactly
+what turned those 22 opaque logs into 49 attributable ones. **`crypto` must be
+exempt** — node's own `lib/internal/crypto/util.js` feature-detects optional
+algorithms by destructuring them and testing for `undefined`, so a throwing member
+breaks the very code that handles their absence.
+
 ## Allocate agents by cause family, not by subsystem
 
 A round that split three agents across `tls`, `http` and `fs` returned +10, +11

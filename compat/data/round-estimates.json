@@ -586,6 +586,21 @@
         "Scope guards to the diff-derived set with --files instead of full-corpus runs; I run the authoritative full corpus once at integration.",
         "Replace 'guarantee 100%' with an explicit block ordering: open the assigned block FIRST, and report its result before touching anything else. No block can be starved by a queue behind it."
       ]
+    },
+    {
+      "round": "cause-family wave 1 \u2014 bindings agent",
+      "id": "g2/agent-1",
+      "target_delta_pass": 35,
+      "actual_delta_pass": 3,
+      "hit_rate": 0.09,
+      "structural_error_in_MY_split": {
+        "what_I_got_wrong": "I treated 'blocked on internalBinding' as a CAUSE FAMILY. It is not a cause, it is a LAYER. Clearing it does not convert files \u2014 it transfers them to whichever family owns the next layer down.",
+        "the_evidence": "All 22 `No such binding: X` files stopped failing at module load, and every one then failed PAST load on a real behaviour gap in mbun's own fs/http/tls JS layers \u2014 i.e. in the other two agents' files. The +35 target assumed load-blocking was the whole cause; it was one layer of several.",
+        "the_rule": "A cause family must be a family of CAUSES, not a family of SYMPTOMS AT ONE DEPTH. Before assigning a layer as a block, sample five of its files, remove the layer by hand, and see what is underneath. If the answer is 'someone else's family', the work is enabling INFRASTRUCTURE and must be budgeted and credited as such \u2014 its value shows up in other agents' numbers, not its own, and giving it a pass target is a category error.",
+        "what_it_should_have_been_given": "A diagnosis target, not a conversion target. It delivered exactly that and it is worth more than the 3 passes: 22 opaque `No such binding: fs` logs became 49 specific causes, each attributed to a named owner (2 need fs to route THROUGH the binding, 4 need GC/heap introspection, 4 need node's internal symbols to be the SAME symbols mbun's http/net use, 4 need a JS-visible parser/stream handle, 2 need createSecureContext to route through binding.SecureContext, 28 are behaviour gaps in their own families, 1 is impossible on JSC, 4 are honest feature-absence skips)."
+      },
+      "verified_by_coordinator": "Gate re-probed independently on the merged binary: with node_modules/internal/{http,fs}.js present, the user package WINS in both flag states; internalBinding is undefined lexically and on globalThis; no enumerable leak; enumerable globals still exactly 15. Permission statement checked: every binding entry bottoms out in __mbunFsNative/__mbunFdNative, which is where the C++ --permission gate lives, so internalBinding('fs').open is gated identically to fs.openSync.",
+      "design_point_worth_keeping": "Unimplemented members throw naming themselves (`No such binding member: fs.lchown`) \u2014 that is what converted 22 opaque logs into 49 attributable causes. BUT `crypto` is deliberately exempt: node's own lib/internal/crypto/util.js feature-detects optional algorithms by destructuring them and testing for undefined, so a throwing member would break the very code that handles their absence."
     }
   ]
 }
