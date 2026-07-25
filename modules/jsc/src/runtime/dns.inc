@@ -697,6 +697,15 @@ std::shared_ptr<DnsDelayedBackend> gDnsDelayedBackend{};
 // JS ownership is deliberately separate from the worker state. A detached
 // worker captures only this pure-C++ state, so an uncancellable libc call may
 // outlive Runtime without retaining or touching a JSContext, JSValue, or Runtime.
+// "is this string already an IP literal?" — inet_pton for both families, which
+// is what node's isIP() reduces to. Used only by the Permission Model gate.
+inline bool dns_is_literal_ip_(const std::string& host) {
+    if (host.empty()) return false;
+    unsigned char buf[16];
+    if (::inet_pton(AF_INET, host.c_str(), buf) == 1) return true;
+    return ::inet_pton(AF_INET6, host.c_str(), buf) == 1;
+}
+
 class DnsAsyncState {
 private:
     struct Job {
@@ -806,12 +815,44 @@ private:
         }
     }
 
+    // Permission Model: node gates the Net scope in cares_wrap.cc, at
+    // GetAddrInfo / GetNameInfo / the resolver Query — DNS is network traffic
+    // and a resolver is an exfiltration channel on its own (data encoded into a
+    // hostname leaves the box even if no socket ever opens).
+    //
+    // The refusal is delivered through the normal completion queue rather than
+    // thrown: every caller here is a callback, and node's own DNS denial arrives
+    // as `err.code === 'ERR_ACCESS_DENIED'` on that callback
+    // (GetAddrInfoReqWrap::InsufficientPermissionError).
+    //
+    // A literal IP address is exempt for `lookup` ONLY. node never reaches its
+    // gate for one either: lib/dns.js short-circuits `isIP(hostname)` before
+    // calling the binding, and getaddrinfo on a literal sends no query. reverse
+    // and lookupService take an IP and DO query, so they are gated.
+    [[nodiscard]] bool net_denied_(const Job& job) const {
+        if (!gPermission.enabled()) return false;
+        if (gPermission.is_granted(mbun::permission::Scope::Net, job.host)) return false;
+        if (job.operation == DnsOperation::lookup && dns_is_literal_ip_(job.host)) return false;
+        return !gPermission.warning_only();
+    }
+
     void submit_(Job job, JSObjectRef callback) {
         auto state{workerState_};
         if (state == nullptr) return;
         job.id = nextId_++;
         dns_protect_(ctx_, callback);
         callbacks_.emplace(job.id, callback);
+        if (net_denied_(job)) {
+            // Never queued to the worker: no resolution is attempted at all.
+            std::lock_guard lock{state->mutex};
+            state->completions.push_back(
+                Completion{.id = job.id,
+                           .result = DnsResult{.operation = job.operation,
+                                               .error = "ERR_ACCESS_DENIED",
+                                               .recordType = job.recordType}});
+            state->condition.notify_one();
+            return;
+        }
         {
             std::lock_guard lock{state->mutex};
             if (state->stopping) {
