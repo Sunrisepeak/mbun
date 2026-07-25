@@ -65,7 +65,7 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
         `The property '${name}' ${reason} Received ${inspect(value)}`);
   const ERR_INVALID_REPL_EVAL_CONFIG = () =>
     ERR("ERR_INVALID_REPL_EVAL_CONFIG", TypeError,
-        "Cannot specify both breakEvalOnSigint and eval for REPL");
+        'Cannot specify both "breakEvalOnSigint" and "eval" for REPL');
   const ERR_INVALID_REPL_INPUT = (msg) => ERR("ERR_INVALID_REPL_INPUT", TypeError, msg);
   const ERR_INVALID_STATE = (msg) => ERR("ERR_INVALID_STATE", Error, `Invalid state: ${msg}`);
 

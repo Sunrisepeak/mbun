@@ -486,11 +486,11 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     }
     spawn(options) {
       // node child_process.ts:1346-1396 validators (ERR_INVALID_ARG_TYPE).
-      if (options === null || typeof options !== "object") { const e = new TypeError('The "options" argument must be of type object. Received ' + (options === null ? "null" : typeof options)); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
-      if (typeof options.file !== "string") { const e = new TypeError('The "options.file" property must be of type string. Received ' + (options.file === undefined ? "undefined" : typeof options.file)); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
-      if (options.args !== undefined && !Array.isArray(options.args)) { const e = new TypeError('The "options.args" property must be an instance of Array. Received ' + typeof options.args); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
+      if (options === null || typeof options !== "object") { const e = new TypeError('The "options" argument must be of type object. Received ' + recvDesc(options)); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
+      if (typeof options.file !== "string") { const e = new TypeError('The "options.file" property must be of type string. Received ' + recvDesc(options.file)); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
+      if (options.args !== undefined && !Array.isArray(options.args)) { const e = new TypeError('The "options.args" property must be an instance of Array. Received ' + recvDesc(options.args)); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
       const __hasIpc = Array.isArray(options.stdio) && options.stdio.includes("ipc");
-      if (__hasIpc && options.envPairs !== undefined && !Array.isArray(options.envPairs)) { const e = new TypeError('The "options.envPairs" property must be an instance of Array. Received ' + typeof options.envPairs); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
+      if (__hasIpc && options.envPairs !== undefined && !Array.isArray(options.envPairs)) { const e = new TypeError('The "options.envPairs" property must be an instance of Array. Received ' + recvDesc(options.envPairs)); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
       const file = toStr(options.file != null ? options.file : options.execPath);
       let args = options.args && options.args.length ? options.args.map(toStr) : [file];
       if (options.argv0 != null) args[0] = toStr(options.argv0);
@@ -1387,7 +1387,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
         if (enc === "utf-8" || enc === "utf-16le" || enc === "utf-16be") {
           let i = 0;
           let out = "";
-          const F = () => { const error = new TypeError("The encoded data was not valid for encoding " + enc + "."); error.code = "ERR_ENCODING_INVALID_ENCODED_DATA"; throw error; };
+          const F = () => { const error = new TypeError("The encoded data was not valid for encoding " + enc); error.code = "ERR_ENCODING_INVALID_ENCODED_DATA"; throw error; };
           const serialize = () => {
             if (!this.ignoreBOM && !this._bomSeen && out.length) {
               this._bomSeen = true;

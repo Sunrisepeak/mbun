@@ -2280,6 +2280,10 @@ export constexpr std::string_view kHttp2JS = R"JS(
     e.code = "ERR_OUT_OF_RANGE"; return e;
   }
   function invalidArgValue(name, value, reason) {
+    // node's ERR_INVALID_ARG_VALUE reports inspect(value) — NOT
+    // determineSpecificType: "Received true", not "Received type boolean (true)".
+    const NE = globalThis.__mbunNodeErrors;
+    if (NE) return NE.ERR_INVALID_ARG_VALUE(name, value, reason);
     const determiner = String(name).includes(".") ? "property" : "argument";
     const e = new TypeError("The " + determiner + " '" + name + "' " + (reason || "is invalid") + ". Received " + determineSpecificType(value));
     e.code = "ERR_INVALID_ARG_VALUE"; return e;
@@ -2488,7 +2492,14 @@ export constexpr std::string_view kHttp2JS = R"JS(
       options = options || {};
       const fs = M["fs"] || M["node:fs"];
       if (fd !== null && typeof fd === "object" && typeof fd.fd === "number") fd = fd.fd;
-      if (typeof fd !== "number") throw argTypeErr("fd", "one of type number or FileHandle", fd);
+      // node passes ['number','FileHandle'] to ERR_INVALID_ARG_TYPE, which reads
+      // "of type number or an instance of FileHandle" — FileHandle is a class,
+      // not a second primitive type.
+      if (typeof fd !== "number") {
+        const NE = globalThis.__mbunNodeErrors;
+        if (NE) throw NE.ERR_INVALID_ARG_TYPE("fd", ["number", "FileHandle"], fd);
+        throw argTypeErr("fd", "of type number or an instance of FileHandle", fd);
+      }
       if (options.statCheck === undefined) { this._sendFd(fs, fd, headersParam, options, null, false); return; }
       let stat = null;
       try { stat = fs.fstatSync(fd); } catch (e) { this._fileError(options, e); return; }

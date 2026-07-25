@@ -572,10 +572,14 @@ export constexpr std::string_view kNetJS = R"JS(
         const e = new TypeError("May not write null values to stream"); e.code = "ERR_STREAM_NULL_VALUES"; throw e;
       }
       if (typeof data !== "string" && !ArrayBuffer.isView(data) && !(data instanceof ArrayBuffer)) {
-        const recv = data === undefined ? ". Received undefined"
+        // The hand-built message appended ". Received …" to a string that already
+        // ended in "." and produced a doubled period.
+        const NE = G.__mbunNodeErrors;
+        if (NE) throw NE.ERR_INVALID_ARG_TYPE("chunk", ["string", "Buffer", "TypedArray", "DataView"], data);
+        const recv = data === undefined ? " Received undefined"
           : (typeof data === "object")
-            ? ". Received an instance of " + ((data && data.constructor && data.constructor.name) || "Object")
-            : ". Received type " + typeof data + " (" + String(data) + ")";
+            ? " Received an instance of " + ((data && data.constructor && data.constructor.name) || "Object")
+            : " Received type " + typeof data + " (" + String(data) + ")";
         const e = new TypeError('The "chunk" argument must be of type string or an instance of Buffer, TypedArray, or DataView.' + recv);
         e.code = "ERR_INVALID_ARG_TYPE"; throw e;
       }

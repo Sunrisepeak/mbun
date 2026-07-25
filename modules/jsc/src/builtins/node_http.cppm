@@ -96,6 +96,13 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
     : a.length === 2 ? a[0] + " or " + a[1]
     : a.slice(0, -1).join(", ") + " or " + a[a.length - 1];
   function ERR_INVALID_ARG_TYPE(name, expected, actual, kind) {
+    // Shared node-exact factory (bootstrap __mbunNodeErrors) when available: it
+    // derives argument/property from the name, applies node's Oxford-comma
+    // formatList, and classifies free-form alternatives like "Agent-like Object"
+    // as `one of …` rather than `an instance of …` (classRegExp rejects any name
+    // with a space or hyphen — /^[A-Z]/ here did not). `kind` becomes redundant.
+    const NE = G.__mbunNodeErrors;
+    if (NE) return NE.ERR_INVALID_ARG_TYPE(name, expected, actual);
     if (!Array.isArray(expected)) expected = [expected];
     const types = [], instances = [], other = [];
     for (const v of expected) {
@@ -114,6 +121,13 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
   const inspectVal = (v) => typeof v === "string" ? "'" + v + "'"
     : Array.isArray(v) ? "[ " + v.map(inspectVal).join(", ") + " ]"
     : String(v);
+  // util.format('%s') on a non-primitive inspects it; on a primitive it is String().
+  const fmtPct = (v) => {
+    if (v === null || typeof v !== "object") return String(v);
+    const u = M["util"] || M["node:util"];
+    try { return u && typeof u.inspect === "function" ? u.inspect(v, { depth: 0 }) : String(v); }
+    catch (e) { return String(v); }
+  };
   const ERR_INVALID_ARG_VALUE = (name, value, reason) => mkErr(TypeError, "ERR_INVALID_ARG_VALUE",
     "The " + (name.indexOf(".") !== -1 ? "property '" + name + "'" : "argument '" + name + "'") +
     " " + (reason || "is invalid") + ". Received " + inspectVal(value));
@@ -128,14 +142,16 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
                        : "Invalid character in " + field + ' ["' + name + '"]');
   const ERR_HTTP_HEADERS_SENT = (what) => mkErr(Error, "ERR_HTTP_HEADERS_SENT",
     "Cannot " + what + " headers after they are sent to the client");
+  // node builds this through util.format('%s'), which inspects a non-primitive
+  // ("{}") instead of String()-ing it ("[object Object]").
   const ERR_HTTP_INVALID_STATUS_CODE = (v) => mkErr(RangeError, "ERR_HTTP_INVALID_STATUS_CODE",
-    "Invalid status code: " + v);
+    "Invalid status code: " + fmtPct(v));
   const ERR_HTTP_TRAILER_INVALID = () => mkErr(Error, "ERR_HTTP_TRAILER_INVALID",
     "Trailers are invalid with this transfer encoding");
   const ERR_HTTP_SOCKET_ASSIGNED = () => mkErr(Error, "ERR_HTTP_SOCKET_ASSIGNED",
     "ServerResponse has an already assigned socket");
   const ERR_HTTP_BODY_NOT_ALLOWED = () => mkErr(Error, "ERR_HTTP_BODY_NOT_ALLOWED",
-    "Adding content for this request method or response status is not allowed");
+    "Adding content for this request method or response status is not allowed.");
   const ERR_HTTP_CONTENT_LENGTH_MISMATCH = (actual, expected) => mkErr(Error, "ERR_HTTP_CONTENT_LENGTH_MISMATCH",
     "Response body's content-length of " + actual + " byte(s) does not match the content-length of " +
     expected + " byte(s) set in header");
