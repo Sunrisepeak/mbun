@@ -155,6 +155,16 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     };
   };
   const ipcRead = (ch, onMessage, onEof) => {
+    // node observes the channel's EOF on a LATER loop turn than the last frame
+    // it delivered, so every nextTick/microtask the frame scheduled has run
+    // before the disconnect lands. This reader drains to EAGAIN in one burst, so
+    // an EOF that arrives with the final frame has to be held over to the next
+    // io tick — otherwise a cluster worker sees the channel die before the
+    // teardown its 'disconnect' frame started can call process.disconnect(),
+    // and the second call raises ERR_IPC_DISCONNECTED
+    // (test-cluster-server-restart-rr / -shared-leak).
+    if (ch.deferEof) { ch.deferEof = false; onEof(); return; }
+    let delivered = 0;
     for (;;) {
       let b;
       if (canPassFd()) {
@@ -162,11 +172,11 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
         try { r = PROC.recvmsgFd(ch.fd, 65536); } catch (e) { onEof(); return; }
         if (r === null) { onEof(); return; }
         if (r.fds && r.fds.length) for (let i = 0; i < r.fds.length; i++) ch.rxFds.push(r.fds[i]);
-        if (r.eof) { onEof(); return; }
+        if (r.eof) { if (delivered) { ch.deferEof = true; return; } onEof(); return; }
         b = r.data;
       } else {
         try { b = PROC.readNB(ch.fd, 65536); } catch (e) { onEof(); return; }
-        if (b === null) { onEof(); return; }
+        if (b === null) { if (delivered) { ch.deferEof = true; return; } onEof(); return; }
       }
       if (b === "") return;
       ch.buf += Buffer.from(_unb64(b)).toString("utf8");
@@ -183,6 +193,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
           handle = ipcRecvHandle(msg.type, fd);
           msg = msg.msg;
         }
+        delivered++;
         onMessage(msg, handle);
       }
     }

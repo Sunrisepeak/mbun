@@ -331,7 +331,12 @@ inline constexpr std::string_view kNodeClusterJS = R"JS(
             this.sockname = { address: address, port: lh.port, family: message.addressType === 6 ? "IPv6" : "IPv4" };
           }
         } catch (e) {
-          this.errno = (e && e.code) || "EADDRINUSE";
+          // The natives throw a plain Error whose message carries the errno
+          // name (runtime/net.inc net_errno_name); net.js classifies the same
+          // way. Without this a bind that failed EACCES was reported as
+          // EADDRINUSE (test-cluster-shared-handle-bind-privileged-port).
+          const hit = /\b(E[A-Z]+)\b/.exec(String((e && e.message) || e));
+          this.errno = hit ? hit[1] : "EADDRINUSE";
         }
       }
       SharedHandle.prototype.add = function (worker, send) {
@@ -528,6 +533,11 @@ inline constexpr std::string_view kNodeClusterJS = R"JS(
       cluster.Worker = Worker;
 
       const send = (message, cb) => sendHelper(proc, message, null, cb);
+      // process.disconnect() raises ERR_IPC_DISCONNECTED on a channel that is
+      // already gone (node lib/internal/child_process.js target.disconnect), and
+      // the primary closes its end at the same time it sends `act: "disconnect"`,
+      // so the teardown below can legitimately race the EOF.
+      const disconnectChannel = () => { if (proc.connected) proc.disconnect(); };
       cluster._send = send;
       cluster._handles = handles;
 
@@ -715,8 +725,8 @@ inline constexpr std::string_view kNodeClusterJS = R"JS(
             // exitedAfterDisconnect is properly set in the primary, otherwise,
             // if it's primary initiated there's no need to send the
             // exitedAfterDisconnect message.
-            if (primaryInitiated) proc.disconnect();
-            else send({ act: "exitedAfterDisconnect" }, () => proc.disconnect());
+            if (primaryInitiated) disconnectChannel();
+            else send({ act: "exitedAfterDisconnect" }, disconnectChannel);
           }
         }
 
@@ -736,7 +746,7 @@ inline constexpr std::string_view kNodeClusterJS = R"JS(
           proc.exit(kNoFailure);
         } else {
           this.state = "destroying";
-          send({ act: "exitedAfterDisconnect" }, () => proc.disconnect());
+          send({ act: "exitedAfterDisconnect" }, disconnectChannel);
           proc.once("disconnect", () => proc.exit(kNoFailure));
         }
       };

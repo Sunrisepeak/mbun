@@ -316,6 +316,12 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
                        "beforeEach", "afterEach", "skip", "todo", "only", "run"]) {
       nodeTest[key] = pick(key);
     }
+    // node lib/test.js exports the SAME function object under its aliases:
+    // `test.test === test`, `test.it === test`, `test.describe === test.suite`
+    // (test-runner-aliases asserts identity, not just equivalent behaviour).
+    nodeTest.test = nodeTest;
+    nodeTest.it = nodeTest;
+    nodeTest.suite = nodeTest.describe;
     Object.defineProperty(nodeTest, "mock", {
       configurable: true,
       get() { return useDelegate() ? delegate.mock : standalone.mock; },

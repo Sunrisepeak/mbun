@@ -216,7 +216,7 @@ inline constexpr std::string_view kNodeNetJS = R"JS(
       _v6() { return this.type === "udp6"; }
       // reuseAddr is an opt-in (node dgram.createSocket({ reuseAddr })): without
       // it a duplicate bind must fail with EADDRINUSE (issue 24157).
-      _ensureFd() { if (this._fd < 0) this._fd = ND.create(this.type, !!this._opts.reuseAddr); }
+      _ensureFd() { if (this._fd < 0) this._fd = ND.create(this.type, !!this._opts.reuseAddr, !!this._opts.reusePort); }
       _reactor() { return G.__mbunNet; }
 
       bind(a1, a2, a3) {
@@ -232,8 +232,11 @@ inline constexpr std::string_view kNodeNetJS = R"JS(
         // UDP socket inside a cluster worker is the primary's socket, shared
         // over IPC (internal/cluster/shared_handle.js). UDP is exempt from
         // round-robin — there is nothing to distribute but raw datagrams.
+        // node lib/dgram.js bind: `reusePort` implies exclusive, so the worker
+        // binds its own socket (test-cluster-dgram-reuseport).
+        const wantsOwnSocket = !!((opts && (opts.exclusive || opts.reusePort)) || this._opts.reusePort);
         const clusterMod = G.__mbunCluster;
-        if (clusterMod && clusterMod.isWorker && !(opts && opts.exclusive) &&
+        if (clusterMod && clusterMod.isWorker && !wantsOwnSocket &&
             typeof clusterMod._getServer === "function") {
           if (cb) this.once("listening", cb);
           const self = this;

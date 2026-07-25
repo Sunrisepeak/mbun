@@ -673,6 +673,10 @@ export constexpr std::string_view kNetJS = R"JS(
         if (o.port != null) { validateListenPort(o.port); port = o.port | 0; }
         if (o.host != null) host = String(o.host);
         if (o.exclusive != null) this._exclusive = !!o.exclusive;
+        // node lib/net.js Server.listen: `reusePort` implies `exclusive`, so the
+        // worker binds its own SO_REUSEPORT socket instead of asking the primary
+        // (test-cluster-net-reuseport asserts cluster._getServer is NOT called).
+        if (o.reusePort === true) { this._exclusive = true; this._reusePort = true; }
         if (o.backlog != null) this._backlog = o.backlog | 0;
         if (o.ipv6Only) this._ipv6Only = true;
         if (typeof a[1] === "function") cb = a[1];
@@ -738,7 +742,7 @@ export constexpr std::string_view kNetJS = R"JS(
       const bindHost = host === "::1" ? "127.0.0.1" : host;  // v6 loopback → v4 bind
       if (cb) this.once("listening", cb);
       let lh;
-      try { lh = NN.listen(bindHost, port); }
+      try { lh = NN.listen(bindHost, port, !!this._reusePort); }
       catch (e) { const err = listenError(e, host, port); G.queueMicrotask(() => this.emit("error", err)); return this; }
       this._fd = lh.fd;
       const reportAddr = host === "localhost" ? (isV6 ? "::1" : "127.0.0.1") : host;
@@ -776,8 +780,12 @@ export constexpr std::string_view kNetJS = R"JS(
       };
       clusterMod._getServer(this, options, (err, handle) => {
         if (err) {
-          const e = listenError({ message: String(err) }, address, unixPath ? undefined : port);
-          if (typeof err === "number") { e.errno = err; }
+          // node lib/net.js listenOnPrimaryHandle: `new ExceptionWithHostPort(
+          // err, 'bind', address, port)` — syscall 'bind', not 'listen'.
+          const code = typeof err === "string" ? err : "EADDRINUSE";
+          const e = mkErr("bind " + code + " " + address + (unixPath ? "" : ":" + port), code);
+          e.syscall = "bind"; e.address = address;
+          if (!unixPath) e.port = port;
           this.emit("error", e);
           return;
         }
@@ -2671,6 +2679,10 @@ export constexpr std::string_view kNetJS = R"JS(
     };
     if (typeof handler === "function") srv.on("request", handler);
     srv.on("connection", (sock) => {
+      // node lib/_http_server.js connectionListenerInternal: the socket learns
+      // which server owns it (test-cluster-send-socket-to-worker-http-server
+      // asserts it after handing a socket to a worker over IPC).
+      sock.server = srv;
       sock.on("error", () => {});
       let carry = [];
       let eofSeen = false;
