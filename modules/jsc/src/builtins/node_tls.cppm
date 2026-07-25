@@ -147,6 +147,38 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
       throw ERR_INVALID_ARG_TYPE(name, [VALID_TLS_ERROR_MESSAGE_TYPES], findInvalidTLSItem(value));
   };
 
+  // ---- DEFAULT_CIPHERS (node src/node_constants.h DEFAULT_CIPHER_LIST_CORE) ---
+  // The exact list node compiles in and exposes as both tls.DEFAULT_CIPHERS and
+  // crypto.constants.defaultCoreCipherList. It is strictly a *restriction* of
+  // OpenSSL's own default: the trailing !aNULL/!eNULL/!EXPORT/!DES/!RC4/!MD5/
+  // !PSK/!SRP/!CAMELLIA exclusions remove unauthenticated, unencrypted, export-
+  // grade and legacy suites. Copied verbatim so tests comparing the two agree.
+  const DEFAULT_CIPHERS =
+    "TLS_AES_256_GCM_SHA384:" +
+    "TLS_CHACHA20_POLY1305_SHA256:" +
+    "TLS_AES_128_GCM_SHA256:" +
+    "ECDHE-RSA-AES128-GCM-SHA256:" +
+    "ECDHE-ECDSA-AES128-GCM-SHA256:" +
+    "ECDHE-RSA-AES256-GCM-SHA384:" +
+    "ECDHE-ECDSA-AES256-GCM-SHA384:" +
+    "DHE-RSA-AES128-GCM-SHA256:" +
+    "ECDHE-RSA-AES128-SHA256:" +
+    "DHE-RSA-AES128-SHA256:" +
+    "ECDHE-RSA-AES256-SHA384:" +
+    "DHE-RSA-AES256-SHA384:" +
+    "ECDHE-RSA-AES256-SHA256:" +
+    "DHE-RSA-AES256-SHA256:" +
+    "HIGH:" +
+    "!aNULL:" +
+    "!eNULL:" +
+    "!EXPORT:" +
+    "!DES:" +
+    "!RC4:" +
+    "!MD5:" +
+    "!PSK:" +
+    "!SRP:" +
+    "!CAMELLIA";
+
   // ---- version defaults & valid set ----
   const VALID_TLS_VERSIONS = new Set(["TLSv1", "TLSv1.1", "TLSv1.2", "TLSv1.3"]);
   let DEFAULT_MIN_VERSION = "TLSv1.2";
@@ -599,6 +631,7 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
   const assign = {
     CLIENT_RENEG_LIMIT: 3,
     CLIENT_RENEG_WINDOW: 600,
+    DEFAULT_CIPHERS,
     connect,
     convertALPNProtocols,
     createSecureContext,

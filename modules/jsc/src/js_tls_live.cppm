@@ -84,6 +84,85 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
     try { return new crypto.X509Certificate(pem); } catch (e) { return undefined; }
   };
 
+  // ---- node argument validators (lib/internal/validators.js subset) ----------
+  // The live surface is where node runs most of its TLS option validation
+  // (internal/tls/wrap.js Server / TLSSocket / connect), and the corpus asserts
+  // the exact message, so determineSpecificType is translated from
+  // lib/internal/errors.js rather than approximated.
+  const specificType = (v) => {
+    if (v === null) return "null";
+    if (v === undefined) return "undefined";
+    const t = typeof v;
+    if (t === "bigint") return "type bigint (" + String(v) + "n)";
+    if (t === "number") {
+      if (v === 0) return 1 / v === -Infinity ? "type number (-0)" : "type number (0)";
+      if (v !== v) return "type number (NaN)";
+      return "type number (" + String(v) + ")";
+    }
+    if (t === "boolean") return v ? "type boolean (true)" : "type boolean (false)";
+    if (t === "symbol") return "type symbol (" + String(v) + ")";
+    if (t === "function") return "function " + v.name;
+    if (t === "object") {
+      if (v.constructor && "name" in v.constructor) return "an instance of " + v.constructor.name;
+      return "[Object: null prototype] {}";
+    }
+    if (t === "string") {
+      let s = v;
+      if (s.length > 28) s = s.slice(0, 25) + "...";
+      return s.indexOf("'") === -1 ? "type string ('" + s + "')" : "type string (" + JSON.stringify(s) + ")";
+    }
+    return "type " + t + " (" + String(v) + ")";
+  };
+  const argTypeError = (name, determinerText, actual) => {
+    const kind = String(name).indexOf(".") !== -1 ? "property" : "argument";
+    const e = new TypeError('The "' + name + '" ' + kind + " " + determinerText +
+      ". Received " + specificType(actual));
+    e.code = "ERR_INVALID_ARG_TYPE";
+    return e;
+  };
+  const outOfRange = (name, range, actual) => {
+    const e = new RangeError('The value of "' + name + '" is out of range. It must be ' +
+      range + ". Received " + specificType(actual));
+    e.code = "ERR_OUT_OF_RANGE";
+    return e;
+  };
+  const invalidArgValue = (name, value, reason) => {
+    const e = new TypeError("The " + (String(name).indexOf(".") !== -1 ? "property" : "argument") +
+      " '" + name + "' " + reason + ". Received " + specificType(value));
+    e.code = "ERR_INVALID_ARG_VALUE";
+    return e;
+  };
+  const validateString = (v, name) => {
+    if (typeof v !== "string") throw argTypeError(name, "must be of type string", v);
+  };
+  const validateNumber = (v, name, min, max) => {
+    if (typeof v !== "number") throw argTypeError(name, "must be of type number", v);
+    if ((min != null && v < min) || (max != null && v > max) || ((min != null || max != null) && v !== v))
+      throw outOfRange(name, (min != null ? ">= " + min : "") + (min != null && max != null ? " && " : "") + (max != null ? "<= " + max : ""), v);
+  };
+  const validateInt32 = (v, name, min, max) => {
+    if (min === undefined) min = -2147483648;
+    if (max === undefined) max = 2147483647;
+    if (typeof v !== "number") throw argTypeError(name, "must be of type number", v);
+    if (!Number.isInteger(v)) throw outOfRange(name, "an integer", v);
+    if (v < min || v > max) throw outOfRange(name, ">= " + min + " && <= " + max, v);
+  };
+  const validateUint32 = (v, name, positive) => {
+    if (typeof v !== "number") throw argTypeError(name, "must be of type number", v);
+    if (!Number.isInteger(v)) throw outOfRange(name, "an integer", v);
+    const min = positive ? 1 : 0;
+    if (v < min || v > 4294967295) throw outOfRange(name, ">= " + min + " && <= 4294967295", v);
+  };
+  const validateFunction = (v, name) => {
+    if (typeof v !== "function") throw argTypeError(name, "must be of type Function", v);
+  };
+  const validateObject = (v, name) => {
+    if (v === null || Array.isArray(v) || typeof v !== "object") throw argTypeError(name, "must be of type object", v);
+  };
+  const validateBuffer = (v, name) => {
+    if (!ArrayBuffer.isView(v)) throw argTypeError(name === undefined ? "buffer" : name, "must be an instance of Buffer, TypedArray, or DataView", v);
+  };
+
   const deferredTLS = (what) => {
     const e = new Error("tls." + what + " requires the socket event loop + real SSL_CTX handshake (DEFERRED in mbun: modules/tls TlsChannel / S-net)");
     e.code = "ERR_MBUN_DEFERRED";
@@ -170,6 +249,20 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
   class TLSSocket extends NetSocket {
     constructor(socket, options) {
       options = mergeSecureContext(options || {});
+      // node internal/tls/wrap.js TLSSocket: the transport must be a stream (it
+      // is wrapped in a JSStreamSocket otherwise), so a bare EventEmitter is a
+      // TypeError rather than a runtime error deep in the handshake.
+      // ref nodejs/node#3655, test-tls-wrap-event-emmiter.
+      if (socket != null && !isMbunNetSocket(socket) &&
+          !(typeof socket === "object" &&
+            (typeof socket.write === "function" || typeof socket.pipe === "function" ||
+             typeof socket._read === "function" || typeof socket._write === "function"))) {
+        throw argTypeError("socket", "must be an instance of net.Socket or stream.Duplex", socket);
+      }
+      if (options.SNICallback !== undefined && options.SNICallback !== null)
+        validateFunction(options.SNICallback, "options.SNICallback");
+      if (options.pskCallback !== undefined && options.pskCallback !== null)
+        validateFunction(options.pskCallback, "options.pskCallback");
       // node _tls_wrap.js: a TLSSocket is never half-open regardless of option.
       super({ allowHalfOpen: false });
       this.allowHalfOpen = false;
@@ -181,6 +274,7 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
       this._secureEstablished = false;
       this._securePending = true;
       this.secureConnecting = !options.isServer;
+      this._isServer = !!options.isServer;
       this.ALPNProtocols = options.ALPNProtocols;
       this._rejectUnauthorized = options.rejectUnauthorized !== false;
       this._requestCert = !!options.requestCert || !options.isServer;
@@ -336,13 +430,39 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
     getPeerFinished() { return undefined; }
     getTLSTicket() { return undefined; }
     isSessionReused() { return false; }
-    setServername(name) { this.servername = name; return this; }
+    // node internal/tls/wrap.js setServername: validateString, then refuse on a
+    // server-side socket — SNI travels client→server only.
+    setServername(name) {
+      validateString(name, "name");
+      if (this._isServer) {
+        const e = new Error("Cannot issue SNI from a TLS server-side socket");
+        e.code = "ERR_TLS_SNI_FROM_SERVER";
+        throw e;
+      }
+      this.servername = name;
+      return this;
+    }
     setSession() { return this; }
-    setMaxSendFragment() { return false; }
-    disableRenegotiation() {}
+    // node: validateInt32(size, 'size'), then SSL_set_max_send_fragment.
+    // DEFERRED: the fragment size is not yet threaded to the native TlsChannel,
+    // so the validated call reports failure rather than claiming success.
+    setMaxSendFragment(size) { validateInt32(size, "size"); return false; }
+    disableRenegotiation() { this._renegotiationDisabled = true; }
     enableTrace() {}
-    exportKeyingMaterial() { throw deferredTLS("TLSSocket.exportKeyingMaterial"); }
-    renegotiate() { return false; }
+    exportKeyingMaterial(length, label, context) {
+      validateUint32(length, "length", true);
+      validateString(label, "label");
+      if (context !== undefined) validateBuffer(context, "context");
+      throw deferredTLS("TLSSocket.exportKeyingMaterial");
+    }
+    // node internal/tls/wrap.js renegotiate(options, callback): both arguments
+    // are validated before anything is attempted, so a bare renegotiate() is an
+    // ERR_INVALID_ARG_TYPE rather than a silent false.
+    renegotiate(options, callback) {
+      validateObject(options, "options");
+      if (callback !== undefined) validateFunction(callback, "callback");
+      return false;
+    }
   }
 
   // ---- tls.connect(): open (or adopt) a socket and drive the client handshake -
@@ -369,6 +489,25 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
       if (typeof a[0] === "string") opts.path = a[0];
       else opts.port = a[0];
       if (host !== undefined) opts.host = host;
+    }
+    // node internal/tls/wrap.js connect(): the defaults are folded in first, then
+    // checkServerIdentity / minDHSize are validated, then the secure context is
+    // built through the tls module's own createSecureContext export (so a caller
+    // that replaced it — as test-tls-client-default-ciphers does — is observed),
+    // and only then is an IP servername refused.
+    opts = Object.assign({
+      rejectUnauthorized: true,
+      ciphers: T.DEFAULT_CIPHERS,
+      checkServerIdentity: T.checkServerIdentity,
+      minDHSize: 1024,
+    }, opts);
+    validateFunction(opts.checkServerIdentity, "options.checkServerIdentity");
+    validateNumber(opts.minDHSize, "options.minDHSize", 1);
+    const secureContext = opts.secureContext || (typeof T.createSecureContext === "function"
+      ? T.createSecureContext(opts) : undefined);
+    if (opts.servername && netIsIP(opts.servername)) {
+      throw invalidArgValue("options.servername", opts.servername,
+        "Setting the TLS ServerName to an IP address is not permitted");
     }
     const host = opts.host || opts.hostname || "localhost";
     const servername = opts.servername != null ? opts.servername
@@ -405,6 +544,10 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
   class Server extends NetServer {
     constructor(options, secureConnectionListener) {
       if (typeof options === "function") { secureConnectionListener = options; options = {}; }
+      // node internal/tls/wrap.js Server: anything that is neither a function nor
+      // an object (nor nullish) is rejected before any option is read.
+      else if (options == null) options = {};
+      else if (typeof options !== "object") throw argTypeError("options", "must be of type object", options);
       super();
       // node tls.Server runs setSecureContext(options) → createSecureContext in
       // the constructor, so an unusable option (a cipher list OpenSSL matches
@@ -416,6 +559,24 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
       // which node:https then compares against (test-https-argument-of-creating).
       if (options && options.ALPNProtocols && T && typeof T.convertALPNProtocols === "function") {
         try { T.convertALPNProtocols(options.ALPNProtocols, this); } catch (e) {}
+      }
+      // node internal/tls/wrap.js Server, after setSecureContext: the
+      // Server-only options (the ones createSecureContext never sees) are
+      // validated here. handshakeTimeout defaults to 120s BEFORE the check, so
+      // `handshakeTimeout: 0` is legal and only a non-number is rejected.
+      const hsTimeoutOpt = options.handshakeTimeout || (120 * 1000);
+      validateNumber(hsTimeoutOpt, "options.handshakeTimeout");
+      if (options.SNICallback !== undefined && options.SNICallback !== null)
+        validateFunction(options.SNICallback, "options.SNICallback");
+      if (options.pskCallback !== undefined && options.pskCallback !== null)
+        validateFunction(options.pskCallback, "options.pskCallback");
+      if (options.ALPNCallback !== undefined && options.ALPNCallback !== null) {
+        validateFunction(options.ALPNCallback, "options.ALPNCallback");
+        if (options.ALPNProtocols) {
+          const e = new TypeError("The ALPNCallback and ALPNProtocols TLS options are mutually exclusive");
+          e.code = "ERR_TLS_ALPN_CALLBACK_WITH_PROTOCOLS";
+          throw e;
+        }
       }
       this._sharedCreds = options || {};
       this._contexts = new Map();
@@ -470,9 +631,31 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
       });
     }
     setSecureContext(options) { this._sharedCreds = options || {}; }
-    addContext(servername, context) { this._contexts.set(servername, context); }
+    // node internal/tls/wrap.js addContext: an empty servername is refused (there
+    // would be nothing to match), and a plain options object is turned into a
+    // SecureContext first.
+    addContext(servername, context) {
+      if (!servername) {
+        const e = new Error('"Server name" is required for TLS server SNI context');
+        e.code = "ERR_TLS_REQUIRED_SERVER_NAME";
+        throw e;
+      }
+      this._contexts.set(servername, context);
+    }
     getTicketKeys() { return Buffer ? Buffer.alloc(48) : new Uint8Array(48); }
-    setTicketKeys() { return this; }
+    // node internal/tls/wrap.js setTicketKeys: validateBuffer, then assert the
+    // 48-byte length (16B name + 16B HMAC key + 16B AES key).
+    setTicketKeys(keys) {
+      validateBuffer(keys);
+      if (keys.byteLength !== 48) {
+        const e = new Error("Session ticket keys must be a 48-byte buffer");
+        e.code = "ERR_ASSERTION";
+        e.name = "AssertionError";
+        throw e;
+      }
+      this._ticketKeys = keys;
+      return this;
+    }
   }
   function createServer(options, connectionListener) { return new Server(options, connectionListener); }
 
