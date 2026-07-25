@@ -64,6 +64,74 @@ export constexpr std::string_view kDnsJS = R"JS(
   };
   const soon = (fn) => { G.queueMicrotask ? G.queueMicrotask(fn) : Promise.resolve().then(fn); };
 
+  // ── node argument validators (lib/internal/validators.js subset) ────────────
+  // node:dns validates every public entry point synchronously and the corpus
+  // asserts the exact ERR_INVALID_ARG_TYPE / ERR_OUT_OF_RANGE message, so the
+  // shapes below are translated from lib/internal/errors.js
+  // (determineSpecificType + the ERR_INVALID_ARG_TYPE determiner rules) rather
+  // than approximated — test/common/index.js invalidArgTypeHelper builds the
+  // expected string with the same algorithm.
+  const specificType = (v) => {
+    if (v === null) return "null";
+    if (v === undefined) return "undefined";
+    const t = typeof v;
+    if (t === "bigint") return "type bigint (" + String(v) + "n)";
+    if (t === "number") {
+      if (v === 0) return 1 / v === -Infinity ? "type number (-0)" : "type number (0)";
+      if (v !== v) return "type number (NaN)";
+      return "type number (" + String(v) + ")";
+    }
+    if (t === "boolean") return v ? "type boolean (true)" : "type boolean (false)";
+    if (t === "symbol") return "type symbol (" + String(v) + ")";
+    if (t === "function") return "function " + v.name;
+    if (t === "object") {
+      if (v.constructor && "name" in v.constructor) return "an instance of " + v.constructor.name;
+      return "[Object: null prototype] {}";
+    }
+    if (t === "string") {
+      let s = v;
+      if (s.length > 28) s = s.slice(0, 25) + "...";
+      return s.indexOf("'") === -1 ? "type string ('" + s + "')" : "type string (" + JSON.stringify(s) + ")";
+    }
+    return "type " + t + " (" + String(v) + ")";
+  };
+  // `name` carrying a dot is a property (options.timeout), otherwise an argument.
+  const argTypeError = (name, determinerText, actual) => {
+    const kind = String(name).indexOf(".") !== -1 ? "property" : "argument";
+    const e = new TypeError('The "' + name + '" ' + kind + " " + determinerText +
+      ". Received " + specificType(actual));
+    e.code = "ERR_INVALID_ARG_TYPE";
+    return e;
+  };
+  const outOfRange = (name, range, actual) => {
+    const e = new RangeError('The value of "' + name + '" is out of range. It must be ' +
+      range + ". Received " + specificType(actual));
+    e.code = "ERR_OUT_OF_RANGE";
+    return e;
+  };
+  const validateString = (v, name) => {
+    if (typeof v !== "string") throw argTypeError(name, "must be of type string", v);
+  };
+  const validateArray = (v, name) => {
+    if (!Array.isArray(v)) throw argTypeError(name, "must be an instance of Array", v);
+  };
+  const validateFunction = (v, name) => {
+    if (typeof v !== "function") throw argTypeError(name, "must be of type function", v);
+  };
+  const validateInt32 = (v, name, min, max) => {
+    if (min === undefined) min = -2147483648;
+    if (max === undefined) max = 2147483647;
+    if (typeof v !== "number") throw argTypeError(name, "must be of type number", v);
+    if (!Number.isInteger(v)) throw outOfRange(name, "an integer", v);
+    if (v < min || v > max) throw outOfRange(name, ">= " + min + " && <= " + max, v);
+  };
+  const validateUint32 = (v, name, positive) => {
+    if (typeof v !== "number") throw argTypeError(name, "must be of type number", v);
+    if (!Number.isInteger(v)) throw outOfRange(name, "an integer", v);
+    const min = positive ? 1 : 0;
+    if (v < min || v > 4294967295) throw outOfRange(name, ">= " + min + " && <= 4294967295", v);
+  };
+
   // Native lookup completes on the JS thread through DN.drain(), which is
   // composed into the runtime's existing IO pump below.
   //
@@ -199,8 +267,16 @@ export constexpr std::string_view kDnsJS = R"JS(
   };
   if (G.Bun) G.Bun.dns = BunDns;
 
+  // ── the module-level default resolver's nameserver list ────────────────────
+  // node binds dns.setServers/getServers/resolve* to a hidden default c-ares
+  // channel (internal/dns/utils.js bindDefaultResolver), so dns.setServers is a
+  // validating mutation the module-level dns.resolve* then observes — not a
+  // no-op. An empty list means "whatever /etc/resolv.conf says".
+  const defaultServers = [];
+
   // ── /etc/resolv.conf nameservers for dns.getServers() ──────────────────────
   const getServers_ = () => {
+    if (defaultServers.length) return defaultServers.slice();
     try {
       const fs = M["fs"] || M["node:fs"];
       if (!fs || typeof fs.readFileSync !== "function") return [];
@@ -220,7 +296,13 @@ export constexpr std::string_view kDnsJS = R"JS(
   // server rotates equally-ranked addresses between consecutive requests.
   const lookupCache = new Map();
   const LOOKUP_CACHE_MS = 30_000;
-  const promiseLookup = (hostname, options) => new Promise((resolve, reject) => {
+  const promiseLookup = (hostname, options) => {
+    // node lib/dns.js lookup(): a truthy hostname must be a string, and the
+    // check is synchronous (dns.lookup(1, {}) throws, it does not reject).
+    if (hostname) validateString(hostname, "hostname");
+    return promiseLookup_(hostname, options);
+  };
+  const promiseLookup_ = (hostname, options) => new Promise((resolve, reject) => {
     let family = 0, all = false, flags = 0;
     if (typeof options === "number") family = normFamily(options);
     else if (options && typeof options === "object") {
@@ -245,23 +327,36 @@ export constexpr std::string_view kDnsJS = R"JS(
     });
   });
 
-  const promiseAddresses = (hostname, fam, rr, options) => new Promise((resolve, reject) => {
-    const host = String(hostname == null ? "" : hostname);
-    const type = fam === 6 ? "AAAA" : "A";
-    rawResolve(host, type, (r) => {
-      if (Array.isArray(r)) resolve(options && options.ttl ? r : r.map((x) => x.address));
-      else reject(nodeError(r.error || "ENOTFOUND", rr, host));
+  // The record queries validate their hostname OUTSIDE the Promise executor:
+  // node's resolve*/resolveNs throw ERR_INVALID_ARG_TYPE synchronously rather
+  // than returning a rejected promise (test-dns-resolvens-typeerror asserts the
+  // synchronous form for both dns.* and dns.promises.*).
+  const promiseAddresses = (hostname, fam, rr, options) => {
+    validateString(hostname, "name");
+    return new Promise((resolve, reject) => {
+      const host = hostname;
+      const type = fam === 6 ? "AAAA" : "A";
+      rawResolve(host, type, (r) => {
+        if (Array.isArray(r)) resolve(options && options.ttl ? r : r.map((x) => x.address));
+        else reject(nodeError(r.error || "ENOTFOUND", rr, host));
+      });
     });
-  });
+  };
 
   // `res` (optional) is the dns.Resolver whose servers/timeout/tries this query
-  // must use; undefined for the module-level dns.resolve*.
-  const promiseRecord = (hostname, type, rr, res) => new Promise((resolve, reject) => {
+  // must use; the module-level dns.resolve* rides the default server list that
+  // dns.setServers maintains.
+  const promiseRecord = (hostname, type, rr, res) => {
+    validateString(hostname, "name");
+    return promiseRecord_(hostname, type, rr, res);
+  };
+  const promiseRecord_ = (hostname, type, rr, res) => new Promise((resolve, reject) => {
     const host = String(hostname == null ? "" : hostname);
+    const servers = res ? res._serverText : defaultServers;
     rawResolve(host, type, (r) => {
       if (r && r.error) reject(nodeError(r.error, rr, host));
       else resolve(r);
-    }, res && res._serverText, res && res._timeout, res && res._tries);
+    }, servers, res && res._timeout, res && res._tries);
   });
 
   const promiseReverse = (ip) => new Promise((resolve, reject) => {
@@ -322,8 +417,11 @@ export constexpr std::string_view kDnsJS = R"JS(
   };
   // "1.2.3.4" | "1.2.3.4:5353" | "[::1]:5353" | "::1" → validated, echoed back
   // verbatim (getServers returns what was set).
-  const parseServerEntry = (entry) => {
-    if (typeof entry !== "string") throw invalidIPError(entry);
+  const parseServerEntry = (entry, index) => {
+    // node ResolverBase.setServers validates the element type BEFORE parsing it,
+    // so a non-string reports ERR_INVALID_ARG_TYPE on "servers[i]" rather than
+    // ERR_INVALID_IP_ADDRESS (test-dns-setservers-type-check asserts both).
+    validateString(entry, "servers[" + (index === undefined ? 0 : index) + "]");
     let host = entry;
     if (host.charCodeAt(0) === 91 /* [ */) {
       const close = host.indexOf("]");
@@ -339,6 +437,17 @@ export constexpr std::string_view kDnsJS = R"JS(
     }
     if (isIP(host) === 0) throw invalidIPError(entry);
     return entry;
+  };
+  // dns.setServers / dns.promises.setServers / require('dns/promises').setServers
+  // are all the default resolver's setServers, so they validate identically.
+  // Every entry is parsed before anything is stored: node caches the old list and
+  // restores it if c-ares rejects the new one, so a failed call must not leave a
+  // half-applied server list behind.
+  const setServers_ = (list) => {
+    validateArray(list, "servers");
+    const parsed = list.map(parseServerEntry);
+    defaultServers.length = 0;
+    for (const entry of parsed) defaultServers.push(entry);
   };
   const RESOLVE_METHODS = {
     resolveAny: ["ANY", "queryAny"], resolveCname: ["CNAME", "queryCname"],
@@ -362,49 +471,87 @@ export constexpr std::string_view kDnsJS = R"JS(
   const makeResolverClass = (promiseStyle) => {
     // A promise-style method returns the promise; a callback-style one takes the
     // node (err, result) callback as its last argument and returns undefined.
-    const adapt = (fn) => promiseStyle
-      ? fn
-      : function (...a) {
-          const cb = a[a.length - 1];
-          if (typeof cb !== "function") throw new TypeError('The "callback" argument must be of type function.');
-          fn.apply(this, a.slice(0, -1)).then((v) => cb(null, v), (e) => cb(e));
-          return undefined;
-        };
+    // `nameArg` names the leading positional argument so it can be validated
+    // exactly where node does it — internal/dns/callback_resolver.js query()
+    // runs validateString(name) BEFORE validateFunction(callback), so
+    // `dns.resolveNs([])` must report the *name* error, not the callback one.
+    const adapt = (fn, nameArg) => {
+      const validateName = (a) => { if (nameArg) validateString(a[0], nameArg); };
+      return promiseStyle
+        ? function (...a) { validateName(a); return fn.apply(this, a); }
+        : function (...a) {
+            validateName(a);
+            const cb = a[a.length - 1];
+            validateFunction(cb, "callback");
+            fn.apply(this, a.slice(0, -1)).then((v) => cb(null, v), (e) => cb(e));
+            return undefined;
+          };
+    };
     class Resolver {
       constructor(options) {
         const o = options && typeof options === "object" ? options : {};
+        // node internal/dns/utils.js ResolverBase: validateTimeout /
+        // validateTries / validateMaxTimeout run BEFORE the c-ares channel is
+        // created, so an out-of-range option is a constructor throw.
+        const timeout = o.timeout === undefined ? -1 : o.timeout;
+        validateInt32(timeout, "options.timeout", -1);
+        const tries = o.tries === undefined ? 4 : o.tries;
+        validateInt32(tries, "options.tries", 1);
+        const maxTimeout = o.maxTimeout === undefined ? 0 : o.maxTimeout;
+        validateUint32(maxTimeout, "options.maxTimeout");
         const hide = (name, value) =>
           Object.defineProperty(this, name, { value, writable: true, enumerable: false, configurable: true });
         hide("_serverText", []);
         // node's defaults: timeout -1 ("use the c-ares default") and 4 tries.
-        hide("_timeout", typeof o.timeout === "number" ? o.timeout : -1);
-        hide("_tries", typeof o.tries === "number" ? o.tries : 4);
+        hide("_timeout", timeout);
+        hide("_tries", tries);
+        hide("_maxTimeout", maxTimeout);
+        hide("_localAddress", null);
       }
       getServers() { return this._serverText.length ? this._serverText.slice() : getServers_(); }
       setServers(list) {
-        if (!Array.isArray(list)) {
-          const e = new TypeError('The "servers" argument must be an instance of Array.');
-          e.code = "ERR_INVALID_ARG_TYPE";
-          throw e;
-        }
+        validateArray(list, "servers");
         this._serverText = list.map(parseServerEntry);
       }
       // DEFERRED: in-flight native queries run on the resolver worker and are not
       // interruptible, so cancel() cannot abort them; it is a no-op rather than a
       // lie about having cancelled.
       cancel() {}
-      setLocalAddress() {}
+      // node ResolverBase.setLocalAddress: both arguments are validated as
+      // strings, then handed to ares_set_local_ip4 / ares_set_local_ip6, which
+      // are family-specific — so the ipv4 slot must not hold an IPv6 literal and
+      // vice versa. A lone first argument may be either family (node passes it to
+      // whichever setter matches). ref test-dns-setlocaladdress.
+      setLocalAddress(ipv4, ipv6) {
+        validateString(ipv4, "ipv4");
+        if (ipv6 !== undefined) validateString(ipv6, "ipv6");
+        const f4 = isIP(ipv4);
+        if (f4 === 0) {
+          const e = new TypeError("Invalid IP address: " + ipv4);
+          e.code = "ERR_INVALID_IP_ADDRESS";
+          throw e;
+        }
+        if (ipv6 !== undefined) {
+          // With both slots supplied they must be one IPv4 and one IPv6.
+          if (f4 !== 4 || isIP(ipv6) !== 6) {
+            const e = new TypeError("Invalid IP address: " + (f4 !== 4 ? ipv4 : ipv6));
+            e.code = "ERR_INVALID_IP_ADDRESS";
+            throw e;
+          }
+        }
+        this._localAddress = { ipv4, ipv6 };
+      }
     }
     const proto = Resolver.prototype;
     for (const name of Object.keys(RESOLVE_METHODS)) {
       const type = RESOLVE_METHODS[name][0], rr = RESOLVE_METHODS[name][1];
-      proto[name] = adapt(function (hostname) { return promiseRecord(hostname, type, rr, this); });
+      proto[name] = adapt(function (hostname) { return promiseRecord(hostname, type, rr, this); }, "name");
     }
     const addresses = (self, hostname, family, rr, options) =>
       promiseRecord(hostname, family === 6 ? "AAAA" : "A", rr, self).then(
         (rows) => (options && options.ttl ? rows : rows.map((row) => (row && row.address !== undefined ? row.address : row))));
-    proto.resolve4 = adapt(function (hostname, options) { return addresses(this, hostname, 4, "queryA", options); });
-    proto.resolve6 = adapt(function (hostname, options) { return addresses(this, hostname, 6, "queryAaaa", options); });
+    proto.resolve4 = adapt(function (hostname, options) { return addresses(this, hostname, 4, "queryA", options); }, "name");
+    proto.resolve6 = adapt(function (hostname, options) { return addresses(this, hostname, 6, "queryAaaa", options); }, "name");
     proto.resolve = adapt(function (hostname, rrtype) {
       const t = (rrtype == null ? "A" : String(rrtype));
       if (t === "A") return addresses(this, hostname, 4, "queryA");
@@ -443,7 +590,7 @@ export constexpr std::string_view kDnsJS = R"JS(
     resolveTxt: (h) => promiseRecord(h, "TXT", "queryTxt"),
     resolveNaptr: (h) => promiseRecord(h, "NAPTR", "queryNaptr"),
     getServers: getServers_,
-    setServers: () => {},
+    setServers: setServers_,
     setDefaultResultOrder: setResultOrder_,
     getDefaultResultOrder: getResultOrder_,
     Resolver: PromiseResolver,
@@ -452,11 +599,14 @@ export constexpr std::string_view kDnsJS = R"JS(
   // ── node:dns (callback style) — wraps the promise layer, links promisify ────
   // A callback wrapper whose last arg is (err, ...results). node's lookup passes
   // (err, address, family); resolve*/reverse pass (err, result); we spread.
-  const cbify = (promiseFn, spread) => {
+  // `nameArg`, when given, is validated BEFORE the callback — node's
+  // internal/dns/callback_resolver.js query() runs validateString(name) first, so
+  // `dns.resolveNs([])` (one argument, no callback) must report the name error.
+  const cbify = (promiseFn, spread, nameArg) => {
     const fn = function (...a) {
+      if (nameArg) validateString(a[0], nameArg);
       const cb = a[a.length - 1];
-      if (typeof cb !== "function")
-        throw new TypeError('The "callback" argument must be of type function.');
+      validateFunction(cb, "callback");
       const args = a.slice(0, -1);
       const p = promiseFn.apply(null, args);
       p.then((v) => cb(null, ...(spread ? spread(v) : [v])), (e) => cb(e));
@@ -469,22 +619,22 @@ export constexpr std::string_view kDnsJS = R"JS(
   const dns = {
     lookup: cbify(promiseLookup, (v) => (v && v.address !== undefined && !Array.isArray(v) ? [v.address, v.family] : [v])),
     lookupService: cbify(promiseLookupService, (v) => [v.hostname, v.service]),
-    resolve: cbify(promiseResolve),
-    resolve4: cbify(dnsPromises.resolve4),
-    resolve6: cbify(dnsPromises.resolve6),
+    resolve: cbify(promiseResolve, undefined, "name"),
+    resolve4: cbify(dnsPromises.resolve4, undefined, "name"),
+    resolve6: cbify(dnsPromises.resolve6, undefined, "name"),
     reverse: cbify(promiseReverse),
-    resolveAny: cbify(dnsPromises.resolveAny),
-    resolveCname: cbify(dnsPromises.resolveCname),
-    resolveCaa: cbify(dnsPromises.resolveCaa),
-    resolveMx: cbify(dnsPromises.resolveMx),
-    resolveNs: cbify(dnsPromises.resolveNs),
-    resolvePtr: cbify(dnsPromises.resolvePtr),
-    resolveSoa: cbify(dnsPromises.resolveSoa),
-    resolveSrv: cbify(dnsPromises.resolveSrv),
-    resolveTxt: cbify(dnsPromises.resolveTxt),
-    resolveNaptr: cbify(dnsPromises.resolveNaptr),
+    resolveAny: cbify(dnsPromises.resolveAny, undefined, "name"),
+    resolveCname: cbify(dnsPromises.resolveCname, undefined, "name"),
+    resolveCaa: cbify(dnsPromises.resolveCaa, undefined, "name"),
+    resolveMx: cbify(dnsPromises.resolveMx, undefined, "name"),
+    resolveNs: cbify(dnsPromises.resolveNs, undefined, "name"),
+    resolvePtr: cbify(dnsPromises.resolvePtr, undefined, "name"),
+    resolveSoa: cbify(dnsPromises.resolveSoa, undefined, "name"),
+    resolveSrv: cbify(dnsPromises.resolveSrv, undefined, "name"),
+    resolveTxt: cbify(dnsPromises.resolveTxt, undefined, "name"),
+    resolveNaptr: cbify(dnsPromises.resolveNaptr, undefined, "name"),
     getServers: getServers_,
-    setServers: () => {},
+    setServers: setServers_,
     setDefaultResultOrder: setResultOrder_,
     getDefaultResultOrder: getResultOrder_,
     lookupService_: undefined,
