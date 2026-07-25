@@ -559,7 +559,21 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
   }
   {
     const CN = G.__mbunCryptoNative;   // native mbun.crypto backend (hash/hmac/pbkdf2/random)
-    const rb = (n) => { if (CN) return Buffer.from(CN.randomBytes(n)); const b = Buffer.alloc(n); for (let i = 0; i < n; i++) b[i] = Math.floor(Math.random() * 256); return b; };
+    // SECURITY: FAIL CLOSED. This used to fall back to Math.random() when the
+    // native CSPRNG binding was absent, which silently downgraded
+    // crypto.randomBytes / randomUUID / randomInt / generateKey to a
+    // non-cryptographic PRNG with no error anywhere — key material an auditor would
+    // read as CSPRNG-derived. The fallback is unreachable in a correctly linked
+    // build, but "unreachable" is exactly the assumption a silently-unbound
+    // partition breaks (see .agents/skills/mbun-runtime-debugging: an IIFE-scope
+    // mistake makes a jsc binding vanish without an error). An absent CSPRNG must
+    // be an exception, never weaker randomness.
+    const rb = (n) => {
+      if (CN) return Buffer.from(CN.randomBytes(n));
+      const e = new Error("No secure random number generator available");
+      e.code = "ERR_CRYPTO_OPERATION_FAILED";
+      throw e;
+    };
     // JS digest fallbacks (only reached if the native backend is absent).
     // Real digests (SHA-256/SHA-1/MD5) implemented in JS (verified vs known vectors).
     const pad64 = (msg, lenLE) => {
