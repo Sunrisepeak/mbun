@@ -224,6 +224,36 @@
           },
           "security_verified_independently": "primordials / internalBinding / getInternalBinding are wrapper parameters, never globals, gated on TWO independent conditions (bare `internal/...` specifier AND resolved path under a lib/internal/ directory). Coordinator re-verified on the composed binary: ordinary user code sees all three undefined; a package shipping node_modules/internal/foo.js resolves normally but receives undefined for both; a relative ./lib/internal/bar.js receives undefined; enumerable globals remain exactly 15 with no leak (checked deliberately against round 9's 265-file enumerable-globals incident).",
           "fragility_found": "require('internal/x') resolves ONLY because node's own compat/node/tsconfig.json maps internal/* -> ./lib/internal/*, and mbun's resolver honours tsconfig `paths`. Nobody wired this deliberately. It works solely inside the node checkout \u2014 which is also what makes the gate safe \u2014 but the capability silently depends on a file in the read-only upstream corpus."
+        },
+        {
+          "id": "r10/agent-6",
+          "cluster": "node:cluster + node:test runner",
+          "worklist_files": 136,
+          "cluster_homogeneity": "selected by the green-ratio heuristic, not by signature",
+          "target_delta_pass": 45,
+          "actual_delta_pass": 73,
+          "hit_rate": 1.62,
+          "wall_clock_min": 105,
+          "split": {
+            "cluster": "11/83 -> 76/83 green (+65), timeouts 3 -> 0",
+            "runner": "10/77 -> 18/77 green (+8)"
+          },
+          "note": "Second validation of the green-ratio heuristic: cluster was 13.3% green and node:cluster turned out to be a STUB whose fork() returned a bare EventEmitter. Translating node's lib/cluster.js + lib/internal/cluster/* was +38 on its own, then NODE_HANDLE/SCM_RIGHTS descriptor passing +17. Signature clustering had shown these 45 files as a `global code@...` bucket, i.e. just 'a top-level throw' \u2014 no usable signal.",
+          "iterative_evidence": {
+            "per_cycle_delta": [
+              38,
+              17,
+              9,
+              6,
+              3,
+              0
+            ],
+            "cycles": 6,
+            "note": "Cycle 5's +3 came from finding that the last three hangs were ONE runtime bug, not a cluster bug \u2014 visible only after cycles 1-4 cleared."
+          },
+          "runtime_bug_found": "A descriptor received over SCM_RIGHTS never went through accept()/connect(), so it was absent from the net reactor's poll set: netn_wait_cb never watched it and the pump parked up to 60s with a FIN sitting unnoticed. Non-deterministic, so it had been reading as flakiness rather than a bug. Also NODE_HANDLE_ACK was missing, so a parent that handed over a socket never exited.",
+          "stop_condition": "Met: re-clustering showed no remaining cause above 2 files. 7 named survivors.",
+          "ceiling_identified": "node:test runner, 55 files, is subsystem-scale not cleanup. Two causes hold 23: node's --test CLI (18) and run() returning a TestsStream of test:pass/test:fail events with per-file child processes (5+). Neither is reachable by patching the current in-process runner; both need lib/internal/test_runner/* ported."
         }
       ],
       "verdicts": {
@@ -233,7 +263,8 @@
       "calibration_addendum": {
         "signature_clustering_blind_spot": "A missing or stand-in LAYER is invisible to signature clustering. Each file asserts something different about the layer, so the logs share no signature and the cluster ranks as a heterogeneous tail \u2014 while the true fix is one translation. Two independent checks now recommended before believing a 'heterogeneous tail': (1) how much of the subsystem is green? http was 102/398 = 26% while its API surface is old and stable, which is itself the signal; (2) is the mbun implementation a translation of node's lib/, or a hand-written stand-in? A stand-in with many small assertion failures means translate the layer, do not extend the stand-in.",
         "green_ratio_heuristic": "For a mature, stable node subsystem, a low green ratio is stronger evidence of a missing layer than the error signatures are. cluster 11/80 and runner 10/73 currently look the same way http did.",
-        "instrumented_stub_pattern": "The strongest single technique observed so far for an unknown-depth wall: stub the missing capability so it FAILS LOUDLY WITH ITS OWN NAME, then let the log histogram pick the next target each cycle. On the internalBinding cluster this produced deltas of +8,+13,+14,+4,+3,+1,+2 over 7 cycles (45 total) where a single blind change would have reached ~21. It converts an open-ended 'implement internalBinding' into a measured, self-terminating work queue."
+        "instrumented_stub_pattern": "The strongest single technique observed so far for an unknown-depth wall: stub the missing capability so it FAILS LOUDLY WITH ITS OWN NAME, then let the log histogram pick the next target each cycle. On the internalBinding cluster this produced deltas of +8,+13,+14,+4,+3,+1,+2 over 7 cycles (45 total) where a single blind change would have reached ~21. It converts an open-ended 'implement internalBinding' into a measured, self-terminating work queue.",
+        "green_ratio_heuristic_validated": "Confirmed twice in one round. http: 26% green -> stand-in -> +170 (2.8x target). cluster: 13.3% green -> stub -> +65 on that subsystem (+73 task, 1.62x target). In both cases signature clustering gave no usable signal (a bare AssertionError tail, and a bare `global code@...` bucket respectively). The green ratio of a mature subsystem is now the primary targeting input; signatures are for picking work WITHIN a subsystem."
       }
     }
   ]

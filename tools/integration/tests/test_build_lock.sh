@@ -82,4 +82,31 @@ rm -f "$marker"
   || fail "command ran despite giving up"
 wait $holder
 
+# --- a build that leaves sources newer than the binary must warn loudly -------
+# `mcpp build` has reported "Finished release in 0.01s" over edited .cppm files.
+# A measurement taken after that silently scores the PREVIOUS binary, which looks
+# like a result — so the wrapper has to say so.
+mkdir -p "$main/modules" "$main/src" "$main/target/t/h/bin"
+: >"$main/target/t/h/bin/mbun"; chmod +x "$main/target/t/h/bin/mbun"
+sleep 0.05
+echo "edited" >"$main/modules/thing.cppm"          # newer than the binary
+warn=$( (cd "$main" && bash "$script" true) 2>&1 )
+printf '%s' "$warn" | grep -q 'sources are NEWER' \
+  && pass "warns when sources are newer than the built binary" \
+  || fail "no staleness warning, got: $warn"
+printf '%s' "$warn" | grep -q 'build.ninja -delete' \
+  && pass "warning names the fix" || fail "warning does not name the fix"
+
+# Touching the binary afterwards must silence it (no false positives).
+touch "$main/target/t/h/bin/mbun"
+warn2=$( (cd "$main" && bash "$script" true) 2>&1 )
+printf '%s' "$warn2" | grep -q 'sources are NEWER' \
+  && fail "false positive: warned with an up-to-date binary" \
+  || pass "silent when the binary is up to date"
+
+# A FAILED build must not also emit the staleness warning (one error, not two).
+warn3=$( (cd "$main" && bash "$script" bash -c 'exit 3') 2>&1 || true )
+printf '%s' "$warn3" | grep -q 'sources are NEWER' \
+  && fail "warned on a failed build" || pass "no staleness warning on a failed build"
+
 echo "test_build_lock: ok"
