@@ -14,10 +14,13 @@
 //
 //   * node propagates the active domain across async boundaries with an
 //     async_hooks init/before/after hook. mbun's `async_hooks.createHook` is a
-//     no-op stub, so the same job is done by wrapping the scheduling primitives
-//     (setTimeout/setInterval/setImmediate/queueMicrotask/process.nextTick):
-//     each captures the domain that was active when the callback was SCHEDULED
-//     and enters it around the call.
+//     no-op stub, so the same job is done through the runtime's scheduling seam
+//     (`globalThis.__mbunSchedHook`, read per call by node_timers' setTimeout/
+//     setInterval/setImmediate and by node_process_lifecycle's queueMicrotask,
+//     which process.nextTick rides on): the hook captures the domain that was
+//     active when the callback was SCHEDULED and enters it around the call.
+//     It is a slot, NOT a replacement of those globals — see the install site
+//     for the harness contract that makes the difference load-bearing.
 //   * node lets a throw out of run()/bind()/a scheduled callback escape into
 //     process._fatalException, which calls `process.domain._errorHandler(er)`.
 //     mbun has no JS-visible _fatalException on the entry-script or microtask
@@ -399,43 +402,32 @@ inline constexpr std::string_view kNodeDomainJS = R"JS(
           return ret;
         };
       };
-      // One scheduling primitive may be built on another — mbun's
-      // process.nextTick IS queueMicrotask — and both are hooked here. Without
-      // this guard the callback got wrapped twice and the domain was entered
-      // twice per tick, so a nextTick scheduled from an error handler saw a
-      // domains stack of [d, d] where node has [d]
+      // Register `wrap` in the runtime's scheduling seam instead of REPLACING
+      // globalThis.setTimeout/setInterval/setImmediate/queueMicrotask.
+      //
+      // Replacing them is what an earlier revision did, and it broke the node
+      // test harness wholesale: test/common/index.js snapshots the VALUES of
+      // those four globals when it loads and its 'exit' listener asserts
+      // "Unexpected global(s) found" on any global whose value changed since.
+      // node:repl loads node:domain to own an eval's uncaught exceptions, so
+      // every REPL test tripped it — 43 of the 94 non-green test-repl-* files
+      // failed on that one line, before any REPL behaviour was even exercised.
+      // node has the same requirement and meets it the same way (its domain
+      // propagation is an async_hooks hook, never a global swap).
+      //
+      // The seam is read per schedule by node_timers' mySet* and by
+      // node_process_lifecycle's queueMicrotask. process.nextTick rides on
+      // queueMicrotask, so it is covered through that one seam — which is also
+      // why the old double-wrap guard is gone: there is exactly one hook point
+      // per scheduled callback now, so a nextTick from an error handler can no
+      // longer see a domains stack of [d, d]
       // (test-domain-thrown-error-handler-stack, -emit-error-handler-stack).
-      let scheduling = false;
-      const hook = (holder, name) => {
-        const original = holder && holder[name];
-        if (typeof original !== "function") return;
-        const hooked = function (callback, ...rest) {
-          if (scheduling) return Reflect.apply(original, this, [callback, ...rest]);
-          const wrapped = wrap(callback);
-          scheduling = true;
-          try {
-            return Reflect.apply(original, this, [wrapped, ...rest]);
-          } finally {
-            scheduling = false;
-          }
-        };
-        try {
-          // Keep the original's own properties (util.promisify's
-          // `__promisify__`, custom symbols) — the hook must be invisible.
-          for (const key of Reflect.ownKeys(original)) {
-            if (key === "length" || key === "name" || key === "prototype") continue;
-            const descriptor = Object.getOwnPropertyDescriptor(original, key);
-            if (descriptor) Object.defineProperty(hooked, key, descriptor);
-          }
-          Object.defineProperty(hooked, "name", { value: name, configurable: true });
-          holder[name] = hooked;
-        } catch (e) {}
-      };
-      hook(G, "setTimeout");
-      hook(G, "setInterval");
-      hook(G, "setImmediate");
-      hook(G, "queueMicrotask");
-      try { hook(process, "nextTick"); } catch (e) {}
+      // Defined non-enumerable: a plain assignment would create an enumerable
+      // global and become a leak of its own in the very check above.
+      try {
+        Object.defineProperty(G, "__mbunSchedHook",
+                              { value: wrap, writable: true, configurable: true, enumerable: false });
+      } catch (e) {}
 
       return exports;
     };
