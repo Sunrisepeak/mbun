@@ -415,6 +415,19 @@ export constexpr std::string_view kNetJS = R"JS(
       }
       return true;
     }
+    // stream.Readable#pipe over this transport: node's net.Socket is a Duplex,
+    // and upgrade handlers routinely `socket.pipe(socket)`.
+    pipe(dest, opts) {
+      const onData = (c) => { const ok = dest.write(c); if (ok === false && this.pause) this.pause(); };
+      const onDrain = () => { if (this.resume) this.resume(); };
+      const onEnd = () => { if (!opts || opts.end !== false) { try { dest.end(); } catch (e) {} } };
+      this.on("data", onData);
+      if (dest.on) dest.on("drain", onDrain);
+      this.on("end", onEnd);
+      this.resume();
+      if (dest.emit) dest.emit("pipe", this);
+      return dest;
+    }
     // stream.Duplex#push: feed bytes to this socket's readable side. node's
     // net.Socket is a Duplex, and http tests drive fake/broken responses by
     // pushing straight into it (test-http-client-read-in-error,
@@ -2474,15 +2487,68 @@ export constexpr std::string_view kNetJS = R"JS(
     const srv = new Server({ allowHalfOpen: false });
     const ResponseClass = typeof o.ServerResponse === "function" ? o.ServerResponse : ServerResponse;
     const RequestClass = typeof o.IncomingMessage === "function" ? o.IncomingMessage : IncomingMessage;
+    // lib/_http_server.js storeHTTPOptions.
+    const HI = G.__mbunHttpInternals || {};
+    const vInt = HI.validateInteger || (() => {});
+    const vBool = HI.validateBoolean || (() => {});
+    const oor = HI.ERR_OUT_OF_RANGE || ((name, range, v) => { const e = new RangeError(name); e.code = "ERR_OUT_OF_RANGE"; return e; });
+    const opt = (name, dflt, validate) => {
+      const v = o[name];
+      if (v === undefined) return dflt;
+      (validate || vInt)(v, name, 0);
+      return v;
+    };
     srv.timeout = 0;
-    srv.keepAliveTimeout = 5000;
-    srv.keepAliveTimeoutBuffer = 1000;
-    srv.headersTimeout = 60000;
-    srv.requestTimeout = 300000;
+    srv.requestTimeout = opt("requestTimeout", 300000);
+    srv.headersTimeout = o.headersTimeout === undefined
+      ? Math.min(60000, srv.requestTimeout) : opt("headersTimeout", 60000);
+    if (srv.requestTimeout > 0 && srv.headersTimeout > 0 && srv.headersTimeout > srv.requestTimeout) {
+      throw oor("headersTimeout", "<= requestTimeout", o.headersTimeout);
+    }
+    srv.keepAliveTimeout = opt("keepAliveTimeout", 5000);
+    srv.keepAliveTimeoutBuffer = opt("keepAliveTimeoutBuffer", 1000);
+    srv.connectionsCheckingInterval = opt("connectionsCheckingInterval", 30000);
     srv.maxHeadersCount = null;
     srv.maxRequestsPerSocket = 0;
-    srv.requireHostHeader = o.requireHostHeader !== false;
+    srv.requireHostHeader = o.requireHostHeader === undefined ? true : (vBool(o.requireHostHeader, "options.requireHostHeader"), o.requireHostHeader);
     srv.rejectNonStandardBodyWrites = !!o.rejectNonStandardBodyWrites;
+    if (o.maxHeaderSize !== undefined) vInt(o.maxHeaderSize, "maxHeaderSize", 0);
+    srv.maxHeaderSize = o.maxHeaderSize;
+    // lib/_http_server.js setupConnectionsTracking: an unref'd sweeper that
+    // expires connections which blew past headersTimeout / requestTimeout. The
+    // 408 it produces is what the server-*-timeout-* corpus asserts.
+    const sweep = () => {
+      if (srv.headersTimeout === 0 && srv.requestTimeout === 0) return;
+      const now = Date.now();
+      for (const s of Array.from(srv._conns)) {
+        // An idle keep-alive connection has no message in flight, so neither
+        // clock is running (llhttp starts them at on_message_begin).
+        if (s.destroyed || s._httpMsgIdle) continue;
+        const started = s._httpMsgStart || 0;
+        if (!started) continue;
+        const headersLate = srv.headersTimeout > 0 && !s._httpHeadersDone &&
+                            (now - started) > srv.headersTimeout;
+        const requestLate = srv.requestTimeout > 0 &&
+                            (now - started) > srv.requestTimeout;
+        if (headersLate || requestLate) onRequestTimeout(s);
+      }
+    };
+    const onRequestTimeout = (sock) => {
+      const err = new Error("Request timeout");
+      err.code = "ERR_HTTP_REQUEST_TIMEOUT";
+      if (!srv.emit("clientError", err, sock)) {
+        if (sock.writable && sock.bytesWritten === 0) {
+          try { sock.end("HTTP/1.1 408 Request Timeout\r\nConnection: close\r\n\r\n"); return; } catch (e) {}
+        }
+        sock.destroy();
+      }
+    };
+    srv.on("listening", () => {
+      if (srv._httpSweeper) G.clearInterval(srv._httpSweeper);
+      const every = srv.connectionsCheckingInterval > 0 ? srv.connectionsCheckingInterval : 30000;
+      srv._httpSweeper = G.setInterval(sweep, every);
+      if (srv._httpSweeper && typeof srv._httpSweeper.unref === "function") srv._httpSweeper.unref();
+    });
     srv.setTimeout = function (msecs, cb) {
       this.timeout = msecs;
       if (typeof cb === "function") this.on("timeout", cb);
@@ -2511,6 +2577,7 @@ export constexpr std::string_view kNetJS = R"JS(
     const netClose = Server.prototype.close;
     srv.close = function (...args) {
       this.closeIdleConnections();
+      if (this._httpSweeper) { G.clearInterval(this._httpSweeper); this._httpSweeper = null; }
       return netClose.apply(this, args);
     };
     // node http.Server.listen fires its callback with (err, hostname, port),
@@ -2542,6 +2609,12 @@ export constexpr std::string_view kNetJS = R"JS(
       if (srv.timeout) { try { sock.setTimeout(srv.timeout); } catch (e) {} }
       sock.server = srv;
       sock._httpInFlight = 0;
+      // headersTimeout / requestTimeout clocks (ConnectionsList's
+      // last_message_start): reset whenever the connection is free to receive
+      // the next message.
+      sock._httpMsgStart = Date.now();
+      sock._httpHeadersDone = false;
+      sock._httpMsgIdle = false;
       // lib/_http_server.js socketOnTimeout: the request, the response and the
       // server each get a say; only if none of them claims the event does the
       // connection go away.
@@ -2582,7 +2655,7 @@ export constexpr std::string_view kNetJS = R"JS(
         if (typeof srv.maxHeadersCount === "number" && srv.maxHeadersCount > 0) {
           parser.maxHeaderPairs = srv.maxHeadersCount << 1;
         }
-        if (typeof o.maxHeaderSize === "number" && o.maxHeaderSize > 0) parser.maxHeaderSize = o.maxHeaderSize;
+        if (typeof srv.maxHeaderSize === "number" && srv.maxHeaderSize > 0) parser.maxHeaderSize = srv.maxHeaderSize;
         sock._httpParser = parser;
         let im = null;
         let res = null;
@@ -2602,6 +2675,10 @@ export constexpr std::string_view kNetJS = R"JS(
             const m = outgoing.shift();
             if (m) m.assignSocket(sock);
           } else if (!sock.destroyed) {
+            // The connection is free again: restart both timeout clocks.
+            sock._httpMsgStart = Date.now();
+            sock._httpHeadersDone = false;
+            sock._httpMsgIdle = true;
             // Idle keep-alive connection: arm the advertised keep-alive timeout
             // (plus node's buffer) so it cannot pin the loop forever.
             if (srv.keepAliveTimeout > 0 && typeof sock.setTimeout === "function") {
@@ -2614,6 +2691,8 @@ export constexpr std::string_view kNetJS = R"JS(
 
         parser.onHead = () => {
           sock._httpInFlight = (sock._httpInFlight | 0) + 1;
+          sock._httpHeadersDone = true;
+          sock._httpMsgIdle = false;
           // A request is in flight: clear any armed keep-alive timeout, node
           // re-arms server.timeout instead (resetSocketTimeout).
           if (typeof sock.setTimeout === "function") { try { sock.setTimeout(srv.timeout || 0); } catch (e) {} }
@@ -2739,6 +2818,9 @@ export constexpr std::string_view kNetJS = R"JS(
       };
 
       sock.on("data", (chunk) => {
+        // First byte of the next message on an idle connection: llhttp's
+        // on_message_begin, where headersTimeout/requestTimeout start counting.
+        if (sock._httpMsgIdle) { sock._httpMsgIdle = false; sock._httpMsgStart = Date.now(); }
         const b = u8(chunk);
         const p = sock._httpParser;
         if (p && !p.done) p.push(b);
