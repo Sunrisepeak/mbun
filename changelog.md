@@ -5,6 +5,41 @@
 
 ## 2026-07-26
 
+### w5/agent-fs：事件循环回调边界排序（全量 2,460 → **2,470 / 4,433**，回归 0；fs 309/342 不变）
+
+本轮的目标是 fs +8，实际 **fs +0**、**全量 +10**。fs 已到天花板（309/342，剩下 23 个逐一点名见下），而被点名为「无人尝试过」的 `process.nextTick` 优先级缺陷落地后，收益全部落在 timers / streams / http / worker。
+
+**两个排序缺陷其实是同一个 bug：mbun 没有「node 回调边界」这个概念。** 凡是 node 在边界上定序的东西，在 mbun 里就按 JSC 单一 microtask FIFO 的偶然顺序跑。
+
+1. **`process.nextTick` 没有优先级** —— 它字面上就是 `queueMicrotask(...)`（`engine.inc`），所以 tick 与 promise continuation 共用一条 FIFO：
+
+       Promise.resolve().then(p1); process.nextTick(t1);
+       Promise.resolve().then(p2); process.nextTick(t2);
+       node -> t1,t2,p1,p2      mbun -> p1,t1,p2,t2
+
+   node 会把**整个** tick 队列（含 tick 里再压的 tick）排空后才跑第一个 promise continuation，microtask 队列空掉后再排一次（`internal/process/task_queues.js processTicksAndRejections`）。此前的可见后果就是 fs abort-signal 测试：`queueMicrotask` 延迟的 fs 回调跑在 `nextTick` 调度的 `abort()` 之前，早前有两个文件是用 `setImmediate` **绕过**而不是修好的。
+
+   队列现在放在 runtime prelude 里，`__mbunRunTicks` 负责排空，并在 mbun 自己拥有的每个边界上**同步**调用 —— 入口脚本的 CJS wrapper、每个 timer 回调、每个 pump phase。**优先级正是这样买来的**：这些都跑在同一次 JSC evaluation 内，而 JSC 只在该 evaluation 释放锁时才排空自己的队列。首次入队时另外挂一个**裸 promise reaction** 作为 node 的第二条臂（让「从 microtask 里调度的 tick」也能跑）。刻意不用 `queueMicrotask`：那个 wrapper 会施加 `__mbunSchedHook`，钩住 drain 而不是钩住 callback 会让每个 tick 进两次 `node:domain`（`test-domain-thrown-error-handler-stack` 钉住的 `[d, d]` 栈）。nextTick 原先从该 wrapper 继承的两件事改为显式做：入队时逐 callback 施加 `__mbunSchedHook`，抛出走 node 的 `uncaughtException` 而不是 JSC 的 rejection tracker。
+
+2. **到期 timer 抢在 pending promise microtask 前面**：
+
+       setTimeout(() => { Promise.resolve().then(p); setTimeout(t, 0); })
+       node -> p,t              mbun -> t,p
+
+   `__mbun_drain_timers` 一次 evaluation 内最多烧 200 个到期 timer，JSC 于是把整批期间产生的 continuation 全部压到批次结束。node 在**每个** timer 回调后做一次 microtask checkpoint。新增 `__mbunDrainMicrotasksNative` 把 JSC 的 drain 暴露给该循环，在 tick drain 之后 checkpoint，与 node 的 timer phase 一致。
+
+**证据**：三个排序探针（含 tick 套 tick、promise continuation 里调度 tick、timer 上下文）现在与**真实 node v24.15.0** 逐字一致。全量 4433 文件、两个二进制各跑一次、`--jobs 5`：`pass 2,460 → 2,470`，**green→non-green 回归 0**。转绿 10 个：`test-microtask-queue-run`、`-run-immediate`、`test-timers-next-tick`、`test-timers-nested`、`test-stream2-push`、`test-stream3-cork-end`、`test-stream-readable-hwm-0-no-flow-data`、`test-http-chunk-extensions-limit`、`test-whatwg-webstreams-adapters-to-writablestream`、`test-worker-message-port-transfer-self`。
+
+**排序改对后暴露的一个真 fs 缺陷**：`FileHandle.close()` 此前在**延迟的 `.then()` 里**发 `"close"`，node 是**同步**发（`lib/internal/fs/promises.js` 末尾 `this.emit('close'); return this[kClosePromise];`），且与 ref 计数无关。这是承重的：`fs.createReadStream(null, { fd: handle })` 注册 `handle.on("close", () => stream.close())`，所以 `createReadStream(...); return handle.close();` 必须**同一 turn 内**销毁流、流永不读。延迟发让流得以对已置 `_closed` 的 handle 发起首次读，`_use()` 以 EBADF 拒绝。此前之所以看着是对的，只是因为流的首次读恰好排在 close 的 microtask 之后 —— tick 排序修好后它提前了。（`test-fs-read-stream-file-handle` 一度回归，二分到 11 个 block 里的第 3 个。）
+
+**fs 剩余 23 个，逐一点名（`compat/` 只读，inventory 修正记在这里）**：
+
+- **有原因但 inventory 无条目**：`test-fs-readdir-stack-overflow` —— JSC 的 RangeError 是 `'Maximum call stack size exceeded.'`（**多一个句点**），V8 没有；语料里共 13 个文件断言该字符串，且**无法在 JS 层修正**（错误由引擎内部构造）。`test-fs-readdir-ucs2` —— native `readdir` 把原始字节按 UTF-8 解码成 JS 字符串，孤立代理对的文件名在到达 `fsReaddirEncode` 前已塌成 U+FFFD（`3d d8 04 dc` → `3d ef bf bd 04 ef bf bd`），要修必须让 native 返回原始字节。`test-fs-promises-file-handle-read-worker` —— `DataCloneError: mustNotCall could not be cloned`，worker 结构化克隆不支持 FileHandle 传输（node 走 `kTransferList`）。`test-fs-glob` —— glob 引擎缺 extglob（`+(a|b)`、`!(x)`）、brace 展开与 `.`/`..` 段处理，33 个子测试里 20 个红。`test-fs-promises` —— **不是超时**（runner 15s 判超时，实际 0.12s 跑完），是 `test-fs-promises.js:56` 的 `expectsError` 错误形状不符。`test-fs-read-stream-pos` —— **语义是通过的**，但耗时 **90.12 s**（node 0.07 s）：文件的提前退出需要「同一个流在短 chunk 之后再收到一个 data 事件」，mbun 的 fs 流在单个 loop turn 内读完，1ms 的写 interval 插不进去，于是只能等文件自带的 90 秒兜底 timer；对 15 s 预算即判超时。`test-fs-read-stream-fd-leak` —— 真挂，卡在 `createReadStream().destroy()` 的泄漏检测。
+- **`test-fs-watchfile-bigint` 归入 internalBinding 家族**：本轮已把 `BigIntStats` 的 atime/mtime/ctime/birthtime 改成 node 那样的**原型惰性访问器**（own key 集合现已完全一致），但它仍红 —— 它的期望值由 `require('internal/fs/utils').BigIntStats` 构造，而 `assert.deepStrictEqual` 还比原型，`fs.watchFile` 造不出 node 内部类的实例。
+- **确认 brief 的判断**：`test-fs-buffer` 是已知 issue #16（JSC rope-string use-after-free），本轮全量里崩过一次（SIGSEGV，exit -11）、另一次全量没崩，单独跑新旧二进制各 5/5 通过 —— **抖动，非回归**。`test-fs-promises-file-handle-{pull,pullsync,writer}` 确为 `fh.pull is not a function`（`--experimental-stream-iter`），与 FileHandle 内部无关。`test-fs-existssync-memleak-longpath` 确为 `queryObjects is not a function`。`test-fs-{access,readfile-error,syncwritestream,write-buffer-large}`、`test-fs-{readdir-types,sync-fd-leak,filehandle}` 及三个 FileHandle `*-errors`、`test-fs-{cp-async-file-url,realpath-native}` 均与 brief 所述一致，未动。
+
+**并发事故（第三次）**：全局 `~/.mcpp/config.toml` 的 `[toolchain] default_target` 被并发 agent 翻成 `x86_64-linux-musl`，仓库内每个构建都死在 `modules/crash_handler/src/install.cppm:35: fatal error: execinfo.h: No such file or directory` —— 读起来像缺系统头文件（`/usr/include/execinfo.h` 明明在），实为 musl 无此头。几分钟后对方又翻了回去，所以还是**间歇性**的。`build_or_die.sh` 现在显式传 `--target x86_64-linux-gnu`（`MBUN_TARGET` 可覆盖），经它发起的构建不再可能被别的 session 改目标。另：`compat/node/test/parallel/should-not-write.txt`（01:44，早于本 worktree）是别处遗留的产物，未清理。
+
 ### 第十二轮整合：node 语料 2,403 → **2,459 / 4,433**（55.5% 严格 / 63.4% 排除自我跳过），**回归 0**
 
 三个 agent 全部达标或超额（tls +16/14、http +26/12、fs +11/11），整合后逐文件 diff：**56 转绿、0 回归** —— 迄今最干净的一次组合。增量分布：http2 15、tls 14、fs 11、http 8、https 5，另有 filehandle/permission/stdio 各 1。
