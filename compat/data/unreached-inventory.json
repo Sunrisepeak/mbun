@@ -1,6 +1,6 @@
 {
  "purpose": "Per-file named causes for corpus files that are NOT passing. Exists to remove the ~35min triage phase that every wave-2 agent paid independently and then threw away. A brief MUST draw its worklist from here rather than asking an agent to re-triage. Entries are what the agent that filed them measured; a stale entry is a bug -- re-derive before budgeting.",
- "provenance": "wave-2 agents w2/agent-1 (tls), w2/agent-2 (http), w2/agent-3 (fs), round 10; tls per-file causes extracted from the r10-j6 full run logs at integration (155 non-pass tls/https: 119 fail, 19 timeout, 17 self-skip)",
+ "provenance": "wave-2 agents w2/agent-1 (tls), w2/agent-2 (http), w2/agent-3 (fs), round 10; tls per-file causes extracted from the r10-j6 full run logs at integration (155 non-pass tls/https: 119 fail, 19 timeout, 17 self-skip); http/http2 per-file causes extracted the same way (165 'fail' files)",
  "how_to_use": "Group by `cause`, count files per cause, budget mechanisms x 10min + 55min overhead. Do NOT budget by subsystem -- see compat/README.md 'Allocate agents by cause family, not by subsystem'.",
  "caveat": "Coverage is uneven: the fs inventory is per-file and complete (58 files); tls and http are recorded at cause-shape granularity because that is the level their agents reported. Filling the tls/http per-file rows is itself a cheap, high-leverage task.",
  "causes": {
@@ -150,21 +150,6 @@
    "note": "CORRECTED LEAD: briefed as '@SECLEVEL=0 is never forwarded'. It IS forwarded, to SSL_CTX_set_cipher_list. Remaining gap is narrower: SSL_CTX_set_ciphersuites (TLS 1.3 suites use a different setter) plus --tls-min-v1.x last-flag-wins.",
    "action": "re-derive the file count from the narrower gap before budgeting"
   },
-  "tls-verify-error-code-mapping": {
-   "corpus": "node",
-   "subsystem": "tls",
-   "files": [
-    "test-https-simple.js",
-    "test-tls-client-auth.js",
-    "test-tls-friendly-error-message.js",
-    "test-tls-set-default-ca-certificates-append-https-request.js",
-    "test-tls-set-default-ca-certificates-reset-https-request.js",
-    "test-tls-socket-default-options.js"
-   ],
-   "cause": "mbun surfaces OpenSSL verify code 20 (UNABLE_TO_GET_ISSUER_CERT_LOCALLY, 'issuer not found locally') where node surfaces 21 (UNABLE_TO_VERIFY_LEAF_SIGNATURE, 'chain has one non-self-signed cert'). One file surfaces null instead of any code. The two codes differ by how a one-cert chain is treated, so this is chain-depth / X509_STORE flag handling, not a trust-store contents problem.",
-   "confidence": "CAUSE named -- the actual/expected pair identifies it uniquely",
-   "action": "single mechanism; highest-value tls cluster found so far"
-  },
   "tls-connect-duplex-transport-unimplemented": {
    "corpus": "node",
    "subsystem": "tls",
@@ -312,6 +297,80 @@
    "cause": "The pump is blocked inside native code and JS never regains control. Most severe shape: a JS-level fix cannot reach it.",
    "confidence": "CLASS named, native frame NOT yet identified",
    "action": "attach gdb or use modules/crash_handler; identify the blocking native call before budgeting"
+  },
+  "verify-error-code-mapping-CROSS-SUBSYSTEM": {
+   "corpus": "node",
+   "subsystem": "tls + http2 (cross-subsystem)",
+   "files": [
+    "test-https-simple.js",
+    "test-tls-client-auth.js",
+    "test-tls-friendly-error-message.js",
+    "test-tls-set-default-ca-certificates-append-https-request.js",
+    "test-tls-set-default-ca-certificates-reset-https-request.js",
+    "test-tls-socket-default-options.js",
+    "test-http2-create-client-secure-session",
+    "test-http2-https-fallback",
+    "test-http2-serve-file"
+   ],
+   "cause": "mbun surfaces OpenSSL verify code 20 (UNABLE_TO_GET_ISSUER_CERT_LOCALLY, 'issuer not found locally') where node surfaces 21 (UNABLE_TO_VERIFY_LEAF_SIGNATURE, 'chain has one non-self-signed cert'). One file surfaces null instead of any code. The two codes differ by how a one-cert chain is treated, so this is chain-depth / X509_STORE flag handling, not a trust-store contents problem.",
+   "confidence": "CAUSE named -- the actual/expected pair identifies it uniquely",
+   "action": "BEST cluster currently known: 9 files, one mechanism, and it is a correctness fix (chain verification), not a workaround",
+   "file_count": 9,
+   "cross_subsystem_note": "Found separately in two subsystems and only recognised as one cause when the http logs were parsed the same way as the tls logs. tls shows it as 'UNABLE_TO_GET_ISSUER_CERT_LOCALLY vs UNABLE_TO_VERIFY_LEAF_SIGNATURE'; http2 shows it as the plain message 'unable to get local issuer certificate'. Same OpenSSL verify path. This is exactly what cluster_finder.py's cross-subsystem ranking exists to catch, and a per-subsystem brief would have split it and under-budgeted both halves."
+  },
+  "missing-internalBinding-stream_pipe": {
+   "corpus": "node",
+   "subsystem": "http2",
+   "file_count": 3,
+   "files": [
+    "test-http2-invalid-last-stream-id",
+    "test-http2-options-max-headers-exceeds-nghttp2",
+    "test-http2-server-sessionerror"
+   ],
+   "cause": "internalBinding('stream_pipe') is not registered in node_internal_binding.cppm, so the require throws before the test body runs.",
+   "confidence": "CAUSE named",
+   "LAYER_NOT_CAUSE_WARNING": "A missing binding is a LAYER, not a cause. Measured precedent: clearing the internalBinding layer on 35 files converted 3 and merely transferred the rest to other failure families. Budget this as ENABLING INFRASTRUCTURE with a DIAGNOSIS target ('what do these 3 files fail on once the binding exists'), never as a conversion target of 3.",
+   "action": "cheap to add; expect the files to move to a new cause rather than to pass"
+  },
+  "http-mustcall-never-fired": {
+   "corpus": "node",
+   "subsystem": "http + http2",
+   "file_count": 29,
+   "cause": "node's common.mustCall reports 'Expected exactly/at least N, actual M' at exit: an expected event never fired. Largest http block. Same class as tls-mustcall-never-fired (10) and as http-timeout-shape-A -- the difference is only whether the process exits or hangs.",
+   "confidence": "CLASS named, per-file event NOT named",
+   "action": "the combined mustCall/dead-flow class now spans 29 http + 10 tls + 15 timeout-shape-A files. Before budgeting, name the missing event per file from the log stack; do NOT hand the class to an agent whole"
+  },
+  "http-mustnotcall-fired": {
+   "corpus": "node",
+   "subsystem": "http + http2",
+   "file_count": 9,
+   "cause": "'function should not have been called' -- mustNotCall fired. The INVERSE of the block above: an event that should not have happened did. Distinct class, and a sign mbun emits an event node does not (or emits it twice).",
+   "confidence": "CLASS named",
+   "action": "separate from mustCall; these often indicate a double-emit"
+  },
+  "http2-nghttp2-error-code-mapping": {
+   "corpus": "node",
+   "subsystem": "http2",
+   "file_count": 6,
+   "examples": [
+    "test-http2-respond-errors",
+    "test-http2-trailers",
+    "test-http2-server-http1-client",
+    "test-http2-session-cleanup-on-nghttp2-goaway",
+    "test-http2-cancel-while-client-reading",
+    "test-http2-server-rst-stream"
+   ],
+   "cause": "Wrong ERR_HTTP2_* code surfaced (expected ERR_HTTP2_INVALID_STREAM / ERR_HTTP2_ERROR, got something else), plus two files where a NGHTTP2_CANCEL stream error escapes as an Error instead of the coded form.",
+   "confidence": "CAUSE named (code mapping)",
+   "action": "mechanical error-code mapping; cheap batch"
+  },
+  "http-value-divergence-UNSPLIT": {
+   "corpus": "node",
+   "subsystem": "http + http2",
+   "file_count_approx": 17,
+   "cause": "NOT A CAUSE. Residue whose actual/expected pair is a bare number or boolean. Recorded explicitly so it is not mistaken for a mechanism -- same trap as tls-value-divergence-UNSPLIT.",
+   "confidence": "MANIFESTATION ONLY",
+   "action": "split per file; never budget whole"
   }
  },
  "coverage_note": "tls timeouts are now triaged: 19 files -> 3 shapes (B:12, A:5, D:2), collapsed by running tools/integration/hang_dump.js over every one. This is the same collapse the http block underwent, and it reproduces the same headline: none of the 19 is an event-loop bug. Cost ~5 minutes total, which is the argument for triaging centrally rather than making each agent pay for it."
