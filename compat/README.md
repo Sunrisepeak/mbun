@@ -531,13 +531,27 @@ round apart:
   file — which only exists now that the file survives instead of being
   OOM-killed. So a *fix* created the neighbour's crash.
 
-Two consequences, and the second is the expensive one:
+The consequence that costs real time: agents burn budget triaging regressions
+that do not exist. One wave spent a third of an agent's remaining time on 70
+phantom files.
 
-1. Published pass counts measured under parallelism are **understated**, not
-   inflated. Correcting a figure downward is the usual direction here; this one
-   goes the other way.
-2. Agents burn budget triaging regressions that do not exist. One wave spent a
-   third of an agent's remaining time on 70 phantom files.
+It does **not** follow that published counts are understated, and an earlier
+revision of this section wrongly claimed so. Measured: re-running the full 4433
+at `--jobs 6` against a `--jobs 10` baseline moved exactly the 11 files three
+agents had claimed and **not one other**. So the flakiness is per-file noise
+that cancels at aggregate, not a systematic bias in the total. Lowering the job
+count buys reliable *attribution*, not a better score.
+
+And the rule cuts both ways, which the same diff proved: it flagged
+`test-timers-ordering` as a fresh regression, and reproduction showed a
+**1-in-6 flake of long standing** whose baseline run had simply rolled well —
+a real defect, just not a new one. `getLibuvNow()` read `performance.now()`
+while timer deadlines were computed on `Date.now()`; a `setTimeout(f, 1)` could
+satisfy its truncated deadline after 0.1 ms of real time, so the value the test
+watches had not advanced. node computes both from one clock — its own
+`internal/timers.js` uses `getLibuvNow()` as the epoch a deadline is measured
+from — and matching that made the file 8/8 instead of 1/6. **Reproduce before
+believing, and reproduce before dismissing.**
 
 **The rule: a single `pass -> fail` in a parallel guard is a lead, not a
 finding.** Reproduce it standalone before you believe it, and before you let it

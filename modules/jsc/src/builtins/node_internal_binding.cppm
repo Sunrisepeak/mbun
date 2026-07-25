@@ -37,6 +37,12 @@ inline constexpr std::string_view kNodeInternalBindingJS = R"JS(
 (function () {
   const G = globalThis;
 
+  // Stands in for libuv's loop-start epoch, so getLibuvNow() can return a small
+  // monotonic-looking millisecond count the way uv_now(loop) does. Captured at
+  // bootstrap rather than on first use: a lazily-captured baseline would make
+  // the first reading ~0 no matter how long the process had already run.
+  const LOOP_START_MS = Date.now();
+
   // Lazily-built binding namespaces, keyed by node's binding name. Each entry
   // is a factory so a binding nobody asks for costs nothing at startup.
   const factories = { __proto__: null };
@@ -1046,7 +1052,26 @@ inline constexpr std::string_view kNodeInternalBindingJS = R"JS(
     immediateInfo: new Uint32Array(3),
     timeoutInfo: new Int32Array(1),
     setupTimers() {},
-    getLibuvNow: () => Math.trunc(G.performance ? G.performance.now() : Date.now()),
+    // node returns uv_now(loop): milliseconds since loop start, on the SAME
+    // clock its timer deadlines are computed against (see node
+    // lib/internal/timers.js:387, which uses this very call as the `start` a
+    // deadline is measured from). That shared clock is the whole contract:
+    // test-timers-ordering asserts a setTimeout(f, 1) chain advances this value
+    // by >=1 each hop, which holds by construction only if deadlines and this
+    // reading come from one clock.
+    //
+    // mbun's timer queue computes `at: Date.now() + d` (process_web.cppm), so
+    // this must read Date.now() too. Reading performance.now() here — a
+    // different origin AND a different resolution — let a 1ms timer satisfy its
+    // Date.now()-truncated deadline after as little as 0.1ms of real time, so
+    // the trunc'd performance.now() had not advanced and the assert failed
+    // ~5 runs in 6. It looked like a merge regression in a corpus diff; it was
+    // a long-standing 1-in-6 flake whose baseline run had simply rolled well.
+    //
+    // Subtracting a start baseline keeps the magnitude SMI-small, which
+    // test-timers-now requires (`< 0x3ffffff`, ~18.6h of uptime) and which a
+    // raw Date.now() would blow by six orders of magnitude.
+    getLibuvNow: () => Date.now() - LOOP_START_MS,
     scheduleTimer() {},
     toggleTimerRef() {},
     toggleImmediateRef() {},
