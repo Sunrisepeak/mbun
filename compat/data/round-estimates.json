@@ -461,6 +461,36 @@
           "infrastructure_side_win": "internalBinding('url') was worth landing independently of the cluster: it unlocked internal/url, internal/fs/utils and internal/modules/helpers corpus-wide, and 5 of the 16 guard-set gains are OUTSIDE its cluster (fs-open-flags, fs-utils-get-dirents, fs-watch-recursive-linux-parallel-remove, module-main-extension-lookup, url-is-url-internal, watch-file-shared-dependency).",
           "own_runner_protected": "mbun's own test runner untouched \u2014 every new path gated on !globalThis.__mbunBT. Verified by the coordinator after merge: `mbun test` on a bun corpus file gives 13 pass / 0 fail.",
           "infrastructure_blocker": "`mcpp test -p jsc` COULD NOT BE RUN: it links ~25 test binaries of ~370MB each and produced ZERO binaries in 40 minutes under SAFE_MEM=6G, and again in 40 minutes under SAFE_MEM=24G/TASKS=512. Pre-existing, not caused by this work. It means the project cannot currently run its own jsc test suite on this machine, so 'no regression in modules/jsc' is not a claim anyone can make here. Needs a link-parallelism cap in the build tooling."
+        },
+        {
+          "id": "r10/agent-14",
+          "cluster": "node:util (inspect) + diagnostics_channel + an 8-file http2 re-triage",
+          "worklist_files": 73,
+          "cluster_homogeneity": "selected by the green-ratio heuristic",
+          "target_delta_pass": 30,
+          "actual_delta_pass": 40,
+          "hit_rate": 1.33,
+          "wall_clock_min": 102,
+          "split": {
+            "diagnostics": "25/67 -> 59/67",
+            "util": "5/29 -> 11/29",
+            "http2_retriage": "3 of 8 convert",
+            "guard_1856": "1084 -> 1132"
+          },
+          "FOURTH_diagnosability_defect": {
+            "defect": "assert.strictEqual produced an AssertionError with an EMPTY message and no actual/expected/operator. Coordinator-verified on the pre-round binary: assert.strictEqual(1,2) gives message:\"\" and actual/expected/operator all undefined. After the fix (a port of internal/assert/assertion_error.js) it gives node's full text plus 1 / 2 / \"strictEqual\".",
+            "why_it_matters_beyond_its_own_files": "This is why cluster_finder kept ranking `error: AssertionError` as the corpus's largest cross-subsystem cause \u2014 359 files across 78 subsystems at its peak. That bucket was largely an ARTIFACT: N different failures all rendered identically because the assertion carried no message. The tool was reporting the shape of a broken error formatter, not a shared root cause. Fixing it converted almost nothing by itself and made the whole area triageable.",
+            "lesson": "A signature cluster is only as meaningful as the error text feeding it. Before treating a large single-signature bucket as one cause, check that the failing assertion actually SAYS anything. Three of this round's four largest apparent causes turned out to be artifacts of broken diagnostics (empty AssertionError, self-skips, a no-op assert.throws)."
+          },
+          "perf_gate_respected": {
+            "inspect_80k_calls": "69.0ms -> 68.2ms (flat)",
+            "format": "119.4 -> 125.6ms (+5%, buys node-correct %d/%i/%f/%s)",
+            "assert_message_path": "67.7 -> 68.4ms while emitting 64% MORE message text (329,783 -> 539,566 chars)",
+            "guard_wall_clock": "229s -> 224s",
+            "verdict": "The brief required a perf gate because a previous wholesale util.inspect replacement caused a catastrophic regression. It stayed out of that territory deliberately and the numbers show it."
+          },
+          "measurement_trap_found": "Running the guard set from a binary COPIED OUTSIDE target/ produced 8 phantom regressions: every self-respawning test saw process.execPath === 'mbun' and failed with `spawn mbun ENOENT`. Always measure the binary at its canonical path.",
+          "honest_non_counts": "test-util-styletext moved fail -> skipped (self-skips on 'Could not create TTY fd'); explicitly not counted as a pass. One knowing cross-corpus risk declared: util.parseEnv now returns a null-prototype object per node's contract, where bun's vendored copy of the same test expects a plain object."
         }
       ],
       "verdicts": {
@@ -477,7 +507,8 @@
         "three_verification_defects": "Round 10 found THREE independent defects in how the corpus was verified, each of which had been inflating the number for an unknown time: self-skips counted as passes (277 files), common.mustCall unenforced because process.on('exit') never fired (946 of 1533 passing files used it), and assert.throws ignoring its error argument so any throw satisfied any matcher (48 verified vacuous passes on the guard sets alone). Lesson: before optimising a metric, audit the metric. All three were found by agents doing unrelated work who stopped to ask why a test passed.",
         "coordinator_hypotheses_are_hints": "A cause stated in a brief must be labelled as a hypothesis, and agents must be told to measure rather than implement it. Two cases this round: the 580-file timeout target assumed handle ref-counting (real cause: the event pump swallowing exceptions), and the dns regression brief assumed a leaked pending count (real cause: a single-threaded resolver deadlocking against dgram's own pre-send lookup, 8011ms -> 3ms once the pool could grow). Both agents measured their way to the real cause. A brief that states a cause as fact would have produced the wrong fix twice.",
         "security_findings_outrank_counts": "This task delivered 80% of its file target and was still the most valuable of the round: it found a certificate-validation bypass of the CVE-2009-2408 class (subjectAltName truncated at an embedded NUL, so a cert for `good.example.org\\0.evil.example.com` was accepted as good.example.org) and a silently-ignored options.ciphers. Neither was visible as a failing count \u2014 the SAN bug's corpus test was one file. Briefs for security-adjacent subsystems should ask explicitly for an audit of what the code CLAIMS to enforce versus what it does, and should say that such a finding outranks the file target.",
-        "inherited_counts_are_not_causes": "Do not inherit a previous agent's file count as a root cause in a new brief. 'These 23 files share X' is a signature grouping until the shared MECHANISM has been verified. I passed such a verdict through as a premise and the task delivered 40% of target because --test turned out to be a symptom cluster: implementing it end to end converted 2 of ~24 files, each of the rest asserting on a different missing feature behind it. Ask for an early verdict on the brief's premise as an explicit deliverable, so a wrong premise is reported at cycle 2 rather than in the final report."
+        "inherited_counts_are_not_causes": "Do not inherit a previous agent's file count as a root cause in a new brief. 'These 23 files share X' is a signature grouping until the shared MECHANISM has been verified. I passed such a verdict through as a premise and the task delivered 40% of target because --test turned out to be a symptom cluster: implementing it end to end converted 2 of ~24 files, each of the rest asserting on a different missing feature behind it. Ask for an early verdict on the brief's premise as an explicit deliverable, so a wrong premise is reported at cycle 2 rather than in the final report.",
+        "large_signature_buckets_may_be_diagnostic_artifacts": "Three of round 10's four largest apparent 'root causes' were artifacts of broken diagnostics rather than shared mechanisms: self-skips counted as passes, assert.throws ignoring its matcher, and assert.strictEqual emitting an EMPTY message so 359 files across 78 subsystems rendered as one indistinguishable `error: AssertionError` bucket. Before committing a round to a big single-signature cluster, verify the failing assertion actually reports something. cluster_finder measures error TEXT; if the text is empty or constant, it is measuring the formatter, not the bug."
       },
       "open_regressions": {
         "total": 10,
