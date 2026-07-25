@@ -8,6 +8,7 @@ import concurrent.futures
 import fnmatch
 import hashlib
 import json
+import os
 import re
 import time
 from dataclasses import asdict, dataclass
@@ -255,6 +256,49 @@ def discover(root: Path, corpus_root: Path, per_group: int) -> list[str]:
     return selected
 
 
+# --- crash-resilient journal -------------------------------------------------
+# write_outputs() runs once, at the very end. A full bun corpus pass is ~2 hours,
+# and a background run of that length in this environment gets killed before it
+# finishes -- which used to throw away every measured file. The node runner grew
+# the same journal for the same reason after a SIGTERM lost a 4433-file run; a
+# later kill kept 3960 of them.
+#
+# One line per finished file, flushed AND fsynced, so a kill at any instant loses
+# at most the file in flight. --resume reads it back and skips what is already
+# measured.
+JOURNAL_NAME = "results.partial.tsv"
+JOURNAL_COLUMNS = ["path", "exit_code", "passed", "failed", "expects", "ran",
+                   "classification", "duration_ms", "log"]
+
+
+def journal_append(stream, result: Result) -> None:
+    values = asdict(result)
+    stream.write("\t".join(str(values[column]) for column in JOURNAL_COLUMNS) + "\n")
+    stream.flush()
+    os.fsync(stream.fileno())
+
+
+def journal_load(output_dir: Path) -> dict[str, Result]:
+    """Previously measured results, keyed by path. A truncated final line (the
+    file that was in flight when the kill landed) is discarded, not guessed at."""
+    journal = output_dir / JOURNAL_NAME
+    if not journal.exists():
+        return {}
+    done: dict[str, Result] = {}
+    for line in journal.read_text(encoding="utf-8", errors="replace").splitlines():
+        fields = line.split("\t")
+        if len(fields) != len(JOURNAL_COLUMNS):
+            continue
+        try:
+            done[fields[0]] = Result(
+                path=fields[0], exit_code=int(fields[1]), passed=int(fields[2]),
+                failed=int(fields[3]), expects=int(fields[4]), ran=int(fields[5]),
+                classification=fields[6], duration_ms=int(fields[7]), log=fields[8])
+        except ValueError:
+            continue
+    return done
+
+
 def write_outputs(output_dir: Path, results: list[Result]) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "selected-tests.txt").write_text(
@@ -304,6 +348,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--timeout", type=float, default=30.0)
     parser.add_argument(
+        "--resume", action="store_true",
+        help="skip files already recorded in results.partial.tsv and append to it, "
+             "so a killed run continues instead of starting over",
+    )
+    parser.add_argument(
         "--allow-missing-node-modules", action="store_true",
         help="measure even when the corpus npm dependencies are absent",
     )
@@ -342,13 +391,26 @@ def main() -> int:
         ensure_corpus_dependencies((args.cwd or root).resolve())
     blocked_patterns = load_patterns(args.blocked_manifest.resolve())
     output_dir.mkdir(parents=True, exist_ok=True)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as executor:
-        futures = [
-            executor.submit(run_one, binary, root, output_dir, args.timeout, path, spawn_cwd,
-                            blocked_patterns)
-            for path in paths
-        ]
-        results = [future.result() for future in futures]
+    done = journal_load(output_dir) if args.resume else {}
+    pending = [path for path in paths if str(path) not in done]
+    if done:
+        print(f"resuming: {len(done)} already measured, {len(pending)} to go", flush=True)
+    # Append on --resume, truncate otherwise, so a fresh run never inherits a
+    # stale journal from a previous binary.
+    results = list(done.values())
+    with (output_dir / JOURNAL_NAME).open("a" if args.resume else "w", encoding="utf-8") as journal:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as executor:
+            futures = [
+                executor.submit(run_one, binary, root, output_dir, args.timeout, path, spawn_cwd,
+                                blocked_patterns)
+                for path in pending
+            ]
+            for future in concurrent.futures.as_completed(futures):
+                result = future.result()
+                journal_append(journal, result)
+                results.append(result)
+    # Stable order regardless of completion order, so two runs diff cleanly.
+    results.sort(key=lambda result: result.path)
     write_outputs(output_dir, results)
     return 0
 

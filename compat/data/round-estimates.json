@@ -549,6 +549,26 @@
      "miss_cause": "The cluster was correctly identified as ONE cause and the fix did land it -- 7 of 9 files now report node's code. But 'the code is now correct' is not 'the file passes': 6 of them had the wrong code as their FIRST failure and have further ones behind it. I budgeted the cluster by counting files whose log mentioned the code, which measures how many files TOUCH a cause, not how many are BLOCKED ONLY by it. Same shape as the internalBinding lesson: clearing a cause transfers files to the next cause. Budget a cause family by asking 'is this the file's LAST wall?', which the log alone cannot answer.",
      "what_went_right": "Root cause was measured, not theorised: `openssl s_client` against mbun's own server showed OpenSSL emitting 20 then 21 and returning 21, which named the mechanism in one command. Two of my theories died first -- 'mbun sends a longer chain' (it sends exactly 1 cert) and gating on SSL_get1_peer_certificate (nullptr on this path, and it regressed the working files until I noticed).",
      "estimate_overrun": "40 min against a ~25 min estimate. The overrun was entirely the two failed attempts plus the 681-file guard, i.e. exactly the 'budget the guard inside the estimate' lesson applied to myself."
+    },
+    {
+     "id": "w3/agent-3",
+     "cluster": "fs.watch + realpath (wave 3, inventory-driven)",
+     "worklist_files": 11,
+     "target_delta_pass": 6,
+     "actual_delta_pass": 10,
+     "hit_rate": 1.67,
+     "wall_clock_min": 49,
+     "note": "First task dispatched with NO triage phase -- causes came pre-named from unreached-inventory.json. Delivered 167% of target in 49 min against a 100-min budget, versus wave 2's 3.7% at 100 min. That is the clearest evidence the bottleneck was the discarded triage, not agent execution. It also ran its guard against TWO separate builds (stash, rebuild, baseline, restore, rebuild) so it had no phantoms to chase.",
+     "security_finding_INDEPENDENTLY_VERIFIED": {
+      "defect": "__mbunWatchNative.start reached inotify_init1/inotify_add_watch with no check at the native boundary. Under --permission a script could watch any directory and enumerate filenames it was never granted.",
+      "precise_shape": "My own verification refines the agent's description. Pre-fix, fs.watch('/etc') WAS denied -- the JS shim checked. What was ungated was the native entry point: RAW globalThis.__mbunWatchNative.start('/etc') returned a watch descriptor. So the gate sat in the shim rather than at the boundary, and every test that went through fs.watch made the runtime look correctly gated. That is a defence-in-depth failure, and it is harder to notice than a missing check.",
+      "my_verification": "On the merged binary: fs.watch('/etc') -> ERR_ACCESS_DENIED, RAW __mbunWatchNative.start('/etc') -> ERR_ACCESS_DENIED, fs.realpathSync.native('/etc') -> ERR_ACCESS_DENIED, fs.watch(<allowed>) -> still works (not over-blocking). On the pre-merge binary the RAW call returned 1. Gated as kFileSystemRead per node's fs_event_wrap.cc classification."
+     },
+     "leads_i_got_wrong": [
+      "The fs-watch mechanism I recorded -- 'a watcher registers as a pollable but holds no fd, so the drain's stall clock never advances' -- is a description of the MANIFESTATION, and the three hangs had three unrelated semantic causes: recursive:'1' not being validated (so a watcher that should never have existed pinned the loop), decodeName ignoring every encoding but 'buffer' (so the hex watcher never recognised its own filename), and an async iterator that had to REJECT with ABORT_ERR instead of ending cleanly. The agent changed nothing in the event loop. FIFTH instance of the manifestation-as-cause error, and the first one I committed to the inventory myself -- I inherited the phrasing from the previous agent's report and recorded it as a cause without testing it.",
+      "test-fs-watchfile-bigint is not '4 Date properties node's zero-row omits'. mbun loads node's REAL internal/fs/utils, so deepStrictEqual fails on PROTOTYPE IDENTITY before comparing any key. Reaching it means having mbun's stats constructed by node's own Stats/BigIntStats -- architectural, adjacent to fs-not-routed-through-internalBinding. The agent deliberately left the date fields alone because the native stat row sets them as own props, so changing only the constructor would desynchronise statSync from new Stats() and risk currently-green test-fs-stat-* files.",
+      "realpath-js-resolver is 2 files, not 3. test-fs-realpath-native requires cwd == the node checkout root; the corpus runner uses cwd=repo root. Pre-change it 'passed' that path silently because weakly_canonical invents non-existent tails; it now honestly throws ENOENT. This is a HARNESS cause, not an fs one, and fixing it means changing the shared runner's cwd -- which would move numbers for every agent mid-wave."
+     ]
     }
    ],
    "verdicts": {

@@ -37,29 +37,17 @@
   "fs-watch": {
    "corpus": "node",
    "subsystem": "fs",
-   "files": [
-    "test-fs-watch-encoding",
-    "test-fs-watch-recursive-promise",
-    "test-fs-watch-recursive-validate",
-    "test-fs-watch-enoent",
-    "test-fs-watch-recursive-symlink",
-    "test-fs-watch-stop-async",
-    "test-fs-watchfile",
-    "test-fs-watchfile-bigint"
-   ],
-   "note": "3 are hangs: a watcher registers as a pollable but holds no fd, so the drain's stall clock never advances. Also err.path missing on ENOENT, symlink loop, and BigIntStats carrying 4 Date props node's zero-row omits.",
-   "action": "one mechanism (pollable-without-fd) unblocks the 3 hangs"
+   "status": "RESOLVED by w3/agent-3 (+7 of 8)",
+   "CORRECTION": "The mechanism this entry used to name -- 'a watcher registers as a pollable but holds no fd, so the drain's stall clock never advances' -- was a MANIFESTATION, not a cause, and not one shared mechanism. Measured: the three hangs had three unrelated semantic causes. recursive:'1' was not validated, so a persistent watcher that should never have existed pinned the loop. decodeName ignored every encoding but 'buffer', so the hex watcher never recognised its own filename and its done never fired. The recursive-promise async iterator had to REJECT with ABORT_ERR rather than end cleanly. Nothing in the event loop was touched. I recorded the manifestation as a cause because I inherited the phrasing from an agent report without testing it -- the fifth instance of this error class in this project and the first one I put into the inventory myself.",
+   "remaining": {
+    "test-fs-watchfile-bigint": "mbun loads node's REAL internal/fs/utils, so deepStrictEqual fails on PROTOTYPE IDENTITY before comparing keys -- NOT the '4 Date properties' this entry previously claimed. Needs mbun's stats built by node's own Stats/BigIntStats; architectural, adjacent to fs-not-routed-through-internalBinding. Changing only the constructor would desynchronise statSync from new Stats() and risk green test-fs-stat-* files."
+   }
   },
   "realpath-js-resolver": {
    "corpus": "node",
    "subsystem": "fs",
-   "files": [
-    "test-fs-realpath",
-    "test-fs-realpath-native",
-    "test-fs-realpath-pipe"
-   ],
-   "note": "mbun uses weakly_canonical; node uses a non-native JS resolver with its own cache semantics.",
-   "action": "direct translation from node lib/fs.js"
+   "status": "RESOLVED by w3/agent-3 (+2 of 2)",
+   "CORRECTION": "This entry said 3 files. It is 2. test-fs-realpath-native requires cwd == the node checkout root while the corpus runner uses cwd = repo root, so it is a HARNESS cause, not an fs one. Before the fix it appeared to resolve because weakly_canonical invents non-existent path tails; it now honestly throws ENOENT. Fixing it means changing the shared runner's cwd, which moves numbers for every agent at once."
   },
   "fs-not-routed-through-internalBinding": {
    "corpus": "node",
@@ -390,6 +378,13 @@
    "cause": "NOT A CAUSE. Residue whose actual/expected pair is a bare number or boolean. Recorded explicitly so it is not mistaken for a mechanism -- same trap as tls-value-divergence-UNSPLIT.",
    "confidence": "MANIFESTATION ONLY",
    "action": "split per file; never budget whole"
+  },
+  "native-entry-points-gated-only-in-the-js-shim": {
+   "corpus": "n/a",
+   "subsystem": "security",
+   "cause": "A --permission check placed in the JS shim rather than at the native boundary. Verified on the pre-fix binary: fs.watch('/etc') was correctly DENIED, but the raw globalThis.__mbunWatchNative.start('/etc') returned a watch descriptor. Every test that went through fs.watch therefore made the runtime look correctly gated.",
+   "why_it_is_a_class_not_an_incident": "__mbunWatchNative is reachable on globalThis, so the shim is not a boundary. Any other __mbun*Native global whose check lives only in its JS wrapper has the same hole. AUDIT ACTION: enumerate every __mbun*Native global and probe each raw method under --permission, not through its public wrapper.",
+   "action": "standing audit item; the fs.watch instance is fixed and independently re-verified"
   }
  },
  "coverage_note": "tls timeouts are now triaged: 19 files -> 3 shapes (B:12, A:5, D:2), collapsed by running tools/integration/hang_dump.js over every one. This is the same collapse the http block underwent, and it reproduces the same headline: none of the 19 is an event-loop bug. Cost ~5 minutes total, which is the argument for triaging centrally rather than making each agent pay for it."
