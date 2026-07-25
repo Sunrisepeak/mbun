@@ -151,6 +151,23 @@ the run would score the previous binary.
   run at all. **Documented limit:** it does not reproduce that dns case itself —
   see the module docstring for the two probe designs that failed to discriminate
   and why; those corpus files guard it instead.
+- `hang_dump.js` — answers *"why is this corpus file hanging?"* without a rebuild:
+  `safe-test.sh 30 <mbun> tools/integration/hang_dump.js <abs-path-to-test> [ms]`.
+  It `require`s the target (so its own timer shares the loop), then dumps the
+  reactor's `pending`/`handles`/`serveActive`/`stall` plus every registered item
+  with `_fd`/`_refd`/`_held`/`destroyed`/`listening`/`_wq`, and every timer with
+  its source text. Exit 99 marks a dump rather than the test's own exit. It works
+  because its timer is **ref'd**, which bounds the pump's otherwise 60-second
+  `poll()` park so control returns to JS while the hang is still in progress.
+  **Why it matters:** the runner classifies a hang as `timeout`, which says
+  nothing about the cause, and 46 hangs had gone uninvestigated across several
+  rounds because looking inside one was expensive. With this, all 46 were triaged
+  in a session — and the result overturned the standing assumption: **31 of 41
+  survivors are not event-loop bugs at all** but protocol-semantics gaps wearing
+  a hang costume (20 are a stalled exchange where the test is genuinely waiting;
+  11 are a server outliving a dead client flow). 4 produce no dump at all, which
+  is itself the finding: the pump is blocked inside native code and JS never
+  regains control.
 - `smoke_examples.py` — boots each `examples/` app in turn, requests
   `http://127.0.0.1:3000/`, asserts a 2xx, then reaps the whole process tree
   (`bounded_run.BoundedServer`). Sequential by design: the demos all hardcode
