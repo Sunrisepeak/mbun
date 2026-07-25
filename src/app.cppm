@@ -109,6 +109,67 @@ int run_markdown(std::string_view file) {
     return mbun::jsc::runtime::run_eval(code);
 }
 
+// ─── node's `--test` CLI ───────────────────────────────────────────────────
+// `node --test [flags] [paths…]` does not execute its positionals as scripts:
+// it hands them to the test runner and streams a reporter to stdout. bun has no
+// `--test` flag, so a command line carrying one is unambiguously node's runner
+// being asked for — and taking the first positional as an entry point (which is
+// what the node-emulation path below would do) runs one file's tests without a
+// reporter, without the exit-code contract, and ignores the rest.
+//
+// Everything about it lives in JS (the :node_test_run builtins partition owns
+// run(), the reporters, and the flag semantics); this is only the dispatch, so
+// the C++ side never has to know node's option table.
+bool has_node_test_flag(std::span<const std::string_view> args) {
+    for (const std::string_view a : args) {
+        if (a == "--test") return true;
+        // Stop at the first positional: `mbun script.js --test` passes --test to
+        // the script, exactly as node does.
+        if (!a.starts_with("-")) {
+            if (mbun::cli::node_flag_takes_value(a)) continue;  // never reached for a value token
+            return false;
+        }
+    }
+    return false;
+}
+
+int exec_node_test_cli(std::span<const std::string_view> args) {
+    std::string flagsLit{"["};
+    std::string filesLit{"["};
+    bool firstFlag{true};
+    bool firstFile{true};
+    for (std::size_t i{0}; i < args.size(); ++i) {
+        const std::string_view a{args[i]};
+        if (a.starts_with("-") && a != "-") {
+            if (!firstFlag) flagsLit += ",";
+            flagsLit += js_quote(a);
+            firstFlag = false;
+            // A value-taking flag owns the next token.
+            if (a.find('=') == std::string_view::npos && mbun::cli::node_flag_takes_value(a) &&
+                i + 1 < args.size()) {
+                flagsLit += "," + js_quote(args[++i]);
+            }
+            continue;
+        }
+        if (!firstFile) filesLit += ",";
+        filesLit += js_quote(a);
+        firstFile = false;
+    }
+    flagsLit += "]";
+    filesLit += "]";
+
+    // process.argv for `node --test x.js` is [execPath, …positionals]; the flags
+    // are already reported through process.execArgv.
+    std::vector<std::string> jsArgv{"mbun"};
+    for (const std::string_view a : args) {
+        if (!a.starts_with("-") || a == "-") jsArgv.emplace_back(a);
+    }
+    mbun::jsc::runtime::set_argv(std::move(jsArgv));
+
+    const std::string code{"globalThis.__mbunNodeTestCli(" + filesLit + "," + flagsLit + ")"};
+    return mbun::jsc::runtime::run_eval(code);
+}
+
 // `--preserve-symlinks-main` (run_command.rs:2580) — set from the flag or from
 // NODE_PRESERVE_SYMLINKS_MAIN (bun reads both; run_command.rs:2581-2584).
 bool gPreserveSymlinksMain{false};
