@@ -87,14 +87,17 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   // { data, passphrase, padding, saltLength, dsaEncoding, oaepHash, oaepLabel }.
   const resolveKey = (k) => {
     if (k == null) throw new TypeError("No key provided");
-    if (k instanceof KeyObject) return { data: k._km, passphrase: k._pass || "" };
-    if (typeof k === "string" || isView(k) || k instanceof ArrayBuffer) return { data: k, passphrase: "" };
+    // passphrase stays `undefined` when none was given: node distinguishes "no
+    // passphrase" (never prompt, never guess) from an explicit empty one (a real,
+    // usable password), and the native loader keys its error off that.
+    if (k instanceof KeyObject) return { data: k._km, passphrase: k._pass };
+    if (typeof k === "string" || isView(k) || k instanceof ArrayBuffer) return { data: k, passphrase: undefined };
     // { key: <JWK object>, format: "jwk", ... } — materialize the JWK to DER up
     // front (private when `d` is present) so the native signer/verifier gets real
     // key bytes. dsaEncoding rides along for EC ieee-p1363 vs der output.
     if (typeof k === "object" && k.format === "jwk" && k.key != null && typeof k.key === "object") {
       const isPriv = k.key.d != null;
-      return { data: jwkToDer(k.key, isPriv), passphrase: "", dsaEncoding: k.dsaEncoding };
+      return { data: jwkToDer(k.key, isPriv), passphrase: undefined, dsaEncoding: k.dsaEncoding };
     }
     if (typeof k === "object" && ("key" in k || "pem" in k)) {
       const inner = resolveKey(k.key != null ? k.key : k.pem);
@@ -106,7 +109,17 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
         encoding: k.encoding,
       };
     }
-    return { data: k, passphrase: "" };
+    return { data: k, passphrase: undefined };
+  };
+  // Give a native key-load failure node's error surface. The native layer already
+  // decides *which* failure it is (see asym_key_error in runtime/crypto_asym.inc);
+  // here we only attach the name/code node reports for it.
+  const keyErr = (e) => {
+    const m = e && typeof e.message === "string" ? e.message : "";
+    if (m === "Passphrase required for encrypted key") {
+      const t = new TypeError(m); t.code = "ERR_MISSING_PASSPHRASE"; return t;
+    }
+    return m.startsWith("error:") ? decorateOsslError(e) : e;
   };
   // publicEncrypt/privateDecrypt accept { key, encoding } where key is a hex/etc
   // string; honor the encoding when converting to bytes.
@@ -143,8 +156,10 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     const r = resolveKey(key);
     validateOaepHash(r);
     const label = toOaepLabel(r);
-    return Buffer.from(AN.publicEncrypt(keyData(r), r.passphrase, toBuf(buffer, r.encoding),
-      r.padding != null ? r.padding : RSA_PKCS1_OAEP_PADDING, r.oaepHash || "", label));
+    try {
+      return Buffer.from(AN.publicEncrypt(keyData(r), r.passphrase, toBuf(buffer, r.encoding),
+        r.padding != null ? r.padding : RSA_PKCS1_OAEP_PADDING, r.oaepHash || "", label));
+    } catch (e) { throw keyErr(e); }
   };
   C.privateDecrypt = (key, buffer) => {
     const r = resolveKey(key);
@@ -156,19 +171,25 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
       e.code = "ERR_INVALID_ARG_VALUE"; throw e;
     }
     const label = toOaepLabel(r);
-    return Buffer.from(AN.privateDecrypt(keyData(r), r.passphrase, toBuf(buffer, r.encoding),
-      r.padding != null ? r.padding : RSA_PKCS1_OAEP_PADDING, r.oaepHash || "", label));
+    try {
+      return Buffer.from(AN.privateDecrypt(keyData(r), r.passphrase, toBuf(buffer, r.encoding),
+        r.padding != null ? r.padding : RSA_PKCS1_OAEP_PADDING, r.oaepHash || "", label));
+    } catch (e) { throw keyErr(e); }
   };
   // privateEncrypt/publicDecrypt (RSA raw sign / verify_recover paths).
   C.privateEncrypt = (key, buffer) => {
     const r = resolveKey(key);
-    return Buffer.from(AN.privateEncrypt(keyData(r), r.passphrase, toBuf(buffer, r.encoding),
-      r.padding != null ? r.padding : RSA_PKCS1_PADDING));
+    try {
+      return Buffer.from(AN.privateEncrypt(keyData(r), r.passphrase, toBuf(buffer, r.encoding),
+        r.padding != null ? r.padding : RSA_PKCS1_PADDING));
+    } catch (e) { throw keyErr(e); }
   };
   C.publicDecrypt = (key, buffer) => {
     const r = resolveKey(key);
-    return Buffer.from(AN.publicDecrypt(keyData(r), r.passphrase, toBuf(buffer, r.encoding),
-      r.padding != null ? r.padding : RSA_PKCS1_PADDING));
+    try {
+      return Buffer.from(AN.publicDecrypt(keyData(r), r.passphrase, toBuf(buffer, r.encoding),
+        r.padding != null ? r.padding : RSA_PKCS1_PADDING));
+    } catch (e) { throw keyErr(e); }
   };
 
   // node lib/internal/crypto/keys.js: dsaEncoding must be "der" or "ieee-p1363".
@@ -183,10 +204,12 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   const doSign = (algo, data, key) => {
     const r = resolveKey(key);
     validateDsaEncoding(r);
-    return Buffer.from(AN.sign(digestName(algo), toBuf(data), keyData(r), r.passphrase,
-      r.padding != null ? r.padding : RSA_PKCS1_PADDING,
-      r.saltLength != null ? r.saltLength : RSA_PSS_SALTLEN_MAX_SIGN,
-      r.dsaEncoding || ""));
+    try {
+      return Buffer.from(AN.sign(digestName(algo), toBuf(data), keyData(r), r.passphrase,
+        r.padding != null ? r.padding : RSA_PKCS1_PADDING,
+        r.saltLength != null ? r.saltLength : RSA_PSS_SALTLEN_MAX_SIGN,
+        r.dsaEncoding || ""));
+    } catch (e) { throw keyErr(e); }
   };
   const doVerify = (algo, data, key, sig) => {
     // Snapshot the data and signature bytes at call time (node reads them before
@@ -196,10 +219,12 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     const sigBuf = Buffer.from(toBuf(sig));
     const r = resolveKey(key);
     validateDsaEncoding(r);
-    return AN.verify(digestName(algo), dataBuf, keyData(r), r.passphrase, sigBuf,
-      r.padding != null ? r.padding : RSA_PKCS1_PADDING,
-      r.saltLength != null ? r.saltLength : RSA_PSS_SALTLEN_MAX_SIGN,
-      r.dsaEncoding || "");
+    try {
+      return AN.verify(digestName(algo), dataBuf, keyData(r), r.passphrase, sigBuf,
+        r.padding != null ? r.padding : RSA_PKCS1_PADDING,
+        r.saltLength != null ? r.saltLength : RSA_PSS_SALTLEN_MAX_SIGN,
+        r.dsaEncoding || "");
+    } catch (e) { throw keyErr(e); }
   };
   C.sign = (algorithm, data, key, callback) => {
     if (typeof callback === "function") {
@@ -306,7 +331,7 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   class KeyObject {
     constructor(brand, kind, material, passphrase) {
       if (brand !== kKObrand) throw new TypeError("Illegal constructor");
-      this._kind = kind; this._km = material; this._pass = passphrase || "";
+      this._kind = kind; this._km = material; this._pass = passphrase == null ? undefined : passphrase;
     }
     get type() { return this._kind; }
     get [Symbol.toStringTag]() { return "KeyObject"; }
@@ -321,6 +346,7 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
         const d = {};
         if (t.modulusLength != null) d.modulusLength = t.modulusLength;
         if (t.publicExponent != null) d.publicExponent = BigInt("0x" + Buffer.from(t.publicExponent).toString("hex"));
+        if (t.divisorLength != null) d.divisorLength = t.divisorLength;
         if (t.namedCurve != null) d.namedCurve = t.namedCurve;
         return d;
       } catch { return {}; }
@@ -421,10 +447,14 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   // starts with a SEQUENCE tag (0x30) is a decode failure; anything else has no
   // PEM start line.
   const asymParseError = (ko, nativeErr) => {
+    // A failure the native layer already classified (missing passphrase / an
+    // OpenSSL error) keeps that classification whatever the container looked like.
+    const classified = keyErr(nativeErr);
+    if (classified !== nativeErr) return classified;
     const isStr = typeof ko._km === "string";
     const bytes = toBuf(ko._km);
     const head = isStr ? ko._km.slice(0, 64) : Buffer.from(bytes.slice(0, 64)).toString("latin1");
-    if (head.includes("-----BEGIN")) return nativeErr; // surface native parse/passphrase error
+    if (head.includes("-----BEGIN")) return keyErr(nativeErr); // surface native parse/passphrase error
     if (!isStr && bytes.length > 0 && bytes[0] === 0x30) {
       const e = new Error("error:06000066:public key routines:OPENSSL_internal:DECODE_ERROR");
       e.code = "ERR_OSSL_UNSUPPORTED"; return e;
@@ -582,11 +612,14 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     const privType = privJwk ? "pkcs8" : (senc.type || "pkcs8");
     const privFmt = (wantPrivObj || privJwk) ? "der" : (senc.format || "pem");
     const cipher = privJwk ? "" : (senc.cipher || "");
-    const pass = privJwk || senc.passphrase == null ? ""
+    const pass = privJwk || senc.passphrase == null ? undefined
       : (typeof senc.passphrase === "string" ? senc.passphrase : toBuf(senc.passphrase).toString("latin1"));
-    const modLen = options.modulusLength || 2048;
+    // 'dh' sizes its prime with primeLength; every other family uses modulusLength.
+    // 'dsa' additionally picks the divisor (q) size with divisorLength.
+    const modLen = (type === "dh" ? options.primeLength : options.modulusLength) || 2048;
     const curve = options.namedCurve || "";
-    const res = AN.generateKeyPair(type, modLen, curve, pubType, pubFmt, privType, privFmt, cipher, pass);
+    const divLen = options.divisorLength || 0;
+    const res = AN.generateKeyPair(type, modLen, curve, pubType, pubFmt, privType, privFmt, cipher, pass, divLen);
     let publicKey = res.publicKey, privateKey = res.privateKey;
     if (wantPubObj) publicKey = mkKO("public", publicKey, "");
     else if (pubJwk) publicKey = jwkFromKey(publicKey, "", true);
@@ -654,6 +687,11 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   // Decipheriv` holds. All construction-time validation matches node cipher.js.
   // Decorate a native OpenSSL error ("error:CODE:library:function:reason") with
   // node's error surface: .code (ERR_OSSL_<REASON>), .reason, .library, .function.
+  // Libraries whose short name node folds into the code. Verified against node
+  // v24: "common libcrypto routines" + "interrupted or cancelled" yields
+  // ERR_OSSL_CRYPTO_INTERRUPTED_OR_CANCELLED, while "Provider routines" +
+  // "bad decrypt" yields a bare ERR_OSSL_BAD_DECRYPT.
+  const OSSL_LIB_CODE_PREFIX = { "common libcrypto routines": "CRYPTO_" };
   const decorateOsslError = (e) => {
     const m = e && typeof e.message === "string" ? e.message : "";
     const parts = m.split(":");
@@ -662,7 +700,8 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
       e.reason = reason;
       e.library = parts[2];
       e.function = parts[3];
-      e.code = "ERR_OSSL_" + reason.toUpperCase().replace(/[^A-Z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+      e.code = "ERR_OSSL_" + (OSSL_LIB_CODE_PREFIX[parts[2]] || "") +
+        reason.toUpperCase().replace(/[^A-Z0-9]+/g, "_").replace(/^_+|_+$/g, "");
     }
     return e;
   };
