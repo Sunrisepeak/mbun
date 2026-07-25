@@ -314,6 +314,11 @@ inline constexpr std::string_view kNodeClusterJS = R"JS(
         this.data = undefined;
         this.sockname = null;
         const udp = message.addressType === "udp4" || message.addressType === "udp6";
+        // The wire type decides what the WORKER reconstructs from the received
+        // descriptor: a bare fd wrapper is enough for round-robin `newconn`, but a
+        // dgram socket needs a real UDP handle (recvStart/getsockname/…) because
+        // lib/dgram.js replaceHandle()s it straight into the Socket.
+        this.udp = udp;
         try {
           if (udp) {
             const ND = G.__mbunDgramNative;
@@ -343,7 +348,8 @@ inline constexpr std::string_view kNodeClusterJS = R"JS(
         this.workers.set(worker.id, worker);
         if (this.errno) { send(this.errno, null, null); return; }
         const self = this;
-        send(0, { sockname: this.sockname }, sharedFd(() => self.fd, "net.Native"));
+        send(0, { sockname: this.sockname },
+             sharedFd(() => self.fd, this.udp ? "dgram.Native" : "net.Native"));
       };
       SharedHandle.prototype.remove = function (worker) {
         if (!this.workers.has(worker.id)) return false;

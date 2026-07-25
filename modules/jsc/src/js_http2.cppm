@@ -326,6 +326,15 @@ export constexpr std::string_view kHttp2JS = R"JS(
   }
   const sessionErr = (code) => mkErr("Session closed with error code " + errName(code), "ERR_HTTP2_SESSION_ERROR");
   const streamErr = (code) => mkErr("Stream closed with error code " + errName(code), "ERR_HTTP2_STREAM_ERROR");
+  // internal/errors.js ERR_HTTP2_STREAM_CANCEL: the error a session destroy hands
+  // to a stream that never got a stream id (node's `pendingStreams`).
+  const streamCancelErr = (cause) => {
+    let msg = "The pending stream has been canceled";
+    if (cause && typeof cause.message === "string") msg += " (caused by: " + cause.message + ")";
+    const e = mkErr(msg, "ERR_HTTP2_STREAM_CANCEL");
+    if (cause) e.cause = cause;
+    return e;
+  };
 
   // === HPACK (RFC 7541) ===
   // Huffman canonical code table (Appendix B): code value + bit length per symbol.
@@ -833,6 +842,8 @@ export constexpr std::string_view kHttp2JS = R"JS(
   function initHttp2Stream(stream, session, id) {
     stream.session = session;
     stream.id = id;
+    // Only the client session maintains this (see ClientHttp2Session#_maybeDestroy).
+    if (session && typeof session._liveStreams === "number") { session._liveStreams++; stream._counted = true; }
     stream._endStreamSent = false;
     stream._closed = false;
     stream._finished = false;
@@ -960,9 +971,15 @@ export constexpr std::string_view kHttp2JS = R"JS(
     }
     try { stream.session.streams.delete(stream.id); } catch (e) {}
     const sess = stream.session;
+    if (stream._counted === true) {
+      stream._counted = false;
+      if (sess && typeof sess._liveStreams === "number" && sess._liveStreams > 0) sess._liveStreams--;
+    }
     G.queueMicrotask(() => {
       if (!sess) return;
       if (sess._endPending) sess._onSocketEnd();
+      // The last live stream releases a graceful close() that was waiting on it.
+      if (sess._destroyPending && typeof sess._maybeDestroy === "function") sess._maybeDestroy();
     });
     cb(err || null);
   }
@@ -990,6 +1007,28 @@ export constexpr std::string_view kHttp2JS = R"JS(
   }
   // A graceful shutdown ends the write side (flushing whatever is queued and
   // sending FIN); an error shutdown destroys the fd right away.
+  // A transport EOF ends the session (RFC 9113 5.4.1): no further frames can
+  // arrive, so every stream still waiting for one is CANCELLED. node does the
+  // same thing on its socket's 'close'
+  // (socketOnClose: state.streams.forEach(s => s.close(NGHTTP2_CANCEL))), and its
+  // native session turns the read EOF into that close. mbun's http2 socket is
+  // allowHalfOpen — the FIN is all it ever gets — and it used to PARK on
+  // `_endPending` until the streams finished by themselves. They never did when
+  // they were the ones waiting for the peer, so the socket stayed ref'd and the
+  // file hung instead of reporting the abort (test-http2-compat-aborted asserts
+  // request.on('aborted') fires with `complete === true`).
+  function abortStreamsOnTransportEof(session) {
+    if (!session.streams || session.streams.size === 0) return;
+    for (const stream of Array.from(session.streams.values())) {
+      if (stream.destroyed || stream._closed) continue;
+      stream.rstCode = constants.NGHTTP2_CANCEL;
+      if (!stream.aborted && !stream.readableEnded) {
+        stream.aborted = true;
+        try { stream.emit("aborted"); } catch (e) {}
+      }
+    }
+  }
+
   function closeSessionSocket(socket, hard) {
     if (!socket) return;
     try {
@@ -1091,12 +1130,12 @@ export constexpr std::string_view kHttp2JS = R"JS(
     setTimeout(ms, cb) { return http2StreamSetTimeout(this, ms, cb); }
     priority(options) { streamPriority(this); }
     _pushData(bytes) { http2StreamPushData(this, bytes); }
-    _onResponse(headersObj, flags) {
+    _onResponse(headersObj, flags, rawHeaders) {
       if (this._responseEmitted) return;
       this._responseEmitted = true;
       this.pending = false;
       this.endAfterHeaders = !!(flags & FLAG.END_STREAM);
-      this.emit("response", headersObj, flags);
+      this.emit("response", headersObj, flags, rawHeaders || []);
     }
     _onEnd() { http2StreamEndReadable(this); }
     _onClose() { http2StreamFinish(this); }
@@ -1129,6 +1168,10 @@ export constexpr std::string_view kHttp2JS = R"JS(
       this._localWindow = DEFAULT_CONNECTION_WINDOW;    // what the peer may still send us
       this._remoteWindow = DEFAULT_CONNECTION_WINDOW;   // what we may still send the peer
       this._lastProcStreamId = 0;
+      // node kMaybeDestroy's gate — see _maybeDestroy(). A stream that is open
+      // (created, not yet destroyed) holds a graceful close() open.
+      this._liveStreams = 0;
+      this._destroyPending = false;
       // node Http2Session: `encrypted` reflects the transport, `alpnProtocol` is
       // "h2c" for a cleartext session, and `originSet` stays undefined until an
       // ORIGIN frame arrives (DEFERRED).
@@ -1213,6 +1256,10 @@ export constexpr std::string_view kHttp2JS = R"JS(
       payload = payload || Buffer.alloc(0);
       const frame = Buffer.concat([frameHeader(payload.length, type, flags, streamId), payload]);
       if (!this._connected) { this._preConnectQ.push(frame); return; }
+      // See the server session's _writeFrame: net.Socket.write() on an ended or
+      // destroyed socket EMITS 'error' instead of throwing, so this try/catch
+      // cannot contain it. nghttp2 drops frames once the transport is gone.
+      if (this.socket.destroyed || this.socket.writable === false) return;
       try { this.socket.write(frame); } catch (e) { if (!this.closed && !this.destroyed) this._fatal(e); }
     }
 
@@ -1231,7 +1278,10 @@ export constexpr std::string_view kHttp2JS = R"JS(
       const optEndStream = options.endStream === true;
       // Header validation runs BEFORE the stream id is consumed: node throws
       // out of request() for a malformed header block and no stream is opened.
-      const built = buildHeaderList(headers, this._scheme, this._authorityName, this._options.strictSingleValueFields);
+      const rawForm = Array.isArray(headers);
+      const built = rawForm
+        ? buildHeaderListArray(headers, this._scheme, this._authorityName, this._options.strictSingleValueFields)
+        : buildHeaderList(headers, this._scheme, this._authorityName, this._options.strictSingleValueFields);
       const streamId = this._nextStreamId();
       const stream = new ClientHttp2Stream(this, streamId, headers, options);
       this.streams.set(streamId, stream);
@@ -1262,7 +1312,7 @@ export constexpr std::string_view kHttp2JS = R"JS(
       // node Http2Stream#sentHeaders is the prepared object, i.e. including the
       // :method/:authority/:scheme/:path defaults request() filled in.
       stream.sentHeaders = built.prepared || headers;
-      const method = headers[":method"] === undefined ? "GET" : String(headers[":method"]);
+      const method = built.method === undefined ? "GET" : String(built.method);
       const noBody = /^(GET|HEAD|DELETE)$/.test(method);
       const endStream = options.endStream === undefined ? noBody : options.endStream === true;
       writeHeaderBlock(this, streamId, block, endStream ? FLAG.END_STREAM : 0);
@@ -1399,6 +1449,14 @@ export constexpr std::string_view kHttp2JS = R"JS(
                 if (!stream.destroyed) stream.destroy(err);
               });
             }
+            // node onStreamClose(): "Push a null so the stream can end whenever
+            // the client consumes it completely." A clean reset (NO_ERROR) is a
+            // normal end of the response, so the readable side has to END --
+            // destroying the Duplex outright swallowed 'end' entirely.
+            else if (!stream._readEnded) {
+              stream.once("end", () => http2StreamFinish(stream));
+              http2StreamEndReadable(stream);
+            }
             else http2StreamFinish(stream);
           }
           return true;
@@ -1514,11 +1572,15 @@ export constexpr std::string_view kHttp2JS = R"JS(
       const stream = this.streams.get(pb.streamId);
       if (!stream) return true;
       const headersObj = headerListToObject(list, this._hpack._sensitive, this._strictWs());
+      // node onSessionHeaders passes the decoded raw name/value array as the third
+      // argument of every header event, so a caller can see duplicates and order
+      // the collapsed object cannot express.
+      const rawHeaders = rawFromList(list);
       // The response HEADERS of a *pushed* stream are surfaced as 'push', not
       // 'response' (node ClientHttp2Stream: a push response is unsolicited).
       if (stream.pushed === true && !stream._responseEmitted) {
         stream._responseEmitted = true;
-        stream.emit("push", headersObj, flags);
+        stream.emit("push", headersObj, flags, rawHeaders);
         if (pb.endStream) { this.streams.delete(pb.streamId); stream._onEnd(); }
         return true;
       }
@@ -1527,14 +1589,14 @@ export constexpr std::string_view kHttp2JS = R"JS(
       // response is informational: node emits 'headers', and the real response
       // still follows (lib/internal/http2/core.js onSessionHeaders).
       const st = headersObj[":status"];
-      if (stream._responseEmitted) stream.emit("trailers", headersObj, flags);
+      if (stream._responseEmitted) stream.emit("trailers", headersObj, flags, rawHeaders);
       else if (typeof st === "number" && st >= 100 && st < 200) {
-        stream.emit("headers", headersObj, flags);
+        stream.emit("headers", headersObj, flags, rawHeaders);
         // node ClientHttp2Stream handleHeaderContinue: a 100 informational
         // response is additionally surfaced as 'continue'.
         if (st === 100) stream.emit("continue");
       }
-      else stream._onResponse(headersObj, flags);
+      else stream._onResponse(headersObj, flags, rawHeaders);
       if (pb.endStream) { this.streams.delete(pb.streamId); stream._onEnd(); }
       return true;
     }
@@ -1579,11 +1641,22 @@ export constexpr std::string_view kHttp2JS = R"JS(
     // allowHalfOpen socket, which would otherwise hold the loop) must go.
     _onSocketEnd() {
       if (this.destroyed) return;
-      if (this.streams && this.streams.size > 0) { this._endPending = true; return; }
+      abortStreamsOnTransportEof(this);
       this._endPending = false;
       this._teardown();
     }
-    _onSocketClose() { if (!this.destroyed && !this.closed) this._fatal(mkErr("Session closed with error code NGHTTP2_INTERNAL_ERROR", "ERR_HTTP2_SESSION_ERROR")); else this._teardown(); }
+    // node socketOnClose(): cancel the open streams, then close the session —
+    // and emit an error ONLY when the socket died while still connecting
+    // (ERR_SOCKET_CLOSED). A transport that simply went away is not by itself a
+    // session error. mbun synthesised ERR_HTTP2_SESSION_ERROR /
+    // NGHTTP2_INTERNAL_ERROR for every abrupt close, which is an uncaught
+    // exception in every test whose peer just destroys its socket.
+    _onSocketClose() {
+      if (this.destroyed) return;
+      abortStreamsOnTransportEof(this);
+      if (this.connecting) { this._fatal(mkErr("Socket has been disconnected from the Http2Session", "ERR_SOCKET_CLOSED")); return; }
+      this._teardown();
+    }
     _fatal(err) {
       if (this.destroyed) return;
       const streams = Array.from(this.streams.values());
@@ -1600,10 +1673,43 @@ export constexpr std::string_view kHttp2JS = R"JS(
     // instead, so the frame reaches the peer.
     _teardown(hard) {
       if (this.destroyed) return;
+      // A GRACEFUL teardown must not discard frames the peer has already
+      // delivered. After close() the peer answers with its own GOAWAY, and those
+      // bytes can be sitting in the socket's receive buffer unread — closing the
+      // fd here would drop them and 'goaway' would never fire
+      // (test-http2-session-graceful-close). node never loses them because its
+      // read callback runs before the destroy; drain the socket once instead.
+      // Must happen BEFORE `destroyed` is set: _onData ignores a destroyed session.
+      if (hard === false && this._drainingSocket !== true) {
+        this._drainingSocket = true;
+        try { if (this.socket && typeof this.socket._poll === "function") this.socket._poll(); } catch (e) {}
+        this._drainingSocket = false;
+        // A drained GOAWAY/FIN can have torn the session down already.
+        if (this.destroyed) return;
+      }
       this.destroyed = true; this.closed = true;
       if (this._timer != null) { try { G.clearTimeout(this._timer); } catch (e) {} this._timer = null; }
       closeSessionSocket(this.socket, hard !== false);
-      G.queueMicrotask(() => this.emit("close"));
+      // "Pending and existing streams will be destroyed. […] pending streams
+      // will be destroyed using a specific ERR_HTTP2_STREAM_CANCEL error"
+      // (lib/internal/http2/core.js, closeSession). mbun's client session left
+      // them dangling entirely: a request made before the socket connected never
+      // got its 'error'/'close' and its handle kept the loop alive
+      // (test-http2-stream-removelisteners-after-close).
+      // Only the PENDING ones: an open stream is already driven to its end by the
+      // socket teardown, and force-finishing those cost 5 files (they emit their
+      // own 'close'/'aborted' first). A stream on a session that never connected
+      // has nothing to drive it at all, so it kept its handle and the loop alive.
+      const pending = !this._connected ? Array.from(this.streams.values()) : [];
+      const self = this;
+      G.queueMicrotask(() => {
+        for (const s of pending) {
+          if (s.destroyed) continue;
+          s._closed = true;
+          s.destroy(streamCancelErr());
+        }
+        self.emit("close");
+      });
     }
     _shutdown() { this._teardown(); }
 
@@ -1618,7 +1724,36 @@ export constexpr std::string_view kHttp2JS = R"JS(
       const p = Buffer.alloc(8); p.writeUInt32BE(this._lastStreamId > 0 ? this._lastStreamId : 0, 0); p.writeUInt32BE(0, 4);
       try { this._writeFrame(FRAME.GOAWAY, 0, 0, p); } catch (e) {}
       const self = this;
-      G.queueMicrotask(() => self._teardown(false));
+      G.queueMicrotask(() => self._maybeDestroy());
+    }
+    // node Http2Session#close() is goaway() + kMaybeDestroy(), and kMaybeDestroy
+    // returns without destroying while `state.streams.size > 0`. That wait is
+    // OBSERVABLE: a client that closes from its request's 'end' handler has to
+    // stay readable long enough to see the peer's own GOAWAY, which the server
+    // only sends once its response has finished (test-http2-session-graceful-
+    // close). Tearing the socket down on the next microtask instead dropped
+    // every frame still in flight.
+    // node's gate is the stream map; mbun's cannot be, because it removes a
+    // stream from the routing map the moment END_STREAM arrives (node keeps it
+    // until [kDestroy]) — so by the time 'end' runs the map is already empty.
+    // `_liveStreams` is the node-equivalent count: it drops on stream destroy.
+    _maybeDestroy() {
+      if (this.destroyed || this._destroyScheduled) return;
+      if (!this.closed) return;
+      if (this.streams.size > 0 || this._liveStreams > 0) { this._destroyPending = true; return; }
+      this._destroyPending = false;
+      this._destroyScheduled = true;
+      // One I/O turn of grace, not a microtask. node's peer answers a graceful
+      // close inside the same read batch (its stream closes synchronously in
+      // nghttp2), so its GOAWAY is already parsed by the time close() destroys.
+      // mbun's server reaches that point one microtask drain later, and the
+      // pump's *second* io_tick of the same iteration is what picks the frame
+      // up — a microtask teardown ran before it and dropped the socket with the
+      // peer's GOAWAY still unread.
+      const self = this;
+      const nextTurn = typeof G.setImmediate === "function" ? G.setImmediate : (fn) => G.setTimeout(fn, 0);
+      const h = nextTurn(() => self._teardown(false));
+      if (h && typeof h.unref === "function") h.unref();
     }
     destroy(err, code) {
       if (this.destroyed) return;
@@ -1745,12 +1880,48 @@ export constexpr std::string_view kHttp2JS = R"JS(
       if (isArray) { for (const v of value) headers.push([key, String(v)]); return; }
       headers.push([key, value]);
     };
-    for (const key of Object.keys(map)) {
-      const value = map[key];
-      if (value === undefined || key === "") continue;
-      processHeader(key, value);
+    // node buildNgHeaderString takes EITHER a header object or a flat
+    // [name, value, name, value, …] array. The array form exists precisely to
+    // keep the caller's order and duplicate fields verbatim, so it must not be
+    // funnelled through Object.keys (which would turn `a,b … a,c` into one key
+    // and expose the indices as header names).
+    if (Array.isArray(map)) {
+      for (let i = 0; i < map.length; i += 2) {
+        const key = map[i];
+        const value = map[i + 1];
+        if (value === undefined || key === "") continue;
+        processHeader(key, value);
+      }
+    } else {
+      for (const key of Object.keys(map)) {
+        const value = map[key];
+        if (value === undefined || key === "") continue;
+        processHeader(key, value);
+      }
     }
     return { list: pseudoHeaders.concat(headers), sensitive };
+  }
+  // [[name, value], …] → node's flat raw-header array (the 3rd argument of
+  // 'response'/'headers'/'trailers'/'push' and the 4th of the server's 'stream').
+  function rawFromList(list) {
+    const raw = [];
+    for (let i = 0; i < list.length; i++) raw.push(list[i][0], list[i][1]);
+    return raw;
+  }
+  // node Http2Stream#sentHeaders getter for a stream whose headers were given as
+  // a raw array: the ORIGINAL key case is kept and a repeated field collapses
+  // into an array of its values, in order.
+  function rawToHeaderObject(rawHeaders) {
+    const obj = { __proto__: null };
+    for (let i = 0; i < rawHeaders.length; i += 2) {
+      const key = rawHeaders[i];
+      const value = rawHeaders[i + 1];
+      const existing = obj[key];
+      if (existing === undefined) obj[key] = value;
+      else if (Array.isArray(existing)) existing.push(value);
+      else obj[key] = [existing, value];
+    }
+    return copySensitiveTo(rawHeaders, obj);
   }
   // node prepareRequestHeadersObject: defaults :method/:authority/:scheme/:path
   // and enforces the CONNECT-specific pseudo-header rules.
@@ -1769,6 +1940,46 @@ export constexpr std::string_view kHttp2JS = R"JS(
     }
     const built = buildNgHeaders(obj, assertValidRequestPseudoHeader, strictSingleValueFields);
     built.prepared = obj;
+    built.method = obj[":method"];
+    return built;
+  }
+  // node prepareRequestHeadersArray: the same pseudo-header defaulting, except the
+  // defaults are PREPENDED to the caller's array instead of merged into an object,
+  // so the raw order the peer observes is `defaults… , caller's fields…`.
+  function buildHeaderListArray(headers, scheme, authorityName, strictSingleValueFields) {
+    let method, sch, authority, path, protocol;
+    for (let i = 0; i < headers.length; i += 2) {
+      const name = String(headers[i]);
+      if (name[0] !== ":") continue;
+      const h = name.toLowerCase();
+      const v = headers[i + 1];
+      if (h === ":method") method = v;
+      else if (h === ":scheme") sch = v;
+      else if (h === ":authority") authority = v;
+      else if (h === ":path") path = v;
+      else if (h === ":protocol") protocol = v;
+    }
+    const add = [];
+    if (method === undefined) { method = "GET"; add.push(":method", method); }
+    const connect = method === "CONNECT";
+    if (!connect || protocol !== undefined) {
+      // `headers["host"]` on an array is always undefined; node reads it anyway
+      // (lib/internal/http2/util.js), so the array form always adds :authority.
+      if (authority === undefined && headers["host"] === undefined) { authority = authorityName; add.push(":authority", authority); }
+      if (sch === undefined) { sch = scheme; add.push(":scheme", sch); }
+      if (path === undefined) add.push(":path", "/");
+    } else {
+      if (authority === undefined) throw H2_ERR(":authority header is required for CONNECT requests", "ERR_HTTP2_CONNECT_AUTHORITY", Error);
+      if (sch !== undefined) throw H2_ERR("The :scheme header is forbidden for CONNECT requests", "ERR_HTTP2_CONNECT_SCHEME", Error);
+      if (path !== undefined) throw H2_ERR("The :path header is forbidden for CONNECT requests", "ERR_HTTP2_CONNECT_PATH", Error);
+    }
+    // concat() drops symbol properties, so the sensitive-header marker has to be
+    // carried across explicitly.
+    const rawHeaders = add.length ? copySensitiveTo(headers, add.concat(headers)) : headers;
+    const built = buildNgHeaders(rawHeaders, assertValidRequestPseudoHeader, strictSingleValueFields);
+    built.rawHeaders = rawHeaders;
+    built.prepared = rawToHeaderObject(rawHeaders);
+    built.method = method;
     return built;
   }
   function headerListToObject(list, sensitive, dropPaddedFields) {
@@ -1795,8 +2006,20 @@ export constexpr std::string_view kHttp2JS = R"JS(
       if (name === "set-cookie") { obj[name].push(value); continue; }
       obj[name] = obj[name] + ", " + value;
     }
+    // node toHeaderObject ends with a plain `obj[kSensitiveHeaders] = …`, i.e. an
+    // ENUMERABLE own symbol — assert.deepStrictEqual compares own enumerable
+    // symbol keys, so a received header object that hides it can never deep-equal
+    // the `{ [sensitiveHeaders]: [] }` the corpus expects. Only the *effective*
+    // symbol (the one http2.sensitiveHeaders resolves to) is enumerable; the
+    // legacy alias stays hidden so exactly one symbol key is observable.
+    const effective = sensitiveSymbols[sensitiveSymbols.length - 1];
     for (let i = 0; i < sensitiveSymbols.length; i++)
-      try { Object.defineProperty(obj, sensitiveSymbols[i], { value: sensitive ? sensitive.slice() : [], enumerable: false, configurable: true }); } catch (e) {}
+      try {
+        Object.defineProperty(obj, sensitiveSymbols[i], {
+          value: sensitive ? sensitive.slice() : [],
+          enumerable: sensitiveSymbols[i] === effective, configurable: true, writable: true,
+        });
+      } catch (e) {}
     return obj;
   }
   function settingsToObject(s) {
@@ -1965,6 +2188,29 @@ export constexpr std::string_view kHttp2JS = R"JS(
     return built;
   }
 
+  // node prepareResponseHeadersArray: the raw form MUTATES the caller's array —
+  // a missing :status is unshifted (as the NUMBER, which is why sentHeaders[':status']
+  // is numeric here but a string when the caller supplied it) and the Date is
+  // appended.
+  function buildResponseHeaderListArray(headers, options, strictSingleValueFields) {
+    let statusCode;
+    let isDateSet = false;
+    for (let i = 0; i < headers.length; i += 2) {
+      const h = String(headers[i]).toLowerCase();
+      if (h === ":status") statusCode = headers[i + 1] | 0;
+      else if (h === "date") isDateSet = true;
+    }
+    if (!statusCode) { statusCode = 200; headers.unshift(":status", statusCode); }
+    if (!isDateSet && (options.sendDate == null || options.sendDate)) headers.push("date", new Date().toUTCString());
+    if (statusCode < 200 || statusCode > 599) {
+      const e = new RangeError("Invalid status code: " + statusCode); e.code = "ERR_HTTP2_STATUS_INVALID"; throw e;
+    }
+    const built = buildNgHeaders(headers, assertValidResponsePseudoHeader, strictSingleValueFields);
+    built.rawHeaders = headers;
+    built.prepared = rawToHeaderObject(headers);
+    return built;
+  }
+
   // === ServerHttp2Stream ===
   class ServerHttp2Stream extends H2StreamBase {
     constructor(session, id, headers) {
@@ -2000,12 +2246,18 @@ export constexpr std::string_view kHttp2JS = R"JS(
       if (this.destroyed || this._closed) throw mkErr("The stream has been destroyed", "ERR_HTTP2_INVALID_STREAM");
       headers = headers || {};
       options = options || {};
-      // node ServerHttp2Stream.respond({ sendDate }) stamps a Date header unless
-      // the response already carries one or sendDate was turned off.
-      if (options.sendDate !== false && headers["date"] === undefined && headers["Date"] === undefined) {
-        try { headers = Object.assign({ __proto__: null }, headers, { date: new Date().toUTCString() }); } catch (e) {}
+      const strictSingle = this.session._options && this.session._options.strictSingleValueFields;
+      let built;
+      if (Array.isArray(headers)) {
+        built = buildResponseHeaderListArray(headers, options, strictSingle);
+      } else {
+        // node ServerHttp2Stream.respond({ sendDate }) stamps a Date header unless
+        // the response already carries one or sendDate was turned off.
+        if (options.sendDate !== false && headers["date"] === undefined && headers["Date"] === undefined) {
+          try { headers = Object.assign({ __proto__: null }, headers, { date: new Date().toUTCString() }); } catch (e) {}
+        }
+        built = buildResponseHeaderList(headers, strictSingle);
       }
-      const built = buildResponseHeaderList(headers, this.session._options && this.session._options.strictSingleValueFields);
       // node ServerHttp2Stream.respond: DATA frames are forbidden for 204/205/304
       // and for a HEAD request, so the HEADERS frame carries END_STREAM itself.
       const st = parseInt(built.list[0] && built.list[0][1], 10);
@@ -2247,6 +2499,12 @@ export constexpr std::string_view kHttp2JS = R"JS(
     }
     _writeFrame(type, flags, streamId, payload) {
       if (this.destroyed || !this.socket) return;
+      // net.Socket.write() on an ended/destroyed socket EMITS 'error' rather than
+      // throwing, so the try/catch below cannot contain it: the session has no
+      // 'error' listener on that path and "write after end" surfaced as an
+      // uncaught exception. nghttp2 simply drops frames once the transport is
+      // gone, so drop them here too.
+      if (this.socket.destroyed || this.socket.writable === false) return;
       payload = payload || Buffer.alloc(0);
       try { this.socket.write(Buffer.concat([frameHeader(payload.length, type, flags, streamId), payload])); } catch (e) {}
     }
@@ -2512,7 +2770,7 @@ export constexpr std::string_view kHttp2JS = R"JS(
     // handles genuinely held the event loop that became a hang.
     _onSocketEnd() {
       if (this.destroyed) return;
-      if (this.streams && this.streams.size > 0) { this._endPending = true; return; }
+      abortStreamsOnTransportEof(this);
       this._endPending = false;
       this._teardown();
     }
@@ -2558,7 +2816,21 @@ export constexpr std::string_view kHttp2JS = R"JS(
       const p = Buffer.alloc(8); p.writeUInt32BE(this._lastStreamId > 0 ? this._lastStreamId : 0, 0); p.writeUInt32BE(0, 4);
       try { this._writeFrame(FRAME.GOAWAY, 0, 0, p); } catch (e) {}
       const self = this;
-      G.queueMicrotask(() => self._teardown(false));
+      G.queueMicrotask(() => self._maybeDestroy());
+    }
+    // node kMaybeDestroy: a graceful close lets the OPEN streams complete on
+    // their own and destroys the session only once the last one is gone. The
+    // server used to tear down on the next microtask instead, which truncated
+    // the response of any stream still in flight when server.close() ran
+    // (test-http2-graceful-close writes 1 MB after calling server.close()).
+    // Unlike the client, the server's stream map is only ever cleared by a
+    // stream destroy, so it is a valid gate on its own.
+    _maybeDestroy() {
+      if (this.destroyed) return;
+      if (!this.closed) return;
+      if (this.streams.size > 0) { this._destroyPending = true; return; }
+      this._destroyPending = false;
+      this._teardown(false);
     }
     destroy(err, code) { if (this.destroyed) return; if (err) { const self = this; this._teardown(); G.queueMicrotask(() => self.emit("error", err)); } else this._teardown(); }
     ref() { if (this.socket && this.socket.ref) this.socket.ref(); return this; }
@@ -2741,6 +3013,13 @@ export constexpr std::string_view kHttp2JS = R"JS(
       stream.on("aborted", () => { if (!self._state.closed) { self._aborted = true; self.emit("aborted"); } });
       stream.on("close", () => { self._state.closed = true; stream._proxySocket = null; self.emit("close"); });
       stream.on("timeout", () => self.emit("timeout"));
+      // node compat.js attaches onStreamError, a DELIBERATELY EMPTY handler:
+      // "errors in compatibility mode are not forwarded to the request and
+      // response objects". Without it the stream error a compat write-after-end
+      // raises (Http2ServerResponse#write destroys the stream with
+      // ERR_STREAM_WRITE_AFTER_END, exactly as node's does) has no listener and
+      // becomes an uncaught exception instead of just the callback's `err`.
+      stream.on("error", () => {});
     }
     get aborted() { return this._aborted; }
     get complete() { return this._aborted || this.readableEnded || this._state.closed || this._stream.destroyed; }
@@ -3037,6 +3316,18 @@ export constexpr std::string_view kHttp2JS = R"JS(
     server._h2options = options || {};
     if (typeof onRequest === "function") server.on("request", onRequest);
     const self = server;
+    // node Http2Server#close(): `NETServer.prototype.close` THEN
+    // closeAllSessions(this) — closing the listener is not enough, the live
+    // sessions have to be told to shut down gracefully too, or an idle client
+    // keeps the connection (and the loop) alive forever
+    // (test-http2-server-close-idle-connection).
+    const sessions = new Set();
+    const netClose = server.close.bind(server);
+    server.close = function (cb) {
+      const result = netClose(cb);
+      for (const session of Array.from(sessions)) { try { session.close(); } catch (e) {} }
+      return result;
+    };
     const onSession = (socket) => {
       // For an ALPN mismatch on a secure server (client spoke http/1.1) node
       // routes to the http1 path; here we only handle h2, so proceed if the
@@ -3052,6 +3343,8 @@ export constexpr std::string_view kHttp2JS = R"JS(
           onServerStream(self, stream, headers, flags, rawHeaders);
       });
       session.on("error", (e) => { if (self.listenerCount("sessionError") > 0) self.emit("sessionError", e, session); else if (self.listenerCount("session") === 0 && self.listenerCount("error") > 0) self.emit("error", e); });
+      sessions.add(session);
+      session.on("close", () => sessions.delete(session));
       self.emit("session", session);
     };
     server.on(secure ? "secureConnection" : "connection", onSession);
