@@ -1650,6 +1650,9 @@ public:
         set_fn(ctx_, fsn, "realpath", fsn_realpath_cb);
         set_fn(ctx_, fsn, "realpathNative", fsn_realpath_native_cb);
         set_fn(ctx_, fsn, "rename", fsn_rename_cb);
+        // Real link(2). Its Permission Model gate lives in fsn_link_cb (the
+        // native boundary), not in the JS shim, so the raw global is gated too.
+        set_fn(ctx_, fsn, "link", fsn_link_cb);
         set_fn(ctx_, fsn, "copyFile", fsn_copyFile_cb);
         set_fn(ctx_, fsn, "symlink", fsn_symlink_cb);
         set_fn(ctx_, fsn, "readdirRecursive", fsn_readdirRecursive_cb);
@@ -1718,6 +1721,7 @@ public:
         set_native_fn(ctx_, fdn, "read", 5, fdn_read_host);
         set_native_fn(ctx_, fdn, "write", 5, fdn_write_host);
         set_native_fn(ctx_, fdn, "ftruncate", 2, fdn_ftruncate_host);
+        set_native_fn(ctx_, fdn, "valid", 1, fdn_valid_host);
         set_prop(ctx_, global, "__mbunFdNative", fdn);
         // bun:internal-for-testing createSocketPair() → [readFd, writeFd].
         set_native_fn(ctx_, global, "__mbunCreateSocketPair", 0, create_socket_pair_host);

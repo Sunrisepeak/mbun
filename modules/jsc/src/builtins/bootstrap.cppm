@@ -5024,9 +5024,19 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   // node DEP0180 Stats constructor (callable with or without `new`); field
   // order per lib/internal/fs/utils.js. statSync builds its own result objects
   // natively — this is the public `fs.Stats` class for `new Stats(...)` users.
+  let showStatsDeprecation = true;
   function Stats(dev, mode, nlink, uid, gid, rdev, blksize, ino, size, blocks,
                  atimeMs, mtimeMs, ctimeMs, birthtimeMs) {
     if (!(this instanceof Stats)) return new Stats(dev, mode, nlink, uid, gid, rdev, blksize, ino, size, blocks, atimeMs, mtimeMs, ctimeMs, birthtimeMs);
+    // DEP0180 is a real runtime deprecation, emitted ONCE on first use. It was
+    // only documented in the comment above; test-fs-stat asserts the warning
+    // actually fires (common.expectWarning).
+    if (showStatsDeprecation) {
+      showStatsDeprecation = false;
+      if (G.process && typeof G.process.emitWarning === "function")
+        G.process.emitWarning("fs.Stats constructor is deprecated.",
+                              "DeprecationWarning", "DEP0180");
+    }
     this.dev = dev; this.mode = mode; this.nlink = nlink; this.uid = uid; this.gid = gid;
     this.rdev = rdev; this.blksize = blksize; this.ino = ino; this.size = size; this.blocks = blocks;
     this.atimeMs = atimeMs; this.mtimeMs = mtimeMs; this.ctimeMs = ctimeMs; this.birthtimeMs = birthtimeMs;
@@ -5212,26 +5222,39 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   // mbun has no fd->path map or permission model the syscall stays a no-op AFTER validation.
   const fsIntU32 = (v, name) => fsValidateInteger(v, name, -1, 4294967295);
   const fsAsyncOk = (fn) => { const cb = fsMakeCallback(fn); G.queueMicrotask(() => cb(null)); };
-  fsMod.fchmodSync = (fd, mode) => { fsValidateFd(fd); const m = fsParseFileMode(mode, "mode"); const p = fdPathMap.get(fd); if (p != null) F.chmod(p, m); };
-  fsMod.fchmod = (fd, mode, cb) => { fsValidateFd(fd); const m = fsParseFileMode(mode, "mode"); const p = fdPathMap.get(fd); try { if (p != null) F.chmod(p, m); } catch (e) {} fsAsyncOk(cb); };
+  fsMod.fchmodSync = (fd, mode) => { fsValidateFd(fd); const m = fsParseFileMode(mode, "mode"); fsCheckFd(fd, "fchmod"); const p = fdPathMap.get(fd); if (p != null) F.chmod(p, m); };
+  fsMod.fchmod = (fd, mode, cb) => { fsValidateFd(fd); const m = fsParseFileMode(mode, "mode"); const p = fdPathMap.get(fd); try { if (fsFdIsValid(fd) && p != null) F.chmod(p, m); } catch (e) {} fsAsyncFd(fd, "fchmod", cb); };
   fsMod.lchmodSync = (path, mode) => { validatePath(path); fsParseFileMode(mode, "mode"); };
   fsMod.lchmod = (path, mode, cb) => { validatePath(path); fsParseFileMode(mode, "mode"); fsAsyncOk(cb); };
-  fsMod.fchownSync = (fd, uid, gid) => { fsValidateFd(fd); fsIntU32(uid, "uid"); fsIntU32(gid, "gid"); };
-  fsMod.fchown = (fd, uid, gid, cb) => { fsValidateFd(fd); fsIntU32(uid, "uid"); fsIntU32(gid, "gid"); fsAsyncOk(cb); };
-  fsMod.lchownSync = (path, uid, gid) => { validatePath(path); fsIntU32(uid, "uid"); fsIntU32(gid, "gid"); };
-  fsMod.lchown = (path, uid, gid, cb) => { validatePath(path); fsIntU32(uid, "uid"); fsIntU32(gid, "gid"); fsAsyncOk(cb); };
-  fsMod.chownSync = (path, uid, gid) => { validatePath(path); fsIntU32(uid, "uid"); fsIntU32(gid, "gid"); };
-  fsMod.chown = (path, uid, gid, cb) => { validatePath(path); fsIntU32(uid, "uid"); fsIntU32(gid, "gid"); fsAsyncOk(cb); };
-  fsMod.fsyncSync = (fd) => { fsValidateFd(fd); };
-  fsMod.fdatasyncSync = (fd) => { fsValidateFd(fd); };
-  fsMod.fsync = (fd, cb) => { fsValidateFd(fd); fsAsyncOk(cb); };
-  fsMod.fdatasync = (fd, cb) => { fsValidateFd(fd); fsAsyncOk(cb); };
+  fsMod.fchownSync = (fd, uid, gid) => { fsValidateFd(fd); fsIntU32(uid, "uid"); fsIntU32(gid, "gid"); fsCheckFd(fd, "fchown"); };
+  fsMod.fchown = (fd, uid, gid, cb) => { fsValidateFd(fd); fsIntU32(uid, "uid"); fsIntU32(gid, "gid"); fsAsyncFd(fd, "fchown", cb); };
+  // chown/lchown have no native row (mbun never changes ownership), but they
+  // must still FAIL like node's when the path does not exist — a silent success
+  // is not a stub, it is a wrong answer (test-fs-error-messages' chown block).
+  const fsChownEnoent = (path, syscall) => {
+    const p = toStr(path);
+    if (!F.exists(p)) throw fsErr("ENOENT", syscall, p);
+  };
+  const fsAsyncChown = (path, syscall, fn) => {
+    const cb = fsMakeCallback(fn);
+    let err = null;
+    try { fsChownEnoent(path, syscall); } catch (e) { err = e; }
+    G.queueMicrotask(() => cb(err));
+  };
+  fsMod.lchownSync = (path, uid, gid) => { validatePath(path); fsIntU32(uid, "uid"); fsIntU32(gid, "gid"); fsChownEnoent(path, "lchown"); };
+  fsMod.lchown = (path, uid, gid, cb) => { validatePath(path); fsIntU32(uid, "uid"); fsIntU32(gid, "gid"); fsAsyncChown(path, "lchown", cb); };
+  fsMod.chownSync = (path, uid, gid) => { validatePath(path); fsIntU32(uid, "uid"); fsIntU32(gid, "gid"); fsChownEnoent(path, "chown"); };
+  fsMod.chown = (path, uid, gid, cb) => { validatePath(path); fsIntU32(uid, "uid"); fsIntU32(gid, "gid"); fsAsyncChown(path, "chown", cb); };
+  fsMod.fsyncSync = (fd) => { fsValidateFd(fd); fsCheckFd(fd, "fsync"); };
+  fsMod.fdatasyncSync = (fd) => { fsValidateFd(fd); fsCheckFd(fd, "fdatasync"); };
+  fsMod.fsync = (fd, cb) => { fsValidateFd(fd); fsAsyncFd(fd, "fsync", cb); };
+  fsMod.fdatasync = (fd, cb) => { fsValidateFd(fd); fsAsyncFd(fd, "fdatasync", cb); };
   fsMod.futimesSync = (fd) => { fsValidateFd(fd); };
   fsMod.futimes = (fd, a, m, cb) => { fsValidateFd(fd); fsAsyncOk(typeof cb === "function" ? cb : m); };
   fsMod.ftruncateSync = (fd, len) => { fsValidateFd(fd); if (len != null) fsValidateInteger(len, "len"); };
   fsMod.ftruncate = (fd, len, cb) => { fsValidateFd(fd); if (typeof len === "number") fsValidateInteger(len, "len"); fsAsyncOk(typeof len === "function" ? len : cb); };
-  fsMod.linkSync = (a, b) => { validatePath(a, "existingPath"); validatePath(b, "newPath"); return F.copyFile(toStr(a), toStr(b)); };
-  fsMod.link = (a, b, cb) => { validatePath(a, "existingPath"); validatePath(b, "newPath"); const fn = fsMakeCallback(cb); try { F.copyFile(toStr(a), toStr(b)); G.queueMicrotask(() => fn(null)); } catch (e) { G.queueMicrotask(() => fn(e)); } };
+  fsMod.linkSync = (a, b) => { validatePath(a, "existingPath"); validatePath(b, "newPath"); return F.link(toStr(a), toStr(b)); };
+  fsMod.link = (a, b, cb) => { validatePath(a, "existingPath"); validatePath(b, "newPath"); const fn = fsMakeCallback(cb); try { F.link(toStr(a), toStr(b)); G.queueMicrotask(() => fn(null)); } catch (e) { G.queueMicrotask(() => fn(e)); } };
   fsMod.renameSync = (a, b) => { validatePath(a, "oldPath"); validatePath(b, "newPath"); return F.rename(toStr(a), toStr(b)); };
   fsMod.rename = (a, b, cb) => { validatePath(a, "oldPath"); validatePath(b, "newPath"); const fn = fsMakeCallback(cb); try { F.rename(toStr(a), toStr(b)); G.queueMicrotask(() => fn(null)); } catch (e) { G.queueMicrotask(() => fn(e)); } };
   fsMod.unlinkSync = (p) => { validatePath(p); return F.unlink(toStr(p)); };
@@ -5247,7 +5270,13 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   const fsCopyFileImpl = (a, b, m) => {
     const mode = fsValidCopyMode(m);
     const s = toStr(a), d = toStr(b);
-    if ((mode & 1) !== 0 && F.exists(d)) throw fsErr("EEXIST", "copyfile", s, d);
+    // COPYFILE_EXCL is enforced by open(dest, O_EXCL) INSIDE the copy, so a
+    // missing SOURCE still reports ENOENT — checking the dest first turned that
+    // case into EEXIST (test-fs-error-messages' "the source does not exist").
+    if ((mode & 1) !== 0 && F.exists(d)) {
+      if (!F.exists(s)) throw fsErr("ENOENT", "copyfile", s, d);
+      throw fsErr("EEXIST", "copyfile", s, d);
+    }
     try { return F.copyFile(s, d); }
     catch (e) { throw (e && e.code && FS_ERRNO[e.code]) ? fsErr(e.code, "copyfile", s, d) : e; }
   };
@@ -5352,6 +5381,26 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     if (path2 !== undefined) e.path = path2;
     if (dest !== undefined) e.dest = dest;
     return e;
+  };
+  // node's fd-level ops fail EBADF on a descriptor that is not open. mbun's
+  // shims for the ops with no native row (fsync/fdatasync/fchmod/fchown/futimes)
+  // only range-checked the NUMBER, so every one of them silently succeeded on a
+  // closed or never-opened fd — test-fs-error-messages asserts the error's
+  // message, errno, code and syscall for each. __mbunFdNative.valid answers for
+  // both mbun's virtual fds and real OS descriptors (stdio, inherited).
+  const fsFdIsValid = (fd) => {
+    const n = globalThis.__mbunFdNative;
+    if (!n || typeof n.valid !== "function") return true;
+    try { return n.valid(fd); } catch (e) { return true; }
+  };
+  const fsCheckFd = (fd, syscall) => { if (!fsFdIsValid(fd)) throw fsErr("EBADF", syscall); return fd; };
+  // The async twins report EBADF THROUGH the callback (only the argument-type
+  // errors stay synchronous), so they cannot share fsAsyncOk's unconditional
+  // cb(null).
+  const fsAsyncFd = (fd, syscall, fn) => {
+    const cb = fsMakeCallback(fn);
+    const err = fsFdIsValid(fd) ? null : fsErr("EBADF", syscall);
+    G.queueMicrotask(() => cb(err));
   };
   // node ERR_INVALID_ARG_VALUE, whose message quotes the offending value.
   const fsArgValueErr = (name, value, reason) => {
@@ -5910,6 +5959,8 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   fsMod.futimesSync = (fd, atime, mtime) => {
     fsValidateFd(fd);
     const a = fsToUnixTimestamp(atime, "atime"), m = fsToUnixTimestamp(mtime, "mtime");
+    // node's syscall name for futimes is 'futime' (uv_fs_futime).
+    fsCheckFd(fd, "futime");
     const p = fdPathMap.get(fd);
     if (p) F.utimes(p, a, m);
   };
@@ -6274,6 +6325,9 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     unlink: P((p) => F.unlink(toStr(p))),
     realpath: P((p, o) => fsMod.realpathSync(p, o)),
     rename: P((a, b) => F.rename(toStr(a), toStr(b))),
+    // fs.promises.link was simply absent (node has it); the callback twin used
+    // to be copyFile, so nothing here could have been right anyway.
+    link: P((a, b) => { validatePath(a, "existingPath"); validatePath(b, "newPath"); return F.link(toStr(a), toStr(b)); }),
     copyFile: P((a, b, m) => { validatePath(a, "src"); validatePath(b, "dest"); fsValidCopyMode(m); return F.copyFile(toStr(a), toStr(b)); }),
     mkdtemp: P((pre) => F.mkdtemp(toStr(pre))),
     access: P((p, m) => { validatePath(p); fsValidAccessMode(m); if (!F.exists(toStr(p))) throw fsErr("ENOENT", "access", toStr(p)); }),
