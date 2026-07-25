@@ -434,6 +434,24 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
       });
       const self = this;
       tlsSock.once("secureConnect", () => self.emit("secureConnection", tlsSock));
+      // node _tls_wrap.js onServerSocketSecure/handshakeTimeout: a connection that
+      // does not finish its handshake within options.handshakeTimeout (default
+      // 120s) is destroyed and reported as 'tlsClientError'. Without it a peer
+      // that opens a TCP connection to a TLS port and then says nothing pins the
+      // server forever — a hang rather than the error node reports.
+      const hsTimeout = creds.handshakeTimeout === undefined ? 120000 : creds.handshakeTimeout;
+      if (hsTimeout > 0) {
+        const timer = G.setTimeout(() => {
+          if (tlsSock._secureEstablished || tlsSock.destroyed) return;
+          const e = new Error("TLS handshake timeout");
+          e.code = "ERR_TLS_HANDSHAKE_TIMEOUT";
+          self.emit("tlsClientError", e, tlsSock);
+          try { tlsSock.destroy(); } catch (e2) {}
+        }, hsTimeout);
+        const clear = () => { try { G.clearTimeout(timer); } catch (e) {} };
+        tlsSock.once("secureConnect", clear);
+        tlsSock.once("close", clear);
+      }
       // node _tls_wrap.js: a failure BEFORE the handshake completes is the
       // server's 'tlsClientError' (with the socket), never an unhandled 'error'
       // on the TLSSocket — a client that speaks junk at a TLS port must not take
