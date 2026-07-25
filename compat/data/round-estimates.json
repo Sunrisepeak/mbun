@@ -432,6 +432,35 @@
           "assert_throws_discipline": "Acted on the warning: hand-verified 32 error shapes (code + name + exact message) with standalone probes, which caught a genuine vacuous pass \u2014 test-tls-basic-validations asserts `Received type number (1)` while mbun emitted `Received 1`, using inspect where node uses determineSpecificType. Fixed and re-verified 32/32.",
           "guard_derived_from_diff": "Followed the rule and it paid: the diff touched crypto_asym.inc, which also feeds crypto.X509Certificate \u2014 a subsystem the brief's guard list did NOT name. It extended the guard by 342 diff-derived files (crypto 129, cluster 80, dgram 76, webcrypto 47) and built a true f628517 binary to baseline them. 236 -> 236, 0 regressions.",
           "environmental_flag": "test-tls-min-max-version + 6 test-tls-cli-*-version dependents now reach the TLSv1/TLSv1.1 rows, where the peer answers `tlsv1 alert protocol version` despite ciphers ALL@SECLEVEL=0 and an explicit floor. Looks like the linked OpenSSL 3.1.5 refusing legacy protocols below its configured policy \u2014 flagged as possibly environmental rather than fixable in mbun."
+        },
+        {
+          "id": "r10/agent-12",
+          "cluster": "node:test runner",
+          "worklist_files": 57,
+          "cluster_homogeneity": "brief claimed high; MEASURED to be a symptom cluster",
+          "target_delta_pass": 25,
+          "actual_delta_pass": 10,
+          "hit_rate": 0.4,
+          "wall_clock_min": 87,
+          "split": {
+            "runner": "17/77 -> 26/77 (22.1% -> 33.8%)",
+            "guard_869": "400 -> 415 pass"
+          },
+          "coordinator_brief_error": {
+            "what_I_wrote": "I passed the previous agent's verdict along as if it were a root cause: '--test CLI and run()/TestsStream hold 23 files, those two alone'.",
+            "reality": "Both are SYMPTOM clusters. --test now works end to end (verified by hand: TAP document, NODE_DEBUG config dump, discovery, exit codes) and converted only 2 of ~24 files, because each of the others asserts on a DIFFERENT unimplemented thing behind it: tracingChannel('test'), coverage, watch mode, snapshots, randomize/seeds, per-file worker IDs, declaration-order event buffering, reporter flush under --test-force-exit. test-runner-run.mjs alone has ~40 subtests spanning watch mode, abort signals, coverage and rerun state.",
+            "lesson": "compat/README.md already predicts this exactly, and I made the mistake anyway by inheriting a file COUNT as if it were a cause. A previous agent's 'N files share this' is a signature grouping until someone has verified the shared mechanism. Restate it as a hypothesis in the brief, never as a premise.",
+            "agent_self_critique": "It noted it should have reported the premise was wrong after cycle 5 rather than at the end \u2014 a fair criticism I should design for: ask for an early verdict on the brief's premise as an explicit deliverable."
+          },
+          "architectural_finding": {
+            "question": "Translate node's internal/test_runner/* wholesale, or graft its logic into mbun's builtins?",
+            "decided_by_measurement": "8 of node's 17 internal/test_runner modules already load unmodified; all 9 failures shared one cause (No such binding: url). Implementing that binding moved it to 12/17, then the wall named itself twice more (modules, contextify) and stopped at node's internal/modules/cjs/loader.js:440.",
+            "verdict": "GRAFT, translating file by file with PORT-SOURCE: headers. Wholesale translation is blocked structurally: internal/test_runner/test.js hard-requires mock/mock.js, which hard-requires node's COMPLETE CJS and ESM loaders (it uses Module._cache as the live registry plus registerHooks). mbun has its own native loader; installing node's beside it is either dead code or two loaders fighting.",
+            "decisive_point": "Those modules resolve ONLY from a node checkout. A shipped mbun has no lib/internal/, so a 'translation' that works inside compat/ would be measurement-only, not a runtime feature. This constrains every future 'just translate node's lib/' plan and is the most reusable thing the task produced."
+          },
+          "infrastructure_side_win": "internalBinding('url') was worth landing independently of the cluster: it unlocked internal/url, internal/fs/utils and internal/modules/helpers corpus-wide, and 5 of the 16 guard-set gains are OUTSIDE its cluster (fs-open-flags, fs-utils-get-dirents, fs-watch-recursive-linux-parallel-remove, module-main-extension-lookup, url-is-url-internal, watch-file-shared-dependency).",
+          "own_runner_protected": "mbun's own test runner untouched \u2014 every new path gated on !globalThis.__mbunBT. Verified by the coordinator after merge: `mbun test` on a bun corpus file gives 13 pass / 0 fail.",
+          "infrastructure_blocker": "`mcpp test -p jsc` COULD NOT BE RUN: it links ~25 test binaries of ~370MB each and produced ZERO binaries in 40 minutes under SAFE_MEM=6G, and again in 40 minutes under SAFE_MEM=24G/TASKS=512. Pre-existing, not caused by this work. It means the project cannot currently run its own jsc test suite on this machine, so 'no regression in modules/jsc' is not a claim anyone can make here. Needs a link-parallelism cap in the build tooling."
         }
       ],
       "verdicts": {
@@ -447,7 +476,8 @@
         "guard_must_cover_what_you_edited": "A guard set scoped to the TARGET subsystems is not enough \u2014 it must cover every subsystem the change touched. The dns regression escaped because the task guarded http/https/tls/net/dgram (its targets) while also editing dns. Rule: derive the guard from the DIFF, not from the brief. `git diff --name-only` -> which builtins/modules changed -> guard every corpus subsystem that loads them.",
         "three_verification_defects": "Round 10 found THREE independent defects in how the corpus was verified, each of which had been inflating the number for an unknown time: self-skips counted as passes (277 files), common.mustCall unenforced because process.on('exit') never fired (946 of 1533 passing files used it), and assert.throws ignoring its error argument so any throw satisfied any matcher (48 verified vacuous passes on the guard sets alone). Lesson: before optimising a metric, audit the metric. All three were found by agents doing unrelated work who stopped to ask why a test passed.",
         "coordinator_hypotheses_are_hints": "A cause stated in a brief must be labelled as a hypothesis, and agents must be told to measure rather than implement it. Two cases this round: the 580-file timeout target assumed handle ref-counting (real cause: the event pump swallowing exceptions), and the dns regression brief assumed a leaked pending count (real cause: a single-threaded resolver deadlocking against dgram's own pre-send lookup, 8011ms -> 3ms once the pool could grow). Both agents measured their way to the real cause. A brief that states a cause as fact would have produced the wrong fix twice.",
-        "security_findings_outrank_counts": "This task delivered 80% of its file target and was still the most valuable of the round: it found a certificate-validation bypass of the CVE-2009-2408 class (subjectAltName truncated at an embedded NUL, so a cert for `good.example.org\\0.evil.example.com` was accepted as good.example.org) and a silently-ignored options.ciphers. Neither was visible as a failing count \u2014 the SAN bug's corpus test was one file. Briefs for security-adjacent subsystems should ask explicitly for an audit of what the code CLAIMS to enforce versus what it does, and should say that such a finding outranks the file target."
+        "security_findings_outrank_counts": "This task delivered 80% of its file target and was still the most valuable of the round: it found a certificate-validation bypass of the CVE-2009-2408 class (subjectAltName truncated at an embedded NUL, so a cert for `good.example.org\\0.evil.example.com` was accepted as good.example.org) and a silently-ignored options.ciphers. Neither was visible as a failing count \u2014 the SAN bug's corpus test was one file. Briefs for security-adjacent subsystems should ask explicitly for an audit of what the code CLAIMS to enforce versus what it does, and should say that such a finding outranks the file target.",
+        "inherited_counts_are_not_causes": "Do not inherit a previous agent's file count as a root cause in a new brief. 'These 23 files share X' is a signature grouping until the shared MECHANISM has been verified. I passed such a verdict through as a premise and the task delivered 40% of target because --test turned out to be a symptom cluster: implementing it end to end converted 2 of ~24 files, each of the rest asserting on a different missing feature behind it. Ask for an early verdict on the brief's premise as an explicit deliverable, so a wrong premise is reported at cycle 2 rather than in the final report."
       },
       "open_regressions": {
         "total": 10,
