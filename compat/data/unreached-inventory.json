@@ -1,0 +1,154 @@
+{
+ "purpose": "Per-file named causes for corpus files that are NOT passing. Exists to remove the ~35min triage phase that every wave-2 agent paid independently and then threw away. A brief MUST draw its worklist from here rather than asking an agent to re-triage. Entries are what the agent that filed them measured; a stale entry is a bug -- re-derive before budgeting.",
+ "provenance": "wave-2 agents w2/agent-1 (tls), w2/agent-2 (http), w2/agent-3 (fs), round 10",
+ "how_to_use": "Group by `cause`, count files per cause, budget mechanisms x 10min + 55min overhead. Do NOT budget by subsystem -- see compat/README.md 'Allocate agents by cause family, not by subsystem'.",
+ "caveat": "Coverage is uneven: the fs inventory is per-file and complete (58 files); tls and http are recorded at cause-shape granularity because that is the level their agents reported. Filling the tls/http per-file rows is itself a cheap, high-leverage task.",
+ "causes": {
+  "platform-impossible": {
+   "corpus": "node",
+   "subsystem": "fs",
+   "files": [
+    "test-fs-lchmod",
+    "test-fs-readdir-buffer",
+    "test-fs-long-path",
+    "test-fs-readdir-pipe",
+    "test-fs-readfilesync-enoent",
+    "test-fs-realpath-on-substed-drive",
+    "test-fs-write-file-invalid-path",
+    "test-fs-stat-temporal"
+   ],
+   "note": "macOS-only, Windows-only, or needs JSC Temporal. Already classified `skipped`. NOT reachable -- exclude from every target.",
+   "action": "none"
+  },
+  "filehandle-lock-ref-protocol": {
+   "corpus": "node",
+   "subsystem": "fs",
+   "files": [
+    "test-fs-promises-file-handle-pull",
+    "test-fs-promises-file-handle-pullsync",
+    "test-fs-promises-file-handle-writer",
+    "test-fs-promises-file-handle-aggregate-errors",
+    "test-fs-promises-file-handle-close-errors",
+    "test-fs-promises-file-handle-op-errors"
+   ],
+   "note": "kLocked/kCloseSync/kClosePromise absent; fh.pull/pullSync/writer missing; no close-error propagation ('Missing expected rejection'). ~570 lines of node's fs.promises.ts.",
+   "action": "densest single remaining fs mechanism -- one dedicated round"
+  },
+  "fs-watch": {
+   "corpus": "node",
+   "subsystem": "fs",
+   "files": [
+    "test-fs-watch-encoding",
+    "test-fs-watch-recursive-promise",
+    "test-fs-watch-recursive-validate",
+    "test-fs-watch-enoent",
+    "test-fs-watch-recursive-symlink",
+    "test-fs-watch-stop-async",
+    "test-fs-watchfile",
+    "test-fs-watchfile-bigint"
+   ],
+   "note": "3 are hangs: a watcher registers as a pollable but holds no fd, so the drain's stall clock never advances. Also err.path missing on ENOENT, symlink loop, and BigIntStats carrying 4 Date props node's zero-row omits.",
+   "action": "one mechanism (pollable-without-fd) unblocks the 3 hangs"
+  },
+  "realpath-js-resolver": {
+   "corpus": "node",
+   "subsystem": "fs",
+   "files": [
+    "test-fs-realpath",
+    "test-fs-realpath-native",
+    "test-fs-realpath-pipe"
+   ],
+   "note": "mbun uses weakly_canonical; node uses a non-native JS resolver with its own cache semantics.",
+   "action": "direct translation from node lib/fs.js"
+  },
+  "fs-not-routed-through-internalBinding": {
+   "corpus": "node",
+   "subsystem": "fs",
+   "files": [
+    "test-fs-readdir-types",
+    "test-fs-sync-fd-leak"
+   ],
+   "note": "internalBinding('fs') EXISTS but mbun's fs does not call through it, so tests that monkey-patch binding.readdir / binding.writeFileUtf8 (and count exactly 2 calls) see nothing.",
+   "action": "architectural: routing fs through the binding is a prerequisite for any test that patches it"
+  },
+  "node-test-subtest-failures": {
+   "corpus": "node",
+   "subsystem": "fs",
+   "files": [
+    "test-fs-append-file-flush",
+    "test-fs-write-file-flush",
+    "test-fs-glob",
+    "test-fs-stat-abort-test",
+    "test-fs-write-file-sync"
+   ],
+   "note": "node:test based; failure is inside a subtest. flush pair needs validateBoolean(options.flush) + a real fsyncSync visible to t.mock.method. test-fs-glob alone is 243/448 subtests failing -- a glob round of its own.",
+   "action": "split: the flush pair is cheap, glob is not"
+  },
+  "fs-one-off": {
+   "corpus": "node",
+   "subsystem": "fs",
+   "files_with_causes": {
+    "test-fs-access": "line 118 mustNotCall fired -- a W_OK case the euid/egid stat triad still gets wrong; no supplementary groups",
+    "test-fs-error-messages": "needs `fstat` in the syscall slot",
+    "test-fs-existssync-memleak-longpath": "queryObjects absent",
+    "test-fs-truncate": "native fsn_truncate_cb maps every non-ENOENT/EISDIR errno to EACCES/open, so EINVAL/EFBIG surface wrong",
+    "test-fs-utimes": "lutimes still follows the symlink -- needs utimensat with AT_SYMLINK_NOFOLLOW",
+    "test-fs-whatwg-url": "ADVANCED past the old failure; now needs ERR_INVALID_FILE_URL_PATH for %2f",
+    "test-fs-write-buffer-large": "Buffer.allocUnsafe caps at 2**31-1 with name 'size'; node's kMaxLength is larger",
+    "test-fs-writesync-crash": "fs errors must set errno by plain assignment so a poisoned Object.prototype setter throws",
+    "test-fs-readdir-ucs2": "lone-surrogate filenames need raw-byte path handling",
+    "test-fs-readdir-stack-overflow": "JSC's RangeError text has a trailing period node's does not",
+    "test-fs-cp-async-file-url": "resolves fixtures against cwd -- an import.meta.url/__dirname bug",
+    "test-fs-readfile": "now only the AbortSignal validation: {signal:'hello'} must throw ERR_INVALID_ARG_TYPE",
+    "test-fs-write-file": "AbortSignal rejects with TypeError, must be AbortError",
+    "test-fs-glob-throw": "a throwing glob callback is not routed to uncaughtException",
+    "test-fs-buffer": "intermittent SIGSEGV in JSC JSRopeString::view under memory pressure -- issue #16, NOT an fs bug"
+   },
+   "action": "each is 1 file; only worth batching, never worth a dedicated agent"
+  },
+  "http-timeout-shape-A-server-outlives-dead-client": {
+   "corpus": "node",
+   "subsystem": "http",
+   "file_count": 10,
+   "signature": "Server{listening} + zero sockets; server.close() sits in a client callback that never fired",
+   "note": "NOT an event-loop bug. The client flow died; node would also hold the loop here. Fix the client-side flow, not the loop.",
+   "action": "one mechanism, highest file count in http"
+  },
+  "http-timeout-shape-B-stalled-exchange": {
+   "corpus": "node",
+   "subsystem": "http",
+   "file_count": 4,
+   "signature": "Server{listening} + live socket pair, _wq=0, no ref'd timer",
+   "note": "genuinely mid-flight; protocol-semantics gap",
+   "action": "per-file"
+  },
+  "http-timeout-shape-C-sockets-outlive-server": {
+   "corpus": "node",
+   "subsystem": "http",
+   "file_count": 3,
+   "signature": "server closed, sockets still held",
+   "action": "one mechanism"
+  },
+  "http-timeout-shape-D-actually-a-native-crash": {
+   "corpus": "node",
+   "subsystem": "http",
+   "file_count": 2,
+   "signature": "no hang dump at all; native WTFCrashWithInfo",
+   "note": "MISFILED as timeout -- these are crashes. Any 'sweep the hangs' brief that includes them is budgeting the wrong work.",
+   "action": "reclassify then treat as crashes"
+  },
+  "tls-pkcs12": {
+   "corpus": "node",
+   "subsystem": "tls",
+   "file_count": 4,
+   "note": "CORRECTED LEAD: briefed as an OpenSSL legacy-provider search-path fix. Reality: only a no-op `loadPKCS12() {}` stub exists and there is no d2i_PKCS12 call anywhere. The work is 'write PKCS#12 parsing, then load the provider'.",
+   "action": "do NOT budget as a config fix; grep d2i_PKCS12 first"
+  },
+  "tls-version-and-ciphersuites": {
+   "corpus": "node",
+   "subsystem": "tls",
+   "note": "CORRECTED LEAD: briefed as '@SECLEVEL=0 is never forwarded'. It IS forwarded, to SSL_CTX_set_cipher_list. Remaining gap is narrower: SSL_CTX_set_ciphersuites (TLS 1.3 suites use a different setter) plus --tls-min-v1.x last-flag-wins.",
+   "action": "re-derive the file count from the narrower gap before budgeting"
+  }
+ }
+}

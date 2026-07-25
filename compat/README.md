@@ -513,3 +513,55 @@ So:
   left enumerable, which node's `common` reports as leaked — and which fired
   *before* ~300 files could reach `common.skip()`, so they reported `fail`
   instead of `skipped`).
+
+### A parallel guard invents regressions; confirm each one alone
+
+Every zero-regression guard in this project runs the corpus in parallel, and
+that parallelism *manufactures* failures. Two independent measurements, one
+round apart:
+
+- A tls guard at `--jobs 10` reported 70 `pass -> fail`. Four of the named files
+  were re-run standalone on the same binary: **3/3 pass, every one.** The
+  agent had already argued they were artifacts and declined to claim zero
+  regressions; it was right.
+- `test-fs-buffer` began `SIGSEGV`-ing in JSC's `JSRopeString::view` at address
+  `0x0`. Standalone: **4/6 then 6/6 clean**; at `--jobs 5` beside its own
+  cluster: **3/3 clean**; in any run that also contained `test-fs-readfile`:
+  **crashes**. The trigger is memory pressure from that file's 2 GiB sparse
+  file — which only exists now that the file survives instead of being
+  OOM-killed. So a *fix* created the neighbour's crash.
+
+Two consequences, and the second is the expensive one:
+
+1. Published pass counts measured under parallelism are **understated**, not
+   inflated. Correcting a figure downward is the usual direction here; this one
+   goes the other way.
+2. Agents burn budget triaging regressions that do not exist. One wave spent a
+   third of an agent's remaining time on 70 phantom files.
+
+**The rule: a single `pass -> fail` in a parallel guard is a lead, not a
+finding.** Reproduce it standalone before you believe it, and before you let it
+block a merge. Conversely, do not let this become a licence to dismiss real
+regressions — the test is reproduction, not plausibility.
+
+And note what the second case implies about *sequencing*: a per-file resource
+footprint that grows because a file stopped dying is a real, if indirect,
+regression risk to its neighbours. The corpus is not a set of independent
+experiments as long as it shares a machine.
+
+### A round can be worth running and still convert nothing
+
+A wave dispatched at "each agent guarantees 100% of its subsystem in 100
+minutes" returned +10 files against a +270 target — a 3.7% hit rate. The
+arithmetic was refutable before dispatch: ~10 min fixed cost per mechanism and
+a measured ~55 min of unavoidable per-agent overhead (triage + build + measure)
+leaves ~4 mechanisms per agent, and mechanisms convert 1-3 files each once a
+subsystem's homogeneous clusters are gone. 270 was never reachable, and saying
+so up front was the job.
+
+What the wave actually produced: three per-file unreached inventories with a
+named cause each, a hang histogram that collapsed 19 files to 4 shapes, two
+corrected leads, and a reproducer for a bug that had been parked for want of
+one. That is a **diagnosis round**, and diagnosis rounds are worth running —
+they are just not worth *scoring* against a conversion target. Label the round
+for what it is before dispatch, or its output looks like failure.
