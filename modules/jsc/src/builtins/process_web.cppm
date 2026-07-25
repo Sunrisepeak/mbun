@@ -570,7 +570,16 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   }
 
   const resolveExe = (file) => {
-    if (file.indexOf("/") >= 0) return F.exists(file) ? file : null;
+    // The existence probe is an mbun implementation detail: node resolves the
+    // executable inside uv_spawn, and gates spawning on the ChildProcess scope
+    // ONLY -- it never charges the caller an fs.read for the binary it is about
+    // to exec. So a Permission Model denial here must not become the reported
+    // error; hand the path to the spawn boundary, which is gated on ChildProcess
+    // and reports ENOENT itself if the file really is missing.
+    if (file.indexOf("/") >= 0) {
+      try { return F.exists(file) ? file : null; }
+      catch (e) { if (e && e.code === "ERR_ACCESS_DENIED") return file; throw e; }
+    }
     try { return G.Bun && Bun.which ? Bun.which(file) : file; } catch (e) { return file; }
   };
 

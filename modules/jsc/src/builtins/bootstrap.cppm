@@ -2405,7 +2405,13 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   def(["cluster"], Object.assign(new EventEmitter(), { isPrimary: true, isMaster: true, isWorker: false, workers: {}, settings: {}, schedulingPolicy: 2, fork: () => new EventEmitter(), setupPrimary() {}, setupMaster() {}, disconnect(cb) { if (cb) cb(); }, worker: null }));
   def(["inspector"], { open() { throw new Error("node:inspector is not yet implemented in Bun. Track the status & thumbs up the issue: https://github.com/oven-sh/bun/issues/2445"); }, close() { throw new Error("node:inspector is not yet implemented in Bun. Track the status & thumbs up the issue: https://github.com/oven-sh/bun/issues/2445"); }, url: () => undefined, waitForDebugger() { throw new Error("node:inspector is not yet implemented in Bun. Track the status & thumbs up the issue: https://github.com/oven-sh/bun/issues/2445"); }, console: G.console, Session: class Session extends EventEmitter { connect() {} disconnect() {} post(m, p, cb) { if (typeof p === "function") p(null, {}); else if (cb) cb(null, {}); } } });
   def(["trace_events"], { createTracing: () => ({ enable() {}, disable() {}, get enabled() { return false; }, categories: "" }), getEnabledCategories: () => undefined });
-  def(["wasi"], { WASI: class WASI { constructor(o) { this.wasiImport = {}; this._opts = o || {}; } start() { return 0; } initialize() {} getImportObject() { return { wasi_snapshot_preview1: this.wasiImport }; } } });
+  def(["wasi"], { WASI: class WASI { constructor(o) {
+    // Permission Model: node gates the WASI scope in WASI::New
+    // (src/node_wasi.cc) — a WASI instance can preopen host directories, so it
+    // is a filesystem capability in its own right.
+    const PN = G.__mbunPermissionNative;
+    if (PN && PN.enabled && !PN.has("wasi")) throw PN.denyError("wasi", "");
+    this.wasiImport = {}; this._opts = o || {}; } start() { return 0; } initialize() {} getImportObject() { return { wasi_snapshot_preview1: this.wasiImport }; } } });
   def(["repl"], { start: () => new EventEmitter(), REPLServer: class REPLServer extends EventEmitter {}, Recoverable: class Recoverable extends Error {}, writer: (v) => String(v), REPL_MODE_SLOPPY: 0, REPL_MODE_STRICT: 1 });
   def(["_stream_wrap"], { StreamWrap: class StreamWrap extends EventEmitter {} });
   def(["test/reporters"], { tap: function* () {}, spec: class Spec {}, dot: function* () {}, junit: function* () {}, lcov: class Lcov {} });

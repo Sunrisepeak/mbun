@@ -246,3 +246,106 @@ std::vector<std::string> gPreloads{};
 // `--user-agent <STR>` — overrides the default fetch User-Agent.
 // ref: bun cli/Arguments.rs:1062 → bun_http::OVERRIDDEN_DEFAULT_USER_AGENT.
 std::string gUserAgent{};
+
+// ── the Permission Model (node --permission / --allow-*) ────────────────────
+// One instance per process, exactly like node's Environment::permission(). It
+// starts DISABLED and every gate below is a no-op in that state, so an ordinary
+// run cannot be affected: `gPermission.enabled()` is the first thing each check
+// tests.
+//
+// This lives here, in the runtime's own state, and NOT behind a JS object,
+// because it is what the C++ fs/spawn/worker boundaries consult. A model that
+// only existed in JS could be reached around by anything that called those
+// boundaries directly.
+mbun::permission::Model gPermission{};
+
+// The parsed flags, kept so the JS layer can reproduce node's
+// getOptionValue('--allow-…') answers (the SecurityWarning loop, the
+// ERR_MISSING_OPTION check) and so child_process can copy them into a child's
+// NODE_OPTIONS.
+mbun::permission::Options gPermissionOptions{};
+
+// Set once, before the model is enabled: `mbun --permission x.js` and
+// `NODE_OPTIONS=--permission mbun x.js` both land here (see src/main.cpp).
+std::vector<std::string> gPermissionTokens{};
+bool gPermissionHasEvalString{false};
+std::string gPermissionEntry{};
+std::vector<std::string> gPermissionPreloads{};
+
+// Bind the model to the live process: node re-resolves a relative reference
+// against the CURRENT cwd on every call (env->GetCwd()), so process.chdir()
+// changes what "." means, and a directory grant is decided by a real stat.
+void permission_bind_probes() {
+    gPermission.set_cwd_provider([] {
+        std::error_code ec{};
+        const auto cwd{std::filesystem::current_path(ec)};
+        return ec ? std::string{} : cwd.string();
+    });
+    gPermission.set_is_dir_probe([](const std::string& p) {
+        std::error_code ec{};
+        // Follows symlinks, as node's uv_fs_stat does in WildcardIfDir.
+        return std::filesystem::is_directory(std::filesystem::path{p}, ec) && !ec;
+    });
+}
+
+// node CreateAccessDeniedError (src/permission/permission.cc): an Error whose
+// `code` is ERR_ACCESS_DENIED and which carries `permission` (the scope's Name)
+// and `resource` (the reference that was refused). The corpus asserts all three.
+JSValueRef permission_denied_error(JSContextRef ctx,
+                                   mbun::permission::Scope scope,
+                                   std::string_view resource,
+                                   std::string_view messageOverride = {}) {
+    const std::string message{messageOverride.empty()
+                                  ? mbun::permission::access_denied_message(scope)
+                                  : std::string{messageOverride}};
+    JSValueRef m{make_string(ctx, message)};
+    JSObjectRef err{JSObjectMakeError(ctx, 1, &m, nullptr)};
+    set_prop(ctx, err, "code", make_string(ctx, "ERR_ACCESS_DENIED"));
+    set_prop(ctx, err, "permission", make_string(ctx, mbun::permission::scope_name(scope)));
+    set_prop(ctx, err, "resource", make_string(ctx, resource));
+    return err;
+}
+
+// Set when the MODULE LOADER's fs adapter refused a read. The loader's read hook
+// can only answer "no bytes" (std::optional), which the require path would report
+// as "Cannot find module" — a misleading error for a file that exists and was
+// deliberately refused. The require path consults this to report
+// ERR_ACCESS_DENIED instead. Cleared on every successful require.
+std::optional<std::string> gPermissionDeniedModuleRead{};
+
+// The fs gate, used by every native fs entry point.
+//
+// Returns true when the operation must NOT proceed, having already stored the
+// ERR_ACCESS_DENIED into `*exc`. Audit mode (`--permission-audit`) reports and
+// then allows, which is what node's warning_only_ does.
+//
+// `path` is the raw argument as the script wrote it; the model resolves it
+// against the cwd before matching, so `../` cannot walk out of a granted tree.
+bool permission_deny_fs(JSContextRef ctx, JSValueRef* exc, std::string_view path, bool write) {
+    if (!gPermission.enabled()) return false;
+    const auto scope{write ? mbun::permission::Scope::FileSystemWrite
+                           : mbun::permission::Scope::FileSystemRead};
+    if (gPermission.is_granted(scope, path)) return false;
+    if (gPermission.warning_only()) {
+        std::println(std::cerr, "Warning: Access to this API has been restricted. Use {} to manage permissions. resource: {}",
+                     mbun::permission::scope_flag(scope), path);
+        return false;
+    }
+    if (exc != nullptr) *exc = permission_denied_error(ctx, scope, path);
+    return true;
+}
+
+// The non-fs scopes (child process, worker, wasi, addon, inspector, net). Same
+// contract as permission_deny_fs.
+bool permission_deny_scope(JSContextRef ctx, JSValueRef* exc, mbun::permission::Scope scope,
+                           std::string_view resource) {
+    if (!gPermission.enabled()) return false;
+    if (gPermission.is_granted(scope, resource)) return false;
+    if (gPermission.warning_only()) {
+        std::println(std::cerr, "Warning: {} resource: {}",
+                     mbun::permission::access_denied_message(scope), resource);
+        return false;
+    }
+    if (exc != nullptr) *exc = permission_denied_error(ctx, scope, resource);
+    return true;
+}

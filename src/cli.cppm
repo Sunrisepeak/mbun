@@ -120,7 +120,12 @@ bool node_flag_takes_value(std::string_view flag) {
         "--diagnostic-dir", "--redirect-warnings", "--disk-cache-dir",
         "--experimental-policy", "--policy-integrity", "--conditions",
         "-C", "--report-dir", "--report-directory", "--report-filename",
-        "--report-signal", "--secure-heap", "--secure-heap-min", "--dns-result-order"};
+        "--report-signal", "--secure-heap", "--secure-heap-min", "--dns-result-order",
+        // Permission Model path lists. node's own corpus passes these in the
+        // space form as often as the `=` form (test-permission-fs-wildcard does
+        // `--allow-fs-read /tmp/*`), and treating the path as a positional made
+        // mbun try to RUN it.
+        "--allow-fs-read", "--allow-fs-write"};
     for (std::string_view f : kValued) {
         if (flag == f) return true;
     }
@@ -191,6 +196,81 @@ std::vector<std::string> derive_exec_argv(std::span<const std::string_view> args
         break;  // the entry point — everything after it belongs to the script
     }
     return execArgv;
+}
+
+// ── the Permission Model's command line ─────────────────────────────────────
+// node reads --permission/--allow-* from NODE_OPTIONS first and the command line
+// second, and gives the entry point plus every --require an implicit fs.read
+// grant (env.cc:952-967). All three facts are command-line analysis, so they are
+// derived here, from the SAME raw argv the execArgv re-parser walks — a second,
+// divergent walk is how a flag ends up honoured in one place and not the other.
+struct PermissionCommandLine {
+    std::vector<std::string> tokens{};    // NODE_OPTIONS words, then argv's flags
+    bool hasEvalString{false};            // -e / --eval / -p / --print
+    std::string entry{};                  // node's argv_[1]
+    std::vector<std::string> preloads{};  // -r / --require / --preload / --import
+};
+
+PermissionCommandLine derive_permission_cli(std::span<const std::string_view> args) {
+    PermissionCommandLine out{};
+
+    // NODE_OPTIONS is whitespace-separated. node allows the permission flags in
+    // it (kAllowedInEnvvar), and node's own child_process propagates the sandbox
+    // to a subprocess exactly this way — so ignoring it would let any spawned
+    // child escape.
+    if (const char* nodeOptions{std::getenv("NODE_OPTIONS")}; nodeOptions != nullptr) {
+        std::string token{};
+        for (const char c : std::string_view{nodeOptions}) {
+            if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+                if (!token.empty()) out.tokens.push_back(std::exchange(token, {}));
+            } else {
+                token.push_back(c);
+            }
+        }
+        if (!token.empty()) out.tokens.push_back(std::move(token));
+    }
+
+    // The command line's own leading flags, stopping at the entry point — the
+    // same walk as derive_exec_argv.
+    bool seenRun{false};
+    std::string_view prev{};
+    for (const std::string_view a : args) {
+        if (!a.empty() && a[0] == '-') {
+            out.tokens.emplace_back(a);
+            if (a == "-e" || a == "--eval" || a == "-p" || a == "--print") {
+                out.hasEvalString = true;
+            }
+            prev = a;
+            continue;
+        }
+        if (!seenRun && a == "run") {
+            seenRun = true;
+            prev = a;
+            continue;
+        }
+        if (!prev.empty() && exec_argv_flag_takes_value(prev)) {
+            out.tokens.emplace_back(a);
+            if (prev == "-r" || prev == "--require" || prev == "--preload" || prev == "--import") {
+                out.preloads.emplace_back(a);
+            }
+            prev = a;
+            continue;
+        }
+        out.entry = std::string{a};
+        break;
+    }
+
+    // `--flag=value` forms of the preload flags (the loop above only sees the
+    // separate-token form).
+    for (const std::string_view a : args) {
+        for (const std::string_view f : {"-r=", "--require=", "--preload=", "--import="}) {
+            if (a.starts_with(f)) out.preloads.emplace_back(a.substr(f.size()));
+        }
+    }
+
+    // An eval string means there is no entry point to grant.
+    if (out.hasEvalString) out.entry.clear();
+    return out;
 }
 
 // ─── `mbun test` flags ──────────────────────────────────────────────────────

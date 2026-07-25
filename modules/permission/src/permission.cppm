@@ -567,4 +567,156 @@ public:
     }
 };
 
+// ── the CLI surface (node src/node_options.cc + src/env.cc:920-985) ──────────
+// The flag table, kept as data so the option parser, the SecurityWarning loop
+// and the NODE_OPTIONS propagation all read the SAME list. node's own
+// `availableFlags()` (lib/internal/process/permission.js) is this order.
+inline constexpr std::string_view kAllowFlags[]{
+    "--allow-fs-read", "--allow-fs-write", "--allow-addons",    "--allow-child-process",
+    "--allow-net",     "--allow-inspector", "--allow-wasi",     "--allow-worker",
+    "--allow-ffi",
+};
+
+// node pre_execution.js initializePermission's warnFlags: each of these widens
+// the sandbox enough that node prints a SecurityWarning naming the flag.
+inline constexpr std::string_view kSecurityWarningFlags[]{
+    "--allow-addons", "--allow-child-process", "--allow-inspector", "--allow-wasi",
+    "--allow-worker",
+};
+
+struct Options {
+    bool permission{false};
+    bool audit{false};  // --permission-audit
+    std::vector<std::string> allowFsRead{};
+    std::vector<std::string> allowFsWrite{};
+    bool allowAddons{false};
+    bool allowChildProcess{false};
+    bool allowWorker{false};
+    bool allowInspector{false};
+    bool allowWasi{false};
+    bool allowNet{false};
+    bool allowFfi{false};
+
+    // Every permission-model token that was seen, in order and in its original
+    // spelling. node's child_process copies exactly these into the child's
+    // NODE_OPTIONS so a subprocess cannot escape the sandbox
+    // (lib/child_process.js copyPermissionModelFlagsToEnv).
+    std::vector<std::string> presentFlags{};
+
+    [[nodiscard]] bool any_allow_flag() const noexcept {
+        return !allowFsRead.empty() || !allowFsWrite.empty() || allowAddons ||
+               allowChildProcess || allowWorker || allowInspector || allowWasi || allowNet ||
+               allowFfi;
+    }
+    [[nodiscard]] bool enabled() const noexcept { return permission || audit; }
+};
+
+// True for the two flags whose value may arrive as a SEPARATE token
+// (`--allow-fs-read *`, which node's corpus uses as often as the `=` form).
+constexpr bool allow_flag_takes_value(std::string_view flag) noexcept {
+    return flag == "--allow-fs-read" || flag == "--allow-fs-write";
+}
+
+// Parse a token stream (NODE_OPTIONS first, then the command line — node's
+// precedence, and the reason a child's own `--permission` wins over an inherited
+// one). Unknown tokens are ignored; this is not a general option parser.
+inline Options parse_options(std::span<const std::string> tokens) {
+    Options o{};
+    for (std::size_t i{0}; i < tokens.size(); ++i) {
+        const std::string& t{tokens[i]};
+        std::string_view name{t};
+        std::optional<std::string> inlineValue{};
+        if (const auto eq{t.find('=')}; eq != std::string::npos) {
+            name = std::string_view{t}.substr(0, eq);
+            inlineValue = t.substr(eq + 1);
+        }
+
+        if (name == "--permission") {
+            o.permission = true;
+            o.presentFlags.push_back(t);
+            continue;
+        }
+        if (name == "--permission-audit") {
+            o.audit = true;
+            o.presentFlags.push_back(t);
+            continue;
+        }
+
+        bool known{false};
+        for (const std::string_view f : kAllowFlags) {
+            if (name == f) { known = true; break; }
+        }
+        if (!known) continue;
+
+        if (allow_flag_takes_value(name)) {
+            std::string value{};
+            if (inlineValue) {
+                value = *inlineValue;
+                o.presentFlags.push_back(t);
+            } else if (i + 1 < tokens.size()) {
+                value = tokens[i + 1];
+                o.presentFlags.push_back(std::string{name} + "=" + value);
+                ++i;
+            } else {
+                continue;  // a dangling flag grants nothing
+            }
+            if (name == "--allow-fs-read") o.allowFsRead.push_back(std::move(value));
+            else o.allowFsWrite.push_back(std::move(value));
+            continue;
+        }
+
+        // Boolean flags. node's option parser accepts `--allow-worker=false`;
+        // anything else (including the bare flag) is true.
+        const bool value{!inlineValue || (*inlineValue != "false" && *inlineValue != "0")};
+        if (name == "--allow-addons") o.allowAddons = value;
+        else if (name == "--allow-child-process") o.allowChildProcess = value;
+        else if (name == "--allow-worker") o.allowWorker = value;
+        else if (name == "--allow-inspector") o.allowInspector = value;
+        else if (name == "--allow-wasi") o.allowWasi = value;
+        else if (name == "--allow-net") o.allowNet = value;
+        else if (name == "--allow-ffi") o.allowFfi = value;
+        if (value) o.presentFlags.push_back(t);
+    }
+    return o;
+}
+
+// node src/env.cc:920-985, verbatim in structure. `entry` is node's `argv_[1]`
+// and `preloads` its `--require` list: both get an IMPLICIT fs.read grant, which
+// is what lets a permission-gated process load its own entry point at all.
+inline void apply_options(Model& model,
+                          const Options& o,
+                          bool hasEvalString,
+                          std::string_view entry,
+                          std::span<const std::string> preloads) {
+    if (!o.enabled()) return;
+
+    model.enable();
+    if (o.audit) model.enable_warning_only();
+
+    // "The process shouldn't be able to neither spawn/worker nor use addons or
+    // enable inspector unless explicitly allowed by the user."
+    const std::vector<std::string> star{"*"};
+    if (!o.allowAddons) model.apply(Scope::Addon, star);
+    if (!o.allowInspector) model.apply(Scope::Inspector, star);
+    if (!o.allowChildProcess) model.apply(Scope::ChildProcess, star);
+    if (!o.allowFfi) model.apply(Scope::Ffi, star);
+    if (!o.allowWorker) model.apply(Scope::WorkerThreads, star);
+    if (!o.allowWasi) model.apply(Scope::Wasi, star);
+
+    std::vector<std::string> reads{o.allowFsRead};
+    if (!hasEvalString) {
+        for (const std::string& mod : preloads) reads.push_back(mod);
+        // node pushes argv_[1] unconditionally (minus the `inspect`
+        // subcommand). An EMPTY entry is skipped here: PathResolve("") yields
+        // the cwd, and since the cwd is a directory WildcardIfDir would turn
+        // that into a `<cwd>/*` grant — a silent whole-tree read grant for an
+        // invocation that asked for nothing.
+        if (!entry.empty() && entry != "inspect") reads.emplace_back(entry);
+    }
+
+    if (!reads.empty()) model.apply(Scope::FileSystemRead, reads);
+    if (!o.allowFsWrite.empty()) model.apply(Scope::FileSystemWrite, o.allowFsWrite);
+    if (o.allowNet) model.apply(Scope::Net, star);
+}
+
 }  // namespace mbun::permission

@@ -293,7 +293,27 @@ inline constexpr std::string_view kNodeInternalBindingJS = R"JS(
   // reports every option as unset, which is the truthful answer for a runtime
   // that accepted no such flag.
   factories["options"] = () => ({
-    getCLIOptionsValues: () => ({ __proto__: null }),
+    // The Permission Model's flags ARE carried, because node's own
+    // lib/internal/process/permission.js decides isEnabled() from
+    // getOptionValue('--permission'); an empty dictionary would report the
+    // sandbox as off to every node lib/** module that asks.
+    getCLIOptionsValues: () => {
+      const PN = G.__mbunPermissionNative;
+      const out = { __proto__: null };
+      if (!PN) return out;
+      out["--permission"] = !!PN.enabled && !PN.audit;
+      out["--permission-audit"] = !!PN.audit;
+      out["--allow-fs-read"] = PN.allowFsRead || [];
+      out["--allow-fs-write"] = PN.allowFsWrite || [];
+      out["--allow-addons"] = !!PN.allowAddons;
+      out["--allow-child-process"] = !!PN.allowChildProcess;
+      out["--allow-worker"] = !!PN.allowWorker;
+      out["--allow-inspector"] = !!PN.allowInspector;
+      out["--allow-wasi"] = !!PN.allowWasi;
+      out["--allow-net"] = !!PN.allowNet;
+      out["--allow-ffi"] = !!PN.allowFfi;
+      return out;
+    },
     getCLIOptionsInfo: () => ({ options: new Map(), aliases: new Map() }),
     getOptionsAsFlags: () => [],
     getEmbedderOptions: () => ({
@@ -717,9 +737,15 @@ inline constexpr std::string_view kNodeInternalBindingJS = R"JS(
   };
 
   // ------------------------------------------------------------ permission ----
-  // This runtime has no permission model; node reports the same shape when
-  // started without --permission.
-  factories["permission"] = () => ({ has: () => true });
+  // node src/permission/permission.cc. Backed by the REAL model, so a node
+  // lib/** module that reaches for internalBinding('permission').has gets the
+  // same answers process.permission.has gives. Returning `true` unconditionally
+  // (as this did) told every caller the sandbox was open.
+  factories["permission"] = () => {
+    const PN = G.__mbunPermissionNative;
+    if (!PN) return { has: () => true, drop() {} };
+    return { has: (scope, ref) => PN.has(scope, ref), drop: (scope, ref) => PN.drop(scope, ref) };
+  };
 
   // ------------------------------------------------------------ async_wrap ----
   // node src/async_wrap.cc + src/env.h (Environment::AsyncHooks). The field

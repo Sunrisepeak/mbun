@@ -375,6 +375,160 @@ void test_enable_state() {
     check(m.warning_only(), "audit mode sticks");
 }
 
+// ── the CLI surface ─────────────────────────────────────────────────────────
+Options opts(std::initializer_list<std::string> tokens) {
+    std::vector<std::string> v{tokens};
+    return parse_options(v);
+}
+
+void test_parse_options() {
+    // Nothing at all: the model must stay off. This is the case that matters
+    // most — every ordinary `mbun script.js` run takes it.
+    {
+        const Options o{opts({"--version", "script.js"})};
+        check(!o.enabled(), "no flags -> model off");
+        check(!o.any_allow_flag(), "no flags -> no allow flags");
+        check(o.presentFlags.empty(), "no flags -> nothing to propagate");
+    }
+    // The `=` form.
+    {
+        const Options o{opts({"--permission", "--allow-fs-read=*", "--allow-fs-write=/tmp"})};
+        check(o.permission && o.enabled(), "--permission");
+        check(!o.audit, "not audit");
+        check(o.allowFsRead.size() == 1 && o.allowFsRead[0] == "*", "read=* parsed");
+        check(o.allowFsWrite.size() == 1 && o.allowFsWrite[0] == "/tmp", "write=/tmp parsed");
+    }
+    // The SPACE form, which node's own corpus uses (test-permission-fs-wildcard
+    // passes `--allow-fs-read /tmp/*`); mis-parsing it would treat the path as
+    // the script to run.
+    {
+        const Options o{opts({"--permission", "--allow-fs-read", "*", "--allow-fs-write",
+                              "../fixtures/x.md", "-e", "0"})};
+        check(o.allowFsRead.size() == 1 && o.allowFsRead[0] == "*", "space-form read");
+        check(o.allowFsWrite.size() == 1 && o.allowFsWrite[0] == "../fixtures/x.md",
+              "space-form write");
+        // Propagation normalises to the `=` form so a child sees one token.
+        check(std::ranges::find(o.presentFlags, std::string{"--allow-fs-read=*"}) != o.presentFlags.end(),
+              "space form propagates as =");
+    }
+    // Repeated flags accumulate (test-permission-fs-repeat-path / -symlink).
+    {
+        const Options o{opts({"--permission", "--allow-fs-read=/a", "--allow-fs-read=/b"})};
+        check(o.allowFsRead.size() == 2, "repeated read flags accumulate");
+    }
+    // Booleans.
+    {
+        const Options o{opts({"--permission-audit", "--allow-child-process", "--allow-worker",
+                              "--allow-net", "--allow-addons", "--allow-wasi",
+                              "--allow-inspector", "--allow-ffi"})};
+        check(o.audit && o.enabled(), "--permission-audit enables");
+        check(!o.permission, "audit is not --permission");
+        check(o.allowChildProcess, "allow child");
+        check(o.allowWorker, "allow worker");
+        check(o.allowNet, "allow net");
+        check(o.allowAddons, "allow addons");
+        check(o.allowWasi, "allow wasi");
+        check(o.allowInspector, "allow inspector");
+        check(o.allowFfi, "allow ffi");
+        check(o.any_allow_flag(), "any_allow_flag");
+    }
+    // A dangling value-taking flag must not read past the end.
+    {
+        const Options o{opts({"--permission", "--allow-fs-read"})};
+        check(o.allowFsRead.empty(), "dangling flag grants nothing");
+    }
+    // Allow flags WITHOUT --permission are still recorded: node throws
+    // ERR_MISSING_OPTION for exactly this combination, so the caller has to be
+    // able to see it.
+    {
+        const Options o{opts({"--allow-fs-read=*", "script.js"})};
+        check(!o.enabled(), "allow flag alone does not enable");
+        check(o.any_allow_flag(), "…but is visible to the ERR_MISSING_OPTION check");
+    }
+}
+
+// node env.cc's bootstrap order, including the implicit entry-point grant.
+void test_apply_options() {
+    // --permission with nothing else: every scope denied, except that the entry
+    // point itself stays readable.
+    {
+        Model m{};
+        init_model(m, "/work");
+        const Options o{opts({"--permission"})};
+        apply_options(m, o, false, "script.js", {});
+        check(m.enabled(), "model enabled");
+        check(!m.is_granted(Scope::ChildProcess), "bare --permission denies child");
+        check(!m.is_granted(Scope::WorkerThreads), "…worker");
+        check(!m.is_granted(Scope::Wasi), "…wasi");
+        check(!m.is_granted(Scope::Inspector), "…inspector");
+        check(!m.is_granted(Scope::Addon), "…addons");
+        check(!m.is_granted(Scope::Ffi), "…ffi");
+        check(!m.is_granted(Scope::Net), "…net");
+        check(m.is_granted(Scope::FileSystemRead, "/work/script.js"),
+              "entry point is implicitly readable");
+        check(!m.is_granted(Scope::FileSystemRead, "/work/other.js"), "…but nothing else is");
+        check(!m.is_granted(Scope::FileSystemWrite, "/work/script.js"), "…and not writable");
+    }
+    // --allow-* flips exactly its own scope.
+    {
+        Model m{};
+        init_model(m, "/work");
+        const Options o{opts({"--permission", "--allow-child-process"})};
+        apply_options(m, o, false, "script.js", {});
+        check(m.is_granted(Scope::ChildProcess), "--allow-child-process grants child");
+        check(!m.is_granted(Scope::WorkerThreads), "…and nothing else");
+    }
+    // -e: no entry point exists, so nothing is implicitly readable
+    // (test-permission-child-process-inherit-flags reads has('fs.read') === false
+    // in a child started with `-e`).
+    {
+        Model m{};
+        init_model(m, "/work");
+        const Options o{opts({"--permission", "-e", "0"})};
+        apply_options(m, o, /*hasEvalString=*/true, "", {});
+        check(!m.is_granted(Scope::FileSystemRead), "-e grants no read");
+        check(!m.is_granted(Scope::FileSystemRead, "/work/script.js"), "-e grants no path");
+    }
+    // Preloaded modules (-r) get the same implicit read grant as the entry
+    // (test-permission-fs-read-entrypoint spawns `-r <loader> --permission <file>`).
+    {
+        Model m{};
+        init_model(m, "/work");
+        const std::vector<std::string> preloads{"/work/loader.js"};
+        const Options o{opts({"--permission"})};
+        apply_options(m, o, false, "hello.js", preloads);
+        check(m.is_granted(Scope::FileSystemRead, "/work/loader.js"), "preload is readable");
+        check(m.is_granted(Scope::FileSystemRead, "/work/hello.js"), "entry is readable");
+    }
+    // The `inspect` subcommand is not an entry point.
+    {
+        Model m{};
+        init_model(m, "/work");
+        apply_options(m, opts({"--permission"}), false, "inspect", {});
+        check(!m.is_granted(Scope::FileSystemRead, "/work/inspect"), "'inspect' is not granted");
+    }
+    // Disabled model: apply_options must be a complete no-op, so an ordinary run
+    // can never be gated by accident.
+    {
+        Model m{};
+        init_model(m, "/work");
+        apply_options(m, opts({"--allow-fs-read=/x", "script.js"}), false, "script.js", {});
+        check(!m.enabled(), "no --permission -> model stays off");
+        check(!m.is_granted(Scope::FileSystemRead, "/x"), "…and nothing was applied");
+    }
+    // NODE_OPTIONS first, command line second: the child's own --permission
+    // decides (test-permission-child-process-inherit-flags case 2/3).
+    {
+        Model m{};
+        init_model(m, "/work");
+        const std::vector<std::string> tokens{"--permission", "--allow-fs-read=*", "-e", "0"};
+        const Options inherited{parse_options(tokens)};
+        check(inherited.allowFsRead.size() == 1, "inherited read flag parsed");
+        apply_options(m, inherited, true, "", {});
+        check(m.is_granted(Scope::FileSystemRead), "inherited read=* applies");
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -391,6 +545,8 @@ int main() {
     test_repeat_path();
     test_relative_grant();
     test_enable_state();
+    test_parse_options();
+    test_apply_options();
 
     std::println("mbun.permission: {} checks, {} failures", checks, failures);
     return failures == 0 ? 0 : 1;

@@ -1,9 +1,64 @@
+// ── Permission Model: propagate the sandbox to a child process ───────────────
+// node's lib/child_process.js copyPermissionModelFlagsToEnv splices the parent's
+// permission flags into the CHILD's NODE_OPTIONS, so `--allow-child-process`
+// grants the ability to spawn — not the ability to spawn an UNGATED process.
+// Without this, one allowed spawn is a complete escape from the sandbox.
+//
+// It is done here, at the fork boundary, rather than in the JS child_process
+// shim: every spawn path in this runtime (node:child_process, Bun.spawn, the pty
+// and "ex" variants) funnels through these helpers, and a JS-level splice would
+// miss the ones that do not go through node:child_process at all.
+//
+// node's exceptions are kept: the child's OWN --permission (in argv, or already
+// in the NODE_OPTIONS it was handed) wins and nothing is added.
+extern "C" char** environ;
+
+void permission_inject_child_env(std::vector<std::string>& env, bool& haveEnv,
+                                 const std::vector<std::string>& argv) {
+    if (!gPermission.enabled()) return;
+    const auto& flags{gPermissionOptions.presentFlags};
+    if (flags.empty()) return;
+    for (const std::string& a : argv) {
+        if (a == "--permission" || a == "--permission-audit") return;
+    }
+
+    // A child with no explicit env inherits ours; to add one variable we have to
+    // materialise the inherited set rather than mutate the PARENT's environ
+    // (the corpus asserts the parent's own process.env.NODE_OPTIONS stays unset).
+    if (!haveEnv) {
+        for (char** e = environ; e != nullptr && *e != nullptr; ++e) env.emplace_back(*e);
+        haveEnv = true;
+    }
+
+    std::string extra{};
+    for (const std::string& f : flags) {
+        if (!extra.empty()) extra += ' ';
+        extra += f;
+    }
+
+    for (std::string& entry : env) {
+        if (!entry.starts_with("NODE_OPTIONS=")) continue;
+        // Already carries a permission flag: node leaves it alone.
+        if (entry.find("--permission") != std::string::npos) return;
+        const bool empty{entry.size() == std::string_view{"NODE_OPTIONS="}.size()};
+        entry += (empty ? "" : " ") + extra;
+        return;
+    }
+    env.push_back("NODE_OPTIONS=" + extra);
+}
+
 JSValueRef cp_spawn_sync_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                             const JSValueRef args[], JSValueRef* exc) {
 #if defined(_WIN32)
     return fs_throw(ctx, exc, "spawnSync: not supported on Windows yet");
 #else
     std::string file{fs_arg(ctx, argc, args, 0)};
+    // Permission Model: node's ChildProcess scope is enforced in
+    // src/spawn_sync.cc / process_wrap.cc, i.e. at the point of the fork — and
+    // so is it here. `resource` is the executable, which is what
+    // test-permission-child-process-cli asserts on.
+    if (permission_deny_scope(ctx, exc, mbun::permission::Scope::ChildProcess, file))
+        return JSValueMakeUndefined(ctx);
     std::vector<std::string> argvStr{file};
     if (argc > 1 && JSValueIsArray(ctx, args[1])) {
         JSObjectRef arr{JSValueToObject(ctx, args[1], nullptr)};
@@ -91,6 +146,7 @@ JSValueRef cp_spawn_sync_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
     const bool pipeErr{stdioMode[2] == Stdio::Pipe};
 
     int outPipe[2]{-1, -1}, errPipe[2]{-1, -1}, inPipe[2]{-1, -1}, statPipe[2];
+    permission_inject_child_env(envStr, haveEnv, argvStr);
     if ((pipeIn && pipe(inPipe) != 0) || (pipeOut && pipe(outPipe) != 0) ||
         (pipeErr && pipe(errPipe) != 0) || pipe(statPipe) != 0) {
         return fs_throw(ctx, exc, "spawnSync: pipe() failed");
@@ -370,8 +426,15 @@ JSValueRef proc_spawn_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t
     return fs_throw(ctx, exc, "proc.spawn: not supported on Windows yet");
 #else
     std::string file{fs_arg(ctx, argc, args, 0)};
+    // Permission Model: node's ChildProcess scope is enforced in
+    // src/spawn_sync.cc / process_wrap.cc, i.e. at the point of the fork — and
+    // so is it here. `resource` is the executable, which is what
+    // test-permission-child-process-cli asserts on.
+    if (permission_deny_scope(ctx, exc, mbun::permission::Scope::ChildProcess, file))
+        return JSValueMakeUndefined(ctx);
     std::vector<std::string> argvStr{parse_spawn_argv(ctx, argc, args, file)};
     SpawnOpts o{parse_spawn_opts(ctx, argc, args)};
+    permission_inject_child_env(o.env, o.haveEnv, argvStr);
     int inPipe[2], outPipe[2], errPipe[2];
     if (pipe(inPipe) != 0 || pipe(outPipe) != 0 || pipe(errPipe) != 0) {
         return fs_throw(ctx, exc, "proc.spawn: pipe() failed");
@@ -722,8 +785,15 @@ JSValueRef proc_spawn_sync_b64_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, st
     return fs_throw(ctx, exc, "proc.spawnSyncB64: not supported on Windows yet");
 #else
     std::string file{fs_arg(ctx, argc, args, 0)};
+    // Permission Model: node's ChildProcess scope is enforced in
+    // src/spawn_sync.cc / process_wrap.cc, i.e. at the point of the fork — and
+    // so is it here. `resource` is the executable, which is what
+    // test-permission-child-process-cli asserts on.
+    if (permission_deny_scope(ctx, exc, mbun::permission::Scope::ChildProcess, file))
+        return JSValueMakeUndefined(ctx);
     std::vector<std::string> argvStr{parse_spawn_argv(ctx, argc, args, file)};
     SpawnOpts o{parse_spawn_opts(ctx, argc, args)};
+    permission_inject_child_env(o.env, o.haveEnv, argvStr);
     std::string input;
     // No budget / no deadline unless the caller asks for one. `Infinity` on the
     // JS side is passed through as absent (bun treats it as "unlimited").

@@ -59,6 +59,7 @@ export import :web_events;
 export import :valkey_client;
 export import :s3;
 export import :html_rewriter;
+export import :node_permission;
 export import :node_internal_binding;
 export import :fn_tostring_printer;
 
@@ -144,6 +145,12 @@ export inline const std::string kNodeBuiltinsJS =
         // node:repl — last of the node modules: REPLServer extends readline's
         // Interface and evaluates through node:vm, so both must be installed.
         .append(detail::kNodeReplJS)
+        // process.permission + node's initializePermission. LAST of the node
+        // modules that matter here: it wraps fs / fs.promises / v8 / process.report
+        // entry points that every partition above must have installed first, and
+        // it must run before any user code so an --allow-* flag with no
+        // --permission still fails at startup (ERR_MISSING_OPTION).
+        .append(detail::kNodePermissionJS)
         // internalBinding(): the accessor node's lib/internal/** modules are
         // evaluated with. Handed to those modules as a wrapper parameter by the
         // loader, never installed as an ambient global.
