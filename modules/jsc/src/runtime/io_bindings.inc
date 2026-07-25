@@ -551,6 +551,23 @@ int fs_errno_for(std::string_view code) {
     if (code == "ELOOP") return -40;
     if (code == "ENOTEMPTY") return -39;
     if (code == "EINVAL") return -22;
+    // libuv on Linux defines UV_E* as -E*, so the remaining codes fd_errno_code
+    // can produce map straight through. Without them a real errno (EXDEV from a
+    // cross-device rename, EMLINK from a link(2) at the link limit, EROFS from a
+    // chmod on a read-only mount) reached JS with `errno === 0`, which node never
+    // reports — uvException always carries the negative uv code.
+    if (code == "ENXIO") return -6;
+    if (code == "EAGAIN") return -11;
+    if (code == "EBUSY") return -16;
+    if (code == "EXDEV") return -18;
+    if (code == "ENODEV") return -19;
+    if (code == "ENFILE") return -23;
+    if (code == "EMFILE") return -24;
+    if (code == "EFBIG") return -27;
+    if (code == "ENOSPC") return -28;
+    if (code == "EROFS") return -30;
+    if (code == "EMLINK") return -31;
+    if (code == "EOVERFLOW") return -75;
     return 0;
 }
 // errno → node's "EINVAL" / "invalid argument" pair. Defined further down this TU
@@ -598,8 +615,20 @@ JSValueRef fs_make_error(JSContextRef ctx, const std::string& msg) {
         if (!syscall.empty() && syscall.find(' ') == std::string::npos)
             put("syscall", make_string(ctx, syscall));
         auto endq{msg.rfind('\'')};
-        if (endq != std::string::npos && endq > quote + 2)
-            put("path", make_string(ctx, msg.substr(quote + 2, endq - (quote + 2))));
+        if (endq != std::string::npos && endq > quote + 2) {
+            const std::string tail{msg.substr(quote + 2, endq - (quote + 2))};
+            // Two-path syscalls (link/rename/symlink/copyfile) render as
+            // "…, <syscall> 'src' -> 'dest'". node's uvException splits that into
+            // .path and .dest; treating the whole tail as one path produced the
+            // mangled `"src' -> 'dest"` and left .dest undefined.
+            const auto arrow{tail.find("' -> '")};
+            if (arrow != std::string::npos) {
+                put("path", make_string(ctx, tail.substr(0, arrow)));
+                put("dest", make_string(ctx, tail.substr(arrow + 6)));
+            } else {
+                put("path", make_string(ctx, tail));
+            }
+        }
     } else if (comma != std::string::npos && quote == std::string::npos) {
         // A pathless message ("EBADF: bad file descriptor, fstat") still names a
         // syscall — node's uvException fills .syscall whether or not there is a
@@ -652,25 +681,63 @@ JSValueRef fsn_readFile_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size
     if (auto c{read_file(path)}) return make_string(ctx, *c);
     return fs_throw(ctx, exc, "ENOENT: no such file or directory, open '" + path + "'");
 }
+// Whole-file write behind fs.writeFileSync / fs.appendFileSync. It used to be a
+// std::ofstream whose write() result was never inspected, so a SHORT write was
+// silently reported as success: with RLIMIT_FSIZE set, writeFileSync wrote as
+// many bytes as the limit allowed and returned normally, where node throws
+// "EFBIG: file too large, write" (test-fs-write-sigxfsz). open/write also give
+// the real errno for the open failure, instead of a blanket EACCES.
+JSValueRef fs_write_whole(JSContextRef ctx, JSValueRef* exc, const std::string& path,
+                          const std::string& data, bool append) {
+#if defined(_WIN32)
+    std::ofstream f{std::filesystem::path{path},
+                    std::ios::binary | (append ? std::ios::app : std::ios::trunc)};
+    if (!f) return fs_throw(ctx, exc, "EACCES: permission denied, open '" + path + "'");
+    f.write(data.data(), static_cast<std::streamsize>(data.size()));
+    f.flush();
+    if (!f) return fs_throw(ctx, exc, "EIO: i/o error, write");
+    return JSValueMakeUndefined(ctx);
+#else
+    const int flags{O_WRONLY | O_CREAT | (append ? O_APPEND : O_TRUNC)};
+    const int fd{::open(path.c_str(), flags, 0666)};
+    if (fd < 0) {
+        const int e{errno};
+        const std::string code{fd_errno_code(e)};
+        return fs_throw(ctx, exc, (code.empty() ? std::string{"EACCES"} : code) + ": "
+                                      + fd_errno_message(e) + ", open '" + path + "'");
+    }
+    std::size_t off{0};
+    while (off < data.size()) {
+        const ssize_t n{::write(fd, data.data() + off, data.size() - off)};
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            const int e{errno};
+            ::close(fd);
+            const std::string code{fd_errno_code(e)};
+            // node's write error names no path (uv_fs_write is fd-level).
+            return fs_throw(ctx, exc, (code.empty() ? std::string{"EIO"} : code) + ": "
+                                          + fd_errno_message(e) + ", write");
+        }
+        if (n == 0) break;
+        off += static_cast<std::size_t>(n);
+    }
+    ::close(fd);
+    return JSValueMakeUndefined(ctx);
+#endif
+}
 JSValueRef fsn_writeFile_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                             const JSValueRef args[], JSValueRef* exc) {
     std::string path{fs_arg(ctx, argc, args, 0)};
     if (permission_deny_fs(ctx, exc, path, true)) return JSValueMakeUndefined(ctx);
     std::string data{fs_arg(ctx, argc, args, 1)};
-    std::ofstream f{std::filesystem::path{path}, std::ios::binary | std::ios::trunc};
-    if (!f) return fs_throw(ctx, exc, "EACCES: cannot write '" + path + "'");
-    f.write(data.data(), static_cast<std::streamsize>(data.size()));
-    return JSValueMakeUndefined(ctx);
+    return fs_write_whole(ctx, exc, path, data, /*append=*/false);
 }
 JSValueRef fsn_appendFile_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                              const JSValueRef args[], JSValueRef* exc) {
     std::string path{fs_arg(ctx, argc, args, 0)};
     if (permission_deny_fs(ctx, exc, path, true)) return JSValueMakeUndefined(ctx);
     std::string data{fs_arg(ctx, argc, args, 1)};
-    std::ofstream f{std::filesystem::path{path}, std::ios::binary | std::ios::app};
-    if (!f) return fs_throw(ctx, exc, "EACCES: cannot append '" + path + "'");
-    f.write(data.data(), static_cast<std::streamsize>(data.size()));
-    return JSValueMakeUndefined(ctx);
+    return fs_write_whole(ctx, exc, path, data, /*append=*/true);
 }
 JSValueRef fsn_exists_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                          const JSValueRef args[], JSValueRef* exc) {
@@ -773,7 +840,12 @@ JSValueRef fsn_rm_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t arg
     } else {
         std::filesystem::remove(std::filesystem::path{path}, ec);
     }
-    if (ec && !force) {
+    // node's { force: true } suppresses ONLY "the path does not exist" — every
+    // other failure still throws (lib/internal/fs/rimraf.js rethrows anything
+    // that is not ENOENT). Swallowing them all made rmSync(<file in a read-only
+    // directory>, { force: true }) a silent no-op where node reports EACCES
+    // (test-fs-rm, nodejs/node#38683).
+    if (ec && !(force && ec.value() == ENOENT)) {
         // node-shaped errno so `err.code` is usable (a bare message left
         // fs.rm/rmdir callers with `code: undefined`).
         switch (ec.value()) {
@@ -1038,6 +1110,12 @@ JSValueRef fsn_stat_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t a
         // on `{ code: 'ELOOP' }` exactly.
         if (errno == ELOOP)
             return fs_throw(ctx, exc, "ELOOP: too many symbolic links encountered, stat '" + path + "'");
+        // Everything else keeps its own errno too. Flattening the tail onto
+        // ENOENT told fs.rm that a file it could not lstat for lack of directory
+        // search permission (EACCES) simply did not exist, so { force: true }
+        // silently skipped it (test-fs-rm).
+        if (const std::string code{fd_errno_code(errno)}; !code.empty() && errno != ENOENT)
+            return fs_throw(ctx, exc, code + ": " + fd_errno_message(errno) + ", stat '" + path + "'");
         return fs_throw(ctx, exc, "ENOENT: no such file or directory, stat '" + path + "'");
     }
     fs_fields_from_stat(st, f);
@@ -1065,13 +1143,24 @@ JSValueRef fsn_fstat_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t 
     FsStatFields f{};
     auto& tbl{fd_table()};
     auto it{tbl.find(vfd)};
+#if defined(_WIN32)
     if (it == tbl.end() || !it->second.is_open())
         return fs_throw(ctx, exc, "EBADF: bad file descriptor, fstat");
-#if defined(_WIN32)
     (void)f;
     return fs_throw(ctx, exc, "EBADF: bad file descriptor, fstat");
 #else
-    const int fd{it->second.native_fd()};
+    // An fd mbun did not hand out is not automatically bad: stdio (0/1/2) and
+    // any inherited descriptor are real and node fstats them happily. Only a
+    // descriptor that is open at neither level is EBADF. `fs.fstat(0, …)` used
+    // to throw here (test-fs-stat).
+    int fd{-1};
+    if (it != tbl.end() && it->second.is_open()) {
+        fd = it->second.native_fd();
+    } else if (vfd >= 0 && ::fcntl(vfd, F_GETFD) != -1) {
+        fd = vfd;
+    } else {
+        return fs_throw(ctx, exc, "EBADF: bad file descriptor, fstat");
+    }
     struct stat st{};
     if (::fstat(fd, &st) != 0)
         return fs_throw(ctx, exc, "EBADF: bad file descriptor, fstat");
@@ -1091,9 +1180,18 @@ JSValueRef fsn_readlink_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size
                            const JSValueRef args[], JSValueRef* exc) {
     std::string path{fs_arg(ctx, argc, args, 0)};
     if (permission_deny_fs(ctx, exc, path, false)) return JSValueMakeUndefined(ctx);
+    // Report the syscall's OWN errno. read_symlink's std::error_code carries it,
+    // but flattening every failure onto EINVAL made readlink of a MISSING path
+    // report "EINVAL: invalid argument" where node reports ENOENT — the last
+    // assertion blocking test-fs-error-messages.
     std::error_code ec;
     auto target{std::filesystem::read_symlink(std::filesystem::path{path}, ec)};
-    if (ec) return fs_throw(ctx, exc, "EINVAL: invalid argument, readlink '" + path + "'");
+    if (ec) {
+        const int e{ec.value()};
+        const std::string code{fd_errno_code(e)};
+        return fs_throw(ctx, exc, (code.empty() ? std::string{"EINVAL"} : code) + ": "
+                                      + fd_errno_message(e) + ", readlink '" + path + "'");
+    }
     return make_string(ctx, target.string());
 }
 // node process.umask([mask]): read (no arg) or set the process file-mode mask.
@@ -1166,9 +1264,61 @@ JSValueRef fsn_unlink_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t
                          const JSValueRef args[], JSValueRef* exc) {
     std::string path{fs_arg(ctx, argc, args, 0)};
     if (permission_deny_fs(ctx, exc, path, true)) return JSValueMakeUndefined(ctx);
+    // std::filesystem::remove reports "nothing to remove" by returning FALSE with
+    // an EMPTY error_code, so unlinkSync(<nonexistent>) silently succeeded — node
+    // throws ENOENT. Go straight to unlink(2): it also keeps EISDIR/EPERM/EACCES
+    // distinct, which `remove` (which happily rmdir's a directory) does not.
+#if defined(_WIN32)
     std::error_code ec;
-    std::filesystem::remove(std::filesystem::path{path}, ec);
-    if (ec) return fs_throw(ctx, exc, "unlink '" + path + "': " + ec.message());
+    if (!std::filesystem::remove(std::filesystem::path{path}, ec) || ec) {
+        const int e{ec ? ec.value() : ENOENT};
+        const std::string code{fd_errno_code(e)};
+        return fs_throw(ctx, exc, (code.empty() ? std::string{"EPERM"} : code) + ": "
+                                      + fd_errno_message(e) + ", unlink '" + path + "'");
+    }
+#else
+    if (::unlink(path.c_str()) != 0) {
+        const int e{errno};
+        const std::string code{fd_errno_code(e)};
+        return fs_throw(ctx, exc, (code.empty() ? std::string{"EPERM"} : code) + ": "
+                                      + fd_errno_message(e) + ", unlink '" + path + "'");
+    }
+#endif
+    return JSValueMakeUndefined(ctx);
+}
+// node fs.linkSync(existingPath, newPath): a HARD link, i.e. link(2). This was
+// implemented as copy_file, which is not the same thing at all — the copy has
+// its own inode, so nlink never rises, writes through one path are invisible
+// through the other, and every error carried syscall 'copyfile' with the two
+// paths mangled into one .path string.
+JSValueRef fsn_link_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                       const JSValueRef args[], JSValueRef* exc) {
+    const std::string oldPath{fs_arg(ctx, argc, args, 0)};
+    const std::string newPath{fs_arg(ctx, argc, args, 1)};
+    // node Link (node_file.cc): read(src), write(src), write(dest) — the source
+    // is gated for WRITE too because a new hard link to it is a second writable
+    // handle on the same inode.
+    if (permission_deny_fs(ctx, exc, oldPath, false)) return JSValueMakeUndefined(ctx);
+    if (permission_deny_fs(ctx, exc, oldPath, true)) return JSValueMakeUndefined(ctx);
+    if (permission_deny_fs(ctx, exc, newPath, true)) return JSValueMakeUndefined(ctx);
+#if defined(_WIN32)
+    std::error_code ec;
+    std::filesystem::create_hard_link(std::filesystem::path{oldPath},
+                                      std::filesystem::path{newPath}, ec);
+    if (ec) {
+        const int e{ec.value()};
+        const std::string code{fd_errno_code(e)};
+        return fs_throw(ctx, exc, (code.empty() ? std::string{"EPERM"} : code) + ": "
+                                      + fd_errno_message(e) + ", link '" + oldPath + "' -> '" + newPath + "'");
+    }
+#else
+    if (::link(oldPath.c_str(), newPath.c_str()) != 0) {
+        const int e{errno};
+        const std::string code{fd_errno_code(e)};
+        return fs_throw(ctx, exc, (code.empty() ? std::string{"EPERM"} : code) + ": "
+                                      + fd_errno_message(e) + ", link '" + oldPath + "' -> '" + newPath + "'");
+    }
+#endif
     return JSValueMakeUndefined(ctx);
 }
 // Real chmod (node:fs chmodSync backing) — needed by Bun.which and any test
@@ -1181,11 +1331,29 @@ JSValueRef fsn_chmod_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t 
     if (permission_deny_fs(ctx, exc, path, true)) return JSValueMakeUndefined(ctx);
     const auto modeNum{(argc > 1) ? JSValueToNumber(ctx, args[1], nullptr) : 0.0};
     const auto bits{static_cast<unsigned>(modeNum) & 07777u};
+    // The message must be node's "<CODE>: <uv text>, chmod '<path>'": the old
+    // "chmod '<path>': No such file or directory" form parsed as neither a code
+    // nor a syscall, so chmodSync(<nonexistent>) threw an Error with no .code,
+    // .errno, .syscall or .path at all.
+#if defined(_WIN32)
     std::error_code ec;
     std::filesystem::permissions(std::filesystem::path{path},
                                  static_cast<std::filesystem::perms>(bits),
                                  std::filesystem::perm_options::replace, ec);
-    if (ec) return fs_throw(ctx, exc, "chmod '" + path + "': " + ec.message());
+    if (ec) {
+        const int e{ec.value()};
+        const std::string code{fd_errno_code(e)};
+        return fs_throw(ctx, exc, (code.empty() ? std::string{"EPERM"} : code) + ": "
+                                      + fd_errno_message(e) + ", chmod '" + path + "'");
+    }
+#else
+    if (::chmod(path.c_str(), static_cast<mode_t>(bits)) != 0) {
+        const int e{errno};
+        const std::string code{fd_errno_code(e)};
+        return fs_throw(ctx, exc, (code.empty() ? std::string{"EPERM"} : code) + ": "
+                                      + fd_errno_message(e) + ", chmod '" + path + "'");
+    }
+#endif
     return JSValueMakeUndefined(ctx);
 }
 JSValueRef fsn_realpath_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
@@ -1244,9 +1412,18 @@ JSValueRef fsn_rename_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t
     if (permission_deny_fs(ctx, exc, oldPath, false)) return JSValueMakeUndefined(ctx);
     if (permission_deny_fs(ctx, exc, oldPath, true)) return JSValueMakeUndefined(ctx);
     if (permission_deny_fs(ctx, exc, newPath, true)) return JSValueMakeUndefined(ctx);
+    // "rename: <libstdc++ text>" named no code, no syscall and no path, so
+    // renameSync(<nonexistent>, x) threw a shapeless Error. node's form is
+    // "<CODE>: <uv text>, rename '<old>' -> '<new>'" (path + dest).
     std::error_code ec;
     std::filesystem::rename(std::filesystem::path{oldPath}, std::filesystem::path{newPath}, ec);
-    if (ec) return fs_throw(ctx, exc, "rename: " + ec.message());
+    if (ec) {
+        const int e{ec.value()};
+        const std::string code{fd_errno_code(e)};
+        return fs_throw(ctx, exc, (code.empty() ? std::string{"EPERM"} : code) + ": "
+                                      + fd_errno_message(e) + ", rename '" + oldPath + "' -> '"
+                                      + newPath + "'");
+    }
     return JSValueMakeUndefined(ctx);
 }
 JSValueRef fsn_copyFile_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
@@ -1404,8 +1581,18 @@ JSValueRef fsn_mkdtemp_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_
         if (std::filesystem::create_directory(std::filesystem::path{dir}, ec) && !ec) {
             return make_string(ctx, dir);
         }
+        // Only a name collision is worth retrying. Spinning 1000 times on a
+        // missing parent directory and then throwing the codeless "mkdtemp
+        // '<p>': failed" hid node's ENOENT (test-fs-error-messages matches the
+        // message, .path, .errno, .code and .syscall).
+        if (ec && ec.value() != EEXIST) {
+            const int e{ec.value()};
+            const std::string code{fd_errno_code(e)};
+            return fs_throw(ctx, exc, (code.empty() ? std::string{"EPERM"} : code) + ": "
+                                          + fd_errno_message(e) + ", mkdtemp '" + dir + "'");
+        }
     }
-    return fs_throw(ctx, exc, "mkdtemp '" + prefix + "': failed");
+    return fs_throw(ctx, exc, "EEXIST: file already exists, mkdtemp '" + prefix + "'");
 }
 
 // ── fd-level positioned I/O (node fs.openSync/readSync/writeSync/closeSync) ──
@@ -1453,6 +1640,11 @@ std::string fd_errno_code(int e) {
         case EBUSY: return "EBUSY";
         case ENOTEMPTY: return "ENOTEMPTY";
         case EAGAIN: return "EAGAIN";
+        // link(2)/rename(2) reach these and nothing else does; without them a
+        // cross-device rename or a hard link at the link limit fell through to
+        // the caller's hand-picked fallback code.
+        case EXDEV: return "EXDEV";
+        case EMLINK: return "EMLINK";
 #if !defined(_WIN32)
         case EOVERFLOW: return "EOVERFLOW";
         case EFBIG: return "EFBIG";
@@ -1486,6 +1678,8 @@ std::string fd_errno_message(int e) {
         case EBUSY: return "resource busy or locked";
         case ENOTEMPTY: return "directory not empty";
         case EAGAIN: return "resource temporarily unavailable";
+        case EXDEV: return "cross-device link not permitted";
+        case EMLINK: return "too many links";
 #if !defined(_WIN32)
         case EOVERFLOW: return "value too large for defined data type";
         case EFBIG: return "file too large";
@@ -1638,7 +1832,29 @@ JSC_DEFINE_HOST_FUNCTION(fdn_open_host, (JSC::JSGlobalObject* global, JSC::CallF
 
 JSC_DEFINE_HOST_FUNCTION(fdn_close_host, (JSC::JSGlobalObject* global, JSC::CallFrame* frame)) {
     if (frame->argumentCount() > 0) {
-        fd_table().erase(static_cast<int>(fd_num(global, frame->argument(0))));
+        const int fd{static_cast<int>(fd_num(global, frame->argument(0)))};
+        if (fd_table().erase(fd) == 0) {
+            // close(2) on a descriptor that is not open is EBADF, and node
+            // surfaces it (test-fs-error-messages' close block runs closeSync on
+            // common.runWithInvalidFD's ~2^30 fd and asserts the message, errno,
+            // code and syscall). Erasing a missing key silently returned
+            // undefined, so both the sync throw and the async callback's error
+            // were absent. An fd we do not own but which IS open at the OS level
+            // (an inherited descriptor, stdio) is left exactly as before — this
+            // adds the error, it does not add a close.
+#if !defined(_WIN32)
+            const bool openAtOs{::fcntl(fd, F_GETFD) != -1};
+#else
+            const bool openAtOs{false};
+#endif
+            if (!openAtOs) {
+                JSC::VM& vm{global->vm()};
+                auto scope{DECLARE_THROW_SCOPE(vm)};
+                JSValueRef err{fs_make_error(toRef(global), "EBADF: bad file descriptor, close")};
+                scope.throwException(global, toJS(global, err));
+                return JSC::encodedJSValue();
+            }
+        }
     }
     return JSC::JSValue::encode(JSC::jsUndefined());
 }
@@ -1652,12 +1868,29 @@ struct FdIoArgs {
     double pos{-1};
 };
 
-std::optional<FdIoArgs> fd_io_args(JSC::JSGlobalObject* global, JSC::CallFrame* frame) {
+// node's fd-level errors carry NO path: "EBADF: bad file descriptor, read".
+// fd_throw_errno always appends " '<path>'", and the older EBADF sites threw a
+// bare JS *string*, so `err.code` / `err.syscall` were undefined on every one of
+// them (test-fs-error-messages checks read/write/ftruncate/close/f* that way).
+JSC::EncodedJSValue fd_throw_errno_nopath(JSC::JSGlobalObject* global, int e,
+                                          const std::string& syscall) {
+    const std::string code{fd_errno_code(e)};
+    JSValueRef err{fs_make_error(toRef(global),
+                                 (code.empty() ? "E" + std::to_string(e) : code) + ": "
+                                     + fd_errno_message(e) + ", " + syscall)};
+    JSC::VM& vm{global->vm()};
+    auto scope{DECLARE_THROW_SCOPE(vm)};
+    scope.throwException(global, toJS(global, err));
+    return JSC::encodedJSValue();
+}
+
+std::optional<FdIoArgs> fd_io_args(JSC::JSGlobalObject* global, JSC::CallFrame* frame,
+                                   const char* syscall) {
     if (frame->argumentCount() < 2) return std::nullopt;
     const int fd{static_cast<int>(fd_num(global, frame->argument(0)))};
     auto it{fd_table().find(fd)};
     if (it == fd_table().end()) {
-        fd_throw(global, "EBADF: bad file descriptor " + std::to_string(fd));
+        fd_throw_errno_nopath(global, EBADF, syscall);
         return std::nullopt;
     }
     JSC::JSValue bufV{frame->argument(1)};
@@ -1692,7 +1925,7 @@ std::optional<FdIoArgs> fd_io_args(JSC::JSGlobalObject* global, JSC::CallFrame* 
 }
 
 JSC_DEFINE_HOST_FUNCTION(fdn_read_host, (JSC::JSGlobalObject* global, JSC::CallFrame* frame)) {
-    auto a{fd_io_args(global, frame)};
+    auto a{fd_io_args(global, frame, "read")};
     // On decode failure any exception is already on the VM; the C API version
     // returned 0 alongside, which callers with a pending exception never see.
     if (!a) return JSC::JSValue::encode(JSC::jsNumber(0));
@@ -1716,7 +1949,7 @@ JSC_DEFINE_HOST_FUNCTION(fdn_read_host, (JSC::JSGlobalObject* global, JSC::CallF
 }
 
 JSC_DEFINE_HOST_FUNCTION(fdn_write_host, (JSC::JSGlobalObject* global, JSC::CallFrame* frame)) {
-    auto a{fd_io_args(global, frame)};
+    auto a{fd_io_args(global, frame, "write")};
     if (!a) return JSC::JSValue::encode(JSC::jsNumber(0));
     std::span<const std::byte> in{a->base, a->len};
     if (a->pos > 9007199254740992.0) return fd_throw_errno(global, EOVERFLOW, "write", "");
@@ -1733,6 +1966,25 @@ JSC_DEFINE_HOST_FUNCTION(fdn_write_host, (JSC::JSGlobalObject* global, JSC::Call
     return JSC::JSValue::encode(JSC::jsNumber(static_cast<double>(*r)));
 }
 
+// __mbunFdNative.valid(fd) — is this descriptor open, at either level? mbun's
+// own fds live in fd_table; stdio and inherited descriptors are only real at the
+// OS level. The JS fd shims that have no native row (fsync/fdatasync/fchmod/
+// fchown/futimes) need exactly this question answered so they can raise node's
+// EBADF instead of silently succeeding on a closed fd.
+JSC_DEFINE_HOST_FUNCTION(fdn_valid_host, (JSC::JSGlobalObject* global, JSC::CallFrame* frame)) {
+    if (frame->argumentCount() < 1) return JSC::JSValue::encode(JSC::jsBoolean(false));
+    const int fd{static_cast<int>(fd_num(global, frame->argument(0)))};
+    if (fd < 0) return JSC::JSValue::encode(JSC::jsBoolean(false));
+    auto it{fd_table().find(fd)};
+    if (it != fd_table().end() && it->second.is_open())
+        return JSC::JSValue::encode(JSC::jsBoolean(true));
+#if defined(_WIN32)
+    return JSC::JSValue::encode(JSC::jsBoolean(false));
+#else
+    return JSC::JSValue::encode(JSC::jsBoolean(::fcntl(fd, F_GETFD) != -1));
+#endif
+}
+
 // ftruncate(2) on a virtual fd. fs.ftruncateSync / filehandle.truncate() were
 // no-ops, so `await handle.truncate(5)` left the file at its original length.
 JSC_DEFINE_HOST_FUNCTION(fdn_ftruncate_host, (JSC::JSGlobalObject* global, JSC::CallFrame* frame)) {
@@ -1740,7 +1992,7 @@ JSC_DEFINE_HOST_FUNCTION(fdn_ftruncate_host, (JSC::JSGlobalObject* global, JSC::
     const int fd{static_cast<int>(fd_num(global, frame->argument(0)))};
     auto it{fd_table().find(fd)};
     if (it == fd_table().end()) {
-        fd_throw(global, "EBADF: bad file descriptor " + std::to_string(fd));
+        fd_throw_errno_nopath(global, EBADF, "ftruncate");
         return JSC::JSValue::encode(JSC::jsUndefined());
     }
     const double len{frame->argumentCount() > 1 ? fd_num(global, frame->argument(1)) : 0.0};

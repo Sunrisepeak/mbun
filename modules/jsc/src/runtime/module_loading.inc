@@ -805,6 +805,12 @@ private:
         // Writing to a child pipe whose read end has closed must fail with EPIPE,
         // not kill the runtime with SIGPIPE (async child_process stdin, Bun.spawn).
         std::signal(SIGPIPE, SIG_IGN);
+        // Same reasoning for RLIMIT_FSIZE: a write past the limit must come back
+        // as EFBIG for the JS layer to throw, not terminate the process with
+        // SIGXFSZ (node ignores it for exactly this reason —
+        // test-fs-write-sigxfsz asserts the process exits 1 with the EFBIG
+        // Error on stderr).
+        std::signal(SIGXFSZ, SIG_IGN);
 #endif
         // bun-style explicit init (idempotent). JSC freezes its option table at the
         // end of initialize(), so options are only settable from inside the

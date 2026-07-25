@@ -18,6 +18,23 @@
 
 守卫集：tls 217 + https 63 全量（改动前后各一次），外加 418 文件跨子系统抽样（`test-net-` 全量 148 + 种子 20260726 的 http/http2 120 与其余 150），**三处回归均为 0，跨子系统抽样前后逐桶完全一致**。
 
+### w4/agent-fs：fs 错误形状 + fd 语义（test-fs- 298/342 → 309/342，实得 +11；全量 2,404 → 2,417）
+
+`--filter test-fs- --jobs 5 --timeout 15`：`pass 298 → 309`、`fail 34 → 23`、timeout 不变（2），**green→non-green 回归 0**。全量 4,433 文件基线/改后各跑一次（基线用冻结的 `target/baseline-w4/bin/mbun`，实测 2,404，与 8db7b9c 记录的 2,403 一致）：`pass 2,404 → 2,417`，逐文件 diff 14 转绿、1 回归，那 1 个是 `test-child-process-stdio-inherit` 的 JSC `WTFCrashWithInfo` SIGABRT，单独跑 3/3 通过，属并行内存压力下的已知抖动。fs 之外的三个额外增量：`test-filehandle-close`、`test-permission-fs-symlink-target-write`、`test-stdio-closed`。
+
+- **五个点名的 fs 错误形状缺陷全部落地**。`unlinkSync(<不存在>)` **根本不抛** —— `std::filesystem::remove` 用「返回 false + 空 error_code」表示「没东西可删」，改走 `unlink(2)`；`chmodSync`/`renameSync` 抛的是 `"chmod '<p>': No such file or directory"` 这种既解析不出 code 也解析不出 syscall 的文本，`.code/.errno/.syscall/.path` 全缺；`readlinkSync(<不存在>)` 报 EINVAL 而 node 报 ENOENT。`fs_make_error` 现在把 `'src' -> 'dest'` 拆成 `.path` + `.dest`。
+- **`fs.linkSync` 实现成了 copyFile** —— 这不只是错误形状，是语义错误：副本有自己的 inode，`nlink` 不增、一侧写另一侧看不见。改为真正的 `link(2)`，并补上此前完全缺失的 `fs.promises.link`。**权限闸门在 native 边界**（`fsn_link_cb` 内），已用裸全局单独取证：`--permission` 下 `globalThis.__mbunFsNative.link(...)` 直接返回 `ERR_ACCESS_DENIED`，不是只有公开 API 被拦。
+- **fd 族此前是「只验数字范围」的空壳**。`fsync/fdatasync/fchmod/fchown/futimes` 对已关闭的 fd 静默成功；`read/write/ftruncate/close` 抛的是**裸 JS 字符串**，于是 `.code`/`.syscall` 在每一个上面都是 undefined。全部改成 node 的无路径 EBADF。反向的错也修了：`fs.fstat(0)` 曾抛 EBADF —— mbun 没发出的 fd 不等于坏 fd，stdio 与继承来的描述符在 OS 层是真的。
+- **`fs.rm` 的 `{ force: true }` 吞掉了所有错误**，而 node 只吞 ENOENT；配套的 lstat 用的助手把任何失败都塌成「不存在」。根因再往下一层：`fsn_stat_cb` 把未列举的 errno 一律压成 ENOENT，于是只读目录里因缺搜索权限而 lstat EACCES 的文件，被 `force` 当成「已经没了」静默跳过（nodejs/node#38683）。
+- **短写被当成成功**。`writeFileSync` 只发一次 `FD.write` 且丢弃返回值：`ulimit -f 1` 下写满限额即正常返回。改成 node 的循环，并在启动时 `SIG_IGN` SIGXFSZ（否则进程直接被信号杀死，拿不到 EFBIG）。native 的整文件写此前是个从不检查 `write()` 结果的 `std::ofstream`。
+- **`node:test` 的 mock 有两处失效**（影响面超出 fs）：`mockImplementationOnce` 拿 `calls.length` 比对调用序号，但调用记录是在实现执行**之前**入队的，差一位导致 once 实现永远选不中；`mock.getter/setter` 用赋值 `object[name] = fn`，根本替换不掉原型上的访问器。两者都改对之后 `test-fs-write-stream-eagain` 才可能通过。
+- **流选项不走原型链**：`getOptions` 用 `Object.assign`（只拷自有属性），而 node 的 `copyObject` 是 `for..in`，所以 `createReadStream(f, { __proto__: { start: 1, end: 2 } })` 在 mbun 里 start/end/encoding 全部丢失。`ReadStream._read` 出错时直接 `this.destroy(er)` 而不是走 `errorOrDestroy`，`{ autoClose: false }` 的流被第一个读错误关掉。
+- **child_process 的 stdio 数字 fd 没做转换**：`fs.openSync` 给的是 mbun 的**虚拟 fd**（从 1000 起编号），原样交给子进程 dup2 就是 EBADF。已在 native 边界翻译成真实 OS fd。
+
+**修正 inventory（`compat/` 只读，改动请在这里记）**：`test-fs-error-messages` 的 note「needs `fstat` in the syscall slot」已过期，实际卡在 readlink 的 ENOENT，且后面还串着 close/ftruncate/fdatasync/fsync/chown/utimes/mkdtemp/copyFile/read/write/fchmod/fchown/futimes 一整族 EBADF；`fs-one-off` 再次漏计 —— 十一个增量里 `test-fs-stat`、`test-fs-rm`、`test-fs-read-stream`、`test-fs-read-stream-inherit`、`test-fs-write-stream-autoclose-option`、`test-fs-write-stream-eagain`、`test-fs-write` 七个在 inventory 里没有条目。`test-fs-cp-async-file-url` 的 note 是对的但属 **harness 口径**（`./test/fixtures/...` 相对 cwd，与 `test-fs-realpath-native` 同类，不是 `import.meta.url` bug）。
+
+**工具链事故**：全局 `~/.mcpp/config.toml` 的 `[toolchain] default` 在 25 日 22:12 被改成 `gcc@15.1.0`，而本仓库需要 gcc 16（15.1 的 `import std` 缺 `std::byteswap`，且模块 TU-local 诊断误报）。`worktree_setup.sh` 会删 `build.ninja` 触发重配，于是此后新建/重指的每个 worktree 都会锁死在无法编译的状态（wt1、wt4 均中招）。已 `mcpp toolchain default gcc@16.1.0` 复位。
+
 ## 2026-07-25
 
 ### 第十一轮整合：node 语料 2,369 → **2,403 / 4,433**（54.2% 严格 / 62.0% 排除自我跳过），组合回归 0

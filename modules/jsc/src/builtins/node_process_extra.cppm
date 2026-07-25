@@ -925,6 +925,45 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
         });
       }
     } catch (e) {}
+
+    // ---- V8's --expose_externalize_string globals --------------------------
+    // Same contract as `gc` above: these four exist ONLY when the flag is
+    // present, because common.js fails a test that leaks an unexpected global.
+    // V8's versions poke at string representation; what the corpus actually
+    // observes is (a) that they exist and (b) that isOneByteString reports
+    // whether the string is Latin-1 — which is the same question JSC's 8-bit
+    // string flag answers (test-fs-write writes both kinds through fs.write).
+    try {
+      const hasFlag = () => {
+        const argv = (G.process && G.process.execArgv) || [];
+        for (const a of argv)
+          if (a === "--expose_externalize_string" || a === "--expose-externalize-string") return true;
+        return false;
+      };
+      const defs = {
+        createExternalizableString: (s) => String(s),
+        createExternalizableTwoByteString: (s) => String(s),
+        externalizeString: () => undefined,
+        isOneByteString: (s) => {
+          const str = String(s);
+          for (let i = 0; i < str.length; ++i) if (str.charCodeAt(i) > 0xff) return false;
+          return true;
+        },
+      };
+      for (const name of Object.keys(defs)) {
+        if (name in G) continue;
+        Object.defineProperty(G, name, {
+          configurable: true,
+          enumerable: false,
+          get() { return hasFlag() ? defs[name] : undefined; },
+          set(v) {
+            Object.defineProperty(G, name, {
+              value: v, writable: true, configurable: true, enumerable: false,
+            });
+          },
+        });
+      }
+    } catch (e) {}
   } catch (e) {}
   // Last: if this process was fork()ed with an IPC channel, wire
   // process.send/'message'/disconnect now that `process` is a full EventEmitter
