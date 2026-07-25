@@ -287,6 +287,31 @@ inline constexpr std::string_view kNodeInternalBindingJS = R"JS(
     setMaybeCacheGeneratedSourceMap() {},
   });
 
+  // --------------------------------------------------------- mksnapshot ----
+  // node src/node_snapshotable.cc. mbun builds no startup snapshot, so every
+  // answer here is "not building one" — which is the truthful answer, not a
+  // stub of convenience.
+  //
+  // Why this tiny binding matters far beyond snapshots: node's
+  // internal/errors.js:249 calls isErrorStackTraceLimitWritable(), which does
+  // `require('internal/v8/startup_snapshot').namespace.isBuildingSnapshot()`,
+  // and that module top-levels internalBinding('mksnapshot'). Without this,
+  // EVERY ERR_* constructed through node's own internal/errors throws
+  // "No such binding: mksnapshot" instead of the error it was building — i.e.
+  // it fails exactly when a test is already failing, replacing a readable
+  // diagnostic with a confusing one, repo-wide.
+  //
+  // isBuildingSnapshotBuffer is a Uint8Array because internal/v8/startup_snapshot
+  // reads element 0 as a flag rather than calling a function.
+  factories["mksnapshot"] = () => ({
+    isBuildingSnapshotBuffer: new Uint8Array(1),
+    setSerializeCallback() {},
+    setDeserializeCallback() {},
+    setDeserializeMainFunction() {},
+    runDeserializeCallbacks() {},
+    compileSerializeMain() { return undefined; },
+  });
+
   // ------------------------------------------------------------- options ----
   // node src/node_options.cc. This runtime does not carry node's CLI option
   // table, so the dictionary is empty: internal/options.js getOptionValue then
