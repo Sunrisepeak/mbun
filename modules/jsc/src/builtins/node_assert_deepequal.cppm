@@ -1,17 +1,26 @@
-// node:assert deep-equality partition: replaces the naive bootstrap deepEq
-// with a comparator that matches bun's deepEquals contract (the acceptance
-// suite compat/bun/test/js/node/assert/deep-equal.test.ts pins bun's documented
-// divergences from node via test.failing, so THAT contract — not vanilla
-// node — is the blueprint):
+// node:assert deep-equality partition: replaces the naive bootstrap deepEq with
+// a comparator translated from node's lib/internal/util/comparisons.js.
+//
+// NOTE ON THE BLUEPRINT (corrected): this file used to claim bun's contract, not
+// node's, was the reference. That was wrong. The acceptance suite
+// compat/bun/test/js/node/assert/deep-equal.test.ts states in its own header
+// that its expectations come from the documented semantics of
+// assert.deepStrictEqual cross-checked against Node.js, and that cases *bun gets
+// wrong* are marked `test.failing` (its `strictBug` field literally records
+// "what Bun does instead"). So that file's expectations ARE node's, and node is
+// the blueprint on both corpora. Implementing bun's known bugs was the defect.
+//
 //   - both modes compare primitives with Object.is (loose does NOT coerce)
 //   - both modes compare own enumerable string AND symbol keys
+//   - strict mode gates on node's constructor/prototype rule
+//     (comparisons.js objectComparisonStart)
+//   - EVERY exotic type (Date/RegExp/Map/Set/ArrayBuffer/DataView/typed array/
+//     array/boxed/Error) additionally compares own enumerable properties, the
+//     way node's keyCheck does
 //   - loose mode treats undefined-valued props / holes / missing as equal
-//   - strict mode matches plain-object classes BY CONSTRUCTOR NAME (missing
-//     constructor is a wildcard; arrays are exempt)
-//   - Date/RegExp/Map/Set/typed arrays ignore extra own properties; Errors
-//     compare name/message/cause plus own properties
 //   - typed arrays: strict compares bytes, loose compares elements with ===
-//   - Buffer vs Uint8Array with equal bytes is equal (kind-tag comparison)
+//   - a Buffer and a Uint8Array with equal bytes are NOT strictly deep-equal
+//     (their constructors differ); bun reports them equal and marks that a bug
 //   - WeakMap/WeakSet: equal when the same kind (strict requires same kind,
 //     loose treats both as opaque empty objects)
 // Also upgrades AssertionError (actual/expected/operator/generatedMessage,
@@ -106,6 +115,39 @@ inline constexpr std::string_view kNodeAssertDeepEqualJS = R"JS(
         return c ? c.name : undefined;
       } catch (_) { return undefined; }
     };
+    // comparisons.js wellKnownConstructors.
+    const wellKnownCtors = new Set([Array, ArrayBuffer, BigInt, BigInt64Array,
+      BigUint64Array, Boolean, G.Buffer, DataView, Date, Error, Float32Array,
+      Float64Array, Function, Int16Array, Int32Array, Int8Array, Map, Number,
+      Object, Promise, RegExp, Set, String, Symbol, Uint16Array, Uint32Array,
+      Uint8Array, Uint8ClampedArray, WeakMap, WeakSet]
+      .concat(typeof G.Float16Array === "function" ? [G.Float16Array] : [])
+      .filter((c) => typeof c === "function"));
+    // Own enumerable properties EXCLUDING array indices (node's
+    // getOwnNonIndexProperties(val, ONLY_ENUMERABLE[|SKIP_SYMBOLS])). Used for
+    // arrays and typed arrays, whose element slots are compared separately.
+    const isIndexKey = (k) => typeof k === "string" && /^(0|[1-9][0-9]*)$/.test(k);
+    const ownKeysNonIndex = (o, strict) => {
+      const keys = [];
+      for (const k of Object.keys(o)) if (!isIndexKey(k)) keys.push(k);
+      if (strict) {
+        for (const sym of Object.getOwnPropertySymbols(o))
+          if (Object.getOwnPropertyDescriptor(o, sym).enumerable) keys.push(sym);
+      }
+      return keys;
+    };
+    // node keyCheck for an array-like: same count of non-index own props, and
+    // every one deep-equal. (mbun previously dropped these entirely, which is
+    // the "typed arrays ignore extra own properties" divergence.)
+    const deqNonIndexProps = (a2, b2, strict, memo) => {
+      const ka = ownKeysNonIndex(a2, strict), kb = ownKeysNonIndex(b2, strict);
+      if (ka.length !== kb.length) return false;
+      for (const k of ka) {
+        if (!Object.prototype.hasOwnProperty.call(b2, k)) return false;
+        if (!deq(a2[k], b2[k], strict, memo)) return false;
+      }
+      return true;
+    };
 
     // ---------------------------------------------------------- comparator
     function deq(a, b, strict, memo) {
@@ -126,14 +168,34 @@ inline constexpr std::string_view kNodeAssertDeepEqualJS = R"JS(
     }
 
     function deqObjects(a, b, strict, memo) {
+      // comparisons.js objectComparisonStart: in strict mode the pair must
+      // agree on constructor (for well-known constructors and for objects that
+      // inherit `constructor`) or, failing that, on prototype identity. This
+      // replaces a constructor-NAME match with a wildcard, which let unrelated
+      // classes that happen to share a name compare equal.
+      if (strict) {
+        let ca, cb2;
+        try { ca = a.constructor; } catch (_) { ca = undefined; }
+        try { cb2 = b.constructor; } catch (_) { cb2 = undefined; }
+        if (wellKnownCtors.has(ca) ||
+            (ca !== undefined && !Object.prototype.hasOwnProperty.call(a, "constructor"))) {
+          if (ca !== cb2) return false;
+        } else if (Object.getPrototypeOf(a) !== Object.getPrototypeOf(b)) {
+          return false;
+        }
+      }
       // typed arrays (Buffer included; compared by kind tag only)
       const ka = taTag(a), kb = taTag(b);
       if (ka !== undefined || kb !== undefined) {
         if (ka !== kb) return false;
-        if (strict) return equalBytes(a, b);
-        if (a.length !== b.length) return false;
-        for (let i = 0; i < a.length; i++) if (!(a[i] === b[i])) return false;
-        return true;
+        if (strict) {
+          if (!equalBytes(a, b)) return false;
+        } else {
+          if (a.length !== b.length) return false;
+          for (let i = 0; i < a.length; i++) if (!(a[i] === b[i])) return false;
+        }
+        // node keyCheck still compares the non-index own properties.
+        return deqNonIndexProps(a, b, strict, memo);
       }
       // boxed primitives
       const bxa = boxedKind(a), bxb = boxedKind(b);
@@ -146,13 +208,15 @@ inline constexpr std::string_view kNodeAssertDeepEqualJS = R"JS(
       const da = isDate(a), db = isDate(b);
       if (da || db) {
         if (da !== db) return false;
-        return Object.is(dateGetTime.call(a), dateGetTime.call(b));
+        if (!Object.is(dateGetTime.call(a), dateGetTime.call(b))) return false;
+        return deqOwnProps(a, b, strict, memo, null);
       }
       // RegExp: source + flags only (lastIndex / extra own props ignored)
       const ra = isRegExp(a), rb = isRegExp(b);
       if (ra || rb) {
         if (ra !== rb) return false;
-        return reSource.call(a) === reSource.call(b) && reFlags.call(a) === reFlags.call(b);
+        if (reSource.call(a) !== reSource.call(b) || reFlags.call(a) !== reFlags.call(b)) return false;
+        return deqOwnProps(a, b, strict, memo, null);
       }
       // ArrayBuffer / SharedArrayBuffer / DataView: byte equality; an
       // ArrayBuffer is never equal to a SharedArrayBuffer (node WPT rule).
@@ -160,10 +224,14 @@ inline constexpr std::string_view kNodeAssertDeepEqualJS = R"JS(
       if (aba || abb) {
         if (aba !== abb) return false;
         if (isAB(a) !== isAB(b)) return false;
-        return equalBytes(a, b);
+        if (!equalBytes(a, b)) return false;
+        return deqOwnProps(a, b, strict, memo, null);
       }
       const dva = isDataView(a), dvb = isDataView(b);
-      if (dva || dvb) return dva === dvb && equalBytes(a, b);
+      if (dva || dvb) {
+        if (dva !== dvb || !equalBytes(a, b)) return false;
+        return deqNonIndexProps(a, b, strict, memo);
+      }
       // Error: name + message + cause + own props
       const ea = isError(a), eb = isError(b);
       if (ea || eb) {
@@ -179,14 +247,16 @@ inline constexpr std::string_view kNodeAssertDeepEqualJS = R"JS(
       if (ma || mb) {
         if (ma !== mb) return false;
         if (mapSize.call(a) !== mapSize.call(b)) return false;
-        return deqMaps(a, b, strict, memo);
+        if (!deqMaps(a, b, strict, memo)) return false;
+        return deqOwnProps(a, b, strict, memo, null);
       }
       // Set
       const sa = isSet(a), sb = isSet(b);
       if (sa || sb) {
         if (sa !== sb) return false;
         if (setSize.call(a) !== setSize.call(b)) return false;
-        return deqSets(a, b, strict, memo);
+        if (!deqSets(a, b, strict, memo)) return false;
+        return deqOwnProps(a, b, strict, memo, null);
       }
       // WeakMap / WeakSet: opaque
       const wma = isWeakMap(a), wmb = isWeakMap(b);
@@ -206,20 +276,17 @@ inline constexpr std::string_view kNodeAssertDeepEqualJS = R"JS(
             if (ia !== ib) return false;
             if (ia && !deq(a[i], b[i], strict, memo)) return false;
           }
-          return true;
+        } else {
+          const n = Math.max(a.length, b.length);
+          for (let i = 0; i < n; i++) if (!deq(a[i], b[i], strict, memo)) return false;
         }
-        const n = Math.max(a.length, b.length);
-        for (let i = 0; i < n; i++) if (!deq(a[i], b[i], strict, memo)) return false;
-        return true;
+        // node keyCheck: an array's NON-index own properties count too.
+        return deqNonIndexProps(a, b, strict, memo);
       }
       // Arguments vs plain object mismatch (both modes)
       const tagA = toStr(a), tagB = toStr(b);
       if ((tagA === "[object Arguments]") !== (tagB === "[object Arguments]")) return false;
-      // strict: plain-object class-name matching (missing constructor is a wildcard)
-      if (strict) {
-        const na = ctorName(a), nb = ctorName(b);
-        if (na !== undefined && nb !== undefined && na !== nb) return false;
-      }
+      // (the strict class gate already ran at the top of deqObjects)
       return deqOwnProps(a, b, strict, memo, null);
     }
 
