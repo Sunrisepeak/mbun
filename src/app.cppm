@@ -2422,8 +2422,13 @@ int exec_as_if_node(std::span<const std::string_view> args) {
     std::size_t i{0};
     for (; i < args.size(); ++i) {
         const std::string_view a{args[i]};
-        // `node -e <code>` / `-p <code>` (run_command.rs:2988-3000).
-        if (a == "-e" || a == "--eval" || a == "-p" || a == "--print") {
+        // `node -e <code>` / `-p <code>` (run_command.rs:2988-3000). `-pe`/`-ep`
+        // are node's combined short forms for `-p -e`; the corpus spawns
+        // children with them (test-tls-cipher-list builds argv as
+        // [...flags, '-pe', expression]), and without them the expression token
+        // was taken for the script path.
+        if (a == "-e" || a == "--eval" || a == "-p" || a == "--print" || a == "-pe" ||
+            a == "-ep") {
             if (i + 1 >= args.size()) {
                 std::println(std::cerr, "error: Missing code to evaluate");
                 return 1;
@@ -2432,7 +2437,8 @@ int exec_as_if_node(std::span<const std::string_view> args) {
             for (std::string_view rest : args.subspan(i + 2)) jsArgv.emplace_back(rest);
             mbun::jsc::runtime::set_argv(std::move(jsArgv));
             std::string code{args[i + 1]};
-            if (a == "-p" || a == "--print") code = "console.log((() => (" + code + "))())";
+            if (a == "-p" || a == "--print" || a == "-pe" || a == "-ep")
+                code = "console.log((() => (" + code + "))())";
             return mbun::jsc::runtime::run_eval(code);
         }
         // `node --version` prints the node compatibility claim, exactly like

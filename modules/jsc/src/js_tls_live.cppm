@@ -388,7 +388,14 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
       transport.on("data", (chunk) => self.emit("data", chunk));
       transport.on("drain", () => self.emit("drain"));
       transport.on("end", () => { self.readable = false; self.emit("end"); });
-      transport.on("close", (hadErr) => { self.destroyed = true; self.emit("close", !!hadErr); });
+      // A destroyed socket is neither readable nor writable — node's
+      // Socket#destroy clears both, and readyState (net.js) is derived from
+      // them, so leaving `writable` true made a closed TLSSocket report
+      // 'writeOnly' (test-tls-set-encoding asserts 'closed' inside 'close').
+      transport.on("close", (hadErr) => {
+        self.destroyed = true; self.readable = false; self.writable = false;
+        self.emit("close", !!hadErr);
+      });
       // node internal/tls/wrap.js onConnectEnd: a transport that disconnects
       // BEFORE the handshake completes is reported as an ECONNRESET carrying the
       // connect options, not as a bare read error — the corpus asserts path /
@@ -426,7 +433,17 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
       // node internal/tls/wrap.js onnewsession: each session OpenSSL issues (one
       // for TLS 1.2, one per NewSessionTicket for TLS 1.3) reaches the TLSSocket
       // as a Buffer the caller can hand back to tls.connect({ session }).
-      transport.on("session", (session) => self.emit("session", session));
+      // The session most recently handed to JS also becomes what getSession()
+      // reports. In node the two agree by construction — the 'session' event is
+      // emitted from OpenSSL's new-session callback, at the moment SSL_get_session
+      // starts returning that very session. Here the sessions are drained from a
+      // poll, so several TLS 1.3 tickets can already have been processed by the
+      // time the first event is delivered and a live SSL_get_session would report
+      // the LAST one to every handler. Caching restores node's pairing at every
+      // point JS can observe: nothing cached before the first event (so
+      // getSession() is still the live handshake session, the TLS 1.3 dummy
+      // included), then the session that event carried.
+      transport.on("session", (session) => { self._lastSession = session; self.emit("session", session); });
       if (self._sessionWanted) transport._sessionWanted = true;
       // node's TLSSocket is a net.Socket over a real connection, so it emits
       // 'connect' when the TCP leg lands (before the handshake) and 'ready'
@@ -628,7 +645,15 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
       if (detailed && this._peerCertDetailed) return this._peerCertDetailed;
       return this._peerCert || {};
     }
-    getCertificate() { return null; }
+    // node crypto_tls.cc TLSWrap::GetCertificate: THIS side's certificate, in
+    // the same object shape getPeerCertificate() produces — for a server that is
+    // the cert it presented, which is the client's peer cert. null when this
+    // side has none (the ordinary client case), as node returns.
+    getCertificate() {
+      if (!this._ownCertPem) return null;
+      if (this._ownCert === undefined) this._ownCert = parseCert(this._ownCertPem);
+      return this._ownCert;
+    }
     // node getX509Certificate()/getPeerX509Certificate(): the same certificates
     // getCertificate()/getPeerCertificate() report, as crypto.X509Certificate
     // objects. DEFERRED: `issuerCertificate` chain walking (needs the verified
@@ -654,6 +679,7 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
     // placeholder, and the resumable one only appears later (the 'session'
     // event). undefined when there is no session at all, as node returns.
     getSession() {
+      if (this._lastSession !== undefined) return this._lastSession;
       const fd = this._transport ? this._transport._fd : -1;
       if (!NN || typeof NN.tlsSession !== "function" || !(fd >= 0)) return undefined;
       let b64;
@@ -957,6 +983,15 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
       // lines as (line, tlsSocket), and only bothers when it has a listener.
       if (typeof self.listenerCount === "function" && self.listenerCount("keylog") > 0)
         tlsSock.on("keylog", (line) => self.emit("keylog", line, tlsSock));
+      // `pauseOnConnect` stays DEFERRED (see the constructor). Handing the
+      // listener an already-paused TLSSocket is easy — pausing it here, after
+      // the handshake, does not stall the ClientHello the way forwarding the
+      // option to the net.Server would. What is NOT in place is libuv's
+      // liveness rule for a paused socket: node's pause() calls readStop(), so
+      // a paused connection stops holding the loop, while here it keeps being
+      // polled and pins the process. Measured: pausing here turned
+      // test-tls-server-parent-constructor-options from a failed assertion into
+      // a 15s hang, which is strictly worse. The gate belongs in _syncEofHold.
       tlsSock.once("secureConnect", () => self.emit("secureConnection", tlsSock));
       // node _tls_wrap.js onServerSocketSecure/handshakeTimeout: a connection that
       // does not finish its handshake within options.handshakeTimeout (default

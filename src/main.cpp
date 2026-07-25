@@ -90,11 +90,23 @@ int main(int argc, char* argv[]) {
     // alongside `-e`/`--eval`, which the strip loop below stops at.
     if (take_interactive_flag(args)) return exec_interactive(args);
 
+    // node's eval flags. `-pe` / `-ep` are the combined short forms node's own
+    // argument parser accepts (`node -pe "expr"` is `-p -e "expr"`), and the
+    // corpus spawns children that way — test-tls-cipher-list builds its argv as
+    // `[...flags, '-pe', expression]`. Without them the token is not recognised
+    // as an eval flag at all and the expression is taken for a script path.
+    const auto is_eval_flag{[](std::string_view a) {
+        return a == "-e" || a == "--eval" || a == "-p" || a == "--print" || a == "-pe" ||
+               a == "-ep";
+    }};
+    const auto eval_flag_prints{[](std::string_view a) {
+        return a == "-p" || a == "--print" || a == "-pe" || a == "-ep";
+    }};
+
     // Strip leading global run flags so `mbun [flags] <script>` runs the script,
     // but never past -e/-p/--eval/--print (those consume the next token as code).
     RunFlags globalFlags{};
-    while (!args.empty() && args[0] != "-e" && args[0] != "--eval" && args[0] != "-p" &&
-           args[0] != "--print") {
+    while (!args.empty() && !is_eval_flag(args[0])) {
         if (const std::size_t n{take_max_http_header_size_flag(args, 0)}; n > 0) {
             args.erase(args.begin(), args.begin() + static_cast<std::ptrdiff_t>(n));
             continue;
@@ -168,8 +180,7 @@ int main(int argc, char* argv[]) {
     // ignores unmodelled node flags and resolves the first positional as the
     // script) is the correct handler, so route there instead of taking the flag
     // itself as the run target ("Script not found \"--expose-gc\"").
-    if (!args.empty() && args[0].starts_with("-") && args[0] != "-" &&
-        args[0] != "-e" && args[0] != "--eval" && args[0] != "-p" && args[0] != "--print") {
+    if (!args.empty() && args[0].starts_with("-") && args[0] != "-" && !is_eval_flag(args[0])) {
         bool hasPositional{false};
         for (std::size_t k{0}; k < args.size(); ++k) {
             if (!args[k].starts_with("-")) {
@@ -191,7 +202,7 @@ int main(int argc, char* argv[]) {
     // execute a JS file through the JSC runtime with the Bun.* API in scope.
     if (!args.empty()) {
         // `mbun -e <code>` / `mbun --eval <code>`: evaluate a JS/TS string.
-        if (args[0] == "-e" || args[0] == "--eval" || args[0] == "-p" || args[0] == "--print") {
+        if (is_eval_flag(args[0])) {
             if (args.size() < 2) {
                 std::println(std::cerr, "mbun {}: missing code (usage: mbun {} <code>)", args[0], args[0]);
                 return 2;
@@ -205,13 +216,15 @@ int main(int argc, char* argv[]) {
             mbun::jsc::runtime::set_argv(std::move(jsArgv));
             std::string code{args[1]};
             // `-p`/`--print` prints the expression result.
-            if (args[0] == "-p" || args[0] == "--print") {
+            if (eval_flag_prints(args[0])) {
                 code = "console.log((() => (" + code + "))())";
             }
             // node/bun expose the ORIGINAL eval source as process._eval
             // (run-eval.test.ts). Set it on the same first line so source-map
             // line numbers are unchanged; args[1] is the pre-wrap source.
             code = "process._eval=" + js_quote(args[1]) + ";" + code;
+            // run_eval() prepends node's addBuiltinLibsToObject shim, so both
+            // this path and the `node`-argv0 emulation get the builtin globals.
             return mbun::jsc::runtime::run_eval(code);
         }
         // `mbun pm version [args...]` — package.json version bumping (npm-compatible).

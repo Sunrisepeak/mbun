@@ -39,6 +39,26 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     RSA_X931_PADDING: 5, RSA_SSLV23_PADDING: 2,
   });
 
+  // ---- cipher-list mirrors (node src/node_constants.cc) ----------------------
+  // node publishes the TLS cipher defaults through node:crypto as well as
+  // node:tls: defaultCipherList is the EFFECTIVE list (tls.DEFAULT_CIPHERS, i.e.
+  // after any --tls-cipher-list override) and defaultCoreCipherList is the
+  // compiled-in one, so a program can see what it was overridden from.
+  // test-tls-cipher-list compares exactly that pair across four child processes.
+  //
+  // Lazy accessors rather than values: node:tls is not necessarily materialised
+  // when this partition runs, and reading the strings at ACCESS time removes the
+  // load-order question entirely instead of duplicating the literal here.
+  for (const spec of [["defaultCipherList", "DEFAULT_CIPHERS"],
+                      ["defaultCoreCipherList", "__mbunCoreCiphers"]]) {
+    if (C.constants[spec[0]] !== undefined) continue;
+    Object.defineProperty(C.constants, spec[0], {
+      configurable: true, enumerable: true,
+      get() { const t = M["tls"] || M["node:tls"]; return t ? t[spec[1]] : undefined; },
+      set(v) { Object.defineProperty(C.constants, spec[0], { configurable: true, enumerable: true, writable: true, value: v }); },
+    });
+  }
+
   // ---- FIPS mode (non-FIPS OpenSSL build) ----
   // node exposes getFips()/setFips()/`fips`. mbun links a stock (non-FIPS)
   // OpenSSL, so FIPS is always off; enabling it is the documented hard error.
