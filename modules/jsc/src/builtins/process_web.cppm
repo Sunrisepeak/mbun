@@ -14,7 +14,9 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   const CP = globalThis.__mbunCpNative;
   const PROC = globalThis.__mbunProcNative;
   const normArgs = (a, o) => (Array.isArray(a) ? { args: a, opts: o || {} } : { args: [], opts: a || {} });
-  const SIGMAP = { SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGILL: 4, SIGTRAP: 5, SIGABRT: 6, SIGIOT: 6, SIGBUS: 7, SIGFPE: 8, SIGKILL: 9, SIGUSR1: 10, SIGSEGV: 11, SIGUSR2: 12, SIGPIPE: 13, SIGALRM: 14, SIGTERM: 15, SIGCHLD: 17, SIGCONT: 18, SIGSTOP: 19, SIGTSTP: 20, SIGTTIN: 21, SIGTTOU: 22 };
+  // Full Linux signal table (os.constants.signals): node validates killSignal
+  // against it, so a partial map made SIGURG/SIGXCPU/... "unknown signals".
+  const SIGMAP = { SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGILL: 4, SIGTRAP: 5, SIGABRT: 6, SIGIOT: 6, SIGBUS: 7, SIGFPE: 8, SIGKILL: 9, SIGUSR1: 10, SIGSEGV: 11, SIGUSR2: 12, SIGPIPE: 13, SIGALRM: 14, SIGTERM: 15, SIGSTKFLT: 16, SIGCHLD: 17, SIGCLD: 17, SIGCONT: 18, SIGSTOP: 19, SIGTSTP: 20, SIGTTIN: 21, SIGTTOU: 22, SIGURG: 23, SIGXCPU: 24, SIGXFSZ: 25, SIGVTALRM: 26, SIGPROF: 27, SIGWINCH: 28, SIGIO: 29, SIGPOLL: 29, SIGPWR: 30, SIGSYS: 31, SIGUNUSED: 31 };
   const SIGNAME = {}; for (const k in SIGMAP) if (!SIGNAME[SIGMAP[k]]) SIGNAME[SIGMAP[k]] = k;
   const ERRNO = { 1: "EPERM", 2: "ENOENT", 8: "ENOEXEC", 9: "EBADF", 11: "EAGAIN", 12: "ENOMEM", 13: "EACCES", 20: "ENOTDIR", 21: "EISDIR", 22: "EINVAL", 23: "ENFILE", 24: "EMFILE", 36: "ENAMETOOLONG" };
   // Node defers only these spawn errnos to the async 'error' event; the rest
@@ -531,7 +533,36 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     for (const k of ["windowsHide", "windowsVerbatimArguments"]) {
       if (o[k] != null && typeof o[k] !== "boolean") throw errPropType("options." + k, "of type boolean", o[k]);
     }
-    if (o.timeout !== undefined && o.timeout !== null && (typeof o.timeout !== "number" || Number.isNaN(o.timeout))) throw errPropType("options.timeout", "of type number", o.timeout);
+    // validateTimeout -> validateInteger(timeout, 'timeout', 0)
+    if (o.timeout != null) {
+      if (typeof o.timeout !== "number") throw errPropType("options.timeout", "of type number", o.timeout);
+      if (!Number.isInteger(o.timeout) || o.timeout < 0) throw errOutOfRange("timeout", "an integer >= 0", o.timeout);
+    }
+    // validateMaxBuffer -> validateNumber(maxBuffer, 'options.maxBuffer', 0):
+    // Infinity and 3.14 are fine, NaN and negatives are not.
+    if (o.maxBuffer != null) {
+      if (typeof o.maxBuffer !== "number") throw errPropType("options.maxBuffer", "of type number", o.maxBuffer);
+      if (Number.isNaN(o.maxBuffer) || o.maxBuffer < 0) throw errOutOfRange("options.maxBuffer", "a number >= 0", o.maxBuffer);
+    }
+    // sanitizeKillSignal -> convertToValidSignal. Own-property lookups only, so
+    // 'toString'/'constructor' are unknown signals rather than prototype hits.
+    if (o.killSignal != null) {
+      const hasOwn = Object.prototype.hasOwnProperty;
+      const unknown = () => { const e = new TypeError("Unknown signal: " + String(o.killSignal)); e.code = "ERR_UNKNOWN_SIGNAL"; return e; };
+      if (typeof o.killSignal === "string") { if (!hasOwn.call(SIGMAP, o.killSignal.toUpperCase())) throw unknown(); }
+      else if (typeof o.killSignal === "number") { if (!hasOwn.call(SIGNAME, String(o.killSignal))) throw unknown(); }
+      else throw errPropType("options.killSignal", "of type string or number", o.killSignal);
+    }
+    // Both env keys and env values must be NUL-free (node's
+    // validateArgumentNullCheck over the envPairs it builds).
+    if (o.env != null) {
+      if (typeof o.env !== "object") throw errPropType("options.env", "of type object", o.env);
+      for (const k of Object.keys(o.env)) {
+        nullCheck(k, "options.env");
+        const v = o.env[k];
+        if (typeof v === "string") nullCheck(v, "options.env");
+      }
+    }
   };
   const normalizeSpawnArgs = (file, args, options) => {
     validateStr(file, "file");
@@ -692,6 +723,11 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     options = options || {};
     validateCommonOpts(options);
     for (const a of args) nullCheck(a, "args");
+    if (options.execPath != null) { validateStr(options.execPath, "options.execPath"); nullCheck(options.execPath, "options.execPath"); }
+    if (options.execArgv != null) {
+      if (!Array.isArray(options.execArgv)) throw errPropType("options.execArgv", "an instance of Array", options.execArgv);
+      for (const a of options.execArgv) nullCheck(a, "options.execArgv");
+    }
     const exe = toStr(options.execPath || (G.process && G.process.execPath) || "bun");
     // node fork(): the child always gets an "ipc" slot appended, stdio defaults
     // to inherit (pipe when silent), and a user-supplied stdio ARRAY without an
