@@ -6370,7 +6370,10 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     link: P((a, b) => { validatePath(a, "existingPath"); validatePath(b, "newPath"); return F.link(toStr(a), toStr(b)); }),
     copyFile: P((a, b, m) => { validatePath(a, "src"); validatePath(b, "dest"); fsValidCopyMode(m); return F.copyFile(toStr(a), toStr(b)); }),
     mkdtemp: P((pre) => F.mkdtemp(toStr(pre))),
-    access: P((p, m) => { validatePath(p); fsValidAccessMode(m); if (!F.exists(toStr(p))) throw fsErr("ENOENT", "access", toStr(p)); }),
+    // Route through accessSync, not a bare existence probe: fs.promises.access
+    // resolved for W_OK on a 0o444 file, where its callback twin already
+    // rejected (test-fs-access).
+    access: P((p, m) => fsMod.accessSync(p, m)),
     exists: P((p) => F.exists(toStr(p))),
     cp: P((src, dest, o) => { validatePath(src, "src"); validatePath(dest, "dest"); return cpRecAsync(toStr(src), toStr(dest), cpValidateOptions(o)); }),
     symlink: P((target, path2, type) => { validatePath(target, "target"); validatePath(path2, "path"); fsValidateSymlinkType(type); return F.symlink(toStr(target), toStr(path2)); }),
