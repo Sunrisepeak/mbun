@@ -120,13 +120,15 @@ Source-snapshot measurements (2026-07-21) against the upstream corpora pinned as
 
 | Target | Result | Rate |
 | --- | ---: | ---: |
-| Bun native test corpus (`compat/bun/test`) | 885 / 1,902 files fully green | 46.5% |
-| Bun native tests, test level | 32,190 pass / 17,254 fail of 52,454 run | 61.4% |
+| Bun native test corpus (`compat/bun/test`) | 885 / 1,902 files fully green *(round-7/8 snapshot — stale, see below)* | 46.5% |
+| Bun native tests, test level | 32,190 pass / 17,254 fail of 52,454 run *(same stale snapshot)* | 61.4% |
 | Node.js native tests (`compat/node/test/parallel`) | 2,329 / 4,433 files pass (direct execution) | 52.5% |
 | Node.js native tests, excluding files that skip themselves | 2,329 / 3,884 files pass | 60.0% |
 | Elysia test suite | 1,522 pass / 3 fail | 99.8% |
 
 File-level "green" means every executed test in the file passed and the file reported no error outside a test; it is stricter than an API checklist and lower than test-level pass rates. Files that declare no runnable test, files whose every test is skipped, and files needing a service this environment lacks (MySQL, Redis, the npm registry) are separate buckets and never count as passes. Node.js files run directly through mbun (exit 0 = pass) without Node's own harness services, so that figure is honest file-level coverage, not API completion.
+
+**The two Bun rows are a stale round-7/8 snapshot and are not contemporaneous with the Node.js rows.** They are the last full Bun-corpus measurement taken, kept for that reason and not because they still hold — rounds 9 and 10 landed 20+ tasks over shared code since. There is direct evidence the number has moved in both directions: the deep-equality alignment deliberately reclassified 22 files in Bun's own deep-equal suite as `ahead-of-reference` (mbun is *more* correct than Bun there, and the runner now scores that as its own bucket rather than as a failure), while the request-smuggling fix took Bun's own `request-smuggling.test.ts` from 53 to 61 passing. A full re-measure is owed.
 
 **The Node.js figures were previously overstated and have been corrected downward at the source.** Two measurement defects were found and fixed:
 
