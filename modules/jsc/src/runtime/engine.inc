@@ -1584,7 +1584,48 @@ public:
             std::cerr.flush();
             std::exit(1);
         }
+        // node env.cc: the model without --allow-addons also clears
+        // allow_native_addons, which removes the "node-addons" ESM condition.
+        if (gPermission.enabled() && !gPermission.is_granted(mbun::permission::Scope::Addon)) {
+            mbun::jsc::module_loader::gAllowNativeAddons = false;
+        }
         set_prop(ctx_, global, "__mbunPermissionNative", build_permission_native_());
+        // node pre_execution.js emits these through process.emitWarning, whose
+        // default handler prints "(node:PID) NAME: message" to stderr. mbun's
+        // emitWarning has no default printer (documented below at p.emitWarning),
+        // and a warning emitted while the builtins image is still evaluating is
+        // dropped anyway: its nextTick drains before the entry script exists, so
+        // no listener can be attached yet. Print here, at the point the flags are
+        // known; the JS partition separately replays them to a 'warning' listener
+        // so common.expectWarning still sees them.
+        if (gPermission.enabled()) {
+            const auto warn{[](std::string_view type, std::string_view msg) {
+                std::println(std::cerr, "(node:{}) {}: {}", ::getpid(), type, msg);
+            }};
+            for (const std::string_view flag : mbun::permission::kSecurityWarningFlags) {
+                bool on{false};
+                if (flag == "--allow-addons") on = gPermissionOptions.allowAddons;
+                else if (flag == "--allow-child-process") on = gPermissionOptions.allowChildProcess;
+                else if (flag == "--allow-inspector") on = gPermissionOptions.allowInspector;
+                else if (flag == "--allow-wasi") on = gPermissionOptions.allowWasi;
+                else if (flag == "--allow-worker") on = gPermissionOptions.allowWorker;
+                if (!on) continue;
+                warn("SecurityWarning",
+                     std::string{"The flag "} + std::string{flag} +
+                         " must be used with extreme caution. It could invalidate the "
+                         "permission model.");
+            }
+            if (gPermissionOptions.allowFfi) {
+                warn("SecurityWarning",
+                     "The flag --allow-ffi must be used with extreme caution. It could "
+                     "invalidate the permission model.");
+            }
+            if (gPermissionOptions.allowNet) {
+                warn("ExperimentalWarning",
+                     "The flag --allow-net is under experimental phase.");
+            }
+            std::cerr.flush();
+        }
 
         // Native filesystem ops (real) exposed for the JS node:fs / fs/promises
         // shapes to build on. Installed BEFORE kNodeBuiltinsJS (which references it).

@@ -4065,6 +4065,11 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     fstatSync: (fd, o) => { const s = F.fstat(fd); return (o && o.bigint) ? mkBigIntStats(s) : Object.setPrototypeOf(s, Stats.prototype); },
     fstat: (fd, o, cb) => { const fn = cb || o; if (typeof fn === "function") fn(null, fsMod.fstatSync(fd)); },
     statfsSync: () => ({ type: 0, bsize: 4096, blocks: 0, bfree: 0, bavail: 0, files: 0, ffree: 0 }),
+    // Not a node fs export: an mbun-internal helper. Left ENUMERABLE it showed
+    // up in Object.keys(require("fs")), which node's own
+    // test-permission-fs-supported reads to prove every exposed fs API is
+    // covered by the permission model — an mbun-only key fails that audit.
+    // Made non-enumerable right after this object literal (see below).
     createStatsForIno: (ino, mode) => ({ ino: ino || 0, mode: mode || 0o644, size: 0, isFile: () => (mode == null ? true : (mode & 0o170000) === 0o100000), isDirectory: () => (mode != null && (mode & 0o170000) === 0o040000), isSymbolicLink: () => false, isBlockDevice: () => false, isCharacterDevice: () => false, isFIFO: () => false, isSocket: () => false, mtime: new Date(0), atime: new Date(0), ctime: new Date(0), birthtime: new Date(0), mtimeMs: 0, atimeMs: 0, ctimeMs: 0, birthtimeMs: 0, uid: 0, gid: 0, dev: 0, nlink: 1, rdev: 0, blksize: 4096, blocks: 0 }),
     unlinkSync: (p) => F.unlink(toStr(p)),
     realpathSync: (p) => F.realpath(toStr(p)),
@@ -4875,6 +4880,28 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     });
   // fs.exists' callback takes (exists) with no error slot.
   fsMod.exists[kPromisifyCustom] = (p) => new Promise((resolve) => fsMod.exists(p, resolve));
+  // mbun-internal helpers must not appear in Object.keys(require("fs")): node's
+  // test-permission-fs-supported enumerates that list to prove every exposed fs
+  // API is covered by the permission model, and an extra key fails the audit.
+  // They stay reachable by name for the internal callers that use them.
+  // mbun-internal helpers must not appear in Object.keys(require("fs")). node's
+  // own test-permission-fs-supported enumerates that list to prove every exposed
+  // fs API is covered by the permission model, so an mbun-only key fails the
+  // audit outright. `hideFsExtras` is exported on the module object so the LAST
+  // writer of each key can call it — node_fs_watch installs fs.FSWatcher after
+  // this point, and a plain assignment there would re-create it as enumerable.
+  const hideFsExtras = () => {
+    for (const k of ["createStatsForIno", "BigIntStats", "FSWatcher", "StatWatcher"]) {
+      if (Object.prototype.hasOwnProperty.call(fsMod, k) &&
+          Object.getOwnPropertyDescriptor(fsMod, k).enumerable) {
+        Object.defineProperty(fsMod, k,
+          { value: fsMod[k], writable: true, configurable: true, enumerable: false });
+      }
+    }
+  };
+  Object.defineProperty(fsMod, "__mbunHideFsExtras",
+    { value: hideFsExtras, writable: true, configurable: true, enumerable: false });
+  hideFsExtras();
   def(["fs"], fsMod);
 
   const P = (fn) => (...a) => { try { return Promise.resolve(fn(...a)); } catch (e) { return Promise.reject(e); } };

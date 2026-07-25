@@ -112,6 +112,12 @@ JSValueRef dgramn_bind_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_
 #else
     const int fd{argc > 0 ? static_cast<int>(JSValueToNumber(ctx, args[0], nullptr)) : -1};
     const std::string host{fs_arg(ctx, argc, args, 1)};
+    // Permission Model: node gates the Net scope in tcp_wrap.cc / pipe_wrap.cc /
+    // udp_wrap.cc — i.e. at the wrap's Bind/Connect/Listen, which is the syscall.
+    // Same place here. `--allow-net` is all-or-nothing in node; the resource is
+    // the address or socket path so the error names what was refused.
+    if (permission_deny_scope(ctx, exc, mbun::permission::Scope::Net, host))
+        return JSValueMakeUndefined(ctx);
     const auto port{static_cast<std::uint16_t>(argc > 2 ? JSValueToNumber(ctx, args[2], nullptr) : 0)};
     sockaddr_storage ss{};
     socklen_t len{};
@@ -155,6 +161,10 @@ JSValueRef dgramn_send_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_
     const std::string data{b64_decode(fs_arg(ctx, argc, args, 1))};
     const auto port{static_cast<std::uint16_t>(argc > 2 ? JSValueToNumber(ctx, args[2], nullptr) : 0)};
     const std::string host{fs_arg(ctx, argc, args, 3)};
+    // Permission Model: node gates UDP send in udp_wrap.cc's DoSend, not just
+    // bind — an unbound socket can still transmit.
+    if (permission_deny_scope(ctx, exc, mbun::permission::Scope::Net, host))
+        return JSValueMakeUndefined(ctx);
     const bool v6{argc > 4 && JSValueToBoolean(ctx, args[4])};
     sockaddr_storage ss{};
     socklen_t len{};

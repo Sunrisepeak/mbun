@@ -40,12 +40,6 @@ int close_range_compat(unsigned first, unsigned last, unsigned flags) {
 JSValueRef proc_spawn_ex_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                             const JSValueRef args[], JSValueRef* exc) {
     std::string file{fs_arg(ctx, argc, args, 0)};
-    // Permission Model: node's ChildProcess scope is enforced in
-    // src/spawn_sync.cc / process_wrap.cc, i.e. at the point of the fork — and
-    // so is it here. `resource` is the executable, which is what
-    // test-permission-child-process-cli asserts on.
-    if (permission_deny_scope(ctx, exc, mbun::permission::Scope::ChildProcess, file))
-        return JSValueMakeUndefined(ctx);
     // argv: args[1] is the FULL argv (including argv[0]).
     std::vector<std::string> argvStr;
     if (argc > 1 && JSValueIsArray(ctx, args[1])) {
@@ -59,6 +53,11 @@ JSValueRef proc_spawn_ex_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
     }
     if (argvStr.empty()) argvStr.push_back(file);
     SpawnOpts o{parse_spawn_opts(ctx, argc, args)};
+    // Permission Model: node enforces the ChildProcess scope at the fork
+    // (src/spawn_sync.cc / process_wrap.cc), and so does this. `resource` is the
+    // executable, which is what test-permission-child-process-cli asserts on.
+    // permission_deny_spawn also handles mbun's worker-as-subprocess case.
+    if (permission_deny_spawn(ctx, exc, file, o.env)) return JSValueMakeUndefined(ctx);
     permission_inject_child_env(o.env, o.haveEnv, argvStr);
     bool detached{false};
     double uid{-1}, gid{-1};
@@ -305,12 +304,6 @@ JSValueRef proc_ids_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t,
 JSValueRef proc_spawn_pty_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                              const JSValueRef args[], JSValueRef* exc) {
     std::string file{fs_arg(ctx, argc, args, 0)};
-    // Permission Model: node's ChildProcess scope is enforced in
-    // src/spawn_sync.cc / process_wrap.cc, i.e. at the point of the fork — and
-    // so is it here. `resource` is the executable, which is what
-    // test-permission-child-process-cli asserts on.
-    if (permission_deny_scope(ctx, exc, mbun::permission::Scope::ChildProcess, file))
-        return JSValueMakeUndefined(ctx);
     std::vector<std::string> argvStr;
     if (argc > 1 && JSValueIsArray(ctx, args[1])) {
         JSObjectRef arr{JSValueToObject(ctx, args[1], nullptr)};
@@ -322,6 +315,11 @@ JSValueRef proc_spawn_pty_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::si
     }
     if (argvStr.empty()) argvStr.push_back(file);
     SpawnOpts o{parse_spawn_opts(ctx, argc, args)};
+    // Permission Model: node enforces the ChildProcess scope at the fork
+    // (src/spawn_sync.cc / process_wrap.cc), and so does this. `resource` is the
+    // executable, which is what test-permission-child-process-cli asserts on.
+    // permission_deny_spawn also handles mbun's worker-as-subprocess case.
+    if (permission_deny_spawn(ctx, exc, file, o.env)) return JSValueMakeUndefined(ctx);
     permission_inject_child_env(o.env, o.haveEnv, argvStr);
     unsigned short cols{80}, rows{24};
     if (argc > 2 && JSValueIsObject(ctx, args[2])) {

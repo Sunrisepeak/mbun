@@ -335,6 +335,49 @@ bool permission_deny_fs(JSContextRef ctx, JSValueRef* exc, std::string_view path
     return true;
 }
 
+// Defined in process_extended.inc; the spawn gate below needs it to recognise a
+// re-exec of this same binary.
+std::string exe_path();
+
+// The spawn gate.
+//
+// mbun implements node's worker_threads as a CHILD PROCESS (one mbun process per
+// worker — see builtins/node_worker.cppm for why), where node uses a thread. So
+// a spawn that is really a worker must be charged to the WorkerThreads scope, not
+// to ChildProcess: `--allow-worker` alone has to be enough, exactly as in node.
+//
+// The allowance is deliberately narrow, because "worker" must not become a
+// general spawn escape:
+//   * WorkerThreads must be granted, AND
+//   * the executable must be THIS binary (a worker re-enters mbun; it can never
+//     exec /bin/sh or any other program), AND
+//   * the child's env must carry the worker handshake variable.
+// The capability that grants is therefore exactly `new Worker(...)`: another mbun
+// process, running JS, and — because the permission flags travel to it in argv
+// and NODE_OPTIONS — under the same sandbox. Nothing a script could not already
+// do with --allow-worker under node.
+bool permission_deny_spawn(JSContextRef ctx, JSValueRef* exc, const std::string& file,
+                           const std::vector<std::string>& env) {
+    if (!gPermission.enabled()) return false;
+    if (gPermission.is_granted(mbun::permission::Scope::ChildProcess)) return false;
+    if (gPermission.is_granted(mbun::permission::Scope::WorkerThreads) && file == exe_path()) {
+        for (const std::string& e : env) {
+            if (e.starts_with("MBUN_WORKER_TID=")) return false;
+        }
+    }
+    if (gPermission.warning_only()) {
+        std::println(std::cerr, "Warning: {} resource: {}",
+                     mbun::permission::access_denied_message(
+                         mbun::permission::Scope::ChildProcess),
+                     file);
+        return false;
+    }
+    if (exc != nullptr) {
+        *exc = permission_denied_error(ctx, mbun::permission::Scope::ChildProcess, file);
+    }
+    return true;
+}
+
 // The non-fs scopes (child process, worker, wasi, addon, inspector, net). Same
 // contract as permission_deny_fs.
 bool permission_deny_scope(JSContextRef ctx, JSValueRef* exc, mbun::permission::Scope scope,

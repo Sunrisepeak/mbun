@@ -75,7 +75,26 @@ export constexpr std::string_view kNetJS = R"JS(
   // ECONNRESET fallback keeps the previous behaviour for unrecognised strings.
   const ERRNO_RE = /\b(ECONNREFUSED|ECONNRESET|ECONNABORTED|EPIPE|ENOENT|EACCES|EPERM|EADDRINUSE|EADDRNOTAVAIL|EAFNOSUPPORT|EHOSTUNREACH|ENETUNREACH|ENETDOWN|ETIMEDOUT|EINVAL|ENAMETOOLONG|EISDIR|ENOTDIR|ELOOP|EMFILE|ENFILE|ENOTSOCK|EAI_AGAIN|EAI_FAIL|ENOTFOUND)\b/;
   const codeOf = (e, fallback) => { const m = String((e && e.message) || e); const hit = ERRNO_RE.exec(m); return hit ? hit[1] : (fallback || "ECONNRESET"); };
+  // A Permission Model refusal is NOT a connect/listen failure to be re-spelled
+  // as `connect ECONNRESET host:port`: node raises ERR_ACCESS_DENIED from
+  // tcp_wrap/pipe_wrap and it reaches the caller verbatim, carrying .permission
+  // and .resource. Re-wrapping it would erase both and report a network error
+  // for something the sandbox refused.
+  const isAccessDenied = (e) => !!(e && e.code === "ERR_ACCESS_DENIED");
   const connectError = (nativeError, host, port) => {
+    if (isAccessDenied(nativeError)) {
+      // node internal/errors.js ExceptionWithHostPort, permission branch:
+      // `connect ERR_ACCESS_DENIED <the denial message>`, with syscall/address/
+      // port attached and the code kept. `.permission`/`.resource` are carried
+      // over too — node drops them here, and keeping them is strictly more
+      // diagnostic information on an error nothing asserts the absence of.
+      const err = mkErr("connect ERR_ACCESS_DENIED " + String(nativeError.message),
+                        "ERR_ACCESS_DENIED");
+      err.syscall = "connect"; err.address = host;
+      if (port !== undefined) err.port = port;
+      err.permission = nativeError.permission; err.resource = nativeError.resource;
+      return err;
+    }
     const code = codeOf(nativeError);
     // node formats a pipe/unix connect as `connect <code> <path>` — no port.
     const error = mkErr("connect " + code + " " + host + (port === undefined ? "" : ":" + port), code);
@@ -90,6 +109,7 @@ export constexpr std::string_view kNetJS = R"JS(
   // node lib/net.js Server: a bind failure carries the requested address/port and
   // syscall so `err.address`/`err.port` are usable (test-net-better-error-messages-*).
   const listenError = (nativeError, address, port) => {
+    if (isAccessDenied(nativeError)) return nativeError;
     // A bind failure the natives describe without an errno ("Is port N in use?")
     // is the address-in-use case, which is what the previous hard-coded value
     // covered — keep it as the fallback so EADDRINUSE detection is unchanged.
@@ -780,7 +800,10 @@ export constexpr std::string_view kNetJS = R"JS(
         if (cb) this.once("listening", cb);
         let ulh;
         try { if (pipePathTooLong(unixPath)) throw new Error("EINVAL"); ulh = NN.listenUnix(unixPath); }
-        catch (e) { const err = listenError(e, unixPath); G.queueMicrotask(() => this.emit("error", err)); return this; }
+        // node's pipe_wrap Bind raises ERR_ACCESS_DENIED synchronously, so
+        // `assert.throws(() => server.listen(path))` sees it — an async 'error'
+        // event would not be catchable there.
+        catch (e) { if (isAccessDenied(e)) throw e; const err = listenError(e, unixPath); G.queueMicrotask(() => this.emit("error", err)); return this; }
         this._fd = ulh.fd;
         this._addr = { address: unixPath, family: "unix", port: 0 };
         this.listening = true;
@@ -803,7 +826,7 @@ export constexpr std::string_view kNetJS = R"JS(
       if (cb) this.once("listening", cb);
       let lh;
       try { lh = NN.listen(bindHost, port, !!this._reusePort); }
-      catch (e) { const err = listenError(e, host, port); G.queueMicrotask(() => this.emit("error", err)); return this; }
+      catch (e) { if (isAccessDenied(e)) throw e; const err = listenError(e, host, port); G.queueMicrotask(() => this.emit("error", err)); return this; }
       this._fd = lh.fd;
       const reportAddr = host === "localhost" ? (isV6 ? "::1" : "127.0.0.1") : host;
       this._addr = { port: lh.port, address: reportAddr, family: isV6 ? "IPv6" : "IPv4" };

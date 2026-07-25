@@ -53,12 +53,6 @@ JSValueRef cp_spawn_sync_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
     return fs_throw(ctx, exc, "spawnSync: not supported on Windows yet");
 #else
     std::string file{fs_arg(ctx, argc, args, 0)};
-    // Permission Model: node's ChildProcess scope is enforced in
-    // src/spawn_sync.cc / process_wrap.cc, i.e. at the point of the fork — and
-    // so is it here. `resource` is the executable, which is what
-    // test-permission-child-process-cli asserts on.
-    if (permission_deny_scope(ctx, exc, mbun::permission::Scope::ChildProcess, file))
-        return JSValueMakeUndefined(ctx);
     std::vector<std::string> argvStr{file};
     if (argc > 1 && JSValueIsArray(ctx, args[1])) {
         JSObjectRef arr{JSValueToObject(ctx, args[1], nullptr)};
@@ -146,6 +140,11 @@ JSValueRef cp_spawn_sync_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
     const bool pipeErr{stdioMode[2] == Stdio::Pipe};
 
     int outPipe[2]{-1, -1}, errPipe[2]{-1, -1}, inPipe[2]{-1, -1}, statPipe[2];
+    // Permission Model: node enforces the ChildProcess scope at the fork
+    // (src/spawn_sync.cc / process_wrap.cc), and so does this. `resource` is the
+    // executable, which is what test-permission-child-process-cli asserts on.
+    // permission_deny_spawn also handles mbun's worker-as-subprocess case.
+    if (permission_deny_spawn(ctx, exc, file, envStr)) return JSValueMakeUndefined(ctx);
     permission_inject_child_env(envStr, haveEnv, argvStr);
     if ((pipeIn && pipe(inPipe) != 0) || (pipeOut && pipe(outPipe) != 0) ||
         (pipeErr && pipe(errPipe) != 0) || pipe(statPipe) != 0) {
@@ -426,14 +425,13 @@ JSValueRef proc_spawn_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t
     return fs_throw(ctx, exc, "proc.spawn: not supported on Windows yet");
 #else
     std::string file{fs_arg(ctx, argc, args, 0)};
-    // Permission Model: node's ChildProcess scope is enforced in
-    // src/spawn_sync.cc / process_wrap.cc, i.e. at the point of the fork — and
-    // so is it here. `resource` is the executable, which is what
-    // test-permission-child-process-cli asserts on.
-    if (permission_deny_scope(ctx, exc, mbun::permission::Scope::ChildProcess, file))
-        return JSValueMakeUndefined(ctx);
     std::vector<std::string> argvStr{parse_spawn_argv(ctx, argc, args, file)};
     SpawnOpts o{parse_spawn_opts(ctx, argc, args)};
+    // Permission Model: node enforces the ChildProcess scope at the fork
+    // (src/spawn_sync.cc / process_wrap.cc), and so does this. `resource` is the
+    // executable, which is what test-permission-child-process-cli asserts on.
+    // permission_deny_spawn also handles mbun's worker-as-subprocess case.
+    if (permission_deny_spawn(ctx, exc, file, o.env)) return JSValueMakeUndefined(ctx);
     permission_inject_child_env(o.env, o.haveEnv, argvStr);
     int inPipe[2], outPipe[2], errPipe[2];
     if (pipe(inPipe) != 0 || pipe(outPipe) != 0 || pipe(errPipe) != 0) {
@@ -785,14 +783,13 @@ JSValueRef proc_spawn_sync_b64_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, st
     return fs_throw(ctx, exc, "proc.spawnSyncB64: not supported on Windows yet");
 #else
     std::string file{fs_arg(ctx, argc, args, 0)};
-    // Permission Model: node's ChildProcess scope is enforced in
-    // src/spawn_sync.cc / process_wrap.cc, i.e. at the point of the fork — and
-    // so is it here. `resource` is the executable, which is what
-    // test-permission-child-process-cli asserts on.
-    if (permission_deny_scope(ctx, exc, mbun::permission::Scope::ChildProcess, file))
-        return JSValueMakeUndefined(ctx);
     std::vector<std::string> argvStr{parse_spawn_argv(ctx, argc, args, file)};
     SpawnOpts o{parse_spawn_opts(ctx, argc, args)};
+    // Permission Model: node enforces the ChildProcess scope at the fork
+    // (src/spawn_sync.cc / process_wrap.cc), and so does this. `resource` is the
+    // executable, which is what test-permission-child-process-cli asserts on.
+    // permission_deny_spawn also handles mbun's worker-as-subprocess case.
+    if (permission_deny_spawn(ctx, exc, file, o.env)) return JSValueMakeUndefined(ctx);
     permission_inject_child_env(o.env, o.haveEnv, argvStr);
     std::string input;
     // No budget / no deadline unless the caller asks for one. `Infinity` on the

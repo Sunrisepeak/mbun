@@ -168,6 +168,15 @@ inline constexpr std::string_view kNodePermissionJS = R"JS(
     if (path) Object.freeze(path);
   } catch (e) {}
 
+  // The startup warnings. They are already on stderr (printed from C++ where the
+  // flags are parsed), because emitWarning at THIS point is lost: this IIFE runs
+  // inside the builtins image, whose nextTick queue drains before the entry
+  // script exists, so no listener can have been attached yet.
+  //
+  // They are still delivered to a listener, because node does and the corpus
+  // checks it (common.expectWarning): held here and replayed the moment someone
+  // subscribes to 'warning'. The interception removes itself on the first flush.
+  const pending = [];
   const warnFlags = [
     ["--allow-addons", PN.allowAddons],
     ["--allow-child-process", PN.allowChildProcess],
@@ -177,10 +186,15 @@ inline constexpr std::string_view kNodePermissionJS = R"JS(
   ];
   for (const [flag, on] of warnFlags) {
     if (on) {
-      proc.emitWarning(
+      pending.push(["SecurityWarning",
         "The flag " + flag + " must be used with extreme caution. " +
-        "It could invalidate the permission model.", "SecurityWarning");
+        "It could invalidate the permission model."]);
     }
+  }
+  if (PN.allowFfi) {
+    pending.push(["SecurityWarning",
+      "The flag --allow-ffi must be used with extreme caution. " +
+      "It could invalidate the permission model."]);
   }
 
   // The comma-separated form stopped being a path list in node 20; a single
@@ -188,17 +202,40 @@ inline constexpr std::string_view kNodePermissionJS = R"JS(
   for (const [flag, values] of [["--allow-fs-read", PN.allowFsRead],
                                 ["--allow-fs-write", PN.allowFsWrite]]) {
     if (values && values.length === 1 && String(values[0]).includes(",")) {
-      proc.emitWarning(
+      pending.push(["Warning",
         "The " + flag + " CLI flag has changed. " +
         "Passing a comma-separated list of paths is no longer valid. " +
         "Documentation can be found at " +
-        "https://nodejs.org/api/permissions.html#file-system-permissions",
-        "Warning");
+        "https://nodejs.org/api/permissions.html#file-system-permissions"]);
     }
   }
 
   if (PN.allowNet) {
-    proc.emitWarning("The flag --allow-net is under experimental phase.", "ExperimentalWarning");
+    pending.push(["ExperimentalWarning", "The flag --allow-net is under experimental phase."]);
+  }
+
+  if (pending.length) {
+    const originals = {};
+    const names = ["on", "addListener", "once", "prependListener", "prependOnceListener"];
+    for (const n of names) originals[n] = proc[n];
+    const restore = () => { for (const n of names) if (typeof originals[n] === "function") proc[n] = originals[n]; };
+    const flush = () => {
+      if (!pending.length) return;
+      const list = pending.splice(0, pending.length);
+      restore();
+      for (const [type, message] of list) {
+        try { proc.emitWarning(message, type); } catch (e) {}
+      }
+    };
+    for (const n of names) {
+      const orig = originals[n];
+      if (typeof orig !== "function") continue;
+      proc[n] = function (event, listener) {
+        const r = orig.call(this, event, listener);
+        if (String(event) === "warning") flush();
+        return r;
+      };
+    }
   }
 
   Object.defineProperty(proc, "permission", {
