@@ -339,7 +339,7 @@ struct TlsChannel::Impl {
             if (!config.serverName.empty()) {
                 // SNI. The cast drops const per the historic macro signature.
                 ::SSL_set_tlsext_host_name(ssl_, config.serverName.c_str());
-                if (config.verify != VerifyMode::disabled) {
+                if (config.verify != VerifyMode::disabled && config.hostCheck) {
                     ::SSL_set1_host(ssl_, config.serverName.c_str());
                 }
             }
@@ -358,6 +358,40 @@ struct TlsChannel::Impl {
     // distro CA bundle locations (this is what bun's platform trust discovery
     // resolves to on Linux), and only fall back to the compiled-in default.
     bool configure_default_trust_() {
+        const bool ok {load_system_trust_()};
+        // node's NewRootCertStore() appends NODE_EXTRA_CA_CERTS to the *default*
+        // root store, i.e. exactly the store used when the caller gave no `ca`
+        // option (lib/internal/tls/secure-context.js calls addRootCerts() only in
+        // that branch). Additional anchors, never a relaxation: a chain that does
+        // not reach one of them still fails. A load failure is ignored here and
+        // reported by the JS layer's one-shot warning, as node does.
+        load_extra_root_certs_();
+        return ok;
+    }
+
+    void load_extra_root_certs_() {
+        const char* file {std::getenv("NODE_EXTRA_CA_CERTS")};
+        if (file == nullptr || *file == '\0') {
+            return;
+        }
+        BIO* bio {::BIO_new_file(file, "r")};
+        if (bio == nullptr) {
+            ::ERR_clear_error(); // the JS layer owns the user-visible warning
+            return;
+        }
+        X509_STORE* store {::SSL_CTX_get_cert_store(ctx_)};
+        X509* cert {nullptr};
+        while ((cert = ::PEM_read_bio_X509_AUX(bio, nullptr, nullptr, nullptr)) != nullptr) {
+            if (store != nullptr) {
+                ::X509_STORE_add_cert(store, cert);
+            }
+            ::X509_free(cert);
+        }
+        ::ERR_clear_error(); // the loop always ends on a "no start line" read
+        ::BIO_free(bio);
+    }
+
+    bool load_system_trust_() {
         if (const char* file {std::getenv("SSL_CERT_FILE")}; file != nullptr && *file != '\0') {
             if (::SSL_CTX_load_verify_locations(ctx_, file, nullptr) == 1) {
                 return true;
@@ -410,10 +444,17 @@ struct TlsChannel::Impl {
             ::X509_free(cert);
         }
         ::BIO_free(bio);
-        if (added == 0) {
-            fail_("load_ca_pem: no certificates in CA bundle");
-            return false;
-        }
+        // node's SecureContext::AddCACert reads certificates in a `while` loop and
+        // stops at the first non-certificate block WITHOUT raising: a `ca` input
+        // that holds no certificate simply contributes no anchor
+        // (test-tls-cnnic-whitelist passes a *private key* as `ca` and expects the
+        // connection to fail later with UNABLE_TO_GET_ISSUER_CERT_LOCALLY, not to
+        // throw at context setup). This fails CLOSED — an empty trust store
+        // verifies nothing — so it relaxes no check; it only moves where the
+        // failure is reported. The trailing "no start line" is the loop's normal
+        // terminator and must not leak into the next fail_() as a stale reason.
+        ::ERR_clear_error();
+        static_cast<void>(added);
         return true;
     }
 

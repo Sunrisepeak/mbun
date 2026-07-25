@@ -41,6 +41,13 @@ export struct Config {
     // default: silently ignoring a caller's cipher restriction is how a
     // connection ends up weaker than the operator asked for.
     std::string ciphers {};
+    // Fold the peer-name check into OpenSSL's chain verification
+    // (SSL_set1_host). node has no equivalent: it verifies the chain in OpenSSL
+    // and the NAME in JS (tls.checkServerIdentity), which a caller may replace.
+    // Set false ONLY when such a replacement will run in JS — it stands the name
+    // check down in one place so it can run in the other, and never affects
+    // chain verification. Default true: the strict path is the default path.
+    bool hostCheck {true};
 
     [[nodiscard]] bool has_credentials() const noexcept {
         return !certificate.empty() || !key.empty();

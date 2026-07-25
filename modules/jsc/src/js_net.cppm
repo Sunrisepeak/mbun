@@ -634,7 +634,13 @@ export constexpr std::string_view kNetJS = R"JS(
         const vmode = typeof o.verify === "number" ? o.verify : (o.verify ? 1 : 0);
         NN.tlsWrap(this._fd, !!o.isServer, o.cert || "", o.key || "", o.servername || "",
                    vmode, o.ca || "", o.alpn || "", o.minVersion || "", o.maxVersion || "",
-                   o.ciphers || "");
+                   o.ciphers || "",
+                   // hostCheck: fold the peer-name check into OpenSSL's verify
+                   // (SSL_set1_host) unless the caller replaced it with its own
+                   // tls.connect({ checkServerIdentity }), which node runs in JS
+                   // INSTEAD of the default. Default true — omitting the flag must
+                   // never be the same as switching the check off.
+                   o.hostCheck === false ? false : true);
         this._tls = 1;
       } catch (e) { this._fail(e); }
       return this;

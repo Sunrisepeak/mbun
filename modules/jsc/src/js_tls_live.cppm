@@ -418,6 +418,25 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
         if (!self.authorized && self._rejectUnauthorized) {
           self.authorizationError = self.authorizationError || "UNABLE_TO_VERIFY_LEAF_SIGNATURE";
         }
+        // Caller-supplied peer-name check. node runs it in onConnectSecure only
+        // when the CHAIN verified (a chain failure already decided the outcome),
+        // records `err.code` as authorizationError, and destroys the socket with
+        // that error when rejectUnauthorized is on. A function that throws is not
+        // swallowed: node lets it propagate, and so must this — swallowing it
+        // would turn a rejected peer into an accepted one.
+        if (!options.isServer && typeof options.checkServerIdentity === "function" && self.authorized) {
+          const identErr = options.checkServerIdentity(
+            options.identityHost || self.servername || "",
+            self.getPeerCertificate(true));
+          if (identErr) {
+            self.authorized = false;
+            self.authorizationError = identErr.code || identErr.message;
+            if (self._rejectUnauthorized) {
+              self.destroy(identErr);
+              return;
+            }
+          }
+        }
         if (transport.remoteAddress) self.remoteAddress = transport.remoteAddress;
         self.remotePort = transport.remotePort;
         self.emit("secure");
@@ -448,6 +467,7 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
           // node SecureContext::SetCiphers. Only a caller-supplied list is sent;
           // "" leaves the engine's default suite selection untouched.
           ciphers: typeof options.ciphers === "string" ? options.ciphers : "",
+          hostCheck: !(typeof options.checkServerIdentity === "function"),
         });
       };
       // A live fd means the reactor's connect() already returned, whether this is
@@ -630,9 +650,18 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
     const servername = opts.servername != null ? opts.servername
       : (typeof opts.host === "string" && !netIsIP(opts.host) ? opts.host : "");
     const transportOpt = opts.socket;
+    // A CALLER-SUPPLIED checkServerIdentity replaces node's default peer-name
+    // check (lib/_tls_wrap.js onConnectSecure picks
+    // `options.checkServerIdentity || tls.checkServerIdentity`). mbun's default
+    // check lives in OpenSSL (SSL_set1_host), where a JS function cannot replace
+    // it — so when, and only when, the caller passed its own, hand the name check
+    // to JS and tell the native layer to stand its copy down. The default stays
+    // native and unchanged. Chain verification is unaffected in both cases.
+    const customIdentity = typeof opts.checkServerIdentity === "function" &&
+      opts.checkServerIdentity !== T.checkServerIdentity ? opts.checkServerIdentity : null;
     const tlsOpts = { isServer: false, servername, ca: opts.ca, cert: opts.cert, key: opts.key, rejectUnauthorized: opts.rejectUnauthorized, ALPNProtocols: opts.ALPNProtocols,
       minVersion: opts.minVersion, maxVersion: opts.maxVersion, secureProtocol: opts.secureProtocol, secureContext: opts.secureContext,
-      ciphers: opts.ciphers };
+      ciphers: opts.ciphers, checkServerIdentity: customIdentity, identityHost: servername || host };
 
     if (isMbunNetSocket(transportOpt)) {
       const tlsSock = new TLSSocket(transportOpt, tlsOpts);

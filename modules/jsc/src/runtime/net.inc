@@ -581,6 +581,15 @@ JSValueRef netn_tls_wrap_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
     // the context default; a list OpenSSL matches nothing to fails the wrap
     // rather than quietly widening the negotiated set.
     if (argc > 10) { cfg.ciphers = fs_arg(ctx, argc, args, 10); }
+    // arg 11: hostCheck. node performs the peer-NAME check in JS
+    // (tls.checkServerIdentity) and lets a caller replace it; mbun folds the
+    // default check into OpenSSL via SSL_set1_host, which is stricter but cannot
+    // be replaced. `false` here means "a caller-supplied checkServerIdentity will
+    // run in JS instead", so the native check must stand aside — the CHAIN
+    // verification is untouched either way. Absent argument = check enabled.
+    if (argc > 11 && JSValueIsBoolean(ctx, args[11])) {
+        cfg.hostCheck = JSValueToBoolean(ctx, args[11]);
+    }
     auto st{std::make_unique<NetTlsState>(
         isServer ? mbun::tls::TlsRole::server : mbun::tls::TlsRole::client, std::move(cfg))};
     if (!st->channel.valid()) {

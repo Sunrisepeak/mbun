@@ -438,8 +438,46 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
     }
   };
   function SecureContext(options) { return new InternalSecureContext(options); }
+  // NODE_EXTRA_CA_CERTS that cannot be read is a WARNING, not an error: node's
+  // NewRootCertStore() prints it to raw stderr once (the root store is built
+  // once) and carries on with the bundled roots only. The trust anchors
+  // themselves are added by the native layer's load_extra_root_certs_(); this is
+  // only the diagnostic, kept here because it must fire even for a context that
+  // never opens a connection (test-tls-env-bad-extra-ca does `createServer({})`
+  // and nothing else). Blueprint: node src/crypto/crypto_context.cc.
+  let _extraCaWarned = false;
+  function warnBadExtraCACerts() {
+    if (_extraCaWarned) return;
+    const path = G.process && G.process.env && G.process.env.NODE_EXTRA_CA_CERTS;
+    if (!path) return;
+    _extraCaWarned = true;
+    let reason = null;
+    try {
+      const fs = M["fs"] || M["node:fs"];
+      if (fs && typeof fs.readFileSync === "function") fs.readFileSync(path);
+    } catch (e) {
+      // OpenSSL's own reason string, which is what node interpolates. The test's
+      // regex wants the capitalised strerror text, not fs's lowercased message.
+      const code = e && e.code;
+      const text = code === "ENOENT" ? "No such file or directory"
+        : code === "EACCES" ? "Permission denied"
+        : code === "EISDIR" ? "Is a directory"
+        : (e && e.message) || String(e);
+      reason = "error:80000002:system library::" + text;
+    }
+    if (reason === null) return;
+    const line = "Warning: Ignoring extra certs from `" + path + "`, load failed: " + reason + "\n";
+    try {
+      if (G.process && G.process.stderr && typeof G.process.stderr.write === "function") G.process.stderr.write(line);
+      else if (G.process && typeof G.process._rawDebug === "function") G.process._rawDebug(line);
+    } catch (e) {}
+  }
   function createSecureContext(options) {
     if (options instanceof InternalSecureContext) return options;
+    // node reaches NewRootCertStore() only in the `else` branch of
+    // `if (ca) addCACert(...) else addRootCerts()`, so an explicit `ca` neither
+    // gains the extra anchors nor triggers the warning.
+    if (!(options && options.ca)) warnBadExtraCACerts();
     return new InternalSecureContext(options, false);
   }
 
