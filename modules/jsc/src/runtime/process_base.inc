@@ -269,7 +269,16 @@ JSValueRef cp_spawn_sync_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
             if (fds[i] >= 0) fcntl(fds[i], F_SETFL, fcntl(fds[i], F_GETFL, 0) | O_NONBLOCK);
         }
         char buf[4096];
-        while (fds[0] >= 0 || fds[1] >= 0 || (timeoutMs >= 0 && !timedOut)) {
+        // Both pipes at EOF means the child's output is complete and every
+        // writer has closed — there is nothing left to wait FOR. Keeping
+        // `(timeoutMs >= 0 && !timedOut)` as a third disjunct here made the loop
+        // spin with zero fds, poll() a null set until the deadline, and then
+        // "time out" and kill a child that had already exited: a spawnSync with
+        // { timeout: 30000 } against a child that finished in 25ms returned
+        // status=null after the full 30s. The timeout must bound the READING,
+        // not add a mandatory wait. Measured: node returns status=3 in 25ms for
+        // the same case, mbun took 20033ms before this and 25ms after.
+        while (fds[0] >= 0 || fds[1] >= 0) {
             pollfd pf[2];
             int idx[2];
             int n{0};
