@@ -1748,6 +1748,113 @@ inline constexpr std::string_view kNodeInternalBindingJS = R"JS(
     PipeConnectWrap: class PipeConnectWrap { constructor() { this.oncomplete = undefined; } },
   });
 
+  // -------------------------------------------------------------- tty_wrap ----
+  // node src/tty_wrap.cc. `internal/child_process` destructures TTY at module
+  // load and only ever uses it for `stream instanceof TTY` in
+  // getHandleWrapType(), so the class needs to exist more than it needs to
+  // drive a terminal. uv_tty_init() fails EINVAL on a non-tty fd; keep that,
+  // because a TTY that constructs over a pipe would make every handle look
+  // like a terminal. guessHandleType is the real probe already used by the
+  // `util` binding.
+  factories["tty_wrap"] = () => {
+    const ttyOf = () => { try { return mod("tty"); } catch { return null; } };
+    return {
+      isTTY(fd) { const t = ttyOf(); try { return !!(t && t.isatty(fd)); } catch { return false; } },
+      guessHandleType(fd) { return internalBinding("util").guessHandleType(fd); },
+      TTY: class TTY {
+        constructor(fd) {
+          this.fd = fd | 0;
+          const t = ttyOf();
+          let atty = false;
+          try { atty = !!(t && t.isatty(this.fd)); } catch { atty = false; }
+          if (!atty) { const e = new Error("EINVAL: invalid argument, uv_tty_init"); e.code = "EINVAL"; throw e; }
+        }
+        getWindowSize(arr) {
+          const out = G.process && G.process.stdout;
+          arr[0] = (out && out.columns) || 80; arr[1] = (out && out.rows) || 24;
+          return true;
+        }
+        setRawMode() { return 0; }
+        readStart() { return 0; } readStop() { return 0; }
+        close(cb) { if (typeof cb === "function") cb(); }
+        ref() {} unref() {}
+      },
+    };
+  };
+
+  // -------------------------------------------------------------- udp_wrap ----
+  // node src/udp_wrap.cc. Same reason as tty_wrap: internal/child_process and
+  // internal/cluster destructure UDP for `instanceof` branches. mbun's dgram is
+  // not built on a JS-reachable libuv handle, so bind/send report EINVAL rather
+  // than pretending a socket exists.
+  factories["udp_wrap"] = () => ({
+    constants: { UV_UDP_IPV6ONLY: 1, UV_UDP_REUSEADDR: 4, UV_UDP_REUSEPORT: 8 },
+    UDP: class UDP {
+      constructor() { this.fd = -1; }
+      bind() { return -22; } bind6() { return -22; }
+      connect() { return -22; } connect6() { return -22; }
+      disconnect() { return -22; }
+      send() { return -22; } send6() { return -22; }
+      open() { return -9; }
+      recvStart() { return 0; } recvStop() { return 0; }
+      getsockname() { return -9; } getpeername() { return -9; }
+      addMembership() { return -22; } dropMembership() { return -22; }
+      setBroadcast() { return 0; } setTTL() { return 0; }
+      setMulticastTTL() { return 0; } setMulticastLoopback() { return 0; }
+      setMulticastInterface() { return 0; }
+      bufferSize() { return 0; }
+      close(cb) { if (typeof cb === "function") cb(); }
+      ref() {} unref() {}
+    },
+    SendWrap: class SendWrap { constructor() { this.oncomplete = undefined; } },
+  });
+
+  // ----------------------------------------------------------- process_wrap ----
+  // node src/process_wrap.cc. `internal/child_process` destructures Process at
+  // module LOAD time, so an unregistered binding made
+  // `require('internal/child_process')` throw "No such binding: process_wrap"
+  // before any test could reach the pure-JS helpers it exports (getValidStdio,
+  // the ChildProcess prototype the corpus monkey-patches).
+  //
+  // spawn() THROWS rather than reporting a uv errno: mbun's node:child_process
+  // does not route through this handle — it drives its own native spawner — so
+  // a Process that "succeeded" and never started anything would hand back a
+  // ChildProcess that silently never exits. Failing at the point of use keeps
+  // the unimplemented path visible (same rule as stream_pipe above).
+  factories["process_wrap"] = () => strictNs("process_wrap", {
+    Process: class Process {
+      constructor() { this.pid = undefined; this.onexit = undefined; }
+      spawn() {
+        const err = new Error(
+          "process_wrap.Process#spawn is not implemented in mbun; node:child_process " +
+          "spawns through the runtime's own process backend, not this handle");
+        err.code = "ERR_METHOD_NOT_IMPLEMENTED";
+        throw err;
+      }
+      kill(signal) {
+        if (typeof this.pid !== "number") return -3;  // UV_ESRCH
+        try { G.process.kill(this.pid, signal); return 0; } catch { return -3; }
+      }
+      close(cb) { if (typeof cb === "function") cb(); }
+      ref() {} unref() {} hasRef() { return true; }
+    },
+  });
+
+  // ------------------------------------------------------------ spawn_sync ----
+  // node src/spawn_sync.cc. Destructured whole (`const spawn_sync =
+  // internalBinding('spawn_sync')`) by internal/child_process; only
+  // `spawn_sync.spawn(options)` is ever called. Same honesty rule as
+  // process_wrap: mbun's spawnSync does not funnel through here.
+  factories["spawn_sync"] = () => strictNs("spawn_sync", {
+    spawn() {
+      const err = new Error(
+        "spawn_sync.spawn is not implemented in mbun; node:child_process spawnSync " +
+        "runs through the runtime's own process backend, not this binding");
+      err.code = "ERR_METHOD_NOT_IMPLEMENTED";
+      throw err;
+    },
+  });
+
   // ----------------------------------------------------------- http_parser ----
   // node src/node_http_parser.cc. The callback-slot indices and the type
   // constants ARE the protocol between node's lib/_http_common.js and llhttp;

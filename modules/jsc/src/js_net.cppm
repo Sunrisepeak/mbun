@@ -236,6 +236,19 @@ export constexpr std::string_view kNetJS = R"JS(
       // final uncork(); keep the cork counter in one place.
       this._corked = 0;
       this._writableState = { corked: 0, ended: false, finished: false, destroyed: false, length: 0, objectMode: false, highWaterMark: this._hwm };
+      // node `new net.Socket({ fd })`: the socket takes over an already-open
+      // descriptor (createHandle + this[kHandle].open(fd)) and is live
+      // immediately — no connect(). That is how a child reads the extra stdio
+      // slots its parent opened, e.g. `new net.Socket({ fd: 4 })` against
+      // `cluster.setupPrimary({ stdio: [..., 'pipe'] })`
+      // (test-cluster-fork-stdio). `readable`/`writable` default to true here
+      // because this transport is duplex either way; node only uses them to
+      // decide which halves to start.
+      if (typeof opts.fd === "number" && opts.fd >= 0) {
+        this._adopt(opts.fd);
+        if (opts.readable === false) this.readable = false;
+        if (opts.writable === false) this.writable = false;
+      }
     }
     _adopt(fd) {
       // A descriptor received over IPC (SCM_RIGHTS) never went through

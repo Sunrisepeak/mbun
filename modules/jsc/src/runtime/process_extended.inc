@@ -119,6 +119,20 @@ JSValueRef proc_spawn_ex_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
             continue;
         }
         if (slots[i].kind != StdioSlot::Kind::Pipe) continue;
+        // Slots 0/1/2 are half-duplex by nature (stdin reads, stdout/stderr
+        // write), so a pipe() is both sufficient and cheaper. A 'pipe' slot
+        // ABOVE stderr has no such direction: node backs every extra slot with a
+        // uv_pipe_t (a socketpair) and hands the parent a duplex net.Socket, which
+        // is what `cluster.setupPrimary({ stdio: [..., 'ipc', 'pipe'] })` then
+        // writes to and reads from over the same descriptor
+        // (test-cluster-fork-stdio). A half-duplex pipe gave the parent a
+        // read-only end, so channel.write() had nothing to write to.
+        if (i >= 3) {
+            if (::socketpair(AF_UNIX, SOCK_STREAM, 0, pipes[i].data()) != 0) {
+                return fs_throw(ctx, exc, "spawnEx: socketpair() failed");
+            }
+            continue;
+        }
         if (pipe(pipes[i].data()) != 0) return fs_throw(ctx, exc, "spawnEx: pipe() failed");
     }
     int errPipe[2];
