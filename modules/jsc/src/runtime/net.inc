@@ -59,6 +59,29 @@ bool net_parse_addr(const std::string& host, std::uint16_t port, sockaddr_in& ou
 #endif
 
 // net.listen(host, port) → { fd, port } (port resolved when 0).
+// errno → its POSIX NAME. The JS net layer classifies native failures by
+// scanning the thrown message for an errno name (js_net.cppm ERRNO_RE), so a
+// strerror-only message ("Permission denied") is indistinguishable from any
+// other and falls back to EADDRINUSE.
+inline const char* net_errno_name(int e) {
+    switch (e) {
+    case EACCES: return "EACCES";
+    case EPERM: return "EPERM";
+    case EADDRINUSE: return "EADDRINUSE";
+    case EADDRNOTAVAIL: return "EADDRNOTAVAIL";
+    case EAFNOSUPPORT: return "EAFNOSUPPORT";
+    case EINVAL: return "EINVAL";
+    case ELOOP: return "ELOOP";
+    case ENAMETOOLONG: return "ENAMETOOLONG";
+    case ENOENT: return "ENOENT";
+    case ENOTDIR: return "ENOTDIR";
+    case EMFILE: return "EMFILE";
+    case ENFILE: return "ENFILE";
+    case ENOTSOCK: return "ENOTSOCK";
+    default: return "UNKNOWN";
+    }
+}
+
 JSValueRef netn_listen_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                           const JSValueRef args[], JSValueRef* exc) {
 #if defined(_WIN32)
@@ -75,11 +98,32 @@ JSValueRef netn_listen_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_
     if (fd < 0) return fs_throw(ctx, exc, "net.listen: socket() failed");
     const int one{1};
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    // net.Server.listen({ reusePort: true }): several sockets may hold the same
+    // address and the kernel load-balances accepts between them. Without it a
+    // second listen on the port fails EADDRINUSE (test-cluster-net-reuseport,
+    // test-net-server-reuseport).
+    if (argc > 2 && JSValueToBoolean(ctx, args[2])) {
+#ifdef SO_REUSEPORT
+        if (setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one) != 0) {
+            const int saved{errno};
+            close(fd);
+            return fs_throw(ctx, exc, std::string{"net.listen: SO_REUSEPORT failed ("} +
+                                          net_errno_name(saved) + ": " + std::strerror(saved) + ")");
+        }
+#else
+        close(fd);
+        return fs_throw(ctx, exc, "net.listen: SO_REUSEPORT failed (ENOTSUP: not supported)");
+#endif
+    }
     if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof addr) != 0 ||
         ::listen(fd, 128) != 0) {
+        const int saved{errno};
         close(fd);
+        // The errno NAME, not just strerror: the JS layer classifies a bind
+        // failure by scanning this message, so "Permission denied" alone was
+        // reported as EADDRINUSE (test-cluster-bind-privileged-port wants EACCES).
         return fs_throw(ctx, exc, std::string{"net.listen: bind/listen failed ("} +
-                                      std::strerror(errno) + ")");
+                                      net_errno_name(saved) + ": " + std::strerror(saved) + ")");
     }
     sockaddr_in bound{};
     socklen_t blen{sizeof bound};
@@ -331,6 +375,27 @@ JSValueRef netn_shutdown_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
                             const JSValueRef args[], JSValueRef*) {
 #if !defined(_WIN32)
     if (argc > 0) shutdown(static_cast<int>(JSValueToNumber(ctx, args[0], nullptr)), SHUT_WR);
+#endif
+    return JSValueMakeUndefined(ctx);
+}
+
+// net.track(fd) → join an EXTERNALLY acquired descriptor to the reactor's poll
+// set (and make it non-blocking). Descriptors that arrive over SCM_RIGHTS —
+// node's NODE_HANDLE protocol, i.e. every socket cluster hands to a worker —
+// never passed through accept()/connect(), so they were absent from net_fds()
+// and netn_wait_cb never polled them: the pump parked for up to 60s while a
+// readable byte or a FIN sat unnoticed on the socket, which is a hang for any
+// test with a 15s budget (test-cluster-worker-wait-server-close,
+// test-cluster-disconnect). Idempotent, so the accept()/connect() paths that
+// already registered their fd can call it too.
+JSValueRef netn_track_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                         const JSValueRef args[], JSValueRef*) {
+#if !defined(_WIN32)
+    const int fd{argc > 0 ? static_cast<int>(JSValueToNumber(ctx, args[0], nullptr)) : -1};
+    if (fd >= 0 && !net_fds().contains(fd)) {
+        net_set_nonblock(fd);
+        net_fds().insert(fd);
+    }
 #endif
     return JSValueMakeUndefined(ctx);
 }

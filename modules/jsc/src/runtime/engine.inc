@@ -1622,6 +1622,10 @@ public:
         set_fn(ctx_, pn, "setNonBlock", proc_set_nonblock_cb);
         set_fn(ctx_, pn, "writeNB", proc_write_nb_cb);
         set_fn(ctx_, pn, "readNB", proc_read_nb_cb);
+        // SCM_RIGHTS twins of writeNB/readNB — node's NODE_HANDLE protocol.
+        set_fn(ctx_, pn, "sendmsgFd", proc_sendmsg_fd_cb);
+        set_fn(ctx_, pn, "recvmsgFd", proc_recvmsg_fd_cb);
+        set_fn(ctx_, pn, "setenv", proc_setenv_cb);
 #endif
         set_prop(ctx_, global, "__mbunProcNative", pn);
         // bun:ffi native backend (Bun.FFI): dlopen + SysV call path + read/ptr.
@@ -1718,6 +1722,7 @@ public:
         set_fn(ctx_, nn, "write", netn_write_cb);
         set_fn(ctx_, nn, "shutdown", netn_shutdown_cb);
         set_fn(ctx_, nn, "close", netn_close_cb);
+        set_fn(ctx_, nn, "track", netn_track_cb);  // adopt an SCM_RIGHTS descriptor
         set_fn(ctx_, nn, "setSockBuf", netn_set_sockbuf_cb);
         set_fn(ctx_, nn, "wait", netn_wait_cb);
         set_fn(ctx_, nn, "sleep", netn_sleep_cb);

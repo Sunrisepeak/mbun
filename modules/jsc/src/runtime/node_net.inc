@@ -82,6 +82,23 @@ JSValueRef dgramn_create_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
         const int one{1};
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
     }
+    // dgram.createSocket({ reusePort: true }): the kernel load-balances incoming
+    // datagrams across every socket holding the address, so two binds to the
+    // same port must both succeed (test-cluster-dgram-reuseport).
+    if (argc > 2 && JSValueToBoolean(ctx, args[2])) {
+#ifdef SO_REUSEPORT
+        const int one{1};
+        if (setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one) != 0) {
+            const int saved{errno};
+            close(fd);
+            return fs_throw(ctx, exc, std::string{"dgram: SO_REUSEPORT failed ("} +
+                                          std::strerror(saved) + ")");
+        }
+#else
+        close(fd);
+        return fs_throw(ctx, exc, "dgram: SO_REUSEPORT failed (ENOTSUP)");
+#endif
+    }
     net_set_nonblock(fd);
     return JSValueMakeNumber(ctx, fd);
 #endif
