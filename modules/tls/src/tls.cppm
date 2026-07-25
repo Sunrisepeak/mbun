@@ -60,6 +60,23 @@ export struct Config {
     // check down in one place so it can run in the other, and never affects
     // chain verification. Default true: the strict path is the default path.
     bool hostCheck {true};
+    // SERVER: the 48-byte session-ticket key (16B key name + 16B HMAC key + 16B
+    // AES key) — node's tls.createServer({ ticketKeys }) / server.setTicketKeys().
+    // Session tickets (RFC 5077) are STATELESS: the session travels back to the
+    // client encrypted under this key, which is what makes resumption possible
+    // at all in this engine, where every connection owns its own SSL_CTX. Empty
+    // leaves OpenSSL's per-context random key in place (tickets are still
+    // issued, they are simply not resumable by any other context).
+    //
+    // Not a relaxation: a ticket is accepted only if it decrypts and
+    // authenticates under this key, and the session it restores carries the peer
+    // identity that was verified when the session was created.
+    std::string ticketKeys {};
+    // CLIENT: a previously serialised SSL_SESSION (DER, i2d_SSL_SESSION) offered
+    // for resumption — node's tls.connect({ session }) / socket.setSession().
+    // Empty = full handshake. A blob OpenSSL cannot parse is ignored, exactly as
+    // node's SetSession does; it never weakens the handshake that follows.
+    std::string sessionDer {};
 
     [[nodiscard]] bool has_credentials() const noexcept {
         return !certificate.empty() || !key.empty();
