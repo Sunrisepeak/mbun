@@ -122,8 +122,8 @@ Source-snapshot measurements (2026-07-21) against the upstream corpora pinned as
 | --- | ---: | ---: |
 | Bun native test corpus (`compat/bun/test`) | 885 / 1,902 files fully green *(round-7/8 snapshot — stale, see below)* | 46.5% |
 | Bun native tests, test level | 32,190 pass / 17,254 fail of 52,454 run *(same stale snapshot)* | 61.4% |
-| Node.js native tests (`compat/node/test/parallel`) | 2,403 / 4,433 files pass (direct execution) | 54.2% |
-| Node.js native tests, excluding files that skip themselves | 2,403 / 3,878 files pass | 62.0% |
+| Node.js native tests (`compat/node/test/parallel`) | 2,459 / 4,433 files pass (direct execution) | 55.5% |
+| Node.js native tests, excluding files that skip themselves | 2,459 / 3,878 files pass | 63.4% |
 | Elysia test suite | 1,522 pass / 3 fail | 99.8% |
 
 File-level "green" means every executed test in the file passed and the file reported no error outside a test; it is stricter than an API checklist and lower than test-level pass rates. Files that declare no runnable test, files whose every test is skipped, and files needing a service this environment lacks (MySQL, Redis, the npm registry) are separate buckets and never count as passes. Node.js files run directly through mbun (exit 0 = pass) without Node's own harness services, so that figure is honest file-level coverage, not API completion.
@@ -136,7 +136,7 @@ File-level "green" means every executed test in the file passed and the file rep
 - **`assert.throws` ignored its error argument.** `assert.throws(fn, { code: 'ERR_X' })` passed for *any* throw, and `assert.throws(fn, common.expectsError({…}))` never called the validator. Fixing it removed 126 passes from the figure below; a random 25 of those were checked individually and all 25 pass again the moment the broken matcher is restored, confirming they were verifying nothing.
 - **`common.mustCall` was never enforced.** Node registers its verifier inside `process.on('exit')`, which mbun did not fire, so an under-called `mustCall(fn, 2)` still exited 0. At the time, 946 of the then-1,533 passing files used `mustCall*` — their central assertion had never run. `process.on('exit')` now fires and the event loop no longer swallows exceptions thrown inside callbacks.
 
-The previously published 44.5% was a product of both defects and was never real. Measured with the corrected runner on the same machine, the comparable prior figure is **38.2%**, and the current figure is **54.2%** strict / **62.0%** excluding self-skips. Timeouts fell from 583 files to 125 over the same period, so a file that used to hang for 15 seconds now reports a real, diagnosable failure. Expect the strict rate to keep moving in both directions as more verification becomes real. Details, the full estimate-vs-actual record, and how to reproduce: [`compat/README.md`](compat/README.md).
+The previously published 44.5% was a product of both defects and was never real. Measured with the corrected runner on the same machine, the comparable prior figure is **38.2%**, and the current figure is **55.5%** strict / **63.4%** excluding self-skips. Timeouts fell from 583 files to 125 over the same period, so a file that used to hang for 15 seconds now reports a real, diagnosable failure. Expect the strict rate to keep moving in both directions as more verification becomes real. Details, the full estimate-vs-actual record, and how to reproduce: [`compat/README.md`](compat/README.md).
 
 ## Related projects
 

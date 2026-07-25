@@ -5,6 +5,21 @@
 
 ## 2026-07-26
 
+### 第十二轮整合：node 语料 2,403 → **2,459 / 4,433**（55.5% 严格 / 63.4% 排除自我跳过），**回归 0**
+
+三个 agent 全部达标或超额（tls +16/14、http +26/12、fs +11/11），整合后逐文件 diff：**56 转绿、0 回归** —— 迄今最干净的一次组合。增量分布：http2 15、tls 14、fs 11、http 8、https 5，另有 filehandle/permission/stdio 各 1。
+
+子系统现状：tls+https **147/263 (55.9%)**、http1 **359/458 (78.4%)**、http2 **195/270 (72.2%)**、fs **308/334 (92.2%)**。
+
+**瓶颈已经转移。** 自从分诊从 agent 内部移到 `compat/data/unreached-inventory.json`，连续三波超额（第二波 3.7% → 第三波 150% → 第四波 143%）。但这一波三个 agent 都撞上同一件事：**inventory 漏计**。agent-fs 十一个增量里七个在 inventory 里没有条目；agent-tls 找到一个 8 文件的原因（**TLS 会话恢复完全不存在** —— `getSession()` 返回 undefined、`setSession()` 空操作、reactor 从不发 `session`），它此前**分散在三个桶里**，所以按桶排名根本看不见它。下一步机制改进是跨桶扫描 +把 `failure_signature.py` 的输出回灌 inventory。
+
+- **`fs.linkSync` 此前是用 copyFile 实现的**，现在是真正的 `link(2)`。独立复验：目标与源 inode 相同，且裸 `__mbunFsNative.link` 在 `--permission` 下被拒（门在 native 边界，不在 JS 外壳）。
+- **`node:test` 的 mock 有两处失效**：`mockImplementationOnce` 拿 `calls.length` 比对，而调用记录在实现执行**之前**入队，差一位导致 once 实现永不选中；`mock.getter/setter` 用赋值，替换不掉原型访问器。**任何依赖它们的语料文件此前都在静默测试未被 mock 的路径** —— 与早前 `assert.throws` 忽略错误参数（修好后移除 126 个虚假通过）同类。全量护栏显示本次修复没有造成通过数下降，这是**测出来的，不是假设的**。
+- **http2 超时首次分诊**：26 个塌缩成停滞交换 18、客户端流已死 3、无 dump 3、误分类 1。与 tls、http1 同一结论 —— **26 个里 25 个不是事件循环 bug**，其中 8 个已转绿。其中 `reset-flood` 曾被归为「原生阻塞」，实为**服务端接受了畸形 HEADERS 块而不是拒绝**，洪泛永不终止 —— 这是「无 dump ≠ 原生崩溃」第三次被证伪。
+
+**工具**：新增 `failure_signature.py`（把语料日志转成带置信标签的原因排名；CAUSE/CLASS/MANIFESTATION/UNSPLIT —— 它在自己首次运行时犯了两次「表象冒充机制」的错，所以自测断言的是置信度纪律而非覆盖率）；新增 `check_submodule_gitlinks.sh`（一次合并曾把 `compat/{bun,node}` 的子模块指针换成符号链接，**在制造它的机器上完全不可见**，别处则语料为空）；`build_or_die.sh` 增加工具链前置检查（全局 `~/.mcpp/config.toml` 在一轮内被并发 agent 翻成不可用的 gcc 两次，第二次由此在 5 秒内定位而非 40 分钟）；两个守卫已接入 CI 首步。
+
+
 ### 第十二轮 w4/agent-tls：TLS 选项层与密码套件（tls+https 128/263 → 144/263，实得 +16）
 
 `--filter test-tls --jobs 5 --timeout 15` 与 `--filter test-https` 实测：tls `pass 90 → 104`、`fail 95 → 81`；https `pass 38 → 40`、`fail 20 → 18`；**timeout 两边都是 17 / 3 不变**，`green→non-green` 回归 0。转绿 16 个：`cli-min-version-{1.0,1.1,1.2,1.3}`、`cli-max-version-{1.2,1.3}`、`min-max-version`、`options-boolean-check`(tls+https)、`keylog-tlsv13`、`https-agent-keylog`、`getcipher`、`set-ciphers`、`getprotocol`、`set-default-ca-certificates-{append,reset}-https-request`。
