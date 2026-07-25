@@ -1256,6 +1256,10 @@ export constexpr std::string_view kHttp2JS = R"JS(
       payload = payload || Buffer.alloc(0);
       const frame = Buffer.concat([frameHeader(payload.length, type, flags, streamId), payload]);
       if (!this._connected) { this._preConnectQ.push(frame); return; }
+      // See the server session's _writeFrame: net.Socket.write() on an ended or
+      // destroyed socket EMITS 'error' instead of throwing, so this try/catch
+      // cannot contain it. nghttp2 drops frames once the transport is gone.
+      if (this.socket.destroyed || this.socket.writable === false) return;
       try { this.socket.write(frame); } catch (e) { if (!this.closed && !this.destroyed) this._fatal(e); }
     }
 
@@ -1633,7 +1637,18 @@ export constexpr std::string_view kHttp2JS = R"JS(
       this._endPending = false;
       this._teardown();
     }
-    _onSocketClose() { if (!this.destroyed && !this.closed) this._fatal(mkErr("Session closed with error code NGHTTP2_INTERNAL_ERROR", "ERR_HTTP2_SESSION_ERROR")); else this._teardown(); }
+    // node socketOnClose(): cancel the open streams, then close the session —
+    // and emit an error ONLY when the socket died while still connecting
+    // (ERR_SOCKET_CLOSED). A transport that simply went away is not by itself a
+    // session error. mbun synthesised ERR_HTTP2_SESSION_ERROR /
+    // NGHTTP2_INTERNAL_ERROR for every abrupt close, which is an uncaught
+    // exception in every test whose peer just destroys its socket.
+    _onSocketClose() {
+      if (this.destroyed) return;
+      abortStreamsOnTransportEof(this);
+      if (this.connecting) { this._fatal(mkErr("Socket has been disconnected from the Http2Session", "ERR_SOCKET_CLOSED")); return; }
+      this._teardown();
+    }
     _fatal(err) {
       if (this.destroyed) return;
       const streams = Array.from(this.streams.values());
@@ -2476,6 +2491,12 @@ export constexpr std::string_view kHttp2JS = R"JS(
     }
     _writeFrame(type, flags, streamId, payload) {
       if (this.destroyed || !this.socket) return;
+      // net.Socket.write() on an ended/destroyed socket EMITS 'error' rather than
+      // throwing, so the try/catch below cannot contain it: the session has no
+      // 'error' listener on that path and "write after end" surfaced as an
+      // uncaught exception. nghttp2 simply drops frames once the transport is
+      // gone, so drop them here too.
+      if (this.socket.destroyed || this.socket.writable === false) return;
       payload = payload || Buffer.alloc(0);
       try { this.socket.write(Buffer.concat([frameHeader(payload.length, type, flags, streamId), payload])); } catch (e) {}
     }
