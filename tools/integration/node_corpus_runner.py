@@ -27,6 +27,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import threading
 import time
 from dataclasses import asdict, dataclass
@@ -61,7 +62,8 @@ def log_name(path: str) -> str:
     return f"{digest}-{readable}.log"
 
 
-def run_one(binary: Path, root: Path, output_dir: Path, timeout: float, path: str, thread_id: int) -> Result:
+def run_one(binary: Path, root: Path, output_dir: Path, timeout: float, path: str, thread_id: int,
+             corpus_dir: Path | None = None) -> Result:
     started = time.monotonic()
     relative_log = Path("logs") / log_name(path)
     # Node's own runner sets TEST_THREAD_ID per worker so per-file temp
@@ -76,12 +78,26 @@ def run_one(binary: Path, root: Path, output_dir: Path, timeout: float, path: st
     # `EEXIST ... mkdir '.../.tmp.3'`. That looked like a code regression in two
     # separate guard runs and was neither reproducible nor real -- both files
     # passed standalone. The pid disambiguates the runs.
+    # The id must be unique per FILE, not per job slot. `thread_id` repeats
+    # every `jobs` files, and node's common/tmpdir does NOT live under the
+    # private TMPDIR below -- it is `<corpus>/../.tmp.<id>`, which the runner
+    # does not own. So two files sharing a slot inherited each other's leftover
+    # directory: one saw a sibling's file inside its own readdir listing and
+    # another hit `EEXIST mkdir`. Both looked like green->non-green regressions
+    # and both passed standalone.
     env = dict(os.environ)
-    env["TEST_THREAD_ID"] = f"{os.getpid()}_{thread_id}"
+    thread_key = f"{os.getpid()}_{log_name(path)[:12]}"
+    env["TEST_THREAD_ID"] = thread_key
+    node_tmp = (corpus_dir.parent / f".tmp.{thread_key}") if corpus_dir is not None else None
     bounded = BoundedRun(
         output_dir / relative_log,
         private_tmp=output_dir / "tmp" / log_name(path)[:12],
     ).run([str(binary), str((root / path).resolve())], timeout=timeout, cwd=root, env=env)
+    # Remove the corpus-side tmpdir this file created. Unique-per-file ids would
+    # otherwise leave one directory per corpus file inside the read-only upstream
+    # checkout (205 were already lying around from earlier rounds).
+    if node_tmp is not None:
+        shutil.rmtree(node_tmp, ignore_errors=True)
     duration_ms = round((time.monotonic() - started) * 1000)
     if bounded.timed_out:
         classification = "timeout"
@@ -284,7 +300,8 @@ def main() -> int:
                 if deadline is not None and time.monotonic() >= deadline:
                     break
                 futures.append(
-                    executor.submit(run_one, binary, root, output_dir, args.timeout, path, index % jobs))
+                    executor.submit(run_one, binary, root, output_dir, args.timeout, path, index % jobs,
+                                    corpus_dir))
                 dispatched += 1
             for future in concurrent.futures.as_completed(futures):
                 result = future.result()
