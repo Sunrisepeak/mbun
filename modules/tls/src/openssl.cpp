@@ -134,8 +134,27 @@ struct TlsChannel::Impl {
     std::string errorCode_ {}; // node-style error.code for the last SSL failure
     std::string serverName_ {}; // client SNI / hostname under verification
     std::string alpnWire_ {}; // server: length-prefixed ALPN list for the select cb
+    // NSS-format key-material lines produced by SSL_CTX_set_keylog_callback, in
+    // order, waiting to be drained by take_keylog(). node's TLSSocket 'keylog'
+    // event (src/crypto/crypto_context.cc SecureContext::KeylogCallback) is the
+    // only consumer. Bounded so a connection nobody drains cannot grow without
+    // limit: a TLS 1.3 handshake emits 5 lines, TLS 1.2 emits 1, and a
+    // renegotiation a few more.
+    std::vector<std::string> keylog_ {};
+    static constexpr std::size_t kKeylogMax {64};
 
     Impl() = default;
+
+    // SSL_CTX_set_keylog_callback. `line` is one NSS keylog entry WITHOUT a
+    // trailing newline; node passes exactly the same bytes plus '\n' to JS.
+    static void keylog_cb_(const SSL* ssl, const char* line) {
+        if (ssl == nullptr || line == nullptr) return;
+        SSL_CTX* ctx {::SSL_get_SSL_CTX(const_cast<SSL*>(ssl))};
+        if (ctx == nullptr) return;
+        auto* self {static_cast<Impl*>(SSL_CTX_get_app_data(ctx))};
+        if (self == nullptr || self->keylog_.size() >= kKeylogMax) return;
+        self->keylog_.emplace_back(line);
+    }
 
     // Server ALPN selection (SSL_CTX_set_alpn_select_cb). Server preference:
     // the first protocol in our list that the client also offered. No match →
@@ -388,6 +407,14 @@ struct TlsChannel::Impl {
                 }
             }
         }
+
+        // Key-material logging. node installs this unconditionally and gates the
+        // 'keylog' EVENT on having a listener (crypto_context.cc + tls/wrap.js),
+        // so the lines exist whenever someone asks for them. Nothing is written
+        // to disk here and nothing leaves the process on its own: take_keylog()
+        // is the only way out, and the JS layer drains it only into a listener.
+        SSL_CTX_set_app_data(ctx_, this);
+        ::SSL_CTX_set_keylog_callback(ctx_, &Impl::keylog_cb_);
 
         ssl_ = ::SSL_new(ctx_);
         if (ssl_ == nullptr) {
@@ -769,6 +796,12 @@ bool TlsChannel::verify_ok() const noexcept {
         return false;
     }
     return ::SSL_get_verify_result(impl_->ssl_) == X509_V_OK;
+}
+
+std::vector<std::string> TlsChannel::take_keylog() {
+    std::vector<std::string> out {};
+    out.swap(impl_->keylog_);
+    return out;
 }
 
 std::string TlsChannel::alpn_protocol() const {

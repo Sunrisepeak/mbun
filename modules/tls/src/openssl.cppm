@@ -82,6 +82,11 @@ public:
     [[nodiscard]] bool verify_ok() const noexcept;
     // Negotiated ALPN protocol (SSL_get0_alpn_selected), empty if none.
     [[nodiscard]] std::string alpn_protocol() const;
+    // Drain the NSS-format key-material lines OpenSSL has produced so far, each
+    // WITHOUT its trailing newline, and clear the buffer. Feeds node's
+    // TLSSocket/Server 'keylog' event; this is the only way the material leaves
+    // the engine, so a caller with no keylog listener never sees it.
+    [[nodiscard]] std::vector<std::string> take_keylog();
     // The peer's certificate chain as PEM, leaf first (SSL_get_peer_cert_chain,
     // with the leaf prepended on the client side where OpenSSL omits it). Feeds
     // node's getPeerCertificate(detailed) `issuerCertificate` chain walk.

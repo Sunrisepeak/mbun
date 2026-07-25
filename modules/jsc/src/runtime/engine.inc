@@ -1883,6 +1883,7 @@ public:
         set_fn(ctx_, nn, "tlsClose", netn_tls_close_cb);
         set_fn(ctx_, nn, "tlsInfo", netn_tls_info_cb);
         set_fn(ctx_, nn, "tlsError", netn_tls_error_cb);
+        set_fn(ctx_, nn, "tlsKeylog", netn_tls_keylog_cb);
         set_fn(ctx_, nn, "tlsExportKeyingMaterial", netn_tls_export_keying_material_cb);
         set_fn(ctx_, nn, "tlsSelfSigned", netn_tls_self_signed_cb);
         set_prop(ctx_, global, "__mbunNetNative", nn);

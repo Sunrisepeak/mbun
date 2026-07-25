@@ -321,6 +321,17 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
       this._peerCert = null;
       // http2-wrapper (JSStreamSocket) reaches for _handle._parentWrap.constructor.
       this._handle = { _parentWrap: this };
+      // 'keylog' costs a native drain per poll, so the reactor only performs it
+      // once something has asked. Any listener added at any time flips the flag —
+      // node installs its keylog callback eagerly, mbun defers the WORK, not the
+      // semantics. Watching 'newListener' catches on/once/addListener/prepend*
+      // alike, including the https.Agent's own onkeylog forward.
+      this._keylogWanted = false;
+      this.on("newListener", (ev) => {
+        if (ev !== "keylog" || this._keylogWanted) return;
+        this._keylogWanted = true;
+        if (this._transport) this._transport._keylogWanted = true;
+      });
       if (isMbunNetSocket(socket)) this._wrapTransport(socket, options);
       // A Duplex/stream transport (no fd) is DEFERRED: construction still yields
       // a shaped TLSSocket (http2-wrapper only reads _handle); the live handshake
@@ -360,6 +371,13 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
       // pinned and the process could not leave the loop (13 test-https-* files
       // hit the 15s corpus timeout on exactly that).
       transport.on("timeout", () => self.emit("timeout"));
+      // node crypto_context.cc SecureContext::KeylogCallback -> tls/wrap.js
+      // onkeylog: each NSS keylog line reaches the TLSSocket as a Buffer that
+      // already carries its trailing newline. The reactor only asks OpenSSL for
+      // the lines when something wants them (_keylogWanted below), so a process
+      // with no listener never moves key material out of the engine.
+      transport.on("keylog", (line) => self.emit("keylog", line));
+      if (self._keylogWanted) transport._keylogWanted = true;
       // node's TLSSocket is a net.Socket over a real connection, so it emits
       // 'connect' when the TCP leg lands (before the handshake) and 'ready'
       // after. The corpus drives raw TLS clients from 'connect'
@@ -782,6 +800,10 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
         secureContext: creds.secureContext, ciphers: creds.ciphers,
       });
       const self = this;
+      // node internal/tls/wrap.js: the server re-emits each connection's keylog
+      // lines as (line, tlsSocket), and only bothers when it has a listener.
+      if (typeof self.listenerCount === "function" && self.listenerCount("keylog") > 0)
+        tlsSock.on("keylog", (line) => self.emit("keylog", line, tlsSock));
       tlsSock.once("secureConnect", () => self.emit("secureConnection", tlsSock));
       // node _tls_wrap.js onServerSocketSecure/handshakeTimeout: a connection that
       // does not finish its handshake within options.handshakeTimeout (default

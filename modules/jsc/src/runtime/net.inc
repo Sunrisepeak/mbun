@@ -778,6 +778,30 @@ JSValueRef netn_tls_info_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
 #endif
 }
 
+// net.tlsKeylog(fd) → array of NSS keylog lines produced since the last call
+// (empty array when there is nothing, or no channel on this fd). Draining is
+// destructive so a JS-side poll cannot re-emit a line twice. Feeds node's
+// TLSSocket/Server 'keylog' event (node src/crypto/crypto_context.cc
+// SecureContext::KeylogCallback -> tls/wrap.js onkeylog); nothing else reads it,
+// so a process with no keylog listener never surfaces key material.
+JSValueRef netn_tls_keylog_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                              const JSValueRef args[], JSValueRef*) {
+    std::vector<JSValueRef> items;
+#if !defined(_WIN32)
+    const int fd{argc > 0 ? static_cast<int>(JSValueToNumber(ctx, args[0], nullptr)) : -1};
+    const auto found{net_tls().find(fd)};
+    if (found != net_tls().end()) {
+        for (const std::string& line : found->second->channel.take_keylog()) {
+            items.push_back(make_string(ctx, line));
+        }
+    }
+#else
+    (void)argc;
+    (void)args;
+#endif
+    return JSObjectMakeArray(ctx, items.size(), items.empty() ? nullptr : items.data(), nullptr);
+}
+
 // net.tlsExportKeyingMaterial(fd, length, label, contextB64|null) → base64 of
 // the RFC 5705 exporter output, or null when the export is not possible (no
 // channel / handshake incomplete). node's TLSSocket.exportKeyingMaterial().
