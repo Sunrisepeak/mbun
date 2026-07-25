@@ -325,6 +325,9 @@ inline constexpr std::string_view kNodeInternalBindingJS = R"JS(
     getCLIOptionsValues: () => {
       const PN = G.__mbunPermissionNative;
       const out = { __proto__: null };
+      // node src/node_options.cc default (16 KiB) — this runtime's real HTTP
+      // header limit, which node's own lib reads to size its parser.
+      out["--max-http-header-size"] = 16384;
       if (!PN) return out;
       out["--permission"] = !!PN.enabled && !PN.audit;
       out["--permission-audit"] = !!PN.audit;
@@ -1058,6 +1061,706 @@ inline constexpr std::string_view kNodeInternalBindingJS = R"JS(
     toUnicode: (s) => s,
     hasConverter: () => false,
   });
+
+  // A binding namespace whose member set is enumerated from node's C++
+  // initializer: reading a name that is NOT implemented throws NAMING ITSELF,
+  // so a corpus log reads `No such binding member: fs.lchown` instead of dying
+  // three frames later on `undefined is not a function`. This is the same
+  // reason internalBinding() itself throws for an unknown binding — the cost of
+  // a silent `undefined` is an un-triageable failure far from its cause.
+  //
+  // Writes are allowed and shadow the implementation, because node's own tests
+  // monkey-patch binding members (test-fs-sync-fd-leak assigns writeFileUtf8,
+  // test-tls-keyengine-unsupported assigns SecureContext).
+  //
+  // NOT used for `crypto`: node's own lib/internal/crypto/* feature-DETECTS
+  // there (`if (Argon2Job === undefined)`), so throwing on a member OpenSSL did
+  // not compile in would break the very code path that handles its absence.
+  const strictNs = (ns, obj) => new Proxy(obj, {
+    get(t, k, r) {
+      if (Reflect.has(t, k)) return Reflect.get(t, k, r);
+      if (typeof k === "symbol") return undefined;
+      const e = new Error("No such binding member: " + ns + "." + String(k));
+      e.code = "ERR_INVALID_MODULE";
+      throw e;
+    },
+  });
+
+  // ------------------------------------------------------------------- fs ----
+  // node src/node_file.cc. Three call conventions share every entry point, and
+  // getting the dispatch right is the whole of it — the last argument decides:
+  //   * `undefined`             → synchronous; throw on error, return the value
+  //   * an `FSReqCallback`      → async; `req.oncomplete(err)` / `(null, value)`
+  //   * `kUsePromises`          → return a Promise
+  // A trailing `ctx` object may follow `undefined`; node's older entries filled
+  // `ctx.errno` instead of throwing and `handleErrorFromBinding(ctx)` re-threw.
+  // Throwing directly is what node's current entries do, and it leaves `ctx`
+  // untouched — which is what test-fs-filehandle asserts (`ctx.errno`
+  // undefined).
+  //
+  // THE PERMISSION MODEL: every syscall below is reached through
+  // `__mbunFsNative` / `__mbunFdNative`. Those ARE the C++ boundary the
+  // --permission fs gate lives at (io_bindings.inc `permission_deny_fs`, called
+  // from all 21 fsn_* entries and fdn_open). This binding therefore adds NO
+  // second route to the filesystem: `internalBinding('fs').open` is gated by
+  // exactly the same --allow-fs-read/--allow-fs-write check as fs.openSync, and
+  // there is deliberately no path here that calls a syscall any other way.
+  factories["fs"] = () => {
+    const kUsePromises = Symbol("kUsePromises");
+    // node src/node_file.h kFsStatsFieldsNumber. StatWatcher hands node's JS
+    // side TWO stats in one array (current at 0, previous at 18), so the buffer
+    // is twice the field count — internal/fs/watchers.js reads offset 18.
+    const kFsStatsFieldsNumber = 18;
+    const statValues = new Float64Array(kFsStatsFieldsNumber * 2);
+    const bigintStatValues = new BigInt64Array(kFsStatsFieldsNumber * 2);
+    const statFsValues = new Float64Array(8);
+    const bigintStatFsValues = new BigInt64Array(8);
+    const FSN = () => G.__mbunFsNative;
+    const FDN = () => G.__mbunFdNative;
+    const fsjs = () => mod("fs");
+
+    class FSReqCallback {
+      constructor(bigint = false) {
+        this.oncomplete = undefined;
+        this.bigint = bigint;
+        this.context = undefined;
+      }
+    }
+
+    const dispatch = (req, run) => {
+      if (req === undefined || req === null) return run();
+      if (req === kUsePromises) {
+        return new Promise((resolve, reject) => {
+          queueMicrotask(() => { try { resolve(run()); } catch (e) { reject(e); } });
+        });
+      }
+      queueMicrotask(() => {
+        let v; let err = null;
+        try { v = run(); } catch (e) { err = e; }
+        const oc = req.oncomplete;
+        if (typeof oc !== "function") return;
+        if (err !== null) oc.call(req, err); else oc.call(req, null, v);
+      });
+      return undefined;
+    };
+
+    // sec/nsec pair per node's FillStatsArray. The seconds come from the
+    // fractional-ms field (a double holds ~1.7e12 ms exactly); the bigint form
+    // uses the integer-nanosecond field, which is what internal/fs/utils
+    // nsFromTimeSpecBigInt recombines.
+    const fillTime = (A, i, ms, ns, big) => {
+      if (big) {
+        const total = BigInt(Math.round(ns));
+        A[i] = total / 1000000000n;
+        A[i + 1] = total % 1000000000n;
+      } else {
+        const sec = Math.floor(ms / 1000);
+        A[i] = sec;
+        A[i + 1] = Math.round((ms - sec * 1000) * 1e6);
+      }
+    };
+    // node src/node_file.cc FillStatsArray. The INDEX LAYOUT IS THE CONTRACT
+    // internal/fs/utils.js getStatsFromBinding decodes positionally: a
+    // reordering here does not error, it silently produces garbage Stats.
+    const fillStats = (s, big, offset = 0) => {
+      const A = big ? bigintStatValues : statValues;
+      const n = big ? ((v) => BigInt(Math.trunc(v))) : ((v) => v);
+      A[offset + 0] = n(s.dev);
+      A[offset + 1] = n(s.mode);
+      A[offset + 2] = n(s.nlink);
+      A[offset + 3] = n(s.uid);
+      A[offset + 4] = n(s.gid);
+      A[offset + 5] = n(s.rdev);
+      A[offset + 6] = n(s.blksize);
+      A[offset + 7] = n(s.ino);
+      A[offset + 8] = n(s.size);
+      A[offset + 9] = n(s.blocks);
+      fillTime(A, offset + 10, s.atimeMs, s.atimeNs, big);
+      fillTime(A, offset + 12, s.mtimeMs, s.mtimeNs, big);
+      fillTime(A, offset + 14, s.ctimeMs, s.ctimeNs, big);
+      fillTime(A, offset + 16, s.birthtimeMs, s.birthtimeNs, big);
+      return A;
+    };
+    const fillStatFs = (s, big) => {
+      const A = big ? bigintStatFsValues : statFsValues;
+      const n = big ? ((v) => BigInt(Math.trunc(v))) : ((v) => v);
+      A[0] = n(s.type); A[1] = n(s.bsize); A[2] = n(s.frsize); A[3] = n(s.blocks);
+      A[4] = n(s.bfree); A[5] = n(s.bavail); A[6] = n(s.files); A[7] = n(s.ffree);
+      return A;
+    };
+
+    // ENOENT with throwIfNoEntry=false is the one error node swallows.
+    const statLike = (get, big, req, throwIfNoEntry) => dispatch(req, () => {
+      let s;
+      try { s = get(); } catch (e) {
+        // stat's `throwIfNoEntry: false` swallows ENOENT; fstat's
+        // `shouldNotThrow` reaches here with the same flag and a bad fd.
+        if (throwIfNoEntry === false && e && (e.code === "ENOENT" || e.code === "EBADF")) {
+          return undefined;
+        }
+        throw e;
+      }
+      return fillStats(s, big);
+    });
+
+    const toBuf = (v) => (typeof v === "string" ? mod("buffer").Buffer.from(v) : v);
+    // node's `encoding` argument on readlink/realpath/mkdtemp: "buffer" hands
+    // back a Buffer, anything else a string in that encoding.
+    const encode = (str, encoding) => {
+      if (encoding === "buffer") return mod("buffer").Buffer.from(str, "utf8");
+      if (encoding === undefined || encoding === null || encoding === "utf8" ||
+          encoding === "utf-8") return str;
+      return mod("buffer").Buffer.from(str, "utf8").toString(encoding);
+    };
+
+    // libuv dirent type codes (uv.h uv_dirent_type_t) — the values node's
+    // fs.constants.UV_DIRENT_* publish and internal/fs/utils Dirent switches on.
+    const UV_DIRENT_UNKNOWN = 0, UV_DIRENT_FILE = 1, UV_DIRENT_DIR = 2,
+          UV_DIRENT_LINK = 3, UV_DIRENT_FIFO = 4, UV_DIRENT_SOCKET = 5,
+          UV_DIRENT_CHAR = 6, UV_DIRENT_BLOCK = 7;
+    const direntType = (full) => {
+      let st;
+      try { st = FSN().stat(full, true); } catch { return UV_DIRENT_UNKNOWN; }
+      const t = st.mode & 61440;
+      if (t === 32768) return UV_DIRENT_FILE;
+      if (t === 16384) return UV_DIRENT_DIR;
+      if (t === 40960) return UV_DIRENT_LINK;
+      if (t === 4096) return UV_DIRENT_FIFO;
+      if (t === 49152) return UV_DIRENT_SOCKET;
+      if (t === 8192) return UV_DIRENT_CHAR;
+      if (t === 24576) return UV_DIRENT_BLOCK;
+      return UV_DIRENT_UNKNOWN;
+    };
+
+    // node's C++ FileHandle: an fd plus a close that is safe to call twice. The
+    // lib-level `FileHandle` in internal/fs/promises.js wraps this one.
+    class FileHandle {
+      constructor(fd) { this.fd = fd; this[Symbol.for("closed")] = false; }
+      close() {
+        if (this.fd < 0) return Promise.resolve();
+        const fd = this.fd;
+        this.fd = -1;
+        return new Promise((resolve, reject) => {
+          try { FDN().close(fd); resolve(); } catch (e) { reject(e); }
+        });
+      }
+      release() { this.fd = -1; }
+      // node emits this warning from C++ when a FileHandle is GC'd unclosed.
+      onclose() {}
+    }
+
+    const impl = {
+      FSReqCallback,
+      FileHandle,
+      kUsePromises,
+      kFsStatsFieldsNumber,
+      statValues,
+      bigintStatValues,
+      statFsValues,
+      bigintStatFsValues,
+
+      access: (path, mode, req) => dispatch(req, () => { fsjs().accessSync(path, mode); }),
+      close: (fd, req) => dispatch(req, () => { FDN().close(fd); }),
+      open: (path, flags, mode, req) =>
+        dispatch(req, () => FDN().open(String(path), flags, mode)),
+      openFileHandle: (path, flags, mode, req) =>
+        dispatch(req, () => new FileHandle(FDN().open(String(path), flags, mode))),
+      read: (fd, buffer, offset, length, position, req) =>
+        dispatch(req, () => FDN().read(fd, buffer, offset || 0,
+                                      length == null ? buffer.byteLength : length,
+                                      position == null ? -1 : Number(position))),
+      readBuffers: (fd, buffers, position, req) => dispatch(req, () => {
+        let total = 0;
+        let pos = position == null ? -1 : Number(position);
+        for (const b of buffers) {
+          const n = FDN().read(fd, b, 0, b.byteLength, pos);
+          total += n;
+          if (pos >= 0) pos += n;
+          if (n < b.byteLength) break;
+        }
+        return total;
+      }),
+      writeBuffer: (fd, buffer, offset, length, position, req) =>
+        dispatch(req, () => FDN().write(fd, buffer, offset || 0,
+                                       length == null ? buffer.byteLength - (offset || 0) : length,
+                                       position == null ? -1 : Number(position))),
+      writeBuffers: (fd, buffers, position, req) => dispatch(req, () => {
+        let total = 0;
+        let pos = position == null ? -1 : Number(position);
+        for (const b of buffers) {
+          const n = FDN().write(fd, b, 0, b.byteLength, pos);
+          total += n;
+          if (pos >= 0) pos += n;
+        }
+        return total;
+      }),
+      // node: writeString(fd, string, position, encoding, req)
+      writeString: (fd, string, position, encoding, req) => dispatch(req, () => {
+        const b = mod("buffer").Buffer.from(String(string), encoding || "utf8");
+        return FDN().write(fd, b, 0, b.byteLength, position == null ? -1 : Number(position));
+      }),
+      // The C++ fast paths. Node's own tests replace these to prove the JS layer
+      // uses them (test-fs-sync-fd-leak), so they must be real, not aliases.
+      writeFileUtf8: (pathOrFd, data, flags, mode) => {
+        if (typeof pathOrFd === "number") {
+          const b = mod("buffer").Buffer.from(String(data), "utf8");
+          return FDN().write(pathOrFd, b, 0, b.byteLength, -1);
+        }
+        FSN().writeFile(String(pathOrFd), String(data));
+        return undefined;
+      },
+      readFileUtf8: (pathOrFd, flags) => {
+        if (typeof pathOrFd === "number") return fsjs().readFileSync(pathOrFd, "utf8");
+        return FSN().readFile(String(pathOrFd));
+      },
+      existsSync: (path) => {
+        try { return FSN().exists(String(path)); } catch { return false; }
+      },
+      // node src/node_file.cc InternalModuleStat: -errno, 0 for a file, 1 for a
+      // directory. The module loader's hot path; it never throws.
+      internalModuleStat: (path) => {
+        let s;
+        try { s = FSN().stat(String(path)); } catch (e) {
+          return typeof e.errno === "number" ? e.errno : -2;
+        }
+        return (s.mode & 61440) === 16384 ? 1 : 0;
+      },
+      stat: (path, big, req, throwIfNoEntry) =>
+        statLike(() => FSN().stat(String(path)), big, req, throwIfNoEntry),
+      lstat: (path, big, req, throwIfNoEntry) =>
+        statLike(() => FSN().stat(String(path), true), big, req, throwIfNoEntry),
+      // node's 4th arg here is `shouldNotThrow`, the inverse of stat's
+      // `throwIfNoEntry`: true means swallow the error and return undefined.
+      fstat: (fd, big, req, shouldNotThrow) =>
+        statLike(() => FSN().fstat(fd), big, req, shouldNotThrow === true ? false : undefined),
+      statfs: (path, big, req) =>
+        dispatch(req, () => fillStatFs(FSN().statfs(String(path)), big)),
+      // node: readdir(path, encoding, withFileTypes, req) → names, or
+      // [names, types] when withFileTypes.
+      readdir: (path, encoding, withFileTypes, req) => dispatch(req, () => {
+        const p = String(path);
+        const names = FSN().readdir(p);
+        const out = encoding === "buffer"
+          ? names.map((n) => mod("buffer").Buffer.from(n, "utf8"))
+          : names;
+        if (!withFileTypes) return out;
+        const sep = p.endsWith("/") ? "" : "/";
+        return [out, names.map((n) => direntType(p + sep + n))];
+      }),
+      readlink: (path, encoding, req) =>
+        dispatch(req, () => encode(FSN().readlink(String(path)), encoding)),
+      realpath: (path, encoding, req) =>
+        dispatch(req, () => encode(FSN().realpath(String(path)), encoding)),
+      mkdtemp: (prefix, encoding, req) =>
+        dispatch(req, () => encode(FSN().mkdtemp(String(prefix)), encoding)),
+      unlink: (path, req) => dispatch(req, () => { FSN().unlink(String(path)); }),
+      rename: (from, to, req) => dispatch(req, () => { FSN().rename(String(from), String(to)); }),
+      copyFile: (src, dest, mode, req) =>
+        dispatch(req, () => { FSN().copyFile(String(src), String(dest), mode); }),
+      link: (from, to, req) => dispatch(req, () => { fsjs().linkSync(from, to); }),
+      symlink: (target, path, type, req) =>
+        dispatch(req, () => { FSN().symlink(String(target), String(path)); }),
+      mkdir: (path, mode, recursive, req) => dispatch(req, () => {
+        const r = FSN().mkdir(String(path), !!recursive, mode);
+        // node returns the first directory created when recursive.
+        return recursive ? r : undefined;
+      }),
+      rmdir: (path, req) => dispatch(req, () => { FSN().rmdir(String(path)); }),
+      rmSync: (path, maxRetries, recursive, retryDelay) => {
+        FSN().rm(String(path), !!recursive, false);
+      },
+      chmod: (path, mode, req) => dispatch(req, () => { FSN().chmod(String(path), mode); }),
+      fchmod: (fd, mode, req) => dispatch(req, () => { fsjs().fchmodSync(fd, mode); }),
+      chown: (path, uid, gid, req) => dispatch(req, () => { fsjs().chownSync(path, uid, gid); }),
+      fchown: (fd, uid, gid, req) => dispatch(req, () => { fsjs().fchownSync(fd, uid, gid); }),
+      lchown: (path, uid, gid, req) => dispatch(req, () => { fsjs().lchownSync(path, uid, gid); }),
+      utimes: (path, atime, mtime, req) =>
+        dispatch(req, () => { FSN().utimes(String(path), atime, mtime); }),
+      futimes: (fd, atime, mtime, req) => dispatch(req, () => { fsjs().futimesSync(fd, atime, mtime); }),
+      lutimes: (path, atime, mtime, req) => dispatch(req, () => { fsjs().lutimesSync(path, atime, mtime); }),
+      ftruncate: (fd, len, req) => dispatch(req, () => { FDN().ftruncate(fd, len || 0); }),
+      fdatasync: (fd, req) => dispatch(req, () => { fsjs().fdatasyncSync(fd); }),
+      fsync: (fd, req) => dispatch(req, () => { fsjs().fsyncSync(fd); }),
+      // node src/node_file.cc: 0 none, 1 module, 2 commonjs, based on the
+      // nearest package.json "type". mbun's loader owns that decision; reporting
+      // "no extension gives no format" is the honest answer here.
+      getFormatOfExtensionlessFile: () => 0,
+      cpSyncCheckPaths: () => undefined,
+      // node's StatWatcher (uv_fs_poll). Backed by the same poll node's
+      // lib/internal/fs/watchers.js expects: start(path, interval) then
+      // onchange(current, previous) reading the shared stat array.
+      StatWatcher: class StatWatcher {
+        constructor(useBigint) { this.bigint = !!useBigint; this._timer = null; this._prev = null; }
+        start(path, interval) {
+          const A = this.bigint ? bigintStatValues : statValues;
+          const read = () => {
+            let s = null;
+            try { s = FSN().stat(String(path)); } catch { s = null; }
+            return s;
+          };
+          const zero = () => {
+            for (let i = 0; i < kFsStatsFieldsNumber; i++) A[i] = this.bigint ? 0n : 0;
+          };
+          this._prev = read();
+          const tick = () => {
+            const cur = read();
+            if (cur === null) zero(); else fillStats(cur, this.bigint, 0);
+            if (this._prev === null) {
+              for (let i = 0; i < kFsStatsFieldsNumber; i++) {
+                A[kFsStatsFieldsNumber + i] = this.bigint ? 0n : 0;
+              }
+            } else {
+              fillStats(this._prev, this.bigint, kFsStatsFieldsNumber);
+            }
+            const changed = cur === null || this._prev === null ||
+                            cur.mtimeMs !== this._prev.mtimeMs || cur.size !== this._prev.size ||
+                            cur.ino !== this._prev.ino;
+            this._prev = cur;
+            if (changed && typeof this.onchange === "function") {
+              this.onchange(A, A.subarray(kFsStatsFieldsNumber));
+            }
+          };
+          this._timer = setInterval(tick, interval > 0 ? interval : 5007);
+          if (this._timer && typeof this._timer.unref === "function") this._timer.unref();
+          return 0;
+        }
+        close() { if (this._timer !== null) { clearInterval(this._timer); this._timer = null; } }
+        ref() { if (this._timer && this._timer.ref) this._timer.ref(); }
+        unref() { if (this._timer && this._timer.unref) this._timer.unref(); }
+      },
+      UV_DIRENT_UNKNOWN, UV_DIRENT_FILE, UV_DIRENT_DIR, UV_DIRENT_LINK,
+      UV_DIRENT_FIFO, UV_DIRENT_SOCKET, UV_DIRENT_CHAR, UV_DIRENT_BLOCK,
+    };
+    return strictNs("fs", impl);
+  };
+
+  // ---------------------------------------------------------------- fs_dir ----
+  // node src/node_dir.cc. opendir over the readdir this runtime has; the
+  // DirHandle keeps the caller's position in the name list.
+  factories["fs_dir"] = () => {
+    const opendir = (path) => {
+      const names = G.__mbunFsNative.readdir(String(path));
+      let i = 0;
+      return {
+        read(bufferSize) {
+          if (i >= names.length) return null;
+          const n = names[i++];
+          return [n, 1];
+        },
+        close() { i = names.length; },
+      };
+    };
+    return strictNs("fs_dir", {
+      opendir: (path, encoding, req) => {
+        const h = opendir(path);
+        if (req === undefined || req === null) return h;
+        queueMicrotask(() => { if (typeof req.oncomplete === "function") req.oncomplete(null, h); });
+        return undefined;
+      },
+      opendirSync: (path) => opendir(path),
+    });
+  };
+
+  // --------------------------------------------------------- fs_event_wrap ----
+  // node src/fs_event_wrap.cc. Backed by node:fs.watch so a JS-side FSEvent
+  // observes real changes rather than never firing.
+  factories["fs_event_wrap"] = () => ({
+    FSEvent: class FSEvent {
+      constructor() { this._w = null; this.onchange = undefined; }
+      start(path, persistent, recursive) {
+        try {
+          this._w = mod("fs").watch(String(path), { persistent: !!persistent, recursive: !!recursive },
+            (event, filename) => {
+              if (typeof this.onchange === "function") {
+                // node's FSEvent flags: 1 = rename, 2 = change.
+                this.onchange(0, event === "rename" ? 1 : 2, filename);
+              }
+            });
+        } catch (e) { return typeof e.errno === "number" ? e.errno : -2; }
+        return 0;
+      }
+      close() { if (this._w !== null) { this._w.close(); this._w = null; } }
+      ref() {} unref() {}
+    },
+  });
+
+  // --------------------------------------------------------------- crypto ----
+  // node src/crypto/*. NOT wrapped in strictNs: node's own
+  // lib/internal/crypto/util.js feature-detects the optional algorithms by
+  // destructuring them and testing for `undefined` (Argon2Job, the ML_DSA/ML_KEM
+  // key types), so a throwing member would break the code that handles absence.
+  //
+  // What this buys is that `internal/crypto/util` and `internal/tls/common`
+  // LOAD — the whole node lib crypto/tls JS graph top-levels this binding.
+  factories["crypto"] = () => {
+    const c = mod("crypto");
+    const list = (fn) => (typeof fn === "function" ? fn() : []);
+    return {
+      getCiphers: () => list(c.getCiphers),
+      getCurves: () => list(c.getCurves),
+      getHashes: () => list(c.getHashes),
+      // node's cached OBJ_NAME alias table (getCachedAliases) — an empty map is
+      // the "nothing cached yet" state its callers already handle.
+      getCachedAliases: () => ({ __proto__: null }),
+      setEngine: () => {
+        const e = new Error("Custom engines not supported by this OpenSSL");
+        e.code = "ERR_CRYPTO_CUSTOM_ENGINE_NOT_SUPPORTED";
+        throw e;
+      },
+      secureHeapUsed: () => ({ total: 0, min: 0, used: 0, utilization: 0 }),
+      // OpenSSL's @SECLEVEL. 1 is the OpenSSL 3.x default and the level node's
+      // own default build reports; the corpus reads it to pick key sizes.
+      getOpenSSLSecLevelCrypto: () => 1,
+      getOpenSSLSecLevel: () => 1,
+      // Optional algorithms this build does not carry. `undefined` IS the
+      // signal node's lib checks for — see the note above.
+      EVP_PKEY_ML_DSA_44: undefined, EVP_PKEY_ML_DSA_65: undefined,
+      EVP_PKEY_ML_DSA_87: undefined, EVP_PKEY_ML_KEM_512: undefined,
+      EVP_PKEY_ML_KEM_768: undefined, EVP_PKEY_ML_KEM_1024: undefined,
+      kKeyVariantAES_OCB_128: undefined,
+      Argon2Job: undefined,
+      KmacJob: undefined,
+      // node's C++ SecureContext. mbun's TLS owns its own context, so this is
+      // the shape node's internal/tls/common.js drives — enough for that module
+      // to load and for a test to observe which setters exist.
+      SecureContext: class SecureContext {
+        init() {} setKey() {} setCert() {} addCACert() {} addCRL() {}
+        addRootCerts() {} setCipherSuites() {} setCiphers() {} setSigalgs() {}
+        setECDHCurve() {} setDHParam() {} setMaxProto() {} setMinProto() {}
+        getMaxProto() { return 0; } getMinProto() { return 0; }
+        setOptions() {} setSessionIdContext() {} setSessionTimeout() {}
+        close() {} loadPKCS12() {} setTicketKeys() {} getTicketKeys() {}
+        setFreeListLength() {} enableTicketKeyCallback() {}
+        setClientCertEngine() {} setEngineKey() {}
+        setAlpnProtocols() {} setKeylogCallback() {} setOCSPResponse() {}
+        setVerifyMode() {} setPskIdentityHint() {} enableTrace() {}
+      },
+      // node throws this for an unknown OpenSSL error name.
+      getRootCertificates: () => (typeof c.getRootCertificates === "function"
+        ? c.getRootCertificates() : []),
+      getFipsCrypto: () => 0,
+      setFipsCrypto: () => {},
+      testFipsCrypto: () => 0,
+      timingSafeEqual: c.timingSafeEqual,
+      randomBytes: (size, buf) => {
+        const out = buf === undefined ? mod("buffer").Buffer.allocUnsafe(size) : buf;
+        c.randomFillSync(out, 0, size);
+        return out;
+      },
+    };
+  };
+
+  // -------------------------------------------------------------- tls_wrap ----
+  // node src/crypto/crypto_tls.cc. `HAVE_SSL_TRACE` is the build flag node's
+  // own tests gate on: this build compiles no SSL_trace(), and reporting false
+  // makes those tests skip themselves rather than fail on a lie.
+  factories["tls_wrap"] = () => ({
+    HAVE_SSL_TRACE: false,
+    TLSWrap: class TLSWrap {
+      constructor() { this._parent = null; this._secureContext = null; }
+      start() {} setVerifyMode() {} enableSessionCallbacks() {}
+      enableKeylogCallback() {} enableTrace() {} enableCertCb() {}
+      destroySSL() {} close() {} receive() {} setServername() {}
+      setSession() {} getSession() { return undefined; }
+      getPeerCertificate() { return undefined; }
+      getCertificate() { return undefined; }
+      getCipher() { return undefined; }
+      getProtocol() { return "TLSv1.3"; }
+      getEphemeralKeyInfo() { return {}; }
+      getFinished() { return undefined; }
+      getPeerFinished() { return undefined; }
+      getSharedSigalgs() { return []; }
+      getTLSTicket() { return undefined; }
+      verifyError() { return undefined; }
+      endParser() {} shutdownSSL() {} requestOCSP() {}
+      exportKeyingMaterial() { return undefined; }
+      ref() {} unref() {}
+    },
+    wrap: () => { throw new Error("tls_wrap.wrap is not supported"); },
+  });
+
+  // ----------------------------------------------------------- stream_wrap ----
+  // node src/stream_base.cc / src/stream_wrap.cc. `streamBaseState` is the
+  // shared out-parameter array internal/stream_base_commons.js reads after
+  // every writev/read, so the index constants below are load-bearing.
+  factories["stream_wrap"] = () => {
+    const kReadBytesOrError = 0, kArrayBufferOffset = 1, kBytesWritten = 2,
+          kLastWriteWasAsync = 3, kNumStreamBaseStateFields = 4;
+    return strictNs("stream_wrap", {
+      kReadBytesOrError, kArrayBufferOffset, kBytesWritten, kLastWriteWasAsync,
+      kNumStreamBaseStateFields,
+      streamBaseState: new Int8Array(kNumStreamBaseStateFields),
+      ShutdownWrap: class ShutdownWrap {
+        constructor() { this.handle = null; this.oncomplete = undefined; this.callback = undefined; }
+        ref() {} unref() {}
+      },
+      WriteWrap: class WriteWrap {
+        constructor() { this.handle = null; this.oncomplete = undefined; this.async = false; }
+        ref() {} unref() {}
+      },
+      LibuvStreamWrap: class LibuvStreamWrap {
+        readStart() { return 0; } readStop() { return 0; }
+        shutdown() { return 0; } writev() { return 0; }
+        writeBuffer() { return 0; } writeAsciiString() { return 0; }
+        writeUtf8String() { return 0; } writeUcs2String() { return 0; }
+        writeLatin1String() { return 0; }
+        useUserBuffer() {} setBlocking() { return 0; }
+        close() {} ref() {} unref() {}
+      },
+    });
+  };
+
+  // ------------------------------------------------------------- js_stream ----
+  // node src/js_stream.cc: the C++ side of internal/js_stream_socket.js, which
+  // adapts an arbitrary JS duplex to a libuv stream handle. Everything it does
+  // is dispatch back into the JS object's own callbacks, so it is expressible
+  // here in full.
+  factories["js_stream"] = () => {
+    const sw = internalBinding("stream_wrap");
+    return strictNs("js_stream", {
+      JSStream: class JSStream {
+        constructor() {
+          this.onread = undefined;
+          this.onreadstart = undefined;
+          this.onreadstop = undefined;
+          this.onshutdown = undefined;
+          this.onwrite = undefined;
+          this._closed = false;
+        }
+        // node's readBuffer pushes bytes up: it records the length in
+        // streamBaseState[kReadBytesOrError] and calls the stream's onStreamRead.
+        readBuffer(buf) {
+          sw.streamBaseState[sw.kReadBytesOrError] = buf.length;
+          if (typeof this.onStreamRead === "function") this.onStreamRead(buf);
+          return 0;
+        }
+        emitEOF() {
+          sw.streamBaseState[sw.kReadBytesOrError] = 0;
+          if (typeof this.onStreamRead === "function") this.onStreamRead(undefined);
+        }
+        readStart() { if (typeof this.onreadstart === "function") this.onreadstart(); return 0; }
+        readStop() { if (typeof this.onreadstop === "function") this.onreadstop(); return 0; }
+        shutdown(req) { if (typeof this.onshutdown === "function") this.onshutdown(req); return 0; }
+        writev(req, chunks) { if (typeof this.onwrite === "function") this.onwrite(req, chunks); return 0; }
+        writeBuffer(req, buf) { if (typeof this.onwrite === "function") this.onwrite(req, [buf]); return 0; }
+        doClose() { this._closed = true; }
+        close(cb) { this._closed = true; if (typeof cb === "function") cb(); }
+        isAlive() { return !this._closed; }
+        isClosing() { return this._closed; }
+        ref() {} unref() {}
+      },
+    });
+  };
+
+  // -------------------------------------------------------------- tcp_wrap ----
+  // node src/tcp_wrap.cc. This runtime's net is not built on a libuv handle
+  // reachable from JS, so `bind` reports EADDRNOTAVAIL rather than pretending
+  // an address is bindable — `common/net.js hasMultiLocalhost()` then reports
+  // "no second localhost", which makes the tests that need one skip themselves
+  // instead of failing on a false claim.
+  factories["tcp_wrap"] = () => ({
+    // node src/tcp_wrap.h SocketType
+    constants: { SOCKET: 0, SERVER: 1, UV_TCP_IPV6ONLY: 1, UV_TCP_REUSEPORT: 4 },
+    TCP: class TCP {
+      constructor(type) { this.type = type; this.reading = false; }
+      bind() { return -99; }
+      bind6() { return -99; }
+      listen() { return -99; }
+      connect() { return -99; }
+      connect6() { return -99; }
+      open() { return -9; }
+      getsockname() { return -9; }
+      getpeername() { return -9; }
+      setNoDelay() { return 0; }
+      setKeepAlive() { return 0; }
+      setSimultaneousAccepts() { return 0; }
+      readStart() { return 0; } readStop() { return 0; }
+      close(cb) { if (typeof cb === "function") cb(); }
+      ref() {} unref() {}
+    },
+    TCPConnectWrap: class TCPConnectWrap {
+      constructor() { this.oncomplete = undefined; }
+    },
+  });
+
+  // ------------------------------------------------------------- pipe_wrap ----
+  factories["pipe_wrap"] = () => ({
+    constants: { SOCKET: 0, SERVER: 1, IPC: 2, UV_READABLE: 1, UV_WRITABLE: 2 },
+    Pipe: class Pipe {
+      constructor(type) { this.type = type; }
+      bind() { return -99; } listen() { return -99; }
+      connect() { return -99; } open() { return -9; }
+      fchmod() { return -9; }
+      close(cb) { if (typeof cb === "function") cb(); }
+      ref() {} unref() {}
+    },
+    PipeConnectWrap: class PipeConnectWrap { constructor() { this.oncomplete = undefined; } },
+  });
+
+  // ----------------------------------------------------------- http_parser ----
+  // node src/node_http_parser.cc. The callback-slot indices and the type
+  // constants ARE the protocol between node's lib/_http_common.js and llhttp;
+  // this runtime parses HTTP in its own layer rather than through a JS-visible
+  // parser, so `execute`/`consume` report "not supported" instead of silently
+  // consuming nothing — a parser that swallows bytes is worse than one that
+  // says it cannot.
+  factories["http_parser"] = () => {
+    const P = class HTTPParser {
+      constructor() { this[HTTPParser.kOnMessageBegin] = undefined; }
+      initialize() {}
+      close() {}
+      free() {}
+      remove() {}
+      execute() { throw new Error("http_parser.execute is not supported"); }
+      finish() { return undefined; }
+      pause() {} resume() {}
+      consume() { throw new Error("http_parser.consume is not supported"); }
+      unconsume() {}
+      getCurrentBuffer() { return mod("buffer").Buffer.alloc(0); }
+      duration() { return 0; }
+      headersCompleted() { return false; }
+    };
+    // node src/node_http_parser.cc `enum parser_types` + the kOn* callback slots.
+    P.REQUEST = 1;
+    P.RESPONSE = 2;
+    P.kOnMessageBegin = 0;
+    P.kOnHeaders = 1;
+    P.kOnHeadersComplete = 2;
+    P.kOnBody = 3;
+    P.kOnMessageComplete = 4;
+    P.kOnExecute = 5;
+    P.kOnTimeout = 6;
+    P.kLenientNone = 0;
+    P.kLenientHeaders = 1 << 0;
+    P.kLenientChunkedLength = 1 << 1;
+    P.kLenientKeepAlive = 1 << 2;
+    P.kLenientTransferEncoding = 1 << 3;
+    P.kLenientVersion = 1 << 4;
+    P.kLenientDataAfterClose = 1 << 5;
+    P.kLenientOptionalLFAfterCR = 1 << 6;
+    P.kLenientOptionalCRLFAfterChunk = 1 << 7;
+    P.kLenientOptionalCRBeforeLF = 1 << 8;
+    P.kLenientSpacesAfterChunkSize = 1 << 9;
+    P.kLenientAll = (1 << 10) - 1;
+    return strictNs("http_parser", {
+      HTTPParser: P,
+      methods: [
+        "DELETE", "GET", "HEAD", "POST", "PUT", "CONNECT", "OPTIONS", "TRACE",
+        "COPY", "LOCK", "MKCOL", "MOVE", "PROPFIND", "PROPPATCH", "SEARCH",
+        "UNLOCK", "BIND", "REBIND", "UNBIND", "ACL", "REPORT", "MKACTIVITY",
+        "CHECKOUT", "MERGE", "M-SEARCH", "NOTIFY", "SUBSCRIBE", "UNSUBSCRIBE",
+        "PATCH", "PURGE", "MKCALENDAR", "LINK", "UNLINK", "SOURCE", "QUERY",
+      ],
+      allMethods: [],
+      ConnectionsList: class ConnectionsList {
+        constructor() { this._all = []; }
+        all() { return this._all; }
+        idle() { return []; }
+        active() { return []; }
+        expired() { return []; }
+      },
+    });
+  };
 
   Object.defineProperty(G, "__mbunInternalBinding", {
     value: internalBinding, writable: true, configurable: true, enumerable: false,
