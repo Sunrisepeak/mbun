@@ -88,13 +88,23 @@ inline constexpr std::string_view kNodeProcessLifecycleJS = R"JS(
   const describe = (err) => {
     try {
       if (err instanceof Error) {
+        // Use err.name AS IS. Do not synthesize "Name [CODE]".
+        //
+        // The AssertionError header really does read "AssertionError
+        // [ERR_ASSERTION]: …", but that is not a general rule about coded errors
+        // — assertion_error.js:358 writes that string into the error's OWN name,
+        // and it is the only place in node's lib that does. An ordinary error
+        // carrying a code prints just "Error: message"; verified against real
+        // node, which prints "Error: boom" for `e.code = "ERR_FOO"`.
+        //
+        // Generalising it broke every corpus file that greps a child's stderr
+        // for a message: test-permission-fs-require asserts
+        // /Error: Access to this API has been restricted/ and got
+        // "Error [ERR_ACCESS_DENIED]: Access to this API…" instead. Taking the
+        // name verbatim gets AssertionError right for free, because the name
+        // already carries the bracket.
         const name = err.name || "Error";
-        // node's error classes carry the code INSIDE the stack header
-        // ("AssertionError [ERR_ASSERTION]: …"); JSC's Error has no such notion,
-        // so re-apply it here from err.code.
-        const code = typeof err.code === "string" && !name.includes(err.code)
-          ? " [" + err.code + "]" : "";
-        const head = name + code + (err.message ? ": " + err.message : "");
+        const head = name + (err.message ? ": " + err.message : "");
         const frames = err.stack ? v8Frames(err.stack) : [];
         if (!frames.length) return head;
         return sourceContext(frames) + "\n" + head + "\n" + frames.join("\n") + "\n";
