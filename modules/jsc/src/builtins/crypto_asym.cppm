@@ -750,14 +750,20 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
         (typeof options.authTagLength !== "number" || !Number.isInteger(options.authTagLength) || options.authTagLength < 0)) {
       throw new TypeError("The property 'options.authTagLength' is invalid. Received " + String(options.authTagLength));
     }
-    // Poly1305 produces exactly 16 bytes and node refuses any other length for it
-    // (crypto_cipher.cc InitAuthenticated: the ChaCha20-Poly1305 arm pins
-    // auth_tag_len to 16). Accepting e.g. 4 would let a peer authenticate with a
-    // truncated tag — a 2^32 forgery instead of 2^128.
-    if (info.aead === true && mode === "stream" && options.authTagLength !== undefined &&
-        options.authTagLength !== 16) {
-      const e = new Error("Invalid authentication tag length: " + options.authTagLength);
-      e.code = "ERR_CRYPTO_INVALID_AUTH_TAG"; throw e;
+    // Each AEAD mode admits its own set of tag lengths (node crypto_cipher.cc
+    // InitAuthenticated). This is a security check, not a formality: a tag of n
+    // bytes caps forgery resistance at 2^(8n), so Poly1305 is pinned to its full
+    // 16 and GCM/CCM/OCB only get the lengths their specs define.
+    if (info.aead === true && options.authTagLength !== undefined) {
+      const n = options.authTagLength;
+      const ok = mode === "gcm" ? (n === 4 || n === 8 || (n >= 12 && n <= 16))
+        : mode === "ccm" ? (n === 4 || n === 6 || n === 8 || n === 10 || n === 12 || n === 14 || n === 16)
+        : mode === "ocb" ? (n >= 1 && n <= 16)
+        : n === 16;  // ChaCha20-Poly1305 (EVP mode "stream")
+      if (!ok) {
+        const e = new TypeError("Invalid authentication tag length: " + n);
+        e.code = "ERR_CRYPTO_INVALID_AUTH_TAG"; throw e;
+      }
     }
     self._algo = algorithm.toLowerCase();
     self._enc = isEncrypt;
@@ -799,7 +805,16 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     Object.setPrototypeOf(Decipheriv, Transform);
   }
   const cipherProto = {
-    setAAD(buffer) { this._aad = toBuf(buffer); return this; },
+    // node CipherBase::SetAAD: AAD is only accepted by an authenticated mode, and
+    // only before any data has been fed in (and never after final()). Anything
+    // else is ERR_CRYPTO_INVALID_STATE — a plain aes-128-cbc never takes AAD.
+    setAAD(buffer) {
+      if (!this._auth || this._done || this._chunks.length > 0) {
+        const e = new Error("Invalid state for operation setAAD");
+        e.code = "ERR_CRYPTO_INVALID_STATE"; throw e;
+      }
+      this._aad = toBuf(buffer); return this;
+    },
     setAutoPadding(ap) { this._noPad = arguments.length > 0 && !ap; return this; },
     getAuthTag() { if (!this._auth || !this._enc || this._tag == null) throw new Error("Unsupported state or unable to authenticate data"); return this._tag; },
     setAuthTag(tag) {
@@ -808,7 +823,7 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
       // with one it must match exactly. node ERR_CRYPTO_INVALID_AUTH_TAG.
       if (this._auth) {
         const ok = this._tagLenSet ? (t.length === this._tagLen) : (t.length === 16);
-        if (!ok) { const e = new Error("Invalid authentication tag length: " + t.length); e.code = "ERR_CRYPTO_INVALID_AUTH_TAG"; throw e; }
+        if (!ok) { const e = new TypeError("Invalid authentication tag length: " + t.length); e.code = "ERR_CRYPTO_INVALID_AUTH_TAG"; throw e; }
       }
       this._tag = t; return this;
     },
@@ -837,9 +852,14 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     },
     final(outputEnc) {
       if (this._done) throw new Error("Trying to add data in an unsupported state");
-      noteOutEnc(this, outputEnc);
       this._done = true;
       const out = this._run();
+      // The output encoding is validated only AFTER the cipher is finalized, as
+      // node does (lib/internal/crypto/cipher.js runs kHandle.final() before
+      // getDecoder). A GCM/OCB/ChaCha20-Poly1305 authentication failure must
+      // surface as the auth error even when final()'s encoding differs from the
+      // one update() used.
+      noteOutEnc(this, outputEnc);
       return (outputEnc && outputEnc !== "buffer") ? out.toString(outputEnc) : out;
     },
     _transform(chunk, e, cb) { this._chunks.push(toBuf(chunk)); cb(); },

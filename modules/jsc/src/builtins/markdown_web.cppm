@@ -723,24 +723,36 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
     Object.setPrototypeOf(Hash, Transform);
     const joinChunks = function (chunks) { let t = 0; for (const c of chunks) t += c.length; const m = new Uint8Array(t); let o = 0; for (const c of chunks) { m.set(c, o); o += c.length; } return m; };
     Hash.prototype.update = function (data, enc) { if (this._done) throw new Error("Digest already called"); if (typeof data !== "string" && !ArrayBuffer.isView(data) && !(data instanceof ArrayBuffer)) throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "data" argument must be of type string or an instance of Buffer, TypedArray, or DataView.' + invalidArgType(data)); this._chunks.push(toBytes(data, enc)); return this; };
+    // node's native hash keeps the finalized digest around: the stream path
+    // finalizes through the handle (bypassing the JS "already called" guard), and
+    // user code may still call digest() afterwards and must get the same bytes
+    // back rather than a throw or a recomputation (nodejs/node#28245).
+    Hash.prototype._rawDigest = function () {
+      if (this._digestBytes === undefined) {
+        const m = joinChunks(this._chunks);
+        const isXof = NORM(this._algo).startsWith("shake");
+        let d;
+        if (isXof) {
+          d = this._out === 0 ? new Uint8Array(0) : digestBytes(this._algo, m, this._out < 0 ? 0 : this._out);
+        } else {
+          d = digestBytes(this._algo, m, 0);
+          // node: a non-XOF digest rejects an explicit outputLength that isn't its
+          // natural length ("Output length N is invalid for <algo>...").
+          if (this._out >= 0 && this._out !== d.length) throw new Error("Output length " + this._out + " is invalid for " + this._algo + ", which does not support XOF");
+        }
+        this._digestBytes = d;
+      }
+      return this._digestBytes;
+    };
     Hash.prototype.digest = function (enc) {
       if (this._done) throw new Error("Digest already called");
       this._done = true;
-      const m = joinChunks(this._chunks);
-      const isXof = NORM(this._algo).startsWith("shake");
-      let d;
-      if (isXof) {
-        d = this._out === 0 ? new Uint8Array(0) : digestBytes(this._algo, m, this._out < 0 ? 0 : this._out);
-      } else {
-        d = digestBytes(this._algo, m, 0);
-        // node: a non-XOF digest rejects an explicit outputLength that isn't its
-        // natural length ("Output length N is invalid for <algo>...").
-        if (this._out >= 0 && this._out !== d.length) throw new Error("Output length " + this._out + " is invalid for " + this._algo + ", which does not support XOF");
-      }
-      return encode(d, enc);
+      return encode(this._rawDigest(), enc);
     };
     Hash.prototype._transform = function (chunk, e, cb) { this.update(chunk); cb(); };
-    Hash.prototype._flush = function (cb) { this.push(this.digest()); cb(); };
+    // Finalize through _rawDigest, not digest(): piping must not arm the
+    // "Digest already called" guard against a later digest() call.
+    Hash.prototype._flush = function (cb) { this.push(encode(this._rawDigest())); cb(); };
     // node's Hash#copy clones the EVP context, which is gone once digest() ran:
     // copying a finalized hash throws, exactly like update() does.
     Hash.prototype.copy = function () { if (this._done) throw new Error("Digest already called"); const h = new Hash(this._algo, { outputLength: this._out }); h._chunks = this._chunks.slice(); return h; };
