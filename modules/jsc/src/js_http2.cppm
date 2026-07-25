@@ -996,7 +996,7 @@ export constexpr std::string_view kHttp2JS = R"JS(
   function http2StreamClose(stream, code, cb) {
     if (code === undefined) code = constants.NGHTTP2_NO_ERROR;
     validateUint32(code, "code");
-    if (cb !== undefined && cb !== null && typeof cb !== "function") throw argTypeErr("callback", "of type function", cb);
+    if (cb !== undefined && typeof cb !== "function") throw argTypeErr("callback", "of type function", cb);
     if (typeof cb === "function") stream.once("close", cb);
     if (stream._closed) return;
     stream._closed = true;
@@ -1121,8 +1121,32 @@ export constexpr std::string_view kHttp2JS = R"JS(
       else socket.destroy();
     } catch (e) { try { socket.destroy(); } catch (e2) {} }
   }
+  // node internal/stream_base_commons setStreamTimeout: validateNumber(msecs)
+  // through getTimerDuration, then an UNREF'd timer that emits 'timeout'. The
+  // old body accepted anything and never fired.
   function http2StreamSetTimeout(stream, ms, cb) {
-    if (typeof cb === "function") stream.once("timeout", cb);
+    if (stream.destroyed) return stream;
+    if (typeof ms !== "number") throw argTypeErr("msecs", "of type number", ms);
+    if (ms < 0 || !Number.isFinite(ms)) throw outOfRangeErr("msecs", "a non-negative finite number", ms);
+    stream.timeout = ms;
+    if (stream._h2Timeout != null) { try { G.clearTimeout(stream._h2Timeout); } catch (e) {} stream._h2Timeout = null; }
+    if (ms === 0) {
+      if (cb !== undefined) {
+        if (typeof cb !== "function") throw argTypeErr("callback", "of type function", cb);
+        stream.removeListener("timeout", cb);
+      }
+      return stream;
+    }
+    // Order matters and is node's: the timer is ARMED BEFORE the callback is
+    // validated, so `setTimeout(100, {})` still leaves a live timer behind (and
+    // any listener an earlier setTimeout registered still fires).
+    const t = G.setTimeout(() => { stream._h2Timeout = null; if (!stream.destroyed) stream.emit("timeout"); }, ms);
+    if (t && typeof t.unref === "function") t.unref();
+    stream._h2Timeout = t;
+    if (cb !== undefined) {
+      if (typeof cb !== "function") throw argTypeErr("callback", "of type function", cb);
+      stream.once("timeout", cb);
+    }
     return stream;
   }
   // node Http2Stream#bufferSize = the bytes still queued for the wire (the
@@ -1372,6 +1396,16 @@ export constexpr std::string_view kHttp2JS = R"JS(
       const optWeight = options.weight;
       const optWaitTrailers = options.waitForTrailers;
       const optEndStream = options.endStream === true;
+      // node setAndValidatePriorityOptions + validateBoolean(options.endStream):
+      // every one of these was accepted with any type at all.
+      if (options.parent !== undefined && typeof options.parent !== "number")
+        throw argTypeErr("options.parent", "of type number", options.parent);
+      if (options.exclusive !== undefined && typeof options.exclusive !== "boolean")
+        throw argTypeErr("options.exclusive", "of type boolean", options.exclusive);
+      if (options.silent !== undefined && typeof options.silent !== "boolean")
+        throw argTypeErr("options.silent", "of type boolean", options.silent);
+      if (options.endStream !== undefined && typeof options.endStream !== "boolean")
+        throw argTypeErr("options.endStream", "of type boolean", options.endStream);
       // Header validation runs BEFORE the stream id is consumed: node throws
       // out of request() for a malformed header block and no stream is opened.
       const rawForm = Array.isArray(headers);
@@ -1890,9 +1924,15 @@ export constexpr std::string_view kHttp2JS = R"JS(
     // every open stream (lib/internal/http2/core.js Http2Session.setTimeout ->
     // #onTimeout -> forEachStream(emitTimeout)). Reset on inbound activity.
     setTimeout(ms, cb) {
-      if (typeof cb === "function") this.on("timeout", cb);
+      if (typeof ms !== "number") throw argTypeErr("msecs", "of type number", ms);
+      if (ms < 0 || !Number.isFinite(ms)) throw outOfRangeErr("msecs", "a non-negative finite number", ms);
+      this.timeout = ms;
       this._timeoutMs = ms | 0;
       this._armTimeout();
+      if (cb !== undefined) {
+        if (typeof cb !== "function") throw argTypeErr("callback", "of type function", cb);
+        this.once("timeout", cb);
+      }
       return this;
     }
     _armTimeout() {
@@ -1904,7 +1944,9 @@ export constexpr std::string_view kHttp2JS = R"JS(
         if (self.destroyed) return;
         self.emit("timeout");
         for (const s of Array.from(self.streams.values())) { try { s.emit("timeout"); } catch (e) {} }
-        self._armTimeout();
+        // node arms ONE unref'd timer and only `refresh()`es it on activity
+        // (kUpdateTimer); it is not periodic. Re-arming here made
+        // `session.setTimeout(1, cb)` call cb forever.
       }, this._timeoutMs);
       if (this._timer && this._timer.unref) this._timer.unref();
     }
@@ -2274,7 +2316,7 @@ export constexpr std::string_view kHttp2JS = R"JS(
   function validateUint32(value, name) {
     if (typeof value !== "number") throw argTypeErr(name, "of type number", value);
     if (!Number.isInteger(value)) throw outOfRangeErr(name, "an integer", value);
-    if (value < 0 || value > 4294967295) throw outOfRangeErr(name, ">= 0 and <= 4294967295", value);
+    if (value < 0 || value > 4294967295) throw outOfRangeErr(name, ">= 0 && <= 4294967295", value);
   }
   const isBufLike = (v) => Buffer.isBuffer(v) || ArrayBuffer.isView(v);
 
@@ -2936,6 +2978,8 @@ export constexpr std::string_view kHttp2JS = R"JS(
     altsvc(alt, originOrStream) { return sessionAltsvc(this, alt, originOrStream); }
     origin(...origins) { return sessionOrigin(this, origins); }
     goaway(code, lastStreamID, opaqueData) {
+      // node Http2Session#goaway: a destroyed session cannot emit any frame.
+      if (this.destroyed) throw mkErr("The session has been destroyed", "ERR_HTTP2_INVALID_SESSION");
       if (code === undefined) code = 0;
       validateNumber(code, "code");
       if (lastStreamID === undefined) lastStreamID = 0;
