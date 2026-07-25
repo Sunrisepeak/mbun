@@ -547,9 +547,46 @@ export constexpr std::string_view kDgramJS = R"JS(
     newHandleObj.lookup = oldHandle.lookup;
     newHandleObj.bind = oldHandle.bind;
     newHandleObj.send = oldHandle.send;
+    // node's handle arrives already built for the right family (its primary calls
+    // dgram._createSocketHandle with the addressType). mbun rebuilds the handle
+    // from a bare descriptor, so the family has to ride across from the socket's
+    // own handle or every setopt/membership call would use the v4 socket level.
+    if (newHandleObj._family6 !== undefined) newHandleObj._family6 = !!oldHandle._family6;
     newHandleObj[kOwner] = self;
     oldHandle.close();
     state.handle = newHandleObj;
+  }
+
+  // lib/dgram.js lazyLoadCluster(): read at CALL time, never at module scope.
+  // node:cluster freezes its primary/worker role at first require and a worker's
+  // role decides whether bind() may touch bind(2) at all, so capturing it here
+  // would also capture the role of whichever module happened to load first.
+  const lazyLoadCluster = () => M["cluster"] || M["node:cluster"] || G.__mbunCluster || {};
+
+  // lib/dgram.js bindServerHandle(): in a cluster worker a non-exclusive bind is
+  // not a bind — it is a request to the primary for the already-bound shared UDP
+  // handle (internal/cluster/shared_handle.js), which then replaces this
+  // socket's own. Both failure shapes matter to the corpus: an error reply after
+  // the socket was closed must stay silent (test-dgram-bind-socket-close-before-
+  // cluster-reply asserts mustNotCall on 'error'), and a handle that arrives
+  // after the close must be closed rather than adopted (test-dgram-cluster-
+  // close-during-bind terminates on exactly that handle.close()).
+  function bindServerHandle(self, options, errCb) {
+    const cluster = lazyLoadCluster();
+    const state = self[kStateSymbol];
+    cluster._getServer(self, options, (err, handle) => {
+      if (err) {
+        // Do not call the callback if the socket is closed.
+        if (state.handle) errCb(err);
+        return;
+      }
+      if (!state.handle) {
+        // Handle has been closed in the mean time.
+        return handle.close();
+      }
+      replaceHandle(self, handle);
+      startListening(self);
+    });
   }
 
   function bufferSize(self, size, buffer) {
@@ -591,6 +628,18 @@ export constexpr std::string_view kDgramJS = R"JS(
     // bind({ fd }): open an existing descriptor instead of creating one.
     if (port !== null && typeof port === "object" && isInt32(port.fd) && port.fd > 0) {
       const fd = port.fd;
+      const fdExclusive = !!port.exclusive;
+      const fdCluster = lazyLoadCluster();
+      if (fdCluster.isWorker && !fdExclusive) {
+        bindServerHandle(this, {
+          address: null, port: null, addressType: this.type, fd, flags: null,
+        }, (err) => {
+          const ex = ErrnoException(err, "open");
+          state.bindState = BIND_STATE_UNBOUND;
+          this.emit("error", ex);
+        });
+        return this;
+      }
       const type = ND.handletype(fd);
       if (type !== "UDP") throw ERR_INVALID_FD_TYPE(type);
       const err = state.handle.open(fd);
@@ -600,11 +649,14 @@ export constexpr std::string_view kDgramJS = R"JS(
     }
 
     let address;
+    let exclusive;
     if (port !== null && typeof port === "object") {
       address = port.address || "";
+      exclusive = !!port.exclusive;
       port = port.port;
     } else {
       address = typeof address_ === "function" ? "" : address_;
+      exclusive = false;
     }
 
     // Defaulting address for bind to all interfaces.
@@ -621,7 +673,20 @@ export constexpr std::string_view kDgramJS = R"JS(
       let flags = 0;
       if (state.reuseAddr) flags |= 4;      // UV_UDP_REUSEADDR
       if (state.ipv6Only) flags |= 1;       // UV_UDP_IPV6ONLY
-      if (state.reusePort) flags |= 8;      // UV_UDP_REUSEPORT
+      // SO_REUSEPORT means "every socket binds for itself", so it also means the
+      // worker must NOT ask the primary for a shared handle (lib/dgram.js).
+      if (state.reusePort) { exclusive = true; flags |= 8; }  // UV_UDP_REUSEPORT
+      const cluster = lazyLoadCluster();
+      if (cluster.isWorker && !exclusive) {
+        bindServerHandle(this, {
+          address: ip, port: port, addressType: this.type, fd: -1, flags: flags,
+        }, (err) => {
+          const ex = ExceptionWithHostPort(err, "bind", ip, port);
+          state.bindState = BIND_STATE_UNBOUND;
+          this.emit("error", ex);
+        });
+        return;
+      }
       const berr = state.handle.bind(ip, port || 0, flags);
       if (berr) {
         const ex = ExceptionWithHostPort(berr, "bind", ip, port);

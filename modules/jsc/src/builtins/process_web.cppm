@@ -145,6 +145,18 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
         const s = new netmod.Socket();
         if (typeof s._adopt === "function") { s._adopt(fd); return s; }
       }
+      // A shared dgram socket (cluster's SharedHandle for udp4/udp6) must arrive
+      // as a real UDP *handle*, not a bare descriptor: lib/dgram.js
+      // bindServerHandle() replaceHandle()s it into the Socket and immediately
+      // calls handle.recvStart(). node passes the live handle across the C++
+      // boundary; mbun only has the fd, so rebuild the handle around it.
+      if (type === "dgram.Native") {
+        const dg = M["internal/dgram"];
+        if (dg && typeof dg.newHandle === "function") {
+          const h = dg.newHandle("udp4");
+          if (h.open(fd) === 0) return h;
+        }
+      }
     } catch (e) {}
     // Raw descriptor wrapper: what cluster's round-robin `newconn` hands to
     // net.Server, and the fallback for anything with no richer JS shape.
