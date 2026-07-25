@@ -19,7 +19,15 @@ ending. This file is what makes that recoverable.
   excluding self-skips, at commit `9d70bbf`. Run dir:
   `.claude/worktrees/wt5/target/integration/r12b`.
 
-## FIRST TASK ON RESUME — two items, in this order
+## FIRST TASK ON RESUME — three items, in this order
+
+0. **A 17x setImmediate performance regression, measured.** A 10 000-link
+   setImmediate chain: **12ms before this round, 209ms after; real node does it
+   in 10ms.** The semantics did not change — baseline, current build and node all
+   print `A,B,A2` — so the cost bought nothing. Suspect the drain-batch stamp
+   added to the Immediate phase in `process_web.cppm` this round. Guarded now by
+   `latency_probe.py --only setImmediate` (400ms threshold; current build 565ms
+   FAILS, pre-round baseline 114ms passes).
 
 1. **Eleven real regressions from this round's runtime-wide changes.** Each
    reproduces 3/3 standalone, so they are not guard artefacts. Four time out:
