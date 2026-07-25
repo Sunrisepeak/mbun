@@ -553,6 +553,12 @@ int fs_errno_for(std::string_view code) {
     if (code == "EINVAL") return -22;
     return 0;
 }
+// errno → node's "EINVAL" / "invalid argument" pair. Defined further down this TU
+// (with the fd-level bindings); forward-declared here so the path-level bindings
+// above can render node's exact "<CODE>: <text>, <syscall> '<path>'" instead of
+// collapsing every unexpected errno onto one hand-picked code.
+std::string fd_errno_code(int e);
+std::string fd_errno_message(int e);
 // node fs errors are Error instances carrying .code/.errno/.syscall/.path — not
 // bare strings. Callers pass a node-ish "ECODE: message, syscall 'path'" text;
 // we build the Error and populate .code + .errno from the leading token so
@@ -561,6 +567,18 @@ int fs_errno_for(std::string_view code) {
 JSValueRef fs_make_error(JSContextRef ctx, const std::string& msg) {
     JSValueRef m{make_string(ctx, msg)};
     JSObjectRef e{JSObjectMakeError(ctx, 1, &m, nullptr)};
+    // node builds this error with plain JS property SETS (lib/internal/errors.js
+    // uvException does `err.errno = …`), so a poisoned Object.prototype accessor
+    // for errno/code/syscall/path throws and THAT error is what the caller must
+    // see. set_prop discards the setter's exception, which turned
+    // test-fs-writesync-crash's expected error into an EBADF report.
+    JSValueRef setExc{nullptr};
+    const auto put{[&](const char* name, JSValueRef v) {
+        if (setExc != nullptr) return;
+        JSStringRef n{JSStringCreateWithUTF8CString(name)};
+        JSObjectSetProperty(ctx, e, n, v, kJSPropertyAttributeNone, &setExc);
+        JSStringRelease(n);
+    }};
     auto colon{msg.find(':')};
     if (colon != std::string::npos && colon > 0 && msg[0] == 'E') {
         std::string code{msg.substr(0, colon)};
@@ -568,8 +586,8 @@ JSValueRef fs_make_error(JSContextRef ctx, const std::string& msg) {
         for (char c : code)
             if (!((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))) { ok = false; break; }
         if (ok) {
-            set_prop(ctx, e, "code", make_string(ctx, code));
-            set_prop(ctx, e, "errno", JSValueMakeNumber(ctx, fs_errno_for(code)));
+            put("code", make_string(ctx, code));
+            put("errno", JSValueMakeNumber(ctx, fs_errno_for(code)));
         }
     }
     // ", <syscall> '<path>'" tail → syscall + path (node uvException layout).
@@ -578,11 +596,20 @@ JSValueRef fs_make_error(JSContextRef ctx, const std::string& msg) {
     if (comma != std::string::npos && quote != std::string::npos && quote > comma + 2) {
         std::string syscall{msg.substr(comma + 2, quote - (comma + 2))};
         if (!syscall.empty() && syscall.find(' ') == std::string::npos)
-            set_prop(ctx, e, "syscall", make_string(ctx, syscall));
+            put("syscall", make_string(ctx, syscall));
         auto endq{msg.rfind('\'')};
         if (endq != std::string::npos && endq > quote + 2)
-            set_prop(ctx, e, "path", make_string(ctx, msg.substr(quote + 2, endq - (quote + 2))));
+            put("path", make_string(ctx, msg.substr(quote + 2, endq - (quote + 2))));
+    } else if (comma != std::string::npos && quote == std::string::npos) {
+        // A pathless message ("EBADF: bad file descriptor, fstat") still names a
+        // syscall — node's uvException fills .syscall whether or not there is a
+        // path, and test-fs-error-messages asserts err.syscall === 'fstat'.
+        std::string syscall{msg.substr(comma + 2)};
+        if (!syscall.empty() && syscall.find(' ') == std::string::npos
+            && syscall.find('\'') == std::string::npos)
+            put("syscall", make_string(ctx, syscall));
     }
+    if (setExc != nullptr) return setExc;
     return e;
 }
 JSValueRef fs_throw(JSContextRef ctx, JSValueRef* exc, const std::string& msg) {
@@ -817,11 +844,13 @@ JSValueRef fsn_truncate_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size
     if (ec) return fs_throw(ctx, exc, "ENOENT: no such file or directory, open '" + path + "'");
 #else
     if (::truncate(path.c_str(), static_cast<off_t>(len)) != 0) {
-        if (errno == ENOENT)
-            return fs_throw(ctx, exc, "ENOENT: no such file or directory, open '" + path + "'");
-        if (errno == EISDIR)
-            return fs_throw(ctx, exc, "EISDIR: illegal operation on a directory, open '" + path + "'");
-        return fs_throw(ctx, exc, "EACCES: permission denied, open '" + path + "'");
+        // node reports the REAL errno (its syscall slot for truncate(2) is
+        // "open", matching libuv's open-then-ftruncate implementation). Mapping
+        // everything that was not ENOENT/EISDIR onto EACCES hid EINVAL/EFBIG.
+        const int e{errno};
+        const std::string code{fd_errno_code(e)};
+        return fs_throw(ctx, exc, (code.empty() ? std::string{"EUNKNOWN"} : code) + ": "
+                                      + fd_errno_message(e) + ", open '" + path + "'");
     }
 #endif
     return JSValueMakeUndefined(ctx);
@@ -1081,8 +1110,12 @@ JSValueRef fsn_umask_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t 
 // node fs.utimesSync(path, atime, mtime): atime/mtime are seconds (may be
 // fractional). Uses utimensat for nanosecond precision (node/bun preserve
 // sub-ms — src/sys uses the *_nsec fields). No-op stub lost the fraction.
-JSValueRef fsn_utimes_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
-                         const JSValueRef args[], JSValueRef* exc) {
+// `flags` is utimensat's flag word: 0 for utimes (follow the link) and
+// AT_SYMLINK_NOFOLLOW for lutimes. Both entry points share this body so they
+// share ONE Permission Model gate (permission_deny_fs, write scope) — the same
+// gate node applies in node_file.cc's UTimes/LUTimes.
+JSValueRef fsn_utimes_impl_(JSContextRef ctx, std::size_t argc, const JSValueRef args[],
+                            JSValueRef* exc, int flags, const char* syscall) {
     std::string path{fs_arg(ctx, argc, args, 0)};
     if (permission_deny_fs(ctx, exc, path, true)) return JSValueMakeUndefined(ctx);
 #if !defined(_WIN32)
@@ -1098,10 +1131,29 @@ JSValueRef fsn_utimes_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t
         return ts;
     }};
     struct timespec times[2]{toTs(aSec), toTs(mSec)};
-    if (::utimensat(AT_FDCWD, path.c_str(), times, 0) != 0)
-        return fs_throw(ctx, exc, "ENOENT: no such file or directory, utime '" + path + "'");
+    if (::utimensat(AT_FDCWD, path.c_str(), times, flags) != 0) {
+        const int e{errno};
+        const std::string code{fd_errno_code(e)};
+        return fs_throw(ctx, exc, (code.empty() ? std::string{"EUNKNOWN"} : code) + ": "
+                                      + fd_errno_message(e) + ", " + syscall + " '" + path + "'");
+    }
+#else
+    (void)flags;
+    (void)syscall;
 #endif
     return JSValueMakeUndefined(ctx);
+}
+JSValueRef fsn_utimes_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                         const JSValueRef args[], JSValueRef* exc) {
+    return fsn_utimes_impl_(ctx, argc, args, exc, 0, "utime");
+}
+// node fs.lutimes / fs.lutimesSync: utimensat with AT_SYMLINK_NOFOLLOW, so the
+// timestamps land on the SYMLINK rather than on whatever it points at. Without
+// its own entry point the JS shim fell back to fsn_utimes_cb and followed the
+// link (test-fs-utimes stamped the target and then failed lstat's mtime check).
+JSValueRef fsn_lutimes_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                          const JSValueRef args[], JSValueRef* exc) {
+    return fsn_utimes_impl_(ctx, argc, args, exc, AT_SYMLINK_NOFOLLOW, "lutime");
 }
 JSValueRef fsn_unlink_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                          const JSValueRef args[], JSValueRef* exc) {
@@ -1408,13 +1460,24 @@ JSC::EncodedJSValue fd_throw_errno(JSC::JSGlobalObject* global, int e,
                     + fd_errno_message(e) + ", " + syscall + " '" + path + "'"};
     JSValueRef m{make_string(ctx, msg)};
     JSObjectRef err{JSObjectMakeError(ctx, 1, &m, nullptr)};
-    if (!code.empty()) set_prop(ctx, err, "code", make_string(ctx, code));
-    set_prop(ctx, err, "errno", JSValueMakeNumber(ctx, -e));
-    set_prop(ctx, err, "syscall", make_string(ctx, syscall));
-    set_prop(ctx, err, "path", make_string(ctx, path));
+    // As in fs_make_error: node populates these by plain assignment, so a
+    // poisoned Object.prototype setter for errno/fd must propagate ITS error
+    // rather than be swallowed here (test-fs-writesync-crash).
+    JSValueRef setExc{nullptr};
+    const auto put{[&](const char* name, JSValueRef v) {
+        if (setExc != nullptr) return;
+        JSStringRef n{JSStringCreateWithUTF8CString(name)};
+        JSObjectSetProperty(ctx, err, n, v, kJSPropertyAttributeNone, &setExc);
+        JSStringRelease(n);
+    }};
+    if (!code.empty()) put("code", make_string(ctx, code));
+    put("errno", JSValueMakeNumber(ctx, -e));
+    put("syscall", make_string(ctx, syscall));
+    put("path", make_string(ctx, path));
     JSC::VM& vm{global->vm()};
     auto scope{DECLARE_THROW_SCOPE(vm)};
-    scope.throwException(global, toJS(global, err));
+    scope.throwException(
+        global, toJS(global, setExc != nullptr ? setExc : static_cast<JSValueRef>(err)));
     return JSC::encodedJSValue();
 }
 
