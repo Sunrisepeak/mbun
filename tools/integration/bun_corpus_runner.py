@@ -110,12 +110,19 @@ def classify(
         # Count the failures that are only "we are more correct than bun".
         ahead = len(AHEAD_RE.findall(output))
         real_failed = max(0, failed - ahead)
-        if exit_code != 0 or real_failed > 0 or last_int(ERROR_COUNT_RE, output) > 0:
-            return "test-failure"
-        if ahead > 0:
-            # Every failure in this file is a `test.failing` marker that now
-            # passes. Nothing regressed; bun's own expectation is stale.
+        errors = last_int(ERROR_COUNT_RE, output)
+        # A file whose ONLY failures are stale `test.failing` markers is ahead of
+        # the reference, and the non-zero exit is the expected consequence of that
+        # -- bun's runner exits 1 precisely BECAUSE a failing-marked test passed.
+        # Testing `exit_code != 0` before this check made the ahead-of-reference
+        # bucket unreachable for the exact case it was added for: measured on the
+        # full corpus, assert/deep-equal.test.ts had 22 of 22 failures be
+        # "expected to fail but passed" and was still scored test-failure. Only a
+        # non-zero exit is forgiven, and only when nothing else went wrong.
+        if ahead > 0 and real_failed == 0 and errors == 0:
             return "ahead-of-reference"
+        if exit_code != 0 or real_failed > 0 or errors > 0:
+            return "test-failure"
         # A file whose every test was skipped exits 0 with 0 failures and so used
         # to score as a full green -- ci-restrictions.test.ts reported 0 pass /
         # 12 skip / 0 fail and counted as one. 25 corpus files gate on Bun.version,

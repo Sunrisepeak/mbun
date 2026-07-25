@@ -4,29 +4,39 @@
  "runs": [
   {
    "corpus": "compat/bun/test",
-   "runner": "tools/integration/bun_corpus_runner.py --cwd compat/bun --discover compat/bun/test --sample-per-group 100000 --jobs 14 --timeout 30",
+   "runner": "tools/integration/bun_corpus_runner.py --cwd compat/bun --discover compat/bun/test --sample-per-group 100000 --jobs 5 --timeout 30 --resume",
+   "binary": "r9/integration @ 8009cfc (round 9 + round 10 waves 1-2 + timers/tls-verify/debuglog fixes)",
    "files": 1902,
    "categories": {
     "all-skipped": 73,
-    "blocked-external": 18,
-    "crash": 13,
-    "green": 885,
-    "load-error": 5,
+    "blocked-external": 15,
+    "green": 868,
+    "load-error": 4,
     "no-tests": 6,
-    "oom-kill": 2,
-    "test-failure": 856,
+    "oom-kill": 4,
+    "test-failure": 885,
+    "ahead-of-reference": 3,
     "timeout": 44
    },
    "test_level": {
-    "ran": 52454,
-    "passed": 32190,
-    "failed": 17404,
-    "expects": 487285
+    "ran": 51494,
+    "passed": 31376,
+    "failed": 17331,
+    "expects": 466110
    },
-   "notes": "file-level green = every executed test in the file passed and the file reported no out-of-test error; all-skipped / no-tests / blocked-external are separate buckets and are NOT passes. The corpus npm dependencies must be installed first (see compat/README.md) -- without them 264 files die at load; test/node_modules is excluded from discovery so third-party packages do not inflate the corpus",
-   "binary": "round-7/8 era snapshot (branch fix/corpus-round7) — STALE",
-   "stale": true,
-   "staleness_note": "These figures predate rounds 9 and 10 (20+ tasks) and are NOT current. They are kept because they are the last full bun-corpus measurement taken, not because they still hold. There is direct evidence the number has moved: the deep-equality alignment deliberately reclassified 22 files in bun's own deep-equal suite to `ahead-of-reference` (mbun is more correct than bun there), and the request-smuggling fix took bun's own request-smuggling.test.ts from 53 to 61 passing. A full re-measure is owed; it costs ~30 minutes and has not been run because the machine has been continuously occupied by node-corpus work."
+   "notes": "file-level green = every executed test in the file passed and nothing errored outside a test. ahead-of-reference = every failure in the file is a stale bun `test.failing` marker that now passes, i.e. mbun is MORE correct than bun there; it is NOT counted as green because the file still does not pass bun's suite as written.",
+   "REGRESSION_AGAINST_PREVIOUS_FULL_RUN": {
+    "compared_to": "target/integration/r5-bun (green 884, the most recent full run with per-file rows; the previously published 885 was a round-7/8 snapshot whose per-file data is gone)",
+    "green_lost": 43,
+    "green_gained": 27,
+    "net": -16,
+    "where_the_lost_went": {
+     "test-failure": 41,
+     "timeout": 2
+    },
+    "how_much_is_a_measurement_artefact": "Little of it. Sampling 10 of the 43: one (assert/deep-equal.test.ts) has 22 of 22 failures be 'expected to fail but passed' and is genuinely ahead-of-reference; the other 9 are real failures of 1-2 assertions each. So node-side progress across rounds 6-10 did cost bun files, and this is a trade to be decided rather than absorbed.",
+    "crash_bucket": "13 -> 0, which is real progress and unrelated to the green loss"
+   }
   },
   {
    "corpus": "compat/node/test/parallel",

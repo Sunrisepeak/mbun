@@ -43,12 +43,32 @@ python3 - "$tmp/out" <<'PY'
 import csv, json, pathlib, sys
 root = pathlib.Path(sys.argv[1])
 rows = list(csv.DictReader((root / "results.tsv").open(), delimiter="\t"))
-assert [row["classification"] for row in rows] == [
-    "green", "test-failure", "load-error", "timeout", "missing-dependency",
-    "missing-fixture", "fixture-build-error", "no-tests", "load-error", "test-failure",
-    "blocked-external", "crash",
-], [row["classification"] for row in rows]
-assert [int(row["passed"]) for row in rows] == [2, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1]
+# Compared as a mapping, not a sequence: the runner now emits results in stable
+# PATH order (so two runs diff cleanly) rather than in --list order, and pinning
+# the sequence here would only re-encode whichever order happens to be current.
+def stem(row):
+    return row["path"].rsplit("/", 1)[-1]
+
+
+assert {stem(row): row["classification"] for row in rows} == {
+    "green.test.ts": "green",
+    "red.test.ts": "test-failure",
+    "load.test.ts": "load-error",
+    "timeout.test.ts": "timeout",
+    "dependency.test.ts": "missing-dependency",
+    "fixture.test.ts": "missing-fixture",
+    "native-build.test.ts": "fixture-build-error",
+    "notests.test.ts": "no-tests",
+    "unhandled.test.ts": "load-error",
+    "outoftest.test.ts": "test-failure",
+    "blockedsvc.test.ts": "blocked-external",
+    "crash.test.ts": "crash",
+}, {stem(row): row["classification"] for row in rows}
+assert {stem(row): int(row["passed"]) for row in rows if int(row["passed"])} == {
+    "green.test.ts": 2, "red.test.ts": 1, "outoftest.test.ts": 1, "crash.test.ts": 1,
+}
+paths = [row["path"] for row in rows]
+assert paths == sorted(paths), f"results.tsv is not in stable path order: {paths}"
 summary = json.loads((root / "summary.json").read_text())
 assert summary["files"] == 12
 assert summary["passed"] == 5 and summary["failed"] == 2
@@ -115,10 +135,24 @@ assert got == "green", got
 got = c(passed=1, failed=1, ran=2, output=" 1 pass\n 1 fail\n")
 assert got == "test-failure", got
 
+# bun's runner exits 1 PRECISELY BECAUSE a failing-marked test passed, so a
+# non-zero exit must not veto the ahead-of-reference verdict. Testing exit_code
+# first made the bucket unreachable for the case it was added for: on the full
+# corpus, assert/deep-equal.test.ts had 22 of 22 failures be "expected to fail
+# but passed" and was still scored test-failure.
 got = c(exit_code=1, passed=2, failed=1, ran=3, output=stale)
+assert got == "ahead-of-reference", got
+
+# ...but the exit code is forgiven ONLY when nothing else went wrong: a real
+# failure alongside, or an out-of-test error count, still means test-failure.
+got = c(exit_code=1, passed=1, failed=2, ran=3, output=mixed)
+assert got == "test-failure", got
+got = c(exit_code=1, passed=2, failed=1, ran=3, output=stale + " 1 error\n")
 assert got == "test-failure", got
 
 print("ok   - a stale test.failing marker is ahead-of-reference, not a failure")
+print("ok   - a non-zero exit does not veto it (bun exits 1 because of it)")
+print("ok   - a real failure or an out-of-test error still wins")
 print("ok   - a real failure alongside a stale marker is still test-failure")
 print("ok   - green, plain failure and non-zero exit are unaffected")
 AHEADPY
