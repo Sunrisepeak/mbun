@@ -599,10 +599,16 @@ construction.**
 
 Its remedy was still exactly right, and is now the rule:
 
-1. **Snapshot the base binary at dispatch** (`cp` it to a stable path) and hand
-   agents *that path*. A rebuild in the integration tree then cannot disturb
-   anyone's baseline. The same trick is what lets a multi-hour corpus run survive
-   integration work continuing around it.
+1. **Snapshot the base binary at dispatch** and hand agents *that path*. A rebuild
+   in the integration tree then cannot disturb anyone's baseline, and the same
+   trick lets a multi-hour corpus run survive integration work continuing around
+   it. **Copy it to `<dir>/bin/mbun` — keep the basename.** Renaming the copy
+   (`mbun-<sha>`) silently breaks every test that re-spawns the runtime: they fail
+   with `spawn mbun ENOENT`, and a full-corpus run measured that way reported
+   **10 regressions that do not exist**, all in child_process/process/signal/
+   module. Each one passed 3/3 against the identical build output under its
+   normal name. Verified both ways: `target/integration/snapdir/bin/mbun` passes,
+   `target/integration/mbun-<sha>` fails.
 2. **An agent that suspects its baseline should rebuild its own control from its
    own base commit in its own worktree** — which is what caught this — and diff
    against that, not against a borrowed binary.

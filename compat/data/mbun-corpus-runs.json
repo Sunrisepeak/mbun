@@ -41,18 +41,18 @@
   {
    "corpus": "compat/node/test/parallel",
    "runner": "tools/integration/node_corpus_runner.py --jobs 6 --timeout 15",
-   "binary": "r9/integration @ daa293d (round 9 + round 10 waves 1-2 + timers clock fix)",
+   "binary": "r9/integration @ 1c3e1f3 (round 10 waves 1-3 complete)",
    "files": 4433,
    "categories": {
-    "fail": 1381,
+    "fail": 1356,
     "oom-kill": 3,
-    "pass": 2369,
+    "pass": 2403,
     "skipped": 555,
-    "timeout": 125
+    "timeout": 116
    },
    "rates": {
-    "strict_pass": 0.534,
-    "excluding_self_skips": 0.611
+    "strict_pass": 0.542,
+    "excluding_self_skips": 0.62
    },
    "baseline_for_comparison": {
     "binary": "round-8 HEAD (23217dd), measured with the SAME corrected runner",
@@ -69,7 +69,9 @@
     }
    },
    "notes": "A file that skipped itself (common.skip() -> '1..0 # Skipped:', exit 0) is classified `skipped`, never `pass`. common.mustCall is enforced from this binary onward (node registers its verifier in process.on('exit'), which previously never fired). Both corrections lower the number relative to previously published figures; the 44.5% published against round 8 was a product of both defects and was never real. Full estimate-vs-actual and methodology: compat/data/round-estimates.json and compat/README.md. A third verification defect was fixed after the previous entry: assert.throws ignored its error argument, so any throw satisfied any matcher. That removed 126 passes (25 of 25 sampled confirmed vacuous), which is why this figure is LOWER than the previously recorded 47.9%/54.7%.",
-   "jobs_note": "Measured at --jobs 6, not 8/10. Higher parallelism does not change the total (a jobs-6 full run moved exactly the 11 files the wave's agents claimed and no others) but it makes per-file attribution unreliable: individual pass->fail results at --jobs 10 have repeatedly failed to reproduce standalone. See compat/README.md 'A parallel guard invents regressions'."
+   "jobs_note": "Measured at --jobs 6, not 8/10. Higher parallelism does not change the total (a jobs-6 full run moved exactly the 11 files the wave's agents claimed and no others) but it makes per-file attribution unreliable: individual pass->fail results at --jobs 10 have repeatedly failed to reproduce standalone. See compat/README.md 'A parallel guard invents regressions'.",
+   "wave3_note": "+35 net against the previous authoritative run (36 gains, 1 regression -- test-fs-buffer, the known issue #16 JSC rope-string use-after-free, which passes standalone and crashes only under memory pressure). Gains: fs 21, http 9, https 2, http2 1, repl 1, timers 1, tls 1. Three agents each reported zero regressions on their own guards and the composition held.",
+   "measurement_caveat": "Measured on the build output directly. A binary COPIED to a different basename (mbun-<sha>) reports 10 phantom regressions across child_process/process/signal/module -- tests that re-spawn the runtime fail with 'spawn mbun ENOENT'. Snapshot to <dir>/bin/mbun instead; verified both ways."
   }
  ],
  "note": "generated_at applies to the node row only. The bun row is a stale round-7/8 snapshot; see its staleness_note. Do not read the two rows as contemporaneous."

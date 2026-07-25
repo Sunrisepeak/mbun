@@ -5,6 +5,23 @@
 
 ## 2026-07-25
 
+### 第十一轮整合：node 语料 2,369 → **2,403 / 4,433**（54.2% 严格 / 62.0% 排除自我跳过），组合回归 0
+
+三个 agent 全部超额（+11 / +10 / +9，目标分别是 8 / 6 / 6），整合后逐文件 diff：**36 转绿、1 回归**，唯一那个是 `test-fs-buffer`（已知 issue #16 的 JSC rope-string use-after-free，单独跑通过，仅在内存压力下崩）。增量分布：fs 21、http 9、https 2、http2 1、repl 1、timers 1、tls 1。
+
+**机制改动才是这轮的主要成果。** 第二波三个 agent 在 100 分钟里合计只推进 3.7%（+10/+270）；第三波换成「派活前集中分诊、原因预先点名写进 `compat/data/unreached-inventory.json`、agent 不再自己分诊」，三个 agent 分别做到目标的 138% / 167% / 150%。差别不在执行力，在于**此前每个 agent 都要花约 35 分钟重做分诊，交完报告即随 agent 消失**。
+
+- **`getLibuvNow` 与定时器不同源**：截止时间算在 `Date.now()`（截断到整毫秒），而 binding 读 `performance.now()`，于是 `setTimeout(f,1)` 最快 0.1ms 就到期、被观测值却没前进，`test-timers-ordering` 6 次里挂 5 次。node 两者同源（`internal/timers.js:387` 直接拿 `getLibuvNow()` 当截止时间起点）。对齐后 8/8。它是被 diff 门禁当成「本轮新回归」报出来的，复现后才发现是**长期存在的 1/6 抖动**。
+- **verify 错误码取的是中途回调而非最终结论**：`openssl s_client` 打 mbun 自己的服务端可见 OpenSSL 先报 20 再报 21、最终返回 21。node 的 `VerifyCallback` 无条件返回 1 让验证走到底，mbun 传 `nullptr` 于是在第一个错误处中止。**只改上报的码，不动验证决策** —— `SSL_VERIFY_PEER` + NULL 回调时 OpenSSL 的中止就是 `rejectUnauthorized` 的实际闸门，改成「回调继续」会把闸门挪进 JS 层，其失败模式是静默的验证绕过，已记为需单独评审的安全改动。跨 tls/http2 共 9 文件同因，转绿 3。
+- **node 的 `debuglog` 从未初始化**：node 故意不初始化 `testEnabled`，靠 `pre_execution.js:488` 调 `initializeDebugEnv`，而 mbun 不跑那个阶段、也从没调过 —— node lib 里 42 个文件调 `debuglog(`。补在该模块自身加载处（唯一能保证「先于首次使用」又不增加启动开销的时机）。
+- **安全（独立复验）**：`__mbunWatchNative.start` 的 inotify 入口此前只在 **JS shell 层**有检查 —— `fs.watch('/etc')` 被拒，但裸 `globalThis.__mbunWatchNative.start('/etc')` 直接放行。凡走 `fs.watch` 的测试都会显示「网关正常」。已补在 native 边界；新增的 `__mbunFsNative.lutimes` 同样在边界受控（裸调用被拒、授权路径可用）。
+
+**四个我自己的判断被测量推翻**，均已记入 `compat/data/round-estimates.json`：`filehandle-lock-ref-protocol` 被两重误判（一半是 `--experimental-stream-iter` 的 `stream/iter` 工作，另一半卡在**模块标识** —— 测试 patch 的是 node 真实的 `internal/fs/promises`，而 mbun 的 `fs/promises` 是另一个类，翻译 570 行不会移动任何东西）；`http-timeout-shape-D`「原生崩溃 2 文件」**根本不存在**（49 个 http 超时全部 exit 124、无一条日志含崩溃文本，而崩溃进程死于信号、走不到超时 kill）；shape A 按 dump 签名是 10 文件、按原因只有 5；`fs-one-off` 严重漏计 —— agent-1 十一个增量里有五个在 inventory 里**根本没有条目**。
+
+- **工具**：`bun_corpus_runner.py` 补增量落盘 + `--resume`（此前只在最后写一次，长跑被 kill 即全丢）；`node_corpus_runner.py` 的 `--max-seconds` **对全新全量运行完全无效**（deadline 在 `submit()` 前检查，而 4433 个 future 在几毫秒内全部入队），改为有界投喂；新增 `build_or_die.sh`（`mcpp build | tail` 会吞掉退出码，一次失败构建曾让陈旧二进制被当作新鲜快照、并据此启动了一次全量测量）。
+- **bun 语料首次重测**（1902 文件，此前公布的是 round-7/8 快照）：green **868**、test-failure 885、ahead-of-reference 3、timeout 44。对比最近一次带逐文件数据的全量（`r5-bun`，green 884）：**43 个丢失、27 个新增、净 −16**。抽查 10 个，1 个是 mbun 比 bun 更正确、9 个是真失败 —— **node 侧推进确实吃掉了 bun 文件，这笔账明确记下不作吸收**。顺带修掉 `ahead-of-reference` 桶的不可达缺陷（它先判 `exit_code != 0`，而 bun 恰恰因为 `test.failing` 意外通过才 exit 1；`deep-equal.test.ts` 22 个失败全是这种，却一直被记成 test-failure）。
+
+
 ### 第十一轮 w3/agent-3：fs.watch + realpath（test-fs- 子系统 276/342 → 287/342，实得 +10）
 
 `--filter test-fs- --jobs 5 --timeout 15` 实测：`pass 276 → 287`、`fail 53 → 45`、`timeout 5 → 2`，**green→non-green 回归 0**。`test-fs-buffer` 的转绿是已知 issue #16（JSC `JSRopeString::view` 偶发 SIGSEGV）的抖动，不计入，因此诚实增量是 **+10**：
