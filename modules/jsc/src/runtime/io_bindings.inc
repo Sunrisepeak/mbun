@@ -802,7 +802,12 @@ JSValueRef fsn_rm_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t arg
     } else {
         std::filesystem::remove(std::filesystem::path{path}, ec);
     }
-    if (ec && !force) {
+    // node's { force: true } suppresses ONLY "the path does not exist" — every
+    // other failure still throws (lib/internal/fs/rimraf.js rethrows anything
+    // that is not ENOENT). Swallowing them all made rmSync(<file in a read-only
+    // directory>, { force: true }) a silent no-op where node reports EACCES
+    // (test-fs-rm, nodejs/node#38683).
+    if (ec && !(force && ec.value() == ENOENT)) {
         // node-shaped errno so `err.code` is usable (a bare message left
         // fs.rm/rmdir callers with `code: undefined`).
         switch (ec.value()) {
@@ -1067,6 +1072,12 @@ JSValueRef fsn_stat_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t a
         // on `{ code: 'ELOOP' }` exactly.
         if (errno == ELOOP)
             return fs_throw(ctx, exc, "ELOOP: too many symbolic links encountered, stat '" + path + "'");
+        // Everything else keeps its own errno too. Flattening the tail onto
+        // ENOENT told fs.rm that a file it could not lstat for lack of directory
+        // search permission (EACCES) simply did not exist, so { force: true }
+        // silently skipped it (test-fs-rm).
+        if (const std::string code{fd_errno_code(errno)}; !code.empty() && errno != ENOENT)
+            return fs_throw(ctx, exc, code + ": " + fd_errno_message(errno) + ", stat '" + path + "'");
         return fs_throw(ctx, exc, "ENOENT: no such file or directory, stat '" + path + "'");
     }
     fs_fields_from_stat(st, f);

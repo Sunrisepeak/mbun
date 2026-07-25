@@ -5441,6 +5441,10 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   // overloads; this port follows node's own argument-count algorithm instead
   // of guessing, so the options-object and string forms keep working.
   fsMod.readSync = function readSync(fd, buffer, offsetOrOptions, length, position) {
+    // node's readSync starts with getValidatedFd(fd) — this one went straight to
+    // the native row, so a non-numeric fd surfaced as EBADF instead of
+    // ERR_INVALID_ARG_TYPE (test-fs-read-type).
+    fsValidateFd(fd);
     fsValidateBuffer(buffer);
     let offset = offsetOrOptions;
     if (arguments.length <= 3 || (offsetOrOptions !== null && typeof offsetOrOptions === "object")) {
@@ -5602,8 +5606,18 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     if (o && o.maxRetries !== undefined) fsValidateInteger(o.maxRetries, "options.maxRetries", 0);
     if (o && o.retryDelay !== undefined) fsValidateInteger(o.retryDelay, "options.retryDelay", 0);
     const path2 = toStr(p);
-    const st = fsLstatOrNull(path2);
-    if (st === null) { if (force) return; throw fsErr("ENOENT", "lstat", path2); }
+    // node's validateRmOptionsSync lstats the path and only swallows ENOENT
+    // under { force: true } — any OTHER lstat failure is rethrown. fsLstatOrNull
+    // collapses every failure to null, so a file inside a read-only directory
+    // (lstat EACCES) was silently treated as already gone (test-fs-rm).
+    let st = null;
+    try {
+      st = fsMod.lstatSync(path2);
+    } catch (e) {
+      if (!(force && e && e.code === "ENOENT")) throw e;
+      return;
+    }
+    if (st === undefined || st === null) { if (force) return; throw fsErr("ENOENT", "lstat", path2); }
     if (st.isDirectory() && !recursive) throw fsEisdirErr(path2);
     F.rm(path2, recursive, force);
   };
