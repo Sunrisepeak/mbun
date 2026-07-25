@@ -362,6 +362,36 @@
             "snapshot": "24 files, 0% conversion. Wall: V8 startup snapshots \u2014 18 of 24 logs name it directly. Every file spawns --build-snapshot then consumes the blob; JSC has no serialize-heap-to-blob API. Faking one would still fail the reproducible-bytes and --build-snapshot-config assertions.",
             "trace": "31 files, 0% conversion. Wall: no trace-event emission. 22 of 31 die on an existsSync(node_trace.1.log) check. A writer alone clears only that check; each file then greps for its own subsystem's event names. Symptom cluster with ~N independent causes; a Chrome-trace writer plus metadata events would plausibly convert 3-6 of 31."
           }
+        },
+        {
+          "id": "r10/agent-10",
+          "cluster": "10 known regressions + http2 third pass",
+          "worklist_files": 126,
+          "cluster_homogeneity": "mixed (repair + tail)",
+          "target_delta_pass": 28,
+          "actual_delta_pass": 31,
+          "hit_rate": 1.11,
+          "wall_clock_min": 88,
+          "split": {
+            "regressions": "10 of 10 closed",
+            "http2": "154/272 -> 175/272 (+21) against a +18 target",
+            "bonus": "test-dgram-exclusive-implicit-bind also converted"
+          },
+          "corrected_the_brief": {
+            "my_hypothesis": "I told it the dns regression was a leaked `pending` count that held the loop open.",
+            "actual_cause": "The pending count was CORRECT. DnsAsyncState had ONE worker thread and a resolver query blocks it for the whole query budget (8s at node's defaults). node's dgram resolves the destination through dns.lookup before every send(), so a test whose fake nameserver is a dgram socket IN THE SAME PROCESS deadlocks: the lookup for its reply is queued behind the very resolve it would unblock.",
+            "lesson": "A coordinator hypothesis stated in a brief is a hint, not a finding. This one was wrong in mechanism while right about the symptom, and the agent measured its way to the real cause instead of implementing mine."
+          },
+          "perf_finding": {
+            "measure": "dns.lookup on a literal IP",
+            "before_ms": 8011,
+            "after_ms": 3,
+            "note": "A grow-on-demand worker pool replaced the single thread. This is a 2670x improvement on one of the most common calls in any networked program, and it was invisible as a perf problem because it only showed up as corpus TIMEOUTS."
+          },
+          "assert_throws_discipline": "Checked all 22 files it converted: none uses assert.throws / assert.rejects / expectsError, so none of its gains is vacuous through that hole. It then deliberately did NOT work the 8-file `Missing expected exception` bucket, because that bucket's oracle was broken on its base \u2014 flagged for re-triage on the merged branch instead of banking unreliable wins.",
+          "guard_derived_from_diff": "Followed the new rule: diff touched runtime/dns.inc, js_dgram.cppm, js_http2.cppm, builtins/node_cluster.cppm and builtins/process_web.cppm, so it widened the guard by 283 test-child-process/process/worker files AND measured a true baseline for them by reverting the five files and rebuilding, rather than assuming. Total guard 1809 files, 1160 -> 1181, REGRESSIONS 0.",
+          "measured_negative_recorded": "Force-finishing a client session's OPEN streams on teardown (rather than only pending ones) cost 5 files; reverted, and the commit message names which 5 so nobody retries it.",
+          "stop_condition": "Both conditions met: cycle 6 delivered +0, cycle 5 delivered +1, and it verified by opening each assertion site that the remaining 9-file AssertionError bucket is 9 unrelated causes."
         }
       ],
       "verdicts": {
@@ -375,7 +405,8 @@
         "green_ratio_heuristic_validated": "Confirmed twice in one round. http: 26% green -> stand-in -> +170 (2.8x target). cluster: 13.3% green -> stub -> +65 on that subsystem (+73 task, 1.62x target). In both cases signature clustering gave no usable signal (a bare AssertionError tail, and a bare `global code@...` bucket respectively). The green ratio of a mature subsystem is now the primary targeting input; signatures are for picking work WITHIN a subsystem.",
         "second_pass_is_worth_it": "A cluster declared 'no cause above 5 files' by a previous pass is NOT necessarily exhausted. The http2 tail yielded +51 on a second pass, +15 of it from a single missing layer (Http2Stream as a stream.Duplex). The earlier verdict was true of the SIGNATURES and false of the CAUSES \u2014 the same blind spot as the green-ratio finding. Treat 'no dominant signature' as 'no more cheap wins by signature', not as 'subsystem done', and re-check the green ratio.",
         "guard_must_cover_what_you_edited": "A guard set scoped to the TARGET subsystems is not enough \u2014 it must cover every subsystem the change touched. The dns regression escaped because the task guarded http/https/tls/net/dgram (its targets) while also editing dns. Rule: derive the guard from the DIFF, not from the brief. `git diff --name-only` -> which builtins/modules changed -> guard every corpus subsystem that loads them.",
-        "three_verification_defects": "Round 10 found THREE independent defects in how the corpus was verified, each of which had been inflating the number for an unknown time: self-skips counted as passes (277 files), common.mustCall unenforced because process.on('exit') never fired (946 of 1533 passing files used it), and assert.throws ignoring its error argument so any throw satisfied any matcher (48 verified vacuous passes on the guard sets alone). Lesson: before optimising a metric, audit the metric. All three were found by agents doing unrelated work who stopped to ask why a test passed."
+        "three_verification_defects": "Round 10 found THREE independent defects in how the corpus was verified, each of which had been inflating the number for an unknown time: self-skips counted as passes (277 files), common.mustCall unenforced because process.on('exit') never fired (946 of 1533 passing files used it), and assert.throws ignoring its error argument so any throw satisfied any matcher (48 verified vacuous passes on the guard sets alone). Lesson: before optimising a metric, audit the metric. All three were found by agents doing unrelated work who stopped to ask why a test passed.",
+        "coordinator_hypotheses_are_hints": "A cause stated in a brief must be labelled as a hypothesis, and agents must be told to measure rather than implement it. Two cases this round: the 580-file timeout target assumed handle ref-counting (real cause: the event pump swallowing exceptions), and the dns regression brief assumed a leaked pending count (real cause: a single-threaded resolver deadlocking against dgram's own pre-send lookup, 8011ms -> 3ms once the pool could grow). Both agents measured their way to the real cause. A brief that states a cause as fact would have produced the wrong fix twice."
       },
       "open_regressions": {
         "total": 10,
