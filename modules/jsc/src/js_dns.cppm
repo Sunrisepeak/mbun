@@ -249,6 +249,17 @@ export constexpr std::string_view kDnsJS = R"JS(
   caresWrap.ChannelWrap.prototype.setServers = function (list) { this._servers = list ? list.slice() : []; return 0; };
   caresWrap.ChannelWrap.prototype.setLocalAddress = function () {};
   caresWrap.ChannelWrap.prototype.cancel = function () {};
+  // node src/cares_wrap.cc CanonicalizeIP: the inet_pton/inet_ntop round trip
+  // that turns "fe80:0:0:0:0:0:0:1" into "fe80::1". node:tls' checkServerIdentity
+  // compares IP SANs through it, and test-tls-canonical-ip reads it straight off
+  // this binding. Backed natively by __mbunNodeTlsNative.canonicalizeIP
+  // (runtime/node_tls.inc) — the same function node:tls already uses, so the two
+  // callers can never disagree.
+  caresWrap.canonicalizeIP = function canonicalizeIP(ip) {
+    const N = G.__mbunNodeTlsNative;
+    if (N && typeof N.canonicalizeIP === "function") return N.canonicalizeIP(ip);
+    return undefined;
+  };
   if (typeof G.__mbunInternalBindingDefine === "function") {
     G.__mbunInternalBindingDefine("cares_wrap", () => caresWrap);
   }

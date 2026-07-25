@@ -566,8 +566,17 @@ JSValueRef netn_tls_wrap_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
     }
     // args 8/9: minVersion / maxVersion names ("TLSv1.2"), mapped to OpenSSL
     // version constants. Empty/unknown leaves the backend default in place.
-    if (argc > 8) { cfg.minVersion = mbun::tls::tls_version_from_name(fs_arg(ctx, argc, args, 8)); }
-    if (argc > 9) { cfg.maxVersion = mbun::tls::tls_version_from_name(fs_arg(ctx, argc, args, 9)); }
+    // The name "none" is the JS layer's explicit "unpinned" marker: node passes
+    // min=max=0 to SecureContext::Init when the caller supplied `secureProtocol`,
+    // so the SSL_METHOD's own range applies rather than node's TLS 1.2 floor.
+    // ref js_tls_live.cppm resolveVersions.
+    const auto version_arg{[&](std::size_t i) {
+        const std::string name{fs_arg(ctx, argc, args, i)};
+        if (name == "none") return -1;
+        return mbun::tls::tls_version_from_name(name);
+    }};
+    if (argc > 8) { cfg.minVersion = version_arg(8); }
+    if (argc > 9) { cfg.maxVersion = version_arg(9); }
     // arg 10: node's options.ciphers, an OpenSSL cipher list string. Empty leaves
     // the context default; a list OpenSSL matches nothing to fails the wrap
     // rather than quietly widening the negotiated set.
@@ -740,8 +749,54 @@ JSValueRef netn_tls_info_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
     if (est) {
         const std::string peer{st.channel.peer_certificate_pem()};
         if (!peer.empty()) set_prop(ctx, r, "peerCert", make_string(ctx, peer));
+        // The verified chain, leaf first — node's getPeerCertificate(true) walks
+        // it through `issuerCertificate`.
+        std::vector<std::string> chain{st.channel.peer_certificate_chain_pem()};
+        if (!chain.empty()) {
+            std::vector<JSValueRef> items;
+            items.reserve(chain.size());
+            for (const std::string& pem : chain) items.push_back(make_string(ctx, pem));
+            set_prop(ctx, r, "peerChain",
+                     JSObjectMakeArray(ctx, items.size(), items.data(), nullptr));
+        }
+        // getFinished()/getPeerFinished(): the handshake's Finished messages.
+        const std::vector<std::uint8_t> fin{st.channel.finished()};
+        if (!fin.empty()) set_prop(ctx, r, "finished", make_string(ctx, b64_encode(fin.data(), fin.size())));
+        const std::vector<std::uint8_t> pfin{st.channel.peer_finished()};
+        if (!pfin.empty()) set_prop(ctx, r, "peerFinished", make_string(ctx, b64_encode(pfin.data(), pfin.size())));
     }
     return r;
+#endif
+}
+
+// net.tlsExportKeyingMaterial(fd, length, label, contextB64|null) → base64 of
+// the RFC 5705 exporter output, or null when the export is not possible (no
+// channel / handshake incomplete). node's TLSSocket.exportKeyingMaterial().
+// A null context argument means "no context" (RFC 5705 use_context = 0), which
+// differs from an empty context — the two produce different key material.
+JSValueRef netn_tls_export_keying_material_cb(JSContextRef ctx, JSObjectRef, JSObjectRef,
+                                              std::size_t argc, const JSValueRef args[],
+                                              JSValueRef*) {
+#if defined(_WIN32)
+    return JSValueMakeNull(ctx);
+#else
+    const int fd{argc > 0 ? static_cast<int>(JSValueToNumber(ctx, args[0], nullptr)) : -1};
+    const auto found{net_tls().find(fd)};
+    if (found == net_tls().end()) return JSValueMakeNull(ctx);
+    const auto length{static_cast<std::size_t>(
+        argc > 1 ? JSValueToNumber(ctx, args[1], nullptr) : 0)};
+    const std::string label{fs_arg(ctx, argc, args, 2)};
+    const bool useContext{argc > 3 && !JSValueIsNull(ctx, args[3])
+                          && !JSValueIsUndefined(ctx, args[3])};
+    std::string raw{};
+    if (useContext) raw = b64_decode(fs_arg(ctx, argc, args, 3));
+    const std::vector<std::uint8_t> out{found->second->channel.export_keying_material(
+        length, label,
+        std::span<const std::uint8_t>{reinterpret_cast<const std::uint8_t*>(raw.data()),
+                                      raw.size()},
+        useContext)};
+    if (out.empty()) return JSValueMakeNull(ctx);
+    return make_string(ctx, b64_encode(out.data(), out.size()));
 #endif
 }
 

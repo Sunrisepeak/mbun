@@ -82,7 +82,40 @@ public:
     [[nodiscard]] bool verify_ok() const noexcept;
     // Negotiated ALPN protocol (SSL_get0_alpn_selected), empty if none.
     [[nodiscard]] std::string alpn_protocol() const;
+    // The peer's certificate chain as PEM, leaf first (SSL_get_peer_cert_chain,
+    // with the leaf prepended on the client side where OpenSSL omits it). Feeds
+    // node's getPeerCertificate(detailed) `issuerCertificate` chain walk.
+    [[nodiscard]] std::vector<std::string> peer_certificate_chain_pem() const;
+    // The Finished messages of the completed handshake (SSL_get_finished /
+    // SSL_get_peer_finished) — node's TLSSocket.getFinished()/getPeerFinished().
+    // Empty before the handshake completes.
+    [[nodiscard]] std::vector<std::uint8_t> finished() const;
+    [[nodiscard]] std::vector<std::uint8_t> peer_finished() const;
+    // RFC 5705 exporter (SSL_export_keying_material) — node's
+    // TLSSocket.exportKeyingMaterial(). `useContext` distinguishes "no context"
+    // from "empty context", which produce different output per the RFC. Empty
+    // result = the export failed (e.g. handshake not complete).
+    [[nodiscard]] std::vector<std::uint8_t> export_keying_material(
+        std::size_t length, std::string_view label,
+        std::span<const std::uint8_t> context, bool useContext) const;
 };
+
+// Does this private key belong to this certificate? node's
+// SecureContext::SetKey runs SSL_CTX_use_PrivateKey, which fails on a key that
+// does not match the already-loaded certificate, and SecureContext::SetCert
+// likewise rejects a PEM it cannot read. Returns an OpenSSL reason string on
+// failure and an empty string on success, so node:tls can throw at
+// createSecureContext() time rather than at first connection.
+// `passphrase` decrypts an encrypted private key; an empty one means "none".
+export std::string check_key_cert_pair(std::string_view certPem, std::string_view keyPem,
+                                       std::string_view passphrase);
+
+// Every certificate in the platform trust store, as PEM. node ships the Mozilla
+// NSS root set in src/node_root_certs.h and exposes it as tls.rootCertificates;
+// mbun has no vendored bundle, so it reports the store it actually verifies
+// against (the same file/dir configure_default_trust_ picks). Never synthesises
+// or accepts anything beyond what that store already contains.
+export std::vector<std::string> platform_root_certificates();
 
 // Ephemeral self-signed cert+key (PEM), used to stand up a local TLS server for
 // tests and Bun.serve's implicit self-signed path. Mirrors what bun does with
