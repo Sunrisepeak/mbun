@@ -595,6 +595,32 @@
       "http-timeout-shape-D DID NOT EXIST. I recorded 2 files as dying in native WTFCrashWithInfo, inherited from a wave-2 agent report. Measured independently: all 49 remaining test-http* timeouts exit 124 and not one log contains WTFCrash/SIGSEGV/SIGABRT/Segmentation text. A crashing process exits on a signal and never reaches the timeout kill, so crash and 124 are mutually exclusive. One of the two 'no dump' cases was hang_dump.js's own limitation: it REQUIREs its target, so a process.argv[2]-dispatched re-exec test throws instead of running. Entry deleted; the limitation is now documented in the tool.",
       "Shape A is 10 files by DUMP SIGNATURE but 5 by cause. The other 5 share the signature and nothing else (2 need --expose-gc/FinalizationRegistry, 2 are destroySoon, 1 is cluster). A dump signature groups files by what the loop looks like when they stop, which is downstream of the cause -- the log-text trap in a better disguise."
      ]
+    },
+    {
+     "id": "w3/agent-1",
+     "cluster": "FileHandle protocol + fs one-offs (wave 3, inventory-driven)",
+     "worklist_files": 21,
+     "target_delta_pass": 8,
+     "actual_delta_pass": 11,
+     "hit_rate": 1.38,
+     "wall_clock_min": 93,
+     "note": "Third inventory-driven task, third overshoot. Full-corpus before/after (4433 files, not a sample): 2359 -> 2370 pass, 0 pass->fail, 0 pass->timeout. It chose the whole corpus as its guard because the fs filter costs ~95s per 874 files, so a full before/after was cheaper than justifying a subset -- and that left zero phantom leads to chase.",
+     "it_declined_my_mis_sized_lead_and_was_right": "I briefed filehandle-lock-ref-protocol as '6 files, ~570 lines of node's fs.promises.ts, translate it'. Two independent reasons that is wrong, both cheap to check and neither checked by me. (a) 3 of the 6 carry '// Flags: --experimental-stream-iter' and drive require('stream/iter'); in node 26 fh.pull/pullSync/writer exist ONLY inside that flag's branch. It is a stream/iter-over-an-fd task, not fs. (b) The other 3 do const {FileHandle} = require('internal/fs/promises'), patch FileHandle.prototype.fd, then call fs/promises.*. That only works if fs/promises IS internal/fs/promises. In mbun they are two different classes -- fs/promises is mbun's own object in bootstrap.cppm while require('internal/fs/promises') resolves via compat/node/tsconfig.json paths to node's real lib. Translating 570 lines into mbun's class changes nothing because the test never touches it. Real size: fold into fs-not-routed-through-internalBinding, an architectural round.",
+     "leads_i_got_wrong": [
+      "fs-one-off UNDERCOUNTS badly. The fs set had 57 fail + 5 timeout on that base; my inventory listed 15. FIVE of its ELEVEN gains had no inventory row at all (test-fs-write-file-flush, -append-file-flush, -stat-abort-test, -write-file-sync, -lchown). A third of the delta came from files the inventory did not know were red -- so the inventory's coverage, not just its accuracy, is a gating factor.",
+      "test-fs-readfile was NOT 'only the AbortSignal validation'. It also needed a nextTick-ordering fix, and that points at a GENERAL untouched defect: mbun drains process.nextTick and promise microtasks as ONE FIFO, so a queueMicrotask-deferred fs callback runs BEFORE a nextTick-scheduled abort(). Fixed narrowly with setImmediate; the general defect -- nextTick has no priority over microtasks -- is still owed and will keep producing this shape.",
+      "test-fs-truncate's EACCES errno mapping was the SYMPTOM. The cause is that mbun never applied node's len = MathMax(0, len); both failures were truncate(f, -1). The clamp is what moved the file.",
+      "test-fs-readdir-stack-overflow is not an fs bug at all. JSC's engine-level message is 'Maximum call stack size exceeded.' for ALL recursion -- a bare function r(){return r()} reproduces it. Fixing it means overriding the engine's RangeError text. Reclassify out of fs-one-off."
+     ],
+     "new_defects_it_found_while_probing": [
+      "fs.unlinkSync(<nonexistent>) does not throw -- std::filesystem::remove returns false rather than setting ec",
+      "fs.chmodSync(<nonexistent>) throws with NO .code/.errno/.syscall/.path",
+      "fs.renameSync(<nonexistent>, x) likewise carries none of them",
+      "fs.linkSync is implemented as COPYFILE: .syscall === 'copyfile', .path is the mangled \"src' -> 'dest\" string, .dest undefined",
+      "fs.readlinkSync(<nonexistent>) gives EINVAL where node gives ENOENT"
+     ],
+     "tooling_defect_it_exposed_in_my_runner": "--max-seconds could not bound a fresh full run: the deadline was checked before each executor.submit(), but submit returns immediately, so all 4433 futures were queued within milliseconds against a clock that had barely moved. Fixed with a bounded feeder (~2x jobs in flight, deadline re-checked as real work completes). Verified: 600 files with --max-seconds 20 now stops at 82 and reports remaining=518 instead of running all 600.",
+     "brief_error": "my brief said cd .claude/worktrees/wt1; worktree_setup.sh wt1 actually creates <repo>/wt1"
     }
    ],
    "verdicts": {
