@@ -1343,6 +1343,39 @@ std::string fd_errno_code(int e) {
     }
 }
 
+// libuv `uv_strerror` text for the errnos fd_errno_code knows. node's fs errors
+// are formatted from libuv, NOT from the C library: glibc's strerror(ENOENT) is
+// "No such file or directory" but uv_strerror(UV_ENOENT) is "no such file or
+// directory", and the corpus compares those messages verbatim. Kept in sync with
+// the UV_LINUX table in builtins/node_util_extra.cppm (util.getSystemErrorMap).
+std::string fd_errno_message(int e) {
+    switch (e) {
+        case ENOENT: return "no such file or directory";
+        case EACCES: return "permission denied";
+        case EEXIST: return "file already exists";
+        case ENOTDIR: return "not a directory";
+        case EISDIR: return "illegal operation on a directory";
+        case ENXIO: return "no such device or address";
+        case EPERM: return "operation not permitted";
+        case EMFILE: return "too many open files";
+        case ENFILE: return "file table overflow";
+        case ELOOP: return "too many symbolic links encountered";
+        case ENAMETOOLONG: return "name too long";
+        case EINVAL: return "invalid argument";
+        case EBADF: return "bad file descriptor";
+        case ENOSPC: return "no space left on device";
+        case EROFS: return "read-only file system";
+        case EBUSY: return "resource busy or locked";
+        case ENOTEMPTY: return "directory not empty";
+        case EAGAIN: return "resource temporarily unavailable";
+#if !defined(_WIN32)
+        case EOVERFLOW: return "value too large for defined data type";
+        case EFBIG: return "file too large";
+#endif
+        default: return std::strerror(e);
+    }
+}
+
 // Throw a Node-style fs error carrying .code/.errno/.syscall/.path, so JS
 // `catch (e) { e.code === "ENXIO" }` works (Node semantics; a bare string
 // would leave .code undefined).
@@ -1351,7 +1384,7 @@ JSC::EncodedJSValue fd_throw_errno(JSC::JSGlobalObject* global, int e,
     JSContextRef ctx{toRef(global)};
     const std::string code{fd_errno_code(e)};
     std::string msg{(code.empty() ? "E" + std::to_string(e) : code) + ": "
-                    + std::strerror(e) + ", " + syscall + " '" + path + "'"};
+                    + fd_errno_message(e) + ", " + syscall + " '" + path + "'"};
     JSValueRef m{make_string(ctx, msg)};
     JSObjectRef err{JSObjectMakeError(ctx, 1, &m, nullptr)};
     if (!code.empty()) set_prop(ctx, err, "code", make_string(ctx, code));
