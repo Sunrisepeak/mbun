@@ -17,6 +17,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Repo hygiene, before anything expensive. Both checks guard damage that
+      # is INVISIBLE to a build:
+      #  - a conflict marker inside a C++ raw string literal (where the JS
+      #    payloads live) compiles clean and ships broken JS;
+      #  - a compat/ submodule staged as a symlink still resolves on the machine
+      #    that created it, so the corpora look fine there and are simply absent
+      #    everywhere else. That one reached a merge commit undetected.
+      # Seconds to run, and neither can be caught later by a green build.
+      - name: Repo hygiene
+        run: |
+          bash tools/integration/check_conflict_markers.sh
+          bash tools/integration/check_submodule_gitlinks.sh
+
       - name: Cache mcpp home (toolchains + BMI)
         uses: actions/cache@v4
         with:
