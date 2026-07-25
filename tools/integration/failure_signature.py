@@ -123,6 +123,46 @@ def bun_signature(output: str) -> Signature:
     return Signature("no recognised failure form", "", "UNSPLIT")
 
 
+# --- rescuing a bare assertion ----------------------------------------------
+# A bare "AssertionError" names no contract, and 378 node files (27%) sat in that
+# state — un-dispatchable, because an agent handed one has to re-derive from
+# scratch exactly what this project spent rounds learning not to pay for.
+#
+# The diagnostic content is not in the log; it is in the TEST, and the log points
+# at it two different ways:
+#   * a node:test file reports `not ok N - <subtest name>`, and the subtest name
+#     IS the contract ("Handle error causes", "Assert constructor requires new");
+#   * a plain assert script leaves a stack frame into the test source, so the
+#     failing line itself names what was being asserted.
+# Reading the corpus source here is read-only and cheap; compat/ is never written.
+TAP_FAIL_RE = re.compile(r"(?m)^not ok \d+ - (.{0,80})")
+TEST_FRAME_RE = re.compile(r"(/[^\s:]*test/(?:parallel|sequential)/[\w.-]+\.(?:js|mjs)):(\d+):\d+")
+
+
+def rescue_bare_assertion(output: str) -> Signature | None:
+    """Name a bare assertion from the test itself, or return None."""
+    failed = TAP_FAIL_RE.findall(output)
+    if failed:
+        first = normalise(failed[0])
+        extra = f" (+{len(failed) - 1} more subtests)" if len(failed) > 1 else ""
+        return Signature(f"subtest failed: {first}", f"node:test file{extra}", "CLASS")
+    for path, line_no in TEST_FRAME_RE.findall(output):
+        source = Path(path)
+        if not source.exists():
+            continue
+        lines = source.read_text(encoding="utf-8", errors="replace").splitlines()
+        index = int(line_no) - 1
+        if not (0 <= index < len(lines)):
+            continue
+        # An assertion often spans lines; the opening line carries the subject.
+        snippet = normalise(lines[index])
+        if len(snippet) < 8 and index + 1 < len(lines):
+            snippet = normalise(lines[index] + " " + lines[index + 1])
+        if snippet:
+            return Signature(f"assertion at {source.name}:{line_no}: {snippet}",
+                             "named from the test source, not the log", "CLASS")
+    return None
+
 def node_signature(output: str) -> Signature:
     if (m := NODE_MUSTCALL_RE.search(output)) is not None:
         return Signature("mustCall: an expected event never fired",
@@ -146,13 +186,15 @@ def node_signature(output: str) -> Signature:
                   "Missing expected exception.",
                   "Expected values to be strictly deep-equal:"):
         if empty in output:
-            return Signature(f"bare assertion: {empty.rstrip(':.')}",
-                             "names no contract -- split per file", "MANIFESTATION")
+            return rescue_bare_assertion(output) or Signature(
+                f"bare assertion: {empty.rstrip(':.')}",
+                "names no contract -- split per file", "MANIFESTATION")
     if (m := NODE_CODE_RE.search(output)) is not None:
         code = m.group(1)
         if code == "ERR_ASSERTION":
-            return Signature("bare assertion: ERR_ASSERTION",
-                             "names no contract -- split per file", "MANIFESTATION")
+            return rescue_bare_assertion(output) or Signature(
+                "bare assertion: ERR_ASSERTION",
+                "names no contract -- split per file", "MANIFESTATION")
         return Signature(f"coded error: {code}", "", "CLASS")
     if (m := NODE_ASSERT_VALUES_RE.search(output)) is not None:
         body = normalise(m.group(1))
