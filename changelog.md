@@ -5,6 +5,18 @@
 
 ## 2026-07-25
 
+### 第十一轮 w3/agent-3：fs.watch + realpath（test-fs- 子系统 276/342 → 287/342，实得 +10）
+
+`--filter test-fs- --jobs 5 --timeout 15` 实测：`pass 276 → 287`、`fail 53 → 45`、`timeout 5 → 2`，**green→non-green 回归 0**。`test-fs-buffer` 的转绿是已知 issue #16（JSC `JSRopeString::view` 偶发 SIGSEGV）的抖动，不计入，因此诚实增量是 **+10**：
+`watch-encoding` / `watch-recursive-validate` / `watch-recursive-promise`（三个 timeout）、`watch-enoent`、`watch-stop-async`、`watchfile`、`promises-watch`、`watch-recursive-symlink`、`realpath`、`realpath-pipe`。
+
+- **两个 timeout 的真因不是事件循环**。上一轮把三个挂起归为「watcher 注册成 pollable 却不持 fd，drain 的 stall 时钟不前进」。实测：`watch-recursive-validate` 是 `fs.watch(d, {recursive:'1'})` **没做校验**，于是凭空建出一个 persistent watcher 永不关闭；`watch-encoding` 是 `decodeName` 只认 `"buffer"`，`encoding:'hex'` 原样返回 utf8 串，测试的 hex watcher 永远认不出自己的文件名，`done` 不触发。**两者都是「本该抛错/本该匹配」的语义缺陷，被 loop 语义放大成挂起。** 记账口径：分类是 timeout，根因层不是 loop。
+- **`fs.realpath` 直译 node 的 JS 解析器**，替掉 `weakly_canonical`（后者对 `/this/path/does/not/exist` 返回原样且不抛）。逐分量 lstat + readlink + 重启走查；ELOOP 由「跟随 stat 失败」检出（同时补了 `fsn_stat_cb` 把 ELOOP 压成 ENOENT 的映射），`seenLinks` 按 dev:ino 保证 `folder/cycles` 重复十次仍合法；走查在 FIFO/socket 处停止，这就是 `/dev/stdin` 能解析成 `/proc/<pid>/fd/pipe:[N]` 的原因。`.native` 另立严格入口（realpath(3)）。
+- **安全**：`__mbunWatchNative.start` 此前**完全没有 permission gate** —— `--permission` 沙箱里可以 watch 任意目录并读出未授权文件名。已按 node 的 `kFileSystemRead` 分类补上，且补在 native 边界（JS shim 层的检查可被绕过）。实测被拒 / 已授权路径仍可用；45 个 `test-permission-*` 通过数不变。
+- **两条线索被证伪，回填 inventory**：① `test-fs-watchfile-bigint` **不是**「BigIntStats 多带 4 个 Date 属性」—— expected 来自 node 真实的 `internal/fs/utils`（mbun 会加载 `compat/node/lib/`），而 mbun 的 `fs.BigIntStats` 是另一个类，`deepStrictEqual` 先卡在**原型不同**上。要通过必须让 mbun 的 stats 用 node 那两个类构造，是架构级改动，不是 4 个属性。② `test-fs-realpath-native` **不是 realpath 问题** —— 它解析 `'./test/parallel/...'`，需要 cwd == node 检出根，而 `node_corpus_runner.py` 用 `cwd=root`（仓库根）。属 harness 口径，全局改动会影响所有 agent 的测量，未动。
+
+守卫集：335 文件（`test-module-`/`test-require-`/`test-permission-`/`test-path-`/`test-worker-fs`/`test-process-cwd` 全量 + 种子 20260725 的 150 文件随机抽样），改动前后各跑一次（各自重新构建二进制），**回归 0**。十个新增文件单独各跑 3 次全绿。
+
 ### 第十轮：先审计量表，再推进覆盖（node 语料 38.2% → 50.9% 严格 / 58.1% 排除自我跳过）
 
 全量 4433 文件、空闲机器、修正后 runner 实测：`pass 1695 → 2255`（+560）、`fail 1862 → 1497`、`timeout 583 → 128`、`oom 14 → 3`。**fail 与 timeout 同时低于基线**，是真转化而非把挂起搬进失败。
