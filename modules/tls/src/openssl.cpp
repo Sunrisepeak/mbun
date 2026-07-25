@@ -134,8 +134,27 @@ struct TlsChannel::Impl {
     std::string errorCode_ {}; // node-style error.code for the last SSL failure
     std::string serverName_ {}; // client SNI / hostname under verification
     std::string alpnWire_ {}; // server: length-prefixed ALPN list for the select cb
+    // NSS-format key-material lines produced by SSL_CTX_set_keylog_callback, in
+    // order, waiting to be drained by take_keylog(). node's TLSSocket 'keylog'
+    // event (src/crypto/crypto_context.cc SecureContext::KeylogCallback) is the
+    // only consumer. Bounded so a connection nobody drains cannot grow without
+    // limit: a TLS 1.3 handshake emits 5 lines, TLS 1.2 emits 1, and a
+    // renegotiation a few more.
+    std::vector<std::string> keylog_ {};
+    static constexpr std::size_t kKeylogMax {64};
 
     Impl() = default;
+
+    // SSL_CTX_set_keylog_callback. `line` is one NSS keylog entry WITHOUT a
+    // trailing newline; node passes exactly the same bytes plus '\n' to JS.
+    static void keylog_cb_(const SSL* ssl, const char* line) {
+        if (ssl == nullptr || line == nullptr) return;
+        SSL_CTX* ctx {::SSL_get_SSL_CTX(const_cast<SSL*>(ssl))};
+        if (ctx == nullptr) return;
+        auto* self {static_cast<Impl*>(SSL_CTX_get_app_data(ctx))};
+        if (self == nullptr || self->keylog_.size() >= kKeylogMax) return;
+        self->keylog_.emplace_back(line);
+    }
 
     // Server ALPN selection (SSL_CTX_set_alpn_select_cb). Server preference:
     // the first protocol in our list that the client also offered. No match →
@@ -319,25 +338,41 @@ struct TlsChannel::Impl {
         if (config.maxVersion > 0) {
             ::SSL_CTX_set_max_proto_version(ctx_, config.maxVersion);
         }
-        // An impossible window (min > max) makes SSL_do_handshake fail. OpenSSL's
-        // reason there is "no protocols available"; node ships BoringSSL, whose
-        // reason is "no supported versions enabled". Pin the node/BoringSSL code
-        // up front so error.code matches node (the failure itself is genuine —
-        // the handshake still fails below). fail_() keeps this first code.
+        // An impossible window (min > max) makes SSL_do_handshake fail. Pin the
+        // code up front so error.code is stable regardless of which stage
+        // reports it (the failure itself is genuine — the handshake still fails
+        // below). fail_() keeps this first code.
+        //
+        // The code is OpenSSL's, not BoringSSL's: mbun links OpenSSL 3, and the
+        // corpus branches on exactly that — test-tls-min-max-version reads
+        // `hasOpenSSL3 ? 'ERR_SSL_NO_PROTOCOLS_AVAILABLE' : 'ERR_SSL_INTERNAL_ERROR'`
+        // and never mentions BoringSSL's SSL_R_NO_SUPPORTED_VERSIONS_ENABLED.
+        // Reporting a code the linked library cannot produce is a lie about
+        // which engine ran.
         if (config.minVersion != 0 && config.maxVersion != 0
             && config.minVersion > config.maxVersion) {
-            errorCode_ = "ERR_SSL_NO_SUPPORTED_VERSIONS_ENABLED";
+            errorCode_ = "ERR_SSL_NO_PROTOCOLS_AVAILABLE";
         }
         // Cipher list (node SecureContext::SetCiphers → SSL_CTX_set_cipher_list).
         // Applied only when the caller asked for one; an unparsable list is a
         // hard failure so the connection can never silently fall back to a
-        // broader default than was requested. node calls only set_cipher_list —
-        // the TLS 1.3 suites named in DEFAULT_CIPHERS are governed by
-        // SSL_CTX_set_ciphersuites and are deliberately left at their default.
+        // broader default than was requested. The caller's option has already
+        // been split by node's processCiphers rule: `ciphers` holds the <=TLS1.2
+        // entries and `cipherSuites` the TLS_-prefixed TLS 1.3 ones, because
+        // OpenSSL keeps them in two different slots. A TLS 1.3 suite name handed
+        // to set_cipher_list matches nothing and fails the whole context — which
+        // is how every TLS_AES_* cipher option used to become "No cipher match".
         if (!config.ciphers.empty()) {
             if (::SSL_CTX_set_cipher_list(ctx_, config.ciphers.c_str()) != 1) {
                 errorCode_ = "ERR_SSL_NO_CIPHER_MATCH";
                 fail_("set_cipher_list: no cipher match for the requested list");
+                return false;
+            }
+        }
+        if (!config.cipherSuites.empty()) {
+            if (::SSL_CTX_set_ciphersuites(ctx_, config.cipherSuites.c_str()) != 1) {
+                errorCode_ = "ERR_SSL_NO_CIPHER_MATCH";
+                fail_("set_ciphersuites: no TLS 1.3 suite match for the requested list");
                 return false;
             }
         }
@@ -353,6 +388,9 @@ struct TlsChannel::Impl {
             if (!load_ca_pem_(config.ca)) {
                 return false;
             }
+        } else if (config.caIsComplete) {
+            // An explicitly EMPTY trust store. Nothing is loaded, so every chain
+            // fails verification — which is exactly what the caller asked for.
         } else if (config.verify != VerifyMode::disabled) {
             if (!configure_default_trust_()) {
                 fail_("configure_default_trust: no usable system CA store");
@@ -382,6 +420,14 @@ struct TlsChannel::Impl {
                 }
             }
         }
+
+        // Key-material logging. node installs this unconditionally and gates the
+        // 'keylog' EVENT on having a listener (crypto_context.cc + tls/wrap.js),
+        // so the lines exist whenever someone asks for them. Nothing is written
+        // to disk here and nothing leaves the process on its own: take_keylog()
+        // is the only way out, and the JS layer drains it only into a listener.
+        SSL_CTX_set_app_data(ctx_, this);
+        ::SSL_CTX_set_keylog_callback(ctx_, &Impl::keylog_cb_);
 
         ssl_ = ::SSL_new(ctx_);
         if (ssl_ == nullptr) {
@@ -726,6 +772,15 @@ std::string TlsChannel::cipher() const {
     return name != nullptr ? std::string {name} : std::string {};
 }
 
+std::string TlsChannel::cipher_standard_name() const {
+    if (impl_->ssl_ == nullptr) {
+        return {};
+    }
+    const SSL_CIPHER* c {::SSL_get_current_cipher(impl_->ssl_)};
+    const char* name {c != nullptr ? ::SSL_CIPHER_standard_name(c) : nullptr};
+    return name != nullptr ? std::string {name} : std::string {};
+}
+
 std::string TlsChannel::peer_server_name() const {
     if (impl_->ssl_ == nullptr) {
         return {};
@@ -763,6 +818,12 @@ bool TlsChannel::verify_ok() const noexcept {
         return false;
     }
     return ::SSL_get_verify_result(impl_->ssl_) == X509_V_OK;
+}
+
+std::vector<std::string> TlsChannel::take_keylog() {
+    std::vector<std::string> out {};
+    out.swap(impl_->keylog_);
+    return out;
 }
 
 std::string TlsChannel::alpn_protocol() const {

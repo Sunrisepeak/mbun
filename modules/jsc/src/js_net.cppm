@@ -640,7 +640,13 @@ export constexpr std::string_view kNetJS = R"JS(
                    // tls.connect({ checkServerIdentity }), which node runs in JS
                    // INSTEAD of the default. Default true — omitting the flag must
                    // never be the same as switching the check off.
-                   o.hostCheck === false ? false : true);
+                   o.hostCheck === false ? false : true,
+                   // TLS 1.3 suites (node SetCipherSuites); a separate OpenSSL
+                   // slot from the <=TLS1.2 cipher list above.
+                   o.cipherSuites || "",
+                   // caComplete: o.ca is the entire trust store; never fall back
+                   // to the platform one (an empty store must stay empty).
+                   o.caComplete === true);
         this._tls = 1;
       } catch (e) { this._fail(e); }
       return this;
@@ -706,8 +712,20 @@ export constexpr std::string_view kNetJS = R"JS(
       if (this._eof && this._wq.length === 0) NET.release(this);
       else NET.hold(this);
     }
+    // Hand OpenSSL's NSS keylog lines to whoever asked for them (node's
+    // TLSSocket 'keylog'). Only runs when a listener exists — the native drain is
+    // a per-poll call and key material must not be moved out of the engine on
+    // spec. Each line arrives without its newline; node's event carries one.
+    _drainKeylog() {
+      if (!this._keylogWanted || !this._tls || this._fd < 0 || !NN.tlsKeylog) return;
+      let lines;
+      try { lines = NN.tlsKeylog(this._fd); } catch (e) { return; }
+      if (!lines || lines.length === 0) return;
+      for (const line of lines) this.emit("keylog", G.Buffer ? G.Buffer.from(line + "\n") : line + "\n");
+    }
     _poll() {
       if (this.destroyed || this._fd < 0) { NET.items.delete(this); return 0; }
+      if (this._keylogWanted) this._drainKeylog();
       if (this._tls === 1) {  // drive the TLS handshake before any app IO
         let st;
         try { st = NN.tlsStep(this._fd); } catch (e) { st = -1; }
@@ -721,6 +739,10 @@ export constexpr std::string_view kNetJS = R"JS(
           return 1;
         }
         if (st !== 1) return 0;
+        // A TLS 1.3 handshake produces all five keylog lines at completion, and
+        // the socket may be destroyed from the secureConnect continuation — drain
+        // here rather than waiting for the next poll that may never come.
+        this._drainKeylog();
         this._tls = 2;
         this._hsGen = NET.gen;  // suppress appdata reads for the rest of this drain
         this.emit("secureConnect");

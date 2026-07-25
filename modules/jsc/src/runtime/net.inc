@@ -590,6 +590,19 @@ JSValueRef netn_tls_wrap_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
     if (argc > 11 && JSValueIsBoolean(ctx, args[11])) {
         cfg.hostCheck = JSValueToBoolean(ctx, args[11]);
     }
+    // arg 12: the TLS 1.3 half of node's `ciphers` option. OpenSSL keeps the 1.3
+    // suites behind SSL_CTX_set_ciphersuites, a different slot from the cipher
+    // list in arg 10, and node splits the caller's string across the two
+    // (lib/internal/tls/secure-context.js processCiphers). Empty leaves the
+    // engine's own TLS 1.3 suite selection in place.
+    if (argc > 12) { cfg.cipherSuites = fs_arg(ctx, argc, args, 12); }
+    // arg 13: caIsComplete. `true` means arg 6 is the caller's ENTIRE trust
+    // store — tls.setDefaultCACertificates() replaced node's addRootCerts() —
+    // so the platform default store must not be consulted, not even when the
+    // supplied store is empty ("trust nothing" is a legitimate instruction).
+    if (argc > 13 && JSValueIsBoolean(ctx, args[13])) {
+        cfg.caIsComplete = JSValueToBoolean(ctx, args[13]);
+    }
     auto st{std::make_unique<NetTlsState>(
         isServer ? mbun::tls::TlsRole::server : mbun::tls::TlsRole::client, std::move(cfg))};
     if (!st->channel.valid()) {
@@ -752,6 +765,10 @@ JSValueRef netn_tls_info_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
     set_prop(ctx, r, "established", JSValueMakeBoolean(ctx, est));
     set_prop(ctx, r, "protocol", make_string(ctx, est ? st.channel.tls_version() : std::string{}));
     set_prop(ctx, r, "cipher", make_string(ctx, est ? st.channel.cipher() : std::string{}));
+    // getCipher().standardName — the IANA name, which is not derivable from the
+    // OpenSSL name ("AES256-SHA256" -> "TLS_RSA_WITH_AES_256_CBC_SHA256").
+    set_prop(ctx, r, "cipherStandardName",
+             make_string(ctx, est ? st.channel.cipher_standard_name() : std::string{}));
     set_prop(ctx, r, "servername", make_string(ctx, st.channel.peer_server_name()));
     set_prop(ctx, r, "authorized", JSValueMakeBoolean(ctx, est && st.channel.verify_ok()));
     set_prop(ctx, r, "alpnProtocol", make_string(ctx, est ? st.channel.alpn_protocol() : std::string{}));
@@ -776,6 +793,30 @@ JSValueRef netn_tls_info_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
     }
     return r;
 #endif
+}
+
+// net.tlsKeylog(fd) → array of NSS keylog lines produced since the last call
+// (empty array when there is nothing, or no channel on this fd). Draining is
+// destructive so a JS-side poll cannot re-emit a line twice. Feeds node's
+// TLSSocket/Server 'keylog' event (node src/crypto/crypto_context.cc
+// SecureContext::KeylogCallback -> tls/wrap.js onkeylog); nothing else reads it,
+// so a process with no keylog listener never surfaces key material.
+JSValueRef netn_tls_keylog_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                              const JSValueRef args[], JSValueRef*) {
+    std::vector<JSValueRef> items;
+#if !defined(_WIN32)
+    const int fd{argc > 0 ? static_cast<int>(JSValueToNumber(ctx, args[0], nullptr)) : -1};
+    const auto found{net_tls().find(fd)};
+    if (found != net_tls().end()) {
+        for (const std::string& line : found->second->channel.take_keylog()) {
+            items.push_back(make_string(ctx, line));
+        }
+    }
+#else
+    (void)argc;
+    (void)args;
+#endif
+    return JSObjectMakeArray(ctx, items.size(), items.empty() ? nullptr : items.data(), nullptr);
 }
 
 // net.tlsExportKeyingMaterial(fd, length, label, contextB64|null) → base64 of

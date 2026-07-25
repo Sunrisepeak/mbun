@@ -175,14 +175,23 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
   const validateBuffer = (v, name) => { if (!ArrayBuffer.isView(v)) throw ERR_INVALID_ARG_TYPE(name, ["Buffer", "TypedArray", "DataView"], v); };
   const validateFunction = (v, name) => { if (typeof v !== "function") throw ERR_INVALID_ARG_TYPE(name, "Function", v); };
 
-  // ---- internal/tls throwOnInvalidTLSArray ----
+  // ---- internal/tls validateKeyOrCertOption / configSecureContext ----
+  // node validates every ca/cert/key value with validateKeyOrCertOption, which
+  // accepts ONLY a string or an ArrayBufferView. The `{ pem, passphrase }` form
+  // is not a value type: configSecureContext unwraps it (`val?.pem !== undefined
+  // ? val.pem : val`) for the ELEMENTS OF A KEY ARRAY only, and validates the
+  // unwrapped pem. So `key: [{ pem }]` is legal, while a bare `key: { pem }` —
+  // and any `{ pem }` under `cert`/`ca` — is ERR_INVALID_ARG_TYPE.
+  // Accepting the bare object made tls.createServer({ key: { pem } }) succeed
+  // where node throws (test-tls-options-boolean-check /
+  // test-https-options-boolean-check assert both key and cert).
   const isValidTLSItem = (o) =>
-    typeof o === "string" || ArrayBuffer.isView(o) || o instanceof ArrayBuffer ||
-    (o && typeof o === "object" && typeof o.pem !== "undefined") ||
-    (Array.isArray(o) && o.every((x) => x && typeof x === "object" && "pem" in x));
-  const isValidTLSArray = (o) => {
+    typeof o === "string" || ArrayBuffer.isView(o) || o instanceof ArrayBuffer;
+  // node's key-array element rule, returning the value the error must name.
+  const unwrapKeyPem = (x) => (x != null && typeof x === "object" && x.pem !== undefined ? x.pem : x);
+  const isValidTLSArray = (o, unwrapPem) => {
     if (isValidTLSItem(o)) return true;
-    if (Array.isArray(o)) return o.every(isValidTLSItem);
+    if (Array.isArray(o)) return o.every((x) => isValidTLSItem(unwrapPem ? unwrapKeyPem(x) : x));
     return false;
   };
   // node lib/internal/tls/secure-context.js validateKeyOrCertOption passes this
@@ -190,13 +199,19 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
   // but the rejection message must be node's (no bun corpus test pins the
   // "or BunFile" wording — it was invented here).
   const VALID_TLS_ERROR_MESSAGE_TYPES = ["string", "Buffer", "TypedArray", "DataView"];
-  const findInvalidTLSItem = (o) => {
-    if (Array.isArray(o)) { for (const item of o) if (!isValidTLSItem(item)) return item; }
+  const findInvalidTLSItem = (o, unwrapPem) => {
+    if (Array.isArray(o)) {
+      for (const item of o) {
+        const v = unwrapPem ? unwrapKeyPem(item) : item;
+        if (!isValidTLSItem(v)) return v;
+      }
+    }
     return o;
   };
-  const throwOnInvalidTLSArray = (name, value) => {
-    if (!isValidTLSArray(value))
-      throw ERR_INVALID_ARG_TYPE(name, VALID_TLS_ERROR_MESSAGE_TYPES, findInvalidTLSItem(value));
+  // `unwrapPem` is set only for options.key, matching where node unwraps.
+  const throwOnInvalidTLSArray = (name, value, unwrapPem) => {
+    if (!isValidTLSArray(value, unwrapPem))
+      throw ERR_INVALID_ARG_TYPE(name, VALID_TLS_ERROR_MESSAGE_TYPES, findInvalidTLSItem(value, unwrapPem));
   };
 
   // ---- DEFAULT_CIPHERS (node src/node_constants.h DEFAULT_CIPHER_LIST_CORE) ---
@@ -231,28 +246,45 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
     "!SRP:" +
     "!CAMELLIA";
 
+  // ---- processCiphers (lib/internal/tls/secure-context.js) -------------------
+  // OpenSSL keeps the TLS 1.3 suites in a separate slot from the <=TLS 1.2
+  // cipher list, reached through SSL_CTX_set_ciphersuites rather than
+  // SSL_CTX_set_cipher_list. node splits the caller's `ciphers` string on ':'
+  // and routes each entry by its TLS_ prefix. An empty entry is dropped; if
+  // BOTH halves end up empty the option is ERR_INVALID_ARG_VALUE, because a
+  // handshake with no suites at all is impossible.
+  const processCiphers = (ciphers) => {
+    const parts = String(ciphers == null || ciphers === "" ? DEFAULT_CIPHERS : ciphers).split(":");
+    const isSuite = (c) => c.startsWith("TLS_") || c.startsWith("!TLS_");
+    return {
+      cipherList: parts.filter((c) => c.length !== 0 && !isSuite(c)).join(":"),
+      cipherSuites: parts.filter((c) => c.length !== 0 && isSuite(c)).join(":"),
+    };
+  };
+
   // ---- version defaults & valid set ----
   const VALID_TLS_VERSIONS = new Set(["TLSv1", "TLSv1.1", "TLSv1.2", "TLSv1.3"]);
   let DEFAULT_MIN_VERSION = "TLSv1.2";
   let DEFAULT_MAX_VERSION = "TLSv1.3";
   const DEFAULT_ECDH_CURVE = "auto";
 
-  // node src/node_options.cc: --tls-min-v1.{0,1,2,3} / --tls-max-v1.{2,3} move
-  // the default protocol window, and a later flag overrides an earlier one
-  // (test-tls-cli-min-version-1.0 passes --tls-min-v1.0 --tls-min-v1.1 and
-  // expects TLSv1). These only ever RESTRICT or widen the default window on the
-  // operator's explicit instruction; nothing here changes the window when no
-  // flag is given.
+  // node lib/tls.js: --tls-min-v1.{0,1,2,3} / --tls-max-v1.{2,3} move the default
+  // protocol window. The resolution is NOT last-flag-wins — it is a fixed
+  // if/else-if chain in a fixed order, so the WIDEST flag present wins no matter
+  // where it appears on the command line: min checks v1.0 first, then v1.1, v1.2,
+  // v1.3; max checks v1.3 first, then v1.2. test-tls-cli-min-version-1.0 passes
+  // `--tls-min-v1.0 --tls-min-v1.1` and expects TLSv1, which last-flag-wins got
+  // backwards. These only ever move the default window on the operator's explicit
+  // instruction; nothing here changes it when no flag is given.
   {
     const argv = (G.process && G.process.execArgv) || [];
-    const minFlags = { "--tls-min-v1.0": "TLSv1", "--tls-min-v1.1": "TLSv1.1",
-                       "--tls-min-v1.2": "TLSv1.2", "--tls-min-v1.3": "TLSv1.3" };
-    const maxFlags = { "--tls-max-v1.2": "TLSv1.2", "--tls-max-v1.3": "TLSv1.3" };
-    for (const a of argv) {
-      if (typeof a !== "string") continue;
-      if (minFlags[a] !== undefined) DEFAULT_MIN_VERSION = minFlags[a];
-      else if (maxFlags[a] !== undefined) DEFAULT_MAX_VERSION = maxFlags[a];
-    }
+    const has = (flag) => argv.some((a) => a === flag);
+    if (has("--tls-min-v1.0")) DEFAULT_MIN_VERSION = "TLSv1";
+    else if (has("--tls-min-v1.1")) DEFAULT_MIN_VERSION = "TLSv1.1";
+    else if (has("--tls-min-v1.2")) DEFAULT_MIN_VERSION = "TLSv1.2";
+    else if (has("--tls-min-v1.3")) DEFAULT_MIN_VERSION = "TLSv1.3";
+    if (has("--tls-max-v1.3")) DEFAULT_MAX_VERSION = "TLSv1.3";
+    else if (has("--tls-max-v1.2")) DEFAULT_MAX_VERSION = "TLSv1.2";
   }
 
   // ---- secureProtocol validation (lib/internal/tls/secure-context.js) ----
@@ -291,19 +323,34 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
     validateSecureProtocol(secureProtocol);
     if (ciphers !== undefined && ciphers !== null) {
       validateString(ciphers, "options.ciphers");
+      // node lib/internal/tls/secure-context.js processCiphers: the TLS 1.3
+      // suites live behind a DIFFERENT OpenSSL setter, so the list is split on
+      // ':' and the TLS_-prefixed entries go to setCipherSuites while the rest go
+      // to setCiphers. Handing the whole string to SSL_CTX_set_cipher_list, as
+      // mbun did, made every TLS 1.3 suite name a "No cipher match" error.
+      const split = processCiphers(ciphers);
+      if (split.cipherList === "" && split.cipherSuites === "") {
+        const e = new TypeError("The argument 'options.ciphers' is invalid. Received " + JSON.stringify(ciphers));
+        e.code = "ERR_INVALID_ARG_VALUE";
+        throw e;
+      }
       // node SecureContext::SetCiphers: a list OpenSSL cannot match to any
       // suite is rejected at context-creation time with the OpenSSL error
       // shape (code/library/reason), not silently ignored.
       // node SetCiphers returns early on an empty list (it leaves the context's
       // TLS1.3 suites in place), so "" is legal and must not be rejected.
       const TN = globalThis.__mbunNodeTlsNative;
-      if (ciphers !== "" && TN && typeof TN.checkCipherList === "function" && !TN.checkCipherList(ciphers)) {
+      const noMatch = () => {
         const e = new Error("No cipher match");
         e.code = "ERR_SSL_NO_CIPHER_MATCH";
         e.library = "SSL routines";
         e.reason = "no cipher match";
-        throw e;
-      }
+        return e;
+      };
+      if (split.cipherList !== "" && TN && typeof TN.checkCipherList === "function"
+          && !TN.checkCipherList(split.cipherList)) throw noMatch();
+      if (split.cipherSuites !== "" && TN && typeof TN.checkCipherSuites === "function"
+          && !TN.checkCipherSuites(split.cipherSuites)) throw noMatch();
     }
     if (passphrase !== undefined && passphrase !== null) validateString(passphrase, "options.passphrase");
     if (ecdhCurve !== undefined && ecdhCurve !== null) validateString(ecdhCurve, "options.ecdhCurve");
@@ -410,7 +457,7 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
       if (options) {
         validateSecureContextOptions(options);
         if (options.cert) throwOnInvalidTLSArray("options.cert", options.cert);
-        if (options.key) throwOnInvalidTLSArray("options.key", options.key);
+        if (options.key) throwOnInvalidTLSArray("options.key", options.key, true);
         if (options.ca) throwOnInvalidTLSArray("options.ca", options.ca);
         if (options.servername != null && typeof options.servername !== "string")
           throw new TypeError("servername argument must be an string");
@@ -841,7 +888,19 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
       out.push(pem);
     }
     _defaultCAs = Object.freeze(out);
+    // The mutated store has to reach the TLS engine, not just getCACertificates:
+    // node's setDefaultCACertificates replaces what addRootCerts() would have
+    // installed, so a client with no explicit `ca` verifies against THIS list and
+    // nothing else. Cache the concatenated PEM once — the list is typically the
+    // whole root bundle and a per-connection join would be quadratic.
+    _defaultCAPem = out.join("\n");
   }
+  // null until the process calls setDefaultCACertificates(); afterwards the
+  // complete trust store as PEM, "" meaning "trust nothing". js_tls_live reads it
+  // for any client that supplied no `ca` of its own. Never widens trust: it can
+  // only replace the platform store with what the caller explicitly handed over.
+  let _defaultCAPem = null;
+  function defaultCAPem() { return _defaultCAPem; }
 
   // ---- install onto the node:tls module object ----
   const assign = {
@@ -857,6 +916,10 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
     getCACertificates,
     setDefaultCACertificates,
     parseCertString,
+    // Internal: js_tls_live needs the same split before it hands the two lists
+    // to the native context. Not part of node's surface.
+    __mbunProcessCiphers: processCiphers,
+    __mbunDefaultCAPem: defaultCAPem,
     SecureContext,
     Server,
     TLSSocket,

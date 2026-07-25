@@ -104,6 +104,28 @@ inline JSValueRef node_tls_check_cipher_list_cb(JSContextRef ctx, JSObjectRef, J
     return JSValueMakeBoolean(ctx, ok);
 }
 
+// __mbunNodeTlsNative.checkCipherSuites(str) → does OpenSSL accept this TLS 1.3
+// suite list? The 1.3 suites sit in a separate slot from the cipher list
+// (SSL_CTX_set_ciphersuites, not SSL_CTX_set_cipher_list), so validating them
+// with the cipher-list setter rejects every legitimate TLS_* name. node's
+// SecureContext::SetCipherSuites raises the same ERR_SSL_NO_CIPHER_MATCH shape
+// when the setter fails.
+inline JSValueRef node_tls_check_cipher_suites_cb(JSContextRef ctx, JSObjectRef, JSObjectRef,
+                                                  std::size_t argc, const JSValueRef argv[],
+                                                  JSValueRef*) {
+    if (argc < 1) return JSValueMakeBoolean(ctx, true);
+    const std::string list{val_to_string(ctx, argv[0])};
+    bool ok{true};
+    if (const SSL_METHOD* method{TLS_method()}) {
+        if (SSL_CTX* c{SSL_CTX_new(method)}) {
+            ok = SSL_CTX_set_ciphersuites(c, list.c_str()) == 1;
+            SSL_CTX_free(c);
+        }
+    }
+    if (!ok) ERR_clear_error();
+    return JSValueMakeBoolean(ctx, ok);
+}
+
 // __mbunNodeTlsNative.rootCertificates() → string[] of PEM certificates from the
 // platform trust store — the store mbun actually verifies chains against. node
 // answers tls.rootCertificates from its vendored Mozilla NSS bundle
@@ -140,6 +162,7 @@ inline void install_node_tls_native(JSContextRef ctx, JSObjectRef global) {
     JSObjectRef tn{JSObjectMake(ctx, nullptr, nullptr)};
     set_fn(ctx, tn, "getCiphers", node_tls_get_ciphers_cb);
     set_fn(ctx, tn, "checkCipherList", node_tls_check_cipher_list_cb);
+    set_fn(ctx, tn, "checkCipherSuites", node_tls_check_cipher_suites_cb);
     set_fn(ctx, tn, "canonicalizeIP", node_tls_canonicalize_ip_cb);
     set_fn(ctx, tn, "rootCertificates", node_tls_root_certificates_cb);
     set_fn(ctx, tn, "checkKeyCert", node_tls_check_key_cert_cb);

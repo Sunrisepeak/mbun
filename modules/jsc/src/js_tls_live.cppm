@@ -215,36 +215,44 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
   };
 
   // ---- protocol version window (node lib/internal/tls/secure-context.js) ------
-  // A secureProtocol like "TLSv1_2_method" pins both bounds to a single version;
-  // "TLS_method"/"SSLv23_method" leave the window open. Otherwise the explicit
-  // minVersion/maxVersion win, falling back to tls.DEFAULT_MIN/MAX_VERSION.
-  const secureProtocolPin = (sp) => {
+  // node does NOT hand min=max=0 to SecureContext::Init when `secureProtocol` is
+  // set — lib/internal/tls/common.js always passes toV(minVersion,DEFAULT_MIN)
+  // and toV(maxVersion,DEFAULT_MAX), and src/crypto/crypto_context.cc
+  // SecureContext::Init then adjusts ONE OR BOTH bounds per method name:
+  //
+  //   TLS_method / _client_ / _server_   min = 0 (no floor), max = TLS1.3
+  //   SSLv23_method / _client_/_server_  max = TLS1.2, min LEFT AT DEFAULT_MIN
+  //   TLSv1_method   (+client/server)    min = max = TLS1.0
+  //   TLSv1_1_method (+client/server)    min = max = TLS1.1
+  //   TLSv1_2_method (+client/server)    min = max = TLS1.2
+  //
+  // The SSLv23 row is the one that matters: it is "any supported protocol at or
+  // above the default minimum", not "anything at all". Treating it as fully
+  // unpinned let an SSLv23 peer negotiate TLS 1.0/1.1 against a TLSv1_method
+  // peer, where node fails the handshake (test-tls-min-max-version, and through
+  // it all five test-tls-cli-{min,max}-version-* files, assert exactly that).
+  // Widening a version window is never a safe default, so the floor stays.
+  const SECURE_PROTOCOL_SUFFIXES = ["_method", "_client_method", "_server_method"];
+  const securePrefix = (sp) => {
     if (typeof sp !== "string") return null;
-    if (sp === "TLSv1_3_method") return "TLSv1.3";
-    if (sp === "TLSv1_2_method") return "TLSv1.2";
-    if (sp === "TLSv1_1_method") return "TLSv1.1";
-    if (sp === "TLSv1_method") return "TLSv1";
+    for (const suffix of SECURE_PROTOCOL_SUFFIXES) {
+      if (sp.endsWith(suffix)) return sp.slice(0, sp.length - suffix.length);
+    }
     return null;
   };
   const resolveVersions = (options) => {
-    // node lib/internal/tls/common.js SecureContext:
-    //   if (secureProtocol) { ...conflict checks...; context.init(secureProtocol, 0, 0); }
-    //   else                 context.init(undefined, toV(minVersion, DEFAULT_MIN),
-    //                                                toV(maxVersion, DEFAULT_MAX));
-    // — an explicit secureProtocol replaces the default version WINDOW with the
-    // method's own range and passes min=max=0, i.e. no pin at all. Folding
-    // DEFAULT_MIN_VERSION in anyway pinned every `secureProtocol: 'TLS_method'`
-    // server at TLSv1.2, so a client that asked for TLSv1/TLSv1.1 (as
-    // test-tls-getprotocol and the test-tls-cli-*-version files do) was answered
-    // with `tlsv1 alert protocol version` by mbun's own server.
-    // This does NOT weaken anything by itself: whether the engine will actually
-    // negotiate a legacy version still depends on the security level, which only
-    // the caller's own `ciphers` string can lower (`@SECLEVEL=0`).
     if (typeof options.secureProtocol === "string" && options.secureProtocol) {
-      const pinned = secureProtocolPin(options.secureProtocol);
       // "none" is the native layer's explicit-unpinned marker (net.inc
       // version_arg); "" would fall back to its TLS 1.2 default floor.
-      return pinned != null ? { min: pinned, max: pinned } : { min: "none", max: "none" };
+      switch (securePrefix(options.secureProtocol)) {
+        case "TLS": return { min: "none", max: "TLSv1.3" };
+        case "SSLv23": return { min: T.DEFAULT_MIN_VERSION || "", max: "TLSv1.2" };
+        case "TLSv1": return { min: "TLSv1", max: "TLSv1" };
+        case "TLSv1_1": return { min: "TLSv1.1", max: "TLSv1.1" };
+        case "TLSv1_2": return { min: "TLSv1.2", max: "TLSv1.2" };
+        case "TLSv1_3": return { min: "TLSv1.3", max: "TLSv1.3" };
+        default: return { min: "none", max: "none" };
+      }
     }
     let min = options.minVersion;
     let max = options.maxVersion;
@@ -313,6 +321,17 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
       this._peerCert = null;
       // http2-wrapper (JSStreamSocket) reaches for _handle._parentWrap.constructor.
       this._handle = { _parentWrap: this };
+      // 'keylog' costs a native drain per poll, so the reactor only performs it
+      // once something has asked. Any listener added at any time flips the flag —
+      // node installs its keylog callback eagerly, mbun defers the WORK, not the
+      // semantics. Watching 'newListener' catches on/once/addListener/prepend*
+      // alike, including the https.Agent's own onkeylog forward.
+      this._keylogWanted = false;
+      this.on("newListener", (ev) => {
+        if (ev !== "keylog" || this._keylogWanted) return;
+        this._keylogWanted = true;
+        if (this._transport) this._transport._keylogWanted = true;
+      });
       if (isMbunNetSocket(socket)) this._wrapTransport(socket, options);
       // A Duplex/stream transport (no fd) is DEFERRED: construction still yields
       // a shaped TLSSocket (http2-wrapper only reads _handle); the live handshake
@@ -352,6 +371,13 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
       // pinned and the process could not leave the loop (13 test-https-* files
       // hit the 15s corpus timeout on exactly that).
       transport.on("timeout", () => self.emit("timeout"));
+      // node crypto_context.cc SecureContext::KeylogCallback -> tls/wrap.js
+      // onkeylog: each NSS keylog line reaches the TLSSocket as a Buffer that
+      // already carries its trailing newline. The reactor only asks OpenSSL for
+      // the lines when something wants them (_keylogWanted below), so a process
+      // with no listener never moves key material out of the engine.
+      transport.on("keylog", (line) => self.emit("keylog", line));
+      if (self._keylogWanted) transport._keylogWanted = true;
       // node's TLSSocket is a net.Socket over a real connection, so it emits
       // 'connect' when the TCP leg lands (before the handshake) and 'ready'
       // after. The corpus drives raw TLS clients from 'connect'
@@ -387,6 +413,7 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
           self.authorized = !!info.authorized;
           self._protocol = info.protocol || null;
           self._cipherName = info.cipher || "";
+          self._cipherStandardName = info.cipherStandardName || "";
           // node crypto_tls.cc TLSWrap::GetALPNNegotiatedProto: SSL_get0_alpn_
           // selected yielding a zero-length protocol is reported as `false`,
           // whether or not this side offered ALPN. `null` is only the
@@ -453,20 +480,54 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
           ? (options.requestCert ? (options.rejectUnauthorized !== false ? 1 : 2) : 0)
           : (options.rejectUnauthorized !== false ? 1 : 0);
         const ver = resolveVersions(options);
+        // node lib/internal/tls/secure-context.js configSecureContext: a context
+        // with no `ca` calls context.addRootCerts(), and
+        // tls.setDefaultCACertificates() REPLACES what that installs. mbun's
+        // engine falls back to the platform store when `ca` is empty, so the
+        // mutated default has to be handed over explicitly or it never takes
+        // effect (test-tls-set-default-ca-certificates-*-https-request).
+        let caPem = pemOf(options.ca);
+        let caComplete = false;
+        if (!caPem && options.ca == null && T && typeof T.__mbunDefaultCAPem === "function") {
+          const overridden = T.__mbunDefaultCAPem();
+          if (overridden !== null && overridden !== undefined) { caPem = overridden; caComplete = true; }
+        }
+        // node processCiphers: TLS 1.3 suites go to SSL_CTX_set_ciphersuites,
+        // everything else to SSL_CTX_set_cipher_list. An empty/absent option
+        // still means "leave the engine's own defaults alone" on both slots.
+        const ciphers = typeof options.ciphers === "string" && options.ciphers
+          ? (T && typeof T.__mbunProcessCiphers === "function"
+              ? T.__mbunProcessCiphers(options.ciphers)
+              : { cipherList: options.ciphers, cipherSuites: "" })
+          : { cipherList: "", cipherSuites: "" };
+        // node configSecureContext: a caller who named ONLY TLS 1.3 suites has no
+        // <=TLS1.2 cipher at all, so the context floor is raised to TLS 1.3
+        // rather than left to fail the handshake with "no shared cipher".
+        if (typeof options.ciphers === "string" && options.ciphers
+            && ciphers.cipherList === "" && ciphers.cipherSuites !== ""
+            && ver.min !== "TLSv1.3" && ver.max !== "TLSv1.2") {
+          ver.min = "TLSv1.3";
+        }
         self._ownCertPem = pemOf(options.cert) || null;
         transport._startTls({
           isServer: !!options.isServer,
           cert: pemOf(options.cert),   // server: own cert; client: mutual-TLS cert
           key: pemOf(options.key),
-          ca: pemOf(options.ca),
+          ca: caPem,
+          // caComplete: `ca` is the WHOLE trust store, so do not fall back to
+          // the platform one — including when it is empty, which is how
+          // tls.setDefaultCACertificates([]) means "trust nothing".
+          caComplete: caComplete,
           servername: options.servername || "",
           verify,
           alpn: alpnCsv(options.ALPNProtocols),
           minVersion: ver.min,
           maxVersion: ver.max,
-          // node SecureContext::SetCiphers. Only a caller-supplied list is sent;
-          // "" leaves the engine's default suite selection untouched.
-          ciphers: typeof options.ciphers === "string" ? options.ciphers : "",
+          // node SecureContext::SetCiphers / SetCipherSuites. Only a
+          // caller-supplied list is sent; "" leaves that slot's engine default
+          // untouched.
+          ciphers: ciphers.cipherList,
+          cipherSuites: ciphers.cipherSuites,
           hostCheck: !(typeof options.checkServerIdentity === "function"),
         });
       };
@@ -519,9 +580,16 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
     getCipher() {
       const n = this._cipherName || "";
       if (!n) return {};
-      return { name: n, standardName: n, version: this._protocol || "TLSv1.3" };
+      return { name: n, standardName: this._cipherStandardName || n, version: this._protocol || "TLSv1.3" };
     }
-    getProtocol() { return this._secureEstablished ? (this._protocol || "TLSv1.3") : null; }
+    // node crypto_tls.cc TLSWrap::GetProtocol reads SSL_get_version off the
+    // handle, and internal/tls/wrap.js nulls the handle on close — so a closed
+    // socket answers null, not the protocol it used to speak. The corpus asserts
+    // exactly that inside its own 'close' listener (test-tls-getprotocol).
+    getProtocol() {
+      if (!this._secureEstablished || this.destroyed) return null;
+      return this._protocol || "TLSv1.3";
+    }
     getSession() { return undefined; }
     getEphemeralKeyInfo() { return null; }
     getSharedSigalgs() { return []; }
@@ -774,6 +842,10 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
         secureContext: creds.secureContext, ciphers: creds.ciphers,
       });
       const self = this;
+      // node internal/tls/wrap.js: the server re-emits each connection's keylog
+      // lines as (line, tlsSocket), and only bothers when it has a listener.
+      if (typeof self.listenerCount === "function" && self.listenerCount("keylog") > 0)
+        tlsSock.on("keylog", (line) => self.emit("keylog", line, tlsSock));
       tlsSock.once("secureConnect", () => self.emit("secureConnection", tlsSock));
       // node _tls_wrap.js onServerSocketSecure/handshakeTimeout: a connection that
       // does not finish its handshake within options.handshakeTimeout (default
