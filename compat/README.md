@@ -224,6 +224,18 @@ sample), while `primordials` + `internalBinding` converts 45/305 = **14.8%**.
 `internalBinding` does roughly 90% of the work. Deferring on the primordials-only
 number had been correct; the missing measurement was the combined one.
 
+### Derive the guard set from the diff, not from the brief
+
+A zero-regression gate is only as wide as the files it runs. Round 10 lost three
+`test-dns-*` files to a task whose guard covered `http`/`https`/`tls`/`net`/`dgram`
+— its targets — while the change also edited `dns`. The gate passed; the
+regression was found two merges later by a full run.
+
+**Rule:** after the work is done, run `git diff --name-only`, map the changed
+builtins/modules to every corpus subsystem that loads them, and guard all of
+them. The brief names where you are *aiming*; the diff names what you can
+*break*.
+
 ### Isolated deltas are not additive
 
 Round 9's eight tasks each measured a gain against their own cluster, each with
