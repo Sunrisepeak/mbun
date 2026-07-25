@@ -1002,6 +1002,13 @@ JSValueRef fsn_stat_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t a
             return fs_throw(ctx, exc, "ENAMETOOLONG: name too long, stat '" + path + "'");
         if (errno == ENOTDIR)
             return fs_throw(ctx, exc, "ENOTDIR: not a directory, stat '" + path + "'");
+        // A symlink cycle must surface as ELOOP, not ENOENT: node's non-native
+        // realpath resolver detects a cycle ONLY by the follow-stat failing that
+        // way (lib/fs.js realpathSync calls binding.stat on each link before
+        // reading it), and test-fs-realpath's cyclic-link-protection case matches
+        // on `{ code: 'ELOOP' }` exactly.
+        if (errno == ELOOP)
+            return fs_throw(ctx, exc, "ELOOP: too many symbolic links encountered, stat '" + path + "'");
         return fs_throw(ctx, exc, "ENOENT: no such file or directory, stat '" + path + "'");
     }
     fs_fields_from_stat(st, f);
@@ -1138,6 +1145,44 @@ JSValueRef fsn_realpath_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size
     auto r{std::filesystem::weakly_canonical(std::filesystem::path{path}, ec)};
     if (ec) return fs_throw(ctx, exc, "realpath '" + path + "': " + ec.message());
     return make_string(ctx, r.string());
+}
+// realpathNative(path) — the STRICT resolver behind fs.realpathSync.native /
+// fs.realpath.native, which node backs with uv_fs_realpath, i.e. realpath(3).
+//
+// It is deliberately a second entry point rather than a change to
+// fsn_realpath_cb: that one is weakly_canonical, which resolves as far as the
+// filesystem goes and then APPENDS the non-existent tail instead of failing.
+// node's `.native` must fail — ENOENT for a missing component, ELOOP for a
+// symlink cycle, ENOTDIR when a non-directory is used as one — and
+// test-fs-realpath asserts all three. Keeping the lenient variant lets the
+// internal callers that rely on "canonicalise what you can" stay as they are.
+JSValueRef fsn_realpath_native_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                                  const JSValueRef args[], JSValueRef* exc) {
+    std::string path{fs_arg(ctx, argc, args, 0)};
+    if (permission_deny_fs(ctx, exc, path, false)) return JSValueMakeUndefined(ctx);
+    if (fs_path_too_long(ctx, exc, path, "realpath")) return JSValueMakeUndefined(ctx);
+#if defined(_WIN32)
+    std::error_code ec;
+    auto r{std::filesystem::canonical(std::filesystem::path{path}, ec)};
+    if (ec) return fs_throw(ctx, exc, "ENOENT: no such file or directory, realpath '" + path + "'");
+    return make_string(ctx, r.string());
+#else
+    char* resolved{::realpath(path.c_str(), nullptr)};
+    if (resolved == nullptr) {
+        // uv_strerror wording, so the message reads exactly as node's uvException
+        // builds it and fs_make_error can recover code/errno/syscall/path.
+        const char* code{errno == ENOENT         ? "ENOENT: no such file or directory"
+                         : errno == ELOOP        ? "ELOOP: too many symbolic links encountered"
+                         : errno == ENOTDIR      ? "ENOTDIR: not a directory"
+                         : errno == EACCES       ? "EACCES: permission denied"
+                         : errno == ENAMETOOLONG ? "ENAMETOOLONG: name too long"
+                                                 : "EINVAL: invalid argument"};
+        return fs_throw(ctx, exc, std::string{code} + ", realpath '" + path + "'");
+    }
+    const std::string out{resolved};
+    ::free(resolved);
+    return make_string(ctx, out);
+#endif
 }
 JSValueRef fsn_rename_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                          const JSValueRef args[], JSValueRef* exc) {

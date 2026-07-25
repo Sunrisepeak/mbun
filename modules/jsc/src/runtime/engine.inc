@@ -1645,6 +1645,7 @@ public:
         set_fn(ctx_, fsn, "utimes", fsn_utimes_cb);
         set_fn(ctx_, fsn, "chmod", fsn_chmod_cb);
         set_fn(ctx_, fsn, "realpath", fsn_realpath_cb);
+        set_fn(ctx_, fsn, "realpathNative", fsn_realpath_native_cb);
         set_fn(ctx_, fsn, "rename", fsn_rename_cb);
         set_fn(ctx_, fsn, "copyFile", fsn_copyFile_cb);
         set_fn(ctx_, fsn, "symlink", fsn_symlink_cb);
