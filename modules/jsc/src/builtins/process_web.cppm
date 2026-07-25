@@ -1733,11 +1733,26 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       // (libuv's callback boundary), not something to drop. Swallowing it here
       // left the throwing test's sockets/servers registered, so the loop never
       // drained and the file hung to its harness timeout instead of failing.
+      let bail = false;
       try { t.fn.apply(null, t.a); }
       catch (e) {
-        if (G.__mbun_uncaught && !G.__mbun_uncaught(e)) { fired++; T.fired++; break; }
+        if (G.__mbun_uncaught && !G.__mbun_uncaught(e)) bail = true;
       }
+      // A timer callback is a node callback boundary: its process.nextTick queue
+      // drains NOW, before the next timer fires and before any promise
+      // continuation it queued. This loop fires up to `budget` timers inside one
+      // JSC evaluation, and JSC only drains its microtask queue when that
+      // evaluation ends -- so without this, `setTimeout(() => { nextTick(t);
+      // ... })` ran t after every other due timer instead of immediately.
+      if (G.__mbunRunTicks) G.__mbunRunTicks();
+      // ...and then the promise microtasks, for the same reason: this loop can
+      // fire 200 timers inside one JSC evaluation, and JSC would otherwise hold
+      // every promise continuation until the whole batch is done. node runs the
+      // microtask checkpoint after each timer callback, so a `.then()` queued by
+      // one timer beats the next due timer.
+      if (G.__mbunDrainMicrotasksNative) G.__mbunDrainMicrotasksNative();
       fired++; T.fired++;
+      if (bail) break;
     }
     const now2 = Date.now();
     let due = 0; for (let i = 0; i < T.q.length; i++) if (T.q[i].at <= now2) due++;
