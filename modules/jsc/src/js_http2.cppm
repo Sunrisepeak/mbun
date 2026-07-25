@@ -326,6 +326,15 @@ export constexpr std::string_view kHttp2JS = R"JS(
   }
   const sessionErr = (code) => mkErr("Session closed with error code " + errName(code), "ERR_HTTP2_SESSION_ERROR");
   const streamErr = (code) => mkErr("Stream closed with error code " + errName(code), "ERR_HTTP2_STREAM_ERROR");
+  // internal/errors.js ERR_HTTP2_STREAM_CANCEL: the error a session destroy hands
+  // to a stream that never got a stream id (node's `pendingStreams`).
+  const streamCancelErr = (cause) => {
+    let msg = "The pending stream has been canceled";
+    if (cause && typeof cause.message === "string") msg += " (caused by: " + cause.message + ")";
+    const e = mkErr(msg, "ERR_HTTP2_STREAM_CANCEL");
+    if (cause) e.cause = cause;
+    return e;
+  };
 
   // === HPACK (RFC 7541) ===
   // Huffman canonical code table (Appendix B): code value + bit length per symbol.
@@ -1658,7 +1667,26 @@ export constexpr std::string_view kHttp2JS = R"JS(
       this.destroyed = true; this.closed = true;
       if (this._timer != null) { try { G.clearTimeout(this._timer); } catch (e) {} this._timer = null; }
       closeSessionSocket(this.socket, hard !== false);
-      G.queueMicrotask(() => this.emit("close"));
+      // "Pending and existing streams will be destroyed. […] pending streams
+      // will be destroyed using a specific ERR_HTTP2_STREAM_CANCEL error"
+      // (lib/internal/http2/core.js, closeSession). mbun's client session left
+      // them dangling entirely: a request made before the socket connected never
+      // got its 'error'/'close' and its handle kept the loop alive
+      // (test-http2-stream-removelisteners-after-close).
+      // Only the PENDING ones: an open stream is already driven to its end by the
+      // socket teardown, and force-finishing those cost 5 files (they emit their
+      // own 'close'/'aborted' first). A stream on a session that never connected
+      // has nothing to drive it at all, so it kept its handle and the loop alive.
+      const pending = !this._connected ? Array.from(this.streams.values()) : [];
+      const self = this;
+      G.queueMicrotask(() => {
+        for (const s of pending) {
+          if (s.destroyed) continue;
+          s._closed = true;
+          s.destroy(streamCancelErr());
+        }
+        self.emit("close");
+      });
     }
     _shutdown() { this._teardown(); }
 
