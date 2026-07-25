@@ -150,6 +150,42 @@
         "timeout_reduction": 414,
         "note": "The published 44.5% headline was never real: it counted ~300 self-skips as passes on top of unenforced mustCall. 38.2% is the honest round-8 figure measured with the corrected runner."
       }
+    },
+    {
+      "round": 10,
+      "corpus": "compat/node/test/parallel",
+      "baseline_binary": "r9/integration @ 1b8745e (globals fix included)",
+      "in_progress": true,
+      "tasks": [
+        {
+          "id": "r10/agent-1",
+          "cluster": "repl restoration + global-replacement root cause",
+          "worklist_files": 94,
+          "cluster_homogeneity": "high",
+          "target_delta_pass": 55,
+          "actual_delta_pass": 55,
+          "hit_rate": 1.0,
+          "wall_clock_min": 50,
+          "note": "Target hit exactly. The brief's stated root cause was directionally right but wrong about the agent: node:domain (eagerly required by node:repl) replaced globalThis.setTimeout/setInterval/setImmediate/queueMicrotask on first require, standing in for the async_hooks init hook mbun lacks; node's common pins those four by value at load. 43 of 94 files died on that one line. Naming a suspected cause in the brief did not mislead the agent \u2014 it re-derived it."
+        },
+        {
+          "id": "r10/agent-3",
+          "cluster": "http2 + tls",
+          "worklist_files": 400,
+          "cluster_homogeneity": "medium",
+          "target_delta_pass": 50,
+          "actual_delta_pass": 75,
+          "hit_rate": 1.5,
+          "wall_clock_min": 77,
+          "note": "Delivered 1.5x target on a 400-file MEDIUM-homogeneity list, which the round-9 calibration would not have predicted. Cause: the agent ran 8 build->measure cycles with a zero-regression gate at each, re-clustering after every one, instead of one large blind change. Method, not cluster shape, drove the result \u2014 the calibration should account for iteration count, not only homogeneity.",
+          "self_reported_wall_clock_min": 195,
+          "self_report_discrepancy": "The agent reported ~3h15m end to end; dispatch-to-completion was ~77-80 min by wall clock and by the harness timer. Agent self-estimates of elapsed time are unreliable and are not used as the recorded value."
+        }
+      ],
+      "verdicts": {
+        "tls_regression_candidates": "The 5 TLS files flagged as the round's only outstanding genuine-regression candidates are NOT regressions. Shared pre-existing root cause: tls.Server attached its pre-handshake error handler to the raw transport, but TLSSocket._wrapTransport re-emits transport 'error' onto the TLSSocket, which had no listener, so EventEmitter's unhandled-'error' throw leaked the raw OpenSSL string to top level instead of node's 'tlsClientError'. 4 of 5 now pass (independently re-verified on the composed binary); the 5th needs SNI addContext and is deferred.",
+        "round_9_real_regressions_final": "Exactly one: test-http-write-empty-string. All other 495 of 496 green->non-green transitions were classified from logs as honest reclassification."
+      }
     }
   ]
 }
