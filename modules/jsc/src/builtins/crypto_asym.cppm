@@ -87,14 +87,17 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   // { data, passphrase, padding, saltLength, dsaEncoding, oaepHash, oaepLabel }.
   const resolveKey = (k) => {
     if (k == null) throw new TypeError("No key provided");
-    if (k instanceof KeyObject) return { data: k._km, passphrase: k._pass || "" };
-    if (typeof k === "string" || isView(k) || k instanceof ArrayBuffer) return { data: k, passphrase: "" };
+    // passphrase stays `undefined` when none was given: node distinguishes "no
+    // passphrase" (never prompt, never guess) from an explicit empty one (a real,
+    // usable password), and the native loader keys its error off that.
+    if (k instanceof KeyObject) return { data: k._km, passphrase: k._pass };
+    if (typeof k === "string" || isView(k) || k instanceof ArrayBuffer) return { data: k, passphrase: undefined };
     // { key: <JWK object>, format: "jwk", ... } — materialize the JWK to DER up
     // front (private when `d` is present) so the native signer/verifier gets real
     // key bytes. dsaEncoding rides along for EC ieee-p1363 vs der output.
     if (typeof k === "object" && k.format === "jwk" && k.key != null && typeof k.key === "object") {
       const isPriv = k.key.d != null;
-      return { data: jwkToDer(k.key, isPriv), passphrase: "", dsaEncoding: k.dsaEncoding };
+      return { data: jwkToDer(k.key, isPriv), passphrase: undefined, dsaEncoding: k.dsaEncoding };
     }
     if (typeof k === "object" && ("key" in k || "pem" in k)) {
       const inner = resolveKey(k.key != null ? k.key : k.pem);
@@ -106,7 +109,17 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
         encoding: k.encoding,
       };
     }
-    return { data: k, passphrase: "" };
+    return { data: k, passphrase: undefined };
+  };
+  // Give a native key-load failure node's error surface. The native layer already
+  // decides *which* failure it is (see asym_key_error in runtime/crypto_asym.inc);
+  // here we only attach the name/code node reports for it.
+  const keyErr = (e) => {
+    const m = e && typeof e.message === "string" ? e.message : "";
+    if (m === "Passphrase required for encrypted key") {
+      const t = new TypeError(m); t.code = "ERR_MISSING_PASSPHRASE"; return t;
+    }
+    return m.startsWith("error:") ? decorateOsslError(e) : e;
   };
   // publicEncrypt/privateDecrypt accept { key, encoding } where key is a hex/etc
   // string; honor the encoding when converting to bytes.
@@ -143,8 +156,10 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     const r = resolveKey(key);
     validateOaepHash(r);
     const label = toOaepLabel(r);
-    return Buffer.from(AN.publicEncrypt(keyData(r), r.passphrase, toBuf(buffer, r.encoding),
-      r.padding != null ? r.padding : RSA_PKCS1_OAEP_PADDING, r.oaepHash || "", label));
+    try {
+      return Buffer.from(AN.publicEncrypt(keyData(r), r.passphrase, toBuf(buffer, r.encoding),
+        r.padding != null ? r.padding : RSA_PKCS1_OAEP_PADDING, r.oaepHash || "", label));
+    } catch (e) { throw keyErr(e); }
   };
   C.privateDecrypt = (key, buffer) => {
     const r = resolveKey(key);
@@ -156,19 +171,25 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
       e.code = "ERR_INVALID_ARG_VALUE"; throw e;
     }
     const label = toOaepLabel(r);
-    return Buffer.from(AN.privateDecrypt(keyData(r), r.passphrase, toBuf(buffer, r.encoding),
-      r.padding != null ? r.padding : RSA_PKCS1_OAEP_PADDING, r.oaepHash || "", label));
+    try {
+      return Buffer.from(AN.privateDecrypt(keyData(r), r.passphrase, toBuf(buffer, r.encoding),
+        r.padding != null ? r.padding : RSA_PKCS1_OAEP_PADDING, r.oaepHash || "", label));
+    } catch (e) { throw keyErr(e); }
   };
   // privateEncrypt/publicDecrypt (RSA raw sign / verify_recover paths).
   C.privateEncrypt = (key, buffer) => {
     const r = resolveKey(key);
-    return Buffer.from(AN.privateEncrypt(keyData(r), r.passphrase, toBuf(buffer, r.encoding),
-      r.padding != null ? r.padding : RSA_PKCS1_PADDING));
+    try {
+      return Buffer.from(AN.privateEncrypt(keyData(r), r.passphrase, toBuf(buffer, r.encoding),
+        r.padding != null ? r.padding : RSA_PKCS1_PADDING));
+    } catch (e) { throw keyErr(e); }
   };
   C.publicDecrypt = (key, buffer) => {
     const r = resolveKey(key);
-    return Buffer.from(AN.publicDecrypt(keyData(r), r.passphrase, toBuf(buffer, r.encoding),
-      r.padding != null ? r.padding : RSA_PKCS1_PADDING));
+    try {
+      return Buffer.from(AN.publicDecrypt(keyData(r), r.passphrase, toBuf(buffer, r.encoding),
+        r.padding != null ? r.padding : RSA_PKCS1_PADDING));
+    } catch (e) { throw keyErr(e); }
   };
 
   // node lib/internal/crypto/keys.js: dsaEncoding must be "der" or "ieee-p1363".
@@ -183,10 +204,12 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   const doSign = (algo, data, key) => {
     const r = resolveKey(key);
     validateDsaEncoding(r);
-    return Buffer.from(AN.sign(digestName(algo), toBuf(data), keyData(r), r.passphrase,
-      r.padding != null ? r.padding : RSA_PKCS1_PADDING,
-      r.saltLength != null ? r.saltLength : RSA_PSS_SALTLEN_MAX_SIGN,
-      r.dsaEncoding || ""));
+    try {
+      return Buffer.from(AN.sign(digestName(algo), toBuf(data), keyData(r), r.passphrase,
+        r.padding != null ? r.padding : RSA_PKCS1_PADDING,
+        r.saltLength != null ? r.saltLength : RSA_PSS_SALTLEN_MAX_SIGN,
+        r.dsaEncoding || ""));
+    } catch (e) { throw keyErr(e); }
   };
   const doVerify = (algo, data, key, sig) => {
     // Snapshot the data and signature bytes at call time (node reads them before
@@ -196,10 +219,12 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     const sigBuf = Buffer.from(toBuf(sig));
     const r = resolveKey(key);
     validateDsaEncoding(r);
-    return AN.verify(digestName(algo), dataBuf, keyData(r), r.passphrase, sigBuf,
-      r.padding != null ? r.padding : RSA_PKCS1_PADDING,
-      r.saltLength != null ? r.saltLength : RSA_PSS_SALTLEN_MAX_SIGN,
-      r.dsaEncoding || "");
+    try {
+      return AN.verify(digestName(algo), dataBuf, keyData(r), r.passphrase, sigBuf,
+        r.padding != null ? r.padding : RSA_PKCS1_PADDING,
+        r.saltLength != null ? r.saltLength : RSA_PSS_SALTLEN_MAX_SIGN,
+        r.dsaEncoding || "");
+    } catch (e) { throw keyErr(e); }
   };
   C.sign = (algorithm, data, key, callback) => {
     if (typeof callback === "function") {
@@ -306,7 +331,7 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   class KeyObject {
     constructor(brand, kind, material, passphrase) {
       if (brand !== kKObrand) throw new TypeError("Illegal constructor");
-      this._kind = kind; this._km = material; this._pass = passphrase || "";
+      this._kind = kind; this._km = material; this._pass = passphrase == null ? undefined : passphrase;
     }
     get type() { return this._kind; }
     get [Symbol.toStringTag]() { return "KeyObject"; }
@@ -321,6 +346,7 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
         const d = {};
         if (t.modulusLength != null) d.modulusLength = t.modulusLength;
         if (t.publicExponent != null) d.publicExponent = BigInt("0x" + Buffer.from(t.publicExponent).toString("hex"));
+        if (t.divisorLength != null) d.divisorLength = t.divisorLength;
         if (t.namedCurve != null) d.namedCurve = t.namedCurve;
         return d;
       } catch { return {}; }
@@ -421,10 +447,14 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   // starts with a SEQUENCE tag (0x30) is a decode failure; anything else has no
   // PEM start line.
   const asymParseError = (ko, nativeErr) => {
+    // A failure the native layer already classified (missing passphrase / an
+    // OpenSSL error) keeps that classification whatever the container looked like.
+    const classified = keyErr(nativeErr);
+    if (classified !== nativeErr) return classified;
     const isStr = typeof ko._km === "string";
     const bytes = toBuf(ko._km);
     const head = isStr ? ko._km.slice(0, 64) : Buffer.from(bytes.slice(0, 64)).toString("latin1");
-    if (head.includes("-----BEGIN")) return nativeErr; // surface native parse/passphrase error
+    if (head.includes("-----BEGIN")) return keyErr(nativeErr); // surface native parse/passphrase error
     if (!isStr && bytes.length > 0 && bytes[0] === 0x30) {
       const e = new Error("error:06000066:public key routines:OPENSSL_internal:DECODE_ERROR");
       e.code = "ERR_OSSL_UNSUPPORTED"; return e;
@@ -582,11 +612,14 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     const privType = privJwk ? "pkcs8" : (senc.type || "pkcs8");
     const privFmt = (wantPrivObj || privJwk) ? "der" : (senc.format || "pem");
     const cipher = privJwk ? "" : (senc.cipher || "");
-    const pass = privJwk || senc.passphrase == null ? ""
+    const pass = privJwk || senc.passphrase == null ? undefined
       : (typeof senc.passphrase === "string" ? senc.passphrase : toBuf(senc.passphrase).toString("latin1"));
-    const modLen = options.modulusLength || 2048;
+    // 'dh' sizes its prime with primeLength; every other family uses modulusLength.
+    // 'dsa' additionally picks the divisor (q) size with divisorLength.
+    const modLen = (type === "dh" ? options.primeLength : options.modulusLength) || 2048;
     const curve = options.namedCurve || "";
-    const res = AN.generateKeyPair(type, modLen, curve, pubType, pubFmt, privType, privFmt, cipher, pass);
+    const divLen = options.divisorLength || 0;
+    const res = AN.generateKeyPair(type, modLen, curve, pubType, pubFmt, privType, privFmt, cipher, pass, divLen);
     let publicKey = res.publicKey, privateKey = res.privateKey;
     if (wantPubObj) publicKey = mkKO("public", publicKey, "");
     else if (pubJwk) publicKey = jwkFromKey(publicKey, "", true);
@@ -654,6 +687,11 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   // Decipheriv` holds. All construction-time validation matches node cipher.js.
   // Decorate a native OpenSSL error ("error:CODE:library:function:reason") with
   // node's error surface: .code (ERR_OSSL_<REASON>), .reason, .library, .function.
+  // Libraries whose short name node folds into the code. Verified against node
+  // v24: "common libcrypto routines" + "interrupted or cancelled" yields
+  // ERR_OSSL_CRYPTO_INTERRUPTED_OR_CANCELLED, while "Provider routines" +
+  // "bad decrypt" yields a bare ERR_OSSL_BAD_DECRYPT.
+  const OSSL_LIB_CODE_PREFIX = { "common libcrypto routines": "CRYPTO_" };
   const decorateOsslError = (e) => {
     const m = e && typeof e.message === "string" ? e.message : "";
     const parts = m.split(":");
@@ -662,7 +700,8 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
       e.reason = reason;
       e.library = parts[2];
       e.function = parts[3];
-      e.code = "ERR_OSSL_" + reason.toUpperCase().replace(/[^A-Z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+      e.code = "ERR_OSSL_" + (OSSL_LIB_CODE_PREFIX[parts[2]] || "") +
+        reason.toUpperCase().replace(/[^A-Z0-9]+/g, "_").replace(/^_+|_+$/g, "");
     }
     return e;
   };
@@ -711,14 +750,20 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
         (typeof options.authTagLength !== "number" || !Number.isInteger(options.authTagLength) || options.authTagLength < 0)) {
       throw new TypeError("The property 'options.authTagLength' is invalid. Received " + String(options.authTagLength));
     }
-    // Poly1305 produces exactly 16 bytes and node refuses any other length for it
-    // (crypto_cipher.cc InitAuthenticated: the ChaCha20-Poly1305 arm pins
-    // auth_tag_len to 16). Accepting e.g. 4 would let a peer authenticate with a
-    // truncated tag — a 2^32 forgery instead of 2^128.
-    if (info.aead === true && mode === "stream" && options.authTagLength !== undefined &&
-        options.authTagLength !== 16) {
-      const e = new Error("Invalid authentication tag length: " + options.authTagLength);
-      e.code = "ERR_CRYPTO_INVALID_AUTH_TAG"; throw e;
+    // Each AEAD mode admits its own set of tag lengths (node crypto_cipher.cc
+    // InitAuthenticated). This is a security check, not a formality: a tag of n
+    // bytes caps forgery resistance at 2^(8n), so Poly1305 is pinned to its full
+    // 16 and GCM/CCM/OCB only get the lengths their specs define.
+    if (info.aead === true && options.authTagLength !== undefined) {
+      const n = options.authTagLength;
+      const ok = mode === "gcm" ? (n === 4 || n === 8 || (n >= 12 && n <= 16))
+        : mode === "ccm" ? (n === 4 || n === 6 || n === 8 || n === 10 || n === 12 || n === 14 || n === 16)
+        : mode === "ocb" ? (n >= 1 && n <= 16)
+        : n === 16;  // ChaCha20-Poly1305 (EVP mode "stream")
+      if (!ok) {
+        const e = new TypeError("Invalid authentication tag length: " + n);
+        e.code = "ERR_CRYPTO_INVALID_AUTH_TAG"; throw e;
+      }
     }
     self._algo = algorithm.toLowerCase();
     self._enc = isEncrypt;
@@ -760,7 +805,16 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     Object.setPrototypeOf(Decipheriv, Transform);
   }
   const cipherProto = {
-    setAAD(buffer) { this._aad = toBuf(buffer); return this; },
+    // node CipherBase::SetAAD: AAD is only accepted by an authenticated mode, and
+    // only before any data has been fed in (and never after final()). Anything
+    // else is ERR_CRYPTO_INVALID_STATE — a plain aes-128-cbc never takes AAD.
+    setAAD(buffer) {
+      if (!this._auth || this._done || this._chunks.length > 0) {
+        const e = new Error("Invalid state for operation setAAD");
+        e.code = "ERR_CRYPTO_INVALID_STATE"; throw e;
+      }
+      this._aad = toBuf(buffer); return this;
+    },
     setAutoPadding(ap) { this._noPad = arguments.length > 0 && !ap; return this; },
     getAuthTag() { if (!this._auth || !this._enc || this._tag == null) throw new Error("Unsupported state or unable to authenticate data"); return this._tag; },
     setAuthTag(tag) {
@@ -769,7 +823,7 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
       // with one it must match exactly. node ERR_CRYPTO_INVALID_AUTH_TAG.
       if (this._auth) {
         const ok = this._tagLenSet ? (t.length === this._tagLen) : (t.length === 16);
-        if (!ok) { const e = new Error("Invalid authentication tag length: " + t.length); e.code = "ERR_CRYPTO_INVALID_AUTH_TAG"; throw e; }
+        if (!ok) { const e = new TypeError("Invalid authentication tag length: " + t.length); e.code = "ERR_CRYPTO_INVALID_AUTH_TAG"; throw e; }
       }
       this._tag = t; return this;
     },
@@ -798,9 +852,14 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     },
     final(outputEnc) {
       if (this._done) throw new Error("Trying to add data in an unsupported state");
-      noteOutEnc(this, outputEnc);
       this._done = true;
       const out = this._run();
+      // The output encoding is validated only AFTER the cipher is finalized, as
+      // node does (lib/internal/crypto/cipher.js runs kHandle.final() before
+      // getDecoder). A GCM/OCB/ChaCha20-Poly1305 authentication failure must
+      // surface as the auth error even when final()'s encoding differs from the
+      // one update() used.
+      noteOutEnc(this, outputEnc);
       return (outputEnc && outputEnc !== "buffer") ? out.toString(outputEnc) : out;
     },
     _transform(chunk, e, cb) { this._chunks.push(toBuf(chunk)); cb(); },
