@@ -21,15 +21,11 @@ ending. This file is what makes that recoverable.
 
 ## FIRST TASK ON RESUME — four items, in this order
 
--1. **bun green 868 -> 612 (-256), diagnosed, one-place fix.** The bun test
-   runner's settle check is blind to the new nextTick queue:
-   `test_runner.cppm:1258` and `:1358` await eight promise ticks and then declare
-   the test finished if `__mbunTimers.q.length === 0`. This round moved
-   `process.nextTick` out of `queueMicrotask` into its own queue drained at
-   callback boundaries, so awaiting promise ticks no longer advances it and work
-   parked there is invisible. 108 of 120 sampled lost files report exactly
-   `test timed out (no pending timers / unresolved async)` — that check's own
-   message. Worth more than every other pending item combined.
+-1. ~~bun -256~~ **FIXED and re-measured: green back to 865** (868 before the
+   round, 3 of the difference now counted as ahead-of-reference). Cause was one
+   missing `writers: []` on the two `Bun.spawn` child records; every `Bun.spawn`
+   threw. Two earlier diagnoses of mine were wrong and are recorded in the commit
+   — both named real defects, neither was the cause.
 
 0. **A 17x setImmediate performance regression, measured.** A 10 000-link
    setImmediate chain: **12ms before this round, 209ms after; real node does it

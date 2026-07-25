@@ -5,19 +5,20 @@
   {
    "corpus": "compat/bun/test",
    "runner": "tools/integration/bun_corpus_runner.py --cwd compat/bun --discover compat/bun/test --sample-per-group 100000 --jobs 5 --timeout 30 --resume",
-   "binary": "r9/integration @ 9d70bbf (round 12) — REGRESSED, see below",
+   "binary": "r9/integration @ e33e568 (round 12, after the Bun.spawn fix)",
    "files": 1902,
    "categories": {
-    "ahead-of-reference": 1,
+    "ahead-of-reference": 3,
     "all-skipped": 73,
-    "blocked-external": 19,
+    "blocked-external": 11,
     "crash": 1,
-    "green": 612,
-    "load-error": 4,
-    "no-tests": 7,
+    "fixture-build-error": 5,
+    "green": 865,
+    "load-error": 5,
+    "no-tests": 6,
     "oom-kill": 4,
-    "test-failure": 1113,
-    "timeout": 68
+    "test-failure": 885,
+    "timeout": 44
    },
    "test_level": {
     "ran": 51494,
@@ -38,13 +39,7 @@
     "how_much_is_a_measurement_artefact": "Little of it. Sampling 10 of the 43: one (assert/deep-equal.test.ts) has 22 of 22 failures be 'expected to fail but passed' and is genuinely ahead-of-reference; the other 9 are real failures of 1-2 assertions each. So node-side progress across rounds 6-10 did cost bun files, and this is a trade to be decided rather than absorbed.",
     "crash_bucket": "13 -> 0, which is real progress and unrelated to the green loss"
    },
-   "REGRESSION_DIAGNOSED": {
-    "green": "868 -> 612 (-256): 260 files lost green, 4 gained",
-    "cause": "The bun test runner's own settle check is blind to the new nextTick queue. test_runner.cppm:1258 and :1358 do `for (i<8) await Promise.resolve()` and then decide the test is finished if `__mbunTimers.q.length === 0`. This round split process.nextTick out of queueMicrotask into its own queue drained at callback boundaries, so awaiting promise ticks no longer advances it and the runner cannot see work parked there.",
-    "evidence": "108 of 120 sampled lost files report exactly `test timed out (no pending timers / unresolved async)` — the message emitted by that check",
-    "scope": "regression/issue 84, js/bun 67, js/node 33, js/web 23, cli/run 12",
-    "status": "NOT FIXED — top task on resume. Worth ~256 files, more than anything else pending."
-   }
+   "round12_note": "green 868 -> 612 -> 865. The -256 was ONE missing field: the child-process round added a `writers` array to the child record and a shared drain loop over it, but only the node:child_process record got the field -- the two Bun.spawn records did not, so every Bun.spawn threw. bunExe()-spawning is the standard pattern in bun's corpus, which is why the damage was spread across regression/issue, js/bun, js/node, js/web and cli/run rather than concentrated. Recovered to 865 (+3 now counted as ahead-of-reference rather than green, so effectively flat against 868)."
   },
   {
    "corpus": "compat/node/test/parallel",
