@@ -28,18 +28,18 @@
     {
       "corpus": "compat/node/test/parallel",
       "runner": "tools/integration/node_corpus_runner.py --jobs 8 --timeout 15",
-      "binary": "r9/integration (round 9 + r10 repl/http2/tls/http)",
+      "binary": "r9/integration (round 9 + r10 repl/http2/tls/http/primordials/cluster)",
       "files": 4433,
       "categories": {
-        "fail": 1873,
+        "fail": 1747,
         "oom-kill": 3,
-        "pass": 1882,
-        "skipped": 542,
-        "timeout": 133
+        "pass": 2007,
+        "skipped": 545,
+        "timeout": 131
       },
       "rates": {
-        "strict_pass": 0.425,
-        "excluding_self_skips": 0.484
+        "strict_pass": 0.453,
+        "excluding_self_skips": 0.516
       },
       "baseline_for_comparison": {
         "binary": "round-8 HEAD (23217dd), measured with the SAME corrected runner",
