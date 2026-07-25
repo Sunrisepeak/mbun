@@ -1401,6 +1401,15 @@ export constexpr std::string_view kNetJS = R"JS(
   // bytes that contradict the framing → InvalidHTTPResponse; connection closed
   // while the framing still expects bytes → ECONNRESET (bun's fetch codes).
   const CRLF2 = [13, 10, 13, 10];
+  // llhttp's METHOD_MAP (== http.METHODS): a server rejects anything else with
+  // HPE_INVALID_METHOD, and it does so as soon as the token stops matching.
+  const HTTP_METHODS = [
+    "ACL", "BIND", "CHECKOUT", "CONNECT", "COPY", "DELETE", "GET", "HEAD",
+    "LINK", "LOCK", "M-SEARCH", "MERGE", "MKACTIVITY", "MKCALENDAR", "MKCOL",
+    "MOVE", "NOTIFY", "OPTIONS", "PATCH", "POST", "PROPFIND", "PROPPATCH",
+    "PURGE", "PUT", "QUERY", "REBIND", "REPORT", "SEARCH", "SOURCE",
+    "SUBSCRIBE", "TRACE", "UNBIND", "UNLINK", "UNLOCK", "UNSUBSCRIBE",
+  ];
   function findSeq(buf, off, seq) {
     const n = buf.length - seq.length;
     outer: for (let i = off; i <= n; i++) {
@@ -1446,6 +1455,28 @@ export constexpr std::string_view kNetJS = R"JS(
     }
     eof() { if (this.done || this.state === "error") return 0; return this._process(true); }
     _err(msg, code) { this.state = "error"; if (this.onError) this.onError(mkErr(msg, code)); }
+    // Is the request-line method already known to be bad? llhttp matches the
+    // method against its METHOD_MAP one byte at a time, so an unknown token
+    // fails at the first character that cannot continue any known method — it
+    // never waits for the rest of the head (http.METHODS is exactly this list).
+    // Returns false while the bytes so far are still a viable prefix.
+    _badMethod() {
+      let i = this.off;
+      const b = this.buf;
+      // llhttp tolerates blank lines before a request line (lenient CRLF skip).
+      while (i < b.length && (b[i] === 13 || b[i] === 10)) i++;
+      let end = i;
+      while (end < b.length && b[end] !== 32) end++;
+      if (end - i > 24) return true;  // longest known method is 12 bytes
+      if (end === i && end === b.length) return false;  // nothing to judge yet
+      const tok = latin1(b, i, end);
+      const exact = end < b.length;  // the space arrived: the token is complete
+      const M = HTTP_METHODS;
+      for (let k = 0; k < M.length; k++) {
+        if (exact ? M[k] === tok : M[k].lastIndexOf(tok, 0) === 0) return false;
+      }
+      return true;
+    }
     _finish() { this.done = true; if (this.onDone) this.onDone(); }
     _emitBody(b) { if (b.length && this.onBody) this.onBody(b); }
     _process(eofSeen) {
@@ -1454,15 +1485,30 @@ export constexpr std::string_view kNetJS = R"JS(
         const avail = this.buf.length - this.off;
         if (this.state === "head") {
           const at = findSeq(this.buf, this.off, CRLF2);
+          const hardLimit = this.maxHeaderSize > 0 ? this.maxHeaderSize
+            : (G.__mbunHttpNative && G.__mbunHttpNative.getMaxHeaderSize ? G.__mbunHttpNative.getMaxHeaderSize() | 0 : 0);
           if (at < 0) {
+            // llhttp validates the head BYTE BY BYTE, so both checks below fire
+            // long before "\r\n\r\n" arrives. Deferring them until the head is
+            // terminated meant a peer that never terminates it — a header flood,
+            // or garbage pipelined behind a request ("hello world") — parked the
+            // connection forever with nothing destroyed and no clientError, which
+            // is what these files were timing out on rather than failing.
+            if (hardLimit > 0 && avail > hardLimit) {
+              this.off = this.buf.length;
+              this._err("Parse Error: Header overflow", "HPE_HEADER_OVERFLOW");
+              return events + 1;
+            }
+            if (!this.isResponse && this._badMethod()) {
+              this._err("Parse Error: Invalid method encountered", "HPE_INVALID_METHOD");
+              return events + 1;
+            }
             if (!eofSeen) return events;
             if (avail === 0 && !this.isResponse) { this.done = true; return events; }  // idle conn closed
             this._err("The socket connection was closed unexpectedly", "ECONNRESET");
             return events + 1;
           }
           const headLen = at + 4 - this.off;
-          const hardLimit = this.maxHeaderSize > 0 ? this.maxHeaderSize
-            : (G.__mbunHttpNative && G.__mbunHttpNative.getMaxHeaderSize ? G.__mbunHttpNative.getMaxHeaderSize() | 0 : 0);
           if (hardLimit > 0 && headLen > hardLimit) {
             this.off = at + 4;
             this._err("Parse Error: Header overflow", "HPE_HEADER_OVERFLOW");
@@ -2999,6 +3045,41 @@ export constexpr std::string_view kNetJS = R"JS(
         if (eofSeen && sock._httpParser === p && !p.done) p.eof();
       };
 
+      // node keeps ONE llhttp parser per connection, so bytes that arrive past a
+      // completed message are parsed IMMEDIATELY (parser.execute() consumes the
+      // whole chunk): a pipelined next request is dispatched at once and queued
+      // through `outgoing`, and a malformed tail becomes a parse error -> the
+      // server's canned 400 -> socket destroyed. This translation used to re-arm
+      // the parser only from resOnFinish, so a handler that never ends its
+      // response left the peer's remaining bytes unparsed forever and the
+      // connection hung with nothing destroyed (test-http-blank-header et al.).
+      // Iterative, not recursive: a deep pipeline would otherwise nest one
+      // pumpCarry frame per message and overflow the stack. The queue depth cap
+      // keeps a flood from materialising unbounded res objects — beyond it the
+      // bytes stay in `carry` and resOnFinish drains them, the old behaviour.
+      const MAX_PIPELINE_AHEAD = 128;
+      let rearming = false;
+      const carryBytes = () => { let n = 0; for (let i = 0; i < carry.length; i++) n += carry[i].length; return n; };
+      const rearm = () => {
+        if (rearming) return;  // the running loop below observes the new carry
+        rearming = true;
+        try {
+          for (;;) {
+            if (sock.destroyed || sock._httpUpgraded) break;
+            if (!sock._httpParser) {
+              if (carryBytes() === 0 || outgoing.length >= MAX_PIPELINE_AHEAD) break;
+              startParser();
+            }
+            const before = carryBytes();
+            pumpCarry();
+            const after = carryBytes();
+            if (after === 0) break;
+            // No progress with a parser still hungry for bytes: wait for more.
+            if (after >= before && sock._httpParser && !sock._httpParser.done) break;
+          }
+        } finally { rearming = false; }
+      };
+
       const startParser = () => {
         const parser = new HttpParser(false);
         if (typeof srv.maxHeadersCount === "number" && srv.maxHeadersCount > 0) {
@@ -3064,8 +3145,8 @@ export constexpr std::string_view kNetJS = R"JS(
             if (srv.keepAliveTimeout > 0 && typeof sock.setTimeout === "function") {
               try { sock.setTimeout(srv.keepAliveTimeout + srv.keepAliveTimeoutBuffer); } catch (e) {}
             }
-            if (parser.done) { startParser(); pumpCarry(); }
-            else parser._afterDone = () => { startParser(); pumpCarry(); };
+            if (parser.done) rearm();
+            else parser._afterDone = rearm;
           }
         };
 
@@ -3100,6 +3181,10 @@ export constexpr std::string_view kNetJS = R"JS(
             im.upgrade = true;
             const head = G.Buffer ? G.Buffer.from(parser.leftover()) : parser.leftover();
             sock._httpParser = null;
+            // The raw socket now belongs to the upgrade/CONNECT listener: no
+            // further byte on it is HTTP, so nothing may re-arm a parser for it
+            // (doing so re-parsed tunnel traffic as a new request).
+            sock._httpUpgraded = true;
             const ev = isConnect ? "connect" : "upgrade";
             if (srv.listenerCount(ev) > 0) srv.emit(ev, im, sock, head);
             else sock.destroy();
@@ -3189,6 +3274,10 @@ export constexpr std::string_view kNetJS = R"JS(
           // EOF: bun internal/http.ts:187 `self.push(null); self.complete = true`.
           if (im) { im.complete = true; im.push(null); }
           if (parser._afterDone) { const f = parser._afterDone; parser._afterDone = null; f(); }
+          // Parse whatever the peer already sent past this message now (node's
+          // single-parser semantics), instead of waiting for this response to
+          // finish. No-op when the tail is empty or the pipeline is capped.
+          rearm();
         };
         parser.onError = (e) => {
           const err = e || mkErr("Parse Error", "HPE_INVALID_CONSTANT");
@@ -3215,7 +3304,11 @@ export constexpr std::string_view kNetJS = R"JS(
         const b = u8(chunk);
         const p = sock._httpParser;
         if (p && !p.done) p.push(b);
-        else carry.push(b.slice());
+        // A message that ended exactly on a chunk boundary leaves no parser
+        // armed; node would still parse the next chunk on arrival, so arm one
+        // and consume it rather than parking the bytes until resOnFinish.
+        else if (sock._httpUpgraded) { /* tunnel bytes: not ours */ }
+        else { carry.push(b.slice()); if (!p) rearm(); }
       });
       sock.on("end", () => { eofSeen = true; const p = sock._httpParser; if (p && !p.done) p.eof(); });
       startParser();
