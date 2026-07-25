@@ -2280,6 +2280,16 @@ int run_embedded_program(const mbun::bundler::standalone_exe::Program& program,
 // only way the corpus can drive it (17 test-repl-* files spawn `mbun -i` /
 // `mbun --interactive` with piped stdio).
 int exec_interactive(std::span<const std::string_view> args) {
+    // node lib/internal/main/repl.js: `--input-type` selects a module kind for
+    // the entry point, and a REPL has none — node prints this on stderr and
+    // exits kInvalidCommandLineArgument (9). test-repl-unsupported-option
+    // asserts the message byte-for-byte and a non-zero status.
+    for (const std::string_view a : args) {
+        if (a == "--input-type" || a.starts_with("--input-type=")) {
+            std::println(std::cerr, "Cannot specify --input-type for REPL");
+            return 9;
+        }
+    }
     // `-i -e <code>` / `-i -p <code>`: the eval string rides along; anything
     // after it is user argv, exactly as in the plain eval path.
     std::string evalCode{};
