@@ -926,15 +926,29 @@ export constexpr std::string_view kHttp2JS = R"JS(
     if (stream._closed) return;
     stream._closed = true;
     stream.rstCode = code;
-    try { stream.session._rstStream(stream, code); } catch (e) {}
-    try { stream.session.streams.delete(stream.id); } catch (e) {}
-    // node: an rst with a non-zero code surfaces as an 'error' on the stream.
-    if (code !== constants.NGHTTP2_NO_ERROR) {
-      const err = streamErr(code);
-      G.queueMicrotask(() => { if (!stream.destroyed) stream.destroy(err); else stream.emit("error", err); });
-      return;
-    }
-    http2StreamFinish(stream);
+    const finish = () => {
+      try { stream.session._rstStream(stream, code); } catch (e) {}
+      try { stream.session.streams.delete(stream.id); } catch (e) {}
+      // node: an rst with a non-zero code surfaces as an 'error' on the stream.
+      if (code !== constants.NGHTTP2_NO_ERROR) {
+        const err = streamErr(code);
+        G.queueMicrotask(() => { if (!stream.destroyed) stream.destroy(err); else stream.emit("error", err); });
+        return;
+      }
+      http2StreamFinish(stream);
+    };
+    // node closeStream(): RST_STREAM waits for the writable side to finish, so
+    // DATA the application already handed to the stream is not thrown away.
+    // `stream.write(a); stream.write(b); stream.end(); stream.close();` must put
+    // both chunks on the wire — with the Duplex, b is still buffered when
+    // close() runs.
+    // Only when there is something to flush: a close() before any write at all
+    // (a server resetting a stream instead of responding) must reset *now*.
+    if (kHaveDuplex && !stream.destroyed && !stream.writableFinished &&
+        (stream.writableLength > 0 || stream.writableCorked > 0)) {
+      stream.once("finish", finish);
+      stream.end();
+    } else finish();
   }
   // node Http2Stream#_destroy: RST_STREAM the peer if the stream had not
   // finished, then let Duplex emit 'error'/'close' in the right order.
