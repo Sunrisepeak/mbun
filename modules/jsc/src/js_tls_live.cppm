@@ -566,7 +566,14 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
       if (!n) return {};
       return { name: n, standardName: this._cipherStandardName || n, version: this._protocol || "TLSv1.3" };
     }
-    getProtocol() { return this._secureEstablished ? (this._protocol || "TLSv1.3") : null; }
+    // node crypto_tls.cc TLSWrap::GetProtocol reads SSL_get_version off the
+    // handle, and internal/tls/wrap.js nulls the handle on close — so a closed
+    // socket answers null, not the protocol it used to speak. The corpus asserts
+    // exactly that inside its own 'close' listener (test-tls-getprotocol).
+    getProtocol() {
+      if (!this._secureEstablished || this.destroyed) return null;
+      return this._protocol || "TLSv1.3";
+    }
     getSession() { return undefined; }
     getEphemeralKeyInfo() { return null; }
     getSharedSigalgs() { return []; }
