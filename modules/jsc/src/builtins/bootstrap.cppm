@@ -4120,6 +4120,36 @@ inline constexpr char kBootstrapJS_[] = R"JS(
 
   // ---- fs (real, via __mbunFsNative) ----
   const F = globalThis.__mbunFsNative;
+  // node getPathFromURLPosix / getPathFromURLWin32 (lib/internal/url.js): a
+  // file: URL handed to an fs API is NOT merely percent-decoded. A non-empty
+  // host is ERR_INVALID_FILE_URL_HOST, and an encoded separator (%2f, plus %5c
+  // on Windows) is ERR_INVALID_FILE_URL_PATH — decoding those would silently
+  // change the path's structure. mbun decoded blindly, so
+  // `file:///c:/tmp/%2f` resolved to "/c:/tmp//" and surfaced as ENOENT.
+  // ref test-fs-whatwg-url.
+  const fsPathFromURL = (u) => {
+    if (!__isWin && u.hostname !== "" && u.hostname !== "localhost") {
+      const e = new TypeError('File URL host must be "localhost" or empty on ' +
+                              (G.process ? G.process.platform : "linux"));
+      e.code = "ERR_INVALID_FILE_URL_HOST"; e.input = u;
+      throw nodeErrToString(e, "ERR_INVALID_FILE_URL_HOST");
+    }
+    const pathname = u.pathname;
+    for (let n = 0; n < pathname.length; n++) {
+      if (pathname[n] === "%") {
+        const third = (pathname.codePointAt(n + 2) | 0) | 0x20;
+        if ((pathname[n + 1] === "2" && third === 102) ||
+            (__isWin && pathname[n + 1] === "5" && third === 99)) {
+          const e = new TypeError(__isWin
+            ? "File URL path must not include encoded \\ or / characters"
+            : "File URL path must not include encoded / characters");
+          e.code = "ERR_INVALID_FILE_URL_PATH"; e.input = u;
+          throw nodeErrToString(e, "ERR_INVALID_FILE_URL_PATH");
+        }
+      }
+    }
+    try { return decodeURIComponent(pathname); } catch (e) { return pathname; }
+  };
   const toStr = (x) => {
     if (typeof x === "string") return x;
     // node accepts file:// URL *instances* everywhere a path goes
@@ -4127,7 +4157,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     // pglite et al. pass `new URL("./x.data", import.meta.url)` into fs.
     if (x && typeof x === "object" && x.href !== undefined && x.protocol === "file:" &&
         typeof x.pathname === "string") {
-      try { return decodeURIComponent(x.pathname); } catch { return x.pathname; }
+      return fsPathFromURL(x);
     }
     // node's getValidatedPath accepts a Buffer *or any TypedArray* and decodes
     // it as UTF-8 (lib/internal/fs/utils.js). A TypedArray inherits
@@ -4212,7 +4242,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
         return;
       }
       if (p.href !== undefined && p.protocol === "file:" && typeof p.pathname === "string") { // URL
-        try { str = decodeURIComponent(p.pathname); } catch (e) { str = p.pathname; }
+        str = fsPathFromURL(p);
       } else if (p.href !== undefined && typeof p.protocol === "string" && typeof p.pathname === "string"
                  && typeof p.searchParams === "object") { // a URL of some other scheme
         throw fsUrlSchemeErr();
@@ -4536,6 +4566,44 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     e.name = "AbortError"; e.code = "ABORT_ERR";
     return e;
   };
+  // node validateAbortSignal(options.signal, 'options.signal') runs at the fs
+  // entry point, BEFORE the work is scheduled: anything that is neither
+  // undefined/null nor an AbortSignal is a synchronous ERR_INVALID_ARG_TYPE.
+  // Without it `readFile(p, { signal: 'hello' }, cb)` silently ignored the
+  // option (ref lib/fs.js readFile/writeFile, test-fs-readfile).
+  const fsValidateSignalOpt = (o) => {
+    const s = (o !== null && typeof o === "object") ? o.signal : undefined;
+    if (s === undefined || s === null) return undefined;
+    if (typeof s !== "object" || typeof s.aborted !== "boolean")
+      throw fsArgTypeErr("options.signal", "an instance of AbortSignal", s);
+    return s;
+  };
+  // node getOptions default `{ flush: false }` + validateBoolean(flush,
+  // 'options.flush'): writeFile/appendFile fsync(2) the descriptor before
+  // closing it when flush is true, and reject any non-boolean.
+  // ref lib/fs.js writeFileSync/writeFile, test-fs-write-file-flush.
+  const fsFlushOf = (o) => {
+    const f = (o !== null && typeof o === "object" && o.flush !== undefined && o.flush !== null)
+      ? o.flush : false;
+    if (typeof f !== "boolean") throw fsArgTypeErr("options.flush", "of type boolean", f);
+    return f;
+  };
+  // The asynchronous half of options.flush: node writes, then calls
+  // fs.fsync(fd, callback) on the SAME descriptor and only runs the user
+  // callback once the flush completes. Returns true when it has taken
+  // responsibility for invoking `cb`.
+  const fsWriteThenFlush = (writeSync, p, d, o, flush, cb) => {
+    if (!flush) { writeSync(p, d, o); return false; }
+    writeSync(p, d, o, (fd, owned) => {
+      // Dispatch through fsMod so `t.mock.method(fs, 'fsync')` observes it.
+      fsMod.fsync(fd, (e) => {
+        if (owned) { try { globalThis.__mbunFdNative.close(fd); } catch (e2) {} }
+        cb(e || null);
+      });
+      return owned;
+    });
+    return true;
+  };
   // node warnOnNonPortableTemplate (lib/internal/fs/utils.js): a mkdtemp
   // template ending in 'X' warns ONCE per process. A URL template never warns
   // (node only checks strings and typed arrays).
@@ -4630,28 +4698,53 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     // Byte-exact writes: binary data must NOT cross the C-API string boundary
     // (NUL / UTF-8 mangling turned every Buffer write into mojibake), so
     // everything goes through the fd path with the requested flag + mode.
-    writeFileSync: (p, d, o) => {
+    // `__onFd` is INTERNAL: it receives the descriptor this call wrote through,
+    // before it is closed, and returning true transfers ownership of the fd to
+    // the hook (which must then close it). fs.writeFile/appendFile use it to
+    // flush with the asynchronous fs.fsync(fd, cb) over the SAME descriptor
+    // node flushes, rather than reopening the file.
+    writeFileSync: (p, d, o, __onFd) => {
       const enc = typeof o === "string" ? o : ((o && typeof o === "object" && o.encoding) || "utf8");
       const flag = (o && typeof o === "object" && o.flag) || "w";
       const mode = (o && typeof o === "object" && o.mode != null)
         ? (typeof o.mode === "string" ? parseInt(o.mode, 8) : (Number(o.mode) & 0o7777))
         : null;
+      const flush = fsFlushOf(o);
+      // node validateStringAfterArrayBufferView(data, 'data'): anything that is
+      // neither a string nor an ArrayBufferView is ERR_INVALID_ARG_TYPE. Without
+      // it every value — a Symbol, a Promise, `new String(…)` — was stringified
+      // through toStr() and written (test-fs-write-file-sync).
+      fsValidateData(d);
       const FD = globalThis.__mbunFdNative;
       let u;
       if (ArrayBuffer.isView(d)) u = new Uint8Array(d.buffer, d.byteOffset, d.byteLength);
       else if (d instanceof ArrayBuffer) u = new Uint8Array(d);
       else { const b = Buffer.from(toStr(d), enc === "buffer" ? "utf8" : enc); u = new Uint8Array(b.buffer, b.byteOffset, b.byteLength); }
-      if (typeof p === "number") { if (u.byteLength) FD.write(p, u, 0, u.byteLength, -1); return; }
+      if (typeof p === "number") {
+        if (u.byteLength) FD.write(p, u, 0, u.byteLength, -1);
+        // A caller-supplied descriptor is never ours to close (second argument
+        // false), so the flush hook must not close it either.
+        if (__onFd !== undefined) __onFd(p, false);
+        else if (flush) fsMod.fsyncSync(p);
+        return;
+      }
       const path2 = toStr(p);
       const fd = FD.open(path2, flag, mode == null ? 0o666 : mode);
-      try { if (u.byteLength) FD.write(fd, u, 0, u.byteLength, -1); } finally { FD.close(fd); }
+      let keep = false;
+      try {
+        if (u.byteLength) FD.write(fd, u, 0, u.byteLength, -1);
+        // Dispatch through fsMod so `t.mock.method(fs, 'fsyncSync')` sees the
+        // call (node's writeFileSync flushes through the same public binding).
+        if (__onFd !== undefined) keep = __onFd(fd, true) === true;
+        else if (flush) fsMod.fsyncSync(fd);
+      } finally { if (!keep) FD.close(fd); }
       if (mode != null) { try { F.chmod(path2, mode); } catch (e) {} }
     },
-    appendFileSync: (p, d, o) => {
+    appendFileSync: (p, d, o, __onFd) => {
       fsValidateData(d); fsValidateEncoding(o);
       const opts = (o && typeof o === "object") ? Object.assign({}, o) : { encoding: o };
       if (opts.flag == null) opts.flag = "a";
-      return fsMod.writeFileSync(p, d, opts);
+      return fsMod.writeFileSync(p, d, opts, __onFd);
     },
     // node fs.existsSync never throws; an invalid argument type emits the
     // DEP0187 deprecation ONCE and returns false. ref lib/fs.js existsSync.
@@ -4832,20 +4925,31 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       fsMakeCallback(cb);
       if (typeof p !== "number") validatePath(p);
       fsValidateEncoding(o);
-      const sig = (o && typeof o === "object") ? o.signal : undefined;
-      G.queueMicrotask(() => {
+      const sig = fsValidateSignalOpt(o);
+      // A MACROtask, not a microtask: node reads through the thread pool, so the
+      // callback always lands in a later loop turn than any process.nextTick.
+      // Deferring by a microtask ran BEFORE a nextTick-scheduled abort() and so
+      // reported success where node reports AbortError
+      // (test-fs-readfile / test-fs-write-file "cancellation, during read").
+      G.setImmediate(() => {
         if (sig && sig.aborted) return cb(fsAbortError());
-        try { cb(null, fsMod.readFileSync(p, o)); } catch (e) { cb(e); }
+        let res, err = null;
+        try { res = fsMod.readFileSync(p, o); } catch (e) { err = e; }
+        if (err === null && sig && sig.aborted) err = fsAbortError();
+        if (err !== null) cb(err); else cb(null, res);
       });
     },
     writeFile: (p, d, a, b) => {
       const cb = typeof a === "function" ? a : b;
       const o = (a !== null && (typeof a === "object" || typeof a === "string")) ? a : undefined;
       fsMakeCallback(cb);
-      const sig = (o && typeof o === "object") ? o.signal : undefined;
-      G.queueMicrotask(() => {
+      const sig = fsValidateSignalOpt(o);
+      const flush = fsFlushOf(o);
+      G.setImmediate(() => {
         if (sig && sig.aborted) return cb(fsAbortError());
-        try { fsMod.writeFileSync(p, d, o); cb(null); } catch (e) { cb(e); }
+        let err = null, owns = false;
+        try { owns = fsWriteThenFlush(fsMod.writeFileSync, p, d, o, flush, cb); } catch (e) { err = e; }
+        if (err !== null) cb(err); else if (!owns) cb(null);
       });
     },
     mkdir: (p, a, b) => { validatePath(p); const cb = b || a; const [rec, mode] = mkdirOpts(typeof a === "object" || typeof a === "number" || typeof a === "string" ? a : null); try { const __r = F.mkdir(toStr(p), rec, mode); cb(null, __r); } catch (e) { e.path = toStr(p); cb(e); } },
@@ -4862,10 +4966,11 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       const o = (typeof a === "object" || typeof a === "string") ? a : undefined;
       fsValidateEncoding(o);
       const cb = typeof a === "function" ? a : b;
-      try {
-        fsMod.appendFileSync(p, d, o);
-        cb && cb(null);
-      } catch (e) { cb && cb(e); }
+      const flush = fsFlushOf(o);
+      const done = (e) => { if (cb) cb(e); };
+      let err = null, owns = false;
+      try { owns = fsWriteThenFlush(fsMod.appendFileSync, p, d, o, flush, done); } catch (e) { err = e; }
+      if (err !== null) done(err); else if (!owns) done(null);
     },
     rm: (p, a, b) => { const cb = typeof a === "function" ? a : b; const o = typeof a === "object" ? a : undefined; try { F.rm(toStr(p), recur(o), !!(o && o.force)); cb && cb(null); } catch (e) { cb && cb(e); } },
     rmdir: (p, a, b) => { const cb = typeof a === "function" ? a : b; try { F.rm(toStr(p), recur(typeof a === "object" ? a : null), true); cb && cb(null); } catch (e) { cb && cb(e); } },
@@ -5147,7 +5252,17 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     catch (e) { throw (e && e.code && FS_ERRNO[e.code]) ? fsErr(e.code, "copyfile", s, d) : e; }
   };
   fsMod.copyFileSync = (a, b, m) => { validatePath(a, "src"); validatePath(b, "dest"); return fsCopyFileImpl(a, b, m); };
-  fsMod.stat = (p, a, b) => { validatePath(p); const cb = fsMakeCallback(typeof a === "function" ? a : b); try { cb(null, fsMod.statSync(p, typeof a === "object" ? a : undefined)); } catch (e) { cb(e); } };
+  // node fs.stat(path[, options], callback) honours options.signal: an already
+  // aborted signal never reaches the syscall and the callback receives an
+  // AbortError (ref lib/fs.js stat, test-fs-stat-abort-test).
+  fsMod.stat = (p, a, b) => {
+    validatePath(p);
+    const cb = fsMakeCallback(typeof a === "function" ? a : b);
+    const o = (a !== null && typeof a === "object") ? a : undefined;
+    const sig = fsValidateSignalOpt(o);
+    if (sig && sig.aborted) { const ae = fsAbortError(); G.queueMicrotask(() => cb(ae)); return; }
+    try { cb(null, fsMod.statSync(p, o)); } catch (e) { cb(e); }
+  };
   fsMod.lstat = (p, a, b) => { validatePath(p); const cb = fsMakeCallback(typeof a === "function" ? a : b); try { cb(null, fsMod.lstatSync(p, typeof a === "object" ? a : undefined)); } catch (e) { cb(e); } };
   fsMod.fstatSync = (fd, o) => { fsValidateFd(fd); const s = fsStatOrNoEntry(() => F.fstat(fd), o); return s === undefined ? undefined : ((o && o.bigint) ? mkBigIntStats(s) : fsAsStats(s)); };
   fsMod.fstat = (fd, a, b) => { fsValidateFd(fd); const cb = fsMakeCallback(typeof a === "function" ? a : b); try { cb(null, fsMod.fstatSync(fd, typeof a === "object" ? a : undefined)); } catch (e) { cb(e); } };
@@ -5457,29 +5572,34 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   // explicit null/''/{}/[] is a validateInteger failure, and `len` is validated
   // before the callback so the ERR_INVALID_ARG_TYPE names "len", not "cb"
   // (ref lib/fs.js truncate/ftruncate, test-fs-truncate).
+  // node clamps the validated length with `len = MathMax(0, len)` — a negative
+  // `len` is coerced to 0 and truncates the file to empty, it is NOT an error.
+  // Passing -1 straight to (f)truncate(2) surfaced EINVAL, which the native
+  // errno map then reported as EACCES (test-fs-truncate).
+  const fsTruncLen = (len) => Math.max(0, len === undefined ? 0 : fsValidateInteger(len, "len"));
   fsMod.ftruncateSync = (fd, len) => {
     fsValidateFd(fd);
-    const l = len === undefined ? 0 : fsValidateInteger(len, "len");
+    const l = fsTruncLen(len);
     globalThis.__mbunFdNative.ftruncate(fd, l);
   };
   fsMod.ftruncate = (fd, len, cb) => {
     const fn = typeof len === "function" ? len : cb;
     fsValidateFd(fd);
-    const l = typeof len === "function" || len === undefined ? 0 : fsValidateInteger(len, "len");
+    const l = fsTruncLen(typeof len === "function" ? undefined : len);
     fsMakeCallback(fn);
     G.queueMicrotask(() => { try { globalThis.__mbunFdNative.ftruncate(fd, l); fn(null); } catch (e) { fn(e); } });
   };
   fsMod.truncateSync = (p, len) => {
     if (typeof p === "number") return fsMod.ftruncateSync(p, len);
     validatePath(p);
-    const l = len === undefined ? 0 : fsValidateInteger(len, "len");
+    const l = fsTruncLen(len);
     F.truncate(toStr(p), l);
   };
   fsMod.truncate = (p, len, cb) => {
     const fn = typeof len === "function" ? len : cb;
     if (typeof p === "number") return fsMod.ftruncate(p, len, cb);
     validatePath(p);
-    const l = typeof len === "function" || len === undefined ? 0 : fsValidateInteger(len, "len");
+    const l = fsTruncLen(typeof len === "function" ? undefined : len);
     fsMakeCallback(fn);
     G.queueMicrotask(() => { try { F.truncate(toStr(p), l); fn(null); } catch (e) { fn(e); } });
   };
@@ -5775,8 +5895,11 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   fsMod.lutimesSync = (p, atime, mtime) => {
     validatePath(p);
     const a = fsToUnixTimestamp(atime, "atime"), m = fsToUnixTimestamp(mtime, "mtime");
-    if (typeof F.lutimes === "function") F.lutimes(toStr(p), a, m);
-    else F.utimes(toStr(p), a, m);
+    // lutimes must stamp the SYMLINK, never its target: F.lutimes is
+    // utimensat(AT_SYMLINK_NOFOLLOW). Falling back to F.utimes followed the
+    // link, so a dangling symlink reported ENOENT and a live one moved the
+    // target's times (test-fs-utimes).
+    F.lutimes(toStr(p), a, m);
   };
   fsMod.lutimes = (p, atime, mtime, cb) => {
     validatePath(p);
@@ -6158,8 +6281,13 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     cp: P((src, dest, o) => { validatePath(src, "src"); validatePath(dest, "dest"); return cpRecAsync(toStr(src), toStr(dest), cpValidateOptions(o)); }),
     symlink: P((target, path2, type) => { validatePath(target, "target"); validatePath(path2, "path"); fsValidateSymlinkType(type); return F.symlink(toStr(target), toStr(path2)); }),
     readlink: P((p) => F.readlink(toStr(p))),
-    chmod: P((p, m) => F.chmod(toStr(p), typeof m === "string" ? parseInt(m, 8) : (Number(m) & 0o7777))), lchmod: P(() => {}), chown: P(() => {}), lchown: P(() => {}),
-    utimes: P((p, a, m) => { const s = (v) => v instanceof Date ? v.getTime() / 1000 : Number(v); F.utimes(toStr(p), s(a), s(m)); }), lutimes: P(() => {}),
+    chmod: P((p, m) => F.chmod(toStr(p), typeof m === "string" ? parseInt(m, 8) : (Number(m) & 0o7777))), lchmod: P(() => {}),
+    // The promise forms validate exactly like their callback twins: a bare
+    // `() => {}` resolved for every invalid path/uid/gid (test-fs-lchown).
+    chown: P((p, uid, gid) => fsMod.chownSync(p, uid, gid)),
+    lchown: P((p, uid, gid) => fsMod.lchownSync(p, uid, gid)),
+    utimes: P((p, a, m) => { const s = (v) => v instanceof Date ? v.getTime() / 1000 : Number(v); F.utimes(toStr(p), s(a), s(m)); }),
+    lutimes: P((p, a, m) => fsMod.lutimesSync(p, a, m)),
     glob: (pat, o) => { const arr = fsMod.globSync(pat, o); let i = 0; return { [Symbol.asyncIterator]() { return { next: () => Promise.resolve(i < arr.length ? { value: arr[i++], done: false } : { value: undefined, done: true }) }; } }; },
     opendir: (p, opts) => Promise.resolve().then(() => fsMod.opendirSync(p, opts)),
     // node fs.promises.mkdtempDisposable: an explicit-resource-management

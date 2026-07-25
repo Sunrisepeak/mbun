@@ -1643,6 +1643,9 @@ public:
         set_fn(ctx_, fsn, "umask", fsn_umask_cb);
         set_fn(ctx_, fsn, "unlink", fsn_unlink_cb);
         set_fn(ctx_, fsn, "utimes", fsn_utimes_cb);
+        // lutimes shares fsn_utimes_cb's body and therefore its Permission Model
+        // gate (write scope); it only differs by AT_SYMLINK_NOFOLLOW.
+        set_fn(ctx_, fsn, "lutimes", fsn_lutimes_cb);
         set_fn(ctx_, fsn, "chmod", fsn_chmod_cb);
         set_fn(ctx_, fsn, "realpath", fsn_realpath_cb);
         set_fn(ctx_, fsn, "realpathNative", fsn_realpath_native_cb);
