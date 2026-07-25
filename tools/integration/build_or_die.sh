@@ -23,6 +23,26 @@ cd "$root" || exit 1
 
 log() { printf '%s\n' "$*" >&2; }
 
+# --- toolchain check, BEFORE building ---------------------------------------
+# A wrong toolchain default does not fail in a way that points at itself. With
+# gcc 15 instead of 16 this project produces an internal compiler error in
+# modules/ffi/src/native.cppm on the first build, then "'byteswap' is not a
+# member of 'std'" across modules/crypto on every build after — which reads like
+# source rot or a corrupted module cache, not a version mismatch. It cost one
+# agent ~40 minutes and cost me a wrong published diagnosis (I blamed deleting
+# build.ninja; the deletion merely forced a reconfigure that picked up the wrong
+# default). Five seconds here instead.
+required=$(grep -rhoP 'xim:gcc@\K[0-9.]+' "$root/.mcpp" 2>/dev/null | sort -u | head -1)
+configured=$(grep -oP '^\s*default\s*=\s*"gcc@\K[0-9.]+' "$HOME/.mcpp/config.toml" 2>/dev/null | head -1)
+if [ -n "$required" ] && [ -n "$configured" ] && [ "$required" != "$configured" ]; then
+  log "build_or_die: TOOLCHAIN MISMATCH — this project needs gcc $required, but"
+  log "build_or_die: ~/.mcpp/config.toml defaults to gcc $configured."
+  log "build_or_die: Building anyway would fail as an ICE in modules/ffi plus"
+  log "build_or_die: \"'byteswap' is not a member of 'std'\" in modules/crypto,"
+  log "build_or_die: neither of which mentions the toolchain. Fix the default first."
+  exit 1
+fi
+
 build_output=$(bash "$root/tools/integration/build_lock.sh" mcpp build 2>&1)
 status=$?
 

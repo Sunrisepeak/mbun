@@ -145,7 +145,9 @@
    ],
    "cause": "mbun throws its own explicit error: 'tls.connect (Duplex socket transport) requires the socket event loop + real SSL_CTX handshake (DEFERRED)'. tls.connect over a caller-supplied Duplex/`socket:` option is simply not implemented.",
    "confidence": "CAUSE named -- mbun says so itself",
-   "action": "architectural; a known-unimplemented path, not a bug hunt"
+   "action": "architectural; a known-unimplemented path, not a bug hunt",
+   "file_count": 7,
+   "CORRECTION": "test-tls-socket-snicallback-without-server belongs here, not in tls-mustcall-never-fired -- it drives a TLSSocket over stream.duplexPair(). 7 files, not 6."
   },
   "tls-protocol-method-validation": {
    "corpus": "node",
@@ -160,7 +162,9 @@
    ],
    "cause": "SSLv2_method/SSLv3_method and friends must be rejected with ERR_TLS_INVALID_PROTOCOL_METHOD.",
    "confidence": "CAUSE named",
-   "action": "pure validation; cheap"
+   "action": "pure validation; cheap",
+   "STATUS": "RESOLVED by w4/agent-tls (6 of 6)",
+   "CORRECTION": "My named cause was stale. SSLv2_method/SSLv3_method -> ERR_TLS_INVALID_PROTOCOL_METHOD ALREADY WORKED; those subcases were passing in the logs. The real blockers were (a) secureProtocol version-window semantics -- node does not pass min=max=0 to SecureContext::Init; common.js always passes toV(minVersion, DEFAULT_MIN) and crypto_context.cc adjusts per method, so SSLv23_method lowers only the CEILING to TLS 1.2 and keeps the default floor -- and (b) --tls-min-v1.x is NOT last-flag-wins: lib/tls.js is a fixed if/else chain, so the WIDEST flag wins wherever it sits. I had briefed last-flag-wins explicitly and that was wrong. Also the cluster is 6-for-1: five of the six are 4-line wrappers that require('./test-tls-min-max-version.js'). Size right, cause wrong."
   },
   "tls-mustcall-never-fired": {
    "corpus": "node",
@@ -304,7 +308,9 @@
     "converted": [
      "test-https-simple",
      "test-tls-friendly-error-message",
-     "test-https-agent-create-connection (not predicted)"
+     "test-https-agent-create-connection (not predicted)",
+     "test-tls-set-default-ca-certificates-append-https-request (w4)",
+     "test-tls-set-default-ca-certificates-reset-https-request (w4)"
     ],
     "still_failing_with_reasons": {
      "test-tls-client-auth": "DISCRIMINATING test: line 188 expects code 21 AND line 223 expects code 20 in different subcases. The 21-expecting subcase still reports 20 -- neither the client stack path nor the server SSL_get1_peer_certificate path yields a leaf there. Needs the always-continue-verification approach, which was deliberately NOT taken (see below).",
@@ -439,6 +445,36 @@
    },
    "confidence": "CAUSE named per file",
    "action": "batch; each is 1 file"
+  },
+  "tls-session-and-ticket-support-ABSENT": {
+   "corpus": "node",
+   "subsystem": "tls + https",
+   "file_count": 8,
+   "files": [
+    "test-tls-ticket",
+    "test-tls-ticket-12",
+    "test-tls-ticket-cluster",
+    "test-tls-client-resume",
+    "test-tls-client-resume-12",
+    "test-https-client-resume",
+    "test-tls-secure-session",
+    "test-https-agent-session-injection"
+   ],
+   "also_the_last_blocker_in": [
+    "test-tls-client-reject",
+    "test-tls-client-reject-12"
+   ],
+   "cause": "TLS session resumption is entirely absent, not partially wrong. js_tls_live.cppm:533 `getSession() { return undefined; }`, :562 `setSession() { return this; }`, and js_https_live.cppm:24 states outright that the reactor never emits 'session'. One mechanism covers all of it: SSL_CTX_sess_set_new_cb + session serialisation + the 'session' event + the `session:` connect option.",
+   "confidence": "CAUSE named",
+   "provenance": "Found by w4/agent-tls, which called it the densest lead it saw. The inventory did NOT have this cluster at all -- its 8 files sat split across three other buckets, so every previous brief under-budgeted all three. A cause that spans buckets is invisible to per-bucket ranking.",
+   "action": "brief as its own agent"
+  },
+  "ipv6-listen-not-implemented-NET-LAYER": {
+   "corpus": "node",
+   "subsystem": "net (blocks tls/https/http)",
+   "cause": "net_parse_addr (modules/jsc/src/runtime/net.inc:45) only ever builds a sockaddr_in and MAPS '::' and '::1' onto IPv4 ANY/loopback, so listen(0, '::1') silently binds IPv4. Blocks test-tls-connect-address-family and test-https-connect-address-family, and almost certainly several test-net-* files.",
+   "confidence": "CAUSE named",
+   "action": "NOT a TLS bug -- do not budget it to a tls agent. Needs a net-layer round that measures its own reach first."
   }
  },
  "coverage_note": "tls timeouts are now triaged: 19 files -> 3 shapes (B:12, A:5, D:2), collapsed by running tools/integration/hang_dump.js over every one. This is the same collapse the http block underwent, and it reproduces the same headline: none of the 19 is an event-loop bug. Cost ~5 minutes total, which is the argument for triaging centrally rather than making each agent pay for it."

@@ -629,3 +629,36 @@ So a dump signature groups files by *what the loop looks like when they stop*,
 which is downstream of the cause — the same trap as grouping by log text, in a
 more convincing disguise. Budget a signature at its cause count, and if you do not
 yet know that count, say the signature is unsplit rather than quoting its size.
+
+
+### A wrong toolchain default does not fail in a way that points at itself
+
+**Correction to a diagnosis I published.** After deleting `build.ninja` to force a
+reconfigure, one worktree could no longer build: an internal compiler error in
+`modules/ffi/src/native.cppm` on the first attempt, then `'byteswap' is not a
+member of 'std'` across `modules/crypto` on every attempt after. Other worktrees
+on the same commit built fine. I concluded that a full reconfigure is not a safe
+reset here and said so in a commit message and on the PR.
+
+That was wrong. The global `~/.mcpp/config.toml` toolchain default had been
+flipped to **gcc 15.1.0**; this project needs **16.1.0** (declared as
+`xim:gcc@16.1.0` in its own package deps). Deleting `build.ninja` did nothing
+worse than force a reconfigure that then picked up the wrong default. Once the
+default was restored the same worktree built immediately, with `build.ninja`
+still absent.
+
+Two things worth keeping from it:
+
+- **Neither error message mentions a compiler version.** An ICE reads like a
+  compiler bug and a missing `std::byteswap` reads like source rot or a corrupt
+  module cache. Cost: ~40 minutes for one agent, plus a wrong published
+  diagnosis from me. `build_or_die.sh` now compares the project's declared
+  `xim:gcc@<version>` against the configured default **before** building and
+  refuses with the actual reason.
+- **An agent changed a global user config outside the repository.** Worktree
+  isolation does not cover `~/.mcpp/`, so one agent's environment fix or break is
+  every concurrent agent's. Treat anything under `$HOME` as shared mutable state.
+
+The general form, and it is the same lesson as the phantom-regression rule: when
+several independent things break at once in a way that does not name a common
+cause, suspect the shared environment before suspecting the code.
