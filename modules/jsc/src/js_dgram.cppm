@@ -381,14 +381,22 @@ export constexpr std::string_view kDgramJS = R"JS(
       if (this.fd < 0) return uvOf("EBADF");
       return rc(ND.mcastiface(this.fd, iface == null ? "" : String(iface), this._family6));
     }
+    // uv_udp_set_membership runs uv__udp_maybe_deferred_bind FIRST, so an
+    // unbound socket gets its descriptor here rather than reporting EBADF —
+    // node's addMembership() on a fresh dgram.Socket has to reach setsockopt(2)
+    // and answer EINVAL for a bad group (test-dgram-membership). That is the
+    // opposite of uv_udp_set_broadcast/_ttl above, which really do return
+    // UV_EBADF while unbound.
     _membership_(add, group, iface) {
-      if (this.fd < 0) return uvOf("EBADF");
+      const e = this._ensureFd_(this._family6);
+      if (e !== 0) return e;
       return rc(ND.membership(this.fd, add, String(group), iface == null ? "" : String(iface), this._family6));
     }
     addMembership(group, iface) { return this._membership_(true, group, iface); }
     dropMembership(group, iface) { return this._membership_(false, group, iface); }
     _srcMembership_(add, source, group, iface) {
-      if (this.fd < 0) return uvOf("EBADF");
+      const e = this._ensureFd_(this._family6);  // uv__udp_maybe_deferred_bind
+      if (e !== 0) return e;
       return rc(ND.srcmembership(this.fd, add, String(source), String(group), iface == null ? "" : String(iface), this._family6));
     }
     addSourceSpecificMembership(source, group, iface) { return this._srcMembership_(true, source, group, iface); }
