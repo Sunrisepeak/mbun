@@ -754,6 +754,48 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   // node-like value inspection (unquoted keys, 'single-quoted' strings, class
   // names, Map/Set/TypedArray/Buffer/Error/Date/RegExp, circular refs, depth cap).
   const kInspectCustom = Symbol.for("nodejs.util.inspect.custom");
+  // node internal/util/inspect.js `ansi` — chalk's ansi-regex, matching every VT
+  // escape sequence (SGR, cursor/tab/clear, and OSC-8 hyperlinks terminated by
+  // BEL / ESC-\ / ST) rather than colour codes only.
+  const kAnsiRe = new RegExp(
+    "[\\u001B\\u009B][[\\]()#;?]*" +
+    "(?:(?:(?:(?:;[-a-zA-Z\\d\\/\\#&.:=?%@~_]+)*" +
+    "|[a-zA-Z\\d]+(?:;[-a-zA-Z\\d\\/\\#&.:=?%@~_]*)*)?" +
+    "(?:\\u0007|\\u001B\\u005C|\\u009C))" +
+    "|(?:(?:\\d{1,4}(?:;\\d{0,4})*)?" +
+    "[\\dA-PR-TZcf-nq-uy=><~]))", "g");
+  // node lib/internal/util/inspect.js inspectDefaultOptions, exposed as
+  // util.inspect.defaultOptions. Every key is an accessor over a backing store
+  // so a direct write (`util.inspect.defaultOptions.compact = 5`, which is how
+  // the corpus uses it) flips the dirty flag without a Proxy.
+  const gInspectDefaultsStore = {
+    indentationLvl: 0, currentDepth: 0, showHidden: false, depth: 2, colors: false,
+    customInspect: true, showProxy: false, maxArrayLength: 100, maxStringLength: 10000,
+    breakLength: 128, compact: 3, sorted: false, getters: false, numericSeparator: false,
+  };
+  let gInspectDefaultsDirty = false;
+  const gInspectDefaults = {};
+  for (const k of Object.keys(gInspectDefaultsStore)) {
+    Object.defineProperty(gInspectDefaults, k, {
+      get() { return gInspectDefaultsStore[k]; },
+      set(v) { gInspectDefaultsStore[k] = v; gInspectDefaultsDirty = true; },
+      enumerable: true, configurable: false,
+    });
+  }
+  Object.seal(gInspectDefaults);
+  // util.inspect must survive a monkeypatched Object/Array/JSON: node's
+  // inspect.js reaches only for primordials, and the corpus asserts it
+  // directly (test-util-primordial-monkeypatching replaces Object.keys with a
+  // throwing stub). These aliases are captured at image build time.
+  const PObjectKeys = Object.keys;
+  const PObjectGetOwnPropertySymbols = Object.getOwnPropertySymbols;
+  const PObjectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+  const PObjectGetPrototypeOf = Object.getPrototypeOf;
+  const PObjectIs = Object.is;
+  const PArrayIsArray = Array.isArray;
+  const PArrayFrom = Array.from;
+  const PJSONStringify = JSON.stringify;
+  const PObjectProtoToString = Object.prototype.toString;
   function inspectValue(v, opts, seen, depth) {
     opts = opts || {}; seen = seen || new Set(); depth = depth || 0;
     const maxDepth = opts.depth === null ? Infinity : (typeof opts.depth === "number" ? opts.depth : 2);
@@ -771,11 +813,11 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     if (v === null) return col(1, 22, "null");
     const t = typeof v;
     if (t === "undefined") return col(90, 39, "undefined");
-    if (t === "number") return col(33, 39, Object.is(v, -0) ? "-0" : String(v));
+    if (t === "number") return col(33, 39, PObjectIs(v, -0) ? "-0" : String(v));
     if (t === "bigint") return col(33, 39, String(v) + "n");
     if (t === "boolean") return col(33, 39, String(v));
     if (t === "symbol") return col(32, 39, v.toString());
-    if (t === "string") return col(32, 39, bun ? JSON.stringify(v) : "'" + v.replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\n/g, "\\n") + "'");
+    if (t === "string") return col(32, 39, bun ? PJSONStringify(v) : "'" + v.replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\n/g, "\\n") + "'");
     if (t === "function") {
       const n = v.name;
       if (bun) {
@@ -823,7 +865,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     // Symbol.toStringTag guard keeps `{[Symbol.toStringTag]: "Error"}` — a plain
     // object wearing the tag — out of the error branch.
     if (v instanceof Error ||
-        (Object.prototype.toString.call(v) === "[object Error]" && !(Symbol.toStringTag in v))) {
+        (PObjectProtoToString.call(v) === "[object Error]" && !(Symbol.toStringTag in v))) {
       // bun/node error inspect starts with the "Name: message" header; mbun's
       // JSC-native stacks use `fn@source` frames without it, dropping the message
       // (which is where e.g. ENOENT/path live). Prepend it when absent.
@@ -845,12 +887,12 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       const extras = [];
       seen.add(v);
       try {
-        for (const k of Object.keys(v)) {
+        for (const k of PObjectKeys(v)) {
           if (k === "message" || k === "stack") continue;
           let s;
           try { s = inspectValue(v[k], opts, seen, depth + 1); } catch (e) { continue; }
           extras.push(extraIndent +
-                      (/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(k) ? k : JSON.stringify(k)) + ": " + s + ",");
+                      (/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(k) ? k : PJSONStringify(k)) + ": " + s + ",");
         }
       } finally { seen.delete(v); }
       if (extras.length) head += " {\n" + extras.join("\n") + "\n" + "  ".repeat(depth) + "}";
@@ -885,15 +927,15 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     if (bun) {
       if (v instanceof Number) return "[Number: " + Number(v) + "]";
       if (v instanceof Boolean) return "[Boolean: " + Boolean(v) + "]";
-      if (v instanceof String) return JSON.stringify(String(v));
+      if (v instanceof String) return PJSONStringify(String(v));
     }
-    if (depth > maxDepth) return Array.isArray(v) ? "[Array]" : (bun ? "[Object ...]" : "[Object]");
+    if (depth > maxDepth) return PArrayIsArray(v) ? "[Array]" : (bun ? "[Object ...]" : "[Object]");
     seen.add(v);
     let result;
     // bun layout helpers: keys are bare identifiers else JSON-quoted; non-empty
     // objects/maps/sets always break across lines with 2-space/level indent and a
     // trailing comma per entry. ref bun ConsoleObject.zig / fmt writeObject.
-    const bunKey = (k) => /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(k) ? k : JSON.stringify(k);
+    const bunKey = (k) => /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(k) ? k : PJSONStringify(k);
     const inner = "  ".repeat(depth + 1), outer = "  ".repeat(depth);
     // `compact: true` collapses a bun-style block onto one line (Bun.inspect's
     // documented option); the default stays the multi-line trailing-comma form.
@@ -911,12 +953,12 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       if (noCompact) return label + open + "\n" + items.map((it) => inner + it).join(",\n") + "\n" + outer + close;
       return label + open + " " + items.join(", ") + " " + close;
     };
-    if (Array.isArray(v)) {
+    if (PArrayIsArray(v)) {
       const items = v.map((x) => inspectValue(x, opts, seen, depth + 1));
       if (!items.length) result = "[]";
       else if (bun) {
         const oneLine = "[ " + items.join(", ") + " ]";
-        const complex = v.some((x) => x !== null && typeof x === "object" && !Array.isArray(x));
+        const complex = v.some((x) => x !== null && typeof x === "object" && !PArrayIsArray(x));
         const hasNL = items.some((s) => s.indexOf("\n") >= 0);
         result = (bunCompact || (!complex && !hasNL && oneLine.length <= 72)) ? oneLine : "[\n" + inner + items.join(", ") + "\n" + outer + "]";
       } else result = nodeBlock("", items, "[", "]");
@@ -931,16 +973,16 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       if (bun) result = bunBlock(v.size ? "Set(" + v.size + ") " : "Set ", items);
       else result = nodeBlock("Set(" + v.size + ") ", items, "{", "}");
     }
-    else if (ArrayBuffer.isView(v) && !(v instanceof DataView)) { const nm = v.constructor ? v.constructor.name : "TypedArray"; const items = Array.from(v).map(String); result = nm + "(" + v.length + ") [" + (items.length ? " " + items.join(", ") + " " : "") + "]"; }
+    else if (ArrayBuffer.isView(v) && !(v instanceof DataView)) { const nm = v.constructor ? v.constructor.name : "TypedArray"; const items = PArrayFrom(v).map(String); result = nm + "(" + v.length + ") [" + (items.length ? " " + items.join(", ") + " " : "") + "]"; }
     else {
-      const keys = Object.keys(v); const cn = v.constructor && v.constructor.name; const ctor = (cn && cn !== "Object") ? cn + " " : (Object.getPrototypeOf(v) === null ? "[Object: null prototype] " : "");
+      const keys = PObjectKeys(v); const cn = v.constructor && v.constructor.name; const ctor = (cn && cn !== "Object") ? cn + " " : (PObjectGetPrototypeOf(v) === null ? "[Object: null prototype] " : "");
       // Enumerable symbol-keyed own props render after string keys: bun as
       // `[Symbol(desc)]: v`, node as `Symbol(desc): v`. ref util.inspect.
-      const syms = Object.getOwnPropertySymbols(v).filter((s) => { const d = Object.getOwnPropertyDescriptor(v, s); return d && d.enumerable; });
+      const syms = PObjectGetOwnPropertySymbols(v).filter((s) => { const d = PObjectGetOwnPropertyDescriptor(v, s); return d && d.enumerable; });
       const descVal = (d, key) => (d && (d.get || d.set)) ? (d.get && d.set ? "[Getter/Setter]" : d.get ? "[Getter]" : "[Setter]") : inspectValue(v[key], opts, seen, depth + 1);
       if (bun) {
-        const items = keys.map((k) => bunKey(k) + ": " + descVal(Object.getOwnPropertyDescriptor(v, k), k));
-        for (const s of syms) items.push("[" + s.toString() + "]: " + descVal(Object.getOwnPropertyDescriptor(v, s), s));
+        const items = keys.map((k) => bunKey(k) + ": " + descVal(PObjectGetOwnPropertyDescriptor(v, k), k));
+        for (const s of syms) items.push("[" + s.toString() + "]: " + descVal(PObjectGetOwnPropertyDescriptor(v, s), s));
         result = bunBlock(ctor, items);
       } else {
         const items = keys.map((k) => { const kk = /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(k) ? k : "'" + k + "'"; return kk + ": " + inspectValue(v[k], opts, seen, depth + 1); });
@@ -951,22 +993,156 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     seen.delete(v);
     return result;
   }
+  // node internal/util/inspect.js formatWithOptionsInternal, per-specifier.
+  //   * %d is Number(x) printed as-is (NOT truncated), %i is parseInt, %f is
+  //     parseFloat; a symbol is 'NaN' and a bigint keeps its `n` suffix;
+  //   * %s only inspects an object whose `toString` is a built-in — an object
+  //     carrying its own toString/Symbol.toPrimitive is String()-ed;
+  //   * -0 prints as '-0' (String(-0) is '0').
+  const kBuiltInToStringOwners = new Set([
+    "Object", "Array", "Function", "Error", "Date", "RegExp", "String", "Number",
+    "Boolean", "BigInt", "Symbol", "Map", "Set", "WeakMap", "WeakSet", "Promise",
+    "ArrayBuffer", "SharedArrayBuffer", "DataView", "Int8Array", "Uint8Array",
+    "Uint8ClampedArray", "Int16Array", "Uint16Array", "Int32Array", "Uint32Array",
+    "Float16Array", "Float32Array", "Float64Array", "BigInt64Array", "BigUint64Array",
+    "EvalError", "RangeError", "ReferenceError", "SyntaxError", "TypeError", "URIError",
+    "AggregateError",
+  ]);
+  // internal/errors.js determineSpecificType — the "Received …" tail every
+  // ERR_INVALID_ARG_TYPE carries. The corpus compares these messages verbatim.
+  function determineSpecificType(value) {
+    if (value === null || value === undefined) return String(value);
+    if (typeof value === "function" && value.name) return "function " + value.name;
+    if (typeof value === "object") {
+      if (value.constructor && value.constructor.name) return "an instance of " + value.constructor.name;
+      try { return util.inspect(value, { depth: -1 }); } catch (e) { return "an instance of Object"; }
+    }
+    let inspected;
+    try { inspected = util.inspect(value, { colors: false }); } catch (e) { inspected = String(value); }
+    if (inspected.length > 28) inspected = inspected.slice(0, 25) + "...";
+    return "type " + (typeof value) + " (" + inspected + ")";
+  }
+  // internal/errors.js ERR_INVALID_ARG_TYPE for the single-type case: a dotted
+  // name reads "property", everything else "argument".
+  function nodeArgTypeError(name, expected, value) {
+    // node: a name that already ends in " argument" is used bare (no quotes, no
+    // second "argument"), a dotted name reads "property".
+    const head = name.endsWith(" argument") ? name + " "
+      : "\"" + name + "\" " + (name.indexOf(".") !== -1 ? "property" : "argument") + " ";
+    const e = new TypeError("The " + head +
+      "must be of type " + expected + ". Received " + determineSpecificType(value));
+    e.code = "ERR_INVALID_ARG_TYPE";
+    return e;
+  }
+  // internal/util/inspect.js addNumericSeparator / addNumericSeparatorEnd.
+  const addNumericSeparator = (s) => {
+    let result = "";
+    let i = s.length;
+    const start = s[0] === "-" ? 1 : 0;
+    for (; i >= start + 4; i -= 3) result = "_" + s.slice(i - 3, i) + result;
+    return i === s.length ? s : s.slice(0, i) + result;
+  };
+  const addNumericSeparatorEnd = (s) => {
+    let result = "";
+    let i = 0;
+    for (; i < s.length - 3; i += 3) result += s.slice(i, i + 3) + "_";
+    return i === 0 ? s : result + s.slice(i);
+  };
+  // internal/util/inspect.js formatNumber / formatBigInt.
+  const fmtNumberSep = (number, numericSeparator) => {
+    if (!numericSeparator) return Object.is(number, -0) ? "-0" : String(number);
+    const numberString = String(number);
+    const integer = Math.trunc(number);
+    if (integer === number) {
+      if (!Number.isFinite(number) || numberString.includes("e")) return numberString;
+      return addNumericSeparator(numberString);
+    }
+    if (Number.isNaN(number)) return numberString;
+    const decimalIndex = numberString.indexOf(".");
+    return addNumericSeparator(numberString.slice(0, decimalIndex)) + "." +
+      addNumericSeparatorEnd(numberString.slice(decimalIndex + 1));
+  };
+  const fmtBigIntSep = (v, numericSeparator) => {
+    const s = String(v);
+    return (numericSeparator ? addNumericSeparator(s) : s) + "n";
+  };
+  const fmtNumber = (n) => (Object.is(n, -0) ? "-0" : String(n));
+  function hasBuiltInToString(value) {
+    let hasOwnToString = Object.prototype.hasOwnProperty;
+    let hasOwnToPrimitive = Object.prototype.hasOwnProperty;
+    const returnFalse = () => false;
+    if (typeof value.toString !== "function") {
+      if (typeof value[Symbol.toPrimitive] !== "function") return true;
+      if (Object.prototype.hasOwnProperty.call(value, Symbol.toPrimitive)) return false;
+      hasOwnToString = returnFalse;
+    } else if (Object.prototype.hasOwnProperty.call(value, "toString")) {
+      return false;
+    } else if (typeof value[Symbol.toPrimitive] !== "function") {
+      hasOwnToPrimitive = returnFalse;
+    } else if (Object.prototype.hasOwnProperty.call(value, Symbol.toPrimitive)) {
+      return false;
+    }
+    let pointer = value;
+    do {
+      pointer = Object.getPrototypeOf(pointer);
+      if (pointer === null) return true;
+    } while (!hasOwnToString.call(pointer, "toString") && !hasOwnToPrimitive.call(pointer, Symbol.toPrimitive));
+    const descriptor = Object.getOwnPropertyDescriptor(pointer, "constructor");
+    return descriptor !== undefined && typeof descriptor.value === "function" &&
+      kBuiltInToStringOwners.has(descriptor.value.name);
+  }
+  function formatSpecifier(m, v, io) {
+    const insp = (x, extra) => util.inspect(x, (io && extra) ? Object.assign({}, io, extra) : (extra || io));
+    // node formatNumberNoColor/formatBigIntNoColor:
+    // `options?.numericSeparator ?? inspectDefaultOptions.numericSeparator`.
+    const sep = (io && io.numericSeparator !== undefined) ? io.numericSeparator : gInspectDefaultsStore.numericSeparator;
+    switch (m) {
+      case "%d":
+        if (typeof v === "bigint") return fmtBigIntSep(v, sep);
+        if (typeof v === "symbol") return "NaN";
+        return fmtNumberSep(Number(v), sep);
+      case "%i":
+        if (typeof v === "bigint") return fmtBigIntSep(v, sep);
+        if (typeof v === "symbol") return "NaN";
+        return fmtNumberSep(parseInt(v), sep);
+      case "%f":
+        if (typeof v === "symbol") return "NaN";
+        return fmtNumberSep(parseFloat(v), sep);
+      case "%j": {
+        let r;
+        try { r = JSON.stringify(v); } catch (e) { return "[Circular]"; }
+        return r === undefined ? "undefined" : r;
+      }
+      case "%c": return "";
+      case "%s":
+        if (typeof v === "number") return fmtNumberSep(v, sep);
+        if (typeof v === "bigint") return fmtBigIntSep(v, sep);
+        if (typeof v !== "object" || v === null) return String(v);
+        { let builtIn; try { builtIn = hasBuiltInToString(v); } catch (e) { builtIn = true; }
+          return builtIn ? insp(v, { depth: 0, colors: false, compact: 3 }) : String(v); }
+      case "%o": return insp(v, { showHidden: true, showProxy: true, depth: 4 });
+      default: return insp(v);   // %O
+    }
+  }
   // Lazily created by util.aborted(); one registry serves every call.
   let utilAbortedRegistry = null;
   const util = {
-    inspect(o, opts) { try { return inspectValue(o, opts, null, 0); } catch (e) { if (e && e.__inspectRethrow) throw e.__inspectOriginal; return String(o); } },
+    inspect(o, opts) {
+      // util.inspect.defaultOptions overrides only when something has actually
+      // written to it: `gInspectDefaultsDirty` is one boolean read on the hot
+      // path, and the merge allocates nothing until a caller opts in.
+      if (gInspectDefaultsDirty) opts = Object.assign({}, gInspectDefaults, opts);
+      try { return inspectValue(o, opts, null, 0); } catch (e) { if (e && e.__inspectRethrow) throw e.__inspectOriginal; return String(o); }
+    },
     format(f, ...a) {
+      // node formatWithOptionsInternal walks `args`, so no arguments at all is
+      // the empty string — not the inspection of a missing first argument.
+      if (arguments.length === 0) return "";
       const fmtArg = (x) => typeof x === "string" ? x : util.inspect(x);
       if (typeof f !== "string") return [f, ...a].map(fmtArg).join(" ");
       let i = 0;
       let s = f.replace(/%[sdifjoOc%]/g, (m) => { if (m === "%%") return "%"; if (i >= a.length) return m;
-        const v = a[i++];
-        if (m === "%d" || m === "%i") return typeof v === "bigint" ? String(v) + "n" : String(Math.trunc(Number(v)));
-        if (m === "%f") return String(parseFloat(v));
-        if (m === "%j") { try { return JSON.stringify(v); } catch (e) { return "[Circular]"; } }
-        if (m === "%c") return "";
-        if (m === "%s") return typeof v === "string" ? v : (typeof v === "bigint" ? String(v) + "n" : (v !== null && typeof v === "object" ? util.inspect(v, { depth: 0 }) : String(v)));
-        return util.inspect(v); });
+        return formatSpecifier(m, a[i++], undefined); });
       for (; i < a.length; i++) s += " " + fmtArg(a[i]);
       return s;
     },
@@ -974,21 +1150,14 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     // caller's inspect options (colors/depth/...) into every %o/%O/%s-object and
     // trailing-arg inspection. ref: node lib/internal/util/inspect.js formatWithOptions.
     formatWithOptions(inspectOptions, f, ...a) {
+      if (arguments.length <= 1) return "";
       const io = (inspectOptions && typeof inspectOptions === "object") ? inspectOptions : {};
       const insp = (x, extra) => util.inspect(x, extra ? Object.assign({}, io, extra) : io);
       const fmtArg = (x) => typeof x === "string" ? x : insp(x);
       if (typeof f !== "string") return [f, ...a].map(fmtArg).join(" ");
       let i = 0;
       let s = f.replace(/%[sdifjoOc%]/g, (m) => { if (m === "%%") return "%"; if (i >= a.length) return m;
-        const v = a[i++];
-        if (m === "%d" || m === "%i") return typeof v === "bigint" ? String(v) + "n" : String(Math.trunc(Number(v)));
-        if (m === "%f") return String(parseFloat(v));
-        if (m === "%j") { try { return JSON.stringify(v); } catch (e) { return "[Circular]"; } }
-        if (m === "%c") return "";
-        if (m === "%s") return typeof v === "string" ? v : (typeof v === "bigint" ? String(v) + "n" : (v !== null && typeof v === "object" ? insp(v, { depth: 0 }) : String(v)));
-        if (m === "%o") return insp(v, { showHidden: true, showProxy: true, depth: 4 });
-        if (m === "%O") return insp(v);
-        return insp(v); });
+        return formatSpecifier(m, a[i++], io); });
       for (; i < a.length; i++) s += " " + fmtArg(a[i]);
       return s;
     },
@@ -1014,15 +1183,102 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       }
       const p = function (...a) { return new Promise((res, rej) => { fn.call(this, ...a, (e, v) => (e ? rej(e) : res(v))); }); };
       Object.defineProperty(p, kCustom, { value: p, enumerable: false, writable: false, configurable: true });
+      // node promisify() copies `original`'s prototype and own descriptors onto
+      // the wrapper, so `name` / `length` and any decoration survive.
+      try {
+        Object.setPrototypeOf(p, Object.getPrototypeOf(fn));
+        Object.defineProperties(p, Object.getOwnPropertyDescriptors(fn));
+      } catch (e) {}
       return p;
     },
-    callbackify(fn) { return function (...a) { const cb = a.pop(); const self = this; fn.apply(this, a).then((v) => cb.call(self, null, v), (e) => cb.call(self, e)); }; },
-    inherits(ctor, sup) { ctor.super_ = sup; Object.setPrototypeOf(ctor.prototype, sup.prototype); },
-    deprecate(fn) { return fn; },
+    // node lib/util.js callbackify: the wrapper carries `original`'s own property
+    // descriptors with `length` bumped by one (the callback) and `name` suffixed
+    // "Callbackified", and the callback is invoked on nextTick.
+    callbackify(fn) {
+      if (typeof fn !== "function") throw nodeArgTypeError("original", "function", fn);
+      function callbackified(...a) {
+        const maybeCb = a.pop();
+        if (typeof maybeCb !== "function") throw nodeArgTypeError("last argument", "function", maybeCb);
+        const cb = maybeCb.bind(this);
+        const tick = (G.process && G.process.nextTick) ? G.process.nextTick.bind(G.process) : (f, ...r) => G.queueMicrotask(() => f(...r));
+        fn.apply(this, a).then(
+          (ret) => tick(cb, null, ret),
+          (rej) => tick(() => {
+            // node callbackifyOnRejected: a falsy rejection reason cannot be
+            // reported as an error, so it is wrapped in one carrying `.reason`.
+            if (!rej) {
+              const err = new Error("Promise was rejected with falsy value");
+              err.reason = rej; err.code = "ERR_FALSY_VALUE_REJECTION";
+              cb(err);
+            } else cb(rej);
+          }));
+      }
+      const descriptors = Object.getOwnPropertyDescriptors(fn);
+      if (descriptors.length && typeof descriptors.length.value === "number") descriptors.length.value++;
+      if (descriptors.name && typeof descriptors.name.value === "string") descriptors.name.value += "Callbackified";
+      try { Object.defineProperties(callbackified, descriptors); } catch (e) {}
+      return callbackified;
+    },
+    // node lib/util.js inherits: `super_` is writable + configurable but NOT
+    // enumerable (test-util-inherits reads the descriptor back).
+    inherits(ctor, sup) {
+      if (ctor === undefined || ctor === null) throw nodeArgTypeError("ctor", "function", ctor);
+      if (sup === undefined || sup === null) throw nodeArgTypeError("superCtor", "function", sup);
+      if (sup.prototype === undefined) throw nodeArgTypeError("superCtor.prototype", "object", sup.prototype);
+      Object.defineProperty(ctor, "super_", { value: sup, writable: true, configurable: true, enumerable: false });
+      Object.setPrototypeOf(ctor.prototype, sup.prototype);
+    },
+    // node internal/util.js deprecate: the wrapper emits the deprecation warning
+    // once (unless process.noDeprecation), keeps `fn`'s prototype chain and
+    // `length`, and validates `code` as a string.
+    deprecate(fn, msg, code) {
+      if (code !== undefined && typeof code !== "string") throw nodeArgTypeError("code", "string", code);
+      let warned = false;
+      function deprecated(...args) {
+        if (!(G.process && G.process.noDeprecation)) {
+          if (!warned) {
+            warned = true;
+            if (G.process && typeof G.process.emitWarning === "function") {
+              if (code !== undefined) G.process.emitWarning(msg, "DeprecationWarning", code, deprecated);
+              else G.process.emitWarning(msg, "DeprecationWarning", deprecated);
+            }
+          }
+        }
+        if (new.target) return Reflect.construct(fn, args, new.target);
+        return Reflect.apply(fn, this, args);
+      }
+      try {
+        Object.setPrototypeOf(deprecated, fn);
+        if (fn.prototype) deprecated.prototype = fn.prototype;
+        const d = Object.getOwnPropertyDescriptor(fn, "length");
+        if (d) Object.defineProperty(deprecated, "length", d);
+      } catch (e) {}
+      return deprecated;
+    },
+    // node internal/util.js convertProcessSignalToExitCode: POSIX 128 + signo.
+    convertProcessSignalToExitCode(signalCode) {
+      const signals = (M["os"] && M["os"].constants && M["os"].constants.signals) || {};
+      const names = Object.keys(signals);
+      if (typeof signalCode !== "string" || !Object.prototype.hasOwnProperty.call(signals, signalCode)) {
+        let received;
+        try { received = util.inspect(signalCode); } catch (e) { received = String(signalCode); }
+        const e = new TypeError("The argument 'signalCode' must be one of: " +
+          names.map((n) => "'" + n + "'").join(", ") + ". Received " + received);
+        e.code = "ERR_INVALID_ARG_VALUE"; throw e;
+      }
+      return 128 + signals[signalCode];
+    },
     getSystemErrorName(errno) { const m = { "-1": "EPERM", "-2": "ENOENT", "-3": "ESRCH", "-4": "EINTR", "-5": "EIO", "-9": "EBADF", "-11": "EAGAIN", "-12": "ENOMEM", "-13": "EACCES", "-14": "EFAULT", "-16": "EBUSY", "-17": "EEXIST", "-20": "ENOTDIR", "-21": "EISDIR", "-22": "EINVAL", "-23": "ENFILE", "-24": "EMFILE", "-28": "ENOSPC", "-32": "EPIPE", "-36": "ENAMETOOLONG", "-39": "ENOTEMPTY", "-40": "ELOOP", "-95": "ENOTSUP", "-98": "EADDRINUSE", "-99": "EADDRNOTAVAIL", "-100": "ENETDOWN", "-101": "ENETUNREACH", "-103": "ECONNABORTED", "-104": "ECONNRESET", "-107": "ENOTCONN", "-110": "ETIMEDOUT", "-111": "ECONNREFUSED", "-113": "EHOSTUNREACH", "-125": "ECANCELED" }; return m[String(errno)] || ("Unknown system error " + errno); },
     getSystemErrorMap() { return new Map(); },
     toUSVString(s) { return String(s); },
-    stripVTControlCharacters(s) { return String(s).replace(/\x1b\[[0-9;]*m/g, ""); },
+    // node internal/util/inspect.js stripVTControlCharacters over chalk's
+    // ansi-regex: the old `\x1b\[[0-9;]*m` only matched SGR colour sequences, so
+    // cursor/tab/clear sequences and OSC-8 hyperlinks survived.
+    stripVTControlCharacters(s) {
+      if (typeof s !== "string") throw nodeArgTypeError("str", "string", s);
+      if (s.indexOf("\u001B") === -1 && s.indexOf("\u009B") === -1) return s;
+      return s.replace(kAnsiRe, "");
+    },
     debuglog() { return () => {}; }, debug() { return () => {}; },
     _extend(a, b) { return Object.assign(a, b); },
     // util.aborted(signal, resource): a promise that settles when `signal`
@@ -1369,6 +1625,23 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   }
   util.MIMEType = MIMEType; util.MIMEParams = MIMEParams;
   util.inspect.custom = kInspectCustom;
+  // node defines defaultOptions as an accessor: the setter validates and
+  // Object.assigns into the shared defaults rather than replacing them.
+  Object.defineProperty(util.inspect, "defaultOptions", {
+    get() { return gInspectDefaults; },
+    set(options) {
+      if (options === null || typeof options !== "object" || Array.isArray(options)) {
+        const e = new TypeError('The "options" argument must be of type object. Received ' +
+          (options === null ? "null" : Array.isArray(options) ? "an instance of Array" : "type " + typeof options));
+        e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+      }
+      for (const k of Object.keys(options)) {
+        if (k in gInspectDefaultsStore) gInspectDefaults[k] = options[k];
+      }
+      return gInspectDefaults;
+    },
+    enumerable: true, configurable: true,
+  });
   G.MIMEType = MIMEType; G.MIMEParams = MIMEParams;
   // util.promisify.custom is the shared symbol Symbol.for("nodejs.util.promisify.custom").
   Object.defineProperty(util.promisify, "custom", { value: Symbol.for("nodejs.util.promisify.custom"), enumerable: false, writable: false, configurable: true });

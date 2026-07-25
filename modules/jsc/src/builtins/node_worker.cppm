@@ -635,6 +635,16 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
       });
       const emitWorker = () => { if (proc && typeof proc.emit === "function") proc.emit("worker", self); };
       if (proc.nextTick) proc.nextTick(emitWorker); else G.queueMicrotask(emitWorker);
+      // node internal/worker.js: the constructor's last act is to announce the
+      // worker on the 'worker_threads' diagnostics channel. The lookup is lazy
+      // because this partition is assembled before node:diagnostics_channel.
+      {
+        const d = M["diagnostics_channel"] || M["node:diagnostics_channel"];
+        if (d && typeof d.channel === "function") {
+          const ch = d.channel("worker_threads");
+          if (ch.hasSubscribers) ch.publish({ worker: this });
+        }
+      }
     }
     postMessage(value, transferList) {
       validateTransferList(transferList);

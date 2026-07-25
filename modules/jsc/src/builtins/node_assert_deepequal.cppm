@@ -377,6 +377,121 @@ inline constexpr std::string_view kNodeAssertDeepEqualJS = R"JS(
       strictMod.notDeepStrictEqual = assertMod.notDeepStrictEqual;
     }
 
+    // ------------------------------------- equal / strictEqual failure messages
+    // The bootstrap stubs threw `AErr(message)` with no generated message at
+    // all, so EVERY `assert.strictEqual` failure in the corpus surfaced as a
+    // bare `error: AssertionError` with an empty message and no
+    // actual/expected/operator — undiagnosable, and wrong: node's message is
+    // part of its contract.
+    //
+    // This is node's `internal/assert/assertion_error.js` minus the Myers diff
+    // engine: the two `isSimpleDiff` branches (short `a !== b`, and the stacked
+    // `+ actual / - expected` form with the mismatch indicator) are exact, and
+    // the multi-line case falls back to the block form deepStrictEqual already
+    // uses instead of a line diff. DEFERRED: myersDiff/printMyersDiff.
+    const kMaxShortStringLength = 12;
+    const inspectValue = (v) => {
+      try {
+        const u = M["util"] || M["node:util"];
+        if (u && typeof u.inspect === "function") {
+          return u.inspect(v, { compact: false, customInspect: false, depth: 1000, maxArrayLength: Infinity,
+                                showHidden: false, showProxy: false, sorted: true, getters: true });
+        }
+      } catch (_) {}
+      try { return String(v); } catch (_) { return "<value>"; }
+    };
+    const trunc512 = (s) => (s.length > 512 ? s.slice(0, 509) + "..." : s);
+    const simpleDiffMessage = (actual, expected, inspectedActual, inspectedExpected) => {
+      let stringsLen = inspectedActual.length + inspectedExpected.length;
+      if (typeof actual === "string") stringsLen -= 2;
+      if (typeof expected === "string") stringsLen -= 2;
+      if (stringsLen <= kMaxShortStringLength && (actual !== 0 || expected !== 0)) {
+        return { header: "", message: inspectedActual + " !== " + inspectedExpected };
+      }
+      // getStackedDiff (no colors): the two values stacked, plus a caret under
+      // the first differing character when both sides are short strings.
+      let message = "\n+ " + inspectedActual + "\n- " + inspectedExpected;
+      if (typeof actual === "string" && typeof expected === "string" &&
+          inspectedActual.length + inspectedExpected.length <= 80) {
+        let indicatorIdx = -1;
+        for (let i = 0; i < inspectedActual.length; i++) {
+          if (inspectedActual[i] !== inspectedExpected[i]) { if (i >= 3) indicatorIdx = i; break; }
+        }
+        if (indicatorIdx !== -1) message += "\n" + " ".repeat(indicatorIdx + 2) + "^";
+      }
+      return { header: "+ actual - expected", message };
+    };
+    const strictEqualDiff = (actual, expected) => {
+      let operator = "strictEqual";
+      const inspectedActual = inspectValue(actual);
+      const inspectedExpected = inspectValue(expected);
+      const splitActual = inspectedActual.split("\n");
+      const splitExpected = inspectedExpected.split("\n");
+      // checkOperator: two equal-looking objects that are not reference-equal
+      // report the "reference-equal" wording instead.
+      if (typeof actual === "object" && actual !== null && typeof expected === "object" && expected !== null &&
+          inspectedActual === inspectedExpected) operator = "notIdentical";
+      else if (typeof actual === "object" && actual !== null && typeof expected === "object" && expected !== null)
+        operator = "strictEqualObject";
+      const simple = splitActual.length === 1 && splitExpected.length === 1 &&
+        (typeof actual !== "object" || actual === null || typeof expected !== "object" || expected === null);
+      let header = "+ actual - expected";
+      let message;
+      if (simple) {
+        const d = simpleDiffMessage(actual, expected, splitActual[0], splitExpected[0]);
+        header = d.header; message = d.message;
+        operator = "strictEqual";
+      } else if (operator === "notIdentical") {
+        header = ""; message = inspectedActual;
+      } else {
+        // Line diff DEFERRED — show both sides in full instead.
+        header = "+ actual - expected";
+        message = "+ " + trunc512(inspectedActual) + "\n- " + trunc512(inspectedExpected);
+      }
+      const readable = {
+        strictEqual: "Expected values to be strictly equal:",
+        strictEqualObject: 'Expected "actual" to be reference-equal to "expected":',
+        notIdentical: "Values have same structure but are not reference-equal:",
+      }[operator];
+      return readable + "\n" + header + "\n" + message + "\n";
+    };
+    const notStrictEqualMessage = (actual) => {
+      let base = 'Expected "actual" to be strictly unequal to:';
+      if ((typeof actual === "object" && actual !== null) || typeof actual === "function")
+        base = 'Expected "actual" not to be reference-equal to "expected":';
+      const res = inspectValue(actual).split("\n");
+      if (res.length === 1) return base + (res[0].length > 5 ? "\n\n" : " ") + res[0];
+      return base + "\n\n" + res.join("\n") + "\n";
+    };
+    assertMod.equal = function equal(actual, expected, message) {
+      // eslint-disable-next-line eqeqeq
+      if (actual != expected)
+        throw assertionError(message, actual, expected, "==",
+          trunc512(inspectValue(actual)) + " == " + trunc512(inspectValue(expected)));
+    };
+    assertMod.notEqual = function notEqual(actual, expected, message) {
+      // eslint-disable-next-line eqeqeq
+      if (actual == expected)
+        throw assertionError(message, actual, expected, "!=",
+          trunc512(inspectValue(actual)) + " != " + trunc512(inspectValue(expected)));
+    };
+    assertMod.strictEqual = function strictEqual(actual, expected, message) {
+      if (!Object.is(actual, expected))
+        throw assertionError(message, actual, expected, "strictEqual", strictEqualDiff(actual, expected));
+    };
+    assertMod.notStrictEqual = function notStrictEqual(actual, expected, message) {
+      if (Object.is(actual, expected))
+        throw assertionError(message, actual, expected, "notStrictEqual", notStrictEqualMessage(actual));
+    };
+    for (const target of [assertMod.strict, M["assert/strict"], M["node:assert/strict"]]) {
+      if (!target || target === assertMod) continue;
+      if (typeof target !== "object" && typeof target !== "function") continue;
+      target.equal = assertMod.strictEqual;
+      target.notEqual = assertMod.notStrictEqual;
+      target.strictEqual = assertMod.strictEqual;
+      target.notStrictEqual = assertMod.notStrictEqual;
+    }
+
     const util = M["util"] || M["node:util"];
     if (util) util.isDeepStrictEqual = function isDeepStrictEqual(a, b) { return deq(a, b, true); };
   } catch (e) {}

@@ -577,6 +577,10 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
     // node stores the resolved connect options on the socket (kConnectOptions);
     // onConnectEnd reads path/host/port/localAddress back off them.
     tlsSock._connectOptions = opts;
+    // node's TLSSocket is itself the socket that connects, so the
+    // 'net.client.socket' diagnostics channel reports the TLSSocket. mbun keeps
+    // the transport Socket separate; point the channel at the TLSSocket.
+    transport._dcClientSocket = tlsSock;
     if (cb) tlsSock.once("secureConnect", cb);
     // node internal/tls/wrap.js connect(): only a socket this call created gets
     // the timeout armed — a caller-supplied socket stays the caller's business.

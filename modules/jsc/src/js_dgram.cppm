@@ -40,6 +40,11 @@ export constexpr std::string_view kDgramJS = R"JS(
   const util = M["util"] || M["node:util"] || {};
   const nextTick = (G.process && G.process.nextTick) ? G.process.nextTick.bind(G.process)
     : (fn, ...a) => G.queueMicrotask(() => fn(...a));
+  // node lib/dgram.js resolves the 'udp.socket' diagnostics channel once at
+  // module load; hasSubscribers gates the publish on the hot path.
+  const dc = M["diagnostics_channel"] || M["node:diagnostics_channel"];
+  const udpSocketChannel = (dc && typeof dc.channel === "function")
+    ? dc.channel("udp.socket") : { hasSubscribers: false, publish() {} };
 
   // ---- errors ---------------------------------------------------------------
   // internal/errors.js message templates, reproduced so assert.throws shapes
@@ -523,6 +528,9 @@ export constexpr std::string_view kDgramJS = R"JS(
           this.once("close", () => { try { signal.removeEventListener("abort", onAborted); } catch (e) {} });
         }
       }
+      // node lib/dgram.js: the last thing the constructor does is announce the
+      // socket on the 'udp.socket' diagnostics channel.
+      if (udpSocketChannel.hasSubscribers) udpSocketChannel.publish({ socket: this });
     }
   }
 
