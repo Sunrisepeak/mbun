@@ -187,6 +187,34 @@ Also: **do not record an agent's self-reported elapsed time.** One task reported
 "~3h15m" for work that took 77–80 minutes by both wall clock and the harness
 timer. Use the measured value.
 
+### Make the wall name itself (round 10)
+
+The strongest single technique observed so far, for a cluster whose depth is
+unknown: **stub the missing capability so it fails loudly with its own name**,
+then let the log histogram choose the next target each cycle.
+
+`internalBinding` was stubbed to throw `No such binding: <name>`. Each cycle's
+logs then named the next densest wall exactly, with no guessing:
+
+| cycle | added | pass |
+| --- | --- | --- |
+| baseline | — | 0 |
+| 1 | `primordials` + the throwing stub | 8 |
+| 2 | `util`, `constants`, `uv`, `errors`, `options`, … | 21 |
+| 3 | `string_decoder` (94 files were gated on `internal/util` reading `.encodings`) | 35 |
+| 4–7 | `buffer`, `os`, `messaging`, `builtins`, `module_wrap`, `worker`, `async_wrap`, … | **45** |
+
+Per-cycle deltas were +8, +13, +14, +4, +3, +1, +2. **A single blind change
+would have reached ~21 of the 45.** The technique converts an open-ended
+"implement `internalBinding`" into a measured, self-terminating work queue, and
+the tail (+1, +2) is the signal to stop.
+
+It also settled a question this project had deferred **twice**: `primordials`
+alone converts 8/305 = **2.6%** (reproducing an earlier 2/60 probe at 5× the
+sample), while `primordials` + `internalBinding` converts 45/305 = **14.8%**.
+`internalBinding` does roughly 90% of the work. Deferring on the primordials-only
+number had been correct; the missing measurement was the combined one.
+
 ### Isolated deltas are not additive
 
 Round 9's eight tasks each measured a gain against their own cluster, each with
