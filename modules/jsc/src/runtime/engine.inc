@@ -479,7 +479,21 @@ public:
             if (r.error().find("SyntaxError") == std::string::npos) {
                 return fail_run_(r.error());
             }
-            (void)eval_void("globalThis.__mbun_run_done=0;globalThis.__mbun_run_err=undefined;");
+            // Define NON-ENUMERABLE. node's common/index.js runs
+            // `for (const val in globalThis)` from an 'exit' listener and fails
+            // the file with "Unexpected global(s) found" on anything it does not
+            // know. Plain assignment created enumerable properties, which cost
+            // 265 corpus files across 79 subsystems -- and worse, it fired
+            // *before* those files could reach common.skip(), so ~300 files that
+            // should report `skipped` reported `fail` instead (inspector went
+            // from 59 green to 1). Later assignments to an existing writable
+            // data property keep this descriptor, so the two sites below stay
+            // plain assignments.
+            (void)eval_void(
+                "Object.defineProperty(globalThis,'__mbun_run_done',"
+                "{value:0,writable:true,configurable:true,enumerable:false});"
+                "Object.defineProperty(globalThis,'__mbun_run_err',"
+                "{value:undefined,writable:true,configurable:true,enumerable:false});");
             const std::string wrapped{
                 "(async function (" + cjsParams + ") {" + script + "\n})" + cjsArgs +
                 ".then(function(){globalThis.__mbun_run_done=1;},"
