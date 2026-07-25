@@ -2114,6 +2114,15 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       // count directly (test-http{,s}-agent-abort-controller).
       if (emitter && typeof emitter.addEventListener === "function" && Array.isArray(emitter._l))
         return type === "abort" ? emitter._l.length : 0;
+      // The general EventTarget (node_process_extra) keeps its listeners in a
+      // Map behind a private symbol; its non-enumerable `listeners(type)` hook
+      // is the same introspection door getEventListeners() uses. node reads
+      // `target[kEvents].get(type).size` here, and the corpus asserts the count
+      // on a plain `new EventTarget()` passed as an options.signal
+      // (test-child-process-fork-timeout-kill-signal).
+      if (emitter && typeof emitter.addEventListener === "function" && typeof emitter.listeners === "function") {
+        try { return emitter.listeners(type).length; } catch (e) { /* not an EventTarget */ }
+      }
       return EventEmitterPrototype.listenerCount.call(emitter, type);
     }
 
@@ -2279,7 +2288,15 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     // an EventEmitter surface in. ref: regression 26411.
     for (const name of ["stdout", "stderr"]) {
       const strm = G.process[name];
-      if (!strm || typeof strm.on === "function") continue;
+      if (!strm) continue;
+      // node's process.stdout/.stderr are Socket/WriteStream/SyncWriteStream and
+      // ALL of them carry the numeric descriptor. internal/child_process
+      // getValidStdio() dispatches on exactly that (`typeof stdio.fd ===
+      // 'number'` → a 'fd' stdio slot), so without it passing process.stdout in
+      // a stdio array fell through to "invalid stdio option"
+      // (test-child-process-validate-stdio). process.stdin already exposes 0.
+      if (typeof strm.fd !== "number") { try { strm.fd = name === "stdout" ? 1 : 2; } catch (e) {} }
+      if (typeof strm.on === "function") continue;
       const ee = new EventEmitter();
       for (const k of ["on", "addListener", "prependListener", "once", "off", "removeListener",
                        "removeAllListeners", "emit", "listeners", "listenerCount",

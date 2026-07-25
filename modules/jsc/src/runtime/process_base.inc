@@ -79,8 +79,24 @@ JSValueRef cp_spawn_sync_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
     enum class Stdio { Pipe, Inherit, Ignore };
     Stdio stdioMode[3]{Stdio::Pipe, Stdio::Pipe, Stdio::Pipe};
     int stdioFd[3]{-1, -1, -1};  // numeric stdio entry: dup this parent fd
+    // options.timeoutMs / options.killSignalNum: node's spawnSync(…, { timeout,
+    // killSignal }) (src/spawn_sync.cc SyncProcessRunner::SetupTimeoutHandler).
+    // The JS wrapper resolves the signal NAME to a number before it gets here so
+    // this layer never carries a signal table. -1 ⇒ no timeout.
+    double timeoutMs{-1};
+    int killSigNum{SIGTERM};
     if (argc > 2 && JSValueIsObject(ctx, args[2])) {
         JSObjectRef opt{JSValueToObject(ctx, args[2], nullptr)};
+        JSValueRef toV{get_prop(ctx, opt, "timeoutMs")};
+        if (JSValueIsNumber(ctx, toV)) {
+            const double v{JSValueToNumber(ctx, toV, nullptr)};
+            if (std::isfinite(v) && v > 0) timeoutMs = v;
+        }
+        JSValueRef ksV{get_prop(ctx, opt, "killSignalNum")};
+        if (JSValueIsNumber(ctx, ksV)) {
+            const int s{static_cast<int>(JSValueToNumber(ctx, ksV, nullptr))};
+            if (s > 0 && s < NSIG) killSigNum = s;
+        }
         const auto readStdioSlot{[&](JSValueRef v, std::size_t slot) {
             if (JSValueIsNumber(ctx, v)) {
                 stdioMode[slot] = Stdio::Inherit;
@@ -235,16 +251,71 @@ JSValueRef cp_spawn_sync_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
         }
         close(inPipe[1]);
     }
-    auto drain{[](int fd) {
-        std::string out;
+    // Drain both pipes concurrently under an optional deadline. Draining them in
+    // sequence (stdout to EOF, then stderr) deadlocks a child that fills the
+    // pipe we read LAST, and a blocking read cannot honour options.timeout at
+    // all — a spawnSync({ timeout }) against a child that never exits hung this
+    // process forever. poll() gives both properties at once.
+    std::string outStr, errStr;
+    bool timedOut{false};
+    {
+        const auto t0{std::chrono::steady_clock::now()};
+        const auto elapsedMs{[&t0] {
+            return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        }};
+        int fds[2]{pipeOut ? outPipe[0] : -1, pipeErr ? errPipe[0] : -1};
+        std::string* bufs[2]{&outStr, &errStr};
+        for (int i = 0; i < 2; ++i) {
+            if (fds[i] >= 0) fcntl(fds[i], F_SETFL, fcntl(fds[i], F_GETFL, 0) | O_NONBLOCK);
+        }
         char buf[4096];
-        ssize_t n;
-        while ((n = read(fd, buf, sizeof buf)) > 0) out.append(buf, static_cast<std::size_t>(n));
-        close(fd);
-        return out;
-    }};
-    std::string outStr{pipeOut ? drain(outPipe[0]) : std::string{}};
-    std::string errStr{pipeErr ? drain(errPipe[0]) : std::string{}};
+        while (fds[0] >= 0 || fds[1] >= 0 || (timeoutMs >= 0 && !timedOut)) {
+            pollfd pf[2];
+            int idx[2];
+            int n{0};
+            for (int i = 0; i < 2; ++i) {
+                if (fds[i] < 0) continue;
+                pf[n] = pollfd{.fd = fds[i], .events = POLLIN, .revents = 0};
+                idx[n] = i;
+                ++n;
+            }
+            int wait{-1};
+            if (timeoutMs >= 0 && !timedOut) {
+                const double left{timeoutMs - elapsedMs()};
+                wait = left <= 0 ? 0 : static_cast<int>(left) + 1;
+            }
+            const int rc{poll(n ? pf : nullptr, static_cast<nfds_t>(n), wait)};
+            if (rc < 0) {
+                if (errno == EINTR) continue;
+                break;
+            }
+            if (rc == 0) {
+                if (timeoutMs >= 0 && !timedOut && elapsedMs() >= timeoutMs) {
+                    // node kills the child and then keeps reading whatever it
+                    // already produced, so the result still carries partial output.
+                    timedOut = true;
+                    kill(pid, killSigNum);
+                }
+                continue;
+            }
+            for (int k = 0; k < n; ++k) {
+                if (!(pf[k].revents & (POLLIN | POLLHUP | POLLERR))) continue;
+                const int i{idx[k]};
+                for (;;) {
+                    const ssize_t r{read(fds[i], buf, sizeof buf)};
+                    if (r > 0) { bufs[i]->append(buf, static_cast<std::size_t>(r)); continue; }
+                    if (r < 0 && errno == EINTR) continue;
+                    if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+                    close(fds[i]);
+                    fds[i] = -1;
+                    break;  // EOF or a dead pipe
+                }
+            }
+        }
+        for (int i = 0; i < 2; ++i) {
+            if (fds[i] >= 0) close(fds[i]);
+        }
+    }
     int status{0};
     waitpid(pid, &status, 0);
     int code{WIFEXITED(status) ? WEXITSTATUS(status) : -1};
@@ -271,6 +342,7 @@ JSValueRef cp_spawn_sync_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
     set_prop(ctx, r, "signal",
              sig ? make_string(ctx, std::to_string(sig)) : JSValueMakeNull(ctx));
     set_prop(ctx, r, "pid", JSValueMakeNumber(ctx, static_cast<double>(pid)));
+    set_prop(ctx, r, "timedOut", JSValueMakeBoolean(ctx, timedOut));
     // node reports a non-piped stdio slot as null, not "" — `stdio: 'inherit'`
     // went straight to the parent's fd and there is nothing to hand back.
     set_prop(ctx, r, "stdout", pipeOut ? make_string(ctx, outStr) : JSValueMakeNull(ctx));

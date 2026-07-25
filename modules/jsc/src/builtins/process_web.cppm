@@ -26,6 +26,16 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   const _b64 = (d) => { const u = _u8(d); let s = ""; for (let i = 0; i < u.length; i += 4096) s += String.fromCharCode.apply(null, u.subarray(i, i + 4096)); return G.btoa(s); };
   const _unb64 = (b) => { const s = G.atob(b); const u = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i); return u; };
   const nextTick = (fn) => (G.process && G.process.nextTick ? G.process.nextTick(fn) : G.queueMicrotask(fn));
+  // A libuv errno (negative) for a SystemError's `errno` field, so that
+  // util.getSystemErrorName(err.errno) round-trips to the same code. Resolved
+  // lazily: node:os is registered after this partition loads.
+  const uvErrno = (name, fallback) => {
+    try {
+      const os = M["os"] || M["node:os"];
+      const v = os && os.constants && os.constants.errno && os.constants.errno[name];
+      return typeof v === "number" ? -Math.abs(v) : fallback;
+    } catch (e) { return fallback; }
+  };
 
   // Active async children; __mbun_io_tick drives every entry each pump turn.
   const CHILDREN = (G.__mbunChildren = G.__mbunChildren || new Set());
@@ -49,6 +59,50 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     };
     r.__end = () => { if (r._ended) return; r._ended = true; r.push(null); };
     return r;
+  };
+
+  // A stdio slot above stderr: node backs it with a uv_pipe_t and exposes a
+  // duplex net.Socket on child.stdio[i] (lib/internal/child_process.js), so the
+  // parent can both write to and read from the extra channel. The read half is
+  // fed by the same drainOut() the stdout/stderr Readables use.
+  const makeDuplexPipe = (fd, rec) => {
+    const S = M["stream"] || M["node:stream"];
+    const DC = S && S.Duplex;
+    if (!DC) return makeReadable();  // stream not registered yet: read-only, as before
+    const w = { fd, buf: [], closed: false };
+    rec.writers.push(w);
+    const d = new DC({
+      read() {},
+      write(chunk, enc, cb) {
+        const data = typeof chunk === "string" ? te.encode(chunk) : _u8(chunk);
+        w.buf.push({ data, off: 0, cb: null });
+        flushWriter(w);
+        cb();
+      },
+      final(cb) { flushWriter(w); cb(); },
+    });
+    d.bytesRead = 0;
+    d.__data = (bytes) => { d.bytesRead += bytes.length; d.push(Buffer.from(bytes)); };
+    d.__end = () => { if (d._ended) return; d._ended = true; w.closed = true; d.push(null); };
+    return d;
+  };
+
+  // The write half of a stdio slot ABOVE stderr. Those slots are socketpairs
+  // (see spawnEx), so the parent's descriptor is duplex: the SAME fd is polled
+  // for reads in rec.outs and written through here. Same non-blocking discipline
+  // as flushStdin — queue, then drain what the kernel accepts each io tick.
+  const flushWriter = (w) => {
+    if (w.fd < 0 || w.closed) return;
+    while (w.buf.length) {
+      const item = w.buf[0];
+      if (item.data.length - item.off <= 0) { w.buf.shift(); if (item.cb) try { item.cb(); } catch (e) {} continue; }
+      const n = PROC.writeNB(w.fd, _b64(item.data.subarray(item.off)), 0);
+      if (n < 0) { w.buf.shift(); if (item.cb) try { item.cb(); } catch (e) {} continue; }  // peer gone
+      if (n === 0) return;  // EAGAIN — retry next tick
+      item.off += n;
+      if (item.off >= item.data.length) { w.buf.shift(); if (item.cb) try { item.cb(); } catch (e) {} }
+      else return;
+    }
   };
 
   const flushStdin = (rec) => {
@@ -88,7 +142,29 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     if (t === "object") return "an instance of " + ((v.constructor && v.constructor.name) || "Object");
     return "type " + t + " (" + String(v) + ")";
   };
-  const makeIpc = (fd) => { PROC.setNonBlock(fd); return { fd, buf: "", out: [], queued: 0, closed: false, refd: true, rxFds: [], sent: [] }; };
+  const makeIpc = (fd, advanced) => { PROC.setNonBlock(fd); return { fd, buf: "", out: [], queued: 0, closed: false, refd: true, rxFds: [], sent: [], adv: !!advanced }; };
+  // ---- 'advanced' (structured-clone) serialization ------------------------
+  // node's `serialization: 'advanced'` swaps JSON for the v8 value serializer,
+  // so a message may be cyclic, a Map/Set, a BigInt or a Buffer
+  // (lib/internal/child_process/serialization.js). mbun keeps the SAME
+  // newline-delimited frame the json mode uses and carries the serialized bytes
+  // base64-encoded inside it, rather than node's 4-byte-length binary framing:
+  // this reader is byte-transparent only through a UTF-8 string buffer, and both
+  // ends of every mbun channel are mbun (the fd is handed over by our own
+  // spawn(), never shared with a real node process). The observable JS contract
+  // — what survives a send() — is the v8 format either way.
+  const v8mod = () => M["v8"] || M["node:v8"];
+  const advEncode = (message) => {
+    const v8 = v8mod();
+    if (!v8 || typeof v8.serialize !== "function") {
+      const e = new Error("advanced serialization requires node:v8"); e.code = "ERR_INVALID_ARG_VALUE"; throw e;
+    }
+    return _b64(_u8(v8.serialize(message === undefined ? null : message)));
+  };
+  const advDecode = (line) => {
+    const v8 = v8mod();
+    return v8.deserialize(Buffer.from(_unb64(line)));
+  };
   const ipcClose = (ch) => { if (ch.closed) return; ch.closed = true; try { PROC.close(ch.fd); } catch (e) {} };
   const canPassFd = () => typeof PROC.sendmsgFd === "function" && typeof PROC.recvmsgFd === "function";
   const ipcFlush = (ch) => {
@@ -115,7 +191,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     }
   };
   const ipcWrite = (ch, message, cb, sendFd) => {
-    const data = te.encode(JSON.stringify(message === undefined ? null : message) + "\n");
+    const data = te.encode((ch.adv ? advEncode(message) : JSON.stringify(message === undefined ? null : message)) + "\n");
     ch.out.push({ data, off: 0, cb: cb || null, fd: typeof sendFd === "number" ? sendFd : -1 });
     ch.queued += data.length;
     ipcFlush(ch);
@@ -218,7 +294,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
         ch.buf = ch.buf.slice(idx + 1);
         if (!line) continue;
         let msg;
-        try { msg = JSON.parse(line); } catch (e) { continue; }
+        try { msg = ch.adv ? advDecode(line) : JSON.parse(line); } catch (e) { continue; }
         let handle;
         if (msg !== null && typeof msg === "object" && msg.cmd === "NODE_HANDLE_ACK") {
           closeSentHandle(ch.sent.shift());
@@ -397,7 +473,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     } else {
       PROC.poll([], 2);  // brief real wait while waiting for a child to exit
     }
-    for (const rec of recs) flushStdin(rec);
+    for (const rec of recs) { flushStdin(rec); for (const w of rec.writers) flushWriter(w); }
     for (const rec of recs) if (rec.ipc && !rec.ipc.closed) { ipcFlush(rec.ipc); rec.ipcDelivery.flush(); }
     if (SELF_IPC !== null && !SELF_IPC.ch.closed) { ipcFlush(SELF_IPC.ch); SELF_IPC.delivery.flush(); }
     for (const rec of recs) reap(rec);
@@ -506,9 +582,13 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       if (ipcIndex >= 0) {
         // node advertises the child's end of the channel through NODE_CHANNEL_FD
         // (lib/internal/child_process.js spawn()); the fd number is the slot index.
+        // The serialization mode travels the same way, in
+        // NODE_CHANNEL_SERIALIZATION_MODE, so the child frames its half
+        // identically without being told twice.
         const e = {};
         for (const k of Object.keys(baseEnv)) e[k] = baseEnv[k];
         e.NODE_CHANNEL_FD = String(ipcIndex);
+        e.NODE_CHANNEL_SERIALIZATION_MODE = options.serialization === "advanced" ? "advanced" : "json";
         sopts.env = e;
       } else {
         sopts.env = baseEnv;
@@ -538,12 +618,12 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       if (spawnDC.hasSubscribers) spawnDC.end.publish({ process: this });
       this.pid = h.pid;
       const fds = h.fds || [];
-      const rec = { cp: this, pid: h.pid, outs: [], stdinFd: -1, stdinBuf: [], stdinEnded: false, stdinClosed: false, exited: false, closed: false, done: false, code: null, signal: null, ipc: null, ipcDelivery: null };
+      const rec = { cp: this, pid: h.pid, outs: [], writers: [], stdinFd: -1, stdinBuf: [], stdinEnded: false, stdinClosed: false, exited: false, closed: false, done: false, code: null, signal: null, ipc: null, ipcDelivery: null };
       const stdioArr = [];
       for (let i = 0; i < stdio.length; i++) {
         const fd = fds[i] != null ? fds[i] : -1;
         if (stdio[i] === "ipc" && fd >= 0) {
-          rec.ipc = makeIpc(fd);
+          rec.ipc = makeIpc(fd, options.serialization === "advanced");
           rec.ipcDelivery = makeIpcDelivery(this);
           stdioArr[i] = null;  // node exposes the channel as .channel, not .stdio[n]
           attachIpc(this, rec.ipc, null);
@@ -552,7 +632,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
           // Out fds MUST be O_NONBLOCK: drainOut loops readNB until "" (EAGAIN);
           // on a blocking fd the read AFTER a partial chunk wedges the JS thread
           // while a long-lived child sits between replies (duplex protocols).
-          else { PROC.setNonBlock(fd); const rd = makeReadable(); rec.outs.push({ fd, stream: rd, ended: false }); stdioArr[i] = rd; if (i === 1) this.stdout = rd; else if (i === 2) this.stderr = rd; }
+          else { PROC.setNonBlock(fd); const rd = i > 2 ? makeDuplexPipe(fd, rec) : makeReadable(); rec.outs.push({ fd, stream: rd, ended: false }); stdioArr[i] = rd; if (i === 1) this.stdout = rd; else if (i === 2) this.stderr = rd; }
         } else { stdioArr[i] = null; }
       }
       this.stdio = stdioArr;
@@ -622,21 +702,34 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   // every entry point rejects the same shapes with the same error codes
   // (ERR_INVALID_ARG_TYPE / ERR_INVALID_ARG_VALUE / ERR_OUT_OF_RANGE), including
   // the embedded-NUL rejection added for CVE-2022-… (nodejs/node#44768).
-  const errArgType = (name, expected, actual) => {
-    const e = new TypeError('The "' + name + '" argument must be ' + expected + '. Received ' + recvDesc(actual));
-    e.code = "ERR_INVALID_ARG_TYPE"; return e;
+  // internal/errors.js makeNodeErrorWithCode gives every NodeError a
+  // `toString()` of `${name} [${code}]: ${message}` (name and stack keep the
+  // base name). `assert.throws(fn, /ERR_INVALID_ARG_TYPE/)` matches
+  // String(err), so without this the code was invisible to a regex matcher and
+  // the timeout/kill-signal tests failed on an otherwise-correct error.
+  const withCode = (e, code) => {
+    e.code = code;
+    const base = e.name;
+    Object.defineProperty(e, "toString", {
+      value() { return base + " [" + code + "]" + (this.message ? ": " + this.message : ""); },
+      configurable: true, writable: true,
+    });
+    return e;
   };
-  const errPropType = (name, expected, actual) => {
-    const e = new TypeError('The "' + name + '" property must be ' + expected + '. Received ' + recvDesc(actual));
-    e.code = "ERR_INVALID_ARG_TYPE"; return e;
-  };
-  const errArgValue = (name, value, reason) => {
-    const e = new TypeError("The argument '" + name + "' " + (reason || "is invalid") + ". Received " + recvDesc(value));
-    e.code = "ERR_INVALID_ARG_VALUE"; return e;
-  };
-  const errOutOfRange = (name, range, value) => {
-    const e = new RangeError('The value of "' + name + '" is out of range. It must be ' + range + ". Received " + String(value));
-    e.code = "ERR_OUT_OF_RANGE"; return e;
+  const errArgType = (name, expected, actual) =>
+    withCode(new TypeError('The "' + name + '" argument must be ' + expected + '. Received ' + recvDesc(actual)), "ERR_INVALID_ARG_TYPE");
+  const errPropType = (name, expected, actual) =>
+    withCode(new TypeError('The "' + name + '" property must be ' + expected + '. Received ' + recvDesc(actual)), "ERR_INVALID_ARG_TYPE");
+  const errArgValue = (name, value, reason) =>
+    withCode(new TypeError("The argument '" + name + "' " + (reason || "is invalid") + ". Received " + recvDesc(value)), "ERR_INVALID_ARG_VALUE");
+  const errOutOfRange = (name, range, value) =>
+    withCode(new RangeError('The value of "' + name + '" is out of range. It must be ' + range + ". Received " + String(value)), "ERR_OUT_OF_RANGE");
+  // node normalizeSpawnArguments: `serialization` is 'json' (default) or
+  // 'advanced'; anything else is ERR_INVALID_ARG_VALUE on options.serialization.
+  const validateSerialization = (s) => {
+    if (s === undefined || s === null) return "json";
+    if (s !== "json" && s !== "advanced") throw errArgValue("options.serialization", s, "must be one of: 'json', 'advanced'");
+    return s;
   };
   const nullCheck = (v, name) => {
     if (typeof v === "string" && v.indexOf("\u0000") !== -1) throw errArgValue(name, v, "must be a string without null bytes");
@@ -737,31 +830,78 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     return { file, args, options, callback };
   };
 
+  // The options object handed to the native sync spawner. It is a COPY: the
+  // caller's options must not grow mbun-internal keys, and the signal name is
+  // resolved here so the native layer never needs a signal table.
+  const syncOpts = (o) => {
+    const out = {};
+    if (o != null) for (const k of Object.keys(o)) out[k] = o[k];
+    if (o != null && o.timeout != null && o.timeout > 0) {
+      out.timeoutMs = o.timeout;
+      out.killSignalNum = mapSig(o.killSignal == null ? "SIGTERM" : o.killSignal);
+    }
+    return out;
+  };
+  // node spawn_sync.cc: a child killed by the timeout reports the kill signal in
+  // `signal`, a null `status`, and an ETIMEDOUT SystemError in `error`.
+  const applySyncTimeout = (r, cmd, args, o) => {
+    if (!r.timedOut) return;
+    const name = o != null && o.killSignal != null ? o.killSignal : "SIGTERM";
+    const err = new Error("spawnSync " + cmd + " ETIMEDOUT");
+    err.code = "ETIMEDOUT"; err.errno = uvErrno("ETIMEDOUT", -110);
+    err.syscall = "spawnSync " + cmd; err.path = cmd; err.spawnargs = args;
+    r.error = err;
+    r.status = null;
+    r.signal = typeof name === "number" ? (SIGNAME[name] || ("SIG" + name)) : String(name);
+  };
+
   function spawnSync(cmd, a, o) {
     const nz = normalizeSpawnArgs(cmd, a, o);
     cmd = nz.file;
-    const n = { args: nz.args, opts: nz.options };
+    const n = { args: nz.args, opts: syncOpts(nz.options) };
     const exe = resolveExe(cmd);
+    // ONE String() per argument: an argument's toString() is observable and node
+    // stringifies it exactly once (test-child-process-spawnsync-non-string-args
+    // asserts that with a mustCall toString).
+    const argv = n.args.map(toStr);
     if (exe === null) {
       const err = new Error("spawnSync " + cmd + " ENOENT");
-      err.code = "ENOENT"; err.errno = -2; err.syscall = "spawnSync " + cmd; err.path = cmd; err.spawnargs = n.args.map(toStr);
+      err.code = "ENOENT"; err.errno = -2; err.syscall = "spawnSync " + cmd; err.path = cmd; err.spawnargs = argv;
       return { pid: 0, output: [null, null, null], stdout: null, stderr: null, status: null, signal: null, error: err };
     }
-    const r = CP.spawnSync(cmd, n.args.map(toStr), n.opts);
+    const r = CP.spawnSync(cmd, argv, n.opts);
     if (r.errno != null) {  // child-side pre-exec failure (EPERM/ENOENT/…)
       const code = ERRNO[r.errno] || ("errno " + r.errno);
       const err = new Error("spawnSync " + cmd + " " + code);
-      err.code = code; err.errno = -1; err.syscall = "spawnSync " + cmd; err.path = cmd; err.spawnargs = n.args.map(toStr);
+      err.code = code; err.errno = -1; err.syscall = "spawnSync " + cmd; err.path = cmd; err.spawnargs = argv;
       return { pid: r.pid, output: [null, null, null], stdout: null, stderr: null, status: null, signal: null, error: err };
     }
     if (r.signal != null) r.signal = SIGNAME[+r.signal] || ("SIG" + r.signal);
     const enc = n.opts && n.opts.encoding;
-    // Node: with a string encoding stdout/stderr are decoded strings; with no
-    // encoding (or "buffer") they are Buffers. Piped-but-empty stays a 0-len
-    // Buffer; a non-piped fd (inherit/ignore) stays null.
+    // node spawn_sync.cc enforces maxBuffer (default 1 MiB) while it reads: the
+    // moment a pipe's accumulated size passes the limit the child's output is
+    // abandoned and the result carries an ENOBUFS SystemError. The bytes ALREADY
+    // read stay in the result — node reads in 64 KiB chunks, so `stdout` is
+    // routinely larger than a small maxBuffer (test-child-process-spawnsync-maxbuf
+    // asserts exactly that with maxBuffer: 1). mbun's native spawnSync collects
+    // the whole pipe, so the limit is applied to the totals here; the data is
+    // reported unchanged rather than truncated to a chunk boundary this layer
+    // never saw.
+    const rawOut = r.stdout == null ? null : _u8(r.stdout);
+    const rawErr = r.stderr == null ? null : _u8(r.stderr);
+    const maxBuffer = n.opts && n.opts.maxBuffer != null ? n.opts.maxBuffer : 1024 * 1024;
+    if ((rawOut !== null && rawOut.length > maxBuffer) || (rawErr !== null && rawErr.length > maxBuffer)) {
+      const err = new Error("spawnSync " + cmd + " ENOBUFS");
+      err.code = "ENOBUFS"; err.errno = uvErrno("ENOBUFS", -105); err.syscall = "spawnSync " + cmd;
+      err.path = cmd; err.spawnargs = argv;
+      r.error = err;
+      r.status = null; r.signal = null;
+    }
+    applySyncTimeout(r, cmd, argv, nz.options);
+    delete r.timedOut;
     const asStr = enc && enc !== "buffer";
-    if (r.stdout != null) r.stdout = asStr ? String(r.stdout) : Buffer.from(_u8(r.stdout));
-    if (r.stderr != null) r.stderr = asStr ? String(r.stderr) : Buffer.from(_u8(r.stderr));
+    if (r.stdout != null) r.stdout = asStr ? String(r.stdout) : Buffer.from(rawOut);
+    if (r.stderr != null) r.stderr = asStr ? String(r.stderr) : Buffer.from(rawErr);
     r.output = [null, r.stdout, r.stderr];
     return r;
   }
@@ -769,7 +909,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     validateStr(command, "command");
     nullCheck(command, "command");
     if (o != null) { validateObj(o, "options"); validateCommonOpts(o); }
-    const r = CP.spawnSync("/bin/sh", ["-c", command], o || {});
+    const r = CP.spawnSync("/bin/sh", ["-c", command], syncOpts(o));
     if (r.status !== 0) { const e = new Error("Command failed: " + command + (r.stderr == null ? "" : "\n" + r.stderr)); e.status = r.status; e.stdout = r.stdout; e.stderr = r.stderr; throw e; }
     const enc = o && o.encoding;
     // A non-piped stdout (stdio: 'inherit'/'ignore') is null in node, not "".
@@ -779,7 +919,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   function execFileSync(file, a, o) {
     const nf = normalizeExecFileArgs(file, a, o, undefined);
     const nz = normalizeSpawnArgs(nf.file, nf.args, typeof nf.options === "function" ? {} : nf.options);
-    const r = CP.spawnSync(nz.file, nz.args, nz.options);
+    const r = CP.spawnSync(nz.file, nz.args, syncOpts(nz.options));
     if (r.status !== 0) { const e = new Error("execFileSync failed: " + nz.file); e.status = r.status; e.stderr = r.stderr; throw e; }
     const enc = nz.options && nz.options.encoding;
     // A non-piped stdout slot is null, not a buffer.
@@ -829,7 +969,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       cmd = sh; argv = [sh, "-c", command];
     }
     const child = new ChildProcess();
-    child.spawn({ file: cmd, args: argv, cwd: options.cwd, env: options.env, stdio: options.stdio, detached: options.detached, uid: options.uid, gid: options.gid, argv0: options.argv0, timeout: options.timeout, killSignal: options.killSignal, signal: options.signal });
+    child.spawn({ file: cmd, args: argv, cwd: options.cwd, env: options.env, stdio: options.stdio, detached: options.detached, uid: options.uid, gid: options.gid, argv0: options.argv0, timeout: options.timeout, killSignal: options.killSignal, signal: options.signal, serialization: validateSerialization(options.serialization) });
     return child;
   }
 
@@ -901,7 +1041,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     // module path so the child inherits the same runtime flags.
     const execArgv = options.execArgv !== undefined ? options.execArgv : ((G.process && G.process.execArgv) || []);
     const child = new ChildProcess();
-    child.spawn({ file: exe, args: [exe].concat((execArgv || []).map(toStr), [toStr(modulePath)], (args || []).map(toStr)), cwd: options.cwd, env: options.env, stdio, detached: options.detached, timeout: options.timeout, killSignal: options.killSignal, signal: options.signal });
+    child.spawn({ file: exe, args: [exe].concat((execArgv || []).map(toStr), [toStr(modulePath)], (args || []).map(toStr)), cwd: options.cwd, env: options.env, stdio, detached: options.detached, timeout: options.timeout, killSignal: options.killSignal, signal: options.signal, serialization: validateSerialization(options.serialization) });
     return child;
   }
 
@@ -918,8 +1058,10 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     if (raw == null || raw === "") return;
     const fd = Number(raw);
     if (!Number.isFinite(fd) || fd < 0) return;
+    const advanced = proc.env.NODE_CHANNEL_SERIALIZATION_MODE === "advanced";
     try { delete proc.env.NODE_CHANNEL_FD; } catch (e) {}
-    const ch = makeIpc(fd);
+    try { delete proc.env.NODE_CHANNEL_SERIALIZATION_MODE; } catch (e) {}
+    const ch = makeIpc(fd, advanced);
     const delivery = makeIpcDelivery(proc);
     attachIpc(proc, ch, null);
     SELF_IPC = {
