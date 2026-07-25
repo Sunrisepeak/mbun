@@ -379,6 +379,52 @@ export constexpr std::string_view kNetJS = R"JS(
     }
     pause() { this._paused = true; return this; }
     resume() { this._paused = false; return this; }
+    // stream.Readable#pipe / #unpipe. node's net.Socket is a Duplex, so every
+    // consumer that forwards a socket somewhere else uses pipe() — including
+    // the corpus' own echo fixture (test/fixtures/tls-connect.js does
+    // `conn.pipe(conn)`), which a missing pipe turned into a TypeError before
+    // the test's real assertions ever ran. This transport is already in flowing
+    // mode ('data' is emitted as bytes arrive), so pipe is the flowing-mode
+    // forwarder: write each chunk, honour the destination's backpressure by
+    // pausing until it drains, and end the destination on 'end' unless
+    // { end: false }. Errors are NOT forwarded (node parity).
+    pipe(dest, options) {
+      if (!dest || typeof dest.write !== "function") throw new TypeError("The \"destination\" argument must be a writable stream");
+      const src = this;
+      const endDest = !(options && options.end === false);
+      // Self-pipe (an echo server) must not apply backpressure to itself:
+      // pausing the read side is what would let the write queue drain.
+      const selfPipe = dest === src;
+      const onData = (chunk) => {
+        const ok = dest.write(chunk);
+        if (ok === false && !selfPipe) {
+          src.pause();
+          dest.once("drain", () => { if (!src.destroyed) src.resume(); });
+        }
+      };
+      const onEnd = () => { if (endDest && typeof dest.end === "function") { try { dest.end(); } catch (e) {} } };
+      const entry = { dest, onData, onEnd };
+      if (!this._pipes) this._pipes = [];
+      this._pipes.push(entry);
+      src.on("data", onData);
+      src.on("end", onEnd);
+      try { if (typeof dest.emit === "function") dest.emit("pipe", src); } catch (e) {}
+      if (this._paused) this.resume();
+      return dest;
+    }
+    unpipe(dest) {
+      const pipes = this._pipes;
+      if (!pipes || !pipes.length) return this;
+      const keep = [];
+      for (const p of pipes) {
+        if (dest !== undefined && p.dest !== dest) { keep.push(p); continue; }
+        this.removeListener("data", p.onData);
+        this.removeListener("end", p.onEnd);
+        try { if (p.dest && typeof p.dest.emit === "function") p.dest.emit("unpipe", this); } catch (e) {}
+      }
+      this._pipes = keep;
+      return this;
+    }
     // stream.Readable#unshift: push bytes back to the front of the read queue.
     // node's HTTP client hands the bytes that followed a 101 header to the
     // 'upgrade' listener, and every upgrade consumer (npm `ws`

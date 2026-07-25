@@ -261,6 +261,12 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
       }
       this.context = newNativeSecureContext(options);
       this.servername = options ? options.servername : undefined;
+      // Keep the validated options: node hands a SecureContext to
+      // `new tls.TLSSocket(sock, { secureContext })` and the live handshake layer
+      // (js_tls_live.cppm) has to recover cert/key/ca from it — without this the
+      // server side started with no certificate at all and OpenSSL answered
+      // every ClientHello with "no shared cipher".
+      this._secureOptions = options || {};
     }
   };
   function SecureContext(options) { return new InternalSecureContext(options); }
@@ -516,9 +522,17 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
   // frozen rootCertificates bundle for default/system/bundled, empty for 'extra';
   // result is cached so repeated calls return the same reference (node parity).
   let _caCache = null;
+  // tls.setDefaultCACertificates() replaces the 'default' store only; 'bundled'
+  // and 'system' keep reporting the built-in bundle (node parity).
+  let _defaultCAs = null;
   function getCACertificates(type) {
     const t = type === undefined ? "default" : type;
-    if (t === "default" || t === "system" || t === "bundled") {
+    if (t === "default") {
+      if (_defaultCAs !== null) return _defaultCAs;
+      if (_caCache === null) _caCache = Object.freeze(rootCertificates.slice());
+      return _caCache;
+    }
+    if (t === "system" || t === "bundled") {
       if (_caCache === null) _caCache = Object.freeze(rootCertificates.slice());
       return _caCache;
     }
@@ -526,6 +540,59 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
     const e = new TypeError("The argument 'type' must be one of: 'default', 'system', 'bundled', 'extra'. Received " + JSON.stringify(type));
     e.code = "ERR_INVALID_ARG_VALUE";
     throw e;
+  }
+  // tls.setDefaultCACertificates(certs): accepts PEM strings and any
+  // ArrayBufferView holding PEM text. node feeds the concatenation to OpenSSL's
+  // PEM reader, so the failure modes are: no PEM block at all in the input ->
+  // ERR_CRYPTO_OPERATION_FAILED, a PEM block OpenSSL cannot decode ->
+  // ERR_OSSL_PEM_ASN1_LIB. Either way the previous default store is left intact
+  // (the operation is all-or-nothing) and duplicates collapse to one entry.
+  const CERT_BLOCK_RE = /-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g;
+  function toPemText(v) {
+    if (typeof v === "string") return v;
+    if (ArrayBuffer.isView(v)) {
+      const u8 = new Uint8Array(v.buffer, v.byteOffset, v.byteLength);
+      if (Buffer) return Buffer.from(u8).toString("utf8");
+      let s = ""; for (let i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]);
+      return s;
+    }
+    if (v instanceof ArrayBuffer) {
+      const u8 = new Uint8Array(v);
+      if (Buffer) return Buffer.from(u8).toString("utf8");
+      let s = ""; for (let i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]);
+      return s;
+    }
+    throw ERR_INVALID_ARG_TYPE("certs", ["string", "Buffer", "TypedArray", "DataView"], v);
+  }
+  function setDefaultCACertificates(certs) {
+    if (!Array.isArray(certs)) throw ERR_INVALID_ARG_TYPE("certs", "Array", certs);
+    const blocks = [];
+    for (const item of certs) {
+      const text = toPemText(item);
+      const found = text.match(CERT_BLOCK_RE);
+      if (found) for (const b of found) blocks.push(b);
+    }
+    if (blocks.length === 0 && certs.length !== 0) {
+      const e = new Error("No valid certificates found in the provided array");
+      e.code = "ERR_CRYPTO_OPERATION_FAILED";
+      throw e;
+    }
+    const seen = new Set();
+    const out = [];
+    for (const pem of blocks) {
+      let parsed;
+      try { parsed = asym && typeof asym.x509parse === "function" ? asym.x509parse(pem) : null; }
+      catch (err) {
+        const e = new Error(err && err.message ? err.message : "error:0688010A:PEM routines::ASN.1 library");
+        e.code = "ERR_OSSL_PEM_ASN1_LIB";
+        throw e;
+      }
+      const key = parsed ? (String(parsed.serialNumber) + "|" + String(parsed.issuer) + "|" + String(parsed.subject)) : pem;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(pem);
+    }
+    _defaultCAs = Object.freeze(out);
   }
 
   // ---- install onto the node:tls module object ----
@@ -539,6 +606,7 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
     DEFAULT_ECDH_CURVE,
     getCiphers,
     getCACertificates,
+    setDefaultCACertificates,
     parseCertString,
     SecureContext,
     Server,
