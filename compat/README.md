@@ -182,6 +182,48 @@ request-smuggling fix took **bun's own** `request-smuggling.test.ts` from 53 to
    about a contract, not the contract itself. Read the upstream test's own
    statement of intent before treating its expectations as a requirement.
 
+## Allocate agents by cause family, not by subsystem
+
+A round that split three agents across `tls`, `http` and `fs` returned +10, +11
+and +39 where the historical per-task mean was +52. Diminishing returns is part
+of it and is real — ten prior rounds had already stripped the cheap clusters.
+But re-classifying the 299 remaining files by **cause** instead of by subsystem
+showed the bigger problem:
+
+| cause family | files | tls / http / fs |
+| --- | --- | --- |
+| value / assertion divergence | 151 | 59 / 60 / 32 |
+| **timeout / hang** | **45** | 16 / 24 / 5 |
+| **re-spawn, needs node internals** | **31** | 13 / 8 / 10 |
+| **`internalBinding` namespace** | **25** | 11 / 6 / 8 |
+
+**Every family spans all three subsystems.** 101 files — 34% of the remainder —
+sat in three families that cut across all three agents, so each agent attacked
+the same mechanisms independently while seeing only a third of the evidence.
+Triple the work, a third of the signal. `internalBinding` and re-spawn are in
+fact *one* piece of work worth 56 files across all three.
+
+Two further causes, both worth designing against:
+
+- **A "guarantee 100%" target misallocates effort.** It pushes an agent to spread
+  across every remaining file instead of going deep on the densest block. All
+  three agents reported the same shape: the mechanical clusters ate the budget
+  and the hard blocks were never opened. The largest single block in the
+  remainder — 45 hangs — received **zero minutes** across 300+ minutes of
+  budget. Assign a block and an explicit ordering instead: open it first, report
+  it before touching anything else.
+- **Measurement overhead is an estimated 40–50% of a 100-minute budget** (a
+  4433-file run is ~9–10 min at `--jobs 8`; a 1000-file guard ~3 min; plus a
+  build per cycle). Hand the agent a baseline you already hold and forbid
+  re-measuring it, scope its guard to the diff-derived set with `--files`, and
+  run the authoritative full corpus once yourself at integration.
+
+**And match the method to the family.** One-sweep-then-fix is right for a known
+missing layer or a binding surface — an agent using it reported *9 of 13
+spot-checked files passing on the first build*. It is wrong for hangs, which need
+per-file teardown tracing and cannot be batch-implemented. Splitting by cause
+family is what lets each block get the method that suits it.
+
 ## Estimating a round target
 
 Targets used to be guesses. [`data/round-estimates.json`](data/round-estimates.json)
