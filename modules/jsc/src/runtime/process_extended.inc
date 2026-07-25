@@ -536,11 +536,24 @@ JSValueRef process_cwd_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_
 JSValueRef process_chdir_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                             const JSValueRef args[], JSValueRef* exc) {
     if (argc < 1) return JSValueMakeUndefined(ctx);
-    std::error_code ec;
-    std::filesystem::current_path(std::filesystem::path{val_to_string(ctx, args[0])}, ec);
-    if (ec && exc != nullptr) {
-        *exc = make_string(ctx, "ENOENT: no such file or directory, chdir '" +
-                                    val_to_string(ctx, args[0]) + "'");
+    const std::string dest{val_to_string(ctx, args[0])};
+    // node throws a real uvException here, not a string: an Error carrying
+    // .code/.errno/.syscall/.path (the cwd we failed to leave) and .dest (the
+    // requested directory), with the two-path message shape
+    // "ENOENT: no such file or directory, chdir '<cwd>' -> '<dest>'".
+    // test-process-chdir-errormessage asserts every one of those fields; a
+    // thrown string satisfied none of them. fs_make_error parses that exact
+    // layout (io_bindings.inc), so reuse it rather than rebuilding the error.
+    if (::chdir(dest.c_str()) != 0) {
+        const int e{errno};
+        if (exc != nullptr) {
+            std::error_code cwdEc;
+            const std::string cwd{std::filesystem::current_path(cwdEc).string()};
+            std::string code{fd_errno_code(e)};
+            if (code.empty()) code = "UNKNOWN";
+            *exc = fs_make_error(ctx, code + ": " + fd_errno_message(e) + ", chdir '" + cwd +
+                                          "' -> '" + dest + "'");
+        }
     }
     return JSValueMakeUndefined(ctx);
 }

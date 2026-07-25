@@ -467,8 +467,21 @@ public:
             ".call(globalThis.module.exports, globalThis.exports, globalThis.require, "
             "globalThis.module, globalThis.__filename, globalThis.__dirname, globalThis.require)"};
         if (script.starts_with("#!")) script.replace(0, 2, "//");
-        const std::string entryScript{"(function (" + cjsParams + ") {" + script + "\n})" +
-                                      cjsArgs + ";"};
+        // A throw escaping the ENTRY script is an uncaught exception like any
+        // other: node hands it to 'uncaughtExceptionMonitor', the capture
+        // callback and 'uncaughtException' before deciding the process's fate.
+        // mbun used to let it fall out of eval_void into fail_run_, so a
+        // top-level throw bypassed every handler the script had installed —
+        // process.on('uncaughtException') simply did not work for the entry
+        // file. When nothing claims it, __mbun_uncaught arms the same fatal
+        // channel the pump uses, so the unclaimed case is unchanged (report +
+        // status 1). The wrapper stays on line 1, like the CommonJS prefix
+        // above, so reported line numbers do not move.
+        const std::string entryScript{"try{(function (" + cjsParams + ") {" + script + "\n})" +
+                                      cjsArgs + ";}catch(__mbun_entry_err){"
+                                      "if(globalThis.__mbun_uncaught)"
+                                      "globalThis.__mbun_uncaught(__mbun_entry_err);"
+                                      "else throw __mbun_entry_err;}"};
         // A top-level-await entry (flagged by the transpiler) goes straight to the
         // async wrapper: in script mode `await (expr)` would otherwise PARSE as a
         // call to an `await` identifier and fail at run time, after side effects.
@@ -655,10 +668,18 @@ public:
             }
         }
         if (fatal_pending_()) {
+            // node's fatal report is NOT prefixed: the header line starts at
+            // column 0 with "Name: message" and the frames follow, then a
+            // "Node.js vX.Y.Z" trailer. The old "error: " prefix (bun's shape)
+            // broke every corpus assertion anchored with /^Error/ — and the
+            // one-line report with no frames left the failure untriageable.
+            // The message itself is built in JS (js_builtins
+            // :node_process_lifecycle describe()), which is where the stack is.
             if (auto m{eval_to_string("globalThis.__mbun_fatal_message()")}; m && !m->empty()) {
-                std::cerr << "error: " << *m << '\n';
+                std::cerr << *m << '\n';
             }
-            status = 1;
+            auto fs{eval_number("globalThis.__mbun_fatal_exit_code?__mbun_fatal_exit_code():1")};
+            status = (fs && *fs > 0) ? static_cast<int>(*fs) : 1;
         } else if (unhandledRejection_) {
             report_unhandled_rejection_();
             status = 1;
@@ -1474,7 +1495,13 @@ public:
   // `title` is installed natively above so a `--title=<name>` runtime flag (which
   // a `--compile`d executable can carry in its baked execArgv) survives; the ??=
   // keeps "bun" as the default for every ordinary run.
-  p.pid = 1; p.ppid = 0; p.exitCode = 0; p.title ??= "bun";
+  // exitCode starts UNDEFINED, not 0: node's per_thread.js leaves the slot
+  // unset until something assigns it, and the corpus reads that difference
+  // directly ('exit' listeners assert `process.exitCode === undefined` when the
+  // process is leaving cleanly — test/common/process-exit-code-cases.js
+  // zeroExitWithUncaughtHandler). A 0 here also makes `process.exitCode ?? x`
+  // and `if (process.exitCode)` disagree with node.
+  p.pid = 1; p.ppid = 0; p.exitCode = undefined; p.title ??= "bun";
   // Resolved at CALL time, never captured: neither queueMicrotask nor the
   // uncaught-exception wrapper over it (js_builtins :node_process_lifecycle)
   // exists yet at this point in startup, and a throw escaping a nextTick
@@ -1779,6 +1806,8 @@ public:
         set_fn(ctx_, pn, "sendmsgFd", proc_sendmsg_fd_cb);
         set_fn(ctx_, pn, "recvmsgFd", proc_recvmsg_fd_cb);
         set_fn(ctx_, pn, "setenv", proc_setenv_cb);
+        set_fn(ctx_, pn, "setTimeZone", proc_set_timezone_cb);
+        set_fn(ctx_, pn, "drainMicrotasks", proc_drain_microtasks_cb);
 #endif
         set_prop(ctx_, global, "__mbunProcNative", pn);
         // bun:ffi native backend (Bun.FFI): dlopen + SysV call path + read/ptr.

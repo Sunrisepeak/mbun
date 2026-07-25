@@ -67,6 +67,12 @@
 // API leaves null (see engine.inc create_context_).
 #include <JavaScriptCore/GlobalObjectMethodTable.h>
 #include <JavaScriptCore/VM.h>
+// JSDateMath.h (JSC::DateCache) + wtf/DateMath.h (WTF::setTimeZoneOverride):
+// assigning process.env.TZ has to invalidate the per-VM timezone cache, which
+// only these expose (runtime/process_base.inc proc_set_timezone_cb).
+#include <JavaScriptCore/JSDateMath.h>
+#include <wtf/DateMath.h>
+#include <wtf/text/WTFString.h>
 #include <wtf/text/StringView.h>
 
 // CAP-NAPI (runtime/napi_core.inc + napi_objects.inc): the Node-API layer is
