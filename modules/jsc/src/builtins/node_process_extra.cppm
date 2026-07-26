@@ -719,6 +719,31 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
       };
       let traceHelperShown = false;
       let disableSet = null;
+      // V8's Error.stack opens with "Name: message" and renders frames as
+      // "    at fn (file:line:col)"; JSC's carries only frames, in its own
+      // `fn@file:line:col` syntax. `--trace-warnings` output is read by the
+      // corpus as node's shape (test-worker-execargv matches
+      // /Warning: some warning[\s\S]*at Object\.<anonymous>/), so rebuild it.
+      const tracedStack = (warning) => {
+        const head = (warning.name || "Error") +
+                     (warning.message ? ": " + warning.message : "");
+        const frames = [];
+        for (const raw of String(warning.stack).split("\n")) {
+          const line = raw.trim();
+          if (!line) continue;
+          // Last '@': a function name cannot hold one, a file:// URL can.
+          const at = line.lastIndexOf("@");
+          if (at < 0) { frames.push("    at " + line); continue; }
+          let fn = line.slice(0, at);
+          const loc = line.slice(at + 1);
+          // JSC calls the top-level program frame "global code"; V8 renders
+          // the same frame as "Object.<anonymous>".
+          if (fn === "global code" || fn === "module code") fn = "Object.<anonymous>";
+          if (!loc) { frames.push("    at " + (fn || "<anonymous>") + " (native)"); continue; }
+          frames.push(fn ? "    at " + fn + " (" + loc + ")" : "    at " + loc);
+        }
+        return frames.length ? head + "\n" + frames.join("\n") : head;
+      };
       const onWarning = function onWarning(warning) {
         // --no-warnings suppresses the printer only; the event still fires.
         // Checked HERE rather than at install time because process.execArgv is
@@ -737,12 +762,18 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
         if (!(warning instanceof Error)) return;
         const isDeprecation = warning.name === "DeprecationWarning";
         if (isDeprecation && proc.noDeprecation) return;
-        const trace = !!(proc.traceProcessWarnings || (isDeprecation && proc.traceDeprecation));
+        // node sets process.traceProcessWarnings / traceDeprecation from the
+        // CLI in per_thread.js; mbun's process object carries neither, so the
+        // flags themselves are the source of truth and `--trace-warnings` was
+        // silently ignored (test-worker-execargv runs a Worker with exactly
+        // that execArgv and greps its stderr for the creation site).
+        const trace = !!(proc.traceProcessWarnings || hasFlag("--trace-warnings") ||
+                         (isDeprecation && (proc.traceDeprecation || hasFlag("--trace-deprecation"))));
         let msg = "(" + ((proc.release && proc.release.name) || "node") + ":" + proc.pid + ") ";
         if (warning.code) msg += "[" + warning.code + "] ";
         // node falls back to Error.prototype.toString when the instance's own
         // toString is not callable (test-process-warning test5 sets it to 1).
-        if (trace && warning.stack) msg += String(warning.stack);
+        if (trace && warning.stack) msg += tracedStack(warning);
         else if (typeof warning.toString === "function") msg += String(warning.toString());
         else msg += Error.prototype.toString.call(warning);
         if (typeof warning.detail === "string") msg += "\n" + warning.detail;
@@ -797,6 +828,55 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
       };
       if (typeof proc.on === "function" && proc.listenerCount("warning") === 0) {
         proc.on("warning", onWarning);
+      }
+
+      // ---- flags that arrive through NODE_OPTIONS ---------------------------
+      // node applies a NODE_OPTIONS flag exactly as if it had been typed on the
+      // command line, but keeps it OUT of process.execArgv — so a flag sourced
+      // only from the environment has to be looked up separately. The corpus
+      // reaches mbun this way whenever a test spawns a child with an env
+      // (test-worker-node-options passes --title / --trace-exit to fixtures).
+      const envFlagValue = (name) => {
+        const own = flagValue(name);
+        if (own !== undefined) return own;
+        const raw = (proc.env && proc.env.NODE_OPTIONS) || "";
+        for (const word of String(raw).split(/\s+/)) {
+          if (word === name) return "";
+          if (word.startsWith(name + "=")) return word.slice(name.length + 1);
+        }
+        return undefined;
+      };
+
+      // `--title=<name>` from NODE_OPTIONS. The runtime's own command line is
+      // handled in C++ (engine.inc reads gExecArgv before process exists); this
+      // is the environment half of the same option.
+      {
+        const t = envFlagValue("--title");
+        if (t) { try { proc.title = t; } catch (e) {} }
+      }
+
+      // `--trace-exit`: node prints a warning plus the call site every time
+      // process.exit() leaves the environment (src/node_process_methods.cc
+      // ProcessExit -> Environment::Exit with trace_exit). Wrapping the native
+      // exit is the whole of it — a natural loop drain is not an Exit() and
+      // must stay silent.
+      if (envFlagValue("--trace-exit") !== undefined && typeof proc.exit === "function" &&
+          !proc.exit.__mbunTraceExit) {
+        const nativeExit = proc.exit;
+        const traced = function exit(code) {
+          try {
+            const e = new Error();
+            e.name = "Trace";
+            const frames = tracedStack(e).split("\n").slice(1).join("\n");
+            const head = "(" + ((proc.release && proc.release.name) || "node") + ":" + proc.pid +
+                         ") WARNING: Exited the environment with code " +
+                         (code === undefined || code === null ? (proc.exitCode || 0) : code);
+            proc.stderr.write(frames ? head + "\n" + frames + "\n" : head + "\n");
+          } catch (e) {}
+          return nativeExit.call(proc, code);
+        };
+        traced.__mbunTraceExit = true;
+        proc.exit = traced;
       }
     } catch (e) {}
 

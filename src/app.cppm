@@ -2026,6 +2026,20 @@ int exec_run_target(std::string_view target, std::span<const std::string_view> p
         if (std::filesystem::exists(p, ec) && !std::filesystem::is_directory(p, ec)) {
             return run_script(target, passthrough);
         }
+        // node resolves the MAIN entry point through the CommonJS loader, so an
+        // extensionless path gets the same tryExtensions() walk a `require()`
+        // would give it (Module._findPath). `node <dir>/fixtures/some-fixture`
+        // is how several corpus files spawn a fixture
+        // (test-worker-node-options), and mbun answered "Script not found".
+        if (p.extension().empty()) {
+            for (const std::string_view ext : {".js", ".mjs", ".cjs", ".json"}) {
+                const std::string candidate{std::string{target} + std::string{ext}};
+                std::filesystem::path cp{candidate};
+                if (std::filesystem::exists(cp, ec) && !std::filesystem::is_directory(cp, ec)) {
+                    return run_script(candidate, passthrough);
+                }
+            }
+        }
     }
 
     run::PackageScripts pkg{run::load_nearest_package_scripts(cwd)};
