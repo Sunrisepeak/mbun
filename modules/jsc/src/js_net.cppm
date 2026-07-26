@@ -244,6 +244,129 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
   // node's initial default is 500ms; the test harness (common/index.js) reads it,
   // multiplies by 5 and re-sets it (→ 2500), which is what tests assert against.
   let autoSelectFamilyAttemptTimeoutDefault = 500;
+  // node net.js Socket#setTypeOfService: NumberIsNaN first (so NaN is an
+  // ERR_INVALID_ARG_TYPE, not an out-of-range), then validateInt32(0, 255).
+  // NumberIsNaN does not coerce, so a string falls through to validateInt32 and
+  // is reported as a type error too.
+  const validateTOS = (tos, name) => {
+    const NE = G.__mbunNodeErrors;
+    if (typeof tos !== "number" || Number.isNaN(tos)) {
+      if (NE) throw NE.ERR_INVALID_ARG_TYPE(name, "number", tos);
+      const e = new TypeError('The "' + name + '" argument must be of type number. Received ' +
+        (typeof tos === "string" ? "type string ('" + tos + "')" : "type " + typeof tos));
+      e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+    }
+    if (!Number.isInteger(tos) || tos < 0 || tos > 255) {
+      const e = new RangeError('The value of "' + name + '" is out of range. It must be >= 0 && <= 255. Received ' + String(tos));
+      e.code = "ERR_OUT_OF_RANGE"; throw e;
+    }
+  };
+  // ---- node's stream handle (tcp_wrap TCP / pipe_wrap Pipe) ------------------
+  // This reactor owns the descriptor directly, so a Socket needs no handle to
+  // do IO — but node's *observable* net API is defined in terms of one, and the
+  // corpus reads and REPLACES its methods: `client._handle.setNoDelay = fn`
+  // (test-net-connect-nodelay), `socket._handle.setKeepAlive` (…-connect-,
+  // …-server-keepalive), `client._handle.close()` (…-socket-write-after-close)
+  // and `server._handle.onconnection` (…-server-nodelay/-keepalive). Those are
+  // not introspection tricks: node's own net.js *delegates* through the handle
+  // (Socket#setNoDelay/#setKeepAlive/#setTypeOfService, and onconnection arms
+  // the server's per-connection options on the CLIENT handle before the
+  // 'connection' listener ever sees the socket), so the delegation has to be
+  // real here too or the overrides observe nothing.
+  //
+  // Deliberately thin: every method is a setsockopt on an fd this process
+  // already owns, and `fd` is the reactor's descriptor so `handle.fd` compares
+  // equal to what the caller passed in ({ fd } adoption).
+  class NetHandle {
+    constructor(owner, fd) {
+      this.owner = owner;
+      this.fd = typeof fd === "number" ? fd : -1;
+      this._closed = false;
+      this.reading = false;
+    }
+    // node hands the delay in SECONDS (Socket#setKeepAlive does ~~(ms/1000)).
+    // setSockBuf's which=3 reads `size > 0` as the SO_KEEPALIVE switch and the
+    // value as TCP_KEEPIDLE, so an enable with a 0/undefined delay keeps the
+    // 60s idle default this runtime has always used rather than turning the
+    // option back off.
+    setKeepAlive(enable, delaySecs) {
+      if (this.fd >= 0 && !this._closed && NN && NN.setSockBuf) {
+        const secs = enable ? ((+delaySecs > 0) ? (+delaySecs | 0) : 60) : 0;
+        try { NN.setSockBuf(this.fd, 3, secs); } catch (e) {}
+      }
+      return 0;
+    }
+    setNoDelay(enable) {
+      if (this.fd >= 0 && !this._closed && NN && NN.setSockBuf) {
+        try { NN.setSockBuf(this.fd, 4, enable ? 1 : 0); } catch (e) {}
+      }
+      return 0;
+    }
+    // node tcp_wrap SetTypeOfService: IP_TOS (v4) / IPV6_TCLASS (v6), returning
+    // a libuv errno (0 on success). getSockOptInt mirrors the read side.
+    setTypeOfService(tos) {
+      if (this.fd < 0 || this._closed || !NN || !NN.setSockBuf) return -9;  // UV_EBADF
+      try { NN.setSockBuf(this.fd, 5, tos | 0); } catch (e) { return -1; }
+      return 0;
+    }
+    getTypeOfService() {
+      if (this.fd < 0 || this._closed || !NN || !NN.getSockOptInt) return 0;
+      try { return NN.getSockOptInt(this.fd, 5) | 0; } catch (e) { return 0; }
+    }
+    getsockname(out) {
+      const o = this.owner;
+      if (!o || !out) return -9;
+      out.address = o.localAddress; out.port = o.localPort; out.family = "IPv4";
+      return 0;
+    }
+    getpeername(out) {
+      const o = this.owner;
+      if (!o || !out) return -9;
+      out.address = o.remoteAddress; out.port = o.remotePort; out.family = o.remoteFamily || "IPv4";
+      return 0;
+    }
+    ref() { const o = this.owner; if (o && typeof o.ref === "function") o.ref(); }
+    unref() { const o = this.owner; if (o && typeof o.unref === "function") o.unref(); }
+    readStart() { this.reading = true; return 0; }
+    readStop() { this.reading = false; return 0; }
+    // node's handle.close() closes the descriptor WITHOUT destroying the
+    // JS-side socket: the stream stays alive and its next write fails with
+    // EBADF. That difference is exactly what test-net-socket-write-after-close
+    // asserts, so this must not route through Socket#destroy().
+    close(cb) {
+      if (!this._closed) {
+        this._closed = true;
+        const o = this.owner;
+        if (this.fd >= 0) { try { NN.close(this.fd); } catch (e) {} }
+        if (o && o._fd === this.fd) { o._fd = -1; NET.items.delete(o); o._loopOpen = false; NET.release(o); }
+        this.fd = -1;
+      }
+      if (typeof cb === "function") G.queueMicrotask(cb);
+      return 0;
+    }
+  }
+  // The listen-side twin of NetHandle (node tcp_wrap/pipe_wrap on a bound
+  // socket). Its whole reason to exist is `onconnection`: node's accept path is
+  // `handle.onconnection(err, clientHandle)`, and both the corpus
+  // (test-net-server-nodelay/-keepalive) and node's own cluster round-robin
+  // handle intercept it there.
+  class ServerHandle {
+    constructor(owner) { this.owner = owner; this.fd = -1; this._closed = false; this.onconnection = null; }
+    getsockname(out) {
+      const a = this.owner && this.owner._addr;
+      if (!a || !out) return -9;
+      out.address = a.address; out.port = a.port; out.family = a.family;
+      return 0;
+    }
+    listen() { return 0; }
+    ref() { const o = this.owner; if (o && typeof o.ref === "function") o.ref(); }
+    unref() { const o = this.owner; if (o && typeof o.unref === "function") o.unref(); }
+    close(cb) {
+      if (!this._closed) { this._closed = true; const o = this.owner; if (o && typeof o.close === "function") o.close(); this.fd = -1; }
+      if (typeof cb === "function") G.queueMicrotask(cb);
+      return 0;
+    }
+  }
   class Socket extends EE {
     constructor(opts) {
       super();
@@ -251,6 +374,28 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       this._fd = -1; this._wq = []; this._wqLen = 0; this._needDrain = false;
       this._shutW = false; this._shutSent = false; this._eof = false; this._closeEmitted = false;
       this._paused = false; this._enc = null; this._everRead = false;
+      // node net.js Socket: `this[kHandle] = null` until connect()/adoption, and
+      // the three deferred socket options it caches until a handle exists.
+      // `_hadHandle` is this runtime's marker for "there WAS a handle" so that
+      // a write after `socket._handle = null` is ERR_SOCKET_CLOSED (node's
+      // `if (!this._handle) cb(new ERR_SOCKET_CLOSED())`) while a write on a
+      // never-connected socket keeps queueing as before.
+      this._handle = null; this._hadHandle = false;
+      // node net.js Socket ctor: validateNumber + clamp, before ~~(ms/1000).
+      if (opts.keepAliveInitialDelay !== undefined) {
+        if (typeof opts.keepAliveInitialDelay !== "number") {
+          const NE = G.__mbunNodeErrors;
+          if (NE) throw NE.ERR_INVALID_ARG_TYPE("options.keepAliveInitialDelay", "number", opts.keepAliveInitialDelay);
+          const e = new TypeError('The "options.keepAliveInitialDelay" argument must be of type number. Received ' + typeof opts.keepAliveInitialDelay);
+          e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+        }
+        if (opts.keepAliveInitialDelay < 0) opts.keepAliveInitialDelay = 0;
+      }
+      this._kSetNoDelay = Boolean(opts.noDelay);
+      this._kSetKeepAlive = Boolean(opts.keepAlive);
+      this._kSetKeepAliveDelay = ~~(opts.keepAliveInitialDelay / 1000);
+      if (opts.typeOfService !== undefined) validateTOS(opts.typeOfService, "options.typeOfService");
+      this._kSetTOS = opts.typeOfService;
         // http's read-side interception and park queue (w5/agent-http): a socket
         // that receives bytes before anything reads used to DROP them.
         this._dataSink = null;
@@ -327,6 +472,12 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       if (NN && NN.track) { try { NN.track(fd); } catch (e) {} }
       this._fd = fd; this.pending = false; this.destroyed = false; this.connecting = false;
       this.readable = true; this.writable = true;
+      // node initSocketHandle: the handle IS the descriptor's owner, so an
+      // adopted fd either binds to the handle connect() already made (the
+      // reactor connects synchronously) or gets a fresh one.
+      if (this._handle && !this._handle._closed) this._handle.fd = fd;
+      else { this._handle = new NetHandle(this, fd); }
+      this._hadHandle = true;
       this._shutW = false; this._shutSent = false; this._eof = false; this._closeEmitted = false;
       NET.items.add(this);
       // An open socket holds the event loop open (node: uv_tcp_t is ref'd until
@@ -398,6 +549,12 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       } else if (a.length === 0 || a[0] === undefined || a[0] === null) {
         throw nErr(TypeError, "ERR_MISSING_ARGS", 'The "options" or "port" or "path" argument must be specified');
       }
+      // node Socket.prototype.connect: `if (!this._handle) { this._handle = new
+      // TCP/Pipe(...); initSocketHandle(this); }` — SYNCHRONOUSLY, before the
+      // lookup/connect is even started. Callers rely on that being observable
+      // straight after connect() returns (`client._handle.setNoDelay = fn` in
+      // test-net-connect-nodelay), so it cannot wait for _adopt().
+      if (!this._handle) { this._handle = new NetHandle(this, -1); this._hadHandle = true; }
       let port = 0, host = "localhost", cb = null, unixPath = null;
       if (typeof a[0] === "object" && a[0] !== null) { unixPath = a[0].path ? String(a[0].path) : null; port = a[0].port | 0; host = a[0].host || "localhost"; cb = typeof a[1] === "function" ? a[1] : null; }
       // node normalizeArgs/isPipeName: a non-numeric string first argument is a
@@ -471,7 +628,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
           catch (e) { self.connecting = false; const err = connectError(e, addr, port); G.queueMicrotask(() => { if (self.destroyed) return; self.emit("error", err); self.destroy(); }); return self; }
           self._adopt(fd2); self.remotePort = port;
           self.connecting = true;
-          G.queueMicrotask(() => { if (self.destroyed) { self.connecting = false; return; } self.connecting = false; self._flushPreConnect(null); self.emit("connect"); self.emit("ready"); });
+          G.queueMicrotask(() => { if (self.destroyed) { self.connecting = false; return; } self.connecting = false; self._flushPreConnect(null); self._applyDeferredSockOpts(); self.emit("connect"); self.emit("ready"); });
           return self;
         };
         const hf = _famOf(host);
@@ -522,8 +679,22 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       // connect() already completed synchronously. A destroy() in between must
       // cancel the pending 'connect' rather than resurrect the socket.
       this.connecting = true;
-      G.queueMicrotask(() => { if (this.destroyed) { this.connecting = false; return; } this.connecting = false; this._flushPreConnect(null); this.emit("connect"); this.emit("ready"); });
+      G.queueMicrotask(() => { if (this.destroyed) { this.connecting = false; return; } this.connecting = false; this._flushPreConnect(null); this._applyDeferredSockOpts(); this.emit("connect"); this.emit("ready"); });
       return this;
+    }
+    // node net.js afterConnect: the options cached by the Socket constructor
+    // (noDelay / keepAlive / typeOfService) are pushed to the handle once the
+    // connection is up, right before 'connect' — never earlier, which is what
+    // makes a caller's `client._handle.setNoDelay = fn` observe the call.
+    _applyDeferredSockOpts() {
+      const h = this._handle;
+      if (!h) return;
+      if (this._kSetNoDelay && h.setNoDelay) h.setNoDelay(true);
+      if (this._kSetKeepAlive && h.setKeepAlive) h.setKeepAlive(true, this._kSetKeepAliveDelay);
+      if (this._kSetTOS !== undefined && h.setTypeOfService) {
+        const err = h.setTypeOfService(this._kSetTOS);
+        if (err) this.emit("error", mkErr("setTypeOfService returned " + err, "ERR_SOCKET_SETTOS"));
+      }
     }
     setEncoding(enc) { this._enc = enc || "utf8"; return this; }
     // node net.Socket.setTimeout: an idle timer that emits 'timeout' after
@@ -573,16 +744,55 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
         if (this._timeoutTimer && typeof this._timeoutTimer.unref === "function") this._timeoutTimer.unref();
       }
     }
-    setNoDelay() { return this; }
-    // node net.Socket#setKeepAlive(enable, initialDelayMs): SO_KEEPALIVE plus
-    // TCP_KEEPIDLE (seconds). The agent arms this on every pooled socket.
-    setKeepAlive(enable, initialDelay) {
-      const on = enable === undefined ? true : !!enable;
-      if (this._fd >= 0 && NN && NN.setSockBuf) {
-        const secs = on ? Math.max(1, Math.round((+initialDelay || 0) / 1000) || 60) : 0;
-        try { NN.setSockBuf(this._fd, 3, secs); } catch (e) {}
+    // node net.js Socket#setNoDelay: cached while there is no handle, and
+    // delegated to it only when the value actually CHANGES — that "only on
+    // change" rule is what test-net-server-nodelay asserts (the accept path
+    // already armed noDelay, so the listener's own setNoDelay(true) must not
+    // reach the handle a second time).
+    setNoDelay(enable) {
+      enable = Boolean(enable === undefined ? true : enable);
+      if (!this._handle) { this._kSetNoDelay = enable; return this; }
+      if (this._handle.setNoDelay && enable !== this._kSetNoDelay) {
+        this._kSetNoDelay = enable;
+        this._handle.setNoDelay(enable);
       }
       return this;
+    }
+    // node net.Socket#setKeepAlive(enable, initialDelayMs): SO_KEEPALIVE plus
+    // TCP_KEEPIDLE. node converts to SECONDS here and the handle receives
+    // seconds. The agent arms this on every pooled socket.
+    setKeepAlive(enable, initialDelayMsecs) {
+      enable = Boolean(enable);
+      const initialDelay = ~~(initialDelayMsecs / 1000);
+      if (!this._handle) {
+        this._kSetKeepAlive = enable; this._kSetKeepAliveDelay = initialDelay;
+        return this;
+      }
+      if (!this._handle.setKeepAlive) return this;
+      if (enable !== this._kSetKeepAlive || (enable && this._kSetKeepAliveDelay !== initialDelay)) {
+        this._kSetKeepAlive = enable; this._kSetKeepAliveDelay = initialDelay;
+        this._handle.setKeepAlive(enable, initialDelay);
+      }
+      return this;
+    }
+    // node net.js Socket#setTypeOfService / #getTypeOfService: IP_TOS, cached
+    // until a handle exists (the corpus sets it BEFORE connect and reads the
+    // applied value back after).
+    setTypeOfService(tos) {
+      validateTOS(tos, "tos");
+      if (!this._handle || !this._handle.setTypeOfService) { this._kSetTOS = tos; return this; }
+      if (tos !== this._kSetTOS) {
+        this._kSetTOS = tos;
+        const err = this._handle.setTypeOfService(tos);
+        if (err) throw mkErr("setTypeOfService returned " + err, "ERR_SOCKET_SETTOS");
+      }
+      return this;
+    }
+    getTypeOfService() {
+      if (!this._handle || !this._handle.getTypeOfService) return this._kSetTOS !== undefined ? this._kSetTOS : 0;
+      const res = this._handle.getTypeOfService();
+      if (typeof res === "number" && res < 0) throw mkErr("getTypeOfService returned " + res, "ERR_SOCKET_GETTOS");
+      return res;
     }
     // This transport writes through immediately, so corking is bookkeeping
     // only -- but node:http's OutgoingMessage reads writableCorked and pokes
@@ -884,6 +1094,23 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
         e.code = "ERR_INVALID_ARG_TYPE"; throw e;
       }
       if (this.destroyed || this._shutW) { const err = mkErr("write after end", "ERR_STREAM_WRITE_AFTER_END"); if (typeof cb === "function") G.queueMicrotask(() => cb(err)); else this.emit("error", err); return false; }
+      // node _writeGeneric: once the socket is past connecting, a missing handle
+      // is ERR_SOCKET_CLOSED, and a handle whose descriptor was closed under it
+      // (`socket._handle.close()`) fails the write with EBADF. Both surface the
+      // way any write error does — cb(err), else 'error' — and then tear the
+      // socket down (node's errorOrDestroy). test-net-socket-write-after-close
+      // asserts each message verbatim.
+      if (!this.connecting && this._hadHandle && !this._handle) {
+        const err = mkErr("Socket is closed", "ERR_SOCKET_CLOSED");
+        G.queueMicrotask(() => { if (typeof cb === "function") cb(err); else this.emit("error", err); if (!this.destroyed) this.destroy(); });
+        return false;
+      }
+      if (!this.connecting && this._handle && this._handle._closed) {
+        const err = mkErr("write EBADF", "EBADF");
+        err.errno = -9; err.syscall = "write";
+        G.queueMicrotask(() => { if (typeof cb === "function") cb(err); else this.emit("error", err); if (!this.destroyed) this.destroy(); });
+        return false;
+      }
       const b = typeof data === "string" && enc && enc !== "utf8" && enc !== "utf-8" && G.Buffer ? u8(G.Buffer.from(data, enc)) : u8(data);
       // A zero-length chunk must never enter the queue: _flush() stops on the
       // first write() that reports 0 bytes, so an empty head parks every byte
@@ -950,6 +1177,11 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       if (this._readableState) { this._readableState.destroyed = true; this._readableState.readable = false; }
       if (this._timeoutTimer) { G.clearTimeout(this._timeoutTimer); this._timeoutTimer = null; }
       if (this._fd >= 0) { try { NN.close(this._fd); } catch (e) {} this._fd = -1; }
+      // node Socket#_destroy closes the handle and drops it (`this[kHandle] =
+      // null`), which is what makes a later write ERR_SOCKET_CLOSED. Only OUR
+      // handle: tls.TLSSocket installs its own `{ _parentWrap }` shim there for
+      // http2-wrapper and must keep it.
+      if (this._handle instanceof NetHandle) { this._handle._closed = true; this._handle.fd = -1; this._handle = null; }
       NET.items.delete(this);
       this._loopOpen = false; NET.release(this);
       if (err) this.emit("error", err);
@@ -1235,6 +1467,22 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       // test-tls-server-parent-constructor-options reads them directly.
       this.allowHalfOpen = !!this._opts.allowHalfOpen;
       this.pauseOnConnect = !!this._opts.pauseOnConnect;
+      // node net.js Server: the per-connection socket options the accept path
+      // arms on every accepted handle, published as own properties (the corpus
+      // asserts `enable === server.noDelay` from inside its own onconnection
+      // override).
+      if (this._opts.keepAliveInitialDelay !== undefined) {
+        if (typeof this._opts.keepAliveInitialDelay !== "number") {
+          const NE = G.__mbunNodeErrors;
+          if (NE) throw NE.ERR_INVALID_ARG_TYPE("options.keepAliveInitialDelay", "number", this._opts.keepAliveInitialDelay);
+          const e = new TypeError('The "options.keepAliveInitialDelay" argument must be of type number. Received ' + typeof this._opts.keepAliveInitialDelay);
+          e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+        }
+        if (this._opts.keepAliveInitialDelay < 0) this._opts.keepAliveInitialDelay = 0;
+      }
+      this.noDelay = Boolean(this._opts.noDelay);
+      this.keepAlive = Boolean(this._opts.keepAlive);
+      this.keepAliveInitialDelay = ~~(this._opts.keepAliveInitialDelay / 1000);
       if (typeof cb === "function") this.on("connection", cb);
       this._fd = -1; this._addr = null; this.listening = false; this._conns = new Set();
       // node semantics: `_refd` is the sticky user intent (a handle unref'd
@@ -1243,9 +1491,54 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       // unref() was a no-op on a not-yet-listening server and listen() then
       // took an unconditional hold); `_loopOpen` is whether the handle is live.
       this._refd = true; this._held = false; this._loopOpen = false;
+      this._handle = null;
     }
     _hold() { this._loopOpen = true; NET.hold(this); }
     _release() { this._loopOpen = false; NET.release(this); }
+    // node Server._listen2/setupListenHandle: the handle exists the moment the
+    // bind succeeded, synchronously inside listen() — callers read
+    // `server._handle.onconnection` on the very next line.
+    _makeHandle() {
+      const h = new ServerHandle(this);
+      h.fd = this._fd;
+      h.onconnection = (err, clientHandle) => this._onconnection(err, clientHandle);
+      this._handle = h;
+      return h;
+    }
+    // node net.js onconnection(err, clientHandle). Note the ORDER: the server's
+    // per-connection options are armed on the CLIENT HANDLE before the
+    // 'connection' listener runs, and the socket caches the same values so its
+    // own setNoDelay/setKeepAlive see them as already applied.
+    _onconnection(err, clientHandle) {
+      if (err || !clientHandle || typeof clientHandle.fd !== "number" || clientHandle.fd < 0) return;
+      const sock = new Socket({ allowHalfOpen: !!this._opts.allowHalfOpen, highWaterMark: this._opts.highWaterMark });
+      sock._handle = clientHandle; clientHandle.owner = sock;
+      sock._adopt(clientHandle.fd);
+      if (this.noDelay && clientHandle.setNoDelay) {
+        sock._kSetNoDelay = true;
+        clientHandle.setNoDelay(true);
+      }
+      if (this.keepAlive && clientHandle.setKeepAlive) {
+        sock._kSetKeepAlive = true;
+        sock._kSetKeepAliveDelay = this.keepAliveInitialDelay;
+        clientHandle.setKeepAlive(true, this.keepAliveInitialDelay);
+      }
+      sock.localPort = this._addr ? this._addr.port : 0;
+      // node net.js onconnection: `socket.server` is the listener that accepted
+      // it (and `_server` its internal alias).
+      sock.server = this; sock._server = this;
+      // node net.js onconnection: with pauseOnConnect the accepted socket is
+      // handed to the listener already paused, so the consumer decides when the
+      // first byte is read (it may pass the fd elsewhere first).
+      if (this._opts.pauseOnConnect) sock.pause();
+      this._conns.add(sock);
+      sock.once("close", () => this._conns.delete(sock));
+      this.emit("connection", sock);
+      // node onconnection() publishes 'net.server.socket' right after the
+      // 'connection' event.
+      if (netServerSocketChannel.hasSubscribers) netServerSocketChannel.publish({ socket: sock });
+      return sock;
+    }
     listen(...a) {
       let port = 0, host = null, cb = null, unixPath = null;
       // node lib/internal/validators validatePort (allowZero): every listen form
@@ -1375,6 +1668,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
           return this;
         }
         this._fd = ulh.fd;
+        this._makeHandle();
         // node lib/net.js Server.listen: readableAll/writableAll are applied
         // right after the bind via uv_pipe_chmod, which ORs the group/other
         // read/write bits into the socket file's existing mode.
@@ -1415,6 +1709,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
         return this;
       }
       this._fd = lh.fd;
+      this._makeHandle();
       if (netServerListen.hasSubscribers) netServerListen.asyncEnd.publish({ server: this });
       const reportAddr = host === "localhost" ? (isV6 ? "::1" : "127.0.0.1") : host;
       this._addr = { port: lh.port, address: reportAddr, family: isV6 ? "IPv6" : "IPv4" };
@@ -1521,6 +1816,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
         G.queueMicrotask(() => this.emit("close"));
         return this;
       }
+      if (this._handle) { this._handle._closed = true; this._handle.fd = -1; this._handle = null; }
       if (this._fd >= 0) {
         try { NN.close(this._fd); } catch (e) {} this._fd = -1; NET.items.delete(this); this.listening = false;
         this._release();
@@ -1560,17 +1856,15 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
         // builds a Socket for the connection: the raw descriptor is handed to a
         // worker over IPC instead (internal/cluster/round_robin_handle.js).
         if (this._rawAccept) { this._rawAccept(cfd); progress++; continue; }
-        const sock = new Socket({ allowHalfOpen: !!this._opts.allowHalfOpen, highWaterMark: this._opts.highWaterMark })._adopt(cfd);
-        sock.localPort = this._addr ? this._addr.port : 0;
-        sock.server = this; sock._server = this;
-        if (this._opts.pauseOnConnect) sock.pause();
-        this._conns.add(sock);
-        sock.once("close", () => this._conns.delete(sock));
         progress++;
-        this.emit("connection", sock);
-        // node onconnection() publishes 'net.server.socket' right after the
-        // 'connection' event.
-        if (netServerSocketChannel.hasSubscribers) netServerSocketChannel.publish({ socket: sock });
+        // Through the handle, ALWAYS: node dispatches every accepted descriptor
+        // as `handle.onconnection(err, clientHandle)`, and a caller that
+        // replaced that property (cluster's round-robin handle; the corpus's
+        // per-connection option probes) must see it.
+        const clientHandle = new NetHandle(null, cfd);
+        const h = this._handle;
+        if (h && typeof h.onconnection === "function") h.onconnection(0, clientHandle);
+        else this._onconnection(0, clientHandle);
       }
       return progress;
     }

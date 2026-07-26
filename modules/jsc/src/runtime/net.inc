@@ -475,8 +475,49 @@ JSValueRef netn_set_sockbuf_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::
         if (size > 0) (void)setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &size, sizeof size);
 #endif
     }
+    // which == 4: TCP_NODELAY, `size` = 0/1. connect()/accept() already enable
+    // it, so this exists for the DISABLE direction node's socket._handle
+    // .setNoDelay(false) asks for.
+    else if (fd >= 0 && which == 4) {
+        const int on{size > 0 ? 1 : 0};
+        (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof on);
+    }
+    // which == 5: IP_TOS (node tcp_wrap SetTypeOfService). Reported back through
+    // getSockOptInt so socket.getTypeOfService() reads the value the kernel
+    // actually kept (it clears the two ECN bits).
+    else if (fd >= 0 && which == 5) {
+        (void)setsockopt(fd, IPPROTO_IP, IP_TOS, &size, sizeof size);
+    }
 #endif
     return JSValueMakeUndefined(ctx);
+}
+
+// getSockOptInt(fd, which) → the current integer value of one of the options
+// setSockBuf writes (same `which` codes), or -1 when the option cannot be read.
+// Reads an option on a descriptor this process already owns: it acquires no new
+// filesystem or network resource, so there is nothing here for the permission
+// model to gate that connect()/listen() have not already gated.
+JSValueRef netn_get_sockopt_int_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                                   const JSValueRef args[], JSValueRef*) {
+#if defined(_WIN32)
+    return JSValueMakeNumber(ctx, -1);
+#else
+    const int fd{argc > 0 ? static_cast<int>(JSValueToNumber(ctx, args[0], nullptr)) : -1};
+    const int which{argc > 1 ? static_cast<int>(JSValueToNumber(ctx, args[1], nullptr)) : 0};
+    int level{0}, name{0};
+    switch (which) {
+        case 1: level = SOL_SOCKET;  name = SO_SNDBUF;   break;
+        case 2: level = SOL_SOCKET;  name = SO_RCVBUF;   break;
+        case 3: level = SOL_SOCKET;  name = SO_KEEPALIVE; break;
+        case 4: level = IPPROTO_TCP; name = TCP_NODELAY; break;
+        case 5: level = IPPROTO_IP;  name = IP_TOS;      break;
+        default: return JSValueMakeNumber(ctx, -1);
+    }
+    int value{0};
+    socklen_t len{sizeof value};
+    if (fd < 0 || getsockopt(fd, level, name, &value, &len) != 0) return JSValueMakeNumber(ctx, -1);
+    return JSValueMakeNumber(ctx, static_cast<double>(value));
+#endif
 }
 
 // net.wait(ms) → number of fds ready to read. Blocks the pump for at most `ms`
