@@ -237,6 +237,22 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
 
   // ---- node:net — real Socket / Server over the reactor ----------------------
   const HWM = 64 * 1024;
+  // node onconnection(): the accepted socket learns its peer from
+  // uv_tcp_getpeername. mbun had no binding for it, so every server-side socket
+  // reported remotePort 0 and a hard-coded remoteAddress — which only looked
+  // consistent while the CLIENT's localPort was 0 too
+  // (test-net-socket-local-address compares the two lists).
+  const adoptPeer = (sock, fd) => {
+    try {
+      const pn = NN.peername ? NN.peername(fd) : null;
+      if (typeof pn === "string") {
+        const i = pn.lastIndexOf(":");
+        sock.remoteAddress = pn.slice(0, i);
+        sock.remotePort = +pn.slice(i + 1);
+        sock.remoteFamily = "IPv4";
+      }
+    } catch (e) {}
+  };
   // node net.js Happy-Eyeballs default (getDefault/setDefaultAutoSelectFamily*).
   // mbun's connect is single-stack so the value is advisory, but the getter/
   // setter contract (default 2500, floor 10, positive-int validation) is tested.
@@ -836,13 +852,21 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
     // whose reader attaches one microtask later, which is every socket created
     // inside another socket's 'data' handler — lost the answer outright and the
     // client reported "socket hang up" (test-http-should-keep-alive).
-    _rqUndelivered() { return !!(this._rq && this._rq.length); }
+    _rqUndelivered() {
+      if (!this._rq || !this._rq.length) return false;
+      // Bounded grace, not an open-ended hold: only while the parked bytes are
+      // fresh enough that a reader arriving on the microtask checkpoint after
+      // this drain could still take them. A consumer that shows up on a TIMER
+      // instead (test-net-socket-close-after-end reads 100 ms later) keeps the
+      // original teardown timing, where destroy() reports 'end' and closes.
+      return ((NET.gen - this._rqGen) | 0) <= 1;
+    }
     _hasReader() { return !!(this._onread || this._dataSink || this._flowing === true || this.listenerCount("data") > 0); }
     _deliver(chunk) {
       if (this._onread) { this._onreadPush(chunk); return; }
       if (this._dataSink) { this._dataSink(chunk); return; }
       if (!this._hasReader()) {
-        if (!this._rq) { this._rq = []; this._rqLen = 0; }
+        if (!this._rq) { this._rq = []; this._rqLen = 0; this._rqGen = NET.gen; }
         this._rq.push(chunk);
         this._rqLen += chunk.length;
         this._readableState.length = this._rqLen;
@@ -1520,6 +1544,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
             if (er || !clientHandle || typeof clientHandle.fd !== "number" || clientHandle.fd < 0) return;
             const sock = new Socket({ allowHalfOpen: !!this._opts.allowHalfOpen, highWaterMark: this._opts.highWaterMark })._adopt(clientHandle.fd);
             sock.localPort = this._addr ? this._addr.port : 0;
+            adoptPeer(sock, clientHandle.fd);
             // node net.js onconnection: `socket.server` is the listener that
             // accepted it (and `_server` its internal alias).
             sock.server = this; sock._server = this;
@@ -1601,6 +1626,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
         if (this._rawAccept) { this._rawAccept(cfd); progress++; continue; }
         const sock = new Socket({ allowHalfOpen: !!this._opts.allowHalfOpen, highWaterMark: this._opts.highWaterMark })._adopt(cfd);
         sock.localPort = this._addr ? this._addr.port : 0;
+        adoptPeer(sock, cfd);
         sock.server = this; sock._server = this;
         if (this._opts.pauseOnConnect) sock.pause();
         this._conns.add(sock);

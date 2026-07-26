@@ -2076,6 +2076,7 @@ public:
         set_fn(ctx_, nn, "connect", netn_connect_cb);
         set_fn(ctx_, nn, "connectUnix", netn_connect_unix_cb);
         set_fn(ctx_, nn, "sockname", netn_sockname_cb);  // getsockname → localAddress/localPort
+        set_fn(ctx_, nn, "peername", netn_peername_cb);  // getpeername → remoteAddress/remotePort
         set_fn(ctx_, nn, "read", netn_read_cb);
         set_fn(ctx_, nn, "readFd", netn_read_fd_cb);  // read(2) twin for process.stdin's fd 0
         set_fn(ctx_, nn, "readByteBlocking", netn_read_byte_blocking_cb);  // blocking 1-byte read for alert/confirm/prompt

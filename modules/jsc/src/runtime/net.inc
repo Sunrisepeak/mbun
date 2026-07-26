@@ -306,6 +306,29 @@ JSValueRef netn_sockname_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
 #endif
 }
 
+// net.peername(fd) → "address:port" of the REMOTE end (getpeername), or null.
+// The accepted-socket path had no way to learn it, so every server-side
+// socket.remotePort read 0 — which agreed with a client localPort that was also
+// 0 until getsockname landed (test-net-socket-local-address compares the two).
+JSValueRef netn_peername_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                            const JSValueRef args[], JSValueRef* exc) {
+#if defined(_WIN32)
+    return fs_throw(ctx, exc, "net.peername: not supported on Windows yet");
+#else
+    (void)exc;
+    const int fd{argc > 0 ? static_cast<int>(JSValueToNumber(ctx, args[0], nullptr)) : -1};
+    if (fd < 0) return JSValueMakeNull(ctx);
+    sockaddr_in addr{};
+    socklen_t len{sizeof addr};
+    if (getpeername(fd, reinterpret_cast<sockaddr*>(&addr), &len) != 0 || addr.sin_family != AF_INET) {
+        return JSValueMakeNull(ctx);
+    }
+    char buf[INET_ADDRSTRLEN]{};
+    if (inet_ntop(AF_INET, &addr.sin_addr, buf, sizeof buf) == nullptr) return JSValueMakeNull(ctx);
+    return make_string(ctx, std::string{buf} + ":" + std::to_string(ntohs(addr.sin_port)));
+#endif
+}
+
 // net.connectUnix(path) → connection fd: AF_UNIX stream connect for
 // Bun.connect({unix}). Only the address differs from netn_connect_cb — the fd is
 // then non-blocking and shares read/write/wait/close with the AF_INET path.
