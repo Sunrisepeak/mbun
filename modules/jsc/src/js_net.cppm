@@ -1507,7 +1507,17 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       });
       return this;
     }
-    address() { return this._addr; }
+    // node lib/net.js Server.prototype.address(): the getsockname object for a
+    // TCP server, but the PIPE NAME (a bare string) for a pipe/unix server —
+    // `else if (this._pipeName) return this._pipeName`. Returning the internal
+    // `{ address, family: 'unix', port: 0 }` record instead made
+    // `net.connect(server.address())` dial port 0 on localhost
+    // (test-http2-pipe-named-pipe), because a `{ port: 0 }` object is a
+    // perfectly valid TCP target. The record stays as `_addr` for internal use.
+    address() {
+      if (this._addr && this._addr.family === "unix") return this._addr.address;
+      return this._addr;
+    }
     close(cb) {
       if (this._clusterHandle) {
         // The handle owns the descriptor (shared case) and the primary-side
