@@ -670,6 +670,22 @@ JSValueRef netn_tls_wrap_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
     // every connection here owns its own SSL_CTX, so without a stable key the
     // ticket is undecryptable by design.
     if (argc > 15) { cfg.ticketKeys = b64_decode(fs_arg(ctx, argc, args, 15)); }
+    // arg 16: node's options.passphrase for an encrypted `key` PEM. Empty means
+    // the empty password — the backend never falls back to OpenSSL's terminal
+    // prompt, so a missing passphrase is a decrypt failure, not a hang.
+    if (argc > 16) { cfg.passphrase = fs_arg(ctx, argc, args, 16); }
+    // arg 17: honorCipherOrder (server only) — SSL_OP_CIPHER_SERVER_PREFERENCE.
+    // Absent = false, so a client never sets it; the JS layer supplies node's
+    // "true unless explicitly false" default for a server.
+    if (argc > 17 && JSValueIsBoolean(ctx, args[17])) {
+        cfg.honorCipherOrder = JSValueToBoolean(ctx, args[17]);
+    }
+    // args 18/19 (server): node's options.dhparam ("auto" or a PEM parameter
+    // block — without one no DHE-* suite can be negotiated at all) and
+    // options.ecdhCurve (a group list that NARROWS what is negotiable; "auto"
+    // and "" leave OpenSSL's own preference in place).
+    if (argc > 18) { cfg.dhParams = fs_arg(ctx, argc, args, 18); }
+    if (argc > 19) { cfg.ecdhCurve = fs_arg(ctx, argc, args, 19); }
     auto st{std::make_unique<NetTlsState>(
         isServer ? mbun::tls::TlsRole::server : mbun::tls::TlsRole::client, std::move(cfg))};
     if (!st->channel.valid()) {
@@ -855,6 +871,17 @@ JSValueRef netn_tls_info_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
             for (const std::string& pem : chain) items.push_back(make_string(ctx, pem));
             set_prop(ctx, r, "peerChain",
                      JSObjectMakeArray(ctx, items.size(), items.data(), nullptr));
+        }
+        // getEphemeralKeyInfo(): the peer's forward-secrecy key for this
+        // connection (SSL_get_server_tmp_key — client side only, and absent
+        // entirely for a static-RSA suite, which node reports as `{}`).
+        const mbun::tls::EphemeralKeyInfo ek{st.channel.ephemeral_key_info()};
+        if (!ek.type.empty()) {
+            JSObjectRef eko{JSObjectMake(ctx, nullptr, nullptr)};
+            set_prop(ctx, eko, "type", make_string(ctx, ek.type));
+            set_prop(ctx, eko, "size", JSValueMakeNumber(ctx, ek.size));
+            if (!ek.name.empty()) set_prop(ctx, eko, "name", make_string(ctx, ek.name));
+            set_prop(ctx, r, "ephemeralKey", eko);
         }
         // getFinished()/getPeerFinished(): the handshake's Finished messages.
         const std::vector<std::uint8_t> fin{st.channel.finished()};

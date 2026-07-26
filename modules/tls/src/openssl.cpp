@@ -49,6 +49,30 @@ std::string drain_openssl_errors() {
     return message;
 }
 
+// PEM passphrase callback — node's crypto_util.cc PasswordCallback.
+//
+// It exists to make sure OpenSSL NEVER falls back to its default UI, which reads
+// the passphrase from the controlling terminal. Handing PEM_read_bio_PrivateKey
+// a NULL password (which is what "no passphrase was supplied" used to mean here)
+// does exactly that: an encrypted key with no passphrase printed
+// "Enter PEM pass phrase:" and failed with `UI routines::processing error`,
+// where node reports `bad decrypt` — and in a non-interactive process it is a
+// prompt nobody can answer. `u` is always a NUL-terminated C string here, so a
+// missing passphrase is the EMPTY password (node passes a zero-length ByteSource
+// for `passphrase: undefined`, which decrypts-and-fails the same way).
+int pem_password_cb(char* buf, int size, int /*rwflag*/, void* u) {
+    if (u == nullptr || size < 0) {
+        return -1;
+    }
+    const auto* pass {static_cast<const char*>(u)};
+    const std::size_t len {std::strlen(pass)};
+    if (len > static_cast<std::size_t>(size)) {
+        return -1;
+    }
+    std::memcpy(buf, pass, len);
+    return static_cast<int>(len);
+}
+
 // node-style error code from a packed OpenSSL error: "ERR_SSL_<REASON>" for the
 // SSL library, "ERR_OSSL_<REASON>" otherwise, with the reason string upcased and
 // spaces turned into underscores. Mirrors node's crypto ThrowCryptoError code
@@ -456,6 +480,17 @@ struct TlsChannel::Impl {
                 return false;
             }
         }
+        // node internal/tls/common.js configSecureContext:
+        //   if (honorCipherOrder) secureOptions |= SSL_OP_CIPHER_SERVER_PREFERENCE
+        // with tls.Server defaulting the flag to true. Without it OpenSSL picks
+        // the first suite in the CLIENT's list that the server also has, so a
+        // server's `ciphers` order was advisory and test-tls-honorcipherorder
+        // read back the client's preferred suite for every honorCipherOrder=true
+        // case. It cannot select anything outside the intersection the two peers
+        // already agreed on.
+        if (config.honorCipherOrder) {
+            ::SSL_CTX_set_options(ctx_, SSL_OP_CIPHER_SERVER_PREFERENCE);
+        }
         ::SSL_CTX_set_verify(ctx_, verify_flags_for(role_, config.verify), nullptr);
 
         // Trust anchors for chain verification. An explicit PEM bundle in
@@ -478,10 +513,46 @@ struct TlsChannel::Impl {
             }
         }
 
+        // Ephemeral key-agreement parameters (node configSecureContext
+        // setECDHCurve / setDHParam).
+        //
+        // ecdhCurve: "auto"/empty leaves OpenSSL's own group preference alone;
+        // a named list NARROWS what may be negotiated (SSL_CTX_set1_groups_list).
+        // A list the library does not know is a hard failure — silently keeping
+        // the default would negotiate a group the caller did not authorise.
+        if (!config.ecdhCurve.empty() && config.ecdhCurve != "auto") {
+            if (::SSL_CTX_set1_groups_list(ctx_, config.ecdhCurve.c_str()) != 1) {
+                fail_("set1_groups_list: unknown ECDH curve");
+                return false;
+            }
+        }
+        // dhparam: "auto" hands the choice to OpenSSL's RFC 7919 named groups
+        // (SSL_CTX_set_dh_auto), which sizes the group to the certificate's key;
+        // otherwise a PEM parameter block is loaded verbatim. Without either,
+        // OpenSSL has no FFDHE parameters and every DHE-* suite the caller
+        // selected is quietly unusable.
+        if (config.dhParams == "auto") {
+            ::SSL_CTX_set_dh_auto(ctx_, 1);
+        } else if (!config.dhParams.empty()) {
+            BIO* bio {::BIO_new_mem_buf(config.dhParams.data(),
+                                        static_cast<int>(config.dhParams.size()))};
+            EVP_PKEY* params {bio != nullptr ? ::PEM_read_bio_Parameters(bio, nullptr) : nullptr};
+            const bool ok {params != nullptr && ::SSL_CTX_set0_tmp_dh_pkey(ctx_, params) == 1};
+            if (!ok && params != nullptr) {
+                ::EVP_PKEY_free(params); // set0 only takes ownership on success
+            }
+            if (bio != nullptr) {
+                ::BIO_free(bio);
+            }
+            if (!ok) {
+                fail_("set0_tmp_dh_pkey: unusable dhparam");
+                return false;
+            }
+        }
         if (!config.certificate.empty() && !use_certificate_(config.certificate)) {
             return false;
         }
-        if (!config.key.empty() && !use_private_key_(config.key)) {
+        if (!config.key.empty() && !use_private_key_(config.key, config.passphrase)) {
             return false;
         }
 
@@ -709,13 +780,18 @@ struct TlsChannel::Impl {
         return ok;
     }
 
-    bool use_private_key_(const std::string& pem) {
+    // `passphrase` may be empty; it is still handed to the callback rather than
+    // left NULL, because a NULL password sends OpenSSL to its terminal UI (see
+    // pem_password_cb). An encrypted key with the wrong/absent passphrase must
+    // fail here with a decrypt error, never block the process on a prompt.
+    bool use_private_key_(const std::string& pem, const std::string& passphrase) {
         BIO* bio {::BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size()))};
         if (bio == nullptr) {
             fail_("BIO_new_mem_buf(key)");
             return false;
         }
-        EVP_PKEY* key {::PEM_read_bio_PrivateKey(bio, nullptr, nullptr, nullptr)};
+        std::string pass {passphrase};
+        EVP_PKEY* key {::PEM_read_bio_PrivateKey(bio, nullptr, &pem_password_cb, pass.data())};
         bool ok {key != nullptr && ::SSL_CTX_use_PrivateKey(ctx_, key) == 1};
         if (key != nullptr) {
             ::EVP_PKEY_free(key);
@@ -980,6 +1056,9 @@ std::vector<std::string> TlsChannel::peer_certificate_chain_pem() const {
     // prepended from SSL_get_peer_certificate(). Server side it already does.
     X509* leaf {::SSL_get_peer_certificate(impl_->ssl_)};
     STACK_OF(X509)* chain {::SSL_get_peer_cert_chain(impl_->ssl_)};
+    // Certificates this function OWNS (issuers pulled out of the trust store
+    // below); freed on the way out. Everything else is borrowed from the SSL*.
+    std::vector<X509*> extra {};
     const bool chainHasLeaf {
         chain != nullptr && leaf != nullptr && sk_X509_num(chain) > 0
         && ::X509_cmp(sk_X509_value(chain, 0), leaf) == 0};
@@ -1001,10 +1080,104 @@ std::vector<std::string> TlsChannel::peer_certificate_chain_pem() const {
             }
         }
     }
+    // Complete the chain from THIS side's trust store, exactly as node's
+    // crypto_common.cc GetLastIssuedCert does: while the last certificate is not
+    // self-issued, look its issuer up in the context's X509_STORE and append it.
+    // The peer only sends what it has (here: leaf + intermediate), so without
+    // this the caller's getPeerCertificate(true) walk stopped one link short and
+    // the ROOT it verified against was invisible (test-tls-cert-chains-in-ca).
+    //
+    // This reports what was already trusted; it neither adds to the store nor
+    // affects verification, which OpenSSL completed before this is ever called.
+    X509* last {chain != nullptr && sk_X509_num(chain) > 0
+                    ? sk_X509_value(chain, sk_X509_num(chain) - 1)
+                    : leaf};
+    if (last != nullptr && impl_->ctx_ != nullptr && !out.empty()) {
+        if (X509_STORE* store {::SSL_CTX_get_cert_store(impl_->ctx_)}) {
+            if (X509_STORE_CTX* sctx {::X509_STORE_CTX_new()}) {
+                if (::X509_STORE_CTX_init(sctx, store, nullptr, nullptr) == 1) {
+                    // Bounded: a store with a certificate cycle would otherwise
+                    // spin here forever. node relies on the self-issued test
+                    // alone; the counter is belt-and-braces, not a policy.
+                    for (int guard {0}; guard < 16; ++guard) {
+                        if (::X509_check_issued(last, last) == X509_V_OK) {
+                            break; // self-signed: the chain is complete
+                        }
+                        X509* issuer {nullptr};
+                        if (::X509_STORE_CTX_get1_issuer(&issuer, sctx, last) != 1
+                            || issuer == nullptr) {
+                            ::ERR_clear_error();
+                            break;
+                        }
+                        std::string s {pem_of(issuer)};
+                        if (!s.empty()) {
+                            out.push_back(std::move(s));
+                        }
+                        extra.emplace_back(issuer); // keeps `issuer` alive as `last`
+                        last = issuer;
+                    }
+                }
+                ::X509_STORE_CTX_free(sctx);
+            }
+        }
+    }
+    for (X509* c : extra) {
+        ::X509_free(c);
+    }
     if (leaf != nullptr) {
         ::X509_free(leaf);
     }
     return out;
+}
+
+// node crypto_tls.cc TLSWrap::GetEphemeralKeyInfo. SSL_get_server_tmp_key only
+// answers on the client — the server has no "peer's" ephemeral key — and a
+// static-RSA suite has none at all, which stays the default-constructed result.
+EphemeralKeyInfo TlsChannel::ephemeral_key_info() const {
+    EphemeralKeyInfo info {};
+    if (impl_->ssl_ == nullptr || !established()) {
+        return info;
+    }
+    EVP_PKEY* key {nullptr};
+    if (::SSL_get_server_tmp_key(impl_->ssl_, &key) != 1 || key == nullptr) {
+        ::ERR_clear_error();
+        return info;
+    }
+    switch (::EVP_PKEY_id(key)) {
+    case EVP_PKEY_DH:
+        info.type = "DH";
+        info.size = ::EVP_PKEY_bits(key);
+        break;
+    case EVP_PKEY_EC: {
+        info.type = "ECDH";
+        // node reports the curve's short name and its ORDER bits (256 for
+        // prime256v1, 521 for secp521r1) — which is exactly what EVP_PKEY_bits
+        // answers for an EC key (the EC keymgmt maps "bits" to
+        // EC_GROUP_order_bits).
+        char group[128] {};
+        std::size_t groupLen {0};
+        if (::EVP_PKEY_get_group_name(key, group, sizeof group, &groupLen) == 1 && groupLen > 0) {
+            info.name.assign(group, groupLen);
+        } else {
+            ::ERR_clear_error();
+        }
+        info.size = ::EVP_PKEY_bits(key);
+        break;
+    }
+    default: {
+        // X25519 / X448: node names them by the key type itself and takes
+        // EVP_PKEY_bits (253 / 448).
+        info.type = "ECDH";
+        const char* sn {::OBJ_nid2sn(::EVP_PKEY_id(key))};
+        if (sn != nullptr) {
+            info.name = sn;
+        }
+        info.size = ::EVP_PKEY_bits(key);
+        break;
+    }
+    }
+    ::EVP_PKEY_free(key);
+    return info;
 }
 
 std::vector<std::uint8_t> TlsChannel::finished() const {
@@ -1111,7 +1284,7 @@ std::vector<std::uint8_t> TlsChannel::tls_ticket() const {
 }
 
 std::string check_key_cert_pair(std::string_view certPem, std::string_view keyPem,
-                                std::string_view passphrase) {
+                                std::string_view passphrase, std::string_view ciphers) {
     ensure_library();
     ::ERR_clear_error();
     SSL_CTX* ctx {::SSL_CTX_new(::TLS_server_method())};
@@ -1125,6 +1298,20 @@ std::string check_key_cert_pair(std::string_view certPem, std::string_view keyPe
         ::ERR_clear_error();
         return reason;
     };
+    // Cipher list FIRST, exactly as node's SecureContext::Init does before
+    // SetCert/SetKey. `@SECLEVEL=n` inside the list moves the context's security
+    // level, and SSL_CTX_use_certificate enforces that level on the key it is
+    // handed — so a caller who lowered it to 0 gets their small key accepted,
+    // and a caller who did not still gets "ee key too small". A list OpenSSL
+    // rejects is ignored here rather than reported: it is the cipher validator's
+    // failure to report (validateSecureContextOptions has already run
+    // checkCipherList), and swallowing it must not change the security level.
+    if (!ciphers.empty()) {
+        const std::string list {ciphers};
+        if (::SSL_CTX_set_cipher_list(ctx, list.c_str()) != 1) {
+            ::ERR_clear_error();
+        }
+    }
     if (!certPem.empty()) {
         BIO* bio {::BIO_new_mem_buf(certPem.data(), static_cast<int>(certPem.size()))};
         X509* cert {bio != nullptr ? ::PEM_read_bio_X509(bio, nullptr, nullptr, nullptr) : nullptr};
@@ -1144,8 +1331,7 @@ std::string check_key_cert_pair(std::string_view certPem, std::string_view keyPe
         std::string pass {passphrase};
         EVP_PKEY* key {
             bio != nullptr
-                ? ::PEM_read_bio_PrivateKey(bio, nullptr, nullptr,
-                                            pass.empty() ? nullptr : pass.data())
+                ? ::PEM_read_bio_PrivateKey(bio, nullptr, &pem_password_cb, pass.data())
                 : nullptr};
         const bool ok {key != nullptr && ::SSL_CTX_use_PrivateKey(ctx, key) == 1};
         if (key != nullptr) {

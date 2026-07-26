@@ -77,6 +77,32 @@ export struct Config {
     // Empty = full handshake. A blob OpenSSL cannot parse is ignored, exactly as
     // node's SetSession does; it never weakens the handshake that follows.
     std::string sessionDer {};
+    // Passphrase for an encrypted `key` PEM — node's options.passphrase (and the
+    // per-entry `key: [{ pem, passphrase }]` form, which the JS layer resolves
+    // down to this single field). Empty means the EMPTY password, not "prompt":
+    // the backend always installs a password callback, so an encrypted key with
+    // no passphrase fails with OpenSSL's decrypt error instead of blocking on a
+    // terminal prompt that a server process can never answer.
+    std::string passphrase {};
+    // SERVER: pick the cipher by the SERVER's preference order rather than the
+    // client's (SSL_OP_CIPHER_SERVER_PREFERENCE) — node's
+    // tls.createServer({ honorCipherOrder }), which node defaults to TRUE for a
+    // server and never sets for a client. Purely an ORDERING choice within the
+    // set both peers already offered: it can only pick a suite the client also
+    // proposed, and letting the operator's order win is the stronger default.
+    bool honorCipherOrder {false};
+    // SERVER: node's options.dhparam — "auto" for OpenSSL's own RFC 7919 group
+    // selection (SSL_CTX_set_dh_auto), otherwise a PEM DH-parameter block. Empty
+    // means no finite-field DH at all, which is why every DHE-* cipher suite was
+    // unavailable and a server whose ciphers named only DHE suites answered with
+    // a handshake failure. Never widens anything by itself: it only makes the
+    // DHE suites the caller already selected usable.
+    std::string dhParams {};
+    // node's options.ecdhCurve (default "auto"). A named list goes to
+    // SSL_CTX_set1_groups_list; "auto"/empty leaves OpenSSL's own group
+    // preference in place. Restricting the group list can only NARROW what is
+    // negotiable.
+    std::string ecdhCurve {};
 
     [[nodiscard]] bool has_credentials() const noexcept {
         return !certificate.empty() || !key.empty();

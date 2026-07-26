@@ -141,11 +141,15 @@ inline JSValueRef node_tls_root_certificates_cb(JSContextRef ctx, JSObjectRef, J
     return JSObjectMakeArray(ctx, out.size(), out.empty() ? nullptr : out.data(), nullptr);
 }
 
-// __mbunNodeTlsNative.checkKeyCert(certPem, keyPem, passphrase) → "" when the
-// pair loads, else the OpenSSL reason string. node's SecureContext::SetKey /
-// SetCert fail at createSecureContext() time on a mismatched pair or a wrong
-// passphrase (test-tls-key-mismatch, test-tls-passphrase); without this the
-// mismatch only surfaced as a handshake failure much later.
+// __mbunNodeTlsNative.checkKeyCert(certPem, keyPem, passphrase, ciphers) → ""
+// when the pair loads, else the OpenSSL reason string. node's
+// SecureContext::SetKey / SetCert fail at createSecureContext() time on a
+// mismatched pair or a wrong passphrase (test-tls-key-mismatch,
+// test-tls-passphrase); without this the mismatch only surfaced as a handshake
+// failure much later. `ciphers` is applied to the probe context BEFORE the cert,
+// mirroring node's Init-then-SetCert order, so an `@SECLEVEL=n` in the caller's
+// cipher list governs whether the key is accepted
+// (test-tls-reduced-SECLEVEL-in-cipher).
 inline JSValueRef node_tls_check_key_cert_cb(JSContextRef ctx, JSObjectRef, JSObjectRef,
                                              std::size_t argc, const JSValueRef argv[],
                                              JSValueRef*) {
@@ -154,7 +158,10 @@ inline JSValueRef node_tls_check_key_cert_cb(JSContextRef ctx, JSObjectRef, JSOb
     const std::string pass{argc > 2 && JSValueIsString(ctx, argv[2])
                                ? val_to_string(ctx, argv[2])
                                : std::string{}};
-    return make_string(ctx, mbun::tls::check_key_cert_pair(cert, key, pass));
+    const std::string ciphers{argc > 3 && JSValueIsString(ctx, argv[3])
+                                  ? val_to_string(ctx, argv[3])
+                                  : std::string{}};
+    return make_string(ctx, mbun::tls::check_key_cert_pair(cert, key, pass, ciphers));
 }
 
 // Install globalThis.__mbunNodeTlsNative. Called once from engine init.

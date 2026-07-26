@@ -27,6 +27,16 @@ export enum class TlsRole : std::uint8_t { client, server };
 // SSL_ERROR_WANT_READ / SSL_ERROR_WANT_WRITE.
 export enum class IoWant : std::uint8_t { none, read, write };
 
+// The peer's ephemeral (forward-secrecy) key for this connection — node's
+// TLSSocket.getEphemeralKeyInfo(), which reads SSL_get_server_tmp_key and is
+// meaningful on the CLIENT only. `type` empty means the negotiated suite has no
+// ephemeral key at all (a static-RSA key exchange), which node reports as `{}`.
+export struct EphemeralKeyInfo {
+    std::string type {};  // "DH" or "ECDH"
+    std::string name {};  // ECDH group short name ("prime256v1", "X25519"); empty for DH
+    int size {0};         // key strength in bits
+};
+
 export class TlsChannel {
 private:
     struct Impl;
@@ -122,6 +132,9 @@ public:
     // the session available immediately after the handshake is the unresumable
     // placeholder node documents; the resumable one arrives via take_new_sessions.
     [[nodiscard]] std::vector<std::uint8_t> session_der() const;
+    // SSL_get_server_tmp_key — node's TLSSocket.getEphemeralKeyInfo(). A default
+    // (empty `type`) result means the suite carries no ephemeral key.
+    [[nodiscard]] EphemeralKeyInfo ephemeral_key_info() const;
     // SSL_session_reused — node's TLSSocket.isSessionReused().
     [[nodiscard]] bool session_reused() const noexcept;
     // The raw session ticket of the current session (SSL_SESSION_get0_ticket) —
@@ -135,9 +148,16 @@ public:
 // likewise rejects a PEM it cannot read. Returns an OpenSSL reason string on
 // failure and an empty string on success, so node:tls can throw at
 // createSecureContext() time rather than at first connection.
-// `passphrase` decrypts an encrypted private key; an empty one means "none".
+// `passphrase` decrypts an encrypted private key; an empty one is still USED (an
+// empty password), never turned into OpenSSL's interactive terminal prompt.
+// `ciphers` is the caller's cipher-list option, applied to the throwaway context
+// BEFORE the certificate is loaded — node's SecureContext::Init sets ciphers
+// first, and that ORDER is observable: `@SECLEVEL=0` in the list is what lets a
+// 1024-bit key load at all (test-tls-reduced-SECLEVEL-in-cipher). Empty leaves
+// the context's default list, and therefore its default security level, alone.
 export std::string check_key_cert_pair(std::string_view certPem, std::string_view keyPem,
-                                       std::string_view passphrase);
+                                       std::string_view passphrase,
+                                       std::string_view ciphers = {});
 
 // Every certificate in the platform trust store, as PEM. node ships the Mozilla
 // NSS root set in src/node_root_certs.h and exposes it as tls.rootCertificates;
