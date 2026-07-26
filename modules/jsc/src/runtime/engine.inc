@@ -1454,6 +1454,7 @@ public:
         set_native_fn(ctx_, cryptoAsymNative, "dhGeneratePrime", 1, node_asym_dh_prime_host);
         set_native_fn(ctx_, cryptoAsymNative, "generatePrime", 4, node_asym_generate_prime_host);
         set_native_fn(ctx_, cryptoAsymNative, "checkPrime", 2, node_asym_check_prime_host);
+        set_native_fn(ctx_, cryptoAsymNative, "spkac", 2, node_asym_spkac_host);
         set_native_fn(ctx_, cryptoAsymNative, "ecValidCurve", 1, node_asym_ec_valid_curve_host);
         set_native_fn(ctx_, cryptoAsymNative, "ecdhGenerate", 1, node_asym_ecdh_generate_host);
         set_native_fn(ctx_, cryptoAsymNative, "ecdhComputeSecret", 3, node_asym_ecdh_compute_host);

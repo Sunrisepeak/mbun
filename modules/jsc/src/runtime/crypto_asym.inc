@@ -915,6 +915,62 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_check_prime_host,
     return JSC::JSValue::encode(JSC::jsBoolean(rc == 1));
 }
 
+// __mbunCryptoAsymNative.spkac(op, input) — SPKAC / Netscape SPKI (crypto.Certificate).
+//   op 0 verifySpkac      → boolean
+//   op 1 exportPublicKey  → Uint8Array (SPKI PEM) or undefined when it does not parse
+//   op 2 exportChallenge  → Uint8Array (challenge string) or undefined
+// The signature check is the real NETSCAPE_SPKI_verify against the key the SPKAC
+// itself carries — a malformed or unsigned SPKAC returns false, never "assume ok".
+// ref: node src/crypto/crypto_spkac.cc + deps/ncrypto VerifySpkac/ExportPublicKey/
+//      ExportChallenge.
+JSC_DEFINE_HOST_FUNCTION(node_asym_spkac_host,
+                         (JSC::JSGlobalObject* global, JSC::CallFrame* frame)) {
+    JSContextRef ctx{toRef(global)};
+    const int op{asym_int(native_arg(frame, 0), 0)};
+    std::vector<std::uint8_t> input;
+    if (!asym_read(global, native_arg(frame, 1), input)) {
+        return hasher_throw(global, "spkac input is required");
+    }
+    NETSCAPE_SPKI* spki{NETSCAPE_SPKI_b64_decode(reinterpret_cast<const char*>(input.data()),
+                                                 static_cast<int>(input.size()))};
+    if (spki == nullptr) {
+        while (ERR_get_error() != 0) {}
+        return JSC::JSValue::encode(op == 0 ? JSC::jsBoolean(false) : JSC::jsUndefined());
+    }
+    JSC::EncodedJSValue result{JSC::JSValue::encode(JSC::jsUndefined())};
+    if (op == 0) {
+        EVP_PKEY* pkey{X509_PUBKEY_get(spki->spkac->pubkey)};
+        const bool ok{pkey != nullptr && NETSCAPE_SPKI_verify(spki, pkey) > 0};
+        if (pkey != nullptr) { EVP_PKEY_free(pkey); }
+        result = JSC::JSValue::encode(JSC::jsBoolean(ok));
+    } else if (op == 1) {
+        EVP_PKEY* pkey{NETSCAPE_SPKI_get_pubkey(spki)};
+        BIO* bio{BIO_new(BIO_s_mem())};
+        if (pkey != nullptr && bio != nullptr && PEM_write_bio_PUBKEY(bio, pkey) > 0) {
+            char* data{nullptr};
+            const long len{BIO_get_mem_data(bio, &data)};
+            if (len > 0) {
+                std::span<const std::uint8_t> bytes{reinterpret_cast<const std::uint8_t*>(data),
+                                                    static_cast<std::size_t>(len)};
+                result = JSC::JSValue::encode(toJS(global, static_cast<JSValueRef>(asym_u8(ctx, bytes))));
+            }
+        }
+        if (bio != nullptr) { BIO_free(bio); }
+        if (pkey != nullptr) { EVP_PKEY_free(pkey); }
+    } else {
+        unsigned char* buf{nullptr};
+        const int n{ASN1_STRING_to_UTF8(&buf, spki->spkac->challenge)};
+        if (n >= 0) {
+            std::span<const std::uint8_t> bytes{buf, static_cast<std::size_t>(n)};
+            result = JSC::JSValue::encode(toJS(global, static_cast<JSValueRef>(asym_u8(ctx, bytes))));
+        }
+        if (buf != nullptr) { OPENSSL_free(buf); }
+    }
+    NETSCAPE_SPKI_free(spki);
+    while (ERR_get_error() != 0) {}
+    return result;
+}
+
 // --- ECDH (provider API via OSSL_PARAM_BLD/fromdata) ---
 
 // Build an EC EVP_PKEY from a group name plus a public point and/or private

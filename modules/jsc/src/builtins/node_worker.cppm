@@ -334,7 +334,11 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
     for (const k of Object.keys(v)) if (hasHostTransferable(v[k], seen)) return true;
     return false;
   };
-  const encodeKeysTop = (v) => encodeKeys(v, new Map());
+  // Only rewrite a payload that actually carries a key: the walk COPIES the
+  // plain objects it descends through, and a copy is a different identity — it
+  // would have slipped past markAsUncloneable()'s WeakSet check on the value
+  // being posted (test-worker-message-mark-as-uncloneable).
+  const encodeKeysTop = (v) => (hasHostTransferable(v, new Set()) ? encodeKeys(v, new Map()) : v);
   const decodeKeysTop = (v) => decodeKeys(v, new Map());
 
   // Clone FIRST, detach after: a transferred ArrayBuffer is frequently also the

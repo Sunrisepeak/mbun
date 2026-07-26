@@ -1268,6 +1268,53 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     };
   }
 
+  // ---- crypto.Certificate (SPKAC / Netscape SPKI) ----
+  // node lib/internal/crypto/certificate.js: a deliberately non-class function
+  // that works called, `new`-ed, or not instantiated at all (the three method
+  // implementations are stateless, so the prototype and the constructor share
+  // them). Everything real happens in AN.spkac.
+  if (typeof AN.spkac === "function") {
+    const spkacRecv = (v) => (v === null ? "null"
+      : (typeof v === "object" ? "an instance of " + ((v.constructor && v.constructor.name) || "Object")
+                               : "type " + typeof v + " (" + String(v) + ")"));
+    const spkacInput = (spkac, encoding) => {
+      if (typeof spkac === "string") return toBuf(spkac, encoding);
+      if (!isView(spkac) && !(spkac instanceof ArrayBuffer) &&
+          !(typeof G.SharedArrayBuffer === "function" && spkac instanceof G.SharedArrayBuffer)) {
+        const e = new TypeError('The "spkac" argument must be of type string or an instance of ' +
+          "ArrayBuffer, Buffer, TypedArray, or DataView. Received " + spkacRecv(spkac));
+        e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+      }
+      return toBuf(spkac);
+    };
+    // op: 0 verify, 1 exportPublicKey, 2 exportChallenge. node answers an empty
+    // input with an empty string on all three, and refuses anything OpenSSL's
+    // int-sized API could not describe.
+    const spkacCall = (op, spkac, encoding) => {
+      const b = spkacInput(spkac, encoding);
+      if (b.length === 0) return "";
+      if (b.length > 2147483647) {
+        const e = new RangeError("spkac is too large"); e.code = "ERR_OUT_OF_RANGE"; throw e;
+      }
+      const r = AN.spkac(op, b);
+      if (op === 0) return r === true;
+      return r === undefined ? "" : Buffer.from(r);
+    };
+    const verifySpkac = function verifySpkac(spkac, encoding) { return spkacCall(0, spkac, encoding); };
+    const exportPublicKey = function exportPublicKey(spkac, encoding) { return spkacCall(1, spkac, encoding); };
+    const exportChallenge = function exportChallenge(spkac, encoding) { return spkacCall(2, spkac, encoding); };
+    function Certificate() {
+      if (!(this instanceof Certificate)) return new Certificate();
+    }
+    Certificate.prototype.verifySpkac = verifySpkac;
+    Certificate.prototype.exportPublicKey = exportPublicKey;
+    Certificate.prototype.exportChallenge = exportChallenge;
+    Certificate.verifySpkac = verifySpkac;
+    Certificate.exportPublicKey = exportPublicKey;
+    Certificate.exportChallenge = exportChallenge;
+    C.Certificate = Certificate;
+  }
+
   // ---- X509Certificate ----
   const wildcardMatch = (host, pattern, allowWildcard) => {
     host = host.toLowerCase(); pattern = pattern.toLowerCase();
