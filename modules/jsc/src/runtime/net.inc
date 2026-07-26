@@ -629,6 +629,16 @@ JSValueRef netn_tls_wrap_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
     // every connection here owns its own SSL_CTX, so without a stable key the
     // ticket is undecryptable by design.
     if (argc > 15) { cfg.ticketKeys = b64_decode(fs_arg(ctx, argc, args, 15)); }
+    // arg 16: node's options.passphrase for an encrypted `key` PEM. Empty means
+    // the empty password — the backend never falls back to OpenSSL's terminal
+    // prompt, so a missing passphrase is a decrypt failure, not a hang.
+    if (argc > 16) { cfg.passphrase = fs_arg(ctx, argc, args, 16); }
+    // arg 17: honorCipherOrder (server only) — SSL_OP_CIPHER_SERVER_PREFERENCE.
+    // Absent = false, so a client never sets it; the JS layer supplies node's
+    // "true unless explicitly false" default for a server.
+    if (argc > 17 && JSValueIsBoolean(ctx, args[17])) {
+        cfg.honorCipherOrder = JSValueToBoolean(ctx, args[17]);
+    }
     auto st{std::make_unique<NetTlsState>(
         isServer ? mbun::tls::TlsRole::server : mbun::tls::TlsRole::client, std::move(cfg))};
     if (!st->channel.valid()) {

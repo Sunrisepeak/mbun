@@ -172,6 +172,26 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
     if (!ArrayBuffer.isView(v)) throw argTypeError(name === undefined ? "buffer" : name, "must be an instance of Buffer, TypedArray, or DataView", v);
   };
 
+  // node internal/tls/wrap.js: `--tls-keylog=<file>` makes EVERY TLSSocket append
+  // its NSS key-material lines to that file, with the one-time warning node
+  // prints for it. This is an operator-only debugging switch: it is reachable
+  // solely from an explicit command-line flag, the file is created 0600, and
+  // nothing is written when the flag is absent (the reactor does not even drain
+  // the lines — _keylogWanted stays false).
+  const tlsKeylogFile = (() => {
+    const argv = (G.process && G.process.execArgv) || [];
+    for (let i = 0; i < argv.length; i++) {
+      const a = argv[i];
+      if (typeof a === "string" && a.startsWith("--tls-keylog=")) return a.slice(13);
+    }
+    return "";
+  })();
+  let warnedTlsKeylog = false;
+  const appendKeylog = (line) => {
+    const fsm = M["fs"] || M["node:fs"];
+    if (!fsm || typeof fsm.appendFileSync !== "function") return;
+    try { fsm.appendFileSync(tlsKeylogFile, line, { mode: 0o600 }); } catch (e) {}
+  };
   const deferredTLS = (what) => {
     const e = new Error("tls." + what + " requires the socket event loop + real SSL_CTX handshake (DEFERRED in mbun: modules/tls TlsChannel / S-net)");
     e.code = "ERR_MBUN_DEFERRED";
@@ -190,12 +210,26 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
     if (v == null) return "";
     if (Array.isArray(v)) return v.map(pemOf).join("\n");
     if (typeof v === "string") return v;
-    if (v && typeof v.pem === "string") return v.pem;
+    // node configSecureContext accepts `{ pem, passphrase }` with pem as a
+    // string OR a Buffer; recursing covers both, where `typeof v.pem === string`
+    // silently fell through to v.toString() → "[object Object]" for the Buffer
+    // form (test-tls-passphrase's `key: [{ pem: passKey }]` cases).
+    if (v && v.pem != null) return pemOf(v.pem);
     if (ArrayBuffer.isView(v) || v instanceof ArrayBuffer) {
       try { return (Buffer ? Buffer.from(v.buffer ? v.buffer : v, v.byteOffset || 0, v.byteLength) : v).toString("utf8"); }
       catch (e) { return String(v); }
     }
     return typeof v.toString === "function" ? v.toString() : String(v);
+  };
+  // node configSecureContext: for `key: [entry, …]` each entry may carry its own
+  // `passphrase`, which WINS over options.passphrase; a plain (non-array) key
+  // uses options.passphrase. mbun's engine loads one key per context, so the
+  // first entry's is the one that applies.
+  const keyPassphraseOf = (key, fallback) => {
+    let entry = key;
+    if (Array.isArray(entry)) entry = entry.length > 0 ? entry[0] : null;
+    if (entry && typeof entry === "object" && typeof entry.passphrase === "string") return entry.passphrase;
+    return typeof fallback === "string" ? fallback : "";
   };
   const isMbunNetSocket = (s) => !!s && typeof s._startTls === "function" && typeof s.on === "function";
   // Session material (a serialised SSL_SESSION, a 48-byte ticket key) crosses to
@@ -377,6 +411,19 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
         this._keylogWanted = true;
         if (this._transport) this._transport._keylogWanted = true;
       });
+      // --tls-keylog=<file>: node registers this per socket in TLSSocket._init,
+      // for both roles, and warns once. Registered here (after the newListener
+      // hook above) so the flag itself is what turns the native drain on.
+      if (tlsKeylogFile) {
+        if (!warnedTlsKeylog) {
+          warnedTlsKeylog = true;
+          try {
+            G.process.emitWarning("Using --tls-keylog makes TLS connections insecure " +
+                                  "by writing secret key material to file " + tlsKeylogFile);
+          } catch (e) {}
+        }
+        this.on("keylog", appendKeylog);
+      }
       if (isMbunNetSocket(socket)) this._wrapTransport(socket, options);
       // A Duplex/stream transport (no fd) is DEFERRED: construction still yields
       // a shaped TLSSocket (http2-wrapper only reads _handle); the live handshake
@@ -604,6 +651,13 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
           // connection (each one builds its own SSL_CTX).
           session: options.isServer ? "" : b64Of(self._sessionToResume),
           ticketKeys: options.isServer ? b64Of(options.ticketKeys) : "",
+          // node configSecureContext setKey(pem, passphrase). Without this an
+          // encrypted key reached PEM_read_bio_PrivateKey with a NULL password
+          // and OpenSSL prompted on the terminal.
+          passphrase: keyPassphraseOf(options.key, options.passphrase),
+          // node tls.Server: honorCipherOrder defaults to true for a SERVER and
+          // is never set for a client (internal/tls/wrap.js Server ctor).
+          honorCipherOrder: options.isServer ? options.honorCipherOrder !== false : false,
         });
       };
       // A live fd means the reactor's connect() already returned, whether this is
@@ -847,6 +901,11 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
     const tlsOpts = { isServer: false, servername, ca: opts.ca, cert: opts.cert, key: opts.key, rejectUnauthorized: opts.rejectUnauthorized, ALPNProtocols: opts.ALPNProtocols,
       minVersion: opts.minVersion, maxVersion: opts.maxVersion, secureProtocol: opts.secureProtocol, secureContext: opts.secureContext,
       ciphers: opts.ciphers, checkServerIdentity: customIdentity, identityHost: servername || host,
+      // node configSecureContext setKey(pem, options.passphrase): a top-level
+      // passphrase is the one that decrypts a plain (non-`{pem,…}`) key, so it
+      // has to reach the handshake options or every encrypted-key client fell
+      // over with "socket disconnected before secure TLS connection".
+      passphrase: opts.passphrase,
       // node internal/tls/wrap.js connect(): `session` is handed to
       // tlssock.setSession() before the socket connects.
       session: opts.session };
@@ -972,6 +1031,10 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
         ALPNProtocols: creds.ALPNProtocols,
         minVersion: creds.minVersion, maxVersion: creds.maxVersion, secureProtocol: creds.secureProtocol,
         secureContext: creds.secureContext, ciphers: creds.ciphers,
+        // Server-side createSecureContext options that reach the SSL_CTX:
+        // the passphrase for an encrypted `key`, and node's server-default
+        // honorCipherOrder (true unless the caller explicitly said false).
+        passphrase: creds.passphrase, honorCipherOrder: creds.honorCipherOrder,
         // Read off the Server at ACCEPT time, not at construction: node's
         // server.setTicketKeys() rotates the key for connections accepted after
         // the call and the corpus (test-tls-ticket) turns exactly that into an

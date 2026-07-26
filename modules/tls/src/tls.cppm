@@ -77,6 +77,20 @@ export struct Config {
     // Empty = full handshake. A blob OpenSSL cannot parse is ignored, exactly as
     // node's SetSession does; it never weakens the handshake that follows.
     std::string sessionDer {};
+    // Passphrase for an encrypted `key` PEM — node's options.passphrase (and the
+    // per-entry `key: [{ pem, passphrase }]` form, which the JS layer resolves
+    // down to this single field). Empty means the EMPTY password, not "prompt":
+    // the backend always installs a password callback, so an encrypted key with
+    // no passphrase fails with OpenSSL's decrypt error instead of blocking on a
+    // terminal prompt that a server process can never answer.
+    std::string passphrase {};
+    // SERVER: pick the cipher by the SERVER's preference order rather than the
+    // client's (SSL_OP_CIPHER_SERVER_PREFERENCE) — node's
+    // tls.createServer({ honorCipherOrder }), which node defaults to TRUE for a
+    // server and never sets for a client. Purely an ORDERING choice within the
+    // set both peers already offered: it can only pick a suite the client also
+    // proposed, and letting the operator's order win is the stronger default.
+    bool honorCipherOrder {false};
 
     [[nodiscard]] bool has_credentials() const noexcept {
         return !certificate.empty() || !key.empty();

@@ -412,7 +412,10 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
     if (v == null) return "";
     if (Array.isArray(v)) return v.map(pemText).join("\n");
     if (typeof v === "string") return v;
-    if (v && typeof v.pem === "string") return v.pem;
+    // `{ pem, passphrase }` with pem as a string OR a Buffer (node
+    // configSecureContext accepts both); recursing handles the Buffer form,
+    // which `typeof v.pem === "string"` skipped entirely.
+    if (v && v.pem != null) return pemText(v.pem);
     if (ArrayBuffer.isView(v) || v instanceof ArrayBuffer) {
       try { return Buffer.from(v.buffer ? v.buffer : v, v.byteOffset || 0, v.byteLength).toString("utf8"); }
       catch (e) { return ""; }
@@ -437,9 +440,25 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
       const keyPem = pemText(options.key);
       if (certPem.indexOf("BEGIN") !== -1 || keyPem.indexOf("BEGIN") !== -1) {
         let reason = "";
+        // node configSecureContext: a `key: [{ pem, passphrase }]` entry's own
+        // passphrase WINS over options.passphrase, and the engine loads one key,
+        // so the first entry's is the one that decides.
+        let pass = typeof options.passphrase === "string" ? options.passphrase : "";
+        {
+          let entry = options.key;
+          if (Array.isArray(entry)) entry = entry.length > 0 ? entry[0] : null;
+          if (entry && typeof entry === "object" && typeof entry.passphrase === "string") pass = entry.passphrase;
+        }
+        // The cipher list has to reach the probe context BEFORE the cert: node
+        // runs SecureContext::Init (which sets ciphers) ahead of SetCert, and
+        // `@SECLEVEL=0` in that list is the documented way to keep a key OpenSSL
+        // 3 would otherwise reject as too small.
+        let cipherList = "";
+        if (typeof options.ciphers === "string" && options.ciphers !== "") {
+          try { cipherList = processCiphers(options.ciphers).cipherList; } catch (e) { cipherList = ""; }
+        }
         try {
-          reason = TN.checkKeyCert(certPem, keyPem,
-                                   typeof options.passphrase === "string" ? options.passphrase : "");
+          reason = TN.checkKeyCert(certPem, keyPem, pass, cipherList);
         } catch (e) { reason = ""; }
         if (typeof reason === "string" && reason !== "") {
           // OpenSSL's packed reason string is what node surfaces verbatim; the
@@ -548,12 +567,19 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
   // ---- checkServerIdentity (RFC 6125), ported from bun-ref/node lib/tls.js ----
   // Canonical text form of an IP literal (NodeTLS.cpp Bun__canonicalizeIP): both
   // sides of the IP-SAN comparison below go through it, so "fe80:0:0:0:0:0:0:1"
-  // and "fe80::1" (or an uppercase-hex SAN) match. Non-IP input comes back
-  // unchanged — the caller has already established it IS an IP for the hostname
-  // side, and a malformed SAN must stay unequal rather than become undefined.
+  // and "fe80::1" (or an uppercase-hex SAN) match.
+  // Input that is NOT an IP literal comes back `undefined`, exactly as node's
+  // cares_wrap CanonicalizeIP does (it returns without setting a value when
+  // neither inet_pton succeeds). That is observable: a CIDR SAN like
+  // "IP Address:8.8.8.0/24" lands in the `ips` list as undefined, so the failure
+  // reason node prints is "…is not in the cert's list: " with nothing after it
+  // (test-tls-check-server-identity case 13). Echoing the raw text back instead
+  // printed the CIDR — and, worse, would let a malformed SAN compare equal to a
+  // hostname that is byte-identical to it. Falling back to `ip` is kept only for
+  // the case where the native binding is absent altogether.
   const canonicalizeIP = (ip) => {
     const N = globalThis.__mbunNodeTlsNative;
-    if (N && typeof N.canonicalizeIP === "function") { const c = N.canonicalizeIP(ip); if (typeof c === "string") return c; }
+    if (N && typeof N.canonicalizeIP === "function") return N.canonicalizeIP(ip);
     return ip;
   };
   const netIsIP = (h) => {
