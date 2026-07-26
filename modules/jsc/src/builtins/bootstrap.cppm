@@ -6377,14 +6377,6 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       this.emit("close");
       return p;
     }
-    stat() { return Promise.resolve().then(() => { if (this._closed || this._fd === -1) { const e = new Error("EBADF: bad file descriptor, fstat"); e.code = "EBADF"; e.errno = -9; e.syscall = "fstat"; throw e; } return fsMod.fstatSync(this._fd); }); }
-    sync() { return Promise.resolve(); }
-    datasync() { return Promise.resolve(); }
-    truncate(len) { return Promise.resolve().then(() => { try { fsMod.ftruncateSync(this._fd, len); } catch (e) {} }); }
-    chmod(m) { return Promise.resolve(); }
-    chown() { return Promise.resolve(); }
-    utimes() { return Promise.resolve(); }
-    close() { if (this._closed) return Promise.resolve(); this._closed = true; const fd = this._fd; return Promise.resolve().then(() => { fsMod.closeSync(fd); this._fd = -1; this.emit("close"); }); }
     [Symbol.asyncDispose]() { return this.close(); }
   }
   const fsPromises = {
