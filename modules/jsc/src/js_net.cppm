@@ -2210,8 +2210,25 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
               const chunkedAt = codings.indexOf("chunked");
               // chunked must be the final coding and appear exactly once; any
               // other shape leaves the body length undefined.
-              teChunked = !sawTE && codings.length > 0 && chunkedAt === codings.length - 1 &&
-                          codings.lastIndexOf("chunked") === chunkedAt;
+              const wellFormed = codings.length > 0 && chunkedAt === codings.length - 1 &&
+                                 codings.lastIndexOf("chunked") === chunkedAt;
+              // A SECOND Transfer-Encoding line after chunked has already been
+              // announced: llhttp rejects that inside on_header_value_complete,
+              // i.e. BEFORE on_headers_complete, so the request is never
+              // observed by the application at all. That is a different failure
+              // from a single header whose coding list cannot frame a body
+              // ("chunkedchunked"), which llhttp accepts as a header and only
+              // then refuses to frame — the te-invalid path below, which node
+              // does observe once (test-http-transfer-encoding-repeated-chunked
+              // vs test-http-header-value-relaxed's duplicate-TE server).
+              // kLenientTransferEncoding (part of kLenientAll, i.e.
+              // insecureHTTPParser / httpValidation:'insecure' — NOT 'relaxed')
+              // accepts the duplicate instead.
+              if (sawTE && teChunked && !this.lenient) {
+                this._err("Parse Error: Invalid transfer encoding", "HPE_INVALID_TRANSFER_ENCODING");
+                return events + 1;
+              }
+              teChunked = this.lenient ? (teChunked || wellFormed) : wellFormed;
               sawTE = true;
             }
             if (this.maxHeaderPairs > 0 && this.rawHeaders.length >= this.maxHeaderPairs) continue;

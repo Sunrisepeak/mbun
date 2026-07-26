@@ -1093,6 +1093,30 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
     srv.maxRequestsPerSocket = 0;
     srv.requireHostHeader = o.requireHostHeader === undefined ? true : (vBool(o.requireHostHeader, "options.requireHostHeader"), o.requireHostHeader);
     srv.rejectNonStandardBodyWrites = !!o.rejectNonStandardBodyWrites;
+    // lib/_http_server.js storeHTTPOptions: `httpValidation` is one of
+    // strict/relaxed/insecure and is mutually exclusive with the older
+    // `insecureHTTPParser` boolean. 'relaxed' widens only the outgoing/incoming
+    // header-value alphabet; 'insecure' additionally turns on llhttp's lenient
+    // parsing (a duplicate Transfer-Encoding is accepted under 'insecure' and
+    // still rejected under 'relaxed').
+    const kLenientHeaders = HI.kLenientHeaders;
+    if (o.insecureHTTPParser !== undefined) vBool(o.insecureHTTPParser, "options.insecureHTTPParser");
+    if (o.httpValidation !== undefined) {
+      if (o.httpValidation !== "strict" && o.httpValidation !== "relaxed" && o.httpValidation !== "insecure") {
+        const e = new TypeError('The argument \'options.httpValidation\' must be one of: ' +
+          "'strict', 'relaxed', 'insecure'. Received " + JSON.stringify(o.httpValidation));
+        e.code = "ERR_INVALID_ARG_VALUE"; throw e;
+      }
+      if (o.insecureHTTPParser !== undefined) {
+        const e = new TypeError("The argument 'options.httpValidation' cannot be used together with " +
+          "options.insecureHTTPParser. Received " + JSON.stringify(o.httpValidation));
+        e.code = "ERR_INVALID_ARG_VALUE"; throw e;
+      }
+    }
+    srv.httpValidation = o.httpValidation;
+    const srvLenientHeaders = o.httpValidation === undefined
+      ? o.insecureHTTPParser === true
+      : (o.httpValidation === "relaxed" || o.httpValidation === "insecure");
     if (o.maxHeaderSize !== undefined) vInt(o.maxHeaderSize, "maxHeaderSize", 0);
     srv.maxHeaderSize = o.maxHeaderSize;
     // lib/_http_server.js storeHTTPOptions: `options.shouldUpgradeCallback`
@@ -1492,7 +1516,7 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
         // lib/_http_server.js connectionListenerInternal: the server's own
         // insecureHTTPParser flag selects llhttp's lenient flags for inbound
         // requests, exactly as the client option does for responses.
-        if (o.insecureHTTPParser) parser.lenient = true;
+        if (o.insecureHTTPParser || o.httpValidation === "insecure") parser.lenient = true;
         sock._httpParser = parser;
         // node keeps ONE parser per connection and republishes it as
         // `socket.parser`; this translation re-arms a fresh parser per message,
@@ -1733,6 +1757,7 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
             highWaterMark: sock.writableHighWaterMark,
             rejectNonStandardBodyWrites: srv.rejectNonStandardBodyWrites,
           });
+          if (kLenientHeaders && srvLenientHeaders) res[kLenientHeaders] = true;
           res._keepAliveTimeout = srv.keepAliveTimeout;
           res._maxRequestsPerSocket = srv.maxRequestsPerSocket;
           res.shouldKeepAlive = keepAlive;
