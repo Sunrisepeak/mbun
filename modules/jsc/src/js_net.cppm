@@ -827,6 +827,16 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
     // tunnel from a timer. Every other socket keeps the old teardown timing —
     // holding them all open turned fifteen green files into hangs.
     _rqPending() { return !!(this._holdForReader && this._rq && this._rq.length); }
+    // Bytes read off the wire that no consumer has taken yet. _rqPending() above
+    // is the LOOP-HOLD test and is deliberately narrow (holding every such
+    // socket open turned fifteen green files into hangs); TEARDOWN is a separate
+    // question and must not be narrowed the same way. destroy() drops _rq on the
+    // floor and then emits 'end' as though the buffer had been drained, so a
+    // peer that writes its whole answer and FINs in one breath — to a socket
+    // whose reader attaches one microtask later, which is every socket created
+    // inside another socket's 'data' handler — lost the answer outright and the
+    // client reported "socket hang up" (test-http-should-keep-alive).
+    _rqUndelivered() { return !!(this._rq && this._rq.length); }
     _hasReader() { return !!(this._onread || this._dataSink || this._flowing === true || this.listenerCount("data") > 0); }
     _deliver(chunk) {
       if (this._onread) { this._onreadPush(chunk); return; }
@@ -1070,7 +1080,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
         // not started reading (see _rqPending): node's socket is only fully
         // done once its readable side has ENDED, which cannot happen while the
         // buffer still holds data.
-        if (this._eof && !this._rqPending()) this.destroy();
+        if (this._eof && !this._rqPending() && !this._rqUndelivered()) this.destroy();
       }
       if (this._needDrain && this._wqLen === 0 && !this.destroyed) { this._needDrain = false; progress++; this.emit("drain"); }
       if (this._destroySoon) this._armDestroySoon();
@@ -1187,10 +1197,10 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
               G.queueMicrotask(() => {
                 if (this.destroyed || this._shutW) return;
                 this._shutW = true; this.writable = false; this._flush();
-                if (this._eof && this._shutSent && this._wq.length === 0 && !this._rqPending()) this.destroy();
+                if (this._eof && this._shutSent && this._wq.length === 0 && !this._rqPending() && !this._rqUndelivered()) this.destroy();
               });
             }
-            if (this._shutSent && this._wq.length === 0 && !this._rqPending()) this.destroy();
+            if (this._shutSent && this._wq.length === 0 && !this._rqPending() && !this._rqUndelivered()) this.destroy();
             // EOF: the read side is stopped, so this handle is only active while
             // a write is queued (see _syncEofHold).
             this._syncEofHold();
@@ -1210,7 +1220,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
           if (this.destroyed || this._paused) break;
         }
       }
-      if (this._eof && this._shutSent && this._wq.length === 0 && !this._rqPending()) this.destroy();
+      if (this._eof && this._shutSent && this._wq.length === 0 && !this._rqPending() && !this._rqUndelivered()) this.destroy();
       return progress;
     }
   }
