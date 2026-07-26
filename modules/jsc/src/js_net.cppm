@@ -240,6 +240,11 @@ export constexpr std::string_view kNetJS = R"JS(
       this._fd = -1; this._wq = []; this._wqLen = 0; this._needDrain = false;
       this._shutW = false; this._shutSent = false; this._eof = false; this._closeEmitted = false;
       this._paused = false; this._enc = null; this._everRead = false;
+        // http's read-side interception and park queue (w5/agent-http): a socket
+        // that receives bytes before anything reads used to DROP them.
+        this._dataSink = null;
+        this._rq = null; this._rqLen = 0; this._rqPaused = false; this._rqEnd = false;
+        this._flowing = null; this._holdForReader = false;
       // node net.Socket({ onread }): the socket reads INTO the caller's buffer
       // and hands that exact object back, so `buf === sockBuf` holds and no
       // per-chunk allocation happens (test-net-onread-static-buffer). `buffer`
@@ -270,7 +275,14 @@ export constexpr std::string_view kNetJS = R"JS(
       // *socket* legitimately read it: npm `ws` socketOnClose gates its final
       // drain on `socket._readableState.endEmitted` and then `socket.read()`.
       this._hwm = typeof opts.highWaterMark === "number" ? opts.highWaterMark : HWM;
-      this._readableState = { endEmitted: false, ended: false, destroyed: false, length: 0, flowing: true, readable: true, objectMode: false, highWaterMark: this._hwm };
+      // node's Duplex keeps the two sides' marks apart, and net.createConnection
+      // forwards `readableHighWaterMark` / `writableHighWaterMark` straight into
+      // it — lib/_http_incoming.js then builds the IncomingMessage with
+      // `socket.readableHighWaterMark`, which is how a caller's createConnection
+      // sizes the response stream (test-http-incoming-message-options).
+      this._rhwm = typeof opts.readableHighWaterMark === "number" ? opts.readableHighWaterMark : this._hwm;
+      this._whwm = typeof opts.writableHighWaterMark === "number" ? opts.writableHighWaterMark : this._hwm;
+      this._readableState = { endEmitted: false, ended: false, destroyed: false, length: 0, flowing: true, readable: true, objectMode: false, highWaterMark: this._rhwm };
       // node:http's OutgoingMessage.end() sets _writableState.corked before its
       // final uncork(); keep the cork counter in one place.
       this._corked = 0;
@@ -288,6 +300,14 @@ export constexpr std::string_view kNetJS = R"JS(
         if (opts.readable === false) this.readable = false;
         if (opts.writable === false) this.writable = false;
       }
+      // The first reader to show up collects whatever _deliver parked for it.
+      // node's Readable.on('data') resumes the stream unless it was explicitly
+      // paused (`if (state.flowing !== false) this.resume()`).
+      this.on("newListener", (ev) => {
+        if (ev !== "data") return;
+        if (this._flowing !== false) this._flowing = true;
+        if (this._rq && this._rq.length) G.queueMicrotask(() => this._flushRq());
+      });
     }
     _adopt(fd) {
       // A descriptor received over IPC (SCM_RIGHTS) never went through
@@ -562,8 +582,8 @@ export constexpr std::string_view kNetJS = R"JS(
     // node honours the `highWaterMark` construction option on both sides of the
     // duplex (net.Socket passes it straight to stream.Duplex), so tls.connect
     // ({ highWaterMark }) is observable on the socket it creates.
-    get writableHighWaterMark() { return this._hwm; }
-    get readableHighWaterMark() { return this._hwm; }
+    get writableHighWaterMark() { return this._whwm; }
+    get readableHighWaterMark() { return this._rhwm; }
     // node net.Socket#bufferSize: how much this socket still has queued to write.
     get bufferSize() { return this.writableLength; }
     // node net.Socket#ref/unref: sticky user intent over the handle's loop
@@ -577,6 +597,22 @@ export constexpr std::string_view kNetJS = R"JS(
     read(n) {
       const q = this._unshiftQ;
       if (q && q.length) { this._unshiftQ = null; return q.length === 1 ? q[0] : (G.Buffer ? G.Buffer.concat(q) : q[0]); }
+      const r = this._rq;
+      if (r && r.length) {
+        this._rq = null; this._rqLen = 0; this._readableState.length = 0;
+        this._holdForReader = false;
+        if (this._rqPaused) { this._rqPaused = false; this._paused = false; }
+        // Draining the buffer is what releases the 'end' EOF earned.
+        if (this._rqEnd) {
+          this._rqEnd = false;
+          G.queueMicrotask(() => {
+            if (this.destroyed || this._readableState.endEmitted) return;
+            this._readableState.endEmitted = true;
+            this.emit("end");
+          });
+        }
+        return r.length === 1 ? r[0] : (G.Buffer ? G.Buffer.concat(r) : r[0]);
+      }
       return null;
     }
     // node net.js afterConnect: `if (readable && !self.isPaused()) self.read(0)`
@@ -722,13 +758,72 @@ export constexpr std::string_view kNetJS = R"JS(
       else this.emit("data", this._enc && G.Buffer ? b.toString(this._enc) : b);
       return true;
     }
-    _flushUnshift() {
-      const q = this._unshiftQ;
-      if (!q || !q.length) return;
-      this._unshiftQ = null;
+    // node's net.Socket is a Readable: bytes that arrive before anything reads
+    // are BUFFERED, not dropped. This transport emits 'data' as bytes arrive, so
+    // a chunk delivered while nobody is listening used to vanish — a server that
+    // answers before its peer attaches a 'data' listener (every http upgrade
+    // handshake, and test-http-upgrade-server-with-large-body's 101) lost its
+    // first reply outright. Park those chunks instead and release them the
+    // moment a reader appears.
+    // node's three-state `readableFlowing`: null = nothing has asked to read
+    // yet (buffer), true = flowing (emit, even with no listener attached —
+    // `socket.resume()` with no 'data' handler is how half the corpus drains a
+    // response), false = explicitly paused.
+    // Bytes read off the wire that a consumer has been PROMISED but has not
+    // taken yet. Only the http upgrade handover sets _holdForReader (node's
+    // `readableFlowing = null` right before the tunnel is emitted): there the
+    // socket must outlive the peer's FIN, because the corpus subscribes to the
+    // tunnel from a timer. Every other socket keeps the old teardown timing —
+    // holding them all open turned fifteen green files into hangs.
+    _rqPending() { return !!(this._holdForReader && this._rq && this._rq.length); }
+    _hasReader() { return !!(this._onread || this._dataSink || this._flowing === true || this.listenerCount("data") > 0); }
+    _deliver(chunk) {
+      if (this._onread) { this._onreadPush(chunk); return; }
+      if (this._dataSink) { this._dataSink(chunk); return; }
+      if (!this._hasReader()) {
+        if (!this._rq) { this._rq = []; this._rqLen = 0; }
+        this._rq.push(chunk);
+        this._rqLen += chunk.length;
+        this._readableState.length = this._rqLen;
+        // Readable stops pulling once the buffer passes the high-water mark;
+        // without this an unread socket would buffer the peer without bound.
+        if (this._rqLen >= this._hwm && !this._paused) { this._paused = true; this._rqPaused = true; }
+        return;
+      }
+      this.emit("data", this._enc && G.Buffer ? chunk.toString(this._enc) : chunk);
+    }
+    _flushRq() {
+      const q = this._rq;
+      if (!q || !q.length || !this._hasReader()) return;
+      this._rq = null; this._rqLen = 0; this._readableState.length = 0;
+      this._holdForReader = false;
+      if (this._rqPaused) { this._rqPaused = false; this._paused = false; }
       for (const c of q) {
         if (this.destroyed) return;
         if (this._onread) this._onreadPush(c);
+        else if (this._dataSink) this._dataSink(c);
+        else this.emit("data", this._enc && G.Buffer ? c.toString(this._enc) : c);
+      }
+      // 'end' is owed after the parked bytes, never before them.
+      if (this._rqEnd && !this.destroyed) {
+        this._rqEnd = false;
+        this._readableState.endEmitted = true;
+        this.emit("end");
+        // The teardown that EOF deferred while bytes were still owed.
+        if (this._eof && this._shutSent && this._wq.length === 0) this.destroy();
+      }
+    }
+    _flushUnshift() {
+      const q = this._unshiftQ;
+      if (!q || !q.length) return;
+      // A paused socket has no reader; emitting into it would drop the bytes on
+      // the floor. Hold them until resume() (which flushes) or the read loop.
+      if (this._paused) return;
+      this._unshiftQ = null;
+      for (const c of q) {
+        if (this.destroyed) return;
+          if (this._onread) this._onreadPush(c);
+          else if (this._dataSink) this._dataSink(c);
         else this.emit("data", this._enc && G.Buffer ? c.toString(this._enc) : c);
       }
     }
@@ -804,6 +899,16 @@ export constexpr std::string_view kNetJS = R"JS(
     }
     destroy(err) {
       if (this.destroyed) return this;
+      // EOF has already been observed but 'end' was held back behind bytes the
+      // consumer never came for. node's Readable would have emitted it as soon
+      // as the buffer was drained; a socket that is torn down instead must
+      // still report that its read side ended, or a 'close' handler asserting
+      // on it fires first (test-net-socket-close-after-end).
+      if (this._rqEnd) {
+        this._rqEnd = false; this._rq = null; this._rqLen = 0;
+        this._readableState.endEmitted = true;
+        this.emit("end");
+      }
       const wasConnecting = this.connecting;
       this.destroyed = true; this.connecting = false; this.readable = false; this.writable = false;
       if (wasConnecting) {
@@ -910,7 +1015,11 @@ export constexpr std::string_view kNetJS = R"JS(
         this._shutSent = true;
         if (this._tls) { try { NN.tlsClose(this._fd); } catch (e) {} }
         try { NN.shutdown(this._fd); } catch (e) {}
-        if (this._eof) this.destroy();
+        // …unless bytes read off the wire are still owed to a consumer that has
+        // not started reading (see _rqPending): node's socket is only fully
+        // done once its readable side has ENDED, which cannot happen while the
+        // buffer still holds data.
+        if (this._eof && !this._rqPending()) this.destroy();
       }
       if (this._needDrain && this._wqLen === 0 && !this.destroyed) { this._needDrain = false; progress++; this.emit("drain"); }
       if (this._destroySoon) this._armDestroySoon();
@@ -937,7 +1046,11 @@ export constexpr std::string_view kNetJS = R"JS(
     // and destroy on EOF anyway), are unaffected.
     _syncEofHold() {
       if (this.destroyed || !this._loopOpen) return;
-      if ((this._eof || (this._paused && !this._everRead)) && this._wq.length === 0) NET.release(this);
+        // Composed release condition. HEAD: a socket paused before it ever read
+        // never made the handle active, so it must not pin the loop. http: bytes
+        // parked for a reader that has not arrived keep it alive. Both hold.
+        if (((this._eof && !this._rqPending()) || (this._paused && !this._everRead)) &&
+            this._wq.length === 0) NET.release(this);
       else NET.hold(this);
     }
     // Hand OpenSSL's NSS keylog lines to whoever asked for them (node's
@@ -1010,8 +1123,11 @@ export constexpr std::string_view kNetJS = R"JS(
           progress++;
           if (r === null) {
             this._eof = true; this.readable = false;
-            this._readableState.endEmitted = true;
-            this.emit("end");
+            // Bytes parked for a reader that has not arrived yet come first:
+            // 'end' means "no more data", so it may not overtake data already
+            // received. _flushRq emits it once the queue drains.
+            if (this._rq && this._rq.length) this._rqEnd = true;
+            else { this._readableState.endEmitted = true; this.emit("end"); }
             // node net.js onReadableStreamEnd auto-ends the write side on the
             // NEXT tick, not inline, so data written synchronously right after
             // 'end'/'secureConnect' (e.g. a TLS1.2 peer that FINs one flight
@@ -1020,10 +1136,10 @@ export constexpr std::string_view kNetJS = R"JS(
               G.queueMicrotask(() => {
                 if (this.destroyed || this._shutW) return;
                 this._shutW = true; this.writable = false; this._flush();
-                if (this._eof && this._shutSent && this._wq.length === 0) this.destroy();
+                if (this._eof && this._shutSent && this._wq.length === 0 && !this._rqPending()) this.destroy();
               });
             }
-            if (this._shutSent && this._wq.length === 0) this.destroy();
+            if (this._shutSent && this._wq.length === 0 && !this._rqPending()) this.destroy();
             // EOF: the read side is stopped, so this handle is only active while
             // a write is queued (see _syncEofHold).
             this._syncEofHold();
@@ -1035,12 +1151,15 @@ export constexpr std::string_view kNetJS = R"JS(
           if (this._timeoutMs) this._armTimeout();
           const chunk = G.Buffer ? G.Buffer.from(bytes) : bytes;
           if (this._unshiftQ) this._flushUnshift();   // unshifted bytes come first
-          if (this._onread) this._onreadPush(bytes);
-          else this.emit("data", this._enc ? (G.Buffer ? chunk.toString(this._enc) : latin1(bytes, 0, bytes.length)) : chunk);
+          // _deliver routes to onread / the http upgrade sink / 'data', and
+          // parks the chunk when nothing is reading yet.
+          if (G.Buffer) this._deliver(chunk);
+          else if (this._onread) this._onread(bytes.length, chunk);
+          else this.emit("data", this._enc ? latin1(bytes, 0, bytes.length) : chunk);
           if (this.destroyed || this._paused) break;
         }
       }
-      if (this._eof && this._shutSent && this._wq.length === 0) this.destroy();
+      if (this._eof && this._shutSent && this._wq.length === 0 && !this._rqPending()) this.destroy();
       return progress;
     }
   }
@@ -1328,7 +1447,7 @@ export constexpr std::string_view kNetJS = R"JS(
         } else {
           handle.onconnection = (er, clientHandle) => {
             if (er || !clientHandle || typeof clientHandle.fd !== "number" || clientHandle.fd < 0) return;
-            const sock = new Socket({ allowHalfOpen: !!this._opts.allowHalfOpen })._adopt(clientHandle.fd);
+            const sock = new Socket({ allowHalfOpen: !!this._opts.allowHalfOpen, highWaterMark: this._opts.highWaterMark })._adopt(clientHandle.fd);
             sock.localPort = this._addr ? this._addr.port : 0;
             // node net.js onconnection: `socket.server` is the listener that
             // accepted it (and `_server` its internal alias).
@@ -1409,7 +1528,7 @@ export constexpr std::string_view kNetJS = R"JS(
         // builds a Socket for the connection: the raw descriptor is handed to a
         // worker over IPC instead (internal/cluster/round_robin_handle.js).
         if (this._rawAccept) { this._rawAccept(cfd); progress++; continue; }
-        const sock = new Socket({ allowHalfOpen: !!this._opts.allowHalfOpen })._adopt(cfd);
+        const sock = new Socket({ allowHalfOpen: !!this._opts.allowHalfOpen, highWaterMark: this._opts.highWaterMark })._adopt(cfd);
         sock.localPort = this._addr ? this._addr.port : 0;
         sock.server = this; sock._server = this;
         if (this._opts.pauseOnConnect) sock.pause();
@@ -3270,10 +3389,123 @@ export constexpr std::string_view kNetJS = R"JS(
   // sockets that carry none of the http state — closeIdleConnections() would
   // read `_httpInFlight === undefined` on every raw socket and destroy the
   // in-flight connection out from under a handler that called close().
+  // node lib/_http_server.js UpgradeStream. An `Upgrade:` request that still
+  // carries a body ('upgrade' is emitted the moment the HEAD is parsed, long
+  // before the body ends) must not hand the raw socket to the consumer: the
+  // bytes still on the wire are the request body, and they belong to `req`.
+  // node therefore wraps the socket in a Duplex that forwards writes straight
+  // through but WITHHOLDS everything on the read side until
+  // requestBodyCompleted() — at which point the bytes past the body become the
+  // tunnel's first chunk. This is a hand-rolled Duplex rather than a
+  // stream.Duplex subclass because js_net is evaluated before node:stream.
+  class UpgradeStream extends EE {
+    constructor(sock) {
+      super();
+      this._sock = sock;
+      this._q = [];             // withheld / buffered read-side chunks
+      this._active = false;     // requestBodyCompleted() has run
+      this._flowing = false;    // a consumer is reading
+      this._srcEnded = false;   // the socket's read side hit EOF
+      this._endEmitted = false;
+      this._closePending = false;
+      this.destroyed = false;
+      this.readable = true;
+      this.writable = true;
+      this.allowHalfOpen = !!sock.allowHalfOpen;
+      sock.on("error", (err) => this.destroy(err));
+      sock.on("close", () => {
+        // Tearing the wrapper down here would drop bytes the consumer has not
+        // read yet — and the corpus reads the tunnel from a timer, long after
+        // the peer's FIN closed the socket. Hold the wrapper open until the
+        // queue drains, then close.
+        this._srcEnded = true;
+        if (this._active && this._q.length && !this._endEmitted) { this._closePending = true; this._pump(); return; }
+        this.destroy();
+      });
+      sock.on("end", () => { this._srcEnded = true; this._pump(); });
+      // node's Duplex starts flowing as soon as a 'data' listener appears; the
+      // wrapper has to reproduce that, because the corpus attaches its listener
+      // from a timer long after the first tunnel byte arrived.
+      this.on("newListener", (ev) => {
+        if (ev !== "data" && ev !== "readable") return;
+        this._flowing = true;
+        if (G.process && typeof G.process.nextTick === "function") G.process.nextTick(() => this._pump());
+        else G.queueMicrotask(() => this._pump());
+      });
+    }
+    // Called once the request body has ended: from here on the socket's bytes
+    // are the tunnel's, starting with whatever followed the last body byte.
+    requestBodyCompleted(head) {
+      if (this._active) return;
+      this._active = true;
+      if (head && head.length) this._q.push(head);
+      this._sock.on("data", (d) => { this._q.push(d); this._pump(); });
+      this._pump();
+    }
+    _pump() {
+      if (this.destroyed || !this._active) return;
+      if (this._flowing) {
+        while (this._q.length) {
+          const c = this._q.shift();
+          this.emit("data", c);
+          if (this.destroyed) return;
+        }
+      }
+      if (this._srcEnded && this._q.length === 0 && !this._endEmitted) {
+        this._endEmitted = true;
+        this.readable = false;
+        this.emit("end");
+        if (this._closePending) { this._closePending = false; this.destroy(); }
+      }
+    }
+    // node's UpgradeStream._read resumes BOTH the request stream and the socket:
+    // reading the tunnel must not require the consumer to drain the body first.
+    read() { this._flowing = true; this._sock.resume(); this._pump(); return null; }
+    resume() { this._flowing = true; this._sock.resume(); this._pump(); return this; }
+    pause() { this._flowing = false; this._sock.pause(); return this; }
+    setEncoding(enc) { this._sock.setEncoding(enc); return this; }
+    setTimeout(ms, cb) { this._sock.setTimeout(ms, cb); return this; }
+    setNoDelay(v) { if (this._sock.setNoDelay) this._sock.setNoDelay(v); return this; }
+    setKeepAlive(a, b) { if (this._sock.setKeepAlive) this._sock.setKeepAlive(a, b); return this; }
+    address() { return this._sock.address(); }
+    ref() { this._sock.ref(); return this; }
+    unref() { this._sock.unref(); return this; }
+    write(chunk, enc, cb) { return this._sock.write(chunk, enc, cb); }
+    cork() { if (this._sock.cork) this._sock.cork(); }
+    uncork() { if (this._sock.uncork) this._sock.uncork(); }
+    end(chunk, enc, cb) { this.writable = false; this._sock.end(chunk, enc, cb); return this; }
+    pipe(dest, opts) {
+      const onData = (c) => { const ok = dest.write(c); if (ok === false) this.pause(); };
+      if (dest.on) dest.on("drain", () => this.resume());
+      this.on("data", onData);
+      this.on("end", () => { if (!opts || opts.end !== false) { try { dest.end(); } catch (e) {} } });
+      this.resume();
+      if (dest.emit) dest.emit("pipe", this);
+      return dest;
+    }
+    destroy(err) {
+      if (this.destroyed) return this;
+      this.destroyed = true;
+      this.readable = false; this.writable = false;
+      if (err) this.emit("error", err);
+      this.emit("close");
+      if (!this._sock.destroyed) this._sock.destroy();
+      return this;
+    }
+  }
+  ["remoteAddress", "remotePort", "remoteFamily", "localAddress", "localPort", "bytesRead", "bytesWritten", "readyState"]
+    .forEach((k) => Object.defineProperty(UpgradeStream.prototype, k, {
+      get() { return this._sock[k]; }, configurable: true,
+    }));
+
   function createHttpServer(o, handler, baseSrv) {
     if (typeof o === "function") { handler = o; o = {}; }
     o = o || {};
-    const srv = baseSrv || new Server({ allowHalfOpen: false });
+    // lib/_http_server.js storeHTTPOptions keeps `options.highWaterMark` and
+    // node's net.Server hands it to every accepted socket, which is where both
+    // `req._readableState.highWaterMark` and `res[kHighWaterMark]` come from
+    // (test-http-server-options-highwatermark).
+    const srv = baseSrv || new Server({ allowHalfOpen: false, highWaterMark: o.highWaterMark });
     const connEvent = baseSrv ? "secureConnection" : "connection";
     srv._httpConns = new Set();
     const ResponseClass = typeof o.ServerResponse === "function" ? o.ServerResponse : ServerResponse;
@@ -3310,6 +3542,20 @@ export constexpr std::string_view kNetJS = R"JS(
     srv.rejectNonStandardBodyWrites = !!o.rejectNonStandardBodyWrites;
     if (o.maxHeaderSize !== undefined) vInt(o.maxHeaderSize, "maxHeaderSize", 0);
     srv.maxHeaderSize = o.maxHeaderSize;
+    // lib/_http_server.js storeHTTPOptions: `options.shouldUpgradeCallback`
+    // decides whether an `Upgrade:` request is handled as an upgrade at all.
+    // The default answers "only if somebody is listening", which is what makes
+    // an unclaimed upgrade continue as an ORDINARY request (200) instead of the
+    // socket being destroyed.
+    if (o.shouldUpgradeCallback !== undefined) {
+      if (typeof o.shouldUpgradeCallback !== "function") {
+        const e = new TypeError('The "options.shouldUpgradeCallback" property must be of type function. Received type ' + typeof o.shouldUpgradeCallback);
+        e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+      }
+      srv.shouldUpgradeCallback = o.shouldUpgradeCallback;
+    } else {
+      srv.shouldUpgradeCallback = function () { return this.listenerCount("upgrade") > 0; };
+    }
     // lib/_http_server.js setupConnectionsTracking: an unref'd sweeper that
     // expires connections which blew past headersTimeout / requestTimeout. The
     // 408 it produces is what the server-*-timeout-* corpus asserts.
@@ -3430,7 +3676,19 @@ export constexpr std::string_view kNetJS = R"JS(
         // still runs inside on_headers_complete, before its own request
         // message completes, and must keep that connection alive
         // (test-http-server-unconsume).
-        if (!s._httpInFlight) { try { s.destroy(); } catch (e) {} }
+        //
+        // Measured against node: "idle" is the set node's ConnectionsList calls
+        // active-but-between-messages — a parser that HAS begun a message at
+        // some point (on_message_begin) and is not in the middle of one now. A
+        // connection that has been accepted but has not sent its first byte is
+        // NOT in that set, and node keeps it. "No message in flight" alone is
+        // not the same thing, and closing on it destroyed the never-used
+        // connection that test-http{,s}-server-close-idle asserts survives
+        // (`assert(!client1Closed)`) — that connection has in fact written a
+        // PARTIAL request line, so "has begun a message" alone is not enough
+        // either: the message must also have finished (_httpMsgOpen), which is
+        // node's `last_message_start_ == 0`.
+        if (s._httpMsgBegun && !s._httpMsgOpen && !s._httpInFlight) { try { s.destroy(); } catch (e) {} }
       }
     };
     // lib/_http_server.js Server.prototype.close -> httpServerPreClose ->
@@ -3550,6 +3808,8 @@ export constexpr std::string_view kNetJS = R"JS(
       sock._httpMsgStart = Date.now();
       sock._httpHeadersDone = false;
       sock._httpMsgIdle = false;
+      sock._httpMsgBegun = false;
+      sock._httpMsgOpen = false;
       // lib/_http_server.js socketOnTimeout: the request, the response and the
       // server each get a say; only if none of them claims the event does the
       // connection go away.
@@ -3666,6 +3926,37 @@ export constexpr std::string_view kNetJS = R"JS(
         let upgraded = false;
         // Set at head-complete, consumed exactly once by handover().
         let doUpgrade = false;
+        // The 'upgrade'/'connect' event already went out with an EMPTY head
+        // because the request body had not finished (node's UpgradeStream
+        // path); the bytes past the body arrive through the wrapper instead.
+        let upStream = null;
+        // node lib/_http_server.js onParserExecuteCommon sets
+        // `socket.readableFlowing = null` immediately before handing the socket
+        // over: the tunnel is delivered NOT flowing, so neither the bytes past
+        // the head nor EOF reach the consumer until it starts reading. mbun's
+        // reactor socket has no three-state flowing flag, so pause it and
+        // resume on the first sign of read intent.
+        const parkForConsumer = () => {
+          // Not pause(): node keeps READING (so the peer's FIN still arrives and
+          // the connection can still be torn down) and only stops EMITTING.
+          // Stopping the read outright stranded a pipelined upgrade whose
+          // consumer never subscribes — test-http-pipeline-socket-parser-typeerror
+          // hangs on exactly that.
+          sock._flowing = false;
+          sock._holdForReader = true;
+          const kick = () => { if (!sock.destroyed) sock.resume(); };
+          const later = (f) => {
+            if (G.process && typeof G.process.nextTick === "function") G.process.nextTick(f);
+            else G.queueMicrotask(f);
+          };
+          if (sock.listenerCount("data") > 0 || sock.listenerCount("readable") > 0) { later(kick); return; }
+          const onNew = (ev) => {
+            if (ev !== "data" && ev !== "readable") return;
+            sock.removeListener("newListener", onNew);
+            later(kick);
+          };
+          sock.on("newListener", onNew);
+        };
         const handover = () => {
           if (!doUpgrade) return;
           doUpgrade = false;
@@ -3675,6 +3966,7 @@ export constexpr std::string_view kNetJS = R"JS(
           // further byte on it is HTTP, so nothing may re-arm a parser for it
           // (doing so re-parsed tunnel traffic as a new request).
           sock._httpUpgraded = true;
+          sock._dataSink = null;
           // node lib/_http_server.js onParserExecuteCommon drops state.onClose
           // (along with onData/onEnd/onDrain) before handing the socket over, so
           // an upgraded request is never abortIncoming()'d -- the socket is no
@@ -3685,9 +3977,30 @@ export constexpr std::string_view kNetJS = R"JS(
             const upAt = incoming.indexOf(im);
             if (upAt !== -1) incoming.splice(upAt, 1);
           }
+          // node removes state.onData here; this translation must too, or the
+          // server's own listener keeps the socket looking "already read" to
+          // parkForConsumer and keeps counting toward listenerCount('data').
+          sock.removeListener("data", onSockData);
+          // node onParserExecuteCommon runs unconsume() + freeParser(), which
+          // takes the connection OUT of the server's ConnectionsList: an
+          // upgraded socket is no longer the http server's to sweep or to close.
+          // Leaving it in made server.close() -> closeIdleConnections() destroy
+          // a live tunnel (test-http-upgrade-server-with-body closes the server
+          // from the client's 'end', while the tunnel is still being read).
+          try { srv._httpConns.delete(sock); } catch (e) {}
+          if (upStream) {
+            // 'upgrade' already went out with an empty head — activate the
+            // wrapper instead of emitting a second time.
+            upStream.requestBodyCompleted(head);
+            return;
+          }
+          // node still checks listenerCount here: shouldUpgradeCallback may
+          // claim a request the server has no handler for (and CONNECT is
+          // claimed unconditionally), and node answers that with a destroy.
           const ev = im && im.method === "CONNECT" ? "connect" : "upgrade";
-          if (srv.listenerCount(ev) > 0) srv.emit(ev, im, sock, head);
-          else sock.destroy();
+          if (srv.listenerCount(ev) === 0) { sock.destroy(); return; }
+          parkForConsumer();
+          srv.emit(ev, im, sock, head);
         };
 
         // lib/_http_server.js resOnFinish: dump an unread body, hand the socket
@@ -3774,28 +4087,55 @@ export constexpr std::string_view kNetJS = R"JS(
           // hands the raw socket plus the bytes already past the head to the
           // 'upgrade'/'connect' listener and stops parsing this connection.
           if (isConnect || (hdrs["upgrade"] !== undefined && connTokens.indexOf("upgrade") !== -1)) {
-            upgraded = true;
             im.upgrade = true;
+            // node lib/_http_server.js parserOnIncoming: an upgrade request is
+            // only TREATED as an upgrade when the server would handle it —
+            //   req.upgrade = req.method === 'CONNECT' ||
+            //                 !!server.shouldUpgradeCallback(req)
+            // and the default callback answers `listenerCount('upgrade') > 0`.
+            // Otherwise req.upgrade goes back to false and the message
+            // continues as an ORDINARY request. This translation destroyed the
+            // socket instead, so an unclaimed `Connection: upgrade` never got
+            // the 200 that test-http-upgrade-server's no-listener leg and
+            // test-http-upgrade-advertise's last case both wait for.
+            // A throwing shouldUpgradeCallback is NOT swallowed — node lets it
+            // out of parserOnIncoming and it lands on uncaughtException
+            // (test-http-upgrade-server-callback's last leg asserts exactly
+            // that), so do not wrap this in a try.
+            const claim = isConnect || !!srv.shouldUpgradeCallback(im);
+            if (!claim) { im.upgrade = false; }
+            else {
+            upgraded = true;
+            doUpgrade = true;
             // The handover is deferred to on_message_complete, which is where
             // llhttp actually pauses an upgrade (HPE_PAUSED_UPGRADE): a request
             // that carries a body — `Upgrade:` plus Content-Length or chunked —
             // has that body parsed FIRST and delivered to `req`, and only the
-            // bytes past it are the upgrade head. Handing the socket over at
-            // head-complete instead made `head` the unparsed request body, so
-            // `req` never emitted 'data'/'end' and the tunnel saw the body
-            // (test-http-upgrade-server-with-body{,-and-extras}).
-            //
-            // node emits 'upgrade' immediately for a body that has NOT arrived
-            // yet, wrapping the socket in an UpgradeStream that withholds
-            // tunnel bytes until the body ends. That wrapper is not implemented
-            // here; the fallback below keeps the old timing for that shape so a
-            // slow body cannot strand the connection.
-            if (parser.state === "done") { doUpgrade = true; return; }
-            doUpgrade = true;
-            if (G.process && typeof G.process.nextTick === "function") {
-              G.process.nextTick(() => { if (doUpgrade && !sock.destroyed) handover(); });
-            }
+            // bytes past it are the upgrade head.
+            if (parser.state === "done") return;
+            // A body is still streaming. node emits 'upgrade' NOW with an empty
+            // head and hands over an UpgradeStream (not the raw socket) that
+            // withholds every tunnel byte until the body has ended; the socket
+            // itself keeps feeding the parser meanwhile. `_dataSink` takes the
+            // bytes straight to the parser so that a consumer which subscribes
+            // to the wrapper immediately (test-http-upgrade-server-with-large-
+            // body) can never observe request-body bytes on the tunnel.
+            const ev = isConnect ? "connect" : "upgrade";
+            sock._dataSink = onSockData;
+            const later = (f) => {
+              if (G.process && typeof G.process.nextTick === "function") G.process.nextTick(f);
+              else G.queueMicrotask(f);
+            };
+            later(() => {
+              // handover() may already have run (the whole message arrived in
+              // one chunk), in which case the real head went out with the emit.
+              if (!doUpgrade || sock.destroyed || upStream) return;
+              if (srv.listenerCount(ev) === 0) { sock._dataSink = null; sock.destroy(); return; }
+              upStream = new UpgradeStream(sock);
+              srv.emit(ev, im, upStream, G.Buffer ? G.Buffer.alloc(0) : new Uint8Array(0));
+            });
             return;
+            }
           }
 
           const keepAlive = (im.httpVersionMajor === 1 && im.httpVersionMinor === 1)
@@ -3881,6 +4221,7 @@ export constexpr std::string_view kNetJS = R"JS(
               im.push(null);
             }
             if (sock._httpInFlight > 0) sock._httpInFlight--;
+            sock._httpMsgOpen = false;
             handover();
             return;
           }
@@ -3892,6 +4233,7 @@ export constexpr std::string_view kNetJS = R"JS(
           // Request message complete -> this connection stops counting as
           // in-flight for closeIdleConnections (llhttp on_message_complete).
           if (sock._httpInFlight > 0) sock._httpInFlight--;
+          sock._httpMsgOpen = false;
           // EOF: bun internal/http.ts:187 `self.push(null); self.complete = true`.
           if (im) {
             im.complete = true;
@@ -3916,10 +4258,19 @@ export constexpr std::string_view kNetJS = R"JS(
         };
       };
 
-      sock.on("data", (chunk) => {
+      // Named (node's `state.onData`) because the upgrade handover removes it:
+      // once the socket is a tunnel it must stop looking like a reader to
+      // parkForConsumer, and a pending-body upgrade routes the wire straight
+      // here through sock._dataSink so no 'data' is emitted at all.
+      const onSockData = (chunk) => {
         // First byte of the next message on an idle connection: llhttp's
         // on_message_begin, where headersTimeout/requestTimeout start counting.
         if (sock._httpMsgIdle) { sock._httpMsgIdle = false; sock._httpMsgStart = Date.now(); }
+        // llhttp on_message_begin / on_message_complete, as closeIdleConnections
+        // reads them: _httpMsgBegun latches for the connection's lifetime,
+        // _httpMsgOpen tracks whether a message is being parsed right now.
+        sock._httpMsgBegun = true;
+        sock._httpMsgOpen = true;
         const b = u8(chunk);
         const p = sock._httpParser;
         if (p && !p.done) p.push(b);
@@ -3928,7 +4279,8 @@ export constexpr std::string_view kNetJS = R"JS(
         // and consume it rather than parking the bytes until resOnFinish.
         else if (sock._httpUpgraded) { /* tunnel bytes: not ours */ }
         else { carry.push(b.slice()); if (!p) rearm(); }
-      });
+      };
+      sock.on("data", onSockData);
       sock.on("end", () => { eofSeen = true; const p = sock._httpParser; if (p && !p.done) p.eof(); });
       startParser();
       pumpCarry();
