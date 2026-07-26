@@ -240,6 +240,32 @@ JSValueRef netn_connect_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size
     }
     const int fd{socket(AF_INET, SOCK_STREAM, 0)};
     if (fd < 0) return fs_throw(ctx, exc, "net.connect: socket() failed");
+    // net.connect(host, port, localAddress, localPort): node binds the socket
+    // to options.localAddress/localPort BEFORE connect(2) (tcp_wrap.cc Bind
+    // then Connect), and a local address this host does not own fails the
+    // connection with EADDRNOTAVAIL rather than silently dialling from the
+    // default source address (test-http-localaddress-bind-error).
+    const std::string laddr{argc > 2 && JSValueIsString(ctx, args[2]) ? fs_arg(ctx, argc, args, 2)
+                                                                      : std::string{}};
+    const auto lport{static_cast<std::uint16_t>(
+        argc > 3 && JSValueIsNumber(ctx, args[3]) ? JSValueToNumber(ctx, args[3], nullptr) : 0)};
+    if (!laddr.empty() || lport != 0) {
+        sockaddr_in local{};
+        if (!net_parse_addr(laddr.empty() ? std::string{"0.0.0.0"} : laddr, lport, local)) {
+            close(fd);
+            return fs_throw(ctx, exc, "EADDRNOTAVAIL: bind to " + laddr + " failed (invalid address)");
+        }
+        if (lport != 0) {
+            const int reuse{1};
+            setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof reuse);
+        }
+        if (bind(fd, reinterpret_cast<sockaddr*>(&local), sizeof local) != 0) {
+            const int saved{errno};
+            close(fd);
+            return fs_throw(ctx, exc, std::string{net_errno_name(saved)} + ": bind to " + laddr + ":" +
+                                          std::to_string(lport) + " failed (" + std::strerror(saved) + ")");
+        }
+    }
     int rc;
     do { rc = connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof addr); }
     while (rc != 0 && errno == EINTR);
@@ -253,6 +279,30 @@ JSValueRef netn_connect_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size
     net_set_nonblock(fd);
     net_fds().insert(fd);
     return JSValueMakeNumber(ctx, fd);
+#endif
+}
+
+// net.sockname(fd) → "address:port" of the LOCAL end (getsockname), or null.
+// node publishes this as socket.localAddress/localPort; without it a client
+// socket reported localPort 0 forever, which is what an agent-reuse test reads
+// to tell two connections apart.
+JSValueRef netn_sockname_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                            const JSValueRef args[], JSValueRef* exc) {
+#if defined(_WIN32)
+    return fs_throw(ctx, exc, "net.sockname: not supported on Windows yet");
+#else
+    (void)exc;
+    const int fd{argc > 0 ? static_cast<int>(JSValueToNumber(ctx, args[0], nullptr)) : -1};
+    if (fd < 0) return JSValueMakeNull(ctx);
+    sockaddr_in addr{};
+    socklen_t len{sizeof addr};
+    if (getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) != 0 || addr.sin_family != AF_INET) {
+        return JSValueMakeNull(ctx);
+    }
+    char buf[INET_ADDRSTRLEN]{};
+    if (inet_ntop(AF_INET, &addr.sin_addr, buf, sizeof buf) == nullptr) return JSValueMakeNull(ctx);
+    const std::string out{std::string{buf} + ":" + std::to_string(ntohs(addr.sin_port))};
+    return make_string(ctx, out);
 #endif
 }
 

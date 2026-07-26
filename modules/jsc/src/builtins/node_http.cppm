@@ -971,7 +971,12 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
   ServerResponse.prototype.writeProcessing = function writeProcessing(cb) {
     this.writeInformation(102, null, cb);
   };
-  const linkValueRegExp = /^(?:<[^>]*>)(?:\s*;\s*[^;"\s=]+(?:=(")?[^;"\s]*\1)?)*$/;
+  // node internal/validators.js linkValueRegExp, character for character. The
+  // two deviations mbun carried were both observable: `[^>]*` inside the angle
+  // brackets accepted a CRLF smuggled into the URI-reference (the corpus asserts
+  // ERR_INVALID_ARG_VALUE for `</styles.css\r\nSet-Cookie: evil>`), and
+  // excluding `=` from the param-name class rejected shapes node accepts.
+  const linkValueRegExp = /^(?:<[^>\r\n]*>)(?:\s*;\s*[^;"\s]+(?:=(")?[^;"\s]*\1)?)*$/;
   const LINK_HINT = 'must be an array or string of format "</styles.css>; rel=preload; as=style"';
   function validateLinkHeaderFormat(value, name) {
     if (typeof value === "undefined" || !linkValueRegExp.exec(value)) {
@@ -1879,6 +1884,11 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
     request.parser = parser;
     socket.parser = parser;
     if (typeof request.maxHeaderSize === "number") parser.maxHeaderSize = request.maxHeaderSize;
+    // _http_client.js: `parser.setLenientFlags(...)` when the request opted into
+    // insecureHTTPParser (or the process did via --insecure-http-parser).
+    parser.lenient = request.insecureHTTPParser === undefined
+      ? !!(G.__mbunHttpNative && G.__mbunHttpNative.insecureHTTPParser)
+      : !!request.insecureHTTPParser;
 
     let res = null;
     let upgraded = false;

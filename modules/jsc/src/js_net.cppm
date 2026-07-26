@@ -449,6 +449,24 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       // ERR_INVALID_ADDRESS_FAMILY (both surfaced on 'error', as in node).
       const _blockList = optArg && optArg.blockList;
       const _lookup = optArg && optArg.lookup;
+      // node lookupAndConnect -> internalConnect: options.localAddress /
+      // localPort are bound on the handle BEFORE connect(2), so a source
+      // address this host does not own fails the connection instead of being
+      // ignored. The bound name is then what socket.localAddress/localPort
+      // report — read back with getsockname rather than echoed, because the
+      // kernel picks both when neither was requested.
+      const _localAddr = (optArg && optArg.localAddress != null) ? String(optArg.localAddress) : null;
+      const _localPort = (optArg && optArg.localPort != null) ? (optArg.localPort | 0) : 0;
+      const _adoptLocal = (sock, sfd) => {
+        try {
+          const sn = NN.sockname ? NN.sockname(sfd) : null;
+          if (typeof sn === "string") {
+            const i = sn.lastIndexOf(":");
+            sock.localAddress = sn.slice(0, i);
+            sock.localPort = +sn.slice(i + 1);
+          }
+        } catch (e) {}
+      };
       const _famOf = (v) => isIPv6(v) ? 6 : isIPv4(v) ? 4 : 0;
       // node net.js lookupAndConnect: a host that is not an IP literal is
       // resolved through dns.lookup before connect(2), and the result (or the
@@ -467,9 +485,9 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
           if (_blockList && _blockList.check(addr, fam === 6 ? "ipv6" : "ipv4")) return failWith(mkErr("IP is blocked by net.BlockList", "ERR_IP_BLOCKED"));
           const dh = (addr === "::1" || addr === "::" || addr === "::0") ? "127.0.0.1" : addr;
           let fd2;
-          try { fd2 = NN.connect(dh, port); }
+          try { fd2 = NN.connect(dh, port, _localAddr, _localPort); }
           catch (e) { self.connecting = false; const err = connectError(e, addr, port); G.queueMicrotask(() => { if (self.destroyed) return; self.emit("error", err); self.destroy(); }); return self; }
-          self._adopt(fd2); self.remotePort = port;
+          self._adopt(fd2); self.remotePort = port; _adoptLocal(self, fd2);
           self.connecting = true;
           G.queueMicrotask(() => { if (self.destroyed) { self.connecting = false; return; } self.connecting = false; self._flushPreConnect(null); self.emit("connect"); self.emit("ready"); });
           return self;
@@ -513,10 +531,11 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       // dials the v4 loopback, which the v4-mapped INADDR_ANY listener accepts.
       const dialHost = (host === "::1" || host === "::" || host === "::0") ? "127.0.0.1" : host;
       let fd;
-      try { if (unixPath && pipePathTooLong(unixPath)) throw new Error("EINVAL"); fd = unixPath ? NN.connectUnix(unixPath) : NN.connect(dialHost, port); }
+      try { if (unixPath && pipePathTooLong(unixPath)) throw new Error("EINVAL"); fd = unixPath ? NN.connectUnix(unixPath) : NN.connect(dialHost, port, _localAddr, _localPort); }
       catch (e) { this.connecting = false; const err = connectError(e, unixPath || host, unixPath ? undefined : port); G.queueMicrotask(() => { if (this.destroyed) return; this.emit("error", err); this.destroy(); }); return this; }
       this._adopt(fd);
       this.remotePort = port;
+      if (!unixPath) _adoptLocal(this, fd);
       // node reports `connecting === true` from the moment connect() returns
       // until the 'connect' event fires; _adopt cleared it because the reactor's
       // connect() already completed synchronously. A destroy() in between must
@@ -1246,6 +1265,16 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
     }
     _hold() { this._loopOpen = true; NET.hold(this); }
     _release() { this._loopOpen = false; NET.release(this); }
+    // node net.js Server.prototype[EventEmitter.captureRejectionSymbol]: with
+    // events.captureRejections on, a connection listener that returns a
+    // rejected promise tears that connection down instead of throwing out of
+    // the microtask queue. Without this hook EventEmitter falls back to
+    // emit('error') on a server nobody is listening to, which is a fatal
+    // uncaught exception.
+    [Symbol.for("nodejs.rejection")](err, event, sock) {
+      if (event === "connection" && sock && typeof sock.destroy === "function") { sock.destroy(err); return; }
+      this.emit("error", err);
+    }
     listen(...a) {
       let port = 0, host = null, cb = null, unixPath = null;
       // node lib/internal/validators validatePort (allowZero): every listen form
@@ -1952,6 +1981,11 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       // maxHeaderSize caps the whole head block (--max-http-header-size).
       this.maxHeaderPairs = 0;
       this.maxHeaderSize = 0;
+      // insecureHTTPParser / --insecure-http-parser: llhttp's lenient flags.
+      // The only one mbun needs so far is obs-fold (RFC 7230 3.2.4 line
+      // folding), which strict llhttp rejects and lenient llhttp joins onto the
+      // previous field value with a single SP.
+      this.lenient = false;
       this.onHead = null; this.onBody = null; this.onDone = null; this.onError = null;
       // 1xx interim heads are not the final response: node re-arms the parser
       // and raises 'continue'/'information' on the ClientRequest instead
@@ -2067,6 +2101,16 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
             }
             if (!eofSeen) return events;
             if (avail === 0 && !this.isResponse) { this.done = true; return events; }  // idle conn closed
+            // llhttp_finish() on a REQUEST that stopped mid-head is
+            // HTTP_FINISH_UNSAFE -> reason "Invalid EOF state" /
+            // HPE_INVALID_EOF_STATE (deps/llhttp/src/api.c), which node reports
+            // verbatim through 'clientError' (test-http-parser-finish-error
+            // matches both /^Parse Error/ and the code). Responses keep the
+            // ECONNRESET wording the client path turns into "socket hang up".
+            if (!this.isResponse) {
+              this._err("Parse Error: Invalid EOF state", "HPE_INVALID_EOF_STATE");
+              return events + 1;
+            }
             this._err("The socket connection was closed unexpectedly", "ECONNRESET");
             return events + 1;
           }
@@ -2076,7 +2120,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
             this._err("Parse Error: Header overflow", "HPE_HEADER_OVERFLOW");
             return events + 1;
           }
-          const head = latin1(this.buf, this.off, at);
+          let head = latin1(this.buf, this.off, at);
           this.off = at + 4;
           // picohttpparser refuses any control byte inside the head: every byte
           // below 0x20 except HTAB (and the CR/LF that end a line), plus DEL.
@@ -2093,6 +2137,13 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
               return events + 1;
             }
           }
+          // obs-fold: a header line that continues on the next line, indented by
+          // SP/HTAB. Strict llhttp rejects it (HPE_INVALID_HEADER_TOKEN, which
+          // is what the loop below produces for a continuation line — it has no
+          // colon); with the lenient flags set it splices the continuation onto
+          // the previous field value separated by one SP, which is what node's
+          // insecureHTTPParser gives (test-http-multi-line-headers).
+          if (this.lenient) head = head.replace(/\r\n[ \t]+/g, " ");
           const lines = head.split("\r\n");
           const first = lines.shift() || "";
           if (this.isResponse) {
@@ -2317,6 +2368,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
     this.remaining = 0; this.chunked = false; this.toEof = false;
     this.reqMethod = "GET";
     this.maxHeaderPairs = 0; this.maxHeaderSize = 0;
+    this.lenient = false;
     this.onHead = this.onBody = this.onDone = this.onError = this.onInterim = null;
     this._lastChunk = null; this._errMsg = null; this._errCode = null;
     this._afterDone = null; this.socket = null; this.outgoing = null;
