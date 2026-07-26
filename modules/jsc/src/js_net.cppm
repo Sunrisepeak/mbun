@@ -1871,6 +1871,14 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
   }
   Server.prototype[Symbol.asyncDispose] = function () { const s = this; return new Promise((res) => s.close(res)); };
   Server.prototype[Symbol.dispose] = function () { this.close(); };
+  // node lib/net.js Server.prototype[EventEmitter.captureRejectionSymbol]: with
+  // `events.captureRejections = true`, an async 'connection' listener that
+  // rejects tears down THAT connection rather than raising an unhandled 'error'
+  // on the server (test-net-server-capture-rejection).
+  Server.prototype[Symbol.for("nodejs.rejection")] = function (err, event, sock) {
+    if (event === "connection" && sock && typeof sock.destroy === "function") sock.destroy(err);
+    else this.emit("error", err);
+  };
 
   // ref: bun src/runtime/node/net/BlockList.rs and src/js/node/net.ts. Keep
   // addresses in network-order bytes so subnet checks do not depend on host
@@ -2199,6 +2207,25 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
     setDefaultAutoSelectFamilyAttemptTimeout, getDefaultAutoSelectFamilyAttemptTimeout,
     setDefaultAutoSelectFamily, getDefaultAutoSelectFamily,
   }));
+
+  // node lib/tty.js: `ReadStream extends net.Socket` / `WriteStream extends
+  // net.Socket`. node:tty is built before net exists here (it lives in the
+  // builtins bundle), so the inheritance is wired up once net is registered —
+  // both links, the static one and the prototype one, because callers read each
+  // (`Object.getPrototypeOf(tty.ReadStream).prototype` in
+  // test-net-access-byteswritten). The tty prototypes keep their own methods;
+  // they simply reach net.Socket's before EventEmitter's, as in node.
+  {
+    const ttyMod = M["tty"] || M["node:tty"];
+    for (const name of ["ReadStream", "WriteStream"]) {
+      const C = ttyMod && ttyMod[name];
+      if (typeof C !== "function" || !C.prototype || C.prototype instanceof Socket) continue;
+      try {
+        Object.setPrototypeOf(C.prototype, SocketW.prototype);
+        Object.setPrototypeOf(C, SocketW);
+      } catch (e) {}
+    }
+  }
 
   // ---- incremental HTTP/1.1 parser (requests and responses) ------------------
   // Content-Length AND chunked transfer-encoding bodies, 100-continue skip,
