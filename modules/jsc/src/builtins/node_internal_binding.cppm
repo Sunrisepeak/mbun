@@ -1797,14 +1797,52 @@ inline constexpr std::string_view kNodeInternalBindingJS = R"JS(
   });
 
   // ------------------------------------------------------------- pipe_wrap ----
+  // node src/pipe_wrap.cc, the unix-socket twin of tcp_wrap above and real for
+  // the same reason: `bind()` takes a descriptor from the reactor's own
+  // __mbunNetNative.listenUnix (where the Permission Model gate lives), so
+  // `handle.fd` is a genuine bound socket. Everything that hands a pipe handle
+  // to net.Server.listen() — child_process's stdio, and the corpus's
+  // `new Pipe(PipeConstants.SOCKET).bind(path)` — read exactly that.
+  //
+  // Same caveat as tcp_wrap: the native combines bind(2)+listen(2), so bind()
+  // here also starts listening. Nothing in node's JS observes a pipe wrap
+  // bound-but-not-listening beyond reading `fd`.
   factories["pipe_wrap"] = () => ({
     constants: { SOCKET: 0, SERVER: 1, IPC: 2, UV_READABLE: 1, UV_WRITABLE: 2 },
     Pipe: class Pipe {
-      constructor(type) { this.type = type; }
-      bind() { return -99; } listen() { return -99; }
+      constructor(type) { this.type = type; this.fd = -1; this._path = null; this.reading = false; }
+      bind(path) {
+        const NN = globalThis.__mbunNetNative;
+        if (!NN || typeof NN.listenUnix !== "function") return -99;
+        if (this.fd >= 0) return 0;
+        try {
+          const h = NN.listenUnix(String(path));
+          this.fd = typeof h === "object" && h ? h.fd : h;
+          this._path = String(path);
+          return 0;
+        } catch (e) {
+          // libuv errno = -(POSIX errno) on Linux; the native reports the name.
+          const UV = { EACCES: -13, EADDRINUSE: -98, EADDRNOTAVAIL: -99, EINVAL: -22,
+                       EMFILE: -24, ENFILE: -23, ENOENT: -2, ENAMETOOLONG: -36, EPERM: -1 };
+          const m = String((e && e.message) || e);
+          for (const k in UV) if (m.indexOf(k) !== -1) return UV[k];
+          return -99;
+        }
+      }
+      listen() { return this.fd >= 0 ? 0 : -99; }
       connect() { return -99; } open() { return -9; }
       fchmod() { return -9; }
-      close(cb) { if (typeof cb === "function") cb(); }
+      getsockname(out) { if (this.fd < 0) return -9; if (out) out.address = this._path; return 0; }
+      readStart() { return 0; } readStop() { return 0; }
+      // uv_close on a bound pipe unlinks the socket file it created; that is why
+      // the corpus closes the handle separately from the server it listened on.
+      close(cb) {
+        const NN = globalThis.__mbunNetNative;
+        if (this.fd >= 0 && NN && typeof NN.close === "function") { try { NN.close(this.fd); } catch (e) {} }
+        if (this._path && this._path[0] !== "\0") { try { mod("fs").unlinkSync(this._path); } catch (e) {} }
+        this.fd = -1; this._path = null;
+        if (typeof cb === "function") cb();
+      }
       ref() {} unref() {}
     },
     PipeConnectWrap: class PipeConnectWrap { constructor() { this.oncomplete = undefined; } },

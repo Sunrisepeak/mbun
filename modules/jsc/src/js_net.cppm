@@ -1592,6 +1592,24 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       } else if (o.path != null && isPipeNameStr(o.path)) {
         unixPath = String(o.path);
       } else if (fdOpt) {
+        // node listen({ fd }) adopts the descriptor through uv_tcp_open /
+        // uv_pipe_open, which fails EINVAL when it is not a socket — a regular
+        // file's fd is an 'error' event, not an ephemeral bind that reports
+        // 'listening' (test-net-server-listen-handle). This runtime cannot
+        // adopt the descriptor itself, so a socket fd keeps the previous
+        // ephemeral bind; only the "not a socket at all" case is now honest.
+        let isSock = false;
+        try {
+          const st = (M["fs"] || M["node:fs"]).fstatSync(o.fd);
+          isSock = !!(st && typeof st.isSocket === "function" && st.isSocket());
+        } catch (e) { isSock = false; }
+        if (!isSock) {
+          const err = mkErr("listen EINVAL: invalid argument", "EINVAL");
+          err.errno = -22; err.syscall = "listen";
+          if (netServerListen.hasSubscribers) netServerListen.error.publish({ server: this, error: err });
+          G.queueMicrotask(() => this.emit("error", err));
+          return this;
+        }
         port = 0;
       } else if (!(("port" in o) || ("path" in o))) {
         throw errListenOptions('must have the property "port" or "path"');
