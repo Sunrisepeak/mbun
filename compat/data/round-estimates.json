@@ -679,6 +679,21 @@
       "fs-one-off UNDERCOUNTS AGAIN -- 7 of its 11 gains had no inventory row. Second wave running: the inventory's COVERAGE, not its accuracy, is now the binding constraint.",
       "test-fs-cp-async-file-url is a HARNESS cause (relative-to-cwd fixture path, same as test-fs-realpath-native), not the 'import.meta.url/__dirname bug' I recorded."
      ]
+    },
+    {
+     "id": "w7/net-dgram",
+     "cluster": "net+dgram worklist (round 14, long-tail protocol)",
+     "worklist_files": 12,
+     "target_delta_pass": 6,
+     "actual_delta_pass": 9,
+     "hit_rate": 1.5,
+     "note": "test-net 95->107, test-dgram unchanged, corpus_diff GATE PASS, 0 regressions. Plus 3 gains outside its list. It did the thing the protocol asks for and that two of my own merges failed to do: it probed the two load-bearing halves of js_net.cppm BEHAVIOURALLY (8 files, all 0->0) rather than trusting a clean build, because its diff touched _adopt/write/destroy/accept.",
+     "security_judgment_i_verified": "It added one native entry point, NN.getSockOptInt(fd, which), and argued it needs no --permission gate because getsockopt acquires no resource — then flagged the judgment explicitly so I could disagree. I checked: getSockOptInt(999, 4) on a descriptor the process does not own returns -1, leaking nothing, and fs reads stay ERR_ACCESS_DENIED in the same process. Agreed, and recorded so the reasoning is auditable.",
+     "named_causes_for_the_3_unreached": [
+      "test-net-normalize-args: needs the SAME Symbol instance node's vendored internal/net.js exports, since deepStrictEqual compares own symbol keys. mbun's net is native and internal/net resolves per-requiring-file via compat/node/tsconfig.json paths, so there is no registry holding those exports. Adding _normalizeArgs with our own symbol converts nothing.",
+      "test-net-connect-options-fd: needs a BIND-ONLY unix socket (NN.listenUnix binds AND listens, so the fd cannot then be connect(2)-ed) plus connect(fd, sockaddr_un) on an already-open fd. Both are new network entry points and would need native-boundary gating with --permission evidence.",
+      "test-net-autoselectfamily-ipv4first: the known IPv6 gap. net.inc:45 builds only sockaddr_in, and js_net remaps '::1'->'127.0.0.1' on BOTH sides, which is what keeps today's listen('::1')+connect('::1') pairs green. A real AF_INET6 bind needs the symmetric change in netn_connect_cb plus peer-address reporting in accept — net/http/serve-wide, not one file."
+     ]
     }
    ],
    "verdicts": {
