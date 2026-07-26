@@ -236,6 +236,16 @@ private:
     // Best-effort subtree crawl: attach a wd to every subdirectory. When
     // `emitInto` is set, synthesize a rename for each discovered entry — a newly
     // created directory's pre-existing children never fire their own IN_CREATE.
+    //
+    // A SYMLINKED directory is reported but never descended into, which is
+    // node's rule verbatim: internal/fs/recursive_watch.js #watchFolder emits
+    // the entry and then recurses only `if (file.isDirectory() &&
+    // !file.isSymbolicLink())`. Descending was an unbounded loop for any link
+    // that points at an ancestor — `symlink-folder -> .` yielded names like
+    // "symlink-folder/symlink-folder/.../file.txt" until directory_iterator hit
+    // the kernel's ELOOP depth (test-fs-watch-recursive-symlink). Note
+    // directory_entry::is_directory() FOLLOWS the link, so is_symlink() has to
+    // be consulted separately.
     void walk_add_(const std::string& absDir, const std::string& relDir,
                    std::vector<FsEvent>* emitInto) {
         std::error_code ec;
@@ -246,12 +256,14 @@ private:
         for (const auto& entry : it) {
             std::error_code isDirEc;
             const bool isDir{entry.is_directory(isDirEc)};
+            std::error_code isLinkEc;
+            const bool isLink{entry.is_symlink(isLinkEc)};
             const std::string name{entry.path().filename().string()};
             const std::string rel{join_(relDir, name)};
             if (emitInto != nullptr) {
                 emit_(*emitInto, EventOp::Create, ChangeKind::Rename, rel, isDir);
             }
-            if (isDir && !isDirEc) {
+            if (isDir && !isDirEc && !(isLink && !isLinkEc)) {
                 (void)add_one_(entry.path().string(), rel, true);
                 walk_add_(entry.path().string(), rel, emitInto);
             }

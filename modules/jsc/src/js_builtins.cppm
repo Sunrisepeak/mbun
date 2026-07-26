@@ -23,10 +23,19 @@ export import :node_stream_readable;
 export import :node_stream_writable;
 export import :node_stream_pipeline;
 export import :node_stream_webadapters;
+export import :node_stream_iter_core;
+export import :node_stream_iter_push;
+export import :node_stream_iter_consumers;
+export import :node_stream_iter_pull;
+export import :node_stream_iter_multi;
+export import :node_stream_iter_classic;
+export import :node_stream_iter_entry;
+export import :node_zlib_iter;
 export import :zlib_stream;
 export import :crypto_asym;
 export import :node_os;
 export import :node_vm;
+export import :node_vm_modules;
 export import :node_tls;
 export import :node_worker;
 export import :node_readline;
@@ -34,14 +43,19 @@ export import :node_v8;
 export import :node_perf;
 export import :node_strdec;
 export import :node_module;
+export import :node_repl;
 export import :node_http;
 export import :node_diag;
 export import :node_net;
 export import :node_fs_watch;
+export import :node_fs_streams;
 export import :bun_password;
 export import :node_process_extra;
+export import :node_process_lifecycle;
 export import :node_util_extra;
 export import :node_test_runner;
+export import :node_test_run;
+export import :node_cluster;
 export import :node_legacy_ctors;
 export import :node_domain;
 export import :node_timers;
@@ -54,6 +68,8 @@ export import :web_events;
 export import :valkey_client;
 export import :s3;
 export import :html_rewriter;
+export import :node_permission;
+export import :node_internal_binding;
 export import :fn_tostring_printer;
 
 namespace mbun::jsc::builtins {
@@ -87,10 +103,27 @@ export inline const std::string kNodeBuiltinsJS =
         .append(detail::kNodeStreamWritableJS)
         .append(detail::kNodeStreamPipelineJS)
         .append(detail::kNodeStreamWebAdaptersJS)
+        // node:stream/iter — registered on the same CJS registry as the
+        // node:stream partitions above (which must therefore precede them), and
+        // only reachable under --experimental-stream-iter. Every module is
+        // require()d lazily by the entry partition, so the order among these
+        // seven is irrelevant; the entry goes last only for readability.
+        .append(detail::kNodeStreamIterCoreJS)
+        .append(detail::kNodeStreamIterPushJS)
+        .append(detail::kNodeStreamIterConsumersJS)
+        .append(detail::kNodeStreamIterPullJS)
+        .append(detail::kNodeStreamIterMultiJS)
+        .append(detail::kNodeStreamIterClassicJS)
+        .append(detail::kNodeStreamIterEntryJS)
+        // node:zlib/iter — same flag, same registry; needs node:zlib registered
+        // for process.binding("constants").zlib, which bootstrap already did.
+        .append(detail::kNodeZlibIterJS)
         .append(detail::kCryptoAsymJS)
         .append(detail::kZlibStreamJS)
         .append(detail::kNodeOsJS)
         .append(detail::kNodeVmJS)
+        // vm.Module & friends — needs the vm namespace above already registered.
+        .append(detail::kNodeVmModulesJS)
         .append(detail::kNodeTlsJS)
         .append(detail::kNodeWorkerJS)
         .append(detail::kNodeReadlineJS)
@@ -101,11 +134,25 @@ export inline const std::string kNodeBuiltinsJS =
         .append(detail::kNodeDiagJS)
         .append(detail::kNodeNetJS)
         .append(detail::kNodeFsWatchJS)
+        // fs.ReadStream/WriteStream: needs node:stream (Readable/Writable) and
+        // the fs module both already registered.
+        .append(detail::kNodeFsStreamsJS)
         .append(detail::kBunPasswordJS)
         .append(detail::kNodeProcessExtraJS)
+        // after node_process_extra: the uncaught-exception path consults the
+        // capture-callback registry installed there.
+        .append(detail::kNodeProcessLifecycleJS)
         // node:test standalone runner (used when no bun:test harness is present);
         // after bootstrap registered the delegating M["test"] it wraps.
+        // node:cluster — after node_process_extra (which wires the child-side
+        // IPC channel a worker's _setupWorker() sends 'online' over) and after
+        // node:child_process/node:net are registered.
+        .append(detail::kNodeClusterJS)
         .append(detail::kNodeTestRunnerJS)
+        // node:test's run() / TestsStream / node:test/reporters, and the
+        // child-process reporter — consumes the event surface the partition
+        // above installs, so it must follow it.
+        .append(detail::kNodeTestRunJS)
         .append(detail::kNodeTimersJS)
         .append(detail::kNodeBufferExtraJS)
         .append(detail::kNodeAssertDeepEqualJS)
@@ -123,6 +170,19 @@ export inline const std::string kNodeBuiltinsJS =
         .append(detail::kHTMLRewriterJS)
         // node:domain — needs node:events (EventEmitter) already registered.
         .append(detail::kNodeDomainJS)
+        // node:repl — last of the node modules: REPLServer extends readline's
+        // Interface and evaluates through node:vm, so both must be installed.
+        .append(detail::kNodeReplJS)
+        // process.permission + node's initializePermission. LAST of the node
+        // modules that matter here: it wraps fs / fs.promises / v8 / process.report
+        // entry points that every partition above must have installed first, and
+        // it must run before any user code so an --allow-* flag with no
+        // --permission still fails at startup (ERR_MISSING_OPTION).
+        .append(detail::kNodePermissionJS)
+        // internalBinding(): the accessor node's lib/internal/** modules are
+        // evaluated with. Handed to those modules as a wrapper parameter by the
+        // loader, never installed as an ambient global.
+        .append(detail::kNodeInternalBindingJS)
         // last: printer-normalizing Function.prototype.toString override —
         // every earlier partition must capture the native toString.
         .append(detail::kFnToStringPrinterJS);

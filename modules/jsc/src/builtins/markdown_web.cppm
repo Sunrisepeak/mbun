@@ -559,7 +559,21 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
   }
   {
     const CN = G.__mbunCryptoNative;   // native mbun.crypto backend (hash/hmac/pbkdf2/random)
-    const rb = (n) => { if (CN) return Buffer.from(CN.randomBytes(n)); const b = Buffer.alloc(n); for (let i = 0; i < n; i++) b[i] = Math.floor(Math.random() * 256); return b; };
+    // SECURITY: FAIL CLOSED. This used to fall back to Math.random() when the
+    // native CSPRNG binding was absent, which silently downgraded
+    // crypto.randomBytes / randomUUID / randomInt / generateKey to a
+    // non-cryptographic PRNG with no error anywhere — key material an auditor would
+    // read as CSPRNG-derived. The fallback is unreachable in a correctly linked
+    // build, but "unreachable" is exactly the assumption a silently-unbound
+    // partition breaks (see .agents/skills/mbun-runtime-debugging: an IIFE-scope
+    // mistake makes a jsc binding vanish without an error). An absent CSPRNG must
+    // be an exception, never weaker randomness.
+    const rb = (n) => {
+      if (CN) return Buffer.from(CN.randomBytes(n));
+      const e = new Error("No secure random number generator available");
+      e.code = "ERR_CRYPTO_OPERATION_FAILED";
+      throw e;
+    };
     // JS digest fallbacks (only reached if the native backend is absent).
     // Real digests (SHA-256/SHA-1/MD5) implemented in JS (verified vs known vectors).
     const pad64 = (msg, lenLE) => {
@@ -709,24 +723,36 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
     Object.setPrototypeOf(Hash, Transform);
     const joinChunks = function (chunks) { let t = 0; for (const c of chunks) t += c.length; const m = new Uint8Array(t); let o = 0; for (const c of chunks) { m.set(c, o); o += c.length; } return m; };
     Hash.prototype.update = function (data, enc) { if (this._done) throw new Error("Digest already called"); if (typeof data !== "string" && !ArrayBuffer.isView(data) && !(data instanceof ArrayBuffer)) throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "data" argument must be of type string or an instance of Buffer, TypedArray, or DataView.' + invalidArgType(data)); this._chunks.push(toBytes(data, enc)); return this; };
+    // node's native hash keeps the finalized digest around: the stream path
+    // finalizes through the handle (bypassing the JS "already called" guard), and
+    // user code may still call digest() afterwards and must get the same bytes
+    // back rather than a throw or a recomputation (nodejs/node#28245).
+    Hash.prototype._rawDigest = function () {
+      if (this._digestBytes === undefined) {
+        const m = joinChunks(this._chunks);
+        const isXof = NORM(this._algo).startsWith("shake");
+        let d;
+        if (isXof) {
+          d = this._out === 0 ? new Uint8Array(0) : digestBytes(this._algo, m, this._out < 0 ? 0 : this._out);
+        } else {
+          d = digestBytes(this._algo, m, 0);
+          // node: a non-XOF digest rejects an explicit outputLength that isn't its
+          // natural length ("Output length N is invalid for <algo>...").
+          if (this._out >= 0 && this._out !== d.length) throw new Error("Output length " + this._out + " is invalid for " + this._algo + ", which does not support XOF");
+        }
+        this._digestBytes = d;
+      }
+      return this._digestBytes;
+    };
     Hash.prototype.digest = function (enc) {
       if (this._done) throw new Error("Digest already called");
       this._done = true;
-      const m = joinChunks(this._chunks);
-      const isXof = NORM(this._algo).startsWith("shake");
-      let d;
-      if (isXof) {
-        d = this._out === 0 ? new Uint8Array(0) : digestBytes(this._algo, m, this._out < 0 ? 0 : this._out);
-      } else {
-        d = digestBytes(this._algo, m, 0);
-        // node: a non-XOF digest rejects an explicit outputLength that isn't its
-        // natural length ("Output length N is invalid for <algo>...").
-        if (this._out >= 0 && this._out !== d.length) throw new Error("Output length " + this._out + " is invalid for " + this._algo + ", which does not support XOF");
-      }
-      return encode(d, enc);
+      return encode(this._rawDigest(), enc);
     };
     Hash.prototype._transform = function (chunk, e, cb) { this.update(chunk); cb(); };
-    Hash.prototype._flush = function (cb) { this.push(this.digest()); cb(); };
+    // Finalize through _rawDigest, not digest(): piping must not arm the
+    // "Digest already called" guard against a later digest() call.
+    Hash.prototype._flush = function (cb) { this.push(encode(this._rawDigest())); cb(); };
     // node's Hash#copy clones the EVP context, which is gone once digest() ran:
     // copying a finalized hash throws, exactly like update() does.
     Hash.prototype.copy = function () { if (this._done) throw new Error("Digest already called"); const h = new Hash(this._algo, { outputLength: this._out }); h._chunks = this._chunks.slice(); return h; };
@@ -765,7 +791,24 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
     Hmac.prototype._transform = function (chunk, e, cb) { this.update(chunk); cb(); };
     Hmac.prototype._flush = function (cb) { this.push(this.digest()); cb(); };
     function createHash(algo, opts) { if (typeof algo !== "string") throw new TypeError('The "algorithm" argument must be of type string. Received ' + (algo === null ? "null" : typeof algo)); if (!supported(algo)) throw new Error("Digest method not supported"); return new Hash(algo, opts); }
-    function createHmac(algo, key, opts) { if (typeof algo !== "string") throw new TypeError('The "hmac" argument must be of type string. Received ' + (algo === null ? "null" : typeof algo)); if (!supported(algo)) throw new Error("Invalid digest: " + algo); if (key === null || key === undefined) throw new TypeError('The "key" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, DataView, KeyObject, or CryptoKey. Received ' + (key === null ? "null" : "undefined")); return new Hmac(algo, key, opts); }
+    // node prepareSecretKey(): the key must be a string, a BufferSource, a
+    // *branded* KeyObject, or a CryptoKey. It used to reject only null/undefined,
+    // so an arbitrary object — including one wearing KeyObject.prototype with no
+    // key in it — was accepted and silently MAC'd as empty bytes.
+    const invalidArgTypeRecv = (v) => (v === null ? "null"
+      : v === undefined ? "undefined"
+      : typeof v === "object" ? "an instance of " + ((v.constructor && v.constructor.name) || "Object")
+      : "type " + typeof v + " (" + String(v) + ")");
+    const validHmacKey = (key) => {
+      if (typeof key === "string") return true;
+      if (key === null || typeof key !== "object") return false;
+      if (ArrayBuffer.isView(key) || key instanceof ArrayBuffer) return true;
+      if (typeof SharedArrayBuffer === "function" && key instanceof SharedArrayBuffer) return true;
+      if (typeof G.__mbunIsKeyObject === "function" && G.__mbunIsKeyObject(key)) return true;
+      if (typeof G.__mbunIsCryptoKey === "function" && G.__mbunIsCryptoKey(key)) return true;
+      return false;
+    };
+    function createHmac(algo, key, opts) { if (typeof algo !== "string") throw new TypeError('The "hmac" argument must be of type string. Received ' + (algo === null ? "null" : typeof algo)); if (!supported(algo)) throw new Error("Invalid digest: " + algo); if (!validHmacKey(key)) throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "key" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, DataView, KeyObject, or CryptoKey. Received ' + invalidArgTypeRecv(key)); return new Hmac(algo, key, opts); }
     // node-style error helpers (message + .code, matching node:crypto).
     const mkErr = (Ctor, code, msg) => { const e = new Ctor(msg); e.code = code; return e; };
     const invalidArgType = (input) => {
@@ -891,6 +934,21 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       // crypto.randomBytes(size[, cb]) — sync return, or async when a callback is
       // given (node passes null as the error on success).
       randomBytes: (n, cb) => {
+        if (typeof cb === "function") { const b = rb(n); deferCb(() => cb(null, b)); return; }
+        return rb(n);
+      },
+      // crypto.pseudoRandomBytes / prng / rng — node's deprecated aliases, all
+      // three literally randomBytes (lib/crypto.js `getRandomBytesAlias`).
+      // Still exported, and still called by the corpus (test-domain-crypto).
+      pseudoRandomBytes: (n, cb) => {
+        if (typeof cb === "function") { const b = rb(n); deferCb(() => cb(null, b)); return; }
+        return rb(n);
+      },
+      prng: (n, cb) => {
+        if (typeof cb === "function") { const b = rb(n); deferCb(() => cb(null, b)); return; }
+        return rb(n);
+      },
+      rng: (n, cb) => {
         if (typeof cb === "function") { const b = rb(n); deferCb(() => cb(null, b)); return; }
         return rb(n);
       },
@@ -2003,13 +2061,29 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       removeEventListener(t, cb) { if (t !== "abort") return; this._l = this._l.filter((x) => x.cb !== cb); }
       dispatchEvent(e) { if (e && e.type === "abort") this._fire(); return true; }
       throwIfAborted() { if (this.aborted) throw this.reason || new G.DOMException("signal is aborted without reason", "AbortError"); }
-      _fire() { const ev = { type: "abort", target: this }; if (typeof this.onabort === "function") this.onabort.call(this, ev); for (const r of this._l.slice()) { if (r.once) this.removeEventListener("abort", r.cb); r.cb.call(this, ev); } }
+      // A listener that throws must NOT abort the dispatch or escape into
+      // abort()'s caller: node's EventTarget reports it as an uncaught
+      // exception on the next tick and carries on with the remaining
+      // listeners (internal/event_target.js emitUncaughtException).
+      _fire() {
+        const ev = { type: "abort", target: this };
+        const report = (err) => {
+          const p = G.process;
+          if (p && typeof p.nextTick === "function") p.nextTick(() => { throw err; });
+          else throw err;
+        };
+        if (typeof this.onabort === "function") { try { this.onabort.call(this, ev); } catch (err) { report(err); } }
+        for (const r of this._l.slice()) {
+          if (r.once) this.removeEventListener("abort", r.cb);
+          try { r.cb.call(this, ev); } catch (err) { report(err); }
+        }
+      }
       static abort(reason) { const s = new AbortSignal(); s.aborted = true; s.reason = reason !== undefined ? reason : new G.DOMException("The operation was aborted.", "AbortError"); return s; }
       // `__mbunAbortAt` records the deadline as a wall-clock instant. A purely
       // synchronous native that has to honour a signal (Bun.spawnSync) cannot
       // run the timer that would fire this signal, so it reads the deadline
       // directly and applies it as its own timeout instead.
-      static timeout(ms) { const s = new AbortSignal(); Object.defineProperty(s, "__mbunAbortAt", { value: Date.now() + (Number(ms) || 0), enumerable: false, configurable: true, writable: true }); if (G.setTimeout) G.setTimeout(() => { s.aborted = true; s.reason = new G.DOMException("The operation timed out", "TimeoutError"); s._fire(); }, ms); return s; }
+      static timeout(ms) { const s = new AbortSignal(); Object.defineProperty(s, "__mbunAbortAt", { value: Date.now() + (Number(ms) || 0), enumerable: false, configurable: true, writable: true }); if (G.setTimeout) G.setTimeout(() => { s.aborted = true; s.reason = new G.DOMException("The operation was aborted due to timeout", "TimeoutError"); s._fire(); }, ms); return s; }
       static any(signals) { const s = new AbortSignal(); for (const sig of signals) { if (sig.aborted) { s.aborted = true; s.reason = sig.reason; return s; } sig.addEventListener("abort", () => { if (!s.aborted) { s.aborted = true; s.reason = sig.reason; s._fire(); } }); } return s; }
       // WebCore AbortSignal::memoryCost() includes m_algorithms.sizeInBytes();
       // mbun's algorithm list is `_l` (std::pair<uint32_t, Function> ≈ 16 bytes

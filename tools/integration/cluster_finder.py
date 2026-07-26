@@ -14,20 +14,30 @@ per-file `logs/*.log`). All bounded/systemd-scoped execution stays in the
 runner (see bounded_run.py); this is pure post-hoc analysis, so it can never
 freeze the machine and needs no safety layer of its own.
 
-For each non-green, non-timeout file it distils the log into a normalised
+For each non-green, non-timeout, non-skipped file it distils the log into a normalised
 *signature* (the error class + message with volatile bits — paths, numbers,
 quoted literals, hex — replaced by placeholders) so that "cannot find module
 /abs/a" and "cannot find module /abs/b" collapse to one bucket. Files are then
 grouped by (subsystem, signature) and subsystems ranked by how many *fixable*
-(non-timeout, non-oom) files they carry — timeouts are usually child_process
+(non-timeout, non-oom, non-skipped) files they carry — timeouts are usually child_process
 harness gaps, not a shared code bug, so they are reported separately and never
 inflate a cluster's fixable score.
+
+Signatures are additionally ranked *across* subsystems, because the causes that
+cost the most files are usually not subsystem-specific — and per-subsystem
+grouping alone shreds them into small shards that never reach the top of the
+report. That section comes first, and `--worklist` writes the chosen cluster
+straight out as a `node_corpus_runner.py --files` list, so picking a round's
+target and scoring it before/after stay the same set of files.
 
 Usage:
     # after: node_corpus_runner.py --bin <mbun> --out /tmp/run1
     cluster_finder.py --results /tmp/run1
     cluster_finder.py --results /tmp/run1 --filter test-vm --top 15
     cluster_finder.py --results /tmp/run1 --json > clusters.json
+    # pick the biggest cross-subsystem cause and score exactly it:
+    cluster_finder.py --results /tmp/run1 --worklist /tmp/round9.txt
+    node_corpus_runner.py --bin <mbun> --files /tmp/round9.txt --out /tmp/before
 
 Exit code is always 0 (analysis, not a gate) unless the results dir is unusable.
 """
@@ -101,13 +111,33 @@ class Cluster:
     subsystem: str
     signature: str
     files: list[str] = field(default_factory=list)
+    paths: list[str] = field(default_factory=list)
+
+
+@dataclass
+class CrossCluster:
+    """One signature seen across several subsystems — a shared root cause.
+
+    Per-subsystem clustering answers "what should I fix inside vm?". It cannot
+    answer "what one bug is costing me the most files?", because a cause that
+    is *not* subsystem-specific gets shredded into dozens of small buckets and
+    the report then ranks whichever subsystem happens to hold the largest
+    shard. That is exactly how node's harness flag re-spawn — 848 files, 19% of
+    the corpus, one root cause — stayed invisible for several rounds behind a
+    `quic: 234` row. Grouping by signature ALONE restores it.
+    """
+
+    signature: str
+    subsystems: dict[str, int] = field(default_factory=dict)
+    paths: list[str] = field(default_factory=list)
 
 
 @dataclass
 class SubsystemStat:
     subsystem: str
     green: int = 0
-    fixable: int = 0        # fail (not timeout/oom)
+    fixable: int = 0        # fail (not timeout/oom/skipped)
+    skipped: int = 0
     timeout: int = 0
     oom: int = 0
     files: list[str] = field(default_factory=list)
@@ -128,10 +158,13 @@ def load_results(results_dir: Path) -> list[dict]:
     return rows
 
 
-def analyze(results_dir: Path, name_filter: str | None) -> tuple[list[SubsystemStat], list[Cluster]]:
+def analyze(
+    results_dir: Path, name_filter: str | None
+) -> tuple[list[SubsystemStat], list[Cluster], list[CrossCluster]]:
     rows = load_results(results_dir)
     subsystems: dict[str, SubsystemStat] = {}
     clusters: dict[tuple[str, str], Cluster] = {}
+    cross: dict[str, CrossCluster] = {}
     for row in rows:
         path = row.get("path", "")
         name = Path(path).name
@@ -143,6 +176,15 @@ def analyze(results_dir: Path, name_filter: str | None) -> tuple[list[SubsystemS
         stat.files.append(name)
         if classification == "pass":
             stat.green += 1
+            continue
+        # A self-skip is an HONEST outcome, not work: the file exited 0 because
+        # the runtime lacks the feature it wanted to test. Counting it as
+        # fixable made the corpus's largest apparent "cluster" 542 skipped
+        # files (quic 234, inspector 71, debugger 60 ...) whose shared
+        # "signature" is just their skip line — pure noise that would have
+        # aimed a whole round at nothing.
+        if classification == "skipped":
+            stat.skipped += 1
             continue
         if classification == "timeout":
             stat.timeout += 1
@@ -160,21 +202,46 @@ def analyze(results_dir: Path, name_filter: str | None) -> tuple[list[SubsystemS
                 signature = normalize_signature(
                     log_path.read_text(encoding="utf-8", errors="replace"))
         key = (sub, signature)
-        clusters.setdefault(key, Cluster(sub, signature)).files.append(name)
+        cluster = clusters.setdefault(key, Cluster(sub, signature))
+        cluster.files.append(name)
+        cluster.paths.append(path)
+        shared = cross.setdefault(signature, CrossCluster(signature))
+        shared.subsystems[sub] = shared.subsystems.get(sub, 0) + 1
+        shared.paths.append(path)
     ranked_subsystems = sorted(
         subsystems.values(), key=lambda s: (-s.fixable, -s.timeout, s.subsystem))
     ranked_clusters = sorted(
         clusters.values(), key=lambda c: (-len(c.files), c.subsystem, c.signature))
-    return ranked_subsystems, ranked_clusters
+    ranked_cross = sorted(
+        cross.values(), key=lambda c: (-len(c.paths), -len(c.subsystems), c.signature))
+    return ranked_subsystems, ranked_clusters, ranked_cross
 
 
-def print_report(subsystems: list[SubsystemStat], clusters: list[Cluster], top: int) -> None:
-    print("== subsystems by fixable-fail density (fixable excludes timeouts/oom) ==")
-    print(f"{'subsystem':16} {'green':>6} {'fixable':>8} {'timeout':>8} {'oom':>5}")
+def print_report(
+    subsystems: list[SubsystemStat],
+    clusters: list[Cluster],
+    cross: list[CrossCluster],
+    top: int,
+    min_subsystems: int,
+) -> None:
+    shared = [c for c in cross if len(c.subsystems) >= min_subsystems]
+    if shared:
+        print(f"== cross-subsystem root causes (one signature, >= {min_subsystems} subsystems) ==")
+        print("   fix these first: one cause, many subsystems' worth of files")
+        for cluster in shared[:top]:
+            spread = sorted(cluster.subsystems.items(), key=lambda kv: (-kv[1], kv[0]))
+            head = " ".join(f"{name}:{count}" for name, count in spread[:6])
+            extra = f" … +{len(spread) - 6} more subsystems" if len(spread) > 6 else ""
+            print(f"[{len(cluster.paths):>4}] across {len(cluster.subsystems):>3} subsystems: {cluster.signature}")
+            print(f"       {head}{extra}")
+        print()
+    print("== subsystems by fixable-fail density (fixable excludes timeouts/oom/skipped) ==")
+    print(f"{'subsystem':16} {'green':>6} {'fixable':>8} {'skipped':>8} {'timeout':>8} {'oom':>5}")
     for stat in subsystems:
         if stat.fixable == 0 and stat.timeout == 0 and stat.oom == 0:
             continue
-        print(f"{stat.subsystem:16} {stat.green:>6} {stat.fixable:>8} {stat.timeout:>8} {stat.oom:>5}")
+        print(f"{stat.subsystem:16} {stat.green:>6} {stat.fixable:>8} {stat.skipped:>8} "
+              f"{stat.timeout:>8} {stat.oom:>5}")
     print()
     print(f"== top {top} single-root-cause clusters (same subsystem + error signature) ==")
     for cluster in clusters[:top]:
@@ -185,11 +252,17 @@ def print_report(subsystems: list[SubsystemStat], clusters: list[Cluster], top: 
             print(f"       … +{len(cluster.files) - 8} more")
 
 
-def to_json(subsystems: list[SubsystemStat], clusters: list[Cluster], top: int) -> str:
+def to_json(
+    subsystems: list[SubsystemStat],
+    clusters: list[Cluster],
+    cross: list[CrossCluster],
+    top: int,
+    min_subsystems: int,
+) -> str:
     return json.dumps({
         "subsystems": [
             {"subsystem": s.subsystem, "green": s.green, "fixable": s.fixable,
-             "timeout": s.timeout, "oom": s.oom}
+             "skipped": s.skipped, "timeout": s.timeout, "oom": s.oom}
             for s in subsystems if (s.fixable or s.timeout or s.oom)
         ],
         "clusters": [
@@ -197,7 +270,26 @@ def to_json(subsystems: list[SubsystemStat], clusters: list[Cluster], top: int) 
              "count": len(c.files), "files": sorted(c.files)}
             for c in clusters[:top]
         ],
+        "cross_subsystem": [
+            {"signature": c.signature, "count": len(c.paths),
+             "subsystems": dict(sorted(c.subsystems.items(), key=lambda kv: (-kv[1], kv[0])))}
+            for c in cross[:top] if len(c.subsystems) >= min_subsystems
+        ],
     }, indent=2)
+
+
+def write_worklist(destination: Path, cluster: Cluster | CrossCluster, description: str) -> None:
+    """Emit a cluster as a `node_corpus_runner.py --files` work-list.
+
+    Without this the loop between "which cluster is worth a round" and "score
+    that cluster before/after" is closed by hand — copying names out of a
+    report, re-deriving their paths, and getting a slightly different set each
+    time, which quietly makes before/after runs non-comparable.
+    """
+    lines = [f"# {description}", f"# signature: {cluster.signature}", *sorted(set(cluster.paths))]
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"wrote {len(set(cluster.paths))} paths to {destination}")
 
 
 def main() -> int:
@@ -208,13 +300,32 @@ def main() -> int:
                         help="only files whose name contains this substring (e.g. test-vm)")
     parser.add_argument("--top", type=int, default=20, help="how many clusters to show")
     parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    parser.add_argument("--min-subsystems", type=int, default=2,
+                        help="a cross-subsystem root cause must span at least this many subsystems")
+    parser.add_argument("--worklist", type=Path, default=None,
+                        help="write the selected cluster's paths as a node_corpus_runner --files list")
+    parser.add_argument("--worklist-rank", type=int, default=1,
+                        help="which cluster to emit, 1-based (default: the largest)")
+    parser.add_argument("--worklist-from", choices=("cross", "subsystem"), default="cross",
+                        help="emit from the cross-subsystem ranking (default) or the per-subsystem one")
     args = parser.parse_args()
 
-    subsystems, clusters = analyze(args.results.resolve(), args.filter)
+    subsystems, clusters, cross = analyze(args.results.resolve(), args.filter)
     if args.json:
-        print(to_json(subsystems, clusters, args.top))
+        print(to_json(subsystems, clusters, cross, args.top, args.min_subsystems))
     else:
-        print_report(subsystems, clusters, args.top)
+        print_report(subsystems, clusters, cross, args.top, args.min_subsystems)
+    if args.worklist:
+        if args.worklist_from == "cross":
+            pool: list = [c for c in cross if len(c.subsystems) >= args.min_subsystems]
+            label = "cross-subsystem cluster"
+        else:
+            pool = clusters
+            label = "per-subsystem cluster"
+        index = args.worklist_rank - 1
+        if index < 0 or index >= len(pool):
+            raise SystemExit(f"--worklist-rank {args.worklist_rank} out of range (1..{len(pool)})")
+        write_worklist(args.worklist, pool[index], f"{label} rank {args.worklist_rank}")
     return 0
 
 

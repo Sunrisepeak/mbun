@@ -1,5 +1,24 @@
 // Resolution result seam. Filesystem/package resolution belongs to resolver;
 // this module only decides whether a specifier is a Bun/Node/Web builtin.
+//
+// ############################################################################
+// WARNING: THIS MODULE IS NOT WIRED INTO THE RUNTIME. It has unit tests and no
+// callers -- a grep for `resolve_builtins` outside this directory finds exactly
+// one hit, and that hit is a comment. In particular `ResolutionKind::Gated`
+// enforces NOTHING: no runtime path consumes it.
+//
+// This has already cost real security. An agent added an `internal/http` shim
+// on the belief that `Gated` enforced `--expose-internals`; its own probe then
+// showed `require('internal/http')` returning the shim with no flag AND
+// shadowing a user's own `node_modules/internal/http.js`. It reverted the shim
+// rather than ship the hole.
+//
+// The gate that actually runs is a PATH rule, not a flag rule, in
+// modules/jsc/src/runtime/module_loading.inc `is_node_internal_module_`: the
+// specifier must be the bare `internal/...` form AND the resolved file must
+// live under a `lib/internal/` directory. Thread any new `internal/*` exposure
+// through THAT, never through this module, until this one is wired or deleted.
+// ############################################################################
 export module mbun.resolve_builtins.resolution;
 
 import std;

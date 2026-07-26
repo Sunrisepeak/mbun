@@ -45,6 +45,18 @@ inline int asym_int(JSC::JSValue v, int dflt) {
     return (v && v.isNumber()) ? static_cast<int>(v.asNumber()) : dflt;
 }
 
+// Optional string arg: nullopt when absent/null/undefined, the (possibly EMPTY)
+// string when one was passed. The distinction matters for passphrases — node
+// treats `passphrase: ''` (decrypt with an empty password, which is a real and
+// valid password) and "no passphrase at all" (refuse, never prompt) as two
+// different requests, with two different errors.
+using AsymPass = std::optional<std::string>;
+inline AsymPass asym_opt_str(JSC::JSGlobalObject* g, JSC::JSValue v) {
+    if (!v || v.isUndefinedOrNull() || !v.isString()) { return std::nullopt; }
+    JsStrArg s{g, v};
+    return std::string{s.view()};
+}
+
 // Last OpenSSL error string (drained), for honest throw messages.
 inline std::string asym_ossl_err() {
     unsigned long code{::ERR_get_error()};
@@ -69,15 +81,10 @@ using PkeyCtxPtr = std::unique_ptr<EVP_PKEY_CTX, EvpPkeyCtxDel>;
 // fail the decode instead of prompting on the terminal.
 inline int asym_no_pass_cb(char*, int, int, void*) { return 0; }
 
-// True when the material is an ENCRYPTED private-key PEM and no passphrase was
-// supplied — the load then fails for a specific, reportable reason. bun surfaces
-// it as ERR_MISSING_PASSPHRASE "Passphrase required for encrypted key"
-// (CryptoUtil.cpp:172, the NEED_PASSPHRASE arm of TryParsePrivateKey) rather
-// than the generic "Invalid key" (issue 27445). Both spellings are covered:
-// PKCS#8 "BEGIN ENCRYPTED PRIVATE KEY" and legacy PKCS#1/SEC1 "Proc-Type:
-// 4,ENCRYPTED" + DEK-Info.
-inline bool asym_needs_passphrase(std::span<const std::uint8_t> data, std::string_view pass) {
-    if (!pass.empty()) { return false; }
+// True when the material is an ENCRYPTED private-key PEM. Both spellings are
+// covered: PKCS#8 "BEGIN ENCRYPTED PRIVATE KEY" and legacy PKCS#1/SEC1
+// "Proc-Type: 4,ENCRYPTED" + DEK-Info.
+inline bool asym_is_encrypted_pem(std::span<const std::uint8_t> data) {
     const std::string_view text{reinterpret_cast<const char*>(data.data()), data.size()};
     if (text.find("-----BEGIN ") == std::string_view::npos) { return false; }
     return text.find("ENCRYPTED PRIVATE KEY-----") != std::string_view::npos ||
@@ -85,42 +92,86 @@ inline bool asym_needs_passphrase(std::span<const std::uint8_t> data, std::strin
            text.find("Proc-Type:4,ENCRYPTED") != std::string_view::npos;
 }
 
+// True when the material is a DER EncryptedPrivateKeyInfo (RFC 5208 §6) — the
+// structure is SEQUENCE { AlgorithmIdentifier, OCTET STRING }, which is exactly
+// what X509_SIG parses; a plain PrivateKeyInfo (INTEGER version first) does not.
+inline bool asym_is_encrypted_der(std::span<const std::uint8_t> data) {
+    if (data.empty() || data[0] != 0x30) { return false; }
+    const unsigned char* p{data.data()};
+    X509_SIG* sig{d2i_X509_SIG(nullptr, &p, static_cast<long>(data.size()))};
+    ERR_clear_error();
+    if (sig == nullptr) { return false; }
+    X509_SIG_free(sig);
+    return true;
+}
+
+// The message node produces when a key load fails, so the JS layer can map it to
+// node's error surface. With no passphrase supplied:
+//   * encrypted PEM  → node's OSSL_DECODER passphrase callback refuses rather
+//     than prompting, and OpenSSL 3 reports that as CRYPTO "interrupted or
+//     cancelled" (ERR_OSSL_CRYPTO_INTERRUPTED_OR_CANCELLED).
+//   * encrypted DER PKCS#8 → detected structurally before any decode attempt,
+//     which node reports as ERR_MISSING_PASSPHRASE.
+// Anything else keeps the caller's own wording.
+inline std::string asym_key_error(std::span<const std::uint8_t> data, bool hasPass,
+                                  std::string_view fallback) {
+    if (!hasPass) {
+        if (asym_is_encrypted_pem(data)) {
+            return "error:07880109:common libcrypto routines::interrupted or cancelled";
+        }
+        if (asym_is_encrypted_der(data)) { return "Passphrase required for encrypted key"; }
+    }
+    return std::string{fallback};
+}
+
 // Decode a key from PEM or DER (public or private), optional passphrase. Tries a
 // private-capable selection first, then public-only (SPKI). Returns nullptr on
-// failure. selection==0 lets OSSL decode whatever the input carries.
-inline EVP_PKEY* asym_load_pkey(std::span<const std::uint8_t> data, std::string_view pass) {
+// failure. An engaged-but-empty `pass` is an empty PASSWORD (node allows keys
+// encrypted under one); a disengaged `pass` means "never ask, never guess".
+inline EVP_PKEY* asym_load_pkey(std::span<const std::uint8_t> data, const AsymPass& pass) {
+    // Every decode below is speculative, so even a SUCCESSFUL load leaves the
+    // failed attempts sitting on OpenSSL's error queue. asym_ossl_err() pops the
+    // OLDEST entry, so without this the next genuine failure gets reported with a
+    // stale message — a leftover DECODER "unsupported" standing in for the EVP
+    // error that actually happened. Clear on the way out of every success path.
+    const auto loaded{[](EVP_PKEY* p) { ERR_clear_error(); return p; }};
     for (int sel : {EVP_PKEY_KEYPAIR, EVP_PKEY_PUBLIC_KEY}) {
         EVP_PKEY* pkey{nullptr};
         OSSL_DECODER_CTX* d{
             OSSL_DECODER_CTX_new_for_pkey(&pkey, nullptr, nullptr, nullptr, sel, nullptr, nullptr)};
         if (d != nullptr) {
-            if (!pass.empty()) {
+            if (pass.has_value()) {
                 OSSL_DECODER_CTX_set_passphrase(
-                    d, reinterpret_cast<const unsigned char*>(pass.data()), pass.size());
+                    d, reinterpret_cast<const unsigned char*>(pass->data()), pass->size());
             }
             const unsigned char* p{data.data()};
             std::size_t len{data.size()};
             OSSL_DECODER_from_data(d, &p, &len);
             OSSL_DECODER_CTX_free(d);
         }
-        if (pkey != nullptr) { return pkey; }
+        if (pkey != nullptr) { return loaded(pkey); }
     }
     // OSSL_DECODER reads only the FIRST PEM block; a SEC1 EC key file that leads
     // with an "EC PARAMETERS" block makes it stop on the params and fail.
     // PEM_read_bio_PrivateKey skips non-key PEM blocks and reads the key that
     // follows. ref: bun-ref ncrypto.cpp EVPKeyPointer::TryParsePrivateKey.
-    {
-        std::string p{pass};
+    // With no passphrase this fallback is skipped for encrypted PEM entirely:
+    // OpenSSL 3's PEM_read_bio_PrivateKey routes the pem_password_cb through the
+    // decoder bridge, where a callback that answers "0 bytes" is taken as a valid
+    // EMPTY password — so a key encrypted under an empty password would decrypt
+    // for a caller that supplied no passphrase at all. node refuses that.
+    if (pass.has_value() || !asym_is_encrypted_pem(data)) {
+        std::string p{pass.value_or(std::string{})};
         BIO* pb{BIO_new_mem_buf(data.data(), static_cast<int>(data.size()))};
         if (pb != nullptr) {
             // cb=nullptr would fall back to PEM_def_callback, which PROMPTS ON THE
             // TERMINAL ("Enter PEM pass phrase:") for an encrypted key — a hang in
             // any non-interactive run. With no passphrase, refuse instead.
-            EVP_PKEY* pk{pass.empty()
+            EVP_PKEY* pk{!pass.has_value()
                              ? PEM_read_bio_PrivateKey(pb, nullptr, asym_no_pass_cb, nullptr)
                              : PEM_read_bio_PrivateKey(pb, nullptr, nullptr, p.data())};
             BIO_free(pb);
-            if (pk != nullptr) { return pk; }
+            if (pk != nullptr) { return loaded(pk); }
         }
     }
     // Fallback: the material may be an X.509 certificate (node's publicEncrypt /
@@ -135,7 +186,7 @@ inline EVP_PKEY* asym_load_pkey(std::span<const std::uint8_t> data, std::string_
     if (cert != nullptr) {
         EVP_PKEY* pub{X509_get_pubkey(cert)};
         X509_free(cert);
-        return pub;
+        return loaded(pub);
     }
     return nullptr;
 }
@@ -151,10 +202,10 @@ inline JSC::EncodedJSValue asym_rsa_raw_host(JSC::JSGlobalObject* global, JSC::C
         !asym_read(global, native_arg(frame, 2), data)) {
         return hasher_throw(global, "key and data are required");
     }
-    const std::string pass{asym_str(global, native_arg(frame, 1))};
+    const AsymPass pass{asym_opt_str(global, native_arg(frame, 1))};
     const int padding{asym_int(native_arg(frame, 3), RSA_PKCS1_PADDING)};
     PkeyPtr pkey{asym_load_pkey(keyBytes, pass)};
-    if (!pkey) { return hasher_throw(global, "invalid key"); }
+    if (!pkey) { return hasher_throw(global, asym_key_error(keyBytes, pass.has_value(), "invalid key")); }
     PkeyCtxPtr pctx{EVP_PKEY_CTX_new(pkey.get(), nullptr)};
     if (!pctx) { return hasher_throw(global, "rsa ctx failed"); }
     int init{0};
@@ -208,6 +259,29 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_ec_valid_curve_host,
 inline std::optional<std::vector<std::uint8_t>> asym_encode_pkey(
     EVP_PKEY* pkey, int selection, const char* structure, bool pem,
     std::string_view cipher, std::string_view pass) {
+    // OSSL_ENCODER's legacy ("type-specific"/PKCS#1/SEC1) PEM writer collects the
+    // passphrase through a callback and treats a zero-length answer as a failed
+    // read (PEM routines::read key). An EMPTY passphrase is a legitimate request
+    // though — node encrypts with it (nodejs/node#35898) — so route that one case
+    // through PEM_write_bio_PrivateKey_traditional, which takes an explicit
+    // zero-length key string instead of asking.
+    if (pem && !cipher.empty() && pass.empty() && selection == EVP_PKEY_KEYPAIR &&
+        structure != nullptr && std::string_view{structure} == "type-specific") {
+        const EVP_CIPHER* c{EVP_get_cipherbyname(std::string{cipher}.c_str())};
+        if (c == nullptr) { return std::nullopt; }
+        BIO* b{BIO_new(BIO_s_mem())};
+        if (b == nullptr) { return std::nullopt; }
+        static const unsigned char kEmpty[1]{0};
+        std::vector<std::uint8_t> v;
+        if (PEM_write_bio_PrivateKey_traditional(b, pkey, c, kEmpty, 0, nullptr, nullptr) != 0) {
+            char* d{nullptr};
+            const long n{BIO_get_mem_data(b, &d)};
+            if (n > 0 && d != nullptr) { v.assign(d, d + n); }
+        }
+        BIO_free(b);
+        if (v.empty()) { return std::nullopt; }
+        return v;
+    }
     OSSL_ENCODER_CTX* e{
         OSSL_ENCODER_CTX_new_for_pkey(pkey, selection, pem ? "PEM" : "DER", structure, nullptr)};
     if (e == nullptr) { return std::nullopt; }
@@ -247,8 +321,48 @@ inline std::size_t asym_field_bytes(EVP_PKEY* pkey) {
     return bits > 0 ? static_cast<std::size_t>((bits + 7) / 8) : 0;
 }
 
+// Finite-field (DSA / classic DH) keygen. OpenSSL 3 has no one-shot for these:
+// the domain parameters (p, q, g) are generated first, then a key inside them.
+// qbits==0 lets the provider pick the divisor size for the requested pbits.
+inline EVP_PKEY* asym_ffc_gen(const char* alg, unsigned int pbits, unsigned int qbits) {
+    PkeyCtxPtr pc{EVP_PKEY_CTX_new_from_name(nullptr, alg, nullptr)};
+    if (!pc || EVP_PKEY_paramgen_init(pc.get()) <= 0) { return nullptr; }
+    OSSL_PARAM params[3];
+    int n{0};
+    params[n++] = OSSL_PARAM_construct_uint(OSSL_PKEY_PARAM_FFC_PBITS, &pbits);
+    if (qbits > 0) { params[n++] = OSSL_PARAM_construct_uint(OSSL_PKEY_PARAM_FFC_QBITS, &qbits); }
+    params[n] = OSSL_PARAM_construct_end();
+    if (EVP_PKEY_CTX_set_params(pc.get(), params) <= 0) { return nullptr; }
+    EVP_PKEY* domain{nullptr};
+    if (EVP_PKEY_generate(pc.get(), &domain) <= 0 || domain == nullptr) { return nullptr; }
+    PkeyPtr dom{domain};
+    PkeyCtxPtr kc{EVP_PKEY_CTX_new_from_pkey(nullptr, dom.get(), nullptr)};
+    EVP_PKEY* key{nullptr};
+    if (!kc || EVP_PKEY_keygen_init(kc.get()) <= 0 || EVP_PKEY_generate(kc.get(), &key) <= 0) {
+        return nullptr;
+    }
+    return key;
+}
+
+// RSA-PSS keygen. EVP_RSA_gen would mint a plain rsaEncryption key; node's
+// 'rsa-pss' must carry the id-RSASSA-PSS OID, and — with no hash/MGF1/salt
+// restriction requested — must NOT emit an RSASSA-PSS-params sequence
+// (nodejs/node#39936), which is what the bare "RSA-PSS" keymgmt produces.
+inline EVP_PKEY* asym_rsa_pss_gen(std::size_t bits) {
+    PkeyCtxPtr pc{EVP_PKEY_CTX_new_from_name(nullptr, "RSA-PSS", nullptr)};
+    if (!pc || EVP_PKEY_keygen_init(pc.get()) <= 0) { return nullptr; }
+    OSSL_PARAM params[2];
+    params[0] = OSSL_PARAM_construct_size_t(OSSL_PKEY_PARAM_RSA_BITS, &bits);
+    params[1] = OSSL_PARAM_construct_end();
+    if (EVP_PKEY_CTX_set_params(pc.get(), params) <= 0) { return nullptr; }
+    EVP_PKEY* key{nullptr};
+    if (EVP_PKEY_generate(pc.get(), &key) <= 0) { return nullptr; }
+    return key;
+}
+
 // __mbunCryptoAsymNative.generateKeyPair(type, modLen, namedCurve, pubType,
-//   pubFmt, privType, privFmt, cipher, passphrase) → {publicKey, privateKey}.
+//   pubFmt, privType, privFmt, cipher, passphrase, divisorLength)
+//   → {publicKey, privateKey}.
 // publicKey/privateKey are strings (PEM) or Uint8Array (DER).
 JSC_DEFINE_HOST_FUNCTION(node_asym_generate_host,
                          (JSC::JSGlobalObject* global, JSC::CallFrame* frame)) {
@@ -262,10 +376,18 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_generate_host,
     const std::string privFmt{asym_str(global, native_arg(frame, 6))};
     const std::string cipher{asym_str(global, native_arg(frame, 7))};
     const std::string pass{asym_str(global, native_arg(frame, 8))};
+    const int divLen{asym_int(native_arg(frame, 9), 0)};
 
     PkeyPtr pkey;
-    if (type == "rsa" || type == "rsa-pss") {
+    if (type == "rsa") {
         pkey.reset(EVP_RSA_gen(static_cast<unsigned int>(modLen > 0 ? modLen : 2048)));
+    } else if (type == "rsa-pss") {
+        pkey.reset(asym_rsa_pss_gen(static_cast<std::size_t>(modLen > 0 ? modLen : 2048)));
+    } else if (type == "dsa") {
+        pkey.reset(asym_ffc_gen("DSA", static_cast<unsigned int>(modLen > 0 ? modLen : 2048),
+                                static_cast<unsigned int>(divLen > 0 ? divLen : 0)));
+    } else if (type == "dh") {
+        pkey.reset(asym_ffc_gen("DH", static_cast<unsigned int>(modLen > 0 ? modLen : 2048), 0));
     } else if (type == "ec") {
         if (curve.empty()) { return hasher_throw(global, "namedCurve is required for ec keys"); }
         pkey.reset(EVP_EC_gen(curve.c_str()));
@@ -361,13 +483,16 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_sign_host,
         !asym_read(global, native_arg(frame, 2), keyBytes)) {
         return hasher_throw(global, "sign: data and key are required");
     }
-    const std::string pass{asym_str(global, native_arg(frame, 3))};
+    const AsymPass pass{asym_opt_str(global, native_arg(frame, 3))};
     const int padding{asym_int(native_arg(frame, 4), RSA_PKCS1_PADDING)};
     const int saltLen{asym_int(native_arg(frame, 5), RSA_PSS_SALTLEN_DIGEST)};
     const std::string dsaEnc{asym_str(global, native_arg(frame, 6))};
 
     PkeyPtr pkey{asym_load_pkey(keyBytes, pass)};
-    if (!pkey) { return hasher_throw(global, "sign: invalid private key"); }
+    if (!pkey) {
+        return hasher_throw(global,
+                            asym_key_error(keyBytes, pass.has_value(), "sign: invalid private key"));
+    }
     MdCtxPtr md{EVP_MD_CTX_new()};
     const EVP_MD* dg{digest.empty() ? nullptr : EVP_get_digestbyname(digest.c_str())};
     if (!digest.empty() && dg == nullptr) { return hasher_throw(global, "Unknown digest: " + digest); }
@@ -404,13 +529,15 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_verify_host,
         !asym_read(global, native_arg(frame, 4), sig)) {
         return hasher_throw(global, "verify: data, key and signature are required");
     }
-    const std::string pass{asym_str(global, native_arg(frame, 3))};
+    const AsymPass pass{asym_opt_str(global, native_arg(frame, 3))};
     const int padding{asym_int(native_arg(frame, 5), RSA_PKCS1_PADDING)};
     const int saltLen{asym_int(native_arg(frame, 6), RSA_PSS_SALTLEN_DIGEST)};
     const std::string dsaEnc{asym_str(global, native_arg(frame, 7))};
 
     PkeyPtr pkey{asym_load_pkey(keyBytes, pass)};
-    if (!pkey) { return hasher_throw(global, "verify: invalid key"); }
+    if (!pkey) {
+        return hasher_throw(global, asym_key_error(keyBytes, pass.has_value(), "verify: invalid key"));
+    }
     if (EVP_PKEY_base_id(pkey.get()) == EVP_PKEY_EC && dsaEnc == "ieee-p1363") {
         sig = asym_ecdsa_p1363_to_der(sig);
     }
@@ -467,7 +594,7 @@ inline JSC::EncodedJSValue asym_rsa_host(JSC::JSGlobalObject* global, JSC::CallF
         !asym_read(global, native_arg(frame, 2), data)) {
         return hasher_throw(global, "key and data are required");
     }
-    const std::string pass{asym_str(global, native_arg(frame, 1))};
+    const AsymPass pass{asym_opt_str(global, native_arg(frame, 1))};
     const int padding{asym_int(native_arg(frame, 3),
                                Decrypt ? RSA_PKCS1_PADDING : RSA_PKCS1_OAEP_PADDING)};
     const std::string oaepHash{asym_str(global, native_arg(frame, 4))};
@@ -475,7 +602,7 @@ inline JSC::EncodedJSValue asym_rsa_host(JSC::JSGlobalObject* global, JSC::CallF
     asym_read(global, native_arg(frame, 5), label);
 
     PkeyPtr pkey{asym_load_pkey(keyBytes, pass)};
-    if (!pkey) { return hasher_throw(global, "invalid key"); }
+    if (!pkey) { return hasher_throw(global, asym_key_error(keyBytes, pass.has_value(), "invalid key")); }
     auto out{asym_rsa_crypt(pkey.get(), !Decrypt, data, padding, oaepHash, label)};
     if (!out) { return hasher_throw(global, (Decrypt ? "decryption failed: " : "encryption failed: ") + asym_ossl_err()); }
     return JSC::JSValue::encode(toJS(global, static_cast<JSValueRef>(asym_u8(ctx, *out))));
@@ -515,12 +642,18 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_cipher_host,
     const EVP_CIPHER* c{EVP_get_cipherbyname(algo.c_str())};
     if (c == nullptr) { return hasher_throw(global, "Unknown cipher: " + algo); }
     const int mode{EVP_CIPHER_mode(c)};
+    // AEAD ciphers: a variable-length IV, associated data, and an authentication
+    // tag on top of the ciphertext. Enumerated explicitly rather than via
+    // EVP_CIPH_FLAG_AEAD_CIPHER, which OpenSSL also sets on the stitched
+    // aes-*-cbc-hmac-sha* ciphers (which are NOT tag-producing here).
+    const bool ocb{mode == EVP_CIPH_OCB_MODE};
     const bool gcm{mode == EVP_CIPH_GCM_MODE};
+    const bool aead{gcm || ocb || EVP_CIPHER_nid(c) == NID_chacha20_poly1305};
     // Key-length validation (node throws for a wrong-sized key/iv).
     if (key.size() != static_cast<std::size_t>(EVP_CIPHER_key_length(c))) {
         return hasher_throw(global, "Invalid key length");
     }
-    if (gcm) {
+    if (aead) {
         if (iv.empty()) { return hasher_throw(global, "Invalid IV length"); }
     } else if (mode == EVP_CIPH_ECB_MODE) {
         if (!iv.empty()) { return hasher_throw(global, "Invalid IV length"); }
@@ -532,8 +665,37 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_cipher_host,
     if (EVP_CipherInit_ex(cc.get(), c, nullptr, nullptr, nullptr, enc ? 1 : 0) <= 0) {
         return hasher_throw(global, "cipher init failed");
     }
-    if (gcm) {
+    if (aead) {
         EVP_CIPHER_CTX_ctrl(cc.get(), EVP_CTRL_AEAD_SET_IVLEN, static_cast<int>(iv.size()), nullptr);
+    }
+    // GCM infers its tag length from the tag the caller hands over; every OTHER
+    // AEAD has it FIXED at init. node does this unconditionally in
+    // InitAuthenticated (src/crypto/crypto_cipher.cc: "In CCM and OCB mode, [the
+    // authentication tag length] must always be given by the user"), and for
+    // ChaCha20-Poly1305 it pins auth_tag_len to 16 before the EVP_CTRL_AEAD_SET_TAG
+    // declaration.
+    //
+    // SECURITY: this is what makes a decrypt with a MISSING tag fail. OpenSSL
+    // leaves chacha20-poly1305's taglen at 0 until told, and its final does
+    // `CRYPTO_memcmp(computed, ctx->buf, taglen)` — a 0-length compare is EQUAL,
+    // so EVP_CipherFinal_ex returned success and handed back tampered plaintext
+    // that was never authenticated. Declaring the length up front turns that into
+    // a 16-byte compare against a zeroed buffer, which fails as it must.
+    //
+    // OCB additionally *requires* the length before the key is installed
+    // (EVP_EncryptInit_ex derives the L table from it), so the whole block sits
+    // ahead of the key/iv init for every mode.
+    const bool fixedTagLen{aead && !gcm};
+    if (fixedTagLen) {
+        // On decrypt with a supplied tag, declare exactly that length: OCB's ctrl
+        // rejects a tag whose length differs from the context's, so the length has
+        // to be declared (ptr == nullptr) before the bytes are handed over.
+        // ref: OpenSSL crypto/evp/e_aes.c aes_ocb_ctrl.
+        const int declared{(!enc && !tagIn.empty()) ? static_cast<int>(tagIn.size()) : tagLen};
+        EVP_CIPHER_CTX_ctrl(cc.get(), EVP_CTRL_AEAD_SET_TAG, declared, nullptr);
+        if (!enc && !tagIn.empty()) {
+            EVP_CIPHER_CTX_ctrl(cc.get(), EVP_CTRL_AEAD_SET_TAG, declared, tagIn.data());
+        }
     }
     if (EVP_CipherInit_ex(cc.get(), nullptr, nullptr, key.data(), iv.empty() ? nullptr : iv.data(),
                           enc ? 1 : 0) <= 0) {
@@ -545,7 +707,7 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_cipher_host,
     }
     if (noPad) { EVP_CIPHER_CTX_set_padding(cc.get(), 0); }
     int tmp{0};
-    if (gcm && !aad.empty()) {
+    if (aead && !aad.empty()) {
         EVP_CipherUpdate(cc.get(), nullptr, &tmp, aad.data(), static_cast<int>(aad.size()));
     }
     std::vector<std::uint8_t> out(data.size() + static_cast<std::size_t>(EVP_CIPHER_block_size(c)));
@@ -559,14 +721,14 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_cipher_host,
         // GCM/AEAD decrypt failure is an authentication failure (node's fixed
         // message); block-cipher failures surface the real OpenSSL error so the
         // JS layer can recover code/library/reason (e.g. WRONG_FINAL_BLOCK_LENGTH).
-        if (!enc && gcm) { return hasher_throw(global, "Unsupported state or unable to authenticate data"); }
+        if (!enc && aead) { return hasher_throw(global, "Unsupported state or unable to authenticate data"); }
         return hasher_throw(global, asym_ossl_err());
     }
     out.resize(static_cast<std::size_t>(outl + finl));
 
     JSObjectRef obj{JSObjectMake(ctx, nullptr, nullptr)};
     set_prop(ctx, obj, "data", static_cast<JSValueRef>(asym_u8(ctx, out)));
-    if (enc && gcm) {
+    if (enc && aead) {
         std::vector<std::uint8_t> tag(static_cast<std::size_t>(tagLen));
         EVP_CIPHER_CTX_ctrl(cc.get(), EVP_CTRL_AEAD_GET_TAG, tagLen, tag.data());
         set_prop(ctx, obj, "tag", static_cast<JSValueRef>(asym_u8(ctx, tag)));
@@ -650,6 +812,22 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_cipher_info_host,
     }
     set_prop(ctx, obj, "keyLength", JSValueMakeNumber(ctx, static_cast<double>(keyLen)));
     set_prop(ctx, obj, "mode", make_string(ctx, modeStr));
+    // mbun extension (node's getCipherInfo has no such field): whether this cipher
+    // is AEAD, i.e. produces/consumes an authentication tag.
+    //
+    // SECURITY: the JS layer used to infer this from `mode`, and ChaCha20-Poly1305's
+    // mode is "stream" — so `_auth` came out FALSE for a real AEAD, setAuthTag()
+    // skipped its length check, and a zero-length tag sailed through unvalidated
+    // into a native path that then skipped EVP_CTRL_AEAD_SET_TAG entirely.
+    // node asks the cipher itself (IsSupportedAuthenticatedMode /
+    // ncrypto::Cipher::isSupportedAuthenticatedMode), which is what this mirrors.
+    // NID_chacha20_poly1305 is enumerated rather than using
+    // EVP_CIPHER_FLAG_AEAD_CIPHER because OpenSSL also sets that flag on the
+    // stitched aes-*-cbc-hmac-sha* ciphers, which are not tag-producing here.
+    const bool isAead{mode == EVP_CIPH_GCM_MODE || mode == EVP_CIPH_CCM_MODE ||
+                      mode == EVP_CIPH_OCB_MODE ||
+                      EVP_CIPHER_nid(c) == NID_chacha20_poly1305};
+    set_prop(ctx, obj, "aead", JSValueMakeBoolean(ctx, isAead));
     return JSC::JSValue::encode(toJS(global, static_cast<JSValueRef>(obj)));
 }
 
@@ -671,6 +849,126 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_dh_prime_host,
     if (n > 0) { BN_bn2bin(p, out.data()); }
     BN_free(p);
     return JSC::JSValue::encode(toJS(global, static_cast<JSValueRef>(asym_u8(ctx, out))));
+}
+
+struct BnDel { void operator()(BIGNUM* p) const { if (p) BN_free(p); } };
+using BnPtr = std::unique_ptr<BIGNUM, BnDel>;
+
+// __mbunCryptoAsymNative.generatePrime(bits, safe, add, rem) → Uint8Array
+// (big-endian, BN_num_bytes long — the same minimal encoding node's
+// RandomPrimeTraits::EncodeOutput produces). `add`/`rem` are optional unsigned
+// big-endian byte strings; OpenSSL then constrains p % add == rem (rem defaults
+// to 1, or to 3 with safe). The two guards node applies before this call
+// (add wider than the requested prime, add <= rem — both of which make
+// BN_generate_prime_ex spin forever) live in the JS layer, where they can carry
+// node's ERR_OUT_OF_RANGE codes.
+// ref: node src/crypto/crypto_random.cc RandomPrimeTraits + ncrypto
+//      BignumPointer::generate.
+JSC_DEFINE_HOST_FUNCTION(node_asym_generate_prime_host,
+                         (JSC::JSGlobalObject* global, JSC::CallFrame* frame)) {
+    JSContextRef ctx{toRef(global)};
+    const int bits{asym_int(native_arg(frame, 0), 0)};
+    if (bits < 1) { return hasher_throw(global, "Invalid prime length"); }
+    const bool safe{[&] { JSC::JSValue v{native_arg(frame, 1)}; return v && v.toBoolean(global); }()};
+    std::vector<std::uint8_t> addBytes;
+    std::vector<std::uint8_t> remBytes;
+    const bool hasAdd{asym_read(global, native_arg(frame, 2), addBytes)};
+    const bool hasRem{asym_read(global, native_arg(frame, 3), remBytes)};
+    BnPtr add{hasAdd ? BN_bin2bn(addBytes.data(), static_cast<int>(addBytes.size()), nullptr)
+                     : nullptr};
+    BnPtr rem{hasRem ? BN_bin2bn(remBytes.data(), static_cast<int>(remBytes.size()), nullptr)
+                     : nullptr};
+    if ((hasAdd && !add) || (hasRem && !rem)) {
+        return hasher_throw(global, "could not generate prime: " + asym_ossl_err());
+    }
+    BnPtr p{BN_new()};
+    if (!p || BN_generate_prime_ex(p.get(), bits, safe ? 1 : 0, add.get(), rem.get(), nullptr) != 1) {
+        return hasher_throw(global, "could not generate prime: " + asym_ossl_err());
+    }
+    const int n{BN_num_bytes(p.get())};
+    std::vector<std::uint8_t> out(n > 0 ? static_cast<std::size_t>(n) : 0, 0);
+    if (n > 0) { BN_bn2bin(p.get(), out.data()); }
+    return JSC::JSValue::encode(toJS(global, static_cast<JSValueRef>(asym_u8(ctx, out))));
+}
+
+// __mbunCryptoAsymNative.checkPrime(candidate, checks) → boolean.
+// `checks` == 0 lets OpenSSL pick the Miller-Rabin round count for the bit size
+// (node passes the option straight through the same way). The BN_bin2bn failure
+// is NOT swallowed: an over-long candidate must surface OpenSSL's own
+// "bignum too long", which the JS layer turns into ERR_OSSL_BN_BIGNUM_TOO_LONG,
+// rather than being answered "not prime".
+// ref: node src/crypto/crypto_random.cc CheckPrimeTraits.
+JSC_DEFINE_HOST_FUNCTION(node_asym_check_prime_host,
+                         (JSC::JSGlobalObject* global, JSC::CallFrame* frame)) {
+    std::vector<std::uint8_t> cand;
+    if (!asym_read(global, native_arg(frame, 0), cand)) {
+        return hasher_throw(global, "candidate is required");
+    }
+    while (ERR_get_error() != 0) {}  // start from a clean queue
+    BnPtr bn{BN_bin2bn(cand.data(), static_cast<int>(cand.size()), nullptr)};
+    if (!bn) { return hasher_throw(global, asym_ossl_err()); }
+    const int checks{asym_int(native_arg(frame, 1), 0)};
+    BN_CTX* bctx{BN_CTX_new()};
+    const int rc{BN_is_prime_ex(bn.get(), checks, bctx, nullptr)};
+    if (bctx != nullptr) { BN_CTX_free(bctx); }
+    if (rc < 0) { return hasher_throw(global, "prime check failed: " + asym_ossl_err()); }
+    return JSC::JSValue::encode(JSC::jsBoolean(rc == 1));
+}
+
+// __mbunCryptoAsymNative.spkac(op, input) — SPKAC / Netscape SPKI (crypto.Certificate).
+//   op 0 verifySpkac      → boolean
+//   op 1 exportPublicKey  → Uint8Array (SPKI PEM) or undefined when it does not parse
+//   op 2 exportChallenge  → Uint8Array (challenge string) or undefined
+// The signature check is the real NETSCAPE_SPKI_verify against the key the SPKAC
+// itself carries — a malformed or unsigned SPKAC returns false, never "assume ok".
+// ref: node src/crypto/crypto_spkac.cc + deps/ncrypto VerifySpkac/ExportPublicKey/
+//      ExportChallenge.
+JSC_DEFINE_HOST_FUNCTION(node_asym_spkac_host,
+                         (JSC::JSGlobalObject* global, JSC::CallFrame* frame)) {
+    JSContextRef ctx{toRef(global)};
+    const int op{asym_int(native_arg(frame, 0), 0)};
+    std::vector<std::uint8_t> input;
+    if (!asym_read(global, native_arg(frame, 1), input)) {
+        return hasher_throw(global, "spkac input is required");
+    }
+    NETSCAPE_SPKI* spki{NETSCAPE_SPKI_b64_decode(reinterpret_cast<const char*>(input.data()),
+                                                 static_cast<int>(input.size()))};
+    if (spki == nullptr) {
+        while (ERR_get_error() != 0) {}
+        return JSC::JSValue::encode(op == 0 ? JSC::jsBoolean(false) : JSC::jsUndefined());
+    }
+    JSC::EncodedJSValue result{JSC::JSValue::encode(JSC::jsUndefined())};
+    if (op == 0) {
+        EVP_PKEY* pkey{X509_PUBKEY_get(spki->spkac->pubkey)};
+        const bool ok{pkey != nullptr && NETSCAPE_SPKI_verify(spki, pkey) > 0};
+        if (pkey != nullptr) { EVP_PKEY_free(pkey); }
+        result = JSC::JSValue::encode(JSC::jsBoolean(ok));
+    } else if (op == 1) {
+        EVP_PKEY* pkey{NETSCAPE_SPKI_get_pubkey(spki)};
+        BIO* bio{BIO_new(BIO_s_mem())};
+        if (pkey != nullptr && bio != nullptr && PEM_write_bio_PUBKEY(bio, pkey) > 0) {
+            char* data{nullptr};
+            const long len{BIO_get_mem_data(bio, &data)};
+            if (len > 0) {
+                std::span<const std::uint8_t> bytes{reinterpret_cast<const std::uint8_t*>(data),
+                                                    static_cast<std::size_t>(len)};
+                result = JSC::JSValue::encode(toJS(global, static_cast<JSValueRef>(asym_u8(ctx, bytes))));
+            }
+        }
+        if (bio != nullptr) { BIO_free(bio); }
+        if (pkey != nullptr) { EVP_PKEY_free(pkey); }
+    } else {
+        unsigned char* buf{nullptr};
+        const int n{ASN1_STRING_to_UTF8(&buf, spki->spkac->challenge)};
+        if (n >= 0) {
+            std::span<const std::uint8_t> bytes{buf, static_cast<std::size_t>(n)};
+            result = JSC::JSValue::encode(toJS(global, static_cast<JSValueRef>(asym_u8(ctx, bytes))));
+        }
+        if (buf != nullptr) { OPENSSL_free(buf); }
+    }
+    NETSCAPE_SPKI_free(spki);
+    while (ERR_get_error() != 0) {}
+    return result;
 }
 
 // --- ECDH (provider API via OSSL_PARAM_BLD/fromdata) ---
@@ -825,6 +1123,58 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_ecdh_convert_host,
 //   crosses into JS. OpenSSL's X25519 derive fails on an all-zero output, which
 //   is the RFC 7748 §6.1 small-order-point rejection the spec requires.
 // ref: bun src/jsc/bindings/webcrypto/CryptoAlgorithmX25519.cpp platformDeriveBits.
+// __mbunCryptoAsymNative.kmac(name, key, data, customization, outLenBytes) →
+//   Uint8Array with the KMAC tag. `name` is OpenSSL's MAC name ("KMAC-128" /
+//   "KMAC-256"); `customization` is NIST SP 800-185's optional S string.
+//   Backs WebCrypto's KMAC128/KMAC256 sign & verify.
+// ref: node src/crypto/crypto_mac.cc (KmacJob) + OpenSSL EVP_MAC-KMAC(7).
+JSC_DEFINE_HOST_FUNCTION(node_asym_kmac_host,
+                         (JSC::JSGlobalObject* global, JSC::CallFrame* frame)) {
+    JSContextRef ctx{toRef(global)};
+    const std::string name{asym_str(global, native_arg(frame, 0))};
+    std::vector<std::uint8_t> key;
+    std::vector<std::uint8_t> data;
+    std::vector<std::uint8_t> custom;
+    if (!asym_read(global, native_arg(frame, 1), key)) {
+        return hasher_throw(global, "kmac: key required");
+    }
+    asym_read(global, native_arg(frame, 2), data);
+    asym_read(global, native_arg(frame, 3), custom);
+    const int outLen{asym_int(native_arg(frame, 4), 32)};
+    if (outLen < 0) { return hasher_throw(global, "kmac: invalid output length"); }
+
+    struct MacDel { void operator()(EVP_MAC* m) const { if (m) EVP_MAC_free(m); } };
+    struct MacCtxDel { void operator()(EVP_MAC_CTX* c) const { if (c) EVP_MAC_CTX_free(c); } };
+    std::unique_ptr<EVP_MAC, MacDel> mac{EVP_MAC_fetch(nullptr, name.c_str(), nullptr)};
+    if (!mac) { return hasher_throw(global, "kmac: unsupported MAC " + name); }
+    std::unique_ptr<EVP_MAC_CTX, MacCtxDel> mctx{EVP_MAC_CTX_new(mac.get())};
+    if (!mctx) { return hasher_throw(global, "kmac: context allocation failed"); }
+
+    std::size_t size{static_cast<std::size_t>(outLen)};
+    OSSL_PARAM params[3];
+    int n{0};
+    params[n++] = OSSL_PARAM_construct_size_t(OSSL_MAC_PARAM_SIZE, &size);
+    if (!custom.empty()) {
+        params[n++] = OSSL_PARAM_construct_octet_string(
+            OSSL_MAC_PARAM_CUSTOM, custom.data(), custom.size());
+    }
+    params[n] = OSSL_PARAM_construct_end();
+
+    if (EVP_MAC_init(mctx.get(), key.data(), key.size(), params) <= 0) {
+        return hasher_throw(global, "kmac init failed: " + asym_ossl_err());
+    }
+    if (!data.empty() && EVP_MAC_update(mctx.get(), data.data(), data.size()) <= 0) {
+        return hasher_throw(global, "kmac update failed: " + asym_ossl_err());
+    }
+    std::vector<std::uint8_t> out(size == 0 ? 1 : size);
+    std::size_t outl{0};
+    if (EVP_MAC_final(mctx.get(), out.data(), &outl, out.size()) <= 0) {
+        return hasher_throw(global, "kmac final failed: " + asym_ossl_err());
+    }
+    out.resize(outl);
+    return JSC::JSValue::encode(toJS(global, static_cast<JSValueRef>(asym_u8(ctx, out))));
+}
+
 JSC_DEFINE_HOST_FUNCTION(node_asym_okp_derive_host,
                          (JSC::JSGlobalObject* global, JSC::CallFrame* frame)) {
     JSContextRef ctx{toRef(global)};
@@ -834,8 +1184,8 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_okp_derive_host,
         !asym_read(global, native_arg(frame, 1), pub)) {
         return hasher_throw(global, "deriveBits: private key and public key required");
     }
-    PkeyPtr me{asym_load_pkey(priv, "")};
-    PkeyPtr peer{asym_load_pkey(pub, "")};
+    PkeyPtr me{asym_load_pkey(priv, std::nullopt)};
+    PkeyPtr peer{asym_load_pkey(pub, std::nullopt)};
     if (!me || !peer) { return hasher_throw(global, "deriveBits: invalid key material"); }
     const int mine{EVP_PKEY_base_id(me.get())};
     if (mine != EVP_PKEY_X25519 && mine != EVP_PKEY_X448) {
@@ -867,9 +1217,12 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_okp_derive_host,
 // public key handed to createPrivateKey with a decode error.
 inline bool asym_has_private(EVP_PKEY* pkey) {
     const int base{EVP_PKEY_base_id(pkey)};
-    const char* bnParam{(base == EVP_PKEY_RSA || base == EVP_PKEY_RSA_PSS) ? OSSL_PKEY_PARAM_RSA_D
-                        : (base == EVP_PKEY_EC)                            ? OSSL_PKEY_PARAM_PRIV_KEY
-                                                                           : nullptr};
+    const char* bnParam{
+        (base == EVP_PKEY_RSA || base == EVP_PKEY_RSA_PSS) ? OSSL_PKEY_PARAM_RSA_D
+        : (base == EVP_PKEY_EC || base == EVP_PKEY_DSA || base == EVP_PKEY_DH ||
+           base == EVP_PKEY_DHX)
+            ? OSSL_PKEY_PARAM_PRIV_KEY
+            : nullptr};
     if (bnParam != nullptr) {
         BIGNUM* bn{nullptr};
         if (EVP_PKEY_get_bn_param(pkey, bnParam, &bn) > 0 && bn != nullptr) {
@@ -893,12 +1246,10 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_key_type_host,
     if (!asym_read(global, native_arg(frame, 0), keyBytes)) {
         return hasher_throw(global, "keyType: key required");
     }
-    const std::string pass{asym_str(global, native_arg(frame, 1))};
+    const AsymPass pass{asym_opt_str(global, native_arg(frame, 1))};
     PkeyPtr pkey{asym_load_pkey(keyBytes, pass)};
     if (!pkey) {
-        return hasher_throw(global, asym_needs_passphrase(keyBytes, pass)
-                                        ? "Passphrase required for encrypted key"
-                                        : "Invalid key");
+        return hasher_throw(global, asym_key_error(keyBytes, pass.has_value(), "Invalid key"));
     }
     const int base{EVP_PKEY_base_id(pkey.get())};
     std::string type;
@@ -906,6 +1257,9 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_key_type_host,
         case EVP_PKEY_RSA: type = "rsa"; break;
         case EVP_PKEY_RSA_PSS: type = "rsa-pss"; break;
         case EVP_PKEY_EC: type = "ec"; break;
+        case EVP_PKEY_DSA: type = "dsa"; break;
+        case EVP_PKEY_DH: type = "dh"; break;
+        case EVP_PKEY_DHX: type = "dh"; break;
         case EVP_PKEY_ED25519: type = "ed25519"; break;
         case EVP_PKEY_ED448: type = "ed448"; break;
         case EVP_PKEY_X25519: type = "x25519"; break;
@@ -936,6 +1290,16 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_key_type_host,
             set_prop(ctx, obj, "publicExponent", static_cast<JSValueRef>(asym_u8(ctx, eb)));
         }
         if (e != nullptr) { BN_free(e); }
+    } else if (base == EVP_PKEY_DSA) {
+        // node asymmetricKeyDetails for DSA: { modulusLength: |p|, divisorLength: |q| }.
+        set_prop(ctx, obj, "modulusLength",
+                 JSValueMakeNumber(ctx, static_cast<double>(EVP_PKEY_get_bits(pkey.get()))));
+        BIGNUM* q{nullptr};
+        if (EVP_PKEY_get_bn_param(pkey.get(), OSSL_PKEY_PARAM_FFC_Q, &q) > 0 && q != nullptr) {
+            set_prop(ctx, obj, "divisorLength",
+                     JSValueMakeNumber(ctx, static_cast<double>(BN_num_bits(q))));
+            BN_free(q);
+        }
     }
     return JSC::JSValue::encode(toJS(global, static_cast<JSValueRef>(obj)));
 }
@@ -1011,14 +1375,12 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_jwk_export_host,
     if (!asym_read(global, native_arg(frame, 0), keyBytes)) {
         return hasher_throw(global, "jwkExport: key required");
     }
-    const std::string pass{asym_str(global, native_arg(frame, 1))};
+    const AsymPass pass{asym_opt_str(global, native_arg(frame, 1))};
     const bool isPublic{[&] { JSC::JSValue v{native_arg(frame, 2)}; return v && v.toBoolean(global); }()};
 
     PkeyPtr pkey{asym_load_pkey(keyBytes, pass)};
     if (!pkey) {
-        return hasher_throw(global, asym_needs_passphrase(keyBytes, pass)
-                                        ? "Passphrase required for encrypted key"
-                                        : "Invalid key");
+        return hasher_throw(global, asym_key_error(keyBytes, pass.has_value(), "Invalid key"));
     }
     JSObjectRef obj{JSObjectMake(ctx, nullptr, nullptr)};
     const int base{EVP_PKEY_base_id(pkey.get())};
@@ -1224,7 +1586,7 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_key_export_host,
     if (!asym_read(global, native_arg(frame, 0), keyBytes)) {
         return hasher_throw(global, "keyExport: key required");
     }
-    const std::string pass{asym_str(global, native_arg(frame, 1))};
+    const AsymPass pass{asym_opt_str(global, native_arg(frame, 1))};
     const bool isPublic{[&] { JSC::JSValue v{native_arg(frame, 2)}; return v && v.toBoolean(global); }()};
     const std::string type{asym_str(global, native_arg(frame, 3))};
     const std::string format{asym_str(global, native_arg(frame, 4))};
@@ -1233,9 +1595,14 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_key_export_host,
 
     PkeyPtr pkey{asym_load_pkey(keyBytes, pass)};
     if (!pkey) {
-        return hasher_throw(global, asym_needs_passphrase(keyBytes, pass)
-                                        ? "Passphrase required for encrypted key"
-                                        : "Invalid key");
+        return hasher_throw(global, asym_key_error(keyBytes, pass.has_value(), "Invalid key"));
+    }
+    // An EC key decoded from a compressed SPKI keeps that point format, but
+    // node (and WebCrypto) always re-emit the uncompressed point.
+    // ref: nodejs/node#45859.
+    if (EVP_PKEY_base_id(pkey.get()) == EVP_PKEY_EC) {
+        EVP_PKEY_set_utf8_string_param(pkey.get(), OSSL_PKEY_PARAM_EC_POINT_CONVERSION_FORMAT,
+                                       "uncompressed");
     }
     int sel{0};
     const char* structure{nullptr};
@@ -1350,6 +1717,58 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_x509_parse_host,
     set_prop(ctx, obj, "fingerprint512", make_string(ctx, fingerprint(EVP_sha512())));
 
     // subjectAltName (node format: "DNS:a, DNS:b, IP Address:1.2.3.4").
+    //
+    // SECURITY: the textual form MUST NOT be produced by copying the raw ASN.1
+    // bytes. A DNS SAN may legally carry an embedded NUL, a comma or a quote,
+    // and every one of those lets a certificate's altname list be misread:
+    //   - an embedded NUL truncates the name in any C-string consumer, so a
+    //     certificate issued for "good.example.org\0.evil.example.com" reads
+    //     back as "good.example.org" and checkServerIdentity accepts it for the
+    //     victim host (the classic null-prefix spoof, CVE-2009-2408 class);
+    //   - a comma forges an extra list entry, because checkServerIdentity splits
+    //     the string on ", ".
+    // node therefore JSON-escapes any name that is not "safe", using the raw
+    // ASN1_STRING bytes (never ASN1_STRING_to_UTF8, which stops at the NUL).
+    // Translated from deps/ncrypto/ncrypto.cc IsSafeAltName / PrintAltName /
+    // PrintGeneralName. ref test-tls-0-dns-altname.
+    const auto is_safe_alt_name{[](const unsigned char* d, int n) {
+        for (int i = 0; i < n; ++i) {
+            const char c{static_cast<char>(d[i])};
+            if (c == '"' || c == '\\' || c == ',' || c == '\'') { return false; }
+            if (c < ' ' || c > '~') { return false; }
+        }
+        return true;
+    }};
+    // Appends the value, escaping it exactly as node does when it is not safe.
+    // The prefix ("DNS:", "email:", "URI:") is written by the caller and stays
+    // OUTSIDE the quotes, matching PrintGeneralName.
+    const auto append_alt_name{[&is_safe_alt_name](std::string& out,
+                                                   const unsigned char* d, int n) {
+        if (d == nullptr || n < 0) { return; }
+        if (is_safe_alt_name(d, n)) {
+            out.append(reinterpret_cast<const char*>(d), static_cast<std::size_t>(n));
+            return;
+        }
+        static constexpr char kHex[]{"0123456789abcdef"};
+        out.push_back('"');
+        for (int i = 0; i < n; ++i) {
+            const char c{static_cast<char>(d[i])};
+            if (c == '\\') {
+                out.append("\\\\");
+            } else if (c == '"') {
+                out.append("\\\"");
+            } else if (c >= ' ' && c != ',' && c <= '~') {
+                out.push_back(c);
+            } else {
+                // Everything else is treated as Latin-1 (the first 255 code
+                // points), which is what node emits.
+                out.append("\\u00");
+                out.push_back(kHex[(static_cast<unsigned char>(c) & 0xF0U) >> 4U]);
+                out.push_back(kHex[static_cast<unsigned char>(c) & 0x0FU]);
+            }
+        }
+        out.push_back('"');
+    }};
     std::string san;
     if (auto* names{static_cast<GENERAL_NAMES*>(
             X509_get_ext_d2i(cert, NID_subject_alt_name, nullptr, nullptr))}) {
@@ -1357,29 +1776,26 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_x509_parse_host,
         for (int i = 0; i < count; ++i) {
             GENERAL_NAME* gen{sk_GENERAL_NAME_value(names, i)};
             if (gen->type == GEN_DNS) {
-                unsigned char* utf8{nullptr};
-                const int len{ASN1_STRING_to_UTF8(&utf8, gen->d.dNSName)};
-                if (len > 0 && utf8 != nullptr) {
+                const ASN1_IA5STRING* nm{gen->d.dNSName};
+                if (nm != nullptr && ASN1_STRING_length(nm) > 0) {
                     if (!san.empty()) { san.append(", "); }
-                    san.append("DNS:").append(reinterpret_cast<char*>(utf8), len);
+                    san.append("DNS:");
+                    append_alt_name(san, ASN1_STRING_get0_data(nm), ASN1_STRING_length(nm));
                 }
-                if (utf8 != nullptr) { OPENSSL_free(utf8); }
             } else if (gen->type == GEN_EMAIL) {
-                unsigned char* utf8{nullptr};
-                const int len{ASN1_STRING_to_UTF8(&utf8, gen->d.rfc822Name)};
-                if (len > 0 && utf8 != nullptr) {
+                const ASN1_IA5STRING* nm{gen->d.rfc822Name};
+                if (nm != nullptr && ASN1_STRING_length(nm) > 0) {
                     if (!san.empty()) { san.append(", "); }
-                    san.append("email:").append(reinterpret_cast<char*>(utf8), len);
+                    san.append("email:");
+                    append_alt_name(san, ASN1_STRING_get0_data(nm), ASN1_STRING_length(nm));
                 }
-                if (utf8 != nullptr) { OPENSSL_free(utf8); }
             } else if (gen->type == GEN_URI) {
-                unsigned char* utf8{nullptr};
-                const int len{ASN1_STRING_to_UTF8(&utf8, gen->d.uniformResourceIdentifier)};
-                if (len > 0 && utf8 != nullptr) {
+                const ASN1_IA5STRING* nm{gen->d.uniformResourceIdentifier};
+                if (nm != nullptr && ASN1_STRING_length(nm) > 0) {
                     if (!san.empty()) { san.append(", "); }
-                    san.append("URI:").append(reinterpret_cast<char*>(utf8), len);
+                    san.append("URI:");
+                    append_alt_name(san, ASN1_STRING_get0_data(nm), ASN1_STRING_length(nm));
                 }
-                if (utf8 != nullptr) { OPENSSL_free(utf8); }
             } else if (gen->type == GEN_IPADD) {
                 // node prints "IP Address:<v4 dotted>" or the full 8-group IPv6
                 // form (no :: compression, lowercase hex) — lib/tls.js formats the

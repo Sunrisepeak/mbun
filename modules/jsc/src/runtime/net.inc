@@ -59,12 +59,52 @@ bool net_parse_addr(const std::string& host, std::uint16_t port, sockaddr_in& ou
 #endif
 
 // net.listen(host, port) → { fd, port } (port resolved when 0).
+// errno → its POSIX NAME. The JS net layer classifies native failures by
+// scanning the thrown message for an errno name (js_net.cppm ERRNO_RE), so a
+// strerror-only message ("Permission denied") is indistinguishable from any
+// other and falls back to EADDRINUSE.
+inline const char* net_errno_name(int e) {
+    switch (e) {
+    case EACCES: return "EACCES";
+    case EPERM: return "EPERM";
+    case EADDRINUSE: return "EADDRINUSE";
+    case EADDRNOTAVAIL: return "EADDRNOTAVAIL";
+    case EAFNOSUPPORT: return "EAFNOSUPPORT";
+    case EINVAL: return "EINVAL";
+    case ELOOP: return "ELOOP";
+    case ENAMETOOLONG: return "ENAMETOOLONG";
+    case ENOENT: return "ENOENT";
+    case ENOTDIR: return "ENOTDIR";
+    case EMFILE: return "EMFILE";
+    case ENFILE: return "ENFILE";
+    case ENOTSOCK: return "ENOTSOCK";
+    // connect(2) side. A unix-socket connect to a path that exists but is not a
+    // socket is ECONNREFUSED on Linux, and one whose mode denies access EACCES;
+    // both used to be reported as a flat ENOENT.
+    case ECONNREFUSED: return "ECONNREFUSED";
+    case ECONNRESET: return "ECONNRESET";
+    case ETIMEDOUT: return "ETIMEDOUT";
+    case EHOSTUNREACH: return "EHOSTUNREACH";
+    case ENETUNREACH: return "ENETUNREACH";
+    case ENETDOWN: return "ENETDOWN";
+    case EPIPE: return "EPIPE";
+    case EISDIR: return "EISDIR";
+    default: return "UNKNOWN";
+    }
+}
+
 JSValueRef netn_listen_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                           const JSValueRef args[], JSValueRef* exc) {
 #if defined(_WIN32)
     return fs_throw(ctx, exc, "net.listen: not supported on Windows yet");
 #else
     const std::string host{fs_arg(ctx, argc, args, 0)};
+    // Permission Model: node gates the Net scope in tcp_wrap.cc / pipe_wrap.cc /
+    // udp_wrap.cc — i.e. at the wrap's Bind/Connect/Listen, which is the syscall.
+    // Same place here. `--allow-net` is all-or-nothing in node; the resource is
+    // the address or socket path so the error names what was refused.
+    if (permission_deny_scope(ctx, exc, mbun::permission::Scope::Net, host))
+        return JSValueMakeUndefined(ctx);
     const auto port{static_cast<std::uint16_t>(
         argc > 1 ? JSValueToNumber(ctx, args[1], nullptr) : 0)};
     sockaddr_in addr{};
@@ -75,11 +115,32 @@ JSValueRef netn_listen_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_
     if (fd < 0) return fs_throw(ctx, exc, "net.listen: socket() failed");
     const int one{1};
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    // net.Server.listen({ reusePort: true }): several sockets may hold the same
+    // address and the kernel load-balances accepts between them. Without it a
+    // second listen on the port fails EADDRINUSE (test-cluster-net-reuseport,
+    // test-net-server-reuseport).
+    if (argc > 2 && JSValueToBoolean(ctx, args[2])) {
+#ifdef SO_REUSEPORT
+        if (setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one) != 0) {
+            const int saved{errno};
+            close(fd);
+            return fs_throw(ctx, exc, std::string{"net.listen: SO_REUSEPORT failed ("} +
+                                          net_errno_name(saved) + ": " + std::strerror(saved) + ")");
+        }
+#else
+        close(fd);
+        return fs_throw(ctx, exc, "net.listen: SO_REUSEPORT failed (ENOTSUP: not supported)");
+#endif
+    }
     if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof addr) != 0 ||
         ::listen(fd, 128) != 0) {
+        const int saved{errno};
         close(fd);
+        // The errno NAME, not just strerror: the JS layer classifies a bind
+        // failure by scanning this message, so "Permission denied" alone was
+        // reported as EADDRINUSE (test-cluster-bind-privileged-port wants EACCES).
         return fs_throw(ctx, exc, std::string{"net.listen: bind/listen failed ("} +
-                                      std::strerror(errno) + ")");
+                                      net_errno_name(saved) + ": " + std::strerror(saved) + ")");
     }
     sockaddr_in bound{};
     socklen_t blen{sizeof bound};
@@ -103,6 +164,12 @@ JSValueRef netn_listen_unix_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::
     return fs_throw(ctx, exc, "net.listenUnix: not supported on Windows yet");
 #else
     const std::string path{fs_arg(ctx, argc, args, 0)};
+    // Permission Model: node gates the Net scope in tcp_wrap.cc / pipe_wrap.cc /
+    // udp_wrap.cc — i.e. at the wrap's Bind/Connect/Listen, which is the syscall.
+    // Same place here. `--allow-net` is all-or-nothing in node; the resource is
+    // the address or socket path so the error names what was refused.
+    if (permission_deny_scope(ctx, exc, mbun::permission::Scope::Net, path))
+        return JSValueMakeUndefined(ctx);
     if (path.empty()) return fs_throw(ctx, exc, "net.listenUnix: empty socket path");
     sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
@@ -159,6 +226,12 @@ JSValueRef netn_connect_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size
     return fs_throw(ctx, exc, "net.connect: not supported on Windows yet");
 #else
     const std::string host{fs_arg(ctx, argc, args, 0)};
+    // Permission Model: node gates the Net scope in tcp_wrap.cc / pipe_wrap.cc /
+    // udp_wrap.cc — i.e. at the wrap's Bind/Connect/Listen, which is the syscall.
+    // Same place here. `--allow-net` is all-or-nothing in node; the resource is
+    // the address or socket path so the error names what was refused.
+    if (permission_deny_scope(ctx, exc, mbun::permission::Scope::Net, host))
+        return JSValueMakeUndefined(ctx);
     const auto port{static_cast<std::uint16_t>(
         argc > 1 ? JSValueToNumber(ctx, args[1], nullptr) : 0)};
     sockaddr_in addr{};
@@ -167,6 +240,32 @@ JSValueRef netn_connect_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size
     }
     const int fd{socket(AF_INET, SOCK_STREAM, 0)};
     if (fd < 0) return fs_throw(ctx, exc, "net.connect: socket() failed");
+    // net.connect(host, port, localAddress, localPort): node binds the socket
+    // to options.localAddress/localPort BEFORE connect(2) (tcp_wrap.cc Bind
+    // then Connect), and a local address this host does not own fails the
+    // connection with EADDRNOTAVAIL rather than silently dialling from the
+    // default source address (test-http-localaddress-bind-error).
+    const std::string laddr{argc > 2 && JSValueIsString(ctx, args[2]) ? fs_arg(ctx, argc, args, 2)
+                                                                      : std::string{}};
+    const auto lport{static_cast<std::uint16_t>(
+        argc > 3 && JSValueIsNumber(ctx, args[3]) ? JSValueToNumber(ctx, args[3], nullptr) : 0)};
+    if (!laddr.empty() || lport != 0) {
+        sockaddr_in local{};
+        if (!net_parse_addr(laddr.empty() ? std::string{"0.0.0.0"} : laddr, lport, local)) {
+            close(fd);
+            return fs_throw(ctx, exc, "EADDRNOTAVAIL: bind to " + laddr + " failed (invalid address)");
+        }
+        if (lport != 0) {
+            const int reuse{1};
+            setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof reuse);
+        }
+        if (bind(fd, reinterpret_cast<sockaddr*>(&local), sizeof local) != 0) {
+            const int saved{errno};
+            close(fd);
+            return fs_throw(ctx, exc, std::string{net_errno_name(saved)} + ": bind to " + laddr + ":" +
+                                          std::to_string(lport) + " failed (" + std::strerror(saved) + ")");
+        }
+    }
     int rc;
     do { rc = connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof addr); }
     while (rc != 0 && errno == EINTR);
@@ -183,6 +282,53 @@ JSValueRef netn_connect_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size
 #endif
 }
 
+// net.sockname(fd) → "address:port" of the LOCAL end (getsockname), or null.
+// node publishes this as socket.localAddress/localPort; without it a client
+// socket reported localPort 0 forever, which is what an agent-reuse test reads
+// to tell two connections apart.
+JSValueRef netn_sockname_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                            const JSValueRef args[], JSValueRef* exc) {
+#if defined(_WIN32)
+    return fs_throw(ctx, exc, "net.sockname: not supported on Windows yet");
+#else
+    (void)exc;
+    const int fd{argc > 0 ? static_cast<int>(JSValueToNumber(ctx, args[0], nullptr)) : -1};
+    if (fd < 0) return JSValueMakeNull(ctx);
+    sockaddr_in addr{};
+    socklen_t len{sizeof addr};
+    if (getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) != 0 || addr.sin_family != AF_INET) {
+        return JSValueMakeNull(ctx);
+    }
+    char buf[INET_ADDRSTRLEN]{};
+    if (inet_ntop(AF_INET, &addr.sin_addr, buf, sizeof buf) == nullptr) return JSValueMakeNull(ctx);
+    const std::string out{std::string{buf} + ":" + std::to_string(ntohs(addr.sin_port))};
+    return make_string(ctx, out);
+#endif
+}
+
+// net.peername(fd) → "address:port" of the REMOTE end (getpeername), or null.
+// The accepted-socket path had no way to learn it, so every server-side
+// socket.remotePort read 0 — which agreed with a client localPort that was also
+// 0 until getsockname landed (test-net-socket-local-address compares the two).
+JSValueRef netn_peername_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                            const JSValueRef args[], JSValueRef* exc) {
+#if defined(_WIN32)
+    return fs_throw(ctx, exc, "net.peername: not supported on Windows yet");
+#else
+    (void)exc;
+    const int fd{argc > 0 ? static_cast<int>(JSValueToNumber(ctx, args[0], nullptr)) : -1};
+    if (fd < 0) return JSValueMakeNull(ctx);
+    sockaddr_in addr{};
+    socklen_t len{sizeof addr};
+    if (getpeername(fd, reinterpret_cast<sockaddr*>(&addr), &len) != 0 || addr.sin_family != AF_INET) {
+        return JSValueMakeNull(ctx);
+    }
+    char buf[INET_ADDRSTRLEN]{};
+    if (inet_ntop(AF_INET, &addr.sin_addr, buf, sizeof buf) == nullptr) return JSValueMakeNull(ctx);
+    return make_string(ctx, std::string{buf} + ":" + std::to_string(ntohs(addr.sin_port)));
+#endif
+}
+
 // net.connectUnix(path) → connection fd: AF_UNIX stream connect for
 // Bun.connect({unix}). Only the address differs from netn_connect_cb — the fd is
 // then non-blocking and shares read/write/wait/close with the AF_INET path.
@@ -193,6 +339,12 @@ JSValueRef netn_connect_unix_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std:
     return fs_throw(ctx, exc, "net.connectUnix: not supported on Windows yet");
 #else
     const std::string path{fs_arg(ctx, argc, args, 0)};
+    // Permission Model: node gates the Net scope in tcp_wrap.cc / pipe_wrap.cc /
+    // udp_wrap.cc — i.e. at the wrap's Bind/Connect/Listen, which is the syscall.
+    // Same place here. `--allow-net` is all-or-nothing in node; the resource is
+    // the address or socket path so the error names what was refused.
+    if (permission_deny_scope(ctx, exc, mbun::permission::Scope::Net, path))
+        return JSValueMakeUndefined(ctx);
     if (path.empty()) return fs_throw(ctx, exc, "net.connectUnix: empty socket path");
     sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
@@ -208,9 +360,15 @@ JSValueRef netn_connect_unix_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std:
     do { rc = connect(fd, reinterpret_cast<sockaddr*>(&addr), alen); }
     while (rc != 0 && errno == EINTR);
     if (rc != 0) {
+        // The errno NAME, not a hard-coded ENOENT: connecting to a path that
+        // exists but is not a socket is ECONNREFUSED (or ENOTSOCK), and one
+        // whose mode denies access is EACCES. The JS layer classifies the
+        // failure by scanning this message, so a fixed "ENOENT" reported every
+        // pipe connect failure as a missing file (test-net-pipe-connect-errors).
+        const int saved{errno};
         close(fd);
-        return fs_throw(ctx, exc, std::string{"ENOENT: connect to unix:"} + path +
-                                      " failed (" + std::strerror(errno) + ")");
+        return fs_throw(ctx, exc, std::string{net_errno_name(saved)} + ": connect to unix:" + path +
+                                      " failed (" + std::strerror(saved) + ")");
     }
     net_set_nonblock(fd);
     net_fds().insert(fd);
@@ -335,6 +493,27 @@ JSValueRef netn_shutdown_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
     return JSValueMakeUndefined(ctx);
 }
 
+// net.track(fd) → join an EXTERNALLY acquired descriptor to the reactor's poll
+// set (and make it non-blocking). Descriptors that arrive over SCM_RIGHTS —
+// node's NODE_HANDLE protocol, i.e. every socket cluster hands to a worker —
+// never passed through accept()/connect(), so they were absent from net_fds()
+// and netn_wait_cb never polled them: the pump parked for up to 60s while a
+// readable byte or a FIN sat unnoticed on the socket, which is a hang for any
+// test with a 15s budget (test-cluster-worker-wait-server-close,
+// test-cluster-disconnect). Idempotent, so the accept()/connect() paths that
+// already registered their fd can call it too.
+JSValueRef netn_track_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                         const JSValueRef args[], JSValueRef*) {
+#if !defined(_WIN32)
+    const int fd{argc > 0 ? static_cast<int>(JSValueToNumber(ctx, args[0], nullptr)) : -1};
+    if (fd >= 0 && !net_fds().contains(fd)) {
+        net_set_nonblock(fd);
+        net_fds().insert(fd);
+    }
+#endif
+    return JSValueMakeUndefined(ctx);
+}
+
 JSValueRef netn_close_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                          const JSValueRef args[], JSValueRef*) {
 #if !defined(_WIN32)
@@ -369,8 +548,49 @@ JSValueRef netn_set_sockbuf_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::
         if (size > 0) (void)setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &size, sizeof size);
 #endif
     }
+    // which == 4: TCP_NODELAY, `size` = 0/1. connect()/accept() already enable
+    // it, so this exists for the DISABLE direction node's socket._handle
+    // .setNoDelay(false) asks for.
+    else if (fd >= 0 && which == 4) {
+        const int on{size > 0 ? 1 : 0};
+        (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof on);
+    }
+    // which == 5: IP_TOS (node tcp_wrap SetTypeOfService). Reported back through
+    // getSockOptInt so socket.getTypeOfService() reads the value the kernel
+    // actually kept (it clears the two ECN bits).
+    else if (fd >= 0 && which == 5) {
+        (void)setsockopt(fd, IPPROTO_IP, IP_TOS, &size, sizeof size);
+    }
 #endif
     return JSValueMakeUndefined(ctx);
+}
+
+// getSockOptInt(fd, which) → the current integer value of one of the options
+// setSockBuf writes (same `which` codes), or -1 when the option cannot be read.
+// Reads an option on a descriptor this process already owns: it acquires no new
+// filesystem or network resource, so there is nothing here for the permission
+// model to gate that connect()/listen() have not already gated.
+JSValueRef netn_get_sockopt_int_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                                   const JSValueRef args[], JSValueRef*) {
+#if defined(_WIN32)
+    return JSValueMakeNumber(ctx, -1);
+#else
+    const int fd{argc > 0 ? static_cast<int>(JSValueToNumber(ctx, args[0], nullptr)) : -1};
+    const int which{argc > 1 ? static_cast<int>(JSValueToNumber(ctx, args[1], nullptr)) : 0};
+    int level{0}, name{0};
+    switch (which) {
+        case 1: level = SOL_SOCKET;  name = SO_SNDBUF;   break;
+        case 2: level = SOL_SOCKET;  name = SO_RCVBUF;   break;
+        case 3: level = SOL_SOCKET;  name = SO_KEEPALIVE; break;
+        case 4: level = IPPROTO_TCP; name = TCP_NODELAY; break;
+        case 5: level = IPPROTO_IP;  name = IP_TOS;      break;
+        default: return JSValueMakeNumber(ctx, -1);
+    }
+    int value{0};
+    socklen_t len{sizeof value};
+    if (fd < 0 || getsockopt(fd, level, name, &value, &len) != 0) return JSValueMakeNumber(ctx, -1);
+    return JSValueMakeNumber(ctx, static_cast<double>(value));
+#endif
 }
 
 // net.wait(ms) → number of fds ready to read. Blocks the pump for at most `ms`
@@ -477,8 +697,68 @@ JSValueRef netn_tls_wrap_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
     }
     // args 8/9: minVersion / maxVersion names ("TLSv1.2"), mapped to OpenSSL
     // version constants. Empty/unknown leaves the backend default in place.
-    if (argc > 8) { cfg.minVersion = mbun::tls::tls_version_from_name(fs_arg(ctx, argc, args, 8)); }
-    if (argc > 9) { cfg.maxVersion = mbun::tls::tls_version_from_name(fs_arg(ctx, argc, args, 9)); }
+    // The name "none" is the JS layer's explicit "unpinned" marker: node passes
+    // min=max=0 to SecureContext::Init when the caller supplied `secureProtocol`,
+    // so the SSL_METHOD's own range applies rather than node's TLS 1.2 floor.
+    // ref js_tls_live.cppm resolveVersions.
+    const auto version_arg{[&](std::size_t i) {
+        const std::string name{fs_arg(ctx, argc, args, i)};
+        if (name == "none") return -1;
+        return mbun::tls::tls_version_from_name(name);
+    }};
+    if (argc > 8) { cfg.minVersion = version_arg(8); }
+    if (argc > 9) { cfg.maxVersion = version_arg(9); }
+    // arg 10: node's options.ciphers, an OpenSSL cipher list string. Empty leaves
+    // the context default; a list OpenSSL matches nothing to fails the wrap
+    // rather than quietly widening the negotiated set.
+    if (argc > 10) { cfg.ciphers = fs_arg(ctx, argc, args, 10); }
+    // arg 11: hostCheck. node performs the peer-NAME check in JS
+    // (tls.checkServerIdentity) and lets a caller replace it; mbun folds the
+    // default check into OpenSSL via SSL_set1_host, which is stricter but cannot
+    // be replaced. `false` here means "a caller-supplied checkServerIdentity will
+    // run in JS instead", so the native check must stand aside — the CHAIN
+    // verification is untouched either way. Absent argument = check enabled.
+    if (argc > 11 && JSValueIsBoolean(ctx, args[11])) {
+        cfg.hostCheck = JSValueToBoolean(ctx, args[11]);
+    }
+    // arg 12: the TLS 1.3 half of node's `ciphers` option. OpenSSL keeps the 1.3
+    // suites behind SSL_CTX_set_ciphersuites, a different slot from the cipher
+    // list in arg 10, and node splits the caller's string across the two
+    // (lib/internal/tls/secure-context.js processCiphers). Empty leaves the
+    // engine's own TLS 1.3 suite selection in place.
+    if (argc > 12) { cfg.cipherSuites = fs_arg(ctx, argc, args, 12); }
+    // arg 13: caIsComplete. `true` means arg 6 is the caller's ENTIRE trust
+    // store — tls.setDefaultCACertificates() replaced node's addRootCerts() —
+    // so the platform default store must not be consulted, not even when the
+    // supplied store is empty ("trust nothing" is a legitimate instruction).
+    if (argc > 13 && JSValueIsBoolean(ctx, args[13])) {
+        cfg.caIsComplete = JSValueToBoolean(ctx, args[13]);
+    }
+    // arg 14: base64 of a previously serialised SSL_SESSION to resume with
+    // (node's tls.connect({ session }) / socket.setSession()). Client only.
+    if (argc > 14) { cfg.sessionDer = b64_decode(fs_arg(ctx, argc, args, 14)); }
+    // arg 15: base64 of the server's 48-byte session-ticket key (node's
+    // tls.createServer({ ticketKeys }) / server.setTicketKeys()). This is what
+    // lets a ticket issued by one accepted connection be resumed by the next —
+    // every connection here owns its own SSL_CTX, so without a stable key the
+    // ticket is undecryptable by design.
+    if (argc > 15) { cfg.ticketKeys = b64_decode(fs_arg(ctx, argc, args, 15)); }
+    // arg 16: node's options.passphrase for an encrypted `key` PEM. Empty means
+    // the empty password — the backend never falls back to OpenSSL's terminal
+    // prompt, so a missing passphrase is a decrypt failure, not a hang.
+    if (argc > 16) { cfg.passphrase = fs_arg(ctx, argc, args, 16); }
+    // arg 17: honorCipherOrder (server only) — SSL_OP_CIPHER_SERVER_PREFERENCE.
+    // Absent = false, so a client never sets it; the JS layer supplies node's
+    // "true unless explicitly false" default for a server.
+    if (argc > 17 && JSValueIsBoolean(ctx, args[17])) {
+        cfg.honorCipherOrder = JSValueToBoolean(ctx, args[17]);
+    }
+    // args 18/19 (server): node's options.dhparam ("auto" or a PEM parameter
+    // block — without one no DHE-* suite can be negotiated at all) and
+    // options.ecdhCurve (a group list that NARROWS what is negotiable; "auto"
+    // and "" leave OpenSSL's own preference in place).
+    if (argc > 18) { cfg.dhParams = fs_arg(ctx, argc, args, 18); }
+    if (argc > 19) { cfg.ecdhCurve = fs_arg(ctx, argc, args, 19); }
     auto st{std::make_unique<NetTlsState>(
         isServer ? mbun::tls::TlsRole::server : mbun::tls::TlsRole::client, std::move(cfg))};
     if (!st->channel.valid()) {
@@ -641,14 +921,165 @@ JSValueRef netn_tls_info_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
     set_prop(ctx, r, "established", JSValueMakeBoolean(ctx, est));
     set_prop(ctx, r, "protocol", make_string(ctx, est ? st.channel.tls_version() : std::string{}));
     set_prop(ctx, r, "cipher", make_string(ctx, est ? st.channel.cipher() : std::string{}));
+    // getCipher().standardName — the IANA name, which is not derivable from the
+    // OpenSSL name ("AES256-SHA256" -> "TLS_RSA_WITH_AES_256_CBC_SHA256").
+    set_prop(ctx, r, "cipherStandardName",
+             make_string(ctx, est ? st.channel.cipher_standard_name() : std::string{}));
     set_prop(ctx, r, "servername", make_string(ctx, st.channel.peer_server_name()));
     set_prop(ctx, r, "authorized", JSValueMakeBoolean(ctx, est && st.channel.verify_ok()));
     set_prop(ctx, r, "alpnProtocol", make_string(ctx, est ? st.channel.alpn_protocol() : std::string{}));
+    // node's TLSSocket.isSessionReused() — SSL_session_reused. Meaningful on
+    // both roles: the client learns its offered session was accepted, the
+    // server learns the peer arrived with a valid ticket.
+    set_prop(ctx, r, "sessionReused", JSValueMakeBoolean(ctx, est && st.channel.session_reused()));
     if (est) {
         const std::string peer{st.channel.peer_certificate_pem()};
         if (!peer.empty()) set_prop(ctx, r, "peerCert", make_string(ctx, peer));
+        // The verified chain, leaf first — node's getPeerCertificate(true) walks
+        // it through `issuerCertificate`.
+        std::vector<std::string> chain{st.channel.peer_certificate_chain_pem()};
+        if (!chain.empty()) {
+            std::vector<JSValueRef> items;
+            items.reserve(chain.size());
+            for (const std::string& pem : chain) items.push_back(make_string(ctx, pem));
+            set_prop(ctx, r, "peerChain",
+                     JSObjectMakeArray(ctx, items.size(), items.data(), nullptr));
+        }
+        // getEphemeralKeyInfo(): the peer's forward-secrecy key for this
+        // connection (SSL_get_server_tmp_key — client side only, and absent
+        // entirely for a static-RSA suite, which node reports as `{}`).
+        const mbun::tls::EphemeralKeyInfo ek{st.channel.ephemeral_key_info()};
+        if (!ek.type.empty()) {
+            JSObjectRef eko{JSObjectMake(ctx, nullptr, nullptr)};
+            set_prop(ctx, eko, "type", make_string(ctx, ek.type));
+            set_prop(ctx, eko, "size", JSValueMakeNumber(ctx, ek.size));
+            if (!ek.name.empty()) set_prop(ctx, eko, "name", make_string(ctx, ek.name));
+            set_prop(ctx, r, "ephemeralKey", eko);
+        }
+        // getFinished()/getPeerFinished(): the handshake's Finished messages.
+        const std::vector<std::uint8_t> fin{st.channel.finished()};
+        if (!fin.empty()) set_prop(ctx, r, "finished", make_string(ctx, b64_encode(fin.data(), fin.size())));
+        const std::vector<std::uint8_t> pfin{st.channel.peer_finished()};
+        if (!pfin.empty()) set_prop(ctx, r, "peerFinished", make_string(ctx, b64_encode(pfin.data(), pfin.size())));
     }
     return r;
+#endif
+}
+
+// net.tlsKeylog(fd) → array of NSS keylog lines produced since the last call
+// (empty array when there is nothing, or no channel on this fd). Draining is
+// destructive so a JS-side poll cannot re-emit a line twice. Feeds node's
+// TLSSocket/Server 'keylog' event (node src/crypto/crypto_context.cc
+// SecureContext::KeylogCallback -> tls/wrap.js onkeylog); nothing else reads it,
+// so a process with no keylog listener never surfaces key material.
+JSValueRef netn_tls_keylog_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                              const JSValueRef args[], JSValueRef*) {
+    std::vector<JSValueRef> items;
+#if !defined(_WIN32)
+    const int fd{argc > 0 ? static_cast<int>(JSValueToNumber(ctx, args[0], nullptr)) : -1};
+    const auto found{net_tls().find(fd)};
+    if (found != net_tls().end()) {
+        for (const std::string& line : found->second->channel.take_keylog()) {
+            items.push_back(make_string(ctx, line));
+        }
+    }
+#else
+    (void)argc;
+    (void)args;
+#endif
+    return JSObjectMakeArray(ctx, items.size(), items.empty() ? nullptr : items.data(), nullptr);
+}
+
+// net.tlsNewSessions(fd) → array of base64 SSL_SESSION DER blobs delivered by
+// OpenSSL since the last call (empty when there is nothing, or no channel).
+// Destructive, like tlsKeylog: a polling reactor must not emit the same session
+// twice. Feeds node's TLSSocket 'session' event, which for TLS 1.3 fires only
+// once the post-handshake NewSessionTicket has been read — which is why this is
+// polled from the read path rather than read once at handshake completion.
+JSValueRef netn_tls_new_sessions_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                                    const JSValueRef args[], JSValueRef*) {
+    std::vector<JSValueRef> items;
+#if !defined(_WIN32)
+    const int fd{argc > 0 ? static_cast<int>(JSValueToNumber(ctx, args[0], nullptr)) : -1};
+    const auto found{net_tls().find(fd)};
+    if (found != net_tls().end()) {
+        for (const std::vector<std::uint8_t>& der : found->second->channel.take_new_sessions()) {
+            items.push_back(make_string(ctx, b64_encode(der.data(), der.size())));
+        }
+    }
+#else
+    (void)argc;
+    (void)args;
+#endif
+    return JSObjectMakeArray(ctx, items.size(), items.empty() ? nullptr : items.data(), nullptr);
+}
+
+// net.tlsSession(fd) → base64 of the CURRENT session (node's getSession()), or
+// "" when there is none. For TLS 1.3 this is the unresumable placeholder node
+// documents right after the handshake; the resumable one arrives through
+// tlsNewSessions.
+JSValueRef netn_tls_session_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                               const JSValueRef args[], JSValueRef*) {
+#if !defined(_WIN32)
+    const int fd{argc > 0 ? static_cast<int>(JSValueToNumber(ctx, args[0], nullptr)) : -1};
+    const auto found{net_tls().find(fd)};
+    if (found != net_tls().end()) {
+        const std::vector<std::uint8_t> der{found->second->channel.session_der()};
+        if (!der.empty()) return make_string(ctx, b64_encode(der.data(), der.size()));
+    }
+#else
+    (void)argc;
+    (void)args;
+#endif
+    return make_string(ctx, std::string{});
+}
+
+// net.tlsTicket(fd) → base64 of the current session's ticket (node's
+// getTLSTicket()), or "" when the session carries none.
+JSValueRef netn_tls_ticket_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                              const JSValueRef args[], JSValueRef*) {
+#if !defined(_WIN32)
+    const int fd{argc > 0 ? static_cast<int>(JSValueToNumber(ctx, args[0], nullptr)) : -1};
+    const auto found{net_tls().find(fd)};
+    if (found != net_tls().end()) {
+        const std::vector<std::uint8_t> tick{found->second->channel.tls_ticket()};
+        if (!tick.empty()) return make_string(ctx, b64_encode(tick.data(), tick.size()));
+    }
+#else
+    (void)argc;
+    (void)args;
+#endif
+    return make_string(ctx, std::string{});
+}
+
+// net.tlsExportKeyingMaterial(fd, length, label, contextB64|null) → base64 of
+// the RFC 5705 exporter output, or null when the export is not possible (no
+// channel / handshake incomplete). node's TLSSocket.exportKeyingMaterial().
+// A null context argument means "no context" (RFC 5705 use_context = 0), which
+// differs from an empty context — the two produce different key material.
+JSValueRef netn_tls_export_keying_material_cb(JSContextRef ctx, JSObjectRef, JSObjectRef,
+                                              std::size_t argc, const JSValueRef args[],
+                                              JSValueRef*) {
+#if defined(_WIN32)
+    return JSValueMakeNull(ctx);
+#else
+    const int fd{argc > 0 ? static_cast<int>(JSValueToNumber(ctx, args[0], nullptr)) : -1};
+    const auto found{net_tls().find(fd)};
+    if (found == net_tls().end()) return JSValueMakeNull(ctx);
+    const auto length{static_cast<std::size_t>(
+        argc > 1 ? JSValueToNumber(ctx, args[1], nullptr) : 0)};
+    const std::string label{fs_arg(ctx, argc, args, 2)};
+    const bool useContext{argc > 3 && !JSValueIsNull(ctx, args[3])
+                          && !JSValueIsUndefined(ctx, args[3])};
+    std::string raw{};
+    if (useContext) raw = b64_decode(fs_arg(ctx, argc, args, 3));
+    const std::vector<std::uint8_t> out{found->second->channel.export_keying_material(
+        length, label,
+        std::span<const std::uint8_t>{reinterpret_cast<const std::uint8_t*>(raw.data()),
+                                      raw.size()},
+        useContext)};
+    if (out.empty()) return JSValueMakeNull(ctx);
+    return make_string(ctx, b64_encode(out.data(), out.size()));
 #endif
 }
 

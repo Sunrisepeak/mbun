@@ -1,0 +1,84 @@
+{
+ "purpose": "Per-cause inventory for the BUN corpus, the mirror of unreached-inventory.json. Exists because the bun side had only a single net number (green 868, -16 against the last per-file run) and no structure to dispatch against. The node inventory is what let wave 3 return 150% of target after wave 2 returned 3.7%.",
+ "measured_from": "target/integration/r10-bun2 @ 8009cfc, full 1902 files, 888 test-failure",
+ "how_to_use": "Group by cause, count files per cause, budget mechanisms x 10min + ~55min per-agent overhead. Never budget a MANIFESTATION bucket as a mechanism.",
+ "causes": {
+  "bun-internal-for-testing-LAYER": {
+   "corpus_files_referencing_the_module": 107,
+   "namespaces_requested_most": {
+    "cssInternals": 13,
+    "socketFaultInjection": 12,
+    "install_test_helpers": 6,
+    "patchInternals": 5,
+    "shellInternals": 3,
+    "fileSinkInternals": 3,
+    "setSyntheticAllocationLimitForTesting": 3
+   },
+   "cause": "bun:internal-for-testing exists in mbun but is only partially populated (highlightJavaScript, createSocketPair, ... in yaml_block_markdown.cppm). Tests destructure a namespace that is absent and die with \"Cannot destructure property 'X' from null or undefined value\" -- often inside a SPAWNED subprocess, so the visible failure is an empty-stderr assertion rather than the destructure itself.",
+   "LAYER_NOT_CAUSE_WARNING": "This is the bun-side analogue of internalBinding. Measured precedent on the node side: clearing the internalBinding layer on 35 files converted 3 and merely transferred the rest to other failure families. Budget as ENABLING INFRASTRUCTURE with a DIAGNOSIS target ('what do these files fail on once the namespace exists'), NEVER as a conversion target of 107.",
+   "action": "largest structural item on the bun side and entirely unmapped until now; start with cssInternals (13) since it is the densest single namespace",
+   "file_count_failing_with_this_symptom": 21,
+   "symptom_breakdown": {
+    "parseRoutePattern": 1,
+    "openTempDirWithoutSharingDelete": 1,
+    "parseLockfile": 5,
+    "getMachOImageZeroOffset": 1,
+    "minifyTest": 10,
+    "parse": 1,
+    "meta": 1,
+    "liveCounts": 1
+   },
+   "counting_note": "The symptom count (files failing with \"Cannot destructure property 'X' from null\") is the DEMONSTRATED lower bound; 107 files import the module and would need it populated, but most of those fail for other reasons first. My first count of this cause was 1 because I grepped the LOGS for the module name -- the logs carry the destructure error, not the import. Count the symptom, not the string you expect."
+  },
+  "registry-unreachable-NOT-AN-MBUN-DEFECT": {
+   "file_count": 40,
+   "files": [
+    "integration/mysql2/mysql2.test.ts",
+    "js/sql/postgres-binary-numeric.test.ts",
+    "js/sql/postgres-multi-statement-fields.test.ts",
+    "js/sql/postgres-prepared-pipeline-reorder.test.ts",
+    "js/sql/postgres-simple-query-pipeline.test.ts",
+    "js/sql/sql-mysql-binary-null-indexed.test.ts",
+    "js/sql/sql-mysql-bind-blob-borrow.test.ts",
+    "js/sql/sql-mysql-bind-oob.test.ts",
+    "js/sql/sql-mysql-cached-error.test.ts",
+    "js/sql/sql-mysql-column-name-digits.test.ts",
+    "js/sql/sql-mysql-datetime-roundtrip.test.ts",
+    "js/sql/sql-mysql-mediumint.test.ts"
+   ],
+   "cause": "These fail with 'Failed to build service <mysql|postgres>_plain: failed to solve: <image>: failed to resolve'. docker IS usable in this environment; the container REGISTRY is not reachable, so the image cannot be pulled. Nothing about mbun is exercised.",
+   "why_not_reclassified": "tools/integration/manifests/blocked-external.txt reclassifies a file ONLY when it TIMES OUT, and these FAIL. Reclassifying them would require changing the classifier's contract, which changes what the published number means -- and it would move the number in the flattering direction. Recorded as read-context instead. Verified they are not among the 43 files that lost green, so the -16 regression is unaffected.",
+   "action": "none; subtract mentally when reading 888"
+  },
+  "redis-not-implemented": {
+   "file_count": 14,
+   "cause": "mbun throws its own explicit 'Redis commands over a live socket are not yet implemented in mbun (DEFERRED)'. An honestly-declared gap, not a bug.",
+   "action": "architectural; a Redis client round of its own"
+  },
+  "caller-location-in-stack-trace": {
+   "file_count": 17,
+   "cause": "bun's test runner needs to resolve a caller frame (\"Couldn't find caller location in stack trace\"). One mechanism -- stack-frame introspection fidelity under JSC -- plausibly covers all of them.",
+   "confidence": "CLASS named, single mechanism UNVERIFIED",
+   "action": "verify one file before budgeting the block"
+  },
+  "bare-value-divergence-UNSPLIT": {
+   "file_count_approx": 136,
+   "cause": "NOT A CAUSE. 113 files whose first mismatch is 'Expected: N / Received: N' and 23 'true | false'. These identify nothing on their own. Recorded explicitly so the block is not mistaken for a mechanism -- the same trap that cost three rounds on the node side.",
+   "confidence": "MANIFESTATION ONLY",
+   "action": "split per file; never hand this bucket to an agent whole"
+  },
+  "no-first-failure-marker": {
+   "file_count": 214,
+   "cause": "214 files whose failure form the extractor does not recognise. This is a TOOLING gap, not a corpus fact: until they are parsed, a quarter of the bun failure surface is invisible to cause analysis. Improving the extractor is worth more than fixing any single file.",
+   "action": "highest-value next tooling step on the bun side"
+  }
+ },
+ "regression_debt": {
+  "net": -16,
+  "lost": 43,
+  "gained": 27,
+  "compared_to": "target/integration/r5-bun (green 884)",
+  "sampled_10_of_43": "1 genuinely ahead-of-reference (assert/deep-equal, 22 of 22 failures are stale test.failing markers), 9 real. Sampled causes -- util.styleText not applying colour, a SharedArrayBuffer snapshot returning empty, >2GiB buffer edges, path.parse, url -- all look like plain gaps rather than node-vs-bun contract conflicts, so they are 'fix them' work and do not need an arbitration decision.",
+  "verified_not_my_round": "regression/issue/24374 (TLS + checkServerIdentity) fails identically on a binary WITHOUT this round's tls verify change, so that change is not implicated."
+ }
+}

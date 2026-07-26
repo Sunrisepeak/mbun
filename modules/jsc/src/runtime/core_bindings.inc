@@ -1102,7 +1102,7 @@ JSC_DEFINE_HOST_FUNCTION(glob_match_host, (JSC::JSGlobalObject* global, JSC::Cal
 // Glob.scanSync([cwd|{cwd}]) → array of matching file paths (relative, generic
 // separators), by recursively walking the directory and matching each entry.
 JSValueRef glob_scan_sync_cb(JSContextRef ctx, JSObjectRef, JSObjectRef thisObj, std::size_t argc,
-                             const JSValueRef args[], JSValueRef*) {
+                             const JSValueRef args[], JSValueRef* exc) {
     auto* pat{static_cast<std::string*>(JSObjectGetPrivate(thisObj))};
     if (pat == nullptr) return JSObjectMakeArray(ctx, 0, nullptr, nullptr);
     std::string cwd;
@@ -1141,6 +1141,13 @@ JSValueRef glob_scan_sync_cb(JSContextRef ctx, JSObjectRef, JSObjectRef thisObj,
     }
     std::error_code ec;
     if (cwd.empty()) cwd = std::filesystem::current_path(ec).string();
+
+    // PERMISSION GATE. A glob scan is a directory walk — the same disclosure
+    // fs.readdirSync is gated for, and mbun's own fs.glob is implemented on top of
+    // this callback. Ungated it enumerated any directory on the machine
+    // (`new Bun.Glob("*").scanSync({cwd: "/etc"})`) while readdirSync on the same
+    // directory was refused.
+    if (permission_deny_fs(ctx, exc, cwd, false)) return JSObjectMakeArray(ctx, 0, nullptr, nullptr);
 
     // onlyFiles=false → drive the full glob walker (Bun.Glob.scan semantics):
     // it emits matched directories AND the globstar-matches-parent-dir case

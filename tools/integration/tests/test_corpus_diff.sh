@@ -112,6 +112,44 @@ printf '%s\n' "$report" | grep -q 'dropped: 1'
 printf '%s\n' "$report" | grep -q -- '- gone.test.ts'
 printf '%s\n' "$report" | grep -q 'REGRESSIONS (green -> non-green): 2'
 
+# --- node-shaped rounds: `pass` is green, and there is no `passed` column ----
+# node_corpus_runner writes a narrower TSV (path/exit_code/classification/
+# duration_ms/log) and spells a real pass `pass`. Both used to break the gate:
+# `pass` was not recognised as green so no transition could ever be detected,
+# and the assertion-move branch indexed a `passed` column that does not exist,
+# aborting the diff with a KeyError. A skip must count as non-green.
+node_cols="path	exit_code	classification	duration_ms	log"
+mkdir -p "$tmp/nbefore" "$tmp/nafter"
+{
+  printf '%s\n' "$node_cols"
+  printf 'test-keep.js\t0\tpass\t100\tlogs/a.log\n'
+  printf 'test-broke.js\t0\tpass\t100\tlogs/b.log\n'
+  printf 'test-quic.js\t0\tpass\t100\tlogs/c.log\n'
+  printf 'test-win.js\t1\tfail\t100\tlogs/d.log\n'
+} >"$tmp/nbefore/results.tsv"
+{
+  printf '%s\n' "$node_cols"
+  printf 'test-keep.js\t0\tpass\t100\tlogs/a.log\n'
+  printf 'test-broke.js\t1\tfail\t100\tlogs/b.log\n'
+  printf 'test-quic.js\t0\tskipped\t100\tlogs/c.log\n'
+  printf 'test-win.js\t0\tpass\t100\tlogs/d.log\n'
+} >"$tmp/nafter/results.tsv"
+
+set +e
+node_report=$(python3 "$diff_tool" "$tmp/nbefore" "$tmp/nafter" --json)
+node_status=$?
+set -e
+test "$node_status" -ne 0   # regressions present -> gate fails
+printf '%s\n' "$node_report" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+# pass->fail AND pass->skipped are both green->non-green regressions
+assert sorted(d["regressions"]) == ["test-broke.js", "test-quic.js"], d["regressions"]
+assert d["gains"] == ["test-win.js"], d["gains"]
+assert d["buckets"]["pass"] == {"before": 3, "after": 2, "delta": -1}, d["buckets"]["pass"]
+assert d["moves"] == [], d["moves"]   # no `passed` column -> no assertion signal, no crash
+'
+
 # --- A malformed / missing results.tsv fails loudly (not a silent pass) ------
 set +e
 python3 "$diff_tool" "$tmp/before" "$tmp/nonexistent" >/dev/null 2>&1

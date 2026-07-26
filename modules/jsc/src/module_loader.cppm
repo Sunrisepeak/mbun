@@ -511,8 +511,17 @@ struct LoadResult {
 // ("the runtime layer adds the base bun set ("bun","node",...) via this list") —
 // which no caller had actually been doing, leaving every conditional export to
 // silently fall through to "default".
+// node env.cc: `--permission` without `--allow-addons` sets
+// `allow_native_addons = false`, which takes "node-addons" OUT of the ESM
+// condition set — so a package whose exports offer a native-addon branch and a
+// pure-JS fallback resolves to the fallback instead of to code that would
+// dlopen a .node. Set once at startup by the runtime (engine.inc), never by a
+// script: this is part of the sandbox, not a tunable.
+inline bool gAllowNativeAddons{true};
+
 inline mbun::resolver::Options with_bun_base_conditions(mbun::resolver::Options opts) {
     for (const std::string_view c : {"bun", "node", "node-addons"}) {
+        if (c == "node-addons" && !gAllowNativeAddons) continue;
         if (std::ranges::find(opts.conditions, c) == opts.conditions.end()) {
             opts.conditions.emplace_back(c);
         }

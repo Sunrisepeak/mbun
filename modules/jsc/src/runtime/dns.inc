@@ -697,6 +697,15 @@ std::shared_ptr<DnsDelayedBackend> gDnsDelayedBackend{};
 // JS ownership is deliberately separate from the worker state. A detached
 // worker captures only this pure-C++ state, so an uncancellable libc call may
 // outlive Runtime without retaining or touching a JSContext, JSValue, or Runtime.
+// "is this string already an IP literal?" — inet_pton for both families, which
+// is what node's isIP() reduces to. Used only by the Permission Model gate.
+inline bool dns_is_literal_ip_(const std::string& host) {
+    if (host.empty()) return false;
+    unsigned char buf[16];
+    if (::inet_pton(AF_INET, host.c_str(), buf) == 1) return true;
+    return ::inet_pton(AF_INET6, host.c_str(), buf) == 1;
+}
+
 class DnsAsyncState {
 private:
     struct Job {
@@ -715,12 +724,26 @@ private:
         std::uint64_t id{0};
         DnsResult result;
     };
+    // A resolver query blocks its worker for the whole query budget
+    // (timeout x attempts — 8s at node's defaults). With a single worker that
+    // makes every OTHER dns job wait on it, and one shape of that wait is a
+    // deadlock rather than a delay: node's dgram resolves the destination
+    // through dns.lookup before every send(), so a test whose fake nameserver
+    // is a dgram socket in this same process cannot answer the query — the
+    // lookup for its reply sits behind the very resolve it would unblock.
+    // (Measured: dns.lookup("127.0.0.1") took 8011ms behind one resolveSrv.)
+    // So the pool grows on demand: a job that arrives with no idle worker
+    // spawns one, up to MAX_WORKERS. Node has the same shape (its dns jobs run
+    // on the libuv threadpool, not on one thread).
+    static constexpr std::size_t MAX_WORKERS{16};
     struct WorkerState {
         std::mutex mutex{};
         std::condition_variable condition{};
         std::deque<Job> jobs{};
         std::deque<Completion> completions{};
         std::shared_ptr<DnsDelayedBackend> delayedBackend{};
+        std::size_t idleWorkers{0};
+        std::size_t totalWorkers{0};
         bool stopping{false};
     };
 
@@ -782,7 +805,9 @@ private:
             std::shared_ptr<DnsDelayedBackend> backend;
             {
                 std::unique_lock lock{state->mutex};
+                ++state->idleWorkers;
                 state->condition.wait(lock, [&] { return state->stopping || !state->jobs.empty(); });
+                --state->idleWorkers;
                 if (state->stopping) {
                     backend = state->delayedBackend;
                     lock.unlock();
@@ -806,12 +831,49 @@ private:
         }
     }
 
+    // Permission Model: node gates the Net scope in cares_wrap.cc, at
+    // GetAddrInfo / GetNameInfo / the resolver Query — DNS is network traffic
+    // and a resolver is an exfiltration channel on its own (data encoded into a
+    // hostname leaves the box even if no socket ever opens).
+    //
+    // The refusal is delivered through the normal completion queue rather than
+    // thrown: every caller here is a callback, and node's own DNS denial arrives
+    // as `err.code === 'ERR_ACCESS_DENIED'` on that callback
+    // (GetAddrInfoReqWrap::InsufficientPermissionError).
+    //
+    // A literal IP address is exempt for `lookup` ONLY. node never reaches its
+    // gate for one either: lib/dns.js short-circuits `isIP(hostname)` before
+    // calling the binding, and getaddrinfo on a literal sends no query. reverse
+    // and lookupService take an IP and DO query, so they are gated.
+    [[nodiscard]] bool net_denied_(const Job& job) const {
+        if (!gPermission.enabled()) return false;
+        if (gPermission.is_granted(mbun::permission::Scope::Net, job.host)) return false;
+        if (job.operation == DnsOperation::lookup && dns_is_literal_ip_(job.host)) return false;
+        return !gPermission.warning_only();
+    }
+
+    static void spawn_worker_(const std::shared_ptr<WorkerState>& state) {
+        std::thread([state] { run_worker_(state); }).detach();
+    }
+
     void submit_(Job job, JSObjectRef callback) {
         auto state{workerState_};
         if (state == nullptr) return;
         job.id = nextId_++;
         dns_protect_(ctx_, callback);
         callbacks_.emplace(job.id, callback);
+        if (net_denied_(job)) {
+            // Never queued to the worker: no resolution is attempted at all.
+            std::lock_guard lock{state->mutex};
+            state->completions.push_back(
+                Completion{.id = job.id,
+                           .result = DnsResult{.operation = job.operation,
+                                               .error = "ERR_ACCESS_DENIED",
+                                               .recordType = job.recordType}});
+            state->condition.notify_one();
+            return;
+        }
+        bool grow{false};
         {
             std::lock_guard lock{state->mutex};
             if (state->stopping) {
@@ -820,14 +882,24 @@ private:
                 return;
             }
             state->jobs.push_back(std::move(job));
+            // No idle worker to take this job (and the queue may already be
+            // backed up behind a multi-second resolve) → add one.
+            if (state->jobs.size() > state->idleWorkers && state->totalWorkers < MAX_WORKERS) {
+                ++state->totalWorkers;
+                grow = true;
+            }
         }
-        state->condition.notify_one();
+        if (grow) spawn_worker_(state);
+        // notify_all, not notify_one: drain() waits on this same condition, so a
+        // notify_one can be spent on the JS thread and leave every worker asleep.
+        state->condition.notify_all();
     }
 
 public:
     explicit DnsAsyncState(JSContextRef ctx)
         : ctx_{ctx}, workerState_{std::make_shared<WorkerState>()} {
-        std::thread([state = workerState_] { run_worker_(std::move(state)); }).detach();
+        workerState_->totalWorkers = 1;
+        spawn_worker_(workerState_);
     }
     DnsAsyncState(const DnsAsyncState&) = delete;
     DnsAsyncState& operator=(const DnsAsyncState&) = delete;

@@ -25,6 +25,7 @@ mkdir -p "$tmp/logs"
   printf 'test-vm-ok.js\t0\tpass\t100\tlogs/vm4.log\n'
   printf 'test-vm-slow.js\t124\ttimeout\t15000\tlogs/vm5.log\n'
   printf 'test-url-parse.js\t1\tfail\t100\tlogs/url1.log\n'
+  printf 'test-vm-gated.js\t0\tskipped\t100\tlogs/vm6.log\n'
 } >"$tmp/results.tsv"
 
 # Two vm logs with the SAME root cause but different volatile substrings.
@@ -34,6 +35,7 @@ printf 'error: AssertionError: Missing expected exception\n' >"$tmp/logs/vm3.log
 : >"$tmp/logs/vm4.log"
 : >"$tmp/logs/vm5.log"
 printf 'error: AssertionError: Missing expected exception\n' >"$tmp/logs/url1.log"
+printf '1..0 # Skipped: no QUIC\n' >"$tmp/logs/vm6.log"
 
 pass() { printf 'ok   - %s\n' "$1"; }
 fail() { printf 'FAIL - %s\n' "$1"; exit 1; }
@@ -60,6 +62,49 @@ top_count=$(printf '%s' "$out" | python3 -c 'import sys,json; d=json.load(sys.st
 url_out=$(python3 "$tool" --results "$tmp" --filter test-url --json)
 url_subs=$(printf '%s' "$url_out" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(",".join(sorted(s["subsystem"] for s in d["subsystems"])))')
 [ "$url_subs" = "url" ] && pass "--filter restricts to matching subsystem" || fail "--filter expected only url, got '$url_subs'"
+
+# --- cross-subsystem ranking -------------------------------------------------
+# "Missing expected exception" appears once in vm and once in url. Per-subsystem
+# clustering shows it as two 1-file buckets and buries it; the cross-subsystem
+# view must surface it as ONE 2-file cause spanning 2 subsystems. The
+# createScript cause is also size 2 but lives in a single subsystem, so it must
+# be excluded at the default --min-subsystems 2.
+cross_top=$(printf '%s' "$out" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d["cross_subsystem"][0]["count"], len(d["cross_subsystem"][0]["subsystems"]))')
+[ "$cross_top" = "2 2" ] && pass "cross-subsystem cause surfaced (2 files, 2 subsystems)" || fail "cross top expected '2 2', got '$cross_top'"
+
+single_sub_leaked=$(printf '%s' "$out" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(any("createScript" in c["signature"] for c in d["cross_subsystem"]))')
+[ "$single_sub_leaked" = "False" ] && pass "single-subsystem cause excluded from cross ranking" || fail "createScript leaked into cross ranking"
+
+# --- worklist emission closes the loop into node_corpus_runner --files -------
+python3 "$tool" --results "$tmp" --worklist "$tmp/wl.txt" >/dev/null
+grep -q '^test-vm-basic.js$' "$tmp/wl.txt" && grep -q '^test-url-parse.js$' "$tmp/wl.txt" \
+  && pass "--worklist emits the top cross-subsystem cluster's paths" \
+  || fail "--worklist missing expected paths: $(cat "$tmp/wl.txt")"
+[ "$(grep -c '^#' "$tmp/wl.txt")" = "2" ] && pass "--worklist header is comment-only" || fail "--worklist header wrong"
+
+python3 "$tool" --results "$tmp" --worklist-from subsystem --worklist "$tmp/wl2.txt" >/dev/null
+grep -q '^test-vm-context.js$' "$tmp/wl2.txt" && pass "--worklist-from subsystem emits the per-subsystem top" \
+  || fail "--worklist-from subsystem wrong: $(cat "$tmp/wl2.txt")"
+
+if python3 "$tool" --results "$tmp" --worklist "$tmp/wl3.txt" --worklist-rank 999 >/dev/null 2>&1; then
+  fail "--worklist-rank out of range should exit non-zero"
+fi
+pass "--worklist-rank out of range rejected"
+
+# --- a self-skip is NOT fixable work ----------------------------------------
+# A skipped file exited 0 because the runtime lacks the feature; counting it as
+# fixable made 542 skipped files the corpus's largest apparent "cluster", whose
+# only shared signature was the skip line itself.
+vm_fixable2=$(printf '%s' "$out" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(next(s["fixable"] for s in d["subsystems"] if s["subsystem"]=="vm"))')
+[ "$vm_fixable2" = "3" ] && pass "skipped file excluded from fixable" || fail "fixable should stay 3, got $vm_fixable2"
+
+vm_skipped=$(printf '%s' "$out" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(next(s["skipped"] for s in d["subsystems"] if s["subsystem"]=="vm"))')
+[ "$vm_skipped" = "1" ] && pass "skipped counted in its own bucket" || fail "skipped expected 1, got $vm_skipped"
+
+if printf '%s' "$out" | grep -q 'Skipped: no QUIC'; then
+  fail "a skip line leaked into the cluster signatures"
+fi
+pass "skip lines never become cluster signatures"
 
 # --- human report renders without error ------------------------------------
 python3 "$tool" --results "$tmp" >/dev/null && pass "human report renders" || fail "human report crashed"

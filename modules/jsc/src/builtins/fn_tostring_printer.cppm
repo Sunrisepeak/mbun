@@ -316,6 +316,11 @@ inline constexpr std::string_view kFnToStringPrinterJS = R"JS(
       configurable: true,
     });
   } catch (_) {}
+
+  // Last statement of the builtin image: every partition has now loaded (several
+  // of them reach for node:zlib while booting), so node:zlib may start
+  // snapshotting buffer.kMaxLength the way node's require() does.
+  try { if (typeof globalThis.__mbunZlibArmKMax === "function") globalThis.__mbunZlibArmKMax(); } catch (_) {}
 })();
 )JS";
 

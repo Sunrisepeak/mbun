@@ -78,8 +78,49 @@ JSValueRef nodevm_create_context_cb(JSContextRef ctx, JSObjectRef, JSObjectRef,
     return JSValueMakeNumber(ctx, static_cast<double>(h));
 }
 
-// runInContext(handle, code, filename?) — contextify in, evaluate in the child
-// global, contextify out. Syntax/runtime errors propagate as JS exceptions.
+// getGlobal(handle) — the child realm's global object, as a value usable from
+// the main context (same VM group). The JS layer mirrors the sandbox onto it
+// with full property descriptors, which JSObjectCopyPropertyNames (enumerable
+// string keys only, values only) cannot express.
+JSValueRef nodevm_get_global_cb(JSContextRef ctx, JSObjectRef, JSObjectRef,
+                                std::size_t argc, const JSValueRef args[], JSValueRef* exc) {
+    int h{argc > 0 ? static_cast<int>(JSValueToNumber(ctx, args[0], nullptr)) : 0};
+    auto it{nodevm_contexts().find(h)};
+    if (it == nodevm_contexts().end()) {
+        if (exc != nullptr) *exc = make_string(ctx, "vm: invalid context handle");
+        return JSValueMakeUndefined(ctx);
+    }
+    return JSContextGetGlobalObject(it->second.ctx);
+}
+
+// checkSyntax(code, filename?) — parse without running, so `new vm.Script(bad)`
+// throws at construction time the way node does.
+JSValueRef nodevm_check_syntax_cb(JSContextRef ctx, JSObjectRef, JSObjectRef,
+                                  std::size_t argc, const JSValueRef args[], JSValueRef* exc) {
+    JSValueRef ex{nullptr};
+    JSStringRef src{JSValueToStringCopy(ctx, argc > 0 ? args[0] : JSValueMakeUndefined(ctx), &ex)};
+    if (src == nullptr) {
+        if (exc != nullptr) *exc = ex;
+        return JSValueMakeUndefined(ctx);
+    }
+    JSStringRef url{(argc > 1 && !JSValueIsUndefined(ctx, args[1]))
+                        ? JSValueToStringCopy(ctx, args[1], nullptr)
+                        : nullptr};
+    bool ok{JSCheckScriptSyntax(ctx, src, url, 0, &ex)};
+    JSStringRelease(src);
+    if (url != nullptr) JSStringRelease(url);
+    if (!ok && ex != nullptr) {
+        if (exc != nullptr) *exc = ex;
+        return JSValueMakeUndefined(ctx);
+    }
+    return JSValueMakeBoolean(ctx, ok);
+}
+
+// runInContext(handle, code, filename?, raw?) — evaluate in the child global.
+// `raw` (used by the current JS layer) skips the legacy value-level contextify
+// copy entirely: the JS layer owns the mirroring and must not have an accessor
+// silently flattened into a data property behind it. Syntax/runtime errors
+// propagate as JS exceptions.
 JSValueRef nodevm_run_in_context_cb(JSContextRef ctx, JSObjectRef, JSObjectRef,
                                     std::size_t argc, const JSValueRef args[], JSValueRef* exc) {
     int h{argc > 0 ? static_cast<int>(JSValueToNumber(ctx, args[0], nullptr)) : 0};
@@ -88,11 +129,12 @@ JSValueRef nodevm_run_in_context_cb(JSContextRef ctx, JSObjectRef, JSObjectRef,
         if (exc != nullptr) *exc = make_string(ctx, "vm: invalid context handle");
         return JSValueMakeUndefined(ctx);
     }
+    bool raw{argc > 3 && JSValueToBoolean(ctx, args[3])};
     JSGlobalContextRef child{it->second.ctx};
     JSObjectRef sandbox{it->second.sandbox};
     JSObjectRef childGlobal{JSContextGetGlobalObject(child)};
 
-    nodevm_copy_enumerable(ctx, sandbox, child, childGlobal);
+    if (!raw) nodevm_copy_enumerable(ctx, sandbox, child, childGlobal);
 
     JSValueRef ex{nullptr};
     JSStringRef src{JSValueToStringCopy(ctx, argc > 1 ? args[1] : JSValueMakeUndefined(ctx), &ex)};
@@ -109,7 +151,7 @@ JSValueRef nodevm_run_in_context_cb(JSContextRef ctx, JSObjectRef, JSObjectRef,
 
     // Contextify out even after a throw, so partial mutations are observable
     // (Node reflects sandbox writes made before the exception).
-    nodevm_copy_enumerable(child, childGlobal, ctx, sandbox);
+    if (!raw) nodevm_copy_enumerable(child, childGlobal, ctx, sandbox);
 
     if (ex != nullptr) {
         if (exc != nullptr) *exc = ex;
@@ -146,5 +188,7 @@ void install_node_vm_native(JSContextRef ctx, JSObjectRef global) {
     set_fn(ctx, vmn, "createContext", nodevm_create_context_cb);
     set_fn(ctx, vmn, "runInContext", nodevm_run_in_context_cb);
     set_fn(ctx, vmn, "runInThis", nodevm_run_in_this_cb);
+    set_fn(ctx, vmn, "getGlobal", nodevm_get_global_cb);
+    set_fn(ctx, vmn, "checkSyntax", nodevm_check_syntax_cb);
     set_prop(ctx, global, "__mbunNodeVMNative", vmn);
 }

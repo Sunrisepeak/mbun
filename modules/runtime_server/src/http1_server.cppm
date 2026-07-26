@@ -413,6 +413,69 @@ private:
         return false;
     }
 
+    static std::string_view trim_ows_(std::string_view v) {
+        while (!v.empty() && (v.front() == ' ' || v.front() == '\t'))
+            v.remove_prefix(1);
+        while (!v.empty() && (v.back() == ' ' || v.back() == '\t'))
+            v.remove_suffix(1);
+        return v;
+    }
+
+    // Every value a field name carries, in header order. Http1Request::header
+    // collapses repeats to the first, which hides exactly the conflicts that make a
+    // message's framing ambiguous.
+    static std::vector<std::string_view> header_values_(const Http1Request& request,
+                                                        std::string_view name) {
+        std::vector<std::string_view> out {};
+        for (const auto& [key, value] : request.headers) {
+            if (iequals_(key, name))
+                out.emplace_back(trim_ows_(value));
+        }
+        return out;
+    }
+
+    // Is "chunked" the FINAL transfer coding of this Transfer-Encoding value?
+    // A trailing coding of anything else (including an unrecognised token) means the
+    // content length is undeterminable, which RFC 9112 §6.1 makes an error for a
+    // request. Empty list items are tolerated — a comma-separated field value with a
+    // trailing separator is still well-formed.
+    static bool last_coding_is_chunked_(std::string_view value) {
+        std::string_view last {};
+        std::size_t start { 0 };
+        while (start <= value.size()) {
+            std::size_t end { value.find(',', start) };
+            if (end == std::string_view::npos)
+                end = value.size();
+            std::string_view item { value.substr(start, end - start) };
+            while (!item.empty() && (item.front() == ' ' || item.front() == '\t'))
+                item.remove_prefix(1);
+            while (!item.empty() && (item.back() == ' ' || item.back() == '\t'))
+                item.remove_suffix(1);
+            if (!item.empty())
+                last = item;
+            start = end + 1;
+        }
+        return iequals_(last, "chunked");
+    }
+
+    // How many "chunked" codings the (possibly multi-line) Transfer-Encoding list
+    // carries. More than one — "chunked, chunked" — is the double-chunked smuggling
+    // vector: chunked is not applied twice, so a recipient that stops at the first
+    // and one that stops at the last frame the message differently.
+    static std::size_t chunked_coding_count_(std::string_view value) {
+        std::size_t n { 0 };
+        std::size_t start { 0 };
+        while (start <= value.size()) {
+            std::size_t end { value.find(',', start) };
+            if (end == std::string_view::npos)
+                end = value.size();
+            if (iequals_(trim_ows_(value.substr(start, end - start)), "chunked"))
+                ++n;
+            start = end + 1;
+        }
+        return n;
+    }
+
     void on_data_(runtime_socket::NativeHandle handle, std::span<const std::byte> bytes) {
         const auto found { conns_.find(handle) };
         if (found == conns_.end() || found->second.closeWhenDrained)
@@ -609,12 +672,15 @@ private:
         conn.request.headers.reserve(res.num_headers);
         for (std::size_t i { 0 }; i < res.num_headers; ++i) {
             const auto& h { storage[i] };
-            if (h.is_multiline()) {  // obs-fold: continuation of the previous value
-                if (!conn.request.headers.empty()) {
-                    conn.request.headers.back().second += ' ';
-                    conn.request.headers.back().second.append(h.value);
-                }
-                continue;
+            if (h.is_multiline()) {
+                // obs-fold. RFC 9112 §5.2 lets a server either reject the message
+                // or replace the fold with SP; node's llhttp rejects (400), and so
+                // does this server. Folding it instead is the more dangerous half of
+                // the choice: an intermediary that rejects and an origin that folds
+                // (or vice versa) disagree about where the header block ends, which
+                // is a request-smuggling differential.
+                fail_request_(handle, 400, "obs-fold in header block");
+                return false;
             }
             conn.request.headers.emplace_back(std::string { h.name }, std::string { h.value });
         }
@@ -628,10 +694,62 @@ private:
 
         conn.inbox.erase(0, res.bytes_read);
 
-        // Body framing: Transfer-Encoding: chunked wins over Content-Length
-        // (RFC 7230 §3.3.3), absent both means no body.
-        const auto transferEncoding { conn.request.header("transfer-encoding") };
-        const bool chunked { transferEncoding && has_token_ci_(*transferEncoding, "chunked") };
+        // ── Body framing ─────────────────────────────────────────────────────
+        // RFC 9112 §6.1/§6.3 and node's llhttp both make an AMBIGUOUS framing an
+        // unrecoverable error, and for one reason: whenever two HTTP
+        // implementations on the same path can pick different answers, the
+        // difference is a request-smuggling primitive. This server previously
+        // resolved every ambiguity silently and kept the connection alive for
+        // pipelining, which is the exact configuration the attack needs. Each
+        // rejection below is measured against node:http, which answers 400 to all
+        // of them; fail_request_ also closes the connection, so nothing that
+        // followed the ambiguous framing is ever parsed as a request.
+        const auto teValues { header_values_(conn.request, "transfer-encoding") };
+        const auto clValues { header_values_(conn.request, "content-length") };
+
+        // 1. Content-Length AND Transfer-Encoding (CL.TE / TE.CL smuggling).
+        //    RFC 9112 §6.1: "A server MAY reject a request that contains both
+        //    Content-Length and Transfer-Encoding". llhttp does, unconditionally.
+        if (!teValues.empty() && !clValues.empty()) {
+            fail_request_(handle, 400, "both Transfer-Encoding and Content-Length");
+            return false;
+        }
+        // 2. CONFLICTING duplicate Content-Length (CL.CL smuggling). header() returns
+        //    the FIRST match, so this server framed on "6" while the JS Headers object
+        //    — and any front-end — could read "6, 0". RFC 9112 §6.3 permits repeats
+        //    only when every copy carries the SAME value, which is the line bun's own
+        //    request-smuggling suite draws ("accepts duplicate Content-Length headers
+        //    with identical values" vs "rejects conflicting duplicate Content-Length
+        //    headers").
+        for (std::size_t i { 1 }; i < clValues.size(); ++i) {
+            if (clValues[i] != clValues[0]) {
+                fail_request_(handle, 400, "conflicting content-length");
+                return false;
+            }
+        }
+        // 3. Transfer-Encoding's LAST coding must be "chunked" (RFC 9112 §6.1: "If
+        //    any transfer coding other than chunked is applied to a request's
+        //    content, the sender MUST apply chunked as the final transfer coding").
+        //    Repeated field lines are one list split across lines (RFC 9110 §5.3), so
+        //    join them in order before looking at the last coding — "Transfer-Encoding:
+        //    gzip" + "Transfer-Encoding: chunked" is legal and must still be served.
+        //    What must NOT pass: "chunked, identity", a second "chunked", an empty
+        //    value, or an unrecognised coding such as "xchunked" — each left this
+        //    server with no framing at all, so it treated the body bytes as the NEXT
+        //    pipelined request.
+        bool chunked { false };
+        if (!teValues.empty()) {
+            std::string joined { teValues.front() };
+            for (std::size_t i { 1 }; i < teValues.size(); ++i) {
+                joined += ',';
+                joined += teValues[i];
+            }
+            if (!last_coding_is_chunked_(joined) || chunked_coding_count_(joined) != 1) {
+                fail_request_(handle, 400, "invalid transfer-encoding");
+                return false;
+            }
+            chunked = true;
+        }
         std::size_t length { 0 };
         if (!chunked) {
             if (const auto contentLength { conn.request.header("content-length") }) {

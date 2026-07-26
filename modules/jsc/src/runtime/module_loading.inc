@@ -157,6 +157,53 @@
         return out;
     }
 
+    // A node-internal module: required through the bare `internal/...` specifier
+    // node's own lib uses AND resolved to a file under a `lib/internal/`
+    // directory. Both halves are required on purpose — the specifier alone would
+    // also match a package that happens to ship a top-level `internal/` folder,
+    // and the path alone would match any project with a `lib/internal/` of its
+    // own reached by a relative require. Only a module passing both is evaluated
+    // with `primordials` / `internalBinding` in scope, so those names stay
+    // unreachable from ordinary user code (they are node-internal, and making
+    // them ambient globals would be a security change, not a compat fix).
+    static bool is_node_internal_module_(std::string_view spec, std::string_view path) {
+        if (!spec.starts_with("internal/")) {
+            return false;
+        }
+        return path.find("/lib/internal/") != std::string_view::npos;
+    }
+
+    // node's `primordials`: the frozen snapshot of the JS builtins its internal
+    // modules destructure instead of touching the (user-mutable) global proxy.
+    //
+    // Built by evaluating node's OWN lib/internal/per_context/primordials.js —
+    // node runs that file in a per-context scope where `primordials` is a free
+    // variable it assigns onto (it never uses module.exports), and the loader
+    // injection below binds exactly that free variable. So the object is
+    // populated by node's own source rather than by a hand-copied list that
+    // would drift from the lib/ tree it has to serve.
+    //
+    // Created and cached BEFORE the require, so the recursive load of
+    // primordials.js itself receives the very object it is filling in.
+    JSValueRef node_primordials_(JSContextRef ctx, const std::string& fromDir) {
+        if (primordials_ != nullptr) {
+            return primordials_;
+        }
+        JSObjectRef obj{JSObjectMake(ctx, nullptr, nullptr)};
+        JSValueProtect(ctx, obj);
+        primordials_ = obj;
+        JSValueRef pexc{nullptr};
+        (void)require_impl(ctx, "internal/per_context/primordials", fromDir, &pexc);
+        return primordials_;
+    }
+
+    // The internalBinding() accessor installed by the js_builtins
+    // :node_internal_binding partition (non-enumerable, so node's `common`
+    // leaked-globals check never sees it).
+    JSValueRef node_internal_binding_(JSContextRef ctx) {
+        return get_prop(ctx, JSContextGetGlobalObject(ctx), "__mbunInternalBinding");
+    }
+
     // `esm`: the *importing* module's source used ESM syntax, so this require()
     // is a lowered `import` and must resolve with the "import" condition (not
     // "require"). See __mbun_make_require_esm below for how it is threaded in.
@@ -347,6 +394,16 @@
             return JSValueMakeUndefined(ctx);
         } else {
             if (exc) {
+                // A read the Permission Model refused is an access error, not a
+                // resolution error: the module was found, and reporting
+                // "Cannot find module" would hide the reason.
+                if (gPermissionDeniedModuleRead) {
+                    const std::string refused{*gPermissionDeniedModuleRead};
+                    gPermissionDeniedModuleRead.reset();
+                    *exc = permission_denied_error(
+                        ctx, mbun::permission::Scope::FileSystemRead, refused);
+                    return JSValueMakeUndefined(ctx);
+                }
                 if (spec.starts_with("node:")) {
                     // Unknown node: builtin — node/bun throw ERR_UNKNOWN_BUILTIN_MODULE
                     // (a real Error with .code), not a bare "cannot find module" string.
@@ -548,8 +605,29 @@
         // kEsmRequireAlias), which the trailing parameter binds to the same
         // require — inert for every module that does not declare one.
         const char* preq{requireAlias ? "__mbun_prequire" : "require"};
-        const std::string params{std::string{"exports, "} + preq + ", module, " + pfn + ", " + pdn +
-                                 ", __mbun_esm_require"};
+        // node evaluates lib/internal/** with `primordials` and `internalBinding`
+        // in scope; without them every one of those modules throws
+        // "ReferenceError: primordials is not defined" on its first line. Append
+        // them as wrapper parameters for node-internal modules only — a
+        // parameter, not a global, so nothing else in the process can reach them.
+        // internal/bootstrap/realm.js declares its own `internalBinding`, so the
+        // same rename guard the other params use applies here too.
+        const bool nodeInternal{is_node_internal_module_(spec, path)};
+        const char* pprim{declares("primordials") ? "__mbun_pprimordials" : "primordials"};
+        const char* pbind{declares("internalBinding") ? "__mbun_pinternalBinding"
+                                                     : "internalBinding"};
+        // internal/bootstrap/realm.js declares its OWN `internalBinding` on top
+        // of the raw `getInternalBinding` node's realm bootstrap leaves in
+        // scope, so that name has to be injected too or the whole loader
+        // module — and internal/util/inspect through it — dies on a
+        // ReferenceError.
+        const char* pgbind{declares("getInternalBinding") ? "__mbun_pgetInternalBinding"
+                                                         : "getInternalBinding"};
+        const std::string params{
+            std::string{"exports, "} + preq + ", module, " + pfn + ", " + pdn +
+            ", __mbun_esm_require" +
+            (nodeInternal ? std::string{", "} + pprim + ", " + pbind + ", " + pgbind
+                          : std::string{})};
         // A module with top-level await gets the async wrapper up front (JSC's
         // script mode has no TLA); its promise is pumped to completion below so
         // requiring it is synchronous and a rejection propagates to the caller.
@@ -563,8 +641,29 @@
                 ? std::string{"var __mbunImportMeta = globalThis.__mbun_make_import_meta("} + pfn +
                       ", " + pdn + ", " + json_quote_(query) + ");\n"
                 : std::string{}};
+        // node's internal/util/debuglog leaves `testEnabled` and `debugImpls`
+        // DELIBERATELY uninitialised ("so any call to debuglog() before
+        // initializeDebugEnv() is called will throw" — its own comment) and calls
+        // initializeDebugEnv from internal/process/pre_execution.js:488, a
+        // bootstrap phase mbun does not run. The result was that every lazily
+        // created debug function threw "testEnabled is not a function" the first
+        // time it was actually invoked, and 42 files of node's own lib call
+        // debuglog(). Appending the call to the module's own body is the only
+        // point that is guaranteed to run before first use without paying a
+        // startup cost on every process.
+        //
+        // The `process` guard matters: this module can be pulled in very early,
+        // before process/env exist. Initialising with an empty env then matches
+        // node's own behaviour for an unset NODE_DEBUG (testEnabled returns
+        // false, debug functions become no-ops) rather than throwing — at the
+        // cost that NODE_DEBUG would not take effect for so early a load.
+        const std::string debugEnvSuffix{
+            spec == "internal/util/debuglog"
+                ? std::string{"\ninitializeDebugEnv(typeof process !== \"undefined\" && process.env"
+                              " ? process.env.NODE_DEBUG : \"\");\n"}
+                : std::string{}};
         std::string wrapper{std::string{tla ? "(async function (" : "(function ("} + params +
-                            ") {\n" + strictPrefix + metaPrefix + source + "\n})"};
+                            ") {\n" + strictPrefix + metaPrefix + source + debugEnvSuffix + "\n})"};
 
         JSValueRef wrapExc{nullptr};
         JSValueRef fnVal{eval_(wrapper, &wrapExc, path)};
@@ -628,10 +727,20 @@
         JSValueRef dirArg{make_string(ctx, dir)};
         JSValueRef reqFn{JSObjectCallAsFunction(ctx, makeReq, nullptr, 1, &dirArg, exc)};
 
-        JSValueRef callArgs[6]{exportsObj, reqFn, moduleObj, make_string(ctx, path),
-                               make_string(ctx, dir), reqFn};
+        JSValueRef callArgs[9]{exportsObj, reqFn,
+                               moduleObj,  make_string(ctx, path),
+                               dirArg,     reqFn,
+                               nullptr,    nullptr,
+                               nullptr};
+        std::size_t callArgc{6};
+        if (nodeInternal) {
+            callArgs[6] = node_primordials_(ctx, dir);
+            callArgs[7] = node_internal_binding_(ctx);
+            callArgs[8] = callArgs[7];
+            callArgc = 9;
+        }
         JSValueRef callExc{nullptr};
-        JSValueRef callRet{JSObjectCallAsFunction(ctx, fn, nullptr, 6, callArgs, &callExc)};
+        JSValueRef callRet{JSObjectCallAsFunction(ctx, fn, nullptr, callArgc, callArgs, &callExc)};
         if (callExc == nullptr && asyncWrapped && callRet != nullptr) {
             // Pump the module's promise to completion so top-level awaits finish
             // before require() returns, and surface a rejection as the require
@@ -696,6 +805,12 @@ private:
         // Writing to a child pipe whose read end has closed must fail with EPIPE,
         // not kill the runtime with SIGPIPE (async child_process stdin, Bun.spawn).
         std::signal(SIGPIPE, SIG_IGN);
+        // Same reasoning for RLIMIT_FSIZE: a write past the limit must come back
+        // as EFBIG for the JS layer to throw, not terminate the process with
+        // SIGXFSZ (node ignores it for exactly this reason —
+        // test-fs-write-sigxfsz asserts the process exits 1 with the EFBIG
+        // Error on stderr).
+        std::signal(SIGXFSZ, SIG_IGN);
 #endif
         // bun-style explicit init (idempotent). JSC freezes its option table at the
         // end of initialize(), so options are only settable from inside the

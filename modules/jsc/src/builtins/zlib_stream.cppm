@@ -127,6 +127,63 @@ inline constexpr std::string_view kZlibStreamJS = R"JS(
   const Brotli = makeAbstract("Brotli", ZlibBase.prototype, ZlibBase);
   const Zstd = makeAbstract("Zstd", ZlibBase.prototype, ZlibBase);
 
+  // ---- options.params validation (node lib/zlib.js Brotli/Zstd constructors) ----
+  // The accepted key space is derived from the exported constants exactly the way
+  // node derives kMaxBrotliParam / kMaxZstd{C,D}Param, so a key outside it (or a
+  // key seen twice, e.g. "0" and "00") is ERR_BROTLI_INVALID_PARAM /
+  // ERR_ZSTD_INVALID_PARAM. A key that is in range but carries a value the codec
+  // itself rejects surfaces as ERR_ZLIB_INITIALIZATION_FAILED, matching the
+  // failed BrotliEncoderSetParameter / ZSTD_CCtx_setParameter node reports.
+  const zc = (zmod.constants || {});
+  const maxParamWithPrefix = (prefix) => {
+    let max = 0;
+    for (const k of Object.keys(zc)) if (k.startsWith(prefix) && zc[k] > max) max = zc[k];
+    return max;
+  };
+  const maxBrotliParam = maxParamWithPrefix("BROTLI_PARAM_");
+  const maxZstdCParam = maxParamWithPrefix("ZSTD_c_");
+  const maxZstdDParam = maxParamWithPrefix("ZSTD_d_");
+  const errInvalidParam = (code, origKey, what) => {
+    const e = new RangeError(origKey + " is not a valid " + what + " parameter");
+    e.code = code;
+    return e;
+  };
+  const errInitFailed = (message) => {
+    const e = new Error(message);
+    e.code = "ERR_ZLIB_INITIALIZATION_FAILED";
+    return e;
+  };
+  // brotli encoder.c BrotliEncoderSetParameter: the two boolean flags and
+  // NPOSTFIX reject out-of-range values, which node reports as a failed init.
+  const brotliSetParam = (key, value) => {
+    if ((key === 4 || key === 6) && value !== 0 && value !== 1) throw errInitFailed("Initialization failed");
+    if (key === 7 && (value < 0 || value > 3)) throw errInitFailed("Initialization failed");
+  };
+  // ZSTD_CCtx_setParameter / ZSTD_DCtx_setParameter bounds (ZSTD_cParam_getBounds).
+  const zstdSetCParam = (key, value) => {
+    if (key === 107 && (value < 0 || value > 9)) throw errInitFailed("Setting parameter failed");   // ZSTD_c_strategy
+  };
+  const zstdSetDParam = (key, value) => {
+    if (key === 100 && (value < 10 || value > 31)) throw errInitFailed("Setting parameter failed"); // ZSTD_d_windowLogMax
+  };
+  const flushMax = (kind) => (kind === K_BENC || kind === K_BDEC) ? 3 : ((kind === K_ZENC || kind === K_ZDEC) ? 2 : 5);
+  const checkParams = (o, maxParam, code, what, setParam) => {
+    const p = (o && o.params) || {};
+    const seen = new Set();
+    const out = {};
+    for (const origKey of Object.keys(p)) {
+      const key = +origKey;
+      if (Number.isNaN(key) || key < 0 || key > maxParam || seen.has(key)) throw errInvalidParam(code, origKey, what);
+      seen.add(key);
+      const pv = p[origKey];
+      if (typeof pv !== "number" && typeof pv !== "boolean") throw errType("options.params[" + origKey + "]", "of type number", pv);
+      const value = typeof pv === "boolean" ? (pv ? 1 : 0) : pv;
+      setParam(key, value);
+      out[key] = value;
+    }
+    return out;
+  };
+
   // ---- shared behaviour on ZlibBase.prototype ----
   const proto = ZlibBase.prototype;
 
@@ -146,25 +203,23 @@ inline constexpr std::string_view kZlibStreamJS = R"JS(
       this._strategy = strategy;
       return ZN.streamOpen(c.kind, wbits(c.fmt, mag, isDec), level, memLevel, strategy, -1, 0, 0);
     }
-    if (c.kind === K_BENC) {
-      const p = (o && o.params) || {};
+    if (c.kind === K_BENC || c.kind === K_BDEC) {
       // Brotli param values must be numbers or booleans (node coerces booleans).
-      for (const k of Object.keys(p)) {
-        const pv = p[k];
-        if (typeof pv !== "number" && typeof pv !== "boolean") throw errType("options.params[" + k + "]", "of type number", pv);
-      }
+      const p = checkParams(o, maxBrotliParam, "ERR_BROTLI_INVALID_PARAM", "Brotli", brotliSetParam);
       const q = typeof p[1] === "number" ? p[1] : -1;   // BROTLI_PARAM_QUALITY
       const lg = typeof p[2] === "number" ? p[2] : 0;    // BROTLI_PARAM_LGWIN
       const md = typeof p[0] === "number" ? p[0] : 0;    // BROTLI_PARAM_MODE
+      if (c.kind === K_BDEC) return ZN.streamOpen(K_BDEC, 0, -1, 8, 0, -1, 0, 0);
       return ZN.streamOpen(K_BENC, 0, -1, 8, 0, q, lg, md);
     }
-    if (c.kind === K_BDEC) return ZN.streamOpen(K_BDEC, 0, -1, 8, 0, -1, 0, 0);
     if (c.kind === K_ZENC) {
+      const p = checkParams(o, maxZstdCParam, "ERR_ZSTD_INVALID_PARAM", "zstd", zstdSetCParam);
       let level = 3;
       if (o && typeof o.level === "number") level = o.level;
-      else { const p = (o && o.params) || {}; if (typeof p[100] === "number") level = p[100]; }
+      else if (typeof p[100] === "number") level = p[100];   // ZSTD_c_compressionLevel
       return ZN.streamOpen(K_ZENC, 0, level, 8, 0, -1, 0, 0);
     }
+    checkParams(o, maxZstdDParam, "ERR_ZSTD_INVALID_PARAM", "zstd", zstdSetDParam);
     return ZN.streamOpen(K_ZDEC, 0, -1, 8, 0, -1, 0, 0);
   };
 
@@ -177,16 +232,33 @@ inline constexpr std::string_view kZlibStreamJS = R"JS(
     // should not be set"). Use a private, non-colliding flag name instead.
     this._zIsDecoder = cfg.kind === K_INFLATE || cfg.kind === K_BDEC || cfg.kind === K_ZDEC;
     this._chunkSize = vopt(opts, "chunkSize", 64, Infinity, 16384);
+    this._maxOutputLength = undefined;   // no cap unless the option asks for one
     if (opts) {
-      vopt(opts, "maxOutputLength", 0, Infinity, undefined);   // validate only
-      vopt(opts, "flush", 0, 5, 0);                            // Z_NO_FLUSH..Z_BLOCK
-      vopt(opts, "finishFlush", 0, 5, 4);
+      // SECURITY: this used to be "validate only" — the option was range-checked
+      // and then thrown away, so every streaming decompressor
+      // (createGunzip/createInflate/createInflateRaw/createBrotliDecompress/
+      // createZstdDecompress/createUnzip) ignored the cap and expanded a zip bomb
+      // in full. maxOutputLength IS the documented defence for decompressing
+      // untrusted input, and the streaming API is where untrusted input arrives;
+      // only the one-shot sync/async helpers were enforcing it. A control that
+      // reports success while doing nothing is worse than an absent one, because
+      // code auditing as bounded was not.
+      // node lib/zlib.js: _maxOutputLength is checked against the running output
+      // total on every produced chunk and raises ERR_BUFFER_TOO_LARGE.
+      this._maxOutputLength = vopt(opts, "maxOutputLength", 0, Infinity, undefined);
+      // Each family has its own flush enum: zlib Z_NO_FLUSH..Z_BLOCK (0..5),
+      // brotli BROTLI_OPERATION_PROCESS..EMIT_METADATA (0..3), zstd
+      // ZSTD_e_continue..ZSTD_e_end (0..2).
+      const maxFlush = flushMax(cfg.kind);
+      vopt(opts, "flush", 0, maxFlush, 0);
+      vopt(opts, "finishFlush", 0, maxFlush, Math.min(4, maxFlush));
       if (opts.dictionary !== undefined && opts.dictionary !== null &&
           !ArrayBuffer.isView(opts.dictionary) && !(opts.dictionary instanceof ArrayBuffer) &&
           !(G.SharedArrayBuffer && opts.dictionary instanceof G.SharedArrayBuffer)) {
         throw errType("options.dictionary", "an instance of Buffer, TypedArray, DataView, or ArrayBuffer", opts.dictionary);
       }
     }
+    this._zOutLen = 0;             // running decompressed-output total for the cap
     this._bytesWritten = 0;
     this._zEnded = false;
     this._zErrored = false;
@@ -225,7 +297,24 @@ inline constexpr std::string_view kZlibStreamJS = R"JS(
     catch (e) { return this._zMakeErr(String(e && e.message || e)); }
     if (!res || !res.ok) return this._zMakeErr((res && res.message) || "zlib stream error");
     this._bytesWritten += res.consumed | 0;
-    if (res.b64) this._pushChunked(Buffer.from(res.b64, "base64"));
+    if (res.b64) {
+      const produced = Buffer.from(res.b64, "base64");
+      // Enforce maxOutputLength on the running total BEFORE pushing, so a bomb is
+      // stopped at the cap instead of after the whole expansion is in memory.
+      // Decoders only: the cap exists to bound what a compressed input can expand
+      // to, which is also the direction mbun's one-shot helpers check.
+      if (this._zIsDecoder && this._maxOutputLength !== undefined) {
+        this._zOutLen += produced.length;
+        if (this._zOutLen > this._maxOutputLength) {
+          this._zErrored = true;
+          const e = new RangeError("Cannot create a Buffer larger than " +
+                                   this._maxOutputLength + " bytes");
+          e.code = "ERR_BUFFER_TOO_LARGE";
+          return e;
+        }
+      }
+      this._pushChunked(produced);
+    }
     if (res.streamEnd) { this._zEnded = true; this.push(null); }
     return null;
   };
@@ -298,6 +387,14 @@ inline constexpr std::string_view kZlibStreamJS = R"JS(
         !ArrayBuffer.isView(chunk) && !(chunk instanceof ArrayBuffer)) {
       throw errType("chunk", "of type string or an instance of Buffer, TypedArray, DataView, or ArrayBuffer", chunk);
     }
+    // A destroyed stream (close() destroys, per node's ZlibBase.close) reports
+    // ERR_STREAM_DESTROYED to the write callback instead of silently succeeding.
+    if (this.destroyed) {
+      const de = new Error("Cannot call write after a stream was destroyed");
+      de.code = "ERR_STREAM_DESTROYED";
+      if (typeof cb === "function") G.queueMicrotask(function () { cb(de); });
+      return false;
+    }
     if (this._writableEnded) { if (typeof cb === "function") G.queueMicrotask(cb); return false; }
     const self = this;
     // The write completion callback fires asynchronously, matching node/bun's
@@ -363,9 +460,17 @@ inline constexpr std::string_view kZlibStreamJS = R"JS(
     return this;
   };
 
+  // node lib/zlib.js ZlibBase.close: `finished(this, callback)` then destroy() —
+  // closing a codec stream destroys it, so a later write() is ERR_STREAM_DESTROYED
+  // rather than a silent no-op.
   proto.close = function (cb) {
     if (this._h >= 0) { ZN.streamClose(this._h); this._h = -1; }
-    if (typeof cb === "function") G.queueMicrotask(cb);
+    this._zEnded = true;
+    if (typeof cb === "function") {
+      if (this.destroyed) G.queueMicrotask(cb);
+      else this.once("close", cb);
+    }
+    this.destroy();
     return this;
   };
 
@@ -429,6 +534,79 @@ inline constexpr std::string_view kZlibStreamJS = R"JS(
   for (const k of Object.keys(patch)) {
     try { Object.defineProperty(zmod, k, { value: patch[k], writable: true, enumerable: true, configurable: true }); }
     catch (e) { zmod[k] = patch[k]; }
+  }
+
+  // ---- one-shot decompression with a non-default finishFlush ----------------
+  // node's convenience helpers are `zlibBuffer(new Ctor(opts), …)`, so
+  // `finishFlush: Z_SYNC_FLUSH` makes a truncated stream yield whatever decoded
+  // before the input ran out instead of erroring (test-zlib-truncated). The
+  // bootstrap one-shots call the whole-buffer natives, which have no such mode,
+  // so route just that case through the incremental handle here.
+  const decodeThroughHandle = (cfg, data, opts, finalFlush) => {
+    const isInflate = cfg.kind === K_INFLATE;
+    const mag = isInflate ? checkNum(opts ? opts.windowBits : undefined, "options.windowBits", cfg.fmt === "gzip" ? 9 : 8, 15, 15) : 0;
+    const h = ZN.streamOpen(cfg.kind, isInflate ? wbits(cfg.fmt, mag, true) : 0, -1, 8, 0, -1, 0, 0);
+    if (h < 0) throw errInitFailed("Initialization failed");
+    try {
+      const bytes = toBytes(data);
+      const out = [];
+      let off = 0, ended = false;
+      do {
+        const end = Math.min(off + Z_SLICE, bytes.length);
+        const res = ZN.streamProcess(h, end > off ? b64(bytes.subarray(off, end)) : EMPTY, end >= bytes.length ? finalFlush : F_NONE);
+        if (!res || !res.ok) { const e = new Error((res && res.message) || "zlib stream error"); e.errno = -3; e.code = "Z_DATA_ERROR"; throw e; }
+        if (res.b64) out.push(Buffer.from(res.b64, "base64"));
+        if (res.streamEnd) { ended = true; break; }
+        off = end;
+      } while (off < bytes.length);
+      // Same end-of-stream check _flush performs: a decoder that never reached
+      // the codec's stream end ran out of input mid-member.
+      if (finalFlush === F_FINISH && !ended) { const e = new Error("unexpected end of file"); e.errno = -5; e.code = "Z_BUF_ERROR"; throw e; }
+      return out.length === 1 ? out[0] : Buffer.concat(out);
+    } finally { try { ZN.streamClose(h); } catch (e) {} }
+  };
+  const decoderOneShots = {
+    inflateSync: { kind: K_INFLATE, fmt: "zlib", Engine: Inflate },
+    inflateRawSync: { kind: K_INFLATE, fmt: "raw", Engine: InflateRaw },
+    gunzipSync: { kind: K_INFLATE, fmt: "gzip", Engine: Gunzip },
+    unzipSync: { kind: K_INFLATE, fmt: "auto", Engine: Unzip },
+    brotliDecompressSync: { kind: K_BDEC, Engine: BrotliDecompress },
+    zstdDecompressSync: { kind: K_ZDEC, Engine: ZstdDecompress },
+  };
+  const asyncOf = { inflateSync: "inflate", inflateRawSync: "inflateRaw", gunzipSync: "gunzip", unzipSync: "unzip", brotliDecompressSync: "brotliDecompress", zstdDecompressSync: "zstdDecompress" };
+  for (const name of Object.keys(decoderOneShots)) {
+    const cfg = decoderOneShots[name];
+    const orig = zmod[name];
+    if (typeof orig !== "function") continue;
+    const finishDefault = Math.min(4, flushMax(cfg.kind));   // Z_FINISH / BROTLI_OPERATION_FINISH / ZSTD_e_end
+    const sync = function (data, opts) {
+      if (opts && typeof opts === "object" && typeof opts.finishFlush === "number" && opts.finishFlush !== finishDefault) {
+        const buf = decodeThroughHandle(cfg, data, opts, F_SYNC);
+        return opts.info ? { buffer: buf, engine: Object.create(cfg.Engine.prototype) } : buf;
+      }
+      try { return orig(data, opts); }
+      catch (e) {
+        // The whole-buffer natives collapse every decode failure into one generic
+        // message; node distinguishes truncated input ("unexpected end of file")
+        // from corrupt data. Re-run the failure through the incremental codec,
+        // which does report the distinction, purely to classify it. Only a codec
+        // error is reclassified — an ERR_BUFFER_TOO_LARGE cap is not.
+        if (!e || e.code !== "Z_DATA_ERROR") throw e;
+        try { decodeThroughHandle(cfg, data, opts, F_FINISH); }
+        catch (e2) { if (e2 && e2.message && e2.message !== e.message) throw e2; }
+        throw e;
+      }
+    };
+    const async = function (data, opts, cb) {
+      if (typeof opts === "function") { cb = opts; opts = undefined; }
+      if (typeof cb !== "function") throw errType("callback", "of type function", cb);
+      G.queueMicrotask(function () { let r; try { r = sync(data, opts); } catch (e) { cb(e); return; } cb(null, r); });
+    };
+    try { Object.defineProperty(zmod, name, { value: sync, writable: true, enumerable: true, configurable: true }); } catch (e) { zmod[name] = sync; }
+    const an = asyncOf[name];
+    if (an && typeof zmod[an] === "function") {
+      try { Object.defineProperty(zmod, an, { value: async, writable: true, enumerable: true, configurable: true }); } catch (e) { zmod[an] = async; }
+    }
   }
 })();
 )JS";

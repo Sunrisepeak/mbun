@@ -60,7 +60,9 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   // still rejected; message reports typeof for the simplified template.
   const validatePathObject = (o) => {
     if (o === null || typeof o !== "object") {
-      const e = new TypeError('The "pathObject" property must be of type object, got ' + typeof o);
+      // node path._format calls validateObject(pathObject, 'pathObject') ->
+      // ERR_INVALID_ARG_TYPE(name, 'Object', value).
+      const e = nodeArgTypeError("pathObject", "Object", o);
       e.code = "ERR_INVALID_ARG_TYPE";
       throw e;
     }
@@ -553,8 +555,29 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   assert.notDeepEqual = (a, b, m) => { if (deepEq(a, b, false)) throw AErr(m); };
   assert.deepStrictEqual = (a, b, m) => { if (!deepEq(a, b, true)) throw AErr(m); };
   assert.notDeepStrictEqual = (a, b, m) => { if (deepEq(a, b, true)) throw AErr(m); };
-  assert.throws = (fn, e, m) => { try { fn(); } catch (_) { return; } throw AErr(m || "Missing expected exception"); };
-  assert.doesNotThrow = (fn) => { fn(); };
+  // assert.throws / assert.doesNotThrow — node lib/assert.js throws() +
+  // getActual(). These USED to ignore the `error` argument entirely:
+  //
+  //   assert.throws = (fn, e, m) => { try { fn(); } catch (_) { return; } ... }
+  //
+  // so `assert.throws(fn, { code: 'ERR_X' })` passed for ANY throw at all, and
+  // `assert.throws(fn, common.expectsError({...}))` never called the validator
+  // — which is how the corpus's most common negative assertion silently checked
+  // nothing. The validation machinery below (expectsError / expectedException /
+  // hasMatchingError, ported from bun's assert.ts) already existed and was
+  // reachable only from assert.rejects; both entry points now share it, so the
+  // sync and async forms agree.
+  const getActual = (fn) => {
+    if (typeof fn !== "function") throw argTypeErr("fn", "of type function", fn);
+    try { fn(); } catch (e) { return e; }
+    return NO_EXC;
+  };
+  assert.throws = function throws(fn, error, message) {
+    return expectsError("throws", getActual(fn), error, message);
+  };
+  assert.doesNotThrow = function doesNotThrow(fn, error, message) {
+    return expectsNoError("doesNotThrow", getActual(fn), error, message);
+  };
   // rejects / doesNotReject: ported from bun src/js/node/assert.ts
   // (waitForActual/expectsError/expectsNoError/expectedException). Enriched
   // AssertionError path via makeAErr is opt-in; other assert.* keep using AErr.
@@ -591,18 +614,29 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     let resultPromise;
     if (typeof promiseFn === "function") {
       resultPromise = promiseFn();
-      if (!isPromiseLike(resultPromise)) { const e = new TypeError('Expected instance of Promise to be returned from the "promiseFn" function but got ' + insp(resultPromise) + "."); e.code = "ERR_INVALID_RETURN_VALUE"; throw e; }
+      // node ERR_INVALID_RETURN_VALUE reports determineSpecificType(value).
+      if (!isPromiseLike(resultPromise)) { const e = new TypeError('Expected instance of Promise to be returned from the "promiseFn" function but got ' + determineSpecificType(resultPromise) + "."); e.code = "ERR_INVALID_RETURN_VALUE"; throw e; }
     } else if (isPromiseLike(promiseFn)) {
       resultPromise = promiseFn;
     } else {
-      throw argTypeErr("promiseFn", "of type function or an instance of Promise", promiseFn);
+      throw nodeArgTypeError("promiseFn", ["function", "Promise"], promiseFn);
     }
     try { await resultPromise; } catch (e) { return e; }
     return NO_EXC;
   }
   function compareExceptionKey(actual, expected, key, message, opName) {
     if (!(key in actual) || !deepEq(actual[key], expected[key], true)) {
-      throw makeAErr({ actual, expected, message, operator: opName, generatedMessage: !message });
+      // node builds a full deep-equal diff here. A NAMED key mismatch is the
+      // single most common negative-assertion failure in the corpus, and an
+      // AssertionError with an empty message is untriageable from a log — say
+      // which property disagreed and how.
+      const generated = !message;
+      if (generated) {
+        message = "Comparison of the '" + key + "' property failed: expected " +
+                  insp(expected[key]) + ", got " +
+                  (key in actual ? insp(actual[key]) : "undefined (property missing)");
+      }
+      throw makeAErr({ actual, expected, message, operator: opName, generatedMessage: generated });
     }
   }
   function expectedException(actual, expected, message, opName) {
@@ -723,6 +757,48 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   // node-like value inspection (unquoted keys, 'single-quoted' strings, class
   // names, Map/Set/TypedArray/Buffer/Error/Date/RegExp, circular refs, depth cap).
   const kInspectCustom = Symbol.for("nodejs.util.inspect.custom");
+  // node internal/util/inspect.js `ansi` — chalk's ansi-regex, matching every VT
+  // escape sequence (SGR, cursor/tab/clear, and OSC-8 hyperlinks terminated by
+  // BEL / ESC-\ / ST) rather than colour codes only.
+  const kAnsiRe = new RegExp(
+    "[\\u001B\\u009B][[\\]()#;?]*" +
+    "(?:(?:(?:(?:;[-a-zA-Z\\d\\/\\#&.:=?%@~_]+)*" +
+    "|[a-zA-Z\\d]+(?:;[-a-zA-Z\\d\\/\\#&.:=?%@~_]*)*)?" +
+    "(?:\\u0007|\\u001B\\u005C|\\u009C))" +
+    "|(?:(?:\\d{1,4}(?:;\\d{0,4})*)?" +
+    "[\\dA-PR-TZcf-nq-uy=><~]))", "g");
+  // node lib/internal/util/inspect.js inspectDefaultOptions, exposed as
+  // util.inspect.defaultOptions. Every key is an accessor over a backing store
+  // so a direct write (`util.inspect.defaultOptions.compact = 5`, which is how
+  // the corpus uses it) flips the dirty flag without a Proxy.
+  const gInspectDefaultsStore = {
+    indentationLvl: 0, currentDepth: 0, showHidden: false, depth: 2, colors: false,
+    customInspect: true, showProxy: false, maxArrayLength: 100, maxStringLength: 10000,
+    breakLength: 128, compact: 3, sorted: false, getters: false, numericSeparator: false,
+  };
+  let gInspectDefaultsDirty = false;
+  const gInspectDefaults = {};
+  for (const k of Object.keys(gInspectDefaultsStore)) {
+    Object.defineProperty(gInspectDefaults, k, {
+      get() { return gInspectDefaultsStore[k]; },
+      set(v) { gInspectDefaultsStore[k] = v; gInspectDefaultsDirty = true; },
+      enumerable: true, configurable: false,
+    });
+  }
+  Object.seal(gInspectDefaults);
+  // util.inspect must survive a monkeypatched Object/Array/JSON: node's
+  // inspect.js reaches only for primordials, and the corpus asserts it
+  // directly (test-util-primordial-monkeypatching replaces Object.keys with a
+  // throwing stub). These aliases are captured at image build time.
+  const PObjectKeys = Object.keys;
+  const PObjectGetOwnPropertySymbols = Object.getOwnPropertySymbols;
+  const PObjectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+  const PObjectGetPrototypeOf = Object.getPrototypeOf;
+  const PObjectIs = Object.is;
+  const PArrayIsArray = Array.isArray;
+  const PArrayFrom = Array.from;
+  const PJSONStringify = JSON.stringify;
+  const PObjectProtoToString = Object.prototype.toString;
   function inspectValue(v, opts, seen, depth) {
     opts = opts || {}; seen = seen || new Set(); depth = depth || 0;
     const maxDepth = opts.depth === null ? Infinity : (typeof opts.depth === "number" ? opts.depth : 2);
@@ -740,11 +816,11 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     if (v === null) return col(1, 22, "null");
     const t = typeof v;
     if (t === "undefined") return col(90, 39, "undefined");
-    if (t === "number") return col(33, 39, Object.is(v, -0) ? "-0" : String(v));
+    if (t === "number") return col(33, 39, PObjectIs(v, -0) ? "-0" : String(v));
     if (t === "bigint") return col(33, 39, String(v) + "n");
     if (t === "boolean") return col(33, 39, String(v));
     if (t === "symbol") return col(32, 39, v.toString());
-    if (t === "string") return col(32, 39, bun ? JSON.stringify(v) : "'" + v.replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\n/g, "\\n") + "'");
+    if (t === "string") return col(32, 39, bun ? PJSONStringify(v) : "'" + v.replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\n/g, "\\n") + "'");
     if (t === "function") {
       const n = v.name;
       if (bun) {
@@ -784,7 +860,15 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     }
     if (v instanceof Date) return isNaN(v.getTime()) ? "Invalid Date" : v.toISOString();
     if (v instanceof RegExp) return v.toString();
-    if (v instanceof Error) {
+    // `instanceof Error` alone misses an error from ANOTHER realm: a vm context
+    // (node:repl's default evaluator runs there) has its own Error intrinsic, so
+    // its errors inspected as a plain object — the REPL printed "Uncaught
+    // Error {}" where node prints "Uncaught ReferenceError: x is not defined".
+    // node uses the internal-class check (util.types.isNativeError); the
+    // Symbol.toStringTag guard keeps `{[Symbol.toStringTag]: "Error"}` — a plain
+    // object wearing the tag — out of the error branch.
+    if (v instanceof Error ||
+        (PObjectProtoToString.call(v) === "[object Error]" && !(Symbol.toStringTag in v))) {
       // bun/node error inspect starts with the "Name: message" header; mbun's
       // JSC-native stacks use `fn@source` frames without it, dropping the message
       // (which is where e.g. ENOENT/path live). Prepend it when absent.
@@ -806,16 +890,30 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       const extras = [];
       seen.add(v);
       try {
-        for (const k of Object.keys(v)) {
+        for (const k of PObjectKeys(v)) {
           if (k === "message" || k === "stack") continue;
           let s;
           try { s = inspectValue(v[k], opts, seen, depth + 1); } catch (e) { continue; }
           extras.push(extraIndent +
-                      (/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(k) ? k : JSON.stringify(k)) + ": " + s + ",");
+                      (/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(k) ? k : PJSONStringify(k)) + ": " + s + ",");
         }
       } finally { seen.delete(v); }
       if (extras.length) head += " {\n" + extras.join("\n") + "\n" + "  ".repeat(depth) + "}";
       return head;
+    }
+    // node/bun both render a promise by state, never as a bare `Promise {}`:
+    // `Promise { <pending> }`, `Promise { <value> }`, `Promise { <rejected> e }`.
+    // Bun.peek.status is the only way to read the state from JS.
+    if (v instanceof Promise && G.Bun && typeof G.Bun.peek === "function" &&
+        typeof G.Bun.peek.status === "function") {
+      let state;
+      try { state = G.Bun.peek.status(v); } catch (e) { state = "pending"; }
+      if (state !== "fulfilled" && state !== "rejected") return "Promise { <pending> }";
+      let settled;
+      try { settled = inspectValue(G.Bun.peek(v), opts, seen, depth + 1); }
+      catch (e) { settled = "<unknown>"; }
+      return state === "rejected" ? "Promise { <rejected> " + settled + " }"
+                                  : "Promise { " + settled + " }";
     }
     if (G.Buffer && G.Buffer.isBuffer && G.Buffer.isBuffer(v)) {
       // node lib/buffer.js: truncate the byte dump at buffer.INSPECT_MAX_BYTES
@@ -832,15 +930,15 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     if (bun) {
       if (v instanceof Number) return "[Number: " + Number(v) + "]";
       if (v instanceof Boolean) return "[Boolean: " + Boolean(v) + "]";
-      if (v instanceof String) return JSON.stringify(String(v));
+      if (v instanceof String) return PJSONStringify(String(v));
     }
-    if (depth > maxDepth) return Array.isArray(v) ? "[Array]" : (bun ? "[Object ...]" : "[Object]");
+    if (depth > maxDepth) return PArrayIsArray(v) ? "[Array]" : (bun ? "[Object ...]" : "[Object]");
     seen.add(v);
     let result;
     // bun layout helpers: keys are bare identifiers else JSON-quoted; non-empty
     // objects/maps/sets always break across lines with 2-space/level indent and a
     // trailing comma per entry. ref bun ConsoleObject.zig / fmt writeObject.
-    const bunKey = (k) => /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(k) ? k : JSON.stringify(k);
+    const bunKey = (k) => /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(k) ? k : PJSONStringify(k);
     const inner = "  ".repeat(depth + 1), outer = "  ".repeat(depth);
     // `compact: true` collapses a bun-style block onto one line (Bun.inspect's
     // documented option); the default stays the multi-line trailing-comma form.
@@ -858,12 +956,12 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       if (noCompact) return label + open + "\n" + items.map((it) => inner + it).join(",\n") + "\n" + outer + close;
       return label + open + " " + items.join(", ") + " " + close;
     };
-    if (Array.isArray(v)) {
+    if (PArrayIsArray(v)) {
       const items = v.map((x) => inspectValue(x, opts, seen, depth + 1));
       if (!items.length) result = "[]";
       else if (bun) {
         const oneLine = "[ " + items.join(", ") + " ]";
-        const complex = v.some((x) => x !== null && typeof x === "object" && !Array.isArray(x));
+        const complex = v.some((x) => x !== null && typeof x === "object" && !PArrayIsArray(x));
         const hasNL = items.some((s) => s.indexOf("\n") >= 0);
         result = (bunCompact || (!complex && !hasNL && oneLine.length <= 72)) ? oneLine : "[\n" + inner + items.join(", ") + "\n" + outer + "]";
       } else result = nodeBlock("", items, "[", "]");
@@ -878,16 +976,16 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       if (bun) result = bunBlock(v.size ? "Set(" + v.size + ") " : "Set ", items);
       else result = nodeBlock("Set(" + v.size + ") ", items, "{", "}");
     }
-    else if (ArrayBuffer.isView(v) && !(v instanceof DataView)) { const nm = v.constructor ? v.constructor.name : "TypedArray"; const items = Array.from(v).map(String); result = nm + "(" + v.length + ") [" + (items.length ? " " + items.join(", ") + " " : "") + "]"; }
+    else if (ArrayBuffer.isView(v) && !(v instanceof DataView)) { const nm = v.constructor ? v.constructor.name : "TypedArray"; const items = PArrayFrom(v).map(String); result = nm + "(" + v.length + ") [" + (items.length ? " " + items.join(", ") + " " : "") + "]"; }
     else {
-      const keys = Object.keys(v); const cn = v.constructor && v.constructor.name; const ctor = (cn && cn !== "Object") ? cn + " " : (Object.getPrototypeOf(v) === null ? "[Object: null prototype] " : "");
+      const keys = PObjectKeys(v); const cn = v.constructor && v.constructor.name; const ctor = (cn && cn !== "Object") ? cn + " " : (PObjectGetPrototypeOf(v) === null ? "[Object: null prototype] " : "");
       // Enumerable symbol-keyed own props render after string keys: bun as
       // `[Symbol(desc)]: v`, node as `Symbol(desc): v`. ref util.inspect.
-      const syms = Object.getOwnPropertySymbols(v).filter((s) => { const d = Object.getOwnPropertyDescriptor(v, s); return d && d.enumerable; });
+      const syms = PObjectGetOwnPropertySymbols(v).filter((s) => { const d = PObjectGetOwnPropertyDescriptor(v, s); return d && d.enumerable; });
       const descVal = (d, key) => (d && (d.get || d.set)) ? (d.get && d.set ? "[Getter/Setter]" : d.get ? "[Getter]" : "[Setter]") : inspectValue(v[key], opts, seen, depth + 1);
       if (bun) {
-        const items = keys.map((k) => bunKey(k) + ": " + descVal(Object.getOwnPropertyDescriptor(v, k), k));
-        for (const s of syms) items.push("[" + s.toString() + "]: " + descVal(Object.getOwnPropertyDescriptor(v, s), s));
+        const items = keys.map((k) => bunKey(k) + ": " + descVal(PObjectGetOwnPropertyDescriptor(v, k), k));
+        for (const s of syms) items.push("[" + s.toString() + "]: " + descVal(PObjectGetOwnPropertyDescriptor(v, s), s));
         result = bunBlock(ctor, items);
       } else {
         const items = keys.map((k) => { const kk = /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(k) ? k : "'" + k + "'"; return kk + ": " + inspectValue(v[k], opts, seen, depth + 1); });
@@ -898,22 +996,293 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     seen.delete(v);
     return result;
   }
+  // node internal/util/inspect.js formatWithOptionsInternal, per-specifier.
+  //   * %d is Number(x) printed as-is (NOT truncated), %i is parseInt, %f is
+  //     parseFloat; a symbol is 'NaN' and a bigint keeps its `n` suffix;
+  //   * %s only inspects an object whose `toString` is a built-in — an object
+  //     carrying its own toString/Symbol.toPrimitive is String()-ed;
+  //   * -0 prints as '-0' (String(-0) is '0').
+  const kBuiltInToStringOwners = new Set([
+    "Object", "Array", "Function", "Error", "Date", "RegExp", "String", "Number",
+    "Boolean", "BigInt", "Symbol", "Map", "Set", "WeakMap", "WeakSet", "Promise",
+    "ArrayBuffer", "SharedArrayBuffer", "DataView", "Int8Array", "Uint8Array",
+    "Uint8ClampedArray", "Int16Array", "Uint16Array", "Int32Array", "Uint32Array",
+    "Float16Array", "Float32Array", "Float64Array", "BigInt64Array", "BigUint64Array",
+    "EvalError", "RangeError", "ReferenceError", "SyntaxError", "TypeError", "URIError",
+    "AggregateError",
+  ]);
+  // internal/errors.js determineSpecificType — the "Received …" tail every
+  // ERR_INVALID_ARG_TYPE carries. The corpus compares these messages verbatim.
+  // Translated case-for-case from node's determineSpecificType; every branch
+  // (bigint suffix, -0, NaN, ±Infinity, the 28-char string cap, the quote
+  // fallback to JSON.stringify, and the EMPTY-named function that must still
+  // read "function " with a trailing space) is load-bearing in the corpus.
+  function determineSpecificType(value) {
+    if (value === null) return "null";
+    if (value === undefined) return "undefined";
+    const type = typeof value;
+    switch (type) {
+      case "bigint": return "type bigint (" + value + "n)";
+      case "number":
+        if (value === 0) return 1 / value === -Infinity ? "type number (-0)" : "type number (0)";
+        if (value !== value) return "type number (NaN)";
+        if (value === Infinity) return "type number (Infinity)";
+        if (value === -Infinity) return "type number (-Infinity)";
+        return "type number (" + value + ")";
+      case "boolean": return value ? "type boolean (true)" : "type boolean (false)";
+      case "symbol": return "type symbol (" + String(value) + ")";
+      case "function": return "function " + value.name;
+      case "object":
+        if (value.constructor && "name" in value.constructor)
+          return "an instance of " + value.constructor.name;
+        try { return util.inspect(value, { depth: -1 }); } catch (e) { return "an instance of Object"; }
+      case "string": {
+        let s = value;
+        if (s.length > 28) s = s.slice(0, 25) + "...";
+        if (s.indexOf("'") === -1) return "type string ('" + s + "')";
+        return "type string (" + JSON.stringify(s) + ")";
+      }
+      default: {
+        let inspected;
+        try { inspected = util.inspect(value, { colors: false }); } catch (e) { inspected = String(value); }
+        if (inspected.length > 28) inspected = inspected.slice(0, 25) + "...";
+        return "type " + type + " (" + inspected + ")";
+      }
+    }
+  }
+  // internal/errors.js makeNodeErrorWithCode: every NodeError overrides
+  // toString() as `${name} [${code}]: ${message}` (name and stack keep the base
+  // name). `assert.throws(fn, /ERR_X/)` matches String(err), so without this the
+  // code is invisible to a regex matcher.
+  const nodeErrToString = (e, code) => {
+    const base = e.name;
+    Object.defineProperty(e, "toString", {
+      value() { return `${base} [${code}]${this.message ? ": " + this.message : ""}`; },
+      configurable: true, writable: true,
+    });
+    return e;
+  };
+  // internal/errors.js formatList. NOTE the 3-element case carries an Oxford
+  // comma ("a, b, or c") — the corpus compares these verbatim and the
+  // hand-rolled per-subsystem copies got this wrong in both directions.
+  function nodeFormatList(array, type) {
+    type = type === undefined ? "and" : type;
+    switch (array.length) {
+      case 0: return "";
+      case 1: return "" + array[0];
+      case 2: return array[0] + " " + type + " " + array[1];
+      case 3: return array[0] + ", " + array[1] + ", " + type + " " + array[2];
+      default:
+        return array.slice(0, -1).join(", ") + ", " + type + " " + array[array.length - 1];
+    }
+  }
+  const kNodeErrTypes = ["string", "function", "number", "object", "Function", "Object",
+                         "boolean", "bigint", "symbol"];
+  const kNodeClassRe = /^[A-Z][a-zA-Z0-9]*$/;
+  // internal/errors.js ERR_INVALID_ARG_TYPE, full multi-type form: `expected`
+  // may be a single string or a list, and node splits it into primitive types
+  // ("of type x"), classes ("an instance of X") and free-form alternatives
+  // ("one of …"). A dotted name reads "property", a name already ending in
+  // " argument" is used bare, everything else "argument".
+  function nodeArgTypeError(name, expected, value) {
+    if (!Array.isArray(expected)) expected = [expected];
+    let msg = "The ";
+    if (String(name).endsWith(" argument")) msg += name + " ";
+    else msg += "\"" + name + "\" " + (String(name).indexOf(".") !== -1 ? "property" : "argument") + " ";
+    msg += "must be ";
+    const types = [], instances = [], other = [];
+    for (const v of expected) {
+      if (kNodeErrTypes.indexOf(v) !== -1) types.push(String(v).toLowerCase());
+      else if (kNodeClassRe.exec(v) !== null) instances.push(v);
+      else other.push(v);
+    }
+    if (instances.length > 0) {
+      const pos = types.indexOf("object");
+      if (pos !== -1) { types.splice(pos, 1); instances.push("Object"); }
+    }
+    if (types.length > 0) {
+      msg += (types.length > 1 ? "one of type " : "of type ") + nodeFormatList(types, "or");
+      if (instances.length > 0 || other.length > 0) msg += " or ";
+    }
+    if (instances.length > 0) {
+      msg += "an instance of " + nodeFormatList(instances, "or");
+      if (other.length > 0) msg += " or ";
+    }
+    if (other.length > 0) {
+      if (other.length > 1) msg += "one of " + nodeFormatList(other, "or");
+      else {
+        if (String(other[0]).toLowerCase() !== other[0]) msg += "an ";
+        msg += other[0];
+      }
+    }
+    msg += ". Received " + determineSpecificType(value);
+    const e = new TypeError(msg);
+    e.code = "ERR_INVALID_ARG_TYPE";
+    return nodeErrToString(e, "ERR_INVALID_ARG_TYPE");
+  }
+  // internal/errors.js ERR_INVALID_ARG_VALUE: inspect(value) capped at 128,
+  // dotted name reads "property".
+  function nodeArgValueError(name, value, reason) {
+    reason = reason === undefined ? "is invalid" : reason;
+    let inspected;
+    try { inspected = util.inspect(value); } catch (e) { inspected = String(value); }
+    if (inspected.length > 128) inspected = inspected.slice(0, 128) + "...";
+    const type = String(name).indexOf(".") !== -1 ? "property" : "argument";
+    const e = new TypeError("The " + type + " '" + name + "' " + reason + ". Received " + inspected);
+    e.code = "ERR_INVALID_ARG_VALUE";
+    return nodeErrToString(e, "ERR_INVALID_ARG_VALUE");
+  }
+  // internal/errors.js ERR_OUT_OF_RANGE. The received value gets `_` numeric
+  // separators once |input| > 2**32 (2n**32n for bigint) — several buffer/fs
+  // range tests compare that formatting verbatim.
+  function nodeRangeError(str, range, input, replaceDefaultBoolean) {
+    let msg = replaceDefaultBoolean ? str : 'The value of "' + str + '" is out of range.';
+    let received;
+    if (Number.isInteger(input) && Math.abs(input) > 2 ** 32) {
+      received = addNumericalSeparator(String(input));
+    } else if (typeof input === "bigint") {
+      received = String(input);
+      if (input > 2n ** 32n || input < -(2n ** 32n)) received = addNumericalSeparator(received);
+      received += "n";
+    } else {
+      try { received = util.inspect(input); } catch (e) { received = String(input); }
+    }
+    msg += " It must be " + range + ". Received " + received;
+    const e = new RangeError(msg);
+    e.code = "ERR_OUT_OF_RANGE";
+    return nodeErrToString(e, "ERR_OUT_OF_RANGE");
+  }
+  // internal/errors.js addNumericalSeparator (distinct from inspect.js's
+  // addNumericSeparator below: no fractional handling, used for range text).
+  function addNumericalSeparator(val) {
+    let res = "";
+    let i = val.length;
+    const start = val[0] === "-" ? 1 : 0;
+    for (; i >= start + 4; i -= 3) res = "_" + val.slice(i - 3, i) + res;
+    return val.slice(0, i) + res;
+  }
+  // One shared surface so later builtins partitions stop hand-rolling their own
+  // (divergent) copies of node's error factories.
+  G.__mbunNodeErrors = {
+    determineSpecificType,
+    formatList: nodeFormatList,
+    addNumericalSeparator,
+    ERR_INVALID_ARG_TYPE: nodeArgTypeError,
+    ERR_INVALID_ARG_VALUE: nodeArgValueError,
+    ERR_OUT_OF_RANGE: nodeRangeError,
+  };
+  // internal/util/inspect.js addNumericSeparator / addNumericSeparatorEnd.
+  const addNumericSeparator = (s) => {
+    let result = "";
+    let i = s.length;
+    const start = s[0] === "-" ? 1 : 0;
+    for (; i >= start + 4; i -= 3) result = "_" + s.slice(i - 3, i) + result;
+    return i === s.length ? s : s.slice(0, i) + result;
+  };
+  const addNumericSeparatorEnd = (s) => {
+    let result = "";
+    let i = 0;
+    for (; i < s.length - 3; i += 3) result += s.slice(i, i + 3) + "_";
+    return i === 0 ? s : result + s.slice(i);
+  };
+  // internal/util/inspect.js formatNumber / formatBigInt.
+  const fmtNumberSep = (number, numericSeparator) => {
+    if (!numericSeparator) return Object.is(number, -0) ? "-0" : String(number);
+    const numberString = String(number);
+    const integer = Math.trunc(number);
+    if (integer === number) {
+      if (!Number.isFinite(number) || numberString.includes("e")) return numberString;
+      return addNumericSeparator(numberString);
+    }
+    if (Number.isNaN(number)) return numberString;
+    const decimalIndex = numberString.indexOf(".");
+    return addNumericSeparator(numberString.slice(0, decimalIndex)) + "." +
+      addNumericSeparatorEnd(numberString.slice(decimalIndex + 1));
+  };
+  const fmtBigIntSep = (v, numericSeparator) => {
+    const s = String(v);
+    return (numericSeparator ? addNumericSeparator(s) : s) + "n";
+  };
+  const fmtNumber = (n) => (Object.is(n, -0) ? "-0" : String(n));
+  function hasBuiltInToString(value) {
+    let hasOwnToString = Object.prototype.hasOwnProperty;
+    let hasOwnToPrimitive = Object.prototype.hasOwnProperty;
+    const returnFalse = () => false;
+    if (typeof value.toString !== "function") {
+      if (typeof value[Symbol.toPrimitive] !== "function") return true;
+      if (Object.prototype.hasOwnProperty.call(value, Symbol.toPrimitive)) return false;
+      hasOwnToString = returnFalse;
+    } else if (Object.prototype.hasOwnProperty.call(value, "toString")) {
+      return false;
+    } else if (typeof value[Symbol.toPrimitive] !== "function") {
+      hasOwnToPrimitive = returnFalse;
+    } else if (Object.prototype.hasOwnProperty.call(value, Symbol.toPrimitive)) {
+      return false;
+    }
+    let pointer = value;
+    do {
+      pointer = Object.getPrototypeOf(pointer);
+      if (pointer === null) return true;
+    } while (!hasOwnToString.call(pointer, "toString") && !hasOwnToPrimitive.call(pointer, Symbol.toPrimitive));
+    const descriptor = Object.getOwnPropertyDescriptor(pointer, "constructor");
+    return descriptor !== undefined && typeof descriptor.value === "function" &&
+      kBuiltInToStringOwners.has(descriptor.value.name);
+  }
+  function formatSpecifier(m, v, io) {
+    const insp = (x, extra) => util.inspect(x, (io && extra) ? Object.assign({}, io, extra) : (extra || io));
+    // node formatNumberNoColor/formatBigIntNoColor:
+    // `options?.numericSeparator ?? inspectDefaultOptions.numericSeparator`.
+    const sep = (io && io.numericSeparator !== undefined) ? io.numericSeparator : gInspectDefaultsStore.numericSeparator;
+    switch (m) {
+      case "%d":
+        if (typeof v === "bigint") return fmtBigIntSep(v, sep);
+        if (typeof v === "symbol") return "NaN";
+        return fmtNumberSep(Number(v), sep);
+      case "%i":
+        if (typeof v === "bigint") return fmtBigIntSep(v, sep);
+        if (typeof v === "symbol") return "NaN";
+        return fmtNumberSep(parseInt(v), sep);
+      case "%f":
+        if (typeof v === "symbol") return "NaN";
+        return fmtNumberSep(parseFloat(v), sep);
+      case "%j": {
+        let r;
+        try { r = JSON.stringify(v); } catch (e) { return "[Circular]"; }
+        return r === undefined ? "undefined" : r;
+      }
+      case "%c": return "";
+      case "%s":
+        if (typeof v === "number") return fmtNumberSep(v, sep);
+        if (typeof v === "bigint") return fmtBigIntSep(v, sep);
+        if (typeof v !== "object" || v === null) return String(v);
+        { let builtIn; try { builtIn = hasBuiltInToString(v); } catch (e) { builtIn = true; }
+          return builtIn ? insp(v, { depth: 0, colors: false, compact: 3 }) : String(v); }
+      case "%o": return insp(v, { showHidden: true, showProxy: true, depth: 4 });
+      default: return insp(v);   // %O
+    }
+  }
   // Lazily created by util.aborted(); one registry serves every call.
   let utilAbortedRegistry = null;
+  // node internal/util.js `codesWarned`: a deprecation code warns once per
+  // process, no matter how many wrappers were created with it.
+  const deprecationCodesWarned = new Set();
   const util = {
-    inspect(o, opts) { try { return inspectValue(o, opts, null, 0); } catch (e) { if (e && e.__inspectRethrow) throw e.__inspectOriginal; return String(o); } },
+    inspect(o, opts) {
+      // util.inspect.defaultOptions overrides only when something has actually
+      // written to it: `gInspectDefaultsDirty` is one boolean read on the hot
+      // path, and the merge allocates nothing until a caller opts in.
+      if (gInspectDefaultsDirty) opts = Object.assign({}, gInspectDefaults, opts);
+      try { return inspectValue(o, opts, null, 0); } catch (e) { if (e && e.__inspectRethrow) throw e.__inspectOriginal; return String(o); }
+    },
     format(f, ...a) {
+      // node formatWithOptionsInternal walks `args`, so no arguments at all is
+      // the empty string — not the inspection of a missing first argument.
+      if (arguments.length === 0) return "";
       const fmtArg = (x) => typeof x === "string" ? x : util.inspect(x);
       if (typeof f !== "string") return [f, ...a].map(fmtArg).join(" ");
       let i = 0;
       let s = f.replace(/%[sdifjoOc%]/g, (m) => { if (m === "%%") return "%"; if (i >= a.length) return m;
-        const v = a[i++];
-        if (m === "%d" || m === "%i") return typeof v === "bigint" ? String(v) + "n" : String(Math.trunc(Number(v)));
-        if (m === "%f") return String(parseFloat(v));
-        if (m === "%j") { try { return JSON.stringify(v); } catch (e) { return "[Circular]"; } }
-        if (m === "%c") return "";
-        if (m === "%s") return typeof v === "string" ? v : (typeof v === "bigint" ? String(v) + "n" : (v !== null && typeof v === "object" ? util.inspect(v, { depth: 0 }) : String(v)));
-        return util.inspect(v); });
+        return formatSpecifier(m, a[i++], undefined); });
       for (; i < a.length; i++) s += " " + fmtArg(a[i]);
       return s;
     },
@@ -921,21 +1290,14 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     // caller's inspect options (colors/depth/...) into every %o/%O/%s-object and
     // trailing-arg inspection. ref: node lib/internal/util/inspect.js formatWithOptions.
     formatWithOptions(inspectOptions, f, ...a) {
+      if (arguments.length <= 1) return "";
       const io = (inspectOptions && typeof inspectOptions === "object") ? inspectOptions : {};
       const insp = (x, extra) => util.inspect(x, extra ? Object.assign({}, io, extra) : io);
       const fmtArg = (x) => typeof x === "string" ? x : insp(x);
       if (typeof f !== "string") return [f, ...a].map(fmtArg).join(" ");
       let i = 0;
       let s = f.replace(/%[sdifjoOc%]/g, (m) => { if (m === "%%") return "%"; if (i >= a.length) return m;
-        const v = a[i++];
-        if (m === "%d" || m === "%i") return typeof v === "bigint" ? String(v) + "n" : String(Math.trunc(Number(v)));
-        if (m === "%f") return String(parseFloat(v));
-        if (m === "%j") { try { return JSON.stringify(v); } catch (e) { return "[Circular]"; } }
-        if (m === "%c") return "";
-        if (m === "%s") return typeof v === "string" ? v : (typeof v === "bigint" ? String(v) + "n" : (v !== null && typeof v === "object" ? insp(v, { depth: 0 }) : String(v)));
-        if (m === "%o") return insp(v, { showHidden: true, showProxy: true, depth: 4 });
-        if (m === "%O") return insp(v);
-        return insp(v); });
+        return formatSpecifier(m, a[i++], io); });
       for (; i < a.length; i++) s += " " + fmtArg(a[i]);
       return s;
     },
@@ -961,15 +1323,112 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       }
       const p = function (...a) { return new Promise((res, rej) => { fn.call(this, ...a, (e, v) => (e ? rej(e) : res(v))); }); };
       Object.defineProperty(p, kCustom, { value: p, enumerable: false, writable: false, configurable: true });
+      // node promisify() copies `original`'s prototype and own descriptors onto
+      // the wrapper, so `name` / `length` and any decoration survive.
+      try {
+        Object.setPrototypeOf(p, Object.getPrototypeOf(fn));
+        Object.defineProperties(p, Object.getOwnPropertyDescriptors(fn));
+      } catch (e) {}
       return p;
     },
-    callbackify(fn) { return function (...a) { const cb = a.pop(); const self = this; fn.apply(this, a).then((v) => cb.call(self, null, v), (e) => cb.call(self, e)); }; },
-    inherits(ctor, sup) { ctor.super_ = sup; Object.setPrototypeOf(ctor.prototype, sup.prototype); },
-    deprecate(fn) { return fn; },
+    // node lib/util.js callbackify: the wrapper carries `original`'s own property
+    // descriptors with `length` bumped by one (the callback) and `name` suffixed
+    // "Callbackified", and the callback is invoked on nextTick.
+    callbackify(fn) {
+      if (typeof fn !== "function") throw nodeArgTypeError("original", "function", fn);
+      function callbackified(...a) {
+        const maybeCb = a.pop();
+        if (typeof maybeCb !== "function") throw nodeArgTypeError("last argument", "function", maybeCb);
+        const cb = maybeCb.bind(this);
+        const tick = (G.process && G.process.nextTick) ? G.process.nextTick.bind(G.process) : (f, ...r) => G.queueMicrotask(() => f(...r));
+        fn.apply(this, a).then(
+          (ret) => tick(cb, null, ret),
+          (rej) => tick(() => {
+            // node callbackifyOnRejected: a falsy rejection reason cannot be
+            // reported as an error, so it is wrapped in one carrying `.reason`.
+            if (!rej) {
+              const err = new Error("Promise was rejected with falsy value");
+              err.reason = rej; err.code = "ERR_FALSY_VALUE_REJECTION";
+              cb(err);
+            } else cb(rej);
+          }));
+      }
+      const descriptors = Object.getOwnPropertyDescriptors(fn);
+      if (descriptors.length && typeof descriptors.length.value === "number") descriptors.length.value++;
+      if (descriptors.name && typeof descriptors.name.value === "string") descriptors.name.value += "Callbackified";
+      try { Object.defineProperties(callbackified, descriptors); } catch (e) {}
+      return callbackified;
+    },
+    // node lib/util.js inherits: `super_` is writable + configurable but NOT
+    // enumerable (test-util-inherits reads the descriptor back).
+    inherits(ctor, sup) {
+      if (ctor === undefined || ctor === null) throw nodeArgTypeError("ctor", "function", ctor);
+      if (sup === undefined || sup === null) throw nodeArgTypeError("superCtor", "function", sup);
+      if (sup.prototype === undefined) throw nodeArgTypeError("superCtor.prototype", "object", sup.prototype);
+      Object.defineProperty(ctor, "super_", { value: sup, writable: true, configurable: true, enumerable: false });
+      Object.setPrototypeOf(ctor.prototype, sup.prototype);
+    },
+    // node internal/util.js deprecate: the wrapper emits the deprecation warning
+    // once (unless process.noDeprecation), keeps `fn`'s prototype chain and
+    // `length`, and validates `code` as a string.
+    deprecate(fn, msg, code, options) {
+      if (code !== undefined && typeof code !== "string") throw nodeArgTypeError("code", "string", code);
+      // node lib/util.js: `deprecate(fn, msg, code, { modifyPrototype })`.
+      const modifyPrototype = !(options != null && typeof options === "object" && options.modifyPrototype === false);
+      let warned = false;
+      function deprecated(...args) {
+        if (!(G.process && G.process.noDeprecation)) {
+          if (!warned) {
+            warned = true;
+            if (G.process && typeof G.process.emitWarning === "function") {
+              // node internal/util.js getDeprecationWarningEmitter dedupes on
+              // `code` PROCESS-WIDE, so two wrappers sharing one code warn once.
+              if (code !== undefined) {
+                if (!deprecationCodesWarned.has(code)) {
+                  deprecationCodesWarned.add(code);
+                  G.process.emitWarning(msg, "DeprecationWarning", code, deprecated);
+                }
+              } else G.process.emitWarning(msg, "DeprecationWarning", deprecated);
+            }
+          }
+        }
+        if (new.target) return Reflect.construct(fn, args, new.target);
+        return Reflect.apply(fn, this, args);
+      }
+      if (modifyPrototype) {
+        try {
+          Object.setPrototypeOf(deprecated, fn);
+          if (fn.prototype) deprecated.prototype = fn.prototype;
+          const d = Object.getOwnPropertyDescriptor(fn, "length");
+          if (d) Object.defineProperty(deprecated, "length", d);
+        } catch (e) {}
+      }
+      return deprecated;
+    },
+    // node internal/util.js convertProcessSignalToExitCode: POSIX 128 + signo.
+    convertProcessSignalToExitCode(signalCode) {
+      const signals = (M["os"] && M["os"].constants && M["os"].constants.signals) || {};
+      const names = Object.keys(signals);
+      if (typeof signalCode !== "string" || !Object.prototype.hasOwnProperty.call(signals, signalCode)) {
+        let received;
+        try { received = util.inspect(signalCode); } catch (e) { received = String(signalCode); }
+        const e = new TypeError("The argument 'signalCode' must be one of: " +
+          names.map((n) => "'" + n + "'").join(", ") + ". Received " + received);
+        e.code = "ERR_INVALID_ARG_VALUE"; throw e;
+      }
+      return 128 + signals[signalCode];
+    },
     getSystemErrorName(errno) { const m = { "-1": "EPERM", "-2": "ENOENT", "-3": "ESRCH", "-4": "EINTR", "-5": "EIO", "-9": "EBADF", "-11": "EAGAIN", "-12": "ENOMEM", "-13": "EACCES", "-14": "EFAULT", "-16": "EBUSY", "-17": "EEXIST", "-20": "ENOTDIR", "-21": "EISDIR", "-22": "EINVAL", "-23": "ENFILE", "-24": "EMFILE", "-28": "ENOSPC", "-32": "EPIPE", "-36": "ENAMETOOLONG", "-39": "ENOTEMPTY", "-40": "ELOOP", "-95": "ENOTSUP", "-98": "EADDRINUSE", "-99": "EADDRNOTAVAIL", "-100": "ENETDOWN", "-101": "ENETUNREACH", "-103": "ECONNABORTED", "-104": "ECONNRESET", "-107": "ENOTCONN", "-110": "ETIMEDOUT", "-111": "ECONNREFUSED", "-113": "EHOSTUNREACH", "-125": "ECANCELED" }; return m[String(errno)] || ("Unknown system error " + errno); },
     getSystemErrorMap() { return new Map(); },
     toUSVString(s) { return String(s); },
-    stripVTControlCharacters(s) { return String(s).replace(/\x1b\[[0-9;]*m/g, ""); },
+    // node internal/util/inspect.js stripVTControlCharacters over chalk's
+    // ansi-regex: the old `\x1b\[[0-9;]*m` only matched SGR colour sequences, so
+    // cursor/tab/clear sequences and OSC-8 hyperlinks survived.
+    stripVTControlCharacters(s) {
+      if (typeof s !== "string") throw nodeArgTypeError("str", "string", s);
+      if (s.indexOf("\u001B") === -1 && s.indexOf("\u009B") === -1) return s;
+      return s.replace(kAnsiRe, "");
+    },
     debuglog() { return () => {}; }, debug() { return () => {}; },
     _extend(a, b) { return Object.assign(a, b); },
     // util.aborted(signal, resource): a promise that settles when `signal`
@@ -1316,6 +1775,23 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   }
   util.MIMEType = MIMEType; util.MIMEParams = MIMEParams;
   util.inspect.custom = kInspectCustom;
+  // node defines defaultOptions as an accessor: the setter validates and
+  // Object.assigns into the shared defaults rather than replacing them.
+  Object.defineProperty(util.inspect, "defaultOptions", {
+    get() { return gInspectDefaults; },
+    set(options) {
+      if (options === null || typeof options !== "object" || Array.isArray(options)) {
+        const e = new TypeError('The "options" argument must be of type object. Received ' +
+          (options === null ? "null" : Array.isArray(options) ? "an instance of Array" : "type " + typeof options));
+        e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+      }
+      for (const k of Object.keys(options)) {
+        if (k in gInspectDefaultsStore) gInspectDefaults[k] = options[k];
+      }
+      return gInspectDefaults;
+    },
+    enumerable: true, configurable: true,
+  });
   G.MIMEType = MIMEType; G.MIMEParams = MIMEParams;
   // util.promisify.custom is the shared symbol Symbol.for("nodejs.util.promisify.custom").
   Object.defineProperty(util.promisify, "custom", { value: Symbol.for("nodejs.util.promisify.custom"), enumerable: false, writable: false, configurable: true });
@@ -1392,7 +1868,17 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     const validateBoolean = (value, name) => { if (typeof value !== "boolean") throw ERR_INVALID_ARG_TYPE(name, "boolean", value); };
     class AbortError extends Error { constructor(message = "The operation was aborted.", options = undefined) { if (options !== undefined && typeof options !== "object") throw ERR_INVALID_ARG_TYPE("options", "Object", options); super(message, options); this.code = "ABORT_ERR"; this.name = "AbortError"; } }
 
+    // node lib/events.js: the constructor does nothing itself, it defers to the
+    // REPLACEABLE `EventEmitter.init`. That indirection is the documented seam
+    // node:domain patches (`const eventInit = EventEmitter.init; EventEmitter.init
+    // = function (opts) { …stamp this.domain…; return eventInit.call(this, opts); }`),
+    // so it has to be a dynamic lookup — `init` used to alias the constructor
+    // itself, which made the override unreachable and left every emitter without
+    // the domain it was created in.
     function EventEmitter(opts) {
+      EventEmitter.init.call(this, opts);
+    }
+    function eventInit(opts) {
       if (this._events === undefined || this._events === Object.getPrototypeOf(this)._events) {
         this._events = { __proto__: null };
         this._eventsCount = 0;
@@ -1416,12 +1902,19 @@ inline constexpr char kBootstrapJS_[] = R"JS(
 
     function emitError(emitter, args) {
       const events = emitter._events;
-      args[0] ??= new Error("Unhandled error.");
-      if (!events) throw args[0];
+      // node substitutes a synthetic error ONLY on the no-listener throw path
+      // (lib/events.js: `throw new ERR_UNHANDLED_ERROR(...)`). A registered
+      // 'error' listener receives the emitted value verbatim, `null` and
+      // `undefined` included — overwriting args[0] up front handed the listener
+      // an "Unhandled error." Error instead, which node:domain then reported as
+      // the thrown value (test-domain-multiple-errors / -error-types emit every
+      // primitive and assert identity).
+      const unhandled = () => args[0] ?? new Error("Unhandled error.");
+      if (!events) throw unhandled();
       const errorMonitor = events[kErrorMonitor];
       if (errorMonitor) for (const handler of errorMonitor.slice()) handler.apply(emitter, args);
       const handlers = events.error;
-      if (!handlers) throw args[0];
+      if (!handlers) throw unhandled();
       for (const handler of handlers.slice()) handler.apply(emitter, args);
       return true;
     }
@@ -1625,6 +2118,24 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     }
     function listenerCount(emitter, type) {
       if (typeof emitter.listenerCount === "function") return emitter.listenerCount(type);
+      // node's events.listenerCount also works on an EventTarget -- its
+      // EventEmitter.prototype.listenerCount reaches into the target's own
+      // listener list. mbun's EventTarget-shaped objects (AbortSignal) keep
+      // theirs in `_l`, which the EventEmitter path cannot see, so
+      // `listenerCount(signal, 'abort')` read 0 no matter how many
+      // addEventListener('abort') calls had been made. The corpus asserts that
+      // count directly (test-http{,s}-agent-abort-controller).
+      if (emitter && typeof emitter.addEventListener === "function" && Array.isArray(emitter._l))
+        return type === "abort" ? emitter._l.length : 0;
+      // The general EventTarget (node_process_extra) keeps its listeners in a
+      // Map behind a private symbol; its non-enumerable `listeners(type)` hook
+      // is the same introspection door getEventListeners() uses. node reads
+      // `target[kEvents].get(type).size` here, and the corpus asserts the count
+      // on a plain `new EventTarget()` passed as an options.signal
+      // (test-child-process-fork-timeout-kill-signal).
+      if (emitter && typeof emitter.addEventListener === "function" && typeof emitter.listeners === "function") {
+        try { return emitter.listeners(type).length; } catch (e) { /* not an EventTarget */ }
+      }
       return EventEmitterPrototype.listenerCount.call(emitter, type);
     }
 
@@ -1648,7 +2159,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       emit(...args) { return this.asyncResource.runInAsyncScope(() => EventEmitterPrototype.emit.apply(this, args)); }
       emitDestroy() { this.asyncResource.emitDestroy(); }
     }
-    Object.assign(EventEmitter, { once, on, getEventListeners, getMaxListeners, setMaxListeners, EventEmitter, EventEmitterAsyncResource, usingDomains: false, captureRejectionSymbol, errorMonitor: kErrorMonitor, addAbortListener, init: EventEmitter, listenerCount });
+    Object.assign(EventEmitter, { once, on, getEventListeners, getMaxListeners, setMaxListeners, EventEmitter, EventEmitterAsyncResource, usingDomains: false, captureRejectionSymbol, errorMonitor: kErrorMonitor, addAbortListener, init: eventInit, listenerCount });
     return EventEmitter;
   })();
   def(["events"], EventEmitter);
@@ -1790,7 +2301,15 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     // an EventEmitter surface in. ref: regression 26411.
     for (const name of ["stdout", "stderr"]) {
       const strm = G.process[name];
-      if (!strm || typeof strm.on === "function") continue;
+      if (!strm) continue;
+      // node's process.stdout/.stderr are Socket/WriteStream/SyncWriteStream and
+      // ALL of them carry the numeric descriptor. internal/child_process
+      // getValidStdio() dispatches on exactly that (`typeof stdio.fd ===
+      // 'number'` → a 'fd' stdio slot), so without it passing process.stdout in
+      // a stdio array fell through to "invalid stdio option"
+      // (test-child-process-validate-stdio). process.stdin already exposes 0.
+      if (typeof strm.fd !== "number") { try { strm.fd = name === "stdout" ? 1 : 2; } catch (e) {} }
+      if (typeof strm.on === "function") continue;
       const ee = new EventEmitter();
       for (const k of ["on", "addListener", "prependListener", "once", "off", "removeListener",
                        "removeAllListeners", "emit", "listeners", "listenerCount",
@@ -1823,6 +2342,10 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     // WTF::URLParser::{parseURLEncodedForm,serialize}.  URLSearchParams uses
     // application/x-www-form-urlencoded, not encodeURIComponent's encode set.
     const toUSVString = (value) => {
+      // node converts through `${value}`, which rejects symbols. JSC's own
+      // message ("Cannot convert a symbol to a string") differs from V8's, and
+      // test-whatwg-url-custom-searchparams-* match V8's wording exactly.
+      if (typeof value === "symbol") throw new TypeError("Cannot convert a Symbol value to a string");
       const input = String(value); let out = "";
       for (let i = 0; i < input.length; i++) {
         const code = input.charCodeAt(i);
@@ -1878,65 +2401,132 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     const formEncode = (value) => encodeURIComponent(toUSVString(value))
       .replace(/%20/g, "+")
       .replace(/[!'()~]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase());
-    const missingArgs = (name, required, actual) => {
-      if (actual >= required) return;
-      throw new TypeError(`${name} requires at least ${required} argument${required === 1 ? "" : "s"}`);
+    // node lib/internal/url.js throws typed errors from every URLSearchParams
+    // entry point: a Web IDL brand check (ERR_INVALID_THIS), an arity check
+    // (ERR_MISSING_ARGS) and the two constructor conversion failures
+    // (ERR_ARG_NOT_ITERABLE / ERR_INVALID_TUPLE). The messages are asserted
+    // verbatim by test-whatwg-url-custom-searchparams-*.
+    const spErr = (code, message) => { const e = new TypeError(message); e.code = code; return e; };
+    const missingArgs = (...names) =>
+      spErr("ERR_MISSING_ARGS", `The ${names.map((n) => `"${n}"`).join(" and ")} argument${names.length === 1 ? "" : "s"} must be specified`);
+    const invalidTuple = () => spErr("ERR_INVALID_TUPLE", "Each query pair must be an iterable [name, value] tuple");
+    // node lib/internal/url.js createSearchParamsIterator: keys()/values()/
+    // entries() return a distinct URLSearchParamsIterator, not a bare Array
+    // iterator. It brand-checks `this` on `next` (ERR_INVALID_THIS naming
+    // URLSearchParamsIterator, a different type name from URLSearchParams),
+    // carries the "URLSearchParams Iterator" toStringTag, and is LIVE over the
+    // parameter list rather than a snapshot of it.
+    const kSPIterTarget = Symbol("SearchParamsIteratorTarget");
+    const kSPIterKind = Symbol("SearchParamsIteratorKind");
+    const kSPIterIndex = Symbol("SearchParamsIteratorIndex");
+    const spIterProto = Object.create(
+      Object.getPrototypeOf(Object.getPrototypeOf([][Symbol.iterator]())));
+    Object.defineProperty(spIterProto, "next", {
+      configurable: true, writable: true,
+      value: function next() {
+        if (this === null || (typeof this !== "object" && typeof this !== "function") ||
+            !(kSPIterTarget in this))
+          throw spErr("ERR_INVALID_THIS", 'Value of "this" must be of type URLSearchParamsIterator');
+        const entries = this[kSPIterTarget]._e;
+        const index = this[kSPIterIndex];
+        if (index >= entries.length) return { value: undefined, done: true };
+        this[kSPIterIndex] = index + 1;
+        const pair = entries[index];
+        const kind = this[kSPIterKind];
+        return { value: kind === "key" ? pair[0] : kind === "value" ? pair[1] : [pair[0], pair[1]],
+                 done: false };
+      },
+    });
+    Object.defineProperty(spIterProto, Symbol.toStringTag, {
+      configurable: true, value: "URLSearchParams Iterator",
+    });
+    const makeSPIter = (target, kind) => {
+      const it = Object.create(spIterProto);
+      it[kSPIterTarget] = target;
+      it[kSPIterKind] = kind;
+      it[kSPIterIndex] = 0;
+      return it;
     };
     G.URLSearchParams = class URLSearchParams {
+      #brand;
+      // Web IDL brand check: `#brand in o` is true only for objects that ran
+      // this constructor, so `params.get.call(undefined)` throws like node's.
+      static #check(o) { if (o === null || (typeof o !== "object" && typeof o !== "function") || !(#brand in o)) throw spErr("ERR_INVALID_THIS", 'Value of "this" must be of type URLSearchParams'); }
       constructor(init) {
         this._e = [];
-        if (typeof init === "string") {
-          let s = init[0] === "?" ? init.slice(1) : init;
-          if (s) for (const p of s.split("&")) {
-            if (!p) continue;
-            const i = p.indexOf("=");
-            this._e.push([formDecode(i < 0 ? p : p.slice(0, i)), formDecode(i < 0 ? "" : p.slice(i + 1))]);
+        if (init == null) return;
+        if (typeof init === "object" || typeof init === "function") {
+          const method = init[Symbol.iterator];
+          if (method != null) {
+            // sequence<sequence<USVString>>
+            if (typeof method !== "function") throw spErr("ERR_ARG_NOT_ITERABLE", "Query pairs must be iterable");
+            // Web IDL sequence conversion uses the object's actual iterator, even
+            // for a URLSearchParams instance whose Symbol.iterator was replaced.
+            for (const pair of init) {
+              if (pair == null) throw invalidTuple();
+              if (Array.isArray(pair)) {
+                if (pair.length !== 2) throw invalidTuple();
+                this._e.push([toUSVString(pair[0]), toUSVString(pair[1])]);
+                continue;
+              }
+              if ((typeof pair !== "object" && typeof pair !== "function") || typeof pair[Symbol.iterator] !== "function") throw invalidTuple();
+              const values = [];
+              for (const element of pair) values.push(toUSVString(element));
+              if (values.length !== 2) throw invalidTuple();
+              this._e.push(values);
+            }
+            return;
           }
-        } else if (init != null && typeof init[Symbol.iterator] === "function") {
-          // Web IDL sequence conversion uses the object's actual iterator, even
-          // for a URLSearchParams instance whose Symbol.iterator was replaced.
-          for (const pair of init) {
-            if (pair == null || typeof pair[Symbol.iterator] !== "function") throw new TypeError("Each query pair must be an iterable");
-            const values = Array.from(pair);
-            if (values.length !== 2) throw new TypeError("Each query pair must contain exactly two items");
-            this._e.push([toUSVString(values[0]), toUSVString(values[1])]);
-          }
-        } else if (init && typeof init === "object") {
-          // A live own-property walk preserves Web IDL's interleaved Get/value
-          // conversion: deleting a later property while stringifying an earlier
+          // record<USVString, USVString>: own keys (symbols included, so a
+          // symbol key surfaces as the same TypeError node reports), taken
+          // live so deleting a later property while stringifying an earlier
           // value prevents the deleted property from becoming a pair.
-          for (const key in init) {
-            if (!Object.prototype.propertyIsEnumerable.call(init, key)) continue;
+          for (const key of Reflect.ownKeys(init)) {
+            const desc = Reflect.getOwnPropertyDescriptor(init, key);
+            if (desc === undefined || !desc.enumerable) continue;
             this._e.push([toUSVString(key), toUSVString(init[key])]);
           }
+          return;
+        }
+        const str = toUSVString(init);
+        let s = str[0] === "?" ? str.slice(1) : str;
+        if (s) for (const p of s.split("&")) {
+          if (!p) continue;
+          const i = p.indexOf("=");
+          this._e.push([formDecode(i < 0 ? p : p.slice(0, i)), formDecode(i < 0 ? "" : p.slice(i + 1))]);
         }
       }
       _updateURL() { if (this._url) { this._url._search = this._e.length ? "?" + this.toString() : ""; this._url._queryPresent = this._e.length !== 0; } }
-      append(k, v) { missingArgs("URLSearchParams.append", 2, arguments.length); this._e.push([toUSVString(k), toUSVString(v)]); this._updateURL(); }
+      append(k, v) { URLSearchParams.#check(this); if (arguments.length < 2) throw missingArgs("name", "value"); this._e.push([toUSVString(k), toUSVString(v)]); this._updateURL(); }
       set(k, v) {
-        missingArgs("URLSearchParams.set", 2, arguments.length); k = toUSVString(k); v = toUSVString(v);
+        URLSearchParams.#check(this); if (arguments.length < 2) throw missingArgs("name", "value");
+        k = toUSVString(k); v = toUSVString(v);
         const first = this._e.findIndex((x) => x[0] === k);
         if (first < 0) this._e.push([k, v]);
         else { this._e[first][1] = v; this._e = this._e.filter((x, i) => i === first || x[0] !== k); }
         this._updateURL();
       }
-      get(k) { missingArgs("URLSearchParams.get", 1, arguments.length); const e = this._e.find((x) => x[0] === toUSVString(k)); return e ? e[1] : null; }
-      getAll(k) { missingArgs("URLSearchParams.getAll", 1, arguments.length); k = toUSVString(k); return this._e.filter((x) => x[0] === k).map((x) => x[1]); }
-      has(k, v) { missingArgs("URLSearchParams.has", 1, arguments.length); k = toUSVString(k); return (arguments.length < 2 || v === undefined) ? this._e.some((x) => x[0] === k) : this._e.some((x) => x[0] === k && x[1] === toUSVString(v)); }
-      delete(k, v) { missingArgs("URLSearchParams.delete", 1, arguments.length); k = toUSVString(k); this._e = this._e.filter((x) => (arguments.length < 2 || v === undefined) ? x[0] !== k : !(x[0] === k && x[1] === toUSVString(v))); this._updateURL(); }
-      forEach(cb, t) { missingArgs("URLSearchParams.forEach", 1, arguments.length); for (let i = 0; i < this._e.length; i++) { const [k, v] = this._e[i]; cb.call(t, v, k, this); } }
-      keys() { return this._e.map((x) => x[0])[Symbol.iterator](); }
-      values() { return this._e.map((x) => x[1])[Symbol.iterator](); }
-      entries() { return this._e.map((x) => [x[0], x[1]])[Symbol.iterator](); }
+      get(k) { URLSearchParams.#check(this); if (arguments.length < 1) throw missingArgs("name"); k = toUSVString(k); const e = this._e.find((x) => x[0] === k); return e ? e[1] : null; }
+      getAll(k) { URLSearchParams.#check(this); if (arguments.length < 1) throw missingArgs("name"); k = toUSVString(k); return this._e.filter((x) => x[0] === k).map((x) => x[1]); }
+      has(k, v) { URLSearchParams.#check(this); if (arguments.length < 1) throw missingArgs("name"); k = toUSVString(k); return (arguments.length < 2 || v === undefined) ? this._e.some((x) => x[0] === k) : this._e.some((x) => x[0] === k && x[1] === toUSVString(v)); }
+      delete(k, v) { URLSearchParams.#check(this); if (arguments.length < 1) throw missingArgs("name"); k = toUSVString(k); this._e = this._e.filter((x) => (arguments.length < 2 || v === undefined) ? x[0] !== k : !(x[0] === k && x[1] === toUSVString(v))); this._updateURL(); }
+      forEach(cb, t) { URLSearchParams.#check(this); if (arguments.length < 1) throw missingArgs("callback"); for (let i = 0; i < this._e.length; i++) { const [k, v] = this._e[i]; cb.call(t, v, k, this); } }
+      keys() { URLSearchParams.#check(this); return makeSPIter(this, "key"); }
+      values() { URLSearchParams.#check(this); return makeSPIter(this, "value"); }
+      entries() { URLSearchParams.#check(this); return makeSPIter(this, "key+value"); }
       [Symbol.iterator]() { return this.entries(); }
-      sort() { this._e.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)); this._updateURL(); }
-      get size() { return this._e.length; }
+      sort() { URLSearchParams.#check(this); this._e.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)); this._updateURL(); }
+      get size() { URLSearchParams.#check(this); return this._e.length; }
       get length() { return this._e.length; }
       toJSON() { const out = {}; for (const [k, v] of this._e) { if (Object.prototype.hasOwnProperty.call(out, k)) { if (Array.isArray(out[k])) out[k].push(v); else out[k] = [out[k], v]; } else out[k] = v; } return out; }
       toString() { return this._e.map(([k, v]) => formEncode(k) + "=" + formEncode(v)).join("&"); }
       [Symbol.for("nodejs.util.inspect.custom")]() { return inspectURLSearchParams(this, false); }
     };
     Object.defineProperty(G.URLSearchParams.prototype, "size", { get: Object.getOwnPropertyDescriptor(G.URLSearchParams.prototype, "size").get, enumerable: true, configurable: true });
+    // Web IDL interfaces carry a non-enumerable, non-writable, configurable
+    // Symbol.toStringTag data property, so Object.prototype.toString.call(sp)
+    // reports "[object URLSearchParams]" (test-whatwg-url-custom-tostringtag).
+    Object.defineProperty(G.URLSearchParams.prototype, Symbol.toStringTag, { value: "URLSearchParams", writable: false, enumerable: false, configurable: true });
   }
   if (typeof G.URL === "undefined" || typeof new G.URL("http://x/").hostname === "undefined") {
     // ref: bun src/jsc/bindings/{DOMURL,URLDecomposition}.cpp and the
@@ -2179,7 +2769,19 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       set search(v) { const s = String(v), query = s.startsWith("?") ? s.slice(1) : s; this._queryPresent = s !== ""; this._search = s === "" ? "" : "?" + encodeQuery(query, !!specialProtocols[this._protocol]); const next = new G.URLSearchParams(query); this.searchParams._e = next._e; }
       get _authority() { const credentials = this._username || this._password ? this._username + (this._password ? ":" + this._password : "") + "@" : ""; return credentials + this.host; }
       get href() { return this._protocol + (this._hasAuthority || this._protocol === "file:" ? "//" + this._authority : "") + this._pathname + (this._queryPresent ? this._search : "") + this._hash; }
-      set href(v) { this._parse(String(v)); }
+      // node's href setter is atomic: an unparseable value throws and leaves the
+      // URL untouched (test-whatwg-url-custom-href-side-effect deepStrictEquals
+      // the object afterwards). Parse into a throwaway URL first, then adopt its
+      // state — _parse mutates field-by-field and would leave a half-written URL.
+      set href(v) {
+        const next = new G.URL(String(v));
+        this._protocol = next._protocol; this._username = next._username; this._password = next._password;
+        this._hostname = next._hostname; this._port = next._port; this._pathname = next._pathname;
+        this._search = next._search; this._hash = next._hash; this._queryPresent = next._queryPresent;
+        this._opaque = next._opaque; this._hasAuthority = next._hasAuthority;
+        if (this.searchParams) this.searchParams._e = next.searchParams._e;
+        else { this.searchParams = next.searchParams; Object.defineProperty(this.searchParams, "_url", { value: this, writable: true, configurable: true }); }
+      }
       get origin() {
         if (this._protocol === "blob:") {
           try {
@@ -2324,7 +2926,13 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   def(["cluster"], Object.assign(new EventEmitter(), { isPrimary: true, isMaster: true, isWorker: false, workers: {}, settings: {}, schedulingPolicy: 2, fork: () => new EventEmitter(), setupPrimary() {}, setupMaster() {}, disconnect(cb) { if (cb) cb(); }, worker: null }));
   def(["inspector"], { open() { throw new Error("node:inspector is not yet implemented in Bun. Track the status & thumbs up the issue: https://github.com/oven-sh/bun/issues/2445"); }, close() { throw new Error("node:inspector is not yet implemented in Bun. Track the status & thumbs up the issue: https://github.com/oven-sh/bun/issues/2445"); }, url: () => undefined, waitForDebugger() { throw new Error("node:inspector is not yet implemented in Bun. Track the status & thumbs up the issue: https://github.com/oven-sh/bun/issues/2445"); }, console: G.console, Session: class Session extends EventEmitter { connect() {} disconnect() {} post(m, p, cb) { if (typeof p === "function") p(null, {}); else if (cb) cb(null, {}); } } });
   def(["trace_events"], { createTracing: () => ({ enable() {}, disable() {}, get enabled() { return false; }, categories: "" }), getEnabledCategories: () => undefined });
-  def(["wasi"], { WASI: class WASI { constructor(o) { this.wasiImport = {}; this._opts = o || {}; } start() { return 0; } initialize() {} getImportObject() { return { wasi_snapshot_preview1: this.wasiImport }; } } });
+  def(["wasi"], { WASI: class WASI { constructor(o) {
+    // Permission Model: node gates the WASI scope in WASI::New
+    // (src/node_wasi.cc) — a WASI instance can preopen host directories, so it
+    // is a filesystem capability in its own right.
+    const PN = G.__mbunPermissionNative;
+    if (PN && PN.enabled && !PN.has("wasi")) throw PN.denyError("wasi", "");
+    this.wasiImport = {}; this._opts = o || {}; } start() { return 0; } initialize() {} getImportObject() { return { wasi_snapshot_preview1: this.wasiImport }; } } });
   def(["repl"], { start: () => new EventEmitter(), REPLServer: class REPLServer extends EventEmitter {}, Recoverable: class Recoverable extends Error {}, writer: (v) => String(v), REPL_MODE_SLOPPY: 0, REPL_MODE_STRICT: 1 });
   def(["_stream_wrap"], { StreamWrap: class StreamWrap extends EventEmitter {} });
   def(["test/reporters"], { tap: function* () {}, spec: class Spec {}, dot: function* () {}, junit: function* () {}, lcov: class Lcov {} });
@@ -2735,7 +3343,10 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     if (input === null) return " Received null";
     if (input === undefined) return " Received undefined";
     const t = typeof input;
-    if (t === "function") return input.name ? " Received function " + input.name : " Received type function ([Function (anonymous)])";
+    // node's determineSpecificType has no anonymous-function special case: it is
+    // always `function ${value.name}`, so an anonymous one reads "function "
+    // (trailing space, empty name).
+    if (t === "function") return " Received function " + input.name;
     if (t === "object") { const c = input.constructor && input.constructor.name; return c ? " Received an instance of " + c : " Received [Object: null prototype] {}"; }
     let ins;
     if (t === "symbol") ins = input.toString();
@@ -2763,6 +3374,10 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   };
   const urlMod = {
     URL: G.URL, URLSearchParams: G.URLSearchParams, Url,
+    // node lib/url.js re-exports URLPattern. It is installed by the
+    // web_urlpattern partition, which runs long after bootstrap, so read it
+    // lazily off the global instead of snapshotting `undefined` here.
+    get URLPattern() { return G.URLPattern; },
     // faithful port of node lib/internal/url.js fileURLToPath / getPathFromURL{Win32,Posix}
     fileURLToPath: (path, options) => {
       const windows = options == null ? undefined : options.windows;
@@ -2881,6 +3496,11 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   const zToU8 = (d) => { if (typeof d === "string") return G.Buffer.from(d, "utf8"); if (d instanceof ArrayBuffer || (G.SharedArrayBuffer && d instanceof G.SharedArrayBuffer)) return new Uint8Array(d); if (ArrayBuffer.isView(d)) return new Uint8Array(d.buffer, d.byteOffset, d.byteLength); throw new TypeError("Received an instance of " + (d === null ? "null" : typeof d) + " where a buffer was expected"); };
   const zB64 = (u8) => { let s = ""; for (let i = 0; i < u8.length; i += 8192) s += String.fromCharCode.apply(null, u8.subarray(i, Math.min(i + 8192, u8.length))); return G.btoa(s); };
   const zErr = (e) => { const err = e instanceof Error ? e : new Error(String(e)); err.code = "Z_DATA_ERROR"; err.errno = -3; return err; };
+  // kMaxLength as captured by require('zlib') — see the module registration below.
+  let zKMaxSnap = null, zKMaxArmed = false;
+  const zKMaxLive = () => (M.buffer && typeof M.buffer.kMaxLength === "number" ? M.buffer.kMaxLength : 0x7fffffff);
+  const zKMax = () => (zKMaxSnap !== null ? zKMaxSnap : zKMaxLive());
+  try { Object.defineProperty(G, "__mbunZlibArmKMax", { value: () => { zKMaxArmed = true; }, enumerable: false, configurable: true }); } catch (e) {}
   const zNum = (opts, k, d) => opts && typeof opts[k] === "number" ? opts[k] : d;
   // node-style ERR_INVALID_ARG_TYPE builder (property vs argument by '.' in name).
   const zFmtRecv = (v) => { if (v === null) return "null"; if (v === undefined) return "undefined"; const t = typeof v; if (t === "string") { let s = v; if (s.length > 25) s = s.slice(0, 25) + "..."; return "type string ('" + s + "')"; } if (t === "number" || t === "boolean" || t === "bigint") return "type " + t + " (" + String(v) + ")"; if (t === "function") return v.name ? "function " + v.name : "an instance of Function"; if (t === "object") { const cn = v.constructor && v.constructor.name; return "an instance of " + (cn || "Object"); } return "type " + t; };
@@ -2890,25 +3510,38 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   const zEngine = (name) => { const C = (M["zlib"] || {})[name]; return C ? Object.create(C.prototype) : {}; };
   const zInfo = (out, opts, engName) => (opts && opts.info) ? { buffer: out, engine: zEngine(engName) } : out;
   // node enforces kMaxLength across ALL codecs (lib/zlib.js → ERR_BUFFER_TOO_LARGE).
-  const zCap = (out, opts) => { const maxLen = opts && typeof opts.maxOutputLength === "number" ? opts.maxOutputLength : (M.buffer && M.buffer.kMaxLength); if (maxLen && out.length > maxLen) { const e = new RangeError("Cannot create a Buffer larger than " + maxLen + " bytes"); e.code = "ERR_BUFFER_TOO_LARGE"; throw e; } return out; };
+  const zCap = (out, opts) => { const maxLen = opts && typeof opts.maxOutputLength === "number" ? opts.maxOutputLength : zKMax(); if (maxLen && out.length > maxLen) { const e = new RangeError("Cannot create a Buffer larger than " + maxLen + " bytes"); e.code = "ERR_BUFFER_TOO_LARGE"; throw e; } return out; };
   // Bytes cross as a Uint8Array, not base64: the base64 bridge cost ~6x the
   // payload in transient strings per crossing and a 150 MB deflateRawSync was
   // OOM-killed. ZN.compress/decompress answer a Uint8Array for a typed-array
   // input (base64 string in, base64 string out is still supported).
-  const zSync = (op, fmt, engName) => (data, opts) => { const level = zNum(opts, "level", -1), wbits = zNum(opts, "windowBits", 15), memLevel = zNum(opts, "memLevel", 8), strategy = zNum(opts, "strategy", 0); const inp = zToU8(data); let r; try { r = op === "c" ? ZN.compress(inp, fmt, level, wbits, memLevel, strategy) : ZN.decompress(inp, fmt, wbits); } catch (e) { throw zErr(e); } const out = typeof r === "string" ? G.Buffer.from(r, "base64") : G.Buffer.from(r.buffer, r.byteOffset, r.byteLength);const maxLen = opts && typeof opts.maxOutputLength === "number" ? opts.maxOutputLength : (M.buffer && M.buffer.kMaxLength); if (op === "d" && maxLen && out.length > maxLen) { const e = new RangeError("Cannot create a Buffer larger than " + maxLen + " bytes"); e.code = "ERR_BUFFER_TOO_LARGE"; throw e; } return zInfo(out, opts, engName); };
+  const zSync = (op, fmt, engName) => (data, opts) => { const level = zNum(opts, "level", -1), wbits = zNum(opts, "windowBits", 15), memLevel = zNum(opts, "memLevel", 8), strategy = zNum(opts, "strategy", 0); const inp = zToU8(data); let r; try { r = op === "c" ? ZN.compress(inp, fmt, level, wbits, memLevel, strategy) : ZN.decompress(inp, fmt, wbits); } catch (e) { throw zErr(e); } const out = typeof r === "string" ? G.Buffer.from(r, "base64") : G.Buffer.from(r.buffer, r.byteOffset, r.byteLength);const maxLen = opts && typeof opts.maxOutputLength === "number" ? opts.maxOutputLength : zKMax(); if (op === "d" && maxLen && out.length > maxLen) { const e = new RangeError("Cannot create a Buffer larger than " + maxLen + " bytes"); e.code = "ERR_BUFFER_TOO_LARGE"; throw e; } return zInfo(out, opts, engName); };
   const zAsync = (sync) => (data, opts, cb) => { if (typeof opts === "function") { cb = opts; opts = undefined; } if (typeof cb !== "function") throw zArgType("callback", "of type function", cb); G.queueMicrotask(() => { try { cb(null, sync(data, opts)); } catch (e) { cb(e); } }); };
   const deflateSync = zSync("c", "zlib", "Deflate"), inflateSync = zSync("d", "zlib", "Inflate"), gzipSync = zSync("c", "gzip", "Gzip"), gunzipSync = zSync("d", "gzip", "Gunzip"), deflateRawSync = zSync("c", "raw", "DeflateRaw"), inflateRawSync = zSync("d", "raw", "InflateRaw"), unzipSync = zSync("d", "auto", "Unzip");
   // brotli (native BrotliEncoder/Decoder via __mbunZlibNative). node forwards
   // quality/lgwin/mode through opts.params keyed by BROTLI_PARAM_* (MODE=0,
   // QUALITY=1, LGWIN=2). All return Buffer.
   const brP = (opts) => { const p = (opts && opts.params) || {}; return [typeof p[1] === "number" ? p[1] : -1, typeof p[2] === "number" ? p[2] : 0, typeof p[0] === "number" ? p[0] : 0]; };
-  const brotliCompressSync = (data, opts) => { const q = brP(opts); let r; try { r = ZN.brotliCompress(zB64(zToU8(data)), q[0], q[1], q[2]); } catch (e) { throw zErr(e); } return zInfo(G.Buffer.from(r, "base64"), opts, "BrotliCompress"); };
-  const brotliDecompressSync = (data, opts) => { let r; try { r = ZN.brotliDecompress(zB64(zToU8(data))); } catch (e) { throw zErr(e); } return zInfo(zCap(G.Buffer.from(r, "base64"), opts), opts, "BrotliDecompress"); };
+  // The one-shot helpers bypass the Transform classes, so they have to repeat the
+  // per-family flush range check node's ZlibBase constructor performs: brotli
+  // flushes are BROTLI_OPERATION_* (0..3), zstd flushes are ZSTD_e_* (0..2).
+  const zRange = (name, rangeMsg, v) => { const e = new RangeError('The value of "' + name + '" is out of range. It must be ' + rangeMsg + ". Received " + String(v)); e.code = "ERR_OUT_OF_RANGE"; return e; };
+  const zFlushRange = (opts, max) => {
+    for (const k of ["flush", "finishFlush"]) {
+      const v = opts ? opts[k] : undefined;
+      if (v === undefined || v === null) continue;
+      if (typeof v !== "number") throw zArgType("options." + k, "of type number", v);
+      if (!Number.isFinite(v)) throw zRange("options." + k, "a finite number", v);
+      if (v < 0 || v > max) throw zRange("options." + k, ">= 0 and <= " + max, v);
+    }
+  };
+  const brotliCompressSync = (data, opts) => { zFlushRange(opts, 3); const q = brP(opts); let r; try { r = ZN.brotliCompress(zB64(zToU8(data)), q[0], q[1], q[2]); } catch (e) { throw zErr(e); } return zInfo(G.Buffer.from(r, "base64"), opts, "BrotliCompress"); };
+  const brotliDecompressSync = (data, opts) => { zFlushRange(opts, 3); let r; try { r = ZN.brotliDecompress(zB64(zToU8(data))); } catch (e) { throw zErr(e); } return zInfo(zCap(G.Buffer.from(r, "base64"), opts), opts, "BrotliDecompress"); };
   // zstd (native ZSTD_compress/decompress). level via opts.level or
   // opts.params[ZSTD_c_compressionLevel=100]; default 3.
   const zstdLvl = (opts) => { const l = zNum(opts, "level", -2); if (l !== -2) return l; const p = opts && opts.params; return p && typeof p[100] === "number" ? p[100] : 3; };
-  const zstdCompressSync = (data, opts) => { let r; try { r = ZN.zstdCompress(zB64(zToU8(data)), zstdLvl(opts)); } catch (e) { throw zErr(e); } return zInfo(G.Buffer.from(r, "base64"), opts, "ZstdCompress"); };
-  const zstdDecompressSync = (data, opts) => { let r; try { r = ZN.zstdDecompress(zB64(zToU8(data))); } catch (e) { throw zErr(e); } return zInfo(zCap(G.Buffer.from(r, "base64"), opts), opts, "ZstdDecompress"); };
+  const zstdCompressSync = (data, opts) => { zFlushRange(opts, 2); let r; try { r = ZN.zstdCompress(zB64(zToU8(data)), zstdLvl(opts)); } catch (e) { throw zErr(e); } return zInfo(G.Buffer.from(r, "base64"), opts, "ZstdCompress"); };
+  const zstdDecompressSync = (data, opts) => { zFlushRange(opts, 2); let r; try { r = ZN.zstdDecompress(zB64(zToU8(data))); } catch (e) { throw zErr(e); } return zInfo(zCap(G.Buffer.from(r, "base64"), opts), opts, "ZstdDecompress"); };
   // DEFERRED: streaming Transform classes (createGzip/createBrotliCompress/…,
   // and the zlib.Deflate/Brotli/Zstd class hierarchy). Real chunked streaming
   // needs the node threadpool _handle lifecycle AND a bounded native inflate
@@ -2923,7 +3556,15 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     BROTLI_MIN_WINDOW_BITS: 10, BROTLI_MAX_WINDOW_BITS: 24, BROTLI_LARGE_MAX_WINDOW_BITS: 30, BROTLI_DEFAULT_WINDOW: 22,
     BROTLI_MIN_INPUT_BLOCK_BITS: 16, BROTLI_MAX_INPUT_BLOCK_BITS: 24,
     BROTLI_DECODER_RESULT_ERROR: 0, BROTLI_DECODER_RESULT_SUCCESS: 1, BROTLI_DECODER_RESULT_NEEDS_MORE_INPUT: 2, BROTLI_DECODER_RESULT_NEEDS_MORE_OUTPUT: 3,
-    ZSTD_e_continue: 0, ZSTD_e_flush: 1, ZSTD_e_end: 2, ZSTD_c_compressionLevel: 100, ZSTD_d_windowLogMax: 100, ZSTD_CLEVEL_DEFAULT: 3, ZSTD_MIN_CLEVEL: -131072, ZSTD_MAX_CLEVEL: 22 };
+    ZSTD_e_continue: 0, ZSTD_e_flush: 1, ZSTD_e_end: 2, ZSTD_CLEVEL_DEFAULT: 3, ZSTD_MIN_CLEVEL: -131072, ZSTD_MAX_CLEVEL: 22,
+    // ZSTD_cParameter / ZSTD_dParameter ordinals (zstd.h). node derives the
+    // accepted options.params key space from these prefixes, so the full set has
+    // to be exported even where the codec bridge ignores the parameter.
+    ZSTD_c_compressionLevel: 100, ZSTD_c_windowLog: 101, ZSTD_c_hashLog: 102, ZSTD_c_chainLog: 103, ZSTD_c_searchLog: 104, ZSTD_c_minMatch: 105, ZSTD_c_targetLength: 106, ZSTD_c_strategy: 107,
+    ZSTD_c_enableLongDistanceMatching: 160, ZSTD_c_ldmHashLog: 161, ZSTD_c_ldmMinMatch: 162, ZSTD_c_ldmBucketSizeLog: 163, ZSTD_c_ldmHashRateLog: 164,
+    ZSTD_c_contentSizeFlag: 200, ZSTD_c_checksumFlag: 201, ZSTD_c_dictIDFlag: 202,
+    ZSTD_c_nbWorkers: 400, ZSTD_c_jobSize: 401, ZSTD_c_overlapLog: 402,
+    ZSTD_d_windowLogMax: 100 };
   // node: zlib.codes maps the return codes both ways (name to num and num to
   // name) and is frozen; zlib.constants is frozen (Z_OK etc. must be immutable).
   const zCodes = { Z_OK: 0, Z_STREAM_END: 1, Z_NEED_DICT: 2, Z_ERRNO: -1, Z_STREAM_ERROR: -2, Z_DATA_ERROR: -3, Z_MEM_ERROR: -4, Z_BUF_ERROR: -5, Z_VERSION_ERROR: -6 };
@@ -2940,7 +3581,18 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   };
   const zlibMod = { deflateSync, inflateSync, gzipSync, gunzipSync, deflateRawSync, inflateRawSync, unzipSync, deflate: zAsync(deflateSync), inflate: zAsync(inflateSync), gzip: zAsync(gzipSync), gunzip: zAsync(gunzipSync), deflateRaw: zAsync(deflateRawSync), inflateRaw: zAsync(inflateRawSync), unzip: zAsync(unzipSync), crc32: zCrc32, createGzip: () => new Transform(), createGunzip: () => new Transform(), createDeflate: () => new Transform(), createInflate: () => new Transform(), createDeflateRaw: () => new Transform(), createInflateRaw: () => new Transform(), createUnzip: () => new Transform(), brotliCompressSync, brotliDecompressSync, brotliCompress: zAsync(brotliCompressSync), brotliDecompress: zAsync(brotliDecompressSync), zstdCompressSync, zstdDecompressSync, zstdCompress: zAsync(zstdCompressSync), zstdDecompress: zAsync(zstdDecompressSync), createBrotliCompress: () => new Transform(), createBrotliDecompress: () => new Transform(), createZstdCompress: () => new Transform(), createZstdDecompress: () => new Transform(), constants: zConstants, ...zConstants };
   Object.defineProperty(zlibMod, "codes", { value: zCodes, writable: false, enumerable: true, configurable: false });
-  def(["zlib"], zlibMod);
+  // node's lib/zlib.js destructures kMaxLength out of node:buffer at require()
+  // time, so a test that lowers buffer.kMaxLength across its `require('zlib')`
+  // keeps the lowered cap for the rest of the run (test-zlib-kmaxlength-rangeerror
+  // and its brotli/zstd siblings). Snapshot on the first module lookup made once
+  // the builtin partitions have finished loading — they reach for node:zlib
+  // themselves while booting, long before user code can touch kMaxLength.
+  for (const zn of ["zlib", "node:zlib"]) {
+    Object.defineProperty(M, zn, {
+      configurable: true, enumerable: true,
+      get() { if (zKMaxArmed && zKMaxSnap === null) zKMaxSnap = zKMaxLive(); return zlibMod; },
+    });
+  }
   if (G.Bun && typeof G.Bun.deflateSync === "undefined") {
     // bun semantics: Bun.deflateSync/inflateSync are RAW deflate (zlib.test.js
     // "deflate_with_headers" reaches for node:zlib instead); gzipSync is the
@@ -3515,6 +4167,36 @@ inline constexpr char kBootstrapJS_[] = R"JS(
 
   // ---- fs (real, via __mbunFsNative) ----
   const F = globalThis.__mbunFsNative;
+  // node getPathFromURLPosix / getPathFromURLWin32 (lib/internal/url.js): a
+  // file: URL handed to an fs API is NOT merely percent-decoded. A non-empty
+  // host is ERR_INVALID_FILE_URL_HOST, and an encoded separator (%2f, plus %5c
+  // on Windows) is ERR_INVALID_FILE_URL_PATH — decoding those would silently
+  // change the path's structure. mbun decoded blindly, so
+  // `file:///c:/tmp/%2f` resolved to "/c:/tmp//" and surfaced as ENOENT.
+  // ref test-fs-whatwg-url.
+  const fsPathFromURL = (u) => {
+    if (!__isWin && u.hostname !== "" && u.hostname !== "localhost") {
+      const e = new TypeError('File URL host must be "localhost" or empty on ' +
+                              (G.process ? G.process.platform : "linux"));
+      e.code = "ERR_INVALID_FILE_URL_HOST"; e.input = u;
+      throw nodeErrToString(e, "ERR_INVALID_FILE_URL_HOST");
+    }
+    const pathname = u.pathname;
+    for (let n = 0; n < pathname.length; n++) {
+      if (pathname[n] === "%") {
+        const third = (pathname.codePointAt(n + 2) | 0) | 0x20;
+        if ((pathname[n + 1] === "2" && third === 102) ||
+            (__isWin && pathname[n + 1] === "5" && third === 99)) {
+          const e = new TypeError(__isWin
+            ? "File URL path must not include encoded \\ or / characters"
+            : "File URL path must not include encoded / characters");
+          e.code = "ERR_INVALID_FILE_URL_PATH"; e.input = u;
+          throw nodeErrToString(e, "ERR_INVALID_FILE_URL_PATH");
+        }
+      }
+    }
+    try { return decodeURIComponent(pathname); } catch (e) { return pathname; }
+  };
   const toStr = (x) => {
     if (typeof x === "string") return x;
     // node accepts file:// URL *instances* everywhere a path goes
@@ -3522,8 +4204,14 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     // pglite et al. pass `new URL("./x.data", import.meta.url)` into fs.
     if (x && typeof x === "object" && x.href !== undefined && x.protocol === "file:" &&
         typeof x.pathname === "string") {
-      try { return decodeURIComponent(x.pathname); } catch { return x.pathname; }
+      return fsPathFromURL(x);
     }
+    // node's getValidatedPath accepts a Buffer *or any TypedArray* and decodes
+    // it as UTF-8 (lib/internal/fs/utils.js). A TypedArray inherits
+    // Array.prototype.toString, so `x.toString()` produced "47,104,111,..."
+    // and every Uint8Array path became garbage (test-fs-mkdtemp).
+    if (ArrayBuffer.isView(x)) return Buffer.from(x.buffer, x.byteOffset, x.byteLength).toString("utf8");
+    if (x instanceof ArrayBuffer) return Buffer.from(x).toString("utf8");
     return x && x.toString ? x.toString() : String(x);
   };
   const recur = (o) => !!(o && (o === true || o.recursive));
@@ -3549,12 +4237,24 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     if (ins.length > 28) ins = ins.slice(0, 25) + "...";
     return "type " + typeof v + " (" + ins + ")";
   };
-  const fsArgTypeErr = (name, expected, value) => { const e = new TypeError('The "' + name + '" argument must be ' + expected + ". Received " + fsSpecType(value)); e.code = "ERR_INVALID_ARG_TYPE"; return e; };
+  // A dotted name reads "property", not "argument" (node validateFunction on
+  // options.fs.open et al.) — ref internal/errors.js ERR_INVALID_ARG_TYPE.
+  // nodeErrToString is what makes `assert.throws(fn, /TypeError \[ERR_…\]/)`
+  // match: every NodeError overrides toString() as `${name} [${code}]: ${msg}`.
+  const fsArgTypeErr = (name, expected, value) => { const e = new TypeError('The "' + name + '" ' + (String(name).indexOf(".") !== -1 ? "property" : "argument") + " must be " + expected + ". Received " + fsSpecType(value)); e.code = "ERR_INVALID_ARG_TYPE"; return nodeErrToString(e, "ERR_INVALID_ARG_TYPE"); };
   // node getValidatedPath rejects a path containing a NUL byte with
   // ERR_INVALID_ARG_VALUE (a TypeError). ref lib/internal/fs/utils.js.
-  const fsNullErr = (name, value) => { const e = new TypeError("The argument '" + (name || "path") + "' must be a string, Buffer, or URL without null bytes. Received " + fsSpecType(value)); e.code = "ERR_INVALID_ARG_VALUE"; return e; };
-  const fsRangeErr = (name, range, value) => { const e = new RangeError('The value of "' + name + '" is out of range. It must be ' + range + ". Received " + (typeof value === "bigint" ? String(value) + "n" : String(value))); e.code = "ERR_OUT_OF_RANGE"; return e; };
-  const fsValidateInteger = (value, name, min, max) => {
+  const fsNullErr = (name, value) => { const e = new TypeError("The argument '" + (name || "path") + "' must be a string, Buffer, or URL without null bytes. Received " + fsSpecType(value)); e.code = "ERR_INVALID_ARG_VALUE"; return nodeErrToString(e, "ERR_INVALID_ARG_VALUE"); };
+  // node ERR_INVALID_URL_SCHEME (internal/url.js fileURLToPath): a URL handed to
+  // an fs API must be a file: URL. Before this a http: URL fell through to the
+  // String-coercion branch and surfaced as ERR_INVALID_ARG_TYPE.
+  const fsUrlSchemeErr = () => { const e = new TypeError("The URL must be of scheme file"); e.code = "ERR_INVALID_URL_SCHEME"; return nodeErrToString(e, "ERR_INVALID_URL_SCHEME"); };
+  // Shared node-exact ERR_OUT_OF_RANGE: the received value picks up node's `_`
+  // numeric separators once |value| > 2**32.
+  const fsRangeErr = (name, range, value) => nodeRangeError(name, range, value);
+  // node validateInteger defaults min/max to ±Number.MAX_SAFE_INTEGER — without
+  // the upper bound, position = MAX_SAFE_INTEGER + 1 slipped through.
+  const fsValidateInteger = (value, name, min = -9007199254740991, max = 9007199254740991) => {
     if (typeof value !== "number") throw fsArgTypeErr(name, "of type number", value);
     if (!Number.isInteger(value)) throw fsRangeErr(name, "an integer", value);
     if ((min != null && value < min) || (max != null && value > max)) throw fsRangeErr(name, (min != null && max != null) ? ">= " + min + " && <= " + max : (min != null ? ">= " + min : "<= " + max), value);
@@ -3589,7 +4289,10 @@ inline constexpr char kBootstrapJS_[] = R"JS(
         return;
       }
       if (p.href !== undefined && p.protocol === "file:" && typeof p.pathname === "string") { // URL
-        try { str = decodeURIComponent(p.pathname); } catch (e) { str = p.pathname; }
+        str = fsPathFromURL(p);
+      } else if (p.href !== undefined && typeof p.protocol === "string" && typeof p.pathname === "string"
+                 && typeof p.searchParams === "object") { // a URL of some other scheme
+        throw fsUrlSchemeErr();
       } else {
         // A String object / subclass (e.g. bun's DisposableString from tempDir())
         // is a valid path — node's getValidatedPath coerces it. String.prototype
@@ -3615,11 +4318,8 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     else if (o === true) recursive = true;
     else if (o && typeof o === "object") {
       if ("recursive" in o && o.recursive !== undefined) {
-        if (typeof o.recursive !== "boolean") {
-          const e = new TypeError('The "options.recursive" argument must be of type boolean. Received ' + (o.recursive === null ? "null" : typeof o.recursive));
-          e.code = "ERR_INVALID_ARG_TYPE";
-          throw e;
-        }
+        if (typeof o.recursive !== "boolean")
+          throw nodeArgTypeError("options.recursive", "boolean", o.recursive);
         recursive = o.recursive;
       }
       if (o.mode != null) mode = typeof o.mode === "string" ? parseInt(o.mode, 8) : (Number(o.mode) & 0o7777);
@@ -3640,50 +4340,230 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   };
   const pDirname = (p) => { const i = p.lastIndexOf("/"); return i <= 0 ? (i === 0 ? "/" : ".") : p.slice(0, i); };
   const cpError = (code, msg, path2) => { const e = new Error(code + ": " + msg); e.code = code; e.path = path2; return e; };
-  // node fs.cp / fs.cpSync (blueprint src/js/internal/fs/cp): recursive copy with
-  // force/errorOnExist/filter/dereference options. Symlinks are preserved (raw
-  // target, relative targets resolved to absolute against dirname(src) so the
-  // copy never links back into the source tree). Modes are carried to the copy;
-  // directories require { recursive: true }; FIFOs/sockets are rejected.
+  // node fs.cp / fs.cpSync — a port of lib/internal/fs/cp/cp-sync.js
+  // (checkPaths + getStats/onFile/onDir/onLink) rather than the previous
+  // hand-rolled walker, which had no ERR_FS_CP_* surface at all: copying a
+  // directory into its own subtree recursed forever and a symlink whose target
+  // straddles src/dest was copied blindly.
+  const CP_DEFAULTS = { dereference: false, errorOnExist: false, filter: undefined, force: true,
+                        mode: 0, preserveTimestamps: false, recursive: false, verbatimSymlinks: false };
+  // ERR_FS_CP_* are SystemErrors: "<prefix>: cp returned <code> (<message>) <path>".
+  const cpSysErr = (key, prefix, code, errnoNum, message, path2, dest2) => {
+    let msg = prefix + ": cp returned " + code + " (" + message + ")";
+    if (path2 !== undefined) msg += " " + path2;
+    if (dest2 !== undefined) msg += " => " + dest2;
+    const e = new Error(msg);
+    e.code = key; e.errno = errnoNum; e.syscall = "cp"; e.path = path2;
+    if (dest2 !== undefined) e.dest = dest2;
+    e.name = "SystemError";
+    return e;
+  };
+  const cpEinval = (message, path2) => cpSysErr("ERR_FS_CP_EINVAL", "Invalid src or dest", "EINVAL", -22, message, path2);
+  const cpValidateOptions = (o) => {
+    if (o === undefined || o === null) return Object.assign({}, CP_DEFAULTS);
+    if (typeof o !== "object" || Array.isArray(o)) throw fsArgTypeErr("options", "of type object", o);
+    const out = Object.assign({}, CP_DEFAULTS, o);
+    for (const k of ["dereference", "errorOnExist", "force", "preserveTimestamps", "recursive", "verbatimSymlinks"])
+      if (typeof out[k] !== "boolean") throw fsArgTypeErr("options." + k, "of type boolean", out[k]);
+    // getValidMode(mode, "copyFile"): 0..COPYFILE_EXCL|FICLONE|FICLONE_FORCE.
+    out.mode = out.mode == null ? 0 : fsValidateInteger(out.mode, "mode", 0, 7);
+    if (out.dereference === true && out.verbatimSymlinks === true) {
+      const e = new TypeError('Option "dereference" cannot be used in combination with option "verbatimSymlinks"');
+      e.code = "ERR_INCOMPATIBLE_OPTION_PAIR";
+      throw e;
+    }
+    if (out.filter !== undefined && typeof out.filter !== "function")
+      throw fsArgTypeErr("options.filter", "of type function", out.filter);
+    return out;
+  };
+  const cpReturnErr = (value) => {
+    const e = new TypeError('Expected boolean to be returned for the filter function, got ' + typeof value);
+    e.code = "ERR_INVALID_RETURN_VALUE";
+    return e;
+  };
+  // node isSrcSubdir: dest is inside src (or equal) once both are normalised.
+  const isSrcSubdir = (src, dest) => {
+    const srcArr = pNormalize(src).split("/");
+    const destArr = pNormalize(dest).split("/");
+    return srcArr.every((cur, i) => destArr[i] === cur);
+  };
+  const cpStatOrNull = (p, lstat) => { try { return F.stat(p, !!lstat); } catch (e) { return null; } };
+  const cpCheckPaths = (src, dest, opts) => {
+    const srcStat = opts.dereference ? F.stat(src) : F.stat(src, true);
+    const destStat = cpStatOrNull(dest, !opts.dereference);
+    if (destStat) {
+      if (srcStat.ino === destStat.ino && srcStat.dev === destStat.dev)
+        throw cpEinval("src and dest cannot be the same", dest);
+      if (srcStat.isDirectory() && !destStat.isDirectory())
+        throw cpSysErr("ERR_FS_CP_DIR_TO_NON_DIR", "Cannot overwrite directory with non-directory",
+                       "EISDIR", -21, "cannot overwrite non-directory " + dest + " with directory " + src, dest);
+      if (!srcStat.isDirectory() && destStat.isDirectory())
+        throw cpSysErr("ERR_FS_CP_NON_DIR_TO_DIR", "Cannot overwrite non-directory with directory",
+                       "ENOTDIR", -20, "cannot overwrite directory " + dest + " with non-directory " + src, dest);
+    }
+    if (srcStat.isDirectory() && isSrcSubdir(src, dest))
+      throw cpEinval("cannot copy " + src + " to a subdirectory of self " + dest, dest);
+    return srcStat;
+  };
+  const cpSetDestMode = (dest, srcMode) => { try { F.chmod(dest, srcMode & 0o7777); } catch (e) {} };
+  const cpEexist = (dest) =>
+    cpSysErr("ERR_FS_CP_EEXIST", "Target already exists", "EEXIST", -17, dest + " already exists", dest);
+  // node cp.js setDestTimestamps: srcStat.atime cannot be trusted (read(2) moved
+  // it), so src is re-stat'ed. Times are truncated to whole milliseconds because
+  // node feeds utimes() a Date — that is what makes
+  // destStat.mtime.getTime() === srcStat.mtime.getTime() exactly.
+  const cpSetDestTimestamps = (src, dest) => {
+    const s = F.stat(src);
+    F.utimes(dest, Math.trunc(s.atimeMs) / 1000, Math.trunc(s.mtimeMs) / 1000);
+  };
+  const cpCopyFile = (srcStat, src, dest, opts) => {
+    F.copyFile(src, dest);
+    if (opts.preserveTimestamps) {
+      // utimes on a mode-0444 copy fails EPERM: make it writable first, then
+      // restore the real mode below (cp.js handleTimestampsAndMode).
+      if ((srcStat.mode & 0o200) === 0) cpSetDestMode(dest, srcStat.mode | 0o200);
+      cpSetDestTimestamps(src, dest);
+    }
+    cpSetDestMode(dest, srcStat.mode);
+  };
+  const cpOnFile = (srcStat, destStat, src, dest, opts) => {
+    if (!destStat) return cpCopyFile(srcStat, src, dest, opts);
+    if (opts.force) {
+      // node removes dest first (cp.js mayCopyFile / node_file.cc
+      // CpSyncOverrideFile's std::filesystem::remove). Copying ONTO a symlink
+      // that resolves to a directory otherwise fails EISDIR/EINVAL.
+      try { F.unlink(dest); } catch (e) {}
+      return cpCopyFile(srcStat, src, dest, opts);
+    }
+    if (opts.errorOnExist) throw cpEexist(dest);
+  };
+  const cpOnLink = (destStat, src, dest, opts) => {
+    let resolvedSrc = F.readlink(src);
+    if (!opts.verbatimSymlinks && resolvedSrc[0] !== "/") resolvedSrc = pNormalize(pDirname(src) + "/" + resolvedSrc);
+    if (!destStat) { F.symlink(resolvedSrc, dest); return; }
+    let resolvedDest;
+    try { resolvedDest = F.readlink(dest); }
+    catch (err) {
+      // dest is a regular file/directory: symlink(2) then reports EEXIST, which
+      // is exactly what node surfaces here.
+      if (err && (err.code === "EINVAL" || err.code === "UNKNOWN")) { F.symlink(resolvedSrc, dest); return; }
+      throw err;
+    }
+    if (resolvedDest[0] !== "/") resolvedDest = pNormalize(pDirname(dest) + "/" + resolvedDest);
+    const srcTarget = cpStatOrNull(src, false);
+    if (srcTarget && srcTarget.isDirectory() && isSrcSubdir(resolvedSrc, resolvedDest))
+      throw cpEinval("cannot copy " + resolvedSrc + " to a subdirectory of self " + resolvedDest, dest);
+    const destTarget = cpStatOrNull(dest, false);
+    if (destTarget && destTarget.isDirectory() && isSrcSubdir(resolvedDest, resolvedSrc))
+      throw cpSysErr("ERR_FS_CP_SYMLINK_TO_SUBDIRECTORY", "Cannot overwrite symlink in subdirectory of self",
+                     "EINVAL", -22, "cannot overwrite " + resolvedDest + " with " + resolvedSrc, dest);
+    try { F.unlink(dest); } catch (e) {}
+    F.symlink(resolvedSrc, dest);
+  };
+  const cpCopyDir = (src, dest, opts, mkDir, srcMode) => {
+    if (mkDir) F.mkdir(dest, false, 0o777);
+    for (const name of F.readdir(src)) {
+      const srcItem = src + "/" + name;
+      const destItem = dest + "/" + name;
+      if (opts.filter) {
+        const shouldCopy = opts.filter(srcItem, destItem);
+        if (shouldCopy && typeof shouldCopy.then === "function") throw cpReturnErr(shouldCopy);
+        if (!shouldCopy) continue;
+      }
+      cpGetStats(srcItem, destItem, opts);
+    }
+    if (srcMode !== undefined) cpSetDestMode(dest, srcMode);
+  };
+  // The non-directory tail of node getStatsForCopy, shared by the sync and the
+  // async walker (only the filter has to be awaited; the fs calls are sync).
+  const cpCopyLeaf = (srcStat, destStat, src, dest, opts) => {
+    if (srcStat.isDirectory())
+      throw cpSysErr("ERR_FS_EISDIR", "Path is a directory", "EISDIR", -21,
+                     "recursive option not enabled, current path: " + src, src);
+    if (srcStat.isFile() || srcStat.isCharacterDevice() || srcStat.isBlockDevice())
+      return cpOnFile(srcStat, destStat, src, dest, opts);
+    if (srcStat.isSymbolicLink()) return cpOnLink(destStat, src, dest, opts);
+    if (srcStat.isSocket())
+      throw cpSysErr("ERR_FS_CP_SOCKET", "Cannot copy a socket file", "EINVAL", -22,
+                     "cannot copy a socket file: " + dest, src);
+    throw cpSysErr("ERR_FS_CP_FIFO_PIPE", "Cannot copy a FIFO pipe", "EINVAL", -22,
+                   "cannot copy a FIFO pipe: " + src, src);
+  };
+  const cpGetStats = (src, dest, opts) => {
+    const srcStat = opts.dereference ? F.stat(src) : F.stat(src, true);
+    const destStat = cpStatOrNull(dest, !opts.dereference);
+    if (srcStat.isDirectory() && opts.recursive) {
+      if (!destStat) return cpCopyDir(src, dest, opts, true, srcStat.mode);
+      return cpCopyDir(src, dest, opts);
+    }
+    return cpCopyLeaf(srcStat, destStat, src, dest, opts);
+  };
+  // node cp.js checkParentPaths: walk dest's ancestors and refuse the copy when
+  // one of them IS src (same dev+ino). This is the only check that sees through a
+  // dest whose parent is a SYMLINK back into src — the string-only isSrcSubdir()
+  // in cpCheckPaths cannot. It runs BEFORE the !recursive ERR_FS_EISDIR throw,
+  // which is the order node_file.cc's cpSyncCheckPaths uses too.
+  const cpCheckParentPaths = (src, srcStat, dest) => {
+    const srcParent = pNormalize(pDirname(src));
+    let destParent = pNormalize(pDirname(dest));
+    for (;;) {
+      if (destParent === srcParent) return;
+      const up = pNormalize(pDirname(destParent));
+      if (up === destParent) return;              // reached the root
+      const st = cpStatOrNull(destParent, false); // stat(): follows symlinks
+      if (!st) return;                            // parent does not exist yet
+      if (st.ino && st.dev && st.ino === srcStat.ino && st.dev === srcStat.dev)
+        throw cpEinval("cannot copy " + src + " to a subdirectory of self " + dest, dest);
+      destParent = up;
+    }
+  };
+  // node cp.js checkParentDir: dest's parent directory is created for you.
+  const cpCheckParentDir = (dest) => {
+    const parent = pDirname(dest);
+    if (parent && parent !== "." && parent !== "/" && !F.exists(parent)) F.mkdir(parent, true, 0o777);
+  };
   const cpRec = (src, dest, o) => {
-    o = o || {};
-    const recursive = !!o.recursive;
-    const force = o.force !== false;
-    const errorOnExist = !!o.errorOnExist;
-    const dereference = !!o.dereference;
-    const filter = typeof o.filter === "function" ? o.filter : null;
-    const walk = (s, d) => {
-      if (filter && !filter(s, d)) return;
-      const lst = F.stat(s, true); // lstat
-      if (!dereference && lst && lst.isSymbolicLink && lst.isSymbolicLink()) {
-        let target = F.readlink(s);
-        if (target[0] !== "/") target = pNormalize(pDirname(s) + "/" + target);
-        try { F.unlink(d); } catch (e) {}
-        F.symlink(target, d);
-        return;
-      }
-      if (lst && lst.isDirectory()) {
-        if (!recursive) throw cpError("ERR_FS_EISDIR", "recursive must be true to copy a directory", s);
-        F.mkdir(d, true, (lst.mode & 0o777) || 0o777);
-        try { F.chmod(d, lst.mode & 0o777); } catch (e) {}
-        for (const e of F.readdir(s)) walk(s + "/" + e, d + "/" + e);
-        return;
-      }
-      if (lst && (lst.isFIFO() || lst.isSocket() || lst.isBlockDevice() || lst.isCharacterDevice())) {
-        throw cpError("ERR_FS_CP_FIFO_PIPE", "cannot copy a FIFO", s);
-      }
-      if (F.exists(d)) {
-        const dst = F.stat(d, true);
-        if (dst && dst.isDirectory()) throw cpError("ERR_FS_CP_NON_DIR_TO_DIR", "cannot overwrite directory with non-directory", s);
-        if (!force) {
-          if (errorOnExist) throw cpError("ERR_FS_CP_EEXIST", "file already exists", d);
-          return;
-        }
-      }
-      F.copyFile(s, d);
-      try { if (lst) F.chmod(d, lst.mode & 0o777); } catch (e) {}
-    };
-    walk(src, dest);
+    const opts = cpValidateOptions(o);
+    if (opts.filter) {
+      const shouldCopy = opts.filter(src, dest);
+      if (shouldCopy && typeof shouldCopy.then === "function") throw cpReturnErr(shouldCopy);
+      if (!shouldCopy) return;
+    }
+    const srcStat = cpCheckPaths(src, dest, opts);
+    cpCheckParentPaths(src, srcStat, dest);
+    cpCheckParentDir(dest);
+    cpGetStats(src, dest, opts);
+  };
+  // fs.cp / fs.promises.cp are genuinely async: options.filter may return a
+  // promise and every level awaits it (cp.js checkPaths + copyDir). cpSync must
+  // keep throwing ERR_INVALID_RETURN_VALUE for a thenable filter, so the async
+  // walker is a separate pair of functions.
+  const cpCopyDirAsync = async (src, dest, opts, mkDir, srcMode) => {
+    if (mkDir) F.mkdir(dest, false, 0o777);
+    for (const name of F.readdir(src)) {
+      const srcItem = src + "/" + name;
+      const destItem = dest + "/" + name;
+      if (opts.filter && !(await opts.filter(srcItem, destItem))) continue;
+      await cpGetStatsAsync(srcItem, destItem, opts);
+    }
+    if (srcMode !== undefined) cpSetDestMode(dest, srcMode);
+  };
+  const cpGetStatsAsync = async (src, dest, opts) => {
+    const srcStat = opts.dereference ? F.stat(src) : F.stat(src, true);
+    const destStat = cpStatOrNull(dest, !opts.dereference);
+    if (srcStat.isDirectory() && opts.recursive) {
+      if (!destStat) return cpCopyDirAsync(src, dest, opts, true, srcStat.mode);
+      if (opts.errorOnExist && !opts.force) throw cpEexist(dest);  // cp.js onDir
+      return cpCopyDirAsync(src, dest, opts);
+    }
+    return cpCopyLeaf(srcStat, destStat, src, dest, opts);
+  };
+  const cpRecAsync = async (src, dest, opts) => {
+    if (opts.filter && !(await opts.filter(src, dest))) return;
+    const srcStat = cpCheckPaths(src, dest, opts);
+    cpCheckParentPaths(src, srcStat, dest);
+    cpCheckParentDir(dest);
+    await cpGetStatsAsync(src, dest, opts);
   };
   // bun node_fs.rs should_throw_out_of_memory_early_for_javascript: a read whose
   // *decoded* length would exceed the synthetic allocation limit fails with
@@ -3704,6 +4584,16 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   const fsOomError = (path2) =>
     Object.assign(new Error("ENOMEM: not enough memory, read '" + path2 + "'"),
                   { code: "ENOMEM", errno: -12, syscall: "read", path: path2 });
+  // node kIoMaxLength (2**31-1): readFile/readFileSync refuse a file larger than
+  // that with ERR_FS_FILE_TOO_LARGE *before* allocating anything. Without it the
+  // read-to-EOF growth loop tried to buffer the whole file and was OOM-killed
+  // (test-fs-readfile).
+  const kIoMaxLength = 2147483647;
+  const fsFileTooLarge = (size) => {
+    const e = new RangeError("File size (" + size + ") is greater than 2 GiB");
+    e.code = "ERR_FS_FILE_TOO_LARGE";
+    return nodeErrToString(e, "ERR_FS_FILE_TOO_LARGE");
+  };
   // node readdir honors options.encoding: 'buffer' yields Buffer entries, any
   // other non-utf8 encoding yields the names re-encoded (e.g. 'hex'). ref
   // lib/fs.js readdir + test-fs-buffer.
@@ -3713,6 +4603,101 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     if (enc === "buffer") return names.map((n) => Buffer.from(n, "utf8"));
     return names.map((n) => Buffer.from(n, "utf8").toString(enc));
   };
+  // options.signal on readFile/writeFile: node rejects/callbacks with a DOMException
+  // named AbortError (ref lib/internal/fs/promises.js + lib/fs.js).
+  const fsAbortError = () => {
+    if (typeof G.DOMException === "function") {
+      try { return new G.DOMException("The operation was aborted", "AbortError"); } catch (e) {}
+    }
+    const e = new Error("The operation was aborted");
+    e.name = "AbortError"; e.code = "ABORT_ERR";
+    return e;
+  };
+  // node validateAbortSignal(options.signal, 'options.signal') runs at the fs
+  // entry point, BEFORE the work is scheduled: anything that is neither
+  // undefined/null nor an AbortSignal is a synchronous ERR_INVALID_ARG_TYPE.
+  // Without it `readFile(p, { signal: 'hello' }, cb)` silently ignored the
+  // option (ref lib/fs.js readFile/writeFile, test-fs-readfile).
+  const fsValidateSignalOpt = (o) => {
+    const s = (o !== null && typeof o === "object") ? o.signal : undefined;
+    if (s === undefined || s === null) return undefined;
+    if (typeof s !== "object" || typeof s.aborted !== "boolean")
+      throw fsArgTypeErr("options.signal", "an instance of AbortSignal", s);
+    return s;
+  };
+  // node getOptions default `{ flush: false }` + validateBoolean(flush,
+  // 'options.flush'): writeFile/appendFile fsync(2) the descriptor before
+  // closing it when flush is true, and reject any non-boolean.
+  // ref lib/fs.js writeFileSync/writeFile, test-fs-write-file-flush.
+  const fsFlushOf = (o) => {
+    const f = (o !== null && typeof o === "object" && o.flush !== undefined && o.flush !== null)
+      ? o.flush : false;
+    if (typeof f !== "boolean") throw fsArgTypeErr("options.flush", "of type boolean", f);
+    return f;
+  };
+  // The asynchronous half of options.flush: node writes, then calls
+  // fs.fsync(fd, callback) on the SAME descriptor and only runs the user
+  // callback once the flush completes. Returns true when it has taken
+  // responsibility for invoking `cb`.
+  const fsWriteThenFlush = (writeSync, p, d, o, flush, cb) => {
+    if (!flush) { writeSync(p, d, o); return false; }
+    writeSync(p, d, o, (fd, owned) => {
+      // Dispatch through fsMod so `t.mock.method(fs, 'fsync')` observes it.
+      fsMod.fsync(fd, (e) => {
+        if (owned) { try { globalThis.__mbunFdNative.close(fd); } catch (e2) {} }
+        cb(e || null);
+      });
+      return owned;
+    });
+    return true;
+  };
+  // node warnOnNonPortableTemplate (lib/internal/fs/utils.js): a mkdtemp
+  // template ending in 'X' warns ONCE per process. A URL template never warns
+  // (node only checks strings and typed arrays).
+  let fsNonPortableTemplateWarn = true;
+  const fsWarnNonPortableTemplate = (template) => {
+    if (!fsNonPortableTemplateWarn) return;
+    const endsX = typeof template === "string"
+      ? template.charCodeAt(template.length - 1) === 0x58
+      : (ArrayBuffer.isView(template) && template.length > 0 && template[template.length - 1] === 0x58);
+    if (!endsX) return;
+    fsNonPortableTemplateWarn = false;
+    G.process.emitWarning("mkdtemp() templates ending with X are not portable. " +
+                          "For details see: https://nodejs.org/api/fs.html");
+  };
+  // The native stat row carries two mbun-internal flags (`_isFile`/`_isDir`, used
+  // by readdir's Dirent path). Left enumerable they leak into Object.keys(stats)
+  // and node's own key-by-key Stats/BigIntStats comparison reports
+  // "_isFile is not a safe integer" (test-fs-stat-bigint). Keep them readable,
+  // hide them from enumeration.
+  // Same story for the isX() methods the native row carries as OWN properties
+  // and for the *Ns fields: node's non-bigint Stats has neither in
+  // Object.keys() (the predicates live on Stats.prototype and the nanosecond
+  // fields only exist on BigIntStats), and test-fs-stat-bigint walks
+  // Object.keys(numStats) key-by-key against the BigInt twin — a function-valued
+  // key lands in its numeric branch ("isFile is not a safe integer").
+  // Non-enumerable, not deleted: the bigint builder still reads s.atimeNs and
+  // readdir still reads s._isDir.
+  const fsStatsHiddenKeys = ["_isFile", "_isDir",
+                             "isFile", "isDirectory", "isSymbolicLink", "isBlockDevice",
+                             "isCharacterDevice", "isFIFO", "isSocket",
+                             "atimeNs", "mtimeNs", "ctimeNs", "birthtimeNs"];
+  const fsStatOrNoEntry = (get, o) => {
+    if (o && typeof o === "object" && o.throwIfNoEntry === false) {
+      try { return get(); }
+      catch (e) { if (e && (e.code === "ENOENT" || e.code === "ENOTDIR")) return undefined; throw e; }
+    }
+    return get();
+  };
+  const fsAsStats = (s) => {
+    for (const k of fsStatsHiddenKeys) {
+      if (Object.prototype.hasOwnProperty.call(s, k) &&
+          Object.getOwnPropertyDescriptor(s, k).enumerable)
+        Object.defineProperty(s, k, { value: s[k], enumerable: false, writable: true, configurable: true });
+    }
+    return Object.setPrototypeOf(s, Stats.prototype);
+  };
+  let showExistsDeprecation = true;
   const fsMod = {
     // node fs.readFileSync: no encoding → Buffer (was wrongly a String).
     // Reads real bytes via the native fd path (binary-correct; F.readFile
@@ -3724,10 +4709,19 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       // node/bun accept a raw fd; it stays open (the caller owns it).
       const isFd = typeof p === "number";
       const path2 = isFd ? String(p) : toStr(p);
-      const fd = isFd ? p : FD.open(path2, "r", 0o666);
+      // options.flag is honoured (node lib/fs.js readFileSync → 'r' default):
+      // 'a+'/'w+' must CREATE the file, and 'ax' must fail EEXIST.
+      // ref test-fs-read-file-sync, test-fs-readfile-flags.
+      const flag = (opts && typeof opts === "object" && opts.flag != null) ? opts.flag : "r";
+      const fd = isFd ? p : FD.open(path2, flag, 0o666);
       const cap = fsOomCap(enc);
       try {
-        let size = (!isFd && F.stat(path2) && F.stat(path2).size) | 0;
+        let size = 0;
+        if (!isFd) { const st0 = F.stat(path2); size = st0 ? Number(st0.size) : 0; }
+        // The check must precede the `| 0` truncation below: a 2 GiB + 1 file
+        // wrapped to a small (or negative) int32 and read to EOF instead.
+        if (size > kIoMaxLength) throw fsFileTooLarge(size);
+        size = size | 0;
         if (size <= 0) size = 65536;  // procfs / char devices report st_size 0 — read to EOF
         if (size > cap) throw fsOomError(path2);
         let u = new Uint8Array(size);
@@ -3748,37 +4742,83 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     },
     // Binary data must NOT cross the C-API string boundary (NUL/UTF-8 mangling):
     // typed arrays / ArrayBuffers write through the fd native path byte-exact.
-    writeFileSync: (p, d, o) => {
-      // node: options may be an encoding string or { encoding, mode, flag };
-      // `mode` is the creation mode (default 0o666) and must be applied even
-      // when the file already exists is false — a fresh file created with
-      // mode 0o777 has to come out executable (cli/run/run-extensionless).
+    // Byte-exact writes: binary data must NOT cross the C-API string boundary
+    // (NUL / UTF-8 mangling turned every Buffer write into mojibake), so
+    // everything goes through the fd path with the requested flag + mode.
+    // `__onFd` is INTERNAL: it receives the descriptor this call wrote through,
+    // before it is closed, and returning true transfers ownership of the fd to
+    // the hook (which must then close it). fs.writeFile/appendFile use it to
+    // flush with the asynchronous fs.fsync(fd, cb) over the SAME descriptor
+    // node flushes, rather than reopening the file.
+    writeFileSync: (p, d, o, __onFd) => {
+      const enc = typeof o === "string" ? o : ((o && typeof o === "object" && o.encoding) || "utf8");
+      const flag = (o && typeof o === "object" && o.flag) || "w";
       const mode = (o && typeof o === "object" && o.mode != null)
         ? (typeof o.mode === "string" ? parseInt(o.mode, 8) : (Number(o.mode) & 0o7777))
         : null;
-      if (ArrayBuffer.isView(d) || d instanceof ArrayBuffer) {
-        const FD = globalThis.__mbunFdNative;
-        const u = d instanceof ArrayBuffer ? new Uint8Array(d) : new Uint8Array(d.buffer, d.byteOffset, d.byteLength);
-        const fd = FD.open(toStr(p), "w", mode == null ? 0o666 : mode);
-        try { FD.write(fd, u, 0, u.byteLength, -1); } finally { FD.close(fd); }
-        if (mode != null) { try { F.chmod(toStr(p), mode); } catch (e) {} }
-        return;
-      }
-      F.writeFile(toStr(p), toStr(d));
-      if (mode != null) { try { F.chmod(toStr(p), mode); } catch (e) {} }
-    },
-    appendFileSync: (p, d, o) => {
-      fsValidateData(d); fsValidateEncoding(o);
+      const flush = fsFlushOf(o);
+      // node validateStringAfterArrayBufferView(data, 'data'): anything that is
+      // neither a string nor an ArrayBufferView is ERR_INVALID_ARG_TYPE. Without
+      // it every value — a Symbol, a Promise, `new String(…)` — was stringified
+      // through toStr() and written (test-fs-write-file-sync).
+      fsValidateData(d);
+      const FD = globalThis.__mbunFdNative;
+      let u;
+      if (ArrayBuffer.isView(d)) u = new Uint8Array(d.buffer, d.byteOffset, d.byteLength);
+      else if (d instanceof ArrayBuffer) u = new Uint8Array(d);
+      else { const b = Buffer.from(toStr(d), enc === "buffer" ? "utf8" : enc); u = new Uint8Array(b.buffer, b.byteOffset, b.byteLength); }
+      // node's writeFileSync LOOPS until every byte is out (lib/fs.js
+      // writeFileSync: `while (remaining > 0)`). A single FD.write whose short
+      // return value is discarded reports success after a partial write — with
+      // RLIMIT_FSIZE set it wrote what fit and returned normally, where node
+      // throws EFBIG on the next write (test-fs-write-sigxfsz).
+      const writeAll = (dfd) => {
+        let woff = 0;
+        while (woff < u.byteLength) {
+          const n = FD.write(dfd, u, woff, u.byteLength - woff, -1);
+          if (!(n > 0)) break;
+          woff += n;
+        }
+      };
       if (typeof p === "number") {
-        const FD = globalThis.__mbunFdNative;
-        const enc = typeof o === "string" ? o : (o && o.encoding) || "utf8";
-        const b = typeof d === "string" ? Buffer.from(d, enc) : Buffer.from(d);
-        FD.write(p, new Uint8Array(b.buffer, b.byteOffset, b.byteLength), 0, b.byteLength, -1);
+        if (u.byteLength) writeAll(p);
+        // A caller-supplied descriptor is never ours to close (second argument
+        // false), so the flush hook must not close it either.
+        if (__onFd !== undefined) __onFd(p, false);
+        else if (flush) fsMod.fsyncSync(p);
         return;
       }
-      return F.appendFile(toStr(p), toStr(d));
+      const path2 = toStr(p);
+      const fd = FD.open(path2, flag, mode == null ? 0o666 : mode);
+      let keep = false;
+      try {
+        if (u.byteLength) writeAll(fd);
+        // Dispatch through fsMod so `t.mock.method(fs, 'fsyncSync')` sees the
+        // call (node's writeFileSync flushes through the same public binding).
+        if (__onFd !== undefined) keep = __onFd(fd, true) === true;
+        else if (flush) fsMod.fsyncSync(fd);
+      } finally { if (!keep) FD.close(fd); }
+      if (mode != null) { try { F.chmod(path2, mode); } catch (e) {} }
     },
-    existsSync: (p) => F.exists(toStr(p)),
+    appendFileSync: (p, d, o, __onFd) => {
+      fsValidateData(d); fsValidateEncoding(o);
+      const opts = (o && typeof o === "object") ? Object.assign({}, o) : { encoding: o };
+      if (opts.flag == null) opts.flag = "a";
+      return fsMod.writeFileSync(p, d, opts, __onFd);
+    },
+    // node fs.existsSync never throws; an invalid argument type emits the
+    // DEP0187 deprecation ONCE and returns false. ref lib/fs.js existsSync.
+    existsSync: (p) => {
+      try { validatePath(p); } catch (e) {
+        if (showExistsDeprecation && e && e.code === "ERR_INVALID_ARG_TYPE") {
+          showExistsDeprecation = false;
+          G.process.emitWarning("Passing invalid argument types to fs.existsSync is deprecated",
+                                "DeprecationWarning", "DEP0187");
+        }
+        return false;
+      }
+      try { return F.exists(toStr(p)); } catch (e) { return false; }
+    },
     mkdirSync: (p, o) => { validatePath(p); const [rec, mode] = mkdirOpts(o); try { return F.mkdir(toStr(p), rec, mode); } catch (e) { e.path = toStr(p); throw e; } },
     rmSync: (p, o) => F.rm(toStr(p), recur(o), !!(o && o.force)),
     rmdirSync: (p, o) => F.rm(toStr(p), recur(o), true),
@@ -3802,18 +4842,30 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     // native stat builds a plain object; link it to fs.Stats.prototype so
     // `statSync(x) instanceof Stats` holds (node/bun: statSync shares the
     // Stats prototype). Own isFile()/mtimeMs/… still shadow.
-    statSync: (p, o) => { const s = F.stat(toStr(p)); return (o && o.bigint) ? mkBigIntStats(s) : Object.setPrototypeOf(s, Stats.prototype); },
-    lstatSync: (p, o) => { const s = F.stat(toStr(p), true); return (o && o.bigint) ? mkBigIntStats(s) : Object.setPrototypeOf(s, Stats.prototype); },
-    fstatSync: (fd, o) => { const s = F.fstat(fd); return (o && o.bigint) ? mkBigIntStats(s) : Object.setPrototypeOf(s, Stats.prototype); },
+    // options.throwIfNoEntry === false: node answers a missing path with
+    // `undefined` instead of throwing ENOENT (lib/fs.js statSync →
+    // handleErrorFromBinding is skipped). Only ENOENT/ENOTDIR are swallowed —
+    // every other errno still throws, as node's binding does.
+    statSync: (p, o) => { validatePath(p); const s = fsStatOrNoEntry(() => F.stat(toStr(p)), o); return s === undefined ? undefined : ((o && o.bigint) ? mkBigIntStats(s) : fsAsStats(s)); },
+    // The native row is one `stat(path, lstat)` entry, so its errors name the
+    // syscall "stat" even for lstat. node reports the syscall the caller asked
+    // for (test-fs-error-messages compares the whole message), so relabel it.
+    lstatSync: (p, o) => { validatePath(p); const s = fsStatOrNoEntry(() => { try { return F.stat(toStr(p), true); } catch (e) { throw (e && e.code && e.syscall === "stat" && FS_ERRNO[e.code]) ? fsErr(e.code, "lstat", toStr(p)) : e; } }, o); return s === undefined ? undefined : ((o && o.bigint) ? mkBigIntStats(s) : fsAsStats(s)); },
+    fstatSync: (fd, o) => { const s = F.fstat(fd); return (o && o.bigint) ? mkBigIntStats(s) : fsAsStats(s); },
     fstat: (fd, o, cb) => { const fn = cb || o; if (typeof fn === "function") fn(null, fsMod.fstatSync(fd)); },
     statfsSync: () => ({ type: 0, bsize: 4096, blocks: 0, bfree: 0, bavail: 0, files: 0, ffree: 0 }),
+    // Not a node fs export: an mbun-internal helper. Left ENUMERABLE it showed
+    // up in Object.keys(require("fs")), which node's own
+    // test-permission-fs-supported reads to prove every exposed fs API is
+    // covered by the permission model — an mbun-only key fails that audit.
+    // Made non-enumerable right after this object literal (see below).
     createStatsForIno: (ino, mode) => ({ ino: ino || 0, mode: mode || 0o644, size: 0, isFile: () => (mode == null ? true : (mode & 0o170000) === 0o100000), isDirectory: () => (mode != null && (mode & 0o170000) === 0o040000), isSymbolicLink: () => false, isBlockDevice: () => false, isCharacterDevice: () => false, isFIFO: () => false, isSocket: () => false, mtime: new Date(0), atime: new Date(0), ctime: new Date(0), birthtime: new Date(0), mtimeMs: 0, atimeMs: 0, ctimeMs: 0, birthtimeMs: 0, uid: 0, gid: 0, dev: 0, nlink: 1, rdev: 0, blksize: 4096, blocks: 0 }),
     unlinkSync: (p) => F.unlink(toStr(p)),
     realpathSync: (p) => F.realpath(toStr(p)),
     renameSync: (a, b) => F.rename(toStr(a), toStr(b)),
     copyFileSync: (a, b) => F.copyFile(toStr(a), toStr(b)),
-    mkdtempSync: (pre, o) => { validatePath(pre, "prefix"); fsValidateEncoding(o); return F.mkdtemp(toStr(pre)); },
-    mkdtemp: (pre, o, cb) => { validatePath(pre, "prefix"); const fn = typeof o === "function" ? o : cb; if (typeof fn !== "function") throw fsArgTypeErr("callback", "of type function", fn); fsValidateEncoding(typeof o === "object" || typeof o === "string" ? o : undefined); G.queueMicrotask(() => { try { fn(null, F.mkdtemp(toStr(pre))); } catch (e) { fn(e); } }); },
+    mkdtempSync: (pre, o) => { validatePath(pre, "prefix"); fsWarnNonPortableTemplate(pre); fsValidateEncoding(o); return F.mkdtemp(toStr(pre)); },
+    mkdtemp: (pre, o, cb) => { validatePath(pre, "prefix"); fsWarnNonPortableTemplate(pre); const fn = typeof o === "function" ? o : cb; if (typeof fn !== "function") throw fsArgTypeErr("callback", "of type function", fn); fsValidateEncoding(typeof o === "object" || typeof o === "string" ? o : undefined); G.queueMicrotask(() => { try { fn(null, F.mkdtemp(toStr(pre))); } catch (e) { fn(e); } }); },
     // fd-level I/O: real descriptors over mbun.core.io (native pread/pwrite),
     // zero-copy typed-array boundary via __mbunFdNative.
     openSync: (p, flags, mode) => { validatePath(p); const md = mode == null ? 0o666 : fsParseFileMode(mode, "mode", 0o666); return fdRemember(globalThis.__mbunFdNative.open(toStr(p), flags == null ? "r" : toStr(flags), md), p); },
@@ -3827,8 +4879,6 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       return globalThis.__mbunFdNative.write(fd, buf, off || 0, len == null ? buf.byteLength : len, pos == null ? -1 : Number(pos));
     },
     fsyncSync: () => {}, fdatasyncSync: () => {},
-    read: (fd, buf, off, len, pos, cb) => { let fn = typeof buf === "function" ? buf : (typeof cb === "function" ? cb : (typeof pos === "function" ? pos : undefined)); if (typeof buf === "function") { fn(null, 0, undefined); return; } try { const n = fsMod.readSync(fd, buf, off, len, typeof pos === "function" ? null : pos); if (fn) fn(null, n, buf); } catch (e) { if (fn) fn(e); } },
-    write: (fd, buf, off, len, pos, cb) => { let fn; const a = [off, len, pos, cb]; for (const x of a) if (typeof x === "function") { fn = x; break; } try { const n = fsMod.writeSync(fd, buf, typeof off === "function" ? undefined : off, typeof len === "function" ? undefined : len, typeof pos === "function" ? undefined : pos); if (fn) fn(null, n, buf); } catch (e) { if (fn) fn(e); } },
     // permission/owner/time metadata: no-ops (our fs has no perm model); access
     // checks existence; readlink resolves via realpath (we have no real symlinks).
     chmodSync: (p, m) => { validatePath(p); return F.chmod(toStr(p), typeof m === "string" ? parseInt(m, 8) : (Number(m) & 0o7777)); }, fchmodSync: () => {}, lchmodSync: () => {},
@@ -3837,19 +4887,32 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     truncateSync: () => {}, ftruncateSync: () => {},
     accessSync: (p, mode) => { if (!F.exists(toStr(p))) { const e = new Error("ENOENT: no such file or directory, access '" + toStr(p) + "'"); e.code = "ENOENT"; e.errno = -2; e.path = toStr(p); throw e; } },
     readlinkSync: (p) => F.readlink(toStr(p)),
-    readlink: (p, o, cb) => { const fn = cb || o; try { fn(null, F.readlink(toStr(p))); } catch (e) { fn(e); } },
+    readlink: (p, o, cb) => { validatePath(p); fsValidateEncoding(typeof o === "function" ? undefined : o); const fn = typeof o === "function" ? o : cb; fsMakeCallback(fn); try { fn(null, F.readlink(toStr(p))); } catch (e) { fn(e); } },
     // file streams: our fs I/O is synchronous, so read pushes the whole content on
     // a microtask and write accumulates then flushes on end/close.
-    createReadStream: (p, opts) => { const rs = new Readable(); rs.path = toStr(p); rs.bytesRead = 0; const enc = typeof opts === "string" ? opts : (opts && opts.encoding); const start = (opts && typeof opts === "object") ? opts.start : undefined; const end = (opts && typeof opts === "object") ? opts.end : undefined; if (start !== undefined && typeof start !== "number") throw fsArgTypeErr("start", "of type number", start); if (end !== undefined && typeof end !== "number") throw fsArgTypeErr("end", "of type number", end); G.queueMicrotask(() => { try { const data = F.readFile(toStr(p)); rs.emit("open", 3); rs.emit("ready"); let buf = Buffer.from(data); if (typeof start === "number" || typeof end === "number") { const s = typeof start === "number" ? start : 0; const e2 = typeof end === "number" ? end + 1 : buf.length; buf = buf.subarray(s, e2); } rs.bytesRead = buf.length; rs.push(enc ? buf.toString(enc) : buf); rs.push(null); rs.emit("close"); } catch (e) { e.code = e.code || "ENOENT"; rs.emit("error", e); } }); rs.close = (cb) => { if (cb) cb(); return rs; }; return rs; },
-    createWriteStream: (p, opts) => { const wstart = (opts && typeof opts === "object") ? opts.start : undefined; if (wstart !== undefined && typeof wstart !== "number") throw fsArgTypeErr("start", "of type number", wstart); const ws = new Writable(); ws.path = toStr(p); ws.bytesWritten = 0; const parts = []; const enc = (opts && opts.encoding) || "utf8"; ws._write = (chunk, e, cb) => { const s = typeof chunk === "string" ? chunk : Buffer.from(chunk).toString(enc); parts.push(s); ws.bytesWritten += s.length; if (typeof (cb || e) === "function") (cb || e)(); }; const flush = () => { try { F.writeFile(toStr(p), parts.join("")); } catch (er) { ws.emit("error", er); } }; const superEnd = ws.end.bind(ws); ws.end = (chunk, e, cb) => { if (chunk != null && typeof chunk !== "function") ws._write(chunk, enc, null); flush(); G.queueMicrotask(() => { ws.emit("finish"); ws.emit("close"); }); const f = cb || (typeof e === "function" ? e : typeof chunk === "function" ? chunk : null); if (f) f(); return ws; }; ws.close = (cb) => { if (cb) cb(); return ws; }; G.queueMicrotask(() => { ws.emit("open", 3); ws.emit("ready"); }); return ws; },
+    createReadStream: (p, opts) => { const rs = new Readable(); rs.path = toStr(p); rs.bytesRead = 0; const enc = typeof opts === "string" ? opts : (opts && opts.encoding); const start = (opts && typeof opts === "object") ? opts.start : undefined; const end = (opts && typeof opts === "object") ? opts.end : undefined; if (start !== undefined && typeof start !== "number") throw fsArgTypeErr("start", "of type number", start); if (end !== undefined && typeof end !== "number") throw fsArgTypeErr("end", "of type number", end); G.queueMicrotask(() => { try { const data = fsMod.readFileSync(toStr(p)); rs.emit("open", 3); rs.emit("ready"); let buf = Buffer.from(data); if (typeof start === "number" || typeof end === "number") { const s = typeof start === "number" ? start : 0; const e2 = typeof end === "number" ? end + 1 : buf.length; buf = buf.subarray(s, e2); } rs.bytesRead = buf.length; rs.push(enc ? buf.toString(enc) : buf); rs.push(null); rs.emit("close"); } catch (e) { e.code = e.code || "ENOENT"; rs.emit("error", e); } }); rs.close = (cb) => { if (cb) cb(); return rs; }; return rs; },
+    createWriteStream: (p, opts) => { const wstart = (opts && typeof opts === "object") ? opts.start : undefined; if (wstart !== undefined && typeof wstart !== "number") throw fsArgTypeErr("start", "of type number", wstart); const ws = new Writable(); ws.path = toStr(p); ws.bytesWritten = 0; const parts = []; const enc = (opts && opts.encoding) || "utf8"; ws._write = (chunk, e, cb) => { const b = typeof chunk === "string" ? Buffer.from(chunk, (typeof e === "string" && e && e !== "buffer") ? e : enc) : Buffer.from(chunk); parts.push(b); ws.bytesWritten += b.length; if (typeof (cb || e) === "function") (cb || e)(); }; const flush = () => { try { fsMod.writeFileSync(toStr(p), parts.length === 1 ? parts[0] : Buffer.concat(parts)); } catch (er) { ws.emit("error", er); } }; const superEnd = ws.end.bind(ws); ws.end = (chunk, e, cb) => { if (chunk != null && typeof chunk !== "function") ws._write(chunk, enc, null); flush(); G.queueMicrotask(() => { ws.emit("finish"); ws.emit("close"); }); const f = cb || (typeof e === "function" ? e : typeof chunk === "function" ? chunk : null); if (f) f(); return ws; }; ws.close = (cb) => { if (cb) cb(); return ws; }; G.queueMicrotask(() => { ws.emit("open", 3); ws.emit("ready"); }); return ws; },
     chmod: (p, m, cb) => { validatePath(p); const fn = typeof m === "function" ? m : cb; try { if (typeof m !== "function") F.chmod(toStr(p), typeof m === "string" ? parseInt(m, 8) : (Number(m) & 0o7777)); if (typeof fn === "function") fn(null); } catch (e) { if (typeof fn === "function") fn(e); } },
     chown: (p, u, g, cb) => { const fn = cb || g; if (typeof fn === "function") fn(null); },
     utimes: (p, a, m, cb) => { const fn = cb || m; try { const s = (v) => v instanceof Date ? v.getTime() / 1000 : Number(v); F.utimes(toStr(p), s(a), s(m)); if (typeof fn === "function") fn(null); } catch (e) { if (typeof fn === "function") fn(e); } },
     access: (p, m, cb) => { const fn = cb || m; try { if (!F.exists(toStr(p))) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" }); fn(null); } catch (e) { fn(e); } },
     symlink: (t, p2, a, cb) => { const fn = cb || (typeof a === "function" ? a : undefined); try { F.symlink(toStr(t), toStr(p2)); fn && fn(null); } catch (e) { fn && fn(e); } },
     symlinkSync: (target, path2) => F.symlink(toStr(target), toStr(path2)),
-    cpSync: (src, dest, o) => cpRec(toStr(src), toStr(dest), o),
-    cp: (src, dest, o, cb) => { const fn = typeof o === "function" ? o : cb; if (typeof fn !== "function") { const e = new TypeError('The "cb" argument must be of type function. Received ' + (fn === undefined ? "undefined" : typeof fn)); e.code = "ERR_INVALID_ARG_TYPE"; throw e; } try { cpRec(toStr(src), toStr(dest), typeof o === "object" ? o : undefined); fn(null); } catch (e) { fn(e); } },
+    cpSync: (src, dest, o) => { validatePath(src, "src"); validatePath(dest, "dest"); return cpRec(toStr(src), toStr(dest), o); },
+    // node fs.cp: the callback and the options are validated SYNCHRONOUSLY
+    // (ERR_INVALID_ARG_TYPE / ERR_OUT_OF_RANGE) before any copying starts.
+    cp: (src, dest, o, cb) => {
+      const fn = typeof o === "function" ? o : cb;
+      fsMakeCallback(fn);
+      const opts = cpValidateOptions(typeof o === "function" ? undefined : o);
+      validatePath(src, "src"); validatePath(dest, "dest");
+      // fn must NOT run inside a try that also wraps the copy: it used to, so a
+      // callback that threw was invoked a second time with its own error
+      // (mustCall double-count + a bogus err.code in the report).
+      G.queueMicrotask(() => {
+        cpRecAsync(toStr(src), toStr(dest), opts).then(() => fn(null), (e) => fn(e));
+      });
+    },
     // node fs.globSync (blueprint bun-ref/src/js/internal/fs/glob.ts): yields
     // matched files AND directories, defaults cwd to process.cwd() (so it
     // tracks process.chdir), and — with withFileTypes — hands Dirents to both
@@ -3900,15 +4963,65 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       }
       return out;
     },
-    glob: (pat, o, cb) => { const fn = typeof o === "function" ? o : cb; if (typeof fn !== "function") throw new TypeError("The \"callback\" argument must be of type function."); try { fn(null, fsMod.globSync(pat, typeof o === "object" ? o : undefined)); } catch (e) { fn(e); } },
-    readFile: (p, a, b) => { const cb = b || a; try { cb(null, F.readFile(toStr(p))); } catch (e) { cb(e); } },
-    writeFile: (p, d, a, b) => { const cb = b || a; try { F.writeFile(toStr(p), toStr(d)); cb(null); } catch (e) { cb(e); } },
+    // The callback must be invoked EXACTLY once: it used to run inside the try
+    // that also wrapped globSync, so a callback that threw was called a second
+    // time with its own error instead of the throw reaching uncaughtException
+    // (test-fs-glob-throw).
+    glob: (pat, o, cb) => {
+      const fn = typeof o === "function" ? o : cb;
+      if (typeof fn !== "function") cbTypeError();
+      let res, err = null;
+      try { res = fsMod.globSync(pat, (o !== null && typeof o === "object") ? o : undefined); } catch (e) { err = e; }
+      // …and it must run on a LATER turn. Called inline it threw straight out
+      // of the caller — at module scope that is a fatal evaluation error, where
+      // node's async glob turns it into an uncaughtException the test is
+      // listening for (test-fs-glob-throw).
+      G.queueMicrotask(() => { if (err) fn(err); else fn(null, res); });
+    },
+    // fs.readFile went through F.readFile, which UTF-8-decodes and takes only a
+    // path: a numeric fd was stringified into a *path* (open '1000'), the
+    // encoding option was ignored, and the callback ran synchronously. Now it
+    // shares readFileSync's fd-aware byte-exact path and defers a tick, with
+    // options.signal honoured (ref lib/fs.js readFile).
+    readFile: (p, a, b) => {
+      const cb = typeof a === "function" ? a : b;
+      const o = (a !== null && (typeof a === "object" || typeof a === "string")) ? a : undefined;
+      fsMakeCallback(cb);
+      if (typeof p !== "number") validatePath(p);
+      fsValidateEncoding(o);
+      const sig = fsValidateSignalOpt(o);
+      // A MACROtask, not a microtask: node reads through the thread pool, so the
+      // callback always lands in a later loop turn than any process.nextTick.
+      // Deferring by a microtask ran BEFORE a nextTick-scheduled abort() and so
+      // reported success where node reports AbortError
+      // (test-fs-readfile / test-fs-write-file "cancellation, during read").
+      G.setImmediate(() => {
+        if (sig && sig.aborted) return cb(fsAbortError());
+        let res, err = null;
+        try { res = fsMod.readFileSync(p, o); } catch (e) { err = e; }
+        if (err === null && sig && sig.aborted) err = fsAbortError();
+        if (err !== null) cb(err); else cb(null, res);
+      });
+    },
+    writeFile: (p, d, a, b) => {
+      const cb = typeof a === "function" ? a : b;
+      const o = (a !== null && (typeof a === "object" || typeof a === "string")) ? a : undefined;
+      fsMakeCallback(cb);
+      const sig = fsValidateSignalOpt(o);
+      const flush = fsFlushOf(o);
+      G.setImmediate(() => {
+        if (sig && sig.aborted) return cb(fsAbortError());
+        let err = null, owns = false;
+        try { owns = fsWriteThenFlush(fsMod.writeFileSync, p, d, o, flush, cb); } catch (e) { err = e; }
+        if (err !== null) cb(err); else if (!owns) cb(null);
+      });
+    },
     mkdir: (p, a, b) => { validatePath(p); const cb = b || a; const [rec, mode] = mkdirOpts(typeof a === "object" || typeof a === "number" || typeof a === "string" ? a : null); try { const __r = F.mkdir(toStr(p), rec, mode); cb(null, __r); } catch (e) { e.path = toStr(p); cb(e); } },
     // callback-style async (node passes (err, result); mirror the *Sync impls).
     stat: (p, a, b) => { const cb = typeof a === "function" ? a : b; try { cb(null, fsMod.statSync(toStr(p))); } catch (e) { cb(e); } },
     lstat: (p, a, b) => { const cb = typeof a === "function" ? a : b; try { cb(null, fsMod.lstatSync(toStr(p))); } catch (e) { cb(e); } },
     readdir: (p, a, b) => { const cb = typeof a === "function" ? a : b; const o = (typeof a === "object" || typeof a === "string") ? a : undefined; try { cb(null, fsMod.readdirSync(p, o)); } catch (e) { cb(e); } },
-    unlink: (p, cb) => { try { F.unlink(toStr(p)); cb && cb(null); } catch (e) { cb && cb(e); } },
+    unlink: (p, cb) => { validatePath(p); fsMakeCallback(cb); try { F.unlink(toStr(p)); cb(null); } catch (e) { cb(e); } },
     realpath: (p, a, b) => { const cb = typeof a === "function" ? a : b; try { cb(null, F.realpath(toStr(p))); } catch (e) { cb(e); } },
     rename: (a2, b2, cb) => { try { F.rename(toStr(a2), toStr(b2)); cb && cb(null); } catch (e) { cb && cb(e); } },
     copyFile: (a2, b2, m, cb) => { const fn = typeof m === "function" ? m : cb; try { F.copyFile(toStr(a2), toStr(b2)); fn && fn(null); } catch (e) { fn && fn(e); } },
@@ -3917,19 +5030,23 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       const o = (typeof a === "object" || typeof a === "string") ? a : undefined;
       fsValidateEncoding(o);
       const cb = typeof a === "function" ? a : b;
-      try {
-        if (typeof p === "number") {
-          const FD = globalThis.__mbunFdNative;
-          const enc = typeof o === "string" ? o : (o && o.encoding) || "utf8";
-          const bb = typeof d === "string" ? Buffer.from(d, enc) : Buffer.from(d);
-          FD.write(p, new Uint8Array(bb.buffer, bb.byteOffset, bb.byteLength), 0, bb.byteLength, -1);
-        } else { F.appendFile(toStr(p), toStr(d)); }
-        cb && cb(null);
-      } catch (e) { cb && cb(e); }
+      const flush = fsFlushOf(o);
+      const done = (e) => { if (cb) cb(e); };
+      let err = null, owns = false;
+      try { owns = fsWriteThenFlush(fsMod.appendFileSync, p, d, o, flush, done); } catch (e) { err = e; }
+      if (err !== null) done(err); else if (!owns) done(null);
     },
     rm: (p, a, b) => { const cb = typeof a === "function" ? a : b; const o = typeof a === "object" ? a : undefined; try { F.rm(toStr(p), recur(o), !!(o && o.force)); cb && cb(null); } catch (e) { cb && cb(e); } },
     rmdir: (p, a, b) => { const cb = typeof a === "function" ? a : b; try { F.rm(toStr(p), recur(typeof a === "object" ? a : null), true); cb && cb(null); } catch (e) { cb && cb(e); } },
-    exists: (p, cb) => { try { cb && cb(F.exists(toStr(p))); } catch (e) { cb && cb(false); } },
+    // node fs.exists: the callback is mandatory (ERR_INVALID_ARG_TYPE without
+    // it) and receives a single boolean — an invalid path is `false`, never a
+    // throw. ref lib/fs.js exists.
+    exists: (p, cb) => {
+      fsMakeCallback(cb);
+      let ok = false;
+      try { validatePath(p); ok = F.exists(toStr(p)); } catch (e) { ok = false; }
+      G.queueMicrotask(() => cb(ok));
+    },
     truncate: (p, a, b) => { const cb = typeof a === "function" ? a : b; if (typeof cb === "function") cb(null); },
     ftruncate: (fd, a, b) => { const cb = typeof a === "function" ? a : b; if (typeof cb === "function") cb(null); },
     // node fs.open(path[, flags[, mode]], callback): validate path + mode + the
@@ -3971,9 +5088,19 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   // node DEP0180 Stats constructor (callable with or without `new`); field
   // order per lib/internal/fs/utils.js. statSync builds its own result objects
   // natively — this is the public `fs.Stats` class for `new Stats(...)` users.
+  let showStatsDeprecation = true;
   function Stats(dev, mode, nlink, uid, gid, rdev, blksize, ino, size, blocks,
                  atimeMs, mtimeMs, ctimeMs, birthtimeMs) {
     if (!(this instanceof Stats)) return new Stats(dev, mode, nlink, uid, gid, rdev, blksize, ino, size, blocks, atimeMs, mtimeMs, ctimeMs, birthtimeMs);
+    // DEP0180 is a real runtime deprecation, emitted ONCE on first use. It was
+    // only documented in the comment above; test-fs-stat asserts the warning
+    // actually fires (common.expectWarning).
+    if (showStatsDeprecation) {
+      showStatsDeprecation = false;
+      if (G.process && typeof G.process.emitWarning === "function")
+        G.process.emitWarning("fs.Stats constructor is deprecated.",
+                              "DeprecationWarning", "DEP0180");
+    }
     this.dev = dev; this.mode = mode; this.nlink = nlink; this.uid = uid; this.gid = gid;
     this.rdev = rdev; this.blksize = blksize; this.ino = ino; this.size = size; this.blocks = blocks;
     this.atimeMs = atimeMs; this.mtimeMs = mtimeMs; this.ctimeMs = ctimeMs; this.birthtimeMs = birthtimeMs;
@@ -3999,8 +5126,26 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     this.rdev = rdev; this.blksize = blksize; this.ino = ino; this.size = size; this.blocks = blocks;
     this.atimeMs = atimeMs; this.mtimeMs = mtimeMs; this.ctimeMs = ctimeMs; this.birthtimeMs = birthtimeMs;
     this.atimeNs = atimeNs; this.mtimeNs = mtimeNs; this.ctimeNs = ctimeNs; this.birthtimeNs = birthtimeNs;
-    this.atime = new Date(Number(atimeMs)); this.mtime = new Date(Number(mtimeMs));
-    this.ctime = new Date(Number(ctimeMs)); this.birthtime = new Date(Number(birthtimeMs));
+  }
+  // atime/mtime/ctime/birthtime are LAZY PROTOTYPE accessors, not own data
+  // properties — node defines them on StatsBase.prototype and materialises an
+  // own property only on first read (lib/internal/fs/utils.js dateFromMs +
+  // ObjectDefineProperties(StatsBase.prototype, ...)). The difference is
+  // observable: assert.deepStrictEqual compares OWN enumerable keys, so a
+  // freshly built BigIntStats that already carries four Date properties can
+  // never equal node's own freshly built one, which carries none
+  // (test-fs-watchfile-bigint compares an all-zero pair key-for-key).
+  for (const name of ["atime", "mtime", "ctime", "birthtime"]) {
+    const msKey = name + "Ms";
+    Object.defineProperty(BigIntStats.prototype, name, {
+      configurable: true, enumerable: true,
+      get() {
+        const d = new Date(Number(this[msKey]));
+        Object.defineProperty(this, name, { value: d, writable: true, enumerable: true, configurable: true });
+        return d;
+      },
+      set(v) { Object.defineProperty(this, name, { value: v, writable: true, enumerable: true, configurable: true }); },
+    });
   }
   BigIntStats.prototype.isFile = function () { return (this.mode & 0o170000n) === 0o100000n; };
   BigIntStats.prototype.isDirectory = function () { return (this.mode & 0o170000n) === 0o040000n; };
@@ -4030,33 +5175,91 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     if (opts == null) return;
     const enc = typeof opts === "string" ? opts : (typeof opts === "object" ? opts.encoding : undefined);
     if (enc == null) return;
-    if (!VALID_ENCODINGS[String(enc).toLowerCase()]) { const e = new TypeError("The argument 'encoding' is invalid. Received " + (typeof enc === "string" ? "'" + enc + "'" : String(enc))); e.code = "ERR_INVALID_ARG_VALUE"; throw e; }
+    // node assertEncoding passes reason 'is invalid encoding' (not the default
+    // 'is invalid') to ERR_INVALID_ARG_VALUE, and the received value is
+    // inspect()-ed.
+    if (!VALID_ENCODINGS[String(enc).toLowerCase()])
+      throw nodeArgValueError("encoding", enc, "is invalid encoding");
   };
-  const cbTypeError = () => { const e = new TypeError('The "callback" argument must be of type function.'); e.code = "ERR_INVALID_ARG_TYPE"; throw e; };
+  const cbTypeError = () => { const e = new TypeError('The "callback" argument must be of type function.'); e.code = "ERR_INVALID_ARG_TYPE"; throw nodeErrToString(e, "ERR_INVALID_ARG_TYPE"); };
   class Dir {
-    constructor(path, entries, encoding) { this._path = path; this._entries = entries; this._i = 0; this._closed = false; this._encoding = encoding || "utf8"; }
-    get path() { return this._path; }
+    constructor(path, entries, encoding) {
+      // node's Dir constructor is not usable from userland: `new fs.Dir()`
+      // throws ERR_MISSING_ARGS (lib/internal/fs/dir.js).
+      if (path === undefined) { const e = new TypeError('The "handle" argument must be specified'); e.code = "ERR_MISSING_ARGS"; throw e; }
+      this._path = path; this._entries = entries; this._i = 0; this._closed = false; this._pending = 0; this._encoding = encoding || "utf8";
+    }
+    // node validateThisInternalField: reading `Dir.prototype.path` (no instance
+    // slots) is ERR_INVALID_THIS, not `undefined`.
+    get path() {
+      if (this._path === undefined) { const e = new TypeError("Value of \"this\" must be of type Dir"); e.code = "ERR_INVALID_THIS"; throw e; }
+      return this._path;
+    }
+    // for await (const dirent of dir) — closes the handle when iteration ends,
+    // breaks, returns or throws (node lib/internal/fs/dir.js).
+    [Symbol.asyncIterator]() {
+      const self = this;
+      return {
+        [Symbol.asyncIterator]() { return this; },
+        next() {
+          if (self._closed) return Promise.resolve({ value: undefined, done: true });
+          const ent = self._next();
+          if (ent === null) { self._closed = true; return Promise.resolve({ value: undefined, done: true }); }
+          return Promise.resolve({ value: ent, done: false });
+        },
+        return() { self._closed = true; return Promise.resolve({ value: undefined, done: true }); },
+        throw(err) { self._closed = true; return Promise.reject(err); },
+      };
+    }
     _guard() { if (this._closed) { const e = new Error("Directory handle was closed"); e.code = "ERR_DIR_CLOSED"; throw e; } }
     _decode(name) { const enc = this._encoding; if (enc === "utf8" || enc === "utf-8" || enc === "buffer") return name; return Buffer.from(name, "utf8").toString(enc); }
     _next() { if (this._i >= this._entries.length) return null; const e = this._entries[this._i++]; return new fsMod.Dirent(this._decode(e.name), e.type, this._path); }
-    readSync() { this._guard(); return this._next(); }
-    read(cb) { if (cb !== undefined && typeof cb !== "function") cbTypeError(); this._guard(); if (typeof cb === "function") { const ent = this._next(); G.queueMicrotask(() => cb(null, ent)); return; } return Promise.resolve(this._next()); }
-    closeSync() { this._guard(); this._closed = true; }
-    close(cb) { if (cb !== undefined && typeof cb !== "function") cbTypeError(); this._guard(); this._closed = true; if (typeof cb === "function") { G.queueMicrotask(() => cb(null)); return; } return Promise.resolve(); }
+    // node forbids a SYNC op while an async one is outstanding
+    // (ERR_DIR_CONCURRENT_OPERATION, lib/internal/fs/dir.js).
+    _busy() {
+      if (this._pending > 0) {
+        const e = new Error("Cannot do a synchronous work while an asynchronous operation is in progress");
+        e.code = "ERR_DIR_CONCURRENT_OPERATION";
+        throw e;
+      }
+    }
+    readSync() { this._busy(); this._guard(); return this._next(); }
+    // The promise form REJECTS on a closed handle (node lib/internal/fs/dir.js);
+    // only the sync/callback forms throw.
+    read(cb) {
+      if (cb !== undefined && typeof cb !== "function") cbTypeError();
+      if (typeof cb === "function") { this._guard(); const ent = this._next(); G.queueMicrotask(() => cb(null, ent)); return; }
+      try { this._guard(); } catch (e) { return Promise.reject(e); }
+      this._pending++;
+      return Promise.resolve().then(() => { this._pending--; return this._next(); });
+    }
+    closeSync() { this._busy(); this._guard(); this._closed = true; }
+    close(cb) {
+      if (cb !== undefined && typeof cb !== "function") cbTypeError();
+      if (typeof cb === "function") {
+        // The callback form REPORTS a closed handle through the callback.
+        if (this._closed) { let e; try { this._guard(); } catch (err) { e = err; } G.queueMicrotask(() => cb(e)); return; }
+        this._closed = true; G.queueMicrotask(() => cb(null)); return;
+      }
+      try { this._guard(); } catch (e) { return Promise.reject(e); }
+      this._pending++;
+      return Promise.resolve().then(() => { this._pending--; this._closed = true; });
+    }
     [Symbol.dispose]() { this._closed = true; }
     [Symbol.asyncDispose]() { this._closed = true; return Promise.resolve(); }
   }
   fsMod.Dir = Dir;
   const openDirImpl = (p, opts) => {
+    validatePath(p);
+    if (opts && typeof opts === "object" && opts.bufferSize !== undefined)
+      fsValidateInteger(opts.bufferSize, "options.bufferSize", 1);
     const path2 = toStr(p);
     let encoding = "utf8";
     if (typeof opts === "string") encoding = opts;
     else if (opts && typeof opts === "object" && opts.encoding != null) encoding = opts.encoding;
-    if (!VALID_ENCODINGS[String(encoding).toLowerCase()]) {
-      const e = new TypeError("The argument 'encoding' is invalid. Received " + JSON.stringify(encoding));
-      e.code = "ERR_INVALID_ARG_VALUE";
-      throw e;
-    }
+    // node assertEncoding: reason 'is invalid encoding', value inspect()-ed.
+    if (!VALID_ENCODINGS[String(encoding).toLowerCase()])
+      throw nodeArgValueError("encoding", encoding, "is invalid encoding");
     const st = F.stat(path2, true); // throws ENOENT (Error) when missing
     if (!(st && st.isDirectory && st.isDirectory())) {
       const e = new Error("ENOTDIR: not a directory, opendir '" + path2 + "'");
@@ -4066,11 +5269,23 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     const entries = F.readdir(path2).map((n) => { let t = 1; try { t = F.stat(path2 + "/" + n)._isDir ? 2 : 1; } catch (e) { t = 3; } return { name: n, type: t }; });
     return new Dir(path2, entries, String(encoding).toLowerCase());
   };
+  fsMod.mkdtempDisposableSync = (prefix, o) => {
+    validatePath(prefix, "prefix"); fsValidateEncoding(o);
+    const dir = F.mkdtemp(toStr(prefix));
+    const abs = dir[0] === "/" ? dir : (G.process.cwd() + "/" + dir);
+    let removed = false;
+    const remove = () => { if (removed) return; F.rm(abs, true, false); removed = true; };
+    return { path: dir, remove, [Symbol.dispose]: remove };
+  };
   fsMod.opendirSync = (p, opts) => openDirImpl(p, opts);
   fsMod.opendir = (p, options, cb) => {
     const fn = typeof options === "function" ? options : cb;
     if (typeof fn !== "function") cbTypeError();
     const opts = typeof options === "object" || typeof options === "string" ? options : undefined;
+    // node validates the path (and bufferSize) SYNCHRONOUSLY, before the work.
+    validatePath(p);
+    if (opts && typeof opts === "object" && opts.bufferSize !== undefined)
+      fsValidateInteger(opts.bufferSize, "options.bufferSize", 1);
     G.queueMicrotask(() => { try { fn(null, openDirImpl(p, opts)); } catch (e) { fn(e); } });
   };
   fsMod.Dirent = class Dirent {
@@ -4089,40 +5304,79 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   // mbun has no fd->path map or permission model the syscall stays a no-op AFTER validation.
   const fsIntU32 = (v, name) => fsValidateInteger(v, name, -1, 4294967295);
   const fsAsyncOk = (fn) => { const cb = fsMakeCallback(fn); G.queueMicrotask(() => cb(null)); };
-  fsMod.fchmodSync = (fd, mode) => { fsValidateFd(fd); const m = fsParseFileMode(mode, "mode"); const p = fdPathMap.get(fd); if (p != null) F.chmod(p, m); };
-  fsMod.fchmod = (fd, mode, cb) => { fsValidateFd(fd); const m = fsParseFileMode(mode, "mode"); const p = fdPathMap.get(fd); try { if (p != null) F.chmod(p, m); } catch (e) {} fsAsyncOk(cb); };
+  fsMod.fchmodSync = (fd, mode) => { fsValidateFd(fd); const m = fsParseFileMode(mode, "mode"); fsCheckFd(fd, "fchmod"); const p = fdPathMap.get(fd); if (p != null) F.chmod(p, m); };
+  fsMod.fchmod = (fd, mode, cb) => { fsValidateFd(fd); const m = fsParseFileMode(mode, "mode"); const p = fdPathMap.get(fd); try { if (fsFdIsValid(fd) && p != null) F.chmod(p, m); } catch (e) {} fsAsyncFd(fd, "fchmod", cb); };
   fsMod.lchmodSync = (path, mode) => { validatePath(path); fsParseFileMode(mode, "mode"); };
   fsMod.lchmod = (path, mode, cb) => { validatePath(path); fsParseFileMode(mode, "mode"); fsAsyncOk(cb); };
-  fsMod.fchownSync = (fd, uid, gid) => { fsValidateFd(fd); fsIntU32(uid, "uid"); fsIntU32(gid, "gid"); };
-  fsMod.fchown = (fd, uid, gid, cb) => { fsValidateFd(fd); fsIntU32(uid, "uid"); fsIntU32(gid, "gid"); fsAsyncOk(cb); };
-  fsMod.lchownSync = (path, uid, gid) => { validatePath(path); fsIntU32(uid, "uid"); fsIntU32(gid, "gid"); };
-  fsMod.lchown = (path, uid, gid, cb) => { validatePath(path); fsIntU32(uid, "uid"); fsIntU32(gid, "gid"); fsAsyncOk(cb); };
-  fsMod.chownSync = (path, uid, gid) => { validatePath(path); fsIntU32(uid, "uid"); fsIntU32(gid, "gid"); };
-  fsMod.chown = (path, uid, gid, cb) => { validatePath(path); fsIntU32(uid, "uid"); fsIntU32(gid, "gid"); fsAsyncOk(cb); };
-  fsMod.fsyncSync = (fd) => { fsValidateFd(fd); };
-  fsMod.fdatasyncSync = (fd) => { fsValidateFd(fd); };
-  fsMod.fsync = (fd, cb) => { fsValidateFd(fd); fsAsyncOk(cb); };
-  fsMod.fdatasync = (fd, cb) => { fsValidateFd(fd); fsAsyncOk(cb); };
+  fsMod.fchownSync = (fd, uid, gid) => { fsValidateFd(fd); fsIntU32(uid, "uid"); fsIntU32(gid, "gid"); fsCheckFd(fd, "fchown"); };
+  fsMod.fchown = (fd, uid, gid, cb) => { fsValidateFd(fd); fsIntU32(uid, "uid"); fsIntU32(gid, "gid"); fsAsyncFd(fd, "fchown", cb); };
+  // chown/lchown have no native row (mbun never changes ownership), but they
+  // must still FAIL like node's when the path does not exist — a silent success
+  // is not a stub, it is a wrong answer (test-fs-error-messages' chown block).
+  const fsChownEnoent = (path, syscall) => {
+    const p = toStr(path);
+    if (!F.exists(p)) throw fsErr("ENOENT", syscall, p);
+  };
+  const fsAsyncChown = (path, syscall, fn) => {
+    const cb = fsMakeCallback(fn);
+    let err = null;
+    try { fsChownEnoent(path, syscall); } catch (e) { err = e; }
+    G.queueMicrotask(() => cb(err));
+  };
+  fsMod.lchownSync = (path, uid, gid) => { validatePath(path); fsIntU32(uid, "uid"); fsIntU32(gid, "gid"); fsChownEnoent(path, "lchown"); };
+  fsMod.lchown = (path, uid, gid, cb) => { validatePath(path); fsIntU32(uid, "uid"); fsIntU32(gid, "gid"); fsAsyncChown(path, "lchown", cb); };
+  fsMod.chownSync = (path, uid, gid) => { validatePath(path); fsIntU32(uid, "uid"); fsIntU32(gid, "gid"); fsChownEnoent(path, "chown"); };
+  fsMod.chown = (path, uid, gid, cb) => { validatePath(path); fsIntU32(uid, "uid"); fsIntU32(gid, "gid"); fsAsyncChown(path, "chown", cb); };
+  fsMod.fsyncSync = (fd) => { fsValidateFd(fd); fsCheckFd(fd, "fsync"); };
+  fsMod.fdatasyncSync = (fd) => { fsValidateFd(fd); fsCheckFd(fd, "fdatasync"); };
+  fsMod.fsync = (fd, cb) => { fsValidateFd(fd); fsAsyncFd(fd, "fsync", cb); };
+  fsMod.fdatasync = (fd, cb) => { fsValidateFd(fd); fsAsyncFd(fd, "fdatasync", cb); };
   fsMod.futimesSync = (fd) => { fsValidateFd(fd); };
   fsMod.futimes = (fd, a, m, cb) => { fsValidateFd(fd); fsAsyncOk(typeof cb === "function" ? cb : m); };
   fsMod.ftruncateSync = (fd, len) => { fsValidateFd(fd); if (len != null) fsValidateInteger(len, "len"); };
   fsMod.ftruncate = (fd, len, cb) => { fsValidateFd(fd); if (typeof len === "number") fsValidateInteger(len, "len"); fsAsyncOk(typeof len === "function" ? len : cb); };
-  fsMod.linkSync = (a, b) => { validatePath(a, "existingPath"); validatePath(b, "newPath"); return F.copyFile(toStr(a), toStr(b)); };
-  fsMod.link = (a, b, cb) => { validatePath(a, "existingPath"); validatePath(b, "newPath"); const fn = fsMakeCallback(cb); try { F.copyFile(toStr(a), toStr(b)); G.queueMicrotask(() => fn(null)); } catch (e) { G.queueMicrotask(() => fn(e)); } };
+  fsMod.linkSync = (a, b) => { validatePath(a, "existingPath"); validatePath(b, "newPath"); return F.link(toStr(a), toStr(b)); };
+  fsMod.link = (a, b, cb) => { validatePath(a, "existingPath"); validatePath(b, "newPath"); const fn = fsMakeCallback(cb); try { F.link(toStr(a), toStr(b)); G.queueMicrotask(() => fn(null)); } catch (e) { G.queueMicrotask(() => fn(e)); } };
   fsMod.renameSync = (a, b) => { validatePath(a, "oldPath"); validatePath(b, "newPath"); return F.rename(toStr(a), toStr(b)); };
   fsMod.rename = (a, b, cb) => { validatePath(a, "oldPath"); validatePath(b, "newPath"); const fn = fsMakeCallback(cb); try { F.rename(toStr(a), toStr(b)); G.queueMicrotask(() => fn(null)); } catch (e) { G.queueMicrotask(() => fn(e)); } };
   fsMod.unlinkSync = (p) => { validatePath(p); return F.unlink(toStr(p)); };
   fsMod.readlinkSync = (p) => { validatePath(p); return F.readlink(toStr(p)); };
-  fsMod.copyFileSync = (a, b, m) => { validatePath(a, "src"); validatePath(b, "dest"); return F.copyFile(toStr(a), toStr(b)); };
-  fsMod.stat = (p, a, b) => { validatePath(p); const cb = fsMakeCallback(typeof a === "function" ? a : b); try { cb(null, fsMod.statSync(p, typeof a === "object" ? a : undefined)); } catch (e) { cb(e); } };
+  // node getValidMode(mode, "copyFile") / ("access"): a non-integer mode is
+  // ERR_INVALID_ARG_TYPE, an out-of-range one ERR_OUT_OF_RANGE.
+  const fsValidCopyMode = (m) => (m == null ? 0 : fsValidateInteger(m, "mode", 0, 7));
+  const fsValidAccessMode = (m) => (m == null ? 0 : fsValidateInteger(m, "mode", 0, 7));
+  // node CopyFile honours the mode flags: COPYFILE_EXCL (1) fails EEXIST when
+  // dest exists. The native row takes no mode, so the flag is enforced here and
+  // every native failure is re-shaped with syscall 'copyfile' + path/dest (the
+  // corpus compares "EEXIST: file already exists, copyfile 'src' -> 'dest'").
+  const fsCopyFileImpl = (a, b, m) => {
+    const mode = fsValidCopyMode(m);
+    const s = toStr(a), d = toStr(b);
+    // COPYFILE_EXCL is enforced by open(dest, O_EXCL) INSIDE the copy, so a
+    // missing SOURCE still reports ENOENT — checking the dest first turned that
+    // case into EEXIST (test-fs-error-messages' "the source does not exist").
+    if ((mode & 1) !== 0 && F.exists(d)) {
+      if (!F.exists(s)) throw fsErr("ENOENT", "copyfile", s, d);
+      throw fsErr("EEXIST", "copyfile", s, d);
+    }
+    try { return F.copyFile(s, d); }
+    catch (e) { throw (e && e.code && FS_ERRNO[e.code]) ? fsErr(e.code, "copyfile", s, d) : e; }
+  };
+  fsMod.copyFileSync = (a, b, m) => { validatePath(a, "src"); validatePath(b, "dest"); return fsCopyFileImpl(a, b, m); };
+  // node fs.stat(path[, options], callback) honours options.signal: an already
+  // aborted signal never reaches the syscall and the callback receives an
+  // AbortError (ref lib/fs.js stat, test-fs-stat-abort-test).
+  fsMod.stat = (p, a, b) => {
+    validatePath(p);
+    const cb = fsMakeCallback(typeof a === "function" ? a : b);
+    const o = (a !== null && typeof a === "object") ? a : undefined;
+    const sig = fsValidateSignalOpt(o);
+    if (sig && sig.aborted) { const ae = fsAbortError(); G.queueMicrotask(() => cb(ae)); return; }
+    try { cb(null, fsMod.statSync(p, o)); } catch (e) { cb(e); }
+  };
   fsMod.lstat = (p, a, b) => { validatePath(p); const cb = fsMakeCallback(typeof a === "function" ? a : b); try { cb(null, fsMod.lstatSync(p, typeof a === "object" ? a : undefined)); } catch (e) { cb(e); } };
-  fsMod.fstatSync = (fd, o) => { fsValidateFd(fd); const s = F.fstat(fd); return (o && o.bigint) ? mkBigIntStats(s) : Object.setPrototypeOf(s, Stats.prototype); };
+  fsMod.fstatSync = (fd, o) => { fsValidateFd(fd); const s = fsStatOrNoEntry(() => F.fstat(fd), o); return s === undefined ? undefined : ((o && o.bigint) ? mkBigIntStats(s) : fsAsStats(s)); };
   fsMod.fstat = (fd, a, b) => { fsValidateFd(fd); const cb = fsMakeCallback(typeof a === "function" ? a : b); try { cb(null, fsMod.fstatSync(fd, typeof a === "object" ? a : undefined)); } catch (e) { cb(e); } };
-  // NOTE: fs.read / fs.readSync are intentionally NOT wrapped here. A validating
-  // rewrite regressed valid overloads (offset:null default, options-object form,
-  // promises optional-params) while yielding no net gain — test-fs-read-type /
-  // test-fs-read need exact byte-for-byte range messages that are out of scope.
-  // Left to the dedicated read-validation follow-up.
   // Path-type validation for the content/dir ops — node validates the path
   // synchronously (before the callback runs), so an invalid path type throws
   // ERR_INVALID_ARG_TYPE rather than reaching the fs work. readFile/writeFile
@@ -4144,108 +5398,1007 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   fsMod.realpath = wrapPath(fsMod.realpath, validatePath);
   fsMod.realpathSync.native = fsMod.realpathSync;
   fsMod.symlinkSync = wrapPath(fsMod.symlinkSync, validatePath);
+  // ---- fs.access / fs.accessSync (node lib/fs.js access, uv_fs_access) ----
+  // The old shim only asked "does the path exist?", so W_OK on a 0o444 file
+  // succeeded and the reported error carried neither syscall nor path
+  // (test-fs-access). R_OK/W_OK/X_OK are exactly the POSIX rwx bits, so the
+  // check is the stat mode triad selected by euid/egid — the same answer
+  // access(2) gives for the single-group case.
+  const fsAccessCheck = (p, mode) => {
+    const path2 = toStr(p);
+    let st;
+    try { st = F.stat(path2); } catch (e) { throw (e && e.code && FS_ERRNO[e.code]) ? fsErr(e.code, "access", path2) : fsErr("ENOENT", "access", path2); }
+    const m = mode == null ? 0 : Number(mode);
+    if (m === 0) return;
+    const stMode = Number(st.mode);
+    const uid = (G.process && typeof G.process.getuid === "function") ? G.process.getuid() : -1;
+    const gid = (G.process && typeof G.process.getgid === "function") ? G.process.getgid() : -1;
+    if (uid === 0) {
+      // root bypasses r/w; x still needs at least one execute bit set.
+      if ((m & 1) !== 0 && (stMode & 0o111) === 0) throw fsErr("EACCES", "access", path2);
+      return;
+    }
+    let bits;
+    if (Number(st.uid) === uid) bits = (stMode >> 6) & 7;
+    else if (Number(st.gid) === gid) bits = (stMode >> 3) & 7;
+    else bits = stMode & 7;
+    if ((m & ~bits) !== 0) throw fsErr("EACCES", "access", path2);
+  };
+  fsMod.accessSync = (p, mode) => { validatePath(p); fsValidAccessMode(mode); fsAccessCheck(p, mode); };
+  fsMod.access = (p, mode, cb) => {
+    validatePath(p);
+    const fn = fsMakeCallback(typeof mode === "function" ? mode : cb);
+    const m = typeof mode === "function" ? 0 : mode;
+    fsValidAccessMode(m);
+    let err = null;
+    try { fsAccessCheck(p, m); } catch (e) { err = e; }
+    G.queueMicrotask(() => fn(err));
+  };
   // node only exposes lchmod/lchmodSync on platforms with the lchmod(2) syscall
   // (macOS / constants.O_SYMLINK defined). On Linux they are undefined and the
   // corpus guards on `if (fs.lchmod)`; a no-op stub would wrongly run those
   // branches (a symlink's mode is always 0o777, so chmod-to-0o644 fails).
   if (process.platform !== "darwin") { delete fsMod.lchmod; delete fsMod.lchmodSync; }
+  // ===== errno-shaped errors + the ops that had no real syscall behind them =====
+  // node's fs errors carry { code, errno, syscall, path } and a message of the
+  // form "CODE: description, syscall 'path'". Building them here (instead of a
+  // bare Error) is what makes the corpus's `{ code }` matchers and the
+  // `err.message.includes(path)` assertions hold.
+  const FS_ERRNO = { __proto__: null,
+    ENOENT: [-2, "no such file or directory"], ENOTDIR: [-20, "not a directory"],
+    ENOTEMPTY: [-39, "directory not empty"], EISDIR: [-21, "illegal operation on a directory"],
+    EBADF: [-9, "bad file descriptor"], EEXIST: [-17, "file already exists"],
+    EPERM: [-1, "operation not permitted"], EACCES: [-13, "permission denied"],
+    EINVAL: [-22, "invalid argument"], ENOSYS: [-38, "function not implemented"],
+    // uv_strerror(UV_ELOOP). Reached by the realpath resolver's follow-stat on a
+    // symlink cycle, which is the only way node detects one.
+    ELOOP: [-40, "too many symbolic links encountered"] };
+  const fsErr = (code, syscall, path2, dest) => {
+    const info = FS_ERRNO[code] || [-1, "unknown error"];
+    let msg = code + ": " + info[1] + ", " + syscall;
+    if (path2 !== undefined) msg += " '" + path2 + "'";
+    if (dest !== undefined) msg += " -> '" + dest + "'";
+    const e = new Error(msg);
+    e.code = code; e.errno = info[0]; e.syscall = syscall;
+    if (path2 !== undefined) e.path = path2;
+    if (dest !== undefined) e.dest = dest;
+    return e;
+  };
+  // node's fd-level ops fail EBADF on a descriptor that is not open. mbun's
+  // shims for the ops with no native row (fsync/fdatasync/fchmod/fchown/futimes)
+  // only range-checked the NUMBER, so every one of them silently succeeded on a
+  // closed or never-opened fd — test-fs-error-messages asserts the error's
+  // message, errno, code and syscall for each. __mbunFdNative.valid answers for
+  // both mbun's virtual fds and real OS descriptors (stdio, inherited).
+  const fsFdIsValid = (fd) => {
+    const n = globalThis.__mbunFdNative;
+    if (!n || typeof n.valid !== "function") return true;
+    try { return n.valid(fd); } catch (e) { return true; }
+  };
+  const fsCheckFd = (fd, syscall) => { if (!fsFdIsValid(fd)) throw fsErr("EBADF", syscall); return fd; };
+  // The async twins report EBADF THROUGH the callback (only the argument-type
+  // errors stay synchronous), so they cannot share fsAsyncOk's unconditional
+  // cb(null).
+  const fsAsyncFd = (fd, syscall, fn) => {
+    const cb = fsMakeCallback(fn);
+    const err = fsFdIsValid(fd) ? null : fsErr("EBADF", syscall);
+    G.queueMicrotask(() => cb(err));
+  };
+  // node ERR_INVALID_ARG_VALUE, whose message quotes the offending value.
+  const fsArgValueErr = (name, value, reason) => {
+    let ins;
+    const util = M["util"] || M["node:util"];
+    // node uses inspect(value, { depth: -1 }); mbun's inspect abbreviates an
+    // EMPTY collection to "[Object]" at that depth, where node still prints
+    // "Uint8Array(0) []" — the plain form matches node for these shallow values.
+    if (util && typeof util.inspect === "function") { try { ins = util.inspect(value); } catch (e) {} }
+    if (ins === undefined) { try { ins = JSON.stringify(value); } catch (e) {} }
+    if (ins === undefined) ins = String(value);
+    const e = new TypeError("The argument '" + name + "' " + reason + ". Received " + ins);
+    e.code = "ERR_INVALID_ARG_VALUE";
+    return nodeErrToString(e, "ERR_INVALID_ARG_VALUE");
+  };
+  // node validatePosition / validateOffsetLengthRead|Write (lib/internal/fs/utils.js).
+  const fsValidatePositionRead = (position, name, length) => {
+    if (typeof position === "number") fsValidateInteger(position, name, -1);
+    else if (typeof position === "bigint") {
+      const maxPosition = 2n ** 63n - 1n - BigInt(length);
+      if (!(position >= -1n && position <= maxPosition))
+        throw fsRangeErr(name, ">= -1 && <= " + maxPosition, position);
+    } else throw fsArgTypeErr(name, "of type number or bigint", position);
+  };
+  const fsValidateOffsetLengthRead = (offset, length, bufferLength) => {
+    if (offset < 0) throw fsRangeErr("offset", ">= 0", offset);
+    if (length < 0) throw fsRangeErr("length", ">= 0", length);
+    if (offset + length > bufferLength) throw fsRangeErr("length", "<= " + (bufferLength - offset), length);
+  };
+  const fsValidateOffsetLengthWrite = (offset, length, bufferLength) => {
+    if (offset > bufferLength) throw fsRangeErr("offset", "<= " + bufferLength, offset);
+    if (length > bufferLength - offset) throw fsRangeErr("length", "<= " + (bufferLength - offset), length);
+    if (length < 0) throw fsRangeErr("length", ">= 0", length);
+  };
+  // node fs.read / fs.readSync / fs.write / fs.writeSync — the full validation
+  // + overload normalisation from lib/fs.js. These were deliberately left
+  // unvalidated before because an earlier partial rewrite broke the valid
+  // overloads; this port follows node's own argument-count algorithm instead
+  // of guessing, so the options-object and string forms keep working.
+  fsMod.readSync = function readSync(fd, buffer, offsetOrOptions, length, position) {
+    // node's readSync starts with getValidatedFd(fd) — this one went straight to
+    // the native row, so a non-numeric fd surfaced as EBADF instead of
+    // ERR_INVALID_ARG_TYPE (test-fs-read-type).
+    fsValidateFd(fd);
+    fsValidateBuffer(buffer);
+    let offset = offsetOrOptions;
+    if (arguments.length <= 3 || (offsetOrOptions !== null && typeof offsetOrOptions === "object")) {
+      if (offsetOrOptions !== undefined && offsetOrOptions !== null
+          && (typeof offsetOrOptions !== "object" || Array.isArray(offsetOrOptions)))
+        throw fsArgTypeErr("options", "of type object", offsetOrOptions);
+      const o = offsetOrOptions == null ? {} : offsetOrOptions;
+      offset = o.offset === undefined ? 0 : o.offset;
+      length = o.length === undefined ? buffer.byteLength - offset : o.length;
+      position = o.position === undefined ? null : o.position;
+    }
+    if (offset === undefined) offset = 0; else fsValidateInteger(offset, "offset", 0);
+    length = length | 0;
+    if (position == null) position = -1; else fsValidatePositionRead(position, "position", length);
+    if (length === 0) return 0;
+    if (buffer.byteLength === 0) throw fsArgValueErr("buffer", buffer, "is empty and cannot be written");
+    fsValidateOffsetLengthRead(offset, length, buffer.byteLength);
+    return globalThis.__mbunFdNative.read(fd, buffer, offset, length,
+                                          typeof position === "bigint" ? Number(position) : position);
+  };
+  fsMod.read = function read(fd, buffer, offsetOrOptions, length, position, callback) {
+    fsValidateFd(fd);
+    let offset = offsetOrOptions;
+    let params = null;
+    const argc = arguments.length;
+    if (argc <= 4) {
+      if (argc === 4) { params = offsetOrOptions; callback = length; }
+      else if (argc === 3) {
+        if (!ArrayBuffer.isView(buffer)) {
+          params = buffer;
+          buffer = (params != null && params.buffer !== undefined) ? params.buffer : Buffer.alloc(16384);
+        }
+        callback = offsetOrOptions;
+      } else { callback = buffer; buffer = Buffer.alloc(16384); }
+      if (params !== undefined && params !== null
+          && (typeof params !== "object" || Array.isArray(params)))
+        throw fsArgTypeErr("options", "of type object", params);
+      const o = params == null ? {} : params;
+      offset = o.offset === undefined ? 0 : o.offset;
+      length = o.length === undefined ? (ArrayBuffer.isView(buffer) ? buffer.byteLength - offset : 0) : o.length;
+      position = o.position === undefined ? null : o.position;
+    }
+    fsValidateBuffer(buffer);
+    fsMakeCallback(callback);
+    if (offset == null) offset = 0; else fsValidateInteger(offset, "offset", 0);
+    length = length | 0;
+    if (position == null) position = -1; else fsValidatePositionRead(position, "position", length);
+    if (length === 0) { G.queueMicrotask(() => callback(null, 0, buffer)); return; }
+    if (buffer.byteLength === 0) throw fsArgValueErr("buffer", buffer, "is empty and cannot be written");
+    fsValidateOffsetLengthRead(offset, length, buffer.byteLength);
+    let n, err = null;
+    try { n = globalThis.__mbunFdNative.read(fd, buffer, offset, length,
+                                             typeof position === "bigint" ? Number(position) : position); }
+    catch (e) { err = e; n = 0; }
+    G.queueMicrotask(() => callback(err, n, buffer));
+  };
+  // node lib/fs.js write/writeSync: a hex-encoded string of odd length cannot
+  // be decoded, and node rejects it up front rather than writing half of it
+  // (ERR_INVALID_ARG_VALUE, nodejs/node#38168).
+  const fsValidateStringEncoding = (data, encoding) => {
+    if (encoding === "hex" && typeof data === "string" && data.length % 2 !== 0)
+      throw fsArgValueErr("encoding", encoding, "is invalid for data of length " + data.length);
+  };
+  fsMod.writeSync = function writeSync(fd, buffer, offsetOrOptions, length, position) {
+    fsValidateFd(fd);
+    let offset = offsetOrOptions;
+    if (ArrayBuffer.isView(buffer)) {
+      if (offsetOrOptions !== null && typeof offsetOrOptions === "object") {
+        const o = offsetOrOptions;
+        offset = o.offset === undefined ? 0 : o.offset;
+        length = o.length === undefined ? buffer.byteLength - offset : o.length;
+        position = o.position === undefined ? null : o.position;
+      }
+      if (position === undefined) position = null;
+      if (offset == null) offset = 0; else fsValidateInteger(offset, "offset", 0);
+      if (typeof length !== "number") length = buffer.byteLength - offset;
+      fsValidateOffsetLengthWrite(offset, length, buffer.byteLength);
+      if (position != null) fsValidatePositionRead(position, "position", length);
+      return globalThis.__mbunFdNative.write(fd, buffer, offset, length,
+        position == null ? -1 : (typeof position === "bigint" ? Number(position) : position));
+    }
+    if (typeof buffer !== "string")
+      throw fsArgTypeErr("buffer", "of type string or an instance of Buffer, TypedArray, or DataView", buffer);
+    const enc = typeof length === "string" ? length : "utf8";
+    fsValidateEncoding(enc);
+    fsValidateStringEncoding(buffer, enc);
+    const b = Buffer.from(buffer, enc);
+    const pos = typeof offset === "number" ? offset : null;
+    return globalThis.__mbunFdNative.write(fd, b, 0, b.byteLength, pos == null ? -1 : pos);
+  };
+  fsMod.write = function write(fd, buffer, offsetOrOptions, length, position, callback) {
+    fsValidateFd(fd);
+    let offset = offsetOrOptions, cb = callback;
+    if (ArrayBuffer.isView(buffer)) {
+      if (typeof offset === "function") { cb = offset; offset = 0; length = undefined; position = null; }
+      else if (offset !== null && typeof offset === "object") {
+        const o = offset;
+        if (typeof length === "function") cb = length;
+        offset = o.offset; length = o.length; position = o.position;
+      } else if (typeof length === "function") { cb = length; length = undefined; position = null; }
+      else if (typeof position === "function") { cb = position; position = null; }
+      fsMakeCallback(cb);
+      if (offset == null) offset = 0; else fsValidateInteger(offset, "offset", 0);
+      if (typeof length !== "number") length = buffer.byteLength - offset;
+      fsValidateOffsetLengthWrite(offset, length, buffer.byteLength);
+      if (position != null && position !== undefined) fsValidatePositionRead(position, "position", length);
+      let n = 0, err = null;
+      try { n = globalThis.__mbunFdNative.write(fd, buffer, offset, length,
+              position == null ? -1 : (typeof position === "bigint" ? Number(position) : position)); }
+      catch (e) { err = e; }
+      G.queueMicrotask(() => cb(err, n, buffer));
+      return;
+    }
+    let spos = offset, enc = length;
+    if (typeof spos === "function") { cb = spos; spos = null; enc = "utf8"; }
+    else if (typeof enc === "function") { cb = enc; enc = "utf8"; }
+    else if (typeof position === "function") { cb = position; }
+    fsMakeCallback(cb);
+    if (typeof buffer !== "string")
+      throw fsArgTypeErr("buffer", "of type string or an instance of Buffer, TypedArray, or DataView", buffer);
+    fsValidateStringEncoding(buffer, typeof enc === "string" ? enc : "utf8");
+    const b = Buffer.from(buffer, typeof enc === "string" ? enc : "utf8");
+    let n = 0, err = null;
+    try { n = globalThis.__mbunFdNative.write(fd, b, 0, b.byteLength, spos == null ? -1 : spos); }
+    catch (e) { err = e; }
+    G.queueMicrotask(() => cb(err, n, buffer));
+  };
+  // node ERR_FS_EISDIR is a SystemError: "Path is a directory: rm returned
+  // EISDIR (is a directory) <path>" (lib/internal/errors.js SystemError).
+  const fsEisdirErr = (path2) => {
+    const e = new Error("Path is a directory: rm returned EISDIR (is a directory) " + path2);
+    e.code = "ERR_FS_EISDIR"; e.errno = -21; e.syscall = "rm"; e.path = path2;
+    e.name = "SystemError";
+    return e;
+  };
+  const fsLstatOrNull = (path2) => { try { return F.stat(path2, true); } catch (e) { return null; } };
+  const fsValidateObjectOpt = (o, name) => {
+    if (o === undefined || o === null) return;
+    if (typeof o !== "object" || Array.isArray(o)) throw fsArgTypeErr(name, "of type object", o);
+  };
+  // fs.rmdir — the `recursive` option was removed from node; passing it is an
+  // ERR_INVALID_ARG_VALUE, not a silent recursive delete (ref lib/fs.js rmdir).
+  const rmdirCheckOpts = (o) => {
+    if (o != null && typeof o === "object" && o.recursive !== undefined)
+      throw fsArgValueErr("options.recursive", o.recursive, "is no longer supported");
+    fsValidateObjectOpt(o, "options");
+  };
+  const rmdirImpl = (p) => {
+    const path2 = toStr(p);
+    F.rmdir(path2);
+  };
+  fsMod.rmdirSync = (p, o) => { validatePath(p); rmdirCheckOpts(o); rmdirImpl(p); };
+  fsMod.rmdir = (p, o, cb) => {
+    const fn = typeof o === "function" ? o : cb;
+    rmdirCheckOpts(typeof o === "function" ? undefined : o);
+    fsMakeCallback(fn);
+    validatePath(p);
+    G.queueMicrotask(() => { try { rmdirImpl(p); fn(null); } catch (e) { fn(e); } });
+  };
+  // fs.rm — a directory without { recursive: true } is ERR_FS_EISDIR; a missing
+  // path is ENOENT unless { force: true } (ref lib/internal/fs/utils.js
+  // validateRmOptionsSync).
+  const rmImpl = (p, o) => {
+    validatePath(p);
+    fsValidateObjectOpt(o, "options");
+    const force = !!(o && o.force);
+    const recursive = !!(o && o.recursive);
+    if (o && o.maxRetries !== undefined) fsValidateInteger(o.maxRetries, "options.maxRetries", 0);
+    if (o && o.retryDelay !== undefined) fsValidateInteger(o.retryDelay, "options.retryDelay", 0);
+    const path2 = toStr(p);
+    // node's validateRmOptionsSync lstats the path and only swallows ENOENT
+    // under { force: true } — any OTHER lstat failure is rethrown. fsLstatOrNull
+    // collapses every failure to null, so a file inside a read-only directory
+    // (lstat EACCES) was silently treated as already gone (test-fs-rm).
+    let st = null;
+    try {
+      st = fsMod.lstatSync(path2);
+    } catch (e) {
+      if (!(force && e && e.code === "ENOENT")) throw e;
+      return;
+    }
+    if (st === undefined || st === null) { if (force) return; throw fsErr("ENOENT", "lstat", path2); }
+    if (st.isDirectory() && !recursive) throw fsEisdirErr(path2);
+    F.rm(path2, recursive, force);
+  };
+  fsMod.rmSync = (p, o) => rmImpl(p, o);
+  fsMod.rm = (p, o, cb) => {
+    const fn = typeof o === "function" ? o : cb;
+    fsMakeCallback(fn);
+    const opts = typeof o === "function" ? undefined : o;
+    try { rmImpl(p, opts); } catch (e) { G.queueMicrotask(() => fn(e)); return; }
+    G.queueMicrotask(() => fn(null));
+  };
+  // fs.truncate / fs.ftruncate — previously no-ops (a truncate followed by a
+  // read returned the original bytes). Now real truncate(2)/ftruncate(2).
+  // node defaults `len` only when the argument is *absent* (`len = 0`); an
+  // explicit null/''/{}/[] is a validateInteger failure, and `len` is validated
+  // before the callback so the ERR_INVALID_ARG_TYPE names "len", not "cb"
+  // (ref lib/fs.js truncate/ftruncate, test-fs-truncate).
+  // node clamps the validated length with `len = MathMax(0, len)` — a negative
+  // `len` is coerced to 0 and truncates the file to empty, it is NOT an error.
+  // Passing -1 straight to (f)truncate(2) surfaced EINVAL, which the native
+  // errno map then reported as EACCES (test-fs-truncate).
+  const fsTruncLen = (len) => Math.max(0, len === undefined ? 0 : fsValidateInteger(len, "len"));
+  fsMod.ftruncateSync = (fd, len) => {
+    fsValidateFd(fd);
+    const l = fsTruncLen(len);
+    globalThis.__mbunFdNative.ftruncate(fd, l);
+  };
+  fsMod.ftruncate = (fd, len, cb) => {
+    const fn = typeof len === "function" ? len : cb;
+    fsValidateFd(fd);
+    const l = fsTruncLen(typeof len === "function" ? undefined : len);
+    fsMakeCallback(fn);
+    G.queueMicrotask(() => { try { globalThis.__mbunFdNative.ftruncate(fd, l); fn(null); } catch (e) { fn(e); } });
+  };
+  fsMod.truncateSync = (p, len) => {
+    if (typeof p === "number") return fsMod.ftruncateSync(p, len);
+    validatePath(p);
+    const l = fsTruncLen(len);
+    F.truncate(toStr(p), l);
+  };
+  fsMod.truncate = (p, len, cb) => {
+    const fn = typeof len === "function" ? len : cb;
+    if (typeof p === "number") return fsMod.ftruncate(p, len, cb);
+    validatePath(p);
+    const l = fsTruncLen(typeof len === "function" ? undefined : len);
+    fsMakeCallback(fn);
+    G.queueMicrotask(() => { try { F.truncate(toStr(p), l); fn(null); } catch (e) { fn(e); } });
+  };
+  // fs.statfs — real statvfs(3) instead of a frozen fake row.
+  fsMod.statfsSync = (p, o) => {
+    validatePath(p);
+    const s = F.statfs(toStr(p));
+    if (o && o.bigint) { const b = { __proto__: null }; for (const k of Object.keys(s)) b[k] = BigInt(Math.floor(s[k])); return b; }
+    return s;
+  };
+  fsMod.statfs = (p, o, cb) => {
+    const fn = typeof o === "function" ? o : cb;
+    validatePath(p);
+    fsMakeCallback(fn);
+    const opts = typeof o === "object" ? o : undefined;
+    G.queueMicrotask(() => { try { fn(null, fsMod.statfsSync(p, opts)); } catch (e) { fn(e); } });
+  };
+  // Remaining getValidatedPath gaps (a NUL byte / wrong type must throw before
+  // the syscall) — ref test-fs-null-bytes.
+  fsMod.utimesSync = wrapPath(fsMod.utimesSync, validatePath);
+  fsMod.utimes = wrapPath(fsMod.utimes, validatePath);
+  fsMod.chmodSync = wrapPath(fsMod.chmodSync, validatePath);
+  fsMod.copyFile = (a, b, m, cb) => {
+    validatePath(a, "src"); validatePath(b, "dest");
+    if (typeof m !== "function") fsValidCopyMode(m);
+    const fn = typeof m === "function" ? m : cb;
+    fsMakeCallback(fn);
+    const mode = typeof m === "function" ? 0 : m;
+    G.queueMicrotask(() => { try { fsCopyFileImpl(a, b, mode); fn(null); } catch (e) { fn(e); } });
+  };
+  // node symlink type: "dir" | "file" | "junction" (or null/undefined).
+  // Anything else is ERR_INVALID_ARG_VALUE, checked after the two paths.
+  const fsValidateSymlinkType = (type) => {
+    if (type === undefined || type === null) return;
+    if (type !== "dir" && type !== "file" && type !== "junction")
+      throw fsArgValueErr("type", type, "must be one of 'dir', 'file', or 'junction'");
+  };
+  fsMod.symlinkSync = (t, p2, type) => { validatePath(t, "target"); validatePath(p2, "path"); fsValidateSymlinkType(type); return F.symlink(toStr(t), toStr(p2)); };
+  fsMod.symlink = (t, p2, a, cb) => {
+    validatePath(t, "target"); validatePath(p2, "path");
+    if (typeof a !== "function") fsValidateSymlinkType(a);
+    const fn = typeof a === "function" ? a : cb;
+    fsMakeCallback(fn);
+    G.queueMicrotask(() => { try { F.symlink(toStr(t), toStr(p2)); fn(null); } catch (e) { fn(e); } });
+  };
+  // node getOptions(): the encoding named in the options argument must be a
+  // known one, checked BEFORE the syscall — ref test-fs-assert-encoding-error.
+  const wrapEnc = (orig, index) => (...a) => { fsValidateEncoding(a[index]); return orig(...a); };
+  fsMod.readFileSync = wrapEnc(fsMod.readFileSync, 1);
+  fsMod.readFile = wrapEnc(fsMod.readFile, 1);
+  fsMod.readdirSync = wrapEnc(fsMod.readdirSync, 1);
+  fsMod.readdir = wrapEnc(fsMod.readdir, 1);
+  fsMod.readlinkSync = wrapEnc(fsMod.readlinkSync, 1);
+  // realpath/realpathSync are NOT wrapped here: they are redefined below (node's
+  // JS resolver) and carry their own fsValidateEncoding call.
+  // node getOptions(): the resolved path comes back in the *requested* encoding —
+  // 'buffer' yields a Buffer, any other known encoding re-decodes the utf8 bytes
+  // (fs.realpathSync(p, 'ucs2') is a re-interpretation, not a conversion).
+  // ref test-fs-realpath-buffer-encoding, lib/fs.js realpathSync/realpath.
+  const fsEncodePath = (str, o) => {
+    const enc = typeof o === "string" ? o : (o && typeof o === "object" ? o.encoding : undefined);
+    if (enc == null || enc === "utf8" || enc === "utf-8") return str;
+    const buf = G.Buffer.from(String(str), "utf8");
+    return enc === "buffer" ? buf : buf.toString(enc);
+  };
+  // ---- fs.realpath / fs.realpathSync: node's NON-NATIVE JS resolver ----------
+  //
+  // A DIRECT TRANSLATION of lib/fs.js realpathSync (node's own comments kept
+  // where they explain a step). node does not call realpath(3) here — it walks
+  // the path component by component with lstat, reads each symlink with
+  // readlink, and restarts the walk from the resolved target. That is not an
+  // implementation detail: it is the observable contract.
+  //   • A cycle is reported as ELOOP with `path` set to the LINK, because the
+  //     detection is the follow-`stat` on the link failing that way — not a
+  //     depth counter (test-fs-realpath test_cyclic_link_protection).
+  //   • `seenLinks`, keyed by dev:ino, is what stops `folder/cycles` repeated ten
+  //     times from being ELOOP as well (test_cyclic_link_overprotection). A
+  //     resolver that just counted hops would reject that legal path.
+  //   • The walk STOPS at a FIFO or a socket, which is how '/dev/stdin' resolves
+  //     to '/proc/<pid>/fd/pipe:[N]' instead of failing ENOENT on a name no
+  //     directory contains (test-fs-realpath-pipe).
+  // mbun previously used std::filesystem::weakly_canonical for both, which fails
+  // none of these cases -- it resolves as far as it can and appends the rest, so
+  // '/this/path/does/not/exist' came back as itself with no error at all.
+  //
+  // node's `statValues` is a single shared array that only the FOLLOW-stat below
+  // writes, so by the time the walk revisits an already-known component it still
+  // holds the mode of the last link target that was stat'ed. `lastFollowMode`
+  // reproduces that exactly; the /dev/stdin case depends on it.
+  const S_IFMT_RP = 0o170000, S_IFIFO_RP = 0o010000, S_IFSOCK_RP = 0o140000;
+  const fsRealpathWalk = (input) => {
+    let p = path.resolve(input);
+    const seenLinks = new Map();
+    const knownHard = new Set();
+    let lastFollowMode = -1;
+    // Skip over roots. POSIX has a single-character root and (unlike Windows)
+    // needs no existence check on it.
+    let current = "/";
+    let base = "/";
+    let previous;
+    let pos = 1;
+    while (pos < p.length) {
+      const result = p.indexOf("/", pos);
+      previous = current;
+      if (result === -1) {
+        const last = p.slice(pos);
+        current += last;
+        base = previous + last;
+        pos = p.length;
+      } else {
+        current += p.slice(pos, result + 1);
+        base = previous + p.slice(pos, result);
+        pos = result + 1;
+      }
+      // Continue if not a symlink, break if a pipe/socket.
+      if (knownHard.has(base)) {
+        if (lastFollowMode >= 0 &&
+            ((lastFollowMode & S_IFMT_RP) === S_IFIFO_RP ||
+             (lastFollowMode & S_IFMT_RP) === S_IFSOCK_RP)) break;
+        continue;
+      }
+      const st = fsMod.lstatSync(base);
+      if (!st.isSymbolicLink()) { knownHard.add(base); continue; }
+      // Read the link if it wasn't read before.
+      const id = String(st.dev) + ":" + String(st.ino);
+      let linkTarget = seenLinks.has(id) ? seenLinks.get(id) : null;
+      if (linkTarget === null) {
+        lastFollowMode = Number(fsMod.statSync(base).mode);
+        linkTarget = fsMod.readlinkSync(base);
+        seenLinks.set(id, linkTarget);
+      }
+      // Resolve the link, then start over.
+      p = path.resolve(path.resolve(previous, linkTarget), p.slice(pos));
+      current = "/";
+      base = "/";
+      pos = 1;
+    }
+    return p;
+  };
+  fsMod.realpathSync = (p2, o) => {
+    fsValidateEncoding(o);
+    validatePath(p2);
+    return fsEncodePath(fsRealpathWalk(toStr(p2)), o);
+  };
+  fsMod.realpath = (p2, a, b) => {
+    const hasOpts = typeof a !== "function";
+    const cb = hasOpts ? b : a;
+    if (hasOpts) fsValidateEncoding(a);
+    fsMakeCallback(cb);
+    validatePath(p2);
+    // node's async realpath interleaves fs.lstat/fs.stat/fs.readlink and hops
+    // through process.nextTick between components, so the callback NEVER runs
+    // before realpath() returns. Doing the walk synchronously and calling back
+    // inline (as this did) nested every subtest of test-fs-realpath inside its
+    // predecessor's stack. One deferred hop is enough to restore the contract
+    // that matters to callers.
+    process.nextTick(() => {
+      let res;
+      try { res = fsRealpathWalk(toStr(p2)); }
+      catch (e) { cb(e); return; }
+      cb(null, fsEncodePath(res, hasOpts ? a : undefined));
+    });
+  };
+  // `.native` is uv_fs_realpath — realpath(3) — not the walk above.
+  fsMod.realpathSync.native = (p2, o) => {
+    fsValidateEncoding(o);
+    validatePath(p2);
+    return fsEncodePath(F.realpathNative(toStr(p2)), o);
+  };
+  fsMod.realpath.native = (p2, a, b) => {
+    const hasOpts = typeof a !== "function";
+    const cb = hasOpts ? b : a;
+    if (hasOpts) fsValidateEncoding(a);
+    fsMakeCallback(cb);
+    validatePath(p2);
+    process.nextTick(() => {
+      let res;
+      try { res = F.realpathNative(toStr(p2)); }
+      catch (e) { cb(e); return; }
+      cb(null, fsEncodePath(res, hasOpts ? a : undefined));
+    });
+  };
+  fsMod.writeFileSync = wrapEnc(fsMod.writeFileSync, 2);
+  fsMod.writeFile = wrapEnc(fsMod.writeFile, 2);
+  // Shared validator seam for the fs partitions appended after this IIFE
+  // (node_fs_watch): they must throw the SAME ERR_* shapes, not re-derive them.
+  G.__mbunFsInternals = { validatePath, validateEncoding: fsValidateEncoding, argTypeErr: fsArgTypeErr,
+                          argValueErr: fsArgValueErr, makeCallback: fsMakeCallback, errno: fsErr,
+                          validateInteger: fsValidateInteger, rangeErr: fsRangeErr,
+                          get FileHandle() { return FileHandle; } };
+  // node marks fs.read/fs.write with kCustomPromisifyArgs so promisify(fs.read)
+  // resolves to { bytesRead, buffer } rather than the first callback value.
+  // mbun's util.promisify has no such hook — attach the documented
+  // nodejs.util.promisify.custom symbol instead (same observable result).
+  // fs.close must hand its callback back on a LATER turn (node/libuv): the fs
+  // stream state machine calls it from _destroy and re-enters otherwise.
+  const fsCloseSync0 = fsMod.closeSync;
+  fsMod.close = (fd, cb) => {
+    fsValidateFd(fd);
+    if (cb !== undefined && typeof cb !== "function") throw fsArgTypeErr("callback", "of type function", cb);
+    let err = null;
+    try { fsCloseSync0(fd); } catch (e) { err = e; }
+    if (cb) G.queueMicrotask(() => cb(err));
+  };
+  // fs.readv / fs.writev (node lib/fs.js) — the vectored fd ops. Backed by a
+  // loop over the positioned single-buffer path.
+  // node validateBufferArray(buffers, 'buffers'): an Array whose every element
+  // is an ArrayBufferView, else ERR_INVALID_ARG_TYPE *thrown synchronously*
+  // (ref lib/internal/fs/utils.js). Previously a non-array reached `for..of`
+  // and surfaced as an un-coded "x is not iterable" TypeError, and the async
+  // forms handed it to the callback instead of throwing (test-fs-readv,
+  // test-fs-writev, test-fs-readv-sync, test-fs-writev-sync).
+  const fsValidateBufferArray = (buffers, name) => {
+    if (!Array.isArray(buffers)) throw fsArgTypeErr(name || "buffers", "an instance of Array", buffers);
+    for (let i = 0; i < buffers.length; ++i)
+      if (!ArrayBuffer.isView(buffers[i]))
+        throw fsArgTypeErr((name || "buffers") + "[" + i + "]", "an instance of Buffer, TypedArray, or DataView", buffers[i]);
+    return buffers;
+  };
+  fsMod.readvSync = (fd, buffers, position) => {
+    fsValidateFd(fd);
+    fsValidateBufferArray(buffers);
+    let total = 0, pos = position == null ? null : Number(position);
+    for (const b of buffers) {
+      if (b.byteLength === 0) continue;
+      const n = fsMod.readSync(fd, b, 0, b.byteLength, pos);
+      total += n;
+      if (pos !== null) pos += n;
+      if (n < b.byteLength) break;
+    }
+    return total;
+  };
+  fsMod.writevSync = (fd, buffers, position) => {
+    fsValidateFd(fd);
+    fsValidateBufferArray(buffers);
+    let total = 0, pos = position == null ? null : Number(position);
+    for (const b of buffers) {
+      if (b.byteLength === 0) continue;
+      const n = fsMod.writeSync(fd, b, 0, b.byteLength, pos);
+      total += n;
+      if (pos !== null) pos += n;
+    }
+    return total;
+  };
+  fsMod.readv = (fd, buffers, position, cb) => {
+    const fn = typeof position === "function" ? position : cb;
+    const pos = typeof position === "function" ? null : position;
+    // Argument validation is synchronous in node — it must throw, not reach the
+    // callback (which the tests install as common.mustNotCall()).
+    fsValidateFd(fd);
+    fsValidateBufferArray(buffers);
+    fsMakeCallback(fn);
+    let n = 0, err = null;
+    try { n = fsMod.readvSync(fd, buffers, pos); } catch (e) { err = e; }
+    G.queueMicrotask(() => fn(err, n, buffers));
+  };
+  fsMod.writev = (fd, buffers, position, cb) => {
+    const fn = typeof position === "function" ? position : cb;
+    const pos = typeof position === "function" ? null : position;
+    fsValidateFd(fd);
+    fsValidateBufferArray(buffers);
+    fsMakeCallback(fn);
+    let n = 0, err = null;
+    try { n = fsMod.writevSync(fd, buffers, pos); } catch (e) { err = e; }
+    G.queueMicrotask(() => fn(err, n, buffers));
+  };
+  // fs._toUnixTimestamp — node exports internal/fs/utils.js's toUnixTimestamp
+  // under this name (lib/fs.js `_toUnixTimestamp`), and the utimes family runs
+  // every time value through it. ref test-fs-timestamp-parsing-error.
+  const fsToUnixTimestamp = (time, name) => {
+    if (typeof time === "string" && +time == time) return +time;
+    if (typeof time === "number" && Number.isFinite(time)) {
+      if (time < 0) return Date.now() / 1000;
+      return time;
+    }
+    if (time instanceof Date || (time && typeof time === "object" &&
+        Object.prototype.toString.call(time) === "[object Date]")) {
+      return Date.prototype.getTime.call(time) / 1000;
+    }
+    throw fsArgTypeErr(name || "time", "of type Date or Time in seconds", time);
+  };
+  fsMod._toUnixTimestamp = fsToUnixTimestamp;
+  fsMod.utimesSync = (p, atime, mtime) => {
+    validatePath(p);
+    F.utimes(toStr(p), fsToUnixTimestamp(atime, "atime"), fsToUnixTimestamp(mtime, "mtime"));
+  };
+  fsMod.utimes = (p, atime, mtime, cb) => {
+    validatePath(p);
+    const a = fsToUnixTimestamp(atime, "atime"), m = fsToUnixTimestamp(mtime, "mtime");
+    const fn = fsMakeCallback(cb);
+    G.queueMicrotask(() => { try { F.utimes(toStr(p), a, m); fn(null); } catch (e) { fn(e); } });
+  };
+  fsMod.lutimesSync = (p, atime, mtime) => {
+    validatePath(p);
+    const a = fsToUnixTimestamp(atime, "atime"), m = fsToUnixTimestamp(mtime, "mtime");
+    // lutimes must stamp the SYMLINK, never its target: F.lutimes is
+    // utimensat(AT_SYMLINK_NOFOLLOW). Falling back to F.utimes followed the
+    // link, so a dangling symlink reported ENOENT and a live one moved the
+    // target's times (test-fs-utimes).
+    F.lutimes(toStr(p), a, m);
+  };
+  fsMod.lutimes = (p, atime, mtime, cb) => {
+    validatePath(p);
+    const a = fsToUnixTimestamp(atime, "atime"), m = fsToUnixTimestamp(mtime, "mtime");
+    const fn = fsMakeCallback(cb);
+    G.queueMicrotask(() => { try { fsMod.lutimesSync(p, a, m); fn(null); } catch (e) { fn(e); } });
+  };
+  fsMod.futimesSync = (fd, atime, mtime) => {
+    fsValidateFd(fd);
+    const a = fsToUnixTimestamp(atime, "atime"), m = fsToUnixTimestamp(mtime, "mtime");
+    // node's syscall name for futimes is 'futime' (uv_fs_futime).
+    fsCheckFd(fd, "futime");
+    const p = fdPathMap.get(fd);
+    if (p) F.utimes(p, a, m);
+  };
+  fsMod.futimes = (fd, atime, mtime, cb) => {
+    fsValidateFd(fd);
+    const a = fsToUnixTimestamp(atime, "atime"), m = fsToUnixTimestamp(mtime, "mtime");
+    const fn = fsMakeCallback(cb);
+    G.queueMicrotask(() => { try { fsMod.futimesSync(fd, a, m); fn(null); } catch (e) { fn(e); } });
+  };
+  const kPromisifyCustom = Symbol.for("nodejs.util.promisify.custom");
+  fsMod.read[kPromisifyCustom] = (...a) =>
+    new Promise((resolve, reject) => {
+      fsMod.read(...a, (err, bytesRead, buf) =>
+        err ? reject(err) : resolve({ bytesRead, buffer: buf }));
+    });
+  fsMod.write[kPromisifyCustom] = (...a) =>
+    new Promise((resolve, reject) => {
+      fsMod.write(...a, (err, bytesWritten, buf) =>
+        err ? reject(err) : resolve({ bytesWritten, buffer: buf }));
+    });
+  // fs.readv/fs.writev carry kCustomPromisifyArgs too (['bytesRead','buffers'] /
+  // ['bytesWritten','buffers']) — ref lib/fs.js (test-fs-readv-promisify).
+  fsMod.readv[kPromisifyCustom] = (...a) =>
+    new Promise((resolve, reject) => {
+      fsMod.readv(...a, (err, bytesRead, buffers) =>
+        err ? reject(err) : resolve({ bytesRead, buffers }));
+    });
+  fsMod.writev[kPromisifyCustom] = (...a) =>
+    new Promise((resolve, reject) => {
+      fsMod.writev(...a, (err, bytesWritten, buffers) =>
+        err ? reject(err) : resolve({ bytesWritten, buffers }));
+    });
+  // fs.exists' callback takes (exists) with no error slot.
+  fsMod.exists[kPromisifyCustom] = (p) => new Promise((resolve) => fsMod.exists(p, resolve));
+  // mbun-internal helpers must not appear in Object.keys(require("fs")): node's
+  // test-permission-fs-supported enumerates that list to prove every exposed fs
+  // API is covered by the permission model, and an extra key fails the audit.
+  // They stay reachable by name for the internal callers that use them.
+  // mbun-internal helpers must not appear in Object.keys(require("fs")). node's
+  // own test-permission-fs-supported enumerates that list to prove every exposed
+  // fs API is covered by the permission model, so an mbun-only key fails the
+  // audit outright. `hideFsExtras` is exported on the module object so the LAST
+  // writer of each key can call it — node_fs_watch installs fs.FSWatcher after
+  // this point, and a plain assignment there would re-create it as enumerable.
+  const hideFsExtras = () => {
+    for (const k of ["createStatsForIno", "BigIntStats", "FSWatcher", "StatWatcher"]) {
+      if (Object.prototype.hasOwnProperty.call(fsMod, k) &&
+          Object.getOwnPropertyDescriptor(fsMod, k).enumerable) {
+        Object.defineProperty(fsMod, k,
+          { value: fsMod[k], writable: true, configurable: true, enumerable: false });
+      }
+    }
+  };
+  Object.defineProperty(fsMod, "__mbunHideFsExtras",
+    { value: hideFsExtras, writable: true, configurable: true, enumerable: false });
+  hideFsExtras();
   def(["fs"], fsMod);
 
   const P = (fn) => (...a) => { try { return Promise.resolve(fn(...a)); } catch (e) { return Promise.reject(e); } };
   // node fs.promises FileHandle (blueprint bun-ref/src/js/node/fs.promises.ts):
   // a promise-returning wrapper over the fd-level sync ops.
+  // node fs.promises AbortSignal handling (ref lib/internal/fs/promises.js):
+  // an aborted signal rejects with an AbortError carrying signal.reason as
+  // `cause`, checked before the first byte and between chunks.
+  const fsAbortErr = (signal) => {
+    const e = new Error("The operation was aborted");
+    e.name = "AbortError"; e.code = "ABORT_ERR";
+    if (signal && signal.reason !== undefined) e.cause = signal.reason;
+    return e;
+  };
+  const fsSignalOf = (o) => {
+    const s = (o && typeof o === "object") ? o.signal : undefined;
+    if (s !== undefined && s !== null && (typeof s !== "object" || !("aborted" in s)))
+      throw fsArgTypeErr("options.signal", "an instance of AbortSignal", s);
+    return s;
+  };
+  const fsThrowIfAborted = (s) => { if (s && s.aborted) throw fsAbortErr(s); };
   class FileHandle {
-    constructor(fd) { this._fd = fd; this._closed = false; this._events = { __proto__: null }; }
+    constructor(fd) { this._fd = fd; this._closed = false; this._refs = 0; this._events = { __proto__: null }; }
     get fd() { return this._fd; }
     // node's FileHandle is an EventEmitter (emits "close"); createReadStream /
     // createWriteStream build fd-bound streams that autoClose the handle
     // (fs-leak: FileHandle stream must not leak the descriptor).
     on(ev, cb) { (this._events[ev] || (this._events[ev] = [])).push(cb); return this; }
+    addListener(ev, cb) { return this.on(ev, cb); }
     once(ev, cb) { const w = (...a) => { this.off(ev, w); cb(...a); }; return this.on(ev, w); }
     off(ev, cb) { const a = this._events[ev]; if (a) { const i = a.indexOf(cb); if (i >= 0) a.splice(i, 1); } return this; }
     removeListener(ev, cb) { return this.off(ev, cb); }
     emit(ev, ...a) { const l = this._events[ev]; if (l) for (const cb of l.slice()) cb(...a); return !!(l && l.length); }
-    appendFile(data, o) {
-      const enc = typeof o === "string" ? o : (o && o.encoding) || "utf8";
-      const b = typeof data === "string" ? Buffer.from(data, enc) : (ArrayBuffer.isView(data) ? data : Buffer.from(data));
-      return Promise.resolve().then(() => { fsMod.writeSync(this._fd, b, 0, b.byteLength || b.length, null); });
+    // node rejects EVERY FileHandle operation after close with EBADF — the
+    // handle's fd is -1 and the binding reports a bad descriptor.
+    _use(syscall) {
+      if (this._closed || this._fd < 0) throw fsErr("EBADF", syscall || "read");
+      return this._fd;
     }
-    createWriteStream(opts) {
-      opts = opts || {}; const self = this; const ws = new Writable();
-      ws.autoClose = opts.autoClose !== false; ws.bytesWritten = 0; const parts = [];
-      ws._write = (chunk, e, cb) => { const b = typeof chunk === "string" ? Buffer.from(chunk, "utf8") : Buffer.from(chunk); parts.push(b); ws.bytesWritten += b.length; const f = cb || e; if (typeof f === "function") f(); };
-      ws.end = (chunk, e, cb) => {
-        if (chunk != null && typeof chunk !== "function") ws._write(chunk, "utf8", null);
-        try { const all = Buffer.concat(parts); fsMod.writeSync(self._fd, all, 0, all.length, null); } catch (er) { ws.emit("error", er); }
-        if (ws.autoClose) self.close();
-        G.queueMicrotask(() => { ws.emit("finish"); ws.emit("close"); });
-        const f = cb || (typeof e === "function" ? e : typeof chunk === "function" ? chunk : null); if (f) f();
-        return ws;
-      };
-      ws.close = (cb) => { if (cb) cb(); return ws; };
-      return ws;
-    }
-    createReadStream(opts) {
-      opts = opts || {}; const self = this; const rs = new Readable(); rs.bytesRead = 0;
-      rs.autoClose = opts.autoClose === true; const enc = typeof opts === "string" ? opts : opts.encoding;
-      G.queueMicrotask(() => {
-        try {
-          const chunks = []; const tmp = Buffer.alloc(65536); let n;
-          while ((n = fsMod.readSync(self._fd, tmp, 0, tmp.length, null)) > 0) chunks.push(Buffer.from(tmp.subarray(0, n)));
-          const buf = Buffer.concat(chunks); rs.bytesRead = buf.length;
-          rs.push(enc ? buf.toString(enc) : buf); rs.push(null);
-          if (rs.autoClose) self.close();
-          rs.emit("close");
-        } catch (e) { e.code = e.code || "ENOENT"; rs.emit("error", e); }
-      });
-      rs.close = (cb) => { if (cb) cb(); return rs; };
-      return rs;
-    }
-    read(buf, off, len, pos) {
-      if (buf && typeof buf === "object" && !ArrayBuffer.isView(buf)) {
-        const o = buf; buf = o.buffer || Buffer.alloc(16384); off = o.offset || 0;
-        len = o.length == null ? buf.byteLength - off : o.length; pos = o.position == null ? null : o.position;
+    // Stream ref-counting: a createReadStream/createWriteStream over this
+    // handle keeps it alive until the stream closes (node kRef/kUnref).
+    _ref() { this._refs++; }
+    _unref() { if (this._refs > 0) this._refs--; }
+    read(buffer, offsetOrOptions, length, position) {
+      let buf = buffer, off = offsetOrOptions, len = length, pos = position;
+      if (buf === undefined || buf === null) { buf = Buffer.alloc(16384); off = 0; len = buf.byteLength; pos = null; }
+      else if (!ArrayBuffer.isView(buf) && typeof buf === "object") {
+        const o = buf;
+        buf = o.buffer === undefined ? Buffer.alloc(16384) : o.buffer;
+        off = o.offset === undefined ? 0 : o.offset;
+        len = o.length === undefined ? buf.byteLength - off : o.length;
+        pos = o.position === undefined ? null : o.position;
+      } else if (off !== null && typeof off === "object") {
+        const o = off;
+        off = o.offset === undefined ? 0 : o.offset;
+        len = o.length === undefined ? buf.byteLength - off : o.length;
+        pos = o.position === undefined ? null : o.position;
       }
+      // Argument validation is EAGER (node validates before the first await),
+      // so a caller that disposes the handle in the same turn still sees the
+      // ERR_INVALID_ARG_* rejection rather than a later EBADF.
+      let o2, l2;
+      try {
+        fsValidateBuffer(buf);
+        o2 = off == null ? 0 : fsValidateInteger(off, "offset", 0);
+        l2 = (len == null ? buf.byteLength - o2 : len) | 0;
+        if (pos != null) fsValidatePositionRead(pos, "position", l2);
+        if (l2 !== 0 && buf.byteLength === 0)
+          throw fsArgValueErr("buffer", buf, "is empty and cannot be written");
+      } catch (e) { return Promise.reject(e); }
       return Promise.resolve().then(() => {
-        const bytesRead = fsMod.readSync(this._fd, buf, off || 0, len == null ? buf.byteLength : len, pos == null ? null : pos);
+        const fd = this._use("read");
+        // A position past the file end reads nothing (node returns bytesRead 0
+        // rather than seeking the descriptor there).
+        const bytesRead = l2 === 0 ? 0 : fsMod.readSync(fd, buf, o2, l2, pos == null ? null : pos);
         return { bytesRead, buffer: buf };
       });
     }
-    write(buf, off, len, pos) {
-      if (typeof buf === "string") {
-        const enc2 = typeof off === "string" ? off : "utf8"; const b = Buffer.from(buf, enc2);
-        return Promise.resolve().then(() => ({ bytesWritten: fsMod.writeSync(this._fd, b, 0, b.length, typeof off === "number" ? off : null), buffer: buf }));
-      }
-      return Promise.resolve().then(() => ({ bytesWritten: fsMod.writeSync(this._fd, buf, off || 0, len == null ? buf.byteLength : len, pos == null ? null : pos), buffer: buf }));
+    readv(buffers, position) {
+      return Promise.resolve().then(() => {
+        const fd = this._use("read");
+        let total = 0;
+        let pos = position == null ? null : Number(position);
+        for (const b of buffers) {
+          if (b.byteLength === 0) continue;
+          const n = fsMod.readSync(fd, b, 0, b.byteLength, pos);
+          total += n;
+          if (pos !== null) pos += n;
+          if (n < b.byteLength) break;
+        }
+        return { bytesRead: total, buffers };
+      });
     }
+    write(buffer, offsetOrOptions, length, position) {
+      return Promise.resolve().then(() => {
+        const fd = this._use("write");
+        if (buffer != null && buffer.byteLength === 0) return { bytesWritten: 0, buffer };
+        if (ArrayBuffer.isView(buffer)) {
+          let off = offsetOrOptions, len = length, pos = position;
+          if (off !== null && typeof off === "object") {
+            const o = off;
+            off = o.offset === undefined ? 0 : o.offset;
+            len = o.length === undefined ? undefined : o.length;
+            pos = o.position === undefined ? null : o.position;
+          }
+          if (off == null) off = 0; else fsValidateInteger(off, "offset", 0);
+          if (len == null) len = buffer.byteLength - off;
+          else fsValidateInteger(len, "length");
+          // node validateOffsetLengthWrite (lib/internal/fs/utils.js).
+          if (off > buffer.byteLength) throw fsRangeErr("offset", "<= " + buffer.byteLength, off);
+          if (len > buffer.byteLength - off) throw fsRangeErr("length", "<= " + (buffer.byteLength - off), len);
+          if (len < 0) throw fsRangeErr("length", ">= 0", len);
+          if (pos != null) fsValidatePosition(pos, "position");
+          return { bytesWritten: fsMod.writeSync(fd, buffer, off, len, pos == null ? null : pos), buffer };
+        }
+        // node validateStringAfterArrayBufferView: anything that is neither a
+        // view nor a primitive string is ERR_INVALID_ARG_TYPE "buffer".
+        if (typeof buffer !== "string")
+          throw fsArgTypeErr("buffer", "of type string or an instance of Buffer, TypedArray, or DataView", buffer);
+        const enc = typeof length === "string" ? length : "utf8";
+        const b = Buffer.from(buffer, enc);
+        const pos = typeof offsetOrOptions === "number" ? offsetOrOptions : null;
+        return { bytesWritten: fsMod.writeSync(fd, b, 0, b.byteLength, pos), buffer };
+      });
+    }
+    writev(buffers, position) {
+      return Promise.resolve().then(() => {
+        const fd = this._use("write");
+        let total = 0;
+        let pos = position == null ? null : Number(position);
+        for (const b of buffers) {
+          if (b.byteLength === 0) continue;
+          const n = fsMod.writeSync(fd, b, 0, b.byteLength, pos);
+          total += n;
+          if (pos !== null) pos += n;
+        }
+        return { bytesWritten: total, buffers };
+      });
+    }
+    createWriteStream(opts) { return new fsMod.WriteStream(undefined, Object.assign({}, opts, { fd: this })); }
+    createReadStream(opts) { return new fsMod.ReadStream(undefined, Object.assign({}, opts, { fd: this })); }
     readFile(o) {
       const enc = typeof o === "string" ? o : (o && o.encoding);
-      return Promise.resolve().then(() => {
+      const signal = fsSignalOf(o);
+      return Promise.resolve().then(async () => {
+        fsThrowIfAborted(signal);
+        const fd = this._use("read");
+        // node kIoMaxLength: a file larger than 2**31-1 cannot be read into one
+        // buffer (ERR_FS_FILE_TOO_LARGE, a RangeError).
+        try {
+          const size = fsMod.fstatSync(fd).size;
+          if (size > 2147483647) {
+            const e = new RangeError("File size (" + size + ") is greater than 2 GiB");
+            e.code = "ERR_FS_FILE_TOO_LARGE";
+            throw e;
+          }
+        } catch (e) { if (e && e.code === "ERR_FS_FILE_TOO_LARGE") throw e; }
         const chunks = []; const tmp = Buffer.alloc(65536); let n;
-        while ((n = fsMod.readSync(this._fd, tmp, 0, tmp.length, null)) > 0) chunks.push(Buffer.from(tmp.subarray(0, n)));
+        while ((n = fsMod.readSync(fd, tmp, 0, tmp.length, null)) > 0) {
+          chunks.push(Buffer.from(tmp.subarray(0, n)));
+          // Yield a full loop turn between chunks: node reads through the
+          // thread pool, so an abort scheduled with process.nextTick OR
+          // setImmediate lands mid-read (common/tick.js uses setImmediate).
+          await new Promise((r) => G.setImmediate(r));
+          fsThrowIfAborted(signal);
+        }
+        await new Promise((r) => G.setImmediate(r));
+        fsThrowIfAborted(signal);
         const all = Buffer.concat(chunks);
         return enc ? all.toString(enc) : all;
       });
     }
     writeFile(data, o) {
       const enc = typeof o === "string" ? o : (o && o.encoding) || "utf8";
-      const b = typeof data === "string" ? Buffer.from(data, enc) : (ArrayBuffer.isView(data) ? data : Buffer.from(data));
-      return Promise.resolve().then(() => { fsMod.writeSync(this._fd, b, 0, b.byteLength || b.length, null); });
+      const signal = fsSignalOf(o);
+      return Promise.resolve().then(async () => {
+        fsThrowIfAborted(signal);
+        const fd = this._use("write");
+        // node consumes (async) iterables here too (a Readable is the common case).
+        if (data != null && typeof data !== "string" && !ArrayBuffer.isView(data) && !(data instanceof ArrayBuffer) &&
+            (typeof data[Symbol.asyncIterator] === "function" || typeof data[Symbol.iterator] === "function")) {
+          for await (const chunk of data) {
+            fsThrowIfAborted(signal);
+            fsValidateData(chunk, "chunk");
+            const c = typeof chunk === "string" ? Buffer.from(chunk, enc) : (ArrayBuffer.isView(chunk) ? chunk : Buffer.from(chunk));
+            if (c.byteLength) fsMod.writeSync(fd, c, 0, c.byteLength, null);
+          }
+          return;
+        }
+        fsValidateData(data);
+        const b = typeof data === "string" ? Buffer.from(data, enc) : (ArrayBuffer.isView(data) ? data : Buffer.from(data));
+        fsMod.writeSync(fd, b, 0, b.byteLength, null);
+      });
     }
-    stat() { return Promise.resolve().then(() => { if (this._closed || this._fd === -1) { const e = new Error("EBADF: bad file descriptor, fstat"); e.code = "EBADF"; e.errno = -9; e.syscall = "fstat"; throw e; } return fsMod.fstatSync(this._fd); }); }
-    sync() { return Promise.resolve(); }
-    datasync() { return Promise.resolve(); }
-    truncate(len) { return Promise.resolve().then(() => { try { fsMod.ftruncateSync(this._fd, len); } catch (e) {} }); }
-    chmod(m) { return Promise.resolve(); }
-    chown() { return Promise.resolve(); }
-    utimes() { return Promise.resolve(); }
-    close() { if (this._closed) return Promise.resolve(); this._closed = true; const fd = this._fd; return Promise.resolve().then(() => { fsMod.closeSync(fd); this._fd = -1; this.emit("close"); }); }
+    appendFile(data, o) {
+      const enc = typeof o === "string" ? o : (o && o.encoding) || "utf8";
+      const signal = fsSignalOf(o);
+      return Promise.resolve().then(() => {
+        fsThrowIfAborted(signal);
+        fsValidateData(data);
+        const fd = this._use("write");
+        const b = typeof data === "string" ? Buffer.from(data, enc) : (ArrayBuffer.isView(data) ? data : Buffer.from(data));
+        fsMod.writeSync(fd, b, 0, b.byteLength, null);
+      });
+    }
+    stat(o) { return Promise.resolve().then(() => fsMod.fstatSync(this._use("fstat"), o)); }
+    statfs(o) { return Promise.resolve().then(() => { const p = fdPathMap.get(this._use("statfs")); return fsMod.statfsSync(p, o); }); }
+    sync() { return Promise.resolve().then(() => { fsMod.fsyncSync(this._use("fsync")); }); }
+    datasync() { return Promise.resolve().then(() => { fsMod.fdatasyncSync(this._use("fdatasync")); }); }
+    truncate(len) { return Promise.resolve().then(() => { fsMod.ftruncateSync(this._use("ftruncate"), len == null ? 0 : len); }); }
+    // fchmod/fchown have no fd-based syscall behind mbun's virtual descriptors;
+    // recover the opened path (fdPathMap) so the mode change actually lands.
+    chmod(mode) {
+      return Promise.resolve().then(() => {
+        const fd = this._use("fchmod");
+        const m = fsParseFileMode(mode, "mode");
+        const p = fdPathMap.get(fd);
+        if (p != null) F.chmod(p, m);
+      });
+    }
+    chown(uid, gid) {
+      return Promise.resolve().then(() => { this._use("fchown"); fsIntU32(uid, "uid"); fsIntU32(gid, "gid"); });
+    }
+    utimes(atime, mtime) {
+      return Promise.resolve().then(() => {
+        const fd = this._use("futimes");
+        const p = fdPathMap.get(fd);
+        const s = (v) => v instanceof Date ? v.getTime() / 1000 : Number(v);
+        if (p != null) F.utimes(p, s(atime), s(mtime));
+      });
+    }
+    readLines(opts) {
+      const rl = M["readline"] || M["node:readline"];
+      return rl.createInterface(Object.assign({ input: this.createReadStream(opts), crlfDelay: Infinity }, opts));
+    }
+    // node emits "close" SYNCHRONOUSLY from close(), before the descriptor is
+    // actually closed and regardless of the ref count (lib/internal/fs/
+    // promises.js: `this.emit('close'); return this[kClosePromise];`). That is
+    // load-bearing, not cosmetic: fs.createReadStream(null, { fd: handle })
+    // registers `handle.on("close", () => stream.close())`, so a caller that
+    // does `createReadStream(...); return handle.close();` destroys the stream
+    // in the SAME turn and the stream never reads. Emitting from the deferred
+    // .then() instead let the stream issue its first read against a handle
+    // already flagged _closed, which _use() rejects with EBADF
+    // (test-fs-read-stream-file-handle, third block).
+    // Repeat calls return the same promise, as node returns kClosePromise.
+    close() {
+      if (this._closed) return this._closePromise || Promise.resolve();
+      this._closed = true;
+      const fd = this._fd;
+      const p = Promise.resolve().then(() => { try { fsMod.closeSync(fd); } finally { this._fd = -1; } });
+      this._closePromise = p;
+      this.emit("close");
+      return p;
+    }
     [Symbol.asyncDispose]() { return this.close(); }
   }
   const fsPromises = {
     open: (p, flags, mode) => Promise.resolve().then(() => { validatePath(p); const md = mode == null ? 0o666 : fsParseFileMode(mode, "mode", 0o666); return new FileHandle(fdRemember(globalThis.__mbunFdNative.open(toStr(p), flags == null ? "r" : (typeof flags === "number" ? flags : toStr(flags)), md), p)); }),
-    readFile: P((p) => F.readFile(toStr(p))),
-    writeFile: (p, d, o) => (async () => {
+    // node fs.promises.readFile: a FileHandle argument reads through the
+    // handle; no encoding yields a Buffer (it used to hand back the UTF-8
+    // string, so `assert.ok(await readFile(empty))` saw a falsy "").
+    readFile: (p, o) => Promise.resolve().then(() => {
+      const signal = fsSignalOf(o);
+      fsThrowIfAborted(signal);
+      if (p && typeof p === "object" && typeof p.readFile === "function") return p.readFile(o);
+      return fsMod.readFileSync(p, o);
+    }),
+    writeFile: (p, d, o) => Promise.resolve().then(async () => {
+      if (p && typeof p === "object" && typeof p.writeFile === "function") return p.writeFile(d, o);
+      const signal = fsSignalOf(o);
+      fsThrowIfAborted(signal);
+      if (d != null && typeof d !== "string" && !ArrayBuffer.isView(d) && !(d instanceof ArrayBuffer) &&
+          typeof d[Symbol.asyncIterator] !== "function" && typeof d[Symbol.iterator] !== "function")
+        fsValidateData(d);
+      else if (d == null || typeof d === "number" || typeof d === "bigint" || typeof d === "boolean" || typeof d === "symbol")
+        fsValidateData(d);
       const path2 = toStr(p);
       if (d != null && typeof d !== "string" && !ArrayBuffer.isView(d) && !(d instanceof ArrayBuffer) &&
           (typeof d[Symbol.asyncIterator] === "function" || typeof d[Symbol.iterator] === "function")) {
@@ -4253,11 +6406,14 @@ inline constexpr char kBootstrapJS_[] = R"JS(
         // first (so a directory path throws EISDIR before the iterator is
         // touched), then write each chunk. ref src/js/node/fs.promises.ts:1493.
         const FD = globalThis.__mbunFdNative;
-        const fd = FD.open(path2, (o && o.flag) || "w", 0o666);
+        // options may be a bare encoding string (writeFile(p, iterable, "latin1")).
+        const oEnc = typeof o === "string" ? o : (o && o.encoding);
+        const oFlag = (o && typeof o === "object" && o.flag) || "w";
+        const fd = FD.open(path2, oFlag, 0o666);
         try {
           for await (const chunk of d) {
             let u;
-            if (typeof chunk === "string") u = Buffer.from(chunk, (o && o.encoding) || "utf8");
+            if (typeof chunk === "string") u = Buffer.from(chunk, oEnc || "utf8");
             else if (ArrayBuffer.isView(chunk)) u = new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
             else if (chunk instanceof ArrayBuffer) u = new Uint8Array(chunk);
             else throw Object.assign(new TypeError("The \"chunk\" argument must be of type string or an instance of Buffer, TypedArray, or DataView. Received " + typeof chunk), { code: "ERR_INVALID_ARG_TYPE" });
@@ -4266,42 +6422,77 @@ inline constexpr char kBootstrapJS_[] = R"JS(
         } finally { FD.close(fd); }
         return;
       }
-      return F.writeFile(path2, toStr(d));
-    })(),
+      return fsMod.writeFileSync(path2, d, o);
+    }),
     appendFile: (p, d, o) => Promise.resolve().then(() => {
       fsValidateData(d); fsValidateEncoding(o);
       if (p && typeof p === "object" && typeof p.appendFile === "function") return p.appendFile(d, o);
-      const isFd = typeof p === "number";
-      if (isFd) {
-        const FD = globalThis.__mbunFdNative;
-        const enc = typeof o === "string" ? o : (o && o.encoding) || "utf8";
-        const b = typeof d === "string" ? Buffer.from(d, enc) : Buffer.from(d);
-        FD.write(p, new Uint8Array(b.buffer, b.byteOffset, b.byteLength), 0, b.byteLength, -1);
-        return;
-      }
-      return F.appendFile(toStr(p), toStr(d));
+      return fsMod.appendFileSync(p, d, o);
     }),
     mkdir: P((p, o) => { validatePath(p); const [rec, mode] = mkdirOpts(o); return F.mkdir(toStr(p), rec, mode); }),
-    rm: P((p, o) => F.rm(toStr(p), recur(o), !!(o && o.force))),
-    rmdir: P((p) => F.rm(toStr(p), true, true)),
+    rm: P((p, o) => rmImpl(p, o)),
+    rmdir: P((p, o) => { validatePath(p); rmdirCheckOpts(o); rmdirImpl(p); }),
+    truncate: P((p, len) => fsMod.truncateSync(p, len)),
+    statfs: P((p, o) => fsMod.statfsSync(p, o)),
     readdir: P((p) => F.readdir(toStr(p))),
-    stat: P((p) => F.stat(toStr(p))),
-    lstat: P((p) => F.stat(toStr(p), true)),
+    // Route through statSync/lstatSync, not F.stat: the raw native row has no
+    // Stats prototype and ignores `{ bigint: true }` (fs.promises.stat must
+    // return the same shape as its sync twin — test-fs-stat-bigint compares
+    // both, and the mbun-only own keys must stay non-enumerable).
+    stat: P((p, o) => fsMod.statSync(p, o)),
+    lstat: P((p, o) => fsMod.lstatSync(p, o)),
     unlink: P((p) => F.unlink(toStr(p))),
-    realpath: P((p) => F.realpath(toStr(p))),
+    realpath: P((p, o) => fsMod.realpathSync(p, o)),
     rename: P((a, b) => F.rename(toStr(a), toStr(b))),
-    copyFile: P((a, b) => F.copyFile(toStr(a), toStr(b))),
+    // fs.promises.link was simply absent (node has it); the callback twin used
+    // to be copyFile, so nothing here could have been right anyway.
+    link: P((a, b) => { validatePath(a, "existingPath"); validatePath(b, "newPath"); return F.link(toStr(a), toStr(b)); }),
+    copyFile: P((a, b, m) => { validatePath(a, "src"); validatePath(b, "dest"); fsValidCopyMode(m); return F.copyFile(toStr(a), toStr(b)); }),
     mkdtemp: P((pre) => F.mkdtemp(toStr(pre))),
-    access: P((p) => { if (!F.exists(toStr(p))) throw Object.assign(new Error("ENOENT: no such file or directory, access '" + toStr(p) + "'"), { code: "ENOENT" }); }),
+    // Route through accessSync, not a bare existence probe: fs.promises.access
+    // resolved for W_OK on a 0o444 file, where its callback twin already
+    // rejected (test-fs-access).
+    access: P((p, m) => fsMod.accessSync(p, m)),
     exists: P((p) => F.exists(toStr(p))),
-    cp: P((src, dest, o) => cpRec(toStr(src), toStr(dest), o)),
-    symlink: P((target, path2) => F.symlink(toStr(target), toStr(path2))),
+    cp: P((src, dest, o) => { validatePath(src, "src"); validatePath(dest, "dest"); return cpRecAsync(toStr(src), toStr(dest), cpValidateOptions(o)); }),
+    symlink: P((target, path2, type) => { validatePath(target, "target"); validatePath(path2, "path"); fsValidateSymlinkType(type); return F.symlink(toStr(target), toStr(path2)); }),
     readlink: P((p) => F.readlink(toStr(p))),
-    chmod: P((p, m) => F.chmod(toStr(p), typeof m === "string" ? parseInt(m, 8) : (Number(m) & 0o7777))), lchmod: P(() => {}), chown: P(() => {}), lchown: P(() => {}),
-    utimes: P((p, a, m) => { const s = (v) => v instanceof Date ? v.getTime() / 1000 : Number(v); F.utimes(toStr(p), s(a), s(m)); }), lutimes: P(() => {}), truncate: P(() => {}),
+    chmod: P((p, m) => F.chmod(toStr(p), typeof m === "string" ? parseInt(m, 8) : (Number(m) & 0o7777))), lchmod: P(() => {}),
+    // The promise forms validate exactly like their callback twins: a bare
+    // `() => {}` resolved for every invalid path/uid/gid (test-fs-lchown).
+    chown: P((p, uid, gid) => fsMod.chownSync(p, uid, gid)),
+    lchown: P((p, uid, gid) => fsMod.lchownSync(p, uid, gid)),
+    utimes: P((p, a, m) => { const s = (v) => v instanceof Date ? v.getTime() / 1000 : Number(v); F.utimes(toStr(p), s(a), s(m)); }),
+    lutimes: P((p, a, m) => fsMod.lutimesSync(p, a, m)),
     glob: (pat, o) => { const arr = fsMod.globSync(pat, o); let i = 0; return { [Symbol.asyncIterator]() { return { next: () => Promise.resolve(i < arr.length ? { value: arr[i++], done: false } : { value: undefined, done: true }) }; } }; },
     opendir: (p, opts) => Promise.resolve().then(() => fsMod.opendirSync(p, opts)),
+    // node fs.promises.mkdtempDisposable: an explicit-resource-management
+    // handle over mkdtemp whose remove()/[Symbol.asyncDispose]() rm -rf's the
+    // directory and is idempotent.
+    mkdtempDisposable: (prefix, o) => Promise.resolve().then(() => {
+      validatePath(prefix, "prefix"); fsValidateEncoding(o);
+      const dir = F.mkdtemp(toStr(prefix));
+      // Removal must not depend on the CWD at removal time (node resolves the
+      // directory up front) — a process.chdir() in between would otherwise make
+      // a relative prefix unremovable.
+      const abs = dir[0] === "/" ? dir : (G.process.cwd() + "/" + dir);
+      let removed = false;
+      const remove = () => Promise.resolve().then(() => {
+        if (removed) return;
+        // The flag flips only on SUCCESS: node re-throws a failed removal and a
+        // later retry (once permissions allow it) must still do the work.
+        F.rm(abs, true, false);
+        removed = true;
+      });
+      return { path: dir, remove, [Symbol.asyncDispose]: remove };
+    }),
+    readv: (fd, buffers, position) => Promise.resolve().then(() => new FileHandle(fd).readv(buffers, position)),
+    writev: (fd, buffers, position) => Promise.resolve().then(() => new FileHandle(fd).writev(buffers, position)),
+    watchFile: undefined,
+    constants: fsMod.constants,
+    FileHandle,
   };
+  delete fsPromises.watchFile;
   if (process.platform !== "darwin") { delete fsPromises.lchmod; }
   fsMod.promises = fsPromises;
   M["fs/promises"] = fsPromises;

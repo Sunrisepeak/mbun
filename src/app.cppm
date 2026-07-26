@@ -109,6 +109,67 @@ int run_markdown(std::string_view file) {
     return mbun::jsc::runtime::run_eval(code);
 }
 
+// ─── node's `--test` CLI ───────────────────────────────────────────────────
+// `node --test [flags] [paths…]` does not execute its positionals as scripts:
+// it hands them to the test runner and streams a reporter to stdout. bun has no
+// `--test` flag, so a command line carrying one is unambiguously node's runner
+// being asked for — and taking the first positional as an entry point (which is
+// what the node-emulation path below would do) runs one file's tests without a
+// reporter, without the exit-code contract, and ignores the rest.
+//
+// Everything about it lives in JS (the :node_test_run builtins partition owns
+// run(), the reporters, and the flag semantics); this is only the dispatch, so
+// the C++ side never has to know node's option table.
+bool has_node_test_flag(std::span<const std::string_view> args) {
+    for (const std::string_view a : args) {
+        if (a == "--test") return true;
+        // Stop at the first positional: `mbun script.js --test` passes --test to
+        // the script, exactly as node does.
+        if (!a.starts_with("-")) {
+            if (mbun::cli::node_flag_takes_value(a)) continue;  // never reached for a value token
+            return false;
+        }
+    }
+    return false;
+}
+
+int exec_node_test_cli(std::span<const std::string_view> args) {
+    std::string flagsLit{"["};
+    std::string filesLit{"["};
+    bool firstFlag{true};
+    bool firstFile{true};
+    for (std::size_t i{0}; i < args.size(); ++i) {
+        const std::string_view a{args[i]};
+        if (a.starts_with("-") && a != "-") {
+            if (!firstFlag) flagsLit += ",";
+            flagsLit += js_quote(a);
+            firstFlag = false;
+            // A value-taking flag owns the next token.
+            if (a.find('=') == std::string_view::npos && mbun::cli::node_flag_takes_value(a) &&
+                i + 1 < args.size()) {
+                flagsLit += "," + js_quote(args[++i]);
+            }
+            continue;
+        }
+        if (!firstFile) filesLit += ",";
+        filesLit += js_quote(a);
+        firstFile = false;
+    }
+    flagsLit += "]";
+    filesLit += "]";
+
+    // process.argv for `node --test x.js` is [execPath, …positionals]; the flags
+    // are already reported through process.execArgv.
+    std::vector<std::string> jsArgv{"mbun"};
+    for (const std::string_view a : args) {
+        if (!a.starts_with("-") || a == "-") jsArgv.emplace_back(a);
+    }
+    mbun::jsc::runtime::set_argv(std::move(jsArgv));
+
+    const std::string code{"globalThis.__mbunNodeTestCli(" + filesLit + "," + flagsLit + ")"};
+    return mbun::jsc::runtime::run_eval(code);
+}
+
 // `--preserve-symlinks-main` (run_command.rs:2580) — set from the flag or from
 // NODE_PRESERVE_SYMLINKS_MAIN (bun reads both; run_command.rs:2581-2584).
 bool gPreserveSymlinksMain{false};
@@ -1965,6 +2026,20 @@ int exec_run_target(std::string_view target, std::span<const std::string_view> p
         if (std::filesystem::exists(p, ec) && !std::filesystem::is_directory(p, ec)) {
             return run_script(target, passthrough);
         }
+        // node resolves the MAIN entry point through the CommonJS loader, so an
+        // extensionless path gets the same tryExtensions() walk a `require()`
+        // would give it (Module._findPath). `node <dir>/fixtures/some-fixture`
+        // is how several corpus files spawn a fixture
+        // (test-worker-node-options), and mbun answered "Script not found".
+        if (p.extension().empty()) {
+            for (const std::string_view ext : {".js", ".mjs", ".cjs", ".json"}) {
+                const std::string candidate{std::string{target} + std::string{ext}};
+                std::filesystem::path cp{candidate};
+                if (std::filesystem::exists(cp, ec) && !std::filesystem::is_directory(cp, ec)) {
+                    return run_script(candidate, passthrough);
+                }
+            }
+        }
     }
 
     run::PackageScripts pkg{run::load_nearest_package_scripts(cwd)};
@@ -2264,6 +2339,86 @@ int run_embedded_program(const mbun::bundler::standalone_exe::Program& program,
     return mbun::jsc::runtime::run_source(virtualPath, program.code);
 }
 
+// ─── `-i` / `--interactive` — force the REPL ─────────────────────────────────
+// Port of node lib/internal/main/repl.js. bun has no REPL at all (its `node`
+// wrapper prints "does not support a repl"), so this is node's shape driven by
+// mbun's node:repl REPLServer, and node's ORDER is observable:
+//
+//   1. the welcome banner, via console.log;
+//   2. the REPL (repl.createInternalRepl → the first `> ` prompt);
+//   3. only THEN the `-e`/`--eval` string, "in the current context".
+//
+// test-force-repl asserts stdout is exactly the banner plus `> `, and
+// test-force-repl-with-eval asserts the eval's output arrives AFTER that
+// prompt (`output.endsWith('> 42\n')`) — so neither the banner nor the ordering
+// is cosmetic. `-i` also forces the REPL when stdin is NOT a tty, which is the
+// only way the corpus can drive it (17 test-repl-* files spawn `mbun -i` /
+// `mbun --interactive` with piped stdio).
+int exec_interactive(std::span<const std::string_view> args) {
+    // node lib/internal/main/repl.js: `--input-type` selects a module kind for
+    // the entry point, and a REPL has none — node prints this on stderr and
+    // exits kInvalidCommandLineArgument (9). test-repl-unsupported-option
+    // asserts the message byte-for-byte and a non-zero status.
+    for (const std::string_view a : args) {
+        if (a == "--input-type" || a.starts_with("--input-type=")) {
+            std::println(std::cerr, "Cannot specify --input-type for REPL");
+            return 9;
+        }
+    }
+    // `-i -e <code>` / `-i -p <code>`: the eval string rides along; anything
+    // after it is user argv, exactly as in the plain eval path.
+    std::string evalCode{};
+    bool print{false};
+    std::vector<std::string> jsArgv{"mbun"};
+    for (std::size_t i{0}; i < args.size(); ++i) {
+        const std::string_view a{args[i]};
+        if (a != "-e" && a != "--eval" && a != "-p" && a != "--print") continue;
+        if (i + 1 >= args.size()) {
+            std::println(std::cerr, "error: Missing code to evaluate");
+            return 1;
+        }
+        print = (a == "-p" || a == "--print");
+        evalCode = std::string{args[i + 1]};
+        for (const std::string_view rest : args.subspan(i + 2)) jsArgv.emplace_back(rest);
+        break;
+    }
+    mbun::jsc::runtime::set_argv(std::move(jsArgv));
+
+    std::string code{
+        "console.log(\"Welcome to Node.js \" + process.version + \".\\n\" + "
+        "'Type \".help\" for more information.');"
+        "require(\"repl\").createInternalRepl(process.env, function (err, r) {"
+        "  if (err) throw err;"
+        "  r.on(\"exit\", function () { process.exit(); });"
+        "});"};
+    if (!evalCode.empty()) {
+        // process._eval is the ORIGINAL source, as in the plain eval path.
+        code += "process._eval=" + js_quote(evalCode) + ";";
+        code += print ? ("console.log((() => (" + evalCode + "))())") : evalCode;
+    }
+    return mbun::jsc::runtime::run_eval(code);
+}
+
+// Strip every leading `-i` / `--interactive` out of `args`, reporting whether
+// one was there. Stops at the first positional so a script or script argument
+// literally named `-i` is never eaten; the value token of an eval flag is
+// skipped for the same reason.
+bool take_interactive_flag(std::vector<std::string_view>& args) {
+    bool interactive{false};
+    for (std::size_t i{0}; i < args.size();) {
+        const std::string_view a{args[i]};
+        if (a == "-i" || a == "--interactive") {
+            interactive = true;
+            args.erase(args.begin() + static_cast<std::ptrdiff_t>(i));
+            continue;
+        }
+        if (a == "-e" || a == "--eval" || a == "-p" || a == "--print") { i += 2; continue; }
+        if (a.starts_with("-") && a != "-") { ++i; continue; }
+        break;
+    }
+    return interactive;
+}
+
 // Port of run_command.rs:2981-3040 `exec_as_if_node` (cli/mod.rs:952-958 routes
 // here when argv[0] is `node`). This is how EVERY `#!/usr/bin/env node` shebang
 // enters this binary once `--bun` has put <BUN_NODE_DIR>/node at the front of
@@ -2274,35 +2429,6 @@ int run_embedded_program(const mbun::bundler::standalone_exe::Program& program,
 // (run_command.rs:3007-3028) and booted regardless of extension or shebang.
 // Unknown flags must not warn (cli/mod.rs:953-955 clears
 // WARN_ON_UNRECOGNIZED_FLAG) — node-mode must not reject node's own flags.
-// A node runtime flag whose value is a SEPARATE token (`--flag value`), not
-// `--flag=value`. Node's V8/bootstrap option table decides this per flag; the
-// corpus re-spawns `process.execPath` with the space form for these, so unless
-// we consume the value token too it is mistaken for the script to run (the
-// `test-*.js` re-exec cluster: `--snapshot-blob X`, `-r X`, `--test-reporter X`).
-// Everything not listed here is treated as a boolean flag (single token).
-bool node_flag_takes_value(std::string_view flag) {
-    static constexpr std::string_view kValued[]{
-        "-r", "--require", "--snapshot-blob", "--build-snapshot-config",
-        "--test-reporter", "--test-reporter-destination", "--test-name-pattern",
-        "--test-skip-pattern", "--test-shard", "--test-concurrency",
-        "--heap-prof-interval", "--heap-prof-dir", "--heap-prof-name",
-        "--cpu-prof-interval", "--cpu-prof-dir", "--cpu-prof-name",
-        "--trace-event-categories", "--trace-event-file-pattern",
-        "--localstorage-file", "--env-file", "--env-file-if-exists",
-        "--max-old-space-size", "--max-semi-space-size", "--stack-size",
-        "--stack-trace-limit", "--v8-pool-size", "--title", "--icu-data-dir",
-        "--openssl-config", "--tls-cipher-list", "--tls-keylog",
-        "--heapsnapshot-signal", "--heapsnapshot-near-heap-limit",
-        "--diagnostic-dir", "--redirect-warnings", "--disk-cache-dir",
-        "--experimental-policy", "--policy-integrity", "--conditions",
-        "-C", "--report-dir", "--report-directory", "--report-filename",
-        "--report-signal", "--secure-heap", "--secure-heap-min", "--dns-result-order"};
-    for (std::string_view f : kValued) {
-        if (flag == f) return true;
-    }
-    return false;
-}
-
 int exec_as_if_node(std::span<const std::string_view> args) {
     mbun::cli::run::set_pretend_to_be_node(true);
 
@@ -2310,8 +2436,13 @@ int exec_as_if_node(std::span<const std::string_view> args) {
     std::size_t i{0};
     for (; i < args.size(); ++i) {
         const std::string_view a{args[i]};
-        // `node -e <code>` / `-p <code>` (run_command.rs:2988-3000).
-        if (a == "-e" || a == "--eval" || a == "-p" || a == "--print") {
+        // `node -e <code>` / `-p <code>` (run_command.rs:2988-3000). `-pe`/`-ep`
+        // are node's combined short forms for `-p -e`; the corpus spawns
+        // children with them (test-tls-cipher-list builds argv as
+        // [...flags, '-pe', expression]), and without them the expression token
+        // was taken for the script path.
+        if (a == "-e" || a == "--eval" || a == "-p" || a == "--print" || a == "-pe" ||
+            a == "-ep") {
             if (i + 1 >= args.size()) {
                 std::println(std::cerr, "error: Missing code to evaluate");
                 return 1;
@@ -2320,7 +2451,8 @@ int exec_as_if_node(std::span<const std::string_view> args) {
             for (std::string_view rest : args.subspan(i + 2)) jsArgv.emplace_back(rest);
             mbun::jsc::runtime::set_argv(std::move(jsArgv));
             std::string code{args[i + 1]};
-            if (a == "-p" || a == "--print") code = "console.log((() => (" + code + "))())";
+            if (a == "-p" || a == "--print" || a == "-pe" || a == "-ep")
+                code = "console.log((() => (" + code + "))())";
             return mbun::jsc::runtime::run_eval(code);
         }
         // `node --version` prints the node compatibility claim, exactly like
@@ -2353,7 +2485,7 @@ int exec_as_if_node(std::span<const std::string_view> args) {
         // (its `=value` rides along in the same token). A separate value token is
         // skipped only for flags known to take one, so boolean flags do not
         // accidentally swallow the script path.
-        if (a.find('=') == std::string_view::npos && node_flag_takes_value(a) &&
+        if (a.find('=') == std::string_view::npos && mbun::cli::node_flag_takes_value(a) &&
             i + 1 < args.size()) {
             ++i;  // consume the value token
         }
