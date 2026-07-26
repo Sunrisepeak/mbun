@@ -816,3 +816,44 @@ naming so nobody removes it:
 The failure mode to watch is not CPU, it is **swap**: it has been driven to 100%
 once in this session and stayed there. Load is recoverable; a machine in swap
 death is not.
+
+
+### Correction: the "256 KiB per-file limit" was not the rule I claimed
+
+Earlier in this series I diagnosed a build failure —
+`index requires mcpp >= 0.0.108 but this is mcpp 0.0.103` — as a **~256 KiB
+per-file source limit**, split `js_net.cppm` and `js_http2.cppm` on that basis,
+and wrote the rule into two commit messages and an agent brief.
+
+The evidence for it was real but incomplete: the file was 254 KiB and built, 274
+KiB and failed, 259 KiB and built again. What I never checked is whether any
+*other* file was already larger. **`modules/jsc/src/builtins/bootstrap.cppm` is
+414 KiB and builds fine**, and four test fixtures under `modules/toml` and
+`modules/glob` are larger still (up to 1.4 MiB). A simple per-file byte cap
+cannot be the rule.
+
+So the size correlation was real and reproducible, and my *explanation* of it was
+wrong. The E0006 floor is about the package index, and it also appeared — then
+vanished — during a concurrent workspace test with two corpus runs in flight,
+which points at shared-state interference rather than at any property of the
+file. The honest statement is: **crossing some size threshold in `modules/jsc`
+can trigger E0006, the mechanism is not established, and splitting the payload is
+a workaround, not a fix.**
+
+The splits stay: they are harmless, they follow the existing
+`js_streams.cppm` shape, and each half is independently under every threshold
+anyone has observed. But do not propagate "mcpp has a 256 KiB file limit" as
+fact — it is not one, and `bootstrap.cppm` disproves it.
+
+### Line budget: 2000 lines per file under `runtime/`
+
+This one IS a real, enforced rule, and it is the one that broke CI. `modules/jsc`'s
+`test_runtime_structure` caps every file under `src/runtime/` — and `runtime.cppm`
+itself — at 2000 lines, and walks the `#include` graph to prove each slice is
+registered. This round pushed `engine.inc` to 2372 and `io_bindings.inc` to 2046,
+so `mcpp test --workspace` failed while `mcpp build` was perfectly green.
+
+Extracted `Runtime::install_bindings_` into `runtime/bindings_install.inc` and the
+tail of `io_bindings.inc`'s free functions into `runtime/io_fs_errors.inc`, each
+`#include`d from where the code used to sit — the same move `module_loading.inc`
+represents. A build passing is not evidence the workspace test will.
