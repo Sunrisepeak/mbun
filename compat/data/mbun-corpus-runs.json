@@ -5,25 +5,25 @@
   {
    "corpus": "compat/bun/test",
    "runner": "tools/integration/bun_corpus_runner.py --cwd compat/bun --discover compat/bun/test --sample-per-group 100000 --jobs 5 --timeout 30 --resume",
-   "binary": "r9/integration @ de1d224 (round 14 checkpoint)",
+   "binary": "rewrite_bun_in_mcpp + r9/integration @ e4639ae (round 14 checkpoint, base merged)",
    "files": 1902,
    "categories": {
     "ahead-of-reference": 3,
     "all-skipped": 73,
-    "blocked-external": 16,
+    "blocked-external": 13,
     "fixture-build-error": 5,
-    "green": 869,
+    "green": 868,
     "load-error": 4,
     "no-tests": 6,
-    "oom-kill": 3,
-    "test-failure": 880,
-    "timeout": 43
+    "oom-kill": 5,
+    "test-failure": 884,
+    "timeout": 41
    },
    "test_level": {
-    "ran": 51425,
-    "passed": 31484,
-    "failed": 17160,
-    "expects": 466896
+    "ran": 51656,
+    "passed": 31479,
+    "failed": 17391,
+    "expects": 466865
    },
    "notes": "file-level green = every executed test in the file passed and nothing errored outside a test. ahead-of-reference = every failure in the file is a stale bun `test.failing` marker that now passes, i.e. mbun is MORE correct than bun there; it is NOT counted as green because the file still does not pass bun's suite as written.",
    "checkpoint_note": "Same binary and session as the node row. 869 green against 885 in the last published round-7/8 snapshot, but those were never contemporaneous — that snapshot predated ~20 tasks over shared code. Running both corpora together is what caught an earlier 868 -> 612 excursion caused by one missing field in Bun.spawn."
@@ -31,18 +31,18 @@
   {
    "corpus": "compat/node/test/parallel",
    "runner": "tools/integration/node_corpus_runner.py --jobs 6 --timeout 15",
-   "binary": "r9/integration @ de1d224 (round 14 checkpoint)",
+   "binary": "rewrite_bun_in_mcpp + r9/integration @ e4639ae (round 14 checkpoint, base merged)",
    "files": 4433,
    "categories": {
     "fail": 1127,
-    "oom-kill": 3,
-    "pass": 2652,
+    "oom-kill": 4,
+    "pass": 2654,
     "skipped": 552,
-    "timeout": 99
+    "timeout": 96
    },
    "rates": {
-    "strict_pass": 0.598,
-    "excluding_self_skips": 0.683
+    "strict_pass": 0.599,
+    "excluding_self_skips": 0.684
    },
    "baseline_for_comparison": {
     "binary": "round-8 HEAD (23217dd), measured with the SAME corrected runner",
