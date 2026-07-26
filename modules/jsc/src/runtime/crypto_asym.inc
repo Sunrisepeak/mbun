@@ -851,6 +851,126 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_dh_prime_host,
     return JSC::JSValue::encode(toJS(global, static_cast<JSValueRef>(asym_u8(ctx, out))));
 }
 
+struct BnDel { void operator()(BIGNUM* p) const { if (p) BN_free(p); } };
+using BnPtr = std::unique_ptr<BIGNUM, BnDel>;
+
+// __mbunCryptoAsymNative.generatePrime(bits, safe, add, rem) → Uint8Array
+// (big-endian, BN_num_bytes long — the same minimal encoding node's
+// RandomPrimeTraits::EncodeOutput produces). `add`/`rem` are optional unsigned
+// big-endian byte strings; OpenSSL then constrains p % add == rem (rem defaults
+// to 1, or to 3 with safe). The two guards node applies before this call
+// (add wider than the requested prime, add <= rem — both of which make
+// BN_generate_prime_ex spin forever) live in the JS layer, where they can carry
+// node's ERR_OUT_OF_RANGE codes.
+// ref: node src/crypto/crypto_random.cc RandomPrimeTraits + ncrypto
+//      BignumPointer::generate.
+JSC_DEFINE_HOST_FUNCTION(node_asym_generate_prime_host,
+                         (JSC::JSGlobalObject* global, JSC::CallFrame* frame)) {
+    JSContextRef ctx{toRef(global)};
+    const int bits{asym_int(native_arg(frame, 0), 0)};
+    if (bits < 1) { return hasher_throw(global, "Invalid prime length"); }
+    const bool safe{[&] { JSC::JSValue v{native_arg(frame, 1)}; return v && v.toBoolean(global); }()};
+    std::vector<std::uint8_t> addBytes;
+    std::vector<std::uint8_t> remBytes;
+    const bool hasAdd{asym_read(global, native_arg(frame, 2), addBytes)};
+    const bool hasRem{asym_read(global, native_arg(frame, 3), remBytes)};
+    BnPtr add{hasAdd ? BN_bin2bn(addBytes.data(), static_cast<int>(addBytes.size()), nullptr)
+                     : nullptr};
+    BnPtr rem{hasRem ? BN_bin2bn(remBytes.data(), static_cast<int>(remBytes.size()), nullptr)
+                     : nullptr};
+    if ((hasAdd && !add) || (hasRem && !rem)) {
+        return hasher_throw(global, "could not generate prime: " + asym_ossl_err());
+    }
+    BnPtr p{BN_new()};
+    if (!p || BN_generate_prime_ex(p.get(), bits, safe ? 1 : 0, add.get(), rem.get(), nullptr) != 1) {
+        return hasher_throw(global, "could not generate prime: " + asym_ossl_err());
+    }
+    const int n{BN_num_bytes(p.get())};
+    std::vector<std::uint8_t> out(n > 0 ? static_cast<std::size_t>(n) : 0, 0);
+    if (n > 0) { BN_bn2bin(p.get(), out.data()); }
+    return JSC::JSValue::encode(toJS(global, static_cast<JSValueRef>(asym_u8(ctx, out))));
+}
+
+// __mbunCryptoAsymNative.checkPrime(candidate, checks) → boolean.
+// `checks` == 0 lets OpenSSL pick the Miller-Rabin round count for the bit size
+// (node passes the option straight through the same way). The BN_bin2bn failure
+// is NOT swallowed: an over-long candidate must surface OpenSSL's own
+// "bignum too long", which the JS layer turns into ERR_OSSL_BN_BIGNUM_TOO_LONG,
+// rather than being answered "not prime".
+// ref: node src/crypto/crypto_random.cc CheckPrimeTraits.
+JSC_DEFINE_HOST_FUNCTION(node_asym_check_prime_host,
+                         (JSC::JSGlobalObject* global, JSC::CallFrame* frame)) {
+    std::vector<std::uint8_t> cand;
+    if (!asym_read(global, native_arg(frame, 0), cand)) {
+        return hasher_throw(global, "candidate is required");
+    }
+    while (ERR_get_error() != 0) {}  // start from a clean queue
+    BnPtr bn{BN_bin2bn(cand.data(), static_cast<int>(cand.size()), nullptr)};
+    if (!bn) { return hasher_throw(global, asym_ossl_err()); }
+    const int checks{asym_int(native_arg(frame, 1), 0)};
+    BN_CTX* bctx{BN_CTX_new()};
+    const int rc{BN_is_prime_ex(bn.get(), checks, bctx, nullptr)};
+    if (bctx != nullptr) { BN_CTX_free(bctx); }
+    if (rc < 0) { return hasher_throw(global, "prime check failed: " + asym_ossl_err()); }
+    return JSC::JSValue::encode(JSC::jsBoolean(rc == 1));
+}
+
+// __mbunCryptoAsymNative.spkac(op, input) — SPKAC / Netscape SPKI (crypto.Certificate).
+//   op 0 verifySpkac      → boolean
+//   op 1 exportPublicKey  → Uint8Array (SPKI PEM) or undefined when it does not parse
+//   op 2 exportChallenge  → Uint8Array (challenge string) or undefined
+// The signature check is the real NETSCAPE_SPKI_verify against the key the SPKAC
+// itself carries — a malformed or unsigned SPKAC returns false, never "assume ok".
+// ref: node src/crypto/crypto_spkac.cc + deps/ncrypto VerifySpkac/ExportPublicKey/
+//      ExportChallenge.
+JSC_DEFINE_HOST_FUNCTION(node_asym_spkac_host,
+                         (JSC::JSGlobalObject* global, JSC::CallFrame* frame)) {
+    JSContextRef ctx{toRef(global)};
+    const int op{asym_int(native_arg(frame, 0), 0)};
+    std::vector<std::uint8_t> input;
+    if (!asym_read(global, native_arg(frame, 1), input)) {
+        return hasher_throw(global, "spkac input is required");
+    }
+    NETSCAPE_SPKI* spki{NETSCAPE_SPKI_b64_decode(reinterpret_cast<const char*>(input.data()),
+                                                 static_cast<int>(input.size()))};
+    if (spki == nullptr) {
+        while (ERR_get_error() != 0) {}
+        return JSC::JSValue::encode(op == 0 ? JSC::jsBoolean(false) : JSC::jsUndefined());
+    }
+    JSC::EncodedJSValue result{JSC::JSValue::encode(JSC::jsUndefined())};
+    if (op == 0) {
+        EVP_PKEY* pkey{X509_PUBKEY_get(spki->spkac->pubkey)};
+        const bool ok{pkey != nullptr && NETSCAPE_SPKI_verify(spki, pkey) > 0};
+        if (pkey != nullptr) { EVP_PKEY_free(pkey); }
+        result = JSC::JSValue::encode(JSC::jsBoolean(ok));
+    } else if (op == 1) {
+        EVP_PKEY* pkey{NETSCAPE_SPKI_get_pubkey(spki)};
+        BIO* bio{BIO_new(BIO_s_mem())};
+        if (pkey != nullptr && bio != nullptr && PEM_write_bio_PUBKEY(bio, pkey) > 0) {
+            char* data{nullptr};
+            const long len{BIO_get_mem_data(bio, &data)};
+            if (len > 0) {
+                std::span<const std::uint8_t> bytes{reinterpret_cast<const std::uint8_t*>(data),
+                                                    static_cast<std::size_t>(len)};
+                result = JSC::JSValue::encode(toJS(global, static_cast<JSValueRef>(asym_u8(ctx, bytes))));
+            }
+        }
+        if (bio != nullptr) { BIO_free(bio); }
+        if (pkey != nullptr) { EVP_PKEY_free(pkey); }
+    } else {
+        unsigned char* buf{nullptr};
+        const int n{ASN1_STRING_to_UTF8(&buf, spki->spkac->challenge)};
+        if (n >= 0) {
+            std::span<const std::uint8_t> bytes{buf, static_cast<std::size_t>(n)};
+            result = JSC::JSValue::encode(toJS(global, static_cast<JSValueRef>(asym_u8(ctx, bytes))));
+        }
+        if (buf != nullptr) { OPENSSL_free(buf); }
+    }
+    NETSCAPE_SPKI_free(spki);
+    while (ERR_get_error() != 0) {}
+    return result;
+}
+
 // --- ECDH (provider API via OSSL_PARAM_BLD/fromdata) ---
 
 // Build an EC EVP_PKEY from a group name plus a public point and/or private

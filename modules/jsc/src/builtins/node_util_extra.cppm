@@ -153,8 +153,14 @@ inline constexpr std::string_view kNodeUtilExtraJS = R"JS(
       isFloat64Array: (v) => taTag(v) === "Float64Array",
       isBigInt64Array: (v) => taTag(v) === "BigInt64Array",
       isBigUint64Array: (v) => taTag(v) === "BigUint64Array",
+      // Brand, never `instanceof`: a plain object given KeyObject.prototype, or
+      // any object once Symbol.hasInstance is redefined, is not a key and must
+      // not be reported as one (node test-crypto-keyobject-brand-check). The
+      // predicate is published by builtins/crypto_asym.cppm, which owns the
+      // slot table; the instanceof path remains only for a build without it.
       isKeyObject: (v) => {
         if (!isObj(v)) return false;
+        if (typeof G.__mbunIsKeyObject === "function") return G.__mbunIsKeyObject(v);
         try {
           const c = M["crypto"] || M["node:crypto"];
           return !!(c && c.KeyObject) && v instanceof c.KeyObject;
