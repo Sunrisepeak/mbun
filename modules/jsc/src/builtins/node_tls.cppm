@@ -376,7 +376,14 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
         throw ERR_INVALID_ARG_TYPE("options.clientCertEngine", ["string", "null", "undefined"], clientCertEngine);
       throw ERR_CRYPTO_CUSTOM_ENGINE_NOT_SUPPORTED("Custom engines not supported by this OpenSSL");
     }
-    if (dhparam === "auto") throw ERR_CRYPTO_UNSUPPORTED_OPERATION("Automatic DH parameter selection is not supported");
+    // `dhparam: 'auto'` is node's SetDHParam(true) → SSL_CTX_set_dh_auto, which
+    // the linked OpenSSL supports. Only a BoringSSL build rejects it
+    // (test-tls-dhparam-auto-boringssl is gated on
+    // process.features.openssl_is_boringssl, which is false here), and throwing
+    // unconditionally made every DHE server unusable.
+    if (dhparam === "auto" && G.process && G.process.features
+        && G.process.features.openssl_is_boringssl)
+      throw ERR_CRYPTO_UNSUPPORTED_OPERATION("Automatic DH parameter selection is not supported");
     if (ticketKeys !== undefined && ticketKeys !== null) {
       validateBuffer(ticketKeys, "options.ticketKeys");
       if (ticketKeys.byteLength !== 48) throw ERR_INVALID_ARG_VALUE("options.ticketKeys", ticketKeys.byteLength, "must be exactly 48 bytes");

@@ -1015,7 +1015,10 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
                    // empty password, never "ask the terminal".
                    o.passphrase || "",
                    // honorCipherOrder: server-side SSL_OP_CIPHER_SERVER_PREFERENCE.
-                   o.honorCipherOrder === true);
+                   o.honorCipherOrder === true,
+                   // dhparam ("auto" | PEM) and ecdhCurve: the server's
+                   // ephemeral key-agreement parameters.
+                   o.dhparam || "", o.ecdhCurve || "");
         this._tls = 1;
       } catch (e) { this._fail(e); }
       return this;

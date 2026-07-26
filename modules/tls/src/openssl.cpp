@@ -513,6 +513,42 @@ struct TlsChannel::Impl {
             }
         }
 
+        // Ephemeral key-agreement parameters (node configSecureContext
+        // setECDHCurve / setDHParam).
+        //
+        // ecdhCurve: "auto"/empty leaves OpenSSL's own group preference alone;
+        // a named list NARROWS what may be negotiated (SSL_CTX_set1_groups_list).
+        // A list the library does not know is a hard failure — silently keeping
+        // the default would negotiate a group the caller did not authorise.
+        if (!config.ecdhCurve.empty() && config.ecdhCurve != "auto") {
+            if (::SSL_CTX_set1_groups_list(ctx_, config.ecdhCurve.c_str()) != 1) {
+                fail_("set1_groups_list: unknown ECDH curve");
+                return false;
+            }
+        }
+        // dhparam: "auto" hands the choice to OpenSSL's RFC 7919 named groups
+        // (SSL_CTX_set_dh_auto), which sizes the group to the certificate's key;
+        // otherwise a PEM parameter block is loaded verbatim. Without either,
+        // OpenSSL has no FFDHE parameters and every DHE-* suite the caller
+        // selected is quietly unusable.
+        if (config.dhParams == "auto") {
+            ::SSL_CTX_set_dh_auto(ctx_, 1);
+        } else if (!config.dhParams.empty()) {
+            BIO* bio {::BIO_new_mem_buf(config.dhParams.data(),
+                                        static_cast<int>(config.dhParams.size()))};
+            EVP_PKEY* params {bio != nullptr ? ::PEM_read_bio_Parameters(bio, nullptr) : nullptr};
+            const bool ok {params != nullptr && ::SSL_CTX_set0_tmp_dh_pkey(ctx_, params) == 1};
+            if (!ok && params != nullptr) {
+                ::EVP_PKEY_free(params); // set0 only takes ownership on success
+            }
+            if (bio != nullptr) {
+                ::BIO_free(bio);
+            }
+            if (!ok) {
+                fail_("set0_tmp_dh_pkey: unusable dhparam");
+                return false;
+            }
+        }
         if (!config.certificate.empty() && !use_certificate_(config.certificate)) {
             return false;
         }
@@ -1092,6 +1128,56 @@ std::vector<std::string> TlsChannel::peer_certificate_chain_pem() const {
         ::X509_free(leaf);
     }
     return out;
+}
+
+// node crypto_tls.cc TLSWrap::GetEphemeralKeyInfo. SSL_get_server_tmp_key only
+// answers on the client — the server has no "peer's" ephemeral key — and a
+// static-RSA suite has none at all, which stays the default-constructed result.
+EphemeralKeyInfo TlsChannel::ephemeral_key_info() const {
+    EphemeralKeyInfo info {};
+    if (impl_->ssl_ == nullptr || !established()) {
+        return info;
+    }
+    EVP_PKEY* key {nullptr};
+    if (::SSL_get_server_tmp_key(impl_->ssl_, &key) != 1 || key == nullptr) {
+        ::ERR_clear_error();
+        return info;
+    }
+    switch (::EVP_PKEY_id(key)) {
+    case EVP_PKEY_DH:
+        info.type = "DH";
+        info.size = ::EVP_PKEY_bits(key);
+        break;
+    case EVP_PKEY_EC: {
+        info.type = "ECDH";
+        // node reports the curve's short name and its ORDER bits (256 for
+        // prime256v1, 521 for secp521r1) — which is exactly what EVP_PKEY_bits
+        // answers for an EC key (the EC keymgmt maps "bits" to
+        // EC_GROUP_order_bits).
+        char group[128] {};
+        std::size_t groupLen {0};
+        if (::EVP_PKEY_get_group_name(key, group, sizeof group, &groupLen) == 1 && groupLen > 0) {
+            info.name.assign(group, groupLen);
+        } else {
+            ::ERR_clear_error();
+        }
+        info.size = ::EVP_PKEY_bits(key);
+        break;
+    }
+    default: {
+        // X25519 / X448: node names them by the key type itself and takes
+        // EVP_PKEY_bits (253 / 448).
+        info.type = "ECDH";
+        const char* sn {::OBJ_nid2sn(::EVP_PKEY_id(key))};
+        if (sn != nullptr) {
+            info.name = sn;
+        }
+        info.size = ::EVP_PKEY_bits(key);
+        break;
+    }
+    }
+    ::EVP_PKEY_free(key);
+    return info;
 }
 
 std::vector<std::uint8_t> TlsChannel::finished() const {

@@ -27,6 +27,16 @@ export enum class TlsRole : std::uint8_t { client, server };
 // SSL_ERROR_WANT_READ / SSL_ERROR_WANT_WRITE.
 export enum class IoWant : std::uint8_t { none, read, write };
 
+// The peer's ephemeral (forward-secrecy) key for this connection — node's
+// TLSSocket.getEphemeralKeyInfo(), which reads SSL_get_server_tmp_key and is
+// meaningful on the CLIENT only. `type` empty means the negotiated suite has no
+// ephemeral key at all (a static-RSA key exchange), which node reports as `{}`.
+export struct EphemeralKeyInfo {
+    std::string type {};  // "DH" or "ECDH"
+    std::string name {};  // ECDH group short name ("prime256v1", "X25519"); empty for DH
+    int size {0};         // key strength in bits
+};
+
 export class TlsChannel {
 private:
     struct Impl;
@@ -122,6 +132,9 @@ public:
     // the session available immediately after the handshake is the unresumable
     // placeholder node documents; the resumable one arrives via take_new_sessions.
     [[nodiscard]] std::vector<std::uint8_t> session_der() const;
+    // SSL_get_server_tmp_key — node's TLSSocket.getEphemeralKeyInfo(). A default
+    // (empty `type`) result means the suite carries no ephemeral key.
+    [[nodiscard]] EphemeralKeyInfo ephemeral_key_info() const;
     // SSL_session_reused — node's TLSSocket.isSessionReused().
     [[nodiscard]] bool session_reused() const noexcept;
     // The raw session ticket of the current session (SSL_SESSION_get0_ticket) —

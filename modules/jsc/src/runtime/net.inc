@@ -639,6 +639,12 @@ JSValueRef netn_tls_wrap_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
     if (argc > 17 && JSValueIsBoolean(ctx, args[17])) {
         cfg.honorCipherOrder = JSValueToBoolean(ctx, args[17]);
     }
+    // args 18/19 (server): node's options.dhparam ("auto" or a PEM parameter
+    // block — without one no DHE-* suite can be negotiated at all) and
+    // options.ecdhCurve (a group list that NARROWS what is negotiable; "auto"
+    // and "" leave OpenSSL's own preference in place).
+    if (argc > 18) { cfg.dhParams = fs_arg(ctx, argc, args, 18); }
+    if (argc > 19) { cfg.ecdhCurve = fs_arg(ctx, argc, args, 19); }
     auto st{std::make_unique<NetTlsState>(
         isServer ? mbun::tls::TlsRole::server : mbun::tls::TlsRole::client, std::move(cfg))};
     if (!st->channel.valid()) {
@@ -824,6 +830,17 @@ JSValueRef netn_tls_info_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
             for (const std::string& pem : chain) items.push_back(make_string(ctx, pem));
             set_prop(ctx, r, "peerChain",
                      JSObjectMakeArray(ctx, items.size(), items.data(), nullptr));
+        }
+        // getEphemeralKeyInfo(): the peer's forward-secrecy key for this
+        // connection (SSL_get_server_tmp_key — client side only, and absent
+        // entirely for a static-RSA suite, which node reports as `{}`).
+        const mbun::tls::EphemeralKeyInfo ek{st.channel.ephemeral_key_info()};
+        if (!ek.type.empty()) {
+            JSObjectRef eko{JSObjectMake(ctx, nullptr, nullptr)};
+            set_prop(ctx, eko, "type", make_string(ctx, ek.type));
+            set_prop(ctx, eko, "size", JSValueMakeNumber(ctx, ek.size));
+            if (!ek.name.empty()) set_prop(ctx, eko, "name", make_string(ctx, ek.name));
+            set_prop(ctx, r, "ephemeralKey", eko);
         }
         // getFinished()/getPeerFinished(): the handshake's Finished messages.
         const std::vector<std::uint8_t> fin{st.channel.finished()};

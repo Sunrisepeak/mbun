@@ -554,6 +554,9 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
           if (typeof info.peerFinished === "string" && info.peerFinished && Buffer)
             self._peerFinished = Buffer.from(info.peerFinished, "base64");
           if (info.servername) self.servername = self.servername || info.servername;
+          // node TLSWrap::GetEphemeralKeyInfo, read at handshake completion:
+          // absent for a static-RSA suite, which node reports as `{}`.
+          if (info.ephemeralKey) self._ephemeralKeyInfo = info.ephemeralKey;
         } else {
           self.authorized = self._rejectUnauthorized;
         }
@@ -658,6 +661,11 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
           // node tls.Server: honorCipherOrder defaults to true for a SERVER and
           // is never set for a client (internal/tls/wrap.js Server ctor).
           honorCipherOrder: options.isServer ? options.honorCipherOrder !== false : false,
+          // node configSecureContext setDHParam/setECDHCurve. `dhparam: 'auto'`
+          // is OpenSSL's own RFC 7919 group selection; a PEM block is loaded as
+          // given. Without either, no DHE-* suite is negotiable at all.
+          dhparam: options.dhparam === "auto" ? "auto" : pemOf(options.dhparam),
+          ecdhCurve: typeof options.ecdhCurve === "string" ? options.ecdhCurve : "",
         });
       };
       // A live fd means the reactor's connect() already returned, whether this is
@@ -741,7 +749,13 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
       if (typeof b64 !== "string" || b64 === "") return undefined;
       return Buffer ? Buffer.from(b64, "base64") : b64;
     }
-    getEphemeralKeyInfo() { return null; }
+    // node crypto_tls.cc TLSWrap::GetEphemeralKeyInfo: "tmp key is available on
+    // only client" — a SERVER answers null. A client whose suite has no
+    // ephemeral key (static RSA) answers `{}`, not null.
+    getEphemeralKeyInfo() {
+      if (this._isServer) return null;
+      return this._ephemeralKeyInfo || {};
+    }
     getSharedSigalgs() { return []; }
     // node: undefined until the handshake completes, then a non-empty Buffer.
     getFinished() { return this._finished; }
@@ -1035,6 +1049,7 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
         // the passphrase for an encrypted `key`, and node's server-default
         // honorCipherOrder (true unless the caller explicitly said false).
         passphrase: creds.passphrase, honorCipherOrder: creds.honorCipherOrder,
+        dhparam: creds.dhparam, ecdhCurve: creds.ecdhCurve,
         // Read off the Server at ACCEPT time, not at construction: node's
         // server.setTicketKeys() rotates the key for connections accepted after
         // the call and the corpus (test-tls-ticket) turns exactly that into an
