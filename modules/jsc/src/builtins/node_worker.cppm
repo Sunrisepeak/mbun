@@ -87,6 +87,162 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
   const UNCLONEABLE = new WeakSet();
   const UNTRANSFERABLE = new WeakSet();
 
+  // ---- the worker wire: a structured-clone subset over JSON IPC -----------
+  // A worker is a child process and the channel to it is node:child_process's
+  // JSON IPC, so anything JSON cannot express used to arrive flattened: a
+  // Uint8Array as {"0":1,…}, a Date as a string, a WebAssembly.Module as {}.
+  // node's worker boundary is a real structured clone. Tagging the handful of
+  // types JSON drops and rebuilding them on the far side closes most of that
+  // gap; ordinary JSON values go over the wire byte-for-byte as before.
+  //
+  // Still honestly red: a SharedArrayBuffer is COPIED, not shared — two
+  // processes cannot share a JS heap object, and Atomics on the far side
+  // operate on the copy.
+  const WIRE = "$mbunSC";
+  const b64enc = (u8) => {
+    if (G.Buffer) return G.Buffer.from(u8.buffer, u8.byteOffset, u8.byteLength).toString("base64");
+    let s = "";
+    for (let i = 0; i < u8.length; i += 4096) s += String.fromCharCode.apply(null, u8.subarray(i, i + 4096));
+    return G.btoa(s);
+  };
+  // Always over an exactly-sized ArrayBuffer: Buffer.from() hands back a view
+  // into a shared pool, and handing that pool's buffer to `new Int32Array(buf)`
+  // would expose 8 KiB of unrelated bytes.
+  const b64dec = (b) => {
+    if (G.Buffer) { const bb = G.Buffer.from(String(b), "base64"); const u = new Uint8Array(bb.byteLength); u.set(bb); return u; }
+    const s = G.atob(String(b));
+    const u = new Uint8Array(s.length);
+    for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i);
+    return u;
+  };
+
+  // A compiled WebAssembly.Module has no route back to its source bytes, and
+  // the bytes are the only thing that can cross a process boundary — so
+  // remember them at compile time (test-worker-message-port-wasm-module posts a
+  // module to a worker and instantiates it there).
+  const WASM_BYTES = new WeakMap();
+  const wasmRemember = (m, src) => {
+    try {
+      let u8 = null;
+      if (src instanceof ArrayBuffer) u8 = new Uint8Array(src.slice(0));
+      else if (ArrayBuffer.isView(src)) { u8 = new Uint8Array(src.byteLength); u8.set(new Uint8Array(src.buffer, src.byteOffset, src.byteLength)); }
+      if (u8 && m !== null && typeof m === "object") WASM_BYTES.set(m, u8);
+    } catch (e) {}
+    return m;
+  };
+  (function installWasmMemo() {
+    const W = G.WebAssembly;
+    if (!W || typeof W.Module !== "function" || W.Module.__mbunWasmMemo) return;
+    const RealModule = W.Module;
+    const Wrapped = function Module(src) {
+      // Called without `new`: let the real constructor raise node's TypeError.
+      if (new.target === undefined) return RealModule(src);
+      const m = Reflect.construct(RealModule, arguments,
+                                  new.target === Wrapped ? RealModule : new.target);
+      return wasmRemember(m, src);
+    };
+    Wrapped.prototype = RealModule.prototype;
+    Object.setPrototypeOf(Wrapped, RealModule);
+    Wrapped.__mbunWasmMemo = true;
+    try { W.Module = Wrapped; } catch (e) { return; }
+    if (typeof W.compile === "function") {
+      const realCompile = W.compile;
+      W.compile = function compile(src) { return realCompile.call(W, src).then((m) => wasmRemember(m, src)); };
+    }
+    if (typeof W.instantiate === "function") {
+      const realInstantiate = W.instantiate;
+      W.instantiate = function instantiate(src, imports) {
+        return realInstantiate.call(W, src, imports).then((r) => {
+          if (r !== null && typeof r === "object" && r.module !== undefined) wasmRemember(r.module, src);
+          return r;
+        });
+      };
+    }
+  })();
+
+  const encWire = (v) => {
+    if (v === undefined) { const o = {}; o[WIRE] = "u"; return o; }
+    if (v === null) return null;
+    const t = typeof v;
+    if (t === "bigint") { const o = {}; o[WIRE] = "bi"; o.v = String(v); return o; }
+    if (t !== "object") return v;
+    if (typeof G.SharedArrayBuffer === "function" && v instanceof G.SharedArrayBuffer) {
+      const o = {}; o[WIRE] = "sab"; o.v = b64enc(new Uint8Array(v)); return o;
+    }
+    if (v instanceof ArrayBuffer) { const o = {}; o[WIRE] = "ab"; o.v = b64enc(new Uint8Array(v)); return o; }
+    if (ArrayBuffer.isView(v)) {
+      const o = {}; o[WIRE] = "ta";
+      o.k = (v.constructor && v.constructor.name) || "Uint8Array";
+      o.v = b64enc(new Uint8Array(v.buffer, v.byteOffset, v.byteLength));
+      return o;
+    }
+    if (v instanceof Date) { const o = {}; o[WIRE] = "date"; o.v = v.getTime(); return o; }
+    if (v instanceof RegExp) { const o = {}; o[WIRE] = "re"; o.s = v.source; o.f = v.flags; return o; }
+    if (G.WebAssembly && typeof G.WebAssembly.Module === "function" && v instanceof G.WebAssembly.Module) {
+      const bytes = WASM_BYTES.get(v);
+      if (!bytes) throw dataClone("A WebAssembly.Module whose source is unknown could not be cloned.");
+      const o = {}; o[WIRE] = "wasm"; o.v = b64enc(bytes); return o;
+    }
+    if (v instanceof Map) {
+      const out = []; for (const kv of v) out.push([encWire(kv[0]), encWire(kv[1])]);
+      const o = {}; o[WIRE] = "map"; o.v = out; return o;
+    }
+    if (v instanceof Set) {
+      const out = []; for (const x of v) out.push(encWire(x));
+      const o = {}; o[WIRE] = "set"; o.v = out; return o;
+    }
+    if (v instanceof Error) {
+      const o = {}; o[WIRE] = "err"; o.n = v.name; o.m = v.message; o.s = v.stack; o.c = v.code; return o;
+    }
+    if (Array.isArray(v)) { const out = new Array(v.length); for (let i = 0; i < v.length; i++) out[i] = encWire(v[i]); return out; }
+    const out = {};
+    let escaped = false;
+    for (const k of Object.keys(v)) { if (k === WIRE) escaped = true; out[k] = encWire(v[k]); }
+    if (!escaped) return out;
+    const o = {}; o[WIRE] = "esc"; o.v = out; return o;
+  };
+
+  const decWire = (v) => {
+    if (v === null || typeof v !== "object") return v;
+    if (Array.isArray(v)) { for (let i = 0; i < v.length; i++) v[i] = decWire(v[i]); return v; }
+    const tag = Object.prototype.hasOwnProperty.call(v, WIRE) ? v[WIRE] : undefined;
+    if (typeof tag === "string") {
+      if (tag === "u") return undefined;
+      if (tag === "bi") { try { return BigInt(v.v); } catch (e) { return v.v; } }
+      if (tag === "ab") return b64dec(v.v).buffer;
+      if (tag === "sab") {
+        const u = b64dec(v.v);
+        if (typeof G.SharedArrayBuffer !== "function") return u.buffer;
+        const s = new G.SharedArrayBuffer(u.length);
+        new Uint8Array(s).set(u);
+        return s;
+      }
+      if (tag === "ta") {
+        const u = b64dec(v.v);
+        if (v.k === "Buffer" && G.Buffer) return G.Buffer.from(u);
+        const C = G[v.k];
+        if (typeof C !== "function") return u;
+        try { return new C(u.buffer); } catch (e) { return u; }
+      }
+      if (tag === "date") return new Date(v.v);
+      if (tag === "re") { try { return new RegExp(v.s, v.f); } catch (e) { return new RegExp(v.s); } }
+      if (tag === "wasm") {
+        try { return new G.WebAssembly.Module(b64dec(v.v)); } catch (e) { return undefined; }
+      }
+      if (tag === "map") { const m = new Map(); for (const kv of (v.v || [])) m.set(decWire(kv[0]), decWire(kv[1])); return m; }
+      if (tag === "set") { const s = new Set(); for (const x of (v.v || [])) s.add(decWire(x)); return s; }
+      if (tag === "err") {
+        const e = new Error(v.m); e.name = v.n || "Error";
+        if (v.s) { try { e.stack = v.s; } catch (_) {} }
+        if (v.c !== undefined) e.code = v.c;
+        return e;
+      }
+      if (tag === "esc") return decWire(v.v);
+    }
+    for (const k of Object.keys(v)) v[k] = decWire(v[k]);
+    return v;
+  };
+
   class MessagePortBase extends EventEmitter {
     addEventListener(type, cb, opts) {
       if (typeof cb !== "function") return;
@@ -229,37 +385,59 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
     return [];
   };
   const PORT_TOK = "__mbunTransferredPort__";
-  const subst = (v, ports, seen) => {
+  const MOD_TOK = "__mbunWasmModule__";
+  const isWasmModule = (v) => G.WebAssembly && typeof G.WebAssembly.Module === "function" &&
+                              v instanceof G.WebAssembly.Module;
+  const subst = (v, ports, seen, mods) => {
     if (v === null || typeof v !== "object") return v;
     const i = ports.indexOf(v);
     if (i >= 0) { const o = {}; o[PORT_TOK] = i; return o; }
+    // JSC's structuredClone silently downgrades a WebAssembly.Module to a plain
+    // object (node's preserves it — test-worker-message-port-wasm-module posts
+    // one through a port and instantiates it on the far side), so swap modules
+    // out for a token and put the originals back after the clone. Checked
+    // BEFORE the prototype bail-out below, which would return the module as-is.
+    if (mods && isWasmModule(v)) { const j = mods.length; mods.push(v); const o = {}; o[MOD_TOK] = j; return o; }
+    // markAsUncloneable: node fails the clone wherever the marked object sits
+    // in the graph, and has no effect on (Shared)ArrayBuffer. The wrapper on
+    // globalThis.structuredClone can only see the TOP-level value, and it stops
+    // seeing even that now that this walk hands the clone a rebuilt copy — so
+    // the check belongs here (test-worker-message-mark-as-uncloneable).
+    if (UNCLONEABLE.has(v) && !(v instanceof ArrayBuffer) &&
+        !(typeof G.SharedArrayBuffer === "function" && v instanceof G.SharedArrayBuffer)) {
+      let label = "Object";
+      try { label = String(v); } catch (e) {}
+      throw dataClone(label + " could not be cloned.");
+    }
     if (seen.has(v)) return seen.get(v);
-    if (Array.isArray(v)) { const out = []; seen.set(v, out); for (let k = 0; k < v.length; k++) out[k] = subst(v[k], ports, seen); return out; }
+    if (Array.isArray(v)) { const out = []; seen.set(v, out); for (let k = 0; k < v.length; k++) out[k] = subst(v[k], ports, seen, mods); return out; }
     const proto = Object.getPrototypeOf(v);
     if (proto !== Object.prototype && proto !== null) return v;
     const out = {}; seen.set(v, out);
-    for (const k of Object.keys(v)) out[k] = subst(v[k], ports, seen);
+    for (const k of Object.keys(v)) out[k] = subst(v[k], ports, seen, mods);
     return out;
   };
-  const unsubst = (v, ports, seen) => {
+  const unsubst = (v, ports, seen, mods) => {
     if (v === null || typeof v !== "object") return v;
     if (Object.prototype.hasOwnProperty.call(v, PORT_TOK) && typeof v[PORT_TOK] === "number") return ports[v[PORT_TOK]];
+    if (mods && Object.prototype.hasOwnProperty.call(v, MOD_TOK) && typeof v[MOD_TOK] === "number") return mods[v[MOD_TOK]];
     if (seen.has(v)) return seen.get(v);
-    if (Array.isArray(v)) { seen.set(v, v); for (let k = 0; k < v.length; k++) v[k] = unsubst(v[k], ports, seen); return v; }
+    if (Array.isArray(v)) { seen.set(v, v); for (let k = 0; k < v.length; k++) v[k] = unsubst(v[k], ports, seen, mods); return v; }
     const proto = Object.getPrototypeOf(v);
     if (proto !== Object.prototype && proto !== null) return v;
     seen.set(v, v);
-    for (const k of Object.keys(v)) v[k] = unsubst(v[k], ports, seen);
+    for (const k of Object.keys(v)) v[k] = unsubst(v[k], ports, seen, mods);
     return v;
   };
   // Clone FIRST, detach after: a transferred ArrayBuffer is frequently also the
   // backing store of the message itself (postMessage(typedArray, [ab])), and
   // detaching before the copy would hand the receiver an empty view.
   const cloneWithPorts = (value, ports, buffers) => {
-    const pre = ports.length ? subst(value, ports, new Map()) : value;
+    const mods = [];
+    const pre = subst(value, ports, new Map(), mods);
     const c = G.structuredClone(pre);
     for (const b of buffers) { try { G.structuredClone(b, { transfer: [b] }); } catch (e) {} }
-    return ports.length ? unsubst(c, ports, new Map()) : c;
+    return (ports.length || mods.length) ? unsubst(c, ports, new Map(), mods) : c;
   };
 
   const severPort = (p) => {
@@ -625,6 +803,45 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
     return { path: pathM.resolve(p) };
   };
 
+  // ---- process.cwd across the worker boundary -----------------------------
+  // node runs a worker as a THREAD, so uv_cwd() is one process-wide value and a
+  // main-thread process.chdir() is already visible in every worker; all node
+  // has to do is invalidate each thread's cached copy, which it does with an
+  // Atomics.load on a shared counter (bootstrap/switches/is_not_main_thread.js
+  // — the reason test-worker-process-cwd asserts `process.cwd.toString()`
+  // mentions AtomicsLoad inside a worker and does NOT on the main thread).
+  // An mbun worker is a CHILD PROCESS with its own cwd, so the move has to
+  // travel: chdir broadcasts a control frame down every live worker channel and
+  // a worker receiving one chdir()s itself — through this same wrapper, so the
+  // move keeps propagating to ITS workers. The frame rides the ordinary IPC
+  // channel, so it can never overtake a postMessage sent after the chdir.
+  const rawCwd = typeof proc.cwd === "function" ? proc.cwd : null;
+  const cwdCounter = new Int32Array(
+      typeof G.SharedArrayBuffer === "function" ? new G.SharedArrayBuffer(4) : new ArrayBuffer(4));
+  const AtomicsLoad = (G.Atomics && typeof G.Atomics.load === "function") ? G.Atomics.load : null;
+  const bumpCwd = () => {
+    try { G.Atomics.add(cwdCounter, 0, 1); } catch (e) { cwdCounter[0] = (cwdCounter[0] + 1) | 0; }
+  };
+  let cwdBroadcastInstalled = false;
+  const installCwdBroadcast = () => {
+    if (cwdBroadcastInstalled) return;
+    cwdBroadcastInstalled = true;
+    const realChdir = proc.chdir;
+    if (typeof realChdir !== "function" || !rawCwd) return;
+    proc.chdir = function chdir(dir) {
+      const r = realChdir.call(proc, dir);
+      bumpCwd();
+      let now;
+      try { now = rawCwd.call(proc); } catch (e) { return r; }
+      for (const w of workerRegistry.values()) {
+        try {
+          if (!w._exited && w._child && w._child.connected) w._child.send({ t: "cd", d: now });
+        } catch (e) {}
+      }
+      return r;
+    };
+  };
+
   const writeTempWorker = (source, tid, ext) => {
     const dir = osM && osM.tmpdir ? osM.tmpdir() : "/tmp";
     const p = pathM.join(dir, "mbun-worker-" + (proc.pid || 0) + "-" + tid + (ext || ".js"));
@@ -664,7 +881,7 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
       // constructor instead of silently reaching the worker as null.
       if (options.workerData !== undefined) G.structuredClone(options.workerData);
       let workerDataJson = "null";
-      try { workerDataJson = JSON.stringify(options.workerData === undefined ? null : options.workerData); }
+      try { workerDataJson = JSON.stringify(options.workerData === undefined ? null : encWire(options.workerData)); }
       catch (e) { throw dataClone(String(options.workerData) + " could not be cloned."); }
       if (workerDataJson === undefined) throw dataClone(String(options.workerData) + " could not be cloned.");
 
@@ -725,9 +942,10 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
       child.on("message", (m) => {
         if (m === null || typeof m !== "object") return;
         if (m.t === "m") {
-          const ev = { data: m.d, type: "message", ports: [], target: self };
+          const d = decWire(m.d);
+          const ev = { data: d, type: "message", ports: [], target: self };
           if (typeof self.onmessage === "function") self.onmessage(ev);
-          self.emit("message", m.d);
+          self.emit("message", d);
         } else if (m.t === "e") {
           const err = new Error(m.d && m.d.message ? m.d.message : String(m.d));
           if (m.d && m.d.name) err.name = m.d.name;
@@ -749,6 +967,7 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
         const rs = self._exitResolvers.splice(0);
         for (const r of rs) r(self._exitCode);
       });
+      installCwdBroadcast();
       const emitWorker = () => { if (proc && typeof proc.emit === "function") proc.emit("worker", self); };
       if (proc.nextTick) proc.nextTick(emitWorker); else G.queueMicrotask(emitWorker);
       // node internal/worker.js: the constructor's last act is to announce the
@@ -766,7 +985,7 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
       validateTransferList(transferList);
       if (this._exited || !this._child.connected) return undefined;
       // `{t:"m"}` with no `d` IS the undefined message: JSON drops the key.
-      try { this._child.send(value === undefined ? { t: "m" } : { t: "m", d: value }); } catch (e) {}
+      try { this._child.send(value === undefined ? { t: "m" } : { t: "m", d: encWire(value) }); } catch (e) {}
       return undefined;
     }
     terminate() {
@@ -792,7 +1011,7 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
   if (MY_TID !== undefined && MY_TID !== null && MY_TID !== "") {
     isMainThread = false;
     threadId = Number(MY_TID) | 0;
-    try { workerData = JSON.parse(WENV.MBUN_WORKER_DATA || "null"); } catch (e) { workerData = null; }
+    try { workerData = decWire(JSON.parse(WENV.MBUN_WORKER_DATA || "null")); } catch (e) { workerData = null; }
     try {
       const ed = JSON.parse(WENV.MBUN_WORKER_ENVDATA || "[]");
       if (Array.isArray(ed)) for (const kv of ed) environmentData.set(kv[0], kv[1]);
@@ -809,7 +1028,7 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
       configurable: true, writable: true,
       value: function (value, transferList) {
         if (typeof proc.send !== "function") return undefined;
-        try { proc.send(value === undefined ? { t: "m" } : { t: "m", d: value }); } catch (e) {}
+        try { proc.send(value === undefined ? { t: "m" } : { t: "m", d: encWire(value) }); } catch (e) {}
         // node detaches every ArrayBuffer in the transfer list; the message is
         // already on the wire, so the parent's copy is unaffected. Ignoring the
         // list left `crypto.sign()`'s buffer alive in the worker after
@@ -844,8 +1063,29 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
     // internal/worker.js reports it the same way it reports a later throw. The
     // hook is only defined in a worker process; a normal run never calls it.
     G.__mbunWorkerFatal = (e) => { if (e !== undefined) reportFatal(e); };
+    // A worker's process.cwd is a cached read guarded by an Atomics.load on the
+    // cwd counter, exactly as node's is — and test-worker-process-cwd asserts
+    // that the function's SOURCE shows it. The counter is bumped by the chdir
+    // wrapper below, which is what a 'cd' control frame from the parent drives.
+    if (rawCwd && AtomicsLoad) {
+      let seen = -1;
+      let cached = null;
+      proc.cwd = function cwd() {
+        const counter = AtomicsLoad(cwdCounter, 0);
+        if (cached === null || counter !== seen) { seen = counter; cached = rawCwd.call(proc); }
+        return cached;
+      };
+    }
+    // Unconditional here (the main thread installs it lazily from the Worker
+    // constructor): a 'cd' frame chdir()s through this wrapper, and without it
+    // the counter would never move and process.cwd() would keep the stale copy.
+    installCwdBroadcast();
     if (typeof proc.on === "function") {
-      proc.on("message", (m) => { if (m !== null && typeof m === "object" && m.t === "m") chan.port2.postMessage(m.d); });
+      proc.on("message", (m) => {
+        if (m === null || typeof m !== "object") return;
+        if (m.t === "m") chan.port2.postMessage(decWire(m.d));
+        else if (m.t === "cd" && typeof m.d === "string") { try { proc.chdir(m.d); } catch (e) {} }
+      });
     }
     // An uncaught throw inside a worker surfaces as an 'error' event on the
     // parent's Worker handle, not as a bare non-zero exit (node worker.js) —
@@ -872,6 +1112,13 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
         let claimed = false;
         if (typeof base === "function" && base !== hook) claimed = !!base.call(this, err);
         if (!claimed) {
+          // A throw FROM the 'uncaughtException' handler is status 7
+          // (kExceptionInFatalExceptionHandler) on the MAIN thread only. node
+          // never gives a worker that code: src/node_worker.cc turns any fatal
+          // error in a worker into an 'error' on the parent's handle plus
+          // exit(1), which is why process-exit-code-cases marks that case
+          // `isWorker ? 1 : 7` (test-worker-exit-code case 9).
+          if (G.__mbun_fatal_status === 7) { try { G.__mbun_fatal_status = 1; } catch (_) {} }
           // The error the 'uncaughtException' handler ITSELF threw is the one
           // node reports (__mbun_uncaught parks it in __mbun_fatal).
           const f = G.__mbun_fatal;
