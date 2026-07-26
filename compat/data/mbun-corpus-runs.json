@@ -44,18 +44,18 @@
   {
    "corpus": "compat/node/test/parallel",
    "runner": "tools/integration/node_corpus_runner.py --jobs 6 --timeout 15",
-   "binary": "r9/integration @ 9d70bbf (round 12, waves 5-6)",
+   "binary": "r9/integration @ 325f872 (round 13: w5/agent-http composed)",
    "files": 4433,
    "categories": {
-    "fail": 1210,
+    "fail": 1191,
     "oom-kill": 3,
-    "pass": 2566,
+    "pass": 2591,
     "skipped": 552,
-    "timeout": 102
+    "timeout": 96
    },
    "rates": {
-    "strict_pass": 0.579,
-    "excluding_self_skips": 0.661
+    "strict_pass": 0.584,
+    "excluding_self_skips": 0.668
    },
    "baseline_for_comparison": {
     "binary": "round-8 HEAD (23217dd), measured with the SAME corrected runner",
@@ -74,7 +74,8 @@
    "notes": "A file that skipped itself (common.skip() -> '1..0 # Skipped:', exit 0) is classified `skipped`, never `pass`. common.mustCall is enforced from this binary onward (node registers its verifier in process.on('exit'), which previously never fired). Both corrections lower the number relative to previously published figures; the 44.5% published against round 8 was a product of both defects and was never real. Full estimate-vs-actual and methodology: compat/data/round-estimates.json and compat/README.md. A third verification defect was fixed after the previous entry: assert.throws ignored its error argument, so any throw satisfied any matcher. That removed 126 passes (25 of 25 sampled confirmed vacuous), which is why this figure is LOWER than the previously recorded 47.9%/54.7%.",
    "jobs_note": "Measured at --jobs 6, not 8/10. Higher parallelism does not change the total (a jobs-6 full run moved exactly the 11 files the wave's agents claimed and no others) but it makes per-file attribution unreliable: individual pass->fail results at --jobs 10 have repeatedly failed to reproduce standalone. See compat/README.md 'A parallel guard invents regressions'.",
    "measurement_caveat": "Measured on the build output directly. A binary COPIED to a different basename (mbun-<sha>) reports 10 phantom regressions across child_process/process/signal/module -- tests that re-spawn the runtime fail with 'spawn mbun ENOENT'. Snapshot to <dir>/bin/mbun instead; verified both ways.",
-   "wave56_note": "+174 gained, -11 REGRESSED, net +163 against the previous authoritative run. The 11 are REAL -- each reproduces 3/3 standalone, not a parallel-guard artefact -- and are the price of this round's runtime-wide changes (the process.nextTick queue split and entry-point error routing). Four are stack-overflow / uncaught-exception / mock-timer files that now time out; the rest are web-locks (2), crypto-worker-thread, permission-fs-require, repl-tab-complete-nested-repls and worker-process-env. Publishing the gross gain alone would misrepresent the round."
+   "wave56_note": "+174 gained, -11 REGRESSED, net +163 against the previous authoritative run. The 11 are REAL -- each reproduces 3/3 standalone, not a parallel-guard artefact -- and are the price of this round's runtime-wide changes (the process.nextTick queue split and entry-point error routing). Four are stack-overflow / uncaught-exception / mock-timer files that now time out; the rest are web-locks (2), crypto-worker-thread, permission-fs-require, repl-tab-complete-nested-repls and worker-process-env. Publishing the gross gain alone would misrepresent the round.",
+   "round13_note": "+25 gained, 0 regressed. The w5/agent-http merge required composing seven hunks where both sides restructured the socket read path; its headline fix is that net.Socket silently DROPPED every byte arriving before a 'data' listener existed. Two composition steps in this round silently failed to apply while the build stayed clean -- the nextTick queue and pause/resume -- and only behavioural probes caught either. Every replacement now asserts its occurrence count."
   }
  ],
  "note": "generated_at applies to the node row only. The bun row is a stale round-7/8 snapshot; see its staleness_note. Do not read the two rows as contemporaneous."
