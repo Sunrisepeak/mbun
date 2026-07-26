@@ -633,8 +633,29 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
     // (test-net-connect-paused-connection). A socket paused after data has
     // already flowed keeps its hold: node only stops the read once the readable
     // buffer fills, which this reactor cannot observe.
-    pause() { this._paused = true; this._syncEofHold(); return this; }
-    resume() { this._paused = false; this._syncEofHold(); if (this._onreadPend) this._onreadFeed(); return this; }
+    pause() { this._paused = true; this._flowing = false; this._syncEofHold(); return this; }
+    resume() {
+      // Composed from both sides of the w5/agent-http merge, and BOTH halves are
+      // load-bearing. HEAD's half is the loop-hold bookkeeping (_syncEofHold) and
+      // the onread feed. The http half is the readable-flow state: without
+      // `_flowing = true`, _deliver's _hasReader() stays false for a socket that
+      // was resumed but has no 'data' listener, so every byte parks in _rq,
+      // _rqPending() keeps the handle alive forever and the peer's writer
+      // stalls. That is exactly what five large-write corpus files hit
+      // (test-net-write-fully-async-*, -bytes-written-large,
+      // test-http-outgoing-drain-writable-length,
+      // test-http-pipeline-requests-connection-leak) when this composition
+      // silently failed to apply.
+      this._paused = false;
+      this._flowing = true;
+      this._holdForReader = false;
+      this._rqPaused = false;
+      this._syncEofHold();
+      if (this._onreadPend) this._onreadFeed();
+      if (this._unshiftQ && this._unshiftQ.length) G.queueMicrotask(() => this._flushUnshift());
+      if (this._rq && this._rq.length) G.queueMicrotask(() => this._flushRq());
+      return this;
+    }
     // node internal/stream_base_commons.js onStreamRead, kBuffer branch: each
     // read fills the user buffer (never more than its length), the callback is
     // invoked with (nread, thatSameBuffer), a `false` return stops the flow, and
