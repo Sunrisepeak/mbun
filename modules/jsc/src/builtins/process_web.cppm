@@ -1969,7 +1969,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       drainTicks = PN && typeof PN.drainMicrotasks === "function" ? PN.drainMicrotasks : null;
     }
     let fired = 0; budget = budget || 100;
-    let b = ++T.batch;
+    const b = ++T.batch;
     // node checks uv__loop_alive() BEFORE each loop iteration, so once nothing
     // ref'd is left the iteration never happens and an unref'd Immediate simply
     // never runs (test-worker-message-port-transfer-closed relies on exactly
@@ -1987,30 +1987,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
         if (it.imm && (it.b >= b || (!it.refd && !alive))) continue;
         if (mi === -1 || it.at < T.q[mi].at) mi = i;
       }
-      if (mi === -1) {
-        // Nothing eligible. If that is only because the remaining Immediates
-        // carry THIS batch's stamp — i.e. they were queued by a callback we just
-        // ran — open the next batch here instead of returning to the pump.
-        //
-        // The deferral itself is node's semantics and stays: an immediate queued
-        // from an immediate belongs to the following check phase, not this one.
-        // What was wrong was the COST. Requiring a full pump round-trip per link
-        // made a 10 000-link setImmediate chain take 209ms where it took 12ms
-        // before and where real node takes 10ms — a 17x regression that bought
-        // no semantic change (baseline, regressed build and node all print
-        // A,B,A2). Async-heavy bun tests then blew their own 5s budgets.
-        //
-        // Due timers stay eligible across the bump (only `imm` entries consult
-        // the stamp), so this cannot starve them, and `budget` still bounds the
-        // whole call.
-        let deferred = false;
-        for (let i = 0; i < T.q.length; i++) {
-          const it = T.q[i];
-          if (it.imm && it.at <= now && it.b >= b && (it.refd || alive)) { deferred = true; break; }
-        }
-        if (deferred && fired < budget) { b = ++T.batch; continue; }
-        break;  // nothing due yet — real time gates firing
-      }
+      if (mi === -1) break;  // nothing due yet — real time gates firing
       const t = T.q[mi]; T.now = now;
       if (t.iv > 0) t.at = now + t.iv; else T.q.splice(mi, 1);
       // node: an exception escaping a timer callback is an uncaught exception
