@@ -160,12 +160,20 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
     }
   })();
 
-  const encWire = (v) => {
+  // `ports` is the caller's transfer list; a MessagePort found in the message
+  // is replaced by its index in it, and one that is NOT in it is node's
+  // DataCloneError (test-worker-workerdata-messageport asserts the wording).
+  const encWire = (v, ports) => {
     if (v === undefined) { const o = {}; o[WIRE] = "u"; return o; }
     if (v === null) return null;
     const t = typeof v;
     if (t === "bigint") { const o = {}; o[WIRE] = "bi"; o.v = String(v); return o; }
     if (t !== "object") return v;
+    if (isPort(v)) {
+      const i = ports ? ports.indexOf(v) : -1;
+      if (i < 0) throw dataClone("Object that needs transfer was found in message but not listed in transferList");
+      const o = {}; o[WIRE] = "port"; o.i = i; return o;
+    }
     if (typeof G.SharedArrayBuffer === "function" && v instanceof G.SharedArrayBuffer) {
       const o = {}; o[WIRE] = "sab"; o.v = b64enc(new Uint8Array(v)); return o;
     }
@@ -184,23 +192,28 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
       const o = {}; o[WIRE] = "wasm"; o.v = b64enc(bytes); return o;
     }
     if (v instanceof Map) {
-      const out = []; for (const kv of v) out.push([encWire(kv[0]), encWire(kv[1])]);
+      const out = []; for (const kv of v) out.push([encWire(kv[0], ports), encWire(kv[1], ports)]);
       const o = {}; o[WIRE] = "map"; o.v = out; return o;
     }
     if (v instanceof Set) {
-      const out = []; for (const x of v) out.push(encWire(x));
+      const out = []; for (const x of v) out.push(encWire(x, ports));
       const o = {}; o[WIRE] = "set"; o.v = out; return o;
     }
     if (v instanceof Error) {
       const o = {}; o[WIRE] = "err"; o.n = v.name; o.m = v.message; o.s = v.stack; o.c = v.code; return o;
     }
-    if (Array.isArray(v)) { const out = new Array(v.length); for (let i = 0; i < v.length; i++) out[i] = encWire(v[i]); return out; }
+    if (Array.isArray(v)) { const out = new Array(v.length); for (let i = 0; i < v.length; i++) out[i] = encWire(v[i], ports); return out; }
     const out = {};
     let escaped = false;
-    for (const k of Object.keys(v)) { if (k === WIRE) escaped = true; out[k] = encWire(v[k]); }
+    for (const k of Object.keys(v)) { if (k === WIRE) escaped = true; out[k] = encWire(v[k], ports); }
     if (!escaped) return out;
     const o = {}; o[WIRE] = "esc"; o.v = out; return o;
   };
+
+  // Set on the worker side (below) to materialise a MessagePort transferred in
+  // from the parent. On the main thread nothing arrives this way.
+  let wirePort = () => undefined;
+  const transferredPorts = new Map();  // transfer-list index -> local channel
 
   const decWire = (v) => {
     if (v === null || typeof v !== "object") return v;
@@ -237,6 +250,7 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
         if (v.c !== undefined) e.code = v.c;
         return e;
       }
+      if (tag === "port") return wirePort(v.i);
       if (tag === "esc") return decWire(v.v);
     }
     for (const k of Object.keys(v)) v[k] = decWire(v[k]);
@@ -863,7 +877,19 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
         if (PN && PN.enabled && !PN.has("worker")) throw PN.denyError("worker", "");
       }
       options = options || {};
-      validateTransferList(options.transferList);
+      // node splits the constructor's transferList exactly as MessagePort's
+      // postMessage does: ports move to the worker, ArrayBuffers are detached
+      // once the message has been serialised.
+      const tlPorts = [], tlBuffers = [];
+      for (const item of validateTransferList(options.transferList)) {
+        if (isPort(item)) {
+          if (item[kDetached] === true) throw dataClone("MessagePort in transfer list is already detached");
+          tlPorts.push(item);
+        } else if (item instanceof ArrayBuffer) {
+          if (abDetached(item)) throw dataClone("ArrayBuffer at index " + tlBuffers.length + " is already detached");
+          if (!UNTRANSFERABLE.has(item)) tlBuffers.push(item);
+        }
+      }
       if (options.env !== undefined && options.env !== null && options.env !== SHARE_ENV &&
           (typeof options.env !== "object" || Array.isArray(options.env))) {
         const e = new TypeError('The "options.env" property must be of type object or one of undefined, null, or worker_threads.SHARE_ENV. Received ' + recvType(options.env));
@@ -877,13 +903,24 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
         const e = new TypeError('The "options.execArgv" property must be an instance of Array. Received ' + recvType(options.execArgv));
         e.code = "ERR_INVALID_ARG_TYPE"; throw e;
       }
-      // node clones workerData up-front, so an unclonable value throws from the
-      // constructor instead of silently reaching the worker as null.
-      if (options.workerData !== undefined) G.structuredClone(options.workerData);
+      // Serialise BEFORE the structuredClone check: the encoder is what knows
+      // about the transfer list, and it owns the "needs transfer but was not
+      // listed" DataCloneError whose exact wording the corpus asserts. A plain
+      // structuredClone of the same value would report the port's own
+      // "can only be transferred, not cloned" instead.
+      let workerDataWire = null;
+      if (options.workerData !== undefined) {
+        workerDataWire = encWire(options.workerData, tlPorts);
+        // node clones workerData up-front, so an unclonable value throws from
+        // the constructor instead of silently reaching the worker as null.
+        G.structuredClone(subst(options.workerData, tlPorts, new Map(), []));
+      }
       let workerDataJson = "null";
-      try { workerDataJson = JSON.stringify(options.workerData === undefined ? null : encWire(options.workerData)); }
+      try { workerDataJson = JSON.stringify(workerDataWire); }
       catch (e) { throw dataClone(String(options.workerData) + " could not be cloned."); }
       if (workerDataJson === undefined) throw dataClone(String(options.workerData) + " could not be cloned.");
+      // The message is on the wire now, so the transferred buffers can go.
+      for (const b of tlBuffers) { try { G.structuredClone(b, { transfer: [b] }); } catch (e) {} }
 
       const tid = nextThreadId++;
       this.threadId = tid;
@@ -938,6 +975,20 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
       workerRegistry.set(tid, this);
 
       const self = this;
+      // A MessagePort transferred into the worker keeps living HERE; the worker
+      // holds a stand-in whose two directions are these frames. 'p' is the
+      // worker posting on its stand-in (delivered to this port's pair), 'pm' is
+      // anything posted to this port travelling the other way.
+      this._tlPorts = tlPorts;
+      for (let i = 0; i < tlPorts.length; i++) {
+        const p = tlPorts[i];
+        const idx = i;
+        p.on("message", (d) => {
+          try {
+            if (!self._exited && child.connected) child.send({ t: "pm", i: idx, d: encWire(d, tlPorts) });
+          } catch (e) {}
+        });
+      }
       child.on("spawn", () => self.emit("online"));
       child.on("message", (m) => {
         if (m === null || typeof m !== "object") return;
@@ -946,6 +997,9 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
           const ev = { data: d, type: "message", ports: [], target: self };
           if (typeof self.onmessage === "function") self.onmessage(ev);
           self.emit("message", d);
+        } else if (m.t === "p" && typeof m.i === "number") {
+          const p = self._tlPorts[m.i];
+          if (p) { try { p.postMessage(decWire(m.d)); } catch (e) {} }
         } else if (m.t === "e") {
           const err = new Error(m.d && m.d.message ? m.d.message : String(m.d));
           if (m.d && m.d.name) err.name = m.d.name;
@@ -1011,6 +1065,27 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
   if (MY_TID !== undefined && MY_TID !== null && MY_TID !== "") {
     isMainThread = false;
     threadId = Number(MY_TID) | 0;
+    // A MessagePort the parent transferred in. The real port never left the
+    // parent, so this end is a local node MessagePort with its outbound half
+    // redirected onto the IPC channel; the parent's 'pm' frames feed the other
+    // half. Memoised per index so `ports[0] === workerData.p` still holds.
+    // Installed before workerData is decoded — that decode is what asks for it.
+    wirePort = (i) => {
+      let entry = transferredPorts.get(i);
+      if (entry) return entry.near;
+      const ch = new MessageChannel();
+      entry = { near: ch.port1, feed: ch.port2 };
+      transferredPorts.set(i, entry);
+      Object.defineProperty(ch.port1, "postMessage", {
+        configurable: true, writable: true,
+        value: function (value) {
+          if (typeof proc.send !== "function") return undefined;
+          try { proc.send({ t: "p", i: i, d: encWire(value, []) }); } catch (e) {}
+          return undefined;
+        },
+      });
+      return ch.port1;
+    };
     try { workerData = decWire(JSON.parse(WENV.MBUN_WORKER_DATA || "null")); } catch (e) { workerData = null; }
     try {
       const ed = JSON.parse(WENV.MBUN_WORKER_ENVDATA || "[]");
@@ -1084,6 +1159,10 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
       proc.on("message", (m) => {
         if (m === null || typeof m !== "object") return;
         if (m.t === "m") chan.port2.postMessage(decWire(m.d));
+        else if (m.t === "pm" && typeof m.i === "number") {
+          const e = transferredPorts.get(m.i);
+          if (e) e.feed.postMessage(decWire(m.d));
+        }
         else if (m.t === "cd" && typeof m.d === "string") { try { proc.chdir(m.d); } catch (e) {} }
       });
     }
