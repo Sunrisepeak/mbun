@@ -1585,6 +1585,14 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       const sock = new Socket({ allowHalfOpen: !!this._opts.allowHalfOpen, highWaterMark: this._opts.highWaterMark });
       sock._handle = clientHandle; clientHandle.owner = sock;
       sock._adopt(clientHandle.fd);
+      // getpeername for the accepted side. The constructor seeds remoteAddress
+      // "127.0.0.1" / remotePort 0 as placeholders, and without this the server
+      // reports those defaults for every peer — which LOOKS right on loopback
+      // and is why it survived: test-net-socket-local-address caught it only
+      // because it compares the server's remotePort against the client's real
+      // localPort. The other accept path (listen()'s own handle.onconnection)
+      // already adopts; this one is the one the corpus actually takes.
+      adoptPeer(sock, clientHandle.fd);
       if (this.noDelay && clientHandle.setNoDelay) {
         sock._kSetNoDelay = true;
         clientHandle.setNoDelay(true);
