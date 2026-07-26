@@ -791,7 +791,24 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
     Hmac.prototype._transform = function (chunk, e, cb) { this.update(chunk); cb(); };
     Hmac.prototype._flush = function (cb) { this.push(this.digest()); cb(); };
     function createHash(algo, opts) { if (typeof algo !== "string") throw new TypeError('The "algorithm" argument must be of type string. Received ' + (algo === null ? "null" : typeof algo)); if (!supported(algo)) throw new Error("Digest method not supported"); return new Hash(algo, opts); }
-    function createHmac(algo, key, opts) { if (typeof algo !== "string") throw new TypeError('The "hmac" argument must be of type string. Received ' + (algo === null ? "null" : typeof algo)); if (!supported(algo)) throw new Error("Invalid digest: " + algo); if (key === null || key === undefined) throw new TypeError('The "key" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, DataView, KeyObject, or CryptoKey. Received ' + (key === null ? "null" : "undefined")); return new Hmac(algo, key, opts); }
+    // node prepareSecretKey(): the key must be a string, a BufferSource, a
+    // *branded* KeyObject, or a CryptoKey. It used to reject only null/undefined,
+    // so an arbitrary object — including one wearing KeyObject.prototype with no
+    // key in it — was accepted and silently MAC'd as empty bytes.
+    const invalidArgTypeRecv = (v) => (v === null ? "null"
+      : v === undefined ? "undefined"
+      : typeof v === "object" ? "an instance of " + ((v.constructor && v.constructor.name) || "Object")
+      : "type " + typeof v + " (" + String(v) + ")");
+    const validHmacKey = (key) => {
+      if (typeof key === "string") return true;
+      if (key === null || typeof key !== "object") return false;
+      if (ArrayBuffer.isView(key) || key instanceof ArrayBuffer) return true;
+      if (typeof SharedArrayBuffer === "function" && key instanceof SharedArrayBuffer) return true;
+      if (typeof G.__mbunIsKeyObject === "function" && G.__mbunIsKeyObject(key)) return true;
+      if (typeof G.__mbunIsCryptoKey === "function" && G.__mbunIsCryptoKey(key)) return true;
+      return false;
+    };
+    function createHmac(algo, key, opts) { if (typeof algo !== "string") throw new TypeError('The "hmac" argument must be of type string. Received ' + (algo === null ? "null" : typeof algo)); if (!supported(algo)) throw new Error("Invalid digest: " + algo); if (!validHmacKey(key)) throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "key" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, DataView, KeyObject, or CryptoKey. Received ' + invalidArgTypeRecv(key)); return new Hmac(algo, key, opts); }
     // node-style error helpers (message + .code, matching node:crypto).
     const mkErr = (Ctor, code, msg) => { const e = new Ctor(msg); e.code = code; return e; };
     const invalidArgType = (input) => {

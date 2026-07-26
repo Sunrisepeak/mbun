@@ -120,7 +120,7 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     // passphrase stays `undefined` when none was given: node distinguishes "no
     // passphrase" (never prompt, never guess) from an explicit empty one (a real,
     // usable password), and the native loader keys its error off that.
-    if (k instanceof KeyObject) return { data: k._km, passphrase: k._pass };
+    if (isKO(k)) return { data: k._km, passphrase: k._pass };
     if (typeof k === "string" || isView(k) || k instanceof ArrayBuffer) return { data: k, passphrase: undefined };
     // { key: <JWK object>, format: "jwk", ... } — materialize the JWK to DER up
     // front (private when `d` is present) so the native signer/verifier gets real
@@ -358,30 +358,47 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   // (missing/invalid handle) throws. The brand is shared with the structured-clone
   // reconstructor via C.__koBrand.
   const kKObrand = Symbol("mbun.node.KeyObject");
+  // The BRAND. node backs a KeyObject with a native handle, so a plain object
+  // wearing KeyObject.prototype (or one produced by a forged Symbol.hasInstance)
+  // is not one and must not be treated as one — reading key state off it would
+  // mean acting on attacker-shaped input. Membership of this WeakMap is the only
+  // thing that makes an object a KeyObject here; `instanceof` never is.
+  // ref: node test-crypto-keyobject-brand-check.
+  const koSlots = new WeakMap();
+  const isKO = (v) => v !== null && typeof v === "object" && koSlots.has(v);
+  G.__mbunIsKeyObject = isKO;
+  // node lib/internal/errors.js ERR_INVALID_THIS.
+  const koThis = () => {
+    const e = new TypeError('Value of "this" must be of type KeyObject');
+    e.code = "ERR_INVALID_THIS"; return e;
+  };
+  // `want`: undefined = any KeyObject, "secret" = only a secret one,
+  // "asymmetric" = only a public/private one. A getter reached on the wrong kind
+  // is ERR_INVALID_THIS in node too — the accessor lives on a prototype the
+  // receiver does not have.
+  const koOf = (self, want) => {
+    const k = koSlots.get(self);
+    if (k === undefined) throw koThis();
+    if (want === "secret" && k !== "secret") throw koThis();
+    if (want === "asymmetric" && k === "secret") throw koThis();
+    return self;
+  };
   class KeyObject {
     constructor(brand, kind, material, passphrase) {
       if (brand !== kKObrand) throw new TypeError("Illegal constructor");
       this._kind = kind; this._km = material; this._pass = passphrase == null ? undefined : passphrase;
+      // node's three concrete classes: SecretKeyObject and Public/PrivateKeyObject
+      // (both under AsymmetricKeyObject), each owning the accessors that only
+      // make sense for it. Constructing through the base and re-pointing the
+      // prototype keeps the one internal entry point (and the structured-clone
+      // reconstructor's `new KeyObject(brand, …)`) working unchanged.
+      Object.setPrototypeOf(this, kind === "secret" ? SecretKeyObject.prototype
+                                : kind === "public" ? PublicKeyObject.prototype
+                                                    : PrivateKeyObject.prototype);
+      koSlots.set(this, kind);
     }
-    get type() { return this._kind; }
+    get type() { return koOf(this)._kind; }
     get [Symbol.toStringTag]() { return "KeyObject"; }
-    get asymmetricKeyType() {
-      if (this._kind === "secret") return undefined;
-      try { return AN.keyType(this._km, this._pass, this._kind === "public").type; } catch { return undefined; }
-    }
-    get asymmetricKeyDetails() {
-      if (this._kind === "secret") return undefined;
-      try {
-        const t = AN.keyType(this._km, this._pass, this._kind === "public");
-        const d = {};
-        if (t.modulusLength != null) d.modulusLength = t.modulusLength;
-        if (t.publicExponent != null) d.publicExponent = BigInt("0x" + Buffer.from(t.publicExponent).toString("hex"));
-        if (t.divisorLength != null) d.divisorLength = t.divisorLength;
-        if (t.namedCurve != null) d.namedCurve = t.namedCurve;
-        return d;
-      } catch { return {}; }
-    }
-    get symmetricKeySize() { return this._kind === "secret" ? toBuf(this._km).length : undefined; }
     export(options) {
       // Secret keys: options are optional and default to a Buffer copy.
       if (this._kind === "secret") {
@@ -419,7 +436,7 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
       return format === "der" ? Buffer.from(out) : out;
     }
     equals(other) {
-      if (!(other instanceof KeyObject)) {
+      if (!isKO(other)) {
         const e = new TypeError('The "otherKeyObject" argument must be an instance of KeyObject. Received type ' +
           typeof other + " (" + String(other) + ")");
         e.code = "ERR_INVALID_ARG_TYPE"; throw e;
@@ -459,10 +476,44 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
       throw new TypeError("Converting this CryptoKey to a KeyObject is not supported yet in mbun");
     }
   }
+  // node's concrete subclasses. Only the accessors that are meaningful for a kind
+  // live on that kind's prototype, which is what the corpus walks
+  // (Object.getPrototypeOf(secret) owns symmetricKeySize; the grandparent of a
+  // public key owns asymmetricKeyType/asymmetricKeyDetails).
+  class SecretKeyObject extends KeyObject {}
+  class AsymmetricKeyObject extends KeyObject {}
+  class PublicKeyObject extends AsymmetricKeyObject {}
+  class PrivateKeyObject extends AsymmetricKeyObject {}
+  Object.defineProperty(SecretKeyObject.prototype, "symmetricKeySize", {
+    configurable: true, enumerable: false,
+    get() { return toBuf(koOf(this, "secret")._km).length; },
+  });
+  Object.defineProperty(AsymmetricKeyObject.prototype, "asymmetricKeyType", {
+    configurable: true, enumerable: false,
+    get() {
+      const self = koOf(this, "asymmetric");
+      try { return AN.keyType(self._km, self._pass, self._kind === "public").type; } catch (e) { return undefined; }
+    },
+  });
+  Object.defineProperty(AsymmetricKeyObject.prototype, "asymmetricKeyDetails", {
+    configurable: true, enumerable: false,
+    get() {
+      const self = koOf(this, "asymmetric");
+      try {
+        const t = AN.keyType(self._km, self._pass, self._kind === "public");
+        const d = {};
+        if (t.modulusLength != null) d.modulusLength = t.modulusLength;
+        if (t.publicExponent != null) d.publicExponent = BigInt("0x" + Buffer.from(t.publicExponent).toString("hex"));
+        if (t.divisorLength != null) d.divisorLength = t.divisorLength;
+        if (t.namedCurve != null) d.namedCurve = t.namedCurve;
+        return d;
+      } catch (e) { return {}; }
+    },
+  });
   const mkKO = (kind, material, passphrase) => new KeyObject(kKObrand, kind, material, passphrase);
   C.__koBrand = kKObrand;
   const makeKeyObject = (kind, key) => {
-    if (key instanceof KeyObject) return key;
+    if (isKO(key)) return key;
     // { key: <JWK object>, format: "jwk" } → materialize as DER up front so the
     // rest of the pipeline sees ordinary key material (node keys.js).
     if (key != null && typeof key === "object" && key.format === "jwk" && key.key != null) {
@@ -495,7 +546,7 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   C.createPrivateKey = (key) => {
     // node: passing an existing KeyObject to createPrivateKey is never allowed
     // (getKeyObjectHandle, kCreatePrivate → ERR_INVALID_ARG_TYPE).
-    if (key instanceof KeyObject) {
+    if (isKO(key)) {
       const e = new TypeError('The "key" argument must be of type string or an instance of ' +
         "ArrayBuffer, Buffer, TypedArray, DataView, Object, or CryptoKey. Received an instance of KeyObject");
       e.code = "ERR_INVALID_ARG_TYPE"; throw e;
@@ -521,7 +572,7 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   C.createPublicKey = (key) => {
     // node getKeyObjectHandle(kCreatePublic): a private KeyObject derives its
     // public half; any other KeyObject (public/secret) throws.
-    if (key instanceof KeyObject) {
+    if (isKO(key)) {
       if (key._kind === "private") {
         const pem = AN.keyExport(key._km, key._pass, true, "spki", "pem", "", "");
         return mkKO("public", pem, "");
@@ -772,7 +823,7 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
       e.code = "ERR_INVALID_ARG_TYPE"; throw e;
     }
     // A secret KeyObject is accepted as the key (node cipher.js prepareSecretKey).
-    if (key instanceof KeyObject) key = key._km;
+    if (isKO(key)) key = key._km;
     // iv: string | ArrayBuffer/view | null accepted; number/undefined/etc rejected.
     if (iv !== null && typeof iv !== "string" && !isView(iv) && !(iv instanceof ArrayBuffer)) {
       const e = new TypeError('The "iv" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView. Received ' +
