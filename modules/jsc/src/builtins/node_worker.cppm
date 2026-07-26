@@ -252,12 +252,101 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
     for (const k of Object.keys(v)) v[k] = unsubst(v[k], ports, seen);
     return v;
   };
+  // ---- node:crypto keys across the worker boundary -------------------------
+  // node transfers a KeyObject / WebCrypto CryptoKey to another thread with its
+  // key state intact (lib/internal/crypto/keys.js kClone / js_transferable), so
+  // `new Worker(f, { workerData: key })` gives the worker a usable key. mbun runs
+  // a worker as a CHILD PROCESS, so every payload crosses as JSON — and both
+  // classes encode to `{}` there: a CryptoKey keeps everything in a WeakMap, and
+  // a KeyObject's fields survive without the prototype that gives them meaning.
+  // These helpers tag the two on the way out and rebuild them on the way in,
+  // through the same internal bridges KeyObject.toCryptoKey/from already use.
+  // The material only ever travels between a parent and the worker it started,
+  // which is the boundary node's thread transfer crosses too.
+  const KEY_TOK = "__mbunTransferredKey__";
+  const cryptoMod = () => M["crypto"] || M["node:crypto"];
+  const encMaterial = (m) => (typeof m === "string" ? { s: m } : { b: Buffer.from(m).toString("base64") });
+  const decMaterial = (d) => (d && typeof d.s === "string" ? d.s : Buffer.from(d.b, "base64"));
+  const encodeKey = (v) => {
+    if (typeof G.__mbunIsCryptoKey === "function" && G.__mbunIsCryptoKey(v)) {
+      const d = G.__mbunCryptoKeyToKeyObject(v);
+      if (!d) return undefined;
+      const o = {};
+      o[KEY_TOK] = { w: 1, kind: d.kind, m: encMaterial(d.material), algorithm: d.algorithm,
+                     usages: d.usages, extractable: d.extractable };
+      return o;
+    }
+    const C = cryptoMod();
+    if (C && typeof C.KeyObject === "function" && v instanceof C.KeyObject && v._kind !== undefined) {
+      const o = {};
+      o[KEY_TOK] = { w: 0, kind: v._kind, m: encMaterial(v._km), p: v._pass };
+      return o;
+    }
+    return undefined;
+  };
+  const decodeKey = (t) => {
+    try {
+      if (t.w === 1) {
+        const bridge = G.__mbunKeyObjectToCryptoKey;
+        if (typeof bridge !== "function") return null;
+        return bridge(t.kind, new Uint8Array(Buffer.from(decMaterial(t.m))), t.algorithm,
+                      t.extractable, t.usages);
+      }
+      const C = cryptoMod();
+      if (!C || typeof C.KeyObject !== "function" || C.__koBrand === undefined) return null;
+      return new C.KeyObject(C.__koBrand, t.kind, decMaterial(t.m), t.p);
+    } catch (e) { return null; }
+  };
+  const encodeKeys = (v, seen) => {
+    if (v === null || typeof v !== "object") return v;
+    const tagged = encodeKey(v);
+    if (tagged !== undefined) return tagged;
+    if (seen.has(v)) return seen.get(v);
+    if (Array.isArray(v)) { const out = []; seen.set(v, out); for (const x of v) out.push(encodeKeys(x, seen)); return out; }
+    const proto = Object.getPrototypeOf(v);
+    if (proto !== Object.prototype && proto !== null) return v;
+    const out = {}; seen.set(v, out);
+    for (const k of Object.keys(v)) out[k] = encodeKeys(v[k], seen);
+    return out;
+  };
+  const decodeKeys = (v, seen) => {
+    if (v === null || typeof v !== "object") return v;
+    if (Object.prototype.hasOwnProperty.call(v, KEY_TOK) && v[KEY_TOK] !== null &&
+        typeof v[KEY_TOK] === "object") {
+      return decodeKey(v[KEY_TOK]);
+    }
+    if (seen.has(v)) return seen.get(v);
+    if (Array.isArray(v)) { seen.set(v, v); for (let k = 0; k < v.length; k++) v[k] = decodeKeys(v[k], seen); return v; }
+    const proto = Object.getPrototypeOf(v);
+    if (proto !== Object.prototype && proto !== null) return v;
+    seen.set(v, v);
+    for (const k of Object.keys(v)) v[k] = decodeKeys(v[k], seen);
+    return v;
+  };
+  const hasHostTransferable = (v, seen) => {
+    if (v === null || typeof v !== "object") return false;
+    if (encodeKey(v) !== undefined) return true;
+    if (seen.has(v)) return false;
+    seen.add(v);
+    if (Array.isArray(v)) { for (const x of v) if (hasHostTransferable(x, seen)) return true; return false; }
+    const proto = Object.getPrototypeOf(v);
+    if (proto !== Object.prototype && proto !== null) return false;
+    for (const k of Object.keys(v)) if (hasHostTransferable(v[k], seen)) return true;
+    return false;
+  };
+  const encodeKeysTop = (v) => encodeKeys(v, new Map());
+  const decodeKeysTop = (v) => decodeKeys(v, new Map());
+
   // Clone FIRST, detach after: a transferred ArrayBuffer is frequently also the
   // backing store of the message itself (postMessage(typedArray, [ab])), and
   // detaching before the copy would hand the receiver an empty view.
   const cloneWithPorts = (value, ports, buffers) => {
-    const pre = ports.length ? subst(value, ports, new Map()) : value;
-    const c = G.structuredClone(pre);
+    // The key tagging runs on THIS side of structuredClone too: the host clone
+    // copies a CryptoKey's prototype but not the WeakMap its state lives in, so
+    // the receiver would get an object that is `instanceof CryptoKey` and yet
+    // has no key in it — worse than a failure, because it reads as a key.
+    const pre = encodeKeysTop(ports.length ? subst(value, ports, new Map()) : value);
+    const c = decodeKeysTop(G.structuredClone(pre));
     for (const b of buffers) { try { G.structuredClone(b, { transfer: [b] }); } catch (e) {} }
     return ports.length ? unsubst(c, ports, new Map()) : c;
   };
@@ -417,6 +506,7 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
     "  };\n" +
     "  return { make: function (id) {\n" +
     "    let onmsg;\n" +
+    "    let onmsgerr;\n" +
     "    const port = {\n" +
     "      postMessage: function (value, transferList) {\n" +
     "        const e = h.post(id, value, transferList);\n" +
@@ -431,7 +521,20 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
     "    Object.defineProperty(port, 'onmessage', {\n" +
     "      configurable: true, get() { return onmsg; }, set(v) { onmsg = v; },\n" +
     "    });\n" +
-    "    h.deliverTo(id, function (data, ports) {\n" +
+    "    Object.defineProperty(port, 'onmessageerror', {\n" +
+    "      configurable: true, get() { return onmsgerr; }, set(v) { onmsgerr = v; },\n" +
+    "    });\n" +
+    // A payload the target context cannot deserialize arrives as an error code
+    // instead of data; the Error itself is minted HERE so it belongs to the
+    // context's realm, like every other object this handle hands out.
+    "    h.deliverTo(id, function (data, ports, errCode) {\n" +
+    "      if (errCode !== undefined) {\n" +
+    "        if (typeof onmsgerr !== 'function') return;\n" +
+    "        const e = new Error('A message object could not be deserialized successfully in the target vm.Context');\n" +
+    "        e.code = errCode;\n" +
+    "        onmsgerr.call(port, { data: e });\n" +
+    "        return;\n" +
+    "      }\n" +
     "      if (typeof onmsg === 'function') onmsg.call(port, { data: copy(data), ports: copy(ports) });\n" +
     "    });\n" +
     "    return port;\n" +
@@ -479,7 +582,18 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
         const raw = (ev && ev.ports) || [];
         for (const sp of raw) mk(sp);
         const fn = st.deliver.get(id);
-        if (fn) fn(ev && ev.data, raw);
+        if (!fn) return;
+        // node deserializes a KeyObject / CryptoKey only into the context that
+        // owns its native handle — src/crypto/crypto_keys.cc
+        // KeyObjectTransferData::Deserialize raises
+        // ERR_MESSAGE_TARGET_CONTEXT_UNAVAILABLE for any other vm.Context, and
+        // the port reports that as a 'messageerror', never as a message. The key
+        // codec above already knows exactly which values are those host objects.
+        if (hasHostTransferable(ev && ev.data, new Set())) {
+          fn(undefined, [], "ERR_MESSAGE_TARGET_CONTEXT_UNAVAILABLE");
+          return;
+        }
+        fn(ev && ev.data, raw);
       };
       return w;
     };
@@ -664,7 +778,7 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
       // constructor instead of silently reaching the worker as null.
       if (options.workerData !== undefined) G.structuredClone(options.workerData);
       let workerDataJson = "null";
-      try { workerDataJson = JSON.stringify(options.workerData === undefined ? null : options.workerData); }
+      try { workerDataJson = JSON.stringify(encodeKeysTop(options.workerData === undefined ? null : options.workerData)); }
       catch (e) { throw dataClone(String(options.workerData) + " could not be cloned."); }
       if (workerDataJson === undefined) throw dataClone(String(options.workerData) + " could not be cloned.");
 
@@ -694,8 +808,27 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
       try { env.MBUN_WORKER_ENVDATA = JSON.stringify(Array.from(environmentData)); }
       catch (e) { env.MBUN_WORKER_ENVDATA = "[]"; }
 
-      const execArgv = Array.isArray(options.execArgv) ? options.execArgv.map(String)
-                                                       : ((proc.execArgv || []).map(String));
+      // node's execArgv KEEPS the eval flag and its code (`node -e "…"` reports
+      // ["-e", "…"]), because node starts a worker as a thread and never replays
+      // that command line. mbun starts one as a child mbun process, so handing
+      // the inherited execArgv straight to spawn() re-evaluates the PARENT's -e
+      // program in every worker — and a parent whose -e program constructs a
+      // Worker forks without bound (observed: repeated SIGABRT under the bounded
+      // scope from `mbun -e 'new Worker(…)'`). The eval flag and the code token
+      // after it are therefore dropped from the spawn argv only; process.execArgv
+      // itself is untouched, so what the worker reports still matches node.
+      const stripEval = (list) => {
+        const out = [];
+        for (let i = 0; i < list.length; i++) {
+          const a = list[i];
+          if (a === "-e" || a === "--eval" || a === "-p" || a === "--print" ||
+              a === "-pe" || a === "-ep") { i++; continue; }
+          out.push(a);
+        }
+        return out;
+      };
+      const execArgv = stripEval(Array.isArray(options.execArgv) ? options.execArgv.map(String)
+                                                                 : ((proc.execArgv || []).map(String)));
       const argv = Array.isArray(options.argv) ? options.argv.map(String) : [];
       const child = CPM.spawn(String(proc.execPath || "mbun"),
                               execArgv.concat([entry], argv),
@@ -725,9 +858,10 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
       child.on("message", (m) => {
         if (m === null || typeof m !== "object") return;
         if (m.t === "m") {
-          const ev = { data: m.d, type: "message", ports: [], target: self };
+          const d = decodeKeysTop(m.d);
+          const ev = { data: d, type: "message", ports: [], target: self };
           if (typeof self.onmessage === "function") self.onmessage(ev);
-          self.emit("message", m.d);
+          self.emit("message", d);
         } else if (m.t === "e") {
           const err = new Error(m.d && m.d.message ? m.d.message : String(m.d));
           if (m.d && m.d.name) err.name = m.d.name;
@@ -766,7 +900,7 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
       validateTransferList(transferList);
       if (this._exited || !this._child.connected) return undefined;
       // `{t:"m"}` with no `d` IS the undefined message: JSON drops the key.
-      try { this._child.send(value === undefined ? { t: "m" } : { t: "m", d: value }); } catch (e) {}
+      try { this._child.send(value === undefined ? { t: "m" } : { t: "m", d: encodeKeysTop(value) }); } catch (e) {}
       return undefined;
     }
     terminate() {
@@ -789,10 +923,16 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
   let threadId = 0;
   let parentPort = null;
   let workerData = null;
+  let workerDataRaw = null;
   if (MY_TID !== undefined && MY_TID !== null && MY_TID !== "") {
     isMainThread = false;
     threadId = Number(MY_TID) | 0;
-    try { workerData = JSON.parse(WENV.MBUN_WORKER_DATA || "null"); } catch (e) { workerData = null; }
+    // Decoded LAZILY (see the accessor installed on `mod` below): rebuilding a
+    // transferred KeyObject/CryptoKey needs node:crypto's real classes, and
+    // crypto_asym.cppm patches those in AFTER this partition has run. The
+    // accessor replaces itself with a plain data property on first read, so
+    // `worker_threads.workerData` still behaves like node's own value.
+    workerDataRaw = WENV.MBUN_WORKER_DATA || "null";
     try {
       const ed = JSON.parse(WENV.MBUN_WORKER_ENVDATA || "[]");
       if (Array.isArray(ed)) for (const kv of ed) environmentData.set(kv[0], kv[1]);
@@ -809,7 +949,7 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
       configurable: true, writable: true,
       value: function (value, transferList) {
         if (typeof proc.send !== "function") return undefined;
-        try { proc.send(value === undefined ? { t: "m" } : { t: "m", d: value }); } catch (e) {}
+        try { proc.send(value === undefined ? { t: "m" } : { t: "m", d: encodeKeysTop(value) }); } catch (e) {}
         // node detaches every ArrayBuffer in the transfer list; the message is
         // already on the wire, so the parent's copy is unaffected. Ignoring the
         // list left `crypto.sign()`'s buffer alive in the worker after
@@ -845,7 +985,7 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
     // hook is only defined in a worker process; a normal run never calls it.
     G.__mbunWorkerFatal = (e) => { if (e !== undefined) reportFatal(e); };
     if (typeof proc.on === "function") {
-      proc.on("message", (m) => { if (m !== null && typeof m === "object" && m.t === "m") chan.port2.postMessage(m.d); });
+      proc.on("message", (m) => { if (m !== null && typeof m === "object" && m.t === "m") chan.port2.postMessage(decodeKeysTop(m.d)); });
     }
     // An uncaught throw inside a worker surfaces as an 'error' event on the
     // parent's Worker handle, not as a bare non-zero exit (node worker.js) —
@@ -924,6 +1064,19 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
     getEnvironmentData,
     SHARE_ENV,
   };
+
+  if (workerDataRaw !== null) {
+    const settle = (v) => {
+      Object.defineProperty(mod, "workerData",
+        { configurable: true, enumerable: true, writable: true, value: v });
+      return v;
+    };
+    Object.defineProperty(mod, "workerData", {
+      configurable: true, enumerable: true,
+      get() { let v = null; try { v = decodeKeysTop(JSON.parse(workerDataRaw)); } catch (e) { v = null; } return settle(v); },
+      set(v) { settle(v); },
+    });
+  }
 
   M["worker_threads"] = M["node:worker_threads"] = mod;
 

@@ -49,6 +49,33 @@ int main(int argc, char* argv[]) {
         return run_embedded_program(*embedded, argc > 0 ? argv[0] : "mbun", embeddedArgs);
     }
 
+    // ── --enable-fips / --force-fips on a non-FIPS OpenSSL → refuse to start.
+    //    node ProcessFipsOptions() (src/crypto/crypto_util.cc) asks OpenSSL for a
+    //    FIPS provider and, when there is none, node.cc:1246 reports
+    //    "OpenSSL error when trying to enable FIPS:" and returns
+    //    ExitCode::kGenericUserError BEFORE any JS runs. mbun links a stock
+    //    OpenSSL 3.1.5 with no FIPS provider, so the request can never be
+    //    honoured — accepting the flag silently would be the dangerous answer
+    //    (a program that asked for FIPS would run outside it and never know).
+    //    Parsed off the raw command line, stopping at the first non-option or an
+    //    eval flag, so a `-e` program that merely mentions the string is not a
+    //    request.
+    {
+        for (int i{1}; i < argc; ++i) {
+            const std::string_view a{argv[i]};
+            if (a == "-e" || a == "--eval" || a == "-p" || a == "--print" || a == "-pe" ||
+                a == "-ep") {
+                break;
+            }
+            if (!a.starts_with("-")) break;
+            if (a == "--enable-fips" || a == "--force-fips") {
+                std::println(std::cerr, "{}: OpenSSL error when trying to enable FIPS:\n",
+                             argc > 0 ? argv[0] : "mbun");
+                return 1;
+            }
+        }
+    }
+
     // process.execArgv — derived from the raw command line before any flag loop
     //    consumes it, exactly as bun does (node_process.rs create_exec_argv).
     //    Every dispatch below (node emulation, `run`, bare script) shares it; a

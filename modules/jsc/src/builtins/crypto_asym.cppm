@@ -66,6 +66,16 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   if (typeof C.getFips !== "function") {
     C.getFips = () => 0;
     C.setFips = (v) => {
+      // node lib/crypto.js setFips(): the worker check runs BEFORE the OpenSSL
+      // call, because FIPS is per-process state and only the thread that owns
+      // the process may change it. Read at call time — worker_threads is on the
+      // registry by then, and setFips is far too rare to pay a load for.
+      const wt = M["worker_threads"] || M["node:worker_threads"];
+      if (wt && wt.isMainThread === false) {
+        const e = new TypeError("Calling crypto.setFips() is not supported in workers");
+        e.code = "ERR_WORKER_UNSUPPORTED_OPERATION";
+        throw e;
+      }
       if (v) {
         const e = new Error("Cannot set FIPS mode in a non-FIPS build.");
         e.code = "ERR_CRYPTO_FIPS_UNAVAILABLE";
@@ -1038,7 +1048,15 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     computeSecret(other, inEnc, outEnc) {
       const p = dhEnsureP(this);
       const ob = typeof other === "string" ? Buffer.from(other, inEnc) : toBuf(other);
-      const sec = dhModPow(dhBufToBig(ob), this._priv, p);
+      // node runs DH_check_pub_key() BEFORE deriving (src/crypto/crypto_dh.cc
+      // ComputeSecret → ncrypto DHPointer::checkPublicKey). A peer key outside
+      // (1, p-1) is rejected rather than reduced: 0/1 give a constant "shared"
+      // secret and p-1 gives ±1, so deriving from one would hand back a secret
+      // an attacker chose. Empty input decodes to 0 and is exactly that case.
+      const y = dhBufToBig(ob);
+      if (y <= 1n) { const e = new RangeError("Supplied key is too small"); e.code = "ERR_CRYPTO_INVALID_KEYLEN"; throw e; }
+      if (y >= p - 1n) { const e = new RangeError("Supplied key is too large"); e.code = "ERR_CRYPTO_INVALID_KEYLEN"; throw e; }
+      const sec = dhModPow(y, this._priv, p);
       const out = dhBigToBuf(sec, dhBigToBuf(p).length);
       return (outEnc && outEnc !== "buffer") ? out.toString(outEnc) : out;
     },
@@ -1107,6 +1125,148 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   C.createDiffieHellman = (sizeOrKey, keyEncoding, generator, genEncoding) => new DiffieHellman(sizeOrKey, keyEncoding, generator, genEncoding);
   C.createDiffieHellmanGroup = (name) => new DiffieHellmanGroup(name);
   C.getDiffieHellman = (name) => new DiffieHellmanGroup(name);
+
+  // ---- generatePrime / checkPrime ----
+  // Backed by OpenSSL's BN_generate_prime_ex / BN_is_prime_ex through the native
+  // bridge, replacing the JS Miller-Rabin placeholder that had no generator at
+  // all. The validation order below is node's
+  // (lib/internal/crypto/random.js createRandomPrimeJob / checkPrime), and the
+  // two "would loop forever inside OpenSSL" guards on add/rem are node's
+  // (src/crypto/crypto_random.cc RandomPrimeTraits::AdditionalConfig) — kept
+  // here because only JS can attach the ERR_OUT_OF_RANGE code node reports.
+  if (typeof AN.generatePrime === "function") {
+    const INT32_MAX = 2147483647;
+    const outOfRange = (name, range, got) => {
+      const e = new RangeError('The value of "' + name + '" is out of range. It must be ' +
+        range + ". Received " + got);
+      e.code = "ERR_OUT_OF_RANGE"; return e;
+    };
+    const argType = (name, expected, got) => {
+      const e = new TypeError('The "' + name + '" argument must be ' + expected + ". Received " +
+        (got === null ? "null" : typeof got));
+      e.code = "ERR_INVALID_ARG_TYPE"; return e;
+    };
+    const propType = (name, expected, got) => {
+      const e = new TypeError('The "' + name + '" property must be ' + expected + ". Received " +
+        (got === null ? "null" : typeof got));
+      e.code = "ERR_INVALID_ARG_TYPE"; return e;
+    };
+    const vInt32 = (v, name, min) => {
+      if (typeof v !== "number") throw argType(name, "of type number", v);
+      if (!Number.isInteger(v)) throw outOfRange(name, "an integer", v);
+      if (v < min || v > INT32_MAX) throw outOfRange(name, ">= " + min + " && <= " + INT32_MAX, v);
+      return v;
+    };
+    const vInt32Prop = (v, name, min) => {
+      if (typeof v !== "number") throw propType(name, "of type number", v);
+      if (!Number.isInteger(v)) throw outOfRange(name, "an integer", v);
+      if (v < min || v > INT32_MAX) throw outOfRange(name, ">= " + min + " && <= " + INT32_MAX, v);
+      return v;
+    };
+    const vObject = (v, name) => {
+      if (v === null || typeof v !== "object" || Array.isArray(v)) throw argType(name, "of type object", v);
+    };
+    const vBool = (v, name) => { if (typeof v !== "boolean") throw propType(name, "of type boolean", v); };
+    const isBufferSource = (v) => isView(v) || v instanceof ArrayBuffer ||
+      (typeof G.SharedArrayBuffer === "function" && v instanceof G.SharedArrayBuffer);
+    // node unsignedBigIntToBuffer(): a negative BigInt is rejected rather than
+    // silently truncated to zero.
+    const bigToBuf = (n, name) => {
+      if (n < 0n) {
+        const e = new RangeError('The value of "' + name + '" is out of range. It must be >= 0. ' +
+          "Received " + n + "n");
+        e.code = "ERR_OUT_OF_RANGE"; throw e;
+      }
+      let hex = n.toString(16);
+      if (hex.length % 2) hex = "0" + hex;
+      return Buffer.from(hex, "hex");
+    };
+    const bufToBig = (b) => {
+      const u = toBuf(b);
+      let n = 0n;
+      for (let i = 0; i < u.length; i++) n = (n << 8n) | BigInt(u[i]);
+      return n;
+    };
+    const primeArgs = (size, options) => {
+      vInt32(size, "size", 1);
+      vObject(options, "options");
+      const safe = options.safe === undefined ? false : options.safe;
+      const bigint = options.bigint === undefined ? false : options.bigint;
+      vBool(safe, "options.safe");
+      vBool(bigint, "options.bigint");
+      let add = options.add, rem = options.rem;
+      for (const spec of [["options.add", 0], ["options.rem", 1]]) {
+        const v = spec[1] === 0 ? add : rem;
+        if (v === undefined) continue;
+        let out;
+        if (typeof v === "bigint") out = bigToBuf(v, spec[0]);
+        else if (isBufferSource(v)) out = toBuf(v);
+        else throw propType(spec[0], "an instance of ArrayBuffer, TypedArray, Buffer, DataView, or bigint", v);
+        if (spec[1] === 0) add = out; else rem = out;
+      }
+      if (add !== undefined) {
+        // Wider than the prime we were asked for: OpenSSL would either loop
+        // forever or hand back a fixed, non-random prime.
+        const addN = bufToBig(add);
+        if (addN > 0n && addN.toString(2).length > size) {
+          const e = new RangeError("invalid options.add"); e.code = "ERR_OUT_OF_RANGE"; throw e;
+        }
+        // rem >= add is unsatisfiable, and OpenSSL does not check it.
+        if (rem !== undefined && addN <= bufToBig(rem)) {
+          const e = new RangeError("invalid options.rem"); e.code = "ERR_OUT_OF_RANGE"; throw e;
+        }
+      }
+      return { safe, bigint, add, rem };
+    };
+    const runPrime = (size, a) => {
+      // node returns an ArrayBuffer (RandomPrimeTraits::EncodeOutput), or the
+      // BigInt when options.bigint is set.
+      const raw = new Uint8Array(AN.generatePrime(size, a.safe, a.add, a.rem));
+      return a.bigint ? bufToBig(raw) : raw.buffer;
+    };
+    C.generatePrimeSync = (size, options) => runPrime(size, primeArgs(size, options === undefined ? {} : options));
+    C.generatePrime = (size, options, callback) => {
+      vInt32(size, "size", 1);
+      if (typeof options === "function") { callback = options; options = {}; }
+      if (typeof callback !== "function") throw argType("callback", "of type function", callback);
+      const a = primeArgs(size, options === undefined ? {} : options);
+      // Deferred: node runs the generation on the threadpool, so a caller that
+      // exits the process in the same tick (test-crypto-prime's interruption
+      // worker) never pays for it and never sees the callback.
+      queueMicrotask(() => {
+        let out, err = null;
+        try { out = runPrime(size, a); } catch (e) { err = e; }
+        if (err) callback(err); else callback(undefined, out);
+      });
+    };
+    const checkArgs = (candidate, options) => {
+      if (typeof candidate === "bigint") candidate = bigToBuf(candidate, "candidate");
+      else if (!isBufferSource(candidate)) {
+        throw argType("candidate", "an instance of ArrayBuffer, TypedArray, Buffer, DataView, or bigint", candidate);
+      }
+      vObject(options, "options");
+      const checks = options.checks === undefined ? 0 : options.checks;
+      vInt32Prop(checks, "options.checks", 0);
+      return { candidate: toBuf(candidate), checks };
+    };
+    C.checkPrimeSync = (candidate, options) => {
+      const a = checkArgs(candidate, options === undefined ? {} : options);
+      try { return AN.checkPrime(a.candidate, a.checks); }
+      catch (e) { throw decorateOsslError(e); }
+    };
+    C.checkPrime = (candidate, options, callback) => {
+      if (typeof options === "function") { callback = options; options = {}; }
+      const a = checkArgs(candidate, options === undefined ? {} : options);
+      if (typeof callback !== "function") throw argType("callback", "of type function", callback);
+      // node's CheckPrimeJob raises a bad-candidate error from AdditionalConfig,
+      // i.e. synchronously, on the async path too — the callback is only for the
+      // answer.
+      let r;
+      try { r = AN.checkPrime(a.candidate, a.checks); }
+      catch (e) { throw decorateOsslError(e); }
+      queueMicrotask(() => callback(null, r));
+    };
+  }
 
   // ---- X509Certificate ----
   const wildcardMatch = (host, pattern, allowWildcard) => {
