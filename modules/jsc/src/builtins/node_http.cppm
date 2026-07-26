@@ -257,9 +257,9 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
       throw ERR_INVALID_HTTP_TOKEN(label || "Header name", name);
     }
   };
-  const validateHeaderValue = (name, value) => {
+  const validateHeaderValue = (name, value, lenient) => {
     if (value === undefined) throw ERR_HTTP_INVALID_HEADER_VALUE(value, name);
-    if (checkInvalidHeaderChar(value)) throw ERR_INVALID_CHAR("header content", name);
+    if (checkInvalidHeaderChar(value, lenient)) throw ERR_INVALID_CHAR("header content", name);
   };
 
   // -------------------------------------------------- symbols (internal/http)
@@ -274,6 +274,12 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
   const kErrored = Symbol("errored");
   const kHighWaterMark = Symbol("kHighWaterMark");
   const kRejectNonStandardBodyWrites = Symbol("kRejectNonStandardBodyWrites");
+  // node's `httpValidation` option, resolved to the one bit the outgoing
+  // header validators need: whether this message uses llhttp's relaxed
+  // field-value alphabet (control chars allowed, NUL/CR/LF never) instead of
+  // RFC 7230's strict one. Carried per MESSAGE, because a server and a client
+  // in the same process can disagree.
+  const kLenientHeaders = Symbol("kLenientHeaders");
   const kPath = Symbol("kPath");
   const kHeaders = Symbol("kHeaders");
   const kHeadersDistinct = Symbol("kHeadersDistinct");
@@ -315,6 +321,7 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
     this._hasBody = true;
     this._trailer = "";
     this[kNeedDrain] = false;
+    this[kLenientHeaders] = false;
     this.finished = false;
     this._headerSent = false;
     this[kCorked] = 0;
@@ -489,7 +496,7 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
     }
   }
   function storeHeaderLine(self, state, key, value, validate) {
-    if (validate) validateHeaderValue(key, value);
+    if (validate) validateHeaderValue(key, value, self[kLenientHeaders]);
     state.header += key + ": " + value + "\r\n";
     matchHeader(self, state, key, value);
   }
@@ -600,7 +607,7 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
     if (this._header) throw ERR_HTTP_HEADERS_SENT("set");
     validateHeaderName(name);
     if (value === undefined) throw ERR_HTTP_INVALID_HEADER_VALUE(value, name);
-    if (checkInvalidHeaderChar(value)) throw ERR_INVALID_CHAR("header content", name);
+    if (checkInvalidHeaderChar(value, this[kLenientHeaders])) throw ERR_INVALID_CHAR("header content", name);
     let headers = this[kOutHeaders];
     if (headers === null || headers === undefined) this[kOutHeaders] = headers = { __proto__: null };
     headers[name.toLowerCase()] = [name, value];
@@ -631,7 +638,7 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
     if (this._header) throw ERR_HTTP_HEADERS_SENT("append");
     validateHeaderName(name);
     if (value === undefined) throw ERR_HTTP_INVALID_HEADER_VALUE(value, name);
-    if (checkInvalidHeaderChar(value)) throw ERR_INVALID_CHAR("header content", name);
+    if (checkInvalidHeaderChar(value, this[kLenientHeaders])) throw ERR_INVALID_CHAR("header content", name);
     const field = name.toLowerCase();
     const headers = this[kOutHeaders];
     if (headers === null || headers === undefined || !headers[field]) return this.setHeader(name, value);
@@ -971,7 +978,12 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
   ServerResponse.prototype.writeProcessing = function writeProcessing(cb) {
     this.writeInformation(102, null, cb);
   };
-  const linkValueRegExp = /^(?:<[^>]*>)(?:\s*;\s*[^;"\s=]+(?:=(")?[^;"\s]*\1)?)*$/;
+  // node internal/validators.js linkValueRegExp, character for character. The
+  // two deviations mbun carried were both observable: `[^>]*` inside the angle
+  // brackets accepted a CRLF smuggled into the URI-reference (the corpus asserts
+  // ERR_INVALID_ARG_VALUE for `</styles.css\r\nSet-Cookie: evil>`), and
+  // excluding `=` from the param-name class rejected shapes node accepts.
+  const linkValueRegExp = /^(?:<[^>\r\n]*>)(?:\s*;\s*[^;"\s]+(?:=(")?[^;"\s]*\1)?)*$/;
   const LINK_HINT = 'must be an array or string of format "</styles.css>; rel=preload; as=style"';
   function validateLinkHeaderFormat(value, name) {
     if (typeof value === "undefined" || !linkValueRegExp.exec(value)) {
@@ -1679,6 +1691,13 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
       }
     }
     this.httpValidation = httpValidation;
+    // Outgoing field-value alphabet. 'relaxed' and 'insecure' both widen it to
+    // the Fetch-spec set (everything but NUL/CR/LF and non-latin1); 'strict' and
+    // the default do not. `insecureHTTPParser: true` is node's older spelling of
+    // the same opt-in, and `false` is an explicit refusal that must stay strict.
+    this[kLenientHeaders] = httpValidation === undefined
+      ? insecureHTTPParser === true
+      : (httpValidation === "relaxed" || httpValidation === "insecure");
 
     if (options.joinDuplicateHeaders !== undefined) {
       validateBoolean(options.joinDuplicateHeaders, "options.joinDuplicateHeaders");
@@ -1879,6 +1898,11 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
     request.parser = parser;
     socket.parser = parser;
     if (typeof request.maxHeaderSize === "number") parser.maxHeaderSize = request.maxHeaderSize;
+    // _http_client.js: `parser.setLenientFlags(...)` when the request opted into
+    // insecureHTTPParser (or the process did via --insecure-http-parser).
+    parser.lenient = request.insecureHTTPParser === undefined
+      ? !!(G.__mbunHttpNative && G.__mbunHttpNative.insecureHTTPParser)
+      : !!request.insecureHTTPParser;
 
     let res = null;
     let upgraded = false;
@@ -2382,7 +2406,7 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
     ERR_HTTP_INVALID_STATUS_CODE, ERR_INVALID_CHAR, ERR_OUT_OF_RANGE,
     validateInteger, validateNumber, validateBoolean, validateObject, validateString,
     getTimerDuration,
-    kConnectionsCheckingInterval, kServerResponse, kIncomingMessage,
+    kConnectionsCheckingInterval, kServerResponse, kIncomingMessage, kLenientHeaders,
     parsersFreeList, freeParser, clearIncoming,
     // js_net's server transport needs node's exact abort error for
     // socketOnClose -> abortIncoming/abortOutgoing.

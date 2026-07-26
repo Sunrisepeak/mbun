@@ -1093,6 +1093,30 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
     srv.maxRequestsPerSocket = 0;
     srv.requireHostHeader = o.requireHostHeader === undefined ? true : (vBool(o.requireHostHeader, "options.requireHostHeader"), o.requireHostHeader);
     srv.rejectNonStandardBodyWrites = !!o.rejectNonStandardBodyWrites;
+    // lib/_http_server.js storeHTTPOptions: `httpValidation` is one of
+    // strict/relaxed/insecure and is mutually exclusive with the older
+    // `insecureHTTPParser` boolean. 'relaxed' widens only the outgoing/incoming
+    // header-value alphabet; 'insecure' additionally turns on llhttp's lenient
+    // parsing (a duplicate Transfer-Encoding is accepted under 'insecure' and
+    // still rejected under 'relaxed').
+    const kLenientHeaders = HI.kLenientHeaders;
+    if (o.insecureHTTPParser !== undefined) vBool(o.insecureHTTPParser, "options.insecureHTTPParser");
+    if (o.httpValidation !== undefined) {
+      if (o.httpValidation !== "strict" && o.httpValidation !== "relaxed" && o.httpValidation !== "insecure") {
+        const e = new TypeError('The argument \'options.httpValidation\' must be one of: ' +
+          "'strict', 'relaxed', 'insecure'. Received " + JSON.stringify(o.httpValidation));
+        e.code = "ERR_INVALID_ARG_VALUE"; throw e;
+      }
+      if (o.insecureHTTPParser !== undefined) {
+        const e = new TypeError("The argument 'options.httpValidation' cannot be used together with " +
+          "options.insecureHTTPParser. Received " + JSON.stringify(o.httpValidation));
+        e.code = "ERR_INVALID_ARG_VALUE"; throw e;
+      }
+    }
+    srv.httpValidation = o.httpValidation;
+    const srvLenientHeaders = o.httpValidation === undefined
+      ? o.insecureHTTPParser === true
+      : (o.httpValidation === "relaxed" || o.httpValidation === "insecure");
     if (o.maxHeaderSize !== undefined) vInt(o.maxHeaderSize, "maxHeaderSize", 0);
     srv.maxHeaderSize = o.maxHeaderSize;
     // lib/_http_server.js storeHTTPOptions: `options.shouldUpgradeCallback`
@@ -1220,6 +1244,28 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
     // node http.Server surface (bun _http_server.ts:364 server.stop(true) /
     // :386 closeIdleConnections): destroy every / every idle tracked socket.
     srv.closeAllConnections = function () { for (const s of Array.from(this._httpConns)) { try { s.destroy(); } catch (e) {} } };
+    // lib/_http_server.js Server.prototype[EE.captureRejectionSymbol]: an async
+    // request handler that rejects answers 500 "Internal Server Error" with the
+    // headers it had already staged REMOVED (node's comment: "Don't leak
+    // headers"), and destroys the socket once the head is on the wire. Anything
+    // other than 'request' falls through to net.Server's handler.
+    srv[Symbol.for("nodejs.rejection")] = function (err, event, ...args) {
+      if (event !== "request") {
+        const base = Object.getPrototypeOf(this)[Symbol.for("nodejs.rejection")];
+        if (typeof base === "function") return base.call(this, err, event, ...args);
+        return this.emit("error", err);
+      }
+      const res = args[1];
+      if (!res) return;
+      if (!res.headersSent && !res.writableEnded) {
+        const names = res.getHeaderNames();
+        for (let i = 0; i < names.length; i++) res.removeHeader(names[i]);
+        res.statusCode = 500;
+        res.end("Internal Server Error");
+      } else {
+        res.destroy();
+      }
+    };
     srv.closeIdleConnections = function () {
       for (const s of Array.from(this._httpConns)) {
         // Idle = the incoming request message has completed, which is what
@@ -1241,6 +1287,14 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
         // PARTIAL request line, so "has begun a message" alone is not enough
         // either: the message must also have finished (_httpMsgOpen), which is
         // node's `last_message_start_ == 0`.
+        // lib/_http_server.js closeIdleConnections skips a connection whose
+        // response is still being written (`socket._httpMessage &&
+        // !socket._httpMessage.finished`). The request message can be complete
+        // long before the handler answers — a handler that replies on a timer
+        // leaves the parser idle while the exchange is very much alive — and
+        // destroying it there is a "socket hang up" on the waiting client
+        // (test-http-server-close-idle-wait-response).
+        if (s._httpMessage && !s._httpMessage.finished) continue;
         if (s._httpMsgBegun && !s._httpMsgOpen && !s._httpInFlight) { try { s.destroy(); } catch (e) {} }
       }
     };
@@ -1459,6 +1513,10 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
           parser.maxHeaderPairs = srv.maxHeadersCount << 1;
         }
         if (typeof srv.maxHeaderSize === "number" && srv.maxHeaderSize > 0) parser.maxHeaderSize = srv.maxHeaderSize;
+        // lib/_http_server.js connectionListenerInternal: the server's own
+        // insecureHTTPParser flag selects llhttp's lenient flags for inbound
+        // requests, exactly as the client option does for responses.
+        if (o.insecureHTTPParser || o.httpValidation === "insecure") parser.lenient = true;
         sock._httpParser = parser;
         // node keeps ONE parser per connection and republishes it as
         // `socket.parser`; this translation re-arms a fresh parser per message,
@@ -1699,6 +1757,7 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
             highWaterMark: sock.writableHighWaterMark,
             rejectNonStandardBodyWrites: srv.rejectNonStandardBodyWrites,
           });
+          if (kLenientHeaders && srvLenientHeaders) res[kLenientHeaders] = true;
           res._keepAliveTimeout = srv.keepAliveTimeout;
           res._maxRequestsPerSocket = srv.maxRequestsPerSocket;
           res.shouldKeepAlive = keepAlive;

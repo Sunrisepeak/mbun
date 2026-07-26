@@ -237,6 +237,22 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
 
   // ---- node:net — real Socket / Server over the reactor ----------------------
   const HWM = 64 * 1024;
+  // node onconnection(): the accepted socket learns its peer from
+  // uv_tcp_getpeername. mbun had no binding for it, so every server-side socket
+  // reported remotePort 0 and a hard-coded remoteAddress — which only looked
+  // consistent while the CLIENT's localPort was 0 too
+  // (test-net-socket-local-address compares the two lists).
+  const adoptPeer = (sock, fd) => {
+    try {
+      const pn = NN.peername ? NN.peername(fd) : null;
+      if (typeof pn === "string") {
+        const i = pn.lastIndexOf(":");
+        sock.remoteAddress = pn.slice(0, i);
+        sock.remotePort = +pn.slice(i + 1);
+        sock.remoteFamily = "IPv4";
+      }
+    } catch (e) {}
+  };
   // node net.js Happy-Eyeballs default (getDefault/setDefaultAutoSelectFamily*).
   // mbun's connect is single-stack so the value is advisory, but the getter/
   // setter contract (default 2500, floor 10, positive-int validation) is tested.
@@ -606,6 +622,24 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       // ERR_INVALID_ADDRESS_FAMILY (both surfaced on 'error', as in node).
       const _blockList = optArg && optArg.blockList;
       const _lookup = optArg && optArg.lookup;
+      // node lookupAndConnect -> internalConnect: options.localAddress /
+      // localPort are bound on the handle BEFORE connect(2), so a source
+      // address this host does not own fails the connection instead of being
+      // ignored. The bound name is then what socket.localAddress/localPort
+      // report — read back with getsockname rather than echoed, because the
+      // kernel picks both when neither was requested.
+      const _localAddr = (optArg && optArg.localAddress != null) ? String(optArg.localAddress) : null;
+      const _localPort = (optArg && optArg.localPort != null) ? (optArg.localPort | 0) : 0;
+      const _adoptLocal = (sock, sfd) => {
+        try {
+          const sn = NN.sockname ? NN.sockname(sfd) : null;
+          if (typeof sn === "string") {
+            const i = sn.lastIndexOf(":");
+            sock.localAddress = sn.slice(0, i);
+            sock.localPort = +sn.slice(i + 1);
+          }
+        } catch (e) {}
+      };
       const _famOf = (v) => isIPv6(v) ? 6 : isIPv4(v) ? 4 : 0;
       // node net.js lookupAndConnect: a host that is not an IP literal is
       // resolved through dns.lookup before connect(2), and the result (or the
@@ -624,9 +658,9 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
           if (_blockList && _blockList.check(addr, fam === 6 ? "ipv6" : "ipv4")) return failWith(mkErr("IP is blocked by net.BlockList", "ERR_IP_BLOCKED"));
           const dh = (addr === "::1" || addr === "::" || addr === "::0") ? "127.0.0.1" : addr;
           let fd2;
-          try { fd2 = NN.connect(dh, port); }
+          try { fd2 = NN.connect(dh, port, _localAddr, _localPort); }
           catch (e) { self.connecting = false; const err = connectError(e, addr, port); G.queueMicrotask(() => { if (self.destroyed) return; self.emit("error", err); self.destroy(); }); return self; }
-          self._adopt(fd2); self.remotePort = port;
+          self._adopt(fd2); self.remotePort = port; _adoptLocal(self, fd2);
           self.connecting = true;
           G.queueMicrotask(() => { if (self.destroyed) { self.connecting = false; return; } self.connecting = false; self._flushPreConnect(null); self._applyDeferredSockOpts(); self.emit("connect"); self.emit("ready"); });
           return self;
@@ -670,10 +704,11 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       // dials the v4 loopback, which the v4-mapped INADDR_ANY listener accepts.
       const dialHost = (host === "::1" || host === "::" || host === "::0") ? "127.0.0.1" : host;
       let fd;
-      try { if (unixPath && pipePathTooLong(unixPath)) throw new Error("EINVAL"); fd = unixPath ? NN.connectUnix(unixPath) : NN.connect(dialHost, port); }
+      try { if (unixPath && pipePathTooLong(unixPath)) throw new Error("EINVAL"); fd = unixPath ? NN.connectUnix(unixPath) : NN.connect(dialHost, port, _localAddr, _localPort); }
       catch (e) { this.connecting = false; const err = connectError(e, unixPath || host, unixPath ? undefined : port); G.queueMicrotask(() => { if (this.destroyed) return; this.emit("error", err); this.destroy(); }); return this; }
       this._adopt(fd);
       this.remotePort = port;
+      if (!unixPath) _adoptLocal(this, fd);
       // node reports `connecting === true` from the moment connect() returns
       // until the 'connect' event fires; _adopt cleared it because the reactor's
       // connect() already completed synchronously. A destroy() in between must
@@ -1018,12 +1053,30 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
     // tunnel from a timer. Every other socket keeps the old teardown timing —
     // holding them all open turned fifteen green files into hangs.
     _rqPending() { return !!(this._holdForReader && this._rq && this._rq.length); }
+    // Bytes read off the wire that no consumer has taken yet. _rqPending() above
+    // is the LOOP-HOLD test and is deliberately narrow (holding every such
+    // socket open turned fifteen green files into hangs); TEARDOWN is a separate
+    // question and must not be narrowed the same way. destroy() drops _rq on the
+    // floor and then emits 'end' as though the buffer had been drained, so a
+    // peer that writes its whole answer and FINs in one breath — to a socket
+    // whose reader attaches one microtask later, which is every socket created
+    // inside another socket's 'data' handler — lost the answer outright and the
+    // client reported "socket hang up" (test-http-should-keep-alive).
+    _rqUndelivered() {
+      if (!this._rq || !this._rq.length) return false;
+      // Bounded grace, not an open-ended hold: only while the parked bytes are
+      // fresh enough that a reader arriving on the microtask checkpoint after
+      // this drain could still take them. A consumer that shows up on a TIMER
+      // instead (test-net-socket-close-after-end reads 100 ms later) keeps the
+      // original teardown timing, where destroy() reports 'end' and closes.
+      return ((NET.gen - this._rqGen) | 0) <= 1;
+    }
     _hasReader() { return !!(this._onread || this._dataSink || this._flowing === true || this.listenerCount("data") > 0); }
     _deliver(chunk) {
       if (this._onread) { this._onreadPush(chunk); return; }
       if (this._dataSink) { this._dataSink(chunk); return; }
       if (!this._hasReader()) {
-        if (!this._rq) { this._rq = []; this._rqLen = 0; }
+        if (!this._rq) { this._rq = []; this._rqLen = 0; this._rqGen = NET.gen; }
         this._rq.push(chunk);
         this._rqLen += chunk.length;
         this._readableState.length = this._rqLen;
@@ -1291,7 +1344,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
         // not started reading (see _rqPending): node's socket is only fully
         // done once its readable side has ENDED, which cannot happen while the
         // buffer still holds data.
-        if (this._eof && !this._rqPending()) this.destroy();
+        if (this._eof && !this._rqPending() && !this._rqUndelivered()) this.destroy();
       }
       if (this._needDrain && this._wqLen === 0 && !this.destroyed) { this._needDrain = false; progress++; this.emit("drain"); }
       if (this._destroySoon) this._armDestroySoon();
@@ -1408,10 +1461,10 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
               G.queueMicrotask(() => {
                 if (this.destroyed || this._shutW) return;
                 this._shutW = true; this.writable = false; this._flush();
-                if (this._eof && this._shutSent && this._wq.length === 0 && !this._rqPending()) this.destroy();
+                if (this._eof && this._shutSent && this._wq.length === 0 && !this._rqPending() && !this._rqUndelivered()) this.destroy();
               });
             }
-            if (this._shutSent && this._wq.length === 0 && !this._rqPending()) this.destroy();
+            if (this._shutSent && this._wq.length === 0 && !this._rqPending() && !this._rqUndelivered()) this.destroy();
             // EOF: the read side is stopped, so this handle is only active while
             // a write is queued (see _syncEofHold).
             this._syncEofHold();
@@ -1431,7 +1484,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
           if (this.destroyed || this._paused) break;
         }
       }
-      if (this._eof && this._shutSent && this._wq.length === 0 && !this._rqPending()) this.destroy();
+      if (this._eof && this._shutSent && this._wq.length === 0 && !this._rqPending() && !this._rqUndelivered()) this.destroy();
       return progress;
     }
   }
@@ -1503,6 +1556,16 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
     }
     _hold() { this._loopOpen = true; NET.hold(this); }
     _release() { this._loopOpen = false; NET.release(this); }
+    // node net.js Server.prototype[EventEmitter.captureRejectionSymbol]: with
+    // events.captureRejections on, a connection listener that returns a
+    // rejected promise tears that connection down instead of throwing out of
+    // the microtask queue. Without this hook EventEmitter falls back to
+    // emit('error') on a server nobody is listening to, which is a fatal
+    // uncaught exception.
+    [Symbol.for("nodejs.rejection")](err, event, sock) {
+      if (event === "connection" && sock && typeof sock.destroy === "function") { sock.destroy(err); return; }
+      this.emit("error", err);
+    }
     // node Server._listen2/setupListenHandle: the handle exists the moment the
     // bind succeeded, synchronously inside listen() — callers read
     // `server._handle.onconnection` on the very next line.
@@ -1802,6 +1865,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
             if (er || !clientHandle || typeof clientHandle.fd !== "number" || clientHandle.fd < 0) return;
             const sock = new Socket({ allowHalfOpen: !!this._opts.allowHalfOpen, highWaterMark: this._opts.highWaterMark })._adopt(clientHandle.fd);
             sock.localPort = this._addr ? this._addr.port : 0;
+            adoptPeer(sock, clientHandle.fd);
             // node net.js onconnection: `socket.server` is the listener that
             // accepted it (and `_server` its internal alias).
             sock.server = this; sock._server = this;
@@ -2309,6 +2373,11 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       // maxHeaderSize caps the whole head block (--max-http-header-size).
       this.maxHeaderPairs = 0;
       this.maxHeaderSize = 0;
+      // insecureHTTPParser / --insecure-http-parser: llhttp's lenient flags.
+      // The only one mbun needs so far is obs-fold (RFC 7230 3.2.4 line
+      // folding), which strict llhttp rejects and lenient llhttp joins onto the
+      // previous field value with a single SP.
+      this.lenient = false;
       this.onHead = null; this.onBody = null; this.onDone = null; this.onError = null;
       // 1xx interim heads are not the final response: node re-arms the parser
       // and raises 'continue'/'information' on the ClientRequest instead
@@ -2424,6 +2493,16 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
             }
             if (!eofSeen) return events;
             if (avail === 0 && !this.isResponse) { this.done = true; return events; }  // idle conn closed
+            // llhttp_finish() on a REQUEST that stopped mid-head is
+            // HTTP_FINISH_UNSAFE -> reason "Invalid EOF state" /
+            // HPE_INVALID_EOF_STATE (deps/llhttp/src/api.c), which node reports
+            // verbatim through 'clientError' (test-http-parser-finish-error
+            // matches both /^Parse Error/ and the code). Responses keep the
+            // ECONNRESET wording the client path turns into "socket hang up".
+            if (!this.isResponse) {
+              this._err("Parse Error: Invalid EOF state", "HPE_INVALID_EOF_STATE");
+              return events + 1;
+            }
             this._err("The socket connection was closed unexpectedly", "ECONNRESET");
             return events + 1;
           }
@@ -2433,7 +2512,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
             this._err("Parse Error: Header overflow", "HPE_HEADER_OVERFLOW");
             return events + 1;
           }
-          const head = latin1(this.buf, this.off, at);
+          let head = latin1(this.buf, this.off, at);
           this.off = at + 4;
           // picohttpparser refuses any control byte inside the head: every byte
           // below 0x20 except HTAB (and the CR/LF that end a line), plus DEL.
@@ -2450,6 +2529,13 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
               return events + 1;
             }
           }
+          // obs-fold: a header line that continues on the next line, indented by
+          // SP/HTAB. Strict llhttp rejects it (HPE_INVALID_HEADER_TOKEN, which
+          // is what the loop below produces for a continuation line — it has no
+          // colon); with the lenient flags set it splices the continuation onto
+          // the previous field value separated by one SP, which is what node's
+          // insecureHTTPParser gives (test-http-multi-line-headers).
+          if (this.lenient) head = head.replace(/\r\n[ \t]+/g, " ");
           const lines = head.split("\r\n");
           const first = lines.shift() || "";
           if (this.isResponse) {
@@ -2506,8 +2592,25 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
               const chunkedAt = codings.indexOf("chunked");
               // chunked must be the final coding and appear exactly once; any
               // other shape leaves the body length undefined.
-              teChunked = !sawTE && codings.length > 0 && chunkedAt === codings.length - 1 &&
-                          codings.lastIndexOf("chunked") === chunkedAt;
+              const wellFormed = codings.length > 0 && chunkedAt === codings.length - 1 &&
+                                 codings.lastIndexOf("chunked") === chunkedAt;
+              // A SECOND Transfer-Encoding line after chunked has already been
+              // announced: llhttp rejects that inside on_header_value_complete,
+              // i.e. BEFORE on_headers_complete, so the request is never
+              // observed by the application at all. That is a different failure
+              // from a single header whose coding list cannot frame a body
+              // ("chunkedchunked"), which llhttp accepts as a header and only
+              // then refuses to frame — the te-invalid path below, which node
+              // does observe once (test-http-transfer-encoding-repeated-chunked
+              // vs test-http-header-value-relaxed's duplicate-TE server).
+              // kLenientTransferEncoding (part of kLenientAll, i.e.
+              // insecureHTTPParser / httpValidation:'insecure' — NOT 'relaxed')
+              // accepts the duplicate instead.
+              if (sawTE && teChunked && !this.lenient) {
+                this._err("Parse Error: Invalid transfer encoding", "HPE_INVALID_TRANSFER_ENCODING");
+                return events + 1;
+              }
+              teChunked = this.lenient ? (teChunked || wellFormed) : wellFormed;
               sawTE = true;
             }
             if (this.maxHeaderPairs > 0 && this.rawHeaders.length >= this.maxHeaderPairs) continue;
@@ -2674,6 +2777,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
     this.remaining = 0; this.chunked = false; this.toEof = false;
     this.reqMethod = "GET";
     this.maxHeaderPairs = 0; this.maxHeaderSize = 0;
+    this.lenient = false;
     this.onHead = this.onBody = this.onDone = this.onError = this.onInterim = null;
     this._lastChunk = null; this._errMsg = null; this._errCode = null;
     this._afterDone = null; this.socket = null; this.outgoing = null;
