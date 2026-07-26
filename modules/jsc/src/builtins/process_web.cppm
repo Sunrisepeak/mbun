@@ -836,6 +836,18 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   const syncOpts = (o) => {
     const out = {};
     if (o != null) for (const k of Object.keys(o)) out[k] = o[k];
+    // node inherits process.env when `env` is unset, and process.env is a live
+    // view of the environment — so `process.env.X = 'v'` before a spawnSync IS
+    // visible to the child. mbun's process.env is a JS-side snapshot and the
+    // native spawn falls back to the C `environ`, so an assignment made after
+    // startup was silently dropped (test-worker-process-env sets SET_IN_WORKER
+    // and asserts the spawnSync'd child sees it). The async ChildProcess path
+    // already snapshots process.env for exactly this reason; this is its
+    // synchronous twin. An explicit `{}` still means an empty environment.
+    if (out.env == null || typeof out.env !== "object") {
+      const pe = G.process && G.process.env;
+      if (pe && typeof pe === "object") out.env = pe;
+    }
     if (o != null && o.timeout != null && o.timeout > 0) {
       out.timeoutMs = o.timeout;
       out.killSignalNum = mapSig(o.killSignal == null ? "SIGTERM" : o.killSignal);
