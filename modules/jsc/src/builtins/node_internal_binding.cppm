@@ -1330,16 +1330,22 @@ inline constexpr std::string_view kNodeInternalBindingJS = R"JS(
     // node's C++ FileHandle: an fd plus a close that is safe to call twice. The
     // lib-level `FileHandle` in internal/fs/promises.js wraps this one.
     class FileHandle {
-      constructor(fd) { this.fd = fd; this[Symbol.for("closed")] = false; }
+      // Keep the descriptor in an internal slot.  The public `fd` accessor is
+      // deliberately observable: node's fs/promises cleanup path reads it
+      // before an operation, while `close()` itself must still be able to
+      // release the descriptor when that accessor throws.
+      constructor(fd) { this._fd = fd; this[Symbol.for("closed")] = false; }
+      get fd() { return this._fd; }
+      set fd(fd) { this._fd = fd; }
       close() {
-        if (this.fd < 0) return Promise.resolve();
-        const fd = this.fd;
-        this.fd = -1;
+        if (this._fd < 0) return Promise.resolve();
+        const fd = this._fd;
+        this._fd = -1;
         return new Promise((resolve, reject) => {
           try { FDN().close(fd); resolve(); } catch (e) { reject(e); }
         });
       }
-      release() { this.fd = -1; }
+      release() { this._fd = -1; }
       // node emits this warning from C++ when a FileHandle is GC'd unclosed.
       onclose() {}
     }

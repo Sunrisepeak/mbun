@@ -7069,6 +7069,35 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     }
     [Symbol.asyncDispose]() { return this.close(); }
   }
+  // Path-based promise operations own a short-lived internal FileHandle in
+  // node.  Keeping that ownership here means an operation error never leaks a
+  // descriptor, and preserves node's AggregateError when both the operation
+  // and its cleanup fail (the exposed-internals fs tests instrument `fd`).
+  const fsWithTemporaryHandle = async (path, flags, mode, operation) => {
+    const binding = typeof G.__mbunInternalBinding === "function" ? G.__mbunInternalBinding("fs") : null;
+    const InternalFileHandle = binding && binding.FileHandle;
+    if (typeof InternalFileHandle !== "function") return operation(null);
+    let handle, result, operationError;
+    try {
+      handle = new InternalFileHandle(globalThis.__mbunFdNative.open(toStr(path), flags, mode));
+      result = await operation(handle.fd);
+    } catch (e) {
+      operationError = e;
+    }
+    let closeError;
+    if (handle) {
+      try { await handle.close(); }
+      catch (e) { closeError = e; }
+    }
+    if (operationError && closeError) {
+      const e = new AggregateError([operationError, closeError]);
+      e.code = operationError.code;
+      throw e;
+    }
+    if (operationError) throw operationError;
+    if (closeError) throw closeError;
+    return result;
+  };
   const fsPromises = {
     open: (p, flags, mode) => Promise.resolve().then(() => { validatePath(p); const md = mode == null ? 0o666 : fsParseFileMode(mode, "mode", 0o666); return new FileHandle(fdRemember(globalThis.__mbunFdNative.open(toStr(p), flags == null ? "r" : (typeof flags === "number" ? flags : toStr(flags)), md), p)); }),
     // node fs.promises.readFile: a FileHandle argument reads through the
@@ -7078,7 +7107,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       const signal = fsSignalOf(o);
       fsThrowIfAborted(signal);
       if (p && typeof p === "object" && typeof p.readFile === "function") return p.readFile(o);
-      return fsMod.readFileSync(p, o);
+      return fsWithTemporaryHandle(p, "r", 0o666, (fd) => new FileHandle(fd).readFile(o));
     }),
     writeFile: (p, d, o) => Promise.resolve().then(async () => {
       if (p && typeof p === "object" && typeof p.writeFile === "function") return p.writeFile(d, o);
@@ -7112,7 +7141,10 @@ inline constexpr char kBootstrapJS_[] = R"JS(
         } finally { FD.close(fd); }
         return;
       }
-      return fsMod.writeFileSync(path2, d, o);
+      const flag = (o && typeof o === "object" && o.flag) || "w";
+      const mode = o && typeof o === "object" && o.mode !== undefined
+        ? fsParseFileMode(o.mode, "mode", 0o666) : 0o666;
+      return fsWithTemporaryHandle(path2, flag, mode, (fd) => new FileHandle(fd).writeFile(d, o));
     }),
     appendFile: (p, d, o) => Promise.resolve().then(() => {
       fsValidateData(d); fsValidateEncoding(o);
@@ -7122,7 +7154,8 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     mkdir: P((p, o) => { validatePath(p); const [rec, mode] = mkdirOpts(o); return F.mkdir(toStr(p), rec, mode); }),
     rm: P((p, o) => rmImpl(p, o)),
     rmdir: P((p, o) => { validatePath(p); rmdirCheckOpts(o); rmdirImpl(p); }),
-    truncate: P((p, len) => fsMod.truncateSync(p, len)),
+    truncate: (p, len) => fsWithTemporaryHandle(p, "r+", 0o666,
+      (fd) => new FileHandle(fd).truncate(len)),
     statfs: P((p, o) => fsMod.statfsSync(p, o)),
     // Reuse the public sync path: it owns encoding, recursive traversal, and
     // Dirent conversion. Calling the raw native row here lost every option
