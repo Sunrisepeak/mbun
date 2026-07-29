@@ -61,6 +61,33 @@ whole-file failure at :111. `finished`/`finished-async-local-storage` and
 `readable-async-iterators` all fail **late** in long files (20+ subtests pass first)
 and are poor value per minute.
 
+### `test-stream-readable-compose.js` — isolated to a two-site handoff (not fixed)
+
+The failure is **not** "compose loses errors". Probed both shapes:
+```
+Readable.from([1,2,3]).compose(async function*(s){ for await (const c of s) { throw new Error('mid'); } })
+  -> toArray() REJECTS correctly
+Readable.from([1,2,3]).compose(async function*(s){ for await (const c of s) {} throw new Error('after'); })
+  -> escapes as an UNCAUGHT exception
+```
+So a throw **mid-stream** propagates; a throw **after the source drains** does not.
+
+Path: `compose` → `Duplex.from(fn)` → `duplexify`
+(`node_stream_writable.cppm:1041`) → `fromAsyncGen(body)` → `from(Duplexify, value, …)`
+= `internal/streams/from` (`node_stream_core.cppm:1345`).
+
+**`nextAsync` (`node_stream_core.cppm:1478`) looks CORRECT** — `await iterator.next()`
+inside `try`, `catch (err) { readable.destroy(err) }`. So the rejection is very likely
+escaping through **`fromAsyncGen`'s separate completion await** (the `final`/`write`
+pair destructured at `node_stream_writable.cppm:1041`), not through the readable's
+iteration loop. That is the next place to instrument.
+
+Deliberately not changed: `internal/streams/from` and `fromAsyncGen` sit under **236
+green `test-stream` files** plus http/fs/webstream consumers, and a speculative fix
+in an async-iterator error path is exactly the shape that regresses many files at
+once. Wants a lane that can guard `test-stream` + `test-http` + `test-webstream`
+cheaply.
+
 ### Two bun files re-examined and DE-PRIORITISED with reasons (wave 54)
 
 - **`internal/macos-cross-config.test.ts`** (18 pass / 1 fail). Its fix was lost as
