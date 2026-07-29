@@ -1161,10 +1161,8 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
   };
   function imOnError(self, error, cb) {
     if (typeof cb !== "function") return;
-    // Stream destroy owns error delivery. Suppressing the callback error when
-    // there is no stream listener makes a later socket failure replace the
-    // caller's original error at process-level uncaughtException.
-    cb(error);
+    if (self.listenerCount("error") === 0) cb();
+    else cb(error);
   }
   IncomingMessage.prototype._addHeaderLines = function _addHeaderLines(headers, n) {
     if (headers && headers.length) {
