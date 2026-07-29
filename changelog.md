@@ -25,21 +25,35 @@ Node 长尾使用 `make_worklists.py` 生成按 subsystem 隔离的 12-file 清�
 - WebSocket RSV/permessage-deflate 预计7、实际仅 **1/7 → 2/6**，实现
   60行且收益1，已 additive revert；重建后回到1/7，另外两目标保持。
 
-### Wave32–33 Node 12-file 长尾吞吐：25分钟新增13 green
+### Wave32–33 Node 长尾全量校正：HTTP 广泛回归已回退，稳定净增约12
 
 六条 subsystem 隔离 lane 各处理12个明确 Node fail，每文件诊断最多5分钟：
 
-- wave32：process **2/3**、HTTP **3/12**、child_process 稳定 **2/12**，
-  合计 **+7 green**；`execfile` 曾短暂 pass、最终复验回到 fail，不计；
+- wave32：process **2/3**、HTTP 定向3但其中2个引发跨文件回归后回退，
+  最终只保留 immediate-error **+1**；child_process 稳定 **2/12**；
+  `execfile` 曾短暂 pass、最终复验回到 fail，不计；
   Worker **0/12**，两个源码提交与静态预测文档全部 additive revert；
 - wave33：module **4/12**、FS **2/12**，合计 **+6 green**；
   HTTP/2 **0/12**，源码与预测文档全回退；FS write-buffer 单提交零收益
   也回退。
 
-两轮约25分钟合计 **+13 Node green = 31.2 green/hour**，比此前全局约
-24/hour 提升约30%，但仍远低于100%所需速度。保留项均由精确原生文件
-runner 验证；零收益复杂度不进入 checkpoint。当前定向推算 Node
-**2801/4433**，待本 PR checkpoint 全量确认。
+首次全量只得 **2761/4433**：14 fail→pass 同时出现41个 HTTP
+pass→fail。四个 HTTP lazy-parser/header-symbol/destroy-error 提交已全回退；
+398-file HTTP 子树从基线353 pass恢复为 **354 pass**，仅保留
+immediate-error +1。校正后两轮稳定推算约 **+12 Node green**；下一次
+全量确认前不再使用定向总和代替全局净值。
+
+### Wave34 24-file 扩容：实际仅5 green，恢复12-file高置信策略
+
+三 lane 各处理24个文件，静态预计18，实际：
+
+- crypto **3/24**：Argon2 unsupported、DEP0203、KeyObject no-own-symbols；
+- net/dgram **2/24**：send queue info、local address/port；
+- util/url **0/24**，全部源码回退。
+
+crypto Hash 零收益提交及 net 静态预测文档也回退。24-file 扩容只扩大
+静态误判，没有提高 green/minute；下一轮恢复12个高置信文件，并在全量前
+先跑完整相关子树。当前校正后定向推算 Node **2805/4433**。
 
 ### 5 小时冲刺第三十批：净减 61 个 Bun 失败，cron 新增全绿
 

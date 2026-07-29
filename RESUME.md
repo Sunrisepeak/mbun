@@ -40,12 +40,17 @@ is +622 pass / -619 fail.
 - Node long-tail wave 33: module +4 green, FS +2; HTTP/2 +0 and was fully
   reverted. A zero-yield FS write-buffer commit was also reverted.
 
-The two Node long-tail waves produced **13 complete green files in about 25
-minutes (31.2/hour)**. Keep this protocol, but treat static predictions as an
-upper bound: wave 32 predicted 14 and delivered 8; wave 33 predicted 15–16 and
-delivered 6. The next cut should give each lane 24 files while preserving the
-five-minute per-file stop rule, so diagnosis breadth rises without another
-build.
+The first full Node check invalidated the targeted total: it was 2761/4433,
+with 14 fail-to-pass but 41 pass-to-fail HTTP regressions. Reverting the four
+HTTP lazy-parser/header-symbol/destroy-error commits restored the complete
+398-file HTTP subset from baseline 353 pass to 354 pass. Stable wave-32/33
+projection is therefore about +12, pending the corrected full run.
+
+Wave 34 tried 24 files per lane. Crypto delivered 3/24, net/dgram 2/24, and
+util/url 0/24. All util code, the zero-yield crypto Hash commit, and the
+inaccurate net assessment doc were reverted. Do not repeat the 24-file cut: it
+increased static false positives without improving green/minute. Return to 12
+high-confidence files and run the complete related subtree before checkpoint.
 
 Session-scoped cron jobs are in-memory only (`durable` has no effect), so the
 hourly loop survives a usage limit — it simply skips the fires that land during
