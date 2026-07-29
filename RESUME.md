@@ -5,6 +5,68 @@ session that is interrupted (usage limit, crash, restart) can pick up from the
 file rather than from memory. **If you are a fresh session reading this, start
 here.**
 
+## 2026-07-30 14:10 — WAVE 56 lane B: `node:test` runner +6 (goal +6), 0 regressions
+
+Integrated as `3ab6763`. Integrator-verified against the **fresh** full baseline
+(`w56-full-node2`, not a lane-local one): `test-runner` **33 → 39 / 77**,
+`test-async` and `test-process` unchanged, REGRESSIONS empty on all three.
+
+**THE METHOD FINDING OF THIS WAVE, and it should change how every future lane
+works: node's full source is vendored at `compat/node/lib/`. Read it instead of
+inferring semantics.** The lane stopped guessing and started diffing against
+`compat/node/lib/internal/test_runner/*.js`, and that is what produced six
+root-caused defects instead of symptom patches:
+
+1. **`this` was unbound in test bodies and hooks.** node calls them via
+   `runInAsyncScope(fn, ctx, ctx)` — the context is *both* the argument and the
+   `this`. So `before(function () { this.name })` threw. Suite bodies already did
+   `fn.call(ctx, ctx)`; nothing else did.
+2. **Root `before()` never ran at registration time.** `createTestTree()` stamps
+   `globalRoot.startTime` immediately, so `createHook`'s "already started, run it
+   now" branch *always* fired for a top-level `before()` — the body ran
+   synchronously at the `before()` call rather than before the first test.
+3. **`isolation:'none'` ran each file's tests inside that file's own drain.** node
+   extends `harness.bootstrapPromise` with a deferred resolved only after the last
+   file is imported, so the whole tree is collected first and root `after()` spans
+   the entire run.
+4. **Only-filtering was entirely absent**, and the rule is genuinely non-obvious:
+   `isFilteringByOnly = (isolation === 'process' || NODE_TEST_CONTEXT) ? options.only : true`
+   — so `isolation:'none'` honours `{ only: true }` *without* `--test-only`. Not
+   findable by grep.
+5. **Suites were counted in `pass`/`fail`/`todo`/`skipped`** — `countCompletedTest()`
+   increments `suites` and returns. **Four independent copies** of the same
+   miscount (sync TAP writer, streaming tap reporter, spec reporter, parent-side
+   tracker), so every `# pass N` over a file using `describe()` was off by the
+   suite count.
+6. **`describe.todo`/`suite.skip` did not exist and `todo` was not inherited** —
+   `describe.todo(...)` was a `TypeError` that silently ate the last suite.
+
+Two campaign rules re-confirmed: my briefed cluster (`[11] error: <v>`) **was** the
+TAP/exit-code artifact I warned about and dissolved — but three of its members did
+share one real cause. And "one file, one blocker rarely holds" hit twice
+(`test-runner-exit-code.js` needed three unrelated fixes). Also worth copying: the
+lane's own 15-line repro had a **wrong expectation**, caught only because the repro
+disagreed with the corpus — so trust the corpus over the repro, not the reverse.
+
+**Best-shaped remaining vein here, with numbers: `test-runner-tag-filter-cli.mjs`,
+5 distinct defects for 2 files** — and the `only`-filtering fix above is the
+template (move tag filtering out of the parent's event stream into the child's test
+tree, and forward the flags to children). Rejected with numbers: `test-runner-xfail`
+(6+ defects, 1 file); the `Unexpected ]` parser bug (1 file, and **0 of 2982 logs**
+in the full run contain that error, so it is not a shared cause); string-to-regexp
+(needs a JSC engine message change, and the assertion runs through node's *real*
+vendored `utils.js` so mbun owns none of it); `test-runner-misc` (needs per-test
+timeout cancellation — a missing feature, not a fix); `test-runner-run.mjs` (the
+remaining blocker risks **duplicating the TAP trailer on every `--test` run**, i.e.
+trading a large green population for one file).
+
+**Bun baseline note:** the lane could not measure bun (corpus npm deps absent in its
+worktree, disk at 98%) and substituted 3 spot-checks. The integrator ran the real
+44-file `bun:test` guard from the main checkout — necessary, because two earlier
+`bun:test` changes cost 18 files. Result: 43 green + `test-failing.test.ts`, which
+the frozen pre-lane binary shows as **5 pass / 3 fail byte-identically**, i.e. the
+known w47 drift, not a regression.
+
 ## 2026-07-30 13:20 — GUARDRAIL BREACH: `mcpp test --workspace` had been failing for waves
 
 **Add `mcpp test --workspace` to the wave gate. It was not in it, and it caught a
