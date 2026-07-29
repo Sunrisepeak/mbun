@@ -483,6 +483,122 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
     return B ? B.from("mbun-vm-cache ") : new Uint8Array([1]);
   }
 
+  // ── dynamic import() inside a vm script ───────────────────────────────────
+  // node routes every `import()` evaluated inside a vm.Script through that
+  // script's own host-defined option, so the specifier reaches
+  // options.importModuleDynamically instead of the process module loader.
+  // V8 exposes that as a per-script slot; JSC's C API has no equivalent hook,
+  // so the CALL SITE is rewritten instead: a script whose source contains a
+  // dynamic import runs with `import(` replaced by an entry in a registry that
+  // carries this script's callback. Scripts without a dynamic import are left
+  // byte-for-byte alone, so ordinary vm code still runs as an untouched
+  // program (var/function declarations still land on the realm global).
+  //
+  // Built with RegExp() rather than a literal: the source text of a literal
+  // containing `import(` is itself a dynamic import to any tooling that lowers
+  // this file.
+  const DYNIMPORT_RE = new RegExp("\\bimport[ \\t\\n]*\\(", "g");
+  const DYN_REGISTRY = "__mbunVmDynamicImport";
+  const dynRegistry = { __proto__: null };
+  let dynNextId = 0;
+
+  const vmErr = (code, message) => {
+    const e = new TypeError(message);
+    e.code = code;
+    return e;
+  };
+
+  // The registry object is a plain non-enumerable global on whichever realm the
+  // rewritten code runs in. It is also registered as one of the realm's OWN
+  // globals so the contextify mirror treats it as a builtin and never copies it
+  // out onto the sandbox.
+  function installDynRegistry(rec) {
+    const target = rec === undefined ? G : rec.global;
+    if (gOPD(target, DYN_REGISTRY) === undefined) {
+      ObjectDefineProperty(target, DYN_REGISTRY, {
+        value: dynRegistry, writable: false, enumerable: false, configurable: true,
+      });
+    }
+    if (rec !== undefined) {
+      rec.nativeKeys.add(DYN_REGISTRY);
+      rec.nativeVals.set(DYN_REGISTRY, dynRegistry);
+    }
+  }
+
+  const hasVmModulesFlag = () => {
+    const argv = G.process && G.process.execArgv;
+    if (Array.isArray(argv)) {
+      for (const a of argv) if (a === "--experimental-vm-modules") return true;
+    }
+    return false;
+  };
+
+  // `import()` evaluated in the host realm, for
+  // vm.constants.USE_MAIN_CONTEXT_DEFAULT_LOADER. Compiled lazily out of split
+  // text for the same reason DYNIMPORT_RE is built from a string.
+  let mainRealmImport;
+  const defaultLoader = (specifier) => {
+    if (mainRealmImport === undefined) {
+      mainRealmImport = new Function("s", "return imp" + "ort(s);");
+    }
+    return mainRealmImport(specifier);
+  };
+
+  // node accepts a vm.Module from the callback and resolves the import with its
+  // namespace, evaluating it first if it has not run yet.
+  function moduleNamespaceOf(result) {
+    if (result !== null && (typeof result === "object" || typeof result === "function") &&
+        typeof result.evaluate === "function" && "namespace" in result) {
+      if (result.status === "evaluated") return result.namespace;
+      return Promise.resolve(result.evaluate()).then(() => result.namespace);
+    }
+    throw vmErr("ERR_VM_MODULE_NOT_MODULE", "Provided module is not an instance of Module");
+  }
+
+  function validateImportModuleDynamically(value) {
+    if (value === undefined) return undefined;
+    if (typeof value !== "function" && value !== USE_MAIN_CONTEXT_DEFAULT_LOADER) {
+      throw invArgType("options.importModuleDynamically", "of type function", value, "property");
+    }
+    return value;
+  }
+
+  function makeDynImportHandler(callback, getWrap) {
+    return async (specifier, importOptions) => {
+      const spec = `${specifier}`;
+      if (callback === undefined) {
+        throw vmErr("ERR_VM_DYNAMIC_IMPORT_CALLBACK_MISSING",
+                    "A dynamic import callback was not specified.");
+      }
+      if (callback === USE_MAIN_CONTEXT_DEFAULT_LOADER) return defaultLoader(spec);
+      // A user callback is only honoured under the flag, and node decides that
+      // BEFORE invoking it — the callback must not be observed to run.
+      if (!hasVmModulesFlag()) {
+        throw vmErr("ERR_VM_DYNAMIC_IMPORT_CALLBACK_MISSING_FLAG",
+                    "A dynamic import callback was invoked without --experimental-vm-modules");
+      }
+      const attributes = { __proto__: null };
+      const withClause = importOptions === null || typeof importOptions !== "object"
+        ? undefined : importOptions.with;
+      if (withClause !== null && typeof withClause === "object") {
+        for (const key of Object.keys(withClause)) attributes[key] = `${withClause[key]}`;
+      }
+      return moduleNamespaceOf(await callback(spec, getWrap(), attributes, "evaluation"));
+    };
+  }
+
+  // Returns the code to actually run, or null when the source has no dynamic
+  // import and must be left untouched.
+  function prepareDynImport(code, callback, getWrap) {
+    const src = `${code}`;
+    DYNIMPORT_RE.lastIndex = 0;
+    if (!DYNIMPORT_RE.test(src)) return null;
+    const id = dynNextId++;
+    DYNIMPORT_RE.lastIndex = 0;
+    dynRegistry[id] = makeDynImportHandler(callback, getWrap);
+    return src.replace(DYNIMPORT_RE, DYN_REGISTRY + "[" + id + "](");
+  }
+
   class Script {
     constructor(code, options) {
       this.__code = `${code}`;
@@ -504,6 +620,8 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
                          cachedData, "property");
       }
       if (produceCachedData !== undefined) validateBoolean(produceCachedData, "options.produceCachedData");
+      const importModuleDynamically =
+        validateImportModuleDynamically(options.importModuleDynamically);
 
       this.__filename = filename === undefined ? "evalmachine.<anonymous>" : `${filename}`;
       this.sourceMapURL = parseSourceMapURL(this.__code);
@@ -519,11 +637,14 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
       }
       // Surface syntax errors at construction time, like node does.
       NVM.checkSyntax(this.__code, this.__filename);
+      const rewritten = prepareDynImport(this.__code, importModuleDynamically, () => this);
+      this.__runCode = rewritten === null ? this.__code : rewritten;
     }
     runInThisContext(options) {
       validateRunOptions(options);
+      if (this.__runCode !== this.__code) installDynRegistry(undefined);
       try {
-        return NVM.runInThis(this.__code, this.__filename);
+        return NVM.runInThis(this.__runCode, this.__filename);
       } catch (err) {
         throw decorateVmError(err, this.__code, this.__filename,
                               options ? options.displayErrors : undefined);
@@ -532,8 +653,10 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
     runInContext(contextifiedObject, options) {
       validateContextified(contextifiedObject);
       validateRunOptions(options);
+      const rec = records.get(contextifiedObject);
+      if (this.__runCode !== this.__code) installDynRegistry(rec);
       try {
-        return evalInContext(records.get(contextifiedObject), this.__code, this.__filename);
+        return evalInContext(rec, this.__runCode, this.__filename);
       } catch (err) {
         throw decorateVmError(err, this.__code, this.__filename,
                               options ? options.displayErrors : undefined);
@@ -572,19 +695,28 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
 
   function compileFunction(code, params, options) {
     options = options || {};
+    const importModuleDynamically =
+      validateImportModuleDynamically(options.importModuleDynamically);
     const args = Array.isArray(params) ? params.slice() : [];
-    args.push(`${code}`);
     const pc = options.parsingContext;
     let FunctionCtor;
+    let rec;
     if (pc !== undefined && pc !== null) {
       if (!isContextInternal(pc)) throw argTypeError("options.parsingContext", "an vm.Context");
-      const rec = records.get(pc);
+      rec = records.get(pc);
       syncIn(rec);
       FunctionCtor = NVM.runInContext(rec.handle, "Function", undefined, true);
     } else {
       FunctionCtor = Function;
     }
-    return Reflect.apply(FunctionCtor, undefined, args);
+    // The compiled function is what node hands the callback as the referrer,
+    // and it does not exist until after the body has been compiled.
+    let compiled;
+    const rewritten = prepareDynImport(code, importModuleDynamically, () => compiled);
+    if (rewritten !== null) installDynRegistry(rec);
+    args.push(rewritten === null ? `${code}` : rewritten);
+    compiled = Reflect.apply(FunctionCtor, undefined, args);
+    return compiled;
   }
 
   // node's vm.measureMemory resolves V8's per-context memory report. JSC has no
