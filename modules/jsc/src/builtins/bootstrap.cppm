@@ -1952,9 +1952,9 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       return (this[kCapture] ? emitWithRejectionCapture : emitWithoutRejectionCapture).apply(this, arguments);
     };
 
-    function overflowWarning(emitter, type, handlers) {
+    function overflowWarning(emitter, type, handlers, maxListeners) {
       handlers.warned = true;
-      const warn = new Error(`Possible EventEmitter memory leak detected. ${handlers.length} ${String(type)} listeners added to [${emitter.constructor.name}]. Use emitter.setMaxListeners() to increase limit`);
+      const warn = new Error(`Possible EventEmitter memory leak detected. ${handlers.length} ${String(type)} listeners added to [${emitter.constructor.name}]. MaxListeners is ${maxListeners}. Use emitter.setMaxListeners() to increase limit`);
       warn.name = "MaxListenersExceededWarning"; warn.emitter = emitter; warn.type = type; warn.count = handlers.length;
       // This is a process warning, not a console diagnostic. Routing through
       // emitWarning preserves the warning event's next-tick timing and exposes
@@ -1970,7 +1970,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       else {
         if (prepend) handlers.unshift(fn); else handlers.push(fn);
         const m = self._maxListeners ?? defaultMaxListeners;
-        if (m > 0 && handlers.length > m && !handlers.warned) overflowWarning(self, type, handlers);
+        if (m > 0 && handlers.length > m && !handlers.warned) overflowWarning(self, type, handlers, m);
       }
       return self;
     }
