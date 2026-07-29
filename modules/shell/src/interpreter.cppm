@@ -17,6 +17,7 @@
 module;
 
 #include <cerrno>
+#include <cstring>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -138,7 +139,12 @@ public:
 
 namespace detail {
 
-inline void write_all(int fd, std::string_view data) {
+// Returns false when the destination refused some of the bytes (errno is the
+// failing write's). A builtin whose whole job is to emit output has FAILED when
+// that happens — `echo a > /dev/full` is a 1, not a 0 (Builtin.zig routes an
+// IOWriter error to the builtin's exit code) — so the result is reported, not
+// swallowed. Callers writing diagnostics to stderr ignore it, as bun does.
+inline bool write_all(int fd, std::string_view data) {
     std::size_t off{0};
     while (off < data.size()) {
         const ssize_t n = ::write(fd, data.data() + off, data.size() - off);
@@ -146,10 +152,24 @@ inline void write_all(int fd, std::string_view data) {
             if (n < 0 && errno == EINTR) {
                 continue;
             }
-            break;
+            return false;
         }
         off += static_cast<std::size_t>(n);
     }
+    return true;
+}
+
+// A builtin's stdout write failed: report it the way bun's shell does and hand
+// back the exit status the caller must return. `||` in a sequential list keys
+// off exactly this status.
+inline int report_write_error(std::string_view builtin) {
+    const int saved{errno};
+    std::string message{builtin};
+    message += ": write error: ";
+    message += std::strerror(saved);
+    message += '\n';
+    write_all(STDERR_FILENO, message);
+    return 1;
 }
 
 // Open flags for a file redirect action.
@@ -907,7 +927,7 @@ private:
             }
         }
         if (!ends_nl && !no_newline) out.push_back('\n');
-        detail::write_all(STDOUT_FILENO, out);
+        if (!detail::write_all(STDOUT_FILENO, out)) return detail::report_write_error("echo");
         return 0;
     }
 
