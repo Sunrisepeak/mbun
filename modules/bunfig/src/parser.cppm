@@ -223,7 +223,8 @@ private:
     // string | array<string> -> flat vector (used by ca, external, excludes...).
     static std::vector<std::string> parse_string_or_array_(const toml::Value& v,
                                                             std::string_view key,
-                                                            std::string_view err) {
+                                                            std::string_view err,
+                                                            std::string_view item_err = {}) {
         std::vector<std::string> out;
         if (v.is_string()) {
             out.push_back(v.as_string());
@@ -231,7 +232,11 @@ private:
             for (std::size_t i{0}; i < v.size(); ++i) {
                 const toml::Value& item{v.at(i)};
                 if (!item.is_string()) {
-                    fail(std::string{key}, std::string{err});
+                    // bun reports the wrong *shape* ("must be a string or array of
+                    // strings") differently from a correctly shaped array carrying a
+                    // non-string element ("array must contain only strings").
+                    fail(std::string{key},
+                         std::string{item_err.empty() ? err : item_err});
                 }
                 out.push_back(item.as_string());
             }
@@ -401,12 +406,14 @@ private:
         if (const toml::Value* v{test->get("coveragePathIgnorePatterns")}) {
             t.coverage.ignore_patterns =
                 parse_string_or_array_(*v, "test.coveragePathIgnorePatterns",
-                                       "coveragePathIgnorePatterns must be a string or array of strings");
+                                       "coveragePathIgnorePatterns must be a string or array of strings",
+                                       "coveragePathIgnorePatterns array must contain only strings");
         }
         if (const toml::Value* v{test->get("pathIgnorePatterns")}) {
             t.path_ignore_patterns =
                 parse_string_or_array_(*v, "test.pathIgnorePatterns",
-                                       "pathIgnorePatterns must be a string or array of strings");
+                                       "pathIgnorePatterns must be a string or array of strings",
+                                       "pathIgnorePatterns array must contain only strings");
         }
     }
 
