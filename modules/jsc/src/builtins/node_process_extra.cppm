@@ -763,8 +763,28 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
       const tracedStack = (warning) => {
         const head = (warning.name || "Error") +
                      (warning.message ? ": " + warning.message : "");
+        const lines = String(warning.stack).split("\n");
+        // A warning built by createWarning() below already carries a V8-shaped
+        // stack (Error.captureStackTrace re-renders the frames and prepends
+        // "Name: message"), so it must be passed through rather than parsed as
+        // JSC "fn@loc" — otherwise every line would gain a second "at ".
+        // Recognised by: a head line with no '@' followed only by "at " frames.
+        if (lines.length > 1 && lines[0].indexOf("@") < 0 &&
+            lines.slice(1).every((l) => !l.trim() || l.trim().startsWith("at "))) {
+          const kept = [];
+          for (const raw of lines.slice(1)) {
+            const line = raw.trim();
+            if (!line) continue;
+            const body = line.slice(3);
+            // mbun's CallSite renders a frame with no function name as the bare
+            // location; V8 names the top-level program frame Object.<anonymous>,
+            // which is the shape the corpus greps for (test-worker-execargv).
+            kept.push("    at " + (body.indexOf("(") < 0 ? "Object.<anonymous> (" + body + ")" : body));
+          }
+          return kept.length ? head + "\n" + kept.join("\n") : head;
+        }
         const frames = [];
-        for (const raw of String(warning.stack).split("\n")) {
+        for (const raw of lines) {
           const line = raw.trim();
           if (!line) continue;
           // Last '@': a function name cannot hold one, a file:// URL can.
@@ -834,6 +854,12 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
         e.name = String(type || "Warning");
         if (code !== undefined) e.code = code;
         if (detail !== undefined) e.detail = detail;
+        // node warning.js: ErrorCaptureStackTrace(warning, ctor || emitWarning).
+        // Without it the stack is JSC's raw one, which (a) opens with the
+        // createWarning/emitWarning plumbing frames node deliberately hides and
+        // (b) carries no "Name: message" head, so `assert.match(w.stack, /msg/)`
+        // — the corpus's usual way of inspecting a warning — cannot match.
+        try { Error.captureStackTrace(e, ctor || proc.emitWarning); } catch (err) {}
         return e;
       };
       proc.emitWarning = function emitWarning(warning, type, code, ctor) {
