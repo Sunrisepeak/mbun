@@ -1858,12 +1858,13 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     const kResistStopPropagation = Symbol.for("nodejs.event_target.resist_stop_propagation");
     let defaultMaxListeners = 10;
 
-    const checkListener = (l) => { if (typeof l !== "function") throw new TypeError("The listener must be a function"); };
     // Node's NodeError bakes the code into toString(): "TypeError [ERR_x]: msg".
     // assert.throws(fn, /ERR_x/) matches on String(err), so it must appear there.
     const addCodeToName = (e, code) => { const base = e.name; Object.defineProperty(e, "toString", { value() { return `${base} [${code}]${this.message ? ": " + this.message : ""}`; }, configurable: true, writable: true }); return e; };
     const ERR_INVALID_ARG_TYPE = (name, type, value) => { const e = new TypeError(`The "${name}" argument must be of type ${type}. Received ${value}`); e.code = "ERR_INVALID_ARG_TYPE"; return addCodeToName(e, "ERR_INVALID_ARG_TYPE"); };
     const ERR_OUT_OF_RANGE = (name, range, value) => { const e = new RangeError(`The "${name}" argument is out of range. It must be ${range}. Received ${value}`); e.code = "ERR_OUT_OF_RANGE"; return addCodeToName(e, "ERR_OUT_OF_RANGE"); };
+    const ERR_UNHANDLED_ERROR = (rendered, context) => { const e = new Error(`Unhandled error. (${rendered})`); e.code = "ERR_UNHANDLED_ERROR"; e.context = context; return addCodeToName(e, "ERR_UNHANDLED_ERROR"); };
+    const checkListener = (l) => { if (typeof l !== "function") throw ERR_INVALID_ARG_TYPE("listener", "function", l); };
     const validateNumber = (value, name, min, max) => { if (typeof value !== "number") throw ERR_INVALID_ARG_TYPE(name, "number", value); if ((min != null && value < min) || (max != null && value > max) || ((min != null || max != null) && Number.isNaN(value))) throw ERR_OUT_OF_RANGE(name, `${min != null ? ">= " + min : ""}${min != null && max != null ? " && " : ""}${max != null ? "<= " + max : ""}`, value); };
     const validateInteger = (value, name, min) => { if (typeof value !== "number" || !Number.isInteger(value)) throw ERR_INVALID_ARG_TYPE(name, "integer", value); if (min != null && value < min) throw ERR_OUT_OF_RANGE(name, ">= " + min, value); };
     const validateObject = (value, name) => { if (value === null || typeof value !== "object") throw ERR_INVALID_ARG_TYPE(name, "Object", value); };
@@ -1912,7 +1913,16 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       // an "Unhandled error." Error instead, which node:domain then reported as
       // the thrown value (test-domain-multiple-errors / -error-types emit every
       // primitive and assert identity).
-      const unhandled = () => args[0] ?? new Error("Unhandled error.");
+      const unhandled = () => {
+        const err = args[0];
+        if (err instanceof Error) return err;
+        // Node includes a util.inspect() rendering in ERR_UNHANDLED_ERROR, but
+        // inspection itself is user code and can throw. In that case its
+        // string coercion fallback still gives callers useful context.
+        let rendered;
+        try { rendered = util.inspect(err); } catch (e) { rendered = err; }
+        return ERR_UNHANDLED_ERROR(rendered, err);
+      };
       if (!events) throw unhandled();
       const errorMonitor = events[kErrorMonitor];
       if (typeof errorMonitor === "function") errorMonitor.apply(emitter, args);
@@ -2153,7 +2163,13 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     function setMaxListeners(n = defaultMaxListeners, ...eventTargets) {
       validateNumber(n, "setMaxListeners", 0);
       if (eventTargets.length === 0) { defaultMaxListeners = n; return; }
-      for (let i = 0; i < eventTargets.length; i++) { const t = eventTargets[i]; if (typeof t.setMaxListeners === "function") t.setMaxListeners(n); else t[kMaxEventTargetListeners] = n; }
+      for (let i = 0; i < eventTargets.length; i++) {
+        const t = eventTargets[i];
+        if (t && typeof t.addEventListener === "function" && typeof t.removeEventListener === "function")
+          t[kMaxEventTargetListeners] = n;
+        else if (typeof t?.setMaxListeners === "function") t.setMaxListeners(n);
+        else throw ERR_INVALID_ARG_TYPE("eventTargets", "EventEmitter or EventTarget", t);
+      }
     }
     function listenerCount(emitter, type) {
       if (typeof emitter.listenerCount === "function") return emitter.listenerCount(type);
