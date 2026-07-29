@@ -298,7 +298,25 @@ export constexpr std::string_view kDnsJS = R"JS(
   // strings) plus its timeout/tries are threaded to the native record transport;
   // absent/empty means /etc/resolv.conf + the transport defaults, which is what
   // the module-level dns.resolve* uses. ref: runtime/dns.inc dnsn_resolve_cb.
-  const rawResolve = (host, type, callback, servers, timeout, tries) => {
+  const rawResolve = (host, type, callback, servers, timeout, tries, channel) => {
+    const CW = cares();
+    const query = "query" + type[0] + type.slice(1).toLowerCase();
+    const handle = channel || (typeof CW.ChannelWrap === "function"
+      ? new CW.ChannelWrap(timeout, tries) : null);
+    // resolve* goes through ChannelWrap in node, so a synchronous c-ares
+    // failure remains observable to callback and promise callers alike.
+    if (handle && typeof handle[query] === "function") {
+      const req = typeof CW.QueryReqWrap === "function" ? new CW.QueryReqWrap() : {};
+      let done = false;
+      req.oncomplete = (err, rows) => {
+        if (done) return;
+        done = true;
+        callback(err ? { error: uvName(err) } : rows);
+      };
+      const err = handle[query](req, String(host));
+      if (err) soon(() => req.oncomplete(err));
+      return;
+    }
     if (DN && DN.resolve) DN.resolve(String(host), TYPE_CODES[type] | 0, callback,
                                      servers && servers.length ? servers : undefined,
                                      typeof timeout === "number" ? timeout : undefined,
@@ -541,7 +559,7 @@ export constexpr std::string_view kDnsJS = R"JS(
     rawResolve(host, type, (r) => {
       if (r && r.error) reject(nodeError(r.error, rr, host));
       else resolve(r);
-    }, servers, res && res._timeout, res && res._tries);
+    }, servers, res && res._timeout, res && res._tries, res && res._handle);
   });
 
   const promiseReverse = (ip) => new Promise((resolve, reject) => {
