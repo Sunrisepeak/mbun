@@ -486,7 +486,16 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
       }
       // Bridge into a node KeyObject via the WebCrypto raw export, when reachable.
       const bridge = G.__mbunCryptoKeyToKeyObject;
-      if (typeof bridge === "function") { const r = bridge(key); if (r) return mkKO(r.kind, r.material, r.passphrase || ""); }
+      if (typeof bridge === "function") {
+        const r = bridge(key);
+        if (r) {
+          if (!r.extractable && G.process && typeof G.process.emitWarning === "function") {
+            G.process.emitWarning("Passing a non-extractable CryptoKey to KeyObject.from() is deprecated.",
+                                  "DeprecationWarning", "DEP0204");
+          }
+          return mkKO(r.kind, r.material, r.passphrase || "");
+        }
+      }
       throw new TypeError("Converting this CryptoKey to a KeyObject is not supported yet in mbun");
     }
   }

@@ -744,6 +744,12 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       const self = Reflect.construct(streamTransform(), [], Hash);
       self._algo = algo; self._fn = hashFns[NORM(algo)];
       self._out = opts && typeof opts.outputLength === "number" ? opts.outputLength : -1;  // -1 = native default (XOF); 0 = explicit empty
+      if (NORM(algo).startsWith("shake") && self._out < 0 && G.process &&
+          typeof G.process.emitWarning === "function") {
+        G.process.emitWarning(
+          "Creating SHAKE128/256 digests without an explicit options.outputLength is deprecated.",
+          "DeprecationWarning", "DEP0198");
+      }
       self._chunks = []; self._done = false;
       return self;
     }
