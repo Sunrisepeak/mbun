@@ -5107,6 +5107,10 @@ inline constexpr char kBootstrapJS_[] = R"JS(
         mkdir: (p, o, cb) => { try { fsMod.mkdirSync(p, o); cb(null); } catch (e) { cb(e); } },
       }, options.fs || {});
       this._fd = -1; this._file = null; this._buf = ""; this._writing = false;
+      // A write may still be in flight when flush() or end() is called. Keep
+      // their completion work here instead of dropping it on the floor: the
+      // final write owns the one transition to drain/finish/close.
+      this._drainCallbacks = []; this._drainEventPending = false;
       this._ending = false; this._destroyed = false; this._opening = false;
       this._minLength = options.minLength || 0; this._maxLength = options.maxLength || 0;
       this._maxWrite = options.maxWrite || 16384; this._sync = options.sync === true;
@@ -5177,32 +5181,68 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     _writeSync() {
       const text = this._buf.slice(0, this._maxWrite);
       const n = this._fs.writeSync(this._fd, text, "utf8");
-      this._buf = this._buf.slice(Math.max(0, n));
+      this._buf = this._remainingAfterBytes(text, n);
       this.emit("write", n);
+      return n;
+    }
+    // fs.write reports bytes while the public Utf8Stream API accepts strings.
+    // Rounding a partial count DOWN to a complete code point avoids queuing a
+    // lone surrogate when a mock (or a short write) stops inside UTF-8 text.
+    _remainingAfterBytes(text, written) {
+      let bytes = 0, index = 0;
+      const limit = Math.max(0, Number(written) || 0);
+      while (index < text.length) {
+        const cp = text.codePointAt(index);
+        const width = cp > 0xffff ? 2 : 1;
+        const count = Buffer.byteLength(text.slice(index, index + width));
+        if (bytes + count > limit) break;
+        bytes += count; index += width;
+      }
+      return text.slice(index);
     }
     _drain(cb) {
+      if (cb) this._drainCallbacks.push(cb); else this._drainEventPending = true;
       if (this._writing || this._fd < 0) return;
-      if (!this._buf.length) { if (cb) cb(); else this.emit("drain"); return; }
+      if (!this._buf.length) { this._completeDrain(); return; }
       this._writing = true;
       if (this._sync) {
-        try { while (this._buf.length) this._writeSync(); if (this._fsync) this._fs.fsyncSync(this._fd); this._writing = false; if (cb) G.queueMicrotask(() => cb()); else G.queueMicrotask(() => this.emit("drain")); }
-        catch (e) { this._writing = false; this.emit("error", e); if (cb) cb(e); }
+        try {
+          while (this._buf.length) {
+            if (this._writeSync() === 0) throw new Error("Utf8Stream write returned zero bytes");
+          }
+          if (this._fsync) this._fs.fsyncSync(this._fd);
+          this._completeDrain();
+        } catch (e) { this._completeDrain(e); }
         return;
       }
       const text = this._buf.slice(0, this._maxWrite);
       this._fs.write(this._fd, text, "utf8", (err, n) => {
-        if (err) { this._writing = false; this.emit("error", err); if (cb) cb(err); return; }
-        this._buf = this._buf.slice(Math.max(0, n || text.length)); this.emit("write", n || text.length);
-        this._writing = false;
-        if (this._buf.length) { this._drain(cb); return; }
-        if (this._fsync) this._fs.fsync(this._fd, (e) => { if (e) this.emit("error", e); if (cb) cb(e); else this.emit("drain"); });
-        else if (cb) cb(); else this.emit("drain");
+        if (err) { this._completeDrain(err); return; }
+        const written = n == null ? text.length : n;
+        this._buf = this._remainingAfterBytes(text, written); this.emit("write", written);
+        if (this._buf.length) { this._writing = false; this._drain(); return; }
+        if (this._fsync) this._fs.fsync(this._fd, (e) => this._completeDrain(e));
+        else this._completeDrain();
+      });
+    }
+    _completeDrain(err) {
+      this._writing = false;
+      const callbacks = this._drainCallbacks.splice(0);
+      const emitDrain = this._drainEventPending;
+      this._drainEventPending = false;
+      G.queueMicrotask(() => {
+        if (this._destroyed) return;
+        if (err) this.emit("error", err);
+        if (!err && emitDrain) this.emit("drain");
+        for (const cb of callbacks) cb(err);
       });
     }
     _close(finish) {
       if (this._destroyed) return;
       this._destroyed = true; if (this._timer !== null) G.clearInterval(this._timer);
-      const done = (err) => { if (err) this.emit("error", err); if (finish) this.emit("finish"); this.emit("close"); };
+      const done = (err) => G.queueMicrotask(() => {
+        if (err) this.emit("error", err); if (finish) this.emit("finish"); this.emit("close");
+      });
       if (this._fd >= 0 && this._fd !== 1 && this._fd !== 2) this._fs.close(this._fd, done); else done();
     }
   }
