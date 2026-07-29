@@ -87,6 +87,17 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     });
   }
 
+  // Node only enables Argon2 when its OpenSSL exposes that provider. This build
+  // has no node:crypto Argon2 backend, so retain Node's feature-gated error
+  // rather than leaking a missing-function TypeError.
+  if (typeof C.argon2 !== "function") {
+    C.argon2 = () => {
+      const e = new Error("Argon2 is not supported by this OpenSSL build");
+      e.code = "ERR_CRYPTO_ARGON2_NOT_SUPPORTED";
+      throw e;
+    };
+  }
+
   const isView = (v) => ArrayBuffer.isView(v);
   const toBuf = (v, enc) => {
     if (v == null) return Buffer.alloc(0);
