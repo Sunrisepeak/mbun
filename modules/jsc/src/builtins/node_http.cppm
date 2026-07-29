@@ -1571,6 +1571,7 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
       ? url.hostname.slice(1, -1) : url.hostname;
     const options = {
       __proto__: null,
+      ...url,
       protocol: url.protocol,
       hostname,
       hash: url.hash,

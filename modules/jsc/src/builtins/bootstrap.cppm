@@ -3425,6 +3425,8 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       throw e;
     }
     const o = {
+      __proto__: null,
+      ...u,
       protocol: u.protocol,
       hostname: typeof u.hostname === "string" && u.hostname[0] === "[" ? u.hostname.slice(1, -1) : u.hostname,
       hash: u.hash, search: u.search, pathname: u.pathname,
