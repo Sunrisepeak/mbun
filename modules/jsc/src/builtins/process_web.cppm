@@ -960,7 +960,9 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   }
 
   const collectExec = (child, options, cb, cmd) => {
-    const enc = options.encoding === undefined ? "utf8" : options.encoding;
+    const enc = Object.prototype.hasOwnProperty.call(options, "encoding")
+      ? options.encoding
+      : "utf8";
     // exec() installs a decoder on the exposed child streams, not merely on its
     // callback result.  This makes `child.stderr.on("data")` observe strings
     // for a valid encoding.  Invalid encoding labels intentionally select the
