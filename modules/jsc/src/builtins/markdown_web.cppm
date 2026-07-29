@@ -2111,7 +2111,28 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       // synchronous native that has to honour a signal (Bun.spawnSync) cannot
       // run the timer that would fire this signal, so it reads the deadline
       // directly and applies it as its own timeout instead.
-      static timeout(ms) { const s = new AbortSignal(); Object.defineProperty(s, "__mbunAbortAt", { value: Date.now() + (Number(ms) || 0), enumerable: false, configurable: true, writable: true }); if (G.setTimeout) G.setTimeout(() => { s.aborted = true; s.reason = new G.DOMException("The operation was aborted due to timeout", "TimeoutError"); s._fire(); }, ms); return s; }
+      static timeout(ms) {
+        const s = new AbortSignal();
+        Object.defineProperty(s, "__mbunAbortAt", {
+          value: Date.now() + (Number(ms) || 0),
+          enumerable: false, configurable: true, writable: true,
+        });
+        if (G.setTimeout) {
+          // Node's timeout signal is not retained by its timer: otherwise an
+          // otherwise-unreachable signal cannot be collected, and a long
+          // timeout keeps an unrelated process alive.
+          const signalRef = new G.WeakRef(s);
+          const timer = G.setTimeout(() => {
+            const signal = signalRef.deref();
+            if (!signal || signal.aborted) return;
+            signal.aborted = true;
+            signal.reason = new G.DOMException("The operation was aborted due to timeout", "TimeoutError");
+            signal._fire();
+          }, ms);
+          if (timer && typeof timer.unref === "function") timer.unref();
+        }
+        return s;
+      }
       static any(signals) { const s = new AbortSignal(); for (const sig of signals) { if (sig.aborted) { s.aborted = true; s.reason = sig.reason; return s; } sig.addEventListener("abort", () => { if (!s.aborted) { s.aborted = true; s.reason = sig.reason; s._fire(); } }); } return s; }
       // WebCore AbortSignal::memoryCost() includes m_algorithms.sizeInBytes();
       // mbun's algorithm list is `_l` (std::pair<uint32_t, Function> ≈ 16 bytes
