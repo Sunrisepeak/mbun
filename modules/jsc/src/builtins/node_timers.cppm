@@ -367,9 +367,12 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
     // promisify hooks (node attaches these to the timer functions themselves).
     const custom = Symbol.for("nodejs.util.promisify.custom");
     try {
-      Object.defineProperty(mySetTimeout, custom, { value: (after, value) => tpSetTimeout(after, value), configurable: true });
-      Object.defineProperty(mySetImmediate, custom, { value: (value) => tpSetImmediate(value), configurable: true });
-      Object.defineProperty(mySetInterval, custom, { value: (after, value) => tpSetInterval(after, value), configurable: true });
+      // Node's custom hooks are the timers/promises functions themselves, not
+      // forwarding lambdas. Their identity is observable through promisify(),
+      // and tpSetInterval's async-iterator result must survive unchanged.
+      Object.defineProperty(mySetTimeout, custom, { value: tpSetTimeout, configurable: true });
+      Object.defineProperty(mySetImmediate, custom, { value: tpSetImmediate, configurable: true });
+      Object.defineProperty(mySetInterval, custom, { value: tpSetInterval, configurable: true });
     } catch (_) {}
 
     // Install wrappers globally and re-register node:timers in place.
