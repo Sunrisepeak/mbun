@@ -509,9 +509,11 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
       return o;
     }
     const C = cryptoMod();
-    if (C && typeof C.KeyObject === "function" && v instanceof C.KeyObject && v._kind !== undefined) {
+    const keySlot = C && typeof C.__mbunKeyObjectTransferData === "function"
+      ? C.__mbunKeyObjectTransferData(v) : null;
+    if (keySlot) {
       const o = {};
-      o[KEY_TOK] = { w: 0, kind: v._kind, m: encMaterial(v._km), p: v._pass };
+      o[KEY_TOK] = { w: 0, kind: keySlot.kind, m: encMaterial(keySlot.material), p: keySlot.passphrase };
       return o;
     }
     return undefined;
