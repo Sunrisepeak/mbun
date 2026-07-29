@@ -412,9 +412,83 @@ inline constexpr std::string_view kNodeModuleJS = R"JS(
       FAILED: 0, ENABLED: 1, ALREADY_ENABLED: 2, DISABLED: 3,
     }),
   });
-  Module.getCompileCacheDir = () => undefined;
-  Module.enableCompileCache = (cacheDir) => ({ status: Module.constants.compileCacheStatus.DISABLED });
+
+  // The native module loader owns serialized bytecode.  Keep the public
+  // compile-cache configuration here, however, so CommonJS and ESM callers
+  // agree on one directory and on Node's enable/disable result contract.
+  // Loader-side cache production/consumption is intentionally separate from
+  // this API layer (see the DEFERRED note at the top of this payload).
+  let compileCacheDirectory;
+  const compileCacheStatus = Module.constants.compileCacheStatus;
+
+  function compileCacheFs() {
+    return M["node:fs"] || M["fs"];
+  }
+
+  function compileCacheDefaultDirectory() {
+    const env = G.process && G.process.env;
+    if (env && env.NODE_COMPILE_CACHE) return env.NODE_COMPILE_CACHE;
+    const os = M["node:os"] || M["os"];
+    const path = getPath();
+    const tmp = os && typeof os.tmpdir === "function" ? os.tmpdir() : "/tmp";
+    return path && typeof path.join === "function" ? path.join(tmp, "node-compile-cache") : tmp + "/node-compile-cache";
+  }
+
+  function invalidCompileCacheOptions(options) {
+    return invalidArgType("options", "string or Object or undefined", options);
+  }
+
+  function enableCompileCache(options) {
+    const env = G.process && G.process.env;
+    if (env && env.NODE_DISABLE_COMPILE_CACHE === "1") {
+      return { status: compileCacheStatus.DISABLED };
+    }
+    if (compileCacheDirectory !== undefined) {
+      return { status: compileCacheStatus.ALREADY_ENABLED, directory: compileCacheDirectory };
+    }
+
+    let directory;
+    let portable;
+    if (options === undefined || typeof options === "string") {
+      directory = options;
+    } else if (options !== null && typeof options === "object") {
+      ({ directory, portable } = options);
+      if (portable !== undefined && typeof portable !== "boolean") {
+        throw invalidArgType("options.portable", "boolean", portable);
+      }
+    } else {
+      throw invalidCompileCacheOptions(options);
+    }
+    if (directory === undefined) directory = compileCacheDefaultDirectory();
+    if (typeof directory !== "string") {
+      throw invalidArgType("options.directory", "string", directory);
+    }
+
+    try {
+      const fs = compileCacheFs();
+      if (!fs || typeof fs.mkdirSync !== "function") {
+        return { status: compileCacheStatus.FAILED, message: "The file system module is unavailable" };
+      }
+      fs.mkdirSync(directory, { recursive: true });
+      compileCacheDirectory = directory;
+      return { status: compileCacheStatus.ENABLED, directory };
+    } catch (error) {
+      return {
+        status: compileCacheStatus.FAILED,
+        message: error && error.message ? String(error.message) : String(error),
+      };
+    }
+  }
+
+  Module.getCompileCacheDir = () => compileCacheDirectory;
+  Module.enableCompileCache = enableCompileCache;
   Module.flushCompileCache = () => {};
+
+  // NODE_COMPILE_CACHE enables the cache during process initialization, before
+  // user preloads can call getCompileCacheDir().
+  if (G.process && G.process.env && G.process.env.NODE_COMPILE_CACHE) {
+    enableCompileCache(G.process.env.NODE_COMPILE_CACHE);
+  }
 
   // ESM loader hooks — accepted but a no-op (native loader integration DEFERRED).
   Module.register = (specifier, parentURL, options) => {};
