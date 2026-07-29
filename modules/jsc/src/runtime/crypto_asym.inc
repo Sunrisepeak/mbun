@@ -1155,7 +1155,15 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_okp_derive_host,
     PkeyPtr peer{asym_load_pkey(pub, std::nullopt)};
     if (!me || !peer) { return hasher_throw(global, "deriveBits: invalid key material"); }
     const int mine{EVP_PKEY_base_id(me.get())};
-    if (mine != EVP_PKEY_X25519 && mine != EVP_PKEY_X448) {
+    // Everything below this point is a generic EVP_PKEY_derive over two DER
+    // blobs, so the accepted set is exactly "algorithms OpenSSL can key-agree".
+    // It was originally narrowed to the OKP curves because that was the only
+    // caller; finite-field DH and EC agree through the identical code path, and
+    // excluding them made `crypto.diffieHellman` look provider-absent when the
+    // primitive was already here. Keep PQC out: ML-KEM is encapsulation, not
+    // agreement, and does not go through EVP_PKEY_derive.
+    if (mine != EVP_PKEY_X25519 && mine != EVP_PKEY_X448 && mine != EVP_PKEY_DH &&
+        mine != EVP_PKEY_EC) {
         return hasher_throw(global, "deriveBits: not a key-agreement key");
     }
     if (mine != EVP_PKEY_base_id(peer.get())) {
