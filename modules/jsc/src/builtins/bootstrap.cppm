@@ -3072,6 +3072,25 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     catch (e) { try { e.input = url; } catch (e2) {} throw e; }
     return u;
   };
+  // DEP0169 is an application deprecation only. Internal packages under
+  // node_modules retain the legacy parser without injecting warnings into their
+  // host application; process.emitWarning supplies node's next-tick delivery.
+  let urlParseDeprecationWarned = false;
+  const urlParsePublic = (url, parseQueryString, slashesDenoteHost) => {
+    if (!urlParseDeprecationWarned) {
+      const stack = String(new Error().stack || "");
+      if (!/(?:^|[/\\])node_modules(?:[/\\]|$)/.test(stack)) {
+        urlParseDeprecationWarned = true;
+        if (G.process && typeof G.process.emitWarning === "function") {
+          G.process.emitWarning(
+            "`url.parse()` behavior is not standardized and prone to errors that have security implications. " +
+            "Use the WHATWG URL API instead. CVEs are not issued for url.parse() vulnerabilities.",
+            "DeprecationWarning", "DEP0169");
+        }
+      }
+    }
+    return urlParse(url, parseQueryString, slashesDenoteHost);
+  };
   let urlWarnInvalidPort = true;
   const urlGetHostname = (self, rest, hostname, url) => {
     for (let i = 0; i < hostname.length; ++i) {
@@ -3484,7 +3503,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       if (encPath[0] !== "/") encPath = "/" + encPath;
       return new G.URL("file://" + encPath);
     },
-    parse: urlParse,
+    parse: urlParsePublic,
     format: urlFormat,
     resolve: (source, relative) => urlParse(source, false, true).resolve(relative),
     resolveObject: (source, relative) => (source ? urlParse(source, false, true).resolveObject(relative) : relative),
