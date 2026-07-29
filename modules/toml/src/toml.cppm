@@ -222,6 +222,8 @@ bool is_value_delim(char c) {
            c == '#';
 }
 
+constexpr std::int64_t MAX_SAFE_INTEGER{(std::int64_t{1} << 53) - 1};
+
 class Parser {
 public:
     explicit Parser(std::string_view s) : s_{s} {}
@@ -614,8 +616,14 @@ private:
             }
             std::int64_t value{0};
             auto res{std::from_chars(digits.data(), digits.data() + digits.size(), value, base)};
+            if (res.ec == std::errc::result_out_of_range) {
+                fail(off, "Integer is outside the 64-bit signed range");
+            }
             if (res.ec != std::errc{} || res.ptr != digits.data() + digits.size()) {
                 fail(off, "Syntax Error: invalid integer");
+            }
+            if (value > MAX_SAFE_INTEGER) {
+                fail(off, "Integer cannot be losslessly represented as a JavaScript number; it must be within +/-(2^53 - 1)");
             }
             return Value::integer(value);
         }
@@ -644,8 +652,14 @@ private:
             ++begin;  // std::from_chars rejects a leading '+'
         }
         auto res{std::from_chars(begin, cleaned.data() + cleaned.size(), value)};
+        if (res.ec == std::errc::result_out_of_range) {
+            fail(off, "Integer is outside the 64-bit signed range");
+        }
         if (res.ec != std::errc{} || res.ptr != cleaned.data() + cleaned.size()) {
             fail(off, "Syntax Error: invalid integer");
+        }
+        if (value > MAX_SAFE_INTEGER || value < -MAX_SAFE_INTEGER) {
+            fail(off, "Integer cannot be losslessly represented as a JavaScript number; it must be within +/-(2^53 - 1)");
         }
         return Value::integer(value);
     }

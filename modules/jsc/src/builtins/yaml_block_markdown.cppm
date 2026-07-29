@@ -1339,6 +1339,7 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
     // serializer only needs the public JS shape, so keeping it here avoids a
     // second C-API object walk and shares the normal JS GC lifetime rules.
     if (Bun.TOML && typeof Bun.TOML.stringify === "undefined") {
+      const tomlNativeParse = Bun.TOML.parse;
       const TOML_SKIP = Symbol("toml.skip");
       const tomlUSV = (input) => {
         const s = String(input);
@@ -1366,6 +1367,34 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
         if (c === "\r") return "\\r";
         return "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0");
       }) + "\"";
+      const tomlParse = (input) => {
+        if (input === undefined || input === null) throw new TypeError("Expected a string to parse");
+
+        let bytes = null;
+        if (typeof Blob !== "undefined" && input instanceof Blob) input = input._u8;
+        if (typeof ArrayBuffer !== "undefined" && input instanceof ArrayBuffer) bytes = new Uint8Array(input);
+        else if (typeof SharedArrayBuffer !== "undefined" && input instanceof SharedArrayBuffer) bytes = new Uint8Array(input);
+        else if (typeof ArrayBuffer !== "undefined" && ArrayBuffer.isView(input)) {
+          bytes = new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
+        }
+
+        if (bytes !== null) {
+          try {
+            // TextDecoder both rejects malformed byte input and consumes a UTF-8
+            // BOM, matching Bun's text-format source boundary.
+            return tomlNativeParse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+          } catch (error) {
+            if (error instanceof TypeError) {
+              throw new SyntaxError("TOML Parse error: Invalid UTF-8 byte sequence");
+            }
+            throw error;
+          }
+        }
+
+        let text = tomlUSV(input);
+        if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+        return tomlNativeParse(text);
+      };
       const tomlBareKey = (key) => /^[A-Za-z0-9_-]+$/.test(key);
       const tomlKey = (key) => tomlBareKey(key) ? key : tomlQuote(key);
       const tomlPlainObject = (value) => value !== null && typeof value === "object" && Object.getPrototypeOf(value) === Object.prototype;
@@ -1450,6 +1479,7 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
         };
         return renderTable(input, [], "");
       };
+      Bun.TOML.parse = tomlParse;
       Bun.TOML.stringify = tomlStringify;
     }
 
