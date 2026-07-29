@@ -109,6 +109,18 @@ directories as the next frozen comparison:
 `target/integration/codex-sprint2-wave27-full-node` and
 `target/integration/codex-sprint2-wave27-full-bun`.
 
+### Sprint wave 28 measured checkpoint (15:25–15:32)
+
+One build reduced another **63 Bun failures in 7 minutes** (~540/hour):
+
+- REPL byte stdin forwarding: 19/98 -> 69/48, -50 failures;
+- TOML parse input and safe-integer boundaries: 58/25 -> 71/12, -13.
+
+Both files remain red and add zero complete-file greens. Stop funding their
+dispersed tails. Wave 29 is assigned to JSON5's remaining 62, WPT Streams'
+remaining 92, and bundler DCE's 53; each lane must find a homogeneous >=20
+cluster or stop within ten minutes.
+
 ### Sprint wave 1 measured checkpoint (10:55–11:15)
 
 One combined build after three static implementation lanes produced 29 newly

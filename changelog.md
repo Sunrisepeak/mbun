@@ -5,6 +5,21 @@
 
 ## 2026-07-29
 
+### 5 小时冲刺第二十八批：7 分钟净减 63 个 Bun 失败，540 fail/hour
+
+15:25–15:32 在 wave27 全量冻结后验收两个同源剩余簇：
+
+- REPL 的统一根因是 `Bun.spawn({ stdin: Buffer })` 未把字节 stdin 转发给
+  child，所有非 PTY 交互只收到 greeting 后 EOF；改走 async pipe writer 后
+  **19/98 → 69/48**，净减 50（静态预计约 64，命中 78%）；
+- TOML.parse 统一 Blob/ArrayBuffer/view/字符串输入边界，补 fatal UTF-8、
+  BOM、USV 与安全整数范围诊断，**58/25 → 71/12**，净减 13
+  （静态预计 12）。
+
+一次精确构建后两文件合计净减 **63 fail**，约 **540 fail/hour**。两文件
+仍红，不计新增 green file；剩余 REPL/TOML 已进入分散尾部，wave29 转向
+JSON5 62、WPT Streams 92、bundler DCE 53 三个更大失败池。
+
 ### 5 小时冲刺第二十七批：18 分钟净减 438 个 Bun 失败断言，1 文件全绿
 
 14:57–15:15 按全量 checkpoint 的失败断言排序，三条静态实现 lane、主线统一
