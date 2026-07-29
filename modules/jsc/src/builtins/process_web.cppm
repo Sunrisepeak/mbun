@@ -142,7 +142,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     if (t === "object") return "an instance of " + ((v.constructor && v.constructor.name) || "Object");
     return "type " + t + " (" + String(v) + ")";
   };
-  const makeIpc = (fd, advanced) => { PROC.setNonBlock(fd); return { fd, buf: "", out: [], queued: 0, closed: false, refd: true, rxFds: [], sent: [], adv: !!advanced }; };
+  const makeIpc = (fd, advanced) => { PROC.setNonBlock(fd); return { fd, buf: Buffer.alloc(0), out: [], queued: 0, pendingAfterHandle: 0, closed: false, refd: true, rxFds: [], sent: [], adv: !!advanced }; };
   // ---- 'advanced' (structured-clone) serialization ------------------------
   // node's `serialization: 'advanced'` swaps JSON for the v8 value serializer,
   // so a message may be cyclic, a Map/Set, a BigInt or a Buffer
@@ -186,16 +186,21 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       }
       if (w === 0) return;  // EAGAIN — retry next tick
       item.off += w; ch.queued -= w;
-      if (item.off >= item.data.length) { ch.out.shift(); if (item.cb) { const cb = item.cb; nextTick(() => cb(null)); } }
+      if (item.off >= item.data.length) { ch.out.shift(); if (item.cb) { const cb = item.cb; nextTick(() => { ch.pendingAfterHandle = 0; cb(null); }); } }
       else return;
     }
   };
   const ipcWrite = (ch, message, cb, sendFd) => {
     const data = te.encode((ch.adv ? advEncode(message) : JSON.stringify(message === undefined ? null : message)) + "\n");
+    // A sent handle remains unacknowledged until the peer processes its
+    // NODE_HANDLE frame. Node reports queue pressure for messages stacked
+    // behind that handle even when the kernel socket buffer still accepts them.
+    const followsHandle = sendFd < 0 && ch.sent.length > 0;
+    if (followsHandle) ch.pendingAfterHandle++;
     ch.out.push({ data, off: 0, cb: cb || null, fd: typeof sendFd === "number" ? sendFd : -1 });
     ch.queued += data.length;
     ipcFlush(ch);
-    return ch.queued < IPC_HIGH_WATER;
+    return ch.queued < IPC_HIGH_WATER && (!followsHandle || ch.pendingAfterHandle < 2);
   };
   // ---- node's NODE_HANDLE protocol ----------------------------------------
   // A message sent with a `handle` argument travels as
@@ -287,11 +292,14 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
         if (b === null) { if (delivered) { ch.deferEof = true; return; } onEof(); return; }
       }
       if (b === "") return;
-      ch.buf += Buffer.from(_unb64(b)).toString("utf8");
+      // A readNB chunk is not a Unicode boundary. Keep bytes until a complete
+      // newline-delimited frame is available so an UTF-8 sequence split across
+      // two reads is decoded once, rather than becoming two replacement chars.
+      ch.buf = Buffer.concat([ch.buf, Buffer.from(_unb64(b))]);
       let idx;
-      while ((idx = ch.buf.indexOf("\n")) >= 0) {
-        const line = ch.buf.slice(0, idx);
-        ch.buf = ch.buf.slice(idx + 1);
+      while ((idx = ch.buf.indexOf(0x0A)) >= 0) {
+        const line = ch.buf.subarray(0, idx).toString("utf8");
+        ch.buf = ch.buf.subarray(idx + 1);
         if (!line) continue;
         let msg;
         try { msg = ch.adv ? advDecode(line) : JSON.parse(line); } catch (e) { continue; }
