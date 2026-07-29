@@ -5,6 +5,21 @@
 
 ## 2026-07-29
 
+### 5 小时冲刺第二十五批：6 分钟净增 3 文件，30 files/hour
+
+14:38–14:44 组合 execFile result/promisify、options/env 与 IPC stdio
+validation，静态预计 6，严格结算 **+3**：
+
+- promisified exec/execFile 暴露 `.child` 并保留 error stdout/stderr，
+  promisified 目标 **+1**；execFile 在主集成补 DEP0190 只发一次后仍因
+  child exit code 独立问题红，不计；
+- ChildProcess.spawn 在 file 前验证 envPairs 与多 IPC，constructor/stdio
+  两文件 **2/2**；
+- options/env prototype 两文件仍红，对应提交 additive revert。
+
+四文件精确保留集为 3 pass / 1 既有 fail，均为 frozen 3 fail→pass，
+green→non-green 0；结构守卫全绿。
+
 ### 5 小时冲刺第二十四批：16 分钟净增 3 文件，11.25 files/hour
 
 14:22–14:38 先止损 TLS/TextDecoder 零收益候选，再集中验收

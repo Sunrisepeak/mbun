@@ -297,6 +297,22 @@ Guards: HTTP client 63/68 pass; module 11 pass, 18 fail, 3 skip; require 13
 pass, 9 fail, 1 skip; abort 1/7 pass; readline 10 pass, 3 fail, 8 skip. Every
 guard has zero green-to-non-green regressions.
 
+### Sprint wave 25 measured checkpoint (14:38–14:44)
+
+ExecFile result/promisify contracts, option/env normalization, and IPC stdio
+validation forecast six files and delivered **+3 in 6 minutes = 30 files/hour**:
+
+- promisified exec/execFile exposes `.child` and retains error stdout/stderr:
+  +1. Integration limited DEP0190 to one warning, but execFile still fails on an
+  independent child exit-code gap and is not counted;
+- envPairs precedence plus multiple-IPC rejection: +2/2;
+- both options/env prototype targets remained red, so that candidate was
+  additively reverted.
+
+The exact retained four-file gate is 3 pass / 1 retained failure, all three
+greens are frozen fail-to-pass, with zero green-to-non-green regressions.
+Structural guards are clean.
+
 ### Sprint wave 24 measured checkpoint (14:22–14:38)
 
 After rejecting zero-yield TLS/TextDecoder candidates, exec encoding and
