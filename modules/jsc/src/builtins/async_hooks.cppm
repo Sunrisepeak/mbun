@@ -318,7 +318,14 @@ inline constexpr std::string_view kAsyncHooksJS = R"JS(
     }
     bind(fn, thisArg) {
       validateFunction(fn);
-      return this.runInAsyncScope.bind(this, fn, thisArg ?? this);
+      const bound = this.runInAsyncScope.bind(this, fn, thisArg ?? this);
+      // node restores the *wrapped* function's arity and exposes the owning
+      // resource (lib/async_hooks.js AsyncResource#bind). The descriptors are
+      // null-prototype so a polluted `Object.prototype.get` cannot turn them
+      // into "both accessors and a value".
+      Object.defineProperty(bound, "length", { __proto__: null, value: fn.length, configurable: true });
+      Object.defineProperty(bound, "asyncResource", { __proto__: null, value: this, configurable: true, enumerable: true });
+      return bound;
     }
     static bind(fn, type, thisArg) {
       validateFunction(fn);

@@ -124,6 +124,15 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
   // and .resource. Re-wrapping it would erase both and report a network error
   // for something the sandbox refused.
   const isAccessDenied = (e) => !!(e && e.code === "ERR_ACCESS_DENIED");
+  // node publishes a "net" performance timeline entry named "connect" once an
+  // outbound socket is up (lib/net.js startPerf/stopPerf). perf_hooks installs
+  // the sink and itself no-ops unless a PerformanceObserver is subscribed to
+  // "net", so an unobserved connect costs one property load.
+  const _perfNetMark = (sock) => { if (G.__mbunPerfNetEntry && G.performance) sock.__perfNetStart = G.performance.now(); };
+  const _perfNetConnect = (sock, host, port) => {
+    const h = G.__mbunPerfNetEntry;
+    if (h) h("connect", sock.__perfNetStart, { host, port });
+  };
   const connectError = (nativeError, host, port) => {
     if (isAccessDenied(nativeError)) {
       // node internal/errors.js ExceptionWithHostPort, permission branch:
@@ -751,6 +760,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
           // remains true until the connect event is published.
           self.pending = true;
           self.connecting = true;
+          _perfNetMark(self);
           const finishConnect = () => {
             if (self._httpClientConnectPending) {
               self._httpClientConnectPending = false;
@@ -758,7 +768,9 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
               return;
             }
             if (self.destroyed) { self.connecting = false; return; }
-            self.pending = false; self.connecting = false; self._flushPreConnect(null); self._applyDeferredSockOpts(); self.emit("connect"); self.emit("ready");
+            self.pending = false; self.connecting = false; self._flushPreConnect(null); self._applyDeferredSockOpts();
+            _perfNetConnect(self, addr, port);
+            self.emit("connect"); self.emit("ready");
           };
           G.queueMicrotask(finishConnect);
           return self;
@@ -835,6 +847,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       // cancel the pending 'connect' rather than resurrect the socket.
       this.pending = true;
       this.connecting = true;
+      _perfNetMark(this);
       const finishConnect = () => {
         if (this._httpClientConnectPending) {
           this._httpClientConnectPending = false;
@@ -842,7 +855,9 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
           return;
         }
         if (this.destroyed) { this.connecting = false; return; }
-        this.pending = false; this.connecting = false; this._flushPreConnect(null); this._applyDeferredSockOpts(); this.emit("connect"); this.emit("ready");
+        this.pending = false; this.connecting = false; this._flushPreConnect(null); this._applyDeferredSockOpts();
+        _perfNetConnect(this, unixPath || host, unixPath ? undefined : port);
+        this.emit("connect"); this.emit("ready");
       };
       G.queueMicrotask(finishConnect);
       return this;
