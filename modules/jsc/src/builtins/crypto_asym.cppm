@@ -392,6 +392,142 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     return Buffer.from(AN.jwkImport(parts, !!isPrivate));
   };
 
+  // ---- raw-public / raw-private / raw-seed ----
+  // node 24's raw key encodings: the bare public point (or Edwards/Montgomery
+  // public value), the bare private scalar/seed, and — for the PQC families —
+  // the generation seed. There is no PEM/DER container, so the only key types
+  // that can be expressed are EC and the OKP curves; RSA/DSA/DH have no such
+  // canonical short form and node rejects them with
+  // ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS rather than inventing one.
+  // ref: node lib/internal/crypto/keys.js (parseKeyFormat / kRawPublic etc.).
+  const RAW_FORMATS = { "raw-public": 1, "raw-private": 1, "raw-seed": 1 };
+  // The OKP curve names JWK uses, keyed by node's asymmetricKeyType spelling.
+  const OKP_JWK_CRV = { ed25519: "Ed25519", x25519: "X25519", ed448: "Ed448", x448: "X448" };
+  // Key types with a raw form in this build. The PQC families (ml-dsa/ml-kem/
+  // slh-dsa) also have one in node, but they need an OpenSSL >= 3.5 provider
+  // that is absent here, so they never become loadable keys in the first place.
+  const RAW_KEY_TYPES = { ec: 1, ed25519: 1, x25519: 1, ed448: 1, x448: 1 };
+  // Every asymmetric type this build can name. Anything else — including the PQC
+  // types, on an OpenSSL without them — is an unknown asymmetricKeyType.
+  const RAW_ASYM_TYPES = { rsa: 1, "rsa-pss": 1, dsa: 1, dh: 1, ec: 1, ed25519: 1, x25519: 1, ed448: 1, x448: 1 };
+  // node accepts both the NIST and the OpenSSL spelling of a curve; the native
+  // helpers only know the OpenSSL one.
+  const EC_NIST_ALIAS = { "P-256": "prime256v1", "P-384": "secp384r1", "P-521": "secp521r1" };
+  const rawIncompat = (fmt) => {
+    const e = new Error("The selected key format " + fmt + " is not supported for this key type.");
+    e.code = "ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS"; return e;
+  };
+  const rawInvalidCurve = (name) => {
+    const e = new TypeError("Invalid EC curve name: " + name);
+    e.code = "ERR_CRYPTO_INVALID_CURVE"; return e;
+  };
+  const rawInvalidValue = (msg) => {
+    const e = new TypeError(msg); e.code = "ERR_INVALID_ARG_VALUE"; return e;
+  };
+  // `jwk` is the key's JWK view (undefined when the type has no raw form — it is
+  // only computed once the type is known to be expressible, because a DSA key
+  // cannot be serialized as JWK at all).
+  const rawExport = (kind, keyType, osslCurve, jwk, options) => {
+    const fmt = options.format;
+    // A raw private encoding is not a container, so it cannot carry encryption.
+    if (fmt !== "raw-public" && options.passphrase != null) {
+      const e = new Error("The selected key encoding " + fmt + " does not support encryption.");
+      e.code = "ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS"; throw e;
+    }
+    if (!RAW_KEY_TYPES[keyType]) throw rawIncompat(fmt);
+    // Seeds exist only for the PQC families, which this build cannot load.
+    if (fmt === "raw-seed") throw rawIncompat(fmt);
+    if (fmt === "raw-private") {
+      if (kind !== "private") throw rawIncompat(fmt);
+      return Buffer.from(b64uDecode(jwk.d));
+    }
+    if (keyType === "ec") {
+      // node defaults the point encoding to uncompressed. `hybrid` is a real SEC1
+      // form but node does not offer it for raw-public.
+      const t = options.type === undefined ? "uncompressed" : options.type;
+      if (t !== "compressed" && t !== "uncompressed") {
+        throw rawInvalidValue("The property 'options.type' is invalid. Received " +
+          (typeof t === "string" ? "'" + t + "'" : String(t)));
+      }
+      const unc = Buffer.concat([Buffer.from([4]), Buffer.from(b64uDecode(jwk.x)), Buffer.from(b64uDecode(jwk.y))]);
+      if (t === "compressed") return Buffer.from(AN.ecdhConvertKey(osslCurve, unc, true));
+      return unc;
+    }
+    // OKP: the JWK `x` member is already the raw public value.
+    return Buffer.from(b64uDecode(jwk.x));
+  };
+  // Build key material (DER) from raw bytes. `kind` is the container the caller
+  // asked for, which is what makes raw-public-into-createPrivateKey a bad option
+  // value rather than a decode failure.
+  const rawImport = (kind, opts) => {
+    const fmt = opts.format;
+    const type = opts.asymmetricKeyType;
+    if (typeof type !== "string") {
+      const e = new TypeError('The "asymmetricKeyType" argument must be of type string. Received ' +
+        (type === null ? "null" : typeof type));
+      e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+    }
+    if (!RAW_ASYM_TYPES[type]) throw rawInvalidValue("Invalid asymmetricKeyType: '" + type + "'");
+    // Checked before the type's raw support: a public encoding can never yield a
+    // private key, whatever the type is.
+    if (kind === "private" && fmt === "raw-public") {
+      throw rawInvalidValue("The property 'options.format' is invalid. Received 'raw-public'");
+    }
+    if (!RAW_KEY_TYPES[type]) throw rawIncompat(fmt);
+    if (fmt === "raw-seed") throw rawIncompat(fmt);
+    // Raw input is bytes: node does not decode a string here even when an
+    // `encoding` is supplied, because the raw forms are not textual.
+    const key = opts.key;
+    if (!ArrayBuffer.isView(key) && !(key instanceof ArrayBuffer)) {
+      const e = new TypeError('The "key" argument must be an instance of ArrayBuffer, Buffer, TypedArray, or DataView. Received ' +
+        argRecv(key));
+      e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+    }
+    const bytes = Buffer.from(toBuf(key));
+    const toJwkDer = (parts, isPrivate, label) => {
+      try { return Buffer.from(AN.jwkImport(parts, !!isPrivate)); }
+      catch (e) { throw rawInvalidValue("Invalid raw key data for " + label); }
+    };
+    if (type === "ec") {
+      const nc = opts.namedCurve;
+      if (typeof nc !== "string") {
+        const e = new TypeError('The "namedCurve" argument must be of type string. Received ' +
+          (nc === null ? "null" : typeof nc));
+        e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+      }
+      const osslCurve = EC_NIST_ALIAS[nc] || nc;
+      let valid = false;
+      try { valid = !!AN.ecValidCurve(osslCurve); } catch (e) { valid = false; }
+      if (!valid) throw rawInvalidCurve(nc);
+      const jwkCrv = JWK_EC_CURVES[osslCurve];
+      if (!jwkCrv) throw rawInvalidCurve(nc);
+      if (fmt === "raw-public") {
+        // Round-tripping the point through the native converter is what rejects a
+        // truncated point, a point of the wrong curve's width, and a well-formed
+        // prefix whose coordinates are not on the curve.
+        let unc;
+        try { unc = Buffer.from(AN.ecdhConvertKey(osslCurve, bytes, false)); }
+        catch (e) { throw rawInvalidValue("Invalid raw-public key data for curve " + nc); }
+        const half = (unc.length - 1) / 2;
+        return toJwkDer({ kty: "EC", crv: jwkCrv, x: unc.subarray(1, 1 + half), y: unc.subarray(1 + half) },
+                        false, nc);
+      }
+      // raw-private is a fixed-width scalar. Deriving the point also tells us the
+      // curve's field width, and the width check is what stops a P-256 scalar from
+      // being silently accepted as a (numerically smaller) P-384 one.
+      let unc;
+      try { unc = Buffer.from(AN.ecdhPublicFromPrivate(osslCurve, bytes)); }
+      catch (e) { throw rawInvalidValue("Invalid raw-private key data for curve " + nc); }
+      const half = (unc.length - 1) / 2;
+      if (bytes.length !== half) throw rawInvalidValue("Invalid raw-private key data for curve " + nc);
+      return toJwkDer({ kty: "EC", crv: jwkCrv, x: unc.subarray(1, 1 + half), y: unc.subarray(1 + half), d: bytes },
+                      true, nc);
+    }
+    const crv = OKP_JWK_CRV[type];
+    const parts = fmt === "raw-public" ? { kty: "OKP", crv, x: bytes } : { kty: "OKP", crv, d: bytes };
+    return toJwkDer(parts, fmt !== "raw-public", type);
+  };
+
   // ---- KeyObject / createPublicKey / createPrivateKey ----
   // node's KeyObject constructor is internal: user code cannot mint one from raw
   // material (it takes a native handle). We reproduce that with a private brand —
@@ -464,6 +600,11 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
       const slot = koOf(this);
       // Secret keys: options are optional and default to a Buffer copy.
       if (slot.kind === "secret") {
+        // A symmetric key has no public/private/seed half, so a raw format is a
+        // bad option value rather than an unsupported key type.
+        if (options != null && typeof options === "object" && RAW_FORMATS[options.format]) {
+          throw rawInvalidValue("The property 'options.format' is invalid. Received '" + options.format + "'");
+        }
         if (options != null && typeof options === "object" && options.format === "jwk") {
           return { kty: "oct", k: Buffer.from(toBuf(slot.material)).toString("base64url") };
         }
@@ -474,6 +615,18 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
         const e = new TypeError('The "options" argument must be of type object. Received ' +
           (options === null ? "null" : typeof options));
         e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+      }
+      // The raw formats are not containers either: resolve the key's type first,
+      // because a type with no raw form (RSA/DSA/DH) must be reported as such and
+      // never reaches the JWK encoder — DSA has no JWK representation at all.
+      if (RAW_FORMATS[options.format]) {
+        const isPublic = slot.kind === "public";
+        let keyType, osslCurve, jwk;
+        try { const info = AN.keyType(slot.material, slot.passphrase, isPublic);
+              keyType = info.type; osslCurve = info.namedCurve; }
+        catch (e) { throw asymParseError(this, e, isPublic); }
+        if (RAW_KEY_TYPES[keyType]) jwk = jwkFromKey(slot.material, slot.passphrase, isPublic);
+        return rawExport(slot.kind, keyType, osslCurve, jwk, options);
       }
       // format:"jwk" is NOT a PEM/DER encoding — it returns a plain JWK object and
       // cannot carry encryption (cipher/passphrase).
@@ -616,6 +769,17 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   });
   const makeKeyObject = (kind, key) => {
     if (isKO(key)) return key;
+    // { key: <bytes>, format: "raw-*", asymmetricKeyType, namedCurve } — rebuild
+    // real key material from the bare point/scalar before the normal pipeline.
+    if (key != null && typeof key === "object" && RAW_FORMATS[key.format]) {
+      const der = rawImport(kind, key);
+      // A raw PRIVATE encoding handed to createPublicKey yields the public half,
+      // exactly as passing a private KeyObject would.
+      if (kind === "public" && key.format !== "raw-public") {
+        return mkKO("public", Buffer.from(AN.keyExport(der, "", true, "spki", "der", "", "")), "");
+      }
+      return mkKO(kind, der, "");
+    }
     // { key: <JWK object>, format: "jwk" } → materialize as DER up front so the
     // rest of the pipeline sees ordinary key material (node keys.js).
     if (key != null && typeof key === "object" && key.format === "jwk" && key.key != null) {
@@ -803,6 +967,36 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     options = options || {};
     const penc = options.publicKeyEncoding || {};
     const senc = options.privateKeyEncoding || {};
+    // A raw encoding has no container for the generator to emit, so generate the
+    // pair as key objects and let the raw encoder do the work. Validation of the
+    // encoding pair happens first, so a bad combination throws before keygen.
+    const pubRawEnc = options.publicKeyEncoding && RAW_FORMATS[penc.format] ? penc : null;
+    const privRawEnc = options.privateKeyEncoding && RAW_FORMATS[senc.format] ? senc : null;
+    if (pubRawEnc || privRawEnc) {
+      // Only the public half can be emitted as raw-public, and only the private
+      // half as raw-private/raw-seed.
+      if (pubRawEnc && pubRawEnc.format !== "raw-public") {
+        throw rawInvalidValue("The property 'options.publicKeyEncoding.format' is invalid. Received '" +
+          pubRawEnc.format + "'");
+      }
+      if (privRawEnc && privRawEnc.format === "raw-public") {
+        throw rawInvalidValue("The property 'options.privateKeyEncoding.format' is invalid. Received 'raw-public'");
+      }
+      if (privRawEnc && (privRawEnc.cipher != null || privRawEnc.passphrase != null)) {
+        const e = new Error("The selected key encoding " + privRawEnc.format + " does not support encryption.");
+        e.code = "ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS"; throw e;
+      }
+      if (!RAW_KEY_TYPES[type]) throw rawIncompat(pubRawEnc ? pubRawEnc.format : privRawEnc.format);
+      if (privRawEnc && privRawEnc.format === "raw-seed") throw rawIncompat("raw-seed");
+      const pair = genKeyPair(type, Object.assign({}, options, {
+        publicKeyEncoding: pubRawEnc ? undefined : options.publicKeyEncoding,
+        privateKeyEncoding: privRawEnc ? undefined : options.privateKeyEncoding,
+      }));
+      return {
+        publicKey: pubRawEnc ? pair.publicKey.export(pubRawEnc) : pair.publicKey,
+        privateKey: privRawEnc ? pair.privateKey.export(privRawEnc) : pair.privateKey,
+      };
+    }
     const wantPubObj = !options.publicKeyEncoding;
     const wantPrivObj = !options.privateKeyEncoding;
     // format:"jwk" is not a PEM/DER encoding: node emits a plain JWK object and
