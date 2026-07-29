@@ -1635,6 +1635,41 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
     // own setNoDelay/setKeepAlive see them as already applied.
     _onconnection(err, clientHandle) {
       if (err || !clientHandle || typeof clientHandle.fd !== "number" || clientHandle.fd < 0) return;
+      // Node decides admission while it still owns the accepted handle: a
+      // blocked peer or a full server must never reach the `connection`
+      // listener, but the peer still observes the accepted socket closing and
+      // the server reports the peer metadata through `drop`.
+      let remoteAddress = "";
+      let remotePort = 0;
+      let remoteFamily = "IPv4";
+      try {
+        const peer = NN.peername ? NN.peername(clientHandle.fd) : null;
+        if (typeof peer === "string") {
+          const colon = peer.lastIndexOf(":");
+          remoteAddress = peer.slice(0, colon);
+          remotePort = +peer.slice(colon + 1);
+        }
+      } catch (e) {}
+      const blockList = this._opts.blockList;
+      const blocked = !!(blockList && remoteAddress &&
+        typeof blockList.check === "function" && blockList.check(remoteAddress, "ipv4"));
+      const full = this.maxConnections != null && this._conns.size >= this.maxConnections;
+      if (blocked || full) {
+        const local = this._addr || {};
+        try {
+          if (typeof clientHandle.close === "function") clientHandle.close();
+          else NN.close(clientHandle.fd);
+        } catch (e) {}
+        this.emit("drop", {
+          localAddress: local.address,
+          localPort: local.port,
+          localFamily: local.family,
+          remoteAddress,
+          remotePort,
+          remoteFamily,
+        });
+        return;
+      }
       const sock = new Socket({ allowHalfOpen: !!this._opts.allowHalfOpen, highWaterMark: this._opts.highWaterMark });
       sock._handle = clientHandle; clientHandle.owner = sock;
       sock._adopt(clientHandle.fd);
