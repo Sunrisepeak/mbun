@@ -55,6 +55,25 @@ crypto Hash 零收益提交及 net 静态预测文档也回退。24-file 扩容�
 静态误判，没有提高 green/minute；下一轮恢复12个高置信文件，并在全量前
 先跑完整相关子树。当前校正后定向推算 Node **2805/4433**。
 
+校正树完整 Node 全量已确认 **2805/4433（63.27%）**，相对 PR 起点
+2654 为 **+151**。18个 fail→pass 与1个 TLS socket timeout；后者同二进制
+持续 timeout，定位到 net preconnect flush 改动后恢复 baseline pass。
+意外 worker pass 同二进制复跑失败，不计稳定收益。
+
+### Wave35 12-file高置信：新增3 green，相关子树零回归
+
+- crypto：ECDH `setPublicKey` DEP0031 **+1**；
+- module：`module.parent` DEP0144 **+1**；首次实现泄漏
+  `__mbunModuleParent` global，导致 pending-deprecation crypto pass 回归，
+  改为闭包私有状态后 crypto guard恢复；
+- require：`--no-experimental-require-module` 的 `.mjs` ERR_REQUIRE_ESM
+  **+1**；
+- net no-halfopen候选造成已绿 local-address timeout，整提交回退；
+  WebCrypto cross-realm 零收益也回退。
+
+完整 crypto/module/require 子树只有上述3个 fail→pass、零pass回归。当前
+定向推算 Node **2808/4433**。
+
 ### 5 小时冲刺第三十批：净减 61 个 Bun 失败，cron 新增全绿
 
 五个独立同源簇经主线三次增量构建、原生文件精确验收：

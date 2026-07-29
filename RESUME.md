@@ -52,6 +52,19 @@ inaccurate net assessment doc were reverted. Do not repeat the 24-file cut: it
 increased static false positives without improving green/minute. Return to 12
 high-confidence files and run the complete related subtree before checkpoint.
 
+Corrected full Node authority is now **2805/4433 pass (63.27%)**, +151 against
+the PR starting point 2654. The one TLS socket pass-to-timeout was traced to
+preconnect flush changes and its exact guard is green again; an unexpected
+worker pass failed on same-binary rerun and is treated as a flake.
+
+Wave 35 retained exactly three new Node greens: ECDH setPublicKey DEP0031,
+module.parent DEP0144, and legacy require-mjs. The first module implementation
+leaked a global and regressed pending-deprecation crypto tests; it was changed
+to closure-private state. A net no-halfopen candidate regressed an existing
+local-address test and was fully reverted. Complete crypto/module/require
+subtrees show only the three intended fail-to-pass transitions. Current
+targeted projection is **2808/4433**, pending the next pushed full run.
+
 Session-scoped cron jobs are in-memory only (`durable` has no effect), so the
 hourly loop survives a usage limit — it simply skips the fires that land during
 the block and resumes within an hour — but it does NOT survive the session
