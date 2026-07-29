@@ -3106,6 +3106,17 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       const s = spawnArgs(a, b);
       validateSignalOpt(s.opts.signal);
       if (s.opts.terminal && PN && PN.spawnPty) return spawnTerminal(s.cmd, s.opts);
+      // A byte stdin payload must use the live pipe path. The synchronous
+      // fallback only forwards string input, so Bun.spawn({ stdin: Buffer })
+      // used to close the child's fd 0 without writing the bytes first.
+      const stdinBytes = s.opts.stdin != null && typeof s.opts.stdin !== "string" &&
+        (ArrayBuffer.isView(s.opts.stdin) || s.opts.stdin instanceof ArrayBuffer);
+      if (PN && PN.spawnEx && stdinBytes) {
+        const proc = spawnAsyncBun(s.cmd, { ...s.opts, stdin: "pipe" });
+        proc.stdin.write(s.opts.stdin);
+        proc.stdin.end();
+        return proc;
+      }
       // stdin: "pipe" rides the fully async spawnEx/io_tick path too — the old
       // spawnPipes path drains stdout/stderr with BLOCKING reads, which parks
       // the JS thread and starves the virtual event loop (deadlocking a child
