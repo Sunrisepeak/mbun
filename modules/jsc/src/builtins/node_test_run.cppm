@@ -594,6 +594,9 @@ inline constexpr std::string_view kNodeTestRunJS = R"JS(
             const e = fileEvent(name, file, internals.nextId());
             e.testNumber = i + 1;
             e.details = { duration_ms: Date.now() - startedAt, type: "test" };
+            // A FileTest has no test body to emit its own start event, but TAP
+            // still wraps it in the same Subtest heading as Node does.
+            forward("test:start", e);
             forward("test:pass", e);
           }
         }
@@ -706,6 +709,7 @@ inline constexpr std::string_view kNodeTestRunJS = R"JS(
           const e = fileEvent(given, file, internals.nextId());
           e.testNumber = ordinal;
           e.details = { duration_ms: Date.now() - startedAt, type: "test" };
+          forward("test:start", e);
           forward("test:pass", e);
         }
         if ((code !== 0 || signal) && !sawResult) {
