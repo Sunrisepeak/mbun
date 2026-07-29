@@ -340,8 +340,7 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
 
   class Script {
     constructor(code, options) {
-      if (typeof code !== "string") throw invArgType("code", "of type string", code);
-      this.__code = code;
+      this.__code = `${code}`;
       if (options === undefined) options = {};
       else if (typeof options === "string") options = { filename: options };
       else if (typeof options !== "object" || options === null) {
@@ -417,25 +416,13 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
   }
 
   function compileFunction(code, params, options) {
-    if (typeof code !== "string") throw invArgType("code", "of type string", code);
-    if (!Array.isArray(params)) throw invArgType("params", "an instance of Array", params);
-    for (let i = 0; i < params.length; i++) {
-      if (typeof params[i] !== "string") {
-        throw invArgType("params[" + i + "]", "of type string", params[i]);
-      }
-    }
-    if (options === undefined) options = {};
-    else if (typeof options !== "object" || options === null || Array.isArray(options)) {
-      throw invArgType("options", "of type object", options);
-    }
-    const args = params.slice();
-    args.push(code);
+    options = options || {};
+    const args = Array.isArray(params) ? params.slice() : [];
+    args.push(`${code}`);
     const pc = options.parsingContext;
     let FunctionCtor;
-    if (pc !== undefined) {
-      if (!isContextInternal(pc)) {
-        throw invArgType("options.parsingContext", "an vm.Context", pc, "property");
-      }
+    if (pc !== undefined && pc !== null) {
+      if (!isContextInternal(pc)) throw argTypeError("options.parsingContext", "an vm.Context");
       const rec = records.get(pc);
       syncIn(rec);
       FunctionCtor = NVM.runInContext(rec.handle, "Function", undefined, true);
