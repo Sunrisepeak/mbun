@@ -360,6 +360,30 @@ inline EVP_PKEY* asym_rsa_pss_gen(std::size_t bits) {
     return key;
 }
 
+// RSA keygen with a caller-selected public exponent. EVP_RSA_gen hard-codes
+// F4, while node forwards options.publicExponent to OpenSSL's RSA keymgmt.
+inline EVP_PKEY* asym_rsa_gen(std::size_t bits, unsigned long exponent) {
+    PkeyCtxPtr pc{EVP_PKEY_CTX_new_from_name(nullptr, "RSA", nullptr)};
+    BIGNUM* e{BN_new()};
+    OSSL_PARAM_BLD* bld{OSSL_PARAM_BLD_new()};
+    if (!pc || !e || !bld || BN_set_word(e, exponent) != 1 ||
+        EVP_PKEY_keygen_init(pc.get()) <= 0) {
+        if (bld != nullptr) { OSSL_PARAM_BLD_free(bld); }
+        if (e != nullptr) { BN_free(e); }
+        return nullptr;
+    }
+    OSSL_PARAM_BLD_push_size_t(bld, OSSL_PKEY_PARAM_RSA_BITS, bits);
+    OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_RSA_E, e);
+    OSSL_PARAM* params{OSSL_PARAM_BLD_to_param(bld)};
+    const bool configured{params != nullptr && EVP_PKEY_CTX_set_params(pc.get(), params) > 0};
+    if (params != nullptr) { OSSL_PARAM_free(params); }
+    OSSL_PARAM_BLD_free(bld);
+    BN_free(e);
+    EVP_PKEY* key{nullptr};
+    if (!configured || EVP_PKEY_generate(pc.get(), &key) <= 0) { return nullptr; }
+    return key;
+}
+
 // __mbunCryptoAsymNative.generateKeyPair(type, modLen, namedCurve, pubType,
 //   pubFmt, privType, privFmt, cipher, passphrase, divisorLength)
 //   → {publicKey, privateKey}.
@@ -377,10 +401,12 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_generate_host,
     const std::string cipher{asym_str(global, native_arg(frame, 7))};
     const std::string pass{asym_str(global, native_arg(frame, 8))};
     const int divLen{asym_int(native_arg(frame, 9), 0)};
+    const int publicExponent{asym_int(native_arg(frame, 10), 65537)};
 
     PkeyPtr pkey;
     if (type == "rsa") {
-        pkey.reset(EVP_RSA_gen(static_cast<unsigned int>(modLen > 0 ? modLen : 2048)));
+        pkey.reset(asym_rsa_gen(static_cast<std::size_t>(modLen > 0 ? modLen : 2048),
+                               static_cast<unsigned long>(publicExponent)));
     } else if (type == "rsa-pss") {
         pkey.reset(asym_rsa_pss_gen(static_cast<std::size_t>(modLen > 0 ? modLen : 2048)));
     } else if (type == "dsa") {

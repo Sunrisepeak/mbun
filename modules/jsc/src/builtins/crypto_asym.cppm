@@ -700,7 +700,9 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     const modLen = (type === "dh" ? options.primeLength : options.modulusLength) || 2048;
     const curve = options.namedCurve || "";
     const divLen = options.divisorLength || 0;
-    const res = AN.generateKeyPair(type, modLen, curve, pubType, pubFmt, privType, privFmt, cipher, pass, divLen);
+    const publicExponent = options.publicExponent == null ? 65537 : options.publicExponent;
+    const res = AN.generateKeyPair(type, modLen, curve, pubType, pubFmt, privType, privFmt,
+                                   cipher, pass, divLen, publicExponent);
     let publicKey = res.publicKey, privateKey = res.privateKey;
     if (wantPubObj) publicKey = mkKO("public", publicKey, "");
     else if (pubJwk) publicKey = jwkFromKey(publicKey, "", true);
