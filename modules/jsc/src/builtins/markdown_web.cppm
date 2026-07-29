@@ -1822,7 +1822,13 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
           out = (G.__mbunCryptoKeyClone && G.__mbunCryptoKeyClone(v)) || copyWithProto(v);
           memory.set(v, out); return out;
         }
-        if (nc().KeyObject && v instanceof nc().KeyObject) { out = copyWithProto(v); memory.set(v, out); return out; }
+        // Same husk problem as CryptoKey above: a KeyObject's state lives in
+        // crypto_asym's koSlots WeakMap and the instance has no own properties,
+        // so copyWithProto yields something util.types.isKeyObject() rejects.
+        if (nc().KeyObject && v instanceof nc().KeyObject) {
+          out = (G.__mbunKeyObjectClone && G.__mbunKeyObjectClone(v)) || copyWithProto(v);
+          memory.set(v, out); return out;
+        }
         if (nc().X509Certificate && v instanceof nc().X509Certificate) { out = copyWithProto(v); memory.set(v, out); return out; }
         // node BlockList clones share the underlying rule set (native-handle semantics).
         if (nnet().BlockList && v instanceof nnet().BlockList) { out = Object.create(nnet().BlockList.prototype); out._rules = v._rules; memory.set(v, out); return out; }

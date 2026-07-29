@@ -767,6 +767,16 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
       return slot && { kind: slot.kind, material: slot.material, passphrase: slot.passphrase };
     },
   });
+  // structuredClone re-mints the key instead of copying it. A KeyObject carries
+  // NO own properties — the whole record lives in koSlots — so a generic
+  // property copy produces something that is `instanceof KeyObject` with an
+  // empty slot: util.types.isKeyObject() says false and every accessor throws
+  // ERR_INVALID_THIS. Rebuilding through the brand gives the clone the same
+  // unforgeable record, which is what node's kClone/kDeserialize pair does.
+  G.__mbunKeyObjectClone = (key) => {
+    const slot = koSlots.get(key);
+    return slot ? mkKO(slot.kind, slot.material, slot.passphrase) : undefined;
+  };
   const makeKeyObject = (kind, key) => {
     if (isKO(key)) return key;
     // { key: <bytes>, format: "raw-*", asymmetricKeyType, namedCurve } — rebuild
