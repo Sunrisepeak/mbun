@@ -20,7 +20,11 @@ std::optional<std::span<const std::uint8_t>> source_map_bytes(JSContextRef ctx, 
     JSObjectRef object{JSValueToObject(ctx, value, &exception)};
     if (object == nullptr || exception != nullptr)
         return std::nullopt;
+    // BytesPtr answers the BUFFER base, ByteLength is view-relative: without the
+    // offset a subarray is read from the wrong bytes.
     void* data{JSObjectGetTypedArrayBytesPtr(ctx, object, &exception)};
+    if (data != nullptr)
+        data = static_cast<char*>(data) + JSObjectGetTypedArrayByteOffset(ctx, object, &exception);
     const std::size_t size{JSObjectGetTypedArrayByteLength(ctx, object, &exception)};
     if (exception != nullptr || (data == nullptr && size != 0))
         return std::nullopt;

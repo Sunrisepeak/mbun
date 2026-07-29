@@ -635,6 +635,10 @@
             if (n < 1) return JSValueMakeNumber(c, 0);
             JSObjectRef o{JSValueToObject(c, a[0], nullptr)};
             void* p{o != nullptr ? JSObjectGetTypedArrayBytesPtr(c, o, nullptr) : nullptr};
+            // BytesPtr answers the BUFFER base; a caller asking for the address
+            // of a subarray must get the address of ITS first byte.
+            if (p != nullptr)
+                p = static_cast<char*>(p) + JSObjectGetTypedArrayByteOffset(c, o, nullptr);
             return JSValueMakeNumber(c, static_cast<double>(reinterpret_cast<std::uintptr_t>(p)));
         });
         // Bun.gc(force) / bun:jsc gcAndSweep|fullGC|edenGC. These were no-op

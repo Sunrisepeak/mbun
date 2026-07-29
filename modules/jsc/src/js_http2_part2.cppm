@@ -560,9 +560,17 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
       // server MUST be treated as a connection error by the client. Node's
       // server half hard-wires it off, so a caller-supplied `enablePush: true`
       // is overridden rather than advertised.
+      // Only CLAMP a caller-supplied enablePush; never inject one. Injecting it
+      // made the server's initial SETTINGS 6 bytes where node sends an EMPTY
+      // frame, which broke node's test-http2-settings-unsolicited-ack.js (it
+      // deep-equals the raw frame). An empty frame already satisfies bun's
+      // regression/29073 requirement of never advertising a non-zero value.
       this._isServerSession = true;
+      const _srvSettings = server && server._h2options && server._h2options.settings;
       this._writeFrame(FRAME.SETTINGS, 0, 0, encodeSettings(
-        Object.assign({}, server && server._h2options && server._h2options.settings, { enablePush: false })));
+        _srvSettings && "enablePush" in _srvSettings
+          ? Object.assign({}, _srvSettings, { enablePush: false })
+          : _srvSettings));
       socket.on("data", (d) => self._onData(d));
       socket.on("error", (e) => self._onSocketError(e));
       socket.on("close", () => self._onSocketClose());

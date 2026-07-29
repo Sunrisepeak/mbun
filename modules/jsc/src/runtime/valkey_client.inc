@@ -34,7 +34,10 @@ std::vector<unsigned char> vk_read_bytes(JSContextRef ctx, JSValueRef v) {
         p = static_cast<const unsigned char*>(JSObjectGetArrayBufferBytesPtr(ctx, obj, nullptr));
         n = JSObjectGetArrayBufferByteLength(ctx, obj, nullptr);
     } else {
+        // BytesPtr answers the BUFFER base, ByteLength is view-relative:
+        // without the offset a subarray is read from the wrong bytes.
         p = static_cast<const unsigned char*>(JSObjectGetTypedArrayBytesPtr(ctx, obj, nullptr));
+        if (p != nullptr) p += JSObjectGetTypedArrayByteOffset(ctx, obj, nullptr);
         n = JSObjectGetTypedArrayByteLength(ctx, obj, nullptr);
     }
     if (p == nullptr) return {};

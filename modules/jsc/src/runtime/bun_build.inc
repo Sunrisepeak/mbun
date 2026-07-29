@@ -360,7 +360,10 @@ inline std::optional<std::string> bun_build_decode_content(JSContextRef ctx, JSV
             data = static_cast<const char*>(JSObjectGetArrayBufferBytesPtr(ctx, obj, nullptr));
             length = JSObjectGetArrayBufferByteLength(ctx, obj, nullptr);
         } else {
+            // BytesPtr answers the BUFFER base, ByteLength is view-relative:
+            // without the offset a subarray is read from the wrong bytes.
             data = static_cast<const char*>(JSObjectGetTypedArrayBytesPtr(ctx, obj, nullptr));
+            if (data != nullptr) data += JSObjectGetTypedArrayByteOffset(ctx, obj, nullptr);
             length = JSObjectGetTypedArrayByteLength(ctx, obj, nullptr);
         }
         if (data == nullptr) {
