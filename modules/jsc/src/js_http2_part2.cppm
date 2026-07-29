@@ -665,6 +665,14 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
           if (flags & FLAG.ACK) { if (len !== 0) { this._connError(constants.NGHTTP2_FRAME_SIZE_ERROR); return false; } resolveSettingsAck(this); return true; }
           if (len % 6 !== 0) { this._connError(constants.NGHTTP2_FRAME_SIZE_ERROR); return false; }
           if (streamId !== 0) { this._connError(constants.NGHTTP2_PROTOCOL_ERROR); return false; }
+          // node hands `maxSettings` to nghttp2 as SETTINGS_MAX_SETTINGS: a peer
+          // that packs more entries than that into one frame is a flood vector,
+          // so nghttp2 fails the connection before the application is told
+          // anything about it — no 'remoteSettings', no streams
+          // (test-http2-max-settings). The option was accepted and ignored.
+          const maxSettings = (this._options && this._options.maxSettings) ||
+            (this.server && this.server._h2options && this.server._h2options.maxSettings) || 32;
+          if (len / 6 > maxSettings) { this._connError(constants.NGHTTP2_PROTOCOL_ERROR); return false; }
           const rangeErr = settingsRangeError(payload);
           if (rangeErr) { this._connError(rangeErr); return false; }
           this._remoteSettings = parseSettingsPayload(payload);
