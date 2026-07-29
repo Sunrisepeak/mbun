@@ -831,6 +831,48 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   const PArrayFrom = Array.from;
   const PJSONStringify = JSON.stringify;
   const PObjectProtoToString = Object.prototype.toString;
+  const PObjectProtoHasOwn = Object.prototype.hasOwnProperty;
+  const PObjectProtoPropIsEnum = Object.prototype.propertyIsEnumerable;
+  const PFuncProtoToString = Function.prototype.toString;
+  // node's getConstructorName: walk the prototype chain for the first own
+  // `constructor` slot holding a *named* function the value is an instance of.
+  // null means the chain ran out (a null-prototype object). ref node
+  // lib/internal/util/inspect.js getConstructorName.
+  function inspectCtorName(v) {
+    let o = v;
+    while (o !== null && o !== undefined) {
+      const d = PObjectGetOwnPropertyDescriptor(o, "constructor");
+      if (d !== undefined && typeof d.value === "function" && d.value.name !== "") {
+        let ok = false;
+        try { ok = v instanceof d.value; } catch (_) { ok = false; }
+        if (ok) return String(d.value.name);
+      }
+      try { o = PObjectGetPrototypeOf(o); } catch (_) { return null; }
+    }
+    return null;
+  }
+  // node tags a function by its *intrinsic* kind, which no later mutation can
+  // move: test-util-inspect re-points a generator's [[Prototype]] at
+  // AsyncFunction.prototype and still expects "[GeneratorFunction …]".  So the
+  // kind is read off Function.prototype.toString source text (immutable, and
+  // the same primordial the class check already used) rather than off the
+  // prototype identity or v.constructor.name, both of which that test moves.
+  function inspectFuncKind(src) {
+    const gen = /^\s*(?:async\s*)?(?:function\s*)?\*/.test(src);
+    const async = /^\s*async[\s*]/.test(src) || (/^\s*async\s*\(/.test(src) && src.indexOf("=>") !== -1);
+    return (async ? "Async" : "") + (gen ? "Generator" : "") + "Function";
+  }
+  const PStripComments = /(\/\/.*?\n)|(\/\*(.|\n)*?\*\/)/g;
+  const PClassRe = /^(\s+[^(]*?)\s*{/;
+  function inspectIsClassSrc(src) {
+    if (!src.startsWith("class") || !src.endsWith("}")) return false;
+    // Reject a *method* literally named `class` — `({ class() {} }).class`
+    // also stringifies to "class() {}". ref node formatRaw's class guard.
+    const slice = src.slice(5, -1);
+    const bi = slice.indexOf("{");
+    if (bi === -1) return false;
+    return slice.slice(0, bi).indexOf("(") === -1 || PClassRe.test(slice.replace(PStripComments, ""));
+  }
   function inspectValue(v, opts, seen, depth) {
     opts = opts || {}; seen = seen || new Set(); depth = depth || 0;
     const maxDepth = opts.depth === null ? Infinity : (typeof opts.depth === "number" ? opts.depth : 2);
@@ -855,20 +897,42 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     if (t === "string") return col(32, 39, bun ? PJSONStringify(v) : "'" + v.replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\n/g, "\\n") + "'");
     if (t === "function") {
       const n = v.name;
-      if (bun) {
-        const s = Function.prototype.toString.call(v);
-        if (s.startsWith("class") || /^class[\s{]/.test(s)) {
-          const base = (s.match(/^class\s+(?:[A-Za-z0-9_$]+\s+)?extends\s+([A-Za-z0-9_$.]+)/) || [])[1];
-          return "[class " + (n || "(anonymous)") + (base ? " extends " + base : "") + "]";
-        }
-        const cn = v.constructor && v.constructor.name;
-        const kind = (cn === "AsyncFunction" || cn === "GeneratorFunction" || cn === "AsyncGeneratorFunction") ? cn : "Function";
-        return n ? "[" + kind + ": " + n + "]" : "[" + kind + "]";
-      }
       // Use Function.prototype.toString (not v.toString()) so a user-defined
       // toString override is never invoked during inspection (test-console-not-
       // call-toString / node util.inspect semantics).
-      const tag = Function.prototype.toString.call(v).startsWith("class") ? "class" : "Function"; return n ? "[" + tag + ": " + n + "]" : "[" + tag + " (anonymous)]";
+      let src = ""; try { src = PFuncProtoToString.call(v); } catch (_) { src = ""; }
+      const ctor = inspectCtorName(v);
+      if (inspectIsClassSrc(src)) {
+        // ref node getClassBase: the superclass name comes from the class's
+        // [[Prototype]] (the real base constructor), not from the source text —
+        // `class X extends (mkBase())` has no readable name in the source.
+        const nm = (PObjectProtoHasOwn.call(v, "name") && n) || "(anonymous)";
+        let out = "class " + nm;
+        if (ctor !== "Function" && ctor !== null) out += " [" + ctor + "]";
+        if (ctor !== null) {
+          const sup = PObjectGetPrototypeOf(v);
+          const supName = sup && sup.name;
+          if (supName) out += " extends " + supName;
+        }
+        if (bun) return "[" + out + "]";
+        let ctag = v[Symbol.toStringTag];
+        if (typeof ctag !== "string" || (ctag !== "" && PObjectProtoPropIsEnum.call(v, Symbol.toStringTag))) ctag = "";
+        if (ctag !== "" && ctag !== ctor) out += " [" + ctag + "]";
+        return "[" + out + "]";
+      }
+      const kind = inspectFuncKind(src);
+      if (bun) return n ? "[" + kind + ": " + n + "]" : "[" + kind + "]";
+      // ref node getFunctionBase: "[<kind>[ (null prototype)][: name |
+      // (anonymous)]][ <constructor>][ [<toStringTag>]]".
+      let base = "[" + kind;
+      if (ctor === null) base += " (null prototype)";
+      base += (n === "" || n === undefined) ? " (anonymous)" : ": " + n;
+      base += "]";
+      if (ctor !== kind && ctor !== null) base += " " + ctor;
+      let tag = v[Symbol.toStringTag];
+      if (typeof tag !== "string" || (tag !== "" && PObjectProtoPropIsEnum.call(v, Symbol.toStringTag))) tag = "";
+      if (tag !== "" && tag !== ctor) base += " [" + tag + "]";
+      return base;
     }
     if (seen.has(v)) return "[Circular *1]";
     // nodejs.util.inspect.custom dispatch: an object exposing a callable custom
