@@ -6629,6 +6629,247 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       const rl = M["readline"] || M["node:readline"];
       return rl.createInterface(Object.assign({ input: this.createReadStream(opts), crlfDelay: Infinity }, opts));
     }
+    // node's experimental stream/iter FileHandle adapters.  These deliberately
+    // live on the same FileHandle that fs.promises.open() returns: stream/iter
+    // pipelines retain the descriptor's cursor, lock the handle while active,
+    // and optionally own its close.
+    _iterState(message) {
+      const e = new Error(message);
+      e.code = "ERR_INVALID_STATE";
+      return e;
+    }
+    _iterOptions(args, withSignal) {
+      const parsed = require("internal/streams/iter/utils").parsePullArgs(args);
+      const o = parsed.options || {};
+      const autoClose = o.autoClose === undefined ? false : o.autoClose;
+      const chunkSize = o.chunkSize === undefined ? 131072 : o.chunkSize;
+      const start = o.start === undefined ? -1 : o.start;
+      const limit = o.limit === undefined ? -1 : o.limit;
+      if (typeof autoClose !== "boolean")
+        throw fsArgTypeErr("options.autoClose", "of type boolean", autoClose);
+      if (start !== -1) fsValidateInteger(start, "options.start", 0);
+      if (limit !== -1) fsValidateInteger(limit, "options.limit", 1);
+      fsValidateInteger(chunkSize, "options.chunkSize", 1);
+      let signal;
+      if (withSignal && o.signal !== undefined) signal = fsSignalOf({ signal: o.signal });
+      return { transforms: parsed.transforms, options: o, autoClose, chunkSize, start, limit, signal };
+    }
+    _iterCheckOpen() {
+      if (this._closed || this._fd < 0) throw this._iterState("The FileHandle is closed");
+      if (this._iterLocked) throw this._iterState("The FileHandle is locked");
+    }
+    pull(...args) {
+      this._iterCheckOpen();
+      const cfg = this._iterOptions(args, true);
+      const handle = this;
+      const fd = this._fd;
+      if (cfg.signal && cfg.signal.aborted) {
+        return {
+          async *[Symbol.asyncIterator]() {
+            if (cfg.autoClose) await handle.close();
+            throw cfg.signal.reason || fsAbortErr(cfg.signal);
+          },
+        };
+      }
+      this._iterLocked = true;
+      let pos = cfg.start, remaining = cfg.limit;
+      const source = {
+        async *[Symbol.asyncIterator]() {
+          try {
+            if (handle._closed || handle._fd < 0) throw handle._iterState("The FileHandle is closed");
+            while (remaining !== 0) {
+              if (cfg.signal && cfg.signal.aborted) throw cfg.signal.reason || fsAbortErr(cfg.signal);
+              const want = remaining > 0 ? Math.min(cfg.chunkSize, remaining) : cfg.chunkSize;
+              const chunk = Buffer.allocUnsafe(want);
+              const n = fsMod.readSync(fd, chunk, 0, want, pos < 0 ? null : pos) || 0;
+              if (n === 0) break;
+              if (pos >= 0) pos += n;
+              if (remaining > 0) remaining -= n;
+              yield [n === want ? chunk : chunk.subarray(0, n)];
+            }
+          } finally {
+            handle._iterLocked = false;
+            if (cfg.autoClose) await handle.close();
+          }
+        },
+      };
+      if (cfg.transforms.length) return require("internal/streams/iter/pull").pull(source, ...cfg.transforms);
+      return source;
+    }
+    pullSync(...args) {
+      this._iterCheckOpen();
+      const cfg = this._iterOptions(args, false);
+      const handle = this;
+      const fd = this._fd;
+      this._iterLocked = true;
+      let pos = cfg.start, remaining = cfg.limit;
+      const source = {
+        [Symbol.iterator]() {
+          let done = false;
+          const cleanup = () => {
+            if (done) return;
+            done = true;
+            handle._iterLocked = false;
+            if (cfg.autoClose) handle.close();
+          };
+          return {
+            next() {
+              if (done || remaining === 0) { cleanup(); return { value: undefined, done: true }; }
+              if (handle._closed || handle._fd < 0) { cleanup(); throw handle._iterState("The FileHandle is closed"); }
+              const want = remaining > 0 ? Math.min(cfg.chunkSize, remaining) : cfg.chunkSize;
+              const chunk = Buffer.allocUnsafe(want);
+              let n;
+              try { n = fsMod.readSync(fd, chunk, 0, want, pos < 0 ? null : pos) || 0; }
+              catch (e) { cleanup(); throw e; }
+              if (n === 0) { cleanup(); return { value: undefined, done: true }; }
+              if (pos >= 0) pos += n;
+              if (remaining > 0) remaining -= n;
+              return { value: [n === want ? chunk : chunk.subarray(0, n)], done: false };
+            },
+            return() { cleanup(); return { value: undefined, done: true }; },
+          };
+        },
+      };
+      if (cfg.transforms.length) return require("internal/streams/iter/pull").pullSync(source, ...cfg.transforms);
+      return source;
+    }
+    writer(options) {
+      this._iterCheckOpen();
+      const o = options === undefined ? {} : options;
+      if (!o || typeof o !== "object" || Array.isArray(o))
+        throw fsArgTypeErr("options", "of type object", o);
+      const autoClose = o.autoClose === undefined ? false : o.autoClose;
+      const chunkSize = o.chunkSize === undefined ? 131072 : o.chunkSize;
+      let pos = o.start === undefined ? -1 : o.start;
+      let remaining = o.limit === undefined ? -1 : o.limit;
+      if (typeof autoClose !== "boolean") throw fsArgTypeErr("options.autoClose", "of type boolean", autoClose);
+      if (pos !== -1) fsValidateInteger(pos, "options.start", 0);
+      if (remaining !== -1) fsValidateInteger(remaining, "options.limit", 1);
+      fsValidateInteger(chunkSize, "options.chunkSize", 1);
+      const handle = this;
+      const fd = this._fd;
+      let total = 0, closed = false, closing = false, error = null;
+      const pending = new Set();
+      const asBytes = (value) => {
+        if (typeof value === "string") return Buffer.from(value);
+        if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+        if (value instanceof ArrayBuffer) return new Uint8Array(value);
+        throw fsArgTypeErr("chunk", "of type string or an instance of Buffer, TypedArray, or DataView", value);
+      };
+      const checkSignal = (op) => {
+        const s = op && op.signal;
+        if (s !== undefined) fsSignalOf({ signal: s });
+        if (s && s.aborted) throw s.reason || fsAbortErr(s);
+      };
+      const reserve = (n, name) => {
+        if (remaining >= 0 && n > remaining) throw fsRangeErr(name, "<= " + remaining + " bytes", n);
+        if (remaining >= 0) remaining -= n;
+        const at = pos;
+        if (pos >= 0) pos += n;
+        return at;
+      };
+      const track = (p) => { pending.add(p); p.then(() => pending.delete(p), () => pending.delete(p)); return p; };
+      const finish = async () => {
+        if (closed) return;
+        closed = true;
+        handle._iterLocked = false;
+        await Promise.all(Array.from(pending));
+        if (autoClose) await handle.close();
+      };
+      this._iterLocked = true;
+      const writeOne = (value, op) => {
+        if (error) return Promise.reject(error);
+        if (closed || closing) return Promise.reject(handle._iterState("The writer is closed"));
+        if (handle._closed || handle._fd < 0) return Promise.reject(handle._iterState("The FileHandle is closed"));
+        let bytes, at;
+        try { checkSignal(op); bytes = asBytes(value); at = reserve(bytes.byteLength, "write"); }
+        catch (e) { return Promise.reject(e); }
+        let job;
+        job = Promise.resolve().then(() => {
+          const n = fsMod.writeSync(fd, bytes, 0, bytes.byteLength, at < 0 ? null : at) || 0;
+          if (n !== bytes.byteLength) throw new Error("Operation failed: short write");
+          total += n;
+        });
+        return track(job.then(undefined, (e) => { error = error || e; throw e; }));
+      };
+      const writeMany = (values, op) => {
+        if (!Array.isArray(values)) return Promise.reject(fsArgTypeErr("chunks", "an instance of Array", values));
+        if (error) return Promise.reject(error);
+        if (closed || closing) return Promise.reject(handle._iterState("The writer is closed"));
+        let chunks, at;
+        try {
+          checkSignal(op); chunks = values.map(asBytes);
+          const n = chunks.reduce((sum, c) => sum + c.byteLength, 0);
+          at = reserve(n, "writev");
+        } catch (e) { return Promise.reject(e); }
+        let job;
+        job = Promise.resolve().then(() => {
+          let offset = at;
+          for (const chunk of chunks) {
+            const n = fsMod.writeSync(fd, chunk, 0, chunk.byteLength, offset < 0 ? null : offset) || 0;
+            if (n !== chunk.byteLength) throw new Error("Operation failed: short write");
+            total += n;
+            if (offset >= 0) offset += n;
+          }
+        });
+        return track(job.then(undefined, (e) => { error = error || e; throw e; }));
+      };
+      const syncOne = (value) => {
+        if (error || closed || closing || pending.size) return false;
+        const bytes = asBytes(value);
+        if (bytes.byteLength > chunkSize || (remaining >= 0 && bytes.byteLength > remaining)) return false;
+        const at = reserve(bytes.byteLength, "write");
+        const n = fsMod.writeSync(fd, bytes, 0, bytes.byteLength, at < 0 ? null : at) || 0;
+        if (n !== bytes.byteLength) return false;
+        total += n;
+        return true;
+      };
+      const syncMany = (values) => {
+        if (!Array.isArray(values) || error || closed || closing || pending.size) return false;
+        const chunks = values.map(asBytes);
+        const n = chunks.reduce((sum, c) => sum + c.byteLength, 0);
+        if (n > chunkSize || (remaining >= 0 && n > remaining)) return false;
+        const at = reserve(n, "writev");
+        let offset = at;
+        for (const chunk of chunks) {
+          const wrote = fsMod.writeSync(fd, chunk, 0, chunk.byteLength, offset < 0 ? null : offset) || 0;
+          if (wrote !== chunk.byteLength) return false;
+          total += wrote;
+          if (offset >= 0) offset += wrote;
+        }
+        return true;
+      };
+      return {
+        write: writeOne,
+        writev: writeMany,
+        writeSync: syncOne,
+        writevSync: syncMany,
+        end(op) {
+          if (error) return Promise.reject(error);
+          if (closing) return this._end || Promise.resolve(total);
+          try { checkSignal(op); } catch (e) { return Promise.reject(e); }
+          closing = true;
+          this._end = finish().then(() => total);
+          return this._end;
+        },
+        endSync() {
+          if (error) return -1;
+          if (closed) return total;
+          if (pending.size) return false;
+          closed = true; handle._iterLocked = false;
+          if (autoClose) handle.close();
+          return total;
+        },
+        fail(reason) {
+          if (closed || error) return;
+          error = reason || handle._iterState("Failed");
+          closed = true; handle._iterLocked = false;
+          if (autoClose) handle.close();
+        },
+        [Symbol.asyncDispose]() { return closing ? (this._end || Promise.resolve()) : (this.fail(), Promise.resolve()); },
+        [Symbol.dispose]() { this.fail(); },
+      };
+    }
     // node emits "close" SYNCHRONOUSLY from close(), before the descriptor is
     // actually closed and regardless of the ref count (lib/internal/fs/
     // promises.js: `this.emit('close'); return this[kClosePromise];`). That is
