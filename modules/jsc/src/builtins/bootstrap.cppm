@@ -6465,8 +6465,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
           throw fsArgValueErr("buffer", buf, "is empty and cannot be written");
       } catch (e) { return Promise.reject(e); }
       return Promise.resolve().then(() => {
-        const fd = this.fd;
-        if (this._closed || fd < 0) throw fsErr("EBADF", "read");
+        const fd = this._use("read");
         // A position past the file end reads nothing (node returns bytesRead 0
         // rather than seeking the descriptor there).
         const bytesRead = l2 === 0 ? 0 : fsMod.readSync(fd, buf, o2, l2, pos == null ? null : pos);
@@ -6490,8 +6489,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     }
     write(buffer, offsetOrOptions, length, position) {
       return Promise.resolve().then(() => {
-        const fd = this.fd;
-        if (this._closed || fd < 0) throw fsErr("EBADF", "write");
+        const fd = this._use("write");
         if (buffer != null && buffer.byteLength === 0) return { bytesWritten: 0, buffer };
         if (ArrayBuffer.isView(buffer)) {
           let off = offsetOrOptions, len = length, pos = position;
@@ -6542,8 +6540,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       const signal = fsSignalOf(o);
       return Promise.resolve().then(async () => {
         fsThrowIfAborted(signal);
-        const fd = this.fd;
-        if (this._closed || fd < 0) throw fsErr("EBADF", "read");
+        const fd = this._use("read");
         // node kIoMaxLength: a file larger than 2**31-1 cannot be read into one
         // buffer (ERR_FS_FILE_TOO_LARGE, a RangeError).
         try {
@@ -6574,8 +6571,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       const signal = fsSignalOf(o);
       return Promise.resolve().then(async () => {
         fsThrowIfAborted(signal);
-        const fd = this.fd;
-        if (this._closed || fd < 0) throw fsErr("EBADF", "write");
+        const fd = this._use("write");
         // node consumes (async) iterables here too (a Readable is the common case).
         if (data != null && typeof data !== "string" && !ArrayBuffer.isView(data) && !(data instanceof ArrayBuffer) &&
             (typeof data[Symbol.asyncIterator] === "function" || typeof data[Symbol.iterator] === "function")) {
@@ -6607,13 +6603,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     statfs(o) { return Promise.resolve().then(() => { const p = fdPathMap.get(this._use("statfs")); return fsMod.statfsSync(p, o); }); }
     sync() { return Promise.resolve().then(() => { fsMod.fsyncSync(this._use("fsync")); }); }
     datasync() { return Promise.resolve().then(() => { fsMod.fdatasyncSync(this._use("fdatasync")); }); }
-    truncate(len) {
-      return Promise.resolve().then(() => {
-        const fd = this.fd;
-        if (this._closed || fd < 0) throw fsErr("EBADF", "ftruncate");
-        fsMod.ftruncateSync(fd, len == null ? 0 : len);
-      });
-    }
+    truncate(len) { return Promise.resolve().then(() => { fsMod.ftruncateSync(this._use("ftruncate"), len == null ? 0 : len); }); }
     // fchmod/fchown have no fd-based syscall behind mbun's virtual descriptors;
     // recover the opened path (fdPathMap) so the mode change actually lands.
     chmod(mode) {
@@ -6661,40 +6651,6 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     }
     [Symbol.asyncDispose]() { return this.close(); }
   }
-  // Path variants of readFile/writeFile/truncate open a temporary FileHandle.
-  // The handle's public `fd` getter and close() are observable internal seams:
-  // an operation failure must still close, and two failures become Node's
-  // AggregateError([operationError, closeError]).
-  const fsAggregateOperationAndCloseError = (closeError, operationError) => {
-    if (closeError && operationError && closeError !== operationError) {
-      if (Array.isArray(operationError.errors)) {
-        operationError.errors.push(closeError);
-        return operationError;
-      }
-      const error = new AggregateError([operationError, closeError], operationError.message);
-      error.code = operationError.code;
-      return error;
-    }
-    return closeError || operationError;
-  };
-  const fsPromiseWithTemporaryHandle = async (path, flags, operation) => {
-    validatePath(path);
-    const handle = new FileHandle(fdRemember(
-      globalThis.__mbunFdNative.open(toStr(path), flags, 0o666), path));
-    let result;
-    try {
-      result = await operation(handle);
-    } catch (operationError) {
-      try {
-        await handle.close();
-      } catch (closeError) {
-        throw fsAggregateOperationAndCloseError(closeError, operationError);
-      }
-      throw operationError;
-    }
-    await handle.close();
-    return result;
-  };
   const fsPromises = {
     open: (p, flags, mode) => Promise.resolve().then(() => { validatePath(p); const md = mode == null ? 0o666 : fsParseFileMode(mode, "mode", 0o666); return new FileHandle(fdRemember(globalThis.__mbunFdNative.open(toStr(p), flags == null ? "r" : (typeof flags === "number" ? flags : toStr(flags)), md), p)); }),
     // node fs.promises.readFile: a FileHandle argument reads through the
@@ -6704,8 +6660,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       const signal = fsSignalOf(o);
       fsThrowIfAborted(signal);
       if (p && typeof p === "object" && typeof p.readFile === "function") return p.readFile(o);
-      const flag = (o && typeof o === "object" && o.flag) || "r";
-      return fsPromiseWithTemporaryHandle(p, flag, (handle) => handle.readFile(o));
+      return fsMod.readFileSync(p, o);
     }),
     writeFile: (p, d, o) => Promise.resolve().then(async () => {
       if (p && typeof p === "object" && typeof p.writeFile === "function") return p.writeFile(d, o);
@@ -6717,7 +6672,6 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       else if (d == null || typeof d === "number" || typeof d === "bigint" || typeof d === "boolean" || typeof d === "symbol")
         fsValidateData(d);
       const path2 = toStr(p);
-      const flag = (o && typeof o === "object" && o.flag) || "w";
       if (d != null && typeof d !== "string" && !ArrayBuffer.isView(d) && !(d instanceof ArrayBuffer) &&
           (typeof d[Symbol.asyncIterator] === "function" || typeof d[Symbol.iterator] === "function")) {
         // node fs.promises.writeFile consumes (async) iterables: open the fd
@@ -6726,7 +6680,8 @@ inline constexpr char kBootstrapJS_[] = R"JS(
         const FD = globalThis.__mbunFdNative;
         // options may be a bare encoding string (writeFile(p, iterable, "latin1")).
         const oEnc = typeof o === "string" ? o : (o && o.encoding);
-        const fd = FD.open(path2, flag, 0o666);
+        const oFlag = (o && typeof o === "object" && o.flag) || "w";
+        const fd = FD.open(path2, oFlag, 0o666);
         try {
           for await (const chunk of d) {
             let u;
@@ -6739,7 +6694,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
         } finally { FD.close(fd); }
         return;
       }
-      return fsPromiseWithTemporaryHandle(p, flag, (handle) => handle.writeFile(d, o));
+      return fsMod.writeFileSync(path2, d, o);
     }),
     appendFile: (p, d, o) => Promise.resolve().then(() => {
       fsValidateData(d); fsValidateEncoding(o);
@@ -6749,7 +6704,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     mkdir: P((p, o) => { validatePath(p); const [rec, mode] = mkdirOpts(o); return F.mkdir(toStr(p), rec, mode); }),
     rm: P((p, o) => rmImpl(p, o)),
     rmdir: P((p, o) => { validatePath(p); rmdirCheckOpts(o); rmdirImpl(p); }),
-    truncate: (p, len) => fsPromiseWithTemporaryHandle(p, "r+", (handle) => handle.truncate(len)),
+    truncate: P((p, len) => fsMod.truncateSync(p, len)),
     statfs: P((p, o) => fsMod.statfsSync(p, o)),
     readdir: P((p) => F.readdir(toStr(p))),
     // Route through statSync/lstatSync, not F.stat: the raw native row has no
