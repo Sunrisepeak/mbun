@@ -223,4 +223,32 @@ touch -d '9 days ago' "$binroot/frozen-mbun"
 run_bin "$binroot/frozen-mbun" frozen >/dev/null \
   || { echo "a frozen baseline binary must not be treated as stale" >&2; exit 1; }
 
+# --- a binary older than the sources it claims to contain must be refused -----
+# Worse than a false zero: one lane spent itself investigating a defect that did
+# not exist, because its evidence came from a binary predating the fix. Being the
+# newest build is not enough -- it must also postdate the sources.
+mkdir -p "$binroot/modules/jsc/src"
+echo "// edited after the build" >"$binroot/modules/jsc/src/thing.cppm"
+if run_bin auto srcnew >/dev/null 2>&1; then
+  echo "expected a binary older than its sources to be refused" >&2
+  exit 1
+fi
+msg=$(run_bin auto srcnew2 2>&1 || true)
+printf '%s' "$msg" | grep -q "older than the sources" \
+  || { echo "refusal does not explain source staleness: $msg" >&2; exit 1; }
+printf '%s' "$msg" | grep -q "build_lock.sh" \
+  || { echo "refusal does not name the fix: $msg" >&2; exit 1; }
+
+# The override still works, and rebuilding (touching the binary) clears it.
+run_bin auto srcnew-allowed --allow-stale-bin >/dev/null
+touch "$binroot/target/x86_64-linux-gnu/new/bin/mbun"
+run_bin auto rebuilt >/dev/null \
+  || { echo "a freshly rebuilt binary must be accepted" >&2; exit 1; }
+
+# A member's own target/ must not count as a source, or every build looks stale.
+mkdir -p "$binroot/modules/jsc/target/x"
+echo "artifact" >"$binroot/modules/jsc/target/x/gen.cppm"
+run_bin auto ignores-target >/dev/null \
+  || { echo "build artifacts under modules/*/target must not count as sources" >&2; exit 1; }
+
 echo "test_node_corpus_runner: ok"

@@ -229,6 +229,29 @@ def built_binaries(root: Path) -> list[Path]:
     return sorted(found, key=lambda p: p.stat().st_mtime, reverse=True)
 
 
+def newest_source(root: Path) -> tuple[Path | None, float]:
+    """Newest mtime among the sources a build turns into the binary."""
+    newest: Path | None = None
+    newest_mtime = 0.0
+    for base in (root / "modules", root / "src"):
+        if not base.is_dir():
+            continue
+        for path in base.rglob("*"):
+            # `target/` lives INSIDE each member; walking into it would compare
+            # the binary against its own build outputs and always look stale.
+            if "target" in path.parts or not path.is_file():
+                continue
+            if path.suffix not in (".cppm", ".cpp", ".h", ".hpp", ".inc"):
+                continue
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            if mtime > newest_mtime:
+                newest, newest_mtime = path, mtime
+    return newest, newest_mtime
+
+
 def resolve_binary(root: Path, requested: Path, allow_stale: bool) -> Path:
     """Resolve --bin, refusing to measure a superseded build.
 
@@ -240,11 +263,36 @@ def resolve_binary(root: Path, requested: Path, allow_stale: bool) -> Path:
     and reported a confident zero delta for work that was in fact fine. The
     runner cannot tell a real zero from that one, and a zero delta is exactly
     the result that gets a candidate reverted. Silence here costs a lane.
+
+    Worse than a false zero: a whole lane was spent investigating a defect that
+    did not exist, because the "evidence" for it came from a binary predating the
+    fix. THREE lanes of one wave lost time to this. So the check is two-sided --
+    the binary must be the newest build AND newer than the sources it claims to
+    contain. `build_lock.sh` only warns about the latter, and a warning scrolls
+    past.
     """
+
+    def refuse_if_source_newer(binary: Path) -> None:
+        source, source_mtime = newest_source(root)
+        if source is None or source_mtime <= binary.stat().st_mtime:
+            return
+        age_m = (source_mtime - binary.stat().st_mtime) / 60.0
+        raise SystemExit(
+            f"--bin is older than the sources it should contain ({age_m:.1f} min):\n"
+            f"    binary: {binary}\n"
+            f"    source: {source}\n"
+            "Measuring now would score the PREVIOUS build and attribute its\n"
+            "results to the current tree. Rebuild first:\n"
+            "    bash tools/integration/build_lock.sh mcpp build\n"
+            "Pass --allow-stale-bin only for a deliberate baseline comparison."
+        )
+
     candidates = built_binaries(root)
     if str(requested) == "auto":
         if not candidates:
             raise SystemExit(f"--bin auto: no mbun binary built under {root}/target")
+        if not allow_stale:
+            refuse_if_source_newer(candidates[0])
         return candidates[0]
 
     binary = requested.resolve()
@@ -255,6 +303,7 @@ def resolve_binary(root: Path, requested: Path, allow_stale: bool) -> Path:
 
     newest = candidates[0]
     if newest.resolve() == binary:
+        refuse_if_source_newer(binary)
         return binary
     # Only refuse a binary that IS one of this checkout's build outputs. A path
     # outside the `target/<arch>/<hash>/bin` layout is a deliberate choice --
@@ -263,6 +312,7 @@ def resolve_binary(root: Path, requested: Path, allow_stale: bool) -> Path:
     # guard exists to protect.
     if binary not in {c.resolve() for c in candidates}:
         return binary
+    refuse_if_source_newer(binary)
     age_h = (newest.stat().st_mtime - binary.stat().st_mtime) / 3600.0
     raise SystemExit(
         f"--bin points at a superseded build ({age_h:.1f}h older than the newest):\n"
