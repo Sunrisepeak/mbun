@@ -988,36 +988,24 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     let outLen = 0, errLen = 0, maxErr = null, done = false;
     const add = (which, name, chunk, stream) => {
       // Stream decoding can combine a split character before this listener
-      // sees it. Re-encode that completed chunk only for byte-accurate
-      // maxBuffer accounting and the final callback accumulator.
+      // sees it. Count the completed chunk in bytes, but keep its original
+      // type: node slices decoded strings by code units and raw Buffers by
+      // bytes when the maxBuffer boundary falls inside a multibyte character.
       const bytes = typeof chunk === "string" ? Buffer.from(chunk, streamEnc) : _u8(chunk);
       const arr = which === 0 ? outs : errs;
       const len = which === 0 ? outLen : errLen;
-      const streamEncoding = stream && stream._readableState && stream._readableState.encoding;
-      const outputEncoding = streamEncoding || streamEnc;
-      const stringOutput = outputEncoding != null;
-      const encoding = outputEncoding === "utf-8" ? "utf8" : outputEncoding;
-      const combined = stringOutput ? Buffer.concat(arr.concat([Buffer.from(bytes)])) : null;
-      const combinedText = stringOutput ? combined.toString(encoding) : null;
-      // The overflow threshold is byte-based even for decoded output. Once it
-      // trips, Node preserves up to maxBuffer decoded string units so it never
-      // returns a torn multi-byte character.
-      const nextLength = len + bytes.length;
-      if (nextLength > maxBuffer) {
-        if (stringOutput) {
-          // Node applies maxBuffer to decoded string units when an encoding is
-          // requested, so a three-character CJK prefix may occupy nine bytes.
-          arr.length = 0;
-          arr.push(Buffer.from(combinedText.slice(0, maxBuffer), encoding));
-        } else {
-          const take = Math.max(0, maxBuffer - len);
-          if (take > 0) arr.push(Buffer.from(bytes.subarray(0, take)));
+      if (len + bytes.length > maxBuffer) {
+        const take = Math.max(0, maxBuffer - len);
+        if (take > 0) {
+          arr.push(typeof chunk === "string"
+            ? chunk.slice(0, take)
+            : Buffer.from(bytes.subarray(0, take)));
         }
         if (which === 0) outLen = maxBuffer; else errLen = maxBuffer;
         if (!maxErr) { maxErr = new RangeError(name + " maxBuffer length exceeded"); maxErr.code = "ERR_CHILD_PROCESS_STDIO_MAXBUFFER"; maxErr.cmd = cmd; child.kill(); }
       } else {
-        arr.push(Buffer.from(bytes));
-        if (which === 0) outLen = nextLength; else errLen = nextLength;
+        arr.push(typeof chunk === "string" ? chunk : Buffer.from(bytes));
+        if (which === 0) outLen += bytes.length; else errLen += bytes.length;
       }
     };
     if (streamEnc !== null) {
@@ -1026,30 +1014,31 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     }
     if (child.stdout) child.stdout.on("data", (d) => add(0, "stdout", d, child.stdout));
     if (child.stderr) child.stderr.on("data", (d) => add(1, "stderr", d, child.stderr));
-    const toOut = (b, stream) => {
-      // A caller may override `{ encoding: null }` later with
-      // child.stdout.setEncoding(). Node returns strings in that case.
+    const mergeOut = (chunks, stream) => {
       const streamEncoding = stream && stream._readableState && stream._readableState.encoding;
       const outputEncoding = streamEncoding || streamEnc;
-      return outputEncoding == null
-        ? b
-        : b.toString(outputEncoding === "utf-8" ? "utf8" : outputEncoding);
+      if (outputEncoding != null) {
+        const encoding = outputEncoding === "utf-8" ? "utf8" : outputEncoding;
+        return chunks.map((chunk) => typeof chunk === "string" ? chunk : chunk.toString(encoding)).join("");
+      }
+      return Buffer.concat(chunks.map((chunk) => typeof chunk === "string" ? Buffer.from(chunk) : chunk));
     };
     const finish = (code, signal) => {
       if (done) return; done = true;
-      const outBuf = Buffer.concat(outs), errBuf = Buffer.concat(errs);
+      const outBuf = mergeOut(outs, child.stdout);
+      const errBuf = mergeOut(errs, child.stderr);
       let err = maxErr;
       if (!err && ((code !== 0 && code != null) || signal)) {
         err = new Error("Command failed: " + cmd + (errBuf.length ? "\n" + errBuf.toString("utf8") : ""));
         err.code = signal ? null : (code < 0 ? (ERRNO[-code] || code) : code); err.killed = child.killed || false; err.signal = signal || null; err.cmd = cmd;
       }
-      if (cb) cb(err || null, toOut(outBuf, child.stdout), toOut(errBuf, child.stderr));
+      if (cb) cb(err || null, outBuf, errBuf);
     };
     child.on("close", (code, signal) => finish(code, signal));
     child.on("error", (e) => {
       if (done) return;
       done = true;
-      if (cb) cb(e, toOut(Buffer.alloc(0), child.stdout), toOut(Buffer.alloc(0), child.stderr));
+      if (cb) cb(e, mergeOut([], child.stdout), mergeOut([], child.stderr));
     });
   };
 
