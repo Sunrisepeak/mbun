@@ -593,6 +593,19 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
     return (ports.length || mods.length) ? unsubst(c, ports, new Map(), mods) : c;
   };
 
+  // Deliver an ALREADY-SERIALISED inbound value onto a port's pair, bypassing
+  // postMessage's transfer-list validation. Every worker IPC frame arrives this
+  // way: the sender already ran the clone/transfer rules, so re-running them on
+  // receipt is not just wasteful, it REJECTS the frame — a decoded MessagePort
+  // stand-in is a port that "needs transfer but was not listed", so a message
+  // carrying one died in the receiver with a DataCloneError instead of reaching
+  // the handler.
+  const deliverLocal = (p, data) => {
+    if (!p || p[kDetached] === true) return;
+    p[kQueue].push({ data, ports: [] });
+    scheduleFlush(p);
+  };
+
   const severPort = (p) => {
     const o = p[kOther];
     p[kDetached] = true; p[kOther] = null;
@@ -1130,6 +1143,17 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
         const e = new TypeError('The "options.env" property must be of type object or one of undefined, null, or worker_threads.SHARE_ENV. Received ' + recvType(options.env));
         e.code = "ERR_INVALID_ARG_TYPE"; throw e;
       }
+      // options.name → the thread's name (node v24.6 threadName). node TRIMS
+      // nothing and ignores a FALSY name (''/0/false/undefined all mean "no
+      // name"), but a truthy non-string is ERR_INVALID_ARG_TYPE.
+      let wname = "";
+      if (options.name) {
+        if (typeof options.name !== "string") {
+          const e = new TypeError('The "options.name" property must be of type string. Received ' + recvType(options.name));
+          e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+        }
+        wname = options.name;
+      }
       if (options.argv !== undefined && options.argv !== null && !Array.isArray(options.argv)) {
         const e = new TypeError('The "options.argv" property must be an instance of Array. Received ' + recvType(options.argv));
         e.code = "ERR_INVALID_ARG_TYPE"; throw e;
@@ -1164,15 +1188,41 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
 
       const tid = nextThreadId++;
       this.threadId = tid;
+      this.threadName = wname;
       this._tempFile = null;
       let entry;
+      let isEval = false;
       if (options.eval) {
         entry = writeTempWorker(String(filename), tid, ".js");
         this._tempFile = entry;
+        isEval = true;
       } else {
         const r = workerEntryPath(filename);
-        if (r.source !== undefined) { entry = writeTempWorker(r.source, tid, ".js"); this._tempFile = entry; }
+        if (r.source !== undefined) { entry = writeTempWorker(r.source, tid, ".js"); this._tempFile = entry; isEval = true; }
         else entry = r.path;
+      }
+      // An entry point that does not RESOLVE is an 'error' event on the parent's
+      // handle carrying the module loader's own error (node reports the CJS/ESM
+      // resolution failure through internal/worker.js like any other fatal
+      // error in the worker). mbun runs the entry in a child mbun process, and a
+      // target that cannot be found is rejected by the CLI *before* the runtime
+      // exists — there is no JS context left to report from, so the child prints
+      // `error: Module not found …` and exits 1 with nothing on the wire.
+      // Turning the miss into a worker whose body throws node's error routes it
+      // through the already-working top-level-throw path instead of bolting a
+      // second, spawn-less error path onto the constructor.
+      // Only for a path that CANNOT gain a resolution: an extensionless
+      // specifier still goes to the child, which probes .js/.json/index.js.
+      if (!isEval && /\.(?:[cm]?js|[cm]?ts|jsx|tsx|json|node)$/.test(entry)) {
+        let missing = false;
+        try { missing = !fsM.existsSync(entry); } catch (e) { missing = false; }
+        if (missing) {
+          entry = writeTempWorker(
+              "const e = new Error(\"Cannot find module '\" + " + JSON.stringify(entry) +
+                  " + \"'\");\ne.code = 'MODULE_NOT_FOUND';\nthrow e;\n",
+              tid, ".js");
+          this._tempFile = entry;
+        }
       }
 
       // Env: SHARE_ENV and the default both inherit; an explicit object replaces.
@@ -1181,6 +1231,12 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
       for (const k of Object.keys(baseEnv)) { const v = baseEnv[k]; if (v !== undefined && v !== null) env[k] = String(v); }
       env.MBUN_WORKER_TID = String(tid);
       env.MBUN_WORKER_DATA = workerDataJson;
+      if (wname !== "") env.MBUN_WORKER_NAME = wname;
+      // node evaluates an `eval: true` worker as a STRING, so its process.argv[1]
+      // is the fixed placeholder '[worker eval]'. mbun materialises the string as
+      // a temp file to hand the child a real entry point, so the child has to be
+      // told to report node's placeholder instead of the temp path.
+      if (isEval) env.MBUN_WORKER_EVAL = "1";
       // environmentData is inherited by every worker STARTED FROM HERE, as a
       // snapshot: node clones the parent's store into the new thread at spawn
       // time, so a later setEnvironmentData in the parent must not reach it.
@@ -1246,16 +1302,8 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
       // holds a stand-in whose two directions are these frames. 'p' is the
       // worker posting on its stand-in (delivered to this port's pair), 'pm' is
       // anything posted to this port travelling the other way.
-      this._tlPorts = tlPorts;
-      for (let i = 0; i < tlPorts.length; i++) {
-        const p = tlPorts[i];
-        const idx = i;
-        p.on("message", (d) => {
-          try {
-            if (!self._exited && child.connected) child.send({ t: "pm", i: idx, d: encWire(d, tlPorts) });
-          } catch (e) {}
-        });
-      }
+      this._tlPorts = [];
+      this._wirePorts(tlPorts);
       child.on("spawn", () => self.emit("online"));
       child.on("message", (m) => {
         if (m === null || typeof m !== "object") return;
@@ -1266,7 +1314,7 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
           self.emit("message", d);
         } else if (m.t === "p" && typeof m.i === "number") {
           const p = self._tlPorts[m.i];
-          if (p) { try { p.postMessage(decodeKeysTop(decWire(m.d))); } catch (e) {} }
+          if (p) { try { deliverLocal(p[kOther], decodeKeysTop(decWire(m.d))); } catch (e) {} }
         } else if (m.t === "e") {
           // node serializes a worker's fatal error and REBUILDS it in the
           // parent with its own class (internal/error_serdes.js keeps the
@@ -1284,6 +1332,11 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
           const err = new Ctor(m.d && m.d.message ? m.d.message : String(m.d));
           if (m.d && m.d.name) err.name = m.d.name;
           if (m.d && m.d.stack) err.stack = m.d.stack;
+          // The worker could not READ err.stack (a Error.prepareStackTrace that
+          // throws). node's error_serdes leaves the deserialized error's stack
+          // undefined in that case, so the freshly-built Error's OWN stack must
+          // be cleared rather than left standing in for the worker's.
+          else if (m.d && m.d.noStack === true) { try { err.stack = undefined; } catch (e) {} }
           if (m.d && m.d.code) err.code = m.d.code;
           if (typeof self.onerror === "function") self.onerror(err);
           self.emit("error", err);
@@ -1296,6 +1349,12 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
         self._exited = true;
         self._exitCode = signal ? 1 : (code == null ? 1 : code);
         self._asyncMessagePortRefd = false;
+        // node internal/worker.js [kOnExit]: the handle is dropped, so both
+        // identifiers report "not running" — threadId -1 and threadName null
+        // (test-worker-safe-getters / test-worker-thread-name assert exactly
+        // this from the 'exit' listener).
+        self.threadId = -1;
+        self.threadName = null;
         workerRegistry.delete(tid);
         if (self._tempFile) { try { fsM.unlinkSync(self._tempFile); } catch (e) {} self._tempFile = null; }
         self.emit("exit", self._exitCode);
@@ -1323,17 +1382,63 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
         }
       }
     }
+    // A MessagePort transferred to the worker keeps living HERE; the worker gets
+    // a stand-in whose two directions are IPC frames carrying this port's index.
+    // 'p' is the worker posting on its stand-in (delivered to this port's pair),
+    // 'pm' is anything posted to this port travelling the other way.
+    //
+    // The index space is the WORKER's, not one transfer list's, so it grows
+    // across calls: the constructor's list fills 0..n-1 and every later
+    // postMessage appends. Keeping it per-call was the whole bug — Worker's
+    // postMessage ignored its transferList entirely, so a port sent after
+    // construction reached the worker as a bare token with no postMessage and
+    // the worker's `parentPort.on('message', ({port}) => …)` never answered
+    // (test-worker-message-channel and test-worker-message-port-message-before-
+    // close hang on exactly that, they do not fail).
+    _wirePorts(ports) {
+      const self = this;
+      for (const p of ports) {
+        if (this._tlPorts.indexOf(p) !== -1) continue;
+        const idx = this._tlPorts.length;
+        this._tlPorts.push(p);
+        p.on("message", (d) => {
+          try {
+            if (!self._exited && self._child.connected) {
+              self._child.send({ t: "pm", i: idx, d: encWire(d, self._tlPorts) });
+            }
+          } catch (e) {}
+        });
+      }
+    }
     postMessage(value, transferList) {
-      validateTransferList(transferList);
+      const list = validateTransferList(transferList);
+      const tlPorts = [], tlBuffers = [];
+      for (const item of list) {
+        if (isPort(item)) {
+          if (item[kDetached] === true) throw dataClone("MessagePort in transfer list is already detached");
+          tlPorts.push(item);
+        } else if (item instanceof ArrayBuffer) {
+          if (abDetached(item)) throw dataClone("ArrayBuffer at index " + tlBuffers.length + " is already detached");
+          if (!UNTRANSFERABLE.has(item)) tlBuffers.push(item);
+        }
+      }
       if (this._exited || !this._child.connected) return undefined;
+      // Registered BEFORE the encode: encWire resolves a port to its index in
+      // this list, and an unlisted one is node's DataCloneError.
+      this._wirePorts(tlPorts);
       // `{t:"m"}` with no `d` IS the undefined message: JSON drops the key.
-      try { this._child.send(value === undefined ? { t: "m" } : { t: "m", d: encWire(encodeKeysTop(value)) }); } catch (e) {}
+      try { this._child.send(value === undefined ? { t: "m" } : { t: "m", d: encWire(encodeKeysTop(value), this._tlPorts) }); } catch (e) {}
+      // The message is on the wire, so the transferred buffers can be detached.
+      for (const b of tlBuffers) { try { G.structuredClone(b, { transfer: [b] }); } catch (e) {} }
       return undefined;
     }
     terminate() {
-      if (this._exited) return Promise.resolve(this._exitCode == null ? 1 : this._exitCode);
+      // node internal/worker.js: the promise fulfils with UNDEFINED, and with
+      // an already-dropped handle it is `PromiseResolve()` — never the exit
+      // code (test-worker-terminate-null-handler asserts the `undefined`).
+      if (this._exited) return Promise.resolve();
       try { this._child.kill("SIGTERM"); } catch (e) {}
-      return new Promise((resolve) => { this._exitResolvers.push(resolve); });
+      return new Promise((resolve) => { this._exitResolvers.push(resolve); }).then(() => undefined);
     }
     ref() { this._refd = true; this._asyncMessagePortRefd = true; if (this._child._rec) this._child._rec.unrefd = false; return this; }
     unref() { this._refd = false; this._asyncMessagePortRefd = false; if (this._child._rec) this._child._rec.unrefd = true; return this; }
@@ -1348,12 +1453,22 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
   const MY_TID = WENV.MBUN_WORKER_TID;
   let isMainThread = true;
   let threadId = 0;
+  // node names the process's first thread "MainThread" (src/node.cc
+  // uv_thread_setname), and worker_threads reports that name as threadName.
+  let threadName = "MainThread";
   let parentPort = null;
   let workerData = null;
   let workerDataRaw = null;
   if (MY_TID !== undefined && MY_TID !== null && MY_TID !== "") {
     isMainThread = false;
     threadId = Number(MY_TID) | 0;
+    threadName = typeof WENV.MBUN_WORKER_NAME === "string" ? WENV.MBUN_WORKER_NAME : "";
+    // node's `eval: true` worker never has a file, so process.argv is
+    // [execPath, '[worker eval]', ...argv]. The child was handed a temp file to
+    // make the entry real; the placeholder is restored before user code runs.
+    if (WENV.MBUN_WORKER_EVAL === "1" && Array.isArray(proc.argv) && proc.argv.length > 1) {
+      try { proc.argv[1] = "[worker eval]"; } catch (e) {}
+    }
     // A MessagePort the parent transferred in. The real port never left the
     // parent, so this end is a local node MessagePort with its outbound half
     // redirected onto the IPC channel; the parent's 'pm' frames feed the other
@@ -1390,7 +1505,8 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
     // worker's environment (test-worker-process-env inspects Object.keys(env)).
     try {
       delete proc.env.MBUN_WORKER_TID; delete proc.env.MBUN_WORKER_DATA;
-      delete proc.env.MBUN_WORKER_ENVDATA;
+      delete proc.env.MBUN_WORKER_ENVDATA; delete proc.env.MBUN_WORKER_NAME;
+      delete proc.env.MBUN_WORKER_EVAL;
     } catch (e) {}
     const chan = new MessageChannel();
     parentPort = chan.port1;
@@ -1426,7 +1542,18 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
     } catch (e) {}
     const reportFatal = (e) => {
       if (typeof proc.send !== "function") return;
-      try { proc.send({ t: "e", d: { message: e && e.message, name: e && e.name, stack: e && e.stack, code: e && e.code } }); } catch (_) {}
+      // EVERY field is read in its own try: they are user-visible getters. A
+      // single try around the whole frame meant one throwing accessor lost the
+      // WHOLE report — an Error.prepareStackTrace that throws for its own error
+      // made `.stack` throw, so nothing was ever sent and the parent's 'error'
+      // event never fired at all (test-worker-error-stack-getter-throws, which
+      // asserts the propagated error arrives with stack === undefined).
+      const d = {};
+      try { d.message = e && e.message; } catch (_) {}
+      try { d.name = e && e.name; } catch (_) {}
+      try { d.stack = e && e.stack; } catch (_) { d.noStack = true; }
+      try { d.code = e && e.code; } catch (_) {}
+      try { proc.send({ t: "e", d }); } catch (_) {}
     };
     // A fatal error in the worker's ENTRY POINT (a bad specifier, a throw at
     // module scope) reaches the parent as an 'error' event too — node
@@ -1453,10 +1580,10 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
     if (typeof proc.on === "function") {
       proc.on("message", (m) => {
         if (m === null || typeof m !== "object") return;
-        if (m.t === "m") chan.port2.postMessage(decodeKeysTop(decWire(m.d)));
+        if (m.t === "m") deliverLocal(parentPort, decodeKeysTop(decWire(m.d)));
         else if (m.t === "pm" && typeof m.i === "number") {
           const e = transferredPorts.get(m.i);
-          if (e) e.feed.postMessage(decodeKeysTop(decWire(m.d)));
+          if (e) deliverLocal(e.near, decodeKeysTop(decWire(m.d)));
         }
         else if (m.t === "cd" && typeof m.d === "string") { try { proc.chdir(m.d); } catch (e) {} }
       });
@@ -1532,6 +1659,7 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
     isMainThread,
     parentPort,
     threadId,
+    threadName,
     workerData,
     resourceLimits: {},
     MessageChannel,
