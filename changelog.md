@@ -5,6 +5,32 @@
 
 ## 2026-07-29
 
+### 5 小时冲刺第三十批：净减 61 个 Bun 失败，cron 新增全绿
+
+五个独立同源簇经主线三次增量构建、原生文件精确验收：
+
+- GFM tagFilter **30/32 → 47/15**（-17）；
+- direct-readable-stream 的 14 个表面 stream 失败实为 JSX text entity
+  未 decode、经 ReactDOM 二次转义；修 lowering 后 **254/15 → 268/1**
+  （-14）；
+- cron invalid/越界 `from` 统一拒绝，**12/12 → 24/0**（-12，新增 green）；
+- bunfig/CLI preload 顺序、去重、合并，**6/12 → 16/2**（-10）；
+- test path-ignore 从解析但丢弃改为 discovery 全路径过滤，
+  **1/9 → 9/1**（-8）。
+
+合计 **-61 fail**，新增 1 个完整 green file。JSON5/JSONL、WPT remaining、
+Bun.write、image-adversarial、CLI init 五条分散或缺 backend 路线均在静态
+阶段止损。
+
+### 第二十九批 PR 推送后全量验证
+
+- Bun：**91/230 green**，assertions **5001/814**，相对 wave28
+  **+58/-58**；JSON5 +45/-45、WPT +14/-14 精确复现，`ws-proxy`
+  4/15→3/16 且同二进制复跑保持 3/16，故诚实全局净值比定向少1；
+- Node：**2787/4433 pass**，984 fail / 90 timeout / 3 OOM / 569 skip；
+  weakref 的 pass→fail 已在前一轮同二进制复跑出现，属于跨轮不稳定，
+  未宣称稳定 Node 新增。
+
 ### 5 小时冲刺第二十九批：净减 59 个 Bun 失败
 
 重排后只接受两个同源实现，其余四条路线在静态阶段止损：

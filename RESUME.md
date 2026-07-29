@@ -138,6 +138,24 @@ DCE, WebView, Inspector profiler, and node:test were stopped statically because
 they require missing multi-stage engines/backends or split across independent
 mechanisms; no stubs were accepted.
 
+Wave-29 full proof: Bun remains 91/230 green at 5001 pass / 814 fail
+assertions, globally +58/-58 because ws-proxy regressed one assertion and
+reproduced at the lower count in a same-binary guard. Node is 2787/4433 pass;
+weakref returned to fail after already failing in the previous same-binary
+guard, so no stable Node gain/loss is attributed to this source wave.
+
+### Sprint wave 30 measured checkpoint
+
+- GFM tagFilter: 30/32 -> 47/15, -17;
+- JSX text entity lowering/direct-readable-stream: 254/15 -> 268/1, -14;
+- cron invalid dates: 12/12 -> 24/0, -12 and one complete green;
+- bunfig/CLI preload merge: 6/12 -> 16/2, -10;
+- test discovery path-ignore: 1/9 -> 9/1, -8.
+
+Total is -61 and one complete green. Wave 31 is assigned to the fresh GFM
+remaining 15, shared WPT/Undici HTTP/2 failures, and import-attributes; retain
+only homogeneous clusters meeting their per-lane thresholds.
+
 ### Sprint wave 1 measured checkpoint (10:55–11:15)
 
 One combined build after three static implementation lanes produced 29 newly
