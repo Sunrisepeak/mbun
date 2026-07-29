@@ -1238,10 +1238,14 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       // established, and a destroy() in that window completes it with
       // ERR_SOCKET_CLOSED_BEFORE_CONNECTION instead of success
       // (test-net-write-cb-on-destroy-before-connect).
-      if (typeof cb === "function" && this.connecting) {
-        (this._preConnectCbs || (this._preConnectCbs = [])).push(cb);
-        if (this._wqLen >= HWM) { this._needDrain = true; return false; }
-        return true;
+      if (this.connecting) {
+        if (typeof cb === "function")
+          (this._preConnectCbs || (this._preConnectCbs = [])).push(cb);
+        // Node reports backpressure for every pre-connect write: it cannot be
+        // considered flushed until the public connect boundary is crossed,
+        // even when the native descriptor was adopted synchronously.
+        this._needDrain = true;
+        return false;
       }
       if (typeof cb === "function") G.queueMicrotask(cb);
       if (this._wqLen >= HWM) { this._needDrain = true; return false; }
