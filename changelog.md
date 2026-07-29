@@ -5,6 +5,18 @@
 
 ## 2026-07-29
 
+### 5 小时冲刺第三批：7 分钟净增 4 文件，34.3 files/hour
+
+11:30–11:37 集成 async_hooks 生命周期注册、AsyncResource ID/context 与
+callback 边界事件。静态预计至少 5 文件；完整 `test-async-*` 55 文件集合
+实测 **+4、green→non-green 0**，即 **34.3 files/hour**。
+
+第一次组合验收为 +4/-1，唯一回归是递归 `runInAsyncScope()` 内全局
+`triggerAsyncId()` 固定返回 0。主审按真实 active resource 修正 trigger
+ID 后重新构建、重跑完整 55 文件，回归消失；最终只按 +4 结算。JSC 原生
+await allocation、GC destroy 与深层 promise timing 仍是 engine seam，
+没有声称该组全部兼容。
+
 ### 5 小时冲刺第二批：15.7 分钟净增 8 文件，30.6 files/hour
 
 11:15–11:30 继续使用 3 个静态实现 lane、主 Agent 单次组合构建与集中

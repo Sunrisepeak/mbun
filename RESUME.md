@@ -101,6 +101,19 @@ fresh Bun HTTP/serve/TLS gate-log clustering. Continue to reject first-error
 movement as yield and stop any lane that cannot identify a shared >=5-file
 mechanism inside ten minutes.
 
+### Sprint wave 3 measured checkpoint (11:30–11:37)
+
+The async_hooks lifecycle wave gained 4 files across the complete 55-file
+`test-async-*` acceptance set in 7 minutes: **34.3 files/hour**, with zero
+green-to-non-green regressions.
+
+The first integration run was +4/-1 because global `triggerAsyncId()` still
+returned zero inside recursively nested `AsyncResource.runInAsyncScope()`.
+Integration fixed it to read the active resource, rebuilt, and reran all 55
+files before accepting the wave. JSC-native await allocation, GC destroy, and
+deep native promise timing remain engine seams; do not claim the whole async
+group is compatible.
+
 The first three-way reuse probe tested local round-10 branches for node's
 `--test` CLI, HTTP/2 argument/timer validation, and verbatim Node error text.
 All three candidate cherry-picks became empty on the current target tree.
