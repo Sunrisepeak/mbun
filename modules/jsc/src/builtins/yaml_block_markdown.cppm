@@ -1334,6 +1334,124 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
       Bun.JSON5 = { parse: parseJSON5, stringify: stringifyJSON5 };
     }
 
+    // Bun.TOML.parse is native because it materializes a TOML value tree. Its
+    // serializer only needs the public JS shape, so keeping it here avoids a
+    // second C-API object walk and shares the normal JS GC lifetime rules.
+    if (Bun.TOML && typeof Bun.TOML.stringify === "undefined") {
+      const TOML_SKIP = Symbol("toml.skip");
+      const tomlUSV = (input) => {
+        const s = String(input);
+        let out = "";
+        for (let i = 0; i < s.length; i++) {
+          const c = s.charCodeAt(i);
+          if (c >= 0xd800 && c <= 0xdbff) {
+            if (i + 1 < s.length) {
+              const next = s.charCodeAt(i + 1);
+              if (next >= 0xdc00 && next <= 0xdfff) { out += s[i] + s[++i]; continue; }
+            }
+            out += "\ufffd";
+          } else if (c >= 0xdc00 && c <= 0xdfff) out += "\ufffd";
+          else out += s[i];
+        }
+        return out;
+      };
+      const tomlQuote = (input) => "\"" + tomlUSV(input).replace(/[\\"\b\t\n\f\r\u0000-\u001f]/g, (c) => {
+        if (c === "\\") return "\\\\";
+        if (c === "\"") return "\\\"";
+        if (c === "\b") return "\\b";
+        if (c === "\t") return "\\t";
+        if (c === "\n") return "\\n";
+        if (c === "\f") return "\\f";
+        if (c === "\r") return "\\r";
+        return "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0");
+      }) + "\"";
+      const tomlBareKey = (key) => /^[A-Za-z0-9_-]+$/.test(key);
+      const tomlKey = (key) => tomlBareKey(key) ? key : tomlQuote(key);
+      const tomlPlainObject = (value) => value !== null && typeof value === "object" && Object.getPrototypeOf(value) === Object.prototype;
+      const tomlStringify = (input, replacer, _space) => {
+        if (replacer !== undefined && replacer !== null) throw new TypeError("TOML.stringify does not support the replacer argument");
+        if (input === undefined) return undefined;
+        if (!tomlPlainObject(input)) throw new TypeError("TOML.stringify expects an object at the top level (a TOML document is a table)");
+        const stack = new Set();
+        const cycle = () => { throw new TypeError("Converting circular structure to TOML"); };
+        const scalar = (value, key, inArray) => {
+          if (value === undefined || typeof value === "function" || typeof value === "symbol") {
+            if (inArray) throw new TypeError("TOML cannot represent " + (value === undefined ? "undefined" : typeof value) + " in an array");
+            return TOML_SKIP;
+          }
+          if (value === null) {
+            throw new TypeError(inArray ? "TOML cannot represent null in an array" : "TOML cannot represent null (key '" + key + "'); remove the key or use a sentinel value");
+          }
+          if (typeof value === "bigint") throw new TypeError("TOML.stringify cannot serialize BigInt");
+          if (value instanceof Number || value instanceof String || value instanceof Boolean) value = value.valueOf();
+          if (typeof value === "string") return tomlQuote(value);
+          if (typeof value === "boolean") return value ? "true" : "false";
+          if (typeof value === "number") {
+            if (Number.isNaN(value)) return "nan";
+            if (value === Infinity) return "inf";
+            if (value === -Infinity) return "-inf";
+            if (Object.is(value, -0)) return "-0.0";
+            const text = String(value);
+            return Number.isInteger(value) && Math.abs(value) > Number.MAX_SAFE_INTEGER && !/[.eE]/.test(text) ? text + ".0" : text;
+          }
+          if (value instanceof Date) {
+            const time = value.getTime();
+            if (Number.isNaN(time)) throw new TypeError("TOML.stringify cannot serialize an invalid Date");
+            const year = value.getUTCFullYear();
+            if (year < 0 || year > 9999) throw new TypeError("TOML.stringify cannot serialize a Date outside years 0000-9999");
+            return value.toISOString();
+          }
+          if (Array.isArray(value)) {
+            if (stack.has(value)) cycle();
+            stack.add(value);
+            const out = "[" + value.map((item) => valueText(item, key, true)).join(", ") + "]";
+            stack.delete(value);
+            return out;
+          }
+          if (tomlPlainObject(value)) {
+            if (stack.has(value)) cycle();
+            stack.add(value);
+            const parts = [];
+            for (const childKey of Object.keys(value)) {
+              const child = valueText(value[childKey], childKey, false);
+              if (child !== TOML_SKIP) parts.push(tomlKey(childKey) + " = " + child);
+            }
+            stack.delete(value);
+            return "{ " + parts.join(", ") + (parts.length ? " " : "") + "}";
+          }
+          throw new TypeError("TOML.stringify expects values to be TOML-compatible");
+        };
+        const valueText = (value, key, inArray) => scalar(value, key, inArray);
+        const isArrayOfTables = (value) => Array.isArray(value) && value.length > 0 && value.every(tomlPlainObject);
+        const renderTable = (table, path, header) => {
+          if (stack.has(table)) cycle();
+          stack.add(table);
+          const scalarLines = [];
+          const tables = [];
+          const arrays = [];
+          for (const key of Object.keys(table)) {
+            const value = table[key];
+            if (value === undefined || typeof value === "function" || typeof value === "symbol") continue;
+            if (tomlPlainObject(value)) tables.push([key, value]);
+            else if (isArrayOfTables(value)) arrays.push([key, value]);
+            else scalarLines.push(tomlKey(key) + " = " + valueText(value, key, false) + "\n");
+          }
+          const sections = [];
+          const own = (header || "") + scalarLines.join("");
+          if (own) sections.push(own);
+          for (const [key, value] of tables) sections.push(renderTable(value, path.concat(key), "[" + path.concat(key).map(tomlKey).join(".") + "]\n"));
+          for (const [key, values] of arrays) {
+            const nextPath = path.concat(key);
+            for (const value of values) sections.push(renderTable(value, nextPath, "[[" + nextPath.map(tomlKey).join(".") + "]]\n"));
+          }
+          stack.delete(table);
+          return sections.join("\n");
+        };
+        return renderTable(input, [], "");
+      };
+      Bun.TOML.stringify = tomlStringify;
+    }
+
     // ---- Bun.markdown.ansi: markdown -> ANSI (port of bun src/md/ansi_renderer) ----
 // Markdown -> ANSI renderer, port of bun src/md/ansi_renderer.rs + a CommonMark-ish
 // parser. Exposed as globalThis.__renderMarkdownAnsi(src, opts).
