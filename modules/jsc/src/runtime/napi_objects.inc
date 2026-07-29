@@ -754,6 +754,61 @@ static JSC::JSValue executeRegisteredModule(JSC::JSGlobalObject* globalObject,
     return result;
 }
 
+// mbun finds its own glibc through the executable's DT_RUNPATH, and DT_RUNPATH
+// is deliberately NOT inherited when the loader resolves the DT_NEEDED entries
+// of a dlopen'd object (unlike the legacy DT_RPATH). A prebuilt .node that
+// still lists the pre-2.34 glibc split libraries — librt.so.1, libpthread.so.0,
+// libdl.so.2, … — therefore fails with "cannot open shared object file" even
+// though those compat stubs sit in the very directory the running libc came
+// from. Load them globally by absolute path before the addon: ld.so matches a
+// DT_NEEDED against already-loaded SONAMEs before it searches any path, so the
+// addon then resolves them. A no-op on a stock system layout, where the same
+// files are already reachable through the default search path.
+static void preloadLibcCompatStubsOnce() {
+    static const bool ran = [] {
+        // The directory the live libc.so.6 was mapped from, straight out of
+        // /proc/self/maps (no dladdr/dlinfo: both need _GNU_SOURCE).
+        std::string libcDir;
+        if (FILE* maps = ::fopen("/proc/self/maps", "re")) {
+            char line[4096];
+            while (::fgets(line, sizeof(line), maps) != nullptr) {
+                std::string text{line};
+                while (!text.empty() && (text.back() == '\n' || text.back() == ' ')) {
+                    text.pop_back();
+                }
+                static constexpr std::string_view kSoname{"/libc.so.6"};
+                if (text.size() <= kSoname.size() || !text.ends_with(kSoname)) {
+                    continue;
+                }
+                const std::size_t pathStart = text.find('/');
+                const std::size_t sonameStart = text.size() - kSoname.size();
+                if (pathStart == std::string::npos || pathStart >= sonameStart) {
+                    continue;
+                }
+                libcDir = text.substr(pathStart, sonameStart - pathStart);
+                break;
+            }
+            ::fclose(maps);
+        }
+        if (libcDir.empty()) {
+            return true;
+        }
+        // glibc >= 2.34 ships these as empty stubs; loading them costs nothing
+        // and only ever adds SONAMEs the loader can then match.
+        static constexpr const char* kCompatStubs[] = {
+            "librt.so.1", "libpthread.so.0", "libdl.so.2",
+            "libanl.so.1", "libutil.so.1", "libresolv.so.2",
+        };
+        for (const char* soname : kCompatStubs) {
+            if (::dlopen((libcDir + "/" + soname).c_str(), RTLD_LAZY | RTLD_GLOBAL) == nullptr) {
+                ::dlerror();  // absent on this layout: not an error, just skip it
+            }
+        }
+        return true;
+    }();
+    (void)ran;
+}
+
 // port: BunProcess.cpp Process_functionDlopen (POSIX branch), minus the
 // embedded-.node / plugin machinery. On failure a JS error is thrown on the
 // VM and an empty JSValue returned.
@@ -763,6 +818,7 @@ static JSC::JSValue loadNapiModule(JSC::JSGlobalObject* globalObject, const std:
     auto scope = DECLARE_THROW_SCOPE(vm);
     auto& state = NapiState::singleton();
 
+    preloadLibcCompatStubsOnce();
     const std::size_t callCountAtStart = state.moduleRegisterCallCount;
     void* handle = dlopen(path.c_str(), RTLD_LAZY);
     if (!handle) {
