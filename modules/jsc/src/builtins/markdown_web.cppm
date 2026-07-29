@@ -869,7 +869,7 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       if (typeof G.__mbunIsCryptoKey === "function" && G.__mbunIsCryptoKey(key)) return true;
       return false;
     };
-    function createHmac(algo, key, opts) { if (typeof algo !== "string") throw new TypeError('The "hmac" argument must be of type string. Received ' + (algo === null ? "null" : typeof algo)); if (!supported(algo)) throw new Error("Invalid digest: " + algo); if (!validHmacKey(key)) throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "key" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, DataView, KeyObject, or CryptoKey. Received ' + invalidArgTypeRecv(key)); return new Hmac(algo, key, opts); }
+    function createHmac(algo, key, opts) { if (typeof algo !== "string") throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "hmac" argument must be of type string. Received ' + (algo === null ? "null" : typeof algo)); if (!supported(algo)) throw new Error("Invalid digest: " + algo); if (!validHmacKey(key)) throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "key" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, DataView, KeyObject, or CryptoKey. Received ' + invalidArgTypeRecv(key)); return new Hmac(algo, key, opts); }
     // node-style error helpers (message + .code, matching node:crypto).
     const mkErr = (Ctor, code, msg) => { const e = new Ctor(msg); e.code = code; return e; };
     const invalidArgType = (input) => {
