@@ -395,6 +395,24 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
     e.errno = errno;
     return e;
   };
+  // The real nghttp2 binding reports submit failures as negative errno values.
+  // Keep that submit boundary replaceable for the JS framing backend too: node
+  // internals, instrumentation, and embedders can provide the same low-level
+  // method on internalBinding('http2').Http2Stream.prototype. A failed submit
+  // is stream-local, so it must become NghttpError on this stream (and its
+  // existing destroy path sends the matching RST_STREAM to the peer).
+  let nativeHttp2StreamPrototype = null;
+  const submitNativeStream = (stream, method, ...args) => {
+    const submit = nativeHttp2StreamPrototype && nativeHttp2StreamPrototype[method];
+    if (typeof submit !== "function") return true;
+    const errno = Reflect.apply(submit, stream, args);
+    if (typeof errno !== "number" || errno >= 0) return true;
+    // A caller of the native binding has also loaded the internal util module;
+    // adopt its constructor before exposing the error for identity checks.
+    if (bindingRequested) adoptNodeHttp2Internals();
+    stream.destroy(nghttpErr(errno));
+    return false;
+  };
   // internal/errors.js AbortError: what request({ signal }) destroys the stream
   // with once the signal fires.
   const abortErr = (reason) => {

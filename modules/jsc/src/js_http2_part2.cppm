@@ -279,6 +279,7 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
       // and for a HEAD request, so the HEADERS frame carries END_STREAM itself.
       const st = parseInt(built.list[0] && built.list[0][1], 10);
       if (st === 204 || st === 205 || st === 304 || this.headRequest === true) options = Object.assign({}, options, { endStream: true });
+      if (!submitNativeStream(this, "respond", built.list, options)) return;
       this.headersSent = true;
       this.sentHeaders = built.prepared || headers;
       const block = encodeHeaders(built.list, built.sensitive);
@@ -505,6 +506,7 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
       if (this.destroyed || this._closed) throw mkErr("The stream has been destroyed", "ERR_HTTP2_INVALID_STREAM");
       if (this.headersSent) throw mkErr("Cannot specify additional headers after response initiated", "ERR_HTTP2_HEADERS_AFTER_RESPOND");
       const built = buildResponseHeaderList(headers || {}, this.session._options && this.session._options.strictSingleValueFields, true);
+      if (!submitNativeStream(this, "info", built.list)) return;
       writeHeaderBlock(this.session, this.id, encodeHeaders(built.list, built.sensitive), 0);
       // node Http2Stream#sentInfoHeaders: every 1xx block sent so far, in order.
       this.sentInfoHeaders.push(built.prepared || headers || {});
@@ -1973,6 +1975,7 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
       class Http2Stream {}
       class Http2Ping {}
       class Http2Settings {}
+      nativeHttp2StreamPrototype = Http2Stream.prototype;
       return {
         constants: bindingConstants,
         settingsBuffer, optionsBuffer, sessionState, streamState,
