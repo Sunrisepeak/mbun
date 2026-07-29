@@ -1029,7 +1029,7 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
       e.code = "ERR_WORKER_PATH"; throw e;
     }
     if (p.startsWith("file://")) {
-      const e = new TypeError("The worker script or module filename must be an absolute path or a relative path starting with './' or '../'. Wrap file: URLs with `new URL`. Received \"" + p + "\"");
+      const e = new TypeError("The worker script or module filename must be an absolute path or a relative path starting with './' or '../'. Wrap file:// URLs with `new URL`. Received \"" + p + "\"");
       e.code = "ERR_WORKER_PATH"; throw e;
     }
     if (!pathM.isAbsolute(p) && !/^\.\.?[/\\]/.test(p)) {
