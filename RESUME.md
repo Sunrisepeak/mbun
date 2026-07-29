@@ -94,6 +94,21 @@ remaining TOML 25, crypto 17, and REPL 98 failures. Run complete Node and Bun
 corpora only after the wave-27 PR push, then use that result to detect global
 regressions and re-rank.
 
+The pushed-tree full measurements are now complete:
+
+- Node **2788/4433 pass**, 984 fail, 88 timeout, 4 OOM, 569 skip. This is +1
+  pass with zero pass-to-non-pass transitions; seven former timeouts now fail
+  and one now OOMs.
+- Bun **91/230 green**, 122 test-failure, 3 blocked-external, 11 all-skipped,
+  1 load-error, 1 no-tests, 1 ahead-of-reference. Assertions are
+  **4880 pass / 933 fail**, exactly +439/-438 globally.
+
+The extra Bun green beyond Bun.inspect.table is
+`native-source-onclose-leak.test.ts`, a WPT Streams side effect. Use these
+directories as the next frozen comparison:
+`target/integration/codex-sprint2-wave27-full-node` and
+`target/integration/codex-sprint2-wave27-full-bun`.
+
 ### Sprint wave 1 measured checkpoint (10:55–11:15)
 
 One combined build after three static implementation lanes produced 29 newly

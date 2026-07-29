@@ -27,6 +27,24 @@
 URLPattern 等分散长尾，后者降级。精确构建和结构守卫全绿；完整 Node/Bun
 corpus 只在本 checkpoint 推送 PR 后运行。
 
+### 第二十七批 PR 推送后全量验证：Bun +2 green，Node +1 pass
+
+`c820938` 推送后完成两套统一 runner 全量：
+
+- Bun：**91/230 green**（前次 89，+2），122 test-failure /
+  3 blocked-external / 11 all-skipped / 1 load-error / 1 no-tests /
+  1 ahead-of-reference；assertions **4880 pass / 933 fail**，相对前次
+  **+439/-438**。除预期 `Bun.inspect.table` 外，WPT Streams 修复还使
+  `native-source-onclose-leak` 3/1→4/0 全绿；next-auth 的外部阻塞分类
+  变为 load-error 并新增 1 个失败断言；
+- Node：**2788/4433 pass**（前次 2787，+1），984 fail / 88 timeout /
+  4 OOM / 569 skip。唯一 non-pass→pass 为 watch-mode watcher；
+  pass→non-pass **0**。另有 7 个 timeout→fail、1 个 timeout→OOM，
+  属于分类移动而不是新 pass 回归。
+
+全量结果确认 wave27 的 438 个 Bun fail 减量没有被隐藏回归抵消。Node
+与 Bun 当前 non-pass 分别为 1645 和 139 个可执行文件分类。
+
 ### 5 小时冲刺全量 checkpoint：Node 2787/4433，Bun 89/230
 
 PR wave26 推送后按统一 runner 完成全量实测：
