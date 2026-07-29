@@ -207,7 +207,7 @@
 
         // node:crypto asymmetric + cipher backend (vendored OpenSSL / mbun.openssl).
         JSObjectRef cryptoAsymNative{JSObjectMake(ctx_, nullptr, nullptr)};
-        set_native_fn(ctx_, cryptoAsymNative, "generateKeyPair", 11, node_asym_generate_host);
+        set_native_fn(ctx_, cryptoAsymNative, "generateKeyPair", 14, node_asym_generate_host);
         set_native_fn(ctx_, cryptoAsymNative, "sign", 7, node_asym_sign_host);
         set_native_fn(ctx_, cryptoAsymNative, "verify", 8, node_asym_verify_host);
         set_native_fn(ctx_, cryptoAsymNative, "publicEncrypt", 6, node_asym_public_encrypt_host);

@@ -520,6 +520,15 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
         if (t.publicExponent != null) d.publicExponent = BigInt("0x" + Buffer.from(t.publicExponent).toString("hex"));
         if (t.divisorLength != null) d.divisorLength = t.divisorLength;
         if (t.namedCurve != null) d.namedCurve = t.namedCurve;
+        // OpenSSL's provider names SHA-2 digests as either SHA256 or SHA2-256;
+        // node exposes the normalized lower-case spelling in key details.
+        const nodeDigest = (name) => {
+          const lower = String(name).toLowerCase();
+          return lower.startsWith("sha2-") ? "sha" + lower.slice(5) : lower;
+        };
+        if (t.hashAlgorithm != null) d.hashAlgorithm = nodeDigest(t.hashAlgorithm);
+        if (t.mgf1HashAlgorithm != null) d.mgf1HashAlgorithm = nodeDigest(t.mgf1HashAlgorithm);
+        if (t.saltLength != null) d.saltLength = t.saltLength;
         return d;
       } catch (e) { return {}; }
     },
@@ -715,8 +724,18 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     const curve = options.namedCurve || "";
     const divLen = options.divisorLength || 0;
     const publicExponent = options.publicExponent == null ? 65537 : options.publicExponent;
-    const res = AN.generateKeyPair(type, modLen, curve, pubType, pubFmt, privType, privFmt,
-                                   cipher, pass, divLen, publicExponent);
+    // RSA-PSS restrictions are properties of the generated key, not merely of
+    // a later sign() call. Pass them to the provider so PEM/DER round trips and
+    // asymmetricKeyDetails retain the selected digest/MGF1/salt policy.
+    const pssDigest = type === "rsa-pss" && options.hashAlgorithm != null
+      ? digestName(options.hashAlgorithm) : "";
+    const pssMgf1Digest = pssDigest
+      ? digestName(options.mgf1HashAlgorithm == null ? pssDigest : options.mgf1HashAlgorithm) : "";
+    const pssDigestLength = { sha1: 20, sha224: 28, sha256: 32, sha384: 48, sha512: 64 };
+    const pssSaltLength = pssDigest
+      ? (options.saltLength == null ? (pssDigestLength[pssDigest] || -1) : options.saltLength) : -1;
+    const res = AN.generateKeyPair(type, modLen, curve, pubType, pubFmt, privType, privFmt, cipher, pass,
+      divLen, publicExponent, pssDigest, pssMgf1Digest, pssSaltLength);
     let publicKey = res.publicKey, privateKey = res.privateKey;
     if (wantPubObj) publicKey = mkKO("public", publicKey, "");
     else if (pubJwk) publicKey = jwkFromKey(publicKey, "", true);

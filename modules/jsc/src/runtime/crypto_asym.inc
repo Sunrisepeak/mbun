@@ -348,12 +348,26 @@ inline EVP_PKEY* asym_ffc_gen(const char* alg, unsigned int pbits, unsigned int 
 // 'rsa-pss' must carry the id-RSASSA-PSS OID, and — with no hash/MGF1/salt
 // restriction requested — must NOT emit an RSASSA-PSS-params sequence
 // (nodejs/node#39936), which is what the bare "RSA-PSS" keymgmt produces.
-inline EVP_PKEY* asym_rsa_pss_gen(std::size_t bits) {
+inline EVP_PKEY* asym_rsa_pss_gen(std::size_t bits, std::string_view digest,
+                                  std::string_view mgf1Digest, int saltLength) {
     PkeyCtxPtr pc{EVP_PKEY_CTX_new_from_name(nullptr, "RSA-PSS", nullptr)};
     if (!pc || EVP_PKEY_keygen_init(pc.get()) <= 0) { return nullptr; }
-    OSSL_PARAM params[2];
-    params[0] = OSSL_PARAM_construct_size_t(OSSL_PKEY_PARAM_RSA_BITS, &bits);
-    params[1] = OSSL_PARAM_construct_end();
+    // A bare RSA-PSS key has no RSASSA-PSS-params sequence. Once node's
+    // hashAlgorithm option is present, the restrictions must be embedded in
+    // the key itself so they survive PEM/DER serialization and keyType().
+    std::string digestName{digest};
+    std::string mgf1Name{mgf1Digest};
+    OSSL_PARAM params[5];
+    int n{};
+    params[n++] = OSSL_PARAM_construct_size_t(OSSL_PKEY_PARAM_RSA_BITS, &bits);
+    if (!digestName.empty()) {
+        params[n++] = OSSL_PARAM_construct_utf8_string(
+            OSSL_PKEY_PARAM_RSA_DIGEST, digestName.data(), 0);
+        params[n++] = OSSL_PARAM_construct_utf8_string(
+            OSSL_PKEY_PARAM_RSA_MGF1_DIGEST, mgf1Name.data(), 0);
+        params[n++] = OSSL_PARAM_construct_int(OSSL_PKEY_PARAM_RSA_PSS_SALTLEN, &saltLength);
+    }
+    params[n] = OSSL_PARAM_construct_end();
     if (EVP_PKEY_CTX_set_params(pc.get(), params) <= 0) { return nullptr; }
     EVP_PKEY* key{nullptr};
     if (EVP_PKEY_generate(pc.get(), &key) <= 0) { return nullptr; }
@@ -385,7 +399,8 @@ inline EVP_PKEY* asym_rsa_gen(std::size_t bits, unsigned long exponent) {
 }
 
 // __mbunCryptoAsymNative.generateKeyPair(type, modLen, namedCurve, pubType,
-//   pubFmt, privType, privFmt, cipher, passphrase, divisorLength)
+//   pubFmt, privType, privFmt, cipher, passphrase, divisorLength,
+//   publicExponent, pssDigest, pssMgf1Digest, pssSaltLength)
 //   → {publicKey, privateKey}.
 // publicKey/privateKey are strings (PEM) or Uint8Array (DER).
 JSC_DEFINE_HOST_FUNCTION(node_asym_generate_host,
@@ -402,13 +417,17 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_generate_host,
     const std::string pass{asym_str(global, native_arg(frame, 8))};
     const int divLen{asym_int(native_arg(frame, 9), 0)};
     const int publicExponent{asym_int(native_arg(frame, 10), 65537)};
+    const std::string pssDigest{asym_str(global, native_arg(frame, 11))};
+    const std::string pssMgf1Digest{asym_str(global, native_arg(frame, 12))};
+    const int pssSaltLength{asym_int(native_arg(frame, 13), -1)};
 
     PkeyPtr pkey;
     if (type == "rsa") {
         pkey.reset(asym_rsa_gen(static_cast<std::size_t>(modLen > 0 ? modLen : 2048),
                                static_cast<unsigned long>(publicExponent)));
     } else if (type == "rsa-pss") {
-        pkey.reset(asym_rsa_pss_gen(static_cast<std::size_t>(modLen > 0 ? modLen : 2048)));
+        pkey.reset(asym_rsa_pss_gen(static_cast<std::size_t>(modLen > 0 ? modLen : 2048),
+                                    pssDigest, pssMgf1Digest, pssSaltLength));
     } else if (type == "dsa") {
         pkey.reset(asym_ffc_gen("DSA", static_cast<unsigned int>(modLen > 0 ? modLen : 2048),
                                 static_cast<unsigned int>(divLen > 0 ? divLen : 0)));
@@ -1319,6 +1338,28 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_key_type_host,
             set_prop(ctx, obj, "publicExponent", static_cast<JSValueRef>(asym_u8(ctx, eb)));
         }
         if (e != nullptr) { BN_free(e); }
+        if (base == EVP_PKEY_RSA_PSS) {
+            char digest[80];
+            std::size_t digestLength{};
+            if (EVP_PKEY_get_utf8_string_param(pkey.get(), OSSL_PKEY_PARAM_RSA_DIGEST, digest,
+                                               sizeof(digest), &digestLength) > 0) {
+                set_prop(ctx, obj, "hashAlgorithm",
+                         make_string(ctx, std::string_view{digest, digestLength}));
+            }
+            char mgf1Digest[80];
+            std::size_t mgf1DigestLength{};
+            if (EVP_PKEY_get_utf8_string_param(pkey.get(), OSSL_PKEY_PARAM_RSA_MGF1_DIGEST,
+                                               mgf1Digest, sizeof(mgf1Digest),
+                                               &mgf1DigestLength) > 0) {
+                set_prop(ctx, obj, "mgf1HashAlgorithm",
+                         make_string(ctx, std::string_view{mgf1Digest, mgf1DigestLength}));
+            }
+            int saltLength{};
+            if (EVP_PKEY_get_int_param(pkey.get(), OSSL_PKEY_PARAM_RSA_PSS_SALTLEN,
+                                       &saltLength) > 0) {
+                set_prop(ctx, obj, "saltLength", JSValueMakeNumber(ctx, saltLength));
+            }
+        }
     } else if (base == EVP_PKEY_DSA) {
         // node asymmetricKeyDetails for DSA: { modulusLength: |p|, divisorLength: |q| }.
         set_prop(ctx, obj, "modulusLength",
