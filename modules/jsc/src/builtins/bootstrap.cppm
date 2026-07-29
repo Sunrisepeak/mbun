@@ -999,7 +999,10 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       } else result = nodeBlock("", items, "[", "]");
     }
     else if (v instanceof Map) {
-      const items = []; for (const [k, val] of v) items.push(inspectValue(k, opts, seen, depth + 1) + (bun ? ": " : " => ") + inspectValue(val, opts, seen, depth + 1));
+      // Indexed reads instead of `const [k, val] of v`: array destructuring of
+      // each entry pair goes through Array.prototype[Symbol.iterator], which the
+      // corpus deletes on purpose. Map's own iterator stays live and is fine.
+      const items = []; for (const pair of v) items.push(inspectValue(pair[0], opts, seen, depth + 1) + (bun ? ": " : " => ") + inspectValue(pair[1], opts, seen, depth + 1));
       if (bun) result = bunBlock(v.size ? "Map(" + v.size + ") " : "Map ", items);
       else result = nodeBlock("Map(" + v.size + ") ", items, "{", "}");
     }
@@ -1017,11 +1020,13 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       const descVal = (d, key) => (d && (d.get || d.set)) ? (d.get && d.set ? "[Getter/Setter]" : d.get ? "[Getter]" : "[Setter]") : inspectValue(v[key], opts, seen, depth + 1);
       if (bun) {
         const items = keys.map((k) => bunKey(k) + ": " + descVal(PObjectGetOwnPropertyDescriptor(v, k), k));
-        for (const s of syms) items.push("[" + s.toString() + "]: " + descVal(PObjectGetOwnPropertyDescriptor(v, s), s));
+        // Index loop, not `for (const s of syms)`: for-of over a plain array
+        // reads Array.prototype[Symbol.iterator] at call time.
+        for (let i = 0; i < syms.length; i++) { const s = syms[i]; items.push("[" + s.toString() + "]: " + descVal(PObjectGetOwnPropertyDescriptor(v, s), s)); }
         result = bunBlock(ctor, items);
       } else {
         const items = keys.map((k) => { const kk = /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(k) ? k : "'" + k + "'"; return kk + ": " + inspectValue(v[k], opts, seen, depth + 1); });
-        for (const s of syms) items.push(s.toString() + ": " + inspectValue(v[s], opts, seen, depth + 1));
+        for (let i = 0; i < syms.length; i++) { const s = syms[i]; items.push(s.toString() + ": " + inspectValue(v[s], opts, seen, depth + 1)); }
         result = nodeBlock(ctor, items, "{", "}");
       }
     }

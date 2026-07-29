@@ -3320,11 +3320,17 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     }
     // Binary process.stdout/.stderr writes (Buffers must not be UTF-8 mangled).
     if (PN && G.process) {
+      const PReflectApply = Reflect.apply;
       for (const [name, fd] of [["stdout", 1], ["stderr", 2]]) {
         const strm = G.process[name];
         if (strm && typeof strm.write === "function" && !strm.__mbunBinWrite) {
           const textWrite = strm.write.bind(strm);
-          strm.write = (d, ...rest) => { if (d instanceof ArrayBuffer || ArrayBuffer.isView(d)) { PN.write(fd, u8ToB64(d)); return true; } return textWrite(d, ...rest); };
+          // Forward with a primordial Reflect.apply, never `...rest`: a spread
+          // call re-reads Array.prototype[Symbol.iterator] at call time, so user
+          // code that deletes it (test-require-delete-array-iterator,
+          // test-repl-unsafe-array-iteration) would break every stdout/stderr
+          // write — including the one the runtime needs to report that failure.
+          strm.write = function write(d) { if (d instanceof ArrayBuffer || ArrayBuffer.isView(d)) { PN.write(fd, u8ToB64(d)); return true; } return PReflectApply(textWrite, this, arguments); };
           strm.__mbunBinWrite = true;
           strm.flush = strm.flush || (() => {});
           // node: a write-only stdout/stderr's async iterator completes at once

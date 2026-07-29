@@ -295,6 +295,7 @@ inline constexpr std::string_view kWebHeadersJS = R"JS(
     G.Headers = HeadersProxy;
 
     // ------------------------------------------------ Bun.inspect formatting
+    const PReflectApply = Reflect.apply;
     const headersInspect = (h) => {
       const o = h.toJSON();
       const keys = Object.keys(o);
@@ -306,11 +307,16 @@ inline constexpr std::string_view kWebHeadersJS = R"JS(
       const prev = util.inspect;
       // Forward EVERY argument: Bun.inspect also takes the positional
       // (value, colors, depth) form, which a 2-parameter wrapper would drop.
-      const wrapped = function inspect(value, ...rest) {
+      // Forwarding goes through a primordial Reflect.apply rather than a
+      // `...rest` spread — a spread call re-reads Array.prototype[Symbol.iterator]
+      // at call time, so deleting it (which the corpus does deliberately) would
+      // make this outermost wrapper throw before the tampering-hardened
+      // inspectValue underneath ever runs.
+      const wrapped = function inspect(value) {
         if (value !== null && typeof value === "object" && value instanceof OrigHeaders && value._m instanceof Map) {
           try { return headersInspect(value); } catch (_) {}
         }
-        return prev.call(this, value, ...rest);
+        return PReflectApply(prev, this, arguments);
       };
       for (const k of Object.keys(prev)) { try { wrapped[k] = prev[k]; } catch (_) {} }
       util.inspect = wrapped;
@@ -323,11 +329,11 @@ inline constexpr std::string_view kWebHeadersJS = R"JS(
       } else if (G.Bun && typeof G.Bun.inspect === "function") {
         try {
           const bunPrev = G.Bun.inspect;
-          const bunWrapped = function inspect(value, ...rest) {
+          const bunWrapped = function inspect(value) {
             if (value !== null && typeof value === "object" && value instanceof OrigHeaders && value._m instanceof Map) {
               try { return headersInspect(value); } catch (_) {}
             }
-            return bunPrev.call(this, value, ...rest);
+            return PReflectApply(bunPrev, this, arguments);
           };
           for (const k of Object.keys(bunPrev)) { try { bunWrapped[k] = bunPrev[k]; } catch (_) {} }
           G.Bun.inspect = bunWrapped;
