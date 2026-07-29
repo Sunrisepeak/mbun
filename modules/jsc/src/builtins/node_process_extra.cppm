@@ -508,35 +508,18 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
         let store = desc.get ? undefined : desc.value;
         const rawGet = desc.get ? desc.get.bind(proc) : () => store;
         const rawSet = desc.set ? desc.set.bind(proc) : (v) => { store = v; };
-        const normalizeExitCode = (code) => {
-          // Node accepts decimal strings here, but stores and exits with their
-          // numeric value. Do not use Number() generally: whitespace, floats,
-          // and exponent notation are not accepted exit codes.
-          if (typeof code === "string" && /^[+-]?\d+$/.test(code)) code = Number(code);
-          if (code !== null && code !== undefined) {
-            if (typeof code !== "number") throw errInvalidArgType("code", "number", code);
-            if (!Number.isInteger(code)) throw errOutOfRange("code", "an integer", code);
-          }
-          return code;
-        };
         Object.defineProperty(proc, "exitCode", {
-          configurable: false,
+          configurable: true,
           enumerable: true,
           get() { return rawGet(); },
           set(code) {
-            rawSet(normalizeExitCode(code));
+            if (code !== null && code !== undefined) {
+              if (typeof code !== "number") throw errInvalidArgType("code", "number", code);
+              if (!Number.isInteger(code)) throw errOutOfRange("code", "an integer", code);
+            }
+            rawSet(code);
           },
         });
-        // The native exit bridge enters the shutdown sequence, which must not
-        // absorb an invalid argument. Validate before crossing that boundary.
-        if (typeof proc.exit === "function" && !proc.exit.__mbunExitCodeValidation) {
-          const nativeExit = proc.exit;
-          const validatedExit = function exit(code) {
-            return nativeExit.call(this, normalizeExitCode(code));
-          };
-          validatedExit.__mbunExitCodeValidation = true;
-          proc.exit = validatedExit;
-        }
       }
     } catch (e) {}
 
