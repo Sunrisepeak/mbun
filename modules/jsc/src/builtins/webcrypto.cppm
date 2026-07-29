@@ -1189,6 +1189,12 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
         }
 
         if (KMAC_ALGS.has(name)) {
+          // KmacImportParams.length is rejected at dictionary-conversion time, so
+          // an explicit 0 beats every later import check.
+          // ref: node lib/internal/crypto/webidl.js KmacImportParams converter.
+          if (alg.length !== undefined && Number(alg.length) === 0) {
+            throw dataError("KmacImportParams.length cannot be 0");
+          }
           if (!rawSecret && convertedFormat !== "jwk") throw unsupportedFormat();
           restrictUsages(usages, ["sign", "verify"], name);
           const raw = convertedFormat === "jwk" ? octFromJwk("sig") : copyBytes(keyData);
@@ -1659,9 +1665,21 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
         extractable: metadata.extractable,
       };
     };
-    G.__mbunKeyObjectToCryptoKey = (kind, material, algorithm, extractable, keyUsages) =>
-      impl.importKey(kind === "secret" ? "raw-secret" : kind === "public" ? "spki" : "pkcs8",
+    G.__mbunKeyObjectToCryptoKey = (kind, material, algorithm, extractable, keyUsages) => {
+      // KeyObject.prototype.toCryptoKey reuses these import steps, but node routes
+      // it through importGenericSecretKey, whose extractable rejection is worded
+      // differently from the SubtleCrypto.importKey path below ("are not" vs
+      // "must not be"). Raise it here so importKey's shared string is untouched.
+      // ref: node lib/internal/crypto/keys.js importGenericSecretKey.
+      const name = typeof algorithm === "string" ? algorithm
+        : (algorithm != null && typeof algorithm === "object" ? algorithm.name : undefined);
+      const upper = typeof name === "string" ? name.toUpperCase() : "";
+      if (extractable && (upper === "PBKDF2" || upper === "HKDF")) {
+        throw domError(upper + " keys are not extractable", "SyntaxError");
+      }
+      return impl.importKey(kind === "secret" ? "raw-secret" : kind === "public" ? "spki" : "pkcs8",
         material, algorithm, extractable, keyUsages);
+    };
     G.__mbunIsCryptoKey = (value) => keyMetadata.has(value);
     // structuredClone/worker transfer must produce a key with its OWN metadata
     // entry. A generic property copy cannot: the instance carries no own

@@ -99,6 +99,19 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   }
 
   const isView = (v) => ArrayBuffer.isView(v);
+  // The "Received …" tail node's ERR_INVALID_ARG_TYPE puts after the expected
+  // type: primitives are shown as `type <t> (<inspected>)`, everything else as
+  // `an instance of <ctor>`. ref: node lib/internal/errors.js ERR_INVALID_ARG_TYPE.
+  const argRecv = (v) => {
+    if (v === null) return "null";
+    const t = typeof v;
+    if (t === "undefined") return "undefined";
+    if (t === "string") return "type string ('" + v + "')";
+    if (t === "number" || t === "boolean" || t === "bigint") return "type " + t + " (" + String(v) + ")";
+    if (t === "symbol") return "type symbol (" + String(v) + ")";
+    if (t === "function") return "function " + (v.name || "");
+    return "an instance of " + ((v.constructor && v.constructor.name) || "Object");
+  };
   const toBuf = (v, enc) => {
     if (v == null) return Buffer.alloc(0);
     if (typeof v === "string") return Buffer.from(v, enc || "utf8");
@@ -413,7 +426,25 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   };
   class KeyObject {
     constructor(brand, kind, material, passphrase) {
-      if (brand !== kKObrand) throw new TypeError("Illegal constructor");
+      if (brand !== kKObrand) {
+        // Reached only from user code, where the signature is node's public
+        // `new KeyObject(type, handle)`: the type is validated first, then the
+        // native handle — which is not constructible from JS, so this always
+        // ends in one of the two errors below.
+        // ref: node lib/internal/crypto/keys.js class KeyObject.
+        const type = brand, handle = kind;
+        if (type !== "secret" && type !== "public" && type !== "private") {
+          const e = new TypeError("The argument 'type' is invalid. Received " +
+            (typeof type === "string" ? "'" + type + "'" : String(type)));
+          e.code = "ERR_INVALID_ARG_VALUE"; throw e;
+        }
+        const e = new TypeError('The "handle" argument must be of type object. Received ' +
+          (handle === null ? "null" : handle === undefined ? "undefined"
+            : typeof handle === "string" ? "type string ('" + handle + "')"
+            : typeof handle === "object" ? "an instance of " + ((handle.constructor && handle.constructor.name) || "Object")
+            : "type " + typeof handle + " (" + String(handle) + ")"));
+        e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+      }
       // node's three concrete classes: SecretKeyObject and Public/PrivateKeyObject
       // (both under AsymmetricKeyObject), each owning the accessors that only
       // make sense for it. Constructing through the base and re-pointing the
@@ -455,6 +486,17 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
       }
       const type = options.type || (slot.kind === "public" ? "spki" : "pkcs8");
       const format = options.format || "pem";
+      // The encoding set is per key kind, so asking a PUBLIC key for a private
+      // container (pkcs8/sec1) is a bad option value rather than an OpenSSL
+      // failure — which is what stops a derived public key from being asked to
+      // hand back private material. ref: node lib/internal/crypto/keys.js
+      // parsePublicKeyEncoding/parsePrivateKeyEncoding.
+      const allowedTypes = slot.kind === "public" ? ["spki", "pkcs1"] : ["pkcs8", "pkcs1", "sec1"];
+      if (allowedTypes.indexOf(type) === -1) {
+        const e = new TypeError("The property 'options.type' is invalid. Received " +
+          (typeof type === "string" ? "'" + type + "'" : String(type)));
+        e.code = "ERR_INVALID_ARG_VALUE"; throw e;
+      }
       // Encrypting a private key requires a cipher; a passphrase alone throws.
       if (slot.kind === "private" && options.passphrase != null && options.cipher == null) {
         const e = new TypeError("The property 'options.cipher' is invalid. Received undefined");
@@ -500,7 +542,7 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
         : !!(G.CryptoKey && key instanceof G.CryptoKey);
       if (!isCryptoKey) {
         const e = new TypeError('The "key" argument must be an instance of CryptoKey. Received ' +
-          (key === null ? "null" : typeof key));
+          argRecv(key));
         e.code = "ERR_INVALID_ARG_TYPE"; throw e;
       }
       // Bridge into a node KeyObject via the WebCrypto raw export, when reachable.
@@ -1092,10 +1134,30 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
 
   // ---- ECDH ----
   const CURVE_NIDS = { secp256k1: "secp256k1", prime256v1: "prime256v1", secp384r1: "secp384r1", secp521r1: "secp521r1" };
+  // Group orders (n) for the curves we expose. OpenSSL rejects a private scalar
+  // outside (0, n) in EC_KEY_set_private_key/EC_KEY_check_key; the native bridge
+  // happily derives the point at infinity instead, so the range test lives here.
+  const CURVE_ORDER = {
+    secp256k1: BigInt("0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141"),
+    prime256v1: BigInt("0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551"),
+    secp384r1: BigInt("0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFC7634D81F4372DDF" +
+                      "581A0DB248B0A77AECEC196ACCC52973"),
+    secp521r1: BigInt("0x01FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF" +
+                      "FFFA51868783BF2F966B7FCC0148F709A5D03BB5C9B8899C47AEBB6FB71E91386409"),
+  };
+  const ecdhCurveArg = (curve) => {
+    // node's ECDH/convertKey both begin with validateString(curve, 'curve'), so a
+    // missing curve is an argument-type error BEFORE the name is looked up.
+    if (typeof curve !== "string") {
+      const e = new TypeError('The "curve" argument must be of type string. Received ' + argRecv(curve));
+      e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+    }
+  };
   // ECDH is a node constructor callable WITHOUT `new` (function form + guard).
   function ECDH(curve) {
     if (!(this instanceof ECDH)) return new ECDH(curve);
-    if (typeof curve !== "string" || !AN.ecValidCurve(curve)) {
+    ecdhCurveArg(curve);
+    if (!AN.ecValidCurve(curve)) {
       throw new TypeError("Invalid EC curve name: " + curve);
     }
     this._curve = curve; this._priv = null; this._pub = null;
@@ -1108,13 +1170,32 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   };
   ECDH.prototype.computeSecret = function (otherPublic, inputEnc, outputEnc) {
     const pub = typeof otherPublic === "string" ? Buffer.from(otherPublic, inputEnc) : toBuf(otherPublic);
-    const sec = Buffer.from(AN.ecdhComputeSecret(this._curve, this._priv, pub));
+    // node derives through EC_KEY_check_key first: a public key that setPublicKey
+    // desynchronised from the private scalar is "Invalid key pair", and only then
+    // is the PEER point rejected as off-curve.
+    // ref: node src/crypto/crypto_ec.cc ECDH::ComputeSecret.
+    if (this._priv != null && this._pub != null) {
+      let derived;
+      try { derived = Buffer.from(AN.ecdhPublicFromPrivate(this._curve, this._priv)); } catch { derived = null; }
+      if (derived && Buffer.compare(derived, Buffer.from(this._pub)) !== 0) {
+        throw new Error("Invalid key pair");
+      }
+    }
+    let sec;
+    try { sec = Buffer.from(AN.ecdhComputeSecret(this._curve, this._priv, pub)); }
+    catch {
+      const e = new Error("Public key is not valid for specified curve");
+      e.code = "ERR_CRYPTO_ECDH_INVALID_PUBLIC_KEY"; throw e;
+    }
     return (outputEnc && outputEnc !== "buffer") ? sec.toString(outputEnc) : sec;
   };
   ECDH.prototype.getPublicKey = function (encoding, format) {
     if (format !== undefined && format !== "compressed" && format !== "uncompressed" && format !== "hybrid") {
       const e = new TypeError("Invalid ECDH format: " + format); e.code = "ERR_CRYPTO_ECDH_INVALID_FORMAT"; throw e;
     }
+    // An ECDH that has neither generated nor been given a key has no point to
+    // encode; node reports that as a plain Error, not a conversion failure.
+    if (this._pub == null) throw new Error("Failed to get ECDH public key");
     let pub;
     if (format === "compressed") pub = Buffer.from(AN.ecdhConvertKey(this._curve, this._pub, true));
     else {
@@ -1124,9 +1205,38 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     }
     return (encoding && encoding !== "buffer") ? pub.toString(encoding) : Buffer.from(pub);
   };
-  ECDH.prototype.getPrivateKey = function (encoding) { return (encoding && encoding !== "buffer") ? this._priv.toString(encoding) : Buffer.from(this._priv); };
-  ECDH.prototype.setPrivateKey = function (key, encoding) { this._priv = typeof key === "string" ? Buffer.from(key, encoding) : toBuf(key); this._pub = Buffer.from(AN.ecdhPublicFromPrivate(this._curve, this._priv)); return this; };
-  ECDH.prototype.setPublicKey = function (key, encoding) { this._pub = typeof key === "string" ? Buffer.from(key, encoding) : toBuf(key); return this; };
+  ECDH.prototype.getPrivateKey = function (encoding) {
+    if (this._priv == null) throw new Error("Failed to get ECDH private key");
+    return (encoding && encoding !== "buffer") ? this._priv.toString(encoding) : Buffer.from(this._priv);
+  };
+  ECDH.prototype.setPrivateKey = function (key, encoding) {
+    const priv = typeof key === "string" ? Buffer.from(key, encoding) : toBuf(key);
+    // Reject a scalar outside (0, n) before touching state: node leaves the
+    // object unchanged when EC_KEY_set_private_key fails, and the corpus asserts
+    // the old key is still readable afterwards.
+    const order = CURVE_ORDER[this._curve];
+    if (order !== undefined) {
+      let n = 0n;
+      for (let i = 0; i < priv.length; i++) n = (n << 8n) | BigInt(priv[i]);
+      if (n <= 0n || n >= order) throw new Error("Private key is not valid for specified curve");
+    }
+    let pub;
+    try { pub = Buffer.from(AN.ecdhPublicFromPrivate(this._curve, priv)); }
+    catch { throw new Error("Private key is not valid for specified curve"); }
+    this._priv = priv; this._pub = pub;
+    return this;
+  };
+  ECDH.prototype.setPublicKey = function (key, encoding) {
+    const raw = typeof key === "string" ? Buffer.from(key, encoding) : toBuf(key);
+    // node stores the point via EC_POINT_oct2point, which rejects anything that
+    // is not a point of THIS curve. Normalising to the uncompressed encoding also
+    // makes the key-pair check in computeSecret a plain byte comparison.
+    let pub;
+    try { pub = Buffer.from(AN.ecdhConvertKey(this._curve, raw, false)); }
+    catch { throw new Error("Failed to convert Buffer to EC_POINT"); }
+    this._pub = pub;
+    return this;
+  };
   // `setPublicKey()` is retained only for compatibility. Node's util.deprecate
   // wrapper warns once even when the underlying key validation then throws.
   const ecdhSetPublicKey = ECDH.prototype.setPublicKey;
@@ -1139,7 +1249,10 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     return ecdhSetPublicKey.call(this, key, encoding);
   };
   ECDH.convertKey = (key, curve, inputEnc, outputEnc, format) => {
-    // node diffiehellman.js convertKey validation order: encoding → curve → format.
+    // node diffiehellman.js convertKey validation order: validateString(curve) →
+    // key/encoding conversion → format → native (which is where the curve NAME is
+    // resolved). The arg-type check therefore precedes "Invalid EC curve name".
+    ecdhCurveArg(curve);
     let pt;
     if (typeof key === "string") {
       const enc = inputEnc || "utf8";
@@ -1149,14 +1262,22 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
         const e = new TypeError("The argument 'encoding' is invalid for data of length " + key.length + ". Received '" + enc + "'");
         e.code = "ERR_INVALID_ARG_VALUE"; throw e;
       }
+    } else if (key == null || !(isView(key) || key instanceof ArrayBuffer)) {
+      const e = new TypeError('The "key" argument must be of type string or an instance of ' +
+        "ArrayBuffer, Buffer, TypedArray, or DataView. Received " + argRecv(key));
+      e.code = "ERR_INVALID_ARG_TYPE"; throw e;
     } else pt = toBuf(key);
     if (typeof C.getCurves === "function" && C.getCurves().indexOf(curve) === -1) {
       const e = new TypeError("Invalid EC curve name"); e.code = "ERR_CRYPTO_INVALID_CURVE"; throw e;
     }
     if (format !== undefined && format !== "compressed" && format !== "uncompressed" && format !== "hybrid") {
-      const e = new Error("Invalid ECDH format: " + format); e.code = "ERR_CRYPTO_ECDH_INVALID_FORMAT"; throw e;
+      const e = new TypeError("Invalid ECDH format: " + format); e.code = "ERR_CRYPTO_ECDH_INVALID_FORMAT"; throw e;
     }
-    const out = Buffer.from(AN.ecdhConvertKey(curve, pt, format === "compressed"));
+    let out;
+    try { out = Buffer.from(AN.ecdhConvertKey(curve, pt, format === "compressed")); }
+    catch { throw new Error("Failed to convert Buffer to EC_POINT"); }
+    // hybrid point: uncompressed X||Y prefixed 0x06 (Y even) / 0x07 (Y odd).
+    if (format === "hybrid") { out = Buffer.from(out); out[0] = 0x06 | (out[out.length - 1] & 1); }
     return (outputEnc && outputEnc !== "buffer") ? out.toString(outputEnc) : out;
   };
   C.ECDH = ECDH;
@@ -1258,7 +1379,10 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     if (typeof primeArg === "number") { self._size = primeArg; self._p = null; }
     else { self._p = dhBufToBig(typeof primeArg === "string" ? Buffer.from(primeArg, primeEnc || undefined) : primeArg); self._size = 0; }
     if (genArg == null) self._g = 2n;
-    else if (typeof genArg === "number") self._g = BigInt(genArg);
+    // "Through a fluke of history, g=0 defaults to DH_GENERATOR (2)" — but only
+    // for the NUMBER overload; a zero-valued generator BUFFER is still rejected.
+    // ref: node test/parallel/test-crypto-dh.js.
+    else if (typeof genArg === "number") self._g = genArg === 0 ? 2n : BigInt(genArg);
     else if (typeof genArg === "string") self._g = dhBufToBig(Buffer.from(genArg, genEnc || "utf8"));
     else self._g = dhBufToBig(genArg);
     self._priv = null; self._pub = null;
@@ -1272,7 +1396,25 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     }
     const a = dhNormArgs(sizeOrKey, keyEncoding, generator, genEncoding);
     if (typeof a.generator === "number" && !Number.isInteger(a.generator)) { const e = new RangeError('The value of "generator" is out of range. It must be an integer. Received ' + a.generator); e.code = "ERR_OUT_OF_RANGE"; throw e; }
+    // node runs the generator through getArrayBufferOrView() when it is neither a
+    // number nor a string, so a boolean/symbol/object/array generator is an
+    // argument-type error and never reaches OpenSSL's bad-generator check.
+    if (a.generator != null && typeof a.generator !== "number" && typeof a.generator !== "string" &&
+        !isView(a.generator) && !(a.generator instanceof ArrayBuffer)) {
+      const e = new TypeError('The "generator" argument must be of type number or string or an instance of ' +
+        "ArrayBuffer, Buffer, TypedArray, or DataView. Received " + argRecv(a.generator));
+      e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+    }
+    // OpenSSL's DH_generate_parameters_ex refuses to build a modulus below
+    // DH_MIN_MODULUS_BITS (512); node surfaces that as ERR_OSSL_DH_MODULUS_TOO_SMALL
+    // rather than silently producing an unusable group.
+    if (typeof a.sizeOrKey === "number" && a.sizeOrKey < 512) {
+      const e = new Error("modulus too small"); e.code = "ERR_OSSL_DH_MODULUS_TOO_SMALL"; throw e;
+    }
     dhInit(this, a.sizeOrKey, a.keyEncoding, a.generator, a.genEncoding);
+    // DH_set0_pqg rejects a generator below 2 (0/1 make the shared secret
+    // constant), which is OpenSSL's DH_BAD_GENERATOR.
+    if (this._g < 2n) { const e = new Error("bad generator"); e.code = "ERR_OSSL_DH_BAD_GENERATOR"; throw e; }
   }
   // node's verifyError exposes DH_check() flags. We flag a too-small or composite
   // modulus as non-zero (matching node for bad user primes); ordinary probable
@@ -1301,7 +1443,7 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   function DiffieHellmanGroup(name) {
     if (!(this instanceof DiffieHellmanGroup)) return new DiffieHellmanGroup(name);
     const hex = MODP[String(name)];
-    if (!hex) { const e = new Error("Unknown group: " + name); e.code = "ERR_CRYPTO_UNKNOWN_DH_GROUP"; throw e; }
+    if (!hex) { const e = new Error("Unknown DH group"); e.code = "ERR_CRYPTO_UNKNOWN_DH_GROUP"; throw e; }
     this._p = dhBufToBig(Buffer.from(hex, "hex")); this._size = 0; this._g = 2n; this._priv = null; this._pub = null;
   }
   // A named group has no setters (node DiffieHellmanGroup).
