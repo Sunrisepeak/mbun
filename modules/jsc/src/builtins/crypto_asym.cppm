@@ -718,6 +718,15 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
       e.code = "ERR_CRYPTO_JWK_UNSUPPORTED_KEY_TYPE";
       throw e;
     }
+    // OpenSSL's EC generator has no equivalent to node's paramEncoding switch,
+    // but node still validates its public API before it reaches that backend.
+    if (type === "ec" && options.paramEncoding !== undefined &&
+        options.paramEncoding !== "named" && options.paramEncoding !== "explicit") {
+      const e = new TypeError("The property 'options.paramEncoding' is invalid. Received '" +
+        String(options.paramEncoding) + "'");
+      e.code = "ERR_INVALID_ARG_VALUE";
+      throw e;
+    }
     const pubType = pubJwk ? "spki" : (penc.type || "spki");
     const pubFmt = (wantPubObj || pubJwk) ? "der" : (penc.format || "pem");
     const privType = privJwk ? "pkcs8" : (senc.type || "pkcs8");
