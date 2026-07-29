@@ -4843,6 +4843,19 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       throw cpEinval("cannot copy " + src + " to a subdirectory of self " + dest, dest);
     return srcStat;
   };
+  // node cp.js runs checkPaths for EVERY entry it descends into, not just the
+  // top-level pair, so a file landing on a same-named destination DIRECTORY is
+  // reported as ERR_FS_CP_NON_DIR_TO_DIR instead of falling through to
+  // copyFile() and surfacing the raw EACCES/EISDIR from the syscall.
+  const cpCheckEntryTypes = (srcStat, destStat, src, dest) => {
+    if (!destStat) return;
+    if (srcStat.isDirectory() && !destStat.isDirectory())
+      throw cpSysErr("ERR_FS_CP_DIR_TO_NON_DIR", "Cannot overwrite directory with non-directory",
+                     "EISDIR", -21, "cannot overwrite non-directory " + dest + " with directory " + src, dest);
+    if (!srcStat.isDirectory() && destStat.isDirectory())
+      throw cpSysErr("ERR_FS_CP_NON_DIR_TO_DIR", "Cannot overwrite non-directory with directory",
+                     "ENOTDIR", -20, "cannot overwrite directory " + dest + " with non-directory " + src, dest);
+  };
   const cpSetDestMode = (dest, srcMode) => { try { F.chmod(dest, srcMode & 0o7777); } catch (e) {} };
   const cpEexist = (dest) =>
     cpSysErr("ERR_FS_CP_EEXIST", "Target already exists", "EEXIST", -17, dest + " already exists", dest);
@@ -4930,6 +4943,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   const cpGetStats = (src, dest, opts) => {
     const srcStat = opts.dereference ? F.stat(src) : F.stat(src, true);
     const destStat = cpStatOrNull(dest, !opts.dereference);
+    cpCheckEntryTypes(srcStat, destStat, src, dest);
     if (srcStat.isDirectory() && opts.recursive) {
       if (!destStat) return cpCopyDir(src, dest, opts, true, srcStat.mode);
       return cpCopyDir(src, dest, opts);
@@ -4989,6 +5003,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   const cpGetStatsAsync = async (src, dest, opts) => {
     const srcStat = opts.dereference ? F.stat(src) : F.stat(src, true);
     const destStat = cpStatOrNull(dest, !opts.dereference);
+    cpCheckEntryTypes(srcStat, destStat, src, dest);
     if (srcStat.isDirectory() && opts.recursive) {
       if (!destStat) return cpCopyDirAsync(src, dest, opts, true, srcStat.mode);
       if (opts.errorOnExist && !opts.force) throw cpEexist(dest);  // cp.js onDir

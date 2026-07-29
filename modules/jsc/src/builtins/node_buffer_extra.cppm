@@ -1030,12 +1030,27 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
       // A string byteOffset slot IS the encoding (2-arg form). Otherwise arg3 is
       // either a numeric `end` limit or a string `encoding`; arg4 (if present) is
       // the encoding that follows a numeric end.
-      let encoding, end;
+      let encoding, end, encodingObj;
+      // An object in the encoding slot is a real encoding: node's C++ search
+      // runs ToString on it. Hold it aside so the coercion happens in node's
+      // order (byteOffset first) rather than inline here.
+      const encodingSlot = (v) => (v !== null && (typeof v === "object" || typeof v === "function"));
       if (typeof byteOffset === "string") { encoding = byteOffset; byteOffset = undefined; }
-      else if (typeof arg3 === "number") { end = arg3; if (typeof arg4 === "string") encoding = arg4; }
+      else if (typeof arg3 === "number") {
+        end = arg3;
+        if (typeof arg4 === "string") encoding = arg4;
+        else if (encodingSlot(arg4)) encodingObj = arg4;
+      }
       else if (typeof arg3 === "string") encoding = arg3;
+      else if (encodingSlot(arg3)) encodingObj = arg3;
+      // ToNumber on byteOffset and ToString on the encoding both run before the
+      // search touches the haystack's memory, and either can detach it. Sample
+      // the length only after both, so a detached buffer searches as empty
+      // instead of scanning a stale bound.
+      const rawOfs = byteOffset === undefined ? undefined : +byteOffset;
+      if (encodingObj !== undefined) encoding = String(encodingObj);
       const hlen = buf.length;
-      let ofs = byteOffset === undefined ? (dir ? 0 : hlen) : +byteOffset;
+      let ofs = rawOfs === undefined ? (dir ? 0 : hlen) : rawOfs;
       if (ofs !== ofs) ofs = dir ? 0 : hlen; // NaN -> scan extent
       let lim = hlen;
       if (end !== undefined) { let e = +end; if (e !== e) e = hlen; if (e < 0) e = 0; else if (e > hlen) e = hlen; lim = e; }

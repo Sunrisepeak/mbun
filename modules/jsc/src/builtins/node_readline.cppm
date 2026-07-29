@@ -105,11 +105,23 @@ const {
 // The host's stringWidth reports UTF-16/code-point length for several wide
 // characters. readline's cursor and completion grid use terminal cells, so
 // keep the node wcwidth rules here rather than inheriting that host detail.
+// Emoji-presentation / emoji-modifier code points, the only ones a zero-width
+// joiner may bind into a single cluster.
+const isEmojiCodePoint = (cp) =>
+  (cp >= 0x1f000 && cp <= 0x1faff) || (cp >= 0x2600 && cp <= 0x27bf) ||
+  cp === 0x2b50 || cp === 0x2b55 || (cp >= 0x2190 && cp <= 0x21ff) ||
+  (cp >= 0x2b00 && cp <= 0x2bff);
 const internalGetStringWidth = (value) => {
   const text = stripANSI(String(value));
   let width = 0;
+  // ICU collapses an emoji ZWJ sequence to the width of its first emoji: the
+  // joined glyph occupies one grapheme cluster on the terminal. Track the
+  // previous code point so a joiner can swallow the emoji that follows it.
+  let previous = 0;
   for (const char of text) {
     const cp = char.codePointAt(0);
+    if (previous === 0x200d && isEmojiCodePoint(cp)) continue;
+    previous = cp;
     if (cp === 0 || cp < 0x20 || (cp >= 0x7f && cp < 0xa0) || cp === 0x200d ||
         cp === 0x200e || cp === 0x200f || (cp >= 0x300 && cp <= 0x36f) ||
         (cp >= 0x1ab0 && cp <= 0x1aff) || (cp >= 0x1dc0 && cp <= 0x1dff) ||
