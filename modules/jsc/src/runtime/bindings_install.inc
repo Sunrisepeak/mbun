@@ -47,6 +47,10 @@
         set_fn(ctx_, iniN, "parse", ini_parse_cb);
         set_prop(ctx_, global, "__mbunIniNative", iniN);
 
+        // CSS parser/printer bridge for bun:internal-for-testing.cssInternals.
+        JSObjectRef cssN{JSObjectMake(ctx_, nullptr, nullptr)};
+        set_fn(ctx_, cssN, "minify", css_minify_cb);
+        set_prop(ctx_, global, "__mbunCssNative", cssN);
 
         // Bun.build → in-memory bundler slice (runtime/bun_build.inc).
         set_native_fn(ctx_, bun, "build", 1, bun_build_host);

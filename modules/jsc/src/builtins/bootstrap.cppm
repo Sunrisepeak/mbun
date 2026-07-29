@@ -4063,6 +4063,9 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     // xxHash3ForTesting(bytes, seed?) — full-u64-seed XXH3_64bits (native).
     xxHash3ForTesting: G.__mbunXxHash3ForTesting,
     iniInternals:(N=>N?{parse:s=>N.parse(String(s))}:void 0)(G.__mbunIniNative),
+    // CSS serialization delegates to the native parser/printer. `expected` and
+    // `targets` preserve Bun's test-helper signature without JS-side minifying.
+    cssInternals:(N=>N?{minifyTest:(source,_expected,_targets)=>N.minify(String(source))}:void 0)(G.__mbunCssNative),
     // bun internal-for-testing.ts:273 → socket_body.rs js_set_socket_options:
     // which 1=send(SO_SNDBUF)/2=recv(SO_RCVBUF), size in bytes.
     setSocketOptions: (socket, which, size) => {

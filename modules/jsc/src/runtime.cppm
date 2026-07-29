@@ -25,6 +25,7 @@ import mbun.image;
 import mbun.image.jpeg;
 import mbun.core.io;
 import mbun.core.strings;
+import mbun.css;
 // node's Permission Model (--permission / --allow-*): the scope table, the fs
 // radix matcher and path.resolve. Consulted by every fs/spawn/worker boundary.
 import mbun.permission;
@@ -85,6 +86,7 @@ namespace {
 #include "runtime/common.inc"
 #include "runtime/jsc_internal.hpp"
 #include "runtime/core_bindings.inc"
+#include "runtime/css.inc"
 #include "runtime/webcrypto.inc"
 // node:crypto native backend (createHash/createHmac/pbkdf2/random* → mbun.crypto).
 #include "runtime/node_crypto.inc"
