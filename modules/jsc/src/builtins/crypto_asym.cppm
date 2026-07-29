@@ -1122,14 +1122,6 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   };
   ECDH.convertKey = (key, curve, inputEnc, outputEnc, format) => {
     // node diffiehellman.js convertKey validation order: encoding → curve → format.
-    if (key === undefined) {
-      const e = new TypeError('The "key" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView. Received undefined');
-      e.code = "ERR_INVALID_ARG_TYPE"; throw e;
-    }
-    if (curve === undefined) {
-      const e = new TypeError('The "curve" argument must be of type string. Received undefined');
-      e.code = "ERR_INVALID_ARG_TYPE"; throw e;
-    }
     let pt;
     if (typeof key === "string") {
       const enc = inputEnc || "utf8";
