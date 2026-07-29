@@ -5029,7 +5029,16 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       // it every value — a Symbol, a Promise, `new String(…)` — was stringified
       // through toStr() and written (test-fs-write-file-sync).
       fsValidateData(d);
-      const FD = globalThis.__mbunFdNative;
+      // Node keeps the default UTF-8 string case on the binding fast path. In
+      // addition to avoiding a needless Buffer round-trip, this is observable:
+      // internal users replace `writeFileUtf8` to make sure this path owns its
+      // descriptor (test-fs-sync-fd-leak).
+      if (typeof p === "string" && typeof d === "string" &&
+          (enc === "utf8" || enc === "utf-8") && !flush && __onFd === undefined) {
+        const binding = typeof G.__mbunInternalBinding === "function" ? G.__mbunInternalBinding("fs") : null;
+        if (binding && typeof binding.writeFileUtf8 === "function")
+          return binding.writeFileUtf8(p, d, flag, mode == null ? 0o666 : mode);
+      }
       let u;
       if (ArrayBuffer.isView(d)) u = new Uint8Array(d.buffer, d.byteOffset, d.byteLength);
       else if (d instanceof ArrayBuffer) u = new Uint8Array(d);
@@ -5042,7 +5051,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       const writeAll = (dfd) => {
         let woff = 0;
         while (woff < u.byteLength) {
-          const n = FD.write(dfd, u, woff, u.byteLength - woff, -1);
+          const n = fsMod.writeSync(dfd, u, woff, u.byteLength - woff, -1);
           if (!(n > 0)) break;
           woff += n;
         }
@@ -5056,7 +5065,9 @@ inline constexpr char kBootstrapJS_[] = R"JS(
         return;
       }
       const path2 = toStr(p);
-      const fd = FD.open(path2, flag, mode == null ? 0o666 : mode);
+      // Go through the public fd rows so their failure and close semantics are
+      // shared with direct fs.openSync/fs.writeSync callers.
+      const fd = fsMod.openSync(path2, flag, mode == null ? 0o666 : mode);
       let keep = false;
       try {
         if (u.byteLength) writeAll(fd);
@@ -5064,7 +5075,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
         // call (node's writeFileSync flushes through the same public binding).
         if (__onFd !== undefined) keep = __onFd(fd, true) === true;
         else if (flush) fsMod.fsyncSync(fd);
-      } finally { if (!keep) FD.close(fd); }
+      } finally { if (!keep) fsMod.closeSync(fd); }
       if (mode != null) { try { F.chmod(path2, mode); } catch (e) {} }
     },
     appendFileSync: (p, d, o, __onFd) => {

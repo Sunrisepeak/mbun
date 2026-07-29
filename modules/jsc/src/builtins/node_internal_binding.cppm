@@ -1401,7 +1401,16 @@ inline constexpr std::string_view kNodeInternalBindingJS = R"JS(
           const b = mod("buffer").Buffer.from(String(data), "utf8");
           return FDN().write(pathOrFd, b, 0, b.byteLength, -1);
         }
-        FSN().writeFile(String(pathOrFd), String(data));
+        const fd = FDN().open(String(pathOrFd), flags || "w", mode == null ? 0o666 : mode);
+        try {
+          const b = mod("buffer").Buffer.from(String(data), "utf8");
+          let offset = 0;
+          while (offset < b.byteLength) {
+            const written = FDN().write(fd, b, offset, b.byteLength - offset, -1);
+            if (!(written > 0)) break;
+            offset += written;
+          }
+        } finally { FDN().close(fd); }
         return undefined;
       },
       readFileUtf8: (pathOrFd, flags) => {
