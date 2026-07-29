@@ -2624,16 +2624,14 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
           }
           let head = latin1(this.buf, this.off, at);
           this.off = at + 4;
-          // picohttpparser refuses any control byte inside the head: every byte
-          // below 0x20 except HTAB (and the CR/LF that end a line), plus DEL.
-          // bun surfaces that as Malformed_HTTP_Response / BadRequest
-          // (compat/bun/src/picohttp/lib.rs). Accepting them let a redirect
-          // Location carrying a raw \x0b / \x01 / \x7f be followed as a normal
-          // target instead of failing the exchange.
+          // Strict parsing refuses every control byte in the head except HTAB
+          // and the CR/LF that end a line. llhttp's insecure flags relax this
+          // for header values (but not NUL), which is observable through both
+          // --insecure-http-parser and per-stream insecureHTTPParser.
           for (let i = 0; i < head.length; i++) {
             const cc = head.charCodeAt(i);
             if (cc === 9 || cc === 10 || cc === 13) continue;
-            if (cc < 32 || cc === 127) {
+            if (cc === 0 || (!this.lenient && (cc < 32 || cc === 127))) {
               if (this.isResponse) this._err("Malformed_HTTP_Response", "Malformed_HTTP_Response");
               else this._err("Invalid HTTP request", "InvalidHTTPRequest");
               return events + 1;
