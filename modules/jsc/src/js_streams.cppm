@@ -88,13 +88,39 @@ constexpr std::string_view kStreamsJS_part1 = R"JS(
     return (chunk) => size(chunk);
   };
 
+  // Queuing strategies are WebIDL interfaces: their public accessors must
+  // reject a foreign receiver instead of exposing implementation state.
+  const byteLengthQueuingStrategyState = new WeakMap();
+  const countQueuingStrategyState = new WeakMap();
+  const byteSizeFunction = Object.defineProperty((chunk) => chunk.byteLength, "name", { value: "size" });
+  const countSizeFunction = Object.defineProperty(() => 1, "name", { value: "size" });
+  const strategyState = (states, receiver) => {
+    const state = states.get(receiver);
+    if (state === undefined) throw new TypeError("Cannot read private member");
+    return state;
+  };
+  const validateStrategyInit = (init) => {
+    if (init === null || (typeof init !== "object" && typeof init !== "function")) {
+      throw new TypeError("init must be an object");
+    }
+    if (init.highWaterMark === undefined) throw new TypeError("init.highWaterMark is required");
+    return Number(init.highWaterMark);
+  };
   class ByteLengthQueuingStrategy {
-    constructor(init) { this.highWaterMark = init.highWaterMark; }
-    size(chunk) { return chunk.byteLength; }
+    constructor(init) { byteLengthQueuingStrategyState.set(this, { highWaterMark: validateStrategyInit(init) }); }
+    get highWaterMark() { return strategyState(byteLengthQueuingStrategyState, this).highWaterMark; }
+    get size() { strategyState(byteLengthQueuingStrategyState, this); return byteSizeFunction; }
   }
   class CountQueuingStrategy {
-    constructor(init) { this.highWaterMark = init.highWaterMark; }
-    size() { return 1; }
+    constructor(init) { countQueuingStrategyState.set(this, { highWaterMark: validateStrategyInit(init) }); }
+    get highWaterMark() { return strategyState(countQueuingStrategyState, this).highWaterMark; }
+    get size() { strategyState(countQueuingStrategyState, this); return countSizeFunction; }
+  }
+  for (const Strategy of [ByteLengthQueuingStrategy, CountQueuingStrategy]) {
+    Object.defineProperties(Strategy.prototype, {
+      highWaterMark: { enumerable: true },
+      size: { enumerable: true },
+    });
   }
 
   // =====================================================================
