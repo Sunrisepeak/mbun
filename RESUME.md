@@ -5,6 +5,67 @@ session that is interrupted (usage limit, crash, restart) can pick up from the
 file rather than from memory. **If you are a fresh session reading this, start
 here.**
 
+## 2026-07-30 08:00 — WAVE 53 (solo): test-stream-consumers green, plus a sized queue
+
+**`test-stream` 233 → 234/249**, 0 regressions (also clean on `test-webstream`).
+Node overall ~2,924/4,433 (66.0%).
+
+### `test-stream-consumers.js` green — and a near-miss worth remembering
+
+Two defects. The second nearly cost a passing assertion:
+
+1. A second consumer on an already-**locked** ReadableStream resolved instead of
+   rejecting. `Bun.readableStreamTo*` throws a bare TypeError with **no `code`**, so
+   a shared `assertUnlocked()` now raises `ERR_INVALID_STATE` before delegating.
+   **I first guarded blob/arrayBuffer/bytes/text and missed `json`** — the file kept
+   failing byte-identically, which looked like the guard not working at all. A probe
+   proved it fired correctly for `blob`, so the fault had to be an unenumerated
+   case. The test exercises **four** ERR_INVALID_STATE paths. Enumerate all cases a
+   test touches, not the representative-looking ones.
+2. `text()`/`json()` over an object-mode stream must reject `ERR_INVALID_ARG_TYPE`
+   for a non-BufferSource chunk — but `blob()`/`bytes()`/`arrayBuffer()` must **NOT**:
+   they stringify through Blob, and the *same file* asserts `bytes()` yields
+   `'[object Object][object Object]'` (30 bytes). The tempting shared chunk guard
+   would have flipped one assertion green and broken a passing one. Validation
+   belongs only in `text()`, with `json()` inheriting it by delegation.
+
+### The remaining 13 `test-stream` failures are 13 DISTINCT causes
+
+Classified from logs (no shared root cause — the umbrella rule holds a sixth time):
+`destroy` (mustNotCall fired), `finished-async-local-storage`, `finished`,
+`iter-readable-interop` (deep-equal), `iter-transform-errors` (brotli code, below),
+`pipeline-process`, `preprocess`, `readable-async-iterators`, `readable-compose`
+(`Error: boom`), `wrap-drain`, `wrap-encoding`, `wrap` (below),
+`writable-samecb-singletick`.
+
+### Two items SIZED, deliberately not started solo
+
+**1. Brotli error codes — and a bigger defect underneath.**
+`test-stream-iter-transform-errors.js` wants `code: 'ERR__ERROR_FORMAT_PADDING_2'`
+(node = `ERR_` + `BrotliDecoderErrorString()`, which returns a leading-underscore
+name — hence the double underscore). mbun reports `Z_BUF_ERROR` /
+"unexpected end of file", manufactured at `zlib_stream.cppm:355` whenever a decoder
+has not ended.
+
+**The real defect is worse than the code string: a CORRUPT brotli stream is being
+reported as TRUNCATED.** `modules/compress/src/brotli.cppm:65-73` already
+distinguishes `BROTLI_DECODER_RESULT_ERROR` (`invalid_input`) from
+`NEEDS_MORE_INPUT` (`truncated_input`), but that distinction never reaches JS — the
+streaming path in `modules/compress/src/stream.cppm` falls through to the
+"unexpected end of file" branch. Fixing properly needs: the brotli error string into
+`compress::Error::message` (the struct already has a `message` field, so **no ripple
+through zlib/gzip/zstd consumers**), propagation through the streaming handle, and a
+brotli-aware code in `zlib_stream.cppm`. Payoff ~1 node file + part of bun's
+`js/web/streams/compression.test.ts`. Shared by four codecs across both corpora, so
+it wants a lane with parallel verification.
+
+**2. `test-stream-wrap.js` needs a real `internal/js_stream_socket` handle.**
+The test does `req.handle = wrap._handle` then `req.handle.shutdown(req)`;
+`wrap._handle` is **null**, so `StreamWrap` exposes no handle at all. Needs a
+`JSStreamSocket` whose `_handle` supports `shutdown()` (and by extension the
+`ShutdownWrap` oncomplete contract). Subsystem work, and it is the same machinery
+`test-stream-wrap-drain`/`-encoding` need — so one project, three files.
+
 ## 2026-07-30 07:00 — WAVE 51/52: solo work under sustained API saturation
 
 **Node 2,821 → 2,923 / 4,433 (65.94%), +102, zero regressions — and every one of the
