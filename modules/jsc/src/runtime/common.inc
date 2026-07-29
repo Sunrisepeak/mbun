@@ -222,6 +222,15 @@ const std::chrono::steady_clock::time_point gStart{std::chrono::steady_clock::no
 // Process argv exposed to scripts as process.argv / Bun.argv.
 std::vector<std::string> gArgv{};
 
+// process.argv0 — node's snapshot of the ORIGINAL argv[0], exactly as the OS
+// handed it over (a bare name when resolved through PATH, a path otherwise).
+// It is deliberately NOT gArgv.front(): that slot carries the runtime's own
+// display name ("mbun"/"bun"/"node") and is later rewritten to execPath by the
+// JS layer, while argv0 must stay whatever invoked us — the corpus respawns the
+// runtime through it (`spawn(process.argv0, …)`).
+// ref: node lib/internal/bootstrap/node.js (process.argv0 = argv[0] snapshot).
+std::string gArgv0{};
+
 // process.execArgv — the runtime's own flags, which are NEVER part of argv.
 // Empty for an ordinary `mbun run`; a `bun build --compile --compile-exec-argv=…`
 // executable carries the flags that were baked into it.

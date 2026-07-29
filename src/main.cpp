@@ -25,6 +25,10 @@ using namespace mbun::app;
 
 int main(int argc, char* argv[]) {
     mbun::platform::raise_file_descriptor_limit();
+    // process.argv0 — node snapshots the ORIGINAL argv[0] before anything can
+    // rewrite it, and the corpus respawns the runtime through it. Recorded first
+    // so every dispatch below (compiled program, node emulation, run, -e) agrees.
+    if (argc > 0 && argv[0] != nullptr) mbun::jsc::runtime::set_argv0(argv[0]);
     // NODE_PRESERVE_SYMLINKS_MAIN — read before any flag parsing so both the
     // node-emulation path and `run` see it (run_command.rs:2581-2584).
     if (const char* v{std::getenv("NODE_PRESERVE_SYMLINKS_MAIN")};

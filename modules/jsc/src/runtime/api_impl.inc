@@ -6,6 +6,13 @@ void set_argv(std::vector<std::string> argv) {
     gArgv = std::move(argv);
 }
 
+// Set process.argv0 — the untouched original argv[0]. Distinct from set_argv,
+// whose first element is the runtime's display name, and from execPath, which
+// is the resolved executable. Call once from main, before any dispatch.
+void set_argv0(std::string argv0) {
+    gArgv0 = std::move(argv0);
+}
+
 // Set process.execArgv — the runtime's own flags, never part of process.argv.
 // Only a `--compile`d executable has any: it carries whatever
 // `--compile-exec-argv` baked in. Call before the runtime is first touched.
