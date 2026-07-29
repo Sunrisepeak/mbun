@@ -1921,10 +1921,41 @@ RunResult run_source(std::string_view js_source, std::string_view dir = ".", boo
                                                                            : "require"};
     const std::string params{std::string{"exports, "} + preq + ", module, " + pfn + ", " + pdn +
                              ", __mbun_esm_require"};
-    const std::string strictPrefix{t.cjs_esm_module ? "\"use strict\";\n" : ""};
-    std::string wrapped{"(function (" + params + ") {\n" + strictPrefix + prepared +
+    // The wrapper prologue stays on the SAME line as the source's first line, so a
+    // frame's reported line is the file's real line. With `{\n` + `"use strict";\n`
+    // every location in the file was reported two lines too low, which was
+    // invisible while the sourceURL was the `<test>` placeholder and actively
+    // misleading once it is a real path. No JS construct has to start a line
+    // (a shebang would, but the transpiler never emits one).
+    const std::string strictPrefix{t.cjs_esm_module ? "\"use strict\";" : ""};
+    std::string wrapped{"(function (" + params + ") {" + strictPrefix + prepared +
                         "\n}).call(globalThis, " + callArgs + ");"};
-    if (auto reg{rt::eval(wrapped, "<test>")}; !reg) {
+    // sourceURL = the test file's real path. Every OTHER module in the run already
+    // gets its path (the CJS loader passes one), so a stack that crosses from a
+    // helper back into the test file used to read
+    //   helper@/abs/path/helper.ts:5:26
+    //   @<test>:6:23
+    // and any harness that locates its own caller by matching a directory prefix
+    // against the frames (bake-harness.ts snapshotCallerLocation) found nothing and
+    // threw "Couldn't find caller location in stack trace" during collection. An
+    // inline/anonymous source has no path, so it keeps the `<test>` placeholder.
+    //
+    // SIZED, so nobody re-derives it: this unblocked collection for the 18
+    // test/bake/dev files that died on that message, and they still do not pass.
+    // Two walls behind it, neither reachable from here:
+    //   1. bake-harness stackTraceFileName() then feeds the frame to
+    //      startsWith(<dir>), which fails on JSC's "@/path:l:c" separator where V8
+    //      writes "at /path:l:c". Removing the "@" means V8-formatting instance
+    //      `.stack` — the SETTLED-not-worth-it rewrite documented at
+    //      builtins/markdown_web.cppm (~5x on error construction, no native route).
+    //   2. Even past that, devTest spawns a bake DevServer:
+    //      Bun.serve() has no `app`/framework option and
+    //      bun:internal-for-testing has no getDevServerDeinitCount. Those 18 files
+    //      are gated on the whole HMR/incremental-bundler subsystem, not on stacks.
+    // So this change is kept for its own sake (correct paths + exact lines in every
+    // test file's frames), not as a step toward the bake corpus.
+    const std::string sourceURL{filename.empty() ? std::string{"<test>"} : std::string{filename}};
+    if (auto reg{rt::eval(wrapped, sourceURL)}; !reg) {
         // Possibly a top-level-await test file (JSC script mode has no TLA): retry
         // with an async wrapper and pump the virtual event loop so module-scope
         // awaits (and the test() collection after them) finish before execution.
@@ -1939,11 +1970,11 @@ RunResult run_source(std::string_view js_source, std::string_view dir = ".", boo
         }
         (void)rt::eval("globalThis.__mbun_collect_done=0;globalThis.__mbun_collect_err=undefined;");
         const std::string awrapped{
-            "(async function (" + params + ") {\n" + strictPrefix + prepared +
+            "(async function (" + params + ") {" + strictPrefix + prepared +
             "\n}).call(globalThis, " + callArgs + ")"
             ".then(function(){globalThis.__mbun_collect_done=1;},"
             "function(e){globalThis.__mbun_collect_err=(e&&e.stack)||String(e);globalThis.__mbun_collect_done=1;});"};
-        if (auto reg2{rt::eval(awrapped, "<test>")}; !reg2) {
+        if (auto reg2{rt::eval(awrapped, sourceURL)}; !reg2) {
             r.error = "test file evaluation error: " + reg.error();  // report the original
             return r;
         }
