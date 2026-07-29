@@ -1616,10 +1616,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
         const stream = !!(opts && opts.stream);
         let b;
         if (input == null) b = new Uint8Array(0);
-        else if (input instanceof ArrayBuffer ||
-                 (typeof G.SharedArrayBuffer === "function" && input instanceof G.SharedArrayBuffer)) {
-          b = input.detached ? new Uint8Array(0) : new Uint8Array(input);
-        }
+        else if (input instanceof ArrayBuffer) b = input.detached ? new Uint8Array(0) : new Uint8Array(input);
         else if (ArrayBuffer.isView(input)) {
           const byteLength = input.byteLength;
           b = byteLength === 0 ? new Uint8Array(0) : new Uint8Array(input.buffer, input.byteOffset, byteLength);
