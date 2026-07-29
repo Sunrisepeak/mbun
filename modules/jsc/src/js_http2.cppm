@@ -724,14 +724,6 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
     if (session.destroyed) throw mkErr("The session has been destroyed", "ERR_HTTP2_INVALID_SESSION");
     assertIsObject(settings, "settings");
     validateSettings(settings);
-    // RFC 8441 3.1: after SETTINGS_ENABLE_CONNECT_PROTOCOL becomes true it
-    // cannot be disabled on the same connection. nghttp2 treats the attempted
-    // downgrade as a connection protocol error.
-    if (settings.enableConnectProtocol === false && session._localSettings &&
-        session._localSettings.enableConnectProtocol === true) {
-      session._connError(constants.NGHTTP2_PROTOCOL_ERROR);
-      return session;
-    }
     if (callback !== undefined && callback !== null && typeof callback !== "function")
       throw argTypeErr("callback", "of type function", callback);
     const copy = Object.assign({}, settings);
@@ -792,21 +784,6 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
   // restricts `alt` to RFC 7230 quoted-string characters.
   const kMaxALTSVC = 16382;
   const kQuotedString = /^[\x21\x23-\x5b\x5d-\x7e\x80-\xff]*$/;
-  // `internal/timers` owns the private symbol that node stores its session
-  // timeout handle under. Keep it lazy: ordinary HTTP/2 users never need to
-  // resolve an internal module, while internal consumers observe the same
-  // timer object that setTimeout() armed.
-  function syncSessionTimeoutShape(session) {
-    let key = null;
-    try {
-      const timers = typeof G.require === "function" ? G.require("internal/timers") : null;
-      if (timers && typeof timers.kTimeout === "symbol") key = timers.kTimeout;
-    } catch (e) {}
-    if (key === null) return;
-    if (!Object.prototype.hasOwnProperty.call(session, key))
-      Object.defineProperty(session, key, { value: null, writable: true, configurable: true });
-    session[key] = session._timer || null;
-  }
   function getURLOrigin(url) {
     // node uses internal/url getURLOrigin: parse and read `origin`, which is
     // the string "null" for a non-special scheme (abc:, foo://bar, ...).
@@ -1683,7 +1660,12 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
         // attached its listener — mbun assigns the id inside request(), so the
         // event has to be raised on the connect edge (or a microtask later for an
         // already-connected session) or nobody can ever observe it.
-        self._queueReady(stream);
+        {
+          const readyStream = stream;
+          const emitReady = () => { if (!readyStream.destroyed) readyStream.emit("ready"); };
+          if (self._connected) G.queueMicrotask(emitReady);
+          else self.once("connect", emitReady);
+        }
         // node ClientHttp2Session#request: 'created' is published with the
         // prepared header object (`sentHeaders`), 'start' once the HEADERS frame
         // has actually been submitted.
@@ -1725,28 +1707,6 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
         }
       }
       return stream;
-    }
-
-    // A pre-connect request needs a deferred 'ready' event, but attaching one
-    // `connect` listener per request trips EventEmitter's max-listener warning
-    // before a busy client has even reached the server. Node drains these from
-    // its pending stream list; keep one session listener and fan it out.
-    _queueReady(stream) {
-      const emitReady = (s) => { if (!s.destroyed) s.emit("ready"); };
-      if (this._connected) {
-        G.queueMicrotask(() => emitReady(stream));
-        return;
-      }
-      if (!this._pendingReadyStreams) this._pendingReadyStreams = [];
-      this._pendingReadyStreams.push(stream);
-      if (this._readyDrainAttached) return;
-      this._readyDrainAttached = true;
-      this.once("connect", () => {
-        this._readyDrainAttached = false;
-        const pending = this._pendingReadyStreams || [];
-        this._pendingReadyStreams = [];
-        for (const readyStream of pending) emitReady(readyStream);
-      });
     }
 
     // The peer's SETTINGS_MAX_CONCURRENT_STREAMS, or Infinity until it has sent
@@ -2270,7 +2230,6 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
         // `session.setTimeout(1, cb)` call cb forever.
       }, this._timeoutMs);
       if (this._timer && this._timer.unref) this._timer.unref();
-      syncSessionTimeoutShape(this);
     }
     get connected() { return this._connected; }
     get remoteSettings() { return this._remoteSettings ? settingsToObject(this._remoteSettings) : undefined; }
