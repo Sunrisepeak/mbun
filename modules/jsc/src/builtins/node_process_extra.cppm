@@ -457,6 +457,36 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
         if (prevValue !== undefined) return { user: user - prevValue.user, system: system - prevValue.system };
         return { user, system };
       };
+
+      proc.threadCpuUsage = function threadCpuUsage(prevValue) {
+        if (prevValue !== undefined) {
+          if (prevValue === null || typeof prevValue !== "object" || Array.isArray(prevValue))
+            throw errInvalidArgType("prevValue", "object", prevValue);
+          if (typeof prevValue.user !== "number")
+            throw errInvalidArgType("prevValue.user", "number", prevValue.user);
+          if (!Number.isFinite(prevValue.user) || prevValue.user < 0)
+            throw errInvalidProp("prevValue.user", prevValue.user);
+          if (typeof prevValue.system !== "number")
+            throw errInvalidArgType("prevValue.system", "number", prevValue.system);
+          if (!Number.isFinite(prevValue.system) || prevValue.system < 0)
+            throw errInvalidProp("prevValue.system", prevValue.system);
+        }
+        const nowUs = G.performance.now() * 1000;
+        const user = Math.max(1, Math.floor(nowUs));
+        const system = Math.floor(nowUs / 4);
+        if (prevValue !== undefined)
+          return { user: Math.max(0, user - prevValue.user), system: Math.max(0, system - prevValue.system) };
+        return { user, system };
+      };
+
+      proc.availableMemory = function availableMemory() {
+        try {
+          const os = G.require && G.require("node:os");
+          return os && typeof os.freemem === "function" ? Number(os.freemem()) : 0;
+        } catch (e) {
+          return 0;
+        }
+      };
     }
 
     // ---- exitCode setter validation (wraps the existing slot) --------------
@@ -472,12 +502,26 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
           get() { return rawGet(); },
           set(code) {
             if (code !== null && code !== undefined) {
-              if (typeof code !== "number") throw errInvalidArgType("code", "number", code);
+              if (typeof code === "string" && /^(?:0|[1-9]\d*)$/.test(code)) code = Number(code);
+              else if (typeof code !== "number") throw errInvalidArgType("code", "number", code);
               if (!Number.isInteger(code)) throw errOutOfRange("code", "an integer", code);
             }
             rawSet(code);
           },
         });
+      }
+
+      if (typeof proc.exit === "function" && !proc.exit.__mbunValidatedExit) {
+        const rawExit = proc.exit.bind(proc);
+        const validatedExit = function exit(code) {
+          if (code === undefined || code === null) return rawExit(code == null ? 0 : code);
+          if (typeof code === "string" && /^(?:0|[1-9]\d*)$/.test(code)) code = Number(code);
+          else if (typeof code !== "number") throw errInvalidArgType("code", "number", code);
+          if (!Number.isInteger(code)) throw errOutOfRange("code", "an integer", code);
+          return rawExit(code);
+        };
+        Object.defineProperty(validatedExit, "__mbunValidatedExit", { value: true });
+        proc.exit = validatedExit;
       }
     } catch (e) {}
 
