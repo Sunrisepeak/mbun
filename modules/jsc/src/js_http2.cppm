@@ -696,11 +696,17 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
     if (typeof cb !== "function") throw argTypeErr("callback", "of type function", cb);
     const buf = payload ? Buffer.from(payload) : Buffer.alloc(8);
     if (!payload) for (let i = 0; i < 8; i++) buf[i] = (Math.random() * 256) | 0;
-    if (session.connecting || session.closed) {
-      G.queueMicrotask(() => cb(mkErr("HTTP2 ping cancelled", "ERR_HTTP2_PING_CANCEL")));
-      return;
-    }
     if (!session._pings) session._pings = [];
+    // node Http2Session::AddPing refuses once maxOutstandingPings are already in
+    // flight and returns false; JS then cancels the callback rather than leaving
+    // it pending (lib/internal/http2/core.js `ping()`: `if (!ret) ping.error()`).
+    // The same cancel-and-return-false shape covers a session that is still
+    // connecting or already closed.
+    const maxPings = (session._options && session._options.maxOutstandingPings) || 10;
+    if (session.connecting || session.closed || session._pings.length >= maxPings) {
+      G.queueMicrotask(() => cb(mkErr("HTTP2 ping cancelled", "ERR_HTTP2_PING_CANCEL")));
+      return false;
+    }
     session._pings.push({ key: buf.toString("hex"), cb, start: Date.now(), payload: buf });
     session._writeFrame(FRAME.PING, 0, 0, buf);
     return true;
@@ -1092,6 +1098,37 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
     if (stream._readBacklog && stream._readBacklog.length) { stream._readBacklog.push(buf); return; }
     if (!stream.push(buf)) { if (!stream._readBacklog) stream._readBacklog = []; }
   }
+  // A trailer HEADERS block, delivered in stream order with the DATA before it.
+  //
+  // node stops reading the socket for as long as a stream's readable side is
+  // paused (streamOnPause -> handle.readStop()), so a trailer block that shares
+  // a read batch with still-undelivered DATA is not even parsed until the
+  // consumer has drained that DATA. mbun parses the whole batch in one go, so
+  // emitting 'trailers' at parse time overtakes bytes the consumer has not seen.
+  // A consumer that reads "trailers" as "the call is over" then throws those
+  // bytes away: grpc-js pauses after every message and outputs the final status
+  // straight from the trailers, dropping every message still buffered behind
+  // them (grpc-js test-server-errors "should emit data for all messages before
+  // error" saw 1 of 2 messages).
+  //
+  // Hold the block for one I/O turn instead, which is the smallest delay that
+  // outlasts a consumer built on process.nextTick — a Readable hands the last
+  // buffered chunk over in a nextTick chain, so anything scheduled with
+  // nextTick here still overtakes it. END_STREAM is held with the trailers so
+  // the order the consumer sees stays node's: data... < trailers < end.
+  function http2StreamEmitTrailers(stream, headersObj, flags, rawHeaders, endStream) {
+    const buffered = kHaveDuplex && !stream.destroyed && !stream._readEnded &&
+      (((stream._readBacklog && stream._readBacklog.length) > 0) || stream.readableLength > 0);
+    if (!endStream || !buffered) { stream.emit("trailers", headersObj, flags, rawHeaders); return; }
+    stream._trailersHeld = true;
+    const nextTurn = typeof G.setImmediate === "function" ? G.setImmediate : (fn) => G.setTimeout(fn, 0);
+    nextTurn(() => {
+      stream._trailersHeld = false;
+      if (stream.destroyed) return;
+      stream.emit("trailers", headersObj, flags, rawHeaders);
+      if (stream._eofHeld) { stream._eofHeld = false; http2StreamEndReadable(stream); }
+    });
+  }
   // The peer sent END_STREAM: EOF the readable side.
   //
   // Pushing null is not enough. node's `onStreamClose` (lib/internal/http2/
@@ -1105,6 +1142,9 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
   // end", same function).
   function http2StreamEndReadable(stream) {
     if (stream._readEnded) return;
+    // Trailers held for the drain turn above carry this stream's END_STREAM;
+    // releasing EOF first would put 'end' in front of them.
+    if (stream._trailersHeld) { stream._eofHeld = true; return; }
     if (kHaveDuplex && stream._readBacklog && stream._readBacklog.length) { stream._readEofPending = true; return; }
     stream._readEnded = true;
     if (!kHaveDuplex) { stream.readable = false; stream.emit("end"); maybeFinishHttp2Stream(stream); return; }
@@ -2099,7 +2139,7 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
       // response is informational: node emits 'headers', and the real response
       // still follows (lib/internal/http2/core.js onSessionHeaders).
       const st = headersObj[":status"];
-      if (stream._responseEmitted) stream.emit("trailers", headersObj, flags, rawHeaders);
+      if (stream._responseEmitted) http2StreamEmitTrailers(stream, headersObj, flags, rawHeaders, pb.endStream);
       else if (typeof st === "number" && st >= 100 && st < 200) {
         stream.emit("headers", headersObj, flags, rawHeaders);
         // node ClientHttp2Stream handleHeaderContinue: a 100 informational
