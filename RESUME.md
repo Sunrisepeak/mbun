@@ -61,6 +61,58 @@ whole-file failure at :111. `finished`/`finished-async-local-storage` and
 `readable-async-iterators` all fail **late** in long files (20+ subtests pass first)
 and are poor value per minute.
 
+## 2026-07-30 10:30 — Buffer pooling: SIZED AND RETIRED (do not schedule)
+
+Two lanes had raised pooling as a suspected explanation for identity-sensitive
+Buffer assertions across both corpora. A sizing-first lane measured it and the
+answer is **do not implement**. No code was written; the tree stayed clean.
+
+**Mechanism confirmed — mbun has ZERO pooling.** `Buffer.poolSize` reports 8192 but
+is **cosmetic**; every allocation gets its own exact-size ArrayBuffer:
+
+| expression | mbun | node |
+| --- | --- | --- |
+| `Buffer.from("abc")` | byteLength 3, off 0 | byteLength 8192, off 0 |
+| `Buffer.from("defg")` | byteLength 4, off 0 | byteLength 8192, off 8 |
+| two `from()` share `.buffer` | **false** | true |
+| `allocUnsafe(8)` ×2 share | **false** | true |
+
+**Blast radius: 65 node source candidates → 1 genuinely blocked file. Bun: 0.**
+The log gate did the work again (the campaign rule: source refs measure surface
+area, logs measure blocked files). All 13 non-passing node candidates were read and
+**none fails for a pooling reason** — they are OpenSSL message text, missing
+`ERR_INVALID_STATE`/`ERR_INVALID_ARG_VALUE`/`ERR_INVALID_THIS` codes,
+`parser.initialize` undefined, `util.inspect` formatting, publicExponent. On bun
+every `pool` match was a **connection/worker/serializer** pool; the `8192` hits were
+`S_IFCHR` and the `byteOffset` hit was a SQL error offset. `compat/bun/test/js/node/buffer.test.js`
+— the only bun file touching `Buffer.poolSize` — is gated by **oom-kill**, not pooling.
+
+**The one blocked file is a 1-for-1 swap, never a net gain.**
+`test-stream-iter-readable-interop.js` needs `bytes()` to yield a plain Uint8Array.
+Pooling is the sole discriminator: node pools `Buffer.from(str)` so it fails
+`concatBytes`' identity check and copies, while zlib's exact-size output keeps the
+identity path. In mbun both are exact-size. `test-stream-iter-transform-sync.js` is
+**currently pass**, so a consumer-side patch trades one green for another — which is
+what an earlier lane measured empirically before reverting.
+
+**Cost that kills it:** node's pooling is *asymmetric* — `alloc` and
+`allocUnsafeSlow` are UNPOOLED, only `allocUnsafe`/`from(string|array)` are pooled.
+Getting that split wrong breaks assertions passing today (`test-buffer-alloc.js:43`
+`b.byteOffset === 0`, `:1144` `allocUnsafeSlow(10).buffer.byteLength === 10`,
+`test-buffer-slow.js`). Guard surface ~700 files, and it is a perf-sensitive global
+hot path — the same shape as the abandoned full `util.inspect` replacement.
+**~700 files of exposure plus allocator perf risk to buy one file.**
+
+**Actions:**
+- Reclassify `test-stream-iter-readable-interop.js` as **known-blocked / wontfix**,
+  pointing at the existing comment at `node_stream_iter_core.cppm:371` so no third
+  lane re-derives it.
+- If ever revisited, the cheap door is **pooling `Buffer.from(string)` ONLY** — the
+  single node path that creates the discriminator — leaving
+  `alloc`/`allocUnsafe`/`allocUnsafeSlow`/`from(arrayBuffer)` untouched. Even then,
+  only bundled into a broader Buffer-semantics project with an allocation-throughput
+  gate, never standalone for one test.
+
 ### `test-stream-readable-compose.js` — isolated to a two-site handoff (not fixed)
 
 The failure is **not** "compose loses errors". Probed both shapes:
