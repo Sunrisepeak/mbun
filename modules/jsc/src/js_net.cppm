@@ -695,6 +695,9 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
           try { fd2 = NN.connect(dh, port, _localAddr, _localPort); }
           catch (e) { self.connecting = false; const err = connectError(e, addr, port); G.queueMicrotask(() => { if (self.destroyed) return; self.emit("error", err); self.destroy(); }); return self; }
           self._adopt(fd2); self.remotePort = port; _adoptLocal(self, fd2);
+          // _adopt owns the descriptor immediately, but public Socket#pending
+          // remains true until the connect event is published.
+          self.pending = true;
           self.connecting = true;
           const finishConnect = () => {
             if (self._httpClientConnectPending) {
@@ -703,7 +706,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
               return;
             }
             if (self.destroyed) { self.connecting = false; return; }
-            self.connecting = false; self._flushPreConnect(null); self._applyDeferredSockOpts(); self.emit("connect"); self.emit("ready");
+            self.pending = false; self.connecting = false; self._flushPreConnect(null); self._applyDeferredSockOpts(); self.emit("connect"); self.emit("ready");
           };
           G.queueMicrotask(finishConnect);
           return self;
@@ -756,6 +759,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       // until the 'connect' event fires; _adopt cleared it because the reactor's
       // connect() already completed synchronously. A destroy() in between must
       // cancel the pending 'connect' rather than resurrect the socket.
+      this.pending = true;
       this.connecting = true;
       const finishConnect = () => {
         if (this._httpClientConnectPending) {
@@ -764,7 +768,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
           return;
         }
         if (this.destroyed) { this.connecting = false; return; }
-        this.connecting = false; this._flushPreConnect(null); this._applyDeferredSockOpts(); this.emit("connect"); this.emit("ready");
+        this.pending = false; this.connecting = false; this._flushPreConnect(null); this._applyDeferredSockOpts(); this.emit("connect"); this.emit("ready");
       };
       G.queueMicrotask(finishConnect);
       return this;
@@ -1275,7 +1279,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
         this.emit("end");
       }
       const wasConnecting = this.connecting;
-      this.destroyed = true; this.connecting = false; this.readable = false; this.writable = false;
+      this.destroyed = true; this.pending = true; this.connecting = false; this.readable = false; this.writable = false;
       if (wasConnecting) {
         this._flushPreConnect(mkErr("Socket closed before the connection was established",
                                     "ERR_SOCKET_CLOSED_BEFORE_CONNECTION"));
