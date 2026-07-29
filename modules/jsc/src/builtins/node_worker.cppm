@@ -100,6 +100,7 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
   const kOnMsgErr = Symbol("mbun.port.onmessageerror");
   const kRefed = Symbol("mbun.port.refed");
   const kStarted = Symbol("mbun.port.started");
+  const kAsyncHookId = Symbol("mbun.port.asyncHookId");
   const INSPECT_SYM = Symbol.for("nodejs.util.inspect.custom");
   // node throws a real DOMException("…", "DataCloneError") — .code === 25 and
   // `err.constructor.name === 'DOMException'` are both asserted by the corpus.
@@ -352,6 +353,7 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
     p[kOnMsgErr] = null;
     p[kRefed] = false;
     p[kStarted] = false;
+    if (typeof G.__mbunAsyncHookInit === "function") p[kAsyncHookId] = G.__mbunAsyncHookInit("MESSAGEPORT", p);
     return p;
   };
 
@@ -409,7 +411,7 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
     if (typeof G.setImmediate === "function") G.setImmediate(() => portFlush(p));
     else G.queueMicrotask(() => portFlush(p));
   };
-  const portStart = (p) => { p[kStarted] = true; scheduleFlush(p); };
+  const portStart = (p) => { p[kStarted] = true; p[kRefed] = true; scheduleFlush(p); };
 
   // ---- structured clone with a transfer list ------------------------------
   const abDetached = (ab) => {
@@ -649,15 +651,21 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
     if (this[kDetached] === true) return;
     const other = this[kOther];
     this[kDetached] = true;
+    this[kRefed] = false;
     this[kOther] = null;
     const self = this;
-    G.queueMicrotask(() => self.emit("close"));
+    G.queueMicrotask(() => {
+      self.emit("close");
+      if (typeof G.__mbunAsyncHookDestroy === "function") G.__mbunAsyncHookDestroy(self[kAsyncHookId]);
+    });
     if (other) {
       other[kOther] = null;
       G.queueMicrotask(() => {
         if (other[kDetached] === true) return;
         other[kDetached] = true;
+        other[kRefed] = false;
         other.emit("close");
+        if (typeof G.__mbunAsyncHookDestroy === "function") G.__mbunAsyncHookDestroy(other[kAsyncHookId]);
       });
     }
   } });
@@ -1208,6 +1216,14 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
       this._exitCode = null;
       this._exitResolvers = [];
       this._refd = true;
+      this._asyncWorkerAlive = true;
+      this._asyncMessagePortRefd = false;
+      this._asyncWorkerHandle = { hasRef: () => this._asyncWorkerAlive ? this._refd : undefined };
+      this._asyncMessagePortHandle = { hasRef: () => this._asyncWorkerAlive ? this._asyncMessagePortRefd : undefined };
+      this._asyncWorkerId = typeof G.__mbunAsyncHookInit === "function"
+        ? G.__mbunAsyncHookInit("WORKER", this._asyncWorkerHandle) : undefined;
+      this._asyncMessagePortId = typeof G.__mbunAsyncHookInit === "function"
+        ? G.__mbunAsyncHookInit("MESSAGEPORT", this._asyncMessagePortHandle) : undefined;
       this.resourceLimits = {};
       this.performance = { eventLoopUtilization: () => ({ idle: 0, active: 0, utilization: 0 }) };
       this.onmessage = null;
@@ -1264,11 +1280,19 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
       child.on("exit", (code, signal) => {
         self._exited = true;
         self._exitCode = signal ? 1 : (code == null ? 1 : code);
+        self._asyncMessagePortRefd = false;
         workerRegistry.delete(tid);
         if (self._tempFile) { try { fsM.unlinkSync(self._tempFile); } catch (e) {} self._tempFile = null; }
         self.emit("exit", self._exitCode);
         const rs = self._exitResolvers.splice(0);
         for (const r of rs) r(self._exitCode);
+        G.queueMicrotask(() => {
+          self._asyncWorkerAlive = false;
+          if (typeof G.__mbunAsyncHookDestroy === "function") {
+            G.__mbunAsyncHookDestroy(self._asyncMessagePortId);
+            G.__mbunAsyncHookDestroy(self._asyncWorkerId);
+          }
+        });
       });
       installCwdBroadcast();
       const emitWorker = () => { if (proc && typeof proc.emit === "function") proc.emit("worker", self); };
@@ -1296,8 +1320,8 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
       try { this._child.kill("SIGTERM"); } catch (e) {}
       return new Promise((resolve) => { this._exitResolvers.push(resolve); });
     }
-    ref() { this._refd = true; if (this._child._rec) this._child._rec.unrefd = false; return this; }
-    unref() { this._refd = false; if (this._child._rec) this._child._rec.unrefd = true; return this; }
+    ref() { this._refd = true; this._asyncMessagePortRefd = true; if (this._child._rec) this._child._rec.unrefd = false; return this; }
+    unref() { this._refd = false; this._asyncMessagePortRefd = false; if (this._child._rec) this._child._rec.unrefd = true; return this; }
     addEventListener(type, cb) { this.on(type, cb); }
     removeEventListener(type, cb) { this.off(type, cb); }
     getHeapSnapshot() { return Promise.reject(new Error("Worker.getHeapSnapshot is not supported in this build")); }

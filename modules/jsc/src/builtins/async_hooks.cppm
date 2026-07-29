@@ -72,6 +72,17 @@ inline constexpr std::string_view kAsyncHooksJS = R"JS(
     }
   };
   const newAsyncId = () => ++nextAsyncId;
+  // JS-backed Worker and MessagePort handles are outside JSC's native provider
+  // table. Route their real resource objects through the same active hook
+  // registry and id sequence as timers and AsyncResource.
+  G.__mbunAsyncHookInit = (type, resource) => {
+    const id = newAsyncId();
+    hookCall("init", id, type, executionId, resource);
+    return id;
+  };
+  G.__mbunAsyncHookDestroy = (id) => {
+    if (id !== undefined) hookCall("destroy", id);
+  };
   const runAsyncCallback = (id, resource, callback, thisArg, args) => {
     const previousId = executionId;
     const previousResource = executionResource;
