@@ -277,6 +277,23 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
   // node's initial default is 500ms; the test harness (common/index.js) reads it,
   // multiplies by 5 and re-sets it (→ 2500), which is what tests assert against.
   let autoSelectFamilyAttemptTimeoutDefault = 500;
+  const normalizedArgsSymbol = () => {
+    try {
+      const internalNet = typeof G.require === "function" ? G.require("internal/net") : null;
+      return internalNet && typeof internalNet.normalizedArgsSymbol === "symbol"
+        ? internalNet.normalizedArgsSymbol : null;
+    } catch (e) { return null; }
+  };
+  const normalizeArgs = (args) => {
+    const list = Array.from(args || []);
+    const options = list[0] && typeof list[0] === "object" ? list[0] : {};
+    const callback = typeof list[0] === "function" ? list[0]
+      : (typeof list[1] === "function" ? list[1] : null);
+    const out = [options, callback];
+    const symbol = normalizedArgsSymbol();
+    if (symbol !== null) out[symbol] = true;
+    return out;
+  };
   // process.execArgv has already been derived from the node-compatible CLI
   // before this module is evaluated. Seed the same defaults net.js reads from
   // its per-isolate options, so child processes retain these switches too.
@@ -491,8 +508,10 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       // Loop-reference state (see NET.hold): sticky intent + current hold.
       this._refd = true; this._held = false; this._loopOpen = false;
       this.allowHalfOpen = !!opts.allowHalfOpen;
-      this.remoteAddress = "127.0.0.1"; this.remoteFamily = "IPv4"; this.remotePort = 0;
-      this.localAddress = "127.0.0.1"; this.localPort = 0;
+      // A client has no peer until its public 'connect' event. Accepted and
+      // adopted sockets fill these in from their handle instead.
+      this.remoteAddress = undefined; this.remoteFamily = undefined; this.remotePort = undefined;
+      this.localAddress = "127.0.0.1"; this.localFamily = "IPv4"; this.localPort = 0;
       this.bytesRead = 0; this.bytesWritten = 0;
       // Minimal node stream.Readable state. This transport pushes straight to
       // 'data' rather than running the Readable machinery, but consumers of a
@@ -566,6 +585,8 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       if (netClientSocketChannel.hasSubscribers) netClientSocketChannel.publish({ socket: this._dcClientSocket || this });
       // ---- node net.js argument validation (Socket.prototype.connect) ----
       const nErr = (Ctor, code, msg) => { const e = new Ctor(msg); e.code = code; return e; };
+      const symbol = normalizedArgsSymbol();
+      if (a.length === 1 && Array.isArray(a[0]) && symbol !== null && a[0][symbol]) a = a[0];
       const optArg = (typeof a[0] === "object" && a[0] !== null && !Array.isArray(a[0])) ? a[0] : null;
       if (optArg) {
         if (optArg.objectMode)
@@ -719,7 +740,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
           let fd2;
           try { fd2 = NN.connect(dh, port, _localAddr, _localPort); }
           catch (e) { self.connecting = false; const err = connectError(e, addr, port); G.queueMicrotask(() => { if (self.destroyed) return; self.emit("error", err); self.destroy(); }); return self; }
-          self._adopt(fd2); self.remotePort = port; _adoptLocal(self, fd2);
+          self._adopt(fd2); self.remoteAddress = addr; self.remoteFamily = fam === 6 ? "IPv6" : "IPv4"; self.remotePort = port; _adoptLocal(self, fd2);
           // _adopt owns the descriptor immediately, but public Socket#pending
           // remains true until the connect event is published.
           self.pending = true;
@@ -731,7 +752,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
               return;
             }
             if (self.destroyed) { self.connecting = false; return; }
-            self.pending = false; self.connecting = false; self._flushPreConnect(null); self._applyDeferredSockOpts(); self.emit("connect"); self.emit("ready");
+            self.pending = false; self.connecting = false; self._flush(); self._flushPreConnect(null); self._applyDeferredSockOpts(); self.emit("connect"); self.emit("ready");
           };
           G.queueMicrotask(finishConnect);
           return self;
@@ -799,6 +820,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       try { if (unixPath && pipePathTooLong(unixPath)) throw new Error("EINVAL"); fd = unixPath ? NN.connectUnix(unixPath) : NN.connect(dialHost, port, _localAddr, _localPort); }
       catch (e) { this.connecting = false; const err = connectError(e, unixPath || host, unixPath ? undefined : port); G.queueMicrotask(() => { if (this.destroyed) return; this.emit("error", err); this.destroy(); }); return this; }
       this._adopt(fd);
+      if (!unixPath) { this.remoteAddress = host; this.remoteFamily = isIPv6(host) ? "IPv6" : "IPv4"; }
       this.remotePort = port;
       if (!unixPath) _adoptLocal(this, fd);
       // node reports `connecting === true` from the moment connect() returns
@@ -814,7 +836,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
           return;
         }
         if (this.destroyed) { this.connecting = false; return; }
-        this.pending = false; this.connecting = false; this._flushPreConnect(null); this._applyDeferredSockOpts(); this.emit("connect"); this.emit("ready");
+        this.pending = false; this.connecting = false; this._flush(); this._flushPreConnect(null); this._applyDeferredSockOpts(); this.emit("connect"); this.emit("ready");
       };
       G.queueMicrotask(finishConnect);
       return this;
@@ -1294,7 +1316,10 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       }
       this._wq.push(b); this._wqLen += b.length; this.bytesWritten += b.length;
       if (this._timeoutMs) this._armTimeout();
-      this._flush();
+      // Pre-connect writes remain observable in Socket#bufferSize until the
+      // public connect boundary. Flushing them immediately let a synchronous
+      // reactor completion erase the queue before user code could inspect it.
+      if (!this.connecting) this._flush();
       // node lib/net.js: a write issued while the socket is still connecting is
       // a *pending* write — its callback fires only once the connection is
       // established, and a destroy() in that window completes it with
@@ -1319,7 +1344,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       if (data != null) this.write(data, enc);
       this._shutW = true; this.writable = false;
       if (typeof cb === "function") this.once("close", cb);
-      this._flush();
+      if (!this.connecting) this._flush();
       return this;
     }
     // Completes the write callbacks that were queued while the socket was still
@@ -2475,6 +2500,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
     isIP, isIPv4, isIPv6,
     setDefaultAutoSelectFamilyAttemptTimeout, getDefaultAutoSelectFamilyAttemptTimeout,
     setDefaultAutoSelectFamily, getDefaultAutoSelectFamily,
+    _normalizeArgs: normalizeArgs,
   }));
 
   // node lib/tty.js: `ReadStream extends net.Socket` / `WriteStream extends
