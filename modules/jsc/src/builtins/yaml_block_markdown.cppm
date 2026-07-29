@@ -1634,10 +1634,14 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
 
   // Split plain text into text + bare-URL autolinks (GFM).
   function pushText(nodes, text) {
-    const re = /(https?:\/\/[^\s<]+)/g;
+    const re = /(https?:\/\/[^\s<]+|www\.[^\s<]+|[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+)/g;
     let last = 0;
     let m;
     while ((m = re.exec(text))) {
+      // GFM does not link `texthttp://…`: a bare autolink needs a text
+      // boundary before its scheme/www form (the email alternative owns its
+      // complete local part, so it is unaffected by this check).
+      if (m.index > 0 && /[A-Za-z0-9]/.test(text[m.index - 1])) continue;
       if (m.index > last) nodes.push({ type: "text", value: text.slice(last, m.index) });
       let url = m[1];
       // Strip trailing punctuation with a single index walk. Paren counts are
@@ -1658,9 +1662,14 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
           end--;
         } else break;
       }
+      // A complete HTML entity suffix belongs to the following text, not the
+      // GFM autolink (`...?q=commonmark&hl;` → link + `&amp;hl;`).
+      const entity = /&[A-Za-z][A-Za-z0-9]*;$/.exec(url.slice(0, end));
+      if (entity) end -= entity[0].length;
       const trail = url.slice(end);
       url = url.slice(0, end);
-      nodes.push({ type: "autolink", href: url, kind: "url", text: url, bare: true });
+      const email = url.includes("@") && !url.includes("://");
+      nodes.push({ type: "autolink", href: email ? url : (url.startsWith("www.") ? "http://" + url : url), kind: email ? "email" : "url", text: url, bare: true });
       if (trail) nodes.push({ type: "text", value: trail });
       last = m.index + m[1].length;
     }
