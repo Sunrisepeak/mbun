@@ -5,6 +5,92 @@ session that is interrupted (usage limit, crash, restart) can pick up from the
 file rather than from memory. **If you are a fresh session reading this, start
 here.**
 
+## 2026-07-29 20:35 — WAVE 40 FINAL: +24 Node green, 0 regressions
+
+Eight lanes total (five dispatched, three re-tasked as lanes freed). Integrated on
+`agent/corpus-coverage-w40`, PR #35. Build green; conflict-marker and
+submodule-gitlink checks clean.
+
+| lane | list | retained | commit |
+| --- | --- | --- | --- |
+| repl2 | 0→7 /12 | serve `internal/repl` from mbun's own REPL | `7a09587` |
+| promise | 0→5 /5 | `v8.promiseHooks` lifecycle hooks | `7405e30` |
+| vm | 0→2 /8 | sandbox writes to realm builtins | `b7d4131` |
+| runner | 0→1 /14 | `node:test` tags + `t.plan` validation | `24bc978` |
+| compile | 0→1 /15 | compile-cache disable trace | `4c26987` |
+| deadblob | — | loud builtin-partition errors | `d42c5cc` |
+| repl | 0/12 | reverted — triaged the seam for repl2 | — |
+| trace | 0/8 | reverted — finding later falsified | — |
+
+**Guards, per-file against the wave-39 full run, 677 files: +24 gained, 0 lost.**
+`test-repl` 56→70, `test-promise` 6→11, `test-vm` 52→54, `test-runner` 29→30,
+`test-compile` 1→2, `test-async` 22→23, and flat on `test-v8` 8/23,
+`test-module` 15/32, `test-process` 66/96, `test-worker` 92/143.
+Node projection **2821 → 2845 / 4433 (64.2%)**, pending the next full run.
+
+### THE lesson of wave 40: three lanes lost to one stale binary
+
+`mcpp build` keys its output dir on a config hash, so a checkout accumulates
+several `target/<arch>/<hash>/bin/mbun`. All of them run. It cost three lanes in
+three different shapes:
+
+1. a lane measured a stale *hash directory* and got a false zero delta;
+2. a lane measured a stale build of the right directory, same result;
+3. **the trace lane reasoned from probes run against a Jul-26 binary and
+   concluded that a live subsystem was dead code.** A whole follow-up lane was
+   spent disproving it.
+
+**CORRECTION — the "dead bootstrap blob" finding recorded earlier in this file
+was WRONG.** `kNodeProcessExtraJS` evaluates to completion; `trace_events` is
+live (`typeof globalThis.__mbunTraceEvents` → `object`,
+`require('trace_events').createTracing` → `function`). Globals installed at
+lines 1371/1399/1504 — well past the alleged abort at ~926 — were present even on
+the stale binary, which by itself falsified the reading. The 22 `test-trace`
+failures are ordinary semantic gaps (e.g. `test-trace-events-api.js` fails on the
+emitted phase character), correctly scoped for a future lane.
+
+The same hazard also *understated* a gain: the repl lanes diffed against a
+Jul-26 baseline of 64/106, so repl2 reported +6 when the authoritative gain was
+**+14**. A stale baseline corrupts results in both directions.
+
+`node_corpus_runner.py` now refuses both shapes — a superseded build output, and
+any binary older than the sources it claims to contain — naming the offending
+file and the rebuild command. `--bin auto` selects the newest build.
+
+**Trap for the next dispatcher:** a worktree based on `6dad3b1` carries the OLD
+runner, where `--bin auto` is treated as a literal path, silently exec's
+`<root>/auto`, and reports every file as `fail` — a very convincing fake
+baseline. Base future lane worktrees on the integration branch, or copy the
+runner in first.
+
+### Other live findings from this wave
+
+- **`process.argv0` returns the bare string `mbun`** instead of the invoked path
+  at `6dad3b1`. It costs any test that respawns through `argv0` (it is why
+  `test-repl-array-prototype-tempering.js` fails). Unfixed; cheap and worth a
+  dedicated item.
+- The builtins blobs contain ~40 inner `try { … } catch (e) {}` blocks, one
+  spanning 364 lines (`node_process_extra.cppm` 747–1111). A throw inside one
+  silently deletes every statement after it. `d42c5cc` makes whole-partition
+  aborts loud but does NOT cover these. Auditing the widest of them is the real
+  structural win.
+
+### Selection lesson for wave 41
+
+Single-signature clusters beat subsystem cuts on triage cost — every lane found
+its root cause inside the timebox, versus waves 34–39 where lanes burned the box
+searching. But a shared signature is not always a shared cause: the runner
+cluster's `error: <v>` was just the corpus runner reporting a non-zero exit, and
+its 14 files needed 13 different features. **Prefer signatures that name a
+contract** (a thrown error type, a missing export) over signatures naming only an
+outcome. The two best lanes (repl2 7/12, promise 5/5) were both cases where mbun
+already owned a near-complete implementation that was unreachable or stubbed —
+that shape is worth hunting deliberately.
+
+Next candidates, ranked: unhandled-rejection cluster (~12 `test-promise*`),
+REPL `historyManager` then terminal line-editing (5 left), vm error-stack
+decoration (2), `test-runner-worker-id` (single mechanism), `argv0`.
+
 ## 2026-07-29 20:20 — wave 40 first five lanes MEASURED (+4 Node, 0 regressions)
 
 Integrated on `agent/corpus-coverage-w40` (based on `origin/rewrite_bun_in_mcpp`
@@ -34,7 +120,9 @@ before quoting it.
 
 Two of the three zero-yield lanes returned findings worth more than their files:
 
-1. **A bootstrap JS blob is dead code.** `kNodeProcessExtraJS` in
+1. **[FALSIFIED — see the wave-40 final section above. The probes behind this
+   came from a stale binary; `trace_events` is live.]** ~~A bootstrap JS blob is
+   dead code.~~ `kNodeProcessExtraJS` in
    `modules/jsc/src/builtins/node_process_extra.cppm` contains a substantially
    complete `trace_events` implementation (~lines 936–1110) that never runs:
    evaluation aborts before ~line 926, silently, so `require('trace_events')`
