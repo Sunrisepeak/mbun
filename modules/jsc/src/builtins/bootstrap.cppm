@@ -1956,7 +1956,10 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       handlers.warned = true;
       const warn = new Error(`Possible EventEmitter memory leak detected. ${handlers.length} ${String(type)} listeners added to [${emitter.constructor.name}]. Use emitter.setMaxListeners() to increase limit`);
       warn.name = "MaxListenersExceededWarning"; warn.emitter = emitter; warn.type = type; warn.count = handlers.length;
-      (G.console && G.console.warn ? G.console.warn : (() => {}))(warn);
+      // This is a process warning, not a console diagnostic. Routing through
+      // emitWarning preserves the warning event's next-tick timing and exposes
+      // node's structured MaxListenersExceededWarning to observers.
+      if (G.process && typeof G.process.emitWarning === "function") G.process.emitWarning(warn);
     }
     function insert(self, type, fn, prepend) {
       let events = self._events;
