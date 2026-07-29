@@ -578,7 +578,12 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       // node inherits process.env when env is unset (undefined/null); an explicit
       // {} means an empty environment. Snapshot process.env so the child sees the
       // JS-visible env (harness-injected vars), not just the raw OS environ.
-      const baseEnv = options.env && typeof options.env === "object" ? options.env : (G.process && G.process.env) || {};
+      const envSource = options.env && typeof options.env === "object" ? options.env : (G.process && G.process.env) || {};
+      // Options are own-property normalized at the public entry points, but
+      // environment objects deliberately retain enumerable inherited entries.
+      // Node passes those through to the child (e.g. Object.create({ FOO: 1 })).
+      const baseEnv = {};
+      for (const k in envSource) baseEnv[k] = envSource[k];
       if (ipcIndex >= 0) {
         // node advertises the child's end of the channel through NODE_CHANNEL_FD
         // (lib/internal/child_process.js spawn()); the fd number is the slot index.
@@ -738,6 +743,11 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   const validateStr = (v, name) => { if (typeof v !== "string") throw errArgType(name, "of type string", v); };
   const validateFn = (v, name) => { if (typeof v !== "function") throw errArgType(name, "of type function", v); };
   const isInt32 = (v) => typeof v === "number" && Number.isInteger(v) && v >= -2147483648 && v <= 2147483647;
+  const ownOptions = (options) => {
+    const out = {};
+    for (const key of Object.keys(options)) out[key] = options[key];
+    return out;
+  };
   const toPathString = (p, name) => {
     if (typeof p === "string") { nullCheck(p, name); return p; }
     if (p !== null && typeof p === "object") {
@@ -823,6 +833,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     for (const a of args) nullCheck(a, "args");
     if (options === undefined) options = {};
     else validateObj(options, "options");
+    options = ownOptions(options);
     validateCommonOpts(options);
     return { file, args, options };
   };
@@ -835,6 +846,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     if (typeof options === "function") callback = options;
     else if (options != null) validateObj(options, "options");
     if (options == null) options = {};
+    options = ownOptions(options);
     if (callback != null) validateFn(callback, "callback");
     if (options.argv0 != null) validateStr(options.argv0, "options.argv0");
     return { file, args, options, callback };
@@ -930,7 +942,9 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   function execSync(command, o) {
     validateStr(command, "command");
     nullCheck(command, "command");
-    if (o != null) { validateObj(o, "options"); validateCommonOpts(o); }
+    if (o != null) validateObj(o, "options");
+    o = ownOptions(o || {});
+    validateCommonOpts(o);
     // Route through spawnSync so execSync observes the same bounded pipe
     // collection as spawnSync/execFileSync (including ENOBUFS + stdout).
     const r = spawnSync("/bin/sh", ["-c", command], o);
@@ -1062,8 +1076,9 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     if (typeof options === "function") { cb = options; options = {}; }
     validateStr(command, "command");
     nullCheck(command, "command");
-    if (options != null) { validateObj(options, "options"); validateCommonOpts(options); }
-    options = options || {};
+    if (options != null) validateObj(options, "options");
+    options = ownOptions(options || {});
+    validateCommonOpts(options);
     if (cb != null) validateFn(cb, "callback");
     const sh = options.shell ? (options.shell === true ? "/bin/sh" : toStr(options.shell)) : "/bin/sh";
     const child = new ChildProcess();
@@ -1122,7 +1137,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     else if (typeof args === "object" && !Array.isArray(args)) { options = args; args = []; }
     else if (!Array.isArray(args)) throw errArgType("args", "an instance of Array", args);
     if (options != null) validateObj(options, "options");
-    options = options || {};
+    options = ownOptions(options || {});
     validateCommonOpts(options);
     for (const a of args) nullCheck(a, "args");
     if (options.execPath != null) { validateStr(options.execPath, "options.execPath"); nullCheck(options.execPath, "options.execPath"); }
