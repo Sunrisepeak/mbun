@@ -100,22 +100,7 @@ export constexpr std::string_view kDgramJS = R"JS(
   const ERR_SOCKET_BAD_BUFFER_SIZE = () => mk(TypeError, "ERR_SOCKET_BAD_BUFFER_SIZE",
     "Buffer size must be a positive integer");
   const ERR_SOCKET_BUFFER_SIZE = (ctx) => {
-    const info = {
-      errno: ctx && ctx.errno,
-      code: ctx && ctx.code,
-      message: ctx && ctx.message,
-      syscall: ctx && ctx.syscall,
-    };
-    const e = mk(Error, "ERR_SOCKET_BUFFER_SIZE", "Could not get or set buffer size: " +
-      info.syscall + " returned " + info.code + " (" + info.message + ")");
-    e.name = "SystemError";
-    e.info = info;
-    // These accessors are enumerable in node's SystemError and are observable
-    // through util.inspect as well as direct property reads.
-    Object.defineProperty(e, "errno", { enumerable: true, configurable: true,
-      get() { return info.errno; }, set(v) { info.errno = v; } });
-    Object.defineProperty(e, "syscall", { enumerable: true, configurable: true,
-      get() { return info.syscall; }, set(v) { info.syscall = v; } });
+    const e = mk(Error, "ERR_SOCKET_BUFFER_SIZE", "Could not get or set buffer size: " + String(ctx && ctx.message || ctx));
     return e;
   };
   const ERR_BUFFER_OUT_OF_BOUNDS = (name) => mk(RangeError, "ERR_BUFFER_OUT_OF_BOUNDS",
