@@ -30,6 +30,10 @@ inline constexpr std::string_view kAsyncHooksJS = R"JS(
     if (index < 0) next.push(storage, value); else next[index + 1] = value;
     return next;
   };
+  // SameValue without consulting the mutable userland Object.is. Node's ALS
+  // uses the primordial operation to decide whether run() may take its
+  // no-frame fast path, so NaN compares equal while +0 and -0 remain distinct.
+  const sameValue = (a, b) => a === b ? (a !== 0 || 1 / a === 1 / b) : a !== a && b !== b;
   const callInContext = (context, fn, thisArg, args) => {
     const previous = contextGet();
     contextSet(context);
@@ -174,12 +178,22 @@ inline constexpr std::string_view kAsyncHooksJS = R"JS(
 
     run(store, callback, ...args) {
       if (typeof callback !== "function") throw new TypeError('The "callback" argument must be of type function');
+      // A same-value run does not install a temporary frame. This is observable:
+      // enterWith() in the callback then survives, as does exit() on a fresh
+      // storage. A disabled storage always takes the full path, even when its
+      // defaultValue matches the requested store.
+      if (!this.#disabled && sameValue(store, this.getStore())) return callback(...args);
       const previous = contextGet();
-      const wasDisabled = this.#disabled;
       this.#disabled = false;
       contextSet(contextWith(previous, this, store));
       try { return callback(...args); }
-      finally { if (!wasDisabled) contextSet(previous); }
+      finally {
+        // disable() may run inside the callback. Re-entering the prior frame
+        // also re-enables this storage; otherwise a nested run would leave its
+        // outer value masked and a disabled run would leak its temporary store.
+        this.#disabled = false;
+        contextSet(previous);
+      }
     }
 
     disable() {
