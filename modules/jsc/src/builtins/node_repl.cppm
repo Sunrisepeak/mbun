@@ -1282,6 +1282,18 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
     }
 
     close() {
+      // node repl.js REPLServer.prototype.close: a terminal REPL must not tear
+      // the Interface down while a debounced history write is still pending,
+      // or the `close` listener runs before the entries reach disk. The next
+      // REPL to open the same NODE_REPL_HISTORY file then reads it empty —
+      // which is exactly how test-repl-history-navigation lost every entry
+      // test #1 had typed before test #2 tried to navigate them.
+      const hm = this.historyManager;
+      if (this.terminal && hm && hm.isFlushing && !this._closingOnFlush) {
+        this._closingOnFlush = true;
+        this.once("flushHistory", () => super.close());
+        return;
+      }
       process.nextTick(() => super.close());
     }
 
