@@ -2676,17 +2676,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     try { Object.defineProperty(G, "__bunResolveObjectURL", { value: __resolveObjectURL, enumerable: false, configurable: true, writable: true }); } catch (e) {}
     G.URL = class URL {
       get [Symbol.toStringTag]() { return "URL"; }
-      static canParse(input, ...rest) {
-        // URL.canParse has one required Web IDL argument. Do this before the
-        // parse attempt: a missing argument is a programmer error, whereas an
-        // invalid supplied URL is the false result this predicate represents.
-        if (arguments.length < 1) {
-          const e = new TypeError('The "url" argument must be specified');
-          e.code = "ERR_MISSING_ARGS";
-          throw e;
-        }
-        try { new G.URL(input, ...rest); return true; } catch (e) { return false; }
-      }
+      static canParse(input, ...rest) { try { new G.URL(input, ...rest); return true; } catch (e) { return false; } }
       static createObjectURL(blob) {
         if (arguments.length < 1) { const e = new TypeError("Not enough arguments"); e.code = "ERR_MISSING_ARGS"; throw e; }
         if (!(G.Blob && blob instanceof G.Blob)) throw new TypeError("createObjectURL expects a Blob object");
