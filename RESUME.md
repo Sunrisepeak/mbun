@@ -297,6 +297,21 @@ Guards: HTTP client 63/68 pass; module 11 pass, 18 fail, 3 skip; require 13
 pass, 9 fail, 1 skip; abort 1/7 pass; readline 10 pass, 3 fail, 8 skip. Every
 guard has zero green-to-non-green regressions.
 
+### Sprint wave 20 measured checkpoint (13:55–14:03)
+
+Hash/Hmac output validation, child maxBuffer, module/require validation, and
+Worker entry protocol delivered **+2 in 8 minutes = 15 files/hour**:
+
+- string URL and URL+eval Worker validation: +2/2 after integration corrected
+  the exact `file://` guidance text;
+- Hash/Hmac remained whole-file red and was additively reverted;
+- child maxBuffer and module/require candidates were semantically identical to
+  wave 4 and wave 14 code respectively, so conflict review skipped them without
+  duplicate commits or gains.
+
+Both Worker targets changed frozen fail-to-pass and pass 2/2 on the exact rebuilt
+tree. There are zero green-to-non-green regressions; structural guards are clean.
+
 ### Sprint wave 19 measured checkpoint (13:50–13:55)
 
 DH/ECDH uninitialized state plus terminal net write errors forecast four files;

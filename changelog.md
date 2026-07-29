@@ -5,6 +5,20 @@
 
 ## 2026-07-29
 
+### 5 小时冲刺第二十批：8 分钟净增 2 文件，15 files/hour
+
+13:55–14:03 验收 Hash/Hmac、child maxBuffer、module/require 与 Worker
+entry protocol，严格结算 **+2**：
+
+- Worker 对字符串 `file:`/`data:` URL 及 URL+eval 组合执行 Node 入口
+  校验；主集成修正 `file://` 精确 guidance 后两个目标 **2/2**；
+- Hash/Hmac encoding 两文件仍红，提交 additive revert；
+- child sync maxBuffer 已由 wave4 公共 `spawnSync` 路径覆盖，module/require
+  校验已由 wave14 覆盖；两项冲突审查后直接 skip，不重复代码、不计收益。
+
+两个 Worker 目标从 frozen fail→pass，green→non-green 0；精确修正版
+重建后 2/2，结构守卫全绿。
+
 ### 5 小时冲刺第十九批：5 分钟净增 1 文件，12 files/hour
 
 13:50–13:55 组合 DH/ECDH 未初始化状态与 net terminal write 错误，静态
