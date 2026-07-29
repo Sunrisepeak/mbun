@@ -59,6 +59,8 @@ import mbun.postgres;
 // Bun.redis RESP codec (runtime/valkey_client.inc __mbunValkeyNative).
 import mbun.valkey;
 import mbun.sourcemap_jsc.internal_source_map;
+// hosted-git-info URL normalization backs bun:internal-for-testing.hostedGitInfo.
+import mbun.install.hosted_git_info;
 // T-LOOP native epoll event loop for Bun.serve (runtime/serve_native.inc).
 import mbun.event_loop;
 import mbun.runtime_socket;
@@ -96,6 +98,7 @@ namespace {
 // node:tls native backend (getCiphers) over vendored OpenSSL/libssl (mbun.openssl).
 #include "runtime/node_tls.inc"
 #include "runtime/sourcemap.inc"
+#include "runtime/hosted_git_info.inc"
 #include "runtime/io_bindings.inc"
 // node:zlib streaming Transform handles (mbun.compress.stream): incremental
 // deflate/inflate/brotli/zstd state machines behind __mbunZlibNative.stream*.

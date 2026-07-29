@@ -4346,6 +4346,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     stringsInternals: { toUTF16AllocSentinel: (b) => new TextDecoder().decode(b) },
     Bun: globalThis.Bun,
     internalSourceMap: globalThis.__mbunSourceMapNative,
+    hostedGitInfo: globalThis.__mbunHostedGitInfoNative,
     // highlightJavaScript/Redacted attached later (in the highlighter's scope).
     // shellInternals.parse — tagged template over the native mbun.shell parser;
     // interpolations become __bun_<i> JSObjRef markers (bun's own encoding).

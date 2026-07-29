@@ -712,6 +712,11 @@
         set_fn(ctx_, smn, "toVLQ", source_map_to_vlq_cb);
         set_fn(ctx_, smn, "find", source_map_find_cb);
         set_prop(ctx_, global, "__mbunSourceMapNative", smn);
+        // hostedGitInfo.parseUrl is an install parser diagnostic exposed solely
+        // through bun:internal-for-testing (bootstrap.cppm).
+        JSObjectRef hostedGitInfo{JSObjectMake(ctx_, nullptr, nullptr)};
+        set_fn(ctx_, hostedGitInfo, "parseUrl", hosted_git_info_parse_url_cb);
+        set_prop(ctx_, global, "__mbunHostedGitInfoNative", hostedGitInfo);
         // node:http maxHeaderSize <-> the process-wide mbun.http limit that
         // every server reads per request. ref: bun node_http_binding.rs.
         JSObjectRef htn{JSObjectMake(ctx_, nullptr, nullptr)};
