@@ -92,6 +92,7 @@ int main(int argc, char* argv[]) {
         const mbun::cli::PermissionCommandLine perm{mbun::cli::derive_permission_cli(rawArgs)};
         mbun::jsc::runtime::set_permission_command_line(perm.tokens, perm.hasEvalString,
                                                         perm.entry, perm.preloads);
+        set_cli_preloads(mbun::cli::derive_runtime_preloads(rawArgs));
     }
 
     // ── argv0 == `node` → node emulation (cli/mod.rs:952 → run_command.rs:2981).
@@ -187,6 +188,18 @@ int main(int argc, char* argv[]) {
         if (args[0] == "--no-env-file") {
             mbun::jsc::runtime::set_disable_env_files(true);
             args.erase(args.begin());
+            continue;
+        }
+        const bool preloadFlag{args[0] == "--preload" || args[0] == "--require" ||
+                               args[0] == "-r" || args[0] == "--import" ||
+                               args[0].starts_with("--preload=") ||
+                               args[0].starts_with("--require=") || args[0].starts_with("-r=") ||
+                               args[0].starts_with("--import=")};
+        if (preloadFlag) {
+            const bool separateValue{args[0] == "--preload" || args[0] == "--require" ||
+                                     args[0] == "-r" || args[0] == "--import"};
+            const std::size_t count{separateValue && args.size() > 1 ? 2 : 1};
+            args.erase(args.begin(), args.begin() + static_cast<std::ptrdiff_t>(count));
             continue;
         }
         if (const std::size_t n{take_valued_flag(args, 0, "--env-file",

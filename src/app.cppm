@@ -46,6 +46,12 @@ Flags:
   -h, --help     Show this message
 )";
 
+std::vector<std::string> gCliPreloads{};
+
+void set_cli_preloads(std::vector<std::string> preloads) {
+    gCliPreloads = std::move(preloads);
+}
+
 // A bare path argument that looks like a runnable script (bun-style `bun x.js`).
 // Defined later in this TU; used by run_install above their definitions.
 std::optional<std::filesystem::path> find_package_json(const std::filesystem::path& start);
@@ -220,6 +226,7 @@ int run_script(std::string_view script, std::span<const std::string_view> script
     // src/bunfig/arguments.rs load_config): emit a config error to stderr but
     // still run the script (exit unaffected). Parser + "expected string" type
     // check already live in modules/bunfig; only the run-path wiring was missing.
+    std::vector<std::string> preloads{};
     {
         std::error_code ec{};
         if (std::filesystem::exists("bunfig.toml", ec)) {
@@ -240,16 +247,18 @@ int run_script(std::string_view script, std::span<const std::string_view> script
                             // --no-env-file. ref: bun bunfig.rs -> dotenv/env_loader.rs.
                             mbun::jsc::runtime::set_disable_env_files(true);
                         }
-                        // `preload = [...]`: imported before the entry point
-                        // (jsc_hooks.rs `reload_entry_point`).
-                        if (!cfg->preloads.empty()) {
-                            mbun::jsc::runtime::set_preloads(cfg->preloads);
-                        }
+                        // bunfig entries precede CLI runtime preload options.
+                        preloads = cfg->preloads;
                     }
                 }
             }
         }
     }
+    for (const std::string& preload : gCliPreloads) {
+        if (std::ranges::find(preloads, preload) == preloads.end())
+            preloads.push_back(preload);
+    }
+    mbun::jsc::runtime::set_preloads(std::move(preloads));
     if (is_markdown(script)) return run_markdown(script);
     const std::string entry{resolve_entry_path(script)};
     std::vector<std::string> jsArgv;
