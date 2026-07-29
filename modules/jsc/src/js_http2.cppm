@@ -1802,21 +1802,6 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
           if (flags & FLAG.ACK) { if (len !== 0) { this._connError(constants.NGHTTP2_FRAME_SIZE_ERROR); return false; } resolveSettingsAck(this); return true; }
           if (len % 6 !== 0) { this._connError(constants.NGHTTP2_FRAME_SIZE_ERROR); return false; }
           if (streamId !== 0) { this._connError(constants.NGHTTP2_PROTOCOL_ERROR); return false; }
-          // RFC 8441 makes ENABLE_CONNECT_PROTOCOL one-way for a connection:
-          // after a peer enables it, a later SETTINGS frame may not explicitly
-          // turn it back off. nghttp2 treats that as a connection protocol
-          // error instead of silently changing the negotiated capability.
-          if (this._remoteSettings && this._remoteSettings.enableConnectProtocol === 1) {
-            for (let i = 0; i + 6 <= payload.length; i += 6) {
-              const id = (payload[i] << 8) | payload[i + 1];
-              const value = (payload[i + 2] * 0x1000000) + (payload[i + 3] << 16) +
-                (payload[i + 4] << 8) + payload[i + 5];
-              if (id === 8 && value === 0) {
-                this._connError(constants.NGHTTP2_PROTOCOL_ERROR);
-                return false;
-              }
-            }
-          }
           const settings = this._parseSettings(payload);
           this._remoteSettings = settings;
           this._writeFrame(FRAME.SETTINGS, FLAG.ACK, 0, Buffer.alloc(0));   // ack
