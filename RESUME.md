@@ -297,6 +297,19 @@ Guards: HTTP client 63/68 pass; module 11 pass, 18 fail, 3 skip; require 13
 pass, 9 fail, 1 skip; abort 1/7 pass; readline 10 pass, 3 fail, 8 skip. Every
 guard has zero green-to-non-green regressions.
 
+### Sprint wave 22 measured checkpoint (14:11–14:15)
+
+V8 transferArrayBuffer state plus DNS lookup boolean validation forecast four
+files and delivered **+1 in 4 minutes = 15 files/hour**:
+
+- shared `all`/`verbatim` validation made the promise deprecated-options DNS
+  file green; the callback file still has an independent failure;
+- V8 serdes remained red while two existing serialization guards stayed green,
+  so the zero-yield V8 commit was additively reverted.
+
+The five-file DNS lookup guard is 4 pass / 1 retained failure: one frozen
+fail-to-pass and zero green-to-non-green regressions. Structural guards are clean.
+
 ### Sprint wave 21 measured checkpoint (14:03–14:11)
 
 VM compile validation plus Worker/MessagePort async-hook lifecycle forecast

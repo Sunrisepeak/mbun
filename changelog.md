@@ -5,6 +5,18 @@
 
 ## 2026-07-29
 
+### 5 小时冲刺第二十二批：4 分钟净增 1 文件，15 files/hour
+
+14:11–14:15 验收 V8 transferArrayBuffer 与 DNS lookup boolean options，
+静态预计 4，实际 **+1**：
+
+- DNS callback/promise 共用 `all`/`verbatim` boolean 校验，promise
+  deprecated-options 目标 **+1/2**；callback 文件仍有独立失败；
+- V8 serdes 仍红，两个既有绿色序列化守卫保持，提交 additive revert。
+
+完整 5 文件 DNS lookup 守卫为 4 pass / 1 既有 fail；frozen 对比
+1 fail→pass、green→non-green 0，结构守卫全绿。
+
 ### 5 小时冲刺第二十一批：8 分钟净增 3 文件，22.5 files/hour
 
 14:03–14:11 组合 vm compile 输入校验与 Worker/MessagePort async-hook
