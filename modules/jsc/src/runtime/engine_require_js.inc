@@ -137,13 +137,13 @@ globalThis.__mbun_make_require_esm = function (dir) {
 // module-scoped require (the script-mode JSC loader can't fetch/transpile TS).
 // Returns a Promise of an ESM namespace (exports + a `default`), so consumers
 // that read `.default` (node builtins/stubs, interop) behave like real import().
-globalThis.__mbun_esm_namespace = function (m) {
+globalThis.__mbun_esm_namespace = function (m, forceCommonJSDefault) {
   if (m === null || (typeof m !== "object" && typeof m !== "function")) return { default: m };
   // Own enumerable props become named exports (a transpiled ESM module also
   // copies its own `.default` here). A pure CJS module has no `default`, so the
   // whole exports object is the default binding (Node CJS→ESM interop).
   var ns = Object.assign({}, m);
-  if (!("default" in ns)) ns.default = m;
+  if (forceCommonJSDefault || !("default" in ns)) ns.default = m;
   return ns;
 };
 globalThis.__mbun_dyn_import = function (req, spec, options) {
@@ -167,7 +167,11 @@ globalThis.__mbun_dyn_import = function (req, spec, options) {
     }
     // Pass the import marker (3rd arg): a dynamic import() is ImportKind::Dynamic,
     // so a resolution failure reports ERR_MODULE_NOT_FOUND (bun ResolveMessage.rs).
-      return globalThis.__mbun_esm_namespace(req(String(spec), attr, 1));
+      var requested = String(spec);
+      // node:process is a CommonJS builtin. Its namespace default is the
+      // process object even if user code assigns process.default.
+      return globalThis.__mbun_esm_namespace(
+        req(requested, attr, 1), requested === "process" || requested === "node:process");
     });
   };
   const modules = globalThis.__mbunNativeModules;
