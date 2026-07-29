@@ -491,9 +491,24 @@ inline constexpr std::string_view kNodeModuleJS = R"JS(
     return invalidArgType("options", "string or Object or undefined", options);
   }
 
+  // NODE_DEBUG_NATIVE=COMPILE_CACHE turns the compile-cache decisions into a
+  // stderr trace.  Node emits these from the native loader; the ones mbun can
+  // honestly report today are the configuration decisions made right here.
+  function compileCacheTrace(message) {
+    const env = G.process && G.process.env;
+    const spec = env && env.NODE_DEBUG_NATIVE;
+    if (!spec || String(spec).indexOf("COMPILE_CACHE") === -1) return;
+    if (G.process && typeof G.process._rawDebug === "function") {
+      G.process._rawDebug("[compile_cache] " + message);
+    } else if (G.process && G.process.stderr && typeof G.process.stderr.write === "function") {
+      G.process.stderr.write("[compile_cache] " + message + "\n");
+    }
+  }
+
   function enableCompileCache(options) {
     const env = G.process && G.process.env;
     if (env && env.NODE_DISABLE_COMPILE_CACHE === "1") {
+      compileCacheTrace("Disabled by NODE_DISABLE_COMPILE_CACHE");
       return { status: compileCacheStatus.DISABLED };
     }
     if (compileCacheDirectory !== undefined) {
