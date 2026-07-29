@@ -2095,6 +2095,10 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
     function onEnd() {
       if (upgraded) return;
       if (!request.res && !socket._hadError) {
+        // EOF can be what first exposes a malformed response. Detach before
+        // publishing the request error so observers never retain the parser's
+        // data listener after a terminal parse failure.
+        detach();
         socket._hadError = true;
         emitErrorEvent(request, ConnResetException("socket hang up"));
       }
