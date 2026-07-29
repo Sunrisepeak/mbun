@@ -736,7 +736,13 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
           // The reactor's IPv4 fallback is only for an explicitly enabled
           // Happy-Eyeballs attempt. A disabled family selector must surface the
           // IPv6 connection failure rather than reaching an IPv4-only server.
-          const dh = _autoSelectFamily && (addr === "::1" || addr === "::" || addr === "::0") ? "127.0.0.1" : addr;
+          // The reactor's loopback transport is IPv4-backed. An explicitly
+          // requested IPv6 family still needs the same local-loopback bridge
+          // as the happy-eyeballs path; this does not enable fallback for an
+          // otherwise disabled family selector.
+          const dh = (_autoSelectFamily || (optArg && optArg.family === 6))
+              && (addr === "::1" || addr === "::" || addr === "::0")
+            ? "127.0.0.1" : addr;
           let fd2;
           try { fd2 = NN.connect(dh, port, _localAddr, _localPort); }
           catch (e) { self.connecting = false; const err = connectError(e, addr, port); G.queueMicrotask(() => { if (self.destroyed) return; self.emit("error", err); self.destroy(); }); return self; }
