@@ -1461,6 +1461,55 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
 
   M["repl"] = replExports;
   M["node:repl"] = replExports;
+
+  // node's `internal/repl` and `internal/repl/await`, served from THIS repl.
+  //
+  // Under --expose-internals the corpus requires those two ids directly. Left
+  // alone they resolve, through compat/node/tsconfig.json's
+  // `"internal/*": ["./lib/internal/*"]`, to node's real lib files, and node's
+  // own chain then dies twice over: internal/repl/utils.js wants the acorn
+  // copy vendored under deps/ (not lib/internal/deps/, so the mapping can never
+  // reach it), and past that internal/vm.js wants a contextify binding that
+  // exposes ContextifyScript, which mbun's internalBinding("contextify") does
+  // not. Registering them as builtins short-circuits require() before the
+  // resolver runs (see builtin_module in runtime/process_extended.inc), so
+  // node's lib chain is bypassed entirely.
+  //
+  // Shape is node's: lib/internal/repl.js is `{ __proto__: REPL }` plus an own
+  // `createInternalRepl`, and lib/internal/repl/await.js exports exactly
+  // `{ processTopLevelAwait }`.
+  //
+  // GATED. `internal/*` is node-internal namespace: handing it to an ordinary
+  // program would let any script — or a package shipping its own
+  // `internal/repl` — be shadowed by this. So the two entries are accessors
+  // that yield the module only under node's own flag, --expose-internals, and
+  // `undefined` otherwise; builtin_module treats undefined as "not a builtin"
+  // and falls through to normal resolution. The check has to be lazy because
+  // the builtins image is evaluated before process.execArgv exists (same
+  // reason node_vm_modules gates vm.Module lazily). Non-enumerable so
+  // `Object.keys(M)` — the source of module.builtinModules — never lists them.
+  const exposeInternals = () => {
+    const argv = (G.process && G.process.execArgv) || [];
+    for (const a of argv) if (a === "--expose-internals") return true;
+    return false;
+  };
+  const internalRepl = Object.create(replExports);
+  Object.defineProperty(internalRepl, "createInternalRepl", {
+    value: createInternalRepl, writable: true, configurable: true, enumerable: true,
+  });
+  const internalReplAwait = { processTopLevelAwait };
+  for (const [id, value] of [["internal/repl", internalRepl],
+                             ["internal/repl/await", internalReplAwait]]) {
+    Object.defineProperty(M, id, {
+      get() { return exposeInternals() ? value : undefined; },
+      set(v) {
+        Object.defineProperty(M, id, {
+          value: v, writable: true, enumerable: false, configurable: true,
+        });
+      },
+      enumerable: false, configurable: true,
+    });
+  }
 })();
 )JS";
 
