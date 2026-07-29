@@ -2056,7 +2056,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
         originalListener = handlers.listener || handlers;
         delete events[type];
         this._eventsCount--;
-      } else {
+      } else if (Array.isArray(handlers)) {
         let position = -1;
         for (let i = handlers.length - 1; i >= 0; i--) {
           if (handlers[i] === fn || handlers[i].listener === fn) {
@@ -2069,7 +2069,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
         if (position === 0) handlers.shift(); else handlers.splice(position, 1);
         if (handlers.length === 1) events[type] = handlers[0];
         else if (handlers.length === 0) { delete events[type]; this._eventsCount--; }
-      }
+      } else return this;
       if (events.removeListener !== undefined) this.emit("removeListener", type, originalListener);
       return this;
     };
