@@ -78,6 +78,7 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
   const kNamespace = Symbol("kNamespace");
   const kExports = Symbol("kExports");
   const kStarExports = Symbol("kStarExports");
+  const kNamedImports = Symbol("kNamedImports");
   const kDeps = Symbol("kDeps");
   const kResolved = Symbol("kResolved");
   const kValues = Symbol("kValues");
@@ -414,6 +415,22 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
         throw ERR("ERR_VM_MODULE_NOT_MODULE", TypeError,
                   "Provided module is not an instance of Module");
       }
+      // A linker may only return modules from the SAME context as the importer;
+      // node rejects a cross-context resolution rather than linking realms
+      // together. `undefined` is the main context, so compare identity directly.
+      if (result[kWrap].contextObject !== mod[kWrap].contextObject) {
+        throw ERR("ERR_VM_MODULE_DIFFERENT_CONTEXT", Error,
+                  "Linked modules must use the same context");
+      }
+      // Linking onto an already-errored module fails the whole link, carrying the
+      // dependency's own error as `cause` (node sets it so the caller can tell
+      // WHICH dependency broke, not just that linking failed).
+      if (result[kWrap].status === "errored") {
+        const le = ERR("ERR_VM_MODULE_LINK_FAILURE", Error,
+                       "Provided module could not be linked");
+        le.cause = result[kWrap].error;
+        throw le;
+      }
       mod[kResolved].set(dep, result);
       resolvedDeps.push(result);
     }
@@ -423,6 +440,22 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
         rw.status = "linking";
         await linkModule(result, linker, seen);
         rw.status = "linked";
+      }
+    }
+    // Only now are the children linked, so their star re-exports are resolvable
+    // and exportNamesOf() is complete. Importing a name a dependency does not
+    // export is a SYNTAX error in the spec (resolution happens at link time, not
+    // at run time), and node surfaces the engine's SyntaxError with no code.
+    for (const need of mod[kNamedImports] || []) {
+      const target = mod[kResolved].get(need.dep);
+      if (target === undefined) continue;
+      const available = exportNamesOf(target, new Set());
+      for (const name of need.names) {
+        if (!available.includes(name)) {
+          throw new SyntaxError(
+            "The requested module '" + need.dep.specifier +
+            "' does not provide an export named '" + name + "'");
+        }
       }
     }
   }
@@ -615,6 +648,7 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
     const contextKey = contextObject === undefined ? kMainContextKey : contextObject;
     mod[kExports] = new Map();
     mod[kStarExports] = [];
+    mod[kNamedImports] = [];
     mod[kDeps] = [];
     mod[kResolved] = new Map();
     mod[kRequests] = [];
@@ -696,6 +730,11 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
 
       const bindings = new Map();
       for (const imp of analysis.imports) {
+        // Record the named bindings so linkModule can verify at link time that
+        // each dependency actually exports them.
+        if (imp.bindings && imp.bindings.length) {
+          this[kNamedImports].push({ dep: imp.dep, names: imp.bindings.map((b) => b[0]) });
+        }
         if (imp.star) {
           bindings.set(imp.star, () => self[kResolved].get(imp.dep)[kNamespace]);
         }
