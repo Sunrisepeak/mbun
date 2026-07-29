@@ -1350,10 +1350,32 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       if (fn[kCustom] !== undefined && fn[kCustom] !== null) {
         const c = fn[kCustom];
         if (typeof c !== "function") { const e = new TypeError('The "util.promisify.custom" property must be of type function. Received ' + typeof c); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
+        // Some built-ins install an anonymous custom promisifier. Node exposes
+        // that function under the original API name (fs.exists, timers, streams,
+        // and child_process all depend on it), without overwriting an explicit
+        // custom name or a non-configurable descriptor.
+        if (!c.name && fn.name) {
+          try { Object.defineProperty(c, "name", { value: fn.name, configurable: true }); } catch (_) {}
+        }
         Object.defineProperty(c, kCustom, { value: c, enumerable: false, writable: false, configurable: true });
         return c;
       }
-      const p = function (...a) { return new Promise((res, rej) => { fn.call(this, ...a, (e, v) => (e ? rej(e) : res(v))); }); };
+      // internal/util's customPromisifyArgs is deliberately a private Symbol,
+      // rather than a registry symbol. Match it by its stable description so a
+      // caller can request an object for multi-value callbacks (fs.read style).
+      const kArgs = Object.getOwnPropertySymbols(fn).find((s) => s.description === "customPromisifyArgs");
+      const argNames = kArgs === undefined ? undefined : fn[kArgs];
+      const p = function (...a) { return new Promise((res, rej) => {
+        fn.call(this, ...a, (e, ...values) => {
+          if (e) return rej(e);
+          if (argNames !== undefined && values.length > 1) {
+            const out = {};
+            for (let i = 0; i < argNames.length; i++) out[argNames[i]] = values[i];
+            return res(out);
+          }
+          return res(values[0]);
+        });
+      }); };
       Object.defineProperty(p, kCustom, { value: p, enumerable: false, writable: false, configurable: true });
       // node promisify() copies `original`'s prototype and own descriptors onto
       // the wrapper, so `name` / `length` and any decoration survive.
