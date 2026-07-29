@@ -834,6 +834,7 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
       JSONL.parseChunk = (input, start, end) => {
         const bytes = input && ArrayBuffer.isView(input);
         if (typeof input !== "string" && !bytes) throw inputError(input);
+        if (bytes) G.__mbunCheckAllocLimit(input.byteLength, "text");
         const length = bytes ? input.byteLength : input.length;
         const offset = (value, fallback, negative) => {
           value = value === undefined ? fallback : Number(value);
