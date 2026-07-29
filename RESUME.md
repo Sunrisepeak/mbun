@@ -14,12 +14,12 @@ ending. This file is what makes that recoverable.
 
 This section supersedes the older state snapshot below.
 
-- **Integration branch**: `agent/corpus-coverage-continuation`, based on
-  `rewrite_bun_in_mcpp` at `5a901d7` through merge checkpoint `e79cc27`.
+- **Integration branch**: `agent/corpus-coverage-live`, based linearly on
+  `rewrite_bun_in_mcpp` at `5a901d7`.
 - **Current published baseline**: node `2,654 / 4,433` pass and bun
   `868 / 1,902` green, from the same target-branch build recorded by PR #32.
-- **PR**: pending the first real post-#32 delta; do not reopen or reuse merged
-  PR #25.
+- **PR**: the live draft PR replaces blocked PR #33; do not reopen or reuse
+  merged PR #25.
 
 The first three-way reuse probe tested local round-10 branches for node's
 `--test` CLI, HTTP/2 argument/timer validation, and verbatim Node error text.
