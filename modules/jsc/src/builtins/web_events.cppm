@@ -198,33 +198,12 @@ inline constexpr std::string_view kWebEventsJS = R"JS(
     // surface. Delivers real MessageEvent instances (initMessageEvent works).
     {
       const reg = new Map(); // name -> Set<channel>
-      let deliveryQueued = false;
-      const drain = () => {
-        deliveryQueued = false;
-        // Node drains each receiving port's FIFO before moving to the next
-        // port, in creation order. Scheduling one microtask per post instead
-        // interleaves senders (c2<-c1 before c1<-c3), which is observably
-        // different in worker_threads' BroadcastChannel contract.
-        for (const channels of reg.values()) {
-          for (const ch of channels) {
-            while (!ch._closed && ch._queue.length) {
-              const data = ch._queue.shift();
-              ch.dispatchEvent(new G.MessageEvent("message", { data }));
-            }
-          }
-        }
-      };
-      const scheduleDrain = () => {
-        if (deliveryQueued) return;
-        deliveryQueued = true;
-        G.queueMicrotask(drain);
-      };
       const HANDLER = new WeakMap();
       class BroadcastChannel extends G.EventTarget {
         constructor(name) {
           if (arguments.length === 0) throw new TypeError("BroadcastChannel constructor requires a name argument");
           super();
-          this._name = String(name); this._closed = false; this._queue = [];
+          this._name = String(name); this._closed = false;
           let s = reg.get(this._name); if (!s) reg.set(this._name, s = new Set());
           s.add(this);
         }
@@ -241,8 +220,9 @@ inline constexpr std::string_view kWebEventsJS = R"JS(
           if (arguments.length === 0) throw new TypeError("postMessage requires a message argument");
           const s = reg.get(this._name); if (!s) return;
           let data = msg; if (typeof G.structuredClone === "function") data = G.structuredClone(msg);
-          for (const ch of s) { if (ch === this || ch._closed) continue; ch._queue.push(data); }
-          scheduleDrain();
+          for (const ch of s) { if (ch === this || ch._closed) continue;
+            G.queueMicrotask(() => { if (!ch._closed) ch.dispatchEvent(new G.MessageEvent("message", { data })); });
+          }
         }
         close() { if (this._closed) return; this._closed = true;
           const s = reg.get(this._name); if (s) { s.delete(this); if (s.size === 0) reg.delete(this._name); } }
