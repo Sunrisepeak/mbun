@@ -429,7 +429,7 @@ private:
         Value::Table* t{dig_(&into, std::span{segs}.first(segs.size() - 1))};
         const std::string& key{segs.back()};
         if (t->find(key) != nullptr) {
-            fail(i_, "Syntax Error: duplicate key");
+            fail(i_, std::format("Cannot redefine key '{}'", key));
         }
         t->entries.emplace_back(key, std::move(v));
     }
@@ -533,7 +533,7 @@ private:
             }
             const std::string& key{segs.back()};
             if (t->find(key) != nullptr) {
-                fail(i_, "Syntax Error: duplicate key in inline table");
+                fail(i_, std::format("Cannot redefine key '{}'", key));
             }
             t->entries.emplace_back(key, std::move(v));
             skip_inline_ws_();
@@ -712,11 +712,21 @@ private:
                 return;
             }
             if (c == '\\') {
-                char nc{peek_at_(1)};
-                if (nc == '\n' || nc == '\r' || nc == ' ' || nc == '\t') {
-                    // Line-continuation: drop the backslash and all following
-                    // whitespace/newlines up to the next non-whitespace char.
-                    ++i_;  // backslash
+                // A line-continuation is a backslash followed by optional inline
+                // whitespace and then a *newline*. A backslash followed by a bare
+                // CR (or by whitespace that never reaches a newline) is an invalid
+                // escape, not a continuation (#30893).
+                std::size_t j{i_ + 1};
+                while (j < s_.size() && (s_[j] == ' ' || s_[j] == '\t')) {
+                    ++j;
+                }
+                bool continuation{j < s_.size() &&
+                                  (s_[j] == '\n' ||
+                                   (s_[j] == '\r' && j + 1 < s_.size() && s_[j + 1] == '\n'))};
+                if (continuation) {
+                    // Drop the backslash and all following whitespace/newlines up
+                    // to the next non-whitespace character.
+                    i_ = j;
                     while (i_ < s_.size() &&
                            (s_[i_] == ' ' || s_[i_] == '\t' || s_[i_] == '\n' || s_[i_] == '\r')) {
                         ++i_;
@@ -785,12 +795,22 @@ private:
         }
     }
 
+    // Renders one byte the way bun's TOML diagnostics do: printable ASCII is
+    // quoted, everything else is shown as a hex code unit.
+    static std::string describe_byte_(char c) {
+        auto b{static_cast<unsigned char>(c)};
+        if (b > 0x20 && b < 0x7F) {
+            return std::format("'{}'", static_cast<char>(b));
+        }
+        return std::format("(0x{:02X})", static_cast<unsigned>(b));
+    }
+
     // i_ points at the backslash. Decodes one escape into `out`.
     void decode_escape_(std::string& out, bool multiline) {
         (void)multiline;
         ++i_;  // backslash
         if (i_ >= s_.size()) {
-            fail(i_, "Syntax Error: unterminated escape");
+            fail(i_, "Unterminated string");
         }
         char e{s_[i_]};
         ++i_;
@@ -820,64 +840,34 @@ private:
             out.push_back('/');
             return;
         case 'x':
-            append_utf8(out, read_fixed_hex_(2));
+            append_utf8(out, read_fixed_hex_(2, "A hex escape must be followed by exactly 2 hex digits"));
             return;
+        // TOML has no `\u{...}` form: `{` is simply not a hex digit, so the
+        // JavaScript escape is rejected at the brace (#30893, #32025, #30825).
         case 'u':
-            if (i_ < s_.size() && s_[i_] == '{') {
-                ++i_;
-                append_utf8(out, read_variable_hex_());
-                return;
-            }
-            append_utf8(out, read_fixed_hex_(4));
+            append_utf8(out,
+                        read_fixed_hex_(4, "A Unicode escape must be followed by exactly 4 hex digits"));
             return;
         case 'U':
-            append_utf8(out, read_fixed_hex_(8));
+            append_utf8(out,
+                        read_fixed_hex_(8, "A Unicode escape must be followed by exactly 8 hex digits"));
             return;
         default:
-            fail(i_, "Syntax Error: invalid escape sequence");
+            fail(i_, std::format("Invalid escape sequence: {}", describe_byte_(e)));
         }
     }
 
-    char32_t read_fixed_hex_(int n) {
+    char32_t read_fixed_hex_(int n, std::string_view badDigits) {
         std::uint32_t value{0};
         for (int k{0}; k < n; ++k) {
             if (i_ >= s_.size() || !is_hex(s_[i_])) {
-                fail(i_, "Syntax Error: invalid hex escape");
+                fail(i_, std::string{badDigits});
             }
             value = value * 16 + static_cast<std::uint32_t>(hex_val(s_[i_]));
             ++i_;
         }
         if (value > 0x10FFFF || (value >= 0xD800 && value <= 0xDFFF)) {
-            fail(i_, "Unicode escape sequence is out of range");
-        }
-        return static_cast<char32_t>(value);
-    }
-
-    // Variable-length \u{...}; i_ points just past '{'. Finds the closing brace
-    // before judging range, so a missing brace is a Syntax Error and an in-range
-    // check never trips on a truncated value (#30825).
-    char32_t read_variable_hex_() {
-        std::uint64_t value{0};
-        bool overflow{false};
-        bool any{false};
-        while (i_ < s_.size() && is_hex(s_[i_])) {
-            any = true;
-            value = value * 16 + static_cast<std::uint64_t>(hex_val(s_[i_]));
-            if (value > 0x10FFFF) {
-                overflow = true;
-                value = 0x110000;  // saturate to keep scanning without overflowing
-            }
-            ++i_;
-        }
-        if (i_ >= s_.size() || s_[i_] != '}') {
-            fail(i_, "Syntax Error: expected '}' in unicode escape");
-        }
-        ++i_;  // closing brace
-        if (!any) {
-            fail(i_, "Syntax Error: empty unicode escape");
-        }
-        if (overflow || value > 0x10FFFF || (value >= 0xD800 && value <= 0xDFFF)) {
-            fail(i_, "Unicode escape sequence is out of range");
+            fail(i_, "Escaped code point must be a Unicode scalar value");
         }
         return static_cast<char32_t>(value);
     }

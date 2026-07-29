@@ -345,8 +345,10 @@ void test_deep_nesting_errors() {
 // ---------------------------------------------------------------------------
 
 void test_parse_ts_vectors() {
-    // \u{XX} variable-length escape at start of a basic string (#30893).
-    expect_key_string("key = \"\\u{41}\"", "key", "A", "toml-parse.ts > #30893 \\u{41}");
+    // `\u{XX}` is a JavaScript escape, not TOML: `{` is not a hex digit, so the
+    // escape is rejected at the brace (#30893, #32025, #30825).
+    expect_error("key = \"\\u{41}\"", "A Unicode escape must be followed by exactly 4 hex digits",
+                 "toml-parse.ts > #30893 \\u{41}");
 
     // Quoted KEY at file offset 0 with a bad escape must throw, never panic
     // (#30893 underflow). The codepoint after \x / \u is U+3945C (F0 B9 91 9C),
@@ -360,9 +362,16 @@ void test_parse_ts_vectors() {
                  "\" = 1",
                  "", "toml-parse.ts > #30893 \\u in quoted key");
 
-    // Trailing backslash-CR line-continuation ending a multiline basic string
-    // (#30893). Bytes: key = """\<CR>"""  ->  "".
-    expect_key_string("key = \"\"\"\\\r\"\"\"", "key", "", "toml-parse.ts > #30893 backslash-CR");
+    // A trailing backslash followed by a *bare* CR is not a line-continuation —
+    // a continuation needs a real newline (#30893).
+    // Bytes: key = """\<CR>"""  ->  Invalid escape sequence: (0x0D).
+    expect_error("key = \"\"\"\\\r\"\"\"", "Invalid escape sequence: (0x0D)",
+                 "toml-parse.ts > #30893 backslash-CR");
+    // A backslash before CRLF (or LF) still continues the line.
+    expect_key_string("key = \"\"\"a\\\r\nb\"\"\"", "key", "ab",
+                      "toml-parse.ts > backslash-CRLF continuation");
+    expect_key_string("key = \"\"\"a\\\n  b\"\"\"", "key", "ab",
+                      "toml-parse.ts > backslash-LF continuation");
 
     // \t = U+0009, \f = U+000C (the zig lexer had these swapped).
     expect_key_string("k = \"a\\tb\"", "k", "a\tb", "toml-parse.ts > \\t escape");
@@ -373,45 +382,40 @@ void test_parse_ts_vectors() {
     expect_key_string("k = \"\"\"a\r\nb\\tc\"\"\"", "k", "a\nb\tc",
                       "toml-parse.ts > CRLF normalization");
 
-    // Out-of-range \u{...} escapes throw with the specific message (#30825).
-    constexpr std::string_view oor{"Unicode escape sequence is out of range"};
-    expect_error("a = \"\\u{3333333316aaaaaaa}\"", oor, "toml-parse.ts > #30825 oor big");
+    // Every \u{...} shape is rejected at the brace, however long the hex run —
+    // including the digit counts that overflowed the old i64 accumulator (#30825).
+    constexpr std::string_view brace{"A Unicode escape must be followed by exactly 4 hex digits"};
+    expect_error("a = \"\\u{3333333316aaaaaaa}\"", brace, "toml-parse.ts > #30825 brace big");
     std::string f64(64, 'f');
-    expect_error("a = \"\\u{" + f64 + "}\"", oor, "toml-parse.ts > #30825 oor 64f");
-    expect_error("a = \"\\u{0000" + f64 + "}\"", oor, "toml-parse.ts > #30825 oor 0000+64f");
-    expect_error("a = \"\\u{110000}\"", oor, "toml-parse.ts > #30825 oor 110000");
+    expect_error("a = \"\\u{" + f64 + "}\"", brace, "toml-parse.ts > #30825 brace 64f");
+    expect_error("a = \"\\u{110000}\"", brace, "toml-parse.ts > #30825 brace 110000");
+    expect_error("a = \"\\u{41\"", brace, "toml-parse.ts > #30825 no-brace 41");
+    expect_error("a = \"\\u{\"", brace, "toml-parse.ts > #30825 no-brace empty");
 
-    // \u{...} with no closing brace throws Syntax Error (#30825).
-    constexpr std::string_view syn{"Syntax Error"};
-    expect_error("a = \"\\u{41\"", syn, "toml-parse.ts > #30825 no-brace 41");
-    expect_error("a = \"\\u{\"", syn, "toml-parse.ts > #30825 no-brace empty");
-    expect_error("a = \"\\u{110000\"", syn, "toml-parse.ts > #30825 no-brace 110000");
-    expect_error("a = \"\\u{" + f64 + "\"", syn, "toml-parse.ts > #30825 no-brace 64f");
-
-    // In-range \u{...} escapes still decode (#30825).
+    // Fixed-width escapes still decode, and out-of-range/surrogate code points
+    // report bun's scalar-value diagnostic.
     {
-        constexpr std::string_view src{"toml-parse.ts > #30825 in-range 41"};
-        auto root{parse_ok("a = \"\\u{41}\"", src)};
+        constexpr std::string_view src{"toml-parse.ts > \\u0041"};
+        auto root{parse_ok("a = \"\\u0041\"", src)};
         if (root) {
             expect_string(*root, {K("a")}, "A", src);
         }
     }
     {
-        constexpr std::string_view src{"toml-parse.ts > #30825 in-range leading zeros"};
-        std::string z64(64, '0');
-        auto root{parse_ok("a = \"\\u{" + z64 + "41}\"", src)};
-        if (root) {
-            expect_string(*root, {K("a")}, "A", src);
-        }
-    }
-    {
-        constexpr std::string_view src{"toml-parse.ts > #30825 in-range 10FFFF"};
-        auto root{parse_ok("a = \"\\u{10FFFF}\"", src)};
+        constexpr std::string_view src{"toml-parse.ts > \\U0010FFFF"};
+        auto root{parse_ok("a = \"\\U0010FFFF\"", src)};
         if (root) {
             // U+10FFFF encodes to F4 8F BF BF.
             expect_string(*root, {K("a")}, "\xF4\x8F\xBF\xBF", src);
         }
     }
+    constexpr std::string_view scalar{"Escaped code point must be a Unicode scalar value"};
+    expect_error("a = \"\\uD800\"", scalar, "toml-parse.ts > surrogate escape");
+    expect_error("a = \"\\U00110000\"", scalar, "toml-parse.ts > out-of-range escape");
+
+    // Duplicate keys name the offending key, as bun's diagnostics do.
+    expect_error("\"\xC3\xA9\" = 1\n\"\xC3\xA9\" = 2", "Cannot redefine key '\xC3\xA9'",
+                 "toml-parse.ts > duplicate non-ASCII key");
 
     // Arrays require comma separators (#31252).
     expect_error("a = [1 2]", "", "toml-parse.ts > #31252 [1 2]");
