@@ -68,7 +68,7 @@ inline constexpr std::string_view kAsyncHooksJS = R"JS(
   const hookCall = (name, ...args) => {
     for (const hook of Array.from(activeHooks)) {
       const callback = hook[name];
-      if (typeof callback === "function") callback(...args);
+      if (typeof callback === "function") Reflect.apply(callback, hook, args);
     }
   };
   const newAsyncId = () => ++nextAsyncId;

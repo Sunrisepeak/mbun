@@ -651,10 +651,10 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
     if (this[kDetached] === true) return;
     const other = this[kOther];
     this[kDetached] = true;
-    this[kRefed] = false;
     this[kOther] = null;
     const self = this;
     G.queueMicrotask(() => {
+      self[kRefed] = false;
       self.emit("close");
       if (typeof G.__mbunAsyncHookDestroy === "function") G.__mbunAsyncHookDestroy(self[kAsyncHookId]);
     });
