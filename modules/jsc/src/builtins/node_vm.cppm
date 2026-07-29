@@ -309,6 +309,81 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
     }
   }
 
+  // ── displayErrors: node's source-context decoration ────────────────────────
+  // An error escaping a vm run carries, ahead of the usual stack, the offending
+  // line and a caret:
+  //     filename:1
+  //     throw new Error("foo");
+  //           ^
+  //
+  //     Error: foo
+  //         at filename:1:7
+  // JSC instead reports a bare "global code@filename:1:16" frame, so build the
+  // header from the compiled source and restate the frames in V8 spelling.
+  // ref: node lib/vm.js (displayErrors) / src/node_contextify.cc DecorateErrorStack.
+  const vmDecorated = new WeakSet();
+
+  // V8 points a call site at the START of the callee expression (including a
+  // leading `new`); JSC points at the opening paren. Walk back over the callee
+  // so the top frame's column matches node's.
+  function callSiteColumn(srcLine, column) {
+    if (typeof srcLine !== "string" || !(column > 1) || srcLine[column - 1] !== "(") return column;
+    let i = column - 1;
+    while (i > 0 && /\s/.test(srcLine[i - 1])) i--;
+    while (i > 0 && /[\w$.]/.test(srcLine[i - 1])) i--;
+    const before = srcLine.slice(0, i).trimEnd();
+    if (before.endsWith("new") && !/[\w$.]/.test(before[before.length - 4] || "")) {
+      i = before.length - 3;
+    }
+    return i + 1;
+  }
+
+  // "fn@file:line:col" / "global code@file:line:col" / "@" → "    at …".
+  function v8Frames(stack) {
+    const out = [];
+    for (const raw of `${stack === undefined ? "" : stack}`.split("\n")) {
+      const ln = raw.trim();
+      if (ln === "") continue;
+      const at = ln.lastIndexOf("@");
+      let name = at >= 0 ? ln.slice(0, at) : "";
+      const loc = at >= 0 ? ln.slice(at + 1) : ln;
+      if (name === "global code" || name === "module code" || name === "eval code") name = "";
+      out.push(name ? `    at ${name} (${loc || "<anonymous>"})` : `    at ${loc || "<anonymous>"}`);
+    }
+    return out;
+  }
+
+  const ErrorProtoToString = Error.prototype.toString;
+
+  function decorateVmError(err, code, filename, displayErrors) {
+    if (displayErrors === false) return err;
+    if (err === null || typeof err !== "object") return err;
+    if (vmDecorated.has(err)) return err;
+    const line = err.line;
+    if (typeof line !== "number" || line < 1) return err;
+    // Only decorate errors raised BY the compiled script, never one that merely
+    // travelled through it.
+    const stack = err.stack;
+    if (err.sourceURL !== filename &&
+        !(typeof stack === "string" && stack.split("\n")[0].endsWith(`@${filename}:${line}:${err.column}`))) {
+      return err;
+    }
+    const srcLine = `${code}`.split("\n")[line - 1];
+    if (typeof srcLine !== "string") return err;
+    const col = callSiteColumn(srcLine, typeof err.column === "number" ? err.column : 1);
+    let title;
+    try { title = ErrorProtoToString.call(err); } catch (e) { return err; }
+    const frames = v8Frames(stack);
+    if (frames.length === 0) frames.push("    at <anonymous>");
+    frames[0] = `    at ${filename}:${line}:${col}`;
+    const head = `${filename}:${line}\n${srcLine}\n${" ".repeat(col - 1)}^\n\n`;
+    try {
+      err.stack = head + title + "\n" + frames.join("\n");
+      vmDecorated.add(err);
+    } catch (e) { /* frozen error object: leave the stack alone */ }
+    return err;
+  }
+
   function evalInContext(rec, code, filename) {
     syncIn(rec);
     armWriteTraps(rec);
@@ -447,12 +522,22 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
     }
     runInThisContext(options) {
       validateRunOptions(options);
-      return NVM.runInThis(this.__code, this.__filename);
+      try {
+        return NVM.runInThis(this.__code, this.__filename);
+      } catch (err) {
+        throw decorateVmError(err, this.__code, this.__filename,
+                              options ? options.displayErrors : undefined);
+      }
     }
     runInContext(contextifiedObject, options) {
       validateContextified(contextifiedObject);
       validateRunOptions(options);
-      return evalInContext(records.get(contextifiedObject), this.__code, this.__filename);
+      try {
+        return evalInContext(records.get(contextifiedObject), this.__code, this.__filename);
+      } catch (err) {
+        throw decorateVmError(err, this.__code, this.__filename,
+                              options ? options.displayErrors : undefined);
+      }
     }
     runInNewContext(contextObject, options) {
       const o = normalizeOptions(options);

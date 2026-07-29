@@ -1607,6 +1607,8 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     });
   } catch (e) {}
   if (G.process) {
+    // Object.prototype.toString.call(process) === "[object process]" in node.
+    try { Object.defineProperty(G.process, Symbol.toStringTag, { value: "process", writable: false, enumerable: false, configurable: true }); } catch (e) {}
     try { Object.defineProperty(G.console, "_stdout", { value: G.process.stdout, writable: true, enumerable: false, configurable: true }); } catch (e) {}
     try { Object.defineProperty(G.console, "_stderr", { value: G.process.stderr, writable: true, enumerable: false, configurable: true }); } catch (e) {}
   }
