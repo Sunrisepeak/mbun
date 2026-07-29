@@ -5,6 +5,20 @@
 
 ## 2026-07-29
 
+### 5 小时冲刺第二十一批：8 分钟净增 3 文件，22.5 files/hour
+
+14:03–14:11 组合 vm compile 输入校验与 Worker/MessagePort async-hook
+生命周期，静态预计 4–5，实际 **+3**：
+
+- WORKER/MESSAGEPORT 资源进入现有 active hook registry；主集成补 hook
+  callback `this` controller 身份、MessagePort close ref 延迟，三个 hasRef
+  目标最终 **3/3**；
+- vm 两个目标仍红，两个既有绿色验证守卫保持，但整文件新增为 0，
+  vm 提交 additive revert。
+
+精确修正版重建后 Worker 三文件 3/3，均为 frozen fail→pass，
+green→non-green 0；结构守卫全绿。
+
 ### 5 小时冲刺第二十批：8 分钟净增 2 文件，15 files/hour
 
 13:55–14:03 验收 Hash/Hmac、child maxBuffer、module/require 与 Worker

@@ -297,6 +297,21 @@ Guards: HTTP client 63/68 pass; module 11 pass, 18 fail, 3 skip; require 13
 pass, 9 fail, 1 skip; abort 1/7 pass; readline 10 pass, 3 fail, 8 skip. Every
 guard has zero green-to-non-green regressions.
 
+### Sprint wave 21 measured checkpoint (14:03–14:11)
+
+VM compile validation plus Worker/MessagePort async-hook lifecycle forecast
+four to five files and delivered **+3 in 8 minutes = 22.5 files/hour**:
+
+- WORKER/MESSAGEPORT resources now use the existing active hook registry;
+  integration corrected callback `this` to the returned hook controller and
+  delayed MessagePort ref clearing to the close event. All three hasRef files
+  pass;
+- both VM failure targets remained red, while two prior validation guards stayed
+  green. The zero-yield VM commit was additively reverted.
+
+The exact rebuilt Worker gate is 3/3, all frozen fail-to-pass, with zero
+green-to-non-green regressions. Structural guards are clean.
+
 ### Sprint wave 20 measured checkpoint (13:55–14:03)
 
 Hash/Hmac output validation, child maxBuffer, module/require validation, and
