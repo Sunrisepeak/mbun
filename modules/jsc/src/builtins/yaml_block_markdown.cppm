@@ -1097,8 +1097,8 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
             if (cc === 47 /* / */) {
               const d = i + 1 < n ? s.charCodeAt(i + 1) : 0;
               if (d === 47) { i += 2; while (i < n && s.charCodeAt(i) !== 10) i++; continue; }
-              if (d === 42) { const e = s.indexOf("*/", i + 2); if (e === -1) err("Unterminated comment"); i = e + 2; continue; }
-              err("Unexpected token '/'");
+              if (d === 42) { const e = s.indexOf("*/", i + 2); if (e === -1) err("Unterminated multi-line comment"); i = e + 2; continue; }
+              err("Unexpected character");
             }
             break;
           }
@@ -1116,7 +1116,7 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
             i += 2;
             const h0 = i;
             while (i < n && isHex(s.charCodeAt(i))) i++;
-            if (i === h0) err("No hexadecimal digits after '0x'");
+            if (i === h0) err("Invalid hex number");
             return parseInt(s.slice(h0, i), 16);
           }
           const i0 = i;
@@ -1135,7 +1135,7 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
             if (i < n && (s.charCodeAt(i) === 43 || s.charCodeAt(i) === 45)) i++;
             const e0 = i;
             while (i < n && (cc = s.charCodeAt(i)) >= 48 && cc <= 57) i++;
-            if (i === e0) err("Exponent has no digits");
+            if (i === e0) err("Invalid number");
           }
           return Number(s.slice(start, i));
         };
@@ -1151,7 +1151,7 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
             if (cc === 92 /* \ */) {
               out += s.slice(chunk, i);
               i++;
-              if (i >= n) err("Unterminated string");
+              if (i >= n) err("Unexpected end of input in escape sequence");
               const e = s.charCodeAt(i);
               // JSON5 line continuation: backslash + line terminator is removed.
               if (e === 10) { i++; }
@@ -1166,9 +1166,9 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
               else if (e === 118) { out += "\v"; i++; }
               else if (e === 48 && !(i + 1 < n && s.charCodeAt(i + 1) >= 48 && s.charCodeAt(i + 1) <= 57)) { out += "\0"; i++; }
               else if (e === 117) { // \uXXXX
-                if (i + 5 > n) err("Invalid unicode escape");
+                if (i + 5 > n) err("Invalid unicode escape: expected 4 hex digits");
                 let v = 0;
-                for (let k = i + 1; k < i + 5; k++) { const h = s.charCodeAt(k); if (!isHex(h)) err("Invalid unicode escape"); v = v * 16 + parseInt(s[k], 16); }
+                for (let k = i + 1; k < i + 5; k++) { const h = s.charCodeAt(k); if (!isHex(h)) err("Invalid unicode escape: expected 4 hex digits"); v = v * 16 + parseInt(s[k], 16); }
                 out += String.fromCharCode(v);
                 i += 5;
               } else if (e === 120) { // \xXX
@@ -1177,11 +1177,12 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
                 if (!isHex(h1) || !isHex(h2)) err("Invalid hex escape");
                 out += String.fromCharCode(parseInt(s.slice(i + 1, i + 3), 16));
                 i += 3;
-              } else err("Invalid escape character " + s[i]);
+              } else if (e >= 48 && e <= 57) err("Octal escape sequences are not allowed in JSON5");
+              else err("Invalid escape character " + s[i]);
               chunk = i;
               continue;
             }
-            if (cc < 0x20) err("Unescaped control character in string");
+            if (cc < 0x20) err("Unterminated string");
             i++;
           }
         };
@@ -1189,51 +1190,61 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
           const cc = s.charCodeAt(i);
           if (cc === 34 || cc === 39) return parseString();
           if (isIdStart(cc)) { const start = i; i++; while (i < n && isIdPart(s.charCodeAt(i))) i++; return s.slice(start, i); }
-          err("Property name must be a string literal or an identifier");
+          if (cc === 92 && s.charCodeAt(i + 1) !== 117) err("Invalid unicode escape: expected 4 hex digits");
+          if (cc === 64) err("Unexpected character");
+          err("Invalid identifier start character");
         };
         const parseObject = () => {
           i++; // {
           const obj = {};
+          let sawProperty = false;
+          let afterComma = false;
           for (;;) {
             skipWS();
-            if (i >= n) err("Unexpected EOF");
+            if (i >= n) err((afterComma || !sawProperty) ? "Unexpected end of input" : "Unterminated object");
             let cc = s.charCodeAt(i);
             if (cc === 125 /* } */) { i++; return obj; }
             const key = parseKey();
             skipWS();
-            if (i >= n || s.charCodeAt(i) !== 58) err("Expected ':' before value in object property definition");
+            if (i >= n || s.charCodeAt(i) !== 58) err("Expected ':' after object key");
             i++;
             const value = parseValue();
             if (key === "__proto__") Object.defineProperty(obj, key, { value, writable: true, enumerable: true, configurable: true });
             else obj[key] = value;
+            sawProperty = true;
+            afterComma = false;
             skipWS();
-            if (i >= n) err("Unexpected EOF");
+            if (i >= n) err("Unterminated object");
             cc = s.charCodeAt(i);
-            if (cc === 44 /* , */) { i++; continue; }
+            if (cc === 44 /* , */) { i++; afterComma = true; continue; }
             if (cc === 125 /* } */) { i++; return obj; }
-            err("Expected '}'");
+            err("Expected ','");
           }
         };
         const parseArray = () => {
           i++; // [
           const arr = [];
+          let sawElement = false;
+          let afterComma = false;
           for (;;) {
             skipWS();
-            if (i >= n) err("Unexpected EOF");
+            if (i >= n) err((afterComma || !sawElement) ? "Unexpected end of input" : "Unterminated array");
             let cc = s.charCodeAt(i);
             if (cc === 93 /* ] */) { i++; return arr; }
             arr.push(parseValue());
+            sawElement = true;
+            afterComma = false;
             skipWS();
-            if (i >= n) err("Unexpected EOF");
+            if (i >= n) err("Unterminated array");
             cc = s.charCodeAt(i);
-            if (cc === 44) { i++; continue; }
+            if (cc === 44) { i++; afterComma = true; continue; }
             if (cc === 93) { i++; return arr; }
-            err("Expected ']'");
+            err("Expected ','");
           }
         };
         const parseValue = () => {
           skipWS();
-          if (i >= n) err("Unexpected EOF");
+          if (i >= n) err("Unexpected end of input");
           const cc = s.charCodeAt(i);
           if (cc === 123) return parseObject();
           if (cc === 91) return parseArray();
@@ -1242,14 +1253,16 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
             i++;
             if (s.startsWith("Infinity", i)) { i += 8; return -Infinity; }
             const d = i < n ? s.charCodeAt(i) : 0;
-            if (!((d >= 48 && d <= 57) || d === 46)) err("Invalid number");
+            if (i >= n) err("Unexpected end of input");
+            if (!((d >= 48 && d <= 57) || d === 46)) err("Unexpected character");
             return -parseNumberBody();
           }
           if (cc === 43 /* + */) {
             i++;
             if (s.startsWith("Infinity", i)) { i += 8; return Infinity; }
             const d = i < n ? s.charCodeAt(i) : 0;
-            if (!((d >= 48 && d <= 57) || d === 46)) err("Invalid number");
+            if (i >= n) err("Unexpected end of input");
+            if (!((d >= 48 && d <= 57) || d === 46)) err("Unexpected character");
             return parseNumberBody();
           }
           if ((cc >= 48 && cc <= 57) || cc === 46) return parseNumberBody();
@@ -1258,13 +1271,14 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
           if (cc === 110 && s.startsWith("null", i)) { i += 4; return null; }
           if (cc === 73 && s.startsWith("Infinity", i)) { i += 8; return Infinity; }
           if (cc === 78 && s.startsWith("NaN", i)) { i += 3; return NaN; }
-          err("Unrecognized token '" + s[i] + "'");
+          if (isIdStart(cc) || cc === 44) err("Unexpected token");
+          err("Unexpected character");
         };
         skipWS();
-        if (i >= n) err("Unexpected end of JSON5 input");
+        if (i >= n) err("Unexpected end of input");
         const value = parseValue();
         skipWS();
-        if (i < n) err("Unexpected token after top-level value");
+        if (i < n) err("Unexpected token after JSON5 value");
         return value;
       };
       // json5@2.x style serializer. JSON.stringify cannot be used as a
