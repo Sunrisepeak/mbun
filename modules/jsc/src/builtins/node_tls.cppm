@@ -848,11 +848,26 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
   // non-string is ERR_INVALID_ARG_TYPE and only an unrecognised *string* is
   // ERR_INVALID_ARG_VALUE (test-tls-get-ca-certificates-error asserts both).
   let _extraCAs = null;
+  // 'default' + NODE_EXTRA_CA_CERTS, cached so repeated calls keep returning the
+  // same frozen array (test-tls-get-ca-certificates-default compares by ===).
+  let _defaultWithExtra = null;
   function getCACertificates(type) {
     const t = type === undefined ? "default" : type;
     if (typeof t !== "string") throw ERR_INVALID_ARG_TYPE("type", "string", t);
     if (t === "default") {
       if (_defaultCAs !== null) return _defaultCAs;
+      // node builds the default store as bundled/system PLUS whatever
+      // NODE_EXTRA_CA_CERTS contributed, so 'default' is a superset of 'extra'
+      // (test-tls-get-ca-certificates-extra-subset asserts exactly that).
+      const extra = getCACertificates("extra");
+      if (extra.length !== 0) {
+        if (_defaultWithExtra === null) {
+          const merged = rootCertificates.slice();
+          for (const pem of extra) if (merged.indexOf(pem) === -1) merged.push(pem);
+          _defaultWithExtra = Object.freeze(merged);
+        }
+        return _defaultWithExtra;
+      }
       if (_caCache === null) _caCache = Object.freeze(rootCertificates.slice());
       return _caCache;
     }
@@ -875,7 +890,10 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
             const text = fs && typeof fs.readFileSync === "function"
               ? String(fs.readFileSync(path, "utf8")) : "";
             const found = text.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g);
-            if (found) for (const b of found) blocks.push(b);
+            // node hands back OpenSSL's PEM_write output, which terminates every
+            // block with a newline; test-tls-get-ca-certificates-extra compares
+            // the result against the raw fixture file byte for byte.
+            if (found) for (const b of found) blocks.push(b + "\n");
           }
         } catch (e) {}
         _extraCAs = Object.freeze(blocks);
@@ -893,7 +911,8 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
   // ERR_OSSL_PEM_ASN1_LIB. Either way the previous default store is left intact
   // (the operation is all-or-nothing) and duplicates collapse to one entry.
   const CERT_BLOCK_RE = /-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g;
-  function toPemText(v) {
+  function toPemText(v, name) {
+    name = name || "certs";
     if (typeof v === "string") return v;
     if (ArrayBuffer.isView(v)) {
       const u8 = new Uint8Array(v.buffer, v.byteOffset, v.byteLength);
@@ -907,13 +926,17 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
       let s = ""; for (let i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]);
       return s;
     }
-    throw ERR_INVALID_ARG_TYPE("certs", ["string", "Buffer", "TypedArray", "DataView"], v);
+    // node validates each element with validateStringOrBufferView(cert,
+    // `certs[${i}]`), so the name carries the index and the accepted class is
+    // the single umbrella ArrayBufferView, not the Buffer/TypedArray/DataView
+    // triple (test-tls-set-default-ca-certificates-error matches the message).
+    throw ERR_INVALID_ARG_TYPE(name, ["string", "ArrayBufferView"], v);
   }
   function setDefaultCACertificates(certs) {
     if (!Array.isArray(certs)) throw ERR_INVALID_ARG_TYPE("certs", "Array", certs);
     const blocks = [];
-    for (const item of certs) {
-      const text = toPemText(item);
+    for (let i = 0; i < certs.length; i++) {
+      const text = toPemText(certs[i], "certs[" + i + "]");
       const found = text.match(CERT_BLOCK_RE);
       if (found) for (const b of found) blocks.push(b);
     }
