@@ -5,6 +5,23 @@
 
 ## 2026-07-29
 
+### 5 小时冲刺第九批：6 分钟净增 4 文件，40 files/hour
+
+12:29–12:35 组合两个静态 lane，预计 7 个整文件、实际净增 4：
+
+- `net.Server` 在 accepted-fd 边界执行 `blockList` / `maxConnections`
+  admission，拒绝时关闭 handle、只发带端点信息的 `drop`，不触发
+  `connection`；四个目标由 2 fail + 2 timeout 全部转绿，实际 **4/4**；
+- fs promises 临时 `FileHandle` 的 operation/close/aggregate error 预计
+  3，实际 **0/3**。exposed internal 测试修改的是另一套 `FileHandle`
+  identity，当前公开 promises 路径不会观察到该 getter；正确修复需要统一
+  internal/public 路由，超出 20 分钟 lane，补丁已 additive revert。
+
+回滚后的精确树重新构建，四个 net 目标 **4/4 pass**；conflict-marker、
+gitlink、diff 守卫通过，green→non-green 0。策略上继续奖励 accepted
+boundary 这类共享 endpoint，并把“需要统一两套 runtime identity”的工作
+移出短 lane。
+
 ### 5 小时冲刺第八批：7 分钟净增 3 文件，25.7 files/hour
 
 12:22–12:29 集中验收五项静态实现候选，预计 6 个整文件、实际新增 3：

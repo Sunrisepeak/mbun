@@ -187,6 +187,25 @@ six targets: 3 pass, 3 retained failures, zero regressions. Continue accepting
 only complete-file transitions; an implementation that advances to a later
 assertion is reverted at the same checkpoint.
 
+### Sprint wave 9 measured checkpoint (12:29–12:35)
+
+Two static lanes forecast seven complete files; the combined checkpoint gained
+4 in 6 minutes: **40 files/hour**, with zero green-to-non-green regressions.
+
+- net.Server accepted-handle admission for `blockList` and `maxConnections`:
+  estimated 4, actual 4/4. The two old failures and two old timeouts all pass;
+  rejected peers close without reaching `connection` and emit `drop` metadata.
+- fs promises temporary FileHandle close/error aggregation: estimated 3,
+  actual 0/3. Exposed-internal tests patch a different FileHandle identity from
+  the public promise path. Correctness requires unifying the internal/public
+  routing rather than adding another wrapper, so the change was additively
+  reverted inside the checkpoint.
+
+Integration rebuilt after the fs revert and reran the four retained targets:
+4/4 pass. Conflict-marker, gitlink, and diff guards are clean. Keep short lanes
+on shared runtime endpoints; route cross-identity architecture work out of the
+five-hour path unless its measured reuse count rises substantially.
+
 The first three-way reuse probe tested local round-10 branches for node's
 `--test` CLI, HTTP/2 argument/timer validation, and verbatim Node error text.
 All three candidate cherry-picks became empty on the current target tree.
