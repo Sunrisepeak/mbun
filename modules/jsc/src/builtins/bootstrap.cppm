@@ -5948,8 +5948,12 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   };
   const fsValidateOffsetLengthWrite = (offset, length, bufferLength) => {
     if (offset > bufferLength) throw fsRangeErr("offset", "<= " + bufferLength, offset);
-    if (length > bufferLength - offset) throw fsRangeErr("length", "<= " + (bufferLength - offset), length);
     if (length < 0) throw fsRangeErr("length", ">= 0", length);
+    // lib/internal/fs/utils.js caps a single write at kIoMaxLength even if
+    // the supplied Buffer is larger. Native writes are int32-sized too.
+    if (length > 2147483647)
+      throw fsRangeErr("length", ">= 0 && <= 2147483647", length);
+    if (length > bufferLength - offset) throw fsRangeErr("length", "<= " + (bufferLength - offset), length);
   };
   // node fs.read / fs.readSync / fs.write / fs.writeSync — the full validation
   // + overload normalisation from lib/fs.js. These were deliberately left
