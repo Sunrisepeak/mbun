@@ -297,6 +297,23 @@ Guards: HTTP client 63/68 pass; module 11 pass, 18 fail, 3 skip; require 13
 pass, 9 fail, 1 skip; abort 1/7 pass; readline 10 pass, 3 fail, 8 skip. Every
 guard has zero green-to-non-green regressions.
 
+### Sprint wave 16 measured checkpoint (13:26–13:38)
+
+The async-hooks timer-bootstrap and net pre-connect write package forecast four
+named files and delivered **+8 complete files in 12 minutes = 40 files/hour**:
+
+- rebinding timer facades after bootstrap delivered the two named async-hooks
+  files plus four same-root lifecycle files, for +6 total;
+- retaining pending state through the public connect event and reporting
+  backpressure for every pre-connect write delivered +2 net files;
+- the stale RSA-PSS candidate was semantically absorbed by the current
+  14-argument ABI/restriction implementation, so integration skipped its
+  conflicts and counted no duplicate gain.
+
+The 60-file related guard finished at 33 pass, 24 retained failures, and 3
+timeouts. Relative to the frozen gate it has eight fail-to-pass transitions and
+zero green-to-non-green regressions. The exact four-file target gate is 4/4.
+
 ### Sprint wave 15 measured checkpoint (13:17–13:26)
 
 CLI syntax-check, diagnostics module tracing, Buffer DEP0005, and OS internal

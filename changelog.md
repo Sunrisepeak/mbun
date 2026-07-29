@@ -5,6 +5,23 @@
 
 ## 2026-07-29
 
+### 5 小时冲刺第十六批：12 分钟净增 8 文件，40 files/hour
+
+13:26–13:38 组合 async-hooks timer bootstrap 与 net pre-connect write
+backpressure，静态命名预计 4，相关簇守卫实际 **+8**：
+
+- timer facade 在 bootstrap 后再绑定 async-hook 生命周期，两个命名目标
+  全绿，并同时修复 close/destroy、disable GC tracking、enabled-hooks exit
+  与 double-destroy 四个同根文件，async-hooks 合计 **+6**；
+- `net.Socket` 在公开 `connect` 边界前保持 pending 状态，任何 pre-connect
+  write 都返回 backpressure 并延迟回调，两个 connect-buffer 目标 **+2**；
+- RSA-PSS 旧候选与当前 14 参数 ABI/限制实现语义重复，冲突审查后直接
+  skip，没有重复提交，也不虚增收益。
+
+完整相关守卫覆盖 60 个 `test-async-hooks-*` / `test-net-connect-*` 文件，
+结果 33 pass / 24 既有 fail / 3 timeout；相对 frozen gate 为 8 个
+fail→pass、green→non-green 0。目标四文件另有精确门禁 4/4 pass。
+
 ### 5 小时冲刺第十五批：9 分钟净增 9 文件，60 files/hour
 
 13:17–13:26 组合 CLI syntax-check、diagnostics module tracing、Buffer
