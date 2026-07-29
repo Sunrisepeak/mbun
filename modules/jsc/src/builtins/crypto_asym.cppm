@@ -1498,6 +1498,42 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   }
   C.X509Certificate = X509Certificate;
 
+  // Assignment-form functions do not retain the property name in this
+  // runtime, unlike node's native crypto methods.  That name is observable to
+  // callers (and to stream tooling), so restore the public names after all
+  // crypto surfaces have been installed rather than changing their behaviour.
+  const setFunctionName = (fn, name) => {
+    if (typeof fn === "function") Object.defineProperty(fn, "name", { value: name, configurable: true });
+  };
+  const nameMethods = (proto, names) => {
+    for (const name of names) setFunctionName(proto[name], name);
+  };
+  nameMethods(C.Hash.prototype, ["update", "digest", "copy", "_transform", "_flush"]);
+  nameMethods(C.Hmac.prototype, ["update", "digest", "_transform", "_flush"]);
+  // Sign and Verify are Writable-like in node.  The local implementation
+  // already has write()/update(); provide the internal write hook as well so
+  // its name and callback contract match the inherited stream surface.
+  Sign.prototype._write = function _write(chunk, encoding, callback) {
+    try { this.update(chunk, encoding); callback(); } catch (error) { callback(error); }
+  };
+  Verify.prototype._write = function _write(chunk, encoding, callback) {
+    try { this.update(chunk, encoding); callback(); } catch (error) { callback(error); }
+  };
+  nameMethods(Sign.prototype, ["update", "sign", "_write"]);
+  nameMethods(Verify.prototype, ["update", "verify", "_write"]);
+  nameMethods(DiffieHellman.prototype, ["generateKeys", "computeSecret", "getPrime", "getGenerator", "getPublicKey", "getPrivateKey", "setPublicKey", "setPrivateKey"]);
+  nameMethods(ECDH.prototype, ["generateKeys", "computeSecret", "getPublicKey", "getPrivateKey", "setPrivateKey"]);
+  // Node exposes setPublicKey through util.deprecate(), whose wrapper is named
+  // "deprecated".  Keep that observable marker without changing the method.
+  setFunctionName(ECDH.prototype.setPublicKey, "deprecated");
+  for (const name of ["createHash", "createHmac", "createSign", "createVerify",
+                      "createCipheriv", "createDecipheriv", "createDiffieHellman",
+                      "createECDH", "hash", "pbkdf2"]) setFunctionName(C[name], name);
+  setFunctionName(C.Hash, "deprecated");
+  setFunctionName(C.Hmac, "deprecated");
+  setFunctionName(C.Sign, "Sign");
+  setFunctionName(C.Verify, "Verify");
+
 })();
 )JS";
 
