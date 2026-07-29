@@ -1232,6 +1232,21 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
         proc[name] = fn;
       }
     }
+
+    // ---- process.ref / process.unref ---------------------------------------
+    // Node first recognizes the symbol protocol, then falls back to the legacy
+    // ref()/unref() methods used by timers and handles.
+    const installRefMethod = (name) => {
+      const symbol = Symbol.for("nodejs." + name);
+      proc[name] = function (resource) {
+        const method = resource != null &&
+          (typeof resource[symbol] === "function" ? resource[symbol] : resource[name]);
+        if (typeof method === "function") method.call(resource);
+      };
+    };
+    installRefMethod("ref");
+    installRefMethod("unref");
+
     if (!Array.isArray(proc.moduleLoadList)) proc.moduleLoadList = [];
     if (!Array.isArray(proc._preload_modules)) proc._preload_modules = [];
 
