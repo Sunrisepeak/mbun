@@ -1203,7 +1203,72 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
         if (i < n) err("Unexpected token after top-level value");
         return value;
       };
-      Bun.JSON5 = { parse: parseJSON5 };
+      // json5@2.x style serializer. JSON.stringify cannot be used as a
+      // post-pass because JSON5 retains Infinity/NaN, accepts unquoted keys,
+      // uses single-quoted strings, and writes trailing commas when indented.
+      const stringifyJSON5 = (input, replacer, space) => {
+        if (replacer !== undefined && replacer !== null) {
+          throw new TypeError("JSON5.stringify does not support the replacer argument");
+        }
+        let gap = "";
+        if (typeof space === "number" || space instanceof Number) {
+          const width = Number(space);
+          gap = " ".repeat(Math.max(0, Math.min(10, Number.isFinite(width) ? Math.floor(width) : width > 0 ? 10 : 0)));
+        } else if (typeof space === "string" || space instanceof String) {
+          gap = String(space).slice(0, 10);
+        }
+        const isIdentifier = (key) => /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(key);
+        const quote = (value) => "'" + value.replace(/[\\'\b\f\n\r\t\v\u0000-\u001f\u2028\u2029]/g, (c) => {
+          if (c === "'") return "\\'";
+          if (c === "\\") return "\\\\";
+          if (c === "\b") return "\\b";
+          if (c === "\f") return "\\f";
+          if (c === "\n") return "\\n";
+          if (c === "\r") return "\\r";
+          if (c === "\t") return "\\t";
+          if (c === "\v") return "\\v";
+          const code = c.charCodeAt(0).toString(16).padStart(4, "0");
+          return "\\u" + code;
+        }) + "'";
+        const stack = new Set();
+        const serialize = (value, indent, inArray) => {
+          if (value === null) return "null";
+          switch (typeof value) {
+            case "boolean": return value ? "true" : "false";
+            case "number":
+              if (Number.isNaN(value)) return "NaN";
+              if (value === Infinity) return "Infinity";
+              if (value === -Infinity) return "-Infinity";
+              return String(value);
+            case "string": return quote(value);
+            case "undefined":
+            case "function":
+            case "symbol": return inArray ? "null" : undefined;
+            case "bigint": throw new TypeError("Do not know how to serialize a BigInt");
+          }
+          if (stack.has(value)) throw new TypeError("Converting circular structure to JSON");
+          stack.add(value);
+          const nextIndent = indent + gap;
+          let result;
+          if (Array.isArray(value)) {
+            const entries = value.map((item) => serialize(item, nextIndent, true));
+            result = entries.length === 0 ? "[]" : gap === "" ? "[" + entries.join(",") + "]"
+              : "[\n" + nextIndent + entries.join(",\n" + nextIndent) + ",\n" + indent + "]";
+          } else {
+            const entries = [];
+            for (const key of Object.keys(value)) {
+              const item = serialize(value[key], nextIndent, false);
+              if (item !== undefined) entries.push((isIdentifier(key) ? key : quote(key)) + (gap === "" ? ":" : ": ") + item);
+            }
+            result = entries.length === 0 ? "{}" : gap === "" ? "{" + entries.join(",") + "}"
+              : "{\n" + nextIndent + entries.join(",\n" + nextIndent) + ",\n" + indent + "}";
+          }
+          stack.delete(value);
+          return result;
+        };
+        return serialize(input, "", false);
+      };
+      Bun.JSON5 = { parse: parseJSON5, stringify: stringifyJSON5 };
     }
 
     // ---- Bun.markdown.ansi: markdown -> ANSI (port of bun src/md/ansi_renderer) ----
