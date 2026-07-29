@@ -711,6 +711,13 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     // encoder for DER and convert, exactly like KeyObject.export({format:"jwk"}).
     const pubJwk = !wantPubObj && penc.format === "jwk";
     const privJwk = !wantPrivObj && senc.format === "jwk";
+    // RFC 7518 has no JWK key type for DSA. Reject at the keygen API boundary
+    // rather than generating a key whose requested output cannot be represented.
+    if (type === "dsa" && (pubJwk || privJwk)) {
+      const e = new Error("Unsupported JWK Key Type.");
+      e.code = "ERR_CRYPTO_JWK_UNSUPPORTED_KEY_TYPE";
+      throw e;
+    }
     const pubType = pubJwk ? "spki" : (penc.type || "spki");
     const pubFmt = (wantPubObj || pubJwk) ? "der" : (penc.format || "pem");
     const privType = privJwk ? "pkcs8" : (senc.type || "pkcs8");
