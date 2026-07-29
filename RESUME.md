@@ -94,6 +94,29 @@ single intended fail-to-pass and no pass-to-nonpass transition (one
 Do not prioritize static error-message, PFX, or one-file HTTP/2 predictions in
 the next cut. Wave 38 is module, fs, and net/dgram, again 12 files per lane.
 
+Wave 38 stopped the module lane read-only when it found no >=2-green mechanism
+and redirected it to streams. Across stream, net/dgram, and fs, exact yield was
+**5/36**: three stream files shared one EventEmitter `removeListener` bug, and
+two net files shared explicit IPv6 custom-lookup handling. The fs FileHandle and
+net write-queue candidates yielded zero and were reverted. Complete stream
+(249), net (150), and dgram (76) subtrees show exactly five fail-to-pass and no
+pass-to-nonpass transition. Observed end-to-end rate was about **20 green/hour**.
+
+Wave 39 selected the largest concrete failure signature rather than another
+subsystem-first cut: 20 files expected `ERR_INVALID_ARG_TYPE`, split between
+async/events, crypto, and misc runtime. Exact yield was **3/20**:
+AsyncLocalStorage.bind, zlib invalid synchronous input, and V8 heap-profile
+options. The zero-yield crypto candidate was reverted. Complete async (56),
+zlib (62), and V8 (23) subtrees show exactly those three fail-to-pass transitions
+and no pass-to-nonpass. Node projection from the wave-36 full authority is now
+**2821/4433 (63.64%)**, +167 from the PR start, pending the next full Node run.
+
+The overdue full Bun checkpoint also completed on the same retained tree:
+**93/230 green, 5074 pass / 740 fail assertions**. Relative to wave 30,
+hostedGitInfo became green and process.stdin moved 5/9 -> 11/3. There is no
+green regression; one third-party next-auth file moved to blocked-external.
+This replaces the prior Bun projection with authoritative full-corpus evidence.
+
 Session-scoped cron jobs are in-memory only (`durable` has no effect), so the
 hourly loop survives a usage limit — it simply skips the fires that land during
 the block and resumes within an hour — but it does NOT survive the session

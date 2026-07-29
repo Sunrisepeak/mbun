@@ -110,6 +110,40 @@ timeout→OOM 不属于 green 回归）。本轮仅 **1/36（2.8%）**，故下�
 停止优先静态错误消息、PFX 和单文件 HTTP/2，改投 module/fs/net-dgram
 三组具共享机制的12-file清单。
 
+### Wave38 动态换 lane：stream +3、net +2，完整相关域零回归
+
+module lane 逐文件读取后确认没有 ≥2-green 可行机制，未改代码即止损，
+动态改派 stream。三组36文件实跑最终 **5/36 转绿**：
+
+- EventEmitter `removeListener` 把不匹配的单函数误作数组遍历，修复后
+  三个 stream 文件转绿；
+- 显式 IPv6 custom lookup/loopback 合同使两个 net 文件转绿；
+- FS FileHandle aggregate-errors 与 net write queue 均0收益，全部回退。
+
+撤回后重建通过；完整 stream 249、net 150、dgram 76文件只有5项
+fail→pass，**0 pass→nonpass**。端到端保守速率约 **20 green/hour**。
+
+### Wave39 按错误签名聚类：20个 ERR_INVALID_ARG_TYPE 文件新增3 green
+
+不再只按子系统切分，而是把最大明确合同簇分成 async/events、crypto、
+misc runtime 三个互斥工作单。实测：
+
+- AsyncLocalStorage.bind **+1**；
+- zlib 非 Buffer/String 同步输入 **+1**；
+- V8 heap-profile options **+1**；
+- crypto HMAC/ECDH 候选0收益并回退。
+
+完整 async 56、zlib 62、V8 23文件复验只有上述3项 fail→pass，
+**0 pass→nonpass**。以 wave36 全量为权威基线，wave37–39 关联域确认
+累计 +9，当前 Node 推算 **2821/4433（63.64%）**，相对 PR 起点 +167。
+
+### Bun 全量刷新：93/230 green，5074 pass / 740 fail
+
+沿用 wave30 同一230文件清单完整复测，确认 hostedGitInfo **0/5→5/0**
+并新增一个 green，process.stdin **5/9→11/3**；无 green 回退。
+next-auth 一项转 blocked-external。当前 Bun 权威值更新为
+**93/230 green、5074 pass / 740 fail assertions**，不再使用定向投影。
+
 ### 5 小时冲刺第三十批：净减 61 个 Bun 失败，cron 新增全绿
 
 五个独立同源簇经主线三次增量构建、原生文件精确验收：
