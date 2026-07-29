@@ -5,6 +5,88 @@ session that is interrupted (usage limit, crash, restart) can pick up from the
 file rather than from memory. **If you are a fresh session reading this, start
 here.**
 
+## 2026-07-30 07:00 — WAVE 51/52: solo work under sustained API saturation
+
+**Node 2,821 → 2,923 / 4,433 (65.94%), +102, zero regressions — and every one of the
+4,433 rows is now backed by a measured guard run**, so the figure is no longer a
+projection over a stale baseline.
+
+### Five consecutive subagent dispatches died on server-side 529 Overloaded
+
+Machine resources were fine throughout (mem 34-36G, disk 50G, load ~1); the
+constraint was API capacity, which the resource watchdog cannot see. Response was
+to work solo rather than keep burning dispatches. **If a future session sees
+repeated 529s, do not retry in a loop — switch to integration-side work and retry
+periodically.**
+
+### `test-vm-module-errors.js` went green solo — EIGHT independent defects
+
+It advanced 29 → 52 → 104 → 127 → 143 → 182 → 203 → 224 → green, and every step was
+a different bug:
+1. `options.identifier` unvalidated (`initBase` coerced `0` via `${identifier}`).
+2. Relink reported `ERR_VM_MODULE_STATUS`; node distinguishes an in-flight link
+   (STATUS) from a finished one (`ERR_VM_MODULE_ALREADY_LINKED`).
+3. **`link()` settled SYNCHRONOUSLY** on a dep-free module, so an un-awaited
+   `m.link(cb)` left status `'linked'` where node leaves `'linking'`. The
+   synchronous shortcut had a **deliberate comment** — it existed so
+   `await link()` observes `'linked'`, and it was load-bearing for 8 files a lane
+   had just won. Moving the flip into a **microtask** preserves that (the awaiting
+   continuation resumes after the callback) while restoring `'linking'`.
+4. `namespace` guard rejected only `'unlinked'`, not `'linking'`; message must name
+   both.
+5. A linker returning a module from a **different context** was accepted, silently
+   linking two realms (`ERR_VM_MODULE_DIFFERENT_CONTEXT`).
+6. Linking onto an **errored** module succeeded; node fails with
+   `ERR_VM_MODULE_LINK_FAILURE` carrying the dependency's error as `cause`.
+7. Importing a name a dependency does not export was undetected. Per spec this
+   resolves at **link** time → SyntaxError, not a runtime miss. Needed a new
+   `kNamedImports` record checked *after* the recursion, because only then are
+   children linked and `exportNamesOf()` complete.
+8. `evaluate({breakOnSigint})` threw `Error` not `TypeError`; `cachedData` accepted
+   anything.
+
+**Generalisable: "one file, one blocker" rarely holds.** Every brief this campaign
+that said "N files gated on X" undercounted; this file is the extreme at 8.
+For `timeout` and `cachedData` only the **argument contracts** were implemented —
+interruption needs real JSC interrupt support and bytecode cachedData is not
+achievable; both remain DEFERRED and the commits say so.
+
+### Two leads retired by probing instead of staffing
+
+- **`[0,0,0,0]` async_hooks grep is thin.** A lane called it "a cheap grep for more
+  of these". Corpus-wide it matches **5 files**, one of which (`test-http2-ping`) is
+  already green. `test-http2-debug` is a from-scratch `NODE_DEBUG=http2` tracing
+  item; `test-async-wrap-uncaughtexception` fails on `call_id` `null !== 2`, i.e.
+  real `executionAsyncId` context tracking — a subsystem, not a wrap. The reusable
+  `__mbunAsyncHookWrap` helper was worth exactly the one file it already won.
+- **`Buffer.from(typedArray)` is NOT a codebase-wide landmine** (audited earlier):
+  `socket.write(new Uint16Array([1,2,3,4]))` yields the correct 8 bytes, and
+  `crypto_asym.cppm:119` already does `Buffer.from(v.buffer, v.byteOffset, v.byteLength)`.
+  The http2 PING site was the exception.
+
+### JS-buffer redirect in `Bun.$` — analysed, NOT started, with the exact contract
+
+`js/bun/shell/commands/yes.test.ts`'s 3 failures are **timeouts, not assertion
+failures**. The contract, from the test source:
+```js
+const buffer = Buffer.alloc(10);
+await $`yes > ${buffer}`;
+expect(buffer.toString()).toEqual("y\ny\ny\ny\ny\n");
+```
+So stdout redirected to a JS Buffer must write **at most `buffer.length` bytes, stop
+the producer, and resolve** — against an infinite producer.
+
+Punt site: `lower_redirect` in `modules/jsc/src/runtime/bunsh.inc:239`. `atom_literal`
+returns nullopt for a non-literal (buffer) target, so the whole script goes to
+`/bin/sh`, losing every mbun builtin. **This is a three-layer change** — lowering in
+`bunsh.inc`, a new buffer-target `RedirectPlan` variant, and a stop-when-full writer
+in `modules/shell`'s interpreter. Deliberately not started solo: a partial version
+replaces machinery the 27-green shell dir depends on.
+
+**Reach caveat for whoever takes it:** a naive `grep '> \$\{'` reports 46 files, but
+that also matches ordinary **file paths** in templates. Do not size this from that
+number — confirm the target is a Buffer/TypedArray, not a path string.
+
 ## 2026-07-30 05:30 — WAVE 50: +8 node, and a keep-or-revert condition honoured
 
 `test-crypto` **86 → 101/129**, `test-http2` **213 → 223/272**, bun `shell/` **20 → 27 green**,
