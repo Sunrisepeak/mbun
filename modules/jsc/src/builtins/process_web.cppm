@@ -988,7 +988,15 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     };
     if (child.stdout) child.stdout.on("data", (d) => add(0, "stdout", _u8(d)));
     if (child.stderr) child.stderr.on("data", (d) => add(1, "stderr", _u8(d)));
-    const toOut = (b) => (enc === "buffer" || enc == null ? b : b.toString(enc === "utf-8" ? "utf8" : enc));
+    const toOut = (b, stream) => {
+      // A caller may override `{ encoding: null }` later with
+      // child.stdout.setEncoding(). Node returns strings in that case.
+      const streamEncoding = stream && stream._readableState && stream._readableState.encoding;
+      const outputEncoding = streamEncoding || enc;
+      return outputEncoding === "buffer" || outputEncoding == null
+        ? b
+        : b.toString(outputEncoding === "utf-8" ? "utf8" : outputEncoding);
+    };
     const finish = (code, signal) => {
       if (done) return; done = true;
       const outBuf = Buffer.concat(outs), errBuf = Buffer.concat(errs);
@@ -997,10 +1005,14 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
         err = new Error("Command failed: " + cmd + (errBuf.length ? "\n" + errBuf.toString("utf8") : ""));
         err.code = signal ? null : code; err.killed = child.killed || false; err.signal = signal || null; err.cmd = cmd;
       }
-      if (cb) cb(err || null, toOut(outBuf), toOut(errBuf));
+      if (cb) cb(err || null, toOut(outBuf, child.stdout), toOut(errBuf, child.stderr));
     };
     child.on("close", (code, signal) => finish(code, signal));
-    child.on("error", (e) => { if (done) return; done = true; if (cb) cb(e, toOut(Buffer.alloc(0)), toOut(Buffer.alloc(0))); });
+    child.on("error", (e) => {
+      if (done) return;
+      done = true;
+      if (cb) cb(e, toOut(Buffer.alloc(0), child.stdout), toOut(Buffer.alloc(0), child.stderr));
+    });
   };
 
   function spawn(file, args, options) {
