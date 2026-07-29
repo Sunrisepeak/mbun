@@ -268,8 +268,14 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
 
     // ------------------------------------------------------- raw decoders
     // All take (buf, start, end) with 0 <= start < end <= live length.
+    // NB: ignoreBOM — node's utf8Slice keeps a leading U+FEFF (a BOM is data at
+    // the Buffer level; only WHATWG TextDecoder strips it). Without this,
+    // fs.readFileSync(f, "utf8") loses the BOM (test-stream-preprocess).
+    // Lazily built: TextDecoder may not be installed yet at bootstrap time.
+    let utf8Dec = null;
     function rawUtf8Slice(buf, s, e) {
-      return new TextDecoder("utf-8").decode(buf.subarray(s, e));
+      if (utf8Dec === null) utf8Dec = new TextDecoder("utf-8", { ignoreBOM: true });
+      return utf8Dec.decode(buf.subarray(s, e));
     }
     function rawLatin1Slice(buf, s, e) {
       let out = "";

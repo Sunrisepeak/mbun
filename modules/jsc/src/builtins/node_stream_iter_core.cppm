@@ -378,6 +378,14 @@ inline constexpr std::string_view kNodeStreamIterCoreJS = R"JS(
       if (chunks.length === 1) {
         const chunk = chunks[0];
         // If non-zero offset, skip the remaining buffer checks.
+        // NB: a Buffer that covers its whole backing store is returned AS A
+        // BUFFER here, exactly as node does — test-stream-iter-transform-sync
+        // deepStrictEquals a bytesSync() result against a Buffer. The mirror
+        // case (test-stream-iter-readable-interop wants a plain Uint8Array from
+        // `bytes(from(readable))`) only holds in node because Buffer.from(str)
+        // is pool-backed there, so it never covers its whole ArrayBuffer and
+        // falls into the copy path below. Fixing that needs Buffer pooling, not
+        // a prototype test here.
         if (chunk.byteOffset === 0) {
           // Works for both ArrayBuffer and SharedArrayBuffer backings.
           if (chunk.byteLength === chunk.buffer.byteLength) {
