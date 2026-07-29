@@ -5181,14 +5181,14 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     _writeSync() {
       const text = this._buf.slice(0, this._maxWrite);
       const n = this._fs.writeSync(this._fd, text, "utf8");
-      this._buf = this._remainingAfterBytes(text, n);
+      this._buf = this._remainingAfterBytes(text, n, this._buf.slice(text.length));
       this.emit("write", n);
       return n;
     }
     // fs.write reports bytes while the public Utf8Stream API accepts strings.
     // Rounding a partial count DOWN to a complete code point avoids queuing a
     // lone surrogate when a mock (or a short write) stops inside UTF-8 text.
-    _remainingAfterBytes(text, written) {
+    _remainingAfterBytes(text, written, suffix) {
       let bytes = 0, index = 0;
       const limit = Math.max(0, Number(written) || 0);
       while (index < text.length) {
@@ -5198,10 +5198,14 @@ inline constexpr char kBootstrapJS_[] = R"JS(
         if (bytes + count > limit) break;
         bytes += count; index += width;
       }
-      return text.slice(index);
+      return text.slice(index) + (suffix || "");
     }
-    _drain(cb) {
-      if (cb) this._drainCallbacks.push(cb); else this._drainEventPending = true;
+    _drain(cb, requestCompletion = true) {
+      // Internal short-write continuations must resume the active drain
+      // without manufacturing an externally observable drain event.
+      if (requestCompletion) {
+        if (cb) this._drainCallbacks.push(cb); else this._drainEventPending = true;
+      }
       if (this._writing || this._fd < 0) return;
       if (!this._buf.length) { this._completeDrain(); return; }
       this._writing = true;
@@ -5219,8 +5223,8 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       this._fs.write(this._fd, text, "utf8", (err, n) => {
         if (err) { this._completeDrain(err); return; }
         const written = n == null ? text.length : n;
-        this._buf = this._remainingAfterBytes(text, written); this.emit("write", written);
-        if (this._buf.length) { this._writing = false; this._drain(); return; }
+        this._buf = this._remainingAfterBytes(text, written, this._buf.slice(text.length)); this.emit("write", written);
+        if (this._buf.length) { this._writing = false; this._drain(undefined, false); return; }
         if (this._fsync) this._fs.fsync(this._fd, (e) => this._completeDrain(e));
         else this._completeDrain();
       });
