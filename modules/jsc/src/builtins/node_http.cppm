@@ -1670,13 +1670,14 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
         const e = new Error("The operation was aborted");
         e.name = "AbortError";
         e.code = "ABORT_ERR";
+        if (signal.reason !== undefined) e.cause = signal.reason;
         return e;
       };
       // A signal that was already aborted at construction time destroys the
       // request before http.get() returns. The later socket assignment still
       // emits its error asynchronously through onSocketNT.
-      if (signal.aborted) this.destroy(signal.reason || abortErr());
-      else signal.addEventListener("abort", () => this.destroy(signal.reason || abortErr()), { once: true });
+      if (signal.aborted) this.destroy(abortErr());
+      else signal.addEventListener("abort", () => this.destroy(abortErr()), { once: true });
       delete optsWithoutSignal.signal;
       this.signal = signal;
     }
