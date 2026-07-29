@@ -416,23 +416,6 @@ inline constexpr std::string_view kNodeTestRunJS = R"JS(
       // `given` is what the caller wrote (node names the file test with it);
       // `files` is what gets executed.
       const files = given.map((f) => (path.isAbsolute(f) ? f : path.resolve(cwd, f)));
-      // node lib/internal/test_runner/runner.js createTestFileList: an explicit,
-      // magic-free pattern that matches nothing is a user error, reported on
-      // stderr with nothing on stdout.
-      if (options.files !== undefined && files.length !== 0) {
-        const fs = fsMod();
-        const missing = files.filter((f) => {
-          if (/[*?[\]{}]/.test(f)) return false;
-          try { fs.statSync(f); return false; } catch (e) { return true; }
-        });
-        if (missing.length === files.length) {
-          const e = new Error("Could not find '" + given.join(", ") + "'");
-          e.code = "ERR_TEST_FILES_NOT_FOUND";
-          e.__mbunUserError = true;
-          throw e;
-        }
-      }
-
       // node lib/internal/test_runner/tag_filter.js: an include filter keeps a
       // test whose flattened tag set matches any filter (`db:*` is a prefix
       // wildcard); everything untagged is dropped.
@@ -503,6 +486,24 @@ inline constexpr std::string_view kNodeTestRunJS = R"JS(
         // listeners synchronously, so nothing may be emitted before that.
         await Promise.resolve();
         try {
+          // node lib/internal/test_runner/runner.js createTestFileList: an explicit,
+          // magic-free pattern that matches nothing is a user error, reported on
+          // stderr with nothing on stdout. This has to run inside this try so it
+          // reaches the CLI's user-error path instead of escaping as an uncaught
+          // exception with an Error prefix and stack.
+          if (options.files !== undefined && files.length !== 0) {
+            const fs = fsMod();
+            const missing = files.filter((f) => {
+              if (/[*?[\]{}]/.test(f)) return false;
+              try { fs.statSync(f); return false; } catch (e) { return true; }
+            });
+            if (missing.length === files.length) {
+              const e = new Error("Could not find '" + given.join(", ") + "'");
+              e.code = "ERR_TEST_FILES_NOT_FOUND";
+              e.__mbunUserError = true;
+              throw e;
+            }
+          }
           if (typeof options.setup === "function") await options.setup(stream);
           if (isolation === "none") await runInProcess(files, given, forward, aborted);
           else await runIsolated(files, given, forward, options, cwd, aborted);
