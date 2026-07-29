@@ -283,8 +283,10 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
     }
     get namespace() {
       const w = brand(this);
-      if (w.status === "unlinked") {
-        throw ERR("ERR_VM_MODULE_STATUS", Error, "Module status must not be unlinked");
+      // node rejects both pre-link states here, and its message names both.
+      if (w.status === "unlinked" || w.status === "linking") {
+        throw ERR("ERR_VM_MODULE_STATUS", Error,
+                  "Module status must not be unlinked or linking");
       }
       return this[kNamespace];
     }
@@ -338,17 +340,23 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
         w = brand(this);
         if (typeof linker !== "function") throw invArgType("linker", "of type function", linker);
         if (w.status !== "unlinked") {
-          throw ERR("ERR_VM_MODULE_STATUS", Error, "Module status must be unlinked");
+          // node distinguishes the two: a link already in flight is a status
+          // error, while a module that has finished linking is ALREADY_LINKED.
+          if (w.status === "linking") {
+            throw ERR("ERR_VM_MODULE_STATUS", Error, "Module status must be unlinked");
+          }
+          throw ERR("ERR_VM_MODULE_ALREADY_LINKED", Error, "Module has already been linked");
         }
       } catch (e) {
         return Promise.reject(e);
       }
       w.status = "linking";
       if (this[kDeps].length === 0) {
-        // Nothing to resolve: settle synchronously rather than through an
-        // extra async hop, so `await mod.link(...)` observes 'linked'.
-        w.status = "linked";
-        return Promise.resolve(undefined);
+        // Nothing to resolve, but do NOT settle synchronously: node's contract is
+        // that an un-awaited `link()` leaves status 'linking'. Flipping to
+        // 'linked' inside the microtask still lets `await mod.link(...)` observe
+        // 'linked', because the awaiting continuation resumes after this callback.
+        return Promise.resolve().then(() => { w.status = "linked"; return undefined; });
       }
       return linkModule(this, linker, new Set()).then(
         () => { w.status = "linked"; return undefined; },
@@ -651,6 +659,11 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
       if (contextObject !== undefined && !vm.isContext(contextObject)) {
         throw invArgType("options.context", "a vm.Context", contextObject, "property");
       }
+      // node validates identifier before use; initBase would otherwise coerce a
+      // number through `${identifier}` and silently accept it.
+      if (options.identifier !== undefined && typeof options.identifier !== "string") {
+        throw invArgType("options.identifier", "of type string", options.identifier, "property");
+      }
       initBase(this, contextObject, options.identifier);
 
       const analysis = analyze(sourceText);
@@ -802,6 +815,11 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
       const contextObject = options.context;
       if (contextObject !== undefined && !vm.isContext(contextObject)) {
         throw invArgType("options.context", "a vm.Context", contextObject, "property");
+      }
+      // node validates identifier before use; initBase would otherwise coerce a
+      // number through `${identifier}` and silently accept it.
+      if (options.identifier !== undefined && typeof options.identifier !== "string") {
+        throw invArgType("options.identifier", "of type string", options.identifier, "property");
       }
       initBase(this, contextObject, options.identifier);
       const values = new Map();
