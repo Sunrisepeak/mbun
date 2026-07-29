@@ -669,8 +669,130 @@ inline constexpr std::string_view kNodeV8JS = R"JS(
       done = true; return Promise.resolve({ done: false, value: Buffer.from("{}") });
     } }; } };
   }
-  const promiseHooks = { createHook: () => () => {}, onInit: () => () => {},
-    onSettled: () => () => {}, onBefore: () => () => {}, onAfter: () => () => {} };
+  // v8.promiseHooks: JSC has no engine-level promise-hook API (V8 exposes
+  // Isolate::SetPromiseHook), so the promise lifecycle is instrumented from JS
+  // -- and only while at least one hook is registered. Registering installs a
+  // Promise facade plus a wrapping Promise.prototype.then; removing the last
+  // hook restores the originals, so code that never touches promiseHooks pays
+  // nothing. The facade inherits the real statics, so Promise.resolve/reject
+  // route through NewPromiseCapability into our constructor and therefore
+  // report init + settled without patching each static separately.
+  const promiseHooks = (function () {
+    const NativePromise = G.Promise;
+    const nativeThen = NativePromise.prototype.then;
+    const toStringTag = Object.prototype.toString;
+    const lists = { init: [], before: [], after: [], settled: [] };
+    let installed = false;
+
+    const hookTypeError = (name) => {
+      const error = new TypeError(
+        'The "' + name + '" argument must be of type function');
+      error.code = "ERR_INVALID_ARG_TYPE";
+      return error;
+    };
+    // A hook must run to completion synchronously inside the lifecycle event,
+    // so Node rejects async and (async) generator functions even though they
+    // are typeof "function".
+    function validateHook(fn, name) {
+      if (typeof fn !== "function" || toStringTag.call(fn) !== "[object Function]") {
+        throw hookTypeError(name);
+      }
+    }
+    function fire(kind, promise, parent) {
+      const list = lists[kind];
+      if (list.length === 0) return;
+      const snapshot = list.slice();
+      for (let i = 0; i < snapshot.length; i++) snapshot[i](promise, parent);
+    }
+
+    function hookedThen(onFulfilled, onRejected) {
+      let derived;
+      const wrap = (handler) => {
+        if (typeof handler !== "function") return handler;
+        return function (value) {
+          fire("before", derived);
+          try {
+            return handler(value);
+          } finally {
+            fire("settled", derived);
+            fire("after", derived);
+          }
+        };
+      };
+      derived = nativeThen.call(this, wrap(onFulfilled), wrap(onRejected));
+      fire("init", derived, this);
+      return derived;
+    }
+
+    function HookedPromise(executor) {
+      if (typeof executor !== "function") return new NativePromise(executor);
+      let promise;
+      let settledEarly = false;
+      const settle = () => {
+        if (promise === undefined) settledEarly = true;
+        else fire("settled", promise);
+      };
+      promise = new NativePromise(function (resolve, reject) {
+        executor(function (value) { resolve(value); settle(); },
+                 function (reason) { reject(reason); settle(); });
+      });
+      fire("init", promise, undefined);
+      if (settledEarly) fire("settled", promise);
+      return promise;
+    }
+    HookedPromise.prototype = NativePromise.prototype;
+    Object.setPrototypeOf(HookedPromise, NativePromise);
+
+    function install() {
+      if (installed) return;
+      installed = true;
+      NativePromise.prototype.then = hookedThen;
+      G.Promise = HookedPromise;
+    }
+    function uninstall() {
+      if (!installed) return;
+      installed = false;
+      NativePromise.prototype.then = nativeThen;
+      G.Promise = NativePromise;
+    }
+    function register(kind, fn) {
+      lists[kind].push(fn);
+      install();
+      let stopped = false;
+      return function () {
+        if (stopped) return;
+        stopped = true;
+        const index = lists[kind].indexOf(fn);
+        if (index !== -1) lists[kind].splice(index, 1);
+        if (!lists.init.length && !lists.before.length &&
+            !lists.after.length && !lists.settled.length) uninstall();
+      };
+    }
+    const kinds = [["init", "initHook"], ["before", "beforeHook"],
+                   ["after", "afterHook"], ["settled", "settledHook"]];
+    const onHook = (kind, name) => (fn) => {
+      validateHook(fn, name);
+      return register(kind, fn);
+    };
+    function createHook(hooks) {
+      if (hooks === null || typeof hooks !== "object") throw hookTypeError("hooks");
+      for (const [kind, name] of kinds) {
+        if (hooks[kind] !== undefined) validateHook(hooks[kind], name);
+      }
+      const stops = [];
+      for (const [kind] of kinds) {
+        if (hooks[kind] !== undefined) stops.push(register(kind, hooks[kind]));
+      }
+      return function () { for (let i = 0; i < stops.length; i++) stops[i](); };
+    }
+    return {
+      createHook,
+      onInit: onHook("init", "initHook"),
+      onBefore: onHook("before", "beforeHook"),
+      onAfter: onHook("after", "afterHook"),
+      onSettled: onHook("settled", "settledHook"),
+    };
+  })();
   const startupSnapshot = { isBuildingSnapshot: () => false,
     addSerializeCallback: () => {}, addDeserializeCallback: () => {},
     setDeserializeMainFunction: () => {} };
