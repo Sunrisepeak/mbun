@@ -767,14 +767,11 @@ static JSC::JSValue loadNapiModule(JSC::JSGlobalObject* globalObject, const std:
     void* handle = dlopen(path.c_str(), RTLD_LAZY);
     if (!handle) {
         const char* err = dlerror();
-        auto* error = JSC::createError(
-            globalObject,
-            WTF::makeString("ERR_DLOPEN_FAILED: "_s,
-                            WTF::String::fromUTF8(err ? err : "dlopen failed")));
-        error->putDirect(vm, JSC::Identifier::fromString(vm, "code"_s),
-                         JSC::jsString(vm, "ERR_DLOPEN_FAILED"_s), 0);
         JSC::throwException(
-            globalObject, scope, error);
+            globalObject, scope,
+            JSC::createError(globalObject,
+                             WTF::makeString("ERR_DLOPEN_FAILED: "_s,
+                                             WTF::String::fromUTF8(err ? err : "dlopen failed"))));
         return {};
     }
 
