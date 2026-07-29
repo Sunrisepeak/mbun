@@ -72,6 +72,229 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
   const isNativeError = (util.types && util.types.isNativeError) || (() => false);
   const isError = (e) => e instanceof Error || isNativeError(e);
 
+  // ── persistent history ────────────────────────────────────────────────────
+  // node lib/internal/repl/history.js ReplHistory, ported onto mbun's readline.
+  //
+  // The entries themselves stay in the Interface's own `this.history` array
+  // (newest first, exactly node's layout), so the line editor's up/down
+  // navigation is untouched and this class owns only what node's manager owns:
+  // the file handle, the 15ms write debounce that guards against pasted input,
+  // the `flushHistory` event a closing REPL waits on, and the `_historyPrev`
+  // override that explains why history is not being persisted.
+  //
+  // node's version drives fs.promises + FileHandle; mbun's file handles are
+  // the sync fd API, so each await point is kept but the I/O under it is
+  // synchronous. The observable protocol — pause/resume around init, isFlushing
+  // true from `line` until the debounced write lands, flushHistory emitted only
+  // when no timer remains — is node's.
+  const kDebounceHistoryMS = 15;
+  const kDefaultHistorySize = 30;
+
+  const replHistoryDisabledMessage =
+    "\nPersistent history support disabled. " +
+    "Set the NODE_REPL_HISTORY environment\nvariable to " +
+    "a valid, user-writable path to enable.\n";
+
+  class ReplHistory {
+    constructor(context, options) {
+      options = options || {};
+      if (options.history !== undefined && !Array.isArray(options.history)) {
+        throw ERR("ERR_INVALID_ARG_TYPE", TypeError,
+                  'The "history" argument must be an instance of Array. ' +
+                  `Received ${inspect(options.history)}`);
+      }
+      if (options.size !== undefined) {
+        if (typeof options.size !== "number" || Number.isNaN(options.size)) {
+          throw ERR("ERR_INVALID_ARG_TYPE", TypeError,
+                    'The "size" argument must be of type number. ' +
+                    `Received ${inspect(options.size)}`);
+        }
+        if (options.size < 0) {
+          throw ERR("ERR_OUT_OF_RANGE", RangeError,
+                    'The value of "size" is out of range. It must be >= 0. ' +
+                    `Received ${options.size}`);
+        }
+      }
+      let filePath = options.filePath;
+      if (typeof filePath === "string") filePath = filePath.trim();
+      this._path = filePath;
+      this._context = context;
+      this._timer = null;
+      this._writing = false;
+      this._pending = false;
+      this._fd = null;
+      this._isFlushing = false;
+      this._size = options.size !== undefined && options.size !== null
+        ? options.size
+        : (context.historySize !== undefined ? context.historySize : kDefaultHistorySize);
+      if (options.history) context.history = options.history;
+      this._removeDuplicates = !!options.removeHistoryDuplicates;
+      this.historyPrev = undefined;
+    }
+
+    get size() { return this._size; }
+    get isFlushing() { return this._isFlushing; }
+    get history() { return this._context.history; }
+    set history(value) { this._context.history = value; }
+    get index() { return this._context.historyIndex; }
+    set index(value) { this._context.historyIndex = value; }
+
+    // node writes through the Interface so the message lands above the prompt
+    // and the prompt is redrawn under it.
+    _writeToOutput(message) {
+      const ctx = this._context;
+      if (typeof ctx._writeToOutput === "function") {
+        ctx._writeToOutput(message);
+        if (typeof ctx._refreshLine === "function") ctx._refreshLine();
+      }
+    }
+
+    // Installed as `_historyPrev` whenever persistence could not be set up: the
+    // first `up` explains it, then the real navigation is restored.
+    _replHistoryMessage() {
+      if (!this._context.history || this._context.history.length === 0) {
+        this._writeToOutput(replHistoryDisabledMessage);
+      }
+      this._context._historyPrev = this.historyPrev;
+      return this._context._historyPrev();
+    }
+
+    _disable(onReadyCallback) {
+      this.historyPrev = this._context._historyPrev;
+      this._context._historyPrev = () => this._replHistoryMessage();
+      return onReadyCallback(null, this._context);
+    }
+
+    _resolveHistoryPath() {
+      if (!this._path) {
+        try {
+          this._path = path.join(req("os").homedir(), ".node_repl_history");
+          return this._path;
+        } catch {
+          return null;
+        }
+      }
+      return this._path;
+    }
+
+    initialize(onReadyCallback) {
+      // An empty string disables persistent history outright.
+      if (this._path === "") return this._disable(onReadyCallback);
+
+      if (!this._resolveHistoryPath()) {
+        this._writeToOutput("\nError: Could not get the home directory.\n" +
+                            "REPL session history will not be persisted.\n");
+        return this._disable(onReadyCallback);
+      }
+
+      this._context.pause();
+      Promise.resolve()
+        .then(() => this._initializeHistory(onReadyCallback))
+        .catch((err) => this._handleInitError(err, onReadyCallback));
+    }
+
+    async _initializeHistory(onReadyCallback) {
+      try {
+        // Touch the file first so it exists; history files are conventionally
+        // owner-only.
+        fs.closeSync(fs.openSync(this._path, "a+", 0o600));
+
+        let data;
+        try {
+          data = fs.readFileSync(this._path, "utf8");
+        } catch (err) {
+          return this._handleInitError(err, onReadyCallback);
+        }
+
+        this._context.history = data
+          ? data.split(/\r?\n+/).slice(0, this._size)
+          : [];
+
+        const fd = fs.openSync(this._path, "r+");
+        this._fd = fd;
+        fs.ftruncateSync(fd, 0);
+
+        this._onLineBound = () => this._onLine();
+        this._context.on("line", this._onLineBound);
+        this._context.once("exit", () => this._onExit());
+
+        this._context.once("flushHistory", () => {
+          if (!this._context.closed) {
+            this._context.resume();
+            onReadyCallback(null, this._context);
+          }
+        });
+
+        await this._flushHistory();
+      } catch (err) {
+        this._closeHandle();
+        return this._handleInitError(err, onReadyCallback);
+      }
+    }
+
+    _handleInitError(err, onReadyCallback) {
+      // Cannot open the history file. Don't crash — just don't persist.
+      this._writeToOutput("\nError: Could not open history file.\n" +
+                          "REPL session history will not be persisted.\n");
+      this._context.resume();
+      return this._disable(onReadyCallback);
+    }
+
+    _onLine() {
+      this._isFlushing = true;
+      if (this._timer) clearTimeout(this._timer);
+      this._timer = setTimeout(() => { this._flushHistory(); }, kDebounceHistoryMS);
+    }
+
+    async _flushHistory() {
+      this._timer = null;
+      if (this._writing) {
+        this._pending = true;
+        return;
+      }
+      this._writing = true;
+      const historyData = (this._context.history || []).join("\n");
+      try {
+        if (this._fd !== null) {
+          fs.writeSync(this._fd, historyData, 0, "utf8");
+          fs.ftruncateSync(this._fd, Buffer.byteLength(historyData, "utf8"));
+        }
+        this._writing = false;
+        if (this._pending) {
+          this._pending = false;
+          this._onLine();
+        } else {
+          this._isFlushing = !!this._timer;
+          if (!this._isFlushing) this._context.emit("flushHistory");
+        }
+      } catch {
+        this._writing = false;
+      }
+    }
+
+    _onExit() {
+      if (this._isFlushing) {
+        this._context.once("flushHistory", () => this._onExit());
+        return;
+      }
+      if (this._onLineBound) this._context.off("line", this._onLineBound);
+      this._closeHandle();
+    }
+
+    _closeHandle() {
+      if (this._fd !== null && this._fd !== undefined) {
+        const fd = this._fd;
+        this._fd = null;
+        try { fs.closeSync(fd); } catch { /* ignore */ }
+      }
+    }
+
+    closeHandle() {
+      this._closeHandle();
+      return Promise.resolve();
+    }
+  }
+
   // ── recoverability ────────────────────────────────────────────────────────
   // node uses acorn (internal/repl/utils.isRecoverableError): an error is
   // recoverable when the parse failed *at* end-of-input, or the input ends
@@ -947,36 +1170,22 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
     }
 
     setupHistory(historyConfig, cb) {
+      // node repl.js: `setupHistory(historyConfig, cb)` where historyConfig is
+      // either the plain file path (the long-standing programmatic form) or the
+      // options bag `{ filePath, size, onHistoryFileLoaded }`. Both build the
+      // ReplHistory manager and expose it as `repl.historyManager`.
       const options = typeof historyConfig === "string"
         ? { filePath: historyConfig } : (historyConfig || {});
-      const filePath = options.filePath;
       const onLoaded = typeof cb === "function" ? cb : options.onHistoryFileLoaded;
-      const done = (err) => {
-        if (typeof onLoaded === "function") {
-          process.nextTick(() => onLoaded(err || null, this));
-        }
-      };
-      if (!filePath) {
-        this._historyPrev = this._historyPrev;
-        done(null);
-        return;
-      }
-      this._historyFilePath = filePath;
-      try {
-        const data = fs.readFileSync(filePath, "utf8");
-        this.history = data.split("\n").filter(Boolean).reverse()
-          .slice(0, this.historySize);
-      } catch {
-        this.history = [];
-      }
-      const flush = () => {
-        try {
-          fs.writeFileSync(filePath, this.history.slice().reverse().join("\n"));
-        } catch { /* ignore */ }
-      };
-      this.on("line", flush);
-      this.once("exit", flush);
-      done(null);
+      const done = typeof onLoaded === "function" ? onLoaded : () => {};
+      this._historyFilePath = options.filePath;
+      this.historyManager = new ReplHistory(this, {
+        filePath: options.filePath,
+        size: options.size,
+        history: options.history,
+        removeHistoryDuplicates: this.removeHistoryDuplicates,
+      });
+      this.historyManager.initialize(done);
     }
 
     clearBufferedCommand() {
