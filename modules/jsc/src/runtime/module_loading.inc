@@ -354,6 +354,22 @@
             requireAlias = loaded.cjs_require_alias;
             source = std::move(loaded.source);
             path = std::move(loaded.path);
+            // Node retains the legacy ERR_REQUIRE_ESM path when explicitly
+            // started with --no-experimental-require-module.  The normal mbun
+            // route supports CJS require of ESM, so gate only this opt-out.
+            const bool noRequireModule{std::find(gExecArgv.begin(), gExecArgv.end(),
+                                                 "--no-experimental-require-module") != gExecArgv.end()};
+            if (noRequireModule && path.ends_with(".mjs")) {
+                if (exc != nullptr) {
+                    JSValueRef m{make_string(
+                        ctx, "require() of ES Module " + path + " not supported.\nInstead change the require of " +
+                                 path + " to a dynamic import() which is available in all CommonJS modules.")};
+                    JSObjectRef e{JSObjectMakeError(ctx, 1, &m, nullptr)};
+                    set_prop(ctx, e, "code", make_string(ctx, "ERR_REQUIRE_ESM"));
+                    *exc = e;
+                }
+                return JSValueMakeUndefined(ctx);
+            }
         } else if (loaded.status == LoadStatus::TranspileFailed) {
             // A transpile failure is a hard error, NOT a reason to evaluate the
             // file's raw bytes. The old "plain-JS-in-.ts: fall back to raw

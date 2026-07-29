@@ -168,10 +168,15 @@ public:
     // can require() local helpers and see Bun.*/node globals.
     std::expected<void, std::string> install_cjs_env(const std::string& dir,
                                                      const std::string& file) {
+        const bool pendingDeprecation{
+            std::find(gExecArgv.begin(), gExecArgv.end(), "--pending-deprecation") != gExecArgv.end()};
         std::string js{"globalThis.__dirname = " + json_quote_(dir) + ";\n" +
                        "globalThis.__filename = " + json_quote_(file) + ";\n" +
                        "if (globalThis.Bun) globalThis.Bun.main = " + json_quote_(file) + ";\n" +
                        "globalThis.module = { exports: {}, filename: " + json_quote_(file) + ", parent: null };\n" +
+                       (pendingDeprecation
+                            ? "var __mbunModuleParent = null;Object.defineProperty(globalThis.module, 'parent', { enumerable: true, configurable: true, get: function(){ return __mbunModuleParent; }, set: function(value){ __mbunModuleParent = value; var p = globalThis.process; if (p && typeof p.emitWarning === 'function') p.emitWarning('module.parent is deprecated due to accuracy issues. Please use require.main to find program entry point instead.', 'DeprecationWarning', 'DEP0144'); } });\n"
+                            : "") +
                        "globalThis.exports = globalThis.module.exports;\n" +
                        "globalThis.require = globalThis.__mbun_make_require(" + json_quote_(dir) +
                        ");\n" +
