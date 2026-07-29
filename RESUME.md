@@ -62,8 +62,22 @@ module.parent DEP0144, and legacy require-mjs. The first module implementation
 leaked a global and regressed pending-deprecation crypto tests; it was changed
 to closure-private state. A net no-halfopen candidate regressed an existing
 local-address test and was fully reverted. Complete crypto/module/require
-subtrees show only the three intended fail-to-pass transitions. Current
-targeted projection is **2808/4433**, pending the next pushed full run.
+subtrees show only the three intended fail-to-pass transitions. The subsequent
+full run is authoritative at **2808/4433 pass (63.34%)**: the three intended
+greens plus recovery of the prior TLS socket timeout, offset by
+`test-worker-terminate-source-map.js` changing pass to fail. That worker file
+fails on three consecutive same-binary reruns and must not be counted as green.
+
+Wave 36 returned to three 12-file high-confidence lists. Static expectation was
+10+, but exact native runs produced **6/36 newly green**: process default export,
+env deprecation, process ref/unref, and three child-process contracts
+(prototype tampering, spawn error, stdin). Three zero-yield process candidates
+(hrtime, exit-code validation, getBuiltinModule type validation), one
+compile-failing dlopen candidate, and an inaccurate assessment document were
+additively reverted. Complete `test-process*` (96 files), `test-child*` (111),
+and `test-cluster*` (83) subtrees show exactly the six fail-to-pass transitions
+and no pass-to-nonpass transition. Projection before the required full Node run
+is **2814/4433**.
 
 Session-scoped cron jobs are in-memory only (`durable` has no effect), so the
 hourly loop survives a usage limit — it simply skips the fires that land during

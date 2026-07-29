@@ -72,7 +72,23 @@ crypto Hash 零收益提交及 net 静态预测文档也回退。24-file 扩容�
   WebCrypto cross-realm 零收益也回退。
 
 完整 crypto/module/require 子树只有上述3个 fail→pass、零pass回归。当前
-定向推算 Node **2808/4433**。
+全量确认 Node **2808/4433（63.34%）**：上述3项加上此前 TLS socket
+timeout 恢复为 pass，同时 `test-worker-terminate-source-map.js` 从 pass
+变 fail；该 worker 文件在同一二进制连续3次复跑均 fail，不再计为 green。
+
+### Wave36 三组12-file实跑：新增6 green，淘汰4个无效候选
+
+静态预计10+，36个原生失败文件实跑后实际 **6/36 转绿**：
+
+- process：动态导入 `node:process` 默认导出、env pending-deprecation、
+  ref/unref protocol，共 **+3**；
+- child_process：prototype tampering、spawn error、stdin，共 **+3**；
+- hrtime、exit-code validation、getBuiltinModule 类型校验均0收益并回退；
+  dlopen error-code候选编译歧义，立即回退；不准确的预测文档同步回退。
+
+撤回后重新构建通过；完整 `test-process*` 96文件、`test-child*` 111文件、
+`test-cluster*` 83文件复验，只有上述6项 fail→pass，**0 pass→nonpass**。
+全量前推算 Node **2814/4433**。
 
 ### 5 小时冲刺第三十批：净减 61 个 Bun 失败，cron 新增全绿
 
