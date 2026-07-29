@@ -2832,13 +2832,8 @@ inline constexpr char kBootstrapJS_[] = R"JS(
         // The URL setter has already removed exactly one leading '?'. Feeding
         // the remainder through the public constructor would incorrectly strip
         // a second one (e.g. "??a" must produce the key "?a").
-        const entries = [];
-        if (query) for (const part of query.split("&")) {
-          if (!part) continue;
-          const i = part.indexOf("=");
-          entries.push([formDecode(i < 0 ? part : part.slice(0, i)), formDecode(i < 0 ? "" : part.slice(i + 1))]);
-        }
-        this.searchParams._e = entries;
+        const paramsInput = query.startsWith("?") ? "%3F" + query.slice(1) : query;
+        this.searchParams._e = new G.URLSearchParams(paramsInput)._e;
       }
       get _authority() { const credentials = this._username || this._password ? this._username + (this._password ? ":" + this._password : "") + "@" : ""; return credentials + this.host; }
       get href() { return this._protocol + (this._hasAuthority || this._protocol === "file:" ? "//" + this._authority : "") + this._pathname + (this._queryPresent ? this._search : "") + this._hash; }
