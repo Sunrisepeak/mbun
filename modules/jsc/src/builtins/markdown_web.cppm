@@ -2254,6 +2254,43 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
     G.DOMException = DOMException;
   }
 
+  // ---- QuotaExceededError (WHATWG webidl §QuotaExceededError) ----
+  // A DOMException subclass with a fixed name/code plus the nullable `quota`
+  // and `requested` telemetry attributes. `crypto.getRandomValues` and the
+  // storage APIs throw it, and the corpus asserts `err instanceof
+  // QuotaExceededError`, so it has to be a real global constructor rather than
+  // a DOMException carrying the name.
+  if (typeof G.QuotaExceededError === "undefined" && typeof G.DOMException === "function") {
+    const kQuota = Symbol("quota");
+    const kRequested = Symbol("requested");
+    // `double?`: absent/undefined is null; anything else is a number that must
+    // not be negative (webidl throws RangeError, not TypeError, for that).
+    const toQuotaDouble = (value, label) => {
+      if (value === undefined || value === null) return null;
+      const n = Number(value);
+      if (!(n >= 0)) throw new RangeError(`${label} must be a non-negative number`);
+      return n;
+    };
+    class QuotaExceededError extends G.DOMException {
+      constructor(message, options) {
+        super(message === undefined ? "" : message, "QuotaExceededError");
+        let quota = null, requested = null;
+        if (options !== undefined && options !== null) {
+          if (typeof options !== "object" && typeof options !== "function")
+            throw new TypeError("QuotaExceededErrorOptions is not an object");
+          quota = toQuotaDouble(options.quota, "options.quota");
+          requested = toQuotaDouble(options.requested, "options.requested");
+        }
+        Object.defineProperty(this, kQuota, { value: quota });
+        Object.defineProperty(this, kRequested, { value: requested });
+      }
+      get quota() { return this[kQuota]; }
+      get requested() { return this[kRequested]; }
+      get [Symbol.toStringTag]() { return "QuotaExceededError"; }
+    }
+    G.QuotaExceededError = QuotaExceededError;
+  }
+
   // ---- V8 stack-trace API (Error.captureStackTrace / prepareStackTrace / CallSite) ----
   // JSC stacks are "name@file:line:col"; V8 (node/bun) are "    at name (file:line:col)".
   // Parse JSC lines into CallSite objects, re-format V8-style, and route through

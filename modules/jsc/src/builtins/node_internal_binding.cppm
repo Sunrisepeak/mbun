@@ -1599,7 +1599,52 @@ inline constexpr std::string_view kNodeInternalBindingJS = R"JS(
   factories["crypto"] = () => {
     const c = mod("crypto");
     const list = (fn) => (typeof fn === "function" ? fn() : []);
+    // node src/crypto/crypto_keys.cc: the KeyObject/CryptoKey base classes are
+    // C++ so that the instances can be transferred between threads, and node's
+    // lib/internal/crypto/keys.js top-levels a call to each factory. Without
+    // them that module throws while loading, and it is loaded transitively by
+    // `internal/crypto/util` and `internal/crypto/webidl` — so the pure-JS
+    // helpers in those modules were unreachable. mbun's `crypto` is native and
+    // never routes through node's key JS, so the base classes only have to
+    // provide the storage contract keys.js drives: a slot tuple stashed on the
+    // instance that the matching `get*Slots` reads back.
+    const kKeyObjectSlots = Symbol("node:KeyObject slots");
+    const kCryptoKeySlots = Symbol("node:CryptoKey slots");
+    const defineSlots = (target, key, slots) => {
+      Object.defineProperty(target, key, { __proto__: null, value: slots });
+      return slots;
+    };
     return {
+      // node's opaque handle to an EVP_PKEY / symmetric secret. keys.js only
+      // uses it for `instanceof` gating and to forward to native jobs.
+      KeyObjectHandle: class KeyObjectHandle {},
+      createNativeKeyObjectClass: (callback) => {
+        class NativeKeyObject {
+          constructor(handle) {
+            defineSlots(this, kKeyObjectSlots,
+              [handle === undefined || handle === null ? undefined : handle.type, handle]);
+          }
+        }
+        return callback(NativeKeyObject);
+      },
+      getKeyObjectSlots: (key) => key[kKeyObjectSlots],
+      createCryptoKeyClass: (callback) => {
+        class NativeCryptoKey {
+          constructor(handle, algorithm, usagesMask, extractable) {
+            defineSlots(this, kCryptoKeySlots,
+              [handle === undefined || handle === null ? undefined : handle.type,
+               extractable, algorithm, usagesMask, handle]);
+          }
+        }
+        return callback(NativeCryptoKey);
+      },
+      getCryptoKeySlots: (key) => key[kCryptoKeySlots],
+      // node src/crypto/crypto_keys.h enums, in declaration order.
+      kKeyTypeSecret: 0, kKeyTypePublic: 1, kKeyTypePrivate: 2,
+      kKeyFormatPEM: 0, kKeyFormatDER: 1, kKeyFormatJWK: 2,
+      kKeyFormatRawPublic: 3, kKeyFormatRawPrivate: 4, kKeyFormatRawSeed: 5,
+      kKeyEncodingPKCS1: 0, kKeyEncodingPKCS8: 1,
+      kKeyEncodingSPKI: 2, kKeyEncodingSEC1: 3,
       getCiphers: () => list(c.getCiphers),
       getCurves: () => list(c.getCurves),
       getHashes: () => list(c.getHashes),
