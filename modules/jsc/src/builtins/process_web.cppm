@@ -1084,6 +1084,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     return promise;
   };
 
+  let warnedExecFileShell = false;
   function execFile(file, args, options, cb) {
     const nf = normalizeExecFileArgs(file, args, options, cb);
     const nz = normalizeSpawnArgs(nf.file, nf.args, typeof nf.options === "function" ? {} : nf.options);
@@ -1092,7 +1093,9 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     const displayCmd = [file].concat(stringArgs).join(" ");
     let spawnFile = file, spawnArgs = [file].concat(stringArgs);
     if (options.shell) {
-      if (stringArgs.length > 0 && G.process && typeof G.process.emitWarning === "function") {
+      if (!warnedExecFileShell && stringArgs.length > 0 &&
+          G.process && typeof G.process.emitWarning === "function") {
+        warnedExecFileShell = true;
         G.process.emitWarning(
           "Passing args to a child process with shell option true can lead to security vulnerabilities, as the arguments are not escaped, only concatenated.",
           "DeprecationWarning", "DEP0190");
