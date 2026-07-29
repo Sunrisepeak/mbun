@@ -571,21 +571,9 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
               crypto: (cr && cr.constants) || {},
               zlib: (zl && zl.constants) || {},
               // node's trace-event phase codes (the ASCII letter of each phase).
-              trace: {
-                TRACE_EVENT_PHASE_BEGIN: 66, TRACE_EVENT_PHASE_END: 69,
-                TRACE_EVENT_PHASE_COMPLETE: 88, TRACE_EVENT_PHASE_INSTANT: 73,
-                TRACE_EVENT_PHASE_ASYNC_BEGIN: 83, TRACE_EVENT_PHASE_ASYNC_STEP_INTO: 84,
-                TRACE_EVENT_PHASE_ASYNC_STEP_PAST: 112, TRACE_EVENT_PHASE_ASYNC_END: 70,
-                TRACE_EVENT_PHASE_NESTABLE_ASYNC_BEGIN: 98, TRACE_EVENT_PHASE_NESTABLE_ASYNC_END: 101,
-                TRACE_EVENT_PHASE_NESTABLE_ASYNC_INSTANT: 110, TRACE_EVENT_PHASE_FLOW_BEGIN: 115,
-                TRACE_EVENT_PHASE_FLOW_STEP: 116, TRACE_EVENT_PHASE_FLOW_END: 102,
-                TRACE_EVENT_PHASE_METADATA: 77, TRACE_EVENT_PHASE_COUNTER: 67,
-                TRACE_EVENT_PHASE_SAMPLE: 80, TRACE_EVENT_PHASE_CREATE_OBJECT: 78,
-                TRACE_EVENT_PHASE_SNAPSHOT_OBJECT: 79, TRACE_EVENT_PHASE_DELETE_OBJECT: 68,
-                TRACE_EVENT_PHASE_MEMORY_DUMP: 118, TRACE_EVENT_PHASE_MARK: 82,
-                TRACE_EVENT_PHASE_CLOCK_SYNC: 99, TRACE_EVENT_PHASE_ENTER_CONTEXT: 40,
-                TRACE_EVENT_PHASE_LEAVE_CONTEXT: 41, TRACE_EVENT_PHASE_LINK_IDS: 61,
-              },
+              // Owned by the trace_events partition below so that this shim and
+              // internalBinding("constants") cannot disagree about a phase.
+              trace: (G.__mbunTraceEvents && G.__mbunTraceEvents.phases) || {},
             };
           }
           else if (name === "uv") {
@@ -947,6 +935,27 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
         let sawTraceFlag = false;
         let initialTitle;
 
+        // node src/tracing/trace_event_common.h: every phase is the ASCII code
+        // of the Chrome-trace `ph` letter. internalBinding("constants").trace
+        // and process.binding("constants").trace both publish this table, and
+        // internalBinding("trace_events").trace turns the code back into that
+        // letter -- so all three have to come from one place.
+        const phases = {
+          TRACE_EVENT_PHASE_BEGIN: 66, TRACE_EVENT_PHASE_END: 69,
+          TRACE_EVENT_PHASE_COMPLETE: 88, TRACE_EVENT_PHASE_INSTANT: 73,
+          TRACE_EVENT_PHASE_ASYNC_BEGIN: 83, TRACE_EVENT_PHASE_ASYNC_STEP_INTO: 84,
+          TRACE_EVENT_PHASE_ASYNC_STEP_PAST: 112, TRACE_EVENT_PHASE_ASYNC_END: 70,
+          TRACE_EVENT_PHASE_NESTABLE_ASYNC_BEGIN: 98, TRACE_EVENT_PHASE_NESTABLE_ASYNC_END: 101,
+          TRACE_EVENT_PHASE_NESTABLE_ASYNC_INSTANT: 110, TRACE_EVENT_PHASE_FLOW_BEGIN: 115,
+          TRACE_EVENT_PHASE_FLOW_STEP: 116, TRACE_EVENT_PHASE_FLOW_END: 102,
+          TRACE_EVENT_PHASE_METADATA: 77, TRACE_EVENT_PHASE_COUNTER: 67,
+          TRACE_EVENT_PHASE_SAMPLE: 80, TRACE_EVENT_PHASE_CREATE_OBJECT: 78,
+          TRACE_EVENT_PHASE_SNAPSHOT_OBJECT: 79, TRACE_EVENT_PHASE_DELETE_OBJECT: 68,
+          TRACE_EVENT_PHASE_MEMORY_DUMP: 118, TRACE_EVENT_PHASE_MARK: 82,
+          TRACE_EVENT_PHASE_CLOCK_SYNC: 99, TRACE_EVENT_PHASE_ENTER_CONTEXT: 40,
+          TRACE_EVENT_PHASE_LEAVE_CONTEXT: 41, TRACE_EVENT_PHASE_LINK_IDS: 61,
+        };
+
         const flagValue = (name) => {
           for (let i = 0; i < argv.length; i++) {
             const arg = argv[i];
@@ -1086,6 +1095,7 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
           } catch (e) {}
         };
         return {
+          phases,
           createTracing, getEnabledCategories, getCategoryEnabledBuffer: categoryBuffer,
           isTraceCategoryEnabled: enabled,
           enableCategories: (categories) => changeCategories(categories, 1),

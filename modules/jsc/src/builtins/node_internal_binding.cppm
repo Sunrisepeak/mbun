@@ -243,7 +243,9 @@ inline constexpr std::string_view kNodeInternalBindingJS = R"JS(
       fs: mod("fs").constants || {},
       crypto: mod("crypto").constants || {},
       zlib: mod("zlib").constants || {},
-      trace: {},
+      // node src/tracing/trace_event_common.h phase codes; the trace_events
+      // partition of the process blob owns the table (see `phases` there).
+      trace: (G.__mbunTraceEvents && G.__mbunTraceEvents.phases) || {},
       internal: {},
       signals: os.signals || {},
     };
