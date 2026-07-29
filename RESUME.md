@@ -155,6 +155,20 @@ Two zero-yield attempts, EC `paramEncoding` and URL.canParse required-argument
 validation, were additively reverted after runtime checks proved that they only
 moved the first error. They are not part of the accepted checkpoint.
 
+### Sprint wave 7 measured checkpoint (12:06–12:22)
+
+This checkpoint gained 7 files in 15.8 minutes: **26.6 files/hour**, with zero
+regressions in the named/related sets.
+
+- EventEmitter direct single-listener storage and array promotion/demotion: +2.
+  The full 26-file `test-event-emitter-*` guard was 23 pass / 3 fail, compared
+  with the old gate as 7 gains, 16 retained passes, and zero regressions (five
+  of those gains were already published in wave 6).
+- protected AbortSignal cleanup listeners: estimated 2, actual +1; the other
+  file reached an independent error-code failure.
+- legacy URL parse DEP0169 plus URLSearchParams inspect/brand/iterator/callback/
+  nested-query contracts: 4/4.
+
 The first three-way reuse probe tested local round-10 branches for node's
 `--test` CLI, HTTP/2 argument/timer validation, and verbatim Node error text.
 All three candidate cherry-picks became empty on the current target tree.

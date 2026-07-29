@@ -5,6 +5,20 @@
 
 ## 2026-07-29
 
+### 5 小时冲刺第七批：15.8 分钟净增 7 文件，26.6 files/hour
+
+12:06–12:22 集中验收三组：
+
+- EventEmitter 单 listener 函数存储/数组升降级，新增 2；完整
+  `test-event-emitter-*` 26 文件回归集为 23 pass / 3 fail，对旧 gate
+  是 7 gain、16 pass 保持、0 regression（其中 5 gain 属上一 checkpoint）；
+- protected AbortSignal listener 绕过普通 listener 的
+  `stopImmediatePropagation`，目标 2 实际新增 1，另一个停在独立错误码；
+- URL legacy parse `DEP0169` + URLSearchParams inspect/brand/iterator/
+  callback/query-prefix，预计 4，实际 **4/4**。
+
+本 checkpoint 相对上一已推状态净 +7，命名/相关子集 green→non-green 0。
+
 ### 5 小时冲刺第六批：11.5 分钟净增 7 文件，36.5 files/hour
 
 11:55–12:06 接受四个短合同组，命名验收 **7/7 全绿**：
