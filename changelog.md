@@ -5,6 +5,32 @@
 
 ## 2026-07-29
 
+### 5 小时冲刺第一批：20 分钟净增 29 文件，83.5 files/hour
+
+10:55–11:15 按新协议运行 3 个 Agent lane，子 Agent 只做静态实现，主
+Agent 一次组合构建后集中验收。结果从上一批 **3.4 files/hour** 提升到
+**29 / 20.8 分钟 = 83.5 files/hour**；所有命名验收集合中
+pass→non-pass 为 0：
+
+- domain abort：预计 10，实际 **10/10**；
+- trace-events 真实 category/API/writer backend：预计 11，实际 **10/29**
+  转绿（此前 0）；审查时删除了固定注入 provider 事件的伪实现；
+- VM module requests/link/TLA：预计 7，实际 **5/7**；
+- FastUtf8Stream：预计 14，实际 **2/14**；
+- compile-cache 公开 API：静态分诊把预计 14+ 修正为 1，实际 **1/22**；
+- Bun CSS 真实 `mbun.css` minifier bridge：预计 10，实际 **1/10**；
+- `--expose_gc` alias：预计首因 5，实际 **0/5**，证明其余均有 GC
+  hook/弱引用独立根因。
+
+总计 Node +28、Bun +1。组合 `build_or_die`、冲突标记、gitlink、diff
+守卫通过。此处的“0 回退”只覆盖本批命名集合及其旧基线对比，不冒充全量
+回归结论。
+
+效率决策：domain 与 trace shared-core 超额/达标，继续选择类似共同
+endpoint；VM 可接受；FastUtf8、CSS、GC 停止按原大组追投，必须先把剩余
+日志重新聚类；compile-cache 的 20 个剩余文件需要真实 loader bytecode
+持久化，不在 45 分钟 lane 内继续。下一批仍以预计 files/hour 排序。
+
 ### 5 小时冲刺切换：停止逐断言慢循环，按 files/hour 分配
 
 10:20–10:55 的第二批使用 3 个实现 Agent、14 个小提交，主线定向结果只有

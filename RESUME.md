@@ -56,6 +56,31 @@ BroadcastChannel transport until its reuse count justifies the cost.
 contracts and must not be subtracted. Establish the new baseline at the next
 pushed checkpoint.
 
+### Sprint wave 1 measured checkpoint (10:55–11:15)
+
+One combined build after three static implementation lanes produced 29 newly
+green files in 20.8 minutes: **83.5 files/hour**, with zero pass regressions in
+the named acceptance sets.
+
+- domain abort 10/10;
+- trace-events 10/29 (10 new);
+- VM module request/link/TLA 5/7;
+- FastUtf8Stream 2/14;
+- compile-cache 1/22;
+- Bun CSS minifier bridge 1/10;
+- expose_gc 0/5.
+
+Node gained 28 and Bun gained 1. Do not extrapolate the scoped zero-regression
+result to the full corpora. The trace implementation is intentionally honest:
+the integration review removed synthetic V8/bootstrap/async event records and
+kept only real category state, API/internal-binding calls, metadata and file
+writer behavior.
+
+Re-rank before dispatch. Do not keep funding the original FastUtf8/CSS/GC
+groups as if their first missing symbol were their only cause. Compile-cache
+engine tests need real loader bytecode persistence and exceed one sprint lane.
+Prefer another shared fatal/state/API endpoint with an estimated 5+ files/hour.
+
 The first three-way reuse probe tested local round-10 branches for node's
 `--test` CLI, HTTP/2 argument/timer validation, and verbatim Node error text.
 All three candidate cherry-picks became empty on the current target tree.
