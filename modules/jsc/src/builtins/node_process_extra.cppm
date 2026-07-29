@@ -497,31 +497,17 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
         const rawGet = desc.get ? desc.get.bind(proc) : () => store;
         const rawSet = desc.set ? desc.set.bind(proc) : (v) => { store = v; };
         Object.defineProperty(proc, "exitCode", {
-          configurable: false,
+          configurable: true,
           enumerable: true,
           get() { return rawGet(); },
           set(code) {
             if (code !== null && code !== undefined) {
-              if (typeof code === "string" && /^(?:0|[1-9]\d*)$/.test(code)) code = Number(code);
-              else if (typeof code !== "number") throw errInvalidArgType("code", "number", code);
+              if (typeof code !== "number") throw errInvalidArgType("code", "number", code);
               if (!Number.isInteger(code)) throw errOutOfRange("code", "an integer", code);
             }
             rawSet(code);
           },
         });
-      }
-
-      if (typeof proc.exit === "function" && !proc.exit.__mbunValidatedExit) {
-        const rawExit = proc.exit.bind(proc);
-        const validatedExit = function exit(code) {
-          if (code === undefined || code === null) return rawExit(code == null ? 0 : code);
-          if (typeof code === "string" && /^(?:0|[1-9]\d*)$/.test(code)) code = Number(code);
-          else if (typeof code !== "number") throw errInvalidArgType("code", "number", code);
-          if (!Number.isInteger(code)) throw errOutOfRange("code", "an integer", code);
-          return rawExit(code);
-        };
-        Object.defineProperty(validatedExit, "__mbunValidatedExit", { value: true });
-        proc.exit = validatedExit;
       }
     } catch (e) {}
 
