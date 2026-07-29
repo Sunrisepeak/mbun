@@ -1008,22 +1008,18 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
     if (comma === -1) { const e = new TypeError("Invalid URL: " + p); e.code = "ERR_INVALID_URL"; throw e; }
     const meta = p.slice(5, comma);
     const payload = p.slice(comma + 1);
-    const mime = meta.split(";", 1)[0].toLowerCase() || "text/plain";
-    let source;
     if (/;base64\s*$/i.test(meta)) {
-      source = G.Buffer ? G.Buffer.from(payload, "base64").toString("utf8")
-        : (G.atob ? G.atob(payload) : payload);
-    } else {
-      try { source = decodeURIComponent(payload); } catch (e) { source = payload; }
+      if (G.Buffer) return G.Buffer.from(payload, "base64").toString("utf8");
+      return G.atob ? G.atob(payload) : payload;
     }
-    return { source, javascript: mime === "text/javascript" || mime === "application/javascript" };
+    try { return decodeURIComponent(payload); } catch (e) { return payload; }
   };
 
   // node ERR_WORKER_PATH: a bare specifier is not a worker entry point.
   const workerEntryPath = (filename) => {
     let p = filename;
     if (p !== null && typeof p === "object" && typeof p.href === "string") {
-      if (p.protocol === "data:") return { data: dataUrlSource(p.href) };
+      if (p.protocol === "data:") return { source: dataUrlSource(p.href) };
       if (p.protocol !== "file:") {
         const e = new TypeError("The URL must be of scheme file: Received protocol '" + p.protocol + "'");
         e.code = "ERR_INVALID_URL_SCHEME"; throw e;
@@ -1140,14 +1136,6 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
         const e = new TypeError('The "options.execArgv" property must be an instance of Array. Received ' + recvType(options.execArgv));
         e.code = "ERR_INVALID_ARG_TYPE"; throw e;
       }
-      // A worker inherits the parent's V8 flags, but an explicitly supplied
-      // V8-only flag is rejected by node before the worker is created. Node
-      // flags such as --expose-internals and --input-type remain valid here.
-      if (Array.isArray(options.execArgv) && options.execArgv.some((arg) => String(arg) === "--expose-gc")) {
-        const e = new Error("Initiated Worker with invalid execArgv flags: --expose-gc");
-        e.code = "ERR_WORKER_INVALID_EXEC_ARGV";
-        throw e;
-      }
       // Serialise BEFORE the structuredClone check: the encoder is what knows
       // about the transfer list, and it owns the "needs transfer but was not
       // listed" DataCloneError whose exact wording the corpus asserts. A plain
@@ -1181,15 +1169,7 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
         this._tempFile = entry;
       } else {
         const r = workerEntryPath(filename);
-        if (r.data !== undefined) {
-          // data: workers are ES modules. The runtime's loader lowers ESM into
-          // the CommonJS wrapper it uses internally, so hide `module.exports`
-          // from the user source while preserving the lowering's `exports`.
-          let source = r.data.source;
-          if (!r.data.javascript) source = "throw new TypeError('Unknown module format');";
-          else source = "Object.defineProperty(module, 'exports', { get() { throw new ReferenceError('module is not defined'); }, set() { throw new ReferenceError('module is not defined'); } });\n" + source;
-          entry = writeTempWorker(source, tid, ".mjs"); this._tempFile = entry;
-        } else if (r.source !== undefined) { entry = writeTempWorker(r.source, tid, ".js"); this._tempFile = entry; }
+        if (r.source !== undefined) { entry = writeTempWorker(r.source, tid, ".js"); this._tempFile = entry; }
         else entry = r.path;
       }
 
@@ -1288,11 +1268,7 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
         } else if (m.t === "e") {
           const err = new Error(m.d && m.d.message ? m.d.message : String(m.d));
           if (m.d && m.d.name) err.name = m.d.name;
-          // Error.prepareStackTrace is user code. If it threw while the child
-          // collected a fatal Error, node still forwards name/message but the
-          // parent-visible error has no stack rather than a locally invented one.
-          if (m.d && m.d.stackUnavailable) err.stack = undefined;
-          else if (m.d && m.d.stack) err.stack = m.d.stack;
+          if (m.d && m.d.stack) err.stack = m.d.stack;
           if (m.d && m.d.code) err.code = m.d.code;
           if (typeof self.onerror === "function") self.onerror(err);
           self.emit("error", err);
@@ -1435,9 +1411,7 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
     } catch (e) {}
     const reportFatal = (e) => {
       if (typeof proc.send !== "function") return;
-      let stack, stackUnavailable = false;
-      try { stack = e && e.stack; } catch (_) { stackUnavailable = true; }
-      try { proc.send({ t: "e", d: { message: e && e.message, name: e && e.name, stack, stackUnavailable, code: e && e.code } }); } catch (_) {}
+      try { proc.send({ t: "e", d: { message: e && e.message, name: e && e.name, stack: e && e.stack, code: e && e.code } }); } catch (_) {}
     };
     // A fatal error in the worker's ENTRY POINT (a bad specifier, a throw at
     // module scope) reaches the parent as an 'error' event too — node
