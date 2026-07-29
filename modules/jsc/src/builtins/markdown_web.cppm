@@ -783,7 +783,8 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
     Object.setPrototypeOf(Hash.prototype, Transform.prototype);
     Object.setPrototypeOf(Hash, Transform);
     const joinChunks = function (chunks) { let t = 0; for (const c of chunks) t += c.length; const m = new Uint8Array(t); let o = 0; for (const c of chunks) { m.set(c, o); o += c.length; } return m; };
-    Hash.prototype.update = function (data, enc) { if (this._done) throw new Error("Digest already called"); if (typeof data !== "string" && !ArrayBuffer.isView(data) && !(data instanceof ArrayBuffer)) throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "data" argument must be of type string or an instance of Buffer, TypedArray, or DataView.' + invalidArgType(data)); this._chunks.push(toBytes(data, enc)); return this; };
+    const hashFinalized = () => mkErr(Error, "ERR_CRYPTO_HASH_FINALIZED", "Digest already called");
+    Hash.prototype.update = function (data, enc) { if (this._done) throw hashFinalized(); if (typeof data !== "string" && !ArrayBuffer.isView(data) && !(data instanceof ArrayBuffer)) throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "data" argument must be of type string or an instance of Buffer, TypedArray, or DataView.' + invalidArgType(data)); this._chunks.push(toBytes(data, enc)); return this; };
     // node's native hash keeps the finalized digest around: the stream path
     // finalizes through the handle (bypassing the JS "already called" guard), and
     // user code may still call digest() afterwards and must get the same bytes
@@ -806,7 +807,7 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       return this._digestBytes;
     };
     Hash.prototype.digest = function (enc) {
-      if (this._done) throw new Error("Digest already called");
+      if (this._done) throw hashFinalized();
       this._done = true;
       return encode(this._rawDigest(), enc);
     };
@@ -816,7 +817,7 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
     Hash.prototype._flush = function (cb) { this.push(encode(this._rawDigest())); cb(); };
     // node's Hash#copy clones the EVP context, which is gone once digest() ran:
     // copying a finalized hash throws, exactly like update() does.
-    Hash.prototype.copy = function () { if (this._done) throw new Error("Digest already called"); const h = new Hash(this._algo, { outputLength: this._out }); h._chunks = this._chunks.slice(); return h; };
+    Hash.prototype.copy = function () { if (this._done) throw hashFinalized(); const h = new Hash(this._algo, { outputLength: this._out }); h._chunks = this._chunks.slice(); return h; };
     // node exposes the native context under a `kHandle` symbol whose methods must
     // reject a bad `this` with ERR_INVALID_THIS (rather than dereferencing a null
     // native pointer). We mirror that contract with a guarded handle object.
