@@ -335,12 +335,40 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       // multi-line, double-quoted, trailing comma), NOT node's util.inspect —
       // real bun's console.log output === Bun.inspect(x). util.inspect stays
       // node-style for node:util tests. ref bun ConsoleObject format path.
-      const inspect1 = (x) => (typeof x === "string" ? x : (G.Bun && Bun.inspect ? Bun.inspect(x) : util.inspect(x)));
+      const inspect1 = (x) => {
+        if (typeof x === "string") return x;
+        try { return G.Bun && Bun.inspect ? Bun.inspect(x) : util.inspect(x); }
+        // Both Node's console and util.inspect render an already-revoked Proxy
+        // without dereferencing it.  JSC's generic inspector throws instead.
+        catch (_) { return "<Revoked Proxy>"; }
+      };
       // Computed-name method shorthand: keeps the correct `.name` (the test
       // test-console-methods asserts console.log.name === 'log') and is
       // non-constructable (`new console.log()` must throw), unlike a plain
       // function expression.
-      con[meth] = ({ [meth](...a) { if (typeof a[0] === "string" && /%[sdifjoOc%]/.test(a[0])) native(util.format(...a)); else native(a.map(inspect1).join(" ")); } })[meth];
+      con[meth] = ({ [meth](...a) {
+        // The native console bridge is below diagnostics_channel in the image,
+        // so resolve it per call. Subscribers receive mutable *raw* arguments
+        // before formatting, exactly as node's console channels promise.
+        const dc = G.__mbunNativeModules && (G.__mbunNativeModules["diagnostics_channel"] || G.__mbunNativeModules["node:diagnostics_channel"]);
+        try {
+          const ch = dc && typeof dc.channel === "function" && dc.channel("console." + meth);
+          if (ch && ch.hasSubscribers) ch.publish(a);
+        } catch (_) {}
+        const text = typeof a[0] === "string" && /%[sdifjoOc%]/.test(a[0])
+          ? util.format(...a) : a.map(inspect1).join(" ");
+        // console._stdout/_stderr are intentionally mutable lazy properties.
+        // Retain the native fast path for the normal process streams, but route
+        // an overridden target through its write method.
+        const stdout = meth === "log" || meth === "info" || meth === "debug";
+        const target = stdout ? con._stdout : con._stderr;
+        const standard = G.process && (stdout ? G.process.stdout : G.process.stderr);
+        if (target && target !== standard && typeof target.write === "function") {
+          target.write(text + "\n");
+          return;
+        }
+        return native(text);
+      } })[meth];
     }
   }
 
