@@ -5,6 +5,64 @@ session that is interrupted (usage limit, crash, restart) can pick up from the
 file rather than from memory. **If you are a fresh session reading this, start
 here.**
 
+## 2026-07-30 10:50 — WAVE 55: `process.nextTick` runs INSIDE the microtask queue
+
+The highest-leverage finding of the campaign so far, and it was found by chasing
+one hanging file. **mbun violates node's core ordering contract: microtasks must
+fully drain before the tick queue runs.** Fifteen-line repro, verified on the
+current build by the integration agent (not just by the lane):
+
+```js
+Promise.resolve()
+  .then(() => { log('mt1'); process.nextTick(log, 'TICK'); })
+  .then(() => log('mt2'));
+// node: mt1 mt2 TICK      mbun: mt1 TICK mt2
+```
+
+Cause: `process.nextTick` arms its drain with a **promise reaction** at
+`modules/jsc/src/runtime/bindings_install.inc:411`. A tick scheduled from inside
+a microtask therefore interleaves into the middle of that microtask chain
+instead of waiting for it to empty.
+
+**Exposure pattern — search for this shape, not for `nextTick`:** *a
+cleanup/teardown step scheduled on `nextTick` that races an error travelling
+through a promise chain.* Known-affected surfaces: stream teardown
+(`destroyImpl`, `end-of-stream`), `pipeline`, `finished()`, async-iterator
+adapters, and anything using `once()`-style listener removal.
+
+**How it manifested.** `pipeline()` removes the tail's `'error'` listener once it
+completes without error (`lastStreamCleanup`, nodejs/node#35452). Node is safe
+because the tail is destroyed *before* pipeline completes — the microtask queue
+drains first. Under the inversion, `'finish'` lands first, pipeline declares
+success, drops the error listener, and a body throw arriving afterwards has no
+listener: uncaught, and the composed stream hangs forever. So this was **never a
+`compose`/`fromAsyncGen`/`nextAsync` gap** — those are all correct; `compose` is
+merely the most ordering-sensitive consumer.
+
+**What shipped (`c87e3af`) is a compensation, NOT the cure.** 24 lines in
+`internal/streams/compose` (`node_stream_pipeline.cppm`) tracking
+`pipelineFinished` plus a tail `'error'` listener routing a post-completion
+error into the existing `d.destroy(err)` seam, gated so pipeline's own `onError`
+stays sole owner while running.
+
+Measured (integration agent, independent of the lane, vs
+`codex-sprint2-wave39-full-node`): `test-stream` **236 → 237 / 249**, `test-http`
+628/734 unchanged, `test-webstream` 10/16 unchanged, **0 regressions in all
+three**. NORMAL-RETURN CHECK passed: `Readable.from([1,2,3]).compose(...)`
+resolves `[2,4,6]` with exactly one `'end'`, one `'close'`, zero `'error'`.
+
+**The cure needs its own lane, and it is expensive.** Correct fix: stop arming
+the tick drain with a promise reaction; drain ticks only at the C++
+microtask-drain boundary (`__mbunRunTicks` after JSC's own drain). Deliberately
+NOT attempted here — the in-code history at `bindings_install.inc:401` records
+that splitting `nextTick` out of `queueMicrotask` once cost **256 bun files**.
+Any attempt must gate on the full bun corpus *and* node async/stream/http
+subtrees before it is allowed to survive. Treat a "+N node files" result on that
+lane as meaningless until the bun number is in hand.
+
+Also reclassified this wave: `test-stream-iter-readable-interop.js` →
+**known-blocked**, not a candidate.
+
 ## 2026-07-30 09:30 — WAVE 54: `Buffer.toString('utf8')` was silently eating BOMs
 
 **`test-stream` 234 → 236/249**, and the more important find is nowhere near streams.
@@ -2019,12 +2077,21 @@ build lock, which serialized the whole wave without using CPU.
 
 ## State
 
-- **Integration branch**: `r9/integration`, pushed to origin. PR **32** targets `rewrite_bun_in_mcpp`.
-- **Integration worktree**: `.claude/worktrees/wt5` (git + docs + measurement).
-  `wt3` is a spare build/measure worktree.
-- **Last authoritative node measurement**: `2566 / 4433` = 57.9% strict, 66.1%
-  excluding self-skips, at commit `9d70bbf`. Run dir:
-  `.claude/worktrees/wt5/target/integration/r12b`.
+- **Integration branch**: `agent/corpus-coverage-w40`, pushed to origin. PR **35**
+  targets `rewrite_bun_in_mcpp`, accounting cumulative from round 1 (2654 →).
+  121 commits ahead as of wave 55 (`27b83c6`).
+- **Integration worktree**: the main checkout. `wt1`, `wt2`, `wt4`, `wt6`–`wt11`
+  are lane worktrees; reclaim their `target/` with `reclaim_disk.sh` when disk
+  tightens (it went to 100% once and every measurement failed looking like a
+  runner bug).
+- **Last authoritative measurement**: node **~2926 / 4433** (66.0%), bun
+  **892+ / 1902**. Zero regressions across ~3000 measured guard files.
+- **Subtree movement from the wave-39 baseline**: `test-crypto` 86→101,
+  `test-vm` 52→69, `test-http2` 213→223, `test-stream` 233→237, bun `shell/`
+  20→27.
+- **Stale-binary class is now closed in the tooling**: `node_corpus_runner.py`
+  takes `--bin auto` and refuses a superseded or source-older binary. The bun
+  runner has **no** `--bin auto` and needs `--cwd compat/bun`.
 
 ## FIRST TASK ON RESUME — four items, in this order
 
