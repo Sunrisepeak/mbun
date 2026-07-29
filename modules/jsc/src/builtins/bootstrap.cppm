@@ -2286,10 +2286,11 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   //
   // Data delivery: while flowing, a pump object rides __mbunNet.items and its
   // _poll() drains fd 0 via the readFd native, emitting "data"/"end". Only the
-  // *flowing* state attaches the pump, and only attach bumps __mbunNet.pending —
-  // that pending count (plus refd timers) is what keeps the loop alive, so a
-  // paused stdin still lets the process exit. Attach happens inside resume()
-  // itself, never in the nextTick doResume: doResume deliberately still fires
+  // flowing or readable mode attaches the pump, and only attach bumps
+  // __mbunNet.pending — that pending count (plus refd timers) is what keeps the
+  // loop alive. A data-mode pause detaches the pump, while readable mode keeps
+  // it attached until EOF so its buffered reads can finish. Attach happens
+  // inside resume() itself, never in the nextTick doResume: doResume deliberately still fires
   // "resume" after a synchronous pause() (Node does too), and attaching there
   // would resurrect the pump and hang a program that meant to exit.
   if (G.process) {
@@ -2299,35 +2300,55 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     const osn = () => G.__mbunOsNative;
     const stdinIsatty = () => { const O = osn(); return !!(O && typeof O.isatty === "function" && O.isatty(0)); };
     stdin.readable = true; stdin.isTTY = stdinIsatty() || undefined; stdin.isRaw = false; stdin.fd = 0; stdin.readableFlowing = null;
-    let flowing = null, resumeScheduled = false, ended = false, attached = false;
+    stdin.readableEnded = false; stdin.readableLength = 0; stdin.destroyed = false;
+    let flowing = null, resumeScheduled = false, ended = false, eof = false, attached = false;
     let rbuf = [], readableMode = false;  // paused/readable-mode buffer + flag
     // __mbunNet lives in mbun.jsc.js_net, which may load after this bootstrap
     // runs (and never, on natives-less builds) — resolve both lazily per use.
     const net = () => G.__mbunNet;
     const nn = () => G.__mbunNetNative;
-    const emitEnd = () => { if (ended) return; ended = true; detach(); stdin.readable = false; stdin.emit("end"); stdin.emit("close"); };
+    const syncReadableLength = () => { stdin.readableLength = rbuf.reduce((length, buf) => length + buf.length, 0); };
+    const emitEnd = () => {
+      if (ended) return;
+      ended = true;
+      stdin.readableEnded = true;
+      detach();
+      stdin.readable = false;
+      stdin.emit("end");
+      stdin.emit("close");
+    };
+    const finishEof = () => {
+      eof = true;
+      detach();
+      if (rbuf.length) return;
+      emitEnd();
+      // Readable listeners are notified once more after EOF. This lets their
+      // final read(null) observation follow the end event without reviving fd 0.
+      if (readableMode) stdin.emit("readable");
+    };
     const pump = {
       _poll() {
-        if (ended || (flowing !== true && !readableMode)) return 0;
+        if (ended || eof || (flowing !== true && !readableMode)) return 0;
         const N = nn(); if (!N || typeof N.readFd !== "function") return 0;
         const chunk = N.readFd(0);
-        if (chunk === null) { emitEnd(); return 1; }   // EOF
+        if (chunk === null) { finishEof(); return 1; }  // EOF
         if (chunk === "") return 0;                    // EAGAIN — poll() will wake us
         const buf = G.Buffer.from(chunk, "base64");
         if (flowing === true) {
           stdin.emit("data", stdin._enc ? buf.toString(stdin._enc) : buf);
         } else {                                       // paused/readable mode: buffer + signal
           rbuf.push(buf);
+          syncReadableLength();
           stdin.emit("readable");
         }
         return 1;
       },
     };
-    const attach = () => { const N = net(); if (attached || ended || !N) return; attached = true; N.items.add(pump); N.pending++; };
+    const attach = () => { const N = net(); if (attached || ended || eof || !N) return; attached = true; N.items.add(pump); N.pending++; };
     function detach() { const N = net(); if (!attached || !N) return; attached = false; N.items.delete(pump); N.pending--; }
     const doResume = () => { resumeScheduled = false; stdin.emit("resume"); };
     stdin.resume = () => { if (flowing !== true) { flowing = true; stdin.readableFlowing = true; attach(); if (!resumeScheduled) { resumeScheduled = true; G.process.nextTick(doResume); } } return stdin; };
-    stdin.pause = () => { if (flowing !== false) { flowing = false; stdin.readableFlowing = false; detach(); stdin.emit("pause"); } return stdin; };
+    stdin.pause = () => { if (flowing !== false) { flowing = false; stdin.readableFlowing = false; if (!readableMode) detach(); stdin.emit("pause"); } return stdin; };
     stdin.setEncoding = (enc) => { stdin._enc = enc; return stdin; };
     // setRawMode is a tty.ReadStream method: node/bun only give process.stdin a
     // `setRawMode` when fd 0 IS a terminal (otherwise stdin is a pipe/file stream
@@ -2349,13 +2370,28 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       };
     }
     stdin.ref = () => stdin; stdin.unref = () => stdin;
-    stdin.read = () => {
-      if (!rbuf.length) return null;
-      const buf = rbuf.length === 1 ? rbuf[0] : G.Buffer.concat(rbuf);
-      rbuf = [];
+    stdin.read = (size) => {
+      if (size !== undefined && size !== null) {
+        size = Number(size);
+        if (!Number.isSafeInteger(size) || size < 0 || size > 0x7fffffff) {
+          const err = new RangeError("The value of \"size\" is out of range");
+          err.code = "ERR_OUT_OF_RANGE";
+          throw err;
+        }
+      }
+      if (!rbuf.length) {
+        if (!eof && !ended) { readableMode = true; attach(); }
+        return null;
+      }
+      const all = rbuf.length === 1 ? rbuf[0] : G.Buffer.concat(rbuf);
+      const count = size === undefined || size === null ? all.length : Math.min(size, all.length);
+      const buf = G.Buffer.from(all.subarray(0, count));
+      rbuf = count < all.length ? [G.Buffer.from(all.subarray(count))] : [];
+      syncReadableLength();
+      if (eof && !rbuf.length) emitEnd();
       return stdin._enc ? buf.toString(stdin._enc) : buf;
     };
-    stdin.destroy = () => { detach(); ended = true; stdin.readable = false; stdin.emit("close"); return stdin; };
+    stdin.destroy = () => { detach(); ended = true; eof = true; stdin.destroyed = true; stdin.readable = false; stdin.emit("close"); return stdin; };
     // The pump's canonical consumer: `process.stdin.pipe(process.stdout)`. The
     // "data" subscription resumes stdin (see the on() override below), which is
     // what attaches the pump. Node never end()s stdout/stderr on the source's
