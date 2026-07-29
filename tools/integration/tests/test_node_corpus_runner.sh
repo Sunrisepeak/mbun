@@ -180,4 +180,47 @@ if python3 "$repo_root/tools/integration/node_corpus_runner.py" \
   exit 1
 fi
 
+# --- a superseded build must be refused, not silently measured ---------------
+# `mcpp build` keys its output dir on a config hash, so a checkout accumulates
+# several `target/<arch>/<hash>/bin/mbun`. They all still run. Two lanes in one
+# wave measured a days-old hash dir and reported a confident zero delta for work
+# that was fine -- and a zero delta is what gets a candidate reverted.
+binroot="$tmp/binroot"
+mkdir -p "$binroot/target/x86_64-linux-gnu/old/bin" "$binroot/target/x86_64-linux-gnu/new/bin"
+cp "$tmp/fake-mbun" "$binroot/target/x86_64-linux-gnu/old/bin/mbun"
+cp "$tmp/fake-mbun" "$binroot/target/x86_64-linux-gnu/new/bin/mbun"
+touch -d '3 days ago' "$binroot/target/x86_64-linux-gnu/old/bin/mbun"
+mkdir -p "$binroot/corpus/parallel"
+echo "// pass" >"$binroot/corpus/parallel/test-pass.js"
+
+run_bin() {
+  python3 "$repo_root/tools/integration/node_corpus_runner.py" \
+    --bin "$1" --root "$binroot" --corpus corpus/parallel \
+    --out "$tmp/out-bin-$2" --jobs 1 --timeout 5 "${@:3}"
+}
+
+if run_bin "$binroot/target/x86_64-linux-gnu/old/bin/mbun" stale >/dev/null 2>&1; then
+  echo "expected a superseded build to be refused" >&2
+  exit 1
+fi
+# ...and the refusal must name the newer binary, or it is not actionable.
+msg=$(run_bin "$binroot/target/x86_64-linux-gnu/old/bin/mbun" stale2 2>&1 || true)
+printf '%s' "$msg" | grep -q "newest:" \
+  || { echo "refusal does not name the newest binary: $msg" >&2; exit 1; }
+
+# --allow-stale-bin is the deliberate escape hatch.
+run_bin "$binroot/target/x86_64-linux-gnu/old/bin/mbun" allowed --allow-stale-bin >/dev/null
+
+# `--bin auto` picks the newest build so no caller has to hardcode a hash.
+python3 "$repo_root/tools/integration/node_corpus_runner.py" \
+  --bin auto --root "$binroot" --corpus corpus/parallel \
+  --out "$tmp/out-bin-auto" --jobs 1 --timeout 5 >/dev/null
+
+# A binary OUTSIDE the target/<arch>/<hash> layout is a deliberate choice -- the
+# frozen baseline a wave measures its "before" against is supposed to be old.
+cp "$tmp/fake-mbun" "$binroot/frozen-mbun"
+touch -d '9 days ago' "$binroot/frozen-mbun"
+run_bin "$binroot/frozen-mbun" frozen >/dev/null \
+  || { echo "a frozen baseline binary must not be treated as stale" >&2; exit 1; }
+
 echo "test_node_corpus_runner: ok"

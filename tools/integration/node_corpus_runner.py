@@ -223,9 +223,70 @@ def write_outputs(output_dir: Path, results: list[Result], remaining: int = 0) -
     print(json.dumps(summary, sort_keys=True))
 
 
+def built_binaries(root: Path) -> list[Path]:
+    """Every mbun executable built under this checkout, newest first."""
+    found = [p for p in root.glob("target/*/*/bin/mbun") if p.is_file()]
+    return sorted(found, key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def resolve_binary(root: Path, requested: Path, allow_stale: bool) -> Path:
+    """Resolve --bin, refusing to measure a superseded build.
+
+    WHY THIS GUARD EXISTS: `mcpp build` keys its output directory on a hash of
+    the build configuration, so a checkout accumulates SEVERAL
+    `target/<arch>/<hash>/bin/mbun` paths. They all look equally plausible, and
+    the stale ones keep working — so a lane that hardcoded a path it had used
+    before spent a full build-and-measure cycle scoring a THREE-DAY-OLD binary
+    and reported a confident zero delta for work that was in fact fine. The
+    runner cannot tell a real zero from that one, and a zero delta is exactly
+    the result that gets a candidate reverted. Silence here costs a lane.
+    """
+    candidates = built_binaries(root)
+    if str(requested) == "auto":
+        if not candidates:
+            raise SystemExit(f"--bin auto: no mbun binary built under {root}/target")
+        return candidates[0]
+
+    binary = requested.resolve()
+    if not binary.is_file():
+        raise SystemExit(f"--bin: no such executable: {binary}")
+    if allow_stale or not candidates:
+        return binary
+
+    newest = candidates[0]
+    if newest.resolve() == binary:
+        return binary
+    # Only refuse a binary that IS one of this checkout's build outputs. A path
+    # outside the `target/<arch>/<hash>/bin` layout is a deliberate choice --
+    # the frozen baseline binary a wave measures its "before" against is
+    # *supposed* to be old, and refusing it would break the comparison this
+    # guard exists to protect.
+    if binary not in {c.resolve() for c in candidates}:
+        return binary
+    age_h = (newest.stat().st_mtime - binary.stat().st_mtime) / 3600.0
+    raise SystemExit(
+        f"--bin points at a superseded build ({age_h:.1f}h older than the newest):\n"
+        f"    given:  {binary}\n"
+        f"    newest: {newest}\n"
+        "Measuring this would score the previous binary and report a false delta.\n"
+        "Use --bin auto, pass the newest path, or --allow-stale-bin if this is "
+        "a deliberate baseline comparison."
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--bin", required=True, type=Path, help="mbun executable")
+    parser.add_argument(
+        "--bin",
+        required=True,
+        type=Path,
+        help="mbun executable, or 'auto' to use the newest one built under <root>/target",
+    )
+    parser.add_argument(
+        "--allow-stale-bin",
+        action="store_true",
+        help="measure even if --bin is not the newest built binary (default: refuse)",
+    )
     parser.add_argument("--root", default=Path.cwd(), type=Path, help="repository root")
     parser.add_argument("--corpus", default=Path("compat/node/test/parallel"), type=Path)
     parser.add_argument("--out", required=True, type=Path)
@@ -258,7 +319,6 @@ def main() -> int:
 
     ensure_disk_headroom()
     root = args.root.resolve()
-    binary = args.bin.resolve()
     output_dir = args.out.resolve()
     # Do NOT resolve the corpus dir: compat/node may be a symlink (worktree
     # setups point it at a sibling checkout). Resolving it would make the
@@ -274,6 +334,11 @@ def main() -> int:
     pending = [path for path in paths if path not in done]
     if args.resume:
         print(f"resume: {len(done)} already recorded, {len(pending)} to run", flush=True)
+
+    # Resolve the binary only once something actually needs running: resuming a
+    # COMPLETE run must stay a no-op, and it is legitimate for the binary to be
+    # gone by then. Validating at parse time broke exactly that property.
+    binary = resolve_binary(root, args.bin, args.allow_stale_bin) if pending else None
 
     jobs = max(1, args.jobs)
     deadline = time.monotonic() + args.max_seconds if args.max_seconds > 0 else None
