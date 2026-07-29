@@ -2825,7 +2825,21 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       get hash() { return this._hash; }
       set hash(v) { const value = String(v); this._hash = value === "" ? "" : "#" + encodeFragment(value.startsWith("#") ? value.slice(1) : value); }
       get search() { return this._search === "?" ? "" : this._search; }
-      set search(v) { const s = String(v), query = s.startsWith("?") ? s.slice(1) : s; this._queryPresent = s !== ""; this._search = s === "" ? "" : "?" + encodeQuery(query, !!specialProtocols[this._protocol]); const next = new G.URLSearchParams(query); this.searchParams._e = next._e; }
+      set search(v) {
+        const s = String(v), query = s.startsWith("?") ? s.slice(1) : s;
+        this._queryPresent = s !== "";
+        this._search = s === "" ? "" : "?" + encodeQuery(query, !!specialProtocols[this._protocol]);
+        // The URL setter has already removed exactly one leading '?'. Feeding
+        // the remainder through the public constructor would incorrectly strip
+        // a second one (e.g. "??a" must produce the key "?a").
+        const entries = [];
+        if (query) for (const part of query.split("&")) {
+          if (!part) continue;
+          const i = part.indexOf("=");
+          entries.push([formDecode(i < 0 ? part : part.slice(0, i)), formDecode(i < 0 ? "" : part.slice(i + 1))]);
+        }
+        this.searchParams._e = entries;
+      }
       get _authority() { const credentials = this._username || this._password ? this._username + (this._password ? ":" + this._password : "") + "@" : ""; return credentials + this.host; }
       get href() { return this._protocol + (this._hasAuthority || this._protocol === "file:" ? "//" + this._authority : "") + this._pathname + (this._queryPresent ? this._search : "") + this._hash; }
       // node's href setter is atomic: an unparseable value throws and leaves the
