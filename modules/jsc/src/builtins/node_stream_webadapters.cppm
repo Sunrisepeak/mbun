@@ -83,16 +83,6 @@ inline constexpr std::string_view kNodeStreamWebAdaptersJS = R"JS(
     const kValidateChunk = Symbol("kValidateChunk");
     const kDestroyOnSyncError = Symbol("kDestroyOnSyncError");
 
-    // Some JSC-provided WHATWG stream objects do not satisfy bun's inherited
-    // prototype predicate, even though they expose the real stream methods.
-    // Accept that interoperable surface while still rejecting ordinary objects.
-    const isReadableWebStream = (stream) => $inheritsReadableStream(stream) ||
-      !!(stream && typeof stream.getReader === "function" &&
-         typeof stream.tee === "function" && typeof stream.cancel === "function");
-    const isWritableWebStream = (stream) => $inheritsWritableStream(stream) ||
-      !!(stream && typeof stream.getWriter === "function" &&
-         typeof stream.abort === "function" && typeof stream.close === "function");
-
     // bun: globalThis.reportError. Absent in mbun -> surface as uncaught, the
     // same intent the blueprint spells out by hand elsewhere.
     const __reportError = G.reportError
@@ -434,7 +424,7 @@ inline constexpr std::string_view kNodeStreamWebAdaptersJS = R"JS(
     }
 
     function newStreamWritableFromWritableStream(writableStream, options = kEmptyObject) {
-      if (!isWritableWebStream(writableStream)) {
+      if (!$inheritsWritableStream(writableStream)) {
         throw $ERR_INVALID_ARG_TYPE("writableStream", "WritableStream", writableStream);
       }
 
@@ -677,7 +667,7 @@ inline constexpr std::string_view kNodeStreamWebAdaptersJS = R"JS(
     }
 
     function newStreamReadableFromReadableStream(readableStream, options = kEmptyObject) {
-      if (!isReadableWebStream(readableStream)) {
+      if (!$inheritsReadableStream(readableStream)) {
         throw $ERR_INVALID_ARG_TYPE("readableStream", "ReadableStream", readableStream);
       }
 
@@ -774,10 +764,10 @@ inline constexpr std::string_view kNodeStreamWebAdaptersJS = R"JS(
       validateObject(pair, "pair");
       const { readable: readableStream, writable: writableStream } = pair;
 
-      if (!isReadableWebStream(readableStream)) {
+      if (!$inheritsReadableStream(readableStream)) {
         throw $ERR_INVALID_ARG_TYPE("pair.readable", "ReadableStream", readableStream);
       }
-      if (!isWritableWebStream(writableStream)) {
+      if (!$inheritsWritableStream(writableStream)) {
         throw $ERR_INVALID_ARG_TYPE("pair.writable", "WritableStream", writableStream);
       }
 

@@ -2324,11 +2324,10 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   // ---- TextEncoderStream / TextDecoderStream (transform-style, minimal) ----
   if (typeof G.TextEncoderStream === "undefined") {
     G.TextEncoderStream = class TextEncoderStream {
-      #encoding; #readable; #writable;
       constructor() {
-        this.#encoding = "utf-8"; const enc = new G.TextEncoder(); let ctrl, pending = "";
-        this.#readable = new G.ReadableStream({ start(c) { ctrl = c; } });
-        this.#writable = new G.WritableStream({
+        this.encoding = "utf-8"; const enc = new G.TextEncoder(); let ctrl, pending = "";
+        this.readable = new G.ReadableStream({ start(c) { ctrl = c; } });
+        this.writable = new G.WritableStream({
           write(chunk) {
             // A throwing toString() must error both sides of the transform
             // (WPT encode-bad-chunks): rethrow errors the writable, ctrl.error
@@ -2342,34 +2341,17 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
           close() { if (pending) ctrl.enqueue(enc.encode(pending)); ctrl.close && ctrl.close(); }
         });
       }
-      get encoding() { return this.#encoding; }
-      get readable() { return this.#readable; }
-      get writable() { return this.#writable; }
     };
   }
   if (typeof G.TextDecoderStream === "undefined") {
     G.TextDecoderStream = class TextDecoderStream {
-      #encoding; #fatal; #ignoreBOM; #readable; #writable;
       constructor(label, opts) {
-        if (label !== undefined && typeof label !== "string") {
-          const e = new RangeError("The encoding is not supported"); e.code = "ERR_ENCODING_NOT_SUPPORTED"; throw e;
-        }
-        if (opts !== undefined && (opts === null || typeof opts !== "object")) {
-          const e = new TypeError('The "options" argument must be of type Object'); e.code = "ERR_INVALID_ARG_TYPE"; throw e;
-        }
-        opts = opts || {};
-        let dec;
-        try { dec = new G.TextDecoder(label === undefined ? "utf-8" : label, { fatal: !!opts.fatal, ignoreBOM: !!opts.ignoreBOM }); }
-        catch (cause) { const e = new RangeError(String(cause && cause.message || cause)); e.code = "ERR_ENCODING_NOT_SUPPORTED"; throw e; }
-        this.#encoding = dec.encoding; this.#fatal = dec.fatal; this.#ignoreBOM = dec.ignoreBOM; let ctrl;
-        this.#readable = new G.ReadableStream({ start(c) { ctrl = c; } });
-        this.#writable = new G.WritableStream({ write(chunk) { const s = dec.decode(chunk, { stream: true }); if (s) ctrl.enqueue(s); }, close() { const t = dec.decode(); if (t) ctrl.enqueue(t); ctrl.close && ctrl.close(); } });
+        opts = opts == null ? {} : opts;
+        const dec = new G.TextDecoder(label === undefined ? "utf-8" : label, { fatal: !!opts.fatal, ignoreBOM: !!opts.ignoreBOM });
+        this.encoding = dec.encoding; this.fatal = dec.fatal; this.ignoreBOM = dec.ignoreBOM; let ctrl;
+        this.readable = new G.ReadableStream({ start(c) { ctrl = c; } });
+        this.writable = new G.WritableStream({ write(chunk) { const s = dec.decode(chunk, { stream: true }); if (s) ctrl.enqueue(s); }, close() { const t = dec.decode(); if (t) ctrl.enqueue(t); ctrl.close && ctrl.close(); } });
       }
-      get encoding() { return this.#encoding; }
-      get fatal() { return this.#fatal; }
-      get ignoreBOM() { return this.#ignoreBOM; }
-      get readable() { return this.#readable; }
-      get writable() { return this.#writable; }
     };
   }
 
