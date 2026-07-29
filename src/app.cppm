@@ -2404,6 +2404,38 @@ int exec_interactive(std::span<const std::string_view> args) {
     return mbun::jsc::runtime::run_eval(code);
 }
 
+// `bun repl` uses the same evaluator and node:repl server as `-i`, but Bun's
+// command accepts eval/print flags without opening an interactive session and
+// advertises Bun rather than the node-compatibility wrapper in its greeting.
+int exec_bun_repl(std::span<const std::string_view> args) {
+    if (!args.empty() && (args[0] == "-e" || args[0] == "--eval" || args[0] == "-p" ||
+                          args[0] == "--print")) {
+        if (args.size() < 2) {
+            std::println(std::cerr, "error: Missing code to evaluate");
+            return 1;
+        }
+        std::vector<std::string> jsArgv{"mbun"};
+        for (const std::string_view rest : args.subspan(2)) jsArgv.emplace_back(rest);
+        mbun::jsc::runtime::set_argv(std::move(jsArgv));
+        std::string code{"process._eval=" + js_quote(args[1]) + ";" + std::string{args[1]}};
+        if (args[0] == "-p" || args[0] == "--print") {
+            code = "process._eval=" + js_quote(args[1]) + ";console.log((() => (" +
+                   std::string{args[1]} + "))())";
+        }
+        return mbun::jsc::runtime::run_eval(code);
+    }
+
+    mbun::jsc::runtime::set_argv({"mbun"});
+    const std::string code{
+        "console.log(\"Welcome to Bun v\" + Bun.version + \".\\n\" + "
+        "'Type \\\".help\\\" for more information.');"
+        "require(\"repl\").createInternalRepl(process.env, function (err, r) {"
+        "  if (err) throw err;"
+        "  r.on(\"exit\", function () { process.exit(); });"
+        "});"};
+    return mbun::jsc::runtime::run_eval(code);
+}
+
 // Strip every leading `-i` / `--interactive` out of `args`, reporting whether
 // one was there. Stops at the first positional so a script or script argument
 // literally named `-i` is never eaten; the value token of an eval flag is

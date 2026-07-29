@@ -262,6 +262,10 @@ int main(int argc, char* argv[]) {
     // `mbun run <script> [args...]` and bare `mbun <script.(m)js> [args...]`
     // execute a JS file through the JSC runtime with the Bun.* API in scope.
     if (!args.empty()) {
+        // `bun repl` is a command, not a package.json script named "repl".
+        // Keep it before auto-command resolution so both piped REPL input and
+        // the command's own -e/-p forms reach the dedicated entry point.
+        if (args[0] == "repl") return exec_bun_repl(std::span{args}.subspan(1));
         // `mbun -e <code>` / `mbun --eval <code>`: evaluate a JS/TS string.
         if (is_eval_flag(args[0])) {
             if (args.size() < 2) {
