@@ -257,12 +257,25 @@ inline constexpr std::string_view kNodeModuleJS = R"JS(
       throw e;
     }
     const path = getPath();
-    let val = filename !== null && typeof filename === "object" && "href" in filename
-      ? String(filename.href)
-      : String(filename);
-    if (!path.isAbsolute(val)) {
-      // file URL string / object → filesystem path.
+    const invalidFilename = () => {
+      const received = filename && typeof filename === "object" ? "{}" : String(filename);
+      const e = new TypeError("The argument 'filename' must be a file URL object, file URL string, or absolute path string. Received " + received);
+      e.code = "ERR_INVALID_ARG_VALUE";
+      return e;
+    };
+    let val;
+    if (typeof filename === "string") {
+      val = filename;
+    } else if (filename !== null && typeof filename === "object" &&
+               typeof filename.href === "string") {
+      val = filename.href;
+    } else {
+      throw invalidFilename();
+    }
+    if (val.startsWith("file:")) {
       val = getUrl().fileURLToPath(val);
+    } else if (!path.isAbsolute(val)) {
+      throw invalidFilename();
     }
     // A trailing slash means the argument names a directory; joining a dummy
     // basename makes dirname(val) resolve back to that directory (Node parity).
@@ -536,7 +549,10 @@ inline constexpr std::string_view kNodeModuleJS = R"JS(
         if (options && Array.isArray(options.paths)) {
           let lastErr;
           for (let k = 0; k < options.paths.length; k++) {
-            try { return G.__mbun_resolve_native(s, String(options.paths[k])); }
+            if (typeof options.paths[k] !== "string") {
+              throw invalidArgType("paths", "string", options.paths[k]);
+            }
+            try { return G.__mbun_resolve_native(s, options.paths[k]); }
             catch (e) { lastErr = e; }
           }
           throw lastErr || new Error("Cannot find module '" + s + "'");

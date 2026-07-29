@@ -32,11 +32,39 @@ globalThis.__mbun_blob_module_source = function (spec) {
            source: bytes ? new TextDecoder().decode(bytes) : "" };
 };
 globalThis.__mbun_make_require = function (dir) {
+  const invalidRequireId = function (value) {
+    if (typeof value !== "string") {
+      let received;
+      if (value === undefined) received = "undefined";
+      else if (value === null) received = "null";
+      else if (typeof value === "object") received = "an instance of " +
+        (value && value.constructor ? value.constructor.name : "Object");
+      else received = "type " + typeof value + " (" + String(value) + ")";
+      const error = new TypeError('The "id" argument must be of type string. Received ' + received);
+      error.code = "ERR_INVALID_ARG_TYPE";
+      return error;
+    }
+    if (value.length === 0) {
+      const error = new TypeError("The argument 'id' must be a non-empty string. Received ''");
+      error.code = "ERR_INVALID_ARG_VALUE";
+      return error;
+    }
+    return null;
+  };
   // `k` (arg 3): truthy when this call is a lowered ESM import statement or a
   // dynamic import (ImportKind::Stmt/Dynamic) rather than a literal require() —
   // it only selects the Node error code on failure (ERR_MODULE_NOT_FOUND vs
   // MODULE_NOT_FOUND), not the resolution condition.
   const req = function (s, o, k) {
+    const invalid = invalidRequireId(s);
+    if (invalid) throw invalid;
+    // The C++ bridge receives UTF-8 through a nul-terminated string. Reject
+    // embedded NULs here so the full request stays observable in Node's error.
+    if (s.indexOf("\0") !== -1) {
+      const error = new Error("Cannot find module '" + s + "'");
+      error.code = "MODULE_NOT_FOUND";
+      throw error;
+    }
     return globalThis.__mbun_require_native(s, dir, false,
       (o && typeof o.type === "string") ? o.type : "", k ? 1 : 0);
   };
