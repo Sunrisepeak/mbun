@@ -2567,7 +2567,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       getAll(k) { URLSearchParams.#check(this); if (arguments.length < 1) throw missingArgs("name"); k = toUSVString(k); return this._e.filter((x) => x[0] === k).map((x) => x[1]); }
       has(k, v) { URLSearchParams.#check(this); if (arguments.length < 1) throw missingArgs("name"); k = toUSVString(k); return (arguments.length < 2 || v === undefined) ? this._e.some((x) => x[0] === k) : this._e.some((x) => x[0] === k && x[1] === toUSVString(v)); }
       delete(k, v) { URLSearchParams.#check(this); if (arguments.length < 1) throw missingArgs("name"); k = toUSVString(k); this._e = this._e.filter((x) => (arguments.length < 2 || v === undefined) ? x[0] !== k : !(x[0] === k && x[1] === toUSVString(v))); this._updateURL(); }
-      forEach(cb, t) { URLSearchParams.#check(this); if (arguments.length < 1) throw missingArgs("callback"); for (let i = 0; i < this._e.length; i++) { const [k, v] = this._e[i]; cb.call(t, v, k, this); } }
+      forEach(cb, t) { URLSearchParams.#check(this); if (typeof cb !== "function") throw spErr("ERR_INVALID_ARG_TYPE", 'The "callback" argument must be of type function'); for (let i = 0; i < this._e.length; i++) { const [k, v] = this._e[i]; cb.call(t, v, k, this); } }
       keys() { URLSearchParams.#check(this); return makeSPIter(this, "key"); }
       values() { URLSearchParams.#check(this); return makeSPIter(this, "value"); }
       entries() { URLSearchParams.#check(this); return makeSPIter(this, "key+value"); }
