@@ -5,6 +5,82 @@ session that is interrupted (usage limit, crash, restart) can pick up from the
 file rather than from memory. **If you are a fresh session reading this, start
 here.**
 
+## 2026-07-30 01:00 — TOOLCHAIN INCIDENT + wave 46
+
+### The incident: the global toolchain flipped to clang mid-session
+
+**Three lanes reported "the tree does not build at its base commit" and I initially
+doubted them, because the main checkout had built fine minutes earlier. They were
+right; I was wrong.** The main checkout only appeared healthy because `main.o` was
+cached — `touch src/main.cpp` reproduced the failure immediately.
+
+Root cause: `~/.mcpp/config.toml` had `[toolchain] default` flipped from
+`gcc@16.1.0` to **`llvm@22.1.8`** (file mtime 23:34, mid-session, by something
+outside this session). Two symptoms, one cause:
+
+1. `src/main.cpp:241` — `const std::size_t count{… ? 2 : 1}` is a hard
+   `-Wc++11-narrowing` **error** under clang, a non-issue under gcc.
+2. ~15 undefined `WTF::`/`JSC::` symbols at link. The mangling is the proof:
+   `libWTF.a` defines `_ZN3WTF21numberToStringAndSizeEdRSt5arrayIcLm124EE`
+   (libstdc++) while the clang objects want
+   `_ZN3WTF21numberToStringAndSizeEdRNSt3__15arrayIcLm124EEE` (libc++'s `St3__1`).
+   The vendored JSC prebuilt is a libstdc++ build; libc++ can never link it.
+
+**Fix:** restored `default = "gcc@16.1.0"`, keeping `default_target = ""`. Do NOT
+copy `config.toml.bak` wholesale — its `default_target = "x86_64-linux-musl"`
+would change the triple and invalidate every incremental artifact under
+`target/x86_64-linux-gnu/`. Old value saved at `~/.mcpp/config.toml.clang-flip-20260729`.
+
+**Measurements were not invalidated:** `build_or_die` returns the same fingerprint
+`607a9025567c80a3` as before the flip, so everything reported earlier was produced
+by the gcc binary.
+
+**Protocol change: verify the wave base builds BEFORE dispatching lanes.** Two
+lanes burned 40-minute boxes rediscovering this independently, and a third lost
+its measurement entirely. One `build_or_die.sh` run at dispatch time costs ~60s
+and would have saved all three.
+
+### Wave 46 results: +4 bun, 5 recovered, 0 regressions
+
+The three blocked lanes' code was salvageable — I built and measured it here:
+**gains** `js/bun/net/tcp-server` (live `getpeername` accessors),
+`js/bun/resolve/import-meta-resolve` (builtins bypass the on-disk resolver),
+`js/node/url/url.test.ts` (WHATWG file-host Windows-drive quirk),
+`js/third_party/grpc-js/test-channel-credentials` (timer-queue fix, below).
+
+**Two reverts, both forced by measurement:**
+
+1. **`url.parse` leniency — a cross-corpus conflict the lane missed.** It made a
+   non-numeric port lenient to satisfy bun's `url-parse-format.test.js`,
+   predicting from a grep that no node test asserted the throw. Measuring it
+   turned node's `test-url-parse-invalid-input.js` **pass → fail**. Restored the
+   throw; the conflict is now documented at the site in `bootstrap.cppm`. No
+   caller-side discriminator exists, so `__bunStyle` routing cannot resolve it.
+2. **bunfig "run preloads under `bun test`" cost 5 bun files.** The full run showed
+   5 green→non-green (`only-inside-only`, regressions `14135`/`19875`/`20092`/`5961`).
+   I first suspected the timer-queue change (the other high-blast-radius edit) and
+   **disproved it by reverting**: those 5 still failed without it, and the revert
+   only lost its own gain. Reverting the preload commit restored all 5. Collateral:
+   an unrelated one-line `path-ignore-patterns` message fix rode in the same
+   commit and was lost with it — worth re-applying on its own.
+
+**`seq` was already implemented** (`modules/shell/src/interpreter.cppm:700`,
+full BSD `-s/-t/-w`). The brief was stale. The real cause of its 4 failures is that
+a `,` argument makes `Bun.$` punt the whole script to `/bin/sh`, so GNU `seq` runs
+— now fixed (27→30 assertions), with the last one needing command substitution.
+
+**The timer-queue fix is genuinely infrastructural**: `__mbun_timers_reset` dropped
+`T.q` wholesale, so **any corpus file with a top-level `setTimeout`/`setImmediate`/
+`fs.readFile` awaited from inside a test never fired** — in both corpora. That is
+why one grpc file failed while 21 siblings passed: it was the only one with
+module-scope async.
+
+**"test timed out" is a symptom class, never a cause class.** In the grpc cluster
+alone it covered a test-runner bug, a `dns.lookup(all)` gap that never merges
+families, an http2 post-error teardown gap, and a test that needs outbound network
+(`test-tonic` downloads protoc and cargo-builds a Rust server — exclude it, like
+`test-end-to-end`).
+
 ## 2026-07-30 00:30 — WAVE 45 (bun-focused): +8 bun green, 0 node regressions
 
 Four lanes on the corrected `worklists-bun3` cut: **bnode +3** (assert partial
