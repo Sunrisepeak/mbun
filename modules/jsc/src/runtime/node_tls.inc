@@ -8,9 +8,6 @@
 // checkServerIdentity input) reuses the already-installed
 // globalThis.__mbunCryptoAsymNative.x509parse (runtime/crypto_asym.inc, same
 // mbun.openssl X509 API) — no duplicate parser here.
-
-// Defined by process_base.inc, which is included after this native TLS slice.
-std::string b64_decode(std::string_view s);
 //
 // ref: bun-ref src/js/node/tls.ts getCiphers()/getDefaultCiphers().split(":").
 // DEFERRED: the SSL_CTX-backed SecureContext handle + live handshake surface
