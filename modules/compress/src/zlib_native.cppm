@@ -39,7 +39,7 @@ export Result<Bytes> zlib_deflate(ByteView input, int windowBits, int level,
     strm.next_out = reinterpret_cast<Bytef*>(out.data());
     strm.avail_out = static_cast<uInt>(out.size());
 
-    while (true) {
+    do {
         if (strm.avail_out == 0) {
             const std::size_t used = out.size();
             out.resize(out.size() * 2);
@@ -84,7 +84,7 @@ export Result<Bytes> zlib_inflate(ByteView input, int windowBits) {
     strm.next_out = reinterpret_cast<Bytef*>(out.data());
     strm.avail_out = static_cast<uInt>(out.size());
 
-    do {
+    while (true) {
         if (strm.avail_out == 0) {
             const std::size_t used = out.size();
             out.resize(out.size() * 2);
