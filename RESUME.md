@@ -297,6 +297,22 @@ Guards: HTTP client 63/68 pass; module 11 pass, 18 fail, 3 skip; require 13
 pass, 9 fail, 1 skip; abort 1/7 pass; readline 10 pass, 3 fail, 8 skip. Every
 guard has zero green-to-non-green regressions.
 
+### Sprint wave 18 measured checkpoint (13:45–13:50)
+
+Keygen, sign/verify, lenient HTTP parsing, timer promisify hooks, and net
+auto-select defaults forecast roughly 13 complete files; strict causal
+accounting delivered **+2 in 5 minutes = 24 files/hour**:
+
+- per-stream insecure HTTP parser: +1/2;
+- auto-select attempt-timeout CLI default: +1/3;
+- keygen/sign and timer candidates remained whole-file red and were additively
+  reverted. Four green RSA/keygen files in the target batch came from earlier
+  published RSA work and are not attributed to this wave.
+
+The eight-file retained HTTP/net guard has 3 pass and 5 retained failures:
+two frozen fail-to-pass transitions and zero green-to-non-green regressions.
+Conflict-marker, gitlink, and diff guards are clean.
+
 ### Sprint wave 17 measured checkpoint (13:38–13:45)
 
 Seven static candidates forecast roughly 12–13 complete files; strict

@@ -5,6 +5,21 @@
 
 ## 2026-07-29
 
+### 5 小时冲刺第十八批：5 分钟净增 2 文件，24 files/hour
+
+13:45–13:50 集中验收 keygen、sign/verify、HTTP lenient parser、timers
+promisify 与 net auto-select defaults，静态预计约 13，严格结算 **+2**：
+
+- HTTP insecure parser per-stream lenient header value **+1/2**；
+- net auto-select attempt-timeout CLI default **+1/3**；
+- keygen/sign 与 timers 目标仍红，三个实现提交 additive revert；
+- 目标集中出现的四个 RSA/keygen 绿色来自此前已发布的 RSA 实现，按因果
+  去重不归因于本批。
+
+8 文件 HTTP/net 完整相关守卫为 3 pass / 5 既有 fail；相对 frozen gate
+2 个 fail→pass、green→non-green 0。conflict-marker、gitlink、diff
+守卫全绿。
+
 ### 5 小时冲刺第十七批：7 分钟净增 5 文件，42.9 files/hour
 
 13:38–13:45 集中验收 crypto、compression、HTTP、util 七个静态候选，
