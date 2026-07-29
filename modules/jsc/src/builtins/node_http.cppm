@@ -1625,7 +1625,12 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
     }
 
     let agent = options.agent;
-    const defaultAgent = options._defaultAgent || this._defaultAgent || globalAgent;
+    // `http.globalAgent` is writable. Consult the exported module object for
+    // plain HTTP requests so a later assignment affects subsequent clients;
+    // HTTPS passes its own `_defaultAgent` explicitly above this fallback.
+    const exportedHttp = M["node:http"] || M["http"];
+    const defaultAgent = options._defaultAgent ||
+      (exportedHttp && exportedHttp.globalAgent) || this._defaultAgent || globalAgent;
     if (agent === false) {
       agent = new defaultAgent.constructor();
     } else if (agent === null || agent === undefined) {
@@ -1667,7 +1672,10 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
         e.code = "ABORT_ERR";
         return e;
       };
-      if (signal.aborted) nextTick(() => this.destroy(signal.reason || abortErr()));
+      // A signal that was already aborted at construction time destroys the
+      // request before http.get() returns. The later socket assignment still
+      // emits its error asynchronously through onSocketNT.
+      if (signal.aborted) this.destroy(signal.reason || abortErr());
       else signal.addEventListener("abort", () => this.destroy(signal.reason || abortErr()), { once: true });
       delete optsWithoutSignal.signal;
       this.signal = signal;

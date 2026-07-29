@@ -2521,6 +2521,9 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
     // `bytesParsed` is what node's own 400/431 path reports.
     _mkErr(msg, code) {
       const e = mkErr(msg, code);
+      // llhttp exposes the parse detail separately from its "Parse Error:"
+      // display prefix; callers such as node's HTTP client inspect it directly.
+      e.reason = msg.startsWith("Parse Error: ") ? msg.slice("Parse Error: ".length) : msg;
       e.bytesParsed = this.off;
       const raw = this._lastChunk && this._lastChunk.length ? this._lastChunk : this.buf;
       try { e.rawPacket = G.Buffer ? G.Buffer.from(raw.slice ? raw.slice() : raw) : raw; } catch (x) {}
