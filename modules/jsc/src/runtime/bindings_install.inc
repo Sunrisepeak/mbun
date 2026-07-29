@@ -262,7 +262,9 @@
             }
         }
         const std::string exe{exe_path()};
-        set_prop(ctx_, process, "argv0", make_string(ctx_, exe));
+        // execPath is the real executable; argv0 preserves the caller's name.
+        const std::string argv0{!gArgv.empty() && !gArgv.front().empty() ? gArgv.front() : exe};
+        set_prop(ctx_, process, "argv0", make_string(ctx_, argv0));
         set_prop(ctx_, process, "execPath", make_string(ctx_, exe));
         set_prop(ctx_, process, "platform", make_string(ctx_, host_platform()));
         set_prop(ctx_, process, "arch", make_string(ctx_, host_arch()));

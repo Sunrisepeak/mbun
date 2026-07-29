@@ -497,7 +497,8 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
 
   const makeStdin = (fd, rec) => {
     const w = new Writable();
-    w.writable = true; w.destroyed = false;
+    // Child stdin is write-only from the parent's point of view.
+    w.readable = false; w.writable = true; w.destroyed = false;
     w.write = (chunk, enc, cb) => {
       if (typeof enc === "function") { cb = enc; enc = null; }
       if (w.destroyed || rec.stdinEnded) {
@@ -571,6 +572,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     spawn(options) {
       // node child_process.ts:1346-1396 validators (ERR_INVALID_ARG_TYPE).
       if (options === null || typeof options !== "object") { const e = new TypeError('The "options" argument must be of type object. Received ' + recvDesc(options)); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
+      options = ownOptions(options);
       if (options.args !== undefined && !Array.isArray(options.args)) { const e = new TypeError('The "options.args" property must be an instance of Array. Received ' + recvDesc(options.args)); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
       const stdio = normStdio(options.stdio);
       const __hasIpc = stdio.includes("ipc");
@@ -582,7 +584,8 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       if (options.argv0 != null) args[0] = toStr(options.argv0);
       this.spawnfile = file; this.spawnargs = args;
       const ipcIndex = stdio.indexOf("ipc");
-      const sopts = { stdio };
+      const sopts = Object.create(null);
+      sopts.stdio = stdio;
       if (options.cwd != null) sopts.cwd = toStr(options.cwd);
       // node inherits process.env when env is unset (undefined/null); an explicit
       // {} means an empty environment. Snapshot process.env so the child sees the
@@ -623,7 +626,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       if (h.errno != null) {
         const code = ERRNO[h.errno] || ("errno " + h.errno);
         const err = new Error("spawn " + file + " " + code);
-        err.errno = -1; err.code = code; err.path = file; err.spawnargs = args.slice(1);
+        err.errno = uvErrno(code, -2); err.code = code; err.path = file; err.spawnargs = args.slice(1);
         // A failed async spawn still exposes the requested stdout/stderr pipe
         // objects. Consumers commonly install their stream handlers before the
         // deferred ENOENT error arrives (including spawn({ cwd: missing })).
@@ -772,6 +775,13 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   const validateObj = (v, name) => { if (v === null || typeof v !== "object" || Array.isArray(v)) throw errArgType(name, "of type object", v); };
   const validateStr = (v, name) => { if (typeof v !== "string") throw errArgType(name, "of type string", v); };
   const validateFn = (v, name) => { if (typeof v !== "function") throw errArgType(name, "of type function", v); };
+  // Public child_process options observe own enumerable settings only.  This
+  // avoids Object.prototype pollution becoming a hidden cwd/shell/uid option.
+  const ownOptions = (o) => {
+    const out = Object.create(null);
+    if (o != null) for (const k of Object.keys(o)) out[k] = o[k];
+    return out;
+  };
   const isInt32 = (v) => typeof v === "number" && Number.isInteger(v) && v >= -2147483648 && v <= 2147483647;
   const toPathString = (p, name) => {
     if (typeof p === "string") { nullCheck(p, name); return p; }
@@ -860,8 +870,8 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     else if (typeof args !== "object") throw errArgType("args", "of type object", args);
     else { options = args; args = []; }
     for (const a of args) nullCheck(a, "args");
-    if (options === undefined) options = {};
-    else validateObj(options, "options");
+    if (options === undefined) options = Object.create(null);
+    else { validateObj(options, "options"); options = ownOptions(options); }
     validateCommonOpts(options);
     return { file, args, options };
   };
@@ -872,8 +882,8 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     else if (typeof args === "function") { callback = args; options = null; args = null; }
     if (args == null) args = [];
     if (typeof options === "function") callback = options;
-    else if (options != null) validateObj(options, "options");
-    if (options == null) options = {};
+    else if (options != null) { validateObj(options, "options"); options = ownOptions(options); }
+    if (options == null) options = Object.create(null);
     if (callback != null) validateFn(callback, "callback");
     if (options.argv0 != null) validateStr(options.argv0, "options.argv0");
     return { file, args, options, callback };
@@ -883,7 +893,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   // caller's options must not grow mbun-internal keys, and the signal name is
   // resolved here so the native layer never needs a signal table.
   const syncOpts = (o) => {
-    const out = {};
+    const out = Object.create(null);
     if (o != null) for (const k of Object.keys(o)) out[k] = o[k];
     // node inherits process.env when `env` is unset, and process.env is a live
     // view of the environment — so `process.env.X = 'v'` before a spawnSync IS
@@ -919,6 +929,12 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   function spawnSync(cmd, a, o) {
     const nz = normalizeSpawnArgs(cmd, a, o);
     cmd = nz.file;
+    const input = nz.options.input;
+    if (input !== undefined && typeof input !== "string" &&
+        !(G.Buffer && typeof G.Buffer.isBuffer === "function" && G.Buffer.isBuffer(input)) &&
+        !(input instanceof ArrayBuffer) && !ArrayBuffer.isView(input)) {
+      throw errPropType("options.input", "of type string or an instance of Buffer, TypedArray, or DataView", input);
+    }
     const n = { args: nz.args, opts: syncOpts(nz.options) };
     const exe = resolveExe(cmd);
     // ONE String() per argument: an argument's toString() is observable and node
@@ -1090,8 +1106,8 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     if (typeof options === "function") { cb = options; options = {}; }
     validateStr(command, "command");
     nullCheck(command, "command");
-    if (options != null) { validateObj(options, "options"); validateCommonOpts(options); }
-    options = options || {};
+    if (options != null) { validateObj(options, "options"); options = ownOptions(options); validateCommonOpts(options); }
+    options = options || Object.create(null);
     if (cb != null) validateFn(cb, "callback");
     const sh = options.shell ? (options.shell === true ? "/bin/sh" : toStr(options.shell)) : "/bin/sh";
     const child = new ChildProcess();
@@ -1152,8 +1168,8 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     if (args == null) args = [];
     else if (typeof args === "object" && !Array.isArray(args)) { options = args; args = []; }
     else if (!Array.isArray(args)) throw errArgType("args", "an instance of Array", args);
-    if (options != null) validateObj(options, "options");
-    options = options || {};
+    if (options != null) { validateObj(options, "options"); options = ownOptions(options); }
+    options = options || Object.create(null);
     validateCommonOpts(options);
     for (const a of args) nullCheck(a, "args");
     if (options.execPath != null) { validateStr(options.execPath, "options.execPath"); nullCheck(options.execPath, "options.execPath"); }
