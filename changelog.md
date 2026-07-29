@@ -5,6 +5,22 @@
 
 ## 2026-07-29
 
+### 5 小时冲刺第十二批：9.5 分钟净增 7 文件，44.2 files/hour
+
+12:49–12:58 组合 console、Buffer、crypto warning 三包，预计 9、实际
+**+7**：
+
+- Buffer detached backing-store / null-prototype input 错误合同 **3/3**；
+- SHAKE 默认 outputLength `DEP0198` 与 non-extractable CryptoKey
+  `DEP0204` 警告 **3/3**；
+- global console 尊重可覆写 `_stdout/_stderr` **1/3**。diagnostics channel
+  registry 与 revoked Proxy `util.inspect(showProxy)` 是独立根因，两段
+  猜测代码在复验 0 收益后由 additive cleanup 删除。
+
+完整 68 文件 `test-buffer-*` 守卫为 52 pass / 14 既有 fail / 2 skip；
+21 文件 `test-console-*` 为 16 pass / 4 既有 fail / 1 timeout；两组均
+green→non-green 0。crypto 三文件全部通过。
+
 ### 5 小时冲刺第十一批：5 分钟净增 8 文件，96 files/hour
 
 12:44–12:49 组合 URL、EventEmitter、timers 三个清扫包，静态预计 9，

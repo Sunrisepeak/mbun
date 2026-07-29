@@ -243,6 +243,23 @@ guard is 46 pass and 11 retained failures. After removing gains already
 published in earlier checkpoints, this wave is exactly +8 with zero
 green-to-non-green regressions. Continue treating first-error movement as zero.
 
+### Sprint wave 12 measured checkpoint (12:49–12:58)
+
+Console, Buffer, and crypto-warning packages forecast nine files and delivered
+**+7 in 9.5 minutes = 44.2 files/hour**:
+
+- Buffer detached backing-store and null-prototype input contracts: 3/3;
+- SHAKE default-output `DEP0198` and non-extractable CryptoKey `DEP0204`
+  warnings: 3/3;
+- mutable global-console stdout/stderr sinks: 1/3. Diagnostics-channel registry
+  identity and revoked-Proxy `util.inspect(showProxy)` are independent roots.
+  Their zero-file speculative code was removed by an additive cleanup commit.
+
+The 68-file `test-buffer-*` guard is 52 pass, 14 retained failures, and 2
+skips. The 21-file `test-console-*` guard is 16 pass, 4 retained failures, and
+1 timeout. Both have zero frozen-gate regressions; all three crypto targets
+pass.
+
 The first three-way reuse probe tested local round-10 branches for node's
 `--test` CLI, HTTP/2 argument/timer validation, and verbatim Node error text.
 All three candidate cherry-picks became empty on the current target tree.
