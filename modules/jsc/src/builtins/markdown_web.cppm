@@ -125,6 +125,40 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
     // md4c escapes the same set in URLs plus leaves other bytes intact.
     return String(s).replace(/[&<>"]/g, (c) => (c === "&" ? "&amp;" : c === "<" ? "&lt;" : c === ">" ? "&gt;" : "&quot;"));
   }
+  // GFM's tagfilter is deliberately narrower than an HTML sanitizer: it does
+  // not remove a tag or escape its complete text.  It only changes the leading
+  // '<' on the nine raw-HTML tags named by the extension, leaving both the
+  // remainder of the tag and ordinary (allowed) HTML untouched.
+  const tagFilterNames = new Set(["title", "textarea", "style", "xmp", "iframe", "noembed", "noframes", "script", "plaintext"]);
+  const tagFilterBlockNames = new Set(["title", "textarea", "style", "iframe", "noframes", "script"]);
+  const tagFilterToken = /\\?<\/?[A-Za-z][A-Za-z0-9-]*(?:\s[^<>]*?)?\/?>/g;
+  function renderTagFilteredText(text, O, quoteText) {
+    const source = String(text);
+    let out = "", pos = 0, match;
+    const renderText = (part) => {
+      let rendered = renderInlineHtml(finalizeInline(parseInline(part)), O);
+      // cmark-gfm entity-escapes quotes in inline raw-HTML text.  Block HTML
+      // retains its literal payload, so keep that path separate below.
+      if (quoteText) rendered = rendered.replace(/"/g, "&quot;");
+      return rendered;
+    };
+    tagFilterToken.lastIndex = 0;
+    while ((match = tagFilterToken.exec(source)) !== null) {
+      out += renderText(source.slice(pos, match.index));
+      const token = match[0];
+      const escaped = token[0] === "\\";
+      const html = escaped ? token.slice(1) : token;
+      const name = /^<\/?([A-Za-z][A-Za-z0-9-]*)/.exec(html);
+      if (escaped || (name && tagFilterNames.has(name[1].toLowerCase()))) out += "&lt;" + html.slice(1);
+      else out += html;
+      pos = match.index + token.length;
+    }
+    return out + renderText(source.slice(pos));
+  }
+  function isTagFilterHtmlBlock(text) {
+    const match = /^\s*<\/?([A-Za-z][A-Za-z0-9-]*)\b/.exec(String(text));
+    return !!(match && tagFilterBlockNames.has(match[1].toLowerCase()));
+  }
   function inlinePlainText(nodes) {
     let s = "";
     for (const nd of nodes) {
@@ -243,7 +277,13 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
           break;
         }
         case "paragraph": {
-          const inl = renderInlineHtml(finalizeInline(parseInline(node.text)), O);
+          if (O.tagFilter && isTagFilterHtmlBlock(node.text)) {
+            out += renderTagFilteredText(node.text, O, false) + "\n";
+            break;
+          }
+          const inl = O.tagFilter
+            ? renderTagFilteredText(node.text, O, true)
+            : renderInlineHtml(finalizeInline(parseInline(node.text)), O);
           if (tight) out += inl + "\n";
           else out += "<p>" + inl + "</p>\n";
           break;
@@ -279,6 +319,7 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       tasklists: !!opts.tasklists,
       autolinks: !!opts.autolinks,
       wikilinks: !!opts.wikilinks,
+      tagFilter: !!opts.tagFilter,
     };
     let hIds = false, hAuto = false;
     const h = opts.headings;
