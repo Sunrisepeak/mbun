@@ -5,6 +5,87 @@ session that is interrupted (usage limit, crash, restart) can pick up from the
 file rather than from memory. **If you are a fresh session reading this, start
 here.**
 
+## 2026-07-30 00:30 — WAVE 45 (bun-focused): +8 bun green, 0 node regressions
+
+Four lanes on the corrected `worklists-bun3` cut: **bnode +3** (assert partial
+array match, crypto oneshot, crypto invalid-this), **bbun +3** (spawn NUL
+rejection, node-shaped require, `Bun.jest`), **breg +1** (http2 server must never
+advertise `SETTINGS_ENABLE_PUSH`), **bweb +1** (URLSearchParams duplicate-key
+grouping + BroadcastChannel surface).
+
+Node sweep after integration: `test-require` 16/23, `test-module` 15→16/32,
+`test-path` 16/17, `test-crypto` 86/129, `test-assert` 5/14, `test-esm` 0/2 —
+**+1, 0 regressions over 217 files**, including the riskiest change of the wave
+(`require` changed from `function (s,o,k)` to `(s, ...rest) =>` in
+`engine_require_js.inc`, i.e. every module's `require` in both corpora).
+
+### The bun near-green screen, after FOUR corrections
+
+Each correction came from a lane measuring the previous one wrong:
+
+1. `failed ≤ 2` — **wrong**: a 1-fail/0-pass file died at *load*; its single
+   assertion measured a whole missing subsystem.
+2. `passed > 0` — better, but does not separate semantic failures from
+   **resource-profile** ones.
+3. `failed ≤ 5 AND pass-ratio > 0.5` — cleaner, but a memory/GC/threading budget
+   is *by construction* a single assertion at the end of a long green file, so
+   this filter actively selects **for** the worst traps. One lane's 4 of 10
+   `js/web` candidates were exactly this.
+4. **Current rule**, and the one to cut the next worklist with:
+   - require `errors == 0`, not just low `failed` — `js/node/util/util.test.js`
+     had 2 fixable failures but can never go green because an out-of-test `node`
+     subprocess exits 127 (there is no `node` on PATH);
+   - **subtract** any candidate whose failing assertion text matches
+     `/memory|bytes|copies|objectTypeCounts|SharedArrayBuffer|heap|timed out|<run wedged>/`;
+   - **subtract** rows whose log carries an absolute tmp path (`sun_path` 108-byte
+     unix-socket limit makes files fail purely from a deep `--out` directory —
+     `js/bun/http/bun-serve-args` loses 3 assertions to this alone);
+   - prefer failure text matching `is not a function` / `Received: undefined` /
+     `ERR_*` mismatches — one lane's 3 wins were all a missing-or-wrong
+     **argument-shape** detail;
+   - rank by **distinct root causes**, not failure count.
+
+### Cross-corpus: one conflict resolved, one irreducible, one open
+
+- **Resolved by routing** (the pattern to reuse): `URLSearchParams` inspect —
+  node pins `URLSearchParams { 'a' => 'a' }`, bun pins a block form. Routed
+  through the existing `__bunStyle` flag; both stay green.
+- **IRREDUCIBLE — strike `js/node/path/to-namespaced-path.test.js` from bun
+  worklists.** `path.win32.toNamespacedPath("\\\\?\\foo")`: bun asserts a trailing
+  separator, node 26 `test-path-makelong.js:82` asserts none. Same API, same
+  input, opposite values, and no caller-side discriminator exists. A lane
+  implemented the bun side, measured 4/32 green, found it cost node's
+  `test-path-makelong` **and** `test-path-resolve` (both previously green), and
+  reverted. Decision is documented in a comment at the special case in
+  `bootstrap.cppm` — do not let another lane re-derive it.
+- **Open, needs a routing decision:** `new Worker("file:///…")`. Bun's *global*
+  `Worker` accepts a `file://` href; node's `worker_threads.Worker` must throw
+  `ERR_WORKER_PATH`. mbun installs one class for both
+  (`node_worker.cppm:1573`). The `__bunStyle`-shaped fix is a separate global
+  `Worker` subclass with the relaxed resolver, leaving `node:worker_threads`
+  strict. Unblocks 2+ bun files.
+
+### Highest-leverage uncashed items, ranked
+
+1. **`.stack` has no `Name: message` header line.** JSC gives frames only; V8/bun
+   prepend `Error: msg`. It is the entirety of both `third_party/express` files
+   and is a plausible long tail across BOTH corpora. Wants a dedicated lane with
+   a full-corpus before/after — too broad for a 40-minute box.
+2. **grpc-js HTTP/2 streams never settle** — 5 bun files, one shared cause, pure
+   JS (not the napi blocker).
+3. **A real `seq` shell builtin** — `js/bun/shell/commands/seq.test.ts` is 27
+   pass / 4 fail, all one cause: mbun has no `seq` builtin so it inherits GNU
+   semantics from `/usr/bin/seq`, while bun implements BSD semantics.
+4. **`__bunStyle` hook in `node_http.cppm`** — absent today; gates
+   `regression/34415` and probably the whole HTTP/1.0-framing seam.
+
+### `js/third_party/*` — exclude from per-file volume lanes
+
+Two lanes scored **0 of 17** and **0 of 7** there. But the reason is useful: those
+7 files carry exactly **two** root causes (5× grpc-js, 2× the `.stack` header).
+They are a poor unit of work and a good *signal* of which subsystems unlock the
+most files at once.
+
 ## 2026-07-29 23:40 — BUN AUTHORITY RE-ESTABLISHED: 866 / 1902 green on the current tree
 
 `target/integration/w44-bun-full` — full 1902-file bun corpus, current integration
