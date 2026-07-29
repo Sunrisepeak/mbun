@@ -588,6 +588,15 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       // {} means an empty environment. Snapshot process.env so the child sees the
       // JS-visible env (harness-injected vars), not just the raw OS environ.
       const baseEnv = options.env && typeof options.env === "object" ? options.env : (G.process && G.process.env) || {};
+      // Node's envPairs loop observes inherited enumerable keys, drops undefined,
+      // and stringifies null rather than treating it as an omitted entry. Pass a
+      // plain snapshot across the native boundary so both ordinary children and
+      // IPC children get the same environment.
+      const childEnv = {};
+      for (const key in baseEnv) {
+        const value = baseEnv[key];
+        if (value !== undefined) childEnv[key] = String(value);
+      }
       if (ipcIndex >= 0) {
         // node advertises the child's end of the channel through NODE_CHANNEL_FD
         // (lib/internal/child_process.js spawn()); the fd number is the slot index.
@@ -595,12 +604,12 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
         // NODE_CHANNEL_SERIALIZATION_MODE, so the child frames its half
         // identically without being told twice.
         const e = {};
-        for (const k of Object.keys(baseEnv)) e[k] = baseEnv[k];
+        for (const k of Object.keys(childEnv)) e[k] = childEnv[k];
         e.NODE_CHANNEL_FD = String(ipcIndex);
         e.NODE_CHANNEL_SERIALIZATION_MODE = options.serialization === "advanced" ? "advanced" : "json";
         sopts.env = e;
       } else {
-        sopts.env = baseEnv;
+        sopts.env = childEnv;
       }
       if (options.detached) sopts.detached = true;
       if (typeof options.uid === "number") sopts.uid = options.uid;
@@ -615,6 +624,23 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
         const code = ERRNO[h.errno] || ("errno " + h.errno);
         const err = new Error("spawn " + file + " " + code);
         err.errno = -1; err.code = code; err.path = file; err.spawnargs = args.slice(1);
+        // A failed async spawn still exposes the requested stdout/stderr pipe
+        // objects. Consumers commonly install their stream handlers before the
+        // deferred ENOENT error arrives (including spawn({ cwd: missing })).
+        // They are empty, already-ending readables rather than null slots.
+        const failedStdio = [];
+        for (let i = 0; i < stdio.length; i++) {
+          if (i > 0 && stdio[i] === "pipe") {
+            const stream = makeReadable();
+            failedStdio[i] = stream;
+            if (i === 1) this.stdout = stream;
+            else if (i === 2) this.stderr = stream;
+            nextTick(() => stream.__end());
+          } else {
+            failedStdio[i] = null;
+          }
+        }
+        this.stdio = failedStdio;
         if (spawnDC.hasSubscribers) spawnDC.error.publish({ process: this, error: err });
         if (DELAYED[code]) {
           err.syscall = "spawn " + file;
@@ -762,12 +788,17 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   };
   // The options members every entry point shares (cwd/argv0/shell must be
   // NUL-free even on the sync paths that never reach normalizeSpawnArguments).
+  const isAbortSignal = (signal) =>
+    !!(signal && ((G.AbortSignal && signal instanceof G.AbortSignal) ||
+      (typeof signal.addEventListener === "function" &&
+       typeof signal.removeEventListener === "function" &&
+       "aborted" in signal)));
   const validateCommonOpts = (o) => {
     if (o == null) return;
     // child_process accepts an actual AbortSignal here.  Checking before the
     // spawn boundary makes exec() and execFile() reject invalid values
     // synchronously, including through util.promisify().
-    if (o.signal !== undefined && !(G.AbortSignal && o.signal instanceof G.AbortSignal)) {
+    if (o.signal !== undefined && !isAbortSignal(o.signal)) {
       throw errArgType("options.signal", "an instance of AbortSignal", o.signal);
     }
     if (o.cwd != null) toPathString(o.cwd, "options.cwd");
@@ -806,8 +837,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       else if (typeof o.killSignal === "number") { if (!hasOwn.call(SIGNAME, String(o.killSignal))) throw unknown(); }
       else throw errPropType("options.killSignal", "of type string or number", o.killSignal);
     }
-    if (o.signal != null &&
-        (typeof G.AbortSignal !== "function" || !(o.signal instanceof G.AbortSignal))) {
+    if (o.signal != null && !isAbortSignal(o.signal)) {
       throw errPropType("options.signal", "an instance of AbortSignal", o.signal);
     }
     // Both env keys and env values must be NUL-free (node's
