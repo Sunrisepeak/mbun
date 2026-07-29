@@ -367,9 +367,9 @@ inline constexpr std::string_view kNodeTestRunJS = R"JS(
       }
     };
 
-    // node's default file discovery: **/*.test.{js,mjs,cjs} plus every file
-    // under a `test` directory, rooted at cwd (runner.js createTestFileList).
-    const TEST_FILE = /((^|[\\/])(test|tests)[\\/].*|[.-](test|spec)|^test)\.(c|m)?js$/;
+    // node's default file discovery: test, test/**, test-*, and
+    // *[._-]test, rooted at cwd (utils.js kPatterns).
+    const TEST_FILE = /((^|[\\/])(test|tests)[\\/].*|[._-](test|spec)|^test)\.(c|m)?js$/;
     const discover = (cwd) => {
       const fs = fsMod();
       const path = pathMod();
@@ -383,7 +383,7 @@ inline constexpr std::string_view kNodeTestRunJS = R"JS(
           if (name === "node_modules" || name.charCodeAt(0) === 46) continue;
           const full = path.join(dir, name);
           if (entry.isDirectory()) walk(full, depth + 1);
-          else if (TEST_FILE.test(path.relative(cwd, full))) found.push(full);
+          else if (TEST_FILE.test(path.relative(cwd, full))) found.push(path.relative(cwd, full));
         }
       };
       walk(cwd, 0);
@@ -531,7 +531,11 @@ inline constexpr std::string_view kNodeTestRunJS = R"JS(
     // events come straight off the in-process reporting surface.
     const runInProcess = async (files, given, forward, aborted) => {
       const createRequire = mod("module").createRequire;
-      const unsubscribe = internals.subscribe(forward);
+      let sawResult = false;
+      const unsubscribe = internals.subscribe((type, data) => {
+        if (type === "test:pass" || type === "test:fail") sawResult = true;
+        forward(type, data);
+      });
       // The evaluated files' failures belong to the returned stream; they must
       // not set the exit status of the process that called run().
       internals.setOwnExitCode(false);
@@ -541,6 +545,7 @@ inline constexpr std::string_view kNodeTestRunJS = R"JS(
           const file = files[i];
           const name = given[i];
           const startedAt = Date.now();
+          sawResult = false;
           // node reports the file itself as a test, so a file that cannot even
           // be loaded still produces an enqueue and a failure.
           forward("test:enqueue", fileEvent(name, file, internals.nextId()));
@@ -556,6 +561,14 @@ inline constexpr std::string_view kNodeTestRunJS = R"JS(
             forward("test:fail", e);
           }
           await drainFully();
+          // A file without a node:test event is still a passing top-level
+          // FileTest in node's CLI output (for example subdir/subdir_test.js).
+          if (!sawResult) {
+            const e = fileEvent(name, file, internals.nextId());
+            e.testNumber = i + 1;
+            e.details = { duration_ms: Date.now() - startedAt, type: "test" };
+            forward("test:pass", e);
+          }
         }
         await drainFully();
       } finally { unsubscribe(); internals.setOwnExitCode(true); }
