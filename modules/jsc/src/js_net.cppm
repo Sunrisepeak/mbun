@@ -277,6 +277,24 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
   // node's initial default is 500ms; the test harness (common/index.js) reads it,
   // multiplies by 5 and re-sets it (→ 2500), which is what tests assert against.
   let autoSelectFamilyAttemptTimeoutDefault = 500;
+  // process.execArgv has already been derived from the node-compatible CLI
+  // before this module is evaluated. Seed the same defaults net.js reads from
+  // its per-isolate options, so child processes retain these switches too.
+  const netExecArgv = (G.process && Array.isArray(G.process.execArgv)) ? G.process.execArgv : [];
+  for (let i = 0; i < netExecArgv.length; i++) {
+    const arg = netExecArgv[i];
+    if (arg === "--network-family-autoselection" || arg === "--enable-network-family-autoselection") {
+      autoSelectFamilyDefault = true;
+    } else if (arg === "--no-network-family-autoselection") {
+      autoSelectFamilyDefault = false;
+    } else if (typeof arg === "string" && arg.startsWith("--network-family-autoselection-attempt-timeout=")) {
+      const value = Number(arg.slice("--network-family-autoselection-attempt-timeout=".length));
+      if (Number.isSafeInteger(value) && value > 0) autoSelectFamilyAttemptTimeoutDefault = Math.max(10, value);
+    } else if (arg === "--network-family-autoselection-attempt-timeout") {
+      const value = Number(netExecArgv[++i]);
+      if (Number.isSafeInteger(value) && value > 0) autoSelectFamilyAttemptTimeoutDefault = Math.max(10, value);
+    }
+  }
   // node net.js Socket#setTypeOfService: NumberIsNaN first (so NaN is an
   // ERR_INVALID_ARG_TYPE, not an out-of-range), then validateInt32(0, 255).
   // NumberIsNaN does not coerce, so a string falls through to validateInt32 and
@@ -664,6 +682,10 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       // kernel picks both when neither was requested.
       const _localAddr = (optArg && optArg.localAddress != null) ? String(optArg.localAddress) : null;
       const _localPort = (optArg && optArg.localPort != null) ? (optArg.localPort | 0) : 0;
+      // lookupAndConnect defaults this option from the module-wide setting;
+      // passing `undefined` must not silently mean false.
+      const _autoSelectFamily = optArg && optArg.autoSelectFamily !== undefined
+        ? optArg.autoSelectFamily : autoSelectFamilyDefault;
       const _adoptLocal = (sock, sfd) => {
         try {
           const sn = NN.sockname ? NN.sockname(sfd) : null;
@@ -690,7 +712,10 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
         const dialResolved = (addr, fam) => {
           if (fam !== 4 && fam !== 6) { const e = mkErr("Invalid address family: " + fam + " " + host + ":" + port, "ERR_INVALID_ADDRESS_FAMILY"); e.host = host; e.port = port; return failWith(e); }
           if (_blockList && _blockList.check(addr, fam === 6 ? "ipv6" : "ipv4")) return failWith(mkErr("IP is blocked by net.BlockList", "ERR_IP_BLOCKED"));
-          const dh = (addr === "::1" || addr === "::" || addr === "::0") ? "127.0.0.1" : addr;
+          // The reactor's IPv4 fallback is only for an explicitly enabled
+          // Happy-Eyeballs attempt. A disabled family selector must surface the
+          // IPv6 connection failure rather than reaching an IPv4-only server.
+          const dh = _autoSelectFamily && (addr === "::1" || addr === "::" || addr === "::0") ? "127.0.0.1" : addr;
           let fd2;
           try { fd2 = NN.connect(dh, port, _localAddr, _localPort); }
           catch (e) { self.connecting = false; const err = connectError(e, addr, port); G.queueMicrotask(() => { if (self.destroyed) return; self.emit("error", err); self.destroy(); }); return self; }
@@ -715,7 +740,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
         if (hf) return dialResolved(host, hf);
         // host needs resolution — drive the caller-supplied lookup (node passes
         // { family, hints, all }; all is set under autoSelectFamily).
-        const lopts = { family: (optArg && optArg.family) || 0, hints: (optArg && optArg.hints) || 0, all: !!(optArg && optArg.autoSelectFamily) };
+        const lopts = { family: (optArg && optArg.family) || 0, hints: (optArg && optArg.hints) || 0, all: _autoSelectFamily };
         const _resolver = _lookup || ((M["dns"] || M["node:dns"] || {}).lookup);
         if (typeof _resolver !== "function") {
           const e = mkErr("getaddrinfo ENOTFOUND " + host, "ENOTFOUND"); e.host = host; e.port = port;
