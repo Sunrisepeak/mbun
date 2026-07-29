@@ -297,6 +297,23 @@ Guards: HTTP client 63/68 pass; module 11 pass, 18 fail, 3 skip; require 13
 pass, 9 fail, 1 skip; abort 1/7 pass; readline 10 pass, 3 fail, 8 skip. Every
 guard has zero green-to-non-green regressions.
 
+### Sprint wave 17 measured checkpoint (13:38–13:45)
+
+Seven static candidates forecast roughly 12–13 complete files; strict
+acceptance delivered **+5 in 7 minutes = 42.9 files/hour**:
+
+- HTTP Agent limit/timeout validation: +2;
+- terminal parser detachment: +1/2;
+- CompressionStream BufferSource validation: +2 across the related guard;
+- crypto random, HTTP pipeline clocks, KeyObject export, and util promisify:
+  zero complete files, all additively reverted. A follow-up null-chunk error-code
+  patch also remained whole-file zero-yield and was reverted.
+
+The 36-file HTTP agent/parser/compression guard finished at 25 pass and 11
+retained failures: five frozen fail-to-pass transitions and zero
+green-to-non-green regressions. Conflict-marker, gitlink, and diff guards are
+clean.
+
 ### Sprint wave 16 measured checkpoint (13:26–13:38)
 
 The async-hooks timer-bootstrap and net pre-connect write package forecast four

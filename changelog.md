@@ -5,6 +5,24 @@
 
 ## 2026-07-29
 
+### 5 小时冲刺第十七批：7 分钟净增 5 文件，42.9 files/hour
+
+13:38–13:45 集中验收 crypto、compression、HTTP、util 七个静态候选，
+预计约 12–13 文件，严格结算 **+5**：
+
+- HTTP Agent maxTotalSockets / timeout option **+2**；
+- terminal HTTP parser 在 upgrade/parse-error 后解除 socket 引用，实际
+  **+1/2**；
+- CompressionStream 只接受 BufferSource，命名目标 **+1/2**，相关守卫
+  另带出 compression/decompression stream 1 个，同根合计 **+2**；
+- crypto random、HTTP pipeline timeout、KeyObject export、util promisify
+  均只推进首错误或仍红，**0**；四个提交已 additive revert。为 null
+  chunk 补专用错误码仍未使整文件转绿，也已 additive revert。
+
+36 文件完整相关守卫为 25 pass / 11 既有 fail；相对 frozen gate 为
+5 个 fail→pass、green→non-green 0。conflict-marker、gitlink、diff 守卫
+全绿。
+
 ### 5 小时冲刺第十六批：12 分钟净增 8 文件，40 files/hour
 
 13:26–13:38 组合 async-hooks timer bootstrap 与 net pre-connect write
