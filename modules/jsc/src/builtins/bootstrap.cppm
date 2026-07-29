@@ -3085,12 +3085,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     enumerable: true,
     get() {
       const bind = G.__mbunInternalBinding;
-      const Parser = bind ? bind("http_parser").HTTPParser : undefined;
-      // The built-in binding is only the public-control fallback. Ordinary
-      // HTTP still needs the transport parser, while an explicitly replaced
-      // binding (Node's lazy-load hook) must be returned verbatim.
-      return Parser && Parser.__mbunHttpParserBinding && G.__mbunHttpParser
-        ? G.__mbunHttpParser : (Parser || class HTTPParser {});
+      return bind ? bind("http_parser").HTTPParser : class HTTPParser {};
     },
   });
   def(["_http_common"], httpCommon);

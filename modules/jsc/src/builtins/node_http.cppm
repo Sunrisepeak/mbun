@@ -2245,10 +2245,7 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
     alloc() {
       const p = this.list.length ? this.list.pop() : null;
       if (p) return p;
-      // _http_common is intentionally lazy: tests may replace its parser
-      // binding before this allocator is first reached.
-      const common = M["_http_common"] || M["node:_http_common"];
-      const HP = (common && common.HTTPParser) || G.__mbunHttpParser;
+      const HP = G.__mbunHttpParser;
       return HP ? new HP(false) : null;
     },
     free(obj) {
