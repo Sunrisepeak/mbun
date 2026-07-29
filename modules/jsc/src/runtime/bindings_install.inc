@@ -448,12 +448,14 @@
   p.prependListener = function (n, f) { return _add(String(n), f, true); };
   p.once = function (n, f) { const w = function (...a) { p.off(n, w); return f.apply(p, a); }; w.listener = f; return _add(String(n), w, false); };
   p.off = p.removeListener = function (n, f) { const k = String(n); const l = _ev[k]; if (l) { const i = l.findIndex((x) => x === f || x.listener === f); if (i >= 0) { const rm = l.splice(i, 1)[0]; _emitIfListened("removeListener", k, _pub(rm)); } } return p; };
-  p.removeAllListeners = function (n) { if (n === undefined) { for (const k of Object.keys(_ev)) delete _ev[k]; } else delete _ev[String(n)]; return p; };
+  // Indexed, not for-of: user code may delete Array.prototype[Symbol.iterator]
+  // (node's corpus does exactly that), and process teardown must still run.
+  p.removeAllListeners = function (n) { if (n === undefined) { const ks = Object.keys(_ev); for (let i = 0; i < ks.length; i++) delete _ev[ks[i]]; } else delete _ev[String(n)]; return p; };
   p.listeners = function (n) { return (_ev[String(n)] || []).map((x) => x.listener || x); };
   p.rawListeners = function (n) { return (_ev[String(n)] || []).slice(); };
   p.listenerCount = function (n) { return (_ev[String(n)] || []).length; };
   p.eventNames = function () { return Object.keys(_ev); };
-  p.emit = function (n, ...a) { const l = _ev[String(n)]; if (!l || !l.length) return false; for (const f of l.slice()) f.apply(p, a); return true; };
+  p.emit = function (n, ...a) { const l = _ev[String(n)]; if (!l || !l.length) return false; const c = l.slice(); for (let i = 0; i < c.length; i++) c[i].apply(p, a); return true; };
   p.cpuUsage = function () { return { user: 0, system: 0 }; };
   // rss is REAL (Linux /proc/self/statm field 2 = resident pages): a flat 0 made
   // every ratio a test takes over two samples NaN, and `NaN < 5` is false — that

@@ -5,6 +5,45 @@ session that is interrupted (usage limit, crash, restart) can pick up from the
 file rather than from memory. **If you are a fresh session reading this, start
 here.**
 
+## 2026-07-29 23:40 — BUN AUTHORITY RE-ESTABLISHED: 866 / 1902 green on the current tree
+
+`target/integration/w44-bun-full` — full 1902-file bun corpus, current integration
+binary: **866 green, 874 test-failure, 32,146 pass / 16,456 fail assertions.**
+**Use this as the bun baseline from now on**, not the 230-file focused set and not
+the 2026-07-21 `r5-bun` run.
+
+**Nine bun files verified green this wave** (9/9 of what the lanes claimed,
+re-checked in the full run, not taken on report):
+`regression/14477`, `regression/16476`, `js/node/diagnostics_channel`,
+`js/bun/crypto/x25519-derive-bits`, `js/bun/stream/direct-readable-stream`,
+`js/node/perf_hooks`, `js/deno/fetch/headers`, `js/web/crypto/web-crypto`,
+`js/web/url/url`.
+
+### The 61-file caveat, stated plainly
+
+`corpus_diff r5-bun -> w44-bun-full` reports **61 green→non-green and 43
+non-green→green** (884 → 866). This is **not** a clean attribution and must not be
+quoted as "we regressed 61 bun files":
+
+- `r5-bun` is from **2026-07-21** — eight days and many waves old, and it predates
+  the measurement-honesty fixes (`assert.throws` validating its error argument,
+  `mustCall` enforcement, self-skips excluded). Those made the node number fall
+  legitimately; the same correction applies here.
+- The runner's classification buckets changed underneath: `fixture-build-error`
+  went 0 → 12 (the bucket did not exist), `crash` 13 → 1, `ahead-of-reference`
+  0 → 3. Files moved between buckets without their behaviour changing.
+
+What WAS checked: the one file on that list this wave could plausibly have caused
+— `js/node/async_hooks/EventEmitterAsyncResource.test.ts`, because a lane changed
+`AsyncResource#bind` arity — fails on `triggerAsyncId reflects the option`, and
+`git show 5928f18 | grep -c triggerAsyncId` is **0**. Unrelated and pre-existing.
+The remaining 60 are unattributed; with `w44-bun-full` as the baseline the next
+wave can diff same-tree and settle it properly.
+
+**Lesson for the protocol: the consolidated integration sweep must cover BOTH
+corpora.** This wave's sweep covered 513 node files and zero bun files, which is
+how a bun-side regression could have slipped through unseen.
+
 ## 2026-07-29 23:05 — BLOCKER: mbun exports 6 dynamic symbols, so no napi addon can load
 
 **Highest-ROI item found on the bun seam, and it is an UPSTREAM mcpp bug — do not
