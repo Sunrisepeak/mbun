@@ -81,6 +81,26 @@ groups as if their first missing symbol were their only cause. Compile-cache
 engine tests need real loader bytecode persistence and exceed one sprint lane.
 Prefer another shared fatal/state/API endpoint with an estimated 5+ files/hour.
 
+### Sprint wave 2 measured checkpoint (11:15–11:30)
+
+The second combined checkpoint gained 8 Node files in 15.7 minutes:
+**30.6 files/hour**, with zero green-to-non-green regressions in the named
+acceptance sets.
+
+- POSIX process credentials: estimated 4, actual 4/4. The implementation uses
+  real libc credential syscalls and passwd/group lookup.
+- FastUtf8Stream drain lifecycle: estimated 5, actual 1 additional file across
+  the 14-file group. The first integration run regressed periodic flush because
+  destroy swallowed a requested flush callback; integration fixed that before
+  accepting the wave, leaving zero scoped regressions.
+- Web Compression Streams: estimated 6, actual 3/6, backed by the real
+  incremental zlib Transform and BufferSource Web adapter.
+
+The active next wave is async_hooks lifecycle (static estimate at least 5) plus
+fresh Bun HTTP/serve/TLS gate-log clustering. Continue to reject first-error
+movement as yield and stop any lane that cannot identify a shared >=5-file
+mechanism inside ten minutes.
+
 The first three-way reuse probe tested local round-10 branches for node's
 `--test` CLI, HTTP/2 argument/timer validation, and verbatim Node error text.
 All three candidate cherry-picks became empty on the current target tree.

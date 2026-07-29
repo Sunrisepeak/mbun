@@ -5,6 +5,25 @@
 
 ## 2026-07-29
 
+### 5 小时冲刺第二批：15.7 分钟净增 8 文件，30.6 files/hour
+
+11:15–11:30 继续使用 3 个静态实现 lane、主 Agent 单次组合构建与集中
+验收。估计收益 15 文件，实际 **8 / 15.7 分钟 = 30.6 files/hour**：
+
+- POSIX process credentials：预计 4，实际 **4/4**；`setuid`/`seteuid`/
+  `setgid`/`setegid`/`setgroups`/`initgroups` 均走真实 libc syscall 与
+  passwd/group 查找，不伪造权限成功；
+- FastUtf8Stream drain 生命周期：预计 5，实际只新增 **1/14**。首次验收
+  还造成 periodic flush 1 个回归；主审定位为 destroy 吞掉已请求的 flush
+  callback，修复后该回归消失，最终本组净 +1；
+- Web Compression Streams：预计 6，实际 **3/6**，复用真实增量 zlib
+  Transform 与 BufferSource Web adapter。
+
+本批 Node 合计 +8；命名集合 green→non-green 为 0。`build_or_die`、冲突
+标记、gitlink、diff 守卫通过。估计与实测差距再次证明：只按整文件绿色
+结算，不能把共享首因数量当最终收益。下一批已在构建/验收之外并发推进
+async_hooks 生命周期（预计至少 5）以及 Bun HTTP/serve/TLS 当前日志聚类。
+
 ### 5 小时冲刺第一批：20 分钟净增 29 文件，83.5 files/hour
 
 10:55–11:15 按新协议运行 3 个 Agent lane，子 Agent 只做静态实现，主
