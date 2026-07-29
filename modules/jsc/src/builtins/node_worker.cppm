@@ -82,6 +82,15 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
   // WeakMap keeps that capability branded: a lookalike object cannot acquire
   // one by adding public properties.
   const broadcastQueues = new WeakMap();
+  const broadcastNames = new WeakMap();
+  const invalidBroadcastThis = () => {
+    const e = new TypeError('Value of "this" must be of type BroadcastChannel');
+    e.code = "ERR_INVALID_THIS";
+    return e;
+  };
+  const assertBroadcast = (value) => {
+    if (!broadcastQueues.has(value)) throw invalidBroadcastThis();
+  };
 
   const kOther = Symbol("mbun.port.other");
   const kQueue = Symbol("mbun.port.queue");
@@ -849,7 +858,7 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
         // accepting them through String(Symbol()).
         if (typeof name === "symbol")
           throw new TypeError("Cannot convert a Symbol value to a string");
-        this.name = `${name}`;
+        broadcastNames.set(this, `${name}`);
         this.onmessage = null;
         this.onmessageerror = null;
         this._closed = false;
@@ -858,7 +867,9 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
         if (!set) { set = new Set(); channels.set(this.name, set); }
         set.add(this);
       }
+      get name() { assertBroadcast(this); return broadcastNames.get(this); }
       postMessage(value) {
+        assertBroadcast(this);
         if (arguments.length === 0)
           throw new TypeError('The "message" argument must be specified');
         if (this._closed) throw new Error("BroadcastChannel is closed");
@@ -887,13 +898,14 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
         }
       }
       close() {
+        assertBroadcast(this);
         if (this._closed) return;
         this._closed = true;
         const set = channels.get(this.name);
         if (set) { set.delete(this); if (set.size === 0) channels.delete(this.name); }
       }
-      ref() { return this; }
-      unref() { return this; }
+      ref() { assertBroadcast(this); return this; }
+      unref() { assertBroadcast(this); return this; }
       addEventListener(type, cb) { this.on(type, cb); }
       removeEventListener(type, cb) { this.off(type, cb); }
     }
