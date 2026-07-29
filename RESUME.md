@@ -21,6 +21,41 @@ This section supersedes the older state snapshot below.
 - **PR**: the live draft PR replaces blocked PR #33; do not reopen or reuse
   merged PR #25.
 
+## 2026-07-29 five-hour sprint protocol
+
+The 10:20–10:55 wave produced only 2 newly green named Node files in 35
+minutes with three implementation lanes: **3.4 files/hour**. Do not resume the
+per-assertion loop. BroadcastChannel and `test-runner-cli.js` advanced through
+many assertions but remained red, so their progress is not coverage yield.
+
+For the next five hours:
+
+1. Rank work by expected newly green files divided by wall-clock hours. Accept
+   tasks forecast at 10+ files or 5+ files/hour; abandon or split a lane after
+   45 minutes without evidence of batch yield.
+2. Agents implement one shared root cause on their persistent lane and do only
+   a cheap reproducer. Integration owns the one combined build, targeted
+   acceptance, related-subtree guard, checkpoint commit, push, and PR comment.
+3. Every PR checkpoint comment must report estimate vs actual, wall-clock
+   time, files/hour, and pass→non-pass regressions. Never count assertion
+   advancement as a green file.
+4. Do not repoint a warmed lane for unrelated integration commits. That caused
+   near-full rebuilds behind the global lock and serialized the previous wave.
+5. Run full Node and Bun corpora only at a pushed PR checkpoint. The interrupted
+   runs `codex-wave3-full-node` (3690/4433) and `codex-wave3-full-bun`
+   (395/1902) are partial journals, not baselines.
+
+The published gap is Node 1779 plus Bun 1034 = 2813 files, requiring 562.6
+files/hour for five-hour completion. The next dispatch is therefore broad
+shared gaps: trace-events (20+ expected), FastUtf8Stream (14 expected), and
+compile-cache (14+ expected). Defer the one-file cross-process
+BroadcastChannel transport until its reuse count justifies the cost.
+
+`node_corpus_runner.py` now launches from the upstream checkout root
+(`compat/node`). Old and new full-run counts are different measurement
+contracts and must not be subtracted. Establish the new baseline at the next
+pushed checkpoint.
+
 The first three-way reuse probe tested local round-10 branches for node's
 `--test` CLI, HTTP/2 argument/timer validation, and verbatim Node error text.
 All three candidate cherry-picks became empty on the current target tree.

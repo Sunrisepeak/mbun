@@ -5,6 +5,35 @@
 
 ## 2026-07-29
 
+### 5 小时冲刺切换：停止逐断言慢循环，按 files/hour 分配
+
+10:20–10:55 的第二批使用 3 个实现 Agent、14 个小提交，主线定向结果只有
+**2 个文件转绿 / 35 分钟 = 3.4 files/hour**：crypto worklist `0/8 → 1/8`
+（`test-crypto-keygen-non-standard-public-exponent.js`），`test-runner-*`
+`28 → 29 / 77`（`test-runner-error-reporter.js`）；worker 保持 `85/141`，
+0 个 pass 回退。BroadcastChannel 与 `test-runner-cli.js` 虽各推进多层，
+但仍红，不能计入收益。这个速度无法支撑 5 小时目标。
+
+立即停止两个尚未完成的全量长跑（Node `3690/4433`、Bun `395/1902`，
+两者都只是 partial journal，**不得当作新基线**）。新协议：
+
+- 子 Agent 不再逐断言提交/构建；一次任务必须瞄准共享根因，预估至少
+  10 个文件或至少 5 files/hour，45 分钟无可验证批量收益就换线；
+- 构建、定向验收、相关子树回归集中到主 Agent 的 PR checkpoint；
+- 每个 checkpoint 推送后在 PR 评论实际转绿数、pass 回退数、墙钟时间和
+  files/hour；估计值与实测值分开；
+- lane 沿自己的 tip 连续开发，不为无关主线提交重指 worktree，避免全量
+  重编译；`compat/` 继续只读。
+
+按已发布口径仍剩 Node `1779`、Bun `1034`，5 小时需要 **562.6
+files/hour**。下一批按当前失败密度优先攻共享缺口：trace-events（预估
+20+）、FastUtf8Stream（预估 14）、compile-cache（预估 14+），而不是继续
+单文件 BroadcastChannel IPC。
+
+本批还校正了 Node runner cwd：上游语料应从 `compat/node` 启动，而不是
+仓库根目录。校正前后的全量数字不可直接比较；下一次 PR checkpoint 才跑
+完整 Node/Bun 并建立新口径。
+
 ### 语料续作第一批：新鲜失败清单净增 3 个 Node 文件，三个完整子树回归 0
 
 从 PR #32 的同一构建基线出发，主 Agent 统一构建并对组合树复验：
