@@ -958,11 +958,13 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     const maxBuffer = options.maxBuffer == null ? 1024 * 1024 : options.maxBuffer;
     const outs = [], errs = [];
     let outLen = 0, errLen = 0, maxErr = null, done = false;
-    const add = (which, name, bytes) => {
+    const add = (which, name, bytes, stream) => {
       const arr = which === 0 ? outs : errs;
       const len = which === 0 ? outLen : errLen;
-      const stringOutput = enc !== "buffer" && enc != null;
-      const encoding = enc === "utf-8" ? "utf8" : enc;
+      const streamEncoding = stream && stream._readableState && stream._readableState.encoding;
+      const outputEncoding = streamEncoding || enc;
+      const stringOutput = outputEncoding !== "buffer" && outputEncoding != null;
+      const encoding = outputEncoding === "utf-8" ? "utf8" : outputEncoding;
       const combined = stringOutput ? Buffer.concat(arr.concat([Buffer.from(bytes)])) : null;
       const combinedText = stringOutput ? combined.toString(encoding) : null;
       // The overflow threshold is byte-based even for decoded output. Once it
@@ -986,8 +988,8 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
         if (which === 0) outLen = nextLength; else errLen = nextLength;
       }
     };
-    if (child.stdout) child.stdout.on("data", (d) => add(0, "stdout", _u8(d)));
-    if (child.stderr) child.stderr.on("data", (d) => add(1, "stderr", _u8(d)));
+    if (child.stdout) child.stdout.on("data", (d) => add(0, "stdout", _u8(d), child.stdout));
+    if (child.stderr) child.stderr.on("data", (d) => add(1, "stderr", _u8(d), child.stderr));
     const toOut = (b, stream) => {
       // A caller may override `{ encoding: null }` later with
       // child.stdout.setEncoding(). Node returns strings in that case.
