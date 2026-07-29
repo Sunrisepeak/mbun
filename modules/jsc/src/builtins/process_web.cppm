@@ -87,6 +87,17 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     return d;
   };
 
+  // A stdio write callback is a node callback boundary, not an internal detail:
+  // node runs it from afterWrite() on the loop, so a throw inside it escapes to
+  // 'uncaughtException' and, unclaimed, kills the process. Swallowing it here
+  // (the old `try { item.cb(); } catch (e) {}`) made a failing assertion written
+  // inside `child.stdin.write(chunk, cb)` exit 0 — a corpus test could report
+  // "pass" having verified nothing. Deferring through nextTick both matches
+  // node's asynchrony (the callback never runs inside write()) and puts the
+  // throw on the tick boundary, which node_process_lifecycle already routes to
+  // __mbun_uncaught.
+  const deferCb = (cb) => { if (cb) nextTick(cb); };
+
   // The write half of a stdio slot ABOVE stderr. Those slots are socketpairs
   // (see spawnEx), so the parent's descriptor is duplex: the SAME fd is polled
   // for reads in rec.outs and written through here. Same non-blocking discipline
@@ -95,12 +106,12 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     if (w.fd < 0 || w.closed) return;
     while (w.buf.length) {
       const item = w.buf[0];
-      if (item.data.length - item.off <= 0) { w.buf.shift(); if (item.cb) try { item.cb(); } catch (e) {} continue; }
+      if (item.data.length - item.off <= 0) { w.buf.shift(); deferCb(item.cb); continue; }
       const n = PROC.writeNB(w.fd, _b64(item.data.subarray(item.off)), 0);
-      if (n < 0) { w.buf.shift(); if (item.cb) try { item.cb(); } catch (e) {} continue; }  // peer gone
+      if (n < 0) { w.buf.shift(); deferCb(item.cb); continue; }  // peer gone
       if (n === 0) return;  // EAGAIN — retry next tick
       item.off += n;
-      if (item.off >= item.data.length) { w.buf.shift(); if (item.cb) try { item.cb(); } catch (e) {} }
+      if (item.off >= item.data.length) { w.buf.shift(); deferCb(item.cb); }
       else return;
     }
   };
@@ -109,12 +120,12 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     if (rec.stdinFd < 0 || rec.stdinClosed) return;
     while (rec.stdinBuf.length) {
       const item = rec.stdinBuf[0];
-      if (item.data.length - item.off <= 0) { rec.stdinBuf.shift(); if (item.cb) try { item.cb(); } catch (e) {} continue; }
+      if (item.data.length - item.off <= 0) { rec.stdinBuf.shift(); deferCb(item.cb); continue; }
       const w = PROC.writeNB(rec.stdinFd, _b64(item.data.subarray(item.off)), 0);
-      if (w < 0) { rec.stdinBuf.shift(); if (item.cb) try { item.cb(); } catch (e) {} continue; }  // broken pipe
+      if (w < 0) { rec.stdinBuf.shift(); deferCb(item.cb); continue; }  // broken pipe
       if (w === 0) return;  // EAGAIN — retry next tick
       item.off += w;
-      if (item.off >= item.data.length) { rec.stdinBuf.shift(); if (item.cb) try { item.cb(); } catch (e) {} }
+      if (item.off >= item.data.length) { rec.stdinBuf.shift(); deferCb(item.cb); }
       else return;
     }
     if (rec.stdinEnded) { try { PROC.close(rec.stdinFd); } catch (e) {} rec.stdinClosed = true; if (rec.cp.stdin) { rec.cp.stdin.destroyed = true; rec.cp.stdin.writable = false; } }
