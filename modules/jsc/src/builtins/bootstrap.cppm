@@ -5113,9 +5113,24 @@ inline constexpr char kBootstrapJS_[] = R"JS(
           return new fsMod.Dirent(name, r.types[i], parent);
         });
       }
-      const names = F.readdir(p);
+      // Keep the public Dirent conversion here, but obtain the raw name/type
+      // row through the same binding that Node exposes to internal consumers.
+      // Besides sharing d_type data, this lets an UNKNOWN type fall back to a
+      // stat below (test-fs-readdir-types).
+      const binding = wft && typeof G.__mbunInternalBinding === "function"
+        ? G.__mbunInternalBinding("fs") : null;
+      const row = binding && typeof binding.readdir === "function"
+        ? binding.readdir(p, "utf8", true) : null;
+      const names = row ? row[0] : F.readdir(p);
       if (!wft) return fsReaddirEncode(names, o);
-      return names.map((n) => { let t = 1; try { t = F.stat(p + "/" + n)._isDir ? 2 : 1; } catch (e) { t = 3; } return new fsMod.Dirent(n, t, p); });
+      const types = row && row[1];
+      return names.map((n, i) => {
+        let t = types ? types[i] : 0;
+        // UV_DIRENT_UNKNOWN is zero. It carries no usable predicate, so Node
+        // stats the entry to construct a truthful Dirent.
+        if (t === 0) { try { t = F.stat(p + "/" + n)._isDir ? 2 : 1; } catch (e) { t = 3; } }
+        return new fsMod.Dirent(n, t, p);
+      });
     },
     // native stat builds a plain object; link it to fs.Stats.prototype so
     // `statSync(x) instanceof Stats` holds (node/bun: statSync shares the
