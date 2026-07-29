@@ -65,8 +65,15 @@ globalThis.__mbun_make_require = function (dir) {
       error.code = "MODULE_NOT_FOUND";
       throw error;
     }
-    return globalThis.__mbun_require_native(s, dir, false,
-      (o && typeof o.type === "string") ? o.type : "", k ? 1 : 0);
+    const load = function () {
+      return globalThis.__mbun_require_native(s, dir, false,
+        (o && typeof o.type === "string") ? o.type : "", k ? 1 : 0);
+    };
+    const modules = globalThis.__mbunNativeModules;
+    const dc = modules && (modules["diagnostics_channel"] || modules["node:diagnostics_channel"]);
+    const trace = dc && typeof dc.tracingChannel === "function" ? dc.tracingChannel("module.require") : null;
+    if (!trace || !trace.hasSubscribers) return load();
+    return trace.traceSync(load, { parentFilename: req.__mbun_parent_filename, id: s });
   };
   req.resolve = function (s) { return globalThis.__mbun_resolve_native(String(s), dir); };
   // require.cache is a live view over the native CommonJS module cache: a plain
@@ -127,14 +134,15 @@ globalThis.__mbun_esm_namespace = function (m) {
   return ns;
 };
 globalThis.__mbun_dyn_import = function (req, spec, options) {
+  const load = function () {
   // A `data:` URL carries its own source — there is nothing to fetch, so bun
   // decodes and compiles it eagerly and a malformed payload (bad base64) throws
   // from the import() call site instead of rejecting later
   // (js/node/string-module.test.js asserts the synchronous throw).
-  if (typeof spec === "string" && spec.startsWith("data:")) {
-    return Promise.resolve(globalThis.__mbun_esm_namespace(req(spec, undefined, 1)));
-  }
-  return Promise.resolve().then(function () {
+    if (typeof spec === "string" && spec.startsWith("data:")) {
+      return Promise.resolve(globalThis.__mbun_esm_namespace(req(spec, undefined, 1)));
+    }
+    return Promise.resolve().then(function () {
     // `import(spec, { with: { type } })` (and the legacy `{ assert: { type } }`)
     // — thread the type import attribute to require() as its 2nd arg so it
     // overrides the extension-derived loader, exactly like a static
@@ -146,8 +154,16 @@ globalThis.__mbun_dyn_import = function (req, spec, options) {
     }
     // Pass the import marker (3rd arg): a dynamic import() is ImportKind::Dynamic,
     // so a resolution failure reports ERR_MODULE_NOT_FOUND (bun ResolveMessage.rs).
-    return globalThis.__mbun_esm_namespace(req(String(spec), attr, 1));
-  });
+      return globalThis.__mbun_esm_namespace(req(String(spec), attr, 1));
+    });
+  };
+  const modules = globalThis.__mbunNativeModules;
+  const dc = modules && (modules["diagnostics_channel"] || modules["node:diagnostics_channel"]);
+  const trace = dc && typeof dc.tracingChannel === "function" ? dc.tracingChannel("module.import") : null;
+  if (!trace || !trace.hasSubscribers) return load();
+  const parentFilename = req && req.__mbun_parent_filename;
+  const parentURL = parentFilename ? "file://" + parentFilename : undefined;
+  return trace.tracePromise(load, { parentURL: parentURL, url: String(spec) });
 };
 // Per-module import.meta: the CJS wrapper injects a local __mbunImportMeta built
 // from the module's own file/dir, so `import.meta.url`/`.dir` are correct inside

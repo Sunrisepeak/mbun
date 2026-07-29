@@ -171,10 +171,12 @@ public:
         std::string js{"globalThis.__dirname = " + json_quote_(dir) + ";\n" +
                        "globalThis.__filename = " + json_quote_(file) + ";\n" +
                        "if (globalThis.Bun) globalThis.Bun.main = " + json_quote_(file) + ";\n" +
-                       "globalThis.module = { exports: {} };\n" +
+                       "globalThis.module = { exports: {}, filename: " + json_quote_(file) + " };\n" +
                        "globalThis.exports = globalThis.module.exports;\n" +
                        "globalThis.require = globalThis.__mbun_make_require(" + json_quote_(dir) +
                        ");\n" +
+                       "Object.defineProperty(globalThis.require, '__mbun_parent_filename', { value: " +
+                       json_quote_(file) + ", configurable: true });\n" +
                        "globalThis.__mbunImportMeta = { url: " + json_quote_("file://" + file) +
                        ", dir: " + json_quote_(dir) + ", dirname: " + json_quote_(dir) +
                        ", path: " + json_quote_(file) + ", filename: " + json_quote_(file) +
