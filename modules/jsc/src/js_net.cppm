@@ -752,7 +752,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
               return;
             }
             if (self.destroyed) { self.connecting = false; return; }
-            self.pending = false; self.connecting = false; self._flush(); self._flushPreConnect(null); self._applyDeferredSockOpts(); self.emit("connect"); self.emit("ready");
+            self.pending = false; self.connecting = false; self._flushPreConnect(null); self._applyDeferredSockOpts(); self.emit("connect"); self.emit("ready");
           };
           G.queueMicrotask(finishConnect);
           return self;
@@ -836,7 +836,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
           return;
         }
         if (this.destroyed) { this.connecting = false; return; }
-        this.pending = false; this.connecting = false; this._flush(); this._flushPreConnect(null); this._applyDeferredSockOpts(); this.emit("connect"); this.emit("ready");
+        this.pending = false; this.connecting = false; this._flushPreConnect(null); this._applyDeferredSockOpts(); this.emit("connect"); this.emit("ready");
       };
       G.queueMicrotask(finishConnect);
       return this;
@@ -1316,10 +1316,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       }
       this._wq.push(b); this._wqLen += b.length; this.bytesWritten += b.length;
       if (this._timeoutMs) this._armTimeout();
-      // Pre-connect writes remain observable in Socket#bufferSize until the
-      // public connect boundary. Flushing them immediately let a synchronous
-      // reactor completion erase the queue before user code could inspect it.
-      if (!this.connecting) this._flush();
+      this._flush();
       // node lib/net.js: a write issued while the socket is still connecting is
       // a *pending* write — its callback fires only once the connection is
       // established, and a destroy() in that window completes it with
@@ -1344,7 +1341,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       if (data != null) this.write(data, enc);
       this._shutW = true; this.writable = false;
       if (typeof cb === "function") this.once("close", cb);
-      if (!this.connecting) this._flush();
+      this._flush();
       return this;
     }
     // Completes the write callbacks that were queued while the socket was still
