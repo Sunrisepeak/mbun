@@ -184,7 +184,7 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
         if (sc < 100 || sc >= 200) { const e = new RangeError("Invalid informational status code: " + obj[":status"]); e.code = "ERR_HTTP2_INVALID_INFO_STATUS"; throw e; }
         obj[":status"] = String(sc);
       }
-      const infoBuilt = buildNgHeaders(obj, assertValidResponsePseudoHeader, strictSingleValueFields);
+      const infoBuilt = buildNgHeaders(obj, assertValidResponsePseudoHeader, strictSingleValueFields, true);
       infoBuilt.prepared = Object.assign({ __proto__: null }, obj);
       if (infoBuilt.prepared[":status"] !== undefined) infoBuilt.prepared[":status"] = parseInt(infoBuilt.prepared[":status"], 10);
       return infoBuilt;
@@ -194,7 +194,7 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
     const status = (obj[":status"] | 0) || 200;
     if (status < 200 || status > 599) { const e = new RangeError("Invalid status code: " + status); e.code = "ERR_HTTP2_STATUS_INVALID"; throw e; }
     obj[":status"] = String(status);
-    const built = buildNgHeaders(obj, assertValidResponsePseudoHeader, strictSingleValueFields);
+    const built = buildNgHeaders(obj, assertValidResponsePseudoHeader, strictSingleValueFields, true);
     // node ServerHttp2Stream#sentHeaders reports the *numeric* status alongside
     // the fields the response actually carried.
     built.prepared = Object.assign({ __proto__: null }, obj, { ":status": status });
@@ -218,7 +218,7 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
     if (statusCode < 200 || statusCode > 599) {
       const e = new RangeError("Invalid status code: " + statusCode); e.code = "ERR_HTTP2_STATUS_INVALID"; throw e;
     }
-    const built = buildNgHeaders(headers, assertValidResponsePseudoHeader, strictSingleValueFields);
+    const built = buildNgHeaders(headers, assertValidResponsePseudoHeader, strictSingleValueFields, true);
     built.rawHeaders = headers;
     built.prepared = rawToHeaderObject(headers);
     return built;
