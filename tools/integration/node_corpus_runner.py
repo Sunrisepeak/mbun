@@ -292,24 +292,52 @@ def main() -> int:
     dispatched = 0
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as executor:
-            futures = []
-            for index, path in enumerate(pending):
-                # Check the budget before *dispatching*, never mid-file: a file
-                # that started must finish and be recorded, otherwise the budget
-                # itself would manufacture phantom timeouts.
-                if deadline is not None and time.monotonic() >= deadline:
+            # Feed the pool in BOUNDED waves rather than submitting everything up
+            # front. submit() returns immediately, so a deadline checked only
+            # before each submit is compared against a clock that has barely
+            # moved: all 4433 futures were queued within milliseconds and
+            # --max-seconds bounded nothing at all on a fresh run. Keeping only
+            # ~2x jobs in flight means the deadline is re-checked as real work
+            # completes, which is what actually bounds the run.
+            #
+            # The budget is still never applied mid-file: a file that has been
+            # dispatched always runs to completion and is recorded, otherwise the
+            # budget itself would manufacture phantom timeouts.
+            queue = iter(list(enumerate(pending)))
+            in_flight: set[concurrent.futures.Future] = set()
+
+            def submit_next() -> bool:
+                item = next(queue, None)
+                if item is None:
+                    return False
+                index, path = item
+                in_flight.add(
+                    executor.submit(run_one, binary, root, output_dir, args.timeout, path,
+                                    index % jobs, corpus_dir))
+                return True
+
+            def out_of_time() -> bool:
+                return deadline is not None and time.monotonic() >= deadline
+
+            while len(in_flight) < jobs * 2 and not out_of_time():
+                if not submit_next():
                     break
-                futures.append(
-                    executor.submit(run_one, binary, root, output_dir, args.timeout, path, index % jobs,
-                                    corpus_dir))
                 dispatched += 1
-            for future in concurrent.futures.as_completed(futures):
-                result = future.result()
-                results.append(result)
-                with journal_lock:
-                    journal.write(row_of(result) + "\n")
-                    journal.flush()
-                    os.fsync(journal.fileno())
+
+            while in_flight:
+                completed, in_flight = concurrent.futures.wait(
+                    in_flight, return_when=concurrent.futures.FIRST_COMPLETED)
+                for future in completed:
+                    result = future.result()
+                    results.append(result)
+                    with journal_lock:
+                        journal.write(row_of(result) + "\n")
+                        journal.flush()
+                        os.fsync(journal.fileno())
+                while len(in_flight) < jobs * 2 and not out_of_time():
+                    if not submit_next():
+                        break
+                    dispatched += 1
     finally:
         journal.close()
 

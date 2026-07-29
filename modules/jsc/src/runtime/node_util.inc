@@ -12,6 +12,13 @@
 // util.parseEnv(new String("FOO=bar"))).
 // Argument validation (including the String-object case) stays on the JS side
 // in the node:util partition, where node's ERR_INVALID_ARG_TYPE shape lives.
+// `expand` is OFF: node's .env reader performs no `${VAR}` / `$VAR`
+// substitution at all, and both corpora pin that — node's
+// test-util-parse-env.js AND bun's vendored copy expect
+// `DOUBLE_QUOTES_WITH_NO_SPACE_BRACKET: '{ port: $MONGOLAB_PORT}'` verbatim.
+// Expansion stays on for `--env-file` / process env loading (engine.inc), which
+// is where bun's loader applies it.
+// The result object has a NULL prototype, as node's parseEnv does.
 JSValueRef dotenv_parse_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                            const JSValueRef args[], JSValueRef*) {
     JsStrArg src{ctx, argc > 0 ? args[0] : nullptr};
@@ -19,8 +26,9 @@ JSValueRef dotenv_parse_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size
     mbun::dotenv::parse_into(map, src.view(),
                              mbun::dotenv::ParseOptions{.override_existing = true,
                                                         .is_process = false,
-                                                        .expand = true});
+                                                        .expand = false});
     JSObjectRef out{JSObjectMake(ctx, nullptr, nullptr)};
+    JSObjectSetPrototype(ctx, out, JSValueMakeNull(ctx));
     for (std::size_t i{0}; i < map.count(); ++i) {
         set_prop(ctx, out, std::string{map.key_at(i)}.c_str(),
                  make_string(ctx, std::string{map.value_at(i)}));

@@ -33,6 +33,19 @@
 // timer stays in the same loop. The timer is REF'D, which is what makes the dump
 // possible at all — a ref'd timer bounds the pump's otherwise 60-second poll()
 // park, so control returns to JS while the hang is still in progress.
+//
+// KNOWN LIMITATION, and it has already produced one wrong conclusion:
+// `require`ing the target means a test that re-execs itself through
+// `process.argv[2]` sees THIS script's argv, not its own. test-http-pipeline-flood
+// throws "Unexpected value: <path>" for exactly that reason. A missing dump is
+// therefore ambiguous — it can mean the pump is blocked in native code, OR it can
+// mean the target never ran. Do not read "no dump" as "crash": a crashing process
+// exits on a signal and never reaches the harness timeout kill, so a crash and a
+// 124 are mutually exclusive. An earlier inventory entry claimed two http files
+// died in native WTFCrashWithInfo on this evidence; measuring all 49 http
+// timeouts found every one exiting 124 with no crash text in any log, and the
+// entry was deleted. When a dump is missing, check the exit code and grep the log
+// for crash text before naming a cause.
 const target = process.argv[2];
 const ms = +(process.argv[3] || 8000);
 

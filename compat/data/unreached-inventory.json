@@ -1,0 +1,530 @@
+{
+ "purpose": "Per-file named causes for corpus files that are NOT passing. Exists to remove the ~35min triage phase that every wave-2 agent paid independently and then threw away. A brief MUST draw its worklist from here rather than asking an agent to re-triage. Entries are what the agent that filed them measured; a stale entry is a bug -- re-derive before budgeting.",
+ "provenance": "wave-2 agents w2/agent-1 (tls), w2/agent-2 (http), w2/agent-3 (fs), round 10; tls per-file causes extracted from the r10-j6 full run logs at integration (155 non-pass tls/https: 119 fail, 19 timeout, 17 self-skip); http/http2 per-file causes extracted the same way (165 'fail' files)",
+ "how_to_use": "Group by `cause`, count files per cause, budget mechanisms x 10min + 55min overhead. Do NOT budget by subsystem -- see compat/README.md 'Allocate agents by cause family, not by subsystem'.",
+ "caveat": "Coverage is uneven: the fs inventory is per-file and complete (58 files); tls and http are recorded at cause-shape granularity because that is the level their agents reported. Filling the tls/http per-file rows is itself a cheap, high-leverage task.",
+ "causes": {
+  "platform-impossible": {
+   "corpus": "node",
+   "subsystem": "fs",
+   "files": [
+    "test-fs-lchmod",
+    "test-fs-readdir-buffer",
+    "test-fs-long-path",
+    "test-fs-readdir-pipe",
+    "test-fs-readfilesync-enoent",
+    "test-fs-realpath-on-substed-drive",
+    "test-fs-write-file-invalid-path",
+    "test-fs-stat-temporal"
+   ],
+   "note": "macOS-only, Windows-only, or needs JSC Temporal. Already classified `skipped`. NOT reachable -- exclude from every target.",
+   "action": "none"
+  },
+  "filehandle-lock-ref-protocol": {
+   "corpus": "node",
+   "subsystem": "fs",
+   "files": [
+    "test-fs-promises-file-handle-pull",
+    "test-fs-promises-file-handle-pullsync",
+    "test-fs-promises-file-handle-writer",
+    "test-fs-promises-file-handle-aggregate-errors",
+    "test-fs-promises-file-handle-close-errors",
+    "test-fs-promises-file-handle-op-errors"
+   ],
+   "note": "kLocked/kCloseSync/kClosePromise absent; fh.pull/pullSync/writer missing; no close-error propagation ('Missing expected rejection'). ~570 lines of node's fs.promises.ts.",
+   "action": "densest single remaining fs mechanism -- one dedicated round"
+  },
+  "fs-watch": {
+   "corpus": "node",
+   "subsystem": "fs",
+   "status": "RESOLVED by w3/agent-3 (+7 of 8)",
+   "CORRECTION": "The mechanism this entry used to name -- 'a watcher registers as a pollable but holds no fd, so the drain's stall clock never advances' -- was a MANIFESTATION, not a cause, and not one shared mechanism. Measured: the three hangs had three unrelated semantic causes. recursive:'1' was not validated, so a persistent watcher that should never have existed pinned the loop. decodeName ignored every encoding but 'buffer', so the hex watcher never recognised its own filename and its done never fired. The recursive-promise async iterator had to REJECT with ABORT_ERR rather than end cleanly. Nothing in the event loop was touched. I recorded the manifestation as a cause because I inherited the phrasing from an agent report without testing it -- the fifth instance of this error class in this project and the first one I put into the inventory myself.",
+   "remaining": {
+    "test-fs-watchfile-bigint": "mbun loads node's REAL internal/fs/utils, so deepStrictEqual fails on PROTOTYPE IDENTITY before comparing keys -- NOT the '4 Date properties' this entry previously claimed. Needs mbun's stats built by node's own Stats/BigIntStats; architectural, adjacent to fs-not-routed-through-internalBinding. Changing only the constructor would desynchronise statSync from new Stats() and risk green test-fs-stat-* files."
+   }
+  },
+  "realpath-js-resolver": {
+   "corpus": "node",
+   "subsystem": "fs",
+   "status": "RESOLVED by w3/agent-3 (+2 of 2)",
+   "CORRECTION": "This entry said 3 files. It is 2. test-fs-realpath-native requires cwd == the node checkout root while the corpus runner uses cwd = repo root, so it is a HARNESS cause, not an fs one. Before the fix it appeared to resolve because weakly_canonical invents non-existent path tails; it now honestly throws ENOENT. Fixing it means changing the shared runner's cwd, which moves numbers for every agent at once."
+  },
+  "fs-not-routed-through-internalBinding": {
+   "corpus": "node",
+   "subsystem": "fs",
+   "files": [
+    "test-fs-readdir-types",
+    "test-fs-sync-fd-leak"
+   ],
+   "note": "internalBinding('fs') EXISTS but mbun's fs does not call through it, so tests that monkey-patch binding.readdir / binding.writeFileUtf8 (and count exactly 2 calls) see nothing.",
+   "action": "architectural: routing fs through the binding is a prerequisite for any test that patches it"
+  },
+  "node-test-subtest-failures": {
+   "corpus": "node",
+   "subsystem": "fs",
+   "files": [
+    "test-fs-append-file-flush",
+    "test-fs-write-file-flush",
+    "test-fs-glob",
+    "test-fs-stat-abort-test",
+    "test-fs-write-file-sync"
+   ],
+   "note": "node:test based; failure is inside a subtest. flush pair needs validateBoolean(options.flush) + a real fsyncSync visible to t.mock.method. test-fs-glob alone is 243/448 subtests failing -- a glob round of its own.",
+   "action": "split: the flush pair is cheap, glob is not"
+  },
+  "fs-one-off": {
+   "corpus": "node",
+   "subsystem": "fs",
+   "files_with_causes": {
+    "test-fs-access": "line 118 mustNotCall fired -- a W_OK case the euid/egid stat triad still gets wrong; no supplementary groups",
+    "test-fs-error-messages": "needs `fstat` in the syscall slot",
+    "test-fs-existssync-memleak-longpath": "queryObjects absent",
+    "test-fs-truncate": "native fsn_truncate_cb maps every non-ENOENT/EISDIR errno to EACCES/open, so EINVAL/EFBIG surface wrong",
+    "test-fs-utimes": "lutimes still follows the symlink -- needs utimensat with AT_SYMLINK_NOFOLLOW",
+    "test-fs-whatwg-url": "ADVANCED past the old failure; now needs ERR_INVALID_FILE_URL_PATH for %2f",
+    "test-fs-write-buffer-large": "Buffer.allocUnsafe caps at 2**31-1 with name 'size'; node's kMaxLength is larger",
+    "test-fs-writesync-crash": "fs errors must set errno by plain assignment so a poisoned Object.prototype setter throws",
+    "test-fs-readdir-ucs2": "lone-surrogate filenames need raw-byte path handling",
+    "test-fs-readdir-stack-overflow": "JSC's RangeError text has a trailing period node's does not",
+    "test-fs-cp-async-file-url": "resolves fixtures against cwd -- an import.meta.url/__dirname bug",
+    "test-fs-readfile": "now only the AbortSignal validation: {signal:'hello'} must throw ERR_INVALID_ARG_TYPE",
+    "test-fs-write-file": "AbortSignal rejects with TypeError, must be AbortError",
+    "test-fs-glob-throw": "a throwing glob callback is not routed to uncaughtException",
+    "test-fs-buffer": "intermittent SIGSEGV in JSC JSRopeString::view under memory pressure -- issue #16, NOT an fs bug"
+   },
+   "action": "each is 1 file; only worth batching, never worth a dedicated agent"
+  },
+  "http-timeout-shape-A-server-outlives-dead-client": {
+   "corpus": "node",
+   "subsystem": "http",
+   "file_count": 10,
+   "signature": "Server{listening} + zero sockets; server.close() sits in a client callback that never fired",
+   "note": "NOT an event-loop bug. The client flow died; node would also hold the loop here. Fix the client-side flow, not the loop.",
+   "action": "one mechanism, highest file count in http",
+   "RESIZED": "Shape A is 10 files by DUMP SIGNATURE but only 5 by cause, and 5 of those 5 are now fixed (w3/agent-2). The other 5 share the signature, not the mechanism: 2 need --expose-gc/FinalizationRegistry (test-http-client-leaky-with-double-response, test-http-server-keepalive-req-gc), 2 are the destroySoon bug, 1 is cluster-layer. Budget a dump signature at its CAUSE count, never at its signature count.",
+   "status": "5 of 5 converted by w3/agent-2"
+  },
+  "http-timeout-shape-B-stalled-exchange": {
+   "corpus": "node",
+   "subsystem": "http",
+   "file_count": 4,
+   "signature": "Server{listening} + live socket pair, _wq=0, no ref'd timer",
+   "note": "genuinely mid-flight; protocol-semantics gap",
+   "action": "per-file"
+  },
+  "http-timeout-shape-C-sockets-outlive-server": {
+   "corpus": "node",
+   "subsystem": "http",
+   "file_count": 3,
+   "signature": "server closed, sockets still held",
+   "action": "one mechanism"
+  },
+  "tls-pkcs12": {
+   "corpus": "node",
+   "subsystem": "tls",
+   "file_count": 4,
+   "note": "CORRECTED LEAD: briefed as an OpenSSL legacy-provider search-path fix. Reality: only a no-op `loadPKCS12() {}` stub exists and there is no d2i_PKCS12 call anywhere. The work is 'write PKCS#12 parsing, then load the provider'.",
+   "action": "do NOT budget as a config fix; grep d2i_PKCS12 first"
+  },
+  "tls-version-and-ciphersuites": {
+   "corpus": "node",
+   "subsystem": "tls",
+   "note": "CORRECTED LEAD: briefed as '@SECLEVEL=0 is never forwarded'. It IS forwarded, to SSL_CTX_set_cipher_list. Remaining gap is narrower: SSL_CTX_set_ciphersuites (TLS 1.3 suites use a different setter) plus --tls-min-v1.x last-flag-wins.",
+   "action": "re-derive the file count from the narrower gap before budgeting"
+  },
+  "tls-connect-duplex-transport-unimplemented": {
+   "corpus": "node",
+   "subsystem": "tls",
+   "files": [
+    "test-tls-connect-stream-writes.js",
+    "test-tls-destroy-whilst-write.js",
+    "test-tls-error-servername.js",
+    "test-tls-generic-stream.js",
+    "test-tls-js-stream.js",
+    "test-tls-streamwrap-buffersize.js"
+   ],
+   "cause": "mbun throws its own explicit error: 'tls.connect (Duplex socket transport) requires the socket event loop + real SSL_CTX handshake (DEFERRED)'. tls.connect over a caller-supplied Duplex/`socket:` option is simply not implemented.",
+   "confidence": "CAUSE named -- mbun says so itself",
+   "action": "architectural; a known-unimplemented path, not a bug hunt",
+   "file_count": 7,
+   "CORRECTION": "test-tls-socket-snicallback-without-server belongs here, not in tls-mustcall-never-fired -- it drives a TLSSocket over stream.duplexPair(). 7 files, not 6."
+  },
+  "tls-protocol-method-validation": {
+   "corpus": "node",
+   "subsystem": "tls",
+   "files": [
+    "test-tls-cli-max-version-1.2.js",
+    "test-tls-cli-max-version-1.3.js",
+    "test-tls-cli-min-version-1.1.js",
+    "test-tls-cli-min-version-1.2.js",
+    "test-tls-cli-min-version-1.3.js",
+    "test-tls-min-max-version.js"
+   ],
+   "cause": "SSLv2_method/SSLv3_method and friends must be rejected with ERR_TLS_INVALID_PROTOCOL_METHOD.",
+   "confidence": "CAUSE named",
+   "action": "pure validation; cheap",
+   "STATUS": "RESOLVED by w4/agent-tls (6 of 6)",
+   "CORRECTION": "My named cause was stale. SSLv2_method/SSLv3_method -> ERR_TLS_INVALID_PROTOCOL_METHOD ALREADY WORKED; those subcases were passing in the logs. The real blockers were (a) secureProtocol version-window semantics -- node does not pass min=max=0 to SecureContext::Init; common.js always passes toV(minVersion, DEFAULT_MIN) and crypto_context.cc adjusts per method, so SSLv23_method lowers only the CEILING to TLS 1.2 and keeps the default floor -- and (b) --tls-min-v1.x is NOT last-flag-wins: lib/tls.js is a fixed if/else chain, so the WIDEST flag wins wherever it sits. I had briefed last-flag-wins explicitly and that was wrong. Also the cluster is 6-for-1: five of the six are 4-line wrappers that require('./test-tls-min-max-version.js'). Size right, cause wrong."
+  },
+  "tls-mustcall-never-fired": {
+   "corpus": "node",
+   "subsystem": "tls",
+   "files": [
+    "test-https-agent-keylog.js",
+    "test-https-server-close-idle.js",
+    "test-https-server-connections-checking-leak.js",
+    "test-tls-client-reject-12.js",
+    "test-tls-client-reject.js",
+    "test-tls-keylog-tlsv13.js",
+    "test-tls-over-http-tunnel.js",
+    "test-tls-secure-context-usage-order.js",
+    "test-tls-socket-snicallback-without-server.js",
+    "test-tls-starttls-server.js"
+   ],
+   "cause": "node's common.mustCall reports 'Expected exactly N, actual 0' at exit: an expected event never fired. SAME CLASS as http-timeout-shape-A (a dead flow), but here the process exits rather than hanging. The specific missing event differs per file and must be read from the log's stack (e.g. test-https-agent-keylog wants a 'keylog' event 10x).",
+   "confidence": "CLASS named, per-file event NOT yet named",
+   "action": "read the named event out of each log before budgeting"
+  },
+  "tls-value-divergence-UNSPLIT": {
+   "corpus": "node",
+   "subsystem": "tls",
+   "files_sample": [
+    "test-tls-buffersize",
+    "test-tls-client-destroy-soon",
+    "test-tls-pause",
+    "test-https-drain",
+    "test-https-max-headers-count"
+   ],
+   "file_count_approx": 17,
+   "cause": "NOT A CAUSE -- this is the residue of the 'strictly equal' bucket whose actual/expected pair is a bare number or boolean (`5 !== 3`, `false !== true`), which identifies nothing on its own. Recorded as explicitly unsplit so nobody mistakes it for a mechanism. Calling a manifestation a cause has cost this project three separate rounds.",
+   "confidence": "MANIFESTATION ONLY -- do not budget as one family",
+   "action": "split per file by reading the assertion's surrounding test intent; do not hand this bucket to an agent whole"
+  },
+  "tls-small-clusters": {
+   "corpus": "node",
+   "subsystem": "tls",
+   "clusters": {
+    "address-family-selection (2)": [
+     "test-https-connect-address-family",
+     "test-tls-connect-address-family"
+    ],
+    "sni-callback-result-null (2)": [
+     "test-tls-sni-option",
+     "test-tls-sni-server-client"
+    ],
+    "session-ticket (2)": [
+     "test-tls-ticket",
+     "test-tls-ticket-12"
+    ],
+    "version-string-TLSv1.1-vs-TLSv1 (1)": [
+     "test-tls-cli-min-version-1.0"
+    ],
+    "ALPNCallback-undefined (1)": [
+     "test-https-argument-of-creating"
+    ],
+    "cipher-list-empty-vs-undefined (1)": [
+     "test-tls-cipher-list"
+    ],
+    "handshake-alert-failure (5)": "first error is `ssl: error:...:SSL routines::sslv3 alert handshake failure`",
+    "no-cipher-match (2)": "first error is `Error: No cipher match`"
+   },
+   "confidence": "each pair/triple is a plausible single mechanism; unverified",
+   "action": "batch only"
+  },
+  "tls-timeout-shape-B-stalled-exchange": {
+   "corpus": "node",
+   "subsystem": "tls",
+   "file_count": 12,
+   "files": [
+    "test-https-agent-abort-controller",
+    "test-tls-client-renegotiation-13",
+    "test-tls-connect-abort-controller",
+    "test-tls-delayed-attach-error",
+    "test-tls-delayed-attach",
+    "test-tls-destroy-stream-12",
+    "test-tls-destroy-stream",
+    "test-tls-inception",
+    "test-tls-interleave",
+    "test-tls-psk-alpn-callback-exception-handling",
+    "test-tls-retain-handle-no-abort",
+    "test-tls-socket-failed-handshake-emits-error"
+   ],
+   "signature": "Uniform across all 12: NET.pending=0, handles=3, items=3 -- one listening Server plus the client/server socket pair, and BOTH sockets readable=true writable=true destroyed=false _paused=false _wq=0. Nothing queued, nothing paused, both ends open and idle.",
+   "cause": "A genuinely stalled exchange: each side is waiting for bytes the other will never send. NOT an event-loop bug -- node would hold the loop here identically. This is the fifth independent confirmation that hangs in this project are protocol-semantics gaps rather than handle-lifetime bugs.",
+   "hypothesis_i_checked_and_REFUTED": "I read NET.pending=0 as 'no fd is in the poll set, so arriving bytes never wake the loop', which would have made all 12 one bug. js_net.cppm:138 says pending counts bounded in-flight operations (e.g. a fetch awaiting its response), NOT poll-set membership. What holds the loop is _held/_loopOpen, both true here. pending=0 is normal. Do not brief an agent on the poll-set theory.",
+   "confidence": "CLASS named and uniform; NOT a single mechanism",
+   "action": "largest tls block. Budget per file or per small group, not as one sweep -- and note it is dominated by abort/destroy/attach-timing cases, which suggests the shared theme is teardown DURING handshake rather than steady-state transfer"
+  },
+  "tls-timeout-shape-A-dead-client-flow": {
+   "corpus": "node",
+   "subsystem": "tls",
+   "file_count": 5,
+   "files": [
+    "test-https-client-resume",
+    "test-https-keep-alive-drop-requests",
+    "test-tls-add-context",
+    "test-tls-async-cb-after-socket-end",
+    "test-tls-secure-session"
+   ],
+   "signature": "Server listening, ZERO live sockets",
+   "cause": "Client flow died; server.close() sits in a callback that never fired. Same shape as http-timeout-shape-A (10 files) -- fix the client flow, not the loop.",
+   "confidence": "CLASS named",
+   "action": "share a mechanism with the http shape-A block; consider one agent for both (15 files total)"
+  },
+  "tls-timeout-shape-D-native-block": {
+   "corpus": "node",
+   "subsystem": "tls",
+   "file_count": 2,
+   "files": [
+    "test-tls-fast-writing",
+    "test-tls-handshake-exception"
+   ],
+   "signature": "hang_dump.js produces NO dump at all (rc=124) even with a ref'd timer bounding the pump's poll park",
+   "cause": "The pump is blocked inside native code and JS never regains control. Most severe shape: a JS-level fix cannot reach it.",
+   "confidence": "CLASS named, native frame NOT yet identified",
+   "action": "attach gdb or use modules/crash_handler; identify the blocking native call before budgeting"
+  },
+  "verify-error-code-mapping-CROSS-SUBSYSTEM": {
+   "corpus": "node",
+   "subsystem": "tls + http2 (cross-subsystem)",
+   "files": [
+    "test-https-simple.js",
+    "test-tls-client-auth.js",
+    "test-tls-friendly-error-message.js",
+    "test-tls-set-default-ca-certificates-append-https-request.js",
+    "test-tls-set-default-ca-certificates-reset-https-request.js",
+    "test-tls-socket-default-options.js",
+    "test-http2-create-client-secure-session",
+    "test-http2-https-fallback",
+    "test-http2-serve-file"
+   ],
+   "cause": "mbun surfaces OpenSSL verify code 20 (UNABLE_TO_GET_ISSUER_CERT_LOCALLY, 'issuer not found locally') where node surfaces 21 (UNABLE_TO_VERIFY_LEAF_SIGNATURE, 'chain has one non-self-signed cert'). One file surfaces null instead of any code. The two codes differ by how a one-cert chain is treated, so this is chain-depth / X509_STORE flag handling, not a trust-store contents problem.",
+   "confidence": "CAUSE named -- the actual/expected pair identifies it uniquely",
+   "action": "BEST cluster currently known: 9 files, one mechanism, and it is a correctness fix (chain verification), not a workaround",
+   "file_count": 9,
+   "cross_subsystem_note": "Found separately in two subsystems and only recognised as one cause when the http logs were parsed the same way as the tls logs. tls shows it as 'UNABLE_TO_GET_ISSUER_CERT_LOCALLY vs UNABLE_TO_VERIFY_LEAF_SIGNATURE'; http2 shows it as the plain message 'unable to get local issuer certificate'. Same OpenSSL verify path. This is exactly what cluster_finder.py's cross-subsystem ranking exists to catch, and a per-subsystem brief would have split it and under-budgeted both halves.",
+   "status_after_fix": {
+    "fixed_in": "modules/tls/src/openssl.cpp -- report OpenSSL's FINAL verdict for code 20 by reproducing build_chain()'s rule locally",
+    "converted": [
+     "test-https-simple",
+     "test-tls-friendly-error-message",
+     "test-https-agent-create-connection (not predicted)",
+     "test-tls-set-default-ca-certificates-append-https-request (w4)",
+     "test-tls-set-default-ca-certificates-reset-https-request (w4)"
+    ],
+    "still_failing_with_reasons": {
+     "test-tls-client-auth": "DISCRIMINATING test: line 188 expects code 21 AND line 223 expects code 20 in different subcases. The 21-expecting subcase still reports 20 -- neither the client stack path nor the server SSL_get1_peer_certificate path yields a leaf there. Needs the always-continue-verification approach, which was deliberately NOT taken (see below).",
+     "test-tls-set-default-ca-certificates-append-https-request": "ADVANCED -- now correctly reports UNABLE_TO_VERIFY_LEAF_SIGNATURE. Its real failure is separate: 'Should not error with correct CA added', i.e. an appended default CA does not take effect.",
+     "test-tls-set-default-ca-certificates-reset-https-request": "same family as the append case: default-CA mutation not taking effect",
+     "test-tls-socket-default-options": "ADVANCED then stalled: fail -> timeout, reproducible 3/3. hang_dump shows 5 listening Servers + TLSSockets, all readable/writable, _wq=0 -- an exact match for tls-timeout-shape-B. It now runs further before stopping, so it joined the stalled-exchange class.",
+     "test-http2-create-client-secure-session": "code now correct; fails on its own http2 secure-session logic",
+     "test-http2-https-fallback": "code now correct ('unable to verify the first certificate'); fails later",
+     "test-http2-serve-file": "code now correct; fails later"
+    },
+    "why_the_fuller_fix_was_declined": "node gets the right code by letting verification run to completion (VerifyCallback returns 1 unconditionally) and checking SSL_get_verify_result() afterwards. mbun passes nullptr to SSL_CTX_set_verify, so OpenSSL's abort IS the enforcement of rejectUnauthorized. Switching to an always-continue callback moves that gate out of OpenSSL into the JS layer, and proving the JS gate airtight on every path (server-side client-cert auth, SNI contexts, session resumption) is a much larger audit whose failure mode is a SILENT VERIFICATION BYPASS. Anyone taking that on must treat it as a security change with its own review, not as a corpus fix.",
+    "measured": "guard 681 files (all tls/https/http2/crypto): 0 green->non-green, +3, 1 fail->timeout characterised above"
+   }
+  },
+  "missing-internalBinding-stream_pipe": {
+   "corpus": "node",
+   "subsystem": "http2",
+   "file_count": 3,
+   "files": [
+    "test-http2-invalid-last-stream-id",
+    "test-http2-options-max-headers-exceeds-nghttp2",
+    "test-http2-server-sessionerror"
+   ],
+   "cause": "internalBinding('stream_pipe') is not registered in node_internal_binding.cppm, so the require throws before the test body runs.",
+   "confidence": "CAUSE named",
+   "LAYER_NOT_CAUSE_WARNING": "A missing binding is a LAYER, not a cause. Measured precedent: clearing the internalBinding layer on 35 files converted 3 and merely transferred the rest to other failure families. Budget this as ENABLING INFRASTRUCTURE with a DIAGNOSIS target ('what do these 3 files fail on once the binding exists'), never as a conversion target of 3.",
+   "action": "cheap to add; expect the files to move to a new cause rather than to pass"
+  },
+  "http-mustcall-never-fired": {
+   "corpus": "node",
+   "subsystem": "http + http2",
+   "file_count": 29,
+   "cause": "node's common.mustCall reports 'Expected exactly/at least N, actual M' at exit: an expected event never fired. Largest http block. Same class as tls-mustcall-never-fired (10) and as http-timeout-shape-A -- the difference is only whether the process exits or hangs.",
+   "confidence": "CLASS named, per-file event NOT named",
+   "action": "the combined mustCall/dead-flow class now spans 29 http + 10 tls + 15 timeout-shape-A files. Before budgeting, name the missing event per file from the log stack; do NOT hand the class to an agent whole"
+  },
+  "http-mustnotcall-fired": {
+   "corpus": "node",
+   "subsystem": "http + http2",
+   "file_count": 9,
+   "cause": "'function should not have been called' -- mustNotCall fired. The INVERSE of the block above: an event that should not have happened did. Distinct class, and a sign mbun emits an event node does not (or emits it twice).",
+   "confidence": "CLASS named",
+   "action": "separate from mustCall; these often indicate a double-emit"
+  },
+  "http2-nghttp2-error-code-mapping": {
+   "corpus": "node",
+   "subsystem": "http2",
+   "file_count": 6,
+   "examples": [
+    "test-http2-respond-errors",
+    "test-http2-trailers",
+    "test-http2-server-http1-client",
+    "test-http2-session-cleanup-on-nghttp2-goaway",
+    "test-http2-cancel-while-client-reading",
+    "test-http2-server-rst-stream"
+   ],
+   "cause": "Wrong ERR_HTTP2_* code surfaced (expected ERR_HTTP2_INVALID_STREAM / ERR_HTTP2_ERROR, got something else), plus two files where a NGHTTP2_CANCEL stream error escapes as an Error instead of the coded form.",
+   "confidence": "CAUSE named (code mapping)",
+   "action": "mechanical error-code mapping; cheap batch"
+  },
+  "http-value-divergence-UNSPLIT": {
+   "corpus": "node",
+   "subsystem": "http + http2",
+   "file_count_approx": 17,
+   "cause": "NOT A CAUSE. Residue whose actual/expected pair is a bare number or boolean. Recorded explicitly so it is not mistaken for a mechanism -- same trap as tls-value-divergence-UNSPLIT.",
+   "confidence": "MANIFESTATION ONLY",
+   "action": "split per file; never budget whole"
+  },
+  "native-entry-points-gated-only-in-the-js-shim": {
+   "corpus": "n/a",
+   "subsystem": "security",
+   "cause": "A --permission check placed in the JS shim rather than at the native boundary. Verified on the pre-fix binary: fs.watch('/etc') was correctly DENIED, but the raw globalThis.__mbunWatchNative.start('/etc') returned a watch descriptor. Every test that went through fs.watch therefore made the runtime look correctly gated.",
+   "why_it_is_a_class_not_an_incident": "__mbunWatchNative is reachable on globalThis, so the shim is not a boundary. Any other __mbun*Native global whose check lives only in its JS wrapper has the same hole. AUDIT ACTION: enumerate every __mbun*Native global and probe each raw method under --permission, not through its public wrapper.",
+   "action": "standing audit item; the fs.watch instance is fixed and independently re-verified"
+  },
+  "http-timeout-shape-D-DELETED-DID-NOT-EXIST": {
+   "corpus": "node",
+   "subsystem": "http",
+   "file_count": 0,
+   "cause": "DELETED. This entry claimed 2 http files died in native WTFCrashWithInfo. Measured: all 49 remaining test-http* timeouts exit 124 (the harness timeout kill) and NOT ONE of their logs contains WTFCrash/SIGSEGV/SIGABRT/Segmentation text. The reasoning that settles it: a crashing process exits on a signal, so it never reaches the timeout kill at all -- a crash and a 124 are mutually exclusive classifications.",
+   "how_the_error_got_in": "A wave-2 agent reported 'no dump / native WTFCrashWithInfo (2)' and I recorded it as a cause without checking. 'hang_dump produced no dump' is not evidence of a crash; for http it turned out one of the two was hang_dump's own limitation (see below). This is the manifestation-as-cause error again, propagated by me from an agent report -- the same way the fs-watch entry went wrong.",
+   "action": "none -- do not budget"
+  },
+  "http-destroySoon-is-immediate-destroy": {
+   "corpus": "node",
+   "subsystem": "http",
+   "file_count": 2,
+   "files": [
+    "test-http-keep-alive-drop-requests",
+    "test-https-keep-alive-drop-requests"
+   ],
+   "cause": "Socket.destroySoon() is implemented as an immediate destroy(). Response 1 carries maxRequestsOnConnectionReached -> res._last -> destroySoon(), which closes the fd synchronously inside onHead, so the pipelined request 2 is never dispatched and dropRequest never fires. node's destroySoon is end() followed by destroy on 'finish'.",
+   "confidence": "CAUSE named",
+   "action": "2 files, one fix",
+   "STATUS": "RESOLVED by w4/agent-http (2 of 2)",
+   "CORRECTION": "My named cause was WRONG. res._last is NOT set by maxRequestsOnConnectionReached -- node's _storeHeader writes 'Connection: close' in that branch without touching _last, and mbun matches, so resOnFinish never called destroySoon() in these files at all. The real cause: the parser rejected the stray CRLF the test writes between pipelined requests (socket.write('\\r\\n\\r\\n')), so request 2 became a 400 that destroyed the connection. llhttp's s_start_req swallows leading CR/LF per RFC 9112 2.2. destroySoon WAS an immediate destroy() and that was fixed too, but it was not what these files needed."
+  },
+  "http-client-connect-ignores-options-signal": {
+   "corpus": "node",
+   "subsystem": "http",
+   "file_count": 2,
+   "files": [
+    "test-http-agent-abort-controller",
+    "test-https-agent-abort-controller"
+   ],
+   "cause": "options.signal is honoured only by Server.listen (js_net.cppm:849); Socket.prototype.connect has no equivalent, so an aborted signal never produces the AbortError on the socket.",
+   "caveat": "The test asserts listenerCount(signal,'abort') === 1 SYNCHRONOUSLY, which node's own nextTick registration appears not to satisfy -- verify against real node before budgeting.",
+   "confidence": "CAUSE named",
+   "action": "2 files",
+   "STATUS": "RESOLVED by w4/agent-http (2 of 2)",
+   "CORRECTION": "My caveat -- 'the test asserts listenerCount(signal,\"abort\") === 1 synchronously, which node's own nextTick registration appears not to satisfy' -- was WRONG, and was refuted the right way: the agent RAN the test against real node v24.15.0 and it passes. The mbun gap was two-part: Socket#connect ignored `signal`, AND events.listenerCount() could not see EventTarget listeners (mbun's AbortSignal keeps them in _l)."
+  },
+  "http-server-socket-error-listener-is-a-noop": {
+   "corpus": "node",
+   "subsystem": "http",
+   "files": [
+    "test-http-header-badrequest",
+    "test-http-socket-error-listeners"
+   ],
+   "cause": "The server connection's 'error' listener is a noop (js_net.cppm:3068) instead of node's socketOnError, so a user's res.socket.emit('error', ...) is swallowed and the response is never torn down. Related: the parser is not re-armed after a clientError the server claimed, so only the first invalid byte errors where one test needs 21.",
+   "confidence": "CAUSE named",
+   "action": "Cheap but WIDE: routing all server-socket errors through socketOnError makes every ECONNRESET emit 'clientError', which is what node does. Guard broadly.",
+   "STATUS": "RESOLVED by w4/agent-http (2 of 2)",
+   "CORRECTION": "Sized right, but the fix is wider and sharper than described. Routing through socketOnError alone is not enough: the parser must be re-armed after a clientError the server CLAIMED (gate on 'claimed' or the 3 files that depend on single-report behaviour break), and the 'ignore further errors' self-removal must keep a permanent noop underneath -- without it, an https TLSSocket occupies the last 'error' slot and a later write-after-end throws. The agent caught that as a real regression in its own guard and fixed it."
+  },
+  "http-misc-named": {
+   "corpus": "node",
+   "subsystem": "http",
+   "files_with_causes": {
+    "test-http-no-read-no-dump": "socket 'pause'/'resume' events are not emitted for read-flow backpressure; _paused exists but is not observable",
+    "test-http-outgoing-message-capture-rejection": "ServerResponse does not honour events.captureRejections -- no Symbol.for('nodejs.rejection') handler",
+    "test-http-upgrade-server-with-body-error.mjs": "UpgradeStream not implemented; node emits 'upgrade' before a pending body arrives and wraps the socket to withhold tunnel bytes (documented in the handover() comment)",
+    "test-http-client-leaky-with-double-response": "needs --expose-gc / real globalThis.gc({type:'major'}) + onGC finalization",
+    "test-http-server-keepalive-req-gc": "same GC requirement",
+    "test-http-server-drop-connections-in-cluster": "cluster worker never reaches its mustCall -- cluster layer, not http",
+    "test-http-incoming-pipelined-socket-destroy": "still shape A after the fix: needs res.destroy()/req.socket.destroy() mid-pipeline to fire requestDone for all 13 seeds",
+    "test-http-pipeline-flood": "needs read-flood prevention (socket._paused suppressing further 'data' once the write buffer fills). NOT a crash."
+   },
+   "confidence": "CAUSE named per file",
+   "action": "batch; each is 1 file"
+  },
+  "tls-session-and-ticket-support-ABSENT": {
+   "corpus": "node",
+   "subsystem": "tls + https",
+   "file_count": 8,
+   "files": [
+    "test-tls-ticket",
+    "test-tls-ticket-12",
+    "test-tls-ticket-cluster",
+    "test-tls-client-resume",
+    "test-tls-client-resume-12",
+    "test-https-client-resume",
+    "test-tls-secure-session",
+    "test-https-agent-session-injection"
+   ],
+   "also_the_last_blocker_in": [
+    "test-tls-client-reject",
+    "test-tls-client-reject-12"
+   ],
+   "cause": "TLS session resumption is entirely absent, not partially wrong. js_tls_live.cppm:533 `getSession() { return undefined; }`, :562 `setSession() { return this; }`, and js_https_live.cppm:24 states outright that the reactor never emits 'session'. One mechanism covers all of it: SSL_CTX_sess_set_new_cb + session serialisation + the 'session' event + the `session:` connect option.",
+   "confidence": "CAUSE named",
+   "provenance": "Found by w4/agent-tls, which called it the densest lead it saw. The inventory did NOT have this cluster at all -- its 8 files sat split across three other buckets, so every previous brief under-budgeted all three. A cause that spans buckets is invisible to per-bucket ranking.",
+   "action": "brief as its own agent"
+  },
+  "ipv6-listen-not-implemented-NET-LAYER": {
+   "corpus": "node",
+   "subsystem": "net (blocks tls/https/http)",
+   "cause": "net_parse_addr (modules/jsc/src/runtime/net.inc:45) only ever builds a sockaddr_in and MAPS '::' and '::1' onto IPv4 ANY/loopback, so listen(0, '::1') silently binds IPv4. Blocks test-tls-connect-address-family and test-https-connect-address-family, and almost certainly several test-net-* files.",
+   "confidence": "CAUSE named",
+   "action": "NOT a TLS bug -- do not budget it to a tls agent. Needs a net-layer round that measures its own reach first."
+  },
+  "http2-timeout-shapes": {
+   "corpus": "node",
+   "subsystem": "http2",
+   "file_count": 26,
+   "histogram": {
+    "B stalled exchange": 18,
+    "B' stalled + the test's own ref'd timer": 1,
+    "A server outlives dead client": 3,
+    "D no dump / native block": 3,
+    "MISCLASSIFIED not a timeout": 1
+   },
+   "cause": "Triaged with hang_dump.js at 8s against the frozen baseline. B: Server{listening} plus live socket pair(s), nothing destroyed, _wq=0, and NO TIMERS AT ALL. Same headline as tls and http1: 25 of 26 are not event-loop bugs. 8 of the 26 are already converted.",
+   "the_D_bucket_keeps_dissolving": "reset-flood was filed as a native block and was nothing of the kind -- the server was accepting a malformed HEADERS block instead of rejecting it, so the flood never terminated. That is the THIRD time a 'native crash/block' claim has dissolved under measurement (http shape-D never existed; one tls 'no dump' was hang_dump's own re-exec limitation). Treat 'no dump' as UNKNOWN, never as 'native'.",
+   "misclassified": "client-socket-destroy exits 1, not 124: client[kSocket] is undefined because the kSocket prototype property is installed by adoptNodeHttp2Internals(), gated on internalBinding('http2') having been requested",
+   "action": "the remaining 2 genuine native blocks are respond-file-with-pipe and respond-file-error-pipe-offset"
+  },
+  "http2-flow-control-TRAP": {
+   "corpus": "node",
+   "subsystem": "http2",
+   "file_count": 2,
+   "files": [
+    "test-http2-misbehaving-flow-control",
+    "test-http2-misbehaving-flow-control-paused"
+   ],
+   "cause": "the server never enforces its LOCAL receive window",
+   "DO_NOT_BUDGET_AS_CHEAP": "mbun's own http2 CLIENT does not respect the peer's send window either (js_http2.cppm:1686 says outright 'we do not throttle our own sends beyond max frame size'). Adding the server-side check first would kill same-runtime transfers -- the client would flood its own server. Fix the client's send-window accounting FIRST, then the server check.",
+   "action": "two-step, in that order"
+  },
+  "http2-misc-named": {
+   "corpus": "node",
+   "subsystem": "http2",
+   "files_with_causes": {
+    "test-http2-info-headers-errors": "monkey-patches Http2Stream.prototype off internalBinding('http2'); mbun's http2 is pure JS and never calls the binding (documented DEFERRED)",
+    "test-http2-respond-nghttperrors": "same binding-identity cause",
+    "test-http2-too-many-settings": "maxOutstandingSettings does not count the session's own initial SETTINGS, so max:2 never trips",
+    "test-http2-exceeds-server-trailer-size": "needs 'frameError' when a header block exceeds maxSendHeaderBlockLength",
+    "test-http2-server-unknown-protocol": "unknownProtocolTimeout option unimplemented",
+    "test-http2-autoselect-protocol": "needs h2Server.emit('connection', socket) after socket.unshift(data)",
+    "test-http2-compat-socket + test-http2-socket-proxy": "session[kTimeout] must be a real internal Timeout (with _idlePrev/_idleNext and node's util.inspect indentation) PLUS a socket proxy that throws on destroy/emit/end/pause/read/resume -- deeper than the one-line _idleTimeout the log suggests",
+    "capture-rejection (http + http2)": "ONE mechanism, two files: Symbol.for('nodejs.rejection') handlers on ServerResponse, Http2Stream and Http2Server. The inventory files them separately and should not"
+   },
+   "action": "batch"
+  }
+ },
+ "coverage_note": "tls timeouts are now triaged: 19 files -> 3 shapes (B:12, A:5, D:2), collapsed by running tools/integration/hang_dump.js over every one. This is the same collapse the http block underwent, and it reproduces the same headline: none of the 19 is an event-loop bug. Cost ~5 minutes total, which is the argument for triaging centrally rather than making each agent pay for it."
+}

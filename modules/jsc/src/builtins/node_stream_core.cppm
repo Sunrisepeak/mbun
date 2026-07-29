@@ -82,17 +82,50 @@ inline constexpr std::string_view kNodeStreamCoreJS = R"JS(
     if (t.length === 2) return t[0] + " or " + t[1];
     return t.slice(0, -1).join(", ") + ", or " + t[t.length - 1];
   };
-  const $ERR_INVALID_ARG_TYPE = (name, type, val) =>
-    mk(TypeError, "ERR_INVALID_ARG_TYPE",
+  // Shared node-exact factory (bootstrap __mbunNodeErrors): the local form always
+  // says "of type X", so a class-valued expectation such as "Object" was never
+  // lower-cased ("of type Object" where node says "of type object") and never
+  // became "an instance of X".
+  const $ERR_INVALID_ARG_TYPE = (name, type, val) => {
+    const NE = globalThis.__mbunNodeErrors;
+    if (NE) return NE.ERR_INVALID_ARG_TYPE(name, type, val);
+    return mk(TypeError, "ERR_INVALID_ARG_TYPE",
       `The ${name.endsWith(" argument") ? name : `"${name}" ${name.includes(".") ? "property" : "argument"}`} must be of type ${joinTypes(type)}. Received ${specific(val)}`);
+  };
   // ERR_INVALID_ARG_VALUE inspects the value (numbers/booleans print bare).
   const inspectVal = (v) =>
     typeof v === "string" ? `'${v}'`
       : typeof v === "number" || typeof v === "boolean" ? String(v)
       : v === null ? "null" : v === undefined ? "undefined" : specific(v);
-  const $ERR_INVALID_ARG_VALUE = (name, value, reason = "is invalid") =>
-    mk(TypeError, "ERR_INVALID_ARG_VALUE",
+  // node's ERR_INVALID_ARG_VALUE reports util.inspect(value), so a plain object
+  // reads "{}" rather than "an instance of Object".
+  const $ERR_INVALID_ARG_VALUE = (name, value, reason = "is invalid") => {
+    const NE = globalThis.__mbunNodeErrors;
+    if (NE) return NE.ERR_INVALID_ARG_VALUE(name, value, reason);
+    return mk(TypeError, "ERR_INVALID_ARG_VALUE",
       `The ${name.includes(".") ? "property" : "argument"} '${name}' ${reason}. Received ${inspectVal(value)}`);
+  };
+  // node errors.js:1471 declares ERR_INVALID_ARG_VALUE with a RangeError variant
+  // (`E(..., TypeError, RangeError)`); stream/iter's consumers use it for an
+  // out-of-domain options.encoding.
+  const $ERR_INVALID_ARG_VALUE_RangeError = (name, value, reason = "is invalid") =>
+    mk(RangeError, "ERR_INVALID_ARG_VALUE",
+      `The ${name.includes(".") ? "property" : "argument"} '${name}' ${reason}. Received ${inspectVal(value)}`);
+  // node errors.js:1554 `E('ERR_INVALID_STATE', 'Invalid state: %s', Error,
+  // TypeError, RangeError)` — one code, three constructors, which stream/iter
+  // uses to distinguish a protocol misuse (TypeError) from an out-of-range
+  // backpressure decision (RangeError).
+  const $ERR_INVALID_STATE = (msg) => mk(Error, "ERR_INVALID_STATE", `Invalid state: ${msg}`);
+  const $ERR_INVALID_STATE_TypeError = (msg) => mk(TypeError, "ERR_INVALID_STATE", `Invalid state: ${msg}`);
+  const $ERR_INVALID_STATE_RangeError = (msg) => mk(RangeError, "ERR_INVALID_STATE", `Invalid state: ${msg}`);
+  // node errors.js:1646 `E('ERR_OPERATION_FAILED', 'Operation failed: %s', Error,
+  // TypeError)`; stream/iter wraps a thrown non-Error in the TypeError variant.
+  const $ERR_OPERATION_FAILED = (msg) => mk(TypeError, "ERR_OPERATION_FAILED", `Operation failed: ${msg}`);
+  // zlib/iter's option validation (internal/streams/iter/transform); text from
+  // node errors.js:1143 / :1959 and lib/zlib.js's initialization failure.
+  const $ERR_BROTLI_INVALID_PARAM = (key) => mk(RangeError, "ERR_BROTLI_INVALID_PARAM", `${key} is not a valid Brotli parameter`);
+  const $ERR_ZSTD_INVALID_PARAM = (key) => mk(RangeError, "ERR_ZSTD_INVALID_PARAM", `${key} is not a valid zstd parameter`);
+  const $ERR_ZLIB_INITIALIZATION_FAILED = () => mk(Error, "ERR_ZLIB_INITIALIZATION_FAILED", "Initialization failed");
   const $ERR_INVALID_RETURN_VALUE = (input, name, value) =>
     mk(TypeError, "ERR_INVALID_RETURN_VALUE",
       `Expected ${input} to be returned from the "${name}" function but got ${specific(value)}.`);
@@ -103,7 +136,13 @@ inline constexpr std::string_view kNodeStreamCoreJS = R"JS(
   const $ERR_METHOD_NOT_IMPLEMENTED = (name) => mk(Error, "ERR_METHOD_NOT_IMPLEMENTED", `The ${name} method is not implemented`);
   const $ERR_ILLEGAL_CONSTRUCTOR = () => mk(TypeError, "ERR_ILLEGAL_CONSTRUCTOR", "Illegal constructor");
   const $ERR_MULTIPLE_CALLBACK = () => mk(Error, "ERR_MULTIPLE_CALLBACK", "Callback called multiple times");
-  const $ERR_UNKNOWN_ENCODING = (enc) => mk(TypeError, "ERR_UNKNOWN_ENCODING", `Unknown encoding: ${enc}`);
+  // node builds this through util.format('%s'), which inspects a non-primitive
+  // ("{}") rather than String()-ing it ("[object Object]").
+  const $ERR_UNKNOWN_ENCODING = (enc) => mk(TypeError, "ERR_UNKNOWN_ENCODING",
+    `Unknown encoding: ${enc === null || typeof enc !== "object" ? String(enc) : (() => {
+      const u = globalThis.__mbunNativeModules && (globalThis.__mbunNativeModules["util"] || globalThis.__mbunNativeModules["node:util"]);
+      try { return u && u.inspect ? u.inspect(enc, { depth: 0 }) : String(enc); } catch (e) { return String(enc); }
+    })()}`);
   const $ERR_STREAM_DESTROYED = (name) => mk(Error, "ERR_STREAM_DESTROYED", `Cannot call ${name} after a stream was destroyed`);
   const $ERR_STREAM_ALREADY_FINISHED = (name) => mk(Error, "ERR_STREAM_ALREADY_FINISHED", `Cannot call ${name} after a stream was finished`);
   const $ERR_STREAM_WRITE_AFTER_END = () => mk(Error, "ERR_STREAM_WRITE_AFTER_END", "write after end");
@@ -143,16 +182,40 @@ inline constexpr std::string_view kNodeStreamCoreJS = R"JS(
   const __hasAsyncContext = () => false;
   // Only reached for a web stream lacking kIsClosedPromise. bun reads the
   // stream's internal closed promise; approximate with the reader's.
+  // node's `stream[kIsClosedPromise].promise` — a per-stream promise that
+  // settles on close/error and NEVER locks the stream. The old fallback here
+  // acquired a reader/writer just to read `.closed`, so `finished(webStream)`
+  // locked it and any later getReader()/getWriter()/`for await` threw
+  // "ReadableStream is locked" (test-webstreams-finished, -compose,
+  // -duplex-fromweb-*).
   const $webStreamClosedPromise = (stream) => {
+    try {
+      const S = G.__mbunStreams;
+      if (S && typeof S.closedPromise === "function") return S.closedPromise(stream);
+    } catch {}
     try {
       if (typeof stream.getReader === "function") return stream.getReader().closed;
       if (typeof stream.getWriter === "function") return stream.getWriter().closed;
     } catch {}
     return new Promise(() => {});
   };
-  // $cpp("NodeModuleModule.cpp", "createStreamIterEnabledFlag") gates the
-  // experimental Symbol.for("Stream.toAsyncStreamable") path only.
-  const $cpp = () => false;
+  // $cpp("NodeModuleModule.cpp", "createStreamIterEnabledFlag") is bun's
+  // write-once CLI bit for --experimental-stream-iter. It gates both the
+  // Symbol.for("Stream.toAsyncStreamable") interop path on Readable and the
+  // node:stream/iter + node:zlib/iter entry points (node_stream_iter_entry).
+  // It cannot be resolved at image-evaluation time — process.execArgv does not
+  // exist yet — which is exactly why node defers the check too
+  // (internal/streams/readable.js:1819), so read execArgv on each call and let
+  // the callers cache. Not a mutable seam: mbun derives execArgv from the raw
+  // command line at startup (src/cli.cppm derive_exec_argv).
+  const $cpp = (file, name) => {
+    if (name !== "createStreamIterEnabledFlag") return false;
+    const argv = (G.process && G.process.execArgv) || [];
+    for (let i = 0; i < argv.length; i++) {
+      if (argv[i] === "--experimental-stream-iter") return true;
+    }
+    return false;
+  };
 
   const H = {
     $ERR_INVALID_ARG_TYPE, $ERR_INVALID_ARG_VALUE, $ERR_INVALID_RETURN_VALUE, $ERR_OUT_OF_RANGE,
@@ -163,6 +226,11 @@ inline constexpr std::string_view kNodeStreamCoreJS = R"JS(
     $ERR_STREAM_ITER_MISSING_FLAG, $makeAbortError, $toClass, __isCallable, __debug, __assert,
     $inheritsReadableStream, $inheritsWritableStream, $inheritsTransformStream, $inheritsBlob,
     __hasAsyncContext, $webStreamClosedPromise, $cpp,
+    // stream/iter (internal/streams/iter/*)
+    $ERR_INVALID_ARG_VALUE_RangeError, $ERR_INVALID_STATE, $ERR_INVALID_STATE_TypeError,
+    $ERR_INVALID_STATE_RangeError, $ERR_OPERATION_FAILED,
+    // zlib/iter (internal/streams/iter/transform)
+    $ERR_BROTLI_INVALID_PARAM, $ERR_ZSTD_INVALID_PARAM, $ERR_ZLIB_INITIALIZATION_FAILED,
   };
   G.__mbunStreamReg = { def: (id, fn) => { __mods[id] = fn; }, require: __req, H };
 
@@ -187,8 +255,23 @@ inline constexpr std::string_view kNodeStreamCoreJS = R"JS(
       throw $ERR_INVALID_ARG_VALUE(name, value, "must be one of: " + allowed);
     }
   };
+  // node validators.js:614 — false for undefined/NaN, true for a finite number,
+  // ERR_INVALID_ARG_TYPE for a non-number, ERR_OUT_OF_RANGE for ±Infinity.
+  const validateFiniteNumber = (number, name) => {
+    if (number === undefined) return false;
+    if (Number.isFinite(number)) return true;
+    if (Number.isNaN(number)) return false;
+    if (typeof number !== "number") throw $ERR_INVALID_ARG_TYPE(name, "number", number);
+    throw $ERR_OUT_OF_RANGE(name, "a finite number", number);
+  };
+  // node validators.js:639.
+  const checkRangesOrGetDefault = (number, name, lower, upper, def) => {
+    if (!validateFiniteNumber(number, name)) return def;
+    if (number < lower || number > upper) throw $ERR_OUT_OF_RANGE(name, `>= ${lower} and <= ${upper}`, number);
+    return number;
+  };
   __mods["internal/validators"] = (req, module) => {
-    module.exports = { validateFunction, validateAbortSignal, validateBoolean, validateObject, validateInteger, validateOneOf };
+    module.exports = { validateFunction, validateAbortSignal, validateBoolean, validateObject, validateInteger, validateOneOf, validateFiniteNumber, checkRangesOrGetDefault };
   };
   __mods["internal/shared"] = (req, module) => {
     const kEmptyObject = Object.freeze(Object.create(null));

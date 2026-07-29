@@ -127,9 +127,25 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
       else if (ms !== undefined && typeof ms === "number" && Number.isNaN(ms) && !warnedNaN) { warnedNaN = true; _warnCountdown("NaN is not a number", "TimeoutNaNWarning"); }
     };
 
+    // Scheduling seam for node:domain (and any future async-context
+    // interceptor). It is a SLOT consulted per call, never a replacement of the
+    // global functions: node's test/common/index.js snapshots the identity of
+    // globalThis.setTimeout/setInterval/setImmediate/queueMicrotask when it
+    // loads and its 'exit' listener fails the file with "Unexpected global(s)
+    // found" for any global whose VALUE changed since. A lazy
+    // require('domain') that swapped those four cost 43 test-repl-* files
+    // (node:repl loads domain to own an eval's uncaught exceptions), and the
+    // same trap waits for anything else that wants to intercept scheduling.
+    // Cost when nothing is installed: one property read per schedule.
+    const __sched = (cb) => {
+      const h = G.__mbunSchedHook;
+      return h === undefined || h === null ? cb : h(cb);
+    };
+
     const mySetTimeout = function setTimeout(cb, ms, ...args) {
       if (typeof cb !== "function") throw __invalidCb(cb);
       _checkCountdown(ms);
+      cb = __sched(cb);
       const state = { gen: 0, ms, args };
       state.run = function (...a) {
         const g = state.gen;
@@ -145,6 +161,7 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
     const mySetInterval = function setInterval(cb, ms, ...args) {
       if (typeof cb !== "function") throw __invalidCb(cb);
       _checkCountdown(ms);
+      cb = __sched(cb);
       const state = { gen: 0, ms, args };
       const t = oSetInterval(cb, ms, ...args);
       state.timer = t;
@@ -153,6 +170,7 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
     };
     const mySetImmediate = function setImmediate(cb, ...args) {
       if (typeof cb !== "function") throw __invalidCb(cb);
+      cb = __sched(cb);
       const state = { gen: 0 };
       state.run = function (...a) {
         const g = state.gen;

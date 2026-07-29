@@ -70,7 +70,12 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
       return e;
     };
     const isU8 = (v) => v instanceof Uint8Array;
+    // Shared node-exact factory (bootstrap __mbunNodeErrors) so the received
+    // value picks up node's `_` numeric separators once |value| > 2**32
+    // ("Received 18_446_744_073_709_551_616n").
     const errOutOfRange = (name, range, value) => {
+      const NE = globalThis.__mbunNodeErrors;
+      if (NE) return NE.ERR_OUT_OF_RANGE(name, range, value);
       const v = typeof value === "bigint" ? value + "n" : String(value);
       const e = new RangeError(`The value of "${name}" is out of range. It must be ${range}. Received ` + v);
       e.code = "ERR_OUT_OF_RANGE";
@@ -678,10 +683,24 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
       if (buf[offset] === undefined || buf[offset + byteLength] === undefined)
         boundsError(offset, buf.length - (byteLength + 1));
     };
+    // internal/buffer.js checkInt: past 3 bytes node stops printing the literal
+    // bounds and switches to power-of-two notation (">= -(2 ** 39) and < 2 ** 39",
+    // ">= 0n and < 2n ** 64n"). The corpus compares these verbatim.
     const checkInt = (value, min, max, buf, offset, byteLength) => {
       if (value > max || value < min) {
         const n = typeof min === "bigint" ? "n" : "";
-        throw errOutOfRange("value", `>= ${min}${n} and <= ${max}${n}`, value);
+        let range;
+        if (byteLength > 3) {
+          if (min === 0 || min === 0n) {
+            range = `>= 0${n} and < 2${n} ** ${(byteLength + 1) * 8}${n}`;
+          } else {
+            range = `>= -(2${n} ** ${(byteLength + 1) * 8 - 1}${n}) and ` +
+                    `< 2${n} ** ${(byteLength + 1) * 8 - 1}${n}`;
+          }
+        } else {
+          range = `>= ${min}${n} and <= ${max}${n}`;
+        }
+        throw errOutOfRange("value", range, value);
       }
       checkBounds(buf, offset, byteLength);
     };

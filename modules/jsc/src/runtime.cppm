@@ -25,6 +25,9 @@ import mbun.image;
 import mbun.image.jpeg;
 import mbun.core.io;
 import mbun.core.strings;
+// node's Permission Model (--permission / --allow-*): the scope table, the fs
+// radix matcher and path.resolve. Consulted by every fs/spawn/worker boundary.
+import mbun.permission;
 import mbun.js_parser;
 // T-CAP-BUILD: in-memory bundler engine backing Bun.build (runtime/bun_build.inc).
 import mbun.bundler.vertical_slice;
@@ -45,6 +48,8 @@ import mbun.jsc.js_tls_live;
 import mbun.jsc.js_http2;
 import mbun.jsc.js_websocket;
 import mbun.jsc.js_dns;
+import mbun.jsc.js_dgram;
+import mbun.jsc.js_https_live;
 import mbun.dns;
 import mbun.ffi;
 import mbun.sqlite;

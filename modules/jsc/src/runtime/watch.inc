@@ -28,8 +28,15 @@ int& watch_next_handle() {
     return gNext;
 }
 
-// Throw a JS Error carrying .code/.errno/.path, matching the shape node's
-// fs.watch errors carry (EPERM/ENOENT/ENOSPC from inotify_add_watch).
+// Throw a JS Error carrying .code/.errno/.path/.filename/.syscall, matching the
+// shape node's fs.watch errors carry (EPERM/ENOENT/ENOSPC from
+// inotify_add_watch). node builds these with UVException (src/node_errors.cc):
+// the message is "<CODE>: <uv_strerror text>, watch '<path>'" — the LIBUV
+// wording, not the C library's strerror text, which is why the description is
+// tabulated here instead of forwarded from BackendError::message. Both `path`
+// and `filename` are set: internal/fs/watchers.js assigns `error.filename` on
+// top of what UVException already put in `error.path`, and a test that reads
+// only `filename` (test-fs-watch-enoent) saw undefined while `path` was right.
 JSValueRef watch_throw(JSContextRef ctx, JSValueRef* exc, const mbun::watcher::BackendError& err,
                        const std::string& path) {
     if (exc != nullptr) {
@@ -37,12 +44,23 @@ JSValueRef watch_throw(JSContextRef ctx, JSValueRef* exc, const mbun::watcher::B
                                : err.code == EACCES ? "EACCES"
                                : err.code == EPERM  ? "EPERM"
                                : err.code == ENOSPC ? "ENOSPC"
+                               : err.code == ENOTDIR ? "ENOTDIR"
                                                     : "EINVAL"};
-        JSValueRef m{make_string(ctx, std::format("{}: {}, watch '{}'", code, err.message, path))};
+        // libuv's uv_strerror text per code. ENOSPC is the one node overrides
+        // (watchers.js): an exhausted inotify budget is reported as the watcher
+        // limit rather than "no space left on device".
+        const std::string desc{err.code == ENOENT   ? "no such file or directory"
+                               : err.code == EACCES ? "permission denied"
+                               : err.code == EPERM  ? "operation not permitted"
+                               : err.code == ENOSPC ? "System limit for number of file watchers reached"
+                               : err.code == ENOTDIR ? "not a directory"
+                                                    : "invalid argument"};
+        JSValueRef m{make_string(ctx, std::format("{}: {}, watch '{}'", code, desc, path))};
         JSObjectRef e{JSObjectMakeError(ctx, 1, &m, nullptr)};
         set_prop(ctx, e, "code", make_string(ctx, code));
         set_prop(ctx, e, "errno", JSValueMakeNumber(ctx, -err.code));
         set_prop(ctx, e, "path", make_string(ctx, path));
+        set_prop(ctx, e, "filename", make_string(ctx, path));
         set_prop(ctx, e, "syscall", make_string(ctx, "watch"));
         *exc = e;
     }
@@ -53,6 +71,14 @@ JSValueRef watch_throw(JSContextRef ctx, JSValueRef* exc, const mbun::watcher::B
 JSValueRef watchn_start_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                            const JSValueRef args[], JSValueRef* exc) {
     std::string path{arg_string(ctx, argc, args, 0)};
+    // THE PERMISSION GATE. inotify_add_watch reads directory contents and file
+    // metadata, so node classifies fs.watch as a FileSystemRead operation
+    // (src/fs_event_wrap.cc FSEventWrap::Start →
+    // THROW_IF_INSUFFICIENT_PERMISSIONS(kFileSystemRead)). Without this check
+    // __mbunWatchNative.start was a way to observe any path in the filesystem
+    // — including names of files under a directory the model never granted —
+    // from inside a --permission sandbox.
+    if (permission_deny_fs(ctx, exc, path, false)) return JSValueMakeUndefined(ctx);
     const bool recursive{argc > 1 && JSValueToBoolean(ctx, args[1])};
     mbun::watcher::FsWatcher w{};
     if (auto ok{w.watch(path, recursive)}; !ok) {

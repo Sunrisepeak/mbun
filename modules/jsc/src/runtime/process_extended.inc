@@ -9,8 +9,13 @@
 // Exec/pre-exec failures (ENOENT, EPERM from setuid, EBADF from bad stdio fd…)
 // are reported through a CLOEXEC status pipe exactly like libuv: the parent
 // blocks on it until exec succeeds (EOF) or the child writes errno.
+// `Ipc` is node's fork() channel slot: a bidirectional AF_UNIX SOCK_STREAM
+// socketpair rather than a half-duplex pipe (node lib/internal/child_process.js
+// setupChannel + src/spawn_sync.cc UV_CREATE_PIPE|UV_READABLE|UV_WRITABLE). The
+// parent end comes back in `fds`; the child end is dup2'd into the slot index
+// and advertised to the child through NODE_CHANNEL_FD (added by the JS layer).
 struct StdioSlot {
-    enum class Kind : std::uint8_t { Pipe, Ignore, Inherit, Fd } kind{Kind::Pipe};
+    enum class Kind : std::uint8_t { Pipe, Ignore, Inherit, Fd, Ipc } kind{Kind::Pipe};
     int fd{-1};  // Fd: source fd number
 };
 
@@ -48,6 +53,12 @@ JSValueRef proc_spawn_ex_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
     }
     if (argvStr.empty()) argvStr.push_back(file);
     SpawnOpts o{parse_spawn_opts(ctx, argc, args)};
+    // Permission Model: node enforces the ChildProcess scope at the fork
+    // (src/spawn_sync.cc / process_wrap.cc), and so does this. `resource` is the
+    // executable, which is what test-permission-child-process-cli asserts on.
+    // permission_deny_spawn also handles mbun's worker-as-subprocess case.
+    if (permission_deny_spawn(ctx, exc, file, o.env)) return JSValueMakeUndefined(ctx);
+    permission_inject_child_env(o.env, o.haveEnv, argvStr);
     bool detached{false};
     double uid{-1}, gid{-1};
     std::vector<StdioSlot> slots{{StdioSlot::Kind::Pipe, -1},
@@ -71,11 +82,23 @@ JSValueRef proc_spawn_ex_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
                 JSValueRef el{JSObjectGetPropertyAtIndex(ctx, arr, i, nullptr)};
                 StdioSlot s;
                 if (JSValueIsNumber(ctx, el)) {
-                    s = {StdioSlot::Kind::Fd, static_cast<int>(JSValueToNumber(ctx, el, nullptr))};
+                    int rawFd{static_cast<int>(JSValueToNumber(ctx, el, nullptr))};
+                    // A descriptor that came from fs.openSync is one of mbun's
+                    // VIRTUAL fds (numbered from 1000); handing that number to
+                    // dup2 in the child is EBADF. Translate it to the real OS
+                    // descriptor the same way every other fd binding does
+                    // (test-fs-syncwritestream spawns a child with
+                    // stdio: ['inherit', fd, fd]).
+                    if (auto it{fd_table().find(rawFd)};
+                        it != fd_table().end() && it->second.is_open()) {
+                        rawFd = it->second.native_fd();
+                    }
+                    s = {StdioSlot::Kind::Fd, rawFd};
                 } else {
                     const std::string k{val_to_string(ctx, el)};
                     s.kind = k == "ignore"    ? StdioSlot::Kind::Ignore
                              : k == "inherit" ? StdioSlot::Kind::Inherit
+                             : k == "ipc"     ? StdioSlot::Kind::Ipc
                                               : StdioSlot::Kind::Pipe;
                 }
                 slots.push_back(s);
@@ -88,7 +111,28 @@ JSValueRef proc_spawn_ex_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
     // Parent/child pipe ends per slot (only Pipe slots use them).
     std::vector<std::array<int, 2>> pipes(slots.size(), {-1, -1});
     for (std::size_t i = 0; i < slots.size(); ++i) {
+        if (slots[i].kind == StdioSlot::Kind::Ipc) {
+            // [0] = parent end, [1] = child end (both directions on each).
+            if (::socketpair(AF_UNIX, SOCK_STREAM, 0, pipes[i].data()) != 0) {
+                return fs_throw(ctx, exc, "spawnEx: socketpair() failed");
+            }
+            continue;
+        }
         if (slots[i].kind != StdioSlot::Kind::Pipe) continue;
+        // Slots 0/1/2 are half-duplex by nature (stdin reads, stdout/stderr
+        // write), so a pipe() is both sufficient and cheaper. A 'pipe' slot
+        // ABOVE stderr has no such direction: node backs every extra slot with a
+        // uv_pipe_t (a socketpair) and hands the parent a duplex net.Socket, which
+        // is what `cluster.setupPrimary({ stdio: [..., 'ipc', 'pipe'] })` then
+        // writes to and reads from over the same descriptor
+        // (test-cluster-fork-stdio). A half-duplex pipe gave the parent a
+        // read-only end, so channel.write() had nothing to write to.
+        if (i >= 3) {
+            if (::socketpair(AF_UNIX, SOCK_STREAM, 0, pipes[i].data()) != 0) {
+                return fs_throw(ctx, exc, "spawnEx: socketpair() failed");
+            }
+            continue;
+        }
         if (pipe(pipes[i].data()) != 0) return fs_throw(ctx, exc, "spawnEx: pipe() failed");
     }
     int errPipe[2];
@@ -129,6 +173,9 @@ JSValueRef proc_spawn_ex_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
             switch (slots[i].kind) {
             case StdioSlot::Kind::Pipe:
                 src = i == 0 ? pipes[i][0] : pipes[i][1];
+                break;
+            case StdioSlot::Kind::Ipc:
+                src = pipes[i][1];
                 break;
             case StdioSlot::Kind::Inherit:
                 src = static_cast<int>(i);
@@ -193,6 +240,7 @@ JSValueRef proc_spawn_ex_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
     // ── parent ──
     close(errPipe[1]);
     for (std::size_t i = 0; i < slots.size(); ++i) {
+        if (slots[i].kind == StdioSlot::Kind::Ipc) { close(pipes[i][1]); continue; }
         if (slots[i].kind != StdioSlot::Kind::Pipe) continue;
         close(i == 0 ? pipes[i][0] : pipes[i][1]);
     }
@@ -205,6 +253,7 @@ JSValueRef proc_spawn_ex_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
         int status{0};
         waitpid(pid, &status, 0);
         for (std::size_t i = 0; i < slots.size(); ++i) {
+            if (slots[i].kind == StdioSlot::Kind::Ipc) { close(pipes[i][0]); continue; }
             if (slots[i].kind != StdioSlot::Kind::Pipe) continue;
             close(i == 0 ? pipes[i][1] : pipes[i][0]);
         }
@@ -216,7 +265,8 @@ JSValueRef proc_spawn_ex_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
     const std::size_t nf{std::min(slots.size(), std::size_t{64})};
     for (std::size_t i = 0; i < nf; ++i) {
         const int f{slots[i].kind == StdioSlot::Kind::Pipe ? (i == 0 ? pipes[i][1] : pipes[i][0])
-                                                           : -1};
+                    : slots[i].kind == StdioSlot::Kind::Ipc ? pipes[i][0]
+                                                            : -1};
         fdVals[i] = JSValueMakeNumber(ctx, f);
     }
     set_prop(ctx, r, "fds", JSObjectMakeArray(ctx, nf, fdVals, nullptr));
@@ -290,6 +340,12 @@ JSValueRef proc_spawn_pty_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::si
     }
     if (argvStr.empty()) argvStr.push_back(file);
     SpawnOpts o{parse_spawn_opts(ctx, argc, args)};
+    // Permission Model: node enforces the ChildProcess scope at the fork
+    // (src/spawn_sync.cc / process_wrap.cc), and so does this. `resource` is the
+    // executable, which is what test-permission-child-process-cli asserts on.
+    // permission_deny_spawn also handles mbun's worker-as-subprocess case.
+    if (permission_deny_spawn(ctx, exc, file, o.env)) return JSValueMakeUndefined(ctx);
+    permission_inject_child_env(o.env, o.haveEnv, argvStr);
     unsigned short cols{80}, rows{24};
     if (argc > 2 && JSValueIsObject(ctx, args[2])) {
         JSObjectRef opt{JSValueToObject(ctx, args[2], nullptr)};
@@ -494,17 +550,63 @@ JSValueRef process_cwd_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_
 JSValueRef process_chdir_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                             const JSValueRef args[], JSValueRef* exc) {
     if (argc < 1) return JSValueMakeUndefined(ctx);
-    std::error_code ec;
-    std::filesystem::current_path(std::filesystem::path{val_to_string(ctx, args[0])}, ec);
-    if (ec && exc != nullptr) {
-        *exc = make_string(ctx, "ENOENT: no such file or directory, chdir '" +
-                                    val_to_string(ctx, args[0]) + "'");
+    const std::string dest{val_to_string(ctx, args[0])};
+    // node throws a real uvException here, not a string: an Error carrying
+    // .code/.errno/.syscall/.path (the cwd we failed to leave) and .dest (the
+    // requested directory), with the two-path message shape
+    // "ENOENT: no such file or directory, chdir '<cwd>' -> '<dest>'".
+    // test-process-chdir-errormessage asserts every one of those fields; a
+    // thrown string satisfied none of them. fs_make_error parses that exact
+    // layout (io_bindings.inc), so reuse it rather than rebuilding the error.
+    if (::chdir(dest.c_str()) != 0) {
+        const int e{errno};
+        if (exc != nullptr) {
+            std::error_code cwdEc;
+            const std::string cwd{std::filesystem::current_path(cwdEc).string()};
+            std::string code{fd_errno_code(e)};
+            if (code.empty()) code = "UNKNOWN";
+            *exc = fs_make_error(ctx, code + ": " + fd_errno_message(e) + ", chdir '" + cwd +
+                                          "' -> '" + dest + "'");
+        }
     }
     return JSValueMakeUndefined(ctx);
 }
 
+// process.exit([code]) — node lib/internal/process/per_thread.js: settle the
+// exit code, emit 'exit' synchronously, then leave. It used to std::exit()
+// straight away, so no 'exit' listener ever ran (and node's own test harness
+// verifies every common.mustCall from inside one). The whole sequence lives in
+// JS (__mbun_run_exit, js_builtins :node_process_lifecycle) and hands back the
+// status to leave with — process.exitCode assigned by a listener wins.
+int run_exit_sequence(JSContextRef ctx, JSValueRef codeArg) {
+    JSObjectRef global{JSContextGetGlobalObject(ctx)};
+    JSStringRef name{JSStringCreateWithUTF8CString("__mbun_run_exit")};
+    JSValueRef fnVal{JSObjectGetProperty(ctx, global, name, nullptr)};
+    JSStringRelease(name);
+    const JSValueRef fallback{codeArg};
+    const auto asStatus{[&](JSValueRef v) {
+        if (v == nullptr || JSValueIsUndefined(ctx, v) || JSValueIsNull(ctx, v)) return 0;
+        const double d{JSValueToNumber(ctx, v, nullptr)};
+        return std::isnan(d) ? 0 : static_cast<int>(d);
+    }};
+    if (fnVal == nullptr || !JSValueIsObject(ctx, fnVal)) return asStatus(fallback);
+    JSObjectRef fn{JSValueToObject(ctx, fnVal, nullptr)};
+    if (fn == nullptr || !JSObjectIsFunction(ctx, fn)) return asStatus(fallback);
+    const JSValueRef callArgs[1]{codeArg != nullptr ? codeArg : JSValueMakeUndefined(ctx)};
+    JSValueRef exc{nullptr};
+    JSValueRef result{JSObjectCallAsFunction(ctx, fn, nullptr, 1, callArgs, &exc)};
+    if (exc != nullptr) return 1;
+    return asStatus(result);
+}
+
 JSValueRef process_exit_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                            const JSValueRef args[], JSValueRef*) {
+    std::exit(run_exit_sequence(ctx, argc > 0 ? args[0] : nullptr));
+}
+
+// process.reallyExit(code) — node's raw exit: no 'exit' emission, no handlers.
+JSValueRef process_really_exit_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                                  const JSValueRef args[], JSValueRef*) {
     std::exit(argc > 0 ? static_cast<int>(JSValueToNumber(ctx, args[0], nullptr)) : 0);
 }
 
@@ -591,6 +693,17 @@ mbun::resolver::FileSystem os_fs() {
             return std::filesystem::is_directory(std::filesystem::path{p}, ec);
         },
         .read_file = [](std::string_view p) -> std::optional<std::string> {
+            // Permission Model: loading a module is an fs READ of that file, and
+            // node gates it the same way (an unlisted require() fails with
+            // ERR_ACCESS_DENIED, not MODULE_NOT_FOUND — test-permission-fs-require).
+            // Gating HERE, in the loader's own read hook, means the bytes are
+            // never even fetched; the require path turns the recorded denial into
+            // the right error.
+            if (gPermission.enabled() && !gPermission.warning_only() &&
+                !gPermission.is_granted(mbun::permission::Scope::FileSystemRead, p)) {
+                gPermissionDeniedModuleRead = std::string{p};
+                return std::nullopt;
+            }
             return read_file(std::string{p});
         },
         // node preserveSymlinks=false: bare-specifier walk-up starts at the

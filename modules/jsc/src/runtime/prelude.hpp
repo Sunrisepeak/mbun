@@ -67,6 +67,12 @@
 // API leaves null (see engine.inc create_context_).
 #include <JavaScriptCore/GlobalObjectMethodTable.h>
 #include <JavaScriptCore/VM.h>
+// JSDateMath.h (JSC::DateCache) + wtf/DateMath.h (WTF::setTimeZoneOverride):
+// assigning process.env.TZ has to invalidate the per-VM timezone cache, which
+// only these expose (runtime/process_base.inc proc_set_timezone_cb).
+#include <JavaScriptCore/JSDateMath.h>
+#include <wtf/DateMath.h>
+#include <wtf/text/WTFString.h>
 #include <wtf/text/StringView.h>
 
 // CAP-NAPI (runtime/napi_core.inc + napi_objects.inc): the Node-API layer is
@@ -124,10 +130,14 @@
 // errno/SIG* macros (not exported by `import std`).
 #include <cerrno>
 #include <csignal>
+// <cstdlib> for ::realpath / ::free (fs.realpathSync.native's strict resolver in
+// io_bindings.inc). `import std` does not export the POSIX realpath overload.
+#include <cstdlib>
 #if !defined(_WIN32)
 #  include <sys/wait.h>
 #  include <sys/stat.h>  // stat() for Bun.which is_executable_file_path probe
 #  include <sys/syscall.h>  // SYS_close_range on Linux/musl
+#  include <sys/statvfs.h>  // statvfs() backing fs.statfs / fs.statfsSync
 #  include <unistd.h>
 // POSIX TCP sockets for __mbunNetNative (Bun.serve / real fetch / node:net).
 #  include <sys/socket.h>

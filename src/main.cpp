@@ -49,20 +49,91 @@ int main(int argc, char* argv[]) {
         return run_embedded_program(*embedded, argc > 0 ? argv[0] : "mbun", embeddedArgs);
     }
 
+    // ── --enable-fips / --force-fips on a non-FIPS OpenSSL → refuse to start.
+    //    node ProcessFipsOptions() (src/crypto/crypto_util.cc) asks OpenSSL for a
+    //    FIPS provider and, when there is none, node.cc:1246 reports
+    //    "OpenSSL error when trying to enable FIPS:" and returns
+    //    ExitCode::kGenericUserError BEFORE any JS runs. mbun links a stock
+    //    OpenSSL 3.1.5 with no FIPS provider, so the request can never be
+    //    honoured — accepting the flag silently would be the dangerous answer
+    //    (a program that asked for FIPS would run outside it and never know).
+    //    Parsed off the raw command line, stopping at the first non-option or an
+    //    eval flag, so a `-e` program that merely mentions the string is not a
+    //    request.
+    {
+        for (int i{1}; i < argc; ++i) {
+            const std::string_view a{argv[i]};
+            if (a == "-e" || a == "--eval" || a == "-p" || a == "--print" || a == "-pe" ||
+                a == "-ep") {
+                break;
+            }
+            if (!a.starts_with("-")) break;
+            if (a == "--enable-fips" || a == "--force-fips") {
+                std::println(std::cerr, "{}: OpenSSL error when trying to enable FIPS:\n",
+                             argc > 0 ? argv[0] : "mbun");
+                return 1;
+            }
+        }
+    }
+
+    // process.execArgv — derived from the raw command line before any flag loop
+    //    consumes it, exactly as bun does (node_process.rs create_exec_argv).
+    //    Every dispatch below (node emulation, `run`, bare script) shares it; a
+    //    compiled program overrides it above with its baked --compile-exec-argv.
+    {
+        std::vector<std::string_view> rawArgs(argv + 1, argv + argc);
+        mbun::jsc::runtime::set_exec_argv(mbun::cli::derive_exec_argv(rawArgs));
+
+        // node's Permission Model (--permission / --allow-*). Derived from the
+        // same raw command line, before any dispatch, so every path below (node
+        // emulation, `run`, a bare script, -e) is gated identically. The model
+        // stays DISABLED unless a --permission flag is actually present, so this
+        // is inert for an ordinary invocation.
+        const mbun::cli::PermissionCommandLine perm{mbun::cli::derive_permission_cli(rawArgs)};
+        mbun::jsc::runtime::set_permission_command_line(perm.tokens, perm.hasEvalString,
+                                                        perm.entry, perm.preloads);
+    }
+
     // ── argv0 == `node` → node emulation (cli/mod.rs:952 → run_command.rs:2981).
     //    Must come before ANY bun-flag parsing: node's flags are not bun's.
     if (argc > 0 && is_node_argv0(argv[0])) {
         std::vector<std::string_view> nodeArgs(argv + 1, argv + argc);
+        // `node -i` is a REPL here too — the wrapper's "does not support a repl"
+        // message only covers the no-target case.
+        if (take_interactive_flag(nodeArgs)) return exec_interactive(nodeArgs);
         return exec_as_if_node(nodeArgs);
     }
 
     std::vector<std::string_view> args(argv + 1, argv + argc);
 
+    // node's `--test` CLI: the positionals are test files for node:test's
+    // runner, not an entry point to execute. Checked before every bun flag loop
+    // because `--test` is not a bun flag and the node-emulation fallback below
+    // would boot the first positional as an ordinary script.
+    if (has_node_test_flag(args)) return exec_node_test_cli(args);
+
+    // `-i` / `--interactive` forces the REPL, before any other flag handling:
+    // it is not a run flag (there is no run target) and it must survive
+    // alongside `-e`/`--eval`, which the strip loop below stops at.
+    if (take_interactive_flag(args)) return exec_interactive(args);
+
+    // node's eval flags. `-pe` / `-ep` are the combined short forms node's own
+    // argument parser accepts (`node -pe "expr"` is `-p -e "expr"`), and the
+    // corpus spawns children that way — test-tls-cipher-list builds its argv as
+    // `[...flags, '-pe', expression]`. Without them the token is not recognised
+    // as an eval flag at all and the expression is taken for a script path.
+    const auto is_eval_flag{[](std::string_view a) {
+        return a == "-e" || a == "--eval" || a == "-p" || a == "--print" || a == "-pe" ||
+               a == "-ep";
+    }};
+    const auto eval_flag_prints{[](std::string_view a) {
+        return a == "-p" || a == "--print" || a == "-pe" || a == "-ep";
+    }};
+
     // Strip leading global run flags so `mbun [flags] <script>` runs the script,
     // but never past -e/-p/--eval/--print (those consume the next token as code).
     RunFlags globalFlags{};
-    while (!args.empty() && args[0] != "-e" && args[0] != "--eval" && args[0] != "-p" &&
-           args[0] != "--print") {
+    while (!args.empty() && !is_eval_flag(args[0])) {
         if (const std::size_t n{take_max_http_header_size_flag(args, 0)}; n > 0) {
             args.erase(args.begin(), args.begin() + static_cast<std::ptrdiff_t>(n));
             continue;
@@ -136,8 +207,7 @@ int main(int argc, char* argv[]) {
     // ignores unmodelled node flags and resolves the first positional as the
     // script) is the correct handler, so route there instead of taking the flag
     // itself as the run target ("Script not found \"--expose-gc\"").
-    if (!args.empty() && args[0].starts_with("-") && args[0] != "-" &&
-        args[0] != "-e" && args[0] != "--eval" && args[0] != "-p" && args[0] != "--print") {
+    if (!args.empty() && args[0].starts_with("-") && args[0] != "-" && !is_eval_flag(args[0])) {
         bool hasPositional{false};
         for (std::size_t k{0}; k < args.size(); ++k) {
             if (!args[k].starts_with("-")) {
@@ -145,7 +215,7 @@ int main(int argc, char* argv[]) {
                 // is not mistaken for the positional entry point.
                 if (k > 0 && args[k - 1].starts_with("-") &&
                     args[k - 1].find('=') == std::string_view::npos &&
-                    node_flag_takes_value(args[k - 1])) {
+                    mbun::cli::node_flag_takes_value(args[k - 1])) {
                     continue;
                 }
                 hasPositional = true;
@@ -159,7 +229,7 @@ int main(int argc, char* argv[]) {
     // execute a JS file through the JSC runtime with the Bun.* API in scope.
     if (!args.empty()) {
         // `mbun -e <code>` / `mbun --eval <code>`: evaluate a JS/TS string.
-        if (args[0] == "-e" || args[0] == "--eval" || args[0] == "-p" || args[0] == "--print") {
+        if (is_eval_flag(args[0])) {
             if (args.size() < 2) {
                 std::println(std::cerr, "mbun {}: missing code (usage: mbun {} <code>)", args[0], args[0]);
                 return 2;
@@ -173,13 +243,15 @@ int main(int argc, char* argv[]) {
             mbun::jsc::runtime::set_argv(std::move(jsArgv));
             std::string code{args[1]};
             // `-p`/`--print` prints the expression result.
-            if (args[0] == "-p" || args[0] == "--print") {
+            if (eval_flag_prints(args[0])) {
                 code = "console.log((() => (" + code + "))())";
             }
             // node/bun expose the ORIGINAL eval source as process._eval
             // (run-eval.test.ts). Set it on the same first line so source-map
             // line numbers are unchanged; args[1] is the pre-wrap source.
             code = "process._eval=" + js_quote(args[1]) + ";" + code;
+            // run_eval() prepends node's addBuiltinLibsToObject shim, so both
+            // this path and the `node`-argv0 emulation get the builtin globals.
             return mbun::jsc::runtime::run_eval(code);
         }
         // `mbun pm version [args...]` — package.json version bumping (npm-compatible).

@@ -134,6 +134,7 @@ members = [
     "modules/sys",
     "modules/sys_bindings",
     "modules/options",
+    "modules/permission",
     "modules/runtime_valkey",
     "modules/runtime_image",
     "modules/runtime_shell",

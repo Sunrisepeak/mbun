@@ -513,3 +513,347 @@ So:
   left enumerable, which node's `common` reports as leaked — and which fired
   *before* ~300 files could reach `common.skip()`, so they reported `fail`
   instead of `skipped`).
+
+### A parallel guard invents regressions; confirm each one alone
+
+Every zero-regression guard in this project runs the corpus in parallel, and
+that parallelism *manufactures* failures. Two independent measurements, one
+round apart:
+
+- A tls guard at `--jobs 10` reported 70 `pass -> fail`. Four of the named files
+  were re-run standalone on the same binary: **3/3 pass, every one.** The
+  agent had already argued they were artifacts and declined to claim zero
+  regressions; it was right.
+- `test-fs-buffer` began `SIGSEGV`-ing in JSC's `JSRopeString::view` at address
+  `0x0`. Standalone: **4/6 then 6/6 clean**; at `--jobs 5` beside its own
+  cluster: **3/3 clean**; in any run that also contained `test-fs-readfile`:
+  **crashes**. The trigger is memory pressure from that file's 2 GiB sparse
+  file — which only exists now that the file survives instead of being
+  OOM-killed. So a *fix* created the neighbour's crash.
+
+The consequence that costs real time: agents burn budget triaging regressions
+that do not exist. One wave spent a third of an agent's remaining time on 70
+phantom files.
+
+It does **not** follow that published counts are understated, and an earlier
+revision of this section wrongly claimed so. Measured: re-running the full 4433
+at `--jobs 6` against a `--jobs 10` baseline moved exactly the 11 files three
+agents had claimed and **not one other**. So the flakiness is per-file noise
+that cancels at aggregate, not a systematic bias in the total. Lowering the job
+count buys reliable *attribution*, not a better score.
+
+And the rule cuts both ways, which the same diff proved: it flagged
+`test-timers-ordering` as a fresh regression, and reproduction showed a
+**1-in-6 flake of long standing** whose baseline run had simply rolled well —
+a real defect, just not a new one. `getLibuvNow()` read `performance.now()`
+while timer deadlines were computed on `Date.now()`; a `setTimeout(f, 1)` could
+satisfy its truncated deadline after 0.1 ms of real time, so the value the test
+watches had not advanced. node computes both from one clock — its own
+`internal/timers.js` uses `getLibuvNow()` as the epoch a deadline is measured
+from — and matching that made the file 8/8 instead of 1/6. **Reproduce before
+believing, and reproduce before dismissing.**
+
+**The rule: a single `pass -> fail` in a parallel guard is a lead, not a
+finding.** Reproduce it standalone before you believe it, and before you let it
+block a merge. Conversely, do not let this become a licence to dismiss real
+regressions — the test is reproduction, not plausibility.
+
+And note what the second case implies about *sequencing*: a per-file resource
+footprint that grows because a file stopped dying is a real, if indirect,
+regression risk to its neighbours. The corpus is not a set of independent
+experiments as long as it shares a machine.
+
+### A round can be worth running and still convert nothing
+
+A wave dispatched at "each agent guarantees 100% of its subsystem in 100
+minutes" returned +10 files against a +270 target — a 3.7% hit rate. The
+arithmetic was refutable before dispatch: ~10 min fixed cost per mechanism and
+a measured ~55 min of unavoidable per-agent overhead (triage + build + measure)
+leaves ~4 mechanisms per agent, and mechanisms convert 1-3 files each once a
+subsystem's homogeneous clusters are gone. 270 was never reachable, and saying
+so up front was the job.
+
+What the wave actually produced: three per-file unreached inventories with a
+named cause each, a hang histogram that collapsed 19 files to 4 shapes, two
+corrected leads, and a reproducer for a bug that had been parked for want of
+one. That is a **diagnosis round**, and diagnosis rounds are worth running —
+they are just not worth *scoring* against a conversion target. Label the round
+for what it is before dispatch, or its output looks like failure.
+
+### Never use a live integration worktree as an agent's baseline
+
+A wave-3 agent's first guard read −2 with three `pass → fail`. All three were
+artefacts, and the cause was mine. Agents were dispatched with base `e2bd37d`,
+but they took their *baseline binary* from the integration worktree — and I kept
+committing and rebuilding there while they worked. By the time the agent measured,
+that binary contained two of my later commits, so its own correctly-built binary
+looked like a regression against it. The three files map exactly onto those two
+commits: two on the tls verify-code fix, one on `testEnabled is not a function`
+from the debuglog fix.
+
+The agent diagnosed it as build-environment drift (fresh prebuilts pulled between
+two builds of the same commit). That is not what happened, and recording it would
+have sent the next round chasing something that does not exist. **Same commit was
+never the question — the integration worktree's binary is a moving target by
+construction.**
+
+Its remedy was still exactly right, and is now the rule:
+
+1. **Snapshot the base binary at dispatch** and hand agents *that path*. A rebuild
+   in the integration tree then cannot disturb anyone's baseline, and the same
+   trick lets a multi-hour corpus run survive integration work continuing around
+   it. **Copy it to `<dir>/bin/mbun` — keep the basename.** Renaming the copy
+   (`mbun-<sha>`) silently breaks every test that re-spawns the runtime: they fail
+   with `spawn mbun ENOENT`, and a full-corpus run measured that way reported
+   **10 regressions that do not exist**, all in child_process/process/signal/
+   module. Each one passed 3/3 against the identical build output under its
+   normal name. Verified both ways: `target/integration/snapdir/bin/mbun` passes,
+   `target/integration/mbun-<sha>` fails.
+2. **An agent that suspects its baseline should rebuild its own control from its
+   own base commit in its own worktree** — which is what caught this — and diff
+   against that, not against a borrowed binary.
+
+The general form: a baseline is a *measurement*, not a file path. If you cannot
+say which source state produced a binary, it is not a baseline, and "it's the same
+commit" does not establish that when someone else is still building in that tree.
+
+### A dump signature is not a cause count
+
+Shape A of the http hangs was catalogued as 10 files sharing one signature
+(`Server{listening}` + zero sockets). Fixing the mechanism converted 5. The other
+5 share the *signature* and nothing else: two need `--expose-gc` and a real
+`FinalizationRegistry`, two are a `destroySoon()` that destroys immediately
+instead of `end()`-then-destroy-on-`'finish'`, one is a cluster-layer failure.
+
+So a dump signature groups files by *what the loop looks like when they stop*,
+which is downstream of the cause — the same trap as grouping by log text, in a
+more convincing disguise. Budget a signature at its cause count, and if you do not
+yet know that count, say the signature is unsplit rather than quoting its size.
+
+
+### A wrong toolchain default does not fail in a way that points at itself
+
+**Correction to a diagnosis I published.** After deleting `build.ninja` to force a
+reconfigure, one worktree could no longer build: an internal compiler error in
+`modules/ffi/src/native.cppm` on the first attempt, then `'byteswap' is not a
+member of 'std'` across `modules/crypto` on every attempt after. Other worktrees
+on the same commit built fine. I concluded that a full reconfigure is not a safe
+reset here and said so in a commit message and on the PR.
+
+That was wrong. The global `~/.mcpp/config.toml` toolchain default had been
+flipped to **gcc 15.1.0**; this project needs **16.1.0** (declared as
+`xim:gcc@16.1.0` in its own package deps). Deleting `build.ninja` did nothing
+worse than force a reconfigure that then picked up the wrong default. Once the
+default was restored the same worktree built immediately, with `build.ninja`
+still absent.
+
+Two things worth keeping from it:
+
+- **Neither error message mentions a compiler version.** An ICE reads like a
+  compiler bug and a missing `std::byteswap` reads like source rot or a corrupt
+  module cache. Cost: ~40 minutes for one agent, plus a wrong published
+  diagnosis from me. `build_or_die.sh` now compares the project's declared
+  `xim:gcc@<version>` against the configured default **before** building and
+  refuses with the actual reason.
+- **An agent changed a global user config outside the repository.** Worktree
+  isolation does not cover `~/.mcpp/`, so one agent's environment fix or break is
+  every concurrent agent's. Treat anything under `$HOME` as shared mutable state.
+
+The general form, and it is the same lesson as the phantom-regression rule: when
+several independent things break at once in a way that does not name a common
+cause, suspect the shared environment before suspecting the code.
+### Real node is installed — but it is a DIFFERENT VERSION from the corpus
+
+**Correction to the rule as it was first written here.** `node v24.15.0` is on
+PATH; the corpus is **node v26.3.0** (`compat/node/src/node_version.h`,
+`NODE_MAJOR_VERSION 26`). Judging a v26 corpus expectation with a v24 binary
+gives a confidently wrong answer, and the first version of this section told
+agents to do exactly that.
+
+Measured: real node v24 **fails** the corpus file
+`test-child-process-spawn-timeout-kill-signal.js`, because `validateTimeout`
+changed between the releases — v24 throws `ERR_OUT_OF_RANGE` for a string
+timeout, v26 throws `ERR_INVALID_ARG_TYPE`. An agent caught this, went by
+`compat/node/lib/` instead, and was right to.
+
+**The authority is `compat/node/lib/` — the vendored v26 JavaScript source.**
+Read it. The on-PATH binary is a *sanity check*, useful only where you have
+reason to believe the behaviour did not move between 24 and 26; when they
+disagree, the vendored source wins and the oracle is simply out of date. Error
+codes and `NodeError` message text are exactly what moves most between releases,
+and they are what corpus files assert on most.
+
+With that qualification, the original point stands: Every question of the form "does node really behave
+that way?" is one command away, and answering it by reasoning instead has now
+cost this project several times over.
+
+The clearest case: an inventory entry carried my caveat that
+`test-http-agent-abort-controller` asserts `listenerCount(signal, 'abort') === 1`
+*synchronously*, "which node's own nextTick registration appears not to satisfy"
+— i.e. I had guessed the test might be unsatisfiable and told an agent to be
+wary of it. The agent ran the file against real node. **It passes.** The mbun gap
+was elsewhere entirely and two-part: `Socket#connect` ignored `signal`, and
+`events.listenerCount()` could not see EventTarget listeners because mbun's
+`AbortSignal` keeps them in `_l`. Both files converted.
+
+Use it as an oracle before recording a cause, and especially before telling
+anyone a corpus expectation might be wrong. The corpus is not the specification;
+the reference implementation is, and it is right there.
+
+### "No dump" is not "native crash" — the third time
+
+A hang with no `hang_dump.js` output has now been filed as a native crash or
+native block three times, and dissolved under measurement three times:
+
+1. `http-timeout-shape-D`, "2 files die in native `WTFCrashWithInfo`" — never
+   existed. All 49 http timeouts exit 124, and a crashing process dies on a
+   signal and never reaches the timeout kill, so a crash and a 124 are mutually
+   exclusive classifications.
+2. One tls "no dump" case was `hang_dump.js`'s own limitation: it `require`s its
+   target, so a `process.argv[2]`-dispatched re-exec test throws instead of
+   running.
+3. `test-http2-reset-flood`, filed under "native block", was the server
+   **accepting a malformed HEADERS block instead of rejecting it**, so the flood
+   never terminated. It is now green.
+
+The rule: a missing dump means UNKNOWN. Check the exit code, grep the log for
+crash text, and only then name a layer.
+
+### A shared global config is contested state
+
+`~/.mcpp/config.toml`'s toolchain default was flipped from gcc 16.1.0 to 15.1.0
+**twice** during one round, by concurrent agents, and this repository does not
+build under 15.1. Worktrees isolate the repo; they do not isolate `$HOME`.
+
+The second flip was caught in five seconds instead of forty minutes, because
+`build_or_die.sh` now compares the project's declared `xim:gcc@<version>` against
+the configured default before building. That check earned its keep on the very
+next build after it was written.
+
+Two rules follow:
+
+- **Treat anything under `$HOME` as shared mutable state**, and re-check it
+  rather than assuming it survived. An agent that "restored" a global setting has
+  not made it stay restored.
+- **`worktree_setup.sh` deletes `build.ninja` to force a reconfigure**, which is
+  precisely when a bad global default gets picked up. So a broken toolchain
+  default does not break the worktree that set it — it breaks every worktree
+  created *afterwards*, which is why it presented as "wt1 and wt4 are both
+  mysteriously unbuildable".
+
+### A broken test facility hides as a passing test
+
+`node:test`'s mock had two dead features, both found while chasing an unrelated
+fs file:
+
+- `mockImplementationOnce` compared against `calls.length`, but the call record
+  is pushed *before* the implementation runs — off by one, so the
+  once-implementation was **never** selected.
+- `mock.getter` / `mock.setter` used plain assignment (`object[name] = fn`),
+  which cannot replace an accessor defined on a prototype.
+
+Any corpus file relying on either was silently exercising the **unmocked** path.
+That is the same shape as the `assert.throws` matcher that ignored its error
+argument — which, when fixed, removed 126 passes that had never been real.
+
+The pattern is worth naming: **a defect in the test facility is invisible in
+exactly the direction that flatters you.** When a harness feature is
+under-exercised, check that it works at all before trusting any file that uses
+it. Here the full-corpus guard showed no pass loss from the fix, so nothing had
+been leaning on it — but that was measured, not assumed.
+
+## Dispatch protocol — the long-tail phase
+
+The mechanism-hunting protocol (causes pre-named, one agent per subsystem, each
+running its own full guard) took a wave from 3.7% of target to 150%. It is now
+the wrong tool, and the measurement says why.
+
+On the round-11 node run, **1419 non-passing files carry 540 distinct failure
+signatures — 2.6 files each.** 41% sit in clusters of ≤4 files, 31% are
+singletons. Only ~20% sit in clusters large enough to brief as a mechanism, and
+even those two (`mustCall`, `timeout`) are umbrellas over many unrelated causes.
+An architectural push was the obvious next hypothesis and it is **refuted**: only
+223 of 1419 files (16%) need `internalBinding` or node's internal modules at all;
+**84% are pure public-API gaps**.
+
+So the search now costs more than the repair. What a long tail needs is
+throughput.
+
+### Division of labour
+
+| | who | why |
+|---|---|---|
+| Full-corpus measurement | **integration only** | ~50 min each. Nine agents paying it is nine times the same number. |
+| Cross-subsystem guard | **integration only** | Only meaningful once changes are composed. |
+| Build verification | **integration only** | One toolchain check, one composed build. |
+| Per-file repair + a subsystem-subset run | **agents** | Seconds to minutes, and the only part that is actually parallel. |
+
+An agent's guard is now `--files <its own worklist>` plus its subsystem filter —
+nothing wider. It is explicitly **not** asked to prove the absence of
+cross-subsystem regressions, because it cannot do that cheaply and integration
+can.
+
+### Worklists, not subsystems
+
+`make_worklists.py` cuts a run into small **disjoint** lists, round-robin across
+subsystems so concurrent agents edit different areas, each file carrying its
+extracted signature and confidence. A file whose signature is MANIFESTATION or
+UNSPLIT is included but flagged — a quarter of the corpus is in that state, and
+hiding it would only move the surprise.
+
+### Resource discipline at higher parallelism
+
+Ten agents is safe *only* because of what is already in place, and it is worth
+naming so nobody removes it:
+
+- `build_lock.sh` defaults to **one build slot**. Builds queue; they never storm.
+  A previous link storm drove this machine to load 41 and exhausted swap.
+- Corpus runs use `--jobs 3` at this parallelism, not 5. Ten agents × 3 ≈ 30
+  concurrent processes against 32 cores.
+- Every test goes through `safe-test.sh` / `bounded_run.py`, which bound memory
+  and kill hangs. A bare corpus file can fork-storm the machine.
+
+The failure mode to watch is not CPU, it is **swap**: it has been driven to 100%
+once in this session and stayed there. Load is recoverable; a machine in swap
+death is not.
+
+
+### Correction: the "256 KiB per-file limit" was not the rule I claimed
+
+Earlier in this series I diagnosed a build failure —
+`index requires mcpp >= 0.0.108 but this is mcpp 0.0.103` — as a **~256 KiB
+per-file source limit**, split `js_net.cppm` and `js_http2.cppm` on that basis,
+and wrote the rule into two commit messages and an agent brief.
+
+The evidence for it was real but incomplete: the file was 254 KiB and built, 274
+KiB and failed, 259 KiB and built again. What I never checked is whether any
+*other* file was already larger. **`modules/jsc/src/builtins/bootstrap.cppm` is
+414 KiB and builds fine**, and four test fixtures under `modules/toml` and
+`modules/glob` are larger still (up to 1.4 MiB). A simple per-file byte cap
+cannot be the rule.
+
+So the size correlation was real and reproducible, and my *explanation* of it was
+wrong. The E0006 floor is about the package index, and it also appeared — then
+vanished — during a concurrent workspace test with two corpus runs in flight,
+which points at shared-state interference rather than at any property of the
+file. The honest statement is: **crossing some size threshold in `modules/jsc`
+can trigger E0006, the mechanism is not established, and splitting the payload is
+a workaround, not a fix.**
+
+The splits stay: they are harmless, they follow the existing
+`js_streams.cppm` shape, and each half is independently under every threshold
+anyone has observed. But do not propagate "mcpp has a 256 KiB file limit" as
+fact — it is not one, and `bootstrap.cppm` disproves it.
+
+### Line budget: 2000 lines per file under `runtime/`
+
+This one IS a real, enforced rule, and it is the one that broke CI. `modules/jsc`'s
+`test_runtime_structure` caps every file under `src/runtime/` — and `runtime.cppm`
+itself — at 2000 lines, and walks the `#include` graph to prove each slice is
+registered. This round pushed `engine.inc` to 2372 and `io_bindings.inc` to 2046,
+so `mcpp test --workspace` failed while `mcpp build` was perfectly green.
+
+Extracted `Runtime::install_bindings_` into `runtime/bindings_install.inc` and the
+tail of `io_bindings.inc`'s free functions into `runtime/io_fs_errors.inc`, each
+`#include`d from where the code used to sit — the same move `module_loading.inc`
+represents. A build passing is not evidence the workspace test will.

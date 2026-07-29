@@ -100,6 +100,15 @@ PROBES: tuple[Probe, ...] = (
         "raw socket accept + write + FIN",
     ),
     Probe(
+        "setImmediate-chain-x10000", 400,
+        'let n=0;const t=()=>{if(++n<10000)setImmediate(t);};t();',
+        "a chain where each setImmediate is queued FROM an immediate, so every link "
+        "needs its own check-phase turn. Real node v24 does this in 10ms; mbun did "
+        "12ms until a drain-batch stamp made it 209ms — a 17x regression that changed "
+        "no observable semantics (baseline, regressed build and node all print A,B,A2). "
+        "Threshold set well above node but far below the regression.",
+    ),
+    Probe(
         "timer-drain-x10000", 900,
         'let n=0;const t=()=>{if(++n<10000)setImmediate(t);};t();',
         "event-pump overhead per turn",
@@ -186,12 +195,23 @@ def main() -> int:
         raw, error = measure(binary, probe, out_dir, args.repeats, args.timeout)
         # Subtract the startup floor: we are timing the operation, not the runtime's boot.
         net = max(0.0, raw - floor)
+        # ...but a clamp to zero is a LIE, and it made this tool report "ok" for
+        # nine probes in a row while measuring nothing. Startup varied 165ms vs
+        # 115ms between two binaries, so every operation cheaper than that spread
+        # subtracted to 0.0 and passed. Measured directly instead, the same pair
+        # differed 12ms vs 209ms on a setImmediate chain — a 17x regression this
+        # tool called "ok" twice.
+        #
+        # So when the subtraction bottoms out, say so rather than printing a
+        # number that is not one. The floor itself is the thing to compare across
+        # binaries in that case.
+        floored = raw > 0 and net <= 0.05 * max(raw, 1.0)
         results[probe.name] = round(net, 1)
         if error:
             broken.append(f"{probe.name}: {error}")
             print(f"{probe.name:26} {net:8.1f} {probe.threshold_ms:8.0f}  BROKEN — {error}")
             continue
-        verdict = "ok"
+        verdict = "ok" if not floored else "UNRESOLVED (< startup noise; compare raw/floor)"
         if net > probe.threshold_ms:
             failures.append(f"{probe.name} {net:.0f}ms > {probe.threshold_ms:.0f}ms threshold")
             verdict = "OVER THRESHOLD"

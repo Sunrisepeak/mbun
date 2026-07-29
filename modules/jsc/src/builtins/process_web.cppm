@@ -14,7 +14,9 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   const CP = globalThis.__mbunCpNative;
   const PROC = globalThis.__mbunProcNative;
   const normArgs = (a, o) => (Array.isArray(a) ? { args: a, opts: o || {} } : { args: [], opts: a || {} });
-  const SIGMAP = { SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGILL: 4, SIGTRAP: 5, SIGABRT: 6, SIGIOT: 6, SIGBUS: 7, SIGFPE: 8, SIGKILL: 9, SIGUSR1: 10, SIGSEGV: 11, SIGUSR2: 12, SIGPIPE: 13, SIGALRM: 14, SIGTERM: 15, SIGCHLD: 17, SIGCONT: 18, SIGSTOP: 19, SIGTSTP: 20, SIGTTIN: 21, SIGTTOU: 22 };
+  // Full Linux signal table (os.constants.signals): node validates killSignal
+  // against it, so a partial map made SIGURG/SIGXCPU/... "unknown signals".
+  const SIGMAP = { SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGILL: 4, SIGTRAP: 5, SIGABRT: 6, SIGIOT: 6, SIGBUS: 7, SIGFPE: 8, SIGKILL: 9, SIGUSR1: 10, SIGSEGV: 11, SIGUSR2: 12, SIGPIPE: 13, SIGALRM: 14, SIGTERM: 15, SIGSTKFLT: 16, SIGCHLD: 17, SIGCLD: 17, SIGCONT: 18, SIGSTOP: 19, SIGTSTP: 20, SIGTTIN: 21, SIGTTOU: 22, SIGURG: 23, SIGXCPU: 24, SIGXFSZ: 25, SIGVTALRM: 26, SIGPROF: 27, SIGWINCH: 28, SIGIO: 29, SIGPOLL: 29, SIGPWR: 30, SIGSYS: 31, SIGUNUSED: 31 };
   const SIGNAME = {}; for (const k in SIGMAP) if (!SIGNAME[SIGMAP[k]]) SIGNAME[SIGMAP[k]] = k;
   const ERRNO = { 1: "EPERM", 2: "ENOENT", 8: "ENOEXEC", 9: "EBADF", 11: "EAGAIN", 12: "ENOMEM", 13: "EACCES", 20: "ENOTDIR", 21: "EISDIR", 22: "EINVAL", 23: "ENFILE", 24: "EMFILE", 36: "ENAMETOOLONG" };
   // Node defers only these spawn errnos to the async 'error' event; the rest
@@ -24,6 +26,16 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   const _b64 = (d) => { const u = _u8(d); let s = ""; for (let i = 0; i < u.length; i += 4096) s += String.fromCharCode.apply(null, u.subarray(i, i + 4096)); return G.btoa(s); };
   const _unb64 = (b) => { const s = G.atob(b); const u = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i); return u; };
   const nextTick = (fn) => (G.process && G.process.nextTick ? G.process.nextTick(fn) : G.queueMicrotask(fn));
+  // A libuv errno (negative) for a SystemError's `errno` field, so that
+  // util.getSystemErrorName(err.errno) round-trips to the same code. Resolved
+  // lazily: node:os is registered after this partition loads.
+  const uvErrno = (name, fallback) => {
+    try {
+      const os = M["os"] || M["node:os"];
+      const v = os && os.constants && os.constants.errno && os.constants.errno[name];
+      return typeof v === "number" ? -Math.abs(v) : fallback;
+    } catch (e) { return fallback; }
+  };
 
   // Active async children; __mbun_io_tick drives every entry each pump turn.
   const CHILDREN = (G.__mbunChildren = G.__mbunChildren || new Set());
@@ -49,6 +61,50 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     return r;
   };
 
+  // A stdio slot above stderr: node backs it with a uv_pipe_t and exposes a
+  // duplex net.Socket on child.stdio[i] (lib/internal/child_process.js), so the
+  // parent can both write to and read from the extra channel. The read half is
+  // fed by the same drainOut() the stdout/stderr Readables use.
+  const makeDuplexPipe = (fd, rec) => {
+    const S = M["stream"] || M["node:stream"];
+    const DC = S && S.Duplex;
+    if (!DC) return makeReadable();  // stream not registered yet: read-only, as before
+    const w = { fd, buf: [], closed: false };
+    rec.writers.push(w);
+    const d = new DC({
+      read() {},
+      write(chunk, enc, cb) {
+        const data = typeof chunk === "string" ? te.encode(chunk) : _u8(chunk);
+        w.buf.push({ data, off: 0, cb: null });
+        flushWriter(w);
+        cb();
+      },
+      final(cb) { flushWriter(w); cb(); },
+    });
+    d.bytesRead = 0;
+    d.__data = (bytes) => { d.bytesRead += bytes.length; d.push(Buffer.from(bytes)); };
+    d.__end = () => { if (d._ended) return; d._ended = true; w.closed = true; d.push(null); };
+    return d;
+  };
+
+  // The write half of a stdio slot ABOVE stderr. Those slots are socketpairs
+  // (see spawnEx), so the parent's descriptor is duplex: the SAME fd is polled
+  // for reads in rec.outs and written through here. Same non-blocking discipline
+  // as flushStdin — queue, then drain what the kernel accepts each io tick.
+  const flushWriter = (w) => {
+    if (w.fd < 0 || w.closed) return;
+    while (w.buf.length) {
+      const item = w.buf[0];
+      if (item.data.length - item.off <= 0) { w.buf.shift(); if (item.cb) try { item.cb(); } catch (e) {} continue; }
+      const n = PROC.writeNB(w.fd, _b64(item.data.subarray(item.off)), 0);
+      if (n < 0) { w.buf.shift(); if (item.cb) try { item.cb(); } catch (e) {} continue; }  // peer gone
+      if (n === 0) return;  // EAGAIN — retry next tick
+      item.off += n;
+      if (item.off >= item.data.length) { w.buf.shift(); if (item.cb) try { item.cb(); } catch (e) {} }
+      else return;
+    }
+  };
+
   const flushStdin = (rec) => {
     if (rec.stdinFd < 0 || rec.stdinClosed) return;
     while (rec.stdinBuf.length) {
@@ -64,6 +120,291 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     if (rec.stdinEnded) { try { PROC.close(rec.stdinFd); } catch (e) {} rec.stdinClosed = true; if (rec.cp.stdin) { rec.cp.stdin.destroyed = true; rec.cp.stdin.writable = false; } }
   };
 
+  // ---- IPC channel (node fork() / process.send) ---------------------------
+  // node frames each IPC message as one line of JSON over the AF_UNIX
+  // socketpair opened by the "ipc" stdio slot
+  // (lib/internal/child_process/serialization.js, `json` mode:
+  // `JSON.stringify(message) + "\n"`). The child locates its own end through
+  // NODE_CHANNEL_FD exactly as node's _forkChild does.
+  // send()'s `handle` argument implements node's NODE_HANDLE protocol: the frame
+  // becomes `{ cmd: "NODE_HANDLE", type, msg }` and the descriptor travels as
+  // SCM_RIGHTS on the same sendmsg (__mbunProcNative.sendmsgFd/recvmsgFd). A
+  // value with no descriptor behind it is still rejected with
+  // ERR_INVALID_HANDLE_TYPE. DEFERRED: 'advanced' (v8) serialization.
+  const IPC_HIGH_WATER = 65536 * 2;
+  const recvDesc = (v) => {
+    if (v === null) return "null";
+    if (v === undefined) return "undefined";
+    const t = typeof v;
+    if (t === "symbol") return "type symbol (" + String(v) + ")";
+    if (t === "string") return "type string ('" + v + "')";
+    if (t === "function") return "function " + (v.name || "");
+    if (t === "object") return "an instance of " + ((v.constructor && v.constructor.name) || "Object");
+    return "type " + t + " (" + String(v) + ")";
+  };
+  const makeIpc = (fd, advanced) => { PROC.setNonBlock(fd); return { fd, buf: "", out: [], queued: 0, closed: false, refd: true, rxFds: [], sent: [], adv: !!advanced }; };
+  // ---- 'advanced' (structured-clone) serialization ------------------------
+  // node's `serialization: 'advanced'` swaps JSON for the v8 value serializer,
+  // so a message may be cyclic, a Map/Set, a BigInt or a Buffer
+  // (lib/internal/child_process/serialization.js). mbun keeps the SAME
+  // newline-delimited frame the json mode uses and carries the serialized bytes
+  // base64-encoded inside it, rather than node's 4-byte-length binary framing:
+  // this reader is byte-transparent only through a UTF-8 string buffer, and both
+  // ends of every mbun channel are mbun (the fd is handed over by our own
+  // spawn(), never shared with a real node process). The observable JS contract
+  // — what survives a send() — is the v8 format either way.
+  const v8mod = () => M["v8"] || M["node:v8"];
+  const advEncode = (message) => {
+    const v8 = v8mod();
+    if (!v8 || typeof v8.serialize !== "function") {
+      const e = new Error("advanced serialization requires node:v8"); e.code = "ERR_INVALID_ARG_VALUE"; throw e;
+    }
+    return _b64(_u8(v8.serialize(message === undefined ? null : message)));
+  };
+  const advDecode = (line) => {
+    const v8 = v8mod();
+    return v8.deserialize(Buffer.from(_unb64(line)));
+  };
+  const ipcClose = (ch) => { if (ch.closed) return; ch.closed = true; try { PROC.close(ch.fd); } catch (e) {} };
+  const canPassFd = () => typeof PROC.sendmsgFd === "function" && typeof PROC.recvmsgFd === "function";
+  const ipcFlush = (ch) => {
+    while (ch.out.length && !ch.closed) {
+      const item = ch.out[0];
+      let w;
+      if (item.fd >= 0 && canPassFd()) {
+        // The descriptor rides on the FIRST byte of this frame; once any byte
+        // of it has gone out the fd is delivered and must not be re-sent.
+        w = PROC.sendmsgFd(ch.fd, _b64(item.data), item.off, item.fd);
+        if (w > 0) item.fd = -1;
+      } else {
+        w = PROC.writeNB(ch.fd, _b64(item.data.subarray(item.off)), 0);
+      }
+      if (w < 0) {  // peer gone — drop the rest, the 'disconnect' path reports it
+        ch.out.shift(); ch.queued -= item.data.length - item.off;
+        if (item.cb) { const cb = item.cb; nextTick(() => cb(null)); }
+        continue;
+      }
+      if (w === 0) return;  // EAGAIN — retry next tick
+      item.off += w; ch.queued -= w;
+      if (item.off >= item.data.length) { ch.out.shift(); if (item.cb) { const cb = item.cb; nextTick(() => cb(null)); } }
+      else return;
+    }
+  };
+  const ipcWrite = (ch, message, cb, sendFd) => {
+    const data = te.encode((ch.adv ? advEncode(message) : JSON.stringify(message === undefined ? null : message)) + "\n");
+    ch.out.push({ data, off: 0, cb: cb || null, fd: typeof sendFd === "number" ? sendFd : -1 });
+    ch.queued += data.length;
+    ipcFlush(ch);
+    return ch.queued < IPC_HIGH_WATER;
+  };
+  // ---- node's NODE_HANDLE protocol ----------------------------------------
+  // A message sent with a `handle` argument travels as
+  // `{ cmd: "NODE_HANDLE", type, msg }` while the descriptor itself goes out as
+  // SCM_RIGHTS on the same sendmsg. Descriptors therefore arrive in frame order
+  // and never later than their frame, so the reader can pair the Nth
+  // NODE_HANDLE frame with the Nth received descriptor.
+  const ipcHandleInfo = (h) => {
+    if (h === null || typeof h !== "object") return null;
+    if (typeof h.__ipcSendFd === "function") { try { return h.__ipcSendFd(); } catch (e) { return null; } }
+    const fd = h._fd;
+    if (typeof fd !== "number" || fd < 0) return null;
+    if (typeof h.listen === "function") return { fd, type: "net.Server" };
+    if (typeof h.connect === "function" && typeof h.write === "function") return { fd, type: "net.Socket" };
+    if (typeof h.bind === "function" && typeof h.send === "function") return { fd, type: "dgram.Native" };
+    return { fd, type: "net.Native" };
+  };
+  const ipcRecvHandle = (type, fd) => {
+    if (typeof fd !== "number" || fd < 0) return null;
+    const netmod = M["net"] || M["node:net"];
+    try {
+      if (type === "net.Socket" && netmod && typeof netmod.Socket === "function") {
+        const s = new netmod.Socket();
+        if (typeof s._adopt === "function") { s._adopt(fd); return s; }
+      }
+      // A shared dgram socket (cluster's SharedHandle for udp4/udp6) must arrive
+      // as a real UDP *handle*, not a bare descriptor: lib/dgram.js
+      // bindServerHandle() replaceHandle()s it into the Socket and immediately
+      // calls handle.recvStart(). node passes the live handle across the C++
+      // boundary; mbun only has the fd, so rebuild the handle around it.
+      if (type === "dgram.Native") {
+        const dg = M["internal/dgram"];
+        if (dg && typeof dg.newHandle === "function") {
+          const h = dg.newHandle("udp4");
+          if (h.open(fd) === 0) return h;
+        }
+      }
+    } catch (e) {}
+    // Raw descriptor wrapper: what cluster's round-robin `newconn` hands to
+    // net.Server, and the fallback for anything with no richer JS shape.
+    return {
+      fd,
+      __ipcSendFd() { return { fd: this.fd, type }; },
+      // libuv's handle.close() takes an optional callback fired once the handle
+      // is really closed; cluster's worker relies on it when it hands a
+      // connection back (test-cluster-worker-handle-close).
+      close(cb) {
+        if (this.fd >= 0) { try { PROC.close(this.fd); } catch (e) {} this.fd = -1; }
+        if (typeof cb === "function") G.queueMicrotask(cb);
+      },
+    };
+  };
+  // node closes the sender's copy of a handle once the peer acknowledges it
+  // (lib/internal/child_process.js handleConversion[...].postSend, skipped for
+  // `options.keepOpen`). Without the ack the parent keeps the socket it handed
+  // over, which pins its event loop for good
+  // (test-cluster-send-socket-to-worker-http-server).
+  const closeSentHandle = (entry) => {
+    if (!entry || entry.keepOpen) return;
+    const h = entry.handle;
+    try {
+      if (h && typeof h.close === "function") h.close();
+      else if (h && typeof h.destroy === "function") h.destroy();
+    } catch (e) {}
+  };
+
+  const ipcRead = (ch, onMessage, onEof) => {
+    // node observes the channel's EOF on a LATER loop turn than the last frame
+    // it delivered, so every nextTick/microtask the frame scheduled has run
+    // before the disconnect lands. This reader drains to EAGAIN in one burst, so
+    // an EOF that arrives with the final frame has to be held over to the next
+    // io tick — otherwise a cluster worker sees the channel die before the
+    // teardown its 'disconnect' frame started can call process.disconnect(),
+    // and the second call raises ERR_IPC_DISCONNECTED
+    // (test-cluster-server-restart-rr / -shared-leak).
+    if (ch.deferEof) { ch.deferEof = false; onEof(); return; }
+    let delivered = 0;
+    for (;;) {
+      let b;
+      if (canPassFd()) {
+        let r;
+        try { r = PROC.recvmsgFd(ch.fd, 65536); } catch (e) { onEof(); return; }
+        if (r === null) { onEof(); return; }
+        if (r.fds && r.fds.length) for (let i = 0; i < r.fds.length; i++) ch.rxFds.push(r.fds[i]);
+        if (r.eof) { if (delivered) { ch.deferEof = true; return; } onEof(); return; }
+        b = r.data;
+      } else {
+        try { b = PROC.readNB(ch.fd, 65536); } catch (e) { onEof(); return; }
+        if (b === null) { if (delivered) { ch.deferEof = true; return; } onEof(); return; }
+      }
+      if (b === "") return;
+      ch.buf += Buffer.from(_unb64(b)).toString("utf8");
+      let idx;
+      while ((idx = ch.buf.indexOf("\n")) >= 0) {
+        const line = ch.buf.slice(0, idx);
+        ch.buf = ch.buf.slice(idx + 1);
+        if (!line) continue;
+        let msg;
+        try { msg = ch.adv ? advDecode(line) : JSON.parse(line); } catch (e) { continue; }
+        let handle;
+        if (msg !== null && typeof msg === "object" && msg.cmd === "NODE_HANDLE_ACK") {
+          closeSentHandle(ch.sent.shift());
+          continue;
+        }
+        if (msg !== null && typeof msg === "object" && msg.cmd === "NODE_HANDLE") {
+          const fd = ch.rxFds.length ? ch.rxFds.shift() : -1;
+          handle = ipcRecvHandle(msg.type, fd);
+          msg = msg.msg;
+          ipcWrite(ch, { cmd: "NODE_HANDLE_ACK" }, null);
+        }
+        delivered++;
+        onMessage(msg, handle);
+      }
+    }
+  };
+  const isInternalIpc = (m) => m !== null && typeof m === "object" && typeof m.cmd === "string" && m.cmd.slice(0, 5) === "NODE_";
+
+  // The send()/disconnect()/connected surface shared by both ends of a channel
+  // (node lib/internal/child_process.js setupChannel): the parent's
+  // ChildProcess and, inside a forked child, `process` itself.
+  const attachIpc = (target, ch, onDisconnect) => {
+    target.channel = { fd: ch.fd, ref() { ch.refd = true; return this; }, unref() { ch.refd = false; return this; }, hasRef() { return ch.refd; } };
+    target.connected = true;
+    target.send = function (message, handle, options, callback) {
+      if (typeof handle === "function") { callback = handle; handle = undefined; options = undefined; }
+      else if (typeof options === "function") { callback = options; options = undefined; }
+      else if (options !== undefined) {
+        if (options === null || typeof options !== "object") {
+          const e = new TypeError('The "options" argument must be of type object. Received ' + recvDesc(options));
+          e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+        }
+      }
+      if (callback !== undefined && callback !== null && typeof callback !== "function") {
+        const e = new TypeError('The "callback" argument must be of type function. Received ' + recvDesc(callback));
+        e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+      }
+      if (message === undefined) { const e = new TypeError('The "message" argument must be specified'); e.code = "ERR_MISSING_ARGS"; throw e; }
+      const mt = typeof message;
+      if (mt !== "string" && mt !== "object" && mt !== "number" && mt !== "boolean") {
+        const e = new TypeError('The "message" argument must be one of type string, object, number, or boolean. Received ' + recvDesc(message));
+        e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+      }
+      let sendFd = -1;
+      if (handle !== undefined && handle !== null) {
+        const info = canPassFd() ? ipcHandleInfo(handle) : null;
+        if (info === null) {
+          const e = new TypeError("This handle type cannot be sent"); e.code = "ERR_INVALID_HANDLE_TYPE"; throw e;
+        }
+        sendFd = info.fd;
+        message = { cmd: "NODE_HANDLE", type: info.type, msg: message };
+        ch.sent.push({ handle, keepOpen: !!(options && options.keepOpen) });
+      }
+      if (!this.connected || ch.closed) {
+        const e = new Error("Channel closed"); e.code = "ERR_IPC_CHANNEL_CLOSED";
+        const self = this;
+        if (typeof callback === "function") nextTick(() => callback(e));
+        else nextTick(() => { self.emit("error", e); });
+        return false;
+      }
+      return ipcWrite(ch, message, typeof callback === "function" ? callback : null, sendFd);
+    };
+    // node defers the 'disconnect' event to the next tick even when the local
+    // side initiated it (test-child-process-disconnect asserts exactly that).
+    target.disconnect = function () {
+      if (!this.connected) {
+        const e = new Error("IPC channel is already disconnected"); e.code = "ERR_IPC_DISCONNECTED";
+        this.emit("error", e);
+        return;
+      }
+      this.connected = false;
+      const self = this;
+      nextTick(() => {
+        ipcClose(ch);
+        self.channel = null;
+        if (onDisconnect) onDisconnect();
+        self.emit("disconnect");
+      });
+    };
+  };
+
+  // Messages that arrive before any 'message' listener exists are queued (node
+  // replays them from the channel's pending list once one is attached).
+  const makeIpcDelivery = (target) => {
+    const pending = [];
+    return {
+      deliver(msg, handle) {
+        if (isInternalIpc(msg)) { target.emit("internalMessage", msg, handle); return; }
+        pending.push([msg, handle]);
+        this.flush();
+      },
+      flush() {
+        while (pending.length && target.listenerCount("message") > 0) {
+          const entry = pending.shift();
+          const msg = entry[0], handle = entry[1];
+          // node dispatches each IPC message from its own tick, so a listener
+          // that throws hits 'uncaughtException' and the next message still
+          // arrives (test-child-process-ipc-next-tick).
+          try {
+            target.emit("message", msg, handle);
+          } catch (e) {
+            const pr = G.process;
+            if (pr && typeof pr.listenerCount === "function" && pr.listenerCount("uncaughtException") > 0) pr.emit("uncaughtException", e);
+            else throw e;
+          }
+        }
+      },
+    };
+  };
+
   const drainOut = (o) => {
     for (;;) {
       const b = PROC.readNB(o.fd, 65536);
@@ -76,6 +417,9 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   const maybeClose = (rec) => {
     if (!rec.exited || rec.closed) return;
     for (const o of rec.outs) if (!o.ended) return;  // wait for all pipes to hit EOF
+    // node counts the IPC channel as a live handle too: 'disconnect' must land
+    // before 'close' (lib/internal/child_process.js maybeClose).
+    if (rec.ipc && !rec.ipc.closed) return;
     if (rec.stdinFd >= 0 && !rec.stdinClosed) { try { PROC.close(rec.stdinFd); } catch (e) {} rec.stdinClosed = true; if (rec.cp.stdin) { rec.cp.stdin.destroyed = true; rec.cp.stdin.writable = false; } }
     rec.closed = true; rec.done = true;
     rec.cp.emit("close", rec.code, rec.signal);
@@ -95,21 +439,51 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     maybeClose(rec);
   };
 
+  // This process's own channel back to the parent when it was fork()ed
+  // (NODE_CHANNEL_FD). Serviced by the same tick as the children we spawned.
+  let SELF_IPC = null;
+
+  const drainChildIpc = (rec) => {
+    ipcRead(rec.ipc, (msg, handle) => rec.ipcDelivery.deliver(msg, handle), () => {
+      ipcClose(rec.ipc);
+      if (rec.cp.connected) {
+        rec.cp.connected = false;
+        rec.cp.channel = null;
+        nextTick(() => rec.cp.emit("disconnect"));
+      }
+    });
+  };
+
   G.__mbun_io_tick = function () {
-    if (!CHILDREN.size) return 0;
+    if (!CHILDREN.size && SELF_IPC === null) return 0;
     const recs = [...CHILDREN];
     const readFds = [], readObjs = [];
     for (const rec of recs) for (const o of rec.outs) if (!o.ended && o.fd >= 0) { readFds.push(o.fd); readObjs.push(o); }
+    for (const rec of recs) if (rec.ipc && !rec.ipc.closed) { readFds.push(rec.ipc.fd); readObjs.push({ ipcRec: rec }); }
+    if (SELF_IPC !== null && !SELF_IPC.ch.closed) { readFds.push(SELF_IPC.ch.fd); readObjs.push({ self: SELF_IPC }); }
     if (readFds.length) {
       const ready = PROC.poll(readFds, 5);
-      for (let i = 0; i < readObjs.length; i++) if (ready[i]) drainOut(readObjs[i]);
+      for (let i = 0; i < readObjs.length; i++) {
+        if (!ready[i]) continue;
+        const o = readObjs[i];
+        if (o.ipcRec) drainChildIpc(o.ipcRec);
+        else if (o.self) o.self.drain();
+        else drainOut(o);
+      }
     } else {
       PROC.poll([], 2);  // brief real wait while waiting for a child to exit
     }
-    for (const rec of recs) flushStdin(rec);
+    for (const rec of recs) { flushStdin(rec); for (const w of rec.writers) flushWriter(w); }
+    for (const rec of recs) if (rec.ipc && !rec.ipc.closed) { ipcFlush(rec.ipc); rec.ipcDelivery.flush(); }
+    if (SELF_IPC !== null && !SELF_IPC.ch.closed) { ipcFlush(SELF_IPC.ch); SELF_IPC.delivery.flush(); }
     for (const rec of recs) reap(rec);
     let active = 0;
-    for (const rec of recs) { if (rec.done) CHILDREN.delete(rec); else active++; }
+    for (const rec of recs) { if (rec.done) CHILDREN.delete(rec); else if (!rec.unrefd) active++; }
+    // node ref-counts the child-side channel: it pins the loop only while a
+    // 'message' or 'disconnect' listener is attached (setupChannel's
+    // newListener/removeListener ref counting) — that is what lets
+    // fixtures/child-process-spawn-node.js exit after removing its listener.
+    if (SELF_IPC !== null && !SELF_IPC.ch.closed && SELF_IPC.ch.refd && SELF_IPC.pinned()) active++;
     return active;
   };
 
@@ -157,7 +531,21 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     if (typeof stdio === "string") stdio = [stdio, stdio, stdio];
     else stdio = stdio.slice();
     while (stdio.length < 3) stdio.push("pipe");
-    return stdio.map((s) => (s == null ? "pipe" : typeof s === "number" ? s : s === "overlapped" ? "pipe" : s === "ipc" ? "ignore" : s));
+    // "ipc" survives to the native layer, which opens an AF_UNIX socketpair for
+    // that slot (node's fork channel); everything else maps to a plain pipe.
+    return stdio.map((s) => (s == null ? "pipe" : typeof s === "number" ? s : s === "overlapped" ? "pipe" : s));
+  };
+
+  // node internal/child_process.js resolves the 'child_process' channel and the
+  // 'child_process.spawn' tracing channel at module load. This partition is
+  // assembled before node:diagnostics_channel, so the lookup is deferred to
+  // first use (spawn time, long after the image is complete).
+  const kCpNoDC = { hasSubscribers: false, publish() {} };
+  const kCpNoTraceDC = { hasSubscribers: false, start: kCpNoDC, end: kCpNoDC, error: kCpNoDC };
+  const cpDC = () => {
+    const d = M["diagnostics_channel"] || M["node:diagnostics_channel"];
+    if (!d || typeof d.channel !== "function") return { channel: kCpNoDC, spawn: kCpNoTraceDC };
+    return { channel: d.channel("child_process"), spawn: d.tracingChannel("child_process.spawn") };
   };
 
   class ChildProcess extends EventEmitter {
@@ -167,34 +555,58 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       this.stdio = [null, null, null]; this.exitCode = null; this.signalCode = null;
       this.killed = false; this.connected = false; this.spawnfile = undefined; this.spawnargs = [];
       this._rec = null; this._timeoutTimer = null;
+      // node's ChildProcess constructor announces the instance on the plain
+      // 'child_process' channel (the spawn tracing channel is separate).
+      const ch = cpDC().channel;
+      if (ch.hasSubscribers) ch.publish({ process: this });
     }
     spawn(options) {
       // node child_process.ts:1346-1396 validators (ERR_INVALID_ARG_TYPE).
-      if (options === null || typeof options !== "object") { const e = new TypeError('The "options" argument must be of type object. Received ' + (options === null ? "null" : typeof options)); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
-      if (typeof options.file !== "string") { const e = new TypeError('The "options.file" property must be of type string. Received ' + (options.file === undefined ? "undefined" : typeof options.file)); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
-      if (options.args !== undefined && !Array.isArray(options.args)) { const e = new TypeError('The "options.args" property must be an instance of Array. Received ' + typeof options.args); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
+      if (options === null || typeof options !== "object") { const e = new TypeError('The "options" argument must be of type object. Received ' + recvDesc(options)); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
+      if (typeof options.file !== "string") { const e = new TypeError('The "options.file" property must be of type string. Received ' + recvDesc(options.file)); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
+      if (options.args !== undefined && !Array.isArray(options.args)) { const e = new TypeError('The "options.args" property must be an instance of Array. Received ' + recvDesc(options.args)); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
       const __hasIpc = Array.isArray(options.stdio) && options.stdio.includes("ipc");
-      if (__hasIpc && options.envPairs !== undefined && !Array.isArray(options.envPairs)) { const e = new TypeError('The "options.envPairs" property must be an instance of Array. Received ' + typeof options.envPairs); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
+      if (__hasIpc && options.envPairs !== undefined && !Array.isArray(options.envPairs)) { const e = new TypeError('The "options.envPairs" property must be an instance of Array. Received ' + recvDesc(options.envPairs)); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
       const file = toStr(options.file != null ? options.file : options.execPath);
       let args = options.args && options.args.length ? options.args.map(toStr) : [file];
       if (options.argv0 != null) args[0] = toStr(options.argv0);
       this.spawnfile = file; this.spawnargs = args;
       const stdio = normStdio(options.stdio);
+      const ipcIndex = stdio.indexOf("ipc");
       const sopts = { stdio };
       if (options.cwd != null) sopts.cwd = toStr(options.cwd);
       // node inherits process.env when env is unset (undefined/null); an explicit
       // {} means an empty environment. Snapshot process.env so the child sees the
       // JS-visible env (harness-injected vars), not just the raw OS environ.
-      sopts.env = options.env && typeof options.env === "object" ? options.env : (G.process && G.process.env) || {};
+      const baseEnv = options.env && typeof options.env === "object" ? options.env : (G.process && G.process.env) || {};
+      if (ipcIndex >= 0) {
+        // node advertises the child's end of the channel through NODE_CHANNEL_FD
+        // (lib/internal/child_process.js spawn()); the fd number is the slot index.
+        // The serialization mode travels the same way, in
+        // NODE_CHANNEL_SERIALIZATION_MODE, so the child frames its half
+        // identically without being told twice.
+        const e = {};
+        for (const k of Object.keys(baseEnv)) e[k] = baseEnv[k];
+        e.NODE_CHANNEL_FD = String(ipcIndex);
+        e.NODE_CHANNEL_SERIALIZATION_MODE = options.serialization === "advanced" ? "advanced" : "json";
+        sopts.env = e;
+      } else {
+        sopts.env = baseEnv;
+      }
       if (options.detached) sopts.detached = true;
       if (typeof options.uid === "number") sopts.uid = options.uid;
       if (typeof options.gid === "number") sopts.gid = options.gid;
       const self = this;
+      // node ChildProcess.prototype.spawn: start is published just before the
+      // handle spawn, then either error (a run-time spawn failure) or end.
+      const spawnDC = cpDC().spawn;
+      if (spawnDC.hasSubscribers) spawnDC.start.publish({ process: this, options });
       const h = PROC.spawnEx(file, args, sopts);
       if (h.errno != null) {
         const code = ERRNO[h.errno] || ("errno " + h.errno);
         const err = new Error("spawn " + file + " " + code);
         err.errno = -1; err.code = code; err.path = file; err.spawnargs = args.slice(1);
+        if (spawnDC.hasSubscribers) spawnDC.error.publish({ process: this, error: err });
         if (DELAYED[code]) {
           err.syscall = "spawn " + file;
           nextTick(() => { self.emit("error", err); self.emit("close", null, null); });
@@ -203,18 +615,24 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
         err.syscall = "spawn";
         throw err;
       }
+      if (spawnDC.hasSubscribers) spawnDC.end.publish({ process: this });
       this.pid = h.pid;
       const fds = h.fds || [];
-      const rec = { cp: this, pid: h.pid, outs: [], stdinFd: -1, stdinBuf: [], stdinEnded: false, stdinClosed: false, exited: false, closed: false, done: false, code: null, signal: null };
+      const rec = { cp: this, pid: h.pid, outs: [], writers: [], stdinFd: -1, stdinBuf: [], stdinEnded: false, stdinClosed: false, exited: false, closed: false, done: false, code: null, signal: null, ipc: null, ipcDelivery: null };
       const stdioArr = [];
       for (let i = 0; i < stdio.length; i++) {
         const fd = fds[i] != null ? fds[i] : -1;
-        if (stdio[i] === "pipe" && fd >= 0) {
+        if (stdio[i] === "ipc" && fd >= 0) {
+          rec.ipc = makeIpc(fd, options.serialization === "advanced");
+          rec.ipcDelivery = makeIpcDelivery(this);
+          stdioArr[i] = null;  // node exposes the channel as .channel, not .stdio[n]
+          attachIpc(this, rec.ipc, null);
+        } else if (stdio[i] === "pipe" && fd >= 0) {
           if (i === 0) { PROC.setNonBlock(fd); rec.stdinFd = fd; const wr = makeStdin(fd, rec); this.stdin = wr; stdioArr[i] = wr; }
           // Out fds MUST be O_NONBLOCK: drainOut loops readNB until "" (EAGAIN);
           // on a blocking fd the read AFTER a partial chunk wedges the JS thread
           // while a long-lived child sits between replies (duplex protocols).
-          else { PROC.setNonBlock(fd); const rd = makeReadable(); rec.outs.push({ fd, stream: rd, ended: false }); stdioArr[i] = rd; if (i === 1) this.stdout = rd; else if (i === 2) this.stderr = rd; }
+          else { PROC.setNonBlock(fd); const rd = i > 2 ? makeDuplexPipe(fd, rec) : makeReadable(); rec.outs.push({ fd, stream: rd, ended: false }); stdioArr[i] = rd; if (i === 1) this.stdout = rd; else if (i === 2) this.stderr = rd; }
         } else { stdioArr[i] = null; }
       }
       this.stdio = stdioArr;
@@ -234,7 +652,15 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
           }
         };
         if (sig.aborted) nextTick(doAbort);
-        else if (typeof sig.addEventListener === "function") sig.addEventListener("abort", doAbort, { once: true });
+        else if (typeof sig.addEventListener === "function") {
+          sig.addEventListener("abort", doAbort, { once: true });
+          // node removes the abort listener once the child is gone, so an
+          // AbortSignal shared across children does not accumulate handlers
+          // (child_process.ts abortChildProcess / onAbortListener cleanup).
+          this.once("exit", () => {
+            if (typeof sig.removeEventListener === "function") sig.removeEventListener("abort", doAbort);
+          });
+        }
       }
       // 'exit' clears any pending timeout so it cannot kill a reused pid.
       this.once("exit", () => { if (self._timeoutTimer) { G.clearTimeout(self._timeoutTimer); self._timeoutTimer = null; } });
@@ -258,48 +684,258 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   }
 
   const resolveExe = (file) => {
-    if (file.indexOf("/") >= 0) return F.exists(file) ? file : null;
+    // The existence probe is an mbun implementation detail: node resolves the
+    // executable inside uv_spawn, and gates spawning on the ChildProcess scope
+    // ONLY -- it never charges the caller an fs.read for the binary it is about
+    // to exec. So a Permission Model denial here must not become the reported
+    // error; hand the path to the spawn boundary, which is gated on ChildProcess
+    // and reports ENOENT itself if the file really is missing.
+    if (file.indexOf("/") >= 0) {
+      try { return F.exists(file) ? file : null; }
+      catch (e) { if (e && e.code === "ERR_ACCESS_DENIED") return file; throw e; }
+    }
     try { return G.Bun && Bun.which ? Bun.which(file) : file; } catch (e) { return file; }
   };
 
+  // ---- node normalizeSpawnArguments / normalizeExecFileArgs ---------------
+  // Ported from node lib/child_process.js + lib/internal/validators.js so that
+  // every entry point rejects the same shapes with the same error codes
+  // (ERR_INVALID_ARG_TYPE / ERR_INVALID_ARG_VALUE / ERR_OUT_OF_RANGE), including
+  // the embedded-NUL rejection added for CVE-2022-… (nodejs/node#44768).
+  // internal/errors.js makeNodeErrorWithCode gives every NodeError a
+  // `toString()` of `${name} [${code}]: ${message}` (name and stack keep the
+  // base name). `assert.throws(fn, /ERR_INVALID_ARG_TYPE/)` matches
+  // String(err), so without this the code was invisible to a regex matcher and
+  // the timeout/kill-signal tests failed on an otherwise-correct error.
+  const withCode = (e, code) => {
+    e.code = code;
+    const base = e.name;
+    Object.defineProperty(e, "toString", {
+      value() { return base + " [" + code + "]" + (this.message ? ": " + this.message : ""); },
+      configurable: true, writable: true,
+    });
+    return e;
+  };
+  const errArgType = (name, expected, actual) =>
+    withCode(new TypeError('The "' + name + '" argument must be ' + expected + '. Received ' + recvDesc(actual)), "ERR_INVALID_ARG_TYPE");
+  const errPropType = (name, expected, actual) =>
+    withCode(new TypeError('The "' + name + '" property must be ' + expected + '. Received ' + recvDesc(actual)), "ERR_INVALID_ARG_TYPE");
+  const errArgValue = (name, value, reason) =>
+    withCode(new TypeError("The argument '" + name + "' " + (reason || "is invalid") + ". Received " + recvDesc(value)), "ERR_INVALID_ARG_VALUE");
+  const errOutOfRange = (name, range, value) =>
+    withCode(new RangeError('The value of "' + name + '" is out of range. It must be ' + range + ". Received " + String(value)), "ERR_OUT_OF_RANGE");
+  // node normalizeSpawnArguments: `serialization` is 'json' (default) or
+  // 'advanced'; anything else is ERR_INVALID_ARG_VALUE on options.serialization.
+  const validateSerialization = (s) => {
+    if (s === undefined || s === null) return "json";
+    if (s !== "json" && s !== "advanced") throw errArgValue("options.serialization", s, "must be one of: 'json', 'advanced'");
+    return s;
+  };
+  const nullCheck = (v, name) => {
+    if (typeof v === "string" && v.indexOf("\u0000") !== -1) throw errArgValue(name, v, "must be a string without null bytes");
+  };
+  const validateObj = (v, name) => { if (v === null || typeof v !== "object" || Array.isArray(v)) throw errArgType(name, "of type object", v); };
+  const validateStr = (v, name) => { if (typeof v !== "string") throw errArgType(name, "of type string", v); };
+  const validateFn = (v, name) => { if (typeof v !== "function") throw errArgType(name, "of type function", v); };
+  const isInt32 = (v) => typeof v === "number" && Number.isInteger(v) && v >= -2147483648 && v <= 2147483647;
+  const toPathString = (p, name) => {
+    if (typeof p === "string") { nullCheck(p, name); return p; }
+    if (p !== null && typeof p === "object") {
+      if (G.Buffer && typeof G.Buffer.isBuffer === "function" && G.Buffer.isBuffer(p)) { const s = p.toString(); nullCheck(s, name); return s; }
+      if (typeof p.href === "string" && p.protocol === "file:") {
+        const u = M["url"] || M["node:url"];
+        const s = u && typeof u.fileURLToPath === "function" ? u.fileURLToPath(p) : String(p.pathname);
+        nullCheck(s, name);
+        return s;
+      }
+    }
+    throw errArgType(name, "of type string or an instance of Buffer or URL", p);
+  };
+  // The options members every entry point shares (cwd/argv0/shell must be
+  // NUL-free even on the sync paths that never reach normalizeSpawnArguments).
+  const validateCommonOpts = (o) => {
+    if (o == null) return;
+    if (o.cwd != null) toPathString(o.cwd, "options.cwd");
+    if (o.argv0 != null) { validateStr(o.argv0, "options.argv0"); nullCheck(o.argv0, "options.argv0"); }
+    if (o.shell != null && typeof o.shell !== "boolean" && typeof o.shell !== "string") throw errPropType("options.shell", "of type boolean or string", o.shell);
+    if (typeof o.shell === "string") nullCheck(o.shell, "options.shell");
+    if (o.detached != null && typeof o.detached !== "boolean") throw errPropType("options.detached", "of type boolean", o.detached);
+    // validateInt32: wrong type is ERR_INVALID_ARG_TYPE, wrong value (NaN,
+    // Infinity, 3.1, out of int32) is ERR_OUT_OF_RANGE.
+    for (const k of ["uid", "gid"]) {
+      const v = o[k];
+      if (v == null) continue;
+      if (typeof v !== "number") throw errPropType("options." + k, "of type number", v);
+      if (!isInt32(v)) throw errOutOfRange("options." + k, "an integer >= -2147483648 and <= 2147483647", v);
+    }
+    for (const k of ["windowsHide", "windowsVerbatimArguments"]) {
+      if (o[k] != null && typeof o[k] !== "boolean") throw errPropType("options." + k, "of type boolean", o[k]);
+    }
+    // validateTimeout -> validateInteger(timeout, 'timeout', 0)
+    if (o.timeout != null) {
+      if (typeof o.timeout !== "number") throw errPropType("options.timeout", "of type number", o.timeout);
+      if (!Number.isInteger(o.timeout) || o.timeout < 0) throw errOutOfRange("timeout", "an integer >= 0", o.timeout);
+    }
+    // validateMaxBuffer -> validateNumber(maxBuffer, 'options.maxBuffer', 0):
+    // Infinity and 3.14 are fine, NaN and negatives are not.
+    if (o.maxBuffer != null) {
+      if (typeof o.maxBuffer !== "number") throw errPropType("options.maxBuffer", "of type number", o.maxBuffer);
+      if (Number.isNaN(o.maxBuffer) || o.maxBuffer < 0) throw errOutOfRange("options.maxBuffer", "a number >= 0", o.maxBuffer);
+    }
+    // sanitizeKillSignal -> convertToValidSignal. Own-property lookups only, so
+    // 'toString'/'constructor' are unknown signals rather than prototype hits.
+    if (o.killSignal != null) {
+      const hasOwn = Object.prototype.hasOwnProperty;
+      const unknown = () => { const e = new TypeError("Unknown signal: " + String(o.killSignal)); e.code = "ERR_UNKNOWN_SIGNAL"; return e; };
+      if (typeof o.killSignal === "string") { if (!hasOwn.call(SIGMAP, o.killSignal.toUpperCase())) throw unknown(); }
+      else if (typeof o.killSignal === "number") { if (!hasOwn.call(SIGNAME, String(o.killSignal))) throw unknown(); }
+      else throw errPropType("options.killSignal", "of type string or number", o.killSignal);
+    }
+    // Both env keys and env values must be NUL-free (node's
+    // validateArgumentNullCheck over the envPairs it builds).
+    if (o.env != null) {
+      if (typeof o.env !== "object") throw errPropType("options.env", "of type object", o.env);
+      for (const k of Object.keys(o.env)) {
+        nullCheck(k, "options.env");
+        const v = o.env[k];
+        if (typeof v === "string") nullCheck(v, "options.env");
+      }
+    }
+  };
+  const normalizeSpawnArgs = (file, args, options) => {
+    validateStr(file, "file");
+    nullCheck(file, "file");
+    if (file.length === 0) throw errArgValue("file", file, "cannot be empty");
+    if (Array.isArray(args)) args = args.slice();
+    else if (args == null) args = [];
+    else if (typeof args !== "object") throw errArgType("args", "of type object", args);
+    else { options = args; args = []; }
+    for (const a of args) nullCheck(a, "args");
+    if (options === undefined) options = {};
+    else validateObj(options, "options");
+    validateCommonOpts(options);
+    return { file, args, options };
+  };
+  // node normalizeExecFileArgs: (file[, args][, options][, callback]).
+  const normalizeExecFileArgs = (file, args, options, callback) => {
+    if (Array.isArray(args)) args = args.slice();
+    else if (args != null && typeof args === "object") { callback = options; options = args; args = null; }
+    else if (typeof args === "function") { callback = args; options = null; args = null; }
+    if (args == null) args = [];
+    if (typeof options === "function") callback = options;
+    else if (options != null) validateObj(options, "options");
+    if (options == null) options = {};
+    if (callback != null) validateFn(callback, "callback");
+    if (options.argv0 != null) validateStr(options.argv0, "options.argv0");
+    return { file, args, options, callback };
+  };
+
+  // The options object handed to the native sync spawner. It is a COPY: the
+  // caller's options must not grow mbun-internal keys, and the signal name is
+  // resolved here so the native layer never needs a signal table.
+  const syncOpts = (o) => {
+    const out = {};
+    if (o != null) for (const k of Object.keys(o)) out[k] = o[k];
+    // node inherits process.env when `env` is unset, and process.env is a live
+    // view of the environment — so `process.env.X = 'v'` before a spawnSync IS
+    // visible to the child. mbun's process.env is a JS-side snapshot and the
+    // native spawn falls back to the C `environ`, so an assignment made after
+    // startup was silently dropped (test-worker-process-env sets SET_IN_WORKER
+    // and asserts the spawnSync'd child sees it). The async ChildProcess path
+    // already snapshots process.env for exactly this reason; this is its
+    // synchronous twin. An explicit `{}` still means an empty environment.
+    if (out.env == null || typeof out.env !== "object") {
+      const pe = G.process && G.process.env;
+      if (pe && typeof pe === "object") out.env = pe;
+    }
+    if (o != null && o.timeout != null && o.timeout > 0) {
+      out.timeoutMs = o.timeout;
+      out.killSignalNum = mapSig(o.killSignal == null ? "SIGTERM" : o.killSignal);
+    }
+    return out;
+  };
+  // node spawn_sync.cc: a child killed by the timeout reports the kill signal in
+  // `signal`, a null `status`, and an ETIMEDOUT SystemError in `error`.
+  const applySyncTimeout = (r, cmd, args, o) => {
+    if (!r.timedOut) return;
+    const name = o != null && o.killSignal != null ? o.killSignal : "SIGTERM";
+    const err = new Error("spawnSync " + cmd + " ETIMEDOUT");
+    err.code = "ETIMEDOUT"; err.errno = uvErrno("ETIMEDOUT", -110);
+    err.syscall = "spawnSync " + cmd; err.path = cmd; err.spawnargs = args;
+    r.error = err;
+    r.status = null;
+    r.signal = typeof name === "number" ? (SIGNAME[name] || ("SIG" + name)) : String(name);
+  };
+
   function spawnSync(cmd, a, o) {
-    const n = normArgs(a, o);
-    cmd = toStr(cmd);
+    const nz = normalizeSpawnArgs(cmd, a, o);
+    cmd = nz.file;
+    const n = { args: nz.args, opts: syncOpts(nz.options) };
     const exe = resolveExe(cmd);
+    // ONE String() per argument: an argument's toString() is observable and node
+    // stringifies it exactly once (test-child-process-spawnsync-non-string-args
+    // asserts that with a mustCall toString).
+    const argv = n.args.map(toStr);
     if (exe === null) {
       const err = new Error("spawnSync " + cmd + " ENOENT");
-      err.code = "ENOENT"; err.errno = -2; err.syscall = "spawnSync " + cmd; err.path = cmd; err.spawnargs = n.args.map(toStr);
+      err.code = "ENOENT"; err.errno = -2; err.syscall = "spawnSync " + cmd; err.path = cmd; err.spawnargs = argv;
       return { pid: 0, output: [null, null, null], stdout: null, stderr: null, status: null, signal: null, error: err };
     }
-    const r = CP.spawnSync(cmd, n.args.map(toStr), n.opts);
+    const r = CP.spawnSync(cmd, argv, n.opts);
     if (r.errno != null) {  // child-side pre-exec failure (EPERM/ENOENT/…)
       const code = ERRNO[r.errno] || ("errno " + r.errno);
       const err = new Error("spawnSync " + cmd + " " + code);
-      err.code = code; err.errno = -1; err.syscall = "spawnSync " + cmd; err.path = cmd; err.spawnargs = n.args.map(toStr);
+      err.code = code; err.errno = -1; err.syscall = "spawnSync " + cmd; err.path = cmd; err.spawnargs = argv;
       return { pid: r.pid, output: [null, null, null], stdout: null, stderr: null, status: null, signal: null, error: err };
     }
     if (r.signal != null) r.signal = SIGNAME[+r.signal] || ("SIG" + r.signal);
     const enc = n.opts && n.opts.encoding;
-    // Node: with a string encoding stdout/stderr are decoded strings; with no
-    // encoding (or "buffer") they are Buffers. Piped-but-empty stays a 0-len
-    // Buffer; a non-piped fd (inherit/ignore) stays null.
+    // node spawn_sync.cc enforces maxBuffer (default 1 MiB) while it reads: the
+    // moment a pipe's accumulated size passes the limit the child's output is
+    // abandoned and the result carries an ENOBUFS SystemError. The bytes ALREADY
+    // read stay in the result — node reads in 64 KiB chunks, so `stdout` is
+    // routinely larger than a small maxBuffer (test-child-process-spawnsync-maxbuf
+    // asserts exactly that with maxBuffer: 1). mbun's native spawnSync collects
+    // the whole pipe, so the limit is applied to the totals here; the data is
+    // reported unchanged rather than truncated to a chunk boundary this layer
+    // never saw.
+    const rawOut = r.stdout == null ? null : _u8(r.stdout);
+    const rawErr = r.stderr == null ? null : _u8(r.stderr);
+    const maxBuffer = n.opts && n.opts.maxBuffer != null ? n.opts.maxBuffer : 1024 * 1024;
+    if ((rawOut !== null && rawOut.length > maxBuffer) || (rawErr !== null && rawErr.length > maxBuffer)) {
+      const err = new Error("spawnSync " + cmd + " ENOBUFS");
+      err.code = "ENOBUFS"; err.errno = uvErrno("ENOBUFS", -105); err.syscall = "spawnSync " + cmd;
+      err.path = cmd; err.spawnargs = argv;
+      r.error = err;
+      r.status = null; r.signal = null;
+    }
+    applySyncTimeout(r, cmd, argv, nz.options);
+    delete r.timedOut;
     const asStr = enc && enc !== "buffer";
-    if (r.stdout != null) r.stdout = asStr ? String(r.stdout) : Buffer.from(_u8(r.stdout));
-    if (r.stderr != null) r.stderr = asStr ? String(r.stderr) : Buffer.from(_u8(r.stderr));
+    if (r.stdout != null) r.stdout = asStr ? String(r.stdout) : Buffer.from(rawOut);
+    if (r.stderr != null) r.stderr = asStr ? String(r.stderr) : Buffer.from(rawErr);
     r.output = [null, r.stdout, r.stderr];
     return r;
   }
   function execSync(command, o) {
-    const r = CP.spawnSync("/bin/sh", ["-c", toStr(command)], o || {});
-    if (r.status !== 0) { const e = new Error("Command failed: " + command + "\n" + r.stderr); e.status = r.status; e.stdout = r.stdout; e.stderr = r.stderr; throw e; }
+    validateStr(command, "command");
+    nullCheck(command, "command");
+    if (o != null) { validateObj(o, "options"); validateCommonOpts(o); }
+    const r = CP.spawnSync("/bin/sh", ["-c", command], syncOpts(o));
+    if (r.status !== 0) { const e = new Error("Command failed: " + command + (r.stderr == null ? "" : "\n" + r.stderr)); e.status = r.status; e.stdout = r.stdout; e.stderr = r.stderr; throw e; }
     const enc = o && o.encoding;
+    // A non-piped stdout (stdio: 'inherit'/'ignore') is null in node, not "".
+    if (r.stdout == null) return null;
     return enc === "buffer" || enc == null ? Buffer.from(_u8(r.stdout)) : r.stdout;
   }
   function execFileSync(file, a, o) {
-    const n = normArgs(a, o);
-    const r = CP.spawnSync(toStr(file), n.args.map(toStr), n.opts);
-    if (r.status !== 0) { const e = new Error("execFileSync failed: " + file); e.status = r.status; e.stderr = r.stderr; throw e; }
-    const enc = n.opts && n.opts.encoding;
+    const nf = normalizeExecFileArgs(file, a, o, undefined);
+    const nz = normalizeSpawnArgs(nf.file, nf.args, typeof nf.options === "function" ? {} : nf.options);
+    const r = CP.spawnSync(nz.file, nz.args, syncOpts(nz.options));
+    if (r.status !== 0) { const e = new Error("execFileSync failed: " + nz.file); e.status = r.status; e.stderr = r.stderr; throw e; }
+    const enc = nz.options && nz.options.encoding;
+    // A non-piped stdout slot is null, not a buffer.
+    if (r.stdout == null) return null;
     return enc === "buffer" || enc == null ? Buffer.from(_u8(r.stdout)) : r.stdout;
   }
 
@@ -336,23 +972,26 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   };
 
   function spawn(file, args, options) {
-    if (typeof file !== "string") { const e = new TypeError('The "file" argument must be of type string. Received type ' + typeof file + ' (' + file + ')'); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
-    if (!Array.isArray(args)) { options = args; args = []; }
-    options = options || {};
-    let cmd = file, argv = [file].concat((args || []).map(toStr));
+    const nz = normalizeSpawnArgs(file, args, options);
+    file = nz.file; args = nz.args; options = nz.options;
+    let cmd = file, argv = [file].concat(args.map(toStr));
     if (options.shell) {
-      const command = [file].concat((args || []).map(toStr)).join(" ");
+      const command = [file].concat(args.map(toStr)).join(" ");
       const sh = options.shell === true ? "/bin/sh" : toStr(options.shell);
       cmd = sh; argv = [sh, "-c", command];
     }
     const child = new ChildProcess();
-    child.spawn({ file: cmd, args: argv, cwd: options.cwd, env: options.env, stdio: options.stdio, detached: options.detached, uid: options.uid, gid: options.gid, argv0: options.argv0, timeout: options.timeout, killSignal: options.killSignal, signal: options.signal });
+    child.spawn({ file: cmd, args: argv, cwd: options.cwd, env: options.env, stdio: options.stdio, detached: options.detached, uid: options.uid, gid: options.gid, argv0: options.argv0, timeout: options.timeout, killSignal: options.killSignal, signal: options.signal, serialization: validateSerialization(options.serialization) });
     return child;
   }
 
   function exec(command, options, cb) {
     if (typeof options === "function") { cb = options; options = {}; }
+    validateStr(command, "command");
+    nullCheck(command, "command");
+    if (options != null) { validateObj(options, "options"); validateCommonOpts(options); }
     options = options || {};
+    if (cb != null) validateFn(cb, "callback");
     const sh = options.shell ? (options.shell === true ? "/bin/sh" : toStr(options.shell)) : "/bin/sh";
     const child = new ChildProcess();
     child.spawn({ file: sh, args: [sh, "-c", toStr(command)], cwd: options.cwd, env: options.env, stdio: ["pipe", "pipe", "pipe"], timeout: options.timeout, killSignal: options.killSignal, signal: options.signal });
@@ -364,12 +1003,11 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   });
 
   function execFile(file, args, options, cb) {
-    if (typeof args === "function") { cb = args; args = []; options = {}; }
-    else if (!Array.isArray(args)) { cb = typeof options === "function" ? options : cb; options = args; args = []; }
-    if (typeof options === "function") { cb = options; options = {}; }
-    options = options || {};
+    const nf = normalizeExecFileArgs(file, args, options, cb);
+    const nz = normalizeSpawnArgs(nf.file, nf.args, typeof nf.options === "function" ? {} : nf.options);
+    file = nz.file; args = nz.args; options = nz.options; cb = nf.callback;
     const child = new ChildProcess();
-    child.spawn({ file: toStr(file), args: [toStr(file)].concat((args || []).map(toStr)), cwd: options.cwd, env: options.env, stdio: ["pipe", "pipe", "pipe"], timeout: options.timeout, killSignal: options.killSignal, signal: options.signal });
+    child.spawn({ file, args: [file].concat(args.map(toStr)), cwd: options.cwd, env: options.env, stdio: ["pipe", "pipe", "pipe"], timeout: options.timeout, killSignal: options.killSignal, signal: options.signal });
     collectExec(child, options, cb, file);
     return child;
   }
@@ -378,18 +1016,83 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   });
 
   function fork(modulePath, args, options) {
-    if (typeof modulePath !== "string") { const e = new TypeError('The "modulePath" argument must be of type string or an instance of Buffer or URL. Received ' + (modulePath === null ? "null" : modulePath === undefined ? "undefined" : typeof modulePath === "object" ? "an instance of " + ((modulePath.constructor && modulePath.constructor.name) || "Object") : typeof modulePath === "symbol" ? "type symbol" : typeof modulePath)); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
-    if (!Array.isArray(args)) { options = args; args = []; }
-    if (options !== undefined && options !== null && typeof options !== "object") { const e = new TypeError('The "options" argument must be of type object. Received ' + (typeof options === "symbol" ? "type symbol" : typeof options)); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
+    modulePath = toPathString(modulePath, "modulePath");
+    if (args == null) args = [];
+    else if (typeof args === "object" && !Array.isArray(args)) { options = args; args = []; }
+    else if (!Array.isArray(args)) throw errArgType("args", "an instance of Array", args);
+    if (options != null) validateObj(options, "options");
     options = options || {};
+    validateCommonOpts(options);
+    for (const a of args) nullCheck(a, "args");
+    if (options.execPath != null) { validateStr(options.execPath, "options.execPath"); nullCheck(options.execPath, "options.execPath"); }
+    if (options.execArgv != null) {
+      if (!Array.isArray(options.execArgv)) throw errPropType("options.execArgv", "an instance of Array", options.execArgv);
+      for (const a of options.execArgv) nullCheck(a, "options.execArgv");
+    }
     const exe = toStr(options.execPath || (G.process && G.process.execPath) || "bun");
-    // IPC unimplemented → default stdio has no channel; stdin stays non-pipe so
-    // child.stdin === null (matches the fork() default-stdio expectation).
-    const stdio = options.stdio || (options.silent ? ["pipe", "pipe", "pipe"] : ["inherit", "inherit", "inherit"]);
+    // node fork(): the child always gets an "ipc" slot appended, stdio defaults
+    // to inherit (pipe when silent), and a user-supplied stdio ARRAY without an
+    // 'ipc' entry is an error (lib/child_process.js fork/stdioStringToArray).
+    let stdio = options.stdio;
+    if (typeof stdio === "string") {
+      if (stdio !== "pipe" && stdio !== "inherit" && stdio !== "ignore" && stdio !== "overlapped") {
+        const e = new TypeError("The argument 'stdio' is invalid. Received '" + stdio + "'");
+        e.code = "ERR_INVALID_ARG_VALUE"; throw e;
+      }
+      stdio = [stdio, stdio, stdio, "ipc"];
+    } else if (!Array.isArray(stdio)) {
+      const s = options.silent ? "pipe" : "inherit";
+      stdio = [s, s, s, "ipc"];
+    } else if (stdio.indexOf("ipc") < 0) {
+      const e = new Error("Forked processes must have an IPC channel, missing value 'ipc' in options.stdio");
+      e.code = "ERR_CHILD_PROCESS_IPC_REQUIRED"; throw e;
+    } else {
+      stdio = stdio.slice();
+    }
+    // node prepends the parent's execArgv (or options.execArgv) before the
+    // module path so the child inherits the same runtime flags.
+    const execArgv = options.execArgv !== undefined ? options.execArgv : ((G.process && G.process.execArgv) || []);
     const child = new ChildProcess();
-    child.spawn({ file: exe, args: [exe, toStr(modulePath)].concat((args || []).map(toStr)), cwd: options.cwd, env: options.env, stdio, detached: options.detached, timeout: options.timeout, killSignal: options.killSignal, signal: options.signal });
+    child.spawn({ file: exe, args: [exe].concat((execArgv || []).map(toStr), [toStr(modulePath)], (args || []).map(toStr)), cwd: options.cwd, env: options.env, stdio, detached: options.detached, timeout: options.timeout, killSignal: options.killSignal, signal: options.signal, serialization: validateSerialization(options.serialization) });
     return child;
   }
+
+  // ---- child side of a fork() channel (NODE_CHANNEL_FD) -------------------
+  // node's _forkChild: wire process.send / 'message' / disconnect onto the
+  // inherited socketpair end, then drop NODE_CHANNEL_FD so grandchildren do not
+  // inherit a channel that is not theirs. Invoked once, late in the builtins
+  // image (node_process_extra), when `process` is a full EventEmitter.
+  G.__mbunSetupIpcChild = function () {
+    if (SELF_IPC !== null) return;
+    const proc = G.process;
+    if (!proc || !proc.env || typeof proc.listenerCount !== "function") return;
+    const raw = proc.env.NODE_CHANNEL_FD;
+    if (raw == null || raw === "") return;
+    const fd = Number(raw);
+    if (!Number.isFinite(fd) || fd < 0) return;
+    const advanced = proc.env.NODE_CHANNEL_SERIALIZATION_MODE === "advanced";
+    try { delete proc.env.NODE_CHANNEL_FD; } catch (e) {}
+    try { delete proc.env.NODE_CHANNEL_SERIALIZATION_MODE; } catch (e) {}
+    const ch = makeIpc(fd, advanced);
+    const delivery = makeIpcDelivery(proc);
+    attachIpc(proc, ch, null);
+    SELF_IPC = {
+      ch,
+      delivery,
+      drain() {
+        ipcRead(ch, (m, handle) => delivery.deliver(m, handle), () => {
+          ipcClose(ch);
+          if (proc.connected && typeof proc.disconnect === "function") proc.disconnect();
+        });
+      },
+      // worker_threads installs a permanent process 'message' bridge, so it
+      // overrides the pin with its own parentPort-sink predicate.
+      pinned() {
+        if (typeof G.__mbunIpcPin === "function") { try { return !!G.__mbunIpcPin(); } catch (e) { return false; } }
+        return proc.listenerCount("message") > 0 || proc.listenerCount("disconnect") > 0;
+      },
+    };
+  };
 
   def(["child_process"], { spawnSync, execSync, execFileSync, execFile, exec, spawn, fork, ChildProcess });
   // node:console — the global console methods + a Console class over given streams.
@@ -730,10 +1433,26 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
 
   // ---- Web/node globals: TextEncoder/TextDecoder, Buffer, btoa/atob ----
   if (typeof G.TextEncoder === "undefined") {
+    // node's TextEncoder keeps `#encoding` in a private field, so calling its
+    // accessors/methods with a foreign receiver surfaces the engine's private-
+    // brand TypeErrors. JSC words those differently, so reproduce node's
+    // observable messages explicitly (test-whatwg-encoding-custom-interop).
+    const kTEBrand = Symbol("kTextEncoderBrand");
+    const teIsInstance = (self) => self !== null && self !== undefined && self[kTEBrand] === true;
+    const tePrivateBrand = (self) => {
+      if (!teIsInstance(self)) throw new TypeError("Cannot read private member #encoding from an object whose class did not declare it");
+    };
+    const teReceiverBrand = (self) => {
+      if (!teIsInstance(self)) throw new TypeError("Receiver must be an instance of class TextEncoder");
+    };
     G.TextEncoder = class TextEncoder {
+      constructor() {
+        Object.defineProperty(this, kTEBrand, { value: true, enumerable: false, writable: false, configurable: false });
+      }
       get [Symbol.toStringTag]() { return "TextEncoder"; }
-      get encoding() { return "utf-8"; }
+      get encoding() { tePrivateBrand(this); return "utf-8"; }
       encode(str = "") {
+        teReceiverBrand(this);
         str = String(str);
         // Encode straight into a typed array. A plain-array `out.push(...)`
         // stores through [[Set]], so a user-defined getter-only index accessor
@@ -781,6 +1500,15 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
         return { read, written };
       }
     };
+    Object.defineProperty(G.TextEncoder.prototype, Symbol.for("nodejs.util.inspect.custom"), {
+      value: function (depth, opts, inspectFn) {
+        if (typeof depth === "number" && depth < 0) return this;
+        tePrivateBrand(this);
+        const obj = { encoding: "utf-8" };
+        return typeof inspectFn === "function" ? inspectFn(obj, opts) : "{ encoding: 'utf-8' }";
+      },
+      enumerable: false, configurable: true, writable: true,
+    });
   }
   if (typeof G.TextDecoder === "undefined") {
     // encoding label → canonical name (WHATWG Encoding standard subset).
@@ -792,25 +1520,51 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     const SBT = {"ibm866":"\u0410\u0411\u0412\u0413\u0414\u0415\u0416\u0417\u0418\u0419\u041a\u041b\u041c\u041d\u041e\u041f\u0420\u0421\u0422\u0423\u0424\u0425\u0426\u0427\u0428\u0429\u042a\u042b\u042c\u042d\u042e\u042f\u0430\u0431\u0432\u0433\u0434\u0435\u0436\u0437\u0438\u0439\u043a\u043b\u043c\u043d\u043e\u043f\u2591\u2592\u2593\u2502\u2524\u2561\u2562\u2556\u2555\u2563\u2551\u2557\u255d\u255c\u255b\u2510\u2514\u2534\u252c\u251c\u2500\u253c\u255e\u255f\u255a\u2554\u2569\u2566\u2560\u2550\u256c\u2567\u2568\u2564\u2565\u2559\u2558\u2552\u2553\u256b\u256a\u2518\u250c\u2588\u2584\u258c\u2590\u2580\u0440\u0441\u0442\u0443\u0444\u0445\u0446\u0447\u0448\u0449\u044a\u044b\u044c\u044d\u044e\u044f\u0401\u0451\u0404\u0454\u0407\u0457\u040e\u045e\u00b0\u2219\u00b7\u221a\u2116\u00a4\u25a0\u00a0","iso-8859-3":"\u0080\u0081\u0082\u0083\u0084\u0085\u0086\u0087\u0088\u0089\u008a\u008b\u008c\u008d\u008e\u008f\u0090\u0091\u0092\u0093\u0094\u0095\u0096\u0097\u0098\u0099\u009a\u009b\u009c\u009d\u009e\u009f\u00a0\u0126\u02d8\u00a3\u00a4\ufffd\u0124\u00a7\u00a8\u0130\u015e\u011e\u0134\u00ad\ufffd\u017b\u00b0\u0127\u00b2\u00b3\u00b4\u00b5\u0125\u00b7\u00b8\u0131\u015f\u011f\u0135\u00bd\ufffd\u017c\u00c0\u00c1\u00c2\ufffd\u00c4\u010a\u0108\u00c7\u00c8\u00c9\u00ca\u00cb\u00cc\u00cd\u00ce\u00cf\ufffd\u00d1\u00d2\u00d3\u00d4\u0120\u00d6\u00d7\u011c\u00d9\u00da\u00db\u00dc\u016c\u015c\u00df\u00e0\u00e1\u00e2\ufffd\u00e4\u010b\u0109\u00e7\u00e8\u00e9\u00ea\u00eb\u00ec\u00ed\u00ee\u00ef\ufffd\u00f1\u00f2\u00f3\u00f4\u0121\u00f6\u00f7\u011d\u00f9\u00fa\u00fb\u00fc\u016d\u015d\u02d9","iso-8859-5":"\u0080\u0081\u0082\u0083\u0084\u0085\u0086\u0087\u0088\u0089\u008a\u008b\u008c\u008d\u008e\u008f\u0090\u0091\u0092\u0093\u0094\u0095\u0096\u0097\u0098\u0099\u009a\u009b\u009c\u009d\u009e\u009f\u00a0\u0401\u0402\u0403\u0404\u0405\u0406\u0407\u0408\u0409\u040a\u040b\u040c\u00ad\u040e\u040f\u0410\u0411\u0412\u0413\u0414\u0415\u0416\u0417\u0418\u0419\u041a\u041b\u041c\u041d\u041e\u041f\u0420\u0421\u0422\u0423\u0424\u0425\u0426\u0427\u0428\u0429\u042a\u042b\u042c\u042d\u042e\u042f\u0430\u0431\u0432\u0433\u0434\u0435\u0436\u0437\u0438\u0439\u043a\u043b\u043c\u043d\u043e\u043f\u0440\u0441\u0442\u0443\u0444\u0445\u0446\u0447\u0448\u0449\u044a\u044b\u044c\u044d\u044e\u044f\u2116\u0451\u0452\u0453\u0454\u0455\u0456\u0457\u0458\u0459\u045a\u045b\u045c\u00a7\u045e\u045f","iso-8859-6":"\u0080\u0081\u0082\u0083\u0084\u0085\u0086\u0087\u0088\u0089\u008a\u008b\u008c\u008d\u008e\u008f\u0090\u0091\u0092\u0093\u0094\u0095\u0096\u0097\u0098\u0099\u009a\u009b\u009c\u009d\u009e\u009f\u00a0\ufffd\ufffd\ufffd\u00a4\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u060c\u00ad\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u061b\ufffd\ufffd\ufffd\u061f\ufffd\u0621\u0622\u0623\u0624\u0625\u0626\u0627\u0628\u0629\u062a\u062b\u062c\u062d\u062e\u062f\u0630\u0631\u0632\u0633\u0634\u0635\u0636\u0637\u0638\u0639\u063a\ufffd\ufffd\ufffd\ufffd\ufffd\u0640\u0641\u0642\u0643\u0644\u0645\u0646\u0647\u0648\u0649\u064a\u064b\u064c\u064d\u064e\u064f\u0650\u0651\u0652\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd","iso-8859-7":"\u0080\u0081\u0082\u0083\u0084\u0085\u0086\u0087\u0088\u0089\u008a\u008b\u008c\u008d\u008e\u008f\u0090\u0091\u0092\u0093\u0094\u0095\u0096\u0097\u0098\u0099\u009a\u009b\u009c\u009d\u009e\u009f\u00a0\u2018\u2019\u00a3\u20ac\u20af\u00a6\u00a7\u00a8\u00a9\u037a\u00ab\u00ac\u00ad\ufffd\u2015\u00b0\u00b1\u00b2\u00b3\u0384\u0385\u0386\u00b7\u0388\u0389\u038a\u00bb\u038c\u00bd\u038e\u038f\u0390\u0391\u0392\u0393\u0394\u0395\u0396\u0397\u0398\u0399\u039a\u039b\u039c\u039d\u039e\u039f\u03a0\u03a1\ufffd\u03a3\u03a4\u03a5\u03a6\u03a7\u03a8\u03a9\u03aa\u03ab\u03ac\u03ad\u03ae\u03af\u03b0\u03b1\u03b2\u03b3\u03b4\u03b5\u03b6\u03b7\u03b8\u03b9\u03ba\u03bb\u03bc\u03bd\u03be\u03bf\u03c0\u03c1\u03c2\u03c3\u03c4\u03c5\u03c6\u03c7\u03c8\u03c9\u03ca\u03cb\u03cc\u03cd\u03ce\ufffd","iso-8859-8":"\u0080\u0081\u0082\u0083\u0084\u0085\u0086\u0087\u0088\u0089\u008a\u008b\u008c\u008d\u008e\u008f\u0090\u0091\u0092\u0093\u0094\u0095\u0096\u0097\u0098\u0099\u009a\u009b\u009c\u009d\u009e\u009f\u00a0\ufffd\u00a2\u00a3\u00a4\u00a5\u00a6\u00a7\u00a8\u00a9\u00d7\u00ab\u00ac\u00ad\u00ae\u00af\u00b0\u00b1\u00b2\u00b3\u00b4\u00b5\u00b6\u00b7\u00b8\u00b9\u00f7\u00bb\u00bc\u00bd\u00be\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u2017\u05d0\u05d1\u05d2\u05d3\u05d4\u05d5\u05d6\u05d7\u05d8\u05d9\u05da\u05db\u05dc\u05dd\u05de\u05df\u05e0\u05e1\u05e2\u05e3\u05e4\u05e5\u05e6\u05e7\u05e8\u05e9\u05ea\ufffd\ufffd\u200e\u200f\ufffd","koi8-u":"\u2500\u2502\u250c\u2510\u2514\u2518\u251c\u2524\u252c\u2534\u253c\u2580\u2584\u2588\u258c\u2590\u2591\u2592\u2593\u2320\u25a0\u2219\u221a\u2248\u2264\u2265\u00a0\u2321\u00b0\u00b2\u00b7\u00f7\u2550\u2551\u2552\u0451\u0454\u2554\u0456\u0457\u2557\u2558\u2559\u255a\u255b\u0491\u255d\u255e\u255f\u2560\u2561\u0401\u0404\u2563\u0406\u0407\u2566\u2567\u2568\u2569\u256a\u0490\u256c\u00a9\u044e\u0430\u0431\u0446\u0434\u0435\u0444\u0433\u0445\u0438\u0439\u043a\u043b\u043c\u043d\u043e\u043f\u044f\u0440\u0441\u0442\u0443\u0436\u0432\u044c\u044b\u0437\u0448\u044d\u0449\u0447\u044a\u042e\u0410\u0411\u0426\u0414\u0415\u0424\u0413\u0425\u0418\u0419\u041a\u041b\u041c\u041d\u041e\u041f\u042f\u0420\u0421\u0422\u0423\u0416\u0412\u042c\u042b\u0417\u0428\u042d\u0429\u0427\u042a","windows-1253":"\u20ac\ufffd\u201a\u0192\u201e\u2026\u2020\u2021\ufffd\u2030\ufffd\u2039\ufffd\ufffd\ufffd\ufffd\ufffd\u2018\u2019\u201c\u201d\u2022\u2013\u2014\ufffd\u2122\ufffd\u203a\ufffd\ufffd\ufffd\ufffd\u00a0\u0385\u0386\u00a3\u00a4\u00a5\u00a6\u00a7\u00a8\u00a9\ufffd\u00ab\u00ac\u00ad\u00ae\u2015\u00b0\u00b1\u00b2\u00b3\u0384\u00b5\u00b6\u00b7\u0388\u0389\u038a\u00bb\u038c\u00bd\u038e\u038f\u0390\u0391\u0392\u0393\u0394\u0395\u0396\u0397\u0398\u0399\u039a\u039b\u039c\u039d\u039e\u039f\u03a0\u03a1\ufffd\u03a3\u03a4\u03a5\u03a6\u03a7\u03a8\u03a9\u03aa\u03ab\u03ac\u03ad\u03ae\u03af\u03b0\u03b1\u03b2\u03b3\u03b4\u03b5\u03b6\u03b7\u03b8\u03b9\u03ba\u03bb\u03bc\u03bd\u03be\u03bf\u03c0\u03c1\u03c2\u03c3\u03c4\u03c5\u03c6\u03c7\u03c8\u03c9\u03ca\u03cb\u03cc\u03cd\u03ce\ufffd","windows-1255":"\u20ac\ufffd\u201a\u0192\u201e\u2026\u2020\u2021\u02c6\u2030\ufffd\u2039\ufffd\ufffd\ufffd\ufffd\ufffd\u2018\u2019\u201c\u201d\u2022\u2013\u2014\u02dc\u2122\ufffd\u203a\ufffd\ufffd\ufffd\ufffd\u00a0\u00a1\u00a2\u00a3\u20aa\u00a5\u00a6\u00a7\u00a8\u00a9\u00d7\u00ab\u00ac\u00ad\u00ae\u00af\u00b0\u00b1\u00b2\u00b3\u00b4\u00b5\u00b6\u00b7\u00b8\u00b9\u00f7\u00bb\u00bc\u00bd\u00be\u00bf\u05b0\u05b1\u05b2\u05b3\u05b4\u05b5\u05b6\u05b7\u05b8\u05b9\ufffd\u05bb\u05bc\u05bd\u05be\u05bf\u05c0\u05c1\u05c2\u05c3\u05f0\u05f1\u05f2\u05f3\u05f4\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u05d0\u05d1\u05d2\u05d3\u05d4\u05d5\u05d6\u05d7\u05d8\u05d9\u05da\u05db\u05dc\u05dd\u05de\u05df\u05e0\u05e1\u05e2\u05e3\u05e4\u05e5\u05e6\u05e7\u05e8\u05e9\u05ea\ufffd\ufffd\u200e\u200f\ufffd","windows-1257":"\u20ac\ufffd\u201a\ufffd\u201e\u2026\u2020\u2021\ufffd\u2030\ufffd\u2039\ufffd\u00a8\u02c7\u00b8\ufffd\u2018\u2019\u201c\u201d\u2022\u2013\u2014\ufffd\u2122\ufffd\u203a\ufffd\u00af\u02db\ufffd\u00a0\ufffd\u00a2\u00a3\u00a4\ufffd\u00a6\u00a7\u00d8\u00a9\u0156\u00ab\u00ac\u00ad\u00ae\u00c6\u00b0\u00b1\u00b2\u00b3\u00b4\u00b5\u00b6\u00b7\u00f8\u00b9\u0157\u00bb\u00bc\u00bd\u00be\u00e6\u0104\u012e\u0100\u0106\u00c4\u00c5\u0118\u0112\u010c\u00c9\u0179\u0116\u0122\u0136\u012a\u013b\u0160\u0143\u0145\u00d3\u014c\u00d5\u00d6\u00d7\u0172\u0141\u015a\u016a\u00dc\u017b\u017d\u00df\u0105\u012f\u0101\u0107\u00e4\u00e5\u0119\u0113\u010d\u00e9\u017a\u0117\u0123\u0137\u012b\u013c\u0161\u0144\u0146\u00f3\u014d\u00f5\u00f6\u00f7\u0173\u0142\u015b\u016b\u00fc\u017c\u017e\u02d9","windows-874":"\u20ac\ufffd\ufffd\ufffd\ufffd\u2026\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u2018\u2019\u201c\u201d\u2022\u2013\u2014\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u00a0\u0e01\u0e02\u0e03\u0e04\u0e05\u0e06\u0e07\u0e08\u0e09\u0e0a\u0e0b\u0e0c\u0e0d\u0e0e\u0e0f\u0e10\u0e11\u0e12\u0e13\u0e14\u0e15\u0e16\u0e17\u0e18\u0e19\u0e1a\u0e1b\u0e1c\u0e1d\u0e1e\u0e1f\u0e20\u0e21\u0e22\u0e23\u0e24\u0e25\u0e26\u0e27\u0e28\u0e29\u0e2a\u0e2b\u0e2c\u0e2d\u0e2e\u0e2f\u0e30\u0e31\u0e32\u0e33\u0e34\u0e35\u0e36\u0e37\u0e38\u0e39\u0e3a\ufffd\ufffd\ufffd\ufffd\u0e3f\u0e40\u0e41\u0e42\u0e43\u0e44\u0e45\u0e46\u0e47\u0e48\u0e49\u0e4a\u0e4b\u0e4c\u0e4d\u0e4e\u0e4f\u0e50\u0e51\u0e52\u0e53\u0e54\u0e55\u0e56\u0e57\u0e58\u0e59\u0e5a\u0e5b\ufffd\ufffd\ufffd\ufffd"};
     SBT["iso-8859-8-i"] = SBT["iso-8859-8"];
     const SB_ALIAS = { "ibm866":"ibm866","866":"ibm866","cp866":"ibm866","csibm866":"ibm866", "iso-8859-3":"iso-8859-3","iso8859-3":"iso-8859-3","iso88593":"iso-8859-3","latin3":"iso-8859-3","l3":"iso-8859-3","csisolatin3":"iso-8859-3","iso-ir-109":"iso-8859-3","iso_8859-3":"iso-8859-3","iso_8859-3:1988":"iso-8859-3", "iso-8859-5":"iso-8859-5","iso8859-5":"iso-8859-5","iso88595":"iso-8859-5","cyrillic":"iso-8859-5","csisolatincyrillic":"iso-8859-5","iso-ir-144":"iso-8859-5","iso_8859-5":"iso-8859-5","iso_8859-5:1988":"iso-8859-5", "iso-8859-6":"iso-8859-6","iso8859-6":"iso-8859-6","iso88596":"iso-8859-6","arabic":"iso-8859-6","csisolatinarabic":"iso-8859-6","ecma-114":"iso-8859-6","asmo-708":"iso-8859-6","iso-ir-127":"iso-8859-6","iso_8859-6":"iso-8859-6","iso_8859-6:1987":"iso-8859-6", "iso-8859-7":"iso-8859-7","iso8859-7":"iso-8859-7","iso88597":"iso-8859-7","greek":"iso-8859-7","greek8":"iso-8859-7","ecma-118":"iso-8859-7","elot_928":"iso-8859-7","csisolatingreek":"iso-8859-7","iso-ir-126":"iso-8859-7","iso_8859-7":"iso-8859-7","iso_8859-7:1987":"iso-8859-7","sun_eu_greek":"iso-8859-7", "iso-8859-8":"iso-8859-8","iso8859-8":"iso-8859-8","iso88598":"iso-8859-8","hebrew":"iso-8859-8","visual":"iso-8859-8","csisolatinhebrew":"iso-8859-8","iso-ir-138":"iso-8859-8","iso_8859-8":"iso-8859-8","iso_8859-8:1988":"iso-8859-8","csiso88598e":"iso-8859-8","iso-8859-8-e":"iso-8859-8", "iso-8859-8-i":"iso-8859-8-i","csiso88598i":"iso-8859-8-i","logical":"iso-8859-8-i", "koi8-u":"koi8-u","koi8-ru":"koi8-u", "windows-1253":"windows-1253","cp1253":"windows-1253","x-cp1253":"windows-1253", "windows-1255":"windows-1255","cp1255":"windows-1255","x-cp1255":"windows-1255", "windows-1257":"windows-1257","cp1257":"windows-1257","x-cp1257":"windows-1257", "windows-874":"windows-874","cp874":"windows-874","dos-874":"windows-874","iso-8859-11":"windows-874","iso8859-11":"windows-874","iso885911":"windows-874","tis-620":"windows-874", "x-user-defined":"x-user-defined", "replacement":"replacement","csiso2022kr":"replacement","hz-gb-2312":"replacement","iso-2022-cn":"replacement","iso-2022-cn-ext":"replacement","iso-2022-kr":"replacement" };
+    // node internal/encoding.js keeps the decoder's observable state in
+    // internal slots and exposes it through PROTOTYPE getters that brand-check
+    // `this` (test-whatwg-encoding-custom-textdecoder calls the raw getters
+    // with a foreign receiver and expects ERR_INVALID_THIS, not a crash).
+    const kTDEncoding = Symbol("kEncoding"), kTDFatal = Symbol("kFatal"), kTDIgnoreBOM = Symbol("kIgnoreBOM");
+    const tdInvalidThis = () => { const e = new TypeError('Value of "this" must be of type TextDecoder'); e.code = "ERR_INVALID_THIS"; return e; };
+    const validateDecoder = (self) => {
+      if (self === null || self === undefined || self[kTDEncoding] === undefined) throw tdInvalidThis();
+      return self;
+    };
+    // node validateObject(..., kValidateObjectAllowObjectsAndNull): `null` is
+    // accepted (and means "no options"); every other non-object is a TypeError.
+    const tdValidateOptions = (opts, name) => {
+      if (opts === undefined || opts === null) return null;
+      if (typeof opts !== "object") {
+        const e = new TypeError('The "' + name + '" argument must be of type object. Received ' + (typeof opts === "string" ? "type string (" + JSON.stringify(opts) + ")" : "type " + typeof opts + " (" + String(opts) + ")"));
+        e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+      }
+      return opts;
+    };
     G.TextDecoder = class TextDecoder {
-      get [Symbol.toStringTag]() { return "TextDecoder"; }
       constructor(enc, opts) {
-        const key = String(enc === undefined ? "utf-8" : enc).toLowerCase().trim();
-        this.encoding = ENC_ALIAS[key] || SB_ALIAS[key];
+        // WHATWG Encoding "get an encoding" strips only ASCII whitespace
+        // (TAB/LF/FF/CR/SPACE). String.prototype.trim would also eat U+000B,
+        // U+00A0, U+2028 and U+2029, turning labels node rejects with
+        // ERR_ENCODING_NOT_SUPPORTED into valid ones.
+        const key = String(enc === undefined ? "utf-8" : enc).toLowerCase().replace(/^[\t\n\f\r ]+/, "").replace(/[\t\n\f\r ]+$/, "");
+        opts = tdValidateOptions(opts, "options");
+        const encoding = ENC_ALIAS[key] || SB_ALIAS[key];
         // bun TextDecoder.rs:588-600 — an unknown/replacement label is a
         // RangeError carrying code ERR_ENCODING_NOT_SUPPORTED.
-        if (!this.encoding || this.encoding === "replacement") {
+        if (!encoding || encoding === "replacement") {
           const e = new RangeError("Unsupported encoding label \"" + enc + "\"");
           e.code = "ERR_ENCODING_NOT_SUPPORTED";
           throw e;
         }
-        if (opts !== undefined && (opts === null || typeof opts !== "object")) throw new TypeError("TextDecoder(options) is invalid");
-        this.fatal = !!(opts && opts.fatal);
         if (opts && opts.ignoreBOM !== undefined && typeof opts.ignoreBOM !== "boolean") throw new TypeError("TextDecoder(options) ignoreBOM is invalid. Expected boolean value");
-        this.ignoreBOM = !!(opts && opts.ignoreBOM);
+        Object.defineProperty(this, kTDEncoding, { value: encoding, enumerable: false, writable: false, configurable: true });
+        Object.defineProperty(this, kTDFatal, { value: !!(opts && opts.fatal), enumerable: false, writable: false, configurable: true });
+        Object.defineProperty(this, kTDIgnoreBOM, { value: !!(opts && opts.ignoreBOM), enumerable: false, writable: false, configurable: true });
         this._doNotFlush = false;
       }
       decode(input, opts) {
+        validateDecoder(this);
+        opts = tdValidateOptions(opts, "options");
         const stream = !!(opts && opts.stream);
         let b;
         if (input == null) b = new Uint8Array(0);
@@ -834,7 +1588,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
         if (enc === "utf-8" || enc === "utf-16le" || enc === "utf-16be") {
           let i = 0;
           let out = "";
-          const F = () => { const error = new TypeError("The encoded data was not valid for encoding " + enc + "."); error.code = "ERR_ENCODING_INVALID_ENCODED_DATA"; throw error; };
+          const F = () => { const error = new TypeError("The encoded data was not valid for encoding " + enc); error.code = "ERR_ENCODING_INVALID_ENCODED_DATA"; throw error; };
           const serialize = () => {
             if (!this.ignoreBOM && !this._bomSeen && out.length) {
               this._bomSeen = true;
@@ -895,6 +1649,44 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
         return "";
       }
     };
+    // ref node internal/encoding.js `sharedProperties`: encoding/fatal/ignoreBOM
+    // are enumerable prototype accessors, the custom-inspect method is
+    // non-enumerable, and Symbol.toStringTag is a data property — each of them
+    // validating the receiver first.
+    Object.defineProperties(G.TextDecoder.prototype, {
+      encoding: { get() { return validateDecoder(this)[kTDEncoding]; }, enumerable: true, configurable: true },
+      fatal: { get() { return validateDecoder(this)[kTDFatal]; }, enumerable: true, configurable: true },
+      ignoreBOM: { get() { return validateDecoder(this)[kTDIgnoreBOM]; }, enumerable: true, configurable: true },
+      [Symbol.toStringTag]: { value: "TextDecoder", writable: false, enumerable: false, configurable: true },
+      [Symbol.for("nodejs.util.inspect.custom")]: {
+        value: function (depth, opts) {
+          validateDecoder(this);
+          // node returns `this` for a negative depth; util.inspect turns that
+          // into "[TextDecoder]".
+          if (typeof depth === "number" && depth < 0) return this;
+          const name = (this.constructor && this.constructor.name) || "TextDecoder";
+          const items = [
+            "encoding: '" + this[kTDEncoding] + "'",
+            "fatal: " + this[kTDFatal],
+            "ignoreBOM: " + this[kTDIgnoreBOM],
+          ];
+          if (opts && opts.showHidden) {
+            // node's internal slots: CONVERTER_FLAGS_FATAL 0x2 | IGNORE_BOM 0x4,
+            // and the ICU converter handle (never materialised here).
+            items.push("Symbol(flags): " + ((this[kTDFatal] ? 2 : 0) | (this[kTDIgnoreBOM] ? 4 : 0)));
+            items.push("Symbol(handle): undefined");
+          }
+          // node reduceToSingleString: entries share one line only while they fit
+          // inside breakLength (80); mbun's generic object layout never wraps, so
+          // reproduce the rule here rather than change it for every inspected value.
+          let total = items.length + (items.length + 1 + 10);
+          for (const it of items) total += it.length;
+          if (total <= 80) return name + " { " + items.join(", ") + " }";
+          return name + " {\n  " + items.join(",\n  ") + "\n}";
+        },
+        enumerable: false, configurable: true, writable: true,
+      },
+    });
   }
   const B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
   if (typeof G.btoa === "undefined") {
@@ -905,7 +1697,22 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   class Buffer extends Uint8Array {
     static from(data, e) {
       if (typeof data === "string") {
-        if (e === "hex") { const a = []; for (let i = 0; i < data.length; i += 2) a.push(parseInt(data.substr(i, 2), 16)); return new Buffer(a); }
+        // node decodes hex PAIRWISE and stops at the first incomplete or
+        // non-hex pair: Buffer.from("abc", "hex") is <ab> (one byte), not
+        // <ab 0c>. Reading the trailing nibble as a whole byte corrupted every
+        // odd-length hex string — visible through node:stream, whose readable
+        // captured this Buffer before node_buffer_extra replaced the global
+        // (test-stream-readable-unshift unshifts "abc" as hex).
+        if (e === "hex") {
+          const a = [];
+          const nib = (c) => (c >= 48 && c <= 57) ? c - 48 : (c >= 97 && c <= 102) ? c - 87 : (c >= 65 && c <= 70) ? c - 55 : -1;
+          for (let i = 0; i + 1 < data.length; i += 2) {
+            const hi = nib(data.charCodeAt(i)), lo = nib(data.charCodeAt(i + 1));
+            if (hi < 0 || lo < 0) break;
+            a.push(hi * 16 + lo);
+          }
+          return new Buffer(a);
+        }
         if (e === "base64") { const s = G.atob(data); const a = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) a[i] = s.charCodeAt(i); return new Buffer(a); }
         // utf16le/ucs2: two little-endian bytes per UTF-16 code unit.
         if (e === "utf16le" || e === "ucs2" || e === "ucs-2" || e === "utf-16le") { const a = new Uint8Array(data.length * 2); for (let i = 0; i < data.length; i++) { const c = data.charCodeAt(i); a[i * 2] = c & 0xff; a[i * 2 + 1] = (c >> 8) & 0xff; } return new Buffer(a); }
@@ -1132,7 +1939,8 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   // unref/ref follow node semantics: only ref'd timers keep the process alive
   // (__mbun_timers_refd feeds the pumps' exit conditions); unref'd timers still
   // fire while the loop runs for other reasons.
-  const T = (G.__mbunTimers = G.__mbunTimers || { q: [], id: 1, now: 0, fired: 0 });
+  const T = (G.__mbunTimers = G.__mbunTimers || { q: [], id: 1, now: 0, fired: 0, batch: 0 });
+  if (T.batch === undefined) T.batch = 0;
   // node returns a Timeout object (coerces to the numeric id for clear*) with
   // ref/unref/hasRef/refresh/close; many tests call setInterval(...).unref().
   const findT = (id) => T.q.find((x) => x.id === id);
@@ -1147,22 +1955,85 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   G.setInterval = function (fn, delay) { const a = Array.prototype.slice.call(arguments, 2); const id = T.id++; const d = +delay || 1; T.q.push({ id: id, fn: fn, at: Date.now() + d, d: d, a: a, iv: d, refd: true }); return mkTimer(id); };
   G.clearTimeout = function (t) { const id = timerId(t); for (let i = 0; i < T.q.length; i++) if (T.q[i].id === id) { T.q.splice(i, 1); return; } };
   G.clearInterval = G.clearTimeout;
-  G.setImmediate = function (fn) { const a = Array.prototype.slice.call(arguments, 1); const id = T.id++; T.q.push({ id: id, fn: fn, at: 0, d: 0, a: a, iv: 0, refd: true }); return mkTimer(id); };
+  // `imm` marks an Immediate; `b` stamps the drain batch it was queued in, so a
+  // setImmediate scheduled FROM an immediate callback waits for the next batch
+  // (node: the check phase runs the immediates present when the phase began,
+  // newly queued ones go to the next loop iteration). Without that stamp a
+  // self-reposting .on('message')/postMessage pair re-queued into the batch it
+  // was running in and starved every timer forever
+  // (test-worker-message-port-infinite-message-loop), and a chained setImmediate
+  // walked all its links inside ONE drain call, so the microtask checkpoint the
+  // pump performs between calls never landed in the middle of the chain
+  // (test-worker-message-port-transfer-self: a port closed from a message
+  // handler stayed "active" for all 10 ticks of common/tick.js).
+  G.setImmediate = function (fn) { const a = Array.prototype.slice.call(arguments, 1); const id = T.id++; T.q.push({ id: id, fn: fn, at: 0, d: 0, a: a, iv: 0, refd: true, imm: true, b: T.batch }); return mkTimer(id); };
   G.clearImmediate = G.clearTimeout;
   // Fire up to `budget` DUE timers (earliest deadline first); returns the count
   // of timers still due right now (0 → the pump may sleep). Intervals
   // reschedule from the current time (bun Timer.zig update()). A per-call fire
   // budget plus a global fired cap bound runaway tight intervals.
+  // Resolved on first drain: __mbunProcNative is installed by the C++ runtime
+  // AFTER this builtins image is evaluated, so it cannot be captured here.
+  let drainTicks;
   G.__mbun_drain_timers = function (budget) {
+    if (drainTicks === undefined) {
+      const PN = G.__mbunProcNative;
+      drainTicks = PN && typeof PN.drainMicrotasks === "function" ? PN.drainMicrotasks : null;
+    }
     let fired = 0; budget = budget || 100;
+    const b = ++T.batch;
+    // node checks uv__loop_alive() BEFORE each loop iteration, so once nothing
+    // ref'd is left the iteration never happens and an unref'd Immediate simply
+    // never runs (test-worker-message-port-transfer-closed relies on exactly
+    // that to prove the channel is gone). Real-deadline timers are untouched:
+    // only the always-due `at: 0` Immediates could otherwise keep firing for
+    // free while the pump counts out its idle grace rounds.
+    let alive = 1;
+    try { alive = G.__mbun_loop_alive ? G.__mbun_loop_alive() : 1; } catch (e) { alive = 1; }
     while (T.q.length && fired < budget && T.fired < 200000) {
       const now = Date.now();
-      let mi = -1; for (let i = 0; i < T.q.length; i++) if (T.q[i].at <= now && (mi === -1 || T.q[i].at < T.q[mi].at)) mi = i;
+      let mi = -1;
+      for (let i = 0; i < T.q.length; i++) {
+        const it = T.q[i];
+        if (it.at > now) continue;
+        if (it.imm && (it.b >= b || (!it.refd && !alive))) continue;
+        if (mi === -1 || it.at < T.q[mi].at) mi = i;
+      }
       if (mi === -1) break;  // nothing due yet — real time gates firing
       const t = T.q[mi]; T.now = now;
       if (t.iv > 0) t.at = now + t.iv; else T.q.splice(mi, 1);
-      try { t.fn.apply(null, t.a); } catch (e) {}
+      // node: an exception escaping a timer callback is an uncaught exception
+      // (libuv's callback boundary), not something to drop. Swallowing it here
+      // left the throwing test's sockets/servers registered, so the loop never
+      // drained and the file hung to its harness timeout instead of failing.
+      let bail = false;
+      try { t.fn.apply(null, t.a); }
+      catch (e) {
+        if (G.__mbun_uncaught && !G.__mbun_uncaught(e)) bail = true;
+      }
+      // A timer callback is a node callback boundary. TWO drains, in this order,
+      // and the order is the whole point.
+      //
+      // First the nextTick queue. It must run before the next timer fires and
+      // before any promise continuation the callback queued. This loop fires up
+      // to `budget` timers inside ONE JSC evaluation and JSC only drains at a
+      // JSLock release, which never comes while the loop holds it — so without
+      // this, `setTimeout(() => { nextTick(t); ... })` ran t after every other
+      // due timer instead of immediately.
+      //
+      // Then the promise microtasks, for the same locking reason: a `.then()`
+      // queued by one timer must beat the next due timer, and node runs a
+      // microtask checkpoint after each timer callback.
+      //
+      // Note for anyone tempted to collapse these into one call: they were the
+      // same thing until process.nextTick stopped being queueMicrotask. Draining
+      // microtasks alone no longer drains the tick queue, and the visible
+      // symptom of getting it wrong is subtle — `emitWarning(x); setImmediate(next)`
+      // delivering x after `next`, which is what test-process-warning pins.
+      if (G.__mbunRunTicks) G.__mbunRunTicks();
+      if (G.__mbunDrainMicrotasksNative) G.__mbunDrainMicrotasksNative();
       fired++; T.fired++;
+      if (bail) break;
     }
     const now2 = Date.now();
     let due = 0; for (let i = 0; i < T.q.length; i++) if (T.q[i].at <= now2) due++;
@@ -1221,7 +2092,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     const cap = shortTick || LONG_PARK;
     return d > cap ? cap : d;
   };
-  G.__mbun_timers_reset = function () { T.q = []; T.now = 0; T.fired = 0; };
+  G.__mbun_timers_reset = function () { T.q = []; T.now = 0; T.fired = 0; T.batch = 0; };
 
   // ---- Headers (WHATWG, case-insensitive multi-map) ----
   if (typeof G.Headers === "undefined") {
@@ -1928,7 +2799,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       if (h.errno != null) { const code = ERRNO[h.errno] || ("errno " + h.errno); const e = new Error("spawn " + cmd[0] + " " + code); e.code = code; e.errno = -1; e.syscall = "spawn " + cmd[0]; throw e; }
       let exitResolve; const exitedP = new Promise((r) => (exitResolve = r));
       const proc = { pid: h.pid, exitCode: null, signalCode: null, killed: false, exited: exitedP, exitedDueToMaxBuffer: false, exitedDueToTimeout: false, ref() {}, unref() {}, resourceUsage() { return __mbunResourceUsage(); } };
-      const rec = { cp: null, pid: h.pid, outs: [], stdinFd: -1, stdinBuf: [], stdinEnded: false, stdinClosed: false, exited: false, closed: false, done: false, code: null, signal: null };
+      const rec = { cp: null, pid: h.pid, outs: [], writers: [], stdinFd: -1, stdinBuf: [], stdinEnded: false, stdinClosed: false, exited: false, closed: false, done: false, code: null, signal: null };
       rec.cp = { emit: (ev, code, signal) => {
         if (ev === "exit") { proc.exitCode = signal ? null : code; proc.signalCode = signal || null; }
         else if (ev === "close") { proc.exitCode = signal ? null : code; proc.signalCode = signal || null; exitResolve(proc.exitCode); }
@@ -2024,7 +2895,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       if (h.errno != null) { const code = ERRNO[h.errno] || ("errno " + h.errno); const e = new Error("spawn " + cmd[0] + " " + code); e.code = code; e.errno = -1; e.syscall = "spawn " + cmd[0]; throw e; }
       let exitResolve; const exitedP = new Promise((r) => (exitResolve = r));
       const proc = { pid: h.pid, exitCode: null, signalCode: null, killed: false, exited: exitedP, ref() {}, unref() {}, resourceUsage() { return __mbunResourceUsage(); } };
-      const rec = { cp: null, pid: h.pid, outs: [], stdinFd: h.write, stdinBuf: [], stdinEnded: false, stdinClosed: false, exited: false, closed: false, done: false, code: null, signal: null };
+      const rec = { cp: null, pid: h.pid, outs: [], writers: [], stdinFd: h.write, stdinBuf: [], stdinEnded: false, stdinClosed: false, exited: false, closed: false, done: false, code: null, signal: null };
       const terminalObj = {
         cols, rows,
         write(d) { const u = anyToU8(d); rec.stdinBuf.push({ data: u, off: 0, cb: null }); return u.length; },

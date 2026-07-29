@@ -50,6 +50,11 @@ private:
     // `module.exports = …` before the cycle re-enters (semver@7's
     // Range/Comparator bottom-requires are the canonical case).
     std::unordered_map<std::string, JSObjectRef> moduleInFlight_;
+    // node's `primordials` object, built on first use from node's own
+    // lib/internal/per_context/primordials.js and handed to node-internal
+    // modules as a wrapper parameter (see node_primordials_ in
+    // module_loading.inc). GC-protected; the context is process-lived.
+    JSObjectRef primordials_{nullptr};
     // Parsed tsconfig.json paths cached by config file path (for `harness`,
     // `_util/*`, … bare-specifier resolution in the vendored bun test suite).
     std::unordered_map<std::string, std::optional<mbun::resolver::TsconfigPaths>> tsconfigCache_;
@@ -57,6 +62,12 @@ private:
     // microtask checkpoint with no handler attached. `mbun run` exits 1 then, like
     // node/bun. Reset per entry-script run; the callback captures its address.
     bool unhandledRejection_{false};
+    // The rejection reason that armed `unhandledRejection_`, rendered as
+    // "Name: message\nstack" the way node prints a fatal rejection. Without it
+    // the process only reported "Unhandled promise rejection" — a corpus run
+    // then gave no clue WHICH await rejected, which made every fs/promises
+    // failure an un-diagnosable log line.
+    std::string unhandledRejectionReason_;
 
 public:
     Runtime(const Runtime&) = delete;
@@ -314,7 +325,16 @@ public:
             return 1;
         }
         apply_dotenv(/*isTest=*/false);
+        // Last step before user code: everything mbun installed on globalThis
+        // becomes non-enumerable, as node's own globals are. node's
+        // test/common/index.js walks `for (const val in globalThis)` from an
+        // 'exit' listener and fails the file for anything it does not know, so
+        // mbun's 148 enumerable internals had to stop being enumerable the
+        // moment 'exit' started firing. Runs here (not at init) because the
+        // CommonJS env above installs the last of them.
+        (void)eval_void("globalThis.__mbun_hide_internal_globals&&__mbun_hide_internal_globals();");
         unhandledRejection_ = false;
+        unhandledRejectionReason_.clear();
         install_unhandled_rejection_hook_();
         // bunfig `preload = [...]` runs before the entry point, in order, in the
         // same context (its plugins/globals must be visible to the entry).
@@ -414,20 +434,17 @@ public:
                 return 1;
             }
             set_prop(ctx_, JSContextGetGlobalObject(ctx_), "__mbunCjsWrapper", wrapper);
-            if (auto r{eval_void("globalThis.__mbunCjsWrapper(globalThis.exports, "
-                                 "globalThis.require, globalThis.module, globalThis.__filename, "
-                                 "globalThis.__dirname);",
+            if (auto r{eval_void(std::string{kEntryCatchOpen} +
+                                     "globalThis.__mbunCjsWrapper(globalThis.exports, "
+                                     "globalThis.require, globalThis.module, globalThis.__filename, "
+                                     "globalThis.__dirname);" +
+                                     std::string{kEntryCatchClose},
                                  absPath)};
                 !r) {
-                std::cerr << "error: " << r.error() << '\n';
-                return 1;
+                return fail_run_(r.error());
             }
             pump_event_loop("0");
-            if (unhandledRejection_) {
-                std::cerr << "error: Unhandled promise rejection\n";
-                return 1;
-            }
-            return 0;
+            return finish_run_(0);
         }
         std::string script{transform_module_(js)};
         // Node/bun evaluate the entry in a MODULE scope, never the global one: a
@@ -452,14 +469,41 @@ public:
             ".call(globalThis.module.exports, globalThis.exports, globalThis.require, "
             "globalThis.module, globalThis.__filename, globalThis.__dirname, globalThis.require)"};
         if (script.starts_with("#!")) script.replace(0, 2, "//");
-        const std::string entryScript{"(function (" + cjsParams + ") {" + script + "\n})" +
-                                      cjsArgs + ";"};
+        // Two requirements meet here, and BOTH are load-bearing.
+        //
+        // (1) A throw escaping the ENTRY script is an uncaught exception like
+        // any other: node hands it to 'uncaughtExceptionMonitor', the capture
+        // callback and 'uncaughtException' before deciding the process's fate.
+        // mbun used to let it fall out of eval_void into fail_run_, so a
+        // top-level throw bypassed every handler the script installed. When
+        // nothing claims it, __mbun_uncaught arms the same fatal channel the
+        // pump uses, so the unclaimed case is unchanged (report + status 1).
+        //
+        // (2) The tick drain must ride in the SAME evaluation as the entry
+        // body: the synchronous top level is node's first callback boundary and
+        // its nextTick queue has to run before any promise continuation the top
+        // level queued. A separate eval_void would be too late — JSC drains its
+        // microtask queue when this evaluation releases the lock.
+        //
+        // The drain sits AFTER the catch, not inside the try: node runs the
+        // uncaughtException path first and the tick queue after it, and a throw
+        // in the body must not swallow ticks the body already queued. The
+        // wrapper stays on line 1, like the CommonJS prefix above, so reported
+        // line numbers do not move.
+        const std::string entryScript{"try{(function (" + cjsParams + ") {" + script + "\n})" +
+                                      cjsArgs + ";}catch(__mbun_entry_err){"
+                                      "if(globalThis.__mbun_uncaught)"
+                                      "globalThis.__mbun_uncaught(__mbun_entry_err);"
+                                      "else throw __mbun_entry_err;}"
+                                      "globalThis.__mbunRunTicks&&globalThis.__mbunRunTicks();"};
         // A top-level-await entry (flagged by the transpiler) goes straight to the
         // async wrapper: in script mode `await (expr)` would otherwise PARSE as a
         // call to an `await` identifier and fail at run time, after side effects.
         if (auto r{tla ? std::expected<void, std::string>{std::unexpected{
                              std::string{"SyntaxError: top-level await"}}}
-                       : eval_void(entryScript, absPath)};
+                       : eval_void(std::string{kEntryCatchOpen} + entryScript +
+                                       std::string{kEntryCatchClose},
+                                   absPath)};
             !r) {
             // JSC's C-API script mode has no top-level-await support, so a module
             // using TLA fails to PARSE (SyntaxError, before any execution). Retry it
@@ -467,10 +511,23 @@ public:
             // Gated on SyntaxError so a runtime error isn't re-run (double side
             // effects); the original error is reported if the wrap doesn't help.
             if (r.error().find("SyntaxError") == std::string::npos) {
-                std::cerr << "error: " << r.error() << '\n';
-                return 1;
+                return fail_run_(r.error());
             }
-            (void)eval_void("globalThis.__mbun_run_done=0;globalThis.__mbun_run_err=undefined;");
+            // Define NON-ENUMERABLE. node's common/index.js runs
+            // `for (const val in globalThis)` from an 'exit' listener and fails
+            // the file with "Unexpected global(s) found" on anything it does not
+            // know. Plain assignment created enumerable properties, which cost
+            // 265 corpus files across 79 subsystems -- and worse, it fired
+            // *before* those files could reach common.skip(), so ~300 files that
+            // should report `skipped` reported `fail` instead (inspector went
+            // from 59 green to 1). Later assignments to an existing writable
+            // data property keep this descriptor, so the two sites below stay
+            // plain assignments.
+            (void)eval_void(
+                "Object.defineProperty(globalThis,'__mbun_run_done',"
+                "{value:0,writable:true,configurable:true,enumerable:false});"
+                "Object.defineProperty(globalThis,'__mbun_run_err',"
+                "{value:undefined,writable:true,configurable:true,enumerable:false});");
             const std::string wrapped{
                 "(async function (" + cjsParams + ") {" + script + "\n})" + cjsArgs +
                 ".then(function(){globalThis.__mbun_run_done=1;},"
@@ -478,17 +535,17 @@ public:
                 // explicitly (else an uncaught rejection prints only stack frames).
                 "function(e){var s=(e&&e.stack)||'';"
                 "var m=(e&&e.message!==undefined)?((e.name||'Error')+': '+e.message):String(e);"
+                "try{Object.defineProperty(globalThis,'__mbun_entry_error',"
+                "{value:e,writable:true,configurable:true,enumerable:false});}catch(_e){}"
                 "globalThis.__mbun_run_err=(s?(m+'\\n'+s):m);globalThis.__mbun_run_done=1;});"};
             if (auto r2{eval_void(wrapped, absPath)}; !r2) {
-                std::cerr << "error: " << r.error() << '\n';  // report the original parse error
-                return 1;
+                return fail_run_(r.error());  // report the original parse error
             }
             const bool settled{pump_event_loop("globalThis.__mbun_run_done")};
             if (auto err{eval_to_string(
                     "globalThis.__mbun_run_err===undefined?'':String(globalThis.__mbun_run_err)")};
                 err && !err->empty()) {
-                std::cerr << "error: " << *err << '\n';
-                return 1;
+                return fail_run_(*err);
             }
             // Top level settled: bun keeps the process alive while live
             // handles remain (ref'd timers, sockets, listening servers, child
@@ -497,14 +554,9 @@ public:
             // (draining it would turn a wedged await into an infinite hang).
             if (settled) {
                 if (auto s{serve_default_export_()}; !s) {
-                    std::cerr << "error: " << s.error() << '\n';
-                    return 1;
+                    return fail_run_(s.error());
                 }
                 pump_event_loop("0");
-                if (unhandledRejection_) {
-                    std::cerr << "error: Unhandled promise rejection\n";
-                    return 1;
-                }
             }
         } else {
             // Top level ran synchronously to completion. Node/bun keep the process
@@ -514,16 +566,13 @@ public:
             // __mbun_io_tick from this pump). A never-true done-expr lets
             // pump_event_loop self-bound on "no timers, no network, no live child".
             if (auto s{serve_default_export_()}; !s) {
-                std::cerr << "error: " << s.error() << '\n';
-                return 1;
+                return fail_run_(s.error());
             }
             pump_event_loop("0");
-            if (unhandledRejection_) {
-                std::cerr << "error: Unhandled promise rejection\n";
-                return 1;
-            }
         }
-        return 0;
+        // Natural drain: 'beforeExit' (re-armable), then 'exit', then whatever
+        // status process.exitCode ended up holding.
+        return finish_run_(0);
     }
 
     // Pump the virtual event loop (setTimeout/setInterval queue + JSC microtasks)
@@ -550,10 +599,10 @@ public:
     void install_unhandled_rejection_hook_() {
         JSC::JSGlobalObject* g{::toJS(ctx_)};
         if (g == nullptr) return;
-        bool* flag{&unhandledRejection_};
+        Runtime* self{this};
         JSC::JSNativeStdFunction* cb{JSC::JSNativeStdFunction::create(
             g->vm(), g, 2, WTF::String::fromLatin1("onUnhandledRejection"),
-            [flag](JSC::JSGlobalObject* gg, JSC::CallFrame* frame) -> JSC::EncodedJSValue {
+            [self](JSC::JSGlobalObject* gg, JSC::CallFrame* frame) -> JSC::EncodedJSValue {
                 // JSC invokes this with (promise, reason) (VM::callPromiseRejectionCallback).
                 // Hand both to the JS dispatcher, which mirrors node's
                 // 'unhandledRejection' → 'uncaughtException' escalation. Only when
@@ -574,10 +623,120 @@ public:
                         handled = exc == nullptr && r != nullptr && JSValueToBoolean(ctx, r);
                     }
                 }
-                if (!handled) *flag = true;
+                if (!handled) {
+                    self->unhandledRejection_ = true;
+                    if (self->unhandledRejectionReason_.empty()) {
+                        self->unhandledRejectionReason_ =
+                            self->describe_rejection_(toRef(gg, frame->argument(1)));
+                    }
+                }
                 return JSC::JSValue::encode(JSC::jsUndefined());
             })};
         g->setUnhandledRejectionCallback(g->vm(), cb);
+    }
+
+    // The child-process I/O tick, guarded the same way as the other pump
+    // phases: a throw from a 'exit'/'data' listener is an uncaught exception.
+    // The trailing __mbunRunTicks is the nextTick drain for this phase; it must
+    // stay inside this evaluation (see pump_event_loop / p.nextTick).
+    static constexpr std::string_view kIoTickJs{
+        "(function(){let r=0;try{r=globalThis.__mbun_io_tick?__mbun_io_tick():0;}"
+        "catch(e){globalThis.__mbun_uncaught&&globalThis.__mbun_uncaught(e);}"
+        "globalThis.__mbunRunTicks&&globalThis.__mbunRunTicks();return r;})()"};
+
+    // Is an unclaimed uncaught exception waiting to kill the process? Every pump
+    // phase routes an escaping throw to node's 'uncaughtException' path
+    // (js_builtins :node_process_lifecycle); when nothing claims it the fatal
+    // channel arms and the pump must stop running callbacks at once.
+    bool fatal_pending_() {
+        auto f{eval_number("globalThis.__mbun_fatal_pending?__mbun_fatal_pending():0")};
+        return f && *f == 1.0;
+    }
+
+    // The unhandled-rejection report. It has exactly one caller — finish_run_,
+    // which every exit path now goes through — so anything the report should
+    // say (the rejection reason, the offending value, a stack) belongs HERE,
+    // not duplicated at the call sites it used to live at.
+    // The reason (name, message, code, stack) comes from the JSC rejection hook
+    // via describe_rejection_(). Without it every fs.promises corpus failure was
+    // a single un-diagnosable line, which is what made that cluster tractable.
+    void report_unhandled_rejection_() {
+        std::cerr << "error: Unhandled promise rejection"
+                  << (unhandledRejectionReason_.empty()
+                          ? std::string{}
+                          : ": " + unhandledRejectionReason_)
+                  << '\n';
+    }
+
+    // Run node's shutdown sequence: emit 'beforeExit' for as long as its
+    // listeners keep re-arming the loop, then emit 'exit' and report the status
+    // the process must leave with. `status` is the run's own verdict (0 for a
+    // clean drain), which a fatal error or `process.exitCode` may override.
+    //
+    // ref: node src/node.cc EmitProcessBeforeExit/EmitProcessExit — 'beforeExit'
+    // is skipped entirely for a fatal exit, and 'exit' listeners run
+    // synchronously with nothing they schedule ever getting a turn.
+    int finish_run_(int status) {
+        if (status == 0 && !unhandledRejection_) {
+            for (int round = 0; round < 100000; ++round) {
+                if (fatal_pending_()) break;
+                auto emitted{eval_number("globalThis.__mbun_before_exit?__mbun_before_exit(0):0")};
+                if (!emitted || *emitted == 0.0) break;
+                if (fatal_pending_()) break;
+                auto alive{eval_number("globalThis.__mbun_loop_alive?__mbun_loop_alive():0")};
+                if (!alive || *alive == 0.0) break;
+                pump_event_loop("0");
+            }
+        }
+        if (fatal_pending_()) {
+            // node's fatal report is NOT prefixed: the header line starts at
+            // column 0 with "Name: message" and the frames follow, then a
+            // "Node.js vX.Y.Z" trailer. The old "error: " prefix (bun's shape)
+            // broke every corpus assertion anchored with /^Error/ — and the
+            // one-line report with no frames left the failure untriageable.
+            // The message itself is built in JS (js_builtins
+            // :node_process_lifecycle describe()), which is where the stack is.
+            if (auto m{eval_to_string("globalThis.__mbun_fatal_message()")}; m && !m->empty()) {
+                std::cerr << *m << '\n';
+            }
+            auto fs{eval_number("globalThis.__mbun_fatal_exit_code?__mbun_fatal_exit_code():1")};
+            status = (fs && *fs > 0) ? static_cast<int>(*fs) : 1;
+        } else if (unhandledRejection_) {
+            report_unhandled_rejection_();
+            status = 1;
+        }
+        const std::string arg{status == 0 ? std::string{"undefined"} : std::to_string(status)};
+        auto final{eval_number("globalThis.__mbun_run_exit?__mbun_run_exit(" + arg + "):" +
+                               std::to_string(status))};
+        return final ? static_cast<int>(*final) : status;
+    }
+
+    // The entry point is evaluated inside these so the thrown VALUE survives,
+    // not just its rendering: fail_run_ hands it to __mbunWorkerFatal, and a
+    // worker child needs the error's .code (ERR_UNKNOWN_BUILTIN_MODULE and
+    // friends) to report the 'error' event node's Worker reports. The open
+    // brace stays on line 1 — the entry's own wrapper prefix already lives
+    // there — so reported line numbers are unchanged, and the rethrow keeps
+    // every existing failure path identical. Non-enumerable: an enumerable
+    // global would trip node common/index.js's "Unexpected global(s) found".
+    static constexpr std::string_view kEntryCatchOpen{"try{"};
+    static constexpr std::string_view kEntryCatchClose{
+        "}catch(__mbun_ee){try{Object.defineProperty(globalThis,'__mbun_entry_error',"
+        "{value:__mbun_ee,writable:true,configurable:true,enumerable:false});}catch(__mbun_e2){}"
+        "throw __mbun_ee;}"};
+
+    // A run that died on its entry point: report it the way node does (the
+    // error, then the 'exit' listeners with status 1) rather than returning
+    // straight to main.
+    int fail_run_(std::string_view message) {
+        // A worker child forwards a fatal entry-point error to its parent as an
+        // 'error' event (node internal/worker.js). The hook exists only in a
+        // worker process, so a normal run evaluates to a no-op here.
+        (void)eval_void("try{globalThis.__mbunWorkerFatal&&"
+                        "globalThis.__mbunWorkerFatal(globalThis.__mbun_entry_error);}"
+                        "catch(e){}");
+        std::cerr << "error: " << message << '\n';
+        return finish_run_(1);
     }
 
     bool pump_event_loop(std::string_view doneExpr) {
@@ -591,19 +750,40 @@ public:
         int idleRounds{};
         for (int iter = 0; iter < 200000; ++iter) {
             if (auto d{eval_number(doneCheck)}; d && *d == 1.0) return true;
-            (void)eval_void("globalThis.__mbun_drain_timers && globalThis.__mbun_drain_timers(200);");
-            (void)eval_void("globalThis.__mbunNetDrain && globalThis.__mbunNetDrain();");
+            // Every phase is a node callback boundary: a throw escaping a timer,
+            // a socket poll or a signal handler is an uncaught exception, not
+            // something to drop. Swallowing it (which is what these phases used
+            // to do) left the throwing test's handles registered, so the loop
+            // never drained and the file hung instead of failing.
+            // Every phase ends by draining process.nextTick, in the phase's OWN
+            // evaluation. That is node's callback boundary rule (drain the tick
+            // queue after each callback, before promise microtasks), and it only
+            // holds if the drain shares the evaluation: JSC drains its microtask
+            // queue at this eval's lock release, so a drain in a later eval would
+            // run after the promise continuations it must precede.
+            constexpr std::string_view kRunTicks{
+                "globalThis.__mbunRunTicks&&globalThis.__mbunRunTicks();"};
+            (void)eval_void(std::string{"try{globalThis.__mbun_drain_timers&&globalThis.__mbun_drain_timers(200);}"
+                            "catch(e){globalThis.__mbun_uncaught&&globalThis.__mbun_uncaught(e);}"} +
+                            std::string{kRunTicks});
+            (void)eval_void(std::string{"try{globalThis.__mbunNetDrain&&globalThis.__mbunNetDrain();}"
+                            "catch(e){globalThis.__mbun_uncaught&&globalThis.__mbun_uncaught(e);}"} +
+                            std::string{kRunTicks});
             // Deliver any POSIX signal that arrived since the last iteration to
             // its process.on("SIG…") listeners (the handler itself only set a flag).
-            (void)eval_void("globalThis.__mbunSignalTick && globalThis.__mbunSignalTick();");
+            (void)eval_void(std::string{"try{globalThis.__mbunSignalTick&&globalThis.__mbunSignalTick();}"
+                            "catch(e){globalThis.__mbun_uncaught&&globalThis.__mbun_uncaught(e);}"} +
+                            std::string{kRunTicks});
             drain_microtasks_();
-            auto ioBusy{eval_number("globalThis.__mbun_io_tick ? __mbun_io_tick() : 0")};
+            auto ioBusy{eval_number(kIoTickJs)};
             drain_microtasks_();
+            if (fatal_pending_()) return false;
             if (auto d{eval_number(doneCheck)}; d && *d == 1.0) return true;
             // The I/O tick can settle one promise whose continuation starts a
             // second child. Observe that child before deciding the loop is idle.
-            ioBusy = eval_number("globalThis.__mbun_io_tick ? __mbun_io_tick() : 0");
+            ioBusy = eval_number(kIoTickJs);
             drain_microtasks_();
+            if (fatal_pending_()) return false;
             if (auto d{eval_number(doneCheck)}; d && *d == 1.0) return true;
             // Ref'd timers (unref'd ones don't hold the loop — node semantics),
             // in-flight network ops (fetch/sockets), OR a live child process
@@ -611,15 +791,18 @@ public:
             // counter so a dead peer cannot wedge the loop forever.
             auto rem{eval_number(
                 "(globalThis.__mbun_timers_refd?globalThis.__mbun_timers_refd():0)+"
+                "(globalThis.__mbunTickCount?globalThis.__mbunTickCount():0)+"
                 "(globalThis.__mbunNet?globalThis.__mbunNet.pending:0)")};
-            // A ref'd listening server (Bun.serve) pins the loop indefinitely —
-            // bun keeps the process alive until stop()/unref(). It also disarms
-            // the runaway-iteration cap, which only guards wedged drains; the
-            // serve reactor's epoll tick paces each idle iteration. Liveness
-            // mode only (see above).
+            // A ref'd handle pins the loop indefinitely: a listening Bun.serve
+            // (serveActive) or a ref'd node handle — net.Server, net.Socket,
+            // dgram.Socket and everything layered on them (NET.handles). bun/node
+            // both keep the process alive until the last one is closed or
+            // unref'd. It also disarms the runaway-iteration cap, which only
+            // guards wedged drains; the park below paces each idle iteration.
+            // Liveness mode only (see above).
             const double srvLive{
-                livenessMode ? eval_number("(globalThis.__mbunNet?(globalThis.__mbunNet."
-                                           "serveActive>0?1:0):0)")
+                livenessMode ? eval_number("(globalThis.__mbunNet?((globalThis.__mbunNet."
+                                           "serveActive>0||globalThis.__mbunNet.handles>0)?1:0):0)")
                                    .value_or(0.0)
                              : 0.0};
             if (srvLive > 0.0) iter = 0;
@@ -648,6 +831,15 @@ public:
                     // wake source cuts the park short.
                     int parkMs{static_cast<int>(*idleMs)};
                     if (!livenessMode && parkMs > 25) parkMs = 25;
+                    // Same arithmetic applies to a liveness pump that is only
+                    // counting out its grace rounds: nothing holds the loop, so
+                    // the process is leaving and the park is pure shutdown
+                    // latency. __mbun_pump_idle_ms still reports a long park
+                    // whenever any pollable is registered (an unref'd listener
+                    // stays in NET.items so its fd keeps being polled), which
+                    // made `server.unref()` cost 32 x 60s — indistinguishable
+                    // from the hang it was meant to fix.
+                    if (idleRounds > 0 && parkMs > 1) parkMs = 1;
                     const auto parked{eval_number(
                         "globalThis.__mbunNetNative&&globalThis.__mbunNetNative.wait?"
                         "(__mbunNetNative.wait(" +
@@ -865,6 +1057,29 @@ public:
         return result;
     }
 
+    // Render a rejection reason the way node's fatal handler does: the
+    // "Name: message" header (JSC's Error.stack omits it) followed by the
+    // stack, plus the error `code` when the reason carries one — that code is
+    // what the node corpus asserts on, so it belongs in the log.
+    std::string describe_rejection_(JSValueRef reason) {
+        std::string text{describe_exception_(reason)};
+        if (reason == nullptr || !JSValueIsObject(ctx_, reason)) return text;
+        JSObjectRef obj{JSValueToObject(ctx_, reason, nullptr)};
+        if (obj == nullptr) return text;
+        const auto read{[&](const char* key) -> std::string {
+            JSStringRef name{JSStringCreateWithUTF8CString(key)};
+            JSValueRef value{JSObjectGetProperty(ctx_, obj, name, nullptr)};
+            JSStringRelease(name);
+            if (value == nullptr || JSValueIsUndefined(ctx_, value) ||
+                JSValueIsNull(ctx_, value))
+                return {};
+            return describe_exception_(value);
+        }};
+        if (std::string code{read("code")}; !code.empty()) text += " [" + code + "]";
+        if (std::string stack{read("stack")}; !stack.empty()) text += '\n' + stack;
+        return text;
+    }
+
     std::string describe_exception_(JSValueRef exception) {
         JSValueRef ignored{nullptr};
         JSStringRef s{JSValueToStringCopy(ctx_, exception, &ignored)};
@@ -949,736 +1164,89 @@ public:
         return out;
     }
 
-    void install_bindings_() {
-        // Runs on the bare main thread (JSGlobalContextCreate released its lock
-        // on return): hold the API lock for the whole installation so the
-        // direct JSC-internal work (set_fn's JSNativeStdFunction::create,
-        // set_native_fn's JSFunction::create) allocates with the VM's
-        // atomStringTable installed (see set_fn in common.inc).
-        JSC::JSLockHolder locker{toJS(ctx_)};
-        JSObjectRef global{JSContextGetGlobalObject(ctx_)};
-
-        // Bun.Glob class
-        JSClassDefinition def{kJSClassDefinitionEmpty};
-        def.className = "Glob";
-        def.staticFunctions = gGlobStaticFns;
-        def.finalize = glob_finalize;
-        gGlobClass = JSClassCreate(&def);
-        JSObjectRef globCtor{JSObjectMakeConstructor(ctx_, gGlobClass, glob_construct_cb)};
-
-        // Bun namespace
-        JSObjectRef bun{JSObjectMake(ctx_, nullptr, nullptr)};
-
-        // semver.order / satisfies: native host functions (no C API lock churn).
-        JSObjectRef semver{JSObjectMake(ctx_, nullptr, nullptr)};
-        set_native_fn(ctx_, semver, "order", 2, semver_order_host);
-        set_native_fn(ctx_, semver, "satisfies", 2, semver_satisfies_host);
-        set_prop(ctx_, bun, "semver", semver);
-
-        JSObjectRef toml{JSObjectMake(ctx_, nullptr, nullptr)};
-        set_fn(ctx_, toml, "parse", toml_parse_cb);
-        set_prop(ctx_, bun, "TOML", toml);
-
-        // .env text -> object, for node's util.parseEnv (node:util partition).
-        JSObjectRef dotenv{JSObjectMake(ctx_, nullptr, nullptr)};
-        set_fn(ctx_, dotenv, "parse", dotenv_parse_cb);
-        set_prop(ctx_, global, "__mbunDotenvNative", dotenv);
-
-        // INI text -> object, for bun:internal-for-testing iniInternals.parse.
-        JSObjectRef iniN{JSObjectMake(ctx_, nullptr, nullptr)};
-        set_fn(ctx_, iniN, "parse", ini_parse_cb);
-        set_prop(ctx_, global, "__mbunIniNative", iniN);
-
-
-        // Bun.build → in-memory bundler slice (runtime/bun_build.inc).
-        set_native_fn(ctx_, bun, "build", 1, bun_build_host);
-
-        // Bun.hash (wyhash) + sub-functions (mbun.crypto non-crypto family).
-        set_native_fn(ctx_, bun, "hash", 1, bun_hash_default_host);
-        JSObjectRef hashObj{JSValueToObject(ctx_, get_prop(ctx_, bun, "hash"), nullptr)};
-        set_native_fn(ctx_, hashObj, "wyhash", 1, bun_hash_wyhash_host);
-        set_native_fn(ctx_, hashObj, "adler32", 1, bun_hash_adler32_host);
-        set_native_fn(ctx_, hashObj, "crc32", 1, bun_hash_crc32_host);
-        set_native_fn(ctx_, hashObj, "cityHash32", 1, bun_hash_cityHash32_host);
-        set_native_fn(ctx_, hashObj, "cityHash64", 1, bun_hash_cityHash64_host);
-        set_native_fn(ctx_, hashObj, "xxHash32", 1, bun_hash_xxHash32_host);
-        set_native_fn(ctx_, hashObj, "xxHash64", 1, bun_hash_xxHash64_host);
-        set_native_fn(ctx_, hashObj, "xxHash3", 1, bun_hash_xxHash3_host);
-        set_native_fn(ctx_, hashObj, "murmur32v2", 1, bun_hash_murmur32v2_host);
-        set_native_fn(ctx_, hashObj, "murmur32v3", 1, bun_hash_murmur32v3_host);
-        set_native_fn(ctx_, hashObj, "murmur64v2", 1, bun_hash_murmur64v2_host);
-        set_native_fn(ctx_, hashObj, "rapidhash", 1, bun_hash_rapidhash_host);
-
-        // Bun.CryptoHasher (md5/sha1/sha2 family) + static hash().
-        JSClassDefinition chDef{kJSClassDefinitionEmpty};
-        chDef.className = "CryptoHasher";
-        chDef.finalize = crypto_hasher_finalize;
-        gCryptoHasherClass = JSClassCreate(&chDef);
-        JSObjectRef chCtor{JSObjectMakeConstructor(ctx_, gCryptoHasherClass,
-                                                   crypto_hasher_construct_cb)};
-        set_native_fn(ctx_, chCtor, "hash", 3, crypto_hasher_static_hash_host);
-        // Bun.CryptoHasher.algorithms — bun's full advertised set. sha512-224 is
-        // now backed; md4/ripemd160 remain DEFERRED in the CryptoHasher constructor
-        // path (node:crypto createHash covers them via crypto_digest_bytes).
-        {
-            static constexpr const char* kAlgos[]{
-                "blake2b256", "blake2b512", "blake2s256", "md4", "md5", "ripemd160",
-                "sha1", "sha224", "sha256", "sha384", "sha512", "sha512-224",
-                "sha512-256", "sha3-224", "sha3-256", "sha3-384", "sha3-512",
-                "shake128", "shake256"};
-            std::vector<JSValueRef> algos;
-            algos.reserve(std::size(kAlgos));
-            for (const char* a : kAlgos) { algos.push_back(make_string(ctx_, a)); }
-            JSObjectRef algosArr{JSObjectMakeArray(ctx_, algos.size(), algos.data(), nullptr)};
-            set_prop(ctx_, chCtor, "algorithms", algosArr);
+    // ── the Permission Model bridge (__mbunPermissionNative) ───────────────
+    // node exposes the model to JS through internalBinding('permission'), whose
+    // only members are has() and drop(); everything else about the model lives
+    // in C++. Same split here: this object is a thin window onto gPermission,
+    // and the enforcement it reports on happens in the fs/spawn/worker gates,
+    // NOT in whatever JS reads this. Tampering with the object cannot grant
+    // anything — the gates never consult it.
+    static JSValueRef permission_has_cb(JSContextRef ctx, JSObjectRef, JSObjectRef,
+                                        std::size_t argc, const JSValueRef args[], JSValueRef*) {
+        // node permission.cc Has: an unknown scope is false, and an EMPTY
+        // reference (as distinct from an absent one) is false too.
+        if (argc < 1 || !JSValueIsString(ctx, args[0])) return JSValueMakeBoolean(ctx, false);
+        const std::string label{val_to_string(ctx, args[0])};
+        const auto scope{mbun::permission::scope_from_label(label)};
+        if (scope == mbun::permission::Scope::Root) return JSValueMakeBoolean(ctx, false);
+        if (argc > 1 && !JSValueIsUndefined(ctx, args[1]) && !JSValueIsNull(ctx, args[1])) {
+            const std::string ref{val_to_string(ctx, args[1])};
+            if (ref.empty()) return JSValueMakeBoolean(ctx, false);
+            return JSValueMakeBoolean(ctx, gPermission.is_granted(scope, ref));
         }
-        set_prop(ctx_, bun, "CryptoHasher", chCtor);
+        return JSValueMakeBoolean(ctx, gPermission.is_granted(scope));
+    }
 
-        // Fixed-algorithm shorthands Bun.SHA1 … Bun.MD5 (each its own class so
-        // ctor.name matches bun for the "already digested" assertions).
-#define MBUN_REG_SHA(CLS)                                                            \
-    do {                                                                            \
-        JSClassDefinition d{kJSClassDefinitionEmpty};                               \
-        d.className = #CLS;                                                          \
-        d.finalize = crypto_hasher_finalize;                                        \
-        g##CLS##Class = JSClassCreate(&d);                                          \
-        JSObjectRef c{JSObjectMakeConstructor(ctx_, g##CLS##Class, CLS##_construct_cb)}; \
-        set_native_fn(ctx_, c, "hash", 2, CLS##_static_hash_host);                  \
-        /* JSObjectMakeConstructor leaves `name` unset; bun's class-based ctors   \
-           carry it, and the corpus builds its expected "<name> hasher already    \
-           digested" messages out of `Class.name`. */                             \
-        set_prop(ctx_, c, "name", make_string(ctx_, #CLS));                        \
-        set_prop(ctx_, bun, #CLS, c);                                               \
-    } while (0)
-        MBUN_REG_SHA(SHA1);
-        MBUN_REG_SHA(SHA224);
-        MBUN_REG_SHA(SHA256);
-        MBUN_REG_SHA(SHA384);
-        MBUN_REG_SHA(SHA512);
-        MBUN_REG_SHA(SHA512_256);
-        MBUN_REG_SHA(MD5);
-        MBUN_REG_SHA(MD4);
-#undef MBUN_REG_SHA
-
-        set_fn(ctx_, bun, "which", bun_which_cb);
-        set_native_fn(ctx_, bun, "stringWidth", 1, string_width_host);
-        set_fn(ctx_, bun, "stripANSI", strip_ansi_cb);
-        set_fn(ctx_, bun, "nanoseconds", nanoseconds_cb);
-        set_fn(ctx_, bun, "file", bunfile_cb);
-        set_prop(ctx_, bun, "Glob", globCtor);
-        // Bun.version is a COMPATIBILITY DECLARATION ("which bun API contract do I
-        // target"), not mbun's product identity -- real projects and the corpus gate
-        // capability on it (elysia utils.ts: semver.satisfies(Bun.version, ">=1.2.14");
-        // ci-restrictions.test.ts: skipIf(satisfies(Bun.version.split("-")[0], "< 1.3"))).
-        // It MUST be a bare semver: bun's own semver rejects a prerelease-tagged version
-        // against a prerelease-free range, so "1.3.14-mbun" satisfies NEITHER ">=1.2.14"
-        // nor even ">=1.3.14" (verified against bun 1.3.14) -- a "-mbun" suffix defeats
-        // the entire point. A "0.x" version is worse than inert: core-js's schedulers-fix
-        // reads Bun.version.split(".") and wraps setTimeout/setInterval for "Bun 0.3.0-".
-        // This mirrors what bun itself does one level down: it reports
-        // process.version = "v24.3.0" (claiming Node 24) and keeps its own identity in
-        // the additive process.versions.bun. mbun's identity likewise lives in
-        // process.versions.mbun (below), not here.
-        // 1.3.14 (not bun-ref's 1.4.0) is the deliberate, conservative claim: it is the
-        // version mbun is differentially verified against, it clears every gate in the
-        // corpus (no test gates on 1.4), and it claims strictly less.
-        // Must stay byte-identical to mbun::cli::VERSION in app/cli/src/cli.cppm.
-        set_prop(ctx_, bun, "version", make_string(ctx_, "1.3.14"));
-        // bun: Bun.revision is the full 40-hex build git sha, Bun.version_with_sha is
-        // "v" + version + " (" + sha[0..9] + ")" (BunObject.cpp constructBunRevision /
-        // constructBunVersionWithSha; node_process.rs; env.rs GIT_SHA_SHORT = sha[0..9]).
-        // mbun has no build-time git-sha injection yet → fixed placeholder sha.
-        // Must stay byte-identical to mbun::cli::REVISION / VERSION_WITH_SHA in
-        // app/cli/src/cli.cppm (modules/jsc cannot import app/cli, so they are synced
-        // by hand). revision MUST NOT be empty: harness.ts normalizeBunSnapshot does
-        // `.replaceAll(Bun.revision, "<revision>")` and replaceAll("") splices the
-        // marker between every character of the snapshot.
-        set_prop(ctx_, bun, "revision",
-                 make_string(ctx_, "7a3f9c2e1b8d4056e9f2c7a1b3d58e460c9f2a71"));
-        set_prop(ctx_, bun, "version_with_sha",
-                 make_string(ctx_, "v1.3.14 (7a3f9c2e1)"));
-        set_prop(ctx_, bun, "isMainThread", JSValueMakeBoolean(ctx_, true));
-
-        set_prop(ctx_, global, "Bun", bun);
-
-        // CAP-WORKER: native seam for real cross-thread Worker execution
-        // (runtime/worker.inc). The JS Worker class (builtins/node_worker.cppm)
-        // drives it; worker→parent events are delivered through the existing
-        // timer loop (a self-rearming setTimeout in the JS layer), so no
-        // event-loop-pump hook is needed here.
-        JSObjectRef workerNative{JSObjectMake(ctx_, nullptr, nullptr)};
-        set_fn(ctx_, workerNative, "spawn", worker_spawn_host);
-        set_fn(ctx_, workerNative, "post", worker_post_host);
-        set_fn(ctx_, workerNative, "terminate", worker_terminate_host);
-        set_fn(ctx_, workerNative, "drain", worker_drain_host);
-        set_fn(ctx_, workerNative, "activeCount", worker_active_host);
-        set_prop(ctx_, global, "__mbunWorkerNative", workerNative);
-
-        JSClassDefinition cryptoKeyDef{kJSClassDefinitionEmpty};
-        cryptoKeyDef.className = "CryptoKey";
-        cryptoKeyDef.finalize = webcrypto_key_finalize;
-        gCryptoKeyClass = JSClassCreate(&cryptoKeyDef);
-        JSObjectRef cryptoKeyCtor{
-            JSObjectMakeConstructor(ctx_, gCryptoKeyClass, webcrypto_key_construct_cb)};
-        set_prop(ctx_, global, "CryptoKey", cryptoKeyCtor);
-
-        JSObjectRef webcryptoNative{JSObjectMake(ctx_, nullptr, nullptr)};
-        set_native_fn(ctx_, webcryptoNative, "importHmac", 4, webcrypto_import_hmac_host);
-        set_native_fn(ctx_, webcryptoNative, "hmac", 2, webcrypto_hmac_host);
-        set_native_fn(ctx_, webcryptoNative, "verifyHmac", 3, webcrypto_verify_hmac_host);
-        set_prop(ctx_, global, "__mbunWebCryptoNative", webcryptoNative);
-
-        // node:crypto native backend (mbun.crypto): hash/hmac/pbkdf2/random.
-        JSObjectRef cryptoNative{JSObjectMake(ctx_, nullptr, nullptr)};
-        set_native_fn(ctx_, cryptoNative, "digest", 3, node_crypto_digest_host);
-        set_native_fn(ctx_, cryptoNative, "hmac", 3, node_crypto_hmac_host);
-        set_native_fn(ctx_, cryptoNative, "pbkdf2", 5, node_crypto_pbkdf2_host);
-        set_native_fn(ctx_, cryptoNative, "randomBytes", 1, node_crypto_random_bytes_host);
-        set_native_fn(ctx_, cryptoNative, "randomFillSync", 1, node_crypto_random_fill_host);
-        set_native_fn(ctx_, cryptoNative, "randomUUID", 0, node_crypto_random_uuid_host);
-        set_prop(ctx_, global, "__mbunCryptoNative", cryptoNative);
-
-        JSObjectRef pwNative{JSObjectMake(ctx_, nullptr, nullptr)};
-        set_native_fn(ctx_, pwNative, "hash", 5, bun_password_hash_host);
-        set_native_fn(ctx_, pwNative, "verify", 3, bun_password_verify_host);
-        set_prop(ctx_, global, "__mbunPasswordNative", pwNative);
-
-        // node:crypto asymmetric + cipher backend (vendored OpenSSL / mbun.openssl).
-        JSObjectRef cryptoAsymNative{JSObjectMake(ctx_, nullptr, nullptr)};
-        set_native_fn(ctx_, cryptoAsymNative, "generateKeyPair", 9, node_asym_generate_host);
-        set_native_fn(ctx_, cryptoAsymNative, "sign", 7, node_asym_sign_host);
-        set_native_fn(ctx_, cryptoAsymNative, "verify", 8, node_asym_verify_host);
-        set_native_fn(ctx_, cryptoAsymNative, "publicEncrypt", 6, node_asym_public_encrypt_host);
-        set_native_fn(ctx_, cryptoAsymNative, "privateDecrypt", 6, node_asym_private_decrypt_host);
-        set_native_fn(ctx_, cryptoAsymNative, "privateEncrypt", 4, node_asym_private_encrypt_host);
-        set_native_fn(ctx_, cryptoAsymNative, "publicDecrypt", 4, node_asym_public_decrypt_host);
-        set_native_fn(ctx_, cryptoAsymNative, "cipher", 8, node_asym_cipher_host);
-        set_native_fn(ctx_, cryptoAsymNative, "cipherInfo", 3, node_asym_cipher_info_host);
-        set_native_fn(ctx_, cryptoAsymNative, "dhGeneratePrime", 1, node_asym_dh_prime_host);
-        set_native_fn(ctx_, cryptoAsymNative, "ecValidCurve", 1, node_asym_ec_valid_curve_host);
-        set_native_fn(ctx_, cryptoAsymNative, "ecdhGenerate", 1, node_asym_ecdh_generate_host);
-        set_native_fn(ctx_, cryptoAsymNative, "ecdhComputeSecret", 3, node_asym_ecdh_compute_host);
-        set_native_fn(ctx_, cryptoAsymNative, "ecdhPublicFromPrivate", 2, node_asym_ecdh_pub_from_priv_host);
-        set_native_fn(ctx_, cryptoAsymNative, "ecdhConvertKey", 3, node_asym_ecdh_convert_host);
-        set_native_fn(ctx_, cryptoAsymNative, "okpDerive", 2, node_asym_okp_derive_host);
-        set_native_fn(ctx_, cryptoAsymNative, "keyType", 3, node_asym_key_type_host);
-        set_native_fn(ctx_, cryptoAsymNative, "keyExport", 7, node_asym_key_export_host);
-        set_native_fn(ctx_, cryptoAsymNative, "jwkExport", 3, node_asym_jwk_export_host);
-        set_native_fn(ctx_, cryptoAsymNative, "jwkImport", 2, node_asym_jwk_import_host);
-        set_native_fn(ctx_, cryptoAsymNative, "x509parse", 1, node_asym_x509_parse_host);
-        set_native_fn(ctx_, cryptoAsymNative, "x509checkIssued", 2, node_asym_x509_check_issued_host);
-        set_prop(ctx_, global, "__mbunCryptoAsymNative", cryptoAsymNative);
-
-        // node:tls native backend (getCiphers over vendored OpenSSL/libssl).
-        install_node_tls_native(ctx_, global);
-
-        // console
-        JSObjectRef console{JSObjectMake(ctx_, nullptr, nullptr)};
-        set_fn(ctx_, console, "log", console_log_cb);
-        set_fn(ctx_, console, "error", console_error_cb);
-        set_prop(ctx_, global, "console", console);
-
-        // process / Bun.argv
-        JSValueRef argvArr{build_argv_()};
-        JSObjectRef process{JSObjectMake(ctx_, nullptr, nullptr)};
-        set_prop(ctx_, process, "argv", argvArr);
-        // execArgv is installed here rather than defaulted in JS so a compiled
-        // executable's baked `--compile-exec-argv` flags survive; the JS layer
-        // (node_process_extra) only fills in an empty array when it is missing.
-        set_prop(ctx_, process, "execArgv", build_string_array_(gExecArgv));
-        // `--title=<name>` among the runtime's own flags renames the process.
-        // ref: bun src/cli/Arguments.rs (--title) — the JS layer below only
-        // defaults this when nothing set it.
-        for (const std::string& flag : gExecArgv) {
-            if (flag.starts_with("--title=")) {
-                set_prop(ctx_, process, "title",
-                         make_string(ctx_, flag.substr(std::string_view{"--title="}.size())));
+    static JSValueRef permission_drop_cb(JSContextRef ctx, JSObjectRef, JSObjectRef,
+                                         std::size_t argc, const JSValueRef args[], JSValueRef*) {
+        if (argc < 1 || !JSValueIsString(ctx, args[0])) return JSValueMakeUndefined(ctx);
+        const auto scope{mbun::permission::scope_from_label(val_to_string(ctx, args[0]))};
+        if (scope == mbun::permission::Scope::Root) return JSValueMakeUndefined(ctx);
+        if (argc > 1 && !JSValueIsUndefined(ctx, args[1]) && !JSValueIsNull(ctx, args[1])) {
+            const std::string ref{val_to_string(ctx, args[1])};
+            if (!ref.empty()) {
+                gPermission.drop(scope, ref);
+                return JSValueMakeUndefined(ctx);
             }
         }
-        const std::string exe{exe_path()};
-        set_prop(ctx_, process, "argv0", make_string(ctx_, exe));
-        set_prop(ctx_, process, "execPath", make_string(ctx_, exe));
-        set_prop(ctx_, process, "platform", make_string(ctx_, host_platform()));
-        set_prop(ctx_, process, "arch", make_string(ctx_, host_arch()));
-        set_prop(ctx_, process, "env", build_process_env(ctx_));
-        set_fn(ctx_, process, "cwd", process_cwd_cb);
-        set_fn(ctx_, process, "chdir", process_chdir_cb);
-        set_fn(ctx_, process, "exit", process_exit_cb);
-        JSObjectRef stdout{JSObjectMake(ctx_, nullptr, nullptr)};
-        set_fn(ctx_, stdout, "write", stdout_write_cb);
-        // Node/bun: isTTY is `true` only when the fd is a terminal, otherwise
-        // `undefined` (never `false`). Mirrors the stdin path in bootstrap.cppm.
-        set_prop(ctx_, stdout, "isTTY",
-                 ::isatty(1) == 1 ? JSValueMakeBoolean(ctx_, true) : JSValueMakeUndefined(ctx_));
-        set_prop(ctx_, process, "stdout", stdout);
-        JSObjectRef stderrObj{JSObjectMake(ctx_, nullptr, nullptr)};
-        set_fn(ctx_, stderrObj, "write", stderr_write_cb);
-        set_prop(ctx_, stderrObj, "isTTY",
-                 ::isatty(2) == 1 ? JSValueMakeBoolean(ctx_, true) : JSValueMakeUndefined(ctx_));
-        set_prop(ctx_, process, "stderr", stderrObj);
-        set_prop(ctx_, global, "process", process);
-        set_prop(ctx_, bun, "argv", argvArr);
+        gPermission.drop(scope);
+        return JSValueMakeUndefined(ctx);
+    }
 
-        // JS-side process fields (version/versions/nextTick/hrtime/pid/no-op event
-        // surface) — data + thin wrappers over the native bits above.
-        JSValueRef pexc{nullptr};
-        eval_(R"JS(
-(function () {
-  const p = globalThis.process;
-  // Node compat claim = the pinned corpus version (compat/node is 26.3.0; the
-  // corpus itself asserts `node --version` -> "v26.3.0"). Must match
-  // mbun::cli::NODE_COMPAT_VERSION (cli.cppm), which `--version` prints and
-  // package.json engines.node is judged against.
-  p.version = "v26.3.0";
-  // `bun` mirrors Bun.version (bun-test.test.ts asserts process.versions.bun === Bun.version).
-  // `mbun` is the additive identity key: Bun.version is a compat claim about the bun API
-  // contract, exactly as process.version/versions.node here are a compat claim about Node,
-  // so mbun's real version lives in its own key -- the same way bun declares itself via
-  // process.versions.bun while reporting process.version = "v24.3.0". Nothing in the corpus
-  // enumerates process.versions, so an extra key is additive-only.
-  // `mbun` must match mbun::cli::MBUN_VERSION (cli.cppm).
-  // `openssl` is the vendored mbun.openssl package's real version, and must keep
-  // node's three-component shape: node's own test/common/crypto.js parses it with
-  // /(?<m>\\d+)\\.(?<n>\\d+)\\.(?<p>\\d+)/ and dereferences `.groups` unguarded, so a
-  // two-component "3.0" made every hasOpenSSL() caller die on `null.groups`.
-  p.versions = { node: "26.3.0", bun: (globalThis.Bun && Bun.version) || "1.3.14", mbun: "2026.07.18.0", v8: "12.4.0", modules: "127", uv: "1.0", openssl: "3.1.5" };
-  // bun mirrors Bun.revision onto process.revision (bun-test.test.ts asserts
-  // process.revision === Bun.revision; verified against bun 1.3.14). Derived from
-  // Bun.revision so the two can never drift.
-  p.revision = (globalThis.Bun && Bun.revision) || "";
-  // `title` is installed natively above so a `--title=<name>` runtime flag (which
-  // a `--compile`d executable can carry in its baked execArgv) survives; the ??=
-  // keeps "bun" as the default for every ordinary run.
-  p.pid = 1; p.ppid = 0; p.exitCode = 0; p.title ??= "bun";
-  p.nextTick = function (fn) { const a = Array.prototype.slice.call(arguments, 1); queueMicrotask(function () { fn.apply(null, a); }); };
-  const nanos = () => (globalThis.Bun && Bun.nanoseconds ? Bun.nanoseconds() : 0);
-  p.hrtime = function (prev) {
-    const t = nanos(); let s = Math.floor(t / 1e9), n = Math.floor(t % 1e9);
-    if (prev) { s -= prev[0]; n -= prev[1]; if (n < 0) { s -= 1; n += 1e9; } }
-    return [s, n];
-  };
-  p.hrtime.bigint = function () { return BigInt(Math.floor(nanos())); };
-  // A real emitter, not the no-op stubs this used to carry: process.emitWarning
-  // and everything else that goes through p.emit was silently dropped, so any
-  // process.on("warning"/"exit"/...) listener never ran. Self-contained rather
-  // than require("node:events") — this runs during prelude, before the module
-  // table exists. _ev is null-prototype so an event named e.g. "toString" cannot
-  // collide with Object.prototype.
-  const _ev = Object.create(null);
-  const _add = (n, f, pre) => { const l = _ev[n] || (_ev[n] = []); pre ? l.unshift(f) : l.push(f); return p; };
-  p.on = p.addListener = function (n, f) { return _add(String(n), f, false); };
-  p.prependListener = function (n, f) { return _add(String(n), f, true); };
-  p.once = function (n, f) { const w = function (...a) { p.off(n, w); return f.apply(p, a); }; w.listener = f; return _add(String(n), w, false); };
-  p.off = p.removeListener = function (n, f) { const l = _ev[String(n)]; if (l) { const i = l.findIndex((x) => x === f || x.listener === f); if (i >= 0) l.splice(i, 1); } return p; };
-  p.removeAllListeners = function (n) { if (n === undefined) { for (const k of Object.keys(_ev)) delete _ev[k]; } else delete _ev[String(n)]; return p; };
-  p.listeners = function (n) { return (_ev[String(n)] || []).map((x) => x.listener || x); };
-  p.rawListeners = function (n) { return (_ev[String(n)] || []).slice(); };
-  p.listenerCount = function (n) { return (_ev[String(n)] || []).length; };
-  p.eventNames = function () { return Object.keys(_ev); };
-  p.emit = function (n, ...a) { const l = _ev[String(n)]; if (!l || !l.length) return false; for (const f of l.slice()) f.apply(p, a); return true; };
-  p.cpuUsage = function () { return { user: 0, system: 0 }; };
-  p.memoryUsage = function () { return { rss: 0, heapTotal: 0, heapUsed: 0, external: 0, arrayBuffers: 0 }; };
-  p.memoryUsage.rss = function () { return 0; };
-  p.umask = function () { return 0; };
-  // Async via nextTick, as bun does (BunProcess.cpp emitWarningErrorInstance):
-  // a listener registered after the emitWarning call in the same tick still sees
-  // the warning. No default stderr print when unlistened (node/bun do print) —
-  // that would inject noise into the snapshot tests; left for the node-compat track.
-  p.emitWarning = function (warning, opts) { const name = (opts && (typeof opts === 'string' ? opts : opts.type)) || 'Warning'; const e = warning instanceof Error ? warning : Object.assign(new Error(String(warning)), { name }); p.nextTick(function () { p.emit('warning', e); }); };
-  p.emitMemoryPressure = function () {};
-  p.isMemoryPressureWatcherInstalled = function () { return false; };
-  p.getuid = function () { return 0; }; p.getgid = function () { return 0; };
-  p.report = {
-    getReport: function () { return { header: { glibcVersionRuntime: "2.35", glibcVersionCompiler: "2.35" } }; },
-    writeReport: function () { return ""; },
-  };
-  p.features = { inspector: false };
-  p.config = { variables: {} };
-  p.release = { name: "node" };
-  p.stdin = { on: function () { return p.stdin; }, read: function () { return null; }, resume: function () {}, pause: function () {}, setEncoding: function () {}, isTTY: false };
-  p.binding = function () { return {}; };
-  // CAP-NAPI: node's low-level addon loader (loads into module.exports).
-  p.dlopen = function (module, filename) { return globalThis.__mbun_napi_dlopen(module, String(filename)); };
-  p.setSourceMapsEnabled = function () {};
-  p.allowedNodeEnvironmentFlags = new Set();
-})();
-)JS",
-              &pexc);
+    // Build the ERR_ACCESS_DENIED node itself raises from JS (lib/fs.js's
+    // symlink / fsync / fchmod refusals, process.report.writeReport,
+    // v8.writeHeapSnapshot). Those live in node's JS layer too, so mirroring
+    // them there is parity — the load-bearing gates stay in C++.
+    static JSValueRef permission_deny_error_cb(JSContextRef ctx, JSObjectRef, JSObjectRef,
+                                               std::size_t argc, const JSValueRef args[],
+                                               JSValueRef*) {
+        const auto scope{argc > 0 ? mbun::permission::scope_from_label(val_to_string(ctx, args[0]))
+                                  : mbun::permission::Scope::Root};
+        const std::string resource{argc > 1 && JSValueIsString(ctx, args[1])
+                                       ? val_to_string(ctx, args[1])
+                                       : std::string{}};
+        const std::string override{argc > 2 && JSValueIsString(ctx, args[2])
+                                       ? val_to_string(ctx, args[2])
+                                       : std::string{}};
+        return permission_denied_error(ctx, scope, resource, override);
+    }
 
-        // require (CommonJS): global fallback (built-ins only) + the real
-        // path-resolving native require and the per-module require factory.
-        set_fn(ctx_, global, "require", require_cb);
-        set_fn(ctx_, global, "__mbun_require_native", require_native_cb);
-        set_fn(ctx_, global, "__mbun_evict_module_cache", evict_module_cache_cb);
-        set_fn(ctx_, global, "__mbun_resolve_native", resolve_native_cb);
-        set_fn(ctx_, global, "__mbun_transpile", transpile_native_cb);
-        set_fn(ctx_, global, "__mbun_napi_dlopen", napi_dlopen_cb);
-        JSValueRef facExc{nullptr};
-        eval_(kRequireMachineryJs, &facExc);
-
-        // Native filesystem ops (real) exposed for the JS node:fs / fs/promises
-        // shapes to build on. Installed BEFORE kNodeBuiltinsJS (which references it).
-        JSObjectRef fsn{JSObjectMake(ctx_, nullptr, nullptr)};
-        set_fn(ctx_, fsn, "readFile", fsn_readFile_cb);
-        set_fn(ctx_, fsn, "writeFile", fsn_writeFile_cb);
-        set_fn(ctx_, fsn, "appendFile", fsn_appendFile_cb);
-        set_fn(ctx_, fsn, "exists", fsn_exists_cb);
-        set_fn(ctx_, fsn, "mkdir", fsn_mkdir_cb);
-        set_fn(ctx_, fsn, "rm", fsn_rm_cb);
-        set_fn(ctx_, fsn, "readdir", fsn_readdir_cb);
-        set_fn(ctx_, fsn, "stat", fsn_stat_cb);
-        set_fn(ctx_, fsn, "fstat", fsn_fstat_cb);
-        set_fn(ctx_, fsn, "readlink", fsn_readlink_cb);
-        set_fn(ctx_, fsn, "umask", fsn_umask_cb);
-        set_fn(ctx_, fsn, "unlink", fsn_unlink_cb);
-        set_fn(ctx_, fsn, "utimes", fsn_utimes_cb);
-        set_fn(ctx_, fsn, "chmod", fsn_chmod_cb);
-        set_fn(ctx_, fsn, "realpath", fsn_realpath_cb);
-        set_fn(ctx_, fsn, "rename", fsn_rename_cb);
-        set_fn(ctx_, fsn, "copyFile", fsn_copyFile_cb);
-        set_fn(ctx_, fsn, "symlink", fsn_symlink_cb);
-        set_fn(ctx_, fsn, "readdirRecursive", fsn_readdirRecursive_cb);
-        set_fn(ctx_, fsn, "mkdtemp", fsn_mkdtemp_cb);
-        set_prop(ctx_, global, "__mbunFsNative", fsn);
-        // Native subprocess ops for node:child_process (spawnSync/execSync).
-        JSObjectRef cpn{JSObjectMake(ctx_, nullptr, nullptr)};
-        set_fn(ctx_, cpn, "spawnSync", cp_spawn_sync_cb);
-        set_prop(ctx_, global, "__mbunCpNative", cpn);
-        // bun:ffi ptr(typedArray) — the real backing-store address (bun parity).
-        set_fn(ctx_, global, "__mbunFfiPtr", [](JSContextRef c, JSObjectRef, JSObjectRef,
-                                               std::size_t n, const JSValueRef a[],
-                                               JSValueRef*) -> JSValueRef {
-            if (n < 1) return JSValueMakeNumber(c, 0);
-            JSObjectRef o{JSValueToObject(c, a[0], nullptr)};
-            void* p{o != nullptr ? JSObjectGetTypedArrayBytesPtr(c, o, nullptr) : nullptr};
-            return JSValueMakeNumber(c, static_cast<double>(reinterpret_cast<std::uintptr_t>(p)));
-        });
-        // Bun.gc(force) / bun:jsc gcAndSweep|fullGC|edenGC. These were no-op
-        // stubs, so a suite that allocates a large blob per test and relies on
-        // the documented `Bun.gc(true)` in afterEach to reclaim it (bun's own
-        // js/web/fetch/blob-oom.test.ts) grew monotonically until the process was
-        // OOM-killed — every one of its OOM *guards* fired correctly, nothing
-        // ever freed the bytes. JSGarbageCollect is JSC's full collect+sweep.
-        set_fn(ctx_, global, "__mbunGcNative",
-               [](JSContextRef c, JSObjectRef, JSObjectRef, std::size_t n, const JSValueRef a[],
-                  JSValueRef*) -> JSValueRef {
-                   JSGarbageCollect(c);
-                   // Only the *forced* form scavenges. bmalloc's scavenge walks
-                   // every free range; leak tests call the unforced `Bun.gc()`
-                   // thousands of times inside a loop (js/web/request/
-                   // request-clone-leak does it 2000x per test), and doing a
-                   // full scavenge there is pure overhead — bun's unforced form
-                   // is `collect_async`, a hint (VirtualMachine.rs).
-                   if (n < 1 || !JSValueToBoolean(c, a[0])) return JSValueMakeNumber(c, 0);
-                   // Collecting alone is not enough: bmalloc caches the freed
-                   // large blocks, so a suite that churns hundreds of MB per
-                   // test keeps every one of them resident and still hits the
-                   // memory ceiling. bun's Bun.gc does the same thing one layer
-                   // down (VirtualMachine.rs garbage_collect →
-                   // bun_core::Global::mimalloc_cleanup).
-                   WTF::releaseFastMallocFreeMemory();
-                   return JSValueMakeNumber(c, 0);
-               });
-        // JSC backing-width introspection used only by bun:internal-for-testing.
-        JSObjectRef jscInternals{JSObjectMake(ctx_, nullptr, nullptr)};
-        set_native_fn(ctx_, jscInternals, "isUTF16String", 1, is_utf16_string_host);
-        set_native_fn(ctx_, jscInternals, "callerSourceOriginNative", 0, caller_source_origin_host);
-        set_native_fn(ctx_, jscInternals, "estimateShallowMemoryUsageOfNative", 1,
-                      estimate_shallow_memory_usage_host);
-        set_prop(ctx_, global, "__mbunJscInternalsNative", jscInternals);
-        // bun:internal-for-testing xxHash3ForTesting (full u64 seed; bootstrap
-        // re-exports it on the module).
-        set_native_fn(ctx_, global, "__mbunXxHash3ForTesting", 2, xxhash3_for_testing_host);
-        // Bun.peek promise-state introspection (native — reads internal slots).
-        set_native_fn(ctx_, global, "__mbun_peek_status", 1, peek_status_host);
-        set_native_fn(ctx_, global, "__mbun_peek_result", 1, peek_result_host);
-        // Native fd-level positioned I/O (fs.openSync/readSync/writeSync/closeSync)
-        // as direct host functions — no C API JSLock churn on the hot loop.
-        JSObjectRef fdn{JSObjectMake(ctx_, nullptr, nullptr)};
-        set_native_fn(ctx_, fdn, "open", 4, fdn_open_host);
-        set_native_fn(ctx_, fdn, "close", 1, fdn_close_host);
-        set_native_fn(ctx_, fdn, "read", 5, fdn_read_host);
-        set_native_fn(ctx_, fdn, "write", 5, fdn_write_host);
-        set_prop(ctx_, global, "__mbunFdNative", fdn);
-        // bun:internal-for-testing createSocketPair() → [readFd, writeFd].
-        set_native_fn(ctx_, global, "__mbunCreateSocketPair", 0, create_socket_pair_host);
-        // Native shell parser for bun:internal-for-testing shellInternals.
-        JSObjectRef shn{JSObjectMake(ctx_, nullptr, nullptr)};
-        set_fn(ctx_, shn, "parse", shell_parse_cb);
-        set_fn(ctx_, shn, "parseErrors", shell_parse_errors_cb);
-        set_fn(ctx_, shn, "compile", shell_compile_cb);
-        set_fn(ctx_, shn, "escape", shell_escape_cb);
-        set_fn(ctx_, shn, "exec", bunsh_exec_cb);
-        set_prop(ctx_, global, "__mbunShellNative", shn);
-        // Bun's private InternalSourceMap codec, exposed only through
-        // bun:internal-for-testing by the bootstrap module.
-        JSObjectRef smn{JSObjectMake(ctx_, nullptr, nullptr)};
-        set_fn(ctx_, smn, "fromVLQ", source_map_from_vlq_cb);
-        set_fn(ctx_, smn, "toVLQ", source_map_to_vlq_cb);
-        set_fn(ctx_, smn, "find", source_map_find_cb);
-        set_prop(ctx_, global, "__mbunSourceMapNative", smn);
-        // node:http maxHeaderSize <-> the process-wide mbun.http limit that
-        // every server reads per request. ref: bun node_http_binding.rs.
-        JSObjectRef htn{JSObjectMake(ctx_, nullptr, nullptr)};
-        set_fn(ctx_, htn, "getMaxHeaderSize", http_get_max_header_size_cb);
-        set_fn(ctx_, htn, "setMaxHeaderSize", http_set_max_header_size_cb);
-        set_fn(ctx_, htn, "userAgent", http_get_user_agent_cb);
-        set_prop(ctx_, global, "__mbunHttpNative", htn);
-        // CAP-S3: AWS SigV4 signing for Bun.S3Client (builtins/s3.cppm calls
-        // __mbunS3Native.sign; algorithm is mbun.s3_signing, crypto is mbun.crypto).
-        JSObjectRef s3n{JSObjectMake(ctx_, nullptr, nullptr)};
-        set_fn(ctx_, s3n, "sign", s3_sign_cb);
-        set_prop(ctx_, global, "__mbunS3Native", s3n);
-        // Binary-safe subprocess/pipe ops (base64 across the JS boundary) for
-        // Bun.spawn(stdin:"pipe"), Bun.spawnSync binary stdio, and Bun.stdin.
+    // The parsed flags, so the JS layer can answer node's
+    // getOptionValue('--allow-…') without a second parser.
+    JSObjectRef build_permission_native_() {
         JSObjectRef pn{JSObjectMake(ctx_, nullptr, nullptr)};
-        set_fn(ctx_, pn, "spawn", proc_spawn_cb);
-        set_fn(ctx_, pn, "write", proc_write_cb);
-        set_fn(ctx_, pn, "read", proc_read_cb);
-        set_fn(ctx_, pn, "close", proc_close_cb);
-        set_fn(ctx_, pn, "wait", proc_wait_cb);
-        set_fn(ctx_, pn, "kill", proc_kill_cb);
-#if !defined(_WIN32)
-        set_fn(ctx_, pn, "signalWatch", proc_signal_watch_cb);
-        set_fn(ctx_, pn, "signalDrain", proc_signal_drain_cb);
-#endif
-        set_fn(ctx_, pn, "spawnSyncB64", proc_spawn_sync_b64_cb);
-#if !defined(_WIN32)
-        set_fn(ctx_, pn, "spawnEx", proc_spawn_ex_cb);
-        set_fn(ctx_, pn, "spawnPty", proc_spawn_pty_cb);
-        set_fn(ctx_, pn, "ptyResize", proc_pty_resize_cb);
-        set_fn(ctx_, pn, "poll", proc_poll_cb);
-        set_fn(ctx_, pn, "ids", proc_ids_cb);
-        set_fn(ctx_, pn, "setNonBlock", proc_set_nonblock_cb);
-        set_fn(ctx_, pn, "writeNB", proc_write_nb_cb);
-        set_fn(ctx_, pn, "readNB", proc_read_nb_cb);
-#endif
-        set_prop(ctx_, global, "__mbunProcNative", pn);
-        // bun:ffi native backend (Bun.FFI): dlopen + SysV call path + read/ptr.
-        install_ffi_native(ctx_, global);
-        // Real pid/uid identity for process.* (default stubs said pid=1/uid=0,
-        // which made root-only tests run as non-root and vice versa).
-        (void)eval_(R"JS(
-(function () {
-  const PN = globalThis.__mbunProcNative;
-  const p = globalThis.process;
-  if (!PN || !PN.ids || !p) return;
-  const ids = PN.ids();
-  p.pid = ids.pid; Object.defineProperty(p, "ppid", { configurable: true, enumerable: true, get() { return PN.ids().ppid; } });
-  p.getuid = () => ids.uid; p.geteuid = () => ids.euid;
-  p.getgid = () => ids.gid; p.getegid = () => ids.egid;
-  p.getgroups = () => [ids.gid];
-  // process.kill(pid, signal) — real signal delivery (default SIGTERM).
-  const SIGMAP = { SIGHUP:1, SIGINT:2, SIGQUIT:3, SIGILL:4, SIGTRAP:5, SIGABRT:6, SIGBUS:7, SIGFPE:8, SIGKILL:9, SIGUSR1:10, SIGSEGV:11, SIGUSR2:12, SIGPIPE:13, SIGALRM:14, SIGTERM:15, SIGCHLD:17, SIGCONT:18, SIGSTOP:19, SIGTSTP:20 };
-  p.kill = function (pid, sig) {
-    const s = sig == null ? 15 : (typeof sig === "number" ? sig : (SIGMAP[sig] != null ? SIGMAP[sig] : 15));
-    const ok = PN.kill(pid | 0, s);
-    if (!ok) { const e = new Error("kill ESRCH"); e.code = "ESRCH"; e.errno = -3; e.syscall = "kill"; throw e; }
-    return true;
-  };
-
-  // ---- process.on("SIG…") → real POSIX handlers -------------------------
-  // node installs a handler the moment a signal gains its first listener and
-  // restores SIG_DFL when the last one goes away (so `process.off` of ONE of
-  // several listeners must NOT uninstall it). The native side only flips a
-  // sig_atomic_t; delivery happens here, off the event-loop pump.
-  if (typeof PN.signalWatch === "function") {
-    const NAME = {}; for (const k of Object.keys(SIGMAP)) NAME[SIGMAP[k]] = k;
-    const isSignal = (ev) => typeof ev === "string" && SIGMAP[ev] != null;
-    const armed = new Set();
-    const sync = (ev) => {
-      if (!isSignal(ev)) return;
-      const want = p.listenerCount(ev) > 0;
-      if (want === armed.has(ev)) return;
-      if (PN.signalWatch(SIGMAP[ev], want)) { if (want) armed.add(ev); else armed.delete(ev); }
-    };
-    for (const m of ["on", "addListener", "once", "prependListener", "prependOnceListener",
-                     "off", "removeListener", "removeAllListeners"]) {
-      const orig = p[m];
-      if (typeof orig !== "function") continue;
-      p[m] = function (ev, ...rest) {
-        const r = orig.call(this, ev, ...rest);
-        if (ev === undefined && m === "removeAllListeners") { for (const s of Array.from(armed)) sync(s); }
-        else sync(ev);
-        return r;
-      };
+        set_fn(ctx_, pn, "has", permission_has_cb);
+        set_fn(ctx_, pn, "drop", permission_drop_cb);
+        set_fn(ctx_, pn, "denyError", permission_deny_error_cb);
+        set_prop(ctx_, pn, "enabled", JSValueMakeBoolean(ctx_, gPermission.enabled()));
+        set_prop(ctx_, pn, "audit", JSValueMakeBoolean(ctx_, gPermission.warning_only()));
+        const auto& o{gPermissionOptions};
+        set_prop(ctx_, pn, "allowAddons", JSValueMakeBoolean(ctx_, o.allowAddons));
+        set_prop(ctx_, pn, "allowChildProcess", JSValueMakeBoolean(ctx_, o.allowChildProcess));
+        set_prop(ctx_, pn, "allowWorker", JSValueMakeBoolean(ctx_, o.allowWorker));
+        set_prop(ctx_, pn, "allowInspector", JSValueMakeBoolean(ctx_, o.allowInspector));
+        set_prop(ctx_, pn, "allowWasi", JSValueMakeBoolean(ctx_, o.allowWasi));
+        set_prop(ctx_, pn, "allowNet", JSValueMakeBoolean(ctx_, o.allowNet));
+        set_prop(ctx_, pn, "allowFfi", JSValueMakeBoolean(ctx_, o.allowFfi));
+        set_prop(ctx_, pn, "anyAllowFlag", JSValueMakeBoolean(ctx_, o.any_allow_flag()));
+        set_prop(ctx_, pn, "allowFsRead", build_string_array_(o.allowFsRead));
+        set_prop(ctx_, pn, "allowFsWrite", build_string_array_(o.allowFsWrite));
+        // The tokens a child process must inherit through NODE_OPTIONS.
+        set_prop(ctx_, pn, "flagsToInherit", build_string_array_(o.presentFlags));
+        return pn;
     }
-    globalThis.__mbunSignalTick = function () {
-      let sigs;
-      try { sigs = PN.signalDrain(); } catch (e) { return 0; }
-      if (!sigs || !sigs.length) return 0;
-      for (const n of sigs) {
-        const name = NAME[n];
-        if (name && p.listenerCount(name) > 0) { try { p.emit(name, name, n); } catch (e) {} }
-      }
-      return sigs.length;
-    };
-  }
-})();
-)JS",
-                     nullptr);
-        // Native compression (mbun.core.compress) for node:zlib / Bun.*Sync.
-        JSObjectRef zn{JSObjectMake(ctx_, nullptr, nullptr)};
-        set_fn(ctx_, zn, "compress", zlibn_compress_cb);
-        set_fn(ctx_, zn, "decompress", zlibn_decompress_cb);
-        set_fn(ctx_, zn, "crc32", zlibn_crc32_cb);
-        set_fn(ctx_, zn, "brotliCompress", brotlin_compress_cb);
-        set_fn(ctx_, zn, "brotliDecompress", brotlin_decompress_cb);
-        set_fn(ctx_, zn, "zstdCompress", zstdn_compress_cb);
-        set_fn(ctx_, zn, "zstdDecompress", zstdn_decompress_cb);
-        install_zlib_stream_native(ctx_, zn);  // streaming Transform handles
-        set_prop(ctx_, global, "__mbunZlibNative", zn);
-        // Native image pipeline (mbun.image) for Bun.Image.
-        JSObjectRef imn{JSObjectMake(ctx_, nullptr, nullptr)};
-        set_fn(ctx_, imn, "metadata", imgn_metadata_cb);
-        set_fn(ctx_, imn, "pipeline", imgn_pipeline_cb);
-        set_fn(ctx_, imn, "placeholder", imgn_placeholder_cb);
-        set_prop(ctx_, global, "__mbunImageNative", imn);
-        // Non-blocking TCP primitives (Bun.serve / real fetch / node:net) — the
-        // JS reactor in js_builtins drives these from the event-loop pump.
-        JSObjectRef nn{JSObjectMake(ctx_, nullptr, nullptr)};
-        set_fn(ctx_, nn, "listen", netn_listen_cb);
-        set_fn(ctx_, nn, "listenUnix", netn_listen_unix_cb);
-        set_fn(ctx_, nn, "accept", netn_accept_cb);
-        set_fn(ctx_, nn, "connect", netn_connect_cb);
-        set_fn(ctx_, nn, "connectUnix", netn_connect_unix_cb);
-        set_fn(ctx_, nn, "read", netn_read_cb);
-        set_fn(ctx_, nn, "readFd", netn_read_fd_cb);  // read(2) twin for process.stdin's fd 0
-        set_fn(ctx_, nn, "readByteBlocking", netn_read_byte_blocking_cb);  // blocking 1-byte read for alert/confirm/prompt
-        set_fn(ctx_, nn, "write", netn_write_cb);
-        set_fn(ctx_, nn, "shutdown", netn_shutdown_cb);
-        set_fn(ctx_, nn, "close", netn_close_cb);
-        set_fn(ctx_, nn, "setSockBuf", netn_set_sockbuf_cb);
-        set_fn(ctx_, nn, "wait", netn_wait_cb);
-        set_fn(ctx_, nn, "sleep", netn_sleep_cb);
-        // T-TLS.3: per-fd TLS channels (Bun.serve https / fetch https / wss).
-        set_fn(ctx_, nn, "tlsWrap", netn_tls_wrap_cb);
-        set_fn(ctx_, nn, "tlsStep", netn_tls_step_cb);
-        set_fn(ctx_, nn, "tlsRead", netn_tls_read_cb);
-        set_fn(ctx_, nn, "tlsWrite", netn_tls_write_cb);
-        set_fn(ctx_, nn, "tlsClose", netn_tls_close_cb);
-        set_fn(ctx_, nn, "tlsInfo", netn_tls_info_cb);
-        set_fn(ctx_, nn, "tlsError", netn_tls_error_cb);
-        set_fn(ctx_, nn, "tlsSelfSigned", netn_tls_self_signed_cb);
-        set_prop(ctx_, global, "__mbunNetNative", nn);
-        // T-LOOP: Bun.serve over the native epoll event loop (Http1Server on
-        // mbun.event_loop; Linux-only — elsewhere this is a no-op and Bun.serve
-        // keeps the portable __mbunNetNative poll reactor).
-        install_serve_native(ctx_, global);
-        install_dgram_native(ctx_, global);
-        // Real sqlite3 backend (mbun.sqlite) for bun:sqlite Database/Statement.
-        JSObjectRef sqn{JSObjectMake(ctx_, nullptr, nullptr)};
-        set_fn(ctx_, sqn, "open", sqliten_open_cb);
-        set_fn(ctx_, sqn, "close", sqliten_close_cb);
-        set_fn(ctx_, sqn, "run", sqliten_run_cb);
-        set_fn(ctx_, sqn, "expandedSQL", sqliten_expanded_sql_cb);
-        set_fn(ctx_, sqn, "inTransaction", sqliten_in_transaction_cb);
-        set_prop(ctx_, global, "__mbunSqliteNative", sqn);
-        // CAP-WATCH: node:fs.watch over inotify (mbun.watcher); no-op off Linux.
-        install_watch_native(ctx_, global);
-        // Bun.sql postgres wire codec bridge (offline protocol layer; the live
-        // socket transport is DEFERRED). See runtime/sql.inc.
-        JSObjectRef psn{JSObjectMake(ctx_, nullptr, nullptr)};
-        set_fn(ctx_, psn, "encodeStartup", psql_encode_startup_cb);
-        set_fn(ctx_, psn, "encodeQuery", psql_encode_query_cb);
-        set_fn(ctx_, psn, "encodeParse", psql_encode_parse_cb);
-        set_fn(ctx_, psn, "encodeBind", psql_encode_bind_cb);
-        set_fn(ctx_, psn, "encodeDescribe", psql_encode_describe_cb);
-        set_fn(ctx_, psn, "encodeExecute", psql_encode_execute_cb);
-        set_fn(ctx_, psn, "encodeSync", psql_encode_sync_cb);
-        set_fn(ctx_, psn, "encodeFlush", psql_encode_flush_cb);
-        set_fn(ctx_, psn, "encodeTerminate", psql_encode_terminate_cb);
-        set_fn(ctx_, psn, "decode", psql_decode_cb);
-        set_fn(ctx_, psn, "decodeValue", psql_decode_value_cb);
-        set_prop(ctx_, global, "__mbunPostgresNative", psn);
-#if !defined(_WIN32)
-        // getaddrinfo/getnameinfo-backed DNS primitives for node:dns / Bun.dns
-        // (the JS shaping/error layer is kDnsJS, evaluated after kNetJS).
-        JSObjectRef dnsn{JSObjectMake(ctx_, nullptr, nullptr)};
-        set_fn(ctx_, dnsn, "lookup", dnsn_lookup_cb);
-        set_fn(ctx_, dnsn, "drain", dnsn_drain_cb);
-        set_fn(ctx_, dnsn, "reverse", dnsn_reverse_cb);
-        set_fn(ctx_, dnsn, "lookupService", dnsn_lookup_service_cb);
-        set_fn(ctx_, dnsn, "resolve", dnsn_resolve_cb);
-        set_prop(ctx_, global, "__mbunDnsNative", dnsn);
-#endif
-        // node:os / node:tty POSIX system-info primitives (__mbunOsNative); the
-        // JS shaping in js_builtins overwrites the pure-JS os/tty stubs.
-        install_node_os_native(ctx_, global);
-        // node:vm sandbox contexts (__mbunNodeVMNative): real child JSC globals.
-        install_node_vm_native(ctx_, global);
-        // CAP-HTMLREWRITER: Bun's HTMLRewriter backend (__mbunHTMLRewriterNative)
-        // over the vendored lol-html engine; the JS class ships in kNodeBuiltinsJS.
-        install_htmlrewriter_native(ctx_, global);
-        install_valkey_native(ctx_, global);
 
-        // WHATWG Streams (installed BEFORE kNodeBuiltinsJS so its `typeof
-        // G.ReadableStream === "undefined"` guards see the spec implementation).
-        JSValueRef sexc{nullptr};
-        eval_(mbun::jsc::builtins::kStreamsJS, &sexc);
-        if (sexc != nullptr && std::getenv("MBUN_DEBUG_BUILTINS")) {
-            std::cerr << "[streams error] " << describe_exception_(sexc) << '\n';
-        }
-
-        // Pure-JS node built-in modules (path/assert/util/os/module/events/fs/…).
-        JSValueRef bexc{nullptr};
-        eval_(mbun::jsc::builtins::kNodeBuiltinsJS, &bexc);
-        if (bexc != nullptr && std::getenv("MBUN_DEBUG_BUILTINS")) {
-            std::cerr << "[builtins error] " << describe_exception_(bexc) << '\n';
-        }
-        // Networking layer (node:net/node:http/Bun.serve/real fetch) over the
-        // __mbunNetNative primitives — replaces the load-only stubs above.
-        JSValueRef nexc{nullptr};
-        eval_(mbun::jsc::js_net::kNetJS, &nexc);
-        if (nexc != nullptr && std::getenv("MBUN_DEBUG_BUILTINS")) {
-            std::cerr << "[js_net error] " << describe_exception_(nexc) << '\n';
-        }
-        // Bun.connect/Bun.listen/Bun.sleepSync over the net reactor (split out
-        // of js_net for the line budget), then the RFC6455 WebSocket layer
-        // (Bun.serve upgrade + client WebSocket) — both need kNetJS first.
-        JSValueRef bsexc{nullptr};
-        eval_(mbun::jsc::js_bun_socket::kBunSocketJS, &bsexc);
-        if (bsexc != nullptr && std::getenv("MBUN_DEBUG_BUILTINS")) {
-            std::cerr << "[js_bun_socket error] " << describe_exception_(bsexc) << '\n';
-        }
-        // Live node:tls socket surface (tls.connect / TLSSocket / createServer)
-        // over the net reactor Socket — must follow kNetJS so `extends net.Socket`
-        // binds the real reactor class, not the pre-image bootstrap stub.
-        JSValueRef tlsexc{nullptr};
-        eval_(mbun::jsc::js_tls_live::kTlsLiveJS, &tlsexc);
-        if (tlsexc != nullptr && std::getenv("MBUN_DEBUG_BUILTINS")) {
-            std::cerr << "[js_tls_live error] " << describe_exception_(tlsexc) << '\n';
-        }
-        // node:http2 client (http2.connect / ClientHttp2Session / Stream) over
-        // the net reactor + node:tls ALPN socket — must follow kNetJS + kTlsLiveJS.
-        JSValueRef h2exc{nullptr};
-        eval_(mbun::jsc::js_http2::kHttp2JS, &h2exc);
-        if (h2exc != nullptr && std::getenv("MBUN_DEBUG_BUILTINS")) {
-            std::cerr << "[js_http2 error] " << describe_exception_(h2exc) << '\n';
-        }
-        JSValueRef wsexc{nullptr};
-        eval_(mbun::jsc::js_websocket::kWebSocketJS, &wsexc);
-        if (wsexc != nullptr && std::getenv("MBUN_DEBUG_BUILTINS")) {
-            std::cerr << "[js_websocket error] " << describe_exception_(wsexc) << '\n';
-        }
-        // node:dns / node:dns/promises / Bun.dns over __mbunDnsNative (after net,
-        // so it can reuse node:net isIP for lookupService address validation).
-        JSValueRef dexc{nullptr};
-        eval_(mbun::jsc::js_dns::kDnsJS, &dexc);
-        if (dexc != nullptr && std::getenv("MBUN_DEBUG_BUILTINS")) {
-            std::cerr << "[js_dns error] " << describe_exception_(dexc) << '\n';
-        }
-        // LAST: node's legacy constructor call forms (`http.Server(fn)` with no
-        // `new`). It re-exports the affected classes through a callable stand-in,
-        // so it must run after the final owner of each module object — kNetJS
-        // REPLACES node:net/node:http wholesale, which would drop a patch applied
-        // inside the builtins blob.
-        JSValueRef lcexc{nullptr};
-        eval_(mbun::jsc::builtins::detail::kNodeLegacyCtorsJS, &lcexc);
-        if (lcexc != nullptr && std::getenv("MBUN_DEBUG_BUILTINS")) {
-            std::cerr << "[legacy ctors error] " << describe_exception_(lcexc) << '\n';
-        }
-    }
+#include "bindings_install.inc"
 
     JSValueRef build_string_array_(const std::vector<std::string>& values) {
         std::vector<JSValueRef> items;
@@ -1779,6 +1347,12 @@ JSValueRef napi_dlopen_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_
     if (filename.starts_with("file://")) {
         filename = file_url_to_path(filename);
     }
+    // Permission Model: node blocks native addons unless --allow-addons
+    // (env.cc also clears allow_native_addons). dlopen'ing a .node hands the
+    // process arbitrary native code, which would void every other gate, so the
+    // check sits at the dlopen itself.
+    if (permission_deny_scope(ctx, exc, mbun::permission::Scope::Addon, filename))
+        return JSValueMakeUndefined(ctx);
     mbun_napi_process_dlopen(ctx, moduleObj, filename, exc);
     return JSValueMakeUndefined(ctx);
 }

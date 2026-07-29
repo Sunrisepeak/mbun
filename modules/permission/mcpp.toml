@@ -1,0 +1,14 @@
+[package]
+name        = "permission"
+version     = "0.1.0"
+description = "mbun.permission — node's Permission Model (--permission / --allow-*), pure logic"
+license     = "MIT"
+standard    = "c++26"
+
+# No cross-member dependencies: the model is a self-contained translation of
+# node's src/permission/* (scope table, the fs radix tree, path.resolve) so it
+# can be unit-tested off the JS engine. The jsc member consumes it and supplies
+# the syscall boundary.
+
+[indices]
+mbun = { path = "../../mcpp" }

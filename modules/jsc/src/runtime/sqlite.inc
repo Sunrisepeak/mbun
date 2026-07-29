@@ -152,6 +152,28 @@ JSValueRef sqliten_open_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size
     mbun::sqlite::DatabaseOptions opts{};
     opts.readonly = argc > 1 && JSValueToBoolean(ctx, args[1]);
     opts.create = argc > 2 ? JSValueToBoolean(ctx, args[2]) : true;
+
+    // PERMISSION GATE. `new Database(path)` is a filesystem open, and with bun's
+    // default flags (readwrite|create) it is also a filesystem WRITE that creates
+    // the file if it is missing — so under `--permission` this was an unrestricted
+    // arbitrary-file-create/write primitive while fs.writeFileSync and Bun.write
+    // were both being denied. An in-memory database touches no path and stays free.
+    const bool inMemory{filename.empty() || filename == ":memory:"
+                        || filename.starts_with("file::memory:")
+                        || filename.find("mode=memory") != std::string::npos};
+    if (!inMemory) {
+        if (permission_deny_fs(ctx, exc, filename, false)) return JSValueMakeUndefined(ctx);
+        if (!opts.readonly && permission_deny_fs(ctx, exc, filename, true)) {
+            return JSValueMakeUndefined(ctx);
+        }
+    }
+    // The gate above can only see the path it was handed. `ATTACH DATABASE '<p>'`
+    // opens a second file from inside a SQL string, so a connection created under a
+    // partial fs grant must not be able to attach at all.
+    opts.no_attach = gPermission.enabled()
+                     && !(gPermission.is_granted(mbun::permission::Scope::FileSystemRead)
+                          && gPermission.is_granted(mbun::permission::Scope::FileSystemWrite));
+
     auto db{mbun::sqlite::open(std::move(filename), opts)};
     if (!db) return sqlite_throw(ctx, exc, db.error().message, db.error().code);
     int handle{sqlite_next_handle()++};

@@ -674,18 +674,27 @@ inline constexpr std::string_view kWebURLPatternJS = R"JS(
         Object.defineProperty(this, COMP, { value: components, enumerable: false, writable: false, configurable: true });
       }
 
-      test(input = {}, baseURL = undefined) { return matchPattern(this, input, baseURL) !== null; }
-      exec(input = {}, baseURL = undefined) { return matchPattern(this, input, baseURL); }
+      test(input = {}, baseURL = undefined) { brand(this); return matchPattern(this, input, baseURL) !== null; }
+      exec(input = {}, baseURL = undefined) { brand(this); return matchPattern(this, input, baseURL); }
 
-      get protocol() { return this[COMP].protocol.patternString; }
-      get username() { return this[COMP].username.patternString; }
-      get password() { return this[COMP].password.patternString; }
-      get hostname() { return this[COMP].hostname.patternString; }
-      get port() { return this[COMP].port.patternString; }
-      get pathname() { return this[COMP].pathname.patternString; }
-      get search() { return this[COMP].search.patternString; }
-      get hash() { return this[COMP].hash.patternString; }
-      get hasRegExpGroups() { return COMPONENTS.some((n) => this[COMP][n].hasRegexpGroups); }
+      get protocol() { return brand(this).protocol.patternString; }
+      get username() { return brand(this).username.patternString; }
+      get password() { return brand(this).password.patternString; }
+      get hostname() { return brand(this).hostname.patternString; }
+      get port() { return brand(this).port.patternString; }
+      get pathname() { return brand(this).pathname.patternString; }
+      get search() { return brand(this).search.patternString; }
+      get hash() { return brand(this).hash.patternString; }
+      get hasRegExpGroups() { const c = brand(this); return COMPONENTS.some((n) => c[n].hasRegexpGroups); }
+    }
+
+    // Web IDL brand check: every URLPattern accessor/method rejects a foreign
+    // receiver with TypeError "Illegal invocation" rather than crashing on the
+    // missing internal slot (test-urlpattern-invalidthis).
+    function brand(self) {
+      const c = (self === null || self === undefined) ? undefined : self[COMP];
+      if (c === null || typeof c !== "object") throw new TypeError("Illegal invocation");
+      return c;
     }
 
     function matchPattern(self, input, baseURLString) {

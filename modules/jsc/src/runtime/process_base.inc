@@ -1,3 +1,52 @@
+// ── Permission Model: propagate the sandbox to a child process ───────────────
+// node's lib/child_process.js copyPermissionModelFlagsToEnv splices the parent's
+// permission flags into the CHILD's NODE_OPTIONS, so `--allow-child-process`
+// grants the ability to spawn — not the ability to spawn an UNGATED process.
+// Without this, one allowed spawn is a complete escape from the sandbox.
+//
+// It is done here, at the fork boundary, rather than in the JS child_process
+// shim: every spawn path in this runtime (node:child_process, Bun.spawn, the pty
+// and "ex" variants) funnels through these helpers, and a JS-level splice would
+// miss the ones that do not go through node:child_process at all.
+//
+// node's exceptions are kept: the child's OWN --permission (in argv, or already
+// in the NODE_OPTIONS it was handed) wins and nothing is added.
+extern "C" char** environ;
+
+void permission_inject_child_env(std::vector<std::string>& env, bool& haveEnv,
+                                 const std::vector<std::string>& argv) {
+    if (!gPermission.enabled()) return;
+    const auto& flags{gPermissionOptions.presentFlags};
+    if (flags.empty()) return;
+    for (const std::string& a : argv) {
+        if (a == "--permission" || a == "--permission-audit") return;
+    }
+
+    // A child with no explicit env inherits ours; to add one variable we have to
+    // materialise the inherited set rather than mutate the PARENT's environ
+    // (the corpus asserts the parent's own process.env.NODE_OPTIONS stays unset).
+    if (!haveEnv) {
+        for (char** e = environ; e != nullptr && *e != nullptr; ++e) env.emplace_back(*e);
+        haveEnv = true;
+    }
+
+    std::string extra{};
+    for (const std::string& f : flags) {
+        if (!extra.empty()) extra += ' ';
+        extra += f;
+    }
+
+    for (std::string& entry : env) {
+        if (!entry.starts_with("NODE_OPTIONS=")) continue;
+        // Already carries a permission flag: node leaves it alone.
+        if (entry.find("--permission") != std::string::npos) return;
+        const bool empty{entry.size() == std::string_view{"NODE_OPTIONS="}.size()};
+        entry += (empty ? "" : " ") + extra;
+        return;
+    }
+    env.push_back("NODE_OPTIONS=" + extra);
+}
+
 JSValueRef cp_spawn_sync_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                             const JSValueRef args[], JSValueRef* exc) {
 #if defined(_WIN32)
@@ -15,14 +64,60 @@ JSValueRef cp_spawn_sync_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
             argvStr.push_back(val_to_string(ctx, el));
         }
     }
-    // options.cwd / options.input / options.env / options.detached
+    // options.cwd / options.input / options.env / options.detached / options.stdio
     std::string cwd, input;
     std::vector<std::string> envStr;  // "KEY=VALUE" pairs; empty ⇒ inherit environ
     bool haveEnv{false};
     bool detached{false};
     double uid{-1}, gid{-1};
+    // options.stdio, per slot: Pipe (capture, the default), Inherit (hand the
+    // parent's own fd to the child), Ignore (/dev/null). node returns `null` for a
+    // non-piped stdout/stderr, and `stdio: 'inherit'` is not a cosmetic detail: a
+    // child that writes more than a pipe buffer to the fd we drain LAST deadlocks
+    // against this synchronous reader, which is how `stdio: 'inherit'` spawns hung
+    // instead of streaming (test/common/index.js's flag re-exec does exactly this).
+    enum class Stdio { Pipe, Inherit, Ignore };
+    Stdio stdioMode[3]{Stdio::Pipe, Stdio::Pipe, Stdio::Pipe};
+    int stdioFd[3]{-1, -1, -1};  // numeric stdio entry: dup this parent fd
+    // options.timeoutMs / options.killSignalNum: node's spawnSync(…, { timeout,
+    // killSignal }) (src/spawn_sync.cc SyncProcessRunner::SetupTimeoutHandler).
+    // The JS wrapper resolves the signal NAME to a number before it gets here so
+    // this layer never carries a signal table. -1 ⇒ no timeout.
+    double timeoutMs{-1};
+    int killSigNum{SIGTERM};
     if (argc > 2 && JSValueIsObject(ctx, args[2])) {
         JSObjectRef opt{JSValueToObject(ctx, args[2], nullptr)};
+        JSValueRef toV{get_prop(ctx, opt, "timeoutMs")};
+        if (JSValueIsNumber(ctx, toV)) {
+            const double v{JSValueToNumber(ctx, toV, nullptr)};
+            if (std::isfinite(v) && v > 0) timeoutMs = v;
+        }
+        JSValueRef ksV{get_prop(ctx, opt, "killSignalNum")};
+        if (JSValueIsNumber(ctx, ksV)) {
+            const int s{static_cast<int>(JSValueToNumber(ctx, ksV, nullptr))};
+            if (s > 0 && s < NSIG) killSigNum = s;
+        }
+        const auto readStdioSlot{[&](JSValueRef v, std::size_t slot) {
+            if (JSValueIsNumber(ctx, v)) {
+                stdioMode[slot] = Stdio::Inherit;
+                stdioFd[slot] = static_cast<int>(JSValueToNumber(ctx, v, nullptr));
+                return;
+            }
+            if (!JSValueIsString(ctx, v)) return;  // null/undefined/stream ⇒ pipe
+            const std::string s{val_to_string(ctx, v)};
+            if (s == "inherit") stdioMode[slot] = Stdio::Inherit;
+            else if (s == "ignore") stdioMode[slot] = Stdio::Ignore;
+            else stdioMode[slot] = Stdio::Pipe;
+        }};
+        JSValueRef stdioV{get_prop(ctx, opt, "stdio")};
+        if (JSValueIsArray(ctx, stdioV)) {
+            JSObjectRef arr{JSValueToObject(ctx, stdioV, nullptr)};
+            for (unsigned s = 0; s < 3; ++s) {
+                readStdioSlot(JSObjectGetPropertyAtIndex(ctx, arr, s, nullptr), s);
+            }
+        } else if (JSValueIsString(ctx, stdioV)) {
+            for (std::size_t s = 0; s < 3; ++s) readStdioSlot(stdioV, s);
+        }
         detached = JSValueToBoolean(ctx, get_prop(ctx, opt, "detached"));
         JSValueRef uidV{get_prop(ctx, opt, "uid")};
         if (JSValueIsNumber(ctx, uidV)) uid = JSValueToNumber(ctx, uidV, nullptr);
@@ -53,8 +148,22 @@ JSValueRef cp_spawn_sync_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
         }
     }
 
-    int outPipe[2], errPipe[2], inPipe[2], statPipe[2];
-    if (pipe(outPipe) != 0 || pipe(errPipe) != 0 || pipe(inPipe) != 0 || pipe(statPipe) != 0) {
+    // `input` forces a pipe on stdin whatever options.stdio asked for (node does
+    // the same: there is nowhere else to write it).
+    if (!input.empty()) stdioMode[0] = Stdio::Pipe;
+    const bool pipeIn{stdioMode[0] == Stdio::Pipe};
+    const bool pipeOut{stdioMode[1] == Stdio::Pipe};
+    const bool pipeErr{stdioMode[2] == Stdio::Pipe};
+
+    int outPipe[2]{-1, -1}, errPipe[2]{-1, -1}, inPipe[2]{-1, -1}, statPipe[2];
+    // Permission Model: node enforces the ChildProcess scope at the fork
+    // (src/spawn_sync.cc / process_wrap.cc), and so does this. `resource` is the
+    // executable, which is what test-permission-child-process-cli asserts on.
+    // permission_deny_spawn also handles mbun's worker-as-subprocess case.
+    if (permission_deny_spawn(ctx, exc, file, envStr)) return JSValueMakeUndefined(ctx);
+    permission_inject_child_env(envStr, haveEnv, argvStr);
+    if ((pipeIn && pipe(inPipe) != 0) || (pipeOut && pipe(outPipe) != 0) ||
+        (pipeErr && pipe(errPipe) != 0) || pipe(statPipe) != 0) {
         return fs_throw(ctx, exc, "spawnSync: pipe() failed");
     }
     fcntl(statPipe[0], F_SETFD, FD_CLOEXEC);
@@ -71,12 +180,35 @@ JSValueRef cp_spawn_sync_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
             _exit(127);
         }};
         if (detached) (void)setsid();  // new session/process group (spawnSync detached)
-        dup2(inPipe[0], 0);
-        dup2(outPipe[1], 1);
-        dup2(errPipe[1], 2);
-        close(inPipe[0]); close(inPipe[1]);
-        close(outPipe[0]); close(outPipe[1]);
-        close(errPipe[0]); close(errPipe[1]);
+        // Wire each standard fd per its stdio mode. "inherit" is the no-op case:
+        // the parent's fd is already there (or is the numeric fd the caller named).
+        const auto wire{[&](int slot, int childEnd) {
+            switch (stdioMode[static_cast<std::size_t>(slot)]) {
+            case Stdio::Pipe:
+                if (childEnd >= 0) dup2(childEnd, slot);
+                break;
+            case Stdio::Inherit: {
+                const int from{stdioFd[static_cast<std::size_t>(slot)]};
+                if (from >= 0 && from != slot) dup2(from, slot);
+                break;
+            }
+            case Stdio::Ignore: {
+                const int devnull{open("/dev/null", slot == 0 ? O_RDONLY : O_WRONLY)};
+                if (devnull >= 0) {
+                    dup2(devnull, slot);
+                    close(devnull);
+                }
+                break;
+            }
+            }
+        }};
+        wire(0, inPipe[0]);
+        wire(1, outPipe[1]);
+        wire(2, errPipe[1]);
+        for (const int fd : {inPipe[0], inPipe[1], outPipe[0], outPipe[1],
+                             errPipe[0], errPipe[1]}) {
+            if (fd >= 3) close(fd);  // never the freshly wired 0/1/2
+        }
         if (!cwd.empty()) { if (chdir(cwd.c_str()) != 0) failStat(errno); }
         if (gid >= 0) {
             if (setgroups(0, nullptr) != 0 && errno == EPERM) failStat(EPERM);
@@ -98,9 +230,9 @@ JSValueRef cp_spawn_sync_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
     }
     // parent
     close(statPipe[1]);
-    close(inPipe[0]);
-    close(outPipe[1]);
-    close(errPipe[1]);
+    if (pipeIn) close(inPipe[0]);
+    if (pipeOut) close(outPipe[1]);
+    if (pipeErr) close(errPipe[1]);
     std::int32_t childErr{0};
     {
         ssize_t sn;
@@ -108,25 +240,91 @@ JSValueRef cp_spawn_sync_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
         if (sn != static_cast<ssize_t>(sizeof childErr)) childErr = 0;
     }
     close(statPipe[0]);
-    if (!input.empty()) {
-        ssize_t off = 0;
-        while (off < static_cast<ssize_t>(input.size())) {
-            ssize_t w{write(inPipe[1], input.data() + off, input.size() - off)};
-            if (w <= 0) break;
-            off += w;
+    if (pipeIn) {
+        if (!input.empty()) {
+            ssize_t off = 0;
+            while (off < static_cast<ssize_t>(input.size())) {
+                ssize_t w{write(inPipe[1], input.data() + off, input.size() - off)};
+                if (w <= 0) break;
+                off += w;
+            }
+        }
+        close(inPipe[1]);
+    }
+    // Drain both pipes concurrently under an optional deadline. Draining them in
+    // sequence (stdout to EOF, then stderr) deadlocks a child that fills the
+    // pipe we read LAST, and a blocking read cannot honour options.timeout at
+    // all — a spawnSync({ timeout }) against a child that never exits hung this
+    // process forever. poll() gives both properties at once.
+    std::string outStr, errStr;
+    bool timedOut{false};
+    {
+        const auto t0{std::chrono::steady_clock::now()};
+        const auto elapsedMs{[&t0] {
+            return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        }};
+        int fds[2]{pipeOut ? outPipe[0] : -1, pipeErr ? errPipe[0] : -1};
+        std::string* bufs[2]{&outStr, &errStr};
+        for (int i = 0; i < 2; ++i) {
+            if (fds[i] >= 0) fcntl(fds[i], F_SETFL, fcntl(fds[i], F_GETFL, 0) | O_NONBLOCK);
+        }
+        char buf[4096];
+        // Both pipes at EOF means the child's output is complete and every
+        // writer has closed — there is nothing left to wait FOR. Keeping
+        // `(timeoutMs >= 0 && !timedOut)` as a third disjunct here made the loop
+        // spin with zero fds, poll() a null set until the deadline, and then
+        // "time out" and kill a child that had already exited: a spawnSync with
+        // { timeout: 30000 } against a child that finished in 25ms returned
+        // status=null after the full 30s. The timeout must bound the READING,
+        // not add a mandatory wait. Measured: node returns status=3 in 25ms for
+        // the same case, mbun took 20033ms before this and 25ms after.
+        while (fds[0] >= 0 || fds[1] >= 0) {
+            pollfd pf[2];
+            int idx[2];
+            int n{0};
+            for (int i = 0; i < 2; ++i) {
+                if (fds[i] < 0) continue;
+                pf[n] = pollfd{.fd = fds[i], .events = POLLIN, .revents = 0};
+                idx[n] = i;
+                ++n;
+            }
+            int wait{-1};
+            if (timeoutMs >= 0 && !timedOut) {
+                const double left{timeoutMs - elapsedMs()};
+                wait = left <= 0 ? 0 : static_cast<int>(left) + 1;
+            }
+            const int rc{poll(n ? pf : nullptr, static_cast<nfds_t>(n), wait)};
+            if (rc < 0) {
+                if (errno == EINTR) continue;
+                break;
+            }
+            if (rc == 0) {
+                if (timeoutMs >= 0 && !timedOut && elapsedMs() >= timeoutMs) {
+                    // node kills the child and then keeps reading whatever it
+                    // already produced, so the result still carries partial output.
+                    timedOut = true;
+                    kill(pid, killSigNum);
+                }
+                continue;
+            }
+            for (int k = 0; k < n; ++k) {
+                if (!(pf[k].revents & (POLLIN | POLLHUP | POLLERR))) continue;
+                const int i{idx[k]};
+                for (;;) {
+                    const ssize_t r{read(fds[i], buf, sizeof buf)};
+                    if (r > 0) { bufs[i]->append(buf, static_cast<std::size_t>(r)); continue; }
+                    if (r < 0 && errno == EINTR) continue;
+                    if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+                    close(fds[i]);
+                    fds[i] = -1;
+                    break;  // EOF or a dead pipe
+                }
+            }
+        }
+        for (int i = 0; i < 2; ++i) {
+            if (fds[i] >= 0) close(fds[i]);
         }
     }
-    close(inPipe[1]);
-    auto drain{[](int fd) {
-        std::string out;
-        char buf[4096];
-        ssize_t n;
-        while ((n = read(fd, buf, sizeof buf)) > 0) out.append(buf, static_cast<std::size_t>(n));
-        close(fd);
-        return out;
-    }};
-    std::string outStr{drain(outPipe[0])};
-    std::string errStr{drain(errPipe[0])};
     int status{0};
     waitpid(pid, &status, 0);
     int code{WIFEXITED(status) ? WEXITSTATUS(status) : -1};
@@ -145,12 +343,19 @@ JSValueRef cp_spawn_sync_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
         set_prop(ctx, r, "stderr", JSValueMakeNull(ctx));
         return r;
     }
-    set_prop(ctx, r, "status", JSValueMakeNumber(ctx, code));
+    // node: exactly one of status/signal is non-null. A child killed by a signal
+    // has `status === null` (lib/child_process.js spawnSync), not -1 — callers
+    // branch on `result.signal` first and then trust `result.status` as an exit
+    // code, so a numeric -1 there reads as "exited with -1".
+    set_prop(ctx, r, "status", sig ? JSValueMakeNull(ctx) : JSValueMakeNumber(ctx, code));
     set_prop(ctx, r, "signal",
              sig ? make_string(ctx, std::to_string(sig)) : JSValueMakeNull(ctx));
     set_prop(ctx, r, "pid", JSValueMakeNumber(ctx, static_cast<double>(pid)));
-    set_prop(ctx, r, "stdout", make_string(ctx, outStr));
-    set_prop(ctx, r, "stderr", make_string(ctx, errStr));
+    set_prop(ctx, r, "timedOut", JSValueMakeBoolean(ctx, timedOut));
+    // node reports a non-piped stdio slot as null, not "" — `stdio: 'inherit'`
+    // went straight to the parent's fd and there is nothing to hand back.
+    set_prop(ctx, r, "stdout", pipeOut ? make_string(ctx, outStr) : JSValueMakeNull(ctx));
+    set_prop(ctx, r, "stderr", pipeErr ? make_string(ctx, errStr) : JSValueMakeNull(ctx));
     return r;
 #endif
 }
@@ -303,6 +508,12 @@ JSValueRef proc_spawn_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t
     std::string file{fs_arg(ctx, argc, args, 0)};
     std::vector<std::string> argvStr{parse_spawn_argv(ctx, argc, args, file)};
     SpawnOpts o{parse_spawn_opts(ctx, argc, args)};
+    // Permission Model: node enforces the ChildProcess scope at the fork
+    // (src/spawn_sync.cc / process_wrap.cc), and so does this. `resource` is the
+    // executable, which is what test-permission-child-process-cli asserts on.
+    // permission_deny_spawn also handles mbun's worker-as-subprocess case.
+    if (permission_deny_spawn(ctx, exc, file, o.env)) return JSValueMakeUndefined(ctx);
+    permission_inject_child_env(o.env, o.haveEnv, argvStr);
     int inPipe[2], outPipe[2], errPipe[2];
     if (pipe(inPipe) != 0 || pipe(outPipe) != 0 || pipe(errPipe) != 0) {
         return fs_throw(ctx, exc, "proc.spawn: pipe() failed");
@@ -413,6 +624,175 @@ JSValueRef proc_read_nb_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size
     if (n == 0) return JSValueMakeNull(ctx);
     return make_string(ctx, b64_encode(reinterpret_cast<const unsigned char*>(buf.data()),
                                        static_cast<std::size_t>(n)));
+}
+
+// proc.setenv(name, value) → write the REAL process environment; value null or
+// undefined unsets. node's process.env is a live view of environ, mbun's is a
+// snapshot taken at startup, so a JS-level `delete process.env.X` is invisible
+// to a child spawned afterwards. Callers that need the real thing (cluster's
+// worker dropping NODE_UNIQUE_ID so grandchildren do not inherit it — node's
+// test-cluster-basic asserts exactly that) go through here.
+JSValueRef proc_setenv_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                          const JSValueRef args[], JSValueRef*) {
+    if (argc == 0) return JSValueMakeUndefined(ctx);
+    const std::string name{fs_arg(ctx, argc, args, 0)};
+    if (name.empty() || name.find('=') != std::string::npos) return JSValueMakeUndefined(ctx);
+    if (argc < 2 || JSValueIsNull(ctx, args[1]) || JSValueIsUndefined(ctx, args[1])) {
+        ::unsetenv(name.c_str());
+        return JSValueMakeUndefined(ctx);
+    }
+    const std::string value{fs_arg(ctx, argc, args, 1)};
+    ::setenv(name.c_str(), value.c_str(), 1);
+    return JSValueMakeUndefined(ctx);
+}
+
+// proc.drainMicrotasks() — run JSC's microtask queue to exhaustion right now.
+// node drains the process.nextTick queue BETWEEN callbacks (runNextTicks after
+// every immediate / timer in lib/internal/timers.js), so a nextTick scheduled
+// by one callback runs before the next callback starts. mbun's nextTick rides
+// on queueMicrotask, and JSC only drains at a JSLock release — which never
+// happens inside the timer drain, since the whole drain runs under one lock.
+// The observable difference: `emitWarning(x); setImmediate(next)` delivered the
+// warning AFTER `next` had run (test-process-warning). Exposing the VM's own
+// drain lets the timer loop restore node's ordering without splitting the drain
+// across pump iterations.
+JSValueRef proc_drain_microtasks_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t,
+                                    const JSValueRef[], JSValueRef*) {
+    if (JSC::JSGlobalObject* g = toJS(ctx); g != nullptr) JSC::getVM(g).drainMicrotasks();
+    return JSValueMakeUndefined(ctx);
+}
+
+// proc.setTimeZone(name) → apply an IANA zone to the engine's date cache, the
+// native half of node's "assigning process.env.TZ changes the local timezone"
+// contract (test-process-env-tz). JSC caches the resolved zone per-VM, so a bare
+// setenv("TZ") is invisible to Date.prototype.toString — the cache has to be
+// invalidated explicitly. Same mechanism bun uses (JSEnvironmentVariableMap.cpp
+// applyTZFromString): WTF::setTimeZoneOverride + DateCache::resetIfNecessarySlow.
+// A missing/empty/null argument drops the override back to the system zone, so
+// `delete process.env.TZ` restores the startup behaviour instead of freezing the
+// last assigned zone. Returns true when the zone was accepted.
+JSValueRef proc_set_timezone_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                                const JSValueRef args[], JSValueRef*) {
+    const bool clear{argc == 0 || JSValueIsNull(ctx, args[0]) || JSValueIsUndefined(ctx, args[0])};
+    const std::string name{clear ? std::string{} : fs_arg(ctx, argc, args, 0)};
+    // bun caps the accepted name at 32 chars; longer input is never a zone id and
+    // WTF would scan it against the whole ICU table for nothing.
+    if (!clear && (name.empty() || name.size() >= 32)) return JSValueMakeBoolean(ctx, false);
+    if (clear) ::unsetenv("TZ"); else ::setenv("TZ", name.c_str(), 1);
+    const WTF::String wtfName{WTF::String::fromUTF8(name)};
+    if (!WTF::setTimeZoneOverride(WTF::StringView{wtfName})) return JSValueMakeBoolean(ctx, false);
+    if (JSC::JSGlobalObject* g = toJS(ctx); g != nullptr)
+        JSC::getVM(g).dateCache.resetIfNecessarySlow();
+    return JSValueMakeBoolean(ctx, true);
+}
+
+// ── SCM_RIGHTS descriptor passing over the fork() IPC socketpair ─────────────
+// node's NODE_HANDLE protocol hands a listening/accepted socket from one process
+// to another; on POSIX that is an AF_UNIX ancillary message carrying the
+// descriptor alongside the JSON frame. Both halves are exposed as non-blocking
+// twins of writeNB/readNB so the JS IPC driver can keep one code path.
+//
+// Ordering contract that makes the JS side simple: Linux attaches ancillary data
+// to the FIRST byte of the sendmsg that carried it and never merges a later
+// segment past that boundary into an earlier recvmsg, so descriptors arrive in
+// the same order as the frames that carry them, never after. The JS layer can
+// therefore queue received fds and pair the Nth NODE_HANDLE frame with the Nth
+// descriptor.
+
+// proc.sendmsgFd(fd, b64, offset, sendFd) → bytes written (0 EAGAIN, -1 error).
+// When sendFd >= 0 the descriptor rides along as SCM_RIGHTS on this write.
+JSValueRef proc_sendmsg_fd_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                              const JSValueRef args[], JSValueRef*) {
+    const int fd{argc > 0 ? static_cast<int>(JSValueToNumber(ctx, args[0], nullptr)) : -1};
+    std::string data{b64_decode(fs_arg(ctx, argc, args, 1))};
+    const std::size_t off{argc > 2 ? static_cast<std::size_t>(JSValueToNumber(ctx, args[2], nullptr))
+                                   : 0};
+    const int sendFd{argc > 3 ? static_cast<int>(JSValueToNumber(ctx, args[3], nullptr)) : -1};
+    if (off >= data.size()) return JSValueMakeNumber(ctx, 0);
+
+    iovec iov{};
+    iov.iov_base = data.data() + off;
+    iov.iov_len = data.size() - off;
+    msghdr msg{};
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+
+    union {
+        char buf[CMSG_SPACE(sizeof(int))];
+        cmsghdr align;
+    } control{};
+    if (sendFd >= 0) {
+        msg.msg_control = control.buf;
+        msg.msg_controllen = sizeof(control.buf);
+        cmsghdr* cm{CMSG_FIRSTHDR(&msg)};
+        cm->cmsg_level = SOL_SOCKET;
+        cm->cmsg_type = SCM_RIGHTS;
+        cm->cmsg_len = CMSG_LEN(sizeof(int));
+        std::memcpy(CMSG_DATA(cm), &sendFd, sizeof(int));
+    }
+
+    ssize_t w;
+    do { w = sendmsg(fd, &msg, MSG_NOSIGNAL); } while (w < 0 && errno == EINTR);
+    if (w < 0) return JSValueMakeNumber(ctx, (errno == EAGAIN || errno == EWOULDBLOCK) ? 0 : -1);
+    return JSValueMakeNumber(ctx, static_cast<double>(w));
+}
+
+// proc.recvmsgFd(fd, max) → { data: b64|"" , fds: [int], eof: bool }.
+// data "" means EAGAIN (nothing ready); eof true means the peer closed.
+JSValueRef proc_recvmsg_fd_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                              const JSValueRef args[], JSValueRef*) {
+    const int fd{argc > 0 ? static_cast<int>(JSValueToNumber(ctx, args[0], nullptr)) : -1};
+    std::size_t max{argc > 1 ? static_cast<std::size_t>(JSValueToNumber(ctx, args[1], nullptr)) : 65536};
+    if (max == 0 || max > (1u << 24)) max = 65536;
+    std::string buf(max, '\0');
+
+    iovec iov{};
+    iov.iov_base = buf.data();
+    iov.iov_len = max;
+    msghdr msg{};
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    union {
+        char buf[CMSG_SPACE(sizeof(int) * 8)];
+        cmsghdr align;
+    } control{};
+    msg.msg_control = control.buf;
+    msg.msg_controllen = sizeof(control.buf);
+
+    ssize_t n;
+    do { n = recvmsg(fd, &msg, 0); } while (n < 0 && errno == EINTR);
+
+    JSObjectRef out{JSObjectMake(ctx, nullptr, nullptr)};
+    JSObjectRef fds{JSObjectMakeArray(ctx, 0, nullptr, nullptr)};
+    unsigned fdCount{0};
+    if (n >= 0) {
+        for (cmsghdr* cm{CMSG_FIRSTHDR(&msg)}; cm != nullptr; cm = CMSG_NXTHDR(&msg, cm)) {
+            if (cm->cmsg_level != SOL_SOCKET || cm->cmsg_type != SCM_RIGHTS) continue;
+            const std::size_t payload{cm->cmsg_len - CMSG_LEN(0)};
+            for (std::size_t i = 0; i + sizeof(int) <= payload; i += sizeof(int)) {
+                int got{-1};
+                std::memcpy(&got, CMSG_DATA(cm) + i, sizeof(int));
+                JSObjectSetPropertyAtIndex(ctx, fds, fdCount++, JSValueMakeNumber(ctx, got), nullptr);
+            }
+        }
+    }
+    set_prop(ctx, out, "fds", fds);
+    if (n < 0) {
+        const bool again{errno == EAGAIN || errno == EWOULDBLOCK};
+        set_prop(ctx, out, "data", make_string(ctx, ""));
+        set_prop(ctx, out, "eof", JSValueMakeBoolean(ctx, !again));
+        return out;
+    }
+    if (n == 0 && fdCount == 0) {
+        set_prop(ctx, out, "data", make_string(ctx, ""));
+        set_prop(ctx, out, "eof", JSValueMakeBoolean(ctx, true));
+        return out;
+    }
+    set_prop(ctx, out, "data",
+             make_string(ctx, b64_encode(reinterpret_cast<const unsigned char*>(buf.data()),
+                                         static_cast<std::size_t>(n))));
+    set_prop(ctx, out, "eof", JSValueMakeBoolean(ctx, false));
+    return out;
 }
 #endif
 
@@ -526,6 +906,12 @@ JSValueRef proc_spawn_sync_b64_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, st
     std::string file{fs_arg(ctx, argc, args, 0)};
     std::vector<std::string> argvStr{parse_spawn_argv(ctx, argc, args, file)};
     SpawnOpts o{parse_spawn_opts(ctx, argc, args)};
+    // Permission Model: node enforces the ChildProcess scope at the fork
+    // (src/spawn_sync.cc / process_wrap.cc), and so does this. `resource` is the
+    // executable, which is what test-permission-child-process-cli asserts on.
+    // permission_deny_spawn also handles mbun's worker-as-subprocess case.
+    if (permission_deny_spawn(ctx, exc, file, o.env)) return JSValueMakeUndefined(ctx);
+    permission_inject_child_env(o.env, o.haveEnv, argvStr);
     std::string input;
     // No budget / no deadline unless the caller asks for one. `Infinity` on the
     // JS side is passed through as absent (bun treats it as "unlimited").

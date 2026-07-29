@@ -3,7 +3,118 @@
 > 只记录**实质进展**（模块落地、测试集通过数变化、性能节点），倒序排列。
 > 格式：`## YYYY-MM-DD` + 条目（关联任务 ID / commit / 测试与性能数据）。
 
+## 2026-07-26
+
+### w5/agent-fs：事件循环回调边界排序（全量 2,460 → **2,470 / 4,433**，回归 0；fs 309/342 不变）
+
+本轮的目标是 fs +8，实际 **fs +0**、**全量 +10**。fs 已到天花板（309/342，剩下 23 个逐一点名见下），而被点名为「无人尝试过」的 `process.nextTick` 优先级缺陷落地后，收益全部落在 timers / streams / http / worker。
+
+**两个排序缺陷其实是同一个 bug：mbun 没有「node 回调边界」这个概念。** 凡是 node 在边界上定序的东西，在 mbun 里就按 JSC 单一 microtask FIFO 的偶然顺序跑。
+
+1. **`process.nextTick` 没有优先级** —— 它字面上就是 `queueMicrotask(...)`（`engine.inc`），所以 tick 与 promise continuation 共用一条 FIFO：
+
+       Promise.resolve().then(p1); process.nextTick(t1);
+       Promise.resolve().then(p2); process.nextTick(t2);
+       node -> t1,t2,p1,p2      mbun -> p1,t1,p2,t2
+
+   node 会把**整个** tick 队列（含 tick 里再压的 tick）排空后才跑第一个 promise continuation，microtask 队列空掉后再排一次（`internal/process/task_queues.js processTicksAndRejections`）。此前的可见后果就是 fs abort-signal 测试：`queueMicrotask` 延迟的 fs 回调跑在 `nextTick` 调度的 `abort()` 之前，早前有两个文件是用 `setImmediate` **绕过**而不是修好的。
+
+   队列现在放在 runtime prelude 里，`__mbunRunTicks` 负责排空，并在 mbun 自己拥有的每个边界上**同步**调用 —— 入口脚本的 CJS wrapper、每个 timer 回调、每个 pump phase。**优先级正是这样买来的**：这些都跑在同一次 JSC evaluation 内，而 JSC 只在该 evaluation 释放锁时才排空自己的队列。首次入队时另外挂一个**裸 promise reaction** 作为 node 的第二条臂（让「从 microtask 里调度的 tick」也能跑）。刻意不用 `queueMicrotask`：那个 wrapper 会施加 `__mbunSchedHook`，钩住 drain 而不是钩住 callback 会让每个 tick 进两次 `node:domain`（`test-domain-thrown-error-handler-stack` 钉住的 `[d, d]` 栈）。nextTick 原先从该 wrapper 继承的两件事改为显式做：入队时逐 callback 施加 `__mbunSchedHook`，抛出走 node 的 `uncaughtException` 而不是 JSC 的 rejection tracker。
+
+2. **到期 timer 抢在 pending promise microtask 前面**：
+
+       setTimeout(() => { Promise.resolve().then(p); setTimeout(t, 0); })
+       node -> p,t              mbun -> t,p
+
+   `__mbun_drain_timers` 一次 evaluation 内最多烧 200 个到期 timer，JSC 于是把整批期间产生的 continuation 全部压到批次结束。node 在**每个** timer 回调后做一次 microtask checkpoint。新增 `__mbunDrainMicrotasksNative` 把 JSC 的 drain 暴露给该循环，在 tick drain 之后 checkpoint，与 node 的 timer phase 一致。
+
+**证据**：三个排序探针（含 tick 套 tick、promise continuation 里调度 tick、timer 上下文）现在与**真实 node v24.15.0** 逐字一致。全量 4433 文件、两个二进制各跑一次、`--jobs 5`：`pass 2,460 → 2,470`，**green→non-green 回归 0**。转绿 10 个：`test-microtask-queue-run`、`-run-immediate`、`test-timers-next-tick`、`test-timers-nested`、`test-stream2-push`、`test-stream3-cork-end`、`test-stream-readable-hwm-0-no-flow-data`、`test-http-chunk-extensions-limit`、`test-whatwg-webstreams-adapters-to-writablestream`、`test-worker-message-port-transfer-self`。
+
+**排序改对后暴露的一个真 fs 缺陷**：`FileHandle.close()` 此前在**延迟的 `.then()` 里**发 `"close"`，node 是**同步**发（`lib/internal/fs/promises.js` 末尾 `this.emit('close'); return this[kClosePromise];`），且与 ref 计数无关。这是承重的：`fs.createReadStream(null, { fd: handle })` 注册 `handle.on("close", () => stream.close())`，所以 `createReadStream(...); return handle.close();` 必须**同一 turn 内**销毁流、流永不读。延迟发让流得以对已置 `_closed` 的 handle 发起首次读，`_use()` 以 EBADF 拒绝。此前之所以看着是对的，只是因为流的首次读恰好排在 close 的 microtask 之后 —— tick 排序修好后它提前了。（`test-fs-read-stream-file-handle` 一度回归，二分到 11 个 block 里的第 3 个。）
+
+**fs 剩余 23 个，逐一点名（`compat/` 只读，inventory 修正记在这里）**：
+
+- **有原因但 inventory 无条目**：`test-fs-readdir-stack-overflow` —— JSC 的 RangeError 是 `'Maximum call stack size exceeded.'`（**多一个句点**），V8 没有；语料里共 13 个文件断言该字符串，且**无法在 JS 层修正**（错误由引擎内部构造）。`test-fs-readdir-ucs2` —— native `readdir` 把原始字节按 UTF-8 解码成 JS 字符串，孤立代理对的文件名在到达 `fsReaddirEncode` 前已塌成 U+FFFD（`3d d8 04 dc` → `3d ef bf bd 04 ef bf bd`），要修必须让 native 返回原始字节。`test-fs-promises-file-handle-read-worker` —— `DataCloneError: mustNotCall could not be cloned`，worker 结构化克隆不支持 FileHandle 传输（node 走 `kTransferList`）。`test-fs-glob` —— glob 引擎缺 extglob（`+(a|b)`、`!(x)`）、brace 展开与 `.`/`..` 段处理，33 个子测试里 20 个红。`test-fs-promises` —— **不是超时**（runner 15s 判超时，实际 0.12s 跑完），是 `test-fs-promises.js:56` 的 `expectsError` 错误形状不符。`test-fs-read-stream-pos` —— **语义是通过的**，但耗时 **90.12 s**（node 0.07 s）：文件的提前退出需要「同一个流在短 chunk 之后再收到一个 data 事件」，mbun 的 fs 流在单个 loop turn 内读完，1ms 的写 interval 插不进去，于是只能等文件自带的 90 秒兜底 timer；对 15 s 预算即判超时。`test-fs-read-stream-fd-leak` —— 真挂，卡在 `createReadStream().destroy()` 的泄漏检测。
+- **`test-fs-watchfile-bigint` 归入 internalBinding 家族**：本轮已把 `BigIntStats` 的 atime/mtime/ctime/birthtime 改成 node 那样的**原型惰性访问器**（own key 集合现已完全一致），但它仍红 —— 它的期望值由 `require('internal/fs/utils').BigIntStats` 构造，而 `assert.deepStrictEqual` 还比原型，`fs.watchFile` 造不出 node 内部类的实例。
+- **确认 brief 的判断**：`test-fs-buffer` 是已知 issue #16（JSC rope-string use-after-free），本轮全量里崩过一次（SIGSEGV，exit -11）、另一次全量没崩，单独跑新旧二进制各 5/5 通过 —— **抖动，非回归**。`test-fs-promises-file-handle-{pull,pullsync,writer}` 确为 `fh.pull is not a function`（`--experimental-stream-iter`），与 FileHandle 内部无关。`test-fs-existssync-memleak-longpath` 确为 `queryObjects is not a function`。`test-fs-{access,readfile-error,syncwritestream,write-buffer-large}`、`test-fs-{readdir-types,sync-fd-leak,filehandle}` 及三个 FileHandle `*-errors`、`test-fs-{cp-async-file-url,realpath-native}` 均与 brief 所述一致，未动。
+
+**并发事故（第三次）**：全局 `~/.mcpp/config.toml` 的 `[toolchain] default_target` 被并发 agent 翻成 `x86_64-linux-musl`，仓库内每个构建都死在 `modules/crash_handler/src/install.cppm:35: fatal error: execinfo.h: No such file or directory` —— 读起来像缺系统头文件（`/usr/include/execinfo.h` 明明在），实为 musl 无此头。几分钟后对方又翻了回去，所以还是**间歇性**的。`build_or_die.sh` 现在显式传 `--target x86_64-linux-gnu`（`MBUN_TARGET` 可覆盖），经它发起的构建不再可能被别的 session 改目标。另：`compat/node/test/parallel/should-not-write.txt`（01:44，早于本 worktree）是别处遗留的产物，未清理。
+
+### 第十二轮整合：node 语料 2,403 → **2,459 / 4,433**（55.5% 严格 / 63.4% 排除自我跳过），**回归 0**
+
+三个 agent 全部达标或超额（tls +16/14、http +26/12、fs +11/11），整合后逐文件 diff：**56 转绿、0 回归** —— 迄今最干净的一次组合。增量分布：http2 15、tls 14、fs 11、http 8、https 5，另有 filehandle/permission/stdio 各 1。
+
+子系统现状：tls+https **147/263 (55.9%)**、http1 **359/458 (78.4%)**、http2 **195/270 (72.2%)**、fs **308/334 (92.2%)**。
+
+**瓶颈已经转移。** 自从分诊从 agent 内部移到 `compat/data/unreached-inventory.json`，连续三波超额（第二波 3.7% → 第三波 150% → 第四波 143%）。但这一波三个 agent 都撞上同一件事：**inventory 漏计**。agent-fs 十一个增量里七个在 inventory 里没有条目；agent-tls 找到一个 8 文件的原因（**TLS 会话恢复完全不存在** —— `getSession()` 返回 undefined、`setSession()` 空操作、reactor 从不发 `session`），它此前**分散在三个桶里**，所以按桶排名根本看不见它。下一步机制改进是跨桶扫描 +把 `failure_signature.py` 的输出回灌 inventory。
+
+- **`fs.linkSync` 此前是用 copyFile 实现的**，现在是真正的 `link(2)`。独立复验：目标与源 inode 相同，且裸 `__mbunFsNative.link` 在 `--permission` 下被拒（门在 native 边界，不在 JS 外壳）。
+- **`node:test` 的 mock 有两处失效**：`mockImplementationOnce` 拿 `calls.length` 比对，而调用记录在实现执行**之前**入队，差一位导致 once 实现永不选中；`mock.getter/setter` 用赋值，替换不掉原型访问器。**任何依赖它们的语料文件此前都在静默测试未被 mock 的路径** —— 与早前 `assert.throws` 忽略错误参数（修好后移除 126 个虚假通过）同类。全量护栏显示本次修复没有造成通过数下降，这是**测出来的，不是假设的**。
+- **http2 超时首次分诊**：26 个塌缩成停滞交换 18、客户端流已死 3、无 dump 3、误分类 1。与 tls、http1 同一结论 —— **26 个里 25 个不是事件循环 bug**，其中 8 个已转绿。其中 `reset-flood` 曾被归为「原生阻塞」，实为**服务端接受了畸形 HEADERS 块而不是拒绝**，洪泛永不终止 —— 这是「无 dump ≠ 原生崩溃」第三次被证伪。
+
+**工具**：新增 `failure_signature.py`（把语料日志转成带置信标签的原因排名；CAUSE/CLASS/MANIFESTATION/UNSPLIT —— 它在自己首次运行时犯了两次「表象冒充机制」的错，所以自测断言的是置信度纪律而非覆盖率）；新增 `check_submodule_gitlinks.sh`（一次合并曾把 `compat/{bun,node}` 的子模块指针换成符号链接，**在制造它的机器上完全不可见**，别处则语料为空）；`build_or_die.sh` 增加工具链前置检查（全局 `~/.mcpp/config.toml` 在一轮内被并发 agent 翻成不可用的 gcc 两次，第二次由此在 5 秒内定位而非 40 分钟）；两个守卫已接入 CI 首步。
+
+
+### 第十二轮 w4/agent-tls：TLS 选项层与密码套件（tls+https 128/263 → 144/263，实得 +16）
+
+`--filter test-tls --jobs 5 --timeout 15` 与 `--filter test-https` 实测：tls `pass 90 → 104`、`fail 95 → 81`；https `pass 38 → 40`、`fail 20 → 18`；**timeout 两边都是 17 / 3 不变**，`green→non-green` 回归 0。转绿 16 个：`cli-min-version-{1.0,1.1,1.2,1.3}`、`cli-max-version-{1.2,1.3}`、`min-max-version`、`options-boolean-check`(tls+https)、`keylog-tlsv13`、`https-agent-keylog`、`getcipher`、`set-ciphers`、`getprotocol`、`set-default-ca-certificates-{append,reset}-https-request`。
+
+- **`secureProtocol` 不是「取消版本窗口」**。此前按「node 传 min=max=0」实现，实际 `lib/internal/tls/common.js` **永远**传 `toV(minVersion, DEFAULT_MIN)`，再由 `crypto_context.cc` 按方法名逐条调整：只有 `TLS_method` 清掉下限，`SSLv23_method` 是**压低上限到 TLS1.2、保留默认下限**。当成完全放开后，SSLv23 端会跟 `TLSv1_method` 端协商出 TLS1.0/1.1，而 node 在这里是握手失败。同时补齐从未匹配过的 `_client_method` / `_server_method` 变体。
+- **`--tls-min-v1.x` 不是后者覆盖前者**，是 `lib/tls.js` 里固定顺序的 if/else 链：min 先看 v1.0、max 先看 v1.3，所以**最宽的那个赢**，与命令行位置无关。`--tls-min-v1.0 --tls-min-v1.1` 应得 TLSv1，此前得 TLSv1.1。
+- **TLS 1.3 套件走的是另一个 OpenSSL 槽位**。node `processCiphers` 按 `TLS_` 前缀把 `ciphers` 拆成两半，分别喂 `SSL_CTX_set_cipher_list` 与 `SSL_CTX_set_ciphersuites`；mbun 整串喂前者，于是每个 `TLS_AES_*` 都被判成 `ERR_SSL_NO_CIPHER_MATCH`。附带补上「只给了 1.3 套件时把版本下限抬到 TLS1.3」以及 `getCipher().standardName`（IANA 名，`AES256-SHA256` → `TLS_RSA_WITH_AES_256_CBC_SHA256`，无法从 OpenSSL 名推导，此前是原样重复）。
+- **`keylog` 事件从零实现**：引擎侧装 `SSL_CTX_set_keylog_callback` 并缓存（上限 64 行），`net.tlsKeylog(fd)` 破坏性抽取。**抽取只在有监听者时发生** —— TLSSocket 的 `newListener` 置位 `_keylogWanted`，tls.Server 仅在自身有 `keylog` 监听时才挂每连接转发，所以没有监听者的进程不会把密钥材料移出引擎，常规路径上也没有每次 poll 的原生调用。
+- **`tls.setDefaultCACertificates()` 此前只改 `getCACertificates()` 的返回值**，没有到达引擎。现在把变更后的信任库作为连接的 `ca` 交下去，并新增 `caIsComplete` 表示「这就是全部信任库」——空库也不得回落到平台库，因为 `setDefaultCACertificates([])` 的语义就是「谁都不信」。该标志**只会收窄信任**。
+- **空版本窗口的错误码此前报的是 BoringSSL 的** `ERR_SSL_NO_SUPPORTED_VERSIONS_ENABLED`；mbun 链接的是 OpenSSL 3，语料也正是按 `hasOpenSSL3` 分支期待 `ERR_SSL_NO_PROTOCOLS_AVAILABLE`。
+
+守卫集：tls 217 + https 63 全量（改动前后各一次），外加 418 文件跨子系统抽样（`test-net-` 全量 148 + 种子 20260726 的 http/http2 120 与其余 150），**三处回归均为 0，跨子系统抽样前后逐桶完全一致**。
+
+### w4/agent-fs：fs 错误形状 + fd 语义（test-fs- 298/342 → 309/342，实得 +11；全量 2,404 → 2,417）
+
+`--filter test-fs- --jobs 5 --timeout 15`：`pass 298 → 309`、`fail 34 → 23`、timeout 不变（2），**green→non-green 回归 0**。全量 4,433 文件基线/改后各跑一次（基线用冻结的 `target/baseline-w4/bin/mbun`，实测 2,404，与 8db7b9c 记录的 2,403 一致）：`pass 2,404 → 2,417`，逐文件 diff 14 转绿、1 回归，那 1 个是 `test-child-process-stdio-inherit` 的 JSC `WTFCrashWithInfo` SIGABRT，单独跑 3/3 通过，属并行内存压力下的已知抖动。fs 之外的三个额外增量：`test-filehandle-close`、`test-permission-fs-symlink-target-write`、`test-stdio-closed`。
+
+- **五个点名的 fs 错误形状缺陷全部落地**。`unlinkSync(<不存在>)` **根本不抛** —— `std::filesystem::remove` 用「返回 false + 空 error_code」表示「没东西可删」，改走 `unlink(2)`；`chmodSync`/`renameSync` 抛的是 `"chmod '<p>': No such file or directory"` 这种既解析不出 code 也解析不出 syscall 的文本，`.code/.errno/.syscall/.path` 全缺；`readlinkSync(<不存在>)` 报 EINVAL 而 node 报 ENOENT。`fs_make_error` 现在把 `'src' -> 'dest'` 拆成 `.path` + `.dest`。
+- **`fs.linkSync` 实现成了 copyFile** —— 这不只是错误形状，是语义错误：副本有自己的 inode，`nlink` 不增、一侧写另一侧看不见。改为真正的 `link(2)`，并补上此前完全缺失的 `fs.promises.link`。**权限闸门在 native 边界**（`fsn_link_cb` 内），已用裸全局单独取证：`--permission` 下 `globalThis.__mbunFsNative.link(...)` 直接返回 `ERR_ACCESS_DENIED`，不是只有公开 API 被拦。
+- **fd 族此前是「只验数字范围」的空壳**。`fsync/fdatasync/fchmod/fchown/futimes` 对已关闭的 fd 静默成功；`read/write/ftruncate/close` 抛的是**裸 JS 字符串**，于是 `.code`/`.syscall` 在每一个上面都是 undefined。全部改成 node 的无路径 EBADF。反向的错也修了：`fs.fstat(0)` 曾抛 EBADF —— mbun 没发出的 fd 不等于坏 fd，stdio 与继承来的描述符在 OS 层是真的。
+- **`fs.rm` 的 `{ force: true }` 吞掉了所有错误**，而 node 只吞 ENOENT；配套的 lstat 用的助手把任何失败都塌成「不存在」。根因再往下一层：`fsn_stat_cb` 把未列举的 errno 一律压成 ENOENT，于是只读目录里因缺搜索权限而 lstat EACCES 的文件，被 `force` 当成「已经没了」静默跳过（nodejs/node#38683）。
+- **短写被当成成功**。`writeFileSync` 只发一次 `FD.write` 且丢弃返回值：`ulimit -f 1` 下写满限额即正常返回。改成 node 的循环，并在启动时 `SIG_IGN` SIGXFSZ（否则进程直接被信号杀死，拿不到 EFBIG）。native 的整文件写此前是个从不检查 `write()` 结果的 `std::ofstream`。
+- **`node:test` 的 mock 有两处失效**（影响面超出 fs）：`mockImplementationOnce` 拿 `calls.length` 比对调用序号，但调用记录是在实现执行**之前**入队的，差一位导致 once 实现永远选不中；`mock.getter/setter` 用赋值 `object[name] = fn`，根本替换不掉原型上的访问器。两者都改对之后 `test-fs-write-stream-eagain` 才可能通过。
+- **流选项不走原型链**：`getOptions` 用 `Object.assign`（只拷自有属性），而 node 的 `copyObject` 是 `for..in`，所以 `createReadStream(f, { __proto__: { start: 1, end: 2 } })` 在 mbun 里 start/end/encoding 全部丢失。`ReadStream._read` 出错时直接 `this.destroy(er)` 而不是走 `errorOrDestroy`，`{ autoClose: false }` 的流被第一个读错误关掉。
+- **child_process 的 stdio 数字 fd 没做转换**：`fs.openSync` 给的是 mbun 的**虚拟 fd**（从 1000 起编号），原样交给子进程 dup2 就是 EBADF。已在 native 边界翻译成真实 OS fd。
+
+**修正 inventory（`compat/` 只读，改动请在这里记）**：`test-fs-error-messages` 的 note「needs `fstat` in the syscall slot」已过期，实际卡在 readlink 的 ENOENT，且后面还串着 close/ftruncate/fdatasync/fsync/chown/utimes/mkdtemp/copyFile/read/write/fchmod/fchown/futimes 一整族 EBADF；`fs-one-off` 再次漏计 —— 十一个增量里 `test-fs-stat`、`test-fs-rm`、`test-fs-read-stream`、`test-fs-read-stream-inherit`、`test-fs-write-stream-autoclose-option`、`test-fs-write-stream-eagain`、`test-fs-write` 七个在 inventory 里没有条目。`test-fs-cp-async-file-url` 的 note 是对的但属 **harness 口径**（`./test/fixtures/...` 相对 cwd，与 `test-fs-realpath-native` 同类，不是 `import.meta.url` bug）。
+
+**工具链事故**：全局 `~/.mcpp/config.toml` 的 `[toolchain] default` 在 25 日 22:12 被改成 `gcc@15.1.0`，而本仓库需要 gcc 16（15.1 的 `import std` 缺 `std::byteswap`，且模块 TU-local 诊断误报）。`worktree_setup.sh` 会删 `build.ninja` 触发重配，于是此后新建/重指的每个 worktree 都会锁死在无法编译的状态（wt1、wt4 均中招）。已 `mcpp toolchain default gcc@16.1.0` 复位。
+
 ## 2026-07-25
+
+### 第十一轮整合：node 语料 2,369 → **2,403 / 4,433**（54.2% 严格 / 62.0% 排除自我跳过），组合回归 0
+
+三个 agent 全部超额（+11 / +10 / +9，目标分别是 8 / 6 / 6），整合后逐文件 diff：**36 转绿、1 回归**，唯一那个是 `test-fs-buffer`（已知 issue #16 的 JSC rope-string use-after-free，单独跑通过，仅在内存压力下崩）。增量分布：fs 21、http 9、https 2、http2 1、repl 1、timers 1、tls 1。
+
+**机制改动才是这轮的主要成果。** 第二波三个 agent 在 100 分钟里合计只推进 3.7%（+10/+270）；第三波换成「派活前集中分诊、原因预先点名写进 `compat/data/unreached-inventory.json`、agent 不再自己分诊」，三个 agent 分别做到目标的 138% / 167% / 150%。差别不在执行力，在于**此前每个 agent 都要花约 35 分钟重做分诊，交完报告即随 agent 消失**。
+
+- **`getLibuvNow` 与定时器不同源**：截止时间算在 `Date.now()`（截断到整毫秒），而 binding 读 `performance.now()`，于是 `setTimeout(f,1)` 最快 0.1ms 就到期、被观测值却没前进，`test-timers-ordering` 6 次里挂 5 次。node 两者同源（`internal/timers.js:387` 直接拿 `getLibuvNow()` 当截止时间起点）。对齐后 8/8。它是被 diff 门禁当成「本轮新回归」报出来的，复现后才发现是**长期存在的 1/6 抖动**。
+- **verify 错误码取的是中途回调而非最终结论**：`openssl s_client` 打 mbun 自己的服务端可见 OpenSSL 先报 20 再报 21、最终返回 21。node 的 `VerifyCallback` 无条件返回 1 让验证走到底，mbun 传 `nullptr` 于是在第一个错误处中止。**只改上报的码，不动验证决策** —— `SSL_VERIFY_PEER` + NULL 回调时 OpenSSL 的中止就是 `rejectUnauthorized` 的实际闸门，改成「回调继续」会把闸门挪进 JS 层，其失败模式是静默的验证绕过，已记为需单独评审的安全改动。跨 tls/http2 共 9 文件同因，转绿 3。
+- **node 的 `debuglog` 从未初始化**：node 故意不初始化 `testEnabled`，靠 `pre_execution.js:488` 调 `initializeDebugEnv`，而 mbun 不跑那个阶段、也从没调过 —— node lib 里 42 个文件调 `debuglog(`。补在该模块自身加载处（唯一能保证「先于首次使用」又不增加启动开销的时机）。
+- **安全（独立复验）**：`__mbunWatchNative.start` 的 inotify 入口此前只在 **JS shell 层**有检查 —— `fs.watch('/etc')` 被拒，但裸 `globalThis.__mbunWatchNative.start('/etc')` 直接放行。凡走 `fs.watch` 的测试都会显示「网关正常」。已补在 native 边界；新增的 `__mbunFsNative.lutimes` 同样在边界受控（裸调用被拒、授权路径可用）。
+
+**四个我自己的判断被测量推翻**，均已记入 `compat/data/round-estimates.json`：`filehandle-lock-ref-protocol` 被两重误判（一半是 `--experimental-stream-iter` 的 `stream/iter` 工作，另一半卡在**模块标识** —— 测试 patch 的是 node 真实的 `internal/fs/promises`，而 mbun 的 `fs/promises` 是另一个类，翻译 570 行不会移动任何东西）；`http-timeout-shape-D`「原生崩溃 2 文件」**根本不存在**（49 个 http 超时全部 exit 124、无一条日志含崩溃文本，而崩溃进程死于信号、走不到超时 kill）；shape A 按 dump 签名是 10 文件、按原因只有 5；`fs-one-off` 严重漏计 —— agent-1 十一个增量里有五个在 inventory 里**根本没有条目**。
+
+- **工具**：`bun_corpus_runner.py` 补增量落盘 + `--resume`（此前只在最后写一次，长跑被 kill 即全丢）；`node_corpus_runner.py` 的 `--max-seconds` **对全新全量运行完全无效**（deadline 在 `submit()` 前检查，而 4433 个 future 在几毫秒内全部入队），改为有界投喂；新增 `build_or_die.sh`（`mcpp build | tail` 会吞掉退出码，一次失败构建曾让陈旧二进制被当作新鲜快照、并据此启动了一次全量测量）。
+- **bun 语料首次重测**（1902 文件，此前公布的是 round-7/8 快照）：green **868**、test-failure 885、ahead-of-reference 3、timeout 44。对比最近一次带逐文件数据的全量（`r5-bun`，green 884）：**43 个丢失、27 个新增、净 −16**。抽查 10 个，1 个是 mbun 比 bun 更正确、9 个是真失败 —— **node 侧推进确实吃掉了 bun 文件，这笔账明确记下不作吸收**。顺带修掉 `ahead-of-reference` 桶的不可达缺陷（它先判 `exit_code != 0`，而 bun 恰恰因为 `test.failing` 意外通过才 exit 1；`deep-equal.test.ts` 22 个失败全是这种，却一直被记成 test-failure）。
+
+
+### 第十一轮 w3/agent-3：fs.watch + realpath（test-fs- 子系统 276/342 → 287/342，实得 +10）
+
+`--filter test-fs- --jobs 5 --timeout 15` 实测：`pass 276 → 287`、`fail 53 → 45`、`timeout 5 → 2`，**green→non-green 回归 0**。`test-fs-buffer` 的转绿是已知 issue #16（JSC `JSRopeString::view` 偶发 SIGSEGV）的抖动，不计入，因此诚实增量是 **+10**：
+`watch-encoding` / `watch-recursive-validate` / `watch-recursive-promise`（三个 timeout）、`watch-enoent`、`watch-stop-async`、`watchfile`、`promises-watch`、`watch-recursive-symlink`、`realpath`、`realpath-pipe`。
+
+- **两个 timeout 的真因不是事件循环**。上一轮把三个挂起归为「watcher 注册成 pollable 却不持 fd，drain 的 stall 时钟不前进」。实测：`watch-recursive-validate` 是 `fs.watch(d, {recursive:'1'})` **没做校验**，于是凭空建出一个 persistent watcher 永不关闭；`watch-encoding` 是 `decodeName` 只认 `"buffer"`，`encoding:'hex'` 原样返回 utf8 串，测试的 hex watcher 永远认不出自己的文件名，`done` 不触发。**两者都是「本该抛错/本该匹配」的语义缺陷，被 loop 语义放大成挂起。** 记账口径：分类是 timeout，根因层不是 loop。
+- **`fs.realpath` 直译 node 的 JS 解析器**，替掉 `weakly_canonical`（后者对 `/this/path/does/not/exist` 返回原样且不抛）。逐分量 lstat + readlink + 重启走查；ELOOP 由「跟随 stat 失败」检出（同时补了 `fsn_stat_cb` 把 ELOOP 压成 ENOENT 的映射），`seenLinks` 按 dev:ino 保证 `folder/cycles` 重复十次仍合法；走查在 FIFO/socket 处停止，这就是 `/dev/stdin` 能解析成 `/proc/<pid>/fd/pipe:[N]` 的原因。`.native` 另立严格入口（realpath(3)）。
+- **安全**：`__mbunWatchNative.start` 此前**完全没有 permission gate** —— `--permission` 沙箱里可以 watch 任意目录并读出未授权文件名。已按 node 的 `kFileSystemRead` 分类补上，且补在 native 边界（JS shim 层的检查可被绕过）。实测被拒 / 已授权路径仍可用；45 个 `test-permission-*` 通过数不变。
+- **两条线索被证伪，回填 inventory**：① `test-fs-watchfile-bigint` **不是**「BigIntStats 多带 4 个 Date 属性」—— expected 来自 node 真实的 `internal/fs/utils`（mbun 会加载 `compat/node/lib/`），而 mbun 的 `fs.BigIntStats` 是另一个类，`deepStrictEqual` 先卡在**原型不同**上。要通过必须让 mbun 的 stats 用 node 那两个类构造，是架构级改动，不是 4 个属性。② `test-fs-realpath-native` **不是 realpath 问题** —— 它解析 `'./test/parallel/...'`，需要 cwd == node 检出根，而 `node_corpus_runner.py` 用 `cwd=root`（仓库根）。属 harness 口径，全局改动会影响所有 agent 的测量，未动。
+
+守卫集：335 文件（`test-module-`/`test-require-`/`test-permission-`/`test-path-`/`test-worker-fs`/`test-process-cwd` 全量 + 种子 20260725 的 150 文件随机抽样），改动前后各跑一次（各自重新构建二进制），**回归 0**。十个新增文件单独各跑 3 次全绿。
 
 ### 第十轮：先审计量表，再推进覆盖（node 语料 38.2% → 50.9% 严格 / 58.1% 排除自我跳过）
 

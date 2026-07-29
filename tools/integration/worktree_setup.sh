@@ -95,4 +95,24 @@ done
 count=$(find "$worktree/compat/node/test/parallel" -maxdepth 1 -name 'test-*.js' | wc -l)
 [ "$count" -gt 0 ] || { echo "$0: wiring failed -- no test files under compat/node/test/parallel" >&2; exit 1; }
 
+# Make `git add -A` safe in this worktree.
+#
+# compat/{bun,node} are TRACKED as submodule gitlinks (mode 160000) but exist
+# here as SYMLINKS into the primary checkout, because git leaves a submodule
+# directory empty in a linked worktree. `git add -A` therefore stages the symlink
+# over the gitlink, and the resulting commit carries a mode-120000 blob holding a
+# path from this machine. It still resolves HERE, so nothing looks wrong to
+# whoever did it; on any other checkout compat/node/test simply does not exist
+# and the corpus runners report zero files rather than an error.
+#
+# .gitignore cannot prevent this — these paths are tracked. --skip-worktree can:
+# it tells git to ignore worktree changes to them entirely, so `git add -A`
+# leaves the gitlinks alone. Verified: the index flag goes H -> S and a
+# subsequent `git add -A` keeps both entries at 160000.
+#
+# This trap hit three agents and the integration worktree in a single round
+# before this existed. check_submodule_gitlinks.sh remains the backstop.
+git -C "$worktree" update-index --skip-worktree compat/bun compat/node 2>/dev/null \
+  || echo "$0: note -- could not set --skip-worktree on compat/{bun,node}; run check_submodule_gitlinks.sh before every commit" >&2
+
 echo "$worktree -> $branch @ $(git -C "$worktree" rev-parse --short HEAD) (corpus ok: $count node parallel files)"

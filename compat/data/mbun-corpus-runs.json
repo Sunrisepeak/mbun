@@ -1,65 +1,68 @@
 {
-  "generated_at": "2026-07-25",
-  "binary": "mbun 2026.07.18.0 (source snapshot, branch fix/corpus-round7)",
-  "runs": [
-    {
-      "corpus": "compat/bun/test",
-      "runner": "tools/integration/bun_corpus_runner.py --cwd compat/bun --discover compat/bun/test --sample-per-group 100000 --jobs 14 --timeout 30",
-      "files": 1902,
-      "categories": {
-        "all-skipped": 73,
-        "blocked-external": 18,
-        "crash": 13,
-        "green": 885,
-        "load-error": 5,
-        "no-tests": 6,
-        "oom-kill": 2,
-        "test-failure": 856,
-        "timeout": 44
-      },
-      "test_level": {
-        "ran": 52454,
-        "passed": 32190,
-        "failed": 17404,
-        "expects": 487285
-      },
-      "notes": "file-level green = every executed test in the file passed and the file reported no out-of-test error; all-skipped / no-tests / blocked-external are separate buckets and are NOT passes. The corpus npm dependencies must be installed first (see compat/README.md) -- without them 264 files die at load; test/node_modules is excluded from discovery so third-party packages do not inflate the corpus",
-      "binary": "round-7/8 era snapshot (branch fix/corpus-round7) \u2014 STALE",
-      "stale": true,
-      "staleness_note": "These figures predate rounds 9 and 10 (20+ tasks) and are NOT current. They are kept because they are the last full bun-corpus measurement taken, not because they still hold. There is direct evidence the number has moved: the deep-equality alignment deliberately reclassified 22 files in bun's own deep-equal suite to `ahead-of-reference` (mbun is more correct than bun there), and the request-smuggling fix took bun's own request-smuggling.test.ts from 53 to 61 passing. A full re-measure is owed; it costs ~30 minutes and has not been run because the machine has been continuously occupied by node-corpus work."
+ "generated_at": "2026-07-25",
+ "binary": "mbun 2026.07.18.0 (source snapshot, branch fix/corpus-round7)",
+ "runs": [
+  {
+   "corpus": "compat/bun/test",
+   "runner": "tools/integration/bun_corpus_runner.py --cwd compat/bun --discover compat/bun/test --sample-per-group 100000 --jobs 5 --timeout 30 --resume",
+   "binary": "rewrite_bun_in_mcpp + r9/integration @ e4639ae (round 14 checkpoint, base merged)",
+   "files": 1902,
+   "categories": {
+    "ahead-of-reference": 3,
+    "all-skipped": 73,
+    "blocked-external": 13,
+    "fixture-build-error": 5,
+    "green": 868,
+    "load-error": 4,
+    "no-tests": 6,
+    "oom-kill": 5,
+    "test-failure": 884,
+    "timeout": 41
+   },
+   "test_level": {
+    "ran": 51656,
+    "passed": 31479,
+    "failed": 17391,
+    "expects": 466865
+   },
+   "notes": "file-level green = every executed test in the file passed and nothing errored outside a test. ahead-of-reference = every failure in the file is a stale bun `test.failing` marker that now passes, i.e. mbun is MORE correct than bun there; it is NOT counted as green because the file still does not pass bun's suite as written.",
+   "checkpoint_note": "Same binary and session as the node row. 869 green against 885 in the last published round-7/8 snapshot, but those were never contemporaneous — that snapshot predated ~20 tasks over shared code. Running both corpora together is what caught an earlier 868 -> 612 excursion caused by one missing field in Bun.spawn."
+  },
+  {
+   "corpus": "compat/node/test/parallel",
+   "runner": "tools/integration/node_corpus_runner.py --jobs 6 --timeout 15",
+   "binary": "rewrite_bun_in_mcpp + r9/integration @ e4639ae (round 14 checkpoint, base merged)",
+   "files": 4433,
+   "categories": {
+    "fail": 1127,
+    "oom-kill": 4,
+    "pass": 2654,
+    "skipped": 552,
+    "timeout": 96
+   },
+   "rates": {
+    "strict_pass": 0.599,
+    "excluding_self_skips": 0.684
+   },
+   "baseline_for_comparison": {
+    "binary": "round-8 HEAD (23217dd), measured with the SAME corrected runner",
+    "categories": {
+     "fail": 1862,
+     "oom-kill": 14,
+     "pass": 1695,
+     "skipped": 279,
+     "timeout": 583
     },
-    {
-      "corpus": "compat/node/test/parallel",
-      "runner": "tools/integration/node_corpus_runner.py --jobs 8 --timeout 15",
-      "binary": "r9/integration (round 9 + round 10, assert.throws fixed, permission model)",
-      "files": 4433,
-      "categories": {
-        "fail": 1392,
-        "oom-kill": 4,
-        "pass": 2358,
-        "skipped": 554,
-        "timeout": 125
-      },
-      "rates": {
-        "strict_pass": 0.532,
-        "excluding_self_skips": 0.608
-      },
-      "baseline_for_comparison": {
-        "binary": "round-8 HEAD (23217dd), measured with the SAME corrected runner",
-        "categories": {
-          "fail": 1862,
-          "oom-kill": 14,
-          "pass": 1695,
-          "skipped": 279,
-          "timeout": 583
-        },
-        "rates": {
-          "strict_pass": 0.382,
-          "excluding_self_skips": 0.408
-        }
-      },
-      "notes": "A file that skipped itself (common.skip() -> '1..0 # Skipped:', exit 0) is classified `skipped`, never `pass`. common.mustCall is enforced from this binary onward (node registers its verifier in process.on('exit'), which previously never fired). Both corrections lower the number relative to previously published figures; the 44.5% published against round 8 was a product of both defects and was never real. Full estimate-vs-actual and methodology: compat/data/round-estimates.json and compat/README.md. A third verification defect was fixed after the previous entry: assert.throws ignored its error argument, so any throw satisfied any matcher. That removed 126 passes (25 of 25 sampled confirmed vacuous), which is why this figure is LOWER than the previously recorded 47.9%/54.7%."
+    "rates": {
+     "strict_pass": 0.382,
+     "excluding_self_skips": 0.408
     }
-  ],
-  "note": "generated_at applies to the node row only. The bun row is a stale round-7/8 snapshot; see its staleness_note. Do not read the two rows as contemporaneous."
+   },
+   "notes": "A file that skipped itself (common.skip() -> '1..0 # Skipped:', exit 0) is classified `skipped`, never `pass`. common.mustCall is enforced from this binary onward (node registers its verifier in process.on('exit'), which previously never fired). Both corrections lower the number relative to previously published figures; the 44.5% published against round 8 was a product of both defects and was never real. Full estimate-vs-actual and methodology: compat/data/round-estimates.json and compat/README.md. A third verification defect was fixed after the previous entry: assert.throws ignored its error argument, so any throw satisfied any matcher. That removed 126 passes (25 of 25 sampled confirmed vacuous), which is why this figure is LOWER than the previously recorded 47.9%/54.7%.",
+   "jobs_note": "Measured at --jobs 6, not 8/10. Higher parallelism does not change the total (a jobs-6 full run moved exactly the 11 files the wave's agents claimed and no others) but it makes per-file attribution unreliable: individual pass->fail results at --jobs 10 have repeatedly failed to reproduce standalone. See compat/README.md 'A parallel guard invents regressions'.",
+   "measurement_caveat": "Measured on the build output directly. A binary COPIED to a different basename (mbun-<sha>) reports 10 phantom regressions across child_process/process/signal/module -- tests that re-spawn the runtime fail with 'spawn mbun ENOENT'. Snapshot to <dir>/bin/mbun instead; verified both ways.",
+   "checkpoint_note": "Measured on the SAME binary as the bun row below, in the same session — the first time the two corpora are directly comparable. Round 14 merged six agent worklists: net-dgram +9, http +8, http2 +7, tls +7, crypto +7, worker +7 against a target of +6 each."
+  }
+ ],
+ "note": "generated_at applies to the node row only. The bun row is a stale round-7/8 snapshot; see its staleness_note. Do not read the two rows as contemporaneous."
 }
