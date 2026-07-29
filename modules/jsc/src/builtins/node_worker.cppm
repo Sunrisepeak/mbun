@@ -868,6 +868,13 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
         set.add(this);
       }
       get name() { assertBroadcast(this); return broadcastNames.get(this); }
+      [INSPECT_SYM](depth, options, inspect) {
+        assertBroadcast(this);
+        const name = typeof inspect === "function"
+          ? inspect(broadcastNames.get(this))
+          : JSON.stringify(broadcastNames.get(this));
+        return "BroadcastChannel { name: " + name + ", active: " + (!this._closed) + " }";
+      }
       postMessage(value) {
         assertBroadcast(this);
         if (arguments.length === 0)
