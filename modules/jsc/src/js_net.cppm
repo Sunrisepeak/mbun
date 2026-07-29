@@ -774,6 +774,27 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       // loopback/wildcard (as reported by an IPv6-defaulted server.address())
       // dials the v4 loopback, which the v4-mapped INADDR_ANY listener accepts.
       const dialHost = (host === "::1" || host === "::" || host === "::0") ? "127.0.0.1" : host;
+      // net.Socket permits callers to supply a libuv-style handle. Its connect
+      // method reports an errno synchronously, while Socket surfaces the
+      // corresponding error asynchronously. Keep that seam for custom Agents;
+      // our own NetHandle deliberately continues through the reactor below.
+      const injectedHandle = !unixPath && this._handle && !(this._handle instanceof NetHandle) &&
+        typeof this._handle.connect === "function" ? this._handle : null;
+      if (injectedHandle) {
+        let status;
+        try { status = injectedHandle.connect({}, dialHost, port); }
+        catch (e) { status = undefined; }
+        if (typeof status === "number" && status !== 0) {
+          const util = M["util"] || M["node:util"];
+          const code = util && typeof util.getSystemErrorName === "function"
+            ? util.getSystemErrorName(status) : "ECONNRESET";
+          const err = mkErr("connect " + code + " " + host + ":" + port, code);
+          err.syscall = "connect"; err.address = host; err.port = port;
+          this.connecting = false;
+          G.queueMicrotask(() => { if (!this.destroyed) { this.emit("error", err); this.destroy(); } });
+          return this;
+        }
+      }
       let fd;
       try { if (unixPath && pipePathTooLong(unixPath)) throw new Error("EINVAL"); fd = unixPath ? NN.connectUnix(unixPath) : NN.connect(dialHost, port, _localAddr, _localPort); }
       catch (e) { this.connecting = false; const err = connectError(e, unixPath || host, unixPath ? undefined : port); G.queueMicrotask(() => { if (this.destroyed) return; this.emit("error", err); this.destroy(); }); return this; }
