@@ -2217,6 +2217,16 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
       // own 'close'/'aborted' first). A stream on a session that never connected
       // has nothing to drive it at all, so it kept its handle and the loop alive.
       const pending = !this._connected ? Array.from(this.streams.values()) : [];
+      // An OPEN stream is usually driven to its end by the socket teardown, and
+      // force-finishing it in this microtask cost 5 files last time — it ran
+      // BEFORE the stream's own 'close'/'aborted' and reordered them. But when
+      // the transport dies mid-response nothing drives it at all: the stream
+      // gets 'aborted' from abortStreamsOnTransportEof and then dangles, with no
+      // 'close', no 'error', and a promise that never settles
+      // (test-http2-client-session-close-before-stream-close). Sweep them one
+      // I/O TURN later instead: every natural path has already run by then, so
+      // only the genuinely dangling ones are still here.
+      const open = this._connected ? Array.from(this.streams.values()) : [];
       // A request still queued behind the peer's concurrency limit has no id and
       // is not in `streams`, so the socket teardown cannot reach it. node
       // destroys its pending streams with ERR_HTTP2_STREAM_CANCEL; leaving them
@@ -2232,6 +2242,21 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
           s.destroy(streamCancelErr());
         }
         self.emit("close");
+        if (open.length === 0) return;
+        // Settle, do not re-report: the reason the transport died has already
+        // been delivered (a session 'error', the stream's own 'aborted', or
+        // nothing at all for a clean close), and injecting an extra 'error'
+        // here is what the 5-file cost was — an unhandled ERR_HTTP2_STREAM_CANCEL
+        // on a stream whose abort the test had already observed. A bare
+        // destroy() emits the missing 'close' and settles the caller.
+        const nextTurn = typeof G.setImmediate === "function" ? G.setImmediate : (fn) => G.setTimeout(fn, 0);
+        nextTurn(() => {
+          for (const s of open) {
+            if (s.destroyed) continue;
+            s._closed = true;
+            s.destroy();
+          }
+        });
       });
     }
     _shutdown() { this._teardown(); }
