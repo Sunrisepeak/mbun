@@ -207,6 +207,25 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
       e.code = "ERR_INVALID_ARG_TYPE";
       return e;
     };
+    // node lib/internal/test_runner/tag_filter.js validateTags(): the option is
+    // validated where the Test/Suite is CONSTRUCTED, so test/suite/describe/it
+    // all reject the same shapes. Hooks never reach here — they take no options
+    // bag — which is why before(fn, { tags }) is silently tolerated.
+    const validateTags = (opts) => {
+      if (opts === null || typeof opts !== "object") return;
+      const tags = opts.tags;
+      if (tags === undefined) return;
+      if (!Array.isArray(tags)) throw argTypeError("options.tags", "an array", tags);
+      for (const tag of tags) {
+        if (typeof tag !== "string") throw argTypeError("options.tags[]", "string", tag);
+        if (tag.length === 0) {
+          const e = new TypeError(
+            "The argument 'options.tags' must not contain an empty string. Received ''");
+          e.code = "ERR_INVALID_ARG_VALUE";
+          throw e;
+        }
+      }
+    };
     const testAssert = {
       register(name, fn) {
         if (typeof name !== "string") throw argTypeError("name", "string", name);
@@ -514,7 +533,26 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
           if (message) out("# TODO " + message);
         },
         runOnly: () => {},
-        plan: (count) => { context.__plan = count; },
+        // node lib/internal/test_runner/test.js TestContext#plan validates both
+        // arguments before recording the count; `wait` is accepted but not yet
+        // honoured here (the count check below is synchronous).
+        plan: (count, options) => {
+          if (typeof count !== "number") throw argTypeError("count", "number", count);
+          if (options !== undefined) {
+            if (options === null || typeof options !== "object") {
+              throw argTypeError("options", "object", options);
+            }
+            const wait = options.wait;
+            if (wait !== undefined && typeof wait !== "boolean" && typeof wait !== "number") {
+              const e = new TypeError('The "options.wait" property must be one of type boolean or' +
+                                      " number. Received type " + typeof wait +
+                                      " (" + String(wait) + ")");
+              e.code = "ERR_INVALID_ARG_TYPE";
+              throw e;
+            }
+          }
+          context.__plan = count;
+        },
         mock: makeMock(),
         before: (fn) => node.hooks.before.push(fn),
         after: (fn) => node.hooks.after.push(fn),
@@ -697,6 +735,7 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
         else if (arg && typeof arg === "object") { if (opts === undefined) opts = arg; }
       }
       if (name === undefined && fn && fn.name) name = fn.name;
+      validateTags(opts);
       return { name, opts: opts || {}, fn };
     };
 
