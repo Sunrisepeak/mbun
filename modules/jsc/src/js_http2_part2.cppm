@@ -129,7 +129,7 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
   // node's `strictFieldWhitespaceValidation` (default on) drops such a field
   // instead of delivering it; turning it off keeps the raw value.
   const kPaddedFieldValue = /^[ \t]|[ \t]$/;
-  function requestHeadersMalformed(list) {
+  function requestHeadersMalformed(list, connectProtocol) {
     const seenPseudo = {};
     let sawRegular = false;
     for (let i = 0; i < list.length; i++) {
@@ -146,6 +146,11 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
         // rejected outright.
         if (name !== ":method" && name !== ":scheme" && name !== ":path" &&
             name !== ":authority" && name !== ":protocol") return true;
+        // RFC 8441 4: `:protocol` is only meaningful once this endpoint has
+        // advertised SETTINGS_ENABLE_CONNECT_PROTOCOL. nghttp2's
+        // http_request_on_header takes that flag as an argument and rejects the
+        // header block without it, so the 'stream' event never fires.
+        if (name === ":protocol" && !connectProtocol) return true;
         seenPseudo[name] = true;
       } else {
         sawRegular = true;
@@ -574,6 +579,14 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
       // regression/29073 requirement of never advertising a non-zero value.
       this._isServerSession = true;
       const _srvSettings = server && server._h2options && server._h2options.settings;
+      // nghttp2 tracks SETTINGS_ENABLE_CONNECT_PROTOCOL as
+      // `pending_enable_connect_protocol` and consults it when validating an
+      // inbound request's `:protocol` pseudo-header, so a server that never
+      // advertised extended CONNECT rejects such a request outright rather than
+      // handing it to the application (test-http2-connect-method-extended vs
+      // -cant-turn-off). It is updated at SUBMIT time, not on the peer's ACK.
+      const _cpSettings = _srvSettings || this._options.settings;
+      this._localConnectProtocol = !!(_cpSettings && _cpSettings.enableConnectProtocol);
       this._writeFrame(FRAME.SETTINGS, 0, 0, encodeSettings(
         _srvSettings && "enablePush" in _srvSettings
           ? Object.assign({}, _srvSettings, { enablePush: false })
@@ -675,6 +688,7 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
           if (len / 6 > maxSettings) { this._connError(constants.NGHTTP2_PROTOCOL_ERROR); return false; }
           const rangeErr = settingsRangeError(payload);
           if (rangeErr) { this._connError(rangeErr); return false; }
+          if (connectProtocolWithdrawn(this, payload)) { this._connError(constants.NGHTTP2_PROTOCOL_ERROR); return false; }
           this._remoteSettings = parseSettingsPayload(payload);
           this._writeFrame(FRAME.SETTINGS, FLAG.ACK, 0, Buffer.alloc(0));
           this.emit("remoteSettings", settingsToObject(this._remoteSettings));
@@ -849,7 +863,7 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
       this.streams.set(pb.streamId, stream);
       if (pb.streamId > this._lastStreamId) this._lastStreamId = pb.streamId;
       if (limitCode !== 0) { this._streamError(stream, limitCode); return true; }
-      if (requestHeadersMalformed(list)) { this._streamError(stream, constants.NGHTTP2_PROTOCOL_ERROR); return true; }
+      if (requestHeadersMalformed(list, this._localConnectProtocol === true)) { this._streamError(stream, constants.NGHTTP2_PROTOCOL_ERROR); return true; }
       if (dupClen) { this._streamError(stream, constants.NGHTTP2_PROTOCOL_ERROR); return true; }
       if (pb.endStream && expectLen != null && expectLen !== 0) { this._streamError(stream, constants.NGHTTP2_PROTOCOL_ERROR); return true; }
       if (!pb.endStream && expectLen != null) stream._expectLen = expectLen;
@@ -1044,6 +1058,26 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
       maxHeaderListSize: s[6] !== undefined ? s[6] : 65535,
       enableConnectProtocol: s[8] !== undefined ? s[8] : 0,
     };
+  }
+  // RFC 8441 3: SETTINGS_ENABLE_CONNECT_PROTOCOL is one-way. A peer that has
+  // advertised the value 1 can never take it back, and a later SETTINGS frame
+  // carrying the value 0 is a connection error of type PROTOCOL_ERROR -- which
+  // is what closes the connection in
+  // test-http2-connect-method-extended-cant-turn-off.
+  //
+  // This has to read the RAW entries, not the parsed object: SETTINGS are
+  // cumulative, so a frame that simply omits id 8 leaves the previous value in
+  // force and must NOT be mistaken for a withdrawal (parseSettingsPayload
+  // substitutes the protocol default 0 for anything absent).
+  function connectProtocolWithdrawn(session, payload) {
+    let seen;
+    for (let i = 0; i + 6 <= payload.length; i += 6) {
+      if (((payload[i] << 8) | payload[i + 1]) !== 8) continue;
+      seen = (payload[i + 2] * 0x1000000) + (payload[i + 3] << 16) + (payload[i + 4] << 8) + payload[i + 5];
+    }
+    if (seen === undefined) return false;
+    if (seen !== 0) { session._peerConnectProtocol = true; return false; }
+    return session._peerConnectProtocol === true;
   }
   function encodeSettings(settings) {
     if (!settings || typeof settings !== "object") return Buffer.alloc(0);

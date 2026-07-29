@@ -118,6 +118,17 @@ inline constexpr std::string_view kAsyncHooksJS = R"JS(
       }
     };
   };
+  // Node models several internal one-shot callbacks as real async resources
+  // (lib/internal/http2/core.js `class Http2Ping extends AsyncResource`, whose
+  // type is 'HTTP2PING'), so user hooks see init/before/after/destroy for each
+  // one. Those subsystems live in their own JS payloads and cannot reach the
+  // registry above, which is why the accounting was silently missing there.
+  // Hand them the same capture used for timers: without an enabled hook it
+  // returns the callback untouched, so this costs nothing on the normal path.
+  Object.defineProperty(G, "__mbunAsyncHookWrap", {
+    configurable: true, enumerable: false,
+    value: (fn, type) => captureAsyncCallback(fn, type),
+  });
 
   // node_timers replaces the global scheduling functions after this payload
   // runs. Keeping timer lifecycle ownership here, but letting that final

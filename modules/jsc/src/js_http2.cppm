@@ -694,7 +694,22 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
       if (payload.byteLength !== 8) { const e = new RangeError("HTTP2 ping payload must be 8 bytes"); e.code = "ERR_HTTP2_PING_LENGTH"; throw e; }
     }
     if (typeof cb !== "function") throw argTypeErr("callback", "of type function", cb);
-    const buf = payload ? Buffer.from(payload) : Buffer.alloc(8);
+    // node wraps every ping in `class Http2Ping extends AsyncResource` with the
+    // type 'HTTP2PING', so async_hooks reports init/before/after/destroy for it
+    // (test-http2-ping counts exactly four of each, the cancelled ping
+    // included). Wrapping the callback here reproduces that lifecycle: the
+    // resource is created when ping() is called and destroyed once the callback
+    // has run, whether it ran with an ACK or with ERR_HTTP2_PING_CANCEL.
+    if (typeof G.__mbunAsyncHookWrap === "function") cb = G.__mbunAsyncHookWrap(cb, "HTTP2PING");
+    // The PING opaque data is the payload's RAW 8 bytes. `Buffer.from(view)`
+    // copies a TypedArray's *elements*, so a Uint16Array([1,2,3,4]) — 8 bytes,
+    // and therefore accepted by the byteLength check above — became a 4-byte
+    // frame and the peer killed the connection with FRAME_SIZE_ERROR
+    // (test-http2-ping). Slicing the underlying ArrayBuffer also gives the
+    // echoed buffer an exactly-8-byte `.buffer`, which that test compares.
+    const buf = payload
+      ? Buffer.from(payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength))
+      : Buffer.alloc(8);
     if (!payload) for (let i = 0; i < 8; i++) buf[i] = (Math.random() * 256) | 0;
     if (!session._pings) session._pings = [];
     // node Http2Session::AddPing refuses once maxOutstandingPings are already in
@@ -736,6 +751,12 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
     // A server never advertises SETTINGS_ENABLE_PUSH != 0 (RFC 9113 6.5.2);
     // mid-connection updates are clamped the same way the initial frame is.
     if (session._isServerSession && copy.enablePush !== undefined) copy.enablePush = false;
+    // nghttp2 updates `pending_enable_connect_protocol` inside submit_settings,
+    // i.e. before the peer has acked, and validates inbound `:protocol` against
+    // it. A server that turns extended CONNECT back off therefore stops
+    // accepting the header immediately (the peer, meanwhile, kills the
+    // connection over the illegal withdrawal — see connectProtocolWithdrawn).
+    if (copy.enableConnectProtocol !== undefined) session._localConnectProtocol = !!copy.enableConnectProtocol;
     const send = () => {
       if (session.destroyed) return;
       if (!session._pendingSettingsAcks) session._pendingSettingsAcks = [];
@@ -1932,6 +1953,9 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
           // (test-http2-max-settings). The option was accepted and ignored.
           const maxSettings = (this._options && this._options.maxSettings) || 32;
           if (len / 6 > maxSettings) { this._connError(constants.NGHTTP2_PROTOCOL_ERROR); return false; }
+          // RFC 8441 3: extended CONNECT cannot be switched back off once the
+          // server has advertised it. See connectProtocolWithdrawn().
+          if (connectProtocolWithdrawn(this, payload)) { this._connError(constants.NGHTTP2_PROTOCOL_ERROR); return false; }
           const settings = this._parseSettings(payload);
           this._remoteSettings = settings;
           this._writeFrame(FRAME.SETTINGS, FLAG.ACK, 0, Buffer.alloc(0));   // ack
