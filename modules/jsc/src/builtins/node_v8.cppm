@@ -42,7 +42,7 @@ inline constexpr std::string_view kNodeV8JS = R"JS(
     falseObject: 0x78, numberObject: 0x6E, bigintObject: 0x7A,
     stringObject: 0x73, regexp: 0x52, beginMap: 0x3B, endMap: 0x3A,
     beginSet: 0x27, endSet: 0x2C, arrayBuffer: 0x42, arrayBufferView: 0x56,
-    sharedArrayBuffer: 0x75, hostObject: 0x5C, error: 0x72,
+    sharedArrayBuffer: 0x75, arrayBufferTransfer: 0x74, hostObject: 0x5C, error: 0x72,
   };
 
   const hasF16 = typeof Float16Array !== "undefined";
@@ -85,6 +85,26 @@ inline constexpr std::string_view kNodeV8JS = R"JS(
     e.name = "DataCloneError";
     return e;
   };
+  const invalidArgType = (name, expected, actual) => {
+    const e = new TypeError('The "' + name + '" argument must be ' + expected +
+      ". Received " + (actual === null ? "null" : typeof actual));
+    e.code = "ERR_INVALID_ARG_TYPE";
+    return e;
+  };
+  const outOfRange = (name, actual) => {
+    const e = new RangeError('The value of "' + name + '" is out of range. Received ' + actual);
+    e.code = "ERR_OUT_OF_RANGE";
+    return e;
+  };
+  const isBufferSource = (value) => value instanceof ArrayBuffer ||
+    (typeof ArrayBuffer.isView === "function" && ArrayBuffer.isView(value));
+  const validateTransfer = (id, arrayBuffer) => {
+    if (typeof id !== "number") throw invalidArgType("id", "of type number", id);
+    if (!Number.isInteger(id) || id < 0 || id > 0xFFFFFFFF) throw outOfRange("id", id);
+    if (!(arrayBuffer instanceof ArrayBuffer)) {
+      throw invalidArgType("arrayBuffer", "an instance of ArrayBuffer", arrayBuffer);
+    }
+  };
 
   // ------------------------------------------------------------- Serializer
   class Serializer {
@@ -94,6 +114,7 @@ inline constexpr std::string_view kNodeV8JS = R"JS(
       this._idMap = new Map();
       this._nextId = 0;
       this._treatViewsAsHost = false;
+      this._transferred = new Map();
     }
     _grow(extra) {
       if (this._len + extra <= this._buf.length) return;
@@ -129,7 +150,10 @@ inline constexpr std::string_view kNodeV8JS = R"JS(
     writeHeader() { this._byte(T.version); this._varint(kLatestVersion); }
     writeValue(value) { this._writeValue(value); return true; }
     releaseBuffer() { return Buffer.from(this._buf.subarray(0, this._len)); }
-    transferArrayBuffer(_id, _ab) { /* DEFERRED: no transfer map wired */ }
+    transferArrayBuffer(id, arrayBuffer) {
+      validateTransfer(id, arrayBuffer);
+      this._transferred.set(arrayBuffer, id);
+    }
     writeUint32(v) { this._varint(v >>> 0); }
     writeUint64(hi, lo) { this._varint((hi >>> 0) * 4294967296 + (lo >>> 0)); }
     writeDouble(d) { this._double(d); }
@@ -277,6 +301,12 @@ inline constexpr std::string_view kNodeV8JS = R"JS(
       this._varint(flags);
     }
     _writeArrayBuffer(ab) {
+      const transferId = this._transferred.get(ab);
+      if (transferId !== undefined) {
+        this._byte(T.arrayBufferTransfer);
+        this._varint(transferId);
+        return;
+      }
       this._byte(T.arrayBuffer);
       this._varint(ab.byteLength);
       this._raw(new Uint8Array(ab));
@@ -305,11 +335,15 @@ inline constexpr std::string_view kNodeV8JS = R"JS(
   // ----------------------------------------------------------- Deserializer
   class Deserializer {
     constructor(buffer) {
+      if (!isBufferSource(buffer)) {
+        throw invalidArgType("buffer", "an instance of Buffer, TypedArray, DataView, or ArrayBuffer", buffer);
+      }
       if (buffer instanceof ArrayBuffer) this._bytes = new Uint8Array(buffer);
       else this._bytes = new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
       this._pos = 0;
       this._version = kLatestVersion;
       this._objects = [];
+      this._transferred = new Map();
     }
     _byte() {
       if (this._pos >= this._bytes.length) throw new Error("v8 deserialize: unexpected end of buffer");
@@ -342,7 +376,10 @@ inline constexpr std::string_view kNodeV8JS = R"JS(
     }
     readValue() { return this._readValue(); }
     getWireFormatVersion() { return this._version; }
-    transferArrayBuffer(_id, _ab) { /* DEFERRED */ }
+    transferArrayBuffer(id, arrayBuffer) {
+      validateTransfer(id, arrayBuffer);
+      this._transferred.set(id, arrayBuffer);
+    }
     readUint32() { return this._varint() >>> 0; }
     readUint64() { const v = this._varint(); return [Math.floor(v / 4294967296) >>> 0, (v >>> 0)]; }
     readDouble() { return this._double(); }
@@ -411,6 +448,18 @@ inline constexpr std::string_view kNodeV8JS = R"JS(
         case T.beginMap: return this._readMap();
         case T.beginSet: return this._readSet();
         case T.arrayBuffer: return this._readArrayBuffer();
+        case T.arrayBufferTransfer: {
+          const id = this._varint();
+          if (!this._transferred.has(id)) {
+            throw new Error("v8 deserialize: missing transferred ArrayBuffer " + id);
+          }
+          const arrayBuffer = this._add(this._transferred.get(id));
+          if (this._peek() === T.arrayBufferView) {
+            this._byte();
+            return this._readArrayBufferView(arrayBuffer);
+          }
+          return arrayBuffer;
+        }
         case T.sharedArrayBuffer: return this._readArrayBuffer();
         case T.hostObject: { const o = this._readHostObject(); return this._add(o); }
         case T.error: return this._readError();
