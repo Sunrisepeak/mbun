@@ -36,6 +36,7 @@ glob   = { path = "../glob" }
 image  = { path = "../image" }
 shell  = { path = "../shell" }
 which  = { path = "../which" }
+install = { path = "../install" }
 dns    = { path = "../dns" }
 dotenv = { path = "../dotenv" }
 sqlite = { path = "../sqlite" }
