@@ -5,6 +5,48 @@ session that is interrupted (usage limit, crash, restart) can pick up from the
 file rather than from memory. **If you are a fresh session reading this, start
 here.**
 
+## 2026-07-29 23:05 — BLOCKER: mbun exports 6 dynamic symbols, so no napi addon can load
+
+**Highest-ROI item found on the bun seam, and it is an UPSTREAM mcpp bug — do not
+re-investigate it in this repo, route it to whoever owns mcpp.**
+
+```
+nm -D --defined-only <mbun> | wc -l          ->  6
+nm    --defined-only <mbun> | grep napi_create_promise  ->  present (T)
+nm -D --defined-only <mbun> | grep napi_create_promise  ->  ABSENT
+```
+
+The whole Node-API surface is compiled into mbun but lives only in the static
+symbol table. A `dlopen`'d addon resolves `napi_*` against the host executable,
+so **every prebuilt `.node` in both corpora fails to link** — sharp,
+`@napi-rs/canvas`, prisma, swc, msgpackr, resvg, rollup's native binding. One
+lane measured 4 of its 17 files gated on exactly this.
+
+`mcpp.toml:28` already declares `ldflags = ["-Wl,--export-dynamic"]`. **mcpp
+0.0.109 does not honour user `ldflags` at all.** Verified exhaustively — the flag
+never reaches the generated `build.ninja` from any of:
+
+- the root `[package]` (line 28, pre-existing);
+- `[targets.mbun]`;
+- a workspace member (`modules/napi`) — which is additionally not a root
+  dependency, so it could never reach the link anyway;
+- a *direct root dependency* that owns the napi seams (`modules/jsc`).
+
+Corroborating evidence that the key is simply unimplemented: `modules/toml`
+declares `ldflags = ["-fsanitize=address"]` and that does not reach the link
+either. The `-ldl` / `-l:libssl.a` entries in build.ninja's global `ldflags` come
+from toolchain/xpkg metadata, **not** from any mcpp.toml. `mcpp build` exposes no
+`--ldflags`, and the only other lever is the machine-global `~/.mcpp/config.toml`,
+which agents must not touch (it has been broken twice that way — see the
+toolchain-mismatch note in the resume steps).
+
+All four experiments were reverted; the tree is unchanged. The declaration at
+`mcpp.toml:28` is left in place because it records the correct intent.
+
+**Prerequisite already landed:** `141afe6 fix(napi): resolve glibc compat sonames
+for dlopen'd addons`. Without it the addons fail earlier, at library resolution,
+and the symbol problem stays invisible.
+
 ## 2026-07-29 22:20 — STRATEGY CORRECTION: pivot capacity to the BUN corpus
 
 The maintainer flagged that throughput was slow **and that bun is half the
