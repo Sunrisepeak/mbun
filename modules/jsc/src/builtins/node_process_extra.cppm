@@ -1385,39 +1385,147 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
     });
 
     // ---- unhandled promise rejection dispatch -------------------------------
-    // The runtime's JSC rejection hook calls this with (reason, promise). node's
-    // escalation order (lib/internal/process/promises.js, mode "throw" — the
-    // default since node 15): deliver to 'unhandledRejection' listeners, else
-    // raise it as an uncaught exception (capture callback, then
-    // 'uncaughtException' listeners). Returning false means nobody claimed it and
-    // the runtime falls back to its own fatal report.
+    // The runtime's JSC rejection hook calls this with (reason, promise). This is
+    // a port of node lib/internal/process/promises.js, INCLUDING its five
+    // --unhandled-rejections modes. Returning false means nobody claimed the
+    // rejection and the runtime falls back to its own fatal report.
     //
-    // The message renders `reason` WITHOUT running user code: node formats it
-    // through v8's ToDetailString, so `{ toString() { ... } }` prints
+    // The mode is read off process.execArgv at the point a rejection is observed
+    // (not snapshotted at startup) for the same reason __mbun_fatal_should_abort
+    // does it: execArgv is populated after the builtins image is evaluated, so a
+    // startup snapshot would silently ignore the command-line flag.
+    //
+    // `noSideEffectsToString` renders `reason` WITHOUT running user code: node
+    // formats it through v8's ToDetailString, so `{ toString() { ... } }` prints
     // "[object Object]" rather than calling the method (js/node/promise/
     // reject-tostring.test.ts asserts exactly that).
+    const noSideEffectsToString = function (reason) {
+      const t = typeof reason;
+      if (t === "string") return reason;
+      if (t === "symbol") return reason.toString();
+      if (t === "bigint") return String(reason);
+      if (reason === null) return "null";
+      if (t === "undefined") return "undefined";
+      if (t === "object" || t === "function") {
+        try { return Object.prototype.toString.call(reason); } catch (e) { return "[object Object]"; }
+      }
+      return String(reason);
+    };
+    // node's isErrorLike: an own `stack` property, NOT `instanceof Error`. A
+    // class that only calls Error.captureStackTrace(this) is rejected as-is and
+    // must NOT be wrapped (test-promise-unhandled-warn asserts the warning stack
+    // still names the function that rejected).
+    const isErrorLike = function (o) {
+      return (typeof o === "object" && o !== null &&
+              Object.prototype.hasOwnProperty.call(o, "stack")) || o instanceof Error;
+    };
+    const unhandledRejectionError = function (reason) {
+      const err = new Error(
+        "This error originated either by throwing inside of an async function " +
+        "without a catch block, or by rejecting a promise which was not handled " +
+        "with .catch(). The promise rejected with the reason \"" +
+        noSideEffectsToString(reason) + "\".");
+      err.code = "ERR_UNHANDLED_REJECTION";
+      // node's UnhandledPromiseRejection sets `name` as an own field, which is
+      // what err.toString() and the corpus's err.name assertions read.
+      Object.defineProperty(err, "name", {
+        value: "UnhandledPromiseRejection", writable: true, configurable: true,
+      });
+      return err;
+    };
+    let lastPromiseId = 0;
+    const emitUnhandledRejectionWarning = function (p, reason, uid) {
+      const warning = new Error(
+        "Unhandled promise rejection. This error originated either by throwing " +
+        "inside of an async function without a catch block, or by rejecting a " +
+        "promise which was not handled with .catch(). To terminate the node " +
+        "process on unhandled promise rejection, use the CLI flag " +
+        "`--unhandled-rejections=strict` (see " +
+        "https://nodejs.org/api/cli.html#cli_unhandled_rejections_mode). " +
+        "(rejection id: " + uid + ")");
+      Object.defineProperty(warning, "name", {
+        value: "UnhandledPromiseRejectionWarning", writable: true, configurable: true,
+      });
+      try {
+        if (isErrorLike(reason)) {
+          warning.stack = reason.stack;
+          p.emitWarning(reason.stack, "UnhandledPromiseRejectionWarning");
+        } else {
+          p.emitWarning(noSideEffectsToString(reason), "UnhandledPromiseRejectionWarning");
+        }
+      } catch (e) {
+        try { p.emitWarning(noSideEffectsToString(reason), "UnhandledPromiseRejectionWarning"); }
+        catch (e2) {}
+      }
+      p.emitWarning(warning);
+    };
+    // getUnhandledRejectionsMode(): the LAST spelling on the command line wins,
+    // matching node's option parser. Both `--flag=value` and `--flag value` are
+    // accepted because execArgv preserves whichever form was typed.
+    const unhandledRejectionsMode = function (p) {
+      let mode = "throw";
+      try {
+        const argv = p.execArgv;
+        if (Array.isArray(argv)) {
+          for (let i = 0; i < argv.length; i++) {
+            const a = argv[i];
+            if (typeof a !== "string") continue;
+            if (a.startsWith("--unhandled-rejections=")) mode = a.slice(23);
+            else if (a === "--unhandled-rejections" && i + 1 < argv.length) mode = argv[i + 1];
+          }
+        }
+      } catch (e) {}
+      return mode;
+    };
+    const raiseUncaught = function (p, err) {
+      const cap = p._mbunUncaughtCaptureCallback;
+      if (typeof cap === "function") { cap(err); return true; }
+      if (p.listenerCount("uncaughtException") > 0) {
+        p.emit("uncaughtException", err, "unhandledRejection");
+        return true;
+      }
+      return false;
+    };
     G.__mbunOnUnhandledRejection = function (reason, promise) {
       try {
         const p = G.process;
         if (!p || typeof p.emit !== "function" || typeof p.listenerCount !== "function") return false;
-        if (p.listenerCount("unhandledRejection") > 0) { p.emit("unhandledRejection", reason, promise); return true; }
-        let err = reason;
-        if (!(reason instanceof Error)) {
-          const t = typeof reason;
-          let s;
-          if (t === "string") s = reason;
-          else if (t === "symbol") s = reason.toString();
-          else if (t === "bigint") s = String(reason);
-          else if (reason === null) s = "null";
-          else if (t === "undefined") s = "undefined";
-          else if (t === "object" || t === "function") { try { s = Object.prototype.toString.call(reason); } catch (e) { s = "[object Object]"; } }
-          else s = String(reason);
-          err = new Error("This error originated either by throwing inside of an async function without a catch block, or by rejecting a promise which was not handled with .catch(). The promise rejected with the reason \"" + s + "\".");
-          err.code = "ERR_UNHANDLED_REJECTION";
+        const uid = ++lastPromiseId;
+        const mode = unhandledRejectionsMode(p);
+        const emitRejection = function () {
+          return p.listenerCount("unhandledRejection") > 0 &&
+                 p.emit("unhandledRejection", reason, promise);
+        };
+        // --unhandled-rejections=none: deliver the event, never warn, never exit.
+        if (mode === "none") { emitRejection(); return true; }
+        // =warn: deliver the event AND always warn (twice: the reason, then the
+        // note explaining where the warning came from).
+        if (mode === "warn") {
+          emitRejection();
+          emitUnhandledRejectionWarning(p, reason, uid);
+          return true;
         }
-        const cap = p._mbunUncaughtCaptureCallback;
-        if (typeof cap === "function") { cap(err); return true; }
-        if (p.listenerCount("uncaughtException") > 0) { p.emit("uncaughtException", err, "unhandledRejection"); return true; }
+        // =warn-with-error-code: warn only when unclaimed, and mark the process
+        // failed without killing it.
+        if (mode === "warn-with-error-code") {
+          if (!emitRejection()) {
+            emitUnhandledRejectionWarning(p, reason, uid);
+            p.exitCode = 1;
+          }
+          return true;
+        }
+        // =strict: raise the uncaught exception FIRST, then still deliver
+        // 'unhandledRejection' (and warn if nothing listened for it).
+        if (mode === "strict") {
+          const err = isErrorLike(reason) ? reason : unhandledRejectionError(reason);
+          if (!raiseUncaught(p, err)) return false;
+          if (!emitRejection()) emitUnhandledRejectionWarning(p, reason, uid);
+          return true;
+        }
+        // =throw (node's default since v15): the event wins; only an unclaimed
+        // rejection escalates to an uncaught exception.
+        if (emitRejection()) return true;
+        return raiseUncaught(p, isErrorLike(reason) ? reason : unhandledRejectionError(reason));
       } catch (e) {}
       return false;
     };

@@ -76,6 +76,42 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // ── --unhandled-rejections=<mode> with an unknown mode → refuse to start.
+    //    node validates the value in EnvironmentOptions::CheckOptions
+    //    (src/node_options.cc) and bails out of bootstrap before any JS runs,
+    //    which is exactly what test-promise-unhandled-flag spawns a child to
+    //    observe. Accepting the bad value instead made that test re-exec itself
+    //    forever (the child ran the test, which spawned another child…), so this
+    //    is also the fix for a corpus hang, not just a message.
+    //    Parsed off the raw command line with the same guards as the FIPS check:
+    //    stop at the first non-option or eval flag so an `-e` program that merely
+    //    mentions the string is not a request.
+    {
+        const auto valid_rejection_mode{[](std::string_view v) {
+            return v == "throw" || v == "strict" || v == "warn" || v == "none" ||
+                   v == "warn-with-error-code";
+        }};
+        for (int i{1}; i < argc; ++i) {
+            const std::string_view a{argv[i]};
+            if (a == "-e" || a == "--eval" || a == "-p" || a == "--print" || a == "-pe" ||
+                a == "-ep") {
+                break;
+            }
+            if (!a.starts_with("-")) break;
+            std::optional<std::string_view> value{};
+            if (a.starts_with("--unhandled-rejections=")) {
+                value = a.substr(std::string_view{"--unhandled-rejections="}.size());
+            } else if (a == "--unhandled-rejections" && i + 1 < argc) {
+                value = std::string_view{argv[++i]};
+            }
+            if (value && !valid_rejection_mode(*value)) {
+                std::println(std::cerr, "{}: invalid value for --unhandled-rejections",
+                             argc > 0 ? argv[0] : "mbun");
+                return 9;
+            }
+        }
+    }
+
     // process.execArgv — derived from the raw command line before any flag loop
     //    consumes it, exactly as bun does (node_process.rs create_exec_argv).
     //    Every dispatch below (node emulation, `run`, bare script) shares it; a
