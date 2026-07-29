@@ -1024,6 +1024,7 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
 
   // ---- ECDH ----
   const CURVE_NIDS = { secp256k1: "secp256k1", prime256v1: "prime256v1", secp384r1: "secp384r1", secp521r1: "secp521r1" };
+  const keyAgreementInvalidState = () => { const e = new Error("Invalid state"); e.code = "ERR_CRYPTO_INVALID_STATE"; return e; };
   // ECDH is a node constructor callable WITHOUT `new` (function form + guard).
   function ECDH(curve) {
     if (!(this instanceof ECDH)) return new ECDH(curve);
@@ -1039,11 +1040,13 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     return this.getPublicKey(encoding, format);
   };
   ECDH.prototype.computeSecret = function (otherPublic, inputEnc, outputEnc) {
+    if (this._priv == null) throw keyAgreementInvalidState();
     const pub = typeof otherPublic === "string" ? Buffer.from(otherPublic, inputEnc) : toBuf(otherPublic);
     const sec = Buffer.from(AN.ecdhComputeSecret(this._curve, this._priv, pub));
     return (outputEnc && outputEnc !== "buffer") ? sec.toString(outputEnc) : sec;
   };
   ECDH.prototype.getPublicKey = function (encoding, format) {
+    if (this._pub == null) throw keyAgreementInvalidState();
     if (format !== undefined && format !== "compressed" && format !== "uncompressed" && format !== "hybrid") {
       const e = new TypeError("Invalid ECDH format: " + format); e.code = "ERR_CRYPTO_ECDH_INVALID_FORMAT"; throw e;
     }
@@ -1056,7 +1059,7 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     }
     return (encoding && encoding !== "buffer") ? pub.toString(encoding) : Buffer.from(pub);
   };
-  ECDH.prototype.getPrivateKey = function (encoding) { return (encoding && encoding !== "buffer") ? this._priv.toString(encoding) : Buffer.from(this._priv); };
+  ECDH.prototype.getPrivateKey = function (encoding) { if (this._priv == null) throw keyAgreementInvalidState(); return (encoding && encoding !== "buffer") ? this._priv.toString(encoding) : Buffer.from(this._priv); };
   ECDH.prototype.setPrivateKey = function (key, encoding) { this._priv = typeof key === "string" ? Buffer.from(key, encoding) : toBuf(key); this._pub = Buffer.from(AN.ecdhPublicFromPrivate(this._curve, this._priv)); return this; };
   ECDH.prototype.setPublicKey = function (key, encoding) { this._pub = typeof key === "string" ? Buffer.from(key, encoding) : toBuf(key); return this; };
   ECDH.convertKey = (key, curve, inputEnc, outputEnc, format) => {
@@ -1129,7 +1132,7 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
       if (dhIsProbablePrime(n)) return n;
     }
   };
-  const dhInvalidState = () => { const e = new Error("Invalid state"); e.code = "ERR_CRYPTO_INVALID_STATE"; return e; };
+  const dhInvalidState = keyAgreementInvalidState;
   const dhEnsureP = (self) => { if (self._p == null && self._size) self._p = dhRandPrime(self._size); return self._p; };
   const dhPrimeLen = (self) => dhBigToBuf(dhEnsureP(self)).length;
   // Shared read/compute surface for DiffieHellman + DiffieHellmanGroup.
@@ -1149,6 +1152,7 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     },
     computeSecret(other, inEnc, outEnc) {
       const p = dhEnsureP(this);
+      if (this._priv == null) throw dhInvalidState();
       const ob = typeof other === "string" ? Buffer.from(other, inEnc) : toBuf(other);
       // node runs DH_check_pub_key() BEFORE deriving (src/crypto/crypto_dh.cc
       // ComputeSecret → ncrypto DHPointer::checkPublicKey). A peer key outside
