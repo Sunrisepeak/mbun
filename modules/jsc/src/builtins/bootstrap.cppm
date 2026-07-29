@@ -3740,7 +3740,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   // ---- zlib (real: DEFLATE/zlib/gzip via __mbunZlibNative → mbun.core.compress;
   // payloads cross the native boundary as base64, converted here to Buffer) ----
   const ZN = globalThis.__mbunZlibNative;
-  const zToU8 = (d) => { if (typeof d === "string") return G.Buffer.from(d, "utf8"); if (d instanceof ArrayBuffer || (G.SharedArrayBuffer && d instanceof G.SharedArrayBuffer)) return new Uint8Array(d); if (ArrayBuffer.isView(d)) return new Uint8Array(d.buffer, d.byteOffset, d.byteLength); throw new TypeError("Received an instance of " + (d === null ? "null" : typeof d) + " where a buffer was expected"); };
+  const zToU8 = (d) => { if (typeof d === "string") return G.Buffer.from(d, "utf8"); if (d instanceof ArrayBuffer || (G.SharedArrayBuffer && d instanceof G.SharedArrayBuffer)) return new Uint8Array(d); if (ArrayBuffer.isView(d)) return new Uint8Array(d.buffer, d.byteOffset, d.byteLength); throw zArgType("buffer", "of type string or an instance of Buffer, TypedArray, DataView, or ArrayBuffer", d); };
   const zB64 = (u8) => { let s = ""; for (let i = 0; i < u8.length; i += 8192) s += String.fromCharCode.apply(null, u8.subarray(i, Math.min(i + 8192, u8.length))); return G.btoa(s); };
   const zErr = (e) => { const err = e instanceof Error ? e : new Error(String(e)); err.code = "Z_DATA_ERROR"; err.errno = -3; return err; };
   // kMaxLength as captured by require('zlib') — see the module registration below.
