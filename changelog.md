@@ -5,6 +5,29 @@
 
 ## 2026-07-29
 
+### 5 小时冲刺第二十九批：净减 59 个 Bun 失败
+
+重排后只接受两个同源实现，其余四条路线在静态阶段止损：
+
+- JSON5 parser 直接按上下文对齐 reference error taxonomy，不以顶层 catch
+  猜测映射，**259/62 → 304/17**，净减 45（预计约35）；
+- WPT byte ReadableStream tee 保留 byte branches、clone chunk、使用 byte
+  controller close/error，**1083/92 → 1097/78**，净减 14（预计30+，
+  明显高估同源簇规模，下一轮必须重新聚类）。
+
+DCE 需要尚缺的 scan/link/codegen/per-export tree shaking；WebView 没有真实
+Chrome/CDP backend；Inspector 没有 JSC profiler seam；node:test 失败拆成
+TestContext delegation 与 mock tracker。四者均未写 stub 或混合补丁。
+
+### 第二十八批 PR 推送后全量验证
+
+- Bun：**91/230 green**，assertions **4943/872**，相对 wave27
+  **+63/-61**；两目标严格 +63/-63，另 `svelte/client-side.test.ts`
+  从 blocked-external 变 test-failure，新增 2 个测得失败；
+- Node：**2788/4433 pass**，983 fail / 89 timeout / 4 OOM / 569 skip。
+  weakref fail→pass 与 watcher pass→timeout 一进一出；同二进制复跑两者
+  又为 fail/timeout，确认是跨运行不稳定，未宣称新增稳定 Node green。
+
 ### 5 小时冲刺第二十八批：7 分钟净减 63 个 Bun 失败，540 fail/hour
 
 15:25–15:32 在 wave27 全量冻结后验收两个同源剩余簇：

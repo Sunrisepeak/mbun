@@ -121,6 +121,23 @@ dispersed tails. Wave 29 is assigned to JSON5's remaining 62, WPT Streams'
 remaining 92, and bundler DCE's 53; each lane must find a homogeneous >=20
 cluster or stop within ten minutes.
 
+Wave-28 full proof: Bun is 91/230 green at 4943 pass / 872 fail assertions.
+The targeted +63/-63 is offset globally by two newly measured failures when
+one Svelte integration moved from blocked-external to test-failure. Node stays
+2788/4433 pass; weakref and watch-mode exchanged fail/pass versus timeout, and
+a same-binary rerun showed both are unstable rather than stable coverage.
+
+### Sprint wave 29 measured checkpoint
+
+- JSON5 error taxonomy: 259/62 -> 304/17, -45 failures;
+- WPT byte-stream tee branches: 1083/92 -> 1097/78, -14 failures.
+
+Total is -59. The WPT estimate (30+) overpredicted actual 14, so recluster the
+remaining 78 from the fresh log instead of continuing the same hypothesis.
+DCE, WebView, Inspector profiler, and node:test were stopped statically because
+they require missing multi-stage engines/backends or split across independent
+mechanisms; no stubs were accepted.
+
 ### Sprint wave 1 measured checkpoint (10:55–11:15)
 
 One combined build after three static implementation lanes produced 29 newly
