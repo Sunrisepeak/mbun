@@ -863,6 +863,12 @@ inline constexpr std::string_view kNodeTestRunJS = R"JS(
     };
 
     G.__mbunNodeTestCli = (files, flags) => {
+        // node emits exactly one reporter stream. Under `--test` the reporters
+        // resolved below own the output, so the in-process TAP printer of
+        // :node_test_runner must go quiet — otherwise `--test-isolation=none`
+        // (which runs the test tree in this very process) writes both its TAP
+        // and the selected reporter to stdout.
+        try { internals.setTap(false); } catch (e) {}
         const { opts, reporterNames, destinations } = parseTestFlags(flags || []);
         // Node gates this mode on its optional Amaro dependency. mbun does not
         // expose that Node capability, so do not silently ignore the flag and
