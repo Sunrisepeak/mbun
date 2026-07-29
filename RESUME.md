@@ -120,12 +120,26 @@ obtainable again after a long run of "full runs keep dying":
 1. **`--resume`.** A bare full run dies at session/turn boundaries and leaves
    nothing. With `--resume` the partial results survive and the next invocation
    picks up where it stopped, so the run is no longer all-or-nothing.
-2. **Measure against a FROZEN COPY of the binary, not the live build output.**
-   Copy it out of `target/<arch>/<hash>/bin` first:
+2. **Measure against a FROZEN COPY of the binary, not the live build output —
+   and the copy MUST be named exactly `mbun`, in a directory of its own.**
    ```
-   cp "$(bash tools/integration/build_or_die.sh | tail -1)" target/integration/frozen-bin/mbun-<tag>
-   python3 tools/integration/node_corpus_runner.py --bin target/integration/frozen-bin/mbun-<tag> --jobs 3 --resume --out ...
+   mkdir -p target/integration/frozen-bin/<tag>
+   cp "$(bash tools/integration/build_or_die.sh | tail -1)" target/integration/frozen-bin/<tag>/mbun
+   python3 tools/integration/node_corpus_runner.py --bin target/integration/frozen-bin/<tag>/mbun --jobs 3 --resume --out ...
    ```
+   **Do NOT name it `mbun-<tag>`.** Doing that cost an hour and produced a
+   completely false alarm: 21 corpus files spawn the runtime *by name* — via
+   `spawn(process.argv[0])`, `execFileSync(node, …)` or `common`'s abort helpers —
+   so a renamed binary makes them fail with `spawn mbun ENOENT` and exit code 127,
+   and `test-process-argv-0` fails comparing `'mbun'` to the frozen path. Against
+   the wave-39 baseline that presented as **"21 full-corpus regressions"** in a
+   perfectly ordinary `corpus_diff.py` report, complete with a plausible
+   10-file `test-domain-no-error-handler-abort-on-uncaught-*` cluster. All 21
+   passed immediately when the identical binary was copied to
+   `frozen-bin/<tag>/mbun`. The lesson generalises: **an all-or-nothing regression
+   cluster that includes `test-process-argv-0` or `spawn … ENOENT` is a harness
+   artifact, not a code regression** — check the binary's *filename* before
+   reading anything else.
    `node_corpus_runner.py` deliberately exempts binaries living outside
    `target/<arch>/<hash>/bin` from its staleness refusal, precisely so frozen
    baselines can be old. Without this, integrating a lane rebuilds the tree, the
