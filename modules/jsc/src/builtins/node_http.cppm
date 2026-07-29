@@ -2356,6 +2356,11 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
   }
   const httpsGlobalAgent = new HttpsAgent({ keepAlive: true, keepAliveMsecs: 5000, timeout: 5000, scheduling: "lifo" });
   const httpsExports = makeExports(HttpsAgent, httpsGlobalAgent);
+  httpsExports.createServer = function createServer(options, listener) {
+    const tls = M["tls"] || M["node:tls"];
+    if (tls && typeof tls.createServer === "function") return tls.createServer(options, listener);
+    return new Server(options, listener);
+  };
   httpsExports.request = function (url, options, cb) {
     if (typeof options === "function") { cb = options; options = undefined; }
     const merged = options ? { ...options } : {};
