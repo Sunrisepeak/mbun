@@ -5,6 +5,97 @@ session that is interrupted (usage limit, crash, restart) can pick up from the
 file rather than from memory. **If you are a fresh session reading this, start
 here.**
 
+## 2026-07-29 20:20 — wave 40 first five lanes MEASURED (+4 Node, 0 regressions)
+
+Integrated on `agent/corpus-coverage-w40` (based on `origin/rewrite_bun_in_mcpp`
+at `6dad3b1`, NOT on the old branch — see the PR note below). Build green;
+`check_conflict_markers` and `check_submodule_gitlinks` both clean.
+
+| lane | list | retained | commit |
+| --- | --- | --- | --- |
+| vm | 0→2 /8 | sandbox writes to realm builtins | `b7d4131` |
+| runner | 0→1 /14 | `node:test` tags + `t.plan` validation | `24bc978` |
+| compile | 0→1 /15 | compile-cache disable trace | `4c26987` |
+| repl | 0/12 | reverted — gate fired | — |
+| trace | 0/8 | reverted — gate fired | — |
+
+**Guards, per-file against the wave-39 full run** (not against lane-local
+baselines): `test-vm` 52→54/98, `test-runner` 29→30/77, `test-compile` 1→2/22,
+`test-module` 15→15/32, `test-require` 16→16/23, `test-esm` 0→0/2. **252 files
+checked, +4 gained, 0 lost.**
+
+**A lane's own subtree number is not authority.** The runner lane reported
+27→30 including two files "outside its list"; against the wave-39 baseline those
+two were *already* passing, so its local baseline was stale and the honest figure
+is +1, not +3. Always re-diff a lane's claim against the authoritative full run
+before quoting it.
+
+### What wave 40 bought besides the +4
+
+Two of the three zero-yield lanes returned findings worth more than their files:
+
+1. **A bootstrap JS blob is dead code.** `kNodeProcessExtraJS` in
+   `modules/jsc/src/builtins/node_process_extra.cppm` contains a substantially
+   complete `trace_events` implementation (~lines 936–1110) that never runs:
+   evaluation aborts before ~line 926, silently, so `require('trace_events')`
+   falls back to a no-op stub. Anything defined after the abort point is missing
+   runtime-wide with no error printed — a failure mode that surfaces far away as
+   unrelated corpus failures. A dedicated lane is bisecting it.
+2. **The repl cluster is a module-identity problem, not a REPL bug.** All 12
+   files `require('internal/repl')` under `--expose-internals`; mbun resolves
+   that to node's *real* lib via the `internal/*` tsconfig mapping, which then
+   dies reaching `internal/deps/acorn` (node vendors deps in `deps/`, not
+   `lib/internal/deps/`). Patching that only moves the wall to
+   `internal/vm.js` → missing `ContextifyScript` in the contextify binding.
+   Measured 0/12 after that patch, so it was reverted. mbun already owns a more
+   complete REPL than the signature suggests (`node_repl.cppm`:
+   `createInternalRepl` ~1408, `processTopLevelAwait` ~500); serving
+   `internal/repl` from it bypasses node's lib chain entirely. A lane is on it.
+
+### Selection lesson for wave 41
+
+Single-signature clusters beat subsystem cuts on *triage* cost — every lane
+identified its root cause inside the timebox, versus waves 34–39 where lanes
+burned the box searching. But a shared signature is not always a shared cause:
+the runner cluster's `error: <v>` turned out to be the corpus runner reporting a
+non-zero exit, i.e. an artifact of exit-code bucketing, and its 14 files needed
+13 different features. **Prefer signatures that name a contract** (a thrown
+error type, a missing export) over signatures that only name an outcome.
+
+## 2026-07-29 20:05 — wave 40 dispatched (IN FLIGHT)
+
+Authoritative baseline for this wave: `target/integration/codex-sprint2-wave39-full-node`
+= Node **2821 / 4433 pass (63.64%)**, 951 fail, 89 timeout, 569 skipped, 3 oom.
+Bun authority is unchanged at **93/230 green, 5074 pass / 740 fail**.
+Build verified green at `a25ef13` (`build_or_die: ok — 607a9025567c80a3`).
+
+**Selection change.** Waves 34–39 cut 12-file lists from *already-mined* subsystems
+(tls, http, crypto, fs, net) and yielded 1–6 per 36 files. Wave 40 instead ranks by
+`cluster_finder` and takes the five densest **unmined single-signature clusters** —
+each lane gets one cause, not one subsystem:
+
+| lane | worktree | branch | files | signature |
+| --- | --- | --- | --- | --- |
+| compile | `wt1` | `w40/compile` | 15 | `stderr did not match expectation` (compile-cache API) |
+| repl | `wt2` | `w40/repl` | 12 | `Node.js v26.<v>` — REPL child dies with a fatal trailer |
+| runner | `wt4` | `w40/runner` | 14 | `error: <v>` — `node:test` throws |
+| trace | `wt6` | `w40/trace` | 8 | falsy assertion — `trace_events` largely unimplemented |
+| vm | `wt7` | `w40/vm` | 8 | strict-equal miss in the new JSC sub-context vm |
+
+Worklists: `target/integration/worklists-w40/<lane>.txt`. Each lane has a 25-minute
+timebox, an admission gate of >=2 newly-green at ~8 minutes, mandatory additive
+revert of any zero-yield commit, and a subsystem-subtree guard run before reporting.
+Parallelism is 5 (was 10); builds serialise through `build_lock.sh`.
+
+**Blocker cleared before dispatch: the disk was 100% full (6.1 GB free).**
+`bounded_run.ensure_disk_headroom()` would have refused every measurement, and the
+symptom would have read as a runner bug. Cause was accumulated regenerable `target/`
+build caches inside *stale* worktrees (`.claude/worktrees/wt1..wt5` = 49 GB,
+`.worktrees/codex-wave1-*` = 6 GB); `.claude/worktrees/wt4` alone held 11 GB under
+`modules/jsc/target`. Reclaiming only those caches restored **44 GB free**. Active
+worktrees, the main `target/`, and the shared `~/.mcpp/bmi` were left untouched.
+Use `tools/integration/reclaim_disk.sh` from now on rather than hand-deleting.
+
 ## 2026-07-29 accelerated protocol after wave 30
 
 The user correctly identified repeated full-corpus runs as the integration
