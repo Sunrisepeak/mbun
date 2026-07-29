@@ -333,6 +333,7 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
     try {
       if (proc.env && typeof proc.env === "object" && !proc.env.__mbunEnvProxy) {
         const backing = proc.env;
+        let envNonScalarWarningEmitted = false;
         const invalidDefine = (msg) => {
           const e = new TypeError(msg);
           e.code = "ERR_INVALID_OBJECT_DEFINE_PROPERTY";
@@ -349,6 +350,15 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
             if (PN && typeof PN.setTimeZone === "function") PN.setTimeZone(value);
           } catch (e) {}
         };
+        const warnNonScalarEnvValue = () => {
+          if (envNonScalarWarningEmitted || !Array.isArray(proc.execArgv) ||
+              !proc.execArgv.includes("--pending-deprecation")) return;
+          envNonScalarWarningEmitted = true;
+          proc.emitWarning(
+            "Assigning any value other than a string, number, or boolean to a process.env property is deprecated. " +
+            "Please make sure to convert the value to a string before setting process.env with it.",
+            "DeprecationWarning", "DEP0104");
+        };
         const envProxy = new Proxy(backing, {
           set(target, key, value) {
             if (typeof key === "symbol") throw new TypeError("Cannot convert a Symbol value to a string");
@@ -356,6 +366,8 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
             const k = String(key);
             // node ignores an empty variable name (test-process-env).
             if (k === "") return true;
+            if (typeof value !== "string" && typeof value !== "number" && typeof value !== "boolean")
+              warnNonScalarEnvValue();
             target[k] = String(value);
             if (k === "TZ") applyTZ(target[k]);
             return true;
