@@ -4540,6 +4540,15 @@ inline constexpr char kBootstrapJS_[] = R"JS(
         beforeAll: hook, afterAll: hook, beforeEach: hook, afterEach: hook, setDefaultTimeout: hook }; } });
   }
 
+  // Bun.jest(filename) is bun's programmatic door to the bun:test module (bun
+  // BunObject.zig `jest`), used by jest-compat shims and by `bun -e` snippets
+  // that want expect()/describe() without the runner. Defined outside the
+  // stub guard above so it resolves to the live runner surface under
+  // `bun test` and to the registration-only stub everywhere else.
+  if (G.Bun && typeof G.Bun.jest !== "function") {
+    G.Bun.jest = (_filename) => M["bun:test"];
+  }
+
   // ---- fs (real, via __mbunFsNative) ----
   const F = globalThis.__mbunFsNative;
   // node getPathFromURLPosix / getPathFromURLWin32 (lib/internal/url.js): a

@@ -2889,6 +2889,10 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     const nul = (s, where) => { if (String(s).indexOf("\0") >= 0) { const e = new TypeError('The "' + where + '" argument must be a string without null bytes.'); e.code = "ERR_INVALID_ARG_VALUE"; throw e; } };
     for (let i = 0; i < mapped.length; i++) nul(mapped[i], i === 0 ? "cmd" : "args[" + i + "]");
     if (opts && opts.env && typeof opts.env === "object") for (const k of Object.keys(opts.env)) { nul(k, "env"); const v = opts.env[k]; if (v != null) nul(v, "env"); }
+    // argv0 lands in argv[0] and cwd in chdir(2); both are C strings, so a NUL
+    // silently truncates them. bun rejects them by option name (spawn.zig).
+    if (opts && opts.argv0 != null) nul(opts.argv0, "options.argv0");
+    if (opts && opts.cwd != null) nul(opts.cwd, "options.cwd");
     return { cmd: mapped, opts };
   };
   const runNative = (cmd, opts) =>

@@ -55,7 +55,12 @@ globalThis.__mbun_make_require = function (dir) {
   // dynamic import (ImportKind::Stmt/Dynamic) rather than a literal require() —
   // it only selects the Node error code on failure (ERR_MODULE_NOT_FOUND vs
   // MODULE_NOT_FOUND), not the resolution condition.
-  const req = function (s, o, k) {
+  // Arrow + rest, not `function (s, o, k)`: node/bun both report
+  // `require.length === 1` and bun's require has no `.prototype` at all
+  // (test/js/bun/resolve/require.test.ts pins both). `o`/`k` stay internal
+  // parameters of the lowered-import bridge, so they must not count.
+  const req = (s, ...rest) => {
+    const o = rest[0], k = rest[1];
     const invalid = invalidRequireId(s);
     if (invalid) throw invalid;
     // The C++ bridge receives UTF-8 through a nul-terminated string. Reject
@@ -121,7 +126,8 @@ globalThis.__mbun_make_require_esm = function (dir) {
   // `k` (arg 3): the lowered-import / dynamic-import marker (see __mbun_make_require).
   // A literal require() in an ESM module passes no `k` → ImportKind::Require →
   // MODULE_NOT_FOUND, while a lowered `import` statement passes 1 → ERR_MODULE_NOT_FOUND.
-  const req = function (s, o, k) {
+  const req = (s, ...rest) => {
+    const o = rest[0], k = rest[1];
     return globalThis.__mbun_require_native(s, dir, true,
       (o && typeof o.type === "string") ? o.type : "", k ? 1 : 0);
   };

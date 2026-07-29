@@ -141,7 +141,14 @@ export constexpr std::string_view kBunSocketJS = R"JS(
         let opened = false, settled = false;
         const fireOpen = () => { if (opened) return; opened = true; call(handlers.open, bs); };
         sock.once("connect", () => {
+          // The wrapper is built before the connect completes, so the peer /
+          // local tuple it snapshotted is still empty. Refresh all four here —
+          // bun's client socket reports remoteAddress inside open() (see
+          // test/js/bun/net/tcp-server.test.ts "remoteAddress works").
           bs.remotePort = sock.remotePort;
+          bs.remoteAddress = sock.remoteAddress;
+          bs.localAddress = sock.localAddress;
+          bs.localPort = sock.localPort;
           if (tlsCfg) {
             bs.servername = tlsCfg.servername;
             sock._startTls(tlsCfg);
