@@ -5,6 +5,22 @@ session that is interrupted (usage limit, crash, restart) can pick up from the
 file rather than from memory. **If you are a fresh session reading this, start
 here.**
 
+### Two bun files re-examined and DE-PRIORITISED with reasons (wave 54)
+
+- **`internal/macos-cross-config.test.ts`** (18 pass / 1 fail). Its fix was lost as
+  *collateral* when the bunfig-preload commit was reverted, so it looked like free
+  re-application (as `path-ignore-patterns` genuinely was). It is not: the test
+  parses `PACKED_FEATURES_LIST` out of the **vendored** `compat/bun/src/analytics/lib.rs`
+  and requires `crash_handler.getFeatureData().features` to match it **exactly, in
+  order**. So the "fix" is a hand-copied data table mirroring a Rust macro in
+  read-only vendored source — a permanent sync hazard for one file. If it is ever
+  wanted, **generate** the table from `compat/` at build time; do not hand-copy it.
+- **`cli/bunfig-test-options.test.ts`** and **`config/bunfig/preload.test.ts`** are the
+  same territory as the twice-reverted preload change. Do not re-attempt without a
+  guard that includes the 5 files it broke both times (`only-inside-only`,
+  regressions `14135`/`19875`/`20092`/`5961`) — they are named in the wave-46 and
+  wave-48 entries.
+
 ## 2026-07-30 08:00 — WAVE 53 (solo): test-stream-consumers green, plus a sized queue
 
 **`test-stream` 233 → 234/249**, 0 regressions (also clean on `test-webstream`).
