@@ -1522,8 +1522,24 @@ int run_build_no_bundle(const mbun::cli::BuildFlags& flags,
         const std::string source{buf.str()};
 
         const bool isJsx{absolute.ends_with(".jsx") || absolute.ends_with(".tsx")};
-        auto transpiled{mbun::js_parser::transpile(source,
-                                                   {.cjs = false, .jsx = isJsx, .jsx_options = jsx})};
+        // TS unused-import elision. bun's BUNDLER (and this is the bundler's
+        // transform-only mode, not Bun.Transpiler) turns it on for TypeScript
+        // loaders: bundler/ParseTask.rs:2435-2436
+        //     opts.features.trim_unused_imports =
+        //         loader.is_typescript() || …
+        // It is a CORRECTNESS feature, not a size win — a TS import can be a pure
+        // type reference, and keeping it makes the OUTPUT resolve and evaluate a
+        // module the program never asked for. Leaving it off is what made
+        // `import * as ns from './foo'` (ns unused, ./foo type-only/absent)
+        // survive into out.js and fail at run time with "Cannot find module".
+        // Loader keying matches mbun's runtime loader (module_loader.cppm
+        // trims_unused_imports): .ts/.tsx only — `.jsx` is javascript_like but not
+        // typescript (ast/loader.rs:242-249).
+        const bool isTypeScript{absolute.ends_with(".ts") || absolute.ends_with(".tsx") ||
+                                absolute.ends_with(".mts") || absolute.ends_with(".cts")};
+        auto transpiled{mbun::js_parser::transpile(
+            source, {.cjs = false, .jsx = isJsx, .jsx_options = jsx,
+                     .trim_unused_imports = isTypeScript})};
         if (!transpiled.ok) {
             std::println(std::cerr, "error: {}", transpiled.error);
             return 1;

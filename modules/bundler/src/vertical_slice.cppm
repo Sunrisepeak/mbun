@@ -1007,15 +1007,38 @@ private:
         // builds byte-identical to before.
         const bool is_jsx{path.ends_with(".jsx") || path.ends_with(".tsx")};
 
+        // TS unused-import elision, keyed on the loader exactly as bun's BUNDLER
+        // keys it: ParseTask.rs:2435-2436 sets
+        //     opts.features.trim_unused_imports = loader.is_typescript() || …
+        // and `is_typescript()` is Ts|Tsx only (ast/loader.rs:242-244) — `.jsx` is
+        // javascript_like but NOT typescript, so it is excluded here too. mbun's
+        // RUNTIME loader already does this (module_loader.cppm trims_unused_imports);
+        // the bundler was the one path that did not, and the gap was a hard build
+        // failure rather than dead weight:
+        //     import { U } from "./types2";  const y: U = …;
+        // has one binding, used only in a TYPE position, so the erasure deletes the
+        // use and bun deletes the import. mbun kept the import record, tried to
+        // resolve "./types2" — a file that legitimately need not exist, or exports
+        // only types — and reported `could not resolve "./types2"`. See
+        // js_parser/trim_imports.cppm for the (oracle-measured, never
+        // over-trimming) mechanism.
+        const bool is_ts{path.ends_with(".ts") || path.ends_with(".tsx") ||
+                         path.ends_with(".mts") || path.ends_with(".cts")};
+
         // Edge extraction lexes ESM syntax. The bundler's plain-JS lexer has no
         // JSX grammar (`</div>` scans as a regexp and errors), so for JSX inputs
         // we first lower JSX while KEEPING ESM (cjs=false) and lex that; non-JSX
         // inputs lex the raw source unchanged.
+        //
+        // A trimmed TS module must be lexed in its TRIMMED form, not raw: the token
+        // scan is what produces the import records, so lexing the original text
+        // would re-add the very edge the trim exists to remove.
         std::string lexOwned;
         std::string_view lexSource{jsSource};
-        if (is_jsx) {
+        if (is_jsx || is_ts) {
             auto lowered{mbun::js_parser::transpile(
-                jsSource, {.cjs = false, .jsx = true, .jsx_options = jsxOptions_})};
+                jsSource, {.cjs = false, .jsx = is_jsx, .jsx_options = jsxOptions_,
+                           .trim_unused_imports = is_ts})};
             if (!lowered.ok) {
                 return std::unexpected(
                     BuildError{module.path, std::move(lowered.error), lowered.error_offset});
@@ -1028,7 +1051,8 @@ private:
             return std::unexpected(tokens.error());
         }
         auto transpiled{mbun::js_parser::transpile(
-            jsSource, {.cjs = true, .jsx = is_jsx, .jsx_options = jsxOptions_})};
+            jsSource, {.cjs = true, .jsx = is_jsx, .jsx_options = jsxOptions_,
+                       .trim_unused_imports = is_ts})};
         if (!transpiled.ok) {
             return std::unexpected(BuildError{module.path, std::move(transpiled.error), transpiled.error_offset});
         }
