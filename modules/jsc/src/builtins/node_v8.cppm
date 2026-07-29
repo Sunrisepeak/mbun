@@ -611,6 +611,51 @@ inline constexpr std::string_view kNodeV8JS = R"JS(
   function takeCoverage() { /* no-op */ }
   function stopCoverage() { /* no-op */ }
   function writeHeapSnapshot() { return ""; }
+  const heapProfileTypeError = (name) => {
+    const error = new TypeError('The "' + name + '" argument must be of the correct type');
+    error.code = "ERR_INVALID_ARG_TYPE";
+    return error;
+  };
+  const heapProfileRangeError = (name) => {
+    const error = new RangeError('The value of "' + name + '" is out of range');
+    error.code = "ERR_OUT_OF_RANGE";
+    return error;
+  };
+  let heapProfileActive = false;
+  function startHeapProfile(options) {
+    if (options !== undefined && (options === null || typeof options !== "object")) {
+      throw heapProfileTypeError("options");
+    }
+    const opts = options || {};
+    for (const name of ["sampleInterval", "stackDepth"]) {
+      const value = opts[name];
+      if (value === undefined) continue;
+      if (typeof value !== "number") throw heapProfileTypeError("options." + name);
+      if (!Number.isInteger(value) || value < (name === "sampleInterval" ? 1 : 0)) {
+        throw heapProfileRangeError("options." + name);
+      }
+    }
+    for (const name of ["forceGC", "includeObjectsCollectedByMajorGC", "includeObjectsCollectedByMinorGC"]) {
+      if (opts[name] !== undefined && typeof opts[name] !== "boolean") {
+        throw heapProfileTypeError("options." + name);
+      }
+    }
+    if (heapProfileActive) {
+      const error = new Error("Heap profile has already been started");
+      error.code = "ERR_HEAP_PROFILE_HAVE_BEEN_STARTED";
+      throw error;
+    }
+    heapProfileActive = true;
+    let stopped = false;
+    return {
+      stop() {
+        if (stopped) return undefined;
+        stopped = true;
+        heapProfileActive = false;
+        return JSON.stringify({ nodes: [], startTime: 0, endTime: 0, samples: [] });
+      },
+    };
+  }
   function setHeapSnapshotNearHeapLimit() {}
   function getHeapSnapshot() {
     const Readable = (M["stream"] || M["node:stream"] || {}).Readable;
@@ -636,7 +681,7 @@ inline constexpr std::string_view kNodeV8JS = R"JS(
     DefaultDeserializer, getHeapStatistics, getHeapSpaceStatistics,
     getHeapCodeStatistics, getHeapSnapshot, cachedDataVersionTag,
     setFlagsFromString, takeCoverage, stopCoverage, writeHeapSnapshot,
-    setHeapSnapshotNearHeapLimit, promiseHooks, startupSnapshot, GCProfiler,
+    startHeapProfile, setHeapSnapshotNearHeapLimit, promiseHooks, startupSnapshot, GCProfiler,
   };
   M["v8"] = v8;
   M["node:v8"] = v8;
