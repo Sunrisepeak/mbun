@@ -504,7 +504,14 @@ public:
             pump_event_loop("0");
             return finish_run_(0);
         }
-        std::string script{transform_module_(js)};
+        // The entry is already lowered: js_parser rewrote `import.meta` to
+        // `__mbunImportMeta` at the TOKEN it parsed, and a TLA entry is handled by
+        // the async-IIFE retry below. No text-level pass may run here — the legacy
+        // one (a blind `replace_all_(source, "import.meta", …)` plus an `await`
+        // stripper) had no idea what a string literal was and silently corrupted
+        // any entry that merely *mentioned* `import.meta` in a quoted string
+        // (e.g. a vm.SourceTextModule source), which is why it is gone.
+        std::string script{std::move(js)};
         // Node/bun evaluate the entry in a MODULE scope, never the global one: a
         // top-level `const Buffer = …` there must stay module-local. Evaluated as
         // a plain script it would instead create a *global lexical* binding that
@@ -1181,52 +1188,6 @@ public:
             }
         }
         out += '"';
-        return out;
-    }
-
-    // Transform an ES-module bench script into an equivalent classic script the
-    // JSC C API (JSEvaluateScript) can run: (1) rewrite `import.meta` to the
-    // injected __mbunImportMeta object; (2) drop the `await` operator — every
-    // value the bench awaits (Bun.file().text()) is produced synchronously by our
-    // bindings, so `await x` ≡ `x` here. Byte-identical file on disk across all
-    // three binaries; a faithful transpile (bun transpiles too) that only adds
-    // work to our side. Scripts without `import.meta` are untouched.
-    static std::string transform_module_(const std::string& source) {
-        if (source.find("import.meta") == std::string::npos) return source;
-        std::string s{replace_all_(source, "import.meta", "__mbunImportMeta")};
-        return strip_await_(s);
-    }
-
-    static std::string replace_all_(std::string s, std::string_view from, std::string_view to) {
-        std::size_t pos{0};
-        while ((pos = s.find(from, pos)) != std::string::npos) {
-            s.replace(pos, from.size(), to);
-            pos += to.size();
-        }
-        return s;
-    }
-
-    // Remove the whole-word `await` keyword (operator use only in these scripts).
-    static std::string strip_await_(const std::string& s) {
-        static constexpr std::string_view kw{"await"};
-        std::string out;
-        out.reserve(s.size());
-        std::size_t i{0};
-        auto is_word = [](char c) {
-            return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '$';
-        };
-        while (i < s.size()) {
-            if (s.compare(i, kw.size(), kw) == 0) {
-                bool leftOk{i == 0 || !is_word(s[i - 1])};
-                bool rightOk{i + kw.size() >= s.size() || !is_word(s[i + kw.size()])};
-                if (leftOk && rightOk) {
-                    i += kw.size();
-                    if (i < s.size() && s[i] == ' ') ++i;  // (await x) → (x)
-                    continue;
-                }
-            }
-            out += s[i++];
-        }
         return out;
     }
 
