@@ -370,6 +370,11 @@ inline constexpr char kBootstrapJS_[] = R"JS(
               if (j < len && j !== last) {
                 last = j;
                 while (j < len && !isPathSepW(p.charCodeAt(j))) j++;
+                // `\\?\x` / `\\.\x` keep only the two-char device prefix, so a
+                // root-only device path resolves without a trailing separator
+                // (node >= 24 test-path-resolve). Bun's corpus still expects the
+                // older `\\?\x\` shape — an irreducible cross-corpus conflict,
+                // decided here for node.
                 if (j === len || j !== last) {
                   if (firstPart !== "." && firstPart !== "?") { device = "\\\\" + firstPart + "\\" + p.slice(last, j); rootEnd = j; }
                   else { device = "\\\\" + firstPart; rootEnd = 4; }
@@ -781,7 +786,19 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       let es = seen.get(a);
       if (es) { if (es.has(e)) return true; } else { es = new Set(); seen.set(a, es); }
       es.add(e);
-      if (Array.isArray(e)) { if (!Array.isArray(a)) return false; const used = new Array(a.length).fill(false); for (const ev of e) { let ok = false; for (let j = 0; j < a.length; j++) { if (!used[j] && partial(a[j], ev, seen)) { used[j] = true; ok = true; break; } } if (!ok) return false; } return true; }
+      // The (a, e) memo entry only stands in for a comparison still in flight.
+      // Keeping a failed pair recorded would make a later, identical comparison
+      // short-circuit to "match" (a repeated reference scanned past once must
+      // still be re-compared honestly).
+      const matched = partialInner(a, e, seen);
+      if (!matched) es.delete(e);
+      return matched;
+    };
+    const partialInner = (a, e, seen) => {
+      // Arrays match as an in-order subsequence: every expected element must be
+      // found in `actual` at an index after the previous match, so [4, 2] does
+      // not match [1, 2, 3, 4]. ref node isPartialStrictEqual.
+      if (Array.isArray(e)) { if (!Array.isArray(a)) return false; let i = 0; for (const ev of e) { let ok = false; while (i < a.length) { if (partial(a[i++], ev, seen)) { ok = true; break; } } if (!ok) return false; } return true; }
       if (e instanceof Map) { if (!(a instanceof Map)) return false; for (const [k, v] of e) { if (!a.has(k) || !partial(a.get(k), v, seen)) return false; } return true; }
       if (e instanceof Set) { if (!(a instanceof Set)) return false; for (const v of e) { let ok = false; for (const av of a) if (partial(av, v, seen)) { ok = true; break; } if (!ok) return false; } return true; }
       for (const k of Object.keys(e)) { if (!(k in a) || !partial(a[k], e[k], seen)) return false; }

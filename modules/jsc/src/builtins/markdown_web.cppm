@@ -890,6 +890,11 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       let enc, outLen;
       if (outputEncoding !== undefined && outputEncoding !== null && typeof outputEncoding === "object") {
         const oe = outputEncoding.outputEncoding;
+        // An options object that carries neither knob is not an options object,
+        // it is a bad outputEncoding: bun rejects any non-string third argument,
+        // while node's XOF form only ever passes outputEncoding/outputLength.
+        if (oe === undefined && outputEncoding.outputLength === undefined)
+          throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "outputEncoding" argument must be of type string.' + invalidArgType(outputEncoding));
         if (oe !== undefined && typeof oe !== "string") throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "options.outputEncoding" argument must be of type string.' + invalidArgType(oe));
         enc = oe === undefined ? "hex" : oe;
         if (typeof outputEncoding.outputLength === "number") outLen = outputEncoding.outputLength;

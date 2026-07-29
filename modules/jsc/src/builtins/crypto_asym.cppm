@@ -1260,6 +1260,13 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   // modulus as non-zero (matching node for bad user primes); ordinary probable
   // primes of DH size verify clean (0), so we don't require a safe prime here.
   const dhVerifyError = function () {
+    // node's native getter validates the receiver first: a foreign `this` must
+    // raise ERR_INVALID_THIS rather than read a missing field (or crash).
+    if (this == null || (!(this instanceof DiffieHellman) && !(this instanceof DiffieHellmanGroup))) {
+      const e = new TypeError('Value of "this" must be of type DiffieHellman');
+      e.code = "ERR_INVALID_THIS";
+      throw e;
+    }
     const p = this._p;
     if (p == null) return 0;
     const bits = dhBigToBuf(p).length * 8;
