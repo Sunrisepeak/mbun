@@ -489,8 +489,13 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
   // printing it, and `mbun -i` reported nothing at all for a throw.
   function userUncaughtExceptionListeners() {
     let n = 0;
-    for (const fn of process.listeners("uncaughtException")) {
-      if (fn !== captureHandler) n++;
+    // Indexed loop, not for-of: this runs on every REPL eval error, including the
+    // one raised by user code that just deleted Array.prototype[Symbol.iterator]
+    // (test-repl-unsafe-array-iteration), and a for-of would re-read it here and
+    // replace the user's TypeError with a crash in the error reporter itself.
+    const ls = process.listeners("uncaughtException");
+    for (let i = 0; i < ls.length; i++) {
+      if (ls[i] !== captureHandler) n++;
     }
     return n;
   }
@@ -1260,7 +1265,13 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
         const lines = errStack.split(/(?<=\n)/);
         let matched = false;
         errStack = "";
-        for (const line of lines) {
+        // Indexed loop, not for-of: this is the last step before the error text
+        // reaches the terminal, and it runs for errors raised by code that may
+        // have just deleted Array.prototype[Symbol.iterator]
+        // (test-repl-unsafe-array-iteration). A for-of here would throw inside the
+        // reporter and turn the user's TypeError into a REPL crash.
+        for (let li = 0; li < lines.length; li++) {
+          const line = lines[li];
           if (!matched && /^\[?([A-Z][a-z0-9_]*)*Error/.test(line)) {
             errStack += writer.options.breakLength >= line.length
               ? `Uncaught ${line}` : `Uncaught:\n${line}`;

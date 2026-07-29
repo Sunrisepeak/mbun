@@ -49,8 +49,15 @@ inline constexpr std::string_view kNodeProcessLifecycleJS = R"JS(
   // untriageable by any tool. Both problems are the same renderer.
   const v8Frames = (stack) => {
     const out = [];
-    for (const raw of String(stack).split("\n")) {
-      const line = raw.trim();
+    // Indexed loops here and in sourceContext, never for-of: this renderer runs
+    // while reporting an uncaught exception, and the exception may well have come
+    // from code that deleted Array.prototype[Symbol.iterator]
+    // (test-require-delete-array-iterator). A for-of would throw inside the
+    // reporter, which is what reduced those failures to a bare
+    // "Uncaught exception" with no error text at all.
+    const rawLines = String(stack).split("\n");
+    for (let i = 0; i < rawLines.length; i++) {
+      const line = rawLines[i].trim();
       if (!line) continue;
       // Split at the LAST '@': a function name cannot contain one, but a
       // file:// URL can.
@@ -73,7 +80,8 @@ inline constexpr std::string_view kNodeProcessLifecycleJS = R"JS(
     try {
       const FS = G.__mbunNativeModules && G.__mbunNativeModules["fs"];
       if (!FS || typeof FS.readFileSync !== "function") return "";
-      for (const f of frames) {
+      for (let i = 0; i < frames.length; i++) {
+        const f = frames[i];
         const m = /^ {4}at (?:.* \()?(\/[^()]*?):(\d+):(\d+)\)?$/.exec(f);
         if (!m) continue;
         const text = String(FS.readFileSync(m[1], "utf8"));

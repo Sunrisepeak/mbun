@@ -850,6 +850,7 @@
     const NAME = {}; for (const k of Object.keys(SIGMAP)) NAME[SIGMAP[k]] = k;
     const isSignal = (ev) => typeof ev === "string" && SIGMAP[ev] != null;
     const armed = new Set();
+    const PReflectApply = Reflect.apply;
     const sync = (ev) => {
       if (!isSignal(ev)) return;
       const want = p.listenerCount(ev) > 0;
@@ -860,9 +861,15 @@
                      "off", "removeListener", "removeAllListeners"]) {
       const orig = p[m];
       if (typeof orig !== "function") continue;
-      p[m] = function (ev, ...rest) {
-        const r = orig.call(this, ev, ...rest);
-        if (ev === undefined && m === "removeAllListeners") { for (const s of Array.from(armed)) sync(s); }
+      // Forward through a captured Reflect.apply, never `...rest`: a spread call
+      // re-reads Array.prototype[Symbol.iterator] at call time. This wrapper sits
+      // on EVERY process listener method, so user code that deletes the array
+      // iterator (test-require-delete-array-iterator) would otherwise be unable to
+      // call process.on at all — including the process.on("exit") that the corpus
+      // harness itself installs.
+      p[m] = function (ev) {
+        const r = PReflectApply(orig, this, arguments);
+        if (ev === undefined && m === "removeAllListeners") { const a = Array.from(armed); for (let i = 0; i < a.length; i++) sync(a[i]); }
         else sync(ev);
         return r;
       };

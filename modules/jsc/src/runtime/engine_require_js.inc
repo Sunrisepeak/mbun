@@ -129,7 +129,14 @@ globalThis.__mbun_make_require_esm = function (dir) {
   // resolve/cache/extensions — so only the *load* path changes. require.resolve
   // keeps the "require" condition: it is a CJS API, and import.meta.resolve (the
   // ESM-facing one, built in __mbun_make_import_meta) is the esm-aware resolver.
-  for (const k of Object.keys(base)) { req[k] = base[k]; }
+  // Indexed loop, not `for (const k of ...)`: a for-of over a plain array reads
+  // Array.prototype[Symbol.iterator] at call time, and this runs on every ESM
+  // module load (the native loader calls __mbun_make_require_esm per module). User
+  // code that deletes the array iterator — which the corpus does deliberately, see
+  // test-require-delete-array-iterator / test-repl-unsafe-array-iteration — would
+  // otherwise make every subsequent `import` throw from inside the loader.
+  const keys = Object.keys(base);
+  for (let i = 0; i < keys.length; i++) { req[keys[i]] = base[keys[i]]; }
   return req;
 };
 // Dynamic import(): the transpiler lowers `import(spec)` (cjs mode) to

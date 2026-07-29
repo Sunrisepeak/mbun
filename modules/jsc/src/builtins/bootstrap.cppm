@@ -99,7 +99,14 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       if (p.length === 0) return ".";
       const abs = p.charCodeAt(0) === 47, trail = p.charCodeAt(p.length - 1) === 47;
       const out = [];
-      for (const s of p.split("/")) {
+      // Indexed loop, not `for (const s of ...)`: for-of over the split array
+      // re-reads Array.prototype[Symbol.iterator] at call time. path.normalize is
+      // reached by path.join/resolve and therefore by nearly every module load, so
+      // user code that deletes the array iterator (test-require-delete-array-iterator)
+      // would otherwise break path handling runtime-wide.
+      const segs = p.split("/");
+      for (let si = 0; si < segs.length; si++) {
+        const s = segs[si];
         if (s === "" || s === ".") continue;
         if (s === "..") { if (out.length && out[out.length - 1] !== "..") out.pop(); else if (!abs) out.push(".."); }
         else out.push(s);
@@ -986,7 +993,14 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       const extras = [];
       seen.add(v);
       try {
-        for (const k of PObjectKeys(v)) {
+        // Indexed loop, not `for (const k of ...)`: for-of over a plain array
+        // re-reads Array.prototype[Symbol.iterator] at call time, and this is the
+        // branch that renders an Error — i.e. exactly the path the REPL takes to
+        // report the TypeError raised by code that deleted the array iterator
+        // (test-repl-unsafe-array-iteration).
+        const ownKeys = PObjectKeys(v);
+        for (let ki = 0; ki < ownKeys.length; ki++) {
+          const k = ownKeys[ki];
           if (k === "message" || k === "stack") continue;
           let s;
           try { s = inspectValue(v[k], opts, seen, depth + 1); } catch (e) { continue; }
