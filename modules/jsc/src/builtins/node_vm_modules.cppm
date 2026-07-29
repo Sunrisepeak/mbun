@@ -18,7 +18,8 @@
 // https://tc39.es/ecma262/#sec-moduleevaluation a graph with no async
 // dependency settles its evaluation promise synchronously, and the tests check
 // exactly that (`inspect(mod.evaluate())` must already read `Promise {
-// undefined }`).
+// undefined }`). A module with top-level await is compiled to an async wrapper
+// and its returned promise remains observable to evaluate().
 //
 // The classes are only reachable under --experimental-vm-modules, matched
 // through a lazy accessor because the builtins image is evaluated before
@@ -198,7 +199,7 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
   const META_RE = new RegExp("\\bimport[ \\t\\n]*\\.[ \\t\\n]*meta\\b", "g");
   const DYNIMPORT_RE = new RegExp("\\bimport[ \\t\\n]*\\(", "g");
 
-  function buildWrapper(analysis) {
+  function buildWrapper(analysis, hasTopLevelAwait) {
     const registrations = analysis.exports
       .map((n) => "__e(" + JSON.stringify(n.exported) + ", () => " + n.local + ");")
       .join("\n");
@@ -208,13 +209,7 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
     // ESM->CJS lowering this file may be loaded through.
     body = body.replace(META_RE, "__vm.meta");
     body = body.replace(DYNIMPORT_RE, "__vm.dynamicImport(");
-    // The JSC C API has no module-record evaluator. The reconstructed graph
-    // still records TLA for the Node 26 introspection APIs, but its ordinary
-    // function wrapper cannot parse a bare await expression. Lower statement
-    // position awaits so linking/instantiation and namespace inspection remain
-    // available; real async evaluation stays outside this JS fallback.
-    body = body.replace(/(^|[;\n])(\s*)await\s+/g, "$1$2");
-    return "(function (__vm) {\n" +
+    return "(" + (hasTopLevelAwait ? "async " : "") + "function (__vm) {\n" +
            "const __e = __vm.registerExport;\n" +
            "with (__vm.scope) {\n" +
            registrations + "\n" +
@@ -339,16 +334,7 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
         w.evaluatePromise = Promise.reject(w.error);
         return w.evaluatePromise;
       }
-      try {
-        evaluateModule(this, new Set());
-        w.status = "evaluated";
-        w.evaluatePromise = Promise.resolve(undefined);
-      } catch (e) {
-        w.status = "errored";
-        w.error = e;
-        w.evaluatePromise = Promise.reject(e);
-      }
-      return w.evaluatePromise;
+      return evaluateModule(this, new Set());
     }
   }
 
@@ -405,22 +391,50 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
   }
 
   function evaluateModule(mod, seen) {
-    if (seen.has(mod)) return;
+    if (seen.has(mod)) return mod[kWrap].evaluatePromise || Promise.resolve(undefined);
     seen.add(mod);
     const w = mod[kWrap];
-    if (w.evaluated) return;
+    if (w.evaluatePromise !== undefined) return w.evaluatePromise;
+    if (w.evaluated) return Promise.resolve(undefined);
     w.evaluated = true;
     w.status = "evaluating";
-    for (const dep of mod[kResolved].values()) {
-      evaluateModule(dep, seen);
-      const dw = dep[kWrap];
-      if (dw.status === "errored") throw dw.error;
-      if (dw.status === "evaluating") dw.status = "evaluated";
+    let dependencies;
+    try {
+      dependencies = [...mod[kResolved].values()].map((dep) => evaluateModule(dep, seen));
+    } catch (e) {
+      w.status = "errored";
+      w.error = e;
+      w.evaluatePromise = Promise.reject(e);
+      return w.evaluatePromise;
     }
-    // The result is intentionally not awaited: an async evaluation step of a
-    // SyntheticModule that rejects is unobservable from the outside and has to
-    // reach the isolate-level unhandledRejection handler (SMR Evaluate).
-    w.run();
+    const run = () => w.run();
+    const finish = () => { w.status = "evaluated"; return undefined; };
+    const fail = (e) => { w.status = "errored"; w.error = e; throw e; };
+    // Promise.all([]) settles asynchronously, while Node exposes a settled
+    // promise for a wholly synchronous graph. Keep the fast path synchronous
+    // and only await the graph when a dependency or this wrapper is async.
+    try {
+      const pending = dependencies.some((p) => p && p.__mbunVmAsync === true);
+      if (!pending) {
+        const result = run();
+        if (result && typeof result.then === "function") {
+          w.evaluatePromise = result.then(finish, fail);
+          w.evaluatePromise.__mbunVmAsync = true;
+        } else {
+          finish();
+          w.evaluatePromise = Promise.resolve(undefined);
+        }
+      } else {
+        w.evaluatePromise = Promise.all(dependencies).then(run).then(finish, fail);
+        w.evaluatePromise.__mbunVmAsync = true;
+      }
+    } catch (e) {
+      w.evaluatePromise = Promise.reject(e);
+      w.evaluatePromise.__mbunVmAsync = true;
+      w.status = "errored";
+      w.error = e;
+    }
+    return w.evaluatePromise;
   }
 
   function lookupExport(mod, key, seen) {
@@ -553,7 +567,8 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
       initBase(this, contextObject, options.identifier);
 
       const analysis = analyze(sourceText);
-      this[kWrap].hasTopLevelAwait = hasSourceTopLevelAwait(sourceText);
+      const hasTopLevelAwait = hasSourceTopLevelAwait(sourceText);
+      this[kWrap].hasTopLevelAwait = hasTopLevelAwait;
       const self = this;
       const seenRequests = new Map();
       const addDep = (entry) => {
@@ -641,7 +656,7 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
         },
       };
 
-      const wrapperSource = buildWrapper(analysis);
+      const wrapperSource = buildWrapper(analysis, hasTopLevelAwait);
       const wrapper = contextObject === undefined
         ? NVM.runInThis(wrapperSource, this[kWrap].identifier)
         : internal.runRaw(contextObject, wrapperSource, this[kWrap].identifier);
