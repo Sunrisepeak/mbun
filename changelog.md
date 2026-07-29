@@ -5,6 +5,21 @@
 
 ## 2026-07-29
 
+### 5 小时冲刺全量 checkpoint：Node 2787/4433，Bun 89/230
+
+PR wave26 推送后按统一 runner 完成全量实测：
+
+- Node：**2787 pass / 4433**（62.87%），另 977 fail / 97 timeout /
+  3 OOM / 569 skip；相对发布起点 2654 pass 的净变化为 **+133**，当前
+  non-pass 1646；
+- Bun 当前可执行 discover：**89 green / 230**，另 123 test-failure /
+  1 timeout / 4 blocked-external / 11 all-skipped / 1 no-tests /
+  1 ahead-of-reference；assertion 口径 **4441 pass / 1371 fail**。
+
+局部 wave 按命名因果累计 +147，而全量净变化 +133；两者差 14 说明局部
+守卫不能替代全量去重/回归口径。后续 Bun 调度改按 failed assertions /
+wall-clock：JSON5 205、JSONL 171、WPT Streams 120 为最高收益前三。
+
 ### 5 小时冲刺第二十六批：4 分钟净增 2 文件，30 files/hour
 
 14:44–14:48 组合 IPC UTF-8 framing/backpressure 与 exec maxBuffer chunk

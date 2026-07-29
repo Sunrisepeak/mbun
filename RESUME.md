@@ -56,6 +56,23 @@ BroadcastChannel transport until its reuse count justifies the cost.
 contracts and must not be subtracted. Establish the new baseline at the next
 pushed checkpoint.
 
+### Full checkpoint after wave 26
+
+The pushed wave-26 tree completed both current runner measurements:
+
+- Node: **2787 / 4433 pass (62.87%)**, 977 fail, 97 timeout, 3 OOM, and
+  569 skip. This is +133 against the published 2654-pass starting point, with
+  1646 current non-pass files.
+- Bun executable discovery: **89 / 230 green**, 123 test-failure, 1 timeout,
+  4 blocked-external, 11 all-skipped, 1 no-tests, and 1 ahead-of-reference.
+  Assertion totals are 4441 pass / 1371 fail.
+
+Named causal wave accounting totals +147 while full-corpus net movement is
++133. Treat the 14-file difference as proof that scoped guards are not a
+substitute for full checkpoint de-duplication/regression measurement. For Bun,
+rank by failed assertions per wall-clock rather than files: JSON5 (205),
+JSONL (171), and WPT Streams (120) are the current top three.
+
 ### Sprint wave 1 measured checkpoint (10:55–11:15)
 
 One combined build after three static implementation lanes produced 29 newly
