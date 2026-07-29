@@ -6638,6 +6638,11 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       e.code = "ERR_INVALID_STATE";
       return e;
     }
+    _iterTypeState(message) {
+      const e = new TypeError(message);
+      e.code = "ERR_INVALID_STATE";
+      return e;
+    }
     _iterOptions(args, withSignal) {
       const parsed = require("internal/streams/iter/utils").parsePullArgs(args);
       const o = parsed.options || {};
@@ -6779,7 +6784,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       this._iterLocked = true;
       const writeOne = (value, op) => {
         if (error) return Promise.reject(error);
-        if (closed || closing) return Promise.reject(handle._iterState("The writer is closed"));
+        if (closed || closing) return Promise.reject(handle._iterTypeState("The writer is closed"));
         if (handle._closed || handle._fd < 0) return Promise.reject(handle._iterState("The FileHandle is closed"));
         let bytes, at;
         try { checkSignal(op); bytes = asBytes(value); at = reserve(bytes.byteLength, "write"); }
@@ -6795,7 +6800,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       const writeMany = (values, op) => {
         if (!Array.isArray(values)) return Promise.reject(fsArgTypeErr("chunks", "an instance of Array", values));
         if (error) return Promise.reject(error);
-        if (closed || closing) return Promise.reject(handle._iterState("The writer is closed"));
+        if (closed || closing) return Promise.reject(handle._iterTypeState("The writer is closed"));
         let chunks, at;
         try {
           checkSignal(op); chunks = values.map(asBytes);
@@ -6855,7 +6860,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
         endSync() {
           if (error) return -1;
           if (closed) return total;
-          if (pending.size) return false;
+          if (pending.size) return -1;
           closed = true; handle._iterLocked = false;
           if (autoClose) handle.close();
           return total;
