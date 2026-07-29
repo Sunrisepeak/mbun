@@ -603,7 +603,8 @@ export constexpr std::string_view kDnsJS = R"JS(
   cbLookupService[promisifyCustom] = promiseLookupService;
 
   const promiseResolve = (hostname, rrtype) => {
-    const t = (rrtype == null ? "A" : String(rrtype));
+    if (rrtype !== undefined) validateString(rrtype, "rrtype");
+    const t = (rrtype === undefined ? "A" : rrtype);
     if (t === "A") return promiseAddresses(hostname, 4, "queryA");
     if (t === "AAAA") return promiseAddresses(hostname, 6, "queryAaaa");
     if (RECORD_TYPES.indexOf(t) === -1)
@@ -831,7 +832,8 @@ export constexpr std::string_view kDnsJS = R"JS(
     proto.resolve4 = adapt(function (hostname, options) { return addresses(this, hostname, 4, "queryA", options); }, "name");
     proto.resolve6 = adapt(function (hostname, options) { return addresses(this, hostname, 6, "queryAaaa", options); }, "name");
     proto.resolve = adapt(function (hostname, rrtype) {
-      const t = (rrtype == null ? "A" : String(rrtype));
+      if (rrtype !== undefined) validateString(rrtype, "rrtype");
+      const t = (rrtype === undefined ? "A" : rrtype);
       if (t === "A") return addresses(this, hostname, 4, "queryA");
       if (t === "AAAA") return addresses(this, hostname, 6, "queryAaaa");
       if (RECORD_TYPES.indexOf(t) === -1)

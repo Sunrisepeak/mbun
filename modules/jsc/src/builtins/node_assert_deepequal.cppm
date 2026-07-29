@@ -379,6 +379,11 @@ inline constexpr std::string_view kNodeAssertDeepEqualJS = R"JS(
         this.expected = options.expected;
         this.operator = options.operator;
         this.generatedMessage = !!options.generatedMessage;
+        // JSC's Error stack omits the error name/message prefix. Node exposes
+        // it, and assert's matcher treats `stack` as an ordinary observable
+        // property (for example `/Failed/` on assert.fail()).
+        if (typeof this.stack === "string" && !this.stack.includes(String(this.message)))
+          this.stack = this.name + " [" + this.code + "]: " + this.message + "\n" + this.stack;
       }
     }
     assertMod.AssertionError = AssertionError;
