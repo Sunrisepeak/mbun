@@ -1551,6 +1551,13 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
     }
   };
   function setRequestSocket(agent, request, socket) {
+    // net.connect() completes on a microtask in this runtime, whereas node
+    // gives ClientRequest's next-tick socket setup a chance to run first.
+    // Keep the transport in its connecting state for that one setup turn: a
+    // request timeout registered before the socket event must install only
+    // after the transport's eventual 'connect', not overwrite the Agent's
+    // initial timeout while the request is being attached.
+    if (socket && socket.connecting) socket._httpClientConnectPending = true;
     request.onSocket(socket);
     const agentTimeout = agent.options.timeout || 0;
     if (request.timeout === undefined || request.timeout === agentTimeout) return;

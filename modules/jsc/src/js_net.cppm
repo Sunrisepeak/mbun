@@ -51,6 +51,23 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
   const def = (names, mod) => { for (const n of names) { M[n] = mod; M["node:" + n] = mod; } };
   const EE = (M["events"] && M["events"].EventEmitter) || class { on() { return this; } once() { return this; } off() { return this; } emit() { return false; } };
   const te = new G.TextEncoder(), td = new G.TextDecoder();
+  // `internal/timers` owns the private kTimeout symbol. It is only available
+  // when the internal module is loaded, so discover it lazily rather than
+  // making ordinary net.Socket construction depend on an internal require.
+  const timeoutSymbol = () => {
+    try {
+      const timers = typeof G.require === "function" ? G.require("internal/timers") : null;
+      return timers && typeof timers.kTimeout === "symbol" ? timers.kTimeout : null;
+    } catch (e) { return null; }
+  };
+  const syncTimeoutShape = (socket) => {
+    const key = timeoutSymbol();
+    if (key === null) return;
+    if (!Object.prototype.hasOwnProperty.call(socket, key)) {
+      Object.defineProperty(socket, key, { value: null, writable: true, configurable: true });
+    }
+    socket[key] = socket._timeoutTimer || null;
+  };
 
   if (typeof Promise.withResolvers !== "function") {
     Promise.withResolvers = function () { let resolve, reject; const promise = new Promise((res, rej) => { resolve = res; reject = rej; }); return { promise, resolve, reject }; };
@@ -390,6 +407,10 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       this._fd = -1; this._wq = []; this._wqLen = 0; this._needDrain = false;
       this._shutW = false; this._shutSent = false; this._eof = false; this._closeEmitted = false;
       this._paused = false; this._enc = null; this._everRead = false;
+      // internal/timers consumers observe an unarmed socket through kTimeout
+      // before the transport emits 'connect'. Keep that slot present (null)
+      // whenever the internal module is available.
+      syncTimeoutShape(this);
       // node net.js Socket: `this[kHandle] = null` until connect()/adoption, and
       // the three deferred socket options it caches until a handle exists.
       // `_hadHandle` is this runtime's marker for "there WAS a handle" so that
@@ -675,7 +696,16 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
           catch (e) { self.connecting = false; const err = connectError(e, addr, port); G.queueMicrotask(() => { if (self.destroyed) return; self.emit("error", err); self.destroy(); }); return self; }
           self._adopt(fd2); self.remotePort = port; _adoptLocal(self, fd2);
           self.connecting = true;
-          G.queueMicrotask(() => { if (self.destroyed) { self.connecting = false; return; } self.connecting = false; self._flushPreConnect(null); self._applyDeferredSockOpts(); self.emit("connect"); self.emit("ready"); });
+          const finishConnect = () => {
+            if (self._httpClientConnectPending) {
+              self._httpClientConnectPending = false;
+              G.queueMicrotask(finishConnect);
+              return;
+            }
+            if (self.destroyed) { self.connecting = false; return; }
+            self.connecting = false; self._flushPreConnect(null); self._applyDeferredSockOpts(); self.emit("connect"); self.emit("ready");
+          };
+          G.queueMicrotask(finishConnect);
           return self;
         };
         const hf = _famOf(host);
@@ -727,7 +757,16 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       // connect() already completed synchronously. A destroy() in between must
       // cancel the pending 'connect' rather than resurrect the socket.
       this.connecting = true;
-      G.queueMicrotask(() => { if (this.destroyed) { this.connecting = false; return; } this.connecting = false; this._flushPreConnect(null); this._applyDeferredSockOpts(); this.emit("connect"); this.emit("ready"); });
+      const finishConnect = () => {
+        if (this._httpClientConnectPending) {
+          this._httpClientConnectPending = false;
+          G.queueMicrotask(finishConnect);
+          return;
+        }
+        if (this.destroyed) { this.connecting = false; return; }
+        this.connecting = false; this._flushPreConnect(null); this._applyDeferredSockOpts(); this.emit("connect"); this.emit("ready");
+      };
+      G.queueMicrotask(finishConnect);
       return this;
     }
     // node net.js afterConnect: the options cached by the Socket constructor
@@ -779,6 +818,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       // (0/undefined once cleared), which tls.connect({ timeout }) then reports.
       this.timeout = ms === 0 ? undefined : ms;
       this._armTimeout();
+      syncTimeoutShape(this);
       return this;
     }
     _armTimeout() {
