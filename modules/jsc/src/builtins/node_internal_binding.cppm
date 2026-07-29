@@ -2042,6 +2042,9 @@ inline constexpr std::string_view kNodeInternalBindingJS = R"JS(
     P.kLenientOptionalCRBeforeLF = 1 << 8;
     P.kLenientSpacesAfterChunkSize = 1 << 9;
     P.kLenientAll = (1 << 10) - 1;
+    // Lets _http_common distinguish this fallback binding from a test's
+    // explicit HTTPParser replacement without comparing constructor names.
+    P.__mbunHttpParserBinding = true;
     return strictNs("http_parser", {
       HTTPParser: P,
       methods: [
