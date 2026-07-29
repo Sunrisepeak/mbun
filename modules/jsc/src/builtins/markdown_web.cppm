@@ -588,6 +588,59 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       e.code = "ERR_CRYPTO_OPERATION_FAILED";
       throw e;
     };
+    const kMaxRandomSize = 0x7fffffff;
+    const checkedRandomSize = (size) => {
+      if (typeof size !== "number") {
+        throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "size" argument must be of type number.' + invalidArgType(size));
+      }
+      if (!Number.isFinite(size) || size < 0 || size > kMaxRandomSize) {
+        throw mkErr(RangeError, "ERR_OUT_OF_RANGE", 'The value of "size" is out of range. It must be >= 0 && <= ' + kMaxRandomSize + '. Received ' + size);
+      }
+      return Math.floor(size);
+    };
+    const checkedRandomCallback = (cb) => {
+      if (cb !== undefined && typeof cb !== "function") {
+        throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "callback" argument must be of type function.' + invalidArgType(cb));
+      }
+    };
+    const randomBytes = (size, cb) => {
+      const n = checkedRandomSize(size);
+      checkedRandomCallback(cb);
+      const out = rb(n);
+      if (cb) { deferCb(() => cb(null, out)); return; }
+      return out;
+    };
+    const isRandomFillBuffer = (value) => value instanceof ArrayBuffer ||
+      (typeof SharedArrayBuffer !== "undefined" && value instanceof SharedArrayBuffer) ||
+      ArrayBuffer.isView(value);
+    const randomFillView = (buf, offset, size) => {
+      if (!isRandomFillBuffer(buf)) {
+        throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "buf" argument must be an instance of ArrayBuffer, SharedArrayBuffer, Buffer, TypedArray, or DataView.' + invalidArgType(buf));
+      }
+      const view = buf instanceof Uint8Array ? buf : (ArrayBuffer.isView(buf) ? new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength) : new Uint8Array(buf));
+      const elem = (ArrayBuffer.isView(buf) && buf.BYTES_PER_ELEMENT) ? buf.BYTES_PER_ELEMENT : 1;
+      const total = view.length;
+      if (offset === undefined) offset = 0;
+      if (typeof offset !== "number") {
+        throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "offset" argument must be of type number.' + invalidArgType(offset));
+      }
+      if (!Number.isFinite(offset) || offset < 0 || offset * elem > total) {
+        throw mkErr(RangeError, "ERR_OUT_OF_RANGE", 'The value of "offset" is out of range. It must be >= 0 && <= ' + (total / elem) + '. Received ' + offset);
+      }
+      if (size === undefined) size = total / elem - offset;
+      if (typeof size !== "number") {
+        throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "size" argument must be of type number.' + invalidArgType(size));
+      }
+      if (!Number.isFinite(size) || size < 0 || size > kMaxRandomSize) {
+        throw mkErr(RangeError, "ERR_OUT_OF_RANGE", 'The value of "size" is out of range. It must be >= 0 && <= ' + kMaxRandomSize + '. Received ' + size);
+      }
+      const off = Math.floor(offset) * elem;
+      const len = Math.floor(size) * elem;
+      if (off + len > total) {
+        throw mkErr(RangeError, "ERR_OUT_OF_RANGE", 'The value of "size + offset" is out of range. It must be <= ' + total + '. Received ' + (off + len));
+      }
+      return { view, off, len };
+    };
     // JS digest fallbacks (only reached if the native backend is absent).
     // Real digests (SHA-256/SHA-1/MD5) implemented in JS (verified vs known vectors).
     const pad64 = (msg, lenLE) => {
@@ -953,35 +1006,18 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       },
       // crypto.randomBytes(size[, cb]) — sync return, or async when a callback is
       // given (node passes null as the error on success).
-      randomBytes: (n, cb) => {
-        if (typeof cb === "function") { const b = rb(n); deferCb(() => cb(null, b)); return; }
-        return rb(n);
-      },
+      randomBytes,
       // crypto.pseudoRandomBytes / prng / rng — node's deprecated aliases, all
       // three literally randomBytes (lib/crypto.js `getRandomBytesAlias`).
       // Still exported, and still called by the corpus (test-domain-crypto).
-      pseudoRandomBytes: (n, cb) => {
-        if (typeof cb === "function") { const b = rb(n); deferCb(() => cb(null, b)); return; }
-        return rb(n);
-      },
-      prng: (n, cb) => {
-        if (typeof cb === "function") { const b = rb(n); deferCb(() => cb(null, b)); return; }
-        return rb(n);
-      },
-      rng: (n, cb) => {
-        if (typeof cb === "function") { const b = rb(n); deferCb(() => cb(null, b)); return; }
-        return rb(n);
-      },
+      pseudoRandomBytes: randomBytes,
+      prng: randomBytes,
+      rng: randomBytes,
       randomFillSync: (buf, offset, size) => {
         // node scales offset/size by BYTES_PER_ELEMENT for TypedArrays (1 for
         // DataView / ArrayBuffer). Bounds are validated against the byte length so
         // an out-of-range offset+size never writes past the allocation.
-        const view = buf instanceof Uint8Array ? buf : (ArrayBuffer.isView(buf) ? new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength) : new Uint8Array(buf));
-        const elem = (ArrayBuffer.isView(buf) && buf.BYTES_PER_ELEMENT) ? buf.BYTES_PER_ELEMENT : 1;
-        const total = view.length;
-        const off = (offset || 0) * elem;
-        const len = size == null ? total - off : size * elem;
-        if (off < 0 || len < 0 || off + len > total) throw mkErr(RangeError, "ERR_OUT_OF_RANGE", 'The value of "size + offset" is out of range. It must be <= ' + total + '. Received ' + (off + len));
+        const { view, off, len } = randomFillView(buf, offset, size);
         // Write directly into `view` at [off, off+len): fill a fresh zero-offset
         // buffer (native randomFillSync ignores a view's byteOffset) then copy
         // element-wise. A subarray view can't be used here — it copies rather than
@@ -1102,8 +1138,9 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
         else if (typeof size === "function") { cb = size; size = undefined; }
         // Validation (element-scaled bounds) happens synchronously — a bad
         // offset/size throws before the callback is scheduled, matching node.
-        nodeCrypto.randomFillSync(buf, offset || 0, size);
-        if (cb) deferCb(() => cb(null, buf));
+        checkedRandomCallback(cb);
+        nodeCrypto.randomFillSync(buf, offset, size);
+        deferCb(() => cb(null, buf));
         return buf;
       },
       // crypto.checkPrimeSync(candidate[, options]) / checkPrime(...): probabilistic
