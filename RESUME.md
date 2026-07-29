@@ -10,6 +10,44 @@ hourly loop survives a usage limit — it simply skips the fires that land durin
 the block and resumes within an hour — but it does NOT survive the session
 ending. This file is what makes that recoverable.
 
+## 2026-07-29 continuation checkpoint
+
+This section supersedes the older state snapshot below.
+
+- **Integration branch**: `agent/corpus-coverage-continuation`, based on
+  `rewrite_bun_in_mcpp` at `5a901d7` through merge checkpoint `e79cc27`.
+- **Current published baseline**: node `2,654 / 4,433` pass and bun
+  `868 / 1,902` green, from the same target-branch build recorded by PR #32.
+- **PR**: pending the first real post-#32 delta; do not reopen or reuse merged
+  PR #25.
+
+The first three-way reuse probe tested local round-10 branches for node's
+`--test` CLI, HTTP/2 argument/timer validation, and verbatim Node error text.
+All three candidate cherry-picks became empty on the current target tree.
+Fresh targeted measurements confirmed that the named historical acceptance
+sets were already absorbed:
+
+- `test-runner-*`: current `28 pass / 43 fail / 3 skipped / 3 timeout` (77
+  files), already beyond the candidate's historical `26 / 77`;
+- the HTTP/2 candidate's eight named files: `8 / 8` pass;
+- the error-text candidate's four named files: `4 / 4` pass.
+
+**Dispatch correction:** branch ancestry and `git cherry` are not sufficient
+evidence that an old agent result is still missing. The target branch may have
+absorbed the same semantics through a differently shaped later commit. Before
+allocating a build slot to historical work, require both:
+
+1. a reverse-apply/static absorption check against the current tree; and
+2. a fresh run of the candidate's named acceptance files.
+
+If both show absorption, skip the candidate before building. The first probe
+returned `0` new files from three tasks, so historical-branch reuse is no longer
+the active allocation strategy. The active three-way batch is drawn directly
+from current failures with named causes: one `test-runner` CLI output mismatch,
+four fs one-offs, and six HTTP/2 error-code mapping files. Agents run only their
+named files; integration owns the build, cross-subsystem guard, checkpoint,
+push, and PR update.
+
 ## State
 
 - **Integration branch**: `r9/integration`, pushed to origin. PR **32** targets `rewrite_bun_in_mcpp`.
