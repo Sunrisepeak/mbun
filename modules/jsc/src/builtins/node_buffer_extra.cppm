@@ -1195,10 +1195,25 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
       throw errFromArgType(value);
     };
 
+    let bufferConstructorWarningShown = false;
+    const warnBufferConstructor = () => {
+      if (bufferConstructorWarningShown) return;
+      const process = G.process;
+      const argv = process && process.execArgv;
+      if (!Array.isArray(argv) || !argv.includes("--pending-deprecation")) return;
+      bufferConstructorWarningShown = true;
+      if (typeof process.emitWarning === "function") {
+        process.emitWarning(
+          "Buffer() is deprecated due to security and usability issues. Please use the Buffer.alloc(), Buffer.allocUnsafe(), or Buffer.from() methods instead.",
+          "DeprecationWarning", "DEP0005");
+      }
+    };
+
     // Thin callable wrapper sharing OrigBuffer.prototype so the deprecated
     // `new Buffer(str, enc)` / `new Buffer(ab, offset, length)` forms take the
     // same paths as Buffer.from.
     const BufferW = function Buffer(value, encodingOrOffset, length) {
+      warnBufferConstructor();
       // node: Buffer(number) / new Buffer(number) === Buffer.alloc(number)
       // (zero-filled, size-validated) since the unsafe-by-default era ended. A
       // string 2nd arg alongside a numeric size is rejected (test-buffer-new).
