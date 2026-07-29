@@ -260,6 +260,24 @@ skips. The 21-file `test-console-*` guard is 16 pass, 4 retained failures, and
 1 timeout. Both have zero frozen-gate regressions; all three crypto targets
 pass.
 
+### Sprint wave 13 measured checkpoint (12:58–13:09)
+
+DNS, assert, and stream async-context packages forecast eight files and
+delivered **+5 in 11 minutes = 27.3 files/hour**:
+
+- Resolver server/channel state: estimated 3, actual 2. Integration added
+  rrtype validation, but `test-dns.js` then reached an independent lookup
+  options error-code mismatch and remains uncounted.
+- assert fail/ifError/async: estimated 3, actual 2. Adding the missing
+  AssertionError stack name/message prefix closed fail; async remains at a
+  separate generatedMessage contract.
+- stream finished AsyncResource/ALS binding: estimated 2, actual 1. The other
+  file observes a separate exposed-internal async-context identity.
+
+Guards: 13 assert files are 5 pass, 7 retained failures, 1 OOM; 28 DNS files
+are 17 pass, 7 retained failures, 4 timeouts; the four stream-finished files
+are 2 pass and 2 retained failures. All three groups have zero regressions.
+
 The first three-way reuse probe tested local round-10 branches for node's
 `--test` CLI, HTTP/2 argument/timer validation, and verbatim Node error text.
 All three candidate cherry-picks became empty on the current target tree.
