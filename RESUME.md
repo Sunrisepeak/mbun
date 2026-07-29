@@ -5,6 +5,62 @@ session that is interrupted (usage limit, crash, restart) can pick up from the
 file rather than from memory. **If you are a fresh session reading this, start
 here.**
 
+## 2026-07-30 09:30 — WAVE 54: `Buffer.toString('utf8')` was silently eating BOMs
+
+**`test-stream` 234 → 236/249**, and the more important find is nowhere near streams.
+
+### A silent data-corruption bug in a very hot path
+
+`rawUtf8Slice` (`node_buffer_extra.cppm:271`) decoded through
+`new TextDecoder("utf-8")`, and the WHATWG default **strips a leading U+FEFF**. So
+`Buffer.prototype.toString('utf8')` — and therefore
+`fs.readFileSync(file, 'utf8')` — silently dropped byte-order marks. Fixed with
+`{ ignoreBOM: true }` through a lazily-created singleton decoder.
+
+Verified: `Buffer.from([0xEF,0xBB,0xBF,0x68,0x69]).toString('utf8')` now keeps the
+BOM. Guarded over **1,409 node files** (`stream`/`buffer`/`fs`/`http`/`webstream`)
+and 38 green bun buffer/encoding/fs files: **+15 gains, 0 regressions** on the node
+side, 38/38 still green on bun.
+
+This is the same class as the earlier typed-array `byteOffset` bridge bug: a
+platform default quietly differing from node's, in a path nothing thinks to test
+directly.
+
+### `Readable.prototype.pause`/`resume` on a destroyed stream
+
+`r.destroy(); r.resume(); r.pause()` emitted `'pause'` synchronously and scheduled a
+`'resume'`. Node 26 (nodejs/node#62557) makes both no-ops once destroyed. Landed with
+`resume` guarded on `kDestroyed && state.length === 0` — **deliberately narrower than
+node's**, mirroring why bun narrowed it (`internal/streams/readable.ts:1136-1146`):
+fd-slicer-style readables set `destroyed` immediately before `push(null)`, and a full
+guard strands the buffered tail.
+
+### Two stream failures are NOT stream bugs
+
+- **`test-stream-iter-readable-interop.js` needs Buffer POOLING.** `bytes(...)` must
+  resolve to a plain `Uint8Array`, but making `concatBytes`
+  (`node_stream_iter_core.cppm:371`) reject Uint8Array *subclasses* in its
+  single-chunk fast path greened it **and regressed
+  `test-stream-iter-transform-sync.js`**, which deep-equals a `bytesSync()` result
+  *against a Buffer*. Both pass on node only because `Buffer.from(str)` there is
+  **pool-backed**, so a small Buffer never covers its whole ArrayBuffer and takes
+  node's copy path, while zlib's exact-size output does. Unfixable inside the
+  consumer. The lane reverted and left the reasoning as a code comment.
+  **Worth sizing on its own:** pooling is why our `Buffer.from(str)` differs from
+  node's in *every* identity/prototype-sensitive assertion, so siblings of this
+  failure are likely elsewhere in both corpora.
+- **`test-stream-writable-samecb-singletick.js` needs async_hooks `TickObject`
+  instrumentation** — `createHook({init})` must fire exactly once with
+  `type === 'TickObject'` across 100 `console.log`s; we emit 0 because
+  `process.nextTick` has no async_hooks resource. The "exactly 1" arity makes it
+  fragile even once instrumented.
+
+### Cheapest untouched stream file
+`test-stream-readable-compose.js` — one `Error: boom` escaping compose's error path,
+whole-file failure at :111. `finished`/`finished-async-local-storage` and
+`readable-async-iterators` all fail **late** in long files (20+ subtests pass first)
+and are poor value per minute.
+
 ### Two bun files re-examined and DE-PRIORITISED with reasons (wave 54)
 
 - **`internal/macos-cross-config.test.ts`** (18 pass / 1 fail). Its fix was lost as
