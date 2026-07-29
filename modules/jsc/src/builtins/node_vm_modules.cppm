@@ -106,7 +106,45 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
   const EXPORT_DEFAULT_RE = /(^|[\n;])([ \t]*)export[ \t\n]+default[ \t\n]+/g;
   const EXPORT_DECL_RE = /(^|[\n;])([ \t]*)export[ \t\n]+(?=(?:const|let|var|function|class|async)\b)/g;
   const EXPORT_DECL_NAME_RE =
-    /(^|[\n;])[ \t]*export[ \t\n]+(?:async[ \t\n]+)?(?:const|let|var|function|class)[ \t\n]*\*?[ \t\n]*([\w$]+)/g;
+    /(^|[\n;])[ \t]*export[ \t\n]+(?:async[ \t\n]+)?(const|let|var|function|class)[ \t\n]*\*?[ \t\n]*([\w$]+)/g;
+
+  // `export const a = 1, b = 2;` declares two exports. The regex above only sees
+  // the first declarator, so walk the rest of the declaration list by hand:
+  // top-level commas separate declarators, and the statement ends at a `;` or at
+  // a newline that is not a continuation of a trailing comma.
+  function trailingDeclaratorNames(source, from) {
+    const names = [];
+    let depth = 0;
+    let last = "";
+    let i = from;
+    while (i < source.length) {
+      const c = source.charAt(i);
+      if (c === "'" || c === '"' || c === "`") {
+        ++i;
+        while (i < source.length) {
+          if (source.charAt(i) === "\\") { i += 2; continue; }
+          if (source.charAt(i) === c) { ++i; break; }
+          ++i;
+        }
+        last = "s";
+        continue;
+      }
+      if (c === "(" || c === "[" || c === "{") { ++depth; last = c; ++i; continue; }
+      if (c === ")" || c === "]" || c === "}") { --depth; last = c; ++i; continue; }
+      if (depth === 0 && c === ";") break;
+      if (c === "\n") { if (last !== ",") break; ++i; continue; }
+      if (c === " " || c === "\t" || c === "\r") { ++i; continue; }
+      if (depth === 0 && c === ",") {
+        ++i;
+        const m = /^[ \t\n]*([\w$]+)/.exec(source.slice(i));
+        if (m) { names.push(m[1]); i += m[0].length; last = "n"; } else { last = ","; }
+        continue;
+      }
+      last = c;
+      ++i;
+    }
+    return names;
+  }
 
   function parseAttributes(text) {
     const attributes = { __proto__: null };
@@ -141,7 +179,14 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
     const declNames = [];
     let dm;
     EXPORT_DECL_NAME_RE.lastIndex = 0;
-    while ((dm = EXPORT_DECL_NAME_RE.exec(source)) !== null) declNames.push(dm[2]);
+    while ((dm = EXPORT_DECL_NAME_RE.exec(source)) !== null) {
+      declNames.push(dm[3]);
+      if (dm[2] === "const" || dm[2] === "let" || dm[2] === "var") {
+        for (const extra of trailingDeclaratorNames(source, EXPORT_DECL_NAME_RE.lastIndex)) {
+          declNames.push(extra);
+        }
+      }
+    }
 
     body = body.replace(EXPORT_FROM_RE, (all, lead, what, starAs, clause, q, spec, attrText) => {
       const attributes = parseAttributes(attrText);
@@ -326,6 +371,13 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
           throw ERR("ERR_VM_MODULE_STATUS", Error,
                     "Module status must be one of linked, evaluated, or errored");
         }
+        // Re-entrant evaluate(): the module is running its own body right now,
+        // so no evaluation promise exists yet to hand back. (An already-started
+        // top-level-await module has one and returns it below.)
+        if (w.status === "evaluating" && w.evaluatePromise === undefined) {
+          throw ERR("ERR_VM_MODULE_STATUS", Error,
+                    "Module status must be one of linked, evaluated, or errored");
+        }
       } catch (e) {
         return Promise.reject(e);
       }
@@ -338,9 +390,15 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
     }
   }
 
+  // node resolves every request of one module before descending into any of
+  // them: the linker is called for the whole request list of the referrer first,
+  // and only then recursively for each resolved dependency. A depth-first walk
+  // interleaves the two and reports the requests in the wrong order (and can ask
+  // for the same shared dependency twice).
   async function linkModule(mod, linker, seen) {
     if (seen.has(mod)) return;
     seen.add(mod);
+    const resolvedDeps = [];
     for (const dep of mod[kDeps]) {
       const extra = { attributes: dep.attributes, assert: dep.attributes };
       const result = await linker(dep.specifier, mod, extra);
@@ -349,6 +407,9 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
                   "Provided module is not an instance of Module");
       }
       mod[kResolved].set(dep, result);
+      resolvedDeps.push(result);
+    }
+    for (const result of resolvedDeps) {
       const rw = result[kWrap];
       if (rw.status === "unlinked") {
         rw.status = "linking";
@@ -417,7 +478,16 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
       const pending = dependencies.some((p) => p && p.__mbunVmAsync === true);
       if (!pending) {
         const result = run();
-        if (result && typeof result.then === "function") {
+        // https://tc39.es/ecma262/#sec-smr-Evaluate: a synthetic module's
+        // evaluation steps settle its promise *immediately* — either resolved
+        // with undefined or rejected with a synchronous throw. Anything the
+        // callback returns, including a promise that later rejects, is not
+        // observable through evaluate(); a rejection surfaces as an unhandled
+        // rejection instead.
+        if (w.synthetic === true) {
+          finish();
+          w.evaluatePromise = Promise.resolve(undefined);
+        } else if (result && typeof result.then === "function") {
           w.evaluatePromise = result.then(finish, fail);
           w.evaluatePromise.__mbunVmAsync = true;
         } else {
@@ -467,7 +537,16 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
   }
 
   function makeNamespace(mod) {
-    return new Proxy({ __proto__: null }, {
+    // A real module namespace carries `Symbol.toStringTag: 'Module'` as a
+    // non-configurable OWN property, and `Reflect.ownKeys` reports it after the
+    // exported names. Define it on the proxy target so the ownKeys /
+    // getOwnPropertyDescriptor traps can report it without breaking the
+    // non-configurability invariant.
+    const target = { __proto__: null };
+    Object.defineProperty(target, Symbol.toStringTag, {
+      value: "Module", writable: false, enumerable: false, configurable: false,
+    });
+    return new Proxy(target, {
       get(t, key) {
         if (key === Symbol.toStringTag) return "Module";
         const getter = lookupExport(mod, key, new Set());
@@ -477,8 +556,15 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
         if (key === Symbol.toStringTag) return true;
         return lookupExport(mod, key, new Set()) !== undefined;
       },
-      ownKeys() { return exportNamesOf(mod, new Set()); },
+      ownKeys() {
+        const keys = exportNamesOf(mod, new Set());
+        keys.push(Symbol.toStringTag);
+        return keys;
+      },
       getOwnPropertyDescriptor(t, key) {
+        if (key === Symbol.toStringTag) {
+          return { value: "Module", writable: false, enumerable: false, configurable: false };
+        }
         const getter = lookupExport(mod, key, new Set());
         if (getter === undefined) return undefined;
         return { value: getter(), writable: true, enumerable: true, configurable: true };
@@ -533,6 +619,7 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
       evaluatePromise: undefined,
       dependencyList: undefined,
       requestsLinked: false,
+      synthetic: false,
       hasTopLevelAwait: false,
       run: () => undefined,
     };
@@ -630,6 +717,9 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
       }
       let metaReady = initMeta === undefined;
       const importCb = options.importModuleDynamically;
+      if (importCb !== undefined && typeof importCb !== "function") {
+        throw invArgType("options.importModuleDynamically", "of type function", importCb, "property");
+      }
       const bridge = {
         scope,
         // node runs initializeImportMeta when the module record is
@@ -647,12 +737,17 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
                       "A dynamic import callback was not specified.");
           }
           const result = await importCb(specifier, self, attrs);
-          if (!isModule(result)) {
-            throw ERR("ERR_VM_MODULE_NOT_MODULE", TypeError,
-                      "Provided module is not an instance of Module");
+          if (isModule(result)) {
+            if (result[kWrap].status !== "evaluated") await result.evaluate();
+            return result[kNamespace];
           }
-          if (result[kWrap].status !== "evaluated") await result.evaluate();
-          return result[kNamespace];
+          // node also accepts an already-evaluated module namespace object.
+          if (result !== null && typeof result === "object" &&
+              result[Symbol.toStringTag] === "Module") {
+            return result;
+          }
+          throw ERR("ERR_VM_MODULE_NOT_MODULE", TypeError,
+                    "Provided module is not an instance of Module");
         },
       };
 
@@ -716,6 +811,7 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
       }
       Object.defineProperty(this, kValues, { value: values, enumerable: false });
       this[kWrap].status = "linked";
+      this[kWrap].synthetic = true;
       const self = this;
       this[kWrap].run = () => evaluateCallback.call(undefined, self);
     }
