@@ -708,9 +708,17 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
       e.code = "ERR_INVALID_ARG_VALUE"; throw e;
     }
   };
+  const validateKeyPairOptions = (options) => {
+    if (options === null || typeof options !== "object" || Array.isArray(options)) {
+      const e = new TypeError('The "options" argument must be of type object. Received ' +
+        (options === null ? "null" : Array.isArray(options) ? "an instance of Array" : "type " + typeof options));
+      e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+    }
+    return options;
+  };
   const genKeyPair = (type, options) => {
     validateKeyPairType(type);
-    options = options || {};
+    options = validateKeyPairOptions(options);
     const penc = options.publicKeyEncoding || {};
     const senc = options.privateKeyEncoding || {};
     const wantPubObj = !options.publicKeyEncoding;
@@ -763,9 +771,13 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   };
   C.generateKeyPairSync = (type, options) => genKeyPair(type, options);
   C.generateKeyPair = (type, options, callback) => {
-    const cb = typeof options === "function" ? options : callback;
-    const opts = typeof options === "function" ? undefined : options;
+    const cb = callback;
     validateKeyPairType(type);   // synchronous type validation (node throws before async work)
+    const opts = validateKeyPairOptions(options);
+    if (typeof cb !== "function") {
+      const e = new TypeError('The "callback" argument must be of type function.');
+      e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+    }
     queueMicrotask(() => {
       try { const { publicKey, privateKey } = genKeyPair(type, opts); cb(null, publicKey, privateKey); }
       catch (e) { cb(e); }
