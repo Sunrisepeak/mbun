@@ -2568,9 +2568,25 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     const entries = params._e;
     if (entries.length === 0) return "URLSearchParams {}";
     const inner = indent + "  ";
-    let body = "";
+    // bun renders the .toJSON() projection, so repeated names collapse into one
+    // key whose value is the array of every value under that name (single
+    // occurrence stays a bare string). ref bun test/js/web/html/URLSearchParams
+    // "should support .toJSON". Insertion order follows first occurrence.
+    const order = [];
+    const grouped = new Map();
     for (const [key, value] of entries) {
-      body += inner + JSON.stringify("" + key) + ": " + JSON.stringify("" + value) + ",\n";
+      const k = "" + key;
+      const bucket = grouped.get(k);
+      if (bucket === undefined) { order.push(k); grouped.set(k, ["" + value]); }
+      else bucket.push("" + value);
+    }
+    let body = "";
+    for (const key of order) {
+      const values = grouped.get(key);
+      const rendered = values.length === 1
+        ? JSON.stringify(values[0])
+        : "[ " + values.map((v) => JSON.stringify(v)).join(", ") + " ]";
+      body += inner + JSON.stringify(key) + ": " + rendered + ",\n";
     }
     return "URLSearchParams {\n" + body + indent + "}";
   };

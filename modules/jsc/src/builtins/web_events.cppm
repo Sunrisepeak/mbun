@@ -199,6 +199,7 @@ inline constexpr std::string_view kWebEventsJS = R"JS(
     {
       const reg = new Map(); // name -> Set<channel>
       const HANDLER = new WeakMap();
+      const ERRHANDLER = new WeakMap();
       class BroadcastChannel extends G.EventTarget {
         constructor(name) {
           if (arguments.length === 0) throw new TypeError("BroadcastChannel constructor requires a name argument");
@@ -214,6 +215,33 @@ inline constexpr std::string_view kWebEventsJS = R"JS(
           if (prev) this.removeEventListener("message", prev);
           if (typeof f === "function") { HANDLER.set(this, f); this.addEventListener("message", f); }
           else HANDLER.delete(this);
+        }
+        // WHATWG HTML §9.4 declares onmessageerror alongside onmessage; an
+        // unset event handler IDL attribute reads back as null, never undefined.
+        get onmessageerror() { return ERRHANDLER.get(this) || null; }
+        set onmessageerror(f) {
+          const prev = ERRHANDLER.get(this);
+          if (prev) this.removeEventListener("messageerror", prev);
+          if (typeof f === "function") { ERRHANDLER.set(this, f); this.addEventListener("messageerror", f); }
+          else ERRHANDLER.delete(this);
+        }
+        // node lib/internal/worker/io.js BroadcastChannel[inspect.custom] and
+        // bun both print the {name, active} projection through the caller's own
+        // inspect options (so breakLength/compact are honoured), not the private
+        // _name/_closed slots. ref node test-broadcastchannel-custom-inspect.
+        [Symbol.for("nodejs.util.inspect.custom")](depth, options) {
+          if (depth < 0) return this;
+          const opts = Object.assign({}, options, {
+            depth: options && options.depth == null ? null : (options.depth - 1),
+          });
+          let inspect = null;
+          try {
+            const M = G.__mbunNativeModules;
+            const util = M && (M["util"] || M["node:util"]);
+            if (util && typeof util.inspect === "function") inspect = util.inspect;
+          } catch (_) { inspect = null; }
+          const projection = { name: this._name, active: !this._closed };
+          return "BroadcastChannel " + (inspect ? inspect(projection, opts) : "{ name: '" + this._name + "', active: " + !this._closed + " }");
         }
         postMessage(msg) {
           if (this._closed) throw new (G.DOMException || Error)("BroadcastChannel is closed", "InvalidStateError");
