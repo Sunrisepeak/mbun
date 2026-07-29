@@ -5,6 +5,138 @@ session that is interrupted (usage limit, crash, restart) can pick up from the
 file rather than from memory. **If you are a fresh session reading this, start
 here.**
 
+## 2026-07-30 13:20 — GUARDRAIL BREACH: `mcpp test --workspace` had been failing for waves
+
+**Add `mcpp test --workspace` to the wave gate. It was not in it, and it caught a
+security regression that every corpus guard missed.**
+
+`mcpp test --workspace` reported **4 of 98 members failed** — and had been for an
+unknown number of waves, because the corpus runners were the only gate anyone was
+watching. Note the trap that hid it: running it as
+`build_lock.sh mcpp test --workspace 2>&1 | tail -25` **exits 0**, because the pipe
+takes `tail`'s status. Check the summary line, not `$?`.
+
+`modules/jsc`'s failure was real and was **this branch's own doing**. The
+`test_webcrypto` `__webcryptoMetadataAttack` case asserts that CryptoKey metadata
+is immutable and unforgeable. Probed conjunct by conjunct:
+
+```
+algName      "AES-GCM"   <- should be HMAC     usagesLen  2      <- should be 1
+hashName     "SHA-1"     <- should be SHA-256  frozenAlg  false  <- should be true
+```
+
+The `algorithm`/`usages` getters hand out a per-key copy cached in a WeakMap for
+identity stability, and the copies were **mutable** — so because they are cached,
+`key.algorithm.name = 'AES-GCM'` stuck for the lifetime of the key. Native usages
+stayed authoritative (signing with a verify-only key still threw
+`InvalidAccessError`), so it was never an auth bypass, but any caller branching on
+`key.algorithm.name` or `key.usages` could be lied to.
+
+An in-code comment claimed the mutability was **deliberate** ("user code may mutate
+it"). It was wrong, and it had been silently contradicting the project's own
+security unit test. Identity stability and immutability are not in tension: freeze
+the cached copy and both hold. Fixed; `modules/jsc` 26/27 → **27/27**, and node
+`test-webcrypto` 33/50 + `test-crypto` 101/129 with `corpus_diff` REGRESSIONS
+empty on both, which proves nothing depended on the mutability.
+
+**Lesson worth more than the fix: a plausible-sounding code comment is not
+evidence.** This one asserted a design decision that no test supported and one
+test actively refuted. Three members still fail (`modules/css_derive`,
+`modules/ini`, `modules/js` — the last is `test_js_transpile` golden drift on
+namespace-import default interop); they are NOT yet proven pre-existing.
+
+## 2026-07-30 13:10 — WAVE 56 lane C: worker_threads +8 (goal +6), 0 regressions
+
+Integrated as `1eba106`. Integrator-verified: `test-worker` **92 → 101 / 143**
+(9 gains vs the wave-39 baseline), `test-async` and `test-process` unchanged,
+REGRESSIONS empty on all three (`w56c-vfy-*`).
+
+Two findings that generalise beyond worker:
+
+- **A seventh umbrella cluster dissolved.** `syntax-error`, `esm-missing-main` and
+  `error-stack-getter-throws` presented *identically* (`Mismatched function calls.
+  Expected exactly 1, actual 0` plus the child's error on stderr) and were three
+  unrelated defects: a transpile failure `return 1`s out of `engine.inc` before
+  `eval_void` so nothing stashes `__mbun_entry_error`; a non-existent entry is
+  rejected in `app.cppm` *before any JS context exists*, so there is nothing to
+  report from; and `reportFatal` built the entire error frame under **one** `try`,
+  so a throwing `.stack` accessor discarded the whole report.
+- **`Worker#postMessage` ignored its `transferList` entirely.** A port sent after
+  construction arrived as a bare wire token with no `postMessage`, so the worker
+  never answered and the parent hung — a dead-on-arrival message, NOT a teardown
+  hang. The stand-in mechanism already existed for the *constructor's* transfer
+  list; the index space was per-call instead of per-worker. And "one file, one
+  blocker" failed again: with that fixed, delivery re-ran `postMessage`'s
+  transfer-list validation on an already-serialised inbound frame, so a decoded
+  port stand-in was "needs transfer but not listed" → `DataCloneError` *in the
+  receiver*.
+
+My brief's "the 9 timeouts likely share one cause / a hang means teardown never
+fires" was **wrong** — `hang_dump.js` was never needed, and 5 of the 9 are v8
+profiling (`cpu-profile`, `heap-profile`, `heap-snapshot`, `heapdump-failure`,
+`nearheaplimit-deadlock`), genuinely unsupported.
+
+**Best remaining worker lane, sized: SharedArrayBuffer is not actually shared —
+5 files.** An mbun worker is a **child process, not a thread**, so this needs
+shm-backed `SharedArrayBuffer` with the wire carrying a mapping handle, i.e.
+JSC-level external-backing-store work. Densest cluster left on that board.
+Rejected with numbers: stack-overflow message text (JSC's trailing period is
+asserted by **6 bun sites**, four as inline snapshots — normalising trades bun
+greens); `ERR_WORKER_INVALID_EXEC_ARGV` (needs node's option table, and **7
+currently-green worker files pass execArgv** — every one a candidate regression
+from a too-tight allowlist); `internal/test/binding` (2 files).
+
+## 2026-07-30 12:40 — WAVE 56 lane E: `Bundle Failed` DISSOLVED, two real defects behind it
+
+The brief said "22 files, one cluster". Wrong, and instructively so: a **generic
+wrapper message is the worst possible clustering key.** The lane widened the set
+to the 49 files that carry the string and found **286 diagnostics across 29
+distinct causes.** Integrated as `df58199`: **+1 green bun file, +23 passing
+tests, 0 regressions**, integrator-verified at 75/75 green on every green
+`bundler/`+`transpiler/` file plus the stack-sensitive slice (`w56e-vfy`).
+
+**The decisive number: only 5 of the 49 files have `Bundle Failed` as their ONLY
+failure.** So the entire theoretical ceiling for "fix the bundler wrapper" is +5
+files, and each of those 5 needs a large capability (splitting ×2, compile+HTML
+×2, byte-exact `__esm`/`__promiseAll` linker snapshot ×1). That is why this vein
+is retired rather than continued.
+
+Two real defects, both found by probing rather than reading:
+
+- **TS unused-import elision was OFF in the bundler.** `trim_imports.cppm` already
+  documents that bun enables `trim_unused_imports` for TS loaders in the bundler,
+  and mbun's *runtime* loader already did it — the bundler was the one path that
+  did not, so a type-only import became `could not resolve "./types2"`. Fixed in
+  `modules/bundler/src/vertical_slice.cppm` + `src/app.cppm`. Trap worth keeping:
+  **the lex source must be the trimmed text too**, or the token scan re-adds the
+  very edge the trim exists to remove.
+- **`Bun.build` with >1 entrypoint wrote NOTHING to `outdir`** — the write was
+  gated on `entryPaths.size() == 1` — and merged unrelated entries into one graph,
+  which is why a CSS entry point listed *alongside* JS entries died with "a CSS
+  import from a JS module is outside this bundler slice" when no JS module
+  imported any CSS. `modules/jsc/src/runtime/bun_build.inc`. `compile` keeps the
+  single-bundle path.
+
+Retired with numbers (do not re-schedule): code splitting (13 diagnostics,
+multi-day: needs multi-chunk emit + shared-chunk extraction in a bundler that
+emits exactly one chunk per entry); the HTML loader (`bundler_html.test.ts` is the
+largest single-file prize at 22 tests, all bundler-caused — but 2 of the 22 need
+splitting, so it cannot go green without it; est. 600–1000 lines as a pair);
+async-module linking (33 diagnostics, **27 are entry-module TLA only**, but a
+cheap entry-only version flips **0** green files because every file it touches has
+large non-TLA failure counts); `bundler_barrel.test.ts` (28 diagnostics — **not a
+bug**: those test files contain *deliberate* syntax errors that barrel
+tree-shaking is supposed to keep from ever being parsed).
+
+**DECLINED, and why it stays declined:** accepting `--minify-syntax` as a silent
+no-op is +1 green file for ~5 lines. It reverses a deliberate "fail loudly rather
+than silently ignore what the user asked for" decision at `src/app.cppm:1683`, and
+buying a corpus file by ignoring a user's flag is gaming, not engineering.
+**But the lane surfaced a real defect inside that finding: mbun's `Bun.build` API
+path already ignores the minify flags entirely while the CLI rejects them — the
+two surfaces disagree today.** Fixing that inconsistency is legitimate work; doing
+it by making the CLI lie is not.
+
 ## 2026-07-30 12:10 — WAVE 56 lane D: bun `bake/dev` sized and RETIRED (0 files, kept anyway)
 
 **Do not schedule the 18 `test/bake/dev` files again.** Lane D's lead was right
