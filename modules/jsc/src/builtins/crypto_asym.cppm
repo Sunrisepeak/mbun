@@ -587,7 +587,7 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   // (has a "-----BEGIN" header) keeps the native/passphrase error; binary DER that
   // starts with a SEQUENCE tag (0x30) is a decode failure; anything else has no
   // PEM start line.
-  const asymParseError = (ko, nativeErr) => {
+  const asymParseError = (ko, nativeErr, wantPublic) => {
     // A failure the native layer already classified (missing passphrase / an
     // OpenSSL error) keeps that classification whatever the container looked like.
     const classified = keyErr(nativeErr);
@@ -596,7 +596,22 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     const isStr = typeof slot.material === "string";
     const bytes = toBuf(slot.material);
     const head = isStr ? slot.material.slice(0, 64) : Buffer.from(bytes.slice(0, 64)).toString("latin1");
-    if (head.includes("-----BEGIN")) return keyErr(nativeErr); // surface native parse/passphrase error
+    if (head.includes("-----BEGIN")) {
+      const surfaced = keyErr(nativeErr);
+      // A well-formed PEM container the loader still could not turn into a pkey
+      // (unknown algorithm OID — ML-DSA/ML-KEM/SLH-DSA on an OpenSSL < 3.5 — or a
+      // corrupt body) reaches here with a bare mbun message and no .code. node
+      // reports the two OpenSSL failures its own loaders hit for that input:
+      // createPublicKey goes through PEM_read_bio_PUBKEY (EVP "decode error"),
+      // createPrivateKey through OSSL_DECODER ("unsupported"). Keep the original
+      // message and only attach the surface node exposes.
+      if (surfaced && surfaced.code === undefined) {
+        surfaced.code = wantPublic ? "ERR_OSSL_EVP_DECODE_ERROR" : "ERR_OSSL_UNSUPPORTED";
+        surfaced.reason = wantPublic ? "decode error" : "unsupported";
+        surfaced.library = wantPublic ? "digital envelope routines" : "DECODER routines";
+      }
+      return surfaced;
+    }
     if (!isStr && bytes.length > 0 && bytes[0] === 0x30) {
       const e = new Error("error:06000066:public key routines:OPENSSL_internal:DECODE_ERROR");
       e.code = "ERR_OSSL_UNSUPPORTED"; return e;
@@ -621,7 +636,7 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
       const slot = koOf(ko);
       info = AN.keyType(slot.material, slot.passphrase, false);
     } catch (e) {
-      throw asymParseError(ko, e);
+      throw asymParseError(ko, e, false);
     }
     // The loader is intent-agnostic: it will parse public-only material (e.g. a
     // PKCS#1 RSAPublicKey) as a pkey. node rejects that with a decode error.
@@ -660,7 +675,7 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
           ? slot.material.slice(0, 64)
           : Buffer.from(toBuf(slot.material).slice(0, 64)).toString("latin1");
         if (head.includes("-----BEGIN CERTIFICATE")) return ko;
-        throw asymParseError(ko, ePub);
+        throw asymParseError(ko, ePub, true);
       }
     }
     return ko;
@@ -800,8 +815,11 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     const opts = typeof options === "function" ? undefined : options;
     validateKeyPairType(type);   // synchronous type validation (node throws before async work)
     queueMicrotask(() => {
-      try { const { publicKey, privateKey } = genKeyPair(type, opts); cb(null, publicKey, privateKey); }
-      catch (e) { cb(e); }
+      // Guard only the generation: a `throw` from inside cb() must escape to the
+      // uncaught handler, never come back as a second cb(e) call.
+      let pair;
+      try { pair = genKeyPair(type, opts); } catch (e) { cb(e); return; }
+      cb(null, pair.publicKey, pair.privateKey);
     });
   };
   C.generateKeyPair[Symbol.for("nodejs.util.promisify.custom")] =

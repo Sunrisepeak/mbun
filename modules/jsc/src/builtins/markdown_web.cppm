@@ -783,7 +783,7 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
     Object.setPrototypeOf(Hash.prototype, Transform.prototype);
     Object.setPrototypeOf(Hash, Transform);
     const joinChunks = function (chunks) { let t = 0; for (const c of chunks) t += c.length; const m = new Uint8Array(t); let o = 0; for (const c of chunks) { m.set(c, o); o += c.length; } return m; };
-    Hash.prototype.update = function (data, enc) { if (this._done) throw new Error("Digest already called"); if (typeof data !== "string" && !ArrayBuffer.isView(data) && !(data instanceof ArrayBuffer)) throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "data" argument must be of type string or an instance of Buffer, TypedArray, or DataView.' + invalidArgType(data)); this._chunks.push(toBytes(data, enc)); return this; };
+    Hash.prototype.update = function (data, enc) { if (this._done) throw mkErr(Error, "ERR_CRYPTO_HASH_FINALIZED", "Digest already called"); if (typeof data !== "string" && !ArrayBuffer.isView(data) && !(data instanceof ArrayBuffer)) throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "data" argument must be of type string or an instance of Buffer, TypedArray, or DataView.' + invalidArgType(data)); this._chunks.push(toBytes(data, enc)); return this; };
     // node's native hash keeps the finalized digest around: the stream path
     // finalizes through the handle (bypassing the JS "already called" guard), and
     // user code may still call digest() afterwards and must get the same bytes
@@ -806,7 +806,7 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       return this._digestBytes;
     };
     Hash.prototype.digest = function (enc) {
-      if (this._done) throw new Error("Digest already called");
+      if (this._done) throw mkErr(Error, "ERR_CRYPTO_HASH_FINALIZED", "Digest already called");
       this._done = true;
       return encode(this._rawDigest(), enc);
     };
@@ -816,7 +816,7 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
     Hash.prototype._flush = function (cb) { this.push(encode(this._rawDigest())); cb(); };
     // node's Hash#copy clones the EVP context, which is gone once digest() ran:
     // copying a finalized hash throws, exactly like update() does.
-    Hash.prototype.copy = function () { if (this._done) throw new Error("Digest already called"); const h = new Hash(this._algo, { outputLength: this._out }); h._chunks = this._chunks.slice(); return h; };
+    Hash.prototype.copy = function () { if (this._done) throw mkErr(Error, "ERR_CRYPTO_HASH_FINALIZED", "Digest already called"); const h = new Hash(this._algo, { outputLength: this._out }); h._chunks = this._chunks.slice(); return h; };
     // node exposes the native context under a `kHandle` symbol whose methods must
     // reject a bad `this` with ERR_INVALID_THIS (rather than dereferencing a null
     // native pointer). We mirror that contract with a guarded handle object.
@@ -840,7 +840,7 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
     }
     Object.setPrototypeOf(Hmac.prototype, Transform.prototype);
     Object.setPrototypeOf(Hmac, Transform);
-    Hmac.prototype.update = function (data, enc) { if (this._done) throw new Error("Digest already called"); this._chunks.push(toBytes(data, enc)); return this; };
+    Hmac.prototype.update = function (data, enc) { if (this._done) throw mkErr(Error, "ERR_CRYPTO_HASH_FINALIZED", "Digest already called"); this._chunks.push(toBytes(data, enc)); return this; };
     Hmac.prototype.digest = function (enc) {
       if (this._done) return encode(new Uint8Array(0), enc);   // node resets ctx: re-digest yields empty
       this._done = true; const m = joinChunks(this._chunks);
@@ -869,7 +869,7 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       if (typeof G.__mbunIsCryptoKey === "function" && G.__mbunIsCryptoKey(key)) return true;
       return false;
     };
-    function createHmac(algo, key, opts) { if (typeof algo !== "string") throw new TypeError('The "hmac" argument must be of type string. Received ' + (algo === null ? "null" : typeof algo)); if (!supported(algo)) throw new Error("Invalid digest: " + algo); if (!validHmacKey(key)) throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "key" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, DataView, KeyObject, or CryptoKey. Received ' + invalidArgTypeRecv(key)); return new Hmac(algo, key, opts); }
+    function createHmac(algo, key, opts) { if (typeof algo !== "string") throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "hmac" argument must be of type string. Received ' + (algo === null ? "null" : typeof algo)); if (!supported(algo)) throw new Error("Invalid digest: " + algo); if (!validHmacKey(key)) throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "key" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, DataView, KeyObject, or CryptoKey. Received ' + invalidArgTypeRecv(key)); return new Hmac(algo, key, opts); }
     // node-style error helpers (message + .code, matching node:crypto).
     const mkErr = (Ctor, code, msg) => { const e = new Ctor(msg); e.code = code; return e; };
     const invalidArgType = (input) => {
@@ -924,7 +924,7 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       // node requires an explicit string digest (no sha1 default): a missing digest
       // is ERR_INVALID_ARG_TYPE, an unknown one ERR_CRYPTO_INVALID_DIGEST.
       if (typeof digest !== "string") throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "digest" argument must be of type string.' + invalidArgType(digest));
-      if (!supported(digest)) throw mkErr(Error, "ERR_CRYPTO_INVALID_DIGEST", "Invalid digest: " + digest);
+      if (!supported(digest)) throw mkErr(TypeError, "ERR_CRYPTO_INVALID_DIGEST", "Invalid digest: " + digest);
     };
     // hkdf/hkdfSync shared parameter validation (node lib/internal/crypto/hkdf.js).
     // Order (matches node): digest type → ikm type → salt type → info type →
@@ -939,7 +939,7 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       if (toBytes(info).length > 1024) throw mkErr(RangeError, "ERR_OUT_OF_RANGE", 'The value of "info" is out of range. It must be <= 1024 bytes. Received ' + toBytes(info).length);
       if (typeof keylen !== "number") throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "length" argument must be of type number.' + invalidArgType(keylen));
       if (!Number.isInteger(keylen) || keylen < 0 || keylen > 2147483647) throw mkErr(RangeError, "ERR_OUT_OF_RANGE", 'The value of "length" is out of range. It must be >= 0 && <= 2147483647. Received ' + keylen);
-      if (!supported(digest)) throw mkErr(Error, "ERR_CRYPTO_INVALID_DIGEST", "Invalid digest: " + digest);
+      if (!supported(digest)) throw mkErr(TypeError, "ERR_CRYPTO_INVALID_DIGEST", "Invalid digest: " + digest);
     };
     const deferCb = (fn) => { (typeof queueMicrotask === "function" ? queueMicrotask : (f) => Promise.resolve().then(f))(fn); };
     // KeyObject instances (real class so instanceof + structured clone work).
@@ -1123,7 +1123,15 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
         validatePbkdf2Input(password, salt);
         validatePbkdf2(iterations, keylen, dg);   // synchronous throw on invalid params (incl. missing digest)
         if (typeof fn !== "function") throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "callback" argument must be of type function.' + invalidArgType(fn));
-        deferCb(() => { try { const r = nodeCrypto.pbkdf2Sync(password, salt, iterations, keylen, dg); fn(null, r); } catch (e) { fn(e); } });
+        // Only the derivation is guarded: a `throw` from INSIDE fn() must escape
+        // to the uncaught handler (node/domain semantics), not be caught here and
+        // reported back through a SECOND fn(e) call.
+        deferCb(() => {
+          let r;
+          try { r = nodeCrypto.pbkdf2Sync(password, salt, iterations, keylen, dg); }
+          catch (e) { fn(e); return; }
+          fn(null, r);
+        });
       },
       hash: cryptoHash,
       getCurves: () => ["prime256v1", "secp256k1", "secp384r1", "secp521r1"],
