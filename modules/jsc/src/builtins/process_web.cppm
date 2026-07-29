@@ -1213,32 +1213,35 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
                        rightMiddle: "┤", left: "│ ", right: " │", middle: " │ " };
   // Display width, not code-unit length: a CJK/emoji cell occupies two columns.
   const tableCellWidth = (s) => (G.Bun && typeof G.Bun.stringWidth === "function" ? G.Bun.stringWidth(String(s)) : String(s).length);
-  const renderTableRow = (row, widths) => {
+  const renderTableRow = (row, widths, measure = row) => {
     let out = tableChars.left;
     for (let i = 0; i < row.length; i++) {
       const cell = row[i];
-      out += cell + " ".repeat(Math.max(0, widths[i] - tableCellWidth(cell)));
+      out += cell + " ".repeat(Math.max(0, widths[i] - tableCellWidth(measure[i])));
       if (i !== row.length - 1) out += tableChars.middle;
     }
     return out + tableChars.right;
   };
-  const renderTable = (head, columns) => {
-    const widths = head.map(tableCellWidth);
+  const renderTable = (head, columns, formatCell) => {
+    const format = (value, row, column) => formatCell ? formatCell(value, row, column) : { text: value, width: value };
+    const renderedHead = head.map((value, column) => format(value, -1, column));
+    const widths = renderedHead.map((cell) => tableCellWidth(cell.width));
     const longest = columns.length === 0 ? 0 : Math.max(...columns.map((a) => a.length));
     const rows = new Array(longest);
     for (let i = 0; i < head.length; i++) {
       const column = columns[i];
       for (let j = 0; j < longest; j++) {
         if (rows[j] === undefined) rows[j] = [];
-        const value = (rows[j][i] = Object.prototype.hasOwnProperty.call(column, j) ? column[j] : "");
-        widths[i] = Math.max(widths[i] || 0, tableCellWidth(value));
+        const value = Object.prototype.hasOwnProperty.call(column, j) ? column[j] : "";
+        const cell = (rows[j][i] = format(value, j, i));
+        widths[i] = Math.max(widths[i] || 0, tableCellWidth(cell.width));
       }
     }
     const divider = widths.map((w) => tableChars.middleMiddle.repeat(w + 2));
     let result = tableChars.topLeft + divider.join(tableChars.topMiddle) + tableChars.topRight + "\n" +
-                 renderTableRow(head, widths) + "\n" +
+                 renderTableRow(renderedHead.map((cell) => cell.text), widths, renderedHead.map((cell) => cell.width)) + "\n" +
                  tableChars.leftMiddle + divider.join(tableChars.rowMiddle) + tableChars.rightMiddle + "\n";
-    for (const row of rows) result += renderTableRow(row, widths) + "\n";
+    for (const row of rows) result += renderTableRow(row.map((cell) => cell.text), widths, row.map((cell) => cell.width)) + "\n";
     return result + tableChars.bottomLeft + divider.join(tableChars.bottomMiddle) + tableChars.bottomRight;
   };
   // `logFn` is the console's own log (stream routing + formatting stay the
@@ -1305,6 +1308,67 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     keys.unshift(indexKey);
     values.unshift(indexKeyArray);
     return final(keys, values);
+  };
+  // Bun.inspect.table returns the grid instead of logging it. Its table model is
+  // deliberately Bun-specific: row headers are blank, Map keys are unquoted,
+  // and ANSI styling must not participate in display-width calculations.
+  const inspectTableImpl = (tabularData, properties, options) => {
+    let props = properties;
+    let opts = options;
+    if (!Array.isArray(props)) { opts = props; props = undefined; }
+    opts = opts && typeof opts === "object" ? opts : {};
+    if (tabularData == null || (typeof tabularData !== "object" && typeof tabularData !== "function")) return "";
+    const colored = opts.colors === true;
+    const cell = (value) => {
+      if (value instanceof RegExp) return { inspectCell: true, text: "", color: false };
+      if (typeof value === "string") return { inspectCell: true, text: value, color: false };
+      if (typeof value === "number") return { inspectCell: true, text: String(value), color: true };
+      if (typeof value === "boolean" || value == null || typeof value === "bigint") return { inspectCell: true, text: String(value), color: true };
+      try { return { inspectCell: true, text: Bun.inspect(value, { colors: false, compact: true }), color: false }; }
+      catch (_) { return { inspectCell: true, text: "", color: false }; }
+    };
+    const render = (head, columns) => renderTable(head, columns, (value, row) => {
+      if (row === -1) {
+        const text = String(value);
+        return { text: colored ? "\x1b[0m\x1b[1m" + text + "\x1b[0m" : text, width: text };
+      }
+      if (value && value.inspectCell) {
+        const text = value.text;
+        return { text: colored && value.color ? "\x1b[0m\x1b[33m" + text + "\x1b[0m" : text, width: text };
+      }
+      const text = String(value);
+      return { text, width: text };
+    }) + "\n";
+    if (tabularData instanceof Map) {
+      const index = [], keys = [], values = [];
+      let i = 0;
+      for (const [key, value] of tabularData) { index.push(String(i++)); keys.push(cell(key)); values.push(cell(value)); }
+      return render(["", "Key", "Values"], [index, keys, values]);
+    }
+    if (tabularData instanceof Set) {
+      const index = [], values = [];
+      let i = 0;
+      for (const value of tabularData) { index.push(String(i++)); values.push(cell(value)); }
+      return render(["", "Values"], [index, values]);
+    }
+    if (typeof tabularData === "function") return render(["", "Values"], [["0"], [cell(tabularData)]]);
+    const indexes = Object.keys(tabularData);
+    const items = indexes.map((key) => tabularData[key]);
+    const primitive = (value) => value === null || (typeof value !== "object" && typeof value !== "function");
+    const hasPrimitives = items.some(primitive);
+    const keys = props || (hasPrimitives ? [] : Array.from(new Set(items.flatMap((item) => Object.keys(item)))));
+    const head = [""];
+    const columns = [indexes];
+    if (hasPrimitives && props === undefined) {
+      head.push("Values");
+      columns.push(items.map(cell));
+    } else {
+      for (const key of keys) {
+        head.push(String(key));
+        columns.push(items.map((item) => primitive(item) || !Object.prototype.hasOwnProperty.call(item, key) ? "" : cell(item[key])));
+      }
+    }
+    return render(head, columns);
   };
   // node:console — faithful port of node lib/internal/console/constructor.js.
   // Console instances own per-instance state (streams, group indent, count/time

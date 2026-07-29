@@ -736,6 +736,7 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
       return isBuildMessage(v) ? inspectBuildMessage(v) : util.inspect(v, Object.assign({ __bunStyle: true }, o));
     };
     if (typeof Bun.inspect === "function" && Bun.inspect.custom === undefined && util.inspect && util.inspect.custom) Bun.inspect.custom = util.inspect.custom;
+    if (typeof Bun.inspect === "function" && typeof Bun.inspect.table !== "function") Bun.inspect.table = inspectTableImpl;
     if (typeof Bun.deepEquals === "undefined") Bun.deepEquals = (a, b, strict) => {
       const eq = (x, y, s, seen) => {
         if (Object.is(x, y)) return true;
