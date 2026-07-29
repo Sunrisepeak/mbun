@@ -4321,6 +4321,21 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     fullGC: () => (G.__mbunGcNative ? G.__mbunGcNative(true) : 0),
     edenGC: () => (G.__mbunGcNative ? G.__mbunGcNative(false) : 0),
     isRope: () => false, describe: (v) => String(v), describeArray: () => "",
+    // bun BunJSCModule.h jscDescribe/jscDescribeArray — JSC's `describe()`,
+    // i.e. JSValue::dumpInContext(). Only the JSString branch is reproducible
+    // from the C API: JSC prints `String[ (rope)][ (atomic)][ (identifier)]
+    // 8Bit:(<0|1>): <contents>`, and the 8-bit flag is observable through the
+    // same native the internal-for-testing jscInternals surface uses. Atom /
+    // rope state is not observable, so those markers are omitted rather than
+    // guessed; every other value falls back to the String() form above.
+    jscDescribe: (v) => {
+      if (typeof v !== "string") return M["bun:jsc"].describe(v);
+      const N = G.__mbunJscInternalsNative;
+      const is8Bit = N && typeof N.isUTF16String === "function" ? !N.isUTF16String(v) : true;
+      return "String 8Bit:(" + (is8Bit ? 1 : 0) + "): " + v;
+    },
+    jscDescribeArray: (args) => (Array.isArray(args) ? "<Butterfly: (nil); public length: " + args.length +
+                                 "; vector length: " + args.length + ">" : ""),
     serialize: (v) => v, deserialize: (v) => v, drainMicrotasks: () => {},
     getProtectedObjects: () => [], totalCompileTime: () => 0,
     // bun BunJSCModule.h:527 — the calling frame's source origin as a URL.
