@@ -376,6 +376,22 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
         if (options !== undefined && (typeof options !== "object" || options === null)) {
           throw invArgType("options", "of type object", options);
         }
+        // node validates both evaluate() options as TypeErrors before touching
+        // module state. `timeout` interruption itself is still DEFERRED, but the
+        // argument contract is observable and cheap to honour.
+        if (options !== undefined) {
+          if (options.breakOnSigint !== undefined && typeof options.breakOnSigint !== "boolean") {
+            throw invArgType("options.breakOnSigint", "of type boolean",
+                             options.breakOnSigint, "property");
+          }
+          if (options.timeout !== undefined &&
+              (typeof options.timeout !== "number" || !(options.timeout > 0) ||
+               !Number.isInteger(options.timeout))) {
+            throw ERR("ERR_OUT_OF_RANGE", RangeError,
+                      'The value of "options.timeout" is out of range. ' +
+                      "It must be a positive integer. Received " + String(options.timeout));
+          }
+        }
         if (w.status === "unlinked" || w.status === "linking") {
           throw ERR("ERR_VM_MODULE_STATUS", Error,
                     "Module status must be one of linked, evaluated, or errored");
@@ -698,6 +714,18 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
       if (options.identifier !== undefined && typeof options.identifier !== "string") {
         throw invArgType("options.identifier", "of type string", options.identifier, "property");
       }
+      // Real bytecode cachedData is DEFERRED (JSC exposes no equivalent), but the
+      // argument contract is observable, so reject a non-BufferSource up front.
+      if (options.cachedData !== undefined) {
+        const cd = options.cachedData;
+        const ok = cd instanceof ArrayBuffer ||
+                   (typeof SharedArrayBuffer === "function" && cd instanceof SharedArrayBuffer) ||
+                   (cd !== null && typeof cd === "object" && ArrayBuffer.isView(cd));
+        if (!ok) {
+          throw invArgType("options.cachedData",
+                           "an instance of Buffer, TypedArray, or DataView", cd, "property");
+        }
+      }
       initBase(this, contextObject, options.identifier);
 
       const analysis = analyze(sourceText);
@@ -859,6 +887,18 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
       // number through `${identifier}` and silently accept it.
       if (options.identifier !== undefined && typeof options.identifier !== "string") {
         throw invArgType("options.identifier", "of type string", options.identifier, "property");
+      }
+      // Real bytecode cachedData is DEFERRED (JSC exposes no equivalent), but the
+      // argument contract is observable, so reject a non-BufferSource up front.
+      if (options.cachedData !== undefined) {
+        const cd = options.cachedData;
+        const ok = cd instanceof ArrayBuffer ||
+                   (typeof SharedArrayBuffer === "function" && cd instanceof SharedArrayBuffer) ||
+                   (cd !== null && typeof cd === "object" && ArrayBuffer.isView(cd));
+        if (!ok) {
+          throw invArgType("options.cachedData",
+                           "an instance of Buffer, TypedArray, or DataView", cd, "property");
+        }
       }
       initBase(this, contextObject, options.identifier);
       const values = new Map();
