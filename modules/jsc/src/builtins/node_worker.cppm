@@ -816,6 +816,8 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
         super();
         // Node's `${name}` conversion deliberately rejects symbols instead of
         // accepting them through String(Symbol()).
+        if (typeof name === "symbol")
+          throw new TypeError("Cannot convert a Symbol value to a string");
         this.name = `${name}`;
         this.onmessage = null;
         this.onmessageerror = null;
