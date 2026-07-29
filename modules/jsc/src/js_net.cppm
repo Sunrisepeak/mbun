@@ -758,7 +758,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
               return;
             }
             if (self.destroyed) { self.connecting = false; return; }
-            self.pending = false; self.connecting = false; self._flush(); self._flushPreConnect(null); self._applyDeferredSockOpts(); self.emit("connect"); self.emit("ready");
+            self.pending = false; self.connecting = false; self._flushPreConnect(null); self._applyDeferredSockOpts(); self.emit("connect"); self.emit("ready");
           };
           G.queueMicrotask(finishConnect);
           return self;
@@ -842,7 +842,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
           return;
         }
         if (this.destroyed) { this.connecting = false; return; }
-        this.pending = false; this.connecting = false; this._flush(); this._flushPreConnect(null); this._applyDeferredSockOpts(); this.emit("connect"); this.emit("ready");
+        this.pending = false; this.connecting = false; this._flushPreConnect(null); this._applyDeferredSockOpts(); this.emit("connect"); this.emit("ready");
       };
       G.queueMicrotask(finishConnect);
       return this;
@@ -1461,10 +1461,6 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
     }
     _flush() {
       if (this._fd < 0) return 0;
-      // A descriptor may already exist while the public connect boundary is
-      // pending. Keep writes queued until that boundary, so bufferSize and
-      // pre-connect write callbacks retain node's observable ordering.
-      if (this.connecting) return 0;
       if (this._tls === 1) return 0;  // handshake still in flight (see _poll)
       // A TLS upgrade is scheduled but _startTls has not run yet (js_tls_live
       // arms it on the transport's 'connect'). Anything queued in that window
