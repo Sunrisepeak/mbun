@@ -3382,7 +3382,9 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
         if (!minSet || !hourSet || !domSet || !monSet || !dowRaw) return null;
         const dowSet = new Set(); for (const v of dowRaw) dowSet.add(v % 7);
         const domR = fields[2] !== "*", dowR = fields[4] !== "*";
-        const d = new Date((from instanceof Date ? from.getTime() : new Date(from).getTime()));
+        const fromMs = from == null ? Date.now() : from instanceof Date ? from.getTime() : new Date(from).getTime();
+        if (!Number.isFinite(fromMs)) throw new RangeError("Invalid date value");
+        const d = new Date(fromMs);
         d.setUTCSeconds(0, 0); d.setUTCMinutes(d.getUTCMinutes() + 1);
         const limit = d.getTime() + 5 * 366 * 24 * 3600 * 1000;
         while (d.getTime() <= limit) {
