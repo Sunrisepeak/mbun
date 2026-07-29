@@ -1358,13 +1358,7 @@ inline constexpr std::string_view HARNESS = R"JS(
           let settled = false;
           const done = (err) => { if (settled) return; settled = true; if (err) reject(err instanceof Error ? err : new Error(String(err))); else resolve(); };
           let r; try { r = t.fn(done); } catch (e) { done(e); return; }
-          // A done-style body that also returns a promise finishes when done()
-          // fires, NOT when the promise resolves — bun waits for both (see
-          // bun_test.fixture.ts "done combined with promise, promise resolves
-          // first", which only completes once the 200ms done() lands). A body
-          // that resolves and never calls done therefore times out, which is
-          // what `test.failing` relies on. A rejection still fails immediately.
-          if (r && typeof r.then === "function") { r.then(() => {}, (e) => done(e)); return; }
+          if (r && typeof r.then === "function") { r.then(() => done(), (e) => done(e)); return; }
           // Body returned synchronously without a promise. Drain a few microtasks;
           // if done() still hasn't fired AND no timer is pending (which could call
           // done via the runner's timer pump), treat it as complete (arity-1 arg
@@ -1446,14 +1440,7 @@ inline constexpr std::string_view HARNESS = R"JS(
       return;
     }
     if (t.mode === "failing") {  // expected-failure test: invert
-      // ...except a timeout, which `.failing` does not absolve: bun still counts
-      // it as a failure (failing-test-timeout.fixture.ts expects " 0 pass").
-      const failTo = failed ? /^error: timed out after (\d+)ms$/.exec(msg) : null;
-      if (failTo) {
-        S.fail++; S.out.push("(fail) " + label);
-        S.out.push("  ^ this test timed out after " + failTo[1] + "ms.");
-      }
-      else if (failed) { S.pass++; S.out.push("(pass) " + label + " (failing)"); }
+      if (failed) { S.pass++; S.out.push("(pass) " + label + " (failing)"); }
       else {
         S.fail++; S.out.push("(fail) " + label);
         S.out.push("  ^ this test is marked as failing but it passed. Remove `.failing` if tested behavior now works");
