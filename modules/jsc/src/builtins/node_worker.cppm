@@ -1570,7 +1570,27 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
   // Expose the web-platform globals the worker tests use unqualified. Worker is
   // real; MessageChannel/MessagePort already exist as DOM globals (web layer),
   // so only fill Worker (and back-fill the others if a build lacks them).
-  if (typeof G.Worker === "undefined") G.Worker = Worker;
+  //
+  // The GLOBAL Worker is the WEB one, and bun's follows the web spec: its first
+  // argument is a *URL string*, so `new Worker(new URL(x, import.meta.url).href)`
+  // is the idiomatic form (test/js/web/workers, broadcastchannel). node's
+  // `worker_threads.Worker` is deliberately stricter — a `file://` or `data:`
+  // STRING is ERR_WORKER_PATH there and must stay that way (node's own
+  // test-worker-invalid-filename asserts it). One class cannot satisfy both, so
+  // the global gets a thin subclass that pre-wraps those two string forms in a
+  // URL — which is exactly the spelling node itself accepts — and
+  // `node:worker_threads` keeps the unmodified strict class.
+  class WebWorker extends Worker {
+    constructor(filename, options) {
+      if (typeof filename === "string" &&
+          (filename.startsWith("file://") || filename.startsWith("data:"))) {
+        try { filename = new URL(filename); } catch (e) {}
+      }
+      super(filename, options);
+    }
+  }
+  Object.defineProperty(WebWorker, "name", { value: "Worker", configurable: true });
+  if (typeof G.Worker === "undefined") G.Worker = WebWorker;
   // node's global MessageChannel/MessagePort ARE the worker_threads ones (they
   // are re-exported onto globalThis since v15), so the node-parity classes win
   // over the load-order web stubs.

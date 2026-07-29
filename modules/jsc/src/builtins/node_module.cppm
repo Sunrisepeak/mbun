@@ -383,6 +383,10 @@ inline constexpr std::string_view kNodeModuleJS = R"JS(
   Module.createRequire = (f) => createRequire(f);
   Module.builtinModules = BUILTIN_MODULES;
   Module.isBuiltin = (m) => isBuiltin(m);
+  // Shared with the per-module `import.meta.resolve` shim minted in engine.inc,
+  // which must hand a bare builtin name back as `node:<name>` instead of running
+  // it through the on-disk resolver.
+  G.__mbunIsBuiltinModule = (m) => isBuiltin(m);
   Module._resolveFilename = (request, parent, isMain, options) => resolveFilename(request, parent, isMain, options);
   Module._resolveLookupPaths = (request, parent) => resolveLookupPaths(request, parent);
   Module._nodeModulePaths = (from) => nodeModulePaths(from);

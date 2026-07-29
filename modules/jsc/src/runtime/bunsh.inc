@@ -36,6 +36,28 @@ using mbun::shell::execution::RedirectPlan;
 // Resolve a parser Atom to its literal text. Returns nullopt when the atom carries
 // any expansion (variable/glob/brace/tilde/command-substitution) the literal-only
 // lowering must not silently drop — the caller then punts to the fallback path.
+// `{`, `}` and `,` are lexed as brace tokens unconditionally (bun's lexer does the
+// same), but a word that is not a *complete* `{a,b}` expansion carries them as plain
+// characters in every POSIX shell — `seq -s, 0 5` passes the literal word "-s,".
+// The parser only sets brace_expansion_hint when open+comma+close are all present,
+// so with the hint clear these three tokens are safe to fold back into text; with
+// the hint set the word still punts to the fallback path.
+std::optional<std::string> brace_token_text(SAKind kind) {
+    switch (kind) {
+        case SAKind::BraceBegin:
+            return std::string{"{"};
+        case SAKind::BraceEnd:
+            return std::string{"}"};
+        case SAKind::Comma:
+            return std::string{","};
+        default:
+            return std::nullopt;
+    }
+}
+
+// Resolve a parser Atom to its literal text. Returns nullopt when the atom carries
+// any expansion (variable/glob/brace/tilde/command-substitution) the literal-only
+// lowering must not silently drop — the caller then punts to the fallback path.
 std::optional<std::string> atom_literal(const Atom& atom) {
     if (atom.kind == AtomKind::Simple) {
         switch (atom.simple.kind) {
@@ -44,7 +66,7 @@ std::optional<std::string> atom_literal(const Atom& atom) {
             case SAKind::QuotedEmpty:
                 return std::string{};
             default:
-                return std::nullopt;
+                return brace_token_text(atom.simple.kind);
         }
     }
     if (atom.compound.glob_hint || atom.compound.brace_expansion_hint) {
@@ -55,7 +77,9 @@ std::optional<std::string> atom_literal(const Atom& atom) {
         if (sub.kind == SAKind::Text) {
             out += sub.text;
         } else if (sub.kind != SAKind::QuotedEmpty) {
-            return std::nullopt;
+            const auto literal = brace_token_text(sub.kind);
+            if (!literal) return std::nullopt;
+            out += *literal;
         }
     }
     return out;

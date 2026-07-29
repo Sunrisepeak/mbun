@@ -214,9 +214,17 @@ public:
                        ", dir: " + json_quote_(dir) + ", dirname: " + json_quote_(dir) +
                        ", path: " + json_quote_(file) + ", filename: " + json_quote_(file) +
                        ", file: " + json_quote_(file) + ", main: false, env: globalThis.process.env,"
+                       // node/bun `import.meta.resolve` returns a BUILTIN specifier
+                       // verbatim rather than a file URL, and never validates that
+                       // the builtin exists (`node:doesnotexist` resolves to itself
+                       // — test/js/bun/resolve/import-meta-resolve). A bare name
+                       // that IS a builtin normalizes to its `node:` form.
                        " resolve: function (s) { s = String(s);"
+                       " if (s.startsWith('node:') || s.startsWith('bun:')) return s;"
                        " if (s.charCodeAt(0) === 47 || s.startsWith('./') || s.startsWith('../') || s.startsWith('file://'))"
                        " return new URL(s, " + json_quote_("file://" + file) + ").href;"
+                       " if (globalThis.__mbunIsBuiltinModule && globalThis.__mbunIsBuiltinModule(s))"
+                       " return 'node:' + s;"
                        " var r = globalThis.__mbun_resolve_native(s, " +
                        json_quote_(dir) + "); return (typeof r === 'string' && r.charCodeAt(0) === 47 && "
                        "globalThis.Bun && globalThis.Bun.pathToFileURL) ? globalThis.Bun.pathToFileURL(r).href : r; },"
