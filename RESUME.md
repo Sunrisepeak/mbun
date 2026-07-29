@@ -41,9 +41,25 @@ empty on both, which proves nothing depended on the mutability.
 
 **Lesson worth more than the fix: a plausible-sounding code comment is not
 evidence.** This one asserted a design decision that no test supported and one
-test actively refuted. Three members still fail (`modules/css_derive`,
-`modules/ini`, `modules/js` — the last is `test_js_transpile` golden drift on
-namespace-import default interop); they are NOT yet proven pre-existing.
+test actively refuted.
+
+**Final disposition of the 4 failing members — 2 were real, both now fixed:**
+
+- `modules/jsc` — the CryptoKey freeze bug above. **Fixed**, 27/27.
+- `modules/js` — `test_js_transpile`'s CJS namespace-import golden was left stale
+  by `7332af2`, which made `import * as ns from "<cjs>"` expose the CJS `default`
+  binding (non-enumerable, so `require()`'s view and `__esModule` interop are
+  unchanged) and was measured at bun js/bun 0/17 → 2/17 green. The behaviour is
+  intended, so the golden moved to match and now records why. **Fixed**, 14/14.
+- `modules/css_derive`, `modules/ini`, and on a later run `modules/install` — all
+  **pass standalone**. Zero commits on this branch touch css_derive or ini.
+
+**So the workspace gate is FLAKY UNDER LOAD, and that matters for how you read
+it.** A second run failed a *different* member (`modules/install`, which takes 33s
+standalone). Slow members time out when the machine is busy with lanes. Protocol:
+run `mcpp test --workspace` on a quiet machine, and **re-check any failing member
+standalone with `mcpp test -p modules/<m>` before believing it.** Two of the four
+original failures would otherwise have been chased as bugs that do not exist.
 
 ## 2026-07-30 13:10 — WAVE 56 lane C: worker_threads +8 (goal +6), 0 regressions
 
