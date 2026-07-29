@@ -5,6 +5,51 @@ session that is interrupted (usage limit, crash, restart) can pick up from the
 file rather than from memory. **If you are a fresh session reading this, start
 here.**
 
+## 2026-07-29 22:20 — STRATEGY CORRECTION: pivot capacity to the BUN corpus
+
+The maintainer flagged that throughput was slow **and that bun is half the
+mandate**. Both are right, and they are the same problem: waves 40–42 spent
+every lane on the node corpus and touched bun zero times, while node's long tail
+costs a lane 1–3 files.
+
+**The bun corpus is far cheaper per green file right now.** From the wave-38 full
+bun run (`target/integration/codex-sprint2-wave38-full-bun`, 230 files, 93 green,
+120 test-failure, 740 failing assertions):
+
+- **75 files need only ≤2 failing assertions fixed to become fully green**;
+- 93 need ≤5;
+- **59 of them produce ZERO passing assertions** — the file dies at load, which is
+  usually one missing export or API away from green.
+
+Near-green worklists cut by area into `target/integration/worklists-bun/`:
+`js-third_party` 17 files/17 assertions, `js-node` 14/22, `regression` 12/14,
+`js-bun` 10/13, `integration` 7/10, `js-web` 6/10, `cli` 4/5, `js-valkey` 3/8,
+plus singles. **84 files needing ~113 assertion fixes in total.**
+
+Bun measurement recipe (differs from node — no `--bin auto` guard covers it, so
+resolve the newest binary by mtime yourself):
+```
+python3 tools/integration/bun_corpus_runner.py --bin <newest> --cwd compat/bun \
+  --list <worklist> --out <dir> --jobs 4 --timeout 30
+```
+`--cwd compat/bun` is mandatory. `all-skipped` / `no-tests` / `blocked-external`
+are not passes; `ahead-of-reference` means mbun is *more* correct than bun's own
+reference and is not a failure.
+
+### Throughput fixes adopted at the same time
+
+1. **Lanes no longer run wide subsystem guards.** Integration was already running
+   a consolidated sweep over every lane's surface, so lane-level guards were
+   duplicated work — and they were consuming roughly half of each lane's box
+   (two lanes blew a 30-minute box on guard runs and build latency alone). Lanes
+   now measure only their own list and declare any high-blast-radius touch so
+   integration widens its own sweep.
+2. **Integration lands fully-diagnosed ≤5-line fixes directly** rather than
+   spending a lane plus two builds (this is how the CryptoKey `structuredClone`
+   fix landed for free).
+3. **Batch edits per build.** The shared build lock is the ceiling; a lane fixing
+   8 small files should build once, not eight times.
+
 ## 2026-07-29 22:05 — WAVE 42 FINAL: +55 cumulative (40+41+42), 0 regressions
 
 Node **2821 → 2876 / 4433 (64.88%)** from **1612 guard files measured**, zero
