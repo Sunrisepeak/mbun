@@ -811,8 +811,12 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
     const channels = new Map();
     class BroadcastChannel extends EventEmitter {
       constructor(name) {
+        if (arguments.length === 0)
+          throw new TypeError('The "name" argument must be specified');
         super();
-        this.name = String(name);
+        // Node's `${name}` conversion deliberately rejects symbols instead of
+        // accepting them through String(Symbol()).
+        this.name = `${name}`;
         this.onmessage = null;
         this.onmessageerror = null;
         this._closed = false;
@@ -821,6 +825,8 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
         set.add(this);
       }
       postMessage(value) {
+        if (arguments.length === 0)
+          throw new TypeError('The "message" argument must be specified');
         if (this._closed) throw new Error("BroadcastChannel is closed");
         const set = channels.get(this.name);
         if (!set) return;
