@@ -5,6 +5,23 @@
 
 ## 2026-07-29
 
+### 5 小时冲刺第二十四批：16 分钟净增 3 文件，11.25 files/hour
+
+14:22–14:38 先止损 TLS/TextDecoder 零收益候选，再集中验收
+child_process exec encoding 与 promisified AbortSignal，严格结算 **+3**：
+
+- exec 有效 encoding 安装 stream decoder、非法/显式 undefined/null/buffer
+  保留 Buffer，主集成补“属性省略 vs 显式 undefined”后 encoding 与 data
+  event 两文件 **2/2**；
+- exec/execFile custom promisify 在 Promise 构造前同步验证 AbortSignal，
+  实际 **+1/2**；exec 目标从 fail 变 timeout，仍按 0；
+- TLS/HTTPS 两目标 frozen 本已绿；TextDecoder 两红仍红；相关三个提交
+  全部 additive revert。AEAD 候选只映射一个 frozen 红文件，未纳入。
+
+14 文件 child exec 相关守卫为 8 pass / 2 既有 fail / 3 timeout / 1 skip；
+本批命名新增 3，green→non-green 0。守卫中的旧 exec-maxbuf green 已在
+早期 maxBuffer wave 发布，不重复归因。结构守卫全绿。
+
 ### 5 小时冲刺第二十三批：7 分钟净增 3 文件，25.7 files/hour
 
 14:15–14:22 验收 string_decoder、DNS resolver channel 与 concatenated

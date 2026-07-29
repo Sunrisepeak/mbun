@@ -297,6 +297,25 @@ Guards: HTTP client 63/68 pass; module 11 pass, 18 fail, 3 skip; require 13
 pass, 9 fail, 1 skip; abort 1/7 pass; readline 10 pass, 3 fail, 8 skip. Every
 guard has zero green-to-non-green regressions.
 
+### Sprint wave 24 measured checkpoint (14:22–14:38)
+
+After rejecting zero-yield TLS/TextDecoder candidates, exec encoding and
+promisified AbortSignal work delivered **+3 in 16 minutes = 11.25 files/hour**:
+
+- valid exec encodings now decode exposed stream data, while invalid and
+  explicitly undefined/null/buffer encodings return Buffer. Integration added
+  omitted-vs-explicit-undefined handling; both named encoding files pass;
+- exec/execFile custom promisifiers synchronously validate AbortSignal before
+  Promise construction: +1/2. The exec case moved fail-to-timeout and remains
+  zero yield;
+- TLS/HTTPS targets were already frozen-green and both TextDecoder failures
+  remained red, so all three zero-increment commits were additively reverted.
+
+The 14-file child exec guard is 8 pass, 2 retained failures, 3 timeouts, and 1
+skip. Named yield is three with zero green-to-non-green regressions. An old
+exec-maxbuf green belongs to the earlier published maxBuffer wave and is not
+counted again. Structural guards are clean.
+
 ### Sprint wave 23 measured checkpoint (14:15–14:22)
 
 StringDecoder validation, DNS resolver channel state, and concatenated gzip
