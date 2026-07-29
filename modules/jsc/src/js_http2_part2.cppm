@@ -552,7 +552,14 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
       this._localWindow = DEFAULT_CONNECTION_WINDOW;
       this._remoteWindow = DEFAULT_CONNECTION_WINDOW;
       this._lastProcStreamId = 0;
-      this.alpnProtocol = socket.alpnProtocol || null;
+      // node Http2Session: `encrypted` reflects the transport and `alpnProtocol`
+      // is "h2c" on a cleartext one. A ServerHttp2Session over a TLSSocket was
+      // reporting neither, so test-http2-create-client-secure-session's server
+      // half saw `session.encrypted` falsy and `originSet` undefined (the origin
+      // set is only tracked for an encrypted session).
+      this.encrypted = !!socket.encrypted;
+      this.alpnProtocol = socket.alpnProtocol || (this.encrypted ? "h2" : "h2c");
+      this._originSet = undefined;
       const self = this;
       // A server may send its SETTINGS immediately (RFC 7540 3.5); the client's
       // preface can still be in flight. Apply any configured settings values.
@@ -917,6 +924,12 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
     get state() { return sessionState(this, (this._lastPushId || 0) + 2); }
     get pendingSettingsAck() { return sessionPendingAck(this); }
     get type() { return constants.NGHTTP2_SESSION_SERVER; }
+    // node Http2Session#originSet: undefined on a cleartext or destroyed
+    // session, otherwise the transport-seeded set as an array.
+    get originSet() {
+      if (!this.encrypted || this.destroyed) return undefined;
+      return Array.from(initOriginSet(this));
+    }
     settings(s, cb) { return sessionSubmitSettings(this, s, cb); }
     ping(payload, cb) { return sessionPing(this, payload, cb); }
     altsvc(alt, originOrStream) { return sessionAltsvc(this, alt, originOrStream); }

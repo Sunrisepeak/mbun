@@ -786,7 +786,11 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
   // a default max frame size once the 2-byte Origin-Len is accounted for) and
   // restricts `alt` to RFC 7230 quoted-string characters.
   const kMaxALTSVC = 16382;
-  const kQuotedString = /^[\x21\x23-\x5b\x5d-\x7e\x80-\xff]*$/;
+  // node lib/internal/http2/core.js kQuotedString. HTAB and SP are legal and so
+  // is the double quote (0x22) — the RFC 7230 quoted-string production this
+  // guards is the *field value* `h2=":8000"`, quotes included. Starting the
+  // class at \x21 / \x23 rejected every real Alt-Svc value node accepts.
+  const kQuotedString = /^[\x09\x20-\x5b\x5d-\x7e\x80-\xff]*$/;
   function getURLOrigin(url) {
     // node uses internal/url getURLOrigin: parse and read `origin`, which is
     // the string "null" for a non-special scheme (abc:, foo://bar, ...).
@@ -823,6 +827,12 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
       e.code = "ERR_HTTP2_ALTSVC_LENGTH";
       throw e;
     }
+    // nghttp2_submit_altsvc() looks the stream up and returns
+    // NGHTTP2_ERR_INVALID_ARGUMENT when it does not exist, so node's "won't
+    // error, but won't send anything because the stream does not exist" case
+    // puts nothing on the wire. Emitting it anyway gave the peer a fifth
+    // 'altsvc' event (test-http2-altsvc expects exactly four).
+    if (stream !== 0 && !(session.streams && session.streams.get(stream))) return;
     // RFC 7838 4: [Origin-Len(16)][Origin][Alt-Svc-Field-Value]. On a stream the
     // origin is implied by the stream, so Origin-Len is 0.
     const originBuf = Buffer.from(stream !== 0 ? "" : (origin || ""), "latin1");
@@ -921,6 +931,19 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
   // stream — it does not emit a PRIORITY frame and the peer never fires
   // 'priority'. Reproduce that exactly, warning included (DEP0194), because the
   // corpus asserts both the warning and that 'priority' is NOT emitted.
+  // node setAndValidatePriorityOptions() opens with `deprecateWeight(options)`,
+  // a deprecateProperty() closure that fires ONCE (process-wide) the first time
+  // a request/pushStream options bag carries a `weight` key at all — `'weight'
+  // in options` is the test, so an explicit `weight: undefined` still warns.
+  let weightWarned = false;
+  function deprecateWeight(options) {
+    if (weightWarned || !options || typeof options !== "object" || !("weight" in options)) return;
+    weightWarned = true;
+    try {
+      G.process.emitWarning("Priority signaling has been deprecated as of RFC 9113.",
+        "DeprecationWarning", "DEP0194");
+    } catch (e) {}
+  }
   let priorityWarned = false;
   function streamPriority(stream) {
     if (!priorityWarned) {
@@ -1332,7 +1355,7 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
       if (kHaveDuplex && session && session._connected !== true) {
         this.cork();
         const self = this;
-        session.once("connect", () => { try { self.uncork(); } catch (e) {} });
+        session._whenConnected(() => { try { self.uncork(); } catch (e) {} });
       }
     }
     get closed() { return this._closed; }
@@ -1435,6 +1458,11 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
       if (typeof listener === "function") this.once("connect", listener);
 
       const u = parseAuthority(authority, options);
+      // node connect(): `if (protocol !== 'http:' && protocol !== 'https:')
+      // throw new ERR_HTTP2_UNSUPPORTED_PROTOCOL(protocol)`. Without it an
+      // `ssh://localhost` authority silently dialled as cleartext http.
+      if (u.protocol !== "http:" && u.protocol !== "https:")
+        throw mkErr('protocol "' + u.protocol + '" is unsupported.', "ERR_HTTP2_UNSUPPORTED_PROTOCOL");
       this._url = u.origin;
       this._authorityName = u.host;
       this._scheme = u.protocol === "https:" ? "https" : "http";
@@ -1530,6 +1558,24 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
       else this.destroy(err);
     }
 
+    // node keeps EVERY pending request's connect continuation in ONE array
+    // (kPendingRequestCalls) drained by a SINGLE `once('connect')` listener, so
+    // the eleventh concurrent request does not trip EventEmitter's
+    // MaxListenersExceededWarning. Registering one listener per request did:
+    // test-http2-client-request-listeners-warning asserts no warning is emitted
+    // for 11 requests issued while the session is still connecting.
+    _whenConnected(fn) {
+      if (this._connected) { G.queueMicrotask(fn); return; }
+      if (this._pendingConnectCalls) { this._pendingConnectCalls.push(fn); return; }
+      this._pendingConnectCalls = [fn];
+      const self = this;
+      this.once("connect", () => {
+        const q = self._pendingConnectCalls;
+        self._pendingConnectCalls = null;
+        if (q) for (const f of q) f();
+      });
+    }
+
     // node Http2Session#originSet: undefined on a cleartext or destroyed
     // session, otherwise the lazily-seeded set as an array.
     get originSet() {
@@ -1571,9 +1617,20 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
     }
 
     request(headers, options) {
-      if (this.destroyed) throw mkErr("The session has been destroyed", "ERR_HTTP2_INVALID_SESSION");
+      // node ClientHttp2Session#request: "Keep argument validation synchronous,
+      // but defer session-state failures to the returned stream so request
+      // retries from stream callbacks do not throw before session lifecycle
+      // handlers run." Throwing synchronously here meant a request issued from
+      // a stream 'close'/'error' handler during teardown blew up inside the
+      // emit instead of settling the new stream with an error — the call then
+      // never completed (test-http2-client-session-close-before-stream-close,
+      // and the same shape behind grpc-js post-error teardown hangs).
+      let requestError;
+      if (this.destroyed) requestError = mkErr("The session has been destroyed", "ERR_HTTP2_INVALID_SESSION");
+      else if (this.closed) requestError = mkErr("New streams cannot be created after receiving a GOAWAY", "ERR_HTTP2_GOAWAY_SESSION");
       headers = headers || {};
       options = options || {};
+      deprecateWeight(options);
       // node reads these option getters synchronously while building the request
       // frame (lib/internal/http2/core.js). Some tests assert the getters fire
       // during request(); read them up front so user side effects run in order.
@@ -1667,7 +1724,19 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
           const readyStream = stream;
           const emitReady = () => { if (!readyStream.destroyed) readyStream.emit("ready"); };
           if (self._connected) G.queueMicrotask(emitReady);
-          else self.once("connect", emitReady);
+          else self._whenConnected(() => {
+            // node requestOnConnect: a session close() that lands between
+            // request() and the socket handshake kills the request with
+            // ERR_HTTP2_GOAWAY_SESSION instead of letting it start. mbun
+            // consumes the stream id inside request(), so the check has to run
+            // on the connect edge (test-http2-goaway-delayed-request).
+            if (self.closed && !self.destroyed && !readyStream.destroyed) {
+              readyStream._closed = true;
+              readyStream.destroy(mkErr("New streams cannot be created after receiving a GOAWAY", "ERR_HTTP2_GOAWAY_SESSION"));
+              return;
+            }
+            emitReady();
+          });
         }
         // node ClientHttp2Session#request: 'created' is published with the
         // prepared header object (`sentHeaders`), 'start' once the HEADERS frame
@@ -1684,7 +1753,13 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
         }
         self._drainPendingSubmits();
       });
-      if (this._pendingSubmits.length > 0 || this._openRequests >= this._maxConcurrentSend()) {
+      if (requestError) {
+        // node: `process.nextTick(requestOnError.bind(stream, requestError))`,
+        // i.e. the stream is destroyed with the session-state error and emits
+        // 'error' + 'close' like any other failed request.
+        stream.pending = false;
+        G.process.nextTick(() => { if (!stream.destroyed) stream.destroy(requestError); });
+      } else if (this._pendingSubmits.length > 0 || this._openRequests >= this._maxConcurrentSend()) {
         // Cork exactly the way the constructor corks a not-yet-connected
         // stream: writes and end() issued by the caller are buffered until the
         // HEADERS frame has gone out.
@@ -1735,6 +1810,11 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
       return this._lastStreamId;
     }
     setNextStreamID(id) {
+      // node Http2Session#setNextStreamID checks the session BEFORE validating
+      // the argument, so `client.setNextStreamID()` on a destroyed session is an
+      // ERR_HTTP2_INVALID_SESSION (name 'Error'), not an ERR_INVALID_ARG_TYPE
+      // (name 'TypeError'). test-http2-client-destroy asserts the name.
+      if (this.destroyed) throw mkErr("The session has been destroyed", "ERR_HTTP2_INVALID_SESSION");
       if (typeof id !== "number") throw argTypeErr("id", "of type number", id);
       if (!Number.isInteger(id) || id <= 0 || id > 4294967295) throw outOfRangeErr("id", "> 0 and <= 4294967295", id);
       this._lastStreamId = id - 2;   // next request() advances by 2 to `id`
@@ -2245,7 +2325,7 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
     ping(payload, cb) { return sessionPing(this, payload, cb); }
     altsvc(alt, originOrStream) { return sessionAltsvc(this, alt, originOrStream); }
     origin(...origins) { return sessionOrigin(this, origins); }
-    goaway(code, lastStreamId, opaqueData) { const p = Buffer.alloc(8); p.writeUInt32BE((lastStreamId || 0) >>> 0, 0); p.writeUInt32BE((code || 0) >>> 0, 4); this._writeFrame(FRAME.GOAWAY, 0, 0, opaqueData ? Buffer.concat([p, Buffer.from(opaqueData)]) : p); }
+    goaway(code, lastStreamId, opaqueData) { if (this.destroyed) throw mkErr("The session has been destroyed", "ERR_HTTP2_INVALID_SESSION"); const p = Buffer.alloc(8); p.writeUInt32BE((lastStreamId || 0) >>> 0, 0); p.writeUInt32BE((code || 0) >>> 0, 4); this._writeFrame(FRAME.GOAWAY, 0, 0, opaqueData ? Buffer.concat([p, Buffer.from(opaqueData)]) : p); }
   }
 
   // === helpers ===
