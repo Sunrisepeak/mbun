@@ -1228,7 +1228,23 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
         const e = new TypeError('The "chunk" argument must be of type string or an instance of Buffer, TypedArray, or DataView.' + recv);
         e.code = "ERR_INVALID_ARG_TYPE"; throw e;
       }
-      if (this.destroyed || this._shutW) { const err = mkErr("write after end", "ERR_STREAM_WRITE_AFTER_END"); if (typeof cb === "function") G.queueMicrotask(() => cb(err)); else this.emit("error", err); return false; }
+      // Writable's terminal states are observably distinct. A caller that
+      // destroyed the stream gets ERR_STREAM_DESTROYED, while a socket whose
+      // peer already sent FIN reports EPIPE even if this side had called end().
+      // Only an ordinary local end remains ERR_STREAM_WRITE_AFTER_END.
+      let terminalWriteError = null;
+      if (this.destroyed) {
+        terminalWriteError = mkErr("Cannot call write after a stream was destroyed", "ERR_STREAM_DESTROYED");
+      } else if (this._shutW) {
+        terminalWriteError = this._eof
+          ? mkErr("This socket has been ended by the other party", "EPIPE")
+          : mkErr("write after end", "ERR_STREAM_WRITE_AFTER_END");
+      }
+      if (terminalWriteError) {
+        if (typeof cb === "function") G.queueMicrotask(() => cb(terminalWriteError));
+        else this.emit("error", terminalWriteError);
+        return false;
+      }
       // node _writeGeneric: once the socket is past connecting, a missing handle
       // is ERR_SOCKET_CLOSED, and a handle whose descriptor was closed under it
       // (`socket._handle.close()`) fails the write with EBADF. Both surface the
