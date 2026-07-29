@@ -63,6 +63,33 @@ lane as meaningless until the bun number is in hand.
 Also reclassified this wave: `test-stream-iter-readable-interop.js` →
 **known-blocked**, not a candidate.
 
+### Protocol: how to run a full corpus measurement without it fighting the build
+
+Two rules, both learned the hard way, and together they make the headline number
+obtainable again after a long run of "full runs keep dying":
+
+1. **`--resume`.** A bare full run dies at session/turn boundaries and leaves
+   nothing. With `--resume` the partial results survive and the next invocation
+   picks up where it stopped, so the run is no longer all-or-nothing.
+2. **Measure against a FROZEN COPY of the binary, not the live build output.**
+   Copy it out of `target/<arch>/<hash>/bin` first:
+   ```
+   cp "$(bash tools/integration/build_or_die.sh | tail -1)" target/integration/frozen-bin/mbun-<tag>
+   python3 tools/integration/node_corpus_runner.py --bin target/integration/frozen-bin/mbun-<tag> --jobs 3 --resume --out ...
+   ```
+   `node_corpus_runner.py` deliberately exempts binaries living outside
+   `target/<arch>/<hash>/bin` from its staleness refusal, precisely so frozen
+   baselines can be old. Without this, integrating a lane rebuilds the tree, the
+   live binary's hash directory changes underneath the running measurement, and
+   the run is silently measuring two different builds — the exact stale-binary
+   class the runner now refuses. With it, integration builds and a long
+   measurement can proceed at the same time.
+
+Corollary: **a full-corpus number belongs to a frozen tree.** Do not derive a new
+headline total by summing subtree deltas onto an old total — that is arithmetic
+presented as measurement. Report subtree deltas as subtree deltas until a real
+full run lands.
+
 ## 2026-07-30 09:30 — WAVE 54: `Buffer.toString('utf8')` was silently eating BOMs
 
 **`test-stream` 234 → 236/249**, and the more important find is nowhere near streams.
