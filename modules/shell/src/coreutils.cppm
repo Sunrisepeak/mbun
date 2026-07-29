@@ -1,15 +1,17 @@
 // coreutils.cppm — mbun.shell.coreutils
 //
-// In-process `ls` / `rm` / `mv` for the Bun.$ interpreter. Bun does not shell out
-// to GNU coreutils for these: it ships its own builtins, and its message text and
+// In-process `ls` / `rm` / `mv` / `cp` for the Bun.$ interpreter. Bun does not shell
+// out to GNU coreutils for these: it ships its own builtins, and its message text and
 // exit codes differ from GNU's in ways the corpus pins verbatim (e.g. GNU says
-// `rm: cannot remove 'p': ...` where bun says `rm: p: ...`). Executing /usr/bin/rm
-// therefore fails those assertions no matter how the shell is driven.
+// `rm: cannot remove 'p': ...` where bun says `rm: p: ...`, and GNU's `cp -v` prints
+// `'a' -> 'b'` where bun prints unquoted *absolute* paths). Executing /usr/bin/rm or
+// /usr/bin/cp therefore fails those assertions no matter how the shell is driven.
 //
 // Ported from bun's own implementations (read-only reference):
 //   - compat/bun/src/runtime/shell/builtin/ls.rs
 //   - compat/bun/src/runtime/shell/builtin/rm.rs
 //   - compat/bun/src/runtime/shell/builtin/mv.rs
+//   - compat/bun/src/runtime/shell/builtin/cp.rs
 //   - compat/bun/src/runtime/shell/Builtin.rs  (task_error_to_string / usage strings)
 //
 // bun runs each path argument as its own thread-pool task and flushes whole
@@ -738,6 +740,269 @@ export int run_mv(const std::vector<std::string>& argv) {
         }
     }
     return 0;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// cp
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace detail {
+
+// cp.rs prints `<abs src> -> <abs dst>` for -v: bun resolves both operands against
+// the interpreter's cwd before printing, so a relative argument still shows up as an
+// absolute path. GNU instead prints the *argument* spelling in single quotes, which
+// is what made the corpus assertions unreachable via /usr/bin/cp.
+inline std::string absolutize(std::string_view path) {
+    if (!path.empty() && path.front() == '/') {
+        return std::string{path};
+    }
+    char buf[4096];
+    if (::getcwd(buf, sizeof(buf)) == nullptr) {
+        return std::string{path};
+    }
+    return join_path(buf, path);
+}
+
+// A trailing slash is a POSIX assertion that the operand names a directory; cp.rs
+// keeps it in the diagnostic verbatim (`cp: lmao2/ is not a directory`).
+inline bool names_directory(std::string_view path) {
+    return !path.empty() && path.back() == '/';
+}
+
+class CpRunner {
+public:
+    explicit CpRunner(bool verbose) : verbose_{verbose} {}
+
+    // Copies one regular file's contents, creating/truncating `dest`.
+    bool copy_file(const std::string& src, const std::string& dest, mode_t mode) {
+        const int in = ::open(src.c_str(), O_RDONLY | O_CLOEXEC);
+        if (in < 0) {
+            report("cp", src, errno);
+            return false;
+        }
+        const int out =
+            ::open(dest.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, mode & 07777);
+        if (out < 0) {
+            const int err{errno};
+            ::close(in);
+            report("cp", dest, err);
+            return false;
+        }
+        bool ok{true};
+        std::vector<char> buf(1 << 16);
+        while (true) {
+            const ssize_t n = ::read(in, buf.data(), buf.size());
+            if (n == 0) {
+                break;
+            }
+            if (n < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                report("cp", src, errno);
+                ok = false;
+                break;
+            }
+            if (!write_all(out, std::string_view{buf.data(), static_cast<std::size_t>(n)})) {
+                report("cp", dest, errno);
+                ok = false;
+                break;
+            }
+        }
+        ::close(in);
+        ::close(out);
+        if (ok) {
+            verbose(src, dest);
+        }
+        return ok;
+    }
+
+    // -R: `dest` is the directory that becomes a copy of `src` (not a parent of it);
+    // the caller has already appended the basename when the target was an existing
+    // directory, matching cp's "cp -R a b" / "cp -R a existing/" split.
+    bool copy_tree(const std::string& src, const std::string& dest, mode_t mode) {
+        if (::mkdir(dest.c_str(), (mode & 07777) | 0700) != 0 && errno != EEXIST) {
+            report("cp", dest, errno);
+            return false;
+        }
+        verbose(src, dest);
+
+        DIR* dir = ::opendir(src.c_str());
+        if (dir == nullptr) {
+            report("cp", src, errno);
+            return false;
+        }
+        // Snapshot first: `cp -R a a/b` would otherwise walk entries it is creating.
+        std::vector<std::string> names;
+        while (const struct ::dirent* entry = ::readdir(dir)) {
+            const std::string_view name{entry->d_name};
+            if (name == "." || name == "..") {
+                continue;
+            }
+            names.emplace_back(name);
+        }
+        ::closedir(dir);
+
+        bool ok{true};
+        for (const std::string& name : names) {
+            const std::string childSrc = join_path(src, name);
+            const std::string childDest = join_path(dest, name);
+            struct ::stat st {};
+            if (::stat(childSrc.c_str(), &st) != 0) {
+                report("cp", childSrc, errno);
+                ok = false;
+                continue;
+            }
+            const bool childOk = S_ISDIR(st.st_mode)
+                                     ? copy_tree(childSrc, childDest, st.st_mode)
+                                     : copy_file(childSrc, childDest, st.st_mode);
+            ok = ok && childOk;
+        }
+        return ok;
+    }
+
+private:
+    void verbose(const std::string& src, const std::string& dest) const {
+        if (!verbose_) {
+            return;
+        }
+        std::string line = absolutize(src);
+        line += " -> ";
+        line += absolutize(dest);
+        line.push_back('\n');
+        write_all(STDOUT_FILENO, line);
+    }
+
+    bool verbose_;
+};
+
+}  // namespace detail
+
+// bun `cp` (builtin/cp.rs). Every source is attempted even after one fails; the
+// command exits 1 if any did. The three diagnostics the corpus pins verbatim are
+// `<src> is a directory (not copied)`, `<target> is not a directory` and
+// `<src> and <dest> are identical (not copied)` — all in argument spelling, unlike
+// the -v output, which is absolute.
+export int run_cp(const std::vector<std::string>& argv) {
+    static constexpr std::string_view kUsage{
+        "usage: cp [-R [-H | -L | -P]] [-fi | -n] [-alpSsvXx] source_file target_file\n"
+        "       cp [-R [-H | -L | -P]] [-fi | -n] [-alpSsvXx] source_file ... "
+        "target_directory\n"};
+
+    bool recursive{false};
+    bool verbose{false};
+    std::size_t sourcesStart{argv.size()};
+    for (std::size_t i = 1; i < argv.size(); ++i) {
+        const std::string& flag = argv[i];
+        if (flag.size() < 2 || flag.front() != '-') {
+            sourcesStart = i;
+            break;
+        }
+        bool illegal{false};
+        for (std::size_t c = 1; c < flag.size() && !illegal; ++c) {
+            switch (flag[c]) {
+                case 'R':
+                case 'r':
+                    recursive = true;
+                    break;
+                case 'a':
+                    // -a is -RpP; only the recursion is observable here.
+                    recursive = true;
+                    break;
+                case 'v':
+                    verbose = true;
+                    break;
+                case 'H':
+                case 'L':
+                case 'P':
+                case 'f':
+                case 'i':
+                case 'n':
+                case 'l':
+                case 'p':
+                case 'S':
+                case 's':
+                case 'X':
+                case 'x':
+                    break;  // accepted; no observable effect on this path
+                default:
+                    illegal = true;
+                    break;
+            }
+        }
+        if (illegal) {
+            detail::report_text("cp", "illegal option -- " + flag.substr(1) + "\n");
+            detail::write_all(STDERR_FILENO, std::string{kUsage});
+            return 1;
+        }
+    }
+
+    if (sourcesStart >= argv.size() || (argv.size() - sourcesStart) < 2) {
+        detail::write_all(STDERR_FILENO, std::string{kUsage});
+        return 1;
+    }
+
+    const std::size_t targetIdx{argv.size() - 1};
+    const std::string& target = argv[targetIdx];
+    const std::size_t nSources{targetIdx - sourcesStart};
+
+    struct ::stat targetSt {};
+    const bool targetExists = ::stat(target.c_str(), &targetSt) == 0;
+    const bool targetIsDir = targetExists && S_ISDIR(targetSt.st_mode);
+
+    detail::CpRunner runner{verbose};
+    int exitCode{0};
+    bool reportedNotDir{false};
+
+    for (std::size_t i = sourcesStart; i < targetIdx; ++i) {
+        const std::string& source = argv[i];
+
+        struct ::stat srcSt {};
+        if (::stat(source.c_str(), &srcSt) != 0) {
+            detail::report("cp", source, errno);
+            exitCode = 1;
+            continue;
+        }
+
+        // Refusing a directory precedes the target check: `cp a b c` with two
+        // directory sources and a nonexistent `c` reports both directories and says
+        // nothing about `c`, because no source ever reaches the target.
+        if (S_ISDIR(srcSt.st_mode) && !recursive) {
+            detail::report_text("cp", source + " is a directory (not copied)\n");
+            exitCode = 1;
+            continue;
+        }
+
+        // Many sources, or a target spelled with a trailing slash, both require the
+        // target to already be a directory. Reported once, not once per source.
+        if (!targetIsDir && (nSources > 1 || detail::names_directory(target))) {
+            if (!reportedNotDir) {
+                detail::report_text("cp", target + " is not a directory\n");
+                reportedNotDir = true;
+            }
+            exitCode = 1;
+            continue;
+        }
+
+        const std::string dest =
+            targetIsDir ? detail::join_path(target, detail::path_basename(source)) : target;
+
+        struct ::stat destSt {};
+        if (::stat(dest.c_str(), &destSt) == 0 && destSt.st_dev == srcSt.st_dev &&
+            destSt.st_ino == srcSt.st_ino) {
+            detail::report_text("cp", source + " and " + dest + " are identical (not copied)\n");
+            exitCode = 1;
+            continue;
+        }
+
+        const bool ok = S_ISDIR(srcSt.st_mode)
+                            ? runner.copy_tree(source, dest, srcSt.st_mode)
+                            : runner.copy_file(source, dest, srcSt.st_mode);
+        if (!ok) {
+            exitCode = 1;
+        }
+    }
+    return exitCode;
 }
 
 }  // namespace mbun::shell::coreutils

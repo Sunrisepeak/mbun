@@ -207,6 +207,7 @@ export enum class BuiltinKind : std::uint8_t {
     Ls,
     Rm,
     Mv,
+    Cp,
 };
 
 export inline std::optional<BuiltinKind> builtin_kind(std::string_view name) {
@@ -224,11 +225,12 @@ export inline std::optional<BuiltinKind> builtin_kind(std::string_view name) {
     if (name == "[[") return BuiltinKind::Test;
     if (name == "seq") return BuiltinKind::Seq;
     if (name == "yes") return BuiltinKind::Yes;
-    // bun ships its own ls/rm/mv rather than exec'ing coreutils; their message
+    // bun ships its own ls/rm/mv/cp rather than exec'ing coreutils; their message
     // text and exit codes differ from GNU's (see modules/shell/src/coreutils.cppm).
     if (name == "ls") return BuiltinKind::Ls;
     if (name == "rm") return BuiltinKind::Rm;
     if (name == "mv") return BuiltinKind::Mv;
+    if (name == "cp") return BuiltinKind::Cp;
     return std::nullopt;
 }
 
@@ -588,6 +590,8 @@ private:
                 return coreutils::run_rm(stage.argv);
             case BuiltinKind::Mv:
                 return coreutils::run_mv(stage.argv);
+            case BuiltinKind::Cp:
+                return coreutils::run_cp(stage.argv);
         }
         return 1;
     }
