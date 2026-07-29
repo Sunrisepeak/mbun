@@ -699,6 +699,14 @@ public:
             if (auto m{eval_to_string("globalThis.__mbun_fatal_message()")}; m && !m->empty()) {
                 std::cerr << *m << '\n';
             }
+            // Node's --abort-on-uncaught-exception changes only the terminal
+            // disposition of an unclaimed exception. Routing every callback
+            // through the JS fatal channel first preserves domain and
+            // uncaughtException handling, then std::abort() gives the child the
+            // observable SIGABRT disposition its parent test harness expects.
+            auto abortOnUncaught{eval_number(
+                "globalThis.__mbun_fatal_should_abort?__mbun_fatal_should_abort():0")};
+            if (abortOnUncaught && *abortOnUncaught == 1.0) std::abort();
             auto fs{eval_number("globalThis.__mbun_fatal_exit_code?__mbun_fatal_exit_code():1")};
             status = (fs && *fs > 0) ? static_cast<int>(*fs) : 1;
         } else if (unhandledRejection_) {

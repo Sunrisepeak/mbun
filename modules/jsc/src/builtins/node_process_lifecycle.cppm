@@ -127,6 +127,17 @@ inline constexpr std::string_view kNodeProcessLifecycleJS = R"JS(
   // test-process-exit-code asserts all three.
   G.__mbun_fatal_status = 1;
   G.__mbun_fatal_exit_code = function () { return G.__mbun_fatal_status | 0; };
+  // This is intentionally resolved at the point a fatal exception is observed:
+  // process.execArgv is populated after the builtins image, and a one-time
+  // startup snapshot would silently ignore a command-line flag. The native
+  // pump owns the actual abort so every uncaught path (entry, tick, timer, I/O,
+  // and node:domain's capture callback) reaches the same SIGABRT exit.
+  G.__mbun_fatal_should_abort = function () {
+    try {
+      const argv = p.execArgv;
+      return Array.isArray(argv) && argv.includes("--abort-on-uncaught-exception") ? 1 : 0;
+    } catch (e) { return 0; }
+  };
 
   // node lib/internal/process/execution.js: an exception escaping a libuv
   // callback goes to 'uncaughtExceptionMonitor', then the capture callback,
