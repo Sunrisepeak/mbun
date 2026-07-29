@@ -294,51 +294,17 @@ inline constexpr std::string_view kNodeStreamCoreJS = R"JS(
     };
   };
   __mods["internal/errors"] = (req, module) => {
-    // The JSC stack string is `fn@file:line:column`, while node's internal
-    // errors expose V8-style frames. Keep this adapter local to errors created
-    // here instead of changing the runtime-wide error renderer.
-    const normalizeStack = (err) => {
-      const raw = String(err.stack || "");
-      if (/(?:^|\n) {4}at /.test(raw)) return err;
-      let location = "";
-      for (const line of raw.split("\n")) {
-        const at = line.lastIndexOf("@");
-        if (at !== -1 && line.slice(at + 1)) {
-          location = " (" + line.slice(at + 1).trim() + ")";
-          break;
-        }
-      }
-      err.stack = err.name + (err.message ? ": " + err.message : "") +
-        "\n    at Object" + location;
-      return err;
-    };
-
-    function DNSException(errno, syscall, hostname) {
-      let code = errno;
-      if (typeof errno === "number") {
-        try { code = G.__mbunInternalBinding("uv").errname(errno); } catch (_) {}
-      }
-      code = String(code);
-      const err = new Error((syscall ? syscall + " " : "") + code +
-                            (hostname ? " " + hostname : ""));
-      err.code = code;
-      err.errno = errno;
-      if (syscall !== undefined) err.syscall = syscall;
-      if (hostname !== undefined) err.hostname = hostname;
-      return normalizeStack(err);
-    }
-
     function aggregateTwoErrors(innerError, outerError) {
       if (innerError && outerError && innerError !== outerError) {
         const outerErrors = outerError.errors;
         if (Array.isArray(outerErrors)) { outerErrors.push(innerError); return outerError; }
         const err = new AggregateError([outerError, innerError], outerError.message);
         err.code = outerError.code;
-        return normalizeStack(err);
+        return err;
       }
       return innerError || outerError;
     }
-    module.exports = { aggregateTwoErrors, DNSException };
+    module.exports = { aggregateTwoErrors };
   };
   __mods["internal/primordials"] = (req, module) => {
     // SafePromiseAllReturnVoid(promises[, mapFn]): Promise.all that resolves with
