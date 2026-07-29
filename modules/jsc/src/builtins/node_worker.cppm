@@ -567,6 +567,8 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
     // late in the list leaves earlier ArrayBuffers untouched.
     for (const item of list) {
       if (isPort(item)) {
+        if (UNTRANSFERABLE.has(item))
+          throw dataClone("Cannot transfer object marked as untransferable");
         if (item === this) throw dataClone("Transfer list contains source port");
         if (seenPorts.has(item)) throw dataClone("Transfer list contains duplicate MessagePort");
         if (item[kDetached] === true) throw dataClone("MessagePort in transfer list is already detached");
@@ -574,7 +576,8 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
       } else if (item instanceof ArrayBuffer) {
         if (seenBufs.has(item)) throw dataClone("Transfer list contains duplicate ArrayBuffer");
         if (abDetached(item)) throw dataClone("ArrayBuffer at index " + buffers.length + " is already detached");
-        if (UNTRANSFERABLE.has(item)) continue;  // markAsUntransferable: clone, don't move
+        if (UNTRANSFERABLE.has(item))
+          throw dataClone("Cannot transfer object marked as untransferable");
         seenBufs.add(item); buffers.push(item);
       } else if (item !== null && (typeof item === "object" || typeof item === "function")) {
         if (UNTRANSFERABLE.has(item)) continue;
@@ -656,6 +659,10 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
   const markAsUntransferable = function (obj) {
     if (obj !== null && (typeof obj === "object" || typeof obj === "function")) UNTRANSFERABLE.add(obj);
     return undefined;
+  };
+  const isMarkedAsUntransferable = function (obj) {
+    return obj !== null && (typeof obj === "object" || typeof obj === "function") &&
+           UNTRANSFERABLE.has(obj);
   };
   const markAsUncloneable = function (obj) {
     if (obj !== null && (typeof obj === "object" || typeof obj === "function")) UNCLONEABLE.add(obj);
@@ -821,7 +828,11 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
         for (const ch of set) {
           if (ch === this || ch._closed) continue;
           G.queueMicrotask(() => {
-            const ev = { data, type: "message" };
+            const ev = typeof G.MessageEvent === "function"
+              ? new G.MessageEvent("message", { data })
+              : { data, type: "message" };
+            ev.target = ch;
+            ev.currentTarget = ch;
             if (typeof ch.onmessage === "function") ch.onmessage(ev);
             ch.emit("message", ev);
           });
@@ -1396,6 +1407,7 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
     BroadcastChannel,
     receiveMessageOnPort,
     markAsUntransferable,
+    isMarkedAsUntransferable,
     markAsUncloneable,
     moveMessagePortToContext,
     setEnvironmentData,
