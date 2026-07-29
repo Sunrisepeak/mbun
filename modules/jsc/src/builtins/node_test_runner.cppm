@@ -169,12 +169,17 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
       opts: opts || {}, fn: fn || null, parent: parent || null,
       children: [],
       __loc: captureLoc(),
+      // node lib/internal/test_runner/test.js: `runOnlySubtests` is set on the
+      // PARENT of an `only` test, `hasOnlyTests` is propagated up the ancestor
+      // chain from there; Test#filter() reads both.
+      runOnlySubtests: false,
+      hasOnlyTests: false,
       hooks: { before: [], after: [], beforeEach: [], afterEach: [] },
     });
 
     const root = makeNode("suite", "<root>", {}, null, null);
     const state = { collecting: null, chain: Promise.resolve(), failures: 0, index: 0, scheduled: false,
-                    current: undefined };
+                    current: undefined, barrier: null, topLevel: 0, filterByOnly: false };
 
     // node's TestContext#fullName joins the ancestor names with " > " and drops
     // the root; the root's own hooks see "<root>" (test-runner-test-fullname).
@@ -223,6 +228,43 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
             "The argument 'options.tags' must not contain an empty string. Received ''");
           e.code = "ERR_INVALID_ARG_VALUE";
           throw e;
+        }
+      }
+    };
+    const rangeError = (name, range, value) => {
+      const e = new RangeError('The value of "' + name + '" is out of range. It must be ' +
+                               range + ". Received " + String(value));
+      e.code = "ERR_OUT_OF_RANGE";
+      return e;
+    };
+    // node lib/internal/test_runner/test.js Test's constructor validates
+    // `options.timeout` with validateNumber(0, TIMEOUT_MAX) and
+    // `options.concurrency` with validateUint32(positive) — both BEFORE the test
+    // is registered, so `test({ timeout: -1 })` throws synchronously
+    // (test-runner-option-validation). Neither was checked here at all.
+    const TIMEOUT_MAX = 2147483647;
+    const validateTestOptions = (opts) => {
+      if (opts === null || typeof opts !== "object") return;
+      const timeout = opts.timeout;
+      if (timeout !== undefined && timeout !== null && timeout !== Infinity) {
+        if (typeof timeout !== "number") throw argTypeError("options.timeout", "number", timeout);
+        if (timeout < 0 || timeout > TIMEOUT_MAX || Number.isNaN(timeout)) {
+          throw rangeError("options.timeout", ">= 0 && <= " + TIMEOUT_MAX, timeout);
+        }
+      }
+      const concurrency = opts.concurrency;
+      if (concurrency !== undefined && concurrency !== null && typeof concurrency !== "boolean") {
+        if (typeof concurrency !== "number") {
+          const e = new TypeError('The "options.concurrency" argument must be one of type boolean' +
+                                  " or number. Received " + typeof concurrency);
+          e.code = "ERR_INVALID_ARG_TYPE";
+          throw e;
+        }
+        if (!Number.isInteger(concurrency)) {
+          throw rangeError("options.concurrency", "an integer", concurrency);
+        }
+        if (concurrency < 1 || concurrency > 4294967295) {
+          throw rangeError("options.concurrency", ">= 1 && <= 4294967295", concurrency);
         }
       }
     };
@@ -307,15 +349,25 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
     const tapResult = (type, data) => {
       tapHeader();
       const failed = type === "test:fail";
-      if (data.details && data.details.type === "suite") tap.counts.suites += 1;
-      else tap.counts.tests += 1;
-      if (data.skip !== undefined) tap.counts.skipped += 1;
-      else if (data.todo !== undefined) tap.counts.todo += 1;
-      else if (failed) {
-        if (data.details && data.details.error && data.details.error.failureType === "cancelledByParent") {
-          tap.counts.cancelled += 1;
-        } else tap.counts.fail += 1;
-      } else tap.counts.pass += 1;
+      // node lib/internal/test_runner/utils.js countCompletedTest(): a SUITE
+      // increments `suites` and RETURNS — it never lands in tests/pass/fail/
+      // skipped/todo/cancelled. Counting suites in `pass` too made every
+      // `# pass N` assertion over a file that uses describe()/suite() off by the
+      // number of suites (test-runner-tag-filter-cli: `# pass 13` for 10 tests
+      // and 3 suites).
+      const isSuite = !!(data.details && data.details.type === "suite");
+      if (isSuite) {
+        tap.counts.suites += 1;
+      } else {
+        tap.counts.tests += 1;
+        if (data.skip !== undefined) tap.counts.skipped += 1;
+        else if (data.todo !== undefined) tap.counts.todo += 1;
+        else if (failed) {
+          if (data.details && data.details.error && data.details.error.failureType === "cancelledByParent") {
+            tap.counts.cancelled += 1;
+          } else tap.counts.fail += 1;
+        } else tap.counts.pass += 1;
+      }
       const number = data.nesting === 0 ? ++tap.topLevel
         : (data.testNumber === undefined ? 1 : data.testNumber);
       const directive = data.skip !== undefined
@@ -421,7 +473,19 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
       if (skip !== undefined) return { skip };
       const optTodo = node.opts.todo;
       const ctxTodo = ctx && ctx.__todo !== undefined ? ctx.__todo : undefined;
-      const todo = (optTodo !== undefined && optTodo !== false) ? (optTodo === true ? true : optTodo) : ctxTodo;
+      let todo = (optTodo !== undefined && optTodo !== false) ? (optTodo === true ? true : optTodo) : ctxTodo;
+      // node lib/internal/test_runner/test.js:
+      //   this.isTodo = (todo !== undefined && todo !== false) || this.parent?.isTodo
+      // — todo is INHERITED, so every test inside `describe.todo(...)` reports
+      // (and is counted) as todo even though it declared nothing
+      // (test-runner-exit-code's todo_exit_code.js fixture: "should inherit
+      // todo"; test-runner-todo-suite-hook-failure's two children).
+      if (todo === undefined) {
+        for (let p = node.parent; p; p = p.parent) {
+          const t = p.opts && p.opts.todo;
+          if (t !== undefined && t !== false) { todo = true; break; }
+        }
+      }
       if (todo !== undefined) return { todo };
       return {};
     };
@@ -492,6 +556,64 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
         list.unshift(...p.hooks[which].map((fn) => ({ fn, owner: p })));
       }
       return list;
+    };
+
+    // node lib/internal/test_runner/test.js Test#run invokes the body through
+    // `runInAsyncScope(fn, ctx, ctx)`, i.e. the context is BOTH the argument and
+    // the `this` value; a hook goes through the same path with the context its
+    // caller passed (a suite's own for before/after, the child test's for
+    // beforeEach/afterEach). A `function () { this.name }` hook — which the
+    // no-isolation fixtures use throughout — therefore reads a real context in
+    // node and threw "undefined is not an object" here while `this` stayed
+    // unbound.
+    const callWithCtx = (fn, ctx, extra) => (extra === undefined
+      ? fn.call(ctx, ctx)
+      : fn.call(ctx, ctx, extra));
+
+    // node applies runOnce to before/after hooks (createHook), so a hook that
+    // already ran — see rootBeforeNow() — is not run a second time when the
+    // enclosing test reaches its before phase. beforeEach/afterEach are per-test
+    // and must NOT be latched.
+    const onceHook = (fn) => {
+      let started = false;
+      let result;
+      const wrapper = (arg) => {
+        if (started) return result;
+        started = true;
+        try { result = Promise.resolve(callWithCtx(fn, arg)); }
+        catch (e) { result = Promise.reject(e); }
+        return result;
+      };
+      wrapper.__raw = fn;
+      return wrapper;
+    };
+    const eachHook = (fn) => {
+      const wrapper = (arg) => callWithCtx(fn, arg);
+      wrapper.__raw = fn;
+      return wrapper;
+    };
+    const addHook = (node, which, fn) => {
+      const wrapped = (which === "before" || which === "after") ? onceHook(fn) : eachHook(fn);
+      node.hooks[which].push(wrapped);
+      return wrapped;
+    };
+    // node lib/internal/test_runner/harness.js createTestTree() stamps the root
+    // test's startTime the moment the tree exists, so Test#createHook's "test has
+    // already started, run the hook immediately" branch ALWAYS fires for a
+    // top-level before(): the body runs synchronously at the before() call rather
+    // than being queued for the first test. run({ isolation: 'none' }) makes that
+    // observable — each file's root before() has to be seen before that file's
+    // suite bodies (test-runner-no-isolation pins the exact interleaving).
+    const rootBeforeNow = (hook) => {
+      const ctx = root.__ctx || (root.__ctx = makeSuiteContext(root));
+      const previous = state.current;
+      state.current = ctx;
+      let promise;
+      try { promise = hook(ctx); } finally { state.current = previous; }
+      // The latched promise is re-awaited by the root's before phase, which is
+      // where a failure is reported; swallow it here only so the rejection is not
+      // counted as unhandled in the meantime.
+      if (promise && typeof promise.catch === "function") promise.catch(() => {});
     };
 
     const runHooks = async (list, arg) => {
@@ -569,10 +691,10 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
           context.__plan = count;
         },
         mock: makeMock(),
-        before: (fn) => node.hooks.before.push(fn),
-        after: (fn) => node.hooks.after.push(fn),
-        beforeEach: (fn) => node.hooks.beforeEach.push(fn),
-        afterEach: (fn) => node.hooks.afterEach.push(fn),
+        before: (fn) => { addHook(node, "before", fn); },
+        after: (fn) => { addHook(node, "after", fn); },
+        beforeEach: (fn) => { addHook(node, "beforeEach", fn); },
+        afterEach: (fn) => { addHook(node, "afterEach", fn); },
         // node lib/internal/test_runner/test.js TestContext#waitFor: poll
         // `condition` every `interval` ms until it stops throwing, giving up
         // after `timeout` ms with the last error.
@@ -711,14 +833,38 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
         passed: true,
         attempt: 0,
         diagnostic: (message) => out("# " + message),
-        before: (fn) => node.hooks.before.push(fn),
-        after: (fn) => node.hooks.after.push(fn),
-        beforeEach: (fn) => node.hooks.beforeEach.push(fn),
-        afterEach: (fn) => node.hooks.afterEach.push(fn),
+        before: (fn) => { addHook(node, "before", fn); },
+        after: (fn) => { addHook(node, "after", fn); },
+        beforeEach: (fn) => { addHook(node, "beforeEach", fn); },
+        afterEach: (fn) => { addHook(node, "afterEach", fn); },
       };
     };
 
+    // node lib/internal/test_runner/test.js Test#filter(): with only-filtering
+    // active, a test that is neither `only` nor an ancestor of one is dropped
+    // whenever its parent saw an `only` sibling. filteredRun() marks it passed
+    // but installs `report = noop`, so a filtered test produces NO event and is
+    // absent from every counter — which is why the fixture that marks its inner
+    // test `{ only: true }` yields exactly four test:pass events under
+    // isolation:'none' (test-runner-no-isolation).
+    const filteredByOnly = (node) => {
+      if (!state.filterByOnly) return false;
+      if (node.opts.only === true || node.hasOnlyTests) return false;
+      const parent = node.parent;
+      if (!parent) return false;
+      return !!(parent.runOnlySubtests || parent.hasOnlyTests || node.opts.only === false);
+    };
+    // Called where the node is CONSTRUCTED, as node does.
+    const markOnly = (node) => {
+      if (node.opts.only !== true) return;
+      const parent = node.parent;
+      if (!parent) return;
+      parent.runOnlySubtests = true;
+      for (let t = parent; t !== null && !t.hasOnlyTests; t = t.parent) t.hasOnlyTests = true;
+    };
+
     const runNode = async (node) => {
+      if (filteredByOnly(node)) return;
       if (node.kind === "suite") return runSuite(node);
       const opts = node.opts;
       // node only lets `skip` prevent a body from running; a `todo` test still
@@ -749,12 +895,12 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
               if (error) reject(error); else resolve();
             };
             try {
-              const maybe = fn(context, done);
+              const maybe = callWithCtx(fn, context, done);
               if (maybe && typeof maybe.then === "function") maybe.then(() => done(), done);
             } catch (e) { done(e); }
           });
         } else {
-          result = fn(context);
+          result = callWithCtx(fn, context);
           if (result && typeof result.then === "function") await result;
         }
         for (const promise of context.__subs) await promise;
@@ -796,8 +942,25 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
           return;
         }
         const ctx = node.__ctx || (node.__ctx = makeSuiteContext(node));
-        await withContext(ctx, () => runHooks(node.hooks.before, ctx));
-        for (const child of node.children) await runNode(child);
+        // node runs a suite's before hook lazily, from inside the FIRST child's
+        // run() (`await this.parent.runHook('before', ...)`), so a throwing before
+        // hook fails every child individually — the children are still reported,
+        // and a `todo` suite's children still come out under the todo directive
+        // (test-runner-todo-suite-hook-failure expects `# todo 2`, `# fail 0`).
+        // Dropping them silently lost both.
+        let hookError;
+        try { await withContext(ctx, () => runHooks(node.hooks.before, ctx)); }
+        catch (e) { hookError = e; }
+        for (const child of node.children) {
+          if (hookError === undefined) { await runNode(child); continue; }
+          if (filteredByOnly(child)) continue;
+          emitDequeue(child);
+          const directive = directiveOf(child, undefined);
+          if (emitResult(child, hookError, undefined, Date.now())) ok(child.name);
+          else if (directive.todo !== undefined) skipped(child.name);
+          else fail(child.name, hookError, true);
+        }
+        if (hookError !== undefined) throw hookError;
         await withContext(ctx, () => runHooks(node.hooks.after, ctx));
         emit("test:plan", { nesting: nestingOf(node) + 1, count: node.children.length });
         emitResult(node, undefined, undefined, startedAt);
@@ -817,30 +980,49 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
       }
       if (name === undefined && fn && fn.name) name = fn.name;
       validateTags(opts);
+      validateTestOptions(opts);
       return { name, opts: opts || {}, fn };
     };
 
     // node runs the ROOT test's before/after hooks around the whole file; these
     // were registered (top-level `before()`/`after()`) and never executed.
     // Chained lazily so the whole synchronous registration pass is visible.
+    const runRootAfter = () => {
+      const ctx = root.__ctx || (root.__ctx = makeSuiteContext(root));
+      state.chain = state.chain
+        .then(() => withContext(ctx, () => runHooks(root.hooks.after, ctx)))
+        .catch((e) => fail("<root>", e));
+    };
     const scheduleRootAfter = () => {
       if (state.rootAfterScheduled) return;
+      // run({ isolation: 'none' }) evaluates the files one at a time and drains
+      // the chain between them, so latching the root after() onto the chain as
+      // soon as the FIRST file registers a test would run it before the second
+      // file had even been loaded. node's root test spans the whole run, so the
+      // runner takes ownership of the root after() phase instead
+      // (test-runner-no-isolation expects both files' after() last).
+      if (state.deferRootAfter) return;
       state.rootAfterScheduled = true;
-      G.queueMicrotask(() => {
-        const ctx = root.__ctx || (root.__ctx = makeSuiteContext(root));
-        state.chain = state.chain
-          .then(() => withContext(ctx, () => runHooks(root.hooks.after, ctx)))
-          .catch((e) => fail("<root>", e));
-      });
+      G.queueMicrotask(runRootAfter);
+    };
+    // node lib/internal/test_runner/runner.js runFiles() for isolation:'none'
+    // extends harness.bootstrapPromise with a deferred it only resolves AFTER the
+    // last file has been imported, and every subtest awaits that in
+    // startSubtestAfterBootstrap(). So under isolation:'none' the whole tree is
+    // COLLECTED first and only then run — file two's suites are registered before
+    // file one's tests execute. state.barrier is that deferred.
+    const ensureRootStarted = () => {
+      if (state.rootStarted) return;
+      state.rootStarted = true;
+      const ctx = root.__ctx || (root.__ctx = makeSuiteContext(root));
+      state.chain = state.chain
+        .then(() => state.barrier)
+        .then(() => withContext(ctx, () => runHooks(root.hooks.before, ctx)))
+        .catch((e) => fail("<root>", e));
     };
     const schedule = (node) => {
-      if (!state.rootStarted) {
-        state.rootStarted = true;
-        const ctx = root.__ctx || (root.__ctx = makeSuiteContext(root));
-        state.chain = state.chain
-          .then(() => withContext(ctx, () => runHooks(root.hooks.before, ctx)))
-          .catch((e) => fail("<root>", e));
-      }
+      ensureRootStarted();
+      state.topLevel += 1;
       state.chain = state.chain.then(() => runNode(node)).catch((e) => fail(node.name, e));
       scheduleRootAfter();
       return state.chain;
@@ -859,10 +1041,12 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
       if (state.collecting) {
         const node = makeNode("test", name, opts, fn, state.collecting);
         state.collecting.children.push(node);
+        markOnly(node);
         emitEnqueue(node);
         return Promise.resolve();
       }
       const node = makeNode("test", name, opts, fn, root);
+      markOnly(node);
       emitEnqueue(node);
       return schedule(node);
     }
@@ -871,6 +1055,7 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
       const { name, opts, fn } = normalize(args);
       const node = makeNode("suite", name, opts, fn, parent || state.collecting || root);
       if (node.parent !== root) node.parent.children.push(node);
+      markOnly(node);
       emitEnqueue(node);
       const previous = state.collecting;
       state.collecting = node;
@@ -903,10 +1088,14 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
       it: (...a) => register(null, ...a),
       describe: (...a) => registerSuite(null, ...a),
       suite: (...a) => registerSuite(null, ...a),
-      before: (fn) => (state.collecting || root).hooks.before.push(fn),
-      after: (fn) => (state.collecting || root).hooks.after.push(fn),
-      beforeEach: (fn) => (state.collecting || root).hooks.beforeEach.push(fn),
-      afterEach: (fn) => (state.collecting || root).hooks.afterEach.push(fn),
+      before: (fn) => {
+        const target = state.collecting || root;
+        const hook = addHook(target, "before", fn);
+        if (target === root) rootBeforeNow(hook);
+      },
+      after: (fn) => { addHook(state.collecting || root, "after", fn); },
+      beforeEach: (fn) => { addHook(state.collecting || root, "beforeEach", fn); },
+      afterEach: (fn) => { addHook(state.collecting || root, "afterEach", fn); },
       skip: (...a) => { const n = normalize(a); return register(null, n.name, Object.assign({}, n.opts, { skip: true }), n.fn); },
       todo: (...a) => { const n = normalize(a); return register(null, n.name, Object.assign({}, n.opts, { todo: true }), n.fn); },
       only: (...a) => register(null, ...a),
@@ -935,6 +1124,20 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
     // (test-runner-aliases asserts identity, not just equivalent behaviour).
     nodeTest.test = nodeTest;
     nodeTest.it = nodeTest;
+    // node lib/internal/test_runner/harness.js runInParentContext() hangs
+    // expectFailure/skip/todo/only off BOTH `test` and `suite`, so
+    // `describe.todo(...)` declares a TODO SUITE. Only the test-side variants
+    // existed here: `describe.todo` was undefined, so the fixture
+    // test-runner-exit-code runs (todo_exit_code.js) threw "not a function" at
+    // top level and lost its last suite entirely.
+    for (const keyword of ["expectFailure", "skip", "todo", "only"]) {
+      nodeTest.describe[keyword] = function (...a) {
+        const n = normalize(a);
+        const opts = Object.assign({}, n.opts);
+        opts[keyword] = true;
+        return nodeTest.describe(n.name, opts, n.fn);
+      };
+    }
     nodeTest.suite = nodeTest.describe;
     Object.defineProperty(nodeTest, "mock", {
       configurable: true,
@@ -961,6 +1164,31 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
         }; },
         setTap(enabled) { tapEnabled = !!enabled; },
         setOwnExitCode(enabled) { ownExitCode = !!enabled; },
+        // isolation:'none' only — see scheduleRootAfter().
+        setDeferRootAfter(enabled) { state.deferRootAfter = !!enabled; },
+        // isolation:'none' only — see ensureRootStarted() and filteredByOnly().
+        setLoadBarrier(promise) { state.barrier = promise; },
+        setFilterByOnly(enabled) { state.filterByOnly = !!enabled; },
+        // How many top-level tests/suites this process has queued. The runner
+        // compares it across a file's evaluation to tell "this file declared no
+        // tests" (node counts root.subtests for the same purpose) — it cannot use
+        // the event stream for that any more, because with the load barrier up no
+        // result has been emitted yet.
+        topLevelCount() { return state.topLevel; },
+        // Let the runner append its own step (a placeholder FileTest) to the
+        // sequential chain, so it lands in the same position node's inline
+        // root.createSubtest() would have put it.
+        appendChain(fn) {
+          ensureRootStarted();
+          state.chain = state.chain.then(fn).catch(() => {});
+          return state.chain;
+        },
+        flushRootAfter() {
+          if (state.rootAfterScheduled) return state.chain;
+          state.rootAfterScheduled = true;
+          runRootAfter();
+          return state.chain;
+        },
         nextId() { return nextTestId++; },
         // Everything the standalone runner has queued, including the root
         // after() hooks — run() waits on this for isolation:'none'.

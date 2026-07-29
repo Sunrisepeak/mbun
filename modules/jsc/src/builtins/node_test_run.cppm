@@ -124,12 +124,15 @@ inline constexpr std::string_view kNodeTestRunJS = R"JS(
           yield indent(data.nesting) + "# Subtest: " + tapEscape(data.name) + "\n";
         } else if (type === "test:pass" || type === "test:fail") {
           const failed = type === "test:fail";
+          // countCompletedTest(): a suite counts ONLY in `suites`.
           if (data.details && data.details.type === "suite") counts.suites++;
-          else counts.tests++;
-          if (data.skip !== undefined) counts.skipped++;
-          else if (data.todo !== undefined) counts.todo++;
-          else if (failed) counts.fail++;
-          else counts.pass++;
+          else {
+            counts.tests++;
+            if (data.skip !== undefined) counts.skipped++;
+            else if (data.todo !== undefined) counts.todo++;
+            else if (failed) counts.fail++;
+            else counts.pass++;
+          }
           const directive = data.skip !== undefined
             ? " # SKIP" + (typeof data.skip === "string" ? " " + tapEscape(data.skip) : "")
             : data.todo !== undefined
@@ -192,12 +195,15 @@ inline constexpr std::string_view kNodeTestRunJS = R"JS(
         let text = "";
         if (type === "test:pass" || type === "test:fail") {
           const failed = type === "test:fail";
+          // countCompletedTest(): a suite counts ONLY in `suites`.
           if (data.details && data.details.type === "suite") this.__counts.suites++;
-          else this.__counts.tests++;
-          if (data.skip !== undefined) this.__counts.skipped++;
-          else if (data.todo !== undefined) this.__counts.todo++;
-          else if (failed) this.__counts.fail++;
-          else this.__counts.pass++;
+          else {
+            this.__counts.tests++;
+            if (data.skip !== undefined) this.__counts.skipped++;
+            else if (data.todo !== undefined) this.__counts.todo++;
+            else if (failed) this.__counts.fail++;
+            else this.__counts.pass++;
+          }
           const ms = data.details && data.details.duration_ms !== undefined ? data.details.duration_ms : 0;
           if (data.nesting === 0) this.__duration += ms;
           text = "  ".repeat(data.nesting) + (failed ? "✖ " : "✔ ") + data.name +
@@ -482,11 +488,15 @@ inline constexpr std::string_view kNodeTestRunJS = R"JS(
       const startedAt = Date.now();
       const track = (type, data) => {
         if (type === "test:pass" || type === "test:fail") {
-          if (data.details && data.details.type === "suite") counts.suites++; else counts.tests++;
-          if (data.skip !== undefined) counts.skipped++;
-          else if (data.todo !== undefined) counts.todo++;
-          else if (type === "test:fail") counts.failed++;
-          else counts.passed++;
+          // countCompletedTest(): a suite counts ONLY in `suites`.
+          if (data.details && data.details.type === "suite") counts.suites++;
+          else {
+            counts.tests++;
+            if (data.skip !== undefined) counts.skipped++;
+            else if (data.todo !== undefined) counts.todo++;
+            else if (type === "test:fail") counts.failed++;
+            else counts.passed++;
+          }
         }
       };
       const forward = (type, data) => {
@@ -531,7 +541,12 @@ inline constexpr std::string_view kNodeTestRunJS = R"JS(
           // stderr with nothing on stdout. This has to run inside this try so it
           // reaches the CLI's user-error path instead of escaping as an uncaught
           // exception with an Error prefix and stack.
-          if (options.files !== undefined && files.length !== 0) {
+          // ...but ONLY for the CLI. node's run() API never stats options.files:
+          // it hands each one to a child, and a file that is not there comes back
+          // as an ordinary test:fail on the stream (test-runner-run's "should fail
+          // with non existing file" listens for exactly one). Treating that as a
+          // user error killed the whole process mid-suite.
+          if (options.__mbunCli === true && options.files !== undefined && files.length !== 0) {
             const fs = fsMod();
             const missing = files.filter((f) => {
               if (/[*?[\]{}]/.test(f)) return false;
@@ -571,53 +586,79 @@ inline constexpr std::string_view kNodeTestRunJS = R"JS(
     // events come straight off the in-process reporting surface.
     const runInProcess = async (files, given, forward, aborted) => {
       const createRequire = mod("module").createRequire;
-      let sawResult = false;
-      const unsubscribe = internals.subscribe((type, data) => {
-        if (type === "test:pass" || type === "test:fail") sawResult = true;
-        forward(type, data);
-      });
+      const unsubscribe = internals.subscribe(forward);
       // The evaluated files' failures belong to the returned stream; they must
       // not set the exit status of the process that called run().
       internals.setOwnExitCode(false);
+      // The root test spans the whole run in node, so its after() hooks belong
+      // after the LAST file — not after the first drain. The runner owns that
+      // phase here and flushes it below.
+      internals.setDeferRootAfter(true);
+      // node's isolation:'none' harness holds every subtest behind a deferred that
+      // only settles once the LAST file has been imported, so the tree is fully
+      // collected before anything runs (test-runner-no-isolation asserts file
+      // two's suite body lands before file one's tests). node also turns
+      // only-filtering ON for this mode regardless of --test-only —
+      // isFilteringByOnly is
+      // `(isolation === 'process' || NODE_TEST_CONTEXT) ? options.only : true`.
+      let releaseBarrier = () => {};
+      internals.setLoadBarrier(new Promise((resolve) => { releaseBarrier = resolve; }));
+      internals.setFilterByOnly(true);
       // There is no child to hand an id to, so this process IS worker 1
       // (test-runner-worker-id: "NODE_TEST_WORKER_ID is 1 with isolation=none").
       try { if (G.process && G.process.env) G.process.env.NODE_TEST_WORKER_ID = "1"; } catch (e) {}
+      const startedAt = Date.now();
       try {
         for (let i = 0; i < files.length; i++) {
           if (aborted()) break;
           const file = files[i];
           const name = given[i];
-          const startedAt = Date.now();
-          sawResult = false;
+          const before = internals.topLevelCount();
           // node reports the file itself as a test, so a file that cannot even
           // be loaded still produces an enqueue and a failure.
           forward("test:enqueue", fileEvent(name, file, internals.nextId()));
+          let threw = false;
           try {
             const req = typeof createRequire === "function" ? createRequire(file)
               : (typeof G.require === "function" ? G.require : null);
             if (req === null) throw new Error("no require available for isolation:'none'");
             req(file);
           } catch (error) {
+            threw = true;
             const e = fileEvent(name, file, internals.nextId());
             e.testNumber = i + 1;
             e.details = { duration_ms: Date.now() - startedAt, type: "test", error };
             forward("test:fail", e);
           }
-          await drainFully();
-          // A file without a node:test event is still a passing top-level
-          // FileTest in node's CLI output (for example subdir/subdir_test.js).
-          if (!sawResult) {
-            const e = fileEvent(name, file, internals.nextId());
-            e.testNumber = i + 1;
-            e.details = { duration_ms: Date.now() - startedAt, type: "test" };
-            // A FileTest has no test body to emit its own start event, but TAP
-            // still wraps it in the same Subtest heading as Node does.
-            forward("test:start", e);
-            forward("test:pass", e);
+          // A file that declared no top-level test is still a passing FileTest in
+          // node's output (for example subdir/subdir_test.js). node inserts it as
+          // a real root subtest right there, so queue it on the same chain to keep
+          // it in file order rather than emitting it ahead of the staged tests.
+          if (!threw && internals.topLevelCount() === before) {
+            const number = i + 1;
+            internals.appendChain(() => {
+              const e = fileEvent(name, file, internals.nextId());
+              e.testNumber = number;
+              e.details = { duration_ms: 0, type: "test" };
+              // A FileTest has no test body to emit its own start event, but TAP
+              // still wraps it in the same Subtest heading as Node does.
+              forward("test:start", e);
+              forward("test:pass", e);
+            });
           }
         }
+        releaseBarrier();
         await drainFully();
-      } finally { unsubscribe(); internals.setOwnExitCode(true); }
+        internals.flushRootAfter();
+        await drainFully();
+      } finally {
+        releaseBarrier();
+        unsubscribe();
+        internals.setOwnExitCode(true);
+        internals.setDeferRootAfter(false);
+        internals.setLoadBarrier(null);
+        internals.setFilterByOnly(false);
+      }
     };
 
     // node's FileTest: named by the path the caller gave (which may be
@@ -922,6 +963,7 @@ inline constexpr std::string_view kNodeTestRunJS = R"JS(
         });
         const stream = run(Object.assign({}, opts, {
             files: files !== undefined && files.length !== 0 ? files : undefined,
+            __mbunCli: true,
         }));
 
         let failed = false;
@@ -929,16 +971,33 @@ inline constexpr std::string_view kNodeTestRunJS = R"JS(
             if (data && (data.todo !== undefined || data.skip !== undefined)) return;
             failed = true;
         });
-        // node prints which test was running when it is interrupted, then exits 1.
+        // node harness.js findRunningTests(): on SIGINT the runner names every test
+        // that had started and not finished, and its tap reporter appends the
+        // location. Under process isolation the parent only knows file-level tests
+        // — so that name is the file path, and it arrives on test:dequeue when the
+        // child is spawned, NOT on test:start (the parent only synthesises a start
+        // for a file that produced no results at all). Watching test:start alone
+        // printed an empty name (test-runner-exit-code asserts the path appears).
+        const running = new Map();
+        const startRunning = (data) => { if (data && data.name) running.set(data.name, data); };
+        const endRunning = (data) => { if (data && data.name) running.delete(data.name); };
+        stream.on("test:dequeue", startRunning);
+        stream.on("test:start", startRunning);
+        stream.on("test:pass", endRunning);
+        stream.on("test:fail", endRunning);
         const onInterrupt = () => {
-            let running = "";
-            try { running = interruptedName; } catch (e) {}
-            try { G.process.stdout.write("# Interrupted while running: " + running + "\n"); } catch (e) {}
+            try {
+                for (const data of running.values()) {
+                    let msg = "Interrupted while running: " + data.name;
+                    if (data.file !== undefined) {
+                        msg += " at " + data.file + ":" + data.line + ":" + data.column;
+                    }
+                    G.process.stdout.write("# " + msg + "\n");
+                }
+            } catch (e) {}
             failed = true;
             try { G.process.exit(1); } catch (e) {}
         };
-        let interruptedName = "";
-        stream.on("test:start", (data) => { if (data && data.name) interruptedName = data.name; });
         try { G.process.on("SIGINT", onInterrupt); } catch (e) {}
 
         const list = reporterNames.length === 0 ? [undefined] : reporterNames;
