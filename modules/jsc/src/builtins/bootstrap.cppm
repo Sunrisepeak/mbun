@@ -3356,25 +3356,25 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     }
     return urlParse(url, parseQueryString, slashesDenoteHost);
   };
-  let urlWarnInvalidPort = true;
+
   const urlGetHostname = (self, rest, hostname, url) => {
     for (let i = 0; i < hostname.length; ++i) {
       const code = hostname.charCodeAt(i);
       const isValid = code !== 47 /* / */ && code !== 92 /* \ */ && code !== 35 /* # */ && code !== 63 /* ? */ && code !== 58 /* : */;
       if (!isValid) {
         // A leftover ":" here means an invalid (non-numeric) port — the valid
-        // trailing :port was already stripped by parseHost(). node lib/url.js
-        // getHostname() stays lenient: it emits DEP0170 once and folds the
-        // leftover into the pathname (`git+ssh://git@github.com:npm/npm` ->
-        // hostname "github.com", pathname "/:npm/npm").
-        if (code === 58 && urlWarnInvalidPort) {
-          urlWarnInvalidPort = false;
-          if (G.process && typeof G.process.emitWarning === "function") {
-            G.process.emitWarning(
-              "The URL " + url + " is invalid. Future versions of Node.js will throw an error.",
-              "DeprecationWarning", "DEP0170");
-          }
-        }
+        // trailing :port was already stripped by parseHost(); node THROWS.
+        //
+        // CROSS-CORPUS CONFLICT, measured — do not "fix" this to be lenient.
+        // bun's compat/bun/test/js/node/url/url-parse-format.test.js wants node's
+        // older lenient behaviour (emit DEP0170 once, fold the leftover into the
+        // pathname, so `git+ssh://git@github.com:npm/npm` -> hostname
+        // "github.com", pathname "/:npm/npm"). A lane implemented exactly that
+        // and it turned node's `test-url-parse-invalid-input.js` from pass to
+        // FAIL: that file asserts the throw and is green. One bun file gained,
+        // one green node file lost, so it was reverted. There is no caller-side
+        // discriminator here, so `__bunStyle`-style routing does not reach it.
+        if (code === 58) { const e = new TypeError("The argument 'url' Invalid port in url. Received " + JSON.stringify(url)); e.code = "ERR_INVALID_ARG_VALUE"; throw e; }
         self.hostname = hostname.slice(0, i);
         return "/" + hostname.slice(i) + rest;
       }
