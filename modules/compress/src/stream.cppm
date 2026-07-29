@@ -57,6 +57,11 @@ namespace {
 struct StreamState {
     StreamKind kind;
     bool ended { false };
+    // gzip (and inflate auto-detect) may carry several RFC 1952 members. A
+    // member boundary is not the stream boundary until the JS transform's final
+    // flush: the next write may begin another member.
+    bool inflateAllowsConcatenatedMembers { false };
+    bool inflateAtMemberBoundary { false };
 
     // zlib (deflate + inflate)
     z_stream zs {};
@@ -129,6 +134,7 @@ export int stream_open(StreamKind kind, int windowBits, int level, int memLevel,
         case StreamKind::inflate: {
             if (inflateInit2(&st->zs, windowBits) != Z_OK) return -1;
             st->zsInit = true;
+            st->inflateAllowsConcatenatedMembers = windowBits > 0 && (windowBits & 16) != 0;
             break;
         }
         case StreamKind::brotli_enc: {
@@ -205,9 +211,16 @@ StreamChunk process_deflate_(StreamState* st, ByteView input, StreamFlush flush)
     return r;
 }
 
-StreamChunk process_inflate_(StreamState* st, ByteView input) {
+StreamChunk process_inflate_(StreamState* st, ByteView input, StreamFlush flush) {
     StreamChunk r;
     z_stream& zs { st->zs };
+    // A previous write ended exactly at a gzip member. Keep the stream open for
+    // a later member, but let the final empty flush close the readable side.
+    if (st->inflateAllowsConcatenatedMembers && st->inflateAtMemberBoundary && input.empty()) {
+        if (flush == StreamFlush::finish) { r.stream_end = true; st->ended = true; }
+        return r;
+    }
+    if (!input.empty()) st->inflateAtMemberBoundary = false;
     zs.next_in = const_cast<Bytef*>(reinterpret_cast<const Bytef*>(input.data()));
     zs.avail_in = static_cast<uInt>(input.size());
 
@@ -218,7 +231,38 @@ StreamChunk process_inflate_(StreamState* st, ByteView input) {
         const int rc { inflate(&zs, Z_NO_FLUSH) };
         const std::size_t produced { sizeof(buf) - zs.avail_out };
         r.output.insert(r.output.end(), buf, buf + produced);
-        if (rc == Z_STREAM_END) { r.stream_end = true; st->ended = true; break; }
+        if (rc == Z_STREAM_END) {
+            if (!st->inflateAllowsConcatenatedMembers) {
+                r.stream_end = true; st->ended = true; break;
+            }
+            // zlib leaves the next member (or trailer) in avail_in. All-zero
+            // trailer padding is ignored by node; anything else is fed through
+            // a reset decoder so a malformed gzip-looking member still reports
+            // zlib's ordinary data error.
+            bool zeroTrailer { true };
+            for (uInt i {0}; i < zs.avail_in; ++i) {
+                if (zs.next_in[i] != 0) { zeroTrailer = false; break; }
+            }
+            if (zs.avail_in != 0 && zeroTrailer) {
+                zs.next_in += zs.avail_in;
+                zs.avail_in = 0;
+            }
+            if (zs.avail_in == 0) {
+                st->inflateAtMemberBoundary = true;
+                if (flush == StreamFlush::finish) { r.stream_end = true; st->ended = true; break; }
+            }
+            const Bytef* const nextIn {zs.next_in};
+            const uInt remaining {zs.avail_in};
+            if (inflateReset(&zs) != Z_OK) { r.ok = false; r.message = "zlib inflate reset failed"; break; }
+            zs.next_in = const_cast<Bytef*>(nextIn);
+            zs.avail_in = remaining;
+            // The fresh member appends to this call's output; it must not start
+            // overwriting the first member's bytes after inflateReset().
+            zs.next_out = buf;
+            zs.avail_out = sizeof(buf);
+            if (remaining == 0) break;
+            continue;
+        }
         if (rc == Z_NEED_DICT) { r.ok = false; r.message = "zlib need dictionary"; break; }
         if (rc == Z_DATA_ERROR || rc == Z_MEM_ERROR) {
             r.ok = false;
@@ -335,7 +379,7 @@ export StreamChunk stream_process(int handle, ByteView input, StreamFlush flush)
     if (st->ended) { StreamChunk r; r.stream_end = true; return r; }
     switch (st->kind) {
         case StreamKind::deflate: return process_deflate_(st, input, flush);
-        case StreamKind::inflate: return process_inflate_(st, input);
+        case StreamKind::inflate: return process_inflate_(st, input, flush);
         case StreamKind::brotli_enc: return process_brotli_enc_(st, input, flush);
         case StreamKind::brotli_dec: return process_brotli_dec_(st, input);
         case StreamKind::zstd_enc: return process_zstd_enc_(st, input, flush);
@@ -350,6 +394,7 @@ export bool stream_reset(int handle) {
     StreamState* st { find_(handle) };
     if (!st) return false;
     st->ended = false;
+    st->inflateAtMemberBoundary = false;
     switch (st->kind) {
         case StreamKind::deflate: return deflateReset(&st->zs) == Z_OK;
         case StreamKind::inflate: return inflateReset(&st->zs) == Z_OK;

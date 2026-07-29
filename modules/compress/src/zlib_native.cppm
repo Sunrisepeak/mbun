@@ -92,6 +92,30 @@ export Result<Bytes> zlib_inflate(ByteView input, int windowBits) {
             strm.avail_out = static_cast<uInt>(out.size() - used);
         }
         rc = inflate(&strm, Z_NO_FLUSH);
+        if (rc == Z_STREAM_END && windowBits > 0 && (windowBits & 16) != 0) {
+            // gzip permits concatenated members. Keep decoding non-zero trailing
+            // input as another member, while treating all-zero padding as an
+            // ignorable trailer (node's gunzip/unzip behaviour).
+            bool zeroTrailer { true };
+            for (uInt i {0}; i < strm.avail_in; ++i) {
+                if (strm.next_in[i] != 0) { zeroTrailer = false; break; }
+            }
+            if (strm.avail_in != 0 && zeroTrailer) {
+                strm.next_in += strm.avail_in;
+                strm.avail_in = 0;
+            }
+            if (strm.avail_in != 0) {
+                const Bytef* const nextIn {strm.next_in};
+                const uInt remaining {strm.avail_in};
+                const std::size_t used {out.size() - strm.avail_out};
+                if (inflateReset(&strm) != Z_OK) { rc = Z_STREAM_ERROR; break; }
+                strm.next_in = const_cast<Bytef*>(nextIn);
+                strm.avail_in = remaining;
+                strm.next_out = reinterpret_cast<Bytef*>(out.data() + used);
+                strm.avail_out = static_cast<uInt>(out.size() - used);
+                continue;
+            }
+        }
         // zlib returns Z_BUF_ERROR when no forward progress is possible. That is
         // only recoverable when it was caused by a full output buffer
         // (avail_out == 0) — we grow and retry above. If output space is still
@@ -100,7 +124,8 @@ export Result<Bytes> zlib_inflate(ByteView input, int windowBits) {
         if (rc == Z_BUF_ERROR && strm.avail_out != 0) {
             break;
         }
-    } while (rc == Z_OK || rc == Z_BUF_ERROR);
+        if (rc != Z_OK && rc != Z_BUF_ERROR) break;
+    }
 
     if (rc != Z_STREAM_END) {
         // Surface zlib's own diagnostic (e.g. "invalid stored block lengths",
@@ -112,7 +137,7 @@ export Result<Bytes> zlib_inflate(ByteView input, int windowBits) {
                                                : ErrorCode::truncated_input;
         return std::unexpected(Error{code, std::move(msg)});
     }
-    out.resize(strm.total_out);
+    out.resize(out.size() - strm.avail_out);
     inflateEnd(&strm);
     return out;
 }
