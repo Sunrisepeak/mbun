@@ -458,7 +458,24 @@ public:
                          .trim_unused_imports = mbun::jsc::module_loader::trims_unused_imports(
                              mbun::jsc::module_loader::loader_for_path(absPath))})};
             if (!t.ok) {
-                std::cerr << "error: " << (t.error.empty() ? "transpile error" : t.error) << '\n';
+                const std::string msg{t.error.empty() ? "transpile error" : t.error};
+                // An entry that does not PARSE never reaches eval_void, so
+                // nothing stashed __mbun_entry_error and the worker-fatal hook
+                // below had no value to forward: a Worker whose entry has a
+                // syntax error reported NOTHING to its parent and `w.on('error')`
+                // never fired (test-worker-syntax-error, which additionally
+                // asserts err.constructor === SyntaxError — hence a real
+                // SyntaxError instance, not a plain Error). Non-enumerable, like
+                // every other internal global: node's common/index.js fails a
+                // file on any unknown enumerable global.
+                (void)eval_void(
+                    "(function(m){try{var e=new SyntaxError(m);"
+                    "Object.defineProperty(globalThis,'__mbun_entry_error',"
+                    "{value:e,writable:true,configurable:true,enumerable:false});"
+                    "globalThis.__mbunWorkerFatal&&globalThis.__mbunWorkerFatal(e);}"
+                    "catch(_e){}})(" +
+                    json_quote_(msg) + ");");
+                std::cerr << "error: " << msg << '\n';
                 return 1;
             }
             tla = t.top_level_await;
