@@ -544,7 +544,25 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   def(["path/win32"], win32);
 
   // ---- assert ----
-  function AErr(msg) { const e = new Error(msg); e.name = "AssertionError"; e.code = "ERR_ASSERTION"; return e; }
+  // The more complete assert partition is appended after this bootstrap and
+  // installs AssertionError. Resolve it when an assertion is raised rather
+  // than when this module initializes, so the early helpers and the later
+  // class always produce one error shape.
+  function AErr(msg, actual, expected, operator, generatedMessage) {
+    const AE = assert.AssertionError;
+    if (typeof AE === "function") {
+      return new AE({ message: msg, actual, expected, operator,
+                      generatedMessage: !!generatedMessage });
+    }
+    const e = new Error(msg);
+    e.name = "AssertionError";
+    e.code = "ERR_ASSERTION";
+    e.actual = actual;
+    e.expected = expected;
+    e.operator = operator;
+    e.generatedMessage = !!generatedMessage;
+    return e;
+  }
   function assert(v, msg) { if (!v) throw AErr(msg || "The expression evaluated to a falsy value"); }
   assert.ok = assert;
   assert.equal = (a, b, m) => { if (a != b) throw AErr(m); };
@@ -720,8 +738,22 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   }
   assert.rejects = async function rejects(block, error, message) { return expectsError("rejects", await waitForActual(block), error, message); };
   assert.doesNotReject = async function doesNotReject(fn, error, message) { return expectsNoError("doesNotReject", await waitForActual(fn), error, message); };
-  assert.fail = (m) => { throw AErr(m || "Failed"); };
-  assert.ifError = (v) => { if (v) throw v; };
+  assert.fail = function fail(message) {
+    if (message instanceof Error) throw message;
+    const generated = arguments.length === 0;
+    throw AErr(generated ? "Failed" : message, undefined, undefined, "fail", generated);
+  };
+  assert.ifError = (v) => {
+    if (v === null || v === undefined) return;
+    let detail;
+    if (v && typeof v.message === "string")
+      detail = v.message || (v instanceof Error ? v.name : "");
+    else if (v && typeof v.name === "string" && v.name.length > 0) detail = v.name;
+    else {
+      try { detail = util.inspect(v); } catch (_) { detail = String(v); }
+    }
+    throw AErr("ifError got unwanted exception: " + detail, v, null, "ifError", true);
+  };
   function assertRegExpMatch(s, re, m, wantMatch) {
     if (!(re instanceof RegExp)) { const e = new TypeError(`The "regexp" argument must be of type RegExp. Received ${typeof re}`); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
     if (typeof s !== "string") { const e = new TypeError(`The "string" argument must be of type string. Received type ${typeof s}`); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
