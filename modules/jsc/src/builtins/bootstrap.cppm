@@ -4188,7 +4188,14 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     startupSnapshot: { isBuildingSnapshot: () => false, addSerializeCallback: () => {}, addDeserializeCallback: () => {}, setDeserializeMainFunction: () => {} },
   });
   // process.getBuiltinModule (node ≥20.16) — resolves through the builtin table
-  { const gbm = (n) => { n = String(n).replace(/^node:/, ""); return M[n]; };
+  { const gbm = (n) => {
+      if (typeof n !== "string") {
+        const e = new TypeError('The "id" argument must be of type string.');
+        e.code = "ERR_INVALID_ARG_TYPE";
+        throw e;
+      }
+      return M[n.replace(/^node:/, "")];
+    };
     if (G.process && !G.process.getBuiltinModule) G.process.getBuiltinModule = gbm;
     else if (!G.process) { let done = false; Object.defineProperty(G, "process", { configurable: true, set(v) { delete G.process; G.process = v; if (v && !v.getBuiltinModule) v.getBuiltinModule = gbm; }, get() { return undefined; } }); } }
   // bun:ffi — shape only (native FFI DEFERRED); files that merely import it load.
