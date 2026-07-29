@@ -1912,10 +1912,12 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       const unhandled = () => args[0] ?? new Error("Unhandled error.");
       if (!events) throw unhandled();
       const errorMonitor = events[kErrorMonitor];
-      if (errorMonitor) for (const handler of errorMonitor.slice()) handler.apply(emitter, args);
+      if (typeof errorMonitor === "function") errorMonitor.apply(emitter, args);
+      else if (errorMonitor) for (const handler of errorMonitor.slice()) handler.apply(emitter, args);
       const handlers = events.error;
       if (!handlers) throw unhandled();
-      for (const handler of handlers.slice()) handler.apply(emitter, args);
+      if (typeof handlers === "function") handlers.apply(emitter, args);
+      else for (const handler of handlers.slice()) handler.apply(emitter, args);
       return true;
     }
     function addCatch(emitter, promise, type, args) {
@@ -1931,8 +1933,8 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       if (events === undefined) return false;
       const handlers = events[type];
       if (handlers === undefined) return false;
-      const cloned = handlers.length > 1 ? handlers.slice() : handlers;
-      for (let i = 0, { length } = cloned; i < length; i++) cloned[i].apply(this, args);
+      if (typeof handlers === "function") handlers.apply(this, args);
+      else for (const handler of handlers.slice()) handler.apply(this, args);
       return true;
     };
     const emitWithRejectionCapture = function emit(type, ...args) {
@@ -1941,9 +1943,11 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       if (events === undefined) return false;
       const handlers = events[type];
       if (handlers === undefined) return false;
-      const cloned = handlers.length > 1 ? handlers.slice() : handlers;
-      for (let i = 0, { length } = cloned; i < length; i++) {
-        const result = cloned[i].apply(this, args);
+      if (typeof handlers === "function") {
+        const result = handlers.apply(this, args);
+        if (result !== undefined && typeof result?.then === "function" && result.then === Promise.prototype.then) addCatch(this, result, type, args);
+      } else for (const handler of handlers.slice()) {
+        const result = handler.apply(this, args);
         if (result !== undefined && typeof result?.then === "function" && result.then === Promise.prototype.then) addCatch(this, result, type, args);
       }
       return true;
@@ -1966,11 +1970,13 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       if (!events) { events = self._events = { __proto__: null }; self._eventsCount = 0; }
       else if (events.newListener) self.emit("newListener", type, fn.listener ?? fn);
       const handlers = events[type];
-      if (!handlers) { events[type] = [fn]; self._eventsCount++; }
+      if (!handlers) { events[type] = fn; self._eventsCount++; }
       else {
-        if (prepend) handlers.unshift(fn); else handlers.push(fn);
+        if (typeof handlers === "function") events[type] = prepend ? [fn, handlers] : [handlers, fn];
+        else if (prepend) handlers.unshift(fn); else handlers.push(fn);
+        const listeners = events[type];
         const m = self._maxListeners ?? defaultMaxListeners;
-        if (m > 0 && handlers.length > m && !handlers.warned) overflowWarning(self, type, handlers, m);
+        if (m > 0 && listeners.length > m && !listeners.warned) overflowWarning(self, type, listeners, m);
       }
       return self;
     }
@@ -2000,12 +2006,26 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       if (!events) return this;
       const handlers = events[type];
       if (!handlers) return this;
-      let position = -1, originalListener;
-      for (let i = handlers.length - 1; i >= 0; i--) { if (handlers[i] === fn || handlers[i].listener === fn) { originalListener = handlers[i].listener; position = i; break; } }
-      if (position < 0) return this;
-      if (position === 0) handlers.shift(); else handlers.splice(position, 1);
-      if (handlers.length === 0) { delete events[type]; this._eventsCount--; }
-      if (events.removeListener !== undefined) this.emit("removeListener", type, originalListener || fn);
+      let originalListener;
+      if (handlers === fn || handlers.listener === fn) {
+        originalListener = handlers.listener || handlers;
+        delete events[type];
+        this._eventsCount--;
+      } else {
+        let position = -1;
+        for (let i = handlers.length - 1; i >= 0; i--) {
+          if (handlers[i] === fn || handlers[i].listener === fn) {
+            originalListener = handlers[i].listener || handlers[i];
+            position = i;
+            break;
+          }
+        }
+        if (position < 0) return this;
+        if (position === 0) handlers.shift(); else handlers.splice(position, 1);
+        if (handlers.length === 1) events[type] = handlers[0];
+        else if (handlers.length === 0) { delete events[type]; this._eventsCount--; }
+      }
+      if (events.removeListener !== undefined) this.emit("removeListener", type, originalListener);
       return this;
     };
     EventEmitterPrototype.off = EventEmitterPrototype.removeListener;
@@ -2028,11 +2048,12 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       else if (handlers !== undefined) { for (let i = handlers.length - 1; i >= 0; i--) this.removeListener(type, handlers[i]); }
       return this;
     };
-    EventEmitterPrototype.listeners = function listeners(type) { const events = this._events; if (!events) return []; const handlers = events[type]; if (!handlers) return []; return handlers.map((x) => x.listener ?? x); };
-    EventEmitterPrototype.rawListeners = function rawListeners(type) { const events = this._events; if (!events) return []; const handlers = events[type]; if (!handlers) return []; return handlers.slice(); };
+    EventEmitterPrototype.listeners = function listeners(type) { const events = this._events; if (!events) return []; const handlers = events[type]; if (!handlers) return []; return typeof handlers === "function" ? [handlers.listener ?? handlers] : handlers.map((x) => x.listener ?? x); };
+    EventEmitterPrototype.rawListeners = function rawListeners(type) { const events = this._events; if (!events) return []; const handlers = events[type]; if (!handlers) return []; return typeof handlers === "function" ? [handlers] : handlers.slice(); };
     EventEmitterPrototype.listenerCount = function listenerCount(type, listener) {
       const events = this._events; if (!events) return 0;
       const evlistener = events[type]; if (!evlistener) return 0;
+      if (typeof evlistener === "function") return listener == null || evlistener === listener || evlistener.listener === listener ? 1 : 0;
       if (listener != null) { let matching = 0; for (let i = 0; i < evlistener.length; i++) { if (evlistener[i] === listener || evlistener[i].listener === listener) matching++; } return matching; }
       return evlistener.length;
     };
