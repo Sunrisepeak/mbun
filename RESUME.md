@@ -297,6 +297,22 @@ Guards: HTTP client 63/68 pass; module 11 pass, 18 fail, 3 skip; require 13
 pass, 9 fail, 1 skip; abort 1/7 pass; readline 10 pass, 3 fail, 8 skip. Every
 guard has zero green-to-non-green regressions.
 
+### Sprint wave 23 measured checkpoint (14:15–14:22)
+
+StringDecoder validation, DNS resolver channel state, and concatenated gzip
+forecast at least five files and delivered **+3 in 7 minutes = 25.7 files/hour**:
+
+- observable Resolver ChannelWrap routing: +2/2;
+- concatenated/trailing gzip handling: +1/3. Its first integration build exposed
+  a malformed inflate loop; integration corrected the loop before runtime
+  acceptance;
+- both StringDecoder related files were already frozen-green, so that
+  zero-increment commit was additively reverted.
+
+The 13-file DNS/zlib guard is 9 pass, 3 retained failures, and 1 timeout:
+three frozen fail-to-pass transitions and zero green-to-non-green regressions.
+Structural guards are clean.
+
 ### Sprint wave 22 measured checkpoint (14:11–14:15)
 
 V8 transferArrayBuffer state plus DNS lookup boolean validation forecast four
