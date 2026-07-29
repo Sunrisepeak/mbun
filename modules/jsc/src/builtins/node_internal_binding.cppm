@@ -806,7 +806,13 @@ inline constexpr std::string_view kNodeInternalBindingJS = R"JS(
       getFreeMem: () => os.freemem(),
       getCPUs: () => os.cpus(),
       getInterfaceAddresses: () => os.networkInterfaces(),
-      getHomeDirectory: () => os.homedir(),
+      // Keep this on the native source rather than public os.homedir(): the
+      // latter calls this binding so tests can replace it with a failing native
+      // operation and observe node's SystemError context.
+      getHomeDirectory: () => {
+        const ON = G.__mbunOsNative;
+        return ON && typeof ON.homedir === "function" ? ON.homedir() : os.homedir();
+      },
       getUserInfo: (opts) => os.userInfo(opts),
       setPriority: (pid, prio) => { os.setPriority(pid, prio); return 0; },
       getPriority: (pid) => os.getPriority(pid),

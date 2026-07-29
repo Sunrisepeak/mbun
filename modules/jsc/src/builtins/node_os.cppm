@@ -103,6 +103,21 @@ inline constexpr std::string_view kNodeOsJS = R"JS(
 
     const prevOs = M["os"] || M["node:os"] || {};
     const constants = prevOs.constants || {};
+    // Node exposes this nested constants table as immutable. Keep the outer
+    // constants object extensible: only `signals` carries that contract.
+    if (constants.signals && !Object.isFrozen(constants.signals)) Object.freeze(constants.signals);
+    const internalOs = () => {
+      try {
+        return typeof G.__mbunInternalBinding === "function" ? G.__mbunInternalBinding("os") : null;
+      } catch (e) { return null; }
+    };
+    const homeError = (ctx) => {
+      const e = new Error("A system error occurred: " + ctx.syscall + " returned " + ctx.code + " (" + ctx.message + ")");
+      e.name = "SystemError";
+      e.code = "ERR_SYSTEM_ERROR";
+      e.syscall = ctx.syscall;
+      return e;
+    };
 
     const os = {
       arch: arch,
@@ -116,7 +131,14 @@ inline constexpr std::string_view kNodeOsJS = R"JS(
         if (!r.ok) throw sysErr("uv_os_getpriority", r.errno | 0);
         return r.value;
       },
-      homedir: function () { return ON.homedir(); },
+      homedir: function () {
+        const binding = internalOs();
+        if (!binding || typeof binding.getHomeDirectory !== "function") return ON.homedir();
+        const ctx = {};
+        const value = binding.getHomeDirectory(ctx);
+        if (value === undefined && ctx.syscall !== undefined) throw homeError(ctx);
+        return value;
+      },
       hostname: function () { return ON.hostname(); },
       loadavg: function () { return ON.loadavg(); },
       machine: function () { return U.machine || "x86_64"; },
@@ -137,8 +159,11 @@ inline constexpr std::string_view kNodeOsJS = R"JS(
       type: typeName,
       uptime: function () { return ON.uptime(); },
       userInfo: function (opts) {
+        // Read the option before crossing the native boundary. Besides matching
+        // node's order, this lets a throwing `encoding` getter escape unchanged.
+        const encoding = opts == null ? undefined : opts.encoding;
         const i = ON.userInfo();
-        if (opts && opts.encoding === "buffer" && G.Buffer) {
+        if (encoding === "buffer" && G.Buffer) {
           return {
             username: G.Buffer.from(i.username),
             uid: i.uid,
