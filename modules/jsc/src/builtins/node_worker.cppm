@@ -1268,7 +1268,20 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
           const p = self._tlPorts[m.i];
           if (p) { try { p.postMessage(decodeKeysTop(decWire(m.d))); } catch (e) {} }
         } else if (m.t === "e") {
-          const err = new Error(m.d && m.d.message ? m.d.message : String(m.d));
+          // node serializes a worker's fatal error and REBUILDS it in the
+          // parent with its own class (internal/error_serdes.js keeps the
+          // native error constructors), so `err.constructor === RangeError`
+          // holds for a stack overflow and `=== SyntaxError` for a bad entry
+          // point. Rebuilding everything as a plain Error and only patching
+          // .name left the constructor wrong, which is exactly what the
+          // stack-overflow and syntax-error tests assert on.
+          const ctors = { Error: Error, TypeError: TypeError, RangeError: RangeError,
+                          SyntaxError: SyntaxError, ReferenceError: ReferenceError,
+                          EvalError: EvalError, URIError: URIError };
+          const nm = m.d && m.d.name;
+          const Ctor = (typeof nm === "string" &&
+                        Object.prototype.hasOwnProperty.call(ctors, nm)) ? ctors[nm] : Error;
+          const err = new Ctor(m.d && m.d.message ? m.d.message : String(m.d));
           if (m.d && m.d.name) err.name = m.d.name;
           if (m.d && m.d.stack) err.stack = m.d.stack;
           if (m.d && m.d.code) err.code = m.d.code;

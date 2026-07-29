@@ -108,11 +108,29 @@ public:
         return num;
     }
 
+    // Park the thrown VALUE where fail_run_ can hand it to __mbunWorkerFatal.
+    // kEntryCatchClose already does this for a throw the entry EXECUTED, but a
+    // script that fails to PARSE never runs its own catch — the SyntaxError
+    // exists only here, as JSC's out-param. Without it a worker whose entry has
+    // a syntax error reported nothing to its parent (__mbunWorkerFatal skips
+    // `undefined`), so `w.on('error')` never fired. Non-enumerable: node's
+    // common/index.js fails a file on any unknown enumerable global.
+    void stash_entry_error_(JSValueRef exc) {
+        if (exc == nullptr) return;
+        JSStringRef name{JSStringCreateWithUTF8CString("__mbun_entry_error")};
+        JSObjectSetProperty(ctx_, JSContextGetGlobalObject(ctx_), name, exc,
+                            kJSPropertyAttributeDontEnum, nullptr);
+        JSStringRelease(name);
+    }
+
     // Evaluate source, discarding the result; returns a diagnostic on error.
     std::expected<void, std::string> eval_void(std::string_view source, const std::string& srcUrl = {}) {
         JSValueRef exc{nullptr};
         eval_(source, &exc, srcUrl);
-        if (exc != nullptr) return std::unexpected(describe_exception_(exc));
+        if (exc != nullptr) {
+            stash_entry_error_(exc);
+            return std::unexpected(describe_exception_(exc));
+        }
         return {};
     }
 
