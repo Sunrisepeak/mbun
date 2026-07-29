@@ -755,6 +755,12 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   // NUL-free even on the sync paths that never reach normalizeSpawnArguments).
   const validateCommonOpts = (o) => {
     if (o == null) return;
+    // child_process accepts an actual AbortSignal here.  Checking before the
+    // spawn boundary makes exec() and execFile() reject invalid values
+    // synchronously, including through util.promisify().
+    if (o.signal !== undefined && !(G.AbortSignal && o.signal instanceof G.AbortSignal)) {
+      throw errArgType("options.signal", "an instance of AbortSignal", o.signal);
+    }
     if (o.cwd != null) toPathString(o.cwd, "options.cwd");
     if (o.argv0 != null) { validateStr(o.argv0, "options.argv0"); nullCheck(o.argv0, "options.argv0"); }
     if (o.shell != null && typeof o.shell !== "boolean" && typeof o.shell !== "string") throw errPropType("options.shell", "of type boolean or string", o.shell);
@@ -1059,9 +1065,15 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     collectExec(child, options, cb, command);
     return child;
   }
-  exec[Symbol.for("nodejs.util.promisify.custom")] = (command, options) => new Promise((resolve, reject) => {
-    exec(command, options, (err, stdout, stderr) => { if (err) { err.stdout = stdout; err.stderr = stderr; reject(err); } else resolve({ stdout, stderr }); });
-  });
+  exec[Symbol.for("nodejs.util.promisify.custom")] = (command, options) => {
+    if (typeof options === "function") options = {};
+    validateStr(command, "command");
+    nullCheck(command, "command");
+    if (options != null) { validateObj(options, "options"); validateCommonOpts(options); }
+    return new Promise((resolve, reject) => {
+      exec(command, options, (err, stdout, stderr) => { if (err) { err.stdout = stdout; err.stderr = stderr; reject(err); } else resolve({ stdout, stderr }); });
+    });
+  };
 
   function execFile(file, args, options, cb) {
     const nf = normalizeExecFileArgs(file, args, options, cb);
@@ -1072,9 +1084,13 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     collectExec(child, options, cb, file);
     return child;
   }
-  execFile[Symbol.for("nodejs.util.promisify.custom")] = (file, args, options) => new Promise((resolve, reject) => {
-    execFile(file, args, options, (err, stdout, stderr) => { if (err) { err.stdout = stdout; err.stderr = stderr; reject(err); } else resolve({ stdout, stderr }); });
-  });
+  execFile[Symbol.for("nodejs.util.promisify.custom")] = (file, args, options) => {
+    const nf = normalizeExecFileArgs(file, args, options, undefined);
+    normalizeSpawnArgs(nf.file, nf.args, typeof nf.options === "function" ? {} : nf.options);
+    return new Promise((resolve, reject) => {
+      execFile(file, args, options, (err, stdout, stderr) => { if (err) { err.stdout = stdout; err.stderr = stderr; reject(err); } else resolve({ stdout, stderr }); });
+    });
+  };
 
   function fork(modulePath, args, options) {
     modulePath = toPathString(modulePath, "modulePath");
