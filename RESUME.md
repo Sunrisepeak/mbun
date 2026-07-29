@@ -206,6 +206,26 @@ Integration rebuilt after the fs revert and reran the four retained targets:
 on shared runtime endpoints; route cross-identity architecture work out of the
 five-hour path unless its measured reuse count rises substantially.
 
+### Sprint wave 10 measured checkpoint (12:35–12:44)
+
+The experimental stream/iter FileHandle adapters forecast three complete
+files and delivered **3/3 in 9.5 minutes = 18.9 files/hour**:
+
+- `FileHandle.pull()` and `pullSync()` implement position, limit, chunk,
+  transform, locking, abort, and auto-close contracts;
+- `FileHandle.writer()` implements async/sync write and writev, position/limit,
+  failure/close/dispose, and handle locking;
+- integration fixed two sequential writer contracts exposed by the combined
+  gate: `endSync()` returns `-1` during an async write, while lock errors remain
+  ordinary Error and writes after writer closure reject with TypeError.
+
+The complete 19-file `test-fs-promises-file-handle-*` guard finished at 15 pass
+and 4 retained failures: +3, zero frozen-gate regressions. A first `--jobs 8`
+guard produced one transient JSC rope-string SIGSEGV in an otherwise
+already-green dispose file; it passed immediately alone, and the complete guard
+rerun at `--jobs 4` had zero regressions. Record the transient honestly, but do
+not attribute an unreproduced concurrent crash to the adapter.
+
 The first three-way reuse probe tested local round-10 branches for node's
 `--test` CLI, HTTP/2 argument/timer validation, and verbatim Node error text.
 All three candidate cherry-picks became empty on the current target tree.

@@ -5,6 +5,24 @@
 
 ## 2026-07-29
 
+### 5 小时冲刺第十批：9.5 分钟净增 3 文件，18.9 files/hour
+
+12:35–12:44 集成 Node experimental stream/iter 的 FileHandle adapter，
+静态预计 3，实际 **3/3**：
+
+- `FileHandle.pull()` / `pullSync()`：position/limit/chunk、transform、锁、
+  abort 与 autoClose；
+- `FileHandle.writer()`：async/sync write/writev、position/limit、失败/
+  关闭/dispose 与 handle 锁；
+- 主集成门禁额外修正 writer 的两个连续合同：async write 进行中
+  `endSync()` 返回 `-1`；handle lock 抛普通 Error，而已关闭 writer 的
+  write/writev 以 TypeError 拒绝。
+
+完整 19 文件 `test-fs-promises-file-handle-*` 子集最终为 15 pass / 4 个
+既有 fail，对 frozen gate 是 +3 / 0 regression。第一次 `--jobs 8` 出现
+一次 JSC rope-string 瞬时 SIGSEGV；目标单文件立即通过，随后 `--jobs 4`
+重跑全部 19 文件无回归，故不把该不可复现并发 crash 归因或隐去。
+
 ### 5 小时冲刺第九批：6 分钟净增 4 文件，40 files/hour
 
 12:29–12:35 组合两个静态 lane，预计 7 个整文件、实际净增 4：
