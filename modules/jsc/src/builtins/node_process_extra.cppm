@@ -523,6 +523,19 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
       }
     } catch (e) {}
 
+    // node internal/util.js isPendingDeprecation(): a documentation-only
+    // deprecation stays SILENT unless --pending-deprecation is on (either as an
+    // exec argv or via NODE_PENDING_DEPRECATION), and --no-deprecation still
+    // wins over it. Never invert this: the default is silence.
+    const isPendingDeprecation = () => {
+      const argv = proc.execArgv;
+      if (Array.isArray(argv) && argv.includes("--no-deprecation")) return false;
+      if (proc.noDeprecation) return false;
+      if (Array.isArray(argv) && argv.includes("--pending-deprecation")) return true;
+      const env = proc.env;
+      return !!(env && env.NODE_PENDING_DEPRECATION && String(env.NODE_PENDING_DEPRECATION)[0] === "1");
+    };
+
     // ---- process.binding allow/deny list (bun's ProcessBindingMap) ---------
     {
       const orig = typeof proc.binding === "function" ? proc.binding.bind(proc) : null;
@@ -655,6 +668,39 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
         }
         return (cache[name] = value);
       };
+      // node initializeDeprecations() (pre_execution.js) and node_uv.cc gate
+      // DEP0111/DEP0119 on --pending-deprecation ONLY: process.binding() is
+      // silent by default and must stay that way. Each fires once per process.
+      if (isPendingDeprecation()) {
+        const rawBinding = proc.binding;
+        let bindingWarned = false;
+        proc.binding = function binding(name) {
+          if (!bindingWarned) {
+            bindingWarned = true;
+            proc.emitWarning("process.binding() is deprecated. Please use public APIs instead.",
+                             "DeprecationWarning", "DEP0111");
+          }
+          const mod = rawBinding.call(this, name);
+          // node uv.cc ErrName(): the DEP0119 warning is attached to errname
+          // itself, so it only fires when errname is actually CALLED.
+          if (name === "uv" && mod && typeof mod.errname === "function" && !mod.__mbunErrnameDeprecated) {
+            const rawErrname = mod.errname;
+            let errnameWarned = false;
+            mod.errname = function errname(err) {
+              if (!errnameWarned) {
+                errnameWarned = true;
+                proc.emitWarning(
+                  "Directly calling process.binding('uv').errname(<val>) is being deprecated. " +
+                  "Please make sure to use util.getSystemErrorName() instead.",
+                  "DeprecationWarning", "DEP0119");
+              }
+              return rawErrname.call(this, err);
+            };
+            try { Object.defineProperty(mod, "__mbunErrnameDeprecated", { value: true }); } catch (e) {}
+          }
+          return mod;
+        };
+      }
     }
 
     // ---- process.dlopen ------------------------------------------------------

@@ -175,7 +175,17 @@ public:
                        "if (globalThis.Bun) globalThis.Bun.main = " + json_quote_(file) + ";\n" +
                        "globalThis.module = { exports: {}, filename: " + json_quote_(file) + ", parent: null };\n" +
                        (pendingDeprecation
-                            ? "(function(){ var moduleParent = null; Object.defineProperty(globalThis.module, 'parent', { enumerable: true, configurable: true, get: function(){ return moduleParent; }, set: function(value){ moduleParent = value; var p = globalThis.process; if (p && typeof p.emitWarning === 'function') p.emitWarning('module.parent is deprecated due to accuracy issues. Please use require.main to find program entry point instead.', 'DeprecationWarning', 'DEP0144'); } }); })();\n"
+                            // node loader.js wraps BOTH the getter and the setter in
+                            // pendingDeprecate(..., 'DEP0144'); internal/util.js dedupes
+                            // on the CODE, so reading and writing share one warning.
+                            ? "(function(){ var moduleParent = null; var warned = false;"
+                              " var warn = function(){ if (warned) return; warned = true;"
+                              " var p = globalThis.process;"
+                              " if (p && typeof p.emitWarning === 'function')"
+                              " p.emitWarning('module.parent is deprecated due to accuracy issues. Please use require.main to find program entry point instead.', 'DeprecationWarning', 'DEP0144'); };"
+                              " Object.defineProperty(globalThis.module, 'parent', { enumerable: true, configurable: true,"
+                              " get: function(){ warn(); return moduleParent; },"
+                              " set: function(value){ warn(); moduleParent = value; } }); })();\n"
                             : "") +
                        "globalThis.exports = globalThis.module.exports;\n" +
                        "globalThis.require = globalThis.__mbun_make_require(" + json_quote_(dir) +
