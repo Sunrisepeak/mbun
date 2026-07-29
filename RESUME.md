@@ -5,6 +5,93 @@ session that is interrupted (usage limit, crash, restart) can pick up from the
 file rather than from memory. **If you are a fresh session reading this, start
 here.**
 
+## 2026-07-29 21:15 — WAVE 41 FINAL: +46 cumulative (40+41), 0 regressions
+
+Node **2821 → 2867 / 4433 (64.67%)**, projected from **1127 guard files actually
+measured**, zero green→non-green anywhere. PR #35. Combined throughput over both
+waves: **24 files/hour with 5 agents over 1.9h** (wave 40 alone ran 32/h; the
+drop is build-lock contention, below).
+
+| lane | added | commit |
+| --- | --- | --- |
+| unhandled | +8 | `--unhandled-rejections` modes (`da89e3f`) |
+| repl3 | +3 | ported node's `ReplHistory` manager (`59a2a97`) |
+| argv0 | +3 | real `argv[0]` (`c31acf1`) + vm stack decoration (`c96d535`) |
+| webcrypto | +2 | `QuotaExceededError` + key-class bindings (`fc0cb20`) |
+| runner2 | +2 | `NODE_TEST_WORKER_ID`, `t.plan` wait (`2804c6b`, `710a005`) |
+| cryptokey | +1 | spec-shaped CryptoKey slots (`5a1c354`) |
+| *integration* | +1 | CryptoKey `structuredClone` re-mint (`42efe39`) |
+| trace | +1 | publish the trace phase table (`1b0c26b`) |
+| identity | +1 | drop `--` from `execArgv` (`a0c877b`) |
+| emitwarning | 0 | node-shaped warning stack (`b4d6d75`) — kept as correctness |
+| streamthrow | 0 | measurement-integrity probe, no code |
+
+### The two findings that outrank the files
+
+1. **No false greens in the stream-callback class.** The repl lane reported that a
+   throw inside a `Writable` write callback was swallowed with exit 0 — the same
+   shape as the `assert.throws`/`mustCall`/self-skip defects that once removed
+   126 unreal passes. A dedicated lane **refuted it**: every generic stream path
+   (write cb, `_write`, `'data'`/`'end'`/`'finish'`/`'close'`, nextTick,
+   microtask, immediate, timers) propagates correctly. Corpus exposure was 1
+   passing file, verified real by negative control. **The 2821 baseline is not
+   inflated.** Two genuine bugs were re-filed as ordinary correctness work:
+   `process.stdout`/`stderr` are not real `Writable`s (will cap the `test-tty-*`
+   subtree later), and `child.stdin.write(chunk, cb)` does swallow a throw.
+2. **Screen on failure logs, not source greps.** The `emitWarning` lane found a
+   real, genuinely cross-cutting divergence (JSC-shaped warning stack instead of
+   node's `Name: message\n    at …`) and it moved **zero** files, because no
+   corpus test asserts on a warning's stack. 73 files referenced the API, 28 were
+   non-passing, **0** were blocked by it. Reading those 28 failure logs takes two
+   minutes and would have predicted the zero before two rebuilds. The sibling
+   `identity` lane measured the same asymmetry: `execPath` has 281 non-passing
+   references and zero divergence. **Source references measure surface area;
+   failure logs measure blocked files. Gate on the logs.**
+
+### Retired veins (do not re-fund)
+
+- **Runtime-identity symbols.** Ten screened (`title`, `execArgv`, `ppid`,
+  `release`, `config`, `version`, `versions`, `hostname`, `execPath`,
+  `arch`/`platform`). Only `execArgv` cleared the gate (+1). `process.title` is
+  worth at most 1 file and needs argv-area/prctl rewriting. The rest either do
+  not diverge or would require mbun to reproduce **node's build manifest**
+  (dependency list, ABI pins, `-node.N` V8 string) — not honestly passable.
+- **Broad trace_events.** 2 files are unsatisfiable on JSC (`cat:'v8'` with
+  `V8.*` names — no honest source; passing them means inventing event names), 2
+  are permanently skipped, and 11 each need a different subsystem's
+  instrumentation seam. Only two bounded items remain (`api-worker-disabled`,
+  `console`), worth ~2 files.
+- **webcrypto "as a cluster".** The cluster reading failed twice running: one
+  lane predicted 3 and paid 1, the next predicted 2–4 and paid 1. Remaining
+  failures are individually priced. 8 of 20 are blocked on algorithms the
+  vendored OpenSSL lacks (TurboSHAKE, ML-KEM/ML-DSA, Argon2) — remaining work,
+  not lane work.
+
+### Operational: build-lock contention is now the throughput ceiling
+
+At 5 concurrent lanes the shared `build_lock.sh` serialises every build, and one
+lane measured **~12 minutes of queue wall-clock** for a single slot; two lanes
+blew a 30-minute box on build latency alone, not analysis. Wave 40 ran 32
+files/hour, wave 41 ran ~19. Options for wave 42, in preference order: (a) run
+**4 lanes** rather than 5, (b) prefer lanes whose targets share a subsystem so
+one build serves two items, (c) have integration land fully-diagnosed ≤5-line
+fixes directly instead of spending a lane plus two builds on them — that is how
+the CryptoKey `structuredClone` fix landed here for free.
+
+### Next candidates, ranked by the evidence above
+
+1. `uncaughtException` → running-test attribution in `node:test` (shared
+   mechanism; the runner2 lane worked around it and expects >1 file).
+2. REPL line-editor fidelity — but per-file, using the standalone-probe method
+   the repl3 lane validated (extract one sub-test, seed its precondition, diff
+   chunk-by-chunk; ~4 min/sub-test). Budget **one file per lane**.
+3. `child.stdin.write/end` callback throw propagation (small, real false-green
+   vector, land before any child_process lane).
+4. `new Buffer(10)` emits no DEP0005 at all — blocks 2 files, but needs a wide
+   guard because it changes stderr for every test calling `new Buffer`.
+5. `process.stdout`/`stderr` as real `Writable`s — large, but it silently caps a
+   whole subtree.
+
 ## 2026-07-29 20:35 — WAVE 40 FINAL: +24 Node green, 0 regressions
 
 Eight lanes total (five dispatched, three re-tasked as lanes freed). Integrated on
