@@ -131,8 +131,11 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
     // OperationError (ref: bun/WebKit CryptoAlgorithm size guards). Checked before
     // the copy so an oversized buffer never gets duplicated.
     const MAX_BUFFER_BYTES = 0x7fffffff;
+    // `instanceof ArrayBuffer` is realm-bound. WebCrypto accepts an ArrayBuffer
+    // created by vm/another realm, but deliberately still rejects SharedArrayBuffer.
+    const isArrayBuffer = (value) => Object.prototype.toString.call(value) === "[object ArrayBuffer]";
     const copyBytes = (value) => {
-      if (value instanceof ArrayBuffer) {
+      if (isArrayBuffer(value)) {
         if (value.byteLength > MAX_BUFFER_BYTES) throw operationError("Data is too large");
         // A detached (transferred) buffer reads as zero bytes in node rather
         // than throwing — the algorithm then fails with its own OperationError.
