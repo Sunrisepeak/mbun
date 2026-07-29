@@ -1014,7 +1014,7 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
       if (p.protocol === "data:") return { source: dataUrlSource(p.href) };
       if (p.protocol !== "file:") {
         const e = new TypeError("The URL must be of scheme file: Received protocol '" + p.protocol + "'");
-        e.code = "ERR_UNSUPPORTED_ESM_URL_SCHEME"; throw e;
+        e.code = "ERR_INVALID_URL_SCHEME"; throw e;
       }
       const u = M["url"] || M["node:url"];
       return { path: u && u.fileURLToPath ? u.fileURLToPath(p) : p.pathname };
@@ -1024,11 +1024,13 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
       const e = new TypeError('The "filename" argument must be of type string or an instance of URL. Received ' + recvType(filename));
       e.code = "ERR_INVALID_ARG_TYPE"; throw e;
     }
-    if (p.startsWith("data:")) return { source: dataUrlSource(p) };
+    if (p.startsWith("data:")) {
+      const e = new TypeError("The worker script or module filename must be an absolute path or a relative path starting with './' or '../'. Wrap data: URLs with `new URL`. Received \"" + p + "\"");
+      e.code = "ERR_WORKER_PATH"; throw e;
+    }
     if (p.startsWith("file://")) {
-      const u = M["url"] || M["node:url"];
-      try { return { path: u && u.fileURLToPath ? u.fileURLToPath(p) : p.slice(7) }; }
-      catch (e) { const err = new TypeError("Invalid file URL: " + p); err.code = "ERR_INVALID_URL"; throw err; }
+      const e = new TypeError("The worker script or module filename must be an absolute path or a relative path starting with './' or '../'. Wrap file: URLs with `new URL`. Received \"" + p + "\"");
+      e.code = "ERR_WORKER_PATH"; throw e;
     }
     if (!pathM.isAbsolute(p) && !/^\.\.?[/\\]/.test(p)) {
       const e = new TypeError("The worker script or module filename must be an absolute path or a relative path starting with './' or '../'. Received \"" + p + "\"");
@@ -1097,6 +1099,9 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
         if (PN && PN.enabled && !PN.has("worker")) throw PN.denyError("worker", "");
       }
       options = options || {};
+      if (options.eval === true && typeof filename !== "string") {
+        throw new TypeError("The property 'options.eval' must be false when 'filename' is not a string.");
+      }
       // node splits the constructor's transferList exactly as MessagePort's
       // postMessage does: ports move to the worker, ArrayBuffers are detached
       // once the message has been serialised.
