@@ -1706,7 +1706,12 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       }
       encodeInto(str, dest) {
         str = String(str);
-        if (!(dest instanceof Uint8Array)) throw new TypeError("The destination must be a Uint8Array");
+        // Cross-realm safe: a vm context's Uint8Array is a different constructor
+        // than the one this builtin closed over, so `instanceof` alone rejects a
+        // perfectly valid destination allocated inside `vm.runInNewContext`.
+        if (!(dest instanceof Uint8Array) &&
+            Object.prototype.toString.call(dest) !== "[object Uint8Array]")
+          throw new TypeError("The destination must be a Uint8Array");
         let read = 0, written = 0;
         while (read < str.length) {
           const first = str.charCodeAt(read); let consumed = 1, bytes;
