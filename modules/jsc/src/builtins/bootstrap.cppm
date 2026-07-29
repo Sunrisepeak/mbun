@@ -3363,8 +3363,18 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       const isValid = code !== 47 /* / */ && code !== 92 /* \ */ && code !== 35 /* # */ && code !== 63 /* ? */ && code !== 58 /* : */;
       if (!isValid) {
         // A leftover ":" here means an invalid (non-numeric) port — the valid
-        // trailing :port was already stripped by parseHost(); node throws.
-        if (code === 58) { const e = new TypeError("The argument 'url' Invalid port in url. Received " + JSON.stringify(url)); e.code = "ERR_INVALID_ARG_VALUE"; throw e; }
+        // trailing :port was already stripped by parseHost(). node lib/url.js
+        // getHostname() stays lenient: it emits DEP0170 once and folds the
+        // leftover into the pathname (`git+ssh://git@github.com:npm/npm` ->
+        // hostname "github.com", pathname "/:npm/npm").
+        if (code === 58 && urlWarnInvalidPort) {
+          urlWarnInvalidPort = false;
+          if (G.process && typeof G.process.emitWarning === "function") {
+            G.process.emitWarning(
+              "The URL " + url + " is invalid. Future versions of Node.js will throw an error.",
+              "DeprecationWarning", "DEP0170");
+          }
+        }
         self.hostname = hostname.slice(0, i);
         return "/" + hostname.slice(i) + rest;
       }
@@ -3727,6 +3737,17 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     flush();
     return parts.length === 1 ? parts[0] : Buffer.concat(parts);
   };
+  // WHATWG "file host state": a would-be host that is a Windows drive letter is
+  // not a host at all — it belongs to the path, so `file://C:/x` parses as host
+  // "" + pathname "/C:/x". WTF::URL (the parser behind JSC's global URL) skips
+  // that quirk and yields host "c", which then trips the
+  // ERR_INVALID_FILE_URL_HOST guard below. Normalise the string form before
+  // handing it to the parser. ref: https://url.spec.whatwg.org/#file-host-state
+  // and compat/bun/test/js/node/url/url.test.ts "#16705".
+  const urlFileDriveQuirk = (s) => {
+    const m = /^(file:\/\/)([a-zA-Z])[:|](?:[/\\?#]|$)/i.exec(s);
+    return m ? m[1] + "/" + s.slice(m[1].length) : s;
+  };
   const urlMod = {
     URL: G.URL, URLSearchParams: G.URLSearchParams, Url,
     // node lib/url.js re-exports URLPattern. It is installed by the
@@ -3736,7 +3757,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     // faithful port of node lib/internal/url.js fileURLToPath / getPathFromURL{Win32,Posix}
     fileURLToPath: (path, options) => {
       const windows = options == null ? undefined : options.windows;
-      if (typeof path === "string") path = new G.URL(path);
+      if (typeof path === "string") path = new G.URL(urlFileDriveQuirk(path));
       else if (!urlIsURLLike(path)) { const e = new TypeError('The "path" argument must be of type string or an instance of URL.' + urlArgTypeReceived(path)); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
       if (path.protocol !== "file:") { const e = new TypeError("The URL must be of scheme file"); e.code = "ERR_INVALID_URL_SCHEME"; throw e; }
       const useWin = windows === undefined ? __isWin : windows;
@@ -3767,7 +3788,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     },
     fileURLToPathBuffer: (path, options) => {
       const windows = options == null ? undefined : options.windows;
-      if (typeof path === "string") path = new G.URL(path);
+      if (typeof path === "string") path = new G.URL(urlFileDriveQuirk(path));
       else if (!urlIsURLLike(path)) { const e = new TypeError('The "path" argument must be of type string or an instance of URL.' + urlArgTypeReceived(path)); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
       if (path.protocol !== "file:") { const e = new TypeError("The URL must be of scheme file"); e.code = "ERR_INVALID_URL_SCHEME"; throw e; }
       const useWin = windows === undefined ? __isWin : windows;

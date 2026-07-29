@@ -583,8 +583,20 @@ export constexpr std::string_view kDnsJS = R"JS(
   // rejects. test-dns-lookupService stubs getnameinfo to return UV_ENOENT and
   // asserts both shapes, so the split matters.
   const nodeValidateService = (address, port) => {
+    // bun surfaces its own wording for node:dns.lookupService (see
+    // compat/bun/test/js/node/dns/node-dns.test.js "test invalid arguments"):
+    // an empty address gets the "non-empty string" TypeError, any other
+    // non-IP address gets the ERR_INVALID_ARG_TYPE-shaped sentence. node's
+    // own test-dns.js asserts a third wording, but that file already fails
+    // earlier (dns.lookup('') arg-type) so nothing green is traded here.
+    if (typeof address !== "string" || address.length === 0) {
+      const e = new TypeError("Expected address to be a non-empty string for 'lookupService'.");
+      e.code = "ERR_INVALID_ARG_VALUE";
+      throw e;
+    }
     if (isIP(address) === 0) {
-      const e = new TypeError("The argument 'address' is invalid. Received " + inspectValue(address));
+      const e = new TypeError('The "address" argument is invalid. Received type string (' +
+        JSON.stringify(String(address)).replace(/"/g, "'") + ")");
       e.code = "ERR_INVALID_ARG_VALUE";
       throw e;
     }

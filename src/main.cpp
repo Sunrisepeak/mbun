@@ -238,7 +238,7 @@ int main(int argc, char* argv[]) {
         if (preloadFlag) {
             const bool separateValue{args[0] == "--preload" || args[0] == "--require" ||
                                      args[0] == "-r" || args[0] == "--import"};
-            const std::size_t count{separateValue && args.size() > 1 ? 2 : 1};
+            const std::size_t count{separateValue && args.size() > 1 ? std::size_t{2} : std::size_t{1}};
             args.erase(args.begin(), args.begin() + static_cast<std::ptrdiff_t>(count));
             continue;
         }
