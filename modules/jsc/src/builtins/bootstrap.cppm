@@ -1350,10 +1350,25 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       if (fn[kCustom] !== undefined && fn[kCustom] !== null) {
         const c = fn[kCustom];
         if (typeof c !== "function") { const e = new TypeError('The "util.promisify.custom" property must be of type function. Received ' + typeof c); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
+        if (!c.name && typeof fn.name === "string") {
+          try { Object.defineProperty(c, "name", { value: fn.name, configurable: true }); } catch (e) {}
+        }
         Object.defineProperty(c, kCustom, { value: c, enumerable: false, writable: false, configurable: true });
         return c;
       }
-      const p = function (...a) { return new Promise((res, rej) => { fn.call(this, ...a, (e, v) => (e ? rej(e) : res(v))); }); };
+      const argNames = Object.getOwnPropertySymbols(fn).map((s) =>
+        s.description === "customPromisifyArgs" ? fn[s] : undefined).find(Array.isArray);
+      const p = function (...a) { return new Promise((res, rej) => {
+        fn.call(this, ...a, (e, ...values) => {
+          if (e) return rej(e);
+          if (argNames && argNames.length > 1) {
+            const result = {};
+            for (let i = 0; i < argNames.length; i++) result[argNames[i]] = values[i];
+            return res(result);
+          }
+          return res(values[0]);
+        });
+      }); };
       Object.defineProperty(p, kCustom, { value: p, enumerable: false, writable: false, configurable: true });
       // node promisify() copies `original`'s prototype and own descriptors onto
       // the wrapper, so `name` / `length` and any decoration survive.
@@ -2819,7 +2834,10 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     try { Object.defineProperty(G, "__bunResolveObjectURL", { value: __resolveObjectURL, enumerable: false, configurable: true, writable: true }); } catch (e) {}
     G.URL = class URL {
       get [Symbol.toStringTag]() { return "URL"; }
-      static canParse(input, ...rest) { try { new G.URL(input, ...rest); return true; } catch (e) { return false; } }
+      static canParse(input, ...rest) {
+        if (arguments.length === 0) { const e = new TypeError('The "url" argument must be specified'); e.code = "ERR_MISSING_ARGS"; throw e; }
+        try { new G.URL(input, ...rest); return true; } catch (e) { return false; }
+      }
       static parse(input, ...rest) { try { return new G.URL(input, ...rest); } catch (e) { return null; } }
       static createObjectURL(blob) {
         if (arguments.length < 1) { const e = new TypeError("Not enough arguments"); e.code = "ERR_MISSING_ARGS"; throw e; }
