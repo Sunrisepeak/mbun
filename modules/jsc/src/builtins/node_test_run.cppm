@@ -715,6 +715,8 @@ inline constexpr std::string_view kNodeTestRunJS = R"JS(
             const inline = eq === -1 ? undefined : raw.slice(eq + 1);
             switch (name) {
                 case "--test": break;
+                case "--strip-types": case "--experimental-strip-types": opts.stripTypes = true; break;
+                case "--no-strip-types": case "--no-experimental-strip-types": opts.stripTypes = false; break;
                 case "--test-only": opts.only = true; break;
                 case "--test-force-exit": opts.forceExit = true; break;
                 case "--test-update-snapshots": opts.updateSnapshots = true; break;
@@ -821,6 +823,14 @@ inline constexpr std::string_view kNodeTestRunJS = R"JS(
 
     G.__mbunNodeTestCli = (files, flags) => {
         const { opts, reporterNames, destinations } = parseTestFlags(flags || []);
+        // Node gates this mode on its optional Amaro dependency. mbun does not
+        // expose that Node capability, so do not silently ignore the flag and
+        // run a JavaScript-only discovery instead.
+        if (opts.stripTypes) {
+            try { G.process.stderr.write("Type stripping is not supported in this build of Node.js\n"); } catch (e) {}
+            G.process.exitCode = 1;
+            return;
+        }
         // The shape node reports (utils.js globalTestOptions), in its order.
         debugConfiguration({
             isTestRunner: true,
