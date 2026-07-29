@@ -393,9 +393,6 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
       if (!Number.isInteger(sessionTimeout)) throw ERR_OUT_OF_RANGE("options.sessionTimeout", "an integer", sessionTimeout);
       if (sessionTimeout < 0 || sessionTimeout > 2147483647) throw ERR_OUT_OF_RANGE("options.sessionTimeout", ">= 0 && <= 2147483647", sessionTimeout);
     }
-    if (options.cert) throwOnInvalidTLSArray("options.cert", options.cert);
-    if (options.key) throwOnInvalidTLSArray("options.key", options.key, true);
-    if (options.ca) throwOnInvalidTLSArray("options.ca", options.ca);
   }
 
   // ---- SecureContext ----
@@ -502,6 +499,9 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
     constructor(options, cached = true) {
       if (options) {
         validateSecureContextOptions(options);
+        if (options.cert) throwOnInvalidTLSArray("options.cert", options.cert);
+        if (options.key) throwOnInvalidTLSArray("options.key", options.key, true);
+        if (options.ca) throwOnInvalidTLSArray("options.ca", options.ca);
         if (options.servername != null && typeof options.servername !== "string")
           throw new TypeError("servername argument must be an string");
         if (options.secureOptions != null && typeof options.secureOptions !== "number")
