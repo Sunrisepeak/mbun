@@ -1592,10 +1592,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
         // (TAB/LF/FF/CR/SPACE). String.prototype.trim would also eat U+000B,
         // U+00A0, U+2028 and U+2029, turning labels node rejects with
         // ERR_ENCODING_NOT_SUPPORTED into valid ones.
-        // Web IDL's DOMString conversion uses ToString, which rejects Symbol;
-        // String(Symbol()) would incorrectly turn it into an encoding label.
-        const label = enc === undefined ? "utf-8" : `${enc}`;
-        const key = label.toLowerCase().replace(/^[\t\n\f\r ]+/, "").replace(/[\t\n\f\r ]+$/, "");
+        const key = String(enc === undefined ? "utf-8" : enc).toLowerCase().replace(/^[\t\n\f\r ]+/, "").replace(/[\t\n\f\r ]+$/, "");
         opts = tdValidateOptions(opts, "options");
         const encoding = ENC_ALIAS[key] || SB_ALIAS[key];
         // bun TextDecoder.rs:588-600 — an unknown/replacement label is a
@@ -1605,6 +1602,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
           e.code = "ERR_ENCODING_NOT_SUPPORTED";
           throw e;
         }
+        if (opts && opts.ignoreBOM !== undefined && typeof opts.ignoreBOM !== "boolean") throw new TypeError("TextDecoder(options) ignoreBOM is invalid. Expected boolean value");
         Object.defineProperty(this, kTDEncoding, { value: encoding, enumerable: false, writable: false, configurable: true });
         Object.defineProperty(this, kTDFatal, { value: !!(opts && opts.fatal), enumerable: false, writable: false, configurable: true });
         Object.defineProperty(this, kTDIgnoreBOM, { value: !!(opts && opts.ignoreBOM), enumerable: false, writable: false, configurable: true });
@@ -2198,13 +2196,8 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   if (typeof G.TextDecoderStream === "undefined") {
     G.TextDecoderStream = class TextDecoderStream {
       constructor(label, opts) {
-        if (opts !== undefined && opts !== null && typeof opts !== "object") {
-          const e = new TypeError('The "options" argument must be of type object. Received type ' + typeof opts);
-          e.code = "ERR_INVALID_ARG_TYPE";
-          throw e;
-        }
         opts = opts == null ? {} : opts;
-        const dec = new G.TextDecoder(label === undefined ? "utf-8" : label, opts);
+        const dec = new G.TextDecoder(label === undefined ? "utf-8" : label, { fatal: !!opts.fatal, ignoreBOM: !!opts.ignoreBOM });
         this.encoding = dec.encoding; this.fatal = dec.fatal; this.ignoreBOM = dec.ignoreBOM; let ctrl;
         this.readable = new G.ReadableStream({ start(c) { ctrl = c; } });
         this.writable = new G.WritableStream({ write(chunk) { const s = dec.decode(chunk, { stream: true }); if (s) ctrl.enqueue(s); }, close() { const t = dec.decode(); if (t) ctrl.enqueue(t); ctrl.close && ctrl.close(); } });
