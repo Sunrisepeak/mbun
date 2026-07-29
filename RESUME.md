@@ -5,6 +5,93 @@ session that is interrupted (usage limit, crash, restart) can pick up from the
 file rather than from memory. **If you are a fresh session reading this, start
 here.**
 
+## 2026-07-30 02:10 — WAVE 47: 4 lanes, all met or beat their numeric goal
+
+Pre-dispatch gates now run every wave (this is the fix for wave 46, where a
+toolchain flip cost three lanes a box each):
+
+| gate | wave-47 reading | decision |
+| --- | --- | --- |
+| base builds | `build_or_die: ok — 607a9025567c80a3` | dispatch allowed |
+| resources | 38 GB free, load 1.95, **disk 31 GB (98%)** | disk binding → reclaimed to 33 GB |
+| stray runners | 0 | clean |
+
+**Parallelism set to 4, not the permitted 5** — disk, not RAM, is the binding
+constraint (each lane's `target/` grows and the box hit 98% twice). Record the
+input, not just the number.
+
+| lane | goal | actual |
+| --- | --- | --- |
+| n47 (bun js/node) | ≥3 | **4** (3 fixes + 1 flake it correctly refused to bank) |
+| b47 (bun js/bun) | ≥3 | **3** |
+| r47 (bun regression) | ≥2 | **2** |
+| x47 (bundler+mixed) | ≥2 | 0 in-list, +1 out-of-list, plus the verdict below |
+
+### The find of the wave: a silent data-corruption bug in the native byte bridge
+
+`JSObjectGetTypedArrayBytesPtr` answers the ArrayBuffer **base**, while
+`JSObjectGetTypedArrayByteLength` is **view-relative**. Every typed array with a
+non-zero `byteOffset` crossing into native was therefore read from the wrong
+bytes at the right length — corruption, not a crash.
+
+The lane found it by refusing to read decompression code: a raw-socket dump of
+the wire bytes located the corruption on the *server* side in ~4 minutes, and a
+copy-vs-view A/B pinned it. It also explains the exact pass/fail split in both
+files it fixed — `Bun.gzipSync` returns a fresh array and `Uint8Array#slice`
+copies (offset 0, passed), while `node:zlib` returns a Buffer whose `.slice` is
+`subarray` (offset ≠ 0, failed).
+
+**Integration audited all 13 call sites**: 8 read caller-supplied views and are
+now fixed (`bun_build`, `sql`, `sqlite`, `valkey_client`, `sourcemap`, bun:ffi
+`ptr()` ×2, the ffi argument coercion); 5 write into freshly-allocated arrays
+whose offset is always 0 and are correct as-is; ArrayBuffer paths need no offset.
+**sqlite/sql/valkey/ffi are the ones that mattered** — a `buf.subarray(n)` bound
+as a blob or handed to native code silently carried the wrong bytes.
+
+### A cross-corpus conflict RESOLVED rather than traded
+
+The http2 `SETTINGS_ENABLE_PUSH` fix (wave 46) *injected* `enablePush:false` into
+the server's initial SETTINGS, making the frame 6 bytes where node sends an
+**empty** one — which regressed node's `test-http2-settings-unsolicited-ack.js`
+(it deep-equals the raw frame). Narrowed to **clamp a caller-supplied value, never
+inject one**: an empty frame already satisfies bun's `29073`. Both now pass —
+`test-http2` 213/272 (exactly baseline, +0 −0) and `29073` green. This is the
+third conflict shape: not "route through `__bunStyle`", not "irreducible", but
+**the bun requirement was weaker than the implementation assumed**.
+
+### Verdict: "the bundler" is at least FOUR projects, not one
+
+Three lanes had reported bundler failures as one output-format cause. A lane
+checked and refuted it: its 7 files fail in 6 independent subsystems —
+output-format/chunking, **a CSS color model that does not exist at all**,
+build-time macros, metafile/compile, TS-syntax rejection, macro error reporting.
+Note the CSS file's 24 "passing" tests pass **by accident**: mbun echoes anything
+unfoldable verbatim, which happens to match the expected `lab()` rows. Best
+value-per-line item found: port `map_gamut`/`delta_eok`/`gam_srgb`/P3→XYZ from
+`compat/bun/src/css/values/color.rs` (~300 lines), which would green a whole file
+and likely several `css/wpt/*` siblings.
+
+### Screen corrections 6 and 7 (from lane evidence)
+
+6. **Drop `spawn node ENOENT` / `Node.js not found in PATH`.** There is no `node`
+   on PATH, so those files are permanently unwinnable — 4 of n47's 23 (17%).
+7. **Live-network tests can pass spuriously.** `js/node/dns/node-dns.test.js`
+   flipped green with no code change: it does a real `google.com` round-robin
+   lookup. The existing `ENOTFOUND|getaddrinfo` filter misses it because the
+   lookup *succeeds*. Screen on the test SOURCE touching public hostnames, not on
+   failure text — and never bank such a flip as a win.
+
+### Two cross-corpus traps recorded before they cost anything
+
+- `getStringWidth('👨‍👩‍👦‍👦')`: bun wants 2, node's
+  `test-readline-promises-interface.js` wants 8. That node file is **skipped**
+  today, so the ZWJ fix is free — if it is ever unskipped this becomes real.
+- `'gc' in globalThis` must be false without `--expose-gc`, but the lazy `gc`
+  accessor is installed unconditionally (execArgv is not populated when builtins
+  evaluate) and `in` does not invoke a getter. Fix by deleting the property once
+  execArgv exists — do **not** drop the accessor, node depends on
+  `typeof gc === "function"` under the flag.
+
 ## 2026-07-30 01:00 — TOOLCHAIN INCIDENT + wave 46
 
 ### The incident: the global toolchain flipped to clang mid-session
