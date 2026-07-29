@@ -5,6 +5,98 @@ session that is interrupted (usage limit, crash, restart) can pick up from the
 file rather than from memory. **If you are a fresh session reading this, start
 here.**
 
+## 2026-07-30 04:00 — WAVE 49: the strongest wave of the campaign
+
+**Node 2,821 → 2,916 / 4,433 (65.78%)** across the PR, +95 with **zero regressions**,
+from **2,822 guard files actually measured**. Wave 49 alone moved three subsystems:
+
+| subtree | wave-39 | now |
+| --- | --- | --- |
+| `test-vm` | 52/98 | **68/98** |
+| `test-crypto` | 86/129 | **98/129** |
+| `test-http2` | 213/272 | **220/272** |
+| bun `shell/` dir | 20 green | **27 green** |
+
+Lane goals vs actual: vmmod **8**/≥3, h2b **4**/≥2, cr2 **4**/≥3, coreutils **4**/≥3,
+vm **4**/≥3, rawkey **2**/≥2, parsermeta (bug lane), sh 1/≥2.
+
+### A source-corruption bug, and my hypothesis about it was wrong
+
+`mbun -e 'const s = "x = import.meta;"; console.log(JSON.stringify(s))'` printed
+`"x = __mbunImportMeta;"`. I briefed this as a parser bug at
+`js_parser.cppm:5550`. **The parser was innocent** — its `add_edit` calls take
+positions from real tokens and are structurally immune, proven by a required-module
+probe that came back byte-identical.
+
+The culprit was a legacy blind text pass on the **entry path only**,
+`engine.inc:507` `transform_module_`: a `std::string::find`/`replace` over the whole
+source with no notion of string literals. It was worse than reported — because the
+parser has *already* lowered every genuine `import.meta`, that pass's guard was true
+**only when the remaining occurrence was inside a string or comment**. It was dead
+for correct code and live exclusively for the corrupting case. And when it fired it
+also ran `strip_await_`, silently deleting **every `await`** in the file.
+
+Deleted, along with three now-dead helpers. `test-vm` +16, `test-module` +1,
+0 regressions, bun transpiler/resolve/shell/bundler sweep 67/67 green.
+
+**Audit result:** there are now **zero** blind text substitutions over source on the
+C++ side. The one remaining is the JS-side `DYNIMPORT_RE` in `node_vm.cppm`, a
+deliberate trade-off. **The dangerous pattern to grep for is `strip_await_`-class
+helpers, not `add_edit`.**
+
+### Method worth propagating: prototype against the live native bridge
+
+The `rawkey` lane implemented raw KeyObject export/import in **one build, no
+round-trips**, by monkeypatching `globalThis.__mbunCryptoAsymNative` from user JS
+until both target tests exited 0, and only then porting the proven JS into the
+`.cppm`. Any lane working the JS-in-C++-raw-string layer can do this, and it
+sidesteps the build lock that is our throughput ceiling.
+
+### "One shared cause" was an umbrella for the FIFTH time
+
+`vmmod`'s 14 files were briefed as "ordinary vm.Module semantics". They resolved into
+**6 distinct causes** — export-list regex capturing one declarator, link() recursing
+before resolving the whole request list, SyntheticModule evaluation needing to settle
+immediately per tc39 `#sec-smr-Evaluate`, re-entrant evaluate needing
+`ERR_VM_MODULE_STATUS`, namespace needing `Symbol.toStringTag` as a non-configurable
+own key, and `importModuleDynamically` resolving to a namespace rather than a Module.
+Fixing all six greened 8 files.
+
+### The http2 "5-file cost" in the source comment was wrong
+
+The comment said force-finishing open streams cost 5 files, which had frozen that
+code. `h2b` separated it into **timing** (sweeping inside the teardown microtask
+reorders the stream's own `'close'`/`'aborted'`) and **error injection** (destroying
+with `ERR_HTTP2_STREAM_CANCEL` re-reports a death the test already saw). Injection
+alone costs **8** files, named in the lane report; a bare `destroy()` one I/O turn
+later costs zero. **Rule: settle, do not re-report.** Those 8 names are now a
+mandatory gate for any http2 teardown change.
+
+### Lanes corrected the briefing four times this wave
+
+- `cr2`: my `setFips` item was **inverted** — node does not refuse it in a non-FIPS
+  build (`TODO(richardlau)` in the test); mbun's throw is the bug.
+- `vmmod`: my "7/7 bun vm files exit 0" did not reproduce (6/7 fail, all pre-existing
+  — the child is spawned without `--experimental-vm-modules`).
+- `coreutils`: refuted that `bunshell.test.ts`'s 97 failures were coreutils text (the
+  `(fail)` name set is byte-identical), and found `yes.test.ts` mis-filed — `yes` is
+  already a builtin; its 3 failures are JS-buffer redirect targets punting out of the
+  interpreter at `bunsh.inc:239`.
+- `sh`: measured the `$(...)` reach as 4 files, only 1 actually gated — so the
+  `${{raw:}}` pattern did **not** repeat, and it pivoted rather than assume.
+
+### Deliberate non-actions worth keeping
+
+- `coreutils` left `cp`/`cat`/`mkdir`/`touch` falling through to GNU rather than ship
+  partial builtins, because a half-written `ls`/`rm` **replaces the binary other shell
+  tests' own helpers depend on** (`rm.test.ts` uses `ls -d`, `mkdir`, `touch`).
+- `rawkey` returned `ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS` for RSA/DSA/DH raw export
+  and for `raw-seed` rather than invent an encoding — the JWK bridge cannot represent
+  DSA, and seeds belong only to the absent PQC providers.
+- `test-http2-altsvc` is green but its response is still truncated; it passes because
+  the stream is *settled*, not because the DATA arrives. Recorded as a separate open
+  bug rather than banked.
+
 ## 2026-07-30 03:00 — WAVE 48: +9 node, +5 bun, 0 real regressions
 
 **Node 2,876 → 2,885** (`test-crypto` 86→92, `test-http2` 213→216; +9 −0 over 401
