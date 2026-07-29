@@ -1310,8 +1310,14 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
         ? this.options.agentKeepAliveTimeoutBuffer : 1000;
 
     validateOneOf(this.scheduling, "scheduling", ["fifo", "lifo"]);
-    if (this.maxTotalSockets !== undefined) validateNumber(this.maxTotalSockets, "maxTotalSockets", 1);
-    else this.maxTotalSockets = Infinity;
+    if (this.maxTotalSockets !== undefined) {
+      validateNumber(this.maxTotalSockets, "maxTotalSockets", 1);
+      // Relational comparisons deliberately leave NaN unordered, but Node's
+      // validateNumber rejects it for this positive socket-count limit.
+      if (Number.isNaN(this.maxTotalSockets)) {
+        throw ERR_OUT_OF_RANGE("maxTotalSockets", ">= 1", this.maxTotalSockets);
+      }
+    } else this.maxTotalSockets = Infinity;
 
     this.on("free", (socket, options) => {
       const name = this.getName(options);
@@ -1452,6 +1458,12 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
       if (!this.sockets[name]) this.sockets[name] = [];
       this.sockets[name].push(s);
       this.totalSocketCount++;
+      // net.createConnection receives the option but Socket does not arm an
+      // idle timer by itself. Apply the Agent timeout before onSocket() so the
+      // request observes both the interval and its forwarding listener.
+      if (options.timeout !== undefined && typeof s.setTimeout === "function") {
+        s.setTimeout(options.timeout);
+      }
       installListeners(this, s, options);
       cb(null, s);
     });
