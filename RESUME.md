@@ -65,13 +65,34 @@ The pushed wave-26 tree completed both current runner measurements:
   1646 current non-pass files.
 - Bun executable discovery: **89 / 230 green**, 123 test-failure, 1 timeout,
   4 blocked-external, 11 all-skipped, 1 no-tests, and 1 ahead-of-reference.
-  Assertion totals are 4441 pass / 1371 fail.
+Assertion totals are 4441 pass / 1371 fail.
 
 Named causal wave accounting totals +147 while full-corpus net movement is
 +133. Treat the 14-file difference as proof that scoped guards are not a
 substitute for full checkpoint de-duplication/regression measurement. For Bun,
 rank by failed assertions per wall-clock rather than files: JSON5 (205),
 JSONL (171), and WPT Streams (120) are the current top three.
+
+### Sprint wave 27 measured checkpoint (14:57–15:15)
+
+The first assertion-ranked Bun wave reduced **438 failed assertions/tests in
+18 minutes** (about **1460/hour**) and made `Bun.inspect.table` fully green:
+
+- JSONL -166, JSON5 -143, Bun.inspect.table -35, WPT Streams -28;
+- TOML -23, REPL -19, GFM -10, crypto -7, URLPattern -4, ALS -3.
+
+All ten targets moved positively, but only Bun.inspect.table is a newly green
+file; do not convert the other assertion deltas into file coverage. JSONL's
+first candidate OOM was fixed before acceptance by restoring the native
+allocation guard. The exact build, conflict-marker check, submodule-gitlink
+check, and `git diff --check` pass.
+
+Continue dispatching by failed assertions per minute. Prefer one missing API or
+entrypoint that owns a large homogeneous cluster; stop investing in dispersed
+tails such as the remaining URLPattern failures. Wave 28 is analyzing the
+remaining TOML 25, crypto 17, and REPL 98 failures. Run complete Node and Bun
+corpora only after the wave-27 PR push, then use that result to detect global
+regressions and re-rank.
 
 ### Sprint wave 1 measured checkpoint (10:55–11:15)
 

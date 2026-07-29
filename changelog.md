@@ -5,6 +5,28 @@
 
 ## 2026-07-29
 
+### 5 小时冲刺第二十七批：18 分钟净减 438 个 Bun 失败断言，1 文件全绿
+
+14:57–15:15 按全量 checkpoint 的失败断言排序，三条静态实现 lane、主线统一
+构建和逐文件原生验收。十个独立目标全部正收益：
+
+- JSONL **98/171 → 264/5**（-166 fail），并恢复 4GB allocation guard，
+  消除候选首次运行的 OOM；
+- JSON5 **116/205 → 259/62**（-143）；
+- WPT Streams **1055/120 → 1083/92**（-28），TOML
+  **35/48 → 58/25**（-23），GFM **20/42 → 30/32**（-10）；
+- `Bun.inspect.table` **0/35 → 35/0**，本轮唯一完整新绿文件；
+- REPL **0/117 → 19/98**（-19），crypto **178/24 → 185/17**
+  （-7），URLPattern **392/16 → 396/12**（-4）；
+- AsyncLocalStorage **22/21 → 25/18**（-3），同时 Node 三个
+  Worker/MessagePort `hasRef` 守卫维持 3/3。
+
+合计净减少 **438 个失败测试/断言**，约 **1460 fail assertions/hour**。
+除 `Bun.inspect.table` 外其余文件仍红，未计作 green-file coverage。策略继续
+按 failed assertions/minute 排序；JSON5/JSONL 的高聚类缺失 API 明显优于
+URLPattern 等分散长尾，后者降级。精确构建和结构守卫全绿；完整 Node/Bun
+corpus 只在本 checkpoint 推送 PR 后运行。
+
 ### 5 小时冲刺全量 checkpoint：Node 2787/4433，Bun 89/230
 
 PR wave26 推送后按统一 runner 完成全量实测：
