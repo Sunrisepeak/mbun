@@ -2317,13 +2317,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     const cap = shortTick || LONG_PARK;
     return d > cap ? cap : d;
   };
-  // Reset the run-local bookkeeping only. Timers armed while the test FILE was
-  // being evaluated (module scope: a top-level setTimeout/setImmediate, or the
-  // async fs/net work an `fs.readFile`-at-import kicks off) are real pending
-  // work in node/bun — dropping T.q here made every promise a test later awaits
-  // on such a timer hang forever, which the pump then reported as
-  // "test timed out (no pending timers / unresolved async)".
-  G.__mbun_timers_reset = function () { T.now = 0; T.fired = 0; T.batch = 0; };
+  G.__mbun_timers_reset = function () { T.q = []; T.now = 0; T.fired = 0; T.batch = 0; };
 
   // ---- Headers (WHATWG, case-insensitive multi-map) ----
   if (typeof G.Headers === "undefined") {
