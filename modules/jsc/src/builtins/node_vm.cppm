@@ -140,9 +140,62 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
       nativeVals,
       mirrored: new Set(),
       proto: new Map(),
+      // Keys of the realm's OWN globals that the running script assigned to.
+      // node's PropertySetterCallback writes every `this.X = …` straight to the
+      // sandbox, so `this.Symbol = Symbol` must surface on the sandbox even
+      // though the value it stored is the realm's own Symbol — a value diff can
+      // never see that write. `trapped` holds the descriptors swapped out to
+      // observe it (see armWriteTraps/disarmWriteTraps).
+      writes: new Set(),
+      trapped: new Map(),
       sandbox,
     };
     return rec;
+  }
+
+  // Swap each untouched realm-global data property for an accessor pair that
+  // records assignments, so syncOut can tell "the script re-assigned this
+  // builtin" from "nobody touched it". The traps live ONLY for the duration of
+  // one run: disarmWriteTraps puts the original descriptor back (carrying the
+  // possibly-updated value) before anything outside the script can observe the
+  // global, so the realm's descriptor shape is unchanged between runs.
+  function armWriteTraps(rec) {
+    const { global: g, nativeKeys, mirrored, writes, trapped } = rec;
+    writes.clear();
+    trapped.clear();
+    for (const key of nativeKeys) {
+      if (mirrored.has(key)) continue;  // sandbox owns it; the normal path applies
+      const d = gOPD(g, key);
+      if (d === undefined || !d.configurable || !("value" in d) || d.writable !== true) continue;
+      let cur = d.value;
+      try {
+        ObjectDefineProperty(g, key, {
+          get() { return cur; },
+          set(v) { cur = v; writes.add(key); },
+          enumerable: d.enumerable,
+          configurable: true,
+        });
+        trapped.set(key, d);
+      } catch { /* ignore */ }
+    }
+  }
+
+  function disarmWriteTraps(rec) {
+    const { global: g, trapped } = rec;
+    for (const [key, d] of trapped) {
+      const cur = gOPD(g, key);
+      // The script may have redefined the key outright (defineProperty beats the
+      // accessor); in that case leave its definition alone.
+      if (cur === undefined || cur.get === undefined) continue;
+      let value;
+      try { value = cur.get.call(g); } catch { continue; }
+      try {
+        ObjectDefineProperty(g, key, {
+          value, writable: d.writable, enumerable: d.enumerable, configurable: d.configurable,
+        });
+      } catch { /* ignore */ }
+    }
+    trapped.clear();
   }
 
   function syncIn(rec) {
@@ -193,19 +246,35 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
   }
 
   function syncOut(rec) {
-    const { sandbox, global: g, nativeKeys, nativeVals, mirrored, proto } = rec;
+    disarmWriteTraps(rec);
+    const { sandbox, global: g, nativeKeys, nativeVals, mirrored, proto, writes } = rec;
     const live = new Set();
     for (const key of ownKeys(g)) {
       const desc = gOPD(g, key);
       if (desc === undefined) continue;
       if (nativeKeys.has(key) && !mirrored.has(key)) {
-        // Only a builtin the script actually replaced travels out. An accessor
-        // among the realm's own globals is never one of those, so it stays put
-        // (defining it on the sandbox would be an extra, observable write).
-        if (!("value" in desc)) continue;
-        // SameValue, not ===: the realm's own `NaN` global would otherwise
-        // compare unequal to itself on every single run.
-        if (Object.is(desc.value, nativeVals.get(key))) continue;
+        // Only a builtin the script actually WROTE travels out. The write trap
+        // is authoritative; the value diff is the fallback for keys that could
+        // not be trapped (non-configurable / accessor globals).
+        if (!writes.has(key)) {
+          if (!("value" in desc)) continue;
+          // SameValue, not ===: the realm's own `NaN` global would otherwise
+          // compare unequal to itself on every single run.
+          if (Object.is(desc.value, nativeVals.get(key))) continue;
+        } else if ("value" in desc) {
+          // A trapped write lands on the sandbox the way node's setter callback
+          // lands it: a plain own, enumerable, writable property — not with the
+          // realm global's non-enumerable builtin attributes.
+          live.add(key);
+          try {
+            ObjectDefineProperty(sandbox, key, {
+              value: desc.value === g ? sandbox : desc.value,
+              writable: true, enumerable: true, configurable: true,
+            });
+            mirrored.add(key);
+          } catch { /* ignore */ }
+          continue;
+        }
       } else if (proto.has(key)) {
         // node's PropertySetterCallback always writes to the sandbox itself,
         // so assigning to a name the sandbox merely INHERITS creates an own,
@@ -242,6 +311,7 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
 
   function evalInContext(rec, code, filename) {
     syncIn(rec);
+    armWriteTraps(rec);
     try {
       return NVM.runInContext(rec.handle, code, filename, true);
     } finally {
@@ -502,6 +572,7 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
       runRaw(contextifiedObject, code, filename) {
         const rec = records.get(contextifiedObject);
         syncIn(rec);
+        armWriteTraps(rec);
         try {
           return NVM.runInContext(rec.handle, code, filename, true);
         } finally {
