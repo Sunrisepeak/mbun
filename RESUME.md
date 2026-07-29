@@ -42,11 +42,29 @@ allocating a build slot to historical work, require both:
 
 If both show absorption, skip the candidate before building. The first probe
 returned `0` new files from three tasks, so historical-branch reuse is no longer
-the active allocation strategy. The active three-way batch is drawn directly
-from current failures with named causes: one `test-runner` CLI output mismatch,
-four fs one-offs, and six HTTP/2 error-code mapping files. Agents run only their
-named files; integration owns the build, cross-subsystem guard, checkpoint,
-push, and PR update.
+the active allocation strategy.
+
+A second probe showed that the old unreached inventory was also stale: its four
+fs one-offs and six HTTP/2 error-code files were already `4 / 4` and `6 / 6`
+green. Do not dispatch directly from `compat/data/unreached-inventory.json`
+without a current red run.
+
+The first worklists generated from the latest full `gate-node` logs produced
+three gains with no guard regression:
+
+- worker `84 → 85 / 141` (timeout unchanged at 9);
+- net `108 → 110 / 150` (timeout unchanged at 4);
+- dgram `71 → 71 / 76` (timeout unchanged at 1);
+- `test-runner-*` stayed `28 / 77`, although `test-runner-cli.js` advanced
+  through two independent assertion layers.
+
+**Current dispatch strategy:** regenerate disjoint eight-file worklists from the
+newest full-run logs, prefer files with CLASS/CAUSE signatures, and iterate only
+while a file advances. Agents run their named files and at most two direct
+guards; integration owns the shared build, full related-subtree regression,
+checkpoint, push, and PR update. Reuse the now-warmed worktrees: fresh worktrees
+spent several minutes installing source dependencies while holding the global
+build lock, which serialized the whole wave without using CPU.
 
 ## State
 

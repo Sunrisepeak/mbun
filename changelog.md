@@ -3,6 +3,35 @@
 > 只记录**实质进展**（模块落地、测试集通过数变化、性能节点），倒序排列。
 > 格式：`## YYYY-MM-DD` + 条目（关联任务 ID / commit / 测试与性能数据）。
 
+## 2026-07-29
+
+### 语料续作第一批：新鲜失败清单净增 3 个 Node 文件，三个完整子树回归 0
+
+从 PR #32 的同一构建基线出发，主 Agent 统一构建并对组合树复验：
+
+- worker：`84 → 85 / 141`，`fail 46 → 45`，timeout `9 → 9`；
+- net：`108 → 110 / 150`，`fail 38 → 36`，timeout `4 → 4`；
+- dgram：`71 → 71 / 76`，timeout `1 → 1`；
+- `test-runner-*`：`28 → 28 / 77`，分类保持
+  `28 pass / 43 fail / 3 skipped / 3 timeout`。
+
+三个真实转绿文件是
+`test-worker-message-transfer-port-mark-as-untransferable.js`、
+`test-net-server-call-listen-multiple-times.js` 和
+`test-net-socket-constructor.js`。对应实现补齐
+`isMarkedAsUntransferable` / transfer-list `DataCloneError`、显式 socket fd
+校验和重复 `listen()` 的 `ERR_SERVER_ALREADY_LISTEN`。BroadcastChannel 的
+`MessageEvent` 与入口参数校验也前进到后续独立失败；`test-runner-cli.js`
+依次越过缺失文件 stderr 与默认 `_test` 文件发现/FileTest 两层断言，但
+文件级仍红，因此不计入增量。
+
+本批先试图复用三个本地历史分支，三项在当前目标树均已被不同形状的后续
+提交吸收；随后按旧 `unreached-inventory.json` 分配的 fs 四文件和 HTTP/2
+六文件也分别 `4/4`、`6/6` 已绿。两轮陈旧输入均为 **0 收益**。策略已改为：
+从最新全量 `gate-node` 的日志实时生成 8 文件互斥 worklist，Agent 只跑命名
+文件，主线统一构建并跑完整相关子树。组合树 `build_or_die`、冲突标记守卫、
+submodule gitlink 守卫均通过；`compat/` 未修改。
+
 ## 2026-07-26
 
 ### w5/agent-fs：事件循环回调边界排序（全量 2,460 → **2,470 / 4,433**，回归 0；fs 309/342 不变）
