@@ -52,20 +52,6 @@ void set_cli_preloads(std::vector<std::string> preloads) {
     gCliPreloads = std::move(preloads);
 }
 
-// `--config=<path>` / `--config <path>` (alias `-c`) REPLACES the implicit
-// ./bunfig.toml — it does not layer on top of it (ref bun bunfig/arguments.rs
-// load_config: an explicit path is the only file read). Empty ⇒ implicit lookup.
-std::string gCliConfigPath{};
-
-void set_cli_config_path(std::string path) {
-    gCliConfigPath = std::move(path);
-}
-
-// The bunfig file this invocation should read, honouring an explicit --config.
-std::string bunfig_path() {
-    return gCliConfigPath.empty() ? std::string{"bunfig.toml"} : gCliConfigPath;
-}
-
 // A bare path argument that looks like a runnable script (bun-style `bun x.js`).
 // Defined later in this TU; used by run_install above their definitions.
 std::optional<std::filesystem::path> find_package_json(const std::filesystem::path& start);
@@ -243,9 +229,8 @@ int run_script(std::string_view script, std::span<const std::string_view> script
     std::vector<std::string> preloads{};
     {
         std::error_code ec{};
-        const std::string cfgPath{bunfig_path()};
-        if (std::filesystem::exists(cfgPath, ec)) {
-            std::ifstream in{cfgPath, std::ios::binary};
+        if (std::filesystem::exists("bunfig.toml", ec)) {
+            std::ifstream in{"bunfig.toml", std::ios::binary};
             if (in) {
                 std::string src{std::istreambuf_iterator<char>{in}, std::istreambuf_iterator<char>{}};
                 if (auto root = mbun::toml::parse(src)) {
@@ -824,12 +809,10 @@ int run_test(std::span<const std::string_view> args) {
     // flag parse and each flag only turns the option ON). modules/bunfig already
     // parses `onlyFailures`/`randomize`/`seed`; this is the consumer.
     std::vector<std::string> bunfigPathIgnorePatterns {};
-    std::vector<std::string> testPreloads {};
     {
         std::error_code ec {};
-        const std::string cfgPath { bunfig_path() };
-        if (std::filesystem::exists(cfgPath, ec)) {
-            std::ifstream in { cfgPath, std::ios::binary };
+        if (std::filesystem::exists("bunfig.toml", ec)) {
+            std::ifstream in { "bunfig.toml", std::ios::binary };
             if (in) {
                 const std::string src { std::istreambuf_iterator<char> { in },
                                         std::istreambuf_iterator<char> {} };
@@ -842,12 +825,6 @@ int run_test(std::span<const std::string_view> args) {
                             flags.randomize = true;  // a seed implies randomizing
                         }
                         bunfigPathIgnorePatterns = cfg->test.path_ignore_patterns;
-                        // A `[test] preload` CLOBBERS the universal top-level
-                        // `preload`; without one, `bun test` still runs the
-                        // universal list. Relative entries resolve against the
-                        // bunfig's directory, i.e. the cwd for the implicit file.
-                        testPreloads = cfg->test.preloads.empty() ? cfg->preloads
-                                                                  : cfg->test.preloads;
                         apply_bunfig_jsx(*cfg, mbun::jsc::module_loader::runtime_jsx_options());
                     } else {
                         const auto& e = cfg.error();
@@ -862,14 +839,6 @@ int run_test(std::span<const std::string_view> args) {
             }
         }
     }
-
-    // bunfig preloads run before every test file, then the CLI's own
-    // --preload/--require/--import entries (deduplicated, bunfig first).
-    for (const std::string& preload : gCliPreloads) {
-        if (std::ranges::find(testPreloads, preload) == testPreloads.end())
-            testPreloads.push_back(preload);
-    }
-    mbun::jsc::test_runner::set_preloads(std::move(testPreloads));
 
     // AI-agent detection: bun defaults --only-failures ON for agents so
     // pass/skip/todo lines don't flood the agent's context window
