@@ -955,15 +955,26 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
 
   const collectExec = (child, options, cb, cmd) => {
     const enc = options.encoding === undefined ? "utf8" : options.encoding;
+    // exec() installs a decoder on the exposed child streams, not merely on its
+    // callback result.  This makes `child.stderr.on("data")` observe strings
+    // for a valid encoding.  Invalid encoding labels intentionally select the
+    // Buffer path, matching node's exec encoding normalization.
+    const streamEnc = typeof enc === "string" && enc !== "buffer" && Buffer.isEncoding(enc)
+      ? (enc === "utf-8" ? "utf8" : enc)
+      : null;
     const maxBuffer = options.maxBuffer == null ? 1024 * 1024 : options.maxBuffer;
     const outs = [], errs = [];
     let outLen = 0, errLen = 0, maxErr = null, done = false;
-    const add = (which, name, bytes, stream) => {
+    const add = (which, name, chunk, stream) => {
+      // Stream decoding can combine a split character before this listener
+      // sees it. Re-encode that completed chunk only for byte-accurate
+      // maxBuffer accounting and the final callback accumulator.
+      const bytes = typeof chunk === "string" ? Buffer.from(chunk, streamEnc) : _u8(chunk);
       const arr = which === 0 ? outs : errs;
       const len = which === 0 ? outLen : errLen;
       const streamEncoding = stream && stream._readableState && stream._readableState.encoding;
-      const outputEncoding = streamEncoding || enc;
-      const stringOutput = outputEncoding !== "buffer" && outputEncoding != null;
+      const outputEncoding = streamEncoding || streamEnc;
+      const stringOutput = outputEncoding != null;
       const encoding = outputEncoding === "utf-8" ? "utf8" : outputEncoding;
       const combined = stringOutput ? Buffer.concat(arr.concat([Buffer.from(bytes)])) : null;
       const combinedText = stringOutput ? combined.toString(encoding) : null;
@@ -988,14 +999,18 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
         if (which === 0) outLen = nextLength; else errLen = nextLength;
       }
     };
-    if (child.stdout) child.stdout.on("data", (d) => add(0, "stdout", _u8(d), child.stdout));
-    if (child.stderr) child.stderr.on("data", (d) => add(1, "stderr", _u8(d), child.stderr));
+    if (streamEnc !== null) {
+      if (child.stdout) child.stdout.setEncoding(streamEnc);
+      if (child.stderr) child.stderr.setEncoding(streamEnc);
+    }
+    if (child.stdout) child.stdout.on("data", (d) => add(0, "stdout", d, child.stdout));
+    if (child.stderr) child.stderr.on("data", (d) => add(1, "stderr", d, child.stderr));
     const toOut = (b, stream) => {
       // A caller may override `{ encoding: null }` later with
       // child.stdout.setEncoding(). Node returns strings in that case.
       const streamEncoding = stream && stream._readableState && stream._readableState.encoding;
-      const outputEncoding = streamEncoding || enc;
-      return outputEncoding === "buffer" || outputEncoding == null
+      const outputEncoding = streamEncoding || streamEnc;
+      return outputEncoding == null
         ? b
         : b.toString(outputEncoding === "utf-8" ? "utf8" : outputEncoding);
     };
