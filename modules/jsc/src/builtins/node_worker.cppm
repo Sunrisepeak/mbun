@@ -331,6 +331,20 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
   };
 
   const isPort = (v) => v !== null && typeof v === "object" && v[kQueue] !== undefined;
+  // BroadcastChannel has no transfer-list parameter. Node therefore rejects a
+  // MessagePort anywhere in its payload instead of silently cloning the host
+  // object; recurse through enumerable payload members so a MessageChannel is
+  // caught through its port1/port2 fields too.
+  const containsTransferable = (value, seen = new Set()) => {
+    if (value === null || typeof value !== "object") return false;
+    if (isPort(value)) return true;
+    if (seen.has(value)) return false;
+    seen.add(value);
+    for (const key of Object.keys(value)) {
+      if (containsTransferable(value[key], seen)) return true;
+    }
+    return false;
+  };
   const portHasListener = (p) => typeof p[kOnMsg] === "function" || p.listenerCount("message") > 0 ||
                                  ((p[kEvt].get("message") || []).length > 0);
   const portHasSink = (p) => p[kStarted] === true || portHasListener(p);
@@ -832,6 +846,8 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
         if (this._closed) throw new Error("BroadcastChannel is closed");
         const set = channels.get(this.name);
         if (!set) return;
+        if (containsTransferable(value))
+          throw dataClone("Object that needs transfer was found in message but not listed in transferList");
         const data = clone(value);
         for (const ch of set) {
           if (ch === this || ch._closed) continue;
