@@ -563,15 +563,16 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     spawn(options) {
       // node child_process.ts:1346-1396 validators (ERR_INVALID_ARG_TYPE).
       if (options === null || typeof options !== "object") { const e = new TypeError('The "options" argument must be of type object. Received ' + recvDesc(options)); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
-      if (typeof options.file !== "string") { const e = new TypeError('The "options.file" property must be of type string. Received ' + recvDesc(options.file)); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
       if (options.args !== undefined && !Array.isArray(options.args)) { const e = new TypeError('The "options.args" property must be an instance of Array. Received ' + recvDesc(options.args)); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
-      const __hasIpc = Array.isArray(options.stdio) && options.stdio.includes("ipc");
+      const stdio = normStdio(options.stdio);
+      const __hasIpc = stdio.includes("ipc");
       if (__hasIpc && options.envPairs !== undefined && !Array.isArray(options.envPairs)) { const e = new TypeError('The "options.envPairs" property must be an instance of Array. Received ' + recvDesc(options.envPairs)); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
+      if (stdio.filter((slot) => slot === "ipc").length > 1) { const e = new Error("Child process can have only one IPC pipe"); e.code = "ERR_IPC_ONE_PIPE"; throw e; }
+      if (typeof options.file !== "string") { const e = new TypeError('The "options.file" property must be of type string. Received ' + recvDesc(options.file)); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
       const file = toStr(options.file != null ? options.file : options.execPath);
       let args = options.args && options.args.length ? options.args.map(toStr) : [file];
       if (options.argv0 != null) args[0] = toStr(options.argv0);
       this.spawnfile = file; this.spawnargs = args;
-      const stdio = normStdio(options.stdio);
       const ipcIndex = stdio.indexOf("ipc");
       const sopts = { stdio };
       if (options.cwd != null) sopts.cwd = toStr(options.cwd);
