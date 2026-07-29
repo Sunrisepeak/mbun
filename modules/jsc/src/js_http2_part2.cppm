@@ -402,7 +402,15 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
     }
     _fileError(options, err) {
       if (options && typeof options.onError === "function") options.onError(err);
-      else this.destroy(err);
+      else {
+        // A filesystem failure belongs to the HTTP/2 stream boundary, not the
+        // public fs API: node closes both peers with INTERNAL_ERROR. Preserve
+        // the HTTP/2-specific errors made above (directory/non-seekable file),
+        // but translate raw errno values such as EBADF before destroy() emits
+        // the server-side error and sends RST_STREAM to the client.
+        const isHttp2Error = err && typeof err.code === "string" && err.code.indexOf("ERR_HTTP2_") === 0;
+        this.destroy(isHttp2Error ? err : streamErr(constants.NGHTTP2_INTERNAL_ERROR));
+      }
     }
     _sendFd(fs, fd, headersParam, options, stat, ownsFd) {
       const headers = Object.assign({}, headersParam);
