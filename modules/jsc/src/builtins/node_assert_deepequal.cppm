@@ -102,6 +102,19 @@ inline constexpr std::string_view kNodeAssertDeepEqualJS = R"JS(
       return true;
     };
 
+    // crypto installs its KeyObject class after assert, so the slot reader is
+    // resolved lazily; a runtime without node:crypto simply never matches.
+    const keyObjectSlot = (v) => {
+      if (v === null || typeof v !== "object") return undefined;
+      const crypto = M["crypto"] || M["node:crypto"];
+      const read = crypto && crypto.__mbunKeyObjectTransferData;
+      if (typeof read !== "function") return undefined;
+      return read(v) || undefined;
+    };
+    const keyBytes = (m) => (typeof m === "string" ? new TextEncoder().encode(m)
+      : m instanceof ArrayBuffer ? new Uint8Array(m)
+      : new Uint8Array(m.buffer, m.byteOffset, m.byteLength));
+
     const ownKeys = (o) => {
       const keys = [];
       for (const k of Object.keys(o)) keys.push(k);
@@ -196,6 +209,18 @@ inline constexpr std::string_view kNodeAssertDeepEqualJS = R"JS(
         }
         // node keyCheck still compares the non-index own properties.
         return deqNonIndexProps(a, b, strict, memo);
+      }
+      // KeyObject: a key carries NO own properties (the whole record lives in
+      // crypto's native-backed slot), so a plain own-property walk reports every
+      // pair of keys as deep-equal. node compares the internal handle through
+      // getKeyObjectHandle/getKeyObjectType, never through the configurable
+      // `type` / `equals` members. ref: comparisons.js innerDeepEqual.
+      const koa = keyObjectSlot(a), kob = keyObjectSlot(b);
+      if (koa !== undefined || kob !== undefined) {
+        if (koa === undefined || kob === undefined) return false;
+        if (koa.kind !== kob.kind || koa.passphrase !== kob.passphrase) return false;
+        if (!equalBytes(keyBytes(koa.material), keyBytes(kob.material))) return false;
+        return deqOwnProps(a, b, strict, memo, null);
       }
       // boxed primitives
       const bxa = boxedKind(a), bxb = boxedKind(b);

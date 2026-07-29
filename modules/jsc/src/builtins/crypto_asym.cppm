@@ -1849,7 +1849,120 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     C.Certificate = Certificate;
   }
 
+  // ---- crypto.diffieHellman(options[, callback]) ----
+  // Stateless (EC)DH over two KeyObjects. Every kind check reads the
+  // unforgeable koSlots record, never the user-replaceable `type` /
+  // `asymmetricKeyType` accessors, which is the whole point of node's
+  // getKeyObjectType / getKeyObjectAsymmetricKeyType internals.
+  // ref: node lib/internal/crypto/diffiehellman.js diffieHellman().
+  const DH_KEY_TYPES = new Set(["dh", "ec", "x448", "x25519"]);
+  // node lib/internal/errors.js ERR_INVALID_ARG_TYPE "Received ..." tail.
+  const dhReceived = (v) => (v === null ? "null"
+    : v === undefined ? "undefined"
+    : typeof v === "object" ? "an instance of " + ((v.constructor && v.constructor.name) || "Object")
+    : "type " + typeof v + " (" + String(v) + ")");
+  const dhAsymType = (slot) => {
+    try { return AN.keyType(slot.material, slot.passphrase, slot.kind === "public").type; }
+    catch (e) { return undefined; }
+  };
+  // The shared secret itself. EC goes through the raw scalar/point primitive;
+  // X25519/X448 derive straight from the DER material (no scalar reaches JS).
+  const dhDerive = (privSlot, pubSlot) => {
+    if (dhAsymType(privSlot) === "ec") {
+      const meta = AN.keyType(privSlot.material, privSlot.passphrase, false);
+      const priv = AN.jwkExport(privSlot.material, privSlot.passphrase, false);
+      const peer = AN.jwkExport(pubSlot.material, pubSlot.passphrase, pubSlot.kind === "public");
+      // jwkExport hands back the affine coordinates; ecdhComputeSecret wants the
+      // uncompressed SEC1 point.
+      const point = Buffer.concat([Buffer.from([4]), toBuf(peer.x), toBuf(peer.y)]);
+      return Buffer.from(AN.ecdhComputeSecret(meta.namedCurve, toBuf(priv.d), point));
+    }
+    return Buffer.from(AN.okpDerive(privSlot.material, pubSlot.material));
+  };
+  const dhPrepare = (key, kind) => (isKO(key) ? koSlots.get(key)
+    : koSlots.get(kind === "private" ? C.createPrivateKey(key) : C.createPublicKey(key)));
+  C.diffieHellman = function diffieHellman(options, callback) {
+    if (options === null || typeof options !== "object" || Array.isArray(options)) {
+      const e = new TypeError('The "options" argument must be of type object. Received ' + dhReceived(options));
+      e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+    }
+    if (callback !== undefined && typeof callback !== "function") {
+      const e = new TypeError('The "callback" argument must be of type function. Received ' + dhReceived(callback));
+      e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+    }
+    const { privateKey, publicKey } = options;
+    // node keeps these as ERR_INVALID_ARG_VALUE rather than letting the key
+    // preparation report a missing argument.
+    if (privateKey == null) {
+      const e = new TypeError("The property 'options.privateKey' is invalid. Received " + String(privateKey));
+      e.code = "ERR_INVALID_ARG_VALUE"; throw e;
+    }
+    if (publicKey == null) {
+      const e = new TypeError("The property 'options.publicKey' is invalid. Received " + String(publicKey));
+      e.code = "ERR_INVALID_ARG_VALUE"; throw e;
+    }
+    const privKO = isKO(privateKey) ? koSlots.get(privateKey) : undefined;
+    if (privKO !== undefined && privKO.kind !== "private") {
+      const e = new TypeError("Invalid key object type " + privKO.kind + ", expected private.");
+      e.code = "ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE"; throw e;
+    }
+    const pubKO = isKO(publicKey) ? koSlots.get(publicKey) : undefined;
+    if (pubKO !== undefined && pubKO.kind !== "public" && pubKO.kind !== "private") {
+      const e = new TypeError("Invalid key object type " + pubKO.kind + ", expected private or public.");
+      e.code = "ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE"; throw e;
+    }
+    if (privKO !== undefined && pubKO !== undefined) {
+      const a = dhAsymType(privKO), b = dhAsymType(pubKO);
+      if (a !== b || !DH_KEY_TYPES.has(a)) {
+        const e = new Error("Incompatible key types for Diffie-Hellman: " + a + " and " + b);
+        e.code = "ERR_CRYPTO_INCOMPATIBLE_KEY"; throw e;
+      }
+    }
+    let secret, failure;
+    try {
+      secret = dhDerive(dhPrepare(privateKey, "private"), dhPrepare(publicKey, "public"));
+    } catch (e) { failure = keyErr(e); }
+    if (callback === undefined) {
+      if (failure !== undefined) throw failure;
+      return secret;
+    }
+    queueMicrotask(() => (failure !== undefined ? callback(failure) : callback(null, secret)));
+    return undefined;
+  };
+
   // ---- X509Certificate ----
+  // Read a KeyObject's record without touching any user-replaceable accessor.
+  const keyObjectSlot = (v) => (isKO(v) ? koSlots.get(v) : undefined);
+  // Minimal DER tag/length reader — enough to walk a Certificate's three
+  // top-level fields. Returns absolute offsets into `buf`.
+  const derTLV = (buf, off) => {
+    const tag = buf[off];
+    let i = off + 1;
+    let len = buf[i++];
+    if ((len & 0x80) !== 0) {
+      const n = len & 0x7f;
+      len = 0;
+      for (let k = 0; k < n; k++) len = (len * 256) + buf[i++];
+    }
+    return { tag, len, start: off, contentStart: i, end: i + len };
+  };
+  // signatureAlgorithm OID (hex of the OID content bytes) → the digest node's
+  // crypto.verify needs. Ed25519/Ed448 carry the digest in the algorithm itself,
+  // so they pass a null digest.
+  const SIG_OID_DIGEST = {
+    "2a864886f70d010104": "md5",     // md5WithRSAEncryption
+    "2a864886f70d010105": "sha1",    // sha1WithRSAEncryption
+    "2a864886f70d01010b": "sha256",  // sha256WithRSAEncryption
+    "2a864886f70d01010c": "sha384",  // sha384WithRSAEncryption
+    "2a864886f70d01010d": "sha512",  // sha512WithRSAEncryption
+    "2a864886f70d01010e": "sha224",  // sha224WithRSAEncryption
+    "2a8648ce3d040301": "sha224",    // ecdsa-with-SHA224
+    "2a8648ce3d040302": "sha256",    // ecdsa-with-SHA256
+    "2a8648ce3d040303": "sha384",    // ecdsa-with-SHA384
+    "2a8648ce3d040304": "sha512",    // ecdsa-with-SHA512
+    "2b6570": null,                  // Ed25519
+    "2b6571": null,                  // Ed448
+  };
   const wildcardMatch = (host, pattern, allowWildcard) => {
     host = host.toLowerCase(); pattern = pattern.toLowerCase();
     if (host === pattern) return true;
@@ -1922,6 +2035,59 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     checkIssued(otherCert) {
       if (!(otherCert instanceof X509Certificate)) throw new TypeError("issuer must be a X509Certificate");
       return !!AN.x509checkIssued(this._raw, otherCert._raw);
+    }
+    // X509_check_private_key: the certificate's SubjectPublicKeyInfo must be the
+    // public half of `privateKey`. Comparing the two SPKI encodings is the same
+    // test without a second native entry point. The kind comes from the
+    // unforgeable slot, never from the replaceable `type` accessor.
+    checkPrivateKey(privateKey) {
+      const slot = keyObjectSlot(privateKey);
+      if (slot === undefined) {
+        const e = new TypeError('The "privateKey" argument must be an instance of KeyObject.' +
+          " Received " + dhReceived(privateKey));
+        e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+      }
+      if (slot.kind !== "private") {
+        const e = new TypeError("Invalid key object type " + slot.kind + ", expected private.");
+        e.code = "ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE"; throw e;
+      }
+      if (!this._publicKeyPem) return false;
+      try {
+        const mine = Buffer.from(AN.keyExport(slot.material, slot.passphrase, true, "spki", "der", "", ""));
+        const certSlot = keyObjectSlot(C.createPublicKey(this._publicKeyPem));
+        const theirs = Buffer.from(AN.keyExport(certSlot.material, certSlot.passphrase, true, "spki", "der", "", ""));
+        return Buffer.compare(mine, theirs) === 0;
+      } catch (e) { return false; }
+    }
+    // X509_verify: check the certificate signature against an issuer public key.
+    // A Certificate is SEQUENCE { tbsCertificate, signatureAlgorithm, signature },
+    // so the three top-level TLVs give the signed bytes, the digest OID and the
+    // signature; the rest is an ordinary crypto.verify.
+    verify(publicKey) {
+      const slot = keyObjectSlot(publicKey);
+      if (slot === undefined) {
+        const e = new TypeError('The "publicKey" argument must be an instance of KeyObject.' +
+          " Received " + dhReceived(publicKey));
+        e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+      }
+      if (slot.kind !== "public") {
+        const e = new TypeError("Invalid key object type " + slot.kind + ", expected public.");
+        e.code = "ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE"; throw e;
+      }
+      try {
+        const raw = Buffer.from(this._raw);
+        const outer = derTLV(raw, 0);
+        const tbs = derTLV(raw, outer.contentStart);
+        const alg = derTLV(raw, tbs.end);
+        const oid = derTLV(raw, alg.contentStart);
+        const sig = derTLV(raw, alg.end);
+        if (oid.tag !== 0x06) return false;
+        const name = raw.slice(oid.contentStart, oid.end).toString("hex");
+        if (!Object.prototype.hasOwnProperty.call(SIG_OID_DIGEST, name)) return false;
+        // The signature is a BIT STRING; its first content byte is the unused-bit count.
+        return !!C.verify(SIG_OID_DIGEST[name], raw.slice(tbs.start, tbs.end), publicKey,
+                          raw.slice(sig.contentStart + 1, sig.end));
+      } catch (e) { return false; }
     }
     toString() { return this._input.toString("utf8").includes("BEGIN") ? this._input.toString("utf8") : this._raw.toString("base64"); }
     toJSON() { return this.toString(); }

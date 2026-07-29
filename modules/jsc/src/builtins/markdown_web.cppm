@@ -941,6 +941,13 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       if (!Number.isInteger(keylen) || keylen < 0 || keylen > 2147483647) throw mkErr(RangeError, "ERR_OUT_OF_RANGE", 'The value of "length" is out of range. It must be >= 0 && <= 2147483647. Received ' + keylen);
       if (!supported(digest)) throw mkErr(TypeError, "ERR_CRYPTO_INVALID_DIGEST", "Invalid digest: " + digest);
     };
+    // crypto_asym installs KeyObject onto this same module object later in
+    // bootstrap, so the accessor is resolved lazily at call time.
+    const keyObjectSlot = (v) => {
+      const read = nodeCrypto.__mbunKeyObjectTransferData;
+      if (typeof read !== "function" || v === null || typeof v !== "object") return undefined;
+      return read(v) || undefined;
+    };
     const deferCb = (fn) => { (typeof queueMicrotask === "function" ? queueMicrotask : (f) => Promise.resolve().then(f))(fn); };
     // KeyObject instances (real class so instanceof + structured clone work).
     class KeyObject {
@@ -1087,11 +1094,19 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       // check) + ncrypto.cpp HKDF.
       hkdfSync: (digest, ikm, salt, info, keylen) => {
         validateHkdf(digest, ikm, salt, info, keylen);
-        if (ikm && typeof ikm === "object" && ikm.type !== undefined && typeof ikm.export === "function" && ikm.type !== "secret") {
-          const e = new TypeError("Invalid key object type " + ikm.type + ", expected secret.");
+        // The key kind must come from the unforgeable native record, not from
+        // the `type` accessor, which is a configurable property a caller can
+        // replace (node reads it through getKeyObjectType).
+        const koSlot = keyObjectSlot(ikm);
+        const ikmKind = koSlot !== undefined ? koSlot.kind
+          : (ikm && typeof ikm === "object" && ikm.type !== undefined && typeof ikm.export === "function") ? ikm.type
+          : undefined;
+        if (ikmKind !== undefined && ikmKind !== "secret") {
+          const e = new TypeError("Invalid key object type " + ikmKind + ", expected secret.");
           e.code = "ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE"; throw e;
         }
-        const ikmB = toBytes(ikm), saltB = toBytes(salt), infoB = toBytes(info);
+        const ikmB = koSlot !== undefined ? toBytes(koSlot.material) : toBytes(ikm);
+        const saltB = toBytes(salt), infoB = toBytes(info);
         const prk = new Uint8Array(createHmac(digest, saltB).update(ikmB).digest());
         const hashLen = prk.length;
         const n = Math.ceil(keylen / hashLen);
