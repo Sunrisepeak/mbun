@@ -715,7 +715,20 @@ void test_cjs_imports() {
     xpc("import foo from \"./foo\";",
         "const __mbun_i0 = require(\"./foo\", undefined, 1); const foo = __mbun_i0 && __mbun_i0.__esModule && \"default\" in __mbun_i0 ? "
         "__mbun_i0.default : __mbun_i0;");
-    xpc("import * as ns from \"./m\";", "const __mbun_i0 = require(\"./m\", undefined, 1); const ns = __mbun_i0;");
+    // `import * as ns from "<cjs>"` exposes the CJS `default` binding, i.e.
+    // module.exports itself, matching node/bun ESM-CJS interop. It is defined
+    // non-enumerably (no `enumerable: true` below), so require()'s view,
+    // Object.keys and the __esModule interop are all unchanged -- and it is
+    // skipped when the module already has a `default` or is non-extensible.
+    // Behaviour change landed in 7332af2 and measured at bun js/bun 0/17 -> 2/17
+    // green; this golden was left stale by that commit, which is why
+    // `mcpp test -p modules/js` had been failing.
+    xpc("import * as ns from \"./m\";",
+        "const __mbun_i0 = require(\"./m\", undefined, 1); const ns = __mbun_i0 && "
+        "(typeof __mbun_i0 === \"object\" || typeof __mbun_i0 === \"function\") && "
+        "Object.isExtensible(__mbun_i0) && !(\"default\" in __mbun_i0) ? "
+        "(Object.defineProperty(__mbun_i0, \"default\", { value: __mbun_i0, writable: true, "
+        "configurable: true }), __mbun_i0) : __mbun_i0;");
     xpc("import def, { a, b as c } from \"./m\";",
         "const __mbun_i0 = require(\"./m\", undefined, 1); const def = __mbun_i0 && __mbun_i0.__esModule && \"default\" in __mbun_i0 ? "
         "__mbun_i0.default : __mbun_i0; let a = __mbun_i0.a, c = __mbun_i0.b; "
