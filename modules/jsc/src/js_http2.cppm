@@ -727,6 +727,9 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
     if (callback !== undefined && callback !== null && typeof callback !== "function")
       throw argTypeErr("callback", "of type function", callback);
     const copy = Object.assign({}, settings);
+    // A server never advertises SETTINGS_ENABLE_PUSH != 0 (RFC 9113 6.5.2);
+    // mid-connection updates are clamped the same way the initial frame is.
+    if (session._isServerSession && copy.enablePush !== undefined) copy.enablePush = false;
     const send = () => {
       if (session.destroyed) return;
       if (!session._pendingSettingsAcks) session._pendingSettingsAcks = [];

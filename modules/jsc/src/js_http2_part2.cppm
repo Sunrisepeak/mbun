@@ -556,7 +556,13 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
       const self = this;
       // A server may send its SETTINGS immediately (RFC 7540 3.5); the client's
       // preface can still be in flight. Apply any configured settings values.
-      this._writeFrame(FRAME.SETTINGS, 0, 0, encodeSettings(server && server._h2options && server._h2options.settings));
+      // RFC 9113 6.5.2: a SETTINGS_ENABLE_PUSH value other than 0 sent by a
+      // server MUST be treated as a connection error by the client. Node's
+      // server half hard-wires it off, so a caller-supplied `enablePush: true`
+      // is overridden rather than advertised.
+      this._isServerSession = true;
+      this._writeFrame(FRAME.SETTINGS, 0, 0, encodeSettings(
+        Object.assign({}, server && server._h2options && server._h2options.settings, { enablePush: false })));
       socket.on("data", (d) => self._onData(d));
       socket.on("error", (e) => self._onSocketError(e));
       socket.on("close", () => self._onSocketClose());
