@@ -89,8 +89,12 @@ bool arg_bytes_view(JSContextRef ctx, std::size_t argc, const JSValueRef args[],
         p = static_cast<const std::uint8_t*>(JSObjectGetArrayBufferBytesPtr(ctx, obj, nullptr));
         n = JSObjectGetArrayBufferByteLength(ctx, obj, nullptr);
     } else {
+        // JSObjectGetTypedArrayBytesPtr answers the BUFFER base, not the view's
+        // first byte, so a subarray (Buffer#slice, chunk.subarray(mid)) must be
+        // offset by hand or it is read from the wrong place at the right length.
         p = static_cast<const std::uint8_t*>(JSObjectGetTypedArrayBytesPtr(ctx, obj, nullptr));
         n = JSObjectGetTypedArrayByteLength(ctx, obj, nullptr);
+        if (p != nullptr) p += JSObjectGetTypedArrayByteOffset(ctx, obj, nullptr);
     }
     if (p == nullptr) n = 0;
     return true;
