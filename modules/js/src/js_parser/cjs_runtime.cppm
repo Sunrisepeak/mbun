@@ -185,7 +185,27 @@ inline std::string build_cjs_import_(std::uint32_t uniq, std::string_view def, s
              g + " ? " + g + ".default : " + g + ";";
     }
     if (!ns.empty()) {
-        s += " const " + std::string{ns} + " = " + g + ";";
+        // `import * as ns from "<cjs>"` — Node's (and bun's) CJS→ESM namespace
+        // always carries a `default` binding whose value is module.exports
+        // itself, on top of the detected named exports. A real CJS module never
+        // assigns one, so attach it here; `js/bun/stream/direct-readable-stream`
+        // reads `React.default.createContext` off a namespace import of the
+        // CommonJS `react` package.
+        //
+        // It is defined **non-enumerably on module.exports** rather than by
+        // copying into a fresh object: a copy would freeze the named bindings at
+        // import time (killing the live-binding behaviour a cycle depends on) and
+        // a Proxy would tax every namespace property read. Non-enumerable keeps
+        // require()'s own view identical — Object.keys / JSON.stringify /
+        // `for…in` over module.exports are unchanged — and the interop tests
+        // (`g.__esModule && "default" in g`) still gate on __esModule, which this
+        // does not add. Skipped when the module already exposes `default` (every
+        // module we transpiled from ESM does) or is non-extensible.
+        const std::string n{ns};
+        s += " const " + n + " = " + g + " && (typeof " + g + " === \"object\" || typeof " + g +
+             " === \"function\") && Object.isExtensible(" + g + ") && !(\"default\" in " + g +
+             ") ? (Object.defineProperty(" + g + ", \"default\", { value: " + g +
+             ", writable: true, configurable: true }), " + g + ") : " + g + ";";
     }
     if (!named.empty()) {
         // ESM named imports are *live bindings*, and a `const {x} = g`

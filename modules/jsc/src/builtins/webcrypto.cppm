@@ -424,6 +424,13 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
       const isDerive = usage === "deriveBits" || usage === "deriveKey";
       const checkUsage = () => {
         if (metadata.usages.includes(usage)) return;
+        // The CFRG curves keep WebKit's wording: node's own cfrg derive tests only
+        // assert the InvalidAccessError name, while bun's corpus pins the message.
+        if (isDerive && (name === "X25519" || name === "X448")) {
+          throw domError(usage === "deriveBits" ? "CryptoKey doesn't support bits derivation"
+                                                : "CryptoKey doesn't support key derivation",
+            "InvalidAccessError");
+        }
         throw domError(isDerive ? "baseKey does not have " + usage + " usage"
                                 : "Unable to use this key to " + usage, "InvalidAccessError");
       };
