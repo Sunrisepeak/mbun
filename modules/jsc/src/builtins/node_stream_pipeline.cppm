@@ -741,7 +741,23 @@ inline constexpr std::string_view kNodeStreamPipelineJS = R"JS(
       let onreadable;
       let onclose;
       let d;
+      // pipeline() removes the LAST stream's 'error' listener once it completes
+      // without error (lastStreamCleanup, nodejs/node#35452 — the tail keeps
+      // living as `d`'s source, so pipeline must not keep listeners on it). Node
+      // gets away with that because a tail whose body throws is always destroyed
+      // BEFORE pipeline completes: the write side finishes on a nextTick, and
+      // node drains the WHOLE microtask queue before the tick queue, so the
+      // async body's rejection (pure microtasks) always overtakes it. mbun's
+      // process.nextTick arms itself with a promise reaction (runtime/
+      // bindings_install.inc), so a tick scheduled from inside a microtask runs
+      // BEFORE the rest of that microtask chain — the tail's 'finish' lands
+      // first, pipeline declares success, drops its error listener, and the body's
+      // throw then has no listener at all: uncaught, and `d` hangs forever.
+      // So track completion and keep a tail-error path of our own for after it.
+      // ref: test-stream-readable-compose.js "after finishing all readable data".
+      let pipelineFinished = false;
       function onfinished(err) {
+        pipelineFinished = true;
         const cb = onclose;
         onclose = null;
         if (cb) {
@@ -824,6 +840,14 @@ inline constexpr std::string_view kNodeStreamPipelineJS = R"JS(
           });
           tail.on("end", function() {
             d.push(null);
+          });
+          // Only after pipeline() has completed: while it is still running its
+          // own onError owns the error and routing it twice would change which
+          // error wins / when `d` is destroyed.
+          tail.on("error", function(err) {
+            if (pipelineFinished && !d.destroyed) {
+              d.destroy(err);
+            }
           });
           d._read = function() {
             while (true) {
