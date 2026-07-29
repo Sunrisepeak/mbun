@@ -127,7 +127,29 @@ constexpr std::string_view kStreamsJS_part1 = R"JS(
   // ReadableStream
   // =====================================================================
 
-  const isReadableStream = (x) => x != null && typeof x === "object" && "_readableStreamController" in x;
+  // The stream algorithms use these predicates for public entry points as
+  // well as internal operations.  A duck-typed controller property is not a
+  // public brand: pipeTo()/pipeThrough() must reject forged receivers before
+  // they observe options or lock either endpoint.
+  const isReadableStream = (x) => x instanceof ReadableStream;
+  const isWritableStream = (x) => x instanceof WritableStream;
+
+  // Web Streams consumes PipeTo options in this observable order.  Keep the
+  // property gets together so a throwing getter stops immediately, and so
+  // pipeTo and pipeThrough cannot drift apart.
+  const extractPipeOptions = (options) => {
+    if (options == null) return { preventAbort: false, preventCancel: false, preventClose: false, signal: undefined };
+    const preventAbort = !!options.preventAbort;
+    const preventCancel = !!options.preventCancel;
+    const preventClose = !!options.preventClose;
+    return { preventAbort, preventCancel, preventClose, signal: options.signal };
+  };
+  const isAbortSignal = (signal) => {
+    if (typeof G.AbortSignal !== "function" || !(signal instanceof G.AbortSignal)) return false;
+    // Object.create(AbortSignal.prototype) passes instanceof but has no
+    // platform signal state; reading aborted exposes that forged brand.
+    try { return typeof signal.aborted === "boolean"; } catch (_) { return false; }
+  };
 
   const readableStreamHasDefaultReader = (stream) => stream._reader !== undefined && stream._reader._readRequests !== undefined;
   const readableStreamHasBYOBReader = (stream) => stream._reader !== undefined && stream._reader._readIntoRequests !== undefined;
@@ -1301,25 +1323,34 @@ constexpr std::string_view kStreamsJS_part2 = R"JS(
       return new ReadableStreamDefaultReader(this);
     }
     pipeThrough(transform, options) {
-      if (transform == null || !("readable" in transform) || !("writable" in transform)) throw new TypeError("pipeThrough requires a {readable, writable} pair");
-      options = options == null ? {} : options;
+      if (!isReadableStream(this)) throw new TypeError("pipeThrough requires a ReadableStream receiver");
+      if (transform == null || (typeof transform !== "object" && typeof transform !== "function")) throw new TypeError("pipeThrough requires a {readable, writable} pair");
+      // Get and validate readable before observing writable.  Both the order
+      // and a getter's original exception are part of the public contract.
+      const readable = transform.readable;
+      if (!isReadableStream(readable)) throw new TypeError("pipeThrough requires a ReadableStream readable");
+      const writable = transform.writable;
+      if (!isWritableStream(writable)) throw new TypeError("pipeThrough requires a WritableStream writable");
+      const pipeOptions = extractPipeOptions(options);
+      if (pipeOptions.signal !== undefined && !isAbortSignal(pipeOptions.signal)) throw new TypeError("Invalid signal");
       if (this.locked) throw new TypeError("ReadableStream is locked");
-      if (transform.writable.locked) throw new TypeError("WritableStream is locked");
-      const promise = readableStreamPipeTo(this, transform.writable, !!options.preventClose, !!options.preventAbort, !!options.preventCancel, options.signal);
+      if (writable.locked) throw new TypeError("WritableStream is locked");
+      const promise = readableStreamPipeTo(this, writable, pipeOptions.preventClose, pipeOptions.preventAbort, pipeOptions.preventCancel, pipeOptions.signal);
       markHandled(promise);
-      return transform.readable;
+      return readable;
     }
     pipeTo(destination, options) {
-      if (!(destination instanceof WritableStream)) return Promise.reject(new TypeError("pipeTo requires a WritableStream"));
-      options = options == null ? {} : options;
-      let signal;
-      if (options.signal !== undefined) {
-        signal = options.signal;
-        if (signal == null || typeof signal.aborted !== "boolean") return Promise.reject(new TypeError("Invalid signal"));
+      if (!isReadableStream(this)) return Promise.reject(new TypeError("pipeTo requires a ReadableStream receiver"));
+      if (!isWritableStream(destination)) return Promise.reject(new TypeError("pipeTo requires a WritableStream"));
+      try {
+        const pipeOptions = extractPipeOptions(options);
+        if (pipeOptions.signal !== undefined && !isAbortSignal(pipeOptions.signal)) throw new TypeError("Invalid signal");
+        if (this.locked) throw new TypeError("ReadableStream is locked");
+        if (destination.locked) throw new TypeError("WritableStream is locked");
+        return readableStreamPipeTo(this, destination, pipeOptions.preventClose, pipeOptions.preventAbort, pipeOptions.preventCancel, pipeOptions.signal);
+      } catch (e) {
+        return Promise.reject(e);
       }
-      if (this.locked) return Promise.reject(new TypeError("ReadableStream is locked"));
-      if (destination.locked) return Promise.reject(new TypeError("WritableStream is locked"));
-      return readableStreamPipeTo(this, destination, !!options.preventClose, !!options.preventAbort, !!options.preventCancel, signal);
     }
     tee() {
       if (this.locked) throw new TypeError("ReadableStream is locked");
