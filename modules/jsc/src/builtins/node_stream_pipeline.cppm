@@ -964,7 +964,18 @@ inline constexpr std::string_view kNodeStreamPipelineJS = R"JS(
 
   R.def("internal/stream.consumers", function (require, module, exports) {
     const JSONParse = JSON.parse;
+    // A second consumer on an already-locked ReadableStream must reject with
+    // ERR_INVALID_STATE. Bun.readableStreamTo* throws a bare TypeError with no
+    // `code`, so guard before delegating.
+    const assertUnlocked = (stream) => {
+      if ($inheritsReadableStream(stream) && stream.locked === true) {
+        const e = new TypeError("Invalid state: The ReadableStream is locked");
+        e.code = "ERR_INVALID_STATE";
+        throw e;
+      }
+    };
     async function blob(stream) {
+      assertUnlocked(stream);
       if ($inheritsReadableStream(stream))
         return Bun.readableStreamToBlob(stream);
       const chunks = [];
@@ -973,12 +984,14 @@ inline constexpr std::string_view kNodeStreamPipelineJS = R"JS(
       return new Blob(chunks);
     }
     async function arrayBuffer(stream) {
+      assertUnlocked(stream);
       if ($inheritsReadableStream(stream))
         return Bun.readableStreamToArrayBuffer(stream);
       const ret = await blob(stream);
       return ret.arrayBuffer();
     }
     async function bytes(stream) {
+      assertUnlocked(stream);
       if ($inheritsReadableStream(stream))
         return Bun.readableStreamToBytes(stream);
       const ret = await blob(stream);
@@ -988,6 +1001,7 @@ inline constexpr std::string_view kNodeStreamPipelineJS = R"JS(
       return Buffer.from(await arrayBuffer(stream));
     }
     async function text(stream) {
+      assertUnlocked(stream);
       if ($inheritsReadableStream(stream))
         return Bun.readableStreamToText(stream);
       const dec = new TextDecoder;
@@ -995,13 +1009,22 @@ inline constexpr std::string_view kNodeStreamPipelineJS = R"JS(
       for await (const chunk of stream) {
         if (typeof chunk === "string")
           str += chunk;
-        else
+        else {
+          // node's text()/json() validate every chunk, unlike blob()/bytes(),
+          // which stringify through Blob (an object-mode stream legitimately
+          // yields '[object Object]' there). Decoding a non-BufferSource here
+          // would otherwise coerce silently.
+          if (chunk === null || typeof chunk !== "object" || !ArrayBuffer.isView(chunk)) {
+            throw $ERR_INVALID_ARG_TYPE("chunk", ["string", "Buffer", "TypedArray", "DataView"], chunk);
+          }
           str += dec.decode(chunk, { stream: true });
+        }
       }
       str += dec.decode(undefined, { stream: false });
       return str;
     }
     async function json(stream) {
+      assertUnlocked(stream);
       if ($inheritsReadableStream(stream))
         return Bun.readableStreamToJSON(stream);
       const str = await text(stream);
