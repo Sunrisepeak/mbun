@@ -2365,17 +2365,19 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   }
 
   // ---- URLSearchParams + URL (WHATWG-ish; runs in every context) ----
-  const inspectURLSearchParams = (params, nested) => {
-    if (!params || !params._e || !params._e.length) return "URLSearchParams {}";
-    const pad = nested ? "    " : "  ", close = nested ? "  " : "";
-    const grouped = [], idx = {};
-    for (const [k, v] of params._e) {
-      if (Object.prototype.hasOwnProperty.call(idx, k)) { const g = grouped[idx[k]]; if (Array.isArray(g[1])) g[1].push(v); else g[1] = [g[1], v]; }
-      else { idx[k] = grouped.length; grouped.push([k, v]); }
-    }
-    const fmt = (v) => Array.isArray(v) ? "[ " + v.map((x) => JSON.stringify(x)).join(", ") + " ]" : JSON.stringify(v);
-    return "URLSearchParams {\n" + grouped.map(([k, v]) => pad + JSON.stringify(k) + ": " + fmt(v) + ",").join("\n") + "\n" + close + "}";
+  const inspectURLSearchParamsEntries = (label, entries, options, iterator = false) => {
+    if (entries.length === 0) return label + (iterator ? " {  }" : " {}");
+    const singleLine = label + " { " + entries.join(", ") + " }";
+    const multiline = typeof options?.breakLength === "number" && singleLine.length > options.breakLength;
+    if (!multiline) return singleLine;
+    const body = entries.map((entry, i) => "  " + entry + (i + 1 < entries.length ? "," : "")).join("\n");
+    return label + " {\n" + body + " }";
   };
+  const inspectURLSearchParams = (params, options) => inspectURLSearchParamsEntries(
+    "URLSearchParams",
+    params._e.map(([key, value]) => util.inspect(key) + " => " + util.inspect(value)),
+    options,
+  );
   if (typeof G.URLSearchParams === "undefined") {
     // ref: bun src/jsc/bindings/URLSearchParams.cpp, backed by
     // WTF::URLParser::{parseURLEncodedForm,serialize}.  URLSearchParams uses
@@ -2479,6 +2481,22 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     Object.defineProperty(spIterProto, Symbol.toStringTag, {
       configurable: true, value: "URLSearchParams Iterator",
     });
+    Object.defineProperty(spIterProto, kInspectCustom, {
+      configurable: true, writable: true,
+      value: function inspect(depth, options) {
+        if (this === null || (typeof this !== "object" && typeof this !== "function") || !(kSPIterTarget in this))
+          throw spErr("ERR_INVALID_THIS", 'Value of "this" must be of type URLSearchParamsIterator');
+        if (depth < 0) return this;
+        const entries = this[kSPIterTarget]._e;
+        const kind = this[kSPIterKind];
+        const values = [];
+        for (let i = this[kSPIterIndex]; i < entries.length; i++) {
+          const pair = entries[i];
+          values.push(kind === "key" ? util.inspect(pair[0]) : kind === "value" ? util.inspect(pair[1]) : util.inspect([pair[0], pair[1]]));
+        }
+        return inspectURLSearchParamsEntries("URLSearchParams Iterator", values, options, true);
+      },
+    });
     const makeSPIter = (target, kind) => {
       const it = Object.create(spIterProto);
       it[kSPIterTarget] = target;
@@ -2553,14 +2571,16 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       keys() { URLSearchParams.#check(this); return makeSPIter(this, "key"); }
       values() { URLSearchParams.#check(this); return makeSPIter(this, "value"); }
       entries() { URLSearchParams.#check(this); return makeSPIter(this, "key+value"); }
-      [Symbol.iterator]() { return this.entries(); }
       sort() { URLSearchParams.#check(this); this._e.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)); this._updateURL(); }
       get size() { URLSearchParams.#check(this); return this._e.length; }
       get length() { return this._e.length; }
       toJSON() { const out = {}; for (const [k, v] of this._e) { if (Object.prototype.hasOwnProperty.call(out, k)) { if (Array.isArray(out[k])) out[k].push(v); else out[k] = [out[k], v]; } else out[k] = v; } return out; }
-      toString() { return this._e.map(([k, v]) => formEncode(k) + "=" + formEncode(v)).join("&"); }
-      [Symbol.for("nodejs.util.inspect.custom")]() { return inspectURLSearchParams(this, false); }
+      toString() { URLSearchParams.#check(this); return this._e.map(([k, v]) => formEncode(k) + "=" + formEncode(v)).join("&"); }
+      [Symbol.for("nodejs.util.inspect.custom")](depth, options) { URLSearchParams.#check(this); return depth < 0 ? this : inspectURLSearchParams(this, options); }
     };
+    // Web IDL aliases @@iterator to entries instead of wrapping it, so callers
+    // can observe the required function identity.
+    Object.defineProperty(G.URLSearchParams.prototype, Symbol.iterator, { value: G.URLSearchParams.prototype.entries, writable: true, configurable: true });
     Object.defineProperty(G.URLSearchParams.prototype, "size", { get: Object.getOwnPropertyDescriptor(G.URLSearchParams.prototype, "size").get, enumerable: true, configurable: true });
     // Web IDL interfaces carry a non-enumerable, non-writable, configurable
     // Symbol.toStringTag data property, so Object.prototype.toString.call(sp)
@@ -2847,7 +2867,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
           "  pathname: " + JSON.stringify(this.pathname) + ",\n" +
           "  hash: " + JSON.stringify(this.hash) + ",\n" +
           "  search: " + JSON.stringify(this.search) + ",\n" +
-          "  searchParams: " + inspectURLSearchParams(this.searchParams, true) + ",\n" +
+          "  searchParams: " + inspectURLSearchParams(this.searchParams) + ",\n" +
           "  toJSON: [Function: toJSON],\n" +
           "  toString: [Function: toString],\n" +
           "}";
@@ -2857,7 +2877,12 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     // URL formatting is ready regardless of whether the Bun global exists yet.
     const inspectBeforeURL = util.inspect;
     util.inspect = function inspect(value, options) {
-      if (value instanceof G.URLSearchParams) return inspectURLSearchParams(value, false);
+      if (value instanceof G.URLSearchParams) {
+        const depth = typeof options?.depth === "number" ? options.depth : 2;
+        if (depth < 0) return "[Object]";
+        const custom = value[kInspectCustom];
+        return typeof custom === "function" ? custom.call(value, depth, options) : inspectURLSearchParams(value, options);
+      }
       if (value instanceof G.URL) return value[Symbol.for("nodejs.util.inspect.custom")]();
       return inspectBeforeURL.call(this, value, options);
     };
