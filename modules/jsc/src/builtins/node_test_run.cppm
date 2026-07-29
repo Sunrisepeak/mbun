@@ -166,6 +166,16 @@ inline constexpr std::string_view kNodeTestRunJS = R"JS(
     // node's spec reporter is a Transform subclass that is ALSO usable as
     // `spec`, `spec()` and `new spec()` (test-runner-run pipes all three).
     const Transform = streamMod().Transform;
+    // PORT-SOURCE: lib/internal/test_runner/reporter/utils.js formatError —
+    // node renders `<name>: <message>`, never the bare message.
+    const formatSpecError = (error) => {
+      if (error === null || error === undefined) return "";
+      if (typeof error !== "object") return String(error);
+      const message = error.message;
+      if (message === undefined) return String(error);
+      const name = typeof error.name === "string" && error.name !== "" ? error.name : "Error";
+      return name + ": " + String(message);
+    };
     let SpecReporter = null;
     if (typeof Transform === "function") {
       SpecReporter = function spec(options) {
@@ -193,7 +203,10 @@ inline constexpr std::string_view kNodeTestRunJS = R"JS(
           text = "  ".repeat(data.nesting) + (failed ? "✖ " : "✔ ") + data.name +
                  " (" + ms + "ms)\n";
           if (failed && data.details && data.details.error) {
-            text += "  ".repeat(data.nesting + 1) + String(data.details.error.message || data.details.error) + "\n";
+            // node's spec reporter formats the error through its stack, whose
+            // first line is `<name>: <message>` — the corpus matches on the
+            // `Error: ` prefix, so a bare message is not equivalent.
+            text += "  ".repeat(data.nesting + 1) + formatSpecError(data.details.error) + "\n";
           }
         } else if (type === "test:diagnostic") {
           text = "  ".repeat(data.nesting || 0) + data.message + "\n";
