@@ -414,25 +414,17 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     get type() { return koOf(this)._kind; }
     get [Symbol.toStringTag]() { return "KeyObject"; }
     export(options) {
-      const self = koOf(this);
-      // Both secret and asymmetric KeyObjects validate the optional export
-      // dictionary. In particular, a string must not silently select the
-      // secret-key default export path.
-      if (options !== undefined && (options === null || typeof options !== "object")) {
-        const e = new TypeError('The "options" argument must be of type object. Received ' +
-          (options === null ? "null" : typeof options));
-        e.code = "ERR_INVALID_ARG_TYPE"; throw e;
-      }
       // Secret keys: options are optional and default to a Buffer copy.
-      if (self._kind === "secret") {
+      if (this._kind === "secret") {
         if (options != null && typeof options === "object" && options.format === "jwk") {
-          return { kty: "oct", k: Buffer.from(toBuf(self._km)).toString("base64url") };
+          return { kty: "oct", k: Buffer.from(toBuf(this._km)).toString("base64url") };
         }
-        return Buffer.from(toBuf(self._km));
+        return Buffer.from(toBuf(this._km));
       }
       // Asymmetric keys: node requires an options object (lib/internal/crypto/keys.js).
-      if (options === undefined) {
-        const e = new TypeError('The "options" argument must be of type object. Received undefined');
+      if (options === null || typeof options !== "object") {
+        const e = new TypeError('The "options" argument must be of type object. Received ' +
+          (options === null ? "null" : typeof options));
         e.code = "ERR_INVALID_ARG_TYPE"; throw e;
       }
       // format:"jwk" is NOT a PEM/DER encoding — it returns a plain JWK object and
@@ -442,18 +434,18 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
           const e = new Error("The selected key encoding jwk does not support encryption.");
           e.code = "ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS"; throw e;
         }
-        return jwkFromKey(self._km, self._pass, self._kind === "public");
+        return jwkFromKey(this._km, this._pass, this._kind === "public");
       }
-      const type = options.type || (self._kind === "public" ? "spki" : "pkcs8");
+      const type = options.type || (this._kind === "public" ? "spki" : "pkcs8");
       const format = options.format || "pem";
       // Encrypting a private key requires a cipher; a passphrase alone throws.
-      if (self._kind === "private" && options.passphrase != null && options.cipher == null) {
+      if (this._kind === "private" && options.passphrase != null && options.cipher == null) {
         const e = new TypeError("The property 'options.cipher' is invalid. Received undefined");
         e.code = "ERR_INVALID_ARG_VALUE"; throw e;
       }
       const cipher = options.cipher || "";
       const outPass = options.passphrase != null ? (typeof options.passphrase === "string" ? options.passphrase : toBuf(options.passphrase).toString("latin1")) : "";
-      const out = AN.keyExport(self._km, self._pass, self._kind === "public", type, format, cipher, outPass);
+      const out = AN.keyExport(this._km, this._pass, this._kind === "public", type, format, cipher, outPass);
       // der format must be a Buffer (node returns Buffer, not a bare Uint8Array).
       return format === "der" ? Buffer.from(out) : out;
     }
