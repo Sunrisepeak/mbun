@@ -185,18 +185,49 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
     // OperationError (ref: bun/WebKit CryptoAlgorithm size guards). Checked before
     // the copy so an oversized buffer never gets duplicated.
     const MAX_BUFFER_BYTES = 0x7fffffff;
+    // A BufferSource is recognised STRUCTURALLY, not by prototype. A vm context
+    // hands back an ArrayBuffer whose prototype is that realm's, so `instanceof
+    // ArrayBuffer` misses it and a perfectly good buffer is rejected as
+    // ERR_INVALID_ARG_TYPE (test-crypto-subtle-cross-realm). The own byteLength
+    // getter reads the object's internal type, which is realm-independent — and
+    // it refuses a SharedArrayBuffer, which is the other half of the contract:
+    // WebCrypto must reject a shared backing store identically from either realm.
+    const abByteLength =
+      Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength").get;
+    const abSlice = ArrayBuffer.prototype.slice;
+    const sabByteLength = (() => {
+      if (typeof SharedArrayBuffer !== "function") return null;
+      const d = Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, "byteLength");
+      return (d && d.get) || null;
+    })();
+    // -1 for anything that is not an ArrayBuffer; a detached one reads as 0.
+    const arrayBufferBytes = (value) => {
+      try { return abByteLength.call(value); } catch (e) { return -1; }
+    };
+    const isSharedBuffer = (value) => {
+      if (!sabByteLength) return false;
+      try { sabByteLength.call(value); return true; } catch (e) { return false; }
+    };
+    const sharedNotAllowed = () => {
+      const err = new TypeError(
+        'The "data" argument is a view on a SharedArrayBuffer, which is not allowed.');
+      err.code = "ERR_INVALID_ARG_TYPE";
+      return err;
+    };
     const copyBytes = (value) => {
-      if (value instanceof ArrayBuffer) {
-        if (value.byteLength > MAX_BUFFER_BYTES) throw operationError("Data is too large");
+      const wholeBytes = arrayBufferBytes(value);
+      if (wholeBytes >= 0) {
+        if (wholeBytes > MAX_BUFFER_BYTES) throw operationError("Data is too large");
         // A detached (transferred) buffer reads as zero bytes in node rather
         // than throwing — the algorithm then fails with its own OperationError.
-        if (value.byteLength === 0) return new Uint8Array(0);
-        return new Uint8Array(value.slice(0));
+        if (wholeBytes === 0) return new Uint8Array(0);
+        return new Uint8Array(abSlice.call(value, 0));
       }
       if (ArrayBuffer.isView(value)) {
+        if (isSharedBuffer(value.buffer)) throw sharedNotAllowed();
         if (value.byteLength > MAX_BUFFER_BYTES) throw operationError("Data is too large");
         if (value.byteLength === 0) return new Uint8Array(0);
-        return new Uint8Array(value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength));
+        return new Uint8Array(abSlice.call(value.buffer, value.byteOffset, value.byteOffset + value.byteLength));
       }
       const err = new TypeError(
         'The "data" argument must be an instance of ArrayBuffer or ArrayBufferView.');
