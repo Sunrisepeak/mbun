@@ -488,13 +488,14 @@ inline std::vector<std::uint8_t> asym_ecdsa_p1363_to_der(std::span<const std::ui
 }
 
 // Configure RSA padding/salt on a signing/verifying pkey ctx.
-inline void asym_apply_rsa_sig_opts(EVP_PKEY_CTX* pctx, EVP_PKEY* pkey, int padding, int saltLen) {
+inline bool asym_apply_rsa_sig_opts(EVP_PKEY_CTX* pctx, EVP_PKEY* pkey, int padding, int saltLen) {
     const int base{EVP_PKEY_base_id(pkey)};
-    if (base != EVP_PKEY_RSA && base != EVP_PKEY_RSA_PSS) { return; }
-    EVP_PKEY_CTX_set_rsa_padding(pctx, padding);
+    if (base != EVP_PKEY_RSA && base != EVP_PKEY_RSA_PSS) { return true; }
+    if (EVP_PKEY_CTX_set_rsa_padding(pctx, padding) <= 0) { return false; }
     if (padding == RSA_PKCS1_PSS_PADDING) {
-        EVP_PKEY_CTX_set_rsa_pss_saltlen(pctx, saltLen);
+        return EVP_PKEY_CTX_set_rsa_pss_saltlen(pctx, saltLen) > 0;
     }
+    return true;
 }
 
 // __mbunCryptoAsymNative.sign(digest, data, key, passphrase, padding, saltLen,
@@ -526,7 +527,9 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_sign_host,
     if (EVP_DigestSignInit(md.get(), &pctx, dg, nullptr, pkey.get()) <= 0) {
         return hasher_throw(global, "sign init failed: " + asym_ossl_err());
     }
-    asym_apply_rsa_sig_opts(pctx, pkey.get(), padding, saltLen);
+    if (!asym_apply_rsa_sig_opts(pctx, pkey.get(), padding, saltLen)) {
+        return hasher_throw(global, "sign init failed: " + asym_ossl_err());
+    }
     std::size_t siglen{0};
     if (EVP_DigestSign(md.get(), nullptr, &siglen, data.data(), data.size()) <= 0) {
         return hasher_throw(global, "sign failed: " + asym_ossl_err());
