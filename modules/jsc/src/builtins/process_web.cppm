@@ -797,6 +797,10 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       else if (typeof o.killSignal === "number") { if (!hasOwn.call(SIGNAME, String(o.killSignal))) throw unknown(); }
       else throw errPropType("options.killSignal", "of type string or number", o.killSignal);
     }
+    if (o.signal != null &&
+        (typeof G.AbortSignal !== "function" || !(o.signal instanceof G.AbortSignal))) {
+      throw errPropType("options.signal", "an instance of AbortSignal", o.signal);
+    }
     // Both env keys and env values must be NUL-free (node's
     // validateArgumentNullCheck over the envPairs it builds).
     if (o.env != null) {
@@ -1028,7 +1032,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       let err = maxErr;
       if (!err && ((code !== 0 && code != null) || signal)) {
         err = new Error("Command failed: " + cmd + (errBuf.length ? "\n" + errBuf.toString("utf8") : ""));
-        err.code = signal ? null : code; err.killed = child.killed || false; err.signal = signal || null; err.cmd = cmd;
+        err.code = signal ? null : (code < 0 ? (ERRNO[-code] || code) : code); err.killed = child.killed || false; err.signal = signal || null; err.cmd = cmd;
       }
       if (cb) cb(err || null, toOut(outBuf, child.stdout), toOut(errBuf, child.stderr));
     };
@@ -1072,26 +1076,44 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     validateStr(command, "command");
     nullCheck(command, "command");
     if (options != null) { validateObj(options, "options"); validateCommonOpts(options); }
-    return new Promise((resolve, reject) => {
-      exec(command, options, (err, stdout, stderr) => { if (err) { err.stdout = stdout; err.stderr = stderr; reject(err); } else resolve({ stdout, stderr }); });
+    let child;
+    const promise = new Promise((resolve, reject) => {
+      child = exec(command, options, (err, stdout, stderr) => { if (err) { err.stdout = stdout; err.stderr = stderr; reject(err); } else resolve({ stdout, stderr }); });
     });
+    promise.child = child;
+    return promise;
   };
 
   function execFile(file, args, options, cb) {
     const nf = normalizeExecFileArgs(file, args, options, cb);
     const nz = normalizeSpawnArgs(nf.file, nf.args, typeof nf.options === "function" ? {} : nf.options);
     file = nz.file; args = nz.args; options = nz.options; cb = nf.callback;
+    const stringArgs = args.map(toStr);
+    const displayCmd = [file].concat(stringArgs).join(" ");
+    let spawnFile = file, spawnArgs = [file].concat(stringArgs);
+    if (options.shell) {
+      if (stringArgs.length > 0 && G.process && typeof G.process.emitWarning === "function") {
+        G.process.emitWarning(
+          "Passing args to a child process with shell option true can lead to security vulnerabilities, as the arguments are not escaped, only concatenated.",
+          "DeprecationWarning", "DEP0190");
+      }
+      const sh = options.shell === true ? "/bin/sh" : toStr(options.shell);
+      spawnFile = sh; spawnArgs = [sh, "-c", displayCmd];
+    }
     const child = new ChildProcess();
-    child.spawn({ file, args: [file].concat(args.map(toStr)), cwd: options.cwd, env: options.env, stdio: ["pipe", "pipe", "pipe"], timeout: options.timeout, killSignal: options.killSignal, signal: options.signal });
-    collectExec(child, options, cb, file);
+    child.spawn({ file: spawnFile, args: spawnArgs, cwd: options.cwd, env: options.env, stdio: ["pipe", "pipe", "pipe"], timeout: options.timeout, killSignal: options.killSignal, signal: options.signal });
+    collectExec(child, options, cb, displayCmd);
     return child;
   }
   execFile[Symbol.for("nodejs.util.promisify.custom")] = (file, args, options) => {
     const nf = normalizeExecFileArgs(file, args, options, undefined);
     normalizeSpawnArgs(nf.file, nf.args, typeof nf.options === "function" ? {} : nf.options);
-    return new Promise((resolve, reject) => {
-      execFile(file, args, options, (err, stdout, stderr) => { if (err) { err.stdout = stdout; err.stderr = stderr; reject(err); } else resolve({ stdout, stderr }); });
+    let child;
+    const promise = new Promise((resolve, reject) => {
+      child = execFile(file, args, options, (err, stdout, stderr) => { if (err) { err.stdout = stdout; err.stderr = stderr; reject(err); } else resolve({ stdout, stderr }); });
     });
+    promise.child = child;
+    return promise;
   };
 
   function fork(modulePath, args, options) {
