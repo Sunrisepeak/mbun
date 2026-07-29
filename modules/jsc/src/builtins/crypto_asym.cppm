@@ -136,7 +136,7 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
         data: inner.data, passphrase: pass,
         padding: k.padding, saltLength: k.saltLength, dsaEncoding: k.dsaEncoding,
         oaepHash: k.oaepHash, oaepLabel: k.oaepLabel,
-        encoding: k.encoding,
+        encoding: k.encoding, context: k.context,
       };
     }
     return { data: k, passphrase: undefined };
@@ -230,10 +230,24 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     }
   };
 
+  // Context is an Ed448/ML-DSA signing option. The EVP bridge has no context
+  // argument, but it must still reject it for every key type that does not
+  // support one, rather than silently producing an ordinary signature.
+  const validateSignContext = (r) => {
+    if (r.context === undefined) return;
+    const type = AN.keyType(keyData(r), r.passphrase, false).type;
+    if (type !== "ed448") {
+      const e = new Error("Context parameter is unsupported");
+      e.code = "ERR_CRYPTO_OPERATION_FAILED";
+      throw e;
+    }
+  };
+
   // ---- sign / verify (one-shot + streaming) ----
   const doSign = (algo, data, key) => {
     const r = resolveKey(key);
     validateDsaEncoding(r);
+    validateSignContext(r);
     try {
       return Buffer.from(AN.sign(digestName(algo), toBuf(data), keyData(r), r.passphrase,
         r.padding != null ? r.padding : RSA_PKCS1_PADDING,
