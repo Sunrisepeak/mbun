@@ -116,6 +116,21 @@ public:
         return {};
     }
 
+    // Parse a classic script without evaluating it. The command-line --check
+    // path deliberately uses this instead of run_script(): stdin may contain
+    // a top-level throw that must be syntax-checked but never executed.
+    int check_syntax(std::string_view source, const std::string& srcUrl) {
+        JSStringRef script{JSStringCreateWithUTF8CString(std::string{source}.c_str())};
+        JSStringRef url{JSStringCreateWithUTF8CString(srcUrl.c_str())};
+        JSValueRef exc{nullptr};
+        const bool ok{JSCheckScriptSyntax(ctx_, script, url, 1, &exc)};
+        JSStringRelease(url);
+        JSStringRelease(script);
+        if (ok) return 0;
+        std::println(std::cerr, "{}: {}", srcUrl, describe_exception_(exc));
+        return 1;
+    }
+
     // Evaluate source and return the string coercion of its result (for reading
     // back non-numeric values, e.g. the bun:test runner's collected output body).
     std::expected<std::string, std::string> eval_to_string(std::string_view source) {

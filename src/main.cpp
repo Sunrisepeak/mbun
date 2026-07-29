@@ -130,6 +130,40 @@ int main(int argc, char* argv[]) {
         return a == "-p" || a == "--print" || a == "-pe" || a == "-ep";
     }};
 
+    // Node's -c/--check parses stdin without executing it. Keep bun's `-c
+    // <config>` spelling intact by only treating short -c as --check when it
+    // has no value (or the next token is another flag).
+    bool checkSyntax{};
+    for (std::size_t i{}; i < args.size(); ++i) {
+        const std::string_view a{args[i]};
+        if (a == "--check" || (a == "-c" &&
+            (i + 1 == args.size() || args[i + 1].starts_with("-")))) {
+            checkSyntax = true;
+        }
+        if (!a.starts_with("-")) break;
+        if (a.find('=') == std::string_view::npos && mbun::cli::node_flag_takes_value(a) &&
+            i + 1 < args.size()) {
+            ++i;
+        }
+    }
+    if (checkSyntax) {
+        for (const std::string_view a : args) {
+            if (is_eval_flag(a)) {
+                std::println(std::cerr, "{}: either --check or --eval can be used, not both",
+                             argc > 0 ? argv[0] : "mbun");
+                return 9;
+            }
+        }
+        bool moduleInput{};
+        for (std::size_t i{}; i < args.size(); ++i) {
+            if (args[i] == "--input-type=module") moduleInput = true;
+            else if (args[i] == "--input-type" && i + 1 < args.size() &&
+                     args[i + 1] == "module") moduleInput = true;
+        }
+        const std::string source{std::istreambuf_iterator<char>{std::cin}, {}};
+        return mbun::jsc::runtime::check_syntax(source, "[stdin]", moduleInput);
+    }
+
     // Strip leading global run flags so `mbun [flags] <script>` runs the script,
     // but never past -e/-p/--eval/--print (those consume the next token as code).
     RunFlags globalFlags{};
@@ -231,8 +265,9 @@ int main(int argc, char* argv[]) {
         // `mbun -e <code>` / `mbun --eval <code>`: evaluate a JS/TS string.
         if (is_eval_flag(args[0])) {
             if (args.size() < 2) {
-                std::println(std::cerr, "mbun {}: missing code (usage: mbun {} <code>)", args[0], args[0]);
-                return 2;
+                std::println(std::cerr, "{}: {} requires an argument",
+                             argc > 0 ? argv[0] : "mbun", args[0]);
+                return 9;
             }
             // argv omits the script slot in eval mode: bun builds argv as
             // [exe] ++ (main unless it ends in "/[eval]" or "/[stdin]") ++ args
