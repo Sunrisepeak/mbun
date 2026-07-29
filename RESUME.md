@@ -114,6 +114,21 @@ files before accepting the wave. JSC-native await allocation, GC destroy, and
 deep native promise timing remain engine seams; do not claim the whole async
 group is compatible.
 
+### Sprint wave 4 measured checkpoint (11:37–11:51)
+
+Three short shared roots gained 7 files in 14.5 minutes: **29.0 files/hour**,
+with zero green-to-non-green regressions in the 9-file acceptance set.
+
+- child_process maxBuffer: estimated 4, actual 4/4;
+- RSA-PSS key restrictions/details: estimated 3, actual 2/3;
+- HTTP/2 response splitting sanitation: estimated 1, actual 1/1.
+
+The maxBuffer guard also reran the already-green spawnSync file. The remaining
+RSA-PSS file moved to an independent sign-padding failure and is not counted as
+key-details yield. Integration resolved the stale-lane conflict by preserving
+both the existing RSA public exponent parameter and the new PSS restriction
+parameters in one 14-argument native ABI.
+
 The first three-way reuse probe tested local round-10 branches for node's
 `--test` CLI, HTTP/2 argument/timer validation, and verbatim Node error text.
 All three candidate cherry-picks became empty on the current target tree.

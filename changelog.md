@@ -5,6 +5,21 @@
 
 ## 2026-07-29
 
+### 5 小时冲刺第四批：14.5 分钟净增 7 文件，29.0 files/hour
+
+11:37–11:51 的三个短根因组静态预计 8 文件，集中验收实际 **+7**：
+
+- child_process maxBuffer：预计 4，实际 **4/4**；async 输出超限使用
+  `RangeError/ERR_CHILD_PROCESS_STDIO_MAXBUFFER`，sync 使用 `ENOBUFS`，
+  同时保留 UTF-8 完整字符与调用方后置 `setEncoding()`；
+- RSA-PSS key restrictions/details：预计 3，实际 **2/3**；第三个文件已
+  进入 sign padding 独立失败，不计 key-details 收益；
+- HTTP/2 response splitting sanitation：预计 1，实际 **1/1**。
+
+完整 9 文件集合包含既有绿色 `spawnsync-maxbuf` 防回归项，最终 8 pass /
+1 fail，green→non-green 0。RSA-PSS lane 与主线 publicExponent 改动发生
+三处语义冲突，集成按新 14 参数 ABI 同时保留两边行为，没有选择性覆盖。
+
 ### 5 小时冲刺第三批：7 分钟净增 4 文件，34.3 files/hour
 
 11:30–11:37 集成 async_hooks 生命周期注册、AsyncResource ID/context 与
