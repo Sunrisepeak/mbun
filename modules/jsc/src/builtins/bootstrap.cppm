@@ -7114,7 +7114,10 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     rmdir: P((p, o) => { validatePath(p); rmdirCheckOpts(o); rmdirImpl(p); }),
     truncate: P((p, len) => fsMod.truncateSync(p, len)),
     statfs: P((p, o) => fsMod.statfsSync(p, o)),
-    readdir: P((p) => F.readdir(toStr(p))),
+    // Reuse the public sync path: it owns encoding, recursive traversal, and
+    // Dirent conversion. Calling the raw native row here lost every option
+    // supplied to fs.promises.readdir().
+    readdir: P((p, o) => fsMod.readdirSync(p, o)),
     // Route through statSync/lstatSync, not F.stat: the raw native row has no
     // Stats prototype and ignores `{ bigint: true }` (fs.promises.stat must
     // return the same shape as its sync twin — test-fs-stat-bigint compares
