@@ -347,11 +347,6 @@ struct TestFlags {
     bool onlyFailures { false };            // --only-failures        (Arguments.rs:1647-1649)
     bool passWithNoTests { false };         // --pass-with-no-tests   (Arguments.rs:1786)
 
-    // --rerun-each <INT>: run every test file this many times (Arguments.rs
-    // TEST_ONLY_PARAMS "--rerun-each"). 0 == absent, so bunfig's
-    // `[test].rerunEach` can supply the default without the flag overriding it.
-    std::uint32_t rerunEach { 0 };
-
     // -t / --test-name-pattern / --grep <STR>: a JS RegExp source matched
     // (partial, unanchored) against each test's full "describe > … > test" name.
     // Non-matching tests count as "skipped because label"; a run that filters out
@@ -470,12 +465,6 @@ TestFlags parse_test(std::span<const std::string_view> args) {
                 }
                 out.randomize = true;
                 out.seed = parsed;
-            } else if (name == "--rerun-each") {
-                std::uint32_t parsed {};
-                const char* begin { value.data() };
-                const char* end { value.data() + value.size() };
-                const auto [ptr, ec] { std::from_chars(begin, end, parsed) };
-                if (ec == std::errc {} && ptr == end) out.rerunEach = parsed;
             } else if (name == "-t" || name == "--test-name-pattern" || name == "--grep") {
                 // Capture the label filter (last one wins, matching bun's option()).
                 out.testNamePattern = std::string { value };

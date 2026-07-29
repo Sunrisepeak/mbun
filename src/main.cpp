@@ -282,25 +282,6 @@ int main(int argc, char* argv[]) {
             args.erase(args.begin());
             continue;
         }
-        // `--config <path>` / `-c <path>`: load THIS bunfig instead of the
-        // implicit ./bunfig.toml. It replaces the auto-discovered file rather
-        // than layering on it, so `--config=bunfig.empty.toml` is how a run
-        // opts out of the project's `preload` list (bunfig/arguments.rs).
-        if ((args[0] == "--config" || args[0] == "-c") && args.size() > 1) {
-            mbun::app::set_bunfig_path(std::string{args[1]});
-            args.erase(args.begin(), args.begin() + 2);
-            continue;
-        }
-        if (args[0].starts_with("--config=")) {
-            mbun::app::set_bunfig_path(std::string{args[0].substr(9)});
-            args.erase(args.begin());
-            continue;
-        }
-        if (args[0].starts_with("-c=")) {
-            mbun::app::set_bunfig_path(std::string{args[0].substr(3)});
-            args.erase(args.begin());
-            continue;
-        }
         if (!is_skippable_run_flag(args[0])) break;
         args.erase(args.begin());
     }

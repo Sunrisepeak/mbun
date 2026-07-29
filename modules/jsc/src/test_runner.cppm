@@ -1787,14 +1787,6 @@ RunResult run_source(std::string_view js_source, std::string_view dir = ".", boo
     }
     // bun auto-loads .env files (test mode: mode=test, .env.local skipped).
     rt::apply_dotenv(/*isTest=*/true);
-    // bunfig `[test].preload` (falling back to the universal `preload`) runs
-    // before the test file, in the same context — that is how a preload's
-    // globals/plugins are visible to the tests. A preload that throws or is
-    // missing aborts the file, like bun's jsc_hooks.rs:730-767.
-    if (auto pre{rt::run_preloads()}; !pre) {
-        r.error = pre.error();
-        return r;
-    }
     // 3. collection: evaluate the test source; test bodies do not run yet, so a
     //    failure here is a genuine top-level/syntax error. Lower any remaining ESM
     //    to CJS with the AST-aware transpiler (template-safe, unlike the old

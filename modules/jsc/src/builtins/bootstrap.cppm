@@ -4509,39 +4509,6 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       getStringWidth: (s) => (typeof s === "string" ? s.length : 0),
     },
     npm_manifest_test_helpers: {},
-    // crash_handler (src/js/internal-for-testing.ts -> src/runtime/api/
-    // crash_handler_jsc.rs). getFeatureData() reports the analytics feature
-    // table: `features` is PACKED_FEATURES_LIST verbatim — the crash-report bit
-    // index of each feature IS its position here, so the ORDER is load-bearing
-    // and must stay in lockstep with `define_features!` in src/analytics/lib.rs
-    // (test/internal/macos-cross-config.test.ts pins the two against each other
-    // so a reshape of either side fails loudly instead of shipping a misaligned
-    // table). Append new features at the end; never reorder.
-    crash_handler: {
-      getFeatureData: () => ({
-        features: [
-          "Bun.stderr", "Bun.stdin", "Bun.stdout", "WebSocket", "abort_signal",
-          "binlinks", "bunfig", "define", "dotenv", "debugger", "external",
-          "extracted_packages", "fetch", "git_dependencies", "html_rewriter",
-          "tcp_server", "tls_server", "http_server", "https_server",
-          "http_client_proxy", "jsc", "dev_server", "lifecycle_scripts",
-          "loaders", "lockfile_migration_from_package_lock", "text_lockfile",
-          "isolated_bun_install", "hoisted_bun_install", "macros", "no_avx2",
-          "no_avx", "shell", "spawn", "standalone_executable",
-          "standalone_shell", "todo_panic", "transpiler_cache", "tsconfig",
-          "tsconfig_paths", "virtual_modules", "workers_spawned",
-          "workers_terminated", "napi_module_register", "process_dlopen",
-          "postgres_connections", "s3", "valkey", "csrf_verify", "csrf_generate",
-          "unsupported_uv_function", "exited", "yarn_migration", "pnpm_migration",
-          "yaml_parse", "cpu_profile", "heap_snapshot", "webview_chrome",
-          "webview_webkit",
-        ],
-        version: (globalThis.Bun && globalThis.Bun.version) || "",
-        is_canary: false,
-        revision: (globalThis.Bun && globalThis.Bun.revision) || "",
-        generated_at: Date.now(),
-      }),
-    },
     // socketFaultInjection (blueprint src/js/internal-for-testing.ts:323): available()
     // is false unless built with --socket-fault-injection=on, so the six
     // *-syscall-fault suites self-skip exactly like a release bun.
