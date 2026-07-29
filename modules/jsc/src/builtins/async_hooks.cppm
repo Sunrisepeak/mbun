@@ -60,7 +60,10 @@ inline constexpr std::string_view kAsyncHooksJS = R"JS(
     value: () => contextGet() !== undefined || activeHooks.size !== 0,
   });
   let nextAsyncId = 1;
-  let executionId = 0;
+  // Node's bootstrap itself owns async id 1. Timers scheduled by user code at
+  // top level therefore inherit triggerAsyncId 1 rather than the internal
+  // sentinel 0.
+  let executionId = 1;
   let executionResource;
   const hookCall = (name, ...args) => {
     for (const hook of Array.from(activeHooks)) {
@@ -99,6 +102,31 @@ inline constexpr std::string_view kAsyncHooksJS = R"JS(
       }
     };
   };
+
+  // node_timers replaces the global scheduling functions after this payload
+  // runs. Keeping timer lifecycle ownership here, but letting that final
+  // wrapper register its returned facade, avoids attaching hooks to the stale
+  // native handle (and makes the init resource the public Immediate/Timeout).
+  const timerHooks = {
+    init(resource, type) {
+      if (activeHooks.size === 0) return undefined;
+      const token = { id: newAsyncId(), resource, destroyed: false };
+      hookCall("init", token.id, type, executionId, resource);
+      return token;
+    },
+    run(token, callback, thisArg, args) {
+      if (token === undefined) return Reflect.apply(callback, thisArg, args);
+      return runAsyncCallback(token.id, token.resource, callback, thisArg, args);
+    },
+    destroy(token) {
+      if (token === undefined || token.destroyed) return;
+      token.destroyed = true;
+      hookCall("destroy", token.id);
+    },
+  };
+  Object.defineProperty(G, "__mbunAsyncHookTimer", {
+    configurable: true, enumerable: false, value: timerHooks,
+  });
 
   class AsyncLocalStorage {
     #disabled = false;
@@ -284,9 +312,6 @@ inline constexpr std::string_view kAsyncHooksJS = R"JS(
     };
   };
   wrapCallbackApi(G, "queueMicrotask");
-  wrapCallbackApi(G, "setTimeout");
-  wrapCallbackApi(G, "setInterval");
-  wrapCallbackApi(G, "setImmediate");
   if (G.process) wrapCallbackApi(G.process, "nextTick");
 
   // Native and JS-backed network/process objects in mbun surface callbacks via

@@ -85,6 +85,11 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
       } else {
         activeImmediates.add(t);
       }
+      const timerHooks = G.__mbunAsyncHookTimer;
+      if (timerHooks && typeof timerHooks.init === "function") {
+        state.timerHooks = timerHooks;
+        state.asyncHook = timerHooks.init(t, kind === "immediate" ? "Immediate" : "Timeout");
+      }
       // unref()/ref() must chain (node returns the timer).
       const oUnref = t.unref, oRef = t.ref;
       if (typeof oUnref === "function") t.unref = function unref() { const r = oUnref.call(state.native); return r === undefined ? t : r; };
@@ -120,6 +125,10 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
 
     function destroyTimer(t) {
       if (t === null || typeof t !== "object") return;
+      const state = t[STATE];
+      if (state && state.timerHooks && typeof state.timerHooks.destroy === "function") {
+        state.timerHooks.destroy(state.asyncHook);
+      }
       t._destroyed = true;
       const id = idOf(t);
       if (id !== null) registry.delete(id);
@@ -164,6 +173,12 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
       const h = G.__mbunSchedHook;
       return h === undefined || h === null ? cb : h(cb);
     };
+    const __runTimerCallback = (state, cb, thisArg, args) => {
+      if (state.timerHooks && typeof state.timerHooks.run === "function") {
+        return state.timerHooks.run(state.asyncHook, cb, thisArg, args);
+      }
+      return cb.apply(thisArg, args);
+    };
 
     const mySetTimeout = function setTimeout(cb, ms, ...args) {
       if (typeof cb !== "function") throw __invalidCb(cb);
@@ -172,7 +187,7 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
       const state = { gen: 0, ms, args };
       state.run = function (...a) {
         const g = state.gen;
-        try { return cb.apply(state.timer, a); }
+        try { return __runTimerCallback(state, cb, state.timer, a); }
         // refresh()/clear during the callback bumps gen: skip the destroy.
         finally { if (state.gen === g && state.timer) destroyTimer(state.timer); }
       };
@@ -186,7 +201,7 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
       _checkCountdown(ms);
       cb = __sched(cb);
       const state = { gen: 0, ms, args };
-      state.run = function (...a) { return cb.apply(state.timer, a); };
+      state.run = function (...a) { return __runTimerCallback(state, cb, state.timer, a); };
       const t = oSetInterval(state.run, ms, ...args);
       state.timer = t;
       state.native = t;
@@ -200,7 +215,7 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
         const g = state.gen;
         // node drops the Immediate from the active set before its callback runs.
         if (state.timer) activeImmediates.delete(state.timer);
-        try { return cb.apply(state.timer, a); }
+        try { return __runTimerCallback(state, cb, state.timer, a); }
         finally { if (state.gen === g && state.timer) destroyTimer(state.timer); }
       };
       const t = oSetImmediate(state.run, ...args);
