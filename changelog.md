@@ -5,6 +5,20 @@
 
 ## 2026-07-29
 
+### 5 小时冲刺第六批：11.5 分钟净增 7 文件，36.5 files/hour
+
+11:55–12:06 接受四个短合同组，命名验收 **7/7 全绿**：
+
+- `urlToHttpOptions` copied-object port shape + invalid argument，1；
+- HTTP/2 file response 先发 HEADERS，再把 raw fd I/O error 转
+  INTERNAL_ERROR stream/RST，1；
+- EventEmitter once wrapper 返回值与 re-entrant once 语义，2；
+- MaxListeners warning 走 `process.emitWarning` 且包含 limit，3。
+
+本批中途试做 EC `paramEncoding` 与 URL.canParse 必填参数，各自只移动首
+错误而文件仍红；两项均用 additive revert 撤销，不把 0 收益代码留在
+checkpoint。最终接受集合 green→non-green 0。
+
 ### 5 小时冲刺第五批：4 分钟净增 4 文件，60 files/hour
 
 11:51–11:55 的 DSA JWK 错误合同与 HTTP/2 native submit error 通用映射，

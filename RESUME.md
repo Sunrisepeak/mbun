@@ -141,6 +141,20 @@ DSA JWK rejection plus the generic HTTP/2 native submit-error adapter made all
 All four transitions are complete-file fail/timeout to pass, not first-error
 movement.
 
+### Sprint wave 6 measured checkpoint (11:55–12:06)
+
+Four short contract groups gained 7 complete files in 11.5 minutes:
+**36.5 files/hour**, with zero named-set regressions.
+
+- `urlToHttpOptions` shape plus invalid argument: 1;
+- HTTP/2 file response HEADERS then fd I/O error to stream/RST: 1;
+- EventEmitter once return/re-entrancy semantics: 2;
+- MaxListeners process warning routing and message limit: 3.
+
+Two zero-yield attempts, EC `paramEncoding` and URL.canParse required-argument
+validation, were additively reverted after runtime checks proved that they only
+moved the first error. They are not part of the accepted checkpoint.
+
 The first three-way reuse probe tested local round-10 branches for node's
 `--test` CLI, HTTP/2 argument/timer validation, and verbatim Node error text.
 All three candidate cherry-picks became empty on the current target tree.
