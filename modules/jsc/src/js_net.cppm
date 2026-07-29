@@ -508,6 +508,11 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       // Loop-reference state (see NET.hold): sticky intent + current hold.
       this._refd = true; this._held = false; this._loopOpen = false;
       this.allowHalfOpen = !!opts.allowHalfOpen;
+      // Keep the node-visible enforcer as an actual `end` listener.  Apart
+      // from matching the public listener shape, this makes every EOF path
+      // (the reactor, a parked read queue, and push(null)) take the same
+      // next-tick write-side shutdown route.
+      if (!this.allowHalfOpen) this.once("end", () => this._enforceNoHalfOpen());
       // A client has no peer until its public 'connect' event. Accepted and
       // adopted sockets fill these in from their handle instead.
       this.remoteAddress = undefined; this.remoteFamily = undefined; this.remotePort = undefined;
@@ -550,6 +555,16 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
         if (ev !== "data") return;
         if (this._flowing !== false) this._flowing = true;
         if (this._rq && this._rq.length) G.queueMicrotask(() => this._flushRq());
+      });
+    }
+    _enforceNoHalfOpen() {
+      if (this.allowHalfOpen || this._shutW) return;
+      // Node leaves one turn for an `end` handler to write before the default
+      // non-half-open shutdown closes the writable side.
+      G.queueMicrotask(() => {
+        if (this.destroyed || this._shutW) return;
+        this._shutW = true; this.writable = false; this._flush();
+        if (this._eof && this._shutSent && this._wq.length === 0 && !this._rqPending() && !this._rqUndelivered()) this.destroy();
       });
     }
     _adopt(fd) {
@@ -1598,17 +1613,6 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
             // received. _flushRq emits it once the queue drains.
             if (this._rq && this._rq.length) this._rqEnd = true;
             else { this._readableState.endEmitted = true; this.emit("end"); }
-            // node net.js onReadableStreamEnd auto-ends the write side on the
-            // NEXT tick, not inline, so data written synchronously right after
-            // 'end'/'secureConnect' (e.g. a TLS1.2 peer that FINs one flight
-            // early) still flushes instead of hitting ERR_STREAM_WRITE_AFTER_END.
-            if (!this.allowHalfOpen && !this._shutW) {
-              G.queueMicrotask(() => {
-                if (this.destroyed || this._shutW) return;
-                this._shutW = true; this.writable = false; this._flush();
-                if (this._eof && this._shutSent && this._wq.length === 0 && !this._rqPending() && !this._rqUndelivered()) this.destroy();
-              });
-            }
             if (this._shutSent && this._wq.length === 0 && !this._rqPending() && !this._rqUndelivered()) this.destroy();
             // EOF: the read side is stopped, so this handle is only active while
             // a write is queued (see _syncEofHold).
