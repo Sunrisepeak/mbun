@@ -895,8 +895,25 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
       const e = new TypeError('The "key" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, DataView, KeyObject, or CryptoKey. Received ' + (key === null ? "null" : "undefined"));
       e.code = "ERR_INVALID_ARG_TYPE"; throw e;
     }
-    // A secret KeyObject is accepted as the key (node cipher.js prepareSecretKey).
-    if (isKO(key)) key = koOf(key).material;
+    // node:crypto still accepts a WebCrypto CryptoKey on this legacy surface,
+    // but reports DEP0203 while converting its hidden raw material. Read the
+    // bridge record rather than public CryptoKey properties, which are mutable.
+    if (typeof G.__mbunIsCryptoKey === "function" && G.__mbunIsCryptoKey(key)) {
+      const bridge = G.__mbunCryptoKeyToKeyObject;
+      const cryptoKey = typeof bridge === "function" ? bridge(key) : undefined;
+      if (!cryptoKey || cryptoKey.kind !== "secret") {
+        const e = new TypeError('The "key" argument must be a secret CryptoKey');
+        e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+      }
+      if (G.process && typeof G.process.emitWarning === "function") {
+        G.process.emitWarning("Passing a CryptoKey to node:crypto functions is deprecated.",
+                              "DeprecationWarning", "DEP0203");
+      }
+      key = cryptoKey.material;
+    } else if (isKO(key)) {
+      // A secret KeyObject is accepted as the key (node cipher.js prepareSecretKey).
+      key = koOf(key).material;
+    }
     // iv: string | ArrayBuffer/view | null accepted; number/undefined/etc rejected.
     if (iv !== null && typeof iv !== "string" && !isView(iv) && !(iv instanceof ArrayBuffer)) {
       const e = new TypeError('The "iv" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView. Received ' +
