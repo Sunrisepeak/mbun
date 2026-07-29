@@ -1573,6 +1573,11 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
           doUpgrade = false;
           const head = G.Buffer ? G.Buffer.from(parser.leftover()) : parser.leftover();
           sock._httpParser = null;
+          // The parser is no longer associated with an upgraded socket. Clear
+          // the public slot through the same freeParser path as normal server
+          // teardown, after taking the leftover bytes needed by the handover.
+          if (freeParser && sock.parser) freeParser(sock.parser, im, sock);
+          else { if (im) im.parser = null; sock.parser = null; }
           // The raw socket now belongs to the upgrade/CONNECT listener: no
           // further byte on it is HTTP, so nothing may re-arm a parser for it
           // (doing so re-parsed tunnel traffic as a new request).

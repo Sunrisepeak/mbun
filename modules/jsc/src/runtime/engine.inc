@@ -116,6 +116,21 @@ public:
         return {};
     }
 
+    // Parse a classic script without evaluating it. The command-line --check
+    // path deliberately uses this instead of run_script(): stdin may contain
+    // a top-level throw that must be syntax-checked but never executed.
+    int check_syntax(std::string_view source, const std::string& srcUrl) {
+        JSStringRef script{JSStringCreateWithUTF8CString(std::string{source}.c_str())};
+        JSStringRef url{JSStringCreateWithUTF8CString(srcUrl.c_str())};
+        JSValueRef exc{nullptr};
+        const bool ok{JSCheckScriptSyntax(ctx_, script, url, 1, &exc)};
+        JSStringRelease(url);
+        JSStringRelease(script);
+        if (ok) return 0;
+        std::println(std::cerr, "{}: {}", srcUrl, describe_exception_(exc));
+        return 1;
+    }
+
     // Evaluate source and return the string coercion of its result (for reading
     // back non-numeric values, e.g. the bun:test runner's collected output body).
     std::expected<std::string, std::string> eval_to_string(std::string_view source) {
@@ -153,13 +168,20 @@ public:
     // can require() local helpers and see Bun.*/node globals.
     std::expected<void, std::string> install_cjs_env(const std::string& dir,
                                                      const std::string& file) {
+        const bool pendingDeprecation{
+            std::find(gExecArgv.begin(), gExecArgv.end(), "--pending-deprecation") != gExecArgv.end()};
         std::string js{"globalThis.__dirname = " + json_quote_(dir) + ";\n" +
                        "globalThis.__filename = " + json_quote_(file) + ";\n" +
                        "if (globalThis.Bun) globalThis.Bun.main = " + json_quote_(file) + ";\n" +
-                       "globalThis.module = { exports: {} };\n" +
+                       "globalThis.module = { exports: {}, filename: " + json_quote_(file) + ", parent: null };\n" +
+                       (pendingDeprecation
+                            ? "(function(){ var moduleParent = null; Object.defineProperty(globalThis.module, 'parent', { enumerable: true, configurable: true, get: function(){ return moduleParent; }, set: function(value){ moduleParent = value; var p = globalThis.process; if (p && typeof p.emitWarning === 'function') p.emitWarning('module.parent is deprecated due to accuracy issues. Please use require.main to find program entry point instead.', 'DeprecationWarning', 'DEP0144'); } }); })();\n"
+                            : "") +
                        "globalThis.exports = globalThis.module.exports;\n" +
                        "globalThis.require = globalThis.__mbun_make_require(" + json_quote_(dir) +
                        ");\n" +
+                       "Object.defineProperty(globalThis.require, '__mbun_parent_filename', { value: " +
+                       json_quote_(file) + ", configurable: true });\n" +
                        "globalThis.__mbunImportMeta = { url: " + json_quote_("file://" + file) +
                        ", dir: " + json_quote_(dir) + ", dirname: " + json_quote_(dir) +
                        ", path: " + json_quote_(file) + ", filename: " + json_quote_(file) +
@@ -699,6 +721,14 @@ public:
             if (auto m{eval_to_string("globalThis.__mbun_fatal_message()")}; m && !m->empty()) {
                 std::cerr << *m << '\n';
             }
+            // Node's --abort-on-uncaught-exception changes only the terminal
+            // disposition of an unclaimed exception. Routing every callback
+            // through the JS fatal channel first preserves domain and
+            // uncaughtException handling, then std::abort() gives the child the
+            // observable SIGABRT disposition its parent test harness expects.
+            auto abortOnUncaught{eval_number(
+                "globalThis.__mbun_fatal_should_abort?__mbun_fatal_should_abort():0")};
+            if (abortOnUncaught && *abortOnUncaught == 1.0) std::abort();
             auto fs{eval_number("globalThis.__mbun_fatal_exit_code?__mbun_fatal_exit_code():1")};
             status = (fs && *fs > 0) ? static_cast<int>(*fs) : 1;
         } else if (unhandledRejection_) {

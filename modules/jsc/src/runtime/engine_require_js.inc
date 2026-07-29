@@ -32,13 +32,61 @@ globalThis.__mbun_blob_module_source = function (spec) {
            source: bytes ? new TextDecoder().decode(bytes) : "" };
 };
 globalThis.__mbun_make_require = function (dir) {
+  const invalidRequireId = function (value) {
+    if (typeof value !== "string") {
+      let received;
+      if (value === undefined) received = "undefined";
+      else if (value === null) received = "null";
+      else if (typeof value === "object") received = "an instance of " +
+        (value && value.constructor ? value.constructor.name : "Object");
+      else received = "type " + typeof value + " (" + String(value) + ")";
+      const error = new TypeError('The "id" argument must be of type string. Received ' + received);
+      error.code = "ERR_INVALID_ARG_TYPE";
+      return error;
+    }
+    if (value.length === 0) {
+      const error = new TypeError("The argument 'id' must be a non-empty string. Received ''");
+      error.code = "ERR_INVALID_ARG_VALUE";
+      return error;
+    }
+    return null;
+  };
   // `k` (arg 3): truthy when this call is a lowered ESM import statement or a
   // dynamic import (ImportKind::Stmt/Dynamic) rather than a literal require() —
   // it only selects the Node error code on failure (ERR_MODULE_NOT_FOUND vs
   // MODULE_NOT_FOUND), not the resolution condition.
   const req = function (s, o, k) {
-    return globalThis.__mbun_require_native(s, dir, false,
-      (o && typeof o.type === "string") ? o.type : "", k ? 1 : 0);
+    const invalid = invalidRequireId(s);
+    if (invalid) throw invalid;
+    // The C++ bridge receives UTF-8 through a nul-terminated string. Reject
+    // embedded NULs here so the full request stays observable in Node's error.
+    if (s.indexOf("\0") !== -1) {
+      const error = new Error("Cannot find module '" + s + "'");
+      error.code = "MODULE_NOT_FOUND";
+      throw error;
+    }
+    const load = function () {
+      // Node consults require.cache before entering its CJS loader.  Keep the
+      // native cache authoritative for ordinary modules, while honouring a
+      // caller-installed cache record (including builtin keys) before crossing
+      // the native boundary.
+      const cache = req.cache;
+      let cacheKey = s;
+      if (s.indexOf("node:") !== 0) {
+        try { cacheKey = req.resolve(s); } catch (_) {}
+      }
+      const cached = cache[cacheKey] || cache[s];
+      if (cached && typeof cached === "object" && "exports" in cached) {
+        return cached.exports;
+      }
+      return globalThis.__mbun_require_native(s, dir, false,
+        (o && typeof o.type === "string") ? o.type : "", k ? 1 : 0);
+    };
+    const modules = globalThis.__mbunNativeModules;
+    const dc = modules && (modules["diagnostics_channel"] || modules["node:diagnostics_channel"]);
+    const trace = dc && typeof dc.tracingChannel === "function" ? dc.tracingChannel("module.require") : null;
+    if (!trace || !trace.hasSubscribers) return load();
+    return trace.traceSync(load, { parentFilename: req.__mbun_parent_filename, id: s });
   };
   req.resolve = function (s) { return globalThis.__mbun_resolve_native(String(s), dir); };
   // require.cache is a live view over the native CommonJS module cache: a plain
@@ -89,24 +137,25 @@ globalThis.__mbun_make_require_esm = function (dir) {
 // module-scoped require (the script-mode JSC loader can't fetch/transpile TS).
 // Returns a Promise of an ESM namespace (exports + a `default`), so consumers
 // that read `.default` (node builtins/stubs, interop) behave like real import().
-globalThis.__mbun_esm_namespace = function (m) {
+globalThis.__mbun_esm_namespace = function (m, forceCommonJSDefault) {
   if (m === null || (typeof m !== "object" && typeof m !== "function")) return { default: m };
   // Own enumerable props become named exports (a transpiled ESM module also
   // copies its own `.default` here). A pure CJS module has no `default`, so the
   // whole exports object is the default binding (Node CJS→ESM interop).
   var ns = Object.assign({}, m);
-  if (!("default" in ns)) ns.default = m;
+  if (forceCommonJSDefault || !("default" in ns)) ns.default = m;
   return ns;
 };
 globalThis.__mbun_dyn_import = function (req, spec, options) {
+  const load = function () {
   // A `data:` URL carries its own source — there is nothing to fetch, so bun
   // decodes and compiles it eagerly and a malformed payload (bad base64) throws
   // from the import() call site instead of rejecting later
   // (js/node/string-module.test.js asserts the synchronous throw).
-  if (typeof spec === "string" && spec.startsWith("data:")) {
-    return Promise.resolve(globalThis.__mbun_esm_namespace(req(spec, undefined, 1)));
-  }
-  return Promise.resolve().then(function () {
+    if (typeof spec === "string" && spec.startsWith("data:")) {
+      return Promise.resolve(globalThis.__mbun_esm_namespace(req(spec, undefined, 1)));
+    }
+    return Promise.resolve().then(function () {
     // `import(spec, { with: { type } })` (and the legacy `{ assert: { type } }`)
     // — thread the type import attribute to require() as its 2nd arg so it
     // overrides the extension-derived loader, exactly like a static
@@ -118,8 +167,20 @@ globalThis.__mbun_dyn_import = function (req, spec, options) {
     }
     // Pass the import marker (3rd arg): a dynamic import() is ImportKind::Dynamic,
     // so a resolution failure reports ERR_MODULE_NOT_FOUND (bun ResolveMessage.rs).
-    return globalThis.__mbun_esm_namespace(req(String(spec), attr, 1));
-  });
+      var requested = String(spec);
+      // node:process is a CommonJS builtin. Its namespace default is the
+      // process object even if user code assigns process.default.
+      return globalThis.__mbun_esm_namespace(
+        req(requested, attr, 1), requested === "process" || requested === "node:process");
+    });
+  };
+  const modules = globalThis.__mbunNativeModules;
+  const dc = modules && (modules["diagnostics_channel"] || modules["node:diagnostics_channel"]);
+  const trace = dc && typeof dc.tracingChannel === "function" ? dc.tracingChannel("module.import") : null;
+  if (!trace || !trace.hasSubscribers) return load();
+  const parentFilename = req && req.__mbun_parent_filename;
+  const parentURL = parentFilename ? "file://" + parentFilename : undefined;
+  return trace.tracePromise(load, { parentURL: parentURL, url: String(spec) });
 };
 // Per-module import.meta: the CJS wrapper injects a local __mbunImportMeta built
 // from the module's own file/dir, so `import.meta.url`/`.dir` are correct inside

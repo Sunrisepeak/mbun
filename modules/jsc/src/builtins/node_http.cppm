@@ -1310,8 +1310,14 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
         ? this.options.agentKeepAliveTimeoutBuffer : 1000;
 
     validateOneOf(this.scheduling, "scheduling", ["fifo", "lifo"]);
-    if (this.maxTotalSockets !== undefined) validateNumber(this.maxTotalSockets, "maxTotalSockets", 1);
-    else this.maxTotalSockets = Infinity;
+    if (this.maxTotalSockets !== undefined) {
+      validateNumber(this.maxTotalSockets, "maxTotalSockets", 1);
+      // Relational comparisons deliberately leave NaN unordered, but Node's
+      // validateNumber rejects it for this positive socket-count limit.
+      if (Number.isNaN(this.maxTotalSockets)) {
+        throw ERR_OUT_OF_RANGE("maxTotalSockets", ">= 1", this.maxTotalSockets);
+      }
+    } else this.maxTotalSockets = Infinity;
 
     this.on("free", (socket, options) => {
       const name = this.getName(options);
@@ -1452,6 +1458,12 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
       if (!this.sockets[name]) this.sockets[name] = [];
       this.sockets[name].push(s);
       this.totalSocketCount++;
+      // net.createConnection receives the option but Socket does not arm an
+      // idle timer by itself. Apply the Agent timeout before onSocket() so the
+      // request observes both the interval and its forwarding listener.
+      if (options.timeout !== undefined && typeof s.setTimeout === "function") {
+        s.setTimeout(options.timeout);
+      }
       installListeners(this, s, options);
       cb(null, s);
     });
@@ -1551,6 +1563,13 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
     }
   };
   function setRequestSocket(agent, request, socket) {
+    // net.connect() completes on a microtask in this runtime, whereas node
+    // gives ClientRequest's next-tick socket setup a chance to run first.
+    // Keep the transport in its connecting state for that one setup turn: a
+    // request timeout registered before the socket event must install only
+    // after the transport's eventual 'connect', not overwrite the Agent's
+    // initial timeout while the request is being attached.
+    if (socket && socket.connecting) socket._httpClientConnectPending = true;
     request.onSocket(socket);
     const agentTimeout = agent.options.timeout || 0;
     if (request.timeout === undefined || request.timeout === agentTimeout) return;
@@ -1571,6 +1590,7 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
       ? url.hostname.slice(1, -1) : url.hostname;
     const options = {
       __proto__: null,
+      ...url,
       protocol: url.protocol,
       hostname,
       hash: url.hash,
@@ -1617,7 +1637,12 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
     }
 
     let agent = options.agent;
-    const defaultAgent = options._defaultAgent || this._defaultAgent || globalAgent;
+    // `http.globalAgent` is writable. Consult the exported module object for
+    // plain HTTP requests so a later assignment affects subsequent clients;
+    // HTTPS passes its own `_defaultAgent` explicitly above this fallback.
+    const exportedHttp = M["node:http"] || M["http"];
+    const defaultAgent = options._defaultAgent ||
+      (exportedHttp && exportedHttp.globalAgent) || this._defaultAgent || globalAgent;
     if (agent === false) {
       agent = new defaultAgent.constructor();
     } else if (agent === null || agent === undefined) {
@@ -1657,10 +1682,14 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
         const e = new Error("The operation was aborted");
         e.name = "AbortError";
         e.code = "ABORT_ERR";
+        if (signal.reason !== undefined) e.cause = signal.reason;
         return e;
       };
-      if (signal.aborted) nextTick(() => this.destroy(signal.reason || abortErr()));
-      else signal.addEventListener("abort", () => this.destroy(signal.reason || abortErr()), { once: true });
+      // A signal that was already aborted at construction time destroys the
+      // request before http.get() returns. The later socket assignment still
+      // emits its error asynchronously through onSocketNT.
+      if (signal.aborted) this.destroy(abortErr());
+      else signal.addEventListener("abort", () => this.destroy(abortErr()), { once: true });
       delete optsWithoutSignal.signal;
       this.signal = signal;
     }
@@ -2066,6 +2095,10 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
     function onEnd() {
       if (upgraded) return;
       if (!request.res && !socket._hadError) {
+        // EOF can be what first exposes a malformed response. Detach before
+        // publishing the request error so observers never retain the parser's
+        // data listener after a terminal parse failure.
+        detach();
         socket._hadError = true;
         emitErrorEvent(request, ConnResetException("socket hang up"));
       }

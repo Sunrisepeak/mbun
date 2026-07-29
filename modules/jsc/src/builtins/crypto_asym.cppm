@@ -87,6 +87,17 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     });
   }
 
+  // Node only enables Argon2 when its OpenSSL exposes that provider. This build
+  // has no node:crypto Argon2 backend, so retain Node's feature-gated error
+  // rather than leaking a missing-function TypeError.
+  if (typeof C.argon2 !== "function") {
+    C.argon2 = () => {
+      const e = new Error("Argon2 is not supported by this OpenSSL build");
+      e.code = "ERR_CRYPTO_ARGON2_NOT_SUPPORTED";
+      throw e;
+    };
+  }
+
   const isView = (v) => ArrayBuffer.isView(v);
   const toBuf = (v, enc) => {
     if (v == null) return Buffer.alloc(0);
@@ -120,7 +131,10 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     // passphrase stays `undefined` when none was given: node distinguishes "no
     // passphrase" (never prompt, never guess) from an explicit empty one (a real,
     // usable password), and the native loader keys its error off that.
-    if (isKO(k)) return { data: k._km, passphrase: k._pass };
+    if (isKO(k)) {
+      const slot = koOf(k);
+      return { data: slot.material, passphrase: slot.passphrase };
+    }
     if (typeof k === "string" || isView(k) || k instanceof ArrayBuffer) return { data: k, passphrase: undefined };
     // { key: <JWK object>, format: "jwk", ... } — materialize the JWK to DER up
     // front (private when `d` is present) so the native signer/verifier gets real
@@ -136,7 +150,7 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
         data: inner.data, passphrase: pass,
         padding: k.padding, saltLength: k.saltLength, dsaEncoding: k.dsaEncoding,
         oaepHash: k.oaepHash, oaepLabel: k.oaepLabel,
-        encoding: k.encoding,
+        encoding: k.encoding, context: k.context,
       };
     }
     return { data: k, passphrase: undefined };
@@ -230,10 +244,24 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     }
   };
 
+  // Context is an Ed448/ML-DSA signing option. The EVP bridge has no context
+  // argument, but it must still reject it for every key type that does not
+  // support one, rather than silently producing an ordinary signature.
+  const validateSignContext = (r) => {
+    if (r.context === undefined) return;
+    const type = AN.keyType(keyData(r), r.passphrase, false).type;
+    if (type !== "ed448") {
+      const e = new Error("Context parameter is unsupported");
+      e.code = "ERR_CRYPTO_OPERATION_FAILED";
+      throw e;
+    }
+  };
+
   // ---- sign / verify (one-shot + streaming) ----
   const doSign = (algo, data, key) => {
     const r = resolveKey(key);
     validateDsaEncoding(r);
+    validateSignContext(r);
     try {
       return Buffer.from(AN.sign(digestName(algo), toBuf(data), keyData(r), r.passphrase,
         r.padding != null ? r.padding : RSA_PKCS1_PADDING,
@@ -377,16 +405,15 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   // is ERR_INVALID_THIS in node too — the accessor lives on a prototype the
   // receiver does not have.
   const koOf = (self, want) => {
-    const k = koSlots.get(self);
-    if (k === undefined) throw koThis();
-    if (want === "secret" && k !== "secret") throw koThis();
-    if (want === "asymmetric" && k === "secret") throw koThis();
-    return self;
+    const slot = koSlots.get(self);
+    if (slot === undefined) throw koThis();
+    if (want === "secret" && slot.kind !== "secret") throw koThis();
+    if (want === "asymmetric" && slot.kind === "secret") throw koThis();
+    return slot;
   };
   class KeyObject {
     constructor(brand, kind, material, passphrase) {
       if (brand !== kKObrand) throw new TypeError("Illegal constructor");
-      this._kind = kind; this._km = material; this._pass = passphrase == null ? undefined : passphrase;
       // node's three concrete classes: SecretKeyObject and Public/PrivateKeyObject
       // (both under AsymmetricKeyObject), each owning the accessors that only
       // make sense for it. Constructing through the base and re-pointing the
@@ -395,17 +422,21 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
       Object.setPrototypeOf(this, kind === "secret" ? SecretKeyObject.prototype
                                 : kind === "public" ? PublicKeyObject.prototype
                                                     : PrivateKeyObject.prototype);
-      koSlots.set(this, kind);
+      // Native KeyObject state is not reflectable. Keep the complete tuple in
+      // the private slot map so Object.getOwnPropertyNames/Symbols is empty and
+      // consumers cannot be redirected through replaceable public accessors.
+      koSlots.set(this, { kind, material, passphrase: passphrase == null ? undefined : passphrase });
     }
-    get type() { return koOf(this)._kind; }
+    get type() { return koOf(this).kind; }
     get [Symbol.toStringTag]() { return "KeyObject"; }
     export(options) {
+      const slot = koOf(this);
       // Secret keys: options are optional and default to a Buffer copy.
-      if (this._kind === "secret") {
+      if (slot.kind === "secret") {
         if (options != null && typeof options === "object" && options.format === "jwk") {
-          return { kty: "oct", k: Buffer.from(toBuf(this._km)).toString("base64url") };
+          return { kty: "oct", k: Buffer.from(toBuf(slot.material)).toString("base64url") };
         }
-        return Buffer.from(toBuf(this._km));
+        return Buffer.from(toBuf(slot.material));
       }
       // Asymmetric keys: node requires an options object (lib/internal/crypto/keys.js).
       if (options === null || typeof options !== "object") {
@@ -420,18 +451,18 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
           const e = new Error("The selected key encoding jwk does not support encryption.");
           e.code = "ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS"; throw e;
         }
-        return jwkFromKey(this._km, this._pass, this._kind === "public");
+        return jwkFromKey(slot.material, slot.passphrase, slot.kind === "public");
       }
-      const type = options.type || (this._kind === "public" ? "spki" : "pkcs8");
+      const type = options.type || (slot.kind === "public" ? "spki" : "pkcs8");
       const format = options.format || "pem";
       // Encrypting a private key requires a cipher; a passphrase alone throws.
-      if (this._kind === "private" && options.passphrase != null && options.cipher == null) {
+      if (slot.kind === "private" && options.passphrase != null && options.cipher == null) {
         const e = new TypeError("The property 'options.cipher' is invalid. Received undefined");
         e.code = "ERR_INVALID_ARG_VALUE"; throw e;
       }
       const cipher = options.cipher || "";
       const outPass = options.passphrase != null ? (typeof options.passphrase === "string" ? options.passphrase : toBuf(options.passphrase).toString("latin1")) : "";
-      const out = AN.keyExport(this._km, this._pass, this._kind === "public", type, format, cipher, outPass);
+      const out = AN.keyExport(slot.material, slot.passphrase, slot.kind === "public", type, format, cipher, outPass);
       // der format must be a Buffer (node returns Buffer, not a bare Uint8Array).
       return format === "der" ? Buffer.from(out) : out;
     }
@@ -441,24 +472,26 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
           typeof other + " (" + String(other) + ")");
         e.code = "ERR_INVALID_ARG_TYPE"; throw e;
       }
-      if (other._kind !== this._kind) return false;
-      try { return Buffer.compare(toBuf(this.export({ format: this._kind === "secret" ? undefined : "der", type: this._kind === "public" ? "spki" : "pkcs8" })), toBuf(other.export({ format: "der", type: this._kind === "public" ? "spki" : "pkcs8" }))) === 0; } catch { return false; }
+      const slot = koOf(this), otherSlot = koOf(other);
+      if (otherSlot.kind !== slot.kind) return false;
+      try { return Buffer.compare(toBuf(this.export({ format: slot.kind === "secret" ? undefined : "der", type: slot.kind === "public" ? "spki" : "pkcs8" })), toBuf(other.export({ format: "der", type: slot.kind === "public" ? "spki" : "pkcs8" }))) === 0; } catch { return false; }
     }
     // node: keyObject.toCryptoKey(algorithm, extractable, keyUsages) — the
     // reverse of KeyObject.from(). Synchronous, like node's.
     // ref: node lib/internal/crypto/keys.js KeyObject.prototype.toCryptoKey.
     toCryptoKey(algorithm, extractable, keyUsages) {
+      const slot = koOf(this);
       const bridge = G.__mbunKeyObjectToCryptoKey;
       if (typeof bridge !== "function") {
         throw new TypeError("WebCrypto is not available in this build");
       }
-      if (this._kind === "secret") {
-        return bridge("secret", new Uint8Array(toBuf(this._km)), algorithm, extractable, keyUsages);
+      if (slot.kind === "secret") {
+        return bridge("secret", new Uint8Array(toBuf(slot.material)), algorithm, extractable, keyUsages);
       }
-      const isPublic = this._kind === "public";
-      const der = AN.keyExport(this._km, this._pass, isPublic,
+      const isPublic = slot.kind === "public";
+      const der = AN.keyExport(slot.material, slot.passphrase, isPublic,
         isPublic ? "spki" : "pkcs8", "der", "", "");
-      return bridge(this._kind, new Uint8Array(der), algorithm, extractable, keyUsages);
+      return bridge(slot.kind, new Uint8Array(der), algorithm, extractable, keyUsages);
     }
     // node: KeyObject.from(cryptoKey) — only a WebCrypto CryptoKey is accepted.
     static from(key) {
@@ -472,7 +505,16 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
       }
       // Bridge into a node KeyObject via the WebCrypto raw export, when reachable.
       const bridge = G.__mbunCryptoKeyToKeyObject;
-      if (typeof bridge === "function") { const r = bridge(key); if (r) return mkKO(r.kind, r.material, r.passphrase || ""); }
+      if (typeof bridge === "function") {
+        const r = bridge(key);
+        if (r) {
+          if (!r.extractable && G.process && typeof G.process.emitWarning === "function") {
+            G.process.emitWarning("Passing a non-extractable CryptoKey to KeyObject.from() is deprecated.",
+                                  "DeprecationWarning", "DEP0204");
+          }
+          return mkKO(r.kind, r.material, r.passphrase || "");
+        }
+      }
       throw new TypeError("Converting this CryptoKey to a KeyObject is not supported yet in mbun");
     }
   }
@@ -486,32 +528,50 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   class PrivateKeyObject extends AsymmetricKeyObject {}
   Object.defineProperty(SecretKeyObject.prototype, "symmetricKeySize", {
     configurable: true, enumerable: false,
-    get() { return toBuf(koOf(this, "secret")._km).length; },
+    get() { return toBuf(koOf(this, "secret").material).length; },
   });
   Object.defineProperty(AsymmetricKeyObject.prototype, "asymmetricKeyType", {
     configurable: true, enumerable: false,
     get() {
-      const self = koOf(this, "asymmetric");
-      try { return AN.keyType(self._km, self._pass, self._kind === "public").type; } catch (e) { return undefined; }
+      const slot = koOf(this, "asymmetric");
+      try { return AN.keyType(slot.material, slot.passphrase, slot.kind === "public").type; } catch (e) { return undefined; }
     },
   });
   Object.defineProperty(AsymmetricKeyObject.prototype, "asymmetricKeyDetails", {
     configurable: true, enumerable: false,
     get() {
-      const self = koOf(this, "asymmetric");
+      const slot = koOf(this, "asymmetric");
       try {
-        const t = AN.keyType(self._km, self._pass, self._kind === "public");
+        const t = AN.keyType(slot.material, slot.passphrase, slot.kind === "public");
         const d = {};
         if (t.modulusLength != null) d.modulusLength = t.modulusLength;
         if (t.publicExponent != null) d.publicExponent = BigInt("0x" + Buffer.from(t.publicExponent).toString("hex"));
         if (t.divisorLength != null) d.divisorLength = t.divisorLength;
         if (t.namedCurve != null) d.namedCurve = t.namedCurve;
+        // OpenSSL's provider names SHA-2 digests as either SHA256 or SHA2-256;
+        // node exposes the normalized lower-case spelling in key details.
+        const nodeDigest = (name) => {
+          const lower = String(name).toLowerCase();
+          return lower.startsWith("sha2-") ? "sha" + lower.slice(5) : lower;
+        };
+        if (t.hashAlgorithm != null) d.hashAlgorithm = nodeDigest(t.hashAlgorithm);
+        if (t.mgf1HashAlgorithm != null) d.mgf1HashAlgorithm = nodeDigest(t.mgf1HashAlgorithm);
+        if (t.saltLength != null) d.saltLength = t.saltLength;
         return d;
       } catch (e) { return {}; }
     },
   });
   const mkKO = (kind, material, passphrase) => new KeyObject(kKObrand, kind, material, passphrase);
   C.__koBrand = kKObrand;
+  // Worker transport must read the same unforgeable record as crypto callers;
+  // never serialize the user-visible type/accessor surface.
+  Object.defineProperty(C, "__mbunKeyObjectTransferData", {
+    configurable: true, enumerable: false,
+    value: (key) => {
+      const slot = koSlots.get(key);
+      return slot && { kind: slot.kind, material: slot.material, passphrase: slot.passphrase };
+    },
+  });
   const makeKeyObject = (kind, key) => {
     if (isKO(key)) return key;
     // { key: <JWK object>, format: "jwk" } → materialize as DER up front so the
@@ -532,9 +592,10 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     // OpenSSL error) keeps that classification whatever the container looked like.
     const classified = keyErr(nativeErr);
     if (classified !== nativeErr) return classified;
-    const isStr = typeof ko._km === "string";
-    const bytes = toBuf(ko._km);
-    const head = isStr ? ko._km.slice(0, 64) : Buffer.from(bytes.slice(0, 64)).toString("latin1");
+    const slot = koOf(ko);
+    const isStr = typeof slot.material === "string";
+    const bytes = toBuf(slot.material);
+    const head = isStr ? slot.material.slice(0, 64) : Buffer.from(bytes.slice(0, 64)).toString("latin1");
     if (head.includes("-----BEGIN")) return keyErr(nativeErr); // surface native parse/passphrase error
     if (!isStr && bytes.length > 0 && bytes[0] === 0x30) {
       const e = new Error("error:06000066:public key routines:OPENSSL_internal:DECODE_ERROR");
@@ -557,7 +618,8 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     // relies on that throw to fall back to createSecretKey for HS* secrets.
     let info;
     try {
-      info = AN.keyType(ko._km, ko._pass, false);
+      const slot = koOf(ko);
+      info = AN.keyType(slot.material, slot.passphrase, false);
     } catch (e) {
       throw asymParseError(ko, e);
     }
@@ -573,11 +635,12 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     // node getKeyObjectHandle(kCreatePublic): a private KeyObject derives its
     // public half; any other KeyObject (public/secret) throws.
     if (isKO(key)) {
-      if (key._kind === "private") {
-        const pem = AN.keyExport(key._km, key._pass, true, "spki", "pem", "", "");
+      const slot = koOf(key);
+      if (slot.kind === "private") {
+        const pem = AN.keyExport(slot.material, slot.passphrase, true, "spki", "pem", "", "");
         return mkKO("public", pem, "");
       }
-      const e = new TypeError("Invalid key object type " + key._kind + ", expected private.");
+      const e = new TypeError("Invalid key object type " + slot.kind + ", expected private.");
       e.code = "ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE"; throw e;
     }
     const ko = makeKeyObject("public", key);
@@ -586,14 +649,16 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     // string secrets. Private material stays accepted (node derives the
     // public half) and certificates pass through to the native layer.
     try {
-      AN.keyType(ko._km, ko._pass, true);
+      const slot = koOf(ko);
+      AN.keyType(slot.material, slot.passphrase, true);
     } catch (ePub) {
       let privOk = false;
-      try { AN.keyType(ko._km, ko._pass, false); privOk = true; } catch { /* not a private key either */ }
+      const slot = koOf(ko);
+      try { AN.keyType(slot.material, slot.passphrase, false); privOk = true; } catch { /* not a private key either */ }
       if (!privOk) {
-        const head = typeof ko._km === "string"
-          ? ko._km.slice(0, 64)
-          : Buffer.from(toBuf(ko._km).slice(0, 64)).toString("latin1");
+        const head = typeof slot.material === "string"
+          ? slot.material.slice(0, 64)
+          : Buffer.from(toBuf(slot.material).slice(0, 64)).toString("latin1");
         if (head.includes("-----BEGIN CERTIFICATE")) return ko;
         throw asymParseError(ko, ePub);
       }
@@ -688,6 +753,13 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     // encoder for DER and convert, exactly like KeyObject.export({format:"jwk"}).
     const pubJwk = !wantPubObj && penc.format === "jwk";
     const privJwk = !wantPrivObj && senc.format === "jwk";
+    // RFC 7518 has no JWK key type for DSA. Reject at the keygen API boundary
+    // rather than generating a key whose requested output cannot be represented.
+    if (type === "dsa" && (pubJwk || privJwk)) {
+      const e = new Error("Unsupported JWK Key Type.");
+      e.code = "ERR_CRYPTO_JWK_UNSUPPORTED_KEY_TYPE";
+      throw e;
+    }
     const pubType = pubJwk ? "spki" : (penc.type || "spki");
     const pubFmt = (wantPubObj || pubJwk) ? "der" : (penc.format || "pem");
     const privType = privJwk ? "pkcs8" : (senc.type || "pkcs8");
@@ -700,7 +772,19 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     const modLen = (type === "dh" ? options.primeLength : options.modulusLength) || 2048;
     const curve = options.namedCurve || "";
     const divLen = options.divisorLength || 0;
-    const res = AN.generateKeyPair(type, modLen, curve, pubType, pubFmt, privType, privFmt, cipher, pass, divLen);
+    const publicExponent = options.publicExponent == null ? 65537 : options.publicExponent;
+    // RSA-PSS restrictions are properties of the generated key, not merely of
+    // a later sign() call. Pass them to the provider so PEM/DER round trips and
+    // asymmetricKeyDetails retain the selected digest/MGF1/salt policy.
+    const pssDigest = type === "rsa-pss" && options.hashAlgorithm != null
+      ? digestName(options.hashAlgorithm) : "";
+    const pssMgf1Digest = pssDigest
+      ? digestName(options.mgf1HashAlgorithm == null ? pssDigest : options.mgf1HashAlgorithm) : "";
+    const pssDigestLength = { sha1: 20, sha224: 28, sha256: 32, sha384: 48, sha512: 64 };
+    const pssSaltLength = pssDigest
+      ? (options.saltLength == null ? (pssDigestLength[pssDigest] || -1) : options.saltLength) : -1;
+    const res = AN.generateKeyPair(type, modLen, curve, pubType, pubFmt, privType, privFmt, cipher, pass,
+      divLen, publicExponent, pssDigest, pssMgf1Digest, pssSaltLength);
     let publicKey = res.publicKey, privateKey = res.privateKey;
     if (wantPubObj) publicKey = mkKO("public", publicKey, "");
     else if (pubJwk) publicKey = jwkFromKey(publicKey, "", true);
@@ -822,8 +906,25 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
       const e = new TypeError('The "key" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, DataView, KeyObject, or CryptoKey. Received ' + (key === null ? "null" : "undefined"));
       e.code = "ERR_INVALID_ARG_TYPE"; throw e;
     }
-    // A secret KeyObject is accepted as the key (node cipher.js prepareSecretKey).
-    if (isKO(key)) key = key._km;
+    // node:crypto still accepts a WebCrypto CryptoKey on this legacy surface,
+    // but reports DEP0203 while converting its hidden raw material. Read the
+    // bridge record rather than public CryptoKey properties, which are mutable.
+    if (typeof G.__mbunIsCryptoKey === "function" && G.__mbunIsCryptoKey(key)) {
+      const bridge = G.__mbunCryptoKeyToKeyObject;
+      const cryptoKey = typeof bridge === "function" ? bridge(key) : undefined;
+      if (!cryptoKey || cryptoKey.kind !== "secret") {
+        const e = new TypeError('The "key" argument must be a secret CryptoKey');
+        e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+      }
+      if (G.process && typeof G.process.emitWarning === "function") {
+        G.process.emitWarning("Passing a CryptoKey to node:crypto functions is deprecated.",
+                              "DeprecationWarning", "DEP0203");
+      }
+      key = cryptoKey.material;
+    } else if (isKO(key)) {
+      // A secret KeyObject is accepted as the key (node cipher.js prepareSecretKey).
+      key = koOf(key).material;
+    }
     // iv: string | ArrayBuffer/view | null accepted; number/undefined/etc rejected.
     if (iv !== null && typeof iv !== "string" && !isView(iv) && !(iv instanceof ArrayBuffer)) {
       const e = new TypeError('The "iv" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView. Received ' +
@@ -1008,6 +1109,17 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   ECDH.prototype.getPrivateKey = function (encoding) { return (encoding && encoding !== "buffer") ? this._priv.toString(encoding) : Buffer.from(this._priv); };
   ECDH.prototype.setPrivateKey = function (key, encoding) { this._priv = typeof key === "string" ? Buffer.from(key, encoding) : toBuf(key); this._pub = Buffer.from(AN.ecdhPublicFromPrivate(this._curve, this._priv)); return this; };
   ECDH.prototype.setPublicKey = function (key, encoding) { this._pub = typeof key === "string" ? Buffer.from(key, encoding) : toBuf(key); return this; };
+  // `setPublicKey()` is retained only for compatibility. Node's util.deprecate
+  // wrapper warns once even when the underlying key validation then throws.
+  const ecdhSetPublicKey = ECDH.prototype.setPublicKey;
+  let ecdhSetPublicKeyWarned = false;
+  ECDH.prototype.setPublicKey = function deprecated(key, encoding) {
+    if (!ecdhSetPublicKeyWarned && G.process && typeof G.process.emitWarning === "function") {
+      ecdhSetPublicKeyWarned = true;
+      G.process.emitWarning("ecdh.setPublicKey() is deprecated.", "DeprecationWarning", "DEP0031");
+    }
+    return ecdhSetPublicKey.call(this, key, encoding);
+  };
   ECDH.convertKey = (key, curve, inputEnc, outputEnc, format) => {
     // node diffiehellman.js convertKey validation order: encoding → curve → format.
     let pt;
@@ -1446,6 +1558,42 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     get [Symbol.toStringTag]() { return "X509Certificate"; }
   }
   C.X509Certificate = X509Certificate;
+
+  // Assignment-form functions do not retain the property name in this
+  // runtime, unlike node's native crypto methods.  That name is observable to
+  // callers (and to stream tooling), so restore the public names after all
+  // crypto surfaces have been installed rather than changing their behaviour.
+  const setFunctionName = (fn, name) => {
+    if (typeof fn === "function") Object.defineProperty(fn, "name", { value: name, configurable: true });
+  };
+  const nameMethods = (proto, names) => {
+    for (const name of names) setFunctionName(proto[name], name);
+  };
+  nameMethods(C.Hash.prototype, ["update", "digest", "copy", "_transform", "_flush"]);
+  nameMethods(C.Hmac.prototype, ["update", "digest", "_transform", "_flush"]);
+  // Sign and Verify are Writable-like in node.  The local implementation
+  // already has write()/update(); provide the internal write hook as well so
+  // its name and callback contract match the inherited stream surface.
+  Sign.prototype._write = function _write(chunk, encoding, callback) {
+    try { this.update(chunk, encoding); callback(); } catch (error) { callback(error); }
+  };
+  Verify.prototype._write = function _write(chunk, encoding, callback) {
+    try { this.update(chunk, encoding); callback(); } catch (error) { callback(error); }
+  };
+  nameMethods(Sign.prototype, ["update", "sign", "_write"]);
+  nameMethods(Verify.prototype, ["update", "verify", "_write"]);
+  nameMethods(DiffieHellman.prototype, ["generateKeys", "computeSecret", "getPrime", "getGenerator", "getPublicKey", "getPrivateKey", "setPublicKey", "setPrivateKey"]);
+  nameMethods(ECDH.prototype, ["generateKeys", "computeSecret", "getPublicKey", "getPrivateKey", "setPrivateKey"]);
+  // Node exposes setPublicKey through util.deprecate(), whose wrapper is named
+  // "deprecated".  Keep that observable marker without changing the method.
+  setFunctionName(ECDH.prototype.setPublicKey, "deprecated");
+  for (const name of ["createHash", "createHmac", "createSign", "createVerify",
+                      "createCipheriv", "createDecipheriv", "createDiffieHellman",
+                      "createECDH", "hash", "pbkdf2"]) setFunctionName(C[name], name);
+  setFunctionName(C.Hash, "deprecated");
+  setFunctionName(C.Hmac, "deprecated");
+  setFunctionName(C.Sign, "Sign");
+  setFunctionName(C.Verify, "Verify");
 
 })();
 )JS";

@@ -228,4 +228,18 @@ int run_eval(const std::string& code) {
     return Runtime::instance().run_script(dir + "/[eval].ts", std::string{kBuiltinGlobals} + code);
 }
 
+// `node --check`: parse without running stdin. ESM input is lowered to the
+// runtime's classic-script form first because the embedded JSC C API exposes
+// script syntax checking, not a standalone module parser.
+int check_syntax(const std::string& code, const std::string& filename, bool module) {
+    mbun::js_parser::TranspileOptions options{};
+    options.cjs = module;
+    auto transformed{mbun::js_parser::transpile(code, options)};
+    if (!transformed.ok) {
+        std::println(std::cerr, "{}: SyntaxError: {}", filename, transformed.error);
+        return 1;
+    }
+    return Runtime::instance().check_syntax(transformed.code, filename);
+}
+
 }  // namespace mbun::jsc::runtime

@@ -116,27 +116,28 @@ still being defined.
 
 ## Compatibility data
 
-Source-snapshot measurements (2026-07-21) against the upstream corpora pinned as submodules under `compat/`, produced by the runners in `tools/integration/`. Unsupported cases are never counted as passes, and these are not release guarantees:
+Source-snapshot measurements against the upstream corpora pinned as submodules under `compat/`, produced by the runners in `tools/integration/`. Unsupported cases are never counted as passes, and these are not release guarantees. The full Node corpus and the focused Bun regression set were last measured on 2026-07-29; the larger Bun full-corpus baseline is retained until its next full run:
 
 | Target | Result | Rate |
 | --- | ---: | ---: |
-| Bun native test corpus (`compat/bun/test`) | 868 / 1,902 files fully green | 45.6% |
-| Bun native tests, test level | 31,479 pass / 17,391 fail of 51,656 run | 60.9% |
-| Node.js native tests (`compat/node/test/parallel`) | 2,654 / 4,433 files pass (direct execution) | 59.9% |
-| Node.js native tests, excluding files that skip themselves | 2,654 / 3,881 files pass | 68.4% |
+| Bun native full-corpus baseline (2026-07-21) | 868 / 1,902 files fully green | 45.6% |
+| Bun focused regression set (2026-07-29) | 93 / 230 files fully green | 40.4% |
+| Bun focused regression set, assertion level | 5,074 pass / 740 fail of 5,814 evaluated | 87.3% |
+| Node.js native tests (`compat/node/test/parallel`) | 2,821 / 4,433 files pass (direct execution) | 63.6% |
+| Node.js native tests, excluding files that skip themselves | 2,821 / 3,864 files pass | 73.0% |
 | Elysia test suite | 1,522 pass / 3 fail | 99.8% |
 
 File-level "green" means every executed test in the file passed and the file reported no error outside a test; it is stricter than an API checklist and lower than test-level pass rates. Files that declare no runnable test, files whose every test is skipped, and files needing a service this environment lacks (MySQL, Redis, the npm registry) are separate buckets and never count as passes. Node.js files run directly through mbun (exit 0 = pass) without Node's own harness services, so that figure is honest file-level coverage, not API completion.
 
-**Both corpora were measured on the same binary, in the same session.** The Bun rows are no longer a stale snapshot: node 2,654/4,433 and bun 868/1,902 come from one build at the commit this table was written for, so they are directly comparable for the first time. A regression on one side can no longer hide behind an old number on the other — and one did: an earlier round in this series took bun from 868 green to 612 because a single missing field broke `Bun.spawn`, which is invisible unless both corpora are run together.
+**The measurement scopes are explicit.** The 2026-07-29 sprint ended with a complete 4,433-file Node run and a 230-file Bun regression run covering the campaign's touched and high-risk surfaces. The 1,902-file Bun row remains the last full-corpus baseline and is not presented as a same-commit comparison. The focused Bun run had no green-file regression; cases requiring unavailable external services remain blocked rather than counted as passes.
 
-**The Node.js figures were previously overstated and have been corrected downward at the source.** Two measurement defects were found and fixed:
+**The Node.js figures were previously overstated and have been corrected downward at the source.** Three measurement defects were found and fixed:
 
-- **Self-skips were counted as passes.** Node's `common.skip()` prints `1..0 # Skipped:` and exits 0, so exit-code-only classification could not tell "ran everything and passed" from "declined to run because this runtime lacks the feature". 1,527 of the 4,433 files can take a skip path. They now land in a `skipped` bucket and never count as passes — which is why the second row excludes 542 files rather than the 351 it used to.
+- **Self-skips were counted as passes.** Node's `common.skip()` prints `1..0 # Skipped:` and exits 0, so exit-code-only classification could not tell "ran everything and passed" from "declined to run because this runtime lacks the feature". 1,527 of the 4,433 files can take a skip path. They now land in a `skipped` bucket and never count as passes; the current run classified 569 files this way.
 - **`assert.throws` ignored its error argument.** `assert.throws(fn, { code: 'ERR_X' })` passed for *any* throw, and `assert.throws(fn, common.expectsError({…}))` never called the validator. Fixing it removed 126 passes from the figure below; a random 25 of those were checked individually and all 25 pass again the moment the broken matcher is restored, confirming they were verifying nothing.
 - **`common.mustCall` was never enforced.** Node registers its verifier inside `process.on('exit')`, which mbun did not fire, so an under-called `mustCall(fn, 2)` still exited 0. At the time, 946 of the then-1,533 passing files used `mustCall*` — their central assertion had never run. `process.on('exit')` now fires and the event loop no longer swallows exceptions thrown inside callbacks.
 
-The previously published 44.5% was a product of both defects and was never real. Measured with the corrected runner on the same machine, the comparable prior figure is **38.2%**, and the current figure is **59.9%** strict / **68.4%** excluding self-skips. Timeouts fell from 583 files to 96 over the same period, so a file that used to hang for 15 seconds now reports a real, diagnosable failure. Expect the strict rate to keep moving in both directions as more verification becomes real. Details, the full estimate-vs-actual record, and how to reproduce: [`compat/README.md`](compat/README.md).
+The previously published 44.5% was a product of these defects and was never real. Measured with the corrected runner on the same machine, the comparable prior figure is **38.2%**, and the current figure is **63.6%** strict / **73.0%** excluding self-skips. The latest run classified 89 files as timeouts, down from 583 in the earlier baseline, so a file that used to hang for 15 seconds now usually reports a real, diagnosable failure. Expect the strict rate to keep moving in both directions as more verification becomes real. Details, the full estimate-vs-actual record, and how to reproduce: [`compat/README.md`](compat/README.md).
 
 ## Related projects
 

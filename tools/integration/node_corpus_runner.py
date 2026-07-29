@@ -89,10 +89,14 @@ def run_one(binary: Path, root: Path, output_dir: Path, timeout: float, path: st
     thread_key = f"{os.getpid()}_{log_name(path)[:12]}"
     env["TEST_THREAD_ID"] = thread_key
     node_tmp = (corpus_dir.parent / f".tmp.{thread_key}") if corpus_dir is not None else None
+    # Node's parallel corpus addresses fixtures as test/fixtures/... relative
+    # to the upstream Node checkout. Keep the test argv absolute, but execute
+    # it from that checkout rather than the encompassing repository root.
+    execution_cwd = corpus_dir.parent.parent if corpus_dir is not None else root
     bounded = BoundedRun(
         output_dir / relative_log,
         private_tmp=output_dir / "tmp" / log_name(path)[:12],
-    ).run([str(binary), str((root / path).resolve())], timeout=timeout, cwd=root, env=env)
+    ).run([str(binary), str((root / path).resolve())], timeout=timeout, cwd=execution_cwd, env=env)
     # Remove the corpus-side tmpdir this file created. Unique-per-file ids would
     # otherwise leave one directory per corpus file inside the read-only upstream
     # checkout (205 were already lying around from earlier rounds).

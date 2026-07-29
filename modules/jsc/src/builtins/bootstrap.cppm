@@ -544,7 +544,25 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   def(["path/win32"], win32);
 
   // ---- assert ----
-  function AErr(msg) { const e = new Error(msg); e.name = "AssertionError"; e.code = "ERR_ASSERTION"; return e; }
+  // The more complete assert partition is appended after this bootstrap and
+  // installs AssertionError. Resolve it when an assertion is raised rather
+  // than when this module initializes, so the early helpers and the later
+  // class always produce one error shape.
+  function AErr(msg, actual, expected, operator, generatedMessage) {
+    const AE = assert.AssertionError;
+    if (typeof AE === "function") {
+      return new AE({ message: msg, actual, expected, operator,
+                      generatedMessage: !!generatedMessage });
+    }
+    const e = new Error(msg);
+    e.name = "AssertionError";
+    e.code = "ERR_ASSERTION";
+    e.actual = actual;
+    e.expected = expected;
+    e.operator = operator;
+    e.generatedMessage = !!generatedMessage;
+    return e;
+  }
   function assert(v, msg) { if (!v) throw AErr(msg || "The expression evaluated to a falsy value"); }
   assert.ok = assert;
   assert.equal = (a, b, m) => { if (a != b) throw AErr(m); };
@@ -720,8 +738,22 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   }
   assert.rejects = async function rejects(block, error, message) { return expectsError("rejects", await waitForActual(block), error, message); };
   assert.doesNotReject = async function doesNotReject(fn, error, message) { return expectsNoError("doesNotReject", await waitForActual(fn), error, message); };
-  assert.fail = (m) => { throw AErr(m || "Failed"); };
-  assert.ifError = (v) => { if (v) throw v; };
+  assert.fail = function fail(message) {
+    if (message instanceof Error) throw message;
+    const generated = arguments.length === 0;
+    throw AErr(generated ? "Failed" : message, undefined, undefined, "fail", generated);
+  };
+  assert.ifError = (v) => {
+    if (v === null || v === undefined) return;
+    let detail;
+    if (v && typeof v.message === "string")
+      detail = v.message || (v instanceof Error ? v.name : "");
+    else if (v && typeof v.name === "string" && v.name.length > 0) detail = v.name;
+    else {
+      try { detail = util.inspect(v); } catch (_) { detail = String(v); }
+    }
+    throw AErr("ifError got unwanted exception: " + detail, v, null, "ifError", true);
+  };
   function assertRegExpMatch(s, re, m, wantMatch) {
     if (!(re instanceof RegExp)) { const e = new TypeError(`The "regexp" argument must be of type RegExp. Received ${typeof re}`); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
     if (typeof s !== "string") { const e = new TypeError(`The "string" argument must be of type string. Received type ${typeof s}`); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
@@ -1853,14 +1885,18 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     const kRejection = Symbol.for("nodejs.rejection");
     const captureRejectionSymbol = Symbol.for("nodejs.rejection");
     const kFirstEventParam = Symbol.for("nodejs.kFirstEventParam");
+    // Node's protected abort listeners must still run when an earlier user
+    // listener stops immediate propagation on the same AbortSignal event.
+    const kResistStopPropagation = Symbol.for("nodejs.event_target.resist_stop_propagation");
     let defaultMaxListeners = 10;
 
-    const checkListener = (l) => { if (typeof l !== "function") throw new TypeError("The listener must be a function"); };
     // Node's NodeError bakes the code into toString(): "TypeError [ERR_x]: msg".
     // assert.throws(fn, /ERR_x/) matches on String(err), so it must appear there.
     const addCodeToName = (e, code) => { const base = e.name; Object.defineProperty(e, "toString", { value() { return `${base} [${code}]${this.message ? ": " + this.message : ""}`; }, configurable: true, writable: true }); return e; };
     const ERR_INVALID_ARG_TYPE = (name, type, value) => { const e = new TypeError(`The "${name}" argument must be of type ${type}. Received ${value}`); e.code = "ERR_INVALID_ARG_TYPE"; return addCodeToName(e, "ERR_INVALID_ARG_TYPE"); };
     const ERR_OUT_OF_RANGE = (name, range, value) => { const e = new RangeError(`The "${name}" argument is out of range. It must be ${range}. Received ${value}`); e.code = "ERR_OUT_OF_RANGE"; return addCodeToName(e, "ERR_OUT_OF_RANGE"); };
+    const ERR_UNHANDLED_ERROR = (rendered, context) => { const e = new Error(`Unhandled error. (${rendered})`); e.code = "ERR_UNHANDLED_ERROR"; e.context = context; return addCodeToName(e, "ERR_UNHANDLED_ERROR"); };
+    const checkListener = (l) => { if (typeof l !== "function") throw ERR_INVALID_ARG_TYPE("listener", "function", l); };
     const validateNumber = (value, name, min, max) => { if (typeof value !== "number") throw ERR_INVALID_ARG_TYPE(name, "number", value); if ((min != null && value < min) || (max != null && value > max) || ((min != null || max != null) && Number.isNaN(value))) throw ERR_OUT_OF_RANGE(name, `${min != null ? ">= " + min : ""}${min != null && max != null ? " && " : ""}${max != null ? "<= " + max : ""}`, value); };
     const validateInteger = (value, name, min) => { if (typeof value !== "number" || !Number.isInteger(value)) throw ERR_INVALID_ARG_TYPE(name, "integer", value); if (min != null && value < min) throw ERR_OUT_OF_RANGE(name, ">= " + min, value); };
     const validateObject = (value, name) => { if (value === null || typeof value !== "object") throw ERR_INVALID_ARG_TYPE(name, "Object", value); };
@@ -1909,13 +1945,24 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       // an "Unhandled error." Error instead, which node:domain then reported as
       // the thrown value (test-domain-multiple-errors / -error-types emit every
       // primitive and assert identity).
-      const unhandled = () => args[0] ?? new Error("Unhandled error.");
+      const unhandled = () => {
+        const err = args[0];
+        if (err instanceof Error) return err;
+        // Node includes a util.inspect() rendering in ERR_UNHANDLED_ERROR, but
+        // inspection itself is user code and can throw. In that case its
+        // string coercion fallback still gives callers useful context.
+        let rendered;
+        try { rendered = util.inspect(err); } catch (e) { rendered = err; }
+        return ERR_UNHANDLED_ERROR(rendered, err);
+      };
       if (!events) throw unhandled();
       const errorMonitor = events[kErrorMonitor];
-      if (errorMonitor) for (const handler of errorMonitor.slice()) handler.apply(emitter, args);
+      if (typeof errorMonitor === "function") errorMonitor.apply(emitter, args);
+      else if (errorMonitor) for (const handler of errorMonitor.slice()) handler.apply(emitter, args);
       const handlers = events.error;
       if (!handlers) throw unhandled();
-      for (const handler of handlers.slice()) handler.apply(emitter, args);
+      if (typeof handlers === "function") handlers.apply(emitter, args);
+      else for (const handler of handlers.slice()) handler.apply(emitter, args);
       return true;
     }
     function addCatch(emitter, promise, type, args) {
@@ -1931,8 +1978,8 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       if (events === undefined) return false;
       const handlers = events[type];
       if (handlers === undefined) return false;
-      const cloned = handlers.length > 1 ? handlers.slice() : handlers;
-      for (let i = 0, { length } = cloned; i < length; i++) cloned[i].apply(this, args);
+      if (typeof handlers === "function") handlers.apply(this, args);
+      else for (const handler of handlers.slice()) handler.apply(this, args);
       return true;
     };
     const emitWithRejectionCapture = function emit(type, ...args) {
@@ -1941,9 +1988,11 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       if (events === undefined) return false;
       const handlers = events[type];
       if (handlers === undefined) return false;
-      const cloned = handlers.length > 1 ? handlers.slice() : handlers;
-      for (let i = 0, { length } = cloned; i < length; i++) {
-        const result = cloned[i].apply(this, args);
+      if (typeof handlers === "function") {
+        const result = handlers.apply(this, args);
+        if (result !== undefined && typeof result?.then === "function" && result.then === Promise.prototype.then) addCatch(this, result, type, args);
+      } else for (const handler of handlers.slice()) {
+        const result = handler.apply(this, args);
         if (result !== undefined && typeof result?.then === "function" && result.then === Promise.prototype.then) addCatch(this, result, type, args);
       }
       return true;
@@ -1952,22 +2001,27 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       return (this[kCapture] ? emitWithRejectionCapture : emitWithoutRejectionCapture).apply(this, arguments);
     };
 
-    function overflowWarning(emitter, type, handlers) {
+    function overflowWarning(emitter, type, handlers, maxListeners) {
       handlers.warned = true;
-      const warn = new Error(`Possible EventEmitter memory leak detected. ${handlers.length} ${String(type)} listeners added to [${emitter.constructor.name}]. Use emitter.setMaxListeners() to increase limit`);
+      const warn = new Error(`Possible EventEmitter memory leak detected. ${handlers.length} ${String(type)} listeners added to [${emitter.constructor.name}]. MaxListeners is ${maxListeners}. Use emitter.setMaxListeners() to increase limit`);
       warn.name = "MaxListenersExceededWarning"; warn.emitter = emitter; warn.type = type; warn.count = handlers.length;
-      (G.console && G.console.warn ? G.console.warn : (() => {}))(warn);
+      // This is a process warning, not a console diagnostic. Routing through
+      // emitWarning preserves the warning event's next-tick timing and exposes
+      // node's structured MaxListenersExceededWarning to observers.
+      if (G.process && typeof G.process.emitWarning === "function") G.process.emitWarning(warn);
     }
     function insert(self, type, fn, prepend) {
       let events = self._events;
       if (!events) { events = self._events = { __proto__: null }; self._eventsCount = 0; }
       else if (events.newListener) self.emit("newListener", type, fn.listener ?? fn);
       const handlers = events[type];
-      if (!handlers) { events[type] = [fn]; self._eventsCount++; }
+      if (!handlers) { events[type] = fn; self._eventsCount++; }
       else {
-        if (prepend) handlers.unshift(fn); else handlers.push(fn);
+        if (typeof handlers === "function") events[type] = prepend ? [fn, handlers] : [handlers, fn];
+        else if (prepend) handlers.unshift(fn); else handlers.push(fn);
+        const listeners = events[type];
         const m = self._maxListeners ?? defaultMaxListeners;
-        if (m > 0 && handlers.length > m && !handlers.warned) overflowWarning(self, type, handlers);
+        if (m > 0 && listeners.length > m && !listeners.warned) overflowWarning(self, type, listeners, m);
       }
       return self;
     }
@@ -1975,9 +2029,21 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     EventEmitterPrototype.on = EventEmitterPrototype.addListener;
     EventEmitterPrototype.prependListener = function prependListener(type, fn) { checkListener(fn); return insert(this, type, fn, true); };
 
-    function onceWrapper(type, listener, ...args) { this.removeListener(type, listener); listener.apply(this, args); }
-    EventEmitterPrototype.once = function once(type, fn) { checkListener(fn); const bound = onceWrapper.bind(this, type, fn); bound.listener = fn; this.addListener(type, bound); return this; };
-    EventEmitterPrototype.prependOnceListener = function prependOnceListener(type, fn) { checkListener(fn); const bound = onceWrapper.bind(this, type, fn); bound.listener = fn; this.prependListener(type, bound); return this; };
+    function onceWrapper(...args) {
+      if (this.fired) return undefined;
+      this.target.removeListener(this.type, this.wrapFn);
+      this.fired = true;
+      return this.listener.apply(this.target, args);
+    }
+    function onceWrap(target, type, listener) {
+      const state = { fired: false, wrapFn: undefined, target, type, listener };
+      const wrapped = onceWrapper.bind(state);
+      wrapped.listener = listener;
+      state.wrapFn = wrapped;
+      return wrapped;
+    }
+    EventEmitterPrototype.once = function once(type, fn) { checkListener(fn); this.addListener(type, onceWrap(this, type, fn)); return this; };
+    EventEmitterPrototype.prependOnceListener = function prependOnceListener(type, fn) { checkListener(fn); this.prependListener(type, onceWrap(this, type, fn)); return this; };
 
     EventEmitterPrototype.removeListener = function removeListener(type, fn) {
       checkListener(fn);
@@ -1985,12 +2051,26 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       if (!events) return this;
       const handlers = events[type];
       if (!handlers) return this;
-      let position = -1, originalListener;
-      for (let i = handlers.length - 1; i >= 0; i--) { if (handlers[i] === fn || handlers[i].listener === fn) { originalListener = handlers[i].listener; position = i; break; } }
-      if (position < 0) return this;
-      if (position === 0) handlers.shift(); else handlers.splice(position, 1);
-      if (handlers.length === 0) { delete events[type]; this._eventsCount--; }
-      if (events.removeListener !== undefined) this.emit("removeListener", type, originalListener || fn);
+      let originalListener;
+      if (handlers === fn || handlers.listener === fn) {
+        originalListener = handlers.listener || handlers;
+        delete events[type];
+        this._eventsCount--;
+      } else if (Array.isArray(handlers)) {
+        let position = -1;
+        for (let i = handlers.length - 1; i >= 0; i--) {
+          if (handlers[i] === fn || handlers[i].listener === fn) {
+            originalListener = handlers[i].listener || handlers[i];
+            position = i;
+            break;
+          }
+        }
+        if (position < 0) return this;
+        if (position === 0) handlers.shift(); else handlers.splice(position, 1);
+        if (handlers.length === 1) events[type] = handlers[0];
+        else if (handlers.length === 0) { delete events[type]; this._eventsCount--; }
+      } else return this;
+      if (events.removeListener !== undefined) this.emit("removeListener", type, originalListener);
       return this;
     };
     EventEmitterPrototype.off = EventEmitterPrototype.removeListener;
@@ -2013,11 +2093,12 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       else if (handlers !== undefined) { for (let i = handlers.length - 1; i >= 0; i--) this.removeListener(type, handlers[i]); }
       return this;
     };
-    EventEmitterPrototype.listeners = function listeners(type) { const events = this._events; if (!events) return []; const handlers = events[type]; if (!handlers) return []; return handlers.map((x) => x.listener ?? x); };
-    EventEmitterPrototype.rawListeners = function rawListeners(type) { const events = this._events; if (!events) return []; const handlers = events[type]; if (!handlers) return []; return handlers.slice(); };
+    EventEmitterPrototype.listeners = function listeners(type) { const events = this._events; if (!events) return []; const handlers = events[type]; if (!handlers) return []; return typeof handlers === "function" ? [handlers.listener ?? handlers] : handlers.map((x) => x.listener ?? x); };
+    EventEmitterPrototype.rawListeners = function rawListeners(type) { const events = this._events; if (!events) return []; const handlers = events[type]; if (!handlers) return []; return typeof handlers === "function" ? [handlers] : handlers.slice(); };
     EventEmitterPrototype.listenerCount = function listenerCount(type, listener) {
       const events = this._events; if (!events) return 0;
       const evlistener = events[type]; if (!evlistener) return 0;
+      if (typeof evlistener === "function") return listener == null || evlistener === listener || evlistener.listener === listener ? 1 : 0;
       if (listener != null) { let matching = 0; for (let i = 0; i < evlistener.length; i++) { if (evlistener[i] === listener || evlistener[i].listener === listener) matching++; } return matching; }
       return evlistener.length;
     };
@@ -2032,7 +2113,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       if (typeof listener !== "function") throw ERR_INVALID_ARG_TYPE("listener", "function", listener);
       let removeEventListener;
       if (signal.aborted) queueMicrotask(() => listener());
-      else { signal.addEventListener("abort", listener, { __proto__: null, once: true }); removeEventListener = () => signal.removeEventListener("abort", listener); }
+      else { signal.addEventListener("abort", listener, { __proto__: null, once: true, [kResistStopPropagation]: true }); removeEventListener = () => signal.removeEventListener("abort", listener); }
       return { __proto__: null, [Symbol.dispose]() { removeEventListener?.(); } };
     }
 
@@ -2048,7 +2129,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
         eventTargetAgnosticAddListener(emitter, type, resolver, { once: true });
         if (type !== "error" && typeof emitter.once === "function") emitter.once("error", errorListener);
         function abortListener() { eventTargetAgnosticRemoveListener(emitter, type, resolver); eventTargetAgnosticRemoveListener(emitter, "error", errorListener); reject(new AbortError(undefined, { cause: signal?.reason })); }
-        if (signal != null) eventTargetAgnosticAddListener(signal, "abort", abortListener, { once: true });
+        if (signal != null) eventTargetAgnosticAddListener(signal, "abort", abortListener, { once: true, [kResistStopPropagation]: true });
       });
     }
 
@@ -2114,7 +2195,13 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     function setMaxListeners(n = defaultMaxListeners, ...eventTargets) {
       validateNumber(n, "setMaxListeners", 0);
       if (eventTargets.length === 0) { defaultMaxListeners = n; return; }
-      for (let i = 0; i < eventTargets.length; i++) { const t = eventTargets[i]; if (typeof t.setMaxListeners === "function") t.setMaxListeners(n); else t[kMaxEventTargetListeners] = n; }
+      for (let i = 0; i < eventTargets.length; i++) {
+        const t = eventTargets[i];
+        if (t && typeof t.addEventListener === "function" && typeof t.removeEventListener === "function")
+          t[kMaxEventTargetListeners] = n;
+        else if (typeof t?.setMaxListeners === "function") t.setMaxListeners(n);
+        else throw ERR_INVALID_ARG_TYPE("eventTargets", "EventEmitter or EventTarget", t);
+      }
     }
     function listenerCount(emitter, type) {
       if (typeof emitter.listenerCount === "function") return emitter.listenerCount(type);
@@ -2199,10 +2286,11 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   //
   // Data delivery: while flowing, a pump object rides __mbunNet.items and its
   // _poll() drains fd 0 via the readFd native, emitting "data"/"end". Only the
-  // *flowing* state attaches the pump, and only attach bumps __mbunNet.pending —
-  // that pending count (plus refd timers) is what keeps the loop alive, so a
-  // paused stdin still lets the process exit. Attach happens inside resume()
-  // itself, never in the nextTick doResume: doResume deliberately still fires
+  // flowing or readable mode attaches the pump, and only attach bumps
+  // __mbunNet.pending — that pending count (plus refd timers) is what keeps the
+  // loop alive. A data-mode pause detaches the pump, while readable mode keeps
+  // it attached until EOF so its buffered reads can finish. Attach happens
+  // inside resume() itself, never in the nextTick doResume: doResume deliberately still fires
   // "resume" after a synchronous pause() (Node does too), and attaching there
   // would resurrect the pump and hang a program that meant to exit.
   if (G.process) {
@@ -2212,35 +2300,55 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     const osn = () => G.__mbunOsNative;
     const stdinIsatty = () => { const O = osn(); return !!(O && typeof O.isatty === "function" && O.isatty(0)); };
     stdin.readable = true; stdin.isTTY = stdinIsatty() || undefined; stdin.isRaw = false; stdin.fd = 0; stdin.readableFlowing = null;
-    let flowing = null, resumeScheduled = false, ended = false, attached = false;
+    stdin.readableEnded = false; stdin.readableLength = 0; stdin.destroyed = false;
+    let flowing = null, resumeScheduled = false, ended = false, eof = false, attached = false;
     let rbuf = [], readableMode = false;  // paused/readable-mode buffer + flag
     // __mbunNet lives in mbun.jsc.js_net, which may load after this bootstrap
     // runs (and never, on natives-less builds) — resolve both lazily per use.
     const net = () => G.__mbunNet;
     const nn = () => G.__mbunNetNative;
-    const emitEnd = () => { if (ended) return; ended = true; detach(); stdin.readable = false; stdin.emit("end"); stdin.emit("close"); };
+    const syncReadableLength = () => { stdin.readableLength = rbuf.reduce((length, buf) => length + buf.length, 0); };
+    const emitEnd = () => {
+      if (ended) return;
+      ended = true;
+      stdin.readableEnded = true;
+      detach();
+      stdin.readable = false;
+      stdin.emit("end");
+      stdin.emit("close");
+    };
+    const finishEof = () => {
+      eof = true;
+      detach();
+      if (rbuf.length) return;
+      emitEnd();
+      // Readable listeners are notified once more after EOF. This lets their
+      // final read(null) observation follow the end event without reviving fd 0.
+      if (readableMode) stdin.emit("readable");
+    };
     const pump = {
       _poll() {
-        if (ended || (flowing !== true && !readableMode)) return 0;
+        if (ended || eof || (flowing !== true && !readableMode)) return 0;
         const N = nn(); if (!N || typeof N.readFd !== "function") return 0;
         const chunk = N.readFd(0);
-        if (chunk === null) { emitEnd(); return 1; }   // EOF
+        if (chunk === null) { finishEof(); return 1; }  // EOF
         if (chunk === "") return 0;                    // EAGAIN — poll() will wake us
         const buf = G.Buffer.from(chunk, "base64");
         if (flowing === true) {
           stdin.emit("data", stdin._enc ? buf.toString(stdin._enc) : buf);
         } else {                                       // paused/readable mode: buffer + signal
           rbuf.push(buf);
+          syncReadableLength();
           stdin.emit("readable");
         }
         return 1;
       },
     };
-    const attach = () => { const N = net(); if (attached || ended || !N) return; attached = true; N.items.add(pump); N.pending++; };
+    const attach = () => { const N = net(); if (attached || ended || eof || !N) return; attached = true; N.items.add(pump); N.pending++; };
     function detach() { const N = net(); if (!attached || !N) return; attached = false; N.items.delete(pump); N.pending--; }
     const doResume = () => { resumeScheduled = false; stdin.emit("resume"); };
     stdin.resume = () => { if (flowing !== true) { flowing = true; stdin.readableFlowing = true; attach(); if (!resumeScheduled) { resumeScheduled = true; G.process.nextTick(doResume); } } return stdin; };
-    stdin.pause = () => { if (flowing !== false) { flowing = false; stdin.readableFlowing = false; detach(); stdin.emit("pause"); } return stdin; };
+    stdin.pause = () => { if (flowing !== false) { flowing = false; stdin.readableFlowing = false; if (!readableMode) detach(); stdin.emit("pause"); } return stdin; };
     stdin.setEncoding = (enc) => { stdin._enc = enc; return stdin; };
     // setRawMode is a tty.ReadStream method: node/bun only give process.stdin a
     // `setRawMode` when fd 0 IS a terminal (otherwise stdin is a pipe/file stream
@@ -2262,13 +2370,28 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       };
     }
     stdin.ref = () => stdin; stdin.unref = () => stdin;
-    stdin.read = () => {
-      if (!rbuf.length) return null;
-      const buf = rbuf.length === 1 ? rbuf[0] : G.Buffer.concat(rbuf);
-      rbuf = [];
+    stdin.read = (size) => {
+      if (size !== undefined && size !== null) {
+        size = Number(size);
+        if (!Number.isSafeInteger(size) || size < 0 || size > 0x7fffffff) {
+          const err = new RangeError("The value of \"size\" is out of range");
+          err.code = "ERR_OUT_OF_RANGE";
+          throw err;
+        }
+      }
+      if (!rbuf.length) {
+        if (!eof && !ended) { readableMode = true; attach(); }
+        return null;
+      }
+      const all = rbuf.length === 1 ? rbuf[0] : G.Buffer.concat(rbuf);
+      const count = size === undefined || size === null ? all.length : Math.min(size, all.length);
+      const buf = G.Buffer.from(all.subarray(0, count));
+      rbuf = count < all.length ? [G.Buffer.from(all.subarray(count))] : [];
+      syncReadableLength();
+      if (eof && !rbuf.length) emitEnd();
       return stdin._enc ? buf.toString(stdin._enc) : buf;
     };
-    stdin.destroy = () => { detach(); ended = true; stdin.readable = false; stdin.emit("close"); return stdin; };
+    stdin.destroy = () => { detach(); ended = true; eof = true; stdin.destroyed = true; stdin.readable = false; stdin.emit("close"); return stdin; };
     // The pump's canonical consumer: `process.stdin.pipe(process.stdout)`. The
     // "data" subscription resumes stdin (see the on() override below), which is
     // what attaches the pump. Node never end()s stdout/stderr on the source's
@@ -2326,17 +2449,19 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   }
 
   // ---- URLSearchParams + URL (WHATWG-ish; runs in every context) ----
-  const inspectURLSearchParams = (params, nested) => {
-    if (!params || !params._e || !params._e.length) return "URLSearchParams {}";
-    const pad = nested ? "    " : "  ", close = nested ? "  " : "";
-    const grouped = [], idx = {};
-    for (const [k, v] of params._e) {
-      if (Object.prototype.hasOwnProperty.call(idx, k)) { const g = grouped[idx[k]]; if (Array.isArray(g[1])) g[1].push(v); else g[1] = [g[1], v]; }
-      else { idx[k] = grouped.length; grouped.push([k, v]); }
-    }
-    const fmt = (v) => Array.isArray(v) ? "[ " + v.map((x) => JSON.stringify(x)).join(", ") + " ]" : JSON.stringify(v);
-    return "URLSearchParams {\n" + grouped.map(([k, v]) => pad + JSON.stringify(k) + ": " + fmt(v) + ",").join("\n") + "\n" + close + "}";
+  const inspectURLSearchParamsEntries = (label, entries, options, iterator = false) => {
+    if (entries.length === 0) return label + (iterator ? " {  }" : " {}");
+    const singleLine = label + " { " + entries.join(", ") + " }";
+    const multiline = typeof options?.breakLength === "number" && singleLine.length > options.breakLength;
+    if (!multiline) return singleLine;
+    const body = entries.map((entry, i) => "  " + entry + (i + 1 < entries.length ? "," : "")).join("\n");
+    return label + " {\n" + body + " }";
   };
+  const inspectURLSearchParams = (params, options) => inspectURLSearchParamsEntries(
+    "URLSearchParams",
+    params._e.map(([key, value]) => util.inspect(key) + " => " + util.inspect(value)),
+    options,
+  );
   if (typeof G.URLSearchParams === "undefined") {
     // ref: bun src/jsc/bindings/URLSearchParams.cpp, backed by
     // WTF::URLParser::{parseURLEncodedForm,serialize}.  URLSearchParams uses
@@ -2440,6 +2565,22 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     Object.defineProperty(spIterProto, Symbol.toStringTag, {
       configurable: true, value: "URLSearchParams Iterator",
     });
+    Object.defineProperty(spIterProto, kInspectCustom, {
+      configurable: true, writable: true,
+      value: function inspect(depth, options) {
+        if (this === null || (typeof this !== "object" && typeof this !== "function") || !(kSPIterTarget in this))
+          throw spErr("ERR_INVALID_THIS", 'Value of "this" must be of type URLSearchParamsIterator');
+        if (depth < 0) return this;
+        const entries = this[kSPIterTarget]._e;
+        const kind = this[kSPIterKind];
+        const values = [];
+        for (let i = this[kSPIterIndex]; i < entries.length; i++) {
+          const pair = entries[i];
+          values.push(kind === "key" ? util.inspect(pair[0]) : kind === "value" ? util.inspect(pair[1]) : util.inspect([pair[0], pair[1]]));
+        }
+        return inspectURLSearchParamsEntries("URLSearchParams Iterator", values, options, true);
+      },
+    });
     const makeSPIter = (target, kind) => {
       const it = Object.create(spIterProto);
       it[kSPIterTarget] = target;
@@ -2510,18 +2651,20 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       getAll(k) { URLSearchParams.#check(this); if (arguments.length < 1) throw missingArgs("name"); k = toUSVString(k); return this._e.filter((x) => x[0] === k).map((x) => x[1]); }
       has(k, v) { URLSearchParams.#check(this); if (arguments.length < 1) throw missingArgs("name"); k = toUSVString(k); return (arguments.length < 2 || v === undefined) ? this._e.some((x) => x[0] === k) : this._e.some((x) => x[0] === k && x[1] === toUSVString(v)); }
       delete(k, v) { URLSearchParams.#check(this); if (arguments.length < 1) throw missingArgs("name"); k = toUSVString(k); this._e = this._e.filter((x) => (arguments.length < 2 || v === undefined) ? x[0] !== k : !(x[0] === k && x[1] === toUSVString(v))); this._updateURL(); }
-      forEach(cb, t) { URLSearchParams.#check(this); if (arguments.length < 1) throw missingArgs("callback"); for (let i = 0; i < this._e.length; i++) { const [k, v] = this._e[i]; cb.call(t, v, k, this); } }
+      forEach(cb, t) { URLSearchParams.#check(this); if (typeof cb !== "function") throw spErr("ERR_INVALID_ARG_TYPE", 'The "callback" argument must be of type function'); for (let i = 0; i < this._e.length; i++) { const [k, v] = this._e[i]; cb.call(t, v, k, this); } }
       keys() { URLSearchParams.#check(this); return makeSPIter(this, "key"); }
       values() { URLSearchParams.#check(this); return makeSPIter(this, "value"); }
       entries() { URLSearchParams.#check(this); return makeSPIter(this, "key+value"); }
-      [Symbol.iterator]() { return this.entries(); }
       sort() { URLSearchParams.#check(this); this._e.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)); this._updateURL(); }
       get size() { URLSearchParams.#check(this); return this._e.length; }
       get length() { return this._e.length; }
       toJSON() { const out = {}; for (const [k, v] of this._e) { if (Object.prototype.hasOwnProperty.call(out, k)) { if (Array.isArray(out[k])) out[k].push(v); else out[k] = [out[k], v]; } else out[k] = v; } return out; }
-      toString() { return this._e.map(([k, v]) => formEncode(k) + "=" + formEncode(v)).join("&"); }
-      [Symbol.for("nodejs.util.inspect.custom")]() { return inspectURLSearchParams(this, false); }
+      toString() { URLSearchParams.#check(this); return this._e.map(([k, v]) => formEncode(k) + "=" + formEncode(v)).join("&"); }
+      [Symbol.for("nodejs.util.inspect.custom")](depth, options) { URLSearchParams.#check(this); return depth < 0 ? this : inspectURLSearchParams(this, options); }
     };
+    // Web IDL aliases @@iterator to entries instead of wrapping it, so callers
+    // can observe the required function identity.
+    Object.defineProperty(G.URLSearchParams.prototype, Symbol.iterator, { value: G.URLSearchParams.prototype.entries, writable: true, configurable: true });
     Object.defineProperty(G.URLSearchParams.prototype, "size", { get: Object.getOwnPropertyDescriptor(G.URLSearchParams.prototype, "size").get, enumerable: true, configurable: true });
     // Web IDL interfaces carry a non-enumerable, non-writable, configurable
     // Symbol.toStringTag data property, so Object.prototype.toString.call(sp)
@@ -2677,9 +2820,14 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     G.URL = class URL {
       get [Symbol.toStringTag]() { return "URL"; }
       static canParse(input, ...rest) { try { new G.URL(input, ...rest); return true; } catch (e) { return false; } }
+      static parse(input, ...rest) { try { return new G.URL(input, ...rest); } catch (e) { return null; } }
       static createObjectURL(blob) {
         if (arguments.length < 1) { const e = new TypeError("Not enough arguments"); e.code = "ERR_MISSING_ARGS"; throw e; }
-        if (!(G.Blob && blob instanceof G.Blob)) throw new TypeError("createObjectURL expects a Blob object");
+        if (!(G.Blob && blob instanceof G.Blob)) {
+          const e = new TypeError('The "obj" argument must be an instance of Blob');
+          e.code = "ERR_INVALID_ARG_TYPE";
+          throw e;
+        }
         const id = "blob:" + __blobUUID();
         __objectURLRegistry.set(id, blob);
         return id;
@@ -2766,7 +2914,16 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       get hash() { return this._hash; }
       set hash(v) { const value = String(v); this._hash = value === "" ? "" : "#" + encodeFragment(value.startsWith("#") ? value.slice(1) : value); }
       get search() { return this._search === "?" ? "" : this._search; }
-      set search(v) { const s = String(v), query = s.startsWith("?") ? s.slice(1) : s; this._queryPresent = s !== ""; this._search = s === "" ? "" : "?" + encodeQuery(query, !!specialProtocols[this._protocol]); const next = new G.URLSearchParams(query); this.searchParams._e = next._e; }
+      set search(v) {
+        const s = String(v), query = s.startsWith("?") ? s.slice(1) : s;
+        this._queryPresent = s !== "";
+        this._search = s === "" ? "" : "?" + encodeQuery(query, !!specialProtocols[this._protocol]);
+        // The URL setter has already removed exactly one leading '?'. Feeding
+        // the remainder through the public constructor would incorrectly strip
+        // a second one (e.g. "??a" must produce the key "?a").
+        const paramsInput = query.startsWith("?") ? "%3F" + query.slice(1) : query;
+        this.searchParams._e = new G.URLSearchParams(paramsInput)._e;
+      }
       get _authority() { const credentials = this._username || this._password ? this._username + (this._password ? ":" + this._password : "") + "@" : ""; return credentials + this.host; }
       get href() { return this._protocol + (this._hasAuthority || this._protocol === "file:" ? "//" + this._authority : "") + this._pathname + (this._queryPresent ? this._search : "") + this._hash; }
       // node's href setter is atomic: an unparseable value throws and leaves the
@@ -2808,7 +2965,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
           "  pathname: " + JSON.stringify(this.pathname) + ",\n" +
           "  hash: " + JSON.stringify(this.hash) + ",\n" +
           "  search: " + JSON.stringify(this.search) + ",\n" +
-          "  searchParams: " + inspectURLSearchParams(this.searchParams, true) + ",\n" +
+          "  searchParams: " + inspectURLSearchParams(this.searchParams) + ",\n" +
           "  toJSON: [Function: toJSON],\n" +
           "  toString: [Function: toString],\n" +
           "}";
@@ -2818,7 +2975,12 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     // URL formatting is ready regardless of whether the Bun global exists yet.
     const inspectBeforeURL = util.inspect;
     util.inspect = function inspect(value, options) {
-      if (value instanceof G.URLSearchParams) return inspectURLSearchParams(value, false);
+      if (value instanceof G.URLSearchParams) {
+        const depth = typeof options?.depth === "number" ? options.depth : 2;
+        if (depth < 0) return "[Object]";
+        const custom = value[kInspectCustom];
+        return typeof custom === "function" ? custom.call(value, depth, options) : inspectURLSearchParams(value, options);
+      }
       if (value instanceof G.URL) return value[Symbol.for("nodejs.util.inspect.custom")]();
       return inspectBeforeURL.call(this, value, options);
     };
@@ -3032,6 +3194,25 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     try { u.parse(url, parseQueryString, slashesDenoteHost); }
     catch (e) { try { e.input = url; } catch (e2) {} throw e; }
     return u;
+  };
+  // DEP0169 is an application deprecation only. Internal packages under
+  // node_modules retain the legacy parser without injecting warnings into their
+  // host application; process.emitWarning supplies node's next-tick delivery.
+  let urlParseDeprecationWarned = false;
+  const urlParsePublic = (url, parseQueryString, slashesDenoteHost) => {
+    if (!urlParseDeprecationWarned) {
+      const stack = String(new Error().stack || "");
+      if (!/(?:^|[/\\])node_modules(?:[/\\]|$)/.test(stack)) {
+        urlParseDeprecationWarned = true;
+        if (G.process && typeof G.process.emitWarning === "function") {
+          G.process.emitWarning(
+            "`url.parse()` behavior is not standardized and prone to errors that have security implications. " +
+            "Use the WHATWG URL API instead. CVEs are not issued for url.parse() vulnerabilities.",
+            "DeprecationWarning", "DEP0169");
+        }
+      }
+    }
+    return urlParse(url, parseQueryString, slashesDenoteHost);
   };
   let urlWarnInvalidPort = true;
   const urlGetHostname = (self, rest, hostname, url) => {
@@ -3327,13 +3508,23 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     return urlObject.format();
   };
   const urlToHttpOptions = (u) => {
+    if (u === null || (typeof u !== "object" && typeof u !== "function")) {
+      const e = new TypeError('The "url" argument must be of type object.' + urlArgTypeReceived(u));
+      e.code = "ERR_INVALID_ARG_TYPE";
+      throw e;
+    }
     const o = {
+      __proto__: null,
+      ...u,
       protocol: u.protocol,
       hostname: typeof u.hostname === "string" && u.hostname[0] === "[" ? u.hostname.slice(1, -1) : u.hostname,
       hash: u.hash, search: u.search, pathname: u.pathname,
       path: (u.pathname || "") + (u.search || ""), href: u.href,
     };
-    if (u.port !== "" && u.port !== null && u.port !== undefined) o.port = Number(u.port);
+    // Preserve Node's object-shape semantics: only the explicit empty-string
+    // URL port is omitted. A URL-like object with no port getter still maps
+    // through Number(undefined), leaving the observable `port: NaN` property.
+    if (u.port !== "") o.port = Number(u.port);
     if (u.username || u.password) o.auth = decodeURIComponent(u.username || "") + ":" + decodeURIComponent(u.password || "");
     return o;
   };
@@ -3371,6 +3562,28 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       out += enc ? "%" + cp.toString(16).toUpperCase().padStart(2, "0") : ch;
     }
     return out;
+  };
+  // Decode a file URL pathname into the original bytes. Unlike decodeURIComponent,
+  // this deliberately preserves percent-encoded non-UTF-8 filenames for the
+  // node:url fileURLToPathBuffer() API.
+  const urlDecodeFilePathBytes = (pathname) => {
+    const parts = [];
+    let encoded = [];
+    const flush = () => { if (encoded.length) { parts.push(Buffer.from(encoded)); encoded = []; } };
+    for (let i = 0; i < pathname.length;) {
+      if (pathname[i] === "%" && /^[0-9a-f]{2}$/i.test(pathname.slice(i + 1, i + 3))) {
+        encoded.push(parseInt(pathname.slice(i + 1, i + 3), 16));
+        i += 3;
+        continue;
+      }
+      flush();
+      const cp = pathname.codePointAt(i);
+      const ch = String.fromCodePoint(cp);
+      parts.push(Buffer.from(ch));
+      i += ch.length;
+    }
+    flush();
+    return parts.length === 1 ? parts[0] : Buffer.concat(parts);
   };
   const urlMod = {
     URL: G.URL, URLSearchParams: G.URLSearchParams, Url,
@@ -3410,6 +3623,40 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       }
       return pathname.indexOf("%") !== -1 ? decodeURIComponent(pathname) : pathname;
     },
+    fileURLToPathBuffer: (path, options) => {
+      const windows = options == null ? undefined : options.windows;
+      if (typeof path === "string") path = new G.URL(path);
+      else if (!urlIsURLLike(path)) { const e = new TypeError('The "path" argument must be of type string or an instance of URL.' + urlArgTypeReceived(path)); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
+      if (path.protocol !== "file:") { const e = new TypeError("The URL must be of scheme file"); e.code = "ERR_INVALID_URL_SCHEME"; throw e; }
+      const useWin = windows === undefined ? __isWin : windows;
+      let pathname = path.pathname;
+      for (let n = 0; n < pathname.length; n++) {
+        if (pathname[n] !== "%") continue;
+        const third = ((pathname.codePointAt(n + 2) | 0)) | 0x20;
+        if ((pathname[n + 1] === "2" && third === 102) ||
+            (useWin && pathname[n + 1] === "5" && third === 99)) {
+          const e = new TypeError(useWin
+            ? "File URL path must not include encoded \\ or / characters"
+            : "File URL path must not include encoded / characters");
+          e.code = "ERR_INVALID_FILE_URL_PATH";
+          e.input = path;
+          throw e;
+        }
+      }
+      if (!useWin) {
+        if (path.hostname !== "") { const e = new TypeError('File URL host must be "localhost" or empty on ' + (G.process ? G.process.platform : "linux")); e.code = "ERR_INVALID_FILE_URL_HOST"; throw e; }
+        return urlDecodeFilePathBytes(pathname);
+      }
+      pathname = pathname.replace(/\//g, "\\");
+      if (path.hostname !== "") {
+        let host = path.hostname;
+        try { host = urlMod.domainToUnicode(host) || host; } catch (e) {}
+        return Buffer.concat([Buffer.from("\\\\" + host), urlDecodeFilePathBytes(pathname)]);
+      }
+      const letter = ((pathname.codePointAt(1) | 0)) | 0x20;
+      if (letter < 97 || letter > 122 || pathname.charAt(2) !== ":") { const e = new TypeError("File URL path must be absolute"); e.code = "ERR_INVALID_FILE_URL_PATH"; e.input = path; throw e; }
+      return urlDecodeFilePathBytes(pathname.slice(1));
+    },
     // faithful port of node lib/internal/url.js pathToFileURL (incl. { windows } option,
     // UNC handling and the ERR_INVALID_ARG_* throws).
     pathToFileURL: (filepath, options) => {
@@ -3437,7 +3684,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       if (encPath[0] !== "/") encPath = "/" + encPath;
       return new G.URL("file://" + encPath);
     },
-    parse: urlParse,
+    parse: urlParsePublic,
     format: urlFormat,
     resolve: (source, relative) => urlParse(source, false, true).resolve(relative),
     resolveObject: (source, relative) => (source ? urlParse(source, false, true).resolveObject(relative) : relative),
@@ -3493,7 +3740,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   // ---- zlib (real: DEFLATE/zlib/gzip via __mbunZlibNative → mbun.core.compress;
   // payloads cross the native boundary as base64, converted here to Buffer) ----
   const ZN = globalThis.__mbunZlibNative;
-  const zToU8 = (d) => { if (typeof d === "string") return G.Buffer.from(d, "utf8"); if (d instanceof ArrayBuffer || (G.SharedArrayBuffer && d instanceof G.SharedArrayBuffer)) return new Uint8Array(d); if (ArrayBuffer.isView(d)) return new Uint8Array(d.buffer, d.byteOffset, d.byteLength); throw new TypeError("Received an instance of " + (d === null ? "null" : typeof d) + " where a buffer was expected"); };
+  const zToU8 = (d) => { if (typeof d === "string") return G.Buffer.from(d, "utf8"); if (d instanceof ArrayBuffer || (G.SharedArrayBuffer && d instanceof G.SharedArrayBuffer)) return new Uint8Array(d); if (ArrayBuffer.isView(d)) return new Uint8Array(d.buffer, d.byteOffset, d.byteLength); throw zArgType("buffer", "of type string or an instance of Buffer, TypedArray, DataView, or ArrayBuffer", d); };
   const zB64 = (u8) => { let s = ""; for (let i = 0; i < u8.length; i += 8192) s += String.fromCharCode.apply(null, u8.subarray(i, Math.min(i + 8192, u8.length))); return G.btoa(s); };
   const zErr = (e) => { const err = e instanceof Error ? e : new Error(String(e)); err.code = "Z_DATA_ERROR"; err.errno = -3; return err; };
   // kMaxLength as captured by require('zlib') — see the module registration below.
@@ -4063,6 +4310,9 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     // xxHash3ForTesting(bytes, seed?) — full-u64-seed XXH3_64bits (native).
     xxHash3ForTesting: G.__mbunXxHash3ForTesting,
     iniInternals:(N=>N?{parse:s=>N.parse(String(s))}:void 0)(G.__mbunIniNative),
+    // CSS serialization delegates to the native parser/printer. `expected` and
+    // `targets` preserve Bun's test-helper signature without JS-side minifying.
+    cssInternals:(N=>N?{minifyTest:(source,_expected,_targets)=>N.minify(String(source))}:void 0)(G.__mbunCssNative),
     // bun internal-for-testing.ts:273 → socket_body.rs js_set_socket_options:
     // which 1=send(SO_SNDBUF)/2=recv(SO_RCVBUF), size in bytes.
     setSocketOptions: (socket, which, size) => {
@@ -4096,6 +4346,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     stringsInternals: { toUTF16AllocSentinel: (b) => new TextDecoder().decode(b) },
     Bun: globalThis.Bun,
     internalSourceMap: globalThis.__mbunSourceMapNative,
+    hostedGitInfo: globalThis.__mbunHostedGitInfoNative,
     // highlightJavaScript/Redacted attached later (in the highlighter's scope).
     // shellInternals.parse — tagged template over the native mbun.shell parser;
     // interpolations become __bun_<i> JSObjRef markers (bun's own encoding).
@@ -4195,7 +4446,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
         }
       }
     }
-    try { return decodeURIComponent(pathname); } catch (e) { return pathname; }
+    return decodeURIComponent(pathname);
   };
   const toStr = (x) => {
     if (typeof x === "string") return x;
@@ -4762,7 +5013,16 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       // it every value — a Symbol, a Promise, `new String(…)` — was stringified
       // through toStr() and written (test-fs-write-file-sync).
       fsValidateData(d);
-      const FD = globalThis.__mbunFdNative;
+      // Node keeps the default UTF-8 string case on the binding fast path. In
+      // addition to avoiding a needless Buffer round-trip, this is observable:
+      // internal users replace `writeFileUtf8` to make sure this path owns its
+      // descriptor (test-fs-sync-fd-leak).
+      if (typeof p === "string" && typeof d === "string" &&
+          (enc === "utf8" || enc === "utf-8") && !flush && __onFd === undefined) {
+        const binding = typeof G.__mbunInternalBinding === "function" ? G.__mbunInternalBinding("fs") : null;
+        if (binding && typeof binding.writeFileUtf8 === "function")
+          return binding.writeFileUtf8(p, d, flag, mode == null ? 0o666 : mode);
+      }
       let u;
       if (ArrayBuffer.isView(d)) u = new Uint8Array(d.buffer, d.byteOffset, d.byteLength);
       else if (d instanceof ArrayBuffer) u = new Uint8Array(d);
@@ -4775,7 +5035,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       const writeAll = (dfd) => {
         let woff = 0;
         while (woff < u.byteLength) {
-          const n = FD.write(dfd, u, woff, u.byteLength - woff, -1);
+          const n = fsMod.writeSync(dfd, u, woff, u.byteLength - woff, -1);
           if (!(n > 0)) break;
           woff += n;
         }
@@ -4789,7 +5049,9 @@ inline constexpr char kBootstrapJS_[] = R"JS(
         return;
       }
       const path2 = toStr(p);
-      const fd = FD.open(path2, flag, mode == null ? 0o666 : mode);
+      // Go through the public fd rows so their failure and close semantics are
+      // shared with direct fs.openSync/fs.writeSync callers.
+      const fd = fsMod.openSync(path2, flag, mode == null ? 0o666 : mode);
       let keep = false;
       try {
         if (u.byteLength) writeAll(fd);
@@ -4797,7 +5059,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
         // call (node's writeFileSync flushes through the same public binding).
         if (__onFd !== undefined) keep = __onFd(fd, true) === true;
         else if (flush) fsMod.fsyncSync(fd);
-      } finally { if (!keep) FD.close(fd); }
+      } finally { if (!keep) fsMod.closeSync(fd); }
       if (mode != null) { try { F.chmod(path2, mode); } catch (e) {} }
     },
     appendFileSync: (p, d, o, __onFd) => {
@@ -4835,9 +5097,24 @@ inline constexpr char kBootstrapJS_[] = R"JS(
           return new fsMod.Dirent(name, r.types[i], parent);
         });
       }
-      const names = F.readdir(p);
+      // Keep the public Dirent conversion here, but obtain the raw name/type
+      // row through the same binding that Node exposes to internal consumers.
+      // Besides sharing d_type data, this lets an UNKNOWN type fall back to a
+      // stat below (test-fs-readdir-types).
+      const binding = wft && typeof G.__mbunInternalBinding === "function"
+        ? G.__mbunInternalBinding("fs") : null;
+      const row = binding && typeof binding.readdir === "function"
+        ? binding.readdir(p, "utf8", true) : null;
+      const names = row ? row[0] : F.readdir(p);
       if (!wft) return fsReaddirEncode(names, o);
-      return names.map((n) => { let t = 1; try { t = F.stat(p + "/" + n)._isDir ? 2 : 1; } catch (e) { t = 3; } return new fsMod.Dirent(n, t, p); });
+      const types = row && row[1];
+      return names.map((n, i) => {
+        let t = types ? types[i] : 0;
+        // UV_DIRENT_UNKNOWN is zero. It carries no usable predicate, so Node
+        // stats the entry to construct a truthful Dirent.
+        if (t === 0) { try { t = F.stat(p + "/" + n)._isDir ? 2 : 1; } catch (e) { t = 3; } }
+        return new fsMod.Dirent(n, t, p);
+      });
     },
     // native stat builds a plain object; link it to fs.Stats.prototype so
     // `statSync(x) instanceof Stats` holds (node/bun: statSync shares the
@@ -5081,7 +5358,174 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       UV_DIRENT_UNKNOWN: 0, UV_DIRENT_FILE: 1, UV_DIRENT_DIR: 2, UV_DIRENT_LINK: 3, UV_DIRENT_FIFO: 4, UV_DIRENT_SOCKET: 5, UV_DIRENT_CHAR: 6, UV_DIRENT_BLOCK: 7 },
   };
   fsMod.realpathSync.native = fsMod.realpathSync;
-  fsMod.ReadStream = Readable; fsMod.WriteStream = Writable;
+  // node:fs Utf8Stream (the built-in SonicBoom-derived fast UTF-8 sink).
+  // The runtime's fd operations are synchronous, so the default async surface
+  // schedules its callbacks on a microtask; injected fs implementations still
+  // receive their native write/open/fsync calls for the stream tests.
+  class Utf8Stream extends EventEmitter {
+    constructor(options) {
+      super();
+      options = options === undefined ? {} : options;
+      if (options === null || typeof options !== "object") throw new TypeError("The \"options\" argument must be of type object.");
+      this._fs = Object.assign({
+        openSync: fsMod.openSync, closeSync: fsMod.closeSync, writeSync: fsMod.writeSync,
+        mkdirSync: fsMod.mkdirSync, fsyncSync: fsMod.fsyncSync,
+        open: (p, f, m, cb) => { try { cb(null, fsMod.openSync(p, f, m)); } catch (e) { cb(e); } },
+        close: (fd, cb) => { try { fsMod.closeSync(fd); cb && cb(null); } catch (e) { cb && cb(e); } },
+        write: (fd, data, enc, cb) => {
+          if (typeof enc === "function") cb = enc;
+          try { const n = fsMod.writeSync(fd, data, typeof enc === "string" ? enc : "utf8"); G.queueMicrotask(() => cb && cb(null, n)); }
+          catch (e) { G.queueMicrotask(() => cb && cb(e)); }
+        },
+        fsync: (fd, cb) => { try { fsMod.fsyncSync(fd); G.queueMicrotask(() => cb && cb(null)); } catch (e) { G.queueMicrotask(() => cb && cb(e)); } },
+        mkdir: (p, o, cb) => { try { fsMod.mkdirSync(p, o); cb(null); } catch (e) { cb(e); } },
+      }, options.fs || {});
+      this._fd = -1; this._file = null; this._buf = ""; this._writing = false;
+      // A write may still be in flight when flush() or end() is called. Keep
+      // their completion work here instead of dropping it on the floor: the
+      // final write owns the one transition to drain/finish/close.
+      this._drainCallbacks = []; this._drainEventPending = false;
+      this._ending = false; this._destroyed = false; this._opening = false;
+      this._minLength = options.minLength || 0; this._maxLength = options.maxLength || 0;
+      this._maxWrite = options.maxWrite || 16384; this._sync = options.sync === true;
+      this._fsync = options.fsync === true; this._append = options.append !== false;
+      this._mkdir = options.mkdir === true; this._mode = options.mode;
+      this._periodicFlush = options.periodicFlush || 0; this._timer = null;
+      this._retryEAGAIN = typeof options.retryEAGAIN === "function" ? options.retryEAGAIN : () => true;
+      if (!Number.isInteger(this._minLength) || this._minLength < 0) throw new RangeError("The value of \"minLength\" is out of range.");
+      if (!Number.isInteger(this._maxWrite) || this._maxWrite < 0) throw new RangeError("The value of \"maxWrite\" is out of range.");
+      if (this._minLength >= this._maxWrite) throw new RangeError("The value of \"minLength\" is out of range.");
+      const target = options.fd !== undefined ? options.fd : options.dest;
+      if (typeof target === "number") { this._fd = target; G.queueMicrotask(() => this.emit("ready")); }
+      else if (typeof target === "string") this._open(target);
+      else throw new TypeError("The \"fd\" argument must be of type number or string.");
+      if (this._periodicFlush) { this._timer = G.setInterval(() => this.flush(), this._periodicFlush); if (this._timer && this._timer.unref) this._timer.unref(); }
+    }
+    get fd() { return this._fd; } get file() { return this._file; }
+    get minLength() { return this._minLength; } get maxLength() { return this._maxLength; }
+    get writing() { return this._writing; } get sync() { return this._sync; }
+    get fsync() { return this._fsync; } get append() { return this._append; }
+    get mode() { return this._mode; } get periodicFlush() { return this._periodicFlush; }
+    get destroyed() { return this._destroyed; }
+    write(data) {
+      if (this._destroyed) throw new Error("Utf8Stream is destroyed");
+      const text = typeof data === "string" ? data : Buffer.from(data).toString("utf8");
+      if (this._maxLength && this._buf.length + text.length > this._maxLength) return false;
+      this._buf += text;
+      if (this._fd >= 0 && this._buf.length > this._minLength && !this._writing) this._drain();
+      return this._buf.length <= 16387;
+    }
+    flush(cb) {
+      if (this._destroyed) { const e = new Error("Utf8Stream is destroyed"); if (cb) return cb(e); throw e; }
+      if (this._fd < 0) { const e = new Error("Invalid file descriptor"); if (cb) return cb(e); throw e; }
+      this._drain(cb);
+    }
+    flushSync() {
+      if (this._destroyed) throw new Error("Utf8Stream is destroyed");
+      while (this._buf.length) this._writeSync();
+      if (this._fsync) this._fs.fsyncSync(this._fd);
+    }
+    end() {
+      if (this._destroyed) throw new Error("Utf8Stream is destroyed");
+      if (this._ending) return;
+      this._ending = true;
+      this._drain(() => this._close(true));
+    }
+    destroy() { if (!this._destroyed) this._close(false); }
+    reopen(file) {
+      if (this._destroyed) throw new Error("Utf8Stream is destroyed");
+      if (!this._file && !file) throw new Error("Unable to reopen a file descriptor");
+      const target = file || this._file;
+      const old = this._fd; this._fd = -1;
+      const reopen = () => this._open(target);
+      if (old >= 0) this._fs.close(old, () => reopen()); else reopen();
+    }
+    _open(file) {
+      this._opening = true;
+      const done = (err, fd) => {
+        this._opening = false;
+        if (err) { this.emit("error", err); return; }
+        this._fd = fd; this._file = file; this.emit("ready");
+        if (this._buf.length > this._minLength) this._drain();
+      };
+      const open = () => this._fs.open(file, this._append ? "a" : "w", this._mode, done);
+      if (this._mkdir) this._fs.mkdir((M["path"] || M["node:path"]).dirname(file), { recursive: true }, (e) => e ? done(e) : open());
+      else open();
+    }
+    _writeSync() {
+      const text = this._buf.slice(0, this._maxWrite);
+      const n = this._fs.writeSync(this._fd, text, "utf8");
+      this._buf = this._remainingAfterBytes(text, n, this._buf.slice(text.length));
+      this.emit("write", n);
+      return n;
+    }
+    // fs.write reports bytes while the public Utf8Stream API accepts strings.
+    // Rounding a partial count DOWN to a complete code point avoids queuing a
+    // lone surrogate when a mock (or a short write) stops inside UTF-8 text.
+    _remainingAfterBytes(text, written, suffix) {
+      let bytes = 0, index = 0;
+      const limit = Math.max(0, Number(written) || 0);
+      while (index < text.length) {
+        const cp = text.codePointAt(index);
+        const width = cp > 0xffff ? 2 : 1;
+        const count = Buffer.byteLength(text.slice(index, index + width));
+        if (bytes + count > limit) break;
+        bytes += count; index += width;
+      }
+      return text.slice(index) + (suffix || "");
+    }
+    _drain(cb, requestCompletion = true) {
+      // Internal short-write continuations must resume the active drain
+      // without manufacturing an externally observable drain event.
+      if (requestCompletion) {
+        if (cb) this._drainCallbacks.push(cb); else this._drainEventPending = true;
+      }
+      if (this._writing || this._fd < 0) return;
+      if (!this._buf.length) { this._completeDrain(); return; }
+      this._writing = true;
+      if (this._sync) {
+        try {
+          while (this._buf.length) {
+            if (this._writeSync() === 0) throw new Error("Utf8Stream write returned zero bytes");
+          }
+          if (this._fsync) this._fs.fsyncSync(this._fd);
+          this._completeDrain();
+        } catch (e) { this._completeDrain(e); }
+        return;
+      }
+      const text = this._buf.slice(0, this._maxWrite);
+      this._fs.write(this._fd, text, "utf8", (err, n) => {
+        if (err) { this._completeDrain(err); return; }
+        const written = n == null ? text.length : n;
+        this._buf = this._remainingAfterBytes(text, written, this._buf.slice(text.length)); this.emit("write", written);
+        if (this._buf.length) { this._writing = false; this._drain(undefined, false); return; }
+        if (this._fsync) this._fs.fsync(this._fd, (e) => this._completeDrain(e));
+        else this._completeDrain();
+      });
+    }
+    _completeDrain(err) {
+      this._writing = false;
+      const callbacks = this._drainCallbacks.splice(0);
+      const emitDrain = this._drainEventPending;
+      this._drainEventPending = false;
+      G.queueMicrotask(() => {
+        // destroy() suppresses later stream events, but it must not swallow
+        // an already-requested flush/end completion callback.
+        if (err && !this._destroyed) this.emit("error", err);
+        if (!err && emitDrain && !this._destroyed) this.emit("drain");
+        for (const cb of callbacks) cb(err);
+      });
+    }
+    _close(finish) {
+      if (this._destroyed) return;
+      this._destroyed = true; if (this._timer !== null) G.clearInterval(this._timer);
+      const done = (err) => G.queueMicrotask(() => {
+        if (err) this.emit("error", err); if (finish) this.emit("finish"); this.emit("close");
+      });
+      if (this._fd >= 0 && this._fd !== 1 && this._fd !== 2) this._fs.close(this._fd, done); else done();
+    }
+  }
+  fsMod.ReadStream = Readable; fsMod.WriteStream = Writable; fsMod.Utf8Stream = Utf8Stream;
   // fs.Dirent — libuv DT_* dirent type checks (matches node's Dirent; type values
   // per UV_DIRENT_* above). isFIFO must be strictly type===4 so DT_UNKNOWN (0)
   // returns false for every predicate (regression issue #24129).
@@ -6357,6 +6801,252 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       const rl = M["readline"] || M["node:readline"];
       return rl.createInterface(Object.assign({ input: this.createReadStream(opts), crlfDelay: Infinity }, opts));
     }
+    // node's experimental stream/iter FileHandle adapters.  These deliberately
+    // live on the same FileHandle that fs.promises.open() returns: stream/iter
+    // pipelines retain the descriptor's cursor, lock the handle while active,
+    // and optionally own its close.
+    _iterState(message) {
+      const e = new Error(message);
+      e.code = "ERR_INVALID_STATE";
+      return e;
+    }
+    _iterTypeState(message) {
+      const e = new TypeError(message);
+      e.code = "ERR_INVALID_STATE";
+      return e;
+    }
+    _iterOptions(args, withSignal) {
+      const parsed = require("internal/streams/iter/utils").parsePullArgs(args);
+      const o = parsed.options || {};
+      const autoClose = o.autoClose === undefined ? false : o.autoClose;
+      const chunkSize = o.chunkSize === undefined ? 131072 : o.chunkSize;
+      const start = o.start === undefined ? -1 : o.start;
+      const limit = o.limit === undefined ? -1 : o.limit;
+      if (typeof autoClose !== "boolean")
+        throw fsArgTypeErr("options.autoClose", "of type boolean", autoClose);
+      if (start !== -1) fsValidateInteger(start, "options.start", 0);
+      if (limit !== -1) fsValidateInteger(limit, "options.limit", 1);
+      fsValidateInteger(chunkSize, "options.chunkSize", 1);
+      let signal;
+      if (withSignal && o.signal !== undefined) signal = fsSignalOf({ signal: o.signal });
+      return { transforms: parsed.transforms, options: o, autoClose, chunkSize, start, limit, signal };
+    }
+    _iterCheckOpen() {
+      if (this._closed || this._fd < 0) throw this._iterState("The FileHandle is closed");
+      if (this._iterLocked) throw this._iterState("The FileHandle is locked");
+    }
+    pull(...args) {
+      this._iterCheckOpen();
+      const cfg = this._iterOptions(args, true);
+      const handle = this;
+      const fd = this._fd;
+      if (cfg.signal && cfg.signal.aborted) {
+        return {
+          async *[Symbol.asyncIterator]() {
+            if (cfg.autoClose) await handle.close();
+            throw cfg.signal.reason || fsAbortErr(cfg.signal);
+          },
+        };
+      }
+      this._iterLocked = true;
+      let pos = cfg.start, remaining = cfg.limit;
+      const source = {
+        async *[Symbol.asyncIterator]() {
+          try {
+            if (handle._closed || handle._fd < 0) throw handle._iterState("The FileHandle is closed");
+            while (remaining !== 0) {
+              if (cfg.signal && cfg.signal.aborted) throw cfg.signal.reason || fsAbortErr(cfg.signal);
+              const want = remaining > 0 ? Math.min(cfg.chunkSize, remaining) : cfg.chunkSize;
+              const chunk = Buffer.allocUnsafe(want);
+              const n = fsMod.readSync(fd, chunk, 0, want, pos < 0 ? null : pos) || 0;
+              if (n === 0) break;
+              if (pos >= 0) pos += n;
+              if (remaining > 0) remaining -= n;
+              yield [n === want ? chunk : chunk.subarray(0, n)];
+            }
+          } finally {
+            handle._iterLocked = false;
+            if (cfg.autoClose) await handle.close();
+          }
+        },
+      };
+      if (cfg.transforms.length) return require("internal/streams/iter/pull").pull(source, ...cfg.transforms);
+      return source;
+    }
+    pullSync(...args) {
+      this._iterCheckOpen();
+      const cfg = this._iterOptions(args, false);
+      const handle = this;
+      const fd = this._fd;
+      this._iterLocked = true;
+      let pos = cfg.start, remaining = cfg.limit;
+      const source = {
+        [Symbol.iterator]() {
+          let done = false;
+          const cleanup = () => {
+            if (done) return;
+            done = true;
+            handle._iterLocked = false;
+            if (cfg.autoClose) handle.close();
+          };
+          return {
+            next() {
+              if (done || remaining === 0) { cleanup(); return { value: undefined, done: true }; }
+              if (handle._closed || handle._fd < 0) { cleanup(); throw handle._iterState("The FileHandle is closed"); }
+              const want = remaining > 0 ? Math.min(cfg.chunkSize, remaining) : cfg.chunkSize;
+              const chunk = Buffer.allocUnsafe(want);
+              let n;
+              try { n = fsMod.readSync(fd, chunk, 0, want, pos < 0 ? null : pos) || 0; }
+              catch (e) { cleanup(); throw e; }
+              if (n === 0) { cleanup(); return { value: undefined, done: true }; }
+              if (pos >= 0) pos += n;
+              if (remaining > 0) remaining -= n;
+              return { value: [n === want ? chunk : chunk.subarray(0, n)], done: false };
+            },
+            return() { cleanup(); return { value: undefined, done: true }; },
+          };
+        },
+      };
+      if (cfg.transforms.length) return require("internal/streams/iter/pull").pullSync(source, ...cfg.transforms);
+      return source;
+    }
+    writer(options) {
+      this._iterCheckOpen();
+      const o = options === undefined ? {} : options;
+      if (!o || typeof o !== "object" || Array.isArray(o))
+        throw fsArgTypeErr("options", "of type object", o);
+      const autoClose = o.autoClose === undefined ? false : o.autoClose;
+      const chunkSize = o.chunkSize === undefined ? 131072 : o.chunkSize;
+      let pos = o.start === undefined ? -1 : o.start;
+      let remaining = o.limit === undefined ? -1 : o.limit;
+      if (typeof autoClose !== "boolean") throw fsArgTypeErr("options.autoClose", "of type boolean", autoClose);
+      if (pos !== -1) fsValidateInteger(pos, "options.start", 0);
+      if (remaining !== -1) fsValidateInteger(remaining, "options.limit", 1);
+      fsValidateInteger(chunkSize, "options.chunkSize", 1);
+      const handle = this;
+      const fd = this._fd;
+      let total = 0, closed = false, closing = false, error = null;
+      const pending = new Set();
+      const asBytes = (value) => {
+        if (typeof value === "string") return Buffer.from(value);
+        if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+        if (value instanceof ArrayBuffer) return new Uint8Array(value);
+        throw fsArgTypeErr("chunk", "of type string or an instance of Buffer, TypedArray, or DataView", value);
+      };
+      const checkSignal = (op) => {
+        const s = op && op.signal;
+        if (s !== undefined) fsSignalOf({ signal: s });
+        if (s && s.aborted) throw s.reason || fsAbortErr(s);
+      };
+      const reserve = (n, name) => {
+        if (remaining >= 0 && n > remaining) throw fsRangeErr(name, "<= " + remaining + " bytes", n);
+        if (remaining >= 0) remaining -= n;
+        const at = pos;
+        if (pos >= 0) pos += n;
+        return at;
+      };
+      const track = (p) => { pending.add(p); p.then(() => pending.delete(p), () => pending.delete(p)); return p; };
+      const finish = async () => {
+        if (closed) return;
+        closed = true;
+        handle._iterLocked = false;
+        await Promise.all(Array.from(pending));
+        if (autoClose) await handle.close();
+      };
+      this._iterLocked = true;
+      const writeOne = (value, op) => {
+        if (error) return Promise.reject(error);
+        if (closed || closing) return Promise.reject(handle._iterTypeState("The writer is closed"));
+        if (handle._closed || handle._fd < 0) return Promise.reject(handle._iterState("The FileHandle is closed"));
+        let bytes, at;
+        try { checkSignal(op); bytes = asBytes(value); at = reserve(bytes.byteLength, "write"); }
+        catch (e) { return Promise.reject(e); }
+        let job;
+        job = Promise.resolve().then(() => {
+          const n = fsMod.writeSync(fd, bytes, 0, bytes.byteLength, at < 0 ? null : at) || 0;
+          if (n !== bytes.byteLength) throw new Error("Operation failed: short write");
+          total += n;
+        });
+        return track(job.then(undefined, (e) => { error = error || e; throw e; }));
+      };
+      const writeMany = (values, op) => {
+        if (!Array.isArray(values)) return Promise.reject(fsArgTypeErr("chunks", "an instance of Array", values));
+        if (error) return Promise.reject(error);
+        if (closed || closing) return Promise.reject(handle._iterTypeState("The writer is closed"));
+        let chunks, at;
+        try {
+          checkSignal(op); chunks = values.map(asBytes);
+          const n = chunks.reduce((sum, c) => sum + c.byteLength, 0);
+          at = reserve(n, "writev");
+        } catch (e) { return Promise.reject(e); }
+        let job;
+        job = Promise.resolve().then(() => {
+          let offset = at;
+          for (const chunk of chunks) {
+            const n = fsMod.writeSync(fd, chunk, 0, chunk.byteLength, offset < 0 ? null : offset) || 0;
+            if (n !== chunk.byteLength) throw new Error("Operation failed: short write");
+            total += n;
+            if (offset >= 0) offset += n;
+          }
+        });
+        return track(job.then(undefined, (e) => { error = error || e; throw e; }));
+      };
+      const syncOne = (value) => {
+        if (error || closed || closing || pending.size) return false;
+        const bytes = asBytes(value);
+        if (bytes.byteLength > chunkSize || (remaining >= 0 && bytes.byteLength > remaining)) return false;
+        const at = reserve(bytes.byteLength, "write");
+        const n = fsMod.writeSync(fd, bytes, 0, bytes.byteLength, at < 0 ? null : at) || 0;
+        if (n !== bytes.byteLength) return false;
+        total += n;
+        return true;
+      };
+      const syncMany = (values) => {
+        if (!Array.isArray(values) || error || closed || closing || pending.size) return false;
+        const chunks = values.map(asBytes);
+        const n = chunks.reduce((sum, c) => sum + c.byteLength, 0);
+        if (n > chunkSize || (remaining >= 0 && n > remaining)) return false;
+        const at = reserve(n, "writev");
+        let offset = at;
+        for (const chunk of chunks) {
+          const wrote = fsMod.writeSync(fd, chunk, 0, chunk.byteLength, offset < 0 ? null : offset) || 0;
+          if (wrote !== chunk.byteLength) return false;
+          total += wrote;
+          if (offset >= 0) offset += wrote;
+        }
+        return true;
+      };
+      return {
+        write: writeOne,
+        writev: writeMany,
+        writeSync: syncOne,
+        writevSync: syncMany,
+        end(op) {
+          if (error) return Promise.reject(error);
+          if (closing) return this._end || Promise.resolve(total);
+          try { checkSignal(op); } catch (e) { return Promise.reject(e); }
+          closing = true;
+          this._end = finish().then(() => total);
+          return this._end;
+        },
+        endSync() {
+          if (error) return -1;
+          if (closed) return total;
+          if (pending.size) return -1;
+          closed = true; handle._iterLocked = false;
+          if (autoClose) handle.close();
+          return total;
+        },
+        fail(reason) {
+          if (closed || error) return;
+          error = reason || handle._iterState("Failed");
+          closed = true; handle._iterLocked = false;
+          if (autoClose) handle.close();
+        },
+        [Symbol.asyncDispose]() { return closing ? (this._end || Promise.resolve()) : (this.fail(), Promise.resolve()); },
+        [Symbol.dispose]() { this.fail(); },
+      };
+    }
     // node emits "close" SYNCHRONOUSLY from close(), before the descriptor is
     // actually closed and regardless of the ref count (lib/internal/fs/
     // promises.js: `this.emit('close'); return this[kClosePromise];`). That is
@@ -6434,7 +7124,10 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     rmdir: P((p, o) => { validatePath(p); rmdirCheckOpts(o); rmdirImpl(p); }),
     truncate: P((p, len) => fsMod.truncateSync(p, len)),
     statfs: P((p, o) => fsMod.statfsSync(p, o)),
-    readdir: P((p) => F.readdir(toStr(p))),
+    // Reuse the public sync path: it owns encoding, recursive traversal, and
+    // Dirent conversion. Calling the raw native row here lost every option
+    // supplied to fs.promises.readdir().
+    readdir: P((p, o) => fsMod.readdirSync(p, o)),
     // Route through statSync/lstatSync, not F.stat: the raw native row has no
     // Stats prototype and ignores `{ bigint: true }` (fs.promises.stat must
     // return the same shape as its sync twin — test-fs-stat-bigint compares

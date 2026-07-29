@@ -257,12 +257,25 @@ inline constexpr std::string_view kNodeModuleJS = R"JS(
       throw e;
     }
     const path = getPath();
-    let val = filename !== null && typeof filename === "object" && "href" in filename
-      ? String(filename.href)
-      : String(filename);
-    if (!path.isAbsolute(val)) {
-      // file URL string / object → filesystem path.
+    const invalidFilename = () => {
+      const received = filename && typeof filename === "object" ? "{}" : String(filename);
+      const e = new TypeError("The argument 'filename' must be a file URL object, file URL string, or absolute path string. Received " + received);
+      e.code = "ERR_INVALID_ARG_VALUE";
+      return e;
+    };
+    let val;
+    if (typeof filename === "string") {
+      val = filename;
+    } else if (filename !== null && typeof filename === "object" &&
+               typeof filename.href === "string") {
+      val = filename.href;
+    } else {
+      throw invalidFilename();
+    }
+    if (val.startsWith("file:")) {
       val = getUrl().fileURLToPath(val);
+    } else if (!path.isAbsolute(val)) {
+      throw invalidFilename();
     }
     // A trailing slash means the argument names a directory; joining a dummy
     // basename makes dirname(val) resolve back to that directory (Node parity).
@@ -373,7 +386,16 @@ inline constexpr std::string_view kNodeModuleJS = R"JS(
   Module._resolveFilename = (request, parent, isMain, options) => resolveFilename(request, parent, isMain, options);
   Module._resolveLookupPaths = (request, parent) => resolveLookupPaths(request, parent);
   Module._nodeModulePaths = (from) => nodeModulePaths(from);
-  Module._cache = {};
+  // `Module._cache` and every module-scoped `require.cache` are one live
+  // object.  In particular, user-installed records must be observed before
+  // the native loader is entered (Node's documented cache-injection idiom).
+  Module._cache = G.__mbun_require_cache || (G.__mbun_require_cache = new Proxy({}, {
+    deleteProperty(target, key) {
+      G.__mbun_evict_module_cache(String(key));
+      delete target[key];
+      return true;
+    },
+  }));
   Module._pathCache = {};
 
   // _stat(path): node's internalModuleStat — 1 for a directory, 0 for a file,
@@ -395,7 +417,28 @@ inline constexpr std::string_view kNodeModuleJS = R"JS(
     ".js": noopLoader, ".json": noopLoader, ".node": noopLoader,
     ".cts": noopLoader, ".ts": noopLoader, ".mjs": noopLoader, ".mts": noopLoader,
   };
-  Module.globalPaths = [];
+  function initPaths() {
+    const path = getPath();
+    const env = G.process && G.process.env || {};
+    const sep = G.process && G.process.platform === "win32" ? ";" : ":";
+    const paths = [];
+    const add = (value) => { if (typeof value === "string" && value.length && !paths.includes(value)) paths.push(value); };
+    if (typeof env.NODE_PATH === "string") {
+      for (const entry of env.NODE_PATH.split(sep)) add(entry);
+    }
+    const home = env.HOME || env.USERPROFILE;
+    if (home) {
+      add(path.join(home, ".node_modules"));
+      add(path.join(home, ".node_libraries"));
+    }
+    const execPath = G.process && G.process.execPath;
+    if (typeof execPath === "string" && execPath.length) {
+      add(path.join(path.dirname(path.dirname(execPath)), "lib", "node"));
+    }
+    add("/usr/lib/node");
+    Module.globalPaths = paths;
+  }
+  initPaths();
 
   Module.wrapper = [
     "(function (exports, require, module, __filename, __dirname) { ",
@@ -405,6 +448,16 @@ inline constexpr std::string_view kNodeModuleJS = R"JS(
 
   Module.SourceMap = SourceMap;
   Module.findSourceMap = (path) => undefined;
+  Module.setSourceMapsSupport = (enabled, options) => {
+    if (typeof enabled !== "boolean") throw invalidArgType("enabled", "boolean", enabled);
+    if (options === undefined) return;
+    if (options === null || typeof options !== "object") throw invalidArgType("options", "Object", options);
+    for (const key of ["nodeModules", "generatedCode"]) {
+      if (options[key] !== undefined && typeof options[key] !== "boolean") {
+        throw invalidArgType("options." + key, "boolean", options[key]);
+      }
+    }
+  };
   Module.syncBuiltinESMExports = () => {};
 
   Module.constants = Object.freeze({
@@ -412,9 +465,83 @@ inline constexpr std::string_view kNodeModuleJS = R"JS(
       FAILED: 0, ENABLED: 1, ALREADY_ENABLED: 2, DISABLED: 3,
     }),
   });
-  Module.getCompileCacheDir = () => undefined;
-  Module.enableCompileCache = (cacheDir) => ({ status: Module.constants.compileCacheStatus.DISABLED });
+
+  // The native module loader owns serialized bytecode.  Keep the public
+  // compile-cache configuration here, however, so CommonJS and ESM callers
+  // agree on one directory and on Node's enable/disable result contract.
+  // Loader-side cache production/consumption is intentionally separate from
+  // this API layer (see the DEFERRED note at the top of this payload).
+  let compileCacheDirectory;
+  const compileCacheStatus = Module.constants.compileCacheStatus;
+
+  function compileCacheFs() {
+    return M["node:fs"] || M["fs"];
+  }
+
+  function compileCacheDefaultDirectory() {
+    const env = G.process && G.process.env;
+    if (env && env.NODE_COMPILE_CACHE) return env.NODE_COMPILE_CACHE;
+    const os = M["node:os"] || M["os"];
+    const path = getPath();
+    const tmp = os && typeof os.tmpdir === "function" ? os.tmpdir() : "/tmp";
+    return path && typeof path.join === "function" ? path.join(tmp, "node-compile-cache") : tmp + "/node-compile-cache";
+  }
+
+  function invalidCompileCacheOptions(options) {
+    return invalidArgType("options", "string or Object or undefined", options);
+  }
+
+  function enableCompileCache(options) {
+    const env = G.process && G.process.env;
+    if (env && env.NODE_DISABLE_COMPILE_CACHE === "1") {
+      return { status: compileCacheStatus.DISABLED };
+    }
+    if (compileCacheDirectory !== undefined) {
+      return { status: compileCacheStatus.ALREADY_ENABLED, directory: compileCacheDirectory };
+    }
+
+    let directory;
+    let portable;
+    if (options === undefined || typeof options === "string") {
+      directory = options;
+    } else if (options !== null && typeof options === "object") {
+      ({ directory, portable } = options);
+      if (portable !== undefined && typeof portable !== "boolean") {
+        throw invalidArgType("options.portable", "boolean", portable);
+      }
+    } else {
+      throw invalidCompileCacheOptions(options);
+    }
+    if (directory === undefined) directory = compileCacheDefaultDirectory();
+    if (typeof directory !== "string") {
+      throw invalidArgType("options.directory", "string", directory);
+    }
+
+    try {
+      const fs = compileCacheFs();
+      if (!fs || typeof fs.mkdirSync !== "function") {
+        return { status: compileCacheStatus.FAILED, message: "The file system module is unavailable" };
+      }
+      fs.mkdirSync(directory, { recursive: true });
+      compileCacheDirectory = directory;
+      return { status: compileCacheStatus.ENABLED, directory };
+    } catch (error) {
+      return {
+        status: compileCacheStatus.FAILED,
+        message: error && error.message ? String(error.message) : String(error),
+      };
+    }
+  }
+
+  Module.getCompileCacheDir = () => compileCacheDirectory;
+  Module.enableCompileCache = enableCompileCache;
   Module.flushCompileCache = () => {};
+
+  // NODE_COMPILE_CACHE enables the cache during process initialization, before
+  // user preloads can call getCompileCacheDir().
+  if (G.process && G.process.env && G.process.env.NODE_COMPILE_CACHE) {
+    enableCompileCache(G.process.env.NODE_COMPILE_CACHE);
+  }
 
   // ESM loader hooks — accepted but a no-op (native loader integration DEFERRED).
   Module.register = (specifier, parentURL, options) => {};
@@ -427,7 +554,7 @@ inline constexpr std::string_view kNodeModuleJS = R"JS(
     const dir = parent && parent.path ? parent.path : G.process.cwd();
     return G.__mbun_make_require(dir)(request);
   };
-  Module._initPaths = () => {};
+  Module._initPaths = () => initPaths();
   Module._preloadModules = () => {};
 
   M["module"] = Module;
@@ -462,7 +589,10 @@ inline constexpr std::string_view kNodeModuleJS = R"JS(
         if (options && Array.isArray(options.paths)) {
           let lastErr;
           for (let k = 0; k < options.paths.length; k++) {
-            try { return G.__mbun_resolve_native(s, String(options.paths[k])); }
+            if (typeof options.paths[k] !== "string") {
+              throw invalidArgType("paths", "string", options.paths[k]);
+            }
+            try { return G.__mbun_resolve_native(s, options.paths[k]); }
             catch (e) { lastErr = e; }
           }
           throw lastErr || new Error("Cannot find module '" + s + "'");
@@ -470,6 +600,7 @@ inline constexpr std::string_view kNodeModuleJS = R"JS(
         return origResolve ? origResolve.call(this, s) : G.__mbun_resolve_native(s, dir);
       };
       req.extensions = Module._extensions;
+      req.cache = Module._cache;
       return req;
     };
     patched.__mbunModulePatched = true;

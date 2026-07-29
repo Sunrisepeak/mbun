@@ -354,6 +354,22 @@
             requireAlias = loaded.cjs_require_alias;
             source = std::move(loaded.source);
             path = std::move(loaded.path);
+            // Node retains the legacy ERR_REQUIRE_ESM path when explicitly
+            // started with --no-experimental-require-module.  The normal mbun
+            // route supports CJS require of ESM, so gate only this opt-out.
+            const bool noRequireModule{std::find(gExecArgv.begin(), gExecArgv.end(),
+                                                 "--no-experimental-require-module") != gExecArgv.end()};
+            if (noRequireModule && path.ends_with(".mjs")) {
+                if (exc != nullptr) {
+                    JSValueRef m{make_string(
+                        ctx, "require() of ES Module " + path + " not supported.\nInstead change the require of " +
+                                 path + " to a dynamic import() which is available in all CommonJS modules.")};
+                    JSObjectRef e{JSObjectMakeError(ctx, 1, &m, nullptr)};
+                    set_prop(ctx, e, "code", make_string(ctx, "ERR_REQUIRE_ESM"));
+                    *exc = e;
+                }
+                return JSValueMakeUndefined(ctx);
+            }
         } else if (loaded.status == LoadStatus::TranspileFailed) {
             // A transpile failure is a hard error, NOT a reason to evaluate the
             // file's raw bytes. The old "plain-JS-in-.ts: fall back to raw
@@ -664,6 +680,30 @@
                 : std::string{}};
         std::string wrapper{std::string{tla ? "(async function (" : "(function ("} + params +
                             ") {\n" + strictPrefix + metaPrefix + source + debugEnvSuffix + "\n})"};
+        // User CommonJS modules run through the mutable Module.wrapper hook.
+        // Keep the extended native wrapper for Node internals (which receive
+        // primordials/internalBinding parameters), but honour changed user
+        // wrapper fragments exactly as Module.wrap() promises.
+        if (!nodeInternal && !tla) {
+            JSObjectRef nativeModules{JSValueToObject(
+                ctx, get_prop(ctx, JSContextGetGlobalObject(ctx), "__mbunNativeModules"), nullptr)};
+            JSObjectRef nodeModule{nativeModules == nullptr
+                                       ? nullptr
+                                       : JSValueToObject(ctx, get_prop(ctx, nativeModules, "module"), nullptr)};
+            JSObjectRef fragments{nodeModule == nullptr
+                                      ? nullptr
+                                      : JSValueToObject(ctx, get_prop(ctx, nodeModule, "wrapper"), nullptr)};
+            if (fragments != nullptr) {
+                const std::string prefix{val_to_string(ctx, get_prop(ctx, fragments, "0"))};
+                const std::string suffix{val_to_string(ctx, get_prop(ctx, fragments, "1"))};
+                constexpr std::string_view defaultPrefix{
+                    "(function (exports, require, module, __filename, __dirname) { "};
+                constexpr std::string_view defaultSuffix{"\n});"};
+                if (prefix != defaultPrefix || suffix != defaultSuffix) {
+                    wrapper = prefix + strictPrefix + metaPrefix + source + debugEnvSuffix + suffix;
+                }
+            }
+        }
 
         JSValueRef wrapExc{nullptr};
         JSValueRef fnVal{eval_(wrapper, &wrapExc, path)};
@@ -836,4 +876,3 @@ private:
 #endif
         install_bindings_();
     }
-

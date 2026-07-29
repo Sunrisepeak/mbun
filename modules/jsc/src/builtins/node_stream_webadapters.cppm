@@ -953,7 +953,12 @@ inline constexpr std::string_view kNodeStreamWebAdaptersJS = R"JS(
       const { isArrayBufferView, isSharedArrayBuffer } = require("node:util/types");
       return newReadableWritablePairFromDuplex(duplex, {
         [kValidateChunk]: function validateBufferSourceChunk(chunk) {
-          if (isSharedArrayBuffer(isArrayBufferView(chunk) ? chunk.buffer : chunk)) {
+          const isView = isArrayBufferView(chunk);
+          // `isSharedArrayBuffer` alone only rejects SAB-backed inputs: strings
+          // and ordinary objects fall through to node:zlib, which accepts and
+          // coerces them. Compression Streams accepts BufferSource exclusively.
+          if ((!isView && !isAnyArrayBuffer(chunk)) ||
+              isSharedArrayBuffer(isView ? chunk.buffer : chunk)) {
             throw $ERR_INVALID_ARG_TYPE("chunk", ["ArrayBuffer", "Buffer", "TypedArray", "DataView"], chunk);
           }
         },

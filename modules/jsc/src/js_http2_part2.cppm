@@ -184,7 +184,7 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
         if (sc < 100 || sc >= 200) { const e = new RangeError("Invalid informational status code: " + obj[":status"]); e.code = "ERR_HTTP2_INVALID_INFO_STATUS"; throw e; }
         obj[":status"] = String(sc);
       }
-      const infoBuilt = buildNgHeaders(obj, assertValidResponsePseudoHeader, strictSingleValueFields);
+      const infoBuilt = buildNgHeaders(obj, assertValidResponsePseudoHeader, strictSingleValueFields, true);
       infoBuilt.prepared = Object.assign({ __proto__: null }, obj);
       if (infoBuilt.prepared[":status"] !== undefined) infoBuilt.prepared[":status"] = parseInt(infoBuilt.prepared[":status"], 10);
       return infoBuilt;
@@ -194,7 +194,7 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
     const status = (obj[":status"] | 0) || 200;
     if (status < 200 || status > 599) { const e = new RangeError("Invalid status code: " + status); e.code = "ERR_HTTP2_STATUS_INVALID"; throw e; }
     obj[":status"] = String(status);
-    const built = buildNgHeaders(obj, assertValidResponsePseudoHeader, strictSingleValueFields);
+    const built = buildNgHeaders(obj, assertValidResponsePseudoHeader, strictSingleValueFields, true);
     // node ServerHttp2Stream#sentHeaders reports the *numeric* status alongside
     // the fields the response actually carried.
     built.prepared = Object.assign({ __proto__: null }, obj, { ":status": status });
@@ -218,7 +218,7 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
     if (statusCode < 200 || statusCode > 599) {
       const e = new RangeError("Invalid status code: " + statusCode); e.code = "ERR_HTTP2_STATUS_INVALID"; throw e;
     }
-    const built = buildNgHeaders(headers, assertValidResponsePseudoHeader, strictSingleValueFields);
+    const built = buildNgHeaders(headers, assertValidResponsePseudoHeader, strictSingleValueFields, true);
     built.rawHeaders = headers;
     built.prepared = rawToHeaderObject(headers);
     return built;
@@ -279,6 +279,7 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
       // and for a HEAD request, so the HEADERS frame carries END_STREAM itself.
       const st = parseInt(built.list[0] && built.list[0][1], 10);
       if (st === 204 || st === 205 || st === 304 || this.headRequest === true) options = Object.assign({}, options, { endStream: true });
+      if (!submitNativeStream(this, "respond", built.list, options)) return;
       this.headersSent = true;
       this.sentHeaders = built.prepared || headers;
       const block = encodeHeaders(built.list, built.sensitive);
@@ -401,7 +402,15 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
     }
     _fileError(options, err) {
       if (options && typeof options.onError === "function") options.onError(err);
-      else this.destroy(err);
+      else {
+        // A filesystem failure belongs to the HTTP/2 stream boundary, not the
+        // public fs API: node closes both peers with INTERNAL_ERROR. Preserve
+        // the HTTP/2-specific errors made above (directory/non-seekable file),
+        // but translate raw errno values such as EBADF before destroy() emits
+        // the server-side error and sends RST_STREAM to the client.
+        const isHttp2Error = err && typeof err.code === "string" && err.code.indexOf("ERR_HTTP2_") === 0;
+        this.destroy(isHttp2Error ? err : streamErr(constants.NGHTTP2_INTERNAL_ERROR));
+      }
     }
     _sendFd(fs, fd, headersParam, options, stat, ownsFd) {
       const headers = Object.assign({}, headersParam);
@@ -418,6 +427,10 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
         length = length < 0 ? stat.size - offset : Math.min(stat.size - offset, length);
         headers["content-length"] = length;
       }
+      // Submit HEADERS before the file source is consumed. A later read error
+      // resets an already-open response stream, so the client observes both the
+      // response event and the INTERNAL_ERROR RST, matching node/nghttp2.
+      this.respond(headers, options.waitForTrailers ? { waitForTrailers: true } : undefined);
       let body;
       try {
         if (length < 0) {
@@ -434,7 +447,6 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
         }
       } catch (e) { if (ownsFd) { try { fs.closeSync(fd); } catch (e2) {} } this._fileError(options, e); return; }
       if (ownsFd) { try { fs.closeSync(fd); } catch (e) {} }
-      this.respond(headers, options.waitForTrailers ? { waitForTrailers: true } : undefined);
       this.end(body);
     }
     // node ServerHttp2Stream#pushStream (lib/internal/http2/core.js). The
@@ -505,6 +517,7 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
       if (this.destroyed || this._closed) throw mkErr("The stream has been destroyed", "ERR_HTTP2_INVALID_STREAM");
       if (this.headersSent) throw mkErr("Cannot specify additional headers after response initiated", "ERR_HTTP2_HEADERS_AFTER_RESPOND");
       const built = buildResponseHeaderList(headers || {}, this.session._options && this.session._options.strictSingleValueFields, true);
+      if (!submitNativeStream(this, "info", built.list)) return;
       writeHeaderBlock(this.session, this.id, encodeHeaders(built.list, built.sensitive), 0);
       // node Http2Stream#sentInfoHeaders: every 1xx block sent so far, in order.
       this.sentInfoHeaders.push(built.prepared || headers || {});
@@ -1973,6 +1986,7 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
       class Http2Stream {}
       class Http2Ping {}
       class Http2Settings {}
+      nativeHttp2StreamPrototype = Http2Stream.prototype;
       return {
         constants: bindingConstants,
         settingsBuffer, optionsBuffer, sessionState, streamState,

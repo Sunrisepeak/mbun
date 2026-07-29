@@ -89,9 +89,11 @@ inline constexpr std::string_view kWebURLPatternJS = R"JS(
       return res;
     };
     const canonOpaquePathname = (v) => {
-      if (v === "") return v;
-      const u = new URL("fake:" + v);
-      return u.pathname;
+      // URLPattern compares opaque paths as component strings. Feeding one
+      // through URL serialisation would percent-encode spaces (for example
+      // `javascript:var x = 1;`), while the URLPattern pattern and init
+      // algorithms preserve those code points for a non-special scheme.
+      return v;
     };
     const canonSearch = (v) => {
       if (v === "") return v;

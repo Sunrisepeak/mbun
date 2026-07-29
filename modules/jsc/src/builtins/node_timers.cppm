@@ -47,6 +47,12 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
 
     const KIND = Symbol("mbun.timerKind");
     const STATE = Symbol("mbun.timerState");
+    // The host scheduler returns plain objects.  Node exposes stable handle
+    // identities, including their public constructor names, to callbacks and
+    // async-context users; keep the native object as the facade rather than
+    // wrapping it so numeric ids/ref state remain shared.
+    function Timeout() {}
+    function Immediate() {}
     const registry = new Map(); // numeric id -> timer object (timeouts/intervals)
     // process.getActiveResourcesInfo() tracking: node reports both setTimeout
     // and setInterval handles as 'Timeout', and setImmediate as 'Immediate'.
@@ -62,6 +68,12 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
       if (t === null || typeof t !== "object") return t;
       t[KIND] = kind;
       t[STATE] = state;
+      try {
+        Object.defineProperty(t, "constructor", {
+          value: kind === "immediate" ? Immediate : Timeout,
+          configurable: true,
+        });
+      } catch (_) {}
       if (t._destroyed === undefined) {
         try { Object.defineProperty(t, "_destroyed", { value: false, writable: true, enumerable: false, configurable: true }); }
         catch (_) { t._destroyed = false; }
@@ -72,6 +84,11 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
         activeTimeouts.add(t);
       } else {
         activeImmediates.add(t);
+      }
+      const timerHooks = G.__mbunAsyncHookTimer;
+      if (timerHooks && typeof timerHooks.init === "function") {
+        state.timerHooks = timerHooks;
+        state.asyncHook = timerHooks.init(t, kind === "immediate" ? "Immediate" : "Timeout");
       }
       // unref()/ref() must chain (node returns the timer).
       const oUnref = t.unref, oRef = t.ref;
@@ -92,11 +109,26 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
           return t;
         };
       }
+      // Native Symbol.dispose clears the host timer directly, bypassing this
+      // facade's registry and `_destroyed` lifecycle.  Route it through the
+      // same path as clearTimeout/clearImmediate instead.
+      if (Symbol.dispose) {
+        try {
+          Object.defineProperty(t, Symbol.dispose, {
+            value: function dispose() { clearNative(t); destroyTimer(t); },
+            configurable: true,
+          });
+        } catch (_) {}
+      }
       return t;
     }
 
     function destroyTimer(t) {
       if (t === null || typeof t !== "object") return;
+      const state = t[STATE];
+      if (state && state.timerHooks && typeof state.timerHooks.destroy === "function") {
+        state.timerHooks.destroy(state.asyncHook);
+      }
       t._destroyed = true;
       const id = idOf(t);
       if (id !== null) registry.delete(id);
@@ -141,6 +173,12 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
       const h = G.__mbunSchedHook;
       return h === undefined || h === null ? cb : h(cb);
     };
+    const __runTimerCallback = (state, cb, thisArg, args) => {
+      if (state.timerHooks && typeof state.timerHooks.run === "function") {
+        return state.timerHooks.run(state.asyncHook, cb, thisArg, args);
+      }
+      return cb.apply(thisArg, args);
+    };
 
     const mySetTimeout = function setTimeout(cb, ms, ...args) {
       if (typeof cb !== "function") throw __invalidCb(cb);
@@ -149,7 +187,7 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
       const state = { gen: 0, ms, args };
       state.run = function (...a) {
         const g = state.gen;
-        try { return cb.apply(this, a); }
+        try { return __runTimerCallback(state, cb, state.timer, a); }
         // refresh()/clear during the callback bumps gen: skip the destroy.
         finally { if (state.gen === g && state.timer) destroyTimer(state.timer); }
       };
@@ -163,7 +201,8 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
       _checkCountdown(ms);
       cb = __sched(cb);
       const state = { gen: 0, ms, args };
-      const t = oSetInterval(cb, ms, ...args);
+      state.run = function (...a) { return __runTimerCallback(state, cb, state.timer, a); };
+      const t = oSetInterval(state.run, ms, ...args);
       state.timer = t;
       state.native = t;
       return initTimer(t, "interval", state);
@@ -176,7 +215,7 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
         const g = state.gen;
         // node drops the Immediate from the active set before its callback runs.
         if (state.timer) activeImmediates.delete(state.timer);
-        try { return cb.apply(this, a); }
+        try { return __runTimerCallback(state, cb, state.timer, a); }
         finally { if (state.gen === g && state.timer) destroyTimer(state.timer); }
       };
       const t = oSetImmediate(state.run, ...args);

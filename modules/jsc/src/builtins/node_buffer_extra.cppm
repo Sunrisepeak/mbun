@@ -130,7 +130,9 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
       if (typeof input === "object") {
         const cn = input.constructor && input.constructor.name;
         if (cn) return " Received an instance of " + cn;
-        return " Received [Object: null prototype] {}";
+        // internal/errors' invalidArgTypeHelper uses the generic Object tag
+        // here, including for a null-prototype object (test-buffer-from).
+        return " Received [Object]";
       }
       let ins = typeof input === "bigint" ? String(input) + "n"
         : typeof input === "symbol" ? input.toString()
@@ -165,6 +167,11 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
     const trunc0 = (v) => { const n = Math.trunc(+v); return Number.isNaN(n) ? 0 : n; };
     const isDetached = (buf) => {
       try { return !!(buf.buffer && buf.buffer.detached === true); } catch (_) { return false; }
+    };
+    const errDetachedArrayBuffer = () => {
+      const e = new TypeError("Cannot perform operation on a detached ArrayBuffer");
+      e.code = "ERR_INVALID_STATE";
+      return e;
     };
 
     // ------------------------------------------------------- raw encoders
@@ -1188,10 +1195,25 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
       throw errFromArgType(value);
     };
 
+    let bufferConstructorWarningShown = false;
+    const warnBufferConstructor = () => {
+      if (bufferConstructorWarningShown) return;
+      const process = G.process;
+      const argv = process && process.execArgv;
+      if (!Array.isArray(argv) || !argv.includes("--pending-deprecation")) return;
+      bufferConstructorWarningShown = true;
+      if (typeof process.emitWarning === "function") {
+        process.emitWarning(
+          "Buffer() is deprecated due to security and usability issues. Please use the Buffer.alloc(), Buffer.allocUnsafe(), or Buffer.from() methods instead.",
+          "DeprecationWarning", "DEP0005");
+      }
+    };
+
     // Thin callable wrapper sharing OrigBuffer.prototype so the deprecated
     // `new Buffer(str, enc)` / `new Buffer(ab, offset, length)` forms take the
     // same paths as Buffer.from.
     const BufferW = function Buffer(value, encodingOrOffset, length) {
+      warnBufferConstructor();
       // node: Buffer(number) / new Buffer(number) === Buffer.alloc(number)
       // (zero-filled, size-validated) since the unsafe-by-default era ended. A
       // string 2nd arg alongside a numeric size is rejected (test-buffer-new).
@@ -1324,19 +1346,24 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
     G.Buffer = BufferW;
 
     // ------------------------------------------------------ module exports
+    const bufferInputBytes = (input) => {
+      if (isAnyArrayBuffer(input)) {
+        if (input.detached === true) throw errDetachedArrayBuffer();
+        return new Uint8Array(input);
+      }
+      if (ArrayBuffer.isView(input)) {
+        if (input.buffer.detached === true) throw errDetachedArrayBuffer();
+        return new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
+      }
+      throw errArgType("input", "ArrayBuffer, Buffer, or TypedArray", input);
+    };
     const isAscii = function isAscii(input) {
-      let u8;
-      if (isAnyArrayBuffer(input)) u8 = new Uint8Array(input);
-      else if (ArrayBuffer.isView(input)) u8 = new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
-      else throw errArgType("input", "ArrayBuffer, Buffer, or TypedArray", input);
+      const u8 = bufferInputBytes(input);
       for (let i = 0; i < u8.length; i++) if (u8[i] > 127) return false;
       return true;
     };
     const isUtf8 = function isUtf8(input) {
-      let u8;
-      if (isAnyArrayBuffer(input)) u8 = new Uint8Array(input);
-      else if (ArrayBuffer.isView(input)) u8 = new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
-      else throw errArgType("input", "ArrayBuffer, Buffer, or TypedArray", input);
+      const u8 = bufferInputBytes(input);
       try { new TextDecoder("utf-8", { fatal: true }).decode(u8); return true; } catch (_) { return false; }
     };
     const SlowBuffer = function SlowBuffer(size) { return OrigBuffer.allocUnsafe(size); };

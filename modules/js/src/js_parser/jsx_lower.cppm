@@ -272,6 +272,89 @@ public:
         return std::string{s.substr(a, b - a)};
     }
 
+    static void jsx_append_utf8_(std::string& out, std::uint32_t codePoint) {
+        if (codePoint <= 0x7FU) {
+            out.push_back(static_cast<char>(codePoint));
+        } else if (codePoint <= 0x7FFU) {
+            out.push_back(static_cast<char>(0xC0U | (codePoint >> 6U)));
+            out.push_back(static_cast<char>(0x80U | (codePoint & 0x3FU)));
+        } else if (codePoint <= 0xFFFFU) {
+            out.push_back(static_cast<char>(0xE0U | (codePoint >> 12U)));
+            out.push_back(static_cast<char>(0x80U | ((codePoint >> 6U) & 0x3FU)));
+            out.push_back(static_cast<char>(0x80U | (codePoint & 0x3FU)));
+        } else {
+            out.push_back(static_cast<char>(0xF0U | (codePoint >> 18U)));
+            out.push_back(static_cast<char>(0x80U | ((codePoint >> 12U) & 0x3FU)));
+            out.push_back(static_cast<char>(0x80U | ((codePoint >> 6U) & 0x3FU)));
+            out.push_back(static_cast<char>(0x80U | (codePoint & 0x3FU)));
+        }
+    }
+
+    static std::string jsx_decode_entities_(std::string_view text) {
+        std::string out;
+        out.reserve(text.size());
+        for (std::size_t i{0}; i < text.size();) {
+            if (text[i] != '&') {
+                out.push_back(text[i++]);
+                continue;
+            }
+            const std::size_t end{text.find(';', i + 1)};
+            if (end == std::string_view::npos) {
+                out.push_back(text[i++]);
+                continue;
+            }
+            const std::string_view entity{text.substr(i + 1, end - i - 1)};
+            std::uint32_t codePoint{0};
+            bool decoded{true};
+            if (entity == "amp") {
+                codePoint = '&';
+            } else if (entity == "lt") {
+                codePoint = '<';
+            } else if (entity == "gt") {
+                codePoint = '>';
+            } else if (entity == "quot") {
+                codePoint = '"';
+            } else if (entity == "apos") {
+                codePoint = '\'';
+            } else if (!entity.empty() && entity[0] == '#') {
+                std::size_t digit{1};
+                unsigned base{10};
+                if (digit < entity.size() && (entity[digit] == 'x' || entity[digit] == 'X')) {
+                    base = 16;
+                    ++digit;
+                }
+                if (digit == entity.size()) {
+                    decoded = false;
+                }
+                for (; decoded && digit < entity.size(); ++digit) {
+                    const char c{entity[digit]};
+                    const unsigned value{(c >= '0' && c <= '9') ? static_cast<unsigned>(c - '0')
+                                         : (base == 16 && c >= 'a' && c <= 'f') ? static_cast<unsigned>(c - 'a' + 10)
+                                         : (base == 16 && c >= 'A' && c <= 'F') ? static_cast<unsigned>(c - 'A' + 10)
+                                                                                  : base};
+                    if (value >= base || codePoint > (0x10FFFFU - value) / base) {
+                        decoded = false;
+                        break;
+                    }
+                    codePoint = codePoint * base + value;
+                }
+                if (codePoint == 0 || codePoint > 0x10FFFFU ||
+                    (codePoint >= 0xD800U && codePoint <= 0xDFFFU)) {
+                    decoded = false;
+                }
+            } else {
+                decoded = false;
+            }
+            if (decoded) {
+                jsx_append_utf8_(out, codePoint);
+            } else {
+                out.append(text.substr(i, end - i + 1));
+            }
+            i = end + 1;
+        }
+        return out;
+    }
+
     // The standard JSX text-whitespace fold (matches babel/esbuild): split on line
     // breaks, drop leading/trailing whitespace adjacent to a newline, collapse the
     // rest with single spaces. Whitespace-only multi-line text folds to empty.
@@ -318,7 +401,7 @@ public:
                 result += line;
             }
         }
-        return result;
+        return jsx_decode_entities_(result);
     }
 
     // Copy a raw `'…'` / `"…"` string literal (quotes included), honoring escapes.

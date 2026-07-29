@@ -30,6 +30,10 @@ inline constexpr std::string_view kAsyncHooksJS = R"JS(
     if (index < 0) next.push(storage, value); else next[index + 1] = value;
     return next;
   };
+  // SameValue without consulting the mutable userland Object.is. Node's ALS
+  // uses the primordial operation to decide whether run() may take its
+  // no-frame fast path, so NaN compares equal while +0 and -0 remain distinct.
+  const sameValue = (a, b) => a === b ? (a !== 0 || 1 / a === 1 / b) : a !== a && b !== b;
   const callInContext = (context, fn, thisArg, args) => {
     const previous = contextGet();
     contextSet(context);
@@ -45,6 +49,115 @@ inline constexpr std::string_view kAsyncHooksJS = R"JS(
     return wrapped;
   };
 
+  // Keep the public async_hooks API backed by one lifecycle registry instead
+  // of reporting success from createHook() while never delivering an event.
+  // The C-API runtime cannot observe every JSC allocation, but it does own the
+  // callback registration boundaries below and AsyncResource directly. Those
+  // are real async resources, so account for them with the same id/context
+  // transition rules Node exposes to user hooks.
+  const activeHooks = new Set();
+  const hookControllers = new WeakMap();
+  // stream.finished() needs this decision at callback-registration time. Keep
+  // the probe in the async-hooks owner, where both the ALS frame and active
+  // hook set are authoritative.
+  Object.defineProperty(G, "__mbunHasAsyncContext", {
+    configurable: true, enumerable: false,
+    value: () => contextGet() !== undefined || activeHooks.size !== 0,
+  });
+  let nextAsyncId = 1;
+  // Node's bootstrap itself owns async id 1. Timers scheduled by user code at
+  // top level therefore inherit triggerAsyncId 1 rather than the internal
+  // sentinel 0.
+  let executionId = 1;
+  let executionResource;
+  const hookCall = (name, ...args) => {
+    for (const hook of Array.from(activeHooks)) {
+      const callback = hook[name];
+      if (typeof callback === "function") Reflect.apply(callback, hookControllers.get(hook) || hook, args);
+    }
+  };
+  const newAsyncId = () => ++nextAsyncId;
+  // JS-backed Worker and MessagePort handles are outside JSC's native provider
+  // table. Route their real resource objects through the same active hook
+  // registry and id sequence as timers and AsyncResource.
+  G.__mbunAsyncHookInit = (type, resource) => {
+    const id = newAsyncId();
+    hookCall("init", id, type, executionId, resource);
+    return id;
+  };
+  G.__mbunAsyncHookDestroy = (id) => {
+    if (id !== undefined) hookCall("destroy", id);
+  };
+  const runAsyncCallback = (id, resource, callback, thisArg, args) => {
+    const previousId = executionId;
+    const previousResource = executionResource;
+    executionId = id;
+    executionResource = resource;
+    hookCall("before", id);
+    try { return Reflect.apply(callback, thisArg, args); }
+    finally {
+      try { hookCall("after", id); }
+      finally {
+        executionId = previousId;
+        executionResource = previousResource;
+      }
+    }
+  };
+  const captureAsyncCallback = (fn, type, context = contextGet(), destroyOnRun = true) => {
+    if (typeof fn !== "function") return fn;
+    const callback = captureContext(fn, context);
+    if (activeHooks.size === 0) return callback;
+    const id = newAsyncId();
+    const resource = { type };
+    hookCall("init", id, type, executionId, resource);
+    return function (...args) {
+      try { return runAsyncCallback(id, resource, callback, this, args); }
+      finally {
+        if (type === "PROMISE") hookCall("promiseResolve", id);
+        if (destroyOnRun) hookCall("destroy", id);
+      }
+    };
+  };
+
+  // node_timers replaces the global scheduling functions after this payload
+  // runs. Keeping timer lifecycle ownership here, but letting that final
+  // wrapper register its returned facade, avoids attaching hooks to the stale
+  // native handle (and makes the init resource the public Immediate/Timeout).
+  const timerHooks = {
+    init(resource, type) {
+      const context = contextGet();
+      const hooksEnabled = activeHooks.size !== 0;
+      if (context === undefined && !hooksEnabled) return undefined;
+      const token = { context, resource, destroyed: false };
+      if (hooksEnabled) {
+        token.id = newAsyncId();
+        hookCall("init", token.id, type, executionId, resource);
+      }
+      return token;
+    },
+    run(token, callback, thisArg, args) {
+      if (token === undefined) return Reflect.apply(callback, thisArg, args);
+      const invoke = () => callInContext(token.context, callback, thisArg, args);
+      if (token.id === undefined) return invoke();
+      return runAsyncCallback(token.id, token.resource, invoke, undefined, []);
+    },
+    destroy(token) {
+      if (token === undefined || token.destroyed) return;
+      token.destroyed = true;
+      if (token.id !== undefined) hookCall("destroy", token.id);
+    },
+  };
+  Object.defineProperty(G, "__mbunAsyncHookTimer", {
+    configurable: true, enumerable: false, value: timerHooks,
+  });
+
+  const validateFunction = (fn) => {
+    if (typeof fn === "function") return;
+    const error = new TypeError('The "fn" argument must be of type function');
+    error.code = "ERR_INVALID_ARG_TYPE";
+    throw error;
+  };
+
   class AsyncLocalStorage {
     #disabled = false;
     // node >= 24 `new AsyncLocalStorage({ defaultValue })`: getStore() outside
@@ -58,14 +171,14 @@ inline constexpr std::string_view kAsyncHooksJS = R"JS(
     }
 
     static bind(fn, ...args) {
-      if (typeof fn !== "function") throw new TypeError('The "fn" argument must be of type function');
+      validateFunction(fn);
       return this.snapshot().bind(null, fn, ...args);
     }
 
     static snapshot() {
       const context = contextGet();
       return (fn, ...args) => {
-        if (typeof fn !== "function") throw new TypeError('The "fn" argument must be of type function');
+        validateFunction(fn);
         return callInContext(context, fn, undefined, args);
       };
     }
@@ -79,12 +192,22 @@ inline constexpr std::string_view kAsyncHooksJS = R"JS(
 
     run(store, callback, ...args) {
       if (typeof callback !== "function") throw new TypeError('The "callback" argument must be of type function');
+      // A same-value run does not install a temporary frame. This is observable:
+      // enterWith() in the callback then survives, as does exit() on a fresh
+      // storage. A disabled storage always takes the full path, even when its
+      // defaultValue matches the requested store.
+      if (!this.#disabled && sameValue(store, this.getStore())) return callback(...args);
       const previous = contextGet();
-      const wasDisabled = this.#disabled;
       this.#disabled = false;
       contextSet(contextWith(previous, this, store));
       try { return callback(...args); }
-      finally { if (!wasDisabled) contextSet(previous); }
+      finally {
+        // disable() may run inside the callback. Re-entering the prior frame
+        // also re-enables this storage; otherwise a nested run would leave its
+        // outer value masked and a disabled run would leak its temporary store.
+        this.#disabled = false;
+        contextSet(previous);
+      }
     }
 
     disable() {
@@ -137,9 +260,16 @@ inline constexpr std::string_view kAsyncHooksJS = R"JS(
   class AsyncResource {
     #snapshot;
     #triggerAsyncId = 0;
+    #asyncId = 0;
+    #destroyed = false;
+    #previousContexts = [];
 
     constructor(type, options) {
-      if (typeof type !== "string") throw new TypeError('The "type" argument must be of type string');
+      if (typeof type !== "string") {
+        const error = new TypeError('The "type" argument must be of type string');
+        error.code = "ERR_INVALID_ARG_TYPE";
+        throw error;
+      }
       let triggerAsyncId = options;
       if (options != null && typeof options !== "number") triggerAsyncId = options.triggerAsyncId === undefined ? 1 : options.triggerAsyncId;
       if (options != null && (!Number.isSafeInteger(triggerAsyncId) || triggerAsyncId < -1)) {
@@ -150,26 +280,48 @@ inline constexpr std::string_view kAsyncHooksJS = R"JS(
       this.type = type;
       // node echoes the constructor's triggerAsyncId back from
       // resource.triggerAsyncId(); with no option it is the current execution
-      // async id, which is always 0 in mbun.
-      this.#triggerAsyncId = (options == null || (typeof options !== "number" && options.triggerAsyncId === undefined)) ? 0 : triggerAsyncId;
+      // async id.
+      this.#triggerAsyncId = (options == null || (typeof options !== "number" && options.triggerAsyncId === undefined)) ? executionId : triggerAsyncId;
       this.#snapshot = contextGet();
+      this.#asyncId = newAsyncId();
+      hookCall("init", this.#asyncId, type, this.#triggerAsyncId, this);
     }
 
-    emitBefore() { return true; }
-    emitAfter() { return true; }
-    asyncId() { return 0; }
+    emitBefore() {
+      this.#previousContexts.push([executionId, executionResource]);
+      executionId = this.#asyncId;
+      executionResource = this;
+      hookCall("before", this.#asyncId);
+      return true;
+    }
+    emitAfter() {
+      try { hookCall("after", this.#asyncId); }
+      finally {
+        const previous = this.#previousContexts.pop() || [0, undefined];
+        executionId = previous[0];
+        executionResource = previous[1];
+      }
+      return true;
+    }
+    asyncId() { return this.#asyncId; }
     triggerAsyncId() { return this.#triggerAsyncId; }
-    emitDestroy() {}
+    emitDestroy() {
+      if (!this.#destroyed) {
+        this.#destroyed = true;
+        hookCall("destroy", this.#asyncId);
+      }
+      return this;
+    }
     runInAsyncScope(fn, thisArg, ...args) {
-      if (typeof fn !== "function") throw new TypeError('The "fn" argument must be of type function');
-      return callInContext(this.#snapshot, fn, thisArg, args);
+      validateFunction(fn);
+      return runAsyncCallback(this.#asyncId, this, () => callInContext(this.#snapshot, fn, thisArg, args), undefined, []);
     }
     bind(fn, thisArg) {
-      if (typeof fn !== "function") throw new TypeError('The "fn" argument must be of type function');
+      validateFunction(fn);
       return this.runInAsyncScope.bind(this, fn, thisArg ?? this);
     }
     static bind(fn, type, thisArg) {
-      if (typeof fn !== "function") throw new TypeError('The "fn" argument must be of type function');
+      validateFunction(fn);
       return new AsyncResource(type || fn.name || "bound-anonymous-fn").bind(fn, thisArg);
     }
   }
@@ -180,7 +332,9 @@ inline constexpr std::string_view kAsyncHooksJS = R"JS(
   const promiseFinally = Promise.prototype.finally;
   Promise.prototype.then = function (onFulfilled, onRejected) {
     const context = contextGet();
-    return promiseThen.call(this, captureContext(onFulfilled, context), captureContext(onRejected, context));
+    return promiseThen.call(this,
+      captureAsyncCallback(onFulfilled, "PROMISE", context),
+      captureAsyncCallback(onRejected, "PROMISE", context));
   };
   Promise.prototype.catch = function (onRejected) { return this.then(undefined, onRejected); };
   Promise.prototype.finally = function (onFinally) {
@@ -191,14 +345,13 @@ inline constexpr std::string_view kAsyncHooksJS = R"JS(
     const original = owner && owner[name];
     if (typeof original !== "function") return;
     owner[name] = function (...args) {
-      args[callbackIndex] = captureContext(args[callbackIndex]);
+      const persistent = name === "setInterval" || name === "addListener" ||
+        name === "on" || name === "prependListener";
+      args[callbackIndex] = captureAsyncCallback(args[callbackIndex], name, contextGet(), !persistent);
       return Reflect.apply(original, this, args);
     };
   };
   wrapCallbackApi(G, "queueMicrotask");
-  wrapCallbackApi(G, "setTimeout");
-  wrapCallbackApi(G, "setInterval");
-  wrapCallbackApi(G, "setImmediate");
   if (G.process) wrapCallbackApi(G.process, "nextTick");
 
   // Native and JS-backed network/process objects in mbun surface callbacks via
@@ -289,18 +442,54 @@ inline constexpr std::string_view kAsyncHooksJS = R"JS(
     };
   }
 
-  let hasEnabledCreateHook = false;
   const createHook = (hook) => {
-    if (hook === null || typeof hook !== "object") throw new TypeError('The "hook" argument must be of type object');
-    for (const name of ["init", "before", "after", "destroy", "promiseResolve"]) {
-      if (hook[name] !== undefined && typeof hook[name] !== "function") throw new TypeError('The "hook.' + name + '" property must be of type function');
+    if (hook === null || typeof hook !== "object") {
+      const error = new TypeError('The "hook" argument must be of type object');
+      error.code = "ERR_INVALID_ARG_TYPE";
+      throw error;
     }
-    return { enable() { hasEnabledCreateHook = true; return this; }, disable() { return this; } };
+    for (const name of ["init", "before", "after", "destroy", "promiseResolve"]) {
+      if (hook[name] !== undefined && typeof hook[name] !== "function") {
+        const error = new TypeError('The "hook.' + name + '" property must be of type function');
+        error.code = "ERR_ASYNC_CALLBACK";
+        throw error;
+      }
+    }
+    let internalMarker;
+    const setInternalHookState = (enabled) => {
+      // internal/async_hooks.enabledHooksExist() owns a separate node-core
+      // array. Keep its observable "some hook is active" state in step with
+      // this public implementation without pretending to install native hooks.
+      try {
+        const internal = typeof G.require === "function" ? G.require("internal/async_hooks") : undefined;
+        const arrays = internal && typeof internal.getHookArrays === "function" && internal.getHookArrays();
+        if (!arrays) return;
+        const hooks = arrays[0];
+        if (enabled && internalMarker === undefined) {
+          internalMarker = {};
+          hooks.push(internalMarker);
+        } else if (!enabled && internalMarker !== undefined) {
+          const index = hooks.indexOf(internalMarker);
+          if (index >= 0) hooks.splice(index, 1);
+          internalMarker = undefined;
+        }
+      } catch { /* internal module unavailable during bootstrap */ }
+    };
+    const controller = {
+      enable() { activeHooks.add(hook); setInternalHookState(true); return this; },
+      disable() { activeHooks.delete(hook); setInternalHookState(false); return this; },
+    };
+    hookControllers.set(hook, controller);
+    return controller;
   };
   const asyncHooksModule = {
     AsyncLocalStorage, AsyncResource, createHook,
-    executionAsyncId: () => 0, triggerAsyncId: () => 0,
-    executionAsyncResource: () => G.process && G.process.stdin,
+    executionAsyncId: () => executionId,
+    triggerAsyncId: () => executionResource &&
+      typeof executionResource.triggerAsyncId === "function"
+      ? executionResource.triggerAsyncId()
+      : (executionResource && executionResource.triggerAsyncId) || 0,
+    executionAsyncResource: () => executionResource,
   };
   def(["async_hooks"], asyncHooksModule);
 )JS";

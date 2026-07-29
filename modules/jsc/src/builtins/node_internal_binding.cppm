@@ -418,15 +418,33 @@ inline constexpr std::string_view kNodeInternalBindingJS = R"JS(
   });
 
   // -------------------------------------------------------- trace_events ----
-  // This runtime emits no trace events; the category set is always disabled,
-  // which is what node reports when built without tracing.
-  factories["trace_events"] = () => ({
-    CategorySet: class CategorySet { constructor() {} enable() {} disable() {} },
-    getCategoryEnabledBuffer: () => new Uint8Array(1),
-    isTraceCategoryEnabled: () => false,
-    setTraceCategoryStateUpdateHandler() {},
-    trace() {},
-  });
+  // Shared with node:trace_events: the process-extra partition owns category
+  // state and the trace-file sink, while this binding exposes Node's native
+  // looking hooks to internal users.
+  factories["trace_events"] = () => {
+    const trace = G.__mbunTraceEvents;
+    if (trace) return {
+      CategorySet: class CategorySet {
+        constructor(categories) {
+          this.categories = Array.isArray(categories) ? categories : String(categories || "").split(",").filter(Boolean);
+          this.enabled = false;
+        }
+        enable() { if (!this.enabled) { this.enabled = true; trace.enableCategories(this.categories); } }
+        disable() { if (this.enabled) { this.enabled = false; trace.disableCategories(this.categories); } }
+      },
+      getCategoryEnabledBuffer: trace.getCategoryEnabledBuffer,
+      isTraceCategoryEnabled: trace.isTraceCategoryEnabled,
+      setTraceCategoryStateUpdateHandler: trace.setTraceCategoryStateUpdateHandler,
+      trace: trace.trace,
+    };
+    return {
+      CategorySet: class CategorySet { constructor() {} enable() {} disable() {} },
+      getCategoryEnabledBuffer: () => new Uint8Array(1),
+      isTraceCategoryEnabled: () => false,
+      setTraceCategoryStateUpdateHandler() {},
+      trace() {},
+    };
+  };
 
   // ------------------------------------------------ async_context_frame ----
   factories["async_context_frame"] = () => {
@@ -788,7 +806,13 @@ inline constexpr std::string_view kNodeInternalBindingJS = R"JS(
       getFreeMem: () => os.freemem(),
       getCPUs: () => os.cpus(),
       getInterfaceAddresses: () => os.networkInterfaces(),
-      getHomeDirectory: () => os.homedir(),
+      // Keep this on the native source rather than public os.homedir(): the
+      // latter calls this binding so tests can replace it with a failing native
+      // operation and observe node's SystemError context.
+      getHomeDirectory: () => {
+        const ON = G.__mbunOsNative;
+        return ON && typeof ON.homedir === "function" ? ON.homedir() : os.homedir();
+      },
       getUserInfo: (opts) => os.userInfo(opts),
       setPriority: (pid, prio) => { os.setPriority(pid, prio); return 0; },
       getPriority: (pid) => os.getPriority(pid),
@@ -1109,7 +1133,25 @@ inline constexpr std::string_view kNodeInternalBindingJS = R"JS(
   factories["icu"] = () => ({
     icuErrName: (n) => "U_ERROR_" + n,
     transcode: (...args) => mod("buffer").transcode(...args),
-    getStringWidth: (s) => String(s).length,
+    getStringWidth: (value) => {
+      const text = String(value).replace(/\u001b(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007]*(?:\u0007|\u001b\\))/g, "");
+      let width = 0;
+      for (const char of text) {
+        const cp = char.codePointAt(0);
+        if (cp === 0 || cp < 0x20 || (cp >= 0x7f && cp < 0xa0) || cp === 0x200d ||
+            cp === 0x200e || cp === 0x200f || (cp >= 0x300 && cp <= 0x36f) ||
+            (cp >= 0x1ab0 && cp <= 0x1aff) || (cp >= 0x1dc0 && cp <= 0x1dff) ||
+            (cp >= 0x20d0 && cp <= 0x20ff) || (cp >= 0xfe00 && cp <= 0xfe0f)) continue;
+        const wide = (cp >= 0x1100 && (cp <= 0x115f || cp === 0x2329 || cp === 0x232a ||
+          (cp >= 0x2e80 && cp <= 0xa4cf) || (cp >= 0xac00 && cp <= 0xd7a3) ||
+          (cp >= 0xf900 && cp <= 0xfaff) || (cp >= 0xfe10 && cp <= 0xfe19) ||
+          (cp >= 0xfe30 && cp <= 0xfe6f) || (cp >= 0xff00 && cp <= 0xff60) ||
+          (cp >= 0xffe0 && cp <= 0xffe6) || (cp >= 0x1f000 && cp <= 0x1faff) ||
+          (cp >= 0x20000 && cp <= 0x3fffd)));
+        width += wide ? 2 : 1;
+      }
+      return width;
+    },
     toASCII: (s) => s,
     toUnicode: (s) => s,
     hasConverter: () => false,
@@ -1359,7 +1401,16 @@ inline constexpr std::string_view kNodeInternalBindingJS = R"JS(
           const b = mod("buffer").Buffer.from(String(data), "utf8");
           return FDN().write(pathOrFd, b, 0, b.byteLength, -1);
         }
-        FSN().writeFile(String(pathOrFd), String(data));
+        const fd = FDN().open(String(pathOrFd), flags || "w", mode == null ? 0o666 : mode);
+        try {
+          const b = mod("buffer").Buffer.from(String(data), "utf8");
+          let offset = 0;
+          while (offset < b.byteLength) {
+            const written = FDN().write(fd, b, offset, b.byteLength - offset, -1);
+            if (!(written > 0)) break;
+            offset += written;
+          }
+        } finally { FDN().close(fd); }
         return undefined;
       },
       readFileUtf8: (pathOrFd, flags) => {

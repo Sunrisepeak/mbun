@@ -176,10 +176,11 @@ inline constexpr std::string_view kNodeStreamCoreJS = R"JS(
   const $inheritsWritableStream = (o) => typeof G.WritableStream === "function" && o instanceof G.WritableStream;
   const $inheritsTransformStream = (o) => typeof G.TransformStream === "function" && o instanceof G.TransformStream;
   const $inheritsBlob = (o) => typeof G.Blob === "function" && o instanceof G.Blob;
-  // eos()'s AsyncResource binding is an optimization keyed on there being an
-  // active async context; mbun has no $asyncContext internal field, so report
-  // "no context" (callback simply is not AsyncResource-wrapped).
-  const __hasAsyncContext = () => false;
+  // eos()'s AsyncResource binding is keyed on either an active ALS frame or an
+  // enabled async hook. async_hooks owns both states and exposes this small
+  // probe without adding a native stream seam.
+  const __hasAsyncContext = () => typeof G.__mbunHasAsyncContext === "function" &&
+    G.__mbunHasAsyncContext();
   // Only reached for a web stream lacking kIsClosedPromise. bun reads the
   // stream's internal closed promise; approximate with the reader's.
   // node's `stream[kIsClosedPromise].promise` — a per-stream promise that
@@ -288,7 +289,7 @@ inline constexpr std::string_view kNodeStreamCoreJS = R"JS(
     module.exports = {
       once, kEmptyObject,
       kAutoDestroyed: Symbol("kAutoDestroyed"),
-      kResistStopPropagation: Symbol("kResistStopPropagation"),
+      kResistStopPropagation: Symbol.for("nodejs.event_target.resist_stop_propagation"),
       kWeakHandler: Symbol("kWeak"),
     };
   };

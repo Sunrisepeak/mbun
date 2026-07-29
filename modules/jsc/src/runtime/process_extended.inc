@@ -317,6 +317,146 @@ JSValueRef proc_ids_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t,
     return r;
 }
 
+// Current-process credential mutations backing process.set{e,}{u,g}id(),
+// setgroups(), and initgroups().  Keep name resolution and the POSIX syscall
+// together: JavaScript validates the public Node argument contract, while this
+// seam reports either the libc errno or which passwd/group lookup failed.
+JSObjectRef proc_credential_result(JSContextRef ctx, int err = 0,
+                                   const char* unknown_kind = nullptr,
+                                   const std::string& unknown_name = {}) {
+    JSObjectRef result{JSObjectMake(ctx, nullptr, nullptr)};
+    set_prop(ctx, result, "errno", JSValueMakeNumber(ctx, err));
+    if (unknown_kind != nullptr) {
+        set_prop(ctx, result, "unknownKind", make_string(ctx, unknown_kind));
+        set_prop(ctx, result, "unknownName", make_string(ctx, unknown_name));
+    }
+    return result;
+}
+
+bool proc_credential_uid(JSContextRef ctx, JSValueRef value, uid_t& out,
+                         std::string& missing) {
+    if (JSValueIsString(ctx, value)) {
+        const std::string name{val_to_string(ctx, value)};
+        if (struct passwd* pw{getpwnam(name.c_str())}; pw != nullptr) {
+            out = pw->pw_uid;
+            return true;
+        }
+        missing = name;
+        return false;
+    }
+    const double raw{JSValueToNumber(ctx, value, nullptr)};
+    if (!std::isfinite(raw) || raw < 0 || raw > static_cast<double>(std::numeric_limits<uid_t>::max())) {
+        errno = EINVAL;
+        return false;
+    }
+    out = static_cast<uid_t>(raw);
+    return true;
+}
+
+bool proc_credential_gid(JSContextRef ctx, JSValueRef value, gid_t& out,
+                         std::string& missing) {
+    if (JSValueIsString(ctx, value)) {
+        const std::string name{val_to_string(ctx, value)};
+        if (struct group* gr{getgrnam(name.c_str())}; gr != nullptr) {
+            out = gr->gr_gid;
+            return true;
+        }
+        missing = name;
+        return false;
+    }
+    const double raw{JSValueToNumber(ctx, value, nullptr)};
+    if (!std::isfinite(raw) || raw < 0 || raw > static_cast<double>(std::numeric_limits<gid_t>::max())) {
+        errno = EINVAL;
+        return false;
+    }
+    out = static_cast<gid_t>(raw);
+    return true;
+}
+
+JSValueRef proc_set_credential_cb(JSContextRef ctx, JSObjectRef, JSObjectRef,
+                                  std::size_t argc, const JSValueRef args[], JSValueRef*) {
+    const int which{argc > 0 ? static_cast<int>(JSValueToNumber(ctx, args[0], nullptr)) : -1};
+    const JSValueRef value{argc > 1 ? args[1] : JSValueMakeUndefined(ctx)};
+    std::string missing;
+    if (which == 0 || which == 1) {
+        uid_t id{};
+        if (!proc_credential_uid(ctx, value, id, missing)) {
+            return proc_credential_result(ctx, missing.empty() ? errno : 0,
+                                          missing.empty() ? nullptr : "user", missing);
+        }
+        const int rc{which == 0 ? setuid(id) : seteuid(id)};
+        return proc_credential_result(ctx, rc == 0 ? 0 : errno);
+    }
+    if (which == 2 || which == 3) {
+        gid_t id{};
+        if (!proc_credential_gid(ctx, value, id, missing)) {
+            return proc_credential_result(ctx, missing.empty() ? errno : 0,
+                                          missing.empty() ? nullptr : "group", missing);
+        }
+        const int rc{which == 2 ? setgid(id) : setegid(id)};
+        return proc_credential_result(ctx, rc == 0 ? 0 : errno);
+    }
+    return proc_credential_result(ctx, EINVAL);
+}
+
+JSValueRef proc_setgroups_cb(JSContextRef ctx, JSObjectRef, JSObjectRef,
+                             std::size_t argc, const JSValueRef args[], JSValueRef*) {
+    JSObjectRef groups{argc > 0 ? JSValueToObject(ctx, args[0], nullptr) : nullptr};
+    if (groups == nullptr) return proc_credential_result(ctx, EINVAL);
+    const std::size_t size{static_cast<std::size_t>(JSValueToNumber(ctx, get_prop(ctx, groups, "length"), nullptr))};
+    std::vector<gid_t> ids;
+    ids.reserve(size);
+    for (std::size_t i{}; i < size; ++i) {
+        std::string missing;
+        gid_t id{};
+        if (!proc_credential_gid(ctx, JSObjectGetPropertyAtIndex(ctx, groups, static_cast<unsigned>(i), nullptr), id, missing)) {
+            return proc_credential_result(ctx, missing.empty() ? errno : 0,
+                                          missing.empty() ? nullptr : "group", missing);
+        }
+        ids.push_back(id);
+    }
+    const int rc{setgroups(ids.size(), ids.data())};
+    return proc_credential_result(ctx, rc == 0 ? 0 : errno);
+}
+
+JSValueRef proc_initgroups_cb(JSContextRef ctx, JSObjectRef, JSObjectRef,
+                              std::size_t argc, const JSValueRef args[], JSValueRef*) {
+    const JSValueRef user{argc > 0 ? args[0] : JSValueMakeUndefined(ctx)};
+    const JSValueRef group_value{argc > 1 ? args[1] : JSValueMakeUndefined(ctx)};
+    // Node resolves the supplementary/extra group before the user; preserve
+    // that observable error order when both names are unknown.
+    std::string group_missing;
+    gid_t group{};
+    if (!proc_credential_gid(ctx, group_value, group, group_missing)) {
+        return proc_credential_result(ctx, group_missing.empty() ? errno : 0,
+                                      group_missing.empty() ? nullptr : "group", group_missing);
+    }
+    std::string user_missing;
+    uid_t uid{};
+    if (!proc_credential_uid(ctx, user, uid, user_missing)) {
+        return proc_credential_result(ctx, user_missing.empty() ? errno : 0,
+                                      user_missing.empty() ? nullptr : "user", user_missing);
+    }
+    struct passwd* pw{getpwuid(uid)};
+    if (pw == nullptr || pw->pw_name == nullptr) {
+        return proc_credential_result(ctx, 0, "user", val_to_string(ctx, user));
+    }
+    const int rc{initgroups(pw->pw_name, group)};
+    return proc_credential_result(ctx, rc == 0 ? 0 : errno);
+}
+
+JSValueRef proc_groups_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t,
+                          const JSValueRef[], JSValueRef*) {
+    const int count{getgroups(0, nullptr)};
+    if (count < 0) return JSObjectMakeArray(ctx, 0, nullptr, nullptr);
+    std::vector<gid_t> groups(static_cast<std::size_t>(count));
+    if (count > 0 && getgroups(count, groups.data()) < 0) return JSObjectMakeArray(ctx, 0, nullptr, nullptr);
+    std::vector<JSValueRef> values;
+    values.reserve(groups.size());
+    for (const gid_t group : groups) values.push_back(JSValueMakeNumber(ctx, static_cast<double>(group)));
+    return JSObjectMakeArray(ctx, values.size(), values.data(), nullptr);
+}
+
 // ── proc.spawnPty: fork a child under a fresh pseudo-terminal (Bun.spawn's
 // `terminal` option / Bun.Terminal). Returns { pid, master, write } — `master`
 // is the read end of the pty master, `write` a dup of it for the terminal.write

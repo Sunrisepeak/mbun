@@ -36,6 +36,9 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
     if (typeof G.EventTarget !== "function") {
       const kStopImmediate = Symbol("kStopImmediate");
       const kCancelBubble = Symbol("kCancelBubble");
+      // Kept in the global symbol registry because the Node-facing `events`
+      // and stream partitions are installed in separate builtin payloads.
+      const kResistStopPropagation = Symbol.for("nodejs.event_target.resist_stop_propagation");
       const isTrustedGet = function isTrusted() { return false; };
       class Event {
         get [Symbol.toStringTag]() { return "Event"; }
@@ -103,7 +106,7 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
           let list = this[kListeners].get(type);
           if (!list) { list = []; this[kListeners].set(type, list); }
           for (const l of list) if (l.callback === callback && l.capture === capture) return;
-          const rec = { callback, capture, once: !!options.once, passive: !!options.passive, removed: false };
+          const rec = { callback, capture, once: !!options.once, passive: !!options.passive, resistStopPropagation: !!options[kResistStopPropagation], removed: false };
           if (options.signal !== undefined) {
             // WebIDL: `signal` is an AbortSignal, so anything else (including
             // null and a bare object with the right shape) is a TypeError.
@@ -119,7 +122,7 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
             const onAbort = () => target.removeEventListener(type, callback, { capture });
             rec.signal = options.signal;
             rec.onAbort = onAbort;
-            options.signal.addEventListener("abort", onAbort, { once: true });
+            options.signal.addEventListener("abort", onAbort, { once: true, [kResistStopPropagation]: true });
           }
           list.push(rec);
         }
@@ -154,7 +157,10 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
           const list = this[kListeners].get(event.type);
           if (list) {
             for (const rec of list.slice()) {
-              if (event[kStopImmediate]) break;
+              // `events.addAbortListener()` and `events.once(..., { signal })`
+              // register protected cleanup listeners. An ordinary listener may
+              // stop its peers, but it must not suppress those abort handlers.
+              if (event[kStopImmediate] && !rec.resistStopPropagation) continue;
               if (rec.removed) continue;
               if (rec.once) this.removeEventListener(event.type, rec.callback, { capture: rec.capture });
               try {
@@ -327,6 +333,7 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
     try {
       if (proc.env && typeof proc.env === "object" && !proc.env.__mbunEnvProxy) {
         const backing = proc.env;
+        let envNonScalarWarningEmitted = false;
         const invalidDefine = (msg) => {
           const e = new TypeError(msg);
           e.code = "ERR_INVALID_OBJECT_DEFINE_PROPERTY";
@@ -343,6 +350,15 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
             if (PN && typeof PN.setTimeZone === "function") PN.setTimeZone(value);
           } catch (e) {}
         };
+        const warnNonScalarEnvValue = () => {
+          if (envNonScalarWarningEmitted || !Array.isArray(proc.execArgv) ||
+              !proc.execArgv.includes("--pending-deprecation")) return;
+          envNonScalarWarningEmitted = true;
+          proc.emitWarning(
+            "Assigning any value other than a string, number, or boolean to a process.env property is deprecated. " +
+            "Please make sure to convert the value to a string before setting process.env with it.",
+            "DeprecationWarning", "DEP0104");
+        };
         const envProxy = new Proxy(backing, {
           set(target, key, value) {
             if (typeof key === "symbol") throw new TypeError("Cannot convert a Symbol value to a string");
@@ -350,6 +366,8 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
             const k = String(key);
             // node ignores an empty variable name (test-process-env).
             if (k === "") return true;
+            if (typeof value !== "string" && typeof value !== "number" && typeof value !== "boolean")
+              warnNonScalarEnvValue();
             target[k] = String(value);
             if (k === "TZ") applyTZ(target[k]);
             return true;
@@ -450,6 +468,36 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
         const system = Math.floor(nowUs / 4);
         if (prevValue !== undefined) return { user: user - prevValue.user, system: system - prevValue.system };
         return { user, system };
+      };
+
+      proc.threadCpuUsage = function threadCpuUsage(prevValue) {
+        if (prevValue !== undefined) {
+          if (prevValue === null || typeof prevValue !== "object" || Array.isArray(prevValue))
+            throw errInvalidArgType("prevValue", "object", prevValue);
+          if (typeof prevValue.user !== "number")
+            throw errInvalidArgType("prevValue.user", "number", prevValue.user);
+          if (!Number.isFinite(prevValue.user) || prevValue.user < 0)
+            throw errInvalidProp("prevValue.user", prevValue.user);
+          if (typeof prevValue.system !== "number")
+            throw errInvalidArgType("prevValue.system", "number", prevValue.system);
+          if (!Number.isFinite(prevValue.system) || prevValue.system < 0)
+            throw errInvalidProp("prevValue.system", prevValue.system);
+        }
+        const nowUs = G.performance.now() * 1000;
+        const user = Math.max(1, Math.floor(nowUs));
+        const system = Math.floor(nowUs / 4);
+        if (prevValue !== undefined)
+          return { user: Math.max(0, user - prevValue.user), system: Math.max(0, system - prevValue.system) };
+        return { user, system };
+      };
+
+      proc.availableMemory = function availableMemory() {
+        try {
+          const os = G.require && G.require("node:os");
+          return os && typeof os.freemem === "function" ? Number(os.freemem()) : 0;
+        } catch (e) {
+          return 0;
+        }
       };
     }
 
@@ -878,6 +926,188 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
         traced.__mbunTraceExit = true;
         proc.exit = traced;
       }
+
+      // ---- trace_events shared state and JSON sink -------------------------
+      // The engine has no native Chrome tracing backend, but node's public API,
+      // internal binding, and command-line writer all share one category state.
+      // Keeping it here (after process and fs are live) also makes tracing work
+      // when user code never explicitly requires `trace_events`.
+      const traceEvents = (() => {
+        const argv = Array.isArray(proc.execArgv) ? proc.execArgv : [];
+        const initial = [];
+        const dynamic = new Map();
+        const buffers = new Map();
+        const handlers = new Set();
+        const events = [];
+        const activeTracings = new Set();
+        let writesTrace = false;
+        let flushed = false;
+        let pattern;
+        let sawCategories = false;
+        let sawTraceFlag = false;
+        let initialTitle;
+
+        const flagValue = (name) => {
+          for (let i = 0; i < argv.length; i++) {
+            const arg = argv[i];
+            if (arg === name) return i + 1 < argv.length ? argv[i + 1] : "";
+            if (typeof arg === "string" && arg.startsWith(name + "=")) return arg.slice(name.length + 1);
+          }
+          return undefined;
+        };
+        initialTitle = flagValue("--title") || proc.title || "node";
+        const categoriesOf = (value) => {
+          if (value === undefined || value === null || value === '""') return [];
+          return String(value).split(",").map((v) => v.trim()).filter(Boolean);
+        };
+        for (const arg of argv) if (arg === "--trace-events-enabled" ||
+                                    (typeof arg === "string" && arg.startsWith("--trace-events-enabled=")))
+          sawTraceFlag = true;
+        const cliCategories = flagValue("--trace-event-categories");
+        if (cliCategories !== undefined) {
+          sawCategories = true;
+          initial.push(...categoriesOf(cliCategories));
+        } else if (sawTraceFlag) {
+          initial.push("v8", "node", "node.async_hooks");
+        }
+        pattern = flagValue("--trace-event-file-pattern");
+        writesTrace = sawTraceFlag || sawCategories;
+
+        const enabledNames = () => {
+          const out = initial.slice();
+          for (const [name, count] of dynamic) if (count > 0 && !out.includes(name)) out.push(name);
+          return out;
+        };
+        const enabled = (name) => enabledNames().includes(name);
+        const updateBuffers = () => {
+          for (const [name, buffer] of buffers) buffer[0] = enabled(name) ? 1 : 0;
+          for (const handler of handlers) { try { handler(); } catch (e) {} }
+        };
+        const getEnabledCategories = () => {
+          const names = enabledNames();
+          return names.length ? names.join(",") : undefined;
+        };
+        const categoryBuffer = (name) => {
+          name = String(name);
+          let buffer = buffers.get(name);
+          if (!buffer) { buffer = new Uint8Array(1); buffers.set(name, buffer); }
+          buffer[0] = enabled(name) ? 1 : 0;
+          return buffer;
+        };
+        const changeCategories = (categories, delta) => {
+          for (const category of categories) {
+            const count = (dynamic.get(category) || 0) + delta;
+            if (count > 0) dynamic.set(category, count); else dynamic.delete(category);
+          }
+          if (delta > 0) writesTrace = true;
+          updateBuffers();
+        };
+        const record = (event) => {
+          events.push(Object.assign({ pid: proc.pid || 0, tid: 1, ts: Date.now() * 1000 }, event));
+        };
+        const trace = (phase, category, name, id, data) => {
+          category = String(category);
+          if (!enabled(category)) return;
+          const event = {
+            ph: typeof phase === "number" ? String.fromCharCode(phase) : String(phase),
+            cat: category,
+            name: String(name),
+            args: data === undefined ? {} : { data },
+          };
+          if (id !== undefined && id !== null) {
+            const n = Number(id);
+            event.id = Number.isFinite(n) ? "0x" + n.toString(16) : String(id);
+          }
+          record(event);
+        };
+        const invalidArg = () => {
+          const error = new TypeError('The "options" argument must be of type object.');
+          error.code = "ERR_INVALID_ARG_TYPE";
+          return error;
+        };
+        const createTracing = (options) => {
+          if (options === null || typeof options !== "object" || Array.isArray(options)) throw invalidArg();
+          if (!Array.isArray(options.categories)) throw invalidArg();
+          if (options.categories.length === 0) {
+            const error = new TypeError("At least one category is required");
+            error.code = "ERR_TRACE_EVENTS_CATEGORY_REQUIRED";
+            throw error;
+          }
+          if (!options.categories.every((category) => typeof category === "string")) throw invalidArg();
+          const categories = options.categories.slice();
+          let active = false;
+          const tracing = {
+            get categories() { return categories.join(","); },
+            get enabled() { return active; },
+            enable() {
+              if (active) return;
+              active = true;
+              activeTracings.add(tracing);
+              changeCategories(categories, 1);
+              if (activeTracings.size > 10 && typeof proc.emitWarning === "function") {
+                proc.emitWarning("Possible trace_events memory leak detected. There are more than 10 enabled Tracing objects.");
+              }
+            },
+            disable() {
+              if (!active) return;
+              active = false;
+              activeTracings.delete(tracing);
+              changeCategories(categories, -1);
+            },
+          };
+          return tracing;
+        };
+        const metadata = () => {
+          const processInfo = {
+            versions: proc.versions || {}, arch: proc.arch, platform: proc.platform,
+            release: proc.release || {},
+          };
+          const title = proc.title || "node";
+          const rows = [
+            { name: "thread_name", args: { name: "JavaScriptMainThread" } },
+            { name: "thread_name", args: { name: "PlatformWorkerThread" } },
+            { name: "version", args: { node: (proc.versions || {}).node } },
+            { name: "node", args: { process: processInfo } },
+            { name: "process_name", args: { name: initialTitle } },
+          ];
+          if (title !== initialTitle) rows.push({ name: "process_name", args: { name: title } });
+          return rows.map((row) => Object.assign({ pid: proc.pid || 0, tid: 1, ts: Date.now() * 1000,
+                                                     ph: "M", cat: "__metadata" }, row));
+        };
+        const flush = () => {
+          if (flushed || !writesTrace) return;
+          flushed = true;
+          const file = String(pattern || "node_trace.${rotation}.log")
+            .replace(/\$\{pid\}/g, String(proc.pid || 0))
+            .replace(/\$\{rotation\}/g, "1");
+          try {
+            const fs = G.__mbunNativeModules && (G.__mbunNativeModules["fs"] || G.__mbunNativeModules["node:fs"]);
+            if (fs && typeof fs.writeFileSync === "function") fs.writeFileSync(file, JSON.stringify({ traceEvents: metadata().concat(events) }));
+          } catch (e) {}
+        };
+        return {
+          createTracing, getEnabledCategories, getCategoryEnabledBuffer: categoryBuffer,
+          isTraceCategoryEnabled: enabled,
+          enableCategories: (categories) => changeCategories(categories, 1),
+          disableCategories: (categories) => changeCategories(categories, -1),
+          setTraceCategoryStateUpdateHandler: (handler) => { if (typeof handler === "function") handlers.add(handler); },
+          trace, flush,
+        };
+      })();
+      Object.defineProperty(G, "__mbunTraceEvents", { value: traceEvents, configurable: true });
+      const traceModule = {
+        createTracing: traceEvents.createTracing,
+        getEnabledCategories: traceEvents.getEnabledCategories,
+      };
+      const modules = G.__mbunNativeModules;
+      if (modules) modules["trace_events"] = modules["node:trace_events"] = traceModule;
+      if (typeof proc.on === "function") proc.on("exit", traceEvents.flush);
+      if (typeof proc.exit === "function" && !proc.exit.__mbunTraceEvents) {
+        const nativeExit = proc.exit;
+        const tracedExit = function exit(code) { traceEvents.flush(); return nativeExit.call(this, code); };
+        tracedExit.__mbunTraceEvents = true;
+        proc.exit = tracedExit;
+      }
     } catch (e) {}
 
     // ---- process.allowedNodeEnvironmentFlags --------------------------------
@@ -1014,6 +1244,21 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
         proc[name] = fn;
       }
     }
+
+    // ---- process.ref / process.unref ---------------------------------------
+    // Node first recognizes the symbol protocol, then falls back to the legacy
+    // ref()/unref() methods used by timers and handles.
+    const installRefMethod = (name) => {
+      const symbol = Symbol.for("nodejs." + name);
+      proc[name] = function (resource) {
+        const method = resource != null &&
+          (typeof resource[symbol] === "function" ? resource[symbol] : resource[name]);
+        if (typeof method === "function") method.call(resource);
+      };
+    };
+    installRefMethod("ref");
+    installRefMethod("unref");
+
     if (!Array.isArray(proc.moduleLoadList)) proc.moduleLoadList = [];
     if (!Array.isArray(proc._preload_modules)) proc._preload_modules = [];
 
@@ -1262,7 +1507,13 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
           get() {
             const argv = (G.process && G.process.execArgv) || [];
             for (const a of argv) {
-              if (a === "--expose-gc" || (typeof a === "string" && a.startsWith("--expose-gc="))) {
+              // V8 accepts both spellings and Node's own corpus uses the
+              // underscore form in `// Flags:` headers.  execArgv deliberately
+              // preserves the spelling it was given, so recognize both here
+              // without exposing gc for an unrelated flag.
+              if (a === "--expose-gc" || a === "--expose_gc" ||
+                  (typeof a === "string" &&
+                    (a.startsWith("--expose-gc=") || a.startsWith("--expose_gc=")))) {
                 return collect;
               }
             }

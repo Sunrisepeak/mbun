@@ -142,7 +142,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     if (t === "object") return "an instance of " + ((v.constructor && v.constructor.name) || "Object");
     return "type " + t + " (" + String(v) + ")";
   };
-  const makeIpc = (fd, advanced) => { PROC.setNonBlock(fd); return { fd, buf: "", out: [], queued: 0, closed: false, refd: true, rxFds: [], sent: [], adv: !!advanced }; };
+  const makeIpc = (fd, advanced) => { PROC.setNonBlock(fd); return { fd, buf: Buffer.alloc(0), out: [], queued: 0, pendingAfterHandle: 0, closed: false, refd: true, rxFds: [], sent: [], adv: !!advanced }; };
   // ---- 'advanced' (structured-clone) serialization ------------------------
   // node's `serialization: 'advanced'` swaps JSON for the v8 value serializer,
   // so a message may be cyclic, a Map/Set, a BigInt or a Buffer
@@ -186,16 +186,21 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       }
       if (w === 0) return;  // EAGAIN — retry next tick
       item.off += w; ch.queued -= w;
-      if (item.off >= item.data.length) { ch.out.shift(); if (item.cb) { const cb = item.cb; nextTick(() => cb(null)); } }
+      if (item.off >= item.data.length) { ch.out.shift(); if (item.cb) { const cb = item.cb; nextTick(() => { ch.pendingAfterHandle = 0; cb(null); }); } }
       else return;
     }
   };
   const ipcWrite = (ch, message, cb, sendFd) => {
     const data = te.encode((ch.adv ? advEncode(message) : JSON.stringify(message === undefined ? null : message)) + "\n");
+    // A sent handle remains unacknowledged until the peer processes its
+    // NODE_HANDLE frame. Node reports queue pressure for messages stacked
+    // behind that handle even when the kernel socket buffer still accepts them.
+    const followsHandle = sendFd < 0 && ch.sent.length > 0;
+    if (followsHandle) ch.pendingAfterHandle++;
     ch.out.push({ data, off: 0, cb: cb || null, fd: typeof sendFd === "number" ? sendFd : -1 });
     ch.queued += data.length;
     ipcFlush(ch);
-    return ch.queued < IPC_HIGH_WATER;
+    return ch.queued < IPC_HIGH_WATER && (!followsHandle || ch.pendingAfterHandle < 2);
   };
   // ---- node's NODE_HANDLE protocol ----------------------------------------
   // A message sent with a `handle` argument travels as
@@ -287,11 +292,14 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
         if (b === null) { if (delivered) { ch.deferEof = true; return; } onEof(); return; }
       }
       if (b === "") return;
-      ch.buf += Buffer.from(_unb64(b)).toString("utf8");
+      // A readNB chunk is not a Unicode boundary. Keep bytes until a complete
+      // newline-delimited frame is available so an UTF-8 sequence split across
+      // two reads is decoded once, rather than becoming two replacement chars.
+      ch.buf = Buffer.concat([ch.buf, Buffer.from(_unb64(b))]);
       let idx;
-      while ((idx = ch.buf.indexOf("\n")) >= 0) {
-        const line = ch.buf.slice(0, idx);
-        ch.buf = ch.buf.slice(idx + 1);
+      while ((idx = ch.buf.indexOf(0x0A)) >= 0) {
+        const line = ch.buf.subarray(0, idx).toString("utf8");
+        ch.buf = ch.buf.subarray(idx + 1);
         if (!line) continue;
         let msg;
         try { msg = ch.adv ? advDecode(line) : JSON.parse(line); } catch (e) { continue; }
@@ -489,7 +497,8 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
 
   const makeStdin = (fd, rec) => {
     const w = new Writable();
-    w.writable = true; w.destroyed = false;
+    // Child stdin is write-only from the parent's point of view.
+    w.readable = false; w.writable = true; w.destroyed = false;
     w.write = (chunk, enc, cb) => {
       if (typeof enc === "function") { cb = enc; enc = null; }
       if (w.destroyed || rec.stdinEnded) {
@@ -563,22 +572,34 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     spawn(options) {
       // node child_process.ts:1346-1396 validators (ERR_INVALID_ARG_TYPE).
       if (options === null || typeof options !== "object") { const e = new TypeError('The "options" argument must be of type object. Received ' + recvDesc(options)); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
-      if (typeof options.file !== "string") { const e = new TypeError('The "options.file" property must be of type string. Received ' + recvDesc(options.file)); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
+      options = ownOptions(options);
       if (options.args !== undefined && !Array.isArray(options.args)) { const e = new TypeError('The "options.args" property must be an instance of Array. Received ' + recvDesc(options.args)); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
-      const __hasIpc = Array.isArray(options.stdio) && options.stdio.includes("ipc");
+      const stdio = normStdio(options.stdio);
+      const __hasIpc = stdio.includes("ipc");
       if (__hasIpc && options.envPairs !== undefined && !Array.isArray(options.envPairs)) { const e = new TypeError('The "options.envPairs" property must be an instance of Array. Received ' + recvDesc(options.envPairs)); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
+      if (stdio.filter((slot) => slot === "ipc").length > 1) { const e = new Error("Child process can have only one IPC pipe"); e.code = "ERR_IPC_ONE_PIPE"; throw e; }
+      if (typeof options.file !== "string") { const e = new TypeError('The "options.file" property must be of type string. Received ' + recvDesc(options.file)); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
       const file = toStr(options.file != null ? options.file : options.execPath);
       let args = options.args && options.args.length ? options.args.map(toStr) : [file];
       if (options.argv0 != null) args[0] = toStr(options.argv0);
       this.spawnfile = file; this.spawnargs = args;
-      const stdio = normStdio(options.stdio);
       const ipcIndex = stdio.indexOf("ipc");
-      const sopts = { stdio };
+      const sopts = Object.create(null);
+      sopts.stdio = stdio;
       if (options.cwd != null) sopts.cwd = toStr(options.cwd);
       // node inherits process.env when env is unset (undefined/null); an explicit
       // {} means an empty environment. Snapshot process.env so the child sees the
       // JS-visible env (harness-injected vars), not just the raw OS environ.
       const baseEnv = options.env && typeof options.env === "object" ? options.env : (G.process && G.process.env) || {};
+      // Node's envPairs loop observes inherited enumerable keys, drops undefined,
+      // and stringifies null rather than treating it as an omitted entry. Pass a
+      // plain snapshot across the native boundary so both ordinary children and
+      // IPC children get the same environment.
+      const childEnv = {};
+      for (const key in baseEnv) {
+        const value = baseEnv[key];
+        if (value !== undefined) childEnv[key] = String(value);
+      }
       if (ipcIndex >= 0) {
         // node advertises the child's end of the channel through NODE_CHANNEL_FD
         // (lib/internal/child_process.js spawn()); the fd number is the slot index.
@@ -586,12 +607,12 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
         // NODE_CHANNEL_SERIALIZATION_MODE, so the child frames its half
         // identically without being told twice.
         const e = {};
-        for (const k of Object.keys(baseEnv)) e[k] = baseEnv[k];
+        for (const k of Object.keys(childEnv)) e[k] = childEnv[k];
         e.NODE_CHANNEL_FD = String(ipcIndex);
         e.NODE_CHANNEL_SERIALIZATION_MODE = options.serialization === "advanced" ? "advanced" : "json";
         sopts.env = e;
       } else {
-        sopts.env = baseEnv;
+        sopts.env = childEnv;
       }
       if (options.detached) sopts.detached = true;
       if (typeof options.uid === "number") sopts.uid = options.uid;
@@ -605,7 +626,24 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       if (h.errno != null) {
         const code = ERRNO[h.errno] || ("errno " + h.errno);
         const err = new Error("spawn " + file + " " + code);
-        err.errno = -1; err.code = code; err.path = file; err.spawnargs = args.slice(1);
+        err.errno = uvErrno(code, -2); err.code = code; err.path = file; err.spawnargs = args.slice(1);
+        // A failed async spawn still exposes the requested stdout/stderr pipe
+        // objects. Consumers commonly install their stream handlers before the
+        // deferred ENOENT error arrives (including spawn({ cwd: missing })).
+        // They are empty, already-ending readables rather than null slots.
+        const failedStdio = [];
+        for (let i = 0; i < stdio.length; i++) {
+          if (i > 0 && stdio[i] === "pipe") {
+            const stream = makeReadable();
+            failedStdio[i] = stream;
+            if (i === 1) this.stdout = stream;
+            else if (i === 2) this.stderr = stream;
+            nextTick(() => stream.__end());
+          } else {
+            failedStdio[i] = null;
+          }
+        }
+        this.stdio = failedStdio;
         if (spawnDC.hasSubscribers) spawnDC.error.publish({ process: this, error: err });
         if (DELAYED[code]) {
           err.syscall = "spawn " + file;
@@ -737,6 +775,13 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   const validateObj = (v, name) => { if (v === null || typeof v !== "object" || Array.isArray(v)) throw errArgType(name, "of type object", v); };
   const validateStr = (v, name) => { if (typeof v !== "string") throw errArgType(name, "of type string", v); };
   const validateFn = (v, name) => { if (typeof v !== "function") throw errArgType(name, "of type function", v); };
+  // Public child_process options observe own enumerable settings only.  This
+  // avoids Object.prototype pollution becoming a hidden cwd/shell/uid option.
+  const ownOptions = (o) => {
+    const out = Object.create(null);
+    if (o != null) for (const k of Object.keys(o)) out[k] = o[k];
+    return out;
+  };
   const isInt32 = (v) => typeof v === "number" && Number.isInteger(v) && v >= -2147483648 && v <= 2147483647;
   const toPathString = (p, name) => {
     if (typeof p === "string") { nullCheck(p, name); return p; }
@@ -753,8 +798,19 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   };
   // The options members every entry point shares (cwd/argv0/shell must be
   // NUL-free even on the sync paths that never reach normalizeSpawnArguments).
+  const isAbortSignal = (signal) =>
+    !!(signal && ((G.AbortSignal && signal instanceof G.AbortSignal) ||
+      (typeof signal.addEventListener === "function" &&
+       typeof signal.removeEventListener === "function" &&
+       "aborted" in signal)));
   const validateCommonOpts = (o) => {
     if (o == null) return;
+    // child_process accepts an actual AbortSignal here.  Checking before the
+    // spawn boundary makes exec() and execFile() reject invalid values
+    // synchronously, including through util.promisify().
+    if (o.signal !== undefined && !isAbortSignal(o.signal)) {
+      throw errArgType("options.signal", "an instance of AbortSignal", o.signal);
+    }
     if (o.cwd != null) toPathString(o.cwd, "options.cwd");
     if (o.argv0 != null) { validateStr(o.argv0, "options.argv0"); nullCheck(o.argv0, "options.argv0"); }
     if (o.shell != null && typeof o.shell !== "boolean" && typeof o.shell !== "string") throw errPropType("options.shell", "of type boolean or string", o.shell);
@@ -791,6 +847,9 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       else if (typeof o.killSignal === "number") { if (!hasOwn.call(SIGNAME, String(o.killSignal))) throw unknown(); }
       else throw errPropType("options.killSignal", "of type string or number", o.killSignal);
     }
+    if (o.signal != null && !isAbortSignal(o.signal)) {
+      throw errPropType("options.signal", "an instance of AbortSignal", o.signal);
+    }
     // Both env keys and env values must be NUL-free (node's
     // validateArgumentNullCheck over the envPairs it builds).
     if (o.env != null) {
@@ -811,8 +870,8 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     else if (typeof args !== "object") throw errArgType("args", "of type object", args);
     else { options = args; args = []; }
     for (const a of args) nullCheck(a, "args");
-    if (options === undefined) options = {};
-    else validateObj(options, "options");
+    if (options === undefined) options = Object.create(null);
+    else { validateObj(options, "options"); options = ownOptions(options); }
     validateCommonOpts(options);
     return { file, args, options };
   };
@@ -823,8 +882,8 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     else if (typeof args === "function") { callback = args; options = null; args = null; }
     if (args == null) args = [];
     if (typeof options === "function") callback = options;
-    else if (options != null) validateObj(options, "options");
-    if (options == null) options = {};
+    else if (options != null) { validateObj(options, "options"); options = ownOptions(options); }
+    if (options == null) options = Object.create(null);
     if (callback != null) validateFn(callback, "callback");
     if (options.argv0 != null) validateStr(options.argv0, "options.argv0");
     return { file, args, options, callback };
@@ -834,7 +893,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   // caller's options must not grow mbun-internal keys, and the signal name is
   // resolved here so the native layer never needs a signal table.
   const syncOpts = (o) => {
-    const out = {};
+    const out = Object.create(null);
     if (o != null) for (const k of Object.keys(o)) out[k] = o[k];
     // node inherits process.env when `env` is unset, and process.env is a live
     // view of the environment — so `process.env.X = 'v'` before a spawnSync IS
@@ -870,6 +929,12 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   function spawnSync(cmd, a, o) {
     const nz = normalizeSpawnArgs(cmd, a, o);
     cmd = nz.file;
+    const input = nz.options.input;
+    if (input !== undefined && typeof input !== "string" &&
+        !(G.Buffer && typeof G.Buffer.isBuffer === "function" && G.Buffer.isBuffer(input)) &&
+        !(input instanceof ArrayBuffer) && !ArrayBuffer.isView(input)) {
+      throw errPropType("options.input", "of type string or an instance of Buffer, TypedArray, or DataView", input);
+    }
     const n = { args: nz.args, opts: syncOpts(nz.options) };
     const exe = resolveExe(cmd);
     // ONE String() per argument: an argument's toString() is observable and node
@@ -921,7 +986,14 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     validateStr(command, "command");
     nullCheck(command, "command");
     if (o != null) { validateObj(o, "options"); validateCommonOpts(o); }
-    const r = CP.spawnSync("/bin/sh", ["-c", command], syncOpts(o));
+    // Route through spawnSync so execSync observes the same bounded pipe
+    // collection as spawnSync/execFileSync (including ENOBUFS + stdout).
+    const r = spawnSync("/bin/sh", ["-c", command], o);
+    if (r.error) {
+      r.error.stdout = r.stdout;
+      r.error.stderr = r.stderr;
+      throw r.error;
+    }
     if (r.status !== 0) { const e = new Error("Command failed: " + command + (r.stderr == null ? "" : "\n" + r.stderr)); e.status = r.status; e.stdout = r.stdout; e.stderr = r.stderr; throw e; }
     const enc = o && o.encoding;
     // A non-piped stdout (stdio: 'inherit'/'ignore') is null in node, not "".
@@ -931,7 +1003,14 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   function execFileSync(file, a, o) {
     const nf = normalizeExecFileArgs(file, a, o, undefined);
     const nz = normalizeSpawnArgs(nf.file, nf.args, typeof nf.options === "function" ? {} : nf.options);
-    const r = CP.spawnSync(nz.file, nz.args, syncOpts(nz.options));
+    // Keep execFileSync on the public spawnSync path: that is where the
+    // per-stream maxBuffer contract turns an overrun into ENOBUFS.
+    const r = spawnSync(nz.file, nz.args, nz.options);
+    if (r.error) {
+      r.error.stdout = r.stdout;
+      r.error.stderr = r.stderr;
+      throw r.error;
+    }
     if (r.status !== 0) { const e = new Error("execFileSync failed: " + nz.file); e.status = r.status; e.stderr = r.stderr; throw e; }
     const enc = nz.options && nz.options.encoding;
     // A non-piped stdout slot is null, not a buffer.
@@ -940,35 +1019,73 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   }
 
   const collectExec = (child, options, cb, cmd) => {
-    const enc = options.encoding === undefined ? "utf8" : options.encoding;
+    const enc = Object.prototype.hasOwnProperty.call(options, "encoding")
+      ? options.encoding
+      : "utf8";
+    // exec() installs a decoder on the exposed child streams, not merely on its
+    // callback result.  This makes `child.stderr.on("data")` observe strings
+    // for a valid encoding.  Invalid encoding labels intentionally select the
+    // Buffer path, matching node's exec encoding normalization.
+    const streamEnc = typeof enc === "string" && enc !== "buffer" && Buffer.isEncoding(enc)
+      ? (enc === "utf-8" ? "utf8" : enc)
+      : null;
     const maxBuffer = options.maxBuffer == null ? 1024 * 1024 : options.maxBuffer;
     const outs = [], errs = [];
     let outLen = 0, errLen = 0, maxErr = null, done = false;
-    const add = (which, name, bytes) => {
+    const add = (which, name, chunk, stream) => {
+      // Stream decoding can combine a split character before this listener
+      // sees it. Count the completed chunk in bytes, but keep its original
+      // type: node slices decoded strings by code units and raw Buffers by
+      // bytes when the maxBuffer boundary falls inside a multibyte character.
+      const bytes = typeof chunk === "string" ? Buffer.from(chunk, streamEnc) : _u8(chunk);
       const arr = which === 0 ? outs : errs;
       const len = which === 0 ? outLen : errLen;
       if (len + bytes.length > maxBuffer) {
         const take = Math.max(0, maxBuffer - len);
-        if (take > 0) arr.push(Buffer.from(bytes.subarray(0, take)));
+        if (take > 0) {
+          arr.push(typeof chunk === "string"
+            ? chunk.slice(0, take)
+            : Buffer.from(bytes.subarray(0, take)));
+        }
         if (which === 0) outLen = maxBuffer; else errLen = maxBuffer;
-        if (!maxErr) { maxErr = new Error(name + " maxBuffer length exceeded"); maxErr.code = "ERR_CHILD_PROCESS_STDIO_MAXBUFFER"; maxErr.cmd = cmd; child.kill(); }
-      } else { arr.push(Buffer.from(bytes)); if (which === 0) outLen += bytes.length; else errLen += bytes.length; }
+        if (!maxErr) { maxErr = new RangeError(name + " maxBuffer length exceeded"); maxErr.code = "ERR_CHILD_PROCESS_STDIO_MAXBUFFER"; maxErr.cmd = cmd; child.kill(); }
+      } else {
+        arr.push(typeof chunk === "string" ? chunk : Buffer.from(bytes));
+        if (which === 0) outLen += bytes.length; else errLen += bytes.length;
+      }
     };
-    if (child.stdout) child.stdout.on("data", (d) => add(0, "stdout", _u8(d)));
-    if (child.stderr) child.stderr.on("data", (d) => add(1, "stderr", _u8(d)));
-    const toOut = (b) => (enc === "buffer" || enc == null ? b : b.toString(enc === "utf-8" ? "utf8" : enc));
+    if (streamEnc !== null) {
+      if (child.stdout) child.stdout.setEncoding(streamEnc);
+      if (child.stderr) child.stderr.setEncoding(streamEnc);
+    }
+    if (child.stdout) child.stdout.on("data", (d) => add(0, "stdout", d, child.stdout));
+    if (child.stderr) child.stderr.on("data", (d) => add(1, "stderr", d, child.stderr));
+    const mergeOut = (chunks, stream) => {
+      const streamEncoding = stream && stream._readableState && stream._readableState.encoding;
+      const outputEncoding = streamEncoding || streamEnc;
+      if (outputEncoding != null) {
+        const encoding = outputEncoding === "utf-8" ? "utf8" : outputEncoding;
+        return chunks.map((chunk) => typeof chunk === "string" ? chunk : chunk.toString(encoding)).join("");
+      }
+      return Buffer.concat(chunks.map((chunk) => typeof chunk === "string" ? Buffer.from(chunk) : chunk));
+    };
     const finish = (code, signal) => {
       if (done) return; done = true;
-      const outBuf = Buffer.concat(outs), errBuf = Buffer.concat(errs);
+      const outBuf = mergeOut(outs, child.stdout);
+      const errBuf = mergeOut(errs, child.stderr);
       let err = maxErr;
       if (!err && ((code !== 0 && code != null) || signal)) {
         err = new Error("Command failed: " + cmd + (errBuf.length ? "\n" + errBuf.toString("utf8") : ""));
-        err.code = signal ? null : code; err.killed = child.killed || false; err.signal = signal || null; err.cmd = cmd;
+        err.code = signal ? null : (code < 0 ? (ERRNO[-code] || code) : code); err.killed = child.killed || false; err.signal = signal || null; err.cmd = cmd;
       }
-      if (cb) cb(err || null, toOut(outBuf), toOut(errBuf));
+      if (cb) cb(err || null, outBuf, errBuf);
     };
     child.on("close", (code, signal) => finish(code, signal));
-    child.on("error", (e) => { if (done) return; done = true; if (cb) cb(e, toOut(Buffer.alloc(0)), toOut(Buffer.alloc(0))); });
+    child.on("error", (e) => {
+      if (done) return;
+      done = true;
+      if (cb) cb(e, mergeOut([], child.stdout), mergeOut([], child.stderr));
+    });
   };
 
   function spawn(file, args, options) {
@@ -989,8 +1106,8 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     if (typeof options === "function") { cb = options; options = {}; }
     validateStr(command, "command");
     nullCheck(command, "command");
-    if (options != null) { validateObj(options, "options"); validateCommonOpts(options); }
-    options = options || {};
+    if (options != null) { validateObj(options, "options"); options = ownOptions(options); validateCommonOpts(options); }
+    options = options || Object.create(null);
     if (cb != null) validateFn(cb, "callback");
     const sh = options.shell ? (options.shell === true ? "/bin/sh" : toStr(options.shell)) : "/bin/sh";
     const child = new ChildProcess();
@@ -998,30 +1115,61 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     collectExec(child, options, cb, command);
     return child;
   }
-  exec[Symbol.for("nodejs.util.promisify.custom")] = (command, options) => new Promise((resolve, reject) => {
-    exec(command, options, (err, stdout, stderr) => { if (err) { err.stdout = stdout; err.stderr = stderr; reject(err); } else resolve({ stdout, stderr }); });
-  });
+  exec[Symbol.for("nodejs.util.promisify.custom")] = (command, options) => {
+    if (typeof options === "function") options = {};
+    validateStr(command, "command");
+    nullCheck(command, "command");
+    if (options != null) { validateObj(options, "options"); validateCommonOpts(options); }
+    let child;
+    const promise = new Promise((resolve, reject) => {
+      child = exec(command, options, (err, stdout, stderr) => { if (err) { err.stdout = stdout; err.stderr = stderr; reject(err); } else resolve({ stdout, stderr }); });
+    });
+    promise.child = child;
+    return promise;
+  };
 
+  let warnedExecFileShell = false;
   function execFile(file, args, options, cb) {
     const nf = normalizeExecFileArgs(file, args, options, cb);
     const nz = normalizeSpawnArgs(nf.file, nf.args, typeof nf.options === "function" ? {} : nf.options);
     file = nz.file; args = nz.args; options = nz.options; cb = nf.callback;
+    const stringArgs = args.map(toStr);
+    const displayCmd = [file].concat(stringArgs).join(" ");
+    let spawnFile = file, spawnArgs = [file].concat(stringArgs);
+    if (options.shell) {
+      if (!warnedExecFileShell && stringArgs.length > 0 &&
+          G.process && typeof G.process.emitWarning === "function") {
+        warnedExecFileShell = true;
+        G.process.emitWarning(
+          "Passing args to a child process with shell option true can lead to security vulnerabilities, as the arguments are not escaped, only concatenated.",
+          "DeprecationWarning", "DEP0190");
+      }
+      const sh = options.shell === true ? "/bin/sh" : toStr(options.shell);
+      spawnFile = sh; spawnArgs = [sh, "-c", displayCmd];
+    }
     const child = new ChildProcess();
-    child.spawn({ file, args: [file].concat(args.map(toStr)), cwd: options.cwd, env: options.env, stdio: ["pipe", "pipe", "pipe"], timeout: options.timeout, killSignal: options.killSignal, signal: options.signal });
-    collectExec(child, options, cb, file);
+    child.spawn({ file: spawnFile, args: spawnArgs, cwd: options.cwd, env: options.env, stdio: ["pipe", "pipe", "pipe"], timeout: options.timeout, killSignal: options.killSignal, signal: options.signal });
+    collectExec(child, options, cb, displayCmd);
     return child;
   }
-  execFile[Symbol.for("nodejs.util.promisify.custom")] = (file, args, options) => new Promise((resolve, reject) => {
-    execFile(file, args, options, (err, stdout, stderr) => { if (err) { err.stdout = stdout; err.stderr = stderr; reject(err); } else resolve({ stdout, stderr }); });
-  });
+  execFile[Symbol.for("nodejs.util.promisify.custom")] = (file, args, options) => {
+    const nf = normalizeExecFileArgs(file, args, options, undefined);
+    normalizeSpawnArgs(nf.file, nf.args, typeof nf.options === "function" ? {} : nf.options);
+    let child;
+    const promise = new Promise((resolve, reject) => {
+      child = execFile(file, args, options, (err, stdout, stderr) => { if (err) { err.stdout = stdout; err.stderr = stderr; reject(err); } else resolve({ stdout, stderr }); });
+    });
+    promise.child = child;
+    return promise;
+  };
 
   function fork(modulePath, args, options) {
     modulePath = toPathString(modulePath, "modulePath");
     if (args == null) args = [];
     else if (typeof args === "object" && !Array.isArray(args)) { options = args; args = []; }
     else if (!Array.isArray(args)) throw errArgType("args", "an instance of Array", args);
-    if (options != null) validateObj(options, "options");
-    options = options || {};
+    if (options != null) { validateObj(options, "options"); options = ownOptions(options); }
+    options = options || Object.create(null);
     validateCommonOpts(options);
     for (const a of args) nullCheck(a, "args");
     if (options.execPath != null) { validateStr(options.execPath, "options.execPath"); nullCheck(options.execPath, "options.execPath"); }
@@ -1111,32 +1259,35 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
                        rightMiddle: "┤", left: "│ ", right: " │", middle: " │ " };
   // Display width, not code-unit length: a CJK/emoji cell occupies two columns.
   const tableCellWidth = (s) => (G.Bun && typeof G.Bun.stringWidth === "function" ? G.Bun.stringWidth(String(s)) : String(s).length);
-  const renderTableRow = (row, widths) => {
+  const renderTableRow = (row, widths, measure = row) => {
     let out = tableChars.left;
     for (let i = 0; i < row.length; i++) {
       const cell = row[i];
-      out += cell + " ".repeat(Math.max(0, widths[i] - tableCellWidth(cell)));
+      out += cell + " ".repeat(Math.max(0, widths[i] - tableCellWidth(measure[i])));
       if (i !== row.length - 1) out += tableChars.middle;
     }
     return out + tableChars.right;
   };
-  const renderTable = (head, columns) => {
-    const widths = head.map(tableCellWidth);
+  const renderTable = (head, columns, formatCell) => {
+    const format = (value, row, column) => formatCell ? formatCell(value, row, column) : { text: value, width: value };
+    const renderedHead = head.map((value, column) => format(value, -1, column));
+    const widths = renderedHead.map((cell) => tableCellWidth(cell.width));
     const longest = columns.length === 0 ? 0 : Math.max(...columns.map((a) => a.length));
     const rows = new Array(longest);
     for (let i = 0; i < head.length; i++) {
       const column = columns[i];
       for (let j = 0; j < longest; j++) {
         if (rows[j] === undefined) rows[j] = [];
-        const value = (rows[j][i] = Object.prototype.hasOwnProperty.call(column, j) ? column[j] : "");
-        widths[i] = Math.max(widths[i] || 0, tableCellWidth(value));
+        const value = Object.prototype.hasOwnProperty.call(column, j) ? column[j] : "";
+        const cell = (rows[j][i] = format(value, j, i));
+        widths[i] = Math.max(widths[i] || 0, tableCellWidth(cell.width));
       }
     }
     const divider = widths.map((w) => tableChars.middleMiddle.repeat(w + 2));
     let result = tableChars.topLeft + divider.join(tableChars.topMiddle) + tableChars.topRight + "\n" +
-                 renderTableRow(head, widths) + "\n" +
+                 renderTableRow(renderedHead.map((cell) => cell.text), widths, renderedHead.map((cell) => cell.width)) + "\n" +
                  tableChars.leftMiddle + divider.join(tableChars.rowMiddle) + tableChars.rightMiddle + "\n";
-    for (const row of rows) result += renderTableRow(row, widths) + "\n";
+    for (const row of rows) result += renderTableRow(row.map((cell) => cell.text), widths, row.map((cell) => cell.width)) + "\n";
     return result + tableChars.bottomLeft + divider.join(tableChars.bottomMiddle) + tableChars.bottomRight;
   };
   // `logFn` is the console's own log (stream routing + formatting stay the
@@ -1203,6 +1354,67 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     keys.unshift(indexKey);
     values.unshift(indexKeyArray);
     return final(keys, values);
+  };
+  // Bun.inspect.table returns the grid instead of logging it. Its table model is
+  // deliberately Bun-specific: row headers are blank, Map keys are unquoted,
+  // and ANSI styling must not participate in display-width calculations.
+  const inspectTableImpl = (tabularData, properties, options) => {
+    let props = properties;
+    let opts = options;
+    if (!Array.isArray(props)) { opts = props; props = undefined; }
+    opts = opts && typeof opts === "object" ? opts : {};
+    if (tabularData == null || (typeof tabularData !== "object" && typeof tabularData !== "function")) return "";
+    const colored = opts.colors === true;
+    const cell = (value) => {
+      if (value instanceof RegExp) return { inspectCell: true, text: "", color: false };
+      if (typeof value === "string") return { inspectCell: true, text: value, color: false };
+      if (typeof value === "number") return { inspectCell: true, text: String(value), color: true };
+      if (typeof value === "boolean" || value == null || typeof value === "bigint") return { inspectCell: true, text: String(value), color: true };
+      try { return { inspectCell: true, text: Bun.inspect(value, { colors: false, compact: true }), color: false }; }
+      catch (_) { return { inspectCell: true, text: "", color: false }; }
+    };
+    const render = (head, columns) => renderTable(head, columns, (value, row) => {
+      if (row === -1) {
+        const text = String(value);
+        return { text: colored ? "\x1b[0m\x1b[1m" + text + "\x1b[0m" : text, width: text };
+      }
+      if (value && value.inspectCell) {
+        const text = value.text;
+        return { text: colored && value.color ? "\x1b[0m\x1b[33m" + text + "\x1b[0m" : text, width: text };
+      }
+      const text = String(value);
+      return { text, width: text };
+    }) + "\n";
+    if (tabularData instanceof Map) {
+      const index = [], keys = [], values = [];
+      let i = 0;
+      for (const [key, value] of tabularData) { index.push(String(i++)); keys.push(cell(key)); values.push(cell(value)); }
+      return render(["", "Key", "Values"], [index, keys, values]);
+    }
+    if (tabularData instanceof Set) {
+      const index = [], values = [];
+      let i = 0;
+      for (const value of tabularData) { index.push(String(i++)); values.push(cell(value)); }
+      return render(["", "Values"], [index, values]);
+    }
+    if (typeof tabularData === "function") return render(["", "Values"], [["0"], [cell(tabularData)]]);
+    const indexes = Object.keys(tabularData);
+    const items = indexes.map((key) => tabularData[key]);
+    const primitive = (value) => value === null || (typeof value !== "object" && typeof value !== "function");
+    const hasPrimitives = items.some(primitive);
+    const keys = props || (hasPrimitives ? [] : Array.from(new Set(items.flatMap((item) => Object.keys(item)))));
+    const head = [""];
+    const columns = [indexes];
+    if (hasPrimitives && props === undefined) {
+      head.push("Values");
+      columns.push(items.map(cell));
+    } else {
+      for (const key of keys) {
+        head.push(String(key));
+        columns.push(items.map((item) => primitive(item) || !Object.prototype.hasOwnProperty.call(item, key) ? "" : cell(item[key])));
+      }
+    }
+    return render(head, columns);
   };
   // node:console — faithful port of node lib/internal/console/constructor.js.
   // Console instances own per-instance state (streams, group indent, count/time
@@ -2940,6 +3152,17 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       const s = spawnArgs(a, b);
       validateSignalOpt(s.opts.signal);
       if (s.opts.terminal && PN && PN.spawnPty) return spawnTerminal(s.cmd, s.opts);
+      // A byte stdin payload must use the live pipe path. The synchronous
+      // fallback only forwards string input, so Bun.spawn({ stdin: Buffer })
+      // used to close the child's fd 0 without writing the bytes first.
+      const stdinBytes = s.opts.stdin != null && typeof s.opts.stdin !== "string" &&
+        (ArrayBuffer.isView(s.opts.stdin) || s.opts.stdin instanceof ArrayBuffer);
+      if (PN && PN.spawnEx && stdinBytes) {
+        const proc = spawnAsyncBun(s.cmd, { ...s.opts, stdin: "pipe" });
+        proc.stdin.write(s.opts.stdin);
+        proc.stdin.end();
+        return proc;
+      }
       // stdin: "pipe" rides the fully async spawnEx/io_tick path too — the old
       // spawnPipes path drains stdout/stderr with BLOCKING reads, which parks
       // the JS thread and starves the virtual event loop (deadlocking a child
@@ -3205,7 +3428,9 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
         if (!minSet || !hourSet || !domSet || !monSet || !dowRaw) return null;
         const dowSet = new Set(); for (const v of dowRaw) dowSet.add(v % 7);
         const domR = fields[2] !== "*", dowR = fields[4] !== "*";
-        const d = new Date((from instanceof Date ? from.getTime() : new Date(from).getTime()));
+        const fromMs = from == null ? Date.now() : from instanceof Date ? from.getTime() : new Date(from).getTime();
+        if (!Number.isFinite(fromMs)) throw new RangeError("Invalid date value");
+        const d = new Date(fromMs);
         d.setUTCSeconds(0, 0); d.setUTCMinutes(d.getUTCMinutes() + 1);
         const limit = d.getTime() + 5 * 366 * 24 * 3600 * 1000;
         while (d.getTime() <= limit) {

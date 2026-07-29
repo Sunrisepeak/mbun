@@ -1125,6 +1125,16 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
         if (tlsSock.listenerCount("error") <= 1) G.queueMicrotask(() => { throw e; });
       });
     }
+    // TLS dispatches its accepted plaintext edge through `secureConnection`,
+    // not net.Server's `connection`. Preserve the same capture-rejections
+    // contract: an async listener rejection belongs to that TLS socket.
+    [Symbol.for("nodejs.rejection")](err, event, sock) {
+      if (event === "secureConnection" && sock && typeof sock.destroy === "function") {
+        sock.destroy(err);
+        return;
+      }
+      return super[Symbol.for("nodejs.rejection")](err, event, sock);
+    }
     setSecureContext(options) { this._sharedCreds = options || {}; }
     // node internal/tls/wrap.js addContext: an empty servername is refused (there
     // would be nothing to match), and a plain options object is turned into a

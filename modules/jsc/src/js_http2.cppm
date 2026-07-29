@@ -395,6 +395,24 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
     e.errno = errno;
     return e;
   };
+  // The real nghttp2 binding reports submit failures as negative errno values.
+  // Keep that submit boundary replaceable for the JS framing backend too: node
+  // internals, instrumentation, and embedders can provide the same low-level
+  // method on internalBinding('http2').Http2Stream.prototype. A failed submit
+  // is stream-local, so it must become NghttpError on this stream (and its
+  // existing destroy path sends the matching RST_STREAM to the peer).
+  let nativeHttp2StreamPrototype = null;
+  const submitNativeStream = (stream, method, ...args) => {
+    const submit = nativeHttp2StreamPrototype && nativeHttp2StreamPrototype[method];
+    if (typeof submit !== "function") return true;
+    const errno = Reflect.apply(submit, stream, args);
+    if (typeof errno !== "number" || errno >= 0) return true;
+    // A caller of the native binding has also loaded the internal util module;
+    // adopt its constructor before exposing the error for identity checks.
+    if (bindingRequested) adoptNodeHttp2Internals();
+    stream.destroy(nghttpErr(errno));
+    return false;
+  };
   // internal/errors.js AbortError: what request({ signal }) destroys the stream
   // with once the signal fires.
   const abortErr = (reason) => {
@@ -2282,7 +2300,12 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
     if (key !== ":status")
       throw H2_ERR('"' + key + '" is an invalid pseudoheader or is used incorrectly', "ERR_HTTP2_INVALID_PSEUDOHEADER");
   }
-  function buildNgHeaders(map, validatePseudo, strictSingleValueFields) {
+  // HTTP field-values are byte strings: HTAB, visible ASCII, and obs-text are
+  // allowed, while every other code point (including CR/LF and Unicode line
+  // separators) must not reach HPACK. nghttp2 drops an invalid response field
+  // rather than turning it into a response-splitting payload.
+  const kInvalidResponseFieldValue = /[^\t\x20-\x7e\x80-\xff]/;
+  function buildNgHeaders(map, validatePseudo, strictSingleValueFields, dropInvalidFieldValues) {
     // node initializeOptions defaults options.strictSingleValueFields to true;
     // only an explicit `false` turns the single-value check off.
     if (strictSingleValueFields === undefined || strictSingleValueFields === null) strictSingleValueFields = true;
@@ -2299,6 +2322,17 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
         if (value.length === 1) { value = String(value[0]); isArray = false; }
         else if (isStrictSingleValueField) throw H2_ERR('Header field "' + key + '" must only have a single value', "ERR_HTTP2_HEADER_SINGLE_VALUE");
       } else value = String(value);
+      // Outgoing response fields follow nghttp2's sanitizing path. Keep this
+      // opt-in because request validation reports malformed user input instead
+      // of silently rewriting it.
+      if (dropInvalidFieldValues) {
+        if (isArray) {
+          value = value.map(String).filter((entry) => !kInvalidResponseFieldValue.test(entry));
+          if (value.length === 0) return;
+        } else if (kInvalidResponseFieldValue.test(value)) {
+          return;
+        }
+      }
       if (isStrictSingleValueField) {
         if (singles.has(key)) throw H2_ERR('Header field "' + key + '" must only have a single value', "ERR_HTTP2_HEADER_SINGLE_VALUE");
         singles.add(key);

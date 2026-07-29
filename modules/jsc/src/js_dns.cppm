@@ -298,7 +298,25 @@ export constexpr std::string_view kDnsJS = R"JS(
   // strings) plus its timeout/tries are threaded to the native record transport;
   // absent/empty means /etc/resolv.conf + the transport defaults, which is what
   // the module-level dns.resolve* uses. ref: runtime/dns.inc dnsn_resolve_cb.
-  const rawResolve = (host, type, callback, servers, timeout, tries) => {
+  const rawResolve = (host, type, callback, servers, timeout, tries, channel) => {
+    const CW = cares();
+    const query = "query" + type[0] + type.slice(1).toLowerCase();
+    const handle = channel || (typeof CW.ChannelWrap === "function"
+      ? new CW.ChannelWrap(timeout, tries) : null);
+    // resolve* goes through ChannelWrap in node, so a synchronous c-ares
+    // failure remains observable to callback and promise callers alike.
+    if (handle && typeof handle[query] === "function") {
+      const req = typeof CW.QueryReqWrap === "function" ? new CW.QueryReqWrap() : {};
+      let done = false;
+      req.oncomplete = (err, rows) => {
+        if (done) return;
+        done = true;
+        callback(err ? { error: uvName(err) } : rows);
+      };
+      const err = handle[query](req, String(host));
+      if (err) soon(() => req.oncomplete(err));
+      return;
+    }
     if (DN && DN.resolve) DN.resolve(String(host), TYPE_CODES[type] | 0, callback,
                                      servers && servers.length ? servers : undefined,
                                      typeof timeout === "number" ? timeout : undefined,
@@ -401,10 +419,13 @@ export constexpr std::string_view kDnsJS = R"JS(
   // validating mutation the module-level dns.resolve* then observes — not a
   // no-op. An empty list means "whatever /etc/resolv.conf says".
   const defaultServers = [];
+  let defaultServersConfigured = false;
 
   // ── /etc/resolv.conf nameservers for dns.getServers() ──────────────────────
   const getServers_ = () => {
-    if (defaultServers.length) return defaultServers.slice();
+    // A caller's explicit `setServers([])` means no servers, not a request to
+    // re-read resolv.conf. Before the first mutation we expose the system list.
+    if (defaultServersConfigured) return defaultServers.slice();
     try {
       const fs = M["fs"] || M["node:fs"];
       if (!fs || typeof fs.readFileSync !== "function") return [];
@@ -455,8 +476,16 @@ export constexpr std::string_view kDnsJS = R"JS(
         else if (options.family === "IPv6") family = 6;
         else { validateOneOf(options.family, "options.family", [0, 4, 6]); family = options.family; }
       }
-      if (options.all !== undefined && options.all !== null) all = options.all === true;
-      if (options.verbatim !== undefined) orderName = options.verbatim ? "verbatim" : "ipv4first";
+      if (options.all !== undefined && options.all !== null) {
+        if (typeof options.all !== "boolean")
+          throw argTypeError("options.all", "must be of type boolean", options.all);
+        all = options.all;
+      }
+      if (options.verbatim !== undefined) {
+        if (typeof options.verbatim !== "boolean")
+          throw argTypeError("options.verbatim", "must be of type boolean", options.verbatim);
+        orderName = options.verbatim ? "verbatim" : "ipv4first";
+      }
       if (options.order !== undefined) {
         validateOneOf(options.order, "order", VALID_DNS_ORDERS);
         orderName = options.order;
@@ -530,7 +559,7 @@ export constexpr std::string_view kDnsJS = R"JS(
     rawResolve(host, type, (r) => {
       if (r && r.error) reject(nodeError(r.error, rr, host));
       else resolve(r);
-    }, servers, res && res._timeout, res && res._tries);
+    }, servers, res && res._timeout, res && res._tries, res && res._handle);
   });
 
   const promiseReverse = (ip) => new Promise((resolve, reject) => {
@@ -600,7 +629,8 @@ export constexpr std::string_view kDnsJS = R"JS(
   cbLookupService[promisifyCustom] = promiseLookupService;
 
   const promiseResolve = (hostname, rrtype) => {
-    const t = (rrtype == null ? "A" : String(rrtype));
+    if (rrtype !== undefined) validateString(rrtype, "rrtype");
+    const t = (rrtype === undefined ? "A" : rrtype);
     if (t === "A") return promiseAddresses(hostname, 4, "queryA");
     if (t === "AAAA") return promiseAddresses(hostname, 6, "queryAaaa");
     if (RECORD_TYPES.indexOf(t) === -1)
@@ -651,21 +681,32 @@ export constexpr std::string_view kDnsJS = R"JS(
     // so a non-string reports ERR_INVALID_ARG_TYPE on "servers[i]" rather than
     // ERR_INVALID_IP_ADDRESS (test-dns-setservers-type-check asserts both).
     validateString(entry, "servers[" + (index === undefined ? 0 : index) + "]");
-    let host = entry;
+    let host = entry, port = 53;
     if (host.charCodeAt(0) === 91 /* [ */) {
       const close = host.indexOf("]");
       if (close === -1) throw invalidIPError(entry);
       const rest = host.slice(close + 1);
       host = host.slice(1, close);
-      if (rest !== "" && !(rest.charCodeAt(0) === 58 /* : */ && Number.isInteger(Number(rest.slice(1)))))
-        throw invalidIPError(entry);
+      if (rest !== "") {
+        if (rest.charCodeAt(0) !== 58 /* : */ || !/^[0-9]+$/.test(rest.slice(1))) throw invalidIPError(entry);
+        port = Number(rest.slice(1));
+      }
     } else {
       const colon = host.lastIndexOf(":");
       // One colon → IPv4:port; several → a bare IPv6 literal.
-      if (colon !== -1 && host.indexOf(":") === colon) host = host.slice(0, colon);
+      if (colon !== -1 && host.indexOf(":") === colon) {
+        const textPort = host.slice(colon + 1);
+        if (!/^[0-9]+$/.test(textPort)) throw invalidIPError(entry);
+        port = Number(textPort);
+        host = host.slice(0, colon);
+      }
     }
-    if (isIP(host) === 0) throw invalidIPError(entry);
-    return entry;
+    const family = isIP(host);
+    if (family === 0 || !Number.isInteger(port) || port < 1 || port > 65535) throw invalidIPError(entry);
+    // c-ares normalizes an explicit :53 away and removes brackets from a
+    // bracketed IPv6 server without a non-default port (test-dns.js).
+    if (port === 53) return host;
+    return family === 6 ? "[" + host + "]:" + port : host + ":" + port;
   };
   // dns.setServers / dns.promises.setServers / require('dns/promises').setServers
   // are all the default resolver's setServers, so they validate identically.
@@ -674,9 +715,13 @@ export constexpr std::string_view kDnsJS = R"JS(
   // half-applied server list behind.
   const setServers_ = (list) => {
     validateArray(list, "servers");
-    const parsed = list.map(parseServerEntry);
+    // Array#map preserves holes, but c-ares ignores them. forEach also keeps
+    // node's live-length behavior when an indexed getter shrinks the list.
+    const parsed = [];
+    list.forEach((entry, index) => { parsed.push(parseServerEntry(entry, index)); });
     defaultServers.length = 0;
     for (const entry of parsed) defaultServers.push(entry);
+    defaultServersConfigured = true;
   };
   const RESOLVE_METHODS = {
     resolveAny: ["ANY", "queryAny"], resolveCname: ["CNAME", "queryCname"],
@@ -707,12 +752,25 @@ export constexpr std::string_view kDnsJS = R"JS(
     const adapt = (fn, nameArg) => {
       const validateName = (a) => { if (nameArg) validateString(a[0], nameArg); };
       return promiseStyle
-        ? function (...a) { validateName(a); return fn.apply(this, a); }
+        ? function (...a) {
+            validateName(a);
+            const p = fn.apply(this, a);
+            this._pendingQueries = (this._pendingQueries || 0) + 1;
+            return p.then(
+              (v) => { this._pendingQueries--; return v; },
+              (e) => { this._pendingQueries--; throw e; },
+            );
+          }
         : function (...a) {
             validateName(a);
             const cb = a[a.length - 1];
             validateFunction(cb, "callback");
-            fn.apply(this, a.slice(0, -1)).then((v) => cb(null, v), (e) => cb(e));
+            const p = fn.apply(this, a.slice(0, -1));
+            this._pendingQueries = (this._pendingQueries || 0) + 1;
+            p.then(
+              (v) => { this._pendingQueries--; cb(null, v); },
+              (e) => { this._pendingQueries--; cb(e); },
+            );
             return undefined;
           };
     };
@@ -736,11 +794,29 @@ export constexpr std::string_view kDnsJS = R"JS(
         hide("_tries", tries);
         hide("_maxTimeout", maxTimeout);
         hide("_localAddress", null);
+        hide("_pendingQueries", 0);
+        const CW = cares().ChannelWrap || caresWrap.ChannelWrap;
+        const handle = new CW(timeout, tries, maxTimeout);
+        // ResolverBase exposes its c-ares handle. Seed it with the system
+        // servers so its observable getServers() starts non-empty like node.
+        handle.setServers(getServers_());
+        hide("_handle", handle);
       }
-      getServers() { return this._serverText.length ? this._serverText.slice() : getServers_(); }
+      getServers() {
+        const servers = this._handle.getServers();
+        return Array.isArray(servers) ? servers : [];
+      }
       setServers(list) {
         validateArray(list, "servers");
-        this._serverText = list.map(parseServerEntry);
+        if (this._pendingQueries > 0) {
+          const e = new Error('c-ares failed to set servers: "There are pending queries." [' + list.join(", ") + "]");
+          e.code = "ERR_DNS_SET_SERVERS_FAILED";
+          throw e;
+        }
+        const parsed = [];
+        list.forEach((entry, index) => { parsed.push(parseServerEntry(entry, index)); });
+        this._serverText = parsed;
+        this._handle.setServers(parsed);
       }
       // DEFERRED: in-flight native queries run on the resolver worker and are not
       // interruptible, so cancel() cannot abort them; it is a no-op rather than a
@@ -782,7 +858,8 @@ export constexpr std::string_view kDnsJS = R"JS(
     proto.resolve4 = adapt(function (hostname, options) { return addresses(this, hostname, 4, "queryA", options); }, "name");
     proto.resolve6 = adapt(function (hostname, options) { return addresses(this, hostname, 6, "queryAaaa", options); }, "name");
     proto.resolve = adapt(function (hostname, rrtype) {
-      const t = (rrtype == null ? "A" : String(rrtype));
+      if (rrtype !== undefined) validateString(rrtype, "rrtype");
+      const t = (rrtype === undefined ? "A" : rrtype);
       if (t === "A") return addresses(this, hostname, 4, "queryA");
       if (t === "AAAA") return addresses(this, hostname, 6, "queryAaaa");
       if (RECORD_TYPES.indexOf(t) === -1)

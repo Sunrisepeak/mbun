@@ -66,6 +66,31 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
     }
     return data;
   };
+  // BroadcastChannel exposes structured-clone failures to its caller; do not
+  // swallow its DataCloneError while posting a broadcast.
+  const cloneBroadcast = (data) => {
+    if (typeof G.structuredClone !== "function") return data;
+    try { return G.structuredClone(data); }
+    catch (e) {
+      // JSC says "Symbol values cannot be cloned"; Node reports the rejected
+      // value itself for BroadcastChannel.
+      if (typeof data === "symbol") throw dataClone(String(data) + " could not be cloned.");
+      throw e;
+    }
+  };
+  // A BroadcastChannel also has a receiveMessageOnPort-compatible inbox. A
+  // WeakMap keeps that capability branded: a lookalike object cannot acquire
+  // one by adding public properties.
+  const broadcastQueues = new WeakMap();
+  const broadcastNames = new WeakMap();
+  const invalidBroadcastThis = () => {
+    const e = new TypeError('Value of "this" must be of type BroadcastChannel');
+    e.code = "ERR_INVALID_THIS";
+    return e;
+  };
+  const assertBroadcast = (value) => {
+    if (!broadcastQueues.has(value)) throw invalidBroadcastThis();
+  };
 
   const kOther = Symbol("mbun.port.other");
   const kQueue = Symbol("mbun.port.queue");
@@ -75,6 +100,7 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
   const kOnMsgErr = Symbol("mbun.port.onmessageerror");
   const kRefed = Symbol("mbun.port.refed");
   const kStarted = Symbol("mbun.port.started");
+  const kAsyncHookId = Symbol("mbun.port.asyncHookId");
   const INSPECT_SYM = Symbol.for("nodejs.util.inspect.custom");
   // node throws a real DOMException("…", "DataCloneError") — .code === 25 and
   // `err.constructor.name === 'DOMException'` are both asserted by the corpus.
@@ -327,10 +353,25 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
     p[kOnMsgErr] = null;
     p[kRefed] = false;
     p[kStarted] = false;
+    if (typeof G.__mbunAsyncHookInit === "function") p[kAsyncHookId] = G.__mbunAsyncHookInit("MESSAGEPORT", p);
     return p;
   };
 
   const isPort = (v) => v !== null && typeof v === "object" && v[kQueue] !== undefined;
+  // BroadcastChannel has no transfer-list parameter. Node therefore rejects a
+  // MessagePort anywhere in its payload instead of silently cloning the host
+  // object; recurse through enumerable payload members so a MessageChannel is
+  // caught through its port1/port2 fields too.
+  const containsTransferable = (value, seen = new Set()) => {
+    if (value === null || typeof value !== "object") return false;
+    if (isPort(value)) return true;
+    if (seen.has(value)) return false;
+    seen.add(value);
+    for (const key of Object.keys(value)) {
+      if (containsTransferable(value[key], seen)) return true;
+    }
+    return false;
+  };
   const portHasListener = (p) => typeof p[kOnMsg] === "function" || p.listenerCount("message") > 0 ||
                                  ((p[kEvt].get("message") || []).length > 0);
   const portHasSink = (p) => p[kStarted] === true || portHasListener(p);
@@ -370,7 +411,7 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
     if (typeof G.setImmediate === "function") G.setImmediate(() => portFlush(p));
     else G.queueMicrotask(() => portFlush(p));
   };
-  const portStart = (p) => { p[kStarted] = true; scheduleFlush(p); };
+  const portStart = (p) => { p[kStarted] = true; p[kRefed] = true; scheduleFlush(p); };
 
   // ---- structured clone with a transfer list ------------------------------
   const abDetached = (ab) => {
@@ -468,9 +509,11 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
       return o;
     }
     const C = cryptoMod();
-    if (C && typeof C.KeyObject === "function" && v instanceof C.KeyObject && v._kind !== undefined) {
+    const keySlot = C && typeof C.__mbunKeyObjectTransferData === "function"
+      ? C.__mbunKeyObjectTransferData(v) : null;
+    if (keySlot) {
       const o = {};
-      o[KEY_TOK] = { w: 0, kind: v._kind, m: encMaterial(v._km), p: v._pass };
+      o[KEY_TOK] = { w: 0, kind: keySlot.kind, m: encMaterial(keySlot.material), p: keySlot.passphrase };
       return o;
     }
     return undefined;
@@ -567,6 +610,8 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
     // late in the list leaves earlier ArrayBuffers untouched.
     for (const item of list) {
       if (isPort(item)) {
+        if (UNTRANSFERABLE.has(item))
+          throw dataClone("Cannot transfer object marked as untransferable");
         if (item === this) throw dataClone("Transfer list contains source port");
         if (seenPorts.has(item)) throw dataClone("Transfer list contains duplicate MessagePort");
         if (item[kDetached] === true) throw dataClone("MessagePort in transfer list is already detached");
@@ -574,7 +619,8 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
       } else if (item instanceof ArrayBuffer) {
         if (seenBufs.has(item)) throw dataClone("Transfer list contains duplicate ArrayBuffer");
         if (abDetached(item)) throw dataClone("ArrayBuffer at index " + buffers.length + " is already detached");
-        if (UNTRANSFERABLE.has(item)) continue;  // markAsUntransferable: clone, don't move
+        if (UNTRANSFERABLE.has(item))
+          throw dataClone("Cannot transfer object marked as untransferable");
         seenBufs.add(item); buffers.push(item);
       } else if (item !== null && (typeof item === "object" || typeof item === "function")) {
         if (UNTRANSFERABLE.has(item)) continue;
@@ -609,13 +655,19 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
     this[kDetached] = true;
     this[kOther] = null;
     const self = this;
-    G.queueMicrotask(() => self.emit("close"));
+    G.queueMicrotask(() => {
+      self[kRefed] = false;
+      self.emit("close");
+      if (typeof G.__mbunAsyncHookDestroy === "function") G.__mbunAsyncHookDestroy(self[kAsyncHookId]);
+    });
     if (other) {
       other[kOther] = null;
       G.queueMicrotask(() => {
         if (other[kDetached] === true) return;
         other[kDetached] = true;
+        other[kRefed] = false;
         other.emit("close");
+        if (typeof G.__mbunAsyncHookDestroy === "function") G.__mbunAsyncHookDestroy(other[kAsyncHookId]);
       });
     }
   } });
@@ -642,12 +694,13 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
   }
 
   const receiveMessageOnPort = function (port) {
-    if (!isPort(port)) {
+    const queue = isPort(port) ? port[kQueue] : broadcastQueues.get(port);
+    if (queue === undefined) {
       const e = new TypeError('The "port" argument must be a MessagePort instance');
       e.code = "ERR_INVALID_ARG_TYPE";
       throw e;
     }
-    if (port[kQueue].length) return { message: port[kQueue].shift().data };
+    if (queue.length) return { message: queue.shift().data };
     return undefined;
   };
 
@@ -656,6 +709,10 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
   const markAsUntransferable = function (obj) {
     if (obj !== null && (typeof obj === "object" || typeof obj === "function")) UNTRANSFERABLE.add(obj);
     return undefined;
+  };
+  const isMarkedAsUntransferable = function (obj) {
+    return obj !== null && (typeof obj === "object" || typeof obj === "function") &&
+           UNTRANSFERABLE.has(obj);
   };
   const markAsUncloneable = function (obj) {
     if (obj !== null && (typeof obj === "object" || typeof obj === "function")) UNCLONEABLE.add(obj);
@@ -804,42 +861,94 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
     const channels = new Map();
     class BroadcastChannel extends EventEmitter {
       constructor(name) {
+        if (arguments.length === 0)
+          throw new TypeError('The "name" argument must be specified');
         super();
-        this.name = String(name);
+        // Node's `${name}` conversion deliberately rejects symbols instead of
+        // accepting them through String(Symbol()).
+        if (typeof name === "symbol")
+          throw new TypeError("Cannot convert a Symbol value to a string");
+        broadcastNames.set(this, `${name}`);
         this.onmessage = null;
         this.onmessageerror = null;
         this._closed = false;
+        broadcastQueues.set(this, []);
         let set = channels.get(this.name);
         if (!set) { set = new Set(); channels.set(this.name, set); }
         set.add(this);
       }
+      get name() { assertBroadcast(this); return broadcastNames.get(this); }
+      [INSPECT_SYM](depth, options, inspect) {
+        assertBroadcast(this);
+        const name = typeof inspect === "function"
+          ? inspect(broadcastNames.get(this))
+          : JSON.stringify(broadcastNames.get(this));
+        return "BroadcastChannel { name: " + name + ", active: " + (!this._closed) + " }";
+      }
       postMessage(value) {
+        assertBroadcast(this);
+        if (arguments.length === 0)
+          throw new TypeError('The "message" argument must be specified');
         if (this._closed) throw new Error("BroadcastChannel is closed");
         const set = channels.get(this.name);
         if (!set) return;
-        const data = clone(value);
+        if (containsTransferable(value))
+          throw dataClone("Object that needs transfer was found in message but not listed in transferList");
+        const data = cloneBroadcast(value);
         for (const ch of set) {
           if (ch === this || ch._closed) continue;
+          const item = { data };
+          broadcastQueues.get(ch).push(item);
           G.queueMicrotask(() => {
-            const ev = { data, type: "message" };
+            const queue = broadcastQueues.get(ch);
+            const index = queue.indexOf(item);
+            if (index < 0) return;
+            queue.splice(index, 1);
+            const ev = typeof G.MessageEvent === "function"
+              ? new G.MessageEvent("message", { data })
+              : { data, type: "message" };
+            ev.target = ch;
+            ev.currentTarget = ch;
             if (typeof ch.onmessage === "function") ch.onmessage(ev);
             ch.emit("message", ev);
           });
         }
       }
       close() {
+        assertBroadcast(this);
         if (this._closed) return;
         this._closed = true;
         const set = channels.get(this.name);
         if (set) { set.delete(this); if (set.size === 0) channels.delete(this.name); }
       }
-      ref() { return this; }
-      unref() { return this; }
+      ref() { assertBroadcast(this); return this; }
+      unref() { assertBroadcast(this); return this; }
       addEventListener(type, cb) { this.on(type, cb); }
       removeEventListener(type, cb) { this.off(type, cb); }
     }
     return BroadcastChannel;
   })();
+  // node's custom formatter deliberately collapses a BroadcastChannel when
+  // inspect has exhausted its depth budget (test-broadcastchannel-custom-inspect).
+  Object.defineProperty(BroadcastChannel.prototype, INSPECT_SYM, {
+    configurable: true,
+    value: function (depth) {
+      if (!(this instanceof BroadcastChannel)) {
+        const e = new TypeError("Value of \"this\" must be of type BroadcastChannel");
+        e.code = "ERR_INVALID_THIS";
+        throw e;
+      }
+      if (typeof depth === "number" && depth < 0) return "BroadcastChannel";
+      const name = String(this.name)
+        .replace(/\\/g, "\\\\")
+        .replace(/'/g, "\\'")
+        .replace(/\n/g, "\\n")
+        .replace(/\r/g, "\\r");
+      return "BroadcastChannel { name: '" + name + "', active: " +
+        (this._closed !== true) + " }";
+    },
+    writable: true,
+  });
 
   // transferList validation shared by Worker#postMessage and the constructor.
   const validateTransferList = (transferList) => {
@@ -915,7 +1024,7 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
       if (p.protocol === "data:") return { source: dataUrlSource(p.href) };
       if (p.protocol !== "file:") {
         const e = new TypeError("The URL must be of scheme file: Received protocol '" + p.protocol + "'");
-        e.code = "ERR_UNSUPPORTED_ESM_URL_SCHEME"; throw e;
+        e.code = "ERR_INVALID_URL_SCHEME"; throw e;
       }
       const u = M["url"] || M["node:url"];
       return { path: u && u.fileURLToPath ? u.fileURLToPath(p) : p.pathname };
@@ -925,11 +1034,13 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
       const e = new TypeError('The "filename" argument must be of type string or an instance of URL. Received ' + recvType(filename));
       e.code = "ERR_INVALID_ARG_TYPE"; throw e;
     }
-    if (p.startsWith("data:")) return { source: dataUrlSource(p) };
+    if (p.startsWith("data:")) {
+      const e = new TypeError("The worker script or module filename must be an absolute path or a relative path starting with './' or '../'. Wrap data: URLs with `new URL`. Received \"" + p + "\"");
+      e.code = "ERR_WORKER_PATH"; throw e;
+    }
     if (p.startsWith("file://")) {
-      const u = M["url"] || M["node:url"];
-      try { return { path: u && u.fileURLToPath ? u.fileURLToPath(p) : p.slice(7) }; }
-      catch (e) { const err = new TypeError("Invalid file URL: " + p); err.code = "ERR_INVALID_URL"; throw err; }
+      const e = new TypeError("The worker script or module filename must be an absolute path or a relative path starting with './' or '../'. Wrap file:// URLs with `new URL`. Received \"" + p + "\"");
+      e.code = "ERR_WORKER_PATH"; throw e;
     }
     if (!pathM.isAbsolute(p) && !/^\.\.?[/\\]/.test(p)) {
       const e = new TypeError("The worker script or module filename must be an absolute path or a relative path starting with './' or '../'. Received \"" + p + "\"");
@@ -998,6 +1109,9 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
         if (PN && PN.enabled && !PN.has("worker")) throw PN.denyError("worker", "");
       }
       options = options || {};
+      if (options.eval === true && typeof filename !== "string") {
+        throw new TypeError("The property 'options.eval' must be false when 'filename' is not a string.");
+      }
       // node splits the constructor's transferList exactly as MessagePort's
       // postMessage does: ports move to the worker, ArrayBuffers are detached
       // once the message has been serialised.
@@ -1104,6 +1218,14 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
       this._exitCode = null;
       this._exitResolvers = [];
       this._refd = true;
+      this._asyncWorkerAlive = true;
+      this._asyncMessagePortRefd = false;
+      this._asyncWorkerHandle = { hasRef: () => this._asyncWorkerAlive ? this._refd : undefined };
+      this._asyncMessagePortHandle = { hasRef: () => this._asyncWorkerAlive ? this._asyncMessagePortRefd : undefined };
+      this._asyncWorkerId = typeof G.__mbunAsyncHookInit === "function"
+        ? G.__mbunAsyncHookInit("WORKER", this._asyncWorkerHandle) : undefined;
+      this._asyncMessagePortId = typeof G.__mbunAsyncHookInit === "function"
+        ? G.__mbunAsyncHookInit("MESSAGEPORT", this._asyncMessagePortHandle) : undefined;
       this.resourceLimits = {};
       this.performance = { eventLoopUtilization: () => ({ idle: 0, active: 0, utilization: 0 }) };
       this.onmessage = null;
@@ -1160,11 +1282,19 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
       child.on("exit", (code, signal) => {
         self._exited = true;
         self._exitCode = signal ? 1 : (code == null ? 1 : code);
+        self._asyncMessagePortRefd = false;
         workerRegistry.delete(tid);
         if (self._tempFile) { try { fsM.unlinkSync(self._tempFile); } catch (e) {} self._tempFile = null; }
         self.emit("exit", self._exitCode);
         const rs = self._exitResolvers.splice(0);
         for (const r of rs) r(self._exitCode);
+        G.queueMicrotask(() => {
+          self._asyncWorkerAlive = false;
+          if (typeof G.__mbunAsyncHookDestroy === "function") {
+            G.__mbunAsyncHookDestroy(self._asyncMessagePortId);
+            G.__mbunAsyncHookDestroy(self._asyncWorkerId);
+          }
+        });
       });
       installCwdBroadcast();
       const emitWorker = () => { if (proc && typeof proc.emit === "function") proc.emit("worker", self); };
@@ -1192,8 +1322,8 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
       try { this._child.kill("SIGTERM"); } catch (e) {}
       return new Promise((resolve) => { this._exitResolvers.push(resolve); });
     }
-    ref() { this._refd = true; if (this._child._rec) this._child._rec.unrefd = false; return this; }
-    unref() { this._refd = false; if (this._child._rec) this._child._rec.unrefd = true; return this; }
+    ref() { this._refd = true; this._asyncMessagePortRefd = true; if (this._child._rec) this._child._rec.unrefd = false; return this; }
+    unref() { this._refd = false; this._asyncMessagePortRefd = false; if (this._child._rec) this._child._rec.unrefd = true; return this; }
     addEventListener(type, cb) { this.on(type, cb); }
     removeEventListener(type, cb) { this.off(type, cb); }
     getHeapSnapshot() { return Promise.reject(new Error("Worker.getHeapSnapshot is not supported in this build")); }
@@ -1396,6 +1526,7 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
     BroadcastChannel,
     receiveMessageOnPort,
     markAsUntransferable,
+    isMarkedAsUntransferable,
     markAsUncloneable,
     moveMessagePortToContext,
     setEnvironmentData,

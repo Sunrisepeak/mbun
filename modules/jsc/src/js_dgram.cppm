@@ -228,6 +228,8 @@ export constexpr std::string_view kDgramJS = R"JS(
       this._refd = true;
       this._held = false;
       this._loopOpen = false;
+      this._sendQueueSize = 0;
+      this._sendQueueCount = 0;
     }
     getAsyncId() { return this._asyncId; }
     // UV_UDP_REUSEADDR = 4, UV_UDP_IPV6ONLY = 1, UV_UDP_REUSEPORT = 8 (uv.h).
@@ -297,6 +299,19 @@ export constexpr std::string_view kDgramJS = R"JS(
       const r = ND.send(this.fd, toB64(joined), connected ? 0 : (port | 0),
                         address == null ? "" : String(address), !!v6, connected);
       if (typeof r === "string") return uvOf(r);
+      // Node's --test-udp-no-try-send disables the synchronous fast path so
+      // callers can observe pending sends. The reactor still completes the
+      // datagram immediately, but retain the libuv queue counters until the
+      // next microtask, matching that observable contract.
+      const argv = (G.process && Array.isArray(G.process.execArgv)) ? G.process.execArgv : [];
+      if (argv.indexOf("--test-udp-no-try-send") !== -1) {
+        this._sendQueueSize += total;
+        this._sendQueueCount++;
+        G.queueMicrotask(() => {
+          this._sendQueueSize -= total;
+          this._sendQueueCount--;
+        });
+      }
       return (r | 0) + 1;
     }
     send(req, list, count, port, address, hasCallback) {
@@ -415,8 +430,8 @@ export constexpr std::string_view kDgramJS = R"JS(
     addSourceSpecificMembership(source, group, iface) { return this._srcMembership_(true, source, group, iface); }
     dropSourceSpecificMembership(source, group, iface) { return this._srcMembership_(false, source, group, iface); }
     // The POSIX send path is synchronous, so nothing is ever queued.
-    getSendQueueSize() { return 0; }
-    getSendQueueCount() { return 0; }
+    getSendQueueSize() { return this._sendQueueSize; }
+    getSendQueueCount() { return this._sendQueueCount; }
     ref() { this._refd = true; if (NET) NET.hold(this); }
     unref() { this._refd = false; if (NET) NET.release(this); }
     hasRef() { return this._refd !== false; }

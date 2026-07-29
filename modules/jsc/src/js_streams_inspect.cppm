@@ -84,6 +84,12 @@ export inline constexpr std::string_view kStreamsJS_part3 = R"JS(
   defineStreamInspect(TransformStreamDefaultController, "TransformStreamDefaultController", (c) => ({
     stream: c._stream,
   }));
+  defineStreamInspect(ByteLengthQueuingStrategy, "ByteLengthQueuingStrategy", (s) => ({
+    highWaterMark: s.highWaterMark,
+  }));
+  defineStreamInspect(CountQueuingStrategy, "CountQueuingStrategy", (s) => ({
+    highWaterMark: s.highWaterMark,
+  }));
 
   // ---- Symbol.toStringTag ----
   // Every WebIDL interface carries a @@toStringTag equal to its interface name,

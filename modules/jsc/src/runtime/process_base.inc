@@ -123,6 +123,10 @@ JSValueRef cp_spawn_sync_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
         if (JSValueIsNumber(ctx, uidV)) uid = JSValueToNumber(ctx, uidV, nullptr);
         JSValueRef gidV{get_prop(ctx, opt, "gid")};
         if (JSValueIsNumber(ctx, gidV)) gid = JSValueToNumber(ctx, gidV, nullptr);
+        JSValueRef argv0V{get_prop(ctx, opt, "argv0")};
+        if (JSValueIsString(ctx, argv0V)) {
+            argvStr.front() = val_to_string(ctx, argv0V);
+        }
         JSValueRef cwdV{get_prop(ctx, opt, "cwd")};
         if (JSValueIsString(ctx, cwdV)) cwd = val_to_string(ctx, cwdV);
         JSValueRef inV{get_prop(ctx, opt, "input")};

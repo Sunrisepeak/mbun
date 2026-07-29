@@ -281,6 +281,48 @@ PermissionCommandLine derive_permission_cli(std::span<const std::string_view> ar
     return out;
 }
 
+// Bun groups runtime preload options by kind: --preload, --require/-r,
+// --import, then BUN_INSPECT_PRELOAD. The engine's module cache makes a
+// repeated specifier execute once while retaining this stable ordering.
+std::vector<std::string> derive_runtime_preloads(std::span<const std::string_view> args) {
+    std::array<std::vector<std::string>, 3> groups{};
+    const auto add{[&](std::size_t group, std::string_view path) {
+        if (!path.empty())
+            groups[group].emplace_back(path);
+    }};
+    for (std::size_t i{}; i < args.size(); ++i) {
+        const std::string_view arg{args[i]};
+        const auto take{[&](std::size_t group, std::string_view flag) {
+            if (arg == flag && i + 1 < args.size()) {
+                add(group, args[++i]);
+                return true;
+            }
+            if (arg.starts_with(flag) && arg.size() > flag.size() && arg[flag.size()] == '=') {
+                add(group, arg.substr(flag.size() + 1));
+                return true;
+            }
+            return false;
+        }};
+        if (take(0, "--preload"))
+            continue;
+        if (take(1, "--require") || take(1, "-r"))
+            continue;
+        (void)take(2, "--import");
+    }
+    if (const char* inspectPreload{std::getenv("BUN_INSPECT_PRELOAD")};
+        inspectPreload != nullptr && *inspectPreload != '\0') {
+        groups[2].emplace_back(inspectPreload);
+    }
+    std::vector<std::string> out{};
+    for (auto& group : groups) {
+        for (std::string& path : group) {
+            if (std::ranges::find(out, path) == out.end())
+                out.emplace_back(std::move(path));
+        }
+    }
+    return out;
+}
+
 // ─── `mbun test` flags ──────────────────────────────────────────────────────
 // Flag names/arity are transcribed from bun's TEST_ONLY_PARAMS table
 // (ref: bun-ref/src/cli/Arguments.rs:560-615) and the semantics from the test
@@ -304,6 +346,11 @@ struct TestFlags {
     // every test fails unless --pass-with-no-tests (ref: test_command.rs:2930 +
     // jest.rs:282 did_label_filter_out_all_tests).
     std::optional<std::string> testNamePattern {};
+
+    // `--path-ignore-patterns` is repeatable.  The optional distinguishes no
+    // CLI override from an explicit command-line pattern list, which replaces
+    // (rather than appends to) bunfig's [test].pathIgnorePatterns.
+    std::optional<std::vector<std::string>> pathIgnorePatterns {};
 
     // ─── JSX ────────────────────────────────────────────────────────────────
     // Not TEST_ONLY_PARAMS: these live in bun's TRANSPILER_PARAMS_, which `test`
@@ -414,6 +461,9 @@ TestFlags parse_test(std::span<const std::string_view> args) {
             } else if (name == "-t" || name == "--test-name-pattern" || name == "--grep") {
                 // Capture the label filter (last one wins, matching bun's option()).
                 out.testNamePattern = std::string { value };
+            } else if (name == "--path-ignore-patterns") {
+                if (!out.pathIgnorePatterns) out.pathIgnorePatterns.emplace();
+                out.pathIgnorePatterns->emplace_back(value);
             } else if (name == "--jsx-import-source") {
                 out.jsxImportSource = std::string { value };
             } else if (name == "--jsx-runtime") {

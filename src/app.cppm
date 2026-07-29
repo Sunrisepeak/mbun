@@ -21,6 +21,7 @@ import mbun.semver;             // engines.node / engines.bun range judgment
 import mbun.toml;
 import mbun.bunfig.types;
 import mbun.bunfig.parser;
+import mbun.glob;
 import mbun.http;
 // `mbun build` bundles through the same engine Bun.build binds to.
 import mbun.bundler;
@@ -44,6 +45,12 @@ Flags:
   -v, --version  Print version and exit
   -h, --help     Show this message
 )";
+
+std::vector<std::string> gCliPreloads{};
+
+void set_cli_preloads(std::vector<std::string> preloads) {
+    gCliPreloads = std::move(preloads);
+}
 
 // A bare path argument that looks like a runnable script (bun-style `bun x.js`).
 // Defined later in this TU; used by run_install above their definitions.
@@ -121,14 +128,19 @@ int run_markdown(std::string_view file) {
 // run(), the reporters, and the flag semantics); this is only the dispatch, so
 // the C++ side never has to know node's option table.
 bool has_node_test_flag(std::span<const std::string_view> args) {
-    for (const std::string_view a : args) {
+    for (std::size_t i{}; i < args.size(); ++i) {
+        const std::string_view a{args[i]};
         if (a == "--test") return true;
         // Stop at the first positional: `mbun script.js --test` passes --test to
         // the script, exactly as node does.
         if (!a.starts_with("-")) {
-            if (mbun::cli::node_flag_takes_value(a)) continue;  // never reached for a value token
             return false;
         }
+        // A value-taking Node flag owns the next token, so `--require preload
+        // --test` remains a test-runner invocation rather than treating the
+        // preload path as a script.
+        if (a.find('=') == std::string_view::npos && mbun::cli::node_flag_takes_value(a) &&
+            i + 1 < args.size()) ++i;
     }
     return false;
 }
@@ -214,6 +226,7 @@ int run_script(std::string_view script, std::span<const std::string_view> script
     // src/bunfig/arguments.rs load_config): emit a config error to stderr but
     // still run the script (exit unaffected). Parser + "expected string" type
     // check already live in modules/bunfig; only the run-path wiring was missing.
+    std::vector<std::string> preloads{};
     {
         std::error_code ec{};
         if (std::filesystem::exists("bunfig.toml", ec)) {
@@ -234,16 +247,18 @@ int run_script(std::string_view script, std::span<const std::string_view> script
                             // --no-env-file. ref: bun bunfig.rs -> dotenv/env_loader.rs.
                             mbun::jsc::runtime::set_disable_env_files(true);
                         }
-                        // `preload = [...]`: imported before the entry point
-                        // (jsc_hooks.rs `reload_entry_point`).
-                        if (!cfg->preloads.empty()) {
-                            mbun::jsc::runtime::set_preloads(cfg->preloads);
-                        }
+                        // bunfig entries precede CLI runtime preload options.
+                        preloads = cfg->preloads;
                     }
                 }
             }
         }
     }
+    for (const std::string& preload : gCliPreloads) {
+        if (std::ranges::find(preloads, preload) == preloads.end())
+            preloads.push_back(preload);
+    }
+    mbun::jsc::runtime::set_preloads(std::move(preloads));
     if (is_markdown(script)) return run_markdown(script);
     const std::string entry{resolve_entry_path(script)};
     std::vector<std::string> jsArgv;
@@ -610,20 +625,54 @@ void scan_dir_for_tests(const std::filesystem::path& dir, std::vector<std::files
     }
 }
 
+// Test ignore patterns are matched against the slash-normalized path relative
+// to the test command's cwd.  A bare directory name is special in Bun's
+// scanner: it prunes that directory and therefore every descendant.  Filtering
+// the discovered candidates gives the same observable file set while retaining
+// this scanner's deterministic ordering.
+bool is_ignored_test_path(const std::filesystem::path& path, const std::filesystem::path& root,
+                          std::span<const std::string> patterns) {
+    std::string relative { path.lexically_relative(root).generic_string() };
+    if (relative.empty() || relative.starts_with("..")) relative = path.generic_string();
+    for (const std::string& pattern : patterns) {
+        if (mbun::glob::match(pattern, relative)) return true;
+        // A leading globstar spans zero or more directory segments.  Keep the
+        // zero-segment case explicit so `**/integration/**` also ignores an
+        // `integration/` directory immediately below cwd.
+        if (pattern.starts_with("**/") && mbun::glob::match(std::string_view{pattern}.substr(3), relative)) return true;
+        if (pattern.find_first_of("/*?[") != std::string::npos) continue;
+        for (const auto& component : path.lexically_relative(root)) {
+            if (component.string() == pattern) return true;
+        }
+    }
+    return false;
+}
+
+void remove_ignored_test_files(std::vector<std::filesystem::path>& files, const std::filesystem::path& root,
+                               std::span<const std::string> patterns) {
+    if (patterns.empty()) return;
+    std::erase_if(files, [&root, patterns](const std::filesystem::path& path) {
+        return is_ignored_test_path(path, root, patterns);
+    });
+}
+
 // Resolve `mbun test`'s positionals to the list of files to run. bun's Scanner
 // visits directories breadth-first and sorts sibling entries by lowercased base
 // name (Scanner.rs:396-412) purely so discovery order is deterministic; sorting
 // the collected absolute paths gets the same guarantee, which is what the
 // `--randomize` tests (an unrandomized run must equal the next unrandomized run)
 // and `--bail` ordering depend on.
-std::vector<std::filesystem::path> discover_test_files(std::span<const std::string> filters) {
+std::vector<std::filesystem::path> discover_test_files(std::span<const std::string> filters,
+                                                        std::span<const std::string> ignorePatterns = {}) {
     std::vector<std::filesystem::path> out {};
     std::error_code ec {};
+    const std::filesystem::path cwd { std::filesystem::current_path(ec) };
 
     // No positional: scan cwd (bun scans the top level dir).
     if (filters.empty()) {
-        scan_dir_for_tests(std::filesystem::current_path(ec), out);
+        scan_dir_for_tests(cwd, out);
         std::ranges::sort(out);
+        remove_ignored_test_files(out, cwd, ignorePatterns);
         return out;
     }
 
@@ -655,6 +704,7 @@ std::vector<std::filesystem::path> discover_test_files(std::span<const std::stri
                 out.push_back(p);
             }
         }
+        remove_ignored_test_files(out, cwd, ignorePatterns);
         return out;
     }
 
@@ -662,7 +712,7 @@ std::vector<std::filesystem::path> discover_test_files(std::span<const std::stri
     // contains any positional as a substring (`does_path_match_filter` is
     // index_of, not starts_with — Scanner.rs:306-317).
     std::vector<std::filesystem::path> scanned {};
-    scan_dir_for_tests(std::filesystem::current_path(ec), scanned);
+    scan_dir_for_tests(cwd, scanned);
     std::ranges::sort(scanned);
     for (const auto& p : scanned) {
         const std::string s { p.string() };
@@ -671,6 +721,7 @@ std::vector<std::filesystem::path> discover_test_files(std::span<const std::stri
             out.push_back(p);
         }
     }
+    remove_ignored_test_files(out, cwd, ignorePatterns);
     return out;
 }
 
@@ -757,6 +808,7 @@ int run_test(std::span<const std::string_view> args) {
     // (ref: bun-ref/src/bunfig/bunfig.rs — load_config runs before Arguments'
     // flag parse and each flag only turns the option ON). modules/bunfig already
     // parses `onlyFailures`/`randomize`/`seed`; this is the consumer.
+    std::vector<std::string> bunfigPathIgnorePatterns {};
     {
         std::error_code ec {};
         if (std::filesystem::exists("bunfig.toml", ec)) {
@@ -772,6 +824,7 @@ int run_test(std::span<const std::string_view> args) {
                             flags.seed = *cfg->test.seed;
                             flags.randomize = true;  // a seed implies randomizing
                         }
+                        bunfigPathIgnorePatterns = cfg->test.path_ignore_patterns;
                         apply_bunfig_jsx(*cfg, mbun::jsc::module_loader::runtime_jsx_options());
                     } else {
                         const auto& e = cfg.error();
@@ -780,6 +833,7 @@ int run_test(std::span<const std::string_view> args) {
                         else
                             std::println(std::cerr, "error: {} for \"{}\" in bunfig.toml", e.message,
                                          e.key);
+                        return 1;
                     }
                 }
             }
@@ -828,7 +882,11 @@ int run_test(std::span<const std::string_view> args) {
     // must be exactly "bun test <version_with_sha>" + one newline — no blank line.
     std::println(std::cout, "bun test {}", mbun::cli::VERSION_WITH_SHA);
 
-    std::vector<std::filesystem::path> files { discover_test_files(flags.filters) };
+    const std::span<const std::string> pathIgnorePatterns {
+        flags.pathIgnorePatterns ? std::span<const std::string>{*flags.pathIgnorePatterns}
+                                 : std::span<const std::string>{bunfigPathIgnorePatterns}
+    };
+    std::vector<std::filesystem::path> files { discover_test_files(flags.filters, pathIgnorePatterns) };
     if (files.empty()) {
         // ref: test_command.rs:2693.
         std::println(std::cerr,
@@ -2396,6 +2454,38 @@ int exec_interactive(std::span<const std::string_view> args) {
         code += "process._eval=" + js_quote(evalCode) + ";";
         code += print ? ("console.log((() => (" + evalCode + "))())") : evalCode;
     }
+    return mbun::jsc::runtime::run_eval(code);
+}
+
+// `bun repl` uses the same evaluator and node:repl server as `-i`, but Bun's
+// command accepts eval/print flags without opening an interactive session and
+// advertises Bun rather than the node-compatibility wrapper in its greeting.
+int exec_bun_repl(std::span<const std::string_view> args) {
+    if (!args.empty() && (args[0] == "-e" || args[0] == "--eval" || args[0] == "-p" ||
+                          args[0] == "--print")) {
+        if (args.size() < 2) {
+            std::println(std::cerr, "error: Missing code to evaluate");
+            return 1;
+        }
+        std::vector<std::string> jsArgv{"mbun"};
+        for (const std::string_view rest : args.subspan(2)) jsArgv.emplace_back(rest);
+        mbun::jsc::runtime::set_argv(std::move(jsArgv));
+        std::string code{"process._eval=" + js_quote(args[1]) + ";" + std::string{args[1]}};
+        if (args[0] == "-p" || args[0] == "--print") {
+            code = "process._eval=" + js_quote(args[1]) + ";console.log((() => (" +
+                   std::string{args[1]} + "))())";
+        }
+        return mbun::jsc::runtime::run_eval(code);
+    }
+
+    mbun::jsc::runtime::set_argv({"mbun"});
+    const std::string code{
+        "console.log(\"Welcome to Bun v\" + Bun.version + \".\\n\" + "
+        "'Type \\\".help\\\" for more information.');"
+        "require(\"repl\").createInternalRepl(process.env, function (err, r) {"
+        "  if (err) throw err;"
+        "  r.on(\"exit\", function () { process.exit(); });"
+        "});"};
     return mbun::jsc::runtime::run_eval(code);
 }
 

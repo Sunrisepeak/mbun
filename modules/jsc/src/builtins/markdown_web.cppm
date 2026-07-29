@@ -125,6 +125,40 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
     // md4c escapes the same set in URLs plus leaves other bytes intact.
     return String(s).replace(/[&<>"]/g, (c) => (c === "&" ? "&amp;" : c === "<" ? "&lt;" : c === ">" ? "&gt;" : "&quot;"));
   }
+  // GFM's tagfilter is deliberately narrower than an HTML sanitizer: it does
+  // not remove a tag or escape its complete text.  It only changes the leading
+  // '<' on the nine raw-HTML tags named by the extension, leaving both the
+  // remainder of the tag and ordinary (allowed) HTML untouched.
+  const tagFilterNames = new Set(["title", "textarea", "style", "xmp", "iframe", "noembed", "noframes", "script", "plaintext"]);
+  const tagFilterBlockNames = new Set(["title", "textarea", "style", "iframe", "noframes", "script"]);
+  const tagFilterToken = /\\?<\/?[A-Za-z][A-Za-z0-9-]*(?:\s[^<>]*?)?\/?>/g;
+  function renderTagFilteredText(text, O, quoteText) {
+    const source = String(text);
+    let out = "", pos = 0, match;
+    const renderText = (part) => {
+      let rendered = renderInlineHtml(finalizeInline(parseInline(part)), O);
+      // cmark-gfm entity-escapes quotes in inline raw-HTML text.  Block HTML
+      // retains its literal payload, so keep that path separate below.
+      if (quoteText) rendered = rendered.replace(/"/g, "&quot;");
+      return rendered;
+    };
+    tagFilterToken.lastIndex = 0;
+    while ((match = tagFilterToken.exec(source)) !== null) {
+      out += renderText(source.slice(pos, match.index));
+      const token = match[0];
+      const escaped = token[0] === "\\";
+      const html = escaped ? token.slice(1) : token;
+      const name = /^<\/?([A-Za-z][A-Za-z0-9-]*)/.exec(html);
+      if (escaped || (name && tagFilterNames.has(name[1].toLowerCase()))) out += "&lt;" + html.slice(1);
+      else out += html;
+      pos = match.index + token.length;
+    }
+    return out + renderText(source.slice(pos));
+  }
+  function isTagFilterHtmlBlock(text) {
+    const match = /^\s*<\/?([A-Za-z][A-Za-z0-9-]*)\b/.exec(String(text));
+    return !!(match && tagFilterBlockNames.has(match[1].toLowerCase()));
+  }
   function inlinePlainText(nodes) {
     let s = "";
     for (const nd of nodes) {
@@ -243,7 +277,13 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
           break;
         }
         case "paragraph": {
-          const inl = renderInlineHtml(finalizeInline(parseInline(node.text)), O);
+          if (O.tagFilter && isTagFilterHtmlBlock(node.text)) {
+            out += renderTagFilteredText(node.text, O, false) + "\n";
+            break;
+          }
+          const inl = O.tagFilter
+            ? renderTagFilteredText(node.text, O, true)
+            : renderInlineHtml(finalizeInline(parseInline(node.text)), O);
           if (tight) out += inl + "\n";
           else out += "<p>" + inl + "</p>\n";
           break;
@@ -279,6 +319,7 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       tasklists: !!opts.tasklists,
       autolinks: !!opts.autolinks,
       wikilinks: !!opts.wikilinks,
+      tagFilter: !!opts.tagFilter,
     };
     let hIds = false, hAuto = false;
     const h = opts.headings;
@@ -340,7 +381,21 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       // test-console-methods asserts console.log.name === 'log') and is
       // non-constructable (`new console.log()` must throw), unlike a plain
       // function expression.
-      con[meth] = ({ [meth](...a) { if (typeof a[0] === "string" && /%[sdifjoOc%]/.test(a[0])) native(util.format(...a)); else native(a.map(inspect1).join(" ")); } })[meth];
+      con[meth] = ({ [meth](...a) {
+        const text = typeof a[0] === "string" && /%[sdifjoOc%]/.test(a[0])
+          ? util.format(...a) : a.map(inspect1).join(" ");
+        // console._stdout/_stderr are intentionally mutable lazy properties.
+        // Retain the native fast path for the normal process streams, but route
+        // an overridden target through its write method.
+        const stdout = meth === "log" || meth === "info" || meth === "debug";
+        const target = stdout ? con._stdout : con._stderr;
+        const standard = G.process && (stdout ? G.process.stdout : G.process.stderr);
+        if (target && target !== standard && typeof target.write === "function") {
+          target.write(text + "\n");
+          return;
+        }
+        return native(text);
+      } })[meth];
     }
   }
 
@@ -716,6 +771,12 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       const self = Reflect.construct(streamTransform(), [], Hash);
       self._algo = algo; self._fn = hashFns[NORM(algo)];
       self._out = opts && typeof opts.outputLength === "number" ? opts.outputLength : -1;  // -1 = native default (XOF); 0 = explicit empty
+      if (NORM(algo).startsWith("shake") && self._out < 0 && G.process &&
+          typeof G.process.emitWarning === "function") {
+        G.process.emitWarning(
+          "Creating SHAKE128/256 digests without an explicit options.outputLength is deprecated.",
+          "DeprecationWarning", "DEP0198");
+      }
       self._chunks = []; self._done = false;
       return self;
     }
@@ -2051,13 +2112,15 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
 
   // ---- AbortController / AbortSignal (WHATWG) ----
   if (typeof G.AbortSignal === "undefined") {
+    const kResistStopPropagation = Symbol.for("nodejs.event_target.resist_stop_propagation");
+    const kStopImmediate = Symbol("kStopImmediate");
     class AbortSignal {
       get [Symbol.toStringTag]() { return "AbortSignal"; }
       constructor() { this.aborted = false; this.reason = undefined; this._l = []; this.onabort = null; }
       // `_l` holds {cb, once} records so `{ once: true }` registrations drop
       // themselves after firing — events.getEventListeners(signal, "abort")
       // must report 0 once the signal has been raised (node semantics).
-      addEventListener(t, cb, opts) { if (t !== "abort" || typeof cb !== "function") return; for (const r of this._l) if (r.cb === cb) return; this._l.push({ cb, once: !!(opts && opts.once) }); }
+      addEventListener(t, cb, opts) { if (t !== "abort" || typeof cb !== "function") return; for (const r of this._l) if (r.cb === cb) return; this._l.push({ cb, once: !!(opts && opts.once), resistStopPropagation: !!opts?.[kResistStopPropagation] }); }
       removeEventListener(t, cb) { if (t !== "abort") return; this._l = this._l.filter((x) => x.cb !== cb); }
       dispatchEvent(e) { if (e && e.type === "abort") this._fire(); return true; }
       throwIfAborted() { if (this.aborted) throw this.reason || new G.DOMException("signal is aborted without reason", "AbortError"); }
@@ -2066,7 +2129,11 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       // exception on the next tick and carries on with the remaining
       // listeners (internal/event_target.js emitUncaughtException).
       _fire() {
-        const ev = { type: "abort", target: this };
+        const ev = {
+          type: "abort", target: this, currentTarget: this, cancelBubble: false,
+          stopPropagation() { this.cancelBubble = true; },
+          stopImmediatePropagation() { this.cancelBubble = true; this[kStopImmediate] = true; },
+        };
         const report = (err) => {
           const p = G.process;
           if (p && typeof p.nextTick === "function") p.nextTick(() => { throw err; });
@@ -2074,16 +2141,39 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
         };
         if (typeof this.onabort === "function") { try { this.onabort.call(this, ev); } catch (err) { report(err); } }
         for (const r of this._l.slice()) {
+          if (ev[kStopImmediate] && !r.resistStopPropagation) continue;
           if (r.once) this.removeEventListener("abort", r.cb);
           try { r.cb.call(this, ev); } catch (err) { report(err); }
         }
+        ev.currentTarget = null;
       }
       static abort(reason) { const s = new AbortSignal(); s.aborted = true; s.reason = reason !== undefined ? reason : new G.DOMException("The operation was aborted.", "AbortError"); return s; }
       // `__mbunAbortAt` records the deadline as a wall-clock instant. A purely
       // synchronous native that has to honour a signal (Bun.spawnSync) cannot
       // run the timer that would fire this signal, so it reads the deadline
       // directly and applies it as its own timeout instead.
-      static timeout(ms) { const s = new AbortSignal(); Object.defineProperty(s, "__mbunAbortAt", { value: Date.now() + (Number(ms) || 0), enumerable: false, configurable: true, writable: true }); if (G.setTimeout) G.setTimeout(() => { s.aborted = true; s.reason = new G.DOMException("The operation was aborted due to timeout", "TimeoutError"); s._fire(); }, ms); return s; }
+      static timeout(ms) {
+        const s = new AbortSignal();
+        Object.defineProperty(s, "__mbunAbortAt", {
+          value: Date.now() + (Number(ms) || 0),
+          enumerable: false, configurable: true, writable: true,
+        });
+        if (G.setTimeout) {
+          // Node's timeout signal is not retained by its timer: otherwise an
+          // otherwise-unreachable signal cannot be collected, and a long
+          // timeout keeps an unrelated process alive.
+          const signalRef = new G.WeakRef(s);
+          const timer = G.setTimeout(() => {
+            const signal = signalRef.deref();
+            if (!signal || signal.aborted) return;
+            signal.aborted = true;
+            signal.reason = new G.DOMException("The operation was aborted due to timeout", "TimeoutError");
+            signal._fire();
+          }, ms);
+          if (timer && typeof timer.unref === "function") timer.unref();
+        }
+        return s;
+      }
       static any(signals) { const s = new AbortSignal(); for (const sig of signals) { if (sig.aborted) { s.aborted = true; s.reason = sig.reason; return s; } sig.addEventListener("abort", () => { if (!s.aborted) { s.aborted = true; s.reason = sig.reason; s._fire(); } }); } return s; }
       // WebCore AbortSignal::memoryCost() includes m_algorithms.sizeInBytes();
       // mbun's algorithm list is `_l` (std::pair<uint32_t, Function> ≈ 16 bytes

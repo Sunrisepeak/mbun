@@ -20,6 +20,7 @@ debug = false
 # Cross-member deps: module_loader (core/resolver/js) + runtime Bun.* bindings (semver/toml/glob).
 [dependencies]
 core     = { path = "../core" }
+css      = { path = "../css" }
 # node's Permission Model. The decision logic is a separate, engine-free member
 # so it can be unit-tested; this member supplies the syscall boundary that
 # consults it (io_bindings.inc, the spawn bridges, the module loader).
@@ -35,6 +36,7 @@ glob   = { path = "../glob" }
 image  = { path = "../image" }
 shell  = { path = "../shell" }
 which  = { path = "../which" }
+install = { path = "../install" }
 dns    = { path = "../dns" }
 dotenv = { path = "../dotenv" }
 sqlite = { path = "../sqlite" }

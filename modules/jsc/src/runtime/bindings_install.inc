@@ -47,6 +47,10 @@
         set_fn(ctx_, iniN, "parse", ini_parse_cb);
         set_prop(ctx_, global, "__mbunIniNative", iniN);
 
+        // CSS parser/printer bridge for bun:internal-for-testing.cssInternals.
+        JSObjectRef cssN{JSObjectMake(ctx_, nullptr, nullptr)};
+        set_fn(ctx_, cssN, "minify", css_minify_cb);
+        set_prop(ctx_, global, "__mbunCssNative", cssN);
 
         // Bun.build → in-memory bundler slice (runtime/bun_build.inc).
         set_native_fn(ctx_, bun, "build", 1, bun_build_host);
@@ -203,7 +207,7 @@
 
         // node:crypto asymmetric + cipher backend (vendored OpenSSL / mbun.openssl).
         JSObjectRef cryptoAsymNative{JSObjectMake(ctx_, nullptr, nullptr)};
-        set_native_fn(ctx_, cryptoAsymNative, "generateKeyPair", 9, node_asym_generate_host);
+        set_native_fn(ctx_, cryptoAsymNative, "generateKeyPair", 14, node_asym_generate_host);
         set_native_fn(ctx_, cryptoAsymNative, "sign", 7, node_asym_sign_host);
         set_native_fn(ctx_, cryptoAsymNative, "verify", 8, node_asym_verify_host);
         set_native_fn(ctx_, cryptoAsymNative, "publicEncrypt", 6, node_asym_public_encrypt_host);
@@ -258,7 +262,9 @@
             }
         }
         const std::string exe{exe_path()};
-        set_prop(ctx_, process, "argv0", make_string(ctx_, exe));
+        // execPath is the real executable; argv0 preserves the caller's name.
+        const std::string argv0{!gArgv.empty() && !gArgv.front().empty() ? gArgv.front() : exe};
+        set_prop(ctx_, process, "argv0", make_string(ctx_, argv0));
         set_prop(ctx_, process, "execPath", make_string(ctx_, exe));
         set_prop(ctx_, process, "platform", make_string(ctx_, host_platform()));
         set_prop(ctx_, process, "arch", make_string(ctx_, host_arch()));
@@ -708,6 +714,11 @@
         set_fn(ctx_, smn, "toVLQ", source_map_to_vlq_cb);
         set_fn(ctx_, smn, "find", source_map_find_cb);
         set_prop(ctx_, global, "__mbunSourceMapNative", smn);
+        // hostedGitInfo.parseUrl is an install parser diagnostic exposed solely
+        // through bun:internal-for-testing (bootstrap.cppm).
+        JSObjectRef hostedGitInfo{JSObjectMake(ctx_, nullptr, nullptr)};
+        set_fn(ctx_, hostedGitInfo, "parseUrl", hosted_git_info_parse_url_cb);
+        set_prop(ctx_, global, "__mbunHostedGitInfoNative", hostedGitInfo);
         // node:http maxHeaderSize <-> the process-wide mbun.http limit that
         // every server reads per request. ref: bun node_http_binding.rs.
         JSObjectRef htn{JSObjectMake(ctx_, nullptr, nullptr)};
@@ -740,6 +751,10 @@
         set_fn(ctx_, pn, "ptyResize", proc_pty_resize_cb);
         set_fn(ctx_, pn, "poll", proc_poll_cb);
         set_fn(ctx_, pn, "ids", proc_ids_cb);
+        set_fn(ctx_, pn, "setCredential", proc_set_credential_cb);
+        set_fn(ctx_, pn, "setgroups", proc_setgroups_cb);
+        set_fn(ctx_, pn, "initgroups", proc_initgroups_cb);
+        set_fn(ctx_, pn, "groups", proc_groups_cb);
         set_fn(ctx_, pn, "setNonBlock", proc_set_nonblock_cb);
         set_fn(ctx_, pn, "writeNB", proc_write_nb_cb);
         set_fn(ctx_, pn, "readNB", proc_read_nb_cb);
@@ -762,9 +777,59 @@
   if (!PN || !PN.ids || !p) return;
   const ids = PN.ids();
   p.pid = ids.pid; Object.defineProperty(p, "ppid", { configurable: true, enumerable: true, get() { return PN.ids().ppid; } });
-  p.getuid = () => ids.uid; p.geteuid = () => ids.euid;
-  p.getgid = () => ids.gid; p.getegid = () => ids.egid;
-  p.getgroups = () => [ids.gid];
+  p.getuid = () => PN.ids().uid; p.geteuid = () => PN.ids().euid;
+  p.getgid = () => PN.ids().gid; p.getegid = () => PN.ids().egid;
+  p.getgroups = () => PN.groups();
+  const credentialType = (name, value) => {
+    const received = value === undefined ? "undefined" : value === null ? "null"
+      : typeof value === "object" ? "an instance of " + ((value.constructor && value.constructor.name) || "Object")
+      : typeof value === "function" ? "function " + (value.name || "")
+      : "type " + typeof value + " (" + String(value) + ")";
+    const e = new TypeError('The "' + name + '" argument must be one of type number or string. Received ' + received);
+    e.code = "ERR_INVALID_ARG_TYPE";
+    return e;
+  };
+  const credentialError = (result) => {
+    if (result.unknownKind) {
+      const e = new Error((result.unknownKind === "user" ? "User" : "Group") +
+        " identifier does not exist: " + result.unknownName);
+      e.code = "ERR_UNKNOWN_CREDENTIAL";
+      throw e;
+    }
+    if (result.errno) {
+      const code = ({ 1:"EPERM", 2:"ENOENT", 13:"EACCES", 22:"EINVAL" })[result.errno] || "UNKNOWN";
+      const e = new Error(code + ", " + (code === "EPERM" ? "Operation not permitted" : "credential operation failed"));
+      e.code = code; e.errno = -result.errno; e.syscall = "set*id";
+      throw e;
+    }
+  };
+  const credentialSetter = (which) => function(id) {
+    if (typeof id !== "number" && typeof id !== "string") throw credentialType("id", id);
+    credentialError(PN.setCredential(which, id));
+  };
+  p.setuid = credentialSetter(0); p.seteuid = credentialSetter(1);
+  p.setgid = credentialSetter(2); p.setegid = credentialSetter(3);
+  p.setgroups = function(groups) {
+    if (!Array.isArray(groups)) {
+      const e = new TypeError('The "groups" argument must be an instance of Array. Received ' +
+        (groups === undefined ? "undefined" : typeof groups));
+      e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+    }
+    for (let i = 0; i < groups.length; ++i) {
+      const group = groups[i];
+      if (typeof group !== "number" && typeof group !== "string") throw credentialType("groups[" + i + "]", group);
+      if (typeof group === "number" && (!Number.isInteger(group) || group < 0)) {
+        const e = new RangeError('The value of "groups[' + i + ']" is out of range.');
+        e.code = "ERR_OUT_OF_RANGE"; throw e;
+      }
+    }
+    credentialError(PN.setgroups(groups));
+  };
+  p.initgroups = function(user, extraGroup) {
+    if (typeof user !== "number" && typeof user !== "string") throw credentialType("user", user);
+    if (typeof extraGroup !== "number" && typeof extraGroup !== "string") throw credentialType("extraGroup", extraGroup);
+    credentialError(PN.initgroups(user, extraGroup));
+  };
   // process.kill(pid, signal) — real signal delivery (default SIGTERM).
   const SIGMAP = { SIGHUP:1, SIGINT:2, SIGQUIT:3, SIGILL:4, SIGTRAP:5, SIGABRT:6, SIGBUS:7, SIGFPE:8, SIGKILL:9, SIGUSR1:10, SIGSEGV:11, SIGUSR2:12, SIGPIPE:13, SIGALRM:14, SIGTERM:15, SIGCHLD:17, SIGCONT:18, SIGSTOP:19, SIGTSTP:20 };
   p.kill = function (pid, sig) {

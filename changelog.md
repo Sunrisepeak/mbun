@@ -3,6 +3,739 @@
 > 只记录**实质进展**（模块落地、测试集通过数变化、性能节点），倒序排列。
 > 格式：`## YYYY-MM-DD` + 条目（关联任务 ID / commit / 测试与性能数据）。
 
+## 2026-07-29
+
+### 推进策略加速：减少全量冻结，切 Node 12-file 长尾吞吐
+
+复盘确认主集成瓶颈是每个 7 分钟小波次都重复冻结 5–7 分钟跑 Node+Bun
+全量。现改为 20–30 分钟 checkpoint、6–10 候选一次组合构建；全 Node
+只在 Node/CLI/bootstrap/process 改动后运行，全 Bun 每2–3波或累计预计
+≥50 fail 时运行。准入门槛提高到 ≥10 fail/15min 或 ≥2 green/20min。
+Node 长尾使用 `make_worklists.py` 生成按 subsystem 隔离的 12-file 清单，
+每文件诊断最多5分钟，目标从“等大根因”改为“25分钟最大完整green数”。
+
+当前权威全量：Node **2788/4433**；Bun **92/230 green**，
+**5063 pass / 752 fail assertions**。相对首个 Bun 统一 checkpoint
+4441/1371，净 **+622/-619**。
+
+### 第三十一批阶段结果：保留 stdin -6 与 hostedGit 全绿，RSV 低收益回退
+
+- process.stdin lifecycle **5/9 → 11/3**（-6）；
+- hostedGitInfo URL parser bridge **0/5 → 5/0**（-5，新增green）；
+- WebSocket RSV/permessage-deflate 预计7、实际仅 **1/7 → 2/6**，实现
+  60行且收益1，已 additive revert；重建后回到1/7，另外两目标保持。
+
+### Wave32–33 Node 长尾全量校正：HTTP 广泛回归已回退，稳定净增约12
+
+六条 subsystem 隔离 lane 各处理12个明确 Node fail，每文件诊断最多5分钟：
+
+- wave32：process **2/3**、HTTP 定向3但其中2个引发跨文件回归后回退，
+  最终只保留 immediate-error **+1**；child_process 稳定 **2/12**；
+  `execfile` 曾短暂 pass、最终复验回到 fail，不计；
+  Worker **0/12**，两个源码提交与静态预测文档全部 additive revert；
+- wave33：module **4/12**、FS **2/12**，合计 **+6 green**；
+  HTTP/2 **0/12**，源码与预测文档全回退；FS write-buffer 单提交零收益
+  也回退。
+
+首次全量只得 **2761/4433**：14 fail→pass 同时出现41个 HTTP
+pass→fail。四个 HTTP lazy-parser/header-symbol/destroy-error 提交已全回退；
+398-file HTTP 子树从基线353 pass恢复为 **354 pass**，仅保留
+immediate-error +1。校正后两轮稳定推算约 **+12 Node green**；下一次
+全量确认前不再使用定向总和代替全局净值。
+
+### Wave34 24-file 扩容：实际仅5 green，恢复12-file高置信策略
+
+三 lane 各处理24个文件，静态预计18，实际：
+
+- crypto **3/24**：Argon2 unsupported、DEP0203、KeyObject no-own-symbols；
+- net/dgram **2/24**：send queue info、local address/port；
+- util/url **0/24**，全部源码回退。
+
+crypto Hash 零收益提交及 net 静态预测文档也回退。24-file 扩容只扩大
+静态误判，没有提高 green/minute；下一轮恢复12个高置信文件，并在全量前
+先跑完整相关子树。当前校正后定向推算 Node **2805/4433**。
+
+校正树完整 Node 全量已确认 **2805/4433（63.27%）**，相对 PR 起点
+2654 为 **+151**。18个 fail→pass 与1个 TLS socket timeout；后者同二进制
+持续 timeout，定位到 net preconnect flush 改动后恢复 baseline pass。
+意外 worker pass 同二进制复跑失败，不计稳定收益。
+
+### Wave35 12-file高置信：新增3 green，相关子树零回归
+
+- crypto：ECDH `setPublicKey` DEP0031 **+1**；
+- module：`module.parent` DEP0144 **+1**；首次实现泄漏
+  `__mbunModuleParent` global，导致 pending-deprecation crypto pass 回归，
+  改为闭包私有状态后 crypto guard恢复；
+- require：`--no-experimental-require-module` 的 `.mjs` ERR_REQUIRE_ESM
+  **+1**；
+- net no-halfopen候选造成已绿 local-address timeout，整提交回退；
+  WebCrypto cross-realm 零收益也回退。
+
+完整 crypto/module/require 子树只有上述3个 fail→pass、零pass回归。当前
+全量确认 Node **2808/4433（63.34%）**：上述3项加上此前 TLS socket
+timeout 恢复为 pass，同时 `test-worker-terminate-source-map.js` 从 pass
+变 fail；该 worker 文件在同一二进制连续3次复跑均 fail，不再计为 green。
+
+### Wave36 三组12-file实跑：新增6 green，淘汰4个无效候选
+
+静态预计10+，36个原生失败文件实跑后实际 **6/36 转绿**：
+
+- process：动态导入 `node:process` 默认导出、env pending-deprecation、
+  ref/unref protocol，共 **+3**；
+- child_process：prototype tampering、spawn error、stdin，共 **+3**；
+- hrtime、exit-code validation、getBuiltinModule 类型校验均0收益并回退；
+  dlopen error-code候选编译歧义，立即回退；不准确的预测文档同步回退。
+
+撤回后重新构建通过；完整 `test-process*` 96文件、`test-child*` 111文件、
+`test-cluster*` 83文件复验，只有上述6项 fail→pass，**0 pass→nonpass**。
+完整 Node 最终为 **2812/4433（63.43%）**，全局净 +4：6个目标转绿，
+另有 watch-mode timeout→pass；同时3个非目标 pass→fail。后者单文件连续
+3次复验均失败，其中 REPL/stdio 两项都是 runner 的 `spawn mbun ENOENT`
+PATH 敏感问题，weakref 是 GC 波动项，均未命中本轮改动合同。效率按保守
+全局净值由 `wave_report.py` 计算为 **11 green/hour（0.35h、3 agents）**，
+不再沿用短时投影的25.7/hour。
+
+### Wave37 errors/HTTP2/TLS：静态预计6，真实仅1，低收益方向降权
+
+三条12-file lane 的静态候选在一次共享构建后实跑：
+
+- errors：DNSException/AggregateError stack **0/2**；
+- HTTP/2：extended CONNECT settings **0/1**；
+- TLS：captureRejections **1/1**，PFX/PKCS#12 **0/2**。
+
+零收益的 errors、HTTP/2、PFX 源码全部 additive revert，仅保留10行 TLS
+修复。重新构建后目标仍绿；完整 `test-tls*` 217文件与 `test-https*`
+63文件只有该项 fail→pass，0 pass→nonpass（`test-tls-fast-writing`
+timeout→OOM 不属于 green 回归）。本轮仅 **1/36（2.8%）**，故下一批
+停止优先静态错误消息、PFX 和单文件 HTTP/2，改投 module/fs/net-dgram
+三组具共享机制的12-file清单。
+
+### Wave38 动态换 lane：stream +3、net +2，完整相关域零回归
+
+module lane 逐文件读取后确认没有 ≥2-green 可行机制，未改代码即止损，
+动态改派 stream。三组36文件实跑最终 **5/36 转绿**：
+
+- EventEmitter `removeListener` 把不匹配的单函数误作数组遍历，修复后
+  三个 stream 文件转绿；
+- 显式 IPv6 custom lookup/loopback 合同使两个 net 文件转绿；
+- FS FileHandle aggregate-errors 与 net write queue 均0收益，全部回退。
+
+撤回后重建通过；完整 stream 249、net 150、dgram 76文件只有5项
+fail→pass，**0 pass→nonpass**。端到端保守速率约 **20 green/hour**。
+
+### Wave39 按错误签名聚类：20个 ERR_INVALID_ARG_TYPE 文件新增3 green
+
+不再只按子系统切分，而是把最大明确合同簇分成 async/events、crypto、
+misc runtime 三个互斥工作单。实测：
+
+- AsyncLocalStorage.bind **+1**；
+- zlib 非 Buffer/String 同步输入 **+1**；
+- V8 heap-profile options **+1**；
+- crypto HMAC/ECDH 候选0收益并回退。
+
+完整 async 56、zlib 62、V8 23文件复验只有上述3项 fail→pass，
+**0 pass→nonpass**。以 wave36 全量为权威基线，wave37–39 关联域确认
+累计 +9，当前 Node 推算 **2821/4433（63.64%）**，相对 PR 起点 +167。
+
+### Bun 全量刷新：93/230 green，5074 pass / 740 fail
+
+沿用 wave30 同一230文件清单完整复测，确认 hostedGitInfo **0/5→5/0**
+并新增一个 green，process.stdin **5/9→11/3**；无 green 回退。
+next-auth 一项转 blocked-external。当前 Bun 权威值更新为
+**93/230 green、5074 pass / 740 fail assertions**，不再使用定向投影。
+
+### 5 小时冲刺第三十批：净减 61 个 Bun 失败，cron 新增全绿
+
+五个独立同源簇经主线三次增量构建、原生文件精确验收：
+
+- GFM tagFilter **30/32 → 47/15**（-17）；
+- direct-readable-stream 的 14 个表面 stream 失败实为 JSX text entity
+  未 decode、经 ReactDOM 二次转义；修 lowering 后 **254/15 → 268/1**
+  （-14）；
+- cron invalid/越界 `from` 统一拒绝，**12/12 → 24/0**（-12，新增 green）；
+- bunfig/CLI preload 顺序、去重、合并，**6/12 → 16/2**（-10）；
+- test path-ignore 从解析但丢弃改为 discovery 全路径过滤，
+  **1/9 → 9/1**（-8）。
+
+合计 **-61 fail**，新增 1 个完整 green file。JSON5/JSONL、WPT remaining、
+Bun.write、image-adversarial、CLI init 五条分散或缺 backend 路线均在静态
+阶段止损。
+
+### 第二十九批 PR 推送后全量验证
+
+- Bun：**91/230 green**，assertions **5001/814**，相对 wave28
+  **+58/-58**；JSON5 +45/-45、WPT +14/-14 精确复现，`ws-proxy`
+  4/15→3/16 且同二进制复跑保持 3/16，故诚实全局净值比定向少1；
+- Node：**2787/4433 pass**，984 fail / 90 timeout / 3 OOM / 569 skip；
+  weakref 的 pass→fail 已在前一轮同二进制复跑出现，属于跨轮不稳定，
+  未宣称稳定 Node 新增。
+
+### 5 小时冲刺第二十九批：净减 59 个 Bun 失败
+
+重排后只接受两个同源实现，其余四条路线在静态阶段止损：
+
+- JSON5 parser 直接按上下文对齐 reference error taxonomy，不以顶层 catch
+  猜测映射，**259/62 → 304/17**，净减 45（预计约35）；
+- WPT byte ReadableStream tee 保留 byte branches、clone chunk、使用 byte
+  controller close/error，**1083/92 → 1097/78**，净减 14（预计30+，
+  明显高估同源簇规模，下一轮必须重新聚类）。
+
+DCE 需要尚缺的 scan/link/codegen/per-export tree shaking；WebView 没有真实
+Chrome/CDP backend；Inspector 没有 JSC profiler seam；node:test 失败拆成
+TestContext delegation 与 mock tracker。四者均未写 stub 或混合补丁。
+
+### 第二十八批 PR 推送后全量验证
+
+- Bun：**91/230 green**，assertions **4943/872**，相对 wave27
+  **+63/-61**；两目标严格 +63/-63，另 `svelte/client-side.test.ts`
+  从 blocked-external 变 test-failure，新增 2 个测得失败；
+- Node：**2788/4433 pass**，983 fail / 89 timeout / 4 OOM / 569 skip。
+  weakref fail→pass 与 watcher pass→timeout 一进一出；同二进制复跑两者
+  又为 fail/timeout，确认是跨运行不稳定，未宣称新增稳定 Node green。
+
+### 5 小时冲刺第二十八批：7 分钟净减 63 个 Bun 失败，540 fail/hour
+
+15:25–15:32 在 wave27 全量冻结后验收两个同源剩余簇：
+
+- REPL 的统一根因是 `Bun.spawn({ stdin: Buffer })` 未把字节 stdin 转发给
+  child，所有非 PTY 交互只收到 greeting 后 EOF；改走 async pipe writer 后
+  **19/98 → 69/48**，净减 50（静态预计约 64，命中 78%）；
+- TOML.parse 统一 Blob/ArrayBuffer/view/字符串输入边界，补 fatal UTF-8、
+  BOM、USV 与安全整数范围诊断，**58/25 → 71/12**，净减 13
+  （静态预计 12）。
+
+一次精确构建后两文件合计净减 **63 fail**，约 **540 fail/hour**。两文件
+仍红，不计新增 green file；剩余 REPL/TOML 已进入分散尾部，wave29 转向
+JSON5 62、WPT Streams 92、bundler DCE 53 三个更大失败池。
+
+### 5 小时冲刺第二十七批：18 分钟净减 438 个 Bun 失败断言，1 文件全绿
+
+14:57–15:15 按全量 checkpoint 的失败断言排序，三条静态实现 lane、主线统一
+构建和逐文件原生验收。十个独立目标全部正收益：
+
+- JSONL **98/171 → 264/5**（-166 fail），并恢复 4GB allocation guard，
+  消除候选首次运行的 OOM；
+- JSON5 **116/205 → 259/62**（-143）；
+- WPT Streams **1055/120 → 1083/92**（-28），TOML
+  **35/48 → 58/25**（-23），GFM **20/42 → 30/32**（-10）；
+- `Bun.inspect.table` **0/35 → 35/0**，本轮唯一完整新绿文件；
+- REPL **0/117 → 19/98**（-19），crypto **178/24 → 185/17**
+  （-7），URLPattern **392/16 → 396/12**（-4）；
+- AsyncLocalStorage **22/21 → 25/18**（-3），同时 Node 三个
+  Worker/MessagePort `hasRef` 守卫维持 3/3。
+
+合计净减少 **438 个失败测试/断言**，约 **1460 fail assertions/hour**。
+除 `Bun.inspect.table` 外其余文件仍红，未计作 green-file coverage。策略继续
+按 failed assertions/minute 排序；JSON5/JSONL 的高聚类缺失 API 明显优于
+URLPattern 等分散长尾，后者降级。精确构建和结构守卫全绿；完整 Node/Bun
+corpus 只在本 checkpoint 推送 PR 后运行。
+
+### 第二十七批 PR 推送后全量验证：Bun +2 green，Node +1 pass
+
+`c820938` 推送后完成两套统一 runner 全量：
+
+- Bun：**91/230 green**（前次 89，+2），122 test-failure /
+  3 blocked-external / 11 all-skipped / 1 load-error / 1 no-tests /
+  1 ahead-of-reference；assertions **4880 pass / 933 fail**，相对前次
+  **+439/-438**。除预期 `Bun.inspect.table` 外，WPT Streams 修复还使
+  `native-source-onclose-leak` 3/1→4/0 全绿；next-auth 的外部阻塞分类
+  变为 load-error 并新增 1 个失败断言；
+- Node：**2788/4433 pass**（前次 2787，+1），984 fail / 88 timeout /
+  4 OOM / 569 skip。唯一 non-pass→pass 为 watch-mode watcher；
+  pass→non-pass **0**。另有 7 个 timeout→fail、1 个 timeout→OOM，
+  属于分类移动而不是新 pass 回归。
+
+全量结果确认 wave27 的 438 个 Bun fail 减量没有被隐藏回归抵消。Node
+与 Bun 当前 non-pass 分别为 1645 和 139 个可执行文件分类。
+
+### 5 小时冲刺全量 checkpoint：Node 2787/4433，Bun 89/230
+
+PR wave26 推送后按统一 runner 完成全量实测：
+
+- Node：**2787 pass / 4433**（62.87%），另 977 fail / 97 timeout /
+  3 OOM / 569 skip；相对发布起点 2654 pass 的净变化为 **+133**，当前
+  non-pass 1646；
+- Bun 当前可执行 discover：**89 green / 230**，另 123 test-failure /
+  1 timeout / 4 blocked-external / 11 all-skipped / 1 no-tests /
+  1 ahead-of-reference；assertion 口径 **4441 pass / 1371 fail**。
+
+局部 wave 按命名因果累计 +147，而全量净变化 +133；两者差 14 说明局部
+守卫不能替代全量去重/回归口径。后续 Bun 调度改按 failed assertions /
+wall-clock：JSON5 205、JSONL 171、WPT Streams 120 为最高收益前三。
+
+### 5 小时冲刺第二十六批：4 分钟净增 2 文件，30 files/hour
+
+14:44–14:48 组合 IPC UTF-8 framing/backpressure 与 exec maxBuffer chunk
+typing，静态预计 4，实际 **+2**：
+
+- IPC 按字节累计完整换行帧再 UTF-8 decode，send-utf8 **+1/2**；
+  backpressure 返回序列仍红；
+- exec/execFile 保留字符串/Buffer chunk 类型并按字节计数、按同型边界
+  截断，execFile maxBuffer **+1**，同时守住已发布的 exec-maxbuf；
+- 两份已发布 encoding 文件也在组合门禁中继续通过。
+
+六文件精确门禁 5 pass / 1 既有 fail；本批新增 2，green→non-green 0，
+结构守卫全绿。
+
+### 5 小时冲刺第二十五批：6 分钟净增 3 文件，30 files/hour
+
+14:38–14:44 组合 execFile result/promisify、options/env 与 IPC stdio
+validation，静态预计 6，严格结算 **+3**：
+
+- promisified exec/execFile 暴露 `.child` 并保留 error stdout/stderr，
+  promisified 目标 **+1**；execFile 在主集成补 DEP0190 只发一次后仍因
+  child exit code 独立问题红，不计；
+- ChildProcess.spawn 在 file 前验证 envPairs 与多 IPC，constructor/stdio
+  两文件 **2/2**；
+- options/env prototype 两文件仍红，对应提交 additive revert。
+
+四文件精确保留集为 3 pass / 1 既有 fail，均为 frozen 3 fail→pass，
+green→non-green 0；结构守卫全绿。
+
+### 5 小时冲刺第二十四批：16 分钟净增 3 文件，11.25 files/hour
+
+14:22–14:38 先止损 TLS/TextDecoder 零收益候选，再集中验收
+child_process exec encoding 与 promisified AbortSignal，严格结算 **+3**：
+
+- exec 有效 encoding 安装 stream decoder、非法/显式 undefined/null/buffer
+  保留 Buffer，主集成补“属性省略 vs 显式 undefined”后 encoding 与 data
+  event 两文件 **2/2**；
+- exec/execFile custom promisify 在 Promise 构造前同步验证 AbortSignal，
+  实际 **+1/2**；exec 目标从 fail 变 timeout，仍按 0；
+- TLS/HTTPS 两目标 frozen 本已绿；TextDecoder 两红仍红；相关三个提交
+  全部 additive revert。AEAD 候选只映射一个 frozen 红文件，未纳入。
+
+14 文件 child exec 相关守卫为 8 pass / 2 既有 fail / 3 timeout / 1 skip；
+本批命名新增 3，green→non-green 0。守卫中的旧 exec-maxbuf green 已在
+早期 maxBuffer wave 发布，不重复归因。结构守卫全绿。
+
+### 5 小时冲刺第二十三批：7 分钟净增 3 文件，25.7 files/hour
+
+14:15–14:22 验收 string_decoder、DNS resolver channel 与 concatenated
+gzip，严格结算 **+3**：
+
+- DNS Resolver 通过可观察 ChannelWrap `_handle` 路由 resolve，两个目标
+  **2/2**；
+- gzip 多 member/trailing 输入预计 3，实际 **+1/3**；候选首次构建暴露
+  inflate loop 语法错误，主集成修正循环结构后才进入运行门禁；
+- string_decoder 相关两文件 frozen 已绿，无新增覆盖，提交 additive
+  revert。
+
+13 文件 DNS/zlib 完整相关守卫为 9 pass / 3 既有 fail / 1 timeout；
+frozen 对比 3 fail→pass、green→non-green 0，结构守卫全绿。
+
+### 5 小时冲刺第二十二批：4 分钟净增 1 文件，15 files/hour
+
+14:11–14:15 验收 V8 transferArrayBuffer 与 DNS lookup boolean options，
+静态预计 4，实际 **+1**：
+
+- DNS callback/promise 共用 `all`/`verbatim` boolean 校验，promise
+  deprecated-options 目标 **+1/2**；callback 文件仍有独立失败；
+- V8 serdes 仍红，两个既有绿色序列化守卫保持，提交 additive revert。
+
+完整 5 文件 DNS lookup 守卫为 4 pass / 1 既有 fail；frozen 对比
+1 fail→pass、green→non-green 0，结构守卫全绿。
+
+### 5 小时冲刺第二十一批：8 分钟净增 3 文件，22.5 files/hour
+
+14:03–14:11 组合 vm compile 输入校验与 Worker/MessagePort async-hook
+生命周期，静态预计 4–5，实际 **+3**：
+
+- WORKER/MESSAGEPORT 资源进入现有 active hook registry；主集成补 hook
+  callback `this` controller 身份、MessagePort close ref 延迟，三个 hasRef
+  目标最终 **3/3**；
+- vm 两个目标仍红，两个既有绿色验证守卫保持，但整文件新增为 0，
+  vm 提交 additive revert。
+
+精确修正版重建后 Worker 三文件 3/3，均为 frozen fail→pass，
+green→non-green 0；结构守卫全绿。
+
+### 5 小时冲刺第二十批：8 分钟净增 2 文件，15 files/hour
+
+13:55–14:03 验收 Hash/Hmac、child maxBuffer、module/require 与 Worker
+entry protocol，严格结算 **+2**：
+
+- Worker 对字符串 `file:`/`data:` URL 及 URL+eval 组合执行 Node 入口
+  校验；主集成修正 `file://` 精确 guidance 后两个目标 **2/2**；
+- Hash/Hmac encoding 两文件仍红，提交 additive revert；
+- child sync maxBuffer 已由 wave4 公共 `spawnSync` 路径覆盖，module/require
+  校验已由 wave14 覆盖；两项冲突审查后直接 skip，不重复代码、不计收益。
+
+两个 Worker 目标从 frozen fail→pass，green→non-green 0；精确修正版
+重建后 2/2，结构守卫全绿。
+
+### 5 小时冲刺第十九批：5 分钟净增 1 文件，12 files/hour
+
+13:50–13:55 组合 DH/ECDH 未初始化状态与 net terminal write 错误，静态
+预计 4，实际 **+1**：
+
+- destroyed socket write 使用 `ERR_STREAM_DESTROYED`，目标 **+1/2**；
+  `test-net-write-after-end-nt` 从 fail 变 timeout，仍按 0；
+- DH/ECDH 五个相关失败全部未转绿，crypto 提交 additive revert。
+
+10 文件 net write/socket-destroy 完整守卫为 9 pass / 1 timeout；相对
+frozen gate 只有上述 1 个 fail→pass，既有 pass 全保持。结构守卫全绿。
+
+### 5 小时冲刺第十八批：5 分钟净增 2 文件，24 files/hour
+
+13:45–13:50 集中验收 keygen、sign/verify、HTTP lenient parser、timers
+promisify 与 net auto-select defaults，静态预计约 13，严格结算 **+2**：
+
+- HTTP insecure parser per-stream lenient header value **+1/2**；
+- net auto-select attempt-timeout CLI default **+1/3**；
+- keygen/sign 与 timers 目标仍红，三个实现提交 additive revert；
+- 目标集中出现的四个 RSA/keygen 绿色来自此前已发布的 RSA 实现，按因果
+  去重不归因于本批。
+
+8 文件 HTTP/net 完整相关守卫为 3 pass / 5 既有 fail；相对 frozen gate
+2 个 fail→pass、green→non-green 0。conflict-marker、gitlink、diff
+守卫全绿。
+
+### 5 小时冲刺第十七批：7 分钟净增 5 文件，42.9 files/hour
+
+13:38–13:45 集中验收 crypto、compression、HTTP、util 七个静态候选，
+预计约 12–13 文件，严格结算 **+5**：
+
+- HTTP Agent maxTotalSockets / timeout option **+2**；
+- terminal HTTP parser 在 upgrade/parse-error 后解除 socket 引用，实际
+  **+1/2**；
+- CompressionStream 只接受 BufferSource，命名目标 **+1/2**，相关守卫
+  另带出 compression/decompression stream 1 个，同根合计 **+2**；
+- crypto random、HTTP pipeline timeout、KeyObject export、util promisify
+  均只推进首错误或仍红，**0**；四个提交已 additive revert。为 null
+  chunk 补专用错误码仍未使整文件转绿，也已 additive revert。
+
+36 文件完整相关守卫为 25 pass / 11 既有 fail；相对 frozen gate 为
+5 个 fail→pass、green→non-green 0。conflict-marker、gitlink、diff 守卫
+全绿。
+
+### 5 小时冲刺第十六批：12 分钟净增 8 文件，40 files/hour
+
+13:26–13:38 组合 async-hooks timer bootstrap 与 net pre-connect write
+backpressure，静态命名预计 4，相关簇守卫实际 **+8**：
+
+- timer facade 在 bootstrap 后再绑定 async-hook 生命周期，两个命名目标
+  全绿，并同时修复 close/destroy、disable GC tracking、enabled-hooks exit
+  与 double-destroy 四个同根文件，async-hooks 合计 **+6**；
+- `net.Socket` 在公开 `connect` 边界前保持 pending 状态，任何 pre-connect
+  write 都返回 backpressure 并延迟回调，两个 connect-buffer 目标 **+2**；
+- RSA-PSS 旧候选与当前 14 参数 ABI/限制实现语义重复，冲突审查后直接
+  skip，没有重复提交，也不虚增收益。
+
+完整相关守卫覆盖 60 个 `test-async-hooks-*` / `test-net-connect-*` 文件，
+结果 33 pass / 24 既有 fail / 3 timeout；相对 frozen gate 为 8 个
+fail→pass、green→non-green 0。目标四文件另有精确门禁 4/4 pass。
+
+### 5 小时冲刺第十五批：9 分钟净增 9 文件，60 files/hour
+
+13:17–13:26 组合 CLI syntax-check、diagnostics module tracing、Buffer
+DEP0005 与 OS internal contracts，预计 13、目标集实际 **+9**：
+
+- CLI `--check` stdin/eval/bad syntax 预计 4，实际 **2**；另两项停在独立
+  stderr 文案/option dispatch；
+- diagnostics `module.require` / `module.import` start/end/error/async 顺序
+  **4/4**；
+- Buffer legacy constructor warning预计 2，实际 **1**；无
+  `--pending-deprecation` 的 callsite/node_modules 判定仍独立；
+- OS signals freeze / checked binding / userInfo getter预计 3，实际新增
+  **2**，第三项 frozen 已绿。
+
+守卫：CLI 7/18 pass，diagnostics 64/67 pass，Buffer 54 pass / 12 fail /
+2 skip，OS 6/7 pass；green→non-green 均为 0。守卫中出现的旧 frozen
+额外 gain 不归因于本批，仍只按命名目标结算。
+
+### 5 小时冲刺第十四批：8 分钟净增 9 文件，67.5 files/hour
+
+13:09–13:17 组合 HTTP client、module/require、readline、Abort timeout、
+BroadcastChannel inspect，静态预计 13，严格结算 **+9**：
+
+- HTTP client pre-abort / parser reason / mutable globalAgent **3/3**；主集成
+  将 DOMException reason 规范成 `AbortError.code=ABORT_ERR` 后全绿；
+- module/require 参数、NUL、paths 合同目标 3/3，并带出
+  `test-module-loading-error`，合计 **+4**；
+- Abort timeout timer unref + WeakRef 预计 2，实际 **+1**；weak listener
+  record 仍强持有 signal；
+- BroadcastChannel depth inspect **+1**；
+- readline 宽字符四目标全部因 dumb terminal self-skip，严格计 **0**，
+  不把 exit 0 冒充兼容。
+
+守卫：HTTP client 63/68 pass，module 11 pass / 18 fail / 3 skip，require
+13 pass / 9 fail / 1 skip，abort 1/7 pass，readline 10 pass / 3 fail /
+8 skip；相对 frozen gate 全部 green→non-green 0。
+
+### 5 小时冲刺第十三批：11 分钟净增 5 文件，27.3 files/hour
+
+12:58–13:09 组合 DNS、assert、stream async-context，预计 8、实际
+**+5**：
+
+- DNS Resolver server/channel state预计 3，实际 **2**；主集成补 rrtype
+  类型校验后 `test-dns.js` 进入独立 lookup-options 错误码，不计；
+- assert fail/ifError/async 预计 3，实际 **2**；补 JSC 缺失的
+  AssertionError stack name/message 前缀后 fail 转绿，async 留在独立
+  generatedMessage 合同；
+- stream finished AsyncResource/ALS 预计 2，实际 **1**；另一个 exposed
+  internal async-context identity 仍为 false。
+
+守卫：13 个 `test-assert-*` 为 5 pass / 7 既有 fail / 1 OOM；28 个
+`test-dns-*` 为 17 pass / 7 既有 fail / 4 timeout；4 个 stream-finished
+目标为 2 pass / 2 既有 fail。三组均 green→non-green 0。
+
+### 5 小时冲刺第十二批：9.5 分钟净增 7 文件，44.2 files/hour
+
+12:49–12:58 组合 console、Buffer、crypto warning 三包，预计 9、实际
+**+7**：
+
+- Buffer detached backing-store / null-prototype input 错误合同 **3/3**；
+- SHAKE 默认 outputLength `DEP0198` 与 non-extractable CryptoKey
+  `DEP0204` 警告 **3/3**；
+- global console 尊重可覆写 `_stdout/_stderr` **1/3**。diagnostics channel
+  registry 与 revoked Proxy `util.inspect(showProxy)` 是独立根因，两段
+  猜测代码在复验 0 收益后由 additive cleanup 删除。
+
+完整 68 文件 `test-buffer-*` 守卫为 52 pass / 14 既有 fail / 2 skip；
+21 文件 `test-console-*` 为 16 pass / 4 既有 fail / 1 timeout；两组均
+green→non-green 0。crypto 三文件全部通过。
+
+### 5 小时冲刺第十一批：5 分钟净增 8 文件，96 files/hour
+
+12:44–12:49 组合 URL、EventEmitter、timers 三个清扫包，静态预计 9，
+实际 **+8**：
+
+- URL：`createObjectURL` 非 Blob 错误码与 `fileURLToPathBuffer` raw-byte /
+  malformed UTF-8 合同 **2/3**；`test-data-url` 仅推进到独立 MIME
+  percent-token 解析失败，不计收益；
+- EventEmitter：无监听 `error` 的 `ERR_UNHANDLED_ERROR`、listener 参数
+  类型、静态 `setMaxListeners` target validation，**3/3**；
+- timers：稳定 Immediate/Timeout facade、callback `this`、dispose 与
+  registry 状态，**3/3**。
+
+完整 EventEmitter 26 文件守卫为 26/26，完整 `test-timers-*` 57 文件为
+46 pass / 11 个既有 fail；按已发布 checkpoint 去重后本批净 +8，两组
+green→non-green 均为 0。URL 的首错误移动再次按 0 结算。
+
+### 5 小时冲刺第十批：9.5 分钟净增 3 文件，18.9 files/hour
+
+12:35–12:44 集成 Node experimental stream/iter 的 FileHandle adapter，
+静态预计 3，实际 **3/3**：
+
+- `FileHandle.pull()` / `pullSync()`：position/limit/chunk、transform、锁、
+  abort 与 autoClose；
+- `FileHandle.writer()`：async/sync write/writev、position/limit、失败/
+  关闭/dispose 与 handle 锁；
+- 主集成门禁额外修正 writer 的两个连续合同：async write 进行中
+  `endSync()` 返回 `-1`；handle lock 抛普通 Error，而已关闭 writer 的
+  write/writev 以 TypeError 拒绝。
+
+完整 19 文件 `test-fs-promises-file-handle-*` 子集最终为 15 pass / 4 个
+既有 fail，对 frozen gate 是 +3 / 0 regression。第一次 `--jobs 8` 出现
+一次 JSC rope-string 瞬时 SIGSEGV；目标单文件立即通过，随后 `--jobs 4`
+重跑全部 19 文件无回归，故不把该不可复现并发 crash 归因或隐去。
+
+### 5 小时冲刺第九批：6 分钟净增 4 文件，40 files/hour
+
+12:29–12:35 组合两个静态 lane，预计 7 个整文件、实际净增 4：
+
+- `net.Server` 在 accepted-fd 边界执行 `blockList` / `maxConnections`
+  admission，拒绝时关闭 handle、只发带端点信息的 `drop`，不触发
+  `connection`；四个目标由 2 fail + 2 timeout 全部转绿，实际 **4/4**；
+- fs promises 临时 `FileHandle` 的 operation/close/aggregate error 预计
+  3，实际 **0/3**。exposed internal 测试修改的是另一套 `FileHandle`
+  identity，当前公开 promises 路径不会观察到该 getter；正确修复需要统一
+  internal/public 路由，超出 20 分钟 lane，补丁已 additive revert。
+
+回滚后的精确树重新构建，四个 net 目标 **4/4 pass**；conflict-marker、
+gitlink、diff 守卫通过，green→non-green 0。策略上继续奖励 accepted
+boundary 这类共享 endpoint，并把“需要统一两套 runtime identity”的工作
+移出短 lane。
+
+### 5 小时冲刺第八批：7 分钟净增 3 文件，25.7 files/hour
+
+12:22–12:29 集中验收五项静态实现候选，预计 6 个整文件、实际新增 3：
+
+- `urlToHttpOptions()` 保留传入 `URL` 的 enumerable 自有属性，
+  `test-http-client-request-options.js` 新增 1；
+- `ClientRequest.setTimeout()` 在 socket connect 后才启动 inactivity
+  timer，`test-http-client-set-timeout.js` 新增 1；第二个 timeout 文件仍停
+  在独立的 `_idleTimeout` 形状合同；
+- Web Streams queuing strategy accessor brand check，
+  `test-whatwg-webstreams-coverage.js` 新增 1；
+- aborted request destroy 与 Encoding Streams 状态校验只移动首错误，
+  各自 0；两项均已用 additive revert 清除。
+
+零收益回滚后的当前树重新执行 `build_or_die`，6 文件门禁为 3 pass /
+3 个既有 fail，即 fail→pass **3**、green→non-green **0**。本批策略结论：
+请求/流的窄合同仍能维持约 25 files/hour，但不得把“进入下一断言”计为
+收益；代理静态预计不够时继续在主集成门禁后立即回滚。
+
+### 5 小时冲刺第七批：15.8 分钟净增 7 文件，26.6 files/hour
+
+12:06–12:22 集中验收三组：
+
+- EventEmitter 单 listener 函数存储/数组升降级，新增 2；完整
+  `test-event-emitter-*` 26 文件回归集为 23 pass / 3 fail，对旧 gate
+  是 7 gain、16 pass 保持、0 regression（其中 5 gain 属上一 checkpoint）；
+- protected AbortSignal listener 绕过普通 listener 的
+  `stopImmediatePropagation`，目标 2 实际新增 1，另一个停在独立错误码；
+- URL legacy parse `DEP0169` + URLSearchParams inspect/brand/iterator/
+  callback/query-prefix，预计 4，实际 **4/4**。
+
+本 checkpoint 相对上一已推状态净 +7，命名/相关子集 green→non-green 0。
+
+### 5 小时冲刺第六批：11.5 分钟净增 7 文件，36.5 files/hour
+
+11:55–12:06 接受四个短合同组，命名验收 **7/7 全绿**：
+
+- `urlToHttpOptions` copied-object port shape + invalid argument，1；
+- HTTP/2 file response 先发 HEADERS，再把 raw fd I/O error 转
+  INTERNAL_ERROR stream/RST，1；
+- EventEmitter once wrapper 返回值与 re-entrant once 语义，2；
+- MaxListeners warning 走 `process.emitWarning` 且包含 limit，3。
+
+本批中途试做 EC `paramEncoding` 与 URL.canParse 必填参数，各自只移动首
+错误而文件仍红；两项均用 additive revert 撤销，不把 0 收益代码留在
+checkpoint。最终接受集合 green→non-green 0。
+
+### 5 小时冲刺第五批：4 分钟净增 4 文件，60 files/hour
+
+11:51–11:55 的 DSA JWK 错误合同与 HTTP/2 native submit error 通用映射，
+静态预计 4 文件，集中验收 **4/4 全绿**：
+
+- DSA JWK keygen 正确抛
+  `ERR_CRYPTO_JWK_UNSUPPORTED_KEY_TYPE`，1/1；
+- `Http2Stream.prototype.info/respond` 负 nghttp2 errno 统一转为
+  stream-level `NghttpError`，经既有 destroy/RST 路径覆盖
+  info headers、direct respond、respondWithFile/FD，3/3。
+
+本批没有只计首错误移动；4 个文件均从 fail/timeout 变为 pass。
+
+### 5 小时冲刺第四批：14.5 分钟净增 7 文件，29.0 files/hour
+
+11:37–11:51 的三个短根因组静态预计 8 文件，集中验收实际 **+7**：
+
+- child_process maxBuffer：预计 4，实际 **4/4**；async 输出超限使用
+  `RangeError/ERR_CHILD_PROCESS_STDIO_MAXBUFFER`，sync 使用 `ENOBUFS`，
+  同时保留 UTF-8 完整字符与调用方后置 `setEncoding()`；
+- RSA-PSS key restrictions/details：预计 3，实际 **2/3**；第三个文件已
+  进入 sign padding 独立失败，不计 key-details 收益；
+- HTTP/2 response splitting sanitation：预计 1，实际 **1/1**。
+
+完整 9 文件集合包含既有绿色 `spawnsync-maxbuf` 防回归项，最终 8 pass /
+1 fail，green→non-green 0。RSA-PSS lane 与主线 publicExponent 改动发生
+三处语义冲突，集成按新 14 参数 ABI 同时保留两边行为，没有选择性覆盖。
+
+### 5 小时冲刺第三批：7 分钟净增 4 文件，34.3 files/hour
+
+11:30–11:37 集成 async_hooks 生命周期注册、AsyncResource ID/context 与
+callback 边界事件。静态预计至少 5 文件；完整 `test-async-*` 55 文件集合
+实测 **+4、green→non-green 0**，即 **34.3 files/hour**。
+
+第一次组合验收为 +4/-1，唯一回归是递归 `runInAsyncScope()` 内全局
+`triggerAsyncId()` 固定返回 0。主审按真实 active resource 修正 trigger
+ID 后重新构建、重跑完整 55 文件，回归消失；最终只按 +4 结算。JSC 原生
+await allocation、GC destroy 与深层 promise timing 仍是 engine seam，
+没有声称该组全部兼容。
+
+### 5 小时冲刺第二批：15.7 分钟净增 8 文件，30.6 files/hour
+
+11:15–11:30 继续使用 3 个静态实现 lane、主 Agent 单次组合构建与集中
+验收。估计收益 15 文件，实际 **8 / 15.7 分钟 = 30.6 files/hour**：
+
+- POSIX process credentials：预计 4，实际 **4/4**；`setuid`/`seteuid`/
+  `setgid`/`setegid`/`setgroups`/`initgroups` 均走真实 libc syscall 与
+  passwd/group 查找，不伪造权限成功；
+- FastUtf8Stream drain 生命周期：预计 5，实际只新增 **1/14**。首次验收
+  还造成 periodic flush 1 个回归；主审定位为 destroy 吞掉已请求的 flush
+  callback，修复后该回归消失，最终本组净 +1；
+- Web Compression Streams：预计 6，实际 **3/6**，复用真实增量 zlib
+  Transform 与 BufferSource Web adapter。
+
+本批 Node 合计 +8；命名集合 green→non-green 为 0。`build_or_die`、冲突
+标记、gitlink、diff 守卫通过。估计与实测差距再次证明：只按整文件绿色
+结算，不能把共享首因数量当最终收益。下一批已在构建/验收之外并发推进
+async_hooks 生命周期（预计至少 5）以及 Bun HTTP/serve/TLS 当前日志聚类。
+
+### 5 小时冲刺第一批：20 分钟净增 29 文件，83.5 files/hour
+
+10:55–11:15 按新协议运行 3 个 Agent lane，子 Agent 只做静态实现，主
+Agent 一次组合构建后集中验收。结果从上一批 **3.4 files/hour** 提升到
+**29 / 20.8 分钟 = 83.5 files/hour**；所有命名验收集合中
+pass→non-pass 为 0：
+
+- domain abort：预计 10，实际 **10/10**；
+- trace-events 真实 category/API/writer backend：预计 11，实际 **10/29**
+  转绿（此前 0）；审查时删除了固定注入 provider 事件的伪实现；
+- VM module requests/link/TLA：预计 7，实际 **5/7**；
+- FastUtf8Stream：预计 14，实际 **2/14**；
+- compile-cache 公开 API：静态分诊把预计 14+ 修正为 1，实际 **1/22**；
+- Bun CSS 真实 `mbun.css` minifier bridge：预计 10，实际 **1/10**；
+- `--expose_gc` alias：预计首因 5，实际 **0/5**，证明其余均有 GC
+  hook/弱引用独立根因。
+
+总计 Node +28、Bun +1。组合 `build_or_die`、冲突标记、gitlink、diff
+守卫通过。此处的“0 回退”只覆盖本批命名集合及其旧基线对比，不冒充全量
+回归结论。
+
+效率决策：domain 与 trace shared-core 超额/达标，继续选择类似共同
+endpoint；VM 可接受；FastUtf8、CSS、GC 停止按原大组追投，必须先把剩余
+日志重新聚类；compile-cache 的 20 个剩余文件需要真实 loader bytecode
+持久化，不在 45 分钟 lane 内继续。下一批仍以预计 files/hour 排序。
+
+### 5 小时冲刺切换：停止逐断言慢循环，按 files/hour 分配
+
+10:20–10:55 的第二批使用 3 个实现 Agent、14 个小提交，主线定向结果只有
+**2 个文件转绿 / 35 分钟 = 3.4 files/hour**：crypto worklist `0/8 → 1/8`
+（`test-crypto-keygen-non-standard-public-exponent.js`），`test-runner-*`
+`28 → 29 / 77`（`test-runner-error-reporter.js`）；worker 保持 `85/141`，
+0 个 pass 回退。BroadcastChannel 与 `test-runner-cli.js` 虽各推进多层，
+但仍红，不能计入收益。这个速度无法支撑 5 小时目标。
+
+立即停止两个尚未完成的全量长跑（Node `3690/4433`、Bun `395/1902`，
+两者都只是 partial journal，**不得当作新基线**）。新协议：
+
+- 子 Agent 不再逐断言提交/构建；一次任务必须瞄准共享根因，预估至少
+  10 个文件或至少 5 files/hour，45 分钟无可验证批量收益就换线；
+- 构建、定向验收、相关子树回归集中到主 Agent 的 PR checkpoint；
+- 每个 checkpoint 推送后在 PR 评论实际转绿数、pass 回退数、墙钟时间和
+  files/hour；估计值与实测值分开；
+- lane 沿自己的 tip 连续开发，不为无关主线提交重指 worktree，避免全量
+  重编译；`compat/` 继续只读。
+
+按已发布口径仍剩 Node `1779`、Bun `1034`，5 小时需要 **562.6
+files/hour**。下一批按当前失败密度优先攻共享缺口：trace-events（预估
+20+）、FastUtf8Stream（预估 14）、compile-cache（预估 14+），而不是继续
+单文件 BroadcastChannel IPC。
+
+本批还校正了 Node runner cwd：上游语料应从 `compat/node` 启动，而不是
+仓库根目录。校正前后的全量数字不可直接比较；下一次 PR checkpoint 才跑
+完整 Node/Bun 并建立新口径。
+
+### 语料续作第一批：新鲜失败清单净增 3 个 Node 文件，三个完整子树回归 0
+
+从 PR #32 的同一构建基线出发，主 Agent 统一构建并对组合树复验：
+
+- worker：`84 → 85 / 141`，`fail 46 → 45`，timeout `9 → 9`；
+- net：`108 → 110 / 150`，`fail 38 → 36`，timeout `4 → 4`；
+- dgram：`71 → 71 / 76`，timeout `1 → 1`；
+- `test-runner-*`：`28 → 28 / 77`，分类保持
+  `28 pass / 43 fail / 3 skipped / 3 timeout`。
+
+三个真实转绿文件是
+`test-worker-message-transfer-port-mark-as-untransferable.js`、
+`test-net-server-call-listen-multiple-times.js` 和
+`test-net-socket-constructor.js`。对应实现补齐
+`isMarkedAsUntransferable` / transfer-list `DataCloneError`、显式 socket fd
+校验和重复 `listen()` 的 `ERR_SERVER_ALREADY_LISTEN`。BroadcastChannel 的
+`MessageEvent` 与入口参数校验也前进到后续独立失败；`test-runner-cli.js`
+依次越过缺失文件 stderr 与默认 `_test` 文件发现/FileTest 两层断言，但
+文件级仍红，因此不计入增量。
+
+本批先试图复用三个本地历史分支，三项在当前目标树均已被不同形状的后续
+提交吸收；随后按旧 `unreached-inventory.json` 分配的 fs 四文件和 HTTP/2
+六文件也分别 `4/4`、`6/6` 已绿。两轮陈旧输入均为 **0 收益**。策略已改为：
+从最新全量 `gate-node` 的日志实时生成 8 文件互斥 worklist，Agent 只跑命名
+文件，主线统一构建并跑完整相关子树。组合树 `build_or_die`、冲突标记守卫、
+submodule gitlink 守卫均通过；`compat/` 未修改。
+
 ## 2026-07-26
 
 ### w5/agent-fs：事件循环回调边界排序（全量 2,460 → **2,470 / 4,433**，回归 0；fs 309/342 不变）

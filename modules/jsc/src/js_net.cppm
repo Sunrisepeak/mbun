@@ -51,6 +51,23 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
   const def = (names, mod) => { for (const n of names) { M[n] = mod; M["node:" + n] = mod; } };
   const EE = (M["events"] && M["events"].EventEmitter) || class { on() { return this; } once() { return this; } off() { return this; } emit() { return false; } };
   const te = new G.TextEncoder(), td = new G.TextDecoder();
+  // `internal/timers` owns the private kTimeout symbol. It is only available
+  // when the internal module is loaded, so discover it lazily rather than
+  // making ordinary net.Socket construction depend on an internal require.
+  const timeoutSymbol = () => {
+    try {
+      const timers = typeof G.require === "function" ? G.require("internal/timers") : null;
+      return timers && typeof timers.kTimeout === "symbol" ? timers.kTimeout : null;
+    } catch (e) { return null; }
+  };
+  const syncTimeoutShape = (socket) => {
+    const key = timeoutSymbol();
+    if (key === null) return;
+    if (!Object.prototype.hasOwnProperty.call(socket, key)) {
+      Object.defineProperty(socket, key, { value: null, writable: true, configurable: true });
+    }
+    socket[key] = socket._timeoutTimer || null;
+  };
 
   if (typeof Promise.withResolvers !== "function") {
     Promise.withResolvers = function () { let resolve, reject; const promise = new Promise((res, rej) => { resolve = res; reject = rej; }); return { promise, resolve, reject }; };
@@ -260,6 +277,41 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
   // node's initial default is 500ms; the test harness (common/index.js) reads it,
   // multiplies by 5 and re-sets it (→ 2500), which is what tests assert against.
   let autoSelectFamilyAttemptTimeoutDefault = 500;
+  const normalizedArgsSymbol = () => {
+    try {
+      const internalNet = typeof G.require === "function" ? G.require("internal/net") : null;
+      return internalNet && typeof internalNet.normalizedArgsSymbol === "symbol"
+        ? internalNet.normalizedArgsSymbol : null;
+    } catch (e) { return null; }
+  };
+  const normalizeArgs = (args) => {
+    const list = Array.from(args || []);
+    const options = list[0] && typeof list[0] === "object" ? list[0] : {};
+    const callback = typeof list[0] === "function" ? list[0]
+      : (typeof list[1] === "function" ? list[1] : null);
+    const out = [options, callback];
+    const symbol = normalizedArgsSymbol();
+    if (symbol !== null) out[symbol] = true;
+    return out;
+  };
+  // process.execArgv has already been derived from the node-compatible CLI
+  // before this module is evaluated. Seed the same defaults net.js reads from
+  // its per-isolate options, so child processes retain these switches too.
+  const netExecArgv = (G.process && Array.isArray(G.process.execArgv)) ? G.process.execArgv : [];
+  for (let i = 0; i < netExecArgv.length; i++) {
+    const arg = netExecArgv[i];
+    if (arg === "--network-family-autoselection" || arg === "--enable-network-family-autoselection") {
+      autoSelectFamilyDefault = true;
+    } else if (arg === "--no-network-family-autoselection") {
+      autoSelectFamilyDefault = false;
+    } else if (typeof arg === "string" && arg.startsWith("--network-family-autoselection-attempt-timeout=")) {
+      const value = Number(arg.slice("--network-family-autoselection-attempt-timeout=".length));
+      if (Number.isSafeInteger(value) && value > 0) autoSelectFamilyAttemptTimeoutDefault = Math.max(10, value);
+    } else if (arg === "--network-family-autoselection-attempt-timeout") {
+      const value = Number(netExecArgv[++i]);
+      if (Number.isSafeInteger(value) && value > 0) autoSelectFamilyAttemptTimeoutDefault = Math.max(10, value);
+    }
+  }
   // node net.js Socket#setTypeOfService: NumberIsNaN first (so NaN is an
   // ERR_INVALID_ARG_TYPE, not an out-of-range), then validateInt32(0, 255).
   // NumberIsNaN does not coerce, so a string falls through to validateInt32 and
@@ -390,6 +442,10 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       this._fd = -1; this._wq = []; this._wqLen = 0; this._needDrain = false;
       this._shutW = false; this._shutSent = false; this._eof = false; this._closeEmitted = false;
       this._paused = false; this._enc = null; this._everRead = false;
+      // internal/timers consumers observe an unarmed socket through kTimeout
+      // before the transport emits 'connect'. Keep that slot present (null)
+      // whenever the internal module is available.
+      syncTimeoutShape(this);
       // node net.js Socket: `this[kHandle] = null` until connect()/adoption, and
       // the three deferred socket options it caches until a handle exists.
       // `_hadHandle` is this runtime's marker for "there WAS a handle" so that
@@ -397,6 +453,19 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       // `if (!this._handle) cb(new ERR_SOCKET_CLOSED())`) while a write on a
       // never-connected socket keeps queueing as before.
       this._handle = null; this._hadHandle = false;
+      // node validates an explicitly supplied descriptor before attempting to
+      // adopt it. In particular, -1 is out of range rather than a sentinel for
+      // an unconnected socket, and a string is never coerced into an fd.
+      if (opts.fd !== undefined) {
+        if (typeof opts.fd !== "number") {
+          const e = new TypeError('The "options.fd" property must be of type number. Received type ' + typeof opts.fd);
+          e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+        }
+        if (!Number.isInteger(opts.fd) || opts.fd < 0) {
+          const e = new RangeError('The value of "options.fd" is out of range. It must be >= 0. Received ' + String(opts.fd));
+          e.code = "ERR_OUT_OF_RANGE"; throw e;
+        }
+      }
       // node net.js Socket ctor: validateNumber + clamp, before ~~(ms/1000).
       if (opts.keepAliveInitialDelay !== undefined) {
         if (typeof opts.keepAliveInitialDelay !== "number") {
@@ -439,8 +508,10 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       // Loop-reference state (see NET.hold): sticky intent + current hold.
       this._refd = true; this._held = false; this._loopOpen = false;
       this.allowHalfOpen = !!opts.allowHalfOpen;
-      this.remoteAddress = "127.0.0.1"; this.remoteFamily = "IPv4"; this.remotePort = 0;
-      this.localAddress = "127.0.0.1"; this.localPort = 0;
+      // A client has no peer until its public 'connect' event. Accepted and
+      // adopted sockets fill these in from their handle instead.
+      this.remoteAddress = undefined; this.remoteFamily = undefined; this.remotePort = undefined;
+      this.localAddress = "127.0.0.1"; this.localFamily = "IPv4"; this.localPort = 0;
       this.bytesRead = 0; this.bytesWritten = 0;
       // Minimal node stream.Readable state. This transport pushes straight to
       // 'data' rather than running the Readable machinery, but consumers of a
@@ -514,6 +585,8 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       if (netClientSocketChannel.hasSubscribers) netClientSocketChannel.publish({ socket: this._dcClientSocket || this });
       // ---- node net.js argument validation (Socket.prototype.connect) ----
       const nErr = (Ctor, code, msg) => { const e = new Ctor(msg); e.code = code; return e; };
+      const symbol = normalizedArgsSymbol();
+      if (a.length === 1 && Array.isArray(a[0]) && symbol !== null && a[0][symbol]) a = a[0];
       const optArg = (typeof a[0] === "object" && a[0] !== null && !Array.isArray(a[0])) ? a[0] : null;
       if (optArg) {
         if (optArg.objectMode)
@@ -630,6 +703,10 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       // kernel picks both when neither was requested.
       const _localAddr = (optArg && optArg.localAddress != null) ? String(optArg.localAddress) : null;
       const _localPort = (optArg && optArg.localPort != null) ? (optArg.localPort | 0) : 0;
+      // lookupAndConnect defaults this option from the module-wide setting;
+      // passing `undefined` must not silently mean false.
+      const _autoSelectFamily = optArg && optArg.autoSelectFamily !== undefined
+        ? optArg.autoSelectFamily : autoSelectFamilyDefault;
       const _adoptLocal = (sock, sfd) => {
         try {
           const sn = NN.sockname ? NN.sockname(sfd) : null;
@@ -656,20 +733,41 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
         const dialResolved = (addr, fam) => {
           if (fam !== 4 && fam !== 6) { const e = mkErr("Invalid address family: " + fam + " " + host + ":" + port, "ERR_INVALID_ADDRESS_FAMILY"); e.host = host; e.port = port; return failWith(e); }
           if (_blockList && _blockList.check(addr, fam === 6 ? "ipv6" : "ipv4")) return failWith(mkErr("IP is blocked by net.BlockList", "ERR_IP_BLOCKED"));
-          const dh = (addr === "::1" || addr === "::" || addr === "::0") ? "127.0.0.1" : addr;
+          // The reactor's IPv4 fallback is only for an explicitly enabled
+          // Happy-Eyeballs attempt. A disabled family selector must surface the
+          // IPv6 connection failure rather than reaching an IPv4-only server.
+          // The reactor's loopback transport is IPv4-backed. An explicitly
+          // requested IPv6 family still needs the same local-loopback bridge
+          // as the happy-eyeballs path; this does not enable fallback for an
+          // otherwise disabled family selector.
+          const dh = (_autoSelectFamily || (optArg && optArg.family === 6))
+              && (addr === "::1" || addr === "::" || addr === "::0")
+            ? "127.0.0.1" : addr;
           let fd2;
           try { fd2 = NN.connect(dh, port, _localAddr, _localPort); }
           catch (e) { self.connecting = false; const err = connectError(e, addr, port); G.queueMicrotask(() => { if (self.destroyed) return; self.emit("error", err); self.destroy(); }); return self; }
-          self._adopt(fd2); self.remotePort = port; _adoptLocal(self, fd2);
+          self._adopt(fd2); self.remoteAddress = addr; self.remoteFamily = fam === 6 ? "IPv6" : "IPv4"; self.remotePort = port; _adoptLocal(self, fd2);
+          // _adopt owns the descriptor immediately, but public Socket#pending
+          // remains true until the connect event is published.
+          self.pending = true;
           self.connecting = true;
-          G.queueMicrotask(() => { if (self.destroyed) { self.connecting = false; return; } self.connecting = false; self._flushPreConnect(null); self._applyDeferredSockOpts(); self.emit("connect"); self.emit("ready"); });
+          const finishConnect = () => {
+            if (self._httpClientConnectPending) {
+              self._httpClientConnectPending = false;
+              G.queueMicrotask(finishConnect);
+              return;
+            }
+            if (self.destroyed) { self.connecting = false; return; }
+            self.pending = false; self.connecting = false; self._flushPreConnect(null); self._applyDeferredSockOpts(); self.emit("connect"); self.emit("ready");
+          };
+          G.queueMicrotask(finishConnect);
           return self;
         };
         const hf = _famOf(host);
         if (hf) return dialResolved(host, hf);
         // host needs resolution — drive the caller-supplied lookup (node passes
         // { family, hints, all }; all is set under autoSelectFamily).
-        const lopts = { family: (optArg && optArg.family) || 0, hints: (optArg && optArg.hints) || 0, all: !!(optArg && optArg.autoSelectFamily) };
+        const lopts = { family: (optArg && optArg.family) || 0, hints: (optArg && optArg.hints) || 0, all: _autoSelectFamily };
         const _resolver = _lookup || ((M["dns"] || M["node:dns"] || {}).lookup);
         if (typeof _resolver !== "function") {
           const e = mkErr("getaddrinfo ENOTFOUND " + host, "ENOTFOUND"); e.host = host; e.port = port;
@@ -703,18 +801,50 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       // loopback/wildcard (as reported by an IPv6-defaulted server.address())
       // dials the v4 loopback, which the v4-mapped INADDR_ANY listener accepts.
       const dialHost = (host === "::1" || host === "::" || host === "::0") ? "127.0.0.1" : host;
+      // net.Socket permits callers to supply a libuv-style handle. Its connect
+      // method reports an errno synchronously, while Socket surfaces the
+      // corresponding error asynchronously. Keep that seam for custom Agents;
+      // our own NetHandle deliberately continues through the reactor below.
+      const injectedHandle = !unixPath && this._handle && !(this._handle instanceof NetHandle) &&
+        typeof this._handle.connect === "function" ? this._handle : null;
+      if (injectedHandle) {
+        let status;
+        try { status = injectedHandle.connect({}, dialHost, port); }
+        catch (e) { status = undefined; }
+        if (typeof status === "number" && status !== 0) {
+          const util = M["util"] || M["node:util"];
+          const code = util && typeof util.getSystemErrorName === "function"
+            ? util.getSystemErrorName(status) : "ECONNRESET";
+          const err = mkErr("connect " + code + " " + host + ":" + port, code);
+          err.syscall = "connect"; err.address = host; err.port = port;
+          this.connecting = false;
+          G.queueMicrotask(() => { if (!this.destroyed) { this.emit("error", err); this.destroy(); } });
+          return this;
+        }
+      }
       let fd;
       try { if (unixPath && pipePathTooLong(unixPath)) throw new Error("EINVAL"); fd = unixPath ? NN.connectUnix(unixPath) : NN.connect(dialHost, port, _localAddr, _localPort); }
       catch (e) { this.connecting = false; const err = connectError(e, unixPath || host, unixPath ? undefined : port); G.queueMicrotask(() => { if (this.destroyed) return; this.emit("error", err); this.destroy(); }); return this; }
       this._adopt(fd);
+      if (!unixPath) { this.remoteAddress = host; this.remoteFamily = isIPv6(host) ? "IPv6" : "IPv4"; }
       this.remotePort = port;
       if (!unixPath) _adoptLocal(this, fd);
       // node reports `connecting === true` from the moment connect() returns
       // until the 'connect' event fires; _adopt cleared it because the reactor's
       // connect() already completed synchronously. A destroy() in between must
       // cancel the pending 'connect' rather than resurrect the socket.
+      this.pending = true;
       this.connecting = true;
-      G.queueMicrotask(() => { if (this.destroyed) { this.connecting = false; return; } this.connecting = false; this._flushPreConnect(null); this._applyDeferredSockOpts(); this.emit("connect"); this.emit("ready"); });
+      const finishConnect = () => {
+        if (this._httpClientConnectPending) {
+          this._httpClientConnectPending = false;
+          G.queueMicrotask(finishConnect);
+          return;
+        }
+        if (this.destroyed) { this.connecting = false; return; }
+        this.pending = false; this.connecting = false; this._flushPreConnect(null); this._applyDeferredSockOpts(); this.emit("connect"); this.emit("ready");
+      };
+      G.queueMicrotask(finishConnect);
       return this;
     }
     // node net.js afterConnect: the options cached by the Socket constructor
@@ -766,6 +896,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       // (0/undefined once cleared), which tls.connect({ timeout }) then reports.
       this.timeout = ms === 0 ? undefined : ms;
       this._armTimeout();
+      syncTimeoutShape(this);
       return this;
     }
     _armTimeout() {
@@ -1146,7 +1277,23 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
         const e = new TypeError('The "chunk" argument must be of type string or an instance of Buffer, TypedArray, or DataView.' + recv);
         e.code = "ERR_INVALID_ARG_TYPE"; throw e;
       }
-      if (this.destroyed || this._shutW) { const err = mkErr("write after end", "ERR_STREAM_WRITE_AFTER_END"); if (typeof cb === "function") G.queueMicrotask(() => cb(err)); else this.emit("error", err); return false; }
+      // Writable's terminal states are observably distinct. A caller that
+      // destroyed the stream gets ERR_STREAM_DESTROYED, while a socket whose
+      // peer already sent FIN reports EPIPE even if this side had called end().
+      // Only an ordinary local end remains ERR_STREAM_WRITE_AFTER_END.
+      let terminalWriteError = null;
+      if (this.destroyed) {
+        terminalWriteError = mkErr("Cannot call write after a stream was destroyed", "ERR_STREAM_DESTROYED");
+      } else if (this._shutW) {
+        terminalWriteError = this._eof
+          ? mkErr("This socket has been ended by the other party", "EPIPE")
+          : mkErr("write after end", "ERR_STREAM_WRITE_AFTER_END");
+      }
+      if (terminalWriteError) {
+        if (typeof cb === "function") G.queueMicrotask(() => cb(terminalWriteError));
+        else this.emit("error", terminalWriteError);
+        return false;
+      }
       // node _writeGeneric: once the socket is past connecting, a missing handle
       // is ERR_SOCKET_CLOSED, and a handle whose descriptor was closed under it
       // (`socket._handle.close()`) fails the write with EBADF. Both surface the
@@ -1181,10 +1328,14 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       // established, and a destroy() in that window completes it with
       // ERR_SOCKET_CLOSED_BEFORE_CONNECTION instead of success
       // (test-net-write-cb-on-destroy-before-connect).
-      if (typeof cb === "function" && this.connecting) {
-        (this._preConnectCbs || (this._preConnectCbs = [])).push(cb);
-        if (this._wqLen >= HWM) { this._needDrain = true; return false; }
-        return true;
+      if (this.connecting) {
+        if (typeof cb === "function")
+          (this._preConnectCbs || (this._preConnectCbs = [])).push(cb);
+        // Node reports backpressure for every pre-connect write: it cannot be
+        // considered flushed until the public connect boundary is crossed,
+        // even when the native descriptor was adopted synchronously.
+        this._needDrain = true;
+        return false;
       }
       if (typeof cb === "function") G.queueMicrotask(cb);
       if (this._wqLen >= HWM) { this._needDrain = true; return false; }
@@ -1222,7 +1373,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
         this.emit("end");
       }
       const wasConnecting = this.connecting;
-      this.destroyed = true; this.connecting = false; this.readable = false; this.writable = false;
+      this.destroyed = true; this.pending = true; this.connecting = false; this.readable = false; this.writable = false;
       if (wasConnecting) {
         this._flushPreConnect(mkErr("Socket closed before the connection was established",
                                     "ERR_SOCKET_CLOSED_BEFORE_CONNECTION"));
@@ -1582,6 +1733,41 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
     // own setNoDelay/setKeepAlive see them as already applied.
     _onconnection(err, clientHandle) {
       if (err || !clientHandle || typeof clientHandle.fd !== "number" || clientHandle.fd < 0) return;
+      // Node decides admission while it still owns the accepted handle: a
+      // blocked peer or a full server must never reach the `connection`
+      // listener, but the peer still observes the accepted socket closing and
+      // the server reports the peer metadata through `drop`.
+      let remoteAddress = "";
+      let remotePort = 0;
+      let remoteFamily = "IPv4";
+      try {
+        const peer = NN.peername ? NN.peername(clientHandle.fd) : null;
+        if (typeof peer === "string") {
+          const colon = peer.lastIndexOf(":");
+          remoteAddress = peer.slice(0, colon);
+          remotePort = +peer.slice(colon + 1);
+        }
+      } catch (e) {}
+      const blockList = this._opts.blockList;
+      const blocked = !!(blockList && remoteAddress &&
+        typeof blockList.check === "function" && blockList.check(remoteAddress, "ipv4"));
+      const full = this.maxConnections != null && this._conns.size >= this.maxConnections;
+      if (blocked || full) {
+        const local = this._addr || {};
+        try {
+          if (typeof clientHandle.close === "function") clientHandle.close();
+          else NN.close(clientHandle.fd);
+        } catch (e) {}
+        this.emit("drop", {
+          localAddress: local.address,
+          localPort: local.port,
+          localFamily: local.family,
+          remoteAddress,
+          remotePort,
+          remoteFamily,
+        });
+        return;
+      }
       const sock = new Socket({ allowHalfOpen: !!this._opts.allowHalfOpen, highWaterMark: this._opts.highWaterMark });
       sock._handle = clientHandle; clientHandle.owner = sock;
       sock._adopt(clientHandle.fd);
@@ -1619,6 +1805,9 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       return sock;
     }
     listen(...a) {
+      if (this.listening) {
+        throw mkErr("Listen method has been called more than once without closing.", "ERR_SERVER_ALREADY_LISTEN");
+      }
       let port = 0, host = null, cb = null, unixPath = null;
       // node lib/internal/validators validatePort (allowZero): every listen form
       // routes its port through this, so an out-of-range value (e.g. -1>>>0) is a
@@ -2314,6 +2503,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
     isIP, isIPv4, isIPv6,
     setDefaultAutoSelectFamilyAttemptTimeout, getDefaultAutoSelectFamilyAttemptTimeout,
     setDefaultAutoSelectFamily, getDefaultAutoSelectFamily,
+    _normalizeArgs: normalizeArgs,
   }));
 
   // node lib/tty.js: `ReadStream extends net.Socket` / `WriteStream extends
@@ -2430,6 +2620,9 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
     // `bytesParsed` is what node's own 400/431 path reports.
     _mkErr(msg, code) {
       const e = mkErr(msg, code);
+      // llhttp exposes the parse detail separately from its "Parse Error:"
+      // display prefix; callers such as node's HTTP client inspect it directly.
+      e.reason = msg.startsWith("Parse Error: ") ? msg.slice("Parse Error: ".length) : msg;
       e.bytesParsed = this.off;
       const raw = this._lastChunk && this._lastChunk.length ? this._lastChunk : this.buf;
       try { e.rawPacket = G.Buffer ? G.Buffer.from(raw.slice ? raw.slice() : raw) : raw; } catch (x) {}
@@ -2522,16 +2715,14 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
           }
           let head = latin1(this.buf, this.off, at);
           this.off = at + 4;
-          // picohttpparser refuses any control byte inside the head: every byte
-          // below 0x20 except HTAB (and the CR/LF that end a line), plus DEL.
-          // bun surfaces that as Malformed_HTTP_Response / BadRequest
-          // (compat/bun/src/picohttp/lib.rs). Accepting them let a redirect
-          // Location carrying a raw \x0b / \x01 / \x7f be followed as a normal
-          // target instead of failing the exchange.
+          // Strict parsing refuses every control byte in the head except HTAB
+          // and the CR/LF that end a line. llhttp's insecure flags relax this
+          // for header values (but not NUL), which is observable through both
+          // --insecure-http-parser and per-stream insecureHTTPParser.
           for (let i = 0; i < head.length; i++) {
             const cc = head.charCodeAt(i);
             if (cc === 9 || cc === 10 || cc === 13) continue;
-            if (cc < 32 || cc === 127) {
+            if (cc === 0 || (!this.lenient && (cc < 32 || cc === 127))) {
               if (this.isResponse) this._err("Malformed_HTTP_Response", "Malformed_HTTP_Response");
               else this._err("Invalid HTTP request", "InvalidHTTPRequest");
               return events + 1;

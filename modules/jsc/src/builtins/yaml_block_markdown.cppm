@@ -736,6 +736,7 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
       return isBuildMessage(v) ? inspectBuildMessage(v) : util.inspect(v, Object.assign({ __bunStyle: true }, o));
     };
     if (typeof Bun.inspect === "function" && Bun.inspect.custom === undefined && util.inspect && util.inspect.custom) Bun.inspect.custom = util.inspect.custom;
+    if (typeof Bun.inspect === "function" && typeof Bun.inspect.table !== "function") Bun.inspect.table = inspectTableImpl;
     if (typeof Bun.deepEquals === "undefined") Bun.deepEquals = (a, b, strict) => {
       const eq = (x, y, s, seen) => {
         if (Object.is(x, y)) return true;
@@ -815,7 +816,70 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
       // Semantics (per bun): parse line-by-line; on the first malformed line,
       // return the values collected so far (partial) — unless none were collected,
       // in which case the parse error propagates. Non-string input → TypeError.
-      const JSONL = { parse: (str) => { if (typeof str !== "string") { if (str && ArrayBuffer.isView(str)) { G.__mbunCheckAllocLimit(str.byteLength, "text"); str = new G.TextDecoder().decode(str); } else throw new TypeError("The \"input\" argument must be of type string or an instance of TypedArray. Received " + (str === null ? "null" : typeof str)); } const out = []; for (const line of str.split("\n")) { const t = line.trim(); if (!t) continue; let v; try { v = JSON.parse(t); } catch (e) { if (out.length > 0) return out; throw e; } out.push(v); } return out; } };
+      const JSONL = {};
+      const inputError = (input) => new TypeError("The \"input\" argument must be of type string or an instance of TypedArray. Received " + (input === null ? "null" : typeof input));
+      const incompleteJSON = (text) => {
+        let depth = 0, quote = 0, escaped = false;
+        for (let i = 0; i < text.length; i++) {
+          const c = text.charCodeAt(i);
+          if (quote) {
+            if (escaped) escaped = false;
+            else if (c === 92) escaped = true;
+            else if (c === quote) quote = 0;
+          } else if (c === 34) quote = c;
+          else if (c === 123 || c === 91) depth++;
+          else if (c === 125 || c === 93) depth--;
+        }
+        return quote !== 0 || depth > 0 || text.endsWith(":") || text.endsWith(",") || ["t", "tr", "tru", "f", "fa", "fal", "fals", "n", "nu", "nul"].includes(text);
+      };
+      JSONL.parseChunk = (input, start, end) => {
+        const bytes = input && ArrayBuffer.isView(input);
+        if (typeof input !== "string" && !bytes) throw inputError(input);
+        if (bytes) G.__mbunCheckAllocLimit(input.byteLength, "text");
+        const length = bytes ? input.byteLength : input.length;
+        const offset = (value, fallback, negative) => {
+          value = value === undefined ? fallback : Number(value);
+          return Number.isNaN(value) || value < 0 ? negative : Math.min(length, Number.isFinite(value) ? Math.floor(value) : length);
+        };
+        let begin = offset(start, 0, 0), finish = offset(end, length, length);
+        if (begin > finish) begin = finish;
+        const raw = bytes ? new Uint8Array(input.buffer, input.byteOffset + begin, finish - begin) : null;
+        let text = bytes ? new G.TextDecoder().decode(raw) : input.slice(begin, finish);
+        let bom = 0;
+        if (bytes && begin === 0 && raw.length >= 3 && raw[0] === 0xef && raw[1] === 0xbb && raw[2] === 0xbf) bom = 3;
+        if (!bytes && begin === 0 && text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+        const toOffset = (index) => bytes ? begin + bom + new G.TextEncoder().encode(text.slice(0, index)).byteLength : begin + index + (input.charCodeAt(0) === 0xfeff && begin === 0 ? 1 : 0);
+        const values = [];
+        let read = begin, pos = 0, error = null, done = true;
+        while (pos <= text.length) {
+          const newline = text.indexOf("\n", pos);
+          const hasNewline = newline !== -1;
+          const lineEnd = hasNewline ? newline : text.length;
+          const line = text.slice(pos, lineEnd);
+          const valueText = line.trim();
+          if (valueText) {
+            try {
+              values.push(JSON.parse(valueText));
+              read = toOffset(pos + line.length - line.trimStart().length + valueText.length);
+            } catch (e) {
+              if (hasNewline || !incompleteJSON(valueText)) error = e;
+              else done = false;
+              break;
+            }
+          }
+          if (!hasNewline) break;
+          pos = newline + 1;
+        }
+        if (error) done = false;
+        return { values, read, done, error };
+      };
+      JSONL.parse = (input) => {
+        if (input === null || input === undefined) throw inputError(input);
+        const source = typeof input === "string" || ArrayBuffer.isView(input) ? input : String(input);
+        const result = JSONL.parseChunk(source);
+        if (result.error && result.values.length === 0) throw result.error;
+        return result.values;
+      };
       Object.defineProperty(JSONL, Symbol.toStringTag, { value: "JSONL", configurable: true });
       Bun.JSONL = JSONL;
     }
@@ -1033,8 +1097,8 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
             if (cc === 47 /* / */) {
               const d = i + 1 < n ? s.charCodeAt(i + 1) : 0;
               if (d === 47) { i += 2; while (i < n && s.charCodeAt(i) !== 10) i++; continue; }
-              if (d === 42) { const e = s.indexOf("*/", i + 2); if (e === -1) err("Unterminated comment"); i = e + 2; continue; }
-              err("Unexpected token '/'");
+              if (d === 42) { const e = s.indexOf("*/", i + 2); if (e === -1) err("Unterminated multi-line comment"); i = e + 2; continue; }
+              err("Unexpected character");
             }
             break;
           }
@@ -1052,7 +1116,7 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
             i += 2;
             const h0 = i;
             while (i < n && isHex(s.charCodeAt(i))) i++;
-            if (i === h0) err("No hexadecimal digits after '0x'");
+            if (i === h0) err("Invalid hex number");
             return parseInt(s.slice(h0, i), 16);
           }
           const i0 = i;
@@ -1071,7 +1135,7 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
             if (i < n && (s.charCodeAt(i) === 43 || s.charCodeAt(i) === 45)) i++;
             const e0 = i;
             while (i < n && (cc = s.charCodeAt(i)) >= 48 && cc <= 57) i++;
-            if (i === e0) err("Exponent has no digits");
+            if (i === e0) err("Invalid number");
           }
           return Number(s.slice(start, i));
         };
@@ -1087,7 +1151,7 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
             if (cc === 92 /* \ */) {
               out += s.slice(chunk, i);
               i++;
-              if (i >= n) err("Unterminated string");
+              if (i >= n) err("Unexpected end of input in escape sequence");
               const e = s.charCodeAt(i);
               // JSON5 line continuation: backslash + line terminator is removed.
               if (e === 10) { i++; }
@@ -1102,9 +1166,9 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
               else if (e === 118) { out += "\v"; i++; }
               else if (e === 48 && !(i + 1 < n && s.charCodeAt(i + 1) >= 48 && s.charCodeAt(i + 1) <= 57)) { out += "\0"; i++; }
               else if (e === 117) { // \uXXXX
-                if (i + 5 > n) err("Invalid unicode escape");
+                if (i + 5 > n) err("Invalid unicode escape: expected 4 hex digits");
                 let v = 0;
-                for (let k = i + 1; k < i + 5; k++) { const h = s.charCodeAt(k); if (!isHex(h)) err("Invalid unicode escape"); v = v * 16 + parseInt(s[k], 16); }
+                for (let k = i + 1; k < i + 5; k++) { const h = s.charCodeAt(k); if (!isHex(h)) err("Invalid unicode escape: expected 4 hex digits"); v = v * 16 + parseInt(s[k], 16); }
                 out += String.fromCharCode(v);
                 i += 5;
               } else if (e === 120) { // \xXX
@@ -1113,11 +1177,12 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
                 if (!isHex(h1) || !isHex(h2)) err("Invalid hex escape");
                 out += String.fromCharCode(parseInt(s.slice(i + 1, i + 3), 16));
                 i += 3;
-              } else err("Invalid escape character " + s[i]);
+              } else if (e >= 48 && e <= 57) err("Octal escape sequences are not allowed in JSON5");
+              else err("Invalid escape character " + s[i]);
               chunk = i;
               continue;
             }
-            if (cc < 0x20) err("Unescaped control character in string");
+            if (cc < 0x20) err("Unterminated string");
             i++;
           }
         };
@@ -1125,51 +1190,61 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
           const cc = s.charCodeAt(i);
           if (cc === 34 || cc === 39) return parseString();
           if (isIdStart(cc)) { const start = i; i++; while (i < n && isIdPart(s.charCodeAt(i))) i++; return s.slice(start, i); }
-          err("Property name must be a string literal or an identifier");
+          if (cc === 92 && s.charCodeAt(i + 1) !== 117) err("Invalid unicode escape: expected 4 hex digits");
+          if (cc === 64) err("Unexpected character");
+          err("Invalid identifier start character");
         };
         const parseObject = () => {
           i++; // {
           const obj = {};
+          let sawProperty = false;
+          let afterComma = false;
           for (;;) {
             skipWS();
-            if (i >= n) err("Unexpected EOF");
+            if (i >= n) err((afterComma || !sawProperty) ? "Unexpected end of input" : "Unterminated object");
             let cc = s.charCodeAt(i);
             if (cc === 125 /* } */) { i++; return obj; }
             const key = parseKey();
             skipWS();
-            if (i >= n || s.charCodeAt(i) !== 58) err("Expected ':' before value in object property definition");
+            if (i >= n || s.charCodeAt(i) !== 58) err("Expected ':' after object key");
             i++;
             const value = parseValue();
             if (key === "__proto__") Object.defineProperty(obj, key, { value, writable: true, enumerable: true, configurable: true });
             else obj[key] = value;
+            sawProperty = true;
+            afterComma = false;
             skipWS();
-            if (i >= n) err("Unexpected EOF");
+            if (i >= n) err("Unterminated object");
             cc = s.charCodeAt(i);
-            if (cc === 44 /* , */) { i++; continue; }
+            if (cc === 44 /* , */) { i++; afterComma = true; continue; }
             if (cc === 125 /* } */) { i++; return obj; }
-            err("Expected '}'");
+            err("Expected ','");
           }
         };
         const parseArray = () => {
           i++; // [
           const arr = [];
+          let sawElement = false;
+          let afterComma = false;
           for (;;) {
             skipWS();
-            if (i >= n) err("Unexpected EOF");
+            if (i >= n) err((afterComma || !sawElement) ? "Unexpected end of input" : "Unterminated array");
             let cc = s.charCodeAt(i);
             if (cc === 93 /* ] */) { i++; return arr; }
             arr.push(parseValue());
+            sawElement = true;
+            afterComma = false;
             skipWS();
-            if (i >= n) err("Unexpected EOF");
+            if (i >= n) err("Unterminated array");
             cc = s.charCodeAt(i);
-            if (cc === 44) { i++; continue; }
+            if (cc === 44) { i++; afterComma = true; continue; }
             if (cc === 93) { i++; return arr; }
-            err("Expected ']'");
+            err("Expected ','");
           }
         };
         const parseValue = () => {
           skipWS();
-          if (i >= n) err("Unexpected EOF");
+          if (i >= n) err("Unexpected end of input");
           const cc = s.charCodeAt(i);
           if (cc === 123) return parseObject();
           if (cc === 91) return parseArray();
@@ -1178,14 +1253,16 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
             i++;
             if (s.startsWith("Infinity", i)) { i += 8; return -Infinity; }
             const d = i < n ? s.charCodeAt(i) : 0;
-            if (!((d >= 48 && d <= 57) || d === 46)) err("Invalid number");
+            if (i >= n) err("Unexpected end of input");
+            if (!((d >= 48 && d <= 57) || d === 46)) err("Unexpected character");
             return -parseNumberBody();
           }
           if (cc === 43 /* + */) {
             i++;
             if (s.startsWith("Infinity", i)) { i += 8; return Infinity; }
             const d = i < n ? s.charCodeAt(i) : 0;
-            if (!((d >= 48 && d <= 57) || d === 46)) err("Invalid number");
+            if (i >= n) err("Unexpected end of input");
+            if (!((d >= 48 && d <= 57) || d === 46)) err("Unexpected character");
             return parseNumberBody();
           }
           if ((cc >= 48 && cc <= 57) || cc === 46) return parseNumberBody();
@@ -1194,16 +1271,230 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
           if (cc === 110 && s.startsWith("null", i)) { i += 4; return null; }
           if (cc === 73 && s.startsWith("Infinity", i)) { i += 8; return Infinity; }
           if (cc === 78 && s.startsWith("NaN", i)) { i += 3; return NaN; }
-          err("Unrecognized token '" + s[i] + "'");
+          if (isIdStart(cc) || cc === 44) err("Unexpected token");
+          err("Unexpected character");
         };
         skipWS();
-        if (i >= n) err("Unexpected end of JSON5 input");
+        if (i >= n) err("Unexpected end of input");
         const value = parseValue();
         skipWS();
-        if (i < n) err("Unexpected token after top-level value");
+        if (i < n) err("Unexpected token after JSON5 value");
         return value;
       };
-      Bun.JSON5 = { parse: parseJSON5 };
+      // json5@2.x style serializer. JSON.stringify cannot be used as a
+      // post-pass because JSON5 retains Infinity/NaN, accepts unquoted keys,
+      // uses single-quoted strings, and writes trailing commas when indented.
+      const stringifyJSON5 = (input, replacer, space) => {
+        if (replacer !== undefined && replacer !== null) {
+          throw new TypeError("JSON5.stringify does not support the replacer argument");
+        }
+        let gap = "";
+        if (typeof space === "number" || space instanceof Number) {
+          const width = Number(space);
+          gap = " ".repeat(Math.max(0, Math.min(10, Number.isFinite(width) ? Math.floor(width) : width > 0 ? 10 : 0)));
+        } else if (typeof space === "string" || space instanceof String) {
+          gap = String(space).slice(0, 10);
+        }
+        const isIdentifier = (key) => /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(key);
+        const quote = (value) => "'" + value.replace(/[\\'\b\f\n\r\t\v\u0000-\u001f\u2028\u2029]/g, (c) => {
+          if (c === "'") return "\\'";
+          if (c === "\\") return "\\\\";
+          if (c === "\b") return "\\b";
+          if (c === "\f") return "\\f";
+          if (c === "\n") return "\\n";
+          if (c === "\r") return "\\r";
+          if (c === "\t") return "\\t";
+          if (c === "\v") return "\\v";
+          const code = c.charCodeAt(0).toString(16).padStart(4, "0");
+          return "\\u" + code;
+        }) + "'";
+        const stack = new Set();
+        const serialize = (value, indent, inArray) => {
+          if (value === null) return "null";
+          switch (typeof value) {
+            case "boolean": return value ? "true" : "false";
+            case "number":
+              if (Number.isNaN(value)) return "NaN";
+              if (value === Infinity) return "Infinity";
+              if (value === -Infinity) return "-Infinity";
+              return String(value);
+            case "string": return quote(value);
+            case "undefined":
+            case "function":
+            case "symbol": return inArray ? "null" : undefined;
+            case "bigint": throw new TypeError("Do not know how to serialize a BigInt");
+          }
+          if (stack.has(value)) throw new TypeError("Converting circular structure to JSON");
+          stack.add(value);
+          const nextIndent = indent + gap;
+          let result;
+          if (Array.isArray(value)) {
+            const entries = value.map((item) => serialize(item, nextIndent, true));
+            result = entries.length === 0 ? "[]" : gap === "" ? "[" + entries.join(",") + "]"
+              : "[\n" + nextIndent + entries.join(",\n" + nextIndent) + ",\n" + indent + "]";
+          } else {
+            const entries = [];
+            for (const key of Object.keys(value)) {
+              const item = serialize(value[key], nextIndent, false);
+              if (item !== undefined) entries.push((isIdentifier(key) ? key : quote(key)) + (gap === "" ? ":" : ": ") + item);
+            }
+            result = entries.length === 0 ? "{}" : gap === "" ? "{" + entries.join(",") + "}"
+              : "{\n" + nextIndent + entries.join(",\n" + nextIndent) + ",\n" + indent + "}";
+          }
+          stack.delete(value);
+          return result;
+        };
+        return serialize(input, "", false);
+      };
+      Bun.JSON5 = { parse: parseJSON5, stringify: stringifyJSON5 };
+    }
+
+    // Bun.TOML.parse is native because it materializes a TOML value tree. Its
+    // serializer only needs the public JS shape, so keeping it here avoids a
+    // second C-API object walk and shares the normal JS GC lifetime rules.
+    if (Bun.TOML && typeof Bun.TOML.stringify === "undefined") {
+      const tomlNativeParse = Bun.TOML.parse;
+      const TOML_SKIP = Symbol("toml.skip");
+      const tomlUSV = (input) => {
+        const s = String(input);
+        let out = "";
+        for (let i = 0; i < s.length; i++) {
+          const c = s.charCodeAt(i);
+          if (c >= 0xd800 && c <= 0xdbff) {
+            if (i + 1 < s.length) {
+              const next = s.charCodeAt(i + 1);
+              if (next >= 0xdc00 && next <= 0xdfff) { out += s[i] + s[++i]; continue; }
+            }
+            out += "\ufffd";
+          } else if (c >= 0xdc00 && c <= 0xdfff) out += "\ufffd";
+          else out += s[i];
+        }
+        return out;
+      };
+      const tomlQuote = (input) => "\"" + tomlUSV(input).replace(/[\\"\b\t\n\f\r\u0000-\u001f]/g, (c) => {
+        if (c === "\\") return "\\\\";
+        if (c === "\"") return "\\\"";
+        if (c === "\b") return "\\b";
+        if (c === "\t") return "\\t";
+        if (c === "\n") return "\\n";
+        if (c === "\f") return "\\f";
+        if (c === "\r") return "\\r";
+        return "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0");
+      }) + "\"";
+      const tomlParse = (input) => {
+        if (input === undefined || input === null) throw new TypeError("Expected a string to parse");
+
+        let bytes = null;
+        if (typeof Blob !== "undefined" && input instanceof Blob) input = input._u8;
+        if (typeof ArrayBuffer !== "undefined" && input instanceof ArrayBuffer) bytes = new Uint8Array(input);
+        else if (typeof SharedArrayBuffer !== "undefined" && input instanceof SharedArrayBuffer) bytes = new Uint8Array(input);
+        else if (typeof ArrayBuffer !== "undefined" && ArrayBuffer.isView(input)) {
+          bytes = new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
+        }
+
+        if (bytes !== null) {
+          try {
+            // TextDecoder both rejects malformed byte input and consumes a UTF-8
+            // BOM, matching Bun's text-format source boundary.
+            return tomlNativeParse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+          } catch (error) {
+            if (error instanceof TypeError) {
+              throw new SyntaxError("TOML Parse error: Invalid UTF-8 byte sequence");
+            }
+            throw error;
+          }
+        }
+
+        let text = tomlUSV(input);
+        if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+        return tomlNativeParse(text);
+      };
+      const tomlBareKey = (key) => /^[A-Za-z0-9_-]+$/.test(key);
+      const tomlKey = (key) => tomlBareKey(key) ? key : tomlQuote(key);
+      const tomlPlainObject = (value) => value !== null && typeof value === "object" && Object.getPrototypeOf(value) === Object.prototype;
+      const tomlStringify = (input, replacer, _space) => {
+        if (replacer !== undefined && replacer !== null) throw new TypeError("TOML.stringify does not support the replacer argument");
+        if (input === undefined) return undefined;
+        if (!tomlPlainObject(input)) throw new TypeError("TOML.stringify expects an object at the top level (a TOML document is a table)");
+        const stack = new Set();
+        const cycle = () => { throw new TypeError("Converting circular structure to TOML"); };
+        const scalar = (value, key, inArray) => {
+          if (value === undefined || typeof value === "function" || typeof value === "symbol") {
+            if (inArray) throw new TypeError("TOML cannot represent " + (value === undefined ? "undefined" : typeof value) + " in an array");
+            return TOML_SKIP;
+          }
+          if (value === null) {
+            throw new TypeError(inArray ? "TOML cannot represent null in an array" : "TOML cannot represent null (key '" + key + "'); remove the key or use a sentinel value");
+          }
+          if (typeof value === "bigint") throw new TypeError("TOML.stringify cannot serialize BigInt");
+          if (value instanceof Number || value instanceof String || value instanceof Boolean) value = value.valueOf();
+          if (typeof value === "string") return tomlQuote(value);
+          if (typeof value === "boolean") return value ? "true" : "false";
+          if (typeof value === "number") {
+            if (Number.isNaN(value)) return "nan";
+            if (value === Infinity) return "inf";
+            if (value === -Infinity) return "-inf";
+            if (Object.is(value, -0)) return "-0.0";
+            const text = String(value);
+            return Number.isInteger(value) && Math.abs(value) > Number.MAX_SAFE_INTEGER && !/[.eE]/.test(text) ? text + ".0" : text;
+          }
+          if (value instanceof Date) {
+            const time = value.getTime();
+            if (Number.isNaN(time)) throw new TypeError("TOML.stringify cannot serialize an invalid Date");
+            const year = value.getUTCFullYear();
+            if (year < 0 || year > 9999) throw new TypeError("TOML.stringify cannot serialize a Date outside years 0000-9999");
+            return value.toISOString();
+          }
+          if (Array.isArray(value)) {
+            if (stack.has(value)) cycle();
+            stack.add(value);
+            const out = "[" + value.map((item) => valueText(item, key, true)).join(", ") + "]";
+            stack.delete(value);
+            return out;
+          }
+          if (tomlPlainObject(value)) {
+            if (stack.has(value)) cycle();
+            stack.add(value);
+            const parts = [];
+            for (const childKey of Object.keys(value)) {
+              const child = valueText(value[childKey], childKey, false);
+              if (child !== TOML_SKIP) parts.push(tomlKey(childKey) + " = " + child);
+            }
+            stack.delete(value);
+            return "{ " + parts.join(", ") + (parts.length ? " " : "") + "}";
+          }
+          throw new TypeError("TOML.stringify expects values to be TOML-compatible");
+        };
+        const valueText = (value, key, inArray) => scalar(value, key, inArray);
+        const isArrayOfTables = (value) => Array.isArray(value) && value.length > 0 && value.every(tomlPlainObject);
+        const renderTable = (table, path, header) => {
+          if (stack.has(table)) cycle();
+          stack.add(table);
+          const scalarLines = [];
+          const tables = [];
+          const arrays = [];
+          for (const key of Object.keys(table)) {
+            const value = table[key];
+            if (value === undefined || typeof value === "function" || typeof value === "symbol") continue;
+            if (tomlPlainObject(value)) tables.push([key, value]);
+            else if (isArrayOfTables(value)) arrays.push([key, value]);
+            else scalarLines.push(tomlKey(key) + " = " + valueText(value, key, false) + "\n");
+          }
+          const sections = [];
+          const own = (header || "") + scalarLines.join("");
+          if (own) sections.push(own);
+          for (const [key, value] of tables) sections.push(renderTable(value, path.concat(key), "[" + path.concat(key).map(tomlKey).join(".") + "]\n"));
+          for (const [key, values] of arrays) {
+            const nextPath = path.concat(key);
+            for (const value of values) sections.push(renderTable(value, nextPath, "[[" + nextPath.map(tomlKey).join(".") + "]]\n"));
+          }
+          stack.delete(table);
+          return sections.join("\n");
+        };
+        return renderTable(input, [], "");
+      };
+      Bun.TOML.parse = tomlParse;
+      Bun.TOML.stringify = tomlStringify;
     }
 
     // ---- Bun.markdown.ansi: markdown -> ANSI (port of bun src/md/ansi_renderer) ----
@@ -1506,10 +1797,14 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
 
   // Split plain text into text + bare-URL autolinks (GFM).
   function pushText(nodes, text) {
-    const re = /(https?:\/\/[^\s<]+)/g;
+    const re = /(https?:\/\/[^\s<]+|www\.[^\s<]+|[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+)/g;
     let last = 0;
     let m;
     while ((m = re.exec(text))) {
+      // GFM does not link `texthttp://…`: a bare autolink needs a text
+      // boundary before its scheme/www form (the email alternative owns its
+      // complete local part, so it is unaffected by this check).
+      if (m.index > 0 && /[A-Za-z0-9]/.test(text[m.index - 1])) continue;
       if (m.index > last) nodes.push({ type: "text", value: text.slice(last, m.index) });
       let url = m[1];
       // Strip trailing punctuation with a single index walk. Paren counts are
@@ -1530,9 +1825,14 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
           end--;
         } else break;
       }
+      // A complete HTML entity suffix belongs to the following text, not the
+      // GFM autolink (`...?q=commonmark&hl;` → link + `&amp;hl;`).
+      const entity = /&[A-Za-z][A-Za-z0-9]*;$/.exec(url.slice(0, end));
+      if (entity) end -= entity[0].length;
       const trail = url.slice(end);
       url = url.slice(0, end);
-      nodes.push({ type: "autolink", href: url, kind: "url", text: url, bare: true });
+      const email = url.includes("@") && !url.includes("://");
+      nodes.push({ type: "autolink", href: email ? url : (url.startsWith("www.") ? "http://" + url : url), kind: email ? "email" : "url", text: url, bare: true });
       if (trail) nodes.push({ type: "text", value: trail });
       last = m.index + m[1].length;
     }

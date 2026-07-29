@@ -367,9 +367,9 @@ inline constexpr std::string_view kNodeTestRunJS = R"JS(
       }
     };
 
-    // node's default file discovery: **/*.test.{js,mjs,cjs} plus every file
-    // under a `test` directory, rooted at cwd (runner.js createTestFileList).
-    const TEST_FILE = /((^|[\\/])(test|tests)[\\/].*|[.-](test|spec)|^test)\.(c|m)?js$/;
+    // node's default file discovery: test, test/**, test-*, and
+    // *[._-]test, rooted at cwd (utils.js kPatterns).
+    const TEST_FILE = /((^|[\\/])(test|tests)[\\/].*|[._-](test|spec)|^test)\.(c|m)?js$/;
     const discover = (cwd) => {
       const fs = fsMod();
       const path = pathMod();
@@ -383,11 +383,37 @@ inline constexpr std::string_view kNodeTestRunJS = R"JS(
           if (name === "node_modules" || name.charCodeAt(0) === 46) continue;
           const full = path.join(dir, name);
           if (entry.isDirectory()) walk(full, depth + 1);
-          else if (TEST_FILE.test(path.relative(cwd, full))) found.push(full);
+          else if (TEST_FILE.test(path.relative(cwd, full))) found.push(path.relative(cwd, full));
         }
       };
       walk(cwd, 0);
       found.sort();
+      return found;
+    };
+
+    // Node expands user-supplied test-file globs too. Default discovery skips
+    // node_modules, but an explicit glob is permitted to select files there.
+    const expandTestFileGlobs = (patterns, cwd) => {
+      const fs = fsMod();
+      const path = pathMod();
+      const found = [];
+      for (const pattern of patterns) {
+        const value = String(pattern);
+        const magic = value.search(/[*?[\]{}]/);
+        if (magic === -1) { found.push(pattern); continue; }
+
+        const slash = Math.max(value.lastIndexOf("/", magic), value.lastIndexOf("\\", magic));
+        const base = slash === -1 ? "" : value.slice(0, slash === 0 ? 1 : slash);
+        const glob = value.slice(slash + 1);
+        const scanCwd = path.isAbsolute(value) ? base : path.resolve(cwd, base || ".");
+        let matches = [];
+        try { matches = fs.globSync(glob, { cwd: scanCwd }); } catch (e) {}
+        for (const match of matches) {
+          const full = path.resolve(scanCwd, match);
+          try { if (!fs.statSync(full).isFile()) continue; } catch (e) { continue; }
+          found.push(path.isAbsolute(value) ? full : path.relative(cwd, full));
+        }
+      }
       return found;
     };
 
@@ -410,29 +436,13 @@ inline constexpr std::string_view kNodeTestRunJS = R"JS(
 
       let given = options.files;
       if (given === undefined) given = discover(cwd);
+      else given = expandTestFileGlobs(given, cwd);
       if (options.shard !== undefined) {
         given = given.filter((_f, i) => (i % options.shard.total) === (options.shard.index - 1));
       }
       // `given` is what the caller wrote (node names the file test with it);
       // `files` is what gets executed.
       const files = given.map((f) => (path.isAbsolute(f) ? f : path.resolve(cwd, f)));
-      // node lib/internal/test_runner/runner.js createTestFileList: an explicit,
-      // magic-free pattern that matches nothing is a user error, reported on
-      // stderr with nothing on stdout.
-      if (options.files !== undefined && files.length !== 0) {
-        const fs = fsMod();
-        const missing = files.filter((f) => {
-          if (/[*?[\]{}]/.test(f)) return false;
-          try { fs.statSync(f); return false; } catch (e) { return true; }
-        });
-        if (missing.length === files.length) {
-          const e = new Error("Could not find '" + given.join(", ") + "'");
-          e.code = "ERR_TEST_FILES_NOT_FOUND";
-          e.__mbunUserError = true;
-          throw e;
-        }
-      }
-
       // node lib/internal/test_runner/tag_filter.js: an include filter keeps a
       // test whose flattened tag set matches any filter (`db:*` is a prefix
       // wildcard); everything untagged is dropped.
@@ -503,6 +513,24 @@ inline constexpr std::string_view kNodeTestRunJS = R"JS(
         // listeners synchronously, so nothing may be emitted before that.
         await Promise.resolve();
         try {
+          // node lib/internal/test_runner/runner.js createTestFileList: an explicit,
+          // magic-free pattern that matches nothing is a user error, reported on
+          // stderr with nothing on stdout. This has to run inside this try so it
+          // reaches the CLI's user-error path instead of escaping as an uncaught
+          // exception with an Error prefix and stack.
+          if (options.files !== undefined && files.length !== 0) {
+            const fs = fsMod();
+            const missing = files.filter((f) => {
+              if (/[*?[\]{}]/.test(f)) return false;
+              try { fs.statSync(f); return false; } catch (e) { return true; }
+            });
+            if (missing.length === files.length) {
+              const e = new Error("Could not find '" + given.join(", ") + "'");
+              e.code = "ERR_TEST_FILES_NOT_FOUND";
+              e.__mbunUserError = true;
+              throw e;
+            }
+          }
           if (typeof options.setup === "function") await options.setup(stream);
           if (isolation === "none") await runInProcess(files, given, forward, aborted);
           else await runIsolated(files, given, forward, options, cwd, aborted);
@@ -530,7 +558,11 @@ inline constexpr std::string_view kNodeTestRunJS = R"JS(
     // events come straight off the in-process reporting surface.
     const runInProcess = async (files, given, forward, aborted) => {
       const createRequire = mod("module").createRequire;
-      const unsubscribe = internals.subscribe(forward);
+      let sawResult = false;
+      const unsubscribe = internals.subscribe((type, data) => {
+        if (type === "test:pass" || type === "test:fail") sawResult = true;
+        forward(type, data);
+      });
       // The evaluated files' failures belong to the returned stream; they must
       // not set the exit status of the process that called run().
       internals.setOwnExitCode(false);
@@ -540,6 +572,7 @@ inline constexpr std::string_view kNodeTestRunJS = R"JS(
           const file = files[i];
           const name = given[i];
           const startedAt = Date.now();
+          sawResult = false;
           // node reports the file itself as a test, so a file that cannot even
           // be loaded still produces an enqueue and a failure.
           forward("test:enqueue", fileEvent(name, file, internals.nextId()));
@@ -555,6 +588,17 @@ inline constexpr std::string_view kNodeTestRunJS = R"JS(
             forward("test:fail", e);
           }
           await drainFully();
+          // A file without a node:test event is still a passing top-level
+          // FileTest in node's CLI output (for example subdir/subdir_test.js).
+          if (!sawResult) {
+            const e = fileEvent(name, file, internals.nextId());
+            e.testNumber = i + 1;
+            e.details = { duration_ms: Date.now() - startedAt, type: "test" };
+            // A FileTest has no test body to emit its own start event, but TAP
+            // still wraps it in the same Subtest heading as Node does.
+            forward("test:start", e);
+            forward("test:pass", e);
+          }
         }
         await drainFully();
       } finally { unsubscribe(); internals.setOwnExitCode(true); }
@@ -665,6 +709,7 @@ inline constexpr std::string_view kNodeTestRunJS = R"JS(
           const e = fileEvent(given, file, internals.nextId());
           e.testNumber = ordinal;
           e.details = { duration_ms: Date.now() - startedAt, type: "test" };
+          forward("test:start", e);
           forward("test:pass", e);
         }
         if ((code !== 0 || signal) && !sawResult) {
@@ -701,6 +746,8 @@ inline constexpr std::string_view kNodeTestRunJS = R"JS(
             const inline = eq === -1 ? undefined : raw.slice(eq + 1);
             switch (name) {
                 case "--test": break;
+                case "--strip-types": case "--experimental-strip-types": opts.stripTypes = true; break;
+                case "--no-strip-types": case "--no-experimental-strip-types": opts.stripTypes = false; break;
                 case "--test-only": opts.only = true; break;
                 case "--test-force-exit": opts.forceExit = true; break;
                 case "--test-update-snapshots": opts.updateSnapshots = true; break;
@@ -807,6 +854,14 @@ inline constexpr std::string_view kNodeTestRunJS = R"JS(
 
     G.__mbunNodeTestCli = (files, flags) => {
         const { opts, reporterNames, destinations } = parseTestFlags(flags || []);
+        // Node gates this mode on its optional Amaro dependency. mbun does not
+        // expose that Node capability, so do not silently ignore the flag and
+        // run a JavaScript-only discovery instead.
+        if (opts.stripTypes) {
+            try { G.process.stderr.write("Type stripping is not supported in this build of Node.js\n"); } catch (e) {}
+            G.process.exitCode = 1;
+            return;
+        }
         // The shape node reports (utils.js globalTestOptions), in its order.
         debugConfiguration({
             isTestRunner: true,
