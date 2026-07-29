@@ -6,10 +6,11 @@
 //
 // Scope (safety-first, no-regression): only fully-literal command graphs are lowered
 // to the interpreter here — commands, pipes (`|`), sequences/conditionals
-// (`; && ||`), assignments and simple file redirects (`> >> < 2>`). Any construct the
-// lowering cannot faithfully model (variable/tilde/glob/brace/command-substitution
-// expansion, subshell, if, `[[ ]]`, fd-duplication, `&`, JS-buffer redirect targets)
-// makes exec return null so the JS layer falls back to the existing spawn path.
+// (`; && ||`), assignments, simple file redirects (`> >> < 2>`) and command
+// substitution (`$(...)`, expanded eagerly through this same path — see LowerCtx).
+// Any construct the lowering cannot faithfully model (variable/tilde/glob/brace
+// expansion, subshell, if, fd-duplication, `&`, JS-buffer redirect targets) makes
+// exec return null so the JS layer falls back to the existing spawn path.
 // Interpolated JS values are single-quoted literals after compile, so the common
 // `$`cmd ${value}`` forms route through the real interpreter.
 //
@@ -55,40 +56,188 @@ std::optional<std::string> brace_token_text(SAKind kind) {
     }
 }
 
-// Resolve a parser Atom to its literal text. Returns nullopt when the atom carries
-// any expansion (variable/glob/brace/tilde/command-substitution) the literal-only
-// lowering must not silently drop — the caller then punts to the fallback path.
-std::optional<std::string> atom_literal(const Atom& atom) {
-    if (atom.kind == AtomKind::Simple) {
-        switch (atom.simple.kind) {
-            case SAKind::Text:
-                return std::string{atom.simple.text};
-            case SAKind::QuotedEmpty:
-                return std::string{};
-            default:
-                return brace_token_text(atom.simple.kind);
+struct ExecResult {
+    int exit_code{0};
+    std::string stdout_bytes;
+    std::string stderr_bytes;
+};
+
+std::optional<ExecResult> run_plan_captured(const ExecutionPlan& plan, const std::string& cwd,
+                                            std::vector<char*>& envp, bool have_env);
+
+// Everything the lowering needs in order to *evaluate* a `$(...)` while it is still
+// building the plan: a command substitution is expanded eagerly, in the parent, by
+// running its own lowered plan through the same captured-fork path the outer script
+// will use. `state_mutated` records that a `cd`/`export`/`unset`/assignment stage was
+// already lowered — after one of those the eager evaluation would observe the *pre*
+// -mutation cwd/env, so any later `$(...)` punts to the /bin/sh fallback rather than
+// silently substituting the wrong text. `stderr_sink` collects what the substituted
+// commands wrote to fd 2, which belongs in the outer result's stderr.
+struct LowerCtx {
+    std::string cwd;
+    std::vector<char*>* envp{nullptr};
+    bool have_env{false};
+    std::string* stderr_sink{nullptr};
+    bool state_mutated{false};
+};
+
+// One piece of a word under construction. `splittable` marks text that came out of an
+// *unquoted* command substitution and therefore undergoes IFS field splitting;
+// literal text and `"$(...)"` never split.
+struct WordSegment {
+    std::string text;
+    bool splittable{false};
+};
+
+std::optional<ExecutionPlan> lower_script(const Script& script, LowerCtx& ctx);
+
+constexpr bool is_ifs_space(char c) {
+    return c == ' ' || c == '\t' || c == '\n';
+}
+
+// Expand one `$(...)`: lower the inner Script with the same context (so nesting works
+// by recursion), run it captured, then strip trailing newlines the way POSIX command
+// substitution does. A construct the lowering cannot model inside the substitution
+// punts the whole outer script, exactly as it would at the top level.
+bool eval_cmdsubst(const SimpleAtom& atom, LowerCtx& ctx, std::vector<WordSegment>& out) {
+    if (!atom.cmdsubst_script || ctx.state_mutated || ctx.envp == nullptr) {
+        return false;
+    }
+    auto inner = lower_script(*atom.cmdsubst_script, ctx);
+    if (!inner) {
+        return false;
+    }
+    auto result = run_plan_captured(*inner, ctx.cwd, *ctx.envp, ctx.have_env);
+    if (!result) {
+        return false;
+    }
+    if (ctx.stderr_sink != nullptr) {
+        *ctx.stderr_sink += result->stderr_bytes;
+    }
+    std::string text{std::move(result->stdout_bytes)};
+    while (!text.empty() && text.back() == '\n') {
+        text.pop_back();
+    }
+    out.push_back(WordSegment{std::move(text), !atom.cmdsubst_quoted});
+    return true;
+}
+
+bool collect_simple_segments(const SimpleAtom& atom, LowerCtx& ctx,
+                             std::vector<WordSegment>& out) {
+    switch (atom.kind) {
+        case SAKind::Text:
+            out.push_back(WordSegment{std::string{atom.text}, false});
+            return true;
+        case SAKind::QuotedEmpty:
+            out.push_back(WordSegment{std::string{}, false});
+            return true;
+        case SAKind::CmdSubst:
+            return eval_cmdsubst(atom, ctx, out);
+        default: {
+            auto literal = brace_token_text(atom.kind);
+            if (!literal) {
+                return false;
+            }
+            out.push_back(WordSegment{std::move(*literal), false});
+            return true;
         }
     }
+}
+
+bool collect_atom_segments(const Atom& atom, LowerCtx& ctx, std::vector<WordSegment>& out) {
+    if (atom.kind == AtomKind::Simple) {
+        return collect_simple_segments(atom.simple, ctx, out);
+    }
     if (atom.compound.glob_hint || atom.compound.brace_expansion_hint) {
+        return false;
+    }
+    for (const auto& sub : atom.compound.atoms) {
+        if (!collect_simple_segments(sub, ctx, out)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Resolve a parser Atom to a single literal word. Returns nullopt when the atom
+// carries an expansion (variable/glob/brace/tilde) the lowering must not silently
+// drop — the caller then punts to the fallback path. Command substitutions ARE
+// resolved, but without field splitting: this is the assignment-value / redirect-
+// target / cond-operand context, where POSIX performs no splitting.
+std::optional<std::string> atom_literal(const Atom& atom, LowerCtx& ctx) {
+    std::vector<WordSegment> segments;
+    if (!collect_atom_segments(atom, ctx, segments)) {
         return std::nullopt;
     }
     std::string out;
-    for (const auto& sub : atom.compound.atoms) {
-        if (sub.kind == SAKind::Text) {
-            out += sub.text;
-        } else if (sub.kind != SAKind::QuotedEmpty) {
-            const auto literal = brace_token_text(sub.kind);
-            if (!literal) return std::nullopt;
-            out += *literal;
-        }
+    for (const auto& segment : segments) {
+        out += segment.text;
     }
     return out;
+}
+
+// Resolve a parser Atom to the argv words it produces. Identical to atom_literal
+// except that text from an unquoted `$(...)` is split on IFS whitespace, so
+// `echo $(seq 0 5)` passes six arguments and `echo "$(seq 0 5)"` passes one. Literal
+// text adjacent to the substitution stays attached to the neighbouring field, which
+// is why splitting runs over the assembled segment list rather than per segment.
+bool lower_word(const Atom& atom, LowerCtx& ctx, std::vector<std::string>& out) {
+    std::vector<WordSegment> segments;
+    if (!collect_atom_segments(atom, ctx, segments)) {
+        return false;
+    }
+    bool splits = false;
+    for (const auto& segment : segments) {
+        splits = splits || segment.splittable;
+    }
+    if (!splits) {
+        std::string word;
+        for (const auto& segment : segments) {
+            word += segment.text;
+        }
+        out.push_back(std::move(word));
+        return true;
+    }
+    std::string current;
+    bool started{false};  // an empty word is still a word once literal text opened it
+    for (const auto& segment : segments) {
+        if (!segment.splittable) {
+            current += segment.text;
+            started = true;
+            continue;
+        }
+        std::size_t i{0};
+        while (i < segment.text.size()) {
+            if (is_ifs_space(segment.text[i])) {
+                if (started) {
+                    out.push_back(current);
+                    current.clear();
+                    started = false;
+                }
+                while (i < segment.text.size() && is_ifs_space(segment.text[i])) {
+                    ++i;
+                }
+                continue;
+            }
+            std::size_t j{i};
+            while (j < segment.text.size() && !is_ifs_space(segment.text[j])) {
+                ++j;
+            }
+            current.append(segment.text, i, j - i);
+            started = true;
+            i = j;
+        }
+    }
+    if (started) {
+        out.push_back(std::move(current));
+    }
+    return true;
 }
 
 // Map a parser redirect (flags + target atom) onto a value-layer RedirectPlan.
 // Only single-file stdin/stdout/stderr forms are modeled; fd-duplication (`2>&1`),
 // combined `&>` and JS-buffer targets punt.
-bool lower_redirect(std::uint8_t flags, const Redirect& redirect,
+bool lower_redirect(std::uint8_t flags, const Redirect& redirect, LowerCtx& ctx,
                     std::vector<RedirectPlan>& out) {
     if (redirect.kind != RedirKind::Atom) {
         return false;
@@ -96,7 +245,7 @@ bool lower_redirect(std::uint8_t flags, const Redirect& redirect,
     if (flags & rf::DUPLICATE_OUT) {
         return false;
     }
-    const auto target = atom_literal(redirect.atom);
+    const auto target = atom_literal(redirect.atom, ctx);
     if (!target) {
         return false;
     }
@@ -136,32 +285,40 @@ bool lower_redirect(std::uint8_t flags, const Redirect& redirect,
     return stdout_ || stderr_;
 }
 
-bool lower_assignments(const std::vector<Assign>& assigns, PipelineStage& stage) {
+bool lower_assignments(const std::vector<Assign>& assigns, LowerCtx& ctx,
+                       PipelineStage& stage) {
     for (const auto& assign : assigns) {
-        const auto value = atom_literal(assign.value);
+        const auto value = atom_literal(assign.value, ctx);
         if (!value) {
             return false;
         }
         stage.assignments.emplace_back(std::string{assign.label}, *value);
     }
+    if (!assigns.empty()) {
+        ctx.state_mutated = true;
+    }
     return true;
 }
 
-std::optional<PipelineStage> lower_cmd(const Cmd& cmd) {
+std::optional<PipelineStage> lower_cmd(const Cmd& cmd, LowerCtx& ctx) {
     PipelineStage stage;
     stage.kind = PipelineStageKind::Command;
-    if (!lower_assignments(cmd.assigns, stage)) {
+    if (!lower_assignments(cmd.assigns, ctx, stage)) {
         return std::nullopt;
     }
     for (const auto& atom : cmd.name_and_args) {
-        const auto word = atom_literal(atom);
-        if (!word) {
+        if (!lower_word(atom, ctx, stage.argv)) {
             return std::nullopt;
         }
-        stage.argv.push_back(*word);
+    }
+    // A stage that repoints cwd or the exported environment invalidates the eager
+    // `$(...)` evaluation for everything after it — see LowerCtx::state_mutated.
+    if (!stage.argv.empty() && (stage.argv.front() == "cd" || stage.argv.front() == "export" ||
+                                stage.argv.front() == "unset")) {
+        ctx.state_mutated = true;
     }
     if (cmd.has_redirect_file) {
-        if (!lower_redirect(cmd.redirect, cmd.redirect_file, stage.redirects)) {
+        if (!lower_redirect(cmd.redirect, cmd.redirect_file, ctx, stage.redirects)) {
             return std::nullopt;
         }
     } else if (cmd.redirect != 0) {
@@ -173,18 +330,18 @@ std::optional<PipelineStage> lower_cmd(const Cmd& cmd) {
     return stage;
 }
 
-std::optional<ExecutionNode> lower_expr(const Expr& expr);
+std::optional<ExecutionNode> lower_expr(const Expr& expr, LowerCtx& ctx);
 
 // Lower a `[[ EXPR ]]` into an argv-form command stage the interpreter's `[[`
 // builtin evaluates: argv = ["[[", op, operand...]. Only the parser-supported
 // operators reach here; operands carrying an expansion punt to the fallback.
-std::optional<PipelineStage> lower_condexpr(const CondExpr& cond) {
+std::optional<PipelineStage> lower_condexpr(const CondExpr& cond, LowerCtx& ctx) {
     PipelineStage stage;
     stage.kind = PipelineStageKind::Command;
     stage.argv.emplace_back("[[");
     stage.argv.push_back(cond.op);
     for (const auto& atom : cond.args) {
-        const auto word = atom_literal(atom);
+        const auto word = atom_literal(atom, ctx);
         if (!word) {
             return std::nullopt;
         }
@@ -193,14 +350,14 @@ std::optional<PipelineStage> lower_condexpr(const CondExpr& cond) {
     return stage;
 }
 
-std::optional<ExecutionNode> lower_pipeline(const Pipeline& pipeline) {
+std::optional<ExecutionNode> lower_pipeline(const Pipeline& pipeline, LowerCtx& ctx) {
     PipelinePlan plan;
     for (const auto& item : pipeline.items) {
         if (item.kind == PIKind::Cmd) {
             if (!item.cmd) {
                 return std::nullopt;
             }
-            auto stage = lower_cmd(*item.cmd);
+            auto stage = lower_cmd(*item.cmd, ctx);
             if (!stage) {
                 return std::nullopt;
             }
@@ -208,7 +365,7 @@ std::optional<ExecutionNode> lower_pipeline(const Pipeline& pipeline) {
         } else if (item.kind == PIKind::Assigns) {
             PipelineStage stage;
             stage.kind = PipelineStageKind::Assignments;
-            if (!lower_assignments(item.assigns, stage)) {
+            if (!lower_assignments(item.assigns, ctx, stage)) {
                 return std::nullopt;
             }
             plan.stages.push_back(std::move(stage));
@@ -216,7 +373,7 @@ std::optional<ExecutionNode> lower_pipeline(const Pipeline& pipeline) {
             if (!item.condexpr) {
                 return std::nullopt;
             }
-            auto stage = lower_condexpr(*item.condexpr);
+            auto stage = lower_condexpr(*item.condexpr, ctx);
             if (!stage) {
                 return std::nullopt;
             }
@@ -231,13 +388,13 @@ std::optional<ExecutionNode> lower_pipeline(const Pipeline& pipeline) {
     return node;
 }
 
-std::optional<ExecutionNode> lower_expr(const Expr& expr) {
+std::optional<ExecutionNode> lower_expr(const Expr& expr, LowerCtx& ctx) {
     switch (expr.kind) {
         case ExprKind::Cmd: {
             if (!expr.cmd) {
                 return std::nullopt;
             }
-            auto stage = lower_cmd(*expr.cmd);
+            auto stage = lower_cmd(*expr.cmd, ctx);
             if (!stage) {
                 return std::nullopt;
             }
@@ -249,7 +406,7 @@ std::optional<ExecutionNode> lower_expr(const Expr& expr) {
         case ExprKind::Assign: {
             PipelineStage stage;
             stage.kind = PipelineStageKind::Assignments;
-            if (!lower_assignments(expr.assigns, stage)) {
+            if (!lower_assignments(expr.assigns, ctx, stage)) {
                 return std::nullopt;
             }
             ExecutionNode node;
@@ -261,14 +418,14 @@ std::optional<ExecutionNode> lower_expr(const Expr& expr) {
             if (!expr.pipeline) {
                 return std::nullopt;
             }
-            return lower_pipeline(*expr.pipeline);
+            return lower_pipeline(*expr.pipeline, ctx);
         }
         case ExprKind::Binary: {
             if (!expr.binary) {
                 return std::nullopt;
             }
-            auto left = lower_expr(expr.binary->left);
-            auto right = lower_expr(expr.binary->right);
+            auto left = lower_expr(expr.binary->left, ctx);
+            auto right = lower_expr(expr.binary->right, ctx);
             if (!left || !right) {
                 return std::nullopt;
             }
@@ -283,7 +440,7 @@ std::optional<ExecutionNode> lower_expr(const Expr& expr) {
             if (!expr.condexpr) {
                 return std::nullopt;
             }
-            auto stage = lower_condexpr(*expr.condexpr);
+            auto stage = lower_condexpr(*expr.condexpr, ctx);
             if (!stage) {
                 return std::nullopt;
             }
@@ -299,11 +456,11 @@ std::optional<ExecutionNode> lower_expr(const Expr& expr) {
 
 // Lower a parsed Script into an ExecutionPlan, or nullopt if any node is outside
 // the interpreter-backed subset (so the JS layer keeps the /bin/sh fallback).
-std::optional<ExecutionPlan> lower_script(const Script& script) {
+std::optional<ExecutionPlan> lower_script(const Script& script, LowerCtx& ctx) {
     ExecutionPlan plan;
     for (const auto& stmt : script.stmts) {
         for (const auto& expr : stmt.exprs) {
-            auto node = lower_expr(expr);
+            auto node = lower_expr(expr, ctx);
             if (!node) {
                 return std::nullopt;
             }
@@ -326,12 +483,6 @@ std::string drain_fd(int fd) {
     ::close(fd);
     return out;
 }
-
-struct ExecResult {
-    int exit_code{0};
-    std::string stdout_bytes;
-    std::string stderr_bytes;
-};
 
 // Fork a child, run the plan through the shell interpreter with stdout/stderr
 // captured into pipes, honoring cwd and the caller-provided environment. stdin is
@@ -441,7 +592,13 @@ int run_source_inherited(const std::string& source) {
         return 1;
     }
 
-    auto plan = lower_script(parsed);
+    // `mbun exec` inherits the process cwd and environ, so the eager `$(...)`
+    // evaluation runs with an empty cwd override and no env block: the substituted
+    // child then sees exactly what the outer script will see.
+    static std::vector<char*> noEnv;
+    LowerCtx ctx;
+    ctx.envp = &noEnv;
+    auto plan = lower_script(parsed, ctx);
     if (!plan) {
         // bun's interpreter covers the whole grammar; mbun's lowering does not yet
         // (subshell / if / cond-expr / async -- see lower_expr's default arm). Say so
@@ -515,11 +672,6 @@ JSValueRef bunsh_exec_cb(JSContextRef context, JSObjectRef, JSObjectRef, std::si
         return JSValueMakeNull(context);
     }
 
-    auto plan = bunsh::lower_script(parsed);
-    if (!plan) {
-        return JSValueMakeNull(context);
-    }
-
     std::string cwd;
     if (argc > 1 && JSValueIsString(context, arguments[1])) {
         shell_value_to_string(context, arguments[1], cwd, nullptr);
@@ -560,9 +712,27 @@ JSValueRef bunsh_exec_cb(JSContextRef context, JSObjectRef, JSObjectRef, std::si
         envp.push_back(nullptr);
     }
 
+    // Lowering must run *after* cwd/env are materialized: a `$(...)` is expanded
+    // eagerly here and the substituted child needs the same cwd and environment the
+    // outer script will run under. Its stderr is captured into `substStderr` and
+    // prepended below, since those commands genuinely ran before the outer plan.
+    std::string substStderr;
+    bunsh::LowerCtx ctx;
+    ctx.cwd = cwd;
+    ctx.envp = &envp;
+    ctx.have_env = haveEnv;
+    ctx.stderr_sink = &substStderr;
+    auto plan = bunsh::lower_script(parsed, ctx);
+    if (!plan) {
+        return JSValueMakeNull(context);
+    }
+
     auto result = bunsh::run_plan_captured(*plan, cwd, envp, haveEnv);
     if (!result) {
         return JSValueMakeNull(context);
+    }
+    if (!substStderr.empty()) {
+        result->stderr_bytes.insert(0, substStderr);
     }
 
     JSObjectRef out{JSObjectMake(context, nullptr, nullptr)};
