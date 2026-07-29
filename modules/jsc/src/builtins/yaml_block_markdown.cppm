@@ -815,7 +815,69 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
       // Semantics (per bun): parse line-by-line; on the first malformed line,
       // return the values collected so far (partial) — unless none were collected,
       // in which case the parse error propagates. Non-string input → TypeError.
-      const JSONL = { parse: (str) => { if (typeof str !== "string") { if (str && ArrayBuffer.isView(str)) { G.__mbunCheckAllocLimit(str.byteLength, "text"); str = new G.TextDecoder().decode(str); } else throw new TypeError("The \"input\" argument must be of type string or an instance of TypedArray. Received " + (str === null ? "null" : typeof str)); } const out = []; for (const line of str.split("\n")) { const t = line.trim(); if (!t) continue; let v; try { v = JSON.parse(t); } catch (e) { if (out.length > 0) return out; throw e; } out.push(v); } return out; } };
+      const JSONL = {};
+      const inputError = (input) => new TypeError("The \"input\" argument must be of type string or an instance of TypedArray. Received " + (input === null ? "null" : typeof input));
+      const incompleteJSON = (text) => {
+        let depth = 0, quote = 0, escaped = false;
+        for (let i = 0; i < text.length; i++) {
+          const c = text.charCodeAt(i);
+          if (quote) {
+            if (escaped) escaped = false;
+            else if (c === 92) escaped = true;
+            else if (c === quote) quote = 0;
+          } else if (c === 34) quote = c;
+          else if (c === 123 || c === 91) depth++;
+          else if (c === 125 || c === 93) depth--;
+        }
+        return quote !== 0 || depth > 0 || text.endsWith(":") || text.endsWith(",") || ["t", "tr", "tru", "f", "fa", "fal", "fals", "n", "nu", "nul"].includes(text);
+      };
+      JSONL.parseChunk = (input, start, end) => {
+        const bytes = input && ArrayBuffer.isView(input);
+        if (typeof input !== "string" && !bytes) throw inputError(input);
+        const length = bytes ? input.byteLength : input.length;
+        const offset = (value, fallback, negative) => {
+          value = value === undefined ? fallback : Number(value);
+          return Number.isNaN(value) || value < 0 ? negative : Math.min(length, Number.isFinite(value) ? Math.floor(value) : length);
+        };
+        let begin = offset(start, 0, 0), finish = offset(end, length, length);
+        if (begin > finish) begin = finish;
+        const raw = bytes ? new Uint8Array(input.buffer, input.byteOffset + begin, finish - begin) : null;
+        let text = bytes ? new G.TextDecoder().decode(raw) : input.slice(begin, finish);
+        let bom = 0;
+        if (bytes && begin === 0 && raw.length >= 3 && raw[0] === 0xef && raw[1] === 0xbb && raw[2] === 0xbf) bom = 3;
+        if (!bytes && begin === 0 && text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+        const toOffset = (index) => bytes ? begin + bom + new G.TextEncoder().encode(text.slice(0, index)).byteLength : begin + index + (input.charCodeAt(0) === 0xfeff && begin === 0 ? 1 : 0);
+        const values = [];
+        let read = begin, pos = 0, error = null, done = true;
+        while (pos <= text.length) {
+          const newline = text.indexOf("\n", pos);
+          const hasNewline = newline !== -1;
+          const lineEnd = hasNewline ? newline : text.length;
+          const line = text.slice(pos, lineEnd);
+          const valueText = line.trim();
+          if (valueText) {
+            try {
+              values.push(JSON.parse(valueText));
+              read = toOffset(pos + line.length - line.trimStart().length + valueText.length);
+            } catch (e) {
+              if (hasNewline || !incompleteJSON(valueText)) error = e;
+              else done = false;
+              break;
+            }
+          }
+          if (!hasNewline) break;
+          pos = newline + 1;
+        }
+        if (error) done = false;
+        return { values, read, done, error };
+      };
+      JSONL.parse = (input) => {
+        if (input === null || input === undefined) throw inputError(input);
+        const source = typeof input === "string" || ArrayBuffer.isView(input) ? input : String(input);
+        const result = JSONL.parseChunk(source);
+        if (result.error && result.values.length === 0) throw result.error;
+        return result.values;
+      };
       Object.defineProperty(JSONL, Symbol.toStringTag, { value: "JSONL", configurable: true });
       Bun.JSONL = JSONL;
     }
