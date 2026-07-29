@@ -5081,7 +5081,129 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       UV_DIRENT_UNKNOWN: 0, UV_DIRENT_FILE: 1, UV_DIRENT_DIR: 2, UV_DIRENT_LINK: 3, UV_DIRENT_FIFO: 4, UV_DIRENT_SOCKET: 5, UV_DIRENT_CHAR: 6, UV_DIRENT_BLOCK: 7 },
   };
   fsMod.realpathSync.native = fsMod.realpathSync;
-  fsMod.ReadStream = Readable; fsMod.WriteStream = Writable;
+  // node:fs Utf8Stream (the built-in SonicBoom-derived fast UTF-8 sink).
+  // The runtime's fd operations are synchronous, so the default async surface
+  // schedules its callbacks on a microtask; injected fs implementations still
+  // receive their native write/open/fsync calls for the stream tests.
+  class Utf8Stream extends EventEmitter {
+    constructor(options) {
+      super();
+      options = options === undefined ? {} : options;
+      if (options === null || typeof options !== "object") throw new TypeError("The \"options\" argument must be of type object.");
+      this._fs = Object.assign({
+        openSync: fsMod.openSync, closeSync: fsMod.closeSync, writeSync: fsMod.writeSync,
+        mkdirSync: fsMod.mkdirSync, fsyncSync: fsMod.fsyncSync,
+        open: (p, f, m, cb) => { try { cb(null, fsMod.openSync(p, f, m)); } catch (e) { cb(e); } },
+        close: (fd, cb) => { try { fsMod.closeSync(fd); cb && cb(null); } catch (e) { cb && cb(e); } },
+        write: (fd, data, enc, cb) => {
+          if (typeof enc === "function") cb = enc;
+          try { const n = fsMod.writeSync(fd, data, typeof enc === "string" ? enc : "utf8"); G.queueMicrotask(() => cb && cb(null, n)); }
+          catch (e) { G.queueMicrotask(() => cb && cb(e)); }
+        },
+        fsync: (fd, cb) => { try { fsMod.fsyncSync(fd); G.queueMicrotask(() => cb && cb(null)); } catch (e) { G.queueMicrotask(() => cb && cb(e)); } },
+        mkdir: (p, o, cb) => { try { fsMod.mkdirSync(p, o); cb(null); } catch (e) { cb(e); } },
+      }, options.fs || {});
+      this._fd = -1; this._file = null; this._buf = ""; this._writing = false;
+      this._ending = false; this._destroyed = false; this._opening = false;
+      this._minLength = options.minLength || 0; this._maxLength = options.maxLength || 0;
+      this._maxWrite = options.maxWrite || 16384; this._sync = options.sync === true;
+      this._fsync = options.fsync === true; this._append = options.append !== false;
+      this._mkdir = options.mkdir === true; this._mode = options.mode;
+      this._periodicFlush = options.periodicFlush || 0; this._timer = null;
+      this._retryEAGAIN = typeof options.retryEAGAIN === "function" ? options.retryEAGAIN : () => true;
+      if (!Number.isInteger(this._minLength) || this._minLength < 0) throw new RangeError("The value of \"minLength\" is out of range.");
+      if (!Number.isInteger(this._maxWrite) || this._maxWrite < 0) throw new RangeError("The value of \"maxWrite\" is out of range.");
+      if (this._minLength >= this._maxWrite) throw new RangeError("The value of \"minLength\" is out of range.");
+      const target = options.fd !== undefined ? options.fd : options.dest;
+      if (typeof target === "number") { this._fd = target; G.queueMicrotask(() => this.emit("ready")); }
+      else if (typeof target === "string") this._open(target);
+      else throw new TypeError("The \"fd\" argument must be of type number or string.");
+      if (this._periodicFlush) { this._timer = G.setInterval(() => this.flush(), this._periodicFlush); if (this._timer && this._timer.unref) this._timer.unref(); }
+    }
+    get fd() { return this._fd; } get file() { return this._file; }
+    get minLength() { return this._minLength; } get maxLength() { return this._maxLength; }
+    get writing() { return this._writing; } get sync() { return this._sync; }
+    get fsync() { return this._fsync; } get append() { return this._append; }
+    get mode() { return this._mode; } get periodicFlush() { return this._periodicFlush; }
+    get destroyed() { return this._destroyed; }
+    write(data) {
+      if (this._destroyed) throw new Error("Utf8Stream is destroyed");
+      const text = typeof data === "string" ? data : Buffer.from(data).toString("utf8");
+      if (this._maxLength && this._buf.length + text.length > this._maxLength) return false;
+      this._buf += text;
+      if (this._fd >= 0 && this._buf.length > this._minLength && !this._writing) this._drain();
+      return this._buf.length <= 16387;
+    }
+    flush(cb) {
+      if (this._destroyed) { const e = new Error("Utf8Stream is destroyed"); if (cb) return cb(e); throw e; }
+      if (this._fd < 0) { const e = new Error("Invalid file descriptor"); if (cb) return cb(e); throw e; }
+      this._drain(cb);
+    }
+    flushSync() {
+      if (this._destroyed) throw new Error("Utf8Stream is destroyed");
+      while (this._buf.length) this._writeSync();
+      if (this._fsync) this._fs.fsyncSync(this._fd);
+    }
+    end() {
+      if (this._destroyed) throw new Error("Utf8Stream is destroyed");
+      if (this._ending) return;
+      this._ending = true;
+      this._drain(() => this._close(true));
+    }
+    destroy() { if (!this._destroyed) this._close(false); }
+    reopen(file) {
+      if (this._destroyed) throw new Error("Utf8Stream is destroyed");
+      if (!this._file && !file) throw new Error("Unable to reopen a file descriptor");
+      const target = file || this._file;
+      const old = this._fd; this._fd = -1;
+      const reopen = () => this._open(target);
+      if (old >= 0) this._fs.close(old, () => reopen()); else reopen();
+    }
+    _open(file) {
+      this._opening = true;
+      const done = (err, fd) => {
+        this._opening = false;
+        if (err) { this.emit("error", err); return; }
+        this._fd = fd; this._file = file; this.emit("ready");
+        if (this._buf.length > this._minLength) this._drain();
+      };
+      const open = () => this._fs.open(file, this._append ? "a" : "w", this._mode, done);
+      if (this._mkdir) this._fs.mkdir((M["path"] || M["node:path"]).dirname(file), { recursive: true }, (e) => e ? done(e) : open());
+      else open();
+    }
+    _writeSync() {
+      const text = this._buf.slice(0, this._maxWrite);
+      const n = this._fs.writeSync(this._fd, text, "utf8");
+      this._buf = this._buf.slice(Math.max(0, n));
+      this.emit("write", n);
+    }
+    _drain(cb) {
+      if (this._writing || this._fd < 0) return;
+      if (!this._buf.length) { if (cb) cb(); else this.emit("drain"); return; }
+      this._writing = true;
+      if (this._sync) {
+        try { while (this._buf.length) this._writeSync(); if (this._fsync) this._fs.fsyncSync(this._fd); this._writing = false; if (cb) G.queueMicrotask(() => cb()); else G.queueMicrotask(() => this.emit("drain")); }
+        catch (e) { this._writing = false; this.emit("error", e); if (cb) cb(e); }
+        return;
+      }
+      const text = this._buf.slice(0, this._maxWrite);
+      this._fs.write(this._fd, text, "utf8", (err, n) => {
+        if (err) { this._writing = false; this.emit("error", err); if (cb) cb(err); return; }
+        this._buf = this._buf.slice(Math.max(0, n || text.length)); this.emit("write", n || text.length);
+        this._writing = false;
+        if (this._buf.length) { this._drain(cb); return; }
+        if (this._fsync) this._fs.fsync(this._fd, (e) => { if (e) this.emit("error", e); if (cb) cb(e); else this.emit("drain"); });
+        else if (cb) cb(); else this.emit("drain");
+      });
+    }
+    _close(finish) {
+      if (this._destroyed) return;
+      this._destroyed = true; if (this._timer !== null) G.clearInterval(this._timer);
+      const done = (err) => { if (err) this.emit("error", err); if (finish) this.emit("finish"); this.emit("close"); };
+      if (this._fd >= 0 && this._fd !== 1 && this._fd !== 2) this._fs.close(this._fd, done); else done();
+    }
+  }
+  fsMod.ReadStream = Readable; fsMod.WriteStream = Writable; fsMod.Utf8Stream = Utf8Stream;
   // fs.Dirent — libuv DT_* dirent type checks (matches node's Dirent; type values
   // per UV_DIRENT_* above). isFIFO must be strictly type===4 so DT_UNKNOWN (0)
   // returns false for every predicate (regression issue #24129).
