@@ -278,6 +278,25 @@ Guards: 13 assert files are 5 pass, 7 retained failures, 1 OOM; 28 DNS files
 are 17 pass, 7 retained failures, 4 timeouts; the four stream-finished files
 are 2 pass and 2 retained failures. All three groups have zero regressions.
 
+### Sprint wave 14 measured checkpoint (13:09–13:17)
+
+HTTP client, module/require, readline, Abort timeout, and BroadcastChannel
+packages forecast 13 files and strictly delivered **+9 in 8 minutes = 67.5
+files/hour**:
+
+- HTTP client lifecycle/parser/globalAgent: 3/3 after integration normalized
+  signal reasons to `AbortError.code = ABORT_ERR`;
+- module/require validation: 3/3 targets plus `test-module-loading-error`, +4;
+- weak unref Abort timeout: estimated 2, actual 1; a weak listener record still
+  retains the signal;
+- BroadcastChannel depth inspect: +1;
+- four readline targets self-skipped on a dumb terminal. They exit zero but
+  count as **zero compatibility gains**.
+
+Guards: HTTP client 63/68 pass; module 11 pass, 18 fail, 3 skip; require 13
+pass, 9 fail, 1 skip; abort 1/7 pass; readline 10 pass, 3 fail, 8 skip. Every
+guard has zero green-to-non-green regressions.
+
 The first three-way reuse probe tested local round-10 branches for node's
 `--test` CLI, HTTP/2 argument/timer validation, and verbatim Node error text.
 All three candidate cherry-picks became empty on the current target tree.

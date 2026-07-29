@@ -5,6 +5,25 @@
 
 ## 2026-07-29
 
+### 5 小时冲刺第十四批：8 分钟净增 9 文件，67.5 files/hour
+
+13:09–13:17 组合 HTTP client、module/require、readline、Abort timeout、
+BroadcastChannel inspect，静态预计 13，严格结算 **+9**：
+
+- HTTP client pre-abort / parser reason / mutable globalAgent **3/3**；主集成
+  将 DOMException reason 规范成 `AbortError.code=ABORT_ERR` 后全绿；
+- module/require 参数、NUL、paths 合同目标 3/3，并带出
+  `test-module-loading-error`，合计 **+4**；
+- Abort timeout timer unref + WeakRef 预计 2，实际 **+1**；weak listener
+  record 仍强持有 signal；
+- BroadcastChannel depth inspect **+1**；
+- readline 宽字符四目标全部因 dumb terminal self-skip，严格计 **0**，
+  不把 exit 0 冒充兼容。
+
+守卫：HTTP client 63/68 pass，module 11 pass / 18 fail / 3 skip，require
+13 pass / 9 fail / 1 skip，abort 1/7 pass，readline 10 pass / 3 fail /
+8 skip；相对 frozen gate 全部 green→non-green 0。
+
 ### 5 小时冲刺第十三批：11 分钟净增 5 文件，27.3 files/hour
 
 12:58–13:09 组合 DNS、assert、stream async-context，预计 8、实际
