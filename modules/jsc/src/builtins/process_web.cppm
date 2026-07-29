@@ -965,7 +965,10 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       const encoding = enc === "utf-8" ? "utf8" : enc;
       const combined = stringOutput ? Buffer.concat(arr.concat([Buffer.from(bytes)])) : null;
       const combinedText = stringOutput ? combined.toString(encoding) : null;
-      const nextLength = stringOutput ? combinedText.length : len + bytes.length;
+      // The overflow threshold is byte-based even for decoded output. Once it
+      // trips, Node preserves up to maxBuffer decoded string units so it never
+      // returns a torn multi-byte character.
+      const nextLength = len + bytes.length;
       if (nextLength > maxBuffer) {
         if (stringOutput) {
           // Node applies maxBuffer to decoded string units when an encoding is
