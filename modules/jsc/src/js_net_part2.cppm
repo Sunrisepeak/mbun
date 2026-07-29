@@ -1508,17 +1508,6 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
       };
 
       const startParser = () => {
-        // A pipelined tail can make the previous parser finish and immediately
-        // start the next request without another socket 'data' event. The
-        // timeout bookkeeping is per message, not per connection: carry must
-        // therefore reset it before this parser observes an incomplete head or
-        // body. Otherwise the completed first request leaves headersDone set
-        // and the sweeper lets the second partial request reach the handler.
-        if (sock._httpMsgBegun && !sock._httpMsgOpen) {
-          sock._httpMsgStart = Date.now();
-          sock._httpHeadersDone = false;
-          sock._httpMsgIdle = false;
-        }
         const parser = new HttpParser(false);
         if (typeof srv.maxHeadersCount === "number" && srv.maxHeadersCount > 0) {
           parser.maxHeaderPairs = srv.maxHeadersCount << 1;
