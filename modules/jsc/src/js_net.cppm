@@ -397,6 +397,19 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       // `if (!this._handle) cb(new ERR_SOCKET_CLOSED())`) while a write on a
       // never-connected socket keeps queueing as before.
       this._handle = null; this._hadHandle = false;
+      // node validates an explicitly supplied descriptor before attempting to
+      // adopt it. In particular, -1 is out of range rather than a sentinel for
+      // an unconnected socket, and a string is never coerced into an fd.
+      if (opts.fd !== undefined) {
+        if (typeof opts.fd !== "number") {
+          const e = new TypeError('The "options.fd" property must be of type number. Received type ' + typeof opts.fd);
+          e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+        }
+        if (!Number.isInteger(opts.fd) || opts.fd < 0) {
+          const e = new RangeError('The value of "options.fd" is out of range. It must be >= 0. Received ' + String(opts.fd));
+          e.code = "ERR_OUT_OF_RANGE"; throw e;
+        }
+      }
       // node net.js Socket ctor: validateNumber + clamp, before ~~(ms/1000).
       if (opts.keepAliveInitialDelay !== undefined) {
         if (typeof opts.keepAliveInitialDelay !== "number") {
@@ -1619,6 +1632,9 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       return sock;
     }
     listen(...a) {
+      if (this.listening) {
+        throw mkErr("Listen method has been called more than once without closing.", "ERR_SERVER_ALREADY_LISTEN");
+      }
       let port = 0, host = null, cb = null, unixPath = null;
       // node lib/internal/validators validatePort (allowZero): every listen form
       // routes its port through this, so an out-of-range value (e.g. -1>>>0) is a
