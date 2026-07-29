@@ -961,12 +961,27 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     const add = (which, name, bytes) => {
       const arr = which === 0 ? outs : errs;
       const len = which === 0 ? outLen : errLen;
-      if (len + bytes.length > maxBuffer) {
-        const take = Math.max(0, maxBuffer - len);
-        if (take > 0) arr.push(Buffer.from(bytes.subarray(0, take)));
+      const stringOutput = enc !== "buffer" && enc != null;
+      const encoding = enc === "utf-8" ? "utf8" : enc;
+      const combined = stringOutput ? Buffer.concat(arr.concat([Buffer.from(bytes)])) : null;
+      const combinedText = stringOutput ? combined.toString(encoding) : null;
+      const nextLength = stringOutput ? combinedText.length : len + bytes.length;
+      if (nextLength > maxBuffer) {
+        if (stringOutput) {
+          // Node applies maxBuffer to decoded string units when an encoding is
+          // requested, so a three-character CJK prefix may occupy nine bytes.
+          arr.length = 0;
+          arr.push(Buffer.from(combinedText.slice(0, maxBuffer), encoding));
+        } else {
+          const take = Math.max(0, maxBuffer - len);
+          if (take > 0) arr.push(Buffer.from(bytes.subarray(0, take)));
+        }
         if (which === 0) outLen = maxBuffer; else errLen = maxBuffer;
         if (!maxErr) { maxErr = new RangeError(name + " maxBuffer length exceeded"); maxErr.code = "ERR_CHILD_PROCESS_STDIO_MAXBUFFER"; maxErr.cmd = cmd; child.kill(); }
-      } else { arr.push(Buffer.from(bytes)); if (which === 0) outLen += bytes.length; else errLen += bytes.length; }
+      } else {
+        arr.push(Buffer.from(bytes));
+        if (which === 0) outLen = nextLength; else errLen = nextLength;
+      }
     };
     if (child.stdout) child.stdout.on("data", (d) => add(0, "stdout", _u8(d)));
     if (child.stderr) child.stderr.on("data", (d) => add(1, "stderr", _u8(d)));
