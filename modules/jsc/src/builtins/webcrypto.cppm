@@ -74,10 +74,28 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
     // getters, so they must NOT be frozen shut. The *internal slots* stay in
     // the frozen WeakMap metadata, which every internal consumer reads.
     //
-    // `algorithm` and `usages` hand out a per-instance, identity-stable but
-    // MUTABLE copy: the spec's "associated ... object" is created once per key
-    // (key.algorithm === key.algorithm) and user code may mutate it without
-    // that mutation reaching the internal slot.
+    // `algorithm` and `usages` hand out a per-instance, identity-stable copy: the
+    // spec's "associated ... object" is created once per key, so
+    // `key.algorithm === key.algorithm`, and it is a copy so nothing a caller does
+    // to it can reach the internal slot.
+    //
+    // The copy is also FROZEN, and that is load-bearing rather than cosmetic.
+    // These copies are *cached*, so while they were mutable a caller could
+    // permanently rewrite a key's JS-visible identity —
+    // `key.algorithm.name = 'AES-GCM'`, `key.algorithm.hash.name = 'SHA-1'`,
+    // `key.usages.push('sign')` all stuck for the lifetime of the key. The native
+    // usages stayed authoritative (signing with a verify-only key still threw
+    // InvalidAccessError), so this was never an auth bypass, but any caller that
+    // branches on `key.algorithm.name` or `key.usages` could be lied to. An
+    // earlier revision described the mutability as deliberate; it was wrong, and
+    // test_webcrypto's `__webcryptoMetadataAttack` case had been failing ever
+    // since. Identity stability and immutability are not in tension here: freeze
+    // the cached copy and both hold.
+    //
+    // Views are copied but not frozen -- Object.freeze on a non-empty TypedArray
+    // throws -- so byte-valued algorithm members (a `counter`, a `salt`) still
+    // have mutable *contents*. That mutation cannot reach the internal slot
+    // either, because the internal copy is a separate view.
     const publicAlgorithm = new WeakMap();
     const publicUsages = new WeakMap();
     const copyAlgorithm = (value) => {
@@ -85,7 +103,7 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
       if (ArrayBuffer.isView(value)) return new value.constructor(value);
       const out = {};
       for (const name of Object.keys(value)) out[name] = copyAlgorithm(value[name]);
-      return out;
+      return freeze(out);
     };
     const cachedCopy = (cache, key, source, copy) => {
       let cached = cache.get(key);
@@ -108,7 +126,7 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
     });
     defineProperty(CryptoKey.prototype, "usages", {
       configurable: true, enumerable: true, get() {
-        return cachedCopy(publicUsages, this, metadataFor(this).usages, (u) => u.slice());
+        return cachedCopy(publicUsages, this, metadataFor(this).usages, (u) => freeze(u.slice()));
       },
     });
     defineProperty(CryptoKey.prototype, Symbol.toStringTag, {
