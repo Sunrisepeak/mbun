@@ -5,6 +5,101 @@ session that is interrupted (usage limit, crash, restart) can pick up from the
 file rather than from memory. **If you are a fresh session reading this, start
 here.**
 
+## 2026-07-29 22:05 — WAVE 42 FINAL: +55 cumulative (40+41+42), 0 regressions
+
+Node **2821 → 2876 / 4433 (64.88%)** from **1612 guard files measured**, zero
+green→non-green anywhere. PR #35. Throughput **21 files/hour at 4 lanes** over
+2.6h (wave 40 ran 32/h on unmined clusters; the decline is the tail, as expected).
+
+| lane | added | commit |
+| --- | ---: | --- |
+| tlstriage | +3 | CA store: extra-cert newline, default⊇extra, element validation (`dd98a7a`) |
+| preparestack | +2 | `Error.prepareStackTrace` with real CallSites (`1c8df96`) |
+| depaudit | +2 | restore DEP0111/DEP0119/DEP0144 emissions (`9512099`) |
+| stdinthrow | +1 | DEP0005 for `new Buffer()` outside node_modules (`3f38219`) |
+| testreporter | +1 | one reporter stream under `--test` (`189a23f`) |
+| stdinthrow | 0 | `child.stdin` write-callback throws now propagate (`7923aab`) |
+| replnav | 0 | REPL close waits for the pending history flush (`1fc441a`) |
+| testreporter | 0 | spec reporter `Error:` prefix (`b49a9c0`) |
+| inspecthard | 0 | survive `Array.prototype[Symbol.iterator]` deletion (`45991a6`) |
+| testuncaught | 0 | no code — gate closed it |
+
+### On the four retained zero-file commits
+
+The protocol says additively revert zero-yield work. These were kept under the
+narrower rule the wave-41 lanes operated by: **a change is retained at zero yield
+only if it is provably correct against node's documented behaviour, has a
+measured before/after probe, and guards clean.** All four do, and two of them
+(`child.stdin` throws, `process.stderr.write` fragility) are correctness fixes on
+paths that can *hide* other failures. This is recorded explicitly rather than
+left to accumulate silently — if a future integrator disagrees, revert them as a
+set, they are independent.
+
+### Wave 42's real product: three retired questions
+
+Negative results dominated this wave, and the log-first gate is why they were
+cheap rather than expensive.
+
+1. **tls is retired as a cluster target.** Of 62 "fixable" files, 6 are behind
+   the self-declared DEFERRED `tls.connect` transport by explicit throw, and ~16
+   more (SNI context switching, PKCS#12/PSK/OCSP identity, ticket resumption)
+   fail *inside* the handshake — the same deferred `SSL_CTX` engine reached via
+   `tls.createServer` instead. So ~22/62 (35%) are one deliberate project. 6 more
+   sit on the shared socket/stream handle path that produced wave-32's 41-file
+   cross-subsystem regression. The remaining ~34 are one-file-per-fix; bucket J
+   alone is 12 unrelated one-offs. The CA-store bucket was the last multi-file
+   cheap cluster and it yielded 3.
+2. **The `node:test` uncaughtException handler is not a throughput lead.** It is
+   genuinely missing, but it gates exactly **one** corpus file, because the
+   `fixtures/test-runner/output/` family that exercises it is not vendored here
+   (`test-runner-output.mjs` is absent). Correctness work, not coverage work.
+3. **The inverted-deprecation-gate bug did not repeat.** 15 DEP sites audited, 0
+   inverted. The one other site with that literal shape (DEP0104) is *correct* —
+   node genuinely makes it `--pending-deprecation`-only, and "fixing" it would
+   have been a bug. A different failure mode surfaced instead (2 emissions wholly
+   missing, 1 half-wired), worth the +2. Residual, unfixed because it blocks
+   nothing today: DEP0198/0203/0204 lack node's once-per-code dedupe and
+   over-emit.
+
+### Two diagnostics that make future sizing cheaper
+
+- **A bare `Uncaught exception` with no detail in a corpus log means
+  `process.stderr.write` itself failed.** That signature appears across several
+  unrelated failing tests and was previously unreadable. The wrapper that broke
+  it under prototype tampering is fixed, so the channel is one site less likely
+  to lie.
+- **Wrapper seams are where primordial discipline leaks.** `util.inspect`'s core
+  was already hardened with captured primordials; the breakage was in a wrapper
+  installed *over* it by an unrelated module (Headers formatting) using spread.
+  Check wrappers before re-auditing an already-hardened core.
+
+### Method now proven over three waves
+
+**Gate on failure logs, not source greps.** Every lane that applied it produced a
+correct sizing; every lead that skipped it was over-optimistic. The scoreboard:
+`emitWarning` 73 refs → 28 non-passing → **0** blocked; `prepareStackTrace` 8 →
+7 → **5** blocked (2 moved); prototype-tampering 50 → 9 → **2** blocked; `argv0`
+12 → 7 → **2** blocked; `node:test` reporter "several" → **1**. Source references
+measure surface area; failure logs measure blocked files.
+
+**The shape that pays is "written but structurally unreachable."** Four for four
+now: `internal/repl` resolving into node's lib chain; one missing
+`internalBinding('crypto')` export taking down the whole `internal/crypto` graph;
+`v8.promiseHooks` stubbed to a no-op; and `prepareStackTrace` scaffolding that
+could never fire because this JSC has no `stack` descriptor on `Error.prototype`.
+
+### Next candidates, ranked
+
+1. **Module-loader primordial hardening** — one more `Reflect.apply`-shaped fix
+   in the native module-load path closes `test-require-delete-array-iterator` and
+   `test-repl-unsafe-array-iteration` (both blocked by the *same* remaining site).
+2. `--test-reporter-destination` — genuinely unimplemented, the only multi-file
+   reach left in `node:test` (`force-exit-flush` + a chunk of `reporters.js`).
+3. `util.inspect` `[AsyncFunction (anonymous)]` tagging — first blocker of
+   `test-util-inspect.js` at line 41.
+4. `process.stdout`/`stderr` as real `Writable`s — large, silently caps `test-tty-*`.
+5. DEP once-per-code dedupe, bundled with whoever fixes the PBKDF2 message.
+
 ## 2026-07-29 21:15 — WAVE 41 FINAL: +46 cumulative (40+41), 0 regressions
 
 Node **2821 → 2867 / 4433 (64.67%)**, projected from **1127 guard files actually
