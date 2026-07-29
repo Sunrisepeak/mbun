@@ -121,14 +121,19 @@ int run_markdown(std::string_view file) {
 // run(), the reporters, and the flag semantics); this is only the dispatch, so
 // the C++ side never has to know node's option table.
 bool has_node_test_flag(std::span<const std::string_view> args) {
-    for (const std::string_view a : args) {
+    for (std::size_t i{}; i < args.size(); ++i) {
+        const std::string_view a{args[i]};
         if (a == "--test") return true;
         // Stop at the first positional: `mbun script.js --test` passes --test to
         // the script, exactly as node does.
         if (!a.starts_with("-")) {
-            if (mbun::cli::node_flag_takes_value(a)) continue;  // never reached for a value token
             return false;
         }
+        // A value-taking Node flag owns the next token, so `--require preload
+        // --test` remains a test-runner invocation rather than treating the
+        // preload path as a script.
+        if (a.find('=') == std::string_view::npos && mbun::cli::node_flag_takes_value(a) &&
+            i + 1 < args.size()) ++i;
     }
     return false;
 }
