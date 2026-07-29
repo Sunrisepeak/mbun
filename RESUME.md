@@ -5,6 +5,48 @@ session that is interrupted (usage limit, crash, restart) can pick up from the
 file rather than from memory. **If you are a fresh session reading this, start
 here.**
 
+## 2026-07-29 accelerated protocol after wave 30
+
+The user correctly identified repeated full-corpus runs as the integration
+bottleneck. Effective immediately:
+
+1. Accumulate work for 20–30 minutes before a PR checkpoint; do not push every
+   7-minute micro-wave.
+2. Combine 6–10 disjoint candidates into one build and run their exact native
+   files in parallel.
+3. Run the full Node corpus only for Node/CLI/bootstrap/process changes. Run the
+   full Bun corpus every 2–3 waves or after an expected cumulative >=50
+   assertion reduction.
+4. Admission threshold is >=10 failures per 15 minutes or >=2 complete green
+   files per 20 minutes. Stop a lane after 5–8 minutes without a credible path.
+5. For the Node long tail, generate named disjoint 12-file worklists with
+   `make_worklists.py`; each lane skips a file after five minutes and maximizes
+   complete green files across its list instead of searching indefinitely for
+   a large shared mechanism.
+
+Current authoritative full checkpoint after wave 30: Node 2788/4433 pass
+(the only movement is known-flaky weakref); Bun 92/230 green with 5063 pass /
+752 fail assertions. Against the first unified Bun checkpoint (4441/1371), this
+is +622 pass / -619 fail.
+
+### Wave 31–33 accelerated results
+
+- Wave 31 retained Bun stdin 5/9 -> 11/3 (-6) and hostedGit 0/5 -> 5/0
+  (-5 plus one green). The 60-line WebSocket RSV candidate moved only 1/7 ->
+  2/6 and was additively reverted.
+- Node long-tail wave 32: process +2 green, HTTP +3, child_process +2 stable;
+  one transient execfile pass returned to fail and is not counted. Worker +0
+  and was fully reverted.
+- Node long-tail wave 33: module +4 green, FS +2; HTTP/2 +0 and was fully
+  reverted. A zero-yield FS write-buffer commit was also reverted.
+
+The two Node long-tail waves produced **13 complete green files in about 25
+minutes (31.2/hour)**. Keep this protocol, but treat static predictions as an
+upper bound: wave 32 predicted 14 and delivered 8; wave 33 predicted 15–16 and
+delivered 6. The next cut should give each lane 24 files while preserving the
+five-minute per-file stop rule, so diagnosis breadth rises without another
+build.
+
 Session-scoped cron jobs are in-memory only (`durable` has no effect), so the
 hourly loop survives a usage limit — it simply skips the fires that land during
 the block and resumes within an hour — but it does NOT survive the session

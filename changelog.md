@@ -5,6 +5,42 @@
 
 ## 2026-07-29
 
+### 推进策略加速：减少全量冻结，切 Node 12-file 长尾吞吐
+
+复盘确认主集成瓶颈是每个 7 分钟小波次都重复冻结 5–7 分钟跑 Node+Bun
+全量。现改为 20–30 分钟 checkpoint、6–10 候选一次组合构建；全 Node
+只在 Node/CLI/bootstrap/process 改动后运行，全 Bun 每2–3波或累计预计
+≥50 fail 时运行。准入门槛提高到 ≥10 fail/15min 或 ≥2 green/20min。
+Node 长尾使用 `make_worklists.py` 生成按 subsystem 隔离的 12-file 清单，
+每文件诊断最多5分钟，目标从“等大根因”改为“25分钟最大完整green数”。
+
+当前权威全量：Node **2788/4433**；Bun **92/230 green**，
+**5063 pass / 752 fail assertions**。相对首个 Bun 统一 checkpoint
+4441/1371，净 **+622/-619**。
+
+### 第三十一批阶段结果：保留 stdin -6 与 hostedGit 全绿，RSV 低收益回退
+
+- process.stdin lifecycle **5/9 → 11/3**（-6）；
+- hostedGitInfo URL parser bridge **0/5 → 5/0**（-5，新增green）；
+- WebSocket RSV/permessage-deflate 预计7、实际仅 **1/7 → 2/6**，实现
+  60行且收益1，已 additive revert；重建后回到1/7，另外两目标保持。
+
+### Wave32–33 Node 12-file 长尾吞吐：25分钟新增13 green
+
+六条 subsystem 隔离 lane 各处理12个明确 Node fail，每文件诊断最多5分钟：
+
+- wave32：process **2/3**、HTTP **3/12**、child_process 稳定 **2/12**，
+  合计 **+7 green**；`execfile` 曾短暂 pass、最终复验回到 fail，不计；
+  Worker **0/12**，两个源码提交与静态预测文档全部 additive revert；
+- wave33：module **4/12**、FS **2/12**，合计 **+6 green**；
+  HTTP/2 **0/12**，源码与预测文档全回退；FS write-buffer 单提交零收益
+  也回退。
+
+两轮约25分钟合计 **+13 Node green = 31.2 green/hour**，比此前全局约
+24/hour 提升约30%，但仍远低于100%所需速度。保留项均由精确原生文件
+runner 验证；零收益复杂度不进入 checkpoint。当前定向推算 Node
+**2801/4433**，待本 PR checkpoint 全量确认。
+
 ### 5 小时冲刺第三十批：净减 61 个 Bun 失败，cron 新增全绿
 
 五个独立同源簇经主线三次增量构建、原生文件精确验收：
