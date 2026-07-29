@@ -987,57 +987,57 @@
         // G.ReadableStream === "undefined"` guards see the spec implementation).
         JSValueRef sexc{nullptr};
         eval_(mbun::jsc::builtins::kStreamsJS, &sexc);
-        if (sexc != nullptr && std::getenv("MBUN_DEBUG_BUILTINS")) {
-            std::cerr << "[streams error] " << describe_exception_(sexc) << '\n';
+        if (sexc != nullptr) {
+            std::cerr << "mbun: builtin partition error [streams]: " << describe_exception_(sexc) << '\n';
         }
 
         // Pure-JS node built-in modules (path/assert/util/os/module/events/fs/…).
         JSValueRef bexc{nullptr};
         eval_(mbun::jsc::builtins::kNodeBuiltinsJS, &bexc);
-        if (bexc != nullptr && std::getenv("MBUN_DEBUG_BUILTINS")) {
-            std::cerr << "[builtins error] " << describe_exception_(bexc) << '\n';
+        if (bexc != nullptr) {
+            std::cerr << "mbun: builtin partition error [builtins]: " << describe_exception_(bexc) << '\n';
         }
         // Networking layer (node:net/node:http/Bun.serve/real fetch) over the
         // __mbunNetNative primitives — replaces the load-only stubs above.
         JSValueRef nexc{nullptr};
         eval_(mbun::jsc::js_net::kNetJS, &nexc);
-        if (nexc != nullptr && std::getenv("MBUN_DEBUG_BUILTINS")) {
-            std::cerr << "[js_net error] " << describe_exception_(nexc) << '\n';
+        if (nexc != nullptr) {
+            std::cerr << "mbun: builtin partition error [js_net]: " << describe_exception_(nexc) << '\n';
         }
         // Bun.connect/Bun.listen/Bun.sleepSync over the net reactor (split out
         // of js_net for the line budget), then the RFC6455 WebSocket layer
         // (Bun.serve upgrade + client WebSocket) — both need kNetJS first.
         JSValueRef bsexc{nullptr};
         eval_(mbun::jsc::js_bun_socket::kBunSocketJS, &bsexc);
-        if (bsexc != nullptr && std::getenv("MBUN_DEBUG_BUILTINS")) {
-            std::cerr << "[js_bun_socket error] " << describe_exception_(bsexc) << '\n';
+        if (bsexc != nullptr) {
+            std::cerr << "mbun: builtin partition error [js_bun_socket]: " << describe_exception_(bsexc) << '\n';
         }
         // Live node:tls socket surface (tls.connect / TLSSocket / createServer)
         // over the net reactor Socket — must follow kNetJS so `extends net.Socket`
         // binds the real reactor class, not the pre-image bootstrap stub.
         JSValueRef tlsexc{nullptr};
         eval_(mbun::jsc::js_tls_live::kTlsLiveJS, &tlsexc);
-        if (tlsexc != nullptr && std::getenv("MBUN_DEBUG_BUILTINS")) {
-            std::cerr << "[js_tls_live error] " << describe_exception_(tlsexc) << '\n';
+        if (tlsexc != nullptr) {
+            std::cerr << "mbun: builtin partition error [js_tls_live]: " << describe_exception_(tlsexc) << '\n';
         }
         // node:http2 client (http2.connect / ClientHttp2Session / Stream) over
         // the net reactor + node:tls ALPN socket — must follow kNetJS + kTlsLiveJS.
         JSValueRef h2exc{nullptr};
         eval_(mbun::jsc::js_http2::kHttp2JS, &h2exc);
-        if (h2exc != nullptr && std::getenv("MBUN_DEBUG_BUILTINS")) {
-            std::cerr << "[js_http2 error] " << describe_exception_(h2exc) << '\n';
+        if (h2exc != nullptr) {
+            std::cerr << "mbun: builtin partition error [js_http2]: " << describe_exception_(h2exc) << '\n';
         }
         JSValueRef wsexc{nullptr};
         eval_(mbun::jsc::js_websocket::kWebSocketJS, &wsexc);
-        if (wsexc != nullptr && std::getenv("MBUN_DEBUG_BUILTINS")) {
-            std::cerr << "[js_websocket error] " << describe_exception_(wsexc) << '\n';
+        if (wsexc != nullptr) {
+            std::cerr << "mbun: builtin partition error [js_websocket]: " << describe_exception_(wsexc) << '\n';
         }
         // node:dns / node:dns/promises / Bun.dns over __mbunDnsNative (after net,
         // so it can reuse node:net isIP for lookupService address validation).
         JSValueRef dexc{nullptr};
         eval_(mbun::jsc::js_dns::kDnsJS, &dexc);
-        if (dexc != nullptr && std::getenv("MBUN_DEBUG_BUILTINS")) {
-            std::cerr << "[js_dns error] " << describe_exception_(dexc) << '\n';
+        if (dexc != nullptr) {
+            std::cerr << "mbun: builtin partition error [js_dns]: " << describe_exception_(dexc) << '\n';
         }
         // node:dgram — node's lib/dgram.js over a real `UDP` handle
         // (internalBinding("udp_wrap")). After kNetJS (borrows the reactor for
@@ -1045,8 +1045,8 @@
         // default lookup is dns.lookup).
         JSValueRef dgexc{nullptr};
         eval_(mbun::jsc::js_dgram::kDgramJS, &dgexc);
-        if (dgexc != nullptr && std::getenv("MBUN_DEBUG_BUILTINS")) {
-            std::cerr << "[js_dgram error] " << describe_exception_(dgexc) << '\n';
+        if (dgexc != nullptr) {
+            std::cerr << "mbun: builtin partition error [js_dgram]: " << describe_exception_(dgexc) << '\n';
         }
         // node:https — node's lib/https.js: a tls.Server carrying the http
         // server's _connectionListener, and an _http_agent Agent whose
@@ -1054,8 +1054,8 @@
         // factory) and kTlsLiveJS (the LIVE tls.Server / tls.connect).
         JSValueRef hsexc{nullptr};
         eval_(mbun::jsc::js_https_live::kHttpsLiveJS, &hsexc);
-        if (hsexc != nullptr && std::getenv("MBUN_DEBUG_BUILTINS")) {
-            std::cerr << "[js_https_live error] " << describe_exception_(hsexc) << '\n';
+        if (hsexc != nullptr) {
+            std::cerr << "mbun: builtin partition error [js_https_live]: " << describe_exception_(hsexc) << '\n';
         }
         // LAST: node's legacy constructor call forms (`http.Server(fn)` with no
         // `new`). It re-exports the affected classes through a callable stand-in,
@@ -1064,7 +1064,7 @@
         // inside the builtins blob.
         JSValueRef lcexc{nullptr};
         eval_(mbun::jsc::builtins::detail::kNodeLegacyCtorsJS, &lcexc);
-        if (lcexc != nullptr && std::getenv("MBUN_DEBUG_BUILTINS")) {
-            std::cerr << "[legacy ctors error] " << describe_exception_(lcexc) << '\n';
+        if (lcexc != nullptr) {
+            std::cerr << "mbun: builtin partition error [legacy ctors]: " << describe_exception_(lcexc) << '\n';
         }
     }
