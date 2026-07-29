@@ -29,6 +29,7 @@ import std;
 import mbun.shell.pipeline;
 import mbun.shell.redirection;
 import mbun.shell.execution_plan;
+import mbun.shell.coreutils;
 
 extern "C" char** environ;
 
@@ -203,6 +204,9 @@ export enum class BuiltinKind : std::uint8_t {
     Test,
     Seq,
     Yes,
+    Ls,
+    Rm,
+    Mv,
 };
 
 export inline std::optional<BuiltinKind> builtin_kind(std::string_view name) {
@@ -220,6 +224,11 @@ export inline std::optional<BuiltinKind> builtin_kind(std::string_view name) {
     if (name == "[[") return BuiltinKind::Test;
     if (name == "seq") return BuiltinKind::Seq;
     if (name == "yes") return BuiltinKind::Yes;
+    // bun ships its own ls/rm/mv rather than exec'ing coreutils; their message
+    // text and exit codes differ from GNU's (see modules/shell/src/coreutils.cppm).
+    if (name == "ls") return BuiltinKind::Ls;
+    if (name == "rm") return BuiltinKind::Rm;
+    if (name == "mv") return BuiltinKind::Mv;
     return std::nullopt;
 }
 
@@ -573,6 +582,12 @@ private:
                 return builtin_seq_(stage);
             case BuiltinKind::Yes:
                 return builtin_yes_(stage);
+            case BuiltinKind::Ls:
+                return coreutils::run_ls(stage.argv);
+            case BuiltinKind::Rm:
+                return coreutils::run_rm(stage.argv);
+            case BuiltinKind::Mv:
+                return coreutils::run_mv(stage.argv);
         }
         return 1;
     }
