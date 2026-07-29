@@ -497,7 +497,7 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
         const rawGet = desc.get ? desc.get.bind(proc) : () => store;
         const rawSet = desc.set ? desc.set.bind(proc) : (v) => { store = v; };
         Object.defineProperty(proc, "exitCode", {
-          configurable: true,
+          configurable: false,
           enumerable: true,
           get() { return rawGet(); },
           set(code) {
