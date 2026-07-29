@@ -263,7 +263,7 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
   };
 
   // -------------------------------------------------- symbols (internal/http)
-  let kOutHeaders = Symbol("kOutHeaders");
+  const kOutHeaders = Symbol("kOutHeaders");
   const kNeedDrain = Symbol("kNeedDrain");
   const kSocket = Symbol("kSocket");
   const kCorked = Symbol("kCorked");
@@ -290,17 +290,6 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
   const kAbortController = Symbol("kAbortController");
   const kRequestOptions = Symbol("requestOptions");
   const kError = Symbol("kError");
-  let adoptedNodeHttpInternals = false;
-  function adoptNodeHttpInternals() {
-    if (adoptedNodeHttpInternals || typeof G.require !== "function") return;
-    let internals;
-    try { internals = G.require("internal/http"); } catch (e) { return; }
-    if (!internals || typeof internals.kOutHeaders !== "symbol") return;
-    adoptedNodeHttpInternals = true;
-    kOutHeaders = internals.kOutHeaders;
-    if (M["_http_outgoing"]) M["_http_outgoing"].kOutHeaders = kOutHeaders;
-    if (G.__mbunHttpInternals) G.__mbunHttpInternals.kOutHeaders = kOutHeaders;
-  }
   const nop = () => {};
   const utcDate = () => new Date().toUTCString();
   const isUint8Array = (v) => v instanceof Uint8Array;
@@ -1620,10 +1609,6 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
     typeof v.protocol === "string" && typeof v.searchParams === "object";
 
   function ClientRequest(input, options, cb) {
-    // `internal/http` mints the private symbol that direct internal consumers
-    // use to inspect a ClientRequest. Adopt it once it is available before the
-    // OutgoingMessage constructor installs the hidden header map.
-    adoptNodeHttpInternals();
     OutgoingMessage.call(this);
 
     if (typeof input === "string") {
