@@ -32,6 +32,7 @@ export import :node_stream_iter_classic;
 export import :node_stream_iter_entry;
 export import :node_zlib_iter;
 export import :zlib_stream;
+export import :web_compression_stream;
 export import :crypto_asym;
 export import :node_os;
 export import :node_vm;
@@ -120,6 +121,7 @@ export inline const std::string kNodeBuiltinsJS =
         .append(detail::kNodeZlibIterJS)
         .append(detail::kCryptoAsymJS)
         .append(detail::kZlibStreamJS)
+        .append(detail::kWebCompressionStreamJS)
         .append(detail::kNodeOsJS)
         .append(detail::kNodeVmJS)
         // vm.Module & friends — needs the vm namespace above already registered.
