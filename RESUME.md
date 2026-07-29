@@ -297,6 +297,20 @@ Guards: HTTP client 63/68 pass; module 11 pass, 18 fail, 3 skip; require 13
 pass, 9 fail, 1 skip; abort 1/7 pass; readline 10 pass, 3 fail, 8 skip. Every
 guard has zero green-to-non-green regressions.
 
+### Sprint wave 19 measured checkpoint (13:50–13:55)
+
+DH/ECDH uninitialized state plus terminal net write errors forecast four files;
+strict acceptance delivered **+1 in 5 minutes = 12 files/hour**:
+
+- destroyed-socket write error contract: +1/2; the other target moved from fail
+  to timeout and remains zero yield;
+- all five related DH/ECDH failures remained non-green, so the crypto commit was
+  additively reverted.
+
+The ten-file net write/socket-destroy guard finished at 9 pass and 1 timeout.
+Only the named file changed fail-to-pass; every frozen pass remained pass.
+Structural guards are clean.
+
 ### Sprint wave 18 measured checkpoint (13:45–13:50)
 
 Keygen, sign/verify, lenient HTTP parsing, timer promisify hooks, and net

@@ -5,6 +5,18 @@
 
 ## 2026-07-29
 
+### 5 小时冲刺第十九批：5 分钟净增 1 文件，12 files/hour
+
+13:50–13:55 组合 DH/ECDH 未初始化状态与 net terminal write 错误，静态
+预计 4，实际 **+1**：
+
+- destroyed socket write 使用 `ERR_STREAM_DESTROYED`，目标 **+1/2**；
+  `test-net-write-after-end-nt` 从 fail 变 timeout，仍按 0；
+- DH/ECDH 五个相关失败全部未转绿，crypto 提交 additive revert。
+
+10 文件 net write/socket-destroy 完整守卫为 9 pass / 1 timeout；相对
+frozen gate 只有上述 1 个 fail→pass，既有 pass 全保持。结构守卫全绿。
+
 ### 5 小时冲刺第十八批：5 分钟净增 2 文件，24 files/hour
 
 13:45–13:50 集中验收 keygen、sign/verify、HTTP lenient parser、timers
