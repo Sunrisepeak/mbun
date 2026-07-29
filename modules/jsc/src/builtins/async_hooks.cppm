@@ -52,6 +52,13 @@ inline constexpr std::string_view kAsyncHooksJS = R"JS(
   // are real async resources, so account for them with the same id/context
   // transition rules Node exposes to user hooks.
   const activeHooks = new Set();
+  // stream.finished() needs this decision at callback-registration time. Keep
+  // the probe in the async-hooks owner, where both the ALS frame and active
+  // hook set are authoritative.
+  Object.defineProperty(G, "__mbunHasAsyncContext", {
+    configurable: true, enumerable: false,
+    value: () => contextGet() !== undefined || activeHooks.size !== 0,
+  });
   let nextAsyncId = 1;
   let executionId = 0;
   let executionResource;
@@ -383,9 +390,29 @@ inline constexpr std::string_view kAsyncHooksJS = R"JS(
         throw error;
       }
     }
+    let internalMarker;
+    const setInternalHookState = (enabled) => {
+      // internal/async_hooks.enabledHooksExist() owns a separate node-core
+      // array. Keep its observable "some hook is active" state in step with
+      // this public implementation without pretending to install native hooks.
+      try {
+        const internal = typeof G.require === "function" ? G.require("internal/async_hooks") : undefined;
+        const arrays = internal && typeof internal.getHookArrays === "function" && internal.getHookArrays();
+        if (!arrays) return;
+        const hooks = arrays[0];
+        if (enabled && internalMarker === undefined) {
+          internalMarker = {};
+          hooks.push(internalMarker);
+        } else if (!enabled && internalMarker !== undefined) {
+          const index = hooks.indexOf(internalMarker);
+          if (index >= 0) hooks.splice(index, 1);
+          internalMarker = undefined;
+        }
+      } catch { /* internal module unavailable during bootstrap */ }
+    };
     return {
-      enable() { activeHooks.add(hook); return this; },
-      disable() { activeHooks.delete(hook); return this; },
+      enable() { activeHooks.add(hook); setInternalHookState(true); return this; },
+      disable() { activeHooks.delete(hook); setInternalHookState(false); return this; },
     };
   };
   const asyncHooksModule = {
