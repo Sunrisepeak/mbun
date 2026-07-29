@@ -290,23 +290,28 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   // returns a fresh instance) — function form + instanceof guard reproduces that.
   function Sign(algorithm) {
     if (!(this instanceof Sign)) return new Sign(algorithm);
-    this._algo = algorithm; this._chunks = [];
+    this._algo = algorithm; this._chunks = []; this._done = false;
   }
-  Sign.prototype.update = function (data, inputEnc) { this._chunks.push(toBuf(data, inputEnc)); return this; };
+  const signStateError = () => { const e = new Error("Not initialised"); e.code = "ERR_CRYPTO_INVALID_STATE"; return e; };
+  Sign.prototype.update = function (data, inputEnc) { if (this._done) throw signStateError(); this._chunks.push(toBuf(data, inputEnc)); return this; };
   Sign.prototype.write = function (data, inputEnc) { this.update(data, inputEnc); return true; };
   Sign.prototype.end = function (data, inputEnc) { if (data != null) this.update(data, inputEnc); return this; };
   Sign.prototype.sign = function (key, outputEnc) {
+    if (this._done) throw signStateError();
+    this._done = true;
     const out = doSign(this._algo, Buffer.concat(this._chunks), key);
     return outputEnc ? out.toString(outputEnc) : out;
   };
   function Verify(algorithm) {
     if (!(this instanceof Verify)) return new Verify(algorithm);
-    this._algo = algorithm; this._chunks = [];
+    this._algo = algorithm; this._chunks = []; this._done = false;
   }
-  Verify.prototype.update = function (data, inputEnc) { this._chunks.push(toBuf(data, inputEnc)); return this; };
+  Verify.prototype.update = function (data, inputEnc) { if (this._done) throw signStateError(); this._chunks.push(toBuf(data, inputEnc)); return this; };
   Verify.prototype.write = function (data, inputEnc) { this.update(data, inputEnc); return true; };
   Verify.prototype.end = function (data, inputEnc) { if (data != null) this.update(data, inputEnc); return this; };
   Verify.prototype.verify = function (key, signature, sigEnc) {
+    if (this._done) throw signStateError();
+    this._done = true;
     const sig = typeof signature === "string" ? Buffer.from(signature, sigEnc || "hex") : toBuf(signature);
     return doVerify(this._algo, Buffer.concat(this._chunks), key, sig);
   };
