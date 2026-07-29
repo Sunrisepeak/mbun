@@ -76,8 +76,23 @@ env deprecation, process ref/unref, and three child-process contracts
 compile-failing dlopen candidate, and an inaccurate assessment document were
 additively reverted. Complete `test-process*` (96 files), `test-child*` (111),
 and `test-cluster*` (83) subtrees show exactly the six fail-to-pass transitions
-and no pass-to-nonpass transition. Projection before the required full Node run
-is **2814/4433**.
+and no pass-to-nonpass transition. The required full Node run landed at
+**2812/4433 (63.43%)**, net +4: the six intended greens plus one watch-mode
+timeout recovery, offset by three unrelated standalone-stable failures. Two are
+runner/PATH-sensitive child-spawn tests (`spawn mbun ENOENT`) and one is the
+known nondeterministic weakref GC test; none exercises the changed wave-36
+contracts. `wave_report.py` nevertheless counts the conservative global net,
+**11 green/hour over 0.35h**, not the targeted +6.
+
+Wave 37 tested errors, HTTP/2, and TLS/PFX across another 36-file cut. Static
+prediction was six; exact native yield was only **1/36**:
+`test-tls-server-capture-rejection.js`. The errors, HTTP/2, and PFX candidates
+were additively reverted. The retained 10-line TLS change rebuilt successfully;
+complete `test-tls*` (217 files) and `test-https*` (63 files) guards show the
+single intended fail-to-pass and no pass-to-nonpass transition (one
+`test-tls-fast-writing` timeout became an OOM, neither is a green regression).
+Do not prioritize static error-message, PFX, or one-file HTTP/2 predictions in
+the next cut. Wave 38 is module, fs, and net/dgram, again 12 files per lane.
 
 Session-scoped cron jobs are in-memory only (`durable` has no effect), so the
 hourly loop survives a usage limit — it simply skips the fires that land during

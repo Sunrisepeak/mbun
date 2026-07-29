@@ -88,7 +88,27 @@ timeout 恢复为 pass，同时 `test-worker-terminate-source-map.js` 从 pass
 
 撤回后重新构建通过；完整 `test-process*` 96文件、`test-child*` 111文件、
 `test-cluster*` 83文件复验，只有上述6项 fail→pass，**0 pass→nonpass**。
-全量前推算 Node **2814/4433**。
+完整 Node 最终为 **2812/4433（63.43%）**，全局净 +4：6个目标转绿，
+另有 watch-mode timeout→pass；同时3个非目标 pass→fail。后者单文件连续
+3次复验均失败，其中 REPL/stdio 两项都是 runner 的 `spawn mbun ENOENT`
+PATH 敏感问题，weakref 是 GC 波动项，均未命中本轮改动合同。效率按保守
+全局净值由 `wave_report.py` 计算为 **11 green/hour（0.35h、3 agents）**，
+不再沿用短时投影的25.7/hour。
+
+### Wave37 errors/HTTP2/TLS：静态预计6，真实仅1，低收益方向降权
+
+三条12-file lane 的静态候选在一次共享构建后实跑：
+
+- errors：DNSException/AggregateError stack **0/2**；
+- HTTP/2：extended CONNECT settings **0/1**；
+- TLS：captureRejections **1/1**，PFX/PKCS#12 **0/2**。
+
+零收益的 errors、HTTP/2、PFX 源码全部 additive revert，仅保留10行 TLS
+修复。重新构建后目标仍绿；完整 `test-tls*` 217文件与 `test-https*`
+63文件只有该项 fail→pass，0 pass→nonpass（`test-tls-fast-writing`
+timeout→OOM 不属于 green 回归）。本轮仅 **1/36（2.8%）**，故下一批
+停止优先静态错误消息、PFX 和单文件 HTTP/2，改投 module/fs/net-dgram
+三组具共享机制的12-file清单。
 
 ### 5 小时冲刺第三十批：净减 61 个 Bun 失败，cron 新增全绿
 
