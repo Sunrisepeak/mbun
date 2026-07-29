@@ -8,6 +8,9 @@ trap 'rm -rf "$tmp"' EXIT
 # Fake mbun: behavior keyed on the test file name it is asked to execute.
 cat >"$tmp/fake-mbun" <<'EOF'
 #!/usr/bin/env bash
+if [ -n "$FAKE_CWD_LOG" ]; then
+  printf '%s\n' "$PWD" >>"$FAKE_CWD_LOG"
+fi
 case "$1" in
   *test-skip*) echo "1..0 # Skipped: QUIC is not enabled" ;;
   *test-pass*) echo ok ;;
@@ -49,6 +52,23 @@ assert all((root / row["log"]).is_file() for row in rows.values())
 tmp_dir = root / "tmp"
 assert not tmp_dir.exists() or not any(tmp_dir.iterdir())
 PY
+
+# Node's upstream test paths are relative to the Node checkout, not the
+# repository root. The runner must derive that execution cwd from the corpus
+# shape rather than assuming its --root is also the upstream checkout.
+cwd_corpus="$tmp/cwd-fixture/node/test/parallel"
+mkdir -p "$cwd_corpus"
+echo "// pass" >"$cwd_corpus/test-cwd.js"
+cwd_log="$tmp/cwd.log"
+: >"$cwd_log"
+FAKE_CWD_LOG="$cwd_log" python3 "$repo_root/tools/integration/node_corpus_runner.py" \
+  --bin "$tmp/fake-mbun" --root "$tmp" --corpus cwd-fixture/node/test/parallel \
+  --out "$tmp/out-cwd" --jobs 1 --timeout 0.1 >/dev/null
+expected_cwd=$(cd "$cwd_corpus/../.." && pwd)
+[ "$(cat "$cwd_log")" = "$expected_cwd" ] || {
+  echo "expected corpus root cwd $expected_cwd, got $(cat "$cwd_log")" >&2
+  exit 1
+}
 
 # --files scopes a run to one cluster; --filter narrows it further. Both keep
 # the repo-relative path form so a cluster run stays diffable against a full one.
