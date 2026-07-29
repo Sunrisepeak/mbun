@@ -129,6 +129,18 @@ key-details yield. Integration resolved the stale-lane conflict by preserving
 both the existing RSA public exponent parameter and the new PSS restriction
 parameters in one 14-argument native ABI.
 
+### Sprint wave 5 measured checkpoint (11:51–11:55)
+
+DSA JWK rejection plus the generic HTTP/2 native submit-error adapter made all
+4 target files green in 4 minutes: **60 files/hour**.
+
+- DSA JWK unsupported output: 1/1;
+- HTTP/2 `info`/`respond` negative nghttp2 errno to stream-level
+  `NghttpError` and existing destroy/RST flow: 3/3.
+
+All four transitions are complete-file fail/timeout to pass, not first-error
+movement.
+
 The first three-way reuse probe tested local round-10 branches for node's
 `--test` CLI, HTTP/2 argument/timer validation, and verbatim Node error text.
 All three candidate cherry-picks became empty on the current target tree.

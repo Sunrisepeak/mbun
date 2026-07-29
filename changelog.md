@@ -5,6 +5,19 @@
 
 ## 2026-07-29
 
+### 5 小时冲刺第五批：4 分钟净增 4 文件，60 files/hour
+
+11:51–11:55 的 DSA JWK 错误合同与 HTTP/2 native submit error 通用映射，
+静态预计 4 文件，集中验收 **4/4 全绿**：
+
+- DSA JWK keygen 正确抛
+  `ERR_CRYPTO_JWK_UNSUPPORTED_KEY_TYPE`，1/1；
+- `Http2Stream.prototype.info/respond` 负 nghttp2 errno 统一转为
+  stream-level `NghttpError`，经既有 destroy/RST 路径覆盖
+  info headers、direct respond、respondWithFile/FD，3/3。
+
+本批没有只计首错误移动；4 个文件均从 fail/timeout 变为 pass。
+
 ### 5 小时冲刺第四批：14.5 分钟净增 7 文件，29.0 files/hour
 
 11:37–11:51 的三个短根因组静态预计 8 文件，集中验收实际 **+7**：
