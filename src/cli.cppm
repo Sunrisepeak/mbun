@@ -305,6 +305,11 @@ struct TestFlags {
     // jest.rs:282 did_label_filter_out_all_tests).
     std::optional<std::string> testNamePattern {};
 
+    // `--path-ignore-patterns` is repeatable.  The optional distinguishes no
+    // CLI override from an explicit command-line pattern list, which replaces
+    // (rather than appends to) bunfig's [test].pathIgnorePatterns.
+    std::optional<std::vector<std::string>> pathIgnorePatterns {};
+
     // ─── JSX ────────────────────────────────────────────────────────────────
     // Not TEST_ONLY_PARAMS: these live in bun's TRANSPILER_PARAMS_, which `test`
     // shares with `run`/`build` (ref Arguments.rs:174-176 for the table entries,
@@ -414,6 +419,9 @@ TestFlags parse_test(std::span<const std::string_view> args) {
             } else if (name == "-t" || name == "--test-name-pattern" || name == "--grep") {
                 // Capture the label filter (last one wins, matching bun's option()).
                 out.testNamePattern = std::string { value };
+            } else if (name == "--path-ignore-patterns") {
+                if (!out.pathIgnorePatterns) out.pathIgnorePatterns.emplace();
+                out.pathIgnorePatterns->emplace_back(value);
             } else if (name == "--jsx-import-source") {
                 out.jsxImportSource = std::string { value };
             } else if (name == "--jsx-runtime") {
