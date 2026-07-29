@@ -1060,10 +1060,33 @@ constexpr std::string_view kStreamsJS_part1 = R"JS(
 
   // ---- tee ----
   function readableStreamTee(stream) {
+    // The byte-stream tee algorithm creates byte branches, not ordinary
+    // ReadableStreams. Besides preserving the public BYOB brand, each branch
+    // owns a distinct buffer: enqueuing a byte chunk transfers its backing
+    // buffer, so handing the original chunk to both branches aliases (or
+    // detaches) the second branch's data.
+    const byteStream = stream._readableStreamController instanceof ReadableByteStreamController;
     const reader = new ReadableStreamDefaultReader(stream);
     let reading = false, readAgain = false, canceled1 = false, canceled2 = false;
     let reason1, reason2, branch1, branch2;
     const cancelDeferred = deferred();
+    const branchEnqueue = (branch, chunk) => {
+      const controller = branch._readableStreamController;
+      if (!byteStream) { defaultControllerEnqueue(controller, chunk); return; }
+      const copy = new Uint8Array(chunk.byteLength);
+      copy.set(new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength));
+      byteControllerEnqueue(controller, copy);
+    };
+    const branchClose = (branch) => {
+      const controller = branch._readableStreamController;
+      if (byteStream) byteControllerClose(controller);
+      else defaultControllerClose(controller);
+    };
+    const branchError = (branch, error) => {
+      const controller = branch._readableStreamController;
+      if (byteStream) byteControllerError(controller, error);
+      else defaultControllerError(controller, error);
+    };
     function pullAlgorithm() {
       if (reading) { readAgain = true; return Promise.resolve(); }
       reading = true;
@@ -1071,16 +1094,16 @@ constexpr std::string_view kStreamsJS_part1 = R"JS(
         chunkSteps: (chunk) => {
           Promise.resolve().then(() => {
             readAgain = false;
-            if (!canceled1) { try { branch1._readableStreamController.enqueue ? branch1._readableStreamController.enqueue(chunk) : 0; } catch (e) {} }
-            if (!canceled2) { try { branch2._readableStreamController.enqueue(chunk); } catch (e) {} }
+            if (!canceled1) { try { branchEnqueue(branch1, chunk); } catch (e) {} }
+            if (!canceled2) { try { branchEnqueue(branch2, chunk); } catch (e) {} }
             reading = false;
             if (readAgain) pullAlgorithm();
           });
         },
         closeSteps: () => {
           reading = false;
-          if (!canceled1) { try { defaultControllerClose(branch1._readableStreamController); } catch (e) {} }
-          if (!canceled2) { try { defaultControllerClose(branch2._readableStreamController); } catch (e) {} }
+          if (!canceled1) { try { branchClose(branch1); } catch (e) {} }
+          if (!canceled2) { try { branchClose(branch2); } catch (e) {} }
           if (!canceled1 || !canceled2) cancelDeferred.resolve(undefined);
         },
         errorSteps: () => { reading = false; },
@@ -1103,11 +1126,15 @@ constexpr std::string_view kStreamsJS_part1 = R"JS(
       }
       return cancelDeferred.promise;
     }
-    branch1 = createReadableStream(noop, pullAlgorithm, cancel1Algorithm);
-    branch2 = createReadableStream(noop, pullAlgorithm, cancel2Algorithm);
+    branch1 = byteStream
+      ? new ReadableStream({ type: "bytes", pull: pullAlgorithm, cancel: cancel1Algorithm })
+      : createReadableStream(noop, pullAlgorithm, cancel1Algorithm);
+    branch2 = byteStream
+      ? new ReadableStream({ type: "bytes", pull: pullAlgorithm, cancel: cancel2Algorithm })
+      : createReadableStream(noop, pullAlgorithm, cancel2Algorithm);
     reader._closedDeferred.promise.then(noop, (e) => {
-      defaultControllerError(branch1._readableStreamController, e);
-      defaultControllerError(branch2._readableStreamController, e);
+      branchError(branch1, e);
+      branchError(branch2, e);
       if (!canceled1 || !canceled2) cancelDeferred.resolve(undefined);
     });
     return [branch1, branch2];
