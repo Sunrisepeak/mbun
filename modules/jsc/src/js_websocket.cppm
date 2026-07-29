@@ -12,8 +12,8 @@
 //   - G.WebSocket client (WHATWG surface: readyState/binaryType/on* +
 //     addEventListener, masked client frames) over node:net's reactor Socket.
 // Evaluated AFTER kNetJS (needs __mbunNativeModules.net + __mbunNet).
-// DEFERRED honestly: wss:// (TLS), complete permessage-deflate context-takeover
-// and outbound compression, backpressure-driven drain (sends buffer fully, so
+// DEFERRED honestly: wss:// (TLS), permessage-deflate (compress flags are
+// accepted and ignored), backpressure-driven drain (sends buffer fully, so
 // drain never fires and send never returns -1).
 export module mbun.jsc.js_websocket;
 
@@ -75,9 +75,7 @@ export constexpr std::string_view kWebSocketJS = R"JS(
     return concat(concat(head, key), body);
   };
 
-  // Incremental parser: feed(bytes) → onFrame(fin, op, payload, rsv1, rsv2,
-  // rsv3) per frame. Extension-specific RSV validation belongs to mkWire,
-  // which knows the negotiated extensions.
+  // Incremental parser: feed(bytes) → onFrame(fin, op, payload) per frame.
   const mkParser = (onFrame, onError) => {
     let buf = new Uint8Array(0);
     return { feed(bytes) {
@@ -85,9 +83,7 @@ export constexpr std::string_view kWebSocketJS = R"JS(
       for (;;) {
         if (buf.length < 2) return;
         const b0 = buf[0], b1 = buf[1];
-        const fin = (b0 & 0x80) !== 0, rsv1 = (b0 & 0x40) !== 0,
-          rsv2 = (b0 & 0x20) !== 0, rsv3 = (b0 & 0x10) !== 0,
-          op = b0 & 0x0f, masked = (b1 & 0x80) !== 0;
+        const fin = (b0 & 0x80) !== 0, op = b0 & 0x0f, masked = (b1 & 0x80) !== 0;
         let len = b1 & 0x7f, off = 2;
         // RFC 6455 5.5: a control frame (opcode >= 8) carries at most a 125
         // byte payload — so it never uses the 126/127 extended-length forms —
@@ -111,12 +107,7 @@ export constexpr std::string_view kWebSocketJS = R"JS(
         if (masked) { payload = new Uint8Array(len); const src = buf.subarray(off, off + len); for (let i = 0; i < len; i++) payload[i] = src[i] ^ key[i & 3]; }
         else payload = buf.slice(off, off + len);
         buf = buf.slice(off + len);
-        // A protocol error must stop this feed pass: a malicious control frame
-        // must not arm state or let a following data frame reach the handler.
-        if (onFrame(fin, op, payload, rsv1, rsv2, rsv3) === false) {
-          buf = new Uint8Array(0);
-          return;
-        }
+        onFrame(fin, op, payload);
       }
     } };
   };
@@ -124,39 +115,9 @@ export constexpr std::string_view kWebSocketJS = R"JS(
   // Message assembly over fragmentation + control dispatch. `sink` supplies
   // sendRaw(bytes), onText(str), onBinary(u8), onPing/onPong(u8),
   // onClose(code, reason) — the codec auto-pongs pings (bun/uWS behavior).
-  const mkWire = (sink, mask, maxPayload, perMessageDeflate) => {
-    let msgOp = 0, parts = [], msgLen = 0, msgCompressed = false;
-    if (maxPayload == null) maxPayload = Infinity;
-    // RFC 7692 7.2.1: a per-message-deflate payload omits the final empty
-    // stored block. Decode it through the existing incremental raw-DEFLATE
-    // bridge with Z_SYNC_FLUSH: a one-shot inflater requires Z_STREAM_END,
-    // whereas this extension deliberately keeps the deflate stream open.
-    const inflatePMD = (payload) => {
-      const zn = G.__mbunZlibNative;
-      if (!zn || typeof zn.streamOpen !== "function" || typeof zn.streamProcess !== "function")
-        throw new Error("permessage-deflate is unavailable");
-      const input = concat(payload, new Uint8Array([0, 0, 255, 255]));
-      let binary = "";
-      for (let i = 0; i < input.length; i += 8192)
-        binary += String.fromCharCode.apply(null, input.subarray(i, Math.min(i + 8192, input.length)));
-      const h = zn.streamOpen(1, -15, -1, 8, 0, -1, 0, 0);  // StreamKind.inflate, raw
-      if (h < 0) throw new Error("permessage-deflate is unavailable");
-      try {
-        const out = zn.streamProcess(h, G.btoa(binary), 1);  // StreamFlush.sync
-        if (!out || !out.ok) throw new Error((out && out.message) || "invalid compressed frame");
-        const decoded = G.atob(out.b64 || ""), bytes = new Uint8Array(decoded.length);
-        for (let i = 0; i < decoded.length; i++) bytes[i] = decoded.charCodeAt(i);
-        return bytes;
-      } finally { try { zn.streamClose(h); } catch (e) {} }
-    };
-    const parser = mkParser((fin, op, payload, rsv1, rsv2, rsv3) => {
-      // RFC 6455 5.2 reserves RSV2/RSV3; RFC 7692 6.1 permits RSV1 only on
-      // the first TEXT/BINARY frame of a negotiated compressed message. In
-      // particular, a control or continuation frame must never set it.
-      if (rsv2 || rsv3 || (rsv1 && (!perMessageDeflate || (op !== 1 && op !== 2)))) {
-        if (sink.onError) sink.onError(new Error(rsv1 ? "Received unexpected RSV1 bit" : "Received unexpected RSV2 or RSV3 bit"));
-        return false;
-      }
+  const mkWire = (sink, mask, maxPayload) => {
+    let msgOp = 0, parts = [], msgLen = 0; if (maxPayload == null) maxPayload = Infinity;
+    const parser = mkParser((fin, op, payload) => {
       if (op === 8) {  // close
         let code = 1005, reason = "";
         if (payload.length >= 2) { code = (payload[0] << 8) | payload[1]; reason = td.decode(payload.subarray(2)); }
@@ -165,7 +126,7 @@ export constexpr std::string_view kWebSocketJS = R"JS(
       }
       if (op === 9) { sink.sendRaw(wsFrame(10, payload, mask)); if (sink.onPing) sink.onPing(payload); return; }
       if (op === 10) { if (sink.onPong) sink.onPong(payload); return; }
-      if (op === 1 || op === 2) { msgOp = op; parts = [payload]; msgLen = payload.length; msgCompressed = rsv1; }
+      if (op === 1 || op === 2) { msgOp = op; parts = [payload]; msgLen = payload.length; }
       else if (op === 0) { parts.push(payload); msgLen += payload.length; }
       else return;  // unknown opcode: drop
       // bun uWS refusePayloadLength: a frame/accumulated message over the cap is
@@ -173,12 +134,7 @@ export constexpr std::string_view kWebSocketJS = R"JS(
       if (msgLen > maxPayload) { sink.onClose(1009, "Received too big message"); return; }
       if (!fin) return;
       let all = parts.length === 1 ? parts[0] : parts.reduce(concat);
-      const kind = msgOp, compressed = msgCompressed;
-      msgOp = 0; parts = []; msgCompressed = false;
-      if (compressed) {
-        try { all = inflatePMD(all); }
-        catch (e) { if (sink.onError) sink.onError(new Error("Received invalid compressed frame")); return false; }
-      }
+      const kind = msgOp; msgOp = 0; parts = [];
       if (kind === 1) sink.onText(td.decode(all));
       else sink.onBinary(all);
     }, sink.onError);
@@ -298,14 +254,10 @@ export constexpr std::string_view kWebSocketJS = R"JS(
         if (!state.closeSent) { state.closeSent = true; try { wire.sendClose(code === 1005 ? 1000 : code, reason); } catch (e) {} }
         teardown(code, reason);
       },
-      // Bun's server handler observes a protocol-level RSV violation as an
-      // unclean close (1006) with the parser diagnostic; no close frame is
-      // written after the invalid control/continuation frame.
-      onError: (err) => teardown(1006, String((err && err.message) || err)),
+      onError: () => teardown(1002, "protocol error"),
       // bun default max_payload_length = 16MB (WebSocketServerContext.rs:268,354).
     }, false, (ctx.handlers && "maxPayloadLength" in ctx.handlers)
-                ? Math.max(0, ctx.handlers.maxPayloadLength | 0) : (16 * 1024 * 1024),
-       ctx.perMessageDeflate && /permessage-deflate/i.test(String(ctx.extensions || "")));
+                ? Math.max(0, ctx.handlers.maxPayloadLength | 0) : (16 * 1024 * 1024));
     ctx.write(head + "\r\n");
     if (!ctx.detach()) return null;
     if (proto) ws.protocol = proto;
