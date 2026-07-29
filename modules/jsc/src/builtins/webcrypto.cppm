@@ -69,22 +69,76 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
     defineProperty(CryptoKey.prototype, "constructor", {
       configurable: false, enumerable: false, writable: false, value: CryptoKey,
     });
+    // WebIDL attributes are configurable accessors on the interface prototype;
+    // test-webcrypto-cryptokey-hidden-slots replaces all four with forged
+    // getters, so they must NOT be frozen shut. The *internal slots* stay in
+    // the frozen WeakMap metadata, which every internal consumer reads.
+    //
+    // `algorithm` and `usages` hand out a per-instance, identity-stable but
+    // MUTABLE copy: the spec's "associated ... object" is created once per key
+    // (key.algorithm === key.algorithm) and user code may mutate it without
+    // that mutation reaching the internal slot.
+    const publicAlgorithm = new WeakMap();
+    const publicUsages = new WeakMap();
+    const copyAlgorithm = (value) => {
+      if (!value || typeof value !== "object") return value;
+      if (ArrayBuffer.isView(value)) return new value.constructor(value);
+      const out = {};
+      for (const name of Object.keys(value)) out[name] = copyAlgorithm(value[name]);
+      return out;
+    };
+    const cachedCopy = (cache, key, source, copy) => {
+      let cached = cache.get(key);
+      if (cached === undefined) {
+        cached = copy(source);
+        cache.set(key, cached);
+      }
+      return cached;
+    };
     defineProperty(CryptoKey.prototype, "type", {
-      configurable: false, enumerable: true, get() { return metadataFor(this).type; },
+      configurable: true, enumerable: true, get() { return metadataFor(this).type; },
     });
     defineProperty(CryptoKey.prototype, "extractable", {
-      configurable: false, enumerable: true, get() { return metadataFor(this).extractable; },
+      configurable: true, enumerable: true, get() { return metadataFor(this).extractable; },
     });
     defineProperty(CryptoKey.prototype, "algorithm", {
-      configurable: false, enumerable: true, get() { return metadataFor(this).algorithm; },
+      configurable: true, enumerable: true, get() {
+        return cachedCopy(publicAlgorithm, this, metadataFor(this).algorithm, copyAlgorithm);
+      },
     });
     defineProperty(CryptoKey.prototype, "usages", {
-      configurable: false, enumerable: true, get() { return metadataFor(this).usages; },
+      configurable: true, enumerable: true, get() {
+        return cachedCopy(publicUsages, this, metadataFor(this).usages, (u) => u.slice());
+      },
     });
     defineProperty(CryptoKey.prototype, Symbol.toStringTag, {
-      configurable: false, value: "CryptoKey",
+      configurable: true, value: "CryptoKey",
     });
-    freeze(CryptoKey.prototype);
+    // node's CryptoKey carries a [kInspect] that renders the *internal slots*,
+    // never the public getters — so a replaced getter or a mutated public
+    // algorithm/usages copy cannot forge the inspect output.
+    defineProperty(CryptoKey.prototype, Symbol.for("nodejs.util.inspect.custom"), {
+      configurable: true, enumerable: false, writable: true,
+      value: function inspectCryptoKey(depth, options, innerInspect) {
+        const metadata = keyMetadata.get(this);
+        if (!metadata) return this;
+        if (typeof depth === "number" && depth < 0) return "[CryptoKey]";
+        const view = {
+          type: metadata.type,
+          extractable: metadata.extractable,
+          algorithm: copyAlgorithm(metadata.algorithm),
+          usages: metadata.usages.slice(),
+        };
+        const util = G.__mbunNativeModules && G.__mbunNativeModules["util"];
+        const render = typeof innerInspect === "function" ? innerInspect :
+          (util && util.inspect);
+        if (typeof render !== "function") return "CryptoKey " + JSON.stringify(view);
+        const opts = Object.assign({}, options);
+        opts.depth = options && options.depth != null ? options.depth - 1 : null;
+        opts.customInspect = false;
+        return "CryptoKey " + render(view, opts);
+      },
+    });
     // node instantiates InternalCryptoKey, a subclass whose prototype chains to
     // CryptoKey.prototype and whose `constructor` still reports CryptoKey.
     // test-webcrypto-cryptokey-brand-check walks exactly that chain.
