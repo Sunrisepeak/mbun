@@ -106,6 +106,22 @@ frozen machine or a silently murdered harness.
   `MBUN_BUILD_SLOTS` (default 1) sets how many may run at once,
   `MBUN_BUILD_WAIT` how long to wait before giving up with exit 75 — it never
   runs the command after giving up.
+- `reclaim_disk.sh` — reclaims regenerable build caches from **stale** agent
+  worktrees: `reclaim_disk.sh --apply`. Dry-run by default. The bounded layer
+  already refuses to start a measurement on a nearly-full disk
+  (`ensure_disk_headroom()`), and that guard is correct — but on 2026-07-29 the
+  box reached **100% with 6.1 GB free of 1.5 TB**, which would have aborted every
+  run of the wave with an error that reads like a runner bug. The cause is
+  structural: each parallel round leaves worktrees behind, each accumulates a
+  `target/` *plus* per-member `modules/*/target/` trees, and nobody owns them
+  (`.claude/worktrees/wt4` alone held 11 GB under `modules/jsc/target`; five
+  stale round-2/round-9 worktrees held 49 GB). Reclaiming only those caches
+  restored 44 GB without touching a line of source. **Staleness is by mtime, not
+  by "is it the current worktree"** — the first cut of the script protected only
+  the current checkout and its dry run promptly offered to delete the five
+  worktrees of the wave then executing. A cache touched within `--stale-hours`
+  (default 24) belongs to somebody, and no agent can see who. Never reclaims
+  source files, the current worktree, or the shared `~/.mcpp/bmi`.
 - `check_conflict_markers.sh` — fails if a tracked file still carries an
   unresolved merge-conflict marker. **Not redundant with the compiler:** mbun's
   builtins embed JavaScript inside C++ raw string literals, so a marker left in
@@ -189,6 +205,7 @@ bash tools/integration/tests/test_smoke_examples.sh
 bash tools/integration/tests/test_worktree_setup.sh
 bash tools/integration/tests/test_build_lock.sh
 bash tools/integration/tests/test_check_conflict_markers.sh
+bash tools/integration/tests/test_reclaim_disk.sh
 bash tools/integration/tests/test_latency_probe.sh
 bash benchmarks/tools/test-bench3.sh
 ```
