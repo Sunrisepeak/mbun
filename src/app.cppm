@@ -52,6 +52,27 @@ void set_cli_preloads(std::vector<std::string> preloads) {
     gCliPreloads = std::move(preloads);
 }
 
+// `--config <path>` / `-c <path>` selects the bunfig to load instead of the
+// implicit `./bunfig.toml` (ref bun src/bunfig/arguments.rs load_config: the
+// explicit path REPLACES the auto-discovered file, so `--config=empty.toml`
+// is how a run opts out of the project's `preload` list). Empty == implicit.
+std::string gBunfigPath{};
+
+void set_bunfig_path(std::string path) {
+    gBunfigPath = std::move(path);
+}
+
+// Resolve the bunfig file to read, or nullopt when there is none. An explicit
+// `--config` path that does not exist is silently ignored, like bun's
+// best-effort load_config.
+std::optional<std::filesystem::path> bunfig_file() {
+    std::error_code ec{};
+    const std::filesystem::path p{gBunfigPath.empty() ? std::filesystem::path{"bunfig.toml"}
+                                                      : std::filesystem::path{gBunfigPath}};
+    if (!std::filesystem::exists(p, ec)) return std::nullopt;
+    return p;
+}
+
 // A bare path argument that looks like a runnable script (bun-style `bun x.js`).
 // Defined later in this TU; used by run_install above their definitions.
 std::optional<std::filesystem::path> find_package_json(const std::filesystem::path& start);
@@ -228,9 +249,8 @@ int run_script(std::string_view script, std::span<const std::string_view> script
     // check already live in modules/bunfig; only the run-path wiring was missing.
     std::vector<std::string> preloads{};
     {
-        std::error_code ec{};
-        if (std::filesystem::exists("bunfig.toml", ec)) {
-            std::ifstream in{"bunfig.toml", std::ios::binary};
+        if (const std::optional<std::filesystem::path> bunfig{bunfig_file()}) {
+            std::ifstream in{*bunfig, std::ios::binary};
             if (in) {
                 std::string src{std::istreambuf_iterator<char>{in}, std::istreambuf_iterator<char>{}};
                 if (auto root = mbun::toml::parse(src)) {
@@ -809,10 +829,10 @@ int run_test(std::span<const std::string_view> args) {
     // flag parse and each flag only turns the option ON). modules/bunfig already
     // parses `onlyFailures`/`randomize`/`seed`; this is the consumer.
     std::vector<std::string> bunfigPathIgnorePatterns {};
+    std::vector<std::string> testPreloads {};
     {
-        std::error_code ec {};
-        if (std::filesystem::exists("bunfig.toml", ec)) {
-            std::ifstream in { "bunfig.toml", std::ios::binary };
+        if (const std::optional<std::filesystem::path> bunfig{bunfig_file()}) {
+            std::ifstream in { *bunfig, std::ios::binary };
             if (in) {
                 const std::string src { std::istreambuf_iterator<char> { in },
                                         std::istreambuf_iterator<char> {} };
@@ -825,6 +845,15 @@ int run_test(std::span<const std::string_view> args) {
                             flags.randomize = true;  // a seed implies randomizing
                         }
                         bunfigPathIgnorePatterns = cfg->test.path_ignore_patterns;
+                        // `[test].preload` CLOBBERS the universal top-level
+                        // `preload` for `bun test` — it is not merged with it
+                        // (ref bun bunfig.rs: the test block overwrites
+                        // `runtime_options.preload` when present). Only when
+                        // the test block has none do the universal ones apply.
+                        testPreloads = cfg->test.preloads.empty() ? cfg->preloads
+                                                                  : cfg->test.preloads;
+                        // bunfig supplies the default; `--rerun-each N` wins.
+                        if (flags.rerunEach == 0) flags.rerunEach = cfg->test.rerun_each;
                         apply_bunfig_jsx(*cfg, mbun::jsc::module_loader::runtime_jsx_options());
                     } else {
                         const auto& e = cfg.error();
@@ -875,6 +904,16 @@ int run_test(std::span<const std::string_view> args) {
         }
     }
 
+    // Preloads for the test run: bunfig's ([test].preload, else the universal
+    // `preload`) first, then the command line's --preload/--require/--import.
+    {
+        std::vector<std::string> preloads { std::move(testPreloads) };
+        for (const std::string& p : gCliPreloads) {
+            if (std::ranges::find(preloads, p) == preloads.end()) preloads.push_back(p);
+        }
+        if (!preloads.empty()) mbun::jsc::runtime::set_preloads(std::move(preloads));
+    }
+
     // bun routes the per-file lines and the aggregate summary to stderr (tests that
     // spawn `bun test` scrape proc.stderr for "N pass"/"Ran N tests"), but the
     // banner goes to STDOUT: test_command.rs exec() writes it via Output::writer()
@@ -921,7 +960,14 @@ int run_test(std::span<const std::string_view> args) {
         flags.testNamePattern ? std::optional<std::string_view> { *flags.testNamePattern }
                               : std::nullopt };
 
+    // `--rerun-each N` / bunfig `[test].rerunEach`: run every test file N times,
+    // aggregating each run into the same totals (ref bun test_command.rs — the
+    // repeat wraps the per-file run, so "N pass" reflects tests x reruns).
+    // 0 and 1 both mean "once"; bun treats the flag's absence as 1.
+    const std::uint32_t repeats { flags.rerunEach > 1 ? flags.rerunEach : 1 };
+
     for (const auto& f : files) {
+      for (std::uint32_t rep { 0 }; rep < repeats; ++rep) {
         const std::string path { f.string() };
         // The file header is titled with the path RELATIVE to the top level dir,
         // not the absolute path (ref: test_command.rs:3096 — `let file_title =
@@ -964,6 +1010,7 @@ int run_test(std::span<const std::string_view> args) {
         errors += r.errors;
         expectCalls += r.expect_calls;
         skippedLabel += r.skipped_label;
+      }
     }
 
     const auto elapsed { std::chrono::duration<double, std::milli>(

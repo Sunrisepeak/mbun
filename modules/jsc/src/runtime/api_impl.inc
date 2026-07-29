@@ -49,6 +49,34 @@ void add_env_file(std::string spec) { gEnvFiles.push_back(std::move(spec)); }
 // bunfig `preload`: modules to import before the entry point.
 void set_preloads(std::vector<std::string> paths) { gPreloads = std::move(paths); }
 
+// Run the configured preloads in the shared context. `bun run` does this inline
+// in Runtime::run_script (engine.inc); `bun test` has no run_script on its path,
+// so the test runner calls this once per file — the require cache makes every
+// call after the first a no-op, matching bun's single-process test run.
+// Returns the first preload error, or {} when all loaded.
+std::expected<void, std::string> run_preloads() {
+    for (const std::string& spec : gPreloads) {
+        std::error_code pec{};
+        std::filesystem::path p{spec};
+        if (!p.is_absolute()) p = std::filesystem::current_path(pec) / spec;
+        if (!std::filesystem::exists(p, pec) || std::filesystem::is_directory(p, pec)) {
+            return std::unexpected("preload not found \"" + spec + "\"");
+        }
+        // Quote the resolved path as a JS string literal (paths may contain
+        // backslashes or quotes; everything else is plain ASCII here).
+        std::string lit{"\""};
+        for (const char c : p.lexically_normal().string()) {
+            if (c == '"' || c == '\\') lit.push_back('\\');
+            lit.push_back(c);
+        }
+        lit.push_back('"');
+        if (auto r{Runtime::instance().eval_void("globalThis.require(" + lit + ");")}; !r) {
+            return std::unexpected(r.error());
+        }
+    }
+    return {};
+}
+
 // `--user-agent <STR>`: default User-Agent for fetch (bun Arguments.rs:1062).
 void set_user_agent(std::string ua) { gUserAgent = std::move(ua); }
 
