@@ -2736,9 +2736,14 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     G.URL = class URL {
       get [Symbol.toStringTag]() { return "URL"; }
       static canParse(input, ...rest) { try { new G.URL(input, ...rest); return true; } catch (e) { return false; } }
+      static parse(input, ...rest) { try { return new G.URL(input, ...rest); } catch (e) { return null; } }
       static createObjectURL(blob) {
         if (arguments.length < 1) { const e = new TypeError("Not enough arguments"); e.code = "ERR_MISSING_ARGS"; throw e; }
-        if (!(G.Blob && blob instanceof G.Blob)) throw new TypeError("createObjectURL expects a Blob object");
+        if (!(G.Blob && blob instanceof G.Blob)) {
+          const e = new TypeError('The "obj" argument must be an instance of Blob');
+          e.code = "ERR_INVALID_ARG_TYPE";
+          throw e;
+        }
         const id = "blob:" + __blobUUID();
         __objectURLRegistry.set(id, blob);
         return id;
@@ -3474,6 +3479,28 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     }
     return out;
   };
+  // Decode a file URL pathname into the original bytes. Unlike decodeURIComponent,
+  // this deliberately preserves percent-encoded non-UTF-8 filenames for the
+  // node:url fileURLToPathBuffer() API.
+  const urlDecodeFilePathBytes = (pathname) => {
+    const parts = [];
+    let encoded = [];
+    const flush = () => { if (encoded.length) { parts.push(Buffer.from(encoded)); encoded = []; } };
+    for (let i = 0; i < pathname.length;) {
+      if (pathname[i] === "%" && /^[0-9a-f]{2}$/i.test(pathname.slice(i + 1, i + 3))) {
+        encoded.push(parseInt(pathname.slice(i + 1, i + 3), 16));
+        i += 3;
+        continue;
+      }
+      flush();
+      const cp = pathname.codePointAt(i);
+      const ch = String.fromCodePoint(cp);
+      parts.push(Buffer.from(ch));
+      i += ch.length;
+    }
+    flush();
+    return parts.length === 1 ? parts[0] : Buffer.concat(parts);
+  };
   const urlMod = {
     URL: G.URL, URLSearchParams: G.URLSearchParams, Url,
     // node lib/url.js re-exports URLPattern. It is installed by the
@@ -3511,6 +3538,40 @@ inline constexpr char kBootstrapJS_[] = R"JS(
         }
       }
       return pathname.indexOf("%") !== -1 ? decodeURIComponent(pathname) : pathname;
+    },
+    fileURLToPathBuffer: (path, options) => {
+      const windows = options == null ? undefined : options.windows;
+      if (typeof path === "string") path = new G.URL(path);
+      else if (!urlIsURLLike(path)) { const e = new TypeError('The "path" argument must be of type string or an instance of URL.' + urlArgTypeReceived(path)); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
+      if (path.protocol !== "file:") { const e = new TypeError("The URL must be of scheme file"); e.code = "ERR_INVALID_URL_SCHEME"; throw e; }
+      const useWin = windows === undefined ? __isWin : windows;
+      let pathname = path.pathname;
+      for (let n = 0; n < pathname.length; n++) {
+        if (pathname[n] !== "%") continue;
+        const third = ((pathname.codePointAt(n + 2) | 0)) | 0x20;
+        if ((pathname[n + 1] === "2" && third === 102) ||
+            (useWin && pathname[n + 1] === "5" && third === 99)) {
+          const e = new TypeError(useWin
+            ? "File URL path must not include encoded \\ or / characters"
+            : "File URL path must not include encoded / characters");
+          e.code = "ERR_INVALID_FILE_URL_PATH";
+          e.input = path;
+          throw e;
+        }
+      }
+      if (!useWin) {
+        if (path.hostname !== "") { const e = new TypeError('File URL host must be "localhost" or empty on ' + (G.process ? G.process.platform : "linux")); e.code = "ERR_INVALID_FILE_URL_HOST"; throw e; }
+        return urlDecodeFilePathBytes(pathname);
+      }
+      pathname = pathname.replace(/\//g, "\\");
+      if (path.hostname !== "") {
+        let host = path.hostname;
+        try { host = urlMod.domainToUnicode(host) || host; } catch (e) {}
+        return Buffer.concat([Buffer.from("\\\\" + host), urlDecodeFilePathBytes(pathname)]);
+      }
+      const letter = ((pathname.codePointAt(1) | 0)) | 0x20;
+      if (letter < 97 || letter > 122 || pathname.charAt(2) !== ":") { const e = new TypeError("File URL path must be absolute"); e.code = "ERR_INVALID_FILE_URL_PATH"; e.input = path; throw e; }
+      return urlDecodeFilePathBytes(pathname.slice(1));
     },
     // faithful port of node lib/internal/url.js pathToFileURL (incl. { windows } option,
     // UNC handling and the ERR_INVALID_ARG_* throws).
@@ -4300,7 +4361,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
         }
       }
     }
-    try { return decodeURIComponent(pathname); } catch (e) { return pathname; }
+    return decodeURIComponent(pathname);
   };
   const toStr = (x) => {
     if (typeof x === "string") return x;
