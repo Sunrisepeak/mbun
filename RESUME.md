@@ -5,6 +5,72 @@ session that is interrupted (usage limit, crash, restart) can pick up from the
 file rather than from memory. **If you are a fresh session reading this, start
 here.**
 
+## 2026-07-30 03:00 — WAVE 48: +9 node, +5 bun, 0 real regressions
+
+**Node 2,876 → 2,885** (`test-crypto` 86→92, `test-http2` 213→216; +9 −0 over 401
+guard files). **Bun 887 → 891** (+5 gains; the one "regression",
+`cli/install/hosted-git-info/boundary-conditions`, is the known network flake —
+it went fail/green/green/fail across the last four runs).
+
+| lane | goal | actual |
+| --- | --- | --- |
+| cr (node crypto) | ≥3 | **6** |
+| bb (bun js/bun) | ≥2 | **4** |
+| bn (bun mixed) | ≥2 | 3 → **net +1 after revert** |
+| h2 (node http2) | ≥3 | **3** |
+
+### Dynamic adjustments made this wave
+
+1. **Capacity rebalanced 4-bun → 2-bun/2-node** because the bun near-green pool
+   thinned 108 → 42 as cheap wins were taken. Both node targets were chosen for
+   the *mostly-green subsystem* shape (crypto 86/129 green, http2 213/272) that
+   has paid best all session — and both delivered.
+2. **A mid-flight watchdog** now samples resources every 60s while lanes run
+   (floors: mem<8G, disk<15G, load>28), so an excursion is visible during a wave
+   rather than only at the next dispatch. Wave 48 stayed at mem 35-37G, disk 38G,
+   load ~2.5 — no excursion.
+3. **Screen v7** added two filters that removed **47 of 89** candidates: drop
+   `spawn node ENOENT` (no `node` on PATH — permanently unwinnable) and drop tests
+   whose SOURCE contacts public hostnames. The second matters because a live
+   `google.com` lookup made a file flip green with no code change; screening on
+   failure text cannot see that, screening on source can.
+
+### The bunfig preload change cost the same 5 files a SECOND time
+
+A lane re-implemented it (`--config`, bunfig preloads under `bun test`,
+`rerunEach`) and guarded it against 13 files, which passed. The specific 5 that
+the *first* attempt broke — `only-inside-only`, regressions `14135`/`19875`/
+`20092`/`5961` — were not in that guard and broke again. Reverted again: +4
+gained vs 5 lost.
+
+**Rule: when a change is re-attempted after a previous revert, its guard MUST
+include the exact files the previous attempt lost.** Those file names are in the
+wave-46 entry; anyone retrying this must run them. The failures are inline-snapshot
+mismatches, so whatever the preload path perturbs, it reaches snapshot formatting.
+
+### Findings worth more than the files
+
+- **http2 post-error teardown, half-fixed and fully diagnosed.** `_teardown()`
+  force-destroys only *pending* streams (`const pending = !this._connected ? … : []`)
+  on the recorded grounds that force-finishing open streams "cost 5 files", so an
+  open stream whose transport dies mid-response is left dangling with no
+  `'error'`/`'close'`. That is the remaining reach into bun's grpc-js files. The
+  other half — a `session.request()` from a close handler throwing *synchronously
+  inside the emit* and unwinding the whole teardown chain — is fixed.
+- **`${{ raw: … }}` was escaped as a single word**, so every raw-built shell
+  command exited 127 corpus-wide. 44 bun files use it; the fix moved
+  `bunshell.test.ts` from 120 to 96 failing assertions. Nobody had attributed
+  those to it. The lane's lesson generalises: look for the shared defect under
+  several near-green files rather than picking them off one by one.
+- **Async crypto callbacks were re-invoked when the callback itself threw**
+  (`try { fn(null,r) } catch(e) { fn(e) }`), which is why domain tests saw
+  "Expected exactly 1, actual 2".
+
+### Provisional result flagged by its own lane
+
+`js/bun/test/test-only.test.ts` went green as a side effect of the shell raw-splice
+fix and the lane did not verify which assertion it repaired. Treat as provisional.
+
 ## 2026-07-30 02:10 — WAVE 47: 4 lanes, all met or beat their numeric goal
 
 Pre-dispatch gates now run every wave (this is the fix for wave 46, where a
