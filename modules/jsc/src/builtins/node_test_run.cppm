@@ -391,6 +391,32 @@ inline constexpr std::string_view kNodeTestRunJS = R"JS(
       return found;
     };
 
+    // Node expands user-supplied test-file globs too. Default discovery skips
+    // node_modules, but an explicit glob is permitted to select files there.
+    const expandTestFileGlobs = (patterns, cwd) => {
+      const fs = fsMod();
+      const path = pathMod();
+      const found = [];
+      for (const pattern of patterns) {
+        const value = String(pattern);
+        const magic = value.search(/[*?[\]{}]/);
+        if (magic === -1) { found.push(pattern); continue; }
+
+        const slash = Math.max(value.lastIndexOf("/", magic), value.lastIndexOf("\\", magic));
+        const base = slash === -1 ? "" : value.slice(0, slash === 0 ? 1 : slash);
+        const glob = value.slice(slash + 1);
+        const scanCwd = path.isAbsolute(value) ? base : path.resolve(cwd, base || ".");
+        let matches = [];
+        try { matches = fs.globSync(glob, { cwd: scanCwd }); } catch (e) {}
+        for (const match of matches) {
+          const full = path.resolve(scanCwd, match);
+          try { if (!fs.statSync(full).isFile()) continue; } catch (e) { continue; }
+          found.push(path.isAbsolute(value) ? full : path.relative(cwd, full));
+        }
+      }
+      return found;
+    };
+
     const toRegExp = (pattern) => {
       if (pattern instanceof RegExp) return pattern;
       // node parses a `/…/flags`-shaped string as a RegExp literal and treats
@@ -410,6 +436,7 @@ inline constexpr std::string_view kNodeTestRunJS = R"JS(
 
       let given = options.files;
       if (given === undefined) given = discover(cwd);
+      else given = expandTestFileGlobs(given, cwd);
       if (options.shard !== undefined) {
         given = given.filter((_f, i) => (i % options.shard.total) === (options.shard.index - 1));
       }
