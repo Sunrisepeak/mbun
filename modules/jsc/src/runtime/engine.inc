@@ -564,17 +564,18 @@ public:
                 err && !err->empty()) {
                 return fail_run_(*err);
             }
+            // Node gives a top-level await that cannot settle because the event
+            // loop went idle status 13 (ERR_UNFINISHED_TOP_LEVEL_AWAIT). This
+            // is observable for data: Worker modules as well as CLI entries.
+            if (!settled)
+                return finish_run_(13);
             // Top level settled: bun keeps the process alive while live
             // handles remain (ref'd timers, sockets, listening servers, child
-            // processes) — same liveness drain as the sync path below. A
-            // top level that idled out unsettled keeps the legacy bailout
-            // (draining it would turn a wedged await into an infinite hang).
-            if (settled) {
-                if (auto s{serve_default_export_()}; !s) {
-                    return fail_run_(s.error());
-                }
-                pump_event_loop("0");
+            // processes) — same liveness drain as the sync path below.
+            if (auto s{serve_default_export_()}; !s) {
+                return fail_run_(s.error());
             }
+            pump_event_loop("0");
         } else {
             // Top level ran synchronously to completion. Node/bun keep the process
             // alive until the event loop drains: pending setTimeout/setInterval
