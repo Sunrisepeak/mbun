@@ -1262,7 +1262,13 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
           get() {
             const argv = (G.process && G.process.execArgv) || [];
             for (const a of argv) {
-              if (a === "--expose-gc" || (typeof a === "string" && a.startsWith("--expose-gc="))) {
+              // V8 accepts both spellings and Node's own corpus uses the
+              // underscore form in `// Flags:` headers.  execArgv deliberately
+              // preserves the spelling it was given, so recognize both here
+              // without exposing gc for an unrelated flag.
+              if (a === "--expose-gc" || a === "--expose_gc" ||
+                  (typeof a === "string" &&
+                    (a.startsWith("--expose-gc=") || a.startsWith("--expose_gc=")))) {
                 return collect;
               }
             }
