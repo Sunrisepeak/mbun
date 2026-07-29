@@ -5,6 +5,55 @@ session that is interrupted (usage limit, crash, restart) can pick up from the
 file rather than from memory. **If you are a fresh session reading this, start
 here.**
 
+## 2026-07-30 12:10 — WAVE 56 lane D: bun `bake/dev` sized and RETIRED (0 files, kept anyway)
+
+**Do not schedule the 18 `test/bake/dev` files again.** Lane D's lead was right
+about the cause and wrong about the payoff, which is the useful kind of negative
+result.
+
+One genuine shared defect existed: `test_runner.cppm` evaluated each test file
+with sourceURL `"<test>"`, so the entry file's own frames carried no path while
+every imported module had one. `bake-harness.ts snapshotCallerLocation()` matches
+`import.meta.dir` against the frames, found nothing, and threw *"Couldn't find
+caller location in stack trace"* during collection. Fixed, and collection now
+proceeds — **but the files still fail, behind two walls:**
+
+1. `stackTraceFileName()` feeds the frame to `startsWith(devTestRoot)`. JSC writes
+   `@/path:l:c`, V8 writes `at /path:l:c`. Removing that `@` **is** the V8
+   `.stack` rewrite already settled as not-worth-it (`markdown_web.cppm` ~2355).
+   Verified there is no cheaper dodge: the harness's `<…>` and `(` strip rules
+   both discard a prefix *before* the `@`, so no function-name or `displayName`
+   trick can hide it.
+2. Past that, `devTest` spawns a bake DevServer. `Bun.serve()` has no
+   `app`/framework option, and `bun:internal-for-testing` has no
+   `getDevServerDeinitCount`. **These 18 files are gated on the whole
+   HMR/incremental-bundler subsystem, not on stacks.**
+
+The other 13 `<test>`-mentioning files (`js/bun/test/stack`,
+`node/v8/capture-stack-trace`, `regression/08794`, `util/inspect-error`) are
+blocked on the same retired V8 format, not on the sourceURL.
+
+**Kept for its own sake** (`0cc2e63`, integrated): test-file frames now carry real
+paths, and the CJS wrapper prologue was merged onto the source's first line so
+reported lines are exact instead of two too low. Measured, integrator-verified:
+52/52 green on the stack-sensitive bun slice, 0 regressions (`w56d-verify`);
+lane's wide guard 868 previously-green bun files, 0 regressions; node 313/313.
+Blast radius is `bun test` only — `test_runner::run_source` is not on the node
+corpus path. No error-construction perf delta (noise-dominated at 200k iters).
+
+### TWO TRAPS THAT WILL FAKE A REGRESSION — read before trusting a bun diff
+
+- **The `AF_UNIX` 108-byte path limit.** A long `--out` directory name pushes unix
+  socket paths past the limit, and bun tests that `listen()` on one fail with
+  `EINVAL`. Lane D saw `js/node/net/node-net-server.test.ts` and
+  `third_party/grpc-js/test-idle-timer.test.ts` "regress" for exactly this reason;
+  both were green again with a short out-dir. **Keep bun run-dir names short.**
+- **The `w47-bun-full` baseline has DRIFTED from the current branch.**
+  `js/bun/test/test-failing.test.ts` was green in w47 and fails on this tree
+  independent of any change in this wave (`jest.setTimeout is not a function`,
+  `test.failing` message text). It is a pre-existing failure, NOT a regression.
+  The bun baseline needs a same-tree refresh before the next bun lane trusts it.
+
 ## 2026-07-30 10:50 — WAVE 55: `process.nextTick` runs INSIDE the microtask queue
 
 The highest-leverage finding of the campaign so far, and it was found by chasing
