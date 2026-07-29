@@ -1978,9 +1978,21 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     EventEmitterPrototype.on = EventEmitterPrototype.addListener;
     EventEmitterPrototype.prependListener = function prependListener(type, fn) { checkListener(fn); return insert(this, type, fn, true); };
 
-    function onceWrapper(type, listener, ...args) { this.removeListener(type, listener); listener.apply(this, args); }
-    EventEmitterPrototype.once = function once(type, fn) { checkListener(fn); const bound = onceWrapper.bind(this, type, fn); bound.listener = fn; this.addListener(type, bound); return this; };
-    EventEmitterPrototype.prependOnceListener = function prependOnceListener(type, fn) { checkListener(fn); const bound = onceWrapper.bind(this, type, fn); bound.listener = fn; this.prependListener(type, bound); return this; };
+    function onceWrapper(...args) {
+      if (this.fired) return undefined;
+      this.target.removeListener(this.type, this.wrapFn);
+      this.fired = true;
+      return this.listener.apply(this.target, args);
+    }
+    function onceWrap(target, type, listener) {
+      const state = { fired: false, wrapFn: undefined, target, type, listener };
+      const wrapped = onceWrapper.bind(state);
+      wrapped.listener = listener;
+      state.wrapFn = wrapped;
+      return wrapped;
+    }
+    EventEmitterPrototype.once = function once(type, fn) { checkListener(fn); this.addListener(type, onceWrap(this, type, fn)); return this; };
+    EventEmitterPrototype.prependOnceListener = function prependOnceListener(type, fn) { checkListener(fn); this.prependListener(type, onceWrap(this, type, fn)); return this; };
 
     EventEmitterPrototype.removeListener = function removeListener(type, fn) {
       checkListener(fn);
