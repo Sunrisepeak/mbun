@@ -1109,6 +1109,17 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   ECDH.prototype.getPrivateKey = function (encoding) { return (encoding && encoding !== "buffer") ? this._priv.toString(encoding) : Buffer.from(this._priv); };
   ECDH.prototype.setPrivateKey = function (key, encoding) { this._priv = typeof key === "string" ? Buffer.from(key, encoding) : toBuf(key); this._pub = Buffer.from(AN.ecdhPublicFromPrivate(this._curve, this._priv)); return this; };
   ECDH.prototype.setPublicKey = function (key, encoding) { this._pub = typeof key === "string" ? Buffer.from(key, encoding) : toBuf(key); return this; };
+  // `setPublicKey()` is retained only for compatibility. Node's util.deprecate
+  // wrapper warns once even when the underlying key validation then throws.
+  const ecdhSetPublicKey = ECDH.prototype.setPublicKey;
+  let ecdhSetPublicKeyWarned = false;
+  ECDH.prototype.setPublicKey = function deprecated(key, encoding) {
+    if (!ecdhSetPublicKeyWarned && G.process && typeof G.process.emitWarning === "function") {
+      ecdhSetPublicKeyWarned = true;
+      G.process.emitWarning("ecdh.setPublicKey() is deprecated.", "DeprecationWarning", "DEP0031");
+    }
+    return ecdhSetPublicKey.call(this, key, encoding);
+  };
   ECDH.convertKey = (key, curve, inputEnc, outputEnc, format) => {
     // node diffiehellman.js convertKey validation order: encoding → curve → format.
     let pt;
