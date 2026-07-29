@@ -3077,18 +3077,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   const PerfObserver = class PerformanceObserver { constructor(cb) { this._cb = cb; } observe() {} disconnect() {} takeRecords() { return []; } };
   PerfObserver.supportedEntryTypes = ["mark", "measure", "function"];
   def(["perf_hooks"], { performance: G.performance || { now: () => 0, timeOrigin: 0, mark() {}, measure() {}, getEntries: () => [], getEntriesByName: () => [], getEntriesByType: () => [], clearMarks() {}, clearMeasures() {} }, PerformanceObserver: PerfObserver, PerformanceEntry: class PerformanceEntry {}, PerformanceMark: class PerformanceMark {}, PerformanceMeasure: class PerformanceMeasure {}, monitorEventLoopDelay: () => ({ enable() {}, disable() {}, reset() {}, percentile: () => 0, min: 0, max: 0, mean: 0, stddev: 0 }), createHistogram: () => ({ record() {}, reset() {}, percentile: () => 0 }), constants: { NODE_PERFORMANCE_GC_MAJOR: 4 } });
-  // `_http_common` is loaded after user code can monkey-patch the http_parser
-  // binding. Keep HTTPParser lazy so both module paths observe that one binding
-  // rather than freezing this bootstrap placeholder at startup.
-  const httpCommon = { methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "CONNECT", "TRACE"], continueExpression: () => false };
-  Object.defineProperty(httpCommon, "HTTPParser", {
-    enumerable: true,
-    get() {
-      const bind = G.__mbunInternalBinding;
-      return bind ? bind("http_parser").HTTPParser : class HTTPParser {};
-    },
-  });
-  def(["_http_common"], httpCommon);
+  def(["_http_common"], { HTTPParser: class HTTPParser {}, methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "CONNECT", "TRACE"], continueExpression: () => false });
   // ---- more node builtins (stubs/aliases so importing files load) ----
   Object.defineProperty(M, "process", { get: () => G.process, configurable: true, enumerable: true });        // node:process → the global (lazy: process may install after this)
   Object.defineProperty(M, "node:process", { get: () => G.process, configurable: true, enumerable: true });
