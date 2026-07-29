@@ -386,7 +386,16 @@ inline constexpr std::string_view kNodeModuleJS = R"JS(
   Module._resolveFilename = (request, parent, isMain, options) => resolveFilename(request, parent, isMain, options);
   Module._resolveLookupPaths = (request, parent) => resolveLookupPaths(request, parent);
   Module._nodeModulePaths = (from) => nodeModulePaths(from);
-  Module._cache = {};
+  // `Module._cache` and every module-scoped `require.cache` are one live
+  // object.  In particular, user-installed records must be observed before
+  // the native loader is entered (Node's documented cache-injection idiom).
+  Module._cache = G.__mbun_require_cache || (G.__mbun_require_cache = new Proxy({}, {
+    deleteProperty(target, key) {
+      G.__mbun_evict_module_cache(String(key));
+      delete target[key];
+      return true;
+    },
+  }));
   Module._pathCache = {};
 
   // _stat(path): node's internalModuleStat — 1 for a directory, 0 for a file,
@@ -408,7 +417,28 @@ inline constexpr std::string_view kNodeModuleJS = R"JS(
     ".js": noopLoader, ".json": noopLoader, ".node": noopLoader,
     ".cts": noopLoader, ".ts": noopLoader, ".mjs": noopLoader, ".mts": noopLoader,
   };
-  Module.globalPaths = [];
+  function initPaths() {
+    const path = getPath();
+    const env = G.process && G.process.env || {};
+    const sep = G.process && G.process.platform === "win32" ? ";" : ":";
+    const paths = [];
+    const add = (value) => { if (typeof value === "string" && value.length && !paths.includes(value)) paths.push(value); };
+    if (typeof env.NODE_PATH === "string") {
+      for (const entry of env.NODE_PATH.split(sep)) add(entry);
+    }
+    const home = env.HOME || env.USERPROFILE;
+    if (home) {
+      add(path.join(home, ".node_modules"));
+      add(path.join(home, ".node_libraries"));
+    }
+    const execPath = G.process && G.process.execPath;
+    if (typeof execPath === "string" && execPath.length) {
+      add(path.join(path.dirname(path.dirname(execPath)), "lib", "node"));
+    }
+    add("/usr/lib/node");
+    Module.globalPaths = paths;
+  }
+  initPaths();
 
   Module.wrapper = [
     "(function (exports, require, module, __filename, __dirname) { ",
@@ -418,6 +448,16 @@ inline constexpr std::string_view kNodeModuleJS = R"JS(
 
   Module.SourceMap = SourceMap;
   Module.findSourceMap = (path) => undefined;
+  Module.setSourceMapsSupport = (enabled, options) => {
+    if (typeof enabled !== "boolean") throw invalidArgType("enabled", "boolean", enabled);
+    if (options === undefined) return;
+    if (options === null || typeof options !== "object") throw invalidArgType("options", "Object", options);
+    for (const key of ["nodeModules", "generatedCode"]) {
+      if (options[key] !== undefined && typeof options[key] !== "boolean") {
+        throw invalidArgType("options." + key, "boolean", options[key]);
+      }
+    }
+  };
   Module.syncBuiltinESMExports = () => {};
 
   Module.constants = Object.freeze({
@@ -514,7 +554,7 @@ inline constexpr std::string_view kNodeModuleJS = R"JS(
     const dir = parent && parent.path ? parent.path : G.process.cwd();
     return G.__mbun_make_require(dir)(request);
   };
-  Module._initPaths = () => {};
+  Module._initPaths = () => initPaths();
   Module._preloadModules = () => {};
 
   M["module"] = Module;
@@ -560,6 +600,7 @@ inline constexpr std::string_view kNodeModuleJS = R"JS(
         return origResolve ? origResolve.call(this, s) : G.__mbun_resolve_native(s, dir);
       };
       req.extensions = Module._extensions;
+      req.cache = Module._cache;
       return req;
     };
     patched.__mbunModulePatched = true;

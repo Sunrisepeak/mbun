@@ -66,6 +66,19 @@ globalThis.__mbun_make_require = function (dir) {
       throw error;
     }
     const load = function () {
+      // Node consults require.cache before entering its CJS loader.  Keep the
+      // native cache authoritative for ordinary modules, while honouring a
+      // caller-installed cache record (including builtin keys) before crossing
+      // the native boundary.
+      const cache = req.cache;
+      let cacheKey = s;
+      if (s.indexOf("node:") !== 0) {
+        try { cacheKey = req.resolve(s); } catch (_) {}
+      }
+      const cached = cache[cacheKey] || cache[s];
+      if (cached && typeof cached === "object" && "exports" in cached) {
+        return cached.exports;
+      }
       return globalThis.__mbun_require_native(s, dir, false,
         (o && typeof o.type === "string") ? o.type : "", k ? 1 : 0);
     };

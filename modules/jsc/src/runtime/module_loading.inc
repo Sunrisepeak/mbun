@@ -664,6 +664,30 @@
                 : std::string{}};
         std::string wrapper{std::string{tla ? "(async function (" : "(function ("} + params +
                             ") {\n" + strictPrefix + metaPrefix + source + debugEnvSuffix + "\n})"};
+        // User CommonJS modules run through the mutable Module.wrapper hook.
+        // Keep the extended native wrapper for Node internals (which receive
+        // primordials/internalBinding parameters), but honour changed user
+        // wrapper fragments exactly as Module.wrap() promises.
+        if (!nodeInternal && !tla) {
+            JSObjectRef nativeModules{JSValueToObject(
+                ctx, get_prop(ctx, JSContextGetGlobalObject(ctx), "__mbunNativeModules"), nullptr)};
+            JSObjectRef nodeModule{nativeModules == nullptr
+                                       ? nullptr
+                                       : JSValueToObject(ctx, get_prop(ctx, nativeModules, "module"), nullptr)};
+            JSObjectRef fragments{nodeModule == nullptr
+                                      ? nullptr
+                                      : JSValueToObject(ctx, get_prop(ctx, nodeModule, "wrapper"), nullptr)};
+            if (fragments != nullptr) {
+                const std::string prefix{val_to_string(ctx, get_prop(ctx, fragments, "0"))};
+                const std::string suffix{val_to_string(ctx, get_prop(ctx, fragments, "1"))};
+                constexpr std::string_view defaultPrefix{
+                    "(function (exports, require, module, __filename, __dirname) { "};
+                constexpr std::string_view defaultSuffix{"\n});"};
+                if (prefix != defaultPrefix || suffix != defaultSuffix) {
+                    wrapper = prefix + strictPrefix + metaPrefix + source + debugEnvSuffix + suffix;
+                }
+            }
+        }
 
         JSValueRef wrapExc{nullptr};
         JSValueRef fnVal{eval_(wrapper, &wrapExc, path)};
@@ -836,4 +860,3 @@ private:
 #endif
         install_bindings_();
     }
-
