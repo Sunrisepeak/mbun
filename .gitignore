@@ -22,3 +22,22 @@ __pycache__/
 # behaviour is identical.
 compat/bun/test/js/bun/ffi/ffi.test.fixture.callback.c
 compat/bun/test/js/bun/ffi/ffi.test.fixture.receiver.c
+
+# Corpus-test litter dropped into the repo root. These come from tests that
+# write relative to process.cwd() with a path derived from a stringified value
+# -- `Bun.write(String(blob), ...)` yields a file literally named
+# "[object Blob]", and `garbage-env` is a copy of an ELF binary. None of it is
+# reproducible input: the tests recreate it on demand. It is ignored because a
+# bare `git add -A` swept this set into a commit once and had to be unwound.
+/1000
+/123
+/[[]object Blob[]]
+/[[]object Object[]]
+/dummy
+/garbage-env
+/null
+
+# Lane worktrees created inside the repo tree by tools/integration/worktree_setup.sh.
+# `git worktree list` is the authority on which exist; they must never be staged.
+/wt[0-9]
+/wt[0-9][0-9]
