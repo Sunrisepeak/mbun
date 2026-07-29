@@ -418,15 +418,33 @@ inline constexpr std::string_view kNodeInternalBindingJS = R"JS(
   });
 
   // -------------------------------------------------------- trace_events ----
-  // This runtime emits no trace events; the category set is always disabled,
-  // which is what node reports when built without tracing.
-  factories["trace_events"] = () => ({
-    CategorySet: class CategorySet { constructor() {} enable() {} disable() {} },
-    getCategoryEnabledBuffer: () => new Uint8Array(1),
-    isTraceCategoryEnabled: () => false,
-    setTraceCategoryStateUpdateHandler() {},
-    trace() {},
-  });
+  // Shared with node:trace_events: the process-extra partition owns category
+  // state and the trace-file sink, while this binding exposes Node's native
+  // looking hooks to internal users.
+  factories["trace_events"] = () => {
+    const trace = G.__mbunTraceEvents;
+    if (trace) return {
+      CategorySet: class CategorySet {
+        constructor(categories) {
+          this.categories = Array.isArray(categories) ? categories : String(categories || "").split(",").filter(Boolean);
+          this.enabled = false;
+        }
+        enable() { if (!this.enabled) { this.enabled = true; trace.enableCategories(this.categories); } }
+        disable() { if (this.enabled) { this.enabled = false; trace.disableCategories(this.categories); } }
+      },
+      getCategoryEnabledBuffer: trace.getCategoryEnabledBuffer,
+      isTraceCategoryEnabled: trace.isTraceCategoryEnabled,
+      setTraceCategoryStateUpdateHandler: trace.setTraceCategoryStateUpdateHandler,
+      trace: trace.trace,
+    };
+    return {
+      CategorySet: class CategorySet { constructor() {} enable() {} disable() {} },
+      getCategoryEnabledBuffer: () => new Uint8Array(1),
+      isTraceCategoryEnabled: () => false,
+      setTraceCategoryStateUpdateHandler() {},
+      trace() {},
+    };
+  };
 
   // ------------------------------------------------ async_context_frame ----
   factories["async_context_frame"] = () => {

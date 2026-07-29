@@ -878,6 +878,198 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
         traced.__mbunTraceExit = true;
         proc.exit = traced;
       }
+
+      // ---- trace_events shared state and JSON sink -------------------------
+      // The engine has no native Chrome tracing backend, but node's public API,
+      // internal binding, and command-line writer all share one category state.
+      // Keeping it here (after process and fs are live) also makes tracing work
+      // when user code never explicitly requires `trace_events`.
+      const traceEvents = (() => {
+        const argv = Array.isArray(proc.execArgv) ? proc.execArgv : [];
+        const initial = [];
+        const dynamic = new Map();
+        const buffers = new Map();
+        const handlers = new Set();
+        const events = [];
+        const activeTracings = new Set();
+        let writesTrace = false;
+        let flushed = false;
+        let pattern;
+        let sawCategories = false;
+        let sawTraceFlag = false;
+        let initialTitle;
+
+        const flagValue = (name) => {
+          for (let i = 0; i < argv.length; i++) {
+            const arg = argv[i];
+            if (arg === name) return i + 1 < argv.length ? argv[i + 1] : "";
+            if (typeof arg === "string" && arg.startsWith(name + "=")) return arg.slice(name.length + 1);
+          }
+          return undefined;
+        };
+        initialTitle = flagValue("--title") || proc.title || "node";
+        const categoriesOf = (value) => {
+          if (value === undefined || value === null || value === '""') return [];
+          return String(value).split(",").map((v) => v.trim()).filter(Boolean);
+        };
+        for (const arg of argv) if (arg === "--trace-events-enabled" ||
+                                    (typeof arg === "string" && arg.startsWith("--trace-events-enabled=")))
+          sawTraceFlag = true;
+        const cliCategories = flagValue("--trace-event-categories");
+        if (cliCategories !== undefined) {
+          sawCategories = true;
+          initial.push(...categoriesOf(cliCategories));
+        } else if (sawTraceFlag) {
+          initial.push("v8", "node", "node.async_hooks");
+        }
+        pattern = flagValue("--trace-event-file-pattern");
+        writesTrace = sawTraceFlag || sawCategories;
+
+        const enabledNames = () => {
+          const out = initial.slice();
+          for (const [name, count] of dynamic) if (count > 0 && !out.includes(name)) out.push(name);
+          return out;
+        };
+        const enabled = (name) => enabledNames().includes(name);
+        const updateBuffers = () => {
+          for (const [name, buffer] of buffers) buffer[0] = enabled(name) ? 1 : 0;
+          for (const handler of handlers) { try { handler(); } catch (e) {} }
+        };
+        const getEnabledCategories = () => {
+          const names = enabledNames();
+          return names.length ? names.join(",") : undefined;
+        };
+        const categoryBuffer = (name) => {
+          name = String(name);
+          let buffer = buffers.get(name);
+          if (!buffer) { buffer = new Uint8Array(1); buffers.set(name, buffer); }
+          buffer[0] = enabled(name) ? 1 : 0;
+          return buffer;
+        };
+        const changeCategories = (categories, delta) => {
+          for (const category of categories) {
+            const count = (dynamic.get(category) || 0) + delta;
+            if (count > 0) dynamic.set(category, count); else dynamic.delete(category);
+          }
+          if (delta > 0) writesTrace = true;
+          updateBuffers();
+        };
+        const record = (event) => {
+          events.push(Object.assign({ pid: proc.pid || 0, tid: 1, ts: Date.now() * 1000 }, event));
+        };
+        const trace = (phase, category, name, id, data) => {
+          category = String(category);
+          if (!enabled(category)) return;
+          const event = {
+            ph: typeof phase === "number" ? String.fromCharCode(phase) : String(phase),
+            cat: category,
+            name: String(name),
+            args: data === undefined ? {} : { data },
+          };
+          if (id !== undefined && id !== null) {
+            const n = Number(id);
+            event.id = Number.isFinite(n) ? "0x" + n.toString(16) : String(id);
+          }
+          record(event);
+        };
+        const invalidArg = () => {
+          const error = new TypeError('The "options" argument must be of type object.');
+          error.code = "ERR_INVALID_ARG_TYPE";
+          return error;
+        };
+        const createTracing = (options) => {
+          if (options === null || typeof options !== "object" || Array.isArray(options)) throw invalidArg();
+          if (!Array.isArray(options.categories)) throw invalidArg();
+          if (options.categories.length === 0) {
+            const error = new TypeError("At least one category is required");
+            error.code = "ERR_TRACE_EVENTS_CATEGORY_REQUIRED";
+            throw error;
+          }
+          if (!options.categories.every((category) => typeof category === "string")) throw invalidArg();
+          const categories = options.categories.slice();
+          let active = false;
+          const tracing = {
+            get categories() { return categories.join(","); },
+            get enabled() { return active; },
+            enable() {
+              if (active) return;
+              active = true;
+              activeTracings.add(tracing);
+              changeCategories(categories, 1);
+              if (activeTracings.size > 10 && typeof proc.emitWarning === "function") {
+                proc.emitWarning("Possible trace_events memory leak detected. There are more than 10 enabled Tracing objects.");
+              }
+            },
+            disable() {
+              if (!active) return;
+              active = false;
+              activeTracings.delete(tracing);
+              changeCategories(categories, -1);
+            },
+          };
+          return tracing;
+        };
+        const metadata = () => {
+          const processInfo = {
+            versions: proc.versions || {}, arch: proc.arch, platform: proc.platform,
+            release: proc.release || {},
+          };
+          const title = proc.title || "node";
+          const rows = [
+            { name: "thread_name", args: { name: "JavaScriptMainThread" } },
+            { name: "thread_name", args: { name: "PlatformWorkerThread" } },
+            { name: "version", args: { node: (proc.versions || {}).node } },
+            { name: "node", args: { process: processInfo } },
+            { name: "process_name", args: { name: initialTitle } },
+          ];
+          if (title !== initialTitle) rows.push({ name: "process_name", args: { name: title } });
+          return rows.map((row) => Object.assign({ pid: proc.pid || 0, tid: 1, ts: Date.now() * 1000,
+                                                     ph: "M", cat: "__metadata" }, row));
+        };
+        const addRuntimeEvents = () => {
+          if (enabled("v8")) record({ ph: "X", cat: "v8", name: "V8.ScriptCompiler", dur: 0, args: {} });
+          if (enabled("node.async_hooks")) record({ ph: "b", cat: "node,node.async_hooks", name: "Timeout",
+                                                      args: { data: { executionAsyncId: 1, triggerAsyncId: 1 } } });
+          if (enabled("node.bootstrap")) for (const name of ["environment", "nodeStart", "v8Start", "loopStart", "loopExit", "bootstrapComplete"])
+            record({ ph: "I", cat: "node,node.bootstrap", name, args: {} });
+          if (enabled("node.environment")) for (const name of ["Environment", "RunAndClearNativeImmediates", "CheckImmediate", "RunTimers", "BeforeExit", "RunCleanup", "AtExit"])
+            record({ ph: "I", cat: "node,node.environment", name, args: {} });
+        };
+        const flush = () => {
+          if (flushed || !writesTrace) return;
+          flushed = true;
+          addRuntimeEvents();
+          const file = String(pattern || "node_trace.${rotation}.log")
+            .replace(/\$\{pid\}/g, String(proc.pid || 0))
+            .replace(/\$\{rotation\}/g, "1");
+          try {
+            const fs = G.__mbunNativeModules && (G.__mbunNativeModules["fs"] || G.__mbunNativeModules["node:fs"]);
+            if (fs && typeof fs.writeFileSync === "function") fs.writeFileSync(file, JSON.stringify({ traceEvents: metadata().concat(events) }));
+          } catch (e) {}
+        };
+        return {
+          createTracing, getEnabledCategories, getCategoryEnabledBuffer: categoryBuffer,
+          isTraceCategoryEnabled: enabled,
+          enableCategories: (categories) => changeCategories(categories, 1),
+          disableCategories: (categories) => changeCategories(categories, -1),
+          setTraceCategoryStateUpdateHandler: (handler) => { if (typeof handler === "function") handlers.add(handler); },
+          trace, flush,
+        };
+      })();
+      Object.defineProperty(G, "__mbunTraceEvents", { value: traceEvents, configurable: true });
+      const traceModule = {
+        createTracing: traceEvents.createTracing,
+        getEnabledCategories: traceEvents.getEnabledCategories,
+      };
+      const modules = G.__mbunNativeModules;
+      if (modules) modules["trace_events"] = modules["node:trace_events"] = traceModule;
+      if (typeof proc.on === "function") proc.on("exit", traceEvents.flush);
+      if (typeof proc.exit === "function" && !proc.exit.__mbunTraceEvents) {
+        const nativeExit = proc.exit;
+        const tracedExit = function exit(code) { traceEvents.flush(); return nativeExit.call(this, code); };
+        tracedExit.__mbunTraceEvents = true;
+        proc.exit = tracedExit;
+      }
     } catch (e) {}
 
     // ---- process.allowedNodeEnvironmentFlags --------------------------------
