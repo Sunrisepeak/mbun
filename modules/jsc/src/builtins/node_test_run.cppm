@@ -566,6 +566,9 @@ inline constexpr std::string_view kNodeTestRunJS = R"JS(
       // The evaluated files' failures belong to the returned stream; they must
       // not set the exit status of the process that called run().
       internals.setOwnExitCode(false);
+      // There is no child to hand an id to, so this process IS worker 1
+      // (test-runner-worker-id: "NODE_TEST_WORKER_ID is 1 with isolation=none").
+      try { if (G.process && G.process.env) G.process.env.NODE_TEST_WORKER_ID = "1"; } catch (e) {}
       try {
         for (let i = 0; i < files.length; i++) {
           if (aborted()) break;
@@ -635,21 +638,28 @@ inline constexpr std::string_view kNodeTestRunJS = R"JS(
       }
 
       let cursor = 0;
-      const worker = async () => {
+      // node gives every concurrent child a 1-based NODE_TEST_WORKER_ID and
+      // RECYCLES it once that child exits, so the live ids are always a subset
+      // of {1..limit} (test-runner-worker-id). Each loop below owns one id for
+      // its whole lifetime, which is exactly that pool discipline.
+      const worker = async (workerId) => {
         for (;;) {
           if (aborted()) return;
           const index = cursor++;
           if (index >= files.length) return;
-          await runOneFile(spawn, files[index], given[index], index + 1, forward, options, cwd);
+          await runOneFile(spawn, files[index], given[index], index + 1, forward, options, cwd, workerId);
         }
       };
       const workers = [];
-      for (let i = 0; i < Math.min(limit, Math.max(files.length, 1)); i++) workers.push(worker());
+      for (let i = 0; i < Math.min(limit, Math.max(files.length, 1)); i++) workers.push(worker(i + 1));
       await Promise.all(workers);
     };
 
-    const runOneFile = (spawn, file, given, ordinal, forward, options, cwd) => new Promise((resolve) => {
-      const env = Object.assign({}, G.process.env, { NODE_TEST_CONTEXT: "child-v8" });
+    const runOneFile = (spawn, file, given, ordinal, forward, options, cwd, workerId) => new Promise((resolve) => {
+      const env = Object.assign({}, G.process.env, {
+        NODE_TEST_CONTEXT: "child-v8",
+        NODE_TEST_WORKER_ID: String(workerId === undefined ? 1 : workerId),
+      });
       if (options.only) env.NODE_TEST_ONLY = "1";
       const args = [];
       if (Array.isArray(options.execArgv)) args.push(...options.execArgv);

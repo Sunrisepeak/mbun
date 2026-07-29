@@ -509,12 +509,23 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
       }
     };
 
+    // node lib/internal/test_runner/test.js TestContext#workerId: the id the
+    // runner put in the environment when it spawned this file, or undefined
+    // when the file was not run by the test runner at all.
+    const workerIdOf = () => {
+      try {
+        const id = Number(G.process.env.NODE_TEST_WORKER_ID);
+        return id || undefined;
+      } catch (e) { return undefined; }
+    };
+
     const makeContext = (node) => {
       const controller = typeof G.AbortController === "function" ? new G.AbortController() : null;
       const context = {
         name: node.name,
         fullName: fullNameOf(node),
         filePath: entryFile(),
+        get workerId() { return workerIdOf(); },
         tags: tagsOf(node),
         signal: controller ? controller.signal : undefined,
         __controller: controller,
