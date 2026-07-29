@@ -531,6 +531,10 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
         __controller: controller,
         __skipped: false,
         __plan: null,
+        __planWait: undefined,
+        __planPending: null,
+        __planWaiting: false,
+        __deferredError: undefined,
         __assertions: 0,
         __subs: [],
         diagnostic: (message) => { out("# " + message); emit("test:diagnostic", { nesting: nestingOf(node), message, level: "info" }); },
@@ -545,8 +549,7 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
         },
         runOnly: () => {},
         // node lib/internal/test_runner/test.js TestContext#plan validates both
-        // arguments before recording the count; `wait` is accepted but not yet
-        // honoured here (the count check below is synchronous).
+        // arguments before recording the count and the `wait` policy.
         plan: (count, options) => {
           if (typeof count !== "number") throw argTypeError("count", "number", count);
           if (options !== undefined) {
@@ -561,6 +564,7 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
               e.code = "ERR_INVALID_ARG_TYPE";
               throw e;
             }
+            context.__planWait = wait;
           }
           context.__plan = count;
         },
@@ -602,6 +606,63 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
           })();
         },
       };
+      // node lib/internal/test_runner/test.js TestPlan: a plan is only "met" at
+      // exactly the planned count. Without a `wait` policy the check is
+      // immediate; with one it hands back a promise the test awaits until the
+      // count arrives, or until `wait` ms elapse (`wait: true` = no deadline).
+      const planActual = () => context.__assertions + context.__subs.length;
+      const planCheck = () => {
+        if (context.__plan === null) return undefined;
+        if (planActual() === context.__plan) {
+          const pending = context.__planPending;
+          if (pending) {
+            context.__planPending = null;
+            if (pending.timer !== null) G.clearTimeout(pending.timer);
+            pending.resolve();
+          }
+          return undefined;
+        }
+        if (context.__planWait === undefined || context.__planWait === false) {
+          const e = new Error("plan expected " + context.__plan + " assertions but received " + planActual());
+          e.code = "ERR_TEST_FAILURE";
+          throw e;
+        }
+        if (context.__planPending === null) {
+          let resolve, reject;
+          const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+          const pending = { promise, resolve, reject, timer: null };
+          context.__planPending = pending;
+          if (context.__planWait !== true) {
+            pending.timer = G.setTimeout(() => {
+              context.__planPending = null;
+              const e = new Error("plan timed out after " + context.__planWait + "ms with " +
+                                  planActual() + " assertions when expecting " + context.__plan);
+              e.code = "ERR_TEST_FAILURE";
+              reject(e);
+            }, context.__planWait);
+          }
+        }
+        return context.__planPending.promise;
+      };
+      // Node re-checks the plan on every counted assertion, but only while one
+      // is actually being awaited (outside that window check() would throw).
+      const planCount = () => { if (context.__planPending !== null) planCheck(); };
+      // An assertion that throws after the body returned still belongs to this
+      // test: node attributes it through uncaughtException, we hand it to the
+      // await below. The count is bumped first, exactly as node does, so a
+      // failing assertion can still be the one that completes the plan.
+      const counted = (call) => function (...a) {
+        context.__assertions += 1;
+        planCount();
+        try {
+          return call.apply(this, a);
+        } catch (error) {
+          if (context.__planWaiting && context.__deferredError === undefined) {
+            context.__deferredError = error;
+          }
+          throw error;
+        }
+      };
       // t.assert mirrors node:assert, counting calls so t.plan() can check them.
       const assert = assertMod();
       const bound = {};
@@ -609,20 +670,25 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
         for (const key of Object.keys(assert)) {
           const value = assert[key];
           if (typeof value !== "function") continue;
-          bound[key] = function (...a) { context.__assertions += 1; return value.apply(assert, a); };
+          bound[key] = counted(function (...a) { return value.apply(assert, a); });
         }
-        bound.ok = function (...a) { context.__assertions += 1; return assert.ok.apply(assert, a); };
+        bound.ok = counted(function (...a) { return assert.ok.apply(assert, a); });
       }
       // Custom assertions registered through node:test's `assert.register` are
       // bound to the TestContext (`this` === t) and count towards t.plan().
       for (const [name, fn] of customAssertions) {
-        bound[name] = function (...a) { context.__assertions += 1; return fn.apply(context, a); };
+        bound[name] = counted(function (...a) { return fn.apply(context, a); });
       }
       context.assert = bound;
+      context.__planCheck = planCheck;
+      // node accepts the plan as a test option too (`test(name, { plan: 1 }, fn)`),
+      // which is the same TestPlan with no `wait` policy.
+      if (node.opts && typeof node.opts.plan === "number") context.__plan = node.opts.plan;
       // Subtests: registered while the parent body runs, awaited by the parent.
       const sub = (...a) => {
         const promise = register(node, ...a);
         context.__subs.push(promise);
+        planCount();
         return promise;
       };
       context.test = sub;
@@ -692,10 +758,14 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
           if (result && typeof result.then === "function") await result;
         }
         for (const promise of context.__subs) await promise;
-        if (context.__plan !== null && context.__plan !== context.__assertions + context.__subs.length) {
-          throw new Error("plan expected " + context.__plan + " assertions, got " +
-                          (context.__assertions + context.__subs.length));
+        const planPromise = context.__planCheck();
+        if (planPromise) {
+          context.__planWaiting = true;
+          try { await planPromise; } finally { context.__planWaiting = false; }
         }
+        // A late assertion may have satisfied the plan and thrown in the same
+        // call; the plan is met but the test still failed.
+        if (context.__deferredError !== undefined) throw context.__deferredError;
         if (context.__controller) context.__controller.abort();
         await runEachHooks(eachHooks(node, "afterEach"), context);
         state.current = previousContext;
