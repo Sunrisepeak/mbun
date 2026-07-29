@@ -3333,7 +3333,10 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       hash: u.hash, search: u.search, pathname: u.pathname,
       path: (u.pathname || "") + (u.search || ""), href: u.href,
     };
-    if (u.port !== "" && u.port !== null && u.port !== undefined) o.port = Number(u.port);
+    // Preserve Node's object-shape semantics: only the explicit empty-string
+    // URL port is omitted. A URL-like object with no port getter still maps
+    // through Number(undefined), leaving the observable `port: NaN` property.
+    if (u.port !== "") o.port = Number(u.port);
     if (u.username || u.password) o.auth = decodeURIComponent(u.username || "") + ":" + decodeURIComponent(u.password || "");
     return o;
   };
