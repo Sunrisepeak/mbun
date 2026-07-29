@@ -45,6 +45,54 @@ inline constexpr std::string_view kAsyncHooksJS = R"JS(
     return wrapped;
   };
 
+  // Keep the public async_hooks API backed by one lifecycle registry instead
+  // of reporting success from createHook() while never delivering an event.
+  // The C-API runtime cannot observe every JSC allocation, but it does own the
+  // callback registration boundaries below and AsyncResource directly. Those
+  // are real async resources, so account for them with the same id/context
+  // transition rules Node exposes to user hooks.
+  const activeHooks = new Set();
+  let nextAsyncId = 1;
+  let executionId = 0;
+  let executionResource;
+  const hookCall = (name, ...args) => {
+    for (const hook of Array.from(activeHooks)) {
+      const callback = hook[name];
+      if (typeof callback === "function") callback(...args);
+    }
+  };
+  const newAsyncId = () => ++nextAsyncId;
+  const runAsyncCallback = (id, resource, callback, thisArg, args) => {
+    const previousId = executionId;
+    const previousResource = executionResource;
+    executionId = id;
+    executionResource = resource;
+    hookCall("before", id);
+    try { return Reflect.apply(callback, thisArg, args); }
+    finally {
+      try { hookCall("after", id); }
+      finally {
+        executionId = previousId;
+        executionResource = previousResource;
+      }
+    }
+  };
+  const captureAsyncCallback = (fn, type, context = contextGet(), destroyOnRun = true) => {
+    if (typeof fn !== "function") return fn;
+    const callback = captureContext(fn, context);
+    if (activeHooks.size === 0) return callback;
+    const id = newAsyncId();
+    const resource = { type };
+    hookCall("init", id, type, executionId, resource);
+    return function (...args) {
+      try { return runAsyncCallback(id, resource, callback, this, args); }
+      finally {
+        if (type === "PROMISE") hookCall("promiseResolve", id);
+        if (destroyOnRun) hookCall("destroy", id);
+      }
+    };
+  };
+
   class AsyncLocalStorage {
     #disabled = false;
     // node >= 24 `new AsyncLocalStorage({ defaultValue })`: getStore() outside
@@ -137,9 +185,16 @@ inline constexpr std::string_view kAsyncHooksJS = R"JS(
   class AsyncResource {
     #snapshot;
     #triggerAsyncId = 0;
+    #asyncId = 0;
+    #destroyed = false;
+    #previousContexts = [];
 
     constructor(type, options) {
-      if (typeof type !== "string") throw new TypeError('The "type" argument must be of type string');
+      if (typeof type !== "string") {
+        const error = new TypeError('The "type" argument must be of type string');
+        error.code = "ERR_INVALID_ARG_TYPE";
+        throw error;
+      }
       let triggerAsyncId = options;
       if (options != null && typeof options !== "number") triggerAsyncId = options.triggerAsyncId === undefined ? 1 : options.triggerAsyncId;
       if (options != null && (!Number.isSafeInteger(triggerAsyncId) || triggerAsyncId < -1)) {
@@ -150,19 +205,41 @@ inline constexpr std::string_view kAsyncHooksJS = R"JS(
       this.type = type;
       // node echoes the constructor's triggerAsyncId back from
       // resource.triggerAsyncId(); with no option it is the current execution
-      // async id, which is always 0 in mbun.
-      this.#triggerAsyncId = (options == null || (typeof options !== "number" && options.triggerAsyncId === undefined)) ? 0 : triggerAsyncId;
+      // async id.
+      this.#triggerAsyncId = (options == null || (typeof options !== "number" && options.triggerAsyncId === undefined)) ? executionId : triggerAsyncId;
       this.#snapshot = contextGet();
+      this.#asyncId = newAsyncId();
+      hookCall("init", this.#asyncId, type, this.#triggerAsyncId, this);
     }
 
-    emitBefore() { return true; }
-    emitAfter() { return true; }
-    asyncId() { return 0; }
+    emitBefore() {
+      this.#previousContexts.push([executionId, executionResource]);
+      executionId = this.#asyncId;
+      executionResource = this;
+      hookCall("before", this.#asyncId);
+      return true;
+    }
+    emitAfter() {
+      try { hookCall("after", this.#asyncId); }
+      finally {
+        const previous = this.#previousContexts.pop() || [0, undefined];
+        executionId = previous[0];
+        executionResource = previous[1];
+      }
+      return true;
+    }
+    asyncId() { return this.#asyncId; }
     triggerAsyncId() { return this.#triggerAsyncId; }
-    emitDestroy() {}
+    emitDestroy() {
+      if (!this.#destroyed) {
+        this.#destroyed = true;
+        hookCall("destroy", this.#asyncId);
+      }
+      return this;
+    }
     runInAsyncScope(fn, thisArg, ...args) {
       if (typeof fn !== "function") throw new TypeError('The "fn" argument must be of type function');
-      return callInContext(this.#snapshot, fn, thisArg, args);
+      return runAsyncCallback(this.#asyncId, this, () => callInContext(this.#snapshot, fn, thisArg, args), undefined, []);
     }
     bind(fn, thisArg) {
       if (typeof fn !== "function") throw new TypeError('The "fn" argument must be of type function');
@@ -180,7 +257,9 @@ inline constexpr std::string_view kAsyncHooksJS = R"JS(
   const promiseFinally = Promise.prototype.finally;
   Promise.prototype.then = function (onFulfilled, onRejected) {
     const context = contextGet();
-    return promiseThen.call(this, captureContext(onFulfilled, context), captureContext(onRejected, context));
+    return promiseThen.call(this,
+      captureAsyncCallback(onFulfilled, "PROMISE", context),
+      captureAsyncCallback(onRejected, "PROMISE", context));
   };
   Promise.prototype.catch = function (onRejected) { return this.then(undefined, onRejected); };
   Promise.prototype.finally = function (onFinally) {
@@ -191,7 +270,9 @@ inline constexpr std::string_view kAsyncHooksJS = R"JS(
     const original = owner && owner[name];
     if (typeof original !== "function") return;
     owner[name] = function (...args) {
-      args[callbackIndex] = captureContext(args[callbackIndex]);
+      const persistent = name === "setInterval" || name === "addListener" ||
+        name === "on" || name === "prependListener";
+      args[callbackIndex] = captureAsyncCallback(args[callbackIndex], name, contextGet(), !persistent);
       return Reflect.apply(original, this, args);
     };
   };
@@ -289,18 +370,28 @@ inline constexpr std::string_view kAsyncHooksJS = R"JS(
     };
   }
 
-  let hasEnabledCreateHook = false;
   const createHook = (hook) => {
-    if (hook === null || typeof hook !== "object") throw new TypeError('The "hook" argument must be of type object');
-    for (const name of ["init", "before", "after", "destroy", "promiseResolve"]) {
-      if (hook[name] !== undefined && typeof hook[name] !== "function") throw new TypeError('The "hook.' + name + '" property must be of type function');
+    if (hook === null || typeof hook !== "object") {
+      const error = new TypeError('The "hook" argument must be of type object');
+      error.code = "ERR_INVALID_ARG_TYPE";
+      throw error;
     }
-    return { enable() { hasEnabledCreateHook = true; return this; }, disable() { return this; } };
+    for (const name of ["init", "before", "after", "destroy", "promiseResolve"]) {
+      if (hook[name] !== undefined && typeof hook[name] !== "function") {
+        const error = new TypeError('The "hook.' + name + '" property must be of type function');
+        error.code = "ERR_ASYNC_CALLBACK";
+        throw error;
+      }
+    }
+    return {
+      enable() { activeHooks.add(hook); return this; },
+      disable() { activeHooks.delete(hook); return this; },
+    };
   };
   const asyncHooksModule = {
     AsyncLocalStorage, AsyncResource, createHook,
-    executionAsyncId: () => 0, triggerAsyncId: () => 0,
-    executionAsyncResource: () => G.process && G.process.stdin,
+    executionAsyncId: () => executionId, triggerAsyncId: () => 0,
+    executionAsyncResource: () => executionResource,
   };
   def(["async_hooks"], asyncHooksModule);
 )JS";
