@@ -1195,18 +1195,53 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
       throw errFromArgType(value);
     };
 
+    // node lib/buffer.js showFlaggedDeprecation(): DEP0005 fires at most once per
+    // process, and is suppressed when the `new Buffer()` CALL SITE sits inside
+    // node_modules — unless --pending-deprecation (or NODE_PENDING_DEPRECATION)
+    // is set, which is the only case the previous implementation handled. That
+    // inversion meant an ordinary `new Buffer(10)` emitted nothing at all.
+    // node answers "inside node_modules" from the native stack
+    // (src/node_util.cc isInsideNodeModules), which is why the JS capture below
+    // has to neutralise a user-installed Error.prepareStackTrace:
+    // test-buffer-constructor-deprecation-error installs one that itself calls
+    // `new Buffer(10)`, so an ordinary `new Error().stack` would recurse.
     let bufferConstructorWarningShown = false;
+    let nodeModulesCheckCounter = 0;
+    const bufferPendingDeprecation = () => {
+      const process = G.process;
+      if (!process) return false;
+      const argv = process.execArgv;
+      if (Array.isArray(argv) && argv.includes("--pending-deprecation")) return true;
+      const env = process.env;
+      const v = env && env.NODE_PENDING_DEPRECATION;
+      return !!v && v !== "0";
+    };
+    const bufferCallSiteInNodeModules = () => {
+      const E = G.Error;
+      const saved = E.prepareStackTrace;
+      try {
+        E.prepareStackTrace = undefined;
+        const stack = new E().stack;
+        return typeof stack === "string" && stack.includes("node_modules");
+      } catch (_) {
+        return false;
+      } finally {
+        try { E.prepareStackTrace = saved; } catch (_) {}
+      }
+    };
     const warnBufferConstructor = () => {
       if (bufferConstructorWarningShown) return;
+      // node stops paying for the stack walk once it has checked 10000 times.
+      if (++nodeModulesCheckCounter > 10000) return;
+      if (!bufferPendingDeprecation() && bufferCallSiteInNodeModules()) return;
       const process = G.process;
-      const argv = process && process.execArgv;
-      if (!Array.isArray(argv) || !argv.includes("--pending-deprecation")) return;
+      if (!process || typeof process.emitWarning !== "function") return;
+      // Latched BEFORE emitting so a Buffer allocation anywhere under
+      // emitWarning cannot re-enter and warn twice.
       bufferConstructorWarningShown = true;
-      if (typeof process.emitWarning === "function") {
-        process.emitWarning(
-          "Buffer() is deprecated due to security and usability issues. Please use the Buffer.alloc(), Buffer.allocUnsafe(), or Buffer.from() methods instead.",
-          "DeprecationWarning", "DEP0005");
-      }
+      process.emitWarning(
+        "Buffer() is deprecated due to security and usability issues. Please use the Buffer.alloc(), Buffer.allocUnsafe(), or Buffer.from() methods instead.",
+        "DeprecationWarning", "DEP0005");
     };
 
     // Thin callable wrapper sharing OrigBuffer.prototype so the deprecated
