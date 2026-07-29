@@ -918,6 +918,27 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
     }
     return BroadcastChannel;
   })();
+  // node's custom formatter deliberately collapses a BroadcastChannel when
+  // inspect has exhausted its depth budget (test-broadcastchannel-custom-inspect).
+  Object.defineProperty(BroadcastChannel.prototype, INSPECT_SYM, {
+    configurable: true,
+    value: function (depth) {
+      if (!(this instanceof BroadcastChannel)) {
+        const e = new TypeError("Value of \"this\" must be of type BroadcastChannel");
+        e.code = "ERR_INVALID_THIS";
+        throw e;
+      }
+      if (typeof depth === "number" && depth < 0) return "BroadcastChannel";
+      const name = String(this.name)
+        .replace(/\\/g, "\\\\")
+        .replace(/'/g, "\\'")
+        .replace(/\n/g, "\\n")
+        .replace(/\r/g, "\\r");
+      return "BroadcastChannel { name: '" + name + "', active: " +
+        (this._closed !== true) + " }";
+    },
+    writable: true,
+  });
 
   // transferList validation shared by Worker#postMessage and the constructor.
   const validateTransferList = (transferList) => {
