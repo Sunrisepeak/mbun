@@ -115,6 +115,13 @@ public:
                 parse_run_like_top_(root, result);
             }
             if (command_ == Command::Test) {
+                // `bun test` still sees the *universal* top-level `preload`; a
+                // `[test] preload` clobbers it (bunfig.rs: the test block's
+                // preload replaces, it does not append). Parsed here because
+                // is_run_like_() excludes Test, so parse_run_like_top_ is skipped.
+                if (const toml::Value* v{root.get("preload")}) {
+                    result.preloads = parse_preload_(*v, "preload");
+                }
                 parse_test_(root, result);
             }
             if (is_install_related_()) {
@@ -221,9 +228,14 @@ private:
     }
 
     // string | array<string> -> flat vector (used by ca, external, excludes...).
+    // `item_err`, when non-empty, is reported instead of `err` for a non-string
+    // element of an otherwise well-formed array. bun distinguishes the two: the
+    // value having the wrong *shape* ("must be a string or array of strings")
+    // versus an array carrying a non-string ("array must contain only strings").
     static std::vector<std::string> parse_string_or_array_(const toml::Value& v,
                                                             std::string_view key,
-                                                            std::string_view err) {
+                                                            std::string_view err,
+                                                            std::string_view item_err = {}) {
         std::vector<std::string> out;
         if (v.is_string()) {
             out.push_back(v.as_string());
@@ -231,7 +243,7 @@ private:
             for (std::size_t i{0}; i < v.size(); ++i) {
                 const toml::Value& item{v.at(i)};
                 if (!item.is_string()) {
-                    fail(std::string{key}, std::string{err});
+                    fail(std::string{key}, std::string{item_err.empty() ? err : item_err});
                 }
                 out.push_back(item.as_string());
             }
@@ -406,7 +418,8 @@ private:
         if (const toml::Value* v{test->get("pathIgnorePatterns")}) {
             t.path_ignore_patterns =
                 parse_string_or_array_(*v, "test.pathIgnorePatterns",
-                                       "pathIgnorePatterns must be a string or array of strings");
+                                       "pathIgnorePatterns must be a string or array of strings",
+                                       "pathIgnorePatterns array must contain only strings");
         }
     }
 

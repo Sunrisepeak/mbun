@@ -1641,6 +1641,14 @@ std::optional<std::string> read_all(const std::filesystem::path& p) {
 
 export namespace mbun::jsc::test_runner {
 
+// bunfig `preload` / `[test] preload` (plus the CLI's --preload aliases) for
+// `bun test`. The runtime's own gPreloads hook only covers `bun run`; a test
+// file is evaluated by run_source below, so the list is replayed there —
+// require()'s module cache makes each specifier execute exactly once.
+inline std::vector<std::string> gPreloads{};
+
+void set_preloads(std::vector<std::string> paths) { gPreloads = std::move(paths); }
+
 // Outcome of running one test file: the pass/fail/skip tally + expect() call
 // count bun reports, the per-test detail body, and load/eval error surfacing.
 struct RunResult {
@@ -1787,6 +1795,29 @@ RunResult run_source(std::string_view js_source, std::string_view dir = ".", boo
     }
     // bun auto-loads .env files (test mode: mode=test, .env.local skipped).
     rt::apply_dotenv(/*isTest=*/true);
+    // 2b. bunfig/CLI preloads: they must be visible to the test file (globals,
+    //     plugins, hooks registered on bun:test), so they run after the CJS env
+    //     exists and before collection. An unresolvable specifier is fatal, as
+    //     in `bun run` (jsc_hooks.rs:730-767).
+    for (const std::string& spec : gPreloads) {
+        std::error_code pec{};
+        std::filesystem::path p{spec};
+        if (!p.is_absolute()) p = std::filesystem::current_path(pec) / spec;
+        if (!std::filesystem::exists(p, pec) || std::filesystem::is_directory(p, pec)) {
+            r.error = "preload not found " + spec;
+            return r;
+        }
+        std::string quoted{"\""};
+        for (const char c : p.lexically_normal().string()) {
+            if (c == '"' || c == '\\') quoted.push_back('\\');
+            quoted.push_back(c);
+        }
+        quoted.push_back('"');
+        if (auto pr{rt::eval("globalThis.require(" + quoted + ");")}; !pr) {
+            r.error = pr.error();
+            return r;
+        }
+    }
     // 3. collection: evaluate the test source; test bodies do not run yet, so a
     //    failure here is a genuine top-level/syntax error. Lower any remaining ESM
     //    to CJS with the AST-aware transpiler (template-safe, unlike the old
