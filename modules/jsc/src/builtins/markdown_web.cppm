@@ -2322,8 +2322,31 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
   // Parse JSC lines into CallSite objects, re-format V8-style, and route through
   // Error.prepareStackTrace when the user replaces it (V8 contract). JSC ships a
   // native captureStackTrace but it emits JSC format and ignores
-  // prepareStackTrace — override it. Instance `.stack` stays JSC-format (own
-  // property materialized at construction; needs native work — DEFERRED).
+  // prepareStackTrace — override it.
+  //
+  // Instance `.stack` deliberately stays JSC-format. This is a SETTLED decision,
+  // not a deferral: it was revisited and measured, and the numbers are recorded
+  // here so it does not get re-derived a fourth time.
+  //   * Payoff: converting every `.stack` to V8 format moves **2 files across
+  //     6,335** (node `test-events-uncaught-exception-stack`, bun
+  //     `third_party/express/express.json`). Only the bun one flips on the
+  //     `Name: message` header alone — the node one also asserts `/^ {4}at/` on
+  //     every frame, so a header by itself buys almost nothing.
+  //   * Cost: the only available mechanism is the dormant Proxy over the eight
+  //     Error constructors plus a per-instance lazy-stack arm. Arming it
+  //     globally measured **~5x on error construction** (48ms -> 230ms per 200k
+  //     errors, ~1us each), paid runtime-wide and forever, against 132 corpus
+  //     files already classified `timeout`.
+  //   * No native escape hatch: modules/jsc links a PREBUILT JavaScriptCore
+  //     (no vendored WebKit source in the tree). Bun gets V8-shaped stacks by
+  //     patching ErrorInstance in its own WebKit fork; mbun cannot.
+  // Note this defect is smaller than it looks from the outside: `util.inspect`
+  // synthesizes the header when `.stack` lacks one (see inspectValue's `head`),
+  // so `console.log(err)` already prints "TypeError: msg\n<frames>". Only the
+  // raw `.stack` string differs.
+  // If anyone does revisit: measure a leaner arm FIRST (the 5x is likely
+  // dominated by getOwnPropertyDescriptor + two defineProperty calls per error,
+  // not by the Proxy trap). A cheaper arm changes the whole cost/benefit.
   {
     class CallSite {
       constructor(name, file, line, col, kind) {
