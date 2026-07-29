@@ -78,6 +78,10 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
       throw e;
     }
   };
+  // A BroadcastChannel also has a receiveMessageOnPort-compatible inbox. A
+  // WeakMap keeps that capability branded: a lookalike object cannot acquire
+  // one by adding public properties.
+  const broadcastQueues = new WeakMap();
 
   const kOther = Symbol("mbun.port.other");
   const kQueue = Symbol("mbun.port.queue");
@@ -671,12 +675,13 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
   }
 
   const receiveMessageOnPort = function (port) {
-    if (!isPort(port)) {
+    const queue = isPort(port) ? port[kQueue] : broadcastQueues.get(port);
+    if (queue === undefined) {
       const e = new TypeError('The "port" argument must be a MessagePort instance');
       e.code = "ERR_INVALID_ARG_TYPE";
       throw e;
     }
-    if (port[kQueue].length) return { message: port[kQueue].shift().data };
+    if (queue.length) return { message: queue.shift().data };
     return undefined;
   };
 
@@ -848,6 +853,7 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
         this.onmessage = null;
         this.onmessageerror = null;
         this._closed = false;
+        broadcastQueues.set(this, []);
         let set = channels.get(this.name);
         if (!set) { set = new Set(); channels.set(this.name, set); }
         set.add(this);
@@ -863,7 +869,13 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
         const data = cloneBroadcast(value);
         for (const ch of set) {
           if (ch === this || ch._closed) continue;
+          const item = { data };
+          broadcastQueues.get(ch).push(item);
           G.queueMicrotask(() => {
+            const queue = broadcastQueues.get(ch);
+            const index = queue.indexOf(item);
+            if (index < 0) return;
+            queue.splice(index, 1);
             const ev = typeof G.MessageEvent === "function"
               ? new G.MessageEvent("message", { data })
               : { data, type: "message" };
