@@ -33,7 +33,7 @@ inline constexpr std::string_view kNodeStreamWebAdaptersJS = R"JS(
   if (!R) return;
   const process = G.process;
   const Buffer = G.Buffer;
-  const { $ERR_INVALID_ARG_TYPE, $ERR_INVALID_ARG_VALUE, $ERR_STREAM_NULL_VALUES, $ERR_STREAM_PREMATURE_CLOSE, $makeAbortError, __debug, $inheritsReadableStream, $inheritsWritableStream } = R.H;
+  const { $ERR_INVALID_ARG_TYPE, $ERR_INVALID_ARG_VALUE, $ERR_STREAM_PREMATURE_CLOSE, $makeAbortError, __debug, $inheritsReadableStream, $inheritsWritableStream } = R.H;
 
   R.def("internal/webstreams_adapters", function (require, module, exports) {
     const { SafePromiseAllReturnVoid, SafeSet, TypedArrayPrototypeGetBuffer, TypedArrayPrototypeGetByteOffset, TypedArrayPrototypeGetByteLength } = require("internal/primordials");
@@ -953,7 +953,6 @@ inline constexpr std::string_view kNodeStreamWebAdaptersJS = R"JS(
       const { isArrayBufferView, isSharedArrayBuffer } = require("node:util/types");
       return newReadableWritablePairFromDuplex(duplex, {
         [kValidateChunk]: function validateBufferSourceChunk(chunk) {
-          if (chunk === null) throw $ERR_STREAM_NULL_VALUES();
           const isView = isArrayBufferView(chunk);
           // `isSharedArrayBuffer` alone only rejects SAB-backed inputs: strings
           // and ordinary objects fall through to node:zlib, which accepts and
