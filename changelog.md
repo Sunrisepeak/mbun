@@ -5,6 +5,25 @@
 
 ## 2026-07-29
 
+### 5 小时冲刺第八批：7 分钟净增 3 文件，25.7 files/hour
+
+12:22–12:29 集中验收五项静态实现候选，预计 6 个整文件、实际新增 3：
+
+- `urlToHttpOptions()` 保留传入 `URL` 的 enumerable 自有属性，
+  `test-http-client-request-options.js` 新增 1；
+- `ClientRequest.setTimeout()` 在 socket connect 后才启动 inactivity
+  timer，`test-http-client-set-timeout.js` 新增 1；第二个 timeout 文件仍停
+  在独立的 `_idleTimeout` 形状合同；
+- Web Streams queuing strategy accessor brand check，
+  `test-whatwg-webstreams-coverage.js` 新增 1；
+- aborted request destroy 与 Encoding Streams 状态校验只移动首错误，
+  各自 0；两项均已用 additive revert 清除。
+
+零收益回滚后的当前树重新执行 `build_or_die`，6 文件门禁为 3 pass /
+3 个既有 fail，即 fail→pass **3**、green→non-green **0**。本批策略结论：
+请求/流的窄合同仍能维持约 25 files/hour，但不得把“进入下一断言”计为
+收益；代理静态预计不够时继续在主集成门禁后立即回滚。
+
 ### 5 小时冲刺第七批：15.8 分钟净增 7 文件，26.6 files/hour
 
 12:06–12:22 集中验收三组：

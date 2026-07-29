@@ -169,6 +169,24 @@ regressions in the named/related sets.
 - legacy URL parse DEP0169 plus URLSearchParams inspect/brand/iterator/callback/
   nested-query contracts: 4/4.
 
+### Sprint wave 8 measured checkpoint (12:22–12:29)
+
+Five static candidates forecast six complete files; the current post-revert
+tree gained 3 files in 7 minutes: **25.7 files/hour**, with zero
+green-to-non-green regressions in the six-file acceptance set.
+
+- retained URL properties in HTTP request options: estimated 1, actual 1/1;
+- defer ClientRequest timeout until connect: estimated 2, actual 1/2; the
+  remaining file needs a distinct `_idleTimeout` shape contract;
+- Web Streams queuing strategy accessor brands: estimated 1, actual 1/1;
+- aborted-request destruction and Encoding Streams state validation: estimated
+  1 each, actual 0 each. Both zero-yield changes were additively reverted.
+
+After those reverts integration rebuilt the exact checkpoint tree and reran all
+six targets: 3 pass, 3 retained failures, zero regressions. Continue accepting
+only complete-file transitions; an implementation that advances to a later
+assertion is reverted at the same checkpoint.
+
 The first three-way reuse probe tested local round-10 branches for node's
 `--test` CLI, HTTP/2 argument/timer validation, and verbatim Node error text.
 All three candidate cherry-picks became empty on the current target tree.
