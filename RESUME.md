@@ -5,6 +5,80 @@ session that is interrupted (usage limit, crash, restart) can pick up from the
 file rather than from memory. **If you are a fresh session reading this, start
 here.**
 
+## 2026-07-30 05:30 — WAVE 50: +8 node, and a keep-or-revert condition honoured
+
+`test-crypto` **86 → 101/129**, `test-http2` **213 → 223/272**, bun `shell/` **20 → 27 green**,
+all with zero regressions. Lane goals: ckey **2**/≥2, h2d **2**/≥2, dhec 1/≥2, cp 11 assertions
+(file not green — see below).
+
+### The derive widening was reverted, as promised
+
+`node_asym_okp_derive_host` (`crypto_asym.inc:1158`) is a generic `EVP_PKEY_derive` narrowed by one
+`if` to X25519/X448. That narrowing is *why* `crypto.diffieHellman` sat on the do-not-attempt list
+as "provider-absent" for several waves. Widening it to `EVP_PKEY_DH`/`EVP_PKEY_EC` measured **0
+gains, 0 regressions**, and I retained it explicitly as a prerequisite with the condition: *if the
+follow-up lane cannot use it, revert*.
+
+Two consecutive lanes died on server-side 529s, so integration answered the condition directly with
+a probe:
+```
+EC  agree: true 32              <- but EC already worked via AN.ecdhComputeSecret
+DH  FAILED: deriveBits: derive setup failed
+```
+**Finite-field DH does not work through it** — `EVP_PKEY_derive_init`/`set_peer` fails, so
+`asym_load_pkey` most likely cannot reconstruct DH params from the DER it is handed. The widening
+bought nothing for either algorithm. **Reverted.** The do-not-attempt entry for finite-field `dh`
+stands after all, but now for a *measured* reason rather than an assumed one, and the real blocker
+is named: DH key loading, not the derive call.
+
+### Corrections lanes made to briefs I wrote (wave 50 alone)
+
+1. **`enableConnectProtocol` "one print away from the leak"** — there was **no leak**. The path
+   worked; the bug was RFC 8441 §3 (a peer that advertised `ENABLE_CONNECT_PROTOCOL=1` may never
+   send `0` again) plus the server continuing to accept `:protocol` after withdrawal.
+2. **My PING retraction was half-wrong.** async_hooks *was* needed, but a second bug also gated the
+   file: **`Buffer.from(typedArray)` copies elements, not bytes**, so `Uint16Array([1,2,3,4])` went
+   on the wire as 4 bytes and drew `FRAME_SIZE_ERROR`.
+3. **`cp.test.ts` is not gated purely on a missing builtin.** Its 30 tests are 15 cases run twice;
+   14 failures are `(exec)` variants blocked on `bun run *.sh`. All 11 genuine `cp` assertions pass.
+   The feared 839-line flag matrix is not exercised — only `-v` and `-R` are.
+4. **`crypto.diffieHellman` was mis-listed as provider-absent** (EC primitive already existed), and
+   **RSA `crypto.encapsulate` is not PQC** — it is RSASVE via plain OpenSSL 3, wrongly lumped with
+   ML-KEM.
+
+**Meta-lesson, and it is aimed at the briefing process:** *"Distrust 'one print away' handovers;
+write the 15-line repro first."* A lane's closing diagnosis is one inference at the end of its
+timebox, not a verified finding. Mark handoffs as **unverified leads** in the next brief.
+
+### `Buffer.from(typedArray)` — audited, NOT a codebase-wide problem
+
+A lane flagged it as a likely landmine. Integration probed instead of sweeping:
+`socket.write(new Uint16Array([1,2,3,4]))` produces the correct 8 bytes `[1,0,2,0,3,0,4,0]`, and
+`crypto_asym.cppm:119` already does `Buffer.from(v.buffer, v.byteOffset, v.byteLength)`. The http2
+PING site was the exception. **No sweep needed.**
+
+### The WeakMap-state class is now FIVE instances
+
+Objects whose state lives in a WeakMap, handled by generic machinery that finds zero own
+properties: `CryptoKey` via `structuredClone`, `KeyObject` via `structuredClone`, `KeyObject` via
+`assert.deepStrictEqual` (two *different* secret keys compared equal), the typed-array `byteOffset`
+native bridge, and `copyBytes`' `instanceof ArrayBuffer` check failing cross-realm. **Grep for this
+deliberately** — it is not five coincidences.
+
+### Shell builtin seam is CLOSED
+
+With `ls`/`rm`/`mv`/`cp` landed, **no bun shell file is gated purely on a missing builtin**. Next on
+that surface is `bun run <file>.sh`, which is deliberately unimplemented (`app.cppm:2001`,
+`run_command.cppm:24` document defaulting to the system shell because `mbun.shell` lacks `$VAR`
+expansion and the `exit` builtin) — a CLI-entry-path change needing a both-corpora guard.
+
+### Runner hazards recorded
+- `generateKeyPairSync('dh', {group:'modp18'})` (8192-bit) takes **>20s**; it flips
+  `job-error-parity` fail→timeout under a 20s limit. Not a regression. Use `--timeout 60`.
+- `bunshell.test.ts`'s `(fail)` name set is **not** always byte-identical run to run; the
+  documented "diff the names" check alone produced a false regression for one lane. The
+  **alone-re-run** is what settles it.
+
 ## 2026-07-30 04:00 — WAVE 49: the strongest wave of the campaign
 
 **Node 2,821 → 2,916 / 4,433 (65.78%)** across the PR, +95 with **zero regressions**,
