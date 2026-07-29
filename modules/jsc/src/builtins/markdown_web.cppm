@@ -711,7 +711,15 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       if (data && data.type === "secret" && typeof data.export === "function") return toBytes(data.export());
       return te.encode(String(data));
     };
-    const encode = (d, enc) => { if (!enc || enc === "buffer") return Buffer.from(d); if (enc === "hex") { let s = ""; for (const b of d) s += b.toString(16).padStart(2, "0"); return s; } if (enc === "base64") { let bin = ""; for (const b of d) bin += String.fromCharCode(b); return G.btoa(bin); } return Buffer.from(d).toString(enc); };
+    const encode = (d, enc) => {
+      if (!enc || enc === "buffer") return Buffer.from(d);
+      if (typeof enc !== "string" || (typeof Buffer.isEncoding === "function" && !Buffer.isEncoding(enc))) {
+        const e = new TypeError("Unknown encoding: " + enc); e.code = "ERR_UNKNOWN_ENCODING"; throw e;
+      }
+      if (enc === "hex") { let s = ""; for (const b of d) s += b.toString(16).padStart(2, "0"); return s; }
+      if (enc === "base64") { let bin = ""; for (const b of d) bin += String.fromCharCode(b); return G.btoa(bin); }
+      return Buffer.from(d).toString(enc);
+    };
     // Hash/Hmac are function-style (callable with or without `new`, like node) and
     // real stream.Transform subclasses (node's LazyHash quirk: instanceof Transform
     // === true, and they can be piped). Digests come from the native mbun.crypto
