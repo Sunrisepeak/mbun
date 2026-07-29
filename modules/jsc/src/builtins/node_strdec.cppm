@@ -247,20 +247,20 @@ inline constexpr std::string_view kNodeStrDecJS = R"JS(
   // (plain Uint8Array, not Buffer).
   function asBuffer(buf) {
     if (G.Buffer.isBuffer(buf)) return buf;
-    return G.Buffer.from(buf.buffer, buf.byteOffset, buf.byteLength);
+    if (typeof ArrayBuffer.isView === "function" && ArrayBuffer.isView(buf)) {
+      return G.Buffer.from(buf.buffer, buf.byteOffset, buf.byteLength);
+    }
+    // Keep write(), end(), and text() on the same Node BufferSource boundary:
+    // a string is not a pre-decoded chunk, and an object with a forged
+    // byteLength must not reach Buffer.from(undefined, ...).
+    const NE = globalThis.__mbunNodeErrors;
+    if (NE) throw NE.ERR_INVALID_ARG_TYPE("buf", ["Buffer", "TypedArray", "DataView"], buf);
+    const e = new TypeError('The "buf" argument must be an instance of Buffer, TypedArray, or DataView.');
+    e.code = "ERR_INVALID_ARG_TYPE";
+    throw e;
   }
 
   StringDecoder.prototype.write = function (buf) {
-    if (typeof buf === "string") return buf;
-    if (buf == null || typeof buf.byteLength !== "number") {
-      // node appends determineSpecificType — the bare message dropped
-      // ". Received null" and could never match test-string-decoder.
-      const NE = globalThis.__mbunNodeErrors;
-      if (NE) throw NE.ERR_INVALID_ARG_TYPE("buf", ["Buffer", "TypedArray", "DataView"], buf);
-      const e = new TypeError('The "buf" argument must be an instance of Buffer, TypedArray, or DataView.');
-      e.code = "ERR_INVALID_ARG_TYPE";
-      throw e;
-    }
     return decWrite(this, asBuffer(buf));
   };
 
@@ -269,10 +269,11 @@ inline constexpr std::string_view kNodeStrDecJS = R"JS(
   };
 
   StringDecoder.prototype.text = function (buf, offset) {
+    buf = asBuffer(buf);
     offset = offset | 0;
     const byteLength = buf.byteLength;
     if (offset < 0 || offset > byteLength) return "";
-    return decWrite(this, asBuffer(buf).subarray(offset));
+    return decWrite(this, buf.subarray(offset));
   };
 
   reg("string_decoder", { StringDecoder });
