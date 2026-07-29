@@ -185,9 +185,7 @@ inline constexpr std::string_view HARNESS = R"JS(
     const ni = indent + "  ";
     if (v === null) return "null";
     if (v === undefined) return "undefined";
-    // pretty-format presents a multi-line string with the opening quote on its
-    // own line, so the body starts flush at column 0 in a stored snapshot.
-    if (typeof v === "string") return v.indexOf("\n") === -1 ? "\"" + v + "\"" : "\"\n" + v + "\"";
+    if (typeof v === "string") return "\"" + v + "\"";
     if (typeof v === "number" || typeof v === "boolean" || typeof v === "bigint") return String(v);
     if (v instanceof Date) return v.toISOString();   // bun pretty-format: unquoted ISO string
     if (v instanceof RegExp) return String(v);
@@ -733,13 +731,7 @@ inline constexpr std::string_view HARNESS = R"JS(
         else if (typeof x === "number") opts = { timeout: x };
       }
       // bun throws at REGISTRATION when a runnable test has no body (todo/skip may omit it).
-      if (fn === undefined && mode !== "todo" && mode !== "skip") {
-        // `.failing` names itself in the diagnostic — the corpus matches on the
-        // exact wording to tell it apart from the plain `test()` arity error.
-        throw new TypeError(mode === "failing"
-          ? "test.failing expects a function as the second argument"
-          : "test() expects a function");
-      }
+      if (fn === undefined && mode !== "todo" && mode !== "skip") throw new TypeError("test() expects a function");
       // .only narrows the run set; a todo-depth describe turns its runnable
       // tests into todos. The two are independent and both apply here.
       // ScopeFunctions.rs:506-508 — a focused registrar is refused in CI before
@@ -1113,7 +1105,7 @@ inline constexpr std::string_view HARNESS = R"JS(
   function ftClearAll() { ftRequireActive(); FT.queue = []; }
   function ftCount() { ftRequireActive(); return FT.queue.length; }
 
-  const jest = { fn: mock, spyOn: spyOn, mock: (m, f) => { if (typeof m !== "string") throw new TypeError("jest.mock() 1st argument must be a string"); if (typeof f !== "function") throw new TypeError("jest.mock() 2nd argument must be a function"); }, unmock: () => {}, setTimeout: (ms) => { const n = Number(ms); if (Number.isFinite(n)) S.defaultTimeout = n; return jest; }, useFakeTimers: (o) => { ftInstall(o); return jest; }, useRealTimers: () => { ftUninstall(); setSystemTime(); return jest; }, setSystemTime: (v) => { setSystemTime(v); return jest; }, restoreAllMocks: () => mock.restoreAllMocks(), clearAllMocks: () => mock.clearAllMocks(), resetAllMocks: () => mock.resetAllMocks(), advanceTimersByTime: (ms) => { ftAdvanceBy(ms); return jest; }, advanceTimersToNextTimer: () => { ftAdvanceToNext(); return jest; }, runAllTimers: () => { ftRunAll(); return jest; }, runOnlyPendingTimers: () => { ftRunPending(); return jest; }, clearAllTimers: () => { ftClearAll(); return jest; }, getTimerCount: () => ftCount(), isFakeTimers: () => FT.on };
+  const jest = { fn: mock, spyOn: spyOn, mock: (m, f) => { if (typeof m !== "string") throw new TypeError("jest.mock() 1st argument must be a string"); if (typeof f !== "function") throw new TypeError("jest.mock() 2nd argument must be a function"); }, unmock: () => {}, useFakeTimers: (o) => { ftInstall(o); return jest; }, useRealTimers: () => { ftUninstall(); setSystemTime(); return jest; }, setSystemTime: (v) => { setSystemTime(v); return jest; }, restoreAllMocks: () => mock.restoreAllMocks(), clearAllMocks: () => mock.clearAllMocks(), resetAllMocks: () => mock.resetAllMocks(), advanceTimersByTime: (ms) => { ftAdvanceBy(ms); return jest; }, advanceTimersToNextTimer: () => { ftAdvanceToNext(); return jest; }, runAllTimers: () => { ftRunAll(); return jest; }, runOnlyPendingTimers: () => { ftRunPending(); return jest; }, clearAllTimers: () => { ftClearAll(); return jest; }, getTimerCount: () => ftCount(), isFakeTimers: () => FT.on };
 
   // `vi` is bun:test's vitest-compat surface. It is NOT the same object as `jest`
   // (verified against bun 1.3.14: `vi === jest` is false) and carries its own key
@@ -1378,7 +1370,7 @@ inline constexpr std::string_view HARNESS = R"JS(
       // so it rejects unconditionally (bun kills a test at its timeout no
       // matter what it awaits). Default 5000ms = bun's per-test default; the
       // stall detector stays as the fallback for the timer-less window.
-      let tmo = (typeof S.defaultTimeout === "number") ? S.defaultTimeout : 5000;
+      let tmo = 5000;
       if (t.opts && typeof t.opts.timeout === "number") tmo = t.opts.timeout;
       let timeoutTimer = null;
       const timeoutPromise = new Promise((_, reject) => {
@@ -1441,10 +1433,7 @@ inline constexpr std::string_view HARNESS = R"JS(
     }
     if (t.mode === "failing") {  // expected-failure test: invert
       if (failed) { S.pass++; S.out.push("(pass) " + label + " (failing)"); }
-      else {
-        S.fail++; S.out.push("(fail) " + label);
-        S.out.push("  ^ this test is marked as failing but it passed. Remove `.failing` if tested behavior now works");
-      }
+      else { S.fail++; S.out.push("(fail) " + label + " — expected to fail but passed"); }
       return;
     }
     if (failed) {
@@ -1480,7 +1469,6 @@ inline constexpr std::string_view HARNESS = R"JS(
     S.todoDepth = 0;   // a describe.todo left open by a throwing body
     S.sysTime = null;  // a file's fake system time must not leak into the next
     S.snapshots = []; S.snapCounters = {}; S.curLabel = "";  // snapshot state is per-file
-    S.defaultTimeout = undefined;  // jest.setTimeout() must not leak into the next file
     G.__mbun_describe_pending = 0;  // async describe bodies of the previous file
     ftUninstall();     // a file's fake timers must not leak into the next either
     __allMocks.length = 0;
