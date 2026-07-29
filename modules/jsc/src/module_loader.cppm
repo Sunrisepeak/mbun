@@ -181,11 +181,14 @@ Loader loader_for_path(std::string_view path) {
     // rather than "any unknown extension → File" because mbun lowers ESM
     // imports to require(), and bun's require() of an unknown extension goes to
     // Ts (code), not File — see the module note above.
+    // `.wasm` belongs to this group too: bun binds the PATH (regression/issue/16476
+    // asserts `import w from "./a.wasm?1"` endsWith "a.wasm"), and feeding the
+    // module's bytes to the JS lexer instead reports "Unterminated string literal".
     if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".gif" || ext == ".webp" ||
         ext == ".avif" || ext == ".bmp" || ext == ".ico" || ext == ".svg" || ext == ".woff" ||
         ext == ".woff2" || ext == ".ttf" || ext == ".otf" || ext == ".eot" || ext == ".mp3" ||
         ext == ".mp4" || ext == ".wav" || ext == ".ogg" || ext == ".webm" || ext == ".pdf" ||
-        ext == ".zip") {
+        ext == ".zip" || ext == ".wasm") {
         return Loader::File;
     }
     return Loader::Js;  // `.file` → js fallback
