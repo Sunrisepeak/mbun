@@ -125,19 +125,26 @@ inline constexpr std::string_view kAsyncHooksJS = R"JS(
   // native handle (and makes the init resource the public Immediate/Timeout).
   const timerHooks = {
     init(resource, type) {
-      if (activeHooks.size === 0) return undefined;
-      const token = { id: newAsyncId(), resource, destroyed: false };
-      hookCall("init", token.id, type, executionId, resource);
+      const context = contextGet();
+      const hooksEnabled = activeHooks.size !== 0;
+      if (context === undefined && !hooksEnabled) return undefined;
+      const token = { context, resource, destroyed: false };
+      if (hooksEnabled) {
+        token.id = newAsyncId();
+        hookCall("init", token.id, type, executionId, resource);
+      }
       return token;
     },
     run(token, callback, thisArg, args) {
       if (token === undefined) return Reflect.apply(callback, thisArg, args);
-      return runAsyncCallback(token.id, token.resource, callback, thisArg, args);
+      const invoke = () => callInContext(token.context, callback, thisArg, args);
+      if (token.id === undefined) return invoke();
+      return runAsyncCallback(token.id, token.resource, invoke, undefined, []);
     },
     destroy(token) {
       if (token === undefined || token.destroyed) return;
       token.destroyed = true;
-      hookCall("destroy", token.id);
+      if (token.id !== undefined) hookCall("destroy", token.id);
     },
   };
   Object.defineProperty(G, "__mbunAsyncHookTimer", {
