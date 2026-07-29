@@ -221,20 +221,6 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
     }
     return typeof v.toString === "function" ? v.toString() : String(v);
   };
-  const pfxCredentials = (pfx, passphrase) => {
-    const native = G.__mbunNodeTlsNative;
-    if (pfx == null || !native || typeof native.decodePfx !== "function" || !Buffer) return null;
-    const archive = Array.isArray(pfx) ? pfx[0] : pfx;
-    try {
-      const bytes = Buffer.isBuffer(archive) ? archive
-        : ArrayBuffer.isView(archive) ? Buffer.from(archive.buffer, archive.byteOffset, archive.byteLength)
-        : archive instanceof ArrayBuffer ? Buffer.from(archive)
-        : Buffer.from(String(archive), "binary");
-      return native.decodePfx(bytes.toString("base64"), typeof passphrase === "string" ? passphrase : "");
-    } catch (e) {
-      throw e;
-    }
-  };
   // node configSecureContext: for `key: [entry, …]` each entry may carry its own
   // `passphrase`, which WINS over options.passphrase; a plain (non-array) key
   // uses options.passphrase. mbun's engine loads one key per context, so the
@@ -640,21 +626,11 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
             && ver.min !== "TLSv1.3" && ver.max !== "TLSv1.2") {
           ver.min = "TLSv1.3";
         }
-        let ownCert = pemOf(options.cert);
-        let ownKey = pemOf(options.key);
-        // The channel consumes PEM credentials. Decode a PFX only when the
-        // caller did not also give an explicit key/cert pair, matching the
-        // ordinary single-identity PKCS#12 path while leaving multi-key
-        // selection to the existing explicit credentials.
-        if (!ownCert && !ownKey && options.pfx != null) {
-          const decoded = pfxCredentials(options.pfx, options.passphrase);
-          if (decoded) { ownCert = decoded.cert || ""; ownKey = decoded.key || ""; }
-        }
-        self._ownCertPem = ownCert || null;
+        self._ownCertPem = pemOf(options.cert) || null;
         transport._startTls({
           isServer: !!options.isServer,
-          cert: ownCert,               // server: own cert; client: mutual-TLS cert
-          key: ownKey,
+          cert: pemOf(options.cert),   // server: own cert; client: mutual-TLS cert
+          key: pemOf(options.key),
           ca: caPem,
           // caComplete: `ca` is the WHOLE trust store, so do not fall back to
           // the platform one — including when it is empty, which is how
@@ -936,7 +912,7 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
     // native and unchanged. Chain verification is unaffected in both cases.
     const customIdentity = typeof opts.checkServerIdentity === "function" &&
       opts.checkServerIdentity !== T.checkServerIdentity ? opts.checkServerIdentity : null;
-    const tlsOpts = { isServer: false, servername, ca: opts.ca, cert: opts.cert, key: opts.key, pfx: opts.pfx, rejectUnauthorized: opts.rejectUnauthorized, ALPNProtocols: opts.ALPNProtocols,
+    const tlsOpts = { isServer: false, servername, ca: opts.ca, cert: opts.cert, key: opts.key, rejectUnauthorized: opts.rejectUnauthorized, ALPNProtocols: opts.ALPNProtocols,
       minVersion: opts.minVersion, maxVersion: opts.maxVersion, secureProtocol: opts.secureProtocol, secureContext: opts.secureContext,
       ciphers: opts.ciphers, checkServerIdentity: customIdentity, identityHost: servername || host,
       // node configSecureContext setKey(pem, options.passphrase): a top-level
@@ -1064,7 +1040,7 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
     _onSecureConnection(raw) {
       const creds = this._sharedCreds || {};
       const tlsSock = new TLSSocket(raw, {
-        isServer: true, cert: creds.cert, key: creds.key, pfx: creds.pfx, ca: creds.ca,
+        isServer: true, cert: creds.cert, key: creds.key, ca: creds.ca,
         requestCert: creds.requestCert, rejectUnauthorized: creds.rejectUnauthorized,
         ALPNProtocols: creds.ALPNProtocols,
         minVersion: creds.minVersion, maxVersion: creds.maxVersion, secureProtocol: creds.secureProtocol,

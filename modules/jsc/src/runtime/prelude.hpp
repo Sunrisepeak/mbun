@@ -166,7 +166,6 @@
 #include <openssl/param_build.h>
 #include <openssl/params.h>
 #include <openssl/pem.h>
-#include <openssl/pkcs12.h>
 #include <openssl/rsa.h>
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>

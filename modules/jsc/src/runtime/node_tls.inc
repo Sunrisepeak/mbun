@@ -164,59 +164,6 @@ inline JSValueRef node_tls_check_key_cert_cb(JSContextRef ctx, JSObjectRef, JSOb
     return make_string(ctx, mbun::tls::check_key_cert_pair(cert, key, pass, ciphers));
 }
 
-// __mbunNodeTlsNative.decodePfx(base64, passphrase) → { cert, key }. The JS TLS
-// surface and reactor already consume PEM strings, so keep PKCS#12 handling at
-// this binary boundary and do not introduce a second TLS credential path.
-inline JSValueRef node_tls_decode_pfx_cb(JSContextRef ctx, JSObjectRef, JSObjectRef,
-                                         std::size_t argc, const JSValueRef argv[],
-                                         JSValueRef* exc) {
-    const std::string der{argc > 0 ? b64_decode(arg_string(ctx, argc, argv, 0)) : std::string{}};
-    const std::string pass{argc > 1 ? arg_string(ctx, argc, argv, 1) : std::string{}};
-    const unsigned char* cursor{reinterpret_cast<const unsigned char*>(der.data())};
-    PKCS12* bundle{!der.empty() ? d2i_PKCS12(nullptr, &cursor, static_cast<long>(der.size())) : nullptr};
-    EVP_PKEY* key{nullptr};
-    X509* cert{nullptr};
-    STACK_OF(X509)* chain{nullptr};
-    if (bundle == nullptr || PKCS12_parse(bundle, pass.c_str(), &key, &cert, &chain) != 1
-        || key == nullptr || cert == nullptr) {
-        if (bundle != nullptr) PKCS12_free(bundle);
-        if (key != nullptr) EVP_PKEY_free(key);
-        if (cert != nullptr) X509_free(cert);
-        if (chain != nullptr) sk_X509_pop_free(chain, X509_free);
-        ERR_clear_error();
-        if (exc != nullptr) *exc = make_named_error(ctx, "Error", "Unable to parse PKCS#12 archive");
-        return JSValueMakeUndefined(ctx);
-    }
-    BIO* certBio{BIO_new(BIO_s_mem())};
-    BIO* keyBio{BIO_new(BIO_s_mem())};
-    const bool wrote{certBio != nullptr && keyBio != nullptr && PEM_write_bio_X509(certBio, cert) == 1
-                     && PEM_write_bio_PrivateKey(keyBio, key, nullptr, nullptr, 0, nullptr, nullptr) == 1};
-    std::string certPem, keyPem;
-    if (wrote) {
-        char* bytes{nullptr};
-        const long certLen{BIO_get_mem_data(certBio, &bytes)};
-        if (certLen > 0) certPem.assign(bytes, static_cast<std::size_t>(certLen));
-        bytes = nullptr;
-        const long keyLen{BIO_get_mem_data(keyBio, &bytes)};
-        if (keyLen > 0) keyPem.assign(bytes, static_cast<std::size_t>(keyLen));
-    }
-    if (certBio != nullptr) BIO_free(certBio);
-    if (keyBio != nullptr) BIO_free(keyBio);
-    EVP_PKEY_free(key);
-    X509_free(cert);
-    if (chain != nullptr) sk_X509_pop_free(chain, X509_free);
-    PKCS12_free(bundle);
-    if (!wrote || certPem.empty() || keyPem.empty()) {
-        ERR_clear_error();
-        if (exc != nullptr) *exc = make_named_error(ctx, "Error", "Unable to decode PKCS#12 credentials");
-        return JSValueMakeUndefined(ctx);
-    }
-    JSObjectRef out{JSObjectMake(ctx, nullptr, nullptr)};
-    set_prop(ctx, out, "cert", make_string(ctx, certPem));
-    set_prop(ctx, out, "key", make_string(ctx, keyPem));
-    return out;
-}
-
 // Install globalThis.__mbunNodeTlsNative. Called once from engine init.
 inline void install_node_tls_native(JSContextRef ctx, JSObjectRef global) {
     JSObjectRef tn{JSObjectMake(ctx, nullptr, nullptr)};
@@ -226,6 +173,5 @@ inline void install_node_tls_native(JSContextRef ctx, JSObjectRef global) {
     set_fn(ctx, tn, "canonicalizeIP", node_tls_canonicalize_ip_cb);
     set_fn(ctx, tn, "rootCertificates", node_tls_root_certificates_cb);
     set_fn(ctx, tn, "checkKeyCert", node_tls_check_key_cert_cb);
-    set_fn(ctx, tn, "decodePfx", node_tls_decode_pfx_cb);
     set_prop(ctx, global, "__mbunNodeTlsNative", tn);
 }
