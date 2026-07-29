@@ -185,6 +185,13 @@ std::vector<std::string> derive_exec_argv(std::span<const std::string_view> args
     bool seenRun{false};
     std::string_view prev{};
     for (const std::string_view a : args) {
+        // `--` is node's end-of-options marker: the option parser CONSUMES it,
+        // so it never reaches process.execArgv (test-process-exec-argv spawns
+        // `mbun --pending-deprecation -- file` and asserts the child reports
+        // exactly ["--pending-deprecation"]). Everything after it is the entry
+        // point and its arguments, so stop here — unless the previous token is
+        // a value-taking flag, which owns `--` as its value.
+        if (a == "--" && (prev.empty() || !exec_argv_flag_takes_value(prev))) break;
         if (!a.empty() && a[0] == '-') {
             execArgv.emplace_back(a);
             prev = a;
