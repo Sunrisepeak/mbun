@@ -28,6 +28,24 @@ submodule-gitlink checks clean.
 `test-module` 15/32, `test-process` 66/96, `test-worker` 92/143.
 Node projection **2821 → 2845 / 4433 (64.2%)**, pending the next full run.
 
+### Computed throughput after wave 40
+
+`wave_report.py --hours 0.75 --agents 5` on the projected tree
+(`target/integration/w40-projected`, the wave-39 run with all 677 guard results
+overlaid — a projection, NOT a full run):
+
+```
+wave: +24 gained, -0 regressed, net +24
+throughput: 32 files/hour over 0.8h with 5 agents (4.8 files/agent)
+remaining: 1026        time to 100% at this rate: 32 hours
+```
+
+**32 files/hour is the best rate the campaign has measured** (previous best 28
+with 3 agents; waves 36–38 ran 11–20). Treat it as a ceiling, not a trend: it
+came from clusters nobody had mined yet, and those deplete. `remaining: 1026` is
+fail+timeout+oom; the 562 self-skips are real gaps in a separate bucket and are
+not in that number.
+
 ### THE lesson of wave 40: three lanes lost to one stale binary
 
 `mcpp build` keys its output dir on a config hash, so a checkout accumulates
