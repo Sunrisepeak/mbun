@@ -2172,12 +2172,31 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   }
 
   // ---- TextEncoderStream / TextDecoderStream (transform-style, minimal) ----
+  // Like the other WebIDL stream interfaces, these expose state through
+  // prototype accessors. Keeping the state private gives foreign receivers the
+  // required TypeError rather than leaking an own implementation property.
+  const textEncoderStreamState = new WeakMap();
+  const textDecoderStreamState = new WeakMap();
+  const encodingStreamState = (states, receiver) => {
+    const state = states.get(receiver);
+    if (state === undefined) throw new TypeError("Cannot read private member");
+    return state;
+  };
+  const validateTextDecoderStreamOptions = (options) => {
+    if (options === undefined || options === null) return options;
+    if (typeof options !== "object") {
+      const e = new TypeError('The "options" argument must be of type object. Received type ' + typeof options);
+      e.code = "ERR_INVALID_ARG_TYPE";
+      throw e;
+    }
+    return options;
+  };
   if (typeof G.TextEncoderStream === "undefined") {
     G.TextEncoderStream = class TextEncoderStream {
       constructor() {
-        this.encoding = "utf-8"; const enc = new G.TextEncoder(); let ctrl, pending = "";
-        this.readable = new G.ReadableStream({ start(c) { ctrl = c; } });
-        this.writable = new G.WritableStream({
+        const enc = new G.TextEncoder(); let ctrl, pending = "";
+        const readable = new G.ReadableStream({ start(c) { ctrl = c; } });
+        const writable = new G.WritableStream({
           write(chunk) {
             // A throwing toString() must error both sides of the transform
             // (WPT encode-bad-chunks): rethrow errors the writable, ctrl.error
@@ -2190,19 +2209,35 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
           },
           close() { if (pending) ctrl.enqueue(enc.encode(pending)); ctrl.close && ctrl.close(); }
         });
+        textEncoderStreamState.set(this, { readable, writable });
       }
+      get encoding() { encodingStreamState(textEncoderStreamState, this); return "utf-8"; }
+      get readable() { return encodingStreamState(textEncoderStreamState, this).readable; }
+      get writable() { return encodingStreamState(textEncoderStreamState, this).writable; }
     };
+    Object.defineProperties(G.TextEncoderStream.prototype, {
+      encoding: { enumerable: true }, readable: { enumerable: true }, writable: { enumerable: true },
+    });
   }
   if (typeof G.TextDecoderStream === "undefined") {
     G.TextDecoderStream = class TextDecoderStream {
       constructor(label, opts) {
-        opts = opts == null ? {} : opts;
-        const dec = new G.TextDecoder(label === undefined ? "utf-8" : label, { fatal: !!opts.fatal, ignoreBOM: !!opts.ignoreBOM });
-        this.encoding = dec.encoding; this.fatal = dec.fatal; this.ignoreBOM = dec.ignoreBOM; let ctrl;
-        this.readable = new G.ReadableStream({ start(c) { ctrl = c; } });
-        this.writable = new G.WritableStream({ write(chunk) { const s = dec.decode(chunk, { stream: true }); if (s) ctrl.enqueue(s); }, close() { const t = dec.decode(); if (t) ctrl.enqueue(t); ctrl.close && ctrl.close(); } });
+        opts = validateTextDecoderStreamOptions(opts);
+        const dec = new G.TextDecoder(label === undefined ? "utf-8" : label, opts); let ctrl;
+        const readable = new G.ReadableStream({ start(c) { ctrl = c; } });
+        const writable = new G.WritableStream({ write(chunk) { const s = dec.decode(chunk, { stream: true }); if (s) ctrl.enqueue(s); }, close() { const t = dec.decode(); if (t) ctrl.enqueue(t); ctrl.close && ctrl.close(); } });
+        textDecoderStreamState.set(this, { dec, readable, writable });
       }
+      get encoding() { return encodingStreamState(textDecoderStreamState, this).dec.encoding; }
+      get fatal() { return encodingStreamState(textDecoderStreamState, this).dec.fatal; }
+      get ignoreBOM() { return encodingStreamState(textDecoderStreamState, this).dec.ignoreBOM; }
+      get readable() { return encodingStreamState(textDecoderStreamState, this).readable; }
+      get writable() { return encodingStreamState(textDecoderStreamState, this).writable; }
     };
+    Object.defineProperties(G.TextDecoderStream.prototype, {
+      encoding: { enumerable: true }, fatal: { enumerable: true }, ignoreBOM: { enumerable: true },
+      readable: { enumerable: true }, writable: { enumerable: true },
+    });
   }
 
   // ---- Response (spec-shaped body consumption, incl. ReadableStream bodies) ----
