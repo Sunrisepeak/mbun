@@ -427,6 +427,10 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
         length = length < 0 ? stat.size - offset : Math.min(stat.size - offset, length);
         headers["content-length"] = length;
       }
+      // Submit HEADERS before the file source is consumed. A later read error
+      // resets an already-open response stream, so the client observes both the
+      // response event and the INTERNAL_ERROR RST, matching node/nghttp2.
+      this.respond(headers, options.waitForTrailers ? { waitForTrailers: true } : undefined);
       let body;
       try {
         if (length < 0) {
@@ -443,7 +447,6 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
         }
       } catch (e) { if (ownsFd) { try { fs.closeSync(fd); } catch (e2) {} } this._fileError(options, e); return; }
       if (ownsFd) { try { fs.closeSync(fd); } catch (e) {} }
-      this.respond(headers, options.waitForTrailers ? { waitForTrailers: true } : undefined);
       this.end(body);
     }
     // node ServerHttp2Stream#pushStream (lib/internal/http2/core.js). The

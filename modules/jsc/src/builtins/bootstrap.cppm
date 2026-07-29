@@ -3327,6 +3327,11 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     return urlObject.format();
   };
   const urlToHttpOptions = (u) => {
+    if (u === null || (typeof u !== "object" && typeof u !== "function")) {
+      const e = new TypeError('The "url" argument must be of type object.' + urlArgTypeReceived(u));
+      e.code = "ERR_INVALID_ARG_TYPE";
+      throw e;
+    }
     const o = {
       protocol: u.protocol,
       hostname: typeof u.hostname === "string" && u.hostname[0] === "[" ? u.hostname.slice(1, -1) : u.hostname,
