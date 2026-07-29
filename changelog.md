@@ -5,6 +5,20 @@
 
 ## 2026-07-29
 
+### 5 小时冲刺第二十六批：4 分钟净增 2 文件，30 files/hour
+
+14:44–14:48 组合 IPC UTF-8 framing/backpressure 与 exec maxBuffer chunk
+typing，静态预计 4，实际 **+2**：
+
+- IPC 按字节累计完整换行帧再 UTF-8 decode，send-utf8 **+1/2**；
+  backpressure 返回序列仍红；
+- exec/execFile 保留字符串/Buffer chunk 类型并按字节计数、按同型边界
+  截断，execFile maxBuffer **+1**，同时守住已发布的 exec-maxbuf；
+- 两份已发布 encoding 文件也在组合门禁中继续通过。
+
+六文件精确门禁 5 pass / 1 既有 fail；本批新增 2，green→non-green 0，
+结构守卫全绿。
+
 ### 5 小时冲刺第二十五批：6 分钟净增 3 文件，30 files/hour
 
 14:38–14:44 组合 execFile result/promisify、options/env 与 IPC stdio

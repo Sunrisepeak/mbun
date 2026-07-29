@@ -297,6 +297,19 @@ Guards: HTTP client 63/68 pass; module 11 pass, 18 fail, 3 skip; require 13
 pass, 9 fail, 1 skip; abort 1/7 pass; readline 10 pass, 3 fail, 8 skip. Every
 guard has zero green-to-non-green regressions.
 
+### Sprint wave 26 measured checkpoint (14:44–14:48)
+
+IPC UTF-8 framing/backpressure plus exec maxBuffer chunk typing forecast four
+files and delivered **+2 in 4 minutes = 30 files/hour**:
+
+- byte-framed IPC decoding made send-utf8 green; send backpressure remains red;
+- preserving string/Buffer chunk types made execFile maxBuffer green while the
+  already-published exec-maxbuf file stayed green;
+- both published exec encoding files also remained green in the combined gate.
+
+The exact six-file gate is 5 pass / 1 retained failure. Named incremental yield
+is two with zero green-to-non-green regressions. Structural guards are clean.
+
 ### Sprint wave 25 measured checkpoint (14:38–14:44)
 
 ExecFile result/promisify contracts, option/env normalization, and IPC stdio
