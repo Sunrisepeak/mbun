@@ -458,8 +458,16 @@ export constexpr std::string_view kDnsJS = R"JS(
         else if (options.family === "IPv6") family = 6;
         else { validateOneOf(options.family, "options.family", [0, 4, 6]); family = options.family; }
       }
-      if (options.all !== undefined && options.all !== null) all = options.all === true;
-      if (options.verbatim !== undefined) orderName = options.verbatim ? "verbatim" : "ipv4first";
+      if (options.all !== undefined && options.all !== null) {
+        if (typeof options.all !== "boolean")
+          throw argTypeError("options.all", "must be of type boolean", options.all);
+        all = options.all;
+      }
+      if (options.verbatim !== undefined) {
+        if (typeof options.verbatim !== "boolean")
+          throw argTypeError("options.verbatim", "must be of type boolean", options.verbatim);
+        orderName = options.verbatim ? "verbatim" : "ipv4first";
+      }
       if (options.order !== undefined) {
         validateOneOf(options.order, "order", VALID_DNS_ORDERS);
         orderName = options.order;
