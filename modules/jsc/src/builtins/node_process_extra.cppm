@@ -1026,19 +1026,9 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
           return rows.map((row) => Object.assign({ pid: proc.pid || 0, tid: 1, ts: Date.now() * 1000,
                                                      ph: "M", cat: "__metadata" }, row));
         };
-        const addRuntimeEvents = () => {
-          if (enabled("v8")) record({ ph: "X", cat: "v8", name: "V8.ScriptCompiler", dur: 0, args: {} });
-          if (enabled("node.async_hooks")) record({ ph: "b", cat: "node,node.async_hooks", name: "Timeout",
-                                                      args: { data: { executionAsyncId: 1, triggerAsyncId: 1 } } });
-          if (enabled("node.bootstrap")) for (const name of ["environment", "nodeStart", "v8Start", "loopStart", "loopExit", "bootstrapComplete"])
-            record({ ph: "I", cat: "node,node.bootstrap", name, args: {} });
-          if (enabled("node.environment")) for (const name of ["Environment", "RunAndClearNativeImmediates", "CheckImmediate", "RunTimers", "BeforeExit", "RunCleanup", "AtExit"])
-            record({ ph: "I", cat: "node,node.environment", name, args: {} });
-        };
         const flush = () => {
           if (flushed || !writesTrace) return;
           flushed = true;
-          addRuntimeEvents();
           const file = String(pattern || "node_trace.${rotation}.log")
             .replace(/\$\{pid\}/g, String(proc.pid || 0))
             .replace(/\$\{rotation\}/g, "1");
