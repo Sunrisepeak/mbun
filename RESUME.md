@@ -226,6 +226,23 @@ already-green dispose file; it passed immediately alone, and the complete guard
 rerun at `--jobs 4` had zero regressions. Record the transient honestly, but do
 not attribute an unreproduced concurrent crash to the adapter.
 
+### Sprint wave 11 measured checkpoint (12:44–12:49)
+
+Three cleanup packages forecast nine complete files and delivered **+8 in
+5 minutes = 96 files/hour**:
+
+- URL object/file helpers: estimated 3, actual 2. Blob argument errors and raw
+  byte/malformed UTF-8 file URL conversion pass; `test-data-url` only advanced
+  to an independent MIME percent-token parser failure and is not counted.
+- EventEmitter error contracts: estimated 3, actual 3/3.
+- stable Immediate/Timeout facade identity, callback `this`, dispose/registry
+  state: estimated 3, actual 3/3.
+
+The complete 26-file EventEmitter guard is 26/26. The 57-file `test-timers-*`
+guard is 46 pass and 11 retained failures. After removing gains already
+published in earlier checkpoints, this wave is exactly +8 with zero
+green-to-non-green regressions. Continue treating first-error movement as zero.
+
 The first three-way reuse probe tested local round-10 branches for node's
 `--test` CLI, HTTP/2 argument/timer validation, and verbatim Node error text.
 All three candidate cherry-picks became empty on the current target tree.

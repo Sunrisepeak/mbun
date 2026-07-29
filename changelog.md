@@ -5,6 +5,23 @@
 
 ## 2026-07-29
 
+### 5 小时冲刺第十一批：5 分钟净增 8 文件，96 files/hour
+
+12:44–12:49 组合 URL、EventEmitter、timers 三个清扫包，静态预计 9，
+实际 **+8**：
+
+- URL：`createObjectURL` 非 Blob 错误码与 `fileURLToPathBuffer` raw-byte /
+  malformed UTF-8 合同 **2/3**；`test-data-url` 仅推进到独立 MIME
+  percent-token 解析失败，不计收益；
+- EventEmitter：无监听 `error` 的 `ERR_UNHANDLED_ERROR`、listener 参数
+  类型、静态 `setMaxListeners` target validation，**3/3**；
+- timers：稳定 Immediate/Timeout facade、callback `this`、dispose 与
+  registry 状态，**3/3**。
+
+完整 EventEmitter 26 文件守卫为 26/26，完整 `test-timers-*` 57 文件为
+46 pass / 11 个既有 fail；按已发布 checkpoint 去重后本批净 +8，两组
+green→non-green 均为 0。URL 的首错误移动再次按 0 结算。
+
 ### 5 小时冲刺第十批：9.5 分钟净增 3 文件，18.9 files/hour
 
 12:35–12:44 集成 Node experimental stream/iter 的 FileHandle adapter，
