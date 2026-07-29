@@ -921,7 +921,14 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     validateStr(command, "command");
     nullCheck(command, "command");
     if (o != null) { validateObj(o, "options"); validateCommonOpts(o); }
-    const r = CP.spawnSync("/bin/sh", ["-c", command], syncOpts(o));
+    // Route through spawnSync so execSync observes the same bounded pipe
+    // collection as spawnSync/execFileSync (including ENOBUFS + stdout).
+    const r = spawnSync("/bin/sh", ["-c", command], o);
+    if (r.error) {
+      r.error.stdout = r.stdout;
+      r.error.stderr = r.stderr;
+      throw r.error;
+    }
     if (r.status !== 0) { const e = new Error("Command failed: " + command + (r.stderr == null ? "" : "\n" + r.stderr)); e.status = r.status; e.stdout = r.stdout; e.stderr = r.stderr; throw e; }
     const enc = o && o.encoding;
     // A non-piped stdout (stdio: 'inherit'/'ignore') is null in node, not "".
@@ -931,7 +938,14 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   function execFileSync(file, a, o) {
     const nf = normalizeExecFileArgs(file, a, o, undefined);
     const nz = normalizeSpawnArgs(nf.file, nf.args, typeof nf.options === "function" ? {} : nf.options);
-    const r = CP.spawnSync(nz.file, nz.args, syncOpts(nz.options));
+    // Keep execFileSync on the public spawnSync path: that is where the
+    // per-stream maxBuffer contract turns an overrun into ENOBUFS.
+    const r = spawnSync(nz.file, nz.args, nz.options);
+    if (r.error) {
+      r.error.stdout = r.stdout;
+      r.error.stderr = r.stderr;
+      throw r.error;
+    }
     if (r.status !== 0) { const e = new Error("execFileSync failed: " + nz.file); e.status = r.status; e.stderr = r.stderr; throw e; }
     const enc = nz.options && nz.options.encoding;
     // A non-piped stdout slot is null, not a buffer.
@@ -951,7 +965,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
         const take = Math.max(0, maxBuffer - len);
         if (take > 0) arr.push(Buffer.from(bytes.subarray(0, take)));
         if (which === 0) outLen = maxBuffer; else errLen = maxBuffer;
-        if (!maxErr) { maxErr = new Error(name + " maxBuffer length exceeded"); maxErr.code = "ERR_CHILD_PROCESS_STDIO_MAXBUFFER"; maxErr.cmd = cmd; child.kill(); }
+        if (!maxErr) { maxErr = new RangeError(name + " maxBuffer length exceeded"); maxErr.code = "ERR_CHILD_PROCESS_STDIO_MAXBUFFER"; maxErr.cmd = cmd; child.kill(); }
       } else { arr.push(Buffer.from(bytes)); if (which === 0) outLen += bytes.length; else errLen += bytes.length; }
     };
     if (child.stdout) child.stdout.on("data", (d) => add(0, "stdout", _u8(d)));
