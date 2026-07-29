@@ -1644,6 +1644,25 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
       impl.importKey(kind === "secret" ? "raw-secret" : kind === "public" ? "spki" : "pkcs8",
         material, algorithm, extractable, keyUsages);
     G.__mbunIsCryptoKey = (value) => keyMetadata.has(value);
+    // structuredClone/worker transfer must produce a key with its OWN metadata
+    // entry. A generic property copy cannot: the instance carries no own
+    // properties (all state lives in `keyMetadata` and the object is
+    // preventExtensions'd), so the copy lands with the right prototype, no
+    // WeakMap entry, and every attribute getter throwing ERR_INVALID_THIS.
+    // Re-running makeKey also gives the spec's "untampered internal algorithm"
+    // for free, since the clone reads the frozen metadata rather than the
+    // caller-visible getters.
+    G.__mbunCryptoKeyClone = (key) => {
+      const metadata = keyMetadata.get(key);
+      if (!metadata) return undefined;
+      const extra = {};
+      for (const name of Object.keys(metadata)) {
+        if (name !== "type" && name !== "algorithm" && name !== "extractable" && name !== "usages") {
+          extra[name] = metadata[name];
+        }
+      }
+      return makeKey(metadata.type, metadata.algorithm, metadata.extractable, metadata.usages, extra);
+    };
     delete G.__mbunWebCryptoNative;
   }
 )JS";

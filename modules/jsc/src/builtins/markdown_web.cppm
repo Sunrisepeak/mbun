@@ -1787,7 +1787,13 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
         if (v.__isBunFile) { out = copyWithProto(v); memory.set(v, out); return out; }
         if (G.File && v instanceof G.File) { out = new G.File([v._u8 || ""], v.name, { type: v.type, lastModified: v.lastModified }); memory.set(v, out); return out; }
         if (G.Blob && v instanceof G.Blob) { out = new G.Blob(v._u8 ? [v._u8] : [], { type: v.type }); memory.set(v, out); return out; }
-        if (G.CryptoKey && v instanceof G.CryptoKey) { out = copyWithProto(v); memory.set(v, out); return out; }
+        // A native CryptoKey has NO own properties -- its state lives in
+        // webcrypto's keyMetadata WeakMap -- so copyWithProto yields a husk
+        // whose every getter throws ERR_INVALID_THIS. Re-mint it instead.
+        if (G.CryptoKey && v instanceof G.CryptoKey) {
+          out = (G.__mbunCryptoKeyClone && G.__mbunCryptoKeyClone(v)) || copyWithProto(v);
+          memory.set(v, out); return out;
+        }
         if (nc().KeyObject && v instanceof nc().KeyObject) { out = copyWithProto(v); memory.set(v, out); return out; }
         if (nc().X509Certificate && v instanceof nc().X509Certificate) { out = copyWithProto(v); memory.set(v, out); return out; }
         // node BlockList clones share the underlying rule set (native-handle semantics).
