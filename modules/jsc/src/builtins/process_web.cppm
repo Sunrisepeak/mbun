@@ -1287,14 +1287,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   const consoleMethods = {
     log(...args) { this[kWriteToConsole](kUseStdout, util.formatWithOptions(this[kGetInspectOptions](this._stdout), ...args)); },
     warn(...args) { this[kWriteToConsole](kUseStderr, util.formatWithOptions(this[kGetInspectOptions](this._stderr), ...args)); },
-    dir(object, options) {
-      let text;
-      try { text = util.inspect(object, Object.assign({ customInspect: false }, this[kGetInspectOptions](this._stdout), options)); }
-      // A revoked Proxy is printable in node; avoid letting JSC's inspector
-      // dereference it and turn console.dir() into a synchronous throw.
-      catch (_) { text = "<Revoked Proxy>"; }
-      this[kWriteToConsole](kUseStdout, text);
-    },
+    dir(object, options) { this[kWriteToConsole](kUseStdout, util.inspect(object, Object.assign({ customInspect: false }, this[kGetInspectOptions](this._stdout), options))); },
     time(label = "default") { label = `${label}`; if (this[kTimes].has(label)) return; this[kTimes].set(label, conNowNs()); },
     timeEnd(label = "default") { label = `${label}`; const t = this[kTimes].get(label); if (t === undefined) return; this[kWriteToConsole](kUseStdout, label + ": " + conFormatDur(conNowNs() - t)); this[kTimes].delete(label); },
     timeLog(label = "default", ...data) { label = `${label}`; const t = this[kTimes].get(label); if (t === undefined) return; this.log(label + ": " + conFormatDur(conNowNs() - t), ...data); },
