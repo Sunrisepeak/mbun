@@ -36,6 +36,9 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
     if (typeof G.EventTarget !== "function") {
       const kStopImmediate = Symbol("kStopImmediate");
       const kCancelBubble = Symbol("kCancelBubble");
+      // Kept in the global symbol registry because the Node-facing `events`
+      // and stream partitions are installed in separate builtin payloads.
+      const kResistStopPropagation = Symbol.for("nodejs.event_target.resist_stop_propagation");
       const isTrustedGet = function isTrusted() { return false; };
       class Event {
         get [Symbol.toStringTag]() { return "Event"; }
@@ -103,7 +106,7 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
           let list = this[kListeners].get(type);
           if (!list) { list = []; this[kListeners].set(type, list); }
           for (const l of list) if (l.callback === callback && l.capture === capture) return;
-          const rec = { callback, capture, once: !!options.once, passive: !!options.passive, removed: false };
+          const rec = { callback, capture, once: !!options.once, passive: !!options.passive, resistStopPropagation: !!options[kResistStopPropagation], removed: false };
           if (options.signal !== undefined) {
             // WebIDL: `signal` is an AbortSignal, so anything else (including
             // null and a bare object with the right shape) is a TypeError.
@@ -119,7 +122,7 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
             const onAbort = () => target.removeEventListener(type, callback, { capture });
             rec.signal = options.signal;
             rec.onAbort = onAbort;
-            options.signal.addEventListener("abort", onAbort, { once: true });
+            options.signal.addEventListener("abort", onAbort, { once: true, [kResistStopPropagation]: true });
           }
           list.push(rec);
         }
@@ -154,7 +157,10 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
           const list = this[kListeners].get(event.type);
           if (list) {
             for (const rec of list.slice()) {
-              if (event[kStopImmediate]) break;
+              // `events.addAbortListener()` and `events.once(..., { signal })`
+              // register protected cleanup listeners. An ordinary listener may
+              // stop its peers, but it must not suppress those abort handlers.
+              if (event[kStopImmediate] && !rec.resistStopPropagation) continue;
               if (rec.removed) continue;
               if (rec.once) this.removeEventListener(event.type, rec.callback, { capture: rec.capture });
               try {

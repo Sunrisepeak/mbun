@@ -1853,6 +1853,9 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     const kRejection = Symbol.for("nodejs.rejection");
     const captureRejectionSymbol = Symbol.for("nodejs.rejection");
     const kFirstEventParam = Symbol.for("nodejs.kFirstEventParam");
+    // Node's protected abort listeners must still run when an earlier user
+    // listener stops immediate propagation on the same AbortSignal event.
+    const kResistStopPropagation = Symbol.for("nodejs.event_target.resist_stop_propagation");
     let defaultMaxListeners = 10;
 
     const checkListener = (l) => { if (typeof l !== "function") throw new TypeError("The listener must be a function"); };
@@ -2068,7 +2071,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       if (typeof listener !== "function") throw ERR_INVALID_ARG_TYPE("listener", "function", listener);
       let removeEventListener;
       if (signal.aborted) queueMicrotask(() => listener());
-      else { signal.addEventListener("abort", listener, { __proto__: null, once: true }); removeEventListener = () => signal.removeEventListener("abort", listener); }
+      else { signal.addEventListener("abort", listener, { __proto__: null, once: true, [kResistStopPropagation]: true }); removeEventListener = () => signal.removeEventListener("abort", listener); }
       return { __proto__: null, [Symbol.dispose]() { removeEventListener?.(); } };
     }
 
@@ -2084,7 +2087,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
         eventTargetAgnosticAddListener(emitter, type, resolver, { once: true });
         if (type !== "error" && typeof emitter.once === "function") emitter.once("error", errorListener);
         function abortListener() { eventTargetAgnosticRemoveListener(emitter, type, resolver); eventTargetAgnosticRemoveListener(emitter, "error", errorListener); reject(new AbortError(undefined, { cause: signal?.reason })); }
-        if (signal != null) eventTargetAgnosticAddListener(signal, "abort", abortListener, { once: true });
+        if (signal != null) eventTargetAgnosticAddListener(signal, "abort", abortListener, { once: true, [kResistStopPropagation]: true });
       });
     }
 

@@ -2051,13 +2051,15 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
 
   // ---- AbortController / AbortSignal (WHATWG) ----
   if (typeof G.AbortSignal === "undefined") {
+    const kResistStopPropagation = Symbol.for("nodejs.event_target.resist_stop_propagation");
+    const kStopImmediate = Symbol("kStopImmediate");
     class AbortSignal {
       get [Symbol.toStringTag]() { return "AbortSignal"; }
       constructor() { this.aborted = false; this.reason = undefined; this._l = []; this.onabort = null; }
       // `_l` holds {cb, once} records so `{ once: true }` registrations drop
       // themselves after firing — events.getEventListeners(signal, "abort")
       // must report 0 once the signal has been raised (node semantics).
-      addEventListener(t, cb, opts) { if (t !== "abort" || typeof cb !== "function") return; for (const r of this._l) if (r.cb === cb) return; this._l.push({ cb, once: !!(opts && opts.once) }); }
+      addEventListener(t, cb, opts) { if (t !== "abort" || typeof cb !== "function") return; for (const r of this._l) if (r.cb === cb) return; this._l.push({ cb, once: !!(opts && opts.once), resistStopPropagation: !!opts?.[kResistStopPropagation] }); }
       removeEventListener(t, cb) { if (t !== "abort") return; this._l = this._l.filter((x) => x.cb !== cb); }
       dispatchEvent(e) { if (e && e.type === "abort") this._fire(); return true; }
       throwIfAborted() { if (this.aborted) throw this.reason || new G.DOMException("signal is aborted without reason", "AbortError"); }
@@ -2066,7 +2068,11 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       // exception on the next tick and carries on with the remaining
       // listeners (internal/event_target.js emitUncaughtException).
       _fire() {
-        const ev = { type: "abort", target: this };
+        const ev = {
+          type: "abort", target: this, currentTarget: this, cancelBubble: false,
+          stopPropagation() { this.cancelBubble = true; },
+          stopImmediatePropagation() { this.cancelBubble = true; this[kStopImmediate] = true; },
+        };
         const report = (err) => {
           const p = G.process;
           if (p && typeof p.nextTick === "function") p.nextTick(() => { throw err; });
@@ -2074,9 +2080,11 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
         };
         if (typeof this.onabort === "function") { try { this.onabort.call(this, ev); } catch (err) { report(err); } }
         for (const r of this._l.slice()) {
+          if (ev[kStopImmediate] && !r.resistStopPropagation) continue;
           if (r.once) this.removeEventListener("abort", r.cb);
           try { r.cb.call(this, ev); } catch (err) { report(err); }
         }
+        ev.currentTarget = null;
       }
       static abort(reason) { const s = new AbortSignal(); s.aborted = true; s.reason = reason !== undefined ? reason : new G.DOMException("The operation was aborted.", "AbortError"); return s; }
       // `__mbunAbortAt` records the deadline as a wall-clock instant. A purely

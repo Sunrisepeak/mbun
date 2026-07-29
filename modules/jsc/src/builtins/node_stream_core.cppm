@@ -288,7 +288,7 @@ inline constexpr std::string_view kNodeStreamCoreJS = R"JS(
     module.exports = {
       once, kEmptyObject,
       kAutoDestroyed: Symbol("kAutoDestroyed"),
-      kResistStopPropagation: Symbol("kResistStopPropagation"),
+      kResistStopPropagation: Symbol.for("nodejs.event_target.resist_stop_propagation"),
       kWeakHandler: Symbol("kWeak"),
     };
   };
