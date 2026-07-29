@@ -2306,11 +2306,21 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
   // property materialized at construction; needs native work — DEFERRED).
   {
     class CallSite {
-      constructor(name, file, line, col) { this._n = name || null; this._f = file || null; this._l = line; this._c = col; }
+      constructor(name, file, line, col, kind) {
+        this._n = name || null; this._f = file || null; this._l = line; this._c = col;
+        this._k = kind || "";
+        // JSC spells a method frame "Type.method"; V8 splits it across
+        // getTypeName()/getMethodName(). Nothing else about the receiver
+        // survives into a JSC stack string, so anything we cannot read off the
+        // frame name stays null rather than being invented.
+        const dot = this._n === null ? -1 : this._n.lastIndexOf(".");
+        this._t = dot > 0 ? this._n.slice(0, dot) : null;
+        this._m = dot > 0 ? this._n.slice(dot + 1) : null;
+      }
       get [Symbol.toStringTag]() { return "CallSite"; }
       getFunctionName() { return this._n; }
-      getMethodName() { return this._n; }
-      getTypeName() { return null; }
+      getMethodName() { return this._m; }
+      getTypeName() { return this._t; }
       getFileName() { return this._f; }
       getScriptNameOrSourceURL() { return this._f; }
       getLineNumber() { return this._l; }
@@ -2318,13 +2328,16 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       getEnclosingLineNumber() { return this._l; }
       getEnclosingColumnNumber() { return this._c; }
       getEvalOrigin() { return undefined; }
+      // V8 hands the formatter the frame's receiver; a JSC stack string does not
+      // carry it (and V8 itself reports undefined for a strict-mode frame), so
+      // undefined is the honest answer for every frame rather than a fake.
       getThis() { return undefined; }
       getFunction() { return undefined; }
       getPosition() { return 0; }
       getScriptHash() { return ""; }
       getPromiseIndex() { return null; }
-      isEval() { return false; }
-      isNative() { return this._f === "[native code]"; }
+      isEval() { return this._k === "eval"; }
+      isNative() { return this._k === "native"; }
       isConstructor() { return false; }
       isAsync() { return false; }
       isPromiseAll() { return false; }
@@ -2340,13 +2353,18 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
         if (!ln) continue;
         const at = ln.lastIndexOf("@");
         if (at < 0) continue;
-        let name = ln.slice(0, at); if (name === "global code" || name === "module code") name = "";
+        let name = ln.slice(0, at);
+        let kind = "";
+        if (name === "eval code") { kind = "eval"; name = ""; }
+        else if (name === "global code" || name === "module code") name = "";
         const loc = ln.slice(at + 1);
+        if (loc === "[native code]" || loc === "native") kind = "native";
         const m = loc.match(/^(.*):(\d+):(\d+)$/);
-        if (m) out.push(new CallSite(name, m[1], +m[2], +m[3]));
-        else out.push(new CallSite(name, loc || null, undefined, undefined));
+        if (m) out.push(new CallSite(name, m[1], +m[2], +m[3], kind));
+        else out.push(new CallSite(name, loc || null, undefined, undefined, kind));
       }
-      return out;
+      const limit = Error.stackTraceLimit;
+      return typeof limit === "number" && limit >= 0 && out.length > limit ? out.slice(0, limit) : out;
     };
     const header = (err) => {
       let name = "Error", msg = "";
@@ -2359,25 +2377,109 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       if (Array.isArray(frames)) for (const f of frames) s += "\n    at " + String(f);
       return s;
     };
-    Error.prepareStackTrace = defaultPrepare;
-    const desc = Object.getOwnPropertyDescriptor(Error.prototype, "stack");
-    if (desc && typeof desc.get === "function") {
-      const origGet = desc.get, origSet = desc.set;
-      Object.defineProperty(Error.prototype, "stack", {
-        configurable: true,
-        get() {
-          const raw = origGet.call(this);
-          const prep = Error.prepareStackTrace;
-          if (typeof prep === "function" && prep !== defaultPrepare) return prep(this, parseFrames(raw));
-          return defaultPrepare(this, parseFrames(raw));
+    // ── Error.prepareStackTrace ────────────────────────────────────────────
+    // V8 calls the formatter LAZILY, on the first read of `.stack`, and its
+    // return value BECOMES `.stack`. This JSC gives every error an own `stack`
+    // DATA property at construction — there is no `Error.prototype.stack`
+    // accessor to wrap — so laziness has to be installed per instance, at
+    // construction, by re-defining that own property as a getter.
+    //
+    // Doing that for every error unconditionally would tax the whole runtime
+    // for a V8-ism almost nothing uses, and would silently move mbun off the
+    // JSC-format `.stack` it deliberately keeps (see the note above). So the
+    // machinery is DORMANT until someone actually installs a formatter:
+    // `Error.prepareStackTrace` is an accessor whose setter arms it once. Code
+    // that never touches prepareStackTrace sees byte-identical behaviour.
+    const kRaw = Symbol("mbunRawStack");
+    const ownStackDesc = (obj) => {
+      try { return Object.getOwnPropertyDescriptor(obj, "stack"); } catch (e) { return undefined; }
+    };
+    // The raw JSC stack of an error, WITHOUT running any user formatter — used
+    // by everything internal that needs frames (captureStackTrace, the
+    // node_modules call-site probe) so a user formatter can neither observe nor
+    // break mbun's own captures.
+    const rawStack = (err) => {
+      try {
+        if (err !== null && typeof err === "object" && kRaw in err) return err[kRaw];
+        const d = ownStackDesc(err);
+        return d && typeof d.get !== "function" ? d.value : undefined;
+      } catch (e) { return undefined; }
+    };
+    // Published so other builtins that must walk frames WITHOUT triggering a
+    // user formatter can do so (util.getCallSites is contractually one of them:
+    // test-util-getcallsites-preparestacktrace asserts it never calls it).
+    try { G[Symbol.for("mbun.rawErrorStack")] = rawStack; } catch (e) {}
+    // Turn the own data `stack` into V8's lazy accessor. The formatter runs at
+    // most once per error and its result is cached, exactly as V8 memoises.
+    const armLazyStack = (err) => {
+      const d = ownStackDesc(err);
+      if (!d || !d.configurable || typeof d.get === "function") return err;
+      const raw = d.value;
+      let cached, computed = false;
+      try {
+        Object.defineProperty(err, kRaw, { value: raw, configurable: true });
+        Object.defineProperty(err, "stack", {
+          configurable: true,
+          enumerable: false,
+          get() {
+            if (computed) return cached;
+            const prep = Error.prepareStackTrace;
+            // No formatter (or the built-in one): keep the JSC-format string
+            // mbun reports everywhere else. Only a user formatter changes shape.
+            if (typeof prep !== "function" || prep === defaultPrepare) return raw;
+            // Latch BEFORE calling out: the formatter may read `.stack` again
+            // (directly, or via console/inspect), and V8 does not re-enter.
+            computed = true;
+            cached = raw;
+            // A throwing formatter propagates, as in V8; the cached JSC string
+            // stays in place so the next read cannot re-enter the thrower.
+            cached = prep(this, parseFrames(raw));
+            return cached;
+          },
+          set(v) { computed = true; cached = v; },
+        });
+      } catch (e) { /* frozen/sealed error: leave it alone */ }
+      return err;
+    };
+    // Swapping the global error constructors for construct-trapping proxies
+    // preserves identity that a hand-written wrapper would not: `.prototype`,
+    // `instanceof`, `class X extends Error`, and every static (including
+    // captureStackTrace and prepareStackTrace itself) forward to the original.
+    let armed = false;
+    const armErrorConstructors = () => {
+      if (armed) return;
+      armed = true;
+      const handler = {
+        construct(target, args, newTarget) {
+          return armLazyStack(Reflect.construct(target, args, newTarget));
         },
-        set(v) { if (origSet) origSet.call(this, v); else Object.defineProperty(this, "stack", { value: v, writable: true, configurable: true }); },
-      });
-    }
+        apply(target, thisArg, args) {
+          const r = Reflect.apply(target, thisArg, args);
+          return r !== null && typeof r === "object" ? armLazyStack(r) : r;
+        },
+      };
+      for (const name of ["Error", "EvalError", "RangeError", "ReferenceError",
+                          "SyntaxError", "TypeError", "URIError", "AggregateError"]) {
+        const ctor = G[name];
+        if (typeof ctor !== "function") continue;
+        try { G[name] = new Proxy(ctor, handler); } catch (e) { /* non-writable global */ }
+      }
+    };
+    let prepareValue = defaultPrepare;
+    Object.defineProperty(Error, "prepareStackTrace", {
+      configurable: true,
+      enumerable: false,
+      get() { return prepareValue; },
+      set(v) {
+        prepareValue = v;
+        if (typeof v === "function" && v !== defaultPrepare) armErrorConstructors();
+      },
+    });
     Error.captureStackTrace = function (obj, skip) {
-      // capture the raw JSC stack directly (bypass our getter to avoid recursion)
+      // capture the raw JSC stack directly (never through a lazy getter, so a
+      // user formatter cannot recurse into or hijack this internal capture)
       let raw = "", frames = [];
-      try { raw = (desc && desc.get) ? desc.get.call(new Error()) : new Error().stack; } catch (e) {}
+      try { raw = rawStack(new Error()); } catch (e) {}
       frames = parseFrames(raw).slice(1);  // drop the captureStackTrace frame itself
       if (typeof skip === "function" && skip.name) {
         const i = frames.findIndex((f) => f.getFunctionName() === skip.name);

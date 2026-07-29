@@ -399,7 +399,14 @@ inline constexpr std::string_view kNodeUtilExtraJS = R"JS(
           throw e;
         }
         let stack = "";
-        try { stack = String(new Error().stack || ""); } catch (e) { stack = ""; }
+        // node's getCallSites reads the structured stack directly and never
+        // routes through Error.prepareStackTrace. mbun's lazy `.stack` getter
+        // WOULD invoke a user formatter, so ask for the raw JSC string.
+        try {
+          const raw = globalThis[Symbol.for("mbun.rawErrorStack")];
+          const e = new Error();
+          stack = String((typeof raw === "function" ? raw(e) : e.stack) || "");
+        } catch (e) { stack = ""; }
         const lines = stack.split("\n").filter((l) => l.trim().length > 0);
         // Drop this frame; tolerate a V8-style "Error" header line.
         let start = 0;
