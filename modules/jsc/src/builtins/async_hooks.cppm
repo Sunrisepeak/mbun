@@ -390,7 +390,11 @@ inline constexpr std::string_view kAsyncHooksJS = R"JS(
   };
   const asyncHooksModule = {
     AsyncLocalStorage, AsyncResource, createHook,
-    executionAsyncId: () => executionId, triggerAsyncId: () => 0,
+    executionAsyncId: () => executionId,
+    triggerAsyncId: () => executionResource &&
+      typeof executionResource.triggerAsyncId === "function"
+      ? executionResource.triggerAsyncId()
+      : (executionResource && executionResource.triggerAsyncId) || 0,
     executionAsyncResource: () => executionResource,
   };
   def(["async_hooks"], asyncHooksModule);
