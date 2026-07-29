@@ -80,6 +80,7 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
   const kDeps = Symbol("kDeps");
   const kResolved = Symbol("kResolved");
   const kValues = Symbol("kValues");
+  const kRequests = Symbol("kRequests");
 
   const kMainContextKey = { __proto__: null };
   const identifierCounters = new WeakMap();
@@ -144,16 +145,21 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
     body = body.replace(EXPORT_FROM_RE, (all, lead, what, starAs, clause, q, spec, attrText) => {
       const attributes = parseAttributes(attrText);
       if (what.charAt(0) === "*") {
-        reexports.push({ specifier: spec, attributes, star: !starAs, starAs: starAs || null, names: [] });
+        reexports.push({ specifier: spec, attributes, phase: "evaluation", star: !starAs, starAs: starAs || null, names: [], dep: undefined });
       } else {
-        reexports.push({ specifier: spec, attributes, star: false, starAs: null, names: splitClause(clause) });
+        reexports.push({ specifier: spec, attributes, phase: "evaluation", star: false, starAs: null, names: splitClause(clause), dep: undefined });
       }
       return lead;
     });
 
     body = body.replace(IMPORT_RE, (all, lead, clause, q, spec, attrText) => {
       const attributes = parseAttributes(attrText);
-      const entry = { specifier: spec, attributes, bindings: [], star: null };
+      let phase = "evaluation";
+      if (clause && /^[ \t\n]*source\b/.test(clause)) {
+        phase = "source";
+        clause = clause.replace(/^[ \t\n]*source\b/, "");
+      }
+      const entry = { specifier: spec, attributes, phase, bindings: [], star: null, dep: undefined };
       if (clause) {
         let rest = clause.trim();
         const starMatch = /\*[ \t\n]*as[ \t\n]+([\w$]+)/.exec(rest);
@@ -202,6 +208,12 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
     // ESM->CJS lowering this file may be loaded through.
     body = body.replace(META_RE, "__vm.meta");
     body = body.replace(DYNIMPORT_RE, "__vm.dynamicImport(");
+    // The JSC C API has no module-record evaluator. The reconstructed graph
+    // still records TLA for the Node 26 introspection APIs, but its ordinary
+    // function wrapper cannot parse a bare await expression. Lower statement
+    // position awaits so linking/instantiation and namespace inspection remain
+    // available; real async evaluation stays outside this JS fallback.
+    body = body.replace(/(^|[;\n])(\s*)await\s+/g, "$1$2");
     return "(function (__vm) {\n" +
            "const __e = __vm.registerExport;\n" +
            "with (__vm.scope) {\n" +
@@ -235,6 +247,50 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
         throw ERR("ERR_VM_MODULE_STATUS", Error, "Module status must not be unlinked");
       }
       return this[kNamespace];
+    }
+    linkRequests(modules) {
+      const w = brand(this);
+      if (!Array.isArray(modules)) throw invArgType("modules", "an Array", modules);
+      if (w.status !== "unlinked") {
+        throw ERR("ERR_VM_MODULE_STATUS", Error, "Module status must be unlinked");
+      }
+      if (modules.length !== this[kDeps].length) {
+        throw ERR("ERR_MODULE_LINK_MISMATCH", Error, "The requested modules do not match the module requests");
+      }
+      const bySpecifier = new Map();
+      for (let i = 0; i < modules.length; ++i) {
+        const resolved = modules[i];
+        if (!isModule(resolved)) {
+          throw ERR("ERR_VM_MODULE_NOT_MODULE", TypeError,
+                    "Provided module is not an instance of Module");
+        }
+        const dep = this[kDeps][i];
+        const prior = bySpecifier.get(dep.specifier);
+        if (prior !== undefined && prior !== resolved) {
+          throw ERR("ERR_MODULE_LINK_MISMATCH", Error, "The requested modules do not match the module requests");
+        }
+        bySpecifier.set(dep.specifier, resolved);
+        this[kResolved].set(dep, resolved);
+      }
+      w.requestsLinked = true;
+      return undefined;
+    }
+    instantiate() {
+      const w = brand(this);
+      if (!w.requestsLinked) {
+        throw ERR("ERR_VM_MODULE_LINK_FAILURE", Error,
+                  "Module " + JSON.stringify(w.identifier) + " has not been linked");
+      }
+      instantiateModule(this, new Set());
+      return undefined;
+    }
+    hasTopLevelAwait() { return brand(this).hasTopLevelAwait; }
+    hasAsyncGraph() {
+      const w = brand(this);
+      if (w.status !== "linked" && w.status !== "evaluated" && w.status !== "evaluating") {
+        throw ERR("ERR_VM_MODULE_STATUS", Error, "Module status must be instantiated");
+      }
+      return hasAsyncGraph(this, new Set());
     }
     link(linker) {
       let w;
@@ -306,7 +362,7 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
         throw ERR("ERR_VM_MODULE_NOT_MODULE", TypeError,
                   "Provided module is not an instance of Module");
       }
-      mod[kResolved].set(dep.specifier, result);
+      mod[kResolved].set(dep, result);
       const rw = result[kWrap];
       if (rw.status === "unlinked") {
         rw.status = "linking";
@@ -314,6 +370,38 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
         rw.status = "linked";
       }
     }
+  }
+
+  function instantiateModule(mod, seen) {
+    if (seen.has(mod)) return;
+    seen.add(mod);
+    const w = mod[kWrap];
+    for (const dep of mod[kDeps]) {
+      const resolved = mod[kResolved].get(dep);
+      if (resolved === undefined) {
+        throw ERR("ERR_VM_MODULE_LINK_FAILURE", Error,
+                  "request for '" + dep.specifier + "' can not be resolved on module '" +
+                  w.identifier + "' that is not linked");
+      }
+      if (!resolved[kWrap].requestsLinked && resolved[kDeps].length !== 0) {
+        throw ERR("ERR_VM_MODULE_LINK_FAILURE", Error,
+                  "request for '" + dep.specifier + "' can not be resolved on module '" +
+                  resolved[kWrap].identifier + "' that is not linked");
+      }
+      instantiateModule(resolved, seen);
+    }
+    w.status = "linked";
+  }
+
+  function hasAsyncGraph(mod, seen) {
+    if (seen.has(mod)) return false;
+    seen.add(mod);
+    if (mod[kWrap].hasTopLevelAwait) return true;
+    for (const dep of mod[kDeps]) {
+      const resolved = mod[kResolved].get(dep);
+      if (resolved && hasAsyncGraph(resolved, seen)) return true;
+    }
+    return false;
   }
 
   function evaluateModule(mod, seen) {
@@ -386,12 +474,42 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
     });
   }
 
+  function hasSourceTopLevelAwait(source) {
+    // Ignore strings and comments, then track function bodies. This keeps the
+    // query tied to the source module rather than to promise behavior at run
+    // time: an await inside an exported async function is not TLA.
+    const text = source.replace(/(?:\/\*[\s\S]*?\*\/|\/\/[^\n]*|'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|`(?:\\.|[^`\\])*`)/g,
+      (match) => match.replace(/[^\n]/g, " "));
+    let braceDepth = 0;
+    let functionPending = false;
+    const functionDepths = [];
+    for (let i = 0; i < text.length;) {
+      const word = /^[A-Za-z_$][\w$]*/.exec(text.slice(i));
+      if (word) {
+        if (word[0] === "function") functionPending = true;
+        if (word[0] === "await" && functionDepths.length === 0) return true;
+        i += word[0].length;
+        continue;
+      }
+      if (text[i] === "{") {
+        ++braceDepth;
+        if (functionPending) { functionDepths.push(braceDepth); functionPending = false; }
+      } else if (text[i] === "}") {
+        if (functionDepths[functionDepths.length - 1] === braceDepth) functionDepths.pop();
+        --braceDepth;
+      }
+      ++i;
+    }
+    return false;
+  }
+
   function initBase(mod, contextObject, identifier) {
     const contextKey = contextObject === undefined ? kMainContextKey : contextObject;
     mod[kExports] = new Map();
     mod[kStarExports] = [];
     mod[kDeps] = [];
     mod[kResolved] = new Map();
+    mod[kRequests] = [];
     mod[kWrap] = {
       status: "unlinked",
       identifier: identifier === undefined ? nextIdentifier(contextKey) : `${identifier}`,
@@ -400,6 +518,8 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
       evaluated: false,
       evaluatePromise: undefined,
       dependencyList: undefined,
+      requestsLinked: false,
+      hasTopLevelAwait: false,
       run: () => undefined,
     };
     mod[kNamespace] = makeNamespace(mod);
@@ -433,36 +553,52 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
       initBase(this, contextObject, options.identifier);
 
       const analysis = analyze(sourceText);
+      this[kWrap].hasTopLevelAwait = hasSourceTopLevelAwait(sourceText);
       const self = this;
-      const seenSpecs = new Set();
-      const addDep = (specifier, attributes) => {
-        if (seenSpecs.has(specifier)) return;
-        seenSpecs.add(specifier);
-        this[kDeps].push({ specifier, attributes });
+      const seenRequests = new Map();
+      const addDep = (entry) => {
+        const key = entry.phase + "\u0000" + entry.specifier + "\u0000" + JSON.stringify(entry.attributes);
+        let dep = seenRequests.get(key);
+        if (dep === undefined) {
+          dep = { specifier: entry.specifier, attributes: entry.attributes, phase: entry.phase };
+          seenRequests.set(key, dep);
+          this[kDeps].push(dep);
+          this[kRequests].push(Object.freeze({ __proto__: null, specifier: dep.specifier,
+            attributes: Object.freeze({ __proto__: null, ...dep.attributes }), phase: dep.phase }));
+        }
+        entry.dep = dep;
+        return dep;
       };
-      for (const imp of analysis.imports) addDep(imp.specifier, imp.attributes);
-      for (const rex of analysis.reexports) addDep(rex.specifier, rex.attributes);
+      for (const imp of analysis.imports) addDep(imp);
+      for (const rex of analysis.reexports) addDep(rex);
+      this[kRequests] = Object.freeze(this[kRequests]);
+      // Instantiation exposes the complete namespace shape before evaluation.
+      // The wrapper replaces these placeholders with live local bindings when
+      // it runs, while re-export getters below are live from the beginning.
+      for (const exp of analysis.exports) {
+        this[kExports].set(exp.exported, () => undefined);
+      }
 
       const bindings = new Map();
       for (const imp of analysis.imports) {
         if (imp.star) {
-          bindings.set(imp.star, () => self[kResolved].get(imp.specifier)[kNamespace]);
+          bindings.set(imp.star, () => self[kResolved].get(imp.dep)[kNamespace]);
         }
         for (const pair of imp.bindings) {
           const imported = pair[0];
-          bindings.set(pair[1], () => self[kResolved].get(imp.specifier)[kNamespace][imported]);
+          bindings.set(pair[1], () => self[kResolved].get(imp.dep)[kNamespace][imported]);
         }
       }
       for (const rex of analysis.reexports) {
         if (rex.star && !rex.starAs) {
-          this[kStarExports].push(rex.specifier);
+          this[kStarExports].push(rex.dep);
         } else if (rex.starAs) {
-          this[kExports].set(rex.starAs, () => self[kResolved].get(rex.specifier)[kNamespace]);
+          this[kExports].set(rex.starAs, () => self[kResolved].get(rex.dep)[kNamespace]);
         }
         for (const pair of rex.names) {
           const imported = pair[0];
           this[kExports].set(pair[1],
-            () => self[kResolved].get(rex.specifier)[kNamespace][imported]);
+            () => self[kResolved].get(rex.dep)[kNamespace][imported]);
         }
       }
 
@@ -514,10 +650,11 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
     get dependencySpecifiers() {
       const w = brand(this);
       if (w.dependencyList === undefined) {
-        w.dependencyList = Object.freeze(this[kDeps].map((d) => d.specifier));
+        w.dependencyList = Object.freeze(this[kRequests].map((d) => d.specifier));
       }
       return w.dependencyList;
     }
+    get moduleRequests() { brand(this); return this[kRequests]; }
     createCachedData() {
       brand(this);
       const B = G.Buffer;
