@@ -1305,32 +1305,6 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
       }
     } catch (e) {}
 
-    // ---- hrtime tuple validation -------------------------------------------
-    // Keep the runtime's monotonic clock, but validate the optional tuple before
-    // delegating. Node rejects a non-array and requires exactly two entries.
-    try {
-      if (typeof proc.hrtime === "function") {
-        const origHrtime = proc.hrtime;
-        proc.hrtime = function hrtime(time) {
-          if (time !== undefined) {
-            if (!Array.isArray(time)) {
-              const e = new TypeError('The "time" argument must be an instance of Array. Received type ' +
-                                      typeof time + ' (' + String(time) + ')');
-              e.code = "ERR_INVALID_ARG_TYPE";
-              throw e;
-            }
-            if (time.length !== 2) {
-              const e = new RangeError('The value of "time" is out of range. It must be 2. Received ' + time.length);
-              e.code = "ERR_OUT_OF_RANGE";
-              throw e;
-            }
-          }
-          return origHrtime.apply(this, arguments);
-        };
-        if (typeof origHrtime.bigint === "function") proc.hrtime.bigint = origHrtime.bigint.bind(origHrtime);
-      }
-    } catch (e) {}
-
     // ---- setSourceMapsEnabled boolean validation ----------------------------
     // node validateBoolean(val, 'val') (test-process-setsourcemapsenabled).
     try {
