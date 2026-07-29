@@ -52,6 +52,7 @@ inline constexpr std::string_view kAsyncHooksJS = R"JS(
   // are real async resources, so account for them with the same id/context
   // transition rules Node exposes to user hooks.
   const activeHooks = new Set();
+  const hookControllers = new WeakMap();
   // stream.finished() needs this decision at callback-registration time. Keep
   // the probe in the async-hooks owner, where both the ALS frame and active
   // hook set are authoritative.
@@ -68,7 +69,7 @@ inline constexpr std::string_view kAsyncHooksJS = R"JS(
   const hookCall = (name, ...args) => {
     for (const hook of Array.from(activeHooks)) {
       const callback = hook[name];
-      if (typeof callback === "function") Reflect.apply(callback, hook, args);
+      if (typeof callback === "function") Reflect.apply(callback, hookControllers.get(hook) || hook, args);
     }
   };
   const newAsyncId = () => ++nextAsyncId;
@@ -446,10 +447,12 @@ inline constexpr std::string_view kAsyncHooksJS = R"JS(
         }
       } catch { /* internal module unavailable during bootstrap */ }
     };
-    return {
+    const controller = {
       enable() { activeHooks.add(hook); setInternalHookState(true); return this; },
       disable() { activeHooks.delete(hook); setInternalHookState(false); return this; },
     };
+    hookControllers.set(hook, controller);
+    return controller;
   };
   const asyncHooksModule = {
     AsyncLocalStorage, AsyncResource, createHook,
