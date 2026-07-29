@@ -5235,9 +5235,10 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       const emitDrain = this._drainEventPending;
       this._drainEventPending = false;
       G.queueMicrotask(() => {
-        if (this._destroyed) return;
-        if (err) this.emit("error", err);
-        if (!err && emitDrain) this.emit("drain");
+        // destroy() suppresses later stream events, but it must not swallow
+        // an already-requested flush/end completion callback.
+        if (err && !this._destroyed) this.emit("error", err);
+        if (!err && emitDrain && !this._destroyed) this.emit("drain");
         for (const cb of callbacks) cb(err);
       });
     }
