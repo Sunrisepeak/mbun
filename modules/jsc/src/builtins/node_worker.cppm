@@ -66,6 +66,18 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
     }
     return data;
   };
+  // BroadcastChannel exposes structured-clone failures to its caller; do not
+  // swallow its DataCloneError while posting a broadcast.
+  const cloneBroadcast = (data) => {
+    if (typeof G.structuredClone !== "function") return data;
+    try { return G.structuredClone(data); }
+    catch (e) {
+      // JSC says "Symbol values cannot be cloned"; Node reports the rejected
+      // value itself for BroadcastChannel.
+      if (typeof data === "symbol") throw dataClone(String(data) + " could not be cloned.");
+      throw e;
+    }
+  };
 
   const kOther = Symbol("mbun.port.other");
   const kQueue = Symbol("mbun.port.queue");
@@ -848,7 +860,7 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
         if (!set) return;
         if (containsTransferable(value))
           throw dataClone("Object that needs transfer was found in message but not listed in transferList");
-        const data = clone(value);
+        const data = cloneBroadcast(value);
         for (const ch of set) {
           if (ch === this || ch._closed) continue;
           G.queueMicrotask(() => {
