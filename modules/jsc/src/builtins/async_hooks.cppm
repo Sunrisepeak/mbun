@@ -144,6 +144,13 @@ inline constexpr std::string_view kAsyncHooksJS = R"JS(
     configurable: true, enumerable: false, value: timerHooks,
   });
 
+  const validateFunction = (fn) => {
+    if (typeof fn === "function") return;
+    const error = new TypeError('The "fn" argument must be of type function');
+    error.code = "ERR_INVALID_ARG_TYPE";
+    throw error;
+  };
+
   class AsyncLocalStorage {
     #disabled = false;
     // node >= 24 `new AsyncLocalStorage({ defaultValue })`: getStore() outside
@@ -157,14 +164,14 @@ inline constexpr std::string_view kAsyncHooksJS = R"JS(
     }
 
     static bind(fn, ...args) {
-      if (typeof fn !== "function") throw new TypeError('The "fn" argument must be of type function');
+      validateFunction(fn);
       return this.snapshot().bind(null, fn, ...args);
     }
 
     static snapshot() {
       const context = contextGet();
       return (fn, ...args) => {
-        if (typeof fn !== "function") throw new TypeError('The "fn" argument must be of type function');
+        validateFunction(fn);
         return callInContext(context, fn, undefined, args);
       };
     }
@@ -299,15 +306,15 @@ inline constexpr std::string_view kAsyncHooksJS = R"JS(
       return this;
     }
     runInAsyncScope(fn, thisArg, ...args) {
-      if (typeof fn !== "function") throw new TypeError('The "fn" argument must be of type function');
+      validateFunction(fn);
       return runAsyncCallback(this.#asyncId, this, () => callInContext(this.#snapshot, fn, thisArg, args), undefined, []);
     }
     bind(fn, thisArg) {
-      if (typeof fn !== "function") throw new TypeError('The "fn" argument must be of type function');
+      validateFunction(fn);
       return this.runInAsyncScope.bind(this, fn, thisArg ?? this);
     }
     static bind(fn, type, thisArg) {
-      if (typeof fn !== "function") throw new TypeError('The "fn" argument must be of type function');
+      validateFunction(fn);
       return new AsyncResource(type || fn.name || "bound-anonymous-fn").bind(fn, thisArg);
     }
   }
