@@ -483,6 +483,16 @@
                         ctx, "To load Node-API modules, use require() or process.dlopen instead of import.")};
                     JSObjectRef e{JSObjectMakeError(ctx, 1, &m, nullptr)};
                     set_prop(ctx, e, "name", make_string(ctx, "TypeError"));
+                    // No frames: bun raises this from the module loader's LINK
+                    // step, so an uncaught one reports exactly
+                    // "TypeError: To load Node-API modules…" on the first line of
+                    // stderr. mbun lowers `import` to a require() call, so JSC
+                    // would otherwise stamp the importing statement's position on
+                    // the error and the fatal reporter would print that file's
+                    // source-context block (`<file>:<line>` + caret) ABOVE the
+                    // message. Clearing .stack makes the reporter's frame list
+                    // empty, which is its "header only" case.
+                    set_prop(ctx, e, "stack", make_string(ctx, ""));
                     JSObjectRef tctor{JSObjectMake(ctx, nullptr, nullptr)};
                     set_prop(ctx, tctor, "name", make_string(ctx, "TypeError"));
                     set_prop(ctx, e, "constructor", tctor);

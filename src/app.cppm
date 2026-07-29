@@ -2028,6 +2028,30 @@ void apply_cwd_flag(std::string_view dir) {
     }
 }
 
+// `--loader .ext:name` / `-l .ext:name`: install a process-wide extension→loader
+// override for the RUNTIME module loader.
+//
+// bun's `--loader` is a TRANSPILER_PARAMS_ entry (Arguments.rs:174-176), so it is
+// shared by `run`/`test`/`build`, not build-only: the runtime's loader lookup
+// probes the user map before DEFAULT_LOADERS (bundler/options.rs:1714). That is
+// how `bun --loader=.xyz:napi entry.mjs` makes `import "./thing.xyz"` a Node-API
+// addon (and therefore the ESM "use require()" TypeError) instead of feeding the
+// addon's bytes to the JS lexer.
+//
+// A malformed pair (no ':', an extension without a leading '.', or a loader name
+// this runtime has no Loader for) is IGNORED rather than fatal: the runtime path
+// must not refuse to start over a transpiler flag, and `loader_from_string`
+// already returns nullopt for names bun knows but mbun cannot produce.
+void apply_loader_flag(std::string pair) {
+    const std::size_t colon{pair.rfind(':')};
+    if (colon == std::string::npos || colon == 0) return;
+    std::string ext{pair.substr(0, colon)};
+    if (ext.front() != '.') return;
+    if (const auto loader{mbun::jsc::module_loader::loader_from_string(pair.substr(colon + 1))}) {
+        mbun::jsc::module_loader::runtime_loader_overrides()[std::move(ext)] = *loader;
+    }
+}
+
 // bun's `default_loader_for(target).can_be_run_by_bun()` (run_command.rs:774).
 bool loader_can_be_run(std::string_view target) {
     return looks_like_script(target) || is_markdown(target);

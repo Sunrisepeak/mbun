@@ -254,6 +254,17 @@ int main(int argc, char* argv[]) {
             args.erase(args.begin(), args.begin() + static_cast<std::ptrdiff_t>(n));
             continue;
         }
+        // `--loader .ext:name` / `-l .ext:name` — shared with run/test, not
+        // build-only (see apply_loader_flag).
+        if (const std::size_t n{take_valued_flag(args, 0, "--loader", apply_loader_flag)};
+            n > 0) {
+            args.erase(args.begin(), args.begin() + static_cast<std::ptrdiff_t>(n));
+            continue;
+        }
+        if (const std::size_t n{take_valued_flag(args, 0, "-l", apply_loader_flag)}; n > 0) {
+            args.erase(args.begin(), args.begin() + static_cast<std::ptrdiff_t>(n));
+            continue;
+        }
         if (args[0] == "--bun" || args[0] == "-b") {
             globalFlags.forceUsingBun = true;
             args.erase(args.begin());
@@ -377,6 +388,18 @@ int main(int argc, char* argv[]) {
                 }
                 if (const std::size_t n{take_valued_flag(args, i, "--user-agent",
                                                          mbun::jsc::runtime::set_user_agent)};
+                    n > 0) {
+                    args.erase(args.begin() + static_cast<std::ptrdiff_t>(i),
+                               args.begin() + static_cast<std::ptrdiff_t>(i + n));
+                    continue;
+                }
+                if (const std::size_t n{take_valued_flag(args, i, "--loader", apply_loader_flag)};
+                    n > 0) {
+                    args.erase(args.begin() + static_cast<std::ptrdiff_t>(i),
+                               args.begin() + static_cast<std::ptrdiff_t>(i + n));
+                    continue;
+                }
+                if (const std::size_t n{take_valued_flag(args, i, "-l", apply_loader_flag)};
                     n > 0) {
                     args.erase(args.begin() + static_cast<std::ptrdiff_t>(i),
                                args.begin() + static_cast<std::ptrdiff_t>(i + n));
