@@ -5,6 +5,24 @@
 
 ## 2026-07-29
 
+### 5 小时冲刺第十五批：9 分钟净增 9 文件，60 files/hour
+
+13:17–13:26 组合 CLI syntax-check、diagnostics module tracing、Buffer
+DEP0005 与 OS internal contracts，预计 13、目标集实际 **+9**：
+
+- CLI `--check` stdin/eval/bad syntax 预计 4，实际 **2**；另两项停在独立
+  stderr 文案/option dispatch；
+- diagnostics `module.require` / `module.import` start/end/error/async 顺序
+  **4/4**；
+- Buffer legacy constructor warning预计 2，实际 **1**；无
+  `--pending-deprecation` 的 callsite/node_modules 判定仍独立；
+- OS signals freeze / checked binding / userInfo getter预计 3，实际新增
+  **2**，第三项 frozen 已绿。
+
+守卫：CLI 7/18 pass，diagnostics 64/67 pass，Buffer 54 pass / 12 fail /
+2 skip，OS 6/7 pass；green→non-green 均为 0。守卫中出现的旧 frozen
+额外 gain 不归因于本批，仍只按命名目标结算。
+
 ### 5 小时冲刺第十四批：8 分钟净增 9 文件，67.5 files/hour
 
 13:09–13:17 组合 HTTP client、module/require、readline、Abort timeout、

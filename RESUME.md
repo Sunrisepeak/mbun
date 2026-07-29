@@ -297,6 +297,23 @@ Guards: HTTP client 63/68 pass; module 11 pass, 18 fail, 3 skip; require 13
 pass, 9 fail, 1 skip; abort 1/7 pass; readline 10 pass, 3 fail, 8 skip. Every
 guard has zero green-to-non-green regressions.
 
+### Sprint wave 15 measured checkpoint (13:17–13:26)
+
+CLI syntax-check, diagnostics module tracing, Buffer DEP0005, and OS internal
+contracts forecast 13 files and delivered **+9 in 9 minutes = 60 files/hour**:
+
+- CLI `--check` dispatch: estimated 4, actual 2; two remain at separate stderr
+  text/option-dispatch contracts;
+- diagnostics module require/import tracing: 4/4;
+- Buffer legacy constructor warning: estimated 2, actual 1; default-vs-
+  node_modules callsite policy is separate from pending deprecation;
+- OS signal freeze, checked binding, userInfo getter: estimated 3, actual 2;
+  the third target was already green in the frozen baseline.
+
+Guards: CLI 7/18 pass; diagnostics 64/67 pass; Buffer 54 pass, 12 fail, 2
+skip; OS 6/7 pass. All have zero regressions. Additional old-frozen gains
+visible in the broad guards are not attributed to this wave.
+
 The first three-way reuse probe tested local round-10 branches for node's
 `--test` CLI, HTTP/2 argument/timer validation, and verbatim Node error text.
 All three candidate cherry-picks became empty on the current target tree.
