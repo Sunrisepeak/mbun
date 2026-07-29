@@ -430,7 +430,13 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
       // Submit HEADERS before the file source is consumed. A later read error
       // resets an already-open response stream, so the client observes both the
       // response event and the INTERNAL_ERROR RST, matching node/nghttp2.
-      this.respond(headers, options.waitForTrailers ? { waitForTrailers: true } : undefined);
+      try {
+        this.respond(headers, options.waitForTrailers ? { waitForTrailers: true } : undefined);
+      } catch (e) {
+        if (ownsFd) { try { fs.closeSync(fd); } catch (e2) {} }
+        this._fileError(options, e);
+        return;
+      }
       let body;
       try {
         if (length < 0) {
@@ -545,7 +551,9 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
       this._hpack = new HpackDecoder();
       this._maxFrameSize = constants.DEFAULT_SETTINGS_MAX_FRAME_SIZE;
       this._remoteSettings = null;
-      this._localSettings = { headerTableSize: 4096, enablePush: 0, initialWindowSize: 65535, maxFrameSize: 16384, maxConcurrentStreams: 4294967295 };
+      this._localSettings = { headerTableSize: 4096, enablePush: 0, initialWindowSize: 65535, maxFrameSize: 16384, maxConcurrentStreams: 4294967295, enableConnectProtocol: false };
+      if (server && server._h2options && server._h2options.settings)
+        Object.assign(this._localSettings, server._h2options.settings);
       this._pendingHeaderBlock = null;
       this._lastStreamId = 0;
       // connection-level flow control bookkeeping, surfaced through `state`
@@ -553,10 +561,12 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
       this._remoteWindow = DEFAULT_CONNECTION_WINDOW;
       this._lastProcStreamId = 0;
       this.alpnProtocol = socket.alpnProtocol || null;
+      this.encrypted = !!(socket && socket.encrypted);
+      this._originSet = undefined;
       const self = this;
       // A server may send its SETTINGS immediately (RFC 7540 3.5); the client's
       // preface can still be in flight. Apply any configured settings values.
-      this._writeFrame(FRAME.SETTINGS, 0, 0, encodeSettings(server && server._h2options && server._h2options.settings));
+      this._writeFrame(FRAME.SETTINGS, 0, 0, encodeSettings(this._localSettings));
       socket.on("data", (d) => self._onData(d));
       socket.on("error", (e) => self._onSocketError(e));
       socket.on("close", () => self._onSocketClose());
@@ -896,6 +906,10 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
     }
     // ---- public surface ----
     get connected() { return !this.destroyed; }
+    get originSet() {
+      if (!this.encrypted || this.destroyed) return undefined;
+      return Array.from(initOriginSet(this));
+    }
     get remoteSettings() { return this._remoteSettings ? settingsToObject(this._remoteSettings) : undefined; }
     get localSettings() { return this._localSettings; }
     // server-initiated streams are even-numbered; we never push, so the next id
@@ -977,6 +991,7 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
         for (const s of Array.from(self.streams.values())) { try { s.emit("timeout"); } catch (e) {} }
       }, this._timeoutMs);
       if (this._timer && this._timer.unref) this._timer.unref();
+      syncSessionTimeoutShape(this);
     }
   }
 
