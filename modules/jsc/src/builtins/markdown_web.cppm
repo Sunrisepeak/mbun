@@ -1191,6 +1191,21 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
     // util.promisify(crypto.generateKeyPair)(...) yields the 2-key object.
     nodeCrypto.generateKeyPair[Symbol.for("nodejs.util.promisify.custom")] =
       (type, options) => Promise.resolve({ publicKey: "", privateKey: "" });
+    // node:crypto re-exports the WebCrypto SubtleCrypto as `crypto.subtle`
+    // (an alias for `crypto.webcrypto.subtle`). It matters beyond the node API:
+    // `mbun -e` exposes builtinModules as globals, and `crypto` is deliberately
+    // let through (see api_impl.inc kBuiltinGlobals), so inside `-e` the global
+    // `crypto` IS this module — without the alias, `crypto.subtle` reads
+    // undefined there while it works in a file. The captured reference is used
+    // rather than `globalThis.crypto` precisely because of that shadowing.
+    const webCryptoGlobal = G.crypto;
+    if (webCryptoGlobal && !("subtle" in nodeCrypto)) {
+      Object.defineProperty(nodeCrypto, "subtle", {
+        configurable: true, enumerable: true,
+        get() { return webCryptoGlobal.subtle; },
+        set() {},
+      });
+    }
     def(["crypto"], nodeCrypto);
     // WebCrypto CryptoKey — a real class so instanceof + structured clone work.
     // Only symmetric key generation/export is modeled (AES-*/HMAC raw bits).

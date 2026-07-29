@@ -2540,10 +2540,31 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     const body = entries.map((entry, i) => "  " + entry + (i + 1 < entries.length ? "," : "")).join("\n");
     return label + " {\n" + body + " }";
   };
-  const inspectURLSearchParams = (params, options) => inspectURLSearchParamsEntries(
-    "URLSearchParams",
-    params._e.map(([key, value]) => util.inspect(key) + " => " + util.inspect(value)),
-    options,
+  // Bun.inspect renders URLSearchParams as an object block ("key": "value" per
+  // line, trailing comma) where node's util.inspect renders the maplike form
+  // ('key' => 'value'). Both corpora pin their own shape — node
+  // test-whatwg-url-custom-searchparams-inspect asserts the maplike string, bun
+  // test/js/web/url/url.test.ts "prints" asserts the object block nested inside
+  // URL — so the layout follows the __bunStyle flag Bun.inspect sets rather than
+  // replacing one with the other.
+  const inspectURLSearchParamsBun = (params, indent) => {
+    const entries = params._e;
+    if (entries.length === 0) return "URLSearchParams {}";
+    const inner = indent + "  ";
+    let body = "";
+    for (const [key, value] of entries) {
+      body += inner + JSON.stringify("" + key) + ": " + JSON.stringify("" + value) + ",\n";
+    }
+    return "URLSearchParams {\n" + body + indent + "}";
+  };
+  const inspectURLSearchParams = (params, options, indent) => (
+    options && options.__bunStyle === true
+      ? inspectURLSearchParamsBun(params, indent || "")
+      : inspectURLSearchParamsEntries(
+          "URLSearchParams",
+          params._e.map(([key, value]) => util.inspect(key) + " => " + util.inspect(value)),
+          options,
+        )
   );
   if (typeof G.URLSearchParams === "undefined") {
     // ref: bun src/jsc/bindings/URLSearchParams.cpp, backed by
@@ -3034,7 +3055,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       }
       toString() { return this.href; }
       toJSON() { return this.href; }
-      [Symbol.for("nodejs.util.inspect.custom")]() {
+      [Symbol.for("nodejs.util.inspect.custom")](depth, options) {
         try { void this.href; } catch (_) { return "URL {}"; }
         return "URL {\n" +
           "  href: " + JSON.stringify(this.href) + ",\n" +
@@ -3048,7 +3069,9 @@ inline constexpr char kBootstrapJS_[] = R"JS(
           "  pathname: " + JSON.stringify(this.pathname) + ",\n" +
           "  hash: " + JSON.stringify(this.hash) + ",\n" +
           "  search: " + JSON.stringify(this.search) + ",\n" +
-          "  searchParams: " + inspectURLSearchParams(this.searchParams) + ",\n" +
+          // nested one level in, so a multi-line bun block indents its entries
+          // to 4 and closes its brace at 2.
+          "  searchParams: " + inspectURLSearchParams(this.searchParams, options, "  ") + ",\n" +
           "  toJSON: [Function: toJSON],\n" +
           "  toString: [Function: toString],\n" +
           "}";
@@ -3064,7 +3087,10 @@ inline constexpr char kBootstrapJS_[] = R"JS(
         const custom = value[kInspectCustom];
         return typeof custom === "function" ? custom.call(value, depth, options) : inspectURLSearchParams(value, options);
       }
-      if (value instanceof G.URL) return value[Symbol.for("nodejs.util.inspect.custom")]();
+      if (value instanceof G.URL) {
+        const depth = typeof options?.depth === "number" ? options.depth : 2;
+        return value[Symbol.for("nodejs.util.inspect.custom")](depth, options);
+      }
       return inspectBeforeURL.call(this, value, options);
     };
     for (const k of Object.keys(inspectBeforeURL)) { try { util.inspect[k] = inspectBeforeURL[k]; } catch (_) {} }

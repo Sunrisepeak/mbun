@@ -57,10 +57,24 @@ inline constexpr std::string_view kWebHeadersJS = R"JS(
     for (const n of WELL_KNOWN) CANONICAL.set(n.toLowerCase(), n);
 
     // ------------------------------------------------------------ validation
-    const TOKEN_RE = /^[!#$%&'*+\-.^_`|~A-Za-z0-9]+$/;
+    // RFC 7230 token, checked by code point rather than /^[...]+$/.test().
+    // RegExp.prototype.test goes through RegExpExec, which reads
+    // `RegExp.prototype.exec` at call time — the deno corpus
+    // (headerInitWithPrototypePollution) replaces that with a thrower and then
+    // requires `new Headers([...])` to still work, so the validator must not
+    // touch a regexp at all.
+    const isTokenChar = (c) =>
+      (c >= 0x30 && c <= 0x39) ||            // 0-9
+      (c >= 0x41 && c <= 0x5a) ||            // A-Z
+      (c >= 0x61 && c <= 0x7a) ||            // a-z
+      c === 0x21 || (c >= 0x23 && c <= 0x27) ||  // ! # $ % & '
+      c === 0x2a || c === 0x2b || c === 0x2d || c === 0x2e ||  // * + - .
+      c === 0x5e || c === 0x5f || c === 0x60 || c === 0x7c || c === 0x7e;  // ^ _ ` | ~
     const validateName = (name) => {
       const s = "" + name;
-      if (!TOKEN_RE.test(s)) throw new TypeError("Invalid header name: '" + s + "'");
+      let ok = s.length > 0;
+      for (let i = 0; ok && i < s.length; i++) ok = isTokenChar(s.charCodeAt(i));
+      if (!ok) throw new TypeError("Invalid header name: '" + s + "'");
       return s;
     };
     // Strip leading/trailing HTTP whitespace, then require ISO-8859-1 without
@@ -147,14 +161,23 @@ inline constexpr std::string_view kWebHeadersJS = R"JS(
     };
     proto.getSetCookie = function getSetCookie() { return this._sc.slice(); };
 
-    // Sorted + combined iteration; set-cookie values enumerate individually.
+    // Sorted + combined iteration; set-cookie values enumerate individually and
+    // come LAST, after the sorted ordinary headers, rather than at set-cookie's
+    // own sorted position. Upstream keeps set-cookie in a separate vector that
+    // the iterator drains after the sorted HTTPHeaderMap, so
+    // `[...new Headers([["Set-Cookie","a"],["X-Deno","b"]])]` is
+    // [["x-deno","b"],["set-cookie","a"]] even though "s" < "x" — the deno
+    // corpus (headersInitMultiple / headersAppendMultiple) pins that order.
     const sortedEntries = (h) => {
       const keys = Array.from(h._m.keys()).sort();
       const out = [];
       for (const k of keys) {
-        if (k === "set-cookie" && h._sc.length) {
-          for (const v of h._sc) out.push([k, v]);
-        } else out.push([k, h._m.get(k)]);
+        if (k === "set-cookie") continue;
+        out.push([k, h._m.get(k)]);
+      }
+      if (h._m.has("set-cookie")) {
+        if (h._sc.length) { for (const v of h._sc) out.push(["set-cookie", v]); }
+        else out.push(["set-cookie", h._m.get("set-cookie")]);
       }
       return out;
     };

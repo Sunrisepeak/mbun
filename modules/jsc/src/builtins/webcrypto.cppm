@@ -1539,6 +1539,13 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
         try { return Promise.resolve(body.apply(impl, args)); }
         catch (e) { return Promise.reject(e); }
       } }[method];
+      // The `...args` wrapper would otherwise report length 0 for every method.
+      // WebIDL's `length` is the number of REQUIRED arguments, which is exactly
+      // what the impl body's own arity is (its optional trailing parameters
+      // carry defaults), so hand it through.
+      defineProperty(wrapper, "length", {
+        configurable: true, value: typeof body === "function" ? body.length : 0,
+      });
       defineProperty(SubtleCrypto.prototype, method, {
         configurable: true, writable: true, enumerable: true, value: wrapper,
       });
@@ -1600,6 +1607,11 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
     defineProperty(Crypto.prototype, "subtle", {
       configurable: true, enumerable: true,
       get() { requireCrypto(this); return subtle; },
+      // A no-op setter, not a getter-only accessor: `crypto.subtle = 123` from
+      // strict-mode/module code must be ignored, not throw
+      // (test/js/web/crypto/web-crypto.test.ts "crypto.subtle setter should not
+      // throw"). The read still returns the real SubtleCrypto.
+      set() {},
     });
     defineProperty(Crypto.prototype, "getRandomValues", {
       configurable: true, writable: true, enumerable: true,
