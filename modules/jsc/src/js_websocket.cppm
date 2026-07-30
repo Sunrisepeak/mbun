@@ -275,7 +275,25 @@ export constexpr std::string_view kWebSocketJS = R"JS(
       this.readyState = RS.CONNECTING;
       // bun defaults to "nodebuffer" (verified: `new WebSocket(u).binaryType`),
       // not the browser's "blob" — binary frames arrive as a Buffer.
-      this.binaryType = "nodebuffer";
+      //
+      // An ACCESSOR, not a data property: the attribute is an enumeration, and
+      // bun rejects a value outside it instead of storing it. As a plain field
+      // `ws.binaryType = "invalid"` was accepted silently and then matched none
+      // of the read sites, so a binary frame afterwards was delivered as the raw
+      // view with no diagnostic at all.
+      {
+        let binaryType = "nodebuffer";
+        Object.defineProperty(this, "binaryType", {
+          enumerable: true, configurable: true,
+          get() { return binaryType; },
+          set(v) {
+            const s = String(v);
+            if (s !== "nodebuffer" && s !== "arraybuffer" && s !== "blob")
+              throw new SyntaxError("binaryType must be either \"blob\", \"arraybuffer\" or \"nodebuffer\"");
+            binaryType = s;
+          },
+        });
+      }
       this.bufferedAmount = 0;
       this.protocol = ""; this.extensions = "";
       this.onopen = null; this.onmessage = null; this.onerror = null; this.onclose = null;
@@ -422,7 +440,19 @@ export constexpr std::string_view kWebSocketJS = R"JS(
     pong(d) { if (this.readyState === RS.OPEN) this._wire.sendPong(d == null ? "" : d); }
     close(code, reason) {
       if (this.readyState === RS.CLOSED || this.readyState === RS.CLOSING) return;
-      if (code !== undefined && code !== 1000 && !(code >= 3000 && code <= 4999)) throw new (G.DOMException || Error)("The close code must be either 1000 or in the range of 3000 to 4999", "InvalidAccessError");
+      // The RFC 6455 §7.4 endpoint set, NOT the browser's "1000 or 3000-4999":
+      // bun's WebSocket.cpp isValidCloseCodeForSending says so in as many words
+      // ("non-browser clients legitimately send 1001 or 1011, and `ws` accepts
+      // the same set"). Enforcing the browser rule here made `ws.close(1001)`
+      // throw from inside the open handler, so the close event never fired and
+      // the test hung rather than failing on the code. No node-corpus test
+      // asserts the narrower rule (node has no WPT websocket suite vendored).
+      if (code !== undefined && code !== null &&
+          !((code >= 1000 && code <= 1014 && code !== 1004 && code !== 1005 && code !== 1006) ||
+            (code >= 3000 && code <= 4999)))
+        throw new (G.DOMException || Error)(
+          "The close code must be a valid WebSocket close code (1000-1014, excluding the reserved codes 1004-1006, or in the range of 3000 to 4999). Received " + code + ".",
+          "InvalidAccessError");
       if (this.readyState === RS.CONNECTING) { this._failConnecting(); return; }
       this.readyState = RS.CLOSING;
       this._state.closeSent = true;
