@@ -403,7 +403,12 @@ public:
         // test file: `bun test` resets per-file state at every file boundary and
         // would otherwise drop e.g. expect.extend() matchers a preload
         // registered. The flag lets that state distinguish the two.
-        (void)eval_void("globalThis.__mbunInPreload=true;");
+        // Non-enumerable: node's common/index.js:437 runs a global-leak check and a
+        // plain assignment made EVERY test using it fail with
+        // "Unexpected global(s) found: __mbunInPreload". Caught by the wide gate,
+        // not by the lane's own subtree.
+        (void)eval_void("Object.defineProperty(globalThis,'__mbunInPreload',"
+                        "{value:true,writable:true,enumerable:false,configurable:true});");
         for (const std::string& spec : gPreloads) {
             std::error_code pec{};
             std::filesystem::path p{spec};
@@ -419,7 +424,8 @@ public:
                 return 1;
             }
         }
-        (void)eval_void("globalThis.__mbunInPreload=false;");
+        (void)eval_void("Object.defineProperty(globalThis,'__mbunInPreload',"
+                        "{value:false,writable:true,enumerable:false,configurable:true});");
         std::string js{source};
         bool tla{false};
         // `// @bun` pragma (after an optional hashbang line): the entry is already
