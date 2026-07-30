@@ -14,15 +14,22 @@
 # at their true file count so the throughput model stays honest, with the value
 # noted in `note`.
 #
-# Columns: wave <TAB> lane <TAB> corpus <TAB> area <TAB> goal <TAB> delivered <TAB> minutes <TAB> regressions <TAB> note
-wave	lane	corpus	area	goal	delivered	minutes	regressions	note
-56	A	jsc	nextTick-ordering	0	0	109	0	cure landed; contract now pinned by tick_order_gate.py; 3 subsystems were depending on the inversion
-56	B	node	test-runner	6	6	255	0	slowest lane; 2 builds + 2 runs went to baseline-by-revert
-56	C	node	test-worker	6	8	250	0	7th umbrella cluster dissolved; postMessage transferList ignored
-56	D	bun	bake/dev	8	0	120	0	retired 18-file vein with numbers; gated on whole HMR subsystem
-56	E	bun	bundler	6	1	105	0	Bundle Failed dissolved into 29 causes; only 5 of 49 files gated solely on bundler
-57	F	node	test-http2	6	6	95	0	one real cluster (Timeout._idleTimeout); 5 of 6 files needed 2-4 fixes
-57	G	node	test-child	6	16	110	0	two architectural-placement bugs; self-caught a change costing a green bun file
-57	H	node	test-zlib+whatwg	6	15	60	0	best throughput of campaign; blocker was a STALE COMMENT, not a missing feature
-57	I	bun	regression/issue	12	13	160	0	failures bimodal with no middle; sort by assertion ratio found the cheap half
-57	J	bun	js/bun/http+net+websocket	8	5	115	0	biggest lever was Bun.spawn ipc, not http; found the load-noise trap
+# `shape` is port | fix | infra. It is the column that predicts yield: the campaign's
+# own 移植三段法 (translate the real source -> fix what breaks -> optimise) is recorded
+# in changelog.md at +111 corpus files in ONE wave, while two waves of fix-shaped lanes
+# produced +71. Lane H is the in-wave proof: at 15.0 files/hour it was doing a porting
+# action (deleting hand-rolled methods that shadowed an already-ported state machine),
+# 4x the next best lane.
+#
+# Columns: wave <TAB> lane <TAB> corpus <TAB> area <TAB> shape <TAB> goal <TAB> delivered <TAB> minutes <TAB> regressions <TAB> note
+wave	lane	corpus	area	shape	goal	delivered	minutes	regressions	note
+56	A	jsc	nextTick-ordering	infra	0	0	109	0	cure landed; contract now pinned by tick_order_gate.py; 3 subsystems were depending on the inversion
+56	B	node	test-runner	fix	6	6	255	0	slowest lane; 2 builds + 2 runs went to baseline-by-revert
+56	C	node	test-worker	fix	6	8	250	0	7th umbrella cluster dissolved; postMessage transferList ignored
+56	D	bun	bake/dev	fix	8	0	120	0	retired 18-file vein with numbers; gated on whole HMR subsystem
+56	E	bun	bundler	fix	6	1	105	0	Bundle Failed dissolved into 29 causes; only 5 of 49 files gated solely on bundler
+57	F	node	test-http2	fix	6	6	95	0	one real cluster (Timeout._idleTimeout); 5 of 6 files needed 2-4 fixes
+57	G	node	test-child	fix	6	16	110	0	two architectural-placement bugs; self-caught a change costing a green bun file
+57	H	node	test-zlib+whatwg	port	6	15	60	0	best throughput of campaign; blocker was a STALE COMMENT, not a missing feature
+57	I	bun	regression/issue	fix	12	13	160	0	failures bimodal with no middle; sort by assertion ratio found the cheap half
+57	J	bun	js/bun/http+net+websocket	fix	8	5	115	0	biggest lever was Bun.spawn ipc, not http; found the load-noise trap

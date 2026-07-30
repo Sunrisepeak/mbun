@@ -5,6 +5,81 @@ session that is interrupted (usage limit, crash, restart) can pick up from the
 file rather than from memory. **If you are a fresh session reading this, start
 here.**
 
+## 2026-07-30 19:30 — STRATEGY PIVOT: the long tail IS the hand-written surface
+
+**Stop mining failures file by file. Port the real source instead.** This is the
+most important entry in this file; it changes what a lane is for.
+
+The project already has the method and it is named in `changelog.md`:
+**移植三段法** — "mechanically translate the real source → fix compile/runtime
+errors → optimise". Its recorded yield here is **+111 corpus files in a single
+wave** (S1 第17轮 wave-2), plus TextDecoder +85 assertions, `install` ~16k lines
+ported to 474 green checks, `resolve.test.ts` 17→37, `image-kernels` 0→37.
+My waves 56–57, run as fix-by-fix lanes, produced **+71 combined in ~13 hours.**
+
+**The correlation is exact, and it is the whole diagnosis.** Every mbun builtin
+that declares itself a 1:1 port of node/bun source is healthy; every hand-written
+one carries the long tail:
+
+| ported (`1:1 translation` in header) | state |
+| --- | --- |
+| `node_stream_*` (12 partitions), `node_vm`, `node_module`, `node_strdec`, `node_perf`, `node_tls`, `process_web` | `test-stream` **237/249 = 95%**, `test-vm` 69 |
+
+| hand-written | actionable failures |
+| --- | ---: |
+| `node_worker.cppm` | test-worker **39** |
+| `node_http.cppm` | test-http **37** |
+| `node_test_runner.cppm` | test-runner **37** |
+| `async_hooks.cppm` | test-async **31** (worst green:fail ratio in the corpus) |
+| `node_net.cppm` | test-net **26** |
+| `node_repl.cppm` | test-repl 23 |
+| `node_timers.cppm`, `node_domain.cppm`, `node_cluster.cppm`, `node_v8.cppm`, `node_vm_modules.cppm`, `node_util_extra.cppm`, `node_process_extra.cppm`, … | the rest of the tail |
+
+So the "long tail" this campaign has been mining is not intrinsic to the corpus —
+it is the residue of hand-writing subsystems whose full source is vendored at
+`compat/node/lib/` and `compat/bun/src/js/`.
+
+**Corroborated from inside my own waves.** Lane H hit 15.0 files/hour, 4x the next
+best, and what it actually did was a *porting* action: it found hand-rolled
+`write`/`end` **shadowing** an already-correctly-ported Transform state machine and
+deleted the hand-rolled layer — 9 files from one architectural correction. The
+fix-shaped lanes managed 1.4–3.8. Lane G's two biggest wins were likewise
+*structural placement* (`shell` applied per entry point instead of inside
+`normalizeSpawnArgs`; the exec timeout in the plain-spawn function) — precisely the
+bug class that porting eliminates by construction. Lane B found **four independent
+copies** of one miscount that node's source contains once.
+
+### What a lane looks like now
+
+1. **Stage 1 — mechanical translation.** Fidelity over cleverness; do not "improve"
+   node's structure, its structure is the value. Reference implementation of the
+   pattern: `modules/jsc/src/builtins/node_stream_pipeline.cppm` (JS payload in a
+   C++ raw string, node/bun's branches and error text kept as blueprint,
+   `$`-intrinsics lowered onto shims, lazy cycle-breaking requires preserved so
+   init order matches).
+2. **Stage 2 — make it compile and run.** The shims are the work
+   (`internalBinding`, `internal/errors`, handle seams). Say explicitly what is
+   stubbed.
+3. **Stage 3 — measure.** Only then run the subtree.
+
+**A partial port that compiles and regresses nothing is a good outcome**, even at
+fewer files, because the next slice is then cheap. That is the opposite of the
+fix-shaped incentive.
+
+**Always test the SHADOWING hypothesis first — it is nearly free.** Where a
+hand-written partition sits over a ported one, monkeypatch from user JS to delete
+the suspect prototype methods and see what turns green before building anything.
+That is how lane H found its 9 files, and `node_http.cppm` / `node_net.cppm`
+hand-written over ported `node_stream_*` is exactly the same configuration.
+
+### Why I drifted, recorded so it does not recur
+
+The tooling optimises for the fix-shaped lane. `cluster_finder.py` and
+`corpus_diff.py` both point at individual failing files, and RESUME's own framing
+had hardened into "long tail". Neither ever asks "is this subsystem hand-written?".
+That question is the one that predicts yield, and nothing in the loop was asking
+it.
+
 ## 2026-07-30 18:30 — WAVE 57 lanes G, I, J + two findings that outlive them
 
 **Lane G — child_process: +16 (goal +6).** `test-child` **74 → 90**, 0 regressions

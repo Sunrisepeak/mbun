@@ -164,6 +164,44 @@ def is_struck(area: str, excluded: dict[str, dict[str, str]]) -> dict[str, str] 
     return None
 
 
+
+PORT_MARKERS = ("1:1 translation", "Mechanical 1:1", "机械翻译", "bun-ref")
+
+
+def builtin_shape(area: str, builtins_dir: Path) -> tuple[str, str]:
+    """Is the mbun builtin behind this area a PORT of the real source, or HAND-WRITTEN?
+
+    This is the question that predicts yield and the one nothing in the loop was
+    asking. Measured correlation: every partition declaring itself a 1:1 port of
+    node/bun source is healthy (the 12 `node_stream_*` partitions -> test-stream
+    237/249 = 95%), while the hand-written ones carry the entire long tail
+    (node_http 37 actionable, node_worker 39, async_hooks 31). The campaign's own
+    method for this is 移植三段法: translate the real source, fix what breaks,
+    optimise -- recorded in changelog.md at +111 corpus files in one wave, against
+    +71 for two waves of fix-by-fix lanes.
+    """
+    if not builtins_dir.is_dir():
+        return ("unknown", "")
+    token = area[5:] if area.startswith("test-") else area
+    token = token.split("/")[0].split("+")[0]
+    if len(token) < 2:
+        return ("unknown", "")
+    best: Path | None = None
+    for f in sorted(builtins_dir.glob("*.cppm")):
+        stem = f.stem
+        if stem == f"node_{token}" or stem == token:
+            best = f
+            break
+        if token in stem and best is None:
+            best = f
+    if best is None:
+        return ("unknown", "")
+    head = best.read_text(errors="replace")[:4000]
+    if any(m in head for m in PORT_MARKERS):
+        return ("port", best.name)
+    return ("hand-written", best.name)
+
+
 def throughput(ledger: list[dict[str, str]],
                excluded: dict[str, dict[str, str]] | None = None) -> dict[str, dict[str, float]]:
     """files/hour per corpus, from verified rows only. The mean plus the max, since
@@ -339,11 +377,16 @@ def cmd_plan(args, node_run, bun_run, ledger, excluded):
                 continue
             # Expected yield for a ~2h lane, never more than what is there to fix.
             expected = min(b["actionable"], rate * args.lane_hours)
+            shape, impl = builtin_shape(area, args.builtins) if corpus == "node" \
+                else ("unknown", "")
+            # A hand-written subsystem is a PORT candidate, and porting has measured
+            # ~3x the yield of fixing. Rank it above an equally dense ported area.
+            weight = 1.5 if shape == "hand-written" else 1.0
             candidates.append({
                 "corpus": corpus, "area": area, "green": b["green"],
                 "actionable": b["actionable"], "unverdicted": b["unverdicted"],
                 "rate": rate, "goal": max(1, int(expected * 0.75)),
-                "expected": expected,
+                "expected": expected * weight, "shape": shape, "impl": impl,
             })
     candidates.sort(key=lambda c: (-c["expected"], -c["actionable"]))
 
@@ -372,6 +415,12 @@ def cmd_plan(args, node_run, bun_run, ledger, excluded):
               f"/ no-verdict {c['unverdicted']}")
         print(f"     corpus rate {c['rate']:.1f} files/h x {args.lane_hours}h "
               f"-> GOAL +{c['goal']}")
+        if c.get("shape") == "hand-written":
+            print(f"     shape: HAND-WRITTEN ({c['impl']}) -> dispatch as a PORT lane "
+                  f"(移植三段法), not a fix lane")
+        elif c.get("shape") == "port":
+            print(f"     shape: already a 1:1 port ({c['impl']}) -> fix-shaped lane is "
+                  f"appropriate here")
     by_corpus: dict[str, int] = {}
     for c in chosen:
         by_corpus[c["corpus"]] = by_corpus.get(c["corpus"], 0) + 1
@@ -402,6 +451,9 @@ def main() -> int:
     ap.add_argument("--lane-hours", type=float, default=2.0)
     ap.add_argument("--min-actionable", type=int, default=8,
                     help="ignore areas with fewer actionable failures than this")
+    ap.add_argument("--builtins", type=Path,
+                    default=HERE.parent.parent / "modules/jsc/src/builtins",
+                    help="where to look up whether a subsystem is ported or hand-written")
     ap.add_argument("--min-per-corpus", type=int, default=2,
                     help="floor of lanes per corpus, so the slower one is not starved")
     ap.add_argument("--exclude", action="append", default=[],

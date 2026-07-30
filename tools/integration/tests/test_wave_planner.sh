@@ -110,6 +110,35 @@ echo "$o" | grep -qE 'actionable 20 / no-verdict 9' \
   || fail "timeouts must be reported as no-verdict, never folded into actionable"
 pass "timeout/oom/skip are excluded from actionable (that is how density gets overstated)"
 
+
+# --- port vs hand-written: the dimension that predicts yield -------------------
+# Measured correlation: ported partitions are healthy (node_stream_* -> test-stream
+# 237/249), hand-written ones carry the long tail. A plan must say which it is, so
+# a lane is dispatched as a PORT lane rather than a fix lane.
+mkdir -p "$tmp/builtins"
+printf '// Mechanical 1:1 translation of bun-ref src/js/x\nexport module a;\n' \
+  >"$tmp/builtins/node_ported.cppm"
+printf '// hand rolled, no port marker anywhere in this header\nexport module b;\n' \
+  >"$tmp/builtins/node_alpha.cppm"
+
+o3=$(out --plan 2 --node-run "$tmp/noderun" --builtins "$tmp/builtins")
+echo "$o3" | grep -q 'HAND-WRITTEN (node_alpha.cppm)' \
+  || fail "a hand-written subsystem must be flagged with its file"
+echo "$o3" | grep -q 'PORT lane' \
+  || fail "a hand-written subsystem must be routed to a port-shaped lane"
+pass "a hand-written subsystem is flagged and routed to a PORT lane"
+
+python3 - "$tmp/builtins" <<'INNER' || fail "builtin_shape must distinguish port from hand-written"
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path("tools/integration").resolve()))
+import wave_planner as wp
+d = pathlib.Path(sys.argv[1])
+assert wp.builtin_shape("test-ported", d)[0] == "port", wp.builtin_shape("test-ported", d)
+assert wp.builtin_shape("test-alpha", d)[0] == "hand-written", wp.builtin_shape("test-alpha", d)
+assert wp.builtin_shape("test-nosuchthing", d)[0] == "unknown"
+INNER
+pass "builtin_shape reads the port marker from the partition header"
+
 # --- coverage names the unreachable remainder --------------------------------
 o=$(out --coverage --node-run "$tmp/noderun" --bun-run "$tmp/bunrun")
 echo "$o" | grep -q 'in struck/blocked areas  15' || fail "coverage must count struck failures separately"
