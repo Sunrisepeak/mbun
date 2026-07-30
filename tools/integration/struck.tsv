@@ -1,0 +1,57 @@
+# Struck veins: work that has already been tried, sized, or measured and found not
+# worth doing. Consult this BEFORE starting a lane -- `check_struck.py <target>`.
+#
+# Why this file exists: the `bunfig` preload change was implemented and reverted
+# TWICE, costing the same 5 bun files both times, because the first retirement was
+# recorded only as prose in RESUME.md -- which is now ~2300 lines and no lane reads
+# end to end. A retired vein is only useful if the next lane trips over it.
+#
+# verdict values:
+#   COSTS_GREEN  implemented and measured; it loses files. Do not re-attempt as-is.
+#   TOO_BIG      real and correct, but the work is out of proportion to the files.
+#   BLOCKED      needs something unavailable (prebuilt JSC, docker, missing OpenSSL).
+#   NOT_A_BUG    the failure is the test doing what it is supposed to do.
+#   DECLINED     technically cheap, but wrong to do (gaming a metric, weakening a check).
+#   LOW_YIELD    measured and it moves ~nothing; the signature over-promised.
+#
+# Columns: area <TAB> target <TAB> verdict <TAB> cost_or_size <TAB> evidence
+#
+# Append-only. If you overturn an entry, do not delete it -- add a new row whose
+# evidence names the commit that overturned it, so the history stays auditable.
+#
+area	target	verdict	cost_or_size	evidence
+bun	bunfig preload	COSTS_GREEN	5 bun files, twice	implemented and reverted TWICE with the identical 5-file loss; this file exists because of it
+bun	bun:test snapshot / pretty-format output	COSTS_GREEN	18 bun files (15 via snapshot)	two separate attempts; snapshot output is asserted byte-for-byte across the corpus
+node	url.parse leniency	COSTS_GREEN	1 green node file	the lane's grep-based prediction was wrong; measured, reverted
+node	path.win32.toNamespacedPath bun trailing separator	COSTS_GREEN	test-path-makelong + test-path-resolve	bun asserts a trailing separator, node 26 asserts none, same input, no caller-side discriminator. Irreducible cross-corpus conflict
+node	Error.prototype.stack in V8 format	TOO_BIG	+2 files for ~5x error-construction cost	48ms -> 230ms per 200k; no native route since JSC is prebuilt. Re-confirmed by wave-56 lane D from a second direction
+node	tls as a cluster target	TOO_BIG	62 fixable, ~22 are the deferred handshake engine	6 more sit on the shared socket/stream handle path that produced wave-32's 41-file regression; remainder is one-file-per-fix
+node	node:test uncaughtException attribution	LOW_YIELD	gates exactly 1 file	the fixtures/test-runner/output/ family that exercises it is not vendored
+node	runtime-identity symbols (execPath, argv0, ...)	LOW_YIELD	10 screened, 1 cleared the gate	process.execPath has 281 non-passing references and zero divergence. Source references measure surface area, not blocked files
+node	trace_events (broad)	TOO_BIG	2 unsatisfiable, 11 need separate seams	passing the 2 would mean inventing V8 event names
+node	webcrypto as a cluster	LOW_YIELD	8 of 20 blocked on absent algorithms	predicted 3 paid 1; predicted 2-4 paid 1. The vendored OpenSSL lacks them
+node	Buffer pooling	TOO_BIG	sized and retired	see RESUME 2026-07-30 10:30
+node	Buffer.from(typedArray) codebase-wide audit	LOW_YIELD	sized and retired	not the landmine it looked like
+node	internal/macos-cross-config	NOT_A_BUG	-	a hand-copied table mirroring a vendored Rust macro
+node	async_hooks [0,0,0,0] grep	LOW_YIELD	-	grep-derived, did not survive log gating
+node	test-stream-iter-readable-interop.js	BLOCKED	1 file	reclassified known-blocked in wave 55
+node	test-runner-xfail.js	TOO_BIG	6+ distinct defects, 1 file	expectFailure label extraction, match validation, suite inheritance, empty-config rejection
+node	test-runner-misc.js	TOO_BIG	1 file, needs a new feature	per-test options.timeout must cancel a body and count as `cancelled`; not implemented at all
+node	test-runner-string-to-regexp.js	BLOCKED	1 file	JSC's RegExp flag message differs from V8's, and the assertion runs through node's real vendored utils.js -- mbun owns none of the code
+node	js parser "Unexpected ]"	LOW_YIELD	1 file	0 of 2982 logs in the full run contain that error, so it is not a shared cause; reduction is already 1-token-minimal
+node	test-runner-run.mjs summary diagnostics	COSTS_GREEN	risks the TAP trailer on every --test run	child must emit test:diagnostic for summary counts; duplicating the trailer trades a large green population for 1 file
+node	worker stack-overflow message text	COSTS_GREEN	6 bun sites assert JSC's trailing period	4 of the 6 are inline snapshots (plugins.test.ts:584, bun-inspect.test.ts:73,86, response.test.ts:163)
+node	ERR_WORKER_INVALID_EXEC_ARGV	COSTS_GREEN	7 green worker files pass execArgv	needs node's option table embedded; a too-tight allowlist regresses all 7
+node	worker internal/test/binding files	BLOCKED	2 files	needs node's internal test binding surface
+node	worker SharedArrayBuffer (shm-backed)	TOO_BIG	5 files, densest worker cluster left	an mbun worker is a child process, not a thread; needs shm SAB with the wire carrying a mapping handle, i.e. JSC external-backing-store work. Deferred, NOT disproven -- correct next capability lane if one is funded
+bun	napi addons	BLOCKED	51 of 55 files in napi/node-napi-tests	mbun exports 6 dynamic symbols, so no napi addon can load at all
+bun	js/sql (mysql, postgres)	BLOCKED	26 files	needs docker services; "Failed to build service mysql_plain"
+bun	js/valkey	BLOCKED	15 files	needs a docker redis service
+bun	bake/dev	TOO_BIG	18 files	gated on the whole HMR/incremental-bundler subsystem: Bun.serve() has no app/framework option, bun:internal-for-testing has no getDevServerDeinitCount. The stack-frame blocker behind it was fixed and the files STILL fail
+bun	bundler code splitting	TOO_BIG	13 diagnostics, gates 2 all-BF files	needs multi-chunk emit + shared-chunk extraction + cross-chunk imports in a bundler that emits exactly one chunk per entry
+bun	bundler HTML loader	TOO_BIG	22 tests, largest single-file prize	bundler_html.test.ts is all-bundler-caused, but 2 of the 22 also need splitting, so it cannot go green without it. Est. 600-1000 lines as a pair
+bun	bundler async-module linking	LOW_YIELD	33 diagnostics, flips 0 green files	27 of 33 are entry-module TLA only; every file it touches has large non-TLA failure counts
+bun	bundler_barrel.test.ts	NOT_A_BUG	28 diagnostics	those test files contain DELIBERATE syntax errors that barrel/optimizeImports tree-shaking must prevent from ever being parsed
+bun	--minify-syntax accepted as a silent no-op	DECLINED	+1 file for ~5 lines	reverses a deliberate fail-loudly decision at src/app.cppm:1683. Buying a corpus file by ignoring a user's flag is gaming. NOTE the real defect it exposed: Bun.build's API already ignores the minify flags while the CLI rejects them -- fixing THAT inconsistency is legitimate
+bun	process-nexttick.test.js "100,000 times"	NOT_A_BUG	passed-count only, not green	queues 100k ticks then `await 1` and expects all to have run; under node's ordering the await continuation is a microtask and runs first, so real node yields 0. bun's own bug -- do not replicate
+jsc	remove the process.nextTick promise-reaction arm	COSTS_GREEN	256 bun files (historical)	OVERTURNED IN PART by 1b1f56e: the arm must STAY (it is node's second arm, reaching ticks pushed from promise continuations). The cure keeps it and makes the reaction run runMicrotasks() first. Contract now pinned by tools/integration/tick_order_gate.py
