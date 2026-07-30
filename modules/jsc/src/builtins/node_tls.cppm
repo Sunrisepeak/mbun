@@ -429,6 +429,54 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
     }
     return "";
   };
+  // ---- node's `pfx` option: a PKCS#12 archive of cert + key + chain ----------
+  // PORT-SOURCE: compat/node/lib/internal/tls/secure-context.js:278-294
+  // configSecureContext -> context.loadPKCS12(toBuf(pfx)[, toBuf(passphrase)]).
+  //
+  // node opens the archive INSIDE SecureContext, so an unreadable one is an
+  // error thrown by createSecureContext() (and therefore by tls.connect(), which
+  // is where the corpus catches it). mbun previously ignored `pfx` outright: an
+  // invalid archive raised nothing at all and a valid one produced a client with
+  // no credentials, which then failed the handshake for an unrelated-looking
+  // reason. The container is DER/ASN.1 with password-encrypted contents, so the
+  // parse itself lives in C++ (mbun::tls::parse_pfx, reached through
+  // __mbunNodeTlsNative.pfxParse); this only shuttles the options.
+  //
+  // The recovered credentials are folded back into the options as cert/key/ca —
+  // the same three fields an explicit caller would have passed — so every layer
+  // below (the native key/cert check, and the live handshake reading
+  // `_secureOptions`) sees them without knowing a PFX was involved.
+  const toBuf = (v) => (typeof v === "string" && Buffer ? Buffer.from(v, "utf8") : v);
+  function applyPfx(options) {
+    const TN = G.__mbunNodeTlsNative;
+    if (!TN || typeof TN.pfxParse !== "function") return options;
+    const entries = Array.isArray(options.pfx) ? options.pfx : [options.pfx];
+    const certs = [], keys = [], cas = [];
+    for (const entry of entries) {
+      // node: `const raw = val.buf || val` — the `{ buf, passphrase }` form lets
+      // each archive in a list carry its own password, falling back to the
+      // top-level one.
+      const raw = (entry && entry.buf) ? entry.buf : entry;
+      const pass = (entry && entry.passphrase != null) ? entry.passphrase : options.passphrase;
+      const creds = TN.pfxParse(toBuf(raw), pass == null ? "" : String(pass));
+      if (creds.cert) certs.push(creds.cert);
+      if (creds.key) keys.push(creds.key);
+      if (Array.isArray(creds.ca)) for (const ca of creds.ca) cas.push(ca);
+    }
+    const out = Object.assign({}, options);
+    if (certs.length) out.cert = certs.length === 1 ? certs[0] : certs;
+    if (keys.length) out.key = keys.length === 1 ? keys[0] : keys;
+    // The key recovered from the archive is already decrypted. Leaving the
+    // ARCHIVE's passphrase in place would hand it to the PEM reader as if it
+    // were the key's own, which is a different secret entirely.
+    out.passphrase = undefined;
+    if (cas.length) {
+      const existing = options.ca == null ? []
+        : (Array.isArray(options.ca) ? options.ca.slice() : [options.ca]);
+      out.ca = existing.concat(cas);
+    }
+    return out;
+  }
   function newNativeSecureContext(options) {
     options = options == null ? {} : options;
     if (asym && typeof asym.x509parse === "function") {
@@ -517,7 +565,32 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
             throw ERR_INVALID_ARG_TYPE("options.privateKeyIdentifier", ["string", "null", "undefined"], privateKeyIdentifier);
         }
       }
+      // node's configSecureContext opens `pfx` after cert/key/ca and before the
+      // engine options, and the credentials it recovers are what the context is
+      // then built from. Resolving it here keeps that order and means the native
+      // key/cert check below judges the REAL credentials.
+      if (options && options.pfx !== undefined && options.pfx !== null) {
+        options = applyPfx(options);
+      }
       this.context = newNativeSecureContext(options);
+      // PORT-SOURCE: compat/node/lib/internal/tls/secure-context.js:234-239 —
+      //   if (context.setEngineKey) context.setEngineKey(id, engine);
+      //   else throw new ERR_CRYPTO_CUSTOM_ENGINE_NOT_SUPPORTED();
+      // The type checks above are node's, but node then ASKS THE CONTEXT whether
+      // it can load a key through an OpenSSL ENGINE, and refuses when it cannot.
+      // mbun's SecureContext has no setEngineKey (the vendored OpenSSL 3.1.5 is
+      // built without ENGINE support, which is also why `clientCertEngine` throws
+      // this same error a few lines up), so a `privateKeyEngine` option was being
+      // accepted and then silently ignored: the process ran on with no private
+      // key at all instead of saying so. Checked AFTER the context is built,
+      // exactly as node does, so it is the context that decides.
+      if (options && typeof options.privateKeyIdentifier === "string" &&
+          typeof options.privateKeyEngine === "string") {
+        if (this.context && typeof this.context.setEngineKey === "function")
+          this.context.setEngineKey(options.privateKeyIdentifier, options.privateKeyEngine);
+        else
+          throw ERR_CRYPTO_CUSTOM_ENGINE_NOT_SUPPORTED("Custom engines not supported by this OpenSSL");
+      }
       this.servername = options ? options.servername : undefined;
       // Keep the validated options: node hands a SecureContext to
       // `new tls.TLSSocket(sock, { secureContext })` and the live handshake layer

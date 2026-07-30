@@ -129,6 +129,40 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // ── `--tls-min-v1.3` together with `--tls-max-v1.2` is an EMPTY protocol
+    //    window: the floor is above the ceiling, so no version could ever be
+    //    negotiated. node rejects it during option parsing rather than letting a
+    //    process start that can never complete a handshake.
+    //    PORT-SOURCE: compat/node/src/node_options.cc:206 PerProcessOptions::
+    //    CheckOptions — `if (tls_min_v1_3 && tls_max_v1_2)` pushes
+    //    "either --tls-min-v1.3 or --tls-max-v1.2 can be used, not both", which
+    //    node prints and exits 9 on. The other combinations (min-v1.2 with
+    //    max-v1.3, …) are legal windows and are NOT checked here, exactly as
+    //    node does not check them.
+    //    Same raw-command-line guards as the --unhandled-rejections block above:
+    //    stop at the first non-option or eval flag so an `-e` program that merely
+    //    mentions the strings is not read as a request.
+    {
+        bool minV13{};
+        bool maxV12{};
+        for (int i{1}; i < argc; ++i) {
+            const std::string_view a{argv[i]};
+            if (a == "-e" || a == "--eval" || a == "-p" || a == "--print" || a == "-pe" ||
+                a == "-ep") {
+                break;
+            }
+            if (!a.starts_with("-")) break;
+            if (a == "--tls-min-v1.3") minV13 = true;
+            else if (a == "--tls-max-v1.2") maxV12 = true;
+        }
+        if (minV13 && maxV12) {
+            std::println(std::cerr,
+                         "{}: either --tls-min-v1.3 or --tls-max-v1.2 can be used, not both",
+                         argc > 0 ? argv[0] : "mbun");
+            return 9;
+        }
+    }
+
     // process.execArgv — derived from the raw command line before any flag loop
     //    consumes it, exactly as bun does (node_process.rs create_exec_argv).
     //    Every dispatch below (node emulation, `run`, bare script) shares it; a

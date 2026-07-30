@@ -13,6 +13,7 @@ module;
 #include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
+#include <openssl/pkcs12.h>
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
@@ -1345,6 +1346,117 @@ std::string check_key_cert_pair(std::string_view certPem, std::string_view keyPe
         }
     }
     return finish({});
+}
+
+// PORT-SOURCE: compat/node/src/crypto/crypto_context.cc:2140-2249
+// SecureContext::SetPFX. Same order, same three failure classes; see the
+// contract in openssl.cppm.
+PfxCredentials parse_pfx(std::span<const std::uint8_t> der, std::string_view passphrase) {
+    ensure_library();
+    ::ERR_clear_error();
+    PfxCredentials out {};
+    const auto fail = [&out](std::string code, std::string message) {
+        out.certPem.clear();
+        out.keyPem.clear();
+        out.caPems.clear();
+        out.errorCode = std::move(code);
+        out.errorMessage = std::move(message);
+        ::ERR_clear_error();
+    };
+    // node's `done:` label. An OpenSSL 3 "unsupported" reason with no context is
+    // what a legacy (RC2 / 40-bit RC4) archive produces when the legacy provider
+    // is not loaded, and node overrides that unhelpful string with its own.
+    const auto openssl_failure = [&fail]() {
+        const unsigned long code {::ERR_get_error()};  // NOLINT(runtime/int)
+        if (ERR_GET_REASON(code) == ERR_R_UNSUPPORTED) {
+            fail("ERR_CRYPTO_UNSUPPORTED_OPERATION", "Unsupported PKCS12 PFX data");
+            return;
+        }
+        const char* reason {::ERR_reason_error_string(code)};
+        fail({}, reason != nullptr ? std::string {reason} : std::string {"Unknown error"});
+    };
+
+    if (der.empty()) {
+        fail("ERR_CRYPTO_OPERATION_FAILED", "Unable to load PFX certificate");
+        return out;
+    }
+    BIO* in {::BIO_new_mem_buf(der.data(), static_cast<int>(der.size()))};
+    if (in == nullptr) {
+        fail("ERR_CRYPTO_OPERATION_FAILED", "Unable to load PFX certificate");
+        return out;
+    }
+    PKCS12* p12 {nullptr};
+    EVP_PKEY* pkey {nullptr};
+    X509* cert {nullptr};
+    STACK_OF(X509)* extraCerts {nullptr};
+    const auto cleanup = [&] {
+        if (extraCerts != nullptr) sk_X509_pop_free(extraCerts, ::X509_free);
+        if (cert != nullptr) ::X509_free(cert);
+        if (pkey != nullptr) ::EVP_PKEY_free(pkey);
+        if (p12 != nullptr) ::PKCS12_free(p12);
+        ::BIO_free(in);
+    };
+
+    if (::d2i_PKCS12_bio(in, &p12) == nullptr) {
+        openssl_failure();
+        cleanup();
+        return out;
+    }
+    // Empty is the EMPTY password, not "no password": PKCS12_parse takes a
+    // NUL-terminated C string and a null pointer means something else to it.
+    const std::string pass {passphrase};
+    if (::PKCS12_parse(p12, pass.c_str(), &pkey, &cert, &extraCerts) != 1) {
+        openssl_failure();
+        cleanup();
+        return out;
+    }
+    if (pkey == nullptr) {
+        fail("ERR_CRYPTO_OPERATION_FAILED", "Unable to load private key from PFX data");
+        cleanup();
+        return out;
+    }
+    if (cert == nullptr) {
+        fail("ERR_CRYPTO_OPERATION_FAILED", "Unable to load certificate from PFX data");
+        cleanup();
+        return out;
+    }
+
+    // Re-serialise to PEM: that is the form every other entry point in this
+    // layer (Config::certificate / ::key / ::ca, check_key_cert_pair) consumes.
+    const auto to_pem = [](auto&& writer) -> std::string {
+        BIO* mem {::BIO_new(::BIO_s_mem())};
+        if (mem == nullptr) return {};
+        std::string text {};
+        if (writer(mem) == 1) {
+            char* data {nullptr};
+            const long len {::BIO_get_mem_data(mem, &data)};
+            if (data != nullptr && len > 0) text.assign(data, static_cast<std::size_t>(len));
+        }
+        ::BIO_free(mem);
+        return text;
+    };
+    out.certPem = to_pem([cert](BIO* b) { return ::PEM_write_bio_X509(b, cert); });
+    out.keyPem = to_pem([pkey](BIO* b) {
+        return ::PEM_write_bio_PrivateKey(b, pkey, nullptr, nullptr, 0, nullptr, nullptr);
+    });
+    if (out.certPem.empty() || out.keyPem.empty()) {
+        openssl_failure();
+        cleanup();
+        return out;
+    }
+    // node adds every extra cert to the context's store AND to the client-CA
+    // list; here they are reported as `ca` entries and the caller decides.
+    if (extraCerts != nullptr) {
+        for (int i {0}; i < sk_X509_num(extraCerts); ++i) {
+            X509* ca {sk_X509_value(extraCerts, i)};
+            if (ca == nullptr) continue;
+            std::string pem {to_pem([ca](BIO* b) { return ::PEM_write_bio_X509(b, ca); })};
+            if (!pem.empty()) out.caPems.push_back(std::move(pem));
+        }
+    }
+    cleanup();
+    ::ERR_clear_error();
+    return out;
 }
 
 std::vector<std::string> platform_root_certificates() {

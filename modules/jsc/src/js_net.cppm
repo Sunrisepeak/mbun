@@ -349,13 +349,23 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
   // node's initial default is 500ms; the test harness (common/index.js) reads it,
   // multiplies by 5 and re-sets it (→ 2500), which is what tests assert against.
   let autoSelectFamilyAttemptTimeoutDefault = 500;
-  const normalizedArgsSymbol = () => {
-    try {
-      const internalNet = typeof G.require === "function" ? G.require("internal/net") : null;
-      return internalNet && typeof internalNet.normalizedArgsSymbol === "symbol"
-        ? internalNet.normalizedArgsSymbol : null;
-    } catch (e) { return null; }
-  };
+  // ---- node lib/internal/net.js symbols --------------------------------------
+  // PORT-SOURCE: compat/node/lib/internal/net.js module.exports.
+  //
+  // These have to be minted HERE, not read back out of node's own lib file.
+  // Unregistered, `require("internal/net")` resolves through
+  // compat/node/tsconfig.json's `"internal/*": ["./lib/internal/*"]` mapping to
+  // node's real lib/internal/net.js, which mints a FRESH set of Symbols that
+  // nothing in mbun ever writes under — so a test reading socket[kSetKeepAlive]
+  // off that copy saw `undefined` on a socket whose keep-alive was armed. One
+  // set of symbols, minted by the layer that stores under them; the module id is
+  // registered (gated) further down so requiring it yields these same symbols.
+  const kSetNoDelay = Symbol("kSetNoDelay");
+  const kSetKeepAlive = Symbol("kSetKeepAlive");
+  const kSetKeepAliveInitialDelay = Symbol("kSetKeepAliveInitialDelay");
+  const kReinitializeHandle = Symbol("kReinitializeHandle");
+  const kNormalizedArgs = Symbol("normalizedArgs");
+  const normalizedArgsSymbol = () => kNormalizedArgs;
   const normalizeArgs = (args) => {
     const list = Array.from(args || []);
     const options = list[0] && typeof list[0] === "object" ? list[0] : {};
@@ -552,9 +562,9 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
         }
         if (opts.keepAliveInitialDelay < 0) opts.keepAliveInitialDelay = 0;
       }
-      this._kSetNoDelay = Boolean(opts.noDelay);
-      this._kSetKeepAlive = Boolean(opts.keepAlive);
-      this._kSetKeepAliveDelay = ~~(opts.keepAliveInitialDelay / 1000);
+      this[kSetNoDelay] = Boolean(opts.noDelay);
+      this[kSetKeepAlive] = Boolean(opts.keepAlive);
+      this[kSetKeepAliveInitialDelay] = ~~(opts.keepAliveInitialDelay / 1000);
       if (opts.typeOfService !== undefined) validateTOS(opts.typeOfService, "options.typeOfService");
       this._kSetTOS = opts.typeOfService;
         // http's read-side interception and park queue (w5/agent-http): a socket
@@ -1005,8 +1015,8 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
     _applyDeferredSockOpts() {
       const h = this._handle;
       if (!h) return;
-      if (this._kSetNoDelay && h.setNoDelay) h.setNoDelay(true);
-      if (this._kSetKeepAlive && h.setKeepAlive) h.setKeepAlive(true, this._kSetKeepAliveDelay);
+      if (this[kSetNoDelay] && h.setNoDelay) h.setNoDelay(true);
+      if (this[kSetKeepAlive] && h.setKeepAlive) h.setKeepAlive(true, this[kSetKeepAliveInitialDelay]);
       if (this._kSetTOS !== undefined && h.setTypeOfService) {
         const err = h.setTypeOfService(this._kSetTOS);
         if (err) this.emit("error", mkErr("setTypeOfService returned " + err, "ERR_SOCKET_SETTOS"));
@@ -1093,9 +1103,9 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
     // reach the handle a second time).
     setNoDelay(enable) {
       enable = Boolean(enable === undefined ? true : enable);
-      if (!this._handle) { this._kSetNoDelay = enable; return this; }
-      if (this._handle.setNoDelay && enable !== this._kSetNoDelay) {
-        this._kSetNoDelay = enable;
+      if (!this._handle) { this[kSetNoDelay] = enable; return this; }
+      if (this._handle.setNoDelay && enable !== this[kSetNoDelay]) {
+        this[kSetNoDelay] = enable;
         this._handle.setNoDelay(enable);
       }
       return this;
@@ -1107,12 +1117,12 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       enable = Boolean(enable);
       const initialDelay = ~~(initialDelayMsecs / 1000);
       if (!this._handle) {
-        this._kSetKeepAlive = enable; this._kSetKeepAliveDelay = initialDelay;
+        this[kSetKeepAlive] = enable; this[kSetKeepAliveInitialDelay] = initialDelay;
         return this;
       }
       if (!this._handle.setKeepAlive) return this;
-      if (enable !== this._kSetKeepAlive || (enable && this._kSetKeepAliveDelay !== initialDelay)) {
-        this._kSetKeepAlive = enable; this._kSetKeepAliveDelay = initialDelay;
+      if (enable !== this[kSetKeepAlive] || (enable && this[kSetKeepAliveInitialDelay] !== initialDelay)) {
+        this[kSetKeepAlive] = enable; this[kSetKeepAliveInitialDelay] = initialDelay;
         this._handle.setKeepAlive(enable, initialDelay);
       }
       return this;
@@ -2117,12 +2127,12 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       // already adopts; this one is the one the corpus actually takes.
       adoptPeer(sock, clientHandle.fd);
       if (this.noDelay && clientHandle.setNoDelay) {
-        sock._kSetNoDelay = true;
+        sock[kSetNoDelay] = true;
         clientHandle.setNoDelay(true);
       }
       if (this.keepAlive && clientHandle.setKeepAlive) {
-        sock._kSetKeepAlive = true;
-        sock._kSetKeepAliveDelay = this.keepAliveInitialDelay;
+        sock[kSetKeepAlive] = true;
+        sock[kSetKeepAliveInitialDelay] = this.keepAliveInitialDelay;
         clientHandle.setKeepAlive(true, this.keepAliveInitialDelay);
       }
       sock.localPort = this._addr ? this._addr.port : 0;
@@ -2908,6 +2918,65 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
     setDefaultAutoSelectFamily, getDefaultAutoSelectFamily,
     _normalizeArgs: normalizeArgs,
   }));
+
+  // ---- node's `internal/net`, served from THIS net ----------------------------
+  // PORT-SOURCE: compat/node/lib/internal/net.js module.exports.
+  //
+  // Registered so the symbols above are THE symbols `require("internal/net")`
+  // hands back. Left unregistered the id resolves, through
+  // compat/node/tsconfig.json's `"internal/*": ["./lib/internal/*"]`, to node's
+  // own lib file, whose Symbol() calls mint a second, disjoint set — and every
+  // one of them then reads `undefined` off an mbun socket that does carry the
+  // value. Registering as a builtin short-circuits require() before the resolver
+  // runs (builtin_module in runtime/process_extended.inc).
+  //
+  // GATED behind --expose-internals, exactly as internal/repl is
+  // (builtins/node_repl.cppm): `internal/*` is node's private namespace, so
+  // handing it to an ordinary program would both expose internals and let any
+  // package shipping its own `internal/net` be shadowed by this one.
+  // builtin_module treats `undefined` as "not a builtin" and falls through to
+  // normal resolution. The check is lazy because the module is registered before
+  // process.execArgv is necessarily final. Non-enumerable so `Object.keys(M)` —
+  // the source of module.builtinModules — never lists it.
+  {
+    // node lib/internal/net.js isLoopback(): a HOST-NAME test, not an address
+    // range test — it is deliberately narrower than "in 127.0.0.0/8 or ::1".
+    const isLoopback = (host) => {
+      const hostLower = String(host).toLowerCase();
+      return hostLower === "localhost" || hostLower.startsWith("127.") ||
+             hostLower === "[::1]" || hostLower === "[0:0:0:0:0:0:0:1]";
+    };
+    // node's makeSyncWrite closes over internalBinding('fs').writeBuffer to give
+    // a handle a BLOCKING write path (child_process stdio on a pipe). mbun's
+    // reactor has no synchronous-write handle, so there is nothing faithful to
+    // return. Throwing names that; returning undefined would fail later, at the
+    // call site, as "handle._write is not a function".
+    const makeSyncWrite = () => {
+      const e = new Error("internal/net makeSyncWrite is not implemented in mbun " +
+                          "(DEFERRED: needs a blocking write path on the reactor handle)");
+      e.code = "ERR_METHOD_NOT_IMPLEMENTED";
+      throw e;
+    };
+    const internalNet = {
+      kReinitializeHandle, kSetNoDelay, kSetKeepAlive, kSetKeepAliveInitialDelay,
+      isIP, isIPv4, isIPv6, makeSyncWrite,
+      normalizedArgsSymbol: kNormalizedArgs, isLoopback,
+    };
+    const exposeInternals = () => {
+      const argv = (G.process && G.process.execArgv) || [];
+      for (const a of argv) if (a === "--expose-internals") return true;
+      return false;
+    };
+    Object.defineProperty(M, "internal/net", {
+      get() { return exposeInternals() ? internalNet : undefined; },
+      set(v) {
+        Object.defineProperty(M, "internal/net", {
+          value: v, writable: true, enumerable: false, configurable: true,
+        });
+      },
+      enumerable: false, configurable: true,
+    });
+  }
 
   // node lib/tty.js: `ReadStream extends net.Socket` / `WriteStream extends
   // net.Socket`. node:tty is built before net exists here (it lives in the

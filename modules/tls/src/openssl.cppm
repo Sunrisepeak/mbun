@@ -159,6 +159,43 @@ export std::string check_key_cert_pair(std::string_view certPem, std::string_vie
                                        std::string_view passphrase,
                                        std::string_view ciphers = {});
 
+// node's `pfx` option: a PKCS#12 archive carrying the certificate, its private
+// key and any chain certificates in one DER blob. node loads it in
+// SecureContext::SetPFX and it is a HARD FAILURE if it cannot — an unreadable
+// archive means the caller has no credentials at all, which must be said at
+// createSecureContext() time rather than discovered as a handshake failure.
+//
+// PORT-SOURCE: compat/node/src/crypto/crypto_context.cc:2140-2249
+// SecureContext::SetPFX. The failure taxonomy is node's, exactly:
+//   - no private key in the archive  → ERR_CRYPTO_OPERATION_FAILED
+//                                      "Unable to load private key from PFX data"
+//   - no certificate in the archive  → ERR_CRYPTO_OPERATION_FAILED
+//                                      "Unable to load certificate from PFX data"
+//   - OpenSSL 3 reason ERR_R_UNSUPPORTED (what a legacy RC2/40-bit archive
+//     produces once the legacy provider is not loaded)
+//                                    → ERR_CRYPTO_UNSUPPORTED_OPERATION
+//                                      "Unsupported PKCS12 PFX data"
+//   - anything else                  → a plain Error carrying OpenSSL's own
+//                                      reason string (a wrong passphrase reads
+//                                      as "mac verify failure").
+//
+// `passphrase` decrypts the archive; empty means the EMPTY password, never a
+// prompt. The recovered key is handed back as an UNENCRYPTED PEM because that is
+// the form the rest of this layer consumes — it is the same secret that was
+// already resident in the caller's own `pfx` buffer, in the same process, and it
+// is never written anywhere.
+export struct PfxCredentials {
+    std::string certPem {};                // the leaf certificate
+    std::string keyPem {};                 // its private key, unencrypted PEM
+    std::vector<std::string> caPems {};    // chain / CA certificates, in archive order
+    // Empty errorMessage == success. errorCode is the node error code to attach,
+    // or empty for a plain Error (node's `env->ThrowError(reason)` path).
+    std::string errorMessage {};
+    std::string errorCode {};
+};
+
+export PfxCredentials parse_pfx(std::span<const std::uint8_t> der, std::string_view passphrase);
+
 // Every certificate in the platform trust store, as PEM. node ships the Mozilla
 // NSS root set in src/node_root_certs.h and exposes it as tls.rootCertificates;
 // mbun has no vendored bundle, so it reports the store it actually verifies

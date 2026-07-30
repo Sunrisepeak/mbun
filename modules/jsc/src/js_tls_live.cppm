@@ -368,7 +368,17 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
       // — when a transport is adopted the transport decides (a net.Socket
       // defaults to false), and only a socket-less TLSSocket honours the option.
       const halfOpen = socket ? !!socket.allowHalfOpen : !!options.allowHalfOpen;
-      super({ allowHalfOpen: halfOpen, highWaterMark: options.highWaterMark });
+      // PORT-SOURCE: compat/node/lib/internal/tls/wrap.js:590-601 — TLSSocket's
+      // net.Socket call forwards noDelay / keepAlive / keepAliveInitialDelay. In
+      // node the TLSSocket IS the connecting socket, so the Socket constructor is
+      // where those land; mbun's rides a hidden transport, and dropping them here
+      // left the TLSSocket reporting keep-alive off for a connection that had
+      // asked for it. They are CACHED options either way — net.Socket only pushes
+      // them to a handle once one exists — so forwarding them is a record of what
+      // the caller asked for, not a second syscall.
+      super({ allowHalfOpen: halfOpen, highWaterMark: options.highWaterMark,
+              noDelay: options.noDelay, keepAlive: options.keepAlive,
+              keepAliveInitialDelay: options.keepAliveInitialDelay });
       this.allowHalfOpen = halfOpen;
       this.encrypted = true;
       this.authorized = false;
@@ -718,10 +728,35 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
     }
     // node getX509Certificate()/getPeerX509Certificate(): the same certificates
     // getCertificate()/getPeerCertificate() report, as crypto.X509Certificate
-    // objects. DEFERRED: `issuerCertificate` chain walking (needs the verified
-    // chain out of the SSL*, not just the leaf).
+    // objects.
     getX509Certificate() { return x509Of(this._ownCertPem); }
-    getPeerX509Certificate() { return x509Of(this._peerCertPem); }
+    // node crypto_tls.cc TLSWrap::GetPeerX509Certificate walks the whole peer
+    // chain and links each certificate to its issuer. The chain is the one the
+    // handshake already verified (`_peerChainPem`, leaf first) — the same list
+    // getPeerCertificate(true) walks — so this adds no trust decision of its
+    // own, it only reports what was verified.
+    //
+    // The terminator differs from getPeerCertificate(true) and the difference is
+    // asserted: there node makes the ROOT point at ITSELF (a loop the corpus
+    // walks until `cert === cert.issuerCertificate`), while the X509 chain
+    // simply ENDS, so the root's issuerCertificate is `undefined`
+    // (test-tls-getcertificate-x509 checks exactly that).
+    getPeerX509Certificate() {
+      const chain = (Array.isArray(this._peerChainPem) && this._peerChainPem.length)
+        ? this._peerChainPem : (this._peerCertPem ? [this._peerCertPem] : []);
+      if (!chain.length) return undefined;
+      const certs = [];
+      for (const pem of chain) {
+        const c = x509Of(pem);
+        // An unparseable link ends the walk rather than dropping the leaf: the
+        // caller still gets the certificate the peer presented.
+        if (c === undefined) break;
+        certs.push(c);
+      }
+      if (!certs.length) return undefined;
+      for (let i = 0; i + 1 < certs.length; i++) certs[i].issuerCertificate = certs[i + 1];
+      return certs[0];
+    }
     getCipher() {
       const n = this._cipherName || "";
       if (!n) return {};
@@ -895,6 +930,15 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
     validateNumber(opts.minDHSize, "options.minDHSize", 1);
     const secureContext = opts.secureContext || (typeof T.createSecureContext === "function"
       ? T.createSecureContext(opts) : undefined);
+    // A `pfx` archive carries the certificate, its key and the chain in one
+    // blob. createSecureContext has just opened it (throwing here if it could
+    // not — which is what test-tls-invalid-pfx / test-tls-legacy-pfx catch), so
+    // read the recovered cert/key/ca back off the context it produced. The
+    // handshake options below are built from `opts`, where `pfx` is still an
+    // unopened Buffer, so without this a client that authenticated with a PFX
+    // presented no certificate at all.
+    const creds = (opts.pfx != null && secureContext && secureContext._secureOptions)
+      ? secureContext._secureOptions : opts;
     if (opts.servername && netIsIP(opts.servername)) {
       throw invalidArgValue("options.servername", opts.servername,
         "Setting the TLS ServerName to an IP address is not permitted");
@@ -912,17 +956,26 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
     // native and unchanged. Chain verification is unaffected in both cases.
     const customIdentity = typeof opts.checkServerIdentity === "function" &&
       opts.checkServerIdentity !== T.checkServerIdentity ? opts.checkServerIdentity : null;
-    const tlsOpts = { isServer: false, servername, ca: opts.ca, cert: opts.cert, key: opts.key, rejectUnauthorized: opts.rejectUnauthorized, ALPNProtocols: opts.ALPNProtocols,
+    const tlsOpts = { isServer: false, servername, ca: creds.ca, cert: creds.cert, key: creds.key, rejectUnauthorized: opts.rejectUnauthorized, ALPNProtocols: opts.ALPNProtocols,
       minVersion: opts.minVersion, maxVersion: opts.maxVersion, secureProtocol: opts.secureProtocol, secureContext: opts.secureContext,
       ciphers: opts.ciphers, checkServerIdentity: customIdentity, identityHost: servername || host,
       // node configSecureContext setKey(pem, options.passphrase): a top-level
       // passphrase is the one that decrypts a plain (non-`{pem,…}`) key, so it
       // has to reach the handshake options or every encrypted-key client fell
       // over with "socket disconnected before secure TLS connection".
-      passphrase: opts.passphrase,
+      // `creds`, not `opts`: a key recovered from a PFX comes back already
+      // decrypted, and the archive's passphrase is NOT that key's passphrase.
+      passphrase: creds.passphrase,
       // node internal/tls/wrap.js connect(): `session` is handed to
       // tlssock.setSession() before the socket connects.
-      session: opts.session };
+      session: opts.session,
+      // PORT-SOURCE: compat/node/lib/internal/tls/wrap.js:597-600 — the socket
+      // options node's TLSSocket hands down to net.Socket. They also reach the
+      // transport through `netOpts` below; both are needed, because the caller
+      // reads them back off the TLSSocket and the transport is the thing that
+      // owns the fd.
+      noDelay: opts.noDelay, keepAlive: opts.keepAlive,
+      keepAliveInitialDelay: opts.keepAliveInitialDelay };
 
     if (isMbunNetSocket(transportOpt)) {
       const tlsSock = new TLSSocket(transportOpt, tlsOpts);
@@ -998,7 +1051,17 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
       // the constructor, so an unusable option (a cipher list OpenSSL matches
       // nothing to, a bad secureProtocol, …) throws from createServer() rather
       // than at the first connection.
-      if (T && typeof T.createSecureContext === "function") T.createSecureContext(options || {});
+      let builtContext;
+      if (T && typeof T.createSecureContext === "function") builtContext = T.createSecureContext(options || {});
+      // A `pfx` server option is a PKCS#12 archive holding the certificate, its
+      // key and the chain. createSecureContext has just opened it (and threw if
+      // it could not); read the recovered cert/key/ca back off the context, or
+      // `_sharedCreds` below carries an unopened Buffer and every accepted
+      // connection is answered with "no shared cipher" — the server would have
+      // had no certificate at all.
+      if (options && options.pfx != null && builtContext && builtContext._secureOptions) {
+        options = builtContext._secureOptions;
+      }
       // node internal/tls/wrap.js Server: the negotiated ALPN list is published on
       // the server in its length-prefixed wire form (tls.convertALPNProtocols),
       // which node:https then compares against (test-https-argument-of-creating).
