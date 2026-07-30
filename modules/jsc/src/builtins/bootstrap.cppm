@@ -863,6 +863,8 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   const PObjectIs = Object.is;
   const PArrayIsArray = Array.isArray;
   const PArrayFrom = Array.from;
+  const PArrayProtoSlice = Array.prototype.slice;
+  const PArrayProtoMap = Array.prototype.map;
   const PJSONStringify = JSON.stringify;
   const PObjectProtoToString = Object.prototype.toString;
   const PObjectProtoHasOwn = Object.prototype.hasOwnProperty;
@@ -963,6 +965,22 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     if (t === "symbol") return col(32, 39, v.toString());
     if (t === "string") {
       if (bun) return col(32, 39, PJSONStringify(v));
+      // PORT-SOURCE: compat/node/lib/internal/util/inspect.js formatPrimitive —
+      // a string longer than ctx.maxStringLength (default 10000) is sliced and a
+      // "... n more characters" trailer rides OUTSIDE the closing quote. `null`
+      // means Infinity, exactly as ctx normalisation does it. Applied only on the
+      // node layout: Bun.inspect does not cap string length.
+      let trailer = "";
+      {
+        const ms = opts.maxStringLength === null ? Infinity
+          : (typeof opts.maxStringLength === "number" ? opts.maxStringLength
+             : gInspectDefaultsStore.maxStringLength);
+        if (v.length > ms) {
+          const rem = v.length - ms;
+          v = v.slice(0, ms);
+          trailer = "... " + rem + " more character" + (rem > 1 ? "s" : "");
+        }
+      }
       // ref node lib/internal/util/inspect.js strEscape: the quote is chosen so
       // the contents need the fewest escapes — single, then double, then
       // backtick — and only the chosen quote is escaped. Always single-quoting
@@ -974,7 +992,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
         if (!v.includes('"')) { q = '"'; re = PStrEscReSingle; }
         else if (!v.includes("`") && !v.includes("${")) { q = "`"; re = PStrEscReSingle; }
       }
-      return col(32, 39, q + v.replace(re, PStrEscFn) + q);
+      return col(32, 39, q + v.replace(re, PStrEscFn) + q) + trailer;
     }
     if (t === "function") {
       const n = v.name;
@@ -1138,17 +1156,38 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     // line and the closing delimiter its own line too (util.inspect's
     // reduceToSingleString "compact === false" branch).
     const noCompact = opts.compact === false;
+    // PORT-SOURCE: compat/node/lib/internal/util/inspect.js — inspectDefaultOptions
+    // .maxArrayLength (100) + `remainingText`. Every list-shaped formatter
+    // (formatArray, formatTypedArray, formatSet, formatMap) renders at most
+    // min(max(0, ctx.maxArrayLength), length) entries and appends
+    // "... n more item(s)" for the rest; `null` means Infinity. mbun rendered
+    // EVERY element, so a 1000-element array printed 1000 entries where node and
+    // bun both stop at 100 — and inspecting a huge array cost O(n) formatting
+    // instead of O(100).
+    const maxArrayLength = opts.maxArrayLength === null ? Infinity
+      : (typeof opts.maxArrayLength === "number"
+           ? (opts.maxArrayLength > 0 ? opts.maxArrayLength : 0)
+           : gInspectDefaultsStore.maxArrayLength);
+    const remainingText = (r) => "... " + r + " more item" + (r > 1 ? "s" : "");
     const nodeBlock = (label, items, open, close) => {
       if (!items.length) return label + open + close;
       if (noCompact) return label + open + "\n" + items.map((it) => inner + it).join(",\n") + "\n" + outer + close;
       return label + open + " " + items.join(", ") + " " + close;
     };
     if (PArrayIsArray(v)) {
-      const items = v.map((x) => inspectValue(x, opts, seen, depth + 1));
+      // formatArray: slice first, THEN format — the slice keeps holes (so a
+      // sparse array still renders its empty slots the way it did) while the
+      // elements past the cap are never inspected at all.
+      const valLen = v.length;
+      const shown = valLen < maxArrayLength ? valLen : maxArrayLength;
+      const src = shown < valLen ? PArrayProtoSlice.call(v, 0, shown) : v;
+      const items = PArrayProtoMap.call(src, (x) => inspectValue(x, opts, seen, depth + 1));
+      const remaining = valLen - shown;
+      if (remaining > 0) items.push(remainingText(remaining));
       if (!items.length) result = "[]";
       else if (bun) {
         const oneLine = "[ " + items.join(", ") + " ]";
-        const complex = v.some((x) => x !== null && typeof x === "object" && !PArrayIsArray(x));
+        const complex = src.some((x) => x !== null && typeof x === "object" && !PArrayIsArray(x));
         const hasNL = items.some((s) => s.indexOf("\n") >= 0);
         result = (bunCompact || (!complex && !hasNL && oneLine.length <= 72)) ? oneLine : "[\n" + inner + items.join(", ") + "\n" + outer + "]";
       } else result = nodeBlock("", items, "[", "]");
@@ -1157,16 +1196,36 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       // Indexed reads instead of `const [k, val] of v`: array destructuring of
       // each entry pair goes through Array.prototype[Symbol.iterator], which the
       // corpus deletes on purpose. Map's own iterator stays live and is fine.
-      const items = []; for (const pair of v) items.push(inspectValue(pair[0], opts, seen, depth + 1) + (bun ? ": " : " => ") + inspectValue(pair[1], opts, seen, depth + 1));
+      // formatMap: at most maxArrayLength entries, then "... n more items".
+      const mMax = v.size < maxArrayLength ? v.size : maxArrayLength;
+      const items = []; let mi = 0;
+      for (const pair of v) { if (mi >= mMax) break; mi++; items.push(inspectValue(pair[0], opts, seen, depth + 1) + (bun ? ": " : " => ") + inspectValue(pair[1], opts, seen, depth + 1)); }
+      if (v.size - mMax > 0) items.push(remainingText(v.size - mMax));
       if (bun) result = bunBlock(v.size ? "Map(" + v.size + ") " : "Map ", items);
       else result = nodeBlock("Map(" + v.size + ") ", items, "{", "}");
     }
     else if (v instanceof Set) {
-      const items = []; for (const x of v) items.push(inspectValue(x, opts, seen, depth + 1));
+      // formatSet: same cap as formatArray/formatMap.
+      const sMax = v.size < maxArrayLength ? v.size : maxArrayLength;
+      const items = []; let si = 0;
+      for (const x of v) { if (si >= sMax) break; si++; items.push(inspectValue(x, opts, seen, depth + 1)); }
+      if (v.size - sMax > 0) items.push(remainingText(v.size - sMax));
       if (bun) result = bunBlock(v.size ? "Set(" + v.size + ") " : "Set ", items);
       else result = nodeBlock("Set(" + v.size + ") ", items, "{", "}");
     }
-    else if (ArrayBuffer.isView(v) && !(v instanceof DataView)) { const nm = v.constructor ? v.constructor.name : "TypedArray"; const items = PArrayFrom(v).map(String); result = nm + "(" + v.length + ") [" + (items.length ? " " + items.join(", ") + " " : "") + "]"; }
+    else if (ArrayBuffer.isView(v) && !(v instanceof DataView)) {
+      // formatTypedArray: maxLength = min(max(0, maxArrayLength), length), then
+      // remainingText. Reading element-by-element instead of Array.from also
+      // stops a 1e6-element TypedArray from being materialised as a JS array
+      // just to print its first hundred entries.
+      const nm = v.constructor ? v.constructor.name : "TypedArray";
+      const tLen = v.length;
+      const tMax = tLen < maxArrayLength ? tLen : maxArrayLength;
+      const items = [];
+      for (let ti = 0; ti < tMax; ti++) items.push(String(v[ti]));
+      if (tLen - tMax > 0) items.push(remainingText(tLen - tMax));
+      result = nm + "(" + tLen + ") [" + (items.length ? " " + items.join(", ") + " " : "") + "]";
+    }
     else {
       const keys = PObjectKeys(v); const cn = v.constructor && v.constructor.name; const ctor = (cn && cn !== "Object") ? cn + " " : (PObjectGetPrototypeOf(v) === null ? "[Object: null prototype] " : "");
       // Enumerable symbol-keyed own props render after string keys: bun as
