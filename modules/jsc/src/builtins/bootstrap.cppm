@@ -918,7 +918,24 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     if (t === "bigint") return col(33, 39, String(v) + "n");
     if (t === "boolean") return col(33, 39, String(v));
     if (t === "symbol") return col(32, 39, v.toString());
-    if (t === "string") return col(32, 39, bun ? PJSONStringify(v) : "'" + v.replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\n/g, "\\n") + "'");
+    if (t === "string") {
+      if (bun) return col(32, 39, PJSONStringify(v));
+      // ref node lib/internal/util/inspect.js strEscape: the quote is chosen so
+      // the contents need the fewest escapes — single, then double, then
+      // backtick — and only the chosen quote is escaped. Always single-quoting
+      // made util.inspect("'string'") read '\'string\'' where node writes
+      // "'string'".
+      let q = "'";
+      if (v.includes("'")) {
+        if (!v.includes('"')) q = '"';
+        else if (!v.includes("`") && !v.includes("${")) q = "`";
+      }
+      let body = v.replace(/\\/g, "\\\\").replace(/\n/g, "\\n");
+      if (q === "'") body = body.replace(/'/g, "\\'");
+      else if (q === '"') body = body.replace(/"/g, '\\"');
+      else body = body.replace(/`/g, "\\`");
+      return col(32, 39, q + body + q);
+    }
     if (t === "function") {
       const n = v.name;
       // Use Function.prototype.toString (not v.toString()) so a user-defined
@@ -942,7 +959,9 @@ inline constexpr char kBootstrapJS_[] = R"JS(
         let ctag = v[Symbol.toStringTag];
         if (typeof ctag !== "string" || (ctag !== "" && PObjectProtoPropIsEnum.call(v, Symbol.toStringTag))) ctag = "";
         if (ctag !== "" && ctag !== ctor) out += " [" + ctag + "]";
-        return "[" + out + "]";
+        // node styles a class base with the `special` colour (cyan).
+        // ref lib/internal/util/inspect.js formatValue -> stylize(base, 'special').
+        return col(36, 39, "[" + out + "]");
       }
       const kind = inspectFuncKind(src);
       if (bun) return n ? "[" + kind + ": " + n + "]" : "[" + kind + "]";
@@ -956,7 +975,8 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       let tag = v[Symbol.toStringTag];
       if (typeof tag !== "string" || (tag !== "" && PObjectProtoPropIsEnum.call(v, Symbol.toStringTag))) tag = "";
       if (tag !== "" && tag !== ctor) base += " [" + tag + "]";
-      return base;
+      // Same `special` colour as the class branch above.
+      return col(36, 39, base);
     }
     if (seen.has(v)) return "[Circular *1]";
     // nodejs.util.inspect.custom dispatch: an object exposing a callable custom

@@ -536,6 +536,15 @@ var kHistorySize = 30;
 var kMaxUndoRedoStackSize = 2048;
 var kMincrlfDelay = 100;
 var lineEnding = /\r?\n|\r(?!\n)/g;
+// node lib/internal/readline/utils.js reverseString: split on `from`, emit the
+// parts in reverse order joined by `to`. Round-trips, so ("\n","\r") on the way
+// into the history array and ("\r","\n") on the way back out.
+function reverseHistoryLine(line, from, to) {
+  const parts = line.split(from);
+  let result = "";
+  for (let i = parts.length - 1; i > 0; i--) result += parts[i] + to;
+  return result + parts[0];
+}
 var kMaxLengthOfKillRing = 32;
 var kLineObjectStream = Symbol("line object stream");
 var kQuestionCancel = Symbol("kQuestionCancel");
@@ -842,17 +851,27 @@ var _Interface = class Interface extends InterfaceConstructor {
     if (this.historySize === 0) return line;
     if (StringPrototypeTrim.call(line).length === 0) return line;
     const history = this.history;
+    // A multiline submission occupies ONE history slot. Because the history
+    // file is newest-entry-first, node stores such an entry with its lines
+    // reversed and joined by '\r', so the file stays newest-first line by line
+    // (lib/internal/repl/history.js kNormalizeLineEndings via
+    // lib/internal/readline/utils.js reverseString). Identity for a
+    // single-line entry, so dedup and the 'history' event are unchanged for
+    // every non-multiline commit.
+    const normalized = reverseHistoryLine(line, "\n", "\r");
     const historyEmpty = history.length === 0;
-    if (historyEmpty || history[0] !== line) {
+    if (historyEmpty || history[0] !== normalized) {
       if (this.removeHistoryDuplicates) {
-        var dupIndex = ArrayPrototypeIndexOf.call(history, line);
+        var dupIndex = ArrayPrototypeIndexOf.call(history, normalized);
         if (dupIndex !== -1) ArrayPrototypeSplice.call(history, dupIndex, 1);
       }
-      ArrayPrototypeUnshift.call(history, line);
+      ArrayPrototypeUnshift.call(history, normalized);
       if (history.length > this.historySize) ArrayPrototypePop.call(history);
     }
     this.historyIndex = -1;
-    const latest = this.history[0];
+    // The `line` event must still see the text the user typed, so undo the
+    // normalisation on the way out.
+    const latest = reverseHistoryLine(this.history[0], "\r", "\n");
     this.emit("history", this.history);
     return latest;
   }

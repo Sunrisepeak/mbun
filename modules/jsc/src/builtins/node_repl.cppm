@@ -57,7 +57,27 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
   const moduleMod = req("module");
   const CJSModule = moduleMod.Module || moduleMod;
 
-  const ERR = (code, Ctor, msg) => { const e = new Ctor(msg); e.code = code; return e; };
+  // node internal/errors.js: an E() error carries kIsNodeError, so both
+  // defaultPrepareStackTrace and NodeError#toString render the code into the
+  // header — `TypeError [ERR_X]: msg`. That header is what assert.throws(/ERR_X/)
+  // matches (it tests String(err)) and what this REPL's own writer() prints.
+  // mbun's `.stack` is pure JSC frames with no header line at all, so the header
+  // has to be PREPENDED; splicing would eat the first frame.
+  const ERR = (code, Ctor, msg) => {
+    const e = new Ctor(msg);
+    e.code = code;
+    const header = `${e.name} [${code}]: ${e.message}`;
+    try {
+      const st = e.stack;
+      e.stack = typeof st === "string" && st.length ? `${header}\n${st}` : header;
+    } catch { /* a throwing/readonly `stack` accessor is not fatal */ }
+    try {
+      Object.defineProperty(e, "toString", {
+        value: () => header, writable: true, configurable: true, enumerable: false,
+      });
+    } catch { /* frozen error: the stack header still carries the code */ }
+    return e;
+  };
   const ERR_MISSING_ARGS = (name) =>
     ERR("ERR_MISSING_ARGS", TypeError, `The "${name}" argument must be specified`);
   const ERR_INVALID_ARG_VALUE = (name, value, reason) =>
@@ -355,6 +375,67 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
     return "code";
   }
 
+  // True when the input ends with brackets still open and no mismatch on the
+  // way, i.e. acorn would have failed exactly at end-of-input. This has to be
+  // tracked separately because parseThrows uses `new Function(code)`, which
+  // appends a synthetic `}`: JSC then blames that token
+  // ("Unexpected token '}'. Expected ')' to end a compound expression") rather
+  // than reporting end-of-script, so `("a"` and `[1,2` look unrecoverable.
+  function unbalancedAtEof(code) {
+    const stack = [];
+    const pairs = { ")": "(", "]": "[", "}": "{" };
+    let i = 0;
+    const n = code.length;
+    while (i < n) {
+      const c = code[i];
+      if (c === "/" && code[i + 1] === "/") {
+        while (i < n && code[i] !== "\n") i++;
+        continue;
+      }
+      if (c === "/" && code[i + 1] === "*") {
+        i += 2;
+        while (i < n && !(code[i] === "*" && code[i + 1] === "/")) i++;
+        if (i >= n) return false; // an open comment is already handled above
+        i += 2;
+        continue;
+      }
+      if (c === '"' || c === "'") {
+        const quote = c;
+        i++;
+        while (i < n) {
+          if (code[i] === "\\") { i += 2; continue; }
+          if (code[i] === quote || code[i] === "\n") break;
+          i++;
+        }
+        if (i >= n) return false;
+        i++;
+        continue;
+      }
+      if (c === "`") {
+        // Template literals are reported by scanEofState; skip the whole thing.
+        i++;
+        let depth = 0;
+        while (i < n) {
+          if (code[i] === "\\") { i += 2; continue; }
+          if (depth === 0 && code[i] === "`") break;
+          if (code[i] === "$" && code[i + 1] === "{") { depth++; i += 2; continue; }
+          if (depth > 0 && code[i] === "}") { depth--; i++; continue; }
+          i++;
+        }
+        if (i >= n) return false;
+        i++;
+        continue;
+      }
+      if (c === "(" || c === "[" || c === "{") stack.push(c);
+      else if (c === ")" || c === "]" || c === "}") {
+        // A mismatch or a stray closer is a real error, never recoverable.
+        if (stack.pop() !== pairs[c]) return false;
+      }
+      i++;
+    }
+    return stack.length > 0;
+  }
+
   function parseThrows(code) {
     try {
       new Function(code);
@@ -378,9 +459,12 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
     if (state === "string") return false;
 
     const msg = String(err.message || "");
-    return msg.includes("Unexpected end of script") ||
-           msg.includes("Unexpected EOF") ||
-           msg.includes("Unexpected token ')'") === false && false;
+    if (msg.includes("Unexpected end of script") || msg.includes("Unexpected EOF")) {
+      return true;
+    }
+    // Brackets still open at end-of-input: acorn would have failed exactly
+    // there, so node reports this as recoverable and prompts with `| `.
+    return unbalancedAtEof(code);
   }
 
   function isValidSyntax(input) {
@@ -427,7 +511,11 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
   writer.options = {
     showHidden: false, depth: 2, colors: false, customInspect: true,
     showProxy: true, maxArrayLength: 100, maxStringLength: 10000,
-    breakLength: 128, compact: 3, sorted: false, getters: false,
+    // node: writer.options = { ...inspect.defaultOptions, showProxy: true },
+    // and inspectDefaultOptions.breakLength is 80 (internal/util/inspect.js).
+    // _handleError picks `Uncaught ` vs `Uncaught:\n` by comparing the error
+    // line against this number, so 128 collapsed two-line output into one.
+    breakLength: 80, compact: 3, sorted: false, getters: false,
     numericSeparator: false,
   };
 
@@ -1537,8 +1625,21 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
         if (isError(e)) {
           if (e.stack) {
             if (e.name === "SyntaxError") {
+              // node drops every frame from a SyntaxError so the REPL prints
+              // just "Uncaught SyntaxError: <message>". Its regex only matches
+              // V8's `    at ...` frames, and — unlike V8 — a JSC `.stack`
+              // holds ONLY frames, with no leading "SyntaxError: msg" line:
+              // `eval@[native code]\n@REPL1:1:11\nglobal code@REPL1:1:1`.
+              // So every `name@source` line has to go too. Without this the
+              // surviving frames are consumed by the NEXT expectation in
+              // test-repl.js, which then stalls for the full timeout.
+              // The tail alternation (empty / [native code] / …:line:col) is
+              // deliberate, so a message line such as
+              // `SyntaxError: Unexpected token '@'` survives the strip.
               e.stack = e.stack.replace(/^REPL\d+:\d+\r?\n/, "")
-                .replace(/^\s+at\s.*\n?/gm, "");
+                .replace(/^\s+at\s.*\n?/gm, "")
+                .replace(/^[^\n]*@(?:\[native code\]|[^\n]*:\d+:\d+)?\r?$\n?/gm, "")
+                .replace(/\n+$/, "");
               const importErrorStr = "Cannot use import statement outside a module";
               if (String(e.message).includes(importErrorStr)) {
                 e.message = "Cannot use import statement inside the Node.js REPL, " +
@@ -1553,6 +1654,11 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
             }
           }
           errStack = this.writer(e);
+          // A user-supplied writer may return anything at all
+          // (test-repl-options passes a bare `function writer() {}`), and mbun
+          // can reach this path for a foreign uncaught error that node would
+          // never route into a REPL. Without this the indexing below threw.
+          if (typeof errStack !== "string") errStack = String(errStack);
           if (errStack[0] === "[" && errStack[errStack.length - 1] === "]") {
             errStack = errStack.slice(1, -1);
           }
