@@ -6444,7 +6444,14 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     mkdtemp: (pre, o, cb) => { validatePath(pre, "prefix"); fsWarnNonPortableTemplate(pre); const fn = typeof o === "function" ? o : cb; if (typeof fn !== "function") throw fsArgTypeErr("callback", "of type function", fn); fsValidateEncoding(typeof o === "object" || typeof o === "string" ? o : undefined); G.queueMicrotask(() => { try { fn(null, F.mkdtemp(toStr(pre))); } catch (e) { fn(e); } }); },
     // fd-level I/O: real descriptors over mbun.core.io (native pread/pwrite),
     // zero-copy typed-array boundary via __mbunFdNative.
-    openSync: (p, flags, mode) => { validatePath(p); const md = mode == null ? 0o666 : fsParseFileMode(mode, "mode", 0o666); return fdRemember(globalThis.__mbunFdNative.open(toStr(p), flags == null ? "r" : toStr(flags), md), p); },
+    // `flags` may be node's numeric O_* bitmask; __mbunFdNative.open decodes
+    // that itself (io_bindings.inc fdn_open_host), but ONLY if the number
+    // arrives as a number. toStr(577) made the native side read '5' as the
+    // flag letter and hand back a READ-ONLY fd, so every numeric-flag open of a
+    // missing file failed ENOENT instead of creating it. The async `open`
+    // (line ~6616) and `promises.open` (~8394) already passed numbers through;
+    // this was the one route that did not. ref: regression 27974.
+    openSync: (p, flags, mode) => { validatePath(p); const md = mode == null ? 0o666 : fsParseFileMode(mode, "mode", 0o666); return fdRemember(globalThis.__mbunFdNative.open(toStr(p), flags == null ? "r" : (typeof flags === "number" ? flags : toStr(flags)), md), p); },
     closeSync: (fd) => { fsValidateFd(fd); globalThis.__mbunFdNative.close(fd); fdForget(fd); },
     readSync: (fd, buf, off, len, pos) => {
       if (off !== null && typeof off === "object") { const o = off; off = o.offset || 0; len = o.length; pos = o.position; }
