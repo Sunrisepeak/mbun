@@ -44,7 +44,7 @@ node	worker stack-overflow message text	COSTS_GREEN	6 bun sites assert JSC's tra
 node	ERR_WORKER_INVALID_EXEC_ARGV	COSTS_GREEN	7 green worker files pass execArgv	needs node's option table embedded; a too-tight allowlist regresses all 7
 node	worker internal/test/binding files	BLOCKED	2 files	needs node's internal test binding surface
 node	worker SharedArrayBuffer (shm-backed)	TOO_BIG	5 files, densest worker cluster left	an mbun worker is a child process, not a thread; needs shm SAB with the wire carrying a mapping handle, i.e. JSC external-backing-store work. Deferred, NOT disproven -- correct next capability lane if one is funded
-bun	napi addons	BLOCKED	51 of 55 files in napi/node-napi-tests	mbun exports 6 dynamic symbols, so no napi addon can load at all
+bun	napi/node-napi-tests (napi addons)	BLOCKED	51 of 55 files in napi/node-napi-tests	mbun exports 6 dynamic symbols, so no napi addon can load at all
 bun	js/sql (mysql, postgres)	BLOCKED	26 files	needs docker services; "Failed to build service mysql_plain"
 bun	js/valkey	BLOCKED	15 files	needs a docker redis service
 bun	bake/dev	TOO_BIG	18 files	gated on the whole HMR/incremental-bundler subsystem: Bun.serve() has no app/framework option, bun:internal-for-testing has no getDevServerDeinitCount. The stack-frame blocker behind it was fixed and the files STILL fail

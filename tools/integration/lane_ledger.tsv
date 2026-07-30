@@ -1,0 +1,28 @@
+# Lane ledger: one row per dispatched lane, appended when the lane's result is
+# INTEGRATOR-VERIFIED (not when the lane reports). This is the input to
+# wave_planner.py's throughput model, so a row here is a measurement, not a claim.
+#
+# `delivered` counts files that moved to green in the integrator's own
+# corpus_diff against a frozen baseline, after serial re-confirmation of any
+# deciding file (see the load-noise trap in RESUME.md). `regressions` is the
+# REGRESSIONS list length from that same diff, after serial re-confirmation --
+# load noise is not a regression.
+#
+# A lane that delivered 0 files is NOT a failed row. Lane A delivered 0 and
+# unblocked an ordering contract three subsystems were silently depending on;
+# lane D delivered 0 and retired an 18-file vein with numbers. Both are recorded
+# at their true file count so the throughput model stays honest, with the value
+# noted in `note`.
+#
+# Columns: wave <TAB> lane <TAB> corpus <TAB> area <TAB> goal <TAB> delivered <TAB> minutes <TAB> regressions <TAB> note
+wave	lane	corpus	area	goal	delivered	minutes	regressions	note
+56	A	jsc	nextTick-ordering	0	0	109	0	cure landed; contract now pinned by tick_order_gate.py; 3 subsystems were depending on the inversion
+56	B	node	test-runner	6	6	255	0	slowest lane; 2 builds + 2 runs went to baseline-by-revert
+56	C	node	test-worker	6	8	250	0	7th umbrella cluster dissolved; postMessage transferList ignored
+56	D	bun	bake/dev	8	0	120	0	retired 18-file vein with numbers; gated on whole HMR subsystem
+56	E	bun	bundler	6	1	105	0	Bundle Failed dissolved into 29 causes; only 5 of 49 files gated solely on bundler
+57	F	node	test-http2	6	6	95	0	one real cluster (Timeout._idleTimeout); 5 of 6 files needed 2-4 fixes
+57	G	node	test-child	6	16	110	0	two architectural-placement bugs; self-caught a change costing a green bun file
+57	H	node	test-zlib+whatwg	6	15	60	0	best throughput of campaign; blocker was a STALE COMMENT, not a missing feature
+57	I	bun	regression/issue	12	13	160	0	failures bimodal with no middle; sort by assertion ratio found the cheap half
+57	J	bun	js/bun/http+net+websocket	8	5	115	0	biggest lever was Bun.spawn ipc, not http; found the load-noise trap
