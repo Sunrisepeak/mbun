@@ -50,6 +50,19 @@ private:
     // `module.exports = …` before the cycle re-enters (semver@7's
     // Range/Comparator bottom-requires are the canonical case).
     std::unordered_map<std::string, JSObjectRef> moduleInFlight_;
+    // The CommonJS `module` RECORD for every loaded module (path+query → the
+    // object handed to the wrapper as `module`). moduleCache_ stores only
+    // module.exports, which is what require() returns, but node's loader keeps
+    // the whole Module and several documented surfaces read it back:
+    // `module.children` has to receive the child's Module (not its exports) even
+    // when the child came from cache, and `require.cache[k].exports` is the
+    // documented shape. GC-protected for the same reason moduleCache_ is.
+    std::unordered_map<std::string, JSObjectRef> moduleRecord_;
+    // The module whose wrapper body is currently executing, innermost last.
+    // node passes `parent` explicitly through Module._load; the loader here is
+    // re-entrant C++, so the stack IS that parent chain. Used for
+    // `module.parent` and for node's updateChildren().
+    std::vector<JSObjectRef> moduleStack_;
     // node's `primordials` object, built on first use from node's own
     // lib/internal/per_context/primordials.js and handed to node-internal
     // modules as a wrapper parameter (see node_primordials_ in
@@ -191,7 +204,16 @@ public:
         std::string js{"globalThis.__dirname = " + json_quote_(dir) + ";\n" +
                        "globalThis.__filename = " + json_quote_(file) + ";\n" +
                        "if (globalThis.Bun) globalThis.Bun.main = " + json_quote_(file) + ";\n" +
-                       "globalThis.module = { exports: {}, filename: " + json_quote_(file) + ", parent: null };\n" +
+                       // node's entry Module: `id` is the literal "." for the main
+                       // module (loader.js executeUserEntryPoint → new Module('.')),
+                       // and the rest of the record is what every CommonJS module
+                       // gets. `children`/`paths`/`loaded` were absent here as well
+                       // as in the loader, so `require.main.children` — the
+                       // documented way to enumerate what the entry pulled in — read
+                       // undefined.
+                       "globalThis.module = { id: '.', exports: {}, filename: " + json_quote_(file) +
+                       ", path: " + json_quote_(dir) + ", parent: null, loaded: false, children: []," +
+                       " paths: [] };\n" +
                        (pendingDeprecation
                             // node loader.js wraps BOTH the getter and the setter in
                             // pendingDeprecate(..., 'DEP0144'); internal/util.js dedupes
@@ -231,7 +253,37 @@ public:
                        " resolveSync: function (s) { return globalThis.__mbun_resolve_native(String(s), " +
                        json_quote_(dir) + "); },"
                        " require: globalThis.__mbun_make_require(" + json_quote_(dir) + ") };\n"};
-        return eval_void(js);
+        if (auto r{eval_void(js)}; !r) {
+            return r;
+        }
+        // Finish the entry Module from C++: `paths` reuses the loader's own
+        // transliteration of Module._nodeModulePaths, and the entry becomes the
+        // root of the parent chain so top-level require()s land in
+        // `require.main.children` (node's Module._load passes the entry as
+        // `parent` for exactly this).
+        JSObjectRef global{JSContextGetGlobalObject(ctx_)};
+        JSObjectRef mainModule{JSValueToObject(ctx_, get_prop(ctx_, global, "module"), nullptr)};
+        if (mainModule != nullptr) {
+            const std::vector<std::string> nm{node_module_paths_(dir)};
+            std::vector<JSValueRef> items;
+            items.reserve(nm.size());
+            for (const auto& p : nm) {
+                items.push_back(make_string(ctx_, p));
+            }
+            set_prop(ctx_, mainModule, "paths",
+                     JSObjectMakeArray(ctx_, items.size(), items.data(), nullptr));
+            JSValueProtect(ctx_, mainModule);
+            moduleStack_.clear();
+            moduleStack_.push_back(mainModule);
+            // `process.mainModule` is the entry Module; `require.main` is an
+            // alias of it defined on every require closure (see
+            // engine_require_js.inc). Both were undefined.
+            JSObjectRef proc{JSValueToObject(ctx_, get_prop(ctx_, global, "process"), nullptr)};
+            if (proc != nullptr) {
+                set_prop(ctx_, proc, "mainModule", mainModule);
+            }
+        }
+        return {};
     }
 
     // Rebind the top-level `require` (installed by install_cjs_env) to the variant
@@ -1079,6 +1131,10 @@ public:
         }
         if (auto it{moduleInFlight_.find(key)}; it != moduleInFlight_.end()) {
             moduleInFlight_.erase(it);
+        }
+        if (auto it{moduleRecord_.find(key)}; it != moduleRecord_.end()) {
+            JSValueUnprotect(ctx_, it->second);
+            moduleRecord_.erase(it);
         }
     }
 

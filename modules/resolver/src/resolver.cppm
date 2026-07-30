@@ -64,6 +64,14 @@ export struct Options {
     // NODE_PATH dirs: extra node_modules-style roots searched (in order) after the
     // node_modules walk-up fails. Populated by the runtime from the env var.
     std::vector<std::string> node_paths;
+    // `--preserve-symlinks`: keep the importer's SYMLINK path when walking up
+    // for node_modules instead of canonicalizing it first. node documents this
+    // precisely for the linked-peer-dependency layout — a package symlinked into
+    // `app/node_modules` must find its peers in `app/node_modules`, which is
+    // reachable only from the symlink path, never from the link target's
+    // parents. Default false (node's default, and what the isolated-linker
+    // layouts below need).
+    bool preserve_symlinks{false};
 };
 
 // ReResolve: `path` is a bare specifier (e.g. a package.json "imports" target
@@ -839,7 +847,7 @@ private:
         // real_path): a module loaded through a node_modules symlink must
         // search its real parents, or isolated-linker layouts lose every
         // transitive dependency.
-        if (fs_.real_path) {
+        if (fs_.real_path && !opts_.preserve_symlinks) {
             if (auto rp{fs_.real_path(dir)}) {
                 dir = paths::normalize(*rp);
             }

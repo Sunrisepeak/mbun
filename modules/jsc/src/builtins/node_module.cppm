@@ -83,6 +83,14 @@ inline constexpr std::string_view kNodeModuleJS = R"JS(
   }
 
   // ---- Node ERR_INVALID_ARG_TYPE message (word-for-word for the cases tested).
+  //
+  // Prefer the shared bootstrap factory (__mbunNodeErrors): it runs the error
+  // through nodeErrToString, which is what puts the code into the STACK the way
+  // node does (`TypeError [ERR_INVALID_ARG_TYPE]: …`). The local copy only set
+  // `.code`, so `String(err)` came back as a plain `TypeError: …` and every
+  // assert.throws(fn, /ERR_INVALID_ARG_TYPE/) in the corpus — which matches
+  // against the stringified error, not against `.code` — failed on an error
+  // that was otherwise completely correct.
   function invalidArgType(name, expected, actual) {
     let received;
     if (actual === undefined) received = "undefined";
@@ -102,7 +110,8 @@ inline constexpr std::string_view kNodeModuleJS = R"JS(
     }
     const e = new TypeError('The "' + name + '" argument must be of type ' + expected + ". Received " + received);
     e.code = "ERR_INVALID_ARG_TYPE";
-    return e;
+    const NE = G.__mbunNodeErrors;
+    return NE && NE.withCodeToString ? NE.withCodeToString(e, "ERR_INVALID_ARG_TYPE") : e;
   }
 
   // ---- SourceMap (node:module) — real base64-VLQ mappings decode.

@@ -1329,6 +1329,11 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     determineSpecificType,
     formatList: nodeFormatList,
     addNumericalSeparator,
+    // Stamp node's `${name} [${code}]: ${message}` toString onto an error whose
+    // MESSAGE a partition already formats itself. Exposed so a partition can
+    // adopt the code-in-toString contract (which is what assert.throws(fn,
+    // /ERR_X/) matches on) without also adopting this file's message text.
+    withCodeToString: nodeErrToString,
     ERR_INVALID_ARG_TYPE: nodeArgTypeError,
     ERR_INVALID_ARG_VALUE: nodeArgValueError,
     ERR_OUT_OF_RANGE: nodeRangeError,

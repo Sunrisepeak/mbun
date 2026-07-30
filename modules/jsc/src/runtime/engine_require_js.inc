@@ -31,6 +31,81 @@ globalThis.__mbun_blob_module_source = function (spec) {
   return { type: typeof blob.type === "string" ? blob.type : "",
            source: bytes ? new TextDecoder().decode(bytes) : "" };
 };
+// 1:1 translation of node lib/internal/modules/cjs/loader.js
+// (CircularRequirePrototypeWarningProxy / emitCircularRequireWarning /
+// getExportsForCircularRequire, and the un-set at Module.prototype.load).
+//
+// When require() re-enters a module whose body is still running, the caller gets
+// a HALF-BUILT exports object, and reading a property that the module has simply
+// not assigned yet is the single most common CommonJS cycle bug. node makes it
+// visible by temporarily swapping the exports' prototype for a proxy that warns
+// on any miss, then restores Object.prototype once the body finishes. The
+// exclusions are node's and each one is load-bearing (see
+// test/fixtures/cycles/warning-*): a Proxy exports must never be touched at all
+// (its traps are the user's), a transpiled ES module (`__esModule`) uses its own
+// cycle protocol, `__esModule` itself always reads through, and exports that is
+// not a plain object (a class, a function) is left alone.
+(function () {
+  const emitCircularRequireWarning = (prop) => {
+    const p = globalThis.process;
+    if (p && typeof p.emitWarning === "function") {
+      p.emitWarning("Accessing non-existent property '" + String(prop) +
+        "' of module exports inside circular dependency");
+    }
+  };
+  const CircularRequirePrototypeWarningProxy = new Proxy({}, {
+    __proto__: null,
+    get(target, prop) {
+      // Allow __esModule access in any case because it is used in the output
+      // of transpiled code to determine whether something comes from an
+      // ES module, and is not used as a regular key of `module.exports`.
+      if (prop in target || prop === "__esModule") return target[prop];
+      emitCircularRequireWarning(prop);
+      return undefined;
+    },
+    getOwnPropertyDescriptor(target, prop) {
+      if (Object.prototype.hasOwnProperty.call(target, prop) || prop === "__esModule") {
+        return Object.getOwnPropertyDescriptor(target, prop);
+      }
+      emitCircularRequireWarning(prop);
+      return undefined;
+    },
+  });
+  // node reads isProxy off internalBinding('util'); util.types is the same
+  // predicate. Looked up lazily (the loader runs long before node:util exists)
+  // and, if it is still unavailable, the check fails CLOSED — no proxy is
+  // installed — because touching a user Proxy is the one unrecoverable mistake
+  // here.
+  let isProxy;
+  const proxyCheckReady = () => {
+    if (isProxy === undefined) {
+      const m = globalThis.__mbunNativeModules;
+      const util = m && (m["node:util"] || m["util"]);
+      isProxy = (util && util.types && typeof util.types.isProxy === "function")
+        ? util.types.isProxy : null;
+    }
+    return isProxy !== null;
+  };
+  globalThis.__mbun_circular_exports = function (exports) {
+    if (exports === null || typeof exports !== "object") return exports;
+    if (!proxyCheckReady() || isProxy(exports)) return exports;
+    if (Object.getPrototypeOf(exports) !== Object.prototype) return exports;
+    if (exports.__esModule) return exports;
+    try { Object.setPrototypeOf(exports, CircularRequirePrototypeWarningProxy); } catch (e) {}
+    return exports;
+  };
+  // Module.prototype.load: "This is later unset once the module is done loading."
+  globalThis.__mbun_circular_exports_done = function (exports) {
+    if (exports === null || (typeof exports !== "object" && typeof exports !== "function")) return exports;
+    if (!proxyCheckReady() || isProxy(exports)) return exports;
+    try {
+      if (Object.getPrototypeOf(exports) === CircularRequirePrototypeWarningProxy) {
+        Object.setPrototypeOf(exports, Object.prototype);
+      }
+    } catch (e) {}
+    return exports;
+  };
+})();
 globalThis.__mbun_make_require = function (dir) {
   const invalidRequireId = function (value) {
     if (typeof value !== "string") {
@@ -94,6 +169,14 @@ globalThis.__mbun_make_require = function (dir) {
     return trace.traceSync(load, { parentFilename: req.__mbun_parent_filename, id: s });
   };
   req.resolve = function (s) { return globalThis.__mbun_resolve_native(String(s), dir); };
+  // node: `require.main` IS `process.mainModule` (loader.js sets both to the
+  // entry Module). An accessor rather than a copied value because the entry
+  // record is installed by install_cjs_env, which can run after the first
+  // require closure has already been minted (bootstrap requires precede it).
+  Object.defineProperty(req, "main", {
+    configurable: true, enumerable: true,
+    get: function () { const p = globalThis.process; return p ? p.mainModule : undefined; },
+  });
   // require.cache is a live view over the native CommonJS module cache: a plain
   // object can't reach the C++ cache, so `delete require.cache[key]` (a common
   // "force re-evaluation" idiom, and what test/js/bun/resolve/import-query uses to
@@ -141,8 +224,19 @@ globalThis.__mbun_make_require_esm = function (dir) {
   // code that deletes the array iterator — which the corpus does deliberately, see
   // test-require-delete-array-iterator / test-repl-unsafe-array-iteration — would
   // otherwise make every subsequent `import` throw from inside the loader.
+  // defineProperty, not assignment: `req[k] = base[k]` is [[Set]], which walks
+  // req's prototype chain (Function.prototype → Object.prototype) and RUNS any
+  // accessor it finds there instead of creating an own property. User code that
+  // installs an Object.prototype setter for one of these names — 'main' is the
+  // realistic case, and test-module-prototype-mutation installs exactly that —
+  // would otherwise see the loader trip its own trap on every ESM module load.
+  // Descriptor copy also preserves `main` as the accessor it is, rather than
+  // freezing the entry module's identity at closure-creation time.
   const keys = Object.keys(base);
-  for (let i = 0; i < keys.length; i++) { req[keys[i]] = base[keys[i]]; }
+  for (let i = 0; i < keys.length; i++) {
+    const d = Object.getOwnPropertyDescriptor(base, keys[i]);
+    if (d !== undefined) Object.defineProperty(req, keys[i], d);
+  }
   return req;
 };
 // Dynamic import(): the transpiler lowers `import(spec)` (cjs mode) to
