@@ -109,6 +109,28 @@ PROBES: tuple[Probe, ...] = (
         "Threshold set well above node but far below the regression.",
     ),
     Probe(
+        "promise-chain-x1000000", 450,
+        'let p=Promise.resolve(0);for(let i=0;i<1000000;i++)p=p.then(v=>v+1);'
+        'p.then(v=>{if(v!==1000000)throw new Error("bad chain "+v);});',
+        "1M sequential .then links -- sized so the WORK dominates process startup.\n        "
+        "At 200k the work was ~15ms against ~150ms startup, so a 6x regression moved\n        "
+        "the total only 1.5x and slipped under any tolerable limit.\n        "
+        "Originally 200k sequential .then links. This probe exists because the async_hooks port "
+        "made Promise.prototype.then instrumentation UNCONDITIONAL — one closure per "
+        ".then — which took this from 16ms to 90-133ms (5.6-8x). Nothing in this gate "
+        "caught it: every other probe here is dominated by process startup, so a "
+        "promise-throughput regression was invisible. Threshold is well above the "
+        "healthy figure and far below the regression.",
+    ),
+    Probe(
+        "promise-fanout-x600000", 700,
+        'const a=[];let n=0;for(let i=0;i<600000;i++)a.push(Promise.resolve(i)'
+        '.then(x=>{n+=x;}));Promise.all(a).then(()=>{if(n===0)throw new Error("no work");});',
+        "200k independent promises resolved and awaited together — catches per-promise "
+        "allocation cost that a single chain can hide. Healthy is ~51ms; the "
+        "unconditional-instrumentation regression put it at 131-188ms.",
+    ),
+    Probe(
         "timer-drain-x10000", 900,
         'let n=0;const t=()=>{if(++n<10000)setImmediate(t);};t();',
         "event-pump overhead per turn",
