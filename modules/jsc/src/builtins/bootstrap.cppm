@@ -612,7 +612,17 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   // (waitForActual/expectsError/expectsNoError/expectedException). Enriched
   // AssertionError path via makeAErr is opt-in; other assert.* keep using AErr.
   const NO_EXC = Symbol("assert.noException");
-  const isRe = (v) => v instanceof RegExp;
+  // Brand check, not `instanceof`: node's own test uses util.types.isRegExp,
+  // which is realm-independent. A RegExp minted inside a vm context (or any
+  // other realm) has a foreign RegExp.prototype, so `instanceof` misses it and
+  // assert.throws(fn, /re/) silently degrades to an error-object comparison.
+  // Object.prototype.toString reports "[object RegExp]" off the [[RegExpMatcher]]
+  // internal slot, so it crosses realms the way V8's check does.
+  const isRe = (v) => {
+    if (v instanceof RegExp) return true;
+    if (v === null || typeof v !== "object") return false;
+    try { return Object.prototype.toString.call(v) === "[object RegExp]"; } catch (_) { return false; }
+  };
   const isErrCtor = (fn) => { try { return Error.isPrototypeOf(fn); } catch (_) { return false; } };
   const isPromiseLike = (o) => (o instanceof Promise) || (o !== null && typeof o === "object" && typeof o.then === "function" && typeof o.catch === "function");
   function insp(v) {
@@ -767,7 +777,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     throw AErr("ifError got unwanted exception: " + detail, v, null, "ifError", true);
   };
   function assertRegExpMatch(s, re, m, wantMatch) {
-    if (!(re instanceof RegExp)) { const e = new TypeError(`The "regexp" argument must be of type RegExp. Received ${typeof re}`); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
+    if (!isRe(re)) { const e = new TypeError(`The "regexp" argument must be of type RegExp. Received ${typeof re}`); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
     if (typeof s !== "string") { const e = new TypeError(`The "string" argument must be of type string. Received type ${typeof s}`); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
     if (re.test(s) !== wantMatch) throw AErr(m);
   }

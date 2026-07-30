@@ -19,9 +19,16 @@
 // reachable — none of which JSObjectCopyPropertyNames + JSObjectSetProperty
 // (enumerable string keys, values only) can express.
 //
-// DEFERRED: vm.Module/SourceTextModule/SyntheticModule, cachedData/bytecode
-// (createCachedData/cachedDataRejected), real timeout interruption,
-// microtaskMode isolation, and DONT_CONTEXTIFY realm identity.
+// cachedData is a source FINGERPRINT rather than real bytecode (see
+// makeCachedDataBuffer): produce/consume/reject and cachedDataRejected are all
+// observably node's, but nothing is actually pre-compiled.
+//
+// DEFERRED: real timeout interruption (JSC does expose
+// JSContextGroupSetExecutionTimeLimit in JSContextRefPrivate.h -- unused so far
+// because the limit is per context GROUP and nested vm timeouts need a
+// save/restore stack), microtaskMode isolation, DONT_CONTEXTIFY realm identity,
+// and V8's readonly-assignment / redefine-property message wording (JSC's own
+// text escapes from the mirrored global's real descriptors).
 export module mbun.jsc.js_builtins:node_vm;
 
 import std;
@@ -123,6 +130,21 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
     const handle = NVM.createContext(NVM.getGlobal ? undefined : {});
     const g = NVM.getGlobal ? NVM.getGlobal(handle)
                             : NVM.runInContext(handle, "globalThis", undefined);
+    // A JSC global object is an immutable-prototype exotic object, but node's
+    // context global is a V8 global PROXY, which accepts a prototype write --
+    // `contextGlobalThis.__proto__ = null` must not throw (nodejs/node#47798).
+    // Relax it in the CHILD realm's own Object.prototype accessor, and only for
+    // that realm's global: nothing on the host side changes, no own property
+    // appears on the context global (which would show up in
+    // getOwnPropertyNames(this) inside the context), and every other object
+    // keeps the real setPrototypeOf semantics.
+    NVM.runInContext(handle,
+      "(function(){var d=Object.getOwnPropertyDescriptor(Object.prototype,'__proto__');" +
+      "if(!d||typeof d.set!=='function')return;var s=d.set;" +
+      "Object.defineProperty(Object.prototype,'__proto__',{get:d.get," +
+      "set:function(v){try{s.call(this,v);}catch(e){if(this!==globalThis)throw e;}}," +
+      "enumerable:d.enumerable,configurable:d.configurable});})();",
+      undefined, true);
     // Snapshot of the realm's own globals, so a script that OVERWRITES one
     // (`this.Symbol = Symbol`) is still seen as a user write on the way out,
     // while the untouched builtins stay out of the sandbox.
@@ -139,6 +161,9 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
       nativeKeys,
       nativeVals,
       mirrored: new Set(),
+      // key -> the value syncIn last mirrored onto the realm global (or the map
+      // itself as a sentinel for an accessor, which has no comparable value).
+      mirroredVals: new Map(),
       proto: new Map(),
       // Keys of the realm's OWN globals that the running script assigned to.
       // node's PropertySetterCallback writes every `this.X = …` straight to the
@@ -199,19 +224,38 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
   }
 
   function syncIn(rec) {
-    const { sandbox, global: g, mirrored, proto } = rec;
+    const { sandbox, global: g, mirrored, mirroredVals, proto } = rec;
     const seen = new Set();
+    mirroredVals.clear();
     for (const key of ownKeys(sandbox)) {
       seen.add(key);
       proto.delete(key);
-      let desc = gOPD(sandbox, key);
+      // A Proxy sandbox may THROW from getOwnPropertyDescriptor. node never
+      // queries attributes just to enter a context (issue 11902), so a throwing
+      // trap must not escape: fall back to a plain read, and if even that
+      // throws, leave the key unmirrored rather than failing the run.
+      let desc;
+      try {
+        desc = gOPD(sandbox, key);
+      } catch (e) {
+        try {
+          desc = { value: sandbox[key], writable: true, enumerable: true, configurable: true };
+        } catch (e2) { continue; }
+      }
       if (desc === undefined) continue;
       if ("value" in desc && desc.value === sandbox) {
         // node's PropertyGetterCallback maps the sandbox onto the global proxy,
         // so `ctx.window = ctx` makes `window === this` inside the context.
         desc = { ...desc, value: g };
       }
-      try { ObjectDefineProperty(g, key, desc); mirrored.add(key); } catch { /* non-configurable */ }
+      try {
+        ObjectDefineProperty(g, key, desc);
+        mirrored.add(key);
+        // Remember what we put there, so syncOut can tell an untouched mirror
+        // from a value the script actually wrote and skip re-defining it on the
+        // sandbox (which for a Proxy would fire traps node never fires).
+        if ("value" in desc) mirroredVals.set(key, desc.value); else mirroredVals.set(key, mirroredVals);
+      } catch (e) { /* non-configurable */ }
     }
     // node resolves an in-context global lookup with GetRealNamedProperty on
     // the sandbox, which walks its prototype chain; mirror inherited members
@@ -238,8 +282,9 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
     // from the context global too.
     for (const key of [...mirrored]) {
       if (!seen.has(key)) {
-        try { delete g[key]; } catch { /* ignore */ }
+        try { delete g[key]; } catch (e) { /* ignore */ }
         mirrored.delete(key);
+        mirroredVals.delete(key);
         proto.delete(key);
       }
     }
@@ -247,7 +292,7 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
 
   function syncOut(rec) {
     disarmWriteTraps(rec);
-    const { sandbox, global: g, nativeKeys, nativeVals, mirrored, proto, writes } = rec;
+    const { sandbox, global: g, nativeKeys, nativeVals, mirrored, mirroredVals, proto, writes } = rec;
     const live = new Set();
     for (const key of ownKeys(g)) {
       const desc = gOPD(g, key);
@@ -297,13 +342,29 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
       live.add(key);
       let d = desc;
       if ("value" in d && d.value === g) d = { ...d, value: sandbox };
-      try { ObjectDefineProperty(sandbox, key, d); } catch { /* ignore */ }
+      // An untouched mirror needs no write-back. Beyond saving work this is
+      // load-bearing for a Proxy sandbox: node only touches the sandbox for
+      // properties the script actually assigned, so re-defining an unchanged
+      // key would fire traps node never fires.
+      if (mirrored.has(key) && "value" in d && Object.is(d.value, mirroredVals.get(key))) {
+        continue;
+      }
+      if (!mirrored.has(key)) {
+        // node's PropertySetterCallback queries the sandbox's own descriptor
+        // before storing, so a Proxy whose getOwnPropertyDescriptor trap breaks
+        // the invariants must surface THAT error, not be silently swallowed
+        // (issue 34606).
+        gOPD(sandbox, key);
+      }
+      try { ObjectDefineProperty(sandbox, key, d); } catch (e) { /* ignore */ }
       mirrored.add(key);
+      if ("value" in d) mirroredVals.set(key, d.value); else mirroredVals.set(key, mirroredVals);
     }
     for (const key of [...mirrored]) {
       if (!live.has(key)) {
-        if (!proto.has(key)) { try { delete sandbox[key]; } catch { /* ignore */ } }
+        if (!proto.has(key)) { try { delete sandbox[key]; } catch (e) { /* ignore */ } }
         mirrored.delete(key);
+        mirroredVals.delete(key);
         proto.delete(key);
       }
     }
@@ -435,6 +496,12 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
     if (options !== undefined && (typeof options !== "object" || options === null)) {
       throw invArgType("options", "of type object", options);
     }
+    if (options !== undefined) {
+      // name/origin are inert here (they only label the context in V8's
+      // inspector), but their type contract is observable.
+      if (options.name !== undefined) validateString(options.name, "options.name");
+      if (options.origin !== undefined) validateString(options.origin, "options.origin");
+    }
     const codegen = validateCodegen(options ? options.codeGeneration : undefined, "options.codeGeneration");
     if (isContextInternal(contextObject)) return contextObject;
     const rec = newRecord(contextObject);
@@ -478,9 +545,48 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
     return last;
   }
 
-  function makeCachedDataBuffer() {
+  // ── cachedData: a source fingerprint, not bytecode ────────────────────────
+  // V8's code cache is a serialised compilation artifact; JSC's C API exposes no
+  // equivalent, so mbun's buffer carries a magic prefix plus a fingerprint of
+  // the source it was produced from. That is enough to reproduce every
+  // OBSERVABLE part of the contract: a buffer produced from the same source is
+  // accepted (cachedDataRejected === false), one produced from different source
+  // -- or truncated, or minted by something else -- is rejected, and either way
+  // the script still compiles from source text. The buffer must survive a
+  // base64 round-trip through a child process (test-vm-cached-data produces it
+  // with `-e`), so the fingerprint is computed from the source alone.
+  //
+  // 32 bytes exactly: common.getArrayBufferViews() only builds a view whose
+  // element size divides byteLength, and the test feeds every view type it can
+  // build back in, so a length divisible by 8 keeps BigInt64Array in play.
+  const CACHE_MAGIC = "mbun-vm-cache:";
+  function sourceFingerprint(src) {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < src.length; i++) {
+      const c = src.charCodeAt(i);
+      h = ((h ^ (c & 0xff)) * 0x01000193) >>> 0;
+      h = ((h ^ (c >>> 8)) * 0x01000193) >>> 0;
+    }
+    let hex = h.toString(16);
+    while (hex.length < 8) hex = "0" + hex;
+    return hex;
+  }
+  function makeCachedDataBuffer(source) {
+    let tag = CACHE_MAGIC + sourceFingerprint(source === undefined ? "" : `${source}`);
+    while (tag.length < 32) tag += " ";
     const B = G.Buffer;
-    return B ? B.from("mbun-vm-cache ") : new Uint8Array([1]);
+    return B ? B.from(tag) : new Uint8Array([1]);
+  }
+  // true when the buffer must be reported as rejected. Mirrors V8: a rejected
+  // cache is never fatal for vm.Script, it only flips cachedDataRejected.
+  function cachedDataRejects(buf, source) {
+    let text = "";
+    try {
+      const u8 = new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+      for (let i = 0; i < u8.length; i++) text += String.fromCharCode(u8[i]);
+    } catch (e) { return true; }
+    if (text.length !== 32 || text.slice(0, CACHE_MAGIC.length) !== CACHE_MAGIC) return true;
+    return text.slice(CACHE_MAGIC.length).trim() !== sourceFingerprint(`${source}`);
   }
 
   // ── dynamic import() inside a vm script ───────────────────────────────────
@@ -627,12 +733,12 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
       this.sourceMapURL = parseSourceMapURL(this.__code);
       if (cachedData !== undefined) {
         this.cachedData = cachedData;
-        this.cachedDataRejected = false;
+        this.cachedDataRejected = cachedDataRejects(cachedData, this.__code);
       } else {
         this.cachedDataRejected = undefined;
       }
       if (produceCachedData === true) {
-        this.cachedData = makeCachedDataBuffer();
+        this.cachedData = makeCachedDataBuffer(this.__code);
         this.cachedDataProduced = true;
       }
       // Surface syntax errors at construction time, like node does.
@@ -663,12 +769,27 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
       }
     }
     runInNewContext(contextObject, options) {
+      // node reaches runInContext through a plain member call on `this`, so a
+      // detached receiver fails with V8's bare "this.runInContext is not a
+      // function". JSC appends an "(In '…', '…' is undefined)" clause that the
+      // test's anchored regexp rejects, so raise the node-shaped TypeError
+      // BEFORE createContext -- node's own createContext would not be reached
+      // either, since V8 evaluates the callee reference at the call site only.
+      if (this === null || this === undefined || typeof this.runInContext !== "function") {
+        throw new TypeError("this.runInContext is not a function");
+      }
       const o = normalizeOptions(options);
-      const ctx = createContext(contextObject, { codeGeneration: o.contextCodeGeneration });
+      if (o.contextName !== undefined) validateString(o.contextName, "options.contextName");
+      if (o.contextOrigin !== undefined) validateString(o.contextOrigin, "options.contextOrigin");
+      const ctx = createContext(contextObject, {
+        codeGeneration: o.contextCodeGeneration,
+        name: o.contextName,
+        origin: o.contextOrigin,
+      });
       return this.runInContext(ctx, options);
     }
     createCachedData() {
-      return makeCachedDataBuffer();
+      return makeCachedDataBuffer(this.__code);
     }
   }
 
@@ -725,8 +846,24 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
     let compiled;
     const rewritten = prepareDynImport(code, importModuleDynamically, () => compiled);
     if (rewritten !== null) installDynRegistry(rec);
-    args.push(rewritten === null ? `${code}` : rewritten);
-    compiled = Reflect.apply(FunctionCtor, undefined, args);
+    const body = rewritten === null ? `${code}` : rewritten;
+    // The Function constructor owns VALIDATION: its wrapper grammar is what
+    // rejects a body that closes the wrapper early (`});…`) the way node's
+    // compileFunction does. A bare function expression would happily parse that
+    // body as a sequence of statements.
+    const viaCtor = Reflect.apply(FunctionCtor, undefined, args.concat([body]));
+    // node's compileFunction hands back an ANONYMOUS FUNCTION EXPRESSION: empty
+    // .name, and `function (p, q) {\n…\n}` from toString(). The Function
+    // constructor instead mints `function anonymous(\n…\n) {…}`, which the shape
+    // is observable through. Recompile in the same realm for node's shape, and
+    // fall back to the constructor's own result if that ever fails.
+    let asExpr;
+    try {
+      const mk = Reflect.apply(FunctionCtor, undefined,
+                               ["return (function (" + args.join(",") + ") {\n" + body + "\n});"]);
+      asExpr = mk();
+    } catch (e) { asExpr = undefined; }
+    compiled = typeof asExpr === "function" ? asExpr : viaCtor;
     return compiled;
   }
 
@@ -811,6 +948,10 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
         const rec = records.get(contextifiedObject);
         return rec === undefined ? undefined : rec.global;
       },
+      // Shared with the :node_vm_modules partition so SourceTextModule's
+      // cachedData uses the SAME fingerprint scheme as vm.Script's.
+      makeCachedDataBuffer,
+      cachedDataRejects,
     },
     enumerable: false,
     configurable: true,

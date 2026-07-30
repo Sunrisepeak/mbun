@@ -21,9 +21,9 @@
 // undefined }`). A module with top-level await is compiled to an async wrapper
 // and its returned promise remains observable to evaluate().
 //
-// The classes are only reachable under --experimental-vm-modules, matched
-// through a lazy accessor because the builtins image is evaluated before
-// process.execArgv exists.
+// The classes are NOT gated on --experimental-vm-modules: bun exports them
+// unconditionally, and the corpus reaches them directly under `bun test`, where
+// no execArgv flag can be supplied. See the note at the export site.
 //
 // DEFERRED: evaluate({ timeout }) interruption, cachedData/bytecode, node 26's
 // linkRequests()/instantiate() split, and dynamic import() inside a plain
@@ -76,6 +76,9 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
   const kResolved = Symbol("kResolved");
   const kValues = Symbol("kValues");
   const kRequests = Symbol("kRequests");
+  // The source text a SourceTextModule was built from, kept so createCachedData
+  // can fingerprint it (see :node_vm's cachedData scheme).
+  const kSource = Symbol("kSource");
 
   const kMainContextKey = { __proto__: null };
   const identifierCounters = new WeakMap();
@@ -94,9 +97,9 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
   // through a `with` scope backed by a Proxy: every read re-reads the exporting
   // module, which is what circular graphs and a SyntheticModule.setExport after
   // evaluation depend on.
-  const IMPORT_RE = /(^|[\n;])[ \t]*import[ \t\n]+(?:([^'"]*?)[ \t\n]+from[ \t\n]*)?(['"])((?:\\.|(?!\3)[^\\])*)\3([ \t\n]*(?:with|assert)[ \t\n]*\{[^}]*\})?[ \t]*;?/g;
-  const EXPORT_FROM_RE = /(^|[\n;])[ \t]*export[ \t\n]+(\*[ \t\n]*(?:as[ \t\n]+([\w$]+)[ \t\n]*)?|\{([^}]*)\})[ \t\n]*from[ \t\n]*(['"])((?:\\.|(?!\5)[^\\])*)\5([ \t\n]*(?:with|assert)[ \t\n]*\{[^}]*\})?[ \t]*;?/g;
-  const EXPORT_NAMED_RE = /(^|[\n;])[ \t]*export[ \t\n]*\{([^}]*)\}[ \t]*;?/g;
+  const IMPORT_RE = /(^|[\n;])[ \t]*import[ \t\n]+(?:([^'"]*?)[ \t\n]+from[ \t\n]*)?(['"])((?:\\.|(?!\3)[^\\])*)\3([ \t\n]*(?:with|assert)[ \t\n]*\{[^}]*\})?[ \t]*/g;
+  const EXPORT_FROM_RE = /(^|[\n;])[ \t]*export[ \t\n]+(\*[ \t\n]*(?:as[ \t\n]+([\w$]+)[ \t\n]*)?|\{([^}]*)\})[ \t\n]*from[ \t\n]*(['"])((?:\\.|(?!\5)[^\\])*)\5([ \t\n]*(?:with|assert)[ \t\n]*\{[^}]*\})?[ \t]*/g;
+  const EXPORT_NAMED_RE = /(^|[\n;])[ \t]*export[ \t\n]*\{([^}]*)\}[ \t]*/g;
   const EXPORT_DEFAULT_RE = /(^|[\n;])([ \t]*)export[ \t\n]+default[ \t\n]+/g;
   const EXPORT_DECL_RE = /(^|[\n;])([ \t]*)export[ \t\n]+(?=(?:const|let|var|function|class|async)\b)/g;
   const EXPORT_DECL_NAME_RE =
@@ -481,8 +484,11 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
                   w.identifier + "' that is not linked");
       }
       if (!resolved[kWrap].requestsLinked && resolved[kDeps].length !== 0) {
+        // node names the request that cannot be resolved ON the unlinked module,
+        // not the request that led us to it.
+        const missing = resolved[kDeps][0];
         throw ERR("ERR_VM_MODULE_LINK_FAILURE", Error,
-                  "request for '" + dep.specifier + "' can not be resolved on module '" +
+                  "request for '" + missing.specifier + "' can not be resolved on module '" +
                   resolved[kWrap].identifier + "' that is not linked");
       }
       instantiateModule(resolved, seen);
@@ -719,7 +725,19 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
                            "an instance of Buffer, TypedArray, or DataView", cd, "property");
         }
       }
+      if (options.cachedData !== undefined) {
+        // Unlike vm.Script -- which only reports cachedDataRejected -- a
+        // SourceTextModule handed a cache that does not belong to its source
+        // THROWS. The buffer carries a fingerprint of the source it was produced
+        // from (see :node_vm), so the mismatch is detectable with no bytecode.
+        const cd = options.cachedData;
+        const view = ArrayBuffer.isView(cd) ? cd : new Uint8Array(cd);
+        if (internal.cachedDataRejects(view, sourceText)) {
+          throw ERR("ERR_VM_MODULE_CACHED_DATA_REJECTED", Error, "cachedData buffer was rejected");
+        }
+      }
       initBase(this, contextObject, options.identifier);
+      Object.defineProperty(this, kSource, { value: sourceText, enumerable: false });
 
       const analysis = analyze(sourceText);
       const hasTopLevelAwait = hasSourceTopLevelAwait(sourceText);
@@ -839,9 +857,14 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
     }
     get moduleRequests() { brand(this); return this[kRequests]; }
     createCachedData() {
-      brand(this);
-      const B = G.Buffer;
-      return B ? B.from("mbun-vm-module-cache ") : new Uint8Array([1]);
+      // V8 can only serialise a module that has not run yet; node surfaces the
+      // rest as ERR_VM_MODULE_CANNOT_CREATE_CACHED_DATA.
+      const st = brand(this).status;
+      if (st === "evaluating" || st === "evaluated" || st === "errored") {
+        throw ERR("ERR_VM_MODULE_CANNOT_CREATE_CACHED_DATA", Error,
+                  "Cached data cannot be created for a module which has been evaluated");
+      }
+      return internal.makeCachedDataBuffer(this[kSource]);
     }
     [inspectCustom](depth, opts, inspect) {
       return inspectModule(this, "SourceTextModule", depth, opts, inspect);
