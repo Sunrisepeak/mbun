@@ -5,6 +5,91 @@ session that is interrupted (usage limit, crash, restart) can pick up from the
 file rather than from memory. **If you are a fresh session reading this, start
 here.**
 
+## 2026-07-30 15:30 — WAVE 56 lane A: THE nextTick CURE LANDED. Read this before touching the pump.
+
+The 256-file risk did **not** materialise. `1b1f56e`, 5 files, +131/−14, mostly
+comments. The ordering contract now matches node and is **pinned by a permanent
+gate** (`tools/integration/tick_order_gate.py`, 7 invariants, 11-assertion
+self-test). Validated three ways: real node 24.4.1 passes, the fixed mbun passes,
+and the **pre-fix binary fails with exactly the historical `mt1,TICK,mt2`
+inversion** — so the gate genuinely catches the regression it exists for.
+
+**The key insight, and it is the opposite of what my brief assumed: the
+promise-reaction arm MUST STAY.** It is node's *second* arm. `__mbunRunTicks` at
+the C++ eval trailers only covers ticks pushed from *synchronous* callback bodies;
+a tick pushed from inside a promise continuation is reachable by nothing else
+until the pump's next phase. Removing the arm re-creates the 256-file failure mode
+at `bindings_install.inc:401` — work that is invisible-and-pending — and also lets
+a timer fire ahead of an already-queued tick. So the fix **keeps** the arm and
+makes the reaction run node's `runMicrotasks()` *itself* before running ticks.
+
+Two non-obvious constraints, both of which will bite anyone who retries this:
+
+- **It cannot use the existing `__mbunDrainMicrotasksNative`.**
+  `VM::drainMicrotasks()` appends `didExhaustMicrotaskQueue()`, which reports every
+  rejected-without-handler promise. node runs that (`processPromiseRejections`)
+  *after* the tick queue, so a rejection whose `.catch()` is attached from a
+  `process.nextTick` is **not** unhandled. Measured: the full drain turns that into
+  1 spurious `unhandledRejection` (node: 0), and in mbun a false one is fatal. The
+  new `__mbunRunMicrotasksNative` checkpoints `vm.defaultMicrotaskQueue()`
+  directly, skipping the report; JSC still performs it at real exhaustion, by which
+  time `JSPromise::isHandled()` suppresses it.
+- **`_tickArmed` must stay true across the drain.** Clearing it first lets each
+  microtask in a chain arm a fresh reaction *inside* the current one — one nested
+  native drain per chain link, i.e. stack exhaustion. Clear it *after*. Verified at
+  a 3000-link chain, and the gate now asserts it.
+
+**THE DEEPER FINDING: three subsystems were silently depending on the broken
+interleaving, each masking an ordering bug of its own.** This is why the contract
+is now gated rather than merely fixed.
+
+1. **`js_net.cppm`** — the http client's `_httpClientConnectPending` re-defer used
+   `queueMicrotask`, which by construction can never land behind a pending tick, so
+   `'connect'` overtook `'socket'`. Now `process.nextTick`, the same FIFO
+   `onSocketNT` already uses.
+2. **`bootstrap.cppm` fs.promises `writeFile`/`appendFile`** (module + FileHandle) —
+   node runs fs work on the thread pool, so a same-turn `nextTick(abort)` always
+   wins; mbun worked synchronously behind one microtask hop. **This is what the
+   abort-signal "memory leak" actually was:** with the abort losing, 100k writes
+   *completed* instead of aborting. Fixing the ordering fixed the RSS, not a leak.
+3. **`test_runner.cppm`** — the `done()` probe spun 8 microtask turns, which
+   *starves* the tick queue by definition. A done-style `beforeEach` whose callback
+   arrives on a tick was declared complete with its side effects unapplied
+   (`jsonwebtoken/claim-aud` went 60 pass → 17, "jwt must be provided").
+
+Integrator-verified node guards, all against the authoritative `w56-full-node2`:
+`test-async`, `test-stream`, `test-http`, `test-timers`, `test-promise`,
+`test-process`, `test-worker`, `test-fs`, `test-runner` — **0 regressions in all
+nine.** Full 1902-file bun A/B against the frozen pre-lane binary is in flight.
+
+**Left open, deliberately:** `process.nextTick` does not validate that its first
+argument is a function (node throws `ERR_INVALID_ARG_TYPE` synchronously); today a
+non-function sits in the queue and later throws `cb.apply is not a function` from
+inside whatever unrelated callback drains next. Also `fsPromises.appendFile`
+(module-level, not FileHandle) ignores `options.signal` entirely — pre-existing.
+And one **bun-encodes-bun's-bug** case: `process-nexttick.test.js`'s "100,000
+times" queues 100k ticks then `await 1` and expects them all to have run; under
+node's ordering the await continuation is a microtask and runs first, so node
+yields 0. Do not replicate it — it costs passed-count, not green.
+
+### TRAP: `bun_corpus_runner.py --discover` gives a 230-file SAMPLE, not the corpus
+
+`--sample-per-group` **defaults to 1**, so `--discover compat/bun/test` returns a
+stratified 230-file sample. That is exactly the subset that made the bun seam look
+far smaller than it is for much of this campaign. For a full run, pass an explicit
+list of all 1902 paths:
+
+```
+awk -F'\t' 'NR>1{print $1}' target/integration/w47-bun-full/results.tsv > /tmp/bun-all.txt
+python3 tools/integration/bun_corpus_runner.py --bin <frozen>/mbun --cwd compat/bun \
+  --list /tmp/bun-all.txt --jobs 3 --timeout 60 --resume --out <dir>
+```
+
+Also note bun full-run **noise is ±3–4 files at high `--jobs`** (lane A measured
+two runs of *identical* code producing **disjoint** delta sets, every file green on
+individual re-run). Do not treat a 3-file bun delta as signal without re-running
+the named files alone.
+
 ## 2026-07-30 14:10 — WAVE 56 lane B: `node:test` runner +6 (goal +6), 0 regressions
 
 Integrated as `3ab6763`. Integrator-verified against the **fresh** full baseline
