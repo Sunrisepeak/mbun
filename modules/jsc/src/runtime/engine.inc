@@ -399,6 +399,11 @@ public:
         // jsc_hooks.rs:730-767: an unresolvable specifier is fatal and reported
         // as `preload not found <json-quoted specifier>`; an exception thrown by
         // a preload aborts the run before the entry is ever imported.
+        // A preload's side effects belong to the whole run, not to the first
+        // test file: `bun test` resets per-file state at every file boundary and
+        // would otherwise drop e.g. expect.extend() matchers a preload
+        // registered. The flag lets that state distinguish the two.
+        (void)eval_void("globalThis.__mbunInPreload=true;");
         for (const std::string& spec : gPreloads) {
             std::error_code pec{};
             std::filesystem::path p{spec};
@@ -414,6 +419,7 @@ public:
                 return 1;
             }
         }
+        (void)eval_void("globalThis.__mbunInPreload=false;");
         std::string js{source};
         bool tla{false};
         // `// @bun` pragma (after an optional hashbang line): the entry is already

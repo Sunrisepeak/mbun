@@ -575,9 +575,14 @@ inline constexpr std::string_view HARNESS = R"JS(
     for (const name of Object.keys(S.customMatchers)) {
       m[name] = (...args) => {
         const ctx = { isNot, equals: deepEqual, promise: "", utils: { printReceived: fmt, printExpected: fmt, matcherHint: () => "", stringify: fmt, EXPECTED_COLOR: (s) => s, RECEIVED_COLOR: (s) => s } };
-        const res = S.customMatchers[name].call(ctx, received, ...args) || {};
-        let pass = !!res.pass; if (isNot) pass = !pass;
-        if (!pass) throw assertionError(typeof res.message === "function" ? res.message() : String(res.message || name));
+        const out = S.customMatchers[name].call(ctx, received, ...args);
+        // A matcher may return a promise (`async _m() {}` / `_m: () => Promise`);
+        // bun awaits it and the call site awaits the matcher, so the verdict must
+        // ride the same promise instead of being read off the (pending) object.
+        if (out && typeof out.then === "function") {
+          return out.then((res) => { settleCustom(name, res, isNot); return m; });
+        }
+        settleCustom(name, out, isNot);
         return m;
       };
     }
@@ -609,6 +614,26 @@ inline constexpr std::string_view HARNESS = R"JS(
       }
     };
     return new Proxy({}, { get(_, prop) { return build(prop); } });
+  }
+  // bun expect.rs custom-matcher protocol: the return value MUST be an object
+  // carrying `pass`. Anything else is a bug in the matcher and is reported as
+  // one (bun names the offending matcher in the message; jest does not).
+  function settleCustom(name, res, isNot) {
+    if (res === null || typeof res !== "object" || !("pass" in res)) {
+      let shown;
+      if (res !== null && typeof res === "object") {
+        try { shown = JSON.stringify(res); } catch (e) { shown = String(res); }
+      } else { shown = String(res); }
+      throw assertionError("Unexpected return from matcher function `" + name + "`.\n" +
+        "Matcher functions should return an object in the following format:\n" +
+        "  {message?: string | function, pass: boolean}\n" +
+        "'" + shown + "' was returned");
+    }
+    let pass = !!res.pass; if (isNot) pass = !pass;
+    if (pass) return;
+    if (res.message === undefined || res.message === null)
+      throw assertionError("No message was specified for this matcher.");
+    throw assertionError(typeof res.message === "function" ? String(res.message()) : String(res.message));
   }
   function evalThrow(threw, err, isNot, expected) {
     let pass = threw, detail = "";
@@ -660,11 +685,34 @@ inline constexpr std::string_view HARNESS = R"JS(
   // reads S.customMatchers per-call, so matchers added here apply to every expect().
   expect.extend = function (obj) {
     if (!obj || typeof obj !== "object") throw new TypeError("expect.extend: expected an object of matchers");
-    for (const name of Object.keys(obj)) {
-      if (typeof obj[name] !== "function")
-        throw new TypeError("expect.extend: `" + name + "` is not a valid matcher. Received " + typeof obj[name]);
+    // Matchers may live on the prototype chain: `expect.extend(Object.create(base))`
+    // and `expect.extend(new SomeClass())` are both supported by bun, and class
+    // methods are non-enumerable, so neither Object.keys nor for..in finds them.
+    const names = [];
+    {
+      const seen = new Set();
+      let o = obj;
+      while (o && o !== Object.prototype && o !== Function.prototype) {
+        for (const n of Object.getOwnPropertyNames(o)) {
+          if (n === "constructor" || seen.has(n)) continue;
+          seen.add(n); names.push(n);
+        }
+        o = Object.getPrototypeOf(o);
+      }
     }
-    Object.assign(S.customMatchers, obj);
+    for (const name of names) {
+      if (typeof obj[name] !== "function")
+        throw new TypeError("expect.extend: `" + name + "` is not a valid matcher. Must be a function, is \"" +
+                            (obj[name] === null ? "null" : typeof obj[name]) + "\"");
+    }
+    for (const name of names) S.customMatchers[name] = obj[name];
+    // A bunfig `preload` extends the ONE process-wide expect; its matchers must
+    // survive the per-file reset that follows (engine.inc sets the flag around
+    // the preload loop). Matchers a test file registers stay file-scoped.
+    if (G.__mbunInPreload) {
+      if (!S.preloadMatchers) S.preloadMatchers = {};
+      for (const name of names) S.preloadMatchers[name] = obj[name];
+    }
     // bun (expect.rs makeAsymmetricMatchers / expect_static): every extended
     // matcher is ALSO exposed statically on `expect` so `expect.myMatcher(...exp)`
     // builds an asymmetric matcher whose asymmetricMatch(actual) runs the matcher
@@ -672,15 +720,33 @@ inline constexpr std::string_view HARNESS = R"JS(
     // asymmetricMatch unchanged (issue: _toThrowOnMatch). Registering the statics
     // also makes `expect.<name>` defined for the "is my matcher installed?" probe
     // (@testing-library/jest-dom, issue #16312).
-    for (const name of Object.keys(obj)) {
+    for (const name of names) {
       const matcherFn = obj[name];
-      expect[name] = function (...expected) {
-        return asym(name, function (actual) {
-          const ctx = { isNot: false, equals: deepEqual, promise: "", utils: { printReceived: fmt, printExpected: fmt, matcherHint: () => "", stringify: fmt, EXPECTED_COLOR: (s) => s, RECEIVED_COLOR: (s) => s } };
-          const res = matcherFn.call(ctx, actual, ...expected) || {};
-          return !!res.pass;
+      const run = (isNot) => function (...expected) {
+        return asym((isNot ? "not." : "") + name, function (actual) {
+          const ctx = { isNot: isNot, equals: deepEqual, promise: "", utils: { printReceived: fmt, printExpected: fmt, matcherHint: () => "", stringify: fmt, EXPECTED_COLOR: (s) => s, RECEIVED_COLOR: (s) => s } };
+          const out = matcherFn.call(ctx, actual, ...expected);
+          // asymmetricMatch has to answer with a boolean, but a matcher may be
+          // async. Settle it by draining the microtask queue (bun's asymmetric
+          // path likewise reads a settled value); a rejection propagates out of
+          // the enclosing toEqual, which is what the corpus asserts.
+          if (out && typeof out.then === "function") {
+            let state = 0, value, err;
+            out.then((v) => { state = 1; value = v; }, (e) => { state = 2; err = e; });
+            if (G.__mbunDrainMicrotasksNative) { try { G.__mbunDrainMicrotasksNative(); } catch (e) {} }
+            if (state === 2) throw err;
+            if (state === 0) return false;
+            const r = value || {};
+            return isNot ? !r.pass : !!r.pass;
+          }
+          const res = out || {};
+          return isNot ? !res.pass : !!res.pass;
         });
       };
+      expect[name] = run(false);
+      // `expect.not.<custom>(...)` — bun exposes every extended matcher on the
+      // negated namespace too, not just the six built-in asymmetric ones.
+      expect.not[name] = run(true);
     }
     return expect;
   };
@@ -1549,7 +1615,7 @@ inline constexpr std::string_view HARNESS = R"JS(
     S.root = fresh; S.current = fresh;
     S.pass = 0; S.fail = 0; S.skip = 0; S.expectCalls = 0; S.total = 0; S.todo = 0;
     S.skippedLabel = 0; S.onlyTests = 0; S.onlyScopes = 0;
-    S.out = []; S.customMatchers = {}; S.errors = []; S.pendingAsserts = [];
+    S.out = []; S.customMatchers = Object.assign({}, S.preloadMatchers); S.errors = []; S.pendingAsserts = [];
     S.timeoutReject = null; S.asyncErr = undefined; S.rand = null; S.skipDepth = 0;
     S.todoDepth = 0;   // a describe.todo left open by a throwing body
     S.sysTime = null;  // a file's fake system time must not leak into the next

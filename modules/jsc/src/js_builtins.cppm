@@ -51,6 +51,7 @@ export import :node_net;
 export import :node_fs_watch;
 export import :node_fs_streams;
 export import :bun_password;
+export import :bun_fs_router;
 export import :node_process_extra;
 export import :node_process_lifecycle;
 export import :node_util_extra;
@@ -140,6 +141,9 @@ export inline const std::string kNodeBuiltinsJS =
         // the fs module both already registered.
         .append(detail::kNodeFsStreamsJS)
         .append(detail::kBunPasswordJS)
+        // Bun.FileSystemRouter — needs node:fs registered (bootstrap) and the Bun
+        // namespace installed; both are in place by here.
+        .append(detail::kBunFsRouterJS)
         .append(detail::kNodeProcessExtraJS)
         // after node_process_extra: the uncaught-exception path consults the
         // capture-callback registry installed there.

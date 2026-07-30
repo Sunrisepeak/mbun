@@ -4849,7 +4849,14 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     // socketFaultInjection (blueprint src/js/internal-for-testing.ts:323): available()
     // is false unless built with --socket-fault-injection=on, so the six
     // *-syscall-fault suites self-skip exactly like a release bun.
-    socketFaultInjection: { available: () => false, set: () => false, clear: () => {} },
+    // set()/clear() must THROW when unavailable, not silently no-op: a test that
+    // arms a rule and then asserts on the fault would otherwise pass vacuously.
+    // bun's own wording is asserted on (/not compiled into this build/).
+    socketFaultInjection: {
+      available: () => false,
+      set: () => { throw new Error("socket fault injection is not compiled into this build"); },
+      clear: () => { throw new Error("socket fault injection is not compiled into this build"); },
+    },
     // translateUVErrorToE / translateNtStatusToE (ibid:382/388): Windows-only Rust
     // fns; off-Windows the tests assert they are functions returning undefined.
     translateUVErrorToE: () => undefined,
