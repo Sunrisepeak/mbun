@@ -2054,60 +2054,23 @@ inline constexpr std::string_view kNodeInternalBindingJS = R"JS(
   });
 
   // ----------------------------------------------------------- http_parser ----
-  // node src/node_http_parser.cc. The callback-slot indices and the type
-  // constants ARE the protocol between node's lib/_http_common.js and llhttp;
-  // this runtime parses HTTP in its own layer rather than through a JS-visible
-  // parser, so `execute`/`consume` report "not supported" instead of silently
-  // consuming nothing — a parser that swallows bytes is worse than one that
-  // says it cannot.
+  // node src/node_http_parser.cc. There is exactly ONE HTTPParser in node: the
+  // class this binding exports is what lib/_http_common.js recycles AND what
+  // `require('_http_common').HTTPParser` hands to user code, so this returns the
+  // runtime's own incremental parser (js_net.cppm) rather than a second class.
+  // It used to export a stub whose execute()/consume() threw "not supported" —
+  // and because bootstrap ALSO registered an empty `class HTTPParser {}` on
+  // `_http_common`, the real parser was unreachable from JS on every path.
+  //
+  // NOT frozen with strictNs: node's own test-http-parser-lazy-loaded replaces
+  // `binding.HTTPParser` before `_http_common` is first used, which is only
+  // observable if the namespace is writable and the free list reads it lazily.
   factories["http_parser"] = () => {
-    const P = class HTTPParser {
-      constructor() { this[HTTPParser.kOnMessageBegin] = undefined; }
-      initialize() {}
-      close() {}
-      free() {}
-      remove() {}
-      execute() { throw new Error("http_parser.execute is not supported"); }
-      finish() { return undefined; }
-      pause() {} resume() {}
-      consume() { throw new Error("http_parser.consume is not supported"); }
-      unconsume() {}
-      getCurrentBuffer() { return mod("buffer").Buffer.alloc(0); }
-      duration() { return 0; }
-      headersCompleted() { return false; }
-    };
-    // node src/node_http_parser.cc `enum parser_types` + the kOn* callback slots.
-    P.REQUEST = 1;
-    P.RESPONSE = 2;
-    P.kOnMessageBegin = 0;
-    P.kOnHeaders = 1;
-    P.kOnHeadersComplete = 2;
-    P.kOnBody = 3;
-    P.kOnMessageComplete = 4;
-    P.kOnExecute = 5;
-    P.kOnTimeout = 6;
-    P.kLenientNone = 0;
-    P.kLenientHeaders = 1 << 0;
-    P.kLenientChunkedLength = 1 << 1;
-    P.kLenientKeepAlive = 1 << 2;
-    P.kLenientTransferEncoding = 1 << 3;
-    P.kLenientVersion = 1 << 4;
-    P.kLenientDataAfterClose = 1 << 5;
-    P.kLenientOptionalLFAfterCR = 1 << 6;
-    P.kLenientOptionalCRLFAfterChunk = 1 << 7;
-    P.kLenientOptionalCRBeforeLF = 1 << 8;
-    P.kLenientSpacesAfterChunkSize = 1 << 9;
-    P.kLenientAll = (1 << 10) - 1;
-    return strictNs("http_parser", {
+    const P = globalThis.__mbunHttpParser;
+    const ns = {
       HTTPParser: P,
-      methods: [
-        "DELETE", "GET", "HEAD", "POST", "PUT", "CONNECT", "OPTIONS", "TRACE",
-        "COPY", "LOCK", "MKCOL", "MOVE", "PROPFIND", "PROPPATCH", "SEARCH",
-        "UNLOCK", "BIND", "REBIND", "UNBIND", "ACL", "REPORT", "MKACTIVITY",
-        "CHECKOUT", "MERGE", "M-SEARCH", "NOTIFY", "SUBSCRIBE", "UNSUBSCRIBE",
-        "PATCH", "PURGE", "MKCALENDAR", "LINK", "UNLINK", "SOURCE", "QUERY",
-      ],
-      allMethods: [],
+      methods: (P && P.methods) || [],
+      allMethods: (P && P.allMethods) || [],
       ConnectionsList: class ConnectionsList {
         constructor() { this._all = []; }
         all() { return this._all; }
@@ -2115,7 +2078,8 @@ inline constexpr std::string_view kNodeInternalBindingJS = R"JS(
         active() { return []; }
         expired() { return []; }
       },
-    });
+    };
+    return ns;
   };
 
   // ------------------------------------------------------------ signal_wrap ----
