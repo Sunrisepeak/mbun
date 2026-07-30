@@ -536,18 +536,273 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
     return true;
   }
 
+  function isNotLegacyObjectPrototypeMethod(str) {
+    return isIdentifier(str) &&
+      str !== "__defineGetter__" &&
+      str !== "__defineSetter__" &&
+      str !== "__lookupGetter__" &&
+      str !== "__lookupSetter__";
+  }
+
   function filteredOwnPropertyNames(obj) {
     if (!obj) return [];
-    const filter = ALL_PROPERTIES;
+    // `Object.prototype` is the only non-contrived object that fulfills
+    // `Object.getPrototypeOf(X) === null &&
+    //  Object.getPrototypeOf(Object.getPrototypeOf(X.constructor)) === X`.
+    // Only on that object does node hide the legacy __define*__/__lookup*__
+    // accessors from completion.
+    let isObjectPrototype = false;
+    try {
+      if (Object.getPrototypeOf(obj) === null) {
+        const ctorDescriptor = Object.getOwnPropertyDescriptor(obj, "constructor");
+        if (ctorDescriptor && ctorDescriptor.value) {
+          const ctorProto = Object.getPrototypeOf(ctorDescriptor.value);
+          isObjectPrototype = !!ctorProto && Object.getPrototypeOf(ctorProto) === obj;
+        }
+      }
+    } catch { /* fall through as a plain object */ }
     let names;
     try {
       names = Object.getOwnPropertyNames(obj);
     } catch { return []; }
-    return names.filter(isIdentifier);
+    // node uses getOwnNonIndexProperties(obj, ALL_PROPERTIES | SKIP_SYMBOLS);
+    // getOwnPropertyNames already skips symbols, and isIdentifier rejects the
+    // array index keys, so the surviving set is the same.
+    return names.filter(
+      isObjectPrototype ? isNotLegacyObjectPrototypeMethod : isIdentifier);
   }
-  const ALL_PROPERTIES = 0;
 
   function getGlobalLexicalScopeNames() { return []; }
+
+  // node's addCommonWords: only words which do not yet exist as a global
+  // property. Pushed as its own group, and only when there is a filter.
+  const COMMON_WORDS = [
+    "async", "await", "break", "case", "catch", "const", "continue",
+    "debugger", "default", "delete", "do", "else", "export", "false",
+    "finally", "for", "function", "if", "import", "in", "instanceof", "let",
+    "new", "null", "return", "switch", "this", "throw", "true", "try",
+    "typeof", "var", "void", "while", "with", "yield",
+  ];
+  function addCommonWords(completionGroups) {
+    completionGroups.push(COMMON_WORDS.slice());
+  }
+
+  // node runs acorn over the line and walks the AST to find the trailing
+  // sub-expression that tab completion should evaluate
+  // (internal/repl/completion.js findExpressionCompleteTarget). The acorn copy
+  // node uses lives in deps/, which the `internal/*` -> lib/internal/* module
+  // mapping can never reach, so this is a reverse scanner over the same
+  // grammar: from the end of the line, walk left over an identifier fragment
+  // and then over as many `.`/`?.`-joined members as the text supports,
+  // matching (), [] and quotes backwards so computed keys such as
+  // `obj[lookupObj["a" + " b"]].toFi` stay part of the target.
+  const DECLARATION_KEYWORD_RE = /(?:^|[^\w$])(?:let|const|var)\s+$/;
+  function findExpressionCompleteTarget(code) {
+    if (!code) return null;
+
+    // A trailing `.` or `?.` cannot terminate an expression, so strip it, find
+    // the target of the rest, and put it back.
+    if (code.endsWith(".")) {
+      if (code.length >= 2 && code[code.length - 2] === "?") {
+        const inner = findExpressionCompleteTarget(code.slice(0, -2));
+        return !inner ? inner : `${inner}?.`;
+      }
+      const inner = findExpressionCompleteTarget(code.slice(0, -1));
+      return !inner ? inner : `${inner}.`;
+    }
+
+    // Walk left over the trailing identifier fragment being completed.
+    let i = code.length;
+    while (i > 0 && /[\w$]/.test(code[i - 1])) i--;
+    const identStart = i;
+
+    // `let a` / `const foo` / `var x`: a declaration with no initialiser has
+    // nothing to complete on, so node's AST walk returns null here.
+    if (DECLARATION_KEYWORD_RE.test(code.slice(0, identStart))) return null;
+
+    // Walk left over member accesses. A `.`/`?.` joiner is optional, because
+    // bracket accesses chain directly (`obj["a"]["b"]`).
+    let start = identStart;
+    for (;;) {
+      let j = start;
+      let afterDot = false;
+      if (j > 0 && code[j - 1] === ".") {
+        j--;
+        if (j > 0 && code[j - 1] === "?") j--;
+        afterDot = true;
+      } else if (!(j > 0 && (code[j - 1] === "]" || code[j - 1] === ")"))) {
+        break;
+      }
+      const k = consumeAtomBackwards(code, j);
+      if (k < 0 || k >= j) {
+        // A `.` whose left-hand side is not a completable base means the line
+        // is not a member expression at all — `{}.a` is a block followed by
+        // junk, which acorn rejects and node completes nothing for.
+        if (afterDot) return null;
+        break;
+      }
+      start = k;
+    }
+
+    const target = code.slice(start);
+    if (target === "" || target === "." || target === "?.") return null;
+
+    // node only evaluates a base that bottoms out at an identifier with
+    // literal property keys (see includesProxiesOrGetters). Anything that
+    // could run user code — a call, an assignment, an increment — makes the
+    // whole target ineligible, which is what keeps tab completion free of
+    // side effects for `incCounter().`, `a=(counter+=1).foo.` and
+    // `arr[incCounter()].b`. Grouping parens around a literal such as
+    // `("").a` carry no call and stay eligible.
+    const base = code.slice(start, identStart);
+    if (/[\w$\])]\s*\(/.test(base)) return null;
+    if (/=|\+\+|--|;/.test(base)) return null;
+
+    return target;
+  }
+
+  const isProxyValue = (util.types && util.types.isProxy) || (() => false);
+
+  // node's includesProxiesOrGetters, over the target string instead of an AST:
+  // split the base into its root identifier plus one step per property access,
+  // then walk it checking each step for an own getter or a Proxy. `true` means
+  // "do not evaluate this, completing it could run user code".
+  function includesProxiesOrGetters(expr, evalInRepl) {
+    const steps = splitMemberPath(expr);
+    if (!steps) return false;
+    let obj;
+    try { obj = evalInRepl(steps.root); } catch { return false; }
+    // The root itself may already be a Proxy (`proxyObj.<TAB>`), in which case
+    // enumerating it would run the handler's traps.
+    if (isProxyValue(obj)) return true;
+    for (const step of steps.props) {
+      if (obj === null || obj === undefined) return false;
+      let key = step.name;
+      if (step.computed) {
+        // A computed key is itself an expression; only evaluate it when it is
+        // literal enough to be side-effect free (findExpressionCompleteTarget
+        // has already rejected calls and assignments).
+        try { key = evalInRepl(step.name); } catch { return false; }
+        if (typeof key !== "string" && typeof key !== "number") return false;
+      }
+      // Check for a getter BEFORE reading the value, so that a property which
+      // does have one is never triggered by this very check.
+      let desc;
+      try { desc = Object.getOwnPropertyDescriptor(obj, key); } catch { return false; }
+      if (desc && typeof desc.get === "function") return true;
+      let value;
+      try { value = obj[key]; } catch { return false; }
+      if (isProxyValue(value)) return true;
+      obj = value;
+    }
+    return false;
+  }
+
+  // Split a member expression such as `a.b["c"]` into { root: "a", props: [...] }.
+  // Returns null when the expression is not a plain identifier-rooted chain.
+  function splitMemberPath(expr) {
+    let i = 0;
+    while (i < expr.length && /[\w$]/.test(expr[i])) i++;
+    if (i === 0) return null;
+    const root = expr.slice(0, i);
+    const props = [];
+    while (i < expr.length) {
+      if (expr[i] === "?" && expr[i + 1] === ".") i += 2;
+      else if (expr[i] === ".") i += 1;
+      else if (expr[i] === "[") {
+        const close = matchForwards(expr, i, "[", "]");
+        if (close < 0) return null;
+        props.push({ name: expr.slice(i + 1, close), computed: true });
+        i = close + 1;
+        continue;
+      } else return null;
+      const start = i;
+      while (i < expr.length && /[\w$]/.test(expr[i])) i++;
+      if (i === start) return null;
+      props.push({ name: expr.slice(start, i), computed: false });
+    }
+    return { root, props };
+  }
+
+  // Given code[start] === open, return the index of the matching close, or -1.
+  function matchForwards(code, start, open, close) {
+    let depth = 0;
+    for (let i = start; i < code.length; i++) {
+      const c = code[i];
+      if (c === "\"" || c === "'" || c === "`") {
+        let j = i + 1;
+        for (; j < code.length; j++) {
+          if (code[j] === "\\") { j++; continue; }
+          if (code[j] === c) break;
+        }
+        if (j >= code.length) return -1;
+        i = j;
+        continue;
+      }
+      if (c === open) depth++;
+      else if (c === close) {
+        depth--;
+        if (depth === 0) return i;
+      }
+    }
+    return -1;
+  }
+
+  // Consume one member-access "atom" ending just before index `end` and return
+  // the index it starts at, or -1 if there is no atom there. A bracket or paren
+  // group also swallows the identifier naming it, so `obj["k"]` is one atom.
+  function consumeAtomBackwards(code, end) {
+    let k = end;
+    const prev = k > 0 ? code[k - 1] : "";
+    if (prev === ")" || prev === "]") {
+      const open = prev === ")" ? "(" : "[";
+      k = matchBackwards(code, k - 1, open, prev);
+      if (k < 0) return -1;
+      while (k > 0 && /[\w$]/.test(code[k - 1])) k--;
+      return k;
+    }
+    if (prev === "\"" || prev === "'" || prev === "`") {
+      return matchQuoteBackwards(code, k - 1, prev);
+    }
+    if (/[\w$]/.test(prev)) {
+      while (k > 0 && /[\w$]/.test(code[k - 1])) k--;
+      return k;
+    }
+    return -1;
+  }
+
+  // Given code[end] === close, return the index of the matching open bracket,
+  // or -1. Skips over nested brackets and quoted strings.
+  function matchBackwards(code, end, open, close) {
+    let depth = 0;
+    for (let i = end; i >= 0; i--) {
+      const c = code[i];
+      if (c === "\"" || c === "'" || c === "`") {
+        i = matchQuoteBackwards(code, i, c);
+        if (i < 0) return -1;
+        continue;
+      }
+      if (c === close) depth++;
+      else if (c === open) {
+        depth--;
+        if (depth === 0) return i;
+      }
+    }
+    return -1;
+  }
+
+  // Given code[end] === quote, return the index of the opening quote, or -1.
+  function matchQuoteBackwards(code, end, quote) {
+    for (let i = end - 1; i >= 0; i--) {
+      if (code[i] !== quote) continue;
+      // Count preceding backslashes to tell an escaped quote from a real one.
+      let bs = 0;
+      let j = i - 1;
+      while (j >= 0 && code[j] === "\\") { bs++; j--; }
+      if (bs % 2 === 0) return i;
+    }
+    return -1;
+  }
 
   function commonPrefix(strings) {
     if (!strings || strings.length === 0) return "";
@@ -565,6 +820,12 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
     // List of completion lists, one for each inheritance "level"
     let completionGroups = [];
     let completeOn, group;
+
+    // node internal/repl/completion.js drops the leading indentation before it
+    // looks at anything, so a line that is only whitespace is treated as an
+    // empty line and still yields the full global completion (with completeOn
+    // "" rather than undefined).
+    line = line.trimStart();
 
     // REPL commands (e.g. ".break").
     let filter = "";
@@ -622,13 +883,16 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
       completionGroups.push(getReplBuiltinLibs().map((lib) => `node:${lib}`));
       completionGroups.push(getReplBuiltinLibs());
     } else if (line.length === 0 || /\w|\.|\$/.test(line[line.length - 1])) {
-      match = simpleExpressionRE.exec(line);
-      if (line.length !== 0 && !match) {
-        completionGroups.push([]);
-        completeOn = "";
-      } else {
+      const completeTarget =
+        line.length === 0 ? line : findExpressionCompleteTarget(line);
+      if (line.length !== 0 && !completeTarget) {
+        // No completable target (e.g. `let a`, or `{ a: true }`): node returns
+        // no completions at all, and leaves completeOn undefined.
+        return completionGroupsLoaded();
+      }
+      {
         let expr = "";
-        completeOn = match ? match[0] : "";
+        completeOn = completeTarget;
         if (line.length !== 0) {
           const lastIndex = completeOn.lastIndexOf(".");
           if (lastIndex > -1) {
@@ -638,42 +902,80 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
             filter = completeOn;
           }
         }
+        // Optional chaining: the split above leaves the `?` on the expression
+        // (`console?.lo` -> expr `console?`), so peel it off and remember that
+        // the member joiner is `?.` rather than `.`.
+        let chaining = ".";
+        if (expr.endsWith("?")) {
+          expr = expr.slice(0, -1);
+          chaining = "?.";
+        }
         if (!expr) {
-          const contextProto = this.useGlobal ? G : this.context;
-          let obj = contextProto;
-          const seen = new Set();
-          while (obj) {
-            for (const n of filteredOwnPropertyNames(obj)) seen.add(n);
-            try { obj = Object.getPrototypeOf(obj); } catch { break; }
+          // One group per inheritance level, exactly as node does: the
+          // prototype chain first (walked away from the context), then the
+          // context's own names, then the keywords. completionGroupsLoaded
+          // unshifts, so this array order comes out reversed — keywords
+          // nearest the cursor, the far end of the prototype chain last.
+          completionGroups.push(getGlobalLexicalScopeNames());
+          let contextProto = this.context;
+          while ((contextProto = Object.getPrototypeOf(contextProto)) !== null) {
+            completionGroups.push(filteredOwnPropertyNames(contextProto));
           }
-          completionGroups.push([...seen]);
-          completionGroups.push(KEYWORDS);
+          const contextOwnNames = filteredOwnPropertyNames(this.context);
+          if (!this.useGlobal) {
+            // When the context is not `global`, builtins are not own
+            // properties of it, so they have to be added back by name.
+            for (const name of globalBuiltinNames()) contextOwnNames.push(name);
+          }
+          completionGroups.push(contextOwnNames);
+          if (filter !== "") addCommonWords(completionGroups);
         } else {
+          const evalInRepl = (src) => this.useGlobal
+            ? (0, eval)(src)
+            : vm.runInContext(src, this.context, { displayErrors: false });
+          // node walks the member chain first and bails out entirely if any
+          // step reads through a getter or a Proxy, so that merely pressing
+          // TAB cannot trigger user code (internal/repl/completion.js
+          // includesProxiesOrGetters).
+          if (includesProxiesOrGetters(expr, evalInRepl)) {
+            return completionGroupsLoaded();
+          }
           let obj;
           try {
-            obj = this.useGlobal
-              ? (0, eval)(expr)
-              : vm.runInContext(expr, this.context, { displayErrors: false });
+            obj = evalInRepl(expr);
           } catch { obj = undefined; }
+          // node builds one group per inheritance level (memberGroups) so that
+          // own properties shadow the ones further up the chain instead of
+          // being merged into a single sorted list.
+          const memberGroups = [];
           if (obj != null) {
-            if (typeof obj === "object" || typeof obj === "function") {
-              try {
-                let p = obj;
-                const seen = new Set();
-                let depth = 0;
-                while (p && depth++ < 4) {
-                  for (const n of filteredOwnPropertyNames(p)) seen.add(n);
-                  p = Object.getPrototypeOf(p);
-                }
-                completionGroups.push([...seen]);
-              } catch { /* ignore */ }
-            } else {
-              const proto = Object.getPrototypeOf(obj);
-              if (proto) completionGroups.push(filteredOwnPropertyNames(proto));
+            try {
+              let p;
+              if (typeof obj === "object" || typeof obj === "function") {
+                memberGroups.push(filteredOwnPropertyNames(obj));
+                p = Object.getPrototypeOf(obj);
+              } else {
+                p = obj.constructor ? obj.constructor.prototype : null;
+              }
+              // Circular refs possible? Let's guard against that.
+              let sentinel = 5;
+              while (p !== null && p !== undefined && sentinel-- !== 0) {
+                memberGroups.push(filteredOwnPropertyNames(p));
+                p = Object.getPrototypeOf(p);
+              }
+            } catch {
+              // Maybe a Proxy object without `getOwnPropertyNames` trap.
+              // We simply ignore it here, as we don't want to break the
+              // autocompletion.
             }
           }
-          if (filter !== "") filter = `${expr}.${filter}`;
-          completionGroups = completionGroups.map((g) => g.map((m) => `${expr}.${m}`));
+          if (memberGroups.length) {
+            expr += chaining;
+            for (const g of memberGroups) {
+              completionGroups.push(g.map((member) => `${expr}${member}`));
+            }
+            if (filter !== "") filter = `${expr}${filter}`;
+          }
         }
       }
     }
@@ -684,32 +986,38 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
       // Filter, sort (within each group), uniq and merge the completion groups.
       if (completionGroups.length && filter !== "") {
         const newCompletionGroups = [];
+        // node: "Filter is always case-insensitive following chromium
+        // autocomplete behavior." So `foo.b` offers `foo.BARbuz` too.
+        const lowerCaseFilter = filter.toLocaleLowerCase();
         for (const group3 of completionGroups) {
-          const filtered = group3.filter((elem) => elem.startsWith(filter));
+          const filtered = group3.filter(
+            (elem) => elem.toLocaleLowerCase().startsWith(lowerCaseFilter));
           if (filtered.length) newCompletionGroups.push(filtered);
         }
         completionGroups = newCompletionGroups;
       }
       const completions = [];
-      if (completionGroups.length) {
-        const uniqueSet = new Set();
-        const empty = Symbol("empty");
-        uniqueSet.add(empty);
-        for (const group4 of completionGroups) {
-          group4.sort((a, b) => (b < a ? 1 : -1));
-          const setSize = uniqueSet.size;
-          for (const entry of group4) {
-            if (!uniqueSet.has(entry)) {
-              completions.push(entry);
-              uniqueSet.add(entry);
-            }
+      // Unique completions across all groups. node seeds the set with "" so an
+      // empty entry inside a group can never be mistaken for a separator.
+      const uniqueSet = new Set();
+      uniqueSet.add("");
+      // Completion group 0 is the "closest" (least far up the inheritance
+      // chain) so its completions go LAST, to sit nearest the cursor in the
+      // REPL. That is why entries and separators are unshifted, not pushed.
+      for (const group4 of completionGroups) {
+        group4.sort((a, b) => (b > a ? 1 : -1));
+        const setSize = uniqueSet.size;
+        for (const entry of group4) {
+          if (!uniqueSet.has(entry)) {
+            completions.unshift(entry);
+            uniqueSet.add(entry);
           }
-          if (uniqueSet.size !== setSize) completions.push("");
         }
-        while (completions.length && completions[completions.length - 1] === "") {
-          completions.pop();
-        }
+        // Add a separator between groups.
+        if (uniqueSet.size !== setSize) completions.unshift("");
       }
+      // Remove obsolete group entry, if present.
+      if (completions[0] === "") completions.shift();
       callback(null, [completions, completeOn]);
     }
   }
@@ -1323,6 +1631,16 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
           }
         }
         context.global = context;
+        // mbun's util.types.isProxy recognises a Proxy by having wrapped the
+        // global Proxy constructor and remembered every instance (see
+        // node_util_extra); a fresh vm context gets JSC's own unwrapped Proxy,
+        // so proxies built inside the REPL would be invisible to it. Share the
+        // host's wrapped constructor so the completer's getter/Proxy bail-out
+        // can actually see them.
+        try {
+          const hostProxy = Object.getOwnPropertyDescriptor(G, "Proxy");
+          if (hostProxy) Object.defineProperty(context, "Proxy", hostProxy);
+        } catch { /* leave the context's own Proxy in place */ }
         const _console = new Console(this.output);
         Object.defineProperty(context, "console", {
           configurable: true, writable: true, value: _console,
