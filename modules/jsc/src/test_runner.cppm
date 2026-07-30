@@ -688,22 +688,29 @@ inline constexpr std::string_view HARNESS = R"JS(
     // Matchers may live on the prototype chain: `expect.extend(Object.create(base))`
     // and `expect.extend(new SomeClass())` are both supported by bun, and class
     // methods are non-enumerable, so neither Object.keys nor for..in finds them.
-    const names = [];
-    {
-      const seen = new Set();
-      let o = obj;
-      while (o && o !== Object.prototype && o !== Function.prototype) {
-        for (const n of Object.getOwnPropertyNames(o)) {
-          if (n === "constructor" || seen.has(n)) continue;
-          seen.add(n); names.push(n);
-        }
-        o = Object.getPrototypeOf(o);
-      }
-    }
+    // Own level: enumerable keys only, and every one of them must be callable
+    // (a non-function there is a caller mistake and is reported). Inherited
+    // levels contribute only their function-valued properties -- a module
+    // namespace passed straight through (issue #16312 does
+    // `expect.extend(matchers)`) carries non-enumerable bookkeeping like
+    // __esModule that must not be mistaken for a broken matcher.
+    const names = Object.keys(obj);
     for (const name of names) {
       if (typeof obj[name] !== "function")
         throw new TypeError("expect.extend: `" + name + "` is not a valid matcher. Must be a function, is \"" +
                             (obj[name] === null ? "null" : typeof obj[name]) + "\"");
+    }
+    {
+      const seen = new Set(names);
+      let o = Object.getPrototypeOf(obj);
+      while (o && o !== Object.prototype && o !== Function.prototype) {
+        for (const n of Object.getOwnPropertyNames(o)) {
+          if (n === "constructor" || seen.has(n)) continue;
+          seen.add(n);
+          if (typeof obj[n] === "function") names.push(n);
+        }
+        o = Object.getPrototypeOf(o);
+      }
     }
     for (const name of names) S.customMatchers[name] = obj[name];
     // A bunfig `preload` extends the ONE process-wide expect; its matchers must
