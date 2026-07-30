@@ -413,6 +413,36 @@ private:
         return false;
     }
 
+    // RFC 9112 §3.2 request-target. picohttpparser accepts any run of non-space
+    // bytes as the target, so the four legal forms have to be discriminated
+    // here or a garbage target is served as if it were a path:
+    //   origin-form    "/path?q"        — the overwhelmingly common case
+    //   absolute-form  "http://h/p"     — proxy-style; scheme is case-insensitive
+    //                                     and, for an origin server, only
+    //                                     http/https are meaningful
+    //   authority-form "host:port"      — CONNECT only
+    //   asterisk-form  "*"              — OPTIONS only
+    // Anything else (h1spec's "^", "H-TTP://…", "HTTPZ://…") is a 400. Rejecting
+    // is the safe half of the choice: a target this server and a front-end parse
+    // differently is a routing/smuggling differential.
+    static bool target_is_valid_(std::string_view method, std::string_view target) {
+        if (target.empty())
+            return false;
+        if (target.front() == '/')
+            return true;
+        // CONNECT's authority-form and OPTIONS' asterisk-form are accepted without
+        // further shape checks: h1spec exercises neither, so tightening them here
+        // would buy nothing and could only reject a tunnel/OPTIONS probe that
+        // works today.
+        if (iequals_(method, "CONNECT") || target == "*")
+            return true;
+        const auto sep { target.find("://") };
+        if (sep == std::string_view::npos)
+            return false;
+        const std::string_view scheme { target.substr(0, sep) };
+        return iequals_(scheme, "http") || iequals_(scheme, "https");
+    }
+
     static std::string_view trim_ows_(std::string_view v) {
         while (!v.empty() && (v.front() == ' ' || v.front() == '\t'))
             v.remove_prefix(1);
@@ -683,6 +713,23 @@ private:
                 return false;
             }
             conn.request.headers.emplace_back(std::string { h.name }, std::string { h.value });
+        }
+
+        // ── Request-line / Host validation ───────────────────────────────────
+        // Both checks must run BEFORE any framing decision: a request this
+        // server would route differently from a front-end is the same class of
+        // differential the framing rejections below exist to close.
+        if (!target_is_valid_(conn.request.method, conn.request.path)) {
+            fail_request_(handle, 400, "invalid request-target");
+            return false;
+        }
+        // RFC 9112 §3.2: an HTTP/1.1 request MUST include exactly one Host, and a
+        // server MUST answer 400 when it is absent. 1.0 predates the header, so
+        // it stays exempt (h1spec's "Valid GET request with HTTP/1.0" and every
+        // corpus HTTP/1.0 client rely on that split).
+        if (res.minor_version >= 1 && !conn.request.header("host")) {
+            fail_request_(handle, 400, "missing Host header");
+            return false;
         }
 
         // HTTP/1.1 defaults to keep-alive; 1.0 must opt in (RFC 7230 §6.3).

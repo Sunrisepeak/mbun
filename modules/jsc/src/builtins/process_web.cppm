@@ -3214,7 +3214,24 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       serr = opts.stderr != null ? opts.stderr : serr != null ? serr : "inherit";
       const norm = (v, d) => (v == null ? d : v === "pipe" || v === "ignore" || v === "inherit" || typeof v === "number" ? v : "ignore");
       const stdio = [norm(sin, "ignore"), norm(sout, "pipe"), norm(serr, "inherit")];
-      const h = PN.spawnEx(cmd[0], cmd, { cwd: opts.cwd ? toStr(opts.cwd) : undefined, env: opts.env && typeof opts.env === "object" ? opts.env : (G.process && G.process.env) || undefined, stdio });
+      // Bun.spawn({ ipc }) — a fourth stdio slot carrying the same AF_UNIX
+      // socketpair child_process.fork() uses, advertised to the child through
+      // NODE_CHANNEL_FD. The child half needs no new code: __mbunSetupIpcChild
+      // already turns that env var into process.send/process.channel/'message'.
+      // bun's own serialization for Bun.spawn is JSON (`serialization` is a
+      // child_process-only option), so the mode is pinned to json.
+      const ipcCb = typeof opts.ipc === "function" ? opts.ipc : null;
+      let ipcEnv = opts.env && typeof opts.env === "object" ? opts.env : (G.process && G.process.env) || undefined;
+      if (ipcCb) {
+        stdio.push("ipc");
+        const e = {};
+        const base = ipcEnv || {};
+        for (const k in base) { const v = base[k]; if (v !== undefined) e[k] = String(v); }
+        e.NODE_CHANNEL_FD = String(stdio.length - 1);
+        e.NODE_CHANNEL_SERIALIZATION_MODE = "json";
+        ipcEnv = e;
+      }
+      const h = PN.spawnEx(cmd[0], cmd, { cwd: opts.cwd ? toStr(opts.cwd) : undefined, env: ipcEnv, stdio });
       if (h.errno != null) { const code = ERRNO[h.errno] || ("errno " + h.errno); const e = new Error("spawn " + cmd[0] + " " + code); e.code = code; e.errno = -1; e.syscall = "spawn " + cmd[0]; throw e; }
       let exitResolve; const exitedP = new Promise((r) => (exitResolve = r));
       const proc = { pid: h.pid, exitCode: null, signalCode: null, killed: false, exited: exitedP, exitedDueToMaxBuffer: false, exitedDueToTimeout: false, ref() {}, unref() {}, resourceUsage() { return __mbunResourceUsage(); } };
@@ -3257,6 +3274,30 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       if (errStd) { PN.setNonBlock(fds[2]); rec.outs.push({ fd: fds[2], stream: errStd, ended: false }); }
       proc.stdout = outStd || bunBody(""); proc.stderr = errStd || bunBody("");
       proc.stdin = null;
+      if (ipcCb && fds[3] != null && fds[3] >= 0) {
+        // attachIpc installs send/channel/connected/disconnect, and its error
+        // paths call target.emit(...) — proc is a plain object, so give it a
+        // minimal emitter first. `subprocess.send` is the documented Bun API for
+        // the parent half; the callback is how the parent RECEIVES.
+        proc.emit = function (ev, a) { if (ev === "error" && a) throw a; return false; };
+        rec.ipc = makeIpc(fds[3], false);
+        // Unlike ChildProcess, the Bun subprocess has no 'message' event to gate
+        // on, so deliver straight to the callback rather than through
+        // makeIpcDelivery's listenerCount-driven queue. Internal frames
+        // (NODE_HANDLE and friends) are protocol, never user messages.
+        rec.ipcDelivery = {
+          deliver(msg, handle) {
+            if (isInternalIpc(msg)) return;
+            try { ipcCb(msg, proc); } catch (e) {
+              const pr = G.process;
+              if (pr && typeof pr.listenerCount === "function" && pr.listenerCount("uncaughtException") > 0) pr.emit("uncaughtException", e);
+              else throw e;
+            }
+          },
+          flush() {},
+        };
+        attachIpc(proc, rec.ipc, null);
+      }
       if (stdio[0] === "pipe" && fds[0] >= 0) {
         // FileSink-flavoured stdin over the non-blocking write queue: bytes are
         // buffered on rec.stdinBuf and flushed by __mbun_io_tick (never blocks
@@ -3374,7 +3415,12 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       // spawnPipes path drains stdout/stderr with BLOCKING reads, which parks
       // the JS thread and starves the virtual event loop (deadlocking a child
       // that talks to an in-process Bun.serve, e.g. bun-install's registry).
-      if (PN && PN.spawnEx && (stdinIsKeyword(s.opts.stdin) || s.opts.stdin === "pipe")) {
+      // An `ipc` callback pins the spawnEx path unconditionally: it is the only
+      // one that opens the fourth (channel) stdio slot and pumps it from
+      // __mbun_io_tick. The sync runNative fallback below would silently drop the
+      // channel, so the child's process.send would be undefined — which is how
+      // every Bun.spawn IPC fixture in the corpus used to die.
+      if (PN && PN.spawnEx && (typeof s.opts.ipc === "function" || stdinIsKeyword(s.opts.stdin) || s.opts.stdin === "pipe")) {
         return spawnAsyncBun(s.cmd, s.opts);
       }
       if (PN && PN.spawn && s.opts.stdin === "pipe") return spawnPipes(s.cmd, s.opts);
