@@ -550,11 +550,21 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
             return;
           }
           if (name && typeof name === "object") { options = name; name = options.name; value = options.value; }
-          _name = String(name); this.value = String(value); options = options || {};
+          _name = String(name); options = options || {};
+          // bun stores the value as WTF-8: a LONE surrogate is replaced with
+          // U+FFFD on the way in (both at construction and through the setter),
+          // which is also why appendTo's encodeURIComponent can never throw.
+          let _value = sanitizeCookieValue(String(value));
+          Object.defineProperty(this, "value", { get() { return _value; }, set(v) { _value = sanitizeCookieValue(String(v)); }, enumerable: true, configurable: true });
           Object.defineProperty(this, "name", { get() { return _name; }, set(v) {}, enumerable: true, configurable: true });
           // An explicit empty path ("") is preserved so appendTo omits the Path attribute;
-          // only an absent path defaults to "/".
-          this.domain = options.domain || null; this.path = (options.path === undefined || options.path === null) ? "/" : options.path;
+          // only an absent path defaults to "/". Assigning either attribute later
+          // validates (and leaves the old value in place on rejection), even though
+          // the constructor does not validate the path.
+          let _domain = options.domain || null;
+          let _path = (options.path === undefined || options.path === null) ? "/" : options.path;
+          Object.defineProperty(this, "domain", { get() { return _domain; }, set(v) { const d = v === null || v === undefined ? null : String(v); if (d !== null && !isValidCookieDomain(d)) throw new Error("Invalid cookie domain: contains invalid characters"); _domain = d; }, enumerable: true, configurable: true });
+          Object.defineProperty(this, "path", { get() { return _path; }, set(v) { const p = String(v); if (!isValidCookiePath(p)) throw new Error("Invalid cookie path: contains invalid characters"); _path = p; }, enumerable: true, configurable: true });
           this.secure = !!options.secure; this.httpOnly = !!options.httpOnly;
           this.sameSite = options.sameSite || "lax"; this.maxAge = options.maxAge; this.partitioned = !!options.partitioned;
           const e = options.expires;
@@ -562,6 +572,15 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
           else if (e instanceof Date) { if (isNaN(e.getTime())) throw new Error("expires must be a valid Date (or Number)"); this.expires = e; }
           else if (typeof e === "number") { if (!isFinite(e)) throw new Error("expires must be a valid Number"); this.expires = new Date(e * 1000); }
           else throw new Error("expires must be a valid Date (or Number)");
+          // bun Cookie.cpp validates the name, the domain and sameSite at
+          // construction — a name/domain carrying CTLs, a space, ';' or '=' would
+          // let a caller smuggle extra Set-Cookie attributes. The PATH is
+          // deliberately NOT validated: bun accepts `/; Path=/x` (cookie.test.js
+          // marks its own path-validation test `.failing`), and sameSite is
+          // case-SENSITIVE, so "Lax" is rejected while "lax" is not.
+          if (!isValidCookieName(_name)) throw new Error("Invalid cookie name: contains invalid characters");
+          if (this.domain !== null && this.domain !== undefined && !isValidCookieDomain(String(this.domain))) throw new Error("Invalid cookie domain: contains invalid characters");
+          if (this.sameSite !== "strict" && this.sameSite !== "lax" && this.sameSite !== "none") throw new Error("Invalid sameSite value. Must be 'strict', 'lax', or 'none'");
         }
         isExpired() { if (this.maxAge != null) return this.maxAge <= 0; return this.expires instanceof Date && this.expires.getTime() < Date.now(); }
         serialize() { return this.toString(); }
@@ -609,9 +628,12 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
       // bun Cookie.cpp validators. Names: [!-:<>-~]+
       // (non-empty). Paths: [ -:=-~]* (may be empty).
       // Domains: [a-z0-9.-]*.
+      // Lone (unpaired) surrogate → U+FFFD, matching the WTF-8 conversion bun does
+      // when it stores a cookie value.
+      const sanitizeCookieValue = (s) => s.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, "�");
       const isValidCookieName = (s) => { if (s.length === 0) return false; for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); if (!((c >= 0x21 && c <= 0x3A) || c === 0x3C || (c >= 0x3E && c <= 0x7E))) return false; } return true; };
       const isValidCookiePath = (s) => { for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); if (!((c >= 0x20 && c <= 0x3A) || (c >= 0x3D && c <= 0x7E))) return false; } return true; };
-      const isValidCookieDomain = (s) => { for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); if (!((c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c === 46 || c === 45)) return false; } return true; };
+      const isValidCookieDomain = (s) => { for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); if (!((c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c === 46 || c === 45)) return false; } return true; };
       // ref: bun src/jsc/bindings/CookieMap.{h,cpp} — two ordered lists, not one map.
       // `_orig` mirrors m_originalCookies (parsed from the request's Cookie header);
       // `_mod` mirrors m_modifiedCookies (only what .set()/.delete() touched).
@@ -630,7 +652,11 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
               const i = part.indexOf("="); if (i < 0) continue;
               const name = part.slice(0, i).trim(); if (name === "") continue;
               let value = part.slice(i + 1).trim();
-              if (hasPct) { try { value = decodeURIComponent(value); } catch (e) {} }
+              // A malformed escape (`foo=%1`) DROPS the pair: it neither survives
+              // verbatim (cookie.test.js marks "should return original value on
+              // escape error" `.failing`) nor aborts the whole header
+              // ("should ignore duplicate cookies" parses `foo=%1;bar=bar;foo=boo`).
+              if (hasPct) { try { value = decodeURIComponent(value); } catch (e) { continue; } }
               this._orig.push([name, value]);
             }
           } else if (Array.isArray(init)) {

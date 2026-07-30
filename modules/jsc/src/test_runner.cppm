@@ -275,7 +275,20 @@ inline constexpr std::string_view HARNESS = R"JS(
         for (let i = 0; i < ua.length; i++) if (ua[i] !== ub[i]) return false;
         return true;
       }
-      if (strictKeys && Object.getPrototypeOf(a) !== Object.getPrototypeOf(b)) return false;
+      if (strictKeys) {
+        const pa = Object.getPrototypeOf(a), pb = Object.getPrototypeOf(b);
+        // bun/jest strict equality compares the values' TYPE, not the identity of
+        // their prototype object (jest expect-utils `typeEquality`, i.e.
+        // a.constructor === b.constructor): a class instance is never strictly
+        // equal to a plain object, but two objects that merely had distinct
+        // (structurally identical) prototypes installed still are. Prototype
+        // identity would make `JSON.parse('{"__proto__":{...}}')`-shaped values
+        // impossible to assert against an object literal.
+        if (pa !== pb) {
+          if (a.constructor !== b.constructor) return false;
+          if (!deepEqualImpl(pa, pb, strictKeys, seen)) return false;
+        }
+      }
       // Arrays compare by index + length ONLY. bun's Bun__deepEquals
       // (bindings.cpp) walks the array branch reading slots with
       // getIndexWithoutAccessors — a hole, an out-of-range index and an accessor
