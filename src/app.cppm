@@ -1219,31 +1219,35 @@ int run_test(std::span<const std::string_view> args) {
     return (fail > 0 || (!flags.passWithNoTests && labelFilteredAll)) ? 1 : 0;
 }
 
+int run_add(std::span<const std::string_view> args);
+
 int run_install(std::span<const std::string_view> args) {
-    mbun::install::command::InstallOptions options{};
-    for (std::size_t i{0}; i < args.size(); ++i) {
-        std::string_view arg{args[i]};
-        if (arg == "--frozen-lockfile") {
-            options.frozenLockfile = true;
-        } else if (arg == "--ignore-scripts") {
-            options.ignoreScripts = true;
-        } else if (arg == "--no-progress") {
-            options.noProgress = true;
-        } else if (arg == "--lockfile-only") {
-            options.lockfileOnly = true;
-        } else if (arg == "--save-text-lockfile") {
-            options.saveTextLockfile = true;
-        } else if (arg == "--force" || arg == "-f") {
-            options.force = true;
-        } else if (arg == "--registry" && i + 1 < args.size()) {
-            options.registry.assign(args[++i]);
-        } else if (arg.starts_with("--registry=")) {
-            options.registry.assign(arg.substr(std::string_view{"--registry="}.size()));
-        } else {
-            std::println(std::cerr, "error: unsupported install argument '{}'", arg);
-            return 2;
-        }
+    auto flags{mbun::cli::parse_install(args)};
+    if (!flags.parseError.empty()) {
+        std::println(std::cerr, "error: {}", flags.parseError);
+        return 2;
     }
+    if (!flags.unsupported.empty()) {
+        std::println(std::cerr, "error: unsupported install argument '{}'",
+                     flags.unsupported.front());
+        return 2;
+    }
+    // `bun install <pkg>...` IS `bun add <pkg>...` — bun gates the update-request
+    // path on `Subcommand::Add | Subcommand::Install` alike
+    // (ref: CommandLineArguments.rs:1307-1314), and bun-add.test.ts:2191 asserts
+    // `install --save X` and `add X` produce the same package.json.
+    if (!flags.packages.empty()) {
+        return run_add(args);
+    }
+
+    mbun::install::command::InstallOptions options{};
+    options.frozenLockfile = flags.frozenLockfile;
+    options.ignoreScripts = flags.ignoreScripts;
+    options.noProgress = flags.noProgress;
+    options.lockfileOnly = flags.lockfileOnly;
+    options.saveTextLockfile = flags.saveTextLockfile;
+    options.force = flags.force;
+    options.registry = flags.registry;
 
     // Installing a project: judge its package.json engines with the compat
     // versions (warn-only, npm non-strict).
@@ -1405,9 +1409,29 @@ int run_add(std::span<const std::string_view> args) {
         list = editor::List::PeerDependencies;
     }
 
+    const auto packageJsonPath{find_package_json(std::filesystem::current_path())};
+    if (!packageJsonPath) {
+        std::println(std::cerr, "error: could not find package.json");
+        return 1;
+    }
+    const std::filesystem::path projectRoot{packageJsonPath->parent_path()};
+
     // ── parse the update requests ──────────────────────────────────────────
     std::vector<AddRequest> requests;
     for (const auto& spec : flags.packages) {
+        // A folder/link positional carries no package name — `file:../pkg` is
+        // ALL specifier. bun leaves such a request nameless and back-patches the
+        // name from the package the install pass resolved (UpdateRequest.rs
+        // :274-286 → lockfile.rs:1267-1283 → PackageJSONEditor.rs:826-876);
+        // mbun's folder resolver is synchronous, so the target's own
+        // package.json "name" is readable here and the literal is written
+        // through verbatim. Without this the whole specifier became the
+        // dependency KEY and the install died on `unsafe dependency name`
+        // (command.cppm:1199 — a key containing ':' is never a safe folder).
+        if (auto folderName{mbun::install::command::folder_positional_name(projectRoot, spec)}) {
+            requests.push_back(AddRequest{std::move(*folderName), std::string{spec}, false});
+            continue;
+        }
         auto [name, version] = mbun::install::dependency::split_name_and_maybe_version(spec);
         if (name.empty()) {
             // ref: UpdateRequest.rs:216-232 `unrecognised dependency format: {}`.
@@ -1430,12 +1454,6 @@ int run_add(std::span<const std::string_view> args) {
         requests.push_back(std::move(request));
     }
 
-    const auto packageJsonPath{find_package_json(std::filesystem::current_path())};
-    if (!packageJsonPath) {
-        std::println(std::cerr, "error: could not find package.json");
-        return 1;
-    }
-
     std::string source;
     {
         std::ifstream file{*packageJsonPath, std::ios::binary};
@@ -1456,6 +1474,28 @@ int run_add(std::span<const std::string_view> args) {
         std::println(std::cerr, "error: failed to parse package.json \"{}\"",
                      packageJsonPath->string());
         return 1;
+    }
+
+    // ── --only-missing: drop requests package.json already declares ────────
+    // PORT-SOURCE: PackageJSONEditor.rs:555 + :669-688 — the scan covers all
+    // FOUR dependency groups (`DependencyGroup::FOUR`, :589), not just the one
+    // this add targets, and a hit swap-removes the request from `updates`
+    // rather than rebinding its version string, so the existing entry keeps its
+    // original range byte-for-byte.
+    if (flags.onlyMissing && document->root && document->root->is_object()) {
+        constexpr std::array GROUPS{editor::List::Dependencies, editor::List::DevDependencies,
+                                    editor::List::OptionalDependencies,
+                                    editor::List::PeerDependencies};
+        const auto alreadyDeclared{[&](const std::string& name) {
+            return std::ranges::any_of(GROUPS, [&](editor::List group) {
+                const json::Value* listObject{document->root->get(editor::list_name(group))};
+                return listObject != nullptr && listObject->is_object() &&
+                       listObject->get(name) != nullptr;
+            });
+        }};
+        std::erase_if(requests, [&](const AddRequest& request) {
+            return alreadyDeclared(request.name);
+        });
     }
 
     // ── phase 1: write the requested literals, then install ────────────────
