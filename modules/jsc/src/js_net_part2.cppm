@@ -1173,6 +1173,14 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
     const srvLenientHeaders = o.httpValidation === undefined
       ? o.insecureHTTPParser === true
       : (o.httpValidation === "relaxed" || o.httpValidation === "insecure");
+    // lib/_http_server.js Server: `this[kOptimizeEmptyRequests] =
+    // options.optimizeEmptyRequests || false`. A request with no body framing is
+    // then dumped and closed BEFORE the handler runs, so the Readable life cycle
+    // ('data'/'end'/'close') is skipped entirely.
+    if (o.optimizeEmptyRequests !== undefined) {
+      vBool(o.optimizeEmptyRequests, "options.optimizeEmptyRequests");
+    }
+    const optimizeEmptyRequests = o.optimizeEmptyRequests || false;
     // lib/_http_server.js Server: `this[kUniqueHeaders] =
     // parseUniqueHeadersOption(options.uniqueHeaders)`, handed to every response.
     const kUniqueHeadersSym = HI.kUniqueHeaders;
@@ -1612,7 +1620,16 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
         // lib/_http_server.js connectionListenerInternal: the server's own
         // insecureHTTPParser flag selects llhttp's lenient flags for inbound
         // requests, exactly as the client option does for responses.
-        if (o.insecureHTTPParser || o.httpValidation === "insecure") parser.lenient = true;
+        // `--insecure-http-parser` is a PROCESS-wide default that
+        // lib/_http_common.js isLenient() folds in whenever the server set
+        // neither option; only the per-server options were consulted here, so the
+        // flag did nothing on the server side (test-http-insecure-parser).
+        if (o.insecureHTTPParser === undefined && o.httpValidation === undefined) {
+          if (typeof HI.processInsecureHTTPParser === "function" && HI.processInsecureHTTPParser()) {
+            parser.lenient = true;
+          }
+        }
+        else if (o.insecureHTTPParser || o.httpValidation === "insecure") parser.lenient = true;
         // httpValidation: 'relaxed' is llhttp's lenient_header_value_relaxed and
         // ONLY that -- inbound header values may carry control bytes, while
         // obs-fold and a duplicate Transfer-Encoding stay rejected (which is the
@@ -1867,6 +1884,20 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
           const keepAlive = (im.httpVersionMajor === 1 && im.httpVersionMinor === 1)
             ? connTokens.indexOf("close") === -1
             : connTokens.indexOf("keep-alive") !== -1;
+
+          // node lib/_http_server.js parserOnIncoming:
+          //   const shouldOptimize = server[kOptimizeEmptyRequests] === true &&
+          //                          !hasBodyHeaders(req.headers);
+          //   if (shouldOptimize) { req._dumpAndCloseReadable(); req._read(); }
+          // hasBodyHeaders is `'content-length' in headers ||
+          // 'transfer-encoding' in headers` -- nothing else, so a bodyless
+          // POST/DELETE is optimized too and a `Content-Length: 0` GET is not
+          // (test-http-server-optimize-empty-requests walks all eight shapes).
+          if (optimizeEmptyRequests &&
+              !("content-length" in im.headers) && !("transfer-encoding" in im.headers)) {
+            if (typeof im._dumpAndCloseReadable === "function") im._dumpAndCloseReadable();
+            if (typeof im._read === "function") im._read();
+          }
 
           res = new ResponseClass(im, {
             highWaterMark: sock.writableHighWaterMark,
