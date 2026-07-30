@@ -197,6 +197,20 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
         list.map((x) => typeof x === "string" ? "'" + x + "'" : String(x)).join(", "));
     }
   };
+  // node internal/options.js getOptionValue('--insecure-http-parser').
+  // `__mbunHttpNative` never carried this flag, so every reader of
+  // `__mbunHttpNative.insecureHTTPParser` -- this port's client parser setup and
+  // _http_common.isLenient -- was comparing against `undefined` and the
+  // process-wide switch did nothing (test-http-insecure-parser). Read execArgv
+  // LAZILY: the builtins image is evaluated before process.execArgv exists.
+  const processInsecureHTTPParser = () => {
+    if (G.__mbunHttpNative && G.__mbunHttpNative.insecureHTTPParser !== undefined) {
+      return !!G.__mbunHttpNative.insecureHTTPParser;
+    }
+    const argv = (G.process && G.process.execArgv) || [];
+    for (let i = 0; i < argv.length; i++) if (argv[i] === "--insecure-http-parser") return true;
+    return false;
+  };
   // internal/timers.js getTimerDuration
   const getTimerDuration = (msecs, name) => {
     validateNumber(msecs, name);
@@ -1293,6 +1307,21 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
   }
   IncomingMessage.prototype._addHeaderLine = _addHeaderLine;
   IncomingMessage.prototype._addHeaderLineDistinct = _addHeaderLineDistinct;
+  // lib/_http_incoming.js _dumpAndCloseReadable: the `optimizeEmptyRequests`
+  // fast path. A request known to carry no body is walked straight to the end of
+  // the Readable life cycle -- ended, endEmitted, destroyed, closed -- so nothing
+  // downstream schedules 'data'/'end'/'close' for it at all.
+  IncomingMessage.prototype._dumpAndCloseReadable = function _dumpAndCloseReadable() {
+    this._dumped = true;
+    const st = this._readableState;
+    if (st) {
+      st.ended = true;
+      st.endEmitted = true;
+      st.destroyed = true;
+      st.closed = true;
+      st.closeEmitted = true;
+    }
+  };
   IncomingMessage.prototype._dump = function _dump() {
     if (!this._dumped) {
       this._dumped = true;
@@ -1971,7 +2000,7 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
     parser.lenient = request.httpValidation === "insecure"
       || (request.httpValidation === undefined
           && (request.insecureHTTPParser === undefined
-              ? !!(G.__mbunHttpNative && G.__mbunHttpNative.insecureHTTPParser)
+              ? processInsecureHTTPParser()
               : !!request.insecureHTTPParser));
     // 'relaxed' relaxes inbound header VALUES only -- not obs-fold, not a
     // duplicate Transfer-Encoding (test-http-header-value-relaxed test 10).
@@ -2518,9 +2547,7 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
       },
       enumerable: true, configurable: true,
     });
-    hc.isLenient = function () {
-      return !!(G.__mbunHttpNative && G.__mbunHttpNative.insecureHTTPParser);
-    };
+    hc.isLenient = function () { return processInsecureHTTPParser(); };
     hc.calculateLenientFlags = function (httpValidation, insecureHTTPParserOption) {
       const HP = realParser() || {};
       if (httpValidation === "strict") return HP.kLenientNone | 0;
@@ -2621,7 +2648,7 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
     ERR_HTTP_HEADERS_SENT, ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE,
     ERR_HTTP_INVALID_STATUS_CODE, ERR_INVALID_CHAR, ERR_OUT_OF_RANGE,
     validateInteger, validateNumber, validateBoolean, validateObject, validateString,
-    getTimerDuration, parseUniqueHeadersOption,
+    getTimerDuration, parseUniqueHeadersOption, processInsecureHTTPParser,
     kConnectionsCheckingInterval, kServerResponse, kIncomingMessage, kLenientHeaders,
     parsersFreeList, freeParser, clearIncoming,
     // js_net's server transport needs node's exact abort error for
