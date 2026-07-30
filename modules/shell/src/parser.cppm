@@ -442,16 +442,23 @@ private:
         return tokens_.back().tag;
     }
 
-    // ── char source (ASCII) with backslash escaping ──
+    // ── char source (byte-transparent) with backslash escaping ──
     // ref: parse.rs ShellCharIter::read_char
+    //
+    // Bytes are passed through unmasked. This used to be `& 0x7F` ("ASCII"),
+    // which silently cleared the high bit of every UTF-8 continuation/lead
+    // byte: `$`echo ${"Í"}`` emitted C3 8D as 43 0D ("C\r") and "€" as
+    // 62 02 2C. No shell metacharacter is >= 0x80, so a raw byte can never be
+    // confused with one, and append_char already truncates to a byte.
+    // ref: regression 17244.
     std::optional<InputChar> read_char() {
         if (i_ >= src_.size()) return std::nullopt;
-        std::uint32_t c = static_cast<unsigned char>(src_[i_]) & 0x7F;
+        std::uint32_t c = static_cast<unsigned char>(src_[i_]);
         if (c != '\\' || state_ == CharState::Single)
             return InputChar{c, false};
         // backslash
         if (i_ + 1 >= src_.size()) return std::nullopt;
-        std::uint32_t nxt = static_cast<unsigned char>(src_[i_ + 1]) & 0x7F;
+        std::uint32_t nxt = static_cast<unsigned char>(src_[i_ + 1]);
         if (state_ == CharState::Normal) {
             return InputChar{nxt, true};
         }

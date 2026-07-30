@@ -379,17 +379,34 @@ JSValueRef osn_setprio_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_
     return o;
 }
 
+// Every tty entry point below takes a descriptor that JS obtained from
+// node:fs, and those are mbun VIRTUAL fds (fd_table(), numbered from 1000) —
+// not descriptors the kernel knows. `new tty.ReadStream(fs.openSync("/dev/tty"))`
+// therefore reported isTTY false and setRawMode failed with EBADF(9), which is
+// the whole "read piped stdin, then reopen /dev/tty" TUI pattern. Resolve the
+// virtual fd to its real one first, exactly as fsn_fstat_cb does, and fall back
+// to the number itself for stdio (0/1/2) and inherited descriptors that mbun
+// never handed out. ref: regression tty-reopen-after-stdin-eof.
+std::unordered_map<int, mbun::core::io::File>& fd_table();
+inline int osn_real_fd(int vfd) {
+    if (vfd < 0) return -1;
+    auto& tbl{fd_table()};
+    auto it{tbl.find(vfd)};
+    if (it != tbl.end() && it->second.is_open()) return it->second.native_fd();
+    return vfd;
+}
+
 // isatty(fd) → bool
 JSValueRef osn_isatty_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                          const JSValueRef args[], JSValueRef*) {
-    const int fd{osn_arg_int(ctx, argc, args, 0, -1)};
+    const int fd{osn_real_fd(osn_arg_int(ctx, argc, args, 0, -1))};
     return JSValueMakeBoolean(ctx, fd >= 0 && ::isatty(fd) == 1);
 }
 
 // ttySize(fd) → [cols, rows] | null (ioctl TIOCGWINSZ)
 JSValueRef osn_ttysize_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                           const JSValueRef args[], JSValueRef*) {
-    const int fd{osn_arg_int(ctx, argc, args, 0, -1)};
+    const int fd{osn_real_fd(osn_arg_int(ctx, argc, args, 0, -1))};
     struct winsize ws {};
     if (fd < 0 || ::ioctl(fd, TIOCGWINSZ, &ws) != 0) return JSValueMakeNull(ctx);
     JSValueRef items[2]{JSValueMakeNumber(ctx, ws.ws_col), JSValueMakeNumber(ctx, ws.ws_row)};
@@ -400,7 +417,7 @@ JSValueRef osn_ttysize_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_
 // mirror of libuv uv_tty_set_mode(UV_TTY_MODE_RAW).
 JSValueRef osn_setrawmode_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                              const JSValueRef args[], JSValueRef*) {
-    const int fd{osn_arg_int(ctx, argc, args, 0, -1)};
+    const int fd{osn_real_fd(osn_arg_int(ctx, argc, args, 0, -1))};
     const bool raw{argc > 1 && JSValueToBoolean(ctx, args[1])};
     struct termios t {};
     if (fd < 0 || ::tcgetattr(fd, &t) != 0) return JSValueMakeNumber(ctx, errno);

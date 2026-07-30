@@ -342,7 +342,17 @@ int main(int argc, char* argv[]) {
             // (node_process.rs), so `mbun -e <code> foo` puts foo at argv[1],
             // matching node. Emitting "[eval]" there shifted every user arg by one.
             std::vector<std::string> jsArgv{"mbun"};
-            for (std::string_view a : std::span{args}.subspan(2)) jsArgv.emplace_back(a);
+            {
+                // A single leading `--` after the eval string is the option
+                // terminator, not a user argument: node's test-cli-eval.js
+                // runs `--eval <code> -- <args>` and asserts argv.slice(1) is
+                // exactly <args>. Only the FIRST one is consumed — with
+                // `-- --` the second `--` is a real argument.
+                // ref: regression 17294.
+                auto rest{std::span{args}.subspan(2)};
+                if (!rest.empty() && rest[0] == "--") rest = rest.subspan(1);
+                for (std::string_view a : rest) jsArgv.emplace_back(a);
+            }
             mbun::jsc::runtime::set_argv(std::move(jsArgv));
             std::string code{args[1]};
             // `-p`/`--print` prints the expression result.

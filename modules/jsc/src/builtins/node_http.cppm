@@ -946,7 +946,13 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
     this._sent100 = false;
     this._expect_continue = false;
     if (reqMsg && (reqMsg.httpVersionMajor < 1 || reqMsg.httpVersionMinor < 1)) {
-      this.useChunkedEncodingByDefault = chunkExpression.test(reqMsg.headers.te);
+      // node reads `TE: chunked` here and would chunk-frame the reply. bun's
+      // writer never chunk-frames an HTTP/1.0 response — an HTTP/1.0 client
+      // (nginx proxy_http_version 1.0) cannot decode chunked, so advertising
+      // it while the body goes out close-delimited is what produced the 502 in
+      // the issue. Close-delimited is the only safe framing at 1.0.
+      // ref: regression 34415.
+      this.useChunkedEncodingByDefault = false;
       this.shouldKeepAlive = false;
     }
     // node lib/_http_server.js: the ServerResponse constructor's last act is to

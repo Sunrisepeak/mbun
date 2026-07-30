@@ -2622,7 +2622,13 @@ int exec_as_if_node(std::span<const std::string_view> args) {
                 return 1;
             }
             std::vector<std::string> jsArgv{"node"};
-            for (std::string_view rest : args.subspan(i + 2)) jsArgv.emplace_back(rest);
+            {
+                // `--` right after the eval string is the option terminator
+                // (see the same rule in main.cpp's eval path, ref 17294).
+                auto rest{args.subspan(i + 2)};
+                if (!rest.empty() && rest[0] == "--") rest = rest.subspan(1);
+                for (std::string_view a : rest) jsArgv.emplace_back(a);
+            }
             mbun::jsc::runtime::set_argv(std::move(jsArgv));
             std::string code{args[i + 1]};
             if (a == "-p" || a == "--print" || a == "-pe" || a == "-ep")
