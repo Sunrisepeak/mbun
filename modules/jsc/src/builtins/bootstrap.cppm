@@ -8707,6 +8707,55 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   // that already schedules its own completion passes straight through, so this
   // cannot double-defer or re-order anything that was already asynchronous.
   // Validation still throws out of the caller's frame: `fn` is invoked inline.
+  //
+  // ONE drain for the whole batch, not one setImmediate per call. Two reasons,
+  // and the first is measured: a per-call immediate costs a full pump round
+  // trip each, which made the heaviest fs file in the bun corpus
+  // (js/node/fs/fs.test.ts) 42s -> 54s, +30%, reproducibly, and pushed it past
+  // the runner's default 30s bound. Batching collapses that to one round trip
+  // per turn. The second reason is fidelity: node's poll phase runs every
+  // completion that is ready before the check phase gets a turn, so
+  //   fs.stat(a, cb1); setImmediate(imm); fs.stat(b, cb2);
+  // is cb1, cb2, imm in node — which is what batching produces and what a
+  // per-call immediate got wrong (cb1, imm, cb2).
+  //
+  // The pending requests are registered so process._getActiveRequests() and
+  // getActiveResourcesInfo() can report the in-flight window this creates —
+  // that window is the whole point, and reporting it is what node does.
+  const fsActiveRequests = new Set();
+  G.__mbunFsActiveRequests = fsActiveRequests;
+  const fsCompletionQueue = [];
+  let fsDrainScheduled = false;
+  const fsDrainCompletions = () => {
+    fsDrainScheduled = false;
+    const batch = fsCompletionQueue.splice(0, fsCompletionQueue.length);
+    for (let i = 0; i < batch.length; i += 1) {
+      // node drops the request before running its completion, the same way a
+      // fired Immediate leaves the active set before its callback runs.
+      fsActiveRequests.delete(batch[i].req);
+      try {
+        batch[i].run();
+      } catch (e) {
+        // Each completion is its own loop callback in node, so a throwing one
+        // must not swallow the completions queued behind it: hand the rest back
+        // to a later turn before letting the throw reach uncaughtException.
+        for (let j = i + 1; j < batch.length; j += 1) fsCompletionQueue.push(batch[j]);
+        if (fsCompletionQueue.length > 0) fsScheduleDrain();
+        throw e;
+      }
+    }
+  };
+  const fsScheduleDrain = () => {
+    if (fsDrainScheduled) return;
+    fsDrainScheduled = true;
+    // The RAW host immediate, not setImmediate: an fs completion is not an
+    // Immediate resource, and counting it as one would make
+    // getActiveResourcesInfo() report the drain alongside the requests it is
+    // draining. Falls back while node:timers has not installed yet.
+    const sys = G.__mbunSystemImmediate;
+    if (typeof sys === "function") sys(fsDrainCompletions);
+    else G.setImmediate(fsDrainCompletions);
+  };
   const fsDeferCompletion = (fn) => function (...args) {
     let i = args.length - 1;
     while (i >= 0 && typeof args[i] !== "function") i -= 1;
@@ -8721,7 +8770,12 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     };
     const ret = fn.apply(this, args);
     inFrame = false;
-    if (fired) G.setImmediate(() => real.apply(undefined, out));
+    if (fired) {
+      const req = { __proto__: null };
+      fsActiveRequests.add(req);
+      fsCompletionQueue.push({ req, run: () => real.apply(undefined, out) });
+      fsScheduleDrain();
+    }
     return ret;
   };
   for (const fsAsyncName of ["open", "stat", "lstat", "fstat", "appendFile",
