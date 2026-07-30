@@ -116,20 +116,34 @@ still being defined.
 
 ## Compatibility data
 
-Source-snapshot measurements against the upstream corpora pinned as submodules under `compat/`, produced by the runners in `tools/integration/`. Unsupported cases are never counted as passes, and these are not release guarantees. The full Node corpus and the focused Bun regression set were last measured on 2026-07-29; the larger Bun full-corpus baseline is retained until its next full run:
+Source-snapshot measurements against the upstream corpora pinned as submodules under `compat/`, produced by the runners in `tools/integration/`. Unsupported cases are never counted as passes, and these are not release guarantees. Both corpora were last measured in full on 2026-07-30, each as a single run over every file on one frozen binary:
 
 | Target | Result | Rate |
 | --- | ---: | ---: |
-| Bun native full-corpus baseline (2026-07-21) | 868 / 1,902 files fully green | 45.6% |
-| Bun focused regression set (2026-07-29) | 93 / 230 files fully green | 40.4% |
-| Bun focused regression set, assertion level | 5,074 pass / 740 fail of 5,814 evaluated | 87.3% |
-| Node.js native tests (`compat/node/test/parallel`) | 2,821 / 4,433 files pass (direct execution) | 63.6% |
-| Node.js native tests, excluding files that skip themselves | 2,821 / 3,864 files pass | 73.0% |
+| Node.js native tests (`compat/node/test/parallel`) | 3,065 / 4,433 files pass (direct execution) | 69.1% |
+| Node.js native tests, excluding files that skip themselves | 3,065 / 3,880 files pass | 79.0% |
+| Bun native full corpus (`compat/bun/test`) | 934 / 1,902 files fully green | 49.1% |
+| Both corpora combined | 3,999 / 6,335 files | 63.1% |
 | Elysia test suite | 1,522 pass / 3 fail | 99.8% |
 
 File-level "green" means every executed test in the file passed and the file reported no error outside a test; it is stricter than an API checklist and lower than test-level pass rates. Files that declare no runnable test, files whose every test is skipped, and files needing a service this environment lacks (MySQL, Redis, the npm registry) are separate buckets and never count as passes. Node.js files run directly through mbun (exit 0 = pass) without Node's own harness services, so that figure is honest file-level coverage, not API completion.
 
-**The measurement scopes are explicit.** The 2026-07-29 sprint ended with a complete 4,433-file Node run and a 230-file Bun regression run covering the campaign's touched and high-risk surfaces. The 1,902-file Bun row remains the last full-corpus baseline and is not presented as a same-commit comparison. The focused Bun run had no green-file regression; cases requiring unavailable external services remain blocked rather than counted as passes.
+**The measurement scopes are explicit.** Both rows above are single full runs over every file, on one frozen copy of the binary, so they are same-commit comparable to each other. Every round in the campaign behind them was gated at zero green-file regressions, verified per file rather than by bucket totals. Cases requiring an unavailable external service remain blocked rather than counted as passes.
+
+**What stands between these figures and 100%, counted rather than estimated.** 553 Node files decline to run themselves, and the reasons are not interchangeable:
+
+| Self-skip reason | Files | Nature |
+| --- | ---: | --- |
+| QUIC is not enabled | 236 | a subsystem mbun does not have (Node does not enable it by default either) |
+| V8 inspector is disabled | 178 | `node:inspector` exists and answers, but `Session.post()` returns `{}` — a shape-only stub |
+| ESLint tests require crypto and Intl | 25 | needs ESLint itself, which is not vendored here |
+| OpenSSL version or `openssl` CLI | 19 | crypto build configuration |
+| Requires Amaro | 6 | TypeScript loader |
+| Windows-specific | ~8 | not reachable on Linux at all |
+
+Two other blocks in that inventory turned out to be **detection gaps rather than missing capabilities**, and both are now closed: `node:sqlite` was unregistered while a working SQLite implementation sat behind `bun:sqlite`, and `process.config.variables.v8_enable_i18n_support` was unset while the engine ships full ICU. The distinction is only knowable by probing the module — a module that exists proves nothing, which is exactly what the inspector demonstrates.
+
+So the honest statement is that roughly **82% per corpus is reachable by long-tail test work**, the remainder needs whole subsystems (QUIC, an inspector protocol) or is platform-closed, and about 1,150 actionable failures remain in the reachable part.
 
 **The Node.js figures were previously overstated and have been corrected downward at the source.** Three measurement defects were found and fixed:
 
@@ -137,7 +151,7 @@ File-level "green" means every executed test in the file passed and the file rep
 - **`assert.throws` ignored its error argument.** `assert.throws(fn, { code: 'ERR_X' })` passed for *any* throw, and `assert.throws(fn, common.expectsError({…}))` never called the validator. Fixing it removed 126 passes from the figure below; a random 25 of those were checked individually and all 25 pass again the moment the broken matcher is restored, confirming they were verifying nothing.
 - **`common.mustCall` was never enforced.** Node registers its verifier inside `process.on('exit')`, which mbun did not fire, so an under-called `mustCall(fn, 2)` still exited 0. At the time, 946 of the then-1,533 passing files used `mustCall*` — their central assertion had never run. `process.on('exit')` now fires and the event loop no longer swallows exceptions thrown inside callbacks.
 
-The previously published 44.5% was a product of these defects and was never real. Measured with the corrected runner on the same machine, the comparable prior figure is **38.2%**, and the current figure is **63.6%** strict / **73.0%** excluding self-skips. The latest run classified 89 files as timeouts, down from 583 in the earlier baseline, so a file that used to hang for 15 seconds now usually reports a real, diagnosable failure. Expect the strict rate to keep moving in both directions as more verification becomes real. Details, the full estimate-vs-actual record, and how to reproduce: [`compat/README.md`](compat/README.md).
+The previously published 44.5% was a product of these defects and was never real. Measured with the corrected runner on the same machine, the comparable prior figure is **38.2%**, and the current figure is **69.1%** strict / **79.0%** excluding self-skips. The latest run classified 85 files as timeouts, down from 583 in the earliest baseline, so a file that used to hang for 15 seconds now usually reports a real, diagnosable failure. Expect the strict rate to keep moving in both directions as more verification becomes real. Details, the full estimate-vs-actual record, and how to reproduce: [`compat/README.md`](compat/README.md).
 
 ## Related projects
 

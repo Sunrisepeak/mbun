@@ -109,14 +109,30 @@ skill,已经知道本仓规范。选一个适合你的层级,开 PR 前务必 re
 
 ## 兼容性数据
 
-以下是源码快照（2026-07-21）针对 `compat/` 下 submodule 固定的上游测试集的测量结果，由 `tools/integration/` 中的 runner 产出。未支持项不会被伪造成通过，数据也不是 release 保证：
+以下是源码快照针对 `compat/` 下 submodule 固定的上游测试集的测量结果，由 `tools/integration/` 中的 runner 产出。未支持项不会被伪造成通过，数据也不是 release 保证。两个语料集最近一次全量测量均在 2026-07-30，各自在同一个冻结二进制上对全部文件跑一遍：
 
 | 测试对象 | 结果 | 通过率 |
 | --- | ---: | ---: |
-| Bun 原生测试集（`compat/bun/test`） | 1,902 个文件中 885 个全绿 | 46.5% |
-| Bun 原生测试（按测试计） | 52,454 个运行，32,190 通过 / 17,254 失败 | 61.4% |
-| Node.js 原生测试（`compat/node/test/parallel`） | 4,433 个文件中 1,811 个通过（直接执行） | 40.9% |
+| Node.js 原生测试（`compat/node/test/parallel`） | 4,433 个文件中 3,065 个通过（直接执行） | 69.1% |
+| Node.js 原生测试，剔除自我 skip 的文件 | 3,880 个文件中 3,065 个通过 | 79.0% |
+| Bun 原生测试集（`compat/bun/test`） | 1,902 个文件中 934 个全绿 | 49.1% |
+| 两个语料集合计 | 6,335 个文件中 3,999 个 | 63.1% |
 | Elysia 测试套件 | 1,522 通过 / 3 失败 | 99.8% |
+
+**距离 100% 还差什么，是数出来的而不是估的。** Node 侧有 553 个文件自己选择跳过，原因彼此不可互换：
+
+| 自我 skip 的原因 | 文件数 | 性质 |
+| --- | ---: | --- |
+| QUIC 未启用 | 236 | mbun 没有这个子系统（Node 自身默认也不开） |
+| V8 inspector 未启用 | 178 | `node:inspector` 存在且能应答，但 `Session.post()` 返回 `{}`，只有形状没有实现 |
+| ESLint 测试需要 crypto 和 Intl | 25 | 需要 ESLint 本身,本仓库未 vendor |
+| OpenSSL 版本 / `openssl` CLI | 19 | crypto 构建配置 |
+| 需要 Amaro | 6 | TypeScript loader |
+| Windows 专属 | ~8 | 在 Linux 上根本不可达 |
+
+这份清单里另有两块原本被归为"缺能力"的,实测是**检测缺口而不是缺能力**,现已关闭:`node:sqlite` 未注册,而 `bun:sqlite` 背后是一份可用的 SQLite 实现;`process.config.variables.v8_enable_i18n_support` 未设置,而引擎本身带完整 ICU。这个区别只能靠**探测模块**得知 —— 模块存在什么都不证明,inspector 就是反例。
+
+所以诚实的说法是:**靠长尾测试工作每个语料集大约能到 82%**,剩下的需要整个子系统(QUIC、inspector 协议)或者在本平台上根本关闭;可达部分还剩约 1,150 个 actionable 失败。
 
 文件级"全绿"要求文件内所有执行的测试全部通过、且文件未报告测试之外的错误，比 API 清单严格，因此低于测试级通过率。上游本就没有可运行测试的文件、全部被 skip 的文件、以及需要本机不具备的服务（MySQL、Redis、npm registry）的文件各自单独归类，一律不算通过。Node.js 文件通过 mbun 直接执行（退出码 0 记为通过），不模拟 Node 自身 harness 提供的服务，所以该数据是诚实的文件级覆盖，不等同 API 完成度。崩溃被修复后测试级通过率会下降——此前段错误或被 OOM 杀掉的文件现在能跑完并报出真实失败。细节与复现方法见 [`compat/README.md`](compat/README.md)。
 
