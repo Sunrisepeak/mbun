@@ -852,7 +852,31 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
       const slot = koOf(ko);
       info = AN.keyType(slot.material, slot.passphrase, false);
     } catch (e) {
-      throw asymParseError(ko, e, false);
+      const err = asymParseError(ko, e, false);
+      // LEGACY (PKCS#1/SEC1) encrypted PEM with no passphrase is node's
+      // NEED_PASSPHRASE case: ncrypto's TryParsePrivateKey (deps/ncrypto/
+      // ncrypto.cc) routes `createPrivateKey` through PEM_read_bio_PrivateKey and
+      // maps PEM_R_BAD_PASSWORD_READ to ERR_MISSING_PASSPHRASE, which is the
+      // surface bun reports too (regression/issue/27445). PKCS#8
+      // "BEGIN ENCRYPTED PRIVATE KEY" is NOT this case — it decodes through
+      // OSSL_DECODER, whose refusal is the CRYPTO "interrupted or cancelled"
+      // error that node's own test/parallel/test-crypto-key-objects.js pins for
+      // `dsa_private_encrypted_1025.pem`. The scope is deliberately just this
+      // constructor: sign/verify keep the OpenSSL wording that
+      // test-crypto-keygen-async-*-encrypted.js assert on their sec1 keys.
+      if (err && err.code !== "ERR_MISSING_PASSPHRASE") {
+        const slot = koOf(ko);
+        if (slot.passphrase === undefined || slot.passphrase === null) {
+          const head = typeof slot.material === "string"
+            ? slot.material.slice(0, 256)
+            : Buffer.from(toBuf(slot.material).slice(0, 256)).toString("latin1");
+          if (head.includes("Proc-Type: 4,ENCRYPTED") || head.includes("Proc-Type:4,ENCRYPTED")) {
+            const t = new TypeError("Passphrase required for encrypted key");
+            t.code = "ERR_MISSING_PASSPHRASE"; throw t;
+          }
+        }
+      }
+      throw err;
     }
     // The loader is intent-agnostic: it will parse public-only material (e.g. a
     // PKCS#1 RSAPublicKey) as a pkey. node rejects that with a decode error.
