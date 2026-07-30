@@ -191,7 +191,10 @@ def builtin_shape(area: str, builtins_dir: Path) -> tuple[str, str]:
         return ("unknown", "")
     token = area[5:] if area.startswith("test-") else area
     token = token.split("/")[0].split("+")[0]
-    if len(token) < 3:
+    # 2 chars is fine here: this matches file STEMS (node_vm.cppm), not prose. The
+    # >=3 guard belongs to is_struck, which greps English and would match "vm"
+    # inside any sentence mentioning it.
+    if len(token) < 2:
         return ("unknown", "")
 
     cands: list[tuple[int, Path]] = []
