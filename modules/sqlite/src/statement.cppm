@@ -14,6 +14,39 @@ namespace mbun::sqlite {
 export struct SqlError {
     std::string message;
     std::string code{"SQLITE_ERROR"};
+    // sqlite3_extended_errcode(). node:sqlite surfaces this verbatim as
+    // `err.errcode` (e.g. 1299 SQLITE_CONSTRAINT_NOTNULL, 1555
+    // SQLITE_CONSTRAINT_PRIMARYKEY) alongside `err.errstr` = sqlite3_errstr of
+    // it, which resolves to the PRIMARY code's text ("constraint failed").
+    // `code` above stays the masked primary token for bun:sqlite parity.
+    int errcode{0};
+    std::string errstr;
+};
+
+// sqlite3_set_authorizer's callback, in engine-neutral terms: the action code
+// plus its four optional string arguments, answering SQLITE_OK/DENY/IGNORE.
+export using AuthorizerFn = std::function<int(int, std::optional<std::string>,
+                                              std::optional<std::string>,
+                                              std::optional<std::string>,
+                                              std::optional<std::string>)>;
+
+// A user-defined scalar SQL function, in engine-neutral terms: it receives the
+// evaluated arguments and answers a value, or an error string that becomes
+// sqlite3_result_error (which aborts the running statement and rolls its changes
+// back). DatabaseSync.prototype.function() is built on this.
+export using ScalarFn =
+    std::function<std::expected<SqlValue, std::string>(std::span<const SqlValue>)>;
+
+// One column of a prepared statement, read without stepping. `database`/`table`/
+// `origin` come from sqlite3_column_{database,table,origin}_name and are empty
+// for a computed column (expression, literal, function call); the amalgamation is
+// built with SQLITE_ENABLE_COLUMN_METADATA=1 so they are available.
+export struct ColumnInfo {
+    std::string name;
+    std::string declared_type;
+    std::string database;
+    std::string table;
+    std::string origin;
 };
 
 export struct ExecutionResult {

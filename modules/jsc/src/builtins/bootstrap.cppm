@@ -4611,96 +4611,608 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     // the whole campaign because self-skips are (correctly) excluded from the
     // "actionable failure" count, so nothing in the planning loop looked at them.
     //
-    // This is a SHIM over the working implementation, not an alias: node's API is
-    // DatabaseSync/StatementSync with variadic parameters, a `run()` that returns
-    // { changes, lastInsertRowid }, and node-shaped errors. Deliberately partial --
-    // session/changeset, backup(), custom function()/aggregate() are NOT here and
-    // the files needing them keep failing rather than pretending.
+    // This is NOT an alias and NOT a wrapper over bun's Statement: node's binding
+    // semantics differ at almost every point that matters -- rows are
+    // null-prototype objects, `run()` reports the CONNECTION-global
+    // sqlite3_changes/last_insert_rowid (so `COMMIT` echoes the previous INSERT's
+    // counters), unknown named parameters are an ERR_INVALID_STATE rather than a
+    // silent null, unbound parameters ARE a silent null, and every error is a node
+    // error code rather than a SQLiteError. So the classes sit directly on
+    // __mbunSqliteNative and reuse only `parseParams` (the SQL parameter scanner)
+    // from the bun layer above.
+    //
+    // Still deliberately absent, because each needs a native trampoline that does
+    // not exist yet: custom function()/aggregate() (sqlite3_create_function_v2
+    // calling back into JS), session/changeset, backup(), and setAuthorizer().
+    // The files needing those keep failing rather than pretending.
     {
-      const nodeErr = (code, msg) => { const e = new Error(msg); e.code = code; return e; };
-      // node accepts stmt.all(1, 'x') as well as stmt.all({ $k: v }); bun's
-      // Statement takes an array or a single bindings object.
-      const bind = (args) => (args.length === 1 && args[0] !== null && typeof args[0] === "object"
-        && !Array.isArray(args[0]) && !ArrayBuffer.isView(args[0])) ? args[0] : args;
+      const INT64_HI = 9223372036854775807n, INT64_LO = -9223372036854775808n;
+      const SQLITE_MAX_LIMIT = 0x7fffffff;
+      // sqlite3_db_config verbs node exposes; none has a PRAGMA form.
+      const DBCONFIG_DEFENSIVE = 1010, DBCONFIG_DQS_DML = 1013, DBCONFIG_DQS_DDL = 1014;
+      // sqlite3_limit ids, in the order node's `limits` object lists them.
+      const LIMIT_IDS = [["length", 0], ["sqlLength", 1], ["column", 2], ["exprDepth", 3],
+                         ["compoundSelect", 4], ["vdbeOp", 5], ["functionArg", 6],
+                         ["attach", 7], ["likePatternLength", 8], ["variableNumber", 9],
+                         ["triggerDepth", 10]];
 
-      class StatementSync {
-        #st; #db;
-        constructor(st, db) { this.#st = st; this.#db = db; }
-        all(...a) { return this.#st.all(bind(a)); }
-        get(...a) { return this.#st.get(bind(a)) ?? undefined; }
-        iterate(...a) { return this.#st.iterate(bind(a)); }
-        run(...a) {
-          this.#st.run(bind(a));
-          // node reports the write result; bun's run() does not.
-          const ch = this.#db.query("select changes() as c, last_insert_rowid() as r").get();
-          return { changes: ch ? ch.c : 0, lastInsertRowid: ch ? ch.r : 0 };
+      const mkErr = (Ctor, code, msg) => { const e = new Ctor(msg); e.code = code; return e; };
+      const argTypeErr = (msg) => mkErr(TypeError, "ERR_INVALID_ARG_TYPE", msg);
+      const argValueErr = (msg) => mkErr(TypeError, "ERR_INVALID_ARG_VALUE", msg);
+      const stateErr = (msg) => mkErr(Error, "ERR_INVALID_STATE", msg);
+      const rangeErr = (msg) => mkErr(RangeError, "ERR_OUT_OF_RANGE", msg);
+      // The native bridge throws bun-shaped SQLiteError; node wants
+      // ERR_SQLITE_ERROR with sqlite3_errmsg verbatim plus the EXTENDED result
+      // code and its errstr (which resolves to the primary code's text).
+      const toNodeSqlErr = (e) => {
+        if (e == null || e.name !== "SQLiteError") return e;
+        const n = new Error(e.message);
+        n.code = "ERR_SQLITE_ERROR";
+        if (e.errcode !== undefined) { n.errcode = e.errcode; n.errstr = e.errstr; }
+        return n;
+      };
+      // An authorizer callback runs inside sqlite3_prepare_v2 -- underneath a
+      // JS->C->JS re-entry -- so it cannot throw across the boundary. The wrapper
+      // below is total: it converts every failure into SQLITE_DENY and parks the
+      // real exception here, and `native()` rethrows THAT instead of the
+      // "not authorized" SQLiteError sqlite would otherwise report.
+      let pendingCallbackError = null;
+      const native = (fn) => {
+        try { return fn(); }
+        catch (e) {
+          if (pendingCallbackError !== null) { const p = pendingCallbackError; pendingCallbackError = null; throw p; }
+          throw toNodeSqlErr(e);
         }
-        columns() {
-          const names = this.#st.columnNames || [];
-          const declared = (() => { try { return this.#st.declaredTypes || []; } catch (e) { return []; } })();
-          return names.map((n, i) => ({ column: n, name: n, type: declared[i] ?? null,
-                                        database: null, table: null }));
-        }
-        setReadBigInts(v) { try { this.#st.safeIntegers(!!v); } catch (e) {} return undefined; }
-        // node's default is to REJECT bare named parameters unless enabled; bun
-        // already accepts them, so enabling is a no-op and disabling is honestly
-        // unsupported rather than silently wrong.
-        setAllowBareNamedParameters(v) {
-          if (!v) throw nodeErr("ERR_NOT_SUPPORTED", "disabling bare named parameters is not supported");
-          return undefined;
-        }
-        get sourceSQL() { return String(this.#st); }
-        get expandedSQL() { return String(this.#st); }
-      }
+      };
 
-      class DatabaseSync {
-        #db; #path; #open = false;
-        constructor(path, options) {
-          if (typeof path !== "string" && !(path && typeof path === "object" && "href" in path)
-              && !ArrayBuffer.isView(path)) {
-            throw nodeErr("ERR_INVALID_ARG_TYPE",
-              'The "path" argument must be a string, Uint8Array, or URL without null bytes.');
+      const checkBool = (v, label) => {
+        if (typeof v !== "boolean") throw argTypeErr(`The "${label}" argument must be a boolean.`);
+        return v;
+      };
+      const optBool = (o, key, dflt) => {
+        const v = o[key];
+        if (v === undefined) return dflt;
+        return checkBool(v, `options.${key}`);
+      };
+
+      // ---- value binding ----------------------------------------------------
+      // node rejects what SQLite cannot store (undefined, functions, symbols,
+      // regexps, promises, maps, sets, booleans) naming the 1-based parameter
+      // position, and normalizes every ArrayBufferView -- including DataView and
+      // the BigInt/Float views -- to the raw bytes behind it.
+      const bindValue = (v, pos) => {
+        if (v === null) return null;
+        const t = typeof v;
+        if (t === "number" || t === "string") return v;
+        if (t === "bigint") {
+          if (v > INT64_HI || v < INT64_LO) {
+            throw argValueErr(`BigInt value is too large to bind. Received ${v}n`);
           }
-          this.#path = String(path);
-          const o = options || {};
-          if (o.open === false) return;                 // node defers until open()
-          this.#openNow(o);
+          return v;
         }
-        #openNow(o) {
-          this.#db = new Database(this.#path, o.readOnly ? { readonly: true } : undefined);
-          this.#open = true;
-          if (o.enableForeignKeyConstraints !== false) {
-            try { this.#db.run("PRAGMA foreign_keys = ON"); } catch (e) {}
+        if (ArrayBuffer.isView(v)) {
+          // JSValueGetTypedArrayType does not recognise a DataView, so hand the
+          // bridge a plain Uint8Array over the same bytes in every case.
+          return v instanceof Uint8Array && v.constructor === Uint8Array
+            ? v : new Uint8Array(v.buffer, v.byteOffset, v.byteLength);
+        }
+        throw argTypeErr(`Provided value cannot be bound to SQLite parameter ${pos}.`);
+      };
+
+      // Positions that carry no name ("?" and "?N"), ascending -- these are what
+      // trailing positional arguments bind to, in order.
+      const anonPositions = (parsed) => {
+        const seen = new Set();
+        for (const t of parsed.tokens) if (t.bare === null) seen.add(t.index);
+        return [...seen].sort((a, b) => a - b);
+      };
+
+      // node's bind protocol: an optional leading named-parameters object, then
+      // positional arguments. Missing positions bind NULL (statements are unbound
+      // on every call), which is why an EXPLICIT undefined is an error while an
+      // omitted argument is not.
+      const bindAll = (parsed, args, st) => {
+        const count = parsed.count;
+        const pos = new Array(count).fill(null);
+        let anonStart = 0;
+        const a0 = args[0];
+        if (args.length > 0 && a0 !== null && typeof a0 === "object"
+            && !Array.isArray(a0) && !ArrayBuffer.isView(a0)) {
+          anonStart = 1;
+          for (const key of Object.keys(a0)) {
+            let idx = -1;
+            const c = key.charCodeAt(0);
+            if (c === 36 || c === 58 || c === 64) {          // $ : @
+              for (const t of parsed.tokens) if (t.raw === key) { idx = t.index; break; }
+            } else if (st.allowBare) {
+              let found = null, clash = null;
+              for (const t of parsed.tokens) {
+                if (t.bare !== key) continue;
+                if (found === null) found = t;
+                else if (t.raw !== found.raw && clash === null) clash = t;
+              }
+              if (clash !== null) {
+                throw stateErr(`Cannot create bare named parameter '${key}' because of `
+                               + `conflicting names '${found.raw}' and '${clash.raw}'.`);
+              }
+              if (found !== null) idx = found.index;
+            }
+            if (idx < 0) {
+              if (st.allowUnknown) continue;
+              throw stateErr(`Unknown named parameter '${key}'`);
+            }
+            pos[idx - 1] = bindValue(a0[key], idx);
           }
         }
-        #need() {
-          if (!this.#open) throw nodeErr("ERR_INVALID_STATE", "database is not open");
+        const anon = anonPositions(parsed);
+        let n = 0;
+        for (let i = anonStart; i < args.length; i++) {
+          if (n >= anon.length) {
+            // sqlite3_bind_* answers SQLITE_RANGE here; node surfaces it verbatim.
+            const e = new Error("column index out of range");
+            e.code = "ERR_SQLITE_ERROR"; e.errcode = 25; e.errstr = "column index out of range";
+            throw e;
+          }
+          const p = anon[n++];
+          pos[p - 1] = bindValue(args[i], p);
+        }
+        return pos;
+      };
+
+      // ---- row shaping ------------------------------------------------------
+      // Rows are null-prototype objects built with defineProperty, so a column
+      // literally named "__proto__" / "constructor" becomes an own data property
+      // instead of mutating the object.
+      const shapeRow = (cols, types, row, st) => {
+        // returnArrays still goes through readValue: the two flags compose, and
+        // `{ returnArrays: true, readBigInts: true }` must yield [1n, 2n].
+        if (st.returnArrays) return row.map((v, i) => readValue(v, types[i], st));
+        const o = { __proto__: null };
+        for (let i = 0; i < cols.length; i++) {
+          Object.defineProperty(o, cols[i], {
+            value: readValue(row[i], types[i], st),
+            writable: true, enumerable: true, configurable: true,
+          });
+        }
+        return o;
+      };
+      const readValue = (v, type, st) => {
+        if (typeof v !== "number" || type !== "INTEGER") return v;
+        if (st.readBigInts) return BigInt(v);
+        // An int64 past 2^53 already lost precision crossing the bridge as a
+        // double; node refuses to hand back a wrong number.
+        if (!Number.isSafeInteger(v)) {
+          throw rangeErr(`Value is too large to be represented as a JavaScript number: ${v}`);
+        }
+        return v;
+      };
+      const counter = (n, st) => (st.readBigInts ? BigInt(n) : n);
+
+      // A user-defined function's return value, mapped onto what SQLite can
+      // store. A Promise is called out separately because returning one is a
+      // plausible mistake with a very unhelpful generic message.
+      const fnReturnToSql = (r) => {
+        if (r === undefined || r === null) return null;
+        const t = typeof r;
+        if (t === "number" || t === "string") return r;
+        if (t === "bigint") {
+          if (r > INT64_HI || r < INT64_LO) {
+            throw rangeErr("BigInt value is too large to convert to a SQLite value");
+          }
+          return r;
+        }
+        if (ArrayBuffer.isView(r)) {
+          return r instanceof Uint8Array && r.constructor === Uint8Array
+            ? r : new Uint8Array(r.buffer, r.byteOffset, r.byteLength);
+        }
+        if (typeof r.then === "function") {
+          throw mkErr(Error, "ERR_SQLITE_ERROR",
+                      "Asynchronous user-defined functions are not supported");
+        }
+        throw mkErr(Error, "ERR_SQLITE_ERROR",
+                    "Returned JavaScript value cannot be converted to a SQLite value");
+      };
+
+      const ILLEGAL = Symbol("node:sqlite illegal constructor");
+
+      class StatementSyncImpl {
+        #db; #sql; #parsed; #gen = 0;
+        readBigInts; returnArrays; allowBare; allowUnknown; finalized = false;
+        constructor(guard, db, sql, opts) {
+          if (guard !== ILLEGAL) {
+            throw mkErr(TypeError, "ERR_ILLEGAL_CONSTRUCTOR", "Illegal constructor");
+          }
+          this.#db = db; this.#sql = sql; this.#parsed = parseParams(sql);
+          this.readBigInts = opts.readBigInts; this.returnArrays = opts.returnArrays;
+          this.allowBare = opts.allowBare; this.allowUnknown = opts.allowUnknown;
+        }
+        get __sql() { return this.#sql; }
+        #live() {
+          if (this.finalized) throw stateErr("statement has been finalized");
+          this.#db.__need();
           return this.#db;
         }
-        open() {
-          if (this.#open) throw nodeErr("ERR_INVALID_STATE", "database is already open");
-          this.#openNow({});
+        #exec(args) {
+          const db = this.#live();
+          this.#gen++;
+          const pos = bindAll(this.#parsed, args, this);
+          this.__lastParams = pos;   // expandedSQL renders these back in
+          return native(() => SQ.run(db.__handle, this.#sql, pos));
         }
-        close() { this.#need(); this.#db.close(); this.#open = false; }
-        exec(sql) { this.#need().run(sql); return undefined; }
-        prepare(sql) { return new StatementSync(this.#need().query(sql), this.#need()); }
-        location(dbName) {
-          this.#need();
-          const r = this.#db.query("select file from pragma_database_list where name = ?")
-            .get([dbName === undefined ? "main" : dbName]);
-          return r && r.file ? r.file : null;
+        run(...a) {
+          const r = this.#exec(a);
+          return { changes: counter(r.changes, this), lastInsertRowid: counter(r.lastInsertRowid, this) };
         }
-        loadExtension(p) { return this.#need().loadExtension(p); }
-        enableLoadExtension(v) { if (!v) return undefined;
-          throw nodeErr("ERR_NOT_SUPPORTED", "enableLoadExtension is not supported"); }
-        get isOpen() { return this.#open; }
-        get isTransaction() { try { return !!this.#need().inTransaction; } catch (e) { return false; } }
-        [Symbol.dispose]() { if (this.#open) this.close(); }
+        get(...a) {
+          const r = this.#exec(a);
+          return r.values.length ? shapeRow(r.columns, r.types, r.values[0], this) : undefined;
+        }
+        all(...a) {
+          const r = this.#exec(a);
+          return r.values.map((row) => shapeRow(r.columns, r.types, row, this));
+        }
+        iterate(...a) {
+          const r = this.#exec(a);
+          const st = this, gen = this.#gen;
+          let i = 0;
+          const done = () => ({ __proto__: null, done: true, value: null });
+          const it = {
+            next() {
+              // Any later get/all/run/iterate on the same statement resets the
+              // underlying cursor, which node reports as an invalidated iterator.
+              if (gen !== st.__gen) throw stateErr("The iterator was invalidated");
+              if (i >= r.values.length) return done();
+              return { __proto__: null, done: false,
+                       value: shapeRow(r.columns, r.types, r.values[i++], st) };
+            },
+            return() { i = r.values.length; return done(); },
+            [Symbol.iterator]() { return this; },
+          };
+          // Iterator.prototype gives `instanceof Iterator` and the iterator
+          // helpers (toArray/take/...) node's iterator inherits.
+          if (typeof G.Iterator === "function") Object.setPrototypeOf(it, G.Iterator.prototype);
+          return it;
+        }
+        get __gen() { return this.#gen; }
+        columns() {
+          const db = this.#live();
+          const info = native(() => SQ.columnInfo(db.__handle, this.#sql));
+          return info.map((c) => ({ __proto__: null, column: c.column, database: c.database,
+                                    name: c.name, table: c.table, type: c.type }));
+        }
+        setReadBigInts(v) { this.readBigInts = checkBool(v, "readBigInts"); return undefined; }
+        setReturnArrays(v) { this.returnArrays = checkBool(v, "returnArrays"); return undefined; }
+        setAllowBareNamedParameters(v) {
+          this.allowBare = checkBool(v, "allowBareNamedParameters"); return undefined;
+        }
+        setAllowUnknownNamedParameters(v) {
+          this.allowUnknown = checkBool(v, "enabled"); return undefined;
+        }
+        get sourceSQL() { return this.#sql; }
+        get expandedSQL() {
+          const db = this.#live();
+          return native(() => SQ.expandedSQL(db.__handle, this.#sql, this.__lastParams || []));
+        }
+        [Symbol.dispose]() { this.finalized = true; }
       }
+      // Direct construction must fail with ERR_ILLEGAL_CONSTRUCTOR, but the class
+      // itself is what `stmt instanceof StatementSync` is checked against.
+      function StatementSync(...a) { return new StatementSyncImpl(...a); }
+      StatementSync.prototype = StatementSyncImpl.prototype;
+      Object.defineProperty(StatementSync, "name", { value: "StatementSync" });
+
+      const decodePath = (p) => {
+        if (typeof p === "string") return p;
+        if (ArrayBuffer.isView(p)) return new TextDecoder().decode(p);
+        if (p instanceof URL || (p && typeof p === "object" && typeof p.href === "string"
+                                 && typeof p.protocol === "string")) {
+          if (p.protocol !== "file:") {
+            throw mkErr(TypeError, "ERR_INVALID_URL_SCHEME", "The URL must be of scheme file:");
+          }
+          return decodeURIComponent(p.pathname);
+        }
+        return null;
+      };
+
+      class DatabaseSyncImpl {
+        #handle = 0; #path; #open = false; #opts; #stmts = new Set(); #limits = null;
+        constructor(path, options) {
+          const decoded = decodePath(path);
+          if (decoded === null || decoded.includes(" ")) {
+            throw argTypeErr("The \"path\" argument must be a string, Uint8Array, or URL "
+                             + "without null bytes.");
+          }
+          if (options !== undefined && (options === null || typeof options !== "object")) {
+            throw argTypeErr("The \"options\" argument must be an object.");
+          }
+          const o = options || {};
+          const opts = {
+            open: optBool(o, "open", true),
+            readOnly: optBool(o, "readOnly", false),
+            enableForeignKeyConstraints: optBool(o, "enableForeignKeyConstraints", true),
+            enableDoubleQuotedStringLiterals: optBool(o, "enableDoubleQuotedStringLiterals", false),
+            defensive: optBool(o, "defensive", true),
+            readBigInts: optBool(o, "readBigInts", false),
+            returnArrays: optBool(o, "returnArrays", false),
+            allowBare: optBool(o, "allowBareNamedParameters", true),
+            allowUnknown: optBool(o, "allowUnknownNamedParameters", false),
+            allowExtension: optBool(o, "allowExtension", false),
+            timeout: 0, limits: null,
+          };
+          if (o.timeout !== undefined) {
+            if (!Number.isInteger(o.timeout)) {
+              throw argTypeErr("The \"options.timeout\" argument must be an integer.");
+            }
+            opts.timeout = o.timeout;
+          }
+          if (o.limits !== undefined) {
+            if (o.limits === null || typeof o.limits !== "object") {
+              throw argTypeErr("The \"options.limits\" argument must be an object.");
+            }
+            const out = [];
+            for (const [name, id] of LIMIT_IDS) {
+              const v = o.limits[name];
+              if (v === undefined) continue;
+              if (!Number.isInteger(v)) {
+                throw argTypeErr(`The "options.limits.${name}" argument must be an integer.`);
+              }
+              if (v < 0) {
+                throw mkErr(RangeError, "ERR_OUT_OF_RANGE",
+                            `The "options.limits.${name}" argument must be non-negative.`);
+              }
+              out.push([id, v]);
+            }
+            opts.limits = out;
+          }
+          this.#path = decoded; this.#opts = opts;
+          if (opts.open) this.#openNow();
+        }
+        #openNow() {
+          this.#handle = native(() => SQ.open(this.#path, this.#opts.readOnly,
+                                              !this.#opts.readOnly));
+          this.#open = true;
+          const o = this.#opts;
+          if (o.timeout > 0) SQ.busyTimeout(this.#handle, o.timeout);
+          // node's defaults differ from SQLite's own on all three of these.
+          SQ.dbConfig(this.#handle, DBCONFIG_DQS_DML, o.enableDoubleQuotedStringLiterals ? 1 : 0);
+          SQ.dbConfig(this.#handle, DBCONFIG_DQS_DDL, o.enableDoubleQuotedStringLiterals ? 1 : 0);
+          SQ.dbConfig(this.#handle, DBCONFIG_DEFENSIVE, o.defensive ? 1 : 0);
+          if (o.enableForeignKeyConstraints) {
+            try { SQ.run(this.#handle, "PRAGMA foreign_keys = ON", []); } catch (e) { /* best effort */ }
+          }
+          if (o.limits) for (const [id, v] of o.limits) SQ.limit(this.#handle, id, v);
+        }
+        __need() {
+          if (!this.#open) throw stateErr("database is not open");
+          return this;
+        }
+        get __handle() { return this.#handle; }
+        get isOpen() { return this.#open; }
+        get isTransaction() {
+          this.__need();
+          return SQ.inTransaction(this.#handle);
+        }
+        open() {
+          if (this.#open) throw stateErr("database is already open");
+          this.#openNow();
+          return undefined;
+        }
+        close() {
+          this.__need();
+          for (const s of this.#stmts) s.finalized = true;
+          this.#stmts.clear();
+          SQ.close(this.#handle);
+          this.#open = false;
+          return undefined;
+        }
+        exec(sql) {
+          this.__need();
+          if (typeof sql !== "string") throw argTypeErr("The \"sql\" argument must be a string.");
+          native(() => SQ.run(this.#handle, sql, []));
+          return undefined;
+        }
+        prepare(sql, options) {
+          this.__need();
+          if (typeof sql !== "string") throw argTypeErr("The \"sql\" argument must be a string.");
+          const o = this.#opts;
+          let readBigInts = o.readBigInts, returnArrays = o.returnArrays;
+          let allowBare = o.allowBare, allowUnknown = o.allowUnknown;
+          if (options !== undefined) {
+            if (options === null || typeof options !== "object") {
+              throw argTypeErr("The \"options\" argument must be an object.");
+            }
+            readBigInts = optBool(options, "readBigInts", readBigInts);
+            returnArrays = optBool(options, "returnArrays", returnArrays);
+            allowBare = optBool(options, "allowBareNamedParameters", allowBare);
+            allowUnknown = optBool(options, "allowUnknownNamedParameters", allowUnknown);
+          }
+          const st = new StatementSyncImpl(ILLEGAL, this, sql,
+                                           { readBigInts, returnArrays, allowBare, allowUnknown });
+          this.#stmts.add(st);
+          return st;
+        }
+        location(dbName) {
+          this.__need();
+          if (dbName !== undefined && typeof dbName !== "string") {
+            throw argTypeErr("The \"dbName\" argument must be a string.");
+          }
+          const f = SQ.filename(this.#handle, dbName === undefined ? "main" : dbName);
+          return f ? f : null;
+        }
+        serialize(dbName) {
+          this.__need();
+          if (dbName !== undefined && typeof dbName !== "string") {
+            throw argTypeErr("The \"dbName\" argument must be a string.");
+          }
+          return native(() => SQ.serialize(this.#handle, dbName === undefined ? "main" : dbName));
+        }
+        deserialize(buffer, options) {
+          this.__need();
+          if (!(buffer instanceof Uint8Array)) {
+            throw argTypeErr("The \"buffer\" argument must be a Uint8Array.");
+          }
+          if (options !== undefined && (options === null || typeof options !== "object")) {
+            throw argTypeErr("The \"options\" argument must be an object.");
+          }
+          const name = options && options.dbName !== undefined ? options.dbName : "main";
+          if (typeof name !== "string") {
+            throw argTypeErr("The \"options.dbName\" argument must be a string.");
+          }
+          if (buffer.length === 0) {
+            throw argValueErr("The \"buffer\" argument must not be empty.");
+          }
+          // Every live statement was compiled against the schema being replaced;
+          // sqlite3_deserialize refuses to run while any is open, and node reports
+          // them as finalized afterwards.
+          for (const s of this.#stmts) s.finalized = true;
+          this.#stmts.clear();
+          native(() => SQ.deserialize(this.#handle, name, buffer));
+          return undefined;
+        }
+        // db.function(name[, options], fn) -- a user-defined SCALAR function.
+        // Arity is fn.length unless varargs, because sqlite resolves overloads by
+        // argument count and a mismatch must produce its own "wrong number of
+        // arguments" error rather than a silent NULL.
+        function(name, optionsOrFn, maybeFn) {
+          this.__need();
+          if (typeof name !== "string") throw argTypeErr("The \"name\" argument must be a string.");
+          let options = {}, fn = optionsOrFn;
+          if (arguments.length >= 3) {
+            options = optionsOrFn; fn = maybeFn;
+            if (options === null || typeof options !== "object") {
+              throw argTypeErr("The \"options\" argument must be an object.");
+            }
+          }
+          if (typeof fn !== "function") {
+            throw argTypeErr("The \"function\" argument must be a function.");
+          }
+          const useBig = optBool(options, "useBigIntArguments", false);
+          const varargs = optBool(options, "varargs", false);
+          const deterministic = optBool(options, "deterministic", false);
+          const directOnly = optBool(options, "directOnly", false);
+          SQ.createFunction(this.#handle, name, varargs ? -1 : fn.length, deterministic,
+                            directOnly, (...a) => {
+            try {
+              for (let i = 0; i < a.length; i++) {
+                const v = a[i];
+                if (typeof v !== "number" || !Number.isInteger(v)) continue;
+                if (useBig) { a[i] = BigInt(v); continue; }
+                // The bridge already flattened int64 to a double; refusing here is
+                // the only honest answer for a value that no longer round-trips.
+                if (!Number.isSafeInteger(v)) {
+                  throw rangeErr(`Value is too large to be represented as a JavaScript number: ${v}`);
+                }
+              }
+              return fnReturnToSql(fn(...a));
+            } catch (e) {
+              // Cannot propagate out of the sqlite3_step trampoline; park it and
+              // let sqlite3_result_error unwind (rolling the statement back).
+              pendingCallbackError = e;
+              throw e;
+            }
+          });
+          return undefined;
+        }
+        setAuthorizer(cb) {
+          this.__need();
+          if (cb === null) { SQ.setAuthorizer(this.#handle, null); return undefined; }
+          if (typeof cb !== "function") {
+            throw argTypeErr("The \"callback\" argument must be a function.");
+          }
+          SQ.setAuthorizer(this.#handle, (action, a1, a2, a3, a4) => {
+            try {
+              const r = cb(action, a1, a2, a3, a4);
+              if (typeof r !== "number" || !Number.isInteger(r)) {
+                pendingCallbackError = new Error(
+                  "Authorizer callback must return an integer authorization code");
+                return 1;
+              }
+              if (r !== 0 && r !== 1 && r !== 2) {
+                pendingCallbackError = new Error(
+                  "Authorizer callback returned a invalid authorization code");
+                return 1;
+              }
+              return r;
+            } catch (e) { pendingCallbackError = e; return 1; }
+          });
+          return undefined;
+        }
+        enableDefensive(v) {
+          this.__need();
+          SQ.dbConfig(this.#handle, DBCONFIG_DEFENSIVE, checkBool(v, "enabled") ? 1 : 0);
+          return undefined;
+        }
+        enableLoadExtension(v) {
+          this.__need();
+          if (!checkBool(v, "allow")) return undefined;
+          throw mkErr(Error, "ERR_LOAD_SQLITE_EXTENSION",
+                      "Cannot load SQLite extensions when the permission model is enabled");
+        }
+        loadExtension() {
+          this.__need();
+          throw mkErr(Error, "ERR_LOAD_SQLITE_EXTENSION",
+                      "Cannot load SQLite extensions when the permission model is enabled");
+        }
+        // Own enumerable accessors, because the corpus asserts Object.keys(limits).
+        get limits() {
+          if (this.#limits !== null) return this.#limits;
+          const self = this;
+          const obj = {};
+          for (const [name, id] of LIMIT_IDS) {
+            Object.defineProperty(obj, name, {
+              enumerable: true, configurable: true,
+              get() { self.__need(); return SQ.limit(self.__handle, id, -1); },
+              set(v) {
+                self.__need();
+                if (typeof v !== "number" || Number.isNaN(v) || v === -Infinity
+                    || (v !== Infinity && !Number.isInteger(v))) {
+                  throw new TypeError("Limit value must be a non-negative integer or Infinity");
+                }
+                if (v < 0) throw new RangeError("Limit value must be non-negative");
+                SQ.limit(self.__handle, id, v === Infinity ? SQLITE_MAX_LIMIT : v);
+              },
+            });
+          }
+          this.#limits = obj;
+          return obj;
+        }
+        [Symbol.dispose]() { if (this.#open) this.close(); }
+        get [Symbol.for("sqlite-type")]() { return "node:sqlite"; }
+      }
+      // node throws ERR_CONSTRUCT_CALL_REQUIRED (not a bare TypeError) when the
+      // constructor is called without `new`, which a class body cannot observe.
+      function DatabaseSync(...a) {
+        if (new.target === undefined) {
+          throw mkErr(TypeError, "ERR_CONSTRUCT_CALL_REQUIRED",
+                      "Cannot call constructor without `new`");
+        }
+        return Reflect.construct(DatabaseSyncImpl, a, new.target);
+      }
+      DatabaseSync.prototype = DatabaseSyncImpl.prototype;
+      Object.defineProperty(DatabaseSync, "name", { value: "DatabaseSync" });
+
+      // bun's constants plus the changeset conflict-resolution verbs node exports.
+      const nodeConstants = Object.assign({}, constants, {
+        SQLITE_CHANGESET_OMIT: 0, SQLITE_CHANGESET_REPLACE: 1, SQLITE_CHANGESET_ABORT: 2,
+        SQLITE_CHANGESET_DATA: 1, SQLITE_CHANGESET_NOTFOUND: 2, SQLITE_CHANGESET_CONFLICT: 3,
+        SQLITE_CHANGESET_CONSTRAINT: 4, SQLITE_CHANGESET_FOREIGN_KEY: 5,
+        // Authorizer verdicts and the full sqlite3_set_authorizer action set.
+        SQLITE_OK: 0, SQLITE_DENY: 1, SQLITE_IGNORE: 2,
+        SQLITE_CREATE_INDEX: 1, SQLITE_CREATE_TABLE: 2, SQLITE_CREATE_TEMP_INDEX: 3,
+        SQLITE_CREATE_TEMP_TABLE: 4, SQLITE_CREATE_TEMP_TRIGGER: 5, SQLITE_CREATE_TEMP_VIEW: 6,
+        SQLITE_CREATE_TRIGGER: 7, SQLITE_CREATE_VIEW: 8, SQLITE_DELETE: 9,
+        SQLITE_DROP_INDEX: 10, SQLITE_DROP_TABLE: 11, SQLITE_DROP_TEMP_INDEX: 12,
+        SQLITE_DROP_TEMP_TABLE: 13, SQLITE_DROP_TEMP_TRIGGER: 14, SQLITE_DROP_TEMP_VIEW: 15,
+        SQLITE_DROP_TRIGGER: 16, SQLITE_DROP_VIEW: 17, SQLITE_INSERT: 18, SQLITE_PRAGMA: 19,
+        SQLITE_READ: 20, SQLITE_SELECT: 21, SQLITE_TRANSACTION: 22, SQLITE_UPDATE: 23,
+        SQLITE_ATTACH: 24, SQLITE_DETACH: 25, SQLITE_ALTER_TABLE: 26, SQLITE_REINDEX: 27,
+        SQLITE_ANALYZE: 28, SQLITE_CREATE_VTABLE: 29, SQLITE_DROP_VTABLE: 30,
+        SQLITE_FUNCTION: 31, SQLITE_SAVEPOINT: 32, SQLITE_COPY: 0, SQLITE_RECURSIVE: 33,
+      });
 
       M["node:sqlite"] = {
-        __esModule: true, DatabaseSync, StatementSync, constants,
-        default: { DatabaseSync, StatementSync, constants },
+        __esModule: true, DatabaseSync, StatementSync, constants: nodeConstants,
+        default: { DatabaseSync, StatementSync, constants: nodeConstants },
       };
     }
   }
@@ -4728,6 +5240,62 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   def(["readline/promises"], { createInterface: readlineMod.createInterface });
   // node global alias + node:stream/web (WHATWG stream classes as a module)
   if (typeof G.global === "undefined") G.global = G;
+  // ---- Web Storage: `Storage` + a session-scoped `sessionStorage` ----------
+  // These are gated on SQLite in node (it backs localStorage with a sqlite file),
+  // so declaring process.versions.sqlite makes the corpus REQUIRE them:
+  // test-webstorage-without-sqlite asserts `typeof sessionStorage === 'object'`
+  // and `Object.hasOwn(globalThis, 'sessionStorage')` exactly when hasSQLite, and
+  // test-global expects `sessionStorage` among the ENUMERABLE own global keys
+  // while `Storage` stays non-enumerable. sessionStorage is per-process and never
+  // persisted (node keeps it in an in-memory database), so a Map is the whole
+  // backing store; `localStorage` stays absent because it exists only with
+  // --localstorage-file, which mbun does not accept.
+  if (typeof G.sessionStorage === "undefined") {
+    const kStore = Symbol("Storage store");
+    const kBrand = Symbol("Storage brand");
+    class Storage {
+      constructor(brand) {
+        if (brand !== kBrand) throw new TypeError("Illegal constructor");
+        this[kStore] = new Map();
+      }
+      #map() {
+        const m = this[kStore];
+        if (!(m instanceof Map)) throw new TypeError("Illegal invocation");
+        return m;
+      }
+      get length() { return this.#map().size; }
+      key(n) {
+        const m = this.#map();
+        const i = Number(n) || 0;
+        if (i < 0 || i >= m.size) return null;
+        return [...m.keys()][i];
+      }
+      getItem(k) { const m = this.#map(); k = String(k); return m.has(k) ? m.get(k) : null; }
+      setItem(k, v) { this.#map().set(String(k), String(v)); }
+      removeItem(k) { this.#map().delete(String(k)); }
+      clear() { this.#map().clear(); }
+    }
+    // Named property access (`sessionStorage.foo = 1`) is part of the interface,
+    // and only a Proxy can express it over a Map without leaking own properties.
+    const isApi = (p) => typeof p !== "string"
+      || ["length", "key", "getItem", "setItem", "removeItem", "clear"].includes(p);
+    const target = new Storage(kBrand);
+    const store = target[kStore];
+    const proxy = new Proxy(target, {
+      get(t, p, r) { return isApi(p) ? Reflect.get(t, p, t) : (store.has(p) ? store.get(p) : undefined); },
+      set(t, p, v) { if (isApi(p)) return Reflect.set(t, p, v, t); store.set(p, String(v)); return true; },
+      has(t, p) { return isApi(p) ? Reflect.has(t, p) : store.has(p); },
+      deleteProperty(t, p) { if (isApi(p)) return Reflect.deleteProperty(t, p); store.delete(p); return true; },
+      ownKeys() { return [...store.keys()]; },
+      getOwnPropertyDescriptor(t, p) {
+        if (isApi(p)) return Reflect.getOwnPropertyDescriptor(t, p);
+        if (!store.has(p)) return undefined;
+        return { value: store.get(p), writable: true, enumerable: true, configurable: true };
+      },
+    });
+    Object.defineProperty(G, "Storage", { value: Storage, writable: true, configurable: true, enumerable: false });
+    Object.defineProperty(G, "sessionStorage", { value: proxy, writable: true, configurable: true, enumerable: true });
+  }
   // node's stream/web.js re-exports the WHATWG globals verbatim (all 17 of
   // them); exporting only a subset made `require("node:stream/web").X`
   // undefined for classes that already exist on globalThis, so
