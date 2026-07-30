@@ -1514,8 +1514,9 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       if (typeof value === "string") return { inspectCell: true, text: value, color: false };
       if (typeof value === "number") return { inspectCell: true, text: String(value), color: true };
       if (typeof value === "boolean" || value == null || typeof value === "bigint") return { inspectCell: true, text: String(value), color: true };
-      try { return { inspectCell: true, text: Bun.inspect(value, { colors: false, compact: true }), color: false }; }
-      catch (_) { return { inspectCell: true, text: "", color: false }; }
+      // A cell's Bun.inspect.custom / toString runs user code; bun lets whatever
+      // it throws escape Bun.inspect.table rather than rendering a blank cell.
+      return { inspectCell: true, text: Bun.inspect(value, { colors: false, compact: true }), color: false };
     };
     const render = (head, columns) => renderTable(head, columns, (value, row) => {
       if (row === -1) {
@@ -1542,8 +1543,16 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       return render(["", "Values"], [index, values]);
     }
     if (typeof tabularData === "function") return render(["", "Values"], [["0"], [cell(tabularData)]]);
-    const indexes = Object.keys(tabularData);
-    const items = indexes.map((key) => tabularData[key]);
+    // A generator/iterator is drained ONCE into rows; Object.keys() on it is []
+    // and re-iterating a spent generator would render an empty table.
+    let indexes, items;
+    if (!Array.isArray(tabularData) && !ArrayBuffer.isView(tabularData) && typeof tabularData[Symbol.iterator] === "function") {
+      items = Array.from(tabularData);
+      indexes = items.map((_, idx) => String(idx));
+    } else {
+      indexes = Object.keys(tabularData);
+      items = indexes.map((key) => tabularData[key]);
+    }
     const primitive = (value) => value === null || (typeof value !== "object" && typeof value !== "function");
     const hasPrimitives = items.some(primitive);
     const keys = props || (hasPrimitives ? [] : Array.from(new Set(items.flatMap((item) => Object.keys(item)))));
@@ -1766,6 +1775,26 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       Object.defineProperty(G.console, key, { value: fn, writable: true, enumerable: false, configurable: true });
     } catch (e) {}
   }
+  // The GLOBAL console is bun's own ConsoleObject, not a node Console instance:
+  // its `table` is Bun.inspect.table (blank row-header column, left-aligned
+  // cells), while node:console's Console#table keeps node's cli_table form
+  // ("(index)"/"(iteration index)" headers, centered cells). Only the global is
+  // re-pointed here; Console.prototype.table above is untouched.
+  try {
+    const globalTable = function table(tabularData, properties) {
+      if (properties !== undefined && !Array.isArray(properties)) {
+        throw mkConErr(TypeError, "ERR_INVALID_ARG_TYPE",
+          'The "properties" argument must be an instance of Array.' + conArgTypeHelper(properties));
+      }
+      const grid = inspectTableImpl(tabularData, properties);
+      if (grid === "") return G.console.log(tabularData);
+      // inspectTableImpl already ends the grid with a newline; console.log adds
+      // the other one.
+      return G.console.log(grid.endsWith("\n") ? grid.slice(0, -1) : grid);
+    };
+    Object.defineProperty(G.console, "table", { value: globalTable, writable: true, enumerable: false, configurable: true });
+  } catch (e) {}
+
   // Correct the name/constructability of the native log/warn/error/info/debug
   // WITHOUT altering their behavior. The native console only owns some of these
   // (log/error); the rest (info/debug → log, warn → error) must be aliased to the

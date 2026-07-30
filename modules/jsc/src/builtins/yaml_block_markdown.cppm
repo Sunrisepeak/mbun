@@ -782,6 +782,129 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
       return eq(a, b, !!strict, new Map());
     };
     if (typeof Bun.escapeHTML === "undefined") Bun.escapeHTML = (s) => ("" + s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#x27;");
+    // ---- Bun.CSRF (blueprint bun src/csrf/lib.rs; core port: mbun.csrf) -----
+    // Token layout, all big-endian, HMAC'd as one message:
+    //   payload[0..8)   creation timestamp (ms since epoch)
+    //   payload[8..24)  16 random bytes
+    //   payload[24..32) expiresIn (ms; 0 = never)
+    //   digest          HMAC(secret, payload || sessionId)
+    // The wire token is `payload || digest`, encoded base64url (default), base64
+    // or hex. verify() is fail-closed: any decode failure, a short token, an
+    // expired timestamp (by the token's own expiresIn OR the verifier's maxAge),
+    // or a sessionId that differs from the one the token was bound to all return
+    // false rather than throwing. Argument problems (empty token/secret, empty or
+    // non-string sessionId, unknown encoding/algorithm) DO throw.
+    if (typeof Bun.CSRF === "undefined") {
+      const CSRF_DAY_MS = 24 * 60 * 60 * 1000;
+      const CSRF_ALGS = { blake2b256: 1, blake2b512: 1, sha256: 1, sha384: 1, sha512: 1, "sha512-256": 1 };
+      const csrfCrypto = () => {
+        const c = M["crypto"] || M["node:crypto"];
+        if (!c || typeof c.createHmac !== "function") throw new Error("Bun.CSRF requires node:crypto");
+        return c;
+      };
+      let csrfDefaultSecret;
+      const csrfSecret = (secret, required) => {
+        if (secret === undefined || secret === null) {
+          if (required) { const e = new TypeError('The "secret" argument must be of type string.'); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
+          // bun lazily mints one process-wide random secret, so a token minted
+          // by CSRF.generate() verifies with CSRF.verify() in the same process
+          // and nowhere else.
+          if (csrfDefaultSecret === undefined) csrfDefaultSecret = csrfCrypto().randomBytes(32).toString("hex");
+          return csrfDefaultSecret;
+        }
+        if (typeof secret !== "string") { const e = new TypeError('The "secret" argument must be of type string. Received ' + typeof secret); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
+        if (secret.length === 0) { const e = new TypeError('The "secret" argument must not be empty.'); e.code = "ERR_INVALID_ARG_VALUE"; throw e; }
+        return secret;
+      };
+      const csrfCommonOptions = (options) => {
+        const opts = options === undefined || options === null ? {} : options;
+        if (typeof opts !== "object") { const e = new TypeError('The "options" argument must be an object.'); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
+        const encoding = opts.encoding === undefined ? "base64url" : opts.encoding;
+        if (encoding !== "base64" && encoding !== "base64url" && encoding !== "hex") {
+          const e = new TypeError('The "encoding" argument must be one of "base64", "base64url" or "hex". Received ' + String(encoding));
+          e.code = "ERR_INVALID_ARG_VALUE"; throw e;
+        }
+        const algorithm = opts.algorithm === undefined ? "sha256" : opts.algorithm;
+        if (typeof algorithm !== "string" || CSRF_ALGS[algorithm] === undefined) {
+          const e = new TypeError('The "algorithm" argument must be a supported HMAC algorithm. Received ' + String(algorithm));
+          e.code = "ERR_INVALID_ARG_VALUE"; throw e;
+        }
+        let sessionId = opts.sessionId;
+        if (sessionId === undefined || sessionId === null) sessionId = "";
+        else {
+          if (typeof sessionId !== "string") { const e = new TypeError('The "sessionId" argument must be of type string. Received ' + typeof sessionId); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
+          if (sessionId.length === 0) { const e = new TypeError('The "sessionId" argument must not be empty.'); e.code = "ERR_INVALID_ARG_VALUE"; throw e; }
+        }
+        return { opts, encoding, algorithm, sessionId };
+      };
+      const csrfMs = (value, fallback, name) => {
+        if (value === undefined || value === null) return fallback;
+        const ms = Number(value);
+        if (!Number.isFinite(ms) || ms < 0) { const e = new TypeError('The "' + name + '" argument must be a non-negative number. Received ' + String(value)); e.code = "ERR_INVALID_ARG_VALUE"; throw e; }
+        return Math.floor(ms);
+      };
+      const csrfHmac = (secret, algorithm, message) => {
+        const h = csrfCrypto().createHmac(algorithm, secret);
+        h.update(message);
+        return h.digest();
+      };
+      // base64 and base64url share one decoder (bun decodes both alphabets with
+      // the same table), so a hex token handed to the default decoder yields
+      // bytes that simply fail the HMAC check instead of an error.
+      const CSRF_B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+      const csrfDecode = (token, encoding) => {
+        const t = token.replace(/^[\r\n\t \v]+/, "").replace(/[\r\n\t \v]+$/, "");
+        if (encoding === "hex") {
+          if (t.length % 2 !== 0 || /[^0-9a-fA-F]/.test(t)) return null;
+          return Buffer.from(t, "hex");
+        }
+        const out = [];
+        let acc = 0, bits = 0;
+        for (let k = 0; k < t.length; k++) {
+          const c = t[k];
+          if (c === "=") break;
+          let pos = CSRF_B64.indexOf(c);
+          if (pos < 0) { if (c === "-") pos = 62; else if (c === "_") pos = 63; else return null; }
+          acc = (acc << 6) | pos; bits += 6;
+          if (bits >= 8) { bits -= 8; out.push((acc >> bits) & 0xff); }
+        }
+        return Buffer.from(out);
+      };
+      Bun.CSRF = {
+        generate(secret, options) {
+          const key = csrfSecret(secret, false);
+          const { opts, encoding, algorithm, sessionId } = csrfCommonOptions(options);
+          const expiresIn = csrfMs(opts.expiresIn, CSRF_DAY_MS, "expiresIn");
+          const payload = Buffer.alloc(32);
+          payload.writeBigUInt64BE(BigInt(Date.now()), 0);
+          csrfCrypto().randomFillSync(payload, 8, 16);
+          payload.writeBigUInt64BE(BigInt(expiresIn), 24);
+          const digest = csrfHmac(key, algorithm, Buffer.concat([payload, Buffer.from(sessionId, "utf8")]));
+          const token = Buffer.concat([payload, digest]);
+          return encoding === "hex" ? token.toString("hex")
+               : encoding === "base64" ? token.toString("base64")
+               : token.toString("base64url");
+        },
+        verify(token, options) {
+          if (typeof token !== "string") { const e = new TypeError('The "token" argument must be of type string. Received ' + typeof token); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
+          if (token.length === 0) { const e = new TypeError('The "token" argument must not be empty.'); e.code = "ERR_INVALID_ARG_VALUE"; throw e; }
+          const { opts, encoding, algorithm, sessionId } = csrfCommonOptions(options);
+          const key = csrfSecret(opts.secret, false);
+          const maxAge = csrfMs(opts.maxAge, CSRF_DAY_MS, "maxAge");
+          const decoded = csrfDecode(token, encoding);
+          if (decoded === null || decoded.length < 64) return false;
+          const timestamp = Number(decoded.readBigUInt64BE(0));
+          const expiresIn = Number(decoded.readBigUInt64BE(24));
+          const now = Date.now();
+          if (expiresIn > 0 && now > timestamp + expiresIn) return false;
+          if (maxAge > 0 && now > timestamp + maxAge) return false;
+          const expected = csrfHmac(key, algorithm, Buffer.concat([decoded.subarray(0, 32), Buffer.from(sessionId, "utf8")]));
+          const got = decoded.subarray(32);
+          if (got.length !== expected.length) return false;
+          return csrfCrypto().timingSafeEqual(got, expected);
+        },
+      };
+    }
     // Bun.peek (blueprint src/js/builtins/Peek.ts): settled → value, else the
     // promise/value itself. Backed by native promise-slot readers.
     {
@@ -840,18 +963,81 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
         }
         return quote !== 0 || depth > 0 || text.endsWith(":") || text.endsWith(",") || ["t", "tr", "tru", "f", "fa", "fal", "fals", "n", "nu", "nul"].includes(text);
       };
+      // JSON's whitespace set, NOT String.prototype.trim's: trim() also strips
+      // U+FEFF, which would silently swallow a BOM appearing between two values
+      // (only a BOM at byte 0 is skipped) and turn an invalid line into a valid
+      // one.
+      const isJsonWS = (c) => c === 32 || c === 9 || c === 10 || c === 13;
+      const jsonTrimStart = (t) => { let a = 0; while (a < t.length && isJsonWS(t.charCodeAt(a))) a++; return t.slice(a); };
+      const jsonTrim = (t) => { let a = 0, b = t.length; while (a < b && isJsonWS(t.charCodeAt(a))) a++; while (b > a && isJsonWS(t.charCodeAt(b - 1))) b--; return t.slice(a, b); };
+      // End offset of the first complete {...}/[...] on the line, or -1. bun's
+      // line parser stops after the first value, so `{"a":1}{"b":2}` yields the
+      // first value and reports the remainder as the error.
+      const firstValueEnd = (t) => {
+        const c0 = t.charCodeAt(0);
+        if (c0 !== 123 && c0 !== 91) return -1;
+        let depth = 0, quote = false, escaped = false;
+        for (let k = 0; k < t.length; k++) {
+          const c = t.charCodeAt(k);
+          if (quote) { if (escaped) escaped = false; else if (c === 92) escaped = true; else if (c === 34) quote = false; continue; }
+          if (c === 34) { quote = true; continue; }
+          if (c === 123 || c === 91) depth++;
+          else if (c === 125 || c === 93) { depth--; if (depth === 0) return k + 1; }
+        }
+        return -1;
+      };
+      // JSON.parse materialises `"__proto__"` as an OWN property; bun builds each
+      // object by assignment, where `__proto__` sets THAT object's prototype (and
+      // pollutes nothing else). Reproduce the assignment shape.
+      const applyProtoAssignment = (root) => {
+        const stack = [root];
+        while (stack.length) {
+          const node = stack.pop();
+          if (node === null || typeof node !== "object") continue;
+          const isArray = Array.isArray(node);
+          // Collect children through OWN keys before touching the prototype, so
+          // the walk never enumerates the newly installed prototype's members.
+          const keys = isArray ? null : Object.keys(node);
+          if (isArray) { for (let k = 0; k < node.length; k++) { const v = node[k]; if (v !== null && typeof v === "object") stack.push(v); } }
+          else { for (const k of keys) { const v = node[k]; if (v !== null && typeof v === "object") stack.push(v); } }
+          if (!isArray && Object.prototype.hasOwnProperty.call(node, "__proto__")) {
+            const proto = node["__proto__"];
+            delete node["__proto__"];
+            if (proto === null || typeof proto === "object") { try { Object.setPrototypeOf(node, proto); } catch (e) {} }
+          }
+        }
+        return root;
+      };
+      // The intrinsic %TypedArray%.prototype byteLength/byteOffset getters: a
+      // subclass may override either accessor, and trusting the override would
+      // build an out-of-range view (or read past the backing buffer).
+      // (A DataView is an ArrayBufferView too, but it answers DataView.prototype's
+      // getters, not %TypedArray%.prototype's.)
+      const taProto = Object.getPrototypeOf(Uint8Array.prototype);
+      const taByteLength = Object.getOwnPropertyDescriptor(taProto, "byteLength").get;
+      const taByteOffset = Object.getOwnPropertyDescriptor(taProto, "byteOffset").get;
+      const dvByteLength = Object.getOwnPropertyDescriptor(DataView.prototype, "byteLength").get;
+      const dvByteOffset = Object.getOwnPropertyDescriptor(DataView.prototype, "byteOffset").get;
+      const viewByteLengthOf = (v) => { try { return taByteLength.call(v); } catch (e) { return dvByteLength.call(v); } };
+      const viewByteOffsetOf = (v) => { try { return taByteOffset.call(v); } catch (e) { return dvByteOffset.call(v); } };
       JSONL.parseChunk = (input, start, end) => {
         const bytes = input && ArrayBuffer.isView(input);
-        if (typeof input !== "string" && !bytes) throw inputError(input);
-        if (bytes) G.__mbunCheckAllocLimit(input.byteLength, "text");
-        const length = bytes ? input.byteLength : input.length;
+        // A non-view object (an ArrayBuffer, say) is stringified rather than
+        // rejected; only null/undefined and primitives are a TypeError.
+        if (typeof input !== "string" && !bytes) {
+          if (input === null || input === undefined || typeof input !== "object") throw inputError(input);
+          input = String(input);
+        }
+        const viewByteLength = bytes ? viewByteLengthOf(input) : 0;
+        if (bytes) G.__mbunCheckAllocLimit(viewByteLength, "text");
+        const length = bytes ? viewByteLength : input.length;
         const offset = (value, fallback, negative) => {
           value = value === undefined ? fallback : Number(value);
           return Number.isNaN(value) || value < 0 ? negative : Math.min(length, Number.isFinite(value) ? Math.floor(value) : length);
         };
         let begin = offset(start, 0, 0), finish = offset(end, length, length);
         if (begin > finish) begin = finish;
-        const raw = bytes ? new Uint8Array(input.buffer, input.byteOffset + begin, finish - begin) : null;
+        const raw = bytes ? new Uint8Array(input.buffer, viewByteOffsetOf(input) + begin, finish - begin) : null;
         let text = bytes ? new G.TextDecoder().decode(raw) : input.slice(begin, finish);
         let bom = 0;
         if (bytes && begin === 0 && raw.length >= 3 && raw[0] === 0xef && raw[1] === 0xbb && raw[2] === 0xbf) bom = 3;
@@ -864,12 +1050,23 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
           const hasNewline = newline !== -1;
           const lineEnd = hasNewline ? newline : text.length;
           const line = text.slice(pos, lineEnd);
-          const valueText = line.trim();
+          const valueText = jsonTrim(line);
+          const lead = line.length - jsonTrimStart(line).length;
           if (valueText) {
             try {
-              values.push(JSON.parse(valueText));
-              read = toOffset(pos + line.length - line.trimStart().length + valueText.length);
+              const parsed = JSON.parse(valueText);
+              values.push(valueText.indexOf("__proto__") === -1 ? parsed : applyProtoAssignment(parsed));
+              read = toOffset(pos + lead + valueText.length);
             } catch (e) {
+              // A line holding several concatenated values keeps the first one.
+              const cut = firstValueEnd(valueText);
+              if (cut > 0 && cut < valueText.length) {
+                try {
+                  const head = JSON.parse(valueText.slice(0, cut));
+                  values.push(valueText.indexOf("__proto__") === -1 ? head : applyProtoAssignment(head));
+                  read = toOffset(pos + lead + cut);
+                } catch (_) {}
+              }
               if (hasNewline || !incompleteJSON(valueText)) error = e;
               else done = false;
               break;
@@ -1091,7 +1288,29 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
       // (0x2A) integers, and numbers like `2.`/`.5`. The empty document is invalid
       // (JSON5 requires exactly one value) — bun surfaces that as a parse error.
       const parseJSON5 = (input) => {
-        const s = String(input);
+        if (input === null || input === undefined) {
+          const e = new TypeError('The "input" argument must be of type string, ArrayBuffer, or TypedArray. Received ' +
+            (input === null ? "null" : "undefined"));
+          e.code = "ERR_INVALID_ARG_TYPE";
+          throw e;
+        }
+        // bun takes a string, an ArrayBuffer or any ArrayBufferView and decodes
+        // the bytes as UTF-8. The byte length is bounded by the 2^31-1 string
+        // allocation limit; anything wider is a RangeError, not a panic.
+        let s;
+        if (typeof input === "string") s = input;
+        else if (input instanceof ArrayBuffer || ArrayBuffer.isView(input)
+                 || (typeof SharedArrayBuffer === "function" && input instanceof SharedArrayBuffer)) {
+          const bytes = ArrayBuffer.isView(input)
+            ? new Uint8Array(input.buffer, input.byteOffset, input.byteLength)
+            : new Uint8Array(input);
+          if (bytes.byteLength > 2147483647) {
+            const e = new RangeError('The value of "input.byteLength" is out of range. It must be <= 2147483647. Received ' + bytes.byteLength);
+            e.code = "ERR_OUT_OF_RANGE";
+            throw e;
+          }
+          s = new TextDecoder().decode(bytes);
+        } else s = String(input);
         const n = s.length;
         let i = 0;
         const err = (m) => { throw new SyntaxError("JSON5 Parse error: " + m); };
@@ -1104,7 +1323,7 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
             if (isWS(cc)) { i++; continue; }
             if (cc === 47 /* / */) {
               const d = i + 1 < n ? s.charCodeAt(i + 1) : 0;
-              if (d === 47) { i += 2; while (i < n && s.charCodeAt(i) !== 10) i++; continue; }
+              if (d === 47) { i += 2; while (i < n) { const t = s.charCodeAt(i); if (t === 10 || t === 13 || t === 0x2028 || t === 0x2029) break; i++; } continue; }
               if (d === 42) { const e = s.indexOf("*/", i + 2); if (e === -1) err("Unterminated multi-line comment"); i = e + 2; continue; }
               err("Unexpected character");
             }
@@ -1125,11 +1344,18 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
             const h0 = i;
             while (i < n && isHex(s.charCodeAt(i))) i++;
             if (i === h0) err("Invalid hex number");
+            // bun's loader accumulates a hex integer in a u64, so a literal with
+            // more than 16 significant hex digits overflows and does not parse.
+            if (s.slice(h0, i).replace(/^0+/, "").length > 16) err("Invalid hex number");
             return parseInt(s.slice(h0, i), 16);
           }
           const i0 = i;
           while (i < n && (cc = s.charCodeAt(i)) >= 48 && cc <= 57) i++;
           const intDigits = i - i0;
+          // JSON5 inherits ECMAScript's DecimalIntegerLiteral: a leading 0
+          // followed by another digit is invalid, covering both the legacy octal
+          // (`010`) and "noctal" (`080`) forms.
+          if (intDigits > 1 && s.charCodeAt(i0) === 48) err("Leading zeros are not allowed in JSON5");
           let fracDigits = 0;
           if (i < n && s.charCodeAt(i) === 46) {
             i++;
@@ -1186,7 +1412,9 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
                 out += String.fromCharCode(parseInt(s.slice(i + 1, i + 3), 16));
                 i += 3;
               } else if (e >= 48 && e <= 57) err("Octal escape sequences are not allowed in JSON5");
-              else err("Invalid escape character " + s[i]);
+              // JSON5 IdentityEscape (json5.org #strings): any other character
+              // that is not a decimal digit stands for itself.
+              else { out += s[i]; i++; }
               chunk = i;
               continue;
             }
@@ -1194,13 +1422,49 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
             i++;
           }
         };
+        // \uXXXX at i (i points at the backslash); returns the code unit.
+        const readKeyUnicodeEscape = () => {
+          if (i + 6 > n) err("Invalid unicode escape: expected 4 hex digits");
+          let v = 0;
+          for (let k = i + 2; k < i + 6; k++) { const h = s.charCodeAt(k); if (!isHex(h)) err("Invalid unicode escape: expected 4 hex digits"); v = v * 16 + parseInt(s[k], 16); }
+          i += 6;
+          return v;
+        };
+        // An IdentifierName key may spell any of its characters as \uXXXX
+        // (json5-tests "unicode escaped unquoted key"), so the key is
+        // accumulated rather than sliced out of the source.
         const parseKey = () => {
           const cc = s.charCodeAt(i);
           if (cc === 34 || cc === 39) return parseString();
-          if (isIdStart(cc)) { const start = i; i++; while (i < n && isIdPart(s.charCodeAt(i))) i++; return s.slice(start, i); }
-          if (cc === 92 && s.charCodeAt(i + 1) !== 117) err("Invalid unicode escape: expected 4 hex digits");
-          if (cc === 64) err("Unexpected character");
-          err("Invalid identifier start character");
+          let key = "";
+          if (cc === 92) {
+            if (s.charCodeAt(i + 1) !== 117) err("Invalid unicode escape: expected 4 hex digits");
+            const v = readKeyUnicodeEscape();
+            if (!isIdStart(v)) err("Invalid identifier start character");
+            key = String.fromCharCode(v);
+          } else if (isIdStart(cc)) { key = s[i]; i++; }
+          else if (cc === 64) err("Unexpected character");
+          else err("Invalid identifier start character");
+          while (i < n) {
+            const c2 = s.charCodeAt(i);
+            if (c2 === 92) {
+              if (s.charCodeAt(i + 1) !== 117) err("Invalid unicode escape: expected 4 hex digits");
+              const v = readKeyUnicodeEscape();
+              if (!isIdPart(v)) err("Invalid identifier start character");
+              key += String.fromCharCode(v);
+              continue;
+            }
+            if (!isIdPart(c2)) break;
+            key += s[i]; i++;
+          }
+          // `{ multi-word: 1 }`: a byte that can neither continue the
+          // IdentifierName nor separate it from the ':' is a hard error, not a
+          // missing colon (json5-tests "illegal unquoted key symbol").
+          if (i < n) {
+            const t = s.charCodeAt(i);
+            if (t !== 58 && t !== 47 && t !== 125 && !isWS(t)) err("Unexpected character");
+          }
+          return key;
         };
         const parseObject = () => {
           i++; // {
@@ -1260,6 +1524,7 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
           if (cc === 45 /* - */) {
             i++;
             if (s.startsWith("Infinity", i)) { i += 8; return -Infinity; }
+            if (s.startsWith("NaN", i)) { i += 3; return NaN; }
             const d = i < n ? s.charCodeAt(i) : 0;
             if (i >= n) err("Unexpected end of input");
             if (!((d >= 48 && d <= 57) || d === 46)) err("Unexpected character");
@@ -1268,6 +1533,7 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
           if (cc === 43 /* + */) {
             i++;
             if (s.startsWith("Infinity", i)) { i += 8; return Infinity; }
+            if (s.startsWith("NaN", i)) { i += 3; return NaN; }
             const d = i < n ? s.charCodeAt(i) : 0;
             if (i >= n) err("Unexpected end of input");
             if (!((d >= 48 && d <= 57) || d === 46)) err("Unexpected character");
