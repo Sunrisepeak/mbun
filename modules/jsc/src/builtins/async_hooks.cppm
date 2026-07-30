@@ -1070,6 +1070,27 @@ inline constexpr std::string_view kAsyncHooksJS = R"JS(
       value: (fn, type) => wrapAsync(fn, type),
     });
 
+    // Frame-only capture, for a runtime layer that defers a user callback to a
+    // later loop turn through its OWN queue rather than through setTimeout /
+    // setImmediate (which carry the frame via timerHooks.run). node:fs is the
+    // caller: it batches its completions behind one drain, and without this the
+    // callback runs with whatever frame the drain happens to be standing in --
+    // measured as AsyncLocalStorage silently LOST across fs.stat/open/readdir/
+    // lstat/fstat/mkdir/readlink/unlink/chmod/appendFile, and a domain unable
+    // to catch a throw out of any of them (test-domain-implicit-binding).
+    //
+    // Deliberately NOT __mbunAsyncHookWrap: that allocates an async id and
+    // emits init/before/after/destroy, so every fs call would become a visible
+    // async resource and move the event stream every test-async-hooks-* file
+    // reads. Node does emit FSREQCALLBACK there, but that is a separate,
+    // separately-measurable change; the context frame is what was lost and is
+    // all this restores. captureContext returns `fn` untouched when no frame is
+    // active, so a program that never uses AsyncLocalStorage pays nothing.
+    Object.defineProperty(G, '__mbunCaptureAsyncContext', {
+      configurable: true, enumerable: false,
+      value: (fn) => captureContext(fn),
+    });
+
     // Timer lifecycle. node's Timeout/Immediate are real async resources whose id
     // is allocated at schedule time whether or not a hook is listening.
     const timerHooks = {

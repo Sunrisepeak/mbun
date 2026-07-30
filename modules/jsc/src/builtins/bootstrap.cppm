@@ -8771,9 +8771,26 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     const ret = fn.apply(this, args);
     inFrame = false;
     if (fired) {
+      // The completion carries the async context of the CALL, captured here at
+      // push time — node's rule, and the same thing process.nextTick does a few
+      // hundred lines away in runtime/bindings_install.inc. A batched drain runs
+      // in whatever context the drain is standing in, which is nobody's: without
+      // these two lines AsyncLocalStorage is silently lost across every one of
+      // these callbacks, and a domain cannot catch a throw out of one
+      // (test-domain-implicit-binding, whose stack named fsDrainCompletions).
+      // setTimeout/setImmediate never needed this spelled out because node:timers
+      // does it for them; a private queue has to do it itself.
+      //
+      // Domain first, then the context frame, so the frame is restored around
+      // the domain's error handling too.
+      let done = real;
+      const h = G.__mbunSchedHook;
+      if (h !== undefined && h !== null) done = h(done);
+      const cap = G.__mbunCaptureAsyncContext;
+      if (typeof cap === "function") done = cap(done);
       const req = { __proto__: null };
       fsActiveRequests.add(req);
-      fsCompletionQueue.push({ req, run: () => real.apply(undefined, out) });
+      fsCompletionQueue.push({ req, run: () => done.apply(undefined, out) });
       fsScheduleDrain();
     }
     return ret;
