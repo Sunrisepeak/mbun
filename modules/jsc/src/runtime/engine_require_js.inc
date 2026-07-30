@@ -31,6 +31,43 @@ globalThis.__mbun_blob_module_source = function (spec) {
   return { type: typeof blob.type === "string" ? blob.type : "",
            source: bytes ? new TextDecoder().decode(bytes) : "" };
 };
+// The identity a `mock.module()` registration and a later require()/import() of
+// the same module must agree on. Resolution is the identity whenever it works
+// (that is what makes mock.module("./second.ts") intercept `import … from
+// "./second"` — 6879.test.ts pins exactly that pair). bun also lets you mock a
+// specifier that does NOT resolve — a relative path to a file that was never
+// written, or a package that is not installed — so an unresolvable relative
+// specifier falls back to a lexically normalised absolute path (no filesystem
+// access), and a bare specifier stays itself. `file:` / `file://` prefixes are
+// stripped first: mock-module.test.ts registers "file:./x.ts" and then imports
+// "./x.ts".
+globalThis.__mbun_mock_key = function (spec, dir) {
+  let s = String(spec);
+  if (s.startsWith("file://")) s = s.slice(7);
+  else if (s.startsWith("file:")) s = s.slice(5);
+  try { return globalThis.__mbun_resolve_native(s, dir); } catch (e) {}
+  const c = s.charCodeAt(0);
+  if (c === 46 /* . */ || c === 47 /* / */) {
+    const parts = (c === 47 ? s : String(dir) + "/" + s).split("/");
+    const out = [];
+    for (let i = 0; i < parts.length; i++) {
+      const p = parts[i];
+      if (p === "" || p === ".") continue;
+      if (p === "..") { out.pop(); continue; }
+      out.push(p);
+    }
+    return "/" + out.join("/");
+  }
+  return s;
+};
+// Consulted by every require flavour before the resolver runs. Empty (the only
+// state outside `bun test`) short-circuits on a Map size read.
+globalThis.__mbun_mock_lookup = function (spec, dir) {
+  const mocks = globalThis.__mbunModuleMocks;
+  if (mocks === undefined || mocks.size === 0) return undefined;
+  const key = globalThis.__mbun_mock_key(spec, dir);
+  return mocks.has(key) ? { exports: mocks.get(key) } : undefined;
+};
 globalThis.__mbun_make_require = function (dir) {
   const invalidRequireId = function (value) {
     if (typeof value !== "string") {
@@ -70,6 +107,8 @@ globalThis.__mbun_make_require = function (dir) {
       error.code = "MODULE_NOT_FOUND";
       throw error;
     }
+    const mocked = globalThis.__mbun_mock_lookup(s, dir);
+    if (mocked !== undefined) return mocked.exports;
     const load = function () {
       // Node consults require.cache before entering its CJS loader.  Keep the
       // native cache authoritative for ordinary modules, while honouring a
@@ -93,7 +132,18 @@ globalThis.__mbun_make_require = function (dir) {
     if (!trace || !trace.hasSubscribers) return load();
     return trace.traceSync(load, { parentFilename: req.__mbun_parent_filename, id: s });
   };
-  req.resolve = function (s) { return globalThis.__mbun_resolve_native(String(s), dir); };
+  req.resolve = function (s) {
+    // A mocked specifier resolves even when nothing is on disk: bun makes
+    // `mock.module("./never-written.ts", …)` turn a previously-throwing
+    // require.resolve() into the mock's own key (mock-module.test.ts asserts
+    // require.resolve === import.meta.resolveSync for exactly that case).
+    const mocks = globalThis.__mbunModuleMocks;
+    if (mocks !== undefined && mocks.size !== 0) {
+      const key = globalThis.__mbun_mock_key(s, dir);
+      if (mocks.has(key)) return key;
+    }
+    return globalThis.__mbun_resolve_native(String(s), dir);
+  };
   // require.cache is a live view over the native CommonJS module cache: a plain
   // object can't reach the C++ cache, so `delete require.cache[key]` (a common
   // "force re-evaluation" idiom, and what test/js/bun/resolve/import-query uses to
@@ -128,6 +178,8 @@ globalThis.__mbun_make_require_esm = function (dir) {
   // MODULE_NOT_FOUND, while a lowered `import` statement passes 1 → ERR_MODULE_NOT_FOUND.
   const req = (s, ...rest) => {
     const o = rest[0], k = rest[1];
+    const mocked = globalThis.__mbun_mock_lookup(s, dir);
+    if (mocked !== undefined) return mocked.exports;
     return globalThis.__mbun_require_native(s, dir, true,
       (o && typeof o.type === "string") ? o.type : "", k ? 1 : 0);
   };
@@ -443,8 +495,31 @@ globalThis.__mbun_disposeAsync = async function (env) {
   // in this file) does the slot become an accessor that fans later
   // `exports.x = v` writes out to every importer's binding, which is what lets
   // a cyclic import observe the finished value the way real ESM does.
+  //
+  // `mock.module()` needs the same fan-out for a module that has ALREADY
+  // settled: bun replaces such a module's exports and every binding an importer
+  // made earlier must observe the new value (test/js/bun/test/mock/6874 mocks a
+  // package a loaded module already destructured; 6879 mocks through a
+  // re-export chain). A settled exports object keeps no back-reference, so the
+  // subscriptions are recorded in a side table instead of by swapping the slot
+  // for an accessor — that costs one lookup per import binding at module-init
+  // time and NOTHING per property read, leaving the acyclic fast path a plain
+  // data property. Recording is gated on __mbun_link_track, which only the
+  // bun:test runner sets: outside `bun test` nothing can call mock.module()
+  // before the bindings are made, so the table would be pure overhead.
+  globalThis.__mbun_link_subs = new WeakMap();
+  globalThis.__mbun_link_record = function (ns, name, set) {
+    if (ns === null || (typeof ns !== "object" && typeof ns !== "function")) return;
+    const table = globalThis.__mbun_link_subs;
+    let byName = table.get(ns);
+    if (byName === undefined) { byName = new Map(); table.set(ns, byName); }
+    let subs = byName.get(name);
+    if (subs === undefined) { subs = []; byName.set(name, subs); }
+    subs.push(set);
+  };
   globalThis.__mbun_link = function (ns, name, set) {
     if (ns == null) { set(undefined); return; }
+    if (globalThis.__mbun_link_track) globalThis.__mbun_link_record(ns, name, set);
     if (!ns.__mbun_pending) { set(ns[name]); return; }
     const d = Object.getOwnPropertyDescriptor(ns, name);
     // Already linked by another importer of the same name: just join the fan-out.

@@ -399,7 +399,21 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
         let size = 0;
         let ioerr;
         let isFifo = false;
-        if (!isFd) {
+        // A fd-backed BunFile derives its byte length from fstat(2) — bun's
+        // ReadFile.resolveSizeAndLastModified does exactly that before reading.
+        // It is deliberately kept OUT of `size`/`__size`: bun reports 0 for a
+        // never-read Bun.file(fd) and structuredClone round-trips that value
+        // (js/web/workers/structured-clone.test.ts "file from fd" asserts
+        // cloned.size === blob.size, and the clone codec re-materialises the fd
+        // as a path). This length only sizes the reads below; -1 means "not a
+        // regular file" (pipe/socket/bad fd), which stays on the stream path.
+        let fdSize = -1;
+        if (isFd) {
+          try {
+            const st = fsm.fstatSync(fdArg);
+            if (st.isFile()) fdSize = Number(st.size) || 0;
+          } catch (e) {}
+        } else {
           try {
             const st = fsm.statSync(fsPath);
             if (st.isDirectory()) ioerr = "EISDIR";
@@ -415,9 +429,11 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
         slot("__size", size);
         slot("__name", p);
         slot("__lastModified", 0);
-        if (!ioerr && !isFd) {
+        if (!ioerr && (!isFd || fdSize >= 0)) {
           const protoU8 = Object.getOwnPropertyDescriptor(G.Blob.prototype, "_u8");
           let loaded = false;   // has the file's content been pulled into __parts?
+          // Byte length to read/clamp against: fstat's for an fd, stat's for a path.
+          const totalSize = isFd ? fdSize : size;
           // Shadows Blob.prototype's `_u8`: the bytes are pulled off disk the
           // first time anything actually needs them, then cached as the blob's
           // single part (so a second read is free and `_u8 = …` still works).
@@ -430,8 +446,11 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
                 // that limit in bun, and text()/bytes()/json() are already
                 // capped on `size` by Blob.prototype before they get here.
                 const FD = G.__mbunFdNative;
-                const fd = FD.open(fsPath, "r", 0o666);
-                let u = new Uint8Array(size > 0 ? size : 65536);
+                // Bun.file(fd) does NOT own the descriptor: read it where it
+                // stands (bun's ReadFile reuses the already-open fd) and leave
+                // closing to whoever opened it.
+                const fd = isFd ? fdArg : FD.open(fsPath, "r", 0o666);
+                let u = new Uint8Array(totalSize > 0 ? totalSize : 65536);
                 let off = 0;
                 try {
                   for (;;) {
@@ -440,7 +459,7 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
                     if (!(n > 0)) break;
                     off += n;
                   }
-                } finally { FD.close(fd); }
+                } finally { if (!isFd) FD.close(fd); }
                 if (off !== u.length) u = u.subarray(0, off);
                 slot("__parts", [u]);
                 slot("__size", off);
@@ -460,13 +479,13 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
               let n = Number(v);
               if (Number.isNaN(n)) n = 0;
               n = Math.trunc(n);
-              return n < 0 ? Math.max(size + n, 0) : Math.min(n, size);
+              return n < 0 ? Math.max(totalSize + n, 0) : Math.min(n, totalSize);
             };
             const s = norm(start, 0);
-            const e = Math.max(norm(end, size), s);
+            const e = Math.max(norm(end, totalSize), s);
             const out = new Uint8Array(e - s);
             if (out.length > 0) {
-              const fd = fsm.openSync(fsPath, "r");
+              const fd = isFd ? fdArg : fsm.openSync(fsPath, "r");
               try {
                 let got = 0;
                 while (got < out.length) {
@@ -474,7 +493,7 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
                   if (!(n > 0)) break;
                   got += n;
                 }
-              } finally { fsm.closeSync(fd); }
+              } finally { if (!isFd) fsm.closeSync(fd); }
             }
             const b = new G.Blob([], { type: sliceType || "" });
             Object.defineProperty(b, "__parts", { value: out.length ? [out] : [], writable: true, enumerable: false, configurable: true });

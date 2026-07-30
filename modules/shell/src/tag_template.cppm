@@ -55,11 +55,24 @@ struct TemplateArgument {
 
 namespace detail {
 
+// The lexer resolves the sentinel byte 0x08 followed by "__bun_"/"__bunstr_" as
+// an INTERNAL reference wherever it occurs — inside quotes too (parser.cppm
+// lex_loop; bun's parse.rs is the same). Interpolated user bytes must therefore
+// never be spliced in adjacent to that prefix: bun breaks the pattern with an
+// empty quoted segment right after the sentinel (escape_8bit writes `\x08""`,
+// mirrored by parser.cppm::escape_string). Do the same here in whichever quote
+// style is in force at this site, so the byte stays literal data — otherwise
+// `${"\x08__bun_abc"}` dies with "Invalid JS object ref (no idx)" and
+// `${"\x08__bun_0"}` would decode as a *real* ref. Genuine refs are written by
+// compile_template itself and never pass through these appenders.
 void append_unquoted(std::string& output, std::string_view word) {
     output.push_back('\'');
     for (const char byte : word) {
         if (byte == '\'') {
             output += "'\\''";
+        } else if (static_cast<unsigned char>(byte) == SPECIAL_JS_CHAR) {
+            output.push_back(byte);
+            output += "''";
         } else {
             output.push_back(byte);
         }
@@ -71,6 +84,9 @@ void append_single_quoted(std::string& output, std::string_view word) {
     for (const char byte : word) {
         if (byte == '\'') {
             output += "'\\''";
+        } else if (static_cast<unsigned char>(byte) == SPECIAL_JS_CHAR) {
+            output.push_back(byte);
+            output += "''";
         } else {
             output.push_back(byte);
         }
@@ -79,6 +95,11 @@ void append_single_quoted(std::string& output, std::string_view word) {
 
 void append_double_quoted(std::string& output, std::string_view word) {
     for (const char byte : word) {
+        if (static_cast<unsigned char>(byte) == SPECIAL_JS_CHAR) {
+            output.push_back(byte);
+            output += "\"\"";
+            continue;
+        }
         if (byte == '\\' || byte == '"' || byte == '$' || byte == '`') {
             output.push_back('\\');
         }

@@ -688,8 +688,40 @@
                 ? std::string{"\ninitializeDebugEnv(typeof process !== \"undefined\" && process.env"
                               " ? process.env.NODE_DEBUG : \"\");\n"}
                 : std::string{}};
+        // The fs classes a node-internal module exports must be MBUN'S classes,
+        // not the ones node's own file just defined.
+        //
+        // Resolving `internal/x` to node's real `lib/internal/x.js` is what makes
+        // those modules load at all, but it also means the module hands back a
+        // second, parallel definition of every class it declares. mbun's `fs`
+        // never uses those definitions, so an identity check across the two
+        // sides cannot hold: `fs.watchFile(f, {bigint:true})` yields an mbun
+        // BigIntStats while the test's expectation is
+        // `new (require('internal/fs/utils').BigIntStats)(...)`, and
+        // assert.deepStrictEqual compares prototypes — so two objects that print
+        // identically, field for field, still fail. The same split makes
+        // `require('internal/fs/promises').FileHandle` a class mbun never
+        // instantiates, so a test that redefines its prototype patches nothing.
+        //
+        // Re-pointing just the class exports keeps every function node's file
+        // defines (stringToFlags, the validators, the option parsers) while
+        // making the classes the single ones the runtime actually uses. The
+        // constructor signatures are already positional-compatible: mbun's
+        // Stats/BigIntStats take node's exact
+        // (dev, mode, nlink, uid, gid, rdev, blksize, ino, size, blocks, …times)
+        // argument list.
+        const std::string fsIdentitySuffix{
+            spec == "internal/fs/utils"
+                ? std::string{"\nif (typeof module === \"object\" && module.exports && globalThis.__mbunFsInternals) {"
+                              " module.exports.Stats = globalThis.__mbunFsInternals.Stats;"
+                              " module.exports.BigIntStats = globalThis.__mbunFsInternals.BigIntStats; }\n"}
+            : spec == "internal/fs/promises"
+                ? std::string{"\nif (typeof module === \"object\" && module.exports && globalThis.__mbunFsInternals) {"
+                              " module.exports.FileHandle = globalThis.__mbunFsInternals.FileHandle; }\n"}
+                : std::string{}};
         std::string wrapper{std::string{tla ? "(async function (" : "(function ("} + params +
-                            ") {\n" + strictPrefix + metaPrefix + source + debugEnvSuffix + "\n})"};
+                            ") {\n" + strictPrefix + metaPrefix + source + debugEnvSuffix +
+                            fsIdentitySuffix + "\n})"};
         // User CommonJS modules run through the mutable Module.wrapper hook.
         // Keep the extended native wrapper for Node internals (which receive
         // primordials/internalBinding parameters), but honour changed user

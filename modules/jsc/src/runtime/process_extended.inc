@@ -967,6 +967,8 @@ JSValueRef require_native_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::si
                              const JSValueRef args[], JSValueRef* exc);
 JSValueRef evict_module_cache_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                                  const JSValueRef args[], JSValueRef* exc);
+JSValueRef module_cache_get_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                               const JSValueRef args[], JSValueRef* exc);
 JSValueRef resolve_native_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                              const JSValueRef args[], JSValueRef* exc);
 JSValueRef transpile_native_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,

@@ -31,6 +31,7 @@ phantom ones. So this refuses to plan lanes it cannot afford, and says why.
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import shutil
 import subprocess
@@ -170,7 +171,13 @@ def is_struck(area: str, excluded: dict[str, dict[str, str]]) -> dict[str, str] 
 # shape plus a documented DELIBERATE divergence -- and matching it made the planner
 # assert "already a 1:1 port" about a file that says the opposite. A lane caught
 # that. Require phrasing that actually asserts a translation.
-PORT_MARKERS = ("1:1 translation", "Mechanical 1:1", "机械翻译",
+# `PORT-SOURCE:` is THIS REPO'S actual convention and was missing here, so 13
+# files that declare their upstream source read as "unmarked" and one of them
+# (node_fs_streams.cppm, a port of the whole of node's internal/fs/streams.js)
+# was briefed to a lane as a direct-port candidate. The lane caught it and
+# correctly refused to re-port an already-ported module. Check the convention the
+# repo uses before trusting a marker scan.
+PORT_MARKERS = ("PORT-SOURCE:", "1:1 translation", "Mechanical 1:1", "机械翻译",
                 "mechanical translation", "1:1 port")
 
 
@@ -266,10 +273,22 @@ def throughput(ledger: list[dict[str, str]],
 
 
 def resource_budget() -> tuple[int, list[str]]:
-    """How many lanes the box can afford, and the reasons for the cap."""
+    """How many lanes the box can afford, and the reasons for the cap.
+
+    MBUN_PLANNER_FAKE_FREE_GB overrides the disk reading. It exists because the
+    self-test was not isolated from live disk state: when the box dropped to 8 GB
+    free, the guard correctly refused to plan and the suite failed with
+    "the rich actionable node area must be planned" -- a real guard doing its job,
+    reported as a tool bug. A test must not depend on how full the disk happens
+    to be.
+    """
     notes: list[str] = []
-    usage = shutil.disk_usage(str(HERE))
-    free_disk_gb = usage.free // (1024 ** 3)
+    fake = os.environ.get("MBUN_PLANNER_FAKE_FREE_GB")
+    if fake:
+        free_disk_gb = int(fake)
+    else:
+        usage = shutil.disk_usage(str(HERE))
+        free_disk_gb = usage.free // (1024 ** 3)
     disk_lanes = max(0, (free_disk_gb - DISK_GB_RESERVE) // DISK_GB_PER_LANE)
     notes.append(f"disk: {free_disk_gb}G free, {DISK_GB_RESERVE}G reserved, "
                  f"{DISK_GB_PER_LANE}G/lane -> {disk_lanes} lanes")

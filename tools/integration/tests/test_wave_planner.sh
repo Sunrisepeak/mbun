@@ -48,6 +48,10 @@ printf 'wave\tlane\tcorpus\tarea\tgoal\tdelivered\tminutes\tregressions\tnote\n'
   printf '1\tC\tbun\tjs/beta\t6\t2\t60\t0\t-\n'     # 2 files/hour
 } >>"$tmp/ledger.tsv"
 
+# Pin the disk reading: the guard is real and correctly refuses to plan when the
+# box is nearly full, which made this suite fail whenever the machine happened to
+# be low. A test must not depend on live disk state.
+export MBUN_PLANNER_FAKE_FREE_GB=200
 run() { python3 "$tool" --ledger "$tmp/ledger.tsv" --struck "$tmp/struck.tsv" "$@"; }
 out() { run "$@" 2>&1 || true; }
 
