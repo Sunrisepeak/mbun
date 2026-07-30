@@ -602,6 +602,18 @@ private:
         case Token::Break:
         case Token::Continue:
             return parse_break_continue_();
+        case Token::Debugger: {
+            // `debugger;` was lexed but had no statement rule at all, so ANY
+            // file containing one died with "Unexpected debugger" before a line
+            // of it ran — a parse hole, not a missing feature. The statement is
+            // specified as a no-op when no debugger is attached (ECMA-262
+            // §14.16 evaluates to empty), and mbun attaches none, so an
+            // EmptyStmt is the semantically exact lowering rather than a stub.
+            const std::uint32_t start = cur_().start;
+            advance_();
+            consume_semicolon_();
+            return arena_.make(NodeKind::EmptyStmt, start, cur_().start);
+        }
         case Token::With:
             return parse_with_();
         case Token::Import:

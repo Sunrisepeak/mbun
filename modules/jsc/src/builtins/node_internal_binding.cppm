@@ -386,12 +386,19 @@ inline constexpr std::string_view kNodeInternalBindingJS = R"JS(
   // ------------------------------------------------------------- symbols ----
   // node src/node_symbols.cc — per-isolate well-known private symbols. Same
   // reasoning as util.privateSymbols: minted on demand, stable per process.
+  // The description is the NAME, with no prefix: node's V(messaging_transfer_
+  // symbol, "messaging_transfer_symbol") pairs the two, and the corpus finds
+  // kTransfer on a prototype by matching `symbol.description ===
+  // 'messaging_transfer_symbol'` — a "node:" prefix made that search fail.
+  // Backed by the process-wide registry so a symbol handed out here is the SAME
+  // symbol worker_threads and the fs FileHandle use; two independent mints
+  // would be an identity check nothing could ever satisfy.
   factories["symbols"] = () => {
-    const cached = { __proto__: null };
+    const cached = G.__mbunNodeSymbols || (G.__mbunNodeSymbols = { __proto__: null });
     return new Proxy({ __proto__: null }, {
       get(_t, key) {
         if (typeof key !== "string") return undefined;
-        return cached[key] || (cached[key] = Symbol("node:" + key));
+        return cached[key] || (cached[key] = Symbol(key));
       },
       has() { return true; },
     });
@@ -1797,6 +1804,12 @@ inline constexpr std::string_view kNodeInternalBindingJS = R"JS(
     return strictNs("js_stream", {
       JSStream: class JSStream {
         constructor() {
+          // A JSStream stands in for a node native handle, and node's
+          // structured clone refuses those ("Cannot clone object of unsupported
+          // type." — test-worker-message-port-transfer-native). Without the
+          // mark it cloned into a husk of its five public callback slots and
+          // the postMessage succeeded.
+          if (typeof G.__mbunMarkNativeHostObject === "function") G.__mbunMarkNativeHostObject(this);
           this.onread = undefined;
           this.onreadstart = undefined;
           this.onreadstop = undefined;
