@@ -1382,6 +1382,15 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
         });
       });
       installCwdBroadcast();
+      // `new Worker(url, { ref: false })` — bun's web Worker option for "do not
+      // keep the parent alive". mbun already had the machinery: unref() drops
+      // both the keep-alive flag and the child channel's ref, and calling it
+      // right after construction worked. The CONSTRUCTOR option was simply never
+      // read, so the parent hung on a worker it was told not to wait for. (This
+      // is the same shape as bun's own regression: `user_keep_alive` was set
+      // from the option and never consulted.) node's worker_threads.Worker has
+      // no `ref` option, so nothing in that corpus reaches this line.
+      if (options.ref === false) { try { this.unref(); } catch (e) {} }
       const emitWorker = () => { if (proc && typeof proc.emit === "function") proc.emit("worker", self); };
       if (proc.nextTick) proc.nextTick(emitWorker); else G.queueMicrotask(emitWorker);
       // node internal/worker.js: the constructor's last act is to announce the
