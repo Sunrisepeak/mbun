@@ -64,10 +64,38 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
 
     const idOf = (t) => { try { const n = +t; return Number.isSafeInteger(n) ? n : null; } catch (_) { return null; } };
 
+    // node lib/internal/timers.js Timeout: `_idleTimeout` is the *enrolled*
+    // duration (node coerces an absent / out-of-range delay to 1, the same
+    // coercion _checkCountdown warns about) and `_idleStart` the libuv
+    // timestamp the timer was last armed at. Both are read straight off a
+    // handle that internals keep under the private `kTimeout` symbol —
+    // `socket[kTimeout]._idleTimeout` in test-http-client-timeout-on-connect
+    // and test-tls-wrap-timeout, `session[kTimeout]._idleTimeout` in
+    // test-http2-compat-socket — and unenroll (clearTimeout, or the timer
+    // firing) resets `_idleTimeout` to -1, which test-tls-wrap-timeout asserts
+    // from its 'exit' handler.
+    //
+    // Non-enumerable, unlike node's own data properties: mbun's util.inspect
+    // prints every enumerable key of a Timeout and several corpus files pin
+    // that exact output, so making these visible would trade the four files
+    // above for whatever asserts on an inspected timer.
+    const TIMEOUT_MAX = 2147483647;
+    const idleDuration = (ms) => (typeof ms === "number" && ms >= 1 && ms <= TIMEOUT_MAX ? ms : 1);
+    // node's _idleStart is `libuv now` (ms since loop start), which is
+    // monotonic and non-decreasing; process.uptime() is the same clock here.
+    const idleNow = () => { try { return Math.trunc(G.process.uptime() * 1000); } catch (_) { return Date.now(); } };
+    const setIdle = (t, ms) => {
+      try {
+        Object.defineProperty(t, "_idleTimeout", { value: idleDuration(ms), writable: true, enumerable: false, configurable: true });
+        Object.defineProperty(t, "_idleStart", { value: idleNow(), writable: true, enumerable: false, configurable: true });
+      } catch (_) {}
+    };
+
     function initTimer(t, kind, state) {
       if (t === null || typeof t !== "object") return t;
       t[KIND] = kind;
       t[STATE] = state;
+      if (kind !== "immediate") setIdle(t, state.ms);
       try {
         Object.defineProperty(t, "constructor", {
           value: kind === "immediate" ? Immediate : Timeout,
@@ -102,6 +130,10 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
           state.gen++;
           try { oClearTimeout(state.native); } catch (_) {}
           state.native = oSetTimeout(state.run, state.ms, ...state.args);
+          // node Timeout.refresh() re-enrols the handle: _idleStart advances
+          // (test-tls-wrap-timeout asserts the later start is strictly greater)
+          // and a previously unenrolled timer gets its duration back.
+          setIdle(t, state.ms);
           t._destroyed = false;
           const id = idOf(t);
           if (id !== null) registry.set(id, t);
@@ -130,6 +162,8 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
         state.timerHooks.destroy(state.asyncHook);
       }
       t._destroyed = true;
+      // node unenroll(): a cleared or fired Timeout reports _idleTimeout = -1.
+      if (t[KIND] !== "immediate") { try { t._idleTimeout = -1; } catch (_) {} }
       const id = idOf(t);
       if (id !== null) registry.delete(id);
       activeTimeouts.delete(t);
