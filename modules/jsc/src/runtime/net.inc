@@ -20,6 +20,63 @@ void net_set_nonblock(int fd) {
     fcntl(fd, F_SETFL, fl | O_NONBLOCK);
 }
 
+// ── AF_UNIX addressing, including paths longer than sun_path ────────────────
+// sockaddr_un.sun_path is a fixed 108 bytes, which an ordinary socket path can
+// exceed: a deep TMPDIR plus a per-test fixture directory gets there without
+// anyone intending it. Refusing outright is wrong, because the socket is still
+// reachable — bun addresses it RELATIVE to an open directory fd instead, via
+// "/proc/self/fd/<dirfd>/<basename>", which is ~18 bytes of prefix no matter how
+// long the real directory is. The dirfd must stay open until after
+// bind()/connect() resolves that path, so ownership is handed to the caller.
+//
+// The fallback is not always available (a >107-byte BASENAME cannot be shortened
+// by any amount of directory indirection — node's test-net-pipe-with-long-path
+// uses a 10000-char one), so `error` still reports EINVAL for those. The code
+// string matters: js_net.cppm's codeOf() scrapes it out of the message.
+struct NetUnixAddr {
+    sockaddr_un addr{};
+    socklen_t len{0};
+    int dirFd{-1};  // caller closes after bind()/connect(); -1 = none needed
+    bool ok{false};
+    std::string error{};
+};
+
+NetUnixAddr net_unix_addr(const std::string& path) {
+    NetUnixAddr out{};
+    out.addr.sun_family = AF_UNIX;
+    constexpr auto cap{sizeof out.addr.sun_path};
+    const auto commit{[&out](const std::string& p) {
+        std::memcpy(out.addr.sun_path, p.data(), p.size());
+        out.len = static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + p.size() + 1);
+        out.ok = true;
+    }};
+    // Abstract-namespace sockets ("\0name") are length-limited too but carry no
+    // filesystem path to reopen, so they take the direct route or fail.
+    if (path.size() < cap) {
+        commit(path);
+        return out;
+    }
+#if defined(__linux__)
+    const auto slash{path.rfind('/')};
+    if (slash != std::string::npos && slash + 1 < path.size() && path.front() != '\0') {
+        const std::string dir{path.substr(0, slash)};
+        const std::string base{path.substr(slash + 1)};
+        const int dirFd{::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC)};
+        if (dirFd >= 0) {
+            const std::string viaProc{"/proc/self/fd/" + std::to_string(dirFd) + "/" + base};
+            if (viaProc.size() < cap) {
+                out.dirFd = dirFd;
+                commit(viaProc);
+                return out;
+            }
+            ::close(dirFd);
+        }
+    }
+#endif
+    out.error = "EINVAL: socket path too long (max " + std::to_string(cap - 1) + " bytes)";
+    return out;
+}
+
 // Per-fd TLS channel (T-TLS.3): memory-BIO engine from mbun.tls over the
 // vendored mbun.openssl ecosystem package (no host libssl). Once a fd is
 // wrapped, ALL its socket IO goes through the tls* callbacks below — the JS
@@ -171,25 +228,26 @@ JSValueRef netn_listen_unix_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::
     if (permission_deny_scope(ctx, exc, mbun::permission::Scope::Net, path))
         return JSValueMakeUndefined(ctx);
     if (path.empty()) return fs_throw(ctx, exc, "net.listenUnix: empty socket path");
-    sockaddr_un addr{};
-    addr.sun_family = AF_UNIX;
-    // sun_path is a fixed 108-byte field. Refuse rather than truncate: a silently
-    // shortened path would bind a socket the caller never asked for.
-    if (path.size() >= sizeof addr.sun_path) {
-        return fs_throw(ctx, exc, "net.listenUnix: socket path too long (max " +
-                                      std::to_string(sizeof addr.sun_path - 1) + " bytes)");
-    }
-    std::memcpy(addr.sun_path, path.data(), path.size());
+    // Never truncates: an over-long path is either re-addressed through a
+    // directory fd or refused outright (see net_unix_addr).
+    NetUnixAddr ua{net_unix_addr(path)};
+    if (!ua.ok) return fs_throw(ctx, exc, "net.listenUnix: " + ua.error);
     // bind() does NOT pre-unlink: Node/libuv (and bun) leave an existing socket
     // file alone so a stale/live path surfaces EADDRINUSE rather than silently
     // stealing it. close()/stop() unlinks the file it created (JS layer).
     const int fd{socket(AF_UNIX, SOCK_STREAM, 0)};
-    if (fd < 0) return fs_throw(ctx, exc, "net.listenUnix: socket() failed");
-    const auto alen{static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + path.size() + 1)};
-    if (bind(fd, reinterpret_cast<sockaddr*>(&addr), alen) != 0 || ::listen(fd, 128) != 0) {
+    if (fd < 0) {
+        if (ua.dirFd >= 0) close(ua.dirFd);
+        return fs_throw(ctx, exc, "net.listenUnix: socket() failed");
+    }
+    const bool bound{bind(fd, reinterpret_cast<sockaddr*>(&ua.addr), ua.len) == 0
+                     && ::listen(fd, 128) == 0};
+    const int bindErrno{errno};
+    if (ua.dirFd >= 0) close(ua.dirFd);  // path already resolved by bind()
+    if (!bound) {
         close(fd);
         return fs_throw(ctx, exc, std::string{"net.listenUnix: bind/listen failed ("} +
-                                      std::strerror(errno) + ")");
+                                      std::strerror(bindErrno) + ")");
     }
     net_set_nonblock(fd);
     net_fds().insert(fd);
@@ -346,19 +404,19 @@ JSValueRef netn_connect_unix_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std:
     if (permission_deny_scope(ctx, exc, mbun::permission::Scope::Net, path))
         return JSValueMakeUndefined(ctx);
     if (path.empty()) return fs_throw(ctx, exc, "net.connectUnix: empty socket path");
-    sockaddr_un addr{};
-    addr.sun_family = AF_UNIX;
-    if (path.size() >= sizeof addr.sun_path) {
-        return fs_throw(ctx, exc, "net.connectUnix: socket path too long (max " +
-                                      std::to_string(sizeof addr.sun_path - 1) + " bytes)");
-    }
-    std::memcpy(addr.sun_path, path.data(), path.size());
+    // Same directory-fd re-addressing as netn_listen_unix_cb: a long path that a
+    // server successfully bound must also be connectable.
+    NetUnixAddr ua{net_unix_addr(path)};
+    if (!ua.ok) return fs_throw(ctx, exc, "net.connectUnix: " + ua.error);
     const int fd{socket(AF_UNIX, SOCK_STREAM, 0)};
-    if (fd < 0) return fs_throw(ctx, exc, "net.connectUnix: socket() failed");
-    const auto alen{static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + path.size() + 1)};
+    if (fd < 0) {
+        if (ua.dirFd >= 0) close(ua.dirFd);
+        return fs_throw(ctx, exc, "net.connectUnix: socket() failed");
+    }
     int rc;
-    do { rc = connect(fd, reinterpret_cast<sockaddr*>(&addr), alen); }
+    do { rc = connect(fd, reinterpret_cast<sockaddr*>(&ua.addr), ua.len); }
     while (rc != 0 && errno == EINTR);
+    if (ua.dirFd >= 0) { const int keep{errno}; close(ua.dirFd); errno = keep; }
     if (rc != 0) {
         // The errno NAME, not a hard-coded ENOENT: connecting to a path that
         // exists but is not a socket is ECONNREFUSED (or ENOTSOCK), and one

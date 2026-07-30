@@ -47,6 +47,20 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
   function writeHttpResponse(sock, res, reqMethod, keepAlive, onFinished) {
     if (!res || typeof res !== "object") res = new G.Response("", { status: 500 });
     const status = res.status || 200;
+    // RFC 9112 §9.6: a server that sends "Connection: close" MUST close the
+    // connection after that response. `Connection` is hop-by-hop, so the header
+    // echo below DROPS the handler's copy and regenerates the token from
+    // `keepAlive` — which is derived from the REQUEST alone. That means the
+    // handler's INTENT has to be captured here, before any of the three body
+    // paths (direct stream / chunked stream / buffered) commits a frame, or the
+    // response advertises keep-alive and the socket goes back in the pool.
+    // 1#connection-option: "close" as one token of a list still closes.
+    if (keepAlive && res.headers && typeof res.headers.get === "function") {
+      let rawConn = null;
+      try { rawConn = res.headers.get("connection"); } catch (e) {}
+      if (rawConn != null && String(rawConn).toLowerCase().split(",").some((t) => t.trim() === "close"))
+        keepAlive = false;
+    }
     const S = G.__mbunStreams;
     if (res._b == null && res._stream != null && S && typeof S.directStreamSource === "function") {
       const source = S.directStreamSource(res._stream);
@@ -383,12 +397,27 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
           const _h = _cd.value.toSetCookieHeaders();
           if (_h && _h.length) _ck = _h;
         }
+        // Snapshot every Sec-WebSocket-* value BEFORE touching opts: reading
+        // opts.data / opts.headers runs arbitrary user getters, and a getter that
+        // mutates req.headers would otherwise change the protocol/extensions this
+        // handshake echoes (bun reads them off the raw request for the same
+        // reason). `key` is already captured above.
+        const _proto = req.headers.get("sec-websocket-protocol") || "";
+        const _ext = req.headers.get("sec-websocket-extensions") || "";
+        const _optHeaders = opts && opts.headers;
+        const _optData = opts ? opts.data : undefined;
+        // Those getters may have re-entered server.upgrade(req) and consumed the
+        // request. The __mbunUpgraded check at the top of this function ran before
+        // they did, so it cannot have seen it: re-check now, or this call performs
+        // a SECOND upgrade on a connection already converted to a WebSocket
+        // (two 'open' events, and the first ServerWebSocket leaked from sock._ws).
+        if (req.__mbunUpgraded || !conns.has(id)) return false;
         const ws = WS.serverUpgrade({
-          key, protocol: req.headers.get("sec-websocket-protocol") || "",
-          headers: opts && opts.headers, setCookies: _ck,
-          extensions: req.headers.get("sec-websocket-extensions") || "",
+          key, protocol: _proto,
+          headers: _optHeaders, setCookies: _ck,
+          extensions: _ext,
           perMessageDeflate: !!handlerRef.ws.perMessageDeflate,
-          data: opts ? opts.data : undefined,
+          data: _optData,
           // ServerWebSocket.remoteAddress is the upgraded socket's peer — the
           // same endpoint requestIP() reports for the upgrade request, since
           // the 101 reuses that connection. ref: bun
@@ -772,10 +801,17 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
           if (!key || String(req.headers.get("upgrade") || "").toLowerCase() !== "websocket") return false;
           if (!handlerRef.ws || typeof handlerRef.ws !== "object")
             throw new Error('Bun.serve(): To enable websocket support, set the "websocket" object in Bun.serve({})');
+          // Same snapshot-then-recheck as the native path above: the opts getters
+          // are user JS that can mutate req.headers or re-enter upgrade(req).
+          const _proto = req.headers.get("sec-websocket-protocol") || "";
+          const _ext = req.headers.get("sec-websocket-extensions") || "";
+          const _optHeaders = o && o.headers;
+          const _optData = o ? o.data : undefined;
+          if (req.__mbunUpgraded || sock.destroyed) return false;
           const ws = WS.serverUpgrade({
-            key, protocol: req.headers.get("sec-websocket-protocol") || "",
-            headers: o && o.headers, data: o ? o.data : undefined,
-            extensions: req.headers.get("sec-websocket-extensions") || "",
+            key, protocol: _proto,
+            headers: _optHeaders, data: _optData,
+            extensions: _ext,
             perMessageDeflate: !!handlerRef.ws.perMessageDeflate,
             server: serverObj, handlers: handlerRef.ws,
             write: (bytes) => { try { sock.write(u8(bytes)); } catch (e) {} },

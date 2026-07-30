@@ -854,7 +854,9 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
         }
       }
       let fd;
-      try { if (unixPath && pipePathTooLong(unixPath)) throw new Error("EINVAL"); fd = unixPath ? NN.connectUnix(unixPath) : NN.connect(dialHost, port, _localAddr, _localPort); }
+      // Same as the listen path: the native connect re-addresses an over-long
+      // path through a directory fd, so no JS-side length gate here either.
+      try { fd = unixPath ? NN.connectUnix(unixPath) : NN.connect(dialHost, port, _localAddr, _localPort); }
       catch (e) { this.connecting = false; const err = connectError(e, unixPath || host, unixPath ? undefined : port); G.queueMicrotask(() => { if (this.destroyed) return; this.emit("error", err); this.destroy(); }); return this; }
       this._adopt(fd);
       if (!unixPath) { this.remoteAddress = host; this.remoteFamily = isIPv6(host) ? "IPv6" : "IPv4"; }
@@ -1976,7 +1978,11 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
         this._unixPath = unixPath;
         if (cb) this.once("listening", cb);
         let ulh;
-        try { if (pipePathTooLong(unixPath)) throw new Error("EINVAL"); ulh = NN.listenUnix(unixPath); }
+        // No JS-side length gate: a path over sun_path's 108 bytes is not
+        // automatically unusable — the native bind re-addresses it through a
+        // directory fd (net_unix_addr) and only reports EINVAL when even that
+        // cannot fit, which codeOf() then reads back out of the message.
+        try { ulh = NN.listenUnix(unixPath); }
         // node's pipe_wrap Bind raises ERR_ACCESS_DENIED synchronously, so
         // `assert.throws(() => server.listen(path))` sees it — an async 'error'
         // event would not be catchable there.
