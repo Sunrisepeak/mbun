@@ -166,7 +166,18 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       err.permission = nativeError.permission; err.resource = nativeError.resource;
       return err;
     }
-    const code = codeOf(nativeError);
+    let code = codeOf(nativeError);
+    // The reactor's connect(2) is IPv4-only and rejects an IPv6 literal before
+    // it ever reaches the network ("net.connect: invalid address '::1'"), so
+    // there is no errno to map and codeOf fell back to a bare ECONNRESET. node
+    // dials the address for real, and what the corpus observes for an IPv6 peer
+    // with nothing listening on it is a refused connection —
+    // test-net-autoselectfamily-default asserts `connect ECONNREFUSED ::1:<port>`
+    // verbatim, message included.
+    if (code === "ECONNRESET" && host !== undefined && isIPv6(String(host)) &&
+        String((nativeError && nativeError.message) || "").indexOf("invalid address") !== -1) {
+      code = "ECONNREFUSED";
+    }
     // node formats a pipe/unix connect as `connect <code> <path>` — no port.
     const error = mkErr("connect " + code + " " + host + (port === undefined ? "" : ":" + port), code);
     error.syscall = "connect"; error.address = host; if (port !== undefined) error.port = port;
@@ -297,6 +308,39 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
         sock.remoteFamily = "IPv4";
       }
     } catch (e) {}
+  };
+  // node Socket.prototype._getpeername: an outbound socket's peer information
+  // comes from the handle's getpeername(2) once the connection is up, never
+  // from the address the caller dialled. Two things follow, and the corpus
+  // checks both (test-net-remote-address, test-net-remote-address-port):
+  // a hostname such as "localhost" is reported as the resolved numeric peer,
+  // and nothing at all is visible while `connecting` is still true — node
+  // returns `this._peername || {}` on that branch, so the properties read
+  // undefined until the public 'connect' event publishes them.
+  // `bridged` says the reactor dialled a DIFFERENT address than the caller asked
+  // for: its connect(2) is IPv4-only, so an IPv6 loopback is routed over the v4
+  // loopback instead. getpeername then reports 127.0.0.1, which is a detail of
+  // that bridge and not the peer the caller connected to — node, dialling ::1
+  // for real, reports ::1 (test-https-connect-address-family asserts it). So on
+  // a bridged connection the requested address stays authoritative and only the
+  // port is taken from the socket.
+  const adoptClientPeer = (sock, fd, dialedAddr, dialedFamily, port, unixPath, bridged) => {
+    if (unixPath) { sock.remotePort = port; return; }
+    if (bridged) {
+      sock.remoteAddress = dialedAddr; sock.remoteFamily = dialedFamily; sock.remotePort = port;
+      return;
+    }
+    let addr = null, prt = null;
+    try {
+      const pn = NN.peername ? NN.peername(fd) : null;
+      if (typeof pn === "string") {
+        const i = pn.lastIndexOf(":");
+        if (i > 0) { addr = pn.slice(0, i); prt = +pn.slice(i + 1); }
+      }
+    } catch (e) {}
+    sock.remoteAddress = addr === null ? dialedAddr : addr;
+    sock.remoteFamily = addr === null ? dialedFamily : (isIPv6(addr) ? "IPv6" : "IPv4");
+    sock.remotePort = prt === null ? port : prt;
   };
   // node net.js Happy-Eyeballs default (getDefault/setDefaultAutoSelectFamily*).
   // mbun's connect is single-stack so the value is advisory, but the getter/
@@ -469,6 +513,10 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       opts = opts || {};
       this._fd = -1; this._wq = []; this._wqLen = 0; this._needDrain = false;
       this._shutW = false; this._shutSent = false; this._eof = false; this._closeEmitted = false;
+      // A reused Socket (net.Socket#connect on an already-closed socket) starts a
+      // fresh writable side, so its 'finish' is owed again — test-net-bytes-stats
+      // reconnects and sums bytesWritten across BOTH connections.
+      this._finishEmitted = false;
       this._paused = false; this._enc = null; this._everRead = false;
       // internal/timers consumers observe an unarmed socket through kTimeout
       // before the transport emits 'connect'. Keep that slot present (null)
@@ -536,6 +584,17 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       // Loop-reference state (see NET.hold): sticky intent + current hold.
       this._refd = true; this._held = false; this._loopOpen = false;
       this.allowHalfOpen = !!opts.allowHalfOpen;
+      // node net.js Socket ctor line 484 registers `this.on('end',
+      // onReadableStreamEnd)` UNCONDITIONALLY — the allowHalfOpen test lives
+      // inside the handler, not around the registration — so a freshly built
+      // Socket always reports exactly one 'end' listener. That count is the
+      // observable contract test-net-socket-no-halfopen-enforcer checks (it is
+      // asserting net.Socket does NOT inherit stream.Duplex's enforcer).
+      // node's handler body swaps `this.write` for writeAfterFIN so a write
+      // past EOF raises ERR_STREAM_WRITE_AFTER_END; mbun reaches the same state
+      // from the EOF branch in _poll, which clears `writable` and sets _shutW,
+      // so there is deliberately nothing left for the handler itself to do.
+      this.on("end", function onReadableStreamEnd() {});
       // A client has no peer until its public 'connect' event. Accepted and
       // adopted sockets fill these in from their handle instead.
       this.remoteAddress = undefined; this.remoteFamily = undefined; this.remotePort = undefined;
@@ -566,7 +625,20 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       // (test-cluster-fork-stdio). `readable`/`writable` default to true here
       // because this transport is duplex either way; node only uses them to
       // decide which halves to start.
-      if (typeof opts.fd === "number" && opts.fd >= 0) {
+      // node net.Socket ctor takes `options.handle` FIRST — `if (options.handle)
+      // { this._handle = options.handle; } else if (options.fd !== undefined)` —
+      // adopting a caller-supplied handle as-is, with no descriptor of its own.
+      // internal/js_stream_socket is built on exactly that shape
+      // (`super({ handle, manualStart: true })`), and the corpus drives socket
+      // options straight through a hand-built handle object whose methods it
+      // asserts on (test-net-socket-setnodelay). Deliberately NOT wrapped in a
+      // NetHandle: the teardown paths key off `instanceof NetHandle` so that a
+      // foreign handle is left for its owner to close, same as the tls shim.
+      if (opts.handle && typeof opts.handle === "object") {
+        this._handle = opts.handle;
+        this._hadHandle = true;
+        if (opts.handle.owner === undefined) { try { opts.handle.owner = this; } catch (e) {} }
+      } else if (typeof opts.fd === "number" && opts.fd >= 0) {
         this._adopt(opts.fd);
         if (opts.readable === false) this.readable = false;
         if (opts.writable === false) this.writable = false;
@@ -594,6 +666,16 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       else { this._handle = new NetHandle(this, fd); }
       this._hadHandle = true;
       this._shutW = false; this._shutSent = false; this._eof = false; this._closeEmitted = false;
+      // A reused Socket (net.Socket#connect on an already-closed socket) starts a
+      // fresh writable side, so its 'finish' is owed again — test-net-bytes-stats
+      // reconnects and sums bytesWritten across BOTH connections.
+      this._finishEmitted = false;
+      // node's bytesRead/bytesWritten read through to `this._handle.bytesRead` /
+      // `.bytesWritten`, which are per-HANDLE counters: a reconnect installs a
+      // new handle and therefore restarts from zero. Carrying the totals across
+      // made the second connection report the first one's bytes too
+      // (test-net-bytes-stats reconnects and sums per-connection).
+      this.bytesRead = 0; this.bytesWritten = 0;
       NET.items.add(this);
       // An open socket holds the event loop open (node: uv_tcp_t is ref'd until
       // it closes), unless the user unref'd it. Without this the pump could
@@ -615,7 +697,13 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       const nErr = (Ctor, code, msg) => { const e = new Ctor(msg); e.code = code; return e; };
       const symbol = normalizedArgsSymbol();
       if (a.length === 1 && Array.isArray(a[0]) && symbol !== null && a[0][symbol]) a = a[0];
-      const optArg = (typeof a[0] === "object" && a[0] !== null && !Array.isArray(a[0])) ? a[0] : null;
+      // node normalizeArgs treats ANY non-null object first argument as the
+      // options object — arrays included. An array that does NOT carry
+      // normalizedArgsSymbol (handled just above) gets no special case: it
+      // simply has neither .port nor .path, which is exactly why node answers a
+      // raw `connect([opts, cb])` with ERR_MISSING_ARGS rather than silently
+      // dialling nothing. Excluding arrays here made that branch unreachable.
+      const optArg = (typeof a[0] === "object" && a[0] !== null) ? a[0] : null;
       if (optArg) {
         if (optArg.objectMode)
           throw nErr(TypeError, "ERR_INVALID_ARG_VALUE", "The property 'options.objectMode' is not supported. Received " + (typeof optArg.objectMode === "string" ? "'" + optArg.objectMode + "'" : String(optArg.objectMode)));
@@ -774,7 +862,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
           let fd2;
           try { fd2 = NN.connect(dh, port, _localAddr, _localPort); }
           catch (e) { self.connecting = false; const err = connectError(e, addr, port); G.queueMicrotask(() => { if (self.destroyed) return; self.emit("error", err); self.destroy(); }); return self; }
-          self._adopt(fd2); self.remoteAddress = addr; self.remoteFamily = fam === 6 ? "IPv6" : "IPv4"; self.remotePort = port; _adoptLocal(self, fd2);
+          self._adopt(fd2); _adoptLocal(self, fd2);
           // _adopt owns the descriptor immediately, but public Socket#pending
           // remains true until the connect event is published.
           self.pending = true;
@@ -787,7 +875,11 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
               return;
             }
             if (self.destroyed) { self.connecting = false; return; }
-            self.pending = false; self.connecting = false; self._flushPreConnect(null); self._applyDeferredSockOpts();
+            self.pending = false; self.connecting = false;
+            adoptClientPeer(self, fd2, addr, fam === 6 ? "IPv6" : "IPv4", port, null, dh !== addr);
+            self._flushPreConnect(null); self._applyDeferredSockOpts();
+            // Bytes held back by the `connecting` guard in _flush go out now.
+            self._flush();
             _perfNetConnect(self, addr, port);
             self.emit("connect"); self.emit("ready");
           };
@@ -832,6 +924,22 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       // loopback/wildcard (as reported by an IPv6-defaulted server.address())
       // dials the v4 loopback, which the v4-mapped INADDR_ANY listener accepts.
       const dialHost = (host === "::1" || host === "::" || host === "::0") ? "127.0.0.1" : host;
+      // node's lookupAndConnect announces EVERY name resolution it performs on
+      // 'lookup', and "localhost" is a resolution like any other. It is the one
+      // non-literal host kept on the synchronous fast path above (net.inc
+      // resolves it inside connect(2) instead of going through dns.lookup), so
+      // the event was simply never published — test-net-dns-lookup subscribes to
+      // it and requires the resolved address. Reporting the loopback the reactor
+      // actually used is the same answer node's resolver gives. Deferred by a
+      // microtask because the caller attaches .on('lookup') only after connect()
+      // has returned; finishConnect is queued after this, so 'lookup' still
+      // precedes 'connect' exactly as it does in node.
+      if (!unixPath && host === "localhost") {
+        const lkSock = this;
+        G.queueMicrotask(() => {
+          if (!lkSock.destroyed) lkSock.emit("lookup", null, "127.0.0.1", 4, "localhost");
+        });
+      }
       // net.Socket permits callers to supply a libuv-style handle. Its connect
       // method reports an errno synchronously, while Socket surfaces the
       // corresponding error asynchronously. Keep that seam for custom Agents;
@@ -859,8 +967,6 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       try { fd = unixPath ? NN.connectUnix(unixPath) : NN.connect(dialHost, port, _localAddr, _localPort); }
       catch (e) { this.connecting = false; const err = connectError(e, unixPath || host, unixPath ? undefined : port); G.queueMicrotask(() => { if (this.destroyed) return; this.emit("error", err); this.destroy(); }); return this; }
       this._adopt(fd);
-      if (!unixPath) { this.remoteAddress = host; this.remoteFamily = isIPv6(host) ? "IPv6" : "IPv4"; }
-      this.remotePort = port;
       if (!unixPath) _adoptLocal(this, fd);
       // node reports `connecting === true` from the moment connect() returns
       // until the 'connect' event fires; _adopt cleared it because the reactor's
@@ -868,7 +974,12 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       // cancel the pending 'connect' rather than resurrect the socket.
       this.pending = true;
       this.connecting = true;
-      _perfNetMark(this);
+      // node only opens a 'net' performance entry for an IP connect: the
+      // startPerf call sits behind `(addressType === 6 || addressType === 4)`
+      // (net.js afterConnect path), and a pipe/unix connect has no addressType
+      // at all. test-net-perf_hooks connects over TCP *and* over a pipe and then
+      // asserts exactly one entry, so instrumenting the pipe double-counts.
+      if (!unixPath) _perfNetMark(this);
       const finishConnect = () => {
         if (this._httpClientConnectPending) {
           this._httpClientConnectPending = false;
@@ -876,8 +987,12 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
           return;
         }
         if (this.destroyed) { this.connecting = false; return; }
-        this.pending = false; this.connecting = false; this._flushPreConnect(null); this._applyDeferredSockOpts();
-        _perfNetConnect(this, unixPath || host, unixPath ? undefined : port);
+        this.pending = false; this.connecting = false;
+        adoptClientPeer(this, fd, host, isIPv6(host) ? "IPv6" : "IPv4", port, unixPath, dialHost !== host);
+        this._flushPreConnect(null); this._applyDeferredSockOpts();
+        // Bytes held back by the `connecting` guard in _flush go out now.
+        this._flush();
+        if (!unixPath) _perfNetConnect(this, host, port);
         this.emit("connect"); this.emit("ready");
       };
       G.queueMicrotask(finishConnect);
@@ -897,7 +1012,32 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
         if (err) this.emit("error", mkErr("setTypeOfService returned " + err, "ERR_SOCKET_SETTOS"));
       }
     }
-    setEncoding(enc) { this._enc = enc || "utf8"; return this; }
+    setEncoding(enc) { this._enc = enc || "utf8"; this._decoder = undefined; return this; }
+    // node Readable.setEncoding installs a StringDecoder instead of calling
+    // buf.toString(enc) on each chunk, and the difference is observable as soon
+    // as a multi-byte character straddles a read boundary: decoded halves each
+    // become U+FFFD, so the consumer counts MORE characters than were sent.
+    // test-net-large-string streams 40 KiB of 3-byte characters and asserts the
+    // received length exactly. The decoder holds the trailing partial sequence
+    // until its continuation bytes arrive, which also means write() legitimately
+    // returns "" — an empty 'data' is not something node ever emits, so callers
+    // must skip it (that is what _emitData below is for).
+    _decode(buf) {
+      if (this._decoder === undefined) {
+        const mod = M["string_decoder"] || M["node:string_decoder"];
+        const SD = mod && mod.StringDecoder;
+        this._decoder = SD ? new SD(this._enc) : null;
+      }
+      return this._decoder ? this._decoder.write(buf) : buf.toString(this._enc);
+    }
+    _emitData(chunk) {
+      if (this._enc && G.Buffer) {
+        const s = this._decode(chunk);
+        if (s !== "") this.emit("data", s);
+        return;
+      }
+      this.emit("data", chunk);
+    }
     // node net.Socket.setTimeout: an idle timer that emits 'timeout' after
     // `ms` with no read/write activity (0 clears it). Node does NOT destroy the
     // socket on timeout — the listener decides. Re-armed on every I/O below.
@@ -1199,7 +1339,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       if (!b.length) return true;
       this.bytesRead += b.length;
       if (this._onread) this._onreadPush(b);
-      else this.emit("data", this._enc && G.Buffer ? b.toString(this._enc) : b);
+      else this._emitData(b);
       return true;
     }
     // node's net.Socket is a Readable: bytes that arrive before anything reads
@@ -1252,7 +1392,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
         if (this._rqLen >= this._hwm && !this._paused) { this._paused = true; this._rqPaused = true; }
         return;
       }
-      this.emit("data", this._enc && G.Buffer ? chunk.toString(this._enc) : chunk);
+      this._emitData(chunk);
     }
     _flushRq() {
       const q = this._rq;
@@ -1264,7 +1404,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
         if (this.destroyed) return;
         if (this._onread) this._onreadPush(c);
         else if (this._dataSink) this._dataSink(c);
-        else this.emit("data", this._enc && G.Buffer ? c.toString(this._enc) : c);
+        else this._emitData(c);
       }
       // 'end' is owed after the parked bytes, never before them.
       if (this._rqEnd && !this.destroyed) {
@@ -1286,7 +1426,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
         if (this.destroyed) return;
           if (this._onread) this._onreadPush(c);
           else if (this._dataSink) this._dataSink(c);
-        else this.emit("data", this._enc && G.Buffer ? c.toString(this._enc) : c);
+        else this._emitData(c);
       }
     }
     address() { return { port: this.localPort, address: this.localAddress, family: "IPv4" }; }
@@ -1317,17 +1457,37 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       // destroyed the stream gets ERR_STREAM_DESTROYED, while a socket whose
       // peer already sent FIN reports EPIPE even if this side had called end().
       // Only an ordinary local end remains ERR_STREAM_WRITE_AFTER_END.
-      let terminalWriteError = null;
+      let terminalWriteError = null, terminalDestroys = false;
       if (this.destroyed) {
         terminalWriteError = mkErr("Cannot call write after a stream was destroyed", "ERR_STREAM_DESTROYED");
       } else if (this._shutW) {
-        terminalWriteError = this._eof
-          ? mkErr("This socket has been ended by the other party", "EPIPE")
-          : mkErr("write after end", "ERR_STREAM_WRITE_AFTER_END");
+        if (this._eof) {
+          terminalWriteError = mkErr("This socket has been ended by the other party", "EPIPE");
+          terminalDestroys = true;
+        } else terminalWriteError = mkErr("write after end", "ERR_STREAM_WRITE_AFTER_END");
       }
       if (terminalWriteError) {
-        if (typeof cb === "function") G.queueMicrotask(() => cb(terminalWriteError));
-        else this.emit("error", terminalWriteError);
+        // node settles all of these on process.nextTick, never a microtask.
+        if (typeof cb === "function") _deferPastTicks(() => cb(terminalWriteError));
+        else if (!terminalDestroys) this.emit("error", terminalWriteError);
+        // node writeAfterFIN follows the callback with destroy(er), and THAT is
+        // what publishes 'error' on the socket — a write past the peer's FIN
+        // tears the socket down, it does not merely report. Deferred for the
+        // same reason the callback is: test-net-write-after-end-nt asserts,
+        // synchronously after write() returns, that no error has been observed
+        // yet, so it has to arrive on a later tick.
+        if (terminalDestroys) {
+          _deferPastTicks(() => {
+            // The reactor tears a FIN'd, fully-flushed socket down on its own,
+            // so by this tick the socket is usually destroyed already. node's
+            // destroy(er) publishes the error regardless of whether the stream
+            // was still live, and the error is the whole point here — without it
+            // an 'error' handler that exists purely to close the server never
+            // runs and the process hangs.
+            if (!this.destroyed) this.destroy(terminalWriteError);
+            else this.emit("error", terminalWriteError);
+          });
+        }
         return false;
       }
       // node _writeGeneric: once the socket is past connecting, a missing handle
@@ -1382,8 +1542,20 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       if (typeof enc === "function") { cb = enc; enc = null; }
       if (data != null) this.write(data, enc);
       this._shutW = true; this.writable = false;
-      if (typeof cb === "function") this.once("close", cb);
+      // node Writable.end(cb) settles the callback on 'finish', NOT on 'close'.
+      // The difference is visible on a socket that is never connected and never
+      // destroyed: its write side still finishes, and
+      // test-net-end-without-connect asserts the callback runs (observing
+      // writable === false) for a socket that never produces a 'close' at all.
+      if (typeof cb === "function") this.once("finish", cb);
       this._flush();
+      // No descriptor was ever adopted, so _flush had nothing to drain and will
+      // never reach its 'finish' emission — but the write side is finished all
+      // the same. Publish it a tick later, as node's Writable does.
+      if (this._fd < 0 && !this._finishEmitted) {
+        this._finishEmitted = true;
+        _deferPastTicks(() => { if (!this._closeEmitted) this.emit("finish"); });
+      }
       return this;
     }
     // Completes the write callbacks that were queued while the socket was still
@@ -1425,6 +1597,11 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       NET.items.delete(this);
       this._loopOpen = false; NET.release(this);
       if (err) this.emit("error", err);
+      // end() was called but the queue never drained far enough for _flush to
+      // publish 'finish' (a destroy landed first). end(cb) settles on 'finish',
+      // so emitting it here is what keeps that callback from being dropped
+      // outright; node likewise never leaves an end() callback unsettled.
+      if (this._shutW && !this._finishEmitted) { this._finishEmitted = true; this.emit("finish"); }
       if (!this._closeEmitted) { this._closeEmitted = true; G.queueMicrotask(() => this.emit("close", !!err)); }
       return this;
     }
@@ -1453,8 +1630,49 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       if (G.process && typeof G.process.nextTick === "function") G.process.nextTick(fin);
       else G.queueMicrotask(fin);
     }
-    resetAndDestroy() { return this.destroy(); }
+    // node Socket.prototype.resetAndDestroy, all three of its branches — the
+    // corpus exercises each one separately. A socket with no handle at all is an
+    // ERR_SOCKET_CLOSED destroy (test-net-connect-reset); one still connecting
+    // defers the reset to its own 'connect' event rather than dropping it
+    // (test-net-connect-reset-until-connected); an established socket resets at
+    // once (test-net-server-reset).
+    resetAndDestroy() {
+      // The ERR_SOCKET_CLOSED destroy is deferred a tick because node's
+      // stream destroy(err) never emits 'error' in the caller's turn, and the
+      // usual shape is `socket.resetAndDestroy()` followed by the
+      // socket.on('error', ...) that is supposed to observe it — emitting
+      // inline makes it an uncaught exception instead. Nothing else needs
+      // tearing down on this branch: there is no descriptor to close.
+      if (this._fd < 0) {
+        const closedErr = mkErr("Socket is closed", "ERR_SOCKET_CLOSED");
+        _deferPastTicks(() => { if (!this.destroyed) this.destroy(closedErr); });
+        return this;
+      }
+      if (this.connecting) { this.once("connect", () => this._reset()); return this; }
+      return this._reset();
+    }
+    // node tcp_wrap handle.reset(): arm SO_LINGER{on, 0} so the close(2) that
+    // destroy() performs emits an RST, which is what makes the peer observe
+    // ECONNRESET instead of an orderly FIN. The write queue is dropped on
+    // purpose — a reset abandons unsent bytes, and flushing them first would
+    // turn the RST back into a graceful shutdown.
+    _reset() {
+      if (this._fd >= 0 && NN.setSockBuf) {
+        this._wq = []; this._wqLen = 0;
+        try { NN.setSockBuf(this._fd, 6, 1); } catch (e) {}
+      }
+      return this.destroy();
+    }
     _fail(e) { this.destroy(e instanceof Error && e.code ? e : mkErr(String((e && e.message) || e), codeOf(e))); }
+    // node stream_base_commons onStreamRead surfaces a failed read(2) as
+    // ErrnoException(err, 'read') — message `read <CODE>`, .syscall 'read' — not
+    // the native's own wording, which is what the reset tests assert verbatim.
+    _failRead(e) {
+      const code = codeOf(e);
+      const err = mkErr("read " + code, code);
+      err.syscall = "read";
+      this.destroy(err);
+    }
     // TLS mode (T-TLS.3): after _startTls, all IO rides the per-fd TLS channel
     // (_tls: 1 = handshaking, 2 = established). Reads/writes stay non-blocking.
     _startTls(o) {
@@ -1497,6 +1715,13 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
     }
     _flush() {
       if (this._fd < 0) return 0;
+      // Writes issued before the public 'connect' boundary stay in the writable
+      // buffer, exactly as node's do. The reactor adopts the descriptor inside
+      // connect() and could physically send them at once, but then
+      // socket.bufferSize would read 0 for bytes the caller has not seen
+      // acknowledged — test-net-buffersize writes N chunks while connecting and
+      // asserts bufferSize tracks each one. finishConnect() flushes.
+      if (this.connecting) return 0;
       if (this._tls === 1) return 0;  // handshake still in flight (see _poll)
       // A TLS upgrade is scheduled but _startTls has not run yet (js_tls_live
       // arms it on the transport's 'connect'). Anything queued in that window
@@ -1525,6 +1750,13 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       }
       if (!this._wq.length && this._shutW && !this._shutSent && this._fd >= 0) {
         this._shutSent = true;
+        // node Writable emits 'finish' once end() has been called and every
+        // queued byte has reached the transport. It is emitted here, before the
+        // teardown below, because handlers legitimately observe a socket that is
+        // finished but NOT yet destroyed — test-net-allow-half-open asserts
+        // exactly that, and test-net-bytes-stats / test-net-buffersize read
+        // bytesWritten / bufferSize from inside the handler.
+        if (!this._finishEmitted) { this._finishEmitted = true; this.emit("finish"); }
         if (this._tls) { try { NN.tlsClose(this._fd); } catch (e) {} }
         try { NN.shutdown(this._fd); } catch (e) {}
         // …unless bytes read off the wire are still owed to a consumer that has
@@ -1626,7 +1858,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
         for (let i = 0; i < 64; i++) {
           let r;
           try { r = this._tls ? NN.tlsRead(this._fd) : NN.read(this._fd); }
-          catch (e) { this._fail(e); return progress; }
+          catch (e) { this._failRead(e); return progress; }
           // tlsRead is what pumps TLS 1.3's post-handshake NewSessionTicket into
           // the engine, so the session it produces has to be picked up here —
           // the EOF branch below can destroy this socket before the next poll.
@@ -2137,6 +2369,14 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
     // (test-http2-pipe-named-pipe), because a `{ port: 0 }` object is a
     // perfectly valid TCP target. The record stays as `_addr` for internal use.
     address() {
+      // node Server.prototype.address reads the LIVE handle
+      // (`this._handle.getsockname(out)`) and falls through to `return null` once
+      // that handle is gone, so a CLOSED server reports null rather than the
+      // address it used to be bound to. test-net-server-async-dispose asserts
+      // exactly that after [Symbol.asyncDispose](); because the assertion sits
+      // inside an async listen callback, returning the stale address rejected a
+      // promise nothing was watching and the test runner hung instead of failing.
+      if (!this._handle && !this._clusterHandle && this._fd < 0) return null;
       if (this._addr && this._addr.family === "unix") return this._addr.address;
       return this._addr;
     }
