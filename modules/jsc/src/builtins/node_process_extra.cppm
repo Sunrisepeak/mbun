@@ -509,6 +509,49 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
       }
     }
 
+    // ---- process.loadEnvFile -------------------------------------------------
+    // PORT-SOURCE: compat/node/lib/internal/process/per_thread.js loadEnvFile
+    // (the JS half) + node src/node_dotenv.cc Dotenv::SetEnvironment (the
+    // assignment rule).
+    //
+    // The surface was entirely absent: `typeof process.loadEnvFile ===
+    // "undefined"`, even though the dotenv PARSER already exists natively
+    // (runtime/node_util.inc dotenv_parse_cb, published as util.parseEnv and
+    // already used for --env-file). So this is pure wiring, not new logic --
+    // per the architecture rule the parse stays in C++ and this layer only
+    // reads the file and applies node's assignment semantics.
+    //
+    // Two details the corpus pins (test-process-load-env-file):
+    //   * the no-argument form reads the RELATIVE path ".env", because the
+    //     ENOENT it raises must carry `path: '.env'`, not an absolute path.
+    //   * an existing process.env key WINS over the file. node's SetEnvironment
+    //     only sets keys with no existing value, which is why the fixture pair
+    //     (--env-file=valid.env with BASIC=basic, then loadEnvFile on
+    //     basic-valid.env with BASIC=overriden) must still read "basic".
+    // Reading through fs.readFileSync rather than a fresh native open is also
+    // what puts this call behind the permission model for free: the C++ fs read
+    // gate raises ERR_ACCESS_DENIED/FileSystemRead under --permission.
+    if (typeof proc.loadEnvFile !== "function") {
+      // The default parameter is node's, and is load-bearing: it makes
+      // loadEnvFile.length === 0.
+      const loadEnvFile = function loadEnvFile(path = undefined) {
+        const fs = G.require ? G.require("node:fs") : null;
+        const util = G.require ? G.require("node:util") : null;
+        if (!fs || !util || typeof util.parseEnv !== "function") return;
+        const src = fs.readFileSync(path != null ? path : ".env", "utf8");
+        const parsed = util.parseEnv(src);
+        if (!parsed) return;
+        for (const key of Object.keys(parsed)) {
+          if (proc.env[key] === undefined) proc.env[key] = parsed[key];
+        }
+      };
+      try {
+        Object.defineProperty(proc, "loadEnvFile", {
+          value: loadEnvFile, writable: true, enumerable: true, configurable: true,
+        });
+      } catch (e) {}
+    }
+
     // ---- process's prototype chain (node internal/bootstrap/node.js) --------
     // node's `process` is an INSTANCE: its constructor is a function whose
     // prototype inherits EventEmitter.prototype, and that prototype carries a

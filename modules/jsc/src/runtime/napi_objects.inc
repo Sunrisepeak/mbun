@@ -823,11 +823,16 @@ static JSC::JSValue loadNapiModule(JSC::JSGlobalObject* globalObject, const std:
     void* handle = dlopen(path.c_str(), RTLD_LAZY);
     if (!handle) {
         const char* err = dlerror();
-        JSC::throwException(
-            globalObject, scope,
-            JSC::createError(globalObject,
-                             WTF::makeString("ERR_DLOPEN_FAILED: "_s,
-                                             WTF::String::fromUTF8(err ? err : "dlopen failed"))));
+        // node raises a plain Error whose MESSAGE is the raw dlerror text and
+        // whose `code` PROPERTY is ERR_DLOPEN_FAILED (src/node_binding.cc
+        // DLOpen -> THROW_ERR_DLOPEN_FAILED). Folding the code into the message
+        // instead left `err.code === undefined`, which
+        // test-process-dlopen-error-message-crash asserts on directly.
+        JSC::JSObject* error = JSC::createError(
+            globalObject, WTF::String::fromUTF8(err ? err : "dlopen failed"));
+        error->putDirect(vm, JSC::Identifier::fromString(vm, "code"_s),
+                         JSC::jsString(vm, WTF::String("ERR_DLOPEN_FAILED"_s)));
+        JSC::throwException(globalObject, scope, error);
         return {};
     }
 

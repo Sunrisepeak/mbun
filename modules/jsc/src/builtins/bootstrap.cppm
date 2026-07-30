@@ -898,6 +898,39 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   }
   const PStripComments = /(\/\/.*?\n)|(\/\*(.|\n)*?\*\/)/g;
   const PClassRe = /^(\s+[^(]*?)\s*{/;
+  // PORT-SOURCE: compat/node/lib/internal/util/inspect.js (meta, escapeFn,
+  // strEscape, addQuotes).
+  // mbun previously escaped only backslash, newline and the chosen quote, so
+  // util.inspect("abc cde") rendered the raw NUL byte where node writes
+  // 'abc\x00cde'. Every C0 control, DEL, the C1 block and lone surrogates need
+  // escaping (test-process-execve-validation compares the ERR_INVALID_ARG_VALUE
+  // message, which embeds an inspected string, byte for byte).
+  const PInspectMeta = [
+    "\\x00", "\\x01", "\\x02", "\\x03", "\\x04", "\\x05", "\\x06", "\\x07",
+    "\\b", "\\t", "\\n", "\\x0B", "\\f", "\\r", "\\x0E", "\\x0F",
+    "\\x10", "\\x11", "\\x12", "\\x13", "\\x14", "\\x15", "\\x16", "\\x17",
+    "\\x18", "\\x19", "\\x1A", "\\x1B", "\\x1C", "\\x1D", "\\x1E", "\\x1F",
+    "", "", "", "", "", "", "", "\\'", "", "", "", "", "", "", "", "",
+    "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+    "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+    "", "", "", "", "", "", "", "", "", "", "", "", "\\\\", "", "", "",
+    "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+    "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "\\x7F",
+    "\\x80", "\\x81", "\\x82", "\\x83", "\\x84", "\\x85", "\\x86", "\\x87",
+    "\\x88", "\\x89", "\\x8A", "\\x8B", "\\x8C", "\\x8D", "\\x8E", "\\x8F",
+    "\\x90", "\\x91", "\\x92", "\\x93", "\\x94", "\\x95", "\\x96", "\\x97",
+    "\\x98", "\\x99", "\\x9A", "\\x9B", "\\x9C", "\\x9D", "\\x9E", "\\x9F",
+  ];
+  // The two variants differ only in whether the single quote (\x27) is escaped:
+  // when node re-quotes with " or ` there is, by construction, no such quote in
+  // the body, so it is left alone. The surrogate alternatives catch UNPAIRED
+  // surrogates only.
+  const PStrEscRe = /[\x00-\x1f\x27\x5c\x7f-\x9f]|[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g;
+  const PStrEscReSingle = /[\x00-\x1f\x5c\x7f-\x9f]|[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g;
+  const PStrEscFn = (s) => {
+    const c = s.charCodeAt(0);
+    return PInspectMeta.length > c ? PInspectMeta[c] : "\\u" + c.toString(16);
+  };
   function inspectIsClassSrc(src) {
     if (!src.startsWith("class") || !src.endsWith("}")) return false;
     // Reject a *method* literally named `class` — `({ class() {} }).class`
@@ -936,15 +969,12 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       // made util.inspect("'string'") read '\'string\'' where node writes
       // "'string'".
       let q = "'";
+      let re = PStrEscRe;
       if (v.includes("'")) {
-        if (!v.includes('"')) q = '"';
-        else if (!v.includes("`") && !v.includes("${")) q = "`";
+        if (!v.includes('"')) { q = '"'; re = PStrEscReSingle; }
+        else if (!v.includes("`") && !v.includes("${")) { q = "`"; re = PStrEscReSingle; }
       }
-      let body = v.replace(/\\/g, "\\\\").replace(/\n/g, "\\n");
-      if (q === "'") body = body.replace(/'/g, "\\'");
-      else if (q === '"') body = body.replace(/"/g, '\\"');
-      else body = body.replace(/`/g, "\\`");
-      return col(32, 39, q + body + q);
+      return col(32, 39, q + v.replace(re, PStrEscFn) + q);
     }
     if (t === "function") {
       const n = v.name;
@@ -5397,7 +5427,29 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     startupSnapshot: { isBuildingSnapshot: () => false, addSerializeCallback: () => {}, addDeserializeCallback: () => {}, setDeserializeMainFunction: () => {} },
   });
   // process.getBuiltinModule (node ≥20.16) — resolves through the builtin table
-  { const gbm = (n) => { n = String(n).replace(/^node:/, ""); return M[n]; };
+  // PORT-SOURCE: compat/node/lib/internal/modules/helpers.js getBuiltinModule +
+  // internal/bootstrap/realm.js BuiltinModule.normalizeRequirableId.
+  // The old one-liner `(n) => M[String(n).replace(/^node:/,"")]` diverged twice:
+  // it coerced instead of validating (so getBuiltinModule(Symbol()) threw a bare
+  // "Cannot convert a symbol" TypeError, not ERR_INVALID_ARG_TYPE), and it
+  // ignored node's rule that some builtins are reachable ONLY through the
+  // `node:` scheme -- `getBuiltinModule("test")` handed back node:test where
+  // node returns undefined. Internal ids ("internal/util") are never requirable
+  // by users either.
+  { const kSchemeOnly = new Set(["test", "test/reporters", "sea", "sqlite", "quic"]);
+    const gbm = function getBuiltinModule(id) {
+      if (typeof id !== "string") {
+        const e = new TypeError('The "id" argument must be of type string. Received ' +
+          (id === null ? "null" : typeof id));
+        e.code = "ERR_INVALID_ARG_TYPE";
+        throw e;
+      }
+      let n = id;
+      if (n.startsWith("node:")) n = n.slice(5);
+      else if (kSchemeOnly.has(n)) return undefined;
+      if (n.startsWith("internal/")) return undefined;
+      return M[n] !== undefined ? M[n] : M[id];
+    };
     if (G.process && !G.process.getBuiltinModule) G.process.getBuiltinModule = gbm;
     else if (!G.process) { let done = false; Object.defineProperty(G, "process", { configurable: true, set(v) { delete G.process; G.process = v; if (v && !v.getBuiltinModule) v.getBuiltinModule = gbm; }, get() { return undefined; } }); } }
   // bun:ffi — shape only (native FFI DEFERRED); files that merely import it load.
