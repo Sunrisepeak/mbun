@@ -43,9 +43,9 @@ printf 'area\ttarget\tverdict\tcost_or_size\tevidence\n' >"$tmp/struck.tsv"
 
 printf 'wave\tlane\tcorpus\tarea\tgoal\tdelivered\tminutes\tregressions\tnote\n' >"$tmp/ledger.tsv"
 {
-  printf '1\tA\tnode\ta\t6\t10\t60\t0\t-\n'   # 10 files/hour
-  printf '1\tB\tnode\tb\t6\t20\t60\t0\t-\n'   # 20 files/hour -> mean 15
-  printf '1\tC\tbun\tc\t6\t2\t60\t0\t-\n'     # 2 files/hour
+  printf '1\tA\tnode\ttest-alpha\t6\t10\t60\t0\t-\n'   # 10 files/hour
+  printf '1\tB\tnode\ttest-beta\t6\t20\t60\t0\t-\n'   # 20 files/hour -> mean 15
+  printf '1\tC\tbun\tjs/beta\t6\t2\t60\t0\t-\n'     # 2 files/hour
 } >>"$tmp/ledger.tsv"
 
 run() { python3 "$tool" --ledger "$tmp/ledger.tsv" --struck "$tmp/struck.tsv" "$@"; }
@@ -92,6 +92,14 @@ assert not wp.is_struck("test-alpha", ex), "test-alpha must NOT be struck"
 assert not wp.is_struck("test-http2", ex), "test-http2 must NOT be struck"
 PY
 pass "is_struck matches on the area's core token at a word boundary"
+
+
+# --- both corpora get lanes ---------------------------------------------------
+o2=$(out --plan 4 --node-run "$tmp/noderun" --bun-run "$tmp/bunrun")
+echo "$o2" | grep -q 'per-corpus split' || fail "a plan must state its per-corpus split"
+echo "$o2" | grep -qE '\[bun\]'  || fail "the slower corpus must still get lanes (floor)"
+echo "$o2" | grep -qE '\[node\]' || fail "the faster corpus must get lanes"
+pass "the per-corpus floor keeps the slower corpus from being starved"
 
 # --- thin areas are ignored ---------------------------------------------------
 echo "$o" | grep -q 'test-tiny' && fail "an area under --min-actionable must be ignored"

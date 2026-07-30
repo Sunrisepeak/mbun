@@ -155,18 +155,35 @@ def is_struck(area: str, excluded: dict[str, dict[str, str]]) -> dict[str, str] 
         k = key.lower()
         if a in k or k.startswith(a):
             return row
-        if core and re.search(rf"(?:^|[\s/(]){re.escape(core)}(?:$|[\s/),])", k):
+        # Require >=3 chars for the word-boundary match. A short token matches
+        # ordinary English: area "a" matched "as A cluster target" and silently
+        # dropped a ledger row from the throughput model.
+        if len(core) >= 3 and re.search(
+                rf"(?:^|[\s/(]){re.escape(core)}(?:$|[\s/),])", k):
             return row
     return None
 
 
-def throughput(ledger: list[dict[str, str]]) -> dict[str, dict[str, float]]:
-    """files/hour per corpus, from verified rows only. Median-ish via the mean of
-    the middle rows would be nicer, but with this few rows the mean plus the max
-    is more informative -- and the max is what proves a rate is achievable."""
+def throughput(ledger: list[dict[str, str]],
+               excluded: dict[str, dict[str, str]] | None = None) -> dict[str, dict[str, float]]:
+    """files/hour per corpus, from verified rows only. The mean plus the max, since
+    with this few rows the max is what proves a rate is achievable.
+
+    Rows whose AREA is now struck are excluded from the model. This is not
+    flattery: those lanes measured real throughput, but they measured it against
+    targets the strategy will never choose again, so including them predicts the
+    wrong thing. Concretely, bun lanes D (bake/dev) and E (bundler) delivered 0 and
+    1 file and both areas are now struck TOO_BIG -- leaving them in pulled bun's
+    mean down to 2.0 files/hour and set a +6 goal for an area where another lane
+    had just delivered +13.
+    """
     stats: dict[str, dict[str, float]] = {}
+    excluded = excluded or {}
     for corpus in {row.get("corpus", "") for row in ledger}:
-        rows = [r for r in ledger if r.get("corpus") == corpus]
+        rows = [r for r in ledger if r.get("corpus") == corpus
+                and not is_struck(r.get("area", ""), excluded)]
+        if not rows:
+            rows = [r for r in ledger if r.get("corpus") == corpus]
         rates = []
         for r in rows:
             try:
@@ -280,8 +297,8 @@ def cmd_coverage(args, node_run, bun_run, excluded):
     return 0
 
 
-def cmd_throughput(args, ledger):
-    stats = throughput(ledger)
+def cmd_throughput(args, ledger, excluded):
+    stats = throughput(ledger, excluded)
     if not stats:
         print("wave_planner: ledger has no usable rows", file=sys.stderr)
         return 2
@@ -309,7 +326,7 @@ def cmd_plan(args, node_run, bun_run, ledger, excluded):
               "first (tools/integration/reclaim_disk.sh --prune-configs --apply).")
         return 1
 
-    stats = throughput(ledger)
+    stats = throughput(ledger, excluded)
     candidates = []
     for corpus, run in (("node", node_run), ("bun", bun_run)):
         if not run:
@@ -317,6 +334,8 @@ def cmd_plan(args, node_run, bun_run, ledger, excluded):
         rate = stats.get(corpus, {}).get("mean", 4.0)
         for area, b in summarise(run, corpus, excluded).items():
             if b["struck"] or b["actionable"] < args.min_actionable:
+                continue
+            if any(x.lower() in area.lower() for x in args.exclude):
                 continue
             # Expected yield for a ~2h lane, never more than what is there to fix.
             expected = min(b["actionable"], rate * args.lane_hours)
@@ -328,16 +347,41 @@ def cmd_plan(args, node_run, bun_run, ledger, excluded):
             })
     candidates.sort(key=lambda c: (-c["expected"], -c["actionable"]))
 
+    # Ranking by expected yield alone starves the slower corpus: node's measured
+    # rate is ~3x bun's, so a pure sort hands every lane to node and the bun metric
+    # stops moving. Both corpora are first-class targets, so each gets a floor.
+    chosen: list[dict] = []
+    if args.min_per_corpus > 0:
+        for corpus in ("node", "bun"):
+            picked = [c for c in candidates if c["corpus"] == corpus][:args.min_per_corpus]
+            chosen.extend(picked)
+        chosen.sort(key=lambda c: (-c["expected"], -c["actionable"]))
+        chosen = chosen[:lanes]
+        for c in candidates:
+            if len(chosen) >= lanes:
+                break
+            if c not in chosen:
+                chosen.append(c)
+    else:
+        chosen = candidates[:lanes]
+
     print("=== ranked assignments ===\n")
-    for i, c in enumerate(candidates[:lanes], 1):
+    for i, c in enumerate(chosen, 1):
         print(f"{i}. [{c['corpus']}] {c['area']}")
         print(f"     green {c['green']} / actionable {c['actionable']} "
               f"/ no-verdict {c['unverdicted']}")
         print(f"     corpus rate {c['rate']:.1f} files/h x {args.lane_hours}h "
               f"-> GOAL +{c['goal']}")
-    if len(candidates) > lanes:
-        print(f"\n(next in line, not dispatched: "
-              f"{', '.join(c['area'] for c in candidates[lanes:lanes + 4])})")
+    by_corpus: dict[str, int] = {}
+    for c in chosen:
+        by_corpus[c["corpus"]] = by_corpus.get(c["corpus"], 0) + 1
+    print(f"\nper-corpus split: " +
+          ", ".join(f"{k} {v}" for k, v in sorted(by_corpus.items())) +
+          f" (floor {args.min_per_corpus}/corpus)")
+    rest = [c for c in candidates if c not in chosen]
+    if rest:
+        print(f"(next in line, not dispatched: "
+              f"{', '.join(c['area'] + '[' + c['corpus'] + ']' for c in rest[:4])})")
     print("\nBefore dispatching each: python3 tools/integration/check_struck.py <area terms>")
     print("Every brief must carry: diff against a FROZEN baseline (never rebuild to")
     print("make one), read compat/node/lib/, sort candidates by assertion ratio, and")
@@ -358,6 +402,10 @@ def main() -> int:
     ap.add_argument("--lane-hours", type=float, default=2.0)
     ap.add_argument("--min-actionable", type=int, default=8,
                     help="ignore areas with fewer actionable failures than this")
+    ap.add_argument("--min-per-corpus", type=int, default=2,
+                    help="floor of lanes per corpus, so the slower one is not starved")
+    ap.add_argument("--exclude", action="append", default=[],
+                    help="area substring to skip (e.g. one mined last wave); repeatable")
     args = ap.parse_args()
 
     if not (args.coverage or args.throughput or args.plan is not None):
@@ -369,7 +417,7 @@ def main() -> int:
     bun_run = load_run(args.bun_run) if args.bun_run else []
 
     if args.throughput:
-        return cmd_throughput(args, ledger)
+        return cmd_throughput(args, ledger, excluded)
     if args.coverage:
         if not (node_run or bun_run):
             ap.error("--coverage needs --node-run and/or --bun-run")
