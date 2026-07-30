@@ -48,6 +48,28 @@
 #   --stale-hours <n>  a cache must be untouched this long to count as stale
 #                      (default 24; use 0 only when you know the box is idle)
 #   --keep <path>      additionally protect a worktree (repeatable)
+#   --prune-configs    ALSO prune superseded per-config build dirs everywhere,
+#                      including the CURRENT worktree (see below)
+#
+# --prune-configs: the second, larger leak
+#
+# The worktree pass above cannot touch the current checkout, and that is correct
+# for its incremental cache -- but it means the main checkout's build output grows
+# without bound in a way nobody notices. mcpp keys build output by config hash:
+# `<root>/target/<arch>/<hash>/` and `<root>/modules/<member>/target/<arch>/<hash>/`.
+# Every toolchain or config change mints a NEW hash and abandons the old tree,
+# fully populated. Measured on 2026-07-30: `modules/jsc/target` alone held 39 GB
+# across four hashes, three of them 10-12 days old and 9.4 GB each, left behind by
+# a gcc->llvm->gcc toolchain flip. The box was at 100% with 9.1 GB free and lanes
+# were about to start failing; pruning superseded configs freed 51 GB and the very
+# next `mcpp build` was a 0.06s no-op, i.e. nothing live was touched.
+#
+# What counts as superseded, per `<root>/target/<arch>/` directory:
+#   - the NEWEST hash dir is the live config -- always kept;
+#   - anything touched within --stale-hours is kept (another lane is building);
+#   - everything else is an abandoned config and is deleted.
+# This is safe in the current worktree in a way deleting `target/` wholesale is
+# not: the live incremental cache survives, so no cold rebuild is forced.
 #
 # Exit 0 on success, 2 on usage error.
 set -uo pipefail
@@ -55,6 +77,7 @@ set -uo pipefail
 apply=0
 min_gb=0
 stale_hours=24
+prune_configs=0
 keeps=()
 
 while [ $# -gt 0 ]; do
@@ -63,7 +86,8 @@ while [ $# -gt 0 ]; do
     --min-gb)      min_gb="${2:?--min-gb needs a value}"; shift 2 ;;
     --stale-hours) stale_hours="${2:?--stale-hours needs a value}"; shift 2 ;;
     --keep)        keeps+=("${2:?--keep needs a path}"); shift 2 ;;
-    -h|--help) sed -n '2,50p' "$0"; exit 0 ;;
+    --prune-configs) prune_configs=1; shift ;;
+    -h|--help) sed -n '2,74p' "$0"; exit 0 ;;
     *) echo "$0: unknown argument '$1'" >&2; exit 2 ;;
   esac
 done
@@ -136,6 +160,35 @@ for wt in "${worktrees[@]}"; do
     echo "would   $wt  ${size}M  (${#caches[@]} cache dirs)"
   fi
 done
+
+# Second pass: superseded per-config build dirs. Unlike the worktree pass this is
+# safe in the CURRENT worktree, because the newest hash -- the live incremental
+# cache -- is always kept.
+if [ "$prune_configs" -eq 1 ]; then
+  while IFS= read -r arch_dir; do
+    newest=$(ls -1dt "$arch_dir"/*/ 2>/dev/null | head -1)
+    [ -n "$newest" ] || continue
+    for hash_dir in "$arch_dir"/*/; do
+      [ -d "$hash_dir" ] || continue
+      # The live config: whatever the next build will reuse.
+      [ "$hash_dir" = "$newest" ] && { echo "keep    $hash_dir (live config)"; continue; }
+      # Somebody is mid-build against this one.
+      if [ -n "$(find "$hash_dir" -maxdepth 3 -newermt "-${stale_hours} hours" -print -quit 2>/dev/null)" ]; then
+        echo "keep    $hash_dir (touched within ${stale_hours}h)"
+        continue
+      fi
+      size=$(du -sm "$hash_dir" 2>/dev/null | awk '{print $1+0}')
+      [ "${size:-0}" -gt 0 ] || continue
+      total_freed=$((total_freed + size))
+      if [ "$apply" -eq 1 ]; then
+        rm -rf "$hash_dir"; echo "reclaim $hash_dir  ${size}M  (superseded config)"
+      else
+        echo "would   $hash_dir  ${size}M  (superseded config)"
+      fi
+    done
+  done < <(find . -mindepth 2 -maxdepth 4 -type d -path '*/target/*' \
+                  \( -name 'x86_64-*' -o -name 'aarch64-*' \) 2>/dev/null)
+fi
 
 after=$(free_gb)
 if [ "$apply" -eq 1 ]; then

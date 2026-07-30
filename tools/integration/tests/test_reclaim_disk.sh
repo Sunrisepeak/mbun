@@ -94,4 +94,58 @@ printf '%s' "$out6" | grep -q "would .*$tmp/active" \
   && pass "--stale-hours 0 offers even a fresh cache" \
   || fail "--stale-hours 0 still filtered: $out6"
 
+
+# --- --prune-configs: superseded per-config build dirs ------------------------
+# The second, larger leak: mcpp keys build output by config hash, and a toolchain
+# change abandons the old hash dir fully populated. The live one must survive so
+# no cold rebuild is forced.
+prune_tmp=$(mktemp -d)
+# reclaim_disk.sh resolves worktrees via git, so the fixture must be a repo or the
+# script exits before the config pass ever runs.
+git -C "$prune_tmp" init -q
+mkdir -p "$prune_tmp/target/x86_64-linux-gnu/live" \
+         "$prune_tmp/target/x86_64-linux-gnu/oldcfg" \
+         "$prune_tmp/modules/jsc/target/x86_64-linux-gnu/live2" \
+         "$prune_tmp/modules/jsc/target/x86_64-linux-gnu/oldcfg2"
+for d in live oldcfg live2 oldcfg2; do
+  find "$prune_tmp" -type d -name "$d" -exec sh -c 'dd if=/dev/zero of="$1/blob" bs=1M count=2 2>/dev/null' _ {} \;
+done
+# Age the abandoned configs well past the staleness window.
+find "$prune_tmp" -type d -name 'oldcfg*' -exec touch -d '20 days ago' {} \; 2>/dev/null
+find "$prune_tmp" -path '*oldcfg*' -type f -exec touch -d '20 days ago' {} \; 2>/dev/null
+
+out=$(cd "$prune_tmp" && bash "$repo_root/tools/integration/reclaim_disk.sh" \
+        --prune-configs --stale-hours 24 2>&1 || true)
+echo "$out" | grep -q 'live.*live config' || fail "--prune-configs must keep the newest hash as live"
+echo "$out" | grep -q 'would.*oldcfg' || fail "--prune-configs must offer to delete an abandoned config"
+pass "--prune-configs keeps the live config and flags abandoned ones"
+
+[ -d "$prune_tmp/target/x86_64-linux-gnu/oldcfg" ] \
+  || fail "a dry run must not delete anything"
+pass "--prune-configs without --apply deletes nothing"
+
+out=$(cd "$prune_tmp" && bash "$repo_root/tools/integration/reclaim_disk.sh" \
+        --prune-configs --stale-hours 24 --apply 2>&1 || true)
+[ -d "$prune_tmp/target/x86_64-linux-gnu/live" ] \
+  || fail "--apply must NEVER delete the live config -- that forces a cold rebuild"
+[ -d "$prune_tmp/modules/jsc/target/x86_64-linux-gnu/live2" ] \
+  || fail "--apply must keep the live per-member config too"
+[ ! -d "$prune_tmp/target/x86_64-linux-gnu/oldcfg" ] \
+  || fail "--apply must delete the abandoned top-level config"
+[ ! -d "$prune_tmp/modules/jsc/target/x86_64-linux-gnu/oldcfg2" ] \
+  || fail "--apply must delete the abandoned per-member config"
+pass "--prune-configs --apply removes abandoned configs and spares both live ones"
+
+# Without the flag, the config pass must not run at all.
+mkdir -p "$prune_tmp/target/x86_64-linux-gnu/oldcfg3"
+dd if=/dev/zero of="$prune_tmp/target/x86_64-linux-gnu/oldcfg3/blob" bs=1M count=2 2>/dev/null
+touch -d '20 days ago' "$prune_tmp/target/x86_64-linux-gnu/oldcfg3" \
+                       "$prune_tmp/target/x86_64-linux-gnu/oldcfg3/blob"
+out=$(cd "$prune_tmp" && bash "$repo_root/tools/integration/reclaim_disk.sh" --apply 2>&1 || true)
+[ -d "$prune_tmp/target/x86_64-linux-gnu/oldcfg3" ] \
+  || fail "the config pass must be opt-in via --prune-configs"
+pass "the config pass is opt-in"
+
+rm -rf "$prune_tmp"
+
 echo "test_reclaim_disk: ok"
