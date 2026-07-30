@@ -5,6 +5,96 @@ session that is interrupted (usage limit, crash, restart) can pick up from the
 file rather than from memory. **If you are a fresh session reading this, start
 here.**
 
+## 2026-07-30 18:30 — WAVE 57 lanes G, I, J + two findings that outlive them
+
+**Lane G — child_process: +16 (goal +6).** `test-child` **74 → 90**, 0 regressions
+across `test-fs`/`test-worker`/`test-process`/`test-stdio` and a 67-file bun
+spawn slice. Integrated. Nine defects, and the two biggest were **architectural
+placement, not semantics**: `shell` was applied per entry point instead of inside
+`normalizeSpawnArgs` (so `spawnSync('missing',{shell:true})` gave ENOENT instead of
+exit 127, and the DEP0190 latch never fired), and exec/execFile's timeout lived in
+`ChildProcess.spawn`, which implements the *plain spawn* flavour (signal only) —
+`sh -c` **forks**, the grandchild inherits the stdout pipe, so `exec({timeout:1})`
+waited out the grandchild's full 20s. Also: `process.exitCode` rejected numeric
+strings (node coerces, so `process.exit('23')` → 23, and `__mbun_run_exit` swallows
+the throw → exit 0); a child's stdout never emitted `'end'` when paused, because
+`push(null)` only reaches `endReadable()` via `flow()` and node's `onStreamRead`
+therefore does `push(null); read(0)`.
+
+**Lane G self-caught a change of its own that cost a green bun file.** Making
+`fs.writeSync` work on raw stdio fds let a child push 8 MiB into an unread pipe;
+`spawn-pipe-leak` had been green *only because its child died on the EBADF*, and
+the parent grew past 1.3 GB until `fork()` failed. Bisected by stashing one file,
+then bounded to `3 <= fd < 1000` — the upper bound matters too, because under that
+test the OS fd table climbs past 1000 and would collide with mbun's virtual fd
+namespace. **The unbounded-buffering defect in the `Bun.spawn` `'pipe'` reader is a
+real, separate bug worth its own lane.**
+
+**Lane I — bun regression/issue: +13 (goal +12).** Integrated as `d1624f3`. The
+brief's premise held but for the wrong reason: small focused files did not mean
+*cheap fixes*, they meant cheaply **diagnosable** ones. The 149 real failures were
+**bimodal with no middle** — ~35 were one missing property/export from green, the
+rest whole unimplemented subsystems. Sorting by assertion ratio surfaced the first
+group in a single pass, and every one was "already implemented but unreachable":
+`node:stream/web` re-exported 7 of node's 17 classes while all 17 exist as globals;
+`BunFile` had no `stat`/`unlink`/`delete` though `node:fs` answers the same paths;
+`xdescribe` was aliased to `describe` instead of `describe.skip`, so xdescribe'd
+tests **ran**.
+
+**Lane J — bun http/net/websocket: +4 (goal +8, short).** The biggest lever in that
+cluster was not HTTP: `Bun.spawn({ipc})` silently dropped the channel, so 5 of 53
+files died at `process.send is not a function` before touching HTTP —
+`__mbunSetupIpcChild` and native `spawnEx`'s socketpair both already existed, only
+the JS route was missing.
+
+### CONFIRMED BLOCKED CLASS: `FinalizationRegistry` callbacks never fire
+
+Controlled comparison, explicit GC on both sides, 10 plainly-garbage objects:
+
+```
+mbun (Bun.gc(true) x4):        collected: 0 of 10
+node 24.4.1 (global.gc() x4):  collected: 10 of 10
+```
+
+**Every corpus test built on `FinalizationRegistry` is blocked on this, not on
+whatever it appears to be testing** (`websocket-upgrade-signal-gc` looks like
+AbortSignal retention; it is not). Method note on how this was established, because
+it nearly went the other way: a first probe that only churned allocations reported
+`0 of 10` on **both** runtimes, which would have looked like agreement. A negative
+GC claim is only meaningful against a control that forces collection.
+
+### TRAP: a lane must not use the MAIN checkout's binary as its baseline
+
+Lane J burned time on **247 phantom node "gains" and 6 phantom "regressions"**
+before catching this by building its own parent commit. The main checkout is the
+*integration* worktree: it advances as lanes are merged, so its binary is ahead of
+whatever `origin/agent/corpus-coverage-w40` pointed at when a lane branched. A
+clean tree and an up-to-date mtime do **not** mean the binary matches your branch
+point. Two sound options, and only these:
+
+- diff against a **frozen run directory** whose tree you know (`w56-full-node2`,
+  `w56-bun-full`) — this is the cheap path and needs no build; or
+- build **your own parent commit** in your own worktree.
+
+Corollary for the integrator: never rebuild the main checkout while a measurement
+is reading its binary. Runs resolve the path once and the file is replaced under
+them. That is what `target/integration/frozen-bin/<tag>/mbun` is for.
+
+### Handoffs left by lane J, both actionable
+
+- **`fetch-file-upload`, root-caused not fixed.** `Response.formData()` on a
+  *fetched* response gets 0 bytes. `__mbunStreams.bytes(stream)` resolves with all
+  1488 bytes, but the view is empty one microtask later: `Response._consume` calls
+  `S.detachBodyStore(stream)` synchronously after creating the promise
+  (`process_web.cppm` ~2702/2710), so the `bytes` branch is 1 hop and survives
+  while `formData` adds a `.then` and sees 0. **Fix: copy the bytes before the
+  extra hop.** A local `new Response(formData)` parses fine, which is why it only
+  shows over the wire.
+- **`serve.test.ts` needs a raised corpus timeout.** Once the IPC fixtures stopped
+  crashing instantly it went 21s → 124s and now runs 259 assertions instead of 224
+  — but it reads `timeout` at the 60s runner limit on **both** base and after, so
+  it will keep hiding real progress at zero measured delta.
+
 ## 2026-07-30 17:00 — LANE PROTOCOL v2: what actually made lanes fast, measured
 
 Throughput across waves 56–57 varied by **25x**, and the spread is explained by
