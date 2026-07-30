@@ -546,6 +546,37 @@
     writeReport: function () { return ""; },
   };
   p.features = { inspector: false };
+  // `variables` was empty, and node's own test harness gates whole families on it:
+  //   compat/node/test/common/index.js:37
+  //     const hasIntl = !!process.config.variables.v8_enable_i18n_support;
+  // So 12 corpus files called common.skip('missing Intl') and never ran, even
+  // though JSC here ships full ICU -- verified directly: de-DE dateStyle:'long'
+  // gives "1. Januar 1970", de-DE NumberFormat gives "1.234,5", a de Collator
+  // sorts a/ä/z correctly, and resolvedOptions().locale round-trips "de-DE".
+  // Report only what is actually true: i18n yes; `icu_small` stays falsy because
+  // non-English locale data is real (line 40 of that file notes small-icu cannot
+  // do non-English); and v8_enable_temporal_support stays unset because Temporal
+  // genuinely is not enabled, so those 2 files should keep skipping.
+  //
+  // This class was invisible until now because self-skips are (correctly) excluded
+  // from the "actionable failure" count, so nothing in the planning loop ever
+  // looked at them. 553 node files self-skip; the inventory is in RESUME.md.
+  // DO NOT set v8_enable_i18n_support here on its own -- measured, and it is a
+  // net trade of green files. It is TRUTHFUL (JSC here ships full ICU: de-DE
+  // dateStyle:'long' gives "1. Januar 1970", de-DE NumberFormat "1.234,5", a de
+  // Collator sorts a/ae/z, resolvedOptions().locale round-trips "de-DE") and it
+  // unblocks 12 self-skipping files for +7 green. But it also costs 4 green files,
+  // because with hasIntl true those files stop skipping the IDNA paths:
+  //   test-url-parse-invalid-input  http://fail<U+2047>fail.com/ must THROW
+  //   test-url-format / test-url-parse-format
+  //   test-process-env-allowed-flags-are-documented  wants --icu-data-dir listed
+  // The blocker is UTS-46 VALIDATION, not punycode: mbun's encoder is correct
+  // (muenchen.de -> xn--mnchen-3ya.de) but it ENCODES a disallowed character
+  // instead of rejecting it (fail<U+2047>fail.com -> xn--failfail-803d.com, where
+  // node's domainToASCII returns '' and new URL() throws).
+  // Land all three together as one lane -- the flag, the UTS-46 disallowed/mapped
+  // table, and --icu-data-dir in allowedNodeEnvironmentFlags -- for ~+11 with zero
+  // regressions. Sized in RESUME.md.
   p.config = { variables: {} };
   p.release = { name: "node" };
   p.stdin = { on: function () { return p.stdin; }, read: function () { return null; }, resume: function () {}, pause: function () {}, setEncoding: function () {}, isTTY: false };

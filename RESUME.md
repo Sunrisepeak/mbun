@@ -5,6 +5,70 @@ session that is interrupted (usage limit, crash, restart) can pick up from the
 file rather than from memory. **If you are a fresh session reading this, start
 here.**
 
+## 2026-07-31 00:30 — THE SELF-SKIP INVENTORY: 553 node files, and nobody had looked
+
+**A whole class was invisible because the loop was correct.** Self-skips are
+(rightly) excluded from the "actionable failure" count, so nothing in the planning
+loop ever examined them — for the entire campaign. There are **553** of them in the
+node corpus. First inventory:
+
+| self-skip reason | files | nature |
+| --- | ---: | --- |
+| QUIC is not enabled | **236** | a whole subsystem node itself does not enable by default |
+| V8 inspector is disabled | **178** | inspector protocol |
+| ESLint tests require crypto and Intl | 25 | check whether ESLint is even vendored before spending |
+| **missing SQLite** | **22** | **`bun:sqlite` WORKS; `node:sqlite` is unregistered** |
+| missing Intl | 12 | **a detection gap, not a missing capability** |
+| OpenSSL version / openssl-cli | 19 | crypto build |
+| Requires Amaro | 6 | TS loader |
+| Windows-specific | ~8 | permanently unreachable on Linux |
+
+**414 files (9.3% of the node corpus) are gated on QUIC + the inspector alone.**
+This is the honest reason 100% strict green is not reachable by lane work: measured
+ceiling if every *actionable* file landed is 3630/4433 node and 1563/1902 bun,
+about 82% each.
+
+### Ready lane #1: `node:sqlite` — up to 22 files, highest confidence on the board
+
+```
+require("bun:sqlite")  -> Database, Statement, constants, SQLiteError   (works)
+require("node:sqlite") -> THROWS ERR_UNKNOWN_BUILTIN_MODULE
+```
+`modules/sqlite/src/` has `database.cppm`, `native.cppm`, `row.cppm`, `sql.cppm`.
+Do NOT alias `bun:sqlite` — node's surface is `DatabaseSync`/`StatementSync` with
+different method names and option bags. Build a shim over the working
+implementation. Files: `grep -rl "missing SQLite" target/integration/w59-node/logs/`.
+
+### Ready lane #2: Intl — MEASURED at +7/−4, so land all three parts together
+
+`common/index.js:37` is `const hasIntl = !!process.config.variables.v8_enable_i18n_support`,
+and `p.config = { variables: {} }` at `bindings_install.inc:549` left it undefined.
+Setting it is **truthful** — verified directly that JSC here ships full ICU
+(`de-DE` `dateStyle:'long'` → `"1. Januar 1970"`, `de-DE` NumberFormat →
+`"1.234,5"`, a `de` Collator sorts a/ä/z, `resolvedOptions().locale` round-trips
+`"de-DE"`). Measured effect of the flag alone: **12 files stop skipping → 5 green,
+4 now-failing, 3 still skip for a second reason; and +7 gains against −4 losses**
+across every `process.config` consumer (105 files).
+
+**The −4 is why the flag is held rather than shipped**, with the reasoning in a
+comment at the site. The blocker is **UTS-46 validation, not punycode**: mbun's
+encoder is correct (`münchen.de` → `xn--mnchen-3ya.de`) but it **encodes a
+disallowed character instead of rejecting it** — `fail⁇fail.com` →
+`xn--failfail-803d.com`, where node's `domainToASCII` returns `''` and `new URL()`
+throws. Land as ONE lane: the flag + the UTS-46 disallowed/mapped table +
+`--icu-data-dir` in `allowedNodeEnvironmentFlags`. Expect ~+11, zero regressions.
+
+**Method note:** this is the second time a "no verdict" bucket hid cheap work.
+The first was timeouts being folded into "fixable", which overstated a subsystem's
+density. Buckets that exist to keep the *gate* honest also hide *opportunity* —
+audit them periodically rather than only reading `actionable`.
+
+### Wave 60 dispatch note
+
+All five lanes died on server-side **529 Overloaded** before doing work. Recorded
+response, unchanged from the earlier occurrence: **do not retry-loop; switch to
+solo integration work.** The two findings above are solo output from that window.
+
 ## 2026-07-30 23:30 — WAVE 58 RESULTS: +47 node, +14 bun, 0 regressions, all integrated
 
 | lane | shape | goal | got | wall | files/h |
