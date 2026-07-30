@@ -1437,6 +1437,21 @@ inline constexpr std::string_view HARNESS = R"JS(
     scope.items = kept;
     return kept.length > 0;
   }
+  // Does anything in this subtree survive -t/--test-name-pattern? A describe
+  // whose every test is filtered out by the label must not run its
+  // beforeAll/afterAll: the hooks belong to the tests that run, and a label run
+  // is expected to be silent for the describes it did not select (issue 21177 —
+  // `bun test fixture.ts -t "true is true"` prints only the banner, and a nested
+  // describe three levels deep must not announce itself either).
+  // Without a pattern every scope is runnable, so this is a no-op for a normal run.
+  function scopeHasLabelMatch(scope) {
+    for (const item of scope.items) {
+      if (item.type === "test") {
+        if (G.__mbunNamePattern.test(fullName(scope, item.name))) return true;
+      } else if (!item.scope.skipped && scopeHasLabelMatch(item.scope)) return true;
+    }
+    return false;
+  }
   async function runScope(scope, beChain, aeChain) {
     // A todo scope only *runs* under --todo; otherwise its tests report as
     // `(todo)` without executing any of the scope's hooks (same as describe.skip).
@@ -1446,10 +1461,16 @@ inline constexpr std::string_view HARNESS = R"JS(
     // yields the same visited order because generation walks scopes in the same
     // depth-first sequence this runner does.
     if (S.rand !== null) shuffleWithIndex(S.rand, scope.items);
-    try { for (const h of scope.beforeAll) await callHook(h); }
-    catch (e) {
-      failAllIn(scope, (e && e.message !== undefined) ? String(e.message) : String(e));
-      return;
+    // The tests still have to be walked (each non-match bumps S.skippedLabel,
+    // which is what tells a label-only run from a real one), only the hooks are
+    // gated.
+    const runHooks = !G.__mbunNamePattern || scopeHasLabelMatch(scope);
+    if (runHooks) {
+      try { for (const h of scope.beforeAll) await callHook(h); }
+      catch (e) {
+        failAllIn(scope, (e && e.message !== undefined) ? String(e.message) : String(e));
+        return;
+      }
     }
     const be = beChain.concat(scope.beforeEach);
     const ae = scope.afterEach.concat(aeChain);
@@ -1457,8 +1478,10 @@ inline constexpr std::string_view HARNESS = R"JS(
       if (item.type === "test") await runTest(scope, item, be, ae);
       else await runScope(item.scope, be, ae);
     }
-    try { for (const h of scope.afterAll) await callHook(h); }
-    catch (e) { S.errors.push((e && e.message !== undefined) ? String(e.message) : String(e)); }
+    if (runHooks) {
+      try { for (const h of scope.afterAll) await callHook(h); }
+      catch (e) { S.errors.push((e && e.message !== undefined) ? String(e.message) : String(e)); }
+    }
   }
   async function runTest(scope, t, be, ae) {
     const label = fullName(scope, t.name);

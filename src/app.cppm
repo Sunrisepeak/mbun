@@ -794,6 +794,122 @@ void apply_bunfig_jsx(const mbun::bunfig::BunfigConfig& cfg,
     out.development = cfg.jsx_development;
 }
 
+// ─── `--reporter=junit --reporter-outfile=<path>` ───────────────────────────
+// bun installs the JUnit reporter ALONGSIDE the console one, so the outfile is
+// written for every run that produced results — including a run cut short by
+// --bail, which is the whole point of regression/issue/26851: the report of a
+// bailed run is exactly the report a CI system needs.
+//
+// The runner already prints one `(pass)|(fail)|(skip)|(todo) <full name>` line
+// per test, so the reporter reads its own report rather than growing a second
+// results channel through mbun.jsc.test_runner.
+struct JUnitCase {
+    std::string name {};
+    char status { 'p' };  // p pass | f fail | s skip | t todo
+    std::string detail {};
+};
+struct JUnitSuite {
+    std::string file {};
+    std::vector<JUnitCase> cases {};
+    double ms { 0.0 };
+};
+
+std::string junit_escape(std::string_view s) {
+    std::string out {};
+    out.reserve(s.size());
+    for (const char c : s) {
+        switch (c) {
+            case '&': out += "&amp;"; break;
+            case '<': out += "&lt;"; break;
+            case '>': out += "&gt;"; break;
+            case '"': out += "&quot;"; break;
+            case '\'': out += "&apos;"; break;
+            default:
+                // XML 1.0 forbids most C0 controls outright; drop them rather than
+                // emit a document no parser will accept.
+                if (static_cast<unsigned char>(c) < 0x20 && c != '\n' && c != '\t' && c != '\r') break;
+                out.push_back(c);
+        }
+    }
+    return out;
+}
+
+// Split one file's report body into cases. Detail lines (an assertion diff, a
+// thrown error) precede their `(fail)` line in this runner, so they are buffered
+// and attached to the next status line the same way only_failure_lines does.
+std::vector<JUnitCase> junit_cases_from_body(std::string_view body) {
+    std::vector<JUnitCase> out {};
+    std::string pending {};
+    for (const auto lineRange : std::views::split(body, '\n')) {
+        const std::string_view line { lineRange.data(), lineRange.size() };
+        char status { 0 };
+        if (line.starts_with("(pass)")) status = 'p';
+        else if (line.starts_with("(fail)")) status = 'f';
+        else if (line.starts_with("(skip)")) status = 's';
+        else if (line.starts_with("(todo)")) status = 't';
+        if (status == 0) {
+            if (!line.empty()) {
+                if (!pending.empty()) pending.push_back('\n');
+                pending.append(line);
+            }
+            continue;
+        }
+        std::string_view name { line.substr(6) };
+        while (!name.empty() && name.front() == ' ') name.remove_prefix(1);
+        out.push_back(JUnitCase { std::string { name }, status,
+                                  status == 'f' ? pending : std::string {} });
+        pending.clear();
+    }
+    return out;
+}
+
+void write_junit_report(const std::filesystem::path& outfile,
+                        const std::vector<JUnitSuite>& suites, double totalMs) {
+    int tests {}, failures {}, skipped {};
+    for (const auto& s : suites) {
+        for (const auto& c : s.cases) {
+            ++tests;
+            if (c.status == 'f') ++failures;
+            else if (c.status == 's' || c.status == 't') ++skipped;
+        }
+    }
+    std::string xml { "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" };
+    xml += std::format("<testsuites name=\"bun test\" tests=\"{}\" assertions=\"{}\" failures=\"{}\" "
+                       "skipped=\"{}\" time=\"{:.6f}\">\n",
+                       tests, tests, failures, skipped, totalMs / 1000.0);
+    for (const auto& s : suites) {
+        int st {}, sf {}, ss {};
+        for (const auto& c : s.cases) {
+            ++st;
+            if (c.status == 'f') ++sf;
+            else if (c.status == 's' || c.status == 't') ++ss;
+        }
+        xml += std::format("  <testsuite name=\"{}\" tests=\"{}\" assertions=\"{}\" failures=\"{}\" "
+                           "skipped=\"{}\" time=\"{:.6f}\">\n",
+                           junit_escape(s.file), st, st, sf, ss, s.ms / 1000.0);
+        for (const auto& c : s.cases) {
+            xml += std::format("    <testcase name=\"{}\" classname=\"{}\" time=\"0\"",
+                               junit_escape(c.name), junit_escape(s.file));
+            if (c.status == 'f') {
+                xml += ">\n      <failure type=\"AssertionError\" message=\"";
+                xml += junit_escape(c.detail);
+                xml += "\"></failure>\n    </testcase>\n";
+            } else if (c.status == 's' || c.status == 't') {
+                xml += ">\n      <skipped/>\n    </testcase>\n";
+            } else {
+                xml += "></testcase>\n";
+            }
+        }
+        xml += "  </testsuite>\n";
+    }
+    xml += "</testsuites>\n";
+
+    std::error_code ec {};
+    if (outfile.has_parent_path()) std::filesystem::create_directories(outfile.parent_path(), ec);
+    std::ofstream out { outfile, std::ios::binary | std::ios::trunc };
+    if (out) out.write(xml.data(), static_cast<std::streamsize>(xml.size()));
+}
+
 // `mbun test [file|dir|filter]...`: discover the test files, run each through
 // mbun.jsc.test_runner, and print a bun-style per-file report + aggregate
 // summary. Returns the process exit code (0 all pass, 1 any fail / load error).
@@ -922,6 +1038,12 @@ int run_test(std::span<const std::string_view> args) {
         flags.testNamePattern ? std::optional<std::string_view> { *flags.testNamePattern }
                               : std::nullopt };
 
+    // Only "junit" exists; any other --reporter value leaves the outfile alone
+    // rather than writing a document in a format nobody asked for.
+    const bool wantJUnit { flags.reporterOutfile.has_value() &&
+                           (!flags.reporter || *flags.reporter == "junit") };
+    std::vector<JUnitSuite> junitSuites {};
+
     for (const auto& f : files) {
         const std::string path { f.string() };
         // The file header is titled with the path RELATIVE to the top level dir,
@@ -937,7 +1059,16 @@ int run_test(std::span<const std::string_view> args) {
             std::println(std::cerr, "{}:\n  error: {}\n", title, r.error);
             fail += 1;
             errors += 1;
+            if (wantJUnit) {
+                junitSuites.push_back(JUnitSuite { title, { JUnitCase { title, 'f', r.error } }, 0.0 });
+            }
             continue;
+        }
+
+        // The JUnit document reports the WHOLE run, so it reads the unfiltered
+        // body — --only-failures is a console-reporter setting.
+        if (wantJUnit) {
+            junitSuites.push_back(JUnitSuite { title, junit_cases_from_body(r.body), 0.0 });
         }
 
         // --only-failures hides everything but the failures (ref: Arguments.rs:601,
@@ -972,6 +1103,10 @@ int run_test(std::span<const std::string_view> args) {
     const auto elapsed { std::chrono::duration<double, std::milli>(
                              std::chrono::steady_clock::now() - started)
                              .count() };
+
+    if (wantJUnit) {
+        write_junit_report(std::filesystem::path { *flags.reporterOutfile }, junitSuites, elapsed);
+    }
 
     // Summary block, in bun's order (ref: test_command.rs:2805-2896): the seed
     // line, then pass / skip / todo / fail / errors / expect() calls, then

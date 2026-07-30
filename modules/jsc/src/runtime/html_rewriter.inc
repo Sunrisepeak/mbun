@@ -577,8 +577,24 @@ hr::Directive call_js_handler(TransformCtx& tc, JSObjectRef fn, JSClassRef cls, 
     // A handler returning a Promise cannot be awaited on the synchronous
     // transform path — bun treats this as an error (the pending handler poisons
     // the stream). Surface it as a thrown error so transform() rejects/throws.
-    if (!exc && is_thenable(ctx, rv))
-        exc = make_error(ctx, "HTMLRewriter: async handlers are not supported on this transform path");
+    if (!exc && is_thenable(ctx, rv)) {
+        // An `async` handler that throws before its first `await` has ALREADY
+        // rejected by the time the call returns, and bun surfaces THAT error
+        // rather than a generic "no async here" (regression/issue/19219 asserts
+        // `transform()` throws "Async handler error"). Read the settled state
+        // directly — `.then` would both need a microtask turn and mark the
+        // rejection handled. mbun_as_promise/status/result come from
+        // core_bindings.inc, included ahead of this file in runtime.cppm.
+        JSC::JSGlobalObject* g{::toJS(ctx)};
+        JSC::JSPromise* p{g != nullptr ? mbun_as_promise(toJS(g, rv)) : nullptr};
+        if (p != nullptr && p->status() == JSC::JSPromise::Status::Rejected) {
+            p->markAsHandled();  // the reason is being rethrown; not an unhandled rejection
+            exc = toRef(g, p->result());
+        } else {
+            exc = make_error(
+                ctx, "HTMLRewriter: async handlers are not supported on this transform path");
+        }
+    }
     JSObjectSetPrivate(wrapper, nullptr);  // invalidate; handle dies with the callback
     ++(*tc.epoch);                          // detach any leaked attribute iterators
     if (exc) {

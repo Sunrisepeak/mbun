@@ -359,6 +359,13 @@ struct TestFlags {
     // (rather than appends to) bunfig's [test].pathIgnorePatterns.
     std::optional<std::vector<std::string>> pathIgnorePatterns {};
 
+    // `--reporter <STR>` / `--reporter-outfile <STR>`: bun's only reporter here is
+    // "junit", and it is written to the outfile IN ADDITION to the normal console
+    // report — never instead of it (ref: bun test_command.rs, which installs the
+    // JUnit reporter alongside the CLI one). Without an outfile the flag is inert.
+    std::optional<std::string> reporter {};
+    std::optional<std::string> reporterOutfile {};
+
     // ─── JSX ────────────────────────────────────────────────────────────────
     // Not TEST_ONLY_PARAMS: these live in bun's TRANSPILER_PARAMS_, which `test`
     // shares with `run`/`build` (ref Arguments.rs:174-176 for the table entries,
@@ -468,6 +475,10 @@ TestFlags parse_test(std::span<const std::string_view> args) {
             } else if (name == "-t" || name == "--test-name-pattern" || name == "--grep") {
                 // Capture the label filter (last one wins, matching bun's option()).
                 out.testNamePattern = std::string { value };
+            } else if (name == "--reporter") {
+                out.reporter = std::string { value };
+            } else if (name == "--reporter-outfile") {
+                out.reporterOutfile = std::string { value };
             } else if (name == "--path-ignore-patterns") {
                 if (!out.pathIgnorePatterns) out.pathIgnorePatterns.emplace();
                 out.pathIgnorePatterns->emplace_back(value);
