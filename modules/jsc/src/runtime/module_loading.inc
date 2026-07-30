@@ -852,6 +852,34 @@
         // internal/bootstrap/realm.js declares its own `internalBinding`, so the
         // same rename guard the other params use applies here too.
         const bool nodeInternal{is_node_internal_module_(spec, path)};
+        // MBUN_DEBUG_INTERNAL_MODULES=1 names every `internal/…` that fell
+        // through to node's OWN vendored lib file instead of resolving to an
+        // mbun builtin.
+        //
+        // This fallback is load-bearing (node's lib modules require each other
+        // through these specifiers), but it is also a standing compatibility
+        // HAZARD and it is completely silent. node's copy runs as a second,
+        // independent implementation: every `Symbol('x')` it mints is a
+        // different symbol from mbun's, and every module-level cache it builds
+        // is a second cache. The result reads as a behavioural gap with no
+        // pointer to its cause — it has already cost two files in http (a fresh
+        // `Symbol('kOutHeaders')` an OutgoingMessage had never heard of) and was
+        // load-bearing for three in worker.
+        //
+        // Measured on w62: node ships 297 internal/* modules; 5 are registered
+        // mbun builtins, 292 take this path. The fix is per module — register an
+        // mbun builtin for `internal/X` wherever mbun implements X natively —
+        // so what a lane needs is to SEE which ones its subsystem is loading.
+        if (nodeInternal) {
+            static const bool trace{[] {
+                const char* v{std::getenv("MBUN_DEBUG_INTERNAL_MODULES")};
+                return v != nullptr && v[0] != '\0' && std::string_view{v} != "0";
+            }()};
+            if (trace) {
+                std::cerr << "[mbun] internal-module fallback: require(" << spec << ") -> " << path
+                          << " (node's own copy; not an mbun builtin)\n";
+            }
+        }
         const char* pprim{declares("primordials") ? "__mbun_pprimordials" : "primordials"};
         const char* pbind{declares("internalBinding") ? "__mbun_pinternalBinding"
                                                      : "internalBinding"};
