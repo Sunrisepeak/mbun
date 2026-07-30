@@ -192,6 +192,58 @@ the run would score the previous binary.
   unless `--install` is passed (bootstrapping through `mbun install` does not
   currently finish for the framework demos).
 
+## The strategy loop
+
+Coverage work is driven by a loop, not by judgement calls that live in one
+session's head. Four artifacts, each with a self-test:
+
+| artifact | role |
+| --- | --- |
+| `wave_planner.py` | reads corpus state + ledger + struck registry + live resources, emits ranked lane assignments with a goal each |
+| `lane_ledger.tsv` | one row per lane, appended only when the result is **integrator-verified**; the throughput model's only input |
+| `struck.tsv` | areas/targets already retired, with the measured cost that retired them |
+| `check_struck.py` | run before dispatching a lane; exits 3 on a hit |
+
+```bash
+# where does 100% actually stand, and what blocks the rest?
+python3 tools/integration/wave_planner.py --coverage \
+  --node-run target/integration/<node-run> --bun-run target/integration/<bun-run>
+
+# what do past lanes say a lane can deliver per hour?
+python3 tools/integration/wave_planner.py --throughput
+
+# plan the next wave (refuses if the box cannot afford it)
+python3 tools/integration/wave_planner.py --plan 5 \
+  --node-run target/integration/<node-run> --bun-run target/integration/<bun-run>
+
+# before dispatching each assignment
+python3 tools/integration/check_struck.py <area terms>
+```
+
+Three properties worth knowing, because each exists in response to something
+that actually went wrong:
+
+- **Goals come from measured throughput, not a constant.** Observed rates spanned
+  25x across two waves (1.4 to 15.0 files/hour), so a flat `+6` was simultaneously
+  trivial for one area and unreachable for another.
+- **`--coverage` separates *actionable* failures from *no-verdict* ones**
+  (timeout / oom / self-skip / environment-blocked) and from struck areas, then
+  states the ceiling if every actionable file landed. Folding timeouts into
+  "fixable" is how a subsystem's density gets overstated.
+- **The resource guard refuses rather than overcommits.** The disk has hit 100%
+  twice, and measuring next to four other lanes turned 113 real failures into 366
+  phantom ones — so a plan reports its disk/memory/cpu budget, caps at 5 lanes,
+  and exits non-zero with the remedy named when it cannot afford the wave.
+
+Two measurement rules the planner prints into every plan, both learned the hard
+way and both cheap to follow:
+
+1. **A BEFORE must correspond to your own branch point** — a frozen run directory
+   whose tree you know, or a build of your own parent commit. Never rebuild to
+   manufacture a baseline; that was the single largest time sink measured.
+2. **A parallel run is a screen, never a verdict.** Re-run any file whose state
+   decides a number serially (`--jobs 1`) before believing it.
+
 ## Self-tests
 
 Every tool has a self-test under `tests/`; run them after touching a runner:
@@ -207,6 +259,9 @@ bash tools/integration/tests/test_build_lock.sh
 bash tools/integration/tests/test_check_conflict_markers.sh
 bash tools/integration/tests/test_reclaim_disk.sh
 bash tools/integration/tests/test_latency_probe.sh
+bash tools/integration/tests/test_wave_planner.sh
+bash tools/integration/tests/test_check_struck.sh
+bash tools/integration/tests/test_tick_order_gate.sh
 bash benchmarks/tools/test-bench3.sh
 ```
 
