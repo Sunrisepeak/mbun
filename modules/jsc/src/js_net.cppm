@@ -1607,7 +1607,8 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       // resolves via the proxy) without tripping the trap. Socket never
       // overrides `emit`, so this is identical for an ordinary socket.
       const emitOn = (...a) => EE.prototype.emit.apply(this, a);
-      if (err) emitOn("error", err);
+      // NB: 'error' is NOT emitted here any more -- it is deferred together with
+      // 'close' below, per node's emitErrorCloseNT. See that block.
       // end() was called but the queue never drained far enough for _flush to
       // publish 'finish' (a destroy landed first). end(cb) settles on 'finish',
       // so emitting it here is what keeps that callback from being dropped
@@ -1630,7 +1631,27 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       // test-http2-respond-with-file-connection-abort, which deliberately
       // routes `net.Socket.prototype.destroy.call(client.socket)` through that
       // proxy. Identical for ordinary sockets, which never override `emit`.
-      if (!this._closeEmitted) { this._closeEmitted = true; G.queueMicrotask(() => emitOn("close", !!err)); }
+      // node's stream destroy(err) NEVER emits 'error' in the caller's turn:
+      // _destroy defers emitErrorCloseNT, which emits 'error' and only THEN
+      // 'close'. Emitting inline makes the extremely common
+      // `sock.destroy(err); sock.once("error", ...)` shape -- ws'
+      // abortHandshake does exactly that -- an uncaught exception instead of
+      // an observed event. Both are queued from the same callback so the
+      // error-before-close order cannot be reordered by the two queues.
+      // ref: node lib/internal/streams/destroy.js emitErrorCloseNT.
+      // Emission goes through emitOn (EE.prototype) rather than a `this.emit`
+      // property READ -- see the note at its definition: http2's session-socket
+      // Proxy throws on reading `emit`, and test-http2-respond-with-file-
+      // connection-abort destroys exactly that object on purpose.
+      if (!this._closeEmitted) {
+        this._closeEmitted = true;
+        const emitErrClose = () => {
+          if (err) emitOn("error", err);
+          emitOn("close", !!err);
+        };
+        if (err && G.process && typeof G.process.nextTick === "function") G.process.nextTick(emitErrClose);
+        else G.queueMicrotask(emitErrClose);
+      }
       return this;
     }
     // node lib/net.js Socket.prototype.destroySoon: end() first, then destroy on
