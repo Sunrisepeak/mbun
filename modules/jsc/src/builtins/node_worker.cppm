@@ -945,13 +945,26 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
   // inspect has exhausted its depth budget (test-broadcastchannel-custom-inspect).
   Object.defineProperty(BroadcastChannel.prototype, INSPECT_SYM, {
     configurable: true,
-    value: function (depth) {
+    value: function (depth, options, inspect) {
       if (!(this instanceof BroadcastChannel)) {
         const e = new TypeError("Value of \"this\" must be of type BroadcastChannel");
         e.code = "ERR_INVALID_THIS";
         throw e;
       }
       if (typeof depth === "number" && depth < 0) return "BroadcastChannel";
+      // node lib/internal/worker/io.js formats the {name, active} pair through
+      // inspect ITSELF with the caller's options (depth decremented), so
+      // `util.inspect(bc, { compact: true, breakLength: 2 })` wraps like any
+      // other object. Hand-rolling the string ignored every user option.
+      const fmt = typeof inspect === "function"
+        ? inspect
+        : (() => { const u = M["util"] || M["node:util"]; return u && u.inspect; })();
+      const body = { name: this.name, active: this._closed !== true };
+      if (typeof fmt === "function") {
+        const opts = Object.assign({}, options);
+        if (opts.depth !== null && typeof opts.depth === "number") opts.depth = opts.depth - 1;
+        try { return "BroadcastChannel " + fmt(body, opts); } catch (e) {}
+      }
       const name = String(this.name)
         .replace(/\\/g, "\\\\")
         .replace(/'/g, "\\'")
