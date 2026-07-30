@@ -869,6 +869,7 @@
         set_fn(ctx_, pn, "close", proc_close_cb);
         set_fn(ctx_, pn, "wait", proc_wait_cb);
         set_fn(ctx_, pn, "kill", proc_kill_cb);
+        set_fn(ctx_, pn, "killErrno", proc_kill_errno_cb);
 #if !defined(_WIN32)
         set_fn(ctx_, pn, "signalWatch", proc_signal_watch_cb);
         set_fn(ctx_, pn, "signalDrain", proc_signal_drain_cb);
@@ -876,6 +877,9 @@
         set_fn(ctx_, pn, "spawnSyncB64", proc_spawn_sync_b64_cb);
 #if !defined(_WIN32)
         set_fn(ctx_, pn, "spawnEx", proc_spawn_ex_cb);
+        // process.execve's syscall half (JS validation lives in
+        // builtins/node_process_extra.cppm).
+        set_fn(ctx_, pn, "execve", proc_execve_cb);
         set_fn(ctx_, pn, "spawnPty", proc_spawn_pty_cb);
         set_fn(ctx_, pn, "ptyResize", proc_pty_resize_cb);
         set_fn(ctx_, pn, "poll", proc_poll_cb);
@@ -968,11 +972,48 @@
     credentialError(PN.initgroups(user, extraGroup));
   };
   // process.kill(pid, signal) — real signal delivery (default SIGTERM).
-  const SIGMAP = { SIGHUP:1, SIGINT:2, SIGQUIT:3, SIGILL:4, SIGTRAP:5, SIGABRT:6, SIGBUS:7, SIGFPE:8, SIGKILL:9, SIGUSR1:10, SIGSEGV:11, SIGUSR2:12, SIGPIPE:13, SIGALRM:14, SIGTERM:15, SIGCHLD:17, SIGCONT:18, SIGSTOP:19, SIGTSTP:20 };
-  p.kill = function (pid, sig) {
-    const s = sig == null ? 15 : (typeof sig === "number" ? sig : (SIGMAP[sig] != null ? SIGMAP[sig] : 15));
-    const ok = PN.kill(pid | 0, s);
-    if (!ok) { const e = new Error("kill ESRCH"); e.code = "ESRCH"; e.errno = -3; e.syscall = "kill"; throw e; }
+  const SIGMAP = { SIGHUP:1, SIGINT:2, SIGQUIT:3, SIGILL:4, SIGTRAP:5, SIGABRT:6, SIGBUS:7, SIGFPE:8, SIGKILL:9, SIGUSR1:10, SIGSEGV:11, SIGUSR2:12, SIGPIPE:13, SIGALRM:14, SIGTERM:15, SIGSTKFLT:16, SIGCHLD:17, SIGCONT:18, SIGSTOP:19, SIGTSTP:20, SIGTTIN:21, SIGTTOU:22, SIGURG:23, SIGXCPU:24, SIGXFSZ:25, SIGVTALRM:26, SIGPROF:27, SIGWINCH:28, SIGIO:29, SIGPOLL:29, SIGPWR:30, SIGSYS:31 };
+  // node lib/internal/process/per_thread.js kill(): validate the pid, resolve a
+  // signal NAME through the table, then hand off to process._kill.
+  //
+  // _kill is a SEAM, not an alias, and node keeps it that way on purpose — its
+  // own comment says "we have to use process._kill here because it's
+  // monkey-patched by tests". test-process-kill-pid replaces _kill to observe the
+  // (pid, signum) pair WITHOUT delivering anything. mbun had the seam inverted
+  // (`_kill` forwarded to `kill`, in builtins/node_process_extra.cppm), so the
+  // patch was bypassed and every case in that file delivered a real signal; an
+  // unrecognised name silently became SIGTERM, so `process.kill(0, 'test')` sent
+  // SIGTERM to this process's entire group and the file hung until the harness
+  // killed it.
+  const KILL_ERRNAME = { 1: "EPERM", 3: "ESRCH", 22: "EINVAL" };
+  p._kill = function _kill(pid, sig) { return PN.killErrno(pid | 0, sig | 0); };
+  p.kill = function kill(pid, sig) {
+    let err;
+    // node's own loose comparison: '0' and String(process.pid) are accepted and
+    // reach _kill UNCOAERCED, while 'SIGTERM'/null/undefined/NaN/±Infinity throw.
+    // eslint-disable-next-line eqeqeq
+    if (pid != (pid | 0)) {
+      const NE = globalThis.__mbunNodeErrors;
+      if (NE) throw NE.ERR_INVALID_ARG_TYPE("pid", "number", pid);
+      const e = new TypeError('The "pid" argument must be of type number.');
+      e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+    }
+    if (sig === (sig | 0)) {
+      err = p._kill(pid, sig);
+    } else {
+      sig = sig || "SIGTERM";
+      if (SIGMAP[sig] != null) {
+        err = p._kill(pid, SIGMAP[sig]);
+      } else {
+        const e = new TypeError("Unknown signal: " + sig);
+        e.code = "ERR_UNKNOWN_SIGNAL"; throw e;
+      }
+    }
+    if (err) {
+      const code = KILL_ERRNAME[-err] || ("Unknown system error " + -err);
+      const e = new Error("kill " + code);
+      e.errno = err; e.code = code; e.syscall = "kill"; throw e;
+    }
     return true;
   };
 
