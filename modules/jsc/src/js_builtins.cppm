@@ -51,7 +51,6 @@ export import :node_net;
 export import :node_fs_watch;
 export import :node_fs_streams;
 export import :bun_password;
-export import :bun_fs_router;
 export import :node_process_extra;
 export import :node_process_lifecycle;
 export import :node_util_extra;
