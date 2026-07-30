@@ -1612,6 +1612,14 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
       };
 
       const startParser = () => {
+        // llhttp's on_message_begin is where headersTimeout/requestTimeout start
+        // counting, and arming a parser IS that point. Only the socket 'data'
+        // path did this, so a PIPELINED message whose bytes were already buffered
+        // when the previous response finished got re-armed with the connection
+        // still flagged idle -- and setupConnectionsTracking's sweeper skips idle
+        // connections, so an incomplete pipelined head never expired into a 408
+        // (test-http-server-{headers,request}-timeout-pipelining).
+        if (sock._httpMsgIdle) { sock._httpMsgIdle = false; sock._httpMsgStart = Date.now(); }
         const parser = new HttpParser(false);
         if (typeof srv.maxHeadersCount === "number" && srv.maxHeadersCount > 0) {
           parser.maxHeaderPairs = srv.maxHeadersCount << 1;
@@ -1790,7 +1798,17 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
             // The connection is free again: restart both timeout clocks.
             sock._httpMsgStart = Date.now();
             sock._httpHeadersDone = false;
-            sock._httpMsgIdle = true;
+            // ...but it is only IDLE if nothing is waiting to be parsed. node
+            // keeps one parser per connection, so a pipelined request whose bytes
+            // arrived while the previous response was still in flight has already
+            // begun (on_message_begin) by the time that response finishes.
+            // Flagging the connection idle here made the sweeper skip it, and an
+            // incomplete pipelined head then sat forever instead of expiring into
+            // a 408 (test-http-server-{headers,request}-timeout-pipelining).
+            const armed = sock._httpParser;
+            const armedPending = (armed && !armed.done && armed.buf)
+              ? (armed.buf.length - armed.off) : 0;
+            sock._httpMsgIdle = (carryBytes() + armedPending) === 0;
             // Idle keep-alive connection: arm the advertised keep-alive timeout
             // (plus node's buffer) so it cannot pin the loop forever.
             if (srv.keepAliveTimeout > 0 && typeof sock.setTimeout === "function") {
