@@ -304,6 +304,7 @@ inline constexpr std::string_view kZlibStreamJS = R"JS(
     this._zEnded = false;
     this._zErrored = false;
     this._zWritePending = false;
+    this._zPendingReset = false;
     this._defaultFullFlushFlag = defaultFullFlush(cfg.kind);
     this._h = this._zOpen();
     // Optional inflate dictionary (node `dictionary` option).
@@ -424,6 +425,10 @@ inline constexpr std::string_view kZlibStreamJS = R"JS(
     G.process.nextTick(function () {
       const err = self._zRun(bytes, flushMode);
       self._zWritePending = false;
+      if (self._zPendingReset) {
+        self._zPendingReset = false;
+        if (self._handle) self._handle.reset();
+      }
       cb(err);
     });
   };
@@ -509,9 +514,17 @@ inline constexpr std::string_view kZlibStreamJS = R"JS(
     return this;
   };
 
-  // node lib/zlib.js ZlibBase.reset: asserts the handle is live, then resets it.
+  // node lib/zlib.js ZlibBase.reset asserts the handle is live and resets it.
+  // The LOW-LEVEL `_handle.reset()` refuses to run while a write is in flight
+  // (node's ZlibStream::Reset checks write_in_progress_), but the PUBLIC reset()
+  // must not throw for that reason: bun defers it until the in-flight write
+  // finishes, and its zlib-reset-race regression test asserts a clean exit for
+  // exactly this pattern. Deferring satisfies both — the race the check exists to
+  // prevent is still impossible, because the codec is only touched once the
+  // write has completed.
   proto.reset = function () {
     if (!this._handle) throw new Error("zlib binding closed");
+    if (this._zWritePending) { this._zPendingReset = true; return this; }
     this._handle.reset();
     return this;
   };
