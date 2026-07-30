@@ -120,17 +120,17 @@ Source-snapshot measurements against the upstream corpora pinned as submodules u
 
 | Target | Result | Rate |
 | --- | ---: | ---: |
-| Node.js native tests (`compat/node/test/parallel`) | 3,076 / 4,433 files pass (direct execution) | 69.4% |
-| Node.js native tests, excluding files that skip themselves | 3,076 / 3,880 files pass | 79.3% |
+| Node.js native tests (`compat/node/test/parallel`) | 3,080 / 4,433 files pass (direct execution) | 69.5% |
+| Node.js native tests, excluding files that skip themselves | 3,080 / 3,880 files pass | 79.4% |
 | Bun native full corpus (`compat/bun/test`) | 944 / 1,902 files fully green | 49.6% |
-| Both corpora combined | 4,020 / 6,335 files | 63.5% |
+| Both corpora combined | 4,024 / 6,335 files | 63.5% |
 | Elysia test suite | 1,522 pass / 3 fail | 99.8% |
 
 File-level "green" means every executed test in the file passed and the file reported no error outside a test; it is stricter than an API checklist and lower than test-level pass rates. Files that declare no runnable test, files whose every test is skipped, and files needing a service this environment lacks (MySQL, Redis, the npm registry) are separate buckets and never count as passes. Node.js files run directly through mbun (exit 0 = pass) without Node's own harness services, so that figure is honest file-level coverage, not API completion.
 
 **The measurement scopes are explicit.** The baseline under both rows is a single full run over every file, on one frozen copy of the binary, so the two corpora are same-commit comparable to each other. Numbers move off that baseline only by increments that were re-measured per file: a change is gated against the subset of the corpus it can reach, every file the gate reports as newly passing is then re-run **serially** on the same frozen binary, and only files green under that serial re-run are added. The parallel gate is a screen, never a verdict — the same binary has been measured passing a file idle and failing it under load, so a concurrent result alone is not evidence. Each round is gated at zero green-file regressions, verified per file rather than by bucket totals.
 
-The current figures are the 2026-07-30 full run (3,065 node / 934 bun) plus wave 62: **+11 node and +10 bun, each confirmed by a serial re-run, with 0 regressions** across a 568-file node gate and a 169-file bun gate. Carrying increments forward this way is deliberate — a full 6,335-file re-run costs more than the campaign's entire per-round measurement budget and is what produces the load noise that fakes regressions. The trade-off is that a regression outside every gate would go unseen until the next full run; that risk is why the gates are built from the changed symbols rather than from the touched subtree. Cases requiring an unavailable external service remain blocked rather than counted as passes.
+The current figures are the 2026-07-30 full run (3,065 node / 934 bun) plus wave 62: **+15 node and +10 bun, each confirmed by a serial re-run, with 0 regressions** across a 1,032-file node gate and a 254-file bun gate. The bun half of that gate was additionally diffed on per-file assertion counts, not just green-file counts — a shared-surface change can leave every file's bucket unchanged while moving assertions underneath it. Carrying increments forward this way is deliberate — a full 6,335-file re-run costs more than the campaign's entire per-round measurement budget and is what produces the load noise that fakes regressions. The trade-off is that a regression outside every gate would go unseen until the next full run; that risk is why the gates are built from the changed symbols rather than from the touched subtree. Cases requiring an unavailable external service remain blocked rather than counted as passes.
 
 **What stands between these figures and 100%, counted rather than estimated.** 553 Node files decline to run themselves, and the reasons are not interchangeable:
 

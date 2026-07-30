@@ -657,6 +657,28 @@ delta files after the nextTick change (all green serially, one of them failing
 each measuring at `--jobs 3-4` degrade each other's readings, and the fix is serial
 confirmation of the deciding files, not fewer lanes.
 
+### The second measurement trap: a file-count guard cannot see an assertion regression
+
+Serial re-confirmation fixes *noise*. It does not fix a guard that is reading the
+wrong quantity. Wave 62's crypto lane shipped a digest-name check that rejected
+`createSign('sha256WithRSAEncryption')` and took bun's
+`js/node/crypto/crypto.test.ts` from **368 passed / 1 failed to 363 / 6**. The
+file's **classification did not move** — it was not green before and it was not
+green after — so a guard comparing green-file counts reported a clean run, twice,
+on a real regression. Only the per-file assertion counts showed it. (The lane
+caught it itself and fixed it by stripping the `...With<KeyAlg>` tail; the
+`passed`/`failed` columns were back to base exactly before it submitted.)
+
+**So: when a change touches a surface shared with the other corpus, diff the
+`passed`/`failed` columns of the bun runner's `results.tsv`, not just
+`classification`.** The columns are there (bun's schema is 9 wide: `path,
+exit_code, passed, failed, expects, ran, classification, duration_ms, log` —
+classification is column **7**, not 3). A not-yet-green file still carries a
+meaningful assertion count, and that count is the only signal that a shared fix
+is quietly costing ground in a file too far from green to change buckets. This
+matters most for `crypto`, `http`, `stream`, `url` and `webcrypto`, where one
+JS/native layer backs both corpora.
+
 ### Handoffs left by lane J, both actionable
 
 - **`fetch-file-upload`, root-caused not fixed.** `Response.formData()` on a
