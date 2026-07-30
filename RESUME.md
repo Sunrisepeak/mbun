@@ -5,6 +5,57 @@ session that is interrupted (usage limit, crash, restart) can pick up from the
 file rather than from memory. **If you are a fresh session reading this, start
 here.**
 
+## 2026-07-31 06:00 — CI IS RED, AND IT IS NOT THIS PR. Do not chase it in the source.
+
+PR #35 cannot merge on "CI green" because **the base branch `rewrite_bun_in_mcpp`
+is itself red** (last run 2026-07-29: gcc failed, llvm passed). Both toolchains on
+the PR fail identically:
+
+```
+ninja: error: '<cache>/pkg/compat/compat.zstd@1.5.7/<hash>/obj/compat_zstd/
+               zstd-1.5.7/lib/common/xxhash.o', needed by 'obj/compat_zstd/...',
+               missing and no known rule to make it
+```
+
+**Root cause: `compat.zstd@1.5.7` emits TWO DIFFERENT OBJECT LAYOUTS depending on
+its config hash.** Both exist on this machine right now:
+
+```
+~/.mcpp/bmi/d8aa3e912a66ce6f/deps/compat/compat.zstd@1.5.7/obj/compat_zstd/zstd-1.5.7/lib/common/xxhash.o   nested
+~/.mcpp/bmi/9cde0150ebd03c93/deps/compat/compat.zstd@1.5.7/obj/xxhash.o                                      flat
+```
+
+The consuming build's ninja dep graph is generated against the **nested** layout;
+a fresh build in CI produces the **flat** one, so the object it asks for does not
+exist and ninja has no rule to make it.
+
+**Why nobody noticed, and why I nearly mis-diagnosed it three times:**
+
+1. **It is invisible with a warm cache.** Every local machine has the nested layout
+   cached, so `mcpp build` is green. My local build passed all session.
+2. **My local gate was WEAKER than CI.** `mcpp build` at the root never builds
+   `modules/compress`, so the zstd path was never exercised locally at all — there
+   was no `compat.zstd` package build on this box until I asked for one explicitly.
+   A green local build was not evidence about CI.
+3. **The timing framed an innocent commit.** CI was green through 08:14 and red
+   from 08:30, which points straight at `d50c0ff` (the nextTick cure, 08:16). That
+   commit cannot affect a third-party C package. Timing correlation is not cause.
+4. **My first hypothesis — a poisoned CI cache — was wrong.** I deleted all four
+   cache entries and re-ran cold; it failed identically. Deleting them was still
+   correct (they were stale), but it did not fix anything, and I should record that
+   the hypothesis was disproved rather than let the action imply it was right.
+
+**What NOT to do:** do not bisect the source, do not revert lane commits, do not
+touch `modules/compress`. The mbun source is not involved.
+
+**The actual fix is upstream/toolchain:** either the `compat.zstd` package must emit
+a stable object layout, or the consumer's dep-graph generation must match whichever
+layout the package produces. Whoever owns the mcpp registry package owns this.
+
+**A guardrail gap this exposes, worth closing regardless:** the local gate should
+build what CI builds. `mcpp build` alone is not equivalent to the CI matrix, and
+this session ran ~15 waves of integration on that weaker signal without noticing.
+
 ## 2026-07-31 04:00 — The inspector IS a stub. Detection-gap vs capability-project, now MEASURED.
 
 The distinction that shaped the last two waves was a prediction; it is now a
