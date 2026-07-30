@@ -33,3 +33,8 @@ wave	lane	corpus	area	shape	goal	delivered	minutes	regressions	note
 57	H	node	test-zlib+whatwg	port	6	15	60	0	best throughput of campaign; blocker was a STALE COMMENT, not a missing feature
 57	I	bun	regression/issue	fix	12	13	160	0	failures bimodal with no middle; sort by assertion ratio found the cheap half
 57	J	bun	js/bun/http+net+websocket	fix	8	5	115	0	biggest lever was Bun.spawn ipc, not http; found the load-noise trap
+58	K	node	test-http	port	27	17	98	0	shadow HTTPParser worth 6 files, proven in 20min with ZERO builds; two past-tense comments claiming it fixed were false; audit corrected my brief (node_http is near-verbatim node)
+58	O	node	test-net	port	19	19	75	0	function-by-function port; DISPROVED two of my premises (node_net.cppm is not the impl; Socket does not inherit Duplex so shadowing was inapplicable)
+58	L	node	test-async	port	23	10	290	0	full port of node async_hooks; first submission failed the perf gate (.then 5.6-8x), resubmitted at parity by gating trackPromise on enabled hooks
+58	N	bun	js/node	port	11	8	350	0	ALS await propagation via m_asyncContextData; found Bun.gc was a no-op and JSGarbageCollect only hints
+58	M	bun	js/bun	fix	11	6	240	0	csrf/router modules exist and are unwired; differential harness gave a regression verdict before the first build
