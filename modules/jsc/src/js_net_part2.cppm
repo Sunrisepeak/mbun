@@ -2378,6 +2378,14 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
       }
 
       const parser = new HttpParser(true);
+      // `--max-http-header-size` (16 KiB) is the SERVER/request-side knob; bun
+      // says so in as many words and refuses to reuse it here because it
+      // rejects legitimate responses with large Location/Set-Cookie headers.
+      // The fetch client bounds its response head with a generous fixed cap
+      // instead. node:http's own client keeps the node knob (it is asserted by
+      // test-http-max-header-size.js).
+      // PORT-SOURCE: compat/bun/src/http/lib.rs MAX_RESPONSE_HEADER_BUFFER (:3728)
+      parser.maxHeaderSize = 1024 * 1024;
       parser.reqMethod = method;
       const chunks = [];
       const bodyPr = Promise.withResolvers();
