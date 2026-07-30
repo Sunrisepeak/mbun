@@ -192,6 +192,41 @@ the run would score the previous binary.
   unless `--install` is passed (bootstrapping through `mbun install` does not
   currently finish for the framework demos).
 
+## Gating a change: use the impact gate, not a full corpus run
+
+`impact_gate.py` derives the corpus files a change can actually reach, from the
+diff, and writes a `--files` list for the runners:
+
+```bash
+python3 tools/integration/impact_gate.py --rev-range HEAD~1..HEAD \
+  --node-run <a node run dir> --bun-run <a bun run dir> \
+  --out /tmp/impact-node.txt --bun-out /tmp/impact-bun.txt
+python3 tools/integration/node_corpus_runner.py --bin auto --files /tmp/impact-node.txt ...
+```
+
+Measured on a real change: **62 node + 58 bun files instead of 6,335** — a 50x
+reduction that still supersets the set built by hand for the same commit. It
+reports which symbols it dropped and why (`open(617)`, `ERR_INVALID_ARG_TYPE(470)`
+appear in too much of the corpus to discriminate).
+
+Two reasons this beats a full run, not just ties it:
+
+- **Cost.** One session spent 19,084 file-executions against a 6,335-file corpus —
+  the whole thing re-run three times — and over half of that was full runs
+  re-confirming what per-file diffs already showed.
+- **Accuracy.** Running 1000+ files concurrently is what produces the load noise
+  that fakes regressions. Measured: 60 files passing idle and failing under load on
+  the *same* binary; a first baseline read 366 failures where the same binary idle
+  reads ~113.
+
+**A clean impact gate is a SCREEN, never a proof, and the tool says so on every
+run.** It finds files that *mention* a changed name; it cannot see coupling with no
+name in the diff. That limitation is real and pinned by the self-test: a genuine
+regression (`test-webstorage-without-sqlite`) sat outside a gate built from its own
+commit, because the coupling ran through `hasSQLite` and the deciding line was a
+comment. Use `--extra-symbol <name>` when you know the surface, and fall back to a
+full run when a change is behavioural (ordering, timing, GC) — saying why.
+
 ## The strategy loop
 
 Coverage work is driven by a loop, not by judgement calls that live in one
@@ -260,6 +295,7 @@ bash tools/integration/tests/test_check_conflict_markers.sh
 bash tools/integration/tests/test_reclaim_disk.sh
 bash tools/integration/tests/test_latency_probe.sh
 bash tools/integration/tests/test_wave_planner.sh
+bash tools/integration/tests/test_impact_gate.sh
 bash tools/integration/tests/test_check_struck.sh
 bash tools/integration/tests/test_tick_order_gate.sh
 bash benchmarks/tools/test-bench3.sh
