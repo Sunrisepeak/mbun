@@ -156,6 +156,15 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
       const isPriv = k.key.d != null;
       return { data: jwkToDer(k.key, isPriv), passphrase: undefined, dsaEncoding: k.dsaEncoding };
     }
+    // { key: <bare point/scalar>, format: "raw-*", asymmetricKeyType } — the
+    // same raw encodings createPrivateKey/createPublicKey accept. Without this
+    // branch the bare bytes went straight to the decoder and came back as
+    // "DECODER routines::unsupported".
+    if (typeof k === "object" && k !== null && RAW_FORMATS[k.format] && k.key != null) {
+      const kind = k.format === "raw-public" ? "public" : "private";
+      return { data: rawImport(kind, k), passphrase: undefined,
+        padding: k.padding, saltLength: k.saltLength, dsaEncoding: k.dsaEncoding, context: k.context };
+    }
     if (typeof k === "object" && ("key" in k || "pem" in k)) {
       const inner = resolveKey(k.key != null ? k.key : k.pem);
       const pass = k.passphrase != null ? (typeof k.passphrase === "string" ? k.passphrase : toBuf(k.passphrase).toString("latin1")) : inner.passphrase;
@@ -189,10 +198,24 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   // node lib/internal/crypto/cipher.js: options.oaepHash is validated as a
   // string before reaching the native EVP layer.
   const validateOaepHash = (r) => {
-    if (r.oaepHash !== undefined && typeof r.oaepHash !== "string") {
+    if (r.oaepHash === undefined) return;
+    if (typeof r.oaepHash !== "string") {
       const e = new TypeError('The "options.oaepHash" property must be of type string. Received ' +
         (r.oaepHash === null ? "null" : typeof r.oaepHash));
       e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+    }
+    // A name EVP_get_digestbyname() cannot resolve is EVP_R_INVALID_DIGEST (152)
+    // in node — `error:03000098:digital envelope routines::invalid digest`. The
+    // native bridge left OpenSSL's queue empty for it, so the JS layer saw only
+    // "encryption failed: operation failed" with no .code at all.
+    let known = true;
+    try { C.createHash(r.oaepHash); } catch (_) { known = false; }
+    if (!known) {
+      const e = new Error("error:03000098:digital envelope routines::invalid digest");
+      e.code = "ERR_OSSL_EVP_INVALID_DIGEST";
+      e.reason = "invalid digest";
+      e.library = "digital envelope routines";
+      throw e;
     }
   };
   // node cipher.js: oaepLabel is validated with getArrayBufferOrView when it is
@@ -256,6 +279,19 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
       e.code = "ERR_INVALID_ARG_VALUE"; throw e;
     }
   };
+  // node lib/internal/crypto/sig.js getIntOption(): `padding` and `saltLength`
+  // must survive a `>> 0` round trip, so anything that is not a 32-bit integer —
+  // null, a float, a string — is ERR_INVALID_ARG_VALUE before any key work. The
+  // sign/verify paths previously coerced these straight into the native call.
+  const validateIntOptions = (r) => {
+    for (const name of ["padding", "saltLength"]) {
+      const v = r[name];
+      if (v === undefined || v === (v >> 0)) continue;
+      const e = new TypeError("The property 'options." + name + "' is invalid. Received " +
+        (v === null ? "null" : typeof v === "string" ? "'" + v + "'" : String(v)));
+      e.code = "ERR_INVALID_ARG_VALUE"; throw e;
+    }
+  };
 
   // Context is an Ed448/ML-DSA signing option. The EVP bridge has no context
   // argument, but it must still reject it for every key type that does not
@@ -271,30 +307,55 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   };
 
   // ---- sign / verify (one-shot + streaming) ----
+  // node lib/internal/crypto/sig.js does NOT default the padding in JS: it hands
+  // the native layer `undefined` and lets the key decide, which is why signing
+  // with an rsa-pss key works without naming a padding. Forcing RSA_PKCS1_PADDING
+  // here made EVP_PKEY_CTX_set_rsa_padding fail on every rsa-pss key with
+  // "illegal or unsupported padding mode". 0 is the "unspecified" sentinel (the
+  // real RSA_*_PADDING values are 1..6) and the native side substitutes
+  // RSA_PKCS1_PSS_PADDING for an rsa-pss key, RSA_PKCS1_PADDING otherwise.
+  // Likewise getSaltLength() only defaults to RSA_PSS_SALTLEN_MAX_SIGN when the
+  // caller ASKED for PSS padding; otherwise the salt length is left unset so a
+  // parameter-restricted rsa-pss key keeps its own.
+  const SALTLEN_UNSET = -0x7fffffff;
+  const sigPadding = (r) => (r.padding != null ? r.padding : 0);
+  const sigSaltLen = (r) => {
+    if (r.saltLength != null) return r.saltLength;
+    return r.padding === RSA_PKCS1_PSS_PADDING ? RSA_PSS_SALTLEN_MAX_SIGN : SALTLEN_UNSET;
+  };
+  // node reports an unresolvable digest as "Invalid digest" from the JS layer
+  // before any EVP work; the native bridge said "Unknown digest: <name>", which
+  // no node error ever spells that way. An EMPTY name is legal (Ed25519/Ed448
+  // sign with no prehash).
+  const validateDigestName = (algo) => {
+    const name = digestName(algo);
+    if (name === "") return;
+    try { C.createHash(name); } catch (_) { throw new Error("Invalid digest: " + algo); }
+  };
   const doSign = (algo, data, key) => {
+    validateDigestName(algo);
     const r = resolveKey(key);
     validateDsaEncoding(r);
+    validateIntOptions(r);
     validateSignContext(r);
     try {
       return Buffer.from(AN.sign(digestName(algo), toBuf(data), keyData(r), r.passphrase,
-        r.padding != null ? r.padding : RSA_PKCS1_PADDING,
-        r.saltLength != null ? r.saltLength : RSA_PSS_SALTLEN_MAX_SIGN,
-        r.dsaEncoding || ""));
+        sigPadding(r), sigSaltLen(r), r.dsaEncoding || ""));
     } catch (e) { throw keyErr(e); }
   };
   const doVerify = (algo, data, key, sig) => {
     // Snapshot the data and signature bytes at call time (node reads them before
     // touching the key). A key object with a mutating `passphrase` getter must not
     // be able to change the signature bytes we verify against.
+    validateDigestName(algo);
     const dataBuf = Buffer.from(toBuf(data));
     const sigBuf = Buffer.from(toBuf(sig));
     const r = resolveKey(key);
     validateDsaEncoding(r);
+    validateIntOptions(r);
     try {
       return AN.verify(digestName(algo), dataBuf, keyData(r), r.passphrase, sigBuf,
-        r.padding != null ? r.padding : RSA_PKCS1_PADDING,
-        r.saltLength != null ? r.saltLength : RSA_PSS_SALTLEN_MAX_SIGN,
-        r.dsaEncoding || "");
+        sigPadding(r), sigSaltLen(r), r.dsaEncoding || "");
     } catch (e) { throw keyErr(e); }
   };
   C.sign = (algorithm, data, key, callback) => {
@@ -315,25 +376,66 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   // Sign / Verify stream objects (Writable-ish: update()/sign()/verify()).
   // node exposes these as constructors callable WITHOUT `new` (Sign('sha256')
   // returns a fresh instance) — function form + instanceof guard reproduces that.
+  // node lib/internal/crypto/sig.js: validateString(algorithm) in the Sign/Verify
+  // constructor, validateEncoding+isArrayBufferView on every update(), and
+  // ERR_CRYPTO_SIGN_KEY_REQUIRED for a falsy key. These were all silently
+  // coerced here, so the corpus saw "Missing expected exception" rather than the
+  // argument errors node raises before any OpenSSL work happens.
+  const sigAlgoArg = (algorithm) => {
+    if (typeof algorithm !== "string") {
+      const e = new TypeError('The "algorithm" argument must be of type string.' + " Received " + argRecv(algorithm));
+      e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+    }
+  };
+  const sigDataArg = (data) => {
+    if (typeof data !== "string" && !isView(data) && !(data instanceof ArrayBuffer)) {
+      const e = new TypeError('The "data" argument must be of type string or an instance of Buffer, TypedArray, or DataView.' + " Received " + argRecv(data));
+      e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+    }
+  };
+  // The key half of a sign()/verify() call: a string/view/ArrayBuffer, a
+  // KeyObject/CryptoKey, or an options object carrying one. A bare number,
+  // array or plain object is an argument-type error, not a decode failure.
+  const sigKeyArg = (key) => {
+    if (typeof key === "string" || isView(key) || key instanceof ArrayBuffer) return;
+    if (key !== null && typeof key === "object" && (isKO(key) || "key" in key || "pem" in key)) return;
+    const e = new TypeError('The "key" argument must be of type string or an instance of ' +
+      "ArrayBuffer, Buffer, TypedArray, DataView, KeyObject, or CryptoKey." + " Received " + argRecv(key));
+    e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+  };
   function Sign(algorithm) {
     if (!(this instanceof Sign)) return new Sign(algorithm);
+    sigAlgoArg(algorithm);
+    try { C.createHash(digestName(algorithm)); } catch (_) { throw new Error("Invalid digest: " + algorithm); }
     this._algo = algorithm; this._chunks = [];
   }
-  Sign.prototype.update = function (data, inputEnc) { this._chunks.push(toBuf(data, inputEnc)); return this; };
+  Sign.prototype.update = function (data, inputEnc) { sigDataArg(data); this._chunks.push(toBuf(data, inputEnc)); return this; };
   Sign.prototype.write = function (data, inputEnc) { this.update(data, inputEnc); return true; };
   Sign.prototype.end = function (data, inputEnc) { if (data != null) this.update(data, inputEnc); return this; };
   Sign.prototype.sign = function (key, outputEnc) {
+    if (!key) { const e = new Error("No key provided to sign"); e.code = "ERR_CRYPTO_SIGN_KEY_REQUIRED"; throw e; }
+    sigKeyArg(key);
     const out = doSign(this._algo, Buffer.concat(this._chunks), key);
-    return outputEnc ? out.toString(outputEnc) : out;
+    // node's `"buffer"` is the name of the NO-ENCODING encoding (it is what
+    // getDefaultEncoding() returns), so `.sign(key, 'buffer')` hands back the
+    // Buffer. Passing it to Buffer#toString threw ERR_UNKNOWN_ENCODING instead.
+    return (outputEnc && outputEnc !== "buffer") ? out.toString(outputEnc) : out;
   };
   function Verify(algorithm) {
     if (!(this instanceof Verify)) return new Verify(algorithm);
+    sigAlgoArg(algorithm);
+    try { C.createHash(digestName(algorithm)); } catch (_) { throw new Error("Invalid digest: " + algorithm); }
     this._algo = algorithm; this._chunks = [];
   }
-  Verify.prototype.update = function (data, inputEnc) { this._chunks.push(toBuf(data, inputEnc)); return this; };
+  Verify.prototype.update = function (data, inputEnc) { sigDataArg(data); this._chunks.push(toBuf(data, inputEnc)); return this; };
   Verify.prototype.write = function (data, inputEnc) { this.update(data, inputEnc); return true; };
   Verify.prototype.end = function (data, inputEnc) { if (data != null) this.update(data, inputEnc); return this; };
   Verify.prototype.verify = function (key, signature, sigEnc) {
+    sigKeyArg(key);
+    if (typeof signature !== "string" && !isView(signature) && !(signature instanceof ArrayBuffer)) {
+      const e = new TypeError('The "signature" argument must be an instance of ArrayBuffer, Buffer, TypedArray, or DataView. Received ' + argRecv(signature));
+      e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+    }
     const sig = typeof signature === "string" ? Buffer.from(signature, sigEnc || "hex") : toBuf(signature);
     return doVerify(this._algo, Buffer.concat(this._chunks), key, sig);
   };
@@ -1148,6 +1250,14 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
       const prefix = lib === "SSL" ? "" : "OSSL_";
       e.code = "ERR_" + prefix + (lib ? lib + "_" : "") +
         reason.toUpperCase().replaceAll(" ", "_");
+      // node's ThrowCryptoError uses the OpenSSL string VERBATIM as the message;
+      // our native layer prepends a call-site tag ("sign failed: ", "sign init
+      // failed: ", "decryption failed: ") that node never has. Once the error is
+      // recognisably an OpenSSL one, drop the tag — the corpus compares this
+      // message literally (`error:1C8000A5:Provider routines::illegal or
+      // unsupported padding mode`, `error:02000070:rsa routines::digest too big
+      // for rsa key`), and the tag was the whole difference.
+      if (hit[0] !== m) e.message = hit[0];
     }
     return e;
   };
@@ -1881,6 +1991,29 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   };
   const dhPrepare = (key, kind) => (isKO(key) ? koSlots.get(key)
     : koSlots.get(kind === "private" ? C.createPrivateKey(key) : C.createPublicKey(key)));
+  // node threads an option NAME into preparePublicOrPrivateKey/preparePrivateKey
+  // ('options.publicKey' / 'options.privateKey'), so a bad `format` or `type` on
+  // the nested descriptor is reported as ERR_INVALID_ARG_VALUE naming the exact
+  // property path (keys.js parseKeyFormat / parseKeyType). Without this the bogus
+  // descriptor reached the decoder and surfaced as ERR_OSSL_NO_START_LINE.
+  const DH_KEY_FORMATS = new Set(["pem", "der", "jwk", "raw-public", "raw-private", "raw-seed"]);
+  const dhCheckEncoding = (v, objName, isPublic) => {
+    if (v === null || typeof v !== "object" || isKO(v) || !("key" in v)) return;
+    if (v.format !== undefined && !DH_KEY_FORMATS.has(v.format)) {
+      const e = new TypeError("The property '" + objName + ".format' is invalid. Received " +
+        (typeof v.format === "string" ? "'" + v.format + "'" : String(v.format)));
+      e.code = "ERR_INVALID_ARG_VALUE"; throw e;
+    }
+    if (v.type !== undefined) {
+      const ok = isPublic ? (v.type === "spki" || v.type === "pkcs1")
+                          : (v.type === "pkcs8" || v.type === "pkcs1" || v.type === "sec1");
+      if (!ok) {
+        const e = new TypeError("The property '" + objName + ".type' is invalid. Received " +
+          (typeof v.type === "string" ? "'" + v.type + "'" : String(v.type)));
+        e.code = "ERR_INVALID_ARG_VALUE"; throw e;
+      }
+    }
+  };
   C.diffieHellman = function diffieHellman(options, callback) {
     if (options === null || typeof options !== "object" || Array.isArray(options)) {
       const e = new TypeError('The "options" argument must be of type object. Received ' + dhReceived(options));
@@ -1918,6 +2051,10 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
         e.code = "ERR_CRYPTO_INCOMPATIBLE_KEY"; throw e;
       }
     }
+    // node prepares the PUBLIC key first, then the private one, so the property
+    // path a malformed descriptor reports follows that order.
+    dhCheckEncoding(publicKey, "options.publicKey", true);
+    dhCheckEncoding(privateKey, "options.privateKey", false);
     let secret, failure;
     try {
       secret = dhDerive(dhPrepare(privateKey, "private"), dhPrepare(publicKey, "public"));
@@ -1976,6 +2113,17 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   };
   class X509Certificate {
     constructor(input) {
+      // node internal/crypto/x509.js: a string is buffered, anything that is not
+      // then an ArrayBufferView is ERR_INVALID_ARG_TYPE. `null` reached the
+      // parser here and came back as a bare "Failed to parse X509 certificate",
+      // which is a parse error where node reports an argument-type error.
+      if (typeof input !== "string" && !isView(input) && !(input instanceof ArrayBuffer)) {
+        const e = new TypeError('The "buffer" argument must be of type string or an instance of Buffer, TypedArray, or DataView. Received ' +
+          (input === null ? "null" : input === undefined ? "undefined"
+            : typeof input === "object" ? "an instance of " + ((input.constructor && input.constructor.name) || "Object")
+            : "type " + typeof input + " (" + String(input) + ")"));
+        e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+      }
       this._input = toBuf(input);
       const p = AN.x509parse(this._input);
       this.subject = p.subject || undefined;
@@ -2111,11 +2259,15 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   // Sign and Verify are Writable-like in node.  The local implementation
   // already has write()/update(); provide the internal write hook as well so
   // its name and callback contract match the inherited stream surface.
+  // node's sig.js _write does NOT trap: `this.update(chunk, encoding); callback()`.
+  // Routing the argument error into callback(error) made a bad chunk look like an
+  // async stream failure, so `assert.throws(() => sign._write(1, 'utf8', cb))` saw
+  // no exception at all.
   Sign.prototype._write = function _write(chunk, encoding, callback) {
-    try { this.update(chunk, encoding); callback(); } catch (error) { callback(error); }
+    this.update(chunk, encoding); callback();
   };
   Verify.prototype._write = function _write(chunk, encoding, callback) {
-    try { this.update(chunk, encoding); callback(); } catch (error) { callback(error); }
+    this.update(chunk, encoding); callback();
   };
   nameMethods(Sign.prototype, ["update", "sign", "_write"]);
   nameMethods(Verify.prototype, ["update", "verify", "_write"]);

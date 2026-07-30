@@ -112,14 +112,33 @@ inline bool asym_is_encrypted_der(std::span<const std::uint8_t> data) {
 //     cancelled" (ERR_OSSL_CRYPTO_INTERRUPTED_OR_CANCELLED).
 //   * encrypted DER PKCS#8 → detected structurally before any decode attempt,
 //     which node reports as ERR_MISSING_PASSPHRASE.
-// Anything else keeps the caller's own wording.
+// Otherwise the REAL OpenSSL error is preferred over the caller's wording: node's
+// ThrowCryptoError reports the decoder's own string verbatim, and the corpus
+// compares it literally — a wrong passphrase has to read
+// `error:1C800064:Provider routines::bad decrypt`, not "invalid key". Surfacing
+// it also gives the JS layer an `error:XXXXXXXX:` message it can decorate with
+// .code/.reason/.library, which is what node's `library` property is. The
+// caller's wording remains the fallback for a failure that left the queue empty.
+//
+// `preferOssl` is OPT-IN per call site, and deliberately so. The JS layer's
+// asymParseError() (crypto_asym.cppm) distinguishes createPublicKey from
+// createPrivateKey by seeing a bare, code-less message and attaching the code
+// node's own loader would have produced (EVP "decode error" vs DECODER
+// "unsupported") -- three PQC key-object files depend on exactly that. Handing
+// those call sites a real OpenSSL string instead makes the message self-coding
+// and that branch never fires. So only the sign / verify / cipher / raw-RSA
+// paths, whose errors node passes through verbatim, ask for the real string.
 inline std::string asym_key_error(std::span<const std::uint8_t> data, bool hasPass,
-                                  std::string_view fallback) {
+                                  std::string_view fallback, bool preferOssl = false) {
     if (!hasPass) {
         if (asym_is_encrypted_pem(data)) {
             return "error:07880109:common libcrypto routines::interrupted or cancelled";
         }
         if (asym_is_encrypted_der(data)) { return "Passphrase required for encrypted key"; }
+    }
+    if (preferOssl) {
+        const std::string ossl{asym_ossl_err()};
+        if (ossl != "operation failed") { return ossl; }
     }
     return std::string{fallback};
 }
@@ -205,7 +224,7 @@ inline JSC::EncodedJSValue asym_rsa_raw_host(JSC::JSGlobalObject* global, JSC::C
     const AsymPass pass{asym_opt_str(global, native_arg(frame, 1))};
     const int padding{asym_int(native_arg(frame, 3), RSA_PKCS1_PADDING)};
     PkeyPtr pkey{asym_load_pkey(keyBytes, pass)};
-    if (!pkey) { return hasher_throw(global, asym_key_error(keyBytes, pass.has_value(), "invalid key")); }
+    if (!pkey) { return hasher_throw(global, asym_key_error(keyBytes, pass.has_value(), "invalid key", true)); }
     PkeyCtxPtr pctx{EVP_PKEY_CTX_new(pkey.get(), nullptr)};
     if (!pctx) { return hasher_throw(global, "rsa ctx failed"); }
     int init{0};
@@ -426,11 +445,22 @@ inline std::vector<std::uint8_t> asym_ecdsa_p1363_to_der(std::span<const std::ui
 }
 
 // Configure RSA padding/salt on a signing/verifying pkey ctx.
+// `padding == 0` means the caller named none (the real RSA_*_PADDING values start
+// at 1). node leaves the choice to the key in that case, and it matters: an
+// rsa-pss key REJECTS RSA_PKCS1_PADDING, so hard-defaulting to PKCS1 made every
+// unqualified sign/verify with an rsa-pss key die on "illegal or unsupported
+// padding mode". `saltLen == kAsymSaltLenUnset` likewise means "don't touch it",
+// so a parameter-restricted rsa-pss key keeps the salt length baked into its own
+// parameters instead of being overridden with SALTLEN_MAX.
+inline constexpr int kAsymSaltLenUnset{-0x7fffffff};
 inline bool asym_apply_rsa_sig_opts(EVP_PKEY_CTX* pctx, EVP_PKEY* pkey, int padding, int saltLen) {
     const int base{EVP_PKEY_base_id(pkey)};
     if (base != EVP_PKEY_RSA && base != EVP_PKEY_RSA_PSS) { return true; }
+    if (padding == 0) {
+        padding = (base == EVP_PKEY_RSA_PSS) ? RSA_PKCS1_PSS_PADDING : RSA_PKCS1_PADDING;
+    }
     if (EVP_PKEY_CTX_set_rsa_padding(pctx, padding) <= 0) { return false; }
-    if (padding == RSA_PKCS1_PSS_PADDING) {
+    if (padding == RSA_PKCS1_PSS_PADDING && saltLen != kAsymSaltLenUnset) {
         return EVP_PKEY_CTX_set_rsa_pss_saltlen(pctx, saltLen) > 0;
     }
     return true;
@@ -456,7 +486,7 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_sign_host,
     PkeyPtr pkey{asym_load_pkey(keyBytes, pass)};
     if (!pkey) {
         return hasher_throw(global,
-                            asym_key_error(keyBytes, pass.has_value(), "sign: invalid private key"));
+                            asym_key_error(keyBytes, pass.has_value(), "sign: invalid private key", true));
     }
     MdCtxPtr md{EVP_MD_CTX_new()};
     const EVP_MD* dg{digest.empty() ? nullptr : EVP_get_digestbyname(digest.c_str())};
@@ -503,7 +533,7 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_verify_host,
 
     PkeyPtr pkey{asym_load_pkey(keyBytes, pass)};
     if (!pkey) {
-        return hasher_throw(global, asym_key_error(keyBytes, pass.has_value(), "verify: invalid key"));
+        return hasher_throw(global, asym_key_error(keyBytes, pass.has_value(), "verify: invalid key", true));
     }
     if (EVP_PKEY_base_id(pkey.get()) == EVP_PKEY_EC && dsaEnc == "ieee-p1363") {
         sig = asym_ecdsa_p1363_to_der(sig);
@@ -569,7 +599,7 @@ inline JSC::EncodedJSValue asym_rsa_host(JSC::JSGlobalObject* global, JSC::CallF
     asym_read(global, native_arg(frame, 5), label);
 
     PkeyPtr pkey{asym_load_pkey(keyBytes, pass)};
-    if (!pkey) { return hasher_throw(global, asym_key_error(keyBytes, pass.has_value(), "invalid key")); }
+    if (!pkey) { return hasher_throw(global, asym_key_error(keyBytes, pass.has_value(), "invalid key", true)); }
     auto out{asym_rsa_crypt(pkey.get(), !Decrypt, data, padding, oaepHash, label)};
     if (!out) { return hasher_throw(global, (Decrypt ? "decryption failed: " : "encryption failed: ") + asym_ossl_err()); }
     return JSC::JSValue::encode(toJS(global, static_cast<JSValueRef>(asym_u8(ctx, *out))));
