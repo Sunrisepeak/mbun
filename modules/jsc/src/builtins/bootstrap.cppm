@@ -3108,6 +3108,9 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       if (!special) return encodeBySet(host, (_c, n) => n > 0x7f);
       try { host = decodeURIComponent(host); } catch (_) { throw new TypeError("invalid host"); }
       if (host.includes("%")) throw new TypeError("invalid host");
+      // UTS-46 mapping/validation must run BEFORE punycode, or a disallowed
+      // code point gets encoded instead of failing the parse. See `uts46`.
+      { const mapped = uts46(host); if (mapped === null) throw new TypeError("invalid host"); host = mapped; }
       if (/[^\x00-\x7f]/.test(host)) host = puny.toASCII(host);
       return canonicalIPv4(host.toLowerCase());
     };
@@ -3414,6 +3417,66 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   })();
   def(["punycode"], puny);
 
+  // ---- UTS-46 (IDNA) validation -- the step that belongs AHEAD of punycode ----
+  // ToASCII is not "punycode-encode every non-ASCII label". UTS-46 first MAPS
+  // and IGNORES code points, and then a label whose mapped form contains a
+  // forbidden domain character is a FAILURE. mbun's punycode encoder was always
+  // correct ("muenchen.de" -> "xn--mnchen-3ya.de") but this step was missing, so
+  // a disallowed character got ENCODED instead of rejected:
+  //   domainToASCII("fail<U+2047>fail.com") -> "xn--failfail-803d.com"
+  // where node returns "" and new URL()/url.parse() throw ERR_INVALID_URL.
+  //
+  // SUBSET IMPLEMENTED -- deliberately not the whole IdnaMappingTable:
+  //   (a) the `ignored` class, removed before anything else, so a host built
+  //       only from them ends up empty and therefore invalid. This is what
+  //       makes url.parse("http://<U+00AD>/bad.com/") throw.
+  //   (b) `mapped`-to-forbidden: a non-ASCII code point whose compatibility
+  //       decomposition (NFKD) contains one of node's forbidden domain
+  //       characters  # % / : ? @ [ \ ] ^ |  is rejected. NFKD is the right
+  //       approximation because UTS-46's `mapped` entries are compatibility-
+  //       derived, and it is exactly the criterion test-url-parse-invalid-input
+  //       generates its own cases from. On this ICU it selects 29 code points
+  //       in 18 ranges -- U+2047..U+2049, U+2100..U+2101, U+2105..U+2106,
+  //       U+2A74, and parts of U+FE13..U+FF5C (so U+2100 -> "a/c" and
+  //       U+FF20 -> "@" are rejected, which the test asserts by name).
+  //       It is derived from the runtime's own normalize() rather than tabled,
+  //       so it cannot go stale against a different ICU.
+  // NOT implemented: the full mapped/deviation tables, CheckBidi, CheckJoiners,
+  // CheckHyphens, VerifyDnsLength, and STD3 rules. Those cost real tables and
+  // nothing in the corpus asks for them.
+  // `require("punycode")` is intentionally left alone: node's punycode module
+  // is plain RFC 3492 with no UTS-46 step, and test-punycode depends on that.
+  const uts46Ignored = /[\u00AD\u034F\u061C\u115F\u1160\u17B4\u17B5\u180B-\u180D\u180F\u200B\u200E\u200F\u202A-\u202E\u2060-\u2064\u206A-\u206F\u3164\uFE00-\uFE0F\uFEFF\uFFA0\uFFF0-\uFFF8]/g;
+  const uts46Forbidden = "#%/:?@[\\]^|";
+  const uts46BadCache = new Map();
+  const uts46BadCp = (cp) => {
+    let v = uts46BadCache.get(cp);
+    if (v === undefined) {
+      v = false;
+      try {
+        const d = String.fromCodePoint(cp).normalize("NFKD");
+        for (const b of uts46Forbidden) if (d.indexOf(b) !== -1) { v = true; break; }
+      } catch (e) {}
+      uts46BadCache.set(cp, v);
+    }
+    return v;
+  };
+  // Returns the domain with UTS-46-ignored code points removed, or null when
+  // the domain must be rejected. Pure-ASCII input is returned untouched, so no
+  // existing ASCII host path can change behaviour.
+  // An ALREADY-empty domain is passed through, not rejected: "file:///tmp/x"
+  // has a legitimately empty host, and callers that do forbid an empty host
+  // (urlValidateHostname, badDomain) already check for it themselves. Only a
+  // NON-empty domain that becomes empty after dropping ignored code points is
+  // a failure -- that is the "http://<U+00AD>/bad.com/" case.
+  const uts46 = (domain) => {
+    const s = String(domain);
+    const d = s.replace(uts46Ignored, "");
+    if (d === "") return s === "" ? "" : null;
+    for (const ch of d) { const cp = ch.codePointAt(0); if (cp >= 0x80 && uts46BadCp(cp)) return null; }
+    return d;
+  };
+
   // ---- node:tty / node:perf_hooks / node:_http_common ----
   def(["tty"], { isatty: () => false, ReadStream: class ReadStream extends EventEmitter { constructor() { super(); this.isTTY = true; this.isRaw = false; } setRawMode() { return this; } ref() {} unref() {} }, WriteStream: class WriteStream extends EventEmitter { constructor() { super(); this.isTTY = true; this.columns = 80; this.rows = 24; } getColorDepth() { return 8; } hasColors() { return true; } clearLine() { return true; } cursorTo() { return true; } getWindowSize() { return [80, 24]; } } });
   const PerfObserver = class PerformanceObserver { constructor(cb) { this._cb = cb; } observe() {} disconnect() {} takeRecords() { return []; } };
@@ -3509,7 +3572,8 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       if (!(hostname[0] === "[" && hostname[hostname.length - 1] === "]" && urlIsIpv6(hostname.slice(1, -1)))) throw urlInvalid(input);
       return hostname;
     }
-    let h = hostname;
+    let h = uts46(hostname);
+    if (h === null) throw urlInvalid(input);
     if (/[^\x00-\x7F]/.test(h)) { try { h = puny.toASCII(h); } catch (e) { throw urlInvalid(input); } }
     if (h === "" || /[\x00-\x20#%/:?@\\]/.test(h)) throw urlInvalid(input);
     return h;
@@ -3625,6 +3689,31 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       if (slashes && !(proto && urlHostlessProtocol[lowerProto])) { rest = rest.slice(2); this.slashes = true; }
     }
     if (!urlHostlessProtocol[lowerProto] && (slashes || (proto && !urlSlashedProtocol[proto]))) {
+      // node lib/url.js:321 -- its host scan drops TAB/LF/CR as it walks and
+      // stops at the first host-ending char, so "http://a\r\"@c\r\nd/e" has
+      // auth "a\"" and host "cd". Everything from that char on is path and is
+      // left alone (the path percent-encodes them: "/\tbc" -> "/%09bc").
+      // mbun replaced node's single scanning loop with indexOf() passes, which
+      // skipped this step; reproduce just the pre-host strip.
+      {
+        let stripped = "", k = 0;
+        for (; k < rest.length; k++) {
+          const c = rest.charCodeAt(k);
+          if (c === 9 || c === 10 || c === 13) continue;
+          // '[' also stops the strip. node itself would keep stripping (real
+          // node v26 parses "https://[\n::1]" as host "[::1]"), but bun's
+          // corpus PINS the stricter reading -- js/node/url/url-parse-ipv6
+          // asserts url.parse("https://[\n::1]") throws, and it is green.
+          // mbun serves both corpora and must not trade a green bun file for a
+          // green node file, so the strip stops at a bracketed literal. The
+          // node case that needs it (test-url-parse-format's
+          // "http://a\r\"...@c\r\nd/e?f") has no brackets, so both hold.
+          if (c === 91 /* [ */) break;
+          if (c === 35 /* # */ || c === 47 /* / */ || c === 63 /* ? */) break;
+          stripped += rest[k];
+        }
+        rest = stripped + rest.slice(k);
+      }
       // host ends at the first of / ? # ; auth may sit left of the last @
       // that appears before that point (http://a@b@c/ → user:a@b host:c)
       let hostEnd = -1;
@@ -3680,17 +3769,30 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     let protocol = this.protocol || "", pathname = this.pathname || "", hash = this.hash || "", host = "", query = "";
     if (this.host) host = auth + this.host;
     else if (this.hostname) {
-      host = auth + (this.hostname.indexOf(":") === -1 ? this.hostname : "[" + this.hostname + "]");
+      // node lib/url.js:655 -- bracket a colon-bearing hostname UNLESS it is
+      // already bracketed (isIpv6Hostname), or format({hostname:"[::]"})
+      // double-wraps to "[[::]]".
+      host = auth + (this.hostname.indexOf(":") === -1 ||
+        (this.hostname.charCodeAt(0) === 91 && this.hostname.charCodeAt(this.hostname.length - 1) === 93)
+        ? this.hostname : "[" + this.hostname + "]");
       if (this.port) host += ":" + this.port;
     }
     if (this.query && typeof this.query === "object" && Object.keys(this.query).length) query = new G.URLSearchParams(this.query).toString();
     let search = this.search || (query && "?" + query) || "";
     if (protocol && protocol[protocol.length - 1] !== ":") protocol += ":";
-    // only slashed protocols get the //; others only if slashes was set
-    if (this.slashes || ((!protocol || urlSlashedProtocol[protocol]) && host.length > 0)) {
-      host = "//" + host;
-      if (pathname && pathname[0] !== "/") pathname = "/" + pathname;
-    } else if (!host) host = "";
+    // only slashed protocols get the //; others only if slashes was set.
+    // Mirrors node lib/url.js exactly (verified against node v26.3.0):
+    //   format({protocol:"file", pathname:"/home/user"}) -> "file:///home/user"
+    //     -- a host-less file: URL still gets the "//" (its own else-branch),
+    //   format({host:"a.com", pathname:"/x"})            -> "a.com/x"
+    //     -- NO "//" when there is no protocol, which the previous
+    //        `!protocol || ...` condition got backwards.
+    if (this.slashes || urlSlashedProtocol[protocol]) {
+      if (this.slashes || host) {
+        if (pathname && pathname[0] !== "/") pathname = "/" + pathname;
+        host = "//" + host;
+      } else if (protocol.slice(0, 4) === "file") host = "//";
+    }
     if (hash && hash[0] !== "#") hash = "#" + hash;
     if (search && search[0] !== "?") search = "?" + search;
     pathname = pathname.replace(/[?#]/g, (m) => encodeURIComponent(m));
@@ -4052,8 +4154,8 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     resolve: (source, relative) => urlParse(source, false, true).resolve(relative),
     resolveObject: (source, relative) => (source ? urlParse(source, false, true).resolveObject(relative) : relative),
     urlToHttpOptions,
-    domainToASCII: (d) => { if (d == null) return d; d = String(d); if (badDomain(d)) return ""; if (d.toLowerCase().split(".").some((l) => /^xn--/i.test(l) && /[^\x00-\x7F]/.test(l))) return ""; try { return puny.toASCII(d.toLowerCase()); } catch (e) { return ""; } },
-    domainToUnicode: (d) => { if (d == null) return d; d = String(d); if (badDomain(d)) return ""; if (d.toLowerCase().split(".").some((l) => /^xn--/i.test(l) && /[^\x00-\x7F]/.test(l))) return ""; try { return puny.toUnicode(d.toLowerCase()); } catch (e) { return ""; } },
+    domainToASCII: (d) => { if (d == null) return d; d = String(d); if (badDomain(d)) return ""; { const m = uts46(d); if (m === null) return ""; d = m; } if (d.toLowerCase().split(".").some((l) => /^xn--/i.test(l) && /[^\x00-\x7F]/.test(l))) return ""; try { return puny.toASCII(d.toLowerCase()); } catch (e) { return ""; } },
+    domainToUnicode: (d) => { if (d == null) return d; d = String(d); if (badDomain(d)) return ""; { const m = uts46(d); if (m === null) return ""; d = m; } if (d.toLowerCase().split(".").some((l) => /^xn--/i.test(l) && /[^\x00-\x7F]/.test(l))) return ""; try { return puny.toUnicode(d.toLowerCase()); } catch (e) { return ""; } },
   };
   def(["url"], urlMod);
 

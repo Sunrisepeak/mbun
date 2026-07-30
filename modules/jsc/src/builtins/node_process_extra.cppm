@@ -1452,8 +1452,14 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
       "--inspect-wait", "--inspect", "--cpu-prof-dir", "--cpu-prof-interval", "--cpu-prof-name",
       "--cpu-prof", "--heap-prof-dir", "--heap-prof-interval", "--heap-prof-name", "--heap-prof",
     ];
+      // Same shape as INSPECTOR_FLAGS: gated on the build feature the test
+      // gates on. test-process-env-allowed-flags-are-documented drops
+      // --icu-data-dir from the documented set unless common.hasIntl, which is
+      // process.config.variables.v8_enable_i18n_support -- true here since
+      // wave 60, so the flag has to be listed or it is "overdocumented".
       const array = proc.features && proc.features.inspector
         ? FLAGS.concat(INSPECTOR_FLAGS) : FLAGS.slice();
+      if (proc.config && proc.config.variables && proc.config.variables.v8_enable_i18n_support) array.push("--icu-data-dir");
       const bare = array.map((f) => f.replace(/^--?/, ""));
       // Kept OUT of the instance: the object is frozen (and class bodies are
       // strict), so caching on `this` would throw on first use.
