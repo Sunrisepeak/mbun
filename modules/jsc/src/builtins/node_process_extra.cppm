@@ -2069,6 +2069,13 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
   // process.send/'message'/disconnect now that `process` is a full EventEmitter
   // (the plumbing itself lives in the process_web partition).
   try { if (typeof globalThis.__mbunSetupIpcChild === "function") globalThis.__mbunSetupIpcChild(); } catch (e) {}
+  // AFTER the IPC wiring, and only in a worker: node disables the process
+  // operations that are process-global rather than thread-local (chdir, umask,
+  // abort, the setuid family, and the fork() channel). The list is published by
+  // the worker_threads partition, which runs BEFORE this one — installing it
+  // there would have been undone by the process.send that __mbunSetupIpcChild
+  // has only just assigned.
+  try { if (typeof globalThis.__mbunWorkerDisableProcessOps === "function") globalThis.__mbunWorkerDisableProcessOps(); } catch (e) {}
 })();
 )JS";
 

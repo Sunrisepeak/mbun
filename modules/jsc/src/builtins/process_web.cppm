@@ -1374,7 +1374,12 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       drain() {
         ipcRead(ch, (m, handle) => delivery.deliver(m, handle), () => {
           ipcClose(ch);
-          if (proc.connected && typeof proc.disconnect === "function") proc.disconnect();
+          // Read defensively: inside a worker_threads worker both `connected`
+          // and `disconnect` are node's ERR_WORKER_UNSUPPORTED_OPERATION stubs,
+          // and the channel this is tearing down is the worker's own wire.
+          let conn = false;
+          try { conn = !!proc.connected; } catch (e) { conn = false; }
+          if (conn && typeof proc.disconnect === "function") { try { proc.disconnect(); } catch (e) {} }
         });
       },
       // worker_threads installs a permanent process 'message' bridge, so it
@@ -3604,7 +3609,25 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
           // code that deletes it (test-require-delete-array-iterator,
           // test-repl-unsafe-array-iteration) would break every stdout/stderr
           // write — including the one the runtime needs to report that failure.
-          strm.write = function write(d) { if (d instanceof ArrayBuffer || ArrayBuffer.isView(d)) { PN.write(fd, u8ToB64(d)); return true; } return PReflectApply(textWrite, this, arguments); };
+          // node's stdout/stderr are Writables, so `write(chunk[, encoding][, cb])`
+          // settles the caller's callback once the chunk is flushed. The native
+          // write only ever read argument 0, so the callback was silently
+          // dropped: `process.stdout.write(s, common.mustSucceed())` never fired
+          // (all ten of them in test-worker-no-stdin-stdout-interaction). The
+          // write itself is synchronous here, so the callback is due on the next
+          // tick — node never calls it re-entrantly either.
+          strm.write = function write(d, enc, cb) {
+            if (typeof enc === "function") { cb = enc; }
+            let ok;
+            if (d instanceof ArrayBuffer || ArrayBuffer.isView(d)) { PN.write(fd, u8ToB64(d)); ok = true; }
+            else ok = PReflectApply(textWrite, this, arguments);
+            if (typeof cb === "function") {
+              const tick = G.process && G.process.nextTick;
+              if (typeof tick === "function") tick(cb, null);
+              else G.queueMicrotask(function () { cb(null); });
+            }
+            return ok;
+          };
           strm.__mbunBinWrite = true;
           strm.flush = strm.flush || (() => {});
           // node: a write-only stdout/stderr's async iterator completes at once

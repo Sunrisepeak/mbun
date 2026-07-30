@@ -112,6 +112,75 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
   };
   const UNCLONEABLE = new WeakSet();
   const UNTRANSFERABLE = new WeakSet();
+  // Objects that stand in for a node NATIVE handle (an internalBinding class).
+  // node's structured clone rejects them with a distinct message, and mbun's
+  // stand-ins are ordinary JS objects that would otherwise clone into a
+  // meaningless husk of their public fields. Registered by whoever mints them.
+  const NATIVE_HOST = new WeakSet();
+  G.__mbunMarkNativeHostObject = (o) => {
+    if (o !== null && (typeof o === "object" || typeof o === "function")) NATIVE_HOST.add(o);
+    return o;
+  };
+
+  // ---- JSTransferable (node lib/internal/worker/js_transferable.js) --------
+  // A host object that is MOVED rather than cloned answers three symbols:
+  // @@kTransferList names what it drags along, @@kTransfer hands back
+  // `{ data, deserializeInfo }`, and the receiver rebuilds it by resolving
+  // deserializeInfo as `module:Ctor` and calling @@kDeserialize on a fresh
+  // instance. mbun had none of it, so `postMessage(fileHandle, [fileHandle])`
+  // died with "Object that needs transfer was found in message but not listed
+  // in transferList" — about an object that WAS listed.
+  //
+  // The resolution step is a security boundary, not a convenience: node looks
+  // deserializeInfo up in the INTERNAL builtin table, so an object whose
+  // @@kTransfer has been overridden cannot name a file on disk and have it
+  // loaded (test-worker-message-port-transfer-fake-js-transferable) nor reach a
+  // public class that never opted in (…-internal). Both failures are reported
+  // to the RECEIVER as a 'messageerror', never to the sender.
+  const nodeSymbol = (name) => {
+    const reg = G.__mbunNodeSymbols || (G.__mbunNodeSymbols = { __proto__: null });
+    return reg[name] || (reg[name] = Symbol(name));
+  };
+  const kJstTransfer = nodeSymbol("messaging_transfer_symbol");
+  const kJstTransferList = nodeSymbol("messaging_transfer_list_symbol");
+  const kJstDeserialize = nodeSymbol("messaging_deserialize_symbol");
+  const JST_TOK = "__mbunJSTransferable__";
+  const isJSTransferable = (v) => {
+    if (v === null || (typeof v !== "object" && typeof v !== "function")) return false;
+    try { return typeof v[kJstTransfer] === "function"; } catch (e) { return false; }
+  };
+  const jstMaterialise = (spec) => {
+    const info = spec === null || spec === undefined ? undefined : spec.deserializeInfo;
+    if (typeof info !== "string") throw new Error("Unknown deserialize spec " + String(info));
+    const sep = info.indexOf(":");
+    const modName = sep < 0 ? info : info.slice(0, sep);
+    const ctorName = sep < 0 ? "" : info.slice(sep + 1);
+    const target = M[modName] !== undefined ? M[modName] : M["node:" + modName];
+    if (target === undefined || target === null) {
+      throw new Error("Missing internal module '" + modName + "'");
+    }
+    const Ctor = target[ctorName];
+    if (typeof Ctor !== "function" || Ctor.prototype === undefined ||
+        typeof Ctor.prototype[kJstDeserialize] !== "function") {
+      throw new Error("Unknown deserialize spec " + info);
+    }
+    const obj = new Ctor();
+    obj[kJstDeserialize](spec.data);
+    return obj;
+  };
+  const jstResolve = (v, specs, seen) => {
+    if (v === null || typeof v !== "object") return v;
+    if (Object.prototype.hasOwnProperty.call(v, JST_TOK) && typeof v[JST_TOK] === "number") {
+      return jstMaterialise(specs[v[JST_TOK]]);
+    }
+    if (seen.has(v)) return seen.get(v);
+    seen.set(v, v);
+    if (Array.isArray(v)) { for (let i = 0; i < v.length; i++) v[i] = jstResolve(v[i], specs, seen); return v; }
+    const proto = Object.getPrototypeOf(v);
+    if (proto !== Object.prototype && proto !== null) return v;
+    for (const k of Object.keys(v)) v[k] = jstResolve(v[k], specs, seen);
+    return v;
+  };
 
   // ---- the worker wire: a structured-clone subset over JSON IPC -----------
   // A worker is a child process and the channel to it is node:child_process's
@@ -379,7 +448,21 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
   // (setupPortReferencing's removeListener hook) — a message posted while no
   // sink exists must stay queued for a listener attached later.
   const portRecheck = (p) => { if (!portHasListener(p)) p[kStarted] = false; };
-  const portDeliver = (p, data, ports) => {
+  const portDeliver = (p, data, ports, err) => {
+    // A payload that could not be DESERIALISED is node's 'messageerror', not a
+    // 'message': the receiver learns the transfer failed and the value never
+    // materialises (test-worker-message-port-transfer-fake-js-transferable
+    // asserts mustNotCall on 'message' and reads the exception off
+    // 'messageerror').
+    if (err !== undefined && err !== null) {
+      const ee = { data: err, type: "messageerror", target: p, currentTarget: p, ports: [] };
+      const oe = p[kOnMsgErr];
+      if (typeof oe === "function") oe.call(p, ee);
+      const dome = p[kEvt].get("messageerror");
+      if (dome && dome.length) for (const l of dome.slice()) { if (l.once) p.removeEventListener("messageerror", l.fn); l.fn.call(p, ee); }
+      EventEmitter.prototype.emit.call(p, "messageerror", err);
+      return;
+    }
     const ev = { data, type: "message", target: p, currentTarget: p, ports: ports || [] };
     const on = p[kOnMsg];
     if (typeof on === "function") on.call(p, ev);
@@ -399,7 +482,7 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
     let n = p[kQueue].length;
     while (n-- > 0 && p[kQueue].length && portHasSink(p)) {
       const item = p[kQueue].shift();
-      portDeliver(p, item.data, item.ports);
+      portDeliver(p, item.data, item.ports, item.err);
     }
     if (p[kQueue].length && portHasSink(p)) scheduleFlush(p);
   };
@@ -443,8 +526,19 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
   const MOD_TOK = "__mbunWasmModule__";
   const isWasmModule = (v) => G.WebAssembly && typeof G.WebAssembly.Module === "function" &&
                               v instanceof G.WebAssembly.Module;
-  const subst = (v, ports, seen, mods) => {
+  const subst = (v, ports, seen, mods, jsts) => {
+    // node reports a function by its SOURCE ("function foo() {} could not be
+    // cloned."); JSC's own DataCloneError names it ("foo could not be cloned.")
+    // and test-worker-message-port-transfer-native pins node's wording.
+    if (typeof v === "function") {
+      let src = "function";
+      try { src = String(v); } catch (e) {}
+      throw dataClone(src + " could not be cloned.");
+    }
     if (v === null || typeof v !== "object") return v;
+    // A native binding object has internal state no clone can carry; node's
+    // serializer refuses it outright rather than emitting an empty husk.
+    if (NATIVE_HOST.has(v)) throw dataClone("Cannot clone object of unsupported type.");
     const i = ports.indexOf(v);
     if (i >= 0) { const o = {}; o[PORT_TOK] = i; return o; }
     // JSC's structuredClone silently downgrades a WebAssembly.Module to a plain
@@ -465,11 +559,20 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
       throw dataClone(label + " could not be cloned.");
     }
     if (seen.has(v)) return seen.get(v);
-    if (Array.isArray(v)) { const out = []; seen.set(v, out); for (let k = 0; k < v.length; k++) out[k] = subst(v[k], ports, seen, mods); return out; }
+    if (Array.isArray(v)) { const out = []; seen.set(v, out); for (let k = 0; k < v.length; k++) out[k] = subst(v[k], ports, seen, mods, jsts); return out; }
     const proto = Object.getPrototypeOf(v);
-    if (proto !== Object.prototype && proto !== null) return v;
+    // Only a HOST object can be a JSTransferable, so the symbol probe lives on
+    // the non-plain branch: a plain-object payload never pays for it.
+    if (proto !== Object.prototype && proto !== null) {
+      if (isJSTransferable(v)) {
+        const j = jsts ? jsts.list.indexOf(v) : -1;
+        if (j < 0) throw dataClone("Object that needs transfer was found in message but not listed in transferList");
+        const o = {}; o[JST_TOK] = j; return o;
+      }
+      return v;
+    }
     const out = {}; seen.set(v, out);
-    for (const k of Object.keys(v)) out[k] = subst(v[k], ports, seen, mods);
+    for (const k of Object.keys(v)) out[k] = subst(v[k], ports, seen, mods, jsts);
     return out;
   };
   const unsubst = (v, ports, seen, mods) => {
@@ -578,7 +681,7 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
   // Clone FIRST, detach after: a transferred ArrayBuffer is frequently also the
   // backing store of the message itself (postMessage(typedArray, [ab])), and
   // detaching before the copy would hand the receiver an empty view.
-  const cloneWithPorts = (value, ports, buffers) => {
+  const cloneWithPorts = (value, ports, buffers, jsts) => {
       // Two codecs compose here and both are load-bearing. subst/unsubst thread
       // `mods` so a WebAssembly.Module survives structuredClone (JSC silently
       // downgrades one to a plain object), and encodeKeysTop/decodeKeysTop tag
@@ -587,7 +690,7 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
       // otherwise hold something that is `instanceof CryptoKey` with no key in
       // it, which reads as a key and is worse than a failure.
       const mods = [];
-      const pre = encodeKeysTop(subst(value, ports, new Map(), mods));
+      const pre = encodeKeysTop(subst(value, ports, new Map(), mods, jsts));
       const c = decodeKeysTop(G.structuredClone(pre));
     for (const b of buffers) { try { G.structuredClone(b, { transfer: [b] }); } catch (e) {} }
     return (ports.length || mods.length) ? unsubst(c, ports, new Map(), mods) : c;
@@ -617,7 +720,7 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
 
   defPortProp("postMessage", { writable: true, value: function (value, transferList) {
     const list = normTransfer(transferList);
-    const ports = [], buffers = [];
+    const ports = [], buffers = [], jstList = [];
     const seenPorts = new Set(), seenBufs = new Set();
     // node validates the WHOLE list before detaching anything, so a bad entry
     // late in the list leaves earlier ArrayBuffers untouched.
@@ -635,6 +738,10 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
         if (UNTRANSFERABLE.has(item))
           throw dataClone("Cannot transfer object marked as untransferable");
         seenBufs.add(item); buffers.push(item);
+      } else if (isJSTransferable(item)) {
+        if (UNTRANSFERABLE.has(item)) throw dataClone("Cannot transfer object marked as untransferable");
+        if (jstList.indexOf(item) >= 0) throw dataClone("Transfer list contains duplicate object");
+        jstList.push(item);
       } else if (item !== null && (typeof item === "object" || typeof item === "function")) {
         if (UNTRANSFERABLE.has(item)) continue;
         throw dataClone("Object that needs transfer was found in message but not listed in transferList");
@@ -642,10 +749,31 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
         throw dataClone("Value at index " + buffers.length + " is not transferable");
       }
     }
+    // Each JSTransferable is asked for its own transfer list and then for its
+    // payload, BEFORE anything is detached — node calls both hooks exactly once
+    // per postMessage, and a nested value that cannot itself be transferred
+    // fails the whole call (test-worker-message-port-jstransferable-nested-
+    // untransferable puts an already-detached MessagePort in the inner list).
+    let jsts = null;
+    if (jstList.length) {
+      jsts = { list: jstList, specs: [] };
+      const nested = [];
+      for (const item of jstList) {
+        let sub;
+        try { sub = typeof item[kJstTransferList] === "function" ? item[kJstTransferList]() : []; }
+        catch (e) { throw e; }
+        if (sub !== null && sub !== undefined) for (const s of sub) nested.push(s);
+        jsts.specs.push(item[kJstTransfer]());
+      }
+      for (const s of nested) {
+        if (isPort(s) && s[kDetached] === true) throw dataClone("MessagePort in transfer list is already detached");
+        if (UNTRANSFERABLE.has(s)) throw dataClone("Cannot transfer object marked as untransferable");
+      }
+    }
     if (this[kDetached] === true) return;
     const target = this[kOther];
     const postedToTarget = target !== null && seenPorts.has(target);
-    const cloned = cloneWithPorts(value, ports, buffers);
+    const cloned = cloneWithPorts(value, ports, buffers, jsts);
     if (postedToTarget) {
       // node node_messaging.cc: the channel is lost and a process warning fires.
       if (G.process && typeof G.process.emitWarning === "function") {
@@ -655,6 +783,23 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
       return;
     }
     if (target === null) return;
+    // node resolves deserializeInfo on the RECEIVING side, and a resolution
+    // that fails reaches the receiver as 'messageerror' — never back to the
+    // sender, which has already given the object away. Both ends of a
+    // MessageChannel live in this process, so the resolution happens here and
+    // the verdict is queued in the receiver's place.
+    if (jsts !== null) {
+      let payload;
+      try { payload = jstResolve(cloned, jsts.specs, new Map()); }
+      catch (e) {
+        target[kQueue].push({ err: e instanceof Error ? e : new Error(String(e)), ports: [] });
+        scheduleFlush(target);
+        return;
+      }
+      target[kQueue].push({ data: payload, ports: ports.slice() });
+      scheduleFlush(target);
+      return;
+    }
     target[kQueue].push({ data: cloned, ports: ports.slice() });
     scheduleFlush(target);
   } });
@@ -815,6 +960,15 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
       const e = new TypeError('The "port" argument must be a MessagePort instance');
       e.code = "ERR_INVALID_ARG_TYPE"; throw e;
     }
+    // node node_messaging.cc MessagePort::MoveToContext: a detached port is
+    // rejected BEFORE the context argument is looked at, because the move is a
+    // transfer and there is nothing left to transfer. Validating the context
+    // first reported ERR_INVALID_ARG_TYPE for a closed port
+    // (test-worker-message-port-close asserts ERR_CLOSED_MESSAGE_PORT).
+    if (port[kDetached] === true) {
+      const e = new Error("Cannot send data on closed MessagePort");
+      e.code = "ERR_CLOSED_MESSAGE_PORT"; throw e;
+    }
     if (!vmM || typeof vmM.runInContext !== "function" || context === null ||
         typeof context !== "object") {
       const e = new TypeError('The "contextifiedSandbox" argument must be a vm.Context');
@@ -869,9 +1023,86 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
     return mk(port);
   };
 
-  // ---- BroadcastChannel (in-process fan-out) ------------------------------
+  // ---- BroadcastChannel ----------------------------------------------------
+  // node's BroadcastChannel reaches every THREAD of the process; mbun's workers
+  // are child processes, so the fan-out has to be relayed over the same IPC
+  // channel the ports use. Without it a channel opened in a worker and one
+  // opened in its parent were two unrelated objects that happened to share a
+  // name, and neither ever heard the other (test-worker-broadcastchannel's
+  // 'worker1' block is exactly that round trip).
+  //
+  // `fromTid` is where the frame came from, so a relay never echoes to its
+  // source: -1 originated here, 0 arrived from the parent, >0 arrived from that
+  // child. A worker forwards both up and down, which is what makes a broadcast
+  // reach a SIBLING worker.
+  let bcLocalDeliver = null;
+  const bcRelay = (name, data, fromTid) => {
+    let wire;
+    try { wire = encWire(data, []); } catch (e) { return; }
+    for (const [tid, w] of workerRegistry) {
+      if (tid === fromTid) continue;
+      try { if (!w._exited && w._child && w._child.connected) w._child.send({ t: "bc", n: name, d: wire }); }
+      catch (e) {}
+    }
+    if (!isMainThread && fromTid !== 0) wsend({ t: "bc", n: name, d: wire });
+  };
   const BroadcastChannel = G.BroadcastChannel || (function () {
     const channels = new Map();
+    // Every live channel in CREATION order. node dispatches a broadcast round
+    // by walking the receiving ports in the order they were constructed and
+    // draining each one's queue, not by walking the messages — so with three
+    // channels on one name posting in turn, c1 hears everything addressed to it
+    // before c2 hears anything (test-worker-broadcastchannel-wpt pins the exact
+    // six-event sequence). Scheduling one microtask PER MESSAGE, as this did,
+    // interleaves the ports instead and produced 'from c1' where node has
+    // 'from c3'.
+    const allChannels = [];
+    let drainScheduled = false;
+    const drainAll = () => {
+      drainScheduled = false;
+      for (const ch of allChannels.slice()) {
+        if (ch._closed) continue;
+        const queue = broadcastQueues.get(ch);
+        if (queue === undefined) continue;
+        // Bounded by what was already queued: a handler that posts back must
+        // not be drained inside the round it is answering.
+        let n = queue.length;
+        while (n-- > 0 && queue.length && !ch._closed) {
+          const item = queue.shift();
+          const ev = typeof G.MessageEvent === "function"
+            ? new G.MessageEvent("message", { data: item.data })
+            : { data: item.data, type: "message" };
+          ev.target = ch;
+          ev.currentTarget = ch;
+          if (typeof ch.onmessage === "function") ch.onmessage(ev);
+          ch.emit("message", ev);
+        }
+      }
+      for (const ch of allChannels) {
+        const queue = broadcastQueues.get(ch);
+        if (!ch._closed && queue !== undefined && queue.length) { scheduleDrain(); return; }
+      }
+    };
+    const scheduleDrain = () => {
+      if (drainScheduled) return;
+      drainScheduled = true;
+      G.queueMicrotask(drainAll);
+    };
+    // The local half of a fan-out, shared by a postMessage raised here and by a
+    // 'bc' frame relayed in from another process. `origin` is the channel that
+    // posted (a sender never hears itself); a relayed frame has none.
+    const deliver = (name, data, origin) => {
+      const set = channels.get(name);
+      if (!set) return;
+      let queued = false;
+      for (const ch of set) {
+        if (ch === origin || ch._closed) continue;
+        broadcastQueues.get(ch).push({ data });
+        queued = true;
+      }
+      if (queued) scheduleDrain();
+    };
+    bcLocalDeliver = deliver;
     class BroadcastChannel extends EventEmitter {
       constructor(name) {
         if (arguments.length === 0)
@@ -889,6 +1120,7 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
         let set = channels.get(this.name);
         if (!set) { set = new Set(); channels.set(this.name, set); }
         set.add(this);
+        allChannels.push(this);
       }
       get name() { assertBroadcast(this); return broadcastNames.get(this); }
       [INSPECT_SYM](depth, options, inspect) {
@@ -908,24 +1140,8 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
         if (containsTransferable(value))
           throw dataClone("Object that needs transfer was found in message but not listed in transferList");
         const data = cloneBroadcast(value);
-        for (const ch of set) {
-          if (ch === this || ch._closed) continue;
-          const item = { data };
-          broadcastQueues.get(ch).push(item);
-          G.queueMicrotask(() => {
-            const queue = broadcastQueues.get(ch);
-            const index = queue.indexOf(item);
-            if (index < 0) return;
-            queue.splice(index, 1);
-            const ev = typeof G.MessageEvent === "function"
-              ? new G.MessageEvent("message", { data })
-              : { data, type: "message" };
-            ev.target = ch;
-            ev.currentTarget = ch;
-            if (typeof ch.onmessage === "function") ch.onmessage(ev);
-            ch.emit("message", ev);
-          });
-        }
+        deliver(this.name, data, this);
+        bcRelay(this.name, data, -1);
       }
       close() {
         assertBroadcast(this);
@@ -933,6 +1149,8 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
         this._closed = true;
         const set = channels.get(this.name);
         if (set) { set.delete(this); if (set.size === 0) channels.delete(this.name); }
+        const at = allChannels.indexOf(this);
+        if (at >= 0) allChannels.splice(at, 1);
       }
       ref() { assertBroadcast(this); return this; }
       unref() { assertBroadcast(this); return this; }
@@ -1119,6 +1337,135 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
     const p = pathM.join(dir, "mbun-worker-" + (proc.pid || 0) + "-" + tid + (ext || ".js"));
     fsM.writeFileSync(p, source);
     return p;
+  };
+
+  // ---- postMessageToThread (node lib/internal/worker/messaging.js) ---------
+  // worker_threads exports it and mbun did not, so every `postMessageToThread`
+  // call in the corpus died with "is not a function" before it could assert
+  // anything (test-worker-messaging-errors-invalid / -handler / -timeout /
+  // test-worker-messaging).
+  //
+  // node's own transport CANNOT be ported: it hands the destination thread a
+  // SharedArrayBuffer, blocks the sender on AtomicsWaitAsync and has the
+  // receiver AtomicsStore the delivery verdict into it. An mbun worker is a
+  // child PROCESS, so that buffer is a copy and the verdict would never come
+  // back. What is observable — the promise settles with exactly one of
+  // DELIVERED / no-listener / listener-threw / timed-out — is a request/response
+  // pair, so that is what rides the existing IPC channel: a 'wm' frame carrying
+  // a correlation id, answered by a 'wr' frame carrying the verdict. The
+  // SharedArrayBuffer was node's signalling mechanism, never its contract.
+  //
+  // Routing is main-thread-mediated exactly as node's is (every thread's port
+  // goes to the main thread, which forwards): a worker's request travels up as
+  // `{t:"wm", dest}` and the main thread either emits it locally (dest 0) or
+  // relays it to that destination's channel.
+  // ---- the worker's own IPC handle, kept after process.send is disabled -----
+  // node takes process.send/chdir/abort/… away inside a worker (they are
+  // process-global, not thread-local). mbun's worker wire IS process.send, so
+  // every internal frame has to go through the captured original rather than
+  // the public property. `sendHost` is a receiver whose `connected` still reads
+  // true: the real send() checks `this.connected`, and the public property
+  // becomes a throwing getter one line later.
+  let rawSendW = null;
+  let rawChdirW = null;
+  const wsend = (frame) => {
+    if (rawSendW !== null) { try { rawSendW(frame); return true; } catch (e) { return false; } }
+    if (typeof proc.send !== "function") return false;
+    try { proc.send(frame); return true; } catch (e) { return false; }
+  };
+  const wsendable = () => rawSendW !== null || typeof proc.send === "function";
+
+  const WM_DELIVERED = 0, WM_NO_LISTENERS = 1, WM_LISTENER_ERROR = 2;
+  let wmSeq = 0;
+  const wmPending = new Map();
+  // node reports "no listener" and "the listener threw" as DIFFERENT errors, so
+  // the listener count has to be read before the emit rather than inferred from
+  // process.emit()'s boolean (which a throwing listener never returns).
+  const emitWorkerMessage = (value, source) => {
+    let n = 0;
+    try { n = typeof proc.listenerCount === "function" ? proc.listenerCount("workerMessage") : 0; } catch (e) { n = 0; }
+    if (n === 0) return WM_NO_LISTENERS;
+    try { proc.emit("workerMessage", value, source); } catch (e) { return WM_LISTENER_ERROR; }
+    return WM_DELIVERED;
+  };
+  const wmSettle = (m) => {
+    const res = wmPending.get(m.id);
+    if (res !== undefined) { wmPending.delete(m.id); res(m.r); }
+  };
+  const wmAsk = (send) => {
+    const id = ++wmSeq;
+    return new Promise((resolve) => {
+      wmPending.set(id, resolve);
+      let ok = false;
+      try { ok = send(id) !== false; } catch (e) { ok = false; }
+      if (!ok) { wmPending.delete(id); resolve(WM_NO_LISTENERS); }
+    });
+  };
+  const wmSendToWorker = (w, source, wire) => {
+    if (!w || w._exited || !w._child || !w._child.connected) return Promise.resolve(WM_NO_LISTENERS);
+    return wmAsk((id) => w._child.send({ t: "wm", id: id, src: source, d: wire }));
+  };
+  // Called on the main thread for a request that arrived from a worker.
+  const wmRoute = (dest, source, wire) => {
+    if (dest === threadId) return Promise.resolve(emitWorkerMessage(decodeKeysTop(decWire(wire)), source));
+    return wmSendToWorker(workerRegistry.get(dest), source, wire);
+  };
+  // A timeout is the caller's deadline on the ROUND TRIP, so the timer is
+  // unref'd: node's AtomicsWaitAsync does not hold the loop open either.
+  const wmWithTimeout = (p, timeout) => {
+    if (timeout === undefined || !(timeout >= 0) || !isFinite(timeout)) return p;
+    return new Promise((resolve) => {
+      let done = false;
+      const t = G.setTimeout(() => { if (!done) { done = true; resolve("timeout"); } }, timeout);
+      try { if (t && typeof t.unref === "function") t.unref(); } catch (e) {}
+      p.then((r) => { if (!done) { done = true; try { G.clearTimeout(t); } catch (e) {} resolve(r); } });
+    });
+  };
+  const wmErr = (code, message) => { const e = new Error(message); e.code = code; return e; };
+  const postMessageToThread = function (destination, value, transferList, timeout) {
+    // An async body on purpose: node's postMessageToThread is an async function,
+    // so EVERY rejection (including the synchronous same-thread one) arrives as
+    // a rejected promise — `assert.rejects(() => postMessageToThread(threadId))`
+    // depends on it.
+    return (async function () {
+      if (typeof transferList === "number" && timeout === undefined) { timeout = transferList; transferList = []; }
+      if (timeout !== undefined) {
+        if (typeof timeout !== "number" || timeout !== timeout) {
+          const e = new TypeError('The "timeout" argument must be of type number. Received ' + recvType(timeout));
+          e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+        }
+        if (timeout < 0) {
+          const e = new RangeError('The value of "timeout" is out of range. It must be >= 0. Received ' + timeout);
+          e.code = "ERR_OUT_OF_RANGE"; throw e;
+        }
+      }
+      if (destination === threadId) {
+        throw wmErr("ERR_WORKER_MESSAGING_SAME_THREAD", "Cannot sent a message to the same thread");
+      }
+      const tlPorts = [];
+      for (const item of validateTransferList(transferList)) if (isPort(item)) tlPorts.push(item);
+      let code;
+      if (isMainThread) {
+        const w = workerRegistry.get(destination);
+        if (!w || w._exited) code = WM_NO_LISTENERS;
+        else {
+          w._wirePorts(tlPorts);
+          const wire = value === undefined ? undefined : encWire(encodeKeysTop(value), w._tlPorts);
+          code = await wmWithTimeout(wmSendToWorker(w, threadId, wire), timeout);
+        }
+      } else {
+        const wire = value === undefined ? undefined : encWire(encodeKeysTop(value), tlPorts);
+        const dest = destination;
+        code = await wmWithTimeout(wmAsk((id) => {
+          if (!wsendable()) return false;
+          return wsend({ t: "wm", id: id, dest: dest, src: threadId, d: wire });
+        }), timeout);
+      }
+      if (code === "timeout") throw wmErr("ERR_WORKER_MESSAGING_TIMEOUT", "Sending a message to another thread timed out");
+      if (code === WM_NO_LISTENERS) throw wmErr("ERR_WORKER_MESSAGING_FAILED", "Cannot find the destination thread or listener");
+      if (code === WM_LISTENER_ERROR) throw wmErr("ERR_WORKER_MESSAGING_ERRORED", "The destination thread threw an error while processing the message");
+      return undefined;
+    })();
   };
 
   class Worker extends EventEmitter {
@@ -1355,6 +1702,25 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
           self.emit("error", err);
         } else if (m.t === "me") {
           self.emit("messageerror", new Error(String(m.d)));
+        } else if (m.t === "wm" && typeof m.id === "number") {
+          // postMessageToThread, travelling UP from this worker. The main thread
+          // is the router (as it is in node), so resolve the destination here
+          // and send the verdict back down on the same correlation id.
+          const reqId = m.id;
+          wmRoute(typeof m.dest === "number" ? m.dest : threadId,
+                  typeof m.src === "number" ? m.src : -1, m.d)
+            .then((r) => {
+              try { if (!self._exited && self._child.connected) self._child.send({ t: "wr", id: reqId, r: r }); }
+              catch (e) {}
+            });
+        } else if (m.t === "wr" && typeof m.id === "number") {
+          wmSettle(m);
+        } else if (m.t === "bc" && typeof m.n === "string") {
+          // A BroadcastChannel post from this worker: fan out here, then relay
+          // to every OTHER worker (and, in a nested worker, on up).
+          const d = decWire(m.d);
+          if (bcLocalDeliver) bcLocalDeliver(m.n, d, null);
+          bcRelay(m.n, d, tid);
         }
       });
       child.on("error", (e) => self.emit("error", e));
@@ -1505,8 +1871,8 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
       Object.defineProperty(ch.port1, "postMessage", {
         configurable: true, writable: true,
         value: function (value) {
-          if (typeof proc.send !== "function") return undefined;
-          try { proc.send({ t: "p", i: i, d: encWire(value, []) }); } catch (e) {}
+          if (!wsendable()) return undefined;
+          wsend({ t: "p", i: i, d: encWire(value, []) });
           return undefined;
         },
       });
@@ -1535,8 +1901,8 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
     Object.defineProperty(parentPort, "postMessage", {
       configurable: true, writable: true,
       value: function (value, transferList) {
-        if (typeof proc.send !== "function") return undefined;
-        try { proc.send(value === undefined ? { t: "m" } : { t: "m", d: encWire(encodeKeysTop(value)) }); } catch (e) {}
+        if (!wsendable()) return undefined;
+        wsend(value === undefined ? { t: "m" } : { t: "m", d: encWire(encodeKeysTop(value)) });
         // node detaches every ArrayBuffer in the transfer list; the message is
         // already on the wire, so the parent's copy is unaffected. Ignoring the
         // list left `crypto.sign()`'s buffer alive in the worker after
@@ -1612,7 +1978,7 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
       };
     } catch (e) {}
     const reportFatal = (e) => {
-      if (typeof proc.send !== "function") return;
+      if (!wsendable()) return;
       // EVERY field is read in its own try: they are user-visible getters. A
       // single try around the whole frame meant one throwing accessor lost the
       // WHOLE report — an Error.prepareStackTrace that throws for its own error
@@ -1624,7 +1990,7 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
       try { d.name = e && e.name; } catch (_) {}
       try { d.stack = e && e.stack; } catch (_) { d.noStack = true; }
       try { d.code = e && e.code; } catch (_) {}
-      try { proc.send({ t: "e", d }); } catch (_) {}
+      wsend({ t: "e", d });
     };
     // A fatal error in the worker's ENTRY POINT (a bad specifier, a throw at
     // module scope) reaches the parent as an 'error' event too — node
@@ -1660,7 +2026,19 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
           const e = transferredPorts.get(m.i);
           if (e) deliverLocal(e.near, decodeKeysTop(decWire(m.d)));
         }
-        else if (m.t === "cd" && typeof m.d === "string") { try { proc.chdir(m.d); } catch (e) {} }
+        else if (m.t === "cd" && typeof m.d === "string") { try { (rawChdirW || proc.chdir).call(proc, m.d); } catch (e) {} }
+        // postMessageToThread, arriving from the main thread's router.
+        else if (m.t === "wm" && typeof m.id === "number") {
+          const r = emitWorkerMessage(decodeKeysTop(decWire(m.d)),
+                                      typeof m.src === "number" ? m.src : 0);
+          wsend({ t: "wr", id: m.id, r: r });
+        }
+        else if (m.t === "wr" && typeof m.id === "number") { wmSettle(m); }
+        else if (m.t === "bc" && typeof m.n === "string") {
+          const d = decWire(m.d);
+          if (bcLocalDeliver) bcLocalDeliver(m.n, d, null);
+          bcRelay(m.n, d, 0);
+        }
       });
     }
     // An uncaught throw inside a worker surfaces as an 'error' event on the
@@ -1727,6 +2105,75 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
     // The channel pins this process's event loop only while parentPort has a
     // sink — otherwise a worker that never listens would never exit.
     G.__mbunIpcPin = () => portHasListener(parentPort) || scopeHasMessageSink();
+
+    // ---- the operations a worker does not get -----------------------------
+    // node lib/internal/bootstrap/switches/is_not_main_thread.js: anything that
+    // mutates PROCESS state rather than thread state is replaced by a stub
+    // carrying `.disabled === true` and throwing ERR_WORKER_UNSUPPORTED_OPERATION
+    // (test-worker-unsupported-things walks the whole list). The V8-inspector
+    // debug hooks are deleted outright rather than stubbed.
+    //
+    // Called from node_process_extra, NOT here: process.send does not exist yet
+    // at this point in the image — __mbunSetupIpcChild assigns it later — so a
+    // stub installed here would simply be overwritten by the real one.
+    G.__mbunWorkerDisableProcessOps = function () {
+      if (typeof proc.send === "function" && proc.send.disabled !== true) {
+        const realSend = proc.send;
+        // A receiver that still reports an open channel: attachIpc's send()
+        // guards on `this.connected`, and `connected` becomes a getter that
+        // throws two blocks below.
+        const sendHost = Object.create(proc);
+        try { Object.defineProperty(sendHost, "connected", { value: true, writable: true, configurable: true }); } catch (e) {}
+        rawSendW = (frame) => realSend.call(sendHost, frame);
+      }
+      if (typeof proc.chdir === "function" && proc.chdir.disabled !== true) {
+        const realChdir = proc.chdir;
+        rawChdirW = realChdir.bind(proc);
+      }
+      const unsupported = (name) => {
+        const f = function () {
+          const e = new TypeError("process." + name + "() is not supported in workers");
+          e.code = "ERR_WORKER_UNSUPPORTED_OPERATION";
+          throw e;
+        };
+        f.disabled = true;
+        return f;
+      };
+      for (const name of ["abort", "chdir", "send", "disconnect", "setuid", "seteuid",
+                          "setgid", "setegid", "setgroups", "initgroups"]) {
+        try { proc[name] = unsupported(name); } catch (e) {}
+      }
+      // READING the umask is fine off the main thread; only setting it is a
+      // process-wide change, so node keeps the getter and rejects the setter.
+      {
+        const realUmask = proc.umask;
+        try {
+          proc.umask = function umask(mask) {
+            if (mask === undefined) return typeof realUmask === "function" ? realUmask.call(proc) : 0;
+            const e = new TypeError("Setting process.umask() is not supported in workers");
+            e.code = "ERR_WORKER_UNSUPPORTED_OPERATION";
+            throw e;
+          };
+        } catch (e) {}
+      }
+      for (const name of ["channel", "connected"]) {
+        try {
+          Object.defineProperty(proc, name, {
+            configurable: true, enumerable: false,
+            get() {
+              const e = new TypeError("process." + name + " is not supported in workers");
+              e.code = "ERR_WORKER_UNSUPPORTED_OPERATION";
+              throw e;
+            },
+            set() {},
+          });
+        } catch (e) {}
+      }
+      for (const name of ["_startProfilerIdleNotifier", "_stopProfilerIdleNotifier",
+                          "_debugProcess", "_debugPause", "_debugEnd"]) {
+        try { delete proc[name]; } catch (e) {}
+      }
+    };
   }
 
   const mod = {
@@ -1745,6 +2192,7 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
     isMarkedAsUntransferable,
     markAsUncloneable,
     moveMessagePortToContext,
+    postMessageToThread,
     setEnvironmentData,
     getEnvironmentData,
     SHARE_ENV,

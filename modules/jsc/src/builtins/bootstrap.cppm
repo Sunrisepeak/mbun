@@ -7162,9 +7162,35 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     if (s === undefined || s === null) return undefined;
     return new Promise((r) => G.setImmediate(r));
   };
+  // node's per-isolate symbols (src/node_symbols.cc). The DESCRIPTION is the
+  // name itself — the corpus finds kTransfer by scanning a prototype for the
+  // symbol whose description is 'messaging_transfer_symbol' — and every holder
+  // has to agree on the identity, so they live in one process-wide registry
+  // that internalBinding('symbols') and worker_threads both read.
+  const nodeSymbol = (name) => {
+    const reg = G.__mbunNodeSymbols || (G.__mbunNodeSymbols = { __proto__: null });
+    return reg[name] || (reg[name] = Symbol(name));
+  };
+  const kFhTransfer = nodeSymbol("messaging_transfer_symbol");
+  const kFhTransferList = nodeSymbol("messaging_transfer_list_symbol");
+  const kFhDeserialize = nodeSymbol("messaging_deserialize_symbol");
   class FileHandle {
     constructor(fd) { this._fd = fd; this._closed = false; this._refs = 0; this._events = { __proto__: null }; }
     get fd() { return this._fd; }
+    // node lib/internal/fs/promises.js marks a FileHandle transferable
+    // (markTransferMode(this, false, true)) and moves the DESCRIPTOR through
+    // postMessage(fh, [fh]) rather than cloning the object. The three hooks are
+    // the JSTransferable protocol worker_threads drives; their mere presence on
+    // the prototype is what the corpus overrides to prove the deserializer
+    // cannot be talked into loading arbitrary code
+    // (test-worker-message-port-transfer-fake-js-transferable*).
+    [kFhTransferList]() { return []; }
+    [kFhTransfer]() {
+      const fd = this._fd;
+      this._fd = -1;
+      return { data: { fd: fd }, deserializeInfo: "internal/fs/promises:FileHandle" };
+    }
+    [kFhDeserialize](data) { this._fd = data && data.fd !== undefined ? data.fd : -1; this._closed = false; }
     // node's FileHandle is an EventEmitter (emits "close"); createReadStream /
     // createWriteStream build fd-bound streams that autoClose the handle
     // (fs-leak: FileHandle stream must not leak the descriptor).
