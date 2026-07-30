@@ -5,6 +5,71 @@ session that is interrupted (usage limit, crash, restart) can pick up from the
 file rather than from memory. **If you are a fresh session reading this, start
 here.**
 
+## 2026-07-31 08:00 — POLICY: port directly wherever node's source is vendored
+
+User directive, verbatim: **"能直接移植的先直接移植 只要 mbun 是双兼容考虑即可 bun 和
+node。目前的核心是最快速度推进 覆盖所有测试集 性能 / 优化 等等 后期再做"**
+
+This supersedes the hedged wording in earlier briefs, which said "if the audit
+finds it genuinely divergent: 移植三段法". The audit stays, but its job is now to
+pick the port boundary, not to decide *whether* to port.
+
+### What the campaign was actually doing, checked rather than remembered
+
+Of the 14 implementation files touched in waves 58-62, **exactly one**
+(`async_hooks.cppm`) declares a mechanical translation. The rest carry no port
+marker. Several results were equivalent-behaviour rewrites rather than ports:
+
+- **REPL completion** — node moved the completer into
+  `internal/repl/completion.js` (802 lines, acorn-based) and it IS vendored. The
+  lane checked that only 1 of 4 "AST" cases needed a parser and wrote a **reverse
+  scanner** instead. +7 files, sound judgement, but not a port.
+- **`node:sqlite`** — a hand-written `DatabaseSync`/`StatementSync` shim over
+  `bun:sqlite`. Mitigating fact found afterwards: `compat/node/lib/sqlite.js` is
+  **3 lines** (a shell over a C++ binding), so there was no JS source to port —
+  but that also means the surface was reproduced from documentation, not translated.
+- **UTS-46** — `compat/node/lib/internal/idna.js` does **not** exist, so again no
+  source; the lane derived the disallowed set from `normalize()` at runtime.
+- **`FileSystemRouter`** — `modules/router/` (358 lines, C++) is STILL zero-import;
+  the lane wrote ~190 new lines of JS over `node:fs` instead. 0->29 files, but the
+  repo now carries two router implementations and one has no users.
+
+**Why the drift happened, so it does not recur:** my briefs made the audit
+mandatory and the port conditional. Under time pressure a lane will always take
+the faster path to green. The instruction order matters.
+
+### Direct-port candidates, measured (node source is vendored for all of these)
+
+| subsystem | node source | actionable | mbun today |
+| --- | ---: | ---: | --- |
+| **test runner** (`internal/test_runner/harness.js`) | **455** | **37** | hand-written |
+| worker_threads (`internal/worker.js`) | 738 | 32 | hand-written |
+| http client (`_http_client.js`) | 1105 | 20 | hand-written |
+| repl completion (`internal/repl/completion.js`) | 802 | 16 | hand-written |
+| repl core (`repl.js`) | 1505 | 16 | hand-written |
+| fs streams (`internal/fs/streams.js`) | 561 | 15 | hand-written |
+| module loader (`internal/modules/cjs/loader.js`) | 2202 | 13 | hand-written |
+| readline (`internal/readline/interface.js`) | 1620 | 4 | hand-written |
+
+**`test runner` is the best target on the board**: the smallest source and the
+highest actionable count. Take it next.
+
+### The three rules that now govern a lane
+
+1. **Port, do not re-implement**, wherever the source is vendored. Put a
+   `1:1 translation of ...` marker in the header so ported code is distinguishable.
+2. **Dual compatibility is the ONLY hard constraint.** Never trade a green node
+   file for a green bun file, or the reverse. Unchanged and absolute.
+3. **Perf is deferred.** Do not hold a port for optimization; record any regression
+   as a number and move on. One carve-out, and only one: a regression that slows
+   the CORPUS RUNS themselves costs every lane throughput, so measure and report
+   that case rather than absorbing it silently.
+
+**Do not start a port you cannot finish** on a surface with no safe partial state.
+The module loader is the live example: 2202 lines under every test in both corpora,
+and a half-ported loader has no working intermediate. Port the largest *coherent*
+piece, mark it, and name the next slice.
+
 ## 2026-07-31 06:00 — CI IS RED, AND IT IS NOT THIS PR. Do not chase it in the source.
 
 PR #35 cannot merge on "CI green" because **the base branch `rewrite_bun_in_mcpp`
