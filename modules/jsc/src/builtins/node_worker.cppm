@@ -1483,6 +1483,11 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
   let workerDataRaw = null;
   if (MY_TID !== undefined && MY_TID !== null && MY_TID !== "") {
     isMainThread = false;
+    // Bun.isMainThread is a plain data property installed as `true` by
+    // install_bindings_ (it has no way to know it is a worker); the worker
+    // child is the only place that knows otherwise. `import { isMainThread }
+    // from "bun"` reads the same object (builtin_module maps "bun" → Bun).
+    try { if (G.Bun) G.Bun.isMainThread = false; } catch (e) {}
     threadId = Number(MY_TID) | 0;
     threadName = typeof WENV.MBUN_WORKER_NAME === "string" ? WENV.MBUN_WORKER_NAME : "";
     // node's `eval: true` worker never has a file, so process.argv is
