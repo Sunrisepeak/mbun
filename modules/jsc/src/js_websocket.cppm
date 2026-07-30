@@ -337,6 +337,12 @@ export constexpr std::string_view kWebSocketJS = R"JS(
       for (let i = 0; i < 16; i++) keyBytes[i] = (Math.random() * 256) | 0;
       let ks = ""; for (let i = 0; i < 16; i++) ks += String.fromCharCode(keyBytes[i]);
       const key = G.btoa(ks);
+      // RFC 6455 §4.1 step 5: the client MUST fail the connection unless the
+      // response's Sec-WebSocket-Accept is base64(sha1(key + GUID)). Computed
+      // here, next to the key, and checked in _ingest.
+      // PORT-SOURCE: compat/bun/src/http_jsc/websocket_client/WebSocketUpgradeClient.rs
+      //              (expected_accept / compute_accept_value, check at :1538)
+      this._state.expectedAccept = acceptFor(key);
       this._wire = mkWire({
         sendRaw: (bytes) => { try { this._sock.write(bytes); } catch (e) {} },
         onText: (s) => this._emit("message", { data: s }),
@@ -419,6 +425,14 @@ export constexpr std::string_view kWebSocketJS = R"JS(
       }
       const head = s.slice(0, at);
       if (head.indexOf(" 101") === -1) { this._fail(new Error("Unexpected server response: " + (head.split("\r\n")[0] || ""))); return; }
+      // Sec-WebSocket-Accept validation. bun closes 1002 with these exact
+      // reasons and treats both as connection failures (error + close).
+      // ref: WebSocket.cpp:1704/1720 missing_/mismatch_websocket_accept_header.
+      if (this._state.expectedAccept) {
+        const am = /\r\nsec-websocket-accept:\s*([^\r\n]+)/i.exec(head);
+        if (!am) { this._fail(new Error("Missing websocket accept header"), 1002); return; }
+        if (am[1].trim() !== this._state.expectedAccept) { this._fail(new Error("Mismatch websocket accept header"), 1002); return; }
+      }
       const pm = /\r\nsec-websocket-protocol:\s*([^\r\n]+)/i.exec(head);
       if (pm) this.protocol = pm[1].trim();
       const em = /\r\nsec-websocket-extensions:\s*([^\r\n]+)/i.exec(head);
@@ -429,10 +443,10 @@ export constexpr std::string_view kWebSocketJS = R"JS(
       const rest = s.slice(at + 4);
       if (rest.length) { const b = new Uint8Array(rest.length); for (let i = 0; i < rest.length; i++) b[i] = rest.charCodeAt(i) & 0xff; this._wire.feed(b); }
     }
-    _fail(err) {
+    _fail(err, code) {
       if (this._state.done) return;
       this._emit("error", { error: err, message: String((err && err.message) || err) });
-      this._finish(1006, String((err && err.message) || err), false);
+      this._finish(code || 1006, String((err && err.message) || err), false);
     }
     _finish(code, reason, wasClean) {
       if (this._state.done) return;
