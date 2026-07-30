@@ -775,15 +775,54 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       const s = M["stream"] || M["node:stream"];
       return (s && s.Transform) || Transform;
     };
-    function Hash(algo, opts) {
+    // node latches every deprecation by CODE (internal/util.js `codesWarned`), so
+    // a warning fires at most once per process no matter how many times the
+    // deprecated path is taken. Emitting per call made `common.expectWarning`
+    // report "Unexpected extra warning" for any file that built more than one
+    // SHAKE digest.
+    const cryptoCodesWarned = new Set();
+    const emitCryptoDeprecation = (code, msg) => {
+      if (cryptoCodesWarned.has(code)) return;
+      cryptoCodesWarned.add(code);
+      if (G.process && typeof G.process.emitWarning === "function") {
+        G.process.emitWarning(msg, "DeprecationWarning", code);
+      }
+    };
+    // node internal/crypto/hash.js validates options.outputLength with
+    // validateUint32 BEFORE the handle is built, so a bad length is a creation
+    // error rather than a digest-time one.
+    const validateOutputLength = (v) => {
+      if (typeof v !== "number") throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "options.outputLength" property must be of type number.' + invalidArgType(v));
+      if (!Number.isInteger(v)) throw mkErr(RangeError, "ERR_OUT_OF_RANGE", 'The value of "options.outputLength" is out of range. It must be an integer. Received ' + v);
+      if (v < 0 || v > 4294967295) throw mkErr(RangeError, "ERR_OUT_OF_RANGE", 'The value of "options.outputLength" is out of range. It must be >= 0 && <= 4294967295. Received ' + v);
+    };
+    // Natural digest size per algorithm, memoized. Only consulted when an
+    // explicit outputLength was given for a NON-XOF algorithm, which node's
+    // native EVP layer rejects at creation with
+    // ERR_OSSL_EVP_NOT_XOF_OR_INVALID_LENGTH unless it equals the natural size.
+    const naturalDigestLen = new Map();
+    const digestLenOf = (algo) => {
+      const k = NORM(algo);
+      let n = naturalDigestLen.get(k);
+      if (n === undefined) { n = digestBytes(algo, new Uint8Array(0), 0).length; naturalDigestLen.set(k, n); }
+      return n;
+    };
+    // `isCopy` mirrors node's `algorithm instanceof _Hash` branch: a copy takes
+    // its outputLength from the options it was handed (defaulting when absent)
+    // and never re-emits the SHAKE deprecation.
+    function Hash(algo, opts, isCopy) {
       const self = Reflect.construct(streamTransform(), [], Hash);
       self._algo = algo; self._fn = hashFns[NORM(algo)];
-      self._out = opts && typeof opts.outputLength === "number" ? opts.outputLength : -1;  // -1 = native default (XOF); 0 = explicit empty
-      if (NORM(algo).startsWith("shake") && self._out < 0 && G.process &&
-          typeof G.process.emitWarning === "function") {
-        G.process.emitWarning(
-          "Creating SHAKE128/256 digests without an explicit options.outputLength is deprecated.",
-          "DeprecationWarning", "DEP0198");
+      const xofLen = opts !== null && typeof opts === "object" ? opts.outputLength : undefined;
+      if (xofLen !== undefined) validateOutputLength(xofLen);
+      self._out = xofLen === undefined ? -1 : xofLen;  // -1 = native default (XOF); 0 = explicit empty
+      if (self._out >= 0 && !NORM(algo).startsWith("shake") && self._out !== digestLenOf(algo)) {
+        throw mkErr(Error, "ERR_OSSL_EVP_NOT_XOF_OR_INVALID_LENGTH",
+          "Output length " + self._out + " is invalid for " + algo + ", which does not support XOF");
+      }
+      if (!isCopy && NORM(algo).startsWith("shake") && xofLen === undefined) {
+        emitCryptoDeprecation("DEP0198",
+          "Creating SHAKE128/256 digests without an explicit options.outputLength is deprecated.");
       }
       self._chunks = []; self._done = false;
       return self;
@@ -824,7 +863,11 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
     Hash.prototype._flush = function (cb) { this.push(encode(this._rawDigest())); cb(); };
     // node's Hash#copy clones the EVP context, which is gone once digest() ran:
     // copying a finalized hash throws, exactly like update() does.
-    Hash.prototype.copy = function () { if (this._done) throw mkErr(Error, "ERR_CRYPTO_HASH_FINALIZED", "Digest already called"); const h = new Hash(this._algo, { outputLength: this._out }); h._chunks = this._chunks.slice(); return h; };
+    // node: `copy(options)` is `new Hash(handle, options)` — the clone's XOF
+    // length comes from the options passed to copy() and NOT from the source, so
+    // `createHash('shake256', { outputLength: 0 }).copy()` digests at the default
+    // length while `.copy({ outputLength: 5 })` overrides a source length of 0.
+    Hash.prototype.copy = function (options) { if (this._done) throw mkErr(Error, "ERR_CRYPTO_HASH_FINALIZED", "Digest already called"); const h = new Hash(this._algo, options, true); h._chunks = this._chunks.slice(); return h; };
     // node exposes the native context under a `kHandle` symbol whose methods must
     // reject a bad `this` with ERR_INVALID_THIS (rather than dereferencing a null
     // native pointer). We mirror that contract with a guarded handle object.
@@ -859,7 +902,12 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
     };
     Hmac.prototype._transform = function (chunk, e, cb) { this.update(chunk); cb(); };
     Hmac.prototype._flush = function (cb) { this.push(this.digest()); cb(); };
-    function createHash(algo, opts) { if (typeof algo !== "string") throw new TypeError('The "algorithm" argument must be of type string. Received ' + (algo === null ? "null" : typeof algo)); if (!supported(algo)) throw new Error("Digest method not supported"); return new Hash(algo, opts); }
+    // The .code is set inline rather than through mkErr(): mkErr is a `const`
+    // declared BELOW this function declaration, and a hoisted function that
+    // reaches for it is only safe once the module body has run past that line.
+    // An earlier attempt to route createHmac through mkErr was reverted; keep
+    // these two constructors self-contained.
+    function createHash(algo, opts) { if (typeof algo !== "string") { const e = new TypeError('The "algorithm" argument must be of type string. Received ' + (algo === null ? "null" : typeof algo)); e.code = "ERR_INVALID_ARG_TYPE"; throw e; } if (!supported(algo)) throw new Error("Digest method not supported"); return new Hash(algo, opts); }
     // node prepareSecretKey(): the key must be a string, a BufferSource, a
     // *branded* KeyObject, or a CryptoKey. It used to reject only null/undefined,
     // so an arbitrary object — including one wearing KeyObject.prototype with no
@@ -886,6 +934,34 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       if (typeof input === "object") { const n = input.constructor && input.constructor.name; return n ? " Received an instance of " + n : " Received " + String(input); }
       if (typeof input === "string") { let s = input; if (s.length > 28) s = s.slice(0, 25) + "..."; return s.indexOf("'") === -1 ? " Received type string ('" + s + "')" : " Received type string (" + JSON.stringify(s) + ")"; }
       return " Received type " + typeof input + " (" + String(input) + ")";
+    };
+    // node lib/internal/crypto/random.js assertSize(): validateNumber first, then
+    // the range, then a uint32 truncation (which is why randomBytes(101.2) yields
+    // 101 bytes rather than throwing). kMaxPossibleLength is
+    // MathMin(buffer.kMaxLength, 2**31-1); this build's kMaxLength IS 2**31-1, so
+    // the min is that constant. Both errors have to fire BEFORE the callback is
+    // even looked at — node validates the size first and the corpus asserts the
+    // two-argument form throws identically.
+    const kMaxRandomSize = 2147483647;
+    const assertRandomSize = (size) => {
+      if (typeof size !== "number") throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "size" argument must be of type number.' + invalidArgType(size));
+      if (Number.isNaN(size) || size > kMaxRandomSize || size < 0) {
+        throw mkErr(RangeError, "ERR_OUT_OF_RANGE", 'The value of "size" is out of range. It must be >= 0 && <= ' + kMaxRandomSize + '. Received ' + size);
+      }
+      return size >>> 0;
+    };
+    // node util.deprecate() for a constructor: the wrapper forwards `new.target`
+    // so `new C()` and `C()` both behave, inherits statics via the prototype
+    // chain, and shares `.prototype` so instanceof against the wrapper holds.
+    const deprecateCtor = (Ctor, msg, code) => {
+      const wrapper = function (...args) {
+        emitCryptoDeprecation(code, msg);
+        return new.target ? Reflect.construct(Ctor, args, new.target) : Ctor.apply(this, args);
+      };
+      Object.setPrototypeOf(wrapper, Ctor);
+      Object.defineProperty(wrapper, "prototype", { value: Ctor.prototype, writable: false, enumerable: false, configurable: false });
+      Object.defineProperty(wrapper, "name", { value: Ctor.name, configurable: true });
+      return wrapper;
     };
     const isDataInput = (d) => typeof d === "string" || d instanceof Uint8Array || ArrayBuffer.isView(d) || d instanceof ArrayBuffer;
     // crypto.hash(algorithm, data[, outputEncoding]) — one-shot digest (default hex).
@@ -1015,6 +1091,7 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       // crypto.randomBytes(size[, cb]) — sync return, or async when a callback is
       // given (node passes null as the error on success).
       randomBytes: (n, cb) => {
+        n = assertRandomSize(n);
         if (typeof cb === "function") { const b = rb(n); deferCb(() => cb(null, b)); return; }
         return rb(n);
       },
@@ -1022,14 +1099,17 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       // three literally randomBytes (lib/crypto.js `getRandomBytesAlias`).
       // Still exported, and still called by the corpus (test-domain-crypto).
       pseudoRandomBytes: (n, cb) => {
+        n = assertRandomSize(n);
         if (typeof cb === "function") { const b = rb(n); deferCb(() => cb(null, b)); return; }
         return rb(n);
       },
       prng: (n, cb) => {
+        n = assertRandomSize(n);
         if (typeof cb === "function") { const b = rb(n); deferCb(() => cb(null, b)); return; }
         return rb(n);
       },
       rng: (n, cb) => {
+        n = assertRandomSize(n);
         if (typeof cb === "function") { const b = rb(n); deferCb(() => cb(null, b)); return; }
         return rb(n);
       },
@@ -1076,7 +1156,14 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
         for (let i = 0; i < 16; i++) s += b[i].toString(16).padStart(2, "0");
         return s.slice(0, 8) + "-" + s.slice(8, 12) + "-" + s.slice(12, 16) + "-" + s.slice(16, 20) + "-" + s.slice(20);
       },
-      createHash, createHmac, Hash, Hmac,
+      createHash, createHmac,
+      // node lib/crypto.js exports the CONSTRUCTORS through util.deprecate
+      // (DEP0179 / DEP0181) while createHash/createHmac call the undecorated
+      // ones. So `crypto.Hash('sha256')` warns and `crypto.createHash('sha256')`
+      // does not, and `instance instanceof crypto.Hash` still has to hold —
+      // hence the prototype is carried across to the wrapper.
+      Hash: deprecateCtor(Hash, "crypto.Hash constructor is deprecated.", "DEP0179"),
+      Hmac: deprecateCtor(Hmac, "crypto.Hmac constructor is deprecated.", "DEP0181"),
       getHashes: () => ["md5", "sha1", "sha224", "sha256", "sha384", "sha512", "sha512-256", "sha3-224", "sha3-256", "sha3-384", "sha3-512", "shake128", "shake256", "blake2b512", "blake2b256", "blake2s256"],
       // Real PBKDF2 (RFC 2898): native mbun.crypto for supported PRFs, JS otherwise.
       pbkdf2Sync: (password, salt, iterations, keylen, digest) => {
