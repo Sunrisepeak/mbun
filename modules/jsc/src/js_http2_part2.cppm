@@ -550,7 +550,12 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
       this._hpack = new HpackDecoder();
       this._maxFrameSize = constants.DEFAULT_SETTINGS_MAX_FRAME_SIZE;
       this._remoteSettings = null;
-      this._localSettings = { headerTableSize: 4096, enablePush: 0, initialWindowSize: 65535, maxFrameSize: 16384, maxConcurrentStreams: 4294967295 };
+      // node's server session advertises the compiled-in defaults with
+      // SETTINGS_ENABLE_PUSH off, and its `localSettings` reflects whatever
+      // `createServer({ settings })` asked for (customSettings included) — see
+      // settingsView(). enablePush stays false whatever the caller passed: RFC
+      // 9113 6.5.2 forbids a server advertising a non-zero value.
+      this._localSettings = { headerTableSize: 4096, enablePush: false, initialWindowSize: 65535, maxFrameSize: 16384, maxConcurrentStreams: 4294967295, maxHeaderListSize: 65535, enableConnectProtocol: false };
       this._pendingHeaderBlock = null;
       this._lastStreamId = 0;
       // connection-level flow control bookkeeping, surfaced through `state`
@@ -587,6 +592,7 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
       // -cant-turn-off). It is updated at SUBMIT time, not on the peer's ACK.
       const _cpSettings = _srvSettings || this._options.settings;
       this._localConnectProtocol = !!(_cpSettings && _cpSettings.enableConnectProtocol);
+      if (_cpSettings) { Object.assign(this._localSettings, _cpSettings); this._localSettings.enablePush = false; }
       this._writeFrame(FRAME.SETTINGS, 0, 0, encodeSettings(
         _srvSettings && "enablePush" in _srvSettings
           ? Object.assign({}, _srvSettings, { enablePush: false })
@@ -689,9 +695,9 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
           const rangeErr = settingsRangeError(payload);
           if (rangeErr) { this._connError(rangeErr); return false; }
           if (connectProtocolWithdrawn(this, payload)) { this._connError(constants.NGHTTP2_PROTOCOL_ERROR); return false; }
-          this._remoteSettings = parseSettingsPayload(payload);
+          this._remoteSettings = parseSettingsPayload(payload); this._remoteSettingsView = undefined;
           this._writeFrame(FRAME.SETTINGS, FLAG.ACK, 0, Buffer.alloc(0));
-          this.emit("remoteSettings", settingsToObject(this._remoteSettings));
+          this.emit("remoteSettings", remoteSettingsOf(this));
           return true;
         }
         case FRAME.HEADERS: {
@@ -932,6 +938,7 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
       if (this.destroyed) return;
       this.destroyed = true; this.closed = true;
       if (this._timer != null) { try { G.clearTimeout(this._timer); } catch (e) {} this._timer = null; }
+      cancelSessionPings(this);
       closeSessionSocket(this.socket, hard !== false);
       const streams = Array.from(this.streams.values());
       const self = this;
@@ -939,8 +946,8 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
     }
     // ---- public surface ----
     get connected() { return !this.destroyed; }
-    get remoteSettings() { return this._remoteSettings ? settingsToObject(this._remoteSettings) : undefined; }
-    get localSettings() { return this._localSettings; }
+    get remoteSettings() { return remoteSettingsOf(this); }
+    get localSettings() { return localSettingsOf(this); }
     // server-initiated streams are even-numbered; we never push, so the next id
     // a server session would allocate stays 2 (node reports the same).
     get state() { return sessionState(this, (this._lastPushId || 0) + 2); }
@@ -1017,7 +1024,7 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
     }
     _armTimeout() {
       if (this._timer != null) { try { G.clearTimeout(this._timer); } catch (e) {} this._timer = null; }
-      if (!this._timeoutMs || this.destroyed) return;
+      if (!this._timeoutMs || this.destroyed) { syncSessionTimeout(this); return; }
       const self = this;
       this._timer = G.setTimeout(() => {
         self._timer = null;
@@ -1026,6 +1033,7 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
         for (const s of Array.from(self.streams.values())) { try { s.emit("timeout"); } catch (e) {} }
       }, this._timeoutMs);
       if (this._timer && this._timer.unref) this._timer.unref();
+      syncSessionTimeout(this);
     }
   }
 
@@ -1057,6 +1065,7 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
       maxFrameSize: s[5] !== undefined ? s[5] : 16384,
       maxHeaderListSize: s[6] !== undefined ? s[6] : 65535,
       enableConnectProtocol: s[8] !== undefined ? s[8] : 0,
+      customSettings: customFromRawSettings(s),
     };
   }
   // RFC 8441 3: SETTINGS_ENABLE_CONNECT_PROTOCOL is one-way. A peer that has
@@ -2111,6 +2120,31 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
   http2.ServerHttp2Stream = ServerHttp2Stream;
   http2.Http2ServerRequest = Http2ServerRequest;
   http2.Http2ServerResponse = Http2ServerResponse;
+
+  // `require("internal/http2/core")` — mbun's http2 IS its internal http2 core,
+  // so resolve the specifier to this module rather than to node's own
+  // lib/internal/http2/core.js. Three corpus files destructure a CLASS out of
+  // it and compare a live mbun session against it
+  // (`assert(session instanceof ServerHttp2Session)` in
+  // test-http2-server-sessionerror, -options-max-headers-exceeds-nghttp2 and
+  // -invalid-last-stream-id). Loading node's core.js gave them node's own class
+  // objects, which nothing mbun creates can ever be an instance of, so the
+  // check was unsatisfiable — a pure identity mismatch, not a behavioural gap.
+  // Only those three files and node's unused lib/http2.js reference the
+  // specifier at all; `internal/http2/util` deliberately keeps resolving to
+  // node's file, because the SYMBOLS minted there are the ones the corpus reads
+  // (see adoptNodeHttp2Internals).
+  M["internal/http2/core"] = {
+    Http2Session: ClientHttp2Session,
+    ClientHttp2Session, ServerHttp2Session,
+    ClientHttp2Stream, ServerHttp2Stream,
+    Http2ServerRequest, Http2ServerResponse,
+    connect, constants,
+    createServer: makeHttp2Server,
+    createSecureServer: makeHttp2SecureServer,
+    getDefaultSettings, getPackedSettings, getUnpackedSettings,
+    get sensitiveHeaders() { return http2.sensitiveHeaders; },
+  };
 })();
 
 )JS";
