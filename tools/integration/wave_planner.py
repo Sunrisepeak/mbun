@@ -237,19 +237,35 @@ def throughput(ledger: list[dict[str, str]],
     """files/hour per corpus, from verified rows only. The mean plus the max, since
     with this few rows the max is what proves a rate is achievable.
 
-    Rows whose AREA is now struck are excluded from the model. This is not
-    flattery: those lanes measured real throughput, but they measured it against
-    targets the strategy will never choose again, so including them predicts the
-    wrong thing. Concretely, bun lanes D (bake/dev) and E (bundler) delivered 0 and
-    1 file and both areas are now struck TOO_BIG -- leaving them in pulled bun's
-    mean down to 2.0 files/hour and set a +6 goal for an area where another lane
-    had just delivered +13.
+    A struck AREA disqualifies a row only when that row ALSO delivered nothing.
+    The original rule dropped every row in a struck area, which was right about
+    the symptom and wrong about the cause: bun lanes D (bake/dev) and E (bundler)
+    delivered 0 and 1 file into areas now struck TOO_BIG, and leaving them in
+    pulled bun's mean to 2.0 files/hour. But the same rule then discarded lanes
+    that had SUCCEEDED in areas where some later vein happened to be struck --
+    measured on 2026-07-30 it dropped 7 of 9 bun rows, including w57 I (13 files
+    in 160 min) and w58 N (8 in 350), and left bun's model resting on 2 rows at
+    2.6 files/hour against node's 8.1. That directly under-planned every bun lane
+    (+3 goals against node's +13) on a campaign whose stated requirement is BOTH
+    corpora, and it got worse every time a lane did its job of recording a dead
+    vein -- an honest negative result silently shrank its own corpus's budget.
+
+    A lane that delivered N files in M minutes proved that rate is reachable, and
+    a strike on some vein in the area does not un-prove it. So the strike ledger
+    governs where to AIM (see plan()), and only a zero-delivery row in a struck
+    area is dropped from how fast we assume lanes GO.
     """
     stats: dict[str, dict[str, float]] = {}
     excluded = excluded or {}
     for corpus in {row.get("corpus", "") for row in ledger}:
-        rows = [r for r in ledger if r.get("corpus") == corpus
-                and not is_struck(r.get("area", ""), excluded)]
+        def _bust(r: dict[str, str]) -> bool:
+            try:
+                got = float(r.get("delivered", 0) or 0)
+            except ValueError:
+                return False
+            return got <= 0 and bool(is_struck(r.get("area", ""), excluded))
+
+        rows = [r for r in ledger if r.get("corpus") == corpus and not _bust(r)]
         if not rows:
             rows = [r for r in ledger if r.get("corpus") == corpus]
         rates = []

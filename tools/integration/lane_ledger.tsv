@@ -38,3 +38,8 @@ wave	lane	corpus	area	shape	goal	delivered	minutes	regressions	note
 58	L	node	test-async	port	23	10	290	0	full port of node async_hooks; first submission failed the perf gate (.then 5.6-8x), resubmitted at parity by gating trackPromise on enabled hooks
 58	N	bun	js/node	port	11	8	350	0	ALS await propagation via m_asyncContextData; found Bun.gc was a no-op and JSGarbageCollect only hints
 58	M	bun	js/bun	fix	11	6	240	0	csrf/router modules exist and are unwired; differential harness gave a regression verdict before the first build
+62	BC	node	test-fs	fix	6	4	150	0	fs-promises FileHandle error aggregation; caught that PORT_MARKERS missed this repo's PORT-SOURCE: form, so 13 files including node_fs_streams were misjudged hand-written
+62	BE	node	test-module	port	8	7	180	0	1:1 port of node lib/internal/modules/cjs/loader.js -- Module record, symlink identity, circular-require warning proxy; require.main as an accessor because install_cjs_env can run after the first require closure is minted
+62	BA	bun	js/bun	port	9	6	210	0	mock.module for real modules + retry/repeats/onTestFinished; mock key falls back to a lexically normalised path so an unresolvable specifier is still mockable
+62	BB	bun	regression/issue	fix	4	4	165	0	junit reporter, label-filtered hooks, async HTMLRewriter handlers, legacy encrypted PEM
+62	W61S	bun	salvage	fix	0	1	0	0	two W61 lanes died on API 529 AFTER committing; recovered from their branches rather than rewritten -- openSync numeric O_* passthrough and `publish` subcommand registration. Cost 0 lane-minutes: check dead lanes' branches before re-dispatching their work

@@ -46,6 +46,12 @@ printf 'wave\tlane\tcorpus\tarea\tgoal\tdelivered\tminutes\tregressions\tnote\n'
   printf '1\tA\tnode\ttest-alpha\t6\t10\t60\t0\t-\n'   # 10 files/hour
   printf '1\tB\tnode\ttest-beta\t6\t20\t60\t0\t-\n'   # 20 files/hour -> mean 15
   printf '1\tC\tbun\tjs/beta\t6\t2\t60\t0\t-\n'     # 2 files/hour
+  # A lane that SUCCEEDED in an area where some vein was later struck. Its rate
+  # is real and must stay in the model; only a zero-delivery row in a struck
+  # area is a bust. Dropping rows like this once discarded 7 of 9 bun rows.
+  printf '1\tD\tbun\tnapi/node-napi-tests\t6\t6\t60\t0\tsucceeded before the strike\n'
+  # A genuine bust: struck area AND delivered nothing. This one must be dropped.
+  printf '1\tE\tbun\tnapi/node-napi-tests\t6\t0\t120\t0\tbust\n'
 } >>"$tmp/ledger.tsv"
 
 # Pin the disk reading: the guard is real and correctly refuses to plan when the
@@ -59,7 +65,9 @@ out() { run "$@" 2>&1 || true; }
 o=$(out --throughput)
 echo "$o" | grep -q 'mean 15.0 files/hour' || fail "node mean should be 15.0 files/hour"
 echo "$o" | grep -q 'best 20.0'            || fail "node best should be 20.0"
-echo "$o" | grep -q 'mean 2.0 files/hour'  || fail "bun mean should be 2.0 files/hour"
+# bun models rows C (2 files/h) and D (6 files/h); the zero-delivery bust E is
+# dropped. Mean 4.0, not 2.0 -- D is a real lane that really delivered.
+echo "$o" | grep -q 'mean 4.0 files/hour'  || fail "bun mean should be 4.0 files/hour (rows C and D)"
 pass "throughput is computed from the ledger, per corpus"
 
 # --- goals follow measured throughput ----------------------------------------
@@ -70,8 +78,11 @@ echo "$o" | grep -qE 'GOAL \+15' || fail "node goal should be 15 (capped by 20 a
 pass "a node goal is set from measured rate, capped by actionable count"
 
 o=$(out --plan 5 --bun-run "$tmp/bunrun")
-# bun: mean 2/h x 2h = 4, under the 12 actionable, x0.75 -> 3
-echo "$o" | grep -qE 'GOAL \+3' || fail "bun goal should be 3 from its slower measured rate"
+# bun: mean 4/h x 2h = 8, under the 12 actionable, x0.75 -> 6. This number is
+# the whole point of the throughput fix: while a succeeded-then-struck lane was
+# being discarded, bun modelled at 2/h and every bun lane was planned at +3
+# against node's +15 -- on a campaign that requires BOTH corpora.
+echo "$o" | grep -qE 'GOAL \+6' || fail "bun goal should be 6 from its measured rate"
 pass "a slower corpus gets a proportionally smaller goal"
 
 # --- struck areas are never planned ------------------------------------------
@@ -192,6 +203,20 @@ rc=$?
 set -e
 [ "$rc" -ne 0 ] || fail "no mode must be a usage error, not a silent no-op"
 pass "a missing mode is a usage error"
+
+# --- a strike governs where to AIM, not how fast lanes are assumed to GO ------
+# Lane D delivered 6 files/hour in an area later struck; lane E delivered 0 in
+# the same area. Only E is a bust. If both were dropped, bun would model as the
+# single 2 files/hour row C -- which is exactly the bug: recording an honest
+# dead vein silently shrank its own corpus's throughput budget, and bun's model
+# collapsed to 2 of 9 rows while its two best lanes were discarded.
+o=$(run --throughput)
+bun_line=$(echo "$o" | grep -A1 '^bun:' | tail -1)
+echo "$o" | grep -qE '^bun: 2 lanes' \
+  || fail "bun must model from 2 rows (C and D), dropping only the zero-delivery bust; got: $(echo "$o" | grep '^bun:')"
+echo "$bun_line" | grep -q 'best 6.0' \
+  || fail "the succeeded-then-struck lane's rate must survive as the achievable best; got: $bun_line"
+pass "a strike drops a zero-delivery row but keeps a lane that actually delivered"
 
 # --- the checked-in inputs must parse ----------------------------------------
 o=$(python3 "$tool" --throughput 2>&1)
