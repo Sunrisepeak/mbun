@@ -1089,12 +1089,32 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
 
   function createHttpServer(o, handler, baseSrv) {
     if (typeof o === "function") { handler = o; o = {}; }
+    // lib/_http_server.js Server: anything that is not a function and not
+    // null/undefined goes through validateObject(options, 'options'), which
+    // rejects a string / number / boolean / ARRAY (test-http-server's first
+    // block walks exactly those four). `o = o || {}` accepted all of them.
+    else if (o !== undefined && o !== null) {
+      if (typeof o !== "object" || Array.isArray(o)) {
+        const e = new TypeError(
+          'The "options" argument must be of type object. Received ' +
+          (Array.isArray(o) ? "an instance of Array" : "type " + typeof o));
+        e.code = "ERR_INVALID_ARG_TYPE";
+        throw e;
+      }
+    }
     o = o || {};
     // lib/_http_server.js storeHTTPOptions keeps `options.highWaterMark` and
     // node's net.Server hands it to every accepted socket, which is where both
     // `req._readableState.highWaterMark` and `res[kHighWaterMark]` come from
     // (test-http-server-options-highwatermark).
-    const srv = baseSrv || new Server({ allowHalfOpen: false, highWaterMark: o.highWaterMark });
+    // lib/_http_server.js Server hands net.Server `noDelay: options.noDelay ?? true`
+    // — an http server disables Nagle on every accepted connection by default,
+    // and `server.noDelay` is readable (test-http-nodelay).
+    const srv = baseSrv || new Server({
+      allowHalfOpen: false,
+      highWaterMark: o.highWaterMark,
+      noDelay: o.noDelay === undefined ? true : o.noDelay,
+    });
     const connEvent = baseSrv ? "secureConnection" : "connection";
     srv._httpConns = new Set();
     const ResponseClass = typeof o.ServerResponse === "function" ? o.ServerResponse : ServerResponse;
@@ -1153,6 +1173,12 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
     const srvLenientHeaders = o.httpValidation === undefined
       ? o.insecureHTTPParser === true
       : (o.httpValidation === "relaxed" || o.httpValidation === "insecure");
+    // lib/_http_server.js Server: `this[kUniqueHeaders] =
+    // parseUniqueHeadersOption(options.uniqueHeaders)`, handed to every response.
+    const kUniqueHeadersSym = HI.kUniqueHeaders;
+    const srvUniqueHeaders = typeof HI.parseUniqueHeadersOption === "function"
+      ? HI.parseUniqueHeadersOption(o.uniqueHeaders) : null;
+    if (kUniqueHeadersSym) srv[kUniqueHeadersSym] = srvUniqueHeaders;
     if (o.maxHeaderSize !== undefined) vInt(o.maxHeaderSize, "maxHeaderSize", 0);
     srv.maxHeaderSize = o.maxHeaderSize;
     // lib/_http_server.js storeHTTPOptions: `options.shouldUpgradeCallback`
@@ -1388,6 +1414,17 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
       // asserts it after handing a socket to a worker over IPC). connEvent is
       // 'secureConnection' for https, so this must stay on the dynamic name.
       sock.server = srv;
+      // node lib/_http_server.js connectionListenerInternal:
+      // `socket.setEncoding = socketSetEncoding`, i.e. changing a connection
+      // socket's encoding is refused outright -- the parser needs raw bytes and
+      // RFC 7230 3. framing does not survive a decoder in front of it
+      // (test-http-socket-encoding-error).
+      sock.setEncoding = function socketSetEncoding() {
+        const e = new Error(
+          "Changing the socket encoding is not allowed per RFC7230 Section 3.");
+        e.code = "ERR_HTTP_SOCKET_ENCODING";
+        throw e;
+      };
       // node lib/_http_server.js connectionListenerInternal: `socket.on('error',
       // socketOnError)`. This was a noop, which silently swallowed every error
       // that reached the connection socket by the EVENT path rather than through
@@ -1446,6 +1483,16 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
         // test-http-keep-alive-pipeline-max-requests, all three on a `req.on
         // ('end')` that stopped firing.
         const parserAtClose = sock.parser;
+        // node's socketOnClose reaches freeParser -> cleanParser SYNCHRONOUSLY,
+        // so a user 'close' listener already sees the kOn* slots nulled. The
+        // freeParser call below has to stay deferred for the reasons above, but
+        // the callback slots are not what that deferral protects (only
+        // parser.incoming is), so drop them here on node's schedule
+        // (test-http-parser-memory-retention reads parser[kOnTimeout] from inside
+        // the socket's own 'close' handler).
+        if (parserAtClose) {
+          parserAtClose[0] = null; parserAtClose[5] = null; parserAtClose[6] = null;
+        }
         const closeLater = () => {
           if (freeParser && parserAtClose) { try { freeParser(parserAtClose, null, sock); } catch (e) {} }
           abortIncoming();
@@ -1566,6 +1613,11 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
         // insecureHTTPParser flag selects llhttp's lenient flags for inbound
         // requests, exactly as the client option does for responses.
         if (o.insecureHTTPParser || o.httpValidation === "insecure") parser.lenient = true;
+        // httpValidation: 'relaxed' is llhttp's lenient_header_value_relaxed and
+        // ONLY that -- inbound header values may carry control bytes, while
+        // obs-fold and a duplicate Transfer-Encoding stay rejected (which is the
+        // distinction test-http-header-value-relaxed tests 14/16 draw).
+        else if (o.httpValidation === "relaxed") parser.lenientHeaderValues = true;
         sock._httpParser = parser;
         // node keeps ONE parser per connection and republishes it as
         // `socket.parser`; this translation re-arms a fresh parser per message,
@@ -1580,6 +1632,15 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
           parser.socket = sock;
           parser.incoming = null;
           parser.outgoing = null;
+          // node lib/_http_server.js connectionListenerInternal:
+          // `parser[kOnTimeout] = onParserTimeout.bind(undefined, server, socket)`
+          // — the slot the parser's own read timeout fires into, which gives the
+          // server a chance to claim it via 'timeout' before the socket dies.
+          // Slot 6 is HTTPParser.kOnTimeout; freeParser() nulls it again
+          // (test-http-parser-memory-retention reads it in both states).
+          parser[6] = function onParserTimeout() {
+            if (!srv.emit("timeout", sock)) sock.destroy();
+          };
         }
         let im = null;
         let res = null;
@@ -1812,6 +1873,13 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
             rejectNonStandardBodyWrites: srv.rejectNonStandardBodyWrites,
           });
           if (kLenientHeaders && srvLenientHeaders) res[kLenientHeaders] = true;
+          // node lib/_http_server.js parserOnIncoming:
+          // `res[kUniqueHeaders] = server[kUniqueHeaders]`. The client side of
+          // `uniqueHeaders` was wired (ClientRequest reads options.uniqueHeaders)
+          // but the server's never reached its responses, so a listed header sent
+          // as an array went out as repeated lines instead of one '; '-joined line
+          // (test-http-multiple-headers).
+          if (kUniqueHeadersSym && srvUniqueHeaders) res[kUniqueHeadersSym] = srvUniqueHeaders;
           res._keepAliveTimeout = srv.keepAliveTimeout;
           res._maxRequestsPerSocket = srv.maxRequestsPerSocket;
           res.shouldKeepAlive = keepAlive;

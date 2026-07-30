@@ -2381,6 +2381,23 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       return this._addr;
     }
     close(cb) {
+      // node net.js Server.prototype.close: the callback is registered as a
+      // one-shot 'close' listener, so a SUCCESSFUL close calls it with NO
+      // argument, and closing a server that is not running calls it with
+      // ERR_SERVER_NOT_RUNNING. mbun passed `null` in both cases, which
+      // test-http-unix-socket reads directly (`strictEqual(error, undefined)`
+      // then `expectsError({ code: 'ERR_SERVER_NOT_RUNNING' })`).
+      const running = !!(this._clusterHandle || this._handle || this._fd >= 0);
+      const done = typeof cb === "function"
+        ? () => G.queueMicrotask(() => {
+            if (running) cb();
+            else {
+              const e = new Error("Server is not running.");
+              e.code = "ERR_SERVER_NOT_RUNNING";
+              cb(e);
+            }
+          })
+        : () => {};
       if (this._clusterHandle) {
         // The handle owns the descriptor (shared case) and the primary-side
         // bookkeeping (round-robin case); closing this._fd here too would be a
@@ -2389,7 +2406,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
         this.listening = false;
         if (this._fd >= 0) { this._fd = -1; NET.items.delete(this); this._release(); }
         try { h.close(); } catch (e) {}
-        if (typeof cb === "function") G.queueMicrotask(() => cb(null));
+        done();
         G.queueMicrotask(() => this.emit("close"));
         return this;
       }
@@ -2401,7 +2418,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
         // abstract sockets, leading NUL). Already-gone is fine.
         if (this._unixPath && this._unixPath[0] !== "\0") { try { (M["fs"] || M["node:fs"]).unlinkSync(this._unixPath); } catch (e) {} }
       }
-      if (typeof cb === "function") G.queueMicrotask(() => cb(null));
+      done();
       G.queueMicrotask(() => this.emit("close"));
       return this;
     }
@@ -2856,6 +2873,9 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       // folding), which strict llhttp rejects and lenient llhttp joins onto the
       // previous field value with a single SP.
       this.lenient = false;
+      // llhttp's lenient_header_value_relaxed on its own (httpValidation:
+      // 'relaxed'): control bytes allowed in header VALUES, nothing else.
+      this.lenientHeaderValues = false;
       this.onHead = null; this.onBody = null; this.onDone = null; this.onError = null;
       // 1xx interim heads are not the final response: node re-arms the parser
       // and raises 'continue'/'information' on the ClientRequest instead
@@ -2898,20 +2918,43 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
     // _http_common.js prepareError: every parse error carries the bytes it
     // choked on. The corpus reads it directly (`err.rawPacket.toString()`), and
     // `bytesParsed` is what node's own 400/431 path reports.
-    _mkErr(msg, code) {
+    _mkErr(msg, code, bytesParsed) {
       const e = mkErr(msg, code);
       // llhttp exposes the parse detail separately from its "Parse Error:"
       // display prefix; callers such as node's HTTP client inspect it directly.
       e.reason = msg.startsWith("Parse Error: ") ? msg.slice("Parse Error: ".length) : msg;
-      e.bytesParsed = this.off;
+      e.bytesParsed = bytesParsed === undefined ? this.off : bytesParsed;
       const raw = this._lastChunk && this._lastChunk.length ? this._lastChunk : this.buf;
       try { e.rawPacket = G.Buffer ? G.Buffer.from(raw.slice ? raw.slice() : raw) : raw; } catch (x) {}
       return e;
     }
-    _err(msg, code) {
+    _err(msg, code, bytesParsed) {
       this.state = "error";
       this._errMsg = msg; this._errCode = code;
-      if (this.onError) this.onError(this._mkErr(msg, code));
+      if (this.onError) this.onError(this._mkErr(msg, code, bytesParsed));
+    }
+    // How many bytes of the request line llhttp accepted before the method token
+    // stopped being a viable prefix of any known method. llhttp fails ON the
+    // offending byte, so "Oopsie-doopsie" reports 1: 'O' can still become
+    // OPTIONS, 'Oo' cannot (test-http-server-client-error reads err.bytesParsed).
+    _methodPrefixLen() {
+      let i = this.off;
+      const b = this.buf;
+      while (i < b.length && (b[i] === 13 || b[i] === 10)) i++;
+      let end = i;
+      while (end < b.length && b[end] !== 32) end++;
+      const M = HTTP_METHODS;
+      let ok = 0;
+      for (let k = 1; k <= end - i; k++) {
+        const tok = latin1(b, i, i + k);
+        let viable = false;
+        for (let j = 0; j < M.length; j++) {
+          if (M[j].lastIndexOf(tok, 0) === 0) { viable = true; break; }
+        }
+        if (!viable) break;
+        ok = k;
+      }
+      return ok;
     }
     // Is the request-line method already known to be bad? llhttp matches the
     // method against its METHOD_MAP one byte at a time, so an unknown token
@@ -2969,7 +3012,8 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
               return events + 1;
             }
             if (!this.isResponse && this._badMethod()) {
-              this._err("Parse Error: Invalid method encountered", "HPE_INVALID_METHOD");
+              this._err("Parse Error: Invalid method encountered", "HPE_INVALID_METHOD",
+                        this._methodPrefixLen());
               return events + 1;
             }
             if (!eofSeen) return events;
@@ -2999,10 +3043,16 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
           // and the CR/LF that end a line. llhttp's insecure flags relax this
           // for header values (but not NUL), which is observable through both
           // --insecure-http-parser and per-stream insecureHTTPParser.
+          //
+          // llhttp 9.4's lenient_header_value_relaxed is exactly THIS relaxation
+          // and nothing else, which is what `httpValidation: 'relaxed'` selects:
+          // control bytes pass, but obs-fold and a duplicate Transfer-Encoding
+          // (both gated on `lenient` below) stay rejected.
+          const lenientValues = this.lenient || this.lenientHeaderValues;
           for (let i = 0; i < head.length; i++) {
             const cc = head.charCodeAt(i);
             if (cc === 9 || cc === 10 || cc === 13) continue;
-            if (cc === 0 || (!this.lenient && (cc < 32 || cc === 127))) {
+            if (cc === 0 || (!lenientValues && (cc < 32 || cc === 127))) {
               if (this.isResponse) this._err("Malformed_HTTP_Response", "Malformed_HTTP_Response");
               else this._err("Invalid HTTP request", "InvalidHTTPRequest");
               return events + 1;
@@ -3257,6 +3307,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
     this.reqMethod = "GET";
     this.maxHeaderPairs = 0; this.maxHeaderSize = 0;
     this.lenient = false;
+    this.lenientHeaderValues = false;
     this.onHead = this.onBody = this.onDone = this.onError = this.onInterim = null;
     this._lastChunk = null; this._errMsg = null; this._errCode = null;
     this._afterDone = null; this.socket = null; this.outgoing = null;
@@ -3273,9 +3324,212 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
     if (parserFreeList.length >= 1000) return;
     p._pooled = true;
     p.onHead = p.onBody = p.onDone = p.onError = p.onInterim = null;
+    // _http_common.js cleanParser: a parser going back to the pool must not
+    // carry its connection's hooks with it. onIncoming and joinDuplicateHeaders
+    // are read back as null once the response has ended
+    // (test-http-parser-memory-retention).
+    p.onIncoming = null;
+    p.joinDuplicateHeaders = null;
+    p[0] = null; p[5] = null; p[6] = null;  // kOnMessageBegin/kOnExecute/kOnTimeout
+    p._consumed = false;
     p.buf = new Uint8Array(0); p.off = 0;
     parserFreeList.push(p);
   };
+
+  // ---- node's src/node_http_parser.cc surface on the same parser -------------
+  // node has exactly ONE HTTPParser: `internalBinding('http_parser').HTTPParser`
+  // is both what lib/_http_common.js recycles through its FreeList and what
+  // `require('_http_common').HTTPParser` hands to user code. mbun used to have
+  // two — this incremental parser for its own client/server path, plus an empty
+  // `class HTTPParser {}` registered by bootstrap — and the empty one shadowed
+  // the real one on every JS-visible path, so `new HTTPParser().initialize` was
+  // undefined (test-http-parser*, six files).
+  //
+  // The llhttp binding is a thin adapter over the same state machine: the kOn*
+  // slots are numeric properties (0..6) on the instance, `execute()` feeds bytes
+  // and returns either the byte count or the parse Error, and a throw from a
+  // callback propagates out of execute() (node's C++ layer rethrows it). The
+  // internal path keeps using onHead/onBody/onDone directly and never calls
+  // initialize(), so the two dispatch styles cannot collide on one parser.
+  //
+  // llhttp's METHOD_MAP order, NOT http.METHODS' alphabetical order: the index
+  // handed to on_headers_complete is an index into this array, and node's
+  // _http_common.js resolves it back with `allMethods[method]`.
+  const LLHTTP_METHODS = [
+    "DELETE", "GET", "HEAD", "POST", "PUT", "CONNECT", "OPTIONS", "TRACE",
+    "COPY", "LOCK", "MKCOL", "MOVE", "PROPFIND", "PROPPATCH", "SEARCH",
+    "UNLOCK", "BIND", "REBIND", "UNBIND", "ACL", "REPORT", "MKACTIVITY",
+    "CHECKOUT", "MERGE", "M-SEARCH", "NOTIFY", "SUBSCRIBE", "UNSUBSCRIBE",
+    "PATCH", "PURGE", "MKCALENDAR", "LINK", "UNLINK", "SOURCE", "QUERY",
+  ];
+  HttpParser.methods = LLHTTP_METHODS;
+  HttpParser.allMethods = LLHTTP_METHODS;
+  // enum parser_types + the kOn* callback-slot indices.
+  HttpParser.REQUEST = 1;
+  HttpParser.RESPONSE = 2;
+  HttpParser.kOnMessageBegin = 0;
+  HttpParser.kOnHeaders = 1;
+  HttpParser.kOnHeadersComplete = 2;
+  HttpParser.kOnBody = 3;
+  HttpParser.kOnMessageComplete = 4;
+  HttpParser.kOnExecute = 5;
+  HttpParser.kOnTimeout = 6;
+  HttpParser.kLenientNone = 0;
+  HttpParser.kLenientHeaders = 1 << 0;
+  HttpParser.kLenientChunkedLength = 1 << 1;
+  HttpParser.kLenientKeepAlive = 1 << 2;
+  HttpParser.kLenientTransferEncoding = 1 << 3;
+  HttpParser.kLenientVersion = 1 << 4;
+  HttpParser.kLenientDataAfterClose = 1 << 5;
+  HttpParser.kLenientOptionalLFAfterCR = 1 << 6;
+  HttpParser.kLenientOptionalCRLFAfterChunk = 1 << 7;
+  HttpParser.kLenientOptionalCRBeforeLF = 1 << 8;
+  HttpParser.kLenientSpacesAfterChunkSize = 1 << 9;
+  HttpParser.kLenientHeaderValueRelaxed = 1 << 10;
+  HttpParser.kLenientAll = (1 << 11) - 1;
+
+  // Bind the numeric kOn* slots to this parser's internal callbacks. Called from
+  // initialize(), which is the only entry point the binding-style API has.
+  function bindParserSlots(p) {
+    p.onHead = function () {
+      const v = String(p.httpVersion).split(".");
+      const major = parseInt(v[0], 10) || 0;
+      const minor = v.length > 1 ? (parseInt(v[1], 10) || 0) : 0;
+      // node's on_headers_complete hands over the headers it has NOT already
+      // delivered through on_header (the "slow path" kOnHeaders), then clears
+      // them; test-http-parser reads `headers || parser.headers` either way.
+      const raw = p.rawHeaders;
+      p.rawHeaders = [];
+      const cb = p[2];
+      if (typeof cb !== "function") return;
+      if (p.isResponse) {
+        cb.call(p, major, minor, raw, undefined, undefined, p.status, p.statusText,
+                false, true);
+      } else {
+        cb.call(p, major, minor, raw, LLHTTP_METHODS.indexOf(p.method), p.target,
+                undefined, undefined, false, true);
+      }
+    };
+    p.onBody = function (b) {
+      const cb = p[3];
+      if (typeof cb !== "function") return;
+      cb.call(p, G.Buffer ? G.Buffer.from(b.slice()) : b.slice());
+    };
+    p.onDone = function () {
+      // Trailers reach JS through the same kOnHeaders slot as a fragmented head,
+      // and they arrive AFTER the body and BEFORE on_message_complete.
+      if (p.rawTrailers && p.rawTrailers.length) {
+        const t = p.rawTrailers;
+        p.rawTrailers = [];
+        const hcb = p[1];
+        if (typeof hcb === "function") hcb.call(p, t, "");
+      }
+      const cb = p[4];
+      if (typeof cb === "function") cb.call(p);
+    };
+    // llhttp reports a parse failure as execute()'s RETURN VALUE, not a throw.
+    p.onError = function (e) { p._llErr = e; };
+  }
+  // The binding's methods are unwrapped from a C++ BaseObject, so calling one
+  // with a foreign `this` is a TypeError rather than silent nonsense
+  // (test-http-parser's "parser 'this' safety" case).
+  function llSelf(self) {
+    if (!(self instanceof HttpParser)) {
+      throw new TypeError("Illegal invocation");
+    }
+    return self;
+  }
+  HttpParser.prototype.initialize = function (type, resource, maxHeaderSize, lenient, headersTimeout) {
+    llSelf(this)._reset(type === HttpParser.RESPONSE);
+    if (maxHeaderSize) this.maxHeaderSize = maxHeaderSize | 0;
+    // The bitmask node hands over is HTTPParser.kLenient*; only
+    // kLenientHeaderValueRelaxed maps onto the narrow header-value relaxation.
+    const mask = lenient | 0;
+    this.lenient = (mask & ~HttpParser.kLenientHeaderValueRelaxed) !== 0;
+    this.lenientHeaderValues = this.lenient
+      || (mask & HttpParser.kLenientHeaderValueRelaxed) !== 0;
+    this._llErr = null;
+    this._llStart = Date.now();
+    this._llConsumed = false;
+    bindParserSlots(this);
+  };
+  HttpParser.prototype.execute = function (buf, off, len) {
+    llSelf(this);
+    if (off === undefined) off = 0;
+    if (len === undefined) len = (buf ? buf.length : 0) - off;
+    let bytes;
+    if (buf && buf.buffer) bytes = new Uint8Array(buf.buffer, buf.byteOffset + off, len);
+    else bytes = new Uint8Array(0);
+    this._llErr = null;
+    this.push(bytes);
+    // kOnExecute belongs to the consume()-from-a-socket mode only; a manual
+    // execute() never raises it (node's Parser::Execute vs Parser::OnStreamRead).
+    if (this._consumed) {
+      const cbExec = this[5];
+      if (typeof cbExec === "function") cbExec.call(this, len);
+    }
+    if (this._llErr) { const e = this._llErr; this._llErr = null; return e; }
+    return len;
+  };
+  HttpParser.prototype.finish = function () {
+    llSelf(this);
+    this._llErr = null;
+    this.eof();
+    if (this._llErr) { const e = this._llErr; this._llErr = null; return e; }
+    return undefined;
+  };
+  // The C++ object's lifetime hooks. There is no separate native allocation to
+  // release here, but the names have to exist because _http_common.js's
+  // freeParser() calls remove() and then either free() or close() on every
+  // parser it retires.
+  HttpParser.prototype.close = function () { llSelf(this); };
+  HttpParser.prototype.free = function () { llSelf(this); };
+  HttpParser.prototype.remove = function () { llSelf(this); };
+  HttpParser.prototype.pause = function () { llSelf(this)._llPaused = true; };
+  HttpParser.prototype.resume = function () { llSelf(this)._llPaused = false; };
+  // node's Parser::Consume attaches the parser DIRECTLY to a stream handle: from
+  // then on every read is fed to llhttp without passing through JS, and each read
+  // raises kOnExecute. Here the handle's owning socket is the only stream in
+  // reach, so the parser subscribes to its 'data' — same observable protocol
+  // (kOnExecute once per read, bodies through kOnBody), one JS hop more.
+  HttpParser.prototype.consume = function (handle) {
+    llSelf(this);
+    this._consumed = true;
+    const sock = handle && handle.owner;
+    if (!sock || typeof sock.on !== "function") return;
+    this.socket = sock;
+    this._llSocket = sock;
+    this._llOnData = (chunk) => {
+      let u8;
+      if (chunk instanceof Uint8Array) u8 = chunk;
+      else if (G.Buffer) u8 = G.Buffer.from(chunk);
+      else return;
+      this.execute(u8, 0, u8.length);
+    };
+    sock.on("data", this._llOnData);
+    if (typeof sock.resume === "function") sock.resume();
+  };
+  HttpParser.prototype.unconsume = function () {
+    llSelf(this);
+    this._consumed = false;
+    if (this._llSocket && this._llOnData && typeof this._llSocket.removeListener === "function") {
+      this._llSocket.removeListener("data", this._llOnData);
+    }
+    this._llSocket = null;
+    this._llOnData = null;
+  };
+  HttpParser.prototype.getCurrentBuffer = function () {
+    llSelf(this);
+    const raw = (this._lastChunk && this._lastChunk.length) ? this._lastChunk : this.buf;
+    const u8 = raw && raw.slice ? raw.slice() : new Uint8Array(0);
+    return G.Buffer ? G.Buffer.from(u8) : u8;
+  };
+  HttpParser.prototype.duration = function () {
+    llSelf(this);
+    return this._llStart ? (Date.now() - this._llStart) : 0;
+  };
+  HttpParser.prototype.headersCompleted = function () { return !!llSelf(this).headDone; };
+
   G.__mbunHttpParser = HttpParser;
 
   // ---- HTTP response serialization (shared by Bun.serve and node:http) -------

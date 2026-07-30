@@ -201,7 +201,18 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
   const getTimerDuration = (msecs, name) => {
     validateNumber(msecs, name);
     if (msecs < 0 || !Number.isFinite(msecs)) throw ERR_OUT_OF_RANGE(name, "a non-negative finite number", msecs);
-    if (msecs > 2147483647) return 2147483647;
+    // internal/timers.js emits the overflow warning HERE, synchronously, so the
+    // warning's stack points at the caller's setTimeout() line rather than at a
+    // timer tick (test-http-timeout-client-warning asserts exactly that).
+    if (msecs > 2147483647) {
+      if (G.process && typeof G.process.emitWarning === "function") {
+        G.process.emitWarning(
+          msecs + " does not fit into a 32-bit signed integer." +
+          "\nTimeout duration was set to 1.",
+          "TimeoutOverflowWarning");
+      }
+      return 2147483647;
+    }
     return msecs;
   };
 
@@ -705,6 +716,9 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
       !msg._removedContLen && !msg.chunkedEncoding && !msg.hasHeader("transfer-encoding");
   }
 
+  // lib/_http_outgoing.js connectionCorkNT.
+  function connectionCorkNT(conn) { conn.uncork(); }
+
   function write_(msg, chunk, encoding, callback, fromEnd) {
     if (typeof callback !== "function") callback = nop;
     if (chunk === null) throw ERR_STREAM_NULL_VALUES();
@@ -744,6 +758,16 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
       if (msg[kRejectNonStandardBodyWrites]) throw ERR_HTTP_BODY_NOT_ALLOWED();
       nextTick(callback);
       return true;
+    }
+    // lib/_http_outgoing.js write_: cork the socket for the rest of the tick so
+    // the four writes a chunked frame costs (size / CRLF / chunk / CRLF) reach
+    // the wire as ONE segment. This was missing, which is why a corked write
+    // reported backpressure it did not have: with the socket uncorked every
+    // _send() drains immediately and write() returns true, where node returns
+    // false until the nextTick uncork (test-http-outgoing-end-cork).
+    if (!fromEnd && msg.socket && !msg.socket.writableCorked) {
+      msg.socket.cork();
+      nextTick(connectionCorkNT, msg.socket);
     }
     let ret;
     if (msg.chunkedEncoding && chunk.length !== 0) {
@@ -1926,12 +1950,32 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
     parser.outgoing = request;
     request.parser = parser;
     socket.parser = parser;
+    // _http_client.js onSocket/tickOnSocket: the parser carries the request's
+    // joinDuplicateHeaders and the onIncoming hook for the life of the
+    // connection, and freeParser() nulls both (test-http-parser-memory-retention
+    // reads them on 'socket' and again on the response's 'end').
+    parser.joinDuplicateHeaders = request.joinDuplicateHeaders === undefined
+      ? null : request.joinDuplicateHeaders;
+    // _http_client.js tickOnSocket:
+    //   if (typeof req.maxHeadersCount === 'number')
+    //     parser.maxHeaderPairs = req.maxHeadersCount << 1;
+    // The server side of this was already wired; the client's cap was ignored, so
+    // a response with 102 headers came back whole under maxHeadersCount = 50
+    // (test-http-max-headers-count).
+    if (typeof request.maxHeadersCount === "number") {
+      parser.maxHeaderPairs = request.maxHeadersCount << 1;
+    }
     if (typeof request.maxHeaderSize === "number") parser.maxHeaderSize = request.maxHeaderSize;
     // _http_client.js: `parser.setLenientFlags(...)` when the request opted into
     // insecureHTTPParser (or the process did via --insecure-http-parser).
-    parser.lenient = request.insecureHTTPParser === undefined
-      ? !!(G.__mbunHttpNative && G.__mbunHttpNative.insecureHTTPParser)
-      : !!request.insecureHTTPParser;
+    parser.lenient = request.httpValidation === "insecure"
+      || (request.httpValidation === undefined
+          && (request.insecureHTTPParser === undefined
+              ? !!(G.__mbunHttpNative && G.__mbunHttpNative.insecureHTTPParser)
+              : !!request.insecureHTTPParser));
+    // 'relaxed' relaxes inbound header VALUES only -- not obs-fold, not a
+    // duplicate Transfer-Encoding (test-http-header-value-relaxed test 10).
+    parser.lenientHeaderValues = parser.lenient || request.httpValidation === "relaxed";
 
     let res = null;
     let upgraded = false;
@@ -1968,7 +2012,12 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
       });
     };
 
-    parser.onHead = () => {
+    // _http_client.js onSocket: `parser.onIncoming = parserOnIncomingClient`.
+    // This driver reaches the same code through parser.onHead (mbun's parser
+    // hands the response over on its own closure protocol rather than through
+    // node's numeric slots), so onIncoming is the same function under node's
+    // name — what freeParser() nulls and what the corpus type-checks.
+    const parserOnIncomingClient = function parserOnIncomingClient() {
       if (request.res) { socket.destroy(); return; }
       res = new IncomingMessage(socket);
       res.httpVersion = parser.httpVersion;
@@ -2020,6 +2069,8 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
       socket.on("timeout", responseOnTimeout);
       if (request.aborted || !request.emit("response", res)) res._dump();
     };
+    parser.onIncoming = parserOnIncomingClient;
+    parser.onHead = parserOnIncomingClient;
 
     function responseOnTimeout() {
       const r = socket._httpMessage;
@@ -2245,7 +2296,18 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
     alloc() {
       const p = this.list.length ? this.list.pop() : null;
       if (p) return p;
-      const HP = G.__mbunHttpParser;
+      // node's FreeList closes over `HTTPParser` from internalBinding at module
+      // load, but _http_common is loaded lazily — late enough that
+      // test-http-parser-lazy-loaded can swap `binding.HTTPParser` first and
+      // still see its own class come out of parsers.alloc(). Resolve through the
+      // binding on every miss so that swap is honoured here too.
+      let HP = null;
+      try {
+        const ib = typeof G.__mbunInternalBinding === "function"
+          ? G.__mbunInternalBinding("http_parser") : null;
+        HP = ib && ib.HTTPParser;
+      } catch (e) {}
+      if (!HP) HP = G.__mbunHttpParser;
       return HP ? new HP(false) : null;
     },
     free(obj) {
@@ -2260,6 +2322,9 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
   const kServerResponse = Symbol("ServerResponse");
   const kServerResponseStatistics = Symbol("ServerResponseStatistics");
   const kIncomingMessage = Symbol("IncomingMessage");
+  // node lib/_http_common.js kSkipPendingData: set on an IncomingMessage whose
+  // remaining body bytes must be dropped rather than delivered.
+  const kSkipPendingData = Symbol("SkipPendingData");
 
   // node lib/_http_common.js freeParser + clearIncoming. `parser.incoming` is
   // what keeps a finished IncomingMessage alive; clearing it is observable
@@ -2284,6 +2349,16 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
       parser._freed = true;
       parser.incoming = null;
       parser.outgoing = null;
+      // lib/_http_common.js cleanParser: the numeric kOn* slots and the two
+      // per-connection fields are part of what a recycled parser must NOT carry
+      // into its next life (test-http-parser-memory-retention reads them back as
+      // null once the socket is gone).
+      parser[0] = null;   // kOnMessageBegin
+      parser[5] = null;   // kOnExecute
+      parser[6] = null;   // kOnTimeout
+      parser.onIncoming = null;
+      parser.joinDuplicateHeaders = null;
+      parser._consumed = false;
       // Drop everything the parser was holding before it is parked: the free
       // list is process-wide, so a retained body buffer or closure would be a
       // per-connection leak (test-http-parser-memory-retention watches for it).
@@ -2385,12 +2460,120 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
     hc._checkIsHttpToken = hc.checkIsHttpToken = checkIsHttpToken;
     hc._checkInvalidHeaderChar = hc.checkInvalidHeaderChar = checkInvalidHeaderChar;
     hc.chunkExpression = chunkExpression;
+    // bootstrap.cppm registered `continueExpression: () => false` — a FUNCTION
+    // where node's is a RegExp (lib/_http_common.js), so every
+    // `continueExpression.test(v)` against the exported object was a TypeError.
+    // js_net_part2.cppm carries a private copy of the regex to avoid it.
+    hc.continueExpression = /(?:^|\W)100-continue(?:$|\W)/i;
     hc.parsers = parsersFreeList;
     hc.freeParser = freeParser;
-    hc.prepareError = function (err) { err.rawPacket = err.rawPacket || undefined; };
+    // lib/_http_common.js prepareError verbatim: the raw packet comes from the
+    // parser when the caller did not carry one, and llhttp's `reason` is what
+    // becomes the displayed "Parse Error: ..." message.
+    hc.prepareError = function (err, parser, rawPacket) {
+      err.rawPacket = rawPacket || (parser && typeof parser.getCurrentBuffer === "function"
+        ? parser.getCurrentBuffer() : undefined);
+      if (typeof err.reason === "string") err.message = "Parse Error: " + err.reason;
+    };
     hc.kIncomingMessage = kIncomingMessage;
-    hc.methods = hc.methods || METHODS;
+    hc.kSkipPendingData = kSkipPendingData;
+    hc.CRLF = "\r\n";
+    // ONE HTTPParser, the runtime's own. bootstrap.cppm registered an empty
+    // `class HTTPParser {}` here, which shadowed the real parser on every
+    // JS-visible path — `new (require('_http_common').HTTPParser)().initialize`
+    // was undefined. See js_net.cppm's llhttp-binding section.
+    // ACCESSORS, not values: this partition is assembled BEFORE kNetJS, which is
+    // where the parser class is defined, so `G.__mbunHttpParser` is still
+    // undefined right here. Reading it at property-access time also keeps
+    // `binding.HTTPParser = ...` swaps visible the way node's late module load
+    // does (test-http-parser-lazy-loaded).
+    const realParser = () => {
+      let HP = null;
+      try {
+        const ib = typeof G.__mbunInternalBinding === "function"
+          ? G.__mbunInternalBinding("http_parser") : null;
+        HP = ib && ib.HTTPParser;
+      } catch (e) {}
+      return HP || G.__mbunHttpParser || null;
+    };
+    Object.defineProperty(hc, "HTTPParser", {
+      get() { return realParser(); },
+      set(v) {
+        Object.defineProperty(hc, "HTTPParser", {
+          value: v, writable: true, enumerable: true, configurable: true,
+        });
+      },
+      enumerable: true, configurable: true,
+    });
+    // llhttp's METHOD_MAP order, which is what an on_headers_complete method
+    // index means. `http.METHODS` (alphabetical) is a different list and stays
+    // where it is. bootstrap.cppm had registered a 9-entry stub here, and the old
+    // `hc.methods || METHODS` let that stub win.
+    Object.defineProperty(hc, "methods", {
+      get() { const HP = realParser(); return (HP && HP.methods) || METHODS; },
+      set(v) {
+        Object.defineProperty(hc, "methods", {
+          value: v, writable: true, enumerable: true, configurable: true,
+        });
+      },
+      enumerable: true, configurable: true,
+    });
+    hc.isLenient = function () {
+      return !!(G.__mbunHttpNative && G.__mbunHttpNative.insecureHTTPParser);
+    };
+    hc.calculateLenientFlags = function (httpValidation, insecureHTTPParserOption) {
+      const HP = realParser() || {};
+      if (httpValidation === "strict") return HP.kLenientNone | 0;
+      if (httpValidation === "relaxed") return HP.kLenientHeaderValueRelaxed | 0;
+      if (httpValidation === "insecure") return HP.kLenientAll | 0;
+      const lenient = insecureHTTPParserOption === undefined
+        ? hc.isLenient() : insecureHTTPParserOption;
+      return lenient ? HP.kLenientAll | 0 : HP.kLenientNone | 0;
+    };
     M["node:_http_common"] = hc;
+  }
+
+  // node lib/internal/http.js. GATED behind --expose-internals exactly the way
+  // node_repl.cppm gates internal/repl, and for the same reason.
+  //
+  // This has to be a registered builtin rather than left to the resolver:
+  // compat/node/tsconfig.json maps `internal/*` onto node's own lib/internal/*,
+  // so `require('internal/http')` used to load node's real file — which mints
+  // `Symbol('kOutHeaders')` of its own. A test that reads
+  // `req[require('internal/http').kOutHeaders]` therefore indexed with a symbol
+  // this runtime's OutgoingMessage had never heard of and got `undefined`
+  // (test-http-correct-hostname, test-http-outgoing-renderHeaders). The symbols
+  // published here are the very ones OutgoingMessage keys with.
+  {
+    const exposeInternals = () => {
+      const argv = (G.process && G.process.execArgv) || [];
+      for (const a of argv) if (a === "--expose-internals") return true;
+      return false;
+    };
+    let traceEventId = 0;
+    const internalHttp = {
+      kOutHeaders,
+      kNeedDrain,
+      kHighWaterMark,
+      kUniqueHeaders,
+      kProxyConfig: Symbol("kProxyConfig"),
+      kWaitForProxyTunnel: Symbol("kWaitForProxyTunnel"),
+      utcDate,
+      getNextTraceEventId: () => ++traceEventId,
+      isTraceHTTPEnabled: () => false,
+      traceBegin: () => {},
+      traceEnd: () => {},
+      getGlobalAgent: () => M["http"] && M["http"].globalAgent,
+    };
+    Object.defineProperty(M, "internal/http", {
+      get() { return exposeInternals() ? internalHttp : undefined; },
+      set(v) {
+        Object.defineProperty(M, "internal/http", {
+          value: v, writable: true, enumerable: false, configurable: true,
+        });
+      },
+      enumerable: false, configurable: true,
+    });
   }
 
   // node splits http across `_http_agent`, `_http_client`, `_http_incoming`,
@@ -2438,7 +2621,7 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
     ERR_HTTP_HEADERS_SENT, ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE,
     ERR_HTTP_INVALID_STATUS_CODE, ERR_INVALID_CHAR, ERR_OUT_OF_RANGE,
     validateInteger, validateNumber, validateBoolean, validateObject, validateString,
-    getTimerDuration,
+    getTimerDuration, parseUniqueHeadersOption,
     kConnectionsCheckingInterval, kServerResponse, kIncomingMessage, kLenientHeaders,
     parsersFreeList, freeParser, clearIncoming,
     // js_net's server transport needs node's exact abort error for
