@@ -482,15 +482,33 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
             return b;
           });
         }
+        slot("__mbunIoErr", ioerr === undefined ? "" : ioerr);
         if (ioerr) {
           // Missing/unreadable file: read methods reject with the errno (bun #26632).
           // These shadow Blob.prototype's resolving versions.
           const mkErr = () => { const e = new Error(ioerr + ": " + (ioerr === "EISDIR" ? "illegal operation on a directory" : "no such file or directory") + ", open '" + p + "'"); e.code = ioerr; e.errno = ioerr === "EISDIR" ? -21 : -2; e.syscall = "open"; e.path = p; return e; };
-          slot("text", () => Promise.reject(mkErr()));
-          slot("json", () => Promise.reject(mkErr()));
-          slot("arrayBuffer", () => Promise.reject(mkErr()));
-          slot("bytes", () => Promise.reject(mkErr()));
-          slot("stream", () => new G.ReadableStream({ start(c) { c.error(mkErr()); } }));
+          // …but a BunFile does its I/O at CALL time in bun, not at construction:
+          // naming a path that does not exist YET is legal, and reading it after
+          // something created it succeeds. Caching the constructor-time ENOENT
+          // in these slots made `Bun.file(p)` a permanently-dead handle, so
+          // js/web/fetch/blob-write — which names a file in a fresh temp dir,
+          // fills it through that same handle's .writer(), then reads it back —
+          // rejected with the stale ENOENT instead of returning the bytes.
+          // Re-derive a fresh handle per call and delegate to it; only when the
+          // path is STILL unreadable is the errno the honest answer. EISDIR is
+          // resolved once and kept: `wrapped` would just report it again.
+          const retry = (m, args, onGone) => {
+            if (ioerr !== "ENOENT") return onGone();
+            let f2;
+            try { f2 = wrapped(path, options); } catch (e) { return onGone(); }
+            if (f2.__mbunIoErr) return onGone();
+            return f2[m].apply(f2, args);
+          };
+          slot("text", function () { return retry("text", arguments, () => Promise.reject(mkErr())); });
+          slot("json", function () { return retry("json", arguments, () => Promise.reject(mkErr())); });
+          slot("arrayBuffer", function () { return retry("arrayBuffer", arguments, () => Promise.reject(mkErr())); });
+          slot("bytes", function () { return retry("bytes", arguments, () => Promise.reject(mkErr())); });
+          slot("stream", function () { return retry("stream", arguments, () => new G.ReadableStream({ start(c) { c.error(mkErr()); } })); });
         }
         // bun: .exists() is true only for a regular file — a directory (or missing
         // path) resolves to false. (text/json/arrayBuffer/bytes/stream/slice all
@@ -508,6 +526,15 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
         slot("delete", unlinkOne);
         // Bun.file(...).writer([opts]) → incremental FileSink over the fd.
         slot("writer", (wopts) => makeFileSink({ path: isFd ? null : fsPath, fd: isFd ? fdArg : -1, isFifo: isFifo, opts: wopts }));
+        // BunFile.write(data) (bun.d.ts BunFile#write) — one-shot overwrite,
+        // resolving the byte count. It was the one writer on BunFile that had no
+        // slot at all, so `Bun.file(p).write(blob)` threw "write is not a
+        // function". Bun.write already carries every accepted data shape
+        // (string / typed array / Blob / BunFile / Response), so delegate.
+        slot("write", (data, wopts) => {
+          try { return Promise.resolve(G.Bun.write(isFd ? fdArg : fsPath, data, wopts)); }
+          catch (e) { return Promise.reject(e); }
+        });
         // A fifo cannot be read by the synchronous Blob loader (open(2)/read(2)
         // would block on the peer); stream it non-blocking instead.
         if (isFifo && !ioerr) slot("stream", (cs) => makeFifoReadStream(fsPath, cs));
