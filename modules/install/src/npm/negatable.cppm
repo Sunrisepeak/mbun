@@ -219,15 +219,26 @@ struct Negatable {
             return;
         }
         // Applying a recognised token resets the wildcard/unrecognized flags to
-        // their defaults (so `["any","linux"]` collapses to LINUX).
+        // their defaults (so `["any","linux"]` collapses to LINUX) — but ONLY
+        // those two. resolver_hooks.rs:687-703 carries the OTHER bitset across
+        // (`removed: self.removed` in the additive arm, `added: self.added` in
+        // the negated one), and `..Default::default()` covers just the flags.
+        // Clearing it here made `["!x64","x64"]` collapse to X64 (allowed)
+        // instead of `added & !removed` == 0 (rejected) — the one case where a
+        // name appears on both lists, which is exactly what
+        // test/cli/install/architecture-match.test.ts pins.
         if (isNot) {
+            Int ad{added};
             Int rm{static_cast<Int>(removed | *field)};
             *this = Negatable{};
+            added = ad;
             removed = rm;
         } else {
             Int ad{static_cast<Int>(added | *field)};
+            Int rm{removed};
             *this = Negatable{};
             added = ad;
+            removed = rm;
         }
     }
 

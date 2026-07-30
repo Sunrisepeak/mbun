@@ -899,7 +899,15 @@
         // through bun:internal-for-testing (bootstrap.cppm).
         JSObjectRef hostedGitInfo{JSObjectMake(ctx_, nullptr, nullptr)};
         set_fn(ctx_, hostedGitInfo, "parseUrl", hosted_git_info_parse_url_cb);
+        set_fn(ctx_, hostedGitInfo, "fromUrl", hosted_git_info_from_url_cb);
         set_prop(ctx_, global, "__mbunHostedGitInfoNative", hostedGitInfo);
+        // npm `cpu`/`os` matching, exposed only through bun:internal-for-testing
+        // (bootstrap.cppm). Same mbun.install.npm.negatable bitsets the
+        // installer's own platform gate uses — see runtime/platform_match.inc.
+        JSObjectRef platformMatch{JSObjectMake(ctx_, nullptr, nullptr)};
+        set_fn(ctx_, platformMatch, "isArchitectureMatch", is_architecture_match_cb);
+        set_fn(ctx_, platformMatch, "isOperatingSystemMatch", is_operating_system_match_cb);
+        set_prop(ctx_, global, "__mbunPlatformMatchNative", platformMatch);
         // node:http maxHeaderSize <-> the process-wide mbun.http limit that
         // every server reads per request. ref: bun node_http_binding.rs.
         JSObjectRef htn{JSObjectMake(ctx_, nullptr, nullptr)};

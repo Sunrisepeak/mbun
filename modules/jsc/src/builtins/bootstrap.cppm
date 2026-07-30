@@ -5585,6 +5585,12 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     Bun: globalThis.Bun,
     internalSourceMap: globalThis.__mbunSourceMapNative,
     hostedGitInfo: globalThis.__mbunHostedGitInfoNative,
+    // npm `cpu`/`os` allow+block-list matching against the host (blueprint
+    // src/js/internal-for-testing.ts:177/183 → npm.rs Architecture /
+    // OperatingSystem jsFunction*IsMatch). Native so the test surface exercises
+    // the installer's own bitsets, not a second JS approximation.
+    isArchitectureMatch: globalThis.__mbunPlatformMatchNative.isArchitectureMatch,
+    isOperatingSystemMatch: globalThis.__mbunPlatformMatchNative.isOperatingSystemMatch,
     // highlightJavaScript/Redacted attached later (in the highlighter's scope).
     // shellInternals.parse — tagged template over the native mbun.shell parser;
     // interpolations become __bun_<i> JSObjRef markers (bun's own encoding).

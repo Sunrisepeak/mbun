@@ -61,6 +61,10 @@ import mbun.valkey;
 import mbun.sourcemap_jsc.internal_source_map;
 // hosted-git-info URL normalization backs bun:internal-for-testing.hostedGitInfo.
 import mbun.install.hosted_git_info;
+// npm `os`/`cpu` allow/block-list algebra — the SAME bitsets `bun install`'s
+// platform gate uses — backs bun:internal-for-testing isArchitectureMatch /
+// isOperatingSystemMatch (runtime/platform_match.inc).
+import mbun.install.npm.negatable;
 // T-LOOP native epoll event loop for Bun.serve (runtime/serve_native.inc).
 import mbun.event_loop;
 import mbun.runtime_socket;
@@ -99,6 +103,7 @@ namespace {
 #include "runtime/node_tls.inc"
 #include "runtime/sourcemap.inc"
 #include "runtime/hosted_git_info.inc"
+#include "runtime/platform_match.inc"
 #include "runtime/io_bindings.inc"
 // node:zlib streaming Transform handles (mbun.compress.stream): incremental
 // deflate/inflate/brotli/zstd state machines behind __mbunZlibNative.stream*.
