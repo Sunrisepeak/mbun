@@ -933,6 +933,18 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     const c = s.charCodeAt(0);
     return PInspectMeta.length > c ? PInspectMeta[c] : "\\u" + c.toString(16);
   };
+  // PORT-SOURCE: compat/node/lib/internal/util/inspect.js — inspectDefaultOptions
+  // .maxArrayLength (100) and its `null → Infinity` normalisation. Every
+  // list-shaped formatter (formatArray, formatTypedArray, formatSet, formatMap,
+  // formatArrayBuffer) renders at most min(max(0, maxArrayLength), length)
+  // entries and appends "... n more item(s)" / "... n more byte(s)".
+  function inspectMaxArrayLength(opts) {
+    const m = opts.maxArrayLength;
+    if (m === null) return Infinity;
+    if (typeof m === "number") return m > 0 ? m : 0;
+    return gInspectDefaultsStore.maxArrayLength;
+  }
+  const inspectRemainingText = (r) => "... " + r + " more item" + (r > 1 ? "s" : "");
   function inspectIsClassSrc(src) {
     if (!src.startsWith("class") || !src.endsWith("}")) return false;
     // Reject a *method* literally named `class` — `({ class() {} }).class`
@@ -1136,6 +1148,37 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       if (v instanceof Number) return "[Number: " + Number(v) + "]";
       if (v instanceof Boolean) return "[Boolean: " + Boolean(v) + "]";
       if (v instanceof String) return PJSONStringify(String(v));
+    } else {
+      // PORT-SOURCE: compat/node/lib/internal/util/inspect.js formatRaw's boxed-
+      // primitive bases (formatNumber/formatBigInt/formatBoolean/formatString
+      // under `[Number: …]`). mbun fell through to the generic object branch, so
+      // `new Number(3)` printed "Number {}" and `new String("ab")` printed
+      // "String { '0': 'a', '1': 'b' }" — node hides a String object's index
+      // properties precisely because they are the string.
+      if (v instanceof Number) return col(36, 39, "[Number: " + inspectValue(Number(v), opts, seen, depth) + "]");
+      if (v instanceof Boolean) return col(36, 39, "[Boolean: " + Boolean(v) + "]");
+      if (v instanceof String) return col(36, 39, "[String: " + inspectValue(String(v), opts, seen, depth) + "]");
+      // formatWeakCollection: the entries of a Weak{Map,Set} are unreachable
+      // without the V8 debug API, and node says so rather than printing "{}".
+      if (v instanceof WeakMap) return "WeakMap { <items unknown> }";
+      if (v instanceof WeakSet) return "WeakSet { <items unknown> }";
+      // formatArrayBuffer: node dumps the backing bytes under a [Uint8Contents]
+      // pseudo-key and prints byteLength alongside; a detached buffer prints
+      // "(detached)".
+      if (v instanceof ArrayBuffer ||
+          (typeof SharedArrayBuffer === "function" && v instanceof SharedArrayBuffer)) {
+        const nm = (v instanceof ArrayBuffer) ? "ArrayBuffer" : "SharedArrayBuffer";
+        let bytes = null;
+        try { bytes = new Uint8Array(v); } catch (e) { bytes = null; }
+        if (bytes === null) return nm + " { (detached) }";
+        const abMax = inspectMaxArrayLength(opts);
+        const abShown = bytes.length < abMax ? bytes.length : abMax;
+        let hex = "";
+        for (let bi = 0; bi < abShown; bi++) hex += (bi ? " " : "") + bytes[bi].toString(16).padStart(2, "0");
+        const abRest = bytes.length - abShown;
+        if (abRest > 0) hex += " ... " + abRest + " more byte" + (abRest > 1 ? "s" : "");
+        return nm + " { [Uint8Contents]: <" + hex + ">, byteLength: " + v.byteLength + " }";
+      }
     }
     if (depth > maxDepth) return PArrayIsArray(v) ? "[Array]" : (bun ? "[Object ...]" : "[Object]");
     seen.add(v);
@@ -1156,19 +1199,11 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     // line and the closing delimiter its own line too (util.inspect's
     // reduceToSingleString "compact === false" branch).
     const noCompact = opts.compact === false;
-    // PORT-SOURCE: compat/node/lib/internal/util/inspect.js — inspectDefaultOptions
-    // .maxArrayLength (100) + `remainingText`. Every list-shaped formatter
-    // (formatArray, formatTypedArray, formatSet, formatMap) renders at most
-    // min(max(0, ctx.maxArrayLength), length) entries and appends
-    // "... n more item(s)" for the rest; `null` means Infinity. mbun rendered
-    // EVERY element, so a 1000-element array printed 1000 entries where node and
-    // bun both stop at 100 — and inspecting a huge array cost O(n) formatting
-    // instead of O(100).
-    const maxArrayLength = opts.maxArrayLength === null ? Infinity
-      : (typeof opts.maxArrayLength === "number"
-           ? (opts.maxArrayLength > 0 ? opts.maxArrayLength : 0)
-           : gInspectDefaultsStore.maxArrayLength);
-    const remainingText = (r) => "... " + r + " more item" + (r > 1 ? "s" : "");
+    // mbun rendered EVERY element, so a 1000-element array printed 1000 entries
+    // where node and bun both stop at 100 — and inspecting a huge array cost
+    // O(n) formatting instead of O(maxArrayLength).
+    const maxArrayLength = inspectMaxArrayLength(opts);
+    const remainingText = inspectRemainingText;
     const nodeBlock = (label, items, open, close) => {
       if (!items.length) return label + open + close;
       if (noCompact) return label + open + "\n" + items.map((it) => inner + it).join(",\n") + "\n" + outer + close;
@@ -1184,6 +1219,35 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       const items = PArrayProtoMap.call(src, (x) => inspectValue(x, opts, seen, depth + 1));
       const remaining = valLen - shown;
       if (remaining > 0) items.push(remainingText(remaining));
+      if (!bun) {
+        // PORT-SOURCE: compat/node/lib/internal/util/inspect.js
+        // formatSpecialArray — a HOLE is not `undefined`, it is
+        // "<n empty items>". `.map` above preserved holes, so rebuild the run
+        // lengths from the sliced source. mbun printed "[ , 1, , 2 ]", which is
+        // not a shape node ever emits.
+        let sparse = false;
+        for (let hi = 0; hi < shown; hi++) { if (!(hi in src)) { sparse = true; break; } }
+        if (sparse) {
+          const packed = []; let run = 0;
+          const flush = () => { if (run > 0) { packed.push("<" + run + " empty item" + (run > 1 ? "s" : "") + ">"); run = 0; } };
+          for (let hi = 0; hi < shown; hi++) {
+            if (hi in src) { flush(); packed.push(items[hi]); } else run++;
+          }
+          flush();
+          if (remaining > 0) packed.push(items[items.length - 1]);
+          items.length = 0;
+          for (let pi = 0; pi < packed.length; pi++) items.push(packed[pi]);
+        }
+        // NOT ported, and deliberately: formatRaw's kArrayExtrasType tail (an
+        // array's non-index own enumerable keys riding after the elements, as
+        // `[ 1, 2, x: 3 ]`) needs the array's own-key list, and Object.keys of a
+        // dense 100-element array allocates 100 index-key strings. Measured over
+        // 20k inspections of a 100-element array: 67ms -> 200ms, a 3x tax on
+        // EVERY array inspection for a shape almost nothing produces. node reads
+        // it from a V8 native (getOwnNonIndexProperties) that mbun has no
+        // equivalent of; doing it honestly means a C++ own-non-index-keys
+        // binding, not a JS scan.
+      }
       if (!items.length) result = "[]";
       else if (bun) {
         const oneLine = "[ " + items.join(", ") + " ]";
@@ -1231,7 +1295,9 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       // Enumerable symbol-keyed own props render after string keys: bun as
       // `[Symbol(desc)]: v`, node as `Symbol(desc): v`. ref util.inspect.
       const syms = PObjectGetOwnPropertySymbols(v).filter((s) => { const d = PObjectGetOwnPropertyDescriptor(v, s); return d && d.enumerable; });
-      const descVal = (d, key) => (d && (d.get || d.set)) ? (d.get && d.set ? "[Getter/Setter]" : d.get ? "[Getter]" : "[Setter]") : inspectValue(v[key], opts, seen, depth + 1);
+      // node's formatProperty reads desc.value, not value[key] — one property
+      // get per key instead of two, and it is the descriptor's own view.
+      const descVal = (d, key) => (d && (d.get || d.set)) ? (d.get && d.set ? "[Getter/Setter]" : d.get ? "[Getter]" : "[Setter]") : inspectValue(d ? d.value : v[key], opts, seen, depth + 1);
       if (bun) {
         const items = keys.map((k) => bunKey(k) + ": " + descVal(PObjectGetOwnPropertyDescriptor(v, k), k));
         // Index loop, not `for (const s of syms)`: for-of over a plain array
@@ -1239,8 +1305,14 @@ inline constexpr char kBootstrapJS_[] = R"JS(
         for (let i = 0; i < syms.length; i++) { const s = syms[i]; items.push("[" + s.toString() + "]: " + descVal(PObjectGetOwnPropertyDescriptor(v, s), s)); }
         result = bunBlock(ctor, items);
       } else {
-        const items = keys.map((k) => { const kk = /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(k) ? k : "'" + k + "'"; return kk + ": " + inspectValue(v[k], opts, seen, depth + 1); });
-        for (let i = 0; i < syms.length; i++) { const s = syms[i]; items.push(s.toString() + ": " + inspectValue(v[s], opts, seen, depth + 1)); }
+        // PORT-SOURCE: compat/node/lib/internal/util/inspect.js formatProperty —
+        // an ACCESSOR renders as [Getter] / [Setter] / [Getter/Setter]; node
+        // only calls the getter under the `getters` option. mbun's node layout
+        // read v[k] directly, so inspecting a value INVOKED every getter on it
+        // (side effects included) and printed the result where node prints the
+        // label. The bun layout already went through descVal.
+        const items = keys.map((k) => { const kk = /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(k) ? k : "'" + k + "'"; return kk + ": " + descVal(PObjectGetOwnPropertyDescriptor(v, k), k); });
+        for (let i = 0; i < syms.length; i++) { const s = syms[i]; items.push(s.toString() + ": " + descVal(PObjectGetOwnPropertyDescriptor(v, s), s)); }
         result = nodeBlock(ctor, items, "{", "}");
       }
     }
