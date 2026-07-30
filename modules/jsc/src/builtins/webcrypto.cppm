@@ -79,23 +79,35 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
     // `key.algorithm === key.algorithm`, and it is a copy so nothing a caller does
     // to it can reach the internal slot.
     //
-    // The copy is also FROZEN, and that is load-bearing rather than cosmetic.
-    // These copies are *cached*, so while they were mutable a caller could
-    // permanently rewrite a key's JS-visible identity —
-    // `key.algorithm.name = 'AES-GCM'`, `key.algorithm.hash.name = 'SHA-1'`,
-    // `key.usages.push('sign')` all stuck for the lifetime of the key. The native
-    // usages stayed authoritative (signing with a verify-only key still threw
-    // InvalidAccessError), so this was never an auth bypass, but any caller that
-    // branches on `key.algorithm.name` or `key.usages` could be lied to. An
-    // earlier revision described the mutability as deliberate; it was wrong, and
-    // test_webcrypto's `__webcryptoMetadataAttack` case had been failing ever
-    // since. Identity stability and immutability are not in tension here: freeze
-    // the cached copy and both hold.
+    // THE COPY MUST STAY MUTABLE. Do not freeze it. node's `key.algorithm` is a
+    // plain mutable object and the corpus pins that directly —
+    // `test-webcrypto-internal-slots.mjs` does
     //
-    // Views are copied but not frozen -- Object.freeze on a non-empty TypedArray
-    // throws -- so byte-valued algorithm members (a `counter`, a `salt`) still
-    // have mutable *contents*. That mutation cannot reach the internal slot
-    // either, because the internal copy is a separate view.
+    //     kp.publicKey.algorithm.name = 'ed25519';
+    //     assert.strictEqual(kp.publicKey.algorithm.name, 'ed25519');
+    //
+    // i.e. it writes a lowercase name and requires the write to stick. Freezing
+    // makes that assignment silently no-op in sloppy mode, so the getter keeps
+    // returning the normalised `'Ed25519'` and the file fails.
+    //
+    // This was tried and reverted. The reasoning that led there was: because the
+    // copies are cached, a mutable copy lets a caller permanently rewrite a key's
+    // JS-visible identity, so freezing looked like a security fix. It is not one,
+    // and the invariant that actually matters is a different one:
+    //
+    //     mutating the public copy must never change ENFORCEMENT.
+    //
+    // That already holds and is what the code is built for — the copy is a copy,
+    // so `type`/`extractable` (getters straight off the internal metadata) and the
+    // native usages are untouched; signing with a verify-only key still throws
+    // InvalidAccessError however the public `usages` array is rewritten. Freezing
+    // added no enforcement and cost a corpus file.
+    //
+    // `test_webcrypto.cpp`'s `__webcryptoMetadataAttack` case asserted
+    // `Object.isFrozen(key.algorithm)`. That assertion encoded a belief about node
+    // that is simply false, so it was restated as the enforcement invariant above
+    // rather than kept and satisfied. Trusting our own unit test over node's actual
+    // behaviour is what produced the regression.
     const publicAlgorithm = new WeakMap();
     const publicUsages = new WeakMap();
     const copyAlgorithm = (value) => {
@@ -103,7 +115,7 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
       if (ArrayBuffer.isView(value)) return new value.constructor(value);
       const out = {};
       for (const name of Object.keys(value)) out[name] = copyAlgorithm(value[name]);
-      return freeze(out);
+      return out;
     };
     const cachedCopy = (cache, key, source, copy) => {
       let cached = cache.get(key);
@@ -126,7 +138,7 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
     });
     defineProperty(CryptoKey.prototype, "usages", {
       configurable: true, enumerable: true, get() {
-        return cachedCopy(publicUsages, this, metadataFor(this).usages, (u) => freeze(u.slice()));
+        return cachedCopy(publicUsages, this, metadataFor(this).usages, (u) => u.slice());
       },
     });
     defineProperty(CryptoKey.prototype, Symbol.toStringTag, {
