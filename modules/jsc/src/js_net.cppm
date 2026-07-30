@@ -1596,13 +1596,24 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       if (this._handle instanceof NetHandle) { this._handle._closed = true; this._handle.fd = -1; this._handle = null; }
       NET.items.delete(this);
       this._loopOpen = false; NET.release(this);
-      if (err) this.emit("error", err);
+      // Emit the teardown events through EventEmitter.prototype rather than a
+      // `this.emit` property READ. node's http2 hands out `session.socket` as a
+      // Proxy that throws ERR_HTTP2_NO_SOCKET_MANIPULATION for the `emit` /
+      // `destroy` / `end` … property names (core.js proxySocketHandler), and
+      // test-http2-respond-with-file-connection-abort destroys exactly that
+      // object on purpose via `net.Socket.prototype.destroy.call(client.socket)`.
+      // Reading `this.emit` there would throw from inside the deferred teardown;
+      // going through the prototype keeps the receiver (so `_events` still
+      // resolves via the proxy) without tripping the trap. Socket never
+      // overrides `emit`, so this is identical for an ordinary socket.
+      const emitOn = (...a) => EE.prototype.emit.apply(this, a);
+      if (err) emitOn("error", err);
       // end() was called but the queue never drained far enough for _flush to
       // publish 'finish' (a destroy landed first). end(cb) settles on 'finish',
       // so emitting it here is what keeps that callback from being dropped
       // outright; node likewise never leaves an end() callback unsettled.
-      if (this._shutW && !this._finishEmitted) { this._finishEmitted = true; this.emit("finish"); }
-      if (!this._closeEmitted) { this._closeEmitted = true; G.queueMicrotask(() => this.emit("close", !!err)); }
+      if (this._shutW && !this._finishEmitted) { this._finishEmitted = true; emitOn("finish"); }
+      if (!this._closeEmitted) { this._closeEmitted = true; G.queueMicrotask(() => emitOn("close", !!err)); }
       return this;
     }
     // node lib/net.js Socket.prototype.destroySoon: end() first, then destroy on

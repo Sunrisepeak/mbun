@@ -727,6 +727,62 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
     session[key] = session._timer || null;
   }
 
+  // PORT-SOURCE: compat/node/lib/internal/http2/core.js `proxySocketHandler`
+  // (and the `get socket()` that lazily installs it).
+  //
+  // `session.socket` is NOT the transport: node hands out a Proxy whose target
+  // is the *session*. Three members answer from the session itself (setTimeout /
+  // ref / unref — they must drive the whole multiplexed connection, not one
+  // socket), the stream-manipulating members are hard errors because touching
+  // them would desynchronise the framing layer, and everything else forwards to
+  // the raw transport held in `_rawSocket` (node's `session[kSocket]`).
+  //
+  // After cleanupSession() node clears `session[kSocket]`, so a proxy captured
+  // before close keeps working as an object but every forwarded access raises
+  // ERR_HTTP2_SOCKET_UNBOUND — that unbinding is exactly what
+  // test-http2-unbound-socket-proxy pins, including `instanceof`, which routes
+  // through the getPrototypeOf trap.
+  const kProxyOwn = new Set(["setTimeout", "ref", "unref"]);
+  const kProxyNoManip = new Set([
+    "destroy", "emit", "end", "pause", "read", "resume", "write",
+    "setEncoding", "setKeepAlive", "setNoDelay",
+  ]);
+  const noManipErr = () => mkErr(
+    "HTTP/2 sockets should not be directly manipulated (e.g. read and written)",
+    "ERR_HTTP2_NO_SOCKET_MANIPULATION");
+  const unboundErr = () => mkErr("HTTP/2 socket has been disconnected", "ERR_HTTP2_SOCKET_UNBOUND");
+  // `_socketUnbound` is set the moment the session commits to tearing down, so
+  // the proxy stops answering at node's timing even while mbun's deferred
+  // teardown still needs the live transport under `_rawSocket`.
+  function sessionRawSocket(session) {
+    const socket = session._rawSocket;
+    if (session._socketUnbound === true || socket === undefined || socket === null) throw unboundErr();
+    return socket;
+  }
+  const proxySocketHandler = {
+    get(session, prop) {
+      if (kProxyOwn.has(prop)) { const v = session[prop]; return typeof v === "function" ? v.bind(session) : v; }
+      if (kProxyNoManip.has(prop)) throw noManipErr();
+      const socket = sessionRawSocket(session);
+      const value = socket[prop];
+      return typeof value === "function" ? value.bind(socket) : value;
+    },
+    getPrototypeOf(session) {
+      return Object.getPrototypeOf(sessionRawSocket(session));
+    },
+    set(session, prop, value) {
+      if (kProxyOwn.has(prop)) { session[prop] = value; return true; }
+      if (kProxyNoManip.has(prop)) throw noManipErr();
+      sessionRawSocket(session)[prop] = value;
+      return true;
+    },
+  };
+  function sessionSocketProxy(session) {
+    const p = session._proxySocket;
+    if (p === null || p === undefined) return (session._proxySocket = new Proxy(session, proxySocketHandler));
+    return p;
+  }
+
   // Http2Session.setLocalWindowSize (node lib/internal/http2/core.js ->
   // nghttp2_session_set_local_window_size). Growing the window announces the
   // delta with a connection-level WINDOW_UPDATE; shrinking only lowers the
@@ -1050,7 +1106,7 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
   function initOriginSet(session) {
     if (session._originSet === undefined) {
       session._originSet = new Set();
-      const socket = session.socket || {};
+      const socket = session._rawSocket || {};
       let hostName = socket.servername;
       if (hostName === null || hostName === undefined || hostName === false) {
         // node reads socket.remoteAddress / remoteFamily here. Both name the
@@ -1729,7 +1785,7 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
       // the session must not dial out itself.
       if (options && typeof options.createConnection === "function") {
         const sock = options.createConnection(u, options);
-        this.socket = sock;
+        this._rawSocket = sock;
         sock.on("data", (d) => self._onData(d));
         sock.on("error", (e) => self._onSocketError(e));
         sock.on("close", () => self._onSocketClose());
@@ -1768,7 +1824,7 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
           tlsOpts.ALPNProtocols = options && options.allowHTTP1 === true ? ["h2", "http/1.1"] : ["h2"];
         }
         const sock = tls.connect(tlsOpts);
-        this.socket = sock;
+        this._rawSocket = sock;
         sock.on("secureConnect", () => { self.alpnProtocol = sock.alpnProtocol || "h2"; self._onSocketReady(); });
         sock.on("data", (d) => self._onData(d));
         sock.on("error", (e) => self._onSocketError(e));
@@ -1784,7 +1840,7 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
         // reach the transport the way node's spread does.
         const netOpts = Object.assign({ port: String(port), host }, options);
         const sock = typeof net.connect === "function" ? net.connect(netOpts) : new net.Socket();
-        this.socket = sock;
+        this._rawSocket = sock;
         sock.on("connect", () => { self.alpnProtocol = "h2c"; self._onSocketReady(); });
         sock.on("data", (d) => self._onData(d));
         sock.on("error", (e) => self._onSocketError(e));
@@ -1834,7 +1890,7 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
       // request() can be called synchronously before the socket connects, so any
       // HEADERS it produced were buffered in _preConnectQ; flush them AFTER the
       // preface + our SETTINGS.
-      this.socket.write(CLIENT_PREFACE);
+      this._rawSocket.write(CLIENT_PREFACE);
       // http2.connect(authority, { settings }) has to reach the wire: the peer
       // reads ENABLE_PUSH from it to decide whether it may push at all, and the
       // corpus asserts the server sees `remoteSettings.enablePush === false`.
@@ -1853,12 +1909,12 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
       if (!this._pendingSettingsAcks) this._pendingSettingsAcks = [];
       this._pendingSettingsAcks.push({ settings: initial, cb: null, start: Date.now() });
       const q = this._preConnectQ; this._preConnectQ = [];
-      for (let i = 0; i < q.length; i++) this.socket.write(q[i].buf);
-      this.emit("connect", this, this.socket);
+      for (let i = 0; i < q.length; i++) this._rawSocket.write(q[i].buf);
+      this.emit("connect", this, this._rawSocket);
     }
 
     _writeFrame(type, flags, streamId, payload) {
-      if (this.destroyed || !this.socket) return;
+      if (this.destroyed || !this._rawSocket) return;
       payload = payload || Buffer.alloc(0);
       const frame = Buffer.concat([frameHeader(payload.length, type, flags, streamId), payload]);
       // Tagged with the stream it belongs to: node does not submit a request at
@@ -1873,8 +1929,8 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
       // See the server session's _writeFrame: net.Socket.write() on an ended or
       // destroyed socket EMITS 'error' instead of throwing, so this try/catch
       // cannot contain it. nghttp2 drops frames once the transport is gone.
-      if (this.socket.destroyed || this.socket.writable === false) return;
-      try { this.socket.write(frame); } catch (e) { if (!this.closed && !this.destroyed) this._fatal(e); }
+      if (this._rawSocket.destroyed || this._rawSocket.writable === false) return;
+      try { this._rawSocket.write(frame); } catch (e) { if (!this.closed && !this.destroyed) this._fatal(e); }
     }
 
     request(headers, options) {
@@ -2493,7 +2549,7 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
       // Must happen BEFORE `destroyed` is set: _onData ignores a destroyed session.
       if (hard === false && this._drainingSocket !== true) {
         this._drainingSocket = true;
-        try { if (this.socket && typeof this.socket._poll === "function") this.socket._poll(); } catch (e) {}
+        try { if (this._rawSocket && typeof this._rawSocket._poll === "function") this._rawSocket._poll(); } catch (e) {}
         this._drainingSocket = false;
         // A drained GOAWAY/FIN can have torn the session down already.
         if (this.destroyed) return;
@@ -2501,7 +2557,12 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
       this.destroyed = true; this.closed = true;
       if (this._timer != null) { try { G.clearTimeout(this._timer); } catch (e) {} this._timer = null; }
       cancelSessionPings(this);
-      closeSessionSocket(this.socket, hard !== false);
+      closeSessionSocket(this._rawSocket, hard !== false);
+      // PORT-SOURCE: compat/node/lib/internal/http2/core.js cleanupSession() —
+      // `session[kSocket] = undefined` runs BEFORE 'close' is emitted, which is
+      // what makes a socket proxy captured earlier start raising
+      // ERR_HTTP2_SOCKET_UNBOUND (test-http2-unbound-socket-proxy).
+      this._rawSocket = undefined;
       // "Pending and existing streams will be destroyed. […] pending streams
       // will be destroyed using a specific ERR_HTTP2_STREAM_CANCEL error"
       // (lib/internal/http2/core.js, closeSession). mbun's client session left
@@ -2590,6 +2651,14 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
       if (this.streams.size > 0 || this._liveStreams > 0) { this._destroyPending = true; return; }
       this._destroyPending = false;
       this._destroyScheduled = true;
+      // node's close() reaches cleanupSession() synchronously once the streams
+      // have drained, so `session[kSocket]` is already gone for any code that
+      // runs after close() returns. mbun cannot clear `_rawSocket` here — the
+      // teardown below is deliberately deferred one I/O turn and still has to
+      // write/read on the transport — so unbind only the PUBLIC proxy view.
+      // Internals keep using `_rawSocket`; `session.socket` starts raising
+      // ERR_HTTP2_SOCKET_UNBOUND at node's moment (test-http2-unbound-socket-proxy).
+      this._socketUnbound = true;
       // One I/O turn of grace, not a microtask. node's peer answers a graceful
       // close inside the same read batch (its stream closes synchronously in
       // nghttp2), so its GOAWAY is already parsed by the time close() destroys.
@@ -2606,8 +2675,11 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
       if (this.destroyed) return;
       if (err) this._fatal(err); else this._teardown();
     }
-    ref() { if (this.socket && this.socket.ref) this.socket.ref(); return this; }
-    unref() { if (this.socket && this.socket.unref) this.socket.unref(); return this; }
+    ref() { if (this._rawSocket && this._rawSocket.ref) this._rawSocket.ref(); return this; }
+    unref() { if (this._rawSocket && this._rawSocket.unref) this._rawSocket.unref(); return this; }
+    // PORT-SOURCE: compat/node/lib/internal/http2/core.js Http2Session `get socket()`
+    get socket() { return sessionSocketProxy(this); }
+    set socket(v) { this._rawSocket = v; }
     // node: an inactivity timeout that emits 'timeout' on the session and on
     // every open stream (lib/internal/http2/core.js Http2Session.setTimeout ->
     // #onTimeout -> forEachStream(emitTimeout)). Reset on inbound activity.
