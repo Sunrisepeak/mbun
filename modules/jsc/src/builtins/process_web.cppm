@@ -57,7 +57,14 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       r.bytesRead += bytes.length;
       r.push(Buffer.from(bytes));  // setEncoding(), if set, decodes downstream
     };
-    r.__end = () => { if (r._ended) return; r._ended = true; r.push(null); };
+    // node stream_base_commons.js onStreamRead does `stream.push(null)` AND THEN
+    // `stream.read(0)` at UV_EOF. The read(0) is not redundant: Readable only
+    // emits 'end' from endReadable(), which push(null) alone reaches solely
+    // through flow() -- i.e. only if the stream is already flowing. A child's
+    // stdout with an 'end' listener but no 'data' listener is PAUSED, so without
+    // the read(0) its 'end' never fires (test-child-process-kill /
+    // -destroy attach exactly that shape and hung on a missing 'end').
+    r.__end = () => { if (r._ended) return; r._ended = true; r.push(null); try { r.read(0); } catch (e) {} };
     return r;
   };
 
@@ -83,7 +90,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     });
     d.bytesRead = 0;
     d.__data = (bytes) => { d.bytesRead += bytes.length; d.push(Buffer.from(bytes)); };
-    d.__end = () => { if (d._ended) return; d._ended = true; w.closed = true; d.push(null); };
+    d.__end = () => { if (d._ended) return; d._ended = true; w.closed = true; d.push(null); try { d.read(0); } catch (e) {} };
     return d;
   };
 
@@ -681,7 +688,22 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
           // Out fds MUST be O_NONBLOCK: drainOut loops readNB until "" (EAGAIN);
           // on a blocking fd the read AFTER a partial chunk wedges the JS thread
           // while a long-lived child sits between replies (duplex protocols).
-          else { PROC.setNonBlock(fd); const rd = i > 2 ? makeDuplexPipe(fd, rec) : makeReadable(); rec.outs.push({ fd, stream: rd, ended: false }); stdioArr[i] = rd; if (i === 1) this.stdout = rd; else if (i === 2) this.stderr = rd; }
+          else {
+            PROC.setNonBlock(fd);
+            const rd = i > 2 ? makeDuplexPipe(fd, rec) : makeReadable();
+            const o = { fd, stream: rd, ended: false };
+            rec.outs.push(o);
+            // node backs these with a net.Socket, so destroy() CLOSES the pipe:
+            // the read end goes away and maybeClose stops waiting on it. Without
+            // this, `child.stdout.destroy()` (which exec() uses to abandon a
+            // timed-out child) left the fd in the poll set and 'close' waited on
+            // whatever else still held the write end -- typically a grandchild
+            // the shell forked.
+            if (typeof rd.once === "function") {
+              rd.once("close", () => { if (!o.ended) { o.ended = true; try { PROC.close(o.fd); } catch (e) {} } });
+            }
+            stdioArr[i] = rd; if (i === 1) this.stdout = rd; else if (i === 2) this.stderr = rd;
+          }
         } else { stdioArr[i] = null; }
       }
       this.stdio = stdioArr;
@@ -765,19 +787,47 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     });
     return e;
   };
+  // node internal/errors.js ERR_INVALID_ARG_TYPE picks the noun from the NAME:
+  // a name ending in " argument" is used verbatim, a name containing a '.' is a
+  // "property", anything else an "argument". Choosing it per call site instead
+  // got `options.argv0` reported as an argument, which
+  // test-child-process-spawn-argv0 compares character for character.
+  const errArgTypeMsg = (name, expected, actual) => {
+    const head = name.endsWith(" argument")
+      ? "The " + name + " "
+      : 'The "' + name + '" ' + (name.indexOf(".") >= 0 ? "property" : "argument") + " ";
+    return head + "must be " + expected + ". Received " + recvDesc(actual);
+  };
   const errArgType = (name, expected, actual) =>
-    withCode(new TypeError('The "' + name + '" argument must be ' + expected + '. Received ' + recvDesc(actual)), "ERR_INVALID_ARG_TYPE");
-  const errPropType = (name, expected, actual) =>
-    withCode(new TypeError('The "' + name + '" property must be ' + expected + '. Received ' + recvDesc(actual)), "ERR_INVALID_ARG_TYPE");
+    withCode(new TypeError(errArgTypeMsg(name, expected, actual)), "ERR_INVALID_ARG_TYPE");
+  const errPropType = errArgType;
+  // node internal/errors.js ERR_INVALID_ARG_VALUE: the noun comes from the name
+  // (same '.' rule as ERR_INVALID_ARG_TYPE) and the value is INSPECTED, not
+  // described -- `Received null`, `Received 42`, `Received 'foo'`, never
+  // "Received type number (42)".
+  const errArgValueInspect = (v) => {
+    const u = M["util"] || M["node:util"];
+    if (u && typeof u.inspect === "function") {
+      try { const s = u.inspect(v); return s.length > 128 ? s.slice(0, 128) + "..." : s; } catch (e) {}
+    }
+    return typeof v === "string" ? "'" + v + "'" : String(v);
+  };
   const errArgValue = (name, value, reason) =>
-    withCode(new TypeError("The argument '" + name + "' " + (reason || "is invalid") + ". Received " + recvDesc(value)), "ERR_INVALID_ARG_VALUE");
+    withCode(new TypeError("The " + (name.indexOf(".") >= 0 ? "property" : "argument") + " '" + name + "' " +
+      (reason || "is invalid") + ". Received " + errArgValueInspect(value)), "ERR_INVALID_ARG_VALUE");
   const errOutOfRange = (name, range, value) =>
     withCode(new RangeError('The value of "' + name + '" is out of range. It must be ' + range + ". Received " + String(value)), "ERR_OUT_OF_RANGE");
   // node normalizeSpawnArguments: `serialization` is 'json' (default) or
   // 'advanced'; anything else is ERR_INVALID_ARG_VALUE on options.serialization.
+  // node internal/child_process.js: validateOneOf(options.serialization,
+  // 'options.serialization', [undefined, 'json', 'advanced']). `undefined` is a
+  // member of the set, so it must appear in the message -- and `null` is NOT a
+  // member: it throws rather than silently meaning 'json'.
   const validateSerialization = (s) => {
-    if (s === undefined || s === null) return "json";
-    if (s !== "json" && s !== "advanced") throw errArgValue("options.serialization", s, "must be one of: 'json', 'advanced'");
+    if (s === undefined) return "json";
+    if (s !== "json" && s !== "advanced") {
+      throw errArgValue("options.serialization", s, "must be one of: undefined, 'json', 'advanced'");
+    }
     return s;
   };
   const nullCheck = (v, name) => {
@@ -798,11 +848,19 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     if (typeof p === "string") { nullCheck(p, name); return p; }
     if (p !== null && typeof p === "object") {
       if (G.Buffer && typeof G.Buffer.isBuffer === "function" && G.Buffer.isBuffer(p)) { const s = p.toString(); nullCheck(s, name); return s; }
-      if (typeof p.href === "string" && p.protocol === "file:") {
+      // Any URL (not just a file: one) goes to fileURLToPath, exactly as node's
+      // getValidatedPath -> toPathIfFileURL does: a wrong scheme is
+      // ERR_INVALID_URL_SCHEME ("The URL must be of scheme file") and a non-local
+      // host is ERR_INVALID_FILE_URL_HOST -- NOT the ERR_INVALID_ARG_TYPE this
+      // used to report for everything that was not already file:.
+      if (typeof p.href === "string" && typeof p.protocol === "string") {
         const u = M["url"] || M["node:url"];
-        const s = u && typeof u.fileURLToPath === "function" ? u.fileURLToPath(p) : String(p.pathname);
-        nullCheck(s, name);
-        return s;
+        if (u && typeof u.fileURLToPath === "function") {
+          const s = u.fileURLToPath(p);
+          nullCheck(s, name);
+          return s;
+        }
+        if (p.protocol === "file:") { const s = String(p.pathname); nullCheck(s, name); return s; }
       }
     }
     throw errArgType(name, "of type string or an instance of Buffer or URL", p);
@@ -872,6 +930,11 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       }
     }
   };
+  // node emits DEP0190 at most ONCE per process, from normalizeSpawnArguments —
+  // so every entry point (spawn/spawnSync/execFile/execFileSync) shares one
+  // latch, and `common.expectWarning` in a file that shells out twice still sees
+  // exactly one warning.
+  let emittedDEP0190Already = false;
   const normalizeSpawnArgs = (file, args, options) => {
     validateStr(file, "file");
     nullCheck(file, "file");
@@ -884,7 +947,30 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     if (options === undefined) options = Object.create(null);
     else { validateObj(options, "options"); options = ownOptions(options); }
     validateCommonOpts(options);
-    return { file, args, options };
+    // The command as the CALLER named it: exec()/execFile() report this in
+    // `err.cmd` and in "Command failed: …", never the /bin/sh wrapper.
+    const origFile = file, origArgs = args;
+    // `shell` belongs HERE, not in each entry point. node does the wrapping
+    // inside normalizeSpawnArguments (lib/child_process.js), which is why
+    // spawnSync('does-not-exist', { shell: true }) is exit 127 from /bin/sh
+    // rather than an ENOENT for a file the shell was going to report on itself.
+    // mbun previously wrapped only in spawn() and execFile(), so both sync
+    // entry points bypassed the shell entirely.
+    if (options.shell) {
+      const strArgs = args.map(toStr);
+      if (strArgs.length > 0 && !emittedDEP0190Already) {
+        emittedDEP0190Already = true;
+        if (G.process && typeof G.process.emitWarning === "function") {
+          G.process.emitWarning(
+            "Passing args to a child process with shell option true can lead to security vulnerabilities, as the arguments are not escaped, only concatenated.",
+            "DeprecationWarning", "DEP0190");
+        }
+      }
+      const command = strArgs.length > 0 ? toStr(file) + " " + strArgs.join(" ") : toStr(file);
+      file = options.shell === true ? "/bin/sh" : toStr(options.shell);
+      args = ["-c", command];
+    }
+    return { file, args, options, origFile, origArgs, shellWrapped: !!options.shell };
   };
   // node normalizeExecFileArgs: (file[, args][, options][, callback]).
   const normalizeExecFileArgs = (file, args, options, callback) => {
@@ -921,6 +1007,14 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     if (o != null && o.timeout != null && o.timeout > 0) {
       out.timeoutMs = o.timeout;
       out.killSignalNum = mapSig(o.killSignal == null ? "SIGTERM" : o.killSignal);
+    }
+    // `input` is bytes, not text (node spawn_sync.cc writes the buffer straight
+    // to the stdin pipe). The native boundary only reads a UTF-8 string, which
+    // would mangle a Buffer/TypedArray -- and used to drop it entirely, so
+    // spawnSync('cat', [], { input: Buffer.from('hi') }) returned empty stdout.
+    if (out.input !== undefined && typeof out.input !== "string") {
+      out.inputB64 = _b64(_u8(out.input));
+      delete out.input;
     }
     return out;
   };
@@ -999,7 +1093,14 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     if (o != null) { validateObj(o, "options"); validateCommonOpts(o); }
     // Route through spawnSync so execSync observes the same bounded pipe
     // collection as spawnSync/execFileSync (including ENOBUFS + stdout).
-    const r = spawnSync("/bin/sh", ["-c", command], o);
+    // node normalizeExecArgs: the command IS the file and `shell` is forced on,
+    // so the single shell wrapping lives in normalizeSpawnArgs. Building
+    // ["/bin/sh", "-c", command] here instead would wrap a caller-supplied
+    // `shell` option TWICE now that spawnSync honours it.
+    const so = Object.create(null);
+    if (o != null) for (const k of Object.keys(o)) so[k] = o[k];
+    so.shell = typeof so.shell === "string" ? so.shell : true;
+    const r = spawnSync(command, [], so);
     if (r.error) {
       r.error.stdout = r.stdout;
       r.error.stderr = r.stderr;
@@ -1013,17 +1114,19 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   }
   function execFileSync(file, a, o) {
     const nf = normalizeExecFileArgs(file, a, o, undefined);
-    const nz = normalizeSpawnArgs(nf.file, nf.args, typeof nf.options === "function" ? {} : nf.options);
     // Keep execFileSync on the public spawnSync path: that is where the
-    // per-stream maxBuffer contract turns an overrun into ENOBUFS.
-    const r = spawnSync(nz.file, nz.args, nz.options);
+    // per-stream maxBuffer contract turns an overrun into ENOBUFS -- and where
+    // normalizeSpawnArgs applies `shell`. Pre-normalizing here would hand
+    // spawnSync an already-shell-wrapped file and wrap it a second time.
+    const opts = typeof nf.options === "function" ? {} : nf.options;
+    const r = spawnSync(nf.file, nf.args, opts);
     if (r.error) {
       r.error.stdout = r.stdout;
       r.error.stderr = r.stderr;
       throw r.error;
     }
-    if (r.status !== 0) { const e = new Error("execFileSync failed: " + nz.file); e.status = r.status; e.stderr = r.stderr; throw e; }
-    const enc = nz.options && nz.options.encoding;
+    if (r.status !== 0) { const e = new Error("execFileSync failed: " + toStr(nf.file)); e.status = r.status; e.stderr = r.stderr; throw e; }
+    const enc = opts && opts.encoding;
     // A non-piped stdout slot is null, not a buffer.
     if (r.stdout == null) return null;
     return enc === "buffer" || enc == null ? Buffer.from(_u8(r.stdout)) : r.stdout;
@@ -1042,7 +1145,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       : null;
     const maxBuffer = options.maxBuffer == null ? 1024 * 1024 : options.maxBuffer;
     const outs = [], errs = [];
-    let outLen = 0, errLen = 0, maxErr = null, done = false;
+    let outLen = 0, errLen = 0, maxErr = null, done = false, killed = false, timeoutId = null;
     const add = (which, name, chunk, stream) => {
       // Stream decoding can combine a split character before this listener
       // sees it. Count the completed chunk in bytes, but keep its original
@@ -1059,7 +1162,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
             : Buffer.from(bytes.subarray(0, take)));
         }
         if (which === 0) outLen = maxBuffer; else errLen = maxBuffer;
-        if (!maxErr) { maxErr = new RangeError(name + " maxBuffer length exceeded"); maxErr.code = "ERR_CHILD_PROCESS_STDIO_MAXBUFFER"; maxErr.cmd = cmd; child.kill(); }
+        if (!maxErr) { maxErr = new RangeError(name + " maxBuffer length exceeded"); maxErr.code = "ERR_CHILD_PROCESS_STDIO_MAXBUFFER"; maxErr.cmd = cmd; killChild(); }
       } else {
         arr.push(typeof chunk === "string" ? chunk : Buffer.from(bytes));
         if (which === 0) outLen += bytes.length; else errLen += bytes.length;
@@ -1082,32 +1185,54 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     };
     const finish = (code, signal) => {
       if (done) return; done = true;
+      if (timeoutId !== null) { G.clearTimeout(timeoutId); timeoutId = null; }
       const outBuf = mergeOut(outs, child.stdout);
       const errBuf = mergeOut(errs, child.stderr);
       let err = maxErr;
       if (!err && ((code !== 0 && code != null) || signal)) {
         err = new Error("Command failed: " + cmd + (errBuf.length ? "\n" + errBuf.toString("utf8") : ""));
-        err.code = signal ? null : (code < 0 ? (ERRNO[-code] || code) : code); err.killed = child.killed || false; err.signal = signal || null; err.cmd = cmd;
+        err.code = signal ? null : (code < 0 ? (ERRNO[-code] || code) : code);
+        err.killed = child.killed || killed; err.signal = signal || null;
       }
+      // node execFile's exithandler stamps `cmd` on WHATEVER error it reports,
+      // including the `ex` an errorhandler stored (a spawn ENOENT), whose own
+      // code/killed it leaves alone. test-child-process-exec-error asserts
+      // err.cmd on exactly that path.
+      if (err) err.cmd = cmd;
       if (cb) cb(err || null, outBuf, errBuf);
     };
+    // node execFile kill(): destroy the collected streams FIRST, then signal.
+    // Destroying is what makes the result empty and lets 'close' land promptly:
+    // `sh -c "<cmd>"` forks, so the grandchild inherits the stdout pipe and
+    // keeps its write end open long after the shell is dead. Without the
+    // destroy, exec({ timeout }) waited for the grandchild's own lifetime and
+    // reported the output it produced meanwhile (test-child-process-exec-timeout-
+    // expire/-kill assert both the empty output and the prompt callback).
+    const killChild = () => {
+      if (child.stdout && typeof child.stdout.destroy === "function") child.stdout.destroy();
+      if (child.stderr && typeof child.stderr.destroy === "function") child.stderr.destroy();
+      killed = true;
+      try { child.kill(options.killSignal || "SIGTERM"); }
+      catch (e) { if (!maxErr) maxErr = e; finish(); }
+    };
+    if (options.timeout > 0) {
+      timeoutId = G.setTimeout(() => { timeoutId = null; killChild(); }, options.timeout);
+    }
     child.on("close", (code, signal) => finish(code, signal));
     child.on("error", (e) => {
       if (done) return;
-      done = true;
-      if (cb) cb(e, mergeOut([], child.stdout), mergeOut([], child.stderr));
+      if (child.stdout && typeof child.stdout.destroy === "function") child.stdout.destroy();
+      if (child.stderr && typeof child.stderr.destroy === "function") child.stderr.destroy();
+      maxErr = maxErr || e;
+      finish();
     });
   };
 
   function spawn(file, args, options) {
     const nz = normalizeSpawnArgs(file, args, options);
     file = nz.file; args = nz.args; options = nz.options;
-    let cmd = file, argv = [file].concat(args.map(toStr));
-    if (options.shell) {
-      const command = [file].concat(args.map(toStr)).join(" ");
-      const sh = options.shell === true ? "/bin/sh" : toStr(options.shell);
-      cmd = sh; argv = [sh, "-c", command];
-    }
+    // normalizeSpawnArgs already applied `shell` (node does it there too).
+    const cmd = file, argv = [file].concat(args.map(toStr));
     const child = new ChildProcess();
     child.spawn({ file: cmd, args: argv, cwd: options.cwd, env: options.env, stdio: options.stdio, detached: options.detached, uid: options.uid, gid: options.gid, argv0: options.argv0, timeout: options.timeout, killSignal: options.killSignal, signal: options.signal, serialization: validateSerialization(options.serialization) });
     return child;
@@ -1122,7 +1247,11 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     if (cb != null) validateFn(cb, "callback");
     const sh = options.shell ? (options.shell === true ? "/bin/sh" : toStr(options.shell)) : "/bin/sh";
     const child = new ChildProcess();
-    child.spawn({ file: sh, args: [sh, "-c", toStr(command)], cwd: options.cwd, env: options.env, stdio: ["pipe", "pipe", "pipe"], timeout: options.timeout, killSignal: options.killSignal, signal: options.signal });
+    // No `timeout` here on purpose: node's exec/execFile own the timer (it must
+    // destroy the collected streams before it signals), while ChildProcess.spawn
+    // implements the plain spawn() timeout that only signals. collectExec below
+    // installs the exec-flavoured one.
+    child.spawn({ file: sh, args: [sh, "-c", toStr(command)], cwd: options.cwd, env: options.env, stdio: ["pipe", "pipe", "pipe"], killSignal: options.killSignal, signal: options.signal });
     collectExec(child, options, cb, command);
     return child;
   }
@@ -1139,27 +1268,17 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     return promise;
   };
 
-  let warnedExecFileShell = false;
   function execFile(file, args, options, cb) {
     const nf = normalizeExecFileArgs(file, args, options, cb);
     const nz = normalizeSpawnArgs(nf.file, nf.args, typeof nf.options === "function" ? {} : nf.options);
-    file = nz.file; args = nz.args; options = nz.options; cb = nf.callback;
-    const stringArgs = args.map(toStr);
-    const displayCmd = [file].concat(stringArgs).join(" ");
-    let spawnFile = file, spawnArgs = [file].concat(stringArgs);
-    if (options.shell) {
-      if (!warnedExecFileShell && stringArgs.length > 0 &&
-          G.process && typeof G.process.emitWarning === "function") {
-        warnedExecFileShell = true;
-        G.process.emitWarning(
-          "Passing args to a child process with shell option true can lead to security vulnerabilities, as the arguments are not escaped, only concatenated.",
-          "DeprecationWarning", "DEP0190");
-      }
-      const sh = options.shell === true ? "/bin/sh" : toStr(options.shell);
-      spawnFile = sh; spawnArgs = [sh, "-c", displayCmd];
-    }
+    options = nz.options; cb = nf.callback;
+    // node execFile: `cmd` is the caller's file plus the caller's args, joined —
+    // the shell wrapper the spawn boundary may have inserted is invisible to it.
+    const origArgs = nz.origArgs.map(toStr);
+    const displayCmd = origArgs.length ? toStr(nz.origFile) + " " + origArgs.join(" ") : toStr(nz.origFile);
+    const spawnFile = nz.file, spawnArgs = [nz.file].concat(nz.args.map(toStr));
     const child = new ChildProcess();
-    child.spawn({ file: spawnFile, args: spawnArgs, cwd: options.cwd, env: options.env, stdio: ["pipe", "pipe", "pipe"], timeout: options.timeout, killSignal: options.killSignal, signal: options.signal });
+    child.spawn({ file: spawnFile, args: spawnArgs, cwd: options.cwd, env: options.env, stdio: ["pipe", "pipe", "pipe"], killSignal: options.killSignal, signal: options.signal });
     collectExec(child, options, cb, displayCmd);
     return child;
   }

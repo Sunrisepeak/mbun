@@ -13,6 +13,11 @@
 // in the NODE_OPTIONS it was handed) wins and nothing is added.
 extern "C" char** environ;
 
+// Defined further down in this partition; spawnSync (above it) needs it to accept
+// a Buffer/TypedArray `input`, which crosses the boundary base64-encoded because
+// it may hold bytes that are not valid UTF-8.
+std::string b64_decode(std::string_view s);
+
 void permission_inject_child_env(std::vector<std::string>& env, bool& haveEnv,
                                  const std::vector<std::string>& argv) {
     if (!gPermission.enabled()) return;
@@ -131,6 +136,11 @@ JSValueRef cp_spawn_sync_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
         if (JSValueIsString(ctx, cwdV)) cwd = val_to_string(ctx, cwdV);
         JSValueRef inV{get_prop(ctx, opt, "input")};
         if (JSValueIsString(ctx, inV)) input = val_to_string(ctx, inV);
+        // node spawn_sync.cc takes `input` as raw bytes; a Buffer/TypedArray must
+        // reach the child unchanged, so the JS layer base64-encodes anything that
+        // is not already a string rather than round-tripping it through UTF-8.
+        JSValueRef inB64V{get_prop(ctx, opt, "inputB64")};
+        if (JSValueIsString(ctx, inB64V)) input = b64_decode(val_to_string(ctx, inB64V));
         JSValueRef envV{get_prop(ctx, opt, "env")};
         if (JSValueIsObject(ctx, envV)) {
             haveEnv = true;
