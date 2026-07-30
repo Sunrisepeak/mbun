@@ -122,10 +122,12 @@ printf '// hand rolled, no port marker anywhere in this header\nexport module b;
   >"$tmp/builtins/node_alpha.cppm"
 
 o3=$(out --plan 2 --node-run "$tmp/noderun" --builtins "$tmp/builtins")
-echo "$o3" | grep -q 'HAND-WRITTEN (node_alpha.cppm)' \
+echo "$o3" | grep -q 'HAND-WRITTEN (node_alpha.cppm' \
   || fail "a hand-written subsystem must be flagged with its file"
 echo "$o3" | grep -q 'PORT lane' \
   || fail "a hand-written subsystem must be routed to a port-shaped lane"
+echo "$o3" | grep -q 'VERIFY the shadowing hypothesis' \
+  || fail "the plan must require verifying the shadowing hypothesis, not assuming it"
 pass "a hand-written subsystem is flagged and routed to a PORT lane"
 
 python3 - "$tmp/builtins" <<'INNER' || fail "builtin_shape must distinguish port from hand-written"

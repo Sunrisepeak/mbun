@@ -169,37 +169,51 @@ PORT_MARKERS = ("1:1 translation", "Mechanical 1:1", "机械翻译", "bun-ref")
 
 
 def builtin_shape(area: str, builtins_dir: Path) -> tuple[str, str]:
-    """Is the mbun builtin behind this area a PORT of the real source, or HAND-WRITTEN?
+    """Is the implementation behind this area a PORT of the real source, or HAND-WRITTEN?
 
     This is the question that predicts yield and the one nothing in the loop was
     asking. Measured correlation: every partition declaring itself a 1:1 port of
     node/bun source is healthy (the 12 `node_stream_*` partitions -> test-stream
-    237/249 = 95%), while the hand-written ones carry the entire long tail
-    (node_http 37 actionable, node_worker 39, async_hooks 31). The campaign's own
-    method for this is 移植三段法: translate the real source, fix what breaks,
-    optimise -- recorded in changelog.md at +111 corpus files in one wave, against
-    +71 for two waves of fix-by-fix lanes.
+    237/249 = 95%), while the hand-written ones carry the long tail (node_worker 39
+    actionable, node_http 37, async_hooks 31). The campaign's method for this is
+    移植三段法 -- translate the real source, fix what breaks, optimise.
+
+    THE MAPPING IS A HEURISTIC AND MUST BE SANITY-CHECKED. Naming a single file by
+    substring got `test-net` badly wrong: it matched `node_net.cppm`, an 8 KB
+    SocketAddress-only partition, while the real implementation is
+    `js_net.cppm` + `js_net_part2.cppm` at 5,703 lines. A lane briefed on that
+    mapping correctly refused the port and said so. So this now searches the whole
+    `src/` tree (not just `builtins/`), ranks candidates by SIZE, and returns every
+    candidate it found so the dispatcher can see when the mapping is wrong.
     """
-    if not builtins_dir.is_dir():
+    src_dir = builtins_dir if builtins_dir.name != "builtins" else builtins_dir.parent
+    if not src_dir.is_dir():
         return ("unknown", "")
     token = area[5:] if area.startswith("test-") else area
     token = token.split("/")[0].split("+")[0]
-    if len(token) < 2:
+    if len(token) < 3:
         return ("unknown", "")
-    best: Path | None = None
-    for f in sorted(builtins_dir.glob("*.cppm")):
+
+    cands: list[tuple[int, Path]] = []
+    for f in list(src_dir.rglob("*.cppm")) + list(src_dir.rglob("*.inc")):
         stem = f.stem
-        if stem == f"node_{token}" or stem == token:
-            best = f
-            break
-        if token in stem and best is None:
-            best = f
-    if best is None:
+        if stem in (f"node_{token}", token, f"js_{token}") or \
+                stem.startswith((f"node_{token}_", f"js_{token}_", f"{token}_")):
+            cands.append((f.stat().st_size, f))
+    if not cands:
         return ("unknown", "")
-    head = best.read_text(errors="replace")[:4000]
-    if any(m in head for m in PORT_MARKERS):
-        return ("port", best.name)
-    return ("hand-written", best.name)
+    cands.sort(reverse=True)
+    total = sum(sz for sz, _ in cands)
+    # Judge the shape from the LARGEST file -- that is the implementation. A small
+    # satellite partition declaring itself a port does not make the subsystem ported.
+    biggest = cands[0][1]
+    head = biggest.read_text(errors="replace")[:4000]
+    shape = "port" if any(m in head for m in PORT_MARKERS) else "hand-written"
+    kb = total // 1024
+    names = ", ".join(f"{f.name} {sz // 1024}K" for sz, f in cands[:3])
+    if len(cands) > 3:
+        names += f", +{len(cands) - 3} more"
+    return (shape, f"{names} (total {kb}K)")
 
 
 def throughput(ledger: list[dict[str, str]],
@@ -416,8 +430,28 @@ def cmd_plan(args, node_run, bun_run, ledger, excluded):
         print(f"     corpus rate {c['rate']:.1f} files/h x {args.lane_hours}h "
               f"-> GOAL +{c['goal']}")
         if c.get("shape") == "hand-written":
-            print(f"     shape: HAND-WRITTEN ({c['impl']}) -> dispatch as a PORT lane "
-                  f"(移植三段法), not a fix lane")
+            print(f"     shape: HAND-WRITTEN ({c['impl']})")
+            # Size is the signal for WHICH port shape. A wholesale port of a large
+            # subsystem has no safe partial landing -- a half-ported net.Socket is
+            # 121 files red plus http/https/http2 -- and one lane sized exactly that
+            # at 3-5 lanes before declining it. What it did instead, and where its
+            # +19 came from, was porting node's algorithms function-by-function into
+            # the existing structure. That is the right default above ~150K.
+            kb = 0
+            for part in c["impl"].replace("(", " ").replace(")", " ").split():
+                if part.endswith("K") and part[:-1].isdigit():
+                    kb = max(kb, int(part[:-1]))
+            big = "total" in c["impl"] and kb >= 150
+            if big:
+                print(f"     -> LARGE: port node's algorithms FUNCTION-BY-FUNCTION into "
+                      f"the existing structure. A wholesale port has no safe partial "
+                      f"landing; size it as 3-5 lanes before attempting it.")
+            else:
+                print(f"     -> dispatch as a PORT lane (移植三段法): translate the real "
+                      f"source, fix what breaks, then measure.")
+            print(f"     -> VERIFY the shadowing hypothesis before relying on it: probe "
+                  f"the prototype chain. It only pays when hand-rolled methods sit ON a "
+                  f"correctly-ported base class.")
         elif c.get("shape") == "port":
             print(f"     shape: already a 1:1 port ({c['impl']}) -> fix-shaped lane is "
                   f"appropriate here")
