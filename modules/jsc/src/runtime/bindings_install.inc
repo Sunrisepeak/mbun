@@ -290,6 +290,28 @@
         set_prop(ctx_, global, "process", process);
         set_prop(ctx_, bun, "argv", argvArr);
 
+        // The process dialect, for the builtins layer. ONE accessor for the
+        // whole JS side: a dispatch point in a builtins payload reads
+        // `globalThis.__mbunDialect === "node"`, it never re-derives the answer
+        // from argv/env of its own (runtime.cppm explains why).
+        //
+        // NON-ENUMERABLE, and that is load-bearing: node's
+        // compat/node/test/common/index.js:413 walks `for (const val in
+        // globalThis)` on exit and fails the file on any unknown enumerable
+        // global, so an enumerable one here would fail every node corpus file
+        // that requires common. ReadOnly|DontDelete too — it is process
+        // infrastructure, not a knob a script gets to move mid-run.
+        {
+            JSStringRef dname{JSStringCreateWithUTF8CString("__mbunDialect")};
+            JSObjectSetProperty(
+                ctx_, global, dname,
+                make_string(ctx_, gDialect == mbun::jsc::runtime::Dialect::Node ? "node" : "bun"),
+                kJSPropertyAttributeDontEnum | kJSPropertyAttributeReadOnly |
+                    kJSPropertyAttributeDontDelete,
+                nullptr);
+            JSStringRelease(dname);
+        }
+
         // JS-side process fields (version/versions/nextTick/hrtime/pid/no-op event
         // surface) — data + thin wrappers over the native bits above.
         JSValueRef pexc{nullptr};

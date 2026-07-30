@@ -238,6 +238,11 @@ std::string gArgv0{};
 // test/bundler/compile-argv.test.ts "CompileExecArgvNoLeak".
 std::vector<std::string> gExecArgv{};
 
+// The dialect this process serves — see runtime.cppm for what it is and who
+// resolves it. Bun by default, so a binary nobody told anything to behaves
+// exactly as it did before the dialect existed.
+mbun::jsc::runtime::Dialect gDialect{mbun::jsc::runtime::Dialect::Bun};
+
 // `--no-env-file` / bunfig env=false: suppress default .env auto-loading.
 bool gDisableEnvFiles{false};
 

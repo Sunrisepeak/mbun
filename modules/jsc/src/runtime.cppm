@@ -87,6 +87,31 @@ import mbun.html_rewriter;
 // note in prelude.hpp). The mbun_napi_* runtime hooks engine.inc calls are
 // declared in runtime/napi/mbun_napi.h.
 
+// ── the process dialect ─────────────────────────────────────────────────────
+// mbun is ONE universal core with a thin node compat layer and a thin bun
+// compat layer (.agents/skills/dev-process/SKILL.md, "通用内核 + 各方言的薄
+// 兼容层"). Where compat/node and compat/bun demand different OBSERVABLE
+// behaviour from the same call, that call site is a dispatch point and this
+// value is its key — not a ceiling, and not something to decide by picking a
+// winner.
+//
+// It is process-level infrastructure: resolved ONCE, in C++, at CLI dispatch
+// (src/main.cpp `resolve_dialect`), never sniffed independently inside a
+// builtins JS payload. JS reads it back through the non-enumerable
+// `globalThis.__mbunDialect` string installed by bindings_install.inc.
+//
+// Declared here rather than in api_impl.inc because everything from
+// common.inc down lives in the anonymous namespace below and needs the type
+// for its storage, while the setter/getter must be exported.
+export namespace mbun::jsc::runtime {
+
+enum class Dialect {
+    Bun,   // the historical default: no signal at all behaves as it always did
+    Node,
+};
+
+}  // namespace mbun::jsc::runtime
+
 namespace {
 
 #include "runtime/common.inc"

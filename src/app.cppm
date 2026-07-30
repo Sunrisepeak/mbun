@@ -220,6 +220,13 @@ std::string resolve_entry_path(std::string_view script) {
     return std::string{script};
 }
 
+// The one entry-point-not-found reporter; defined further down, next to the
+// rest of the run-target machinery. Declared here because run_script — which is
+// where the node-emulation path lands, and the ONLY route by which a missing
+// entry reached `mbun run: cannot read script` (a string that is neither node's
+// nor bun's, and that no corpus file on either side pins) — needs it.
+int report_run_target_not_found(std::string_view target);
+
 // Run a JS file with process.argv = [runtime, script, ...args] (Node/bun order).
 int run_script(std::string_view script, std::span<const std::string_view> scriptArgs) {
     // Best-effort, NON-FATAL bunfig.toml validation (ref bun
@@ -261,6 +268,18 @@ int run_script(std::string_view script, std::span<const std::string_view> script
     mbun::jsc::runtime::set_preloads(std::move(preloads));
     if (is_markdown(script)) return run_markdown(script);
     const std::string entry{resolve_entry_path(script)};
+    // A missing entry is reported by the shared not-found reporter, so the node
+    // emulation path (`mbun --preserve-symlinks <missing>` routes here through
+    // exec_as_if_node) gets the same dialect dispatch as a bare `mbun <missing>`
+    // — compat/node/test/parallel/test-module-main-preserve-symlinks-fail.js:15
+    // asserts on exactly that child's stderr.
+    {
+        std::error_code ec{};
+        const std::filesystem::path p{entry};
+        if (!std::filesystem::exists(p, ec) || std::filesystem::is_directory(p, ec)) {
+            return report_run_target_not_found(entry);
+        }
+    }
     std::vector<std::string> jsArgv;
     jsArgv.reserve(scriptArgs.size() + 2);
     jsArgv.emplace_back("mbun");
@@ -2359,12 +2378,68 @@ bool loader_can_be_run(std::string_view target) {
     return looks_like_script(target) || is_markdown(target);
 }
 
+// DISPATCH POINT — entry point not found.
+//
+// The two corpora pin different text for the identical invocation, a bare
+// `<runtime> <missing>`:
+//
+//   node  compat/node/test/parallel/test-module-main-fail.js:15-17 needs
+//         /MODULE_NOT_FOUND/ AND /Cannot find module/ in the CHILD's stderr;
+//         test-module-main-preserve-symlinks-fail.js:15 needs the literal
+//         "Error: Cannot find module".
+//   bun   compat/bun/test/cli/run/if-present.test.ts:41,53 pins
+//         /Module not found/ and compat/bun/test/cli/install/bun-run.test.ts:481
+//         pins the whole stderr with toBe, including
+//         `error: Module not found "index.js"`.
+//
+// Both are a bare `mbun <file>`, so there is no discriminator AT THE CALL SITE
+// — which is exactly why the discriminator has to be the process dialect,
+// resolved before dispatch and inherited by children.
+//
+// node's own rendering: the CJS loader throws a MODULE_NOT_FOUND Error whose
+// message carries the RESOLVED absolute path, and the uncaught-exception
+// printer appends the `{ code, requireStack }` block.
+// ref: node lib/internal/modules/cjs/loader.js Module._resolveFilename.
+int report_entry_not_found_node(std::string_view target) {
+    std::error_code ec{};
+    std::filesystem::path p{target};
+    if (!p.is_absolute()) {
+        const std::filesystem::path cwd{std::filesystem::current_path(ec)};
+        if (!ec) p = cwd / p;
+    }
+    // No frame line numbers are invented here: mbun's loader is not node's, and
+    // a fabricated `loader.js:1215` would be a claim about a file that does not
+    // exist in this binary. The frame NAMES are what node prints and what a
+    // reader greps for; the corpus pins neither.
+    std::println(std::cerr,
+                 "Error: Cannot find module '{}'\n"
+                 "    at Module._resolveFilename (node:internal/modules/cjs/loader)\n"
+                 "    at Module._load (node:internal/modules/cjs/loader)\n"
+                 "    at Function.executeUserEntryPoint [as runMain] "
+                 "(node:internal/modules/run_main)\n"
+                 "    at node:internal/main/run_main_module {{\n"
+                 "  code: 'MODULE_NOT_FOUND',\n"
+                 "  requireStack: []\n"
+                 "}}\n\n"
+                 "Node.js v{}",
+                 p.lexically_normal().string(), mbun::cli::NODE_COMPAT_VERSION);
+    return 1;
+}
+
 // ref: run_command.rs:2745-2775 — the not-found wording is target-shaped.
 int report_run_target_not_found(std::string_view target) {
     // An existing file with a loader that cannot be executed (e.g. .css) is
     // "Cannot run", not "File not found". ref bun run_command.rs:2745.
     std::error_code ec2{};
     std::filesystem::path tp{target};
+    // Under the node dialect every miss is one error: node has no notion of a
+    // package.json script or a .bin shim to fall back to, so `node <anything
+    // that did not resolve>` is MODULE_NOT_FOUND. The "Cannot run" arm below
+    // stays bun-only — it is about bun's loader table, which node does not have.
+    if (mbun::jsc::runtime::dialect_is_node() &&
+        !(std::filesystem::exists(tp, ec2) && !std::filesystem::is_directory(tp, ec2))) {
+        return report_entry_not_found_node(target);
+    }
     if (!target.empty() && !target.ends_with(".json") &&
         std::filesystem::exists(tp, ec2) && !std::filesystem::is_directory(tp, ec2) &&
         !loader_can_be_run(target)) {
@@ -2641,6 +2716,9 @@ bool is_skippable_run_flag(std::string_view a) {
         // Consumed here; the value is picked up in main() before flag parsing
         // (it must reach resolve_entry_path, which run_script calls).
         "--preserve-symlinks-main"};
+    // `--dialect=<name>` — already consumed by resolve_dialect() before any
+    // dispatch; drop it so it never reaches a run target or a script's argv.
+    if (a.starts_with("--dialect=")) return true;
     if (a.starts_with("--install=") || a.starts_with("--conditions=") ||
         a.starts_with("--cwd=") || a.starts_with("--config=") ||
         // node's rejection mode selector: mbun always behaves as "throw" (node's
@@ -2657,6 +2735,146 @@ bool is_skippable_run_flag(std::string_view a) {
 // ref: cli/mod.rs:854-863 `is_node` — a plain suffix test on the WHOLE argv[0]
 // (NOT the basename), ported verbatim including that looseness.
 bool is_node_argv0(std::string_view argv0) { return argv0.ends_with("node"); }
+
+// ── dialect resolution ──────────────────────────────────────────────────────
+// Which compat layer this process serves. See modules/jsc/src/runtime.cppm for
+// what the dialect IS; this is only where the one answer gets picked.
+//
+// Resolved once, before any dispatch, from three signals in strict priority:
+//
+//   1. `--dialect=node|bun` on the command line, else the MBUN_DIALECT env var.
+//      Explicit always wins, and it is the signal that makes the other two
+//      testable at all.
+//   2. argv[0] ending in `node` — the signal bun already carries
+//      (is_node_argv0 above → set_pretend_to_be_node). Every `#!/usr/bin/env
+//      node` shebang that lands in this binary arrives this way.
+//   3. The subcommand. `mbun test|run|install|add|build|exec|publish|pm|x|i`
+//      is a bun invocation by construction — none of those words is a thing
+//      node can be asked to do. Everything else, above all a bare
+//      `mbun <file>`, leans node: node's ONLY calling convention is
+//      `node <file>`, so that is the shape a node-flavoured run has.
+//
+// Rule 3 alone already separates the two corpora, with no symlink and no
+// runner change: tools/integration/bun_corpus_runner.py spawns
+// `<bin> test <file>` and node_corpus_runner.py spawns `<bin> <file>`.
+//
+// The default with NO signal at all stays Bun, so nothing about an ordinary
+// invocation moves.
+mbun::jsc::runtime::Dialect dialect_from_name(std::string_view v) {
+    return v == "node" ? mbun::jsc::runtime::Dialect::Node : mbun::jsc::runtime::Dialect::Bun;
+}
+
+bool is_valid_dialect_name(std::string_view v) { return v == "node" || v == "bun"; }
+
+// The subcommands that ARE bun. Kept in sync with mbun::cli::parse (src/cli.cppm)
+// plus the two main() handles ahead of it (`run`, `pm`) and the package-manager
+// verbs bun owns even where mbun has not implemented them yet — a word bun
+// reserves must never be read as a node entry point.
+bool is_bun_subcommand(std::string_view a) {
+    static constexpr std::string_view kBunSubcommands[]{
+        "test",    "run",    "install", "i",       "add",     "remove", "rm",
+        "update",  "upgrade","link",    "unlink",  "pm",      "x",      "exec",
+        "build",   "create", "init",    "publish", "patch",   "why",    "audit",
+        "outdated","repl"};
+    for (std::string_view s : kBunSubcommands) {
+        if (a == s) return true;
+    }
+    return false;
+}
+
+// `--dialect=<name>` / `--dialect <name>`, scanned off the RAW command line
+// before any flag loop consumes it — the same discipline set_exec_argv and the
+// permission model already use. Stops at the first non-flag or at an eval flag
+// so a `-e` program that merely contains the word is not a request.
+std::optional<mbun::jsc::runtime::Dialect> dialect_from_argv(int argc, char* argv[]) {
+    for (int i{1}; i < argc; ++i) {
+        const std::string_view a{argv[i]};
+        if (a == "-e" || a == "--eval" || a == "-p" || a == "--print" || a == "-pe" ||
+            a == "-ep") {
+            break;
+        }
+        if (a.starts_with("--dialect=")) {
+            const std::string_view v{a.substr(std::string_view{"--dialect="}.size())};
+            if (is_valid_dialect_name(v)) return dialect_from_name(v);
+            break;
+        }
+        if (a == "--dialect" && i + 1 < argc) {
+            const std::string_view v{argv[i + 1]};
+            if (is_valid_dialect_name(v)) return dialect_from_name(v);
+            break;
+        }
+        if (!a.starts_with("-")) break;
+    }
+    return std::nullopt;
+}
+
+struct ResolvedDialect {
+    mbun::jsc::runtime::Dialect value{mbun::jsc::runtime::Dialect::Bun};
+    // Whether the answer came from an EXPLICIT signal (flag or env) rather than
+    // from argv0/subcommand inference. Only an explicit answer, and a `bun`
+    // answer, need to be handed to children: a child invoked the way rule 3
+    // reads as node re-derives node on its own.
+    bool explicitly_set{false};
+};
+
+ResolvedDialect resolve_dialect(int argc, char* argv[]) {
+    // 1a. the flag.
+    if (const auto d{dialect_from_argv(argc, argv)}) return {*d, true};
+    // 1b. the env var — the form that INHERITS, which is what a conflict
+    //     asserting on a CHILD process needs (compat/node/test/parallel/
+    //     test-module-main-fail.js spawns process.argv[0] with no env option, so
+    //     the child gets the parent's environment; compat/bun/test/harness.ts:64
+    //     `bunEnv` spreads process.env, so it propagates on that side too).
+    if (const char* v{std::getenv("MBUN_DIALECT")}; v != nullptr && is_valid_dialect_name(v)) {
+        return {dialect_from_name(v), true};
+    }
+    // 2. argv0.
+    if (argc > 0 && argv[0] != nullptr && is_node_argv0(argv[0])) {
+        return {mbun::jsc::runtime::Dialect::Node, false};
+    }
+    // 3. the subcommand. The first non-flag token is the subcommand slot; a
+    //    command line with no positional at all (`mbun --version`, a bare
+    //    `mbun`) reaches no dispatch point and keeps the Bun default.
+    for (int i{1}; i < argc; ++i) {
+        const std::string_view a{argv[i]};
+        if (a == "-e" || a == "--eval" || a == "-p" || a == "--print" || a == "-pe" ||
+            a == "-ep") {
+            // `mbun -e <code>` is node's calling convention too.
+            return {mbun::jsc::runtime::Dialect::Node, false};
+        }
+        if (a.starts_with("-")) {
+            // A valued flag swallows its argument, so the value is never
+            // mistaken for the subcommand.
+            if (a.find('=') == std::string_view::npos && mbun::cli::node_flag_takes_value(a) &&
+                i + 1 < argc) {
+                ++i;
+            }
+            continue;
+        }
+        return {is_bun_subcommand(a) ? mbun::jsc::runtime::Dialect::Bun
+                                     : mbun::jsc::runtime::Dialect::Node,
+                false};
+    }
+    return {mbun::jsc::runtime::Dialect::Bun, false};
+}
+
+// Publish the resolved dialect to the runtime AND, when a child could not
+// re-derive it, to the environment so children inherit it.
+//
+// The asymmetry is deliberate, and it is the whole reason the default path can
+// stay unchanged. A child spawned as a bare `mbun <file>` re-derives Node from
+// rule 3 by itself, so an implicit Node answer needs no env var and the node
+// corpus' process.env is untouched. A Bun answer is the one a bare child
+// CANNOT re-derive — compat/bun/test/cli/run/if-present.test.ts:35 spawns
+// `<bin> ./notpresent.js` from inside a `mbun test` run and pins bun's
+// `Module not found` — so Bun is exported, as is any explicit override.
+void publish_dialect(ResolvedDialect d) {
+    mbun::jsc::runtime::set_dialect(d.value);
+    if (d.explicitly_set || d.value == mbun::jsc::runtime::Dialect::Bun) {
+        mbun::platform::set_env_var(
+            "MBUN_DIALECT", d.value == mbun::jsc::runtime::Dialect::Node ? "node" : "bun");
+    }
+}
 
 // ── `--compile`d executables ────────────────────────────────────────────────
 // A standalone executable is this same binary with a program appended (see

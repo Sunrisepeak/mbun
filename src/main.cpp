@@ -29,6 +29,12 @@ int main(int argc, char* argv[]) {
     // rewrite it, and the corpus respawns the runtime through it. Recorded first
     // so every dispatch below (compiled program, node emulation, run, -e) agrees.
     if (argc > 0 && argv[0] != nullptr) mbun::jsc::runtime::set_argv0(argv[0]);
+    // The process dialect (node vs bun). Resolved ONCE, here, before any
+    // dispatch, and read afterwards by the C++ dispatch points and by JS
+    // through globalThis.__mbunDialect. See mbun::app::resolve_dialect for the
+    // priority order and modules/jsc/src/runtime.cppm for what it is for.
+    // Published below — the compiled-executable branch publishes its own.
+    const ResolvedDialect resolvedDialect{resolve_dialect(argc, argv)};
     // NODE_PRESERVE_SYMLINKS_MAIN — read before any flag parsing so both the
     // node-emulation path and `run` see it (run_command.rs:2581-2584).
     if (const char* v{std::getenv("NODE_PRESERVE_SYMLINKS_MAIN")};
@@ -49,9 +55,16 @@ int main(int argc, char* argv[]) {
     //    ref: cli/mod.rs, which consults StandaloneModuleGraph.fromExecutable()
     //    before any argument parsing.
     if (const auto embedded{embedded_program()}) {
+        // A compiled executable owns its whole command line, so the SUBCOMMAND
+        // signal cannot be read off it — `./myapp test` is the program's own
+        // argument, not a bun subcommand. Only an EXPLICIT dialect survives
+        // here; otherwise a `bun build --compile` artifact keeps the bun
+        // default, which is what it was built as.
+        publish_dialect(resolvedDialect.explicitly_set ? resolvedDialect : ResolvedDialect{});
         std::vector<std::string_view> embeddedArgs(argv + 1, argv + argc);
         return run_embedded_program(*embedded, argc > 0 ? argv[0] : "mbun", embeddedArgs);
     }
+    publish_dialect(resolvedDialect);
 
     // ── --enable-fips / --force-fips on a non-FIPS OpenSSL → refuse to start.
     //    node ProcessFipsOptions() (src/crypto/crypto_util.cc) asks OpenSSL for a
@@ -218,6 +231,17 @@ int main(int argc, char* argv[]) {
         if (args[0] == "--if-present") {
             globalFlags.ifPresent = true;
             args.erase(args.begin());
+            continue;
+        }
+        // `--dialect=<name>` / `--dialect <name>` — already consumed by
+        // resolve_dialect() above; drop it here so it is not mistaken for a run
+        // target or forwarded to the script.
+        if (args[0].starts_with("--dialect=")) {
+            args.erase(args.begin());
+            continue;
+        }
+        if (args[0] == "--dialect" && args.size() > 1) {
+            args.erase(args.begin(), args.begin() + 2);
             continue;
         }
         if (args[0] == "--silent") {

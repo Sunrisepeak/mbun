@@ -113,6 +113,11 @@ Parsed parse(std::initializer_list<std::string_view> args) {
 // Everything not listed here is treated as a boolean flag (single token).
 bool node_flag_takes_value(std::string_view flag) {
     static constexpr std::string_view kValued[]{
+        // mbun's own: `--dialect node|bun` selects the compat layer. Listed
+        // here so every flag walker in the CLI skips its value token instead of
+        // mistaking it for the subcommand or the script (mbun::app::resolve_dialect
+        // reads the flag itself, long before these walkers run).
+        "--dialect",
         "-r", "--require", "--snapshot-blob", "--build-snapshot-config",
         "--test-reporter", "--test-reporter-destination", "--test-name-pattern",
         "--test-skip-pattern", "--test-shard", "--test-concurrency",

@@ -1139,7 +1139,19 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       r.error.stderr = r.stderr;
       throw r.error;
     }
-    if (r.status !== 0) { const e = new Error("execFileSync failed: " + toStr(nf.file)); e.status = r.status; e.stderr = r.stderr; throw e; }
+    if (r.status !== 0) {
+      // node lib/child_process.js `checkExecSyncError`: execFileSync has no
+      // command string, so the message joins argv0-or-file with the arguments,
+      // and the CHILD'S STDERR is appended to it. That tail is the whole point —
+      // `e.toString()` is how a caller sees what the child said, and
+      // compat/node/test/parallel/test-module-main-fail.js:13-17 matches the
+      // child's MODULE_NOT_FOUND out of exactly this string.
+      // "execFileSync failed: <file>" carried neither, and no corpus file on
+      // either side pins that wording.
+      let msg = "Command failed: " + [(opts && opts.argv0) || toStr(nf.file)].concat(nf.args || []).join(" ");
+      if (r.stderr != null && r.stderr.length > 0) msg += "\n" + r.stderr.toString();
+      const e = new Error(msg); e.status = r.status; e.stdout = r.stdout; e.stderr = r.stderr; throw e;
+    }
     const enc = opts && opts.encoding;
     // A non-piped stdout slot is null, not a buffer.
     if (r.stdout == null) return null;
