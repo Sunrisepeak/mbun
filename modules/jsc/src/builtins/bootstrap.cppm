@@ -7663,6 +7663,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   G.__mbunFsInternals = { validatePath, validateEncoding: fsValidateEncoding, argTypeErr: fsArgTypeErr,
                           argValueErr: fsArgValueErr, makeCallback: fsMakeCallback, errno: fsErr,
                           validateInteger: fsValidateInteger, rangeErr: fsRangeErr,
+                          Stats, BigIntStats,
                           get FileHandle() { return FileHandle; } };
   // node marks fs.read/fs.write with kCustomPromisifyArgs so promisify(fs.read)
   // resolves to { bytesRead, buffer } rather than the first callback value.
@@ -7920,9 +7921,17 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     emit(ev, ...a) { const l = this._events[ev]; if (l) for (const cb of l.slice()) cb(...a); return !!(l && l.length); }
     // node rejects EVERY FileHandle operation after close with EBADF — the
     // handle's fd is -1 and the binding reports a bad descriptor.
+    // Reads `this.fd` — the public GETTER — not the `_fd` slot behind it. node's
+    // own promises layer touches `filehandle.fd` on every operation
+    // (readFileHandle/writeFileHandle/ftruncate all pass `handle.fd` to the
+    // binding), and three corpus files redefine `FileHandle.prototype.fd` to
+    // observe exactly that (test-fs-promises-file-handle-{op,close,aggregate}-
+    // errors install a getter that wraps `close`). Going straight to `_fd` made
+    // the descriptor unobservable, so the override never ran.
     _use(syscall) {
-      if (this._closed || this._fd < 0) throw fsErr("EBADF", syscall || "read");
-      return this._fd;
+      const fd = this.fd;
+      if (this._closed || fd < 0) throw fsErr("EBADF", syscall || "read");
+      return fd;
     }
     // Stream ref-counting: a createReadStream/createWriteStream over this
     // handle keeps it alive until the stream closes (node kRef/kUnref).
@@ -8043,7 +8052,14 @@ inline constexpr char kBootstrapJS_[] = R"JS(
           }
         } catch (e) { if (e && e.code === "ERR_FS_FILE_TOO_LARGE") throw e; }
         const chunks = []; const tmp = Buffer.alloc(65536); let n;
+        // Same synthetic-allocation guard readFileSync carries: a character
+        // device stats as size 0, so this read-to-EOF loop never terminates on
+        // /dev/zero and the process is OOM-killed instead of throwing. It only
+        // began to matter once fs.promises.readFile started routing here.
+        const oomCap = fsOomCap(enc); let total = 0;
         while ((n = fsMod.readSync(fd, tmp, 0, tmp.length, null)) > 0) {
+          total += n;
+          if (total > oomCap) throw fsOomError(fdPathMap.get(fd) || "");
           chunks.push(Buffer.from(tmp.subarray(0, n)));
           // Yield a full loop turn between chunks: node reads through the
           // thread pool, so an abort scheduled with process.nextTick OR
@@ -8390,6 +8406,41 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     }
     [Symbol.asyncDispose]() { return this.close(); }
   }
+  // node lib/internal/fs/promises.js handleFdClose(). The path forms of
+  // readFile/writeFile/appendFile/truncate open a FileHandle, run the operation
+  // and then close it — and the CLOSE is awaited as a first-class step, not run
+  // in a `finally`. That distinction is observable three ways, and all three are
+  // asserted by the corpus:
+  //   * op ok  + close throws  -> reject with the CLOSE error
+  //   * op throws + close ok   -> reject with the OP error
+  //   * both throw             -> reject with AggregateError([opError, closeError])
+  // `handle.close()` is looked up on the instance every time on purpose: the
+  // tests install a per-instance `close` from inside the `fd` getter, so a
+  // captured method reference would miss it.
+  // The both-threw case is node's aggregateTwoErrors(closeError, opError)
+  // (lib/internal/errors.js): the OP error leads, supplies the message AND the
+  // `code` of the AggregateError, and an op error that is already an
+  // AggregateError absorbs the close error instead of nesting.
+  const fsAggregateTwoErrors = (closeError, opError) => {
+    if (closeError && opError && closeError !== opError) {
+      if (Array.isArray(opError.errors)) { opError.errors.push(closeError); return opError; }
+      const e = new AggregateError([opError, closeError], opError.message);
+      e.code = opError.code;
+      return e;
+    }
+    return closeError || opError;
+  };
+  const fsHandleFdClose = (opPromise, handle) =>
+    opPromise.then(
+      (result) => handle.close().then(() => result),
+      (opError) => handle.close().then(
+        () => { throw opError; },
+        (closeError) => { throw fsAggregateTwoErrors(closeError, opError); }));
+  // Only a path-shaped argument gets the open/close treatment. A numeric fd is
+  // not something node's promises API accepts at all, but mbun's sync layer has
+  // always tolerated it, so that path stays on the old direct call rather than
+  // turning a working call into an ERR_INVALID_ARG_TYPE.
+  const fsPathIsHandleable = (p) => typeof p !== "number";
   const fsPromises = {
     open: (p, flags, mode) => Promise.resolve().then(() => { validatePath(p); const md = mode == null ? 0o666 : fsParseFileMode(mode, "mode", 0o666); return new FileHandle(fdRemember(globalThis.__mbunFdNative.open(toStr(p), flags == null ? "r" : (typeof flags === "number" ? flags : toStr(flags)), md), p)); }),
     // node fs.promises.readFile: a FileHandle argument reads through the
@@ -8399,7 +8450,10 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       const signal = fsSignalOf(o);
       fsThrowIfAborted(signal);
       if (p && typeof p === "object" && typeof p.readFile === "function") return p.readFile(o);
-      return fsMod.readFileSync(p, o);
+      if (!fsPathIsHandleable(p)) return fsMod.readFileSync(p, o);
+      const flag = (o && typeof o === "object" && o.flag != null) ? o.flag : "r";
+      return fsPromises.open(p, flag, 0o666)
+        .then((fh) => fsHandleFdClose(fh.readFile(o), fh));
     }),
     writeFile: (p, d, o) => Promise.resolve().then(async () => {
       if (p && typeof p === "object" && typeof p.writeFile === "function") return p.writeFile(d, o);
@@ -8434,17 +8488,38 @@ inline constexpr char kBootstrapJS_[] = R"JS(
         } finally { FD.close(fd); }
         return;
       }
-      return fsMod.writeFileSync(path2, d, o);
+      if (!fsPathIsHandleable(p)) return fsMod.writeFileSync(path2, d, o);
+      const wFlag = (o && typeof o === "object" && o.flag != null) ? o.flag : "w";
+      const wMode = (o && typeof o === "object" && o.mode != null) ? o.mode : 0o666;
+      // options.flush is an fsync BEFORE the close, so it belongs inside the
+      // operation promise handleFdClose wraps, not after it. fsFlushOf also
+      // REJECTS a non-boolean, which used to come free from writeFileSync —
+      // routing through the handle skipped it (test-fs-write-file-flush).
+      const wFlush = fsFlushOf(o);
+      return fsPromises.open(p, wFlag, wMode).then((fh) => fsHandleFdClose(
+        fh.writeFile(d, o).then(() => (wFlush ? fh.sync() : undefined)), fh));
     }),
     appendFile: (p, d, o) => Promise.resolve().then(() => {
       fsValidateData(d); fsValidateEncoding(o);
       if (p && typeof p === "object" && typeof p.appendFile === "function") return p.appendFile(d, o);
-      return fsMod.appendFileSync(p, d, o);
+      if (!fsPathIsHandleable(p)) return fsMod.appendFileSync(p, d, o);
+      const aFlag = (o && typeof o === "object" && o.flag != null) ? o.flag : "a";
+      const aMode = (o && typeof o === "object" && o.mode != null) ? o.mode : 0o666;
+      const aFlush = fsFlushOf(o);
+      return fsPromises.open(p, aFlag, aMode).then((fh) => fsHandleFdClose(
+        fh.appendFile(d, o).then(() => (aFlush ? fh.sync() : undefined)), fh));
     }),
     mkdir: P((p, o) => { validatePath(p); const [rec, mode] = mkdirOpts(o); return F.mkdir(toStr(p), rec, mode); }),
     rm: P((p, o) => rmImpl(p, o)),
     rmdir: P((p, o) => { validatePath(p); rmdirCheckOpts(o); rmdirImpl(p); }),
-    truncate: P((p, len) => fsMod.truncateSync(p, len)),
+    // node opens 'r+' and truncates through the handle (lib/internal/fs/
+    // promises.js truncate), so a close failure is reportable here too.
+    truncate: (p, len) => Promise.resolve().then(() => {
+      if (!fsPathIsHandleable(p)) return fsMod.truncateSync(p, len);
+      validatePath(p);
+      return fsPromises.open(p, "r+", 0o666)
+        .then((fh) => fsHandleFdClose(fh.truncate(len == null ? 0 : len), fh));
+    }),
     statfs: P((p, o) => fsMod.statfsSync(p, o)),
     // Reuse the public sync path: it owns encoding, recursive traversal, and
     // Dirent conversion. Calling the raw native row here lost every option
