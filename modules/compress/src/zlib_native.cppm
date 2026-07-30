@@ -69,6 +69,14 @@ export Result<Bytes> zlib_deflate(ByteView input, int windowBits, int level,
 // windowBits (31) zlib will also transparently accept a zlib stream when the
 // caller adds 32, but we keep formats explicit to match bun's per-API framing.
 export Result<Bytes> zlib_inflate(ByteView input, int windowBits) {
+    // gzip framing (mag + 16) may carry concatenated RFC 1952 members. windowBits
+    // >= 32 asks zlib to sniff the framing, which clears the 16 bit — so the
+    // gate below used to be false for unzip() and it decoded only the first
+    // member. node's UNZIP mode resolves to GUNZIP from the header bytes and gets
+    // the same multi-member handling; a zlib stream does not.
+    const bool multiMember { (windowBits > 0 && (windowBits & 16) != 0) ||
+                             (windowBits >= 32 && input.size() >= 2 &&
+                              input[0] == 0x1f && input[1] == 0x8b) };
     z_stream strm{};
     int rc = inflateInit2(&strm, windowBits);
     if (rc != Z_OK) {
@@ -92,7 +100,7 @@ export Result<Bytes> zlib_inflate(ByteView input, int windowBits) {
             strm.avail_out = static_cast<uInt>(out.size() - used);
         }
         rc = inflate(&strm, Z_NO_FLUSH);
-        if (rc == Z_STREAM_END && windowBits > 0 && (windowBits & 16) != 0) {
+        if (rc == Z_STREAM_END && multiMember) {
             // gzip permits concatenated members. Keep decoding non-zero trailing
             // input as another member, while treating all-zero padding as an
             // ignorable trailer (node's gunzip/unzip behaviour).

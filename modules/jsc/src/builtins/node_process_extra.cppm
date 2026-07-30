@@ -39,6 +39,9 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
       // Kept in the global symbol registry because the Node-facing `events`
       // and stream partitions are installed in separate builtin payloads.
       const kResistStopPropagation = Symbol.for("nodejs.event_target.resist_stop_propagation");
+      // WHATWG "in passive listener flag": set while a listener registered with
+      // { passive: true } runs, and checked by preventDefault().
+      const kInPassiveListener = Symbol("kInPassiveListener");
       const isTrustedGet = function isTrusted() { return false; };
       class Event {
         get [Symbol.toStringTag]() { return "Event"; }
@@ -68,7 +71,7 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
           this.timeStamp = (G.performance && G.performance.now && G.performance.now()) || 0;
           this[kStopImmediate] = false;
         }
-        preventDefault() { if (this.cancelable) { this.defaultPrevented = true; this.returnValue = false; } }
+        preventDefault() { if (this.cancelable && !this[kInPassiveListener]) { this.defaultPrevented = true; this.returnValue = false; } }
         stopPropagation() { this.cancelBubble = true; }
         stopImmediatePropagation() { this.cancelBubble = true; this[kStopImmediate] = true; }
         composedPath() { return this.currentTarget ? [this.currentTarget] : []; }
@@ -97,22 +100,31 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
         addEventListener(type, callback, options) {
           if (arguments.length < 2) throw new TypeError("2 arguments required");
           if (!this || !this[kListeners]) throw new TypeError("Illegal invocation");  // WebIDL brand check
-          if (callback === null || callback === undefined) return;
           if (typeof callback !== "function" && typeof callback !== "object") throw new TypeError("callback must be an object or function");
           type = String(type);
+          // WHATWG "add an event listener": the options dictionary is converted
+          // (i.e. its getters run) BEFORE the null-callback early return. Bailing
+          // out first meant `options.passive` was never read, which is exactly how
+          // feature detection asks whether passive listeners are supported
+          // (WPT AddEventListenerOptions-passive.html).
           if (typeof options === "boolean") options = { capture: options };
           options = options || {};
           const capture = !!options.capture;
+          const once = !!options.once;
+          const passive = !!options.passive;
+          const resistStopPropagation = !!options[kResistStopPropagation];
+          const signal = options.signal;
+          if (callback === null || callback === undefined) return;
           let list = this[kListeners].get(type);
           if (!list) { list = []; this[kListeners].set(type, list); }
           for (const l of list) if (l.callback === callback && l.capture === capture) return;
-          const rec = { callback, capture, once: !!options.once, passive: !!options.passive, resistStopPropagation: !!options[kResistStopPropagation], removed: false };
-          if (options.signal !== undefined) {
+          const rec = { callback, capture, once, passive, resistStopPropagation, removed: false };
+          if (signal !== undefined) {
             // WebIDL: `signal` is an AbortSignal, so anything else (including
             // null and a bare object with the right shape) is a TypeError.
-            if (!(G.AbortSignal && options.signal instanceof G.AbortSignal))
+            if (!(G.AbortSignal && signal instanceof G.AbortSignal))
               throw new TypeError("The 'signal' option must be an AbortSignal");
-            if (options.signal.aborted) return;
+            if (signal.aborted) return;
             const target = this;
             // The abort algorithm is owned by the *listener*: whichever path
             // removes the listener (removeEventListener, `once` firing, abort
@@ -120,9 +132,9 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
             // signal accumulates dead closures forever
             // (WebCore RegisteredEventListener::m_abortAlgorithm).
             const onAbort = () => target.removeEventListener(type, callback, { capture });
-            rec.signal = options.signal;
+            rec.signal = signal;
             rec.onAbort = onAbort;
-            options.signal.addEventListener("abort", onAbort, { once: true, [kResistStopPropagation]: true });
+            signal.addEventListener("abort", onAbort, { once: true, [kResistStopPropagation]: true });
           }
           list.push(rec);
         }
@@ -163,11 +175,14 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
               if (event[kStopImmediate] && !rec.resistStopPropagation) continue;
               if (rec.removed) continue;
               if (rec.once) this.removeEventListener(event.type, rec.callback, { capture: rec.capture });
+              if (rec.passive) event[kInPassiveListener] = true;
               try {
                 if (typeof rec.callback === "function") rec.callback.call(this, event);
                 else if (rec.callback && typeof rec.callback.handleEvent === "function") rec.callback.handleEvent(event);
               } catch (err) {
                 if (G.reportError) G.reportError(err); else if (G.console && G.console.error) G.console.error(err);
+              } finally {
+                if (rec.passive) event[kInPassiveListener] = false;
               }
             }
           }
