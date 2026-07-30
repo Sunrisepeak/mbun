@@ -1148,6 +1148,25 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
       if (typeof v === "boolean") v = v ? 1 : 0;
       entries.push([ids[k], v >>> 0]);
     }
+    // PORT-SOURCE: lib/internal/http2/util.js updateSettingsBuffer -- the tail
+    // of that function walks `settings.customSettings` and writes one 6-byte
+    // entry per NUMERIC value, exactly like a defined id. mbun encoded only the
+    // seven defined ids, so a `settings: { customSettings: {...} }` option was
+    // accepted, stored, and reported back through `localSettings` but never
+    // reached the wire at all -- which is why the PEER's `remoteSettings` never
+    // carried a customSettings object and test-http2-session-settings failed at
+    // `typeof settings.customSettings === 'object'` on the receiving half.
+    const custom = settings.customSettings;
+    if (custom !== null && typeof custom === "object") {
+      for (const key in custom) {
+        if (!Object.prototype.hasOwnProperty.call(custom, key)) continue;
+        const v = custom[key];
+        if (typeof v !== "number") continue;
+        const id = Number.parseInt(key, 10);
+        if (!Number.isFinite(id) || id < 0 || id > 0xffff) continue;
+        entries.push([id, v >>> 0]);
+      }
+    }
     const p = Buffer.alloc(entries.length * 6);
     for (let i = 0; i < entries.length; i++) { p.writeUInt16BE(entries[i][0], i * 6); p.writeUInt32BE(entries[i][1], i * 6 + 2); }
     return p;

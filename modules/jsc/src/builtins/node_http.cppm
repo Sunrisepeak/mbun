@@ -52,6 +52,23 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
   const nextTick = (fn, ...a) => (G.process && G.process.nextTick)
     ? G.process.nextTick(fn, ...a) : G.queueMicrotask(() => fn(...a));
 
+  // PORT-SOURCE: lib/_http_agent.js -- `const debug = require('internal/util/
+  // debuglog').debuglog('http')`. node's http stack traces through the 'http'
+  // debuglog channel, and switching that channel on is what makes node print
+  // its "NODE_DEBUG=http can expose sensitive data" warning (the warning lives
+  // in debuglog, but nothing emits it until an http debug call actually runs --
+  // test-http-debug spawns a child with NODE_DEBUG=http and greps stderr for
+  // it). Resolved lazily for the same reason httpDC is: node:util is not
+  // registered yet when this partition is assembled.
+  let httpDebugFn = null;
+  const debug = (...args) => {
+    if (httpDebugFn === null) {
+      const u = M["util"] || M["node:util"];
+      httpDebugFn = (u && typeof u.debuglog === "function") ? u.debuglog("http") : () => {};
+    }
+    httpDebugFn(...args);
+  };
+
   // ---- built-in http diagnostics channels ----
   // node lib/_http_client.js / lib/_http_server.js resolve these once at module
   // load, but this partition is assembled BEFORE node:diagnostics_channel is
@@ -1521,15 +1538,18 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
     const freeLen = freeSockets ? freeSockets.length : 0;
     const sockLen = freeLen + this.sockets[name].length;
     if (socket) {
+      debug("have free socket");
       this.reuseSocket(socket, request);
       setRequestSocket(this, request, socket);
       this.sockets[name].push(socket);
     } else if (sockLen < this.maxSockets && this.totalSocketCount < this.maxTotalSockets) {
+      debug("call onSocket", sockLen, freeLen);
       this.createSocket(request, options, (err, sock) => {
         if (err) { request.onSocket(sock, err); return; }
         setRequestSocket(this, request, sock);
       });
     } else {
+      debug("wait for socket");
       if (!this.requests[name]) this.requests[name] = [];
       request[kRequestOptions] = options;
       this.requests[name].push(request);
@@ -1543,6 +1563,7 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
     const timeout = request.timeout || this.options.timeout || undefined;
     if (timeout) options.timeout = timeout;
     const name = this.getName(options);
+    debug("createConnection", name);
     options._agentKey = name;
     options.encoding = null;
     const oncreate = once((err, s) => {

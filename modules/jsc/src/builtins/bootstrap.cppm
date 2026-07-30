@@ -1757,7 +1757,61 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       if (s.indexOf("\u001B") === -1 && s.indexOf("\u009B") === -1) return s;
       return s.replace(kAnsiRe, "");
     },
-    debuglog() { return () => {}; }, debug() { return () => {}; },
+    // PORT-SOURCE: lib/internal/util/debuglog.js (debuglog / debuglogImpl /
+    // emitWarningIfNeeded / initializeDebugEnv).
+    //
+    // The old stub handed back a no-op without ever looking at NODE_DEBUG, so
+    // `NODE_DEBUG=http` produced no trace AND -- the part the corpus actually
+    // pins -- none of the security warning node prints the first time an `http`
+    // or `http2` debug channel is switched on (test-http-debug greps stderr of a
+    // spawned child for it verbatim). The warning is emitted lazily, on the
+    // FIRST call of an ENABLED debug function, which is why the returned
+    // function starts as a thunk that initialises itself.
+    debuglog(set, cb) {
+      const name = String(set).toUpperCase();
+      // node initializeDebugEnv: NODE_DEBUG is a comma/space separated list of
+      // section names in which `*` is a wildcard, compiled into one regexp.
+      const isEnabled = () => {
+        const env = (G.process && G.process.env && G.process.env.NODE_DEBUG) || "";
+        if (!env) return false;
+        const parts = String(env).split(/[,\s]+/);
+        for (let i = 0; i < parts.length; i++) {
+          if (!parts[i]) continue;
+          const pat = parts[i].replace(/[|\\{}()[\]^$+?.]/g, "\\$&").replace(/\*/g, ".*");
+          if (new RegExp("^" + pat + "$", "i").test(name)) return true;
+        }
+        return false;
+      };
+      let impl;
+      const init = () => {
+        if (isEnabled()) {
+          // node emitWarningIfNeeded: only these two channels leak credentials.
+          if (name === "HTTP" || name === "HTTP2") {
+            try {
+              G.process.emitWarning("Setting the NODE_DEBUG environment variable " +
+                "to '" + name.toLowerCase() + "' can expose sensitive " +
+                "data (such as passwords, tokens and authentication headers) " +
+                "in the resulting log.");
+            } catch (e) {}
+          }
+          const pid = (G.process && G.process.pid) || 0;
+          impl = (...args) => {
+            const line = util.format("%s %s: %s\n", name, pid, util.format(...args));
+            try { G.process.stderr.write(line); } catch (e) {}
+          };
+        } else {
+          impl = () => {};
+        }
+        if (typeof cb === "function") cb(impl);
+      };
+      const lazy = (...args) => { if (impl === undefined) init(); impl(...args); };
+      Object.defineProperty(lazy, "enabled", {
+        configurable: true, enumerable: true,
+        get() { if (impl === undefined) init(); return isEnabled(); },
+      });
+      return lazy;
+    },
+    debug(set, cb) { return util.debuglog(set, cb); },
     _extend(a, b) { return Object.assign(a, b); },
     // util.aborted(signal, resource): a promise that settles when `signal`
     // fires, but which does NOT keep `resource` alive — once `resource` is
