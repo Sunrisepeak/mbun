@@ -256,7 +256,12 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
     }
     _write(chunk, enc, cb) { if (!this.headersSent) this.respond(); http2StreamWrite(this, chunk, enc, cb); }
     _writev(chunks, cb) { if (!this.headersSent) this.respond(); http2StreamWritev(this, chunks, cb); }
-    _final(cb) { if (!this.headersSent) this.respond(); http2StreamFinal(this, this._wantTrailers, cb); }
+    // `_emptyPayload` is pushStream(endStream)/STREAM_OPTION_EMPTY_PAYLOAD: node
+    // shuts the pushed stream's writable side in the handle at submit time, so
+    // end() before respond() finishes synchronously WITHOUT opening the response
+    // and without an empty DATA frame — END_STREAM rides on respond()'s HEADERS
+    // (core.js shutdownWritable / kMaybeDestroy: no destroy while !headersSent).
+    _final(cb) { if (this._emptyPayload === true && !this.headersSent) { cb(); return; } if (!this.headersSent) this.respond(); http2StreamFinal(this, this._wantTrailers, cb); }
     _read() { this._didRead = true; http2StreamRead(this); }
     _destroy(err, cb) { http2StreamDestroy(this, err, cb); }
     respond(headers, options) {
@@ -376,7 +381,7 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
       let fd;
       try { fd = fs.openSync(path, "r"); } catch (e) { this._fileError(options, e); return; }
       let stat;
-      try { stat = fs.fstatSync(fd); } catch (e) { try { fs.closeSync(fd); } catch (e2) {} this._fileError(options, e); return; }
+      try { stat = fs.fstatSync(fd); } catch (e) { tryCloseFd(fs, fd); this._fileError(options, e); return; }
       if (!stat.isFile()) {
         // node: a directory is ERR_HTTP2_SEND_FILE; anything else non-regular
         // with an explicit offset/length window is ERR_HTTP2_SEND_FILE_NOSEEK.
@@ -384,7 +389,7 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
         const e = isDir
           ? mkErr("Directories cannot be sent", "ERR_HTTP2_SEND_FILE")
           : mkErr("Offset or length can only be specified for regular files", "ERR_HTTP2_SEND_FILE_NOSEEK");
-        try { fs.closeSync(fd); } catch (e2) {}
+        tryCloseFd(fs, fd);
         this._fileError(options, e);
         return;
       }
@@ -421,10 +426,10 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
       const headers = Object.assign({}, headersParam);
       if (stat && typeof options.statCheck === "function") {
         if (options.statCheck.call(this, stat, headers, { offset: options.offset !== undefined ? options.offset : 0, length: options.length !== undefined ? options.length : -1 }) === false) {
-          if (ownsFd) { try { fs.closeSync(fd); } catch (e) {} }
+          if (ownsFd) tryCloseFd(fs, fd);
           return;
         }
-        if (this.headersSent) { if (ownsFd) { try { fs.closeSync(fd); } catch (e) {} } return; }
+        if (this.headersSent) { if (ownsFd) tryCloseFd(fs, fd); return; }
       }
       const offset = options.offset !== undefined ? (options.offset | 0) : 0;
       let length = options.length !== undefined ? (options.length | 0) : -1;
@@ -435,7 +440,19 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
       // Submit HEADERS before the file source is consumed. A later read error
       // resets an already-open response stream, so the client observes both the
       // response event and the INTERNAL_ERROR RST, matching node/nghttp2.
-      this.respond(headers, options.waitForTrailers ? { waitForTrailers: true } : undefined);
+      // PORT-SOURCE: compat/node/lib/internal/http2/core.js processRespondWithFD
+      // The response header list is built AFTER the fd exists, so an invalid
+      // response pseudo-header (`:method` on a response) must not escape
+      // respondWithFile(): node closes the fd it owns and destroys the stream
+      // with the raw error. It deliberately does NOT route this through
+      // options.onError.
+      try {
+        this.respond(headers, options.waitForTrailers ? { waitForTrailers: true } : undefined);
+      } catch (e) {
+        if (ownsFd) tryCloseFd(fs, fd);
+        this.destroy(e);
+        return;
+      }
       let body;
       try {
         if (length < 0) {
@@ -450,8 +467,8 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
             if (n < length) body = body.subarray(0, n < 0 ? 0 : n);
           }
         }
-      } catch (e) { if (ownsFd) { try { fs.closeSync(fd); } catch (e2) {} } this._fileError(options, e); return; }
-      if (ownsFd) { try { fs.closeSync(fd); } catch (e) {} }
+      } catch (e) { if (ownsFd) { tryCloseFd(fs, fd); } this._fileError(options, e); return; }
+      if (ownsFd) tryCloseFd(fs, fd);
       this.end(body);
     }
     // node ServerHttp2Stream#pushStream (lib/internal/http2/core.js). The
@@ -478,9 +495,30 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
       if (String(h[":method"]).toUpperCase() === "HEAD") headRequest = opts.endStream = true;
       const strict = this.session._options && this.session._options.strictSingleValueFields;
       const built = buildNgHeaders(h, assertValidRequestPseudoHeader, strict);
+      // PORT-SOURCE: compat/node/lib/internal/http2/core.js:2944-2963 —
+      // `this[kHandle].pushPromise()` is the same replaceable native boundary as
+      // respond()/info(), but with pushPromise's own contract: success returns a
+      // handle, and ANY number is an nghttp2 errno reported to the CALLBACK with
+      // exactly ONE argument and no frame on the wire.
+      const nativePushPromise = nativeHttp2StreamPrototype && nativeHttp2StreamPrototype.pushPromise;
+      if (typeof nativePushPromise === "function") {
+        const ret = Reflect.apply(nativePushPromise, this, [built.list, opts.endStream ? 1 : 0]);
+        if (typeof ret === "number") {
+          let perr;
+          // NGHTTP2_ERR_STREAM_ID_NOT_AVAILABLE / NGHTTP2_ERR_STREAM_CLOSED are
+          // HTTP2_HIDDEN_CONSTANTS — they live on the binding, not on `constants`.
+          if (ret === -509)
+            perr = mkErr("No stream ID is available because maximum stream ID has been reached", "ERR_HTTP2_OUT_OF_STREAMS");
+          else if (ret === -510)
+            perr = mkErr("The stream has been destroyed", "ERR_HTTP2_INVALID_STREAM");
+          else perr = nghttpErr(ret);
+          G.queueMicrotask(() => callback(perr));
+          return;
+        }
+      }
       const session = this.session;
       const id = session._nextPushId();
-      if (id === 0) { G.queueMicrotask(() => callback(mkErr("Out of streams", "ERR_HTTP2_OUT_OF_STREAMS"))); return; }
+      if (id === 0) { G.queueMicrotask(() => callback(mkErr("No stream ID is available because maximum stream ID has been reached", "ERR_HTTP2_OUT_OF_STREAMS"))); return; }
       const block = encodeHeaders(built.list, built.sensitive);
       const promised = Buffer.alloc(4); promised.writeUInt32BE(id, 0);
       // PUSH_PROMISE splits into PUSH_PROMISE + CONTINUATION the same way
@@ -505,6 +543,10 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
       // EOF and `endAfterHeaders` is true.
       push.endAfterHeaders = true;
       session.streams.set(id, push);
+      // node ServerHttp2Stream#pushStream: `if (options.endStream) stream.end();`
+      // synchronously, BEFORE the tick that runs the callback — a HEAD push is
+      // already writable-ended when the application first sees it.
+      if (opts.endStream) { push._emptyPayload = true; push.end(); }
       // node ServerHttp2Stream#pushStream publishes 'created' synchronously and
       // defers 'start' to the tick that invokes the callback, so createdTime is
       // strictly before startTime here too.
@@ -1175,6 +1217,13 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
     // Anything that is neither a string nor an array is rejected outright
     // (node lib/internal/validators.js validateLinkHeaderValue).
     throw invalidArgValue("hints", hints, LINK_FORMAT_REASON);
+  }
+  // PORT-SOURCE: compat/node/lib/internal/http2/core.js `tryClose()`
+  // node releases an fd it owns with the ASYNC fs.close, never closeSync.
+  // test-http2-respond-file-fd-leak patches fs.close and asserts it ran, so the
+  // sync call was invisible to it.
+  function tryCloseFd(fs, fd) {
+    try { fs.close(fd, () => {}); } catch (e) { try { fs.closeSync(fd); } catch (e2) {} }
   }
   function http2StatusInvalid(code) {
     const e = new RangeError("Invalid status code: " + code); e.code = "ERR_HTTP2_STATUS_INVALID"; return e;

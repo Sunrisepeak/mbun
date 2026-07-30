@@ -371,7 +371,12 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
     }
     return dst;
   }
-  const sessionErr = (code) => mkErr("Session closed with error code " + errName(code), "ERR_HTTP2_SESSION_ERROR");
+  // PORT-SOURCE: compat/node/lib/internal/http2/core.js:760,1611 —
+  // `new ERR_HTTP2_SESSION_ERROR(code)` is handed the RAW numeric code, so the
+  // message reads "…error code 7". Only the STREAM error is name-mapped
+  // (core.js:2487 `nameForErrorCode[code] || code`), which is why streamErr
+  // below keeps errName().
+  const sessionErr = (code) => mkErr("Session closed with error code " + code, "ERR_HTTP2_SESSION_ERROR");
   const streamErr = (code) => mkErr("Stream closed with error code " + errName(code), "ERR_HTTP2_STREAM_ERROR");
   // ERR_HTTP2_SESSION_ERROR and ERR_HTTP2_ERROR are NOT interchangeable, and
   // mbun used the first for both. node reserves ERR_HTTP2_SESSION_ERROR for a
