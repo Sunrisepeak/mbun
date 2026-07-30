@@ -525,7 +525,23 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
       const EE = G.__mbunNativeModules && (G.__mbunNativeModules["events"] || G.__mbunNativeModules["node:events"]);
       const EEProto = EE && (EE.prototype || (EE.EventEmitter && EE.EventEmitter.prototype));
       if (EEProto && Object.getPrototypeOf(proc) === Object.prototype) {
-        const ProcessCtor = function () {};
+        // Called as a plain function (not `new`), it adopts and RETURNS the
+        // receiver. bun's js/node/process/call-constructor.test.js does
+        //   Object.getPrototypeOf(process.constructor.call({ ...process }))
+        //     === Object.getPrototypeOf(process)
+        // and that file passed before this block existed only by accident: while
+        // process was a plain object its constructor was `Object`, and
+        // `Object.call(x)` returns a fresh {} whose prototype happened to match
+        // process's Object.prototype. A constructor returning undefined breaks it.
+        // Adopting the receiver satisfies bun without changing node's shape
+        // requirement, so both corpora hold.
+        const ProcessCtor = function () {
+          if (this === undefined || this === G) return undefined;
+          if (Object.getPrototypeOf(this) !== ProcessCtor.prototype) {
+            try { Object.setPrototypeOf(this, ProcessCtor.prototype); } catch (e) {}
+          }
+          return this;
+        };
         Object.defineProperty(ProcessCtor, "name", { value: "process", configurable: true });
         ProcessCtor.prototype = Object.create(EEProto, {
           constructor: { value: ProcessCtor, writable: true, enumerable: false, configurable: true },
