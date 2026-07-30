@@ -1530,6 +1530,55 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
         return undefined;
       },
     });
+    // ---- DOM WorkerGlobalScope message surface ------------------------------
+    // bun's web corpus drives a worker through the WEB spelling, not node's:
+    // `self.postMessage(x)`, `self.onmessage = e => ...`,
+    // `self.addEventListener("message", ...)`. Every part needed for that was
+    // already present and simply unconnected — parentPort carries both
+    // directions, the global is wired to a hidden EventTarget with
+    // addEventListener/dispatchEvent, MessageEvent exists, and
+    // node_process_extra installs the `onmessage` handler-IDL accessor onto the
+    // global. Nothing bridged the two, so inside a worker `postMessage` was an
+    // undefined global (js/web/workers/create-port-worker.js died with
+    // `ReferenceError: postMessage is not defined`) and a `self.onmessage`
+    // assignment silently never fired.
+    //
+    // The inbound hop is spliced into the IPC frame handler below rather than
+    // implemented as a parentPort listener ON PURPOSE: a node MessagePort stays
+    // closed until the user attaches a sink, and receiveMessageOnPort() drains
+    // that queue, so an always-on bridge listener would start the port and eat
+    // the FIFO out from under it. parentPort's state machine is left untouched.
+    //
+    // scopeHasMessageSink asks the GLOBAL EventTarget whether anything is
+    // listening for "message" there, which is what `self.onmessage = …` and
+    // `self.addEventListener("message", …)` both come down to. It is read, never
+    // cached: this partition is assembled BEFORE node_process_extra, so at this
+    // point G.addEventListener does not exist yet and no wrapper installed here
+    // could ever see a registration (the first attempt counted zero of them).
+    // node_process_extra publishes the hidden global target it binds those
+    // methods to as __mbunGlobalEventTarget for exactly this question.
+    const scopeHasMessageSink = () => {
+      if (typeof G.onmessage === "function") return true;
+      const t = G.__mbunGlobalEventTarget;
+      if (t && typeof t.listeners === "function") {
+        try { return t.listeners("message").length > 0; } catch (e) {}
+      }
+      return false;
+    };
+    if (typeof G.postMessage !== "function") {
+      G.postMessage = function postMessage(value, transferList) {
+        return parentPort.postMessage(value, transferList);
+      };
+    }
+    // Dispatched in addition to (not instead of) the parentPort delivery: a
+    // worker is free to use either spelling and neither may starve the other.
+    const dispatchScopeMessage = (data) => {
+      if (!scopeHasMessageSink()) return;
+      let ev;
+      try { ev = new G.MessageEvent("message", { data: data }); }
+      catch (e) { ev = { type: "message", data: data, ports: [] }; }
+      try { G.dispatchEvent(ev); } catch (e) {}
+    };
     // node makes process.execve main-thread only: inside a worker it throws
     // TypeError ERR_WORKER_UNSUPPORTED_OPERATION rather than replacing the
     // process image out from under the other threads.
@@ -1580,7 +1629,11 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
     if (typeof proc.on === "function") {
       proc.on("message", (m) => {
         if (m === null || typeof m !== "object") return;
-        if (m.t === "m") deliverLocal(parentPort, decodeKeysTop(decWire(m.d)));
+        if (m.t === "m") {
+          const d = decodeKeysTop(decWire(m.d));
+          deliverLocal(parentPort, d);
+          dispatchScopeMessage(d);
+        }
         else if (m.t === "pm" && typeof m.i === "number") {
           const e = transferredPorts.get(m.i);
           if (e) deliverLocal(e.near, decodeKeysTop(decWire(m.d)));
@@ -1651,7 +1704,7 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
     }
     // The channel pins this process's event loop only while parentPort has a
     // sink — otherwise a worker that never listens would never exit.
-    G.__mbunIpcPin = () => portHasListener(parentPort);
+    G.__mbunIpcPin = () => portHasListener(parentPort) || scopeHasMessageSink();
   }
 
   const mod = {
