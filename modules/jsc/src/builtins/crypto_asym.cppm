@@ -131,6 +131,17 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     let s = String(algo).toLowerCase();
     if (s.startsWith("rsa-")) s = s.slice(4);
     if (s.startsWith("ecdsa-with-")) s = s.slice(11);
+    // OpenSSL's composite SIGNATURE-algorithm long names ("sha256WithRSAEncryption",
+    // "dsaWithSHA1", ...) are accepted by createSign/createVerify and name the
+    // digest half. EVP_get_digestbyname resolves them, so they used to reach the
+    // native layer intact; normalising them here keeps that working while letting
+    // the JS-side digest check recognise them too (bun's crypto.test.ts signs with
+    // all five of these).
+    const withIdx = s.indexOf("with");
+    if (withIdx > 0) {
+      const head = s.slice(0, withIdx);
+      if (head.startsWith("sha") || head.startsWith("md")) { s = head; }
+    }
     // Legacy OpenSSL name: DSS1 is an alias for SHA-1 (DSA signatures).
     if (s === "dss1") s = "sha1";
     return s;
