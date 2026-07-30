@@ -565,6 +565,63 @@ int run_exec(const std::string& script) {
     return mbun::jsc::runtime::run_shell_source(script);
 }
 
+// ─── `mbun publish` ─────────────────────────────────────────────────────────
+// Only the help screen is real: nothing here talks to a registry. It exists
+// because `publish` is one of bun's reserved subcommands, so it must not fall
+// through to package.json script resolution.
+//
+// Shape and wording follow bun's Subcommand::Publish help block
+// (ref: bun-ref/src/install/PackageManager/CommandLineArguments.rs:842-863 for
+// the intro/examples, :313-333 PUBLISH_PARAMS for the publish-only flags, and
+// :56-126 SHARED_PARAMS for the rest). `--dry-run` deliberately carries the
+// command-neutral description from SHARED_PARAMS:71 — it used to be documented
+// with install's wording ("Don't install anything") for every command, which is
+// the upstream bug regression/issue/24806 pins.
+constexpr std::string_view PUBLISH_USAGE = R"(Usage:
+  Publish a package to the npm registry.
+  mbun publish [flags] [dist]
+
+Flags:
+      --access <STR>           Set access level for scoped packages
+      --tag <STR>              Tag the release. Default is "latest"
+      --otp <STR>              Provide a one-time password for authentication
+      --auth-type <STR>        Specify the type of one-time password authentication (default is 'web')
+      --gzip-level <STR>       Specify a custom compression level for gzip. Default is 9.
+      --tolerate-republish     Don't exit with code 1 when republishing over an existing version number
+      --dry-run                Perform a dry run without making changes
+      --registry <STR>         Use a specific registry by default, overriding .npmrc, bunfig.toml and environment variables
+      --cwd <STR>              Set a specific cwd
+      --silent                 Don't log anything
+      --verbose                Excessively verbose logging
+  -c, --config <STR>           Specify path to config file (bunfig.toml)
+  -h, --help                   Print this help menu
+
+Examples:
+  Display files that would be published, without publishing to the registry.
+  mbun publish --dry-run
+
+  Publish the current package with public access.
+  mbun publish --access public
+
+  Publish a pre-existing package tarball with tag 'next'.
+  mbun publish --tag next ./path/to/tarball.tgz
+)";
+
+// `mbun publish [flags] [dist]`. `--help`/`-h` anywhere in the argument list
+// prints the help and exits 0, as bun's clap does; every other invocation is an
+// explicit "not implemented" rather than a silent no-op, because a publish that
+// appears to succeed without uploading anything is the dangerous answer.
+int run_publish(std::span<const std::string_view> args) {
+    for (const std::string_view a : args) {
+        if (a == "--help" || a == "-h") {
+            std::print("{}", PUBLISH_USAGE);
+            return 0;
+        }
+    }
+    std::println(std::cerr, "error: `mbun publish` is not implemented yet");
+    return 1;
+}
+
 // ─── `mbun test` file discovery ─────────────────────────────────────────────
 // Port of bun's Scanner (ref: bun-ref/src/cli/test/Scanner.rs) plus the
 // path-mode/filter-mode switch that drives it (test_command.rs:2272-2296).
