@@ -211,6 +211,16 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
         const _g = new EventTarget();
         for (const m of ["addEventListener", "removeEventListener", "dispatchEvent"])
           if (typeof G[m] !== "function") G[m] = EventTarget.prototype[m].bind(_g);
+        // The bound methods hide WHICH target they act on, so nothing could ask
+        // whether the global has a listener for a given type. A worker needs
+        // exactly that: node_worker keeps the IPC channel pinning the event loop
+        // only while some sink is registered, and `self.onmessage = …` is a sink
+        // that lives here rather than on parentPort. Non-enumerable, and read
+        // through the `listeners(type)` introspection hook above.
+        try {
+          Object.defineProperty(G, "__mbunGlobalEventTarget",
+                                { value: _g, enumerable: false, configurable: true });
+        } catch (e) {}
       }
     }
   } catch (e) {}
