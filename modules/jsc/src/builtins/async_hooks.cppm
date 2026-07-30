@@ -24,15 +24,29 @@
 // lifecycle (init/before/after/destroy, the id stack, the hook-array snapshot
 // taken while hooks are running) did not exist at all.
 //
-// The two engine seams that remain, stated precisely so nobody re-derives them:
+// CONTEXT ACROSS `await` IS SOLVED, and an earlier version of this comment was
+// wrong about why it could not be. node propagates context across await through
+// V8's continuation-preserved embedder data. This build's prebuilt WebKit is
+// Bun's fork with USE(BUN_JSC_ADDITIONS)=1 and carries the equivalent:
+// JSGlobalObject::m_asyncContextData, which JSPromise.cpp snapshots at
+// registration and JSMicrotask.cpp restores before running the job. The previous
+// note called that "an engine seam ... private to JSC builtins and unreachable
+// from a C-API payload". Both halves were false: the field's nearest access
+// specifier in JSGlobalObject.h is `public:`, and this runtime compiles against
+// full JSC internals rather than only the C API. The frame now lives in that
+// tuple (host trio __mbunAsyncContextNative in runtime/core_bindings.inc, from
+// the w58 bun js/node lane), adopted lazily on the first AsyncLocalStorage.
 //
-//  1. `await` continuations. node propagates context across await through V8's
-//     continuation-preserved embedder data. bun-webkit has the equivalent
-//     (JSGlobalObject::m_asyncContextData, gated on
-//     setAsyncContextTrackingEnabled) but the field is private to JSC builtins
-//     and unreachable from a C-API payload, so the frame slot here is a plain
-//     variable. Everything mbun itself snapshots — timers, nextTick, then /
-//     catch / finally reactions, EventEmitter listeners — does propagate.
+// The engine seams that DO remain, stated precisely so nobody re-derives them:
+//
+//  1. async_hooks *ids* still do not cross `await`. The engine restores the
+//     context frame, not this layer's execution/trigger id pair, so
+//     executionAsyncId() inside an async function after an await is still the
+//     id of whatever ran the continuation. Carrying the id pair inside the frame
+//     would fix it and is the next thing to try here; it is why
+//     test-async-hooks-async-await, -enable-disable-enable and
+//     -execution-async-resource-await are still failing while
+//     test-async-local-storage-contexts (pure ALS) now passes.
 //  2. Promise *creation* is only observed where JS can see it: the Promise
 //     static factories and `then` (which is where every derived promise in a
 //     chain comes from). A promise the engine creates internally, including the
@@ -425,26 +439,66 @@ inline constexpr std::string_view kAsyncHooksJS = R"JS(
   // lib/internal/async_context_frame.js
   // The frame algebra is node's: a copy-on-write Map keyed by storage. What node
   // gets from V8 is the *slot* — continuation-preserved embedder data, which the
-  // engine carries across `await`. bun-webkit has the equivalent
-  // (JSGlobalObject::m_asyncContextData, gated on setAsyncContextTrackingEnabled)
-  // but it is private to JSC builtins and unreachable from a C-API payload, so
-  // the slot here is a plain variable. Consequence, stated precisely: the frame
-  // propagates everywhere mbun snapshots a callback (timers, nextTick, then /
-  // catch / finally reactions, EventEmitter listeners) but NOT across a native
-  // `await` continuation. That is the one remaining engine seam.
+  // engine carries across `await`.
+  //
+  // THIS BUILD HAS THE EQUIVALENT SLOT, and it is reachable. The prebuilt WebKit
+  // is Bun's fork with USE(BUN_JSC_ADDITIONS)=1: JSGlobalObject holds an
+  // InternalFieldTuple in m_asyncContextData, JSPromise.cpp snapshots field 0
+  // when a reaction or await job is registered, and JSMicrotask.cpp restores it
+  // before running the job. So the engine does the propagation — including
+  // across `await`, which no JS wrapper can reach — as long as the live frame
+  // lives in that tuple rather than in a JS variable.
+  //
+  // Mechanism and host trio (__mbunAsyncContextNative, runtime/core_bindings.inc)
+  // are from the w58 bun js/node lane; this is the same adoption, driven from
+  // node's frame class instead of the previous hand-written context array.
+  //
+  // A correction to the record, because an earlier note in this file (and my own
+  // sizing of the await-context work as out of reach) said the opposite: the
+  // field is NOT private and the runtime is NOT restricted to the C API. The
+  // last access specifier before it in JSGlobalObject.h is `public:`, and this
+  // runtime already compiles against full JSC internals. That claim was reached
+  // by grepping for an accessor method, finding none, and inferring privacy
+  // without checking the specifier. Do not re-derive it: measure instead.
+  //
+  // Adoption is lazy — on the first AsyncLocalStorage, exactly as bun enables
+  // tracking — so a program that never uses ALS keeps the plain JS variable and
+  // pays no host call on any callback-registration path.
   // ===========================================================================
   let continuationData;
+  let engineContext = null;
+  // Marks "the engine owns this registration's frame" without reading the slot.
+  const kEngineFrame = Symbol('mbun.engineAsyncContextFrame');
+  const frameGet = () => (engineContext !== null ? engineContext.get() : continuationData);
+  const frameSet = (value) => {
+    if (engineContext !== null) engineContext.set(value); else continuationData = value;
+  };
+  // Idempotent, and a no-op on a realm whose tuple was never installed (the
+  // native reports that), so the JS fallback stays authoritative rather than
+  // stores vanishing.
+  const adoptEngineContext = () => {
+    if (engineContext !== null) return;
+    const N = G.__mbunAsyncContextNative;
+    if (!N || typeof N.enable !== 'function') return;
+    let ok = false;
+    try { ok = N.enable() === true; } catch (e) { ok = false; }
+    if (!ok) return;
+    // Carry whatever the JS fallback held into the engine slot, so a frame
+    // established before the first ALS is not dropped mid-flight.
+    try { if (continuationData !== undefined) N.set(continuationData); } catch (e) { /* keep going */ }
+    engineContext = N;
+  };
   class AsyncContextFrame extends Map {
     constructor(store, data) {
       super(AsyncContextFrame.current());
       this.set(store, data);
     }
     static get enabled() { return true; }
-    static current() { return continuationData; }
-    static set(frame) { continuationData = frame; }
+    static current() { return frameGet(); }
+    static set(frame) { frameSet(frame); }
     static exchange(frame) {
-      const prior = continuationData;
-      continuationData = frame;
+      const prior = frameGet();
+      frameSet(frame);
       return prior;
     }
     static disable(store) {
@@ -665,6 +719,10 @@ inline constexpr std::string_view kAsyncHooksJS = R"JS(
     #name = undefined;
 
     constructor(options = {}) {
+      // Hand the frame over to the engine here, as bun does on the first
+      // AsyncLocalStorage. From this point `await` propagates the store, because
+      // JSC snapshots and restores its own slot around promise reactions.
+      adoptEngineContext();
       validateObject(options, 'options');
       this.#defaultValue = options.defaultValue;
       if (options.name !== undefined) this.#name = `${options.name}`;
@@ -853,12 +911,16 @@ inline constexpr std::string_view kAsyncHooksJS = R"JS(
       asyncId = derived[async_id_symbol];
       emitBeforeScript(asyncId, derived[trigger_async_id_symbol], derived, true);
     }
-    const prior = continuationData;
-    continuationData = frame;
+    // `frame === kEngineFrame` means the engine already restored the right frame
+    // around this reaction (JSMicrotask.cpp), so touching the slot here would
+    // only overwrite the engine's own answer — and each touch is a host call.
+    const engineOwned = frame === kEngineFrame;
+    const prior = engineOwned ? undefined : frameGet();
+    if (!engineOwned) frameSet(frame);
     try {
       return fn.call(thisArg, value);
     } finally {
-      continuationData = prior;
+      if (!engineOwned) frameSet(prior);
       if (asyncId !== 0) {
         if (hasHooks(kAfter)) emitAfterNative(asyncId, true);
         // node's promiseAfterHook pops only if this id is still the current
@@ -885,7 +947,12 @@ inline constexpr std::string_view kAsyncHooksJS = R"JS(
     // holder object: both wrappers close over the same `derived` binding, which
     // nativeThen fills in before any reaction can run.
     proto.then = function then(onFulfilled, onRejected) {
-      const frame = continuationData;
+      // Once the engine owns the frame it snapshots this registration itself and
+      // restores it before the reaction runs, so there is nothing for JS to
+      // carry — and asking for the current frame would be a host call on the
+      // hottest path in the runtime. kEngineFrame records "the engine has this"
+      // without reading the slot.
+      const frame = engineContext !== null ? kEngineFrame : continuationData;
       // Zero-instrumentation path, and it is node's own structure rather than a
       // shortcut: node installs the V8 PromiseHook on enable
       // (updatePromiseHookMode) and removes it when the last hook goes away
@@ -903,7 +970,11 @@ inline constexpr std::string_view kAsyncHooksJS = R"JS(
       // which nothing in JS can reproduce without the permanent wrapper. Three
       // corpus files want it (see the header); they are not worth a 2.2x tax on
       // every promise, so they stay failing and are recorded as such.
-      if (frame === undefined && active_hooks.array.length === 0) {
+      // With the engine owning the frame this is reached for ALS code too, not
+      // just for code with no frame at all: the engine propagates the store, so
+      // an `als.run()` body no longer forces the instrumented path.
+      if ((frame === undefined || frame === kEngineFrame) &&
+          active_hooks.array.length === 0) {
         return nativeThen.call(this, onFulfilled, onRejected);
       }
       let derived;
@@ -918,7 +989,8 @@ inline constexpr std::string_view kAsyncHooksJS = R"JS(
       // node's own ordering pins down.
       const wrappedFulfilled = typeof onFulfilled === 'function' ?
         function (value) {
-          if (active_hooks.array.length === 0 && continuationData === frame) {
+          if (active_hooks.array.length === 0 &&
+              (frame === kEngineFrame || continuationData === frame)) {
             const result = onFulfilled.call(this, value);
             if (active_hooks.array.length !== 0) afterLateHook(derived);
             return result;
@@ -927,7 +999,8 @@ inline constexpr std::string_view kAsyncHooksJS = R"JS(
         } : onFulfilled;
       const wrappedRejected = typeof onRejected === 'function' ?
         function (value) {
-          if (active_hooks.array.length === 0 && continuationData === frame) {
+          if (active_hooks.array.length === 0 &&
+              (frame === kEngineFrame || continuationData === frame)) {
             const result = onRejected.call(this, value);
             if (active_hooks.array.length !== 0) afterLateHook(derived);
             return result;
