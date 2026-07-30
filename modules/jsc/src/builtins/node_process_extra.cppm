@@ -404,6 +404,18 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
     if (typeof proc.constrainedMemory !== "function")
       proc.constrainedMemory = function constrainedMemory() { return 0; };
 
+    // node internal/bootstrap/node.js: the pre-streams2 accessor for stdin. It
+    // is not deprecated-with-a-warning, just old, and node's own test fixtures
+    // still use it (test/fixtures/echo.js, which several child_process files
+    // spawn as the echo peer).
+    if (typeof proc.openStdin !== "function") {
+      proc.openStdin = function openStdin() {
+        const stdin = proc.stdin;
+        if (stdin && typeof stdin.resume === "function") stdin.resume();
+        return stdin;
+      };
+    }
+
     if (typeof proc._kill !== "function" && typeof proc.kill === "function") {
       const realKill = proc.kill.bind(proc);
       proc._kill = function _kill(pid, sig) { return realKill(pid, sig); };
@@ -514,8 +526,21 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
           get() { return rawGet(); },
           set(code) {
             if (code !== null && code !== undefined) {
-              if (typeof code !== "number") throw errInvalidArgType("code", "number", code);
-              if (!Number.isInteger(code)) throw errOutOfRange("code", "an integer", code);
+              // node internal/bootstrap/node.js: a NUMERIC string is coerced
+              // before validateInteger, so `process.exitCode = '2'` (and
+              // `process.exit('2')`, which routes through this setter) settle 2.
+              // Only a string that does NOT parse as a number keeps its type and
+              // is reported as ERR_INVALID_ARG_TYPE. '' is deliberately excluded:
+              // Number('') is 0, and node rejects it.
+              let value = code;
+              if (typeof code === "string" && code !== "") {
+                const asNum = Number(code);
+                if (!Number.isNaN(asNum)) value = asNum;
+              }
+              if (typeof value !== "number") throw errInvalidArgType("code", "number", value);
+              if (!Number.isInteger(value)) throw errOutOfRange("code", "an integer", value);
+              rawSet(value);
+              return;
             }
             rawSet(code);
           },

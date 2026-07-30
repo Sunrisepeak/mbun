@@ -1795,6 +1795,9 @@ JSC_DEFINE_HOST_FUNCTION(fdn_close_host, (JSC::JSGlobalObject* global, JSC::Call
 // position < 0 → current-cursor read/write; otherwise positioned (pread/pwrite).
 struct FdIoArgs {
     mbun::core::io::File* file{nullptr};
+    // Set INSTEAD of `file` for a descriptor the virtual table does not own; the
+    // syscall then goes through fd_raw_io (see io_fd_raw.inc).
+    int rawFd{-1};
     std::byte* base{nullptr};
     std::size_t len{0};
     double pos{-1};
@@ -1816,14 +1819,20 @@ JSC::EncodedJSValue fd_throw_errno_nopath(JSC::JSGlobalObject* global, int e,
     return JSC::encodedJSValue();
 }
 
+#include "io_fd_raw.inc"
+
 std::optional<FdIoArgs> fd_io_args(JSC::JSGlobalObject* global, JSC::CallFrame* frame,
                                    const char* syscall) {
     if (frame->argumentCount() < 2) return std::nullopt;
     const int fd{static_cast<int>(fd_num(global, frame->argument(0)))};
     auto it{fd_table().find(fd)};
-    if (it == fd_table().end()) {
-        fd_throw_errno_nopath(global, EBADF, syscall);
-        return std::nullopt;
+    int rawFd{-1};
+    if (it == fd_table().end() || !it->second.is_open()) {
+        if (!fd_raw_eligible(fd)) {
+            fd_throw_errno_nopath(global, EBADF, syscall);
+            return std::nullopt;
+        }
+        rawFd = fd;
     }
     JSC::JSValue bufV{frame->argument(1)};
     JSC::JSArrayBufferView* view{
@@ -1853,7 +1862,8 @@ std::optional<FdIoArgs> fd_io_args(JSC::JSGlobalObject* global, JSC::CallFrame* 
     if (len > cap - off) len = cap - off;
     double pos{-1};
     if (posV.isNumber()) pos = posV.asNumber();
-    return FdIoArgs{.file = &it->second, .base = base + off, .len = len, .pos = pos};
+    return FdIoArgs{.file = rawFd >= 0 ? nullptr : &it->second, .rawFd = rawFd,
+                    .base = base + off, .len = len, .pos = pos};
 }
 
 JSC_DEFINE_HOST_FUNCTION(fdn_read_host, (JSC::JSGlobalObject* global, JSC::CallFrame* frame)) {
@@ -1867,6 +1877,8 @@ JSC_DEFINE_HOST_FUNCTION(fdn_read_host, (JSC::JSGlobalObject* global, JSC::CallF
     // corpus accepts EFBIG/EOVERFLOW for such positions — report EOVERFLOW
     // rather than a bare EIO string with no `code` on it.
     if (a->pos > 9007199254740992.0) return fd_throw_errno(global, EOVERFLOW, "read", "");
+    if (a->file == nullptr)
+        return fd_raw_io(global, a->rawFd, out.data(), out.size(), a->pos, false, "read");
     auto r{a->pos >= 0 ? a->file->read_at(static_cast<std::uint64_t>(a->pos), out)
                        : a->file->read(out)};
     if (!r) {
@@ -1885,6 +1897,8 @@ JSC_DEFINE_HOST_FUNCTION(fdn_write_host, (JSC::JSGlobalObject* global, JSC::Call
     if (!a) return JSC::JSValue::encode(JSC::jsNumber(0));
     std::span<const std::byte> in{a->base, a->len};
     if (a->pos > 9007199254740992.0) return fd_throw_errno(global, EOVERFLOW, "write", "");
+    if (a->file == nullptr)
+        return fd_raw_io(global, a->rawFd, a->base, a->len, a->pos, true, "write");
     auto r{a->pos >= 0 ? a->file->write_at(static_cast<std::uint64_t>(a->pos), in)
                        : a->file->write(in)};
     if (!r) {
