@@ -331,11 +331,24 @@ public:
         std::error_code ec;
         const std::string cwd{std::filesystem::current_path(ec).string()};
         if (ec) return;
+        // The suffix is a THREE-valued enum in bun (`DotEnvFileSuffix`,
+        // env_loader.rs:17-21), not the NODE_ENV string: transpiler.rs:792-797
+        // picks Test when running `bun test` or when the env says "test",
+        // Production when `options.production` (set at :750-752 from
+        // `env.is_production()`, i.e. the env var is exactly "production"), and
+        // Development for EVERYTHING else. So there is no `.env.<anything>` —
+        // `NODE_ENV=staging` loads `.env.development`, and so does the literal
+        // string "undefined" that `NODE_ENV=undefined bun run …` produces
+        // (cli/run/env.test.ts "e2e NODE_ENV=undefined" pins exactly that).
+        // BUN_ENV wins over NODE_ENV (env_loader.rs:179-191 get_node_env).
         std::string nodeEnv;
-        if (auto v{eval_to_string("(process.env.NODE_ENV===undefined?'':String(process.env.NODE_ENV))")}) {
+        if (auto v{eval_to_string("(()=>{const e=process.env.BUN_ENV!==undefined?process.env.BUN_ENV"
+                                  ":process.env.NODE_ENV;return e===undefined?'':String(e)})()")}) {
             nodeEnv = *v;
         }
-        const std::string mode{isTest ? "test" : (nodeEnv.empty() ? "development" : nodeEnv)};
+        const std::string mode{(isTest || nodeEnv == "test") ? "test"
+                               : nodeEnv == "production"     ? "production"
+                                                             : "development"};
 
         // Seed with the real process environment (bun: load_process) so ${VAR}
         // expansion can reference shell vars and OVERRIDE=false protects them.
@@ -370,7 +383,10 @@ public:
             }
         } else {
             files.push_back(".env." + mode + ".local");
-            if (!isTest) files.push_back(".env.local");
+            // `.env.local` is skipped for the Test suffix however that suffix was
+            // reached — `bun test` OR NODE_ENV/BUN_ENV == "test"
+            // (env_loader.rs:727-729 gates on the suffix, not on the command).
+            if (mode != "test") files.push_back(".env.local");
             files.push_back(".env." + mode);
             files.emplace_back(".env");
         }
