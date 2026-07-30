@@ -1,0 +1,22 @@
+{
+  "goal_accuracy": 0.0,
+  "last_evaluated_wave": "65",
+  "modes": {
+    "bun": {
+      "fraction": 0.084,
+      "mode": "STRUCTURAL",
+      "near_green": 78,
+      "non_green": 924,
+      "partial_run": false,
+      "run_files": 1902
+    },
+    "node": {
+      "fraction": 0.503,
+      "mode": "AREA",
+      "near_green": 185,
+      "non_green": 368,
+      "partial_run": true,
+      "run_files": 1955
+    }
+  }
+}
