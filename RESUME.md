@@ -63,7 +63,21 @@ it nearly went the other way: a first probe that only churned allocations report
 `0 of 10` on **both** runtimes, which would have looked like agreement. A negative
 GC claim is only meaningful against a control that forces collection.
 
-### TRAP: a lane must not use the MAIN checkout's binary as its baseline
+### TRAP: a BEFORE must correspond to YOUR OWN branch point
+
+State it that way, not as "the integration binary is untrustworthy" — that framing
+was checked and is false. The integration binary is built from its tree; that tree
+is simply *ahead* of origin.
+
+**How to check a binary's provenance, since mtime cannot:** `git status
+--porcelain` plus an mtime comparison can only distinguish a clean tree from a
+dirty one. They cannot tell "binary inconsistent with its tree" from "binary
+consistent with a tree ahead of origin" — the two produce identical symptoms. Test
+instead for **specific expected content**: run a one-liner that exercises a fix you
+know is or is not in that commit (`typeof Bun.file(x).stat === "function"` for lane
+I; `process.exitCode = "23"` coercing to `23` for lane G). Absence of disturbance is
+not evidence; presence of the expected behaviour is.
+
 
 Lane J burned time on **247 phantom node "gains" and 6 phantom "regressions"**
 before catching this by building its own parent commit. The main checkout is the
@@ -79,6 +93,31 @@ point. Two sound options, and only these:
 Corollary for the integrator: never rebuild the main checkout while a measurement
 is reading its binary. Runs resolve the path once and the file is replaced under
 them. That is what `target/integration/frozen-bin/<tag>/mbun` is for.
+
+### TRAP 2: measuring next to other lanes invents failures on the SAME binary
+
+Independent of the branch-point trap, and it produces identical-looking phantoms.
+Lane J measured 60 files three ways:
+
+| integration binary, idle | integration binary, under load | its own branch binary |
+| ---: | ---: | ---: |
+| 60 pass | **60 fail** | 60 pass |
+
+The only variable between the middle column and the others is machine load. Its
+first node baseline read **366 failures where the same binary idle reads ~113**.
+(Caveat it stated honestly: those 60 were `gains[:60]`, not a random sample, so the
+other 187 of its 247 phantom gains may well be branch divergence — 247 is plausibly
+a mix of both traps.)
+
+**The rule this forces, and it is cheap enough to always follow: a parallel run is
+a SCREEN, never a verdict. Any file whose state decides a number gets re-run
+serially (`--jobs 1`, generous `--timeout`) before it is believed.** Every
+"regression" resolved this way in waves 56–57 turned out to be load noise: bun's 3
+delta files after the nextTick change (all green serially, one of them failing
+*before* the change), and `regression/issue/11806.test.ts` (green 3/3 serially at
+120s). This is why parallelism does not translate 1:1 into throughput — five lanes
+each measuring at `--jobs 3-4` degrade each other's readings, and the fix is serial
+confirmation of the deciding files, not fewer lanes.
 
 ### Handoffs left by lane J, both actionable
 
