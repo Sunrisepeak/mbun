@@ -71,6 +71,16 @@
 # This is safe in the current worktree in a way deleting `target/` wholesale is
 # not: the live incremental cache survives, so no cold rebuild is forced.
 #
+# THAT SAID, RECLAIM THE IDLE WORKTREES AGGRESSIVELY. The instinct to preserve a
+# lane worktree's live cache is wrong on this box: a lane measured a COLD build at
+# **95 seconds**. Four idle lane worktrees were holding ~59 GB of live jsc build
+# output between them to save ~95s each -- a bad trade at any disk pressure, and
+# an actively dangerous one at 99% full, where the bounded layer starts refusing
+# measurements and the failure reads like a runner bug. Deleting
+# `<wt>/target`, `<wt>/modules/*/target` and `<wt>/.mcpp` for every worktree with
+# no running process took this box from 22 GB to 103 GB free in one pass. Sources
+# are never touched, so no uncommitted lane work is at risk.
+#
 # Exit 0 on success, 2 on usage error.
 set -uo pipefail
 
