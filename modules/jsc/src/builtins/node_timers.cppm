@@ -478,15 +478,6 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
     G.setTimeout = mySetTimeout;
     G.setInterval = mySetInterval;
     G.setImmediate = mySetImmediate;
-    // An internal "run this on the next loop turn" with no node-visible
-    // resource attached: the raw host immediate, so it registers no Immediate
-    // in activeImmediates, no async-hook id, and no Timeout facade. node:fs
-    // uses it to drain its completion queue — an fs completion is an
-    // FSREQCALLBACK request, not an Immediate, and getActiveResourcesInfo()
-    // must not report the drain alongside the requests it is draining. Throws
-    // land in the pump's own uncaught channel, the same place __runTimerCallback
-    // sends them.
-    G.__mbunSystemImmediate = function (fn) { return oSetImmediate(fn); };
     G.clearTimeout = myClearTimeout;
     G.clearInterval = myClearInterval;
     G.clearImmediate = myClearImmediate;
@@ -506,12 +497,6 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
           // node:net; see builtins/node_process_extra.cppm.
           const HT = G.__mbunHandleTrack;
           if (HT) for (const t of HT.types()) out.push(t);
-          // …and libuv REQUESTS. node:fs registers one per async operation
-          // whose completion has not been delivered yet; node reports those as
-          // FSREQCALLBACK (test-process-getactiveresources-track-active-requests
-          // fires 12 fs.open and asserts the count synchronously).
-          const FSR = G.__mbunFsActiveRequests;
-          if (FSR) for (let i = 0; i < FSR.size; i++) out.push("FSREQCALLBACK");
           return out;
         };
       }

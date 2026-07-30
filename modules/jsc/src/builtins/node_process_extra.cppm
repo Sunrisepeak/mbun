@@ -1588,20 +1588,6 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
       const getActiveHandles = function _getActiveHandles() { return G.__mbunHandleTrack.handles(); };
       Object.defineProperty(getActiveHandles, "name", { value: "_getActiveHandles" });
       proc._getActiveHandles = getActiveHandles;
-      // REQUESTS, the other libuv half. node's are short-lived: an fs operation
-      // holds one from submission until its completion is delivered. node:fs
-      // owns that set (builtins/bootstrap.cppm, __mbunFsActiveRequests) because
-      // it is the producer, exactly as node:net owns the handle set above.
-      // Until the fs callbacks were deferred there was no in-flight window for
-      // this to report, so it could only ever have been the []-stub below.
-      const getActiveRequests = function _getActiveRequests() {
-        const out = [];
-        const reqs = G.__mbunFsActiveRequests;
-        if (reqs) for (const r of reqs) out.push(r);
-        return out;
-      };
-      Object.defineProperty(getActiveRequests, "name", { value: "_getActiveRequests" });
-      proc._getActiveRequests = getActiveRequests;
     }
     // ---- process.finalization (node internal/process/finalization.js) -------
     // A 1:1 port of node's createFinalization(): run a callback for an object at
