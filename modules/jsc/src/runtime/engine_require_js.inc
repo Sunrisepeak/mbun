@@ -582,13 +582,26 @@ globalThis.__mbun_disposeAsync = async function (env) {
   // ESM named imports are live bindings. js_parser's CJS lowering binds each one
   // with `let` and subscribes it here (ref: js_parser.cppm build_cjs_import_).
   //
-  // A settled exporter needs nothing: its exports are final, so the common
-  // acyclic path just assigns and leaves the exports object a plain data object
-  // — no accessor, no property-access deopt. Only while the exporter is still
-  // evaluating (`__mbun_pending`, stamped across the module body by require()
-  // in this file) does the slot become an accessor that fans later
+  // A settled exporter USUALLY needs nothing: its exports are final, so the
+  // common acyclic path just assigns and leaves the exports object a plain data
+  // object — no accessor, no property-access deopt. Only while the exporter is
+  // still evaluating (`__mbun_pending`, stamped across the module body by
+  // require() in this file) does the slot become an accessor that fans later
   // `exports.x = v` writes out to every importer's binding, which is what lets
   // a cyclic import observe the finished value the way real ESM does.
+  //
+  // "Final" is not the same as "settled", though, and that gap was a measured
+  // corpus bug: a module that exports `let x` and reassigns it from an exported
+  // function called LATER (`export let root_url; export function beforeAll(){
+  // root_url = … }` — every cli/install test's dummy.registry) is settled when
+  // the importer links, yet its value is still to come. The snapshot below is
+  // wrong for exactly those names, and only those. The exporter now announces
+  // them in a non-enumerable `__mbun_mut` array (js_parser cjs_runtime.cppm
+  // kLiveMutMarker) written in its tail — i.e. before any acyclic importer gets
+  // here — and each one gets a subscription list hung off the module's own
+  // __mbun_X getter, which its `__mbun_XN` write-wrap then fans out. One extra
+  // property load (`ns.__mbun_mut`, undefined for essentially every module) on
+  // the fast path; nothing at all per property read.
   //
   // `mock.module()` needs the same fan-out for a module that has ALREADY
   // settled: bun replaces such a module's exports and every binding an importer
@@ -614,7 +627,26 @@ globalThis.__mbun_disposeAsync = async function (env) {
   globalThis.__mbun_link = function (ns, name, set) {
     if (ns == null) { set(undefined); return; }
     if (globalThis.__mbun_link_track) globalThis.__mbun_link_record(ns, name, set);
-    if (!ns.__mbun_pending) { set(ns[name]); return; }
+    if (!ns.__mbun_pending) {
+      const mut = ns.__mbun_mut;
+      if (mut !== undefined && mut.indexOf(name) >= 0) {
+        // Subscribe ON the exporter's live-export getter rather than swapping the
+        // slot for a cell of our own: swapping would strand that getter and
+        // freeze the value at whatever it is now, which is the very bug being
+        // fixed. `!__mbun_subs` keeps this to the exporter's OWN __mbun_X getter: a
+        // getter carrying __mbun_subs is a cyclic importer's link cell that took
+        // the slot over, and its cached `cur` is not the module local, so
+        // __mbun_XN could only publish a stale value through it. It applies the
+        // same test, so the two ends agree on which slots participate.
+        const md = Object.getOwnPropertyDescriptor(ns, name);
+        if (md && md.get && !md.get.__mbun_subs) {
+          if (md.get.__mbun_msubs) md.get.__mbun_msubs.push(set);
+          else md.get.__mbun_msubs = [set];
+        }
+      }
+      set(ns[name]);
+      return;
+    }
     const d = Object.getOwnPropertyDescriptor(ns, name);
     // Already linked by another importer of the same name: just join the fan-out.
     if (d && d.get && d.get.__mbun_subs) { d.get.__mbun_subs.push(set); set(d.get.call(ns)); return; }

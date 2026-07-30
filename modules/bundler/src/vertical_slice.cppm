@@ -1415,9 +1415,18 @@ private:
         // (ref: modules/js/src/js_parser.cppm build_cjs_import_). Same deal as
         // __mbun_dyn_import: mbun's runtime installs it (runtime/engine.inc), but
         // an emitted chunk must also run outside it. `__mbun_pending` below marks
-        // the in-flight window in which an export slot can still be assigned.
+        // the in-flight window in which an export slot can still be assigned, and
+        // `__mbun_mut` the SETTLED exports the module reassigns later (see
+        // js_parser/cjs_runtime.cppm kLiveMutMarker) — the two together are why a
+        // chunk's copy has to track the runtime's, not just resemble it.
         put("globalThis.__mbun_link??=function(ns,name,set){if(ns==null){set(void 0);return;}"
-            "if(!ns.__mbun_pending){set(ns[name]);return;}"
+            "if(!ns.__mbun_pending){const mut=ns.__mbun_mut;"
+            "if(mut!==void 0&&mut.indexOf(name)>=0){"
+            "const md=Object.getOwnPropertyDescriptor(ns,name);"
+            "if(md&&md.get&&!md.get.__mbun_subs){"
+            "if(md.get.__mbun_msubs)md.get.__mbun_msubs.push(set);"
+            "else md.get.__mbun_msubs=[set];}}"
+            "set(ns[name]);return;}"
             "const d=Object.getOwnPropertyDescriptor(ns,name);"
             "if(d&&d.get&&d.get.__mbun_subs){d.get.__mbun_subs.push(set);set(d.get.call(ns));return;}"
             "if(d&&!d.configurable){set(ns[name]);return;}"
