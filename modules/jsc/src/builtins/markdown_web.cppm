@@ -620,6 +620,14 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       return s.slice(0, 8) + "-" + s.slice(8, 12) + "-" + s.slice(12, 16) + "-" + s.slice(16, 20) + "-" + s.slice(20);
     };
   }
+  // `mbun -e` republishes builtinModules as globals and deliberately lets
+  // `crypto` overwrite the WebCrypto global (api_impl.inc kBuiltinGlobals), so
+  // inside -e the global `crypto` IS node:crypto. Anything that reaches the
+  // WebCrypto entropy through `G.crypto` therefore calls node:crypto's own
+  // delegating wrapper -- a strict-mode tail call to itself, i.e. a silent
+  // 100% CPU hang, not a throw. Capture the real object once, at bootstrap,
+  // before any shadowing can happen.
+  const webCryptoRoot = G.crypto;
   {
     const CN = G.__mbunCryptoNative;   // native mbun.crypto backend (hash/hmac/pbkdf2/random)
     // SECURITY: FAIL CLOSED. This used to fall back to Math.random() when the
@@ -1086,7 +1094,7 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
           if (typeof options !== "object" || options === null) throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "options" argument must be of type object.' + invalidArgType(options));
           if (options.disableEntropyCache !== undefined && typeof options.disableEntropyCache !== "boolean") throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "options.disableEntropyCache" property must be of type boolean.' + invalidArgType(options.disableEntropyCache));
         }
-        return G.crypto.randomUUID();
+        return webCryptoRoot.randomUUID();
       },
       // crypto.randomBytes(size[, cb]) — sync return, or async when a callback is
       // given (node passes null as the error on success).
@@ -1132,7 +1140,7 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
         for (let i = 0; i < len; i++) view[off + i] = tmp[i];
         return buf;
       },
-      getRandomValues: (a) => G.crypto.getRandomValues(a),
+      getRandomValues: (a) => webCryptoRoot.getRandomValues(a),
       // crypto.randomUUIDv7([options]) — RFC 9562 UUIDv7: 48-bit big-endian
       // millisecond timestamp, version 7, variant 10xx, remaining bits random.
       randomUUIDv7: (options) => {
@@ -1793,7 +1801,7 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
   // "----WebKitFormBoundary" + 32 lowercase hex of a fresh UUID (Blob.rs).
   const fdBoundary = () => {
     const b = new Uint8Array(16);
-    if (G.crypto && G.crypto.getRandomValues) G.crypto.getRandomValues(b);
+    if (webCryptoRoot && webCryptoRoot.getRandomValues) webCryptoRoot.getRandomValues(b);
     else for (let i = 0; i < 16; i++) b[i] = Math.floor(Math.random() * 256);
     let hex = "";
     for (let i = 0; i < 16; i++) hex += b[i].toString(16).padStart(2, "0");
