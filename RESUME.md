@@ -5,6 +5,88 @@ session that is interrupted (usage limit, crash, restart) can pick up from the
 file rather than from memory. **If you are a fresh session reading this, start
 here.**
 
+## 2026-07-30 23:30 — WAVE 58 RESULTS: +47 node, +14 bun, 0 regressions, all integrated
+
+| lane | shape | goal | got | wall | files/h |
+| --- | --- | ---: | ---: | ---: | ---: |
+| O `test-net` | port (function-by-function) | +19 | **+19** | 1h15m | **15.2** |
+| K `test-http` | port (after a fidelity audit) | +27 | **+17** | 1h38m | **10.4** |
+| L `test-async` | port (wholesale) | +23 | **+11** | ~4h50m | 2.3 |
+| N bun `js/node` | port | +11 | **+8** | 5h50m | 1.4 |
+| M bun `js/bun` | fix | +11 | **+6** | 4h00m | 1.5 |
+
+Measured `test-async` 23 → 34, `test-http` 355 → 371, `test-https` 50 → 51,
+`test-net` 121 → 140. REGRESSIONS empty on every gate; `modules/jsc` 27/27; tick
+gate 7/7; promise probes at parity.
+
+### The audit is what separates a 15 files/hour port lane from a 2
+
+Both fast lanes audited against `compat/node/lib/` before committing, and **both
+audits contradicted my brief — in opposite directions**, which is exactly why the
+audit has to happen inside the lane rather than in the brief:
+
+- **Lane O found the subsystem was BIGGER than I said.** `node_net.cppm` is an 8 KB
+  SocketAddress-only partition; the real implementation is `js_net.cppm` +
+  `js_net_part2.cppm` + `net.inc`, 424 KB. It also probed the prototype chain and
+  found `Socket → EventEmitter → Object` with every stream method **own** on
+  `Socket.prototype` — so my shadowing hypothesis was **structurally inapplicable**,
+  worth 0 files, not 9. It sized a wholesale port at 3-5 lanes with **no safe
+  partial landing** (Socket cannot be half-reactor/half-libuv; every intermediate
+  state is 121 net files red plus http/https/http2), declined it, and ported node's
+  algorithms *function-by-function* into the existing structure instead. That is
+  where all 19 files came from.
+- **Lane K found the subsystem was already CLOSER than I said.** `node_http.cppm`'s
+  `OutgoingMessage`/`IncomingMessage`/`Agent` halves are near-verbatim node despite
+  carrying no port marker, so a wholesale re-port would have burned the lane for ~0
+  files. The real gaps were narrow: a **shadow HTTPParser** (bootstrap registered an
+  empty `class HTTPParser {}` and `internalBinding('http_parser')` returned a second
+  stub whose `execute()` threw, while the real incremental parser sat in
+  `js_net.cppm` reachable only through a private closure protocol — node has exactly
+  ONE HTTPParser); `_http_common` being two definitions that merge **stub-first**
+  (`hc.methods || METHODS` let a 9-entry stub win, and `continueExpression` was a
+  *function* where node's is a RegExp); and `internal/http` not existing as a
+  builtin, so `require('internal/http')` resolved to node's own lib file and minted
+  a **fresh `Symbol('kOutHeaders')`** that one `OutgoingMessage` had never heard of.
+
+### Two lanes disagreed about engine reachability. The one that measured was right.
+
+Lane L sized ALS `await` propagation as needing an engine seam unreachable from a
+C-API payload, and called it the subsystem's highest-value follow-up. Lane N
+implemented it. On reconciliation lane L verified and **overturned its own
+rejection**: `USE_BUN_JSC_ADDITIONS 1` is set in this build's `cmakeconfig.h`, the
+runtime compiles against full JSC internals (`JSCInlines.h`,
+`JSC_DEFINE_HOST_FUNCTION`), and `m_asyncContextData` is **public** — the nearest
+access specifier before it in `JSGlobalObject.h` is `public:`. Its stated error:
+it grepped for an *accessor method*, found none, inferred privacy, and over-read a
+style note about using the pure C API *inside callbacks* (a locking constraint) as
+a constraint on what the runtime may *link against*.
+
+**But lane L's "+4 files" sizing was also wrong, and lane N's "+1" was right.** Only
+`test-async-local-storage-contexts.js` moved. The engine restores the context
+*frame*, not this layer's execution/trigger **id pair**, and the other three assert
+`executionAsyncId()`/`executionAsyncResource()` across `await`. Fixing them needs
+the id pair to ride inside the frame — a change to node's own state machine, named
+in the header as the next step rather than smuggled in.
+
+**A perf WIN came out of it.** Once the engine owns the frame, `then` must *not*
+capture it — capturing would overwrite the engine's answer and put a host call on
+the hottest path. A `kEngineFrame` sentinel records "the engine has this" without
+reading the slot, letting ALS code reach the zero-instrumentation `then` path,
+which the pre-port version could never do because it wrapped every reaction purely
+to carry the frame: **98-103ms → 41-42ms**. Now gated by
+`promise-chain-als-x1000000`, whose signal is **equality with the plain probe**
+(measured 214.3 vs 214.2), because a lazily-adopted engine slot is invisible to the
+plain probe.
+
+### Rebase hazard worth knowing
+
+Lane L's first submission had been cherry-picked and then reverted on the
+integration branch. A plain `git rebase` therefore **skipped the port commit** as
+already-applied and would have landed only the perf fix on top of a reverted port —
+silently broken. It reset and re-landed as two fresh commits instead. **If you
+revert a lane's commit from the integration branch, tell the lane, or its next
+rebase is booby-trapped.**
+
 ## 2026-07-30 22:00 — FIVE FALSE COMMENTS. Distrusting comments is now the single highest-yield habit.
 
 This is no longer an anecdote, it is the pattern. Every one of these blocked real
