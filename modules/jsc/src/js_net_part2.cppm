@@ -1179,6 +1179,19 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
         // An idle keep-alive connection has no message in flight, so neither
         // clock is running (llhttp starts them at on_message_begin).
         if (s.destroyed || s._httpMsgIdle) continue;
+        // Neither clock survives on_message_complete. node's
+        // ConnectionsList::Expired only walks active_connections_, and
+        // node_http_parser.cc on_message_complete does
+        // `Pop(this); PopActive(this); last_message_start_ = 0; Push(this)` --
+        // Push WITHOUT PushActive -- so a connection whose REQUEST is fully
+        // received can no longer expire, however long the handler then takes to
+        // stream the response. A body-less GET completes the moment its head is
+        // parsed, which is why `requestTimeout` was killing a slow streaming
+        // handler with a spurious 408 (node-http-server-timeouts.test.ts).
+        // A brand-new connection that has sent nothing is NOT in this state and
+        // stays expirable: Initialize() does PushActive explicitly, as the DoS
+        // guard for `server.timeout === 0` (its comment says so).
+        if (s._httpMsgBegun && !s._httpMsgOpen) continue;
         const started = s._httpMsgStart || 0;
         if (!started) continue;
         const headersLate = srv.headersTimeout > 0 && !s._httpHeadersDone &&

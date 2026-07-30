@@ -47,13 +47,6 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
   if (!vm || !vm.__internal) return;
   const internal = vm.__internal;
 
-  // node only defines vm.Module & friends under --experimental-vm-modules.
-  const flagged = () => {
-    const argv = (G.process && G.process.execArgv) || [];
-    for (const a of argv) if (a === "--experimental-vm-modules") return true;
-    return false;
-  };
-
   const ERR = (code, Ctor, msg) => { const e = new Ctor(msg); e.code = code; return e; };
   const invalidArgTypeHelper = (input) => {
     if (input === undefined || input === null) return " Received " + String(input);
@@ -936,20 +929,23 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
     }
   }
 
-  // Lazily gated: the builtins image is evaluated before process.execArgv
-  // exists, so the flag can only be consulted on first access.
+  // NOT gated on --experimental-vm-modules. node hides these behind the flag,
+  // but bun exports them unconditionally (src/js/node/vm.ts's default export
+  // lists Module / SourceTextModule / SyntheticModule with no flag check), and
+  // bun is the reference implementation here. The gate cost
+  // vm/vm-script-fetcher-leak.test.ts, which constructs SourceTextModule
+  // directly under `bun test`, where no execArgv flag can be supplied.
+  //
+  // node's own suite is unaffected: test/common re-spawns any file carrying a
+  // `// Flags:` comment as a child process WITH those flags, so the vm-module
+  // tests already arrive flagged, and none of them assert the classes are
+  // ABSENT without it (test-vm-dynamic-import-callback-missing-flag checks the
+  // ERR_VM_DYNAMIC_IMPORT_CALLBACK_MISSING_FLAG path, not class visibility).
   for (const [name, value] of [["Module", Module],
                                ["SourceTextModule", SourceTextModule],
                                ["SyntheticModule", SyntheticModule]]) {
     Object.defineProperty(vm, name, {
-      get() { return flagged() ? value : undefined; },
-      set(v) {
-        Object.defineProperty(vm, name, {
-          value: v, writable: true, enumerable: true, configurable: true,
-        });
-      },
-      enumerable: true,
-      configurable: true,
+      value, writable: true, enumerable: true, configurable: true,
     });
   }
 })();

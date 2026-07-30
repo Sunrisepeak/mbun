@@ -3687,7 +3687,18 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       Bun.which = (c) => { try { const r = CPN.spawnSync("/bin/sh", ["-c", "command -v " + toStr(c)], {}); const o = (r.stdout || "").trim(); return o || null; } catch (e) { return null; } };
     }
     if (typeof Bun.env === "undefined") Bun.env = globalThis.process.env;
-    if (typeof Bun.gc === "undefined") Bun.gc = () => {};
+    // Bun.gc(force) — the real collector, not a stub. Nothing else in the
+    // runtime defines Bun.gc, so this `=== "undefined"` guard always fired and
+    // Bun.gc was permanently `() => {}`: every corpus test that forces a
+    // collection to observe reclamation (expectMaxObjectTypeCount, the
+    // FinalizationRegistry/WeakRef waits, the OOM-guard suites' afterEach) was
+    // driving a no-op, so a "wait until finalized" loop could only ever spin.
+    // Only bun:jsc's gcAndSweep/fullGC/edenGC were wired to the native.
+    // ref bun VirtualMachine.rs garbage_collect(force): sync full when forced,
+    // an async hint otherwise -- which is exactly __mbunGcNative's split.
+    if (typeof Bun.gc === "undefined") {
+      Bun.gc = (force) => (G.__mbunGcNative ? G.__mbunGcNative(!!force) : 0);
+    }
     if (typeof Bun.allocUnsafe !== "function") Bun.allocUnsafe = (size) => new Uint8Array((size >>> 0));
     // Bun.unsafe: low-level knobs. gcAggressionLevel(v?) reads/sets the level and
     // returns the previous one (drives harness withoutAggressiveGC). No-op GC
