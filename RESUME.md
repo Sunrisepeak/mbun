@@ -5,6 +5,50 @@ session that is interrupted (usage limit, crash, restart) can pick up from the
 file rather than from memory. **If you are a fresh session reading this, start
 here.**
 
+## 2026-07-31 08:30 — CORE RULE: JS is the thinnest possible interface layer
+
+User directive: **"js 只做最薄的接口层,能用 C++ 实现的都用 C++ 实现,保证性能"**,
+prompted by the `modules/router` case. Written into
+`.agents/skills/mcpp-style-ref/SKILL.md` as a new section ahead of 接口与实现.
+
+**That file is a PROTECTED SURFACE** (`charter.md` §5: `.agents/skills/**`, agent
+may not self-merge, maintainer sign-off required). The directive is the sign-off;
+the change sits on the branch as a proposal, which is what the charter asks for.
+
+### The decision order the rule states
+
+1. **A C++ module already exists → wire it. No exceptions.** The live violation:
+   `modules/router/` holds a 358-line `FileSystemRouter` with **zero importers**,
+   and a lane wrote ~190 new lines of JS over `node:fs` instead. It took the file
+   0→29 green, so the result was real — but the repo now carries two router
+   implementations and one has no callers. The lane's reasoning ("that module has
+   no directory scan and no JSC bindings, so wiring it means writing those anyway")
+   does not hold: filling the gap **is** the wiring. Writing a parallel JS copy is
+   bypassing it.
+2. **Vendored real source exists and mbun's version is hand-written JS → port it
+   1:1 first** (coverage is the current priority), mark the header, and record it
+   as a **sink-to-C++ candidate**. Ported JS carries debt; it is not the end state.
+3. **Neither, and the logic has real weight → write a C++ module**, JS keeps only
+   the binding.
+
+### The tension with port-first, named rather than left implicit
+
+Porting node's `lib/**` means importing *more* JS, which reads as the opposite of
+"JS should be thin". Both hold, in this order: an existing C++ module must never be
+bypassed (absolute); a 1:1 port is the fastest route to coverage and is authorised
+now with perf deferred; but **new substantive logic with no vendored source belongs
+in C++**, because "perf comes later" licenses deferring optimization, not
+manufacturing debt.
+
+**Wiring an existing C++ module is not a performance optimization** — it is not
+duplicating work that already exists, so it is not covered by the deferral.
+
+### Concrete follow-up this creates
+
+`modules/router` is still zero-import. Either wire `Bun.FileSystemRouter` to it and
+delete the JS copy, or delete the C++ module and record why. Leaving two
+implementations, one unused, is the state the rule exists to prevent.
+
 ## 2026-07-31 08:00 — POLICY: port directly wherever node's source is vendored
 
 User directive, verbatim: **"能直接移植的先直接移植 只要 mbun 是双兼容考虑即可 bun 和
