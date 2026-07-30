@@ -1857,54 +1857,219 @@ inline constexpr char kBootstrapJS_[] = R"JS(
              isAsyncFunction: (v) => typeof v === "function" && v.constructor && v.constructor.name === "AsyncFunction" },
     TextEncoder: globalThis.TextEncoder, TextDecoder: globalThis.TextDecoder,
   };
-  // util.MIMEType / MIMEParams (WHATWG): parse "type/subtype;p=v" strings.
-  const MIME_TOKEN_RE = /^[!#$%&'*+\-.^_`|~A-Za-z0-9]+$/;
-  const MIME_INVALID_VALUE_RE = /[^\t -~-ÿ]/;
-  const mimeEncodeValue = (v) => { if (v.length === 0) return '""'; if (MIME_TOKEN_RE.test(v)) return v; return '"' + v.replace(/[\\"]/g, "\\$&") + '"'; };
-  class MIMEParams {
-    constructor() { this._m = new Map(); }
-    get(k) { return this._m.has(k) ? this._m.get(k) : null; }
-    set(k, v) { k = String(k); v = String(v); if (!MIME_TOKEN_RE.test(k)) throw new TypeError("The MIME syntax for a parameter name in " + k + " is invalid"); if (MIME_INVALID_VALUE_RE.test(v)) throw new TypeError("The MIME syntax for a parameter value in " + v + " is invalid"); this._m.set(k, v); }
-    has(k) { return this._m.has(k); }
-    delete(k) { this._m.delete(k); }
-    entries() { return this._m.entries(); }
-    keys() { return this._m.keys(); }
-    values() { return this._m.values(); }
-    [Symbol.iterator]() { return this._m.entries(); }
-    toString() { return Array.from(this._m).map(([k, v]) => k + "=" + mimeEncodeValue(v)).join(";"); }
-    toJSON() { return this.toString(); }
-  }
-  class MIMEType {
-    constructor(input) {
-      const s = String(input); const semi = s.indexOf(";");
-      const essence = (semi < 0 ? s : s.slice(0, semi)).trim().toLowerCase();
-      const slash = essence.indexOf("/");
-      if (slash < 0) throw new TypeError("Invalid MIME type: " + input);
-      this._type = essence.slice(0, slash); this._subtype = essence.slice(slash + 1);
-      this.params = new MIMEParams();
-      // WHATWG mimesniff §parse a MIME type (node internal/mime.js): quoted
-      // values unescape \X, empty values are dropped, first name wins.
-      if (semi >= 0) for (const part of s.slice(semi + 1).split(";")) {
-        const eq = part.indexOf("="); if (eq < 0) continue;
-        const name = part.slice(0, eq).trim().toLowerCase();
-        let raw = part.slice(eq + 1).trim();
-        let val;
-        if (raw.startsWith('"')) {
-          val = ""; let i = 1;
-          for (; i < raw.length && raw[i] !== '"'; i++) { if (raw[i] === "\\" && i + 1 < raw.length) i++; val += raw[i]; }
-        } else val = raw;
-        if (!name || !MIME_TOKEN_RE.test(name) || val === "" || MIME_INVALID_VALUE_RE.test(val)) continue;
-        if (!this.params._m.has(name)) this.params._m.set(name, val);
-      }
+  // util.MIMEType / MIMEParams — a 1:1 port of node lib/internal/mime.js.
+  //
+  // The previous hand-rolled parser split on ';' and trimmed with String.trim(),
+  // which is neither of the two things the WHATWG mimesniff grammar asks for:
+  // "HTTP whitespace" is exactly CR/LF/tab/space (String.trim() also eats \v, \f
+  // and every Unicode space), and a quoted parameter value may legally contain
+  // ';' and '=' so it cannot be found by splitting first. 388 of the 952 WPT
+  // mime-types cases disagreed with it. The port also carries node's
+  // ERR_INVALID_MIME_SYNTAX code, which every failure here previously lacked.
+  const NON_ASCII_RE = /[^\x00-\x7f]/;
+  const NOT_HTTP_TOKEN_CODE_POINT = /[^!#$%&'*+\-.^_`|~A-Za-z0-9]/g;
+  const NOT_HTTP_QUOTED_STRING_CODE_POINT = /[^\t\u0020-~\u0080-\u00FF]/g;
+  const END_BEGINNING_WHITESPACE = /[^\r\n\t ]|$/;
+  const START_ENDING_WHITESPACE = /[\r\n\t ]*$/;
+  const EQUALS_SEMICOLON_OR_END = /[;=]|$/;
+  const QUOTED_VALUE_PATTERN = /^(?:([\\]$)|[\\][\s\S]|[^"])*(?:(")|$)/u;
+  const mimeSyntaxError = (production, str, invalidIndex) => {
+    const e = new TypeError('The MIME syntax for a ' + production + ' in "' + str +
+                            '" is invalid' + (invalidIndex !== -1 ? " at " + invalidIndex : ""));
+    e.code = "ERR_INVALID_MIME_SYNTAX";
+    // node's NodeError renders the code inside the name, and both mime tests
+    // match /ERR_INVALID_MIME_SYNTAX/ against String(err), not against .code.
+    Object.defineProperty(e, "toString", {
+      value() { return "TypeError [ERR_INVALID_MIME_SYNTAX]" + (this.message ? ": " + this.message : ""); },
+      configurable: true, writable: true,
+    });
+    return e;
+  };
+  const mimeToASCIILower = (str) => {
+    if (!NON_ASCII_RE.test(str)) return str.toLowerCase();
+    let result = "";
+    for (let i = 0; i < str.length; i++) {
+      const char = str[i];
+      result += char >= "A" && char <= "Z" ? char.toLowerCase() : char;
     }
-    get type() { return this._type; }
-    set type(v) { v = String(v); if (!MIME_TOKEN_RE.test(v)) throw new TypeError("The MIME syntax for a type in " + v + " is invalid"); this._type = v.toLowerCase(); }
-    get subtype() { return this._subtype; }
-    set subtype(v) { v = String(v); if (!MIME_TOKEN_RE.test(v)) throw new TypeError("The MIME syntax for a subtype in " + v + " is invalid"); this._subtype = v.toLowerCase(); }
-    get essence() { return this._type + "/" + this._subtype; }
-    toString() { const p = this.params.toString(); return this.essence + (p ? ";" + p : ""); }
-    toJSON() { return this.toString(); }
+    return result;
+  };
+  const mimeParseTypeAndSubtype = (str) => {
+    let position = str.search(END_BEGINNING_WHITESPACE);
+    const typeEnd = str.indexOf("/", position);
+    const trimmedType = typeEnd === -1 ? str.slice(position) : str.slice(position, typeEnd);
+    const invalidTypeIndex = trimmedType.search(NOT_HTTP_TOKEN_CODE_POINT);
+    if (trimmedType === "" || invalidTypeIndex !== -1 || typeEnd === -1)
+      throw mimeSyntaxError("type", str, invalidTypeIndex);
+    position = typeEnd + 1;
+    const type = mimeToASCIILower(trimmedType);
+    const subtypeEnd = str.indexOf(";", position);
+    const rawSubtype = subtypeEnd === -1 ? str.slice(position) : str.slice(position, subtypeEnd);
+    position += rawSubtype.length;
+    if (subtypeEnd !== -1) position += 1;
+    const trimmedSubtype = rawSubtype.slice(0, rawSubtype.search(START_ENDING_WHITESPACE));
+    const invalidSubtypeIndex = trimmedSubtype.search(NOT_HTTP_TOKEN_CODE_POINT);
+    if (trimmedSubtype === "" || invalidSubtypeIndex !== -1)
+      throw mimeSyntaxError("subtype", str, invalidSubtypeIndex);
+    return [type, mimeToASCIILower(trimmedSubtype), position];
+  };
+  const mimeRemoveBackslashes = (str) => {
+    let ret = "";
+    let i;
+    // Stop one short: the loop looks ahead one character for the escape.
+    for (i = 0; i < str.length - 1; i++) {
+      const c = str[i];
+      if (c === "\\") { i++; ret += str[i]; } else ret += c;
+    }
+    if (i === str.length - 1) ret += str[i];
+    return ret;
+  };
+  const mimeEscapeQuoteOrSolidus = (str) => {
+    let result = "";
+    for (let i = 0; i < str.length; i++) {
+      const char = str[i];
+      result += (char === '"' || char === "\\") ? "\\" + char : char;
+    }
+    return result;
+  };
+  const mimeEncodeValue = (value) => {
+    if (value.length === 0) return '""';
+    if (value.search(NOT_HTTP_TOKEN_CODE_POINT) === -1) return value;
+    return '"' + mimeEscapeQuoteOrSolidus(value) + '"';
+  };
+  class MIMEParams {
+    #data = new Map();
+    // Parsing is deferred: MIMEType hands over the raw parameter substring and
+    // only pays for it when the params are actually touched.
+    #processed = true;
+    #string = null;
+    static __instantiate(str) {
+      const instance = new MIMEParams();
+      instance.#string = str;
+      instance.#processed = false;
+      return instance;
+    }
+    delete(name) { this.#parse(); this.#data.delete(name); }
+    get(name) { this.#parse(); return this.#data.has(name) ? this.#data.get(name) : null; }
+    has(name) { this.#parse(); return this.#data.has(name); }
+    set(name, value) {
+      this.#parse();
+      name = `${name}`;
+      value = `${value}`;
+      const invalidNameIndex = name.search(NOT_HTTP_TOKEN_CODE_POINT);
+      if (name.length === 0 || invalidNameIndex !== -1)
+        throw mimeSyntaxError("parameter name", name, invalidNameIndex);
+      const invalidValueIndex = value.search(NOT_HTTP_QUOTED_STRING_CODE_POINT);
+      if (invalidValueIndex !== -1)
+        throw mimeSyntaxError("parameter value", value, invalidValueIndex);
+      this.#data.set(name, value);
+    }
+    *entries() { this.#parse(); yield* this.#data.entries(); }
+    *keys() { this.#parse(); yield* this.#data.keys(); }
+    *values() { this.#parse(); yield* this.#data.values(); }
+    toString() {
+      this.#parse();
+      let ret = "";
+      for (const { 0: key, 1: value } of this.#data) {
+        if (ret.length) ret += ";";
+        ret += key + "=" + mimeEncodeValue(value);
+      }
+      return ret;
+    }
+    #parse() {
+      if (this.#processed) return;
+      const paramsMap = this.#data;
+      let position = 0;
+      const str = this.#string;
+      const endOfSource = str.slice(position).search(START_ENDING_WHITESPACE) + position;
+      while (position < endOfSource) {
+        position += str.slice(position).search(END_BEGINNING_WHITESPACE);
+        const afterParameterName = str.slice(position).search(EQUALS_SEMICOLON_OR_END) + position;
+        const parameterString = mimeToASCIILower(str.slice(position, afterParameterName));
+        position = afterParameterName;
+        if (position < endOfSource) {
+          const terminator = str.charAt(position);
+          position += 1;
+          if (terminator === ";") continue;   // parameter without a value
+        }
+        if (position >= endOfSource) break;
+        const char = str.charAt(position);
+        let parameterValue = null;
+        if (char === '"') {
+          position += 1;
+          // $1 = terminated on an unmatched backslash, $2 = terminated on the
+          // closing quote; either way the last character is not part of the value.
+          const insideMatch = QUOTED_VALUE_PATTERN.exec(str.slice(position));
+          position += insideMatch[0].length;
+          const inside = insideMatch[1] || insideMatch[2] ? insideMatch[0].slice(0, -1) : insideMatch[0];
+          parameterValue = mimeRemoveBackslashes(inside);
+          if (insideMatch[1]) parameterValue += "\\";
+        } else {
+          const valueEnd = str.indexOf(";", position);
+          const rawValue = valueEnd === -1 ? str.slice(position) : str.slice(position, valueEnd);
+          position += rawValue.length;
+          const trimmedValue = rawValue.slice(0, rawValue.search(START_ENDING_WHITESPACE));
+          if (trimmedValue === "") continue;
+          parameterValue = trimmedValue;
+        }
+        if (parameterString !== "" &&
+            parameterString.search(NOT_HTTP_TOKEN_CODE_POINT) === -1 &&
+            parameterValue.search(NOT_HTTP_QUOTED_STRING_CODE_POINT) === -1 &&
+            paramsMap.has(parameterString) === false) {
+          paramsMap.set(parameterString, parameterValue);
+        }
+        position++;
+      }
+      this.#data = paramsMap;
+      this.#processed = true;
+    }
   }
+  const MIMEParamsStringify = MIMEParams.prototype.toString;
+  Object.defineProperty(MIMEParams.prototype, Symbol.iterator, {
+    configurable: true, value: MIMEParams.prototype.entries, writable: true,
+  });
+  Object.defineProperty(MIMEParams.prototype, "toJSON", {
+    configurable: true, value: MIMEParamsStringify, writable: true,
+  });
+  const mimeInstantiateParams = MIMEParams.__instantiate;
+  delete MIMEParams.__instantiate;
+  class MIMEType {
+    #type;
+    #subtype;
+    #parameters;
+    constructor(string) {
+      string = `${string}`;
+      const data = mimeParseTypeAndSubtype(string);
+      this.#type = data[0];
+      this.#subtype = data[1];
+      this.#parameters = mimeInstantiateParams(string.slice(data[2]));
+    }
+    get type() { return this.#type; }
+    set type(v) {
+      v = `${v}`;
+      const invalidTypeIndex = v.search(NOT_HTTP_TOKEN_CODE_POINT);
+      if (v.length === 0 || invalidTypeIndex !== -1) throw mimeSyntaxError("type", v, invalidTypeIndex);
+      this.#type = mimeToASCIILower(v);
+    }
+    get subtype() { return this.#subtype; }
+    set subtype(v) {
+      v = `${v}`;
+      const invalidSubtypeIndex = v.search(NOT_HTTP_TOKEN_CODE_POINT);
+      if (v.length === 0 || invalidSubtypeIndex !== -1) throw mimeSyntaxError("subtype", v, invalidSubtypeIndex);
+      this.#subtype = mimeToASCIILower(v);
+    }
+    get essence() { return this.#type + "/" + this.#subtype; }
+    get params() { return this.#parameters; }
+    toString() {
+      let ret = this.#type + "/" + this.#subtype;
+      const paramStr = MIMEParamsStringify.call(this.#parameters);
+      if (paramStr.length) ret += ";" + paramStr;
+      return ret;
+    }
+  }
+  Object.defineProperty(MIMEType.prototype, "toJSON", {
+    configurable: true, value: MIMEType.prototype.toString, writable: true,
+  });
   util.MIMEType = MIMEType; util.MIMEParams = MIMEParams;
   util.inspect.custom = kInspectCustom;
   // node defines defaultOptions as an accessor: the setter validates and

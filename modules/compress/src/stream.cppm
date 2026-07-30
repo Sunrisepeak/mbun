@@ -19,6 +19,7 @@ module;
 #include <brotli/decode.h>
 #include <brotli/encode.h>
 #include <zstd.h>
+#include <zstd_errors.h>
 
 export module mbun.compress.stream;
 
@@ -37,10 +38,20 @@ export enum class StreamKind : std::uint8_t {
 };
 
 // Flush operation requested by the JS layer for one process() call.
+//
+// The first three ordinals are load-bearing: the JS layers (zlib_stream.cppm,
+// node_zlib_iter.cppm) hard-code 0/1/2, so partial/full/block are APPENDED. They
+// exist because node's zlib exposes five distinct deflate flush modes and
+// `.flush()` defaults to Z_FULL_FLUSH, not Z_SYNC_FLUSH; collapsing them all
+// onto Z_SYNC_FLUSH produced byte streams node's own tests do not accept
+// (test-zlib-params compares the exact stored-block framing).
 export enum class StreamFlush : std::uint8_t {
-    none,    // _transform: keep buffering internally where possible
-    sync,    // .flush(): emit everything buffered so far
-    finish,  // _flush(): finalize the stream
+    none,     // _transform: keep buffering internally where possible
+    sync,     // Z_SYNC_FLUSH: emit everything buffered so far
+    finish,   // _flush(): finalize the stream
+    partial,  // Z_PARTIAL_FLUSH
+    full,     // Z_FULL_FLUSH (.flush() default for the zlib family)
+    block,    // Z_BLOCK
 };
 
 // Result of one incremental process() call.
@@ -50,6 +61,12 @@ export struct StreamChunk {
     bool stream_end { false };    // codec reached end-of-stream
     bool ok { true };             // false → data error (message set)
     std::string message;
+    // node's err.code for the failure, when the engine reports one the JS layer
+    // could not have guessed from the message: Z_NEED_DICT for a zlib stream
+    // that wants a dictionary, ERR_<BrotliDecoderErrorString> for brotli, and
+    // ZSTD_error_<name> for zstd. Empty means "no engine code" and the JS layer
+    // falls back to Z_DATA_ERROR.
+    std::string code;
 };
 
 namespace {
@@ -62,6 +79,20 @@ struct StreamState {
     // flush: the next write may begin another member.
     bool inflateAllowsConcatenatedMembers { false };
     bool inflateAtMemberBoundary { false };
+    // windowBits >= 32 asks zlib to sniff zlib-vs-gzip framing, so at open time
+    // we do NOT yet know whether concatenated members apply: node's UNZIP mode
+    // becomes GUNZIP (multi-member) or INFLATE (single member) once the first two
+    // header bytes are in. Tracked across writes because createUnzip() is fed one
+    // byte at a time by test-zlib-unzip-one-byte-chunks.
+    bool inflateAutoDetect { false };
+    int autoHeaderBytesSeen { 0 };
+    int openWindowBits { 15 };
+
+    // node's `dictionary` option for inflate. A zlib-framed stream cannot take
+    // the dictionary until it asks (Z_NEED_DICT), so it is stored here and
+    // applied from process(); raw deflate takes it immediately at open.
+    Bytes dictionary;
+    bool hasDictionary { false };
 
     // zlib (deflate + inflate)
     z_stream zs {};
@@ -103,13 +134,65 @@ StreamState* find_(int handle) {
     return it == reg.end() ? nullptr : it->second.get();
 }
 
+// node reports a zstd failure as err.code === "ZSTD_error_<enum name>"
+// (test-zlib-zstd-pledged-src-size asserts ZSTD_error_srcSize_wrong exactly).
+// zstd's API only offers human-readable strings — ZSTD_getErrorName() answers
+// "Src size is incorrect" — so the public ZSTD_ErrorCode enum from
+// zstd_errors.h is mapped by hand.
+std::string zstd_error_code_(std::size_t rc) {
+    switch (ZSTD_getErrorCode(rc)) {
+        case ZSTD_error_no_error: return "ZSTD_error_no_error";
+        case ZSTD_error_GENERIC: return "ZSTD_error_GENERIC";
+        case ZSTD_error_prefix_unknown: return "ZSTD_error_prefix_unknown";
+        case ZSTD_error_version_unsupported: return "ZSTD_error_version_unsupported";
+        case ZSTD_error_frameParameter_unsupported: return "ZSTD_error_frameParameter_unsupported";
+        case ZSTD_error_frameParameter_windowTooLarge: return "ZSTD_error_frameParameter_windowTooLarge";
+        case ZSTD_error_corruption_detected: return "ZSTD_error_corruption_detected";
+        case ZSTD_error_checksum_wrong: return "ZSTD_error_checksum_wrong";
+        case ZSTD_error_literals_headerWrong: return "ZSTD_error_literals_headerWrong";
+        case ZSTD_error_dictionary_corrupted: return "ZSTD_error_dictionary_corrupted";
+        case ZSTD_error_dictionary_wrong: return "ZSTD_error_dictionary_wrong";
+        case ZSTD_error_dictionaryCreation_failed: return "ZSTD_error_dictionaryCreation_failed";
+        case ZSTD_error_parameter_unsupported: return "ZSTD_error_parameter_unsupported";
+        case ZSTD_error_parameter_combination_unsupported: return "ZSTD_error_parameter_combination_unsupported";
+        case ZSTD_error_parameter_outOfBound: return "ZSTD_error_parameter_outOfBound";
+        case ZSTD_error_tableLog_tooLarge: return "ZSTD_error_tableLog_tooLarge";
+        case ZSTD_error_maxSymbolValue_tooLarge: return "ZSTD_error_maxSymbolValue_tooLarge";
+        case ZSTD_error_maxSymbolValue_tooSmall: return "ZSTD_error_maxSymbolValue_tooSmall";
+        case ZSTD_error_stabilityCondition_notRespected: return "ZSTD_error_stabilityCondition_notRespected";
+        case ZSTD_error_stage_wrong: return "ZSTD_error_stage_wrong";
+        case ZSTD_error_init_missing: return "ZSTD_error_init_missing";
+        case ZSTD_error_memory_allocation: return "ZSTD_error_memory_allocation";
+        case ZSTD_error_workSpace_tooSmall: return "ZSTD_error_workSpace_tooSmall";
+        case ZSTD_error_dstSize_tooSmall: return "ZSTD_error_dstSize_tooSmall";
+        case ZSTD_error_srcSize_wrong: return "ZSTD_error_srcSize_wrong";
+        case ZSTD_error_dstBuffer_null: return "ZSTD_error_dstBuffer_null";
+        case ZSTD_error_noForwardProgress_destFull: return "ZSTD_error_noForwardProgress_destFull";
+        case ZSTD_error_noForwardProgress_inputEmpty: return "ZSTD_error_noForwardProgress_inputEmpty";
+        case ZSTD_error_frameIndex_tooLarge: return "ZSTD_error_frameIndex_tooLarge";
+        case ZSTD_error_seekableIO: return "ZSTD_error_seekableIO";
+        case ZSTD_error_dstBuffer_wrong: return "ZSTD_error_dstBuffer_wrong";
+        case ZSTD_error_srcBuffer_wrong: return "ZSTD_error_srcBuffer_wrong";
+        case ZSTD_error_sequenceProducer_failed: return "ZSTD_error_sequenceProducer_failed";
+        case ZSTD_error_externalSequences_invalid: return "ZSTD_error_externalSequences_invalid";
+        default: return "ZSTD_error_GENERIC";
+    }
+}
+
 int to_zlib_op_(StreamFlush f) {
     switch (f) {
         case StreamFlush::sync: return Z_SYNC_FLUSH;
         case StreamFlush::finish: return Z_FINISH;
+        case StreamFlush::partial: return Z_PARTIAL_FLUSH;
+        case StreamFlush::full: return Z_FULL_FLUSH;
+        case StreamFlush::block: return Z_BLOCK;
         default: return Z_NO_FLUSH;
     }
 }
+
+// brotli and zstd have no partial/full/block distinction: anything that is not
+// "keep buffering" and not "finalize" is their single flush operation.
+bool is_flush_op_(StreamFlush f) { return f != StreamFlush::none && f != StreamFlush::finish; }
 
 }  // namespace
 
@@ -134,7 +217,13 @@ export int stream_open(StreamKind kind, int windowBits, int level, int memLevel,
         case StreamKind::inflate: {
             if (inflateInit2(&st->zs, windowBits) != Z_OK) return -1;
             st->zsInit = true;
+            st->openWindowBits = windowBits;
+            // gzip framing (mag + 16) carries RFC 1952 members and may be
+            // concatenated. Auto-detect framing (mag + 32) clears the 16 bit, so
+            // it lands in inflateAutoDetect instead and is decided from the
+            // first two header bytes in process_inflate_.
             st->inflateAllowsConcatenatedMembers = windowBits > 0 && (windowBits & 16) != 0;
+            st->inflateAutoDetect = windowBits >= 32;
             break;
         }
         case StreamKind::brotli_enc: {
@@ -181,6 +270,12 @@ export int stream_open(StreamKind kind, int windowBits, int level, int memLevel,
 export bool stream_inflate_set_dictionary(int handle, ByteView dict) {
     StreamState* st { find_(handle) };
     if (!st || st->kind != StreamKind::inflate) return false;
+    // Remember it either way: a zlib-framed stream rejects the dictionary now
+    // (it is only accepted after Z_NEED_DICT) and node reports "Bad dictionary"
+    // vs "Missing dictionary" based on whether one was supplied at all, so the
+    // bytes have to outlive this call even when inflateSetDictionary fails here.
+    st->dictionary.assign(dict.begin(), dict.end());
+    st->hasDictionary = true;
     return inflateSetDictionary(&st->zs,
                                 reinterpret_cast<const Bytef*>(dict.data()),
                                 static_cast<uInt>(dict.size())) == Z_OK;
@@ -221,6 +316,21 @@ StreamChunk process_inflate_(StreamState* st, ByteView input, StreamFlush flush)
         return r;
     }
     if (!input.empty()) st->inflateAtMemberBoundary = false;
+    // node's UNZIP mode resolves to GUNZIP or INFLATE from the first two bytes
+    // (src/node_zlib.cc: GZIP_HEADER_ID1/ID2, tracked in gzip_id_bytes_read_).
+    // Only the gzip resolution gets concatenated-member handling — the test
+    // corpus asserts that unzip()ing two concatenated *zlib* streams yields the
+    // first one only.
+    for (std::size_t i {0}; st->inflateAutoDetect && i < input.size(); ++i) {
+        const std::uint8_t b { input[i] };
+        if (st->autoHeaderBytesSeen == 0) {
+            if (b != 0x1f) { st->inflateAutoDetect = false; break; }
+            st->autoHeaderBytesSeen = 1;
+        } else {
+            st->inflateAllowsConcatenatedMembers = b == 0x8b;
+            st->inflateAutoDetect = false;
+        }
+    }
     zs.next_in = const_cast<Bytef*>(reinterpret_cast<const Bytef*>(input.data()));
     zs.avail_in = static_cast<uInt>(input.size());
 
@@ -263,7 +373,18 @@ StreamChunk process_inflate_(StreamState* st, ByteView input, StreamFlush flush)
             if (remaining == 0) break;
             continue;
         }
-        if (rc == Z_NEED_DICT) { r.ok = false; r.message = "zlib need dictionary"; break; }
+        if (rc == Z_NEED_DICT) {
+            // node src/node_zlib.cc: a zlib stream that asks for a dictionary is
+            // "Missing dictionary" when none was supplied and "Bad dictionary"
+            // when the supplied one does not match the stream's Adler-32.
+            if (!st->hasDictionary) {
+                r.ok = false; r.message = "Missing dictionary"; r.code = "Z_NEED_DICT"; break;
+            }
+            if (inflateSetDictionary(&zs, st->dictionary.data(),
+                                     static_cast<uInt>(st->dictionary.size())) == Z_OK)
+                continue;
+            r.ok = false; r.message = "Bad dictionary"; r.code = "Z_DATA_ERROR"; break;
+        }
         if (rc == Z_DATA_ERROR || rc == Z_MEM_ERROR) {
             r.ok = false;
             r.message = zs.msg != nullptr ? zs.msg : "incorrect data check";
@@ -281,7 +402,7 @@ StreamChunk process_brotli_enc_(StreamState* st, ByteView input, StreamFlush flu
     StreamChunk r;
     BrotliEncoderOperation op {
         flush == StreamFlush::finish ? BROTLI_OPERATION_FINISH
-        : flush == StreamFlush::sync ? BROTLI_OPERATION_FLUSH
+        : is_flush_op_(flush)        ? BROTLI_OPERATION_FLUSH
                                      : BROTLI_OPERATION_PROCESS };
     std::size_t availIn { input.size() };
     const std::uint8_t* nextIn { input.data() };
@@ -319,7 +440,18 @@ StreamChunk process_brotli_dec_(StreamState* st, ByteView input) {
                                           &nextOut, nullptr) };
         r.output.insert(r.output.end(), buf, buf + (sizeof(buf) - availOut));
         if (res == BROTLI_DECODER_RESULT_SUCCESS) { r.stream_end = true; st->ended = true; break; }
-        if (res == BROTLI_DECODER_RESULT_ERROR) { r.ok = false; r.message = "brotli decode failed"; break; }
+        if (res == BROTLI_DECODER_RESULT_ERROR) {
+            // The engine DOES distinguish a corrupt stream from a truncated one
+            // (BROTLI_DECODER_ERROR_FORMAT_* vs the NEEDS_MORE_INPUT path above);
+            // until now that detail died here and every brotli failure reached JS
+            // as one generic message with no code. node reports
+            // "ERR_" + BrotliDecoderErrorString(code) as err.code.
+            const char* name { BrotliDecoderErrorString(BrotliDecoderGetErrorCode(st->bd)) };
+            r.ok = false;
+            r.message = name != nullptr ? name : "brotli decode failed";
+            r.code = std::string{"ERR_"} + (name != nullptr ? name : "BROTLI_DECODE_FAILED");
+            break;
+        }
         if (res == BROTLI_DECODER_RESULT_NEEDS_MORE_INPUT) break;
         // NEEDS_MORE_OUTPUT → loop with a fresh buffer.
     }
@@ -331,7 +463,7 @@ StreamChunk process_zstd_enc_(StreamState* st, ByteView input, StreamFlush flush
     StreamChunk r;
     const ZSTD_EndDirective dir {
         flush == StreamFlush::finish ? ZSTD_e_end
-        : flush == StreamFlush::sync ? ZSTD_e_flush
+        : is_flush_op_(flush)        ? ZSTD_e_flush
                                      : ZSTD_e_continue };
     ZSTD_inBuffer in { input.data(), input.size(), 0 };
 
@@ -339,7 +471,12 @@ StreamChunk process_zstd_enc_(StreamState* st, ByteView input, StreamFlush flush
     for (;;) {
         ZSTD_outBuffer out { buf, sizeof(buf), 0 };
         const std::size_t rc { ZSTD_compressStream2(st->zc, &out, &in, dir) };
-        if (ZSTD_isError(rc)) { r.ok = false; r.message = "zstd compress failed"; break; }
+        if (ZSTD_isError(rc)) {
+            r.ok = false;
+            r.message = ZSTD_getErrorName(rc);
+            r.code = zstd_error_code_(rc);
+            break;
+        }
         r.output.insert(r.output.end(), buf, buf + out.pos);
         if (dir == ZSTD_e_end) {
             if (rc == 0) { r.stream_end = true; st->ended = true; break; }
@@ -359,7 +496,12 @@ StreamChunk process_zstd_dec_(StreamState* st, ByteView input) {
     for (;;) {
         ZSTD_outBuffer out { buf, sizeof(buf), 0 };
         const std::size_t rc { ZSTD_decompressStream(st->zd, &out, &in) };
-        if (ZSTD_isError(rc)) { r.ok = false; r.message = "zstd decode failed"; break; }
+        if (ZSTD_isError(rc)) {
+            r.ok = false;
+            r.message = ZSTD_getErrorName(rc);
+            r.code = zstd_error_code_(rc);
+            break;
+        }
         r.output.insert(r.output.end(), buf, buf + out.pos);
         if (rc == 0) { r.stream_end = true; st->ended = true; break; }  // frame complete
         if (in.pos == in.size && out.pos < out.size) break;  // needs more input
@@ -395,6 +537,13 @@ export bool stream_reset(int handle) {
     if (!st) return false;
     st->ended = false;
     st->inflateAtMemberBoundary = false;
+    // A reset stream re-sniffs its framing from scratch.
+    st->autoHeaderBytesSeen = 0;
+    if (st->kind == StreamKind::inflate) {
+        st->inflateAllowsConcatenatedMembers =
+            st->openWindowBits > 0 && (st->openWindowBits & 16) != 0;
+        st->inflateAutoDetect = st->openWindowBits >= 32;
+    }
     switch (st->kind) {
         case StreamKind::deflate: return deflateReset(&st->zs) == Z_OK;
         case StreamKind::inflate: return inflateReset(&st->zs) == Z_OK;
@@ -402,6 +551,25 @@ export bool stream_reset(int handle) {
         case StreamKind::zstd_enc: ZSTD_CCtx_reset(st->zc, ZSTD_reset_session_only); return true;
         default: return false;
     }
+}
+
+// node zlib .params(level, strategy): change the deflate parameters mid-stream
+// without restarting the stream (deflateParams). The caller must have flushed
+// first (node's Zlib.prototype.params does a Z_SYNC_FLUSH), otherwise zlib has
+// pending output and reports Z_BUF_ERROR. Only meaningful for compressors.
+export bool stream_params(int handle, int level, int strategy) {
+    StreamState* st { find_(handle) };
+    if (!st || st->kind != StreamKind::deflate) return false;
+    return deflateParams(&st->zs, level, strategy) == Z_OK;
+}
+
+// node zstd `pledgedSrcSize`: declare the uncompressed size up front so the
+// frame header carries it and the encoder rejects a mismatched total
+// (ZSTD_error_srcSize_wrong). Must be set before any input is compressed.
+export bool stream_zstd_set_pledged_src_size(int handle, unsigned long long size) {
+    StreamState* st { find_(handle) };
+    if (!st || st->kind != StreamKind::zstd_enc) return false;
+    return !ZSTD_isError(ZSTD_CCtx_setPledgedSrcSize(st->zc, size));
 }
 
 // Release the codec state. Idempotent.

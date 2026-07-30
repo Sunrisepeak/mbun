@@ -33,14 +33,49 @@ inline constexpr std::string_view kZlibStreamJS = R"JS(
   const streamMod = M["stream"] || M["node:stream"];
   if (!zmod || !streamMod || !streamMod.Transform) return;
   const Transform = streamMod.Transform;
+  const finished = streamMod.finished;
   const Buffer = G.Buffer;
   const EMPTY = "";
   const MAXS = Number.MAX_SAFE_INTEGER;
 
   // StreamKind ordinals (mirror mbun::compress::StreamKind).
   const K_DEFLATE = 0, K_INFLATE = 1, K_BENC = 2, K_BDEC = 3, K_ZENC = 4, K_ZDEC = 5;
-  // StreamFlush ordinals.
-  const F_NONE = 0, F_SYNC = 1, F_FINISH = 2;
+  // StreamFlush ordinals (mirror mbun::compress::StreamFlush).
+  const F_NONE = 0, F_SYNC = 1, F_FINISH = 2, F_PARTIAL = 3, F_FULL = 4, F_BLOCK = 5;
+
+  // node's per-family flush constant -> StreamFlush ordinal. The zlib family has
+  // six distinct modes (Z_NO_FLUSH .. Z_BLOCK); brotli and zstd have one flush
+  // operation each, so everything that is not "process" or "finish" is a flush.
+  const ZLIB_FLUSH_MAP = [F_NONE, F_PARTIAL, F_SYNC, F_FULL, F_FINISH, F_BLOCK];
+  const flushOrdinal = (kind, nodeFlush) => {
+    if (kind === K_DEFLATE || kind === K_INFLATE) {
+      const m = ZLIB_FLUSH_MAP[nodeFlush];
+      return m === undefined ? F_NONE : m;
+    }
+    // brotli: 0 PROCESS, 1 FLUSH, 2 FINISH, 3 EMIT_METADATA.
+    // zstd:   0 continue, 1 flush, 2 end.
+    if (nodeFlush === 2 && (kind === K_ZENC || kind === K_ZDEC)) return F_FINISH;
+    if (kind === K_BENC || kind === K_BDEC) return nodeFlush === 2 ? F_FINISH : (nodeFlush === 1 ? F_SYNC : F_NONE);
+    return nodeFlush === 1 ? F_SYNC : F_NONE;
+  };
+  // node's `.flush()` default (ZlibBase _defaultFullFlushFlag): Z_FULL_FLUSH for
+  // the zlib family, the single flush operation for brotli/zstd.
+  const defaultFullFlush = (kind) => (kind === K_DEFLATE || kind === K_INFLATE) ? 3 : 1;
+
+  // node lib/zlib.js smuggles a flush request through the write queue as a
+  // zero-length chunk carrying the flush flag, so `.flush()` is ordered against
+  // `.write()` instead of jumping the queue (test-zlib-flush-write-sync-interleaved).
+  const kFlushFlag = G.Symbol("kFlushFlag");
+  const flushChunks = new Map();
+  const flushChunk = (nodeFlush) => {
+    let b = flushChunks.get(nodeFlush);
+    if (b === undefined) {
+      b = Buffer.from(new ArrayBuffer(0));
+      b[kFlushFlag] = nodeFlush;
+      flushChunks.set(nodeFlush, b);
+    }
+    return b;
+  };
 
   const b64 = (u8) => { if (!u8 || u8.length === 0) return ""; let s = ""; for (let i = 0; i < u8.length; i += 8192) s += String.fromCharCode.apply(null, u8.subarray(i, Math.min(i + 8192, u8.length))); return G.btoa(s); };
   const toBytes = (chunk, enc) => {
@@ -217,7 +252,13 @@ inline constexpr std::string_view kZlibStreamJS = R"JS(
       let level = 3;
       if (o && typeof o.level === "number") level = o.level;
       else if (typeof p[100] === "number") level = p[100];   // ZSTD_c_compressionLevel
-      return ZN.streamOpen(K_ZENC, 0, level, 8, 0, -1, 0, 0);
+      const pledged = checkNum(o ? o.pledgedSrcSize : undefined, "options.pledgedSrcSize", 0, MAXS, undefined);
+      const h = ZN.streamOpen(K_ZENC, 0, level, 8, 0, -1, 0, 0);
+      // node's `pledgedSrcSize` goes into the frame header, so it has to be set
+      // before the first byte is compressed — not on the first write.
+      if (h >= 0 && pledged !== undefined && typeof ZN.streamZstdPledged === "function")
+        ZN.streamZstdPledged(h, pledged);
+      return h;
     }
     checkParams(o, maxZstdDParam, "ERR_ZSTD_INVALID_PARAM", "zstd", zstdSetDParam);
     return ZN.streamOpen(K_ZDEC, 0, -1, 8, 0, -1, 0, 0);
@@ -262,16 +303,40 @@ inline constexpr std::string_view kZlibStreamJS = R"JS(
     this._bytesWritten = 0;
     this._zEnded = false;
     this._zErrored = false;
+    this._zWritePending = false;
+    this._defaultFullFlushFlag = defaultFullFlush(cfg.kind);
     this._h = this._zOpen();
     // Optional inflate dictionary (node `dictionary` option).
     if (this._h >= 0 && cfg.kind === K_INFLATE && opts && opts.dictionary) {
       try { ZN.streamDict(this._h, b64(toBytes(opts.dictionary))); } catch (e) {}
     }
-    // NOTE: the low-level native `_handle` (writeSync/write/onerror + writeState,
-    // threadpool lifecycle, GC-estimated-size) is a separate concern and stays
-    // DEFERRED — these streams drive the codec through _transform/_flush, not a
-    // node-style _handle. Left unset so the native-handle test files see the
-    // same (absent) surface as before rather than a misleading JS shim.
+    // node exposes the native codec as `stream._handle` and derives `_closed`
+    // from it (`ZlibBase.prototype._closed` is a getter for `!this._handle`), so
+    // the lifecycle every zlib test observes IS this object: destroy() nulls it,
+    // .reset()/.params() go through it, and resetting mid-write throws rather
+    // than reaching a codec the threadpool still owns. It is a JS shim over the
+    // handle id in `_h` rather than a separate native object.
+    const self = this;
+    this._handle = {
+      reset() {
+        if (self._zWritePending)
+          throw new Error("Cannot reset zlib stream while a write is in progress");
+        self._zEnded = false;
+        self._zErrored = false;
+        self._bytesWritten = 0;
+        if (self._h >= 0 && !ZN.streamReset(self._h)) {
+          ZN.streamClose(self._h);
+          self._h = self._zOpen();
+        }
+      },
+      params(level, strategy) {
+        if (self._h >= 0) ZN.streamParams(self._h, level, strategy);
+      },
+      close() {
+        if (self._h >= 0) { try { ZN.streamClose(self._h); } catch (e) {} }
+        self._h = -1;
+      },
+    };
   };
 
   proto._pushChunked = function (u8) {
@@ -295,7 +360,7 @@ inline constexpr std::string_view kZlibStreamJS = R"JS(
     let res;
     try { res = ZN.streamProcess(this._h, piece && piece.length ? b64(piece) : EMPTY, flushMode); }
     catch (e) { return this._zMakeErr(String(e && e.message || e)); }
-    if (!res || !res.ok) return this._zMakeErr((res && res.message) || "zlib stream error");
+    if (!res || !res.ok) return this._zMakeErr((res && res.message) || "zlib stream error", res && res.code);
     this._bytesWritten += res.consumed | 0;
     if (res.b64) {
       const produced = Buffer.from(res.b64, "base64");
@@ -334,21 +399,37 @@ inline constexpr std::string_view kZlibStreamJS = R"JS(
     return null;
   };
 
-  proto._zMakeErr = function (msg) {
+  proto._zMakeErr = function (msg, code) {
     this._zErrored = true;
     const e = new Error(msg || "zlib error");
-    e.errno = -3; e.code = "Z_DATA_ERROR";
+    // The engine's own code when the bridge reported one (Z_NEED_DICT,
+    // ERR_BROTLI_DECODER_*, ZSTD_error_*); Z_DATA_ERROR is only the fallback.
+    e.errno = -3; e.code = code || "Z_DATA_ERROR";
     return e;
   };
 
   proto._transform = function (chunk, enc, cb) {
-    const err = this._zRun(toBytes(chunk, enc), F_NONE);
-    cb(err);
+    let flushMode = F_NONE;
+    if (chunk != null && typeof chunk[kFlushFlag] === "number")
+      flushMode = flushOrdinal(this._zcfg.kind, chunk[kFlushFlag]);
+    const bytes = toBytes(chunk, enc);
+    const self = this;
+    // node dispatches every zlib write to the threadpool, so the write is still
+    // "in progress" when write() returns. Tests depend on that: a stream with a
+    // small highWaterMark must report needDrain before the write lands
+    // (test-zlib-flush-drain) and .reset() during a pending write must throw
+    // (test-zlib-reset-during-write). Completing synchronously would make both
+    // unobservable, so the codec step is deferred a tick.
+    this._zWritePending = true;
+    G.process.nextTick(function () {
+      const err = self._zRun(bytes, flushMode);
+      self._zWritePending = false;
+      cb(err);
+    });
   };
 
   proto._flush = function (cb) {
-    if (this._zErrored) { cb(); return; }
-    if (this._zEnded) { cb(); return; }
+    if (this._zErrored || this._zEnded || this.destroyed || this._h < 0) { cb(); return; }
     const err = this._zRun(EMPTY, F_FINISH);
     if (err) { cb(err); return; }
     if (this._zIsDecoder && !this._zEnded) {
@@ -375,113 +456,86 @@ inline constexpr std::string_view kZlibStreamJS = R"JS(
     return out.length === 1 ? out[0] : Buffer.concat(out);
   };
 
-  // mbun's base Transform is a stub whose write()/end() do NOT drive the
-  // _transform/_flush pipeline (see bootstrap Writable/Duplex). Implement the
-  // pipeline here so writes are compressed/decompressed, output is emitted via
-  // Readable.push ('data'), and the readable side ends (push(null) → 'end').
-  proto.write = function (chunk, enc, cb) {
-    if (typeof enc === "function") { cb = enc; enc = undefined; }
-    // node rejects non-buffer/string chunks synchronously (ERR_INVALID_ARG_TYPE),
-    // it does NOT emit an 'error' event for a bad write argument.
-    if (typeof chunk !== "string" && typeof chunk !== "number" &&
-        !ArrayBuffer.isView(chunk) && !(chunk instanceof ArrayBuffer)) {
-      throw errType("chunk", "of type string or an instance of Buffer, TypedArray, DataView, or ArrayBuffer", chunk);
-    }
-    // A destroyed stream (close() destroys, per node's ZlibBase.close) reports
-    // ERR_STREAM_DESTROYED to the write callback instead of silently succeeding.
-    if (this.destroyed) {
-      const de = new Error("Cannot call write after a stream was destroyed");
-      de.code = "ERR_STREAM_DESTROYED";
-      if (typeof cb === "function") G.queueMicrotask(function () { cb(de); });
-      return false;
-    }
-    if (this._writableEnded) { if (typeof cb === "function") G.queueMicrotask(cb); return false; }
-    const self = this;
-    // The write completion callback fires asynchronously, matching node/bun's
-    // threadpool-backed zlib writes: callers that queue several writes before
-    // the loop yields (e.g. the reset-race regression) rely on completions not
-    // landing synchronously mid-loop.
-    this._transform(chunk, enc, function (err) {
-      if (err) self.emit("error", err);
-      if (typeof cb === "function") G.queueMicrotask(function () { cb(err); });
-    });
-    return true;
+  // NOTE: node:stream's Transform (the 1:1 port in node_stream_*.cppm) drives the
+  // _transform/_flush pipeline itself, so this partition deliberately does NOT
+  // override write()/end() any more. It used to — back when `M["stream"]` was
+  // bootstrap's stub — and that hand-rolled pipeline was what kept _writableState,
+  // needDrain, ordered flushes, autoDestroy and the destroy/close lifecycle out of
+  // reach of node:zlib. Everything below is now the node lib/zlib.js surface
+  // layered on top of the real stream machinery.
+
+  // node lib/zlib.js: `_closed` is a getter over the handle, not a stored flag,
+  // so a stream that errored (error → destroy → _destroy nulls the handle)
+  // reports closed by the time the 'error' listener runs.
+  Object.defineProperty(proto, "_closed", {
+    configurable: true,
+    enumerable: true,
+    get: function () { return !this._handle; },
+  });
+
+  // node lib/zlib.js _close(engine): close the codec and drop the handle.
+  const zClose = function (self) {
+    if (self._handle) { self._handle.close(); self._handle = null; }
+    self._h = -1;
+    self._zEnded = true;
   };
 
-  proto.end = function (chunk, enc, cb) {
-    if (typeof chunk === "function") { cb = chunk; chunk = undefined; enc = undefined; }
-    else if (typeof enc === "function") { cb = enc; enc = undefined; }
-    const self = this;
-    const finish = function () {
-      self._writableEnded = true;
-      self._flush(function (err) {
-        if (err) self.emit("error", err);
-        self.emit("finish");
-        // Emit 'close' only AFTER the readable side has ended, matching node's
-        // stream teardown order (finish → end → close). `push(null)` schedules
-        // 'end' asynchronously, so emitting 'close' synchronously here would
-        // fire it before 'end'. raw-body attaches a 'close' listener whose
-        // cleanup() removes the 'end'/'data' listeners, so a premature 'close'
-        // strips 'end' before it fires and hangs the read (express gzip/deflate
-        // request bodies). Note `_flush` may already have pushed null (decoder
-        // reached stream-end), so 'end' can be pending even when _zEnded is set.
-        if (!self._zClosed) {
-          self._zClosed = true;
-          self.once("end", function () { self.emit("close"); });
-        }
-        if (!self._zEnded) { self._zEnded = true; self.push(null); }  // → 'end'
-        if (typeof cb === "function") cb(err);
-      });
-    };
-    if (chunk != null) this.write(chunk, enc, finish);
-    else finish();
-    return this;
+  proto._destroy = function (err, cb) {
+    zClose(this);
+    cb(err);
   };
 
-  // node zlib .flush([kind], cb): emit everything buffered so far, then cb.
-  proto.flush = function (kind, cb) {
-    if (typeof kind === "function") { cb = kind; kind = F_SYNC; }
-    const done = typeof cb === "function" ? cb : function () {};
-    if (this._zEnded || this._zErrored || this._h < 0) { G.queueMicrotask(done); return; }
-    const err = this._zRun(EMPTY, F_SYNC);
-    if (err) { this.emit("error", err); G.queueMicrotask(done); return; }
-    G.queueMicrotask(done);
-  };
-
-  // node zlib .reset(): return the codec to its initial state.
-  proto.reset = function () {
-    this._zEnded = false;
-    this._zErrored = false;
-    this._bytesWritten = 0;
-    if (this._h >= 0 && !ZN.streamReset(this._h)) {
-      ZN.streamClose(this._h);
-      this._h = this._zOpen();
-    }
-    return this;
-  };
-
-  // node lib/zlib.js ZlibBase.close: `finished(this, callback)` then destroy() —
-  // closing a codec stream destroys it, so a later write() is ERR_STREAM_DESTROYED
-  // rather than a silent no-op.
+  // node lib/zlib.js ZlibBase.close: wait for the stream to finish, then destroy.
   proto.close = function (cb) {
-    if (this._h >= 0) { ZN.streamClose(this._h); this._h = -1; }
-    this._zEnded = true;
-    if (typeof cb === "function") {
-      if (this.destroyed) G.queueMicrotask(cb);
-      else this.once("close", cb);
-    }
+    if (typeof cb === "function") finished(this, cb);
     this.destroy();
     return this;
   };
 
+  // node lib/zlib.js ZlibBase.flush: a flush is a zero-length write carrying the
+  // flush flag, so it is ordered against the writes around it.
+  proto.flush = function (kind, cb) {
+    if (typeof kind === "function" || (kind === undefined && !cb)) {
+      cb = kind;
+      kind = this._defaultFullFlushFlag;
+    }
+    if (this.writableFinished) {
+      if (typeof cb === "function") G.process.nextTick(cb);
+    } else if (this.writableEnded) {
+      if (typeof cb === "function") this.once("end", cb);
+    } else {
+      this.write(flushChunk(kind), "", cb);
+    }
+    return this;
+  };
+
+  // node lib/zlib.js ZlibBase.reset: asserts the handle is live, then resets it.
+  proto.reset = function () {
+    if (!this._handle) throw new Error("zlib binding closed");
+    this._handle.reset();
+    return this;
+  };
+
+  // node lib/zlib.js Zlib.params: flush what is buffered, then change the live
+  // codec's level/strategy with deflateParams — the stream continues, so the
+  // output must NOT restart with a fresh zlib header (test-zlib-params).
   proto.params = function (level, strategy, cb) {
-    // node validates the bare `level`/`strategy` arguments (no "options." prefix).
     checkNum(level, "level", -1, 9, undefined);
     checkNum(strategy, "strategy", 0, 4, undefined);
-    // Streaming param change: re-open honouring the new level/strategy.
-    if (this._zopts) { this._zopts = Object.assign({}, this._zopts, { level: level, strategy: strategy }); }
-    if (this._h >= 0) { ZN.streamClose(this._h); this._h = this._zOpen(); }
-    if (typeof cb === "function") G.queueMicrotask(cb);
+    if (this._level !== level || this._strategy !== strategy) {
+      const self = this;
+      this.flush(2 /* Z_SYNC_FLUSH */, function () {
+        if (!self._handle) throw new Error("zlib binding closed");
+        self._handle.params(level, strategy);
+        if (!self._zErrored) {
+          self._level = level;
+          self._strategy = strategy;
+          if (typeof cb === "function") cb();
+        }
+      });
+    } else if (typeof cb === "function") {
+      G.process.nextTick(cb);
+    }
   };
 
   Object.defineProperty(proto, "bytesWritten", {
@@ -489,13 +543,41 @@ inline constexpr std::string_view kZlibStreamJS = R"JS(
     configurable: true,
   });
 
+  // node lib/zlib.js ZlibBase: the user's options are forwarded to Transform
+  // (highWaterMark matters — test-zlib-flush-drain sets 16), with autoDestroy on
+  // and the object/encoding modes forced off because a codec is byte-oriented.
+  const transformOpts = (opts) => {
+    const o = Object.assign({ autoDestroy: true }, opts && typeof opts === "object" ? opts : null);
+    if (o.encoding || o.objectMode || o.writableObjectMode) {
+      o.encoding = null; o.objectMode = false; o.writableObjectMode = false;
+    }
+    return o;
+  };
+
   // ---- leaf constructors (callable with or without `new`) ----
   const makeLeaf = (name, Parent, cfg) => {
+    let warnedNoNew = false;
     function Ctor(opts) {
-      if (!(this instanceof Ctor)) return new Ctor(opts);
-      const self = Reflect.construct(Transform, [{}], new.target || Ctor);
-      self._zInit(cfg, opts);
-      return self;
+      // Called as a plain function on an object that already inherits from Ctor
+      // (`DeflateRaw.call(this, options)` from a setPrototypeOf-style subclass):
+      // initialise THAT object. Reflect.construct used to build a fresh instance
+      // and return it, which such a caller discards — leaving its own object
+      // without any stream state (test-zlib-deflate-raw-inherits).
+      if (!(this instanceof Ctor)) {
+        // node internal/util deprecateInstantiation (DEP0184), emitted once per
+        // class: `zlib.Gzip()` still works but warns.
+        if (!warnedNoNew) {
+          warnedNoNew = true;
+          try {
+            G.process.emitWarning("Instantiating " + name + " without the 'new' keyword has been deprecated.",
+                                  "DeprecationWarning", "DEP0184");
+          } catch (e) {}
+        }
+        return new Ctor(opts);
+      }
+      Transform.call(this, transformOpts(opts));
+      this._zInit(cfg, opts);
+      return this;
     }
     Ctor.prototype = Object.create(Parent.prototype);
     Object.setPrototypeOf(Ctor, Parent);
@@ -554,7 +636,7 @@ inline constexpr std::string_view kZlibStreamJS = R"JS(
       do {
         const end = Math.min(off + Z_SLICE, bytes.length);
         const res = ZN.streamProcess(h, end > off ? b64(bytes.subarray(off, end)) : EMPTY, end >= bytes.length ? finalFlush : F_NONE);
-        if (!res || !res.ok) { const e = new Error((res && res.message) || "zlib stream error"); e.errno = -3; e.code = "Z_DATA_ERROR"; throw e; }
+        if (!res || !res.ok) { const e = new Error((res && res.message) || "zlib stream error"); e.errno = -3; e.code = (res && res.code) || "Z_DATA_ERROR"; throw e; }
         if (res.b64) out.push(Buffer.from(res.b64, "base64"));
         if (res.streamEnd) { ended = true; break; }
         off = end;
@@ -565,6 +647,52 @@ inline constexpr std::string_view kZlibStreamJS = R"JS(
       return out.length === 1 ? out[0] : Buffer.concat(out);
     } finally { try { ZN.streamClose(h); } catch (e) {} }
   };
+  // The one-shot helpers (deflateSync/gzipSync/gunzipSync/…) call the
+  // whole-buffer natives directly, which take the options as plain numbers and
+  // range-check nothing: `zlib.gzipSync(buf, { windowBits: 8 })` silently used 8
+  // where the gzip framing needs >= 9, instead of node's ERR_OUT_OF_RANGE. node
+  // builds each one-shot out of the same class as the streaming API, so it gets
+  // one validator; this is that validator, shared with the Transform path above.
+  const validateZlibOpts = function (cfg, opts) {
+    if (!opts || typeof opts !== "object") return;
+    if (cfg.kind === K_DEFLATE || cfg.kind === K_INFLATE) {
+      const isDec = cfg.kind === K_INFLATE;
+      // windowBits 0 on the decompression side means "read it from the header".
+      if (!(isDec && opts.windowBits === 0))
+        checkNum(opts.windowBits, "options.windowBits", cfg.fmt === "gzip" ? 9 : 8, 15, 15);
+      checkLevel(opts.level, "options.level", -1, 9, -1);
+      checkNum(opts.memLevel, "options.memLevel", 1, 9, 8);
+      checkLevel(opts.strategy, "options.strategy", 0, 4, 0);
+    }
+    vopt(opts, "chunkSize", 64, Infinity, 16384);
+    const maxFlushVal = flushMax(cfg.kind);
+    vopt(opts, "flush", 0, maxFlushVal, 0);
+    vopt(opts, "finishFlush", 0, maxFlushVal, Math.min(4, maxFlushVal));
+  };
+  const compressorOneShots = {
+    deflateSync: { kind: K_DEFLATE, fmt: "zlib" },
+    deflateRawSync: { kind: K_DEFLATE, fmt: "raw" },
+    gzipSync: { kind: K_DEFLATE, fmt: "gzip" },
+  };
+  const compressorAsyncOf = { deflateSync: "deflate", deflateRawSync: "deflateRaw", gzipSync: "gzip" };
+  for (const name of Object.keys(compressorOneShots)) {
+    const cfg = compressorOneShots[name];
+    const orig = zmod[name];
+    if (typeof orig !== "function") continue;
+    const sync = function (data, opts) { validateZlibOpts(cfg, opts); return orig(data, opts); };
+    const async = function (data, opts, cb) {
+      if (typeof opts === "function") { cb = opts; opts = undefined; }
+      if (typeof cb !== "function") throw errType("callback", "of type function", cb);
+      validateZlibOpts(cfg, opts);
+      G.queueMicrotask(function () { let r; try { r = orig(data, opts); } catch (e) { cb(e); return; } cb(null, r); });
+    };
+    try { Object.defineProperty(zmod, name, { value: sync, writable: true, enumerable: true, configurable: true }); } catch (e) { zmod[name] = sync; }
+    const an = compressorAsyncOf[name];
+    if (an && typeof zmod[an] === "function") {
+      try { Object.defineProperty(zmod, an, { value: async, writable: true, enumerable: true, configurable: true }); } catch (e) { zmod[an] = async; }
+    }
+  }
+
   const decoderOneShots = {
     inflateSync: { kind: K_INFLATE, fmt: "zlib", Engine: Inflate },
     inflateRawSync: { kind: K_INFLATE, fmt: "raw", Engine: InflateRaw },
@@ -580,6 +708,7 @@ inline constexpr std::string_view kZlibStreamJS = R"JS(
     if (typeof orig !== "function") continue;
     const finishDefault = Math.min(4, flushMax(cfg.kind));   // Z_FINISH / BROTLI_OPERATION_FINISH / ZSTD_e_end
     const sync = function (data, opts) {
+      validateZlibOpts(cfg, opts);
       if (opts && typeof opts === "object" && typeof opts.finishFlush === "number" && opts.finishFlush !== finishDefault) {
         const buf = decodeThroughHandle(cfg, data, opts, F_SYNC);
         return opts.info ? { buffer: buf, engine: Object.create(cfg.Engine.prototype) } : buf;
