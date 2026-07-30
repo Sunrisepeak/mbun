@@ -41,3 +41,13 @@ compat/bun/test/js/bun/ffi/ffi.test.fixture.receiver.c
 # `git worktree list` is the authority on which exist; they must never be staged.
 /wt[0-9]
 /wt[0-9][0-9]
+
+# More corpus-test litter in the repo root, same class as the block above: bundler
+# and sqlite tests that write relative to process.cwd(). `app` and
+# `app-with-resources` are compiled single-file executables, `nosourcemap_entry` a
+# build artifact, `mydb.sqlite` a database left by the node:sqlite suite. The two
+# unprintable names come from tests that build a path out of a stringified value.
+/app
+/app-with-resources
+/nosourcemap_entry
+/mydb.sqlite
