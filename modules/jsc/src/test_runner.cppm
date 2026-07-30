@@ -318,6 +318,21 @@ inline constexpr std::string_view HARNESS = R"JS(
   function deepEqualStrict(a, b) { return deepEqualImpl(a, b, true, new Map()); }
   function assertionError(msg) { const e = new Error(msg); e.name = "AssertionError"; return e; }
 
+  // Failure message for the call-argument spy matchers. bun/jest print a diff
+  // block ("- Expected" / "+ Received") so a one-field mismatch deep inside a
+  // nested argument is visible; mbun printed only the expected arguments, which
+  // told you nothing about what the mock actually received (issue 10380).
+  // `index` selects which recorded call to diff against (-1 => none recorded).
+  function callDiff(name, expectedArgs, mockFn, index) {
+    const calls = mockFn && mockFn.mock ? mockFn.mock.calls : null;
+    let out = name + "(" + fmt(expectedArgs) + ")\n\n- Expected\n+ Received\n\n- " + fmt(expectedArgs) + "\n";
+    if (!calls) return out + "+ <not a mock function>";
+    if (!(index >= 0) || index >= calls.length) {
+      return out + "+ <" + calls.length + " call" + (calls.length === 1 ? "" : "s") + " recorded>";
+    }
+    return out + "+ " + fmt(calls[index]);
+  }
+
   // `expect(received, label)` (bun expect.rs custom_label): the label REPLACES the
   // matcher hint line of the failure message ("lol!\n\nExpected: ...").
   function makeMatchers(received, isNot, label) {
@@ -452,15 +467,42 @@ inline constexpr std::string_view HARNESS = R"JS(
         if (typeof expected !== "string") throw assertionError("toEqualIgnoringWhitespace() requires argument to be a string");
         const strip = (s) => s.replace(/\s/g, "");
         check(typeof received === "string" && strip(received) === strip(expected), () => "toEqualIgnoringWhitespace\n\nExpected: " + fmt(expected) + "\nReceived: " + fmt(received)); return m; },
+      // bun's key matchers (jest-extended surface, expect.classes.ts
+      // toContainKey/toContainKeys/toContainAllKeys/toContainAnyKeys). Ownership
+      // is tested with hasOwnProperty, not `in`: that is what makes a Proxy's
+      // getOwnPropertyDescriptor trap run, so a throwing trap propagates instead
+      // of being silently answered by the `has` trap (issue 11677).
+      toContainKey(key) {
+        if (received === null || received === undefined) throw assertionError("toContainKey() requires the expect(value) to be an object");
+        check(Object.prototype.hasOwnProperty.call(received, key), () => "toContainKey(" + fmt(key) + ")\n\nReceived: " + fmt(received)); return m; },
+      toContainKeys(keys) {
+        if (received === null || received === undefined) throw assertionError("toContainKeys() requires the expect(value) to be an object");
+        if (!Array.isArray(keys)) throw assertionError("toContainKeys() requires the argument to be an array");
+        let ok = true;
+        for (const key of keys) if (!Object.prototype.hasOwnProperty.call(received, key)) { ok = false; break; }
+        check(ok, () => "toContainKeys(" + fmt(keys) + ")\n\nReceived: " + fmt(received)); return m; },
+      toContainAnyKeys(keys) {
+        if (received === null || received === undefined) throw assertionError("toContainAnyKeys() requires the expect(value) to be an object");
+        if (!Array.isArray(keys)) throw assertionError("toContainAnyKeys() requires the argument to be an array");
+        let ok = false;
+        for (const key of keys) if (Object.prototype.hasOwnProperty.call(received, key)) { ok = true; break; }
+        check(ok, () => "toContainAnyKeys(" + fmt(keys) + ")\n\nReceived: " + fmt(received)); return m; },
+      toContainAllKeys(keys) {
+        if (received === null || received === undefined) throw assertionError("toContainAllKeys() requires the expect(value) to be an object");
+        if (!Array.isArray(keys)) throw assertionError("toContainAllKeys() requires the argument to be an array");
+        let ok = true;
+        for (const key of keys) if (!Object.prototype.hasOwnProperty.call(received, key)) { ok = false; break; }
+        if (ok) { const own = Object.keys(received); const want = new Set(keys.map((k) => String(k))); ok = own.length === want.size && own.every((k) => want.has(k)); }
+        check(ok, () => "toContainAllKeys(" + fmt(keys) + ")\n\nReceived: " + fmt(received)); return m; },
       // bun: unconditional pass/fail (respect .not — pass under .not fails, etc).
       pass(msg) { if (arguments.length > 0 && typeof msg !== "string") throw assertionError("Expected message to be a string for 'pass'."); check(true, () => (arguments.length > 0 ? msg : "passes by .pass() assertion")); return m; },
       fail(msg) { if (arguments.length > 0 && typeof msg !== "string") throw assertionError("Expected message to be a string for 'fail'."); check(false, () => (arguments.length > 0 ? msg : "fails by .fail() assertion")); return m; },
       // mock matchers (received is a mock/spy from mock()/spyOn())
       toHaveBeenCalled() { check(!!(received && received.mock && received.mock.calls.length > 0), () => "toHaveBeenCalled"); return m; },
       toHaveBeenCalledTimes(n) { check(!!(received && received.mock) && received.mock.calls.length === n, () => "toHaveBeenCalledTimes(" + n + ")\n\nReceived: " + (received && received.mock ? received.mock.calls.length : "n/a")); return m; },
-      toHaveBeenCalledWith(...a) { let ok = false; if (received && received.mock) for (const call of received.mock.calls) if (deepEqual(call, a)) { ok = true; break; } check(ok, () => "toHaveBeenCalledWith(" + fmt(a) + ")"); return m; },
-      toHaveBeenLastCalledWith(...a) { const c = received && received.mock ? received.mock.calls : []; check(c.length > 0 && deepEqual(c[c.length - 1], a), () => "toHaveBeenLastCalledWith(" + fmt(a) + ")"); return m; },
-      toHaveBeenNthCalledWith(n, ...a) { const c = received && received.mock ? received.mock.calls : []; check(c.length >= n && deepEqual(c[n - 1], a), () => "toHaveBeenNthCalledWith"); return m; },
+      toHaveBeenCalledWith(...a) { let ok = false; if (received && received.mock) for (const call of received.mock.calls) if (deepEqual(call, a)) { ok = true; break; } check(ok, () => callDiff("toHaveBeenCalledWith", a, received, received && received.mock ? received.mock.calls.length - 1 : -1)); return m; },
+      toHaveBeenLastCalledWith(...a) { const c = received && received.mock ? received.mock.calls : []; check(c.length > 0 && deepEqual(c[c.length - 1], a), () => callDiff("toHaveBeenLastCalledWith", a, received, c.length - 1)); return m; },
+      toHaveBeenNthCalledWith(n, ...a) { const c = received && received.mock ? received.mock.calls : []; check(c.length >= n && deepEqual(c[n - 1], a), () => callDiff("toHaveBeenNthCalledWith", a, received, n - 1)); return m; },
       toHaveBeenCalledOnce() { check(!!(received && received.mock) && received.mock.calls.length === 1, () => "toHaveBeenCalledOnce\n\nReceived: " + (received && received.mock ? received.mock.calls.length : "n/a")); return m; },
       // jest-compat aliases. Each maps onto the canonical matcher exactly as bun
       // does in jest.classes.ts:300-337 (`toBeCalled -> toHaveBeenCalled`,
@@ -491,6 +533,7 @@ inline constexpr std::string_view HARNESS = R"JS(
           S.snapCounters = S.snapCounters || {};
           const n = (S.snapCounters[key] = (S.snapCounters[key] || 0) + 1);
           (S.snapshots || (S.snapshots = [])).push({ key: key + " " + n, value: snapSerialize(received, "") });
+          S.snapTotal = (S.snapTotal || 0) + 1;   // bun's summary snapshot tally
         } catch (e) {}
         return m;
       },
@@ -659,7 +702,12 @@ inline constexpr std::string_view HARNESS = R"JS(
     return v != null && (v instanceof ctor || (v.constructor === ctor));
   });
   expect.objectContaining = (obj) => asym("objectContaining", (v) => { if (v == null || typeof v !== "object") return false; for (const k of Object.keys(obj)) { if (!(k in v) || !deepEqual(v[k], obj[k])) return false; } return true; });
-  expect.arrayContaining = (arr) => asym("arrayContaining", (v) => { if (!Array.isArray(v)) return false; return arr.every((x) => v.some((y) => deepEqual(y, x))); });
+  // A Proxy passes IsArray but is not a JSArray. bun's arrayContaining needs a
+  // real one on BOTH sides and reports no match otherwise, rather than reading
+  // through the traps (regression/issue/isArray-proxy-crash, where matching a
+  // Proxy used to be a null deref).
+  const isRealArray = (v) => Array.isArray(v) && !(G.__mbunProxyRegistry && G.__mbunProxyRegistry.has(v));
+  expect.arrayContaining = (arr) => asym("arrayContaining", (v) => { if (!isRealArray(v) || !isRealArray(arr)) return false; return arr.every((x) => v.some((y) => deepEqual(y, x))); });
   expect.stringContaining = (s) => asym("stringContaining", (v) => typeof v === "string" && v.indexOf(s) !== -1);
   expect.stringMatching = (re) => asym("stringMatching", (v) => typeof v === "string" && (re instanceof RegExp ? re.test(v) : v.indexOf(String(re)) !== -1));
   expect.closeTo = (n, d) => asym("closeTo", (v) => typeof v === "number" && Math.abs(v - n) < Math.pow(10, -(d === undefined ? 2 : d)) / 2);
@@ -1140,7 +1188,10 @@ inline constexpr std::string_view HARNESS = R"JS(
     return make();
   })();
 
-  G.__mbunBT = { test, it, describe, xdescribe: describe, xit: test.skip, xtest: test.skip, expect,
+  // xdescribe is describe.SKIP, not describe (jest's x-prefix family is the skip
+  // family): aliasing it to plain describe ran every test inside an xdescribe
+  // block, so an `xdescribe` guarding a throwing test failed the file (issue 5228).
+  G.__mbunBT = { test, it, describe, xdescribe: describe.skip, xit: test.skip, xtest: test.skip, expect,
                  beforeEach, afterEach, beforeAll, afterAll, mock, spyOn, jest, vi, expectTypeOf,
                  setDefaultTimeout: function () {}, setSystemTime: setSystemTime,
                  spyOn: spyOn };
@@ -1490,6 +1541,7 @@ inline constexpr std::string_view HARNESS = R"JS(
     S.todoDepth = 0;   // a describe.todo left open by a throwing body
     S.sysTime = null;  // a file's fake system time must not leak into the next
     S.snapshots = []; S.snapCounters = {}; S.curLabel = "";  // snapshot state is per-file
+    S.snapTotal = 0; S.snapAdded = 0;                        // …including its tallies
     G.__mbun_describe_pending = 0;  // async describe bodies of the previous file
     ftUninstall();     // a file's fake timers must not leak into the next either
     __allMocks.length = 0;
@@ -1507,6 +1559,10 @@ inline constexpr std::string_view HARNESS = R"JS(
       const snapDir = path.join(path.dirname(G.__filename), "__snapshots__");
       const snapFile = path.join(snapDir, path.basename(G.__filename) + ".snap");
       if (fs.existsSync(snapFile)) return;   // never clobber an existing snapshot
+      // bun's summary reports how many snapshots this run WROTE ("snapshots:
+      // +N added", test_command.rs:2870). Without it a first run looked
+      // indistinguishable from a re-run against an existing .snap (issue 14029).
+      S.snapAdded = (S.snapAdded || 0) + S.snapshots.length;
       fs.mkdirSync(snapDir, { recursive: true });
       const esc = (s) => String(s).replace(/\\/g, "\\\\").replace(/`/g, "\\`").replace(/\$\{/g, "\\${");
       const snaps = S.snapshots.slice().sort((a, b) => a.key < b.key ? -1 : a.key > b.key ? 1 : 0);
@@ -1529,6 +1585,7 @@ inline constexpr std::string_view HARNESS = R"JS(
     G.__mbun_pass = S.pass; G.__mbun_fail = S.fail; G.__mbun_skip = S.skip;
     G.__mbun_todo = S.todo; G.__mbun_skipped_label = S.skippedLabel;
     G.__mbun_expect = S.expectCalls; G.__mbun_total = S.total;
+    G.__mbun_snap_total = S.snapTotal || 0; G.__mbun_snap_added = S.snapAdded || 0;
     G.__mbun_errors = S.errors.length;
     G.__mbun_error_text = S.errors.map((m) => "error: " + m).join("\n");
     G.__mbun_output = S.out.join("\n"); G.__mbun_done = true;
@@ -1671,6 +1728,8 @@ struct RunResult {
     int todo{0};
     int errors{0};       // file-level errors (describe-scope throws, afterAll throws, …)
     int expect_calls{0};
+    int snap_total{0};   // toMatchSnapshot() calls (bun's snapshots.total)
+    int snap_added{0};   // snapshots this run wrote to a new .snap (snapshots.added)
     int total{0};
     int skipped_label{0};  // tests skipped by -t/--test-name-pattern (jest.rs:282)
     std::string body;    // per-test (pass)/(fail)/(skip) lines + failure detail
@@ -2155,6 +2214,8 @@ RunResult run_source(std::string_view js_source, std::string_view dir = ".", boo
     r.todo = as_int(rt::eval_number("globalThis.__mbun_todo||0"));
     r.errors = as_int(rt::eval_number("globalThis.__mbun_errors||0"));
     r.expect_calls = as_int(rt::eval_number("globalThis.__mbun_expect"));
+    r.snap_total = as_int(rt::eval_number("globalThis.__mbun_snap_total||0"));
+    r.snap_added = as_int(rt::eval_number("globalThis.__mbun_snap_added||0"));
     r.total = as_int(rt::eval_number("globalThis.__mbun_total"));
     r.skipped_label = as_int(rt::eval_number("globalThis.__mbun_skipped_label||0"));
     if (auto body{rt::eval_to_string("String(globalThis.__mbun_output)")}) {

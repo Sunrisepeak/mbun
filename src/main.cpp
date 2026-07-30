@@ -407,6 +407,22 @@ int main(int argc, char* argv[]) {
                 }
                 if (args[i] == "--if-present") { flags.ifPresent = true; ++i; continue; }
                 if (args[i] == "--workspaces") { flags.workspaces = true; ++i; continue; }
+                // `--filter <pattern>` / `-F <pattern>` (Arguments.rs:325): the
+                // same workspace fan-out as `--workspaces`, narrowed to the
+                // members whose package name matches. Unhandled, "--filter" was
+                // taken as the script name (issue 26207).
+                if ((args[i] == "--filter" || args[i] == "-F") && i + 1 < args.size()) {
+                    flags.workspaces = true;
+                    flags.workspaceFilters.emplace_back(args[i + 1]);
+                    i += 2;
+                    continue;
+                }
+                if (args[i].starts_with("--filter=")) {
+                    flags.workspaces = true;
+                    flags.workspaceFilters.emplace_back(args[i].substr(9));
+                    ++i;
+                    continue;
+                }
                 if (args[i] == "--bun" || args[i] == "-b") { flags.forceUsingBun = true; ++i; continue; }
                 // `--cwd <dir>` / `--cwd=<dir>` — chdir before resolving the target
                 // (Arguments.rs:773). Two-token form was previously unhandled, which

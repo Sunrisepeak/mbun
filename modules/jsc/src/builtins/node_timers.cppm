@@ -64,6 +64,17 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
 
     const idOf = (t) => { try { const n = +t; return Number.isSafeInteger(n) ? n : null; } catch (_) { return null; } };
 
+    // node's Timeout._idleStart is uv_now() — the libuv loop's monotonic clock in
+    // whole milliseconds (internal/timers.js insert()). hrtime.bigint() reads the
+    // same monotonic source.
+    const uvNow = () => {
+      try {
+        const p = G.process;
+        if (p && p.hrtime && typeof p.hrtime.bigint === "function") return Number(p.hrtime.bigint() / 1000000n);
+      } catch (_) {}
+      return Math.trunc((G.performance && typeof G.performance.now === "function") ? G.performance.now() : Date.now());
+    };
+
     function initTimer(t, kind, state) {
       if (t === null || typeof t !== "object") return t;
       t[KIND] = kind;
@@ -79,6 +90,16 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
         catch (_) { t._destroyed = false; }
       } else t._destroyed = false;
       if (kind !== "immediate") {
+        // node's Timeout carries _idleStart (the uv_now() at insert time) and
+        // _idleTimeout (the delay); Next.js 16 reads and rewrites _idleStart to
+        // coordinate its own timers, and mbun's facade had neither, so
+        // `"_idleStart" in timer` was false (issue 25639). uv_now() is the
+        // monotonic clock in ms, which is what hrtime.bigint() measures.
+        // Non-enumerable so a Timeout's inspect output is unchanged.
+        try {
+          Object.defineProperty(t, "_idleStart", { value: uvNow(), writable: true, enumerable: false, configurable: true });
+          Object.defineProperty(t, "_idleTimeout", { value: state && state.ms !== undefined ? state.ms : 1, writable: true, enumerable: false, configurable: true });
+        } catch (_) {}
         const id = idOf(t);
         if (id !== null) registry.set(id, t);
         activeTimeouts.add(t);
@@ -102,6 +123,7 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
           state.gen++;
           try { oClearTimeout(state.native); } catch (_) {}
           state.native = oSetTimeout(state.run, state.ms, ...state.args);
+          t._idleStart = uvNow();   // node's refresh() re-inserts, which restamps it
           t._destroyed = false;
           const id = idOf(t);
           if (id !== null) registry.set(id, t);

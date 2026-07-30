@@ -498,6 +498,14 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
         // bun carries .exists on Blob.prototype, so it is never an own key of a
         // BunFile: keep it off Object.keys()/JSON.stringify().
         slot("exists", () => { try { return Promise.resolve(fsm.statSync(fsPath).isFile()); } catch (e) { return Promise.resolve(false); } });
+        // BunFile.stat()/.unlink()/.delete() (bun.d.ts BunFile): stat resolves a
+        // node fs.Stats, unlink/delete remove the path. They were missing
+        // entirely, so `Bun.file(p).stat()` threw "stat is not a function"
+        // (issue 26647) even though node:fs already answers the same paths.
+        slot("stat", () => { try { return Promise.resolve(isFd ? fsm.fstatSync(fdArg) : fsm.statSync(fsPath)); } catch (e) { return Promise.reject(e); } });
+        const unlinkOne = () => { try { fsm.unlinkSync(fsPath); return Promise.resolve(undefined); } catch (e) { return Promise.reject(e); } };
+        slot("unlink", unlinkOne);
+        slot("delete", unlinkOne);
         // Bun.file(...).writer([opts]) → incremental FileSink over the fd.
         slot("writer", (wopts) => makeFileSink({ path: isFd ? null : fsPath, fd: isFd ? fdArg : -1, isFifo: isFifo, opts: wopts }));
         // A fifo cannot be read by the synchronous Blob loader (open(2)/read(2)
