@@ -25,6 +25,11 @@ inline constexpr std::string_view kWebCompressionStreamJS = R"JS(
     deflate: ["createDeflate", "createInflate"],
     "deflate-raw": ["createDeflateRaw", "createInflateRaw"],
     brotli: ["createBrotliCompress", "createBrotliDecompress"],
+    // zstd is in the same Compression Streams format list as brotli in bun, and
+    // zlib_stream.cppm has carried the real streaming ZstdCompress/ZstdDecompress
+    // Transforms all along — this table was simply never extended, so
+    // `new CompressionStream("zstd")` reported the format as invalid.
+    zstd: ["createZstdCompress", "createZstdDecompress"],
   };
 
   const invalidFormat = (format) => {
@@ -46,8 +51,14 @@ inline constexpr std::string_view kWebCompressionStreamJS = R"JS(
     // TypeError on both Web-stream halves.
     if (decompress && typeof duplex._zMakeErr === "function") {
       const makeZlibError = duplex._zMakeErr;
-      duplex._zMakeErr = function (message) {
-        const e = makeZlibError.call(this, message);
+      // BOTH arguments: _zMakeErr is (message, code), and the engine's own code
+      // (ERR_<BrotliDecoderErrorString>, ZSTD_error_*, Z_NEED_DICT) arrives in
+      // the second one. Forwarding only `message` silently re-derived every
+      // decoder failure as the Z_DATA_ERROR fallback, so a corrupt brotli body
+      // surfaced as `code: "Z_DATA_ERROR"` on the web streams even though
+      // modules/compress had already resolved it to ERR__ERROR_FORMAT_PADDING_2.
+      duplex._zMakeErr = function (message, code) {
+        const e = makeZlibError.call(this, message, code);
         if (e) e.name = "TypeError";
         return e;
       };
