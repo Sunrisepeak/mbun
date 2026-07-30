@@ -354,6 +354,16 @@ struct TestFlags {
     bool onlyFailures { false };            // --only-failures        (Arguments.rs:1647-1649)
     bool passWithNoTests { false };         // --pass-with-no-tests   (Arguments.rs:1786)
 
+    // --rerun-each <INT>: run EVERY test file N times, in the same JS realm
+    // (test_command.rs:3108-3160 `repeat_count`). "Same realm" is the contract
+    // the flag is used for — a file's globals must survive the reruns so a flaky
+    // test can accumulate state across them (cli/test/rerun-each.test.ts counts
+    // `globalThis.testRunCounter` up to 3); only the module entry is
+    // re-evaluated. The file is counted ONCE in the summary regardless of the
+    // rerun count (test_command.rs:3162-3164 `if repeat_index == 0 {
+    // summary().files += 1 }`), so the report stays "Ran 3 tests across 1 file".
+    std::optional<std::uint32_t> rerunEach {};
+
     // -t / --test-name-pattern / --grep <STR>: a JS RegExp source matched
     // (partial, unanchored) against each test's full "describe > … > test" name.
     // Non-matching tests count as "skipped because label"; a run that filters out
@@ -479,6 +489,15 @@ TestFlags parse_test(std::span<const std::string_view> args) {
                 }
                 out.randomize = true;
                 out.seed = parsed;
+            } else if (name == "--rerun-each") {
+                // Arguments.rs parses it as a u32; bun clamps to >= 1 at the use
+                // site (`repeat_count.max(1)`, test_command.rs:2144), so 0 and a
+                // junk value both mean "run once" rather than "run nothing".
+                std::uint32_t parsed {};
+                const char* begin { value.data() };
+                const char* end { value.data() + value.size() };
+                const auto [ptr, ec] { std::from_chars(begin, end, parsed) };
+                if (ec == std::errc {} && ptr == end) out.rerunEach = parsed;
             } else if (name == "-t" || name == "--test-name-pattern" || name == "--grep") {
                 // Capture the label filter (last one wins, matching bun's option()).
                 out.testNamePattern = std::string { value };

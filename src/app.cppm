@@ -997,6 +997,12 @@ int run_test(std::span<const std::string_view> args) {
                             flags.seed = *cfg->test.seed;
                             flags.randomize = true;  // a seed implies randomizing
                         }
+                        // [test] rerunEach — the bunfig spelling of --rerun-each
+                        // (bunfig parser.cppm:389, which also enforces the
+                        // mutually-exclusive-with-retry rule). CLI wins.
+                        if (cfg->test.rerun_each != 0 && !flags.rerunEach) {
+                            flags.rerunEach = cfg->test.rerun_each;
+                        }
                         bunfigPathIgnorePatterns = cfg->test.path_ignore_patterns;
                         apply_bunfig_jsx(*cfg, mbun::jsc::module_loader::runtime_jsx_options());
                     } else {
@@ -1101,7 +1107,13 @@ int run_test(std::span<const std::string_view> args) {
                            (!flags.reporter || *flags.reporter == "junit") };
     std::vector<JUnitSuite> junitSuites {};
 
+    // --rerun-each / [test] rerunEach: how many times each file is evaluated.
+    // Clamped to >= 1 exactly as bun does (`repeat_count.max(1)`,
+    // test_command.rs:2144), so `--rerun-each=0` still runs the suite once.
+    const std::uint32_t rerunEach { std::max<std::uint32_t>(1, flags.rerunEach.value_or(1)) };
+
     for (const auto& f : files) {
+      for (std::uint32_t repeatIndex { 0 }; repeatIndex < rerunEach; ++repeatIndex) {
         const std::string path { f.string() };
         // The file header is titled with the path RELATIVE to the top level dir,
         // not the absolute path (ref: test_command.rs:3096 — `let file_title =
@@ -1110,6 +1122,11 @@ int run_test(std::span<const std::string_view> args) {
         const std::filesystem::path rel { std::filesystem::relative(f, std::filesystem::current_path(rec), rec) };
         const std::string title { (rec || rel.empty()) ? path : rel.string() };
 
+        // Each rerun re-evaluates the module entry in the SAME realm, so the
+        // file's `globalThis` state carries across (that is the whole point of
+        // the flag) while its snapshot counters are reset — run_source clears
+        // S.snapCounters per evaluation (test_runner.cppm:1771), which is bun's
+        // `snapshots.reset_counts()` at test_command.rs:3121.
         mbun::jsc::test_runner::RunResult r { mbun::jsc::test_runner::run_file(path, seed, namePattern) };
 
         if (!r.ok) {  // a file that fails to load/run counts as one failed test (bun)
@@ -1155,6 +1172,7 @@ int run_test(std::span<const std::string_view> args) {
         snapTotal += r.snap_total;
         snapAdded += r.snap_added;
         skippedLabel += r.skipped_label;
+      }
     }
 
     const auto elapsed { std::chrono::duration<double, std::milli>(
