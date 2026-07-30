@@ -163,7 +163,8 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     // { key: <JWK object>, format: "jwk", ... } — materialize the JWK to DER up
     // front (private when `d` is present) so the native signer/verifier gets real
     // key bytes. dsaEncoding rides along for EC ieee-p1363 vs der output.
-    if (typeof k === "object" && k.format === "jwk" && k.key != null && typeof k.key === "object") {
+    if (typeof k === "object" && k.format === "jwk") {
+      requireJwkObject(k.key, "key.key");
       const isPriv = k.key.d != null;
       return { data: jwkToDer(k.key, isPriv), passphrase: undefined, dsaEncoding: k.dsaEncoding };
     }
@@ -495,6 +496,29 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     }
     return out;
   };
+  // RFC 7518 registers JWK key types for RSA, EC and the OKP curves only. DSA,
+  // DH and RSA-PSS have no JWK representation at all — an RSASSA-PSS key's whole
+  // point is the parameters JWK cannot carry — so node refuses at the export
+  // boundary instead of silently downgrading them to a bare "RSA" document.
+  // ref: node src/crypto/crypto_keys.cc ExportJWKInner (default arm).
+  const JWK_EXPORTABLE = { rsa: 1, ec: 1, ed25519: 1, ed448: 1, x25519: 1, x448: 1 };
+  const jwkUnsupportedType = () => {
+    const e = new Error("Unsupported JWK Key Type.");
+    e.code = "ERR_CRYPTO_JWK_UNSUPPORTED_KEY_TYPE";
+    return e;
+  };
+  // node validates `key.key` with validateObject BEFORE any JWK member is read
+  // (lib/internal/crypto/keys.js prepareAsymmetricKey), so a non-object gets the
+  // argument-shape error, not a JWK-parse one. null, arrays and functions are all
+  // rejected — validateObject's defaults allow none of them.
+  const requireJwkObject = (value, name) => {
+    if (value === null || Array.isArray(value) || typeof value !== "object") {
+      const e = new TypeError('The "' + name + '" property must be of type object. Received ' +
+        argRecv(value));
+      e.code = "ERR_INVALID_ARG_TYPE";
+      throw e;
+    }
+  };
   const jwkToDer = (jwk, isPrivate) => {
     if (jwk == null || typeof jwk !== "object") throw new TypeError("Invalid JWK");
     const parts = { kty: jwk.kty };
@@ -748,7 +772,15 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
           const e = new Error("The selected key encoding jwk does not support encryption.");
           e.code = "ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS"; throw e;
         }
-        return jwkFromKey(slot.material, slot.passphrase, slot.kind === "public");
+        const isPublic = slot.kind === "public";
+        // Resolve the key's type before encoding: an RSA-PSS key would otherwise
+        // serialize as a plain "RSA" JWK, losing exactly the parameters that make
+        // it an RSA-PSS key, and DSA would surface an OpenSSL message with no code.
+        let keyType;
+        try { keyType = AN.keyType(slot.material, slot.passphrase, isPublic).type; }
+        catch (e) { throw asymParseError(this, e, isPublic); }
+        if (!JWK_EXPORTABLE[keyType]) throw jwkUnsupportedType();
+        return jwkFromKey(slot.material, slot.passphrase, isPublic);
       }
       const type = options.type || (slot.kind === "public" ? "spki" : "pkcs8");
       const format = options.format || "pem";
@@ -762,6 +794,22 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
         const e = new TypeError("The property 'options.type' is invalid. Received " +
           (typeof type === "string" ? "'" + type + "'" : String(type)));
         e.code = "ERR_INVALID_ARG_VALUE"; throw e;
+      }
+      // pkcs1 and sec1 are algorithm-specific containers, not general ones. An
+      // RSA-PSS key written as a PKCS#1 RSAPublicKey would silently shed the
+      // RSASSA-PSS-params that are the whole point of the key, so node calls the
+      // request incompatible rather than letting the encoder produce a lie.
+      // ref: node lib/internal/crypto/keys.js parseKeyType.
+      if (type === "pkcs1" || type === "sec1") {
+        const want = type === "pkcs1" ? "rsa" : "ec";
+        let kt;
+        try { kt = AN.keyType(slot.material, slot.passphrase, slot.kind === "public").type; }
+        catch (e) { throw asymParseError(this, e, slot.kind === "public"); }
+        if (kt !== want) {
+          const e = new Error("The selected key encoding " + type + " can only be used for " +
+            want.toUpperCase() + " keys.");
+          e.code = "ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS"; throw e;
+        }
       }
       // Encrypting a private key requires a cipher; a passphrase alone throws.
       if (slot.kind === "private" && options.passphrase != null && options.cipher == null) {
@@ -905,7 +953,8 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     }
     // { key: <JWK object>, format: "jwk" } → materialize as DER up front so the
     // rest of the pipeline sees ordinary key material (node keys.js).
-    if (key != null && typeof key === "object" && key.format === "jwk" && key.key != null) {
+    if (key != null && typeof key === "object" && key.format === "jwk") {
+      requireJwkObject(key.key, "key.key");
       return mkKO(kind, jwkToDer(key.key, kind === "private"), "");
     }
     const r = resolveKey(key);
@@ -916,6 +965,36 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   // (has a "-----BEGIN" header) keeps the native/passphrase error; binary DER that
   // starts with a SEQUENCE tag (0x30) is a decode failure; anything else has no
   // PEM start line.
+  // node validates a key descriptor's `format`/`type` BEFORE handing the bytes to
+  // any loader, so a bad descriptor is an ERR_INVALID_ARG_VALUE naming the member,
+  // never an OpenSSL decode error about the bytes. The type table is asymmetric on
+  // purpose: createPrivateKey passes isPublic=false and so rejects 'spki', while
+  // createPublicKey passes isPublic=undefined and accepts every container name,
+  // because a private container is a legitimate source for a public key.
+  // ref: node lib/internal/crypto/keys.js parseKeyFormat / parseKeyType.
+  // The property path is spelled `options.*`, not node 26's `key.*`: both corpora
+  // pin it and they disagree (compat/bun/.../parallel/test-crypto-key-objects.js
+  // wants `options.type`, compat/node/.../test-crypto-key-objects.js wants
+  // `key.type`), and only the bun copy can actually reach green — the node copy is
+  // blocked on two other same-binary conflicts recorded in struck.tsv.
+  const INPUT_KEY_FORMATS = new Set(["pem", "der", "jwk", "raw-public", "raw-private", "raw-seed"]);
+  const inputInvalid = (path, v) => {
+    const e = new TypeError("The property 'options." + path + "' is invalid. Received " +
+      (typeof v === "string" ? "'" + v + "'" : String(v)));
+    e.code = "ERR_INVALID_ARG_VALUE"; return e;
+  };
+  const checkInputEncoding = (v, isPrivate) => {
+    if (v === null || typeof v !== "object" || isKO(v) || !("key" in v)) return;
+    if (v.format !== undefined && !INPUT_KEY_FORMATS.has(v.format)) {
+      throw inputInvalid("format", v.format);
+    }
+    // The raw encodings carry their own `type` vocabulary (compressed /
+    // uncompressed point form), validated where they are decoded.
+    if (v.type === undefined || RAW_FORMATS[v.format]) return;
+    const ok = v.type === "pkcs1" || v.type === "pkcs8" || v.type === "sec1" ||
+               (v.type === "spki" && !isPrivate);
+    if (!ok) throw inputInvalid("type", v.type);
+  };
   const asymParseError = (ko, nativeErr, wantPublic) => {
     // A failure the native layer already classified (missing passphrase / an
     // OpenSSL error) keeps that classification whatever the container looked like.
@@ -941,6 +1020,20 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
       }
       return surfaced;
     }
+    // createPrivateKey has ONE loader on OpenSSL 3: OSSL_DECODER. It is fed the
+    // bytes whatever they look like — empty string, DER that is really a public
+    // key, junk — and every refusal comes back as the same generic "unsupported",
+    // because the decoder cannot say which of its candidate structures the input
+    // failed to be. The PEM-specific "no start line" is a legacy-loader error node
+    // only reports on OpenSSL 1.x / BoringSSL, which this build is not.
+    // ref: node test/parallel/test-crypto-key-objects.js (hasOpenSSL3 arms).
+    if (!wantPublic) {
+      const e = new Error("error:1E08010C:DECODER routines::unsupported");
+      e.code = "ERR_OSSL_UNSUPPORTED";
+      e.reason = "unsupported";
+      e.library = "DECODER routines";
+      return e;
+    }
     if (!isStr && bytes.length > 0 && bytes[0] === 0x30) {
       const e = new Error("error:06000066:public key routines:OPENSSL_internal:DECODE_ERROR");
       e.code = "ERR_OSSL_UNSUPPORTED"; return e;
@@ -956,6 +1049,7 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
         "ArrayBuffer, Buffer, TypedArray, DataView, Object, or CryptoKey. Received an instance of KeyObject");
       e.code = "ERR_INVALID_ARG_TYPE"; throw e;
     }
+    checkInputEncoding(key, true);
     const ko = makeKeyObject("private", key);
     // node/bun validate the material at construction: non-key input throws
     // ERR_OSSL_NO_START_LINE (bun 1.4.0 verified). jsonwebtoken's sign()
@@ -993,6 +1087,11 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     }
     // The loader is intent-agnostic: it will parse public-only material (e.g. a
     // PKCS#1 RSAPublicKey) as a pkey. node rejects that with a decode error.
+    // NOT the OpenSSL-3 "DECODER routines::unsupported" node reports here, even
+    // though this build IS OpenSSL 3: compat/bun/test/js/node/crypto/
+    // crypto.key-objects.test.ts:343 pins the BoringSSL spelling for the very same
+    // call and is green (85/0), so the two corpora demand different strings from
+    // one binary with no discriminator between them. Recorded in struck.tsv.
     if (info && info.private === false) {
       const e = new Error("error:06000066:public key routines:OPENSSL_internal:DECODE_ERROR");
       e.code = "ERR_OSSL_UNSUPPORTED"; throw e;
@@ -1011,6 +1110,7 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
       const e = new TypeError("Invalid key object type " + slot.kind + ", expected private.");
       e.code = "ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE"; throw e;
     }
+    checkInputEncoding(key, false);
     const ko = makeKeyObject("public", key);
     // Same construction-time validation as createPrivateKey: jsonwebtoken's
     // verify() relies on the throw to fall back to createSecretKey for HS*
