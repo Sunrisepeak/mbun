@@ -4501,6 +4501,106 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     Database.MAX_QUERY_CACHE_SIZE = 20;
     const mod = { __esModule: true, Database, Statement, constants, SQLiteError, default: Database };
     M["bun:sqlite"] = { Database, Statement, constants, SQLiteError, default: mod };
+
+    // ---- node:sqlite -------------------------------------------------------
+    // `bun:sqlite` was fully working while `node:sqlite` threw
+    // ERR_UNKNOWN_BUILTIN_MODULE, so 22 corpus files called
+    // common.skip('missing SQLite') and never ran. That class was invisible for
+    // the whole campaign because self-skips are (correctly) excluded from the
+    // "actionable failure" count, so nothing in the planning loop looked at them.
+    //
+    // This is a SHIM over the working implementation, not an alias: node's API is
+    // DatabaseSync/StatementSync with variadic parameters, a `run()` that returns
+    // { changes, lastInsertRowid }, and node-shaped errors. Deliberately partial --
+    // session/changeset, backup(), custom function()/aggregate() are NOT here and
+    // the files needing them keep failing rather than pretending.
+    {
+      const nodeErr = (code, msg) => { const e = new Error(msg); e.code = code; return e; };
+      // node accepts stmt.all(1, 'x') as well as stmt.all({ $k: v }); bun's
+      // Statement takes an array or a single bindings object.
+      const bind = (args) => (args.length === 1 && args[0] !== null && typeof args[0] === "object"
+        && !Array.isArray(args[0]) && !ArrayBuffer.isView(args[0])) ? args[0] : args;
+
+      class StatementSync {
+        #st; #db;
+        constructor(st, db) { this.#st = st; this.#db = db; }
+        all(...a) { return this.#st.all(bind(a)); }
+        get(...a) { return this.#st.get(bind(a)) ?? undefined; }
+        iterate(...a) { return this.#st.iterate(bind(a)); }
+        run(...a) {
+          this.#st.run(bind(a));
+          // node reports the write result; bun's run() does not.
+          const ch = this.#db.query("select changes() as c, last_insert_rowid() as r").get();
+          return { changes: ch ? ch.c : 0, lastInsertRowid: ch ? ch.r : 0 };
+        }
+        columns() {
+          const names = this.#st.columnNames || [];
+          const declared = (() => { try { return this.#st.declaredTypes || []; } catch (e) { return []; } })();
+          return names.map((n, i) => ({ column: n, name: n, type: declared[i] ?? null,
+                                        database: null, table: null }));
+        }
+        setReadBigInts(v) { try { this.#st.safeIntegers(!!v); } catch (e) {} return undefined; }
+        // node's default is to REJECT bare named parameters unless enabled; bun
+        // already accepts them, so enabling is a no-op and disabling is honestly
+        // unsupported rather than silently wrong.
+        setAllowBareNamedParameters(v) {
+          if (!v) throw nodeErr("ERR_NOT_SUPPORTED", "disabling bare named parameters is not supported");
+          return undefined;
+        }
+        get sourceSQL() { return String(this.#st); }
+        get expandedSQL() { return String(this.#st); }
+      }
+
+      class DatabaseSync {
+        #db; #path; #open = false;
+        constructor(path, options) {
+          if (typeof path !== "string" && !(path && typeof path === "object" && "href" in path)
+              && !ArrayBuffer.isView(path)) {
+            throw nodeErr("ERR_INVALID_ARG_TYPE",
+              'The "path" argument must be a string, Uint8Array, or URL without null bytes.');
+          }
+          this.#path = String(path);
+          const o = options || {};
+          if (o.open === false) return;                 // node defers until open()
+          this.#openNow(o);
+        }
+        #openNow(o) {
+          this.#db = new Database(this.#path, o.readOnly ? { readonly: true } : undefined);
+          this.#open = true;
+          if (o.enableForeignKeyConstraints !== false) {
+            try { this.#db.run("PRAGMA foreign_keys = ON"); } catch (e) {}
+          }
+        }
+        #need() {
+          if (!this.#open) throw nodeErr("ERR_INVALID_STATE", "database is not open");
+          return this.#db;
+        }
+        open() {
+          if (this.#open) throw nodeErr("ERR_INVALID_STATE", "database is already open");
+          this.#openNow({});
+        }
+        close() { this.#need(); this.#db.close(); this.#open = false; }
+        exec(sql) { this.#need().run(sql); return undefined; }
+        prepare(sql) { return new StatementSync(this.#need().query(sql), this.#need()); }
+        location(dbName) {
+          this.#need();
+          const r = this.#db.query("select file from pragma_database_list where name = ?")
+            .get([dbName === undefined ? "main" : dbName]);
+          return r && r.file ? r.file : null;
+        }
+        loadExtension(p) { return this.#need().loadExtension(p); }
+        enableLoadExtension(v) { if (!v) return undefined;
+          throw nodeErr("ERR_NOT_SUPPORTED", "enableLoadExtension is not supported"); }
+        get isOpen() { return this.#open; }
+        get isTransaction() { try { return !!this.#need().inTransaction; } catch (e) { return false; } }
+        [Symbol.dispose]() { if (this.#open) this.close(); }
+      }
+
+      M["node:sqlite"] = {
+        __esModule: true, DatabaseSync, StatementSync, constants,
+        default: { DatabaseSync, StatementSync, constants },
+      };
+    }
   }
   const timersPromises = {
     setTimeout: (ms, v) => new Promise((r) => G.setTimeout(() => r(v), ms)),

@@ -312,6 +312,26 @@
   // node's three-component shape: node's own test/common/crypto.js parses it with
   // /(?<m>\\d+)\\.(?<n>\\d+)\\.(?<p>\\d+)/ and dereferences `.groups` unguarded, so a
   // two-component "3.0" made every hasOpenSSL() caller die on `null.groups`.
+  // DO NOT add `sqlite: "3.45.1"` here on its own -- measured, and it is a wash.
+  //   compat/node/test/common/index.js:72
+  //     const hasSQLite = Boolean(process.versions.sqlite);
+  // Absent, so 22 files call common.skip('missing SQLite') and never run. Adding it
+  // IS truthful (the linked engine answers 3.45.1 to `select sqlite_version()`, and
+  // node:sqlite is now a real DatabaseSync/StatementSync shim -- see
+  // bootstrap.cppm), and it does unblock all 22. But measured: only **1** goes
+  // green (test-sqlite-timeout); 20 then fail on API this shim does not cover
+  // (backup(), createSession()/applyChangeset(), custom function()/aggregate(),
+  // typed-array binding, authz, limits); and it COSTS test-webstorage-without-sqlite,
+  // which exists to assert behaviour for a build WITHOUT sqlite. Net 0 green.
+  // Land it as one lane together with the missing StatementSync/DatabaseSync
+  // surface AND webstorage (localStorage/sessionStorage backed by sqlite, which
+  // hasSQLite also gates at common/index.js:392) -- then it is worth ~+15 rather
+  // than a wash. Sized in RESUME.md.
+  //
+  // Note what is deliberately NOT claimed here, because the same file gates on it:
+  // `process.features.inspector` and `process.features.quic` stay false, which is
+  // why 178 + 236 files correctly keep skipping -- mbun has neither subsystem, and
+  // flipping those booleans would make 414 files run and fail rather than progress.
   p.versions = { node: "26.3.0", bun: (globalThis.Bun && Bun.version) || "1.3.14", mbun: "2026.07.18.0", v8: "12.4.0", modules: "127", uv: "1.0", openssl: "3.1.5" };
   // bun mirrors Bun.revision onto process.revision (bun-test.test.ts asserts
   // process.revision === Bun.revision; verified against bun 1.3.14). Derived from

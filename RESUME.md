@@ -5,6 +5,69 @@ session that is interrupted (usage limit, crash, restart) can pick up from the
 file rather than from memory. **If you are a fresh session reading this, start
 here.**
 
+## 2026-07-31 02:00 — TWO detection gaps found, MEASURED, and both HELD. Read before re-attempting.
+
+Both came out of the self-skip inventory, both are truthful changes, and **both are
+a wash or worse on their own.** The measurement is the deliverable; do not re-derive
+it, and do not ship either flag alone.
+
+### `node:sqlite` — shim SHIPPED, detection flag HELD
+
+`node:sqlite` threw `ERR_UNKNOWN_BUILTIN_MODULE` while `bun:sqlite` worked
+completely. A real `DatabaseSync`/`StatementSync` shim over that implementation is
+now in `bootstrap.cppm` (variadic params, `run()` returning
+`{changes, lastInsertRowid}`, `columns()`, `location()`, `isOpen`,
+`ERR_INVALID_STATE` after close) and is verified working. It ships because it is
+additive and costs nothing.
+
+**The gate is `process.versions.sqlite`** (`common/index.js:72`
+`const hasSQLite = Boolean(process.versions.sqlite)`), and adding it is measured:
+
+| | result |
+| --- | --- |
+| 22 skipping files | **1 green** (`test-sqlite-timeout`), 20 fail, 1 still skips |
+| cost | **−1 green**: `test-webstorage-without-sqlite` exists to assert behaviour for a build WITHOUT sqlite |
+| net | **0 green** |
+
+The 20 fail on surface the shim deliberately does not cover: `backup()`,
+`createSession()`/`applyChangeset()`, custom `function()`/`aggregate()`,
+typed-array binding, authz, limits. And `hasSQLite` *also* gates webstorage at
+`common/index.js:392`, so the complete lane is **shim + the missing
+DatabaseSync/StatementSync surface + localStorage/sessionStorage backed by
+sqlite**. That is worth roughly +15 instead of a wash.
+
+### Intl — flag HELD pending UTS-46
+
+Same shape, recorded in full at the previous entry: the flag alone is **+7/−4**
+because with `hasIntl` true those files stop skipping IDNA paths, and the blocker
+is **UTS-46 validation, not punycode** (`fail⁇fail.com` gets *encoded* to
+`xn--failfail-803d.com` where node's `domainToASCII` returns `''`).
+
+### What the harness gates on, so nobody guesses again
+
+```
+common/index.js:70  hasInspector = Boolean(process.features.inspector)   -> 178 files
+common/index.js:71  hasSQLite    = Boolean(process.versions.sqlite)      ->  22 files
+common/index.js:72  hasFFI       = Boolean(process.config.variables.node_use_ffi)
+common/index.js:37  hasIntl      = !!process.config.variables.v8_enable_i18n_support -> 12 files
+common/index.js:74  hasQuic      = hasCrypto && !!process.features.quic  -> 236 files
+```
+
+**`features.inspector` and `features.quic` stay false, and that is correct.** mbun
+has neither subsystem, so flipping those two booleans would make **414 files run
+and fail** — a 9.3% swing in the fail column bought with zero real progress. They
+are capability projects, not detection gaps. Distinguishing the two is the whole
+point of this entry: `sqlite` and `i18n` are things mbun HAS and fails to declare;
+`quic` and `inspector` are things it does not have.
+
+### Discipline note
+
+Both flags were reverted after measuring rather than shipped for a net-positive-
+looking number. "Never trade a green file" is why, and it is worth restating that
+the temptation here was real: the sqlite flag alone produces a +1 headline and a
+−1 nobody would notice, and 20 skip→fail conversions that make the corpus look
+worse while being strictly more honest.
+
 ## 2026-07-31 00:30 — THE SELF-SKIP INVENTORY: 553 node files, and nobody had looked
 
 **A whole class was invisible because the loop was correct.** Self-skips are
