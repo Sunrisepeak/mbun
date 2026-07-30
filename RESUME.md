@@ -165,6 +165,62 @@ layout the package produces. Whoever owns the mcpp registry package owns this.
 build what CI builds. `mcpp build` alone is not equivalent to the CI matrix, and
 this session ran ~15 waves of integration on that weaker signal without noticing.
 
+### 2026-07-31 — REPRODUCED LOCALLY. It is a transitive-dependency bug, and the trigger is `modules/libarchive`.
+
+The section above says the fix is upstream. That still holds, but it stops short of
+the mechanism, and two more hypotheses have since been tested and **disproved**:
+
+- **Not the CI cache.** A run reporting `Cache not found for input keys: mcpp-v3-…`
+  — fully cold, nothing restored — failed identically on both toolchains. The
+  build-cache exclusion tried in `ci.yml` was reverted for this reason.
+- **Not the mcpp version.** The 14:25 run used `2026.7.30.2`, the 16:27 run used
+  `2026.7.30.3`; both failed. Local `2026.7.30.2` builds it fine. mcpp is now
+  **pinned** in `ci.yml` anyway, because an unpinned toolchain means CI inputs
+  change with no commit and a red run cannot be attributed to the diff that seems
+  to have caused it — which is exactly how this looked like a code regression.
+- **Not `--workspace` parallelism.** `cd modules/libarchive && mcpp build`, alone
+  and cold, reproduces it.
+
+**The minimal reproduction, and the real discriminator:**
+
+```
+cd modules/compress   && mcpp build      # PASSES — declares compat.zstd DIRECTLY
+cd modules/libarchive && mcpp build      # FAILS  — reaches zlib/zstd TRANSITIVELY
+                                         #          through compat.libarchive
+```
+
+A **directly declared** compat package is built and consumed with flat object
+names (`obj/xxhash.o`). A **transitively resolved** one is staged from the shared
+package cache under a nested path (`obj/compat_zstd/zstd-1.5.7/lib/common/xxhash.o`)
+that the package build never produces. Hence the error's real shape — visible only
+in the untruncated line, which is what misled the earlier cache diagnosis:
+
+```
+ninja: error: '<cache>/…/obj/compat_zstd/…/xxhash.o',
+      needed by 'obj/compat_zstd/…/xxhash.o', missing and no known rule to make it
+```
+
+**The object is needed by itself.** It is a stage/copy rule whose input is the
+cached absolute path and whose output is the same relative path, with no compile
+rule generated for the input.
+
+Inspecting the cache entry it fails on settles it: 26 objects present, `entry.json`
+valid, layout **flat** — while the consumer asks for **nested**. Producer and
+consumer disagree about the same entry.
+
+**A repo-side workaround was attempted and does NOT hold.** Declaring every backend
+directly in `modules/libarchive/mcpp.toml` (`zlib`, `zstd`, `bzip2`, `lz4`, `xz` —
+which libarchive genuinely links; its generated config sets `HAVE_LIBZ`,
+`HAVE_LIBZSTD` et al.) makes `modules/libarchive` build **cold and clean on its
+own**, but the full `mcpp build --workspace` still fails: two members resolve the
+same package to the same cache hash while disagreeing on layout, and the hash does
+not distinguish them. The change was reverted rather than left in place looking
+like a fix. Do not re-try it without solving the workspace case.
+
+`modules/libarchive` is the only member relying on transitive compat resolution,
+which is why this surfaced when it did and why every local `modules/compress` build
+kept passing.
+
 ## 2026-07-31 04:00 — The inspector IS a stub. Detection-gap vs capability-project, now MEASURED.
 
 The distinction that shaped the last two waves was a prediction; it is now a
