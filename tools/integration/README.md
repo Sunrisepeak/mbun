@@ -296,6 +296,7 @@ bash tools/integration/tests/test_reclaim_disk.sh
 bash tools/integration/tests/test_latency_probe.sh
 bash tools/integration/tests/test_wave_planner.sh
 bash tools/integration/tests/test_impact_gate.sh
+bash tools/integration/tests/test_safe_test.sh
 bash tools/integration/tests/test_check_struck.sh
 bash tools/integration/tests/test_tick_order_gate.sh
 bash benchmarks/tools/test-bench3.sh
