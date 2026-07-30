@@ -1607,8 +1607,28 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       // resolves via the proxy) without tripping the trap. Socket never
       // overrides `emit`, so this is identical for an ordinary socket.
       const emitOn = (...a) => EE.prototype.emit.apply(this, a);
-      // NB: 'error' is NOT emitted here any more -- it is deferred together with
-      // 'close' below, per node's emitErrorCloseNT. See that block.
+      // node's stream destroy(err) never emits 'error' in the caller's turn --
+      // _destroy defers emitErrorCloseNT. The observable difference only bites
+      // when NOBODY is listening yet: `sock.destroy(err); sock.once("error",
+      // ...)` (ws' abortHandshake is exactly that) attaches the handler one
+      // statement too late, so an inline emit becomes an uncaught exception
+      // instead of an observed event. Defer only that case.
+      //
+      // A full deferral was measured and reverted: it costs 4 green node files
+      // (test-http2-reset-flood / -max-invalid-frames / -invalid-last-stream-id
+      // and test-stream-pipeline), all of which drive a write loop off an
+      // already-attached 'error' listener and get an extra turn of writes into
+      // a destroyed socket. Sockets that already have a listener therefore keep
+      // mbun's existing inline timing.
+      // ref: node lib/internal/streams/destroy.js emitErrorCloseNT.
+      //
+      // The listener count is read through EE.prototype for the same reason as
+      // emitOn above: `this.listenerCount` is a property READ on what may be
+      // http2's session-socket Proxy, and that object is destroyed on purpose
+      // by test-http2-respond-with-file-connection-abort.
+      const deferErr = !!err && EE.prototype.listenerCount.call(this, "error") === 0;
+      if (err && !deferErr) emitOn("error", err);
+
       // end() was called but the queue never drained far enough for _flush to
       // publish 'finish' (a destroy landed first). end(cb) settles on 'finish',
       // so emitting it here is what keeps that callback from being dropped
@@ -1646,10 +1666,10 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       if (!this._closeEmitted) {
         this._closeEmitted = true;
         const emitErrClose = () => {
-          if (err) emitOn("error", err);
+          if (deferErr) emitOn("error", err);
           emitOn("close", !!err);
         };
-        if (err && G.process && typeof G.process.nextTick === "function") G.process.nextTick(emitErrClose);
+        if (deferErr && G.process && typeof G.process.nextTick === "function") G.process.nextTick(emitErrClose);
         else G.queueMicrotask(emitErrClose);
       }
       return this;
