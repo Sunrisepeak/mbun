@@ -2792,6 +2792,29 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
   };
   const getDefaultAutoSelectFamily = () => autoSelectFamilyDefault;
 
+  // process._getActiveHandles / getActiveResourcesInfo: report this module's live
+  // handles. `NET.items` is already the authoritative set — a Socket joins it in
+  // _adopt() and leaves in _destroy(), a Server joins on a successful listen and
+  // leaves on close — so this is a pure read of state net already maintains
+  // rather than a second registration pass free to drift from it. node names the
+  // libuv wrap types, and a unix-domain endpoint is a PipeWrap, not a TCP one
+  // (test-process-getactivehandles, test-process-getactiveresources-track-active-handles).
+  try {
+    const HT = G.__mbunHandleTrack;
+    if (HT && typeof HT.addProvider === "function") {
+      HT.addProvider(() => {
+        const out = [];
+        for (const it of NET.items) {
+          const isServer = it instanceof Server;
+          const isPipe = !!(it && (it._unixPath || (it._addr && it._addr.family === "unix")));
+          out.push([it, isServer ? (isPipe ? "PipeServerWrap" : "TCPServerWrap")
+                                 : (isPipe ? "PipeWrap" : "TCPSocketWrap")]);
+        }
+        return out;
+      });
+    }
+  } catch (e) {}
+
   def(["net"], Object.assign({}, M["net"] || {}, {
     Socket: SocketW, Stream: SocketW, Server: ServerW, BlockList,
     createServer: (o, cb) => new Server(o, cb),

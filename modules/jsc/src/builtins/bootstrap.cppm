@@ -2697,6 +2697,11 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       // a stdio array fell through to "invalid stdio option"
       // (test-child-process-validate-stdio). process.stdin already exposes 0.
       if (typeof strm.fd !== "number") { try { strm.fd = name === "stdout" ? 1 : 2; } catch (e) {} }
+      // node's stdout/stderr are Writables and report `writable === true` for the
+      // whole process lifetime; the native pair carried no such property, so
+      // `process.stdout.writable` read undefined (test-process-execve-throws
+      // checks it as its "the process survived a failed execve" probe).
+      if (typeof strm.writable !== "boolean") { try { strm.writable = true; } catch (e) {} }
       if (typeof strm.on === "function") continue;
       const ee = new EventEmitter();
       for (const k of ["on", "addListener", "prependListener", "once", "off", "removeListener",

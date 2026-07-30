@@ -578,6 +578,104 @@ JSValueRef proc_pty_resize_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::s
     }
     return JSValueMakeUndefined(ctx);
 }
+
+// ── proc.execve: replace THIS process image ──────────────────────────────────
+// node src/node_process_methods.cc Execve, driven by
+// lib/internal/process/per_thread.js execve(). The JS half does node's argument
+// validation; this half is the syscall plus the two things node inherits from
+// libuv and its permission model for free:
+//
+//   * the ChildProcess permission scope (node's THROW_IF_INSUFFICIENT_PERMISSIONS
+//     with PermissionScope::kChildProcess), so `--permission` without
+//     `--allow-child-process` refuses the exec with an ERR_ACCESS_DENIED that
+//     carries permission/resource — test-process-execve-permission-fail asserts
+//     all three.
+//
+//   * every inherited descriptor above stdio becoming CLOEXEC. node's fds are
+//     CLOEXEC because libuv opens them that way, so after a successful execve the
+//     listening socket is gone and the replacement image can bind the SAME port
+//     (test-process-execve-socket does exactly that). mbun's sockets are not
+//     CLOEXEC, so they are marked here.
+//
+//     Marked, never closed, and only after the target has been proven
+//     executable: execve can FAIL, and test-process-execve-throws requires the
+//     process to be fully intact afterwards — stdout writable, nextTick and
+//     setImmediate still firing. FD_CLOEXEC has no effect until an exec actually
+//     succeeds, so a failed execve leaves every descriptor usable.
+void execve_mark_cloexec_above_stdio() {
+#if defined(__linux__) && defined(SYS_close_range)
+#  if !defined(CLOSE_RANGE_CLOEXEC)
+#    define CLOSE_RANGE_CLOEXEC (1U << 2)
+#  endif
+    if (::syscall(SYS_close_range, 3u, ~0u, CLOSE_RANGE_CLOEXEC) == 0) return;
+#endif
+    // Fallback: walk the open descriptors. Deliberately NOT close_range_compat —
+    // its own fallback CLOSES fds, which would maim a process whose execve fails.
+    const long openMax{sysconf(_SC_OPEN_MAX)};
+    const int limit{static_cast<int>(openMax > 0 ? std::min<long>(openMax, 65536) : 1024)};
+    for (int fd{3}; fd < limit; ++fd) {
+        const int flags{fcntl(fd, F_GETFD)};
+        if (flags >= 0 && (flags & FD_CLOEXEC) == 0) (void)fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+    }
+}
+
+// node's ErrnoException(errno, "execve", nullptr, execPath): `errno` is the raw
+// POSITIVE errno here, not libuv's negated form (test-process-execve-throws
+// asserts `err.errno > 0`), alongside code/syscall/path.
+JSValueRef execve_throw_errno(JSContextRef ctx, JSValueRef* exc, int e, const std::string& path) {
+    const std::string code{fd_errno_code(e)};
+    const std::string msg{(code.empty() ? "E" + std::to_string(e) : code) + ": "
+                          + fd_errno_message(e) + ", execve '" + path + "'"};
+    JSValueRef m{make_string(ctx, msg)};
+    JSObjectRef err{JSObjectMakeError(ctx, 1, &m, nullptr)};
+    if (!code.empty()) set_prop(ctx, err, "code", make_string(ctx, code));
+    set_prop(ctx, err, "errno", JSValueMakeNumber(ctx, e));
+    set_prop(ctx, err, "syscall", make_string(ctx, "execve"));
+    set_prop(ctx, err, "path", make_string(ctx, path));
+    if (exc != nullptr) *exc = err;
+    return JSValueMakeUndefined(ctx);
+}
+
+// proc.execve(execPath, argv, env) — argv is the FULL argv (including argv[0]);
+// env is an array of "KEY=VALUE" strings, as node's JS layer builds it. Returns
+// only on failure.
+JSValueRef proc_execve_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                          const JSValueRef args[], JSValueRef* exc) {
+    const std::string path{fs_arg(ctx, argc, args, 0)};
+    if (permission_deny_scope(ctx, exc, mbun::permission::Scope::ChildProcess, path)) {
+        return JSValueMakeUndefined(ctx);
+    }
+    const auto readList{[&](std::size_t idx, std::vector<std::string>& out) {
+        if (argc <= idx || !JSValueIsArray(ctx, args[idx])) return;
+        JSObjectRef arr{JSValueToObject(ctx, args[idx], nullptr)};
+        JSStringRef lenKey{JSStringCreateWithUTF8CString("length")};
+        const double len{JSValueToNumber(ctx, JSObjectGetProperty(ctx, arr, lenKey, nullptr), nullptr)};
+        JSStringRelease(lenKey);
+        for (unsigned i = 0; i < static_cast<unsigned>(len); ++i) {
+            out.push_back(val_to_string(ctx, JSObjectGetPropertyAtIndex(ctx, arr, i, nullptr)));
+        }
+    }};
+    std::vector<std::string> argvStr;
+    readList(1, argvStr);
+    std::vector<std::string> envStr;
+    readList(2, envStr);
+    // Refuse BEFORE touching descriptors, so a doomed execve leaves the process
+    // whole. access(2) covers the cases the corpus exercises (missing file,
+    // non-executable, permission) and reports the errno execve itself would.
+    if (::access(path.c_str(), X_OK) != 0) return execve_throw_errno(ctx, exc, errno, path);
+    // node flushes stdio before handing the image over; buffered bytes would
+    // otherwise die with the old image.
+    std::fflush(nullptr);
+    execve_mark_cloexec_above_stdio();
+    std::vector<char*> cargv;
+    for (auto& a : argvStr) cargv.push_back(const_cast<char*>(a.c_str()));
+    cargv.push_back(nullptr);
+    std::vector<char*> cenv;
+    for (auto& e : envStr) cenv.push_back(const_cast<char*>(e.c_str()));
+    cenv.push_back(nullptr);
+    ::execve(path.c_str(), cargv.data(), cenv.data());
+    return execve_throw_errno(ctx, exc, errno, path);
+}
 #endif
 
 // Pure-JS implementations of the common node built-in modules, registered under

@@ -424,6 +424,11 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
           const out = [];
           for (let i = 0; i < activeTimeouts.size; i++) out.push("Timeout");
           for (let i = 0; i < activeImmediates.size; i++) out.push("Immediate");
+          // The other half of node's answer: libuv HANDLES (live sockets and
+          // servers). The registry lives on the global because its producer is
+          // node:net; see builtins/node_process_extra.cppm.
+          const HT = G.__mbunHandleTrack;
+          if (HT) for (const t of HT.types()) out.push(t);
           return out;
         };
       }

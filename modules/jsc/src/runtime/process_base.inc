@@ -846,6 +846,25 @@ JSValueRef proc_kill_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t 
     return JSValueMakeBoolean(ctx, false);
 }
 
+// proc.killErrno(pid, sig) → 0 on success, or libuv's NEGATIVE errno on failure.
+// This is the contract node's process._kill has (lib/internal/process/per_thread.js
+// turns a non-zero return into `new ErrnoException(err, 'kill')`), and the
+// distinction from proc.kill above is not cosmetic: `process.kill(pid, 987)` has
+// to report EINVAL, which a boolean cannot express — the boolean version reported
+// every failure as ESRCH.
+JSValueRef proc_kill_errno_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                              const JSValueRef args[], JSValueRef*) {
+#if !defined(_WIN32)
+    if (argc > 0) {
+        const pid_t pid{static_cast<pid_t>(JSValueToNumber(ctx, args[0], nullptr))};
+        const int sig{argc > 1 ? static_cast<int>(JSValueToNumber(ctx, args[1], nullptr)) : SIGTERM};
+        if (kill(pid, sig) == 0) return JSValueMakeNumber(ctx, 0);
+        return JSValueMakeNumber(ctx, -errno);
+    }
+#endif
+    return JSValueMakeNumber(ctx, -EINVAL);
+}
+
 // ── POSIX signal delivery to JS listeners ──────────────────────────────────
 // node/bun install a real handler for every signal that has a `process.on(SIG…)`
 // listener and drop back to SIG_DFL when the last one is removed. The handler
