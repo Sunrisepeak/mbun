@@ -482,6 +482,13 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
         // when init doesn't override. A Request built from another Request
         // inherits its mode via the init merge above.
         this.redirect = init.redirect || "follow";
+        // Request.cache / Request.mode (spec defaults "default" / "cors"). Both
+        // were absent, so `new Request(url, { cache: "no-store" }).cache` read
+        // undefined (issue 2993). Own enumerable properties, exactly like
+        // `redirect`, so the Object.assign merge above carries them through
+        // `new Request(request)` and clone() below forwards them explicitly.
+        this.cache = init.cache || "default";
+        this.mode = init.mode || "cors";
         this._used = false;
         const norm = G.__mbunNormalizeBody(init.body);
         const body = norm.body;
@@ -585,7 +592,8 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       // refcount a byte body).
       clone() {
         throwIfBodyUnusable(this._body, this._used, this.__st);   // spec step 1
-        const init = { method: this.method, headers: this.headers, signal: this.signal };
+        const init = { method: this.method, headers: this.headers, signal: this.signal,
+                       redirect: this.redirect, cache: this.cache, mode: this.mode };
         if (this._body !== undefined) return new G.Request(this.url, Object.assign({}, init, { body: this._body }));
         if (!isStream(this._stream)) return new G.Request(this.url, init);
         const [mine, theirs] = this._stream.tee();

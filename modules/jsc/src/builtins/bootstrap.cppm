@@ -4491,7 +4491,29 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   def(["readline/promises"], { createInterface: readlineMod.createInterface });
   // node global alias + node:stream/web (WHATWG stream classes as a module)
   if (typeof G.global === "undefined") G.global = G;
-  def(["stream/web"], { get ReadableStream() { return G.ReadableStream; }, get WritableStream() { return G.WritableStream; }, get TransformStream() { return G.TransformStream; }, get TextEncoderStream() { return G.TextEncoderStream; }, get TextDecoderStream() { return G.TextDecoderStream; }, get ByteLengthQueuingStrategy() { return G.ByteLengthQueuingStrategy || class {}; }, get CountQueuingStrategy() { return G.CountQueuingStrategy || class {}; } });
+  // node's stream/web.js re-exports the WHATWG globals verbatim (all 17 of
+  // them); exporting only a subset made `require("node:stream/web").X`
+  // undefined for classes that already exist on globalThis, so
+  // `x instanceof ReadableStreamBYOBReader` threw "Right hand side of
+  // instanceof is not an object" (issue 29225). Each name is a live getter so
+  // the module tracks a later global replacement, exactly like node's binding.
+  {
+    const webStreamMod = {};
+    for (const name of [
+      "ReadableStream", "ReadableStreamDefaultReader", "ReadableStreamBYOBReader",
+      "ReadableStreamBYOBRequest", "ReadableByteStreamController",
+      "ReadableStreamDefaultController", "TransformStream",
+      "TransformStreamDefaultController", "WritableStream",
+      "WritableStreamDefaultWriter", "WritableStreamDefaultController",
+      "ByteLengthQueuingStrategy", "CountQueuingStrategy", "TextEncoderStream",
+      "TextDecoderStream", "CompressionStream", "DecompressionStream",
+    ]) {
+      Object.defineProperty(webStreamMod, name, {
+        get() { return G[name]; }, enumerable: true, configurable: true,
+      });
+    }
+    def(["stream/web"], webStreamMod);
+  }
   // ---- async_hooks (synchronous AsyncLocalStorage — correct under a single call
   // stack; no continuation propagation across the virtual-timer loop) ----
   class AsyncLocalStorage {
@@ -4729,6 +4751,25 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     };
     expectStub.extend = () => {}; expectStub.any = (c) => ({ __any: c }); expectStub.anything = () => ({});
     const hook = () => {};
+    // `mock` is callable outside `bun test`, and so is `mock.module`: bun installs
+    // the same module-override hook on the bun:test namespace regardless of the
+    // runner, and a plain `bun run` script that calls it used to die with
+    // "mock.module is not a function" (issue 11664). The override lands in the
+    // same registry the runner's mock.module writes to, so the module loader
+    // honours it identically in both modes.
+    const runModeMock = (i) => i || (() => {});
+    runModeMock.module = function (name, factory) {
+      try {
+        const mod = factory();
+        G.__mbunNativeModules = G.__mbunNativeModules || {};
+        const value = (mod && mod.default !== undefined && Object.keys(mod).length === 1) ? mod.default : mod;
+        G.__mbunNativeModules[name] = value;
+        G.__mbunNativeModules["node:" + name] = value;
+      } catch (e) {}
+    };
+    runModeMock.restore = () => {};
+    runModeMock.clearAllMocks = () => {};
+    runModeMock.restoreAllMocks = () => {};
     // setSystemTime IS live outside `bun test` (bun installs the native
     // JSMock__jsSetSystemTime on the module regardless of the runner) — issue
     // 32793 pins the clock from `bun -e`. The Date patch is installed lazily on
@@ -4754,7 +4795,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       get() { return G.__mbunBT || { test: noop, it: noop, xit: noop.skip, xtest: noop.skip,
         describe: desc, xdescribe: desc, expect: expectStub,
         jest: { fn: (i) => i || (() => {}), setSystemTime: (v) => { setSystemTime(v); } },
-        mock: (i) => i || (() => {}), spyOn: () => ({ mockRestore() {} }),
+        mock: runModeMock, spyOn: () => ({ mockRestore() {} }),
         setSystemTime: setSystemTime,
         beforeAll: hook, afterAll: hook, beforeEach: hook, afterEach: hook, setDefaultTimeout: hook }; } });
   }

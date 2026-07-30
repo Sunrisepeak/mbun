@@ -875,6 +875,14 @@
         (groups === undefined ? "undefined" : typeof groups));
       e.code = "ERR_INVALID_ARG_TYPE"; throw e;
     }
+    // A Proxy passes IsArray but is not a JSArray; bun's setgroups needs a real
+    // one and rejects the Proxy with a TypeError instead of reading through the
+    // traps (regression/issue/isArray-proxy-crash). Reaching the syscall instead
+    // surfaced a plain EPERM Error, which is not a TypeError.
+    if (globalThis.__mbunProxyRegistry && globalThis.__mbunProxyRegistry.has(groups)) {
+      const e = new TypeError('The "groups" argument must be an instance of Array. Received an instance of Proxy');
+      e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+    }
     for (let i = 0; i < groups.length; ++i) {
       const group = groups[i];
       if (typeof group !== "number" && typeof group !== "string") throw credentialType("groups[" + i + "]", group);

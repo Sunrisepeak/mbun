@@ -695,8 +695,19 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
 
   function compileFunction(code, params, options) {
     options = options || {};
+    // A Proxy passes IsArray but is not a JSArray; bun's compileFunction requires
+    // a real one for `params` and `contextExtensions` and throws rather than
+    // reading through the traps (regression/issue/isArray-proxy-crash).
+    const PR = G.__mbunProxyRegistry;
+    if (PR && params !== null && typeof params === "object" && PR.has(params)) {
+      throw argTypeError("params", "an Array of strings");
+    }
     const importModuleDynamically =
       validateImportModuleDynamically(options.importModuleDynamically);
+    if (PR && options.contextExtensions !== null && typeof options.contextExtensions === "object"
+        && PR.has(options.contextExtensions)) {
+      throw argTypeError("options.contextExtensions", "an Array of objects");
+    }
     const args = Array.isArray(params) ? params.slice() : [];
     const pc = options.parsingContext;
     let FunctionCtor;

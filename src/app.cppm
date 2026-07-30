@@ -914,6 +914,7 @@ int run_test(std::span<const std::string_view> args) {
 
     const auto started { std::chrono::steady_clock::now() };
     int pass { 0 }, fail { 0 }, skip { 0 }, todo { 0 }, errors { 0 }, expectCalls { 0 };
+    int snapTotal { 0 }, snapAdded { 0 };
     int skippedLabel { 0 };  // tests dropped by -t/--test-name-pattern (jest.rs:282)
 
     // The label filter (-t/--test-name-pattern/--grep), forwarded to each file.
@@ -963,6 +964,8 @@ int run_test(std::span<const std::string_view> args) {
         todo += r.todo;
         errors += r.errors;
         expectCalls += r.expect_calls;
+        snapTotal += r.snap_total;
+        snapAdded += r.snap_added;
         skippedLabel += r.skipped_label;
     }
 
@@ -981,6 +984,16 @@ int run_test(std::span<const std::string_view> args) {
     if (todo > 0) std::println(std::cerr, " {} todo", todo);
     std::println(std::cerr, " {} fail", fail);
     if (errors > 0) std::println(std::cerr, " {} error{}", errors, errors == 1 ? "" : "s");
+    // Snapshot tally, between the error count and the expect() calls line
+    // (test_command.rs:2847-2890). Only the "something changed" branch is
+    // emitted: bun's other branch REPLACES the expect() calls line with
+    // "N snapshots, M expect() calls" when nothing was added, and reproducing
+    // that would rewrite the summary of every already-passing snapshot suite.
+    // Without this line a first run (which writes the .snap) was
+    // indistinguishable from a re-run against it (issue 14029).
+    if (snapTotal > 0 && snapAdded > 0) {
+        std::println(std::cerr, "snapshots: +{} added", snapAdded);
+    }
     if (expectCalls > 0) std::println(std::cerr, " {} expect() calls", expectCalls);
     std::println(std::cerr, "Ran {} test{} across {} file{}. [{:.2f}ms]", pass + fail + skip + todo,
                  (pass + fail + skip + todo) == 1 ? "" : "s", files.size(),
@@ -2029,7 +2042,30 @@ struct RunFlags {
     // `--workspaces`: "Run a script in all workspace packages" (Arguments.rs:336
     // → ctx.workspaces at Arguments.rs:809).
     bool workspaces{false};
+    // `--filter <pattern>` / `-F <pattern>`: "Run a script in all workspace
+    // packages matching the pattern" (Arguments.rs:325 → filter_run.rs). Like
+    // `--workspaces` it fans the script out over the workspace members, but only
+    // over those whose package NAME matches one of the patterns.
+    std::vector<std::string> workspaceFilters{};
 };
+
+// A `--filter` pattern matched against a workspace package name. bun's filter
+// engine accepts glob syntax; `*` (any run of characters, including none) is the
+// only metacharacter the run-side filters use in practice, so this is a plain
+// wildcard matcher rather than a full glob.
+bool filter_pattern_matches(std::string_view pattern, std::string_view name) {
+    if (pattern.empty()) return name.empty();
+    // Iterative backtracking wildcard match — no recursion, no allocation.
+    std::size_t p{0}, n{0}, starP{std::string_view::npos}, starN{0};
+    while (n < name.size()) {
+        if (p < pattern.size() && (pattern[p] == name[n])) { ++p; ++n; continue; }
+        if (p < pattern.size() && pattern[p] == '*') { starP = p++; starN = n; continue; }
+        if (starP != std::string_view::npos) { p = starP + 1; n = ++starN; continue; }
+        return false;
+    }
+    while (p < pattern.size() && pattern[p] == '*') ++p;
+    return p == pattern.size();
+}
 
 // `--cwd <STR>`: "Absolute path to resolve files & entry points from. This just
 // changes the process' cwd." (Arguments.rs:120). bun joins it onto the current
@@ -2309,7 +2345,15 @@ int exec_run_workspaces(std::string_view target, std::span<const std::string_vie
     for (const auto& member : members) {
         const std::filesystem::path dir{root / member.relPath};
         // multi_run.rs:885 — the root package is excluded under --workspaces.
-        if (std::filesystem::equivalent(dir, root, ec)) continue;
+        // Under `--filter` the root is a candidate like any other member: the
+        // pattern decides (filter_run.rs matches every package by name).
+        if (flags.workspaceFilters.empty() && std::filesystem::equivalent(dir, root, ec)) continue;
+        if (!flags.workspaceFilters.empty() &&
+            !std::ranges::any_of(flags.workspaceFilters, [&](const std::string& pattern) {
+                return filter_pattern_matches(pattern, member.name);
+            })) {
+            continue;
+        }
         run::PackageScripts pkg{run::load_nearest_package_scripts(dir)};
         if (!pkg.found || pkg.packageJsonDir != dir || pkg.find(target) == nullptr) continue;
         std::filesystem::current_path(dir, ec);

@@ -764,6 +764,11 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
     if (typeof proc.setgroups !== "function") {
       proc.setgroups = function setgroups(groups) {
         if (!Array.isArray(groups)) throw errInvalidArgType("groups", "Array", groups);
+        // A Proxy passes IsArray but is not a JSArray, and bun's setgroups needs a
+        // real one — it rejects the Proxy with a TypeError rather than reading
+        // through the traps (regression/issue/isArray-proxy-crash). Reaching the
+        // syscall instead surfaced EPERM, which is not a TypeError.
+        if (G.__mbunProxyRegistry && G.__mbunProxyRegistry.has(groups)) throw errInvalidArgType("groups", "Array", groups);
         for (let i = 0; i < groups.length; i++) {
           const g = groups[i];             // accessor getters run here and may throw
           if (typeof g !== "number" || !Number.isInteger(g) || g < 0) {

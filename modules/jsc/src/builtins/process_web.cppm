@@ -560,7 +560,14 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     while (stdio.length < 3) stdio.push("pipe");
     // "ipc" survives to the native layer, which opens an AF_UNIX socketpair for
     // that slot (node's fork channel); everything else maps to a plain pipe.
-    return stdio.map((s) => (s == null ? "pipe" : typeof s === "number" ? s : s === "overlapped" ? "pipe" : s));
+    // A stream/handle carrying a numeric `fd` is a {type:'fd'} slot in node
+    // (internal/child_process.js getValidStdio: `typeof stdio.fd === 'number'`),
+    // so `stdio: [..., process.stderr, ...]` must dup that descriptor rather
+    // than fall through to a pipe. Falling through captured output node never
+    // captures and left `result.stdout` a string where node reports null
+    // (issue 20321, the AWS CDK pattern).
+    return stdio.map((s) => (s == null ? "pipe" : typeof s === "number" ? s : s === "overlapped" ? "pipe"
+      : (typeof s === "object" && typeof s.fd === "number") ? s.fd : s));
   };
 
   // node internal/child_process.js resolves the 'child_process' channel and the
@@ -1003,6 +1010,13 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     if (out.env == null || typeof out.env !== "object") {
       const pe = G.process && G.process.env;
       if (pe && typeof pe === "object") out.env = pe;
+    }
+    // The sync spawner does not go through normStdio, so resolve the one shape it
+    // cannot read here: a stream/handle with a numeric `fd` is node's
+    // {type:'fd'} slot (issue 20321). Everything else is passed through exactly
+    // as given so the native layer keeps owning 'pipe'/'inherit'/'ignore'.
+    if (Array.isArray(out.stdio)) {
+      out.stdio = out.stdio.map((s) => (s != null && typeof s === "object" && typeof s.fd === "number") ? s.fd : s);
     }
     if (o != null && o.timeout != null && o.timeout > 0) {
       out.timeoutMs = o.timeout;
@@ -3541,7 +3555,14 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
           }
         }
         const FD = G.__mbunFdNative;
-        const fd = FD.open(target, "w", 0o666);
+        // `{ mode }` (bun BunObject.rs write → node_fs WriteFile.mode) sets the
+        // destination's permissions. It was dropped entirely, so every
+        // Bun.write() produced 0o666 & ~umask (issue 25903). open(2)'s mode only
+        // applies when the file is CREATED, so an explicit mode is also chmod'd
+        // afterwards — otherwise overwriting an existing file kept its old bits.
+        const wantMode = (opts && opts.mode != null && Number.isFinite(Number(opts.mode)))
+          ? (Number(opts.mode) & 0o7777) : null;
+        const fd = FD.open(target, "w", wantMode === null ? 0o666 : wantMode);
         let total = 0;
         try {
           for (const c of chunks) {
@@ -3554,6 +3575,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
             total += off;
           }
         } finally { FD.close(fd); }
+        if (wantMode !== null) { try { F.chmod(target, wantMode); } catch (e) {} }
         return total;
       };
       const isBlob = (v) => !!(v && G.Blob && v instanceof G.Blob);
