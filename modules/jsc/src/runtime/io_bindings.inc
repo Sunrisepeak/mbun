@@ -1952,6 +1952,36 @@ JSC_DEFINE_HOST_FUNCTION(fdn_ftruncate_host, (JSC::JSGlobalObject* global, JSC::
 #endif
 }
 
+// bun:internal-for-testing memfd_create(size) → fd. An anonymous memory-backed
+// regular file of `size` bytes, adopted into the virtual fd table so writeSync /
+// readFileSync / closeSync take it like any other fd.
+//
+// The point of a memfd is that it is a REGULAR file with a real st_size (unlike
+// /dev/zero, which reports 0), so fs.readFileSync can be made to size an
+// allocation from it and hit the synthetic allocation limit — that is what
+// node/fs/fs-oom.test.ts uses it for. Linux only, exactly as in bun.
+JSC_DEFINE_HOST_FUNCTION(memfd_create_host, (JSC::JSGlobalObject* global, JSC::CallFrame* frame)) {
+#if defined(__linux__) && defined(__NR_memfd_create)
+    const double size{frame->argumentCount() > 0 ? fd_num(global, frame->argument(0)) : 0.0};
+    const long raw{::syscall(__NR_memfd_create, "mbun-test", 0)};
+    if (raw < 0) return fd_throw_errno_nopath(global, errno, "memfd_create");
+    const int native{static_cast<int>(raw)};
+    if (size > 0.0 && ::ftruncate(native, static_cast<off_t>(size)) != 0) {
+        const int err{errno};
+        (void)::close(native);
+        return fd_throw_errno_nopath(global, err, "ftruncate");
+    }
+    auto& tbl{fd_table()};
+    int fd{1000};
+    while (tbl.contains(fd)) ++fd;
+    tbl.emplace(fd, mbun::core::io::File::adopt(native));
+    return JSC::JSValue::encode(JSC::jsNumber(fd));
+#else
+    (void)frame;
+    return fd_throw(global, "ENOSYS: memfd_create is only supported on Linux");
+#endif
+}
+
 // bun:internal-for-testing createSocketPair() → [readFd, writeFd]. A connected
 // AF_UNIX SOCK_STREAM pair, both non-blocking and adopted into the virtual fd
 // table so FileSink (writer) and the streaming reader can drive real socket

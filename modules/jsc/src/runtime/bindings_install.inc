@@ -416,6 +416,24 @@
     _tickQ.push([cb, a]);
     if (!_tickArmed) {
       _tickArmed = true;
+      // The tick drain is armed with a PROMISE REACTION, and the engine
+      // snapshots the AsyncLocalStorage frame into every reaction it queues
+      // (JSGlobalObject::m_asyncContextData; see core_bindings.inc). Arming
+      // from inside als.run() therefore made the drain reaction carry that
+      // run's frame and LEAVE it installed when it returned -- the frame then
+      // leaked into everything later in the same microtask turn, including an
+      // `await` continuation whose own snapshot was empty. Observable as
+      //   als.run("v", () => process.nextTick(f)); await 1; als.getStore()
+      // reporting "v" outside the run.
+      //
+      // The drain is internal scheduling and must be context-transparent, so
+      // register it with the frame cleared (the reaction then carries nothing)
+      // and put the caller's frame back immediately. Each queued callback still
+      // carries its OWN captured frame via __mbunSchedHook.
+      const _ac = globalThis.__mbunAsyncContextNative;
+      const _acPrev = _ac !== undefined && _ac !== null ? _ac.get() : undefined;
+      if (_acPrev !== undefined) _ac.set(undefined);
+      try {
       _pthen.call(_presolve(), function () {
         // node's arm is `runMicrotasks(); <tick loop>` — the microtask queue is
         // EXHAUSTED before the tick queue is touched. This reaction is queued at
@@ -432,11 +450,23 @@
         // pushed by one of the microtasks drained here then arms NO second
         // reaction inside this one: a promise chain that ticks once per link
         // would otherwise nest one native drain per link and exhaust the stack.
-        const d = globalThis.__mbunRunMicrotasksNative;
-        if (d !== undefined) d();
-        _tickArmed = false;
-        runTicks();
+        // Whatever the frame is on entry is the frame the turn had before this
+        // reaction (the reaction itself carries none, by construction above);
+        // restore it so the drain leaves the turn exactly as it found it.
+        const ac = globalThis.__mbunAsyncContextNative;
+        const entry = ac !== undefined && ac !== null ? ac.get() : undefined;
+        try {
+          const d = globalThis.__mbunRunMicrotasksNative;
+          if (d !== undefined) d();
+          _tickArmed = false;
+          runTicks();
+        } finally {
+          if (ac !== undefined && ac !== null && ac.get() !== entry) ac.set(entry);
+        }
       });
+      } finally {
+        if (_acPrev !== undefined) _ac.set(_acPrev);
+      }
     }
   };
   const nanos = () => (globalThis.Bun && Bun.nanoseconds ? Bun.nanoseconds() : 0);
@@ -666,18 +696,45 @@
         // the documented `Bun.gc(true)` in afterEach to reclaim it (bun's own
         // js/web/fetch/blob-oom.test.ts) grew monotonically until the process was
         // OOM-killed — every one of its OOM *guards* fired correctly, nothing
-        // ever freed the bytes. JSGarbageCollect is JSC's full collect+sweep.
+        // ever freed the bytes.
+        //
+        // SHARED SURFACE: this is the GC every leak/finalizer test in both
+        // corpora drives.
+        //
+        // The forced form must be a REAL synchronous collection. The comment
+        // that used to sit here said "JSGarbageCollect is JSC's full
+        // collect+sweep" -- it is not. JSGarbageCollect() is
+        //   VM& vm = ...; JSLockHolder locker(vm); vm.heap.reportAbandonedObjectGraph();
+        // i.e. a HINT to the activity-based collector, which may never run.
+        // Measured consequence: a WeakRef to an unreachable object never cleared
+        // and a FinalizationRegistry callback never fired, after 50 consecutive
+        // `Bun.gc(true)` calls. Any test that waits for a finalizer therefore
+        // spun forever (js/node/util/test-aborted.test.ts wedges on exactly that
+        // loop). collectNow(Sync, Full) is what JSC's own
+        // JSSynchronousGarbageCollectForDebugging does, and
+        // finalizeSynchronousJSExecution() bumps the weak-ref version so
+        // WeakRef.deref() stops reporting a dead target as live.
+        //
+        // The UNFORCED form deliberately stays a hint: bun's `Bun.gc()` is
+        // collect_async (VirtualMachine.rs), and leak tests call it thousands of
+        // times inside a loop (js/web/request/request-clone-leak: 2000x per
+        // test), where a synchronous collection each time is pure cost.
         set_fn(ctx_, global, "__mbunGcNative",
                [](JSContextRef c, JSObjectRef, JSObjectRef, std::size_t n, const JSValueRef a[],
                   JSValueRef*) -> JSValueRef {
-                   JSGarbageCollect(c);
-                   // Only the *forced* form scavenges. bmalloc's scavenge walks
-                   // every free range; leak tests call the unforced `Bun.gc()`
-                   // thousands of times inside a loop (js/web/request/
-                   // request-clone-leak does it 2000x per test), and doing a
-                   // full scavenge there is pure overhead — bun's unforced form
-                   // is `collect_async`, a hint (VirtualMachine.rs).
-                   if (n < 1 || !JSValueToBoolean(c, a[0])) return JSValueMakeNumber(c, 0);
+                   const bool force{n >= 1 && JSValueToBoolean(c, a[0])};
+                   if (!force) {
+                       JSGarbageCollect(c);
+                       return JSValueMakeNumber(c, 0);
+                   }
+                   if (JSC::JSGlobalObject* g{toJS(c)}; g != nullptr) {
+                       JSC::VM& vm{JSC::getVM(g)};
+                       JSC::JSLockHolder locker{vm};
+                       vm.heap.collectNow(JSC::Synchronousness::Sync, JSC::CollectionScope::Full);
+                       vm.finalizeSynchronousJSExecution();
+                   } else {
+                       JSGarbageCollect(c);
+                   }
                    // Collecting alone is not enough: bmalloc caches the freed
                    // large blocks, so a suite that churns hundreds of MB per
                    // test keeps every one of them resident and still hits the
@@ -734,6 +791,16 @@
                    }
                    return JSValueMakeUndefined(c);
                });
+        // SHARED SURFACE: the AsyncLocalStorage frame slot. Backed by the
+        // engine's own m_asyncContextData tuple so JSC's promise/await
+        // snapshot+restore carries the store across `await` — see
+        // core_bindings.inc. `enable()` is called by the AsyncLocalStorage
+        // constructor, so a program that never uses ALS pays nothing.
+        JSObjectRef asyncCtx{JSObjectMake(ctx_, nullptr, nullptr)};
+        set_native_fn(ctx_, asyncCtx, "enable", 0, async_context_enable_host);
+        set_native_fn(ctx_, asyncCtx, "get", 0, async_context_get_host);
+        set_native_fn(ctx_, asyncCtx, "set", 1, async_context_set_host);
+        set_prop(ctx_, global, "__mbunAsyncContextNative", asyncCtx);
         // JSC backing-width introspection used only by bun:internal-for-testing.
         JSObjectRef jscInternals{JSObjectMake(ctx_, nullptr, nullptr)};
         set_native_fn(ctx_, jscInternals, "isUTF16String", 1, is_utf16_string_host);
@@ -759,6 +826,8 @@
         set_prop(ctx_, global, "__mbunFdNative", fdn);
         // bun:internal-for-testing createSocketPair() → [readFd, writeFd].
         set_native_fn(ctx_, global, "__mbunCreateSocketPair", 0, create_socket_pair_host);
+        // bun:internal-for-testing memfd_create(size) → fd (Linux memfd).
+        set_native_fn(ctx_, global, "__mbunMemfdCreate", 1, memfd_create_host);
         // Native shell parser for bun:internal-for-testing shellInternals.
         JSObjectRef shn{JSObjectMake(ctx_, nullptr, nullptr)};
         set_fn(ctx_, shn, "parse", shell_parse_cb);

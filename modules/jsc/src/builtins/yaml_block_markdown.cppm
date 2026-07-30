@@ -2768,6 +2768,13 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
       if (typeof G.__mbunCreateSocketPair !== "function") throw new Error("createSocketPair is not supported on this platform");
       return G.__mbunCreateSocketPair();
     };
+    // memfd_create(size) → fd: an anonymous memory-backed REGULAR file, so
+    // fs.readFileSync sees a real st_size (which /dev/zero cannot provide) and
+    // the synthetic allocation limit can be driven deterministically. Linux only.
+    M["bun:internal-for-testing"].memfd_create = (size) => {
+      if (typeof G.__mbunMemfdCreate !== "function") throw new Error("memfd_create is not supported on this platform");
+      return G.__mbunMemfdCreate(size);
+    };
     // fileSinkInternals.liveCount(): live FileSink count (JS-tracked on a global
     // by the Bun.file(...).writer() factory).
     M["bun:internal-for-testing"].fileSinkInternals = { liveCount: () => (G.__mbunFileSinkLive ? G.__mbunFileSinkLive.n : 0) };

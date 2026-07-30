@@ -4642,6 +4642,21 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   };
   M["bun:internal-for-testing"] = {
     isASANEnabled: () => false,
+    // process.on("memoryPressure") is a Bun extension. Real OS pressure cannot
+    // be induced reliably (Linux PSI triggers need CAP_SYS_RESOURCE before
+    // 6.6), so bun exposes the emit path itself for testing:
+    //   emitMemoryPressure(level)            -> deliver one synthetic event
+    //   isMemoryPressureWatcherInstalled()   -> is the watcher armed?
+    // The watcher's lifetime is exactly "process has at least one
+    // memoryPressure listener": bun arms it on the first listener and disarms
+    // on the last removal, so listenerCount IS the armed state, and an emit
+    // with nothing listening is a no-op rather than an unhandled event.
+    emitMemoryPressure: (level) => {
+      if (G.process && G.process.listenerCount("memoryPressure") > 0)
+        G.process.emit("memoryPressure", level);
+    },
+    isMemoryPressureWatcherInstalled: () =>
+      !!G.process && G.process.listenerCount("memoryPressure") > 0,
     // canonicalizeIP (src/js/internal-for-testing.ts:16 → NodeTLS.cpp
     // Bun__canonicalizeIP): inet_pton/inet_ntop round trip; undefined for a
     // non-IP literal or a CIDR. Same native the node:tls IP-SAN check uses.

@@ -10,14 +10,43 @@ inline constexpr std::string_view kAsyncHooksJS = R"JS(
   // ---- async_hooks / AsyncLocalStorage ----
   // Bun stores an immutable [storage, value, ...] frame and snapshots it when
   // an async callback is registered. The Bun-patched JSC also snapshots native
-  // Promise/await reactions. A bare C-API global lacks that private intrinsic,
-  // so this layer covers every callback boundary exposed by mbun's JS runtime;
-  // native async-function continuation tracking remains an engine seam.
+  // Promise/await reactions, and THIS BUILD'S PREBUILT JSC IS THAT FORK: the
+  // engine keeps the live frame in JSGlobalObject::m_asyncContextData, snapshots
+  // it when a promise reaction is registered, and restores it before running the
+  // reaction. So the frame must live in the engine's slot, not in a JS closure
+  // variable: the JS wrappers below cover `.then`, queueMicrotask and the
+  // timers, but an async function's continuation after `await` is scheduled and
+  // dispatched entirely inside the engine, where no JS wrapper can reach it.
+  // (The previous note here claimed that was "an engine seam" and unreachable.
+  // It is reachable — __mbunAsyncContextNative in runtime/core_bindings.inc.)
+  //
+  // The engine slot is adopted lazily, on the first AsyncLocalStorage, exactly
+  // as bun enables tracking; until then the JS variable below is authoritative
+  // and costs nothing, which keeps callback registration on its current hot path
+  // for every program that never uses ALS.
   let asyncContext;
+  let engineContext = null;
   const kAsyncFrame = Symbol("mbun.asyncContextFrame");
 
-  const contextGet = () => asyncContext;
-  const contextSet = (value) => { asyncContext = value; };
+  const contextGet = () => (engineContext !== null ? engineContext.get() : asyncContext);
+  const contextSet = (value) => {
+    if (engineContext !== null) engineContext.set(value); else asyncContext = value;
+  };
+  // Adopt the engine slot. Idempotent, and a no-op on a realm whose tuple was
+  // never installed (the native reports that), so the JS fallback stays live
+  // rather than stores vanishing.
+  const adoptEngineContext = () => {
+    if (engineContext !== null) return;
+    const N = G.__mbunAsyncContextNative;
+    if (!N || typeof N.enable !== "function") return;
+    let ok = false;
+    try { ok = N.enable() === true; } catch (e) { ok = false; }
+    if (!ok) return;
+    // Carry whatever the JS fallback was holding into the engine slot so a
+    // frame established before the first ALS is not dropped mid-flight.
+    try { if (asyncContext !== undefined) N.set(asyncContext); } catch (e) {}
+    engineContext = N;
+  };
   const contextIndex = (context, storage) => {
     if (!context) return -1;
     for (let i = 0; i < context.length; i += 2) if (context[i] === storage) return i;
@@ -176,6 +205,10 @@ inline constexpr std::string_view kAsyncHooksJS = R"JS(
     #defaultValue = undefined;
 
     constructor(options) {
+      // Hand the frame over to the engine here (bun does the same on the first
+      // AsyncLocalStorage): from now on `await` propagates the store, because
+      // JSC snapshots and restores its own slot around promise reactions.
+      adoptEngineContext();
       if (options !== null && options !== undefined && typeof options === "object") {
         this.#defaultValue = options.defaultValue;
       }
