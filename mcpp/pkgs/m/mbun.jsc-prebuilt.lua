@@ -92,6 +92,22 @@ package = {
                 -- 翻译成其配置的 C++ 标准库（libc++），根本到不了链接器；
                 -- -l: 显式档案名直达 ld/lld，且强制静态。
                 "-l:libstdc++.a",
+                -- napi addons are dlopen'd .node shared objects that resolve
+                -- `napi_*` against the HOST executable's DYNAMIC symbol table.
+                -- mbun implements 241 napi entry points
+                -- (modules/jsc/src/runtime/napi/), but a default link publishes
+                -- only the 6 symbols glibc forces out, so every addon died in
+                -- the loader with "undefined symbol: napi_define_properties".
+                -- That is what struck.tsv's `napi/node-napi-tests BLOCKED` row
+                -- measured -- a LINK flag, not a missing implementation.
+                --
+                -- It lives HERE, in the xpkg, because mcpp builds `ldflags`
+                -- solely from registry packages: the root mcpp.toml has
+                -- declared `ldflags = ["-Wl,--export-dynamic"]` since before
+                -- this lane and it never reached the link line (verified
+                -- against the generated build.ninja), and neither does a path
+                -- member's `[package].ldflags`.
+                "-Wl,--export-dynamic",
             },
         },
         -- macosx/windows：xpm 产物 URL/sha256 已就位；链接参数按产物 lib/ 实际
