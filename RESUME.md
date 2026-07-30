@@ -5,6 +5,51 @@ session that is interrupted (usage limit, crash, restart) can pick up from the
 file rather than from memory. **If you are a fresh session reading this, start
 here.**
 
+## 2026-07-30 22:00 — FIVE FALSE COMMENTS. Distrusting comments is now the single highest-yield habit.
+
+This is no longer an anecdote, it is the pattern. Every one of these blocked real
+files, and in each case the comment asserted a state of the world that a
+five-minute probe disproved:
+
+| comment claimed | reality | cost of believing it |
+| --- | --- | ---: |
+| `zlib_stream.cppm`: "mbun's base Transform is a stub whose write()/end() do NOT drive the pipeline" | it had been replaced by a faithful port long before; the hand-rolled layer was *shadowing* the real state machine | **9 files** |
+| `node_internal_binding.cppm:2062` + `js_net.cppm:3043`: HTTPParser wiring fixed (past tense) | both false; `internalBinding('http_parser')` returned a stub whose `execute()` threw while the real incremental parser sat unreachable | **6 files** |
+| `async_hooks.cppm`: `await` context propagation is "an engine seam" | this prebuilt WebKit is Bun's fork with `USE(BUN_JSC_ADDITIONS)=1` and already snapshots/restores `JSGlobalObject::m_asyncContextData` around promise reactions | ALS `await` propagation |
+| `bun:jsc` native: "JSGarbageCollect is JSC's full collect+sweep" | it only calls `reportAbandonedObjectGraph()` — a *hint*. And `Bun.gc` itself was `() => {}` | every forced-collection test, incl. a phantom `test-weakref` regression |
+| `webcrypto.cppm`: CryptoKey's mutable metadata copies are deliberate | **this one was TRUE and I overrode it** — see below | 1 file, mine |
+
+**The habit that pays: a comment asserting a design decision is a hypothesis.
+Probe it before believing it, and the probe is usually ~20 minutes with zero
+builds.** Lane K confirmed the shadow parser by monkeypatching a 90-line adapter
+onto `globalThis.__mbunHttpParser` from user JS and running node's own 573-line
+`test-http-parser.js` against the *frozen baseline* binary. It passed — thesis
+proven before a single compile.
+
+**And the symmetric error is mine, so it is recorded at equal weight.** I read
+webcrypto's "mutability is deliberate" comment as another false one and froze the
+public `algorithm`/`usages` copies. It was true: node's `key.algorithm` is mutable
+and `test-webcrypto-internal-slots.mjs` asserts `algorithm.name = 'ed25519'`
+sticks. Freezing cost that file. Worse, my guard could not see it because I diffed
+against a wave-39 baseline where the file was already non-green — the exact
+"BEFORE must match your branch point" trap I had just written up for lanes.
+**Distrusting comments does not mean assuming they are false; it means measuring.**
+
+### Corollary: a missing port marker means UNKNOWN fidelity, not hand-written
+
+`node_http.cppm` has no `1:1 translation` header, and my planner therefore called
+it hand-written and briefed a re-port. Its `OutgoingMessage`/`IncomingMessage`/
+`Agent` halves are **near-verbatim node** — a wholesale re-port would have burned
+the lane for ~0 files. What was actually missing was narrow and far higher-yield:
+`_http_common` (two definitions merging stub-first), `internal/http` (absent, so
+`require` resolved to node's own file and minted a *fresh* `Symbol('kOutHeaders')`),
+the client socket loop, and a handful of individually-omitted functions.
+
+**So a FIDELITY AUDIT against `compat/node/lib/` is now the mandatory first step of
+any port-shaped lane**, and `wave_planner` says so instead of asserting
+hand-written. The lane that ran one landed **+17 at 10.4 files/hour** and
+recommended it as standard.
+
 ## 2026-07-30 19:30 — STRATEGY PIVOT: the long tail IS the hand-written surface
 
 **Stop mining failures file by file. Port the real source instead.** This is the

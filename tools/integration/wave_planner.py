@@ -208,7 +208,7 @@ def builtin_shape(area: str, builtins_dir: Path) -> tuple[str, str]:
     # satellite partition declaring itself a port does not make the subsystem ported.
     biggest = cands[0][1]
     head = biggest.read_text(errors="replace")[:4000]
-    shape = "port" if any(m in head for m in PORT_MARKERS) else "hand-written"
+    shape = "port" if any(m in head for m in PORT_MARKERS) else "unmarked"
     kb = total // 1024
     names = ", ".join(f"{f.name} {sz // 1024}K" for sz, f in cands[:3])
     if len(cands) > 3:
@@ -395,7 +395,7 @@ def cmd_plan(args, node_run, bun_run, ledger, excluded):
                 else ("unknown", "")
             # A hand-written subsystem is a PORT candidate, and porting has measured
             # ~3x the yield of fixing. Rank it above an equally dense ported area.
-            weight = 1.5 if shape == "hand-written" else 1.0
+            weight = 1.5 if shape == "unmarked" else 1.0
             candidates.append({
                 "corpus": corpus, "area": area, "green": b["green"],
                 "actionable": b["actionable"], "unverdicted": b["unverdicted"],
@@ -429,8 +429,8 @@ def cmd_plan(args, node_run, bun_run, ledger, excluded):
               f"/ no-verdict {c['unverdicted']}")
         print(f"     corpus rate {c['rate']:.1f} files/h x {args.lane_hours}h "
               f"-> GOAL +{c['goal']}")
-        if c.get("shape") == "hand-written":
-            print(f"     shape: HAND-WRITTEN ({c['impl']})")
+        if c.get("shape") == "unmarked":
+            print(f"     shape: NO PORT MARKER ({c['impl']})")
             # Size is the signal for WHICH port shape. A wholesale port of a large
             # subsystem has no safe partial landing -- a half-ported net.Socket is
             # 121 files red plus http/https/http2 -- and one lane sized exactly that
@@ -442,13 +442,23 @@ def cmd_plan(args, node_run, bun_run, ledger, excluded):
                 if part.endswith("K") and part[:-1].isdigit():
                     kb = max(kb, int(part[:-1]))
             big = "total" in c["impl"] and kb >= 150
+            # A missing marker does NOT mean hand-written. node_http.cppm's
+            # OutgoingMessage/IncomingMessage/Agent halves are near-verbatim node and
+            # simply never declared it; a lane briefed as "hand-written, re-port it"
+            # would have burned itself for ~0 files. It instead ran a FIDELITY AUDIT
+            # against compat/node/lib first, found the gaps were narrow
+            # (_http_common, internal/http, the client socket loop, a handful of
+            # omitted functions) and landed +17 at 10.4 files/hour. Audit first.
+            print(f"     -> AUDIT FIRST: diff this against compat/node/lib/ before "
+                  f"committing to a port. A missing marker means UNKNOWN fidelity, not "
+                  f"hand-written -- some partitions are near-verbatim node undeclared.")
             if big:
-                print(f"     -> LARGE: port node's algorithms FUNCTION-BY-FUNCTION into "
-                      f"the existing structure. A wholesale port has no safe partial "
-                      f"landing; size it as 3-5 lanes before attempting it.")
+                print(f"     -> if the audit finds it genuinely divergent: port node's "
+                      f"algorithms FUNCTION-BY-FUNCTION into the existing structure. At "
+                      f"this size a wholesale port has no safe partial landing (3-5 lanes).")
             else:
-                print(f"     -> dispatch as a PORT lane (移植三段法): translate the real "
-                      f"source, fix what breaks, then measure.")
+                print(f"     -> if the audit finds it genuinely divergent: 移植三段法 "
+                      f"-- translate the real source, fix what breaks, then measure.")
             print(f"     -> VERIFY the shadowing hypothesis before relying on it: probe "
                   f"the prototype chain. It only pays when hand-rolled methods sit ON a "
                   f"correctly-ported base class.")

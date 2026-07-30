@@ -122,13 +122,13 @@ printf '// hand rolled, no port marker anywhere in this header\nexport module b;
   >"$tmp/builtins/node_alpha.cppm"
 
 o3=$(out --plan 2 --node-run "$tmp/noderun" --builtins "$tmp/builtins")
-echo "$o3" | grep -q 'HAND-WRITTEN (node_alpha.cppm' \
-  || fail "a hand-written subsystem must be flagged with its file"
-echo "$o3" | grep -q 'PORT lane' \
-  || fail "a hand-written subsystem must be routed to a port-shaped lane"
+echo "$o3" | grep -q 'NO PORT MARKER (node_alpha.cppm' \
+  || fail "an unmarked subsystem must be flagged with its file"
+echo "$o3" | grep -q 'AUDIT FIRST' \
+  || fail "an unmarked subsystem must be routed to a fidelity audit first"
 echo "$o3" | grep -q 'VERIFY the shadowing hypothesis' \
   || fail "the plan must require verifying the shadowing hypothesis, not assuming it"
-pass "a hand-written subsystem is flagged and routed to a PORT lane"
+pass "an unmarked subsystem is flagged and routed to a fidelity audit"
 
 python3 - "$tmp/builtins" <<'INNER' || fail "builtin_shape must distinguish port from hand-written"
 import sys, pathlib
@@ -136,7 +136,7 @@ sys.path.insert(0, str(pathlib.Path("tools/integration").resolve()))
 import wave_planner as wp
 d = pathlib.Path(sys.argv[1])
 assert wp.builtin_shape("test-ported", d)[0] == "port", wp.builtin_shape("test-ported", d)
-assert wp.builtin_shape("test-alpha", d)[0] == "hand-written", wp.builtin_shape("test-alpha", d)
+assert wp.builtin_shape("test-alpha", d)[0] == "unmarked", wp.builtin_shape("test-alpha", d)
 assert wp.builtin_shape("test-nosuchthing", d)[0] == "unknown"
 INNER
 pass "builtin_shape reads the port marker from the partition header"
