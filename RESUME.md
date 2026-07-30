@@ -5,6 +5,112 @@ session that is interrupted (usage limit, crash, restart) can pick up from the
 file rather than from memory. **If you are a fresh session reading this, start
 here.**
 
+## 2026-07-30 17:00 — LANE PROTOCOL v2: what actually made lanes fast, measured
+
+Throughput across waves 56–57 varied by **25x**, and the spread is explained by
+method, not by subsystem difficulty. Numbers first, because this is the evidence:
+
+| lane | files | wall clock | files/hour |
+| --- | ---: | ---: | ---: |
+| H zlib+whatwg | +15 | 1h00m | **15.0** |
+| F http2 | +6 | 1h35m | 3.8 |
+| C worker | +8 | 4h10m | 1.9 |
+| B node:test | +6 | 4h15m | 1.4 |
+| E bun bundler | +1 | 1h45m | 0.6 |
+| D bun bake | 0 | 2h00m | 0 |
+| A nextTick | 0 net | 1h49m | (unblocked a contract) |
+
+**Seven rules, each traceable to one of those rows. Put them in every brief.**
+
+1. **NEVER reconstruct a baseline by reverting and rebuilding.** This is the single
+   largest waste found. Lane B reverted its two touched files, rebuilt, measured,
+   restored, and rebuilt again — **two extra builds plus two extra subtree runs**,
+   and it was the slowest lane on the board. There is an authoritative same-tree
+   full-corpus run; diff the AFTER against it. `corpus_diff.py` matches per file,
+   so a subset AFTER against a full BEFORE is valid. Lane F did exactly this and
+   confirmed its baseline subset reproduced the authoritative numbers **at zero
+   build cost**.
+2. **Read the vendored node source.** `compat/node/lib/` is the complete node
+   implementation. Three lanes independently credited their results to diffing
+   against it instead of inferring semantics from test names. Lane H found the
+   dominant blocker this way in minutes.
+3. **DISTRUST CODE COMMENTS. Two of this session's biggest blockers were false
+   comments, not missing features.** `zlib_stream.cppm` claimed "mbun's base
+   Transform is a stub whose write()/end() do NOT drive the pipeline" — it had
+   been replaced long before, and the hand-rolled `write`/`end` shadowing the real
+   state machine was worth **9 files**. `webcrypto.cppm` claimed CryptoKey's
+   mutable metadata copies were deliberate — they were a forgery vector, and the
+   project's own security test had been failing against that comment. A comment
+   asserting a design decision is a hypothesis; check it against a test.
+4. **Prototype by monkeypatch BEFORE you build.** Lane H proved its architecture
+   thesis by `delete ZlibBase.prototype.write/end` from user JS and watched 2 files
+   go green **with zero builds**. Build-lock contention was 35 of lane F's 95
+   minutes, so every build avoided is real time.
+5. **Run `check_struck.py <your target>` first.** The registry exists because
+   `bunfig` preload was implemented and reverted twice for the identical 5-file
+   loss. A hit is not a veto — it is a measurement already paid for.
+6. **Sort candidates by "closest to passing", not by cluster size.** The runner
+   records per-file passed/failed assertion counts; a file failing 1 of 40 is worth
+   far more per hour than one failing 40 of 40. Cluster size has been actively
+   misleading — seven umbrella clusters have now dissolved, and lane F found
+   exactly **one** real cluster among many shared signatures.
+7. **Budget 2–4 blockers per file.** "One file, one blocker" failed in **five of
+   six** files lane F touched, and both earlier waves hit it too. Lane F called
+   this line "the single most load-bearing in the brief" and said it would have
+   mis-scored three veins without it.
+
+**A revert is not failure — an unrecorded revert is.** Lane F implemented node's
+421 `originSet.delete`, measured that it turned a 1-second failure into a
+**30-second timeout** without turning the file green, backed it out, and left a
+source comment naming the two lines. That is the process working. The waste is
+only ever the *repeat*, which is what `struck.tsv` now prevents.
+
+## 2026-07-30 16:40 — WAVE 57 lanes F and H
+
+**Lane H — zlib + whatwg: +15 (goal +6), the best files/hour of the campaign.**
+Integrated as `e0f5af7` + `53317b7`. `test-zlib` **45 → 57**, `test-whatwg`
+**41 → 44**, `test-mime` 1 → 2. Skip counts unchanged, so no pass came from a
+self-skip. Root causes: the stale-comment architecture fix above (9 files);
+concatenated gzip gated on `windowBits & 16`, true for gzip framing but **false
+for auto-detect** so `createUnzip()` decoded only the first member (2 files);
+`Z_NEED_DICT` collapsed to one message and a supplied dictionary discarded at
+open; `StreamChunk` had no `code` field so every engine code died in the bridge;
+MIMEType split on `;` and trimmed with `String.trim()` where HTTP whitespace is
+only CR/LF/tab/space (388 of 952 WPT cases disagreed); **17 of 28 legacy
+single-byte encoding tables missing and 5 of the 11 present hand-transcribed
+WRONG** (koi8-u, windows-874/1253/1255/1257); EventTarget returned early on a
+null callback *before* converting the options dictionary, so `options.passive`'s
+getter never ran — which is exactly how passive-support feature detection works.
+The brotli lead **held** (corrupt vs truncated now distinguished) but was worth
+**0 files alone**. It also caught a genuine node-vs-bun conflict mid-flight:
+node's `_handle.reset()` throws mid-write while bun defers a public `reset()`;
+both hold now, and without the bun guard it would have shipped.
+
+**Lane F — http2: +6 (goal +6).** Integrated as `8beb1d0`. `test-http2`
+**223 → 229**. Ten defects, all diffed against `compat/node/lib/internal/http2/*`.
+The one real cluster: **`Timeout._idleTimeout`/`_idleStart` never existed**, read
+off a handle under `internal/timers`' private `kTimeout`, spanning http2, http and
+tls. Two wins were *identity/plumbing*, not semantics —
+`require("internal/http2/core")` resolved to **node's** file, so three files
+compared a live mbun session against node's class (unsatisfiable), and
+`Http2Session[kTimeout]` was simply never assigned. Also: destroyed sessions never
+cancelled outstanding pings; `closeSession()` collapsed two stream lists so
+`ABORT_ERR` beat the cancel's async error; a request destroyed pre-handshake still
+reached the wire; `:authority` dropped a default port; nghttp2 forces
+never-indexed on `authorization` and short `cookie`, reported back through
+`sensitiveHeaders`; `localSettings`/`remoteSettings` returned the raw record rather
+than node's normalised **and cached** projection.
+
+Retired with numbers this wave: generic `util.inspect` line-breaking (mbun's
+inspector **never wraps at all** — 1 file gained against an output change across
+all 4433, so it was solved locally for the one file that pins it); http2
+`encodeSettings()` never serialising `customSettings` (one function, but it changes
+every SETTINGS frame on the wire — too wide to land unmeasured); node
+internal/webstreams adapters (**7 files**, but the fix means swapping
+`node:stream/web` and the globals to node's JS implementation, under everything in
+bun that touches streams); the URL prototype surface (4 files, only **1**
+reachable — the rest need V8 natives syntax or V8-exact messages).
+
 ## 2026-07-30 15:30 — WAVE 56 lane A: THE nextTick CURE LANDED. Read this before touching the pump.
 
 The 256-file risk did **not** materialise. `1b1f56e`, 5 files, +131/−14, mostly
