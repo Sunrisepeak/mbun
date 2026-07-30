@@ -263,7 +263,7 @@ inline constexpr std::string_view kNodePerfJS = R"JS(
   performanceObj.timerify = timerify;
 
   // ── PerformanceObserver ───────────────────────────────────────────────────
-  const SUPPORTED = ["mark", "measure", "function", "net"];
+  const SUPPORTED = ["mark", "measure", "function", "net", "http"];
   class PerformanceObserver {
     constructor(callback) {
       if (typeof callback !== "function") throw errArgType("callback", "function", callback);
@@ -301,6 +301,27 @@ inline constexpr std::string_view kNodePerfJS = R"JS(
       if (!hasObserverFor("net")) return;
       const start = typeof startTime === "number" ? startTime : perfNow();
       addEntry(new PerformanceNodeEntry(kConstruct, name, "net", start, perfNow() - start, detail));
+    },
+  });
+  // lib/internal/perf/observe.js hasObserver / startPerf / stopPerf, as the
+  // "http" timeline uses them: _http_server.js and _http_client.js stash a
+  // `{ type, name, detail, startTime }` context on the message while an
+  // observer is subscribed and turn it into an entry when the exchange ends.
+  // Same pay-nothing-unless-observed contract as the net timeline above.
+  Object.defineProperty(G, "__mbunPerfHasObserver", {
+    configurable: true, enumerable: false, writable: true,
+    value: (type) => hasObserverFor(type),
+  });
+  Object.defineProperty(G, "__mbunPerfStart", {
+    configurable: true, enumerable: false, writable: true,
+    value: (name, type, detail) => ({ name, type, detail, startTime: perfNow() }),
+  });
+  Object.defineProperty(G, "__mbunPerfStop", {
+    configurable: true, enumerable: false, writable: true,
+    value: (ctx, detail) => {
+      if (!ctx || !hasObserverFor(ctx.type)) return;
+      addEntry(new PerformanceNodeEntry(kConstruct, ctx.name, ctx.type, ctx.startTime,
+        perfNow() - ctx.startTime, Object.assign({}, ctx.detail, detail)));
     },
   });
 

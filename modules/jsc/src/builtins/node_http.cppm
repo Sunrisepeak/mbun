@@ -938,6 +938,25 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
 
   // ================================================== ServerResponse
   // lib/_http_server.js.
+  // lib/internal/perf/observe.js startPerf/stopPerf, as _http_server.js and
+  // _http_client.js drive the "http" timeline. Both hooks are no-ops unless a
+  // PerformanceObserver is subscribed to type 'http' (node gates every one of
+  // these call sites on hasObserver('http')), so an unobserved exchange pays a
+  // single property read. test-http-perf_hooks asserts two HttpClient and two
+  // HttpRequest entries with both a `detail.req` and a `detail.res`.
+  const kPerfStats = Symbol("kPerfStatistics");
+  const perfHttpObserved = () => typeof G.__mbunPerfHasObserver === "function" && G.__mbunPerfHasObserver("http");
+  const perfHttpStart = (target, name, detail) => {
+    if (!perfHttpObserved()) return;
+    target[kPerfStats] = G.__mbunPerfStart(name, "http", detail);
+  };
+  const perfHttpStop = (target, detail) => {
+    const ctx = target[kPerfStats];
+    if (!ctx || !perfHttpObserved()) return;
+    target[kPerfStats] = null;
+    G.__mbunPerfStop(ctx, detail);
+  };
+
   function ServerResponse(reqMsg, options) {
     OutgoingMessage.call(this, options);
     if (reqMsg && reqMsg.method === "HEAD") this._hasBody = false;
@@ -954,6 +973,9 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
       this.useChunkedEncodingByDefault = chunkExpression.test(reqMsg.headers.te);
       this.shouldKeepAlive = false;
     }
+    perfHttpStart(this, "HttpRequest", {
+      req: { method: reqMsg && reqMsg.method, url: reqMsg && reqMsg.url, headers: reqMsg && reqMsg.headers },
+    });
     // node lib/_http_server.js: the ServerResponse constructor's last act is to
     // publish 'http.server.response.created' with the request it answers.
     const ch = httpDC().serverResponseCreated;
@@ -963,6 +985,18 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
   Object.setPrototypeOf(ServerResponse, OutgoingMessage);
   ServerResponse.prototype.statusCode = 200;
   ServerResponse.prototype.statusMessage = undefined;
+  // lib/_http_server.js ServerResponse.prototype._finish: close the 'http'
+  // timeline entry opened in the constructor, then defer to OutgoingMessage.
+  ServerResponse.prototype._finish = function _finish() {
+    perfHttpStop(this, {
+      res: {
+        statusCode: this.statusCode,
+        statusMessage: this.statusMessage === undefined ? (STATUS_CODES[this.statusCode] || "unknown") : this.statusMessage,
+        headers: typeof this.getHeaders === "function" ? this.getHeaders() : {},
+      },
+    });
+    OutgoingMessage.prototype._finish.call(this);
+  };
 
   function onServerResponseClose() {
     if (this._httpMessage) emitCloseNT(this._httpMessage);
@@ -1887,6 +1921,13 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
   // its way, which is what 'http.client.request.start' reports.
   ClientRequest.prototype._finish = function _finish() {
     OutgoingMessage.prototype._finish.call(this);
+    perfHttpStart(this, "HttpClient", {
+      req: {
+        method: this.method,
+        url: this.protocol + "//" + this.host + this.path,
+        headers: typeof this.getHeaders === "function" ? this.getHeaders() : {},
+      },
+    });
     // _flush() re-enters _finish for an already-finished message, so the publish
     // is latched: node reports one 'start' per request, not per flush.
     if (this._dcStartPublished) return;
@@ -2099,6 +2140,9 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
       if (request.shouldKeepAlive && !peerKeepAlive && !request.upgradeOrConnect) {
         request.shouldKeepAlive = false;
       }
+      perfHttpStop(request, {
+        res: { statusCode: res.statusCode, statusMessage: res.statusMessage, headers: res.headers },
+      });
       // node parserOnIncomingClient: 'http.client.response.finish' fires once the
       // response head has been parsed, before the 'response' event.
       {
