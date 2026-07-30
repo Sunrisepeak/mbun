@@ -1449,14 +1449,15 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
       // is not equivalent -- it leaves a window where another layer's listener
       // (a TLSSocket's) is the only one, and a later 'write after end' on a
       // pipelined response threw (test-tls-use-after-free-regression).
-      sock.on("error", () => {});
+      const socketOnErrorNoop = () => {};
+      sock.on("error", socketOnErrorNoop);
       const onSockError = (e) => {
         socketOnError(sock, e instanceof Error ? e : mkErr(String((e && e.message) || e), codeOf(e)));
       };
       sock._httpOnError = onSockError;
       sock.on("error", onSockError);
       srv._httpConns.add(sock);
-      sock.once("close", () => {
+      const socketOnClose = () => {
         srv._httpConns.delete(sock);
         // node lib/_http_server.js socketOnClose -> freeParser(parser, null,
         // null). The corpus overwrites `parser.free` to observe exactly this
@@ -1509,7 +1510,8 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
         if (typeof G.setImmediate === "function") G.setImmediate(closeLater);
         else if (G.process && typeof G.process.nextTick === "function") G.process.nextTick(closeLater);
         else closeLater();
-      });
+      };
+      sock.once("close", socketOnClose);
       if (srv.timeout) { try { sock.setTimeout(srv.timeout); } catch (e) {} }
       sock.server = srv;
       sock._httpInFlight = 0;
@@ -1524,14 +1526,15 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
       // lib/_http_server.js socketOnTimeout: the request, the response and the
       // server each get a say; only if none of them claims the event does the
       // connection go away.
-      sock.on("timeout", () => {
+      const socketOnTimeout = () => {
         const inFlightReq = sock._httpIncoming;
         const reqTimeout = inFlightReq && !inFlightReq.complete && inFlightReq.emit("timeout", sock);
         const res = sock._httpMessage;
         const resTimeout = res && res.emit("timeout", sock);
         const serverTimeout = srv.emit("timeout", sock);
         if (!reqTimeout && !resTimeout && !serverTimeout) sock.destroy();
-      });
+      };
+      sock.on("timeout", socketOnTimeout);
       let carry = [];
       let eofSeen = false;
       let requestsCount = 0;
@@ -1728,10 +1731,22 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
             const upAt = incoming.indexOf(im);
             if (upAt !== -1) incoming.splice(upAt, 1);
           }
-          // node removes state.onData here; this translation must too, or the
-          // server's own listener keeps the socket looking "already read" to
-          // parkForConsumer and keeps counting toward listenerCount('data').
+          // node lib/_http_server.js onParserExecuteCommon detaches the WHOLE
+          // server listener set before the handover -- onData, onEnd, onClose,
+          // onDrain, socketOnError and socketOnTimeout -- because the raw socket
+          // now belongs to the 'upgrade'/'connect' consumer and none of those
+          // callbacks may fire on it again. Only onData was being removed, so the
+          // handed-over socket still looked "already read" to parkForConsumer and
+          // still carried the server's close/error/timeout handlers;
+          // test-http-connect asserts the exact residual listener counts
+          // (close/drain/data/error/timeout all 0, and 'end' just the one
+          // Readable's own onReadableStreamEnd).
           sock.removeListener("data", onSockData);
+          sock.removeListener("end", socketOnEnd);
+          sock.removeListener("close", socketOnClose);
+          if (sock._httpOnError) { sock.removeListener("error", sock._httpOnError); sock._httpOnError = null; }
+          sock.removeListener("error", socketOnErrorNoop);
+          sock.removeListener("timeout", socketOnTimeout);
           // node onParserExecuteCommon runs unconsume() + freeParser(), which
           // takes the connection OUT of the server's ConnectionsList: an
           // upgraded socket is no longer the http server's to sweep or to close.
@@ -1809,6 +1824,18 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
             const armedPending = (armed && !armed.done && armed.buf)
               ? (armed.buf.length - armed.off) : 0;
             sock._httpMsgIdle = (carryBytes() + armedPending) === 0;
+            // ...and the same argument applies to the OTHER half of the sweeper's
+            // guard. `_httpMsgOpen` mirrors llhttp on_message_begin/complete, but
+            // it was only ever latched from the socket 'data' handler. Pipelined
+            // bytes that arrived with the PREVIOUS request produce no further
+            // 'data' event, so on_message_complete cleared _httpMsgOpen and
+            // nothing set it again -- leaving `_httpMsgBegun && !_httpMsgOpen`,
+            // which setupConnectionsTracking's sweeper skips outright. node's
+            // node_http_parser.cc on_message_begin does PushActive the moment
+            // llhttp starts the buffered head, so the connection stays expirable
+            // and an incomplete pipelined head becomes a 408
+            // (test-http-server-{headers,request}-timeout-pipelining).
+            if (!sock._httpMsgIdle) { sock._httpMsgBegun = true; sock._httpMsgOpen = true; }
             // Idle keep-alive connection: arm the advertised keep-alive timeout
             // (plus node's buffer) so it cannot pin the loop forever.
             if (srv.keepAliveTimeout > 0 && typeof sock.setTimeout === "function") {
@@ -2064,7 +2091,8 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
         else { carry.push(b.slice()); if (!p) rearm(); }
       };
       sock.on("data", onSockData);
-      sock.on("end", () => { eofSeen = true; const p = sock._httpParser; if (p && !p.done) p.eof(); });
+      const socketOnEnd = () => { eofSeen = true; const p = sock._httpParser; if (p && !p.done) p.eof(); };
+      sock.on("end", socketOnEnd);
       startParser();
       pumpCarry();
     });

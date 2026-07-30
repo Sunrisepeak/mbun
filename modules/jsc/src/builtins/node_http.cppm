@@ -2070,6 +2070,14 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
         res.upgrade = true;
         const head = G.Buffer.from(parser.leftover());
         const ev = isConnect ? "connect" : "upgrade";
+        // lib/_http_client.js socketOnData, upgrade/CONNECT branch: the two
+        // timeout listeners come off with data/end/drain, BEFORE the socket is
+        // handed to the consumer. Only responseOnEnd was dropping them, which a
+        // tunnelled socket never reaches -- so a detached CONNECT socket kept the
+        // request's timeout handler (test-http-connect asserts
+        // `socket.listenerCount('timeout') === 0`).
+        if (request.timeoutCb) socket.removeListener("timeout", emitRequestTimeout);
+        socket.removeListener("timeout", responseOnTimeout);
         hardDetach();
         if (request.listenerCount(ev) > 0) {
           request.upgradeOrConnect = true;

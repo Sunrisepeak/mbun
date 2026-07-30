@@ -1613,6 +1613,23 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       // so emitting it here is what keeps that callback from being dropped
       // outright; node likewise never leaves an end() callback unsettled.
       if (this._shutW && !this._finishEmitted) { this._finishEmitted = true; emitOn("finish"); }
+      // node lib/net.js Socket.prototype._destroy does the accepting server's
+      // connection bookkeeping from the SOCKET's own teardown
+      // (`if (this._server) { this._server._connections--; ... }`) -- the server
+      // does not install a 'close' listener on what it accepted. Doing it with a
+      // listener kept the count right but left an observable listener on every
+      // accepted socket, and node's http CONNECT/upgrade handover asserts
+      // `socket.listenerCount('close') === 0` on the detached socket
+      // (test-http-connect). It also runs synchronously here, as node's does,
+      // rather than a microtask later.
+      if (this._server && this._server._conns) { try { this._server._conns.delete(this); } catch (e) {} }
+      // Emission goes through EE.prototype (emitOn, line ~1609) rather than
+      // `this.emit`: http2 hands out a Proxy over the session for
+      // `session.socket`, and node's proxy THROWS on reading `emit` at all
+      // (core.js proxySocketHandler). Reading it here to call it broke
+      // test-http2-respond-with-file-connection-abort, which deliberately
+      // routes `net.Socket.prototype.destroy.call(client.socket)` through that
+      // proxy. Identical for ordinary sockets, which never override `emit`.
       if (!this._closeEmitted) { this._closeEmitted = true; G.queueMicrotask(() => emitOn("close", !!err)); }
       return this;
     }
@@ -2076,7 +2093,6 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       // first byte is read (it may pass the fd elsewhere first).
       if (this._opts.pauseOnConnect) sock.pause();
       this._conns.add(sock);
-      sock.once("close", () => this._conns.delete(sock));
       this.emit("connection", sock);
       // node onconnection() publishes 'net.server.socket' right after the
       // 'connection' event.
@@ -2354,7 +2370,6 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
             // when the first byte is read (it may pass the fd elsewhere first).
             if (this._opts.pauseOnConnect) sock.pause();
             this._conns.add(sock);
-            sock.once("close", () => this._conns.delete(sock));
             this.emit("connection", sock);
             if (netServerSocketChannel.hasSubscribers) netServerSocketChannel.publish({ socket: sock });
           };
@@ -2826,11 +2841,27 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
     }
   } catch (e) {}
 
+  // node lib/net.js connect(): normalize the arguments ONCE here and hand
+  // Socket.prototype.connect the normalized `[options, callback]` array --
+  // that array shape is observable, because it is what an interceptor on
+  // Socket.prototype.connect receives (test-http-nodelay replaces the method
+  // and asserts `args[0].noDelay`, which the Agent puts on its options).
+  // Spreading the raw arguments instead handed such an interceptor the bare
+  // options object. Only the already-an-options-object form takes this path:
+  // the local normalizeArgs is a thin [options, cb] pairing that would drop the
+  // port from the (port[, host][, cb]) overloads, which Socket.prototype.connect
+  // normalizes for itself.
+  const netConnect = (a) => {
+    const opts = (typeof a[0] === "object" && a[0] !== null && !Array.isArray(a[0])) ? a[0] : null;
+    const socket = new Socket(opts || undefined);
+    if (opts && normalizedArgsSymbol() !== null) return socket.connect(normalizeArgs(a));
+    return socket.connect(...a);
+  };
   def(["net"], Object.assign({}, M["net"] || {}, {
     Socket: SocketW, Stream: SocketW, Server: ServerW, BlockList,
     createServer: (o, cb) => new Server(o, cb),
-    createConnection: (...a) => new Socket(typeof a[0] === "object" ? a[0] : undefined).connect(...a),
-    connect: (...a) => new Socket(typeof a[0] === "object" ? a[0] : undefined).connect(...a),
+    createConnection: (...a) => netConnect(a),
+    connect: (...a) => netConnect(a),
     isIP, isIPv4, isIPv6,
     setDefaultAutoSelectFamilyAttemptTimeout, getDefaultAutoSelectFamilyAttemptTimeout,
     setDefaultAutoSelectFamily, getDefaultAutoSelectFamily,
