@@ -12,6 +12,14 @@
 #   e.g.  tools/integration/safe-test.sh 30 ./app/cli/target/.../mbun test <file>
 # Env overrides: SAFE_MEM (default 6G), SAFE_TASKS (default 128).
 #
+# COMPILING UNDER THIS WRAPPER NEEDS SAFE_MEM RAISED. `mcpp test -p modules/jsc`
+# compiles before it runs, and 6G is not enough: the cgroup OOM-kills it and the
+# wrapper reports **exit 124**, which reads exactly like a timeout. Two separate
+# lanes lost ~50 minutes each to that misdiagnosis -- one retried at a two-hour
+# bound, the other concluded the wrapper "reaps during the compile stage". With
+# `SAFE_MEM=34G` it finishes normally. Raise SAFE_MEM for anything that builds;
+# the 6G default is sized for RUNNING a single corpus test, not for a compile.
+#
 # ALWAYS use this (never a bare `mbun test <spawn-heavy-file>`) when a hang is
 # possible. Exit code is the command's, or 124 on timeout kill.
 set -u
