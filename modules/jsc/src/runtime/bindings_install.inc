@@ -312,27 +312,24 @@
   // node's three-component shape: node's own test/common/crypto.js parses it with
   // /(?<m>\\d+)\\.(?<n>\\d+)\\.(?<p>\\d+)/ and dereferences `.groups` unguarded, so a
   // two-component "3.0" made every hasOpenSSL() caller die on `null.groups`.
-  // DO NOT add `sqlite: "3.45.1"` here on its own -- measured, and it is a wash.
+  // `sqlite` is the vendored mbun.sqlite3 amalgamation's version, and it is what
   //   compat/node/test/common/index.js:72
   //     const hasSQLite = Boolean(process.versions.sqlite);
-  // Absent, so 22 files call common.skip('missing SQLite') and never run. Adding it
-  // IS truthful (the linked engine answers 3.45.1 to `select sqlite_version()`, and
-  // node:sqlite is now a real DatabaseSync/StatementSync shim -- see
-  // bootstrap.cppm), and it does unblock all 22. But measured: only **1** goes
-  // green (test-sqlite-timeout); 20 then fail on API this shim does not cover
-  // (backup(), createSession()/applyChangeset(), custom function()/aggregate(),
-  // typed-array binding, authz, limits); and it COSTS test-webstorage-without-sqlite,
-  // which exists to assert behaviour for a build WITHOUT sqlite. Net 0 green.
-  // Land it as one lane together with the missing StatementSync/DatabaseSync
-  // surface AND webstorage (localStorage/sessionStorage backed by sqlite, which
-  // hasSQLite also gates at common/index.js:392) -- then it is worth ~+15 rather
-  // than a wash. Sized in RESUME.md.
+  // gates 22 self-skipping files on. It was held for a wave because the flag ALONE
+  // is a wash (1 green, 20 fail, and it costs test-webstorage-without-sqlite). It
+  // ships now that the three parts land together: a real DatabaseSync/StatementSync
+  // implemented directly on __mbunSqliteNative (bootstrap.cppm), the direct
+  // sqlite3 C-API surface those files need (dbConfig/limit/serialize/columnInfo --
+  // runtime/sqlite.inc), and a `sessionStorage` global so the without-sqlite file
+  // keeps passing. Files still failing do so on capability, not on detection:
+  // custom function()/aggregate(), session/changeset, backup(), authorizer, and
+  // the FTS3/GEOPOLY/RBU compile options test-sqlite.js probes.
   //
   // Note what is deliberately NOT claimed here, because the same file gates on it:
   // `process.features.inspector` and `process.features.quic` stay false, which is
   // why 178 + 236 files correctly keep skipping -- mbun has neither subsystem, and
   // flipping those booleans would make 414 files run and fail rather than progress.
-  p.versions = { node: "26.3.0", bun: (globalThis.Bun && Bun.version) || "1.3.14", mbun: "2026.07.18.0", v8: "12.4.0", modules: "127", uv: "1.0", openssl: "3.1.5" };
+  p.versions = { node: "26.3.0", bun: (globalThis.Bun && Bun.version) || "1.3.14", mbun: "2026.07.18.0", v8: "12.4.0", modules: "127", uv: "1.0", openssl: "3.1.5", sqlite: "3.45.1" };
   // bun mirrors Bun.revision onto process.revision (bun-test.test.ts asserts
   // process.revision === Bun.revision; verified against bun 1.3.14). Derived from
   // Bun.revision so the two can never drift.
@@ -1180,6 +1177,16 @@
         set_fn(ctx_, sqn, "run", sqliten_run_cb);
         set_fn(ctx_, sqn, "expandedSQL", sqliten_expanded_sql_cb);
         set_fn(ctx_, sqn, "inTransaction", sqliten_in_transaction_cb);
+        // node:sqlite surface with no SQL/PRAGMA form (see runtime/sqlite.inc).
+        set_fn(ctx_, sqn, "dbConfig", sqliten_db_config_cb);
+        set_fn(ctx_, sqn, "limit", sqliten_limit_cb);
+        set_fn(ctx_, sqn, "busyTimeout", sqliten_busy_timeout_cb);
+        set_fn(ctx_, sqn, "filename", sqliten_filename_cb);
+        set_fn(ctx_, sqn, "serialize", sqliten_serialize_cb);
+        set_fn(ctx_, sqn, "deserialize", sqliten_deserialize_cb);
+        set_fn(ctx_, sqn, "columnInfo", sqliten_column_info_cb);
+        set_fn(ctx_, sqn, "setAuthorizer", sqliten_set_authorizer_cb);
+        set_fn(ctx_, sqn, "createFunction", sqliten_create_function_cb);
         set_prop(ctx_, global, "__mbunSqliteNative", sqn);
         // CAP-WATCH: node:fs.watch over inotify (mbun.watcher); no-op off Linux.
         install_watch_native(ctx_, global);

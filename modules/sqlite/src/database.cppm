@@ -19,6 +19,38 @@ export struct DatabaseBackend {
     std::function<bool()> in_transaction;
     TransactionBackend transaction;
     std::function<void()> close;
+    // ---- node:sqlite surface -------------------------------------------------
+    // These have no SQL/PRAGMA equivalent, so they cannot be expressed through
+    // execute(); each is a direct sqlite3 C-API call supplied by the native
+    // adapter. Kept as optional hooks so the deferred (no-sqlite3) build still
+    // links -- an unset hook reports "unsupported" rather than crashing.
+    //
+    // sqlite3_db_config(op, value) -> resulting value. DEFENSIVE (1010) and
+    // DQS_DML/DQS_DDL (1013/1014) are the ones node exposes.
+    std::function<std::expected<int, SqlError>(int, int)> db_config;
+    // sqlite3_limit(id, value); a negative value queries without changing.
+    std::function<int(int, int)> limit;
+    // sqlite3_busy_timeout(ms) for DatabaseSync's `timeout` option.
+    std::function<void(int)> busy_timeout;
+    // sqlite3_serialize / sqlite3_deserialize of a named schema ("main").
+    std::function<std::expected<std::vector<std::byte>, SqlError>(std::string)> serialize;
+    std::function<std::expected<void, SqlError>(std::string, std::vector<std::byte>)> deserialize;
+    // Prepare-only column introspection for StatementSync.prototype.columns(),
+    // which must not execute the statement (an INSERT would run twice).
+    std::function<std::expected<std::vector<ColumnInfo>, SqlError>(std::string)> column_info;
+    // sqlite3_db_filename(name) for DatabaseSync.prototype.location(); empty for
+    // a temporary/in-memory schema, which JS surfaces as null.
+    std::function<std::string(std::string)> db_filename;
+    // sqlite3_set_authorizer. The callback fires DURING prepare, once per action
+    // sqlite is about to compile, and its four arguments are absent (nullopt)
+    // rather than empty for actions that do not carry them. An empty std::function
+    // clears the authorizer.
+    std::function<void(AuthorizerFn)> set_authorizer;
+    // sqlite3_create_function_v2. `nargs` is -1 for varargs; `deterministic` and
+    // `direct_only` become SQLITE_DETERMINISTIC / SQLITE_DIRECTONLY, which sqlite
+    // only honours at registration time.
+    std::function<std::expected<void, SqlError>(std::string, int, bool, bool, ScalarFn)>
+        create_function;
 };
 
 export struct DatabaseOptions {
@@ -86,6 +118,41 @@ public:
         return backend_.expanded_sql(sql, params);
     }
     Transaction transaction() const { return Transaction{backend_.transaction}; }
+
+    static SqlError unsupported() {
+        return SqlError{"sqlite3 backend is deferred", "SQLITE_NOTFOUND"};
+    }
+    std::expected<int, SqlError> db_config(int op, int value) const {
+        if (!backend_.db_config) return std::unexpected(unsupported());
+        return backend_.db_config(op, value);
+    }
+    int limit(int id, int value) const { return backend_.limit ? backend_.limit(id, value) : -1; }
+    void busy_timeout(int ms) const { if (backend_.busy_timeout) backend_.busy_timeout(ms); }
+    std::expected<std::vector<std::byte>, SqlError> serialize(std::string schema) const {
+        if (!backend_.serialize) return std::unexpected(unsupported());
+        return backend_.serialize(std::move(schema));
+    }
+    std::expected<void, SqlError> deserialize(std::string schema,
+                                              std::vector<std::byte> bytes) const {
+        if (!backend_.deserialize) return std::unexpected(unsupported());
+        return backend_.deserialize(std::move(schema), std::move(bytes));
+    }
+    std::expected<std::vector<ColumnInfo>, SqlError> column_info(std::string sql) const {
+        if (!backend_.column_info) return std::unexpected(unsupported());
+        return backend_.column_info(std::move(sql));
+    }
+    std::string db_filename(std::string name) const {
+        return backend_.db_filename ? backend_.db_filename(std::move(name)) : std::string{};
+    }
+    void set_authorizer(AuthorizerFn fn) const {
+        if (backend_.set_authorizer) backend_.set_authorizer(std::move(fn));
+    }
+    std::expected<void, SqlError> create_function(std::string name, int nargs, bool deterministic,
+                                                  bool direct_only, ScalarFn fn) const {
+        if (!backend_.create_function) return std::unexpected(unsupported());
+        return backend_.create_function(std::move(name), nargs, deterministic, direct_only,
+                                        std::move(fn));
+    }
 
     void close() noexcept {
         if (closed_) return;
