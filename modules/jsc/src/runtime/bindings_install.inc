@@ -581,23 +581,26 @@
   // This class was invisible until now because self-skips are (correctly) excluded
   // from the "actionable failure" count, so nothing in the planning loop ever
   // looked at them. 553 node files self-skip; the inventory is in RESUME.md.
-  // DO NOT set v8_enable_i18n_support here on its own -- measured, and it is a
-  // net trade of green files. It is TRUTHFUL (JSC here ships full ICU: de-DE
-  // dateStyle:'long' gives "1. Januar 1970", de-DE NumberFormat "1.234,5", a de
-  // Collator sorts a/ae/z, resolvedOptions().locale round-trips "de-DE") and it
-  // unblocks 12 self-skipping files for +7 green. But it also costs 4 green files,
-  // because with hasIntl true those files stop skipping the IDNA paths:
+  // The flag is set here ONLY because the two things it used to cost were
+  // landed with it, as one lane (wave 60). Setting it alone was measured at
+  // +7/-4 and was correctly held twice; the -4 came from files that, with
+  // hasIntl true, stop skipping the IDNA paths:
   //   test-url-parse-invalid-input  http://fail<U+2047>fail.com/ must THROW
   //   test-url-format / test-url-parse-format
   //   test-process-env-allowed-flags-are-documented  wants --icu-data-dir listed
-  // The blocker is UTS-46 VALIDATION, not punycode: mbun's encoder is correct
-  // (muenchen.de -> xn--mnchen-3ya.de) but it ENCODES a disallowed character
+  // The blocker was UTS-46 VALIDATION, not punycode: mbun's encoder is correct
+  // (muenchen.de -> xn--mnchen-3ya.de) but it ENCODED a disallowed character
   // instead of rejecting it (fail<U+2047>fail.com -> xn--failfail-803d.com, where
-  // node's domainToASCII returns '' and new URL() throws).
-  // Land all three together as one lane -- the flag, the UTS-46 disallowed/mapped
-  // table, and --icu-data-dir in allowedNodeEnvironmentFlags -- for ~+11 with zero
-  // regressions. Sized in RESUME.md.
-  p.config = { variables: {} };
+  // node's domainToASCII returns '' and new URL() throws). That step now exists
+  // as `uts46` in bootstrap.cppm (see the subset note there), and --icu-data-dir
+  // is conditionally in allowedNodeEnvironmentFlags in node_process_extra.cppm.
+  // If you ever revert one of those three, revert all three.
+  //
+  // What stays UNSET and why: `icu_small` is falsy because non-English locale
+  // data really is present (small-icu cannot do non-English, per line 40 of
+  // common/index.js), and `v8_enable_temporal_support` is unset because Temporal
+  // genuinely is not enabled -- those 2 files SHOULD keep skipping.
+  p.config = { variables: { v8_enable_i18n_support: 1 } };
   p.release = { name: "node" };
   p.stdin = { on: function () { return p.stdin; }, read: function () { return null; }, resume: function () {}, pause: function () {}, setEncoding: function () {}, isTTY: false };
   p.binding = function () { return {}; };
