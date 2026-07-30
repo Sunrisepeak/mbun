@@ -43,6 +43,25 @@ export constexpr std::string_view kWebSocketJS = R"JS(
   const fire = (fn, ...a) => { if (typeof fn === "function") { try { return fn(...a); } catch (e) { try { G.console && G.console.error("error: " + ((e && e.message) || e)); } catch (e2) {} } } };
 
   // Sec-WebSocket-Accept (RFC 6455 §4.2.2).
+  // Sec-WebSocket-Protocol header helpers, shared by the request builder and the
+  // RFC 6455 response check. `wsProtoSplit` reproduces bun's HeaderValueIterator:
+  // tokenize on ',', trim " \t" off each token, drop the empties.
+  // ref: compat/bun/src/http/HeaderValueIterator.rs
+  const wsProtoSplit = (v) => String(v).split(",").map((t) => t.replace(/^[ \t]+|[ \t]+$/g, "")).filter((t) => t.length);
+  const wsProtoValues = (head) => {
+    const out = [];
+    for (const line of String(head).split("\r\n")) {
+      const c = line.indexOf(":");
+      if (c > 0 && line.slice(0, c).trim().toLowerCase() === "sec-websocket-protocol") out.push(line.slice(c + 1));
+    }
+    return out;
+  };
+  const wsProtoTokens = (head) => {
+    const out = [];
+    for (const v of wsProtoValues(head)) for (const t of wsProtoSplit(v)) if (out.indexOf(t) === -1) out.push(t);
+    return out;
+  };
+
   const acceptFor = (key) => {
     try {
       const C = M["node:crypto"] || M["crypto"];
@@ -391,6 +410,11 @@ export constexpr std::string_view kWebSocketJS = R"JS(
         }
         if (basicAuth && !sawAuth) req += "Authorization: " + basicAuth + "\r\n";
         req += userHeaders;
+        // The set of protocols the response is allowed to name is seeded from
+        // the Sec-WebSocket-Protocol header we actually PUT ON THE WIRE -- which
+        // may come from the `protocols` argument OR from options.headers.
+        // ref: WebSocketUpgradeClient.rs:330-337 (`protocol_for_subprotocols`).
+        this._state.offered = wsProtoTokens(req);
         sock.write(req + "\r\n");
       };
       if (secure) {
@@ -433,8 +457,28 @@ export constexpr std::string_view kWebSocketJS = R"JS(
         if (!am) { this._fail(new Error("Missing websocket accept header"), 1002); return; }
         if (am[1].trim() !== this._state.expectedAccept) { this._fail(new Error("Mismatch websocket accept header"), 1002); return; }
       }
-      const pm = /\r\nsec-websocket-protocol:\s*([^\r\n]+)/i.exec(head);
-      if (pm) this.protocol = pm[1].trim();
+      // RFC 6455 client-side subprotocol validation. The response may carry AT
+      // MOST ONE Sec-WebSocket-Protocol header naming EXACTLY ONE protocol, and
+      // that protocol must be one the client offered; anything else fails the
+      // connection. Both failures are CLEAN 1002 closes with no 'error' event.
+      // PORT-SOURCE: compat/bun/src/http_jsc/websocket_client/WebSocketUpgradeClient.rs
+      //   :1340-1381 (per-header check) and :1518-1523 (missing-header check);
+      //   reasons from compat/bun/src/jsc/bindings/webcore/WebSocket.cpp:1724-1730.
+      {
+        const protoVals = wsProtoValues(head);
+        const offered = this._state.offered || [];
+        if (protoVals.length) {
+          const toks = protoVals.length === 1 ? wsProtoSplit(protoVals[0]) : [];
+          if (protoVals.length !== 1 || toks.length !== 1 || offered.indexOf(toks[0]) === -1) {
+            this._state.inHead = false; this._state.head = "";
+            this._finish(1002, "Mismatch client protocol", true); return;
+          }
+          this.protocol = toks[0];
+        } else if (offered.length) {
+          this._state.inHead = false; this._state.head = "";
+          this._finish(1002, "Missing client protocol", true); return;
+        }
+      }
       const em = /\r\nsec-websocket-extensions:\s*([^\r\n]+)/i.exec(head);
       if (em) this.extensions = em[1].trim();
       this._state.inHead = false; this._state.head = "";

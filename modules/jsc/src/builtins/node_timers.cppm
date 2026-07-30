@@ -96,6 +96,14 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
       t[KIND] = kind;
       t[STATE] = state;
       if (kind !== "immediate") setIdle(t, state.ms);
+      // node's Timeout holds its callback on `_onTimeout`, and listOnTimeout
+      // DROPS a timer whose `_onTimeout` was nulled instead of running it
+      // (lib/internal/timers.js). timers-fixture-unref.js cancels an interval
+      // exactly that way. Non-enumerable for the same reason as _idleTimeout.
+      if (kind !== "immediate" && typeof state.cb === "function" && t._onTimeout === undefined) {
+        try { Object.defineProperty(t, "_onTimeout", { value: state.cb, writable: true, enumerable: false, configurable: true }); }
+        catch (_) {}
+      }
       try {
         Object.defineProperty(t, "constructor", {
           value: kind === "immediate" ? Immediate : Timeout,
@@ -127,6 +135,12 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
         // callback. The native refresh cannot re-arm a fired timer, so always
         // schedule a fresh native timer behind the stable facade object.
         t.refresh = function refresh() {
+          // node refresh() ends in insert(this, this._idleTimeout), and insert()
+          // returns early for a negative msecs -- so refreshing a timer the
+          // caller UNENROLLED (_idleTimeout = -1) does not re-arm it. A timer
+          // that already fired or was cleared also reads -1 here, and node DOES
+          // re-arm that one, so _destroyed is what separates the two cases.
+          if (!t._destroyed && t._idleTimeout < 0) return t;
           state.gen++;
           try { oClearTimeout(state.native); } catch (_) {}
           state.native = __applySchedule(oSetTimeout, [state.run, state.ms],
@@ -141,6 +155,19 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
           activeTimeouts.add(t);
           return t;
         };
+      } else if (kind === "interval") {
+        // Same unenrolled-refresh rule for intervals; everything else stays on
+        // the native refresh the "refreshed setInterval should not reschedule
+        // again" case already exercises.
+        const oRefresh = t.refresh;
+        if (typeof oRefresh === "function") {
+          t.refresh = function refresh() {
+            if (!t._destroyed && t._idleTimeout < 0) return t;
+            state.rearmed = true;
+            const r = oRefresh.call(t);
+            return r === undefined ? t : r;
+          };
+        }
       }
       // Native Symbol.dispose clears the host timer directly, bypassing this
       // facade's registry and `_destroyed` lifecycle.  Route it through the
@@ -240,9 +267,10 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
       if (typeof cb !== "function") throw __invalidCb(cb);
       _checkCountdown(ms);
       cb = __sched(cb);
-      const state = { gen: 0, ms, args };
+      const state = { gen: 0, ms, args, cb };
       state.run = function (...a) {
         const g = state.gen;
+        if (state.timer && state.timer._onTimeout === null) { destroyTimer(state.timer); return; }
         try { return __runTimerCallback(state, cb, state.timer, a); }
         // refresh()/clear during the callback bumps gen: skip the destroy.
         finally { if (state.gen === g && state.timer) destroyTimer(state.timer); }
@@ -256,8 +284,26 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
       if (typeof cb !== "function") throw __invalidCb(cb);
       _checkCountdown(ms);
       cb = __sched(cb);
-      const state = { gen: 0, ms, args };
-      state.run = function (...a) { return __runTimerCallback(state, cb, state.timer, a); };
+      const state = { gen: 0, ms, args, cb };
+      state.run = function (...a) {
+        const t = state.timer;
+        // node listOnTimeout drops a timer whose _onTimeout was nulled without
+        // running it, and only re-inserts a repeating timer while its
+        // _idleTimeout is still enrolled -- unenrolling it to -1 from inside the
+        // callback stops the interval. ref: node lib/internal/timers.js.
+        if (t && t._onTimeout === null) { clearNative(t); destroyTimer(t); return; }
+        // A refresh() from inside the callback re-inserts the timer itself, so
+        // node's "don't re-insert an unenrolled repeater" branch cannot reach
+        // it -- it fires once more. `rearmed` reproduces that.
+        state.rearmed = false;
+        try { return __runTimerCallback(state, cb, t, a); }
+        finally { if (t && !t._destroyed && !state.rearmed && t._idleTimeout < 0) { clearNative(t); destroyTimer(t); } }
+      };
+      // Scheduled through __applySchedule, NOT `oSetInterval(state.run, ms,
+      // ...args)`. The spread form reads Array.prototype[Symbol.iterator], and
+      // test-repl-autocomplete / test-repl-history-navigation delete that
+      // intrinsic on purpose -- call-spread here made every setInterval throw
+      // for the rest of the process. Same call, no iterator dependency.
       const t = __applySchedule(oSetInterval, [state.run, ms], args);
       state.timer = t;
       state.native = t;
