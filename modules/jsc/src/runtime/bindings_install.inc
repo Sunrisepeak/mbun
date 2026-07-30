@@ -416,7 +416,27 @@
     _tickQ.push([cb, a]);
     if (!_tickArmed) {
       _tickArmed = true;
-      _pthen.call(_presolve(), function () { _tickArmed = false; runTicks(); });
+      _pthen.call(_presolve(), function () {
+        // node's arm is `runMicrotasks(); <tick loop>` — the microtask queue is
+        // EXHAUSTED before the tick queue is touched. This reaction is queued at
+        // PUSH time, i.e. in the middle of the very chain it must outlive, so it
+        // has to finish that chain itself. Without the drain,
+        //   Promise.resolve().then(() => {m1; nextTick(t)}).then(() => m2)
+        // ran m1, t, m2 where node runs m1, m2, t: the reaction sat in the queue
+        // ahead of the `.then` continuation the callback had just resolved.
+        // The drain must be the rejection-checkpoint-free one; see
+        // __mbunRunMicrotasksNative for why the full drain is not usable here.
+        // Resolved at call time — the native is installed after this prelude.
+        //
+        // _tickArmed stays TRUE for the drain and is cleared after it. A tick
+        // pushed by one of the microtasks drained here then arms NO second
+        // reaction inside this one: a promise chain that ticks once per link
+        // would otherwise nest one native drain per link and exhaust the stack.
+        const d = globalThis.__mbunRunMicrotasksNative;
+        if (d !== undefined) d();
+        _tickArmed = false;
+        runTicks();
+      });
     }
   };
   const nanos = () => (globalThis.Bun && Bun.nanoseconds ? Bun.nanoseconds() : 0);
@@ -680,6 +700,38 @@
                [](JSContextRef c, JSObjectRef, JSObjectRef, std::size_t, const JSValueRef[],
                   JSValueRef*) -> JSValueRef {
                    if (JSC::JSGlobalObject* g{::toJS(c)}) g->vm().drainMicrotasks();
+                   return JSValueMakeUndefined(c);
+               });
+        // node's runMicrotasks(): exhaust the microtask queue and NOTHING else.
+        // The difference from __mbunDrainMicrotasksNative above is the tail
+        // VM::drainMicrotasks() appends to the checkpoint —
+        // VM::didExhaustMicrotaskQueue(), which reports every
+        // rejected-without-handler promise it has collected. node performs that
+        // step (processPromiseRejections) only AFTER the nextTick queue has
+        // drained, so a rejection whose .catch() is attached from inside a
+        // process.nextTick is not unhandled. Calling the full drain from the
+        // middle of a microtask — which is what the p.nextTick arm above does —
+        // would run that report too early, and in mbun a false "Unhandled
+        // promise rejection" is fatal (finish_run_ forces status 1). Draining
+        // the default queue directly skips the report; JSC still performs it at
+        // the genuine exhaustion, by which time the tick has run and
+        // JSPromise::isHandled() suppresses it.
+        set_fn(ctx_, global, "__mbunRunMicrotasksNative",
+               [](JSContextRef c, JSObjectRef, JSObjectRef, std::size_t, const JSValueRef[],
+                  JSValueRef*) -> JSValueRef {
+                   if (JSC::JSGlobalObject* g{::toJS(c)}) {
+                       JSC::VM& vm{g->vm()};
+                       JSC::MicrotaskQueue& q{vm.defaultMicrotaskQueue()};
+                       // Nothing queued => nothing to exhaust, and the caller may
+                       // proceed straight to its ticks. Worth the branch: the
+                       // nextTick arm calls this on EVERY drain cycle, and a
+                       // checkpoint entered for an empty queue still builds a
+                       // VMEntryScope and an exception scope for no work.
+                       if (!q.isEmpty()) {
+                           const auto noSwitch{[](JSC::JSGlobalObject*, JSC::JSGlobalObject*) {}};
+                           q.performMicrotaskCheckpoint<false>(vm, noSwitch);
+                       }
+                   }
                    return JSValueMakeUndefined(c);
                });
         // JSC backing-width introspection used only by bun:internal-for-testing.
