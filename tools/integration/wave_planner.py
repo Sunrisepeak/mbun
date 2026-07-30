@@ -165,7 +165,13 @@ def is_struck(area: str, excluded: dict[str, dict[str, str]]) -> dict[str, str] 
 
 
 
-PORT_MARKERS = ("1:1 translation", "Mechanical 1:1", "机械翻译", "bun-ref")
+# A port marker must CLAIM a port. "bun-ref" alone is too loose: node_vm.cppm's
+# header reads "Blueprint: bun-ref src/js/node/vm.ts", which is a reference for
+# shape plus a documented DELIBERATE divergence -- and matching it made the planner
+# assert "already a 1:1 port" about a file that says the opposite. A lane caught
+# that. Require phrasing that actually asserts a translation.
+PORT_MARKERS = ("1:1 translation", "Mechanical 1:1", "机械翻译",
+                "mechanical translation", "1:1 port")
 
 
 def builtin_shape(area: str, builtins_dir: Path) -> tuple[str, str]:
