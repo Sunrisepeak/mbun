@@ -8684,6 +8684,54 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   M["fs/promises"] = fsPromises;
   M["node:fs/promises"] = fsPromises;
 
+  // ---- async fs: the callback must never run inside the caller's frame ----
+  // PORT-SOURCE: compat/node/lib/fs.js (open/stat/readdir/... all build an
+  // FSReqCallback and hand it to the binding; `req.oncomplete` is invoked by
+  // the loop, so node guarantees two things this runtime was breaking):
+  //   1. the callback NEVER runs before the caller returns, and
+  //   2. it runs after the process.nextTick queue and the microtask queue that
+  //      the calling turn produced — the completion lands in a later loop turn.
+  // Measured on the pre-change binary, ten entry points invoked their callback
+  // synchronously (open, stat, lstat, fstat, appendFile, readdir, unlink,
+  // mkdir, chmod, readlink), so there was never an in-flight window at all.
+  // fs.readFile / fs.writeFile were already fixed this way (see their
+  // G.setImmediate above, added for test-fs-readfile / test-fs-write-file
+  // cancellation); this generalises that fix instead of inventing a mechanism.
+  //
+  // setImmediate, NOT queueMicrotask: process.nextTick has strict priority over
+  // promise microtasks in this runtime, so a microtask-deferred completion
+  // still beats a nextTick queued before it — which is exactly backwards from
+  // node and is what made a nextTick-scheduled abort() lose the race.
+  //
+  // The wrapper defers ONLY a callback that fired synchronously. An entry point
+  // that already schedules its own completion passes straight through, so this
+  // cannot double-defer or re-order anything that was already asynchronous.
+  // Validation still throws out of the caller's frame: `fn` is invoked inline.
+  const fsDeferCompletion = (fn) => function (...args) {
+    let i = args.length - 1;
+    while (i >= 0 && typeof args[i] !== "function") i -= 1;
+    if (i < 0) return fn.apply(this, args);
+    const real = args[i];
+    let inFrame = true, fired = false, out = null;
+    args[i] = function (...r) {
+      // Still inside fn's own call? Capture and replay later. Otherwise the
+      // implementation already deferred, and the completion is passed through.
+      if (inFrame) { fired = true; out = r; return undefined; }
+      return real.apply(this, r);
+    };
+    const ret = fn.apply(this, args);
+    inFrame = false;
+    if (fired) G.setImmediate(() => real.apply(undefined, out));
+    return ret;
+  };
+  for (const fsAsyncName of ["open", "stat", "lstat", "fstat", "appendFile",
+                             "readdir", "unlink", "mkdir", "chmod", "readlink",
+                             "fchmod", "lchmod", "chown", "fchown", "lchown"]) {
+    if (typeof fsMod[fsAsyncName] === "function") {
+      fsMod[fsAsyncName] = fsDeferCompletion(fsMod[fsAsyncName]);
+    }
+  }
+
   // ---- string_decoder ----
   class StringDecoder {
     constructor(enc) { this.encoding = enc || "utf8"; }
