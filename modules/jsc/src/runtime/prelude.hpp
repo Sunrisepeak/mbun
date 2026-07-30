@@ -67,6 +67,11 @@
 // API leaves null (see engine.inc create_context_).
 #include <JavaScriptCore/GlobalObjectMethodTable.h>
 #include <JavaScriptCore/VM.h>
+// MicrotaskQueueInlines.h — MicrotaskQueue::performMicrotaskCheckpoint, i.e.
+// node's runMicrotasks(): exhaust the microtask queue WITHOUT the
+// unhandled-rejection checkpoint VM::drainMicrotasks() appends to it
+// (bindings_install.inc __mbunRunMicrotasksNative).
+#include <JavaScriptCore/MicrotaskQueueInlines.h>
 // JSDateMath.h (JSC::DateCache) + wtf/DateMath.h (WTF::setTimeZoneOverride):
 // assigning process.env.TZ has to invalidate the per-VM timezone cache, which
 // only these expose (runtime/process_base.inc proc_set_timezone_cb).

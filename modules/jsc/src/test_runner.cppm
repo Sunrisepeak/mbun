@@ -1243,11 +1243,31 @@ inline constexpr std::string_view HARNESS = R"JS(
       } else failAllIn(item.scope, msg);
     }
   }
+  // Wait for a done() that has not fired yet, WITHOUT declaring a hook/body
+  // complete while its callback is still queued somewhere.
+  //
+  // A microtask spin alone cannot see a done() scheduled with
+  // process.nextTick: the tick queue runs only once the microtask queue is
+  // EXHAUSTED (node's processTicksAndRejections), and awaiting resolved
+  // promises keeps it non-empty for exactly as long as the spin lasts. So the
+  // spin is only the cheap first stage; while the tick queue actually holds
+  // work, yield to the pump instead — every pump phase drains ticks — and
+  // re-check. Getting this wrong is silent and wide: a done-style
+  // `beforeEach` whose callback arrives on a tick was treated as complete, and
+  // every test in the describe then observed its side effects as unapplied
+  // (jsonwebtoken/claim-aud: 60 pass → 17, all "jwt must be provided").
+  async function awaitDone(isSettled) {
+    for (let i = 0; i < 8 && !isSettled(); i++) await Promise.resolve();
+    for (let i = 0; i < 16 && !isSettled() && G.__mbunTickCount && G.__mbunTickCount() > 0; i++) {
+      await new Promise((r) => natSetTimeout(r, 0));
+    }
+  }
   // Run one hook, supporting done-callback style (fn.length >= 1) exactly like
-  // a done-style test body: done() may fire sync, via a microtask, or via a
-  // timer (setImmediate/setTimeout push into __mbunTimers.q, which the C++ pump
-  // drains). Without this, a done-style beforeEach/beforeAll would not be
-  // awaited and the test body would observe its side effects as not-yet-applied.
+  // a done-style test body: done() may fire sync, via a microtask, via the tick
+  // queue, or via a timer (setImmediate/setTimeout push into __mbunTimers.q,
+  // which the C++ pump drains). Without this, a done-style beforeEach/beforeAll
+  // would not be awaited and the test body would observe its side effects as
+  // not-yet-applied.
   function callHook(h) {
     if (typeof h === "function" && h.length >= 1) {
       return new Promise((resolve, reject) => {
@@ -1255,7 +1275,7 @@ inline constexpr std::string_view HARNESS = R"JS(
         const done = (err) => { if (settled) return; settled = true; if (err) reject(err instanceof Error ? err : new Error(String(err))); else resolve(); };
         let r; try { r = h(done); } catch (e) { done(e); return; }
         if (r && typeof r.then === "function") { r.then(() => done(), (e) => done(e)); return; }
-        (async () => { for (let i = 0; i < 8 && !settled; i++) await Promise.resolve(); if (!settled && (!G.__mbunTimers || G.__mbunTimers.q.length === 0)) { settled = true; resolve(); } })();
+        (async () => { await awaitDone(() => settled); if (!settled && (!G.__mbunTimers || G.__mbunTimers.q.length === 0)) { settled = true; resolve(); } })();
       });
     }
     const r = h();
@@ -1351,11 +1371,12 @@ inline constexpr std::string_view HARNESS = R"JS(
           const done = (err) => { if (settled) return; settled = true; if (err) reject(err instanceof Error ? err : new Error(String(err))); else resolve(); };
           let r; try { r = t.fn(done); } catch (e) { done(e); return; }
           if (r && typeof r.then === "function") { r.then(() => done(), (e) => done(e)); return; }
-          // Body returned synchronously without a promise. Drain a few microtasks;
-          // if done() still hasn't fired AND no timer is pending (which could call
-          // done via the runner's timer pump), treat it as complete (arity-1 arg
-          // that isn't a done callback). If timers ARE pending, wait for them.
-          (async () => { for (let i = 0; i < 8 && !settled; i++) await Promise.resolve(); if (!settled && (!G.__mbunTimers || G.__mbunTimers.q.length === 0)) { settled = true; resolve(); } })();
+          // Body returned synchronously without a promise. Give the pending
+          // done() every queue it could be sitting in (see awaitDone); if it
+          // still hasn't fired AND no timer is pending (which could call done via
+          // the runner's timer pump), treat it as complete (arity-1 arg that
+          // isn't a done callback). If timers ARE pending, wait for them.
+          (async () => { await awaitDone(() => settled); if (!settled && (!G.__mbunTimers || G.__mbunTimers.q.length === 0)) { settled = true; resolve(); } })();
         });
       } else {
         bodyPromise = Promise.resolve().then(() => { const r = t.fn(); return (r && typeof r.then === "function") ? r : undefined; });

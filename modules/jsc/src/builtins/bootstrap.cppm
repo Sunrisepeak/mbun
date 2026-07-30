@@ -6789,6 +6789,23 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     return s;
   };
   const fsThrowIfAborted = (s) => { if (s && s.aborted) throw fsAbortErr(s); };
+  // Yield a full loop turn before honouring options.signal. node runs fs work on
+  // the thread pool, so the operation's own completion is a LOOP turn: an abort
+  // scheduled with process.nextTick (or setImmediate) in the turn that started
+  // the call always lands first, and every abort-signal test asserts exactly
+  // that (node test-fs-promises-writefile, -file-handle-writeFile,
+  // -file-handle-append-file; bun abort-signal-leak-read-write-file). mbun does
+  // the work synchronously behind ONE microtask hop, so the abort only used to
+  // win by accident: process.nextTick armed its drain with a promise reaction
+  // queued mid-chain, and that reaction interleaved into the middle of this very
+  // `.then`. Once nextTick drains at the microtask-exhaustion boundary node puts
+  // it at, one microtask hop is no longer enough. FileHandle#readFile below
+  // already yields this way, with the same reasoning. Only signalled calls pay
+  // the turn — an unsignalled writeFile keeps its microtask-only latency.
+  const fsAbortYield = (s) => {
+    if (s === undefined || s === null) return undefined;
+    return new Promise((r) => G.setImmediate(r));
+  };
   class FileHandle {
     constructor(fd) { this._fd = fd; this._closed = false; this._refs = 0; this._events = { __proto__: null }; }
     get fd() { return this._fd; }
@@ -6944,6 +6961,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       const enc = typeof o === "string" ? o : (o && o.encoding) || "utf8";
       const signal = fsSignalOf(o);
       return Promise.resolve().then(async () => {
+        await fsAbortYield(signal);
         fsThrowIfAborted(signal);
         const fd = this._use("write");
         // node consumes (async) iterables here too (a Readable is the common case).
@@ -6965,7 +6983,8 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     appendFile(data, o) {
       const enc = typeof o === "string" ? o : (o && o.encoding) || "utf8";
       const signal = fsSignalOf(o);
-      return Promise.resolve().then(() => {
+      return Promise.resolve().then(async () => {
+        await fsAbortYield(signal);
         fsThrowIfAborted(signal);
         fsValidateData(data);
         const fd = this._use("write");
@@ -7285,6 +7304,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     writeFile: (p, d, o) => Promise.resolve().then(async () => {
       if (p && typeof p === "object" && typeof p.writeFile === "function") return p.writeFile(d, o);
       const signal = fsSignalOf(o);
+      await fsAbortYield(signal);
       fsThrowIfAborted(signal);
       if (d != null && typeof d !== "string" && !ArrayBuffer.isView(d) && !(d instanceof ArrayBuffer) &&
           typeof d[Symbol.asyncIterator] !== "function" && typeof d[Symbol.iterator] !== "function")

@@ -124,6 +124,25 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
   // and .resource. Re-wrapping it would erase both and report a network error
   // for something the sandbox refused.
   const isAccessDenied = (e) => !!(e && e.code === "ERR_ACCESS_DENIED");
+  // Re-defer a callback so it lands BEHIND everything already in the
+  // process.nextTick queue. node's 'connect' comes from the poll phase, i.e.
+  // strictly after the tick queue of the turn that started the connect, and
+  // ClientRequest's socket setup (onSocket -> nextTick(onSocketNT)) lives in
+  // that queue. This runtime completes connect() on a MICROTASK, so a plain
+  // queueMicrotask re-defer cannot get behind a pending tick: microtasks drain
+  // to exhaustion BEFORE the tick queue runs. Handing it to nextTick puts it in
+  // the same FIFO as onSocketNT, which was pushed first — so 'connect' still
+  // follows the socket setup. (It used to work by accident: nextTick armed its
+  // drain with a promise reaction queued mid-chain, so one extra microtask hop
+  // was enough to lose the race. Correcting that ordering broke the hop, and
+  // 'connect' overtook 'socket' — visible as test-http-client-set-timeout
+  // seeing the request timeout already applied and
+  // test-http-keep-alive-close-on-header counting zero 'connect' events.)
+  const _deferPastTicks = (fn) => {
+    const p = G.process;
+    if (p && typeof p.nextTick === "function") p.nextTick(fn);
+    else G.queueMicrotask(fn);
+  };
   // node publishes a "net" performance timeline entry named "connect" once an
   // outbound socket is up (lib/net.js startPerf/stopPerf). perf_hooks installs
   // the sink and itself no-ops unless a PerformanceObserver is subscribed to
@@ -764,7 +783,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
           const finishConnect = () => {
             if (self._httpClientConnectPending) {
               self._httpClientConnectPending = false;
-              G.queueMicrotask(finishConnect);
+              _deferPastTicks(finishConnect);
               return;
             }
             if (self.destroyed) { self.connecting = false; return; }
@@ -851,7 +870,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       const finishConnect = () => {
         if (this._httpClientConnectPending) {
           this._httpClientConnectPending = false;
-          G.queueMicrotask(finishConnect);
+          _deferPastTicks(finishConnect);
           return;
         }
         if (this.destroyed) { this.connecting = false; return; }
