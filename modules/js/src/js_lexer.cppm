@@ -541,6 +541,13 @@ private:
         if (is_unicode_whitespace(cp) || is_unicode_newline(cp)) {
             return false;
         }
+        // C1 controls (U+0080..U+009F) are Cc, never ID_Start/ID_Continue. The
+        // default-allow rule below let `class { W\u0081; }` lex as one
+        // identifier and the invalid property name went unreported.
+        // ref: regression 012039.
+        if (cp <= 0x009F) {
+            return false;
+        }
         if (cp >= 0x00A1 && cp <= 0x00BF) {
             return cp == 0x00AA || cp == 0x00B5 || cp == 0x00BA;
         }
@@ -865,6 +872,21 @@ private:
             auto [cp, len] = decode_utf8(pos_);
             bool ok = first ? is_unicode_id_start(cp) : is_unicode_id_continue(cp);
             if (!ok) {
+                // A non-ASCII codepoint that is neither an identifier character
+                // nor a separator cannot begin the NEXT token either, so merely
+                // ending the identifier here reported the failure in the wrong
+                // place ("Expected identifier but found SyntaxError"). Name the
+                // offending run instead, the way esbuild/bun do.
+                // Whitespace/newline codepoints (NBSP, U+2028, ...) legitimately
+                // terminate an identifier and must keep breaking out.
+                // ref: regression 012039.
+                if (!first && !is_unicode_whitespace(cp) && !is_unicode_newline(cp)) {
+                    std::string msg{"Unexpected \""};
+                    msg += identBuf_;
+                    msg += src_.substr(pos_, len);
+                    msg += '"';
+                    return make_fatal(msg);
+                }
                 break;
             }
             identBuf_.append(src_.substr(pos_, len));

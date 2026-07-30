@@ -299,11 +299,23 @@ export constexpr std::string_view kWebSocketJS = R"JS(
       this.onopen = null; this.onmessage = null; this.onerror = null; this.onclose = null;
       this._ls = Object.create(null);
       this._state = { head: "", inHead: true, closeSent: false, done: false, pending: false };
-      const m = /^(wss?|https?):\/\/(\[[^\]]+\]|[^/:?#]+)(?::(\d+))?(.*)$/.exec(this.url);
+      // The authority may carry userinfo (`ws://user:pass@host:port/`). Without
+      // the `(?:([^/?#@]*)@)?` group the host class stopped at the first ":",
+      // so `host` became the username and the connect failed with ENOTFOUND.
+      // WHATWG: userinfo is percent-decoded and re-sent as HTTP Basic auth.
+      // ref: regression 24388.
+      const m = /^(wss?|https?):\/\/(?:([^/?#@]*)@)?(\[[^\]]+\]|[^/:?#]+)(?::(\d+))?(.*)$/.exec(this.url);
       if (!m) throw new SyntaxError("Invalid WebSocket URL: " + this.url);
       const secure = m[1] === "wss" || m[1] === "https";
-      const host = m[2], port = m[3] ? +m[3] : (secure ? 443 : 80);
-      let target = m[4] || "/"; if (target[0] !== "/") target = "/" + target;
+      const host = m[3], port = m[4] ? +m[4] : (secure ? 443 : 80);
+      let target = m[5] || "/"; if (target[0] !== "/") target = "/" + target;
+      let basicAuth = null;
+      if (m[2] !== undefined && m[2] !== "") {
+        const at = m[2].indexOf(":");
+        const dec = (s) => { try { return decodeURIComponent(s); } catch (e) { return s; } };
+        const userpass = at === -1 ? dec(m[2]) : dec(m[2].slice(0, at)) + ":" + dec(m[2].slice(at + 1));
+        basicAuth = "Basic " + (G.Buffer ? G.Buffer.from(userpass, "utf8").toString("base64") : G.btoa(userpass));
+      }
       if (typeof protocols === "string") protocols = [protocols];
       let wsOpts = null;
       if (protocols && !Array.isArray(protocols) && typeof protocols === "object") {  // bun: options object
@@ -361,7 +373,18 @@ export constexpr std::string_view kWebSocketJS = R"JS(
         if (!(wsOpts && "perMessageDeflate" in wsOpts && !wsOpts.perMessageDeflate))
           req += "Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\n";
         if (this._protocols.length) req += "Sec-WebSocket-Protocol: " + this._protocols.join(", ") + "\r\n";
-        if (wsOpts && wsOpts.headers) { const hs = wsOpts.headers; if (typeof hs.forEach === "function") hs.forEach((v, k) => { req += k + ": " + v + "\r\n"; }); else for (const k of Object.keys(hs)) req += k + ": " + hs[k] + "\r\n"; }
+        // Collect the caller's headers first so an explicit Authorization wins
+        // over the one derived from the URL's userinfo (24388 asserts exactly
+        // that precedence), and so the two never both reach the wire.
+        let userHeaders = "", sawAuth = false;
+        if (wsOpts && wsOpts.headers) {
+          const hs = wsOpts.headers;
+          const add = (v, k) => { if (String(k).toLowerCase() === "authorization") sawAuth = true; userHeaders += k + ": " + v + "\r\n"; };
+          if (typeof hs.forEach === "function") hs.forEach(add);
+          else for (const k of Object.keys(hs)) add(hs[k], k);
+        }
+        if (basicAuth && !sawAuth) req += "Authorization: " + basicAuth + "\r\n";
+        req += userHeaders;
         sock.write(req + "\r\n");
       };
       if (secure) {

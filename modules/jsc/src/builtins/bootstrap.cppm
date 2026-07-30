@@ -2711,6 +2711,47 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       else if (ev === "readable") { readableMode = true; if (!ended) attach(); }
       return stdin;
     };
+    // `for await (const chunk of process.stdin)` — the canonical way a CLI/TUI
+    // drains piped input. node's Readable gets this from Symbol.asyncIterator;
+    // this stdin is a hand-rolled EventEmitter, so it had none at all and the
+    // for-await threw "undefined is not a function". Subscribe with origOn so
+    // the on() override's implicit resume() does not double-fire, then drive
+    // flowing mode explicitly. ref: regression tui-app-tty-pattern.
+    stdin[Symbol.asyncIterator] = function () {
+      const q = [];
+      let fin = ended || eof, ferr = null, waiter = null, live = true;
+      const wake = () => { const w = waiter; waiter = null; if (w) w(); };
+      const onData = (c) => { q.push(c); wake(); };
+      const onEnd = () => { fin = true; wake(); };
+      const onErr = (e) => { ferr = e; fin = true; wake(); };
+      const cleanup = () => {
+        if (!live) return;
+        live = false;
+        stdin.removeListener("data", onData);
+        stdin.removeListener("end", onEnd);
+        stdin.removeListener("error", onErr);
+      };
+      if (!fin) {
+        origOn("data", onData); origOn("end", onEnd); origOn("error", onErr);
+        stdin.resume();
+      } else {
+        live = false;
+      }
+      return {
+        [Symbol.asyncIterator]() { return this; },
+        next() {
+          const step = () => {
+            if (q.length) return { value: q.shift(), done: false };
+            if (ferr) { const e = ferr; ferr = null; cleanup(); throw e; }
+            if (fin) { cleanup(); return { value: undefined, done: true }; }
+            return new Promise((res) => { waiter = res; }).then(step);
+          };
+          try { return Promise.resolve(step()); } catch (e) { return Promise.reject(e); }
+        },
+        return(v) { cleanup(); return Promise.resolve({ value: v, done: true }); },
+        throw(e) { cleanup(); return Promise.reject(e); },
+      };
+    };
     G.process.stdin = stdin;
     // process.stdout/.stderr are tty.WriteStream/Socket in node & bun, i.e. real
     // EventEmitters: consumers subscribe to "resize"/"error"/"close" on them
