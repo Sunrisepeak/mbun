@@ -223,11 +223,31 @@ def ensure_corpus_dependencies(corpus_root: Path) -> None:
 
 
 def read_list(path: Path) -> list[str]:
+    """A newline-separated list of test paths -- and NOT a results.tsv.
+
+    Handing this a results.tsv is an easy mistake (both are line-oriented, both
+    start with a path) and it used to fail silently: every row's trailing
+    tab-separated columns became part of the "path", nothing matched, and the run
+    reported ~1900 `no-tests` rows. That reads exactly like a catastrophic
+    regression rather than like a bad argument, and a lane lost a full round to
+    it. So detect the shape and refuse.
+    """
     values: list[str] = []
+    tabbed = 0
     for line in path.read_text(encoding="utf-8").splitlines():
         value = line.strip()
-        if value and not value.startswith("#"):
-            values.append(value)
+        if not value or value.startswith("#"):
+            continue
+        if "\t" in value:
+            tabbed += 1
+        values.append(value)
+    if tabbed:
+        raise SystemExit(
+            f"bun_corpus_runner: --list {path} looks like a TSV, not a path list "
+            f"({tabbed} of {len(values)} lines contain tabs).\n"
+            f"  A results.tsv passed here yields ~1900 silent 'no-tests' rows that "
+            f"look like a total regression.\n"
+            f"  Extract the paths first:  awk -F'\\t' 'NR>1{{print $1}}' {path} > list.txt")
     return values
 
 
