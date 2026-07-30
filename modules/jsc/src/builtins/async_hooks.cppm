@@ -1138,7 +1138,13 @@ inline constexpr std::string_view kAsyncHooksJS = R"JS(
       internalNextTick = (fn) => Reflect.apply(nativeNextTick, processRef, [fn]);
       G.process.nextTick = function nextTick(callback, ...args) {
         if (typeof callback !== 'function') return Reflect.apply(nativeNextTick, this, arguments);
-        return Reflect.apply(nativeNextTick, this, [wrapAsync(callback, 'TickObject'), ...args]);
+        // Indexed copy, not `[wrapped, ...args]`: array-literal spread reads
+        // `Array.prototype[Symbol.iterator]` at call time, so user code that
+        // deleted the array iterator would break every nextTick after it.
+        // node's own tick queue is written against primordials for this reason.
+        const call = [wrapAsync(callback, 'TickObject')];
+        for (let i = 0; i < args.length; i++) call[call.length] = args[i];
+        return Reflect.apply(nativeNextTick, this, call);
       };
     }
 

@@ -129,7 +129,8 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
         t.refresh = function refresh() {
           state.gen++;
           try { oClearTimeout(state.native); } catch (_) {}
-          state.native = oSetTimeout(state.run, state.ms, ...state.args);
+          state.native = __applySchedule(oSetTimeout, [state.run, state.ms],
+                                        state.args || []);
           // node Timeout.refresh() re-enrols the handle: _idleStart advances
           // (test-tls-wrap-timeout asserts the later start is strictly greater)
           // and a previously unenrolled timer gets its duration back.
@@ -214,6 +215,27 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
       return cb.apply(thisArg, args);
     };
 
+    // Forward to a native scheduler without ever writing `f(a, ...args)`.
+    //
+    // Spread in a CALL goes through the iterator protocol — it reads
+    // `Array.prototype[Symbol.iterator]` at the moment of the call — while a
+    // rest PARAMETER does not (it is built with CreateArrayFromList) and
+    // `Function.prototype.apply` does not either (CreateListFromArrayLike).
+    // node's timers are written against primordials for exactly this reason,
+    // so `delete Array.prototype[Symbol.iterator]` cannot break scheduling.
+    // mbun's spread version could: the first setTimeout after that deletion
+    // threw `Spread syntax requires ...iterable[Symbol.iterator] to be a
+    // function` out of readline's line handler, which killed the REPL driver
+    // in test-repl-autocomplete / test-repl-history-navigation before they
+    // could restore the intrinsic, and the leaked deletion then took down
+    // test/common/tmpdir's exit-time cleanup.
+    // PORT-SOURCE: node lib/timers.js (ArrayPrototypePush + ReflectApply)
+    const __applySchedule = (fn, head, args) => {
+      const call = head;
+      for (let i = 0; i < args.length; i++) call[call.length] = args[i];
+      return fn.apply(undefined, call);
+    };
+
     const mySetTimeout = function setTimeout(cb, ms, ...args) {
       if (typeof cb !== "function") throw __invalidCb(cb);
       _checkCountdown(ms);
@@ -225,7 +247,7 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
         // refresh()/clear during the callback bumps gen: skip the destroy.
         finally { if (state.gen === g && state.timer) destroyTimer(state.timer); }
       };
-      const t = oSetTimeout(state.run, ms, ...args);
+      const t = __applySchedule(oSetTimeout, [state.run, ms], args);
       state.timer = t;
       state.native = t;
       return initTimer(t, "timeout", state);
@@ -236,7 +258,7 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
       cb = __sched(cb);
       const state = { gen: 0, ms, args };
       state.run = function (...a) { return __runTimerCallback(state, cb, state.timer, a); };
-      const t = oSetInterval(state.run, ms, ...args);
+      const t = __applySchedule(oSetInterval, [state.run, ms], args);
       state.timer = t;
       state.native = t;
       return initTimer(t, "interval", state);
@@ -252,7 +274,7 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
         try { return __runTimerCallback(state, cb, state.timer, a); }
         finally { if (state.gen === g && state.timer) destroyTimer(state.timer); }
       };
-      const t = oSetImmediate(state.run, ...args);
+      const t = __applySchedule(oSetImmediate, [state.run], args);
       state.timer = t;
       state.native = t;
       return initTimer(t, "immediate", state);

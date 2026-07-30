@@ -2258,18 +2258,18 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       if (!events) throw unhandled();
       const errorMonitor = events[kErrorMonitor];
       if (typeof errorMonitor === "function") errorMonitor.apply(emitter, args);
-      else if (errorMonitor) for (const handler of errorMonitor.slice()) handler.apply(emitter, args);
+      else if (errorMonitor) { const c = errorMonitor.slice(); for (let i = 0; i < c.length; i++) c[i].apply(emitter, args); }
       const handlers = events.error;
       if (!handlers) throw unhandled();
       if (typeof handlers === "function") handlers.apply(emitter, args);
-      else for (const handler of handlers.slice()) handler.apply(emitter, args);
+      else { const c = handlers.slice(); for (let i = 0; i < c.length; i++) c[i].apply(emitter, args); }
       return true;
     }
     function addCatch(emitter, promise, type, args) {
       promise.then(undefined, function (err) { queueMicrotask(() => emitUnhandledRejectionOrErr(emitter, err, type, args)); });
     }
     function emitUnhandledRejectionOrErr(emitter, err, type, args) {
-      if (typeof emitter[kRejection] === "function") { emitter[kRejection](err, type, ...args); }
+      if (typeof emitter[kRejection] === "function") { const c = [err, type]; for (let i = 0; i < args.length; i++) c[c.length] = args[i]; emitter[kRejection].apply(emitter, c); }
       else { try { emitter[kCapture] = false; emitter.emit("error", err); } finally { emitter[kCapture] = true; } }
     }
     const emitWithoutRejectionCapture = function emit(type, ...args) {
@@ -2279,7 +2279,12 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       const handlers = events[type];
       if (handlers === undefined) return false;
       if (typeof handlers === "function") handlers.apply(this, args);
-      else for (const handler of handlers.slice()) handler.apply(this, args);
+      // Indexed loop, not for-of: `for (x of arr)` reads
+      // `Array.prototype[Symbol.iterator]` on every emit, so a program that
+      // deleted the array iterator could no longer dispatch ANY multi-listener
+      // event — including the 'line' event readline uses to drive the REPL.
+      // node's lib/events.js uses ArrayPrototypeSlice + ReflectApply for this.
+      else { const c = handlers.slice(); for (let i = 0; i < c.length; i++) c[i].apply(this, args); }
       return true;
     };
     const emitWithRejectionCapture = function emit(type, ...args) {
@@ -2291,9 +2296,12 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       if (typeof handlers === "function") {
         const result = handlers.apply(this, args);
         if (result !== undefined && typeof result?.then === "function" && result.then === Promise.prototype.then) addCatch(this, result, type, args);
-      } else for (const handler of handlers.slice()) {
-        const result = handler.apply(this, args);
-        if (result !== undefined && typeof result?.then === "function" && result.then === Promise.prototype.then) addCatch(this, result, type, args);
+      } else {
+        const c = handlers.slice();
+        for (let i = 0; i < c.length; i++) {
+          const result = c[i].apply(this, args);
+          if (result !== undefined && typeof result?.then === "function" && result.then === Promise.prototype.then) addCatch(this, result, type, args);
+        }
       }
       return true;
     };
