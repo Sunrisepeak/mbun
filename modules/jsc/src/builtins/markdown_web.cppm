@@ -1431,6 +1431,11 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       json() { G.__mbunCheckAllocLimit(this.size, "json"); return Promise.resolve(JSON.parse(td.decode(this._u8))); }
       arrayBuffer() { return Promise.resolve(this._u8.buffer.slice(this._u8.byteOffset, this._u8.byteOffset + this._u8.byteLength)); }
       bytes() { G.__mbunCheckAllocLimit(this.size, "bytes"); return Promise.resolve(new Uint8Array(this._u8)); }
+      // Blob#stat() (bun Blob.rs getStat): a blob backed by BYTES has no file
+      // behind it, so it resolves undefined rather than throwing — only the
+      // *writers* (write/writer/unlink/delete) are read-only errors there.
+      // Bun.file() installs its own `stat` slot, which shadows this one.
+      stat() { return Promise.resolve(undefined); }
       // Slicing walks the part list and keeps sub-views of the parts it
       // overlaps, so `bigBlob.slice(n, n + 1)` costs one byte, not a join of
       // the whole blob.
