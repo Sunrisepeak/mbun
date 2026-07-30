@@ -5,6 +5,55 @@ session that is interrupted (usage limit, crash, restart) can pick up from the
 file rather than from memory. **If you are a fresh session reading this, start
 here.**
 
+## 2026-07-31 04:00 — The inspector IS a stub. Detection-gap vs capability-project, now MEASURED.
+
+The distinction that shaped the last two waves was a prediction; it is now a
+measurement, and it held.
+
+**`node:inspector` already exists** and exports `open, close, url,
+waitForDebugger, console, Session`, while `process.features.inspector` is false —
+which is exactly the shape that made `node:sqlite` (+13) and Intl (+7) cheap. So
+the obvious move was to flip the flag. **It is a shape-only stub:**
+
+```
+new Session().connect()                      -> ok
+session.post("Runtime.evaluate", {...}, cb)  -> cb(null, {})     <- empty, does nothing
+inspector.url()                              -> undefined
+```
+
+Methods exist and do not throw; they do no work. Flipping `features.inspector`
+would make **178 files run and fail**. It is a capability project, and the earlier
+call to leave the flag false was right for the right reason.
+
+**So the three big blocks are now each classified by evidence, not by guess:**
+
+| block | files | verdict | basis |
+| --- | ---: | --- | --- |
+| `node:sqlite` | 22 | **detection gap** — CLOSED, +13 | `bun:sqlite` fully worked |
+| Intl | 12 | **detection gap** — CLOSED, +7 | full ICU verified (de-DE formatting, collation) |
+| V8 inspector | 178 | **capability project** | `post()` returns `{}`; probed above |
+| QUIC | 236 | **capability project** | `features.quic` false, no subsystem present |
+
+That is the whole method for the remaining self-skips: probe the module before
+touching the flag. A module that exists proves nothing — `bun:sqlite` did real
+work, `node:inspector` does not.
+
+### Worklists regenerated — the drift was doubling
+
+The wave-57 worklists had decayed badly; a lane found **26 of its 174 "failing"
+files already green**. Regenerated from the w59 full run:
+
+| area | w57 said fail | actually fail |
+| --- | ---: | ---: |
+| `js/bun` | 260 | **236** |
+| `regression/issue` | 174 | **148** |
+| `js/node` | 135 | **125** |
+| `js/web` | 79 | **75** |
+
+New lists live in `target/integration/worklists-w61/`. **Regenerate after every
+full run** — a stale fail-list sends lanes at files that are already green, which
+is silent waste that looks like productive triage.
+
 ## 2026-07-31 02:00 — TWO detection gaps found, MEASURED, and both HELD. Read before re-attempting.
 
 Both came out of the self-skip inventory, both are truthful changes, and **both are
