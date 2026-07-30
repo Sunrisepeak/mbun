@@ -619,6 +619,17 @@ JSValueRef netn_set_sockbuf_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::
     else if (fd >= 0 && which == 5) {
         (void)setsockopt(fd, IPPROTO_IP, IP_TOS, &size, sizeof size);
     }
+    // which == 6: SO_LINGER with a zero timeout, `size` = 0/1. This is the
+    // switch node's tcp_wrap handle.reset() throws before close(2): a lingering
+    // socket closed with l_onoff=1/l_linger=0 sends an RST instead of a FIN, so
+    // the peer's next read(2) fails with ECONNRESET rather than reporting EOF.
+    // Socket.prototype.resetAndDestroy is built on exactly that.
+    else if (fd >= 0 && which == 6) {
+        struct linger lg{};
+        lg.l_onoff = size > 0 ? 1 : 0;
+        lg.l_linger = 0;
+        (void)setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg, sizeof lg);
+    }
 #endif
     return JSValueMakeUndefined(ctx);
 }
