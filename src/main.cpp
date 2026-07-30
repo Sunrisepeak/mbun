@@ -516,6 +516,8 @@ int main(int argc, char* argv[]) {
         return run_build(std::span{args}.subspan(1));
     case Action::Exec:
         return run_exec(parsed.argument);
+    case Action::Publish:
+        return run_publish(std::span{args}.subspan(1));
     case Action::NotImplemented:
         std::println("mbun: '{}' is planned but not implemented yet", parsed.argument);
         return 1;

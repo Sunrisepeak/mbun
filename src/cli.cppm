@@ -50,6 +50,7 @@ enum class Action {
     Add,             // `mbun add <pkg>...` — resolve + install + edit package.json
     Build,           // `mbun build <entry> [...flags]` — bundler CLI (R7)
     Exec,            // `mbun exec <script>` — shell script via mbun's shell interpreter
+    Publish,         // `mbun publish [flags] [dist]` — help screen only (see run_publish)
     NotImplemented,  // 已规划子命令占位（当前为空），由后续任务逐步实现
     Unknown,
 };
@@ -83,6 +84,12 @@ Parsed parse(std::span<const std::string_view> args) {
     if (first == "exec") {
         return { Action::Exec, args.size() > 1 ? std::string { args[1] } : std::string {} };
     }
+
+    // `publish` is a reserved subcommand in bun (PackageManager Subcommand::Publish),
+    // so it must never fall through to package.json script resolution — that is
+    // what made `mbun publish --help` report `Script not found "publish"`.
+    // Only the help screen is implemented; see mbun::app::run_publish.
+    if (first == "publish") return { Action::Publish, std::string { first } };
 
     // `run` handled ahead of dispatch in main; `test`/`install`/`build`/`exec` handled above.
     return { Action::Unknown, std::string { first } };
