@@ -103,11 +103,25 @@ inline constexpr std::string_view kNodeDiagJS = R"JS(
 
   // WeakReference: a WeakRef with an explicit incRef/decRef counter (Node's
   // internal WeakReference used to keep channels alive while referenced).
+  // node's WeakReference is STRONG while refCount > 0 -- that is the whole point
+  // of incRef/decRef, and counting alone does not do it. This held a weak
+  // reference at every refcount, which was invisible for as long as forced GC was
+  // a no-op (`Bun.gc` was `() => {}` and the native only hinted). Once real
+  // collection landed, a channel with live subscribers was collected and
+  // `channel('x').hasSubscribers` went false -- exactly what
+  // test-diagnostics-channel-gc-maintains-subcriptions.js pins.
   class WeakReference extends WeakRef {
     #refs = 0;
-    get() { return this.deref(); }
-    incRef() { return ++this.#refs; }
-    decRef() { return --this.#refs; }
+    #strong = undefined;
+    get() { return this.#strong !== undefined ? this.#strong : this.deref(); }
+    incRef() {
+      if (++this.#refs === 1) this.#strong = this.deref();
+      return this.#refs;
+    }
+    decRef() {
+      if (--this.#refs <= 0) this.#strong = undefined;
+      return this.#refs;
+    }
   }
 
   // Channels map keyed by name -> WeakReference(channel); GC finalization is the

@@ -1781,7 +1781,12 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   // ("(index)"/"(iteration index)" headers, centered cells). Only the global is
   // re-pointed here; Console.prototype.table above is untouched.
   try {
-    const globalTable = function table(tabularData, properties) {
+    // Method shorthand, NOT `function table(){}`: a function expression is
+    // constructible, and test-console-methods.js asserts every console method
+    // throws TypeError under `new console[method]()`. Console#table above is a
+    // shorthand method and was already correct; re-pointing the global one to a
+    // function expression was what made `new console.table()` stop throwing.
+    const globalTable = { table(tabularData, properties) {
       if (properties !== undefined && !Array.isArray(properties)) {
         throw mkConErr(TypeError, "ERR_INVALID_ARG_TYPE",
           'The "properties" argument must be an instance of Array.' + conArgTypeHelper(properties));
@@ -1791,7 +1796,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       // inspectTableImpl already ends the grid with a newline; console.log adds
       // the other one.
       return G.console.log(grid.endsWith("\n") ? grid.slice(0, -1) : grid);
-    };
+    } }.table;
     Object.defineProperty(G.console, "table", { value: globalTable, writable: true, enumerable: false, configurable: true });
   } catch (e) {}
 
