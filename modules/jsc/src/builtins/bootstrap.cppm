@@ -5632,13 +5632,25 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     // honours it identically in both modes.
     const runModeMock = (i) => i || (() => {});
     runModeMock.module = function (name, factory) {
-      try {
-        const mod = factory();
-        G.__mbunNativeModules = G.__mbunNativeModules || {};
-        const value = (mod && mod.default !== undefined && Object.keys(mod).length === 1) ? mod.default : mod;
-        G.__mbunNativeModules[name] = value;
-        G.__mbunNativeModules["node:" + name] = value;
-      } catch (e) {}
+      // Argument validation is NOT best-effort and must happen BEFORE the
+      // specifier is resolved: bun's resolver can reach the package-manager
+      // auto-install path, which reentrantly ticks the event loop and blocks on
+      // the registry, so a forgotten callback has to throw first
+      // (mock-module-non-string.test.ts "does not run the resolver when callback
+      // is missing" spawns a run-mode script to prove exactly that).
+      if (typeof name !== "string") throw new TypeError("mock(module, fn) requires a module name string");
+      if (typeof factory !== "function") throw new TypeError("mock(module, fn) requires a function");
+      const mod = factory();
+      G.__mbunNativeModules = G.__mbunNativeModules || {};
+      const value = (mod && mod.default !== undefined && Object.keys(mod).length === 1) ? mod.default : mod;
+      G.__mbunNativeModules[name] = value;
+      G.__mbunNativeModules["node:" + name] = value;
+      // Same registry the runner's mock.module writes to, so a file-path or
+      // package specifier is honoured by require()/import() here too.
+      if (typeof G.__mbun_mock_key === "function") {
+        const cwd = (G.process && typeof G.process.cwd === "function") ? G.process.cwd() : ".";
+        (G.__mbunModuleMocks || (G.__mbunModuleMocks = new Map())).set(G.__mbun_mock_key(name, cwd), mod);
+      }
     };
     runModeMock.restore = () => {};
     runModeMock.clearAllMocks = () => {};
@@ -5668,6 +5680,12 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       get() { return G.__mbunBT || { test: noop, it: noop, xit: noop.skip, xtest: noop.skip,
         describe: desc, xdescribe: desc, expect: expectStub,
         jest: { fn: (i) => i || (() => {}), setSystemTime: (v) => { setSystemTime(v); } },
+        // `vi` is bun:test's vitest-compat surface and, like `mock`, exists
+        // outside the runner — vi.mock IS mock.module, so a run-mode script gets
+        // the same validation and the same module override.
+        vi: { fn: (i) => i || (() => {}), mock: (m, f) => runModeMock.module(m, f),
+              spyOn: () => ({ mockRestore() {} }),
+              clearAllMocks: () => {}, resetAllMocks: () => {}, restoreAllMocks: () => {} },
         mock: runModeMock, spyOn: () => ({ mockRestore() {} }),
         setSystemTime: setSystemTime,
         beforeAll: hook, afterAll: hook, beforeEach: hook, afterEach: hook, setDefaultTimeout: hook }; } });

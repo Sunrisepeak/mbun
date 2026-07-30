@@ -73,6 +73,14 @@ inline constexpr std::string_view HARNESS = R"JS(
   "use strict";
   const G = globalThis;
 
+  // mock.module() has to reach bindings that importers made BEFORE the mock was
+  // registered, so __mbun_link (engine_require_js.inc) must remember its
+  // subscriptions. That bookkeeping is off by default — outside `bun test`
+  // nothing can call mock.module() before a module's importers bind, so the
+  // side table would be pure allocation. Turning it on here scopes the cost to
+  // the test runner.
+  G.__mbun_link_track = true;
+
   // The per-test timeout must fire on REAL wall-clock, immune to userland timer
   // mocks (sinon/jest useFakeTimers replace G.setTimeout, so a test that ticks
   // the fake clock past the timeout would falsely time out — bun's per-test
@@ -108,6 +116,7 @@ inline constexpr std::string_view HARNESS = R"JS(
               timeoutReject: null, errors: [], asyncErr: undefined, todo: 0, pendingAsserts: [],
               sysTime: null, skippedLabel: 0, onlyTests: 0, onlyScopes: 0,
               assertExpected: null, assertHas: false,
+              onFinished: [], innerAfterAll: [], inTest: false, inConcurrent: false,
               snapshots: [], snapCounters: {}, curLabel: "" };
   G.__mbunState = S;
   // ── CI detection (`.only` is refused in CI) ────────────────────────────────
@@ -850,7 +859,7 @@ inline constexpr std::string_view HARNESS = R"JS(
       ret.then(settle, (e) => { dropScope(e); settle(); });
     }
   }
-  function makeTest(mode, only) {
+  function makeTest(mode, only, conc) {
     // Supports test(name, fn) and test(name, options, fn) (the options object —
     // e.g. { timeout, retry } — is recorded but its knobs beyond selection are
     // not yet honored). fn is whichever argument is a function.
@@ -866,6 +875,13 @@ inline constexpr std::string_view HARNESS = R"JS(
       }
       // bun throws at REGISTRATION when a runnable test has no body (todo/skip may omit it).
       if (fn === undefined && mode !== "todo" && mode !== "skip") throw new TypeError("test() expects a function");
+      // `retry` re-runs a FAILING test until it passes; `repeats` re-runs a
+      // PASSING one a fixed number of extra times. They are mutually exclusive
+      // (bun_test.rs validates the option bag at registration, before the test
+      // is queued).
+      if (opts && typeof opts === "object" && opts.retry != null && opts.repeats != null) {
+        throw new Error("Cannot set both retry and repeats");
+      }
       // .only narrows the run set; a todo-depth describe turns its runnable
       // tests into todos. The two are independent and both apply here.
       // ScopeFunctions.rs:506-508 — a focused registrar is refused in CI before
@@ -874,6 +890,7 @@ inline constexpr std::string_view HARNESS = R"JS(
       const isOnly = !!only && !(S.skipDepth > 0);
       if (isOnly) S.onlyTests++;
       S.current.items.push({ type: "test", name: String(name), fn: fn, opts: opts, only: isOnly,
+                             concurrent: !!conc,
                              mode: (S.skipDepth > 0 ? "skip"
                                     : ((S.todoDepth > 0 && mode === "run") ? "todo" : mode)) });
     };
@@ -942,7 +959,7 @@ inline constexpr std::string_view HARNESS = R"JS(
     // execution model) are lazy memoized getters so the chain is fully
     // bidirectional — test.concurrent.skipIf(c) AND test.skipIf(c).concurrent
     // both work — without infinite eager recursion.
-    Object.defineProperty(fn, "concurrent", { configurable: true, get() { const c = decorate(makeTest(mode), mode); Object.defineProperty(fn, "concurrent", { value: c, configurable: true }); return c; } });
+    Object.defineProperty(fn, "concurrent", { configurable: true, get() { const c = decorate(makeTest(mode, false, true), mode); Object.defineProperty(fn, "concurrent", { value: c, configurable: true }); return c; } });
     Object.defineProperty(fn, "serial", { configurable: true, get() { const c = decorate(makeTest(mode), mode); Object.defineProperty(fn, "serial", { value: c, configurable: true }); return c; } });
     return fn;
   }
@@ -989,7 +1006,22 @@ inline constexpr std::string_view HARNESS = R"JS(
   function beforeEach(fn) { S.current.beforeEach.push(fn); }
   function afterEach(fn) { S.current.afterEach.push(fn); }
   function beforeAll(fn) { S.current.beforeAll.push(fn); }
-  function afterAll(fn) { S.current.afterAll.push(fn); }
+  // An afterAll registered while a test BODY is running belongs to that test:
+  // bun runs it right after the body, ahead of the afterEach chain, rather than
+  // deferring it to the end of the enclosing scope (test-on-test-finished.test.ts
+  // "onTestFinished ordering" and test-retry-repeats-basic "retry with inner
+  // afterAll" both pin it, the latter once per retry attempt).
+  function afterAll(fn) { if (S.inTest) S.innerAfterAll.push(fn); else S.current.afterAll.push(fn); }
+  // onTestFinished(cb): a teardown callback scoped to the running test, run after
+  // afterEach in registration order (vitest's API, adopted by bun). Concurrent
+  // tests have no single "current test" to attach to, so bun refuses there.
+  function onTestFinished(fn) {
+    if (S.inConcurrent) {
+      throw new Error("Cannot call onTestFinished() here. It cannot be called inside a concurrent test. Use test.serial or remove test.concurrent.");
+    }
+    if (!S.inTest) throw new Error("Cannot call onTestFinished() here. It can only be called inside a test.");
+    S.onFinished.push(fn);
+  }
 
   // mock / spyOn / jest (minimal — call tracking + implementation override).
   const __allMocks = [];
@@ -1018,7 +1050,63 @@ inline constexpr std::string_view HARNESS = R"JS(
     return f;
   }
   // Static helpers on the bun:test `mock` function.
-  mock.module = function (name, factory) { try { const m = factory(); G.__mbunNativeModules = G.__mbunNativeModules || {}; G.__mbunNativeModules[name] = (m && m.default !== undefined && Object.keys(m).length === 1) ? m.default : m; G.__mbunNativeModules["node:" + name] = G.__mbunNativeModules[name]; } catch (e) {} };
+  // mock.module(specifier, factory) — replace a module's exports.
+  //
+  // Three things have to happen, and the corpus pins each one separately:
+  //   1. FUTURE require()/import() of the specifier get the mock. That is the
+  //      __mbunModuleMocks registry, consulted by every require flavour in
+  //      engine_require_js.inc before the resolver runs.
+  //   2. A module that is ALREADY loaded has its exports replaced IN PLACE, so
+  //      that importers which already destructured it (`import { trim } from
+  //      "lodash"`, mock/6874) and re-export chains (mock/6879) observe the new
+  //      value. The value is pushed through the live-binding subscriptions that
+  //      __mbun_link records.
+  //   3. Argument validation throws BEFORE the specifier is resolved. bun's
+  //      resolver can reach the auto-install path and reentrantly tick the event
+  //      loop, so a forgotten callback must not get that far
+  //      (mock-module-non-string.test.ts:"does not run the resolver").
+  mock.module = function (name, factory) {
+    if (typeof name !== "string") throw new TypeError("mock(module, fn) requires a module name string");
+    if (typeof factory !== "function") throw new TypeError("mock(module, fn) requires a function");
+    const dir = G.__mbunTestDir || ".";
+    const key = G.__mbun_mock_key(name, dir);
+    const mocks = G.__mbunModuleMocks || (G.__mbunModuleMocks = new Map());
+    const apply = function (m) {
+      // Native/builtin specifiers keep the existing registry path: `mock.module
+      // ("fs/promises", …)` must reach __mbunNativeModules, which is what
+      // require("node:fs/promises") reads. Unwrapping a lone `default` matches
+      // the shape a builtin's consumers expect.
+      G.__mbunNativeModules = G.__mbunNativeModules || {};
+      const native = (m && m.default !== undefined && Object.keys(m).length === 1) ? m.default : m;
+      G.__mbunNativeModules[name] = native;
+      G.__mbunNativeModules["node:" + name] = native;
+      // A module already in the CommonJS cache is mutated rather than replaced:
+      // its identity is what every existing binding and namespace points at.
+      let live;
+      try { live = G.__mbun_module_cache_get(key); } catch (e) {}
+      if (live !== undefined && live !== null && (typeof live === "object" || typeof live === "function") && m !== null && typeof m === "object") {
+        const subs = G.__mbun_link_subs ? G.__mbun_link_subs.get(live) : undefined;
+        for (const k of Object.keys(m)) {
+          const v = m[k];
+          try { live[k] = v; } catch (e) {}
+          const list = subs ? subs.get(k) : undefined;
+          if (list) for (let i = 0; i < list.length; i++) { try { list[i](v); } catch (e) {} }
+        }
+        mocks.set(key, live);
+      } else {
+        mocks.set(key, m);
+      }
+    };
+    const produced = factory();
+    // An async factory (mock.module("x", async () => …)) registers once it
+    // settles; bun awaits the promise before the mocked import resolves.
+    if (produced !== null && typeof produced === "object" && typeof produced.then === "function") {
+      mocks.set(key, produced);
+      produced.then(apply, function () {});
+    } else {
+      apply(produced);
+    }
+  };
   mock.restore = function () {};
   // clearAllMocks: reset call/result history for every mock (implementations preserved).
   mock.clearAllMocks = function () { for (const f of __allMocks) if (f && typeof f.mockClear === "function") f.mockClear(); };
@@ -1246,7 +1334,10 @@ inline constexpr std::string_view HARNESS = R"JS(
   // set — but the fake-timer entry points are the SAME native functions on both
   // objects (FakeTimers.rs put_timers_fns: every FAKE_TIMERS_FNS entry is put on
   // `vi` and `jest`), each returning `this`.
-  const vi = { fn: mock, mock: function () {}, spyOn: spyOn,
+  // vi.mock IS mock.module in bun (jest.rs routes both to the same native), so
+  // it shares the argument validation and the "mock(module, fn) requires a
+  // function" message mock-module-non-string.test.ts asserts.
+  const vi = { fn: mock, mock: function (m, f) { return mock.module(m, f); }, spyOn: spyOn,
                clearAllMocks: function () { mock.clearAllMocks(); },
                resetAllMocks: function () { mock.resetAllMocks(); },
                restoreAllMocks: function () { mock.restoreAllMocks(); },
@@ -1278,7 +1369,7 @@ inline constexpr std::string_view HARNESS = R"JS(
   // family): aliasing it to plain describe ran every test inside an xdescribe
   // block, so an `xdescribe` guarding a throwing test failed the file (issue 5228).
   G.__mbunBT = { test, it, describe, xdescribe: describe.skip, xit: test.skip, xtest: test.skip, expect,
-                 beforeEach, afterEach, beforeAll, afterAll, mock, spyOn, jest, vi, expectTypeOf,
+                 beforeEach, afterEach, beforeAll, afterAll, onTestFinished, mock, spyOn, jest, vi, expectTypeOf,
                  setDefaultTimeout: function () {}, setSystemTime: setSystemTime,
                  spyOn: spyOn };
   // bun exposes the test globals without an explicit import; mirror onto globalThis.
@@ -1480,6 +1571,12 @@ inline constexpr std::string_view HARNESS = R"JS(
       else { S.skip++; S.out.push("(skip) " + label); }
       return;
     }
+    // retry/repeats: an ATTEMPT is the whole beforeEach → body → inner afterAll
+    // → afterEach → onTestFinished sequence, and each re-run repeats all of it
+    // (test-retry-repeats-basic pins `["beforeEach","test-1","afterEach",
+    // "beforeEach","test-2","afterEach"]`). Only the last attempt is reported.
+    let failed = false, msg = "";
+    const attemptOnce = async function () {
     // expect.assertions(n)/hasAssertions() bookkeeping: reset the expectation for
     // this test and snapshot the running expect()-call counter so we can measure
     // how many the body makes (verified after it settles, below).
@@ -1490,7 +1587,8 @@ inline constexpr std::string_view HARNESS = R"JS(
     // failures print the expect() message directly.
     const errMsg = (e) => ((e && e.name === "AssertionError") ? "" : "error: ") +
                           ((e && e.message !== undefined) ? String(e.message) : String(e));
-    let failed = false, msg = "";
+    failed = false; msg = "";
+    S.onFinished = []; S.innerAfterAll = []; S.inTest = true; S.inConcurrent = !!t.concurrent;
     S.asyncErr = undefined;
     S.pendingAsserts = [];
     try {
@@ -1559,7 +1657,15 @@ inline constexpr std::string_view HARNESS = R"JS(
       // in flight fails the test (bun: async exceptions are attributed to it).
       if (S.asyncErr !== undefined) { const ae2 = S.asyncErr; S.asyncErr = undefined; throw ae2; }
     } catch (e) { failed = true; msg = errMsg(e); }
-    try { for (const h of ae) await callHook(h); }
+    S.inTest = false; S.inConcurrent = false;
+    // Teardown order for one test, pinned by test-on-test-finished.test.ts as
+    // ["test", "inner afterAll", "afterEach", "onTestFinished"]: an afterAll
+    // registered from INSIDE a body belongs to that test (it runs immediately,
+    // not at the end of the scope), the afterEach chain follows, and
+    // onTestFinished callbacks run last — even when the body threw.
+    const teardown = S.innerAfterAll.concat(ae, S.onFinished);
+    S.innerAfterAll = []; S.onFinished = [];
+    try { for (const h of teardown) await callHook(h); }
     catch (e) { if (!failed) { failed = true; msg = errMsg(e); } }
     // expect.assertions(n)/hasAssertions(): a body that settled without failing
     // still fails if it did not make the promised number of expect() calls
@@ -1578,6 +1684,18 @@ inline constexpr std::string_view HARNESS = R"JS(
         failed = true;
         msg = "AssertionError: expected at least one assertion to be called but received none";
       }
+    }
+    };
+    // `retry: N` gives up to N+1 attempts and stops at the first pass; the test
+    // reports the LAST attempt (so a test that finally passes is a pass).
+    // `repeats: N` runs exactly N+1 times and stops at the first failure.
+    const ropts = t.opts || {};
+    const retryN = (typeof ropts.retry === "number" && ropts.retry > 0) ? ropts.retry : 0;
+    const repeatN = (retryN === 0 && typeof ropts.repeats === "number" && ropts.repeats > 0) ? ropts.repeats : 0;
+    const attempts = 1 + retryN + repeatN;
+    for (let i = 0; i < attempts; i++) {
+      await attemptOnce();
+      if (retryN > 0 ? !failed : failed) break;
     }
     if (t.mode === "todo") {  // running under --todo
       if (failed) {
@@ -1624,6 +1742,7 @@ inline constexpr std::string_view HARNESS = R"JS(
     S.skippedLabel = 0; S.onlyTests = 0; S.onlyScopes = 0;
     S.out = []; S.customMatchers = Object.assign({}, S.preloadMatchers); S.errors = []; S.pendingAsserts = [];
     S.timeoutReject = null; S.asyncErr = undefined; S.rand = null; S.skipDepth = 0;
+    S.onFinished = []; S.innerAfterAll = []; S.inTest = false; S.inConcurrent = false;
     S.todoDepth = 0;   // a describe.todo left open by a throwing body
     S.sysTime = null;  // a file's fake system time must not leak into the next
     S.snapshots = []; S.snapCounters = {}; S.curLabel = "";  // snapshot state is per-file
@@ -1911,6 +2030,21 @@ RunResult run_source(std::string_view js_source, std::string_view dir = ".", boo
     if (auto h{rt::eval(detail::HARNESS)}; !h) {
         r.error = "bun:test harness init failed: " + h.error();
         return r;
+    }
+    // 1a2. The directory mock.module() resolves relative specifiers against.
+    //      bun resolves them against the *caller*, and the caller is the test
+    //      file in every corpus use; taking it from here rather than from a
+    //      stack walk keeps it exact and free.
+    {
+        std::string lit;
+        lit.reserve(dir.size() + 2);
+        lit.push_back('"');
+        for (const char c : dir) {
+            if (c == '"' || c == '\\') lit.push_back('\\');
+            lit.push_back(c);
+        }
+        lit.push_back('"');
+        rt::eval("globalThis.__mbunTestDir=" + lit + ";");
     }
     // 1b. runner flags: --todo makes todo tests run (pass → fail, fail → todo).
     rt::eval(detail::has_cli_flag("--todo") ? "globalThis.__mbunRunTodo=true;"

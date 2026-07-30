@@ -622,6 +622,7 @@
         set_fn(ctx_, global, "require", require_cb);
         set_fn(ctx_, global, "__mbun_require_native", require_native_cb);
         set_fn(ctx_, global, "__mbun_evict_module_cache", evict_module_cache_cb);
+        set_fn(ctx_, global, "__mbun_module_cache_get", module_cache_get_cb);
         set_fn(ctx_, global, "__mbun_resolve_native", resolve_native_cb);
         set_fn(ctx_, global, "__mbun_transpile", transpile_native_cb);
         set_fn(ctx_, global, "__mbun_napi_dlopen", napi_dlopen_cb);

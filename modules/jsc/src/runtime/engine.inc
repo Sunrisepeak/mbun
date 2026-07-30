@@ -1124,6 +1124,18 @@ public:
     // `delete Module._cache[key]` (whose plain-object semantics can't reach the
     // C++ cache on their own — see the require.cache Proxy in __mbun_make_require).
     // The key is the resolved path plus any `?query` suffix (the module identity).
+    // Read the native CommonJS cache without loading anything. `mock.module()`
+    // has to replace the exports of a module that is ALREADY loaded (its
+    // importers have bound their names by then), and it must not evaluate a
+    // module that has not been loaded — so it needs a pure lookup, which
+    // require() cannot give it. Returns undefined for an unknown key.
+    JSValueRef module_cache_get(const std::string& key) const {
+        if (auto it{moduleCache_.find(key)}; it != moduleCache_.end()) {
+            return it->second;
+        }
+        return JSValueMakeUndefined(ctx_);
+    }
+
     void evict_module_cache(const std::string& key) {
         if (auto it{moduleCache_.find(key)}; it != moduleCache_.end()) {
             JSValueUnprotect(ctx_, it->second);
@@ -1394,6 +1406,12 @@ JSValueRef evict_module_cache_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std
                                  const JSValueRef args[], JSValueRef*) {
     Runtime::instance().evict_module_cache(arg_string(ctx, argc, args, 0));
     return JSValueMakeBoolean(ctx, true);
+}
+// Trampoline: __mbun_module_cache_get(key) → Runtime::module_cache_get.
+// Backs mock.module()'s in-place replacement of an already-loaded module.
+JSValueRef module_cache_get_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                               const JSValueRef args[], JSValueRef*) {
+    return Runtime::instance().module_cache_get(arg_string(ctx, argc, args, 0));
 }
 // Trampoline: __mbun_resolve_native(spec, fromDir, esm) → Runtime::resolve_sync_impl.
 // Backs Bun.resolveSync / import.meta.resolveSync / require.resolve.
