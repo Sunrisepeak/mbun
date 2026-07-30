@@ -30,43 +30,30 @@ jobs:
           bash tools/integration/check_conflict_markers.sh
           bash tools/integration/check_submodule_gitlinks.sh
 
-      # `build-cache` is deliberately EXCLUDED, and that exclusion is the whole
-      # point of the v3 key bump.
-      #
-      # This step caches toolchains and BMI, as its name says -- but `path:
-      # ~/.mcpp` also swept in `~/.mcpp/build-cache`, the compiled-object cache
-      # for registry packages. That cache is keyed by a config hash that does
-      # NOT include the mcpp version, while `Install mcpp` below always installs
-      # `latest`. So when mcpp changed how it names a package's object files,
-      # every run kept restoring objects laid out by the OLD mcpp and then built
-      # with the new one, and `restore-keys` prefix-matching guaranteed a
-      # poisoned entry was always found. Deleting the caches by hand did not help
-      # for the same reason: any surviving entry under the prefix repopulates.
-      #
-      # Measured 2026-07-31: CI failed on
-      #   ninja: error: '.../compat.zstd@1.5.7/80f379b3dc1bf6f3/obj/compat_zstd/
-      #   zstd-1.5.7/lib/common/xxhash.o', needed by 'obj/compat_zstd/...'
-      # i.e. a ninja demanding NESTED object paths. Reproducing that exact config
-      # hash (80f379b3dc1bf6f3) locally from a cold package resolve -- same mcpp
-      # version, same `mcpp build --workspace`, same toolchain override -- emits
-      # a FLAT `obj/xxhash.o` and links fine. Same inputs, same hash, different
-      # layout: the only difference was the restored cache. The base branch was
-      # red from this too, having been green through 07-26, so it was never
-      # anything in a PR.
-      #
-      # Rebuilding registry packages from source costs ~6s (zstd/zlib/brotli are
-      # small C); the toolchains are what is actually expensive to fetch, and
-      # they still cache.
+      # The key is v3 (was v2) purely to evict entries written before mcpp was
+      # pinned below. Excluding ~/.mcpp/build-cache from this path was tried and
+      # REVERTED: a run with `Cache not found for input keys: mcpp-v3-...`, i.e.
+      # fully cold with nothing restored, failed identically on both toolchains.
+      # That rules out cache contents as the cause; do not re-try that fix.
       - name: Cache mcpp home (toolchains + BMI)
         uses: actions/cache@v4
         with:
-          path: |
-            ~/.mcpp
-            !~/.mcpp/build-cache
+          path: ~/.mcpp
           key: mcpp-v3-${{ runner.os }}-${{ matrix.toolchain }}-${{ hashFiles('**/mcpp.lock') }}
           restore-keys: mcpp-v3-${{ runner.os }}-${{ matrix.toolchain }}-
 
+      # PINNED, not `latest`. An unpinned toolchain means the build inputs change
+      # under CI without a commit, so a red run cannot be attributed to the diff
+      # that appears to have caused it -- which is exactly what happened here:
+      # the base branch went red on 2026-07-29 having been green through 07-26,
+      # with no relevant change in between. install.sh takes MCPP_VERSION and
+      # adds the `v` prefix itself (VERSION="${MCPP_VERSION:-latest}").
+      #
+      # Bump this deliberately, and re-run CI on the bump alone so a toolchain
+      # change is never entangled with a code change.
       - name: Install mcpp
+        env:
+          MCPP_VERSION: "2026.7.30.3"
         run: |
           curl -fsSL https://github.com/mcpp-community/mcpp/releases/latest/download/install.sh | bash
           echo "$HOME/.mcpp/bin" >> "$GITHUB_PATH"
