@@ -81,6 +81,67 @@ inline constexpr std::string_view kBunSpawnStreamJS = R"JS(
     })();
     pump.catch(() => {});
   };
+  const wrapBunReadableConsumption = (stream) => {
+    if (!stream || typeof stream.__data !== "function" || typeof stream.__end !== "function") return stream;
+    let used = false;
+    const usedError = () => {
+      const e = new Error("ReadableStream has already been used");
+      e.code = "ERR_BODY_ALREADY_USED";
+      return e;
+    };
+    const claim = () => {
+      if (used) return usedError();
+      used = true;
+      return null;
+    };
+    for (const name of ["text", "bytes", "arrayBuffer", "blob", "json"]) {
+      const consume = stream[name];
+      if (typeof consume !== "function") continue;
+      stream[name] = function (...args) {
+        const e = claim();
+        return e ? Promise.reject(e) : consume.apply(this, args);
+      };
+    }
+    const pipeTo = stream.pipeTo;
+    if (typeof pipeTo === "function") {
+      stream.pipeTo = function (...args) {
+        const e = claim();
+        return e ? Promise.reject(e) : pipeTo.apply(this, args);
+      };
+    }
+    const asyncIterator = stream[Symbol.asyncIterator];
+    if (typeof asyncIterator === "function") {
+      stream[Symbol.asyncIterator] = function (...args) {
+        const iterator = asyncIterator.apply(this, args);
+        let first = true;
+        return {
+          next(...nextArgs) {
+            if (first) {
+              first = false;
+              const e = claim();
+              if (e) return Promise.reject(e);
+            }
+            return iterator.next(...nextArgs);
+          },
+          return(...returnArgs) {
+            return typeof iterator.return === "function" ? iterator.return(...returnArgs) : Promise.resolve({ done: true });
+          },
+          throw(...throwArgs) {
+            return typeof iterator.throw === "function" ? iterator.throw(...throwArgs) : Promise.reject(throwArgs[0]);
+          },
+          [Symbol.asyncIterator]() { return this; },
+        };
+      };
+    }
+    return stream;
+  };
+  const wrapSpawnResult = (proc) => {
+    if (proc) {
+      proc.stdout = wrapBunReadableConsumption(proc.stdout);
+      proc.stderr = wrapBunReadableConsumption(proc.stderr);
+    }
+    return proc;
+  };
   // Bun.file() is a regular-file stdio source. Wrap the already-installed
   // Bun.spawn after process_web so this policy stays out of its near-limit
   // constexpr payload; generic Blob values keep the live-pipe path.
@@ -100,12 +161,13 @@ inline constexpr std::string_view kBunSpawnStreamJS = R"JS(
           if (fd >= 0) {
             try {
               const next = { ...opts, stdin: fd };
-              return Array.isArray(a) ? spawnWithBlob.call(this, a, next) : spawnWithBlob.call(this, next);
+              const proc = Array.isArray(a) ? spawnWithBlob.call(this, a, next) : spawnWithBlob.call(this, next);
+              return wrapSpawnResult(proc);
             } finally { try { fs.closeSync(fd); } catch (e) {} }
           }
         }
       }
-      return spawnWithBlob.apply(this, arguments);
+      return wrapSpawnResult(spawnWithBlob.apply(this, arguments));
     };
   }
 )JS";
