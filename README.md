@@ -122,15 +122,15 @@ Source-snapshot measurements against the upstream corpora pinned as submodules u
 | --- | ---: | ---: |
 | Node.js native tests (`compat/node/test/parallel`) | 3,117 / 4,433 files pass (direct execution) | 70.3% |
 | Node.js native tests, excluding files that skip themselves | 3,117 / 3,880 files pass | 80.3% |
-| Bun native full corpus (`compat/bun/test`) | 1,006 / 1,902 files fully green | 52.9% |
-| Both corpora combined | 4,123 / 6,335 files | 65.1% |
+| Bun native full corpus (`compat/bun/test`) | 1,009 / 1,902 files fully green | 53.0% |
+| Both corpora combined | 4,126 / 6,335 files | 65.1% |
 | Elysia test suite | 1,522 pass / 3 fail | 99.8% |
 
 File-level "green" means every executed test in the file passed and the file reported no error outside a test; it is stricter than an API checklist and lower than test-level pass rates. Files that declare no runnable test, files whose every test is skipped, and files needing a service this environment lacks (MySQL, Redis, the npm registry) are separate buckets and never count as passes. Node.js files run directly through mbun (exit 0 = pass) without Node's own harness services, so that figure is honest file-level coverage, not API completion.
 
 **The measurement scopes are explicit, and the two rows do not share one.** Numbers normally move by increments re-measured per file: a change is gated against the subset of the corpus it can reach, every file the gate reports as newly passing is re-run **serially** on the same frozen binary, and only files green under that serial re-run are counted. The parallel gate is a screen, never a verdict — the same binary has been measured passing a file idle and failing it under load, so a concurrent result alone is not evidence. Each round is gated at zero green-file regressions, verified per file rather than by bucket totals, and on shared surfaces additionally on per-file assertion counts — a change can leave every file's bucket unchanged while moving assertions underneath it.
 
-**Bun (1,006)** is the 2026-07-31 full run (978) plus +28 verified increments. **Node.js (3,117)** is the 2026-07-30 full run (3,065) plus +52 verified increments, so the two are *not* same-commit comparable to each other; only the Bun row is a direct measurement.
+**Bun (1,009)** is the 2026-07-31 full run (978) plus +31 verified increments. **Node.js (3,117)** is the 2026-07-30 full run (3,065) plus +52 verified increments, so the two are *not* same-commit comparable to each other; only the Bun row is a direct measurement.
 
 That full Bun run is also the argument for why increments alone are not enough. Carrying them forward is deliberate — re-running all 6,335 files costs more than a round's entire measurement budget and generates the load noise that fabricates regressions — but the documented risk is that a regression outside every gate stays invisible until the next full run, and this run found exactly that: two files green at the previous full run were no longer green, neither attributable to the round being gated. One is a write-coalescing flake (a child's `pause\n` / `resume\n` arriving as two chunks against a single `.read()`); the other is `bun/resolve/require.test.ts`, where a `test.failing()` case now **passes** because `require.main` became a real `Module` — mbun ahead of the reference, which the runner buckets separately rather than counting as a pass. Cases requiring an unavailable external service remain blocked rather than counted as passes.
 
