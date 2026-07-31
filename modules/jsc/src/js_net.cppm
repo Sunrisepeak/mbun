@@ -1787,7 +1787,13 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
                    o.honorCipherOrder === true,
                    // dhparam ("auto" | PEM) and ecdhCurve: the server's
                    // ephemeral key-agreement parameters.
-                   o.dhparam || "", o.ecdhCurve || "");
+                   o.dhparam || "", o.ecdhCurve || "",
+                   // caExtra: additional trust anchors, ADDED to whatever store
+                   // `ca`/the platform default set up. Only the chain certs of
+                   // the caller's own `pfx` archive travel here — routing them
+                   // through `ca` would make that the WHOLE store and revoke the
+                   // platform anchors (and NODE_EXTRA_CA_CERTS) with it.
+                   o.caExtra || "");
         this._tls = 1;
       } catch (e) { this._fail(e); }
       return this;

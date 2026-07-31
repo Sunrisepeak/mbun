@@ -514,6 +514,16 @@ struct TlsChannel::Impl {
             }
         }
 
+        // PKCS#12 chain certificates: ADDED on top of whichever store the branch
+        // above chose, never instead of it. node's SecureContext::SetPFX does
+        // exactly this (X509_STORE_add_cert per extra cert, plus
+        // SSL_CTX_add_client_CA) and leaves the default root store in place —
+        // which is why these cannot travel through `ca`, whose contract is
+        // "this is the whole store". See Config::caExtra.
+        if (!config.caExtra.empty() && !load_ca_pem_(config.caExtra)) {
+            return false;
+        }
+
         // Ephemeral key-agreement parameters (node configSecureContext
         // setECDHCurve / setDHParam).
         //

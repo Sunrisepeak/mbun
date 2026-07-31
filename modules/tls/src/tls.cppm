@@ -53,6 +53,21 @@ export struct Config {
     // trusted: with this false the platform store is still the fallback, and
     // with it true nothing is trusted beyond what `ca` names.
     bool caIsComplete {false};
+    // Trust anchors ADDED to whatever store `ca` (or the platform default)
+    // already established, rather than replacing it. There is exactly one
+    // source: the chain certificates inside a PKCS#12 archive
+    // (node's `pfx`), which node's SecureContext::SetPFX puts straight into the
+    // context store with X509_STORE_add_cert — a store it never switches away
+    // from the default for. Routing them through `ca` instead would REVOKE
+    // trust, because a non-empty `ca` means "this is the complete store" and
+    // the platform anchors (and NODE_EXTRA_CA_CERTS) stop being consulted:
+    // measured as test-tls-env-extra-ca-with-options going from pass to
+    // "unable to verify the first certificate".
+    //
+    // This WIDENS what is trusted, so it is deliberately not a general option:
+    // it carries only certificates the caller themselves supplied inside their
+    // own archive, alongside the private key they are authenticating with.
+    std::string caExtra {};
     // Fold the peer-name check into OpenSSL's chain verification
     // (SSL_set1_host). node has no equivalent: it verifies the chain in OpenSSL
     // and the NAME in JS (tls.checkServerIdentity), which a caller may replace.

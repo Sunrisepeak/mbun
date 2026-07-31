@@ -646,6 +646,11 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
           // the platform one — including when it is empty, which is how
           // tls.setDefaultCACertificates([]) means "trust nothing".
           caComplete: caComplete,
+          // The chain certificates recovered from a `pfx` archive. node's
+          // SetPFX adds them to the context store directly; they must NOT ride
+          // `ca`, which declares the whole trust store and would drop the
+          // platform anchors and NODE_EXTRA_CA_CERTS with it.
+          caExtra: pemOf(options.caExtra),
           servername: options.servername || "",
           verify,
           alpn: alpnCsv(options.ALPNProtocols),
@@ -956,7 +961,7 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
     // native and unchanged. Chain verification is unaffected in both cases.
     const customIdentity = typeof opts.checkServerIdentity === "function" &&
       opts.checkServerIdentity !== T.checkServerIdentity ? opts.checkServerIdentity : null;
-    const tlsOpts = { isServer: false, servername, ca: creds.ca, cert: creds.cert, key: creds.key, rejectUnauthorized: opts.rejectUnauthorized, ALPNProtocols: opts.ALPNProtocols,
+    const tlsOpts = { isServer: false, servername, ca: creds.ca, caExtra: creds.caExtra, cert: creds.cert, key: creds.key, rejectUnauthorized: opts.rejectUnauthorized, ALPNProtocols: opts.ALPNProtocols,
       minVersion: opts.minVersion, maxVersion: opts.maxVersion, secureProtocol: opts.secureProtocol, secureContext: opts.secureContext,
       ciphers: opts.ciphers, checkServerIdentity: customIdentity, identityHost: servername || host,
       // node configSecureContext setKey(pem, options.passphrase): a top-level
@@ -1104,6 +1109,8 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
       const creds = this._sharedCreds || {};
       const tlsSock = new TLSSocket(raw, {
         isServer: true, cert: creds.cert, key: creds.key, ca: creds.ca,
+        // A `pfx` server's chain certs: added to the store, not replacing it.
+        caExtra: creds.caExtra,
         requestCert: creds.requestCert, rejectUnauthorized: creds.rejectUnauthorized,
         ALPNProtocols: creds.ALPNProtocols,
         minVersion: creds.minVersion, maxVersion: creds.maxVersion, secureProtocol: creds.secureProtocol,

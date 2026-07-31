@@ -470,10 +470,23 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
     // ARCHIVE's passphrase in place would hand it to the PEM reader as if it
     // were the key's own, which is a different secret entirely.
     out.passphrase = undefined;
+    // The archive's OTHER certificates go to `caExtra`, NOT to `ca`.
+    // node's SetPFX puts them in the context's store with X509_STORE_add_cert,
+    // which ADDS to whatever is already trusted and leaves the default root
+    // store in place. mbun's `ca` option means the opposite: it is the caller's
+    // COMPLETE trust store, so a non-empty `ca` stops the platform anchors —
+    // and NODE_EXTRA_CA_CERTS with them — from being consulted at all. Routing
+    // the chain through it therefore REVOKED trust the caller already had:
+    // test-tls-env-extra-ca-with-options connects with `{ pfx, passphrase }`
+    // while NODE_EXTRA_CA_CERTS names the root that signs the server, and
+    // folding agent1.pfx's own ca1 into `ca` turned a passing verification into
+    // "unable to verify the first certificate". `caExtra` is the additive
+    // channel (mbun::tls::Config::caExtra) and carries nothing but the archive
+    // the caller opened themselves.
     if (cas.length) {
-      const existing = options.ca == null ? []
-        : (Array.isArray(options.ca) ? options.ca.slice() : [options.ca]);
-      out.ca = existing.concat(cas);
+      const existing = options.caExtra == null ? []
+        : (Array.isArray(options.caExtra) ? options.caExtra.slice() : [options.caExtra]);
+      out.caExtra = existing.concat(cas);
     }
     return out;
   }

@@ -828,6 +828,11 @@ JSValueRef netn_tls_wrap_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
     // and "" leave OpenSSL's own preference in place).
     if (argc > 18) { cfg.dhParams = fs_arg(ctx, argc, args, 18); }
     if (argc > 19) { cfg.ecdhCurve = fs_arg(ctx, argc, args, 19); }
+    // arg 20: caExtra — trust anchors ADDED to the store arg 6 / the platform
+    // default already established. Carries only the chain certificates found
+    // inside the caller's own `pfx` archive; see mbun::tls::Config::caExtra for
+    // why those cannot be routed through arg 6.
+    if (argc > 20) { cfg.caExtra = fs_arg(ctx, argc, args, 20); }
     auto st{std::make_unique<NetTlsState>(
         isServer ? mbun::tls::TlsRole::server : mbun::tls::TlsRole::client, std::move(cfg))};
     if (!st->channel.valid()) {
