@@ -358,6 +358,26 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
     const proc = G.process;
     if (!proc) return;
 
+    // JSC has no V8 optimizer controls. When the Node corpus explicitly asks
+    // for --allow-natives-syntax, accept the two optimization-only intrinsics
+    // used by fast-call tests as no-ops; ordinary processes keep the native
+    // eval path untouched.
+    if (Array.isArray(proc.execArgv) && proc.execArgv.includes("--allow-natives-syntax") &&
+        typeof G.eval === "function" && !G.__mbunNativeSyntaxEvalCompat) {
+      const nativeEval = G.eval;
+      const optimizationIntrinsic = /^\s*%(?:PrepareFunctionForOptimization|OptimizeFunctionOnNextCall)\([^)]*\)\s*$/;
+      const compatEval = function eval(source) {
+        if (typeof source === "string" && optimizationIntrinsic.test(source)) return undefined;
+        return nativeEval(source);
+      };
+      Object.defineProperty(G, "eval", {
+        value: compatEval, writable: true, configurable: true, enumerable: false,
+      });
+      Object.defineProperty(G, "__mbunNativeSyntaxEvalCompat", {
+        value: true, writable: false, configurable: true, enumerable: false,
+      });
+    }
+
     // node's determineSpecificType() rendering, used by arg-type errors.
     const specificType = (v) => {
       if (v === null) return "null";
