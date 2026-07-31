@@ -48,6 +48,11 @@
   `test-util-types.js`、`test-util-inspect-getters-accessing-this.js` 各有独立
   语义 blocker，未做推测性修改。`t.assert` source-position 进一步确认走
   bootstrap `AErr` live path，未验证的 internal-binding bridge 已移除并 parked。
+- `5514993` 补齐 `util.types.isExternal()` 的真实身份边界：internal `JSStream`
+  现在提供 non-enumerable `_externalStream`，由私有 WeakSet 标记，普通对象不会被
+  误判为 External。`test-util-types.js` 已越过原先的 `undefined`/`isExternal` blocker，
+  继续停在 `%PrepareFunctionForOptimization` 的 V8 native-syntax 解析差异，仍不计
+  新增 green；5 个 util/promisify/snapshot 回归 lane 全部 exit 0。
 - `163a0a3` 将本地敏感信息过滤规则加入 `hagent/agents.md` 及中文同步页；该受保护面
   需要维护者签字，不由 agent 自行合并。PR #36 已同步两轮候选实测和本节点策略。
 

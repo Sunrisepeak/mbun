@@ -111,6 +111,21 @@ files exited successfully: `test-util-getcallsites.js`,
 `test-util-types.js`, and `test-util-inspect-getters-accessing-this.js` each
 hit one distinct semantic blocker. Those three were not changed speculatively.
 
+The next targeted slice added the missing external-value identity for the
+internal `JSStream` test handle:
+
+- `util.types.isExternal()` now uses a private WeakSet identity registry, and
+  `JSStream` exposes its non-enumerable `_externalStream` test value through
+  that registry. Plain objects are not classified as external.
+- `test-util-types.js` moved past its first blocker (`undefined` did not match
+  `isExternal`) and now reaches the later V8-native-syntax probe for
+  `%PrepareFunctionForOptimization`; it remains **1 file fail**, so no new
+  green file is claimed from this slice.
+- Fresh five-lane regression evidence is all exit 0:
+  `test-util-types-exists.js`, `test-util-getcallsites.js`,
+  `test-util-parse-env.js`, `test-util-promisify.js`, and
+  `test-runner-snapshot-file-tests.js`.
+
 The assertion source-position probe was also closed as parked for this
 checkpoint. `internalBinding('errors').getErrorSourcePositions()` is not the
 live path for `t.assert.ok`: the public test assertion uses bootstrap-owned
@@ -121,8 +136,9 @@ boundary as one slice.
 
 ## Next route
 
-1. Prefer the five measured green util files as the next coverage accounting
-   checkpoint; do not infer a new full-corpus score from them.
+1. Keep the external-value slice additive, but treat V8 native syntax in
+   `test-util-types.js` as a separate runtime/parser lane rather than widening
+   the current fix.
 2. Keep callbackify stack shape, util format/types/inspect semantics, and
    bootstrap assertion source extraction as separate lanes with explicit
    ownership.
