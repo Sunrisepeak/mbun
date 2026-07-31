@@ -218,9 +218,19 @@ jobs:
 #          its macOS lane is unknown from the checkout here (its CI results are
 #          not in it) and is deliberately not guessed at.
 #
-#          mcpp/pkgs/m/mbun.jsc-prebuilt.lua's install() now supplies the header
-#          on macosx; whether that alone clears the wall is what the next probe
-#          run measures, not something asserted here.
+#          mcpp/pkgs/m/mbun.jsc-prebuilt.lua's install() supplies the header on
+#          macosx. Measured, not assumed: the probe then failed at RetainRef.h
+#          line 34 instead of line 30 -- the same #if USE(CF) block's NEXT
+#          missing header, wtf/cf/CFTypeTraits.h.
+#
+#          Rather than discover these one CI round-trip at a time, the artifact's
+#          include tree was scanned for references to headers it does not carry.
+#          13 exist, and they partition cleanly: 11 are for other ports
+#          (wtf/glib/*, wtf/win/*, PlatformEnable{Glib,Win,PlayStation}.h) and
+#          sit behind platform guards Darwin never reaches. Exactly 2 are
+#          macOS-relevant -- NSTypeTraits.h and CFTypeTraits.h -- and install()
+#          now supplies both. So this class of failure is bounded and should be
+#          finished, though only a green probe settles that.
 # windows  no job. Deliberately removed rather than left red: mcpp does publish
 #          a Windows release, so this is not a toolchain gap, but nothing here
 #          has ever been built or measured on Windows and a permanently-failing

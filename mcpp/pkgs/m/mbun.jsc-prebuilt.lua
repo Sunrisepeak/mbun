@@ -191,6 +191,106 @@ using WTF::IsNSType;
 using WTF::NSType;
 ]]
 
+-- 同一个缺口的第二个头，补 NSTypeTraits.h 后由 RetainRef.h:34 暴露出来。
+-- 已装的 wtf/cf/TypeCastsCF.h 也引用它（CFTypeTrait<T>::typeID()），所以这不是
+-- 只为 RetainRef.h 服务的。整份内容都在 `#if USE(CF)` 内，非 Cocoa 平台为空。
+-- 扫描产物 include 树的引用闭包确认：macOS 相关的缺失头就这两个，其余 11 个
+-- （wtf/glib/*、wtf/win/*、PlatformEnable{Glib,Win,PlayStation}.h）都在别的
+-- port 的平台守卫内，Darwin 上永远到不了。
+local CF_TYPE_TRAITS = [==[
+#pragma once
+// Supplied by mbun.jsc-prebuilt: absent from the upstream macOS tarball while
+// two shipped headers, <wtf/RetainRef.h> and <wtf/cf/TypeCastsCF.h>, include it.
+// Mirrors Source/WTF/wtf/cf/CFTypeTraits.h (WebKit, LGPL-2.1-or-later).
+#include <wtf/Platform.h>
+
+#if USE(CF)
+
+#include <CoreFoundation/CoreFoundation.h>
+#include <concepts>
+#include <type_traits>
+
+namespace WTF {
+
+template <typename> struct CFTypeTrait;
+
+} // namespace WTF
+
+#define WTF_DECLARE_CF_TYPE_TRAIT(ClassName) \
+template <> \
+struct WTF::CFTypeTrait<ClassName##Ref> { \
+    static inline CFTypeID typeID() { return ClassName##GetTypeID(); } \
+};
+
+#define WTF_DECLARE_CF_TYPE_TRAIT_WITHOUT_TYPE_ID(ClassName) \
+template <> \
+struct WTF::CFTypeTrait<ClassName##Ref> { \
+    static inline CFTypeID typeID() { RELEASE_ASSERT_NOT_REACHED(); } \
+};
+
+#define WTF_DECLARE_CF_MUTABLE_TYPE_TRAIT(ClassName, MutableClassName) \
+template <> \
+struct WTF::CFTypeTrait<MutableClassName##Ref> { \
+    static inline CFTypeID typeID() { return ClassName##GetTypeID(); } \
+};
+
+WTF_DECLARE_CF_TYPE_TRAIT(CFArray);
+WTF_DECLARE_CF_TYPE_TRAIT(CFBoolean);
+WTF_DECLARE_CF_TYPE_TRAIT(CFData);
+WTF_DECLARE_CF_TYPE_TRAIT(CFDictionary);
+WTF_DECLARE_CF_TYPE_TRAIT(CFError);
+WTF_DECLARE_CF_TYPE_TRAIT(CFNumber);
+WTF_DECLARE_CF_TYPE_TRAIT(CFRunLoop);
+WTF_DECLARE_CF_TYPE_TRAIT(CFRunLoopSource);
+WTF_DECLARE_CF_TYPE_TRAIT(CFRunLoopTimer);
+WTF_DECLARE_CF_TYPE_TRAIT(CFString);
+WTF_DECLARE_CF_TYPE_TRAIT(CFURL);
+
+WTF_DECLARE_CF_MUTABLE_TYPE_TRAIT(CFArray, CFMutableArray);
+WTF_DECLARE_CF_MUTABLE_TYPE_TRAIT(CFData, CFMutableData);
+WTF_DECLARE_CF_MUTABLE_TYPE_TRAIT(CFDictionary, CFMutableDictionary);
+WTF_DECLARE_CF_MUTABLE_TYPE_TRAIT(CFString, CFMutableString);
+
+#if USE(CG)
+#include <CoreGraphics/CGColor.h>
+#include <CoreGraphics/CGImage.h>
+#include <CoreGraphics/CGPath.h>
+WTF_DECLARE_CF_TYPE_TRAIT(CGColor);
+WTF_DECLARE_CF_TYPE_TRAIT(CGImage);
+WTF_DECLARE_CF_TYPE_TRAIT(CGPath);
+WTF_DECLARE_CF_MUTABLE_TYPE_TRAIT(CGPath, CGMutablePath);
+#endif
+
+namespace WTF {
+
+namespace detail {
+
+template<typename T, typename = void>
+inline constexpr bool HasCFTypeTraitHelper = false;
+
+template<typename T>
+inline constexpr bool HasCFTypeTraitHelper<T, std::void_t<decltype(CFTypeTrait<T>::typeID())>> = true;
+
+} // namespace detail
+
+template<typename T>
+inline constexpr bool HasCFTypeTrait = detail::HasCFTypeTraitHelper<T>;
+
+template<typename T>
+inline constexpr bool IsCFType = std::is_pointer_v<T> && (
+    std::same_as<std::remove_cv_t<T>, CFTypeRef> || HasCFTypeTrait<T>
+);
+template<typename T> concept CFType = IsCFType<T>;
+
+} // namespace WTF
+
+using WTF::CFType;
+using WTF::HasCFTypeTrait;
+using WTF::IsCFType;
+
+#endif // USE(CF)
+]==]
+
 -- linux：把构建依赖 xim:gcc 的 libstdc++.a 拷入 bun-webkit/lib（供 ldflags
 -- 的 -lstdc++ 解析，路径可移植），并写出 anchor TU——anchor 的缺失正是让
 -- mcpp 在构建前运行本 install() 的触发器（compat.openblas 同款机制）。
@@ -219,11 +319,19 @@ function install()
     -- macosx：只补头，不碰 lib（产物 lib/ 已自足，链接系统 libicucore）。
     -- 幂等：已存在就不覆盖，让上游哪天补齐后自动让位。
     if host == "macosx" then
-        local header = path.join(wkdir, "include", "wtf", "cocoa", "NSTypeTraits.h")
-        if not os.isfile(header) then
-            os.mkdir(path.directory(header))
-            io.writefile(header, NS_TYPE_TRAITS)
-            log.info("mbun.jsc-prebuilt: supplied missing wtf/cocoa/NSTypeTraits.h")
+        -- 逐项 {相对路径, 内容}。不用 table.unpack：xmake 跑在 LuaJIT(5.1)上，
+        -- 那里只有全局 unpack，写 table.unpack 会在 macOS 上运行期才炸。
+        local supply = {
+            { "wtf/cocoa/NSTypeTraits.h", NS_TYPE_TRAITS },
+            { "wtf/cf/CFTypeTraits.h",    CF_TYPE_TRAITS },
+        }
+        for _, h in ipairs(supply) do
+            local header = path.join(wkdir, "include", h[1])
+            if not os.isfile(header) then
+                os.mkdir(path.directory(header))
+                io.writefile(header, h[2])
+                log.info("mbun.jsc-prebuilt: supplied missing %s", h[1])
+            end
         end
         return true
     end
