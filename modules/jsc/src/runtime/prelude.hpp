@@ -26,6 +26,25 @@
 // returned nullptr before this include was added). Must precede all WTF/JSC headers.
 #include <cmakeconfig.h>
 
+// macOS only, and a defect in the artifact's own config rather than a choice:
+// cmakeconfig.h:83 sets ENABLE_MEDIA_SOURCE 0 for this JSC-only build but says
+// nothing about COCOA_WEBM_PLAYER, so PlatformEnableCocoa.h:80 then turns that
+// one ON by Cocoa default -- and PlatformEnable.h:1052 asserts the combination
+// is impossible:
+//
+//     #if ENABLE(COCOA_WEBM_PLAYER) && !ENABLE(MEDIA_SOURCE)
+//     #error "ENABLE(COCOA_WEBM_PLAYER) requires ENABLE(MEDIA_SOURCE)"
+//
+// Both of PlatformEnableCocoa.h's defines are `#if !defined(...)` guarded, so
+// settling it here wins. Off, not on: this is a media-player feature, mbun uses
+// none of it, and unlike the WEBASSEMBLY case above it gates no JSC struct
+// member -- turning MEDIA_SOURCE on instead would diverge from the config the
+// shipped library was compiled with, which is the exact hazard cmakeconfig.h is
+// included to avoid.
+#if defined(__APPLE__) && !defined(ENABLE_COCOA_WEBM_PLAYER)
+#define ENABLE_COCOA_WEBM_PLAYER 0
+#endif
+
 // Global module fragment: the JSC C API header + JSC::initialize declaration
 // (external C++ symbol from the prebuilt product), mirroring jsc.cppm so the
 // header symbols stay in the global module with external linkage.

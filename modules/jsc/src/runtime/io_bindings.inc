@@ -1042,8 +1042,39 @@ JSValueRef fs_build_stat_object(JSContextRef ctx, const FsStatFields& f, JSValue
     return r;
 }
 #if !defined(_WIN32)
-// Fill FsStatFields from a POSIX struct stat (birthtime falls back to ctime;
-// real btime is filled by statx on Linux). Shared by lstat/fstat paths.
+// Darwin names the nanosecond stat timestamps st_*timespec; POSIX.1-2008 (what
+// glibc exposes) names them st_*tim. Both are `struct timespec`, so one accessor
+// per field keeps the arithmetic below identical on either.
+[[nodiscard]] inline const struct timespec& stat_atim(const struct stat& st) noexcept {
+#if defined(__APPLE__)
+    return st.st_atimespec;
+#else
+    return st.st_atim;
+#endif
+}
+[[nodiscard]] inline const struct timespec& stat_mtim(const struct stat& st) noexcept {
+#if defined(__APPLE__)
+    return st.st_mtimespec;
+#else
+    return st.st_mtim;
+#endif
+}
+[[nodiscard]] inline const struct timespec& stat_ctim(const struct stat& st) noexcept {
+#if defined(__APPLE__)
+    return st.st_ctimespec;
+#else
+    return st.st_ctim;
+#endif
+}
+[[nodiscard]] inline long long ts_ns(const struct timespec& t) noexcept {
+    return static_cast<long long>(t.tv_sec) * 1000000000LL + t.tv_nsec;
+}
+[[nodiscard]] inline double ts_ms(const struct timespec& t) noexcept {
+    return static_cast<double>(t.tv_sec) * 1000.0 + static_cast<double>(t.tv_nsec) / 1e6;
+}
+// Fill FsStatFields from a POSIX struct stat. birthtime: macOS carries the real
+// creation time in struct stat itself; Linux has no such field, so it falls back
+// to ctime here and the callers overwrite it via statx.
 void fs_fields_from_stat(const struct stat& st, FsStatFields& f) {
     f.dev = static_cast<long long>(st.st_dev);
     f.mode = static_cast<long long>(st.st_mode);
@@ -1055,14 +1086,21 @@ void fs_fields_from_stat(const struct stat& st, FsStatFields& f) {
     f.size = static_cast<long long>(st.st_size);
     f.blksize = static_cast<long long>(st.st_blksize);
     f.blocks = static_cast<long long>(st.st_blocks);
-    f.atimeNs = static_cast<long long>(st.st_atim.tv_sec) * 1000000000LL + st.st_atim.tv_nsec;
-    f.mtimeNs = static_cast<long long>(st.st_mtim.tv_sec) * 1000000000LL + st.st_mtim.tv_nsec;
-    f.ctimeNs = static_cast<long long>(st.st_ctim.tv_sec) * 1000000000LL + st.st_ctim.tv_nsec;
-    f.atimeMs = static_cast<double>(st.st_atim.tv_sec) * 1000.0 + static_cast<double>(st.st_atim.tv_nsec) / 1e6;
-    f.mtimeMs = static_cast<double>(st.st_mtim.tv_sec) * 1000.0 + static_cast<double>(st.st_mtim.tv_nsec) / 1e6;
-    f.ctimeMs = static_cast<double>(st.st_ctim.tv_sec) * 1000.0 + static_cast<double>(st.st_ctim.tv_nsec) / 1e6;
+    f.atimeNs = ts_ns(stat_atim(st));
+    f.mtimeNs = ts_ns(stat_mtim(st));
+    f.ctimeNs = ts_ns(stat_ctim(st));
+    f.atimeMs = ts_ms(stat_atim(st));
+    f.mtimeMs = ts_ms(stat_mtim(st));
+    f.ctimeMs = ts_ms(stat_ctim(st));
+#if defined(__APPLE__)
+    // Real btime, straight out of the same stat() -- no second syscall, and
+    // statx does not exist here.
+    f.birthtimeNs = ts_ns(st.st_birthtimespec);
+    f.birthtimeMs = ts_ms(st.st_birthtimespec);
+#else
     f.birthtimeMs = f.ctimeMs;  // overwritten by statx btime when available
     f.birthtimeNs = f.ctimeNs;
+#endif
 }
 #endif
 JSValueRef fsn_stat_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
@@ -1123,15 +1161,19 @@ JSValueRef fsn_stat_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t a
         return fs_throw(ctx, exc, "ENOENT: no such file or directory, stat '" + path + "'");
     }
     fs_fields_from_stat(st, f);
+#if defined(__linux__)
     // Linux struct stat has no st_birthtim; statx STATX_BTIME gives the real
     // creation time (node uses it — src/sys.rs). Fall back to ctime otherwise.
+    // macOS needs none of this: fs_fields_from_stat already read the real
+    // birthtime out of struct stat, and statx is a Linux syscall.
     struct statx stx{};
     if (::statx(AT_FDCWD, path.c_str(), useLstat ? AT_SYMLINK_NOFOLLOW : 0, STATX_BTIME, &stx) == 0
         && (stx.stx_mask & STATX_BTIME)) {
         f.birthtimeNs = static_cast<long long>(stx.stx_btime.tv_sec) * 1000000000LL + stx.stx_btime.tv_nsec;
         f.birthtimeMs = static_cast<double>(stx.stx_btime.tv_sec) * 1000.0 + static_cast<double>(stx.stx_btime.tv_nsec) / 1e6;
     }
-#endif
+#endif  // __linux__
+#endif  // !_WIN32
     return fs_build_stat_object(ctx, f, exc);
 }
 // node fs.fstatSync(fd): stat over an open descriptor. Real fields (birthtime
@@ -1169,11 +1211,15 @@ JSValueRef fsn_fstat_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t 
     if (::fstat(fd, &st) != 0)
         return fs_throw(ctx, exc, "EBADF: bad file descriptor, fstat");
     fs_fields_from_stat(st, f);
+#if defined(__linux__)
+    // Same as the stat path: statx supplies the btime Linux's struct stat lacks,
+    // and macOS already has it from fs_fields_from_stat.
     struct statx stx{};
     if (::statx(fd, "", AT_EMPTY_PATH, STATX_BTIME, &stx) == 0 && (stx.stx_mask & STATX_BTIME)) {
         f.birthtimeNs = static_cast<long long>(stx.stx_btime.tv_sec) * 1000000000LL + stx.stx_btime.tv_nsec;
         f.birthtimeMs = static_cast<double>(stx.stx_btime.tv_sec) * 1000.0 + static_cast<double>(stx.stx_btime.tv_nsec) / 1e6;
     }
+#endif
     return fs_build_stat_object(ctx, f, exc);
 #endif
 }
