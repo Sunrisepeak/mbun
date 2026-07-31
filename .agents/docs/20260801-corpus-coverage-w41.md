@@ -137,9 +137,19 @@ than type semantics:
   matrix, including the JSStream external value.
 - Three parallel fast-call regressions also exit 0:
   `test-buffer-swap-fast.js`, `test-timers-fast-calls.js`, and
-  `test-os-fast.js`. `test-whatwg-url-canparse.js` remains red on an unrelated
-  missing TypeError, and `test-process-hrtime.js` remains red on an unrelated
-  argument-validation mismatch.
+  `test-os-fast.js`.
+
+The next measured slice closed the `process.hrtime` argument contract:
+
+- `3427591` validates a supplied previous-time value as an Array of exactly two
+  entries, preserving the existing nanosecond subtraction and reporting the
+  corresponding Node error codes.
+- `test-process-hrtime.js` moved from the observed missing TypeError to exit 0
+  after the RED-to-GREEN change. Fresh bounded regressions also exit 0 for
+  `test-process-hrtime-bigint.js`, `test-util-types.js`,
+  `test-buffer-swap-fast.js`, and `test-runner-snapshot-file-tests.js`.
+- This is a targeted runtime result, not a new full-corpus score. The remaining
+  `test-whatwg-url-canparse.js` TypeError mismatch stays an independent blocker.
 
 The assertion source-position probe was also closed as parked for this
 checkpoint. `internalBinding('errors').getErrorSourcePositions()` is not the
@@ -154,9 +164,9 @@ boundary as one slice.
 1. Keep the native-syntax compatibility gate limited to the two measured
    optimization controls; evaluate additional V8 intrinsics only from their
    own failing corpus evidence.
-2. Keep callbackify stack shape, util format/types/inspect semantics, and
-   bootstrap assertion source extraction as separate lanes with explicit
-   ownership.
+2. Evaluate the `test-whatwg-url-canparse.js` TypeError contract as the next
+   single-file candidate; keep callbackify stack shape, util format/types/inspect
+   semantics, and bootstrap assertion source extraction as separate lanes.
 3. Keep test-v8 profiler/queryObjects and broad VM wording changes parked until
    ownership is clear.
 

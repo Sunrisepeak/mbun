@@ -58,12 +58,18 @@
   作为 no-op 接受，普通进程不改变 eval 路径。`test-util-types.js` 现 exit 0，
   `test-buffer-swap-fast.js`、`test-timers-fast-calls.js`、`test-os-fast.js` 三条并行
   回归也 exit 0；URL.canParse 与 process.hrtime 的失败分别保留为独立 blocker。
+- `3427591` 补齐 `process.hrtime(previousTime)` 的 Node 参数合同：显式校验 Array
+  及长度 2，并保留纳秒差值计算。`test-process-hrtime.js` 从缺少 TypeError 的 RED
+  变为 exit 0；新鲜 bounded 回归中的 `test-process-hrtime-bigint.js`、
+  `test-util-types.js`、`test-buffer-swap-fast.js`、`test-runner-snapshot-file-tests.js`
+  也全部 exit 0。没有重复全量语料；`test-whatwg-url-canparse.js` 的 TypeError
+  mismatch 作为下一条独立候选。
 - `163a0a3` 将本地敏感信息过滤规则加入 `hagent/agents.md` 及中文同步页；该受保护面
   需要维护者签字，不由 agent 自行合并。PR #36 已同步两轮候选实测和本节点策略。
 
-下一步优先实现 test-runner assertion surface 的真实小切片（先验证 `t.assert` 契约，
-再决定 snapshot 读写是否值得投入）；test-util native external 与 test-v8 profiler/query
-objects 暂停，VM 只保留近绿、低共享风险候选。
+下一步先处理 `test-whatwg-url-canparse.js` 的单文件 TypeError 合同；test-runner
+assertion source-position、test-util inspect/callbackify 与 test-v8 profiler/queryObjects
+继续按独立 blocker 管理，不做无证据的跨域扩展。
 
 ## 2026-07-29
 
