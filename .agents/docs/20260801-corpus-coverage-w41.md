@@ -299,6 +299,20 @@ A low-cost Bun micro-wave then measured four small subtrees in parallel:
   necessary despite the disk gate. The broad async-context and large-buffer
   boundaries remain parked behind their own owners.
 
+The next standard-module Bun wave stayed build-free and produced a high-yield
+green sample:
+
+- Four one-file subtrees all exited green: `path/dirname.test.js` (3/3),
+  `zlib/deflate-streaming.test.ts` (1/1),
+  `dns/dns-lookup-keepalive.test.ts` (1/1), and
+  `diagnostics_channel/diagnostics_channel.test.ts` (6/6; 9 tests ran).
+- Expanded four-file samples gave `path` **3/4 files green, 9/10 tests** and
+  `zlib` **2/4 files green, 9/39 tests**. The path failure is the
+  `toNamespacedPath` Windows trailing-slash shape; zlib failures are native
+  handle `write`/`writeSync` and lifecycle API ownership gaps.
+- No new build was started while swap headroom remained critically low. These
+  are measured native slices, not full-corpus score changes.
+
 ## Next route
 
 1. Keep the native-syntax compatibility gate limited to the two measured
