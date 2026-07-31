@@ -355,6 +355,18 @@ The next single-owner path lane was repaired and rechecked:
   `win32-exists` **1/1**. This was a no-build confirmation of the adjacent
   path slice, not a full path-corpus claim.
 
+The next measured console owner also closed with one narrow runtime change:
+
+- `5f36ae9` aligns `Console#table` with the vendored Bun `ConsoleObject` model:
+  cells are centered within their display-width column and an odd spare space
+  is placed on the right. The prior implementation incorrectly used Node's
+  left-aligned CLI-table rule.
+- The target `console/console-table-iterators.test.ts` moved from **0/1** to
+  **1/1**. Fresh-build regression lanes stayed green for
+  `path/to-namespaced-path` **4/4**, `events/event-emitter` **67/67**, and
+  `os/os` **52/52**; the four-file run measured **124/124 tests**, **0 failed**,
+  and **537 expects**.
+
 ## Next route
 
 1. Keep the native-syntax compatibility gate limited to the two measured

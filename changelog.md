@@ -14,6 +14,10 @@
   提升为 **4/4 files、10/10 tests**：`dirname` **3/3**、`is-absolute` **2/2**、
   `to-namespaced-path` **4/4**、`win32-exists` **1/1**；仅做 bounded no-build
   确认，不宣称完整 path corpus。
+- `5f36ae9` 修复 `Console#table` 的 Bun 语义：按显示宽度居中 cell，奇数余量放在右侧；
+  原实现误用了 Node CLI table 的左对齐规则。`console-table-iterators` 从 **0/1**
+  提升为 **1/1**；fresh-build 4-file 回归（含 path/events/os）合计 **124/124**、
+  **0 failed**、537 expects。
 
 ### W41 Linux 优先推进：planner 修复、8 条候选 lane 实测与 Node 近绿切片
 
