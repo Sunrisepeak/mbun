@@ -3449,7 +3449,14 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     try { Object.defineProperty(G, "__bunResolveObjectURL", { value: __resolveObjectURL, enumerable: false, configurable: true, writable: true }); } catch (e) {}
     G.URL = class URL {
       get [Symbol.toStringTag]() { return "URL"; }
-      static canParse(input, ...rest) { try { new G.URL(input, ...rest); return true; } catch (e) { return false; } }
+      static canParse(input, ...rest) {
+        if (arguments.length < 1) {
+          const e = new TypeError('The "url" argument must be specified');
+          e.code = "ERR_MISSING_ARGS";
+          throw e;
+        }
+        try { new G.URL(input, ...rest); return true; } catch (e) { return false; }
+      }
       static parse(input, ...rest) { try { return new G.URL(input, ...rest); } catch (e) { return null; } }
       static createObjectURL(blob) {
         if (arguments.length < 1) { const e = new TypeError("Not enough arguments"); e.code = "ERR_MISSING_ARGS"; throw e; }
