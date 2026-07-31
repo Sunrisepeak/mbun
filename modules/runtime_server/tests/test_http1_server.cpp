@@ -37,7 +37,7 @@ void check(bool condition, std::string_view name) {
 #if defined(__linux__)
 
 struct Fixture {
-    mbun::event_loop::EpollBackend epoll {};
+    mbun::event_loop::HostReadinessBackend epoll {};
     mbun::event_loop::EventLoop loop;
     Http1Server server;
 
@@ -619,7 +619,7 @@ void test_detach_raw_tunnel() {
 #else  // !__linux__
 
 void test_deferred_stub() {
-    mbun::event_loop::EpollBackend epoll {};
+    mbun::event_loop::HostReadinessBackend epoll {};
     mbun::event_loop::EventLoop loop { epoll.seam() };
     Http1Server server { loop, epoll };
     const auto port { server.listen("127.0.0.1", 0,

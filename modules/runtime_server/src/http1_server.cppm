@@ -178,7 +178,7 @@ private:
     Http1RequestId nextRequestId_ { 1 };
 
 public:  // Big Five: callbacks capture `this`, so pin the object.
-    Http1Server(event_loop::EventLoop& loop, event_loop::EpollBackend& epoll) {
+    Http1Server(event_loop::EventLoop& loop, event_loop::HostReadinessBackend& epoll) {
         runtime_socket::SocketEvents events {};
         events.on_open = [this](runtime_socket::NativeHandle handle, bool isClient) {
             if (!isClient) {

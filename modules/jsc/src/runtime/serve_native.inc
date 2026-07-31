@@ -26,7 +26,7 @@ struct ServeNativeEvent {
 };
 
 struct ServeNativeState {
-    mbun::event_loop::EpollBackend epoll{};
+    mbun::event_loop::HostReadinessBackend epoll{};
     mbun::event_loop::EventLoop loop;
     std::unordered_map<int, std::unique_ptr<mbun::runtime_server::Http1Server>> servers{};
     std::deque<ServeNativeEvent> events{};

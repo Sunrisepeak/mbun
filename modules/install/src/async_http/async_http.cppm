@@ -14,7 +14,7 @@
 // and idle sockets go back to a fixed 64-slot keep-alive pool per scheme
 // (HTTPContext.rs:19).
 //
-// mbun mirrors that shape on its own foundation: mbun::event_loop::EpollBackend
+// mbun mirrors that shape on its own foundation: mbun::event_loop::HostReadinessBackend
 // for the loop, mbun::runtime_socket::EpollSocketBackend for non-blocking
 // connect/read/write, mbun::tls::TlsChannel (memory-BIO) for async TLS, and
 // mbun::http::parse_response/ChunkedDecoder for incremental framing. The TLS

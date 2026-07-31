@@ -66,7 +66,7 @@ private:
     };
 
     event_loop::EventLoop& loop_;
-    event_loop::EpollBackend& epoll_;
+    event_loop::HostReadinessBackend& epoll_;
     SocketEvents events_ {};
     std::unordered_map<int, Entry> entries_ {};
     // Process-global token counter: several backends may share one EventLoop
@@ -75,7 +75,7 @@ private:
     inline static std::uint64_t gNextToken { 1 };
 
 public:  // Big Five: references + live fd table, non-copyable/non-movable.
-    EpollSocketBackend(event_loop::EventLoop& loop, event_loop::EpollBackend& epoll,
+    EpollSocketBackend(event_loop::EventLoop& loop, event_loop::HostReadinessBackend& epoll,
                        SocketEvents events)
         : loop_ { loop }
         , epoll_ { epoll }

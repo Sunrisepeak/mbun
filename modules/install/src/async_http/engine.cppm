@@ -6,7 +6,7 @@
 // (MiniEventLoop::init_global at :1281) running `drain_events(); uws_loop.tick();`
 // (:1373-1381), with the socket context's callbacks routed to the HTTPClient that
 // owns each socket (src/http/HTTPContext.rs). mbun's equivalent is
-// event_loop::EpollBackend + EventLoop + runtime_socket::EpollSocketBackend.
+// event_loop::HostReadinessBackend + EventLoop + runtime_socket::EpollSocketBackend.
 //
 // Routing: runtime_socket installs ONE SocketEvents callback set per backend and
 // routes by fd (epoll_socket_backend.cppm:44-50), so the fd→connection map lives
@@ -72,7 +72,7 @@ private:
         bool https{false};
     };
 
-    event_loop::EpollBackend epoll_{};
+    event_loop::HostReadinessBackend epoll_{};
     event_loop::EventLoop loop_;
     std::unique_ptr<runtime_socket::EpollSocketBackend> backend_{};
     std::unordered_map<runtime_socket::NativeHandle, InFlight*> byHandle_{};
