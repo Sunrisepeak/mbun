@@ -20,6 +20,9 @@
   9 failed、355 expects**；Node `test-vm-context.js` **1/1 file green**，
   callbackify/util.format/vm-basic 各自卡 stack、inspect constructor label、JSC
   parser message。红测 ownership 分散，未混修、未新增构建、未跑全量。
+- W49 fresh-binary 回归闸门：`events/event-emitter`、`os/os`、
+  `timers.promises`、`stream/node-stream-uint8array` 四文件均通过，合计
+  **128/128 tests、0 failed、565 expects**；未新增构建、未跑全量。
 - `0ddb3f3` 修复 `path.win32.toNamespacedPath` 对裸 namespace root
   (`\\\\?\\foo`) 丢失 Node 要求的尾斜杠；fresh Linux build 后目标文件
   **4/4** 全绿。与 `events/event-emitter` **67/67**、`os/os` **52/52**、

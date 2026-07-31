@@ -462,6 +462,16 @@ surface on Linux:
   dialect 专项；下一轮只从可由单一运行时边界闭合的近绿项选任务，继续维持
   3–5 个 bounded lanes，暂不跑全量 corpus。
 
+### W49 fresh-binary 回归闸门
+
+- 复用当前最新二进制并行复跑四条既有绿线：Bun
+  `events/event-emitter`、`os/os`、`timers.promises`、
+  `stream/node-stream-uint8array`。
+- 结果为 **4/4 files green、128/128 tests、0 failed、565 expects**；这是
+  stream-like stdin source checkpoint 的邻接回归证据，不替代 Bun/Node 全量分数。
+- 资源保持在约 **44 GiB available memory / 164 MiB swap / 23 GiB free disk**，
+  无新构建、无全量 corpus、无临时产物清理。
+
 ## Next route
 
 1. Keep the native-syntax compatibility gate limited to the two measured
