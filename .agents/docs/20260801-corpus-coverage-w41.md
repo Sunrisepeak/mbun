@@ -437,7 +437,10 @@ surface on Linux:
 - stream 文件唯一剩余失败是其 upstream `ReadableStream object type count`
   的 50-child burst，在 `spawnEx: fork() failed` 处触发 native spawn-burst
   资源边界；单文件复测仍复现，因此不归因于四 lane 并发，也不继续扩大本
-  owner 的改动。`spawnSync` 与 broad `spawn.test` 维持原有独立 owner。
+  owner 的改动。随后以单文件 `MemoryMax=34G、TasksMax=1024` bounded scope
+  复跑完整 stream 文件，结果为 **28 pass、2 TODO、0 fail**，说明源适配本身
+  已闭合，默认 runner 的 **4G/512** 安全 profile 才是该异常 burst 的测量边界。
+  `spawnSync` 与 broad `spawn.test` 维持原有独立 owner。
 - 构建后资源记录约 **44 GiB available memory**、swap 可用约 **163 MiB**、
   根分区可用约 **23 GiB**；临时构建产物 dry-run 未发现安全可回收量，未做
   清理，未启动全量 corpus。

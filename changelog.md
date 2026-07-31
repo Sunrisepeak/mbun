@@ -11,7 +11,10 @@
   **27/30**，两项 async-iterable 用例通过；相邻 `spawn-streaming-stdout` 保持
   **1/1、211 expects**。四文件 bounded probe 合计 **34 passed、8 failed、47 ran、
   288 expects**。剩余 object-count 失败明确是 upstream 50-child burst 的
-  `fork()` 资源边界；未跑全量 corpus，`spawnSync` 与 broad `spawn.test` 继续停车。
+  `fork()` 资源边界；同文件在单文件 `34G/1024 tasks` bounded scope 下为
+  **28 pass、2 TODO、0 fail**，确认不是 stdin 源适配回归，而是默认 runner
+  `4G/512` profile 的测量边界。未跑全量 corpus，`spawnSync` 与 broad `spawn.test`
+  继续停车。
 - `0ddb3f3` 修复 `path.win32.toNamespacedPath` 对裸 namespace root
   (`\\\\?\\foo`) 丢失 Node 要求的尾斜杠；fresh Linux build 后目标文件
   **4/4** 全绿。与 `events/event-emitter` **67/67**、`os/os` **52/52**、
