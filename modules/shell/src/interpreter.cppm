@@ -22,6 +22,9 @@ module;
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <crt_externs.h>  // _NSGetEnviron: Darwin has no writable `environ`
+#endif
 
 export module mbun.shell.interpreter;
 
@@ -476,7 +479,19 @@ private:
         }
         envp.push_back(nullptr);
 
-        ::execvpe(argv[0], argv.data(), envp.data());
+        // execvpe is a glibc extension -- Darwin has no such function, which is
+        // where the macOS CI probe stopped ("no member named 'execvpe'").
+        // POSIX's portable equivalent is to publish the environment and call
+        // execvp, which performs the same PATH search. On Darwin the process
+        // environment is reached through _NSGetEnviron() rather than a writable
+        // `environ` symbol. This runs in the forked child immediately before
+        // exec, so mutating it affects nothing the parent can observe.
+#if defined(__APPLE__)
+        *::_NSGetEnviron() = envp.data();
+#else
+        environ = envp.data();
+#endif
+        ::execvp(argv[0], argv.data());
         // exec failed.
         detail::write_all(STDERR_FILENO,
                           std::string{stage.argv.front()} + ": command not found\n");
