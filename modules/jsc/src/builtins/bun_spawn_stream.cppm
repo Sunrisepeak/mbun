@@ -81,6 +81,33 @@ inline constexpr std::string_view kBunSpawnStreamJS = R"JS(
     })();
     pump.catch(() => {});
   };
+  // Bun.file() is a regular-file stdio source. Wrap the already-installed
+  // Bun.spawn after process_web so this policy stays out of its near-limit
+  // constexpr payload; generic Blob values keep the live-pipe path.
+  if (G.Bun && typeof G.Bun.spawn === "function") {
+    const spawnWithBlob = G.Bun.spawn;
+    G.Bun.spawn = function (a, b) {
+      const opts = Array.isArray(a) ? (b || {}) : (a || {});
+      const file = opts.stdin;
+      const fs = M["fs"] || M["node:fs"] || (typeof G.require === "function" ? G.require("fs") : null);
+      if (file && file.__isBunFile && typeof file.name === "string" && fs &&
+          typeof fs.statSync === "function" && typeof fs.openSync === "function") {
+        let regular = false;
+        try { regular = fs.statSync(file.name).isFile(); } catch (e) {}
+        if (regular) {
+          let fd = -1;
+          try { fd = fs.openSync(file.name, "r"); } catch (e) { fd = -1; }
+          if (fd >= 0) {
+            try {
+              const next = { ...opts, stdin: fd };
+              return Array.isArray(a) ? spawnWithBlob.call(this, a, next) : spawnWithBlob.call(this, next);
+            } finally { try { fs.closeSync(fd); } catch (e) {} }
+          }
+        }
+      }
+      return spawnWithBlob.apply(this, arguments);
+    };
+  }
 )JS";
 
 }  // namespace mbun::jsc::builtins::detail

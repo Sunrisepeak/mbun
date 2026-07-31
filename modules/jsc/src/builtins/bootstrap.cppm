@@ -2983,7 +2983,16 @@ inline constexpr char kBootstrapJS_[] = R"JS(
         return stdin;
       };
     }
-    stdin.ref = () => stdin; stdin.unref = () => stdin;
+    const stdinIsRegularFile = () => {
+      const F = G.__mbunFsNative;
+      try {
+        const stat = F && typeof F.fstat === "function" ? F.fstat(0) : null;
+        return !!(stat && typeof stat.isFile === "function" && stat.isFile());
+      } catch (e) { return false; }
+    };
+    if (!stdinIsRegularFile()) {
+      stdin.ref = () => stdin; stdin.unref = () => stdin;
+    }
     stdin.read = (size) => {
       if (size !== undefined && size !== null) {
         size = Number(size);
