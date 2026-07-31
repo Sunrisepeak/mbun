@@ -3466,6 +3466,17 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       const s = spawnArgs(a, b);
       validateSignalOpt(s.opts.signal);
       if (s.opts.terminal && PN && PN.spawnPty && PN.openPty) return spawnTerminal(s.cmd, s.opts);
+      const stdinStream = s.opts.stdin != null && G.__mbunStreams &&
+        typeof G.__mbunStreams.isReadableStream === "function" &&
+        G.__mbunStreams.isReadableStream(s.opts.stdin);
+      const stdinAsyncIterable = s.opts.stdin != null && typeof Symbol !== "undefined" &&
+        Symbol.asyncIterator && typeof s.opts.stdin[Symbol.asyncIterator] === "function";
+      if (PN && PN.spawnEx && (stdinStream || stdinAsyncIterable)) {
+        if (stdinStream) validateBunReadableStdin(s.opts.stdin);
+        const proc = spawnAsyncBun(s.cmd, { ...s.opts, stdin: "pipe" });
+        pumpBunReadableStdin(proc, s.opts.stdin, stdinStream);
+        return proc;
+      }
       // A byte stdin payload must use the live pipe path. The synchronous
       // fallback only forwards string input, so Bun.spawn({ stdin: Buffer })
       // used to close the child's fd 0 without writing the bytes first.

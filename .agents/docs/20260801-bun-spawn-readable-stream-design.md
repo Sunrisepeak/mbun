@@ -2,11 +2,11 @@
 
 ## Goal
 
-Make `Bun.spawn({ stdin: ReadableStream })` use the existing asynchronous
-`spawnEx`/`__mbun_io_tick` path on Linux. The current dispatch only recognizes
-strings, byte views, ArrayBuffers, Blobs, and keyword stdin values; a
-`ReadableStream` falls through to the synchronous fallback and the child
-receives no input.
+Make `Bun.spawn({ stdin: ReadableStream })` and its accepted async-iterable
+variant use the existing asynchronous `spawnEx`/`__mbun_io_tick` path on Linux.
+The current dispatch only recognizes strings, byte views, ArrayBuffers, Blobs,
+and keyword stdin values; stream-like input falls through to the synchronous
+fallback and the child receives no input.
 
 The acceptance target is the vendored Bun stream-input contract. The upstream
 tests remain read-only and are the source of truth.
@@ -17,7 +17,8 @@ The bounded four-file probe measured:
 
 - `spawn-stdin-readable-stream.test.ts`: **7 passed, 21 failed, 30 ran**;
   ordinary data, delayed pulls, byte chunks, stream errors, cancellation, and
-  early-child-exit cases all report the missing stream-input boundary.
+  early-child-exit cases all report the missing stream-input boundary; the
+  async-iterable child-exit cases fail in the same owner.
 - `spawn-streaming-stdout.test.ts`: **1 passed, 0 failed, 211 expects**;
   this is the required adjacent regression lane.
 - `spawnSync.test.ts`: **6 passed, 7 failed** across timeout, fixture/optimization,
@@ -28,19 +29,21 @@ The bounded four-file probe measured:
 ## Design
 
 1. Detect a real `ReadableStream` with the already-installed
-   `G.__mbunStreams.isReadableStream` predicate. Before creating a child,
-   reject locked or disturbed streams with the Bun-facing stdin error shape.
+   `G.__mbunStreams.isReadableStream` predicate, or an object implementing
+   `Symbol.asyncIterator`. Before creating a child, reject locked or disturbed
+   streams with the Bun-facing stdin error shape.
 2. Create the child through the existing `spawnAsyncBun(..., { stdin: "pipe" })`
    path. Do not alter string, byte-view, ArrayBuffer, Blob, keyword, or
    `stdin: "pipe"` dispatch.
-3. Acquire the stream's default reader and pump one `read()` result at a time
-   into the existing non-blocking stdin queue. Convert strings and supported
-   byte views through the existing `anyToU8` helper; close the sink only after
-   `{ done: true }`.
+3. Acquire either the stream's default reader or the async iterator and pump
+   one result at a time into the existing non-blocking stdin queue. Convert
+   strings and supported byte views through the existing `anyToU8` helper;
+   close the sink only after `{ done: true }`.
 4. Race the read loop with the child exit. On child termination, cancel the
-   reader and release it so a pull source cannot keep the parent alive. Mark
-   the pump promise handled; an input error must not become an unhandled
-   rejection after the child has already closed.
+   reader or call the iterator's `return()`, then release the reader so a pull
+   source cannot keep the parent alive. Mark the pump promise handled; an input
+   error must not become an unhandled rejection after the child has already
+   closed.
 5. Keep the implementation in the JS payload because the behavior is Web
    Streams reader/prototype/Promise protocol glue. The reader pump lives in a
    small `bun_spawn_stream.cppm` payload immediately after `process_web.cppm`:
@@ -52,12 +55,13 @@ The bounded four-file probe measured:
 ## Error and lifecycle behavior
 
 - A locked or already-disturbed stream fails synchronously before spawning.
-- A source that closes normally ends child stdin and preserves exact bytes,
+- A stream-like source that closes normally ends child stdin and preserves exact bytes,
   including NUL bytes and mixed string/typed-array chunks.
 - A source error preserves data already delivered, closes the child input, and
   is handled by the pump so it does not surface as an unhandled rejection.
-- Child exit/kill cancels the reader once and releases it; later source pulls
-  must not write to a closed descriptor or pin the event loop.
+- Child exit/kill cancels the reader or returns the iterator once and releases
+  the reader; later source pulls must not write to a closed descriptor or pin
+  the event loop.
 - AbortSignal behavior remains owned by `spawnAsyncBun`; the stream pump only
   observes the resulting child exit.
 
@@ -80,5 +84,4 @@ before/after count, not a claim about the entire Bun corpus.
 
 - `spawnSync` timeout=0, memfd/optimization fixtures, uid/gid error shape;
 - the broad `spawn.test.ts` timeout;
-- async-iterable stdin support beyond what the existing stream contract needs;
 - changes to `compat/` test files or full-corpus measurement.

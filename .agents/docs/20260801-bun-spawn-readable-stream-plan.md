@@ -2,9 +2,9 @@
 
 > **For agentic workers:** Execute the tasks in this plan inline with a fresh red/green checkpoint after each source change.
 
-**Goal:** Route `Bun.spawn({ stdin: ReadableStream })` through the existing asynchronous pipe path so stream chunks reach the child with correct close, error, and early-exit lifecycle behavior.
+**Goal:** Route `Bun.spawn({ stdin: ReadableStream })` and async-iterable stdin through the existing asynchronous pipe path so chunks reach the child with correct close, error, and early-exit lifecycle behavior.
 
-**Architecture:** Keep native process creation and non-blocking fd flushing in `proc.spawnEx` and `__mbun_io_tick`. Add one JS protocol adapter beside `spawnAsyncBun` that acquires a Web Streams reader, forwards each chunk to the existing stdin sink, and cancels/releases the reader when the child closes. Dispatch only real `ReadableStream` values to this adapter; existing string, byte, Blob, keyword, and `stdin: "pipe"` paths remain unchanged.
+**Architecture:** Keep native process creation and non-blocking fd flushing in `proc.spawnEx` and `__mbun_io_tick`. Add one JS protocol adapter beside `spawnAsyncBun` that acquires either a Web Streams reader or async iterator, forwards each chunk to the existing stdin sink, and cancels/returns the source when the child closes. Dispatch only stream-like values to this adapter; existing string, byte, Blob, keyword, and `stdin: "pipe"` paths remain unchanged.
 
 **Tech Stack:** C++26 module raw-string builtin payload, JSC Web Streams shim, `tools/integration/bun_corpus_runner.py`, vendored Bun tests.
 
@@ -51,41 +51,42 @@ does not become an actionable source failure.
 
 **Interfaces:**
 - Consumes: `spawnAsyncBun(cmd, opts)`, `anyToU8(value)`,
-  `G.__mbunStreams.isReadableStream(value)`, and `proc.exited`.
-- Produces: `pumpBunReadableStdin(proc, stream)`; it returns no public value and
+  `G.__mbunStreams.isReadableStream(value)`, `Symbol.asyncIterator`, and
+  `proc.exited`.
+- Produces: `pumpBunReadableStdin(proc, source, isStream)`; it returns no public value and
   owns a handled internal promise. The helper is lexically visible to the
   `Bun.spawn` function because the payloads are concatenated into one IIFE.
 
-- [ ] **Step 1: Validate the stream before creating the child.**
+- [x] **Step 1: Validate the stream before creating the child.**
 
-Use `G.__mbunStreams.isReadableStream(value)` to identify the source. If
-`value.locked` is true, throw a `TypeError` synchronously. If
-`G.__mbunStreams.isDisturbed(value)` is true, throw exactly
-`'stdin' ReadableStream has already been used` so the existing upstream
-assertion can observe the Bun-facing error.
+Use `G.__mbunStreams.isReadableStream(value)` or `Symbol.asyncIterator` to
+identify the source. If it is a stream and `value.locked` is true, throw a
+`TypeError` synchronously. If `G.__mbunStreams.isDisturbed(value)` is true,
+throw exactly `'stdin' ReadableStream has already been used` so the existing
+upstream assertion can observe the Bun-facing error.
 
-- [ ] **Step 2: Implement the handled reader pump in the split payload.**
+- [x] **Step 2: Implement the handled reader/iterator pump in the split payload.**
 
-Acquire `stream.getReader()`, read one result at a time, and call the existing
-`proc.stdin.write(anyToU8(value))`. Stop on `done`, then call
-`proc.stdin.end()`. Catch source/read/write failures, end the sink, and attach a
-`.catch(() => {})` to the internal pump promise so a late pipe error cannot
-  become an unhandled rejection.
+Acquire `source.getReader()` or `source[Symbol.asyncIterator]()`, read one
+result at a time, and call the existing `proc.stdin.write(value)`. Stop on
+`done`, then call `proc.stdin.end()`. Catch source/read/write failures, end the
+sink, and attach a `.catch(() => {})` to the internal pump promise so a late
+pipe error cannot become an unhandled rejection.
 
-- [ ] **Step 3: Tie the reader to child lifecycle.**
+- [x] **Step 3: Tie the reader/iterator to child lifecycle.**
 
-Race each reader read against `proc.exited`. When the child closes, call
-`reader.cancel()` once, handle a rejected cancel promise, and release the
-reader in `finally`. Do not cancel after ordinary EOF; this preserves a source's
-normal close semantics while preventing a pending pull from keeping the parent
-alive after child termination.
+Race each source read against `proc.exited`. When the child closes, call
+`reader.cancel()` or `iterator.return()` once, handle a rejected cleanup
+promise, and release the reader in `finally`. Do not cancel after ordinary EOF;
+this preserves a source's normal close semantics while preventing a pending
+pull from keeping the parent alive after child termination.
 
-- [ ] **Step 4: Add only the new dispatch branch.**
+- [x] **Step 4: Add only the new dispatch branch.**
 
 Before the existing byte and Blob branches in `Bun.spawn`, validate a detected
-ReadableStream, create `spawnAsyncBun(s.cmd, { ...s.opts, stdin: "pipe" })`,
-start the pump, and return the process. Leave all other branches byte-for-byte
-unchanged unless the compiler requires a local helper name adjustment.
+ReadableStream when needed, create `spawnAsyncBun(s.cmd, { ...s.opts, stdin:
+"pipe" })`, start the pump, and return the process. Leave all other branches
+byte-for-byte unchanged unless the compiler requires a local helper name adjustment.
 
 ### Task 3: Build and verify the focused green lane
 
@@ -99,25 +100,28 @@ unchanged unless the compiler requires a local helper name adjustment.
 - Produces: fresh build exit status, focused pass/fail counts, and regression
   counts for the adjacent stream lane.
 
-- [ ] **Step 1: Recheck resource headroom.**
+- [x] **Step 1: Recheck resource headroom.**
 
 Do not build if the disk or swap gate is below the safe threshold. If the gate
 is acceptable, run one incremental Linux build and select the newest binary by
 mtime; do not run concurrent builds.
 
-- [ ] **Step 2: Run the two-file bounded verification.**
+- [x] **Step 2: Run the bounded verification.**
 
 Run the stream-input file and streaming-stdout file through
 `bun_corpus_runner.py` with four jobs and a 30-second file bound. Read the
 machine summary and each failure line; do not print whole logs into tracked
 files or PR comments.
 
-- [ ] **Step 3: If the stream file is not green, classify the next owner.**
+- [x] **Step 3: If the stream file is not green, classify the next owner.**
 
 Use the exact failing assertion to distinguish reader lifecycle, child-exit
 cancellation, or an unrelated async-iterable case. Make at most one additional
 source hypothesis in this commit; otherwise stop the commit at the measured
-partial gain and park the remaining owner.
+partial gain and park the remaining owner. The stream lane reached **27/30**
+with the two async-iterable cases green; the only remaining failure is the
+upstream 50-child object-count burst, which still reports `fork()` resource
+exhaustion and is parked as a native spawn-burst owner.
 
 ### Task 4: Record, checkpoint, and publish
 

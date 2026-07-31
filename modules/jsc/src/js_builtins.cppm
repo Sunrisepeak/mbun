@@ -8,6 +8,7 @@ export module mbun.jsc.js_builtins;
 import std;
 export import :bootstrap;
 export import :process_web;
+export import :bun_spawn_stream;
 export import :bun_terminal;
 export import :async_hooks;
 export import :yaml_flow;
@@ -79,6 +80,10 @@ namespace mbun::jsc::builtins {
 export inline const std::string kNodeBuiltinsJS =
     std::string {detail::kBootstrapJS}
         .append(detail::kProcessWebJS)
+        // Stream stdin is split from process_web because that payload is near
+        // GCC's constant-evaluated string-length ceiling. It stays adjacent so
+        // both pieces remain in the same IIFE and lexical scope.
+        .append(detail::kBunSpawnStreamJS)
         // Bun.Terminal: split out of :process_web only because that partition's
         // constexpr payload had reached GCC's 262144-character strlen ceiling.
         // It must stay immediately after it -- same scope, and __mbun_io_tick
