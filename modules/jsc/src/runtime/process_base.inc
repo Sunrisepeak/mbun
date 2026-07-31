@@ -236,7 +236,7 @@ JSValueRef cp_spawn_sync_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
             std::vector<char*> cenv;
             for (auto& e : envStr) cenv.push_back(const_cast<char*>(e.c_str()));
             cenv.push_back(nullptr);
-            execvpe(file.c_str(), cargv.data(), cenv.data());
+            mbun::platform::process::exec_path_env(file.c_str(), cargv.data(), cenv.data());
         } else {
             execvp(file.c_str(), cargv.data());
         }
@@ -505,7 +505,7 @@ std::string resolve_in_env_path(const std::string& file, const std::vector<std::
         cenv.push_back(nullptr);
         const std::string resolved{resolve_in_env_path(file, o.env)};
         if (!resolved.empty()) execve(resolved.c_str(), cargv.data(), cenv.data());
-        execvpe(file.c_str(), cargv.data(), cenv.data());
+        mbun::platform::process::exec_path_env(file.c_str(), cargv.data(), cenv.data());
     } else {
         execvp(file.c_str(), cargv.data());
     }

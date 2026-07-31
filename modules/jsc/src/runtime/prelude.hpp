@@ -219,5 +219,7 @@
 #  if defined(__linux__)
 #    include <sys/sysinfo.h>       // sysinfo() totalram/freeram/uptime/loads
 #    include <netpacket/packet.h>  // sockaddr_ll interface MAC address
+#  elif defined(__APPLE__)
+#    include <mach/mach.h>         // host_statistics64() vm page counts for os.freemem
 #  endif
 #endif

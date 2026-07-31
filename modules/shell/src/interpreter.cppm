@@ -481,11 +481,19 @@ private:
 
         // execvpe is a glibc extension -- Darwin has no such function, which is
         // where the macOS CI probe stopped ("no member named 'execvpe'").
-        // POSIX's portable equivalent is to publish the environment and call
-        // execvp, which performs the same PATH search. On Darwin the process
-        // environment is reached through _NSGetEnviron() rather than a writable
-        // `environ` symbol. This runs in the forked child immediately before
-        // exec, so mutating it affects nothing the parent can observe.
+        //
+        // Publishing the environment and calling execvp is NOT identical to it:
+        // execvpe searches the CALLER's PATH, whereas this searches the PATH in
+        // envp. That difference is deliberate here and not in the other four
+        // exec sites (which use mbun::platform::process::exec_path_env to keep
+        // the glibc semantics exactly). A shell is the one caller that wants the
+        // new environment's PATH: POSIX has `PATH=/foo cmd` affect the command
+        // search for that very command, which is what this does.
+        //
+        // On Darwin the process environment is reached through _NSGetEnviron()
+        // rather than a writable `environ` symbol. This runs in the forked child
+        // immediately before exec, so mutating it affects nothing the parent can
+        // observe.
 #if defined(__APPLE__)
         *::_NSGetEnviron() = envp.data();
 #else

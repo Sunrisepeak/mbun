@@ -74,6 +74,17 @@ JSValueRef osn_freemem_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_
     }
     if (!got) { if (::sysinfo(&si) == 0) v = static_cast<double>(si.freeram) * si.mem_unit; }
 }
+#elif defined(__APPLE__)
+    // Darwin has no _SC_AVPHYS_PAGES (it is a Linux/Solaris sysconf), so free
+    // pages come from the mach VM statistics. Same source libuv reads for
+    // uv_get_free_memory, which is what node reports here.
+    vm_statistics64_data_t vmInfo{};
+    mach_msg_type_number_t count{HOST_VM_INFO64_COUNT};
+    if (::host_statistics64(::mach_host_self(), HOST_VM_INFO64,
+                            reinterpret_cast<host_info64_t>(&vmInfo), &count) == KERN_SUCCESS) {
+        const long ps{::sysconf(_SC_PAGE_SIZE)};
+        if (ps > 0) v = static_cast<double>(vmInfo.free_count) * static_cast<double>(ps);
+    }
 #else
     const long pages{::sysconf(_SC_AVPHYS_PAGES)}, ps{::sysconf(_SC_PAGE_SIZE)};
     if (pages > 0 && ps > 0) v = static_cast<double>(pages) * static_cast<double>(ps);

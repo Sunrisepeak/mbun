@@ -8,4 +8,5 @@ export import mbun.platform.syscall;
 // Implementations behind the seams above. These are the modules that are
 // allowed to include OS headers; everything else in mbun consumes them.
 export import mbun.platform.posix_backend;
+export import mbun.platform.process;
 export import mbun.platform.pty;

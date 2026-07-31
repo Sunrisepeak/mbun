@@ -231,7 +231,7 @@ JSValueRef proc_spawn_ex_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
             // (execvpe searches the caller's environ PATH).
             const std::string resolved{resolve_in_env_path(file, o.env)};
             if (!resolved.empty()) execve(resolved.c_str(), cargv.data(), cenv.data());
-            execvpe(file.c_str(), cargv.data(), cenv.data());
+            mbun::platform::process::exec_path_env(file.c_str(), cargv.data(), cenv.data());
         } else {
             execvp(file.c_str(), cargv.data());
         }
@@ -530,7 +530,7 @@ JSValueRef proc_spawn_pty_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::si
             cenv.push_back(nullptr);
             const std::string resolved{resolve_in_env_path(file, o.env)};
             if (!resolved.empty()) execve(resolved.c_str(), cargv.data(), cenv.data());
-            execvpe(file.c_str(), cargv.data(), cenv.data());
+            mbun::platform::process::exec_path_env(file.c_str(), cargv.data(), cenv.data());
         } else {
             execvp(file.c_str(), cargv.data());
         }
