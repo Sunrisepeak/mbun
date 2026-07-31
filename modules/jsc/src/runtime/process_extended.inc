@@ -824,25 +824,13 @@ extern "C" char** environ;
 #endif
 
 // The host platform / arch as node's process.platform / process.arch strings.
+// The fact and its node spelling both belong to mbun.platform.capability, which
+// resolves them once at compile time; there is no conditional left here.
 constexpr const char* host_platform() {
-#if defined(__APPLE__)
-    return "darwin";
-#elif defined(_WIN32)
-    return "win32";
-#elif defined(__FreeBSD__)
-    return "freebsd";
-#else
-    return "linux";
-#endif
+    return mbun::platform::platform_name(mbun::platform::HOST_PLATFORM);
 }
 constexpr const char* host_arch() {
-#if defined(__aarch64__) || defined(_M_ARM64)
-    return "arm64";
-#elif defined(__x86_64__) || defined(_M_X64)
-    return "x64";
-#else
-    return "x64";
-#endif
+    return mbun::platform::architecture_name(mbun::platform::HOST_ARCHITECTURE);
 }
 
 // Absolute path to the running executable (process.execPath / bunExe()). Tests

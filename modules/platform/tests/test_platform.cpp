@@ -163,6 +163,16 @@ int main() {
     static_assert(platform::decode_linux_raw_result(-2).code == platform::ErrorCode::NotFound);
     static_assert(platform::decode_linux_raw_result(-4096).is_success());
 
+    // node's process.platform / process.arch spellings, which the jsc runtime
+    // now takes from here instead of its own #ifdef ladder.
+    static_assert(std::string_view{platform::platform_name(platform::Platform::Darwin)} == "darwin");
+    static_assert(std::string_view{platform::platform_name(platform::Platform::Windows)} == "win32");
+    static_assert(std::string_view{platform::platform_name(platform::Platform::Unknown)} == "linux");
+    static_assert(std::string_view{platform::architecture_name(platform::Architecture::Aarch64)} ==
+                  "arm64");
+    static_assert(std::string_view{platform::architecture_name(platform::Architecture::Other)} ==
+                  "x64");
+
     // DeferredBackend still answers NotSupported for everything -- it stays the
     // honest fallback for operations and targets without an implementation.
     platform::DeferredBackend backend;
