@@ -167,6 +167,36 @@ def near_green(run: Path, corpus: str) -> tuple[int, int] | None:
     return (nearn, nong) if (nearn is not None and nong is not None) else None
 
 
+def area_rates(rows: list[dict[str, str]]) -> dict[str, dict]:
+    """Measured files/hour per AREA, not per corpus.
+
+    The corpus mean hides the thing that actually decides a goal. Wave 66 ran two
+    node lanes against the same near-green list and the same +6 goal: test-tls
+    delivered 6 in 1.0h (6.0 files/h, goal accuracy 1.00) and test-http2 delivered
+    2 in 2.6h (0.8 files/h, 0.33). That is not lane quality -- tls's near-green
+    files shared ONE missing feature (PKCS#12), http2's were independent deep
+    defects. Sizing both from the corpus mean of 3.5 guarantees one goal is
+    fantasy and the other is timid, and blocker_rank cannot see the difference
+    because it counts how many blockers remain, not whether they share a cause.
+    """
+    by: dict[str, list[tuple[float, float]]] = {}
+    for r in rows:
+        try:
+            got, mins = float(r.get("delivered", 0) or 0), float(r.get("minutes", 0) or 0)
+        except ValueError:
+            continue
+        if mins <= 0:
+            continue
+        by.setdefault(r.get("area", "?"), []).append((got, mins))
+    out = {}
+    for area, obs in by.items():
+        hours = sum(m for _, m in obs) / 60.0
+        files = sum(g for g, _ in obs)
+        out[area] = {"lanes": len(obs), "files": files, "hours": round(hours, 1),
+                     "rate": round(files / hours, 2) if hours else None}
+    return out
+
+
 def mode_for(nearn: int, nong: int) -> tuple[str, float]:
     frac = (nearn / nong) if nong else 0.0
     return ("AREA" if frac >= STRUCTURAL_BELOW else "STRUCTURAL"), frac
@@ -184,11 +214,13 @@ def main() -> int:
     ap.add_argument("--plan", action="store_true", help="emit the next dispatch from measured state")
     ap.add_argument("--node-run", type=Path, help="latest node run dir")
     ap.add_argument("--bun-run", type=Path, help="latest bun run dir")
+    ap.add_argument("--areas", action="store_true",
+                    help="measured files/hour per area, for sizing the next goals")
     ap.add_argument("--commit-state", action="store_true",
                     help="write strategy_state.json so the next --plan reads it back")
     args = ap.parse_args()
-    if not args.evaluate and not args.plan:
-        ap.error("nothing to do: pass --evaluate WAVE and/or --plan")
+    if not args.evaluate and not args.plan and not args.areas:
+        ap.error("nothing to do: pass --evaluate WAVE, --areas and/or --plan")
 
     state: dict = {}
     if STATE.exists():
@@ -223,6 +255,19 @@ def main() -> int:
             print("     plan must be sized from the MEASURED rate, not the previous target.")
         state["last_evaluated_wave"] = ev["wave"]
         state["goal_accuracy"] = ga
+
+    if args.areas:
+        rates = area_rates(read_ledger())
+        ranked = sorted((a for a in rates.items() if a[1]["rate"] is not None),
+                        key=lambda kv: -kv[1]["rate"])
+        print("\n=== measured rate per AREA (size the next goal from the area, not the corpus) ===\n")
+        print(f"  {'area':<26} {'lanes':>5} {'files':>6} {'hours':>6} {'files/h':>8}")
+        for area, s in ranked[:20]:
+            print(f"  {area[:26]:<26} {s['lanes']:>5} {s['files']:>6.0f} "
+                  f"{s['hours']:>6.1f} {s['rate']:>8.2f}")
+        print("\n  A goal is rate x hours x 0.75. An area with no row yet has no measured")
+        print("  rate -- use the corpus mean and say that is what you did.")
+        state["area_rates"] = {a: s for a, s in rates.items()}
 
     if args.plan:
         print("\n=== what the measurements imply for the next wave ===\n")

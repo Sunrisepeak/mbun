@@ -82,6 +82,31 @@ set -e
 [ "$rc" -ne 0 ] || fail "evaluating an unknown wave must fail, not return empty"
 pass "an unknown wave fails loudly"
 
+# --- per-area rates are computed per AREA, not pooled ------------------------
+# This is what the corpus mean hides: two lanes, same goal, same near-green
+# axis, 7.5x apart because one area's blockers shared a cause and the other's
+# did not. Pooling them makes both goals wrong.
+o=$(python3 - "$tool" "$tmp/ar.tsv" <<'EOF'
+import sys, importlib.util, pathlib
+spec = importlib.util.spec_from_file_location("wc", sys.argv[1])
+wc = importlib.util.module_from_spec(spec); spec.loader.exec_module(wc)
+rows = [
+  {"area": "fast", "delivered": "6", "minutes": "60"},    # 6.0/h
+  {"area": "slow", "delivered": "2", "minutes": "156"},   # 0.77/h
+  {"area": "slow", "delivered": "4", "minutes": "204"},   # pooled with the above
+  {"area": "nohours", "delivered": "9", "minutes": "0"},  # unmeasurable, must drop
+]
+r = wc.area_rates(rows)
+print("fast", r["fast"]["rate"], "lanes", r["fast"]["lanes"])
+print("slow", r["slow"]["rate"], "lanes", r["slow"]["lanes"])
+print("nohours_present", "nohours" in r)
+EOF
+)
+echo "$o" | grep -q 'fast 6.0 lanes 1'  || fail "6 files in 60min must be 6.0/h: $o"
+echo "$o" | grep -q 'slow 1.0 lanes 2'  || fail "slow must pool its 2 lanes to 6 files/6h = 1.0/h: $o"
+echo "$o" | grep -q 'nohours_present False'   || fail "a zero-minute row is unmeasurable and must not produce a rate: $o"
+pass "rates are per-area, pooled within an area, and zero-minute rows are dropped"
+
 # --- the checked-in ledger evaluates ----------------------------------------
 python3 "$tool" --evaluate 65 >/dev/null 2>&1 || fail "the checked-in ledger must evaluate"
 pass "the checked-in ledger evaluates"
