@@ -116,7 +116,21 @@ members = [
     "modules/tls",
     "modules/http_client",
     "modules/http_jsc",
-    "modules/libarchive",
+    # modules/libarchive is EXCLUDED from the workspace build, not deleted.
+    # It has zero consumers (nothing imports mbun.libarchive) and it is the only
+    # member that reaches its compat packages TRANSITIVELY, through
+    # compat.libarchive rather than declaring them. A transitively-resolved
+    # package is staged from the shared cache under a nested object path that
+    # the package build never produces, giving an object that depends on itself:
+    #   ninja: error: '<cache>/obj/compat_zstd/.../xxhash.o',
+    #   needed by 'obj/compat_zstd/.../xxhash.o', missing and no known rule
+    # Reproduced locally: `cd modules/libarchive && mcpp build` fails from cold
+    # while modules/compress -- which declares zlib/zstd directly -- passes.
+    # Declaring the backends directly here was tried and does NOT fix it, so the
+    # defect is in mcpp's transitive resolution, not in this manifest.
+    # This is what made CI red on both toolchains from 2026-07-29 while the base
+    # branch was equally red. Re-add the member once mcpp resolves it.
+    # "modules/libarchive",
     "modules/watcher",
     "modules/sqlite",
     "modules/event_loop",
