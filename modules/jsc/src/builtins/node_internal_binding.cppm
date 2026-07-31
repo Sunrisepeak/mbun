@@ -1810,6 +1810,11 @@ inline constexpr std::string_view kNodeInternalBindingJS = R"JS(
           // mark it cloned into a husk of its five public callback slots and
           // the postMessage succeeded.
           if (typeof G.__mbunMarkNativeHostObject === "function") G.__mbunMarkNativeHostObject(this);
+          const external = {};
+          if (typeof G.__mbunMarkExternal === "function") G.__mbunMarkExternal(external);
+          Object.defineProperty(this, "_externalStream", {
+            value: external, enumerable: false, writable: false, configurable: false,
+          });
           this.onread = undefined;
           this.onreadstart = undefined;
           this.onreadstop = undefined;

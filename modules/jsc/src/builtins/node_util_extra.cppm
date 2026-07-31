@@ -54,6 +54,22 @@ inline constexpr std::string_view kNodeUtilExtraJS = R"JS(
     const fnSrc = Function.prototype.toString;
     const isNativeCodeFn = (f) => { try { return /\[native code\]\s*\}\s*$/.test(fnSrc.call(f)); } catch (_) { return true; } };
 
+    // V8's External values have no direct JSC equivalent. Keep an explicit
+    // identity registry for the internal JSStream test handle instead of
+    // treating every plain object as external.
+    const externalRegistry = G.__mbunExternalRegistry || new WeakSet();
+    if (!G.__mbunExternalRegistry) {
+      Object.defineProperty(G, "__mbunExternalRegistry", {
+        value: externalRegistry, enumerable: false, writable: false, configurable: true,
+      });
+    }
+    if (typeof G.__mbunMarkExternal !== "function") {
+      Object.defineProperty(G, "__mbunMarkExternal", {
+        value: (v) => { if (isObj(v)) externalRegistry.add(v); return v; },
+        enumerable: false, writable: false, configurable: true,
+      });
+    }
+
     // -------------------------------------------- isProxy via Proxy wrapper
     // Proxies are transparent to JS, so track creation. The wrapper forwards
     // everything (name/length/prototype reads) to the native constructor.
@@ -90,7 +106,7 @@ inline constexpr std::string_view kNodeUtilExtraJS = R"JS(
     const isSymbolObject = (v) => isObj(v) && brand(Symbol.prototype.valueOf, v);
     const isBigIntObject = (v) => isObj(v) && brand(BigInt.prototype.valueOf, v);
     const T = {
-      isExternal: (v) => false,
+      isExternal: (v) => isObj(v) && externalRegistry.has(v),
       isDate: (v) => isObj(v) && brand(Date.prototype.getTime, v),
       isArgumentsObject: (v) => isObj(v) && toStr(v) === "[object Arguments]",
       isBigIntObject,
