@@ -74,6 +74,17 @@ JSValueRef osn_freemem_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_
     }
     if (!got) { if (::sysinfo(&si) == 0) v = static_cast<double>(si.freeram) * si.mem_unit; }
 }
+#elif defined(__APPLE__)
+    // Darwin has no _SC_AVPHYS_PAGES (it is a Linux/Solaris sysconf), so free
+    // pages come from the mach VM statistics. Same source libuv reads for
+    // uv_get_free_memory, which is what node reports here.
+    vm_statistics64_data_t vmInfo{};
+    mach_msg_type_number_t count{HOST_VM_INFO64_COUNT};
+    if (::host_statistics64(::mach_host_self(), HOST_VM_INFO64,
+                            reinterpret_cast<host_info64_t>(&vmInfo), &count) == KERN_SUCCESS) {
+        const long ps{::sysconf(_SC_PAGE_SIZE)};
+        if (ps > 0) v = static_cast<double>(vmInfo.free_count) * static_cast<double>(ps);
+    }
 #else
     const long pages{::sysconf(_SC_AVPHYS_PAGES)}, ps{::sysconf(_SC_PAGE_SIZE)};
     if (pages > 0 && ps > 0) v = static_cast<double>(pages) * static_cast<double>(ps);
@@ -379,28 +390,90 @@ JSValueRef osn_setprio_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_
     return o;
 }
 
+// Every tty entry point below takes a descriptor that JS obtained from
+// node:fs, and those are mbun VIRTUAL fds (fd_table(), numbered from 1000) —
+// not descriptors the kernel knows. `new tty.ReadStream(fs.openSync("/dev/tty"))`
+// therefore reported isTTY false and setRawMode failed with EBADF(9), which is
+// the whole "read piped stdin, then reopen /dev/tty" TUI pattern. Resolve the
+// virtual fd to its real one first, exactly as fsn_fstat_cb does, and fall back
+// to the number itself for stdio (0/1/2) and inherited descriptors that mbun
+// never handed out. ref: regression tty-reopen-after-stdin-eof.
+std::unordered_map<int, mbun::core::io::File>& fd_table();
+inline int osn_real_fd(int vfd) {
+    if (vfd < 0) return -1;
+    auto& tbl{fd_table()};
+    auto it{tbl.find(vfd)};
+    if (it != tbl.end() && it->second.is_open()) return it->second.native_fd();
+    return vfd;
+}
+
 // isatty(fd) → bool
 JSValueRef osn_isatty_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                          const JSValueRef args[], JSValueRef*) {
-    const int fd{osn_arg_int(ctx, argc, args, 0, -1)};
+    const int fd{osn_real_fd(osn_arg_int(ctx, argc, args, 0, -1))};
     return JSValueMakeBoolean(ctx, fd >= 0 && ::isatty(fd) == 1);
 }
 
 // ttySize(fd) → [cols, rows] | null (ioctl TIOCGWINSZ)
 JSValueRef osn_ttysize_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                           const JSValueRef args[], JSValueRef*) {
-    const int fd{osn_arg_int(ctx, argc, args, 0, -1)};
+    const int fd{osn_real_fd(osn_arg_int(ctx, argc, args, 0, -1))};
     struct winsize ws {};
     if (fd < 0 || ::ioctl(fd, TIOCGWINSZ, &ws) != 0) return JSValueMakeNull(ctx);
     JSValueRef items[2]{JSValueMakeNumber(ctx, ws.ws_col), JSValueMakeNumber(ctx, ws.ws_row)};
     return JSObjectMakeArray(ctx, 2, items, nullptr);
 }
 
+// ── stdin termios restore at exit (libuv uv_tty_reset_mode) ─────────────────
+// A process that leaves a terminal in raw mode leaves the USER's shell in raw
+// mode: libuv snapshots the descriptor's termios the first time a mode change
+// is made and restores it from an atexit hook. node inherits that for free;
+// mbun did not, so a `bun -e 'process.stdin.setRawMode(true)'` under a pty left
+// ICANON/ECHO cleared for whoever owned the pty afterwards -- which is exactly
+// what "child that called setRawMode restores termios on exit" observes from
+// the parent side, and what makes an interactive TUI wreck the terminal it
+// crashed out of.
+//
+// The snapshot is taken at INSTALL time when stdin is a terminal, not at the
+// first setRawMode: the "interactive wrapper" case restores a cooked state the
+// process itself never set (the mode was changed out from under it), which only
+// a startup snapshot can produce. PORT-SOURCE: libuv src/unix/tty.c
+// uv_tty_reset_mode + bun's bun_restore_stdio.
+struct TtyStartupMode {
+    struct termios saved {};
+    bool valid{false};
+};
+inline TtyStartupMode& tty_startup_mode() {
+    static TtyStartupMode m;
+    return m;
+}
+inline void tty_restore_startup_mode() {
+    TtyStartupMode& m{tty_startup_mode()};
+    if (!m.valid) return;
+    m.valid = false;  // restore exactly once, even if exit runs twice
+    (void)::tcsetattr(STDIN_FILENO, TCSANOW, &m.saved);
+}
+inline void tty_capture_startup_mode() {
+    TtyStartupMode& m{tty_startup_mode()};
+    // Gated on stdout being a terminal too. A pipeline PRODUCER (stdout is a
+    // pipe, stdin happens to share a tty device with an interactive program)
+    // must NOT write a stale cooked snapshot back on the way out: that is the
+    // `less` case, where the exiting producer would clobber the raw mode the
+    // live foreground program set. bun draws the same line in bun_restore_stdio,
+    // and "pipeline producer exit does not clobber raw mode on shared tty
+    // device" is the regression test for it.
+    if (m.valid || ::isatty(STDIN_FILENO) != 1 || ::isatty(STDOUT_FILENO) != 1) return;
+    if (::tcgetattr(STDIN_FILENO, &m.saved) != 0) return;
+    m.valid = true;
+    static bool registered{false};
+    if (!registered) { registered = true; std::atexit(tty_restore_startup_mode); }
+}
+
 // setRawMode(fd, flag) → 0 on success, else the positive errno. termios cbreak
 // mirror of libuv uv_tty_set_mode(UV_TTY_MODE_RAW).
 JSValueRef osn_setrawmode_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                              const JSValueRef args[], JSValueRef*) {
-    const int fd{osn_arg_int(ctx, argc, args, 0, -1)};
+    const int fd{osn_real_fd(osn_arg_int(ctx, argc, args, 0, -1))};
     const bool raw{argc > 1 && JSValueToBoolean(ctx, args[1])};
     struct termios t {};
     if (fd < 0 || ::tcgetattr(fd, &t) != 0) return JSValueMakeNumber(ctx, errno);
@@ -436,6 +509,7 @@ void install_node_os_native(JSContextRef ctx, JSObjectRef global) {
     set_fn(ctx, on, "isatty", osn_isatty_cb);
     set_fn(ctx, on, "ttySize", osn_ttysize_cb);
     set_fn(ctx, on, "setRawMode", osn_setrawmode_cb);
+    tty_capture_startup_mode();
     set_prop(ctx, global, "__mbunOsNative", on);
 }
 

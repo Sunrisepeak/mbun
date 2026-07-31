@@ -268,8 +268,14 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
 
     // ------------------------------------------------------- raw decoders
     // All take (buf, start, end) with 0 <= start < end <= live length.
+    // NB: ignoreBOM — node's utf8Slice keeps a leading U+FEFF (a BOM is data at
+    // the Buffer level; only WHATWG TextDecoder strips it). Without this,
+    // fs.readFileSync(f, "utf8") loses the BOM (test-stream-preprocess).
+    // Lazily built: TextDecoder may not be installed yet at bootstrap time.
+    let utf8Dec = null;
     function rawUtf8Slice(buf, s, e) {
-      return new TextDecoder("utf-8").decode(buf.subarray(s, e));
+      if (utf8Dec === null) utf8Dec = new TextDecoder("utf-8", { ignoreBOM: true });
+      return utf8Dec.decode(buf.subarray(s, e));
     }
     function rawLatin1Slice(buf, s, e) {
       let out = "";
@@ -1030,12 +1036,27 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
       // A string byteOffset slot IS the encoding (2-arg form). Otherwise arg3 is
       // either a numeric `end` limit or a string `encoding`; arg4 (if present) is
       // the encoding that follows a numeric end.
-      let encoding, end;
+      let encoding, end, encodingObj;
+      // An object in the encoding slot is a real encoding: node's C++ search
+      // runs ToString on it. Hold it aside so the coercion happens in node's
+      // order (byteOffset first) rather than inline here.
+      const encodingSlot = (v) => (v !== null && (typeof v === "object" || typeof v === "function"));
       if (typeof byteOffset === "string") { encoding = byteOffset; byteOffset = undefined; }
-      else if (typeof arg3 === "number") { end = arg3; if (typeof arg4 === "string") encoding = arg4; }
+      else if (typeof arg3 === "number") {
+        end = arg3;
+        if (typeof arg4 === "string") encoding = arg4;
+        else if (encodingSlot(arg4)) encodingObj = arg4;
+      }
       else if (typeof arg3 === "string") encoding = arg3;
+      else if (encodingSlot(arg3)) encodingObj = arg3;
+      // ToNumber on byteOffset and ToString on the encoding both run before the
+      // search touches the haystack's memory, and either can detach it. Sample
+      // the length only after both, so a detached buffer searches as empty
+      // instead of scanning a stale bound.
+      const rawOfs = byteOffset === undefined ? undefined : +byteOffset;
+      if (encodingObj !== undefined) encoding = String(encodingObj);
       const hlen = buf.length;
-      let ofs = byteOffset === undefined ? (dir ? 0 : hlen) : +byteOffset;
+      let ofs = rawOfs === undefined ? (dir ? 0 : hlen) : rawOfs;
       if (ofs !== ofs) ofs = dir ? 0 : hlen; // NaN -> scan extent
       let lim = hlen;
       if (end !== undefined) { let e = +end; if (e !== e) e = hlen; if (e < 0) e = 0; else if (e > hlen) e = hlen; lim = e; }
@@ -1195,18 +1216,53 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
       throw errFromArgType(value);
     };
 
+    // node lib/buffer.js showFlaggedDeprecation(): DEP0005 fires at most once per
+    // process, and is suppressed when the `new Buffer()` CALL SITE sits inside
+    // node_modules — unless --pending-deprecation (or NODE_PENDING_DEPRECATION)
+    // is set, which is the only case the previous implementation handled. That
+    // inversion meant an ordinary `new Buffer(10)` emitted nothing at all.
+    // node answers "inside node_modules" from the native stack
+    // (src/node_util.cc isInsideNodeModules), which is why the JS capture below
+    // has to neutralise a user-installed Error.prepareStackTrace:
+    // test-buffer-constructor-deprecation-error installs one that itself calls
+    // `new Buffer(10)`, so an ordinary `new Error().stack` would recurse.
     let bufferConstructorWarningShown = false;
+    let nodeModulesCheckCounter = 0;
+    const bufferPendingDeprecation = () => {
+      const process = G.process;
+      if (!process) return false;
+      const argv = process.execArgv;
+      if (Array.isArray(argv) && argv.includes("--pending-deprecation")) return true;
+      const env = process.env;
+      const v = env && env.NODE_PENDING_DEPRECATION;
+      return !!v && v !== "0";
+    };
+    const bufferCallSiteInNodeModules = () => {
+      const E = G.Error;
+      const saved = E.prepareStackTrace;
+      try {
+        E.prepareStackTrace = undefined;
+        const stack = new E().stack;
+        return typeof stack === "string" && stack.includes("node_modules");
+      } catch (_) {
+        return false;
+      } finally {
+        try { E.prepareStackTrace = saved; } catch (_) {}
+      }
+    };
     const warnBufferConstructor = () => {
       if (bufferConstructorWarningShown) return;
+      // node stops paying for the stack walk once it has checked 10000 times.
+      if (++nodeModulesCheckCounter > 10000) return;
+      if (!bufferPendingDeprecation() && bufferCallSiteInNodeModules()) return;
       const process = G.process;
-      const argv = process && process.execArgv;
-      if (!Array.isArray(argv) || !argv.includes("--pending-deprecation")) return;
+      if (!process || typeof process.emitWarning !== "function") return;
+      // Latched BEFORE emitting so a Buffer allocation anywhere under
+      // emitWarning cannot re-enter and warn twice.
       bufferConstructorWarningShown = true;
-      if (typeof process.emitWarning === "function") {
-        process.emitWarning(
-          "Buffer() is deprecated due to security and usability issues. Please use the Buffer.alloc(), Buffer.allocUnsafe(), or Buffer.from() methods instead.",
-          "DeprecationWarning", "DEP0005");
-      }
+      process.emitWarning(
+        "Buffer() is deprecated due to security and usability issues. Please use the Buffer.alloc(), Buffer.allocUnsafe(), or Buffer.from() methods instead.",
+        "DeprecationWarning", "DEP0005");
     };
 
     // Thin callable wrapper sharing OrigBuffer.prototype so the deprecated

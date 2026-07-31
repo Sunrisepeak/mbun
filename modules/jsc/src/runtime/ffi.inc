@@ -139,6 +139,11 @@ mbun::ffi::NativeValue ffi_js_to_native(JSContextRef ctx, JSValueRef v, mbun::ff
             void* p{tt == kJSTypedArrayTypeArrayBuffer
                         ? JSObjectGetArrayBufferBytesPtr(ctx, o, nullptr)
                         : JSObjectGetTypedArrayBytesPtr(ctx, o, nullptr)};
+            // BytesPtr answers the BUFFER base; native code handed a subarray
+            // must receive the address of ITS first byte. (ArrayBuffers have no
+            // view offset, so only the typed-array arm needs it.)
+            if (p != nullptr && tt != kJSTypedArrayTypeArrayBuffer)
+                p = static_cast<char*>(p) + JSObjectGetTypedArrayByteOffset(ctx, o, nullptr);
             return NativeValue::pointer(p);
         }
         return NativeValue::pointer(reinterpret_cast<void*>(ffi_to_address(ctx, v)));
@@ -220,6 +225,10 @@ JSValueRef ffi_ptr_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t ar
                 ? JSObjectGetArrayBufferBytesPtr(ctx, o, nullptr)
                 : JSObjectGetTypedArrayBytesPtr(ctx, o, nullptr)};
     if (p == nullptr) return ffi_throw(ctx, exc, "ptr: expected a TypedArray or ArrayBuffer");
+    // BytesPtr answers the BUFFER base; `ptr(buf.subarray(n))` must report the
+    // address of the SUBARRAY. (ArrayBuffers have no view offset.)
+    if (tt != kJSTypedArrayTypeArrayBuffer)
+        p = static_cast<char*>(p) + JSObjectGetTypedArrayByteOffset(ctx, o, nullptr);
     std::uintptr_t addr{reinterpret_cast<std::uintptr_t>(p)};
     if (argc >= 2 && JSValueIsNumber(ctx, args[1])) {
         addr += static_cast<std::uintptr_t>(JSValueToNumber(ctx, args[1], nullptr));

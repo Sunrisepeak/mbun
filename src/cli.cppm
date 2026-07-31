@@ -50,6 +50,7 @@ enum class Action {
     Add,             // `mbun add <pkg>...` — resolve + install + edit package.json
     Build,           // `mbun build <entry> [...flags]` — bundler CLI (R7)
     Exec,            // `mbun exec <script>` — shell script via mbun's shell interpreter
+    Publish,         // `mbun publish [flags] [dist]` — help screen only (see run_publish)
     NotImplemented,  // 已规划子命令占位（当前为空），由后续任务逐步实现
     Unknown,
 };
@@ -84,6 +85,12 @@ Parsed parse(std::span<const std::string_view> args) {
         return { Action::Exec, args.size() > 1 ? std::string { args[1] } : std::string {} };
     }
 
+    // `publish` is a reserved subcommand in bun (PackageManager Subcommand::Publish),
+    // so it must never fall through to package.json script resolution — that is
+    // what made `mbun publish --help` report `Script not found "publish"`.
+    // Only the help screen is implemented; see mbun::app::run_publish.
+    if (first == "publish") return { Action::Publish, std::string { first } };
+
     // `run` handled ahead of dispatch in main; `test`/`install`/`build`/`exec` handled above.
     return { Action::Unknown, std::string { first } };
 }
@@ -106,6 +113,11 @@ Parsed parse(std::initializer_list<std::string_view> args) {
 // Everything not listed here is treated as a boolean flag (single token).
 bool node_flag_takes_value(std::string_view flag) {
     static constexpr std::string_view kValued[]{
+        // mbun's own: `--dialect node|bun` selects the compat layer. Listed
+        // here so every flag walker in the CLI skips its value token instead of
+        // mistaking it for the subcommand or the script (mbun::app::resolve_dialect
+        // reads the flag itself, long before these walkers run).
+        "--dialect",
         "-r", "--require", "--snapshot-blob", "--build-snapshot-config",
         "--test-reporter", "--test-reporter-destination", "--test-name-pattern",
         "--test-skip-pattern", "--test-shard", "--test-concurrency",
@@ -185,6 +197,13 @@ std::vector<std::string> derive_exec_argv(std::span<const std::string_view> args
     bool seenRun{false};
     std::string_view prev{};
     for (const std::string_view a : args) {
+        // `--` is node's end-of-options marker: the option parser CONSUMES it,
+        // so it never reaches process.execArgv (test-process-exec-argv spawns
+        // `mbun --pending-deprecation -- file` and asserts the child reports
+        // exactly ["--pending-deprecation"]). Everything after it is the entry
+        // point and its arguments, so stop here — unless the previous token is
+        // a value-taking flag, which owns `--` as its value.
+        if (a == "--" && (prev.empty() || !exec_argv_flag_takes_value(prev))) break;
         if (!a.empty() && a[0] == '-') {
             execArgv.emplace_back(a);
             prev = a;
@@ -340,6 +359,16 @@ struct TestFlags {
     bool onlyFailures { false };            // --only-failures        (Arguments.rs:1647-1649)
     bool passWithNoTests { false };         // --pass-with-no-tests   (Arguments.rs:1786)
 
+    // --rerun-each <INT>: run EVERY test file N times, in the same JS realm
+    // (test_command.rs:3108-3160 `repeat_count`). "Same realm" is the contract
+    // the flag is used for — a file's globals must survive the reruns so a flaky
+    // test can accumulate state across them (cli/test/rerun-each.test.ts counts
+    // `globalThis.testRunCounter` up to 3); only the module entry is
+    // re-evaluated. The file is counted ONCE in the summary regardless of the
+    // rerun count (test_command.rs:3162-3164 `if repeat_index == 0 {
+    // summary().files += 1 }`), so the report stays "Ran 3 tests across 1 file".
+    std::optional<std::uint32_t> rerunEach {};
+
     // -t / --test-name-pattern / --grep <STR>: a JS RegExp source matched
     // (partial, unanchored) against each test's full "describe > … > test" name.
     // Non-matching tests count as "skipped because label"; a run that filters out
@@ -351,6 +380,13 @@ struct TestFlags {
     // CLI override from an explicit command-line pattern list, which replaces
     // (rather than appends to) bunfig's [test].pathIgnorePatterns.
     std::optional<std::vector<std::string>> pathIgnorePatterns {};
+
+    // `--reporter <STR>` / `--reporter-outfile <STR>`: bun's only reporter here is
+    // "junit", and it is written to the outfile IN ADDITION to the normal console
+    // report — never instead of it (ref: bun test_command.rs, which installs the
+    // JUnit reporter alongside the CLI one). Without an outfile the flag is inert.
+    std::optional<std::string> reporter {};
+    std::optional<std::string> reporterOutfile {};
 
     // ─── JSX ────────────────────────────────────────────────────────────────
     // Not TEST_ONLY_PARAMS: these live in bun's TRANSPILER_PARAMS_, which `test`
@@ -458,9 +494,22 @@ TestFlags parse_test(std::span<const std::string_view> args) {
                 }
                 out.randomize = true;
                 out.seed = parsed;
+            } else if (name == "--rerun-each") {
+                // Arguments.rs parses it as a u32; bun clamps to >= 1 at the use
+                // site (`repeat_count.max(1)`, test_command.rs:2144), so 0 and a
+                // junk value both mean "run once" rather than "run nothing".
+                std::uint32_t parsed {};
+                const char* begin { value.data() };
+                const char* end { value.data() + value.size() };
+                const auto [ptr, ec] { std::from_chars(begin, end, parsed) };
+                if (ec == std::errc {} && ptr == end) out.rerunEach = parsed;
             } else if (name == "-t" || name == "--test-name-pattern" || name == "--grep") {
                 // Capture the label filter (last one wins, matching bun's option()).
                 out.testNamePattern = std::string { value };
+            } else if (name == "--reporter") {
+                out.reporter = std::string { value };
+            } else if (name == "--reporter-outfile") {
+                out.reporterOutfile = std::string { value };
             } else if (name == "--path-ignore-patterns") {
                 if (!out.pathIgnorePatterns) out.pathIgnorePatterns.emplace();
                 out.pathIgnorePatterns->emplace_back(value);
@@ -889,6 +938,14 @@ struct AddFlags {
     bool optional { false };  // --optional
     bool peer { false };      // --peer
     bool exact { false };     // -E / --exact
+    // --only-missing: a request whose name already appears in ANY of the four
+    // dependency lists is dropped, leaving that entry byte-for-byte untouched.
+    //   PORT-SOURCE: bun-ref/src/install/PackageManager/CommandLineArguments.rs:1313
+    //   (`cli.only_missing = args.flag(b"--only-missing")`) →
+    //   PackageManagerOptions.rs:680-681 (`Enable::ONLY_MISSING`) →
+    //   PackageJSONEditor.rs:555 + :669-688 (the `else` arm swap-removes the
+    //   request from `updates` instead of rebinding its version string).
+    bool onlyMissing { false };
 
     bool help { false };
 
@@ -908,14 +965,25 @@ inline constexpr std::array ADD_VALUE_FLAGS {
     std::string_view { "--token" },      std::string_view { "--concurrent-scripts" },
     std::string_view { "--network-concurrency" },
     std::string_view { "--cache-dir" },  std::string_view { "--backend" },
-    std::string_view { "--linker" },     std::string_view { "--cpu" },
+    std::string_view { "--cpu" },
     std::string_view { "--os" },         std::string_view { "--omit" },
 };
+
+// `--linker <STR>` names the module layout. mbun implements exactly one — the
+// hoisted node_modules tree — so `hoisted` is an accurate no-op while every
+// other value (including a misspelling like `isoalted`) must still fail loudly.
+// It is handled by name rather than through ADD_VALUE_FLAGS because the VALUE,
+// not the flag, decides whether mbun can honour it.
+//   ref: CommandLineArguments.rs SHARED_PARAMS `--linker`, consumed by
+//   PackageManagerOptions.rs `node_linker`.
+constexpr bool linker_is_implemented(std::string_view value) {
+    return value == "hoisted";
+}
 
 // Boolean add flags mbun recognises but does not implement.
 inline constexpr std::array ADD_UNSUPPORTED_BOOL_FLAGS {
     std::string_view { "--analyze" },      std::string_view { "-a" },
-    std::string_view { "--only-missing" }, std::string_view { "--trust" },
+    std::string_view { "--trust" },
     std::string_view { "--global" },       std::string_view { "-g" },
     std::string_view { "--production" },   std::string_view { "-p" },
     std::string_view { "--frozen-lockfile" },
@@ -988,6 +1056,25 @@ AddFlags parse_add(std::span<const std::string_view> args) {
             out.exact = true;
             continue;
         }
+        if (name == "--only-missing") {
+            out.onlyMissing = true;
+            continue;
+        }
+        // `--save` is `add`'s default and its only effect is to pick this path.
+        if (name == "--save") continue;
+        if (name == "--linker") {
+            if (!hasInlineValue) {
+                if (i + 1 >= args.size()) {
+                    out.parseError = std::format("Missing value for \"{}\"", name);
+                    return out;
+                }
+                inlineValue = args[++i];
+            }
+            if (!detail::linker_is_implemented(inlineValue)) {
+                out.unsupported.emplace_back(std::format("--linker={}", inlineValue));
+            }
+            continue;
+        }
 
         if (std::ranges::contains(detail::ADD_UNSUPPORTED_BOOL_FLAGS, name)) {
             out.unsupported.emplace_back(name);
@@ -1004,6 +1091,150 @@ AddFlags parse_add(std::span<const std::string_view> args) {
                 ++i;
             }
             (void)inlineValue;
+            out.unsupported.emplace_back(name);
+            continue;
+        }
+
+        out.parseError = std::format("Unknown flag \"{}\"", name);
+        return out;
+    }
+
+    return out;
+}
+
+// ─── `mbun install` flags ───────────────────────────────────────────────────
+// `install` and `add` share one parameter table in bun: INSTALL_PARAMS is
+// SHARED_PARAMS plus `--only-missing`/`--analyze`/`--dev`/… , and both land in
+// the SAME `Subcommand::Add | Subcommand::Install` arm
+// (ref: bun-ref/src/install/PackageManager/CommandLineArguments.rs:113-160 and
+// the shared arm at :1307-1314). mbun's `install` had grown its own ad-hoc
+// `if` chain that rejected every flag `add` already tolerated — including
+// `--linker=hoisted`, which names the ONLY linker mbun implements. That
+// divergence is the bug this parser removes; the two commands now classify a
+// flag identically, and only the flags whose behaviour mbun genuinely lacks
+// still fail loudly.
+struct InstallFlags {
+    // Positionals. bun routes `bun install <pkg>...` through the very same
+    // update-request path as `bun add` (CommandLineArguments.rs:1307 gates on
+    // `Add | Install`, and updatePackageJSONAndInstall.rs drives both), so a
+    // non-empty list here means "behave as add".
+    std::vector<std::string> packages {};
+
+    bool frozenLockfile { false };
+    bool ignoreScripts { false };
+    bool noProgress { false };
+    bool lockfileOnly { false };
+    bool saveTextLockfile { false };
+    bool force { false };
+    std::string registry {};
+
+    // Shared with `add`, meaningful only next to positionals (same arm:
+    // CommandLineArguments.rs:1307-1314).
+    bool dev { false };
+    bool optional { false };
+    bool peer { false };
+    bool exact { false };
+    bool onlyMissing { false };
+
+    bool help { false };
+
+    std::vector<std::string> unsupported {};
+    std::string parseError {};
+};
+
+// Parse the argument list *after* the `install` subcommand word.
+InstallFlags parse_install(std::span<const std::string_view> args) {
+    InstallFlags out {};
+
+    for (std::size_t i { 0 }; i < args.size(); ++i) {
+        const std::string_view arg { args[i] };
+
+        if (arg == "--") {
+            for (std::size_t j { i + 1 }; j < args.size(); ++j) out.packages.emplace_back(args[j]);
+            break;
+        }
+
+        if (!arg.starts_with("-") || arg == "-") {
+            out.packages.emplace_back(arg);
+            continue;
+        }
+
+        if (arg == "--help" || arg == "-h") {
+            out.help = true;
+            continue;
+        }
+
+        std::string_view name { arg };
+        std::string_view inlineValue {};
+        bool hasInlineValue { false };
+        if (const std::size_t eq { arg.find('=') }; eq != std::string_view::npos) {
+            name = arg.substr(0, eq);
+            inlineValue = arg.substr(eq + 1);
+            hasInlineValue = true;
+        }
+
+        // ── flags mbun's installer honours ──────────────────────────────────
+        if (name == "--frozen-lockfile") { out.frozenLockfile = true; continue; }
+        if (name == "--ignore-scripts") { out.ignoreScripts = true; continue; }
+        if (name == "--no-progress") { out.noProgress = true; continue; }
+        if (name == "--lockfile-only") { out.lockfileOnly = true; continue; }
+        if (name == "--save-text-lockfile") { out.saveTextLockfile = true; continue; }
+        if (name == "--force" || name == "-f") { out.force = true; continue; }
+        // `--save` is bun's default for `install`; it only becomes meaningful
+        // next to positionals, where it selects the add path this parser
+        // already takes (bun-add.test.ts:2191 asserts `install --save X` and
+        // `add X` are the same command).
+        if (name == "--save") { continue; }
+        if (name == "--dev" || name == "--development" || name == "-d" || name == "-D") {
+            out.dev = true;
+            continue;
+        }
+        if (name == "--optional") { out.optional = true; continue; }
+        if (name == "--peer") { out.peer = true; continue; }
+        if (name == "--exact" || name == "-E") { out.exact = true; continue; }
+        if (name == "--only-missing") { out.onlyMissing = true; continue; }
+
+        if (name == "--registry") {
+            if (!hasInlineValue) {
+                if (i + 1 >= args.size()) {
+                    out.parseError = std::format("Missing value for \"{}\"", name);
+                    return out;
+                }
+                inlineValue = args[++i];
+            }
+            out.registry.assign(inlineValue);
+            continue;
+        }
+
+        if (name == "--linker") {
+            if (!hasInlineValue) {
+                if (i + 1 >= args.size()) {
+                    out.parseError = std::format("Missing value for \"{}\"", name);
+                    return out;
+                }
+                inlineValue = args[++i];
+            }
+            if (!detail::linker_is_implemented(inlineValue)) {
+                out.unsupported.emplace_back(std::format("--linker={}", inlineValue));
+            }
+            continue;
+        }
+
+        // ── shared classification with `add` ────────────────────────────────
+        if (std::ranges::contains(detail::ADD_UNSUPPORTED_BOOL_FLAGS, name)) {
+            out.unsupported.emplace_back(name);
+            continue;
+        }
+        if (std::ranges::contains(detail::ADD_IGNORED_BOOL_FLAGS, name)) continue;
+
+        if (std::ranges::contains(detail::ADD_VALUE_FLAGS, name)) {
+            if (!hasInlineValue) {
+                if (i + 1 >= args.size()) {
+                    out.parseError = std::format("Missing value for \"{}\"", name);
+                    return out;
+                }
+                ++i;
+            }
             out.unsupported.emplace_back(name);
             continue;
         }

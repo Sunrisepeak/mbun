@@ -83,6 +83,14 @@ inline constexpr std::string_view kNodeModuleJS = R"JS(
   }
 
   // ---- Node ERR_INVALID_ARG_TYPE message (word-for-word for the cases tested).
+  //
+  // Prefer the shared bootstrap factory (__mbunNodeErrors): it runs the error
+  // through nodeErrToString, which is what puts the code into the STACK the way
+  // node does (`TypeError [ERR_INVALID_ARG_TYPE]: …`). The local copy only set
+  // `.code`, so `String(err)` came back as a plain `TypeError: …` and every
+  // assert.throws(fn, /ERR_INVALID_ARG_TYPE/) in the corpus — which matches
+  // against the stringified error, not against `.code` — failed on an error
+  // that was otherwise completely correct.
   function invalidArgType(name, expected, actual) {
     let received;
     if (actual === undefined) received = "undefined";
@@ -102,7 +110,8 @@ inline constexpr std::string_view kNodeModuleJS = R"JS(
     }
     const e = new TypeError('The "' + name + '" argument must be of type ' + expected + ". Received " + received);
     e.code = "ERR_INVALID_ARG_TYPE";
-    return e;
+    const NE = G.__mbunNodeErrors;
+    return NE && NE.withCodeToString ? NE.withCodeToString(e, "ERR_INVALID_ARG_TYPE") : e;
   }
 
   // ---- SourceMap (node:module) — real base64-VLQ mappings decode.
@@ -383,6 +392,10 @@ inline constexpr std::string_view kNodeModuleJS = R"JS(
   Module.createRequire = (f) => createRequire(f);
   Module.builtinModules = BUILTIN_MODULES;
   Module.isBuiltin = (m) => isBuiltin(m);
+  // Shared with the per-module `import.meta.resolve` shim minted in engine.inc,
+  // which must hand a bare builtin name back as `node:<name>` instead of running
+  // it through the on-disk resolver.
+  G.__mbunIsBuiltinModule = (m) => isBuiltin(m);
   Module._resolveFilename = (request, parent, isMain, options) => resolveFilename(request, parent, isMain, options);
   Module._resolveLookupPaths = (request, parent) => resolveLookupPaths(request, parent);
   Module._nodeModulePaths = (from) => nodeModulePaths(from);
@@ -491,9 +504,24 @@ inline constexpr std::string_view kNodeModuleJS = R"JS(
     return invalidArgType("options", "string or Object or undefined", options);
   }
 
+  // NODE_DEBUG_NATIVE=COMPILE_CACHE turns the compile-cache decisions into a
+  // stderr trace.  Node emits these from the native loader; the ones mbun can
+  // honestly report today are the configuration decisions made right here.
+  function compileCacheTrace(message) {
+    const env = G.process && G.process.env;
+    const spec = env && env.NODE_DEBUG_NATIVE;
+    if (!spec || String(spec).indexOf("COMPILE_CACHE") === -1) return;
+    if (G.process && typeof G.process._rawDebug === "function") {
+      G.process._rawDebug("[compile_cache] " + message);
+    } else if (G.process && G.process.stderr && typeof G.process.stderr.write === "function") {
+      G.process.stderr.write("[compile_cache] " + message + "\n");
+    }
+  }
+
   function enableCompileCache(options) {
     const env = G.process && G.process.env;
     if (env && env.NODE_DISABLE_COMPILE_CACHE === "1") {
+      compileCacheTrace("Disabled by NODE_DISABLE_COMPILE_CACHE");
       return { status: compileCacheStatus.DISABLED };
     }
     if (compileCacheDirectory !== undefined) {

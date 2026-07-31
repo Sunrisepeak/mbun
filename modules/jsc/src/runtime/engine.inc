@@ -50,6 +50,19 @@ private:
     // `module.exports = …` before the cycle re-enters (semver@7's
     // Range/Comparator bottom-requires are the canonical case).
     std::unordered_map<std::string, JSObjectRef> moduleInFlight_;
+    // The CommonJS `module` RECORD for every loaded module (path+query → the
+    // object handed to the wrapper as `module`). moduleCache_ stores only
+    // module.exports, which is what require() returns, but node's loader keeps
+    // the whole Module and several documented surfaces read it back:
+    // `module.children` has to receive the child's Module (not its exports) even
+    // when the child came from cache, and `require.cache[k].exports` is the
+    // documented shape. GC-protected for the same reason moduleCache_ is.
+    std::unordered_map<std::string, JSObjectRef> moduleRecord_;
+    // The module whose wrapper body is currently executing, innermost last.
+    // node passes `parent` explicitly through Module._load; the loader here is
+    // re-entrant C++, so the stack IS that parent chain. Used for
+    // `module.parent` and for node's updateChildren().
+    std::vector<JSObjectRef> moduleStack_;
     // node's `primordials` object, built on first use from node's own
     // lib/internal/per_context/primordials.js and handed to node-internal
     // modules as a wrapper parameter (see node_primordials_ in
@@ -108,11 +121,29 @@ public:
         return num;
     }
 
+    // Park the thrown VALUE where fail_run_ can hand it to __mbunWorkerFatal.
+    // kEntryCatchClose already does this for a throw the entry EXECUTED, but a
+    // script that fails to PARSE never runs its own catch — the SyntaxError
+    // exists only here, as JSC's out-param. Without it a worker whose entry has
+    // a syntax error reported nothing to its parent (__mbunWorkerFatal skips
+    // `undefined`), so `w.on('error')` never fired. Non-enumerable: node's
+    // common/index.js fails a file on any unknown enumerable global.
+    void stash_entry_error_(JSValueRef exc) {
+        if (exc == nullptr) return;
+        JSStringRef name{JSStringCreateWithUTF8CString("__mbun_entry_error")};
+        JSObjectSetProperty(ctx_, JSContextGetGlobalObject(ctx_), name, exc,
+                            kJSPropertyAttributeDontEnum, nullptr);
+        JSStringRelease(name);
+    }
+
     // Evaluate source, discarding the result; returns a diagnostic on error.
     std::expected<void, std::string> eval_void(std::string_view source, const std::string& srcUrl = {}) {
         JSValueRef exc{nullptr};
         eval_(source, &exc, srcUrl);
-        if (exc != nullptr) return std::unexpected(describe_exception_(exc));
+        if (exc != nullptr) {
+            stash_entry_error_(exc);
+            return std::unexpected(describe_exception_(exc));
+        }
         return {};
     }
 
@@ -173,9 +204,28 @@ public:
         std::string js{"globalThis.__dirname = " + json_quote_(dir) + ";\n" +
                        "globalThis.__filename = " + json_quote_(file) + ";\n" +
                        "if (globalThis.Bun) globalThis.Bun.main = " + json_quote_(file) + ";\n" +
-                       "globalThis.module = { exports: {}, filename: " + json_quote_(file) + ", parent: null };\n" +
+                       // node's entry Module: `id` is the literal "." for the main
+                       // module (loader.js executeUserEntryPoint → new Module('.')),
+                       // and the rest of the record is what every CommonJS module
+                       // gets. `children`/`paths`/`loaded` were absent here as well
+                       // as in the loader, so `require.main.children` — the
+                       // documented way to enumerate what the entry pulled in — read
+                       // undefined.
+                       "globalThis.module = { id: '.', exports: {}, filename: " + json_quote_(file) +
+                       ", path: " + json_quote_(dir) + ", parent: null, loaded: false, children: []," +
+                       " paths: [] };\n" +
                        (pendingDeprecation
-                            ? "(function(){ var moduleParent = null; Object.defineProperty(globalThis.module, 'parent', { enumerable: true, configurable: true, get: function(){ return moduleParent; }, set: function(value){ moduleParent = value; var p = globalThis.process; if (p && typeof p.emitWarning === 'function') p.emitWarning('module.parent is deprecated due to accuracy issues. Please use require.main to find program entry point instead.', 'DeprecationWarning', 'DEP0144'); } }); })();\n"
+                            // node loader.js wraps BOTH the getter and the setter in
+                            // pendingDeprecate(..., 'DEP0144'); internal/util.js dedupes
+                            // on the CODE, so reading and writing share one warning.
+                            ? "(function(){ var moduleParent = null; var warned = false;"
+                              " var warn = function(){ if (warned) return; warned = true;"
+                              " var p = globalThis.process;"
+                              " if (p && typeof p.emitWarning === 'function')"
+                              " p.emitWarning('module.parent is deprecated due to accuracy issues. Please use require.main to find program entry point instead.', 'DeprecationWarning', 'DEP0144'); };"
+                              " Object.defineProperty(globalThis.module, 'parent', { enumerable: true, configurable: true,"
+                              " get: function(){ warn(); return moduleParent; },"
+                              " set: function(value){ warn(); moduleParent = value; } }); })();\n"
                             : "") +
                        "globalThis.exports = globalThis.module.exports;\n" +
                        "globalThis.require = globalThis.__mbun_make_require(" + json_quote_(dir) +
@@ -186,16 +236,54 @@ public:
                        ", dir: " + json_quote_(dir) + ", dirname: " + json_quote_(dir) +
                        ", path: " + json_quote_(file) + ", filename: " + json_quote_(file) +
                        ", file: " + json_quote_(file) + ", main: false, env: globalThis.process.env,"
+                       // node/bun `import.meta.resolve` returns a BUILTIN specifier
+                       // verbatim rather than a file URL, and never validates that
+                       // the builtin exists (`node:doesnotexist` resolves to itself
+                       // — test/js/bun/resolve/import-meta-resolve). A bare name
+                       // that IS a builtin normalizes to its `node:` form.
                        " resolve: function (s) { s = String(s);"
+                       " if (s.startsWith('node:') || s.startsWith('bun:')) return s;"
                        " if (s.charCodeAt(0) === 47 || s.startsWith('./') || s.startsWith('../') || s.startsWith('file://'))"
                        " return new URL(s, " + json_quote_("file://" + file) + ").href;"
+                       " if (globalThis.__mbunIsBuiltinModule && globalThis.__mbunIsBuiltinModule(s))"
+                       " return 'node:' + s;"
                        " var r = globalThis.__mbun_resolve_native(s, " +
                        json_quote_(dir) + "); return (typeof r === 'string' && r.charCodeAt(0) === 47 && "
                        "globalThis.Bun && globalThis.Bun.pathToFileURL) ? globalThis.Bun.pathToFileURL(r).href : r; },"
                        " resolveSync: function (s) { return globalThis.__mbun_resolve_native(String(s), " +
                        json_quote_(dir) + "); },"
                        " require: globalThis.__mbun_make_require(" + json_quote_(dir) + ") };\n"};
-        return eval_void(js);
+        if (auto r{eval_void(js)}; !r) {
+            return r;
+        }
+        // Finish the entry Module from C++: `paths` reuses the loader's own
+        // transliteration of Module._nodeModulePaths, and the entry becomes the
+        // root of the parent chain so top-level require()s land in
+        // `require.main.children` (node's Module._load passes the entry as
+        // `parent` for exactly this).
+        JSObjectRef global{JSContextGetGlobalObject(ctx_)};
+        JSObjectRef mainModule{JSValueToObject(ctx_, get_prop(ctx_, global, "module"), nullptr)};
+        if (mainModule != nullptr) {
+            const std::vector<std::string> nm{node_module_paths_(dir)};
+            std::vector<JSValueRef> items;
+            items.reserve(nm.size());
+            for (const auto& p : nm) {
+                items.push_back(make_string(ctx_, p));
+            }
+            set_prop(ctx_, mainModule, "paths",
+                     JSObjectMakeArray(ctx_, items.size(), items.data(), nullptr));
+            JSValueProtect(ctx_, mainModule);
+            moduleStack_.clear();
+            moduleStack_.push_back(mainModule);
+            // `process.mainModule` is the entry Module; `require.main` is an
+            // alias of it defined on every require closure (see
+            // engine_require_js.inc). Both were undefined.
+            JSObjectRef proc{JSValueToObject(ctx_, get_prop(ctx_, global, "process"), nullptr)};
+            if (proc != nullptr) {
+                set_prop(ctx_, proc, "mainModule", mainModule);
+            }
+        }
+        return {};
     }
 
     // Rebind the top-level `require` (installed by install_cjs_env) to the variant
@@ -243,11 +331,24 @@ public:
         std::error_code ec;
         const std::string cwd{std::filesystem::current_path(ec).string()};
         if (ec) return;
+        // The suffix is a THREE-valued enum in bun (`DotEnvFileSuffix`,
+        // env_loader.rs:17-21), not the NODE_ENV string: transpiler.rs:792-797
+        // picks Test when running `bun test` or when the env says "test",
+        // Production when `options.production` (set at :750-752 from
+        // `env.is_production()`, i.e. the env var is exactly "production"), and
+        // Development for EVERYTHING else. So there is no `.env.<anything>` —
+        // `NODE_ENV=staging` loads `.env.development`, and so does the literal
+        // string "undefined" that `NODE_ENV=undefined bun run …` produces
+        // (cli/run/env.test.ts "e2e NODE_ENV=undefined" pins exactly that).
+        // BUN_ENV wins over NODE_ENV (env_loader.rs:179-191 get_node_env).
         std::string nodeEnv;
-        if (auto v{eval_to_string("(process.env.NODE_ENV===undefined?'':String(process.env.NODE_ENV))")}) {
+        if (auto v{eval_to_string("(()=>{const e=process.env.BUN_ENV!==undefined?process.env.BUN_ENV"
+                                  ":process.env.NODE_ENV;return e===undefined?'':String(e)})()")}) {
             nodeEnv = *v;
         }
-        const std::string mode{isTest ? "test" : (nodeEnv.empty() ? "development" : nodeEnv)};
+        const std::string mode{(isTest || nodeEnv == "test") ? "test"
+                               : nodeEnv == "production"     ? "production"
+                                                             : "development"};
 
         // Seed with the real process environment (bun: load_process) so ${VAR}
         // expansion can reference shell vars and OVERRIDE=false protects them.
@@ -282,7 +383,10 @@ public:
             }
         } else {
             files.push_back(".env." + mode + ".local");
-            if (!isTest) files.push_back(".env.local");
+            // `.env.local` is skipped for the Test suffix however that suffix was
+            // reached — `bun test` OR NODE_ENV/BUN_ENV == "test"
+            // (env_loader.rs:727-729 gates on the suffix, not on the command).
+            if (mode != "test") files.push_back(".env.local");
             files.push_back(".env." + mode);
             files.emplace_back(".env");
         }
@@ -363,6 +467,16 @@ public:
         // jsc_hooks.rs:730-767: an unresolvable specifier is fatal and reported
         // as `preload not found <json-quoted specifier>`; an exception thrown by
         // a preload aborts the run before the entry is ever imported.
+        // A preload's side effects belong to the whole run, not to the first
+        // test file: `bun test` resets per-file state at every file boundary and
+        // would otherwise drop e.g. expect.extend() matchers a preload
+        // registered. The flag lets that state distinguish the two.
+        // Non-enumerable: node's common/index.js:437 runs a global-leak check and a
+        // plain assignment made EVERY test using it fail with
+        // "Unexpected global(s) found: __mbunInPreload". Caught by the wide gate,
+        // not by the lane's own subtree.
+        (void)eval_void("Object.defineProperty(globalThis,'__mbunInPreload',"
+                        "{value:true,writable:true,enumerable:false,configurable:true});");
         for (const std::string& spec : gPreloads) {
             std::error_code pec{};
             std::filesystem::path p{spec};
@@ -378,6 +492,8 @@ public:
                 return 1;
             }
         }
+        (void)eval_void("Object.defineProperty(globalThis,'__mbunInPreload',"
+                        "{value:false,writable:true,enumerable:false,configurable:true});");
         std::string js{source};
         bool tla{false};
         // `// @bun` pragma (after an optional hashbang line): the entry is already
@@ -422,7 +538,24 @@ public:
                          .trim_unused_imports = mbun::jsc::module_loader::trims_unused_imports(
                              mbun::jsc::module_loader::loader_for_path(absPath))})};
             if (!t.ok) {
-                std::cerr << "error: " << (t.error.empty() ? "transpile error" : t.error) << '\n';
+                const std::string msg{t.error.empty() ? "transpile error" : t.error};
+                // An entry that does not PARSE never reaches eval_void, so
+                // nothing stashed __mbun_entry_error and the worker-fatal hook
+                // below had no value to forward: a Worker whose entry has a
+                // syntax error reported NOTHING to its parent and `w.on('error')`
+                // never fired (test-worker-syntax-error, which additionally
+                // asserts err.constructor === SyntaxError — hence a real
+                // SyntaxError instance, not a plain Error). Non-enumerable, like
+                // every other internal global: node's common/index.js fails a
+                // file on any unknown enumerable global.
+                (void)eval_void(
+                    "(function(m){try{var e=new SyntaxError(m);"
+                    "Object.defineProperty(globalThis,'__mbun_entry_error',"
+                    "{value:e,writable:true,configurable:true,enumerable:false});"
+                    "globalThis.__mbunWorkerFatal&&globalThis.__mbunWorkerFatal(e);}"
+                    "catch(_e){}})(" +
+                    json_quote_(msg) + ");");
+                std::cerr << "error: " << msg << '\n';
                 return 1;
             }
             tla = t.top_level_await;
@@ -468,7 +601,14 @@ public:
             pump_event_loop("0");
             return finish_run_(0);
         }
-        std::string script{transform_module_(js)};
+        // The entry is already lowered: js_parser rewrote `import.meta` to
+        // `__mbunImportMeta` at the TOKEN it parsed, and a TLA entry is handled by
+        // the async-IIFE retry below. No text-level pass may run here — the legacy
+        // one (a blind `replace_all_(source, "import.meta", …)` plus an `await`
+        // stripper) had no idea what a string literal was and silently corrupted
+        // any entry that merely *mentioned* `import.meta` in a quoted string
+        // (e.g. a vm.SourceTextModule source), which is why it is gone.
+        std::string script{std::move(js)};
         // Node/bun evaluate the entry in a MODULE scope, never the global one: a
         // top-level `const Buffer = …` there must stay module-local. Evaluated as
         // a plain script it would instead create a *global lexical* binding that
@@ -580,6 +720,26 @@ public:
                 }
                 pump_event_loop("0");
             }
+            // NOT node's status 13 (ExitCode::kUnsettledTopLevelAwait), and the
+            // reason is measured, not assumed. node warns and leaves with 13
+            // when the loop drains with the entry module's await still pending;
+            // w66 implemented exactly that and it cost TWO green bun files,
+            // both re-confirmed at --jobs 1
+            // (js/bun/util/bun-isMainThread.test.js expects exitCode 0 from a
+            // program that awaits a Worker "open" event mbun never fires, and
+            // js/web/workers/worker-terminate-lifetime.test.ts asserts stderr
+            // is EMPTY for `bun -e` programs in the same shape). Both were
+            // passing only because this arm leaves with 0.
+            //
+            // Two things have to be true before 13 can land, and neither is a
+            // worker change: (a) mbun must not idle out on a top level that is
+            // legitimately waiting -- the "open" event above is a real liveness
+            // gap that 13 merely makes visible; (b) bun's own exit code for an
+            // unsettled TLA is 0, so this is a cross-corpus behaviour conflict
+            // and belongs on the dialect census in struck.tsv, not here. A
+            // bare `mbun <file>` is node-flavoured, which is exactly the
+            // invocation both bun files use, so dialect dispatch alone does
+            // NOT separate them.
         } else {
             // Top level ran synchronously to completion. Node/bun keep the process
             // alive until the event loop drains: pending setTimeout/setInterval
@@ -608,7 +768,16 @@ public:
     // module could not pump its own promise to completion and returned exports
     // that the module body had not filled in yet.
     void drain_microtasks_() {
-        if (JSC::JSGlobalObject* g{::toJS(ctx_)}) g->vm().drainMicrotasks();
+        if (JSC::JSGlobalObject* g{::toJS(ctx_)}) {
+            g->vm().drainMicrotasks();
+            // JSC parks post-GC work (FinalizationRegistry cleanups,
+            // Atomics.waitAsync resumptions, async WebAssembly compiles) on
+            // VM::deferredWorkTimer, a JSRunLoopTimer whose RunLoop mbun never
+            // enters. This pump is one of the timer's two drain points; the
+            // other is __mbunDrainMicrotasksNative, for the loops that run in
+            // JS (`mbun test`, process_web's timers).
+            mbun_drain_deferred_work(g->vm());
+        }
         // CAP-NAPI: GC-time addon finalizers are deferred (Node runs them on
         // the loop, never inside GC); the pump is their drain point.
         mbun_napi_drain_deferred_finalizers();
@@ -1000,6 +1169,18 @@ public:
     // `delete Module._cache[key]` (whose plain-object semantics can't reach the
     // C++ cache on their own — see the require.cache Proxy in __mbun_make_require).
     // The key is the resolved path plus any `?query` suffix (the module identity).
+    // Read the native CommonJS cache without loading anything. `mock.module()`
+    // has to replace the exports of a module that is ALREADY loaded (its
+    // importers have bound their names by then), and it must not evaluate a
+    // module that has not been loaded — so it needs a pure lookup, which
+    // require() cannot give it. Returns undefined for an unknown key.
+    JSValueRef module_cache_get(const std::string& key) const {
+        if (auto it{moduleCache_.find(key)}; it != moduleCache_.end()) {
+            return it->second;
+        }
+        return JSValueMakeUndefined(ctx_);
+    }
+
     void evict_module_cache(const std::string& key) {
         if (auto it{moduleCache_.find(key)}; it != moduleCache_.end()) {
             JSValueUnprotect(ctx_, it->second);
@@ -1007,6 +1188,10 @@ public:
         }
         if (auto it{moduleInFlight_.find(key)}; it != moduleInFlight_.end()) {
             moduleInFlight_.erase(it);
+        }
+        if (auto it{moduleRecord_.find(key)}; it != moduleRecord_.end()) {
+            JSValueUnprotect(ctx_, it->second);
+            moduleRecord_.erase(it);
         }
     }
 
@@ -1148,52 +1333,6 @@ public:
         return out;
     }
 
-    // Transform an ES-module bench script into an equivalent classic script the
-    // JSC C API (JSEvaluateScript) can run: (1) rewrite `import.meta` to the
-    // injected __mbunImportMeta object; (2) drop the `await` operator — every
-    // value the bench awaits (Bun.file().text()) is produced synchronously by our
-    // bindings, so `await x` ≡ `x` here. Byte-identical file on disk across all
-    // three binaries; a faithful transpile (bun transpiles too) that only adds
-    // work to our side. Scripts without `import.meta` are untouched.
-    static std::string transform_module_(const std::string& source) {
-        if (source.find("import.meta") == std::string::npos) return source;
-        std::string s{replace_all_(source, "import.meta", "__mbunImportMeta")};
-        return strip_await_(s);
-    }
-
-    static std::string replace_all_(std::string s, std::string_view from, std::string_view to) {
-        std::size_t pos{0};
-        while ((pos = s.find(from, pos)) != std::string::npos) {
-            s.replace(pos, from.size(), to);
-            pos += to.size();
-        }
-        return s;
-    }
-
-    // Remove the whole-word `await` keyword (operator use only in these scripts).
-    static std::string strip_await_(const std::string& s) {
-        static constexpr std::string_view kw{"await"};
-        std::string out;
-        out.reserve(s.size());
-        std::size_t i{0};
-        auto is_word = [](char c) {
-            return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '$';
-        };
-        while (i < s.size()) {
-            if (s.compare(i, kw.size(), kw) == 0) {
-                bool leftOk{i == 0 || !is_word(s[i - 1])};
-                bool rightOk{i + kw.size() >= s.size() || !is_word(s[i + kw.size()])};
-                if (leftOk && rightOk) {
-                    i += kw.size();
-                    if (i < s.size() && s[i] == ' ') ++i;  // (await x) → (x)
-                    continue;
-                }
-            }
-            out += s[i++];
-        }
-        return out;
-    }
-
     // ── the Permission Model bridge (__mbunPermissionNative) ───────────────
     // node exposes the model to JS through internalBinding('permission'), whose
     // only members are has() and drop(); everything else about the model lives
@@ -1312,6 +1451,12 @@ JSValueRef evict_module_cache_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std
                                  const JSValueRef args[], JSValueRef*) {
     Runtime::instance().evict_module_cache(arg_string(ctx, argc, args, 0));
     return JSValueMakeBoolean(ctx, true);
+}
+// Trampoline: __mbun_module_cache_get(key) → Runtime::module_cache_get.
+// Backs mock.module()'s in-place replacement of an already-loaded module.
+JSValueRef module_cache_get_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                               const JSValueRef args[], JSValueRef*) {
+    return Runtime::instance().module_cache_get(arg_string(ctx, argc, args, 0));
 }
 // Trampoline: __mbun_resolve_native(spec, fromDir, esm) → Runtime::resolve_sync_impl.
 // Backs Bun.resolveSync / import.meta.resolveSync / require.resolve.

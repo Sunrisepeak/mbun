@@ -83,7 +83,18 @@ public:
     // pollable — readable while events are queued — so an outer poll() set can
     // include it to wake instantly on reactor traffic (the runtime's idle pump
     // parks in poll() over net fds + this fd instead of a blind sleep).
-    [[nodiscard]] int backend_fd() const noexcept { return epollFd_; }
+    // Guarded like every other use: epollFd_ is itself declared only under
+    // __linux__, so returning it unguarded made this the one place the file did
+    // not compile off Linux -- "use of undeclared identifier 'epollFd_'", which
+    // is where the macOS CI probe stopped once OpenSSL was unblocked. Off Linux
+    // there is no backend fd, and -1 is what the guarded paths already report.
+    [[nodiscard]] int backend_fd() const noexcept {
+#if defined(__linux__)
+        return epollFd_;
+#else
+        return -1;
+#endif
+    }
 
     // us_poll_start: register fd with an interest set and a routing token.
     [[nodiscard]] bool add(int fd, PollInterest interest, std::uint64_t token) {

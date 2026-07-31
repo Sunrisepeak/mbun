@@ -231,7 +231,7 @@ JSValueRef proc_spawn_ex_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
             // (execvpe searches the caller's environ PATH).
             const std::string resolved{resolve_in_env_path(file, o.env)};
             if (!resolved.empty()) execve(resolved.c_str(), cargv.data(), cenv.data());
-            execvpe(file.c_str(), cargv.data(), cenv.data());
+            mbun::platform::process::exec_path_env(file.c_str(), cargv.data(), cenv.data());
         } else {
             execvp(file.c_str(), cargv.data());
         }
@@ -457,15 +457,16 @@ JSValueRef proc_groups_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_
     return JSObjectMakeArray(ctx, values.size(), values.data(), nullptr);
 }
 
-// ── proc.spawnPty: fork a child under a fresh pseudo-terminal (Bun.spawn's
-// `terminal` option / Bun.Terminal). Returns { pid, master, write } — `master`
-// is the read end of the pty master, `write` a dup of it for the terminal.write
-// queue (independent close). Ref: bun-ref src/runtime/api/bun/Terminal.rs
-// create_pty_posix (openpty → dup master into read/write fds; cooked-mode
-// termios defaults on the slave; child dup2s the slave onto 0/1/2 after
-// setsid+TIOCSCTTY). We use POSIX posix_openpt/grantpt/unlockpt/ptsname (all in
-// libc, no libutil dlopen) instead of openpty. Exec failures cross a CLOEXEC
-// status pipe exactly like spawnEx.
+// ── proc.spawnPty(file, argv, { ..., slave }): fork a child onto an EXISTING
+// pseudo-terminal and return { pid } (or { errno }). The pty itself is created
+// by proc.openPty below and owned by a Bun.Terminal, which is the only shape
+// bun has: `Bun.spawn({terminal})` either borrows a live Terminal or builds one
+// from an options object first, so there is exactly one pty implementation and
+// one owner of the fds. `slave` stays open in the parent (the Terminal holds
+// it) so the pty survives this child.
+// The child setsid()s, claims the slave as its controlling terminal with
+// TIOCSCTTY and dup2s it onto 0/1/2; exec failures cross a CLOEXEC status pipe
+// exactly like spawnEx. Ref: bun-ref src/runtime/api/bun/Terminal.rs.
 JSValueRef proc_spawn_pty_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                              const JSValueRef args[], JSValueRef* exc) {
     std::string file{fs_arg(ctx, argc, args, 0)};
@@ -486,34 +487,27 @@ JSValueRef proc_spawn_pty_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::si
     // permission_deny_spawn also handles mbun's worker-as-subprocess case.
     if (permission_deny_spawn(ctx, exc, file, o.env)) return JSValueMakeUndefined(ctx);
     permission_inject_child_env(o.env, o.haveEnv, argvStr);
-    unsigned short cols{80}, rows{24};
+    // `slave` — the descriptor of the pty this child is being attached to. It
+    // belongs to a Bun.Terminal (bun js_bun_spawn_bindings.rs:823
+    // `existing_terminal`), which also owns the window size, so nothing about
+    // the pty is configured here.
+    int slave{-1};
     if (argc > 2 && JSValueIsObject(ctx, args[2])) {
         JSObjectRef opt{JSValueToObject(ctx, args[2], nullptr)};
-        JSValueRef c{get_prop(ctx, opt, "cols")};
-        if (JSValueIsNumber(ctx, c)) { double d{JSValueToNumber(ctx, c, nullptr)}; if (d > 0 && d < 65535) cols = static_cast<unsigned short>(d); }
-        JSValueRef rw{get_prop(ctx, opt, "rows")};
-        if (JSValueIsNumber(ctx, rw)) { double d{JSValueToNumber(ctx, rw, nullptr)}; if (d > 0 && d < 65535) rows = static_cast<unsigned short>(d); }
+        JSValueRef sv{get_prop(ctx, opt, "slave")};
+        if (JSValueIsNumber(ctx, sv)) { double d{JSValueToNumber(ctx, sv, nullptr)}; if (d >= 0) slave = static_cast<int>(d); }
     }
-
-    const int master{posix_openpt(O_RDWR | O_NOCTTY)};
-    if (master < 0) return fs_throw(ctx, exc, "spawnPty: posix_openpt() failed");
-    if (grantpt(master) != 0 || unlockpt(master) != 0) { close(master); return fs_throw(ctx, exc, "spawnPty: grantpt/unlockpt failed"); }
-    char sname[256];
-    if (ptsname_r(master, sname, sizeof sname) != 0) { close(master); return fs_throw(ctx, exc, "spawnPty: ptsname failed"); }
-    const int slave{open(sname, O_RDWR | O_NOCTTY)};
-    if (slave < 0) { close(master); return fs_throw(ctx, exc, "spawnPty: open(pts) failed"); }
-    { struct winsize ws{}; ws.ws_col = cols; ws.ws_row = rows; ioctl(master, TIOCSWINSZ, &ws); }
+    if (slave < 0) return fs_throw(ctx, exc, "spawnPty: no pty slave descriptor (opts.slave)");
 
     int errPipe[2];
-    if (pipe(errPipe) != 0) { close(master); close(slave); return fs_throw(ctx, exc, "spawnPty: pipe() failed"); }
+    if (pipe(errPipe) != 0) return fs_throw(ctx, exc, "spawnPty: pipe() failed");
     fcntl(errPipe[0], F_SETFD, FD_CLOEXEC);
     fcntl(errPipe[1], F_SETFD, FD_CLOEXEC);
 
     const pid_t pid{fork()};
-    if (pid < 0) { close(master); close(slave); close(errPipe[0]); close(errPipe[1]); return fs_throw(ctx, exc, "spawnPty: fork() failed"); }
+    if (pid < 0) { close(errPipe[0]); close(errPipe[1]); return fs_throw(ctx, exc, "spawnPty: fork() failed"); }
     if (pid == 0) {  // ── child ──
         close(errPipe[0]);
-        close(master);
         { sigset_t ss; sigemptyset(&ss); sigprocmask(SIG_SETMASK, &ss, nullptr);
           for (int s = 1; s < NSIG; ++s) signal(s, SIG_DFL); }
         const auto failFd{[&](int e) {
@@ -521,10 +515,11 @@ JSValueRef proc_spawn_pty_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::si
             (void)!write(errPipe[1], &v, sizeof v);
             _exit(127);
         }};
-        if (setsid() < 0) failFd(errno);
-        if (ioctl(slave, TIOCSCTTY, 0) < 0) failFd(errno);
-        if (dup2(slave, 0) < 0 || dup2(slave, 1) < 0 || dup2(slave, 2) < 0) failFd(errno);
-        if (slave > 2) close(slave);
+        // setsid + TIOCSCTTY + dup2 onto 0/1/2 is the platform layer's job:
+        // it is async-signal-safe there too, and Windows has no equivalent at
+        // all. Non-zero is the errno of the first step that failed.
+        if (const int ptyErr{mbun::platform::pty::attach_controlling_terminal(slave)}; ptyErr != 0)
+            failFd(ptyErr);
         if (!o.cwd.empty() && chdir(o.cwd.c_str()) != 0) failFd(errno);
         std::vector<char*> cargv;
         for (auto& a : argvStr) cargv.push_back(const_cast<char*>(a.c_str()));
@@ -535,7 +530,7 @@ JSValueRef proc_spawn_pty_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::si
             cenv.push_back(nullptr);
             const std::string resolved{resolve_in_env_path(file, o.env)};
             if (!resolved.empty()) execve(resolved.c_str(), cargv.data(), cenv.data());
-            execvpe(file.c_str(), cargv.data(), cenv.data());
+            mbun::platform::process::exec_path_env(file.c_str(), cargv.data(), cenv.data());
         } else {
             execvp(file.c_str(), cargv.data());
         }
@@ -543,7 +538,9 @@ JSValueRef proc_spawn_pty_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::si
     }
     // ── parent ──
     close(errPipe[1]);
-    close(slave);  // child owns the slave; the parent only reads/writes the master
+    // The slave is NOT closed here: it belongs to the Bun.Terminal that owns
+    // this pty, which keeps it open so the pty survives the child and can host
+    // the next one.
     std::int32_t childErr{0};
     ssize_t n;
     do { n = read(errPipe[0], &childErr, sizeof childErr); } while (n < 0 && errno == EINTR);
@@ -552,18 +549,105 @@ JSValueRef proc_spawn_pty_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::si
     if (n == static_cast<ssize_t>(sizeof childErr)) {  // pre-exec/exec failure
         int status{0};
         waitpid(pid, &status, 0);
-        close(master);
         set_prop(ctx, r, "errno", JSValueMakeNumber(ctx, childErr));
         return r;
     }
-    // A second fd onto the same master lets the read side (drainOut) and the
-    // write side (terminal.write queue) be closed independently — no double
-    // close of one fd number that the OS may have recycled.
-    const int writeFd{fcntl(master, F_DUPFD, 3)};
     set_prop(ctx, r, "pid", JSValueMakeNumber(ctx, static_cast<double>(pid)));
-    set_prop(ctx, r, "master", JSValueMakeNumber(ctx, master));
-    set_prop(ctx, r, "write", JSValueMakeNumber(ctx, writeFd >= 0 ? writeFd : master));
     return r;
+}
+
+// ── Bun.Terminal's PTY primitives ───────────────────────────────────────────
+// spawnPty above creates a pty AND forks in one step, which is all
+// `Bun.spawn({terminal: {...}})` needs. `new Bun.Terminal({...})` is the other
+// half of the same API: a pty that exists on its own, before (and after) any
+// child is attached to it. These three entry points are that half — creation,
+// termios access, and raw mode — so the JS class stays a thin wrapper over the
+// syscalls rather than re-deriving terminal semantics.
+//
+// PORT-SOURCE: compat/bun/src/runtime/api/bun/Terminal.rs create_pty_posix
+// (:922) for the cooked-mode defaults, get_termios/set_termios (:1302) for the
+// flag accessors, and bun_core::tty::State for raw mode.
+
+// proc.openPty(cols, rows) → { master, write, slave }.
+// `master` is the read side and the ioctl/termios handle; `write` is a second
+// descriptor onto the same master so the read and write sides can be closed
+// independently (same reason spawnPty dups it); `slave` stays open in this
+// process so the pty does not collapse when an attached child exits.
+JSValueRef proc_open_pty_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                            const JSValueRef args[], JSValueRef* exc) {
+    unsigned short cols{80}, rows{24};
+    if (argc > 0 && JSValueIsNumber(ctx, args[0])) {
+        const double d{JSValueToNumber(ctx, args[0], nullptr)};
+        if (d > 0 && d < 65535) cols = static_cast<unsigned short>(d);
+    }
+    if (argc > 1 && JSValueIsNumber(ctx, args[1])) {
+        const double d{JSValueToNumber(ctx, args[1], nullptr)};
+        if (d > 0 && d < 65535) rows = static_cast<unsigned short>(d);
+    }
+    // Creation, the cooked-mode defaults and the CLOEXEC discipline all live in
+    // mbun::platform::pty::open_pty. What stays here is the JS-facing half: the
+    // message text for each failure stage, and the shape of the result object.
+    const auto pty{mbun::platform::pty::open_pty({cols, rows})};
+    if (!pty.ok()) {
+        using Stage = mbun::platform::pty::OpenStage;
+        switch (pty.stage) {
+            case Stage::OpenMaster:   return fs_throw(ctx, exc, "openPty: posix_openpt() failed");
+            case Stage::Unlock:       return fs_throw(ctx, exc, "openPty: grantpt/unlockpt failed");
+            case Stage::ResolveSlave: return fs_throw(ctx, exc, "openPty: ptsname failed");
+            case Stage::OpenSlave:    return fs_throw(ctx, exc, "openPty: open(pts) failed");
+            default:                  return fs_throw(ctx, exc, "openPty: not supported on this platform");
+        }
+    }
+    JSObjectRef r{JSObjectMake(ctx, nullptr, nullptr)};
+    set_prop(ctx, r, "master", JSValueMakeNumber(ctx, static_cast<double>(pty.descriptors.master)));
+    set_prop(ctx, r, "write", JSValueMakeNumber(ctx, static_cast<double>(pty.descriptors.write)));
+    set_prop(ctx, r, "slave", JSValueMakeNumber(ctx, static_cast<double>(pty.descriptors.slave)));
+    return r;
+}
+
+// proc.ptyTermios(fd) → { iflag, oflag, cflag, lflag } | null when fd is dead.
+JSValueRef proc_pty_termios_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                               const JSValueRef args[], JSValueRef*) {
+    if (argc < 1 || !JSValueIsNumber(ctx, args[0])) return JSValueMakeNull(ctx);
+    const int fd{static_cast<int>(JSValueToNumber(ctx, args[0], nullptr))};
+    const auto flags{mbun::platform::pty::termios_flags(fd)};
+    if (!flags) return JSValueMakeNull(ctx);
+    JSObjectRef r{JSObjectMake(ctx, nullptr, nullptr)};
+    set_prop(ctx, r, "iflag", JSValueMakeNumber(ctx, static_cast<double>(flags->input)));
+    set_prop(ctx, r, "oflag", JSValueMakeNumber(ctx, static_cast<double>(flags->output)));
+    set_prop(ctx, r, "cflag", JSValueMakeNumber(ctx, static_cast<double>(flags->control)));
+    set_prop(ctx, r, "lflag", JSValueMakeNumber(ctx, static_cast<double>(flags->local)));
+    return r;
+}
+
+// proc.ptySetTermios(fd, which, bits) — which: 0=iflag 1=oflag 2=cflag 3=lflag.
+// Read-modify-write so the other three fields and c_cc survive, exactly like
+// bun's set_termios_flag.
+JSValueRef proc_pty_set_termios_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                                   const JSValueRef args[], JSValueRef*) {
+    if (argc < 3) return JSValueMakeBoolean(ctx, false);
+    const int fd{static_cast<int>(JSValueToNumber(ctx, args[0], nullptr))};
+    const int which{static_cast<int>(JSValueToNumber(ctx, args[1], nullptr))};
+    const double raw{JSValueToNumber(ctx, args[2], nullptr)};
+    if (fd < 0 || !std::isfinite(raw) || which < 0 || which > 3) return JSValueMakeBoolean(ctx, false);
+    // The 32-bit narrowing is the JS contract, not a platform detail: the JS
+    // side clamps flags to uint32 before calling, and widening it here would
+    // start honouring bits that never reached the terminal before.
+    const auto bits{static_cast<std::uint32_t>(static_cast<std::int64_t>(raw))};
+    const auto field{static_cast<mbun::platform::pty::TermiosField>(which)};
+    return JSValueMakeBoolean(ctx, mbun::platform::pty::set_termios_field(fd, field, bits));
+}
+
+// proc.ptySetRaw(fd, enable) → cfmakeraw() on, cooked defaults back off.
+// bun keeps the pre-raw termios in the Terminal so a restore is exact; the
+// saved copy lives on the JS object here for the same reason (`saved` is the
+// object ptyTermios returned before raw mode was entered).
+JSValueRef proc_pty_set_raw_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                               const JSValueRef args[], JSValueRef*) {
+    if (argc < 2) return JSValueMakeBoolean(ctx, false);
+    const int fd{static_cast<int>(JSValueToNumber(ctx, args[0], nullptr))};
+    const bool enable{JSValueToBoolean(ctx, args[1])};
+    return JSValueMakeBoolean(ctx, mbun::platform::pty::set_raw_mode(fd, enable));
 }
 
 // proc.ptyResize(fd, cols, rows) → push a new window size to the pty master.
@@ -571,12 +655,109 @@ JSValueRef proc_pty_resize_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::s
                               const JSValueRef args[], JSValueRef*) {
     if (argc >= 3) {
         const int fd{static_cast<int>(JSValueToNumber(ctx, args[0], nullptr))};
-        struct winsize ws{};
-        ws.ws_col = static_cast<unsigned short>(JSValueToNumber(ctx, args[1], nullptr));
-        ws.ws_row = static_cast<unsigned short>(JSValueToNumber(ctx, args[2], nullptr));
-        ioctl(fd, TIOCSWINSZ, &ws);
+        mbun::platform::pty::resize(
+            fd, {static_cast<std::uint16_t>(JSValueToNumber(ctx, args[1], nullptr)),
+                 static_cast<std::uint16_t>(JSValueToNumber(ctx, args[2], nullptr))});
     }
     return JSValueMakeUndefined(ctx);
+}
+
+// ── proc.execve: replace THIS process image ──────────────────────────────────
+// node src/node_process_methods.cc Execve, driven by
+// lib/internal/process/per_thread.js execve(). The JS half does node's argument
+// validation; this half is the syscall plus the two things node inherits from
+// libuv and its permission model for free:
+//
+//   * the ChildProcess permission scope (node's THROW_IF_INSUFFICIENT_PERMISSIONS
+//     with PermissionScope::kChildProcess), so `--permission` without
+//     `--allow-child-process` refuses the exec with an ERR_ACCESS_DENIED that
+//     carries permission/resource — test-process-execve-permission-fail asserts
+//     all three.
+//
+//   * every inherited descriptor above stdio becoming CLOEXEC. node's fds are
+//     CLOEXEC because libuv opens them that way, so after a successful execve the
+//     listening socket is gone and the replacement image can bind the SAME port
+//     (test-process-execve-socket does exactly that). mbun's sockets are not
+//     CLOEXEC, so they are marked here.
+//
+//     Marked, never closed, and only after the target has been proven
+//     executable: execve can FAIL, and test-process-execve-throws requires the
+//     process to be fully intact afterwards — stdout writable, nextTick and
+//     setImmediate still firing. FD_CLOEXEC has no effect until an exec actually
+//     succeeds, so a failed execve leaves every descriptor usable.
+void execve_mark_cloexec_above_stdio() {
+#if defined(__linux__) && defined(SYS_close_range)
+#  if !defined(CLOSE_RANGE_CLOEXEC)
+#    define CLOSE_RANGE_CLOEXEC (1U << 2)
+#  endif
+    if (::syscall(SYS_close_range, 3u, ~0u, CLOSE_RANGE_CLOEXEC) == 0) return;
+#endif
+    // Fallback: walk the open descriptors. Deliberately NOT close_range_compat —
+    // its own fallback CLOSES fds, which would maim a process whose execve fails.
+    const long openMax{sysconf(_SC_OPEN_MAX)};
+    const int limit{static_cast<int>(openMax > 0 ? std::min<long>(openMax, 65536) : 1024)};
+    for (int fd{3}; fd < limit; ++fd) {
+        const int flags{fcntl(fd, F_GETFD)};
+        if (flags >= 0 && (flags & FD_CLOEXEC) == 0) (void)fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+    }
+}
+
+// node's ErrnoException(errno, "execve", nullptr, execPath): `errno` is the raw
+// POSITIVE errno here, not libuv's negated form (test-process-execve-throws
+// asserts `err.errno > 0`), alongside code/syscall/path.
+JSValueRef execve_throw_errno(JSContextRef ctx, JSValueRef* exc, int e, const std::string& path) {
+    const std::string code{fd_errno_code(e)};
+    const std::string msg{(code.empty() ? "E" + std::to_string(e) : code) + ": "
+                          + fd_errno_message(e) + ", execve '" + path + "'"};
+    JSValueRef m{make_string(ctx, msg)};
+    JSObjectRef err{JSObjectMakeError(ctx, 1, &m, nullptr)};
+    if (!code.empty()) set_prop(ctx, err, "code", make_string(ctx, code));
+    set_prop(ctx, err, "errno", JSValueMakeNumber(ctx, e));
+    set_prop(ctx, err, "syscall", make_string(ctx, "execve"));
+    set_prop(ctx, err, "path", make_string(ctx, path));
+    if (exc != nullptr) *exc = err;
+    return JSValueMakeUndefined(ctx);
+}
+
+// proc.execve(execPath, argv, env) — argv is the FULL argv (including argv[0]);
+// env is an array of "KEY=VALUE" strings, as node's JS layer builds it. Returns
+// only on failure.
+JSValueRef proc_execve_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                          const JSValueRef args[], JSValueRef* exc) {
+    const std::string path{fs_arg(ctx, argc, args, 0)};
+    if (permission_deny_scope(ctx, exc, mbun::permission::Scope::ChildProcess, path)) {
+        return JSValueMakeUndefined(ctx);
+    }
+    const auto readList{[&](std::size_t idx, std::vector<std::string>& out) {
+        if (argc <= idx || !JSValueIsArray(ctx, args[idx])) return;
+        JSObjectRef arr{JSValueToObject(ctx, args[idx], nullptr)};
+        JSStringRef lenKey{JSStringCreateWithUTF8CString("length")};
+        const double len{JSValueToNumber(ctx, JSObjectGetProperty(ctx, arr, lenKey, nullptr), nullptr)};
+        JSStringRelease(lenKey);
+        for (unsigned i = 0; i < static_cast<unsigned>(len); ++i) {
+            out.push_back(val_to_string(ctx, JSObjectGetPropertyAtIndex(ctx, arr, i, nullptr)));
+        }
+    }};
+    std::vector<std::string> argvStr;
+    readList(1, argvStr);
+    std::vector<std::string> envStr;
+    readList(2, envStr);
+    // Refuse BEFORE touching descriptors, so a doomed execve leaves the process
+    // whole. access(2) covers the cases the corpus exercises (missing file,
+    // non-executable, permission) and reports the errno execve itself would.
+    if (::access(path.c_str(), X_OK) != 0) return execve_throw_errno(ctx, exc, errno, path);
+    // node flushes stdio before handing the image over; buffered bytes would
+    // otherwise die with the old image.
+    std::fflush(nullptr);
+    execve_mark_cloexec_above_stdio();
+    std::vector<char*> cargv;
+    for (auto& a : argvStr) cargv.push_back(const_cast<char*>(a.c_str()));
+    cargv.push_back(nullptr);
+    std::vector<char*> cenv;
+    for (auto& e : envStr) cenv.push_back(const_cast<char*>(e.c_str()));
+    cenv.push_back(nullptr);
+    ::execve(path.c_str(), cargv.data(), cenv.data());
+    return execve_throw_errno(ctx, exc, errno, path);
 }
 #endif
 
@@ -643,25 +824,13 @@ extern "C" char** environ;
 #endif
 
 // The host platform / arch as node's process.platform / process.arch strings.
+// The fact and its node spelling both belong to mbun.platform.capability, which
+// resolves them once at compile time; there is no conditional left here.
 constexpr const char* host_platform() {
-#if defined(__APPLE__)
-    return "darwin";
-#elif defined(_WIN32)
-    return "win32";
-#elif defined(__FreeBSD__)
-    return "freebsd";
-#else
-    return "linux";
-#endif
+    return mbun::platform::platform_name(mbun::platform::HOST_PLATFORM);
 }
 constexpr const char* host_arch() {
-#if defined(__aarch64__) || defined(_M_ARM64)
-    return "arm64";
-#elif defined(__x86_64__) || defined(_M_X64)
-    return "x64";
-#else
-    return "x64";
-#endif
+    return mbun::platform::architecture_name(mbun::platform::HOST_ARCHITECTURE);
 }
 
 // Absolute path to the running executable (process.execPath / bunExe()). Tests
@@ -869,6 +1038,8 @@ JSValueRef require_native_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::si
                              const JSValueRef args[], JSValueRef* exc);
 JSValueRef evict_module_cache_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                                  const JSValueRef args[], JSValueRef* exc);
+JSValueRef module_cache_get_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                               const JSValueRef args[], JSValueRef* exc);
 JSValueRef resolve_native_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                              const JSValueRef args[], JSValueRef* exc);
 JSValueRef transpile_native_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,

@@ -126,6 +126,39 @@ inline JSValueRef node_tls_check_cipher_suites_cb(JSContextRef ctx, JSObjectRef,
     return JSValueMakeBoolean(ctx, ok);
 }
 
+// __mbunNodeTlsNative.dhParamBits(pem) → the prime size in bits of a PEM DH
+// parameter block, or 0 when the argument is not one. PORT-SOURCE:
+// compat/node/src/crypto/crypto_context.cc SecureContext::SetDHParam, which
+// reads BN_num_bits(p) and REFUSES anything under 1024 bits at
+// createSecureContext() time ("DH parameter is less than 1024 bits") while only
+// warning between 1024 and 2048. That refusal is a security floor, not a
+// formatting check: a 512-bit group is breakable, and accepting it silently
+// would have every DHE handshake on that server negotiate it. Reporting the
+// size here lets the JS layer raise node's error at node's moment — before a
+// connection exists — instead of discovering it as a handshake failure.
+inline JSValueRef node_tls_dh_param_bits_cb(JSContextRef ctx, JSObjectRef, JSObjectRef,
+                                            std::size_t argc, const JSValueRef argv[],
+                                            JSValueRef*) {
+    if (argc < 1) return JSValueMakeNumber(ctx, 0);
+    const std::string pem{val_to_string(ctx, argv[0])};
+    int bits{0};
+    if (BIO* bio{BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size()))}) {
+        if (EVP_PKEY* params{PEM_read_bio_Parameters(bio, nullptr)}) {
+            BIGNUM* p{nullptr};
+            if (EVP_PKEY_get_bn_param(params, OSSL_PKEY_PARAM_FFC_P, &p) == 1 && p != nullptr) {
+                bits = BN_num_bits(p);
+                BN_free(p);
+            }
+            EVP_PKEY_free(params);
+        }
+        BIO_free(bio);
+    }
+    // A non-DH argument leaves a parse reason queued; it is not an error here
+    // (0 says "not DH parameters"), so it must not surface on a later call.
+    ERR_clear_error();
+    return JSValueMakeNumber(ctx, bits);
+}
+
 // __mbunNodeTlsNative.rootCertificates() → string[] of PEM certificates from the
 // platform trust store — the store mbun actually verifies chains against. node
 // answers tls.rootCertificates from its vendored Mozilla NSS bundle
@@ -164,6 +197,83 @@ inline JSValueRef node_tls_check_key_cert_cb(JSContextRef ctx, JSObjectRef, JSOb
     return make_string(ctx, mbun::tls::check_key_cert_pair(cert, key, pass, ciphers));
 }
 
+// __mbunNodeTlsNative.pfxParse(pfx, passphrase) → { cert, key, ca: string[] },
+// the PEM credentials inside a PKCS#12 archive (node's `pfx` option). Throws
+// node's own error for an archive that cannot be opened — see the taxonomy on
+// mbun::tls::parse_pfx (modules/tls/src/openssl.cppm), which this only shuttles.
+//
+// The JS layer cannot do this: PKCS#12 is a DER/ASN.1 container whose contents
+// are password-encrypted, and mbun already links the OpenSSL that owns
+// PKCS12_parse. Reimplementing an ASN.1 + PBES parser in JS to feed a C++ TLS
+// stack would be the wrong side of the interface line.
+//
+// `pfx` arrives as a Buffer/Uint8Array (node's option is a BufferSource); a
+// string argument is rejected rather than guessed at, because a PFX is binary
+// and any text encoding of it would silently corrupt the DER.
+inline JSValueRef node_tls_pfx_parse_cb(JSContextRef ctx, JSObjectRef, JSObjectRef,
+                                        std::size_t argc, const JSValueRef argv[],
+                                        JSValueRef* exc) {
+    const std::uint8_t* bytes{nullptr};
+    std::size_t length{0};
+    if (argc > 0) {
+        const JSTypedArrayType tt{JSValueGetTypedArrayType(ctx, argv[0], nullptr)};
+        if (tt != kJSTypedArrayTypeNone) {
+            if (JSObjectRef obj{JSValueToObject(ctx, argv[0], nullptr)}) {
+                if (tt == kJSTypedArrayTypeArrayBuffer) {
+                    bytes = static_cast<const std::uint8_t*>(
+                        JSObjectGetArrayBufferBytesPtr(ctx, obj, nullptr));
+                    length = JSObjectGetArrayBufferByteLength(ctx, obj, nullptr);
+                } else {
+                    // JSObjectGetTypedArrayBytesPtr answers the BUFFER base, not
+                    // the view's first byte: a Buffer that is a slice of a pooled
+                    // allocation (which every small Buffer is) would otherwise be
+                    // read from the wrong offset.
+                    bytes = static_cast<const std::uint8_t*>(
+                        JSObjectGetTypedArrayBytesPtr(ctx, obj, nullptr));
+                    length = JSObjectGetTypedArrayByteLength(ctx, obj, nullptr);
+                    if (bytes != nullptr) {
+                        bytes += JSObjectGetTypedArrayByteOffset(ctx, obj, nullptr);
+                    }
+                }
+            }
+        }
+    }
+    if (bytes == nullptr || length == 0) {
+        if (exc != nullptr) {
+            JSValueRef m{make_string(ctx, "Unable to load PFX certificate")};
+            JSObjectRef err{JSObjectMakeError(ctx, 1, &m, nullptr)};
+            set_prop(ctx, err, "code", make_string(ctx, "ERR_CRYPTO_OPERATION_FAILED"));
+            *exc = err;
+        }
+        return JSValueMakeUndefined(ctx);
+    }
+    const std::string pass{argc > 1 && JSValueIsString(ctx, argv[1])
+                               ? val_to_string(ctx, argv[1])
+                               : std::string{}};
+    const mbun::tls::PfxCredentials creds{
+        mbun::tls::parse_pfx(std::span<const std::uint8_t>{bytes, length}, pass)};
+    if (!creds.errorMessage.empty()) {
+        if (exc != nullptr) {
+            JSValueRef m{make_string(ctx, creds.errorMessage)};
+            JSObjectRef err{JSObjectMakeError(ctx, 1, &m, nullptr)};
+            if (!creds.errorCode.empty()) {
+                set_prop(ctx, err, "code", make_string(ctx, creds.errorCode));
+            }
+            *exc = err;
+        }
+        return JSValueMakeUndefined(ctx);
+    }
+    JSObjectRef out{JSObjectMake(ctx, nullptr, nullptr)};
+    set_prop(ctx, out, "cert", make_string(ctx, creds.certPem));
+    set_prop(ctx, out, "key", make_string(ctx, creds.keyPem));
+    std::vector<JSValueRef> cas;
+    cas.reserve(creds.caPems.size());
+    for (const std::string& pem : creds.caPems) cas.push_back(make_string(ctx, pem));
+    set_prop(ctx, out, "ca",
+             JSObjectMakeArray(ctx, cas.size(), cas.empty() ? nullptr : cas.data(), nullptr));
+    return out;
+}
+
 // Install globalThis.__mbunNodeTlsNative. Called once from engine init.
 inline void install_node_tls_native(JSContextRef ctx, JSObjectRef global) {
     JSObjectRef tn{JSObjectMake(ctx, nullptr, nullptr)};
@@ -173,5 +283,7 @@ inline void install_node_tls_native(JSContextRef ctx, JSObjectRef global) {
     set_fn(ctx, tn, "canonicalizeIP", node_tls_canonicalize_ip_cb);
     set_fn(ctx, tn, "rootCertificates", node_tls_root_certificates_cb);
     set_fn(ctx, tn, "checkKeyCert", node_tls_check_key_cert_cb);
+    set_fn(ctx, tn, "pfxParse", node_tls_pfx_parse_cb);
+    set_fn(ctx, tn, "dhParamBits", node_tls_dh_param_bits_cb);
     set_prop(ctx, global, "__mbunNodeTlsNative", tn);
 }

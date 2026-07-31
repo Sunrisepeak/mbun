@@ -236,7 +236,11 @@ export void install() {
     struct sigaction act {};
     act.sa_sigaction = &handler_;
     act.sa_flags = SA_SIGINFO | SA_RESTART | SA_ONSTACK;
-    ::sigemptyset(&act.sa_mask);
+    // Unqualified: sigemptyset is a MACRO on Darwin, so `::sigemptyset` is a
+    // parse error there ("expected unqualified-id") -- the third wall the macOS
+    // CI probe hit. Unqualified works on both: glibc declares a real function
+    // and Darwin expands its macro.
+    sigemptyset(&act.sa_mask);
 
     for (int sig : kFaultSignals) {
         struct sigaction old {};

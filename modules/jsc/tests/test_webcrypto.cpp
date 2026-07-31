@@ -86,6 +86,19 @@ int main() {
         0, "schedule CryptoKey constructor and forgery attacks");
     expect_number("__webcryptoBrandAttack", 1, "CryptoKey construction and forgery rejected");
 
+    // The invariant is ENFORCEMENT, not immutability. node's `key.algorithm` is a
+    // plain mutable object -- `test-webcrypto-internal-slots.mjs` assigns
+    // `algorithm.name = 'ed25519'` and requires the write to stick -- so this case
+    // must NOT assert Object.isFrozen. It previously did, that assertion encoded a
+    // belief about node that is false, and satisfying it by freezing the public
+    // copy cost that corpus file.
+    //
+    // What must hold, and what is checked below: however the caller rewrites the
+    // public `algorithm` / `usages`, none of it reaches the internal slots. So
+    // `type` and `extractable` (getters straight off the internal metadata) are
+    // unchanged, a direct `usages` redefinition is refused, and above all signing
+    // with a verify-only key still throws InvalidAccessError. The public copies are
+    // allowed to lie; the crypto is not.
     expect_number(
         "globalThis.__webcryptoMetadataAttack=0;"
         "(async()=>{try{"
@@ -97,14 +110,18 @@ int main() {
         "try{Object.defineProperty(key,'usages',{value:['sign']})}catch{}"
         "let signRejected=false;try{await crypto.subtle.sign('HMAC',key,new Uint8Array([4]))}"
         "catch(e){signRejected=e.name==='InvalidAccessError'}"
+        // A fresh key proves the internal slot was never touched: the mutations
+        // above must not have taught the implementation the wrong algorithm.
+        "const fresh=await crypto.subtle.importKey('raw',new Uint8Array([1,2,3]),"
+        "{name:'HMAC',hash:'SHA-256'},false,['verify']);"
         "__webcryptoMetadataAttack=signRejected&&key.type==='secret'&&!key.extractable"
-        "&&key.algorithm.name==='HMAC'&&key.algorithm.hash.name==='SHA-256'"
-        "&&key.usages.length===1&&key.usages[0]==='verify'"
-        "&&Object.isFrozen(key.algorithm)&&Object.isFrozen(key.algorithm.hash)"
-        "&&Object.isFrozen(key.usages)&&!Object.isExtensible(key)?1:-1;"
+        "&&fresh.algorithm.name==='HMAC'&&fresh.algorithm.hash.name==='SHA-256'"
+        "&&fresh.usages.length===1&&fresh.usages[0]==='verify'"
+        "&&!Object.isExtensible(key)?1:-1;"
         "}catch(e){__webcryptoMetadataAttack=-2;}})();0",
         0, "schedule CryptoKey metadata and usage attacks");
-    expect_number("__webcryptoMetadataAttack", 1, "CryptoKey metadata and native usages are immutable");
+    expect_number("__webcryptoMetadataAttack", 1,
+                  "rewriting a CryptoKey's public metadata cannot reach the internal slots");
 
     expect_number(
         "globalThis.__webcryptoImportConversion=0;"

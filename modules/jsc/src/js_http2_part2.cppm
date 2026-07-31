@@ -129,7 +129,7 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
   // node's `strictFieldWhitespaceValidation` (default on) drops such a field
   // instead of delivering it; turning it off keeps the raw value.
   const kPaddedFieldValue = /^[ \t]|[ \t]$/;
-  function requestHeadersMalformed(list) {
+  function requestHeadersMalformed(list, connectProtocol) {
     const seenPseudo = {};
     let sawRegular = false;
     for (let i = 0; i < list.length; i++) {
@@ -146,6 +146,11 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
         // rejected outright.
         if (name !== ":method" && name !== ":scheme" && name !== ":path" &&
             name !== ":authority" && name !== ":protocol") return true;
+        // RFC 8441 4: `:protocol` is only meaningful once this endpoint has
+        // advertised SETTINGS_ENABLE_CONNECT_PROTOCOL. nghttp2's
+        // http_request_on_header takes that flag as an argument and rejects the
+        // header block without it, so the 'stream' event never fires.
+        if (name === ":protocol" && !connectProtocol) return true;
         seenPseudo[name] = true;
       } else {
         sawRegular = true;
@@ -251,7 +256,12 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
     }
     _write(chunk, enc, cb) { if (!this.headersSent) this.respond(); http2StreamWrite(this, chunk, enc, cb); }
     _writev(chunks, cb) { if (!this.headersSent) this.respond(); http2StreamWritev(this, chunks, cb); }
-    _final(cb) { if (!this.headersSent) this.respond(); http2StreamFinal(this, this._wantTrailers, cb); }
+    // `_emptyPayload` is pushStream(endStream)/STREAM_OPTION_EMPTY_PAYLOAD: node
+    // shuts the pushed stream's writable side in the handle at submit time, so
+    // end() before respond() finishes synchronously WITHOUT opening the response
+    // and without an empty DATA frame — END_STREAM rides on respond()'s HEADERS
+    // (core.js shutdownWritable / kMaybeDestroy: no destroy while !headersSent).
+    _final(cb) { if (this._emptyPayload === true && !this.headersSent) { cb(); return; } if (!this.headersSent) this.respond(); http2StreamFinal(this, this._wantTrailers, cb); }
     _read() { this._didRead = true; http2StreamRead(this); }
     _destroy(err, cb) { http2StreamDestroy(this, err, cb); }
     respond(headers, options) {
@@ -371,7 +381,7 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
       let fd;
       try { fd = fs.openSync(path, "r"); } catch (e) { this._fileError(options, e); return; }
       let stat;
-      try { stat = fs.fstatSync(fd); } catch (e) { try { fs.closeSync(fd); } catch (e2) {} this._fileError(options, e); return; }
+      try { stat = fs.fstatSync(fd); } catch (e) { tryCloseFd(fs, fd); this._fileError(options, e); return; }
       if (!stat.isFile()) {
         // node: a directory is ERR_HTTP2_SEND_FILE; anything else non-regular
         // with an explicit offset/length window is ERR_HTTP2_SEND_FILE_NOSEEK.
@@ -379,7 +389,7 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
         const e = isDir
           ? mkErr("Directories cannot be sent", "ERR_HTTP2_SEND_FILE")
           : mkErr("Offset or length can only be specified for regular files", "ERR_HTTP2_SEND_FILE_NOSEEK");
-        try { fs.closeSync(fd); } catch (e2) {}
+        tryCloseFd(fs, fd);
         this._fileError(options, e);
         return;
       }
@@ -416,10 +426,10 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
       const headers = Object.assign({}, headersParam);
       if (stat && typeof options.statCheck === "function") {
         if (options.statCheck.call(this, stat, headers, { offset: options.offset !== undefined ? options.offset : 0, length: options.length !== undefined ? options.length : -1 }) === false) {
-          if (ownsFd) { try { fs.closeSync(fd); } catch (e) {} }
+          if (ownsFd) tryCloseFd(fs, fd);
           return;
         }
-        if (this.headersSent) { if (ownsFd) { try { fs.closeSync(fd); } catch (e) {} } return; }
+        if (this.headersSent) { if (ownsFd) tryCloseFd(fs, fd); return; }
       }
       const offset = options.offset !== undefined ? (options.offset | 0) : 0;
       let length = options.length !== undefined ? (options.length | 0) : -1;
@@ -430,7 +440,19 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
       // Submit HEADERS before the file source is consumed. A later read error
       // resets an already-open response stream, so the client observes both the
       // response event and the INTERNAL_ERROR RST, matching node/nghttp2.
-      this.respond(headers, options.waitForTrailers ? { waitForTrailers: true } : undefined);
+      // PORT-SOURCE: compat/node/lib/internal/http2/core.js processRespondWithFD
+      // The response header list is built AFTER the fd exists, so an invalid
+      // response pseudo-header (`:method` on a response) must not escape
+      // respondWithFile(): node closes the fd it owns and destroys the stream
+      // with the raw error. It deliberately does NOT route this through
+      // options.onError.
+      try {
+        this.respond(headers, options.waitForTrailers ? { waitForTrailers: true } : undefined);
+      } catch (e) {
+        if (ownsFd) tryCloseFd(fs, fd);
+        this.destroy(e);
+        return;
+      }
       let body;
       try {
         if (length < 0) {
@@ -445,8 +467,8 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
             if (n < length) body = body.subarray(0, n < 0 ? 0 : n);
           }
         }
-      } catch (e) { if (ownsFd) { try { fs.closeSync(fd); } catch (e2) {} } this._fileError(options, e); return; }
-      if (ownsFd) { try { fs.closeSync(fd); } catch (e) {} }
+      } catch (e) { if (ownsFd) { tryCloseFd(fs, fd); } this._fileError(options, e); return; }
+      if (ownsFd) tryCloseFd(fs, fd);
       this.end(body);
     }
     // node ServerHttp2Stream#pushStream (lib/internal/http2/core.js). The
@@ -473,9 +495,30 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
       if (String(h[":method"]).toUpperCase() === "HEAD") headRequest = opts.endStream = true;
       const strict = this.session._options && this.session._options.strictSingleValueFields;
       const built = buildNgHeaders(h, assertValidRequestPseudoHeader, strict);
+      // PORT-SOURCE: compat/node/lib/internal/http2/core.js:2944-2963 —
+      // `this[kHandle].pushPromise()` is the same replaceable native boundary as
+      // respond()/info(), but with pushPromise's own contract: success returns a
+      // handle, and ANY number is an nghttp2 errno reported to the CALLBACK with
+      // exactly ONE argument and no frame on the wire.
+      const nativePushPromise = nativeHttp2StreamPrototype && nativeHttp2StreamPrototype.pushPromise;
+      if (typeof nativePushPromise === "function") {
+        const ret = Reflect.apply(nativePushPromise, this, [built.list, opts.endStream ? 1 : 0]);
+        if (typeof ret === "number") {
+          let perr;
+          // NGHTTP2_ERR_STREAM_ID_NOT_AVAILABLE / NGHTTP2_ERR_STREAM_CLOSED are
+          // HTTP2_HIDDEN_CONSTANTS — they live on the binding, not on `constants`.
+          if (ret === -509)
+            perr = mkErr("No stream ID is available because maximum stream ID has been reached", "ERR_HTTP2_OUT_OF_STREAMS");
+          else if (ret === -510)
+            perr = mkErr("The stream has been destroyed", "ERR_HTTP2_INVALID_STREAM");
+          else perr = nghttpErr(ret);
+          G.queueMicrotask(() => callback(perr));
+          return;
+        }
+      }
       const session = this.session;
       const id = session._nextPushId();
-      if (id === 0) { G.queueMicrotask(() => callback(mkErr("Out of streams", "ERR_HTTP2_OUT_OF_STREAMS"))); return; }
+      if (id === 0) { G.queueMicrotask(() => callback(mkErr("No stream ID is available because maximum stream ID has been reached", "ERR_HTTP2_OUT_OF_STREAMS"))); return; }
       const block = encodeHeaders(built.list, built.sensitive);
       const promised = Buffer.alloc(4); promised.writeUInt32BE(id, 0);
       // PUSH_PROMISE splits into PUSH_PROMISE + CONTINUATION the same way
@@ -500,6 +543,10 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
       // EOF and `endAfterHeaders` is true.
       push.endAfterHeaders = true;
       session.streams.set(id, push);
+      // node ServerHttp2Stream#pushStream: `if (options.endStream) stream.end();`
+      // synchronously, BEFORE the tick that runs the callback — a HEAD push is
+      // already writable-ended when the application first sees it.
+      if (opts.endStream) { push._emptyPayload = true; push.end(); }
       // node ServerHttp2Stream#pushStream publishes 'created' synchronously and
       // defers 'start' to the tick that invokes the callback, so createdTime is
       // strictly before startTime here too.
@@ -535,7 +582,7 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
     constructor(server, socket, options) {
       super();
       this.server = server;
-      this.socket = socket;
+      this._rawSocket = socket;
       this._options = options || {};
       this.streams = new Map();
       this.destroyed = false;
@@ -545,33 +592,68 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
       this._hpack = new HpackDecoder();
       this._maxFrameSize = constants.DEFAULT_SETTINGS_MAX_FRAME_SIZE;
       this._remoteSettings = null;
-      this._localSettings = { headerTableSize: 4096, enablePush: 0, initialWindowSize: 65535, maxFrameSize: 16384, maxConcurrentStreams: 4294967295 };
+      // node's server session advertises the compiled-in defaults with
+      // SETTINGS_ENABLE_PUSH off, and its `localSettings` reflects whatever
+      // `createServer({ settings })` asked for (customSettings included) — see
+      // settingsView(). enablePush stays false whatever the caller passed: RFC
+      // 9113 6.5.2 forbids a server advertising a non-zero value.
+      this._localSettings = { headerTableSize: 4096, enablePush: false, initialWindowSize: 65535, maxFrameSize: 16384, maxConcurrentStreams: 4294967295, maxHeaderListSize: 65535, enableConnectProtocol: false };
       this._pendingHeaderBlock = null;
       this._lastStreamId = 0;
       // connection-level flow control bookkeeping, surfaced through `state`
       this._localWindow = DEFAULT_CONNECTION_WINDOW;
       this._remoteWindow = DEFAULT_CONNECTION_WINDOW;
       this._lastProcStreamId = 0;
-      this.alpnProtocol = socket.alpnProtocol || null;
+      // node Http2Session: `encrypted` reflects the transport and `alpnProtocol`
+      // is "h2c" on a cleartext one. A ServerHttp2Session over a TLSSocket was
+      // reporting neither, so test-http2-create-client-secure-session's server
+      // half saw `session.encrypted` falsy and `originSet` undefined (the origin
+      // set is only tracked for an encrypted session).
+      this.encrypted = !!socket.encrypted;
+      this.alpnProtocol = socket.alpnProtocol || (this.encrypted ? "h2" : "h2c");
+      this._originSet = undefined;
       const self = this;
       // A server may send its SETTINGS immediately (RFC 7540 3.5); the client's
       // preface can still be in flight. Apply any configured settings values.
-      this._writeFrame(FRAME.SETTINGS, 0, 0, encodeSettings(server && server._h2options && server._h2options.settings));
+      // RFC 9113 6.5.2: a SETTINGS_ENABLE_PUSH value other than 0 sent by a
+      // server MUST be treated as a connection error by the client. Node's
+      // server half hard-wires it off, so a caller-supplied `enablePush: true`
+      // is overridden rather than advertised.
+      // Only CLAMP a caller-supplied enablePush; never inject one. Injecting it
+      // made the server's initial SETTINGS 6 bytes where node sends an EMPTY
+      // frame, which broke node's test-http2-settings-unsolicited-ack.js (it
+      // deep-equals the raw frame). An empty frame already satisfies bun's
+      // regression/29073 requirement of never advertising a non-zero value.
+      this._isServerSession = true;
+      const _srvSettings = server && server._h2options && server._h2options.settings;
+      // nghttp2 tracks SETTINGS_ENABLE_CONNECT_PROTOCOL as
+      // `pending_enable_connect_protocol` and consults it when validating an
+      // inbound request's `:protocol` pseudo-header, so a server that never
+      // advertised extended CONNECT rejects such a request outright rather than
+      // handing it to the application (test-http2-connect-method-extended vs
+      // -cant-turn-off). It is updated at SUBMIT time, not on the peer's ACK.
+      const _cpSettings = _srvSettings || this._options.settings;
+      this._localConnectProtocol = !!(_cpSettings && _cpSettings.enableConnectProtocol);
+      if (_cpSettings) { Object.assign(this._localSettings, _cpSettings); this._localSettings.enablePush = false; }
+      this._writeFrame(FRAME.SETTINGS, 0, 0, encodeSettings(
+        _srvSettings && "enablePush" in _srvSettings
+          ? Object.assign({}, _srvSettings, { enablePush: false })
+          : _srvSettings));
       socket.on("data", (d) => self._onData(d));
       socket.on("error", (e) => self._onSocketError(e));
       socket.on("close", () => self._onSocketClose());
       socket.on("end", () => self._onSocketEnd());
     }
     _writeFrame(type, flags, streamId, payload) {
-      if (this.destroyed || !this.socket) return;
+      if (this.destroyed || !this._rawSocket) return;
       // net.Socket.write() on an ended/destroyed socket EMITS 'error' rather than
       // throwing, so the try/catch below cannot contain it: the session has no
       // 'error' listener on that path and "write after end" surfaced as an
       // uncaught exception. nghttp2 simply drops frames once the transport is
       // gone, so drop them here too.
-      if (this.socket.destroyed || this.socket.writable === false) return;
+      if (this._rawSocket.destroyed || this._rawSocket.writable === false) return;
       payload = payload || Buffer.alloc(0);
-      try { this.socket.write(Buffer.concat([frameHeader(payload.length, type, flags, streamId), payload])); } catch (e) {}
+      try { this._rawSocket.write(Buffer.concat([frameHeader(payload.length, type, flags, streamId), payload])); } catch (e) {}
     }
     _sendData(stream, buf, endStream) {
       if (this.destroyed) return;
@@ -644,11 +726,20 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
           if (flags & FLAG.ACK) { if (len !== 0) { this._connError(constants.NGHTTP2_FRAME_SIZE_ERROR); return false; } resolveSettingsAck(this); return true; }
           if (len % 6 !== 0) { this._connError(constants.NGHTTP2_FRAME_SIZE_ERROR); return false; }
           if (streamId !== 0) { this._connError(constants.NGHTTP2_PROTOCOL_ERROR); return false; }
+          // node hands `maxSettings` to nghttp2 as SETTINGS_MAX_SETTINGS: a peer
+          // that packs more entries than that into one frame is a flood vector,
+          // so nghttp2 fails the connection before the application is told
+          // anything about it — no 'remoteSettings', no streams
+          // (test-http2-max-settings). The option was accepted and ignored.
+          const maxSettings = (this._options && this._options.maxSettings) ||
+            (this.server && this.server._h2options && this.server._h2options.maxSettings) || 32;
+          if (len / 6 > maxSettings) { this._connError(constants.NGHTTP2_PROTOCOL_ERROR); return false; }
           const rangeErr = settingsRangeError(payload);
           if (rangeErr) { this._connError(rangeErr); return false; }
-          this._remoteSettings = parseSettingsPayload(payload);
+          if (connectProtocolWithdrawn(this, payload)) { this._connError(constants.NGHTTP2_PROTOCOL_ERROR); return false; }
+          this._remoteSettings = parseSettingsPayload(payload); this._remoteSettingsView = undefined;
           this._writeFrame(FRAME.SETTINGS, FLAG.ACK, 0, Buffer.alloc(0));
-          this.emit("remoteSettings", settingsToObject(this._remoteSettings));
+          this.emit("remoteSettings", remoteSettingsOf(this));
           return true;
         }
         case FRAME.HEADERS: {
@@ -820,7 +911,7 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
       this.streams.set(pb.streamId, stream);
       if (pb.streamId > this._lastStreamId) this._lastStreamId = pb.streamId;
       if (limitCode !== 0) { this._streamError(stream, limitCode); return true; }
-      if (requestHeadersMalformed(list)) { this._streamError(stream, constants.NGHTTP2_PROTOCOL_ERROR); return true; }
+      if (requestHeadersMalformed(list, this._localConnectProtocol === true)) { this._streamError(stream, constants.NGHTTP2_PROTOCOL_ERROR); return true; }
       if (dupClen) { this._streamError(stream, constants.NGHTTP2_PROTOCOL_ERROR); return true; }
       if (pb.endStream && expectLen != null && expectLen !== 0) { this._streamError(stream, constants.NGHTTP2_PROTOCOL_ERROR); return true; }
       if (!pb.endStream && expectLen != null) stream._expectLen = expectLen;
@@ -889,20 +980,32 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
       if (this.destroyed) return;
       this.destroyed = true; this.closed = true;
       if (this._timer != null) { try { G.clearTimeout(this._timer); } catch (e) {} this._timer = null; }
-      closeSessionSocket(this.socket, hard !== false);
+      cancelSessionPings(this);
+      closeSessionSocket(this._rawSocket, hard !== false);
+      // PORT-SOURCE: compat/node/lib/internal/http2/core.js cleanupSession() —
+      // `session[kSocket] = undefined` runs BEFORE 'close' is emitted, which is
+      // what makes a socket proxy captured earlier start raising
+      // ERR_HTTP2_SOCKET_UNBOUND (test-http2-unbound-socket-proxy).
+      this._rawSocket = undefined;
       const streams = Array.from(this.streams.values());
       const self = this;
       G.queueMicrotask(() => { for (const s of streams) s._finish(); self.emit("close"); });
     }
     // ---- public surface ----
     get connected() { return !this.destroyed; }
-    get remoteSettings() { return this._remoteSettings ? settingsToObject(this._remoteSettings) : undefined; }
-    get localSettings() { return this._localSettings; }
+    get remoteSettings() { return remoteSettingsOf(this); }
+    get localSettings() { return localSettingsOf(this); }
     // server-initiated streams are even-numbered; we never push, so the next id
     // a server session would allocate stays 2 (node reports the same).
     get state() { return sessionState(this, (this._lastPushId || 0) + 2); }
     get pendingSettingsAck() { return sessionPendingAck(this); }
     get type() { return constants.NGHTTP2_SESSION_SERVER; }
+    // node Http2Session#originSet: undefined on a cleartext or destroyed
+    // session, otherwise the transport-seeded set as an array.
+    get originSet() {
+      if (!this.encrypted || this.destroyed) return undefined;
+      return Array.from(initOriginSet(this));
+    }
     settings(s, cb) { return sessionSubmitSettings(this, s, cb); }
     ping(payload, cb) { return sessionPing(this, payload, cb); }
     altsvc(alt, originOrStream) { return sessionAltsvc(this, alt, originOrStream); }
@@ -946,8 +1049,11 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
       this._teardown(false);
     }
     destroy(err, code) { if (this.destroyed) return; if (err) { const self = this; this._teardown(); G.queueMicrotask(() => self.emit("error", err)); } else this._teardown(); }
-    ref() { if (this.socket && this.socket.ref) this.socket.ref(); return this; }
-    unref() { if (this.socket && this.socket.unref) this.socket.unref(); return this; }
+    ref() { if (this._rawSocket && this._rawSocket.ref) this._rawSocket.ref(); return this; }
+    unref() { if (this._rawSocket && this._rawSocket.unref) this._rawSocket.unref(); return this; }
+    // PORT-SOURCE: compat/node/lib/internal/http2/core.js Http2Session `get socket()`
+    get socket() { return sessionSocketProxy(this); }
+    set socket(v) { this._rawSocket = v; }
     // node Http2Session#setTimeout is on BOTH halves (it lives on the shared
     // Http2Session prototype); this one was a no-op stub, so an http2 SERVER
     // could never reap an idle session and `server.setTimeout()` / `server.timeout`
@@ -968,7 +1074,7 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
     }
     _armTimeout() {
       if (this._timer != null) { try { G.clearTimeout(this._timer); } catch (e) {} this._timer = null; }
-      if (!this._timeoutMs || this.destroyed) return;
+      if (!this._timeoutMs || this.destroyed) { syncSessionTimeout(this); return; }
       const self = this;
       this._timer = G.setTimeout(() => {
         self._timer = null;
@@ -977,6 +1083,7 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
         for (const s of Array.from(self.streams.values())) { try { s.emit("timeout"); } catch (e) {} }
       }, this._timeoutMs);
       if (this._timer && this._timer.unref) this._timer.unref();
+      syncSessionTimeout(this);
     }
   }
 
@@ -1008,7 +1115,28 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
       maxFrameSize: s[5] !== undefined ? s[5] : 16384,
       maxHeaderListSize: s[6] !== undefined ? s[6] : 65535,
       enableConnectProtocol: s[8] !== undefined ? s[8] : 0,
+      customSettings: customFromRawSettings(s),
     };
+  }
+  // RFC 8441 3: SETTINGS_ENABLE_CONNECT_PROTOCOL is one-way. A peer that has
+  // advertised the value 1 can never take it back, and a later SETTINGS frame
+  // carrying the value 0 is a connection error of type PROTOCOL_ERROR -- which
+  // is what closes the connection in
+  // test-http2-connect-method-extended-cant-turn-off.
+  //
+  // This has to read the RAW entries, not the parsed object: SETTINGS are
+  // cumulative, so a frame that simply omits id 8 leaves the previous value in
+  // force and must NOT be mistaken for a withdrawal (parseSettingsPayload
+  // substitutes the protocol default 0 for anything absent).
+  function connectProtocolWithdrawn(session, payload) {
+    let seen;
+    for (let i = 0; i + 6 <= payload.length; i += 6) {
+      if (((payload[i] << 8) | payload[i + 1]) !== 8) continue;
+      seen = (payload[i + 2] * 0x1000000) + (payload[i + 3] << 16) + (payload[i + 4] << 8) + payload[i + 5];
+    }
+    if (seen === undefined) return false;
+    if (seen !== 0) { session._peerConnectProtocol = true; return false; }
+    return session._peerConnectProtocol === true;
   }
   function encodeSettings(settings) {
     if (!settings || typeof settings !== "object") return Buffer.alloc(0);
@@ -1019,6 +1147,25 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
       let v = settings[k];
       if (typeof v === "boolean") v = v ? 1 : 0;
       entries.push([ids[k], v >>> 0]);
+    }
+    // PORT-SOURCE: lib/internal/http2/util.js updateSettingsBuffer -- the tail
+    // of that function walks `settings.customSettings` and writes one 6-byte
+    // entry per NUMERIC value, exactly like a defined id. mbun encoded only the
+    // seven defined ids, so a `settings: { customSettings: {...} }` option was
+    // accepted, stored, and reported back through `localSettings` but never
+    // reached the wire at all -- which is why the PEER's `remoteSettings` never
+    // carried a customSettings object and test-http2-session-settings failed at
+    // `typeof settings.customSettings === 'object'` on the receiving half.
+    const custom = settings.customSettings;
+    if (custom !== null && typeof custom === "object") {
+      for (const key in custom) {
+        if (!Object.prototype.hasOwnProperty.call(custom, key)) continue;
+        const v = custom[key];
+        if (typeof v !== "number") continue;
+        const id = Number.parseInt(key, 10);
+        if (!Number.isFinite(id) || id < 0 || id > 0xffff) continue;
+        entries.push([id, v >>> 0]);
+      }
     }
     const p = Buffer.alloc(entries.length * 6);
     for (let i = 0; i < entries.length; i++) { p.writeUInt16BE(entries[i][0], i * 6); p.writeUInt32BE(entries[i][1], i * 6 + 2); }
@@ -1090,6 +1237,13 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
     // (node lib/internal/validators.js validateLinkHeaderValue).
     throw invalidArgValue("hints", hints, LINK_FORMAT_REASON);
   }
+  // PORT-SOURCE: compat/node/lib/internal/http2/core.js `tryClose()`
+  // node releases an fd it owns with the ASYNC fs.close, never closeSync.
+  // test-http2-respond-file-fd-leak patches fs.close and asserts it ran, so the
+  // sync call was invisible to it.
+  function tryCloseFd(fs, fd) {
+    try { fs.close(fd, () => {}); } catch (e) { try { fs.closeSync(fd); } catch (e2) {} }
+  }
   function http2StatusInvalid(code) {
     const e = new RangeError("Invalid status code: " + code); e.code = "ERR_HTTP2_STATUS_INVALID"; return e;
   }
@@ -1100,7 +1254,7 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
   function makeProxySocket(stream) {
     const noManip = new Set(["write", "read", "pause", "resume"]);
     const bindStream = new Set(["on", "once", "end", "emit", "destroy", "removeListener", "addListener", "off"]);
-    const refOf = () => (stream.session !== undefined && stream.session ? stream.session.socket : stream);
+    const refOf = () => (stream.session !== undefined && stream.session ? stream.session._rawSocket : stream);
     return new Proxy(stream, {
       has(t, prop) { const ref = refOf(); return (prop in t) || (ref != null && prop in ref); },
       get(t, prop) {
@@ -1900,9 +2054,10 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
     if (u == null || typeof u.kSocket !== "symbol") return;
     adoptedInternals = true;
     // The Http2Session's real transport. node stores it under kSocket and
-    // exposes the *proxy* as `.socket`; mbun's `.socket` is already the raw
-    // socket, so both names resolve to the same object.
-    const desc = { get() { return this.socket; }, set(v) { this.socket = v; }, configurable: true };
+    // exposes the *proxy* as `.socket`; `_rawSocket` is mbun's kSocket slot, so
+    // the internal symbol and the internal field name the same object while
+    // `.socket` stays the proxy.
+    const desc = { get() { return this._rawSocket; }, set(v) { this._rawSocket = v; }, configurable: true };
     Object.defineProperty(ClientHttp2Session.prototype, u.kSocket, desc);
     Object.defineProperty(ServerHttp2Session.prototype, u.kSocket, desc);
     if (typeof u.kSensitiveHeaders === "symbol" && sensitiveSymbols.indexOf(u.kSensitiveHeaders) < 0)
@@ -2042,6 +2197,31 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
   http2.ServerHttp2Stream = ServerHttp2Stream;
   http2.Http2ServerRequest = Http2ServerRequest;
   http2.Http2ServerResponse = Http2ServerResponse;
+
+  // `require("internal/http2/core")` — mbun's http2 IS its internal http2 core,
+  // so resolve the specifier to this module rather than to node's own
+  // lib/internal/http2/core.js. Three corpus files destructure a CLASS out of
+  // it and compare a live mbun session against it
+  // (`assert(session instanceof ServerHttp2Session)` in
+  // test-http2-server-sessionerror, -options-max-headers-exceeds-nghttp2 and
+  // -invalid-last-stream-id). Loading node's core.js gave them node's own class
+  // objects, which nothing mbun creates can ever be an instance of, so the
+  // check was unsatisfiable — a pure identity mismatch, not a behavioural gap.
+  // Only those three files and node's unused lib/http2.js reference the
+  // specifier at all; `internal/http2/util` deliberately keeps resolving to
+  // node's file, because the SYMBOLS minted there are the ones the corpus reads
+  // (see adoptNodeHttp2Internals).
+  M["internal/http2/core"] = {
+    Http2Session: ClientHttp2Session,
+    ClientHttp2Session, ServerHttp2Session,
+    ClientHttp2Stream, ServerHttp2Stream,
+    Http2ServerRequest, Http2ServerResponse,
+    connect, constants,
+    createServer: makeHttp2Server,
+    createSecureServer: makeHttp2SecureServer,
+    getDefaultSettings, getPackedSettings, getUnpackedSettings,
+    get sensitiveHeaders() { return http2.sensitiveHeaders; },
+  };
 })();
 
 )JS";

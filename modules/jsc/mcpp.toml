@@ -21,6 +21,10 @@ debug = false
 [dependencies]
 core     = { path = "../core" }
 css      = { path = "../css" }
+# mbun.platform — the strongly platform-dependent primitives (pty creation and
+# termios, the POSIX syscall backend). runtime/process_extended.inc consumes it
+# so the pty surface carries no terminal headers or platform #ifdefs here.
+platform = { path = "../platform" }
 # node's Permission Model. The decision logic is a separate, engine-free member
 # so it can be unit-tested; this member supplies the syscall boundary that
 # consults it (io_bindings.inc, the spawn bridges, the module loader).
@@ -64,10 +68,20 @@ crash_handler  = { path = "../crash_handler" }
 
 [dependencies.mbun]
 jsc-prebuilt = "20260706"
-# Vendored OpenSSL 3.1.5 static backend (no host libssl) for node:crypto's
-# asymmetric + cipher EVP bridge (src/runtime/crypto_asym.inc). Same local-index
-# package modules/tls links; -l:libssl.a/-l:libcrypto.a reach here via its ldflags.
-openssl = "3.1.5+mbun.3"
+# (OpenSSL moved to [dependencies.compat] below.)
+
+# OpenSSL comes from the OFFICIAL registry package compat.openssl, which builds a
+# fully static libcrypto.a + libssl.a FROM SOURCE on both linux and macosx. It
+# replaces the local-index mbun.openssl, whose own header excluded this option on
+# the premise that "mcpp 注册表有 compat.mbedtls，但无 compat.openssl" -- true when
+# that file was written, false now: the registry has since gained it. mbun.openssl
+# wrapped the xim:openssl PREBUILT, which exists only for linux, and that is what
+# stopped the macOS CI probe.
+#
+# This is a 3.1.5 -> 3.5.1 bump, not a drop-in swap, so it is gated on the crypto
+# and TLS corpora rather than assumed compatible.
+[dependencies.compat]
+openssl = "3.5.1"
 
 [indices]
 mbun = { path = "../../mcpp" }

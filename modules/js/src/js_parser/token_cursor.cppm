@@ -191,8 +191,9 @@ public:
                     // A bail-out on the lowerer's nesting budget is an overflow,
                     // not a syntax error: report it the way the parser's own
                     // descent does so the caller sees one catchable message.
-                    errMsg_ = jsxLower_.overflowed() ? "Maximum call stack size exceeded"
-                                                     : "Unexpected token in JSX";
+                    errMsg_ = jsxLower_.overflowed()  ? "Maximum call stack size exceeded"
+                              : !jsxLower_.tag_mismatch().empty() ? jsxLower_.tag_mismatch()
+                                                                  : "Unexpected token in JSX";
                     errOff_ = jsxStart;
                     return false;
                 }

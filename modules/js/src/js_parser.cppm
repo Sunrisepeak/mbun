@@ -59,6 +59,11 @@ struct ParseResult {
     // (CJS mode) every live export as (key literal, local name), for the
     // end-of-module re-push. Insertion-ordered; duplicates are harmless.
     std::vector<std::pair<std::string, std::string>> cjs_live_names;
+    // (CJS mode) the export KEY literals this module REASSIGNS after their
+    // declaration — the `__mbun_mut` marker's contents. Empty for almost every
+    // module, which is exactly what keeps __mbun_link's snapshot fast path free
+    // (see cjs_runtime.cppm kLiveNotifyAlias).
+    std::vector<std::string> cjs_mut_keys;
     bool top_level_await{false};  // module awaits at top level (needs an async wrapper in
                                   // the script-mode JSC runtime, which has no native TLA)
 };
@@ -156,6 +161,7 @@ public:
         result.cjs_esm_export = cjsEsmExport_;
         result.cjs_live_export = cjsLiveExport_;
         result.cjs_live_names = cjsLiveNames_;
+        result.cjs_mut_keys = cjsMutKeys_;
         result.top_level_await = topLevelAwait_;
         return result;
     }
@@ -237,6 +243,7 @@ private:
     bool cjsEsmExport_{false};  // saw an ESM `export` → module needs __esModule marker
     bool cjsLiveExport_{false};  // emitted a __mbun_X call → prelude must define the helper
     std::vector<std::pair<std::string, std::string>> cjsLiveNames_;  // (key, local) per __mbun_X
+    std::vector<std::string> cjsMutKeys_;  // live-export keys this module reassigns (__mbun_XN)
     int fnDepth_{0};            // nesting depth of function/method/arrow bodies
     bool topLevelAwait_{false};  // saw `await` at module top level (fnDepth_ == 0)
     // `yield` is a contextual keyword: a YieldExpression only inside a generator
@@ -602,6 +609,18 @@ private:
         case Token::Break:
         case Token::Continue:
             return parse_break_continue_();
+        case Token::Debugger: {
+            // `debugger;` was lexed but had no statement rule at all, so ANY
+            // file containing one died with "Unexpected debugger" before a line
+            // of it ran — a parse hole, not a missing feature. The statement is
+            // specified as a no-op when no debugger is attached (ECMA-262
+            // §14.16 evaluates to empty), and mbun attaches none, so an
+            // EmptyStmt is the semantically exact lowering rather than a stub.
+            const std::uint32_t start = cur_().start;
+            advance_();
+            consume_semicolon_();
+            return arena_.make(NodeKind::EmptyStmt, start, cur_().start);
+        }
         case Token::With:
             return parse_with_();
         case Token::Import:
@@ -4072,6 +4091,75 @@ private:
         return n;
     }
 
+    // Wrap an assignment / update expression that WRITES a name this module
+    // exports live, so the write reaches importers that already settled.
+    //
+    //     x = 1        ->    __mbun_XN("x", x = 1)
+    //
+    // See js_parser/cjs_runtime.cppm kLiveNotifyAlias for the why. Three
+    // properties make this safe without a scope table:
+    //
+    //   * The helper is handed only the export KEY, and re-reads the value by
+    //     CALLING THE EXPORT SLOT'S OWN GETTER — the `() => local` __mbun_X
+    //     installed at the declaration, which closes over the module-scope
+    //     binding. It never uses the value it was passed and never evaluates a
+    //     thunk written at the assignment site, so a wrap that fired inside a
+    //     scope shadowing the name re-publishes the module binding's UNCHANGED
+    //     value: a redundant push, never a wrong one. That asymmetry is what
+    //     buys us the right to skip scope analysis. (An earlier revision passed
+    //     `() => x` from the assignment site instead; it captured the shadow and
+    //     published 1000 for `export let a; function shadow(){ let a = 999;
+    //     a = 1000 }` where bun leaves `a` alone — measured, then discarded.)
+    //   * It returns the assignment's own value unchanged, so the wrap is
+    //     transparent wherever an assignment may appear (`for (x = 0; …)`,
+    //     `f(x = 1)`, `a = x = 1`).
+    //   * `end` is prev_end_() — the end of the expression's LAST TOKEN, not
+    //     `cur_().start`. Closing the paren at the next token's start would push
+    //     `)` past a newline and past any comment between them, which for
+    //     `x = 1\nfoo()` emits `…x = 1\n)foo()` — a syntax error. Every span this
+    //     records is token-tight for that reason.
+    //
+    // Recorded as two zero-width insertions (add_edit(p, p, …)), so speculative
+    // backtracking rolls them back with every other edit via truncate_edits, and
+    // an enclosing erasure (a `declare` block) subsumes both at apply time by the
+    // overlap rule — they are inside it together or outside it together.
+    //
+    // KNOWN INCOMPLETENESS, deliberate: the check is against the live-export set
+    // AS IT STANDS AT THIS POINT IN THE PARSE, so an assignment that textually
+    // PRECEDES the `export let x` it writes (only reachable through a hoisted
+    // `export function f(){ x = 1 }` declared above the export, or a `var`) is
+    // not wrapped and keeps today's snapshot behaviour. Checking at parse time is
+    // what makes backtracking correct for free; deferring the decision would need
+    // the candidate list threaded through TokenCursor::Save.
+    void note_live_assign_(NodeIndex target, std::uint32_t start, std::uint32_t end) {
+        if (!cjs_ || cjsLiveNames_.empty() || target == NONE || start >= end) {
+            return;
+        }
+        const std::string_view name{arena_.at(target).text};
+        if (arena_.at(target).kind != NodeKind::Identifier || name.empty()) {
+            return;
+        }
+        std::string prefix;
+        std::string suffix;
+        for (const auto& [key, local] : cjsLiveNames_) {
+            if (local != name) {
+                continue;
+            }
+            // One wrap per KEY: `export { x, x as y }` publishes the same local
+            // twice, and both importers' bindings have to hear the write.
+            prefix += std::string{detail::kLiveNotifyAlias} + "(" + key + ", ";
+            suffix += ")";
+            if (std::find(cjsMutKeys_.begin(), cjsMutKeys_.end(), key) == cjsMutKeys_.end()) {
+                cjsMutKeys_.push_back(key);
+            }
+        }
+        if (prefix.empty()) {
+            return;
+        }
+        arena_.add_edit(start, start, std::move(prefix));
+        arena_.add_edit(end, end, std::move(suffix));
+    }
+
     NodeIndex parse_assign_(bool allowIn) {
         DepthGuard depth{this};  // nested elements/arguments/conditionals recurse here
         if (!depth.ok) {
@@ -4105,6 +4193,7 @@ private:
             arena_.at(n).aux = static_cast<std::uint32_t>(k);
             arena_.at(n).a = left;
             arena_.at(n).b = right;
+            note_live_assign_(left, static_cast<std::uint32_t>(start), prev_end_());
             return n;
         }
         return left;
@@ -4379,6 +4468,7 @@ private:
             arena_.at(n).aux = static_cast<std::uint32_t>(k);
             arena_.at(n).a = operand;
             arena_.at(n).flags = 1;  // prefix
+            note_live_assign_(operand, static_cast<std::uint32_t>(start), prev_end_());
             return n;
         }
         default:
@@ -4396,6 +4486,7 @@ private:
             NodeIndex n = arena_.make(NodeKind::Update, start, cur_().start);
             arena_.at(n).aux = static_cast<std::uint32_t>(op);
             arena_.at(n).a = e;
+            note_live_assign_(e, static_cast<std::uint32_t>(start), prev_end_());
             return n;
         }
         return e;
@@ -5950,6 +6041,37 @@ TranspileResult transpile_(std::string_view src, const TranspileOptions& opts, b
                        ".getOwnPropertyDescriptor(exports, k);"
                        " if (d && d.get && d.get.__mbun_subs) { exports[k] = g(); } };";
         }
+        // `__mbun_XN(k, v)` republishes a POST-SETTLE write to a live export
+        // and returns `v` (the assignment's own value) untouched — see
+        // cjs_runtime.cppm kLiveNotifyAlias. Emitted only when this module
+        // actually reassigns an export, so the helper does not ride along on the
+        // thousands of modules that never do.
+        //
+        // It re-reads through the SLOT'S OWN getter (`d.get.call(exports)` — the
+        // `() => local` __mbun_X installed at the declaration) rather than
+        // trusting `v`. That is what makes postfix `x++`, whose value is the OLD
+        // one, publish the new value, and what makes a write inside a scope that
+        // SHADOWS the name publish the module binding's unchanged value instead
+        // of the shadow's.
+        //
+        // `!d.get.__mbun_subs` is the discriminator between the two accessors
+        // that can own the slot. A getter carrying `__mbun_subs` is a CYCLIC
+        // importer's __mbun_link cell, which took the slot over while this module
+        // was still pending; its `cur` is a cached value, not the local, so
+        // calling it would publish a stale one. Those keep the pre-existing
+        // __mbun_XP end-of-body settle and nothing else, which is why a cycle
+        // cannot regress here. Measured on a two-module cycle: the leaf's export
+        // goes live where it was stale before, the entry's stays exactly as it
+        // was. __mbun_link applies the identical test before subscribing, so the
+        // two ends agree on which slots participate.
+        if (!r.cjs_mut_keys.empty()) {
+            prelude += " var " + std::string{detail::kLiveNotifyAlias} +
+                       " = (k, v) => { const d = " + O +
+                       ".getOwnPropertyDescriptor(exports, k);"
+                       " if (d && d.get && !d.get.__mbun_subs) { const m = d.get.__mbun_msubs;"
+                       " if (m) { const nv = d.get.call(exports);"
+                       " for (let i = 0; i < m.length; i++) m[i](nv); } } return v; };";
+        }
         out.code.insert(0, prelude + "\n");
         // Re-push every live export now the body has run and each local is final;
         // see kLiveRepushAlias. A no-op unless a cyclic importer linked the slot.
@@ -5957,6 +6079,24 @@ TranspileResult transpile_(std::string_view src, const TranspileOptions& opts, b
             std::string tail{"\n"};
             for (const auto& [key, local] : r.cjs_live_names) {
                 tail += std::string{detail::kLiveRepushAlias} + "(" + key + ", () => " + local + ");";
+            }
+            // Advertise the reassigned exports so __mbun_link knows which settled
+            // slots still need a fan-out subscription; every other module keeps
+            // the plain snapshot fast path. In the tail rather than the prelude
+            // because the parser only knows the answer once the whole body has
+            // been read — and the tail still runs before any ACYCLIC importer's
+            // __mbun_link, which is the only reader. Non-enumerable: `exports` is
+            // the namespace object (see kLiveMutMarker).
+            if (!r.cjs_mut_keys.empty()) {
+                tail += std::string{detail::kObjectAlias} + ".defineProperty(exports, \"" +
+                        std::string{detail::kLiveMutMarker} + "\", { value: [";
+                for (std::size_t i{0}; i < r.cjs_mut_keys.size(); ++i) {
+                    if (i != 0) {
+                        tail += ",";
+                    }
+                    tail += r.cjs_mut_keys[i];
+                }
+                tail += "], configurable: true });";
             }
             out.code += tail;
         }

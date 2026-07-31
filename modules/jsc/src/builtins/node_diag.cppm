@@ -82,28 +82,46 @@ inline constexpr std::string_view kNodeDiagJS = R"JS(
     }
     if (other.length > 0) msg += other.length > 1 ? "one of " + formatList(other, "or") : other[0];
     msg += ". Received " + determineSpecificType(value);
+    return makeArgTypeError(msg);
+  };
+  // The ERR_INVALID_ARG_TYPE tail shared by argTypeError and the hand-worded
+  // messages below. node's E()-generated errors carry the code in toString(),
+  // which is what assert.throws(fn, /ERR_INVALID_ARG_TYPE/) matches against
+  // (assert compares the RegExp with String(err)).
+  function makeArgTypeError(msg) {
     const e = new TypeError(msg);
     e.code = "ERR_INVALID_ARG_TYPE";
-    // node's E()-generated errors carry the code in toString(), which is what
-    // assert.throws(fn, /ERR_INVALID_ARG_TYPE/) matches against (assert compares
-    // the RegExp with String(err)).
     Object.defineProperty(e, "toString", {
       value: function () { return this.name + " [ERR_INVALID_ARG_TYPE]: " + this.message; },
       writable: true, enumerable: false, configurable: true,
     });
     return e;
-  };
+  }
   const validateFunction = (value, name) => {
     if (typeof value !== "function") throw argTypeError(name, "function", value);
   };
 
   // WeakReference: a WeakRef with an explicit incRef/decRef counter (Node's
   // internal WeakReference used to keep channels alive while referenced).
+  // node's WeakReference is STRONG while refCount > 0 -- that is the whole point
+  // of incRef/decRef, and counting alone does not do it. This held a weak
+  // reference at every refcount, which was invisible for as long as forced GC was
+  // a no-op (`Bun.gc` was `() => {}` and the native only hinted). Once real
+  // collection landed, a channel with live subscribers was collected and
+  // `channel('x').hasSubscribers` went false -- exactly what
+  // test-diagnostics-channel-gc-maintains-subcriptions.js pins.
   class WeakReference extends WeakRef {
     #refs = 0;
-    get() { return this.deref(); }
-    incRef() { return ++this.#refs; }
-    decRef() { return --this.#refs; }
+    #strong = undefined;
+    get() { return this.#strong !== undefined ? this.#strong : this.deref(); }
+    incRef() {
+      if (++this.#refs === 1) this.#strong = this.deref();
+      return this.#refs;
+    }
+    decRef() {
+      if (--this.#refs <= 0) this.#strong = undefined;
+      return this.#refs;
+    }
   }
 
   // Channels map keyed by name -> WeakReference(channel); GC finalization is the
@@ -241,8 +259,16 @@ inline constexpr std::string_view kNodeDiagJS = R"JS(
   const channel = (name) => {
     const existing = channels.get(name);
     if (existing) return existing;
-    if (typeof name !== "string" && typeof name !== "symbol")
-      throw argTypeError("channel", ["string", "symbol"], name);
+    if (typeof name !== "string" && typeof name !== "symbol") {
+      // Bun passes the two accepted types as one pre-joined string
+      // ($ERR_INVALID_ARG_TYPE("channel", "string or symbol", name)), so its
+      // message reads "must be of type string or symbol" rather than node's
+      // multi-type "must be one of type ..." phrasing, and its corpus asserts
+      // that exact text. Node's own tests only match on the error code, so
+      // bun's wording satisfies both corpora.
+      throw makeArgTypeError('The "channel" argument must be of type string or symbol. Received ' +
+        determineSpecificType(name));
+    }
     return new Channel(name);
   };
   const subscribe = (name, subscription) => channel(name).subscribe(subscription);

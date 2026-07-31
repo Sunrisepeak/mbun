@@ -105,6 +105,22 @@ bool shell_collect_words(JSContextRef context, JSValueRef value, std::uint32_t d
     return true;
 }
 
+// Is `value` bun's raw escape hatch, `{ raw: "..." }`, as a WHOLE interpolation?
+// On true, `out` holds the string to splice into the shell source verbatim.
+// Arrays and file-backed Blobs are not raw (a Blob interpolates as its path).
+bool shell_whole_raw_text(JSContextRef context, JSValueRef value, std::string& out,
+                          JSValueRef* exception) {
+    if (!JSValueIsObject(context, value) || JSValueIsArray(context, value)) return false;
+    JSObjectRef obj{JSValueToObject(context, value, exception)};
+    if (obj == nullptr || (exception != nullptr && *exception != nullptr)) return false;
+    JSStringRef rawKey{JSStringCreateWithUTF8CString("raw")};
+    JSValueRef rawVal{JSObjectGetProperty(context, obj, rawKey, exception)};
+    JSStringRelease(rawKey);
+    if (exception != nullptr && *exception != nullptr) return false;
+    if (rawVal == nullptr || !JSValueToBoolean(context, rawVal)) return false;
+    return shell_value_to_string(context, rawVal, out, exception);
+}
+
 // __mbunShellNative.escape(str) — backs Bun.$.escape. ref: BunObject.rs
 // shell_escape: a string that needs no escaping is returned unchanged (bun
 // hands back the very same JSValue), everything else comes back double-quoted.
@@ -168,6 +184,14 @@ JSValueRef shell_compile_cb(JSContextRef context, JSObjectRef, JSObjectRef, std:
         // (shell_body.rs:807-840); those class checks are not wired up here yet.
         if (JSValueGetTypedArrayType(context, value, nullptr) != kJSTypedArrayTypeNone) {
             argument.jsObjIndex = jsObjCount++;
+        } else if (std::string rawText; shell_whole_raw_text(context, value, rawText, exception)) {
+            // bun shell_body.rs:885-905 — a WHOLE `${{ raw: "..." }}` interpolation
+            // is spliced into the shell source unescaped. shell_collect_words'
+            // raw branch stays for a raw object nested inside an interpolated
+            // array, which bun still turns into a single word.
+            argument.rawText = std::move(rawText);
+        } else if (exception != nullptr && *exception != nullptr) {
+            return JSValueMakeUndefined(context);
         } else if (!shell_collect_words(context, value, 0, argument.words, exception)) {
             return JSValueMakeUndefined(context);
         }

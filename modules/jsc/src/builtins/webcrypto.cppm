@@ -69,22 +69,106 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
     defineProperty(CryptoKey.prototype, "constructor", {
       configurable: false, enumerable: false, writable: false, value: CryptoKey,
     });
+    // WebIDL attributes are configurable accessors on the interface prototype;
+    // test-webcrypto-cryptokey-hidden-slots replaces all four with forged
+    // getters, so they must NOT be frozen shut. The *internal slots* stay in
+    // the frozen WeakMap metadata, which every internal consumer reads.
+    //
+    // `algorithm` and `usages` hand out a per-instance, identity-stable copy: the
+    // spec's "associated ... object" is created once per key, so
+    // `key.algorithm === key.algorithm`, and it is a copy so nothing a caller does
+    // to it can reach the internal slot.
+    //
+    // THE COPY MUST STAY MUTABLE. Do not freeze it. node's `key.algorithm` is a
+    // plain mutable object and the corpus pins that directly —
+    // `test-webcrypto-internal-slots.mjs` does
+    //
+    //     kp.publicKey.algorithm.name = 'ed25519';
+    //     assert.strictEqual(kp.publicKey.algorithm.name, 'ed25519');
+    //
+    // i.e. it writes a lowercase name and requires the write to stick. Freezing
+    // makes that assignment silently no-op in sloppy mode, so the getter keeps
+    // returning the normalised `'Ed25519'` and the file fails.
+    //
+    // This was tried and reverted. The reasoning that led there was: because the
+    // copies are cached, a mutable copy lets a caller permanently rewrite a key's
+    // JS-visible identity, so freezing looked like a security fix. It is not one,
+    // and the invariant that actually matters is a different one:
+    //
+    //     mutating the public copy must never change ENFORCEMENT.
+    //
+    // That already holds and is what the code is built for — the copy is a copy,
+    // so `type`/`extractable` (getters straight off the internal metadata) and the
+    // native usages are untouched; signing with a verify-only key still throws
+    // InvalidAccessError however the public `usages` array is rewritten. Freezing
+    // added no enforcement and cost a corpus file.
+    //
+    // `test_webcrypto.cpp`'s `__webcryptoMetadataAttack` case asserted
+    // `Object.isFrozen(key.algorithm)`. That assertion encoded a belief about node
+    // that is simply false, so it was restated as the enforcement invariant above
+    // rather than kept and satisfied. Trusting our own unit test over node's actual
+    // behaviour is what produced the regression.
+    const publicAlgorithm = new WeakMap();
+    const publicUsages = new WeakMap();
+    const copyAlgorithm = (value) => {
+      if (!value || typeof value !== "object") return value;
+      if (ArrayBuffer.isView(value)) return new value.constructor(value);
+      const out = {};
+      for (const name of Object.keys(value)) out[name] = copyAlgorithm(value[name]);
+      return out;
+    };
+    const cachedCopy = (cache, key, source, copy) => {
+      let cached = cache.get(key);
+      if (cached === undefined) {
+        cached = copy(source);
+        cache.set(key, cached);
+      }
+      return cached;
+    };
     defineProperty(CryptoKey.prototype, "type", {
-      configurable: false, enumerable: true, get() { return metadataFor(this).type; },
+      configurable: true, enumerable: true, get() { return metadataFor(this).type; },
     });
     defineProperty(CryptoKey.prototype, "extractable", {
-      configurable: false, enumerable: true, get() { return metadataFor(this).extractable; },
+      configurable: true, enumerable: true, get() { return metadataFor(this).extractable; },
     });
     defineProperty(CryptoKey.prototype, "algorithm", {
-      configurable: false, enumerable: true, get() { return metadataFor(this).algorithm; },
+      configurable: true, enumerable: true, get() {
+        return cachedCopy(publicAlgorithm, this, metadataFor(this).algorithm, copyAlgorithm);
+      },
     });
     defineProperty(CryptoKey.prototype, "usages", {
-      configurable: false, enumerable: true, get() { return metadataFor(this).usages; },
+      configurable: true, enumerable: true, get() {
+        return cachedCopy(publicUsages, this, metadataFor(this).usages, (u) => u.slice());
+      },
     });
     defineProperty(CryptoKey.prototype, Symbol.toStringTag, {
-      configurable: false, value: "CryptoKey",
+      configurable: true, value: "CryptoKey",
     });
-    freeze(CryptoKey.prototype);
+    // node's CryptoKey carries a [kInspect] that renders the *internal slots*,
+    // never the public getters — so a replaced getter or a mutated public
+    // algorithm/usages copy cannot forge the inspect output.
+    defineProperty(CryptoKey.prototype, Symbol.for("nodejs.util.inspect.custom"), {
+      configurable: true, enumerable: false, writable: true,
+      value: function inspectCryptoKey(depth, options, innerInspect) {
+        const metadata = keyMetadata.get(this);
+        if (!metadata) return this;
+        if (typeof depth === "number" && depth < 0) return "[CryptoKey]";
+        const view = {
+          type: metadata.type,
+          extractable: metadata.extractable,
+          algorithm: copyAlgorithm(metadata.algorithm),
+          usages: metadata.usages.slice(),
+        };
+        const util = G.__mbunNativeModules && G.__mbunNativeModules["util"];
+        const render = typeof innerInspect === "function" ? innerInspect :
+          (util && util.inspect);
+        if (typeof render !== "function") return "CryptoKey " + JSON.stringify(view);
+        const opts = Object.assign({}, options);
+        opts.depth = options && options.depth != null ? options.depth - 1 : null;
+        opts.customInspect = false;
+        return "CryptoKey " + render(view, opts);
+      },
+    });
     // node instantiates InternalCryptoKey, a subclass whose prototype chains to
     // CryptoKey.prototype and whose `constructor` still reports CryptoKey.
     // test-webcrypto-cryptokey-brand-check walks exactly that chain.
@@ -131,18 +215,49 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
     // OperationError (ref: bun/WebKit CryptoAlgorithm size guards). Checked before
     // the copy so an oversized buffer never gets duplicated.
     const MAX_BUFFER_BYTES = 0x7fffffff;
+    // A BufferSource is recognised STRUCTURALLY, not by prototype. A vm context
+    // hands back an ArrayBuffer whose prototype is that realm's, so `instanceof
+    // ArrayBuffer` misses it and a perfectly good buffer is rejected as
+    // ERR_INVALID_ARG_TYPE (test-crypto-subtle-cross-realm). The own byteLength
+    // getter reads the object's internal type, which is realm-independent — and
+    // it refuses a SharedArrayBuffer, which is the other half of the contract:
+    // WebCrypto must reject a shared backing store identically from either realm.
+    const abByteLength =
+      Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength").get;
+    const abSlice = ArrayBuffer.prototype.slice;
+    const sabByteLength = (() => {
+      if (typeof SharedArrayBuffer !== "function") return null;
+      const d = Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, "byteLength");
+      return (d && d.get) || null;
+    })();
+    // -1 for anything that is not an ArrayBuffer; a detached one reads as 0.
+    const arrayBufferBytes = (value) => {
+      try { return abByteLength.call(value); } catch (e) { return -1; }
+    };
+    const isSharedBuffer = (value) => {
+      if (!sabByteLength) return false;
+      try { sabByteLength.call(value); return true; } catch (e) { return false; }
+    };
+    const sharedNotAllowed = () => {
+      const err = new TypeError(
+        'The "data" argument is a view on a SharedArrayBuffer, which is not allowed.');
+      err.code = "ERR_INVALID_ARG_TYPE";
+      return err;
+    };
     const copyBytes = (value) => {
-      if (value instanceof ArrayBuffer) {
-        if (value.byteLength > MAX_BUFFER_BYTES) throw operationError("Data is too large");
+      const wholeBytes = arrayBufferBytes(value);
+      if (wholeBytes >= 0) {
+        if (wholeBytes > MAX_BUFFER_BYTES) throw operationError("Data is too large");
         // A detached (transferred) buffer reads as zero bytes in node rather
         // than throwing — the algorithm then fails with its own OperationError.
-        if (value.byteLength === 0) return new Uint8Array(0);
-        return new Uint8Array(value.slice(0));
+        if (wholeBytes === 0) return new Uint8Array(0);
+        return new Uint8Array(abSlice.call(value, 0));
       }
       if (ArrayBuffer.isView(value)) {
+        if (isSharedBuffer(value.buffer)) throw sharedNotAllowed();
         if (value.byteLength > MAX_BUFFER_BYTES) throw operationError("Data is too large");
         if (value.byteLength === 0) return new Uint8Array(0);
-        return new Uint8Array(value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength));
+        return new Uint8Array(abSlice.call(value.buffer, value.byteOffset, value.byteOffset + value.byteLength));
       }
       const err = new TypeError(
         'The "data" argument must be an instance of ArrayBuffer or ArrayBufferView.');
@@ -370,6 +485,13 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
       const isDerive = usage === "deriveBits" || usage === "deriveKey";
       const checkUsage = () => {
         if (metadata.usages.includes(usage)) return;
+        // The CFRG curves keep WebKit's wording: node's own cfrg derive tests only
+        // assert the InvalidAccessError name, while bun's corpus pins the message.
+        if (isDerive && (name === "X25519" || name === "X448")) {
+          throw domError(usage === "deriveBits" ? "CryptoKey doesn't support bits derivation"
+                                                : "CryptoKey doesn't support key derivation",
+            "InvalidAccessError");
+        }
         throw domError(isDerive ? "baseKey does not have " + usage + " usage"
                                 : "Unable to use this key to " + usage, "InvalidAccessError");
       };
@@ -1128,6 +1250,12 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
         }
 
         if (KMAC_ALGS.has(name)) {
+          // KmacImportParams.length is rejected at dictionary-conversion time, so
+          // an explicit 0 beats every later import check.
+          // ref: node lib/internal/crypto/webidl.js KmacImportParams converter.
+          if (alg.length !== undefined && Number(alg.length) === 0) {
+            throw dataError("KmacImportParams.length cannot be 0");
+          }
           if (!rawSecret && convertedFormat !== "jwk") throw unsupportedFormat();
           restrictUsages(usages, ["sign", "verify"], name);
           const raw = convertedFormat === "jwk" ? octFromJwk("sig") : copyBytes(keyData);
@@ -1478,6 +1606,13 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
         try { return Promise.resolve(body.apply(impl, args)); }
         catch (e) { return Promise.reject(e); }
       } }[method];
+      // The `...args` wrapper would otherwise report length 0 for every method.
+      // WebIDL's `length` is the number of REQUIRED arguments, which is exactly
+      // what the impl body's own arity is (its optional trailing parameters
+      // carry defaults), so hand it through.
+      defineProperty(wrapper, "length", {
+        configurable: true, value: typeof body === "function" ? body.length : 0,
+      });
       defineProperty(SubtleCrypto.prototype, method, {
         configurable: true, writable: true, enumerable: true, value: wrapper,
       });
@@ -1539,6 +1674,11 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
     defineProperty(Crypto.prototype, "subtle", {
       configurable: true, enumerable: true,
       get() { requireCrypto(this); return subtle; },
+      // A no-op setter, not a getter-only accessor: `crypto.subtle = 123` from
+      // strict-mode/module code must be ignored, not throw
+      // (test/js/web/crypto/web-crypto.test.ts "crypto.subtle setter should not
+      // throw"). The read still returns the real SubtleCrypto.
+      set() {},
     });
     defineProperty(Crypto.prototype, "getRandomValues", {
       configurable: true, writable: true, enumerable: true,
@@ -1586,10 +1726,41 @@ inline constexpr std::string_view kWebCryptoJS = R"JS(  // ---- WebCrypto ----
         extractable: metadata.extractable,
       };
     };
-    G.__mbunKeyObjectToCryptoKey = (kind, material, algorithm, extractable, keyUsages) =>
-      impl.importKey(kind === "secret" ? "raw-secret" : kind === "public" ? "spki" : "pkcs8",
+    G.__mbunKeyObjectToCryptoKey = (kind, material, algorithm, extractable, keyUsages) => {
+      // KeyObject.prototype.toCryptoKey reuses these import steps, but node routes
+      // it through importGenericSecretKey, whose extractable rejection is worded
+      // differently from the SubtleCrypto.importKey path below ("are not" vs
+      // "must not be"). Raise it here so importKey's shared string is untouched.
+      // ref: node lib/internal/crypto/keys.js importGenericSecretKey.
+      const name = typeof algorithm === "string" ? algorithm
+        : (algorithm != null && typeof algorithm === "object" ? algorithm.name : undefined);
+      const upper = typeof name === "string" ? name.toUpperCase() : "";
+      if (extractable && (upper === "PBKDF2" || upper === "HKDF")) {
+        throw domError(upper + " keys are not extractable", "SyntaxError");
+      }
+      return impl.importKey(kind === "secret" ? "raw-secret" : kind === "public" ? "spki" : "pkcs8",
         material, algorithm, extractable, keyUsages);
+    };
     G.__mbunIsCryptoKey = (value) => keyMetadata.has(value);
+    // structuredClone/worker transfer must produce a key with its OWN metadata
+    // entry. A generic property copy cannot: the instance carries no own
+    // properties (all state lives in `keyMetadata` and the object is
+    // preventExtensions'd), so the copy lands with the right prototype, no
+    // WeakMap entry, and every attribute getter throwing ERR_INVALID_THIS.
+    // Re-running makeKey also gives the spec's "untampered internal algorithm"
+    // for free, since the clone reads the frozen metadata rather than the
+    // caller-visible getters.
+    G.__mbunCryptoKeyClone = (key) => {
+      const metadata = keyMetadata.get(key);
+      if (!metadata) return undefined;
+      const extra = {};
+      for (const name of Object.keys(metadata)) {
+        if (name !== "type" && name !== "algorithm" && name !== "extractable" && name !== "usages") {
+          extra[name] = metadata[name];
+        }
+      }
+      return makeKey(metadata.type, metadata.algorithm, metadata.extractable, metadata.usages, extra);
+    };
     delete G.__mbunWebCryptoNative;
   }
 )JS";

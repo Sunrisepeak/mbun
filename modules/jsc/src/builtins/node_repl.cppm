@@ -57,7 +57,27 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
   const moduleMod = req("module");
   const CJSModule = moduleMod.Module || moduleMod;
 
-  const ERR = (code, Ctor, msg) => { const e = new Ctor(msg); e.code = code; return e; };
+  // node internal/errors.js: an E() error carries kIsNodeError, so both
+  // defaultPrepareStackTrace and NodeError#toString render the code into the
+  // header — `TypeError [ERR_X]: msg`. That header is what assert.throws(/ERR_X/)
+  // matches (it tests String(err)) and what this REPL's own writer() prints.
+  // mbun's `.stack` is pure JSC frames with no header line at all, so the header
+  // has to be PREPENDED; splicing would eat the first frame.
+  const ERR = (code, Ctor, msg) => {
+    const e = new Ctor(msg);
+    e.code = code;
+    const header = `${e.name} [${code}]: ${e.message}`;
+    try {
+      const st = e.stack;
+      e.stack = typeof st === "string" && st.length ? `${header}\n${st}` : header;
+    } catch { /* a throwing/readonly `stack` accessor is not fatal */ }
+    try {
+      Object.defineProperty(e, "toString", {
+        value: () => header, writable: true, configurable: true, enumerable: false,
+      });
+    } catch { /* frozen error: the stack header still carries the code */ }
+    return e;
+  };
   const ERR_MISSING_ARGS = (name) =>
     ERR("ERR_MISSING_ARGS", TypeError, `The "${name}" argument must be specified`);
   const ERR_INVALID_ARG_VALUE = (name, value, reason) =>
@@ -71,6 +91,229 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
 
   const isNativeError = (util.types && util.types.isNativeError) || (() => false);
   const isError = (e) => e instanceof Error || isNativeError(e);
+
+  // ── persistent history ────────────────────────────────────────────────────
+  // node lib/internal/repl/history.js ReplHistory, ported onto mbun's readline.
+  //
+  // The entries themselves stay in the Interface's own `this.history` array
+  // (newest first, exactly node's layout), so the line editor's up/down
+  // navigation is untouched and this class owns only what node's manager owns:
+  // the file handle, the 15ms write debounce that guards against pasted input,
+  // the `flushHistory` event a closing REPL waits on, and the `_historyPrev`
+  // override that explains why history is not being persisted.
+  //
+  // node's version drives fs.promises + FileHandle; mbun's file handles are
+  // the sync fd API, so each await point is kept but the I/O under it is
+  // synchronous. The observable protocol — pause/resume around init, isFlushing
+  // true from `line` until the debounced write lands, flushHistory emitted only
+  // when no timer remains — is node's.
+  const kDebounceHistoryMS = 15;
+  const kDefaultHistorySize = 30;
+
+  const replHistoryDisabledMessage =
+    "\nPersistent history support disabled. " +
+    "Set the NODE_REPL_HISTORY environment\nvariable to " +
+    "a valid, user-writable path to enable.\n";
+
+  class ReplHistory {
+    constructor(context, options) {
+      options = options || {};
+      if (options.history !== undefined && !Array.isArray(options.history)) {
+        throw ERR("ERR_INVALID_ARG_TYPE", TypeError,
+                  'The "history" argument must be an instance of Array. ' +
+                  `Received ${inspect(options.history)}`);
+      }
+      if (options.size !== undefined) {
+        if (typeof options.size !== "number" || Number.isNaN(options.size)) {
+          throw ERR("ERR_INVALID_ARG_TYPE", TypeError,
+                    'The "size" argument must be of type number. ' +
+                    `Received ${inspect(options.size)}`);
+        }
+        if (options.size < 0) {
+          throw ERR("ERR_OUT_OF_RANGE", RangeError,
+                    'The value of "size" is out of range. It must be >= 0. ' +
+                    `Received ${options.size}`);
+        }
+      }
+      let filePath = options.filePath;
+      if (typeof filePath === "string") filePath = filePath.trim();
+      this._path = filePath;
+      this._context = context;
+      this._timer = null;
+      this._writing = false;
+      this._pending = false;
+      this._fd = null;
+      this._isFlushing = false;
+      this._size = options.size !== undefined && options.size !== null
+        ? options.size
+        : (context.historySize !== undefined ? context.historySize : kDefaultHistorySize);
+      if (options.history) context.history = options.history;
+      this._removeDuplicates = !!options.removeHistoryDuplicates;
+      this.historyPrev = undefined;
+    }
+
+    get size() { return this._size; }
+    get isFlushing() { return this._isFlushing; }
+    get history() { return this._context.history; }
+    set history(value) { this._context.history = value; }
+    get index() { return this._context.historyIndex; }
+    set index(value) { this._context.historyIndex = value; }
+
+    // node writes through the Interface so the message lands above the prompt
+    // and the prompt is redrawn under it.
+    _writeToOutput(message) {
+      const ctx = this._context;
+      if (typeof ctx._writeToOutput === "function") {
+        ctx._writeToOutput(message);
+        if (typeof ctx._refreshLine === "function") ctx._refreshLine();
+      }
+    }
+
+    // Installed as `_historyPrev` whenever persistence could not be set up: the
+    // first `up` explains it, then the real navigation is restored.
+    _replHistoryMessage() {
+      if (!this._context.history || this._context.history.length === 0) {
+        this._writeToOutput(replHistoryDisabledMessage);
+      }
+      this._context._historyPrev = this.historyPrev;
+      return this._context._historyPrev();
+    }
+
+    _disable(onReadyCallback) {
+      this.historyPrev = this._context._historyPrev;
+      this._context._historyPrev = () => this._replHistoryMessage();
+      return onReadyCallback(null, this._context);
+    }
+
+    _resolveHistoryPath() {
+      if (!this._path) {
+        try {
+          this._path = path.join(req("os").homedir(), ".node_repl_history");
+          return this._path;
+        } catch {
+          return null;
+        }
+      }
+      return this._path;
+    }
+
+    initialize(onReadyCallback) {
+      // An empty string disables persistent history outright.
+      if (this._path === "") return this._disable(onReadyCallback);
+
+      if (!this._resolveHistoryPath()) {
+        this._writeToOutput("\nError: Could not get the home directory.\n" +
+                            "REPL session history will not be persisted.\n");
+        return this._disable(onReadyCallback);
+      }
+
+      this._context.pause();
+      Promise.resolve()
+        .then(() => this._initializeHistory(onReadyCallback))
+        .catch((err) => this._handleInitError(err, onReadyCallback));
+    }
+
+    async _initializeHistory(onReadyCallback) {
+      try {
+        // Touch the file first so it exists; history files are conventionally
+        // owner-only.
+        fs.closeSync(fs.openSync(this._path, "a+", 0o600));
+
+        let data;
+        try {
+          data = fs.readFileSync(this._path, "utf8");
+        } catch (err) {
+          return this._handleInitError(err, onReadyCallback);
+        }
+
+        this._context.history = data
+          ? data.split(/\r?\n+/).slice(0, this._size)
+          : [];
+
+        const fd = fs.openSync(this._path, "r+");
+        this._fd = fd;
+        fs.ftruncateSync(fd, 0);
+
+        this._onLineBound = () => this._onLine();
+        this._context.on("line", this._onLineBound);
+        this._context.once("exit", () => this._onExit());
+
+        this._context.once("flushHistory", () => {
+          if (!this._context.closed) {
+            this._context.resume();
+            onReadyCallback(null, this._context);
+          }
+        });
+
+        await this._flushHistory();
+      } catch (err) {
+        this._closeHandle();
+        return this._handleInitError(err, onReadyCallback);
+      }
+    }
+
+    _handleInitError(err, onReadyCallback) {
+      // Cannot open the history file. Don't crash — just don't persist.
+      this._writeToOutput("\nError: Could not open history file.\n" +
+                          "REPL session history will not be persisted.\n");
+      this._context.resume();
+      return this._disable(onReadyCallback);
+    }
+
+    _onLine() {
+      this._isFlushing = true;
+      if (this._timer) clearTimeout(this._timer);
+      this._timer = setTimeout(() => { this._flushHistory(); }, kDebounceHistoryMS);
+    }
+
+    async _flushHistory() {
+      this._timer = null;
+      if (this._writing) {
+        this._pending = true;
+        return;
+      }
+      this._writing = true;
+      const historyData = (this._context.history || []).join("\n");
+      try {
+        if (this._fd !== null) {
+          fs.writeSync(this._fd, historyData, 0, "utf8");
+          fs.ftruncateSync(this._fd, Buffer.byteLength(historyData, "utf8"));
+        }
+        this._writing = false;
+        if (this._pending) {
+          this._pending = false;
+          this._onLine();
+        } else {
+          this._isFlushing = !!this._timer;
+          if (!this._isFlushing) this._context.emit("flushHistory");
+        }
+      } catch {
+        this._writing = false;
+      }
+    }
+
+    _onExit() {
+      if (this._isFlushing) {
+        this._context.once("flushHistory", () => this._onExit());
+        return;
+      }
+      if (this._onLineBound) this._context.off("line", this._onLineBound);
+      this._closeHandle();
+    }
+
+    _closeHandle() {
+      if (this._fd !== null && this._fd !== undefined) {
+        const fd = this._fd;
+        this._fd = null;
+        try { fs.closeSync(fd); } catch { /* ignore */ }
+      }
+    }
+
+    closeHandle() {
+      this._closeHandle();
+      return Promise.resolve();
+    }
+  }
 
   // ── recoverability ────────────────────────────────────────────────────────
   // node uses acorn (internal/repl/utils.isRecoverableError): an error is
@@ -132,6 +375,67 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
     return "code";
   }
 
+  // True when the input ends with brackets still open and no mismatch on the
+  // way, i.e. acorn would have failed exactly at end-of-input. This has to be
+  // tracked separately because parseThrows uses `new Function(code)`, which
+  // appends a synthetic `}`: JSC then blames that token
+  // ("Unexpected token '}'. Expected ')' to end a compound expression") rather
+  // than reporting end-of-script, so `("a"` and `[1,2` look unrecoverable.
+  function unbalancedAtEof(code) {
+    const stack = [];
+    const pairs = { ")": "(", "]": "[", "}": "{" };
+    let i = 0;
+    const n = code.length;
+    while (i < n) {
+      const c = code[i];
+      if (c === "/" && code[i + 1] === "/") {
+        while (i < n && code[i] !== "\n") i++;
+        continue;
+      }
+      if (c === "/" && code[i + 1] === "*") {
+        i += 2;
+        while (i < n && !(code[i] === "*" && code[i + 1] === "/")) i++;
+        if (i >= n) return false; // an open comment is already handled above
+        i += 2;
+        continue;
+      }
+      if (c === '"' || c === "'") {
+        const quote = c;
+        i++;
+        while (i < n) {
+          if (code[i] === "\\") { i += 2; continue; }
+          if (code[i] === quote || code[i] === "\n") break;
+          i++;
+        }
+        if (i >= n) return false;
+        i++;
+        continue;
+      }
+      if (c === "`") {
+        // Template literals are reported by scanEofState; skip the whole thing.
+        i++;
+        let depth = 0;
+        while (i < n) {
+          if (code[i] === "\\") { i += 2; continue; }
+          if (depth === 0 && code[i] === "`") break;
+          if (code[i] === "$" && code[i + 1] === "{") { depth++; i += 2; continue; }
+          if (depth > 0 && code[i] === "}") { depth--; i++; continue; }
+          i++;
+        }
+        if (i >= n) return false;
+        i++;
+        continue;
+      }
+      if (c === "(" || c === "[" || c === "{") stack.push(c);
+      else if (c === ")" || c === "]" || c === "}") {
+        // A mismatch or a stray closer is a real error, never recoverable.
+        if (stack.pop() !== pairs[c]) return false;
+      }
+      i++;
+    }
+    return stack.length > 0;
+  }
+
   function parseThrows(code) {
     try {
       new Function(code);
@@ -155,9 +459,12 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
     if (state === "string") return false;
 
     const msg = String(err.message || "");
-    return msg.includes("Unexpected end of script") ||
-           msg.includes("Unexpected EOF") ||
-           msg.includes("Unexpected token ')'") === false && false;
+    if (msg.includes("Unexpected end of script") || msg.includes("Unexpected EOF")) {
+      return true;
+    }
+    // Brackets still open at end-of-input: acorn would have failed exactly
+    // there, so node reports this as recoverable and prompts with `| `.
+    return unbalancedAtEof(code);
   }
 
   function isValidSyntax(input) {
@@ -204,7 +511,11 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
   writer.options = {
     showHidden: false, depth: 2, colors: false, customInspect: true,
     showProxy: true, maxArrayLength: 100, maxStringLength: 10000,
-    breakLength: 128, compact: 3, sorted: false, getters: false,
+    // node: writer.options = { ...inspect.defaultOptions, showProxy: true },
+    // and inspectDefaultOptions.breakLength is 80 (internal/util/inspect.js).
+    // _handleError picks `Uncaught ` vs `Uncaught:\n` by comparing the error
+    // line against this number, so 128 collapsed two-line output into one.
+    breakLength: 80, compact: 3, sorted: false, getters: false,
     numericSeparator: false,
   };
 
@@ -266,8 +577,13 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
   // printing it, and `mbun -i` reported nothing at all for a throw.
   function userUncaughtExceptionListeners() {
     let n = 0;
-    for (const fn of process.listeners("uncaughtException")) {
-      if (fn !== captureHandler) n++;
+    // Indexed loop, not for-of: this runs on every REPL eval error, including the
+    // one raised by user code that just deleted Array.prototype[Symbol.iterator]
+    // (test-repl-unsafe-array-iteration), and a for-of would re-read it here and
+    // replace the user's TypeError with a crash in the error reporter itself.
+    const ls = process.listeners("uncaughtException");
+    for (let i = 0; i < ls.length; i++) {
+      if (ls[i] !== captureHandler) n++;
     }
     return n;
   }
@@ -308,18 +624,273 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
     return true;
   }
 
+  function isNotLegacyObjectPrototypeMethod(str) {
+    return isIdentifier(str) &&
+      str !== "__defineGetter__" &&
+      str !== "__defineSetter__" &&
+      str !== "__lookupGetter__" &&
+      str !== "__lookupSetter__";
+  }
+
   function filteredOwnPropertyNames(obj) {
     if (!obj) return [];
-    const filter = ALL_PROPERTIES;
+    // `Object.prototype` is the only non-contrived object that fulfills
+    // `Object.getPrototypeOf(X) === null &&
+    //  Object.getPrototypeOf(Object.getPrototypeOf(X.constructor)) === X`.
+    // Only on that object does node hide the legacy __define*__/__lookup*__
+    // accessors from completion.
+    let isObjectPrototype = false;
+    try {
+      if (Object.getPrototypeOf(obj) === null) {
+        const ctorDescriptor = Object.getOwnPropertyDescriptor(obj, "constructor");
+        if (ctorDescriptor && ctorDescriptor.value) {
+          const ctorProto = Object.getPrototypeOf(ctorDescriptor.value);
+          isObjectPrototype = !!ctorProto && Object.getPrototypeOf(ctorProto) === obj;
+        }
+      }
+    } catch { /* fall through as a plain object */ }
     let names;
     try {
       names = Object.getOwnPropertyNames(obj);
     } catch { return []; }
-    return names.filter(isIdentifier);
+    // node uses getOwnNonIndexProperties(obj, ALL_PROPERTIES | SKIP_SYMBOLS);
+    // getOwnPropertyNames already skips symbols, and isIdentifier rejects the
+    // array index keys, so the surviving set is the same.
+    return names.filter(
+      isObjectPrototype ? isNotLegacyObjectPrototypeMethod : isIdentifier);
   }
-  const ALL_PROPERTIES = 0;
 
   function getGlobalLexicalScopeNames() { return []; }
+
+  // node's addCommonWords: only words which do not yet exist as a global
+  // property. Pushed as its own group, and only when there is a filter.
+  const COMMON_WORDS = [
+    "async", "await", "break", "case", "catch", "const", "continue",
+    "debugger", "default", "delete", "do", "else", "export", "false",
+    "finally", "for", "function", "if", "import", "in", "instanceof", "let",
+    "new", "null", "return", "switch", "this", "throw", "true", "try",
+    "typeof", "var", "void", "while", "with", "yield",
+  ];
+  function addCommonWords(completionGroups) {
+    completionGroups.push(COMMON_WORDS.slice());
+  }
+
+  // node runs acorn over the line and walks the AST to find the trailing
+  // sub-expression that tab completion should evaluate
+  // (internal/repl/completion.js findExpressionCompleteTarget). The acorn copy
+  // node uses lives in deps/, which the `internal/*` -> lib/internal/* module
+  // mapping can never reach, so this is a reverse scanner over the same
+  // grammar: from the end of the line, walk left over an identifier fragment
+  // and then over as many `.`/`?.`-joined members as the text supports,
+  // matching (), [] and quotes backwards so computed keys such as
+  // `obj[lookupObj["a" + " b"]].toFi` stay part of the target.
+  const DECLARATION_KEYWORD_RE = /(?:^|[^\w$])(?:let|const|var)\s+$/;
+  function findExpressionCompleteTarget(code) {
+    if (!code) return null;
+
+    // A trailing `.` or `?.` cannot terminate an expression, so strip it, find
+    // the target of the rest, and put it back.
+    if (code.endsWith(".")) {
+      if (code.length >= 2 && code[code.length - 2] === "?") {
+        const inner = findExpressionCompleteTarget(code.slice(0, -2));
+        return !inner ? inner : `${inner}?.`;
+      }
+      const inner = findExpressionCompleteTarget(code.slice(0, -1));
+      return !inner ? inner : `${inner}.`;
+    }
+
+    // Walk left over the trailing identifier fragment being completed.
+    let i = code.length;
+    while (i > 0 && /[\w$]/.test(code[i - 1])) i--;
+    const identStart = i;
+
+    // `let a` / `const foo` / `var x`: a declaration with no initialiser has
+    // nothing to complete on, so node's AST walk returns null here.
+    if (DECLARATION_KEYWORD_RE.test(code.slice(0, identStart))) return null;
+
+    // Walk left over member accesses. A `.`/`?.` joiner is optional, because
+    // bracket accesses chain directly (`obj["a"]["b"]`).
+    let start = identStart;
+    for (;;) {
+      let j = start;
+      let afterDot = false;
+      if (j > 0 && code[j - 1] === ".") {
+        j--;
+        if (j > 0 && code[j - 1] === "?") j--;
+        afterDot = true;
+      } else if (!(j > 0 && (code[j - 1] === "]" || code[j - 1] === ")"))) {
+        break;
+      }
+      const k = consumeAtomBackwards(code, j);
+      if (k < 0 || k >= j) {
+        // A `.` whose left-hand side is not a completable base means the line
+        // is not a member expression at all — `{}.a` is a block followed by
+        // junk, which acorn rejects and node completes nothing for.
+        if (afterDot) return null;
+        break;
+      }
+      start = k;
+    }
+
+    const target = code.slice(start);
+    if (target === "" || target === "." || target === "?.") return null;
+
+    // node only evaluates a base that bottoms out at an identifier with
+    // literal property keys (see includesProxiesOrGetters). Anything that
+    // could run user code — a call, an assignment, an increment — makes the
+    // whole target ineligible, which is what keeps tab completion free of
+    // side effects for `incCounter().`, `a=(counter+=1).foo.` and
+    // `arr[incCounter()].b`. Grouping parens around a literal such as
+    // `("").a` carry no call and stay eligible.
+    const base = code.slice(start, identStart);
+    if (/[\w$\])]\s*\(/.test(base)) return null;
+    if (/=|\+\+|--|;/.test(base)) return null;
+
+    return target;
+  }
+
+  const isProxyValue = (util.types && util.types.isProxy) || (() => false);
+
+  // node's includesProxiesOrGetters, over the target string instead of an AST:
+  // split the base into its root identifier plus one step per property access,
+  // then walk it checking each step for an own getter or a Proxy. `true` means
+  // "do not evaluate this, completing it could run user code".
+  function includesProxiesOrGetters(expr, evalInRepl) {
+    const steps = splitMemberPath(expr);
+    if (!steps) return false;
+    let obj;
+    try { obj = evalInRepl(steps.root); } catch { return false; }
+    // The root itself may already be a Proxy (`proxyObj.<TAB>`), in which case
+    // enumerating it would run the handler's traps.
+    if (isProxyValue(obj)) return true;
+    for (const step of steps.props) {
+      if (obj === null || obj === undefined) return false;
+      let key = step.name;
+      if (step.computed) {
+        // A computed key is itself an expression; only evaluate it when it is
+        // literal enough to be side-effect free (findExpressionCompleteTarget
+        // has already rejected calls and assignments).
+        try { key = evalInRepl(step.name); } catch { return false; }
+        if (typeof key !== "string" && typeof key !== "number") return false;
+      }
+      // Check for a getter BEFORE reading the value, so that a property which
+      // does have one is never triggered by this very check.
+      let desc;
+      try { desc = Object.getOwnPropertyDescriptor(obj, key); } catch { return false; }
+      if (desc && typeof desc.get === "function") return true;
+      let value;
+      try { value = obj[key]; } catch { return false; }
+      if (isProxyValue(value)) return true;
+      obj = value;
+    }
+    return false;
+  }
+
+  // Split a member expression such as `a.b["c"]` into { root: "a", props: [...] }.
+  // Returns null when the expression is not a plain identifier-rooted chain.
+  function splitMemberPath(expr) {
+    let i = 0;
+    while (i < expr.length && /[\w$]/.test(expr[i])) i++;
+    if (i === 0) return null;
+    const root = expr.slice(0, i);
+    const props = [];
+    while (i < expr.length) {
+      if (expr[i] === "?" && expr[i + 1] === ".") i += 2;
+      else if (expr[i] === ".") i += 1;
+      else if (expr[i] === "[") {
+        const close = matchForwards(expr, i, "[", "]");
+        if (close < 0) return null;
+        props.push({ name: expr.slice(i + 1, close), computed: true });
+        i = close + 1;
+        continue;
+      } else return null;
+      const start = i;
+      while (i < expr.length && /[\w$]/.test(expr[i])) i++;
+      if (i === start) return null;
+      props.push({ name: expr.slice(start, i), computed: false });
+    }
+    return { root, props };
+  }
+
+  // Given code[start] === open, return the index of the matching close, or -1.
+  function matchForwards(code, start, open, close) {
+    let depth = 0;
+    for (let i = start; i < code.length; i++) {
+      const c = code[i];
+      if (c === "\"" || c === "'" || c === "`") {
+        let j = i + 1;
+        for (; j < code.length; j++) {
+          if (code[j] === "\\") { j++; continue; }
+          if (code[j] === c) break;
+        }
+        if (j >= code.length) return -1;
+        i = j;
+        continue;
+      }
+      if (c === open) depth++;
+      else if (c === close) {
+        depth--;
+        if (depth === 0) return i;
+      }
+    }
+    return -1;
+  }
+
+  // Consume one member-access "atom" ending just before index `end` and return
+  // the index it starts at, or -1 if there is no atom there. A bracket or paren
+  // group also swallows the identifier naming it, so `obj["k"]` is one atom.
+  function consumeAtomBackwards(code, end) {
+    let k = end;
+    const prev = k > 0 ? code[k - 1] : "";
+    if (prev === ")" || prev === "]") {
+      const open = prev === ")" ? "(" : "[";
+      k = matchBackwards(code, k - 1, open, prev);
+      if (k < 0) return -1;
+      while (k > 0 && /[\w$]/.test(code[k - 1])) k--;
+      return k;
+    }
+    if (prev === "\"" || prev === "'" || prev === "`") {
+      return matchQuoteBackwards(code, k - 1, prev);
+    }
+    if (/[\w$]/.test(prev)) {
+      while (k > 0 && /[\w$]/.test(code[k - 1])) k--;
+      return k;
+    }
+    return -1;
+  }
+
+  // Given code[end] === close, return the index of the matching open bracket,
+  // or -1. Skips over nested brackets and quoted strings.
+  function matchBackwards(code, end, open, close) {
+    let depth = 0;
+    for (let i = end; i >= 0; i--) {
+      const c = code[i];
+      if (c === "\"" || c === "'" || c === "`") {
+        i = matchQuoteBackwards(code, i, c);
+        if (i < 0) return -1;
+        continue;
+      }
+      if (c === close) depth++;
+      else if (c === open) {
+        depth--;
+        if (depth === 0) return i;
+      }
+    }
+    return -1;
+  }
+
+  // Given code[end] === quote, return the index of the opening quote, or -1.
+  function matchQuoteBackwards(code, end, quote) {
+    for (let i = end - 1; i >= 0; i--) {
+      if (code[i] !== quote) continue;
+      // Count preceding backslashes to tell an escaped quote from a real one.
+      let bs = 0;
+      let j = i - 1;
+      while (j >= 0 && code[j] === "\\") { bs++; j--; }
+      if (bs % 2 === 0) return i;
+    }
+    return -1;
+  }
 
   function commonPrefix(strings) {
     if (!strings || strings.length === 0) return "";
@@ -337,6 +908,12 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
     // List of completion lists, one for each inheritance "level"
     let completionGroups = [];
     let completeOn, group;
+
+    // node internal/repl/completion.js drops the leading indentation before it
+    // looks at anything, so a line that is only whitespace is treated as an
+    // empty line and still yields the full global completion (with completeOn
+    // "" rather than undefined).
+    line = line.trimStart();
 
     // REPL commands (e.g. ".break").
     let filter = "";
@@ -394,13 +971,16 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
       completionGroups.push(getReplBuiltinLibs().map((lib) => `node:${lib}`));
       completionGroups.push(getReplBuiltinLibs());
     } else if (line.length === 0 || /\w|\.|\$/.test(line[line.length - 1])) {
-      match = simpleExpressionRE.exec(line);
-      if (line.length !== 0 && !match) {
-        completionGroups.push([]);
-        completeOn = "";
-      } else {
+      const completeTarget =
+        line.length === 0 ? line : findExpressionCompleteTarget(line);
+      if (line.length !== 0 && !completeTarget) {
+        // No completable target (e.g. `let a`, or `{ a: true }`): node returns
+        // no completions at all, and leaves completeOn undefined.
+        return completionGroupsLoaded();
+      }
+      {
         let expr = "";
-        completeOn = match ? match[0] : "";
+        completeOn = completeTarget;
         if (line.length !== 0) {
           const lastIndex = completeOn.lastIndexOf(".");
           if (lastIndex > -1) {
@@ -410,42 +990,80 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
             filter = completeOn;
           }
         }
+        // Optional chaining: the split above leaves the `?` on the expression
+        // (`console?.lo` -> expr `console?`), so peel it off and remember that
+        // the member joiner is `?.` rather than `.`.
+        let chaining = ".";
+        if (expr.endsWith("?")) {
+          expr = expr.slice(0, -1);
+          chaining = "?.";
+        }
         if (!expr) {
-          const contextProto = this.useGlobal ? G : this.context;
-          let obj = contextProto;
-          const seen = new Set();
-          while (obj) {
-            for (const n of filteredOwnPropertyNames(obj)) seen.add(n);
-            try { obj = Object.getPrototypeOf(obj); } catch { break; }
+          // One group per inheritance level, exactly as node does: the
+          // prototype chain first (walked away from the context), then the
+          // context's own names, then the keywords. completionGroupsLoaded
+          // unshifts, so this array order comes out reversed — keywords
+          // nearest the cursor, the far end of the prototype chain last.
+          completionGroups.push(getGlobalLexicalScopeNames());
+          let contextProto = this.context;
+          while ((contextProto = Object.getPrototypeOf(contextProto)) !== null) {
+            completionGroups.push(filteredOwnPropertyNames(contextProto));
           }
-          completionGroups.push([...seen]);
-          completionGroups.push(KEYWORDS);
+          const contextOwnNames = filteredOwnPropertyNames(this.context);
+          if (!this.useGlobal) {
+            // When the context is not `global`, builtins are not own
+            // properties of it, so they have to be added back by name.
+            for (const name of globalBuiltinNames()) contextOwnNames.push(name);
+          }
+          completionGroups.push(contextOwnNames);
+          if (filter !== "") addCommonWords(completionGroups);
         } else {
+          const evalInRepl = (src) => this.useGlobal
+            ? (0, eval)(src)
+            : vm.runInContext(src, this.context, { displayErrors: false });
+          // node walks the member chain first and bails out entirely if any
+          // step reads through a getter or a Proxy, so that merely pressing
+          // TAB cannot trigger user code (internal/repl/completion.js
+          // includesProxiesOrGetters).
+          if (includesProxiesOrGetters(expr, evalInRepl)) {
+            return completionGroupsLoaded();
+          }
           let obj;
           try {
-            obj = this.useGlobal
-              ? (0, eval)(expr)
-              : vm.runInContext(expr, this.context, { displayErrors: false });
+            obj = evalInRepl(expr);
           } catch { obj = undefined; }
+          // node builds one group per inheritance level (memberGroups) so that
+          // own properties shadow the ones further up the chain instead of
+          // being merged into a single sorted list.
+          const memberGroups = [];
           if (obj != null) {
-            if (typeof obj === "object" || typeof obj === "function") {
-              try {
-                let p = obj;
-                const seen = new Set();
-                let depth = 0;
-                while (p && depth++ < 4) {
-                  for (const n of filteredOwnPropertyNames(p)) seen.add(n);
-                  p = Object.getPrototypeOf(p);
-                }
-                completionGroups.push([...seen]);
-              } catch { /* ignore */ }
-            } else {
-              const proto = Object.getPrototypeOf(obj);
-              if (proto) completionGroups.push(filteredOwnPropertyNames(proto));
+            try {
+              let p;
+              if (typeof obj === "object" || typeof obj === "function") {
+                memberGroups.push(filteredOwnPropertyNames(obj));
+                p = Object.getPrototypeOf(obj);
+              } else {
+                p = obj.constructor ? obj.constructor.prototype : null;
+              }
+              // Circular refs possible? Let's guard against that.
+              let sentinel = 5;
+              while (p !== null && p !== undefined && sentinel-- !== 0) {
+                memberGroups.push(filteredOwnPropertyNames(p));
+                p = Object.getPrototypeOf(p);
+              }
+            } catch {
+              // Maybe a Proxy object without `getOwnPropertyNames` trap.
+              // We simply ignore it here, as we don't want to break the
+              // autocompletion.
             }
           }
-          if (filter !== "") filter = `${expr}.${filter}`;
-          completionGroups = completionGroups.map((g) => g.map((m) => `${expr}.${m}`));
+          if (memberGroups.length) {
+            expr += chaining;
+            for (const g of memberGroups) {
+              completionGroups.push(g.map((member) => `${expr}${member}`));
+            }
+            if (filter !== "") filter = `${expr}${filter}`;
+          }
         }
       }
     }
@@ -456,32 +1074,38 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
       // Filter, sort (within each group), uniq and merge the completion groups.
       if (completionGroups.length && filter !== "") {
         const newCompletionGroups = [];
+        // node: "Filter is always case-insensitive following chromium
+        // autocomplete behavior." So `foo.b` offers `foo.BARbuz` too.
+        const lowerCaseFilter = filter.toLocaleLowerCase();
         for (const group3 of completionGroups) {
-          const filtered = group3.filter((elem) => elem.startsWith(filter));
+          const filtered = group3.filter(
+            (elem) => elem.toLocaleLowerCase().startsWith(lowerCaseFilter));
           if (filtered.length) newCompletionGroups.push(filtered);
         }
         completionGroups = newCompletionGroups;
       }
       const completions = [];
-      if (completionGroups.length) {
-        const uniqueSet = new Set();
-        const empty = Symbol("empty");
-        uniqueSet.add(empty);
-        for (const group4 of completionGroups) {
-          group4.sort((a, b) => (b < a ? 1 : -1));
-          const setSize = uniqueSet.size;
-          for (const entry of group4) {
-            if (!uniqueSet.has(entry)) {
-              completions.push(entry);
-              uniqueSet.add(entry);
-            }
+      // Unique completions across all groups. node seeds the set with "" so an
+      // empty entry inside a group can never be mistaken for a separator.
+      const uniqueSet = new Set();
+      uniqueSet.add("");
+      // Completion group 0 is the "closest" (least far up the inheritance
+      // chain) so its completions go LAST, to sit nearest the cursor in the
+      // REPL. That is why entries and separators are unshifted, not pushed.
+      for (const group4 of completionGroups) {
+        group4.sort((a, b) => (b > a ? 1 : -1));
+        const setSize = uniqueSet.size;
+        for (const entry of group4) {
+          if (!uniqueSet.has(entry)) {
+            completions.unshift(entry);
+            uniqueSet.add(entry);
           }
-          if (uniqueSet.size !== setSize) completions.push("");
         }
-        while (completions.length && completions[completions.length - 1] === "") {
-          completions.pop();
-        }
+        // Add a separator between groups.
+        if (uniqueSet.size !== setSize) completions.unshift("");
       }
+      // Remove obsolete group entry, if present.
+      if (completions[0] === "") completions.shift();
       callback(null, [completions, completeOn]);
     }
   }
@@ -947,36 +1571,22 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
     }
 
     setupHistory(historyConfig, cb) {
+      // node repl.js: `setupHistory(historyConfig, cb)` where historyConfig is
+      // either the plain file path (the long-standing programmatic form) or the
+      // options bag `{ filePath, size, onHistoryFileLoaded }`. Both build the
+      // ReplHistory manager and expose it as `repl.historyManager`.
       const options = typeof historyConfig === "string"
         ? { filePath: historyConfig } : (historyConfig || {});
-      const filePath = options.filePath;
       const onLoaded = typeof cb === "function" ? cb : options.onHistoryFileLoaded;
-      const done = (err) => {
-        if (typeof onLoaded === "function") {
-          process.nextTick(() => onLoaded(err || null, this));
-        }
-      };
-      if (!filePath) {
-        this._historyPrev = this._historyPrev;
-        done(null);
-        return;
-      }
-      this._historyFilePath = filePath;
-      try {
-        const data = fs.readFileSync(filePath, "utf8");
-        this.history = data.split("\n").filter(Boolean).reverse()
-          .slice(0, this.historySize);
-      } catch {
-        this.history = [];
-      }
-      const flush = () => {
-        try {
-          fs.writeFileSync(filePath, this.history.slice().reverse().join("\n"));
-        } catch { /* ignore */ }
-      };
-      this.on("line", flush);
-      this.once("exit", flush);
-      done(null);
+      const done = typeof onLoaded === "function" ? onLoaded : () => {};
+      this._historyFilePath = options.filePath;
+      this.historyManager = new ReplHistory(this, {
+        filePath: options.filePath,
+        size: options.size,
+        history: options.history,
+        removeHistoryDuplicates: this.removeHistoryDuplicates,
+      });
+      this.historyManager.initialize(done);
     }
 
     clearBufferedCommand() {
@@ -1015,8 +1625,21 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
         if (isError(e)) {
           if (e.stack) {
             if (e.name === "SyntaxError") {
+              // node drops every frame from a SyntaxError so the REPL prints
+              // just "Uncaught SyntaxError: <message>". Its regex only matches
+              // V8's `    at ...` frames, and — unlike V8 — a JSC `.stack`
+              // holds ONLY frames, with no leading "SyntaxError: msg" line:
+              // `eval@[native code]\n@REPL1:1:11\nglobal code@REPL1:1:1`.
+              // So every `name@source` line has to go too. Without this the
+              // surviving frames are consumed by the NEXT expectation in
+              // test-repl.js, which then stalls for the full timeout.
+              // The tail alternation (empty / [native code] / …:line:col) is
+              // deliberate, so a message line such as
+              // `SyntaxError: Unexpected token '@'` survives the strip.
               e.stack = e.stack.replace(/^REPL\d+:\d+\r?\n/, "")
-                .replace(/^\s+at\s.*\n?/gm, "");
+                .replace(/^\s+at\s.*\n?/gm, "")
+                .replace(/^[^\n]*@(?:\[native code\]|[^\n]*:\d+:\d+)?\r?$\n?/gm, "")
+                .replace(/\n+$/, "");
               const importErrorStr = "Cannot use import statement outside a module";
               if (String(e.message).includes(importErrorStr)) {
                 e.message = "Cannot use import statement inside the Node.js REPL, " +
@@ -1031,6 +1654,11 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
             }
           }
           errStack = this.writer(e);
+          // A user-supplied writer may return anything at all
+          // (test-repl-options passes a bare `function writer() {}`), and mbun
+          // can reach this path for a foreign uncaught error that node would
+          // never route into a REPL. Without this the indexing below threw.
+          if (typeof errStack !== "string") errStack = String(errStack);
           if (errStack[0] === "[" && errStack[errStack.length - 1] === "]") {
             errStack = errStack.slice(1, -1);
           }
@@ -1051,7 +1679,13 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
         const lines = errStack.split(/(?<=\n)/);
         let matched = false;
         errStack = "";
-        for (const line of lines) {
+        // Indexed loop, not for-of: this is the last step before the error text
+        // reaches the terminal, and it runs for errors raised by code that may
+        // have just deleted Array.prototype[Symbol.iterator]
+        // (test-repl-unsafe-array-iteration). A for-of here would throw inside the
+        // reporter and turn the user's TypeError into a REPL crash.
+        for (let li = 0; li < lines.length; li++) {
+          const line = lines[li];
           if (!matched && /^\[?([A-Z][a-z0-9_]*)*Error/.test(line)) {
             errStack += writer.options.breakLength >= line.length
               ? `Uncaught ${line}` : `Uncaught:\n${line}`;
@@ -1073,6 +1707,18 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
     }
 
     close() {
+      // node repl.js REPLServer.prototype.close: a terminal REPL must not tear
+      // the Interface down while a debounced history write is still pending,
+      // or the `close` listener runs before the entries reach disk. The next
+      // REPL to open the same NODE_REPL_HISTORY file then reads it empty —
+      // which is exactly how test-repl-history-navigation lost every entry
+      // test #1 had typed before test #2 tried to navigate them.
+      const hm = this.historyManager;
+      if (this.terminal && hm && hm.isFlushing && !this._closingOnFlush) {
+        this._closingOnFlush = true;
+        this.once("flushHistory", () => super.close());
+        return;
+      }
       process.nextTick(() => super.close());
     }
 
@@ -1091,6 +1737,16 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
           }
         }
         context.global = context;
+        // mbun's util.types.isProxy recognises a Proxy by having wrapped the
+        // global Proxy constructor and remembered every instance (see
+        // node_util_extra); a fresh vm context gets JSC's own unwrapped Proxy,
+        // so proxies built inside the REPL would be invisible to it. Share the
+        // host's wrapped constructor so the completer's getter/Proxy bail-out
+        // can actually see them.
+        try {
+          const hostProxy = Object.getOwnPropertyDescriptor(G, "Proxy");
+          if (hostProxy) Object.defineProperty(context, "Proxy", hostProxy);
+        } catch { /* leave the context's own Proxy in place */ }
         const _console = new Console(this.output);
         Object.defineProperty(context, "console", {
           configurable: true, writable: true, value: _console,
@@ -1461,6 +2117,55 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
 
   M["repl"] = replExports;
   M["node:repl"] = replExports;
+
+  // node's `internal/repl` and `internal/repl/await`, served from THIS repl.
+  //
+  // Under --expose-internals the corpus requires those two ids directly. Left
+  // alone they resolve, through compat/node/tsconfig.json's
+  // `"internal/*": ["./lib/internal/*"]`, to node's real lib files, and node's
+  // own chain then dies twice over: internal/repl/utils.js wants the acorn
+  // copy vendored under deps/ (not lib/internal/deps/, so the mapping can never
+  // reach it), and past that internal/vm.js wants a contextify binding that
+  // exposes ContextifyScript, which mbun's internalBinding("contextify") does
+  // not. Registering them as builtins short-circuits require() before the
+  // resolver runs (see builtin_module in runtime/process_extended.inc), so
+  // node's lib chain is bypassed entirely.
+  //
+  // Shape is node's: lib/internal/repl.js is `{ __proto__: REPL }` plus an own
+  // `createInternalRepl`, and lib/internal/repl/await.js exports exactly
+  // `{ processTopLevelAwait }`.
+  //
+  // GATED. `internal/*` is node-internal namespace: handing it to an ordinary
+  // program would let any script — or a package shipping its own
+  // `internal/repl` — be shadowed by this. So the two entries are accessors
+  // that yield the module only under node's own flag, --expose-internals, and
+  // `undefined` otherwise; builtin_module treats undefined as "not a builtin"
+  // and falls through to normal resolution. The check has to be lazy because
+  // the builtins image is evaluated before process.execArgv exists (same
+  // reason node_vm_modules gates vm.Module lazily). Non-enumerable so
+  // `Object.keys(M)` — the source of module.builtinModules — never lists them.
+  const exposeInternals = () => {
+    const argv = (G.process && G.process.execArgv) || [];
+    for (const a of argv) if (a === "--expose-internals") return true;
+    return false;
+  };
+  const internalRepl = Object.create(replExports);
+  Object.defineProperty(internalRepl, "createInternalRepl", {
+    value: createInternalRepl, writable: true, configurable: true, enumerable: true,
+  });
+  const internalReplAwait = { processTopLevelAwait };
+  for (const [id, value] of [["internal/repl", internalRepl],
+                             ["internal/repl/await", internalReplAwait]]) {
+    Object.defineProperty(M, id, {
+      get() { return exposeInternals() ? value : undefined; },
+      set(v) {
+        Object.defineProperty(M, id, {
+          value: v, writable: true, enumerable: false, configurable: true,
+        });
+      },
+      enumerable: false, configurable: true,
+    });
+  }
 })();
 )JS";
 

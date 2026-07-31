@@ -26,6 +26,25 @@
 // returned nullptr before this include was added). Must precede all WTF/JSC headers.
 #include <cmakeconfig.h>
 
+// macOS only, and a defect in the artifact's own config rather than a choice:
+// cmakeconfig.h:83 sets ENABLE_MEDIA_SOURCE 0 for this JSC-only build but says
+// nothing about COCOA_WEBM_PLAYER, so PlatformEnableCocoa.h:80 then turns that
+// one ON by Cocoa default -- and PlatformEnable.h:1052 asserts the combination
+// is impossible:
+//
+//     #if ENABLE(COCOA_WEBM_PLAYER) && !ENABLE(MEDIA_SOURCE)
+//     #error "ENABLE(COCOA_WEBM_PLAYER) requires ENABLE(MEDIA_SOURCE)"
+//
+// Both of PlatformEnableCocoa.h's defines are `#if !defined(...)` guarded, so
+// settling it here wins. Off, not on: this is a media-player feature, mbun uses
+// none of it, and unlike the WEBASSEMBLY case above it gates no JSC struct
+// member -- turning MEDIA_SOURCE on instead would diverge from the config the
+// shipped library was compiled with, which is the exact hazard cmakeconfig.h is
+// included to avoid.
+#if defined(__APPLE__) && !defined(ENABLE_COCOA_WEBM_PLAYER)
+#define ENABLE_COCOA_WEBM_PLAYER 0
+#endif
+
 // Global module fragment: the JSC C API header + JSC::initialize declaration
 // (external C++ symbol from the prebuilt product), mirroring jsc.cppm so the
 // header symbols stay in the global module with external linkage.
@@ -67,6 +86,11 @@
 // API leaves null (see engine.inc create_context_).
 #include <JavaScriptCore/GlobalObjectMethodTable.h>
 #include <JavaScriptCore/VM.h>
+// MicrotaskQueueInlines.h — MicrotaskQueue::performMicrotaskCheckpoint, i.e.
+// node's runMicrotasks(): exhaust the microtask queue WITHOUT the
+// unhandled-rejection checkpoint VM::drainMicrotasks() appends to it
+// (bindings_install.inc __mbunRunMicrotasksNative).
+#include <JavaScriptCore/MicrotaskQueueInlines.h>
 // JSDateMath.h (JSC::DateCache) + wtf/DateMath.h (WTF::setTimeZoneOverride):
 // assigning process.env.TZ has to invalidate the per-VM timezone cache, which
 // only these expose (runtime/process_base.inc proc_set_timezone_cb).
@@ -103,6 +127,17 @@
 #include <JavaScriptCore/Symbol.h>
 #include <JavaScriptCore/WeakHandleOwner.h>
 #include <JavaScriptCore/WeakInlines.h>
+// PORT-SOURCE: compat/bun/src/jsc/bindings/JSCTaskScheduler.cpp,
+// compat/bun/src/jsc/bindings/BunClientData.cpp:110-118.
+// JSC parks post-GC work -- JSFinalizationRegistry cleanup callbacks,
+// Atomics.waitAsync resumptions, async WebAssembly compile completions -- on
+// VM::deferredWorkTimer, a JSRunLoopTimer. mbun never runs WTF's RunLoop on
+// the JS thread, so that timer NEVER fires and the parked work is dropped on
+// the floor forever. bun does not run the RunLoop either; it replaces the
+// timer's dispatch with onAddPendingWork/onScheduleWorkSoon hooks that queue
+// into its own event loop. mbun's equivalent is to drain the timer's task
+// queue from its own pump (see mbun_drain_deferred_work).
+#include <JavaScriptCore/DeferredWorkTimer.h>
 #if !defined(_WIN32)
 #  include <dlfcn.h>  // dlopen/dlsym for .node addon loading
 #endif
@@ -184,5 +219,7 @@
 #  if defined(__linux__)
 #    include <sys/sysinfo.h>       // sysinfo() totalram/freeram/uptime/loads
 #    include <netpacket/packet.h>  // sockaddr_ll interface MAC address
+#  elif defined(__APPLE__)
+#    include <mach/mach.h>         // host_statistics64() vm page counts for os.freemem
 #  endif
 #endif

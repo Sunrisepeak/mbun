@@ -776,6 +776,57 @@ JSC_DEFINE_HOST_FUNCTION(peek_result_host,
     return JSC::JSValue::encode(p->result());
 }
 
+// ── AsyncLocalStorage frame storage owned by the ENGINE, not by JS ──────────
+//
+// SHARED SURFACE. This is the async-context seam the whole async_hooks layer
+// hangs off; anything that registers a callback reads through it.
+//
+// Why it cannot stay a JS closure variable (which is what
+// builtins/async_hooks.cppm used): `await` resumption happens *inside* the
+// engine. `.then`, `queueMicrotask` and the timers are JS-wrapped, so those
+// propagated the store correctly, but an async function's continuation is
+// scheduled by JSPromise.cpp and dispatched by JSMicrotask.cpp, which nothing
+// in JS can intercept — so `als.run(v, async () => { await 1; als.getStore() })`
+// saw `undefined` after the await.
+//
+// This prebuilt WebKit is Bun's fork with USE(BUN_JSC_ADDITIONS)=1 (see
+// prelude.hpp, which includes cmakeconfig.h for exactly this ABI reason), and
+// that fork already carries the machinery: JSGlobalObject holds an
+// InternalFieldTuple in m_asyncContextData, JSPromise.cpp snapshots field 0
+// when a reaction/await job is registered, and JSMicrotask.cpp writes it back
+// before running the job (its `restoreAsyncContext` local). The engine does the
+// propagation for free — it just needs the current frame to live in the tuple
+// instead of in a JS variable it cannot see.
+//
+// Tracking is enabled lazily (bun enables it when the first AsyncLocalStorage
+// is constructed) so a program that never touches ALS keeps the previous
+// zero-host-call path.
+JSC_DEFINE_HOST_FUNCTION(async_context_enable_host,
+                         (JSC::JSGlobalObject* global, JSC::CallFrame* frame)) {
+    (void)frame;
+    // A derived realm may not have had its tuple installed; report failure so
+    // the JS side keeps its own fallback rather than dropping stores silently.
+    if (global->m_asyncContextData.get() == nullptr) return JSC::JSValue::encode(JSC::jsBoolean(false));
+    global->setAsyncContextTrackingEnabled(true);
+    return JSC::JSValue::encode(JSC::jsBoolean(true));
+}
+
+JSC_DEFINE_HOST_FUNCTION(async_context_get_host,
+                         (JSC::JSGlobalObject* global, JSC::CallFrame* frame)) {
+    (void)frame;
+    JSC::InternalFieldTuple* tuple{global->m_asyncContextData.get()};
+    if (tuple == nullptr) return JSC::JSValue::encode(JSC::jsUndefined());
+    return JSC::JSValue::encode(tuple->getInternalField(0));
+}
+
+JSC_DEFINE_HOST_FUNCTION(async_context_set_host,
+                         (JSC::JSGlobalObject* global, JSC::CallFrame* frame)) {
+    JSC::InternalFieldTuple* tuple{global->m_asyncContextData.get()};
+    if (tuple == nullptr) return JSC::JSValue::encode(JSC::jsUndefined());
+    tuple->putInternalField(global->vm(), 0, native_arg(frame, 0));
+    return JSC::JSValue::encode(JSC::jsUndefined());
+}
+
 // ── bun:internal-for-testing string representation introspection ───────────
 
 // ref: bun src/jsc/bindings/JSCTestingHelpers.cpp jsFunctionIsUTF16String.

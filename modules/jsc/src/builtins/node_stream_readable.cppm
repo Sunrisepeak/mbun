@@ -832,6 +832,13 @@ inline constexpr std::string_view kNodeStreamReadableJS = R"JS(
     }
     Readable.prototype.resume = function() {
       const state = this._readableState;
+      // Node 26 (nodejs/node#62557) makes resume() a no-op on a destroyed
+      // stream. Narrowed to "nothing buffered": fd-slicer-style readables set
+      // `destroyed` right before push(null), and a full guard would strand
+      // their buffered tail when a piped dest drains (yauzl/extract-zip).
+      if ((state[kState] & kDestroyed) !== 0 && state.length === 0) {
+        return this;
+      }
       if ((state[kState] & kFlowing) === 0) {
         __debug("resume");
         state[kState] |= kHasFlowing;
@@ -865,6 +872,10 @@ inline constexpr std::string_view kNodeStreamReadableJS = R"JS(
     }
     Readable.prototype.pause = function() {
       const state = this._readableState;
+      // pause() is a no-op on a destroyed stream (nodejs/node#62557).
+      if ((state[kState] & kDestroyed) !== 0) {
+        return this;
+      }
       __debug("call pause");
       if ((state[kState] & (kHasFlowing | kFlowing)) !== kHasFlowing) {
         __debug("pause");

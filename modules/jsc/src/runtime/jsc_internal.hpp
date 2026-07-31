@@ -117,6 +117,27 @@ inline JSC::EncodedJSValue throw_plain_error(JSC::JSGlobalObject* global, std::s
     return JSC::encodedJSValue();
 }
 
+// Throw an `Error` that already carries node's `.code` (ERR_CRYPTO_INVALID_JWK,
+// ERR_CRYPTO_INVALID_CURVE, ...). node's crypto tests assert on `code`, never on
+// message text, so a validation failure detected natively has to arrive in JS
+// already classified — otherwise the thin JS layer can only re-derive the class
+// by string-matching an OpenSSL message, which is neither stable nor honest.
+inline JSC::EncodedJSValue throw_coded_error(JSC::JSGlobalObject* global, std::string_view code,
+                                             std::string_view msg) {
+    JSC::VM& vm{global->vm()};
+    auto scope{DECLARE_THROW_SCOPE(vm)};
+    JSContextRef ctx{toRef(global)};
+    JSValueRef message{make_string(ctx, msg)};
+    JSValueRef error{JSObjectMakeError(ctx, 1, &message, nullptr)};
+    if (JSObjectRef obj{JSValueToObject(ctx, error, nullptr)}) {
+        JSStringRef key{JSStringCreateWithUTF8CString("code")};
+        JSObjectSetProperty(ctx, obj, key, make_string(ctx, code), kJSPropertyAttributeNone, nullptr);
+        JSStringRelease(key);
+    }
+    scope.throwException(global, toJS(global, error));
+    return JSC::encodedJSValue();
+}
+
 inline void set_native_fn(JSContextRef ctx, JSObjectRef object, const char* name,
                           unsigned length, JSC::NativeFunction function) {
     JSC::JSGlobalObject* global{toJS(ctx)};

@@ -89,8 +89,12 @@ bool arg_bytes_view(JSContextRef ctx, std::size_t argc, const JSValueRef args[],
         p = static_cast<const std::uint8_t*>(JSObjectGetArrayBufferBytesPtr(ctx, obj, nullptr));
         n = JSObjectGetArrayBufferByteLength(ctx, obj, nullptr);
     } else {
+        // JSObjectGetTypedArrayBytesPtr answers the BUFFER base, not the view's
+        // first byte, so a subarray (Buffer#slice, chunk.subarray(mid)) must be
+        // offset by hand or it is read from the wrong place at the right length.
         p = static_cast<const std::uint8_t*>(JSObjectGetTypedArrayBytesPtr(ctx, obj, nullptr));
         n = JSObjectGetTypedArrayByteLength(ctx, obj, nullptr);
+        if (p != nullptr) p += JSObjectGetTypedArrayByteOffset(ctx, obj, nullptr);
     }
     if (p == nullptr) n = 0;
     return true;
@@ -1037,30 +1041,7 @@ JSValueRef fs_build_stat_object(JSContextRef ctx, const FsStatFields& f, JSValue
     JSStringRelease(src);
     return r;
 }
-#if !defined(_WIN32)
-// Fill FsStatFields from a POSIX struct stat (birthtime falls back to ctime;
-// real btime is filled by statx on Linux). Shared by lstat/fstat paths.
-void fs_fields_from_stat(const struct stat& st, FsStatFields& f) {
-    f.dev = static_cast<long long>(st.st_dev);
-    f.mode = static_cast<long long>(st.st_mode);
-    f.nlink = static_cast<long long>(st.st_nlink);
-    f.uid = static_cast<long long>(st.st_uid);
-    f.gid = static_cast<long long>(st.st_gid);
-    f.rdev = static_cast<long long>(st.st_rdev);
-    f.ino = static_cast<long long>(st.st_ino);
-    f.size = static_cast<long long>(st.st_size);
-    f.blksize = static_cast<long long>(st.st_blksize);
-    f.blocks = static_cast<long long>(st.st_blocks);
-    f.atimeNs = static_cast<long long>(st.st_atim.tv_sec) * 1000000000LL + st.st_atim.tv_nsec;
-    f.mtimeNs = static_cast<long long>(st.st_mtim.tv_sec) * 1000000000LL + st.st_mtim.tv_nsec;
-    f.ctimeNs = static_cast<long long>(st.st_ctim.tv_sec) * 1000000000LL + st.st_ctim.tv_nsec;
-    f.atimeMs = static_cast<double>(st.st_atim.tv_sec) * 1000.0 + static_cast<double>(st.st_atim.tv_nsec) / 1e6;
-    f.mtimeMs = static_cast<double>(st.st_mtim.tv_sec) * 1000.0 + static_cast<double>(st.st_mtim.tv_nsec) / 1e6;
-    f.ctimeMs = static_cast<double>(st.st_ctim.tv_sec) * 1000.0 + static_cast<double>(st.st_ctim.tv_nsec) / 1e6;
-    f.birthtimeMs = f.ctimeMs;  // overwritten by statx btime when available
-    f.birthtimeNs = f.ctimeNs;
-}
-#endif
+#include "fs_stat_fields.inc"
 JSValueRef fsn_stat_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                        const JSValueRef args[], JSValueRef* exc) {
     std::string path{fs_arg(ctx, argc, args, 0)};
@@ -1119,15 +1100,19 @@ JSValueRef fsn_stat_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t a
         return fs_throw(ctx, exc, "ENOENT: no such file or directory, stat '" + path + "'");
     }
     fs_fields_from_stat(st, f);
+#if defined(__linux__)
     // Linux struct stat has no st_birthtim; statx STATX_BTIME gives the real
     // creation time (node uses it — src/sys.rs). Fall back to ctime otherwise.
+    // macOS needs none of this: fs_fields_from_stat already read the real
+    // birthtime out of struct stat, and statx is a Linux syscall.
     struct statx stx{};
     if (::statx(AT_FDCWD, path.c_str(), useLstat ? AT_SYMLINK_NOFOLLOW : 0, STATX_BTIME, &stx) == 0
         && (stx.stx_mask & STATX_BTIME)) {
         f.birthtimeNs = static_cast<long long>(stx.stx_btime.tv_sec) * 1000000000LL + stx.stx_btime.tv_nsec;
         f.birthtimeMs = static_cast<double>(stx.stx_btime.tv_sec) * 1000.0 + static_cast<double>(stx.stx_btime.tv_nsec) / 1e6;
     }
-#endif
+#endif  // __linux__
+#endif  // !_WIN32
     return fs_build_stat_object(ctx, f, exc);
 }
 // node fs.fstatSync(fd): stat over an open descriptor. Real fields (birthtime
@@ -1165,11 +1150,15 @@ JSValueRef fsn_fstat_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t 
     if (::fstat(fd, &st) != 0)
         return fs_throw(ctx, exc, "EBADF: bad file descriptor, fstat");
     fs_fields_from_stat(st, f);
+#if defined(__linux__)
+    // Same as the stat path: statx supplies the btime Linux's struct stat lacks,
+    // and macOS already has it from fs_fields_from_stat.
     struct statx stx{};
     if (::statx(fd, "", AT_EMPTY_PATH, STATX_BTIME, &stx) == 0 && (stx.stx_mask & STATX_BTIME)) {
         f.birthtimeNs = static_cast<long long>(stx.stx_btime.tv_sec) * 1000000000LL + stx.stx_btime.tv_nsec;
         f.birthtimeMs = static_cast<double>(stx.stx_btime.tv_sec) * 1000.0 + static_cast<double>(stx.stx_btime.tv_nsec) / 1e6;
     }
+#endif
     return fs_build_stat_object(ctx, f, exc);
 #endif
 }
@@ -1791,6 +1780,9 @@ JSC_DEFINE_HOST_FUNCTION(fdn_close_host, (JSC::JSGlobalObject* global, JSC::Call
 // position < 0 → current-cursor read/write; otherwise positioned (pread/pwrite).
 struct FdIoArgs {
     mbun::core::io::File* file{nullptr};
+    // Set INSTEAD of `file` for a descriptor the virtual table does not own; the
+    // syscall then goes through fd_raw_io (see io_fd_raw.inc).
+    int rawFd{-1};
     std::byte* base{nullptr};
     std::size_t len{0};
     double pos{-1};
@@ -1812,14 +1804,20 @@ JSC::EncodedJSValue fd_throw_errno_nopath(JSC::JSGlobalObject* global, int e,
     return JSC::encodedJSValue();
 }
 
+#include "io_fd_raw.inc"
+
 std::optional<FdIoArgs> fd_io_args(JSC::JSGlobalObject* global, JSC::CallFrame* frame,
                                    const char* syscall) {
     if (frame->argumentCount() < 2) return std::nullopt;
     const int fd{static_cast<int>(fd_num(global, frame->argument(0)))};
     auto it{fd_table().find(fd)};
-    if (it == fd_table().end()) {
-        fd_throw_errno_nopath(global, EBADF, syscall);
-        return std::nullopt;
+    int rawFd{-1};
+    if (it == fd_table().end() || !it->second.is_open()) {
+        if (!fd_raw_eligible(fd)) {
+            fd_throw_errno_nopath(global, EBADF, syscall);
+            return std::nullopt;
+        }
+        rawFd = fd;
     }
     JSC::JSValue bufV{frame->argument(1)};
     JSC::JSArrayBufferView* view{
@@ -1849,7 +1847,8 @@ std::optional<FdIoArgs> fd_io_args(JSC::JSGlobalObject* global, JSC::CallFrame* 
     if (len > cap - off) len = cap - off;
     double pos{-1};
     if (posV.isNumber()) pos = posV.asNumber();
-    return FdIoArgs{.file = &it->second, .base = base + off, .len = len, .pos = pos};
+    return FdIoArgs{.file = rawFd >= 0 ? nullptr : &it->second, .rawFd = rawFd,
+                    .base = base + off, .len = len, .pos = pos};
 }
 
 JSC_DEFINE_HOST_FUNCTION(fdn_read_host, (JSC::JSGlobalObject* global, JSC::CallFrame* frame)) {
@@ -1863,6 +1862,8 @@ JSC_DEFINE_HOST_FUNCTION(fdn_read_host, (JSC::JSGlobalObject* global, JSC::CallF
     // corpus accepts EFBIG/EOVERFLOW for such positions — report EOVERFLOW
     // rather than a bare EIO string with no `code` on it.
     if (a->pos > 9007199254740992.0) return fd_throw_errno(global, EOVERFLOW, "read", "");
+    if (a->file == nullptr)
+        return fd_raw_io(global, a->rawFd, out.data(), out.size(), a->pos, false, "read");
     auto r{a->pos >= 0 ? a->file->read_at(static_cast<std::uint64_t>(a->pos), out)
                        : a->file->read(out)};
     if (!r) {
@@ -1881,6 +1882,8 @@ JSC_DEFINE_HOST_FUNCTION(fdn_write_host, (JSC::JSGlobalObject* global, JSC::Call
     if (!a) return JSC::JSValue::encode(JSC::jsNumber(0));
     std::span<const std::byte> in{a->base, a->len};
     if (a->pos > 9007199254740992.0) return fd_throw_errno(global, EOVERFLOW, "write", "");
+    if (a->file == nullptr)
+        return fd_raw_io(global, a->rawFd, a->base, a->len, a->pos, true, "write");
     auto r{a->pos >= 0 ? a->file->write_at(static_cast<std::uint64_t>(a->pos), in)
                        : a->file->write(in)};
     if (!r) {
@@ -1933,6 +1936,10 @@ JSC_DEFINE_HOST_FUNCTION(fdn_ftruncate_host, (JSC::JSGlobalObject* global, JSC::
     return JSC::JSValue::encode(JSC::jsUndefined());
 #endif
 }
+
+// bun:internal-for-testing memfd_create(size) → fd, in its own slice so
+// this file stays inside the structural line budget.
+#include "io_memfd.inc"
 
 // bun:internal-for-testing createSocketPair() → [readFd, writeFd]. A connected
 // AF_UNIX SOCK_STREAM pair, both non-blocking and adopted into the virtual fd

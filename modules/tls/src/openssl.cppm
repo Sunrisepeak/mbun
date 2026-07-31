@@ -95,6 +95,22 @@ public:
     [[nodiscard]] std::string peer_certificate_pem() const;
     // SSL_get_verify_result == X509_V_OK — node's socket.authorized.
     [[nodiscard]] bool verify_ok() const noexcept;
+    // node's socket.authorizationError: the X509_V_ERR_* the chain verification
+    // ended on, spelled the way node spells it (the macro name minus the
+    // X509_V_ERR_ prefix, e.g. "UNABLE_TO_VERIFY_LEAF_SIGNATURE").
+    // PORT-SOURCE: compat/node/src/crypto/crypto_common.cc X509ErrorCode.
+    // Empty when the chain verified. Reporting this does not decide anything:
+    // whether an unverified peer is admitted is the caller's rejectUnauthorized,
+    // which is enforced before this is ever read.
+    [[nodiscard]] std::string verify_error_code() const;
+    // node's TLSSocket.getSharedSigalgs() — the signature algorithms both peers
+    // offered (SSL_get_shared_sigalgs), in node's "RSA-PSS+SHA384" spelling.
+    // Server side only; empty before the handshake completes.
+    [[nodiscard]] std::vector<std::string> shared_sigalgs() const;
+    // node's TLSSocket.setMaxSendFragment(size) — SSL_set_max_send_fragment.
+    // Returns false when OpenSSL refuses the size (its documented 512..16384
+    // range), which is exactly what node reports to the caller.
+    bool set_max_send_fragment(std::size_t size) noexcept;
     // Negotiated ALPN protocol (SSL_get0_alpn_selected), empty if none.
     [[nodiscard]] std::string alpn_protocol() const;
     // Drain the NSS-format key-material lines OpenSSL has produced so far, each
@@ -158,6 +174,43 @@ public:
 export std::string check_key_cert_pair(std::string_view certPem, std::string_view keyPem,
                                        std::string_view passphrase,
                                        std::string_view ciphers = {});
+
+// node's `pfx` option: a PKCS#12 archive carrying the certificate, its private
+// key and any chain certificates in one DER blob. node loads it in
+// SecureContext::SetPFX and it is a HARD FAILURE if it cannot — an unreadable
+// archive means the caller has no credentials at all, which must be said at
+// createSecureContext() time rather than discovered as a handshake failure.
+//
+// PORT-SOURCE: compat/node/src/crypto/crypto_context.cc:2140-2249
+// SecureContext::SetPFX. The failure taxonomy is node's, exactly:
+//   - no private key in the archive  → ERR_CRYPTO_OPERATION_FAILED
+//                                      "Unable to load private key from PFX data"
+//   - no certificate in the archive  → ERR_CRYPTO_OPERATION_FAILED
+//                                      "Unable to load certificate from PFX data"
+//   - OpenSSL 3 reason ERR_R_UNSUPPORTED (what a legacy RC2/40-bit archive
+//     produces once the legacy provider is not loaded)
+//                                    → ERR_CRYPTO_UNSUPPORTED_OPERATION
+//                                      "Unsupported PKCS12 PFX data"
+//   - anything else                  → a plain Error carrying OpenSSL's own
+//                                      reason string (a wrong passphrase reads
+//                                      as "mac verify failure").
+//
+// `passphrase` decrypts the archive; empty means the EMPTY password, never a
+// prompt. The recovered key is handed back as an UNENCRYPTED PEM because that is
+// the form the rest of this layer consumes — it is the same secret that was
+// already resident in the caller's own `pfx` buffer, in the same process, and it
+// is never written anywhere.
+export struct PfxCredentials {
+    std::string certPem {};                // the leaf certificate
+    std::string keyPem {};                 // its private key, unencrypted PEM
+    std::vector<std::string> caPems {};    // chain / CA certificates, in archive order
+    // Empty errorMessage == success. errorCode is the node error code to attach,
+    // or empty for a plain Error (node's `env->ThrowError(reason)` path).
+    std::string errorMessage {};
+    std::string errorCode {};
+};
+
+export PfxCredentials parse_pfx(std::span<const std::uint8_t> der, std::string_view passphrase);
 
 // Every certificate in the platform trust store, as PEM. node ships the Mozilla
 // NSS root set in src/node_root_certs.h and exposes it as tls.rootCertificates;

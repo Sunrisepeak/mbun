@@ -12,6 +12,14 @@
 //     127.0.0.1 server (no external network): framing, redirects, transport
 //     failures, and — the whole point — that requests actually overlap.
 
+// LINUX-ONLY, and deliberately so until the Darwin path is debugged: with
+// runtime_socket ported off linux this file's in-process server does real
+// async HTTP over kqueue, and on macOS it HANGS -- it is the first
+// modules/install test and the macOS CI Test step times out there. The
+// narrower vectors are left unguarded on purpose (test_epoll_backend's 28
+// real-fd contract checks, test_epoll_socket_backend, test_http1_server,
+// test_serve_native_smoke) precisely so they can say whether the fault is in
+// the kqueue backend itself or above it. Widen this one back once they have.
 #if defined(__linux__)
 #include <cerrno>
 #include <netinet/in.h>

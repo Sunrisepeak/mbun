@@ -105,11 +105,23 @@ const {
 // The host's stringWidth reports UTF-16/code-point length for several wide
 // characters. readline's cursor and completion grid use terminal cells, so
 // keep the node wcwidth rules here rather than inheriting that host detail.
+// Emoji-presentation / emoji-modifier code points, the only ones a zero-width
+// joiner may bind into a single cluster.
+const isEmojiCodePoint = (cp) =>
+  (cp >= 0x1f000 && cp <= 0x1faff) || (cp >= 0x2600 && cp <= 0x27bf) ||
+  cp === 0x2b50 || cp === 0x2b55 || (cp >= 0x2190 && cp <= 0x21ff) ||
+  (cp >= 0x2b00 && cp <= 0x2bff);
 const internalGetStringWidth = (value) => {
   const text = stripANSI(String(value));
   let width = 0;
+  // ICU collapses an emoji ZWJ sequence to the width of its first emoji: the
+  // joined glyph occupies one grapheme cluster on the terminal. Track the
+  // previous code point so a joiner can swallow the emoji that follows it.
+  let previous = 0;
   for (const char of text) {
     const cp = char.codePointAt(0);
+    if (previous === 0x200d && isEmojiCodePoint(cp)) continue;
+    previous = cp;
     if (cp === 0 || cp < 0x20 || (cp >= 0x7f && cp < 0xa0) || cp === 0x200d ||
         cp === 0x200e || cp === 0x200f || (cp >= 0x300 && cp <= 0x36f) ||
         (cp >= 0x1ab0 && cp <= 0x1aff) || (cp >= 0x1dc0 && cp <= 0x1dff) ||
@@ -524,6 +536,15 @@ var kHistorySize = 30;
 var kMaxUndoRedoStackSize = 2048;
 var kMincrlfDelay = 100;
 var lineEnding = /\r?\n|\r(?!\n)/g;
+// node lib/internal/readline/utils.js reverseString: split on `from`, emit the
+// parts in reverse order joined by `to`. Round-trips, so ("\n","\r") on the way
+// into the history array and ("\r","\n") on the way back out.
+function reverseHistoryLine(line, from, to) {
+  const parts = line.split(from);
+  let result = "";
+  for (let i = parts.length - 1; i > 0; i--) result += parts[i] + to;
+  return result + parts[0];
+}
 var kMaxLengthOfKillRing = 32;
 var kLineObjectStream = Symbol("line object stream");
 var kQuestionCancel = Symbol("kQuestionCancel");
@@ -830,17 +851,27 @@ var _Interface = class Interface extends InterfaceConstructor {
     if (this.historySize === 0) return line;
     if (StringPrototypeTrim.call(line).length === 0) return line;
     const history = this.history;
+    // A multiline submission occupies ONE history slot. Because the history
+    // file is newest-entry-first, node stores such an entry with its lines
+    // reversed and joined by '\r', so the file stays newest-first line by line
+    // (lib/internal/repl/history.js kNormalizeLineEndings via
+    // lib/internal/readline/utils.js reverseString). Identity for a
+    // single-line entry, so dedup and the 'history' event are unchanged for
+    // every non-multiline commit.
+    const normalized = reverseHistoryLine(line, "\n", "\r");
     const historyEmpty = history.length === 0;
-    if (historyEmpty || history[0] !== line) {
+    if (historyEmpty || history[0] !== normalized) {
       if (this.removeHistoryDuplicates) {
-        var dupIndex = ArrayPrototypeIndexOf.call(history, line);
+        var dupIndex = ArrayPrototypeIndexOf.call(history, normalized);
         if (dupIndex !== -1) ArrayPrototypeSplice.call(history, dupIndex, 1);
       }
-      ArrayPrototypeUnshift.call(history, line);
+      ArrayPrototypeUnshift.call(history, normalized);
       if (history.length > this.historySize) ArrayPrototypePop.call(history);
     }
     this.historyIndex = -1;
-    const latest = this.history[0];
+    // The `line` event must still see the text the user typed, so undo the
+    // normalisation on the way out.
+    const latest = reverseHistoryLine(this.history[0], "\r", "\n");
     this.emit("history", this.history);
     return latest;
   }

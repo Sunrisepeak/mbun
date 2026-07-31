@@ -70,7 +70,34 @@ private:
     string                   out_;
     int                      indent_{0};
 
+    // Logical border-radius longhands lowered out of the block by
+    // collect_logical_radius_ and re-emitted as :dir(ltr)/:dir(rtl) rules.
+    struct LogicalRadius {
+        string_view ltr;   // physical property under a left-to-right direction
+        string_view rtl;   // ...and under right-to-left
+        string      value; // already-printed value text, "!important" included
+    };
+    std::vector<LogicalRadius> logical_{};
+    // Only a style rule's OWN declaration block is lowered: a nested (CSS
+    // nesting) block has a different selector, so its logical decls must not be
+    // hoisted into the outer rule's :dir() clones. Off by default.
+    bool lowerLogical_{false};
+    // Segments the most recent lowered declaration block actually printed.
+    size_t lastBlockDecls_{0};
+
     string_view text_(const Token& t) const { return src_.substr(t.start, t.end - t.start); }
+
+    // border-{start,end}-{start,end}-radius resolve to different physical
+    // corners per writing direction, so one declaration becomes two rules.
+    // ref: bun/lightningcss properties/border_radius.rs flush() + logical.rs.
+    // ref: regression 25785, 27458.
+    static bool logical_radius_map_(string_view name, string_view& ltr, string_view& rtl) {
+        if (ieq(name, "border-start-start-radius")) { ltr = "border-top-left-radius"; rtl = "border-top-right-radius"; return true; }
+        if (ieq(name, "border-start-end-radius")) { ltr = "border-top-right-radius"; rtl = "border-top-left-radius"; return true; }
+        if (ieq(name, "border-end-start-radius")) { ltr = "border-bottom-left-radius"; rtl = "border-bottom-right-radius"; return true; }
+        if (ieq(name, "border-end-end-radius")) { ltr = "border-bottom-right-radius"; rtl = "border-bottom-left-radius"; return true; }
+        return false;
+    }
 
     // low-level writers (printer.rs analogues)
     void w(string_view s) { out_ += s; }
@@ -513,6 +540,12 @@ private:
             }
 
             // block rule
+            // Rewind point: a style rule whose every declaration was lowered to
+            // :dir() clones must not leave an empty `.sel { }` behind — bun's
+            // 27458 asserts the FIRST block already carries the four physical
+            // properties.
+            const size_t outMark = out_.size();
+            const bool prevFirstEmitted = firstEmitted;
             if (firstEmitted) {
                 if (top) {
                     // Blank separator line: a bare '\n' first, so the empty line
@@ -556,8 +589,17 @@ private:
                     print_decl_block_(bodyBegin, bodyEnd);
                 }
             } else {
+                lowerLogical_ = true;
+                logical_.clear();
+                lastBlockDecls_ = 0;
                 write_prelude(ruleStart, bracePos);
                 print_decl_block_(bodyBegin, bodyEnd);
+                lowerLogical_ = false;
+                if (!logical_.empty() && lastBlockDecls_ == 0) {
+                    out_.resize(outMark);
+                    firstEmitted = prevFirstEmitted;
+                }
+                flush_logical_radius_(ruleStart, bracePos, firstEmitted, top);
             }
             i = (bodyEnd < end) ? bodyEnd + 1 : end;
         }
@@ -619,6 +661,24 @@ private:
             }
         }
 
+        // Lower logical border-radius longhands out of the block BEFORE the
+        // trailing-';' accounting runs — they are re-emitted by the caller as
+        // :dir() rules, so leaving them in segs would mis-count the last decl.
+        if (lowerLogical_) {
+            std::vector<Seg> kept;
+            kept.reserve(segs.size());
+            for (const Seg& sg : segs) {
+                string_view ltr, rtl;
+                if (!sg.isRule && decl_is_logical_radius_(sg.b, sg.e, ltr, rtl)) {
+                    logical_.push_back(LogicalRadius{ltr, rtl, capture_decl_value_(sg.b, sg.e)});
+                    continue;
+                }
+                kept.push_back(sg);
+            }
+            segs.swap(kept);
+            lastBlockDecls_ = segs.size();
+        }
+
         whitespace();
         wc('{');
         indent_ += 2;
@@ -632,7 +692,10 @@ private:
                 size_t rb = sg.braceRel + 1;
                 size_t re = match_close(sg.braceRel, end);
                 write_prelude(sg.b, sg.braceRel);
+                const bool savedLower = lowerLogical_;
+                lowerLogical_ = false;
                 print_decl_block_(rb, re);
+                lowerLogical_ = savedLower;
             } else {
                 print_declaration_(sg.b, sg.e);
                 bool last = (s == segs.size() - 1);
@@ -643,6 +706,88 @@ private:
         indent_ -= 2;
         newline();
         wc('}');
+    }
+
+    // Locate a declaration's top-level ':'; end when there is none (malformed).
+    size_t decl_colon_(size_t begin, size_t end) const {
+        int depthP = 0, depthS = 0;
+        for (size_t k = begin; k < end; k++) {
+            Tk kk = toks_[k].kind;
+            if (kk == Tk::OpenParen || kk == Tk::Function) depthP++;
+            else if (kk == Tk::CloseParen) { if (depthP) depthP--; }
+            else if (kk == Tk::OpenSquare) depthS++;
+            else if (kk == Tk::CloseSquare) { if (depthS) depthS--; }
+            else if (kk == Tk::Colon && depthP == 0 && depthS == 0) return k;
+        }
+        return end;
+    }
+
+    // True when the declaration's property is a logical border-radius longhand.
+    bool decl_is_logical_radius_(size_t begin, size_t end, string_view& ltr, string_view& rtl) {
+        size_t colon = decl_colon_(begin, end);
+        if (colon == end) return false;
+        size_t nameBeg = skip_ws(begin, colon);
+        size_t nameEnd = colon;
+        while (nameEnd > nameBeg && is_ws_tok(toks_[nameEnd - 1].kind)) nameEnd--;
+        // A logical longhand is always exactly one ident token.
+        if (nameEnd != nameBeg + 1 || toks_[nameBeg].kind != Tk::Ident) return false;
+        return logical_radius_map_(text_(toks_[nameBeg]), ltr, rtl);
+    }
+
+    // Render just the value half of a declaration (plus !important) through the
+    // normal value printer, by borrowing the output buffer.
+    string capture_decl_value_(size_t begin, size_t end) {
+        size_t colon = decl_colon_(begin, end);
+        if (colon == end) return {};
+        size_t vBeg = colon + 1;
+        size_t vEnd = end;
+        bool important = detect_important_(vBeg, vEnd);
+        string saved;
+        saved.swap(out_);
+        std::vector<ValItem> val = build_value(vBeg, vEnd);
+        write_value(val);
+        if (important) {
+            whitespace();
+            w("!important");
+        }
+        string captured;
+        captured.swap(out_);
+        out_.swap(saved);
+        return captured;
+    }
+
+    // Emit the deferred logical radius declarations as a :dir(ltr)/:dir(rtl)
+    // pair cloned from the rule's own selector.
+    void flush_logical_radius_(size_t preludeBegin, size_t preludeEnd, bool& firstEmitted, bool top) {
+        if (logical_.empty()) return;
+        std::vector<LogicalRadius> pending;
+        pending.swap(logical_);
+        for (const char* dir : {"ltr", "rtl"}) {
+            bool isLtr = dir[0] == 'l';
+            if (firstEmitted) {
+                if (top && !minify_) out_ += '\n';
+                newline();
+            }
+            firstEmitted = true;
+            write_prelude(preludeBegin, preludeEnd);
+            w(":dir(");
+            w(dir);
+            wc(')');
+            whitespace();
+            wc('{');
+            indent_ += 2;
+            for (size_t n = 0; n < pending.size(); n++) {
+                newline();
+                w(isLtr ? pending[n].ltr : pending[n].rtl);
+                wc(':');
+                whitespace();
+                w(pending[n].value);
+                if (n + 1 != pending.size() || !minify_) wc(';');
+            }
+            indent_ -= 2;
+            newline();
+            wc('}');
+        }
     }
 
     // ── Single declaration: `prop: value [!important]` ── ref: properties_impl.rs ─

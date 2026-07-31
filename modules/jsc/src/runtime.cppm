@@ -26,6 +26,10 @@ import mbun.image.jpeg;
 import mbun.core.io;
 import mbun.core.strings;
 import mbun.css;
+// The platform layer. Strongly platform-dependent primitives live there, not
+// behind #ifdefs at the call site: runtime/process_extended.inc's pty bindings
+// are argument coercion and JS object shaping over mbun::platform::pty.
+import mbun.platform;
 // node's Permission Model (--permission / --allow-*): the scope table, the fs
 // radix matcher and path.resolve. Consulted by every fs/spawn/worker boundary.
 import mbun.permission;
@@ -61,6 +65,10 @@ import mbun.valkey;
 import mbun.sourcemap_jsc.internal_source_map;
 // hosted-git-info URL normalization backs bun:internal-for-testing.hostedGitInfo.
 import mbun.install.hosted_git_info;
+// npm `os`/`cpu` allow/block-list algebra — the SAME bitsets `bun install`'s
+// platform gate uses — backs bun:internal-for-testing isArchitectureMatch /
+// isOperatingSystemMatch (runtime/platform_match.inc).
+import mbun.install.npm.negatable;
 // T-LOOP native epoll event loop for Bun.serve (runtime/serve_native.inc).
 import mbun.event_loop;
 import mbun.runtime_socket;
@@ -83,6 +91,31 @@ import mbun.html_rewriter;
 // note in prelude.hpp). The mbun_napi_* runtime hooks engine.inc calls are
 // declared in runtime/napi/mbun_napi.h.
 
+// ── the process dialect ─────────────────────────────────────────────────────
+// mbun is ONE universal core with a thin node compat layer and a thin bun
+// compat layer (.agents/skills/dev-process/SKILL.md, "通用内核 + 各方言的薄
+// 兼容层"). Where compat/node and compat/bun demand different OBSERVABLE
+// behaviour from the same call, that call site is a dispatch point and this
+// value is its key — not a ceiling, and not something to decide by picking a
+// winner.
+//
+// It is process-level infrastructure: resolved ONCE, in C++, at CLI dispatch
+// (src/main.cpp `resolve_dialect`), never sniffed independently inside a
+// builtins JS payload. JS reads it back through the non-enumerable
+// `globalThis.__mbunDialect` string installed by bindings_install.inc.
+//
+// Declared here rather than in api_impl.inc because everything from
+// common.inc down lives in the anonymous namespace below and needs the type
+// for its storage, while the setter/getter must be exported.
+export namespace mbun::jsc::runtime {
+
+enum class Dialect {
+    Bun,   // the historical default: no signal at all behaves as it always did
+    Node,
+};
+
+}  // namespace mbun::jsc::runtime
+
 namespace {
 
 #include "runtime/common.inc"
@@ -99,6 +132,7 @@ namespace {
 #include "runtime/node_tls.inc"
 #include "runtime/sourcemap.inc"
 #include "runtime/hosted_git_info.inc"
+#include "runtime/platform_match.inc"
 #include "runtime/io_bindings.inc"
 // node:zlib streaming Transform handles (mbun.compress.stream): incremental
 // deflate/inflate/brotli/zstd state machines behind __mbunZlibNative.stream*.

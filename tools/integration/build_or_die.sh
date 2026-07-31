@@ -61,7 +61,15 @@ if [ "$status" != 0 ]; then
   exit "$status"
 fi
 
-binary=$(find "$root/target" -type f -name mbun -perm -111 -printf '%T@ %p\n' 2>/dev/null \
+# `target/integration/` is the measurement area, not build output: it holds frozen
+# binary copies kept deliberately for long corpus runs (see the frozen-binary
+# protocol in RESUME.md). Those copies are newer than the build they came from, so
+# without this prune the freshest-binary search returns a FROZEN one and every
+# caller doing `--bin "$(build_or_die | tail -1)"` silently measures a snapshot
+# instead of the tree it just built -- the exact stale-binary class that
+# node_corpus_runner.py already refuses.
+binary=$(find "$root/target" -type f -name mbun -perm -111 \
+           -not -path "$root/target/integration/*" -printf '%T@ %p\n' 2>/dev/null \
          | sort -rn | head -1 | cut -d' ' -f2-)
 if [ -z "$binary" ]; then
   log "build_or_die: build reported success but no mbun binary exists under target/."

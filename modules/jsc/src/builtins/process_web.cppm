@@ -39,6 +39,9 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
 
   // Active async children; __mbun_io_tick drives every entry each pump turn.
   const CHILDREN = (G.__mbunChildren = G.__mbunChildren || new Set());
+  // Live Bun.Terminal pseudo-terminals, polled by the same __mbun_io_tick pass.
+  // Declared and driven in the :bun_terminal partition (a Terminal is not a
+  // child: it has no pid to reap and outlives any process attached to it).
   const decodeEnc = (bytes, enc) => Buffer.from(bytes).toString(enc === "utf-8" ? "utf8" : enc);
 
   // A child's stdout/stderr. `Readable` is lexically the bootstrap load-order
@@ -57,7 +60,14 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       r.bytesRead += bytes.length;
       r.push(Buffer.from(bytes));  // setEncoding(), if set, decodes downstream
     };
-    r.__end = () => { if (r._ended) return; r._ended = true; r.push(null); };
+    // node stream_base_commons.js onStreamRead does `stream.push(null)` AND THEN
+    // `stream.read(0)` at UV_EOF. The read(0) is not redundant: Readable only
+    // emits 'end' from endReadable(), which push(null) alone reaches solely
+    // through flow() -- i.e. only if the stream is already flowing. A child's
+    // stdout with an 'end' listener but no 'data' listener is PAUSED, so without
+    // the read(0) its 'end' never fires (test-child-process-kill /
+    // -destroy attach exactly that shape and hung on a missing 'end').
+    r.__end = () => { if (r._ended) return; r._ended = true; r.push(null); try { r.read(0); } catch (e) {} };
     return r;
   };
 
@@ -83,9 +93,20 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     });
     d.bytesRead = 0;
     d.__data = (bytes) => { d.bytesRead += bytes.length; d.push(Buffer.from(bytes)); };
-    d.__end = () => { if (d._ended) return; d._ended = true; w.closed = true; d.push(null); };
+    d.__end = () => { if (d._ended) return; d._ended = true; w.closed = true; d.push(null); try { d.read(0); } catch (e) {} };
     return d;
   };
+
+  // A stdio write callback is a node callback boundary, not an internal detail:
+  // node runs it from afterWrite() on the loop, so a throw inside it escapes to
+  // 'uncaughtException' and, unclaimed, kills the process. Swallowing it here
+  // (the old `try { item.cb(); } catch (e) {}`) made a failing assertion written
+  // inside `child.stdin.write(chunk, cb)` exit 0 — a corpus test could report
+  // "pass" having verified nothing. Deferring through nextTick both matches
+  // node's asynchrony (the callback never runs inside write()) and puts the
+  // throw on the tick boundary, which node_process_lifecycle already routes to
+  // __mbun_uncaught.
+  const deferCb = (cb) => { if (cb) nextTick(cb); };
 
   // The write half of a stdio slot ABOVE stderr. Those slots are socketpairs
   // (see spawnEx), so the parent's descriptor is duplex: the SAME fd is polled
@@ -95,12 +116,12 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     if (w.fd < 0 || w.closed) return;
     while (w.buf.length) {
       const item = w.buf[0];
-      if (item.data.length - item.off <= 0) { w.buf.shift(); if (item.cb) try { item.cb(); } catch (e) {} continue; }
+      if (item.data.length - item.off <= 0) { w.buf.shift(); deferCb(item.cb); continue; }
       const n = PROC.writeNB(w.fd, _b64(item.data.subarray(item.off)), 0);
-      if (n < 0) { w.buf.shift(); if (item.cb) try { item.cb(); } catch (e) {} continue; }  // peer gone
+      if (n < 0) { w.buf.shift(); deferCb(item.cb); continue; }  // peer gone
       if (n === 0) return;  // EAGAIN — retry next tick
       item.off += n;
-      if (item.off >= item.data.length) { w.buf.shift(); if (item.cb) try { item.cb(); } catch (e) {} }
+      if (item.off >= item.data.length) { w.buf.shift(); deferCb(item.cb); }
       else return;
     }
   };
@@ -109,12 +130,12 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     if (rec.stdinFd < 0 || rec.stdinClosed) return;
     while (rec.stdinBuf.length) {
       const item = rec.stdinBuf[0];
-      if (item.data.length - item.off <= 0) { rec.stdinBuf.shift(); if (item.cb) try { item.cb(); } catch (e) {} continue; }
+      if (item.data.length - item.off <= 0) { rec.stdinBuf.shift(); deferCb(item.cb); continue; }
       const w = PROC.writeNB(rec.stdinFd, _b64(item.data.subarray(item.off)), 0);
-      if (w < 0) { rec.stdinBuf.shift(); if (item.cb) try { item.cb(); } catch (e) {} continue; }  // broken pipe
+      if (w < 0) { rec.stdinBuf.shift(); deferCb(item.cb); continue; }  // broken pipe
       if (w === 0) return;  // EAGAIN — retry next tick
       item.off += w;
-      if (item.off >= item.data.length) { rec.stdinBuf.shift(); if (item.cb) try { item.cb(); } catch (e) {} }
+      if (item.off >= item.data.length) { rec.stdinBuf.shift(); deferCb(item.cb); }
       else return;
     }
     if (rec.stdinEnded) { try { PROC.close(rec.stdinFd); } catch (e) {} rec.stdinClosed = true; if (rec.cp.stdin) { rec.cp.stdin.destroyed = true; rec.cp.stdin.writable = false; } }
@@ -462,12 +483,52 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     });
   };
 
+  // PORT-SOURCE: compat/node/lib/internal/per_context/primordials.js (the idea).
+  // Same reason as the netItemsSnapshot in js_net.cppm: __mbun_io_tick is on the
+  // pump path of every process that has a child or an IPC channel — which is
+  // EVERY worker child, since mbun runs a worker as a child mbun process — so
+  // walking its state through `[...set]` / `for…of` makes a user edit to
+  // Array.prototype[Symbol.iterator] or %ArrayIteratorPrototype%.next a fatal
+  // error in the runtime rather than in the user's own code.
+  // test-worker-terminate-source-map does exactly that edit, on purpose, to
+  // prove node's shutdown path calls no user JS.
+  const _setForEachP = Set.prototype.forEach;
+  const childSnapshot = () => {
+    const out = [];
+    _setForEachP.call(CHILDREN, (rec) => { out[out.length] = rec; });
+    return out;
+  };
   G.__mbun_io_tick = function () {
-    if (!CHILDREN.size && SELF_IPC === null) return 0;
-    const recs = [...CHILDREN];
+    // The Bun.Terminal reactor lives in the :bun_terminal partition, whose text
+    // is appended INSIDE this partition's still-open `if (globalThis.Bun)`
+    // block -- so its declarations are NOT in this function's scope. It hands
+    // itself over on the global instead; reached lazily because this function
+    // is installed before that partition has run.
+    //
+    // Snapshotted through _setForEachP, NOT `[...TR.set]`. This function runs on
+    // every pump iteration, so a spread here reads Array.prototype[Symbol.iterator]
+    // on every turn and a program that deletes it kills the runtime at shutdown
+    // with a two-frame (native) stack naming nothing. That is the same defect
+    // this commit fixes for CHILDREN; the terminal set has to obey it too.
+    const TR = G.__mbunTerminalReactor;
+    const terms = [];
+    if (TR) _setForEachP.call(TR.set, (t) => { terms[terms.length] = t; });
+    if (!CHILDREN.size && SELF_IPC === null && !terms.length) return 0;
+    // Snapshotted because the drains below add to and delete from CHILDREN.
+    const recs = childSnapshot();
     const readFds = [], readObjs = [];
-    for (const rec of recs) for (const o of rec.outs) if (!o.ended && o.fd >= 0) { readFds.push(o.fd); readObjs.push(o); }
-    for (const rec of recs) if (rec.ipc && !rec.ipc.closed) { readFds.push(rec.ipc.fd); readObjs.push({ ipcRec: rec }); }
+    for (let ri = 0; ri < recs.length; ri++) {
+      const rec = recs[ri], outs = rec.outs;
+      for (let oi = 0; oi < outs.length; oi++) {
+        const o = outs[oi];
+        if (!o.ended && o.fd >= 0) { readFds.push(o.fd); readObjs.push(o); }
+      }
+    }
+    for (let ri = 0; ri < recs.length; ri++) { const rec = recs[ri]; if (rec.ipc && !rec.ipc.closed) { readFds.push(rec.ipc.fd); readObjs.push({ ipcRec: rec }); } }
+    for (let ti = 0; ti < terms.length; ti++) {
+      const t = terms[ti];
+      if (!t.closed && t.master >= 0) { readFds.push(t.master); readObjs.push({ term: t }); }
+    }
     if (SELF_IPC !== null && !SELF_IPC.ch.closed) { readFds.push(SELF_IPC.ch.fd); readObjs.push({ self: SELF_IPC }); }
     if (readFds.length) {
       const ready = PROC.poll(readFds, 5);
@@ -475,18 +536,34 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
         if (!ready[i]) continue;
         const o = readObjs[i];
         if (o.ipcRec) drainChildIpc(o.ipcRec);
+        else if (o.term) TR.drain(o.term);
         else if (o.self) o.self.drain();
         else drainOut(o);
       }
     } else {
       PROC.poll([], 2);  // brief real wait while waiting for a child to exit
     }
-    for (const rec of recs) { flushStdin(rec); for (const w of rec.writers) flushWriter(w); }
-    for (const rec of recs) if (rec.ipc && !rec.ipc.closed) { ipcFlush(rec.ipc); rec.ipcDelivery.flush(); }
+    for (let ti = 0; ti < terms.length; ti++) TR.flush(terms[ti]);
+    for (let ri = 0; ri < recs.length; ri++) {
+      const rec = recs[ri];
+      flushStdin(rec);
+      const ws = rec.writers;
+      for (let wi = 0; wi < ws.length; wi++) flushWriter(ws[wi]);
+    }
+    for (let ri = 0; ri < recs.length; ri++) { const rec = recs[ri]; if (rec.ipc && !rec.ipc.closed) { ipcFlush(rec.ipc); rec.ipcDelivery.flush(); } }
     if (SELF_IPC !== null && !SELF_IPC.ch.closed) { ipcFlush(SELF_IPC.ch); SELF_IPC.delivery.flush(); }
-    for (const rec of recs) reap(rec);
+    for (let ri = 0; ri < recs.length; ri++) reap(recs[ri]);
     let active = 0;
-    for (const rec of recs) { if (rec.done) CHILDREN.delete(rec); else if (!rec.unrefd) active++; }
+    for (let ri = 0; ri < recs.length; ri++) { const rec = recs[ri]; if (rec.done) CHILDREN.delete(rec); else if (!rec.unrefd) active++; }
+    // A ref'd Terminal pins the loop the way bun's reader/writer poll does --
+    // but ONLY while it can still produce an observable event. A terminal with
+    // no data/drain/exit callback can never call back into JS, so pinning for
+    // it could only turn "the script finished" into a hang.
+    for (let ti = 0; ti < terms.length; ti++) {
+      const t = terms[ti];
+      if (t.closed) { TR.set.delete(t); continue; }
+      if (!t.unrefd && (t.onData || t.onDrain || t.onExit)) active++;
+    }
     // node ref-counts the child-side channel: it pins the loop only while a
     // 'message' or 'disconnect' listener is attached (setupChannel's
     // newListener/removeListener ref counting) — that is what lets
@@ -542,7 +619,14 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     while (stdio.length < 3) stdio.push("pipe");
     // "ipc" survives to the native layer, which opens an AF_UNIX socketpair for
     // that slot (node's fork channel); everything else maps to a plain pipe.
-    return stdio.map((s) => (s == null ? "pipe" : typeof s === "number" ? s : s === "overlapped" ? "pipe" : s));
+    // A stream/handle carrying a numeric `fd` is a {type:'fd'} slot in node
+    // (internal/child_process.js getValidStdio: `typeof stdio.fd === 'number'`),
+    // so `stdio: [..., process.stderr, ...]` must dup that descriptor rather
+    // than fall through to a pipe. Falling through captured output node never
+    // captures and left `result.stdout` a string where node reports null
+    // (issue 20321, the AWS CDK pattern).
+    return stdio.map((s) => (s == null ? "pipe" : typeof s === "number" ? s : s === "overlapped" ? "pipe"
+      : (typeof s === "object" && typeof s.fd === "number") ? s.fd : s));
   };
 
   // node internal/child_process.js resolves the 'child_process' channel and the
@@ -670,7 +754,22 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
           // Out fds MUST be O_NONBLOCK: drainOut loops readNB until "" (EAGAIN);
           // on a blocking fd the read AFTER a partial chunk wedges the JS thread
           // while a long-lived child sits between replies (duplex protocols).
-          else { PROC.setNonBlock(fd); const rd = i > 2 ? makeDuplexPipe(fd, rec) : makeReadable(); rec.outs.push({ fd, stream: rd, ended: false }); stdioArr[i] = rd; if (i === 1) this.stdout = rd; else if (i === 2) this.stderr = rd; }
+          else {
+            PROC.setNonBlock(fd);
+            const rd = i > 2 ? makeDuplexPipe(fd, rec) : makeReadable();
+            const o = { fd, stream: rd, ended: false };
+            rec.outs.push(o);
+            // node backs these with a net.Socket, so destroy() CLOSES the pipe:
+            // the read end goes away and maybeClose stops waiting on it. Without
+            // this, `child.stdout.destroy()` (which exec() uses to abandon a
+            // timed-out child) left the fd in the poll set and 'close' waited on
+            // whatever else still held the write end -- typically a grandchild
+            // the shell forked.
+            if (typeof rd.once === "function") {
+              rd.once("close", () => { if (!o.ended) { o.ended = true; try { PROC.close(o.fd); } catch (e) {} } });
+            }
+            stdioArr[i] = rd; if (i === 1) this.stdout = rd; else if (i === 2) this.stderr = rd;
+          }
         } else { stdioArr[i] = null; }
       }
       this.stdio = stdioArr;
@@ -754,19 +853,47 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     });
     return e;
   };
+  // node internal/errors.js ERR_INVALID_ARG_TYPE picks the noun from the NAME:
+  // a name ending in " argument" is used verbatim, a name containing a '.' is a
+  // "property", anything else an "argument". Choosing it per call site instead
+  // got `options.argv0` reported as an argument, which
+  // test-child-process-spawn-argv0 compares character for character.
+  const errArgTypeMsg = (name, expected, actual) => {
+    const head = name.endsWith(" argument")
+      ? "The " + name + " "
+      : 'The "' + name + '" ' + (name.indexOf(".") >= 0 ? "property" : "argument") + " ";
+    return head + "must be " + expected + ". Received " + recvDesc(actual);
+  };
   const errArgType = (name, expected, actual) =>
-    withCode(new TypeError('The "' + name + '" argument must be ' + expected + '. Received ' + recvDesc(actual)), "ERR_INVALID_ARG_TYPE");
-  const errPropType = (name, expected, actual) =>
-    withCode(new TypeError('The "' + name + '" property must be ' + expected + '. Received ' + recvDesc(actual)), "ERR_INVALID_ARG_TYPE");
+    withCode(new TypeError(errArgTypeMsg(name, expected, actual)), "ERR_INVALID_ARG_TYPE");
+  const errPropType = errArgType;
+  // node internal/errors.js ERR_INVALID_ARG_VALUE: the noun comes from the name
+  // (same '.' rule as ERR_INVALID_ARG_TYPE) and the value is INSPECTED, not
+  // described -- `Received null`, `Received 42`, `Received 'foo'`, never
+  // "Received type number (42)".
+  const errArgValueInspect = (v) => {
+    const u = M["util"] || M["node:util"];
+    if (u && typeof u.inspect === "function") {
+      try { const s = u.inspect(v); return s.length > 128 ? s.slice(0, 128) + "..." : s; } catch (e) {}
+    }
+    return typeof v === "string" ? "'" + v + "'" : String(v);
+  };
   const errArgValue = (name, value, reason) =>
-    withCode(new TypeError("The argument '" + name + "' " + (reason || "is invalid") + ". Received " + recvDesc(value)), "ERR_INVALID_ARG_VALUE");
+    withCode(new TypeError("The " + (name.indexOf(".") >= 0 ? "property" : "argument") + " '" + name + "' " +
+      (reason || "is invalid") + ". Received " + errArgValueInspect(value)), "ERR_INVALID_ARG_VALUE");
   const errOutOfRange = (name, range, value) =>
     withCode(new RangeError('The value of "' + name + '" is out of range. It must be ' + range + ". Received " + String(value)), "ERR_OUT_OF_RANGE");
   // node normalizeSpawnArguments: `serialization` is 'json' (default) or
   // 'advanced'; anything else is ERR_INVALID_ARG_VALUE on options.serialization.
+  // node internal/child_process.js: validateOneOf(options.serialization,
+  // 'options.serialization', [undefined, 'json', 'advanced']). `undefined` is a
+  // member of the set, so it must appear in the message -- and `null` is NOT a
+  // member: it throws rather than silently meaning 'json'.
   const validateSerialization = (s) => {
-    if (s === undefined || s === null) return "json";
-    if (s !== "json" && s !== "advanced") throw errArgValue("options.serialization", s, "must be one of: 'json', 'advanced'");
+    if (s === undefined) return "json";
+    if (s !== "json" && s !== "advanced") {
+      throw errArgValue("options.serialization", s, "must be one of: undefined, 'json', 'advanced'");
+    }
     return s;
   };
   const nullCheck = (v, name) => {
@@ -787,11 +914,19 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     if (typeof p === "string") { nullCheck(p, name); return p; }
     if (p !== null && typeof p === "object") {
       if (G.Buffer && typeof G.Buffer.isBuffer === "function" && G.Buffer.isBuffer(p)) { const s = p.toString(); nullCheck(s, name); return s; }
-      if (typeof p.href === "string" && p.protocol === "file:") {
+      // Any URL (not just a file: one) goes to fileURLToPath, exactly as node's
+      // getValidatedPath -> toPathIfFileURL does: a wrong scheme is
+      // ERR_INVALID_URL_SCHEME ("The URL must be of scheme file") and a non-local
+      // host is ERR_INVALID_FILE_URL_HOST -- NOT the ERR_INVALID_ARG_TYPE this
+      // used to report for everything that was not already file:.
+      if (typeof p.href === "string" && typeof p.protocol === "string") {
         const u = M["url"] || M["node:url"];
-        const s = u && typeof u.fileURLToPath === "function" ? u.fileURLToPath(p) : String(p.pathname);
-        nullCheck(s, name);
-        return s;
+        if (u && typeof u.fileURLToPath === "function") {
+          const s = u.fileURLToPath(p);
+          nullCheck(s, name);
+          return s;
+        }
+        if (p.protocol === "file:") { const s = String(p.pathname); nullCheck(s, name); return s; }
       }
     }
     throw errArgType(name, "of type string or an instance of Buffer or URL", p);
@@ -861,6 +996,11 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       }
     }
   };
+  // node emits DEP0190 at most ONCE per process, from normalizeSpawnArguments —
+  // so every entry point (spawn/spawnSync/execFile/execFileSync) shares one
+  // latch, and `common.expectWarning` in a file that shells out twice still sees
+  // exactly one warning.
+  let emittedDEP0190Already = false;
   const normalizeSpawnArgs = (file, args, options) => {
     validateStr(file, "file");
     nullCheck(file, "file");
@@ -873,7 +1013,30 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     if (options === undefined) options = Object.create(null);
     else { validateObj(options, "options"); options = ownOptions(options); }
     validateCommonOpts(options);
-    return { file, args, options };
+    // The command as the CALLER named it: exec()/execFile() report this in
+    // `err.cmd` and in "Command failed: …", never the /bin/sh wrapper.
+    const origFile = file, origArgs = args;
+    // `shell` belongs HERE, not in each entry point. node does the wrapping
+    // inside normalizeSpawnArguments (lib/child_process.js), which is why
+    // spawnSync('does-not-exist', { shell: true }) is exit 127 from /bin/sh
+    // rather than an ENOENT for a file the shell was going to report on itself.
+    // mbun previously wrapped only in spawn() and execFile(), so both sync
+    // entry points bypassed the shell entirely.
+    if (options.shell) {
+      const strArgs = args.map(toStr);
+      if (strArgs.length > 0 && !emittedDEP0190Already) {
+        emittedDEP0190Already = true;
+        if (G.process && typeof G.process.emitWarning === "function") {
+          G.process.emitWarning(
+            "Passing args to a child process with shell option true can lead to security vulnerabilities, as the arguments are not escaped, only concatenated.",
+            "DeprecationWarning", "DEP0190");
+        }
+      }
+      const command = strArgs.length > 0 ? toStr(file) + " " + strArgs.join(" ") : toStr(file);
+      file = options.shell === true ? "/bin/sh" : toStr(options.shell);
+      args = ["-c", command];
+    }
+    return { file, args, options, origFile, origArgs, shellWrapped: !!options.shell };
   };
   // node normalizeExecFileArgs: (file[, args][, options][, callback]).
   const normalizeExecFileArgs = (file, args, options, callback) => {
@@ -907,9 +1070,24 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       const pe = G.process && G.process.env;
       if (pe && typeof pe === "object") out.env = pe;
     }
+    // The sync spawner does not go through normStdio, so resolve the one shape it
+    // cannot read here: a stream/handle with a numeric `fd` is node's
+    // {type:'fd'} slot (issue 20321). Everything else is passed through exactly
+    // as given so the native layer keeps owning 'pipe'/'inherit'/'ignore'.
+    if (Array.isArray(out.stdio)) {
+      out.stdio = out.stdio.map((s) => (s != null && typeof s === "object" && typeof s.fd === "number") ? s.fd : s);
+    }
     if (o != null && o.timeout != null && o.timeout > 0) {
       out.timeoutMs = o.timeout;
       out.killSignalNum = mapSig(o.killSignal == null ? "SIGTERM" : o.killSignal);
+    }
+    // `input` is bytes, not text (node spawn_sync.cc writes the buffer straight
+    // to the stdin pipe). The native boundary only reads a UTF-8 string, which
+    // would mangle a Buffer/TypedArray -- and used to drop it entirely, so
+    // spawnSync('cat', [], { input: Buffer.from('hi') }) returned empty stdout.
+    if (out.input !== undefined && typeof out.input !== "string") {
+      out.inputB64 = _b64(_u8(out.input));
+      delete out.input;
     }
     return out;
   };
@@ -988,7 +1166,14 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     if (o != null) { validateObj(o, "options"); validateCommonOpts(o); }
     // Route through spawnSync so execSync observes the same bounded pipe
     // collection as spawnSync/execFileSync (including ENOBUFS + stdout).
-    const r = spawnSync("/bin/sh", ["-c", command], o);
+    // node normalizeExecArgs: the command IS the file and `shell` is forced on,
+    // so the single shell wrapping lives in normalizeSpawnArgs. Building
+    // ["/bin/sh", "-c", command] here instead would wrap a caller-supplied
+    // `shell` option TWICE now that spawnSync honours it.
+    const so = Object.create(null);
+    if (o != null) for (const k of Object.keys(o)) so[k] = o[k];
+    so.shell = typeof so.shell === "string" ? so.shell : true;
+    const r = spawnSync(command, [], so);
     if (r.error) {
       r.error.stdout = r.stdout;
       r.error.stderr = r.stderr;
@@ -1002,17 +1187,31 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   }
   function execFileSync(file, a, o) {
     const nf = normalizeExecFileArgs(file, a, o, undefined);
-    const nz = normalizeSpawnArgs(nf.file, nf.args, typeof nf.options === "function" ? {} : nf.options);
     // Keep execFileSync on the public spawnSync path: that is where the
-    // per-stream maxBuffer contract turns an overrun into ENOBUFS.
-    const r = spawnSync(nz.file, nz.args, nz.options);
+    // per-stream maxBuffer contract turns an overrun into ENOBUFS -- and where
+    // normalizeSpawnArgs applies `shell`. Pre-normalizing here would hand
+    // spawnSync an already-shell-wrapped file and wrap it a second time.
+    const opts = typeof nf.options === "function" ? {} : nf.options;
+    const r = spawnSync(nf.file, nf.args, opts);
     if (r.error) {
       r.error.stdout = r.stdout;
       r.error.stderr = r.stderr;
       throw r.error;
     }
-    if (r.status !== 0) { const e = new Error("execFileSync failed: " + nz.file); e.status = r.status; e.stderr = r.stderr; throw e; }
-    const enc = nz.options && nz.options.encoding;
+    if (r.status !== 0) {
+      // node lib/child_process.js `checkExecSyncError`: execFileSync has no
+      // command string, so the message joins argv0-or-file with the arguments,
+      // and the CHILD'S STDERR is appended to it. That tail is the whole point —
+      // `e.toString()` is how a caller sees what the child said, and
+      // compat/node/test/parallel/test-module-main-fail.js:13-17 matches the
+      // child's MODULE_NOT_FOUND out of exactly this string.
+      // "execFileSync failed: <file>" carried neither, and no corpus file on
+      // either side pins that wording.
+      let msg = "Command failed: " + [(opts && opts.argv0) || toStr(nf.file)].concat(nf.args || []).join(" ");
+      if (r.stderr != null && r.stderr.length > 0) msg += "\n" + r.stderr.toString();
+      const e = new Error(msg); e.status = r.status; e.stdout = r.stdout; e.stderr = r.stderr; throw e;
+    }
+    const enc = opts && opts.encoding;
     // A non-piped stdout slot is null, not a buffer.
     if (r.stdout == null) return null;
     return enc === "buffer" || enc == null ? Buffer.from(_u8(r.stdout)) : r.stdout;
@@ -1031,7 +1230,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       : null;
     const maxBuffer = options.maxBuffer == null ? 1024 * 1024 : options.maxBuffer;
     const outs = [], errs = [];
-    let outLen = 0, errLen = 0, maxErr = null, done = false;
+    let outLen = 0, errLen = 0, maxErr = null, done = false, killed = false, timeoutId = null;
     const add = (which, name, chunk, stream) => {
       // Stream decoding can combine a split character before this listener
       // sees it. Count the completed chunk in bytes, but keep its original
@@ -1048,7 +1247,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
             : Buffer.from(bytes.subarray(0, take)));
         }
         if (which === 0) outLen = maxBuffer; else errLen = maxBuffer;
-        if (!maxErr) { maxErr = new RangeError(name + " maxBuffer length exceeded"); maxErr.code = "ERR_CHILD_PROCESS_STDIO_MAXBUFFER"; maxErr.cmd = cmd; child.kill(); }
+        if (!maxErr) { maxErr = new RangeError(name + " maxBuffer length exceeded"); maxErr.code = "ERR_CHILD_PROCESS_STDIO_MAXBUFFER"; maxErr.cmd = cmd; killChild(); }
       } else {
         arr.push(typeof chunk === "string" ? chunk : Buffer.from(bytes));
         if (which === 0) outLen += bytes.length; else errLen += bytes.length;
@@ -1071,32 +1270,54 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     };
     const finish = (code, signal) => {
       if (done) return; done = true;
+      if (timeoutId !== null) { G.clearTimeout(timeoutId); timeoutId = null; }
       const outBuf = mergeOut(outs, child.stdout);
       const errBuf = mergeOut(errs, child.stderr);
       let err = maxErr;
       if (!err && ((code !== 0 && code != null) || signal)) {
         err = new Error("Command failed: " + cmd + (errBuf.length ? "\n" + errBuf.toString("utf8") : ""));
-        err.code = signal ? null : (code < 0 ? (ERRNO[-code] || code) : code); err.killed = child.killed || false; err.signal = signal || null; err.cmd = cmd;
+        err.code = signal ? null : (code < 0 ? (ERRNO[-code] || code) : code);
+        err.killed = child.killed || killed; err.signal = signal || null;
       }
+      // node execFile's exithandler stamps `cmd` on WHATEVER error it reports,
+      // including the `ex` an errorhandler stored (a spawn ENOENT), whose own
+      // code/killed it leaves alone. test-child-process-exec-error asserts
+      // err.cmd on exactly that path.
+      if (err) err.cmd = cmd;
       if (cb) cb(err || null, outBuf, errBuf);
     };
+    // node execFile kill(): destroy the collected streams FIRST, then signal.
+    // Destroying is what makes the result empty and lets 'close' land promptly:
+    // `sh -c "<cmd>"` forks, so the grandchild inherits the stdout pipe and
+    // keeps its write end open long after the shell is dead. Without the
+    // destroy, exec({ timeout }) waited for the grandchild's own lifetime and
+    // reported the output it produced meanwhile (test-child-process-exec-timeout-
+    // expire/-kill assert both the empty output and the prompt callback).
+    const killChild = () => {
+      if (child.stdout && typeof child.stdout.destroy === "function") child.stdout.destroy();
+      if (child.stderr && typeof child.stderr.destroy === "function") child.stderr.destroy();
+      killed = true;
+      try { child.kill(options.killSignal || "SIGTERM"); }
+      catch (e) { if (!maxErr) maxErr = e; finish(); }
+    };
+    if (options.timeout > 0) {
+      timeoutId = G.setTimeout(() => { timeoutId = null; killChild(); }, options.timeout);
+    }
     child.on("close", (code, signal) => finish(code, signal));
     child.on("error", (e) => {
       if (done) return;
-      done = true;
-      if (cb) cb(e, mergeOut([], child.stdout), mergeOut([], child.stderr));
+      if (child.stdout && typeof child.stdout.destroy === "function") child.stdout.destroy();
+      if (child.stderr && typeof child.stderr.destroy === "function") child.stderr.destroy();
+      maxErr = maxErr || e;
+      finish();
     });
   };
 
   function spawn(file, args, options) {
     const nz = normalizeSpawnArgs(file, args, options);
     file = nz.file; args = nz.args; options = nz.options;
-    let cmd = file, argv = [file].concat(args.map(toStr));
-    if (options.shell) {
-      const command = [file].concat(args.map(toStr)).join(" ");
-      const sh = options.shell === true ? "/bin/sh" : toStr(options.shell);
-      cmd = sh; argv = [sh, "-c", command];
-    }
+    // normalizeSpawnArgs already applied `shell` (node does it there too).
+    const cmd = file, argv = [file].concat(args.map(toStr));
     const child = new ChildProcess();
     child.spawn({ file: cmd, args: argv, cwd: options.cwd, env: options.env, stdio: options.stdio, detached: options.detached, uid: options.uid, gid: options.gid, argv0: options.argv0, timeout: options.timeout, killSignal: options.killSignal, signal: options.signal, serialization: validateSerialization(options.serialization) });
     return child;
@@ -1111,7 +1332,11 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     if (cb != null) validateFn(cb, "callback");
     const sh = options.shell ? (options.shell === true ? "/bin/sh" : toStr(options.shell)) : "/bin/sh";
     const child = new ChildProcess();
-    child.spawn({ file: sh, args: [sh, "-c", toStr(command)], cwd: options.cwd, env: options.env, stdio: ["pipe", "pipe", "pipe"], timeout: options.timeout, killSignal: options.killSignal, signal: options.signal });
+    // No `timeout` here on purpose: node's exec/execFile own the timer (it must
+    // destroy the collected streams before it signals), while ChildProcess.spawn
+    // implements the plain spawn() timeout that only signals. collectExec below
+    // installs the exec-flavoured one.
+    child.spawn({ file: sh, args: [sh, "-c", toStr(command)], cwd: options.cwd, env: options.env, stdio: ["pipe", "pipe", "pipe"], killSignal: options.killSignal, signal: options.signal });
     collectExec(child, options, cb, command);
     return child;
   }
@@ -1128,27 +1353,17 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     return promise;
   };
 
-  let warnedExecFileShell = false;
   function execFile(file, args, options, cb) {
     const nf = normalizeExecFileArgs(file, args, options, cb);
     const nz = normalizeSpawnArgs(nf.file, nf.args, typeof nf.options === "function" ? {} : nf.options);
-    file = nz.file; args = nz.args; options = nz.options; cb = nf.callback;
-    const stringArgs = args.map(toStr);
-    const displayCmd = [file].concat(stringArgs).join(" ");
-    let spawnFile = file, spawnArgs = [file].concat(stringArgs);
-    if (options.shell) {
-      if (!warnedExecFileShell && stringArgs.length > 0 &&
-          G.process && typeof G.process.emitWarning === "function") {
-        warnedExecFileShell = true;
-        G.process.emitWarning(
-          "Passing args to a child process with shell option true can lead to security vulnerabilities, as the arguments are not escaped, only concatenated.",
-          "DeprecationWarning", "DEP0190");
-      }
-      const sh = options.shell === true ? "/bin/sh" : toStr(options.shell);
-      spawnFile = sh; spawnArgs = [sh, "-c", displayCmd];
-    }
+    options = nz.options; cb = nf.callback;
+    // node execFile: `cmd` is the caller's file plus the caller's args, joined —
+    // the shell wrapper the spawn boundary may have inserted is invisible to it.
+    const origArgs = nz.origArgs.map(toStr);
+    const displayCmd = origArgs.length ? toStr(nz.origFile) + " " + origArgs.join(" ") : toStr(nz.origFile);
+    const spawnFile = nz.file, spawnArgs = [nz.file].concat(nz.args.map(toStr));
     const child = new ChildProcess();
-    child.spawn({ file: spawnFile, args: spawnArgs, cwd: options.cwd, env: options.env, stdio: ["pipe", "pipe", "pipe"], timeout: options.timeout, killSignal: options.killSignal, signal: options.signal });
+    child.spawn({ file: spawnFile, args: spawnArgs, cwd: options.cwd, env: options.env, stdio: ["pipe", "pipe", "pipe"], killSignal: options.killSignal, signal: options.signal });
     collectExec(child, options, cb, displayCmd);
     return child;
   }
@@ -1230,7 +1445,12 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       drain() {
         ipcRead(ch, (m, handle) => delivery.deliver(m, handle), () => {
           ipcClose(ch);
-          if (proc.connected && typeof proc.disconnect === "function") proc.disconnect();
+          // Read defensively: inside a worker_threads worker both `connected`
+          // and `disconnect` are node's ERR_WORKER_UNSUPPORTED_OPERATION stubs,
+          // and the channel this is tearing down is the worker's own wire.
+          let conn = false;
+          try { conn = !!proc.connected; } catch (e) { conn = false; }
+          if (conn && typeof proc.disconnect === "function") { try { proc.disconnect(); } catch (e) {} }
         });
       },
       // worker_threads installs a permanent process 'message' bridge, so it
@@ -1370,8 +1590,9 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       if (typeof value === "string") return { inspectCell: true, text: value, color: false };
       if (typeof value === "number") return { inspectCell: true, text: String(value), color: true };
       if (typeof value === "boolean" || value == null || typeof value === "bigint") return { inspectCell: true, text: String(value), color: true };
-      try { return { inspectCell: true, text: Bun.inspect(value, { colors: false, compact: true }), color: false }; }
-      catch (_) { return { inspectCell: true, text: "", color: false }; }
+      // A cell's Bun.inspect.custom / toString runs user code; bun lets whatever
+      // it throws escape Bun.inspect.table rather than rendering a blank cell.
+      return { inspectCell: true, text: Bun.inspect(value, { colors: false, compact: true }), color: false };
     };
     const render = (head, columns) => renderTable(head, columns, (value, row) => {
       if (row === -1) {
@@ -1398,8 +1619,16 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       return render(["", "Values"], [index, values]);
     }
     if (typeof tabularData === "function") return render(["", "Values"], [["0"], [cell(tabularData)]]);
-    const indexes = Object.keys(tabularData);
-    const items = indexes.map((key) => tabularData[key]);
+    // A generator/iterator is drained ONCE into rows; Object.keys() on it is []
+    // and re-iterating a spent generator would render an empty table.
+    let indexes, items;
+    if (!Array.isArray(tabularData) && !ArrayBuffer.isView(tabularData) && typeof tabularData[Symbol.iterator] === "function") {
+      items = Array.from(tabularData);
+      indexes = items.map((_, idx) => String(idx));
+    } else {
+      indexes = Object.keys(tabularData);
+      items = indexes.map((key) => tabularData[key]);
+    }
     const primitive = (value) => value === null || (typeof value !== "object" && typeof value !== "function");
     const hasPrimitives = items.some(primitive);
     const keys = props || (hasPrimitives ? [] : Array.from(new Set(items.flatMap((item) => Object.keys(item)))));
@@ -1607,6 +1836,8 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     });
   } catch (e) {}
   if (G.process) {
+    // Object.prototype.toString.call(process) === "[object process]" in node.
+    try { Object.defineProperty(G.process, Symbol.toStringTag, { value: "process", writable: false, enumerable: false, configurable: true }); } catch (e) {}
     try { Object.defineProperty(G.console, "_stdout", { value: G.process.stdout, writable: true, enumerable: false, configurable: true }); } catch (e) {}
     try { Object.defineProperty(G.console, "_stderr", { value: G.process.stderr, writable: true, enumerable: false, configurable: true }); } catch (e) {}
   }
@@ -1620,6 +1851,31 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       Object.defineProperty(G.console, key, { value: fn, writable: true, enumerable: false, configurable: true });
     } catch (e) {}
   }
+  // The GLOBAL console is bun's own ConsoleObject, not a node Console instance:
+  // its `table` is Bun.inspect.table (blank row-header column, left-aligned
+  // cells), while node:console's Console#table keeps node's cli_table form
+  // ("(index)"/"(iteration index)" headers, centered cells). Only the global is
+  // re-pointed here; Console.prototype.table above is untouched.
+  try {
+    // Method shorthand, NOT `function table(){}`: a function expression is
+    // constructible, and test-console-methods.js asserts every console method
+    // throws TypeError under `new console[method]()`. Console#table above is a
+    // shorthand method and was already correct; re-pointing the global one to a
+    // function expression was what made `new console.table()` stop throwing.
+    const globalTable = { table(tabularData, properties) {
+      if (properties !== undefined && !Array.isArray(properties)) {
+        throw mkConErr(TypeError, "ERR_INVALID_ARG_TYPE",
+          'The "properties" argument must be an instance of Array.' + conArgTypeHelper(properties));
+      }
+      const grid = inspectTableImpl(tabularData, properties);
+      if (grid === "") return G.console.log(tabularData);
+      // inspectTableImpl already ends the grid with a newline; console.log adds
+      // the other one.
+      return G.console.log(grid.endsWith("\n") ? grid.slice(0, -1) : grid);
+    } }.table;
+    Object.defineProperty(G.console, "table", { value: globalTable, writable: true, enumerable: false, configurable: true });
+  } catch (e) {}
+
   // Correct the name/constructability of the native log/warn/error/info/debug
   // WITHOUT altering their behavior. The native console only owns some of these
   // (log/error); the rest (info/debug → log, warn → error) must be aliased to the
@@ -1693,7 +1949,12 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       }
       encodeInto(str, dest) {
         str = String(str);
-        if (!(dest instanceof Uint8Array)) throw new TypeError("The destination must be a Uint8Array");
+        // Cross-realm safe: a vm context's Uint8Array is a different constructor
+        // than the one this builtin closed over, so `instanceof` alone rejects a
+        // perfectly valid destination allocated inside `vm.runInNewContext`.
+        if (!(dest instanceof Uint8Array) &&
+            Object.prototype.toString.call(dest) !== "[object Uint8Array]")
+          throw new TypeError("The destination must be a Uint8Array");
         let read = 0, written = 0;
         while (read < str.length) {
           const first = str.charCodeAt(read); let consumed = 1, bytes;
@@ -1727,11 +1988,42 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     const ENC_ALIAS = { "unicode-1-1-utf-8": "utf-8", "unicode11utf8": "utf-8", "unicode20utf8": "utf-8", "utf-8": "utf-8", "utf8": "utf-8", "x-unicode20utf8": "utf-8", "latin1": "windows-1252", "l1": "windows-1252", "iso-8859-1": "windows-1252", "iso8859-1": "windows-1252", "iso88591": "windows-1252", "cp1252": "windows-1252", "cp819": "windows-1252", "ibm819": "windows-1252", "csisolatin1": "windows-1252", "windows-1252": "windows-1252", "x-cp1252": "windows-1252", "ascii": "windows-1252", "us-ascii": "windows-1252", "ansi_x3.4-1968": "windows-1252", "utf-16le": "utf-16le", "utf-16": "utf-16le", "ucs-2": "utf-16le", "unicodefeff": "utf-16le", "csunicode": "utf-16le", "utf-16be": "utf-16be", "unicodefffe": "utf-16be" };
     // windows-1252 0x80–0x9F differ from latin1; other bytes map identically.
     const W1252 = { 128: 0x20ac, 130: 0x201a, 131: 0x0192, 132: 0x201e, 133: 0x2026, 134: 0x2020, 135: 0x2021, 136: 0x02c6, 137: 0x2030, 138: 0x0160, 139: 0x2039, 140: 0x0152, 142: 0x017d, 145: 0x2018, 146: 0x2019, 147: 0x201c, 148: 0x201d, 149: 0x2022, 150: 0x2013, 151: 0x2014, 152: 0x02dc, 153: 0x2122, 154: 0x0161, 155: 0x203a, 156: 0x0153, 158: 0x017e, 159: 0x0178 };
-    // WHATWG legacy single-byte encodings (0x80-0xFF tables generated from the
-    // Encoding standard indexes); plus x-user-defined (formula) and replacement.
-    const SBT = {"ibm866":"\u0410\u0411\u0412\u0413\u0414\u0415\u0416\u0417\u0418\u0419\u041a\u041b\u041c\u041d\u041e\u041f\u0420\u0421\u0422\u0423\u0424\u0425\u0426\u0427\u0428\u0429\u042a\u042b\u042c\u042d\u042e\u042f\u0430\u0431\u0432\u0433\u0434\u0435\u0436\u0437\u0438\u0439\u043a\u043b\u043c\u043d\u043e\u043f\u2591\u2592\u2593\u2502\u2524\u2561\u2562\u2556\u2555\u2563\u2551\u2557\u255d\u255c\u255b\u2510\u2514\u2534\u252c\u251c\u2500\u253c\u255e\u255f\u255a\u2554\u2569\u2566\u2560\u2550\u256c\u2567\u2568\u2564\u2565\u2559\u2558\u2552\u2553\u256b\u256a\u2518\u250c\u2588\u2584\u258c\u2590\u2580\u0440\u0441\u0442\u0443\u0444\u0445\u0446\u0447\u0448\u0449\u044a\u044b\u044c\u044d\u044e\u044f\u0401\u0451\u0404\u0454\u0407\u0457\u040e\u045e\u00b0\u2219\u00b7\u221a\u2116\u00a4\u25a0\u00a0","iso-8859-3":"\u0080\u0081\u0082\u0083\u0084\u0085\u0086\u0087\u0088\u0089\u008a\u008b\u008c\u008d\u008e\u008f\u0090\u0091\u0092\u0093\u0094\u0095\u0096\u0097\u0098\u0099\u009a\u009b\u009c\u009d\u009e\u009f\u00a0\u0126\u02d8\u00a3\u00a4\ufffd\u0124\u00a7\u00a8\u0130\u015e\u011e\u0134\u00ad\ufffd\u017b\u00b0\u0127\u00b2\u00b3\u00b4\u00b5\u0125\u00b7\u00b8\u0131\u015f\u011f\u0135\u00bd\ufffd\u017c\u00c0\u00c1\u00c2\ufffd\u00c4\u010a\u0108\u00c7\u00c8\u00c9\u00ca\u00cb\u00cc\u00cd\u00ce\u00cf\ufffd\u00d1\u00d2\u00d3\u00d4\u0120\u00d6\u00d7\u011c\u00d9\u00da\u00db\u00dc\u016c\u015c\u00df\u00e0\u00e1\u00e2\ufffd\u00e4\u010b\u0109\u00e7\u00e8\u00e9\u00ea\u00eb\u00ec\u00ed\u00ee\u00ef\ufffd\u00f1\u00f2\u00f3\u00f4\u0121\u00f6\u00f7\u011d\u00f9\u00fa\u00fb\u00fc\u016d\u015d\u02d9","iso-8859-5":"\u0080\u0081\u0082\u0083\u0084\u0085\u0086\u0087\u0088\u0089\u008a\u008b\u008c\u008d\u008e\u008f\u0090\u0091\u0092\u0093\u0094\u0095\u0096\u0097\u0098\u0099\u009a\u009b\u009c\u009d\u009e\u009f\u00a0\u0401\u0402\u0403\u0404\u0405\u0406\u0407\u0408\u0409\u040a\u040b\u040c\u00ad\u040e\u040f\u0410\u0411\u0412\u0413\u0414\u0415\u0416\u0417\u0418\u0419\u041a\u041b\u041c\u041d\u041e\u041f\u0420\u0421\u0422\u0423\u0424\u0425\u0426\u0427\u0428\u0429\u042a\u042b\u042c\u042d\u042e\u042f\u0430\u0431\u0432\u0433\u0434\u0435\u0436\u0437\u0438\u0439\u043a\u043b\u043c\u043d\u043e\u043f\u0440\u0441\u0442\u0443\u0444\u0445\u0446\u0447\u0448\u0449\u044a\u044b\u044c\u044d\u044e\u044f\u2116\u0451\u0452\u0453\u0454\u0455\u0456\u0457\u0458\u0459\u045a\u045b\u045c\u00a7\u045e\u045f","iso-8859-6":"\u0080\u0081\u0082\u0083\u0084\u0085\u0086\u0087\u0088\u0089\u008a\u008b\u008c\u008d\u008e\u008f\u0090\u0091\u0092\u0093\u0094\u0095\u0096\u0097\u0098\u0099\u009a\u009b\u009c\u009d\u009e\u009f\u00a0\ufffd\ufffd\ufffd\u00a4\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u060c\u00ad\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u061b\ufffd\ufffd\ufffd\u061f\ufffd\u0621\u0622\u0623\u0624\u0625\u0626\u0627\u0628\u0629\u062a\u062b\u062c\u062d\u062e\u062f\u0630\u0631\u0632\u0633\u0634\u0635\u0636\u0637\u0638\u0639\u063a\ufffd\ufffd\ufffd\ufffd\ufffd\u0640\u0641\u0642\u0643\u0644\u0645\u0646\u0647\u0648\u0649\u064a\u064b\u064c\u064d\u064e\u064f\u0650\u0651\u0652\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd","iso-8859-7":"\u0080\u0081\u0082\u0083\u0084\u0085\u0086\u0087\u0088\u0089\u008a\u008b\u008c\u008d\u008e\u008f\u0090\u0091\u0092\u0093\u0094\u0095\u0096\u0097\u0098\u0099\u009a\u009b\u009c\u009d\u009e\u009f\u00a0\u2018\u2019\u00a3\u20ac\u20af\u00a6\u00a7\u00a8\u00a9\u037a\u00ab\u00ac\u00ad\ufffd\u2015\u00b0\u00b1\u00b2\u00b3\u0384\u0385\u0386\u00b7\u0388\u0389\u038a\u00bb\u038c\u00bd\u038e\u038f\u0390\u0391\u0392\u0393\u0394\u0395\u0396\u0397\u0398\u0399\u039a\u039b\u039c\u039d\u039e\u039f\u03a0\u03a1\ufffd\u03a3\u03a4\u03a5\u03a6\u03a7\u03a8\u03a9\u03aa\u03ab\u03ac\u03ad\u03ae\u03af\u03b0\u03b1\u03b2\u03b3\u03b4\u03b5\u03b6\u03b7\u03b8\u03b9\u03ba\u03bb\u03bc\u03bd\u03be\u03bf\u03c0\u03c1\u03c2\u03c3\u03c4\u03c5\u03c6\u03c7\u03c8\u03c9\u03ca\u03cb\u03cc\u03cd\u03ce\ufffd","iso-8859-8":"\u0080\u0081\u0082\u0083\u0084\u0085\u0086\u0087\u0088\u0089\u008a\u008b\u008c\u008d\u008e\u008f\u0090\u0091\u0092\u0093\u0094\u0095\u0096\u0097\u0098\u0099\u009a\u009b\u009c\u009d\u009e\u009f\u00a0\ufffd\u00a2\u00a3\u00a4\u00a5\u00a6\u00a7\u00a8\u00a9\u00d7\u00ab\u00ac\u00ad\u00ae\u00af\u00b0\u00b1\u00b2\u00b3\u00b4\u00b5\u00b6\u00b7\u00b8\u00b9\u00f7\u00bb\u00bc\u00bd\u00be\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u2017\u05d0\u05d1\u05d2\u05d3\u05d4\u05d5\u05d6\u05d7\u05d8\u05d9\u05da\u05db\u05dc\u05dd\u05de\u05df\u05e0\u05e1\u05e2\u05e3\u05e4\u05e5\u05e6\u05e7\u05e8\u05e9\u05ea\ufffd\ufffd\u200e\u200f\ufffd","koi8-u":"\u2500\u2502\u250c\u2510\u2514\u2518\u251c\u2524\u252c\u2534\u253c\u2580\u2584\u2588\u258c\u2590\u2591\u2592\u2593\u2320\u25a0\u2219\u221a\u2248\u2264\u2265\u00a0\u2321\u00b0\u00b2\u00b7\u00f7\u2550\u2551\u2552\u0451\u0454\u2554\u0456\u0457\u2557\u2558\u2559\u255a\u255b\u0491\u255d\u255e\u255f\u2560\u2561\u0401\u0404\u2563\u0406\u0407\u2566\u2567\u2568\u2569\u256a\u0490\u256c\u00a9\u044e\u0430\u0431\u0446\u0434\u0435\u0444\u0433\u0445\u0438\u0439\u043a\u043b\u043c\u043d\u043e\u043f\u044f\u0440\u0441\u0442\u0443\u0436\u0432\u044c\u044b\u0437\u0448\u044d\u0449\u0447\u044a\u042e\u0410\u0411\u0426\u0414\u0415\u0424\u0413\u0425\u0418\u0419\u041a\u041b\u041c\u041d\u041e\u041f\u042f\u0420\u0421\u0422\u0423\u0416\u0412\u042c\u042b\u0417\u0428\u042d\u0429\u0427\u042a","windows-1253":"\u20ac\ufffd\u201a\u0192\u201e\u2026\u2020\u2021\ufffd\u2030\ufffd\u2039\ufffd\ufffd\ufffd\ufffd\ufffd\u2018\u2019\u201c\u201d\u2022\u2013\u2014\ufffd\u2122\ufffd\u203a\ufffd\ufffd\ufffd\ufffd\u00a0\u0385\u0386\u00a3\u00a4\u00a5\u00a6\u00a7\u00a8\u00a9\ufffd\u00ab\u00ac\u00ad\u00ae\u2015\u00b0\u00b1\u00b2\u00b3\u0384\u00b5\u00b6\u00b7\u0388\u0389\u038a\u00bb\u038c\u00bd\u038e\u038f\u0390\u0391\u0392\u0393\u0394\u0395\u0396\u0397\u0398\u0399\u039a\u039b\u039c\u039d\u039e\u039f\u03a0\u03a1\ufffd\u03a3\u03a4\u03a5\u03a6\u03a7\u03a8\u03a9\u03aa\u03ab\u03ac\u03ad\u03ae\u03af\u03b0\u03b1\u03b2\u03b3\u03b4\u03b5\u03b6\u03b7\u03b8\u03b9\u03ba\u03bb\u03bc\u03bd\u03be\u03bf\u03c0\u03c1\u03c2\u03c3\u03c4\u03c5\u03c6\u03c7\u03c8\u03c9\u03ca\u03cb\u03cc\u03cd\u03ce\ufffd","windows-1255":"\u20ac\ufffd\u201a\u0192\u201e\u2026\u2020\u2021\u02c6\u2030\ufffd\u2039\ufffd\ufffd\ufffd\ufffd\ufffd\u2018\u2019\u201c\u201d\u2022\u2013\u2014\u02dc\u2122\ufffd\u203a\ufffd\ufffd\ufffd\ufffd\u00a0\u00a1\u00a2\u00a3\u20aa\u00a5\u00a6\u00a7\u00a8\u00a9\u00d7\u00ab\u00ac\u00ad\u00ae\u00af\u00b0\u00b1\u00b2\u00b3\u00b4\u00b5\u00b6\u00b7\u00b8\u00b9\u00f7\u00bb\u00bc\u00bd\u00be\u00bf\u05b0\u05b1\u05b2\u05b3\u05b4\u05b5\u05b6\u05b7\u05b8\u05b9\ufffd\u05bb\u05bc\u05bd\u05be\u05bf\u05c0\u05c1\u05c2\u05c3\u05f0\u05f1\u05f2\u05f3\u05f4\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u05d0\u05d1\u05d2\u05d3\u05d4\u05d5\u05d6\u05d7\u05d8\u05d9\u05da\u05db\u05dc\u05dd\u05de\u05df\u05e0\u05e1\u05e2\u05e3\u05e4\u05e5\u05e6\u05e7\u05e8\u05e9\u05ea\ufffd\ufffd\u200e\u200f\ufffd","windows-1257":"\u20ac\ufffd\u201a\ufffd\u201e\u2026\u2020\u2021\ufffd\u2030\ufffd\u2039\ufffd\u00a8\u02c7\u00b8\ufffd\u2018\u2019\u201c\u201d\u2022\u2013\u2014\ufffd\u2122\ufffd\u203a\ufffd\u00af\u02db\ufffd\u00a0\ufffd\u00a2\u00a3\u00a4\ufffd\u00a6\u00a7\u00d8\u00a9\u0156\u00ab\u00ac\u00ad\u00ae\u00c6\u00b0\u00b1\u00b2\u00b3\u00b4\u00b5\u00b6\u00b7\u00f8\u00b9\u0157\u00bb\u00bc\u00bd\u00be\u00e6\u0104\u012e\u0100\u0106\u00c4\u00c5\u0118\u0112\u010c\u00c9\u0179\u0116\u0122\u0136\u012a\u013b\u0160\u0143\u0145\u00d3\u014c\u00d5\u00d6\u00d7\u0172\u0141\u015a\u016a\u00dc\u017b\u017d\u00df\u0105\u012f\u0101\u0107\u00e4\u00e5\u0119\u0113\u010d\u00e9\u017a\u0117\u0123\u0137\u012b\u013c\u0161\u0144\u0146\u00f3\u014d\u00f5\u00f6\u00f7\u0173\u0142\u015b\u016b\u00fc\u017c\u017e\u02d9","windows-874":"\u20ac\ufffd\ufffd\ufffd\ufffd\u2026\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u2018\u2019\u201c\u201d\u2022\u2013\u2014\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u00a0\u0e01\u0e02\u0e03\u0e04\u0e05\u0e06\u0e07\u0e08\u0e09\u0e0a\u0e0b\u0e0c\u0e0d\u0e0e\u0e0f\u0e10\u0e11\u0e12\u0e13\u0e14\u0e15\u0e16\u0e17\u0e18\u0e19\u0e1a\u0e1b\u0e1c\u0e1d\u0e1e\u0e1f\u0e20\u0e21\u0e22\u0e23\u0e24\u0e25\u0e26\u0e27\u0e28\u0e29\u0e2a\u0e2b\u0e2c\u0e2d\u0e2e\u0e2f\u0e30\u0e31\u0e32\u0e33\u0e34\u0e35\u0e36\u0e37\u0e38\u0e39\u0e3a\ufffd\ufffd\ufffd\ufffd\u0e3f\u0e40\u0e41\u0e42\u0e43\u0e44\u0e45\u0e46\u0e47\u0e48\u0e49\u0e4a\u0e4b\u0e4c\u0e4d\u0e4e\u0e4f\u0e50\u0e51\u0e52\u0e53\u0e54\u0e55\u0e56\u0e57\u0e58\u0e59\u0e5a\u0e5b\ufffd\ufffd\ufffd\ufffd"};
+    // WHATWG legacy single-byte encodings: index tables straight from the
+    // Encoding standard (28 encodings). Five of the eleven that used to be here
+    // were transcribed by hand and disagreed with the standard index
+    // (koi8-u, windows-874, windows-1253, windows-1255, windows-1257), and
+    // seventeen were missing outright, so TextDecoder("iso-8859-2") threw. The
+    // decoder that consumes them was already complete: a hole decodes to U+FFFD,
+    // or throws under `fatal`.
+    const SBT = {};
+    SBT["ibm866"] = "\u0410\u0411\u0412\u0413\u0414\u0415\u0416\u0417\u0418\u0419\u041a\u041b\u041c\u041d\u041e\u041f\u0420\u0421\u0422\u0423\u0424\u0425\u0426\u0427\u0428\u0429\u042a\u042b\u042c\u042d\u042e\u042f\u0430\u0431\u0432\u0433\u0434\u0435\u0436\u0437\u0438\u0439\u043a\u043b\u043c\u043d\u043e\u043f\u2591\u2592\u2593\u2502\u2524\u2561\u2562\u2556\u2555\u2563\u2551\u2557\u255d\u255c\u255b\u2510\u2514\u2534\u252c\u251c\u2500\u253c\u255e\u255f\u255a\u2554\u2569\u2566\u2560\u2550\u256c\u2567\u2568\u2564\u2565\u2559\u2558\u2552\u2553\u256b\u256a\u2518\u250c\u2588\u2584\u258c\u2590\u2580\u0440\u0441\u0442\u0443\u0444\u0445\u0446\u0447\u0448\u0449\u044a\u044b\u044c\u044d\u044e\u044f\u0401\u0451\u0404\u0454\u0407\u0457\u040e\u045e\u00b0\u2219\u00b7\u221a\u2116\u00a4\u25a0\u00a0";
+    SBT["iso-8859-2"] = "\u0080\u0081\u0082\u0083\u0084\u0085\u0086\u0087\u0088\u0089\u008a\u008b\u008c\u008d\u008e\u008f\u0090\u0091\u0092\u0093\u0094\u0095\u0096\u0097\u0098\u0099\u009a\u009b\u009c\u009d\u009e\u009f\u00a0\u0104\u02d8\u0141\u00a4\u013d\u015a\u00a7\u00a8\u0160\u015e\u0164\u0179\u00ad\u017d\u017b\u00b0\u0105\u02db\u0142\u00b4\u013e\u015b\u02c7\u00b8\u0161\u015f\u0165\u017a\u02dd\u017e\u017c\u0154\u00c1\u00c2\u0102\u00c4\u0139\u0106\u00c7\u010c\u00c9\u0118\u00cb\u011a\u00cd\u00ce\u010e\u0110\u0143\u0147\u00d3\u00d4\u0150\u00d6\u00d7\u0158\u016e\u00da\u0170\u00dc\u00dd\u0162\u00df\u0155\u00e1\u00e2\u0103\u00e4\u013a\u0107\u00e7\u010d\u00e9\u0119\u00eb\u011b\u00ed\u00ee\u010f\u0111\u0144\u0148\u00f3\u00f4\u0151\u00f6\u00f7\u0159\u016f\u00fa\u0171\u00fc\u00fd\u0163\u02d9";
+    SBT["iso-8859-3"] = "\u0080\u0081\u0082\u0083\u0084\u0085\u0086\u0087\u0088\u0089\u008a\u008b\u008c\u008d\u008e\u008f\u0090\u0091\u0092\u0093\u0094\u0095\u0096\u0097\u0098\u0099\u009a\u009b\u009c\u009d\u009e\u009f\u00a0\u0126\u02d8\u00a3\u00a4\ufffd\u0124\u00a7\u00a8\u0130\u015e\u011e\u0134\u00ad\ufffd\u017b\u00b0\u0127\u00b2\u00b3\u00b4\u00b5\u0125\u00b7\u00b8\u0131\u015f\u011f\u0135\u00bd\ufffd\u017c\u00c0\u00c1\u00c2\ufffd\u00c4\u010a\u0108\u00c7\u00c8\u00c9\u00ca\u00cb\u00cc\u00cd\u00ce\u00cf\ufffd\u00d1\u00d2\u00d3\u00d4\u0120\u00d6\u00d7\u011c\u00d9\u00da\u00db\u00dc\u016c\u015c\u00df\u00e0\u00e1\u00e2\ufffd\u00e4\u010b\u0109\u00e7\u00e8\u00e9\u00ea\u00eb\u00ec\u00ed\u00ee\u00ef\ufffd\u00f1\u00f2\u00f3\u00f4\u0121\u00f6\u00f7\u011d\u00f9\u00fa\u00fb\u00fc\u016d\u015d\u02d9";
+    SBT["iso-8859-4"] = "\u0080\u0081\u0082\u0083\u0084\u0085\u0086\u0087\u0088\u0089\u008a\u008b\u008c\u008d\u008e\u008f\u0090\u0091\u0092\u0093\u0094\u0095\u0096\u0097\u0098\u0099\u009a\u009b\u009c\u009d\u009e\u009f\u00a0\u0104\u0138\u0156\u00a4\u0128\u013b\u00a7\u00a8\u0160\u0112\u0122\u0166\u00ad\u017d\u00af\u00b0\u0105\u02db\u0157\u00b4\u0129\u013c\u02c7\u00b8\u0161\u0113\u0123\u0167\u014a\u017e\u014b\u0100\u00c1\u00c2\u00c3\u00c4\u00c5\u00c6\u012e\u010c\u00c9\u0118\u00cb\u0116\u00cd\u00ce\u012a\u0110\u0145\u014c\u0136\u00d4\u00d5\u00d6\u00d7\u00d8\u0172\u00da\u00db\u00dc\u0168\u016a\u00df\u0101\u00e1\u00e2\u00e3\u00e4\u00e5\u00e6\u012f\u010d\u00e9\u0119\u00eb\u0117\u00ed\u00ee\u012b\u0111\u0146\u014d\u0137\u00f4\u00f5\u00f6\u00f7\u00f8\u0173\u00fa\u00fb\u00fc\u0169\u016b\u02d9";
+    SBT["iso-8859-5"] = "\u0080\u0081\u0082\u0083\u0084\u0085\u0086\u0087\u0088\u0089\u008a\u008b\u008c\u008d\u008e\u008f\u0090\u0091\u0092\u0093\u0094\u0095\u0096\u0097\u0098\u0099\u009a\u009b\u009c\u009d\u009e\u009f\u00a0\u0401\u0402\u0403\u0404\u0405\u0406\u0407\u0408\u0409\u040a\u040b\u040c\u00ad\u040e\u040f\u0410\u0411\u0412\u0413\u0414\u0415\u0416\u0417\u0418\u0419\u041a\u041b\u041c\u041d\u041e\u041f\u0420\u0421\u0422\u0423\u0424\u0425\u0426\u0427\u0428\u0429\u042a\u042b\u042c\u042d\u042e\u042f\u0430\u0431\u0432\u0433\u0434\u0435\u0436\u0437\u0438\u0439\u043a\u043b\u043c\u043d\u043e\u043f\u0440\u0441\u0442\u0443\u0444\u0445\u0446\u0447\u0448\u0449\u044a\u044b\u044c\u044d\u044e\u044f\u2116\u0451\u0452\u0453\u0454\u0455\u0456\u0457\u0458\u0459\u045a\u045b\u045c\u00a7\u045e\u045f";
+    SBT["iso-8859-6"] = "\u0080\u0081\u0082\u0083\u0084\u0085\u0086\u0087\u0088\u0089\u008a\u008b\u008c\u008d\u008e\u008f\u0090\u0091\u0092\u0093\u0094\u0095\u0096\u0097\u0098\u0099\u009a\u009b\u009c\u009d\u009e\u009f\u00a0\ufffd\ufffd\ufffd\u00a4\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u060c\u00ad\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u061b\ufffd\ufffd\ufffd\u061f\ufffd\u0621\u0622\u0623\u0624\u0625\u0626\u0627\u0628\u0629\u062a\u062b\u062c\u062d\u062e\u062f\u0630\u0631\u0632\u0633\u0634\u0635\u0636\u0637\u0638\u0639\u063a\ufffd\ufffd\ufffd\ufffd\ufffd\u0640\u0641\u0642\u0643\u0644\u0645\u0646\u0647\u0648\u0649\u064a\u064b\u064c\u064d\u064e\u064f\u0650\u0651\u0652\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd";
+    SBT["iso-8859-7"] = "\u0080\u0081\u0082\u0083\u0084\u0085\u0086\u0087\u0088\u0089\u008a\u008b\u008c\u008d\u008e\u008f\u0090\u0091\u0092\u0093\u0094\u0095\u0096\u0097\u0098\u0099\u009a\u009b\u009c\u009d\u009e\u009f\u00a0\u2018\u2019\u00a3\u20ac\u20af\u00a6\u00a7\u00a8\u00a9\u037a\u00ab\u00ac\u00ad\ufffd\u2015\u00b0\u00b1\u00b2\u00b3\u0384\u0385\u0386\u00b7\u0388\u0389\u038a\u00bb\u038c\u00bd\u038e\u038f\u0390\u0391\u0392\u0393\u0394\u0395\u0396\u0397\u0398\u0399\u039a\u039b\u039c\u039d\u039e\u039f\u03a0\u03a1\ufffd\u03a3\u03a4\u03a5\u03a6\u03a7\u03a8\u03a9\u03aa\u03ab\u03ac\u03ad\u03ae\u03af\u03b0\u03b1\u03b2\u03b3\u03b4\u03b5\u03b6\u03b7\u03b8\u03b9\u03ba\u03bb\u03bc\u03bd\u03be\u03bf\u03c0\u03c1\u03c2\u03c3\u03c4\u03c5\u03c6\u03c7\u03c8\u03c9\u03ca\u03cb\u03cc\u03cd\u03ce\ufffd";
+    SBT["iso-8859-8"] = "\u0080\u0081\u0082\u0083\u0084\u0085\u0086\u0087\u0088\u0089\u008a\u008b\u008c\u008d\u008e\u008f\u0090\u0091\u0092\u0093\u0094\u0095\u0096\u0097\u0098\u0099\u009a\u009b\u009c\u009d\u009e\u009f\u00a0\ufffd\u00a2\u00a3\u00a4\u00a5\u00a6\u00a7\u00a8\u00a9\u00d7\u00ab\u00ac\u00ad\u00ae\u00af\u00b0\u00b1\u00b2\u00b3\u00b4\u00b5\u00b6\u00b7\u00b8\u00b9\u00f7\u00bb\u00bc\u00bd\u00be\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u2017\u05d0\u05d1\u05d2\u05d3\u05d4\u05d5\u05d6\u05d7\u05d8\u05d9\u05da\u05db\u05dc\u05dd\u05de\u05df\u05e0\u05e1\u05e2\u05e3\u05e4\u05e5\u05e6\u05e7\u05e8\u05e9\u05ea\ufffd\ufffd\u200e\u200f\ufffd";
+    SBT["iso-8859-10"] = "\u0080\u0081\u0082\u0083\u0084\u0085\u0086\u0087\u0088\u0089\u008a\u008b\u008c\u008d\u008e\u008f\u0090\u0091\u0092\u0093\u0094\u0095\u0096\u0097\u0098\u0099\u009a\u009b\u009c\u009d\u009e\u009f\u00a0\u0104\u0112\u0122\u012a\u0128\u0136\u00a7\u013b\u0110\u0160\u0166\u017d\u00ad\u016a\u014a\u00b0\u0105\u0113\u0123\u012b\u0129\u0137\u00b7\u013c\u0111\u0161\u0167\u017e\u2015\u016b\u014b\u0100\u00c1\u00c2\u00c3\u00c4\u00c5\u00c6\u012e\u010c\u00c9\u0118\u00cb\u0116\u00cd\u00ce\u00cf\u00d0\u0145\u014c\u00d3\u00d4\u00d5\u00d6\u0168\u00d8\u0172\u00da\u00db\u00dc\u00dd\u00de\u00df\u0101\u00e1\u00e2\u00e3\u00e4\u00e5\u00e6\u012f\u010d\u00e9\u0119\u00eb\u0117\u00ed\u00ee\u00ef\u00f0\u0146\u014d\u00f3\u00f4\u00f5\u00f6\u0169\u00f8\u0173\u00fa\u00fb\u00fc\u00fd\u00fe\u0138";
+    SBT["iso-8859-13"] = "\u0080\u0081\u0082\u0083\u0084\u0085\u0086\u0087\u0088\u0089\u008a\u008b\u008c\u008d\u008e\u008f\u0090\u0091\u0092\u0093\u0094\u0095\u0096\u0097\u0098\u0099\u009a\u009b\u009c\u009d\u009e\u009f\u00a0\u201d\u00a2\u00a3\u00a4\u201e\u00a6\u00a7\u00d8\u00a9\u0156\u00ab\u00ac\u00ad\u00ae\u00c6\u00b0\u00b1\u00b2\u00b3\u201c\u00b5\u00b6\u00b7\u00f8\u00b9\u0157\u00bb\u00bc\u00bd\u00be\u00e6\u0104\u012e\u0100\u0106\u00c4\u00c5\u0118\u0112\u010c\u00c9\u0179\u0116\u0122\u0136\u012a\u013b\u0160\u0143\u0145\u00d3\u014c\u00d5\u00d6\u00d7\u0172\u0141\u015a\u016a\u00dc\u017b\u017d\u00df\u0105\u012f\u0101\u0107\u00e4\u00e5\u0119\u0113\u010d\u00e9\u017a\u0117\u0123\u0137\u012b\u013c\u0161\u0144\u0146\u00f3\u014d\u00f5\u00f6\u00f7\u0173\u0142\u015b\u016b\u00fc\u017c\u017e\u2019";
+    SBT["iso-8859-14"] = "\u0080\u0081\u0082\u0083\u0084\u0085\u0086\u0087\u0088\u0089\u008a\u008b\u008c\u008d\u008e\u008f\u0090\u0091\u0092\u0093\u0094\u0095\u0096\u0097\u0098\u0099\u009a\u009b\u009c\u009d\u009e\u009f\u00a0\u1e02\u1e03\u00a3\u010a\u010b\u1e0a\u00a7\u1e80\u00a9\u1e82\u1e0b\u1ef2\u00ad\u00ae\u0178\u1e1e\u1e1f\u0120\u0121\u1e40\u1e41\u00b6\u1e56\u1e81\u1e57\u1e83\u1e60\u1ef3\u1e84\u1e85\u1e61\u00c0\u00c1\u00c2\u00c3\u00c4\u00c5\u00c6\u00c7\u00c8\u00c9\u00ca\u00cb\u00cc\u00cd\u00ce\u00cf\u0174\u00d1\u00d2\u00d3\u00d4\u00d5\u00d6\u1e6a\u00d8\u00d9\u00da\u00db\u00dc\u00dd\u0176\u00df\u00e0\u00e1\u00e2\u00e3\u00e4\u00e5\u00e6\u00e7\u00e8\u00e9\u00ea\u00eb\u00ec\u00ed\u00ee\u00ef\u0175\u00f1\u00f2\u00f3\u00f4\u00f5\u00f6\u1e6b\u00f8\u00f9\u00fa\u00fb\u00fc\u00fd\u0177\u00ff";
+    SBT["iso-8859-15"] = "\u0080\u0081\u0082\u0083\u0084\u0085\u0086\u0087\u0088\u0089\u008a\u008b\u008c\u008d\u008e\u008f\u0090\u0091\u0092\u0093\u0094\u0095\u0096\u0097\u0098\u0099\u009a\u009b\u009c\u009d\u009e\u009f\u00a0\u00a1\u00a2\u00a3\u20ac\u00a5\u0160\u00a7\u0161\u00a9\u00aa\u00ab\u00ac\u00ad\u00ae\u00af\u00b0\u00b1\u00b2\u00b3\u017d\u00b5\u00b6\u00b7\u017e\u00b9\u00ba\u00bb\u0152\u0153\u0178\u00bf\u00c0\u00c1\u00c2\u00c3\u00c4\u00c5\u00c6\u00c7\u00c8\u00c9\u00ca\u00cb\u00cc\u00cd\u00ce\u00cf\u00d0\u00d1\u00d2\u00d3\u00d4\u00d5\u00d6\u00d7\u00d8\u00d9\u00da\u00db\u00dc\u00dd\u00de\u00df\u00e0\u00e1\u00e2\u00e3\u00e4\u00e5\u00e6\u00e7\u00e8\u00e9\u00ea\u00eb\u00ec\u00ed\u00ee\u00ef\u00f0\u00f1\u00f2\u00f3\u00f4\u00f5\u00f6\u00f7\u00f8\u00f9\u00fa\u00fb\u00fc\u00fd\u00fe\u00ff";
+    SBT["iso-8859-16"] = "\u0080\u0081\u0082\u0083\u0084\u0085\u0086\u0087\u0088\u0089\u008a\u008b\u008c\u008d\u008e\u008f\u0090\u0091\u0092\u0093\u0094\u0095\u0096\u0097\u0098\u0099\u009a\u009b\u009c\u009d\u009e\u009f\u00a0\u0104\u0105\u0141\u20ac\u201e\u0160\u00a7\u0161\u00a9\u0218\u00ab\u0179\u00ad\u017a\u017b\u00b0\u00b1\u010c\u0142\u017d\u201d\u00b6\u00b7\u017e\u010d\u0219\u00bb\u0152\u0153\u0178\u017c\u00c0\u00c1\u00c2\u0102\u00c4\u0106\u00c6\u00c7\u00c8\u00c9\u00ca\u00cb\u00cc\u00cd\u00ce\u00cf\u0110\u0143\u00d2\u00d3\u00d4\u0150\u00d6\u015a\u0170\u00d9\u00da\u00db\u00dc\u0118\u021a\u00df\u00e0\u00e1\u00e2\u0103\u00e4\u0107\u00e6\u00e7\u00e8\u00e9\u00ea\u00eb\u00ec\u00ed\u00ee\u00ef\u0111\u0144\u00f2\u00f3\u00f4\u0151\u00f6\u015b\u0171\u00f9\u00fa\u00fb\u00fc\u0119\u021b\u00ff";
+    SBT["koi8-r"] = "\u2500\u2502\u250c\u2510\u2514\u2518\u251c\u2524\u252c\u2534\u253c\u2580\u2584\u2588\u258c\u2590\u2591\u2592\u2593\u2320\u25a0\u2219\u221a\u2248\u2264\u2265\u00a0\u2321\u00b0\u00b2\u00b7\u00f7\u2550\u2551\u2552\u0451\u2553\u2554\u2555\u2556\u2557\u2558\u2559\u255a\u255b\u255c\u255d\u255e\u255f\u2560\u2561\u0401\u2562\u2563\u2564\u2565\u2566\u2567\u2568\u2569\u256a\u256b\u256c\u00a9\u044e\u0430\u0431\u0446\u0434\u0435\u0444\u0433\u0445\u0438\u0439\u043a\u043b\u043c\u043d\u043e\u043f\u044f\u0440\u0441\u0442\u0443\u0436\u0432\u044c\u044b\u0437\u0448\u044d\u0449\u0447\u044a\u042e\u0410\u0411\u0426\u0414\u0415\u0424\u0413\u0425\u0418\u0419\u041a\u041b\u041c\u041d\u041e\u041f\u042f\u0420\u0421\u0422\u0423\u0416\u0412\u042c\u042b\u0417\u0428\u042d\u0429\u0427\u042a";
+    SBT["koi8-u"] = "\u2500\u2502\u250c\u2510\u2514\u2518\u251c\u2524\u252c\u2534\u253c\u2580\u2584\u2588\u258c\u2590\u2591\u2592\u2593\u2320\u25a0\u2219\u221a\u2248\u2264\u2265\u00a0\u2321\u00b0\u00b2\u00b7\u00f7\u2550\u2551\u2552\u0451\u0454\u2554\u0456\u0457\u2557\u2558\u2559\u255a\u255b\u0491\u045e\u255e\u255f\u2560\u2561\u0401\u0404\u2563\u0406\u0407\u2566\u2567\u2568\u2569\u256a\u0490\u040e\u00a9\u044e\u0430\u0431\u0446\u0434\u0435\u0444\u0433\u0445\u0438\u0439\u043a\u043b\u043c\u043d\u043e\u043f\u044f\u0440\u0441\u0442\u0443\u0436\u0432\u044c\u044b\u0437\u0448\u044d\u0449\u0447\u044a\u042e\u0410\u0411\u0426\u0414\u0415\u0424\u0413\u0425\u0418\u0419\u041a\u041b\u041c\u041d\u041e\u041f\u042f\u0420\u0421\u0422\u0423\u0416\u0412\u042c\u042b\u0417\u0428\u042d\u0429\u0427\u042a";
+    SBT["macintosh"] = "\u00c4\u00c5\u00c7\u00c9\u00d1\u00d6\u00dc\u00e1\u00e0\u00e2\u00e4\u00e3\u00e5\u00e7\u00e9\u00e8\u00ea\u00eb\u00ed\u00ec\u00ee\u00ef\u00f1\u00f3\u00f2\u00f4\u00f6\u00f5\u00fa\u00f9\u00fb\u00fc\u2020\u00b0\u00a2\u00a3\u00a7\u2022\u00b6\u00df\u00ae\u00a9\u2122\u00b4\u00a8\u2260\u00c6\u00d8\u221e\u00b1\u2264\u2265\u00a5\u00b5\u2202\u2211\u220f\u03c0\u222b\u00aa\u00ba\u03a9\u00e6\u00f8\u00bf\u00a1\u00ac\u221a\u0192\u2248\u2206\u00ab\u00bb\u2026\u00a0\u00c0\u00c3\u00d5\u0152\u0153\u2013\u2014\u201c\u201d\u2018\u2019\u00f7\u25ca\u00ff\u0178\u2044\u20ac\u2039\u203a\ufb01\ufb02\u2021\u00b7\u201a\u201e\u2030\u00c2\u00ca\u00c1\u00cb\u00c8\u00cd\u00ce\u00cf\u00cc\u00d3\u00d4\uf8ff\u00d2\u00da\u00db\u00d9\u0131\u02c6\u02dc\u00af\u02d8\u02d9\u02da\u00b8\u02dd\u02db\u02c7";
+    SBT["windows-874"] = "\u20ac\u0081\u0082\u0083\u0084\u2026\u0086\u0087\u0088\u0089\u008a\u008b\u008c\u008d\u008e\u008f\u0090\u2018\u2019\u201c\u201d\u2022\u2013\u2014\u0098\u0099\u009a\u009b\u009c\u009d\u009e\u009f\u00a0\u0e01\u0e02\u0e03\u0e04\u0e05\u0e06\u0e07\u0e08\u0e09\u0e0a\u0e0b\u0e0c\u0e0d\u0e0e\u0e0f\u0e10\u0e11\u0e12\u0e13\u0e14\u0e15\u0e16\u0e17\u0e18\u0e19\u0e1a\u0e1b\u0e1c\u0e1d\u0e1e\u0e1f\u0e20\u0e21\u0e22\u0e23\u0e24\u0e25\u0e26\u0e27\u0e28\u0e29\u0e2a\u0e2b\u0e2c\u0e2d\u0e2e\u0e2f\u0e30\u0e31\u0e32\u0e33\u0e34\u0e35\u0e36\u0e37\u0e38\u0e39\u0e3a\ufffd\ufffd\ufffd\ufffd\u0e3f\u0e40\u0e41\u0e42\u0e43\u0e44\u0e45\u0e46\u0e47\u0e48\u0e49\u0e4a\u0e4b\u0e4c\u0e4d\u0e4e\u0e4f\u0e50\u0e51\u0e52\u0e53\u0e54\u0e55\u0e56\u0e57\u0e58\u0e59\u0e5a\u0e5b\ufffd\ufffd\ufffd\ufffd";
+    SBT["windows-1250"] = "\u20ac\u0081\u201a\u0083\u201e\u2026\u2020\u2021\u0088\u2030\u0160\u2039\u015a\u0164\u017d\u0179\u0090\u2018\u2019\u201c\u201d\u2022\u2013\u2014\u0098\u2122\u0161\u203a\u015b\u0165\u017e\u017a\u00a0\u02c7\u02d8\u0141\u00a4\u0104\u00a6\u00a7\u00a8\u00a9\u015e\u00ab\u00ac\u00ad\u00ae\u017b\u00b0\u00b1\u02db\u0142\u00b4\u00b5\u00b6\u00b7\u00b8\u0105\u015f\u00bb\u013d\u02dd\u013e\u017c\u0154\u00c1\u00c2\u0102\u00c4\u0139\u0106\u00c7\u010c\u00c9\u0118\u00cb\u011a\u00cd\u00ce\u010e\u0110\u0143\u0147\u00d3\u00d4\u0150\u00d6\u00d7\u0158\u016e\u00da\u0170\u00dc\u00dd\u0162\u00df\u0155\u00e1\u00e2\u0103\u00e4\u013a\u0107\u00e7\u010d\u00e9\u0119\u00eb\u011b\u00ed\u00ee\u010f\u0111\u0144\u0148\u00f3\u00f4\u0151\u00f6\u00f7\u0159\u016f\u00fa\u0171\u00fc\u00fd\u0163\u02d9";
+    SBT["windows-1251"] = "\u0402\u0403\u201a\u0453\u201e\u2026\u2020\u2021\u20ac\u2030\u0409\u2039\u040a\u040c\u040b\u040f\u0452\u2018\u2019\u201c\u201d\u2022\u2013\u2014\u0098\u2122\u0459\u203a\u045a\u045c\u045b\u045f\u00a0\u040e\u045e\u0408\u00a4\u0490\u00a6\u00a7\u0401\u00a9\u0404\u00ab\u00ac\u00ad\u00ae\u0407\u00b0\u00b1\u0406\u0456\u0491\u00b5\u00b6\u00b7\u0451\u2116\u0454\u00bb\u0458\u0405\u0455\u0457\u0410\u0411\u0412\u0413\u0414\u0415\u0416\u0417\u0418\u0419\u041a\u041b\u041c\u041d\u041e\u041f\u0420\u0421\u0422\u0423\u0424\u0425\u0426\u0427\u0428\u0429\u042a\u042b\u042c\u042d\u042e\u042f\u0430\u0431\u0432\u0433\u0434\u0435\u0436\u0437\u0438\u0439\u043a\u043b\u043c\u043d\u043e\u043f\u0440\u0441\u0442\u0443\u0444\u0445\u0446\u0447\u0448\u0449\u044a\u044b\u044c\u044d\u044e\u044f";
+    SBT["windows-1253"] = "\u20ac\u0081\u201a\u0192\u201e\u2026\u2020\u2021\u0088\u2030\u008a\u2039\u008c\u008d\u008e\u008f\u0090\u2018\u2019\u201c\u201d\u2022\u2013\u2014\u0098\u2122\u009a\u203a\u009c\u009d\u009e\u009f\u00a0\u0385\u0386\u00a3\u00a4\u00a5\u00a6\u00a7\u00a8\u00a9\ufffd\u00ab\u00ac\u00ad\u00ae\u2015\u00b0\u00b1\u00b2\u00b3\u0384\u00b5\u00b6\u00b7\u0388\u0389\u038a\u00bb\u038c\u00bd\u038e\u038f\u0390\u0391\u0392\u0393\u0394\u0395\u0396\u0397\u0398\u0399\u039a\u039b\u039c\u039d\u039e\u039f\u03a0\u03a1\ufffd\u03a3\u03a4\u03a5\u03a6\u03a7\u03a8\u03a9\u03aa\u03ab\u03ac\u03ad\u03ae\u03af\u03b0\u03b1\u03b2\u03b3\u03b4\u03b5\u03b6\u03b7\u03b8\u03b9\u03ba\u03bb\u03bc\u03bd\u03be\u03bf\u03c0\u03c1\u03c2\u03c3\u03c4\u03c5\u03c6\u03c7\u03c8\u03c9\u03ca\u03cb\u03cc\u03cd\u03ce\ufffd";
+    SBT["windows-1254"] = "\u20ac\u0081\u201a\u0192\u201e\u2026\u2020\u2021\u02c6\u2030\u0160\u2039\u0152\u008d\u008e\u008f\u0090\u2018\u2019\u201c\u201d\u2022\u2013\u2014\u02dc\u2122\u0161\u203a\u0153\u009d\u009e\u0178\u00a0\u00a1\u00a2\u00a3\u00a4\u00a5\u00a6\u00a7\u00a8\u00a9\u00aa\u00ab\u00ac\u00ad\u00ae\u00af\u00b0\u00b1\u00b2\u00b3\u00b4\u00b5\u00b6\u00b7\u00b8\u00b9\u00ba\u00bb\u00bc\u00bd\u00be\u00bf\u00c0\u00c1\u00c2\u00c3\u00c4\u00c5\u00c6\u00c7\u00c8\u00c9\u00ca\u00cb\u00cc\u00cd\u00ce\u00cf\u011e\u00d1\u00d2\u00d3\u00d4\u00d5\u00d6\u00d7\u00d8\u00d9\u00da\u00db\u00dc\u0130\u015e\u00df\u00e0\u00e1\u00e2\u00e3\u00e4\u00e5\u00e6\u00e7\u00e8\u00e9\u00ea\u00eb\u00ec\u00ed\u00ee\u00ef\u011f\u00f1\u00f2\u00f3\u00f4\u00f5\u00f6\u00f7\u00f8\u00f9\u00fa\u00fb\u00fc\u0131\u015f\u00ff";
+    SBT["windows-1255"] = "\u20ac\u0081\u201a\u0192\u201e\u2026\u2020\u2021\u02c6\u2030\u008a\u2039\u008c\u008d\u008e\u008f\u0090\u2018\u2019\u201c\u201d\u2022\u2013\u2014\u02dc\u2122\u009a\u203a\u009c\u009d\u009e\u009f\u00a0\u00a1\u00a2\u00a3\u20aa\u00a5\u00a6\u00a7\u00a8\u00a9\u00d7\u00ab\u00ac\u00ad\u00ae\u00af\u00b0\u00b1\u00b2\u00b3\u00b4\u00b5\u00b6\u00b7\u00b8\u00b9\u00f7\u00bb\u00bc\u00bd\u00be\u00bf\u05b0\u05b1\u05b2\u05b3\u05b4\u05b5\u05b6\u05b7\u05b8\u05b9\u05ba\u05bb\u05bc\u05bd\u05be\u05bf\u05c0\u05c1\u05c2\u05c3\u05f0\u05f1\u05f2\u05f3\u05f4\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u05d0\u05d1\u05d2\u05d3\u05d4\u05d5\u05d6\u05d7\u05d8\u05d9\u05da\u05db\u05dc\u05dd\u05de\u05df\u05e0\u05e1\u05e2\u05e3\u05e4\u05e5\u05e6\u05e7\u05e8\u05e9\u05ea\ufffd\ufffd\u200e\u200f\ufffd";
+    SBT["windows-1256"] = "\u20ac\u067e\u201a\u0192\u201e\u2026\u2020\u2021\u02c6\u2030\u0679\u2039\u0152\u0686\u0698\u0688\u06af\u2018\u2019\u201c\u201d\u2022\u2013\u2014\u06a9\u2122\u0691\u203a\u0153\u200c\u200d\u06ba\u00a0\u060c\u00a2\u00a3\u00a4\u00a5\u00a6\u00a7\u00a8\u00a9\u06be\u00ab\u00ac\u00ad\u00ae\u00af\u00b0\u00b1\u00b2\u00b3\u00b4\u00b5\u00b6\u00b7\u00b8\u00b9\u061b\u00bb\u00bc\u00bd\u00be\u061f\u06c1\u0621\u0622\u0623\u0624\u0625\u0626\u0627\u0628\u0629\u062a\u062b\u062c\u062d\u062e\u062f\u0630\u0631\u0632\u0633\u0634\u0635\u0636\u00d7\u0637\u0638\u0639\u063a\u0640\u0641\u0642\u0643\u00e0\u0644\u00e2\u0645\u0646\u0647\u0648\u00e7\u00e8\u00e9\u00ea\u00eb\u0649\u064a\u00ee\u00ef\u064b\u064c\u064d\u064e\u00f4\u064f\u0650\u00f7\u0651\u00f9\u0652\u00fb\u00fc\u200e\u200f\u06d2";
+    SBT["windows-1257"] = "\u20ac\u0081\u201a\u0083\u201e\u2026\u2020\u2021\u0088\u2030\u008a\u2039\u008c\u00a8\u02c7\u00b8\u0090\u2018\u2019\u201c\u201d\u2022\u2013\u2014\u0098\u2122\u009a\u203a\u009c\u00af\u02db\u009f\u00a0\ufffd\u00a2\u00a3\u00a4\ufffd\u00a6\u00a7\u00d8\u00a9\u0156\u00ab\u00ac\u00ad\u00ae\u00c6\u00b0\u00b1\u00b2\u00b3\u00b4\u00b5\u00b6\u00b7\u00f8\u00b9\u0157\u00bb\u00bc\u00bd\u00be\u00e6\u0104\u012e\u0100\u0106\u00c4\u00c5\u0118\u0112\u010c\u00c9\u0179\u0116\u0122\u0136\u012a\u013b\u0160\u0143\u0145\u00d3\u014c\u00d5\u00d6\u00d7\u0172\u0141\u015a\u016a\u00dc\u017b\u017d\u00df\u0105\u012f\u0101\u0107\u00e4\u00e5\u0119\u0113\u010d\u00e9\u017a\u0117\u0123\u0137\u012b\u013c\u0161\u0144\u0146\u00f3\u014d\u00f5\u00f6\u00f7\u0173\u0142\u015b\u016b\u00fc\u017c\u017e\u02d9";
+    SBT["windows-1258"] = "\u20ac\u0081\u201a\u0192\u201e\u2026\u2020\u2021\u02c6\u2030\u008a\u2039\u0152\u008d\u008e\u008f\u0090\u2018\u2019\u201c\u201d\u2022\u2013\u2014\u02dc\u2122\u009a\u203a\u0153\u009d\u009e\u0178\u00a0\u00a1\u00a2\u00a3\u00a4\u00a5\u00a6\u00a7\u00a8\u00a9\u00aa\u00ab\u00ac\u00ad\u00ae\u00af\u00b0\u00b1\u00b2\u00b3\u00b4\u00b5\u00b6\u00b7\u00b8\u00b9\u00ba\u00bb\u00bc\u00bd\u00be\u00bf\u00c0\u00c1\u00c2\u0102\u00c4\u00c5\u00c6\u00c7\u00c8\u00c9\u00ca\u00cb\u0300\u00cd\u00ce\u00cf\u0110\u00d1\u0309\u00d3\u00d4\u01a0\u00d6\u00d7\u00d8\u00d9\u00da\u00db\u00dc\u01af\u0303\u00df\u00e0\u00e1\u00e2\u0103\u00e4\u00e5\u00e6\u00e7\u00e8\u00e9\u00ea\u00eb\u0301\u00ed\u00ee\u00ef\u0111\u00f1\u0323\u00f3\u00f4\u01a1\u00f6\u00f7\u00f8\u00f9\u00fa\u00fb\u00fc\u01b0\u20ab\u00ff";
+    SBT["x-mac-cyrillic"] = "\u0410\u0411\u0412\u0413\u0414\u0415\u0416\u0417\u0418\u0419\u041a\u041b\u041c\u041d\u041e\u041f\u0420\u0421\u0422\u0423\u0424\u0425\u0426\u0427\u0428\u0429\u042a\u042b\u042c\u042d\u042e\u042f\u2020\u00b0\u0490\u00a3\u00a7\u2022\u00b6\u0406\u00ae\u00a9\u2122\u0402\u0452\u2260\u0403\u0453\u221e\u00b1\u2264\u2265\u0456\u00b5\u0491\u0408\u0404\u0454\u0407\u0457\u0409\u0459\u040a\u045a\u0458\u0405\u00ac\u221a\u0192\u2248\u2206\u00ab\u00bb\u2026\u00a0\u040b\u045b\u040c\u045c\u0455\u2013\u2014\u201c\u201d\u2018\u2019\u00f7\u201e\u040e\u045e\u040f\u045f\u2116\u0401\u0451\u044f\u0430\u0431\u0432\u0433\u0434\u0435\u0436\u0437\u0438\u0439\u043a\u043b\u043c\u043d\u043e\u043f\u0440\u0441\u0442\u0443\u0444\u0445\u0446\u0447\u0448\u0449\u044a\u044b\u044c\u044d\u044e\u20ac";
     SBT["iso-8859-8-i"] = SBT["iso-8859-8"];
-    const SB_ALIAS = { "ibm866":"ibm866","866":"ibm866","cp866":"ibm866","csibm866":"ibm866", "iso-8859-3":"iso-8859-3","iso8859-3":"iso-8859-3","iso88593":"iso-8859-3","latin3":"iso-8859-3","l3":"iso-8859-3","csisolatin3":"iso-8859-3","iso-ir-109":"iso-8859-3","iso_8859-3":"iso-8859-3","iso_8859-3:1988":"iso-8859-3", "iso-8859-5":"iso-8859-5","iso8859-5":"iso-8859-5","iso88595":"iso-8859-5","cyrillic":"iso-8859-5","csisolatincyrillic":"iso-8859-5","iso-ir-144":"iso-8859-5","iso_8859-5":"iso-8859-5","iso_8859-5:1988":"iso-8859-5", "iso-8859-6":"iso-8859-6","iso8859-6":"iso-8859-6","iso88596":"iso-8859-6","arabic":"iso-8859-6","csisolatinarabic":"iso-8859-6","ecma-114":"iso-8859-6","asmo-708":"iso-8859-6","iso-ir-127":"iso-8859-6","iso_8859-6":"iso-8859-6","iso_8859-6:1987":"iso-8859-6", "iso-8859-7":"iso-8859-7","iso8859-7":"iso-8859-7","iso88597":"iso-8859-7","greek":"iso-8859-7","greek8":"iso-8859-7","ecma-118":"iso-8859-7","elot_928":"iso-8859-7","csisolatingreek":"iso-8859-7","iso-ir-126":"iso-8859-7","iso_8859-7":"iso-8859-7","iso_8859-7:1987":"iso-8859-7","sun_eu_greek":"iso-8859-7", "iso-8859-8":"iso-8859-8","iso8859-8":"iso-8859-8","iso88598":"iso-8859-8","hebrew":"iso-8859-8","visual":"iso-8859-8","csisolatinhebrew":"iso-8859-8","iso-ir-138":"iso-8859-8","iso_8859-8":"iso-8859-8","iso_8859-8:1988":"iso-8859-8","csiso88598e":"iso-8859-8","iso-8859-8-e":"iso-8859-8", "iso-8859-8-i":"iso-8859-8-i","csiso88598i":"iso-8859-8-i","logical":"iso-8859-8-i", "koi8-u":"koi8-u","koi8-ru":"koi8-u", "windows-1253":"windows-1253","cp1253":"windows-1253","x-cp1253":"windows-1253", "windows-1255":"windows-1255","cp1255":"windows-1255","x-cp1255":"windows-1255", "windows-1257":"windows-1257","cp1257":"windows-1257","x-cp1257":"windows-1257", "windows-874":"windows-874","cp874":"windows-874","dos-874":"windows-874","iso-8859-11":"windows-874","iso8859-11":"windows-874","iso885911":"windows-874","tis-620":"windows-874", "x-user-defined":"x-user-defined", "replacement":"replacement","csiso2022kr":"replacement","hz-gb-2312":"replacement","iso-2022-cn":"replacement","iso-2022-cn-ext":"replacement","iso-2022-kr":"replacement" };
+    const SB_ALIAS = { "ibm866":"ibm866","866":"ibm866","cp866":"ibm866","csibm866":"ibm866", "iso-8859-3":"iso-8859-3","iso8859-3":"iso-8859-3","iso88593":"iso-8859-3","latin3":"iso-8859-3","l3":"iso-8859-3","csisolatin3":"iso-8859-3","iso-ir-109":"iso-8859-3","iso_8859-3":"iso-8859-3","iso_8859-3:1988":"iso-8859-3", "iso-8859-5":"iso-8859-5","iso8859-5":"iso-8859-5","iso88595":"iso-8859-5","cyrillic":"iso-8859-5","csisolatincyrillic":"iso-8859-5","iso-ir-144":"iso-8859-5","iso_8859-5":"iso-8859-5","iso_8859-5:1988":"iso-8859-5", "iso-8859-6":"iso-8859-6","iso8859-6":"iso-8859-6","iso88596":"iso-8859-6","arabic":"iso-8859-6","csisolatinarabic":"iso-8859-6","ecma-114":"iso-8859-6","asmo-708":"iso-8859-6","iso-ir-127":"iso-8859-6","iso_8859-6":"iso-8859-6","iso_8859-6:1987":"iso-8859-6", "iso-8859-7":"iso-8859-7","iso8859-7":"iso-8859-7","iso88597":"iso-8859-7","greek":"iso-8859-7","greek8":"iso-8859-7","ecma-118":"iso-8859-7","elot_928":"iso-8859-7","csisolatingreek":"iso-8859-7","iso-ir-126":"iso-8859-7","iso_8859-7":"iso-8859-7","iso_8859-7:1987":"iso-8859-7","sun_eu_greek":"iso-8859-7", "iso-8859-8":"iso-8859-8","iso8859-8":"iso-8859-8","iso88598":"iso-8859-8","hebrew":"iso-8859-8","visual":"iso-8859-8","csisolatinhebrew":"iso-8859-8","iso-ir-138":"iso-8859-8","iso_8859-8":"iso-8859-8","iso_8859-8:1988":"iso-8859-8","csiso88598e":"iso-8859-8","iso-8859-8-e":"iso-8859-8", "iso-8859-8-i":"iso-8859-8-i","csiso88598i":"iso-8859-8-i","logical":"iso-8859-8-i", "koi8-u":"koi8-u","koi8-ru":"koi8-u", "windows-1253":"windows-1253","cp1253":"windows-1253","x-cp1253":"windows-1253", "windows-1255":"windows-1255","cp1255":"windows-1255","x-cp1255":"windows-1255", "windows-1257":"windows-1257","cp1257":"windows-1257","x-cp1257":"windows-1257", "windows-874":"windows-874","cp874":"windows-874","dos-874":"windows-874","iso-8859-11":"windows-874","iso8859-11":"windows-874","iso885911":"windows-874","tis-620":"windows-874", "x-user-defined":"x-user-defined", "replacement":"replacement","csiso2022kr":"replacement","hz-gb-2312":"replacement","iso-2022-cn":"replacement","iso-2022-cn-ext":"replacement","iso-2022-kr":"replacement", "csisolatin2":"iso-8859-2", "iso-8859-2":"iso-8859-2", "iso-ir-101":"iso-8859-2", "iso8859-2":"iso-8859-2", "iso88592":"iso-8859-2", "iso_8859-2":"iso-8859-2", "iso_8859-2:1987":"iso-8859-2", "l2":"iso-8859-2", "latin2":"iso-8859-2", "csisolatin4":"iso-8859-4", "iso-8859-4":"iso-8859-4", "iso-ir-110":"iso-8859-4", "iso8859-4":"iso-8859-4", "iso88594":"iso-8859-4", "iso_8859-4":"iso-8859-4", "iso_8859-4:1988":"iso-8859-4", "l4":"iso-8859-4", "latin4":"iso-8859-4", "csiso88596e":"iso-8859-6", "csiso88596i":"iso-8859-6", "iso-8859-6-e":"iso-8859-6", "iso-8859-6-i":"iso-8859-6", "csisolatin6":"iso-8859-10", "iso-8859-10":"iso-8859-10", "iso-ir-157":"iso-8859-10", "iso8859-10":"iso-8859-10", "iso885910":"iso-8859-10", "l6":"iso-8859-10", "latin6":"iso-8859-10", "iso-8859-13":"iso-8859-13", "iso8859-13":"iso-8859-13", "iso885913":"iso-8859-13", "iso-8859-14":"iso-8859-14", "iso8859-14":"iso-8859-14", "iso885914":"iso-8859-14", "csisolatin9":"iso-8859-15", "iso-8859-15":"iso-8859-15", "iso8859-15":"iso-8859-15", "iso885915":"iso-8859-15", "iso_8859-15":"iso-8859-15", "l9":"iso-8859-15", "iso-8859-16":"iso-8859-16", "cskoi8r":"koi8-r", "koi":"koi8-r", "koi8":"koi8-r", "koi8-r":"koi8-r", "koi8_r":"koi8-r", "csmacintosh":"macintosh", "mac":"macintosh", "macintosh":"macintosh", "x-mac-roman":"macintosh", "cp1250":"windows-1250", "windows-1250":"windows-1250", "x-cp1250":"windows-1250", "cp1251":"windows-1251", "windows-1251":"windows-1251", "x-cp1251":"windows-1251", "ansi_x3.4-1968":"windows-1252", "ascii":"windows-1252", "cp1252":"windows-1252", "cp819":"windows-1252", "csisolatin1":"windows-1252", "ibm819":"windows-1252", "iso-8859-1":"windows-1252", "iso-ir-100":"windows-1252", "iso8859-1":"windows-1252", "iso88591":"windows-1252", "iso_8859-1":"windows-1252", "iso_8859-1:1987":"windows-1252", "l1":"windows-1252", "latin1":"windows-1252", "us-ascii":"windows-1252", "windows-1252":"windows-1252", "x-cp1252":"windows-1252", "cp1254":"windows-1254", "csisolatin5":"windows-1254", "iso-8859-9":"windows-1254", "iso-ir-148":"windows-1254", "iso8859-9":"windows-1254", "iso88599":"windows-1254", "iso_8859-9":"windows-1254", "iso_8859-9:1989":"windows-1254", "l5":"windows-1254", "latin5":"windows-1254", "windows-1254":"windows-1254", "x-cp1254":"windows-1254", "cp1256":"windows-1256", "windows-1256":"windows-1256", "x-cp1256":"windows-1256", "cp1258":"windows-1258", "windows-1258":"windows-1258", "x-cp1258":"windows-1258", "x-mac-cyrillic":"x-mac-cyrillic", "x-mac-ukrainian":"x-mac-cyrillic" };
     // node internal/encoding.js keeps the decoder's observable state in
     // internal slots and exposes it through PROTOTYPE getters that brand-check
     // `this` (test-whatwg-encoding-custom-textdecoder calls the raw getters
@@ -1785,7 +2077,15 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
           const byteLength = input.byteLength;
           b = byteLength === 0 ? new Uint8Array(0) : new Uint8Array(input.buffer, input.byteOffset, byteLength);
         }
-        else throw new TypeError("TextDecoder.decode expects an ArrayBuffer or TypedArray");
+        // node internal/encoding.js validates with ERR_INVALID_ARG_TYPE; the code
+        // is part of the contract (test-whatwg-encoding-custom-textdecoder-invalid-arg
+        // asserts on it, not on the message).
+        else {
+          const e = new TypeError('The "input" argument must be an instance of ArrayBuffer or ArrayBufferView. Received ' +
+                                  (input === null ? "null" : "type " + typeof input));
+          e.code = "ERR_INVALID_ARG_TYPE";
+          throw e;
+        }
         if (!this._doNotFlush) { this._pending = null; this._leadSurrogate = null; this._bomSeen = false; }
         this._doNotFlush = stream;
         // Streaming: prepend bytes held back from a prior decode(_, {stream:true}).
@@ -2304,7 +2604,13 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     const cap = shortTick || LONG_PARK;
     return d > cap ? cap : d;
   };
-  G.__mbun_timers_reset = function () { T.q = []; T.now = 0; T.fired = 0; T.batch = 0; };
+  // Reset the run-local bookkeeping only. Timers armed while the test FILE was
+  // being evaluated (module scope: a top-level setTimeout/setImmediate, or the
+  // async fs/net work an `fs.readFile`-at-import kicks off) are real pending
+  // work in node/bun — dropping T.q here made every promise a test later awaits
+  // on such a timer hang forever, which the pump then reported as
+  // "test timed out (no pending timers / unresolved async)".
+  G.__mbun_timers_reset = function () { T.now = 0; T.fired = 0; T.batch = 0; };
 
   // ---- Headers (WHATWG, case-insensitive multi-map) ----
   if (typeof G.Headers === "undefined") {
@@ -2362,6 +2668,13 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   if (typeof G.TextDecoderStream === "undefined") {
     G.TextDecoderStream = class TextDecoderStream {
       constructor(label, opts) {
+        // WebIDL dictionary conversion: a non-object, non-nullish `options`
+        // is ERR_INVALID_ARG_TYPE, it is NOT silently ignored.
+        if (opts !== undefined && opts !== null && typeof opts !== "object") {
+          const e = new TypeError('The "options" argument must be of type object. Received type ' + typeof opts + " (" + String(opts) + ")");
+          e.code = "ERR_INVALID_ARG_TYPE";
+          throw e;
+        }
         opts = opts == null ? {} : opts;
         const dec = new G.TextDecoder(label === undefined ? "utf-8" : label, { fatal: !!opts.fatal, ignoreBOM: !!opts.ignoreBOM });
         this.encoding = dec.encoding; this.fatal = dec.fatal; this.ignoreBOM = dec.ignoreBOM; let ctrl;
@@ -2876,6 +3189,10 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     const nul = (s, where) => { if (String(s).indexOf("\0") >= 0) { const e = new TypeError('The "' + where + '" argument must be a string without null bytes.'); e.code = "ERR_INVALID_ARG_VALUE"; throw e; } };
     for (let i = 0; i < mapped.length; i++) nul(mapped[i], i === 0 ? "cmd" : "args[" + i + "]");
     if (opts && opts.env && typeof opts.env === "object") for (const k of Object.keys(opts.env)) { nul(k, "env"); const v = opts.env[k]; if (v != null) nul(v, "env"); }
+    // argv0 lands in argv[0] and cwd in chdir(2); both are C strings, so a NUL
+    // silently truncates them. bun rejects them by option name (spawn.zig).
+    if (opts && opts.argv0 != null) nul(opts.argv0, "options.argv0");
+    if (opts && opts.cwd != null) nul(opts.cwd, "options.cwd");
     return { cmd: mapped, opts };
   };
   const runNative = (cmd, opts) =>
@@ -3007,7 +3324,24 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       serr = opts.stderr != null ? opts.stderr : serr != null ? serr : "inherit";
       const norm = (v, d) => (v == null ? d : v === "pipe" || v === "ignore" || v === "inherit" || typeof v === "number" ? v : "ignore");
       const stdio = [norm(sin, "ignore"), norm(sout, "pipe"), norm(serr, "inherit")];
-      const h = PN.spawnEx(cmd[0], cmd, { cwd: opts.cwd ? toStr(opts.cwd) : undefined, env: opts.env && typeof opts.env === "object" ? opts.env : (G.process && G.process.env) || undefined, stdio });
+      // Bun.spawn({ ipc }) — a fourth stdio slot carrying the same AF_UNIX
+      // socketpair child_process.fork() uses, advertised to the child through
+      // NODE_CHANNEL_FD. The child half needs no new code: __mbunSetupIpcChild
+      // already turns that env var into process.send/process.channel/'message'.
+      // bun's own serialization for Bun.spawn is JSON (`serialization` is a
+      // child_process-only option), so the mode is pinned to json.
+      const ipcCb = typeof opts.ipc === "function" ? opts.ipc : null;
+      let ipcEnv = opts.env && typeof opts.env === "object" ? opts.env : (G.process && G.process.env) || undefined;
+      if (ipcCb) {
+        stdio.push("ipc");
+        const e = {};
+        const base = ipcEnv || {};
+        for (const k in base) { const v = base[k]; if (v !== undefined) e[k] = String(v); }
+        e.NODE_CHANNEL_FD = String(stdio.length - 1);
+        e.NODE_CHANNEL_SERIALIZATION_MODE = "json";
+        ipcEnv = e;
+      }
+      const h = PN.spawnEx(cmd[0], cmd, { cwd: opts.cwd ? toStr(opts.cwd) : undefined, env: ipcEnv, stdio });
       if (h.errno != null) { const code = ERRNO[h.errno] || ("errno " + h.errno); const e = new Error("spawn " + cmd[0] + " " + code); e.code = code; e.errno = -1; e.syscall = "spawn " + cmd[0]; throw e; }
       let exitResolve; const exitedP = new Promise((r) => (exitResolve = r));
       const proc = { pid: h.pid, exitCode: null, signalCode: null, killed: false, exited: exitedP, exitedDueToMaxBuffer: false, exitedDueToTimeout: false, ref() {}, unref() {}, resourceUsage() { return __mbunResourceUsage(); } };
@@ -3050,6 +3384,30 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       if (errStd) { PN.setNonBlock(fds[2]); rec.outs.push({ fd: fds[2], stream: errStd, ended: false }); }
       proc.stdout = outStd || bunBody(""); proc.stderr = errStd || bunBody("");
       proc.stdin = null;
+      if (ipcCb && fds[3] != null && fds[3] >= 0) {
+        // attachIpc installs send/channel/connected/disconnect, and its error
+        // paths call target.emit(...) — proc is a plain object, so give it a
+        // minimal emitter first. `subprocess.send` is the documented Bun API for
+        // the parent half; the callback is how the parent RECEIVES.
+        proc.emit = function (ev, a) { if (ev === "error" && a) throw a; return false; };
+        rec.ipc = makeIpc(fds[3], false);
+        // Unlike ChildProcess, the Bun subprocess has no 'message' event to gate
+        // on, so deliver straight to the callback rather than through
+        // makeIpcDelivery's listenerCount-driven queue. Internal frames
+        // (NODE_HANDLE and friends) are protocol, never user messages.
+        rec.ipcDelivery = {
+          deliver(msg, handle) {
+            if (isInternalIpc(msg)) return;
+            try { ipcCb(msg, proc); } catch (e) {
+              const pr = G.process;
+              if (pr && typeof pr.listenerCount === "function" && pr.listenerCount("uncaughtException") > 0) pr.emit("uncaughtException", e);
+              else throw e;
+            }
+          },
+          flush() {},
+        };
+        attachIpc(proc, rec.ipc, null);
+      }
       if (stdio[0] === "pipe" && fds[0] >= 0) {
         // FileSink-flavoured stdin over the non-blocking write queue: bytes are
         // buffered on rec.stdinBuf and flushed by __mbun_io_tick (never blocks
@@ -3093,51 +3451,6 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       }
       return proc;
     };
-    // Bun.spawn({terminal}) — run the child under a pseudo-terminal (Bun.Terminal).
-    // The master fd is pumped by the same __mbun_io_tick reactor as spawnEx: reads
-    // deliver child output to terminal.data(t, chunk); writes queue through the
-    // non-blocking stdin path; child reap fires terminal.exit(). proc.terminal
-    // exposes write/close/resize. Ref: bun-ref subprocess.rs get_terminal +
-    // Terminal.rs (POSIX openpty; stdio 0/1/2 = slave).
-    const spawnTerminal = (cmd, opts) => {
-      const term = opts.terminal || {};
-      const cols = typeof term.cols === "number" && term.cols > 0 ? term.cols : 80;
-      const rows = typeof term.rows === "number" && term.rows > 0 ? term.rows : 24;
-      const h = PN.spawnPty(cmd[0], cmd, { cwd: opts.cwd ? toStr(opts.cwd) : undefined, env: opts.env && typeof opts.env === "object" ? opts.env : (G.process && G.process.env) || undefined, cols, rows });
-      if (h.errno != null) { const code = ERRNO[h.errno] || ("errno " + h.errno); const e = new Error("spawn " + cmd[0] + " " + code); e.code = code; e.errno = -1; e.syscall = "spawn " + cmd[0]; throw e; }
-      let exitResolve; const exitedP = new Promise((r) => (exitResolve = r));
-      const proc = { pid: h.pid, exitCode: null, signalCode: null, killed: false, exited: exitedP, ref() {}, unref() {}, resourceUsage() { return __mbunResourceUsage(); } };
-      const rec = { cp: null, pid: h.pid, outs: [], writers: [], stdinFd: h.write, stdinBuf: [], stdinEnded: false, stdinClosed: false, exited: false, closed: false, done: false, code: null, signal: null };
-      const terminalObj = {
-        cols, rows,
-        write(d) { const u = anyToU8(d); rec.stdinBuf.push({ data: u, off: 0, cb: null }); return u.length; },
-        resize(c, r) { if (typeof PN.ptyResize === "function") PN.ptyResize(h.master, c | 0, r | 0); this.cols = c | 0; this.rows = r | 0; },
-        flush() {},
-        close() { rec.stdinEnded = true; },
-        [Symbol.dispose]() { rec.stdinEnded = true; },
-      };
-      const ptyStream = {
-        __data: (bytes) => { if (typeof term.data === "function") { try { term.data(terminalObj, bytes); } catch (e) {} } },
-        __end: () => {},
-      };
-      PN.setNonBlock(h.master);
-      rec.outs.push({ fd: h.master, stream: ptyStream, ended: false });
-      rec.cp = { emit: (ev, code, signal) => {
-        if (ev === "exit") { proc.exitCode = signal ? null : code; proc.signalCode = signal || null; }
-        else if (ev === "close") {
-          proc.exitCode = signal ? null : code; proc.signalCode = signal || null;
-          if (typeof term.exit === "function") { try { term.exit(terminalObj, proc.exitCode, proc.signalCode); } catch (e) {} }
-          exitResolve(proc.exitCode);
-        }
-      }, stdin: null };
-      proc.terminal = terminalObj;
-      proc.stdin = null; proc.stdout = null; proc.stderr = null;
-      proc.kill = function (sig) { const s = bunMapSig(sig); PN.kill(h.pid, s); this.killed = true; return true; };
-      proc[Symbol.dispose] = function () { try { this.kill(); } catch (e) {} };
-      proc[Symbol.asyncDispose] = function () { try { this.kill(); } catch (e) {} return exitedP; };
-      CHILDREN.add(rec);
-      return proc;
-    };
     // `signal` must be an AbortSignal; bun rejects anything else up front
     // (js/bun/spawn/spawn-signal "AbortSignal args validation").
     const validateSignalOpt = (sg) => {
@@ -3151,7 +3464,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     Bun.spawn = function (a, b) {
       const s = spawnArgs(a, b);
       validateSignalOpt(s.opts.signal);
-      if (s.opts.terminal && PN && PN.spawnPty) return spawnTerminal(s.cmd, s.opts);
+      if (s.opts.terminal && PN && PN.spawnPty && PN.openPty) return spawnTerminal(s.cmd, s.opts);
       // A byte stdin payload must use the live pipe path. The synchronous
       // fallback only forwards string input, so Bun.spawn({ stdin: Buffer })
       // used to close the child's fd 0 without writing the bytes first.
@@ -3163,11 +3476,29 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
         proc.stdin.end();
         return proc;
       }
+      // Blob (and Bun.file(), which IS one) stdin — see BLOB-STDIN below.
+      const stdinBlob = !stdinBytes && s.opts.stdin != null &&
+        typeof s.opts.stdin === "object" && typeof s.opts.stdin.arrayBuffer === "function" &&
+        typeof s.opts.stdin.size === "number";
+      if (PN && PN.spawnEx && stdinBlob) {
+        const proc = spawnAsyncBun(s.cmd, { ...s.opts, stdin: "pipe" });
+        const endStdin = () => { try { proc.stdin.end(); } catch (e) {} };
+        s.opts.stdin.arrayBuffer().then((ab) => {
+          try { if (ab && ab.byteLength > 0) proc.stdin.write(new Uint8Array(ab)); } catch (e) {}
+          endStdin();
+        }, endStdin);
+        return proc;
+      }
       // stdin: "pipe" rides the fully async spawnEx/io_tick path too — the old
       // spawnPipes path drains stdout/stderr with BLOCKING reads, which parks
       // the JS thread and starves the virtual event loop (deadlocking a child
       // that talks to an in-process Bun.serve, e.g. bun-install's registry).
-      if (PN && PN.spawnEx && (stdinIsKeyword(s.opts.stdin) || s.opts.stdin === "pipe")) {
+      // An `ipc` callback pins the spawnEx path unconditionally: it is the only
+      // one that opens the fourth (channel) stdio slot and pumps it from
+      // __mbun_io_tick. The sync runNative fallback below would silently drop the
+      // channel, so the child's process.send would be undefined — which is how
+      // every Bun.spawn IPC fixture in the corpus used to die.
+      if (PN && PN.spawnEx && (typeof s.opts.ipc === "function" || stdinIsKeyword(s.opts.stdin) || s.opts.stdin === "pipe")) {
         return spawnAsyncBun(s.cmd, s.opts);
       }
       if (PN && PN.spawn && s.opts.stdin === "pipe") return spawnPipes(s.cmd, s.opts);
@@ -3307,11 +3638,35 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     }
     // Binary process.stdout/.stderr writes (Buffers must not be UTF-8 mangled).
     if (PN && G.process) {
+      const PReflectApply = Reflect.apply;
       for (const [name, fd] of [["stdout", 1], ["stderr", 2]]) {
         const strm = G.process[name];
         if (strm && typeof strm.write === "function" && !strm.__mbunBinWrite) {
           const textWrite = strm.write.bind(strm);
-          strm.write = (d, ...rest) => { if (d instanceof ArrayBuffer || ArrayBuffer.isView(d)) { PN.write(fd, u8ToB64(d)); return true; } return textWrite(d, ...rest); };
+          // Forward with a primordial Reflect.apply, never `...rest`: a spread
+          // call re-reads Array.prototype[Symbol.iterator] at call time, so user
+          // code that deletes it (test-require-delete-array-iterator,
+          // test-repl-unsafe-array-iteration) would break every stdout/stderr
+          // write — including the one the runtime needs to report that failure.
+          // node's stdout/stderr are Writables, so `write(chunk[, encoding][, cb])`
+          // settles the caller's callback once the chunk is flushed. The native
+          // write only ever read argument 0, so the callback was silently
+          // dropped: `process.stdout.write(s, common.mustSucceed())` never fired
+          // (all ten of them in test-worker-no-stdin-stdout-interaction). The
+          // write itself is synchronous here, so the callback is due on the next
+          // tick — node never calls it re-entrantly either.
+          strm.write = function write(d, enc, cb) {
+            if (typeof enc === "function") { cb = enc; }
+            let ok;
+            if (d instanceof ArrayBuffer || ArrayBuffer.isView(d)) { PN.write(fd, u8ToB64(d)); ok = true; }
+            else ok = PReflectApply(textWrite, this, arguments);
+            if (typeof cb === "function") {
+              const tick = G.process && G.process.nextTick;
+              if (typeof tick === "function") tick(cb, null);
+              else G.queueMicrotask(function () { cb(null); });
+            }
+            return ok;
+          };
           strm.__mbunBinWrite = true;
           strm.flush = strm.flush || (() => {});
           // node: a write-only stdout/stderr's async iterator completes at once
@@ -3342,7 +3697,14 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
           }
         }
         const FD = G.__mbunFdNative;
-        const fd = FD.open(target, "w", 0o666);
+        // `{ mode }` (bun BunObject.rs write → node_fs WriteFile.mode) sets the
+        // destination's permissions. It was dropped entirely, so every
+        // Bun.write() produced 0o666 & ~umask (issue 25903). open(2)'s mode only
+        // applies when the file is CREATED, so an explicit mode is also chmod'd
+        // afterwards — otherwise overwriting an existing file kept its old bits.
+        const wantMode = (opts && opts.mode != null && Number.isFinite(Number(opts.mode)))
+          ? (Number(opts.mode) & 0o7777) : null;
+        const fd = FD.open(target, "w", wantMode === null ? 0o666 : wantMode);
         let total = 0;
         try {
           for (const c of chunks) {
@@ -3355,6 +3717,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
             total += off;
           }
         } finally { FD.close(fd); }
+        if (wantMode !== null) { try { F.chmod(target, wantMode); } catch (e) {} }
         return total;
       };
       const isBlob = (v) => !!(v && G.Blob && v instanceof G.Blob);
@@ -3391,7 +3754,18 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       Bun.which = (c) => { try { const r = CPN.spawnSync("/bin/sh", ["-c", "command -v " + toStr(c)], {}); const o = (r.stdout || "").trim(); return o || null; } catch (e) { return null; } };
     }
     if (typeof Bun.env === "undefined") Bun.env = globalThis.process.env;
-    if (typeof Bun.gc === "undefined") Bun.gc = () => {};
+    // Bun.gc(force) — the real collector, not a stub. Nothing else in the
+    // runtime defines Bun.gc, so this `=== "undefined"` guard always fired and
+    // Bun.gc was permanently `() => {}`: every corpus test that forces a
+    // collection to observe reclamation (expectMaxObjectTypeCount, the
+    // FinalizationRegistry/WeakRef waits, the OOM-guard suites' afterEach) was
+    // driving a no-op, so a "wait until finalized" loop could only ever spin.
+    // Only bun:jsc's gcAndSweep/fullGC/edenGC were wired to the native.
+    // ref bun VirtualMachine.rs garbage_collect(force): sync full when forced,
+    // an async hint otherwise -- which is exactly __mbunGcNative's split.
+    if (typeof Bun.gc === "undefined") {
+      Bun.gc = (force) => (G.__mbunGcNative ? G.__mbunGcNative(!!force) : 0);
+    }
     if (typeof Bun.allocUnsafe !== "function") Bun.allocUnsafe = (size) => new Uint8Array((size >>> 0));
     // Bun.unsafe: low-level knobs. gcAggressionLevel(v?) reads/sets the level and
     // returns the previous one (drives harness withoutAggressiveGC). No-op GC
@@ -3447,5 +3821,23 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       Bun.cron = Object.assign(function () { throw new Error("Bun.cron scheduling is not implemented yet in mbun"); }, { parse });
     }
 )JS";
+
+// BLOB-STDIN (Bun.spawn, kProcessWebJS above). bun accepts a Blob as `stdin`
+// and hands the child its bytes; Bun.file() returns a Blob, so a file stdin is
+// the same case. mbun recognised only ArrayBuffer/views, so a Blob fell through
+// to the synchronous runNative path, which closes the child's fd 0 without ever
+// writing -- measured, a 64 KiB Blob reached the child as 0 bytes, and every
+// spawn in js/node/module/sourcemap-simd.test.ts (24 tests) died that way.
+//
+// The bytes are only reachable through a promise (Blob.arrayBuffer), so the
+// Blob case rides the same live-pipe path as the byte case and writes when they
+// arrive; the child simply blocks on the read until then, which is what the
+// pipe is for. The test is structural (arrayBuffer + numeric size) rather than
+// `instanceof Blob` on purpose: it must include a BunFile, and must exclude
+// Bun.stdin (a plain object wrapper, not a Blob) and a ReadableStream.
+//
+// The rationale lives out here, in C++, and not beside the code it explains,
+// because kProcessWebJS is 261 KB against GCC's 262144-char constexpr strlen
+// ceiling -- prose inside the raw string is charged against that budget.
 
 }  // namespace mbun::jsc::builtins::detail

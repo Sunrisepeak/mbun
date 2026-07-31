@@ -1,0 +1,210 @@
+{
+  "area_rates": {
+    "async-fs": {
+      "files": 3.0,
+      "hours": 2.8,
+      "lanes": 1,
+      "rate": 1.06
+    },
+    "bake/dev": {
+      "files": 0.0,
+      "hours": 2.0,
+      "lanes": 1,
+      "rate": 0.0
+    },
+    "bundler": {
+      "files": 1.0,
+      "hours": 1.8,
+      "lanes": 1,
+      "rate": 0.57
+    },
+    "cli/install": {
+      "files": 4.0,
+      "hours": 5.7,
+      "lanes": 2,
+      "rate": 0.7
+    },
+    "conflict-census": {
+      "files": 0.0,
+      "hours": 3.0,
+      "lanes": 1,
+      "rate": 0.0
+    },
+    "dialect": {
+      "files": 2.0,
+      "hours": 3.5,
+      "lanes": 1,
+      "rate": 0.57
+    },
+    "esm-live-bindings": {
+      "files": 0.0,
+      "hours": 4.5,
+      "lanes": 1,
+      "rate": 0.0
+    },
+    "js/bun": {
+      "files": 12.0,
+      "hours": 7.5,
+      "lanes": 2,
+      "rate": 1.6
+    },
+    "js/bun/http+net+websocket": {
+      "files": 5.0,
+      "hours": 1.9,
+      "lanes": 1,
+      "rate": 2.61
+    },
+    "js/node": {
+      "files": 8.0,
+      "hours": 5.8,
+      "lanes": 1,
+      "rate": 1.37
+    },
+    "js/web": {
+      "files": 4.0,
+      "hours": 4.2,
+      "lanes": 2,
+      "rate": 0.95
+    },
+    "napi": {
+      "files": 21.0,
+      "hours": 4.5,
+      "lanes": 1,
+      "rate": 4.67
+    },
+    "nextTick-ordering": {
+      "files": 0.0,
+      "hours": 1.8,
+      "lanes": 1,
+      "rate": 0.0
+    },
+    "regression/issue": {
+      "files": 17.0,
+      "hours": 5.4,
+      "lanes": 2,
+      "rate": 3.14
+    },
+    "shared-cause": {
+      "files": 4.0,
+      "hours": 7.0,
+      "lanes": 1,
+      "rate": 0.57
+    },
+    "test-async": {
+      "files": 10.0,
+      "hours": 4.8,
+      "lanes": 1,
+      "rate": 2.07
+    },
+    "test-child": {
+      "files": 16.0,
+      "hours": 1.8,
+      "lanes": 1,
+      "rate": 8.73
+    },
+    "test-crypto": {
+      "files": 4.0,
+      "hours": 4.8,
+      "lanes": 1,
+      "rate": 0.84
+    },
+    "test-crypto-jwk": {
+      "files": 0.0,
+      "hours": 3.5,
+      "lanes": 1,
+      "rate": 0.0
+    },
+    "test-fs": {
+      "files": 4.0,
+      "hours": 2.5,
+      "lanes": 1,
+      "rate": 1.6
+    },
+    "test-http": {
+      "files": 22.0,
+      "hours": 4.0,
+      "lanes": 2,
+      "rate": 5.45
+    },
+    "test-http2": {
+      "files": 12.0,
+      "hours": 6.8,
+      "lanes": 3,
+      "rate": 1.77
+    },
+    "test-module": {
+      "files": 7.0,
+      "hours": 3.0,
+      "lanes": 1,
+      "rate": 2.33
+    },
+    "test-net": {
+      "files": 19.0,
+      "hours": 1.2,
+      "lanes": 1,
+      "rate": 15.2
+    },
+    "test-process": {
+      "files": 1.0,
+      "hours": 2.9,
+      "lanes": 1,
+      "rate": 0.34
+    },
+    "test-repl": {
+      "files": 0.0,
+      "hours": 2.6,
+      "lanes": 1,
+      "rate": 0.0
+    },
+    "test-runner": {
+      "files": 6.0,
+      "hours": 4.2,
+      "lanes": 1,
+      "rate": 1.41
+    },
+    "test-tls": {
+      "files": 6.0,
+      "hours": 1.0,
+      "lanes": 1,
+      "rate": 6.0
+    },
+    "test-worker": {
+      "files": 10.0,
+      "hours": 8.7,
+      "lanes": 2,
+      "rate": 1.15
+    },
+    "test-zlib+whatwg": {
+      "files": 15.0,
+      "hours": 1.0,
+      "lanes": 1,
+      "rate": 15.0
+    },
+    "util-inspect": {
+      "files": 1.0,
+      "hours": 4.5,
+      "lanes": 1,
+      "rate": 0.22
+    }
+  },
+  "goal_accuracy": 0.5555555555555556,
+  "last_evaluated_wave": "66",
+  "modes": {
+    "bun": {
+      "fraction": 0.276,
+      "mode": "AREA",
+      "near_green": 247,
+      "non_green": 896,
+      "partial_run": false,
+      "run_files": 1902
+    },
+    "node": {
+      "fraction": 0.486,
+      "mode": "AREA",
+      "near_green": 174,
+      "non_green": 358,
+      "partial_run": true,
+      "run_files": 1955
+    }
+  }
+}

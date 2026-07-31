@@ -429,6 +429,67 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
     }
     return "";
   };
+  // ---- node's `pfx` option: a PKCS#12 archive of cert + key + chain ----------
+  // PORT-SOURCE: compat/node/lib/internal/tls/secure-context.js:278-294
+  // configSecureContext -> context.loadPKCS12(toBuf(pfx)[, toBuf(passphrase)]).
+  //
+  // node opens the archive INSIDE SecureContext, so an unreadable one is an
+  // error thrown by createSecureContext() (and therefore by tls.connect(), which
+  // is where the corpus catches it). mbun previously ignored `pfx` outright: an
+  // invalid archive raised nothing at all and a valid one produced a client with
+  // no credentials, which then failed the handshake for an unrelated-looking
+  // reason. The container is DER/ASN.1 with password-encrypted contents, so the
+  // parse itself lives in C++ (mbun::tls::parse_pfx, reached through
+  // __mbunNodeTlsNative.pfxParse); this only shuttles the options.
+  //
+  // The recovered credentials are folded back into the options as cert/key/ca —
+  // the same three fields an explicit caller would have passed — so every layer
+  // below (the native key/cert check, and the live handshake reading
+  // `_secureOptions`) sees them without knowing a PFX was involved.
+  const toBuf = (v) => (typeof v === "string" && Buffer ? Buffer.from(v, "utf8") : v);
+  function applyPfx(options) {
+    const TN = G.__mbunNodeTlsNative;
+    if (!TN || typeof TN.pfxParse !== "function") return options;
+    const entries = Array.isArray(options.pfx) ? options.pfx : [options.pfx];
+    const certs = [], keys = [], cas = [];
+    for (const entry of entries) {
+      // node: `const raw = val.buf || val` — the `{ buf, passphrase }` form lets
+      // each archive in a list carry its own password, falling back to the
+      // top-level one.
+      const raw = (entry && entry.buf) ? entry.buf : entry;
+      const pass = (entry && entry.passphrase != null) ? entry.passphrase : options.passphrase;
+      const creds = TN.pfxParse(toBuf(raw), pass == null ? "" : String(pass));
+      if (creds.cert) certs.push(creds.cert);
+      if (creds.key) keys.push(creds.key);
+      if (Array.isArray(creds.ca)) for (const ca of creds.ca) cas.push(ca);
+    }
+    const out = Object.assign({}, options);
+    if (certs.length) out.cert = certs.length === 1 ? certs[0] : certs;
+    if (keys.length) out.key = keys.length === 1 ? keys[0] : keys;
+    // The key recovered from the archive is already decrypted. Leaving the
+    // ARCHIVE's passphrase in place would hand it to the PEM reader as if it
+    // were the key's own, which is a different secret entirely.
+    out.passphrase = undefined;
+    // The archive's OTHER certificates go to `caExtra`, NOT to `ca`.
+    // node's SetPFX puts them in the context's store with X509_STORE_add_cert,
+    // which ADDS to whatever is already trusted and leaves the default root
+    // store in place. mbun's `ca` option means the opposite: it is the caller's
+    // COMPLETE trust store, so a non-empty `ca` stops the platform anchors —
+    // and NODE_EXTRA_CA_CERTS with them — from being consulted at all. Routing
+    // the chain through it therefore REVOKED trust the caller already had:
+    // test-tls-env-extra-ca-with-options connects with `{ pfx, passphrase }`
+    // while NODE_EXTRA_CA_CERTS names the root that signs the server, and
+    // folding agent1.pfx's own ca1 into `ca` turned a passing verification into
+    // "unable to verify the first certificate". `caExtra` is the additive
+    // channel (mbun::tls::Config::caExtra) and carries nothing but the archive
+    // the caller opened themselves.
+    if (cas.length) {
+      const existing = options.caExtra == null ? []
+        : (Array.isArray(options.caExtra) ? options.caExtra.slice() : [options.caExtra]);
+      out.caExtra = existing.concat(cas);
+    }
+    return out;
+  }
   function newNativeSecureContext(options) {
     options = options == null ? {} : options;
     if (asym && typeof asym.x509parse === "function") {
@@ -482,6 +543,26 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
         }
       }
     }
+    // PORT-SOURCE: compat/node/src/crypto/crypto_context.cc
+    // SecureContext::SetDHParam — the DH prime is measured at
+    // createSecureContext() time, refused under 1024 bits and warned about
+    // under 2048. Raising it here, rather than at the handshake, is what
+    // test-tls-client-mindhsize's synchronous assert.throws expects, and it is
+    // also the only moment at which refusing costs nothing: past this point a
+    // server is already listening on a group too small to be safe.
+    if (TN && typeof TN.dhParamBits === "function" && options.dhparam != null
+        && options.dhparam !== "auto") {
+      const dhPem = pemText(options.dhparam);
+      if (dhPem.indexOf("BEGIN") !== -1) {
+        let bits = 0;
+        try { bits = TN.dhParamBits(dhPem) | 0; } catch (e) { bits = 0; }
+        if (bits > 0 && bits < 1024)
+          throw ERR_INVALID_ARG_VALUE("options.dhparam", options.dhparam,
+                                      "DH parameter is less than 1024 bits");
+        if (bits >= 1024 && bits < 2048 && G.process && typeof G.process.emitWarning === "function")
+          G.process.emitWarning("DH parameter is less than 2048 bits");
+      }
+    }
     const min = options.minVersion != null ? options.minVersion : DEFAULT_MIN_VERSION;
     const max = options.maxVersion != null ? options.maxVersion : DEFAULT_MAX_VERSION;
     const cas = [];
@@ -517,7 +598,32 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
             throw ERR_INVALID_ARG_TYPE("options.privateKeyIdentifier", ["string", "null", "undefined"], privateKeyIdentifier);
         }
       }
+      // node's configSecureContext opens `pfx` after cert/key/ca and before the
+      // engine options, and the credentials it recovers are what the context is
+      // then built from. Resolving it here keeps that order and means the native
+      // key/cert check below judges the REAL credentials.
+      if (options && options.pfx !== undefined && options.pfx !== null) {
+        options = applyPfx(options);
+      }
       this.context = newNativeSecureContext(options);
+      // PORT-SOURCE: compat/node/lib/internal/tls/secure-context.js:234-239 —
+      //   if (context.setEngineKey) context.setEngineKey(id, engine);
+      //   else throw new ERR_CRYPTO_CUSTOM_ENGINE_NOT_SUPPORTED();
+      // The type checks above are node's, but node then ASKS THE CONTEXT whether
+      // it can load a key through an OpenSSL ENGINE, and refuses when it cannot.
+      // mbun's SecureContext has no setEngineKey (the vendored OpenSSL 3.1.5 is
+      // built without ENGINE support, which is also why `clientCertEngine` throws
+      // this same error a few lines up), so a `privateKeyEngine` option was being
+      // accepted and then silently ignored: the process ran on with no private
+      // key at all instead of saying so. Checked AFTER the context is built,
+      // exactly as node does, so it is the context that decides.
+      if (options && typeof options.privateKeyIdentifier === "string" &&
+          typeof options.privateKeyEngine === "string") {
+        if (this.context && typeof this.context.setEngineKey === "function")
+          this.context.setEngineKey(options.privateKeyIdentifier, options.privateKeyEngine);
+        else
+          throw ERR_CRYPTO_CUSTOM_ENGINE_NOT_SUPPORTED("Custom engines not supported by this OpenSSL");
+      }
       this.servername = options ? options.servername : undefined;
       // Keep the validated options: node hands a SecureContext to
       // `new tls.TLSSocket(sock, { secureContext })` and the live handshake layer
@@ -848,11 +954,26 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
   // non-string is ERR_INVALID_ARG_TYPE and only an unrecognised *string* is
   // ERR_INVALID_ARG_VALUE (test-tls-get-ca-certificates-error asserts both).
   let _extraCAs = null;
+  // 'default' + NODE_EXTRA_CA_CERTS, cached so repeated calls keep returning the
+  // same frozen array (test-tls-get-ca-certificates-default compares by ===).
+  let _defaultWithExtra = null;
   function getCACertificates(type) {
     const t = type === undefined ? "default" : type;
     if (typeof t !== "string") throw ERR_INVALID_ARG_TYPE("type", "string", t);
     if (t === "default") {
       if (_defaultCAs !== null) return _defaultCAs;
+      // node builds the default store as bundled/system PLUS whatever
+      // NODE_EXTRA_CA_CERTS contributed, so 'default' is a superset of 'extra'
+      // (test-tls-get-ca-certificates-extra-subset asserts exactly that).
+      const extra = getCACertificates("extra");
+      if (extra.length !== 0) {
+        if (_defaultWithExtra === null) {
+          const merged = rootCertificates.slice();
+          for (const pem of extra) if (merged.indexOf(pem) === -1) merged.push(pem);
+          _defaultWithExtra = Object.freeze(merged);
+        }
+        return _defaultWithExtra;
+      }
       if (_caCache === null) _caCache = Object.freeze(rootCertificates.slice());
       return _caCache;
     }
@@ -875,7 +996,10 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
             const text = fs && typeof fs.readFileSync === "function"
               ? String(fs.readFileSync(path, "utf8")) : "";
             const found = text.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g);
-            if (found) for (const b of found) blocks.push(b);
+            // node hands back OpenSSL's PEM_write output, which terminates every
+            // block with a newline; test-tls-get-ca-certificates-extra compares
+            // the result against the raw fixture file byte for byte.
+            if (found) for (const b of found) blocks.push(b + "\n");
           }
         } catch (e) {}
         _extraCAs = Object.freeze(blocks);
@@ -893,7 +1017,8 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
   // ERR_OSSL_PEM_ASN1_LIB. Either way the previous default store is left intact
   // (the operation is all-or-nothing) and duplicates collapse to one entry.
   const CERT_BLOCK_RE = /-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g;
-  function toPemText(v) {
+  function toPemText(v, name) {
+    name = name || "certs";
     if (typeof v === "string") return v;
     if (ArrayBuffer.isView(v)) {
       const u8 = new Uint8Array(v.buffer, v.byteOffset, v.byteLength);
@@ -907,13 +1032,17 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
       let s = ""; for (let i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]);
       return s;
     }
-    throw ERR_INVALID_ARG_TYPE("certs", ["string", "Buffer", "TypedArray", "DataView"], v);
+    // node validates each element with validateStringOrBufferView(cert,
+    // `certs[${i}]`), so the name carries the index and the accepted class is
+    // the single umbrella ArrayBufferView, not the Buffer/TypedArray/DataView
+    // triple (test-tls-set-default-ca-certificates-error matches the message).
+    throw ERR_INVALID_ARG_TYPE(name, ["string", "ArrayBufferView"], v);
   }
   function setDefaultCACertificates(certs) {
     if (!Array.isArray(certs)) throw ERR_INVALID_ARG_TYPE("certs", "Array", certs);
     const blocks = [];
-    for (const item of certs) {
-      const text = toPemText(item);
+    for (let i = 0; i < certs.length; i++) {
+      const text = toPemText(certs[i], "certs[" + i + "]");
       const found = text.match(CERT_BLOCK_RE);
       if (found) for (const b of found) blocks.push(b);
     }

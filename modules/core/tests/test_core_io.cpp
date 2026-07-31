@@ -217,9 +217,16 @@ void test_platform_contracts() {
     check(contract::max_single_io_size(Windows) ==
               static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()),
           "Windows single I/O length is capped at DWORD_MAX");
-    check(contract::uses_nocancel_io(Darwin),
-          "Darwin dispatch selects the non-cancellation syscall family");
-    check(!contract::uses_nocancel_io(Linux) && !contract::uses_nocancel_io(Windows),
+    using contract::ArchKind;
+    check(contract::uses_nocancel_io(Darwin, ArchKind::X86_64),
+          "Darwin x86_64 dispatch selects the non-cancellation syscall family");
+    // The `$NOCANCEL` asm labels are an x86_64 convention; Apple silicon's
+    // libSystem does not export them, and claiming them there links with
+    // `undefined symbol: write$NOCANCEL` -- the macOS CI probe's second wall.
+    check(!contract::uses_nocancel_io(Darwin, ArchKind::Arm64),
+          "Darwin arm64 must NOT claim NOCANCEL symbols: libSystem lacks them");
+    check(!contract::uses_nocancel_io(Linux, ArchKind::X86_64) &&
+              !contract::uses_nocancel_io(Windows, ArchKind::X86_64),
           "non-Darwin dispatch does not claim NOCANCEL symbols");
     check(contract::positioned_io_retries_eintr(Darwin),
           "Darwin positioned NOCANCEL I/O retains Bun's EINTR retry contract");

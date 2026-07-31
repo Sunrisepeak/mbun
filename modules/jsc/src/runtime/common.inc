@@ -222,12 +222,26 @@ const std::chrono::steady_clock::time_point gStart{std::chrono::steady_clock::no
 // Process argv exposed to scripts as process.argv / Bun.argv.
 std::vector<std::string> gArgv{};
 
+// process.argv0 — node's snapshot of the ORIGINAL argv[0], exactly as the OS
+// handed it over (a bare name when resolved through PATH, a path otherwise).
+// It is deliberately NOT gArgv.front(): that slot carries the runtime's own
+// display name ("mbun"/"bun"/"node") and is later rewritten to execPath by the
+// JS layer, while argv0 must stay whatever invoked us — the corpus respawns the
+// runtime through it (`spawn(process.argv0, …)`).
+// ref: node lib/internal/bootstrap/node.js (process.argv0 = argv[0] snapshot).
+std::string gArgv0{};
+
 // process.execArgv — the runtime's own flags, which are NEVER part of argv.
 // Empty for an ordinary `mbun run`; a `bun build --compile --compile-exec-argv=…`
 // executable carries the flags that were baked into it.
 // ref: bun src/runtime/node/node_process.rs (execArgv) and
 // test/bundler/compile-argv.test.ts "CompileExecArgvNoLeak".
 std::vector<std::string> gExecArgv{};
+
+// The dialect this process serves — see runtime.cppm for what it is and who
+// resolves it. Bun by default, so a binary nobody told anything to behaves
+// exactly as it did before the dialect existed.
+mbun::jsc::runtime::Dialect gDialect{mbun::jsc::runtime::Dialect::Bun};
 
 // `--no-env-file` / bunfig env=false: suppress default .env auto-loading.
 bool gDisableEnvFiles{false};
@@ -391,4 +405,57 @@ bool permission_deny_scope(JSContextRef ctx, JSValueRef* exc, mbun::permission::
     }
     if (exc != nullptr) *exc = permission_denied_error(ctx, scope, resource);
     return true;
+}
+
+// ── JSC deferred work (post-GC / cross-thread) ──────────────────────────────
+// PORT-SOURCE: compat/bun/src/jsc/bindings/JSCTaskScheduler.cpp
+//
+// JSC does not run a FinalizationRegistry's cleanup callback inside GC. The
+// End phase only MOVES the dead holdings onto the registry, then parks the
+// callback on VM::deferredWorkTimer (JSFinalizationRegistry::
+// finalizeUnconditionally -> scheduleWorkSoon). DeferredWorkTimer is a
+// JSRunLoopTimer, so it only fires when someone runs WTF's RunLoop on the JS
+// thread. mbun runs its OWN pump and never enters that RunLoop, so the parked
+// task sat in DeferredWorkTimer::m_tasks forever: `Bun.gc(true)` cleared
+// WeakRefs (finalizeSynchronousJSExecution bumps the weak version) yet no
+// FinalizationRegistry callback ever ran -- measured 0/8 finalizers after 60
+// forced collections. bun hits the same wall and solves it by REPLACING the
+// timer's dispatch (onScheduleWorkSoon -> its own event loop); the equivalent
+// with a pump we already own is to drain the queue from the pump.
+//
+// Same queue carries Atomics.waitAsync resumptions and async WebAssembly
+// compile completions, so this is not finalizer-specific plumbing.
+//
+// doWork() asserts the caller holds the API lock and calls vm.drainMicrotasks()
+// after each task, so it must run at a point where re-entering JS is legal --
+// i.e. the same places we already drain microtasks, never inside GC itself.
+void mbun_drain_deferred_work(JSC::VM& vm) {
+    // The API lock is NOT optional here, and its absence does not fail loudly.
+    // A parked task calls back into JS (JSFinalizationRegistry::
+    // runFinalizationCleanup invokes the user callback), and JSLock::lock is
+    // what installs vm.atomStringTable() as the CURRENT THREAD's AtomString
+    // table. Compiling/running that callback allocates, an allocation can
+    // trigger a sweep, and the sweep destroys cells (JSC::SymbolTable) holding
+    // AtomStrings interned in the VM's table -- which AtomStringImpl::remove
+    // then looks for in the thread's default table and cannot find:
+    //   RELEASE_ASSERT ... WTFCrashWithInfoImpl, on a string as ordinary as
+    //   "eventName".
+    // The native pump (Runtime::drain_microtasks_) runs OUTSIDE any JS call,
+    // so it holds no lock of its own; JSLock is recursive, so taking it here is
+    // also correct for the caller that already holds one
+    // (__mbunDrainMicrotasksNative, reached from JS).
+    JSC::DeferredWorkTimer* deferred{vm.deferredWorkTimer.ptr()};
+    if (deferred == nullptr) return;
+    // doWork() ends with an unconditional vm.drainMicrotasks(), so it is only
+    // safe where a microtask checkpoint is ALREADY expected. That is why the
+    // callers are exactly the two checkpoints -- the native pump and
+    // __mbunDrainMicrotasksNative -- and why Bun.gc(true) deliberately is not
+    // one (see the note in bindings_install.inc's __mbunGcNative). Skipping
+    // when nothing is parked keeps the hot tick off the timer's lock; a
+    // scheduled task always has a pending ticket, so this cannot hide work.
+    if (!deferred->hasAnyPendingWork()) return;
+    JSC::JSLockHolder locker{vm};
+    // Virtual dispatch through the JSRunLoopTimer base: doWork is the timer's
+    // pure-virtual entry, so this needs no exported symbol.
+    static_cast<JSC::JSRunLoopTimer*>(deferred)->doWork(vm);
 }

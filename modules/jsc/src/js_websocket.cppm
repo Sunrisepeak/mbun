@@ -43,6 +43,25 @@ export constexpr std::string_view kWebSocketJS = R"JS(
   const fire = (fn, ...a) => { if (typeof fn === "function") { try { return fn(...a); } catch (e) { try { G.console && G.console.error("error: " + ((e && e.message) || e)); } catch (e2) {} } } };
 
   // Sec-WebSocket-Accept (RFC 6455 §4.2.2).
+  // Sec-WebSocket-Protocol header helpers, shared by the request builder and the
+  // RFC 6455 response check. `wsProtoSplit` reproduces bun's HeaderValueIterator:
+  // tokenize on ',', trim " \t" off each token, drop the empties.
+  // ref: compat/bun/src/http/HeaderValueIterator.rs
+  const wsProtoSplit = (v) => String(v).split(",").map((t) => t.replace(/^[ \t]+|[ \t]+$/g, "")).filter((t) => t.length);
+  const wsProtoValues = (head) => {
+    const out = [];
+    for (const line of String(head).split("\r\n")) {
+      const c = line.indexOf(":");
+      if (c > 0 && line.slice(0, c).trim().toLowerCase() === "sec-websocket-protocol") out.push(line.slice(c + 1));
+    }
+    return out;
+  };
+  const wsProtoTokens = (head) => {
+    const out = [];
+    for (const v of wsProtoValues(head)) for (const t of wsProtoSplit(v)) if (out.indexOf(t) === -1) out.push(t);
+    return out;
+  };
+
   const acceptFor = (key) => {
     try {
       const C = M["node:crypto"] || M["crypto"];
@@ -275,17 +294,47 @@ export constexpr std::string_view kWebSocketJS = R"JS(
       this.readyState = RS.CONNECTING;
       // bun defaults to "nodebuffer" (verified: `new WebSocket(u).binaryType`),
       // not the browser's "blob" — binary frames arrive as a Buffer.
-      this.binaryType = "nodebuffer";
+      //
+      // An ACCESSOR, not a data property: the attribute is an enumeration, and
+      // bun rejects a value outside it instead of storing it. As a plain field
+      // `ws.binaryType = "invalid"` was accepted silently and then matched none
+      // of the read sites, so a binary frame afterwards was delivered as the raw
+      // view with no diagnostic at all.
+      {
+        let binaryType = "nodebuffer";
+        Object.defineProperty(this, "binaryType", {
+          enumerable: true, configurable: true,
+          get() { return binaryType; },
+          set(v) {
+            const s = String(v);
+            if (s !== "nodebuffer" && s !== "arraybuffer" && s !== "blob")
+              throw new SyntaxError("binaryType must be either \"blob\", \"arraybuffer\" or \"nodebuffer\"");
+            binaryType = s;
+          },
+        });
+      }
       this.bufferedAmount = 0;
       this.protocol = ""; this.extensions = "";
       this.onopen = null; this.onmessage = null; this.onerror = null; this.onclose = null;
       this._ls = Object.create(null);
       this._state = { head: "", inHead: true, closeSent: false, done: false, pending: false };
-      const m = /^(wss?|https?):\/\/(\[[^\]]+\]|[^/:?#]+)(?::(\d+))?(.*)$/.exec(this.url);
+      // The authority may carry userinfo (`ws://user:pass@host:port/`). Without
+      // the `(?:([^/?#@]*)@)?` group the host class stopped at the first ":",
+      // so `host` became the username and the connect failed with ENOTFOUND.
+      // WHATWG: userinfo is percent-decoded and re-sent as HTTP Basic auth.
+      // ref: regression 24388.
+      const m = /^(wss?|https?):\/\/(?:([^/?#@]*)@)?(\[[^\]]+\]|[^/:?#]+)(?::(\d+))?(.*)$/.exec(this.url);
       if (!m) throw new SyntaxError("Invalid WebSocket URL: " + this.url);
       const secure = m[1] === "wss" || m[1] === "https";
-      const host = m[2], port = m[3] ? +m[3] : (secure ? 443 : 80);
-      let target = m[4] || "/"; if (target[0] !== "/") target = "/" + target;
+      const host = m[3], port = m[4] ? +m[4] : (secure ? 443 : 80);
+      let target = m[5] || "/"; if (target[0] !== "/") target = "/" + target;
+      let basicAuth = null;
+      if (m[2] !== undefined && m[2] !== "") {
+        const at = m[2].indexOf(":");
+        const dec = (s) => { try { return decodeURIComponent(s); } catch (e) { return s; } };
+        const userpass = at === -1 ? dec(m[2]) : dec(m[2].slice(0, at)) + ":" + dec(m[2].slice(at + 1));
+        basicAuth = "Basic " + (G.Buffer ? G.Buffer.from(userpass, "utf8").toString("base64") : G.btoa(userpass));
+      }
       if (typeof protocols === "string") protocols = [protocols];
       let wsOpts = null;
       if (protocols && !Array.isArray(protocols) && typeof protocols === "object") {  // bun: options object
@@ -307,6 +356,12 @@ export constexpr std::string_view kWebSocketJS = R"JS(
       for (let i = 0; i < 16; i++) keyBytes[i] = (Math.random() * 256) | 0;
       let ks = ""; for (let i = 0; i < 16; i++) ks += String.fromCharCode(keyBytes[i]);
       const key = G.btoa(ks);
+      // RFC 6455 §4.1 step 5: the client MUST fail the connection unless the
+      // response's Sec-WebSocket-Accept is base64(sha1(key + GUID)). Computed
+      // here, next to the key, and checked in _ingest.
+      // PORT-SOURCE: compat/bun/src/http_jsc/websocket_client/WebSocketUpgradeClient.rs
+      //              (expected_accept / compute_accept_value, check at :1538)
+      this._state.expectedAccept = acceptFor(key);
       this._wire = mkWire({
         sendRaw: (bytes) => { try { this._sock.write(bytes); } catch (e) {} },
         onText: (s) => this._emit("message", { data: s }),
@@ -343,7 +398,23 @@ export constexpr std::string_view kWebSocketJS = R"JS(
         if (!(wsOpts && "perMessageDeflate" in wsOpts && !wsOpts.perMessageDeflate))
           req += "Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\n";
         if (this._protocols.length) req += "Sec-WebSocket-Protocol: " + this._protocols.join(", ") + "\r\n";
-        if (wsOpts && wsOpts.headers) { const hs = wsOpts.headers; if (typeof hs.forEach === "function") hs.forEach((v, k) => { req += k + ": " + v + "\r\n"; }); else for (const k of Object.keys(hs)) req += k + ": " + hs[k] + "\r\n"; }
+        // Collect the caller's headers first so an explicit Authorization wins
+        // over the one derived from the URL's userinfo (24388 asserts exactly
+        // that precedence), and so the two never both reach the wire.
+        let userHeaders = "", sawAuth = false;
+        if (wsOpts && wsOpts.headers) {
+          const hs = wsOpts.headers;
+          const add = (v, k) => { if (String(k).toLowerCase() === "authorization") sawAuth = true; userHeaders += k + ": " + v + "\r\n"; };
+          if (typeof hs.forEach === "function") hs.forEach(add);
+          else for (const k of Object.keys(hs)) add(hs[k], k);
+        }
+        if (basicAuth && !sawAuth) req += "Authorization: " + basicAuth + "\r\n";
+        req += userHeaders;
+        // The set of protocols the response is allowed to name is seeded from
+        // the Sec-WebSocket-Protocol header we actually PUT ON THE WIRE -- which
+        // may come from the `protocols` argument OR from options.headers.
+        // ref: WebSocketUpgradeClient.rs:330-337 (`protocol_for_subprotocols`).
+        this._state.offered = wsProtoTokens(req);
         sock.write(req + "\r\n");
       };
       if (secure) {
@@ -378,8 +449,36 @@ export constexpr std::string_view kWebSocketJS = R"JS(
       }
       const head = s.slice(0, at);
       if (head.indexOf(" 101") === -1) { this._fail(new Error("Unexpected server response: " + (head.split("\r\n")[0] || ""))); return; }
-      const pm = /\r\nsec-websocket-protocol:\s*([^\r\n]+)/i.exec(head);
-      if (pm) this.protocol = pm[1].trim();
+      // Sec-WebSocket-Accept validation. bun closes 1002 with these exact
+      // reasons and treats both as connection failures (error + close).
+      // ref: WebSocket.cpp:1704/1720 missing_/mismatch_websocket_accept_header.
+      if (this._state.expectedAccept) {
+        const am = /\r\nsec-websocket-accept:\s*([^\r\n]+)/i.exec(head);
+        if (!am) { this._fail(new Error("Missing websocket accept header"), 1002); return; }
+        if (am[1].trim() !== this._state.expectedAccept) { this._fail(new Error("Mismatch websocket accept header"), 1002); return; }
+      }
+      // RFC 6455 client-side subprotocol validation. The response may carry AT
+      // MOST ONE Sec-WebSocket-Protocol header naming EXACTLY ONE protocol, and
+      // that protocol must be one the client offered; anything else fails the
+      // connection. Both failures are CLEAN 1002 closes with no 'error' event.
+      // PORT-SOURCE: compat/bun/src/http_jsc/websocket_client/WebSocketUpgradeClient.rs
+      //   :1340-1381 (per-header check) and :1518-1523 (missing-header check);
+      //   reasons from compat/bun/src/jsc/bindings/webcore/WebSocket.cpp:1724-1730.
+      {
+        const protoVals = wsProtoValues(head);
+        const offered = this._state.offered || [];
+        if (protoVals.length) {
+          const toks = protoVals.length === 1 ? wsProtoSplit(protoVals[0]) : [];
+          if (protoVals.length !== 1 || toks.length !== 1 || offered.indexOf(toks[0]) === -1) {
+            this._state.inHead = false; this._state.head = "";
+            this._finish(1002, "Mismatch client protocol", true); return;
+          }
+          this.protocol = toks[0];
+        } else if (offered.length) {
+          this._state.inHead = false; this._state.head = "";
+          this._finish(1002, "Missing client protocol", true); return;
+        }
+      }
       const em = /\r\nsec-websocket-extensions:\s*([^\r\n]+)/i.exec(head);
       if (em) this.extensions = em[1].trim();
       this._state.inHead = false; this._state.head = "";
@@ -388,10 +487,10 @@ export constexpr std::string_view kWebSocketJS = R"JS(
       const rest = s.slice(at + 4);
       if (rest.length) { const b = new Uint8Array(rest.length); for (let i = 0; i < rest.length; i++) b[i] = rest.charCodeAt(i) & 0xff; this._wire.feed(b); }
     }
-    _fail(err) {
+    _fail(err, code) {
       if (this._state.done) return;
       this._emit("error", { error: err, message: String((err && err.message) || err) });
-      this._finish(1006, String((err && err.message) || err), false);
+      this._finish(code || 1006, String((err && err.message) || err), false);
     }
     _finish(code, reason, wasClean) {
       if (this._state.done) return;
@@ -422,7 +521,19 @@ export constexpr std::string_view kWebSocketJS = R"JS(
     pong(d) { if (this.readyState === RS.OPEN) this._wire.sendPong(d == null ? "" : d); }
     close(code, reason) {
       if (this.readyState === RS.CLOSED || this.readyState === RS.CLOSING) return;
-      if (code !== undefined && code !== 1000 && !(code >= 3000 && code <= 4999)) throw new (G.DOMException || Error)("The close code must be either 1000 or in the range of 3000 to 4999", "InvalidAccessError");
+      // The RFC 6455 §7.4 endpoint set, NOT the browser's "1000 or 3000-4999":
+      // bun's WebSocket.cpp isValidCloseCodeForSending says so in as many words
+      // ("non-browser clients legitimately send 1001 or 1011, and `ws` accepts
+      // the same set"). Enforcing the browser rule here made `ws.close(1001)`
+      // throw from inside the open handler, so the close event never fired and
+      // the test hung rather than failing on the code. No node-corpus test
+      // asserts the narrower rule (node has no WPT websocket suite vendored).
+      if (code !== undefined && code !== null &&
+          !((code >= 1000 && code <= 1014 && code !== 1004 && code !== 1005 && code !== 1006) ||
+            (code >= 3000 && code <= 4999)))
+        throw new (G.DOMException || Error)(
+          "The close code must be a valid WebSocket close code (1000-1014, excluding the reserved codes 1004-1006, or in the range of 3000 to 4999). Received " + code + ".",
+          "InvalidAccessError");
       if (this.readyState === RS.CONNECTING) { this._failConnecting(); return; }
       this.readyState = RS.CLOSING;
       this._state.closeSent = true;

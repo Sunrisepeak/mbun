@@ -31,6 +31,118 @@ globalThis.__mbun_blob_module_source = function (spec) {
   return { type: typeof blob.type === "string" ? blob.type : "",
            source: bytes ? new TextDecoder().decode(bytes) : "" };
 };
+// 1:1 translation of node lib/internal/modules/cjs/loader.js
+// (CircularRequirePrototypeWarningProxy / emitCircularRequireWarning /
+// getExportsForCircularRequire, and the un-set at Module.prototype.load).
+//
+// When require() re-enters a module whose body is still running, the caller gets
+// a HALF-BUILT exports object, and reading a property that the module has simply
+// not assigned yet is the single most common CommonJS cycle bug. node makes it
+// visible by temporarily swapping the exports' prototype for a proxy that warns
+// on any miss, then restores Object.prototype once the body finishes. The
+// exclusions are node's and each one is load-bearing (see
+// test/fixtures/cycles/warning-*): a Proxy exports must never be touched at all
+// (its traps are the user's), a transpiled ES module (`__esModule`) uses its own
+// cycle protocol, `__esModule` itself always reads through, and exports that is
+// not a plain object (a class, a function) is left alone.
+(function () {
+  const emitCircularRequireWarning = (prop) => {
+    const p = globalThis.process;
+    if (p && typeof p.emitWarning === "function") {
+      p.emitWarning("Accessing non-existent property '" + String(prop) +
+        "' of module exports inside circular dependency");
+    }
+  };
+  const CircularRequirePrototypeWarningProxy = new Proxy({}, {
+    __proto__: null,
+    get(target, prop) {
+      // Allow __esModule access in any case because it is used in the output
+      // of transpiled code to determine whether something comes from an
+      // ES module, and is not used as a regular key of `module.exports`.
+      if (prop in target || prop === "__esModule") return target[prop];
+      emitCircularRequireWarning(prop);
+      return undefined;
+    },
+    getOwnPropertyDescriptor(target, prop) {
+      if (Object.prototype.hasOwnProperty.call(target, prop) || prop === "__esModule") {
+        return Object.getOwnPropertyDescriptor(target, prop);
+      }
+      emitCircularRequireWarning(prop);
+      return undefined;
+    },
+  });
+  // node reads isProxy off internalBinding('util'); util.types is the same
+  // predicate. Looked up lazily (the loader runs long before node:util exists)
+  // and, if it is still unavailable, the check fails CLOSED — no proxy is
+  // installed — because touching a user Proxy is the one unrecoverable mistake
+  // here.
+  let isProxy;
+  const proxyCheckReady = () => {
+    if (isProxy === undefined) {
+      const m = globalThis.__mbunNativeModules;
+      const util = m && (m["node:util"] || m["util"]);
+      isProxy = (util && util.types && typeof util.types.isProxy === "function")
+        ? util.types.isProxy : null;
+    }
+    return isProxy !== null;
+  };
+  globalThis.__mbun_circular_exports = function (exports) {
+    if (exports === null || typeof exports !== "object") return exports;
+    if (!proxyCheckReady() || isProxy(exports)) return exports;
+    if (Object.getPrototypeOf(exports) !== Object.prototype) return exports;
+    if (exports.__esModule) return exports;
+    try { Object.setPrototypeOf(exports, CircularRequirePrototypeWarningProxy); } catch (e) {}
+    return exports;
+  };
+  // Module.prototype.load: "This is later unset once the module is done loading."
+  globalThis.__mbun_circular_exports_done = function (exports) {
+    if (exports === null || (typeof exports !== "object" && typeof exports !== "function")) return exports;
+    if (!proxyCheckReady() || isProxy(exports)) return exports;
+    try {
+      if (Object.getPrototypeOf(exports) === CircularRequirePrototypeWarningProxy) {
+        Object.setPrototypeOf(exports, Object.prototype);
+      }
+    } catch (e) {}
+    return exports;
+  };
+})();
+// The identity a `mock.module()` registration and a later require()/import() of
+// the same module must agree on. Resolution is the identity whenever it works
+// (that is what makes mock.module("./second.ts") intercept `import … from
+// "./second"` — 6879.test.ts pins exactly that pair). bun also lets you mock a
+// specifier that does NOT resolve — a relative path to a file that was never
+// written, or a package that is not installed — so an unresolvable relative
+// specifier falls back to a lexically normalised absolute path (no filesystem
+// access), and a bare specifier stays itself. `file:` / `file://` prefixes are
+// stripped first: mock-module.test.ts registers "file:./x.ts" and then imports
+// "./x.ts".
+globalThis.__mbun_mock_key = function (spec, dir) {
+  let s = String(spec);
+  if (s.startsWith("file://")) s = s.slice(7);
+  else if (s.startsWith("file:")) s = s.slice(5);
+  try { return globalThis.__mbun_resolve_native(s, dir); } catch (e) {}
+  const c = s.charCodeAt(0);
+  if (c === 46 /* . */ || c === 47 /* / */) {
+    const parts = (c === 47 ? s : String(dir) + "/" + s).split("/");
+    const out = [];
+    for (let i = 0; i < parts.length; i++) {
+      const p = parts[i];
+      if (p === "" || p === ".") continue;
+      if (p === "..") { out.pop(); continue; }
+      out.push(p);
+    }
+    return "/" + out.join("/");
+  }
+  return s;
+};
+// Consulted by every require flavour before the resolver runs. Empty (the only
+// state outside `bun test`) short-circuits on a Map size read.
+globalThis.__mbun_mock_lookup = function (spec, dir) {
+  const mocks = globalThis.__mbunModuleMocks;
+  if (mocks === undefined || mocks.size === 0) return undefined;
+  const key = globalThis.__mbun_mock_key(spec, dir);
+  return mocks.has(key) ? { exports: mocks.get(key) } : undefined;
+};
 globalThis.__mbun_make_require = function (dir) {
   const invalidRequireId = function (value) {
     if (typeof value !== "string") {
@@ -55,7 +167,12 @@ globalThis.__mbun_make_require = function (dir) {
   // dynamic import (ImportKind::Stmt/Dynamic) rather than a literal require() —
   // it only selects the Node error code on failure (ERR_MODULE_NOT_FOUND vs
   // MODULE_NOT_FOUND), not the resolution condition.
-  const req = function (s, o, k) {
+  // Arrow + rest, not `function (s, o, k)`: node/bun both report
+  // `require.length === 1` and bun's require has no `.prototype` at all
+  // (test/js/bun/resolve/require.test.ts pins both). `o`/`k` stay internal
+  // parameters of the lowered-import bridge, so they must not count.
+  const req = (s, ...rest) => {
+    const o = rest[0], k = rest[1];
     const invalid = invalidRequireId(s);
     if (invalid) throw invalid;
     // The C++ bridge receives UTF-8 through a nul-terminated string. Reject
@@ -65,6 +182,8 @@ globalThis.__mbun_make_require = function (dir) {
       error.code = "MODULE_NOT_FOUND";
       throw error;
     }
+    const mocked = globalThis.__mbun_mock_lookup(s, dir);
+    if (mocked !== undefined) return mocked.exports;
     const load = function () {
       // Node consults require.cache before entering its CJS loader.  Keep the
       // native cache authoritative for ordinary modules, while honouring a
@@ -88,7 +207,26 @@ globalThis.__mbun_make_require = function (dir) {
     if (!trace || !trace.hasSubscribers) return load();
     return trace.traceSync(load, { parentFilename: req.__mbun_parent_filename, id: s });
   };
-  req.resolve = function (s) { return globalThis.__mbun_resolve_native(String(s), dir); };
+  req.resolve = function (s) {
+    // A mocked specifier resolves even when nothing is on disk: bun makes
+    // `mock.module("./never-written.ts", …)` turn a previously-throwing
+    // require.resolve() into the mock's own key (mock-module.test.ts asserts
+    // require.resolve === import.meta.resolveSync for exactly that case).
+    const mocks = globalThis.__mbunModuleMocks;
+    if (mocks !== undefined && mocks.size !== 0) {
+      const key = globalThis.__mbun_mock_key(s, dir);
+      if (mocks.has(key)) return key;
+    }
+    return globalThis.__mbun_resolve_native(String(s), dir);
+  };
+  // node: `require.main` IS `process.mainModule` (loader.js sets both to the
+  // entry Module). An accessor rather than a copied value because the entry
+  // record is installed by install_cjs_env, which can run after the first
+  // require closure has already been minted (bootstrap requires precede it).
+  Object.defineProperty(req, "main", {
+    configurable: true, enumerable: true,
+    get: function () { const p = globalThis.process; return p ? p.mainModule : undefined; },
+  });
   // require.cache is a live view over the native CommonJS module cache: a plain
   // object can't reach the C++ cache, so `delete require.cache[key]` (a common
   // "force re-evaluation" idiom, and what test/js/bun/resolve/import-query uses to
@@ -121,7 +259,10 @@ globalThis.__mbun_make_require_esm = function (dir) {
   // `k` (arg 3): the lowered-import / dynamic-import marker (see __mbun_make_require).
   // A literal require() in an ESM module passes no `k` → ImportKind::Require →
   // MODULE_NOT_FOUND, while a lowered `import` statement passes 1 → ERR_MODULE_NOT_FOUND.
-  const req = function (s, o, k) {
+  const req = (s, ...rest) => {
+    const o = rest[0], k = rest[1];
+    const mocked = globalThis.__mbun_mock_lookup(s, dir);
+    if (mocked !== undefined) return mocked.exports;
     return globalThis.__mbun_require_native(s, dir, true,
       (o && typeof o.type === "string") ? o.type : "", k ? 1 : 0);
   };
@@ -129,7 +270,25 @@ globalThis.__mbun_make_require_esm = function (dir) {
   // resolve/cache/extensions — so only the *load* path changes. require.resolve
   // keeps the "require" condition: it is a CJS API, and import.meta.resolve (the
   // ESM-facing one, built in __mbun_make_import_meta) is the esm-aware resolver.
-  for (const k of Object.keys(base)) { req[k] = base[k]; }
+  // Indexed loop, not `for (const k of ...)`: a for-of over a plain array reads
+  // Array.prototype[Symbol.iterator] at call time, and this runs on every ESM
+  // module load (the native loader calls __mbun_make_require_esm per module). User
+  // code that deletes the array iterator — which the corpus does deliberately, see
+  // test-require-delete-array-iterator / test-repl-unsafe-array-iteration — would
+  // otherwise make every subsequent `import` throw from inside the loader.
+  // defineProperty, not assignment: `req[k] = base[k]` is [[Set]], which walks
+  // req's prototype chain (Function.prototype → Object.prototype) and RUNS any
+  // accessor it finds there instead of creating an own property. User code that
+  // installs an Object.prototype setter for one of these names — 'main' is the
+  // realistic case, and test-module-prototype-mutation installs exactly that —
+  // would otherwise see the loader trip its own trap on every ESM module load.
+  // Descriptor copy also preserves `main` as the accessor it is, rather than
+  // freezing the entry module's identity at closure-creation time.
+  const keys = Object.keys(base);
+  for (let i = 0; i < keys.length; i++) {
+    const d = Object.getOwnPropertyDescriptor(base, keys[i]);
+    if (d !== undefined) Object.defineProperty(req, keys[i], d);
+  }
   return req;
 };
 // Dynamic import(): the transpiler lowers `import(spec)` (cjs mode) to
@@ -423,16 +582,71 @@ globalThis.__mbun_disposeAsync = async function (env) {
   // ESM named imports are live bindings. js_parser's CJS lowering binds each one
   // with `let` and subscribes it here (ref: js_parser.cppm build_cjs_import_).
   //
-  // A settled exporter needs nothing: its exports are final, so the common
-  // acyclic path just assigns and leaves the exports object a plain data object
-  // — no accessor, no property-access deopt. Only while the exporter is still
-  // evaluating (`__mbun_pending`, stamped across the module body by require()
-  // in this file) does the slot become an accessor that fans later
+  // A settled exporter USUALLY needs nothing: its exports are final, so the
+  // common acyclic path just assigns and leaves the exports object a plain data
+  // object — no accessor, no property-access deopt. Only while the exporter is
+  // still evaluating (`__mbun_pending`, stamped across the module body by
+  // require() in this file) does the slot become an accessor that fans later
   // `exports.x = v` writes out to every importer's binding, which is what lets
   // a cyclic import observe the finished value the way real ESM does.
+  //
+  // "Final" is not the same as "settled", though, and that gap was a measured
+  // corpus bug: a module that exports `let x` and reassigns it from an exported
+  // function called LATER (`export let root_url; export function beforeAll(){
+  // root_url = … }` — every cli/install test's dummy.registry) is settled when
+  // the importer links, yet its value is still to come. The snapshot below is
+  // wrong for exactly those names, and only those. The exporter now announces
+  // them in a non-enumerable `__mbun_mut` array (js_parser cjs_runtime.cppm
+  // kLiveMutMarker) written in its tail — i.e. before any acyclic importer gets
+  // here — and each one gets a subscription list hung off the module's own
+  // __mbun_X getter, which its `__mbun_XN` write-wrap then fans out. One extra
+  // property load (`ns.__mbun_mut`, undefined for essentially every module) on
+  // the fast path; nothing at all per property read.
+  //
+  // `mock.module()` needs the same fan-out for a module that has ALREADY
+  // settled: bun replaces such a module's exports and every binding an importer
+  // made earlier must observe the new value (test/js/bun/test/mock/6874 mocks a
+  // package a loaded module already destructured; 6879 mocks through a
+  // re-export chain). A settled exports object keeps no back-reference, so the
+  // subscriptions are recorded in a side table instead of by swapping the slot
+  // for an accessor — that costs one lookup per import binding at module-init
+  // time and NOTHING per property read, leaving the acyclic fast path a plain
+  // data property. Recording is gated on __mbun_link_track, which only the
+  // bun:test runner sets: outside `bun test` nothing can call mock.module()
+  // before the bindings are made, so the table would be pure overhead.
+  globalThis.__mbun_link_subs = new WeakMap();
+  globalThis.__mbun_link_record = function (ns, name, set) {
+    if (ns === null || (typeof ns !== "object" && typeof ns !== "function")) return;
+    const table = globalThis.__mbun_link_subs;
+    let byName = table.get(ns);
+    if (byName === undefined) { byName = new Map(); table.set(ns, byName); }
+    let subs = byName.get(name);
+    if (subs === undefined) { subs = []; byName.set(name, subs); }
+    subs.push(set);
+  };
   globalThis.__mbun_link = function (ns, name, set) {
     if (ns == null) { set(undefined); return; }
-    if (!ns.__mbun_pending) { set(ns[name]); return; }
+    if (globalThis.__mbun_link_track) globalThis.__mbun_link_record(ns, name, set);
+    if (!ns.__mbun_pending) {
+      const mut = ns.__mbun_mut;
+      if (mut !== undefined && mut.indexOf(name) >= 0) {
+        // Subscribe ON the exporter's live-export getter rather than swapping the
+        // slot for a cell of our own: swapping would strand that getter and
+        // freeze the value at whatever it is now, which is the very bug being
+        // fixed. `!__mbun_subs` keeps this to the exporter's OWN __mbun_X getter: a
+        // getter carrying __mbun_subs is a cyclic importer's link cell that took
+        // the slot over, and its cached `cur` is not the module local, so
+        // __mbun_XN could only publish a stale value through it. It applies the
+        // same test, so the two ends agree on which slots participate.
+        const md = Object.getOwnPropertyDescriptor(ns, name);
+        if (md && md.get && !md.get.__mbun_subs) {
+          if (md.get.__mbun_msubs) md.get.__mbun_msubs.push(set);
+          else md.get.__mbun_msubs = [set];
+        }
+      }
+      set(ns[name]);
+      return;
+    }
     const d = Object.getOwnPropertyDescriptor(ns, name);
     // Already linked by another importer of the same name: just join the fan-out.
     if (d && d.get && d.get.__mbun_subs) { d.get.__mbun_subs.push(set); set(d.get.call(ns)); return; }

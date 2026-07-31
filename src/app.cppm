@@ -220,6 +220,13 @@ std::string resolve_entry_path(std::string_view script) {
     return std::string{script};
 }
 
+// The one entry-point-not-found reporter; defined further down, next to the
+// rest of the run-target machinery. Declared here because run_script — which is
+// where the node-emulation path lands, and the ONLY route by which a missing
+// entry reached `mbun run: cannot read script` (a string that is neither node's
+// nor bun's, and that no corpus file on either side pins) — needs it.
+int report_run_target_not_found(std::string_view target);
+
 // Run a JS file with process.argv = [runtime, script, ...args] (Node/bun order).
 int run_script(std::string_view script, std::span<const std::string_view> scriptArgs) {
     // Best-effort, NON-FATAL bunfig.toml validation (ref bun
@@ -261,6 +268,18 @@ int run_script(std::string_view script, std::span<const std::string_view> script
     mbun::jsc::runtime::set_preloads(std::move(preloads));
     if (is_markdown(script)) return run_markdown(script);
     const std::string entry{resolve_entry_path(script)};
+    // A missing entry is reported by the shared not-found reporter, so the node
+    // emulation path (`mbun --preserve-symlinks <missing>` routes here through
+    // exec_as_if_node) gets the same dialect dispatch as a bare `mbun <missing>`
+    // — compat/node/test/parallel/test-module-main-preserve-symlinks-fail.js:15
+    // asserts on exactly that child's stderr.
+    {
+        std::error_code ec{};
+        const std::filesystem::path p{entry};
+        if (!std::filesystem::exists(p, ec) || std::filesystem::is_directory(p, ec)) {
+            return report_run_target_not_found(entry);
+        }
+    }
     std::vector<std::string> jsArgv;
     jsArgv.reserve(scriptArgs.size() + 2);
     jsArgv.emplace_back("mbun");
@@ -565,6 +584,63 @@ int run_exec(const std::string& script) {
     return mbun::jsc::runtime::run_shell_source(script);
 }
 
+// ─── `mbun publish` ─────────────────────────────────────────────────────────
+// Only the help screen is real: nothing here talks to a registry. It exists
+// because `publish` is one of bun's reserved subcommands, so it must not fall
+// through to package.json script resolution.
+//
+// Shape and wording follow bun's Subcommand::Publish help block
+// (ref: bun-ref/src/install/PackageManager/CommandLineArguments.rs:842-863 for
+// the intro/examples, :313-333 PUBLISH_PARAMS for the publish-only flags, and
+// :56-126 SHARED_PARAMS for the rest). `--dry-run` deliberately carries the
+// command-neutral description from SHARED_PARAMS:71 — it used to be documented
+// with install's wording ("Don't install anything") for every command, which is
+// the upstream bug regression/issue/24806 pins.
+constexpr std::string_view PUBLISH_USAGE = R"(Usage:
+  Publish a package to the npm registry.
+  mbun publish [flags] [dist]
+
+Flags:
+      --access <STR>           Set access level for scoped packages
+      --tag <STR>              Tag the release. Default is "latest"
+      --otp <STR>              Provide a one-time password for authentication
+      --auth-type <STR>        Specify the type of one-time password authentication (default is 'web')
+      --gzip-level <STR>       Specify a custom compression level for gzip. Default is 9.
+      --tolerate-republish     Don't exit with code 1 when republishing over an existing version number
+      --dry-run                Perform a dry run without making changes
+      --registry <STR>         Use a specific registry by default, overriding .npmrc, bunfig.toml and environment variables
+      --cwd <STR>              Set a specific cwd
+      --silent                 Don't log anything
+      --verbose                Excessively verbose logging
+  -c, --config <STR>           Specify path to config file (bunfig.toml)
+  -h, --help                   Print this help menu
+
+Examples:
+  Display files that would be published, without publishing to the registry.
+  mbun publish --dry-run
+
+  Publish the current package with public access.
+  mbun publish --access public
+
+  Publish a pre-existing package tarball with tag 'next'.
+  mbun publish --tag next ./path/to/tarball.tgz
+)";
+
+// `mbun publish [flags] [dist]`. `--help`/`-h` anywhere in the argument list
+// prints the help and exits 0, as bun's clap does; every other invocation is an
+// explicit "not implemented" rather than a silent no-op, because a publish that
+// appears to succeed without uploading anything is the dangerous answer.
+int run_publish(std::span<const std::string_view> args) {
+    for (const std::string_view a : args) {
+        if (a == "--help" || a == "-h") {
+            std::print("{}", PUBLISH_USAGE);
+            return 0;
+        }
+    }
+    std::println(std::cerr, "error: `mbun publish` is not implemented yet");
+    return 1;
+}
+
 // ─── `mbun test` file discovery ─────────────────────────────────────────────
 // Port of bun's Scanner (ref: bun-ref/src/cli/test/Scanner.rs) plus the
 // path-mode/filter-mode switch that drives it (test_command.rs:2272-2296).
@@ -794,6 +870,122 @@ void apply_bunfig_jsx(const mbun::bunfig::BunfigConfig& cfg,
     out.development = cfg.jsx_development;
 }
 
+// ─── `--reporter=junit --reporter-outfile=<path>` ───────────────────────────
+// bun installs the JUnit reporter ALONGSIDE the console one, so the outfile is
+// written for every run that produced results — including a run cut short by
+// --bail, which is the whole point of regression/issue/26851: the report of a
+// bailed run is exactly the report a CI system needs.
+//
+// The runner already prints one `(pass)|(fail)|(skip)|(todo) <full name>` line
+// per test, so the reporter reads its own report rather than growing a second
+// results channel through mbun.jsc.test_runner.
+struct JUnitCase {
+    std::string name {};
+    char status { 'p' };  // p pass | f fail | s skip | t todo
+    std::string detail {};
+};
+struct JUnitSuite {
+    std::string file {};
+    std::vector<JUnitCase> cases {};
+    double ms { 0.0 };
+};
+
+std::string junit_escape(std::string_view s) {
+    std::string out {};
+    out.reserve(s.size());
+    for (const char c : s) {
+        switch (c) {
+            case '&': out += "&amp;"; break;
+            case '<': out += "&lt;"; break;
+            case '>': out += "&gt;"; break;
+            case '"': out += "&quot;"; break;
+            case '\'': out += "&apos;"; break;
+            default:
+                // XML 1.0 forbids most C0 controls outright; drop them rather than
+                // emit a document no parser will accept.
+                if (static_cast<unsigned char>(c) < 0x20 && c != '\n' && c != '\t' && c != '\r') break;
+                out.push_back(c);
+        }
+    }
+    return out;
+}
+
+// Split one file's report body into cases. Detail lines (an assertion diff, a
+// thrown error) precede their `(fail)` line in this runner, so they are buffered
+// and attached to the next status line the same way only_failure_lines does.
+std::vector<JUnitCase> junit_cases_from_body(std::string_view body) {
+    std::vector<JUnitCase> out {};
+    std::string pending {};
+    for (const auto lineRange : std::views::split(body, '\n')) {
+        const std::string_view line { lineRange.data(), lineRange.size() };
+        char status { 0 };
+        if (line.starts_with("(pass)")) status = 'p';
+        else if (line.starts_with("(fail)")) status = 'f';
+        else if (line.starts_with("(skip)")) status = 's';
+        else if (line.starts_with("(todo)")) status = 't';
+        if (status == 0) {
+            if (!line.empty()) {
+                if (!pending.empty()) pending.push_back('\n');
+                pending.append(line);
+            }
+            continue;
+        }
+        std::string_view name { line.substr(6) };
+        while (!name.empty() && name.front() == ' ') name.remove_prefix(1);
+        out.push_back(JUnitCase { std::string { name }, status,
+                                  status == 'f' ? pending : std::string {} });
+        pending.clear();
+    }
+    return out;
+}
+
+void write_junit_report(const std::filesystem::path& outfile,
+                        const std::vector<JUnitSuite>& suites, double totalMs) {
+    int tests {}, failures {}, skipped {};
+    for (const auto& s : suites) {
+        for (const auto& c : s.cases) {
+            ++tests;
+            if (c.status == 'f') ++failures;
+            else if (c.status == 's' || c.status == 't') ++skipped;
+        }
+    }
+    std::string xml { "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" };
+    xml += std::format("<testsuites name=\"bun test\" tests=\"{}\" assertions=\"{}\" failures=\"{}\" "
+                       "skipped=\"{}\" time=\"{:.6f}\">\n",
+                       tests, tests, failures, skipped, totalMs / 1000.0);
+    for (const auto& s : suites) {
+        int st {}, sf {}, ss {};
+        for (const auto& c : s.cases) {
+            ++st;
+            if (c.status == 'f') ++sf;
+            else if (c.status == 's' || c.status == 't') ++ss;
+        }
+        xml += std::format("  <testsuite name=\"{}\" tests=\"{}\" assertions=\"{}\" failures=\"{}\" "
+                           "skipped=\"{}\" time=\"{:.6f}\">\n",
+                           junit_escape(s.file), st, st, sf, ss, s.ms / 1000.0);
+        for (const auto& c : s.cases) {
+            xml += std::format("    <testcase name=\"{}\" classname=\"{}\" time=\"0\"",
+                               junit_escape(c.name), junit_escape(s.file));
+            if (c.status == 'f') {
+                xml += ">\n      <failure type=\"AssertionError\" message=\"";
+                xml += junit_escape(c.detail);
+                xml += "\"></failure>\n    </testcase>\n";
+            } else if (c.status == 's' || c.status == 't') {
+                xml += ">\n      <skipped/>\n    </testcase>\n";
+            } else {
+                xml += "></testcase>\n";
+            }
+        }
+        xml += "  </testsuite>\n";
+    }
+    xml += "</testsuites>\n";
+
+    std::error_code ec {};
+    if (outfile.has_parent_path()) std::filesystem::create_directories(outfile.parent_path(), ec);
+    std::ofstream out { outfile, std::ios::binary | std::ios::trunc };
+    if (out) out.write(xml.data(), static_cast<std::streamsize>(xml.size()));
+}
+
 // `mbun test [file|dir|filter]...`: discover the test files, run each through
 // mbun.jsc.test_runner, and print a bun-style per-file report + aggregate
 // summary. Returns the process exit code (0 all pass, 1 any fail / load error).
@@ -823,6 +1015,12 @@ int run_test(std::span<const std::string_view> args) {
                         if (cfg->test.seed && !flags.seed) {
                             flags.seed = *cfg->test.seed;
                             flags.randomize = true;  // a seed implies randomizing
+                        }
+                        // [test] rerunEach — the bunfig spelling of --rerun-each
+                        // (bunfig parser.cppm:389, which also enforces the
+                        // mutually-exclusive-with-retry rule). CLI wins.
+                        if (cfg->test.rerun_each != 0 && !flags.rerunEach) {
+                            flags.rerunEach = cfg->test.rerun_each;
                         }
                         bunfigPathIgnorePatterns = cfg->test.path_ignore_patterns;
                         apply_bunfig_jsx(*cfg, mbun::jsc::module_loader::runtime_jsx_options());
@@ -914,6 +1112,7 @@ int run_test(std::span<const std::string_view> args) {
 
     const auto started { std::chrono::steady_clock::now() };
     int pass { 0 }, fail { 0 }, skip { 0 }, todo { 0 }, errors { 0 }, expectCalls { 0 };
+    int snapTotal { 0 }, snapAdded { 0 };
     int skippedLabel { 0 };  // tests dropped by -t/--test-name-pattern (jest.rs:282)
 
     // The label filter (-t/--test-name-pattern/--grep), forwarded to each file.
@@ -921,7 +1120,19 @@ int run_test(std::span<const std::string_view> args) {
         flags.testNamePattern ? std::optional<std::string_view> { *flags.testNamePattern }
                               : std::nullopt };
 
+    // Only "junit" exists; any other --reporter value leaves the outfile alone
+    // rather than writing a document in a format nobody asked for.
+    const bool wantJUnit { flags.reporterOutfile.has_value() &&
+                           (!flags.reporter || *flags.reporter == "junit") };
+    std::vector<JUnitSuite> junitSuites {};
+
+    // --rerun-each / [test] rerunEach: how many times each file is evaluated.
+    // Clamped to >= 1 exactly as bun does (`repeat_count.max(1)`,
+    // test_command.rs:2144), so `--rerun-each=0` still runs the suite once.
+    const std::uint32_t rerunEach { std::max<std::uint32_t>(1, flags.rerunEach.value_or(1)) };
+
     for (const auto& f : files) {
+      for (std::uint32_t repeatIndex { 0 }; repeatIndex < rerunEach; ++repeatIndex) {
         const std::string path { f.string() };
         // The file header is titled with the path RELATIVE to the top level dir,
         // not the absolute path (ref: test_command.rs:3096 — `let file_title =
@@ -930,13 +1141,27 @@ int run_test(std::span<const std::string_view> args) {
         const std::filesystem::path rel { std::filesystem::relative(f, std::filesystem::current_path(rec), rec) };
         const std::string title { (rec || rel.empty()) ? path : rel.string() };
 
+        // Each rerun re-evaluates the module entry in the SAME realm, so the
+        // file's `globalThis` state carries across (that is the whole point of
+        // the flag) while its snapshot counters are reset — run_source clears
+        // S.snapCounters per evaluation (test_runner.cppm:1771), which is bun's
+        // `snapshots.reset_counts()` at test_command.rs:3121.
         mbun::jsc::test_runner::RunResult r { mbun::jsc::test_runner::run_file(path, seed, namePattern) };
 
         if (!r.ok) {  // a file that fails to load/run counts as one failed test (bun)
             std::println(std::cerr, "{}:\n  error: {}\n", title, r.error);
             fail += 1;
             errors += 1;
+            if (wantJUnit) {
+                junitSuites.push_back(JUnitSuite { title, { JUnitCase { title, 'f', r.error } }, 0.0 });
+            }
             continue;
+        }
+
+        // The JUnit document reports the WHOLE run, so it reads the unfiltered
+        // body — --only-failures is a console-reporter setting.
+        if (wantJUnit) {
+            junitSuites.push_back(JUnitSuite { title, junit_cases_from_body(r.body), 0.0 });
         }
 
         // --only-failures hides everything but the failures (ref: Arguments.rs:601,
@@ -963,12 +1188,19 @@ int run_test(std::span<const std::string_view> args) {
         todo += r.todo;
         errors += r.errors;
         expectCalls += r.expect_calls;
+        snapTotal += r.snap_total;
+        snapAdded += r.snap_added;
         skippedLabel += r.skipped_label;
+      }
     }
 
     const auto elapsed { std::chrono::duration<double, std::milli>(
                              std::chrono::steady_clock::now() - started)
                              .count() };
+
+    if (wantJUnit) {
+        write_junit_report(std::filesystem::path { *flags.reporterOutfile }, junitSuites, elapsed);
+    }
 
     // Summary block, in bun's order (ref: test_command.rs:2805-2896): the seed
     // line, then pass / skip / todo / fail / errors / expect() calls, then
@@ -981,6 +1213,16 @@ int run_test(std::span<const std::string_view> args) {
     if (todo > 0) std::println(std::cerr, " {} todo", todo);
     std::println(std::cerr, " {} fail", fail);
     if (errors > 0) std::println(std::cerr, " {} error{}", errors, errors == 1 ? "" : "s");
+    // Snapshot tally, between the error count and the expect() calls line
+    // (test_command.rs:2847-2890). Only the "something changed" branch is
+    // emitted: bun's other branch REPLACES the expect() calls line with
+    // "N snapshots, M expect() calls" when nothing was added, and reproducing
+    // that would rewrite the summary of every already-passing snapshot suite.
+    // Without this line a first run (which writes the .snap) was
+    // indistinguishable from a re-run against it (issue 14029).
+    if (snapTotal > 0 && snapAdded > 0) {
+        std::println(std::cerr, "snapshots: +{} added", snapAdded);
+    }
     if (expectCalls > 0) std::println(std::cerr, " {} expect() calls", expectCalls);
     std::println(std::cerr, "Ran {} test{} across {} file{}. [{:.2f}ms]", pass + fail + skip + todo,
                  (pass + fail + skip + todo) == 1 ? "" : "s", files.size(),
@@ -996,31 +1238,35 @@ int run_test(std::span<const std::string_view> args) {
     return (fail > 0 || (!flags.passWithNoTests && labelFilteredAll)) ? 1 : 0;
 }
 
+int run_add(std::span<const std::string_view> args);
+
 int run_install(std::span<const std::string_view> args) {
-    mbun::install::command::InstallOptions options{};
-    for (std::size_t i{0}; i < args.size(); ++i) {
-        std::string_view arg{args[i]};
-        if (arg == "--frozen-lockfile") {
-            options.frozenLockfile = true;
-        } else if (arg == "--ignore-scripts") {
-            options.ignoreScripts = true;
-        } else if (arg == "--no-progress") {
-            options.noProgress = true;
-        } else if (arg == "--lockfile-only") {
-            options.lockfileOnly = true;
-        } else if (arg == "--save-text-lockfile") {
-            options.saveTextLockfile = true;
-        } else if (arg == "--force" || arg == "-f") {
-            options.force = true;
-        } else if (arg == "--registry" && i + 1 < args.size()) {
-            options.registry.assign(args[++i]);
-        } else if (arg.starts_with("--registry=")) {
-            options.registry.assign(arg.substr(std::string_view{"--registry="}.size()));
-        } else {
-            std::println(std::cerr, "error: unsupported install argument '{}'", arg);
-            return 2;
-        }
+    auto flags{mbun::cli::parse_install(args)};
+    if (!flags.parseError.empty()) {
+        std::println(std::cerr, "error: {}", flags.parseError);
+        return 2;
     }
+    if (!flags.unsupported.empty()) {
+        std::println(std::cerr, "error: unsupported install argument '{}'",
+                     flags.unsupported.front());
+        return 2;
+    }
+    // `bun install <pkg>...` IS `bun add <pkg>...` — bun gates the update-request
+    // path on `Subcommand::Add | Subcommand::Install` alike
+    // (ref: CommandLineArguments.rs:1307-1314), and bun-add.test.ts:2191 asserts
+    // `install --save X` and `add X` produce the same package.json.
+    if (!flags.packages.empty()) {
+        return run_add(args);
+    }
+
+    mbun::install::command::InstallOptions options{};
+    options.frozenLockfile = flags.frozenLockfile;
+    options.ignoreScripts = flags.ignoreScripts;
+    options.noProgress = flags.noProgress;
+    options.lockfileOnly = flags.lockfileOnly;
+    options.saveTextLockfile = flags.saveTextLockfile;
+    options.force = flags.force;
+    options.registry = flags.registry;
 
     // Installing a project: judge its package.json engines with the compat
     // versions (warn-only, npm non-strict).
@@ -1182,9 +1428,29 @@ int run_add(std::span<const std::string_view> args) {
         list = editor::List::PeerDependencies;
     }
 
+    const auto packageJsonPath{find_package_json(std::filesystem::current_path())};
+    if (!packageJsonPath) {
+        std::println(std::cerr, "error: could not find package.json");
+        return 1;
+    }
+    const std::filesystem::path projectRoot{packageJsonPath->parent_path()};
+
     // ── parse the update requests ──────────────────────────────────────────
     std::vector<AddRequest> requests;
     for (const auto& spec : flags.packages) {
+        // A folder/link positional carries no package name — `file:../pkg` is
+        // ALL specifier. bun leaves such a request nameless and back-patches the
+        // name from the package the install pass resolved (UpdateRequest.rs
+        // :274-286 → lockfile.rs:1267-1283 → PackageJSONEditor.rs:826-876);
+        // mbun's folder resolver is synchronous, so the target's own
+        // package.json "name" is readable here and the literal is written
+        // through verbatim. Without this the whole specifier became the
+        // dependency KEY and the install died on `unsafe dependency name`
+        // (command.cppm:1199 — a key containing ':' is never a safe folder).
+        if (auto folderName{mbun::install::command::folder_positional_name(projectRoot, spec)}) {
+            requests.push_back(AddRequest{std::move(*folderName), std::string{spec}, false});
+            continue;
+        }
         auto [name, version] = mbun::install::dependency::split_name_and_maybe_version(spec);
         if (name.empty()) {
             // ref: UpdateRequest.rs:216-232 `unrecognised dependency format: {}`.
@@ -1207,12 +1473,6 @@ int run_add(std::span<const std::string_view> args) {
         requests.push_back(std::move(request));
     }
 
-    const auto packageJsonPath{find_package_json(std::filesystem::current_path())};
-    if (!packageJsonPath) {
-        std::println(std::cerr, "error: could not find package.json");
-        return 1;
-    }
-
     std::string source;
     {
         std::ifstream file{*packageJsonPath, std::ios::binary};
@@ -1233,6 +1493,28 @@ int run_add(std::span<const std::string_view> args) {
         std::println(std::cerr, "error: failed to parse package.json \"{}\"",
                      packageJsonPath->string());
         return 1;
+    }
+
+    // ── --only-missing: drop requests package.json already declares ────────
+    // PORT-SOURCE: PackageJSONEditor.rs:555 + :669-688 — the scan covers all
+    // FOUR dependency groups (`DependencyGroup::FOUR`, :589), not just the one
+    // this add targets, and a hit swap-removes the request from `updates`
+    // rather than rebinding its version string, so the existing entry keeps its
+    // original range byte-for-byte.
+    if (flags.onlyMissing && document->root && document->root->is_object()) {
+        constexpr std::array GROUPS{editor::List::Dependencies, editor::List::DevDependencies,
+                                    editor::List::OptionalDependencies,
+                                    editor::List::PeerDependencies};
+        const auto alreadyDeclared{[&](const std::string& name) {
+            return std::ranges::any_of(GROUPS, [&](editor::List group) {
+                const json::Value* listObject{document->root->get(editor::list_name(group))};
+                return listObject != nullptr && listObject->is_object() &&
+                       listObject->get(name) != nullptr;
+            });
+        }};
+        std::erase_if(requests, [&](const AddRequest& request) {
+            return alreadyDeclared(request.name);
+        });
     }
 
     // ── phase 1: write the requested literals, then install ────────────────
@@ -1522,8 +1804,24 @@ int run_build_no_bundle(const mbun::cli::BuildFlags& flags,
         const std::string source{buf.str()};
 
         const bool isJsx{absolute.ends_with(".jsx") || absolute.ends_with(".tsx")};
-        auto transpiled{mbun::js_parser::transpile(source,
-                                                   {.cjs = false, .jsx = isJsx, .jsx_options = jsx})};
+        // TS unused-import elision. bun's BUNDLER (and this is the bundler's
+        // transform-only mode, not Bun.Transpiler) turns it on for TypeScript
+        // loaders: bundler/ParseTask.rs:2435-2436
+        //     opts.features.trim_unused_imports =
+        //         loader.is_typescript() || …
+        // It is a CORRECTNESS feature, not a size win — a TS import can be a pure
+        // type reference, and keeping it makes the OUTPUT resolve and evaluate a
+        // module the program never asked for. Leaving it off is what made
+        // `import * as ns from './foo'` (ns unused, ./foo type-only/absent)
+        // survive into out.js and fail at run time with "Cannot find module".
+        // Loader keying matches mbun's runtime loader (module_loader.cppm
+        // trims_unused_imports): .ts/.tsx only — `.jsx` is javascript_like but not
+        // typescript (ast/loader.rs:242-249).
+        const bool isTypeScript{absolute.ends_with(".ts") || absolute.ends_with(".tsx") ||
+                                absolute.ends_with(".mts") || absolute.ends_with(".cts")};
+        auto transpiled{mbun::js_parser::transpile(
+            source, {.cjs = false, .jsx = isJsx, .jsx_options = jsx,
+                     .trim_unused_imports = isTypeScript})};
         if (!transpiled.ok) {
             std::println(std::cerr, "error: {}", transpiled.error);
             return 1;
@@ -2013,7 +2311,30 @@ struct RunFlags {
     // `--workspaces`: "Run a script in all workspace packages" (Arguments.rs:336
     // → ctx.workspaces at Arguments.rs:809).
     bool workspaces{false};
+    // `--filter <pattern>` / `-F <pattern>`: "Run a script in all workspace
+    // packages matching the pattern" (Arguments.rs:325 → filter_run.rs). Like
+    // `--workspaces` it fans the script out over the workspace members, but only
+    // over those whose package NAME matches one of the patterns.
+    std::vector<std::string> workspaceFilters{};
 };
+
+// A `--filter` pattern matched against a workspace package name. bun's filter
+// engine accepts glob syntax; `*` (any run of characters, including none) is the
+// only metacharacter the run-side filters use in practice, so this is a plain
+// wildcard matcher rather than a full glob.
+bool filter_pattern_matches(std::string_view pattern, std::string_view name) {
+    if (pattern.empty()) return name.empty();
+    // Iterative backtracking wildcard match — no recursion, no allocation.
+    std::size_t p{0}, n{0}, starP{std::string_view::npos}, starN{0};
+    while (n < name.size()) {
+        if (p < pattern.size() && (pattern[p] == name[n])) { ++p; ++n; continue; }
+        if (p < pattern.size() && pattern[p] == '*') { starP = p++; starN = n; continue; }
+        if (starP != std::string_view::npos) { p = starP + 1; n = ++starN; continue; }
+        return false;
+    }
+    while (p < pattern.size() && pattern[p] == '*') ++p;
+    return p == pattern.size();
+}
 
 // `--cwd <STR>`: "Absolute path to resolve files & entry points from. This just
 // changes the process' cwd." (Arguments.rs:120). bun joins it onto the current
@@ -2028,9 +2349,81 @@ void apply_cwd_flag(std::string_view dir) {
     }
 }
 
+// `--loader .ext:name` / `-l .ext:name`: install a process-wide extension→loader
+// override for the RUNTIME module loader.
+//
+// bun's `--loader` is a TRANSPILER_PARAMS_ entry (Arguments.rs:174-176), so it is
+// shared by `run`/`test`/`build`, not build-only: the runtime's loader lookup
+// probes the user map before DEFAULT_LOADERS (bundler/options.rs:1714). That is
+// how `bun --loader=.xyz:napi entry.mjs` makes `import "./thing.xyz"` a Node-API
+// addon (and therefore the ESM "use require()" TypeError) instead of feeding the
+// addon's bytes to the JS lexer.
+//
+// A malformed pair (no ':', an extension without a leading '.', or a loader name
+// this runtime has no Loader for) is IGNORED rather than fatal: the runtime path
+// must not refuse to start over a transpiler flag, and `loader_from_string`
+// already returns nullopt for names bun knows but mbun cannot produce.
+void apply_loader_flag(std::string pair) {
+    const std::size_t colon{pair.rfind(':')};
+    if (colon == std::string::npos || colon == 0) return;
+    std::string ext{pair.substr(0, colon)};
+    if (ext.front() != '.') return;
+    if (const auto loader{mbun::jsc::module_loader::loader_from_string(pair.substr(colon + 1))}) {
+        mbun::jsc::module_loader::runtime_loader_overrides()[std::move(ext)] = *loader;
+    }
+}
+
 // bun's `default_loader_for(target).can_be_run_by_bun()` (run_command.rs:774).
 bool loader_can_be_run(std::string_view target) {
     return looks_like_script(target) || is_markdown(target);
+}
+
+// DISPATCH POINT — entry point not found.
+//
+// The two corpora pin different text for the identical invocation, a bare
+// `<runtime> <missing>`:
+//
+//   node  compat/node/test/parallel/test-module-main-fail.js:15-17 needs
+//         /MODULE_NOT_FOUND/ AND /Cannot find module/ in the CHILD's stderr;
+//         test-module-main-preserve-symlinks-fail.js:15 needs the literal
+//         "Error: Cannot find module".
+//   bun   compat/bun/test/cli/run/if-present.test.ts:41,53 pins
+//         /Module not found/ and compat/bun/test/cli/install/bun-run.test.ts:481
+//         pins the whole stderr with toBe, including
+//         `error: Module not found "index.js"`.
+//
+// Both are a bare `mbun <file>`, so there is no discriminator AT THE CALL SITE
+// — which is exactly why the discriminator has to be the process dialect,
+// resolved before dispatch and inherited by children.
+//
+// node's own rendering: the CJS loader throws a MODULE_NOT_FOUND Error whose
+// message carries the RESOLVED absolute path, and the uncaught-exception
+// printer appends the `{ code, requireStack }` block.
+// ref: node lib/internal/modules/cjs/loader.js Module._resolveFilename.
+int report_entry_not_found_node(std::string_view target) {
+    std::error_code ec{};
+    std::filesystem::path p{target};
+    if (!p.is_absolute()) {
+        const std::filesystem::path cwd{std::filesystem::current_path(ec)};
+        if (!ec) p = cwd / p;
+    }
+    // No frame line numbers are invented here: mbun's loader is not node's, and
+    // a fabricated `loader.js:1215` would be a claim about a file that does not
+    // exist in this binary. The frame NAMES are what node prints and what a
+    // reader greps for; the corpus pins neither.
+    std::println(std::cerr,
+                 "Error: Cannot find module '{}'\n"
+                 "    at Module._resolveFilename (node:internal/modules/cjs/loader)\n"
+                 "    at Module._load (node:internal/modules/cjs/loader)\n"
+                 "    at Function.executeUserEntryPoint [as runMain] "
+                 "(node:internal/modules/run_main)\n"
+                 "    at node:internal/main/run_main_module {{\n"
+                 "  code: 'MODULE_NOT_FOUND',\n"
+                 "  requireStack: []\n"
+                 "}}\n\n"
+                 "Node.js v{}",
+                 p.lexically_normal().string(), mbun::cli::NODE_COMPAT_VERSION);
+    return 1;
 }
 
 // ref: run_command.rs:2745-2775 — the not-found wording is target-shaped.
@@ -2039,6 +2432,14 @@ int report_run_target_not_found(std::string_view target) {
     // "Cannot run", not "File not found". ref bun run_command.rs:2745.
     std::error_code ec2{};
     std::filesystem::path tp{target};
+    // Under the node dialect every miss is one error: node has no notion of a
+    // package.json script or a .bin shim to fall back to, so `node <anything
+    // that did not resolve>` is MODULE_NOT_FOUND. The "Cannot run" arm below
+    // stays bun-only — it is about bun's loader table, which node does not have.
+    if (mbun::jsc::runtime::dialect_is_node() &&
+        !(std::filesystem::exists(tp, ec2) && !std::filesystem::is_directory(tp, ec2))) {
+        return report_entry_not_found_node(target);
+    }
     if (!target.empty() && !target.ends_with(".json") &&
         std::filesystem::exists(tp, ec2) && !std::filesystem::is_directory(tp, ec2) &&
         !loader_can_be_run(target)) {
@@ -2269,7 +2670,15 @@ int exec_run_workspaces(std::string_view target, std::span<const std::string_vie
     for (const auto& member : members) {
         const std::filesystem::path dir{root / member.relPath};
         // multi_run.rs:885 — the root package is excluded under --workspaces.
-        if (std::filesystem::equivalent(dir, root, ec)) continue;
+        // Under `--filter` the root is a candidate like any other member: the
+        // pattern decides (filter_run.rs matches every package by name).
+        if (flags.workspaceFilters.empty() && std::filesystem::equivalent(dir, root, ec)) continue;
+        if (!flags.workspaceFilters.empty() &&
+            !std::ranges::any_of(flags.workspaceFilters, [&](const std::string& pattern) {
+                return filter_pattern_matches(pattern, member.name);
+            })) {
+            continue;
+        }
         run::PackageScripts pkg{run::load_nearest_package_scripts(dir)};
         if (!pkg.found || pkg.packageJsonDir != dir || pkg.find(target) == nullptr) continue;
         std::filesystem::current_path(dir, ec);
@@ -2307,6 +2716,9 @@ bool is_skippable_run_flag(std::string_view a) {
         // Consumed here; the value is picked up in main() before flag parsing
         // (it must reach resolve_entry_path, which run_script calls).
         "--preserve-symlinks-main"};
+    // `--dialect=<name>` — already consumed by resolve_dialect() before any
+    // dispatch; drop it so it never reaches a run target or a script's argv.
+    if (a.starts_with("--dialect=")) return true;
     if (a.starts_with("--install=") || a.starts_with("--conditions=") ||
         a.starts_with("--cwd=") || a.starts_with("--config=") ||
         // node's rejection mode selector: mbun always behaves as "throw" (node's
@@ -2323,6 +2735,146 @@ bool is_skippable_run_flag(std::string_view a) {
 // ref: cli/mod.rs:854-863 `is_node` — a plain suffix test on the WHOLE argv[0]
 // (NOT the basename), ported verbatim including that looseness.
 bool is_node_argv0(std::string_view argv0) { return argv0.ends_with("node"); }
+
+// ── dialect resolution ──────────────────────────────────────────────────────
+// Which compat layer this process serves. See modules/jsc/src/runtime.cppm for
+// what the dialect IS; this is only where the one answer gets picked.
+//
+// Resolved once, before any dispatch, from three signals in strict priority:
+//
+//   1. `--dialect=node|bun` on the command line, else the MBUN_DIALECT env var.
+//      Explicit always wins, and it is the signal that makes the other two
+//      testable at all.
+//   2. argv[0] ending in `node` — the signal bun already carries
+//      (is_node_argv0 above → set_pretend_to_be_node). Every `#!/usr/bin/env
+//      node` shebang that lands in this binary arrives this way.
+//   3. The subcommand. `mbun test|run|install|add|build|exec|publish|pm|x|i`
+//      is a bun invocation by construction — none of those words is a thing
+//      node can be asked to do. Everything else, above all a bare
+//      `mbun <file>`, leans node: node's ONLY calling convention is
+//      `node <file>`, so that is the shape a node-flavoured run has.
+//
+// Rule 3 alone already separates the two corpora, with no symlink and no
+// runner change: tools/integration/bun_corpus_runner.py spawns
+// `<bin> test <file>` and node_corpus_runner.py spawns `<bin> <file>`.
+//
+// The default with NO signal at all stays Bun, so nothing about an ordinary
+// invocation moves.
+mbun::jsc::runtime::Dialect dialect_from_name(std::string_view v) {
+    return v == "node" ? mbun::jsc::runtime::Dialect::Node : mbun::jsc::runtime::Dialect::Bun;
+}
+
+bool is_valid_dialect_name(std::string_view v) { return v == "node" || v == "bun"; }
+
+// The subcommands that ARE bun. Kept in sync with mbun::cli::parse (src/cli.cppm)
+// plus the two main() handles ahead of it (`run`, `pm`) and the package-manager
+// verbs bun owns even where mbun has not implemented them yet — a word bun
+// reserves must never be read as a node entry point.
+bool is_bun_subcommand(std::string_view a) {
+    static constexpr std::string_view kBunSubcommands[]{
+        "test",    "run",    "install", "i",       "add",     "remove", "rm",
+        "update",  "upgrade","link",    "unlink",  "pm",      "x",      "exec",
+        "build",   "create", "init",    "publish", "patch",   "why",    "audit",
+        "outdated","repl"};
+    for (std::string_view s : kBunSubcommands) {
+        if (a == s) return true;
+    }
+    return false;
+}
+
+// `--dialect=<name>` / `--dialect <name>`, scanned off the RAW command line
+// before any flag loop consumes it — the same discipline set_exec_argv and the
+// permission model already use. Stops at the first non-flag or at an eval flag
+// so a `-e` program that merely contains the word is not a request.
+std::optional<mbun::jsc::runtime::Dialect> dialect_from_argv(int argc, char* argv[]) {
+    for (int i{1}; i < argc; ++i) {
+        const std::string_view a{argv[i]};
+        if (a == "-e" || a == "--eval" || a == "-p" || a == "--print" || a == "-pe" ||
+            a == "-ep") {
+            break;
+        }
+        if (a.starts_with("--dialect=")) {
+            const std::string_view v{a.substr(std::string_view{"--dialect="}.size())};
+            if (is_valid_dialect_name(v)) return dialect_from_name(v);
+            break;
+        }
+        if (a == "--dialect" && i + 1 < argc) {
+            const std::string_view v{argv[i + 1]};
+            if (is_valid_dialect_name(v)) return dialect_from_name(v);
+            break;
+        }
+        if (!a.starts_with("-")) break;
+    }
+    return std::nullopt;
+}
+
+struct ResolvedDialect {
+    mbun::jsc::runtime::Dialect value{mbun::jsc::runtime::Dialect::Bun};
+    // Whether the answer came from an EXPLICIT signal (flag or env) rather than
+    // from argv0/subcommand inference. Only an explicit answer, and a `bun`
+    // answer, need to be handed to children: a child invoked the way rule 3
+    // reads as node re-derives node on its own.
+    bool explicitly_set{false};
+};
+
+ResolvedDialect resolve_dialect(int argc, char* argv[]) {
+    // 1a. the flag.
+    if (const auto d{dialect_from_argv(argc, argv)}) return {*d, true};
+    // 1b. the env var — the form that INHERITS, which is what a conflict
+    //     asserting on a CHILD process needs (compat/node/test/parallel/
+    //     test-module-main-fail.js spawns process.argv[0] with no env option, so
+    //     the child gets the parent's environment; compat/bun/test/harness.ts:64
+    //     `bunEnv` spreads process.env, so it propagates on that side too).
+    if (const char* v{std::getenv("MBUN_DIALECT")}; v != nullptr && is_valid_dialect_name(v)) {
+        return {dialect_from_name(v), true};
+    }
+    // 2. argv0.
+    if (argc > 0 && argv[0] != nullptr && is_node_argv0(argv[0])) {
+        return {mbun::jsc::runtime::Dialect::Node, false};
+    }
+    // 3. the subcommand. The first non-flag token is the subcommand slot; a
+    //    command line with no positional at all (`mbun --version`, a bare
+    //    `mbun`) reaches no dispatch point and keeps the Bun default.
+    for (int i{1}; i < argc; ++i) {
+        const std::string_view a{argv[i]};
+        if (a == "-e" || a == "--eval" || a == "-p" || a == "--print" || a == "-pe" ||
+            a == "-ep") {
+            // `mbun -e <code>` is node's calling convention too.
+            return {mbun::jsc::runtime::Dialect::Node, false};
+        }
+        if (a.starts_with("-")) {
+            // A valued flag swallows its argument, so the value is never
+            // mistaken for the subcommand.
+            if (a.find('=') == std::string_view::npos && mbun::cli::node_flag_takes_value(a) &&
+                i + 1 < argc) {
+                ++i;
+            }
+            continue;
+        }
+        return {is_bun_subcommand(a) ? mbun::jsc::runtime::Dialect::Bun
+                                     : mbun::jsc::runtime::Dialect::Node,
+                false};
+    }
+    return {mbun::jsc::runtime::Dialect::Bun, false};
+}
+
+// Publish the resolved dialect to the runtime AND, when a child could not
+// re-derive it, to the environment so children inherit it.
+//
+// The asymmetry is deliberate, and it is the whole reason the default path can
+// stay unchanged. A child spawned as a bare `mbun <file>` re-derives Node from
+// rule 3 by itself, so an implicit Node answer needs no env var and the node
+// corpus' process.env is untouched. A Bun answer is the one a bare child
+// CANNOT re-derive — compat/bun/test/cli/run/if-present.test.ts:35 spawns
+// `<bin> ./notpresent.js` from inside a `mbun test` run and pins bun's
+// `Module not found` — so Bun is exported, as is any explicit override.
+void publish_dialect(ResolvedDialect d) {
+    mbun::jsc::runtime::set_dialect(d.value);
+    if (d.explicitly_set || d.value == mbun::jsc::runtime::Dialect::Bun) {
+        mbun::platform::set_env_var(
+            "MBUN_DIALECT", d.value == mbun::jsc::runtime::Dialect::Node ? "node" : "bun");
+    }
+}
 
 // ── `--compile`d executables ────────────────────────────────────────────────
 // A standalone executable is this same binary with a program appended (see
@@ -2538,7 +3090,13 @@ int exec_as_if_node(std::span<const std::string_view> args) {
                 return 1;
             }
             std::vector<std::string> jsArgv{"node"};
-            for (std::string_view rest : args.subspan(i + 2)) jsArgv.emplace_back(rest);
+            {
+                // `--` right after the eval string is the option terminator
+                // (see the same rule in main.cpp's eval path, ref 17294).
+                auto rest{args.subspan(i + 2)};
+                if (!rest.empty() && rest[0] == "--") rest = rest.subspan(1);
+                for (std::string_view a : rest) jsArgv.emplace_back(a);
+            }
             mbun::jsc::runtime::set_argv(std::move(jsArgv));
             std::string code{args[i + 1]};
             if (a == "-p" || a == "--print" || a == "-pe" || a == "-ep")

@@ -42,15 +42,37 @@ struct TemplateArgument {
     // as_array_buffer check, shell_body.rs:851-881); mbun's per-argument word list cannot
     // express that interleaving, so nested buffers still stringify.
     std::optional<std::uint32_t> jsObjIndex;
+
+    // Set when the interpolation is bun's raw escape hatch, `${{ raw: "..." }}`.
+    // bun splices that string into the shell SOURCE verbatim
+    // (shell_body.rs:885-905 → ShellSrcBuilder::appendJSValueStr with escaping
+    // OFF), which is the entire point of the hatch: ``$`${{raw:"echo hi"}}` ``
+    // must run `echo hi`, not a single command whose NAME is "echo hi".
+    // Escaping it as a word instead made every raw-built command exit 127.
+    // `words` is unused when this is set.
+    std::optional<std::string> rawText;
 };
 
 namespace detail {
 
+// The lexer resolves the sentinel byte 0x08 followed by "__bun_"/"__bunstr_" as
+// an INTERNAL reference wherever it occurs — inside quotes too (parser.cppm
+// lex_loop; bun's parse.rs is the same). Interpolated user bytes must therefore
+// never be spliced in adjacent to that prefix: bun breaks the pattern with an
+// empty quoted segment right after the sentinel (escape_8bit writes `\x08""`,
+// mirrored by parser.cppm::escape_string). Do the same here in whichever quote
+// style is in force at this site, so the byte stays literal data — otherwise
+// `${"\x08__bun_abc"}` dies with "Invalid JS object ref (no idx)" and
+// `${"\x08__bun_0"}` would decode as a *real* ref. Genuine refs are written by
+// compile_template itself and never pass through these appenders.
 void append_unquoted(std::string& output, std::string_view word) {
     output.push_back('\'');
     for (const char byte : word) {
         if (byte == '\'') {
             output += "'\\''";
+        } else if (static_cast<unsigned char>(byte) == SPECIAL_JS_CHAR) {
+            output.push_back(byte);
+            output += "''";
         } else {
             output.push_back(byte);
         }
@@ -62,6 +84,9 @@ void append_single_quoted(std::string& output, std::string_view word) {
     for (const char byte : word) {
         if (byte == '\'') {
             output += "'\\''";
+        } else if (static_cast<unsigned char>(byte) == SPECIAL_JS_CHAR) {
+            output.push_back(byte);
+            output += "''";
         } else {
             output.push_back(byte);
         }
@@ -70,6 +95,11 @@ void append_single_quoted(std::string& output, std::string_view word) {
 
 void append_double_quoted(std::string& output, std::string_view word) {
     for (const char byte : word) {
+        if (static_cast<unsigned char>(byte) == SPECIAL_JS_CHAR) {
+            output.push_back(byte);
+            output += "\"\"";
+            continue;
+        }
         if (byte == '\\' || byte == '"' || byte == '$' || byte == '`') {
             output.push_back('\\');
         }
@@ -107,6 +137,7 @@ compile_template(std::span<const std::string> rawSegments,
     std::size_t outputSize{0};
     for (const auto& raw : rawSegments) outputSize += raw.size();
     for (const auto& argument : arguments) {
+        if (argument.rawText) outputSize += argument.rawText->size();
         for (const auto& word : argument.words) outputSize += word.size() + 3;
     }
 
@@ -128,6 +159,13 @@ compile_template(std::span<const std::string> rawSegments,
     for (std::size_t index{0}; index < rawSegments.size(); ++index) {
         markerScript += rawSegments[index];
         if (index >= arguments.size()) continue;
+        // A raw interpolation IS source text: it must be part of the string the
+        // quote-context analysis runs over (it may open/close quotes or carry
+        // operators), and it consumes no marker index.
+        if (arguments[index].rawText) {
+            markerScript += *arguments[index].rawText;
+            continue;
+        }
         if (const auto objIndex{arguments[index].jsObjIndex}) {
             std::format_to(std::back_inserter(markerScript), "\x08__bun_{}", *objIndex);
         } else {
@@ -153,6 +191,17 @@ compile_template(std::span<const std::string> rawSegments,
         }
         output += raw;
         if (i == arguments.size()) continue;
+
+        if (const auto& rawText{arguments[i].rawText}) {
+            if (rawText->find('\0') != std::string::npos) {
+                return std::unexpected(TemplateError{
+                    TemplateErrorCode::NullByte,
+                    "The shell argument must be a string without null bytes",
+                });
+            }
+            output += *rawText;
+            continue;
+        }
 
         // An object ref carries no text: emit the reference itself, as bun writes
         // LEX_JS_OBJREF_PREFIX ++ idx straight into out_script (shell_body.rs:808-814).

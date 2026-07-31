@@ -399,7 +399,21 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
         let size = 0;
         let ioerr;
         let isFifo = false;
-        if (!isFd) {
+        // A fd-backed BunFile derives its byte length from fstat(2) — bun's
+        // ReadFile.resolveSizeAndLastModified does exactly that before reading.
+        // It is deliberately kept OUT of `size`/`__size`: bun reports 0 for a
+        // never-read Bun.file(fd) and structuredClone round-trips that value
+        // (js/web/workers/structured-clone.test.ts "file from fd" asserts
+        // cloned.size === blob.size, and the clone codec re-materialises the fd
+        // as a path). This length only sizes the reads below; -1 means "not a
+        // regular file" (pipe/socket/bad fd), which stays on the stream path.
+        let fdSize = -1;
+        if (isFd) {
+          try {
+            const st = fsm.fstatSync(fdArg);
+            if (st.isFile()) fdSize = Number(st.size) || 0;
+          } catch (e) {}
+        } else {
           try {
             const st = fsm.statSync(fsPath);
             if (st.isDirectory()) ioerr = "EISDIR";
@@ -415,9 +429,11 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
         slot("__size", size);
         slot("__name", p);
         slot("__lastModified", 0);
-        if (!ioerr && !isFd) {
+        if (!ioerr && (!isFd || fdSize >= 0)) {
           const protoU8 = Object.getOwnPropertyDescriptor(G.Blob.prototype, "_u8");
           let loaded = false;   // has the file's content been pulled into __parts?
+          // Byte length to read/clamp against: fstat's for an fd, stat's for a path.
+          const totalSize = isFd ? fdSize : size;
           // Shadows Blob.prototype's `_u8`: the bytes are pulled off disk the
           // first time anything actually needs them, then cached as the blob's
           // single part (so a second read is free and `_u8 = …` still works).
@@ -430,8 +446,11 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
                 // that limit in bun, and text()/bytes()/json() are already
                 // capped on `size` by Blob.prototype before they get here.
                 const FD = G.__mbunFdNative;
-                const fd = FD.open(fsPath, "r", 0o666);
-                let u = new Uint8Array(size > 0 ? size : 65536);
+                // Bun.file(fd) does NOT own the descriptor: read it where it
+                // stands (bun's ReadFile reuses the already-open fd) and leave
+                // closing to whoever opened it.
+                const fd = isFd ? fdArg : FD.open(fsPath, "r", 0o666);
+                let u = new Uint8Array(totalSize > 0 ? totalSize : 65536);
                 let off = 0;
                 try {
                   for (;;) {
@@ -440,7 +459,7 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
                     if (!(n > 0)) break;
                     off += n;
                   }
-                } finally { FD.close(fd); }
+                } finally { if (!isFd) FD.close(fd); }
                 if (off !== u.length) u = u.subarray(0, off);
                 slot("__parts", [u]);
                 slot("__size", off);
@@ -460,13 +479,13 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
               let n = Number(v);
               if (Number.isNaN(n)) n = 0;
               n = Math.trunc(n);
-              return n < 0 ? Math.max(size + n, 0) : Math.min(n, size);
+              return n < 0 ? Math.max(totalSize + n, 0) : Math.min(n, totalSize);
             };
             const s = norm(start, 0);
-            const e = Math.max(norm(end, size), s);
+            const e = Math.max(norm(end, totalSize), s);
             const out = new Uint8Array(e - s);
             if (out.length > 0) {
-              const fd = fsm.openSync(fsPath, "r");
+              const fd = isFd ? fdArg : fsm.openSync(fsPath, "r");
               try {
                 let got = 0;
                 while (got < out.length) {
@@ -474,7 +493,7 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
                   if (!(n > 0)) break;
                   got += n;
                 }
-              } finally { fsm.closeSync(fd); }
+              } finally { if (!isFd) fsm.closeSync(fd); }
             }
             const b = new G.Blob([], { type: sliceType || "" });
             Object.defineProperty(b, "__parts", { value: out.length ? [out] : [], writable: true, enumerable: false, configurable: true });
@@ -482,15 +501,33 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
             return b;
           });
         }
+        slot("__mbunIoErr", ioerr === undefined ? "" : ioerr);
         if (ioerr) {
           // Missing/unreadable file: read methods reject with the errno (bun #26632).
           // These shadow Blob.prototype's resolving versions.
           const mkErr = () => { const e = new Error(ioerr + ": " + (ioerr === "EISDIR" ? "illegal operation on a directory" : "no such file or directory") + ", open '" + p + "'"); e.code = ioerr; e.errno = ioerr === "EISDIR" ? -21 : -2; e.syscall = "open"; e.path = p; return e; };
-          slot("text", () => Promise.reject(mkErr()));
-          slot("json", () => Promise.reject(mkErr()));
-          slot("arrayBuffer", () => Promise.reject(mkErr()));
-          slot("bytes", () => Promise.reject(mkErr()));
-          slot("stream", () => new G.ReadableStream({ start(c) { c.error(mkErr()); } }));
+          // …but a BunFile does its I/O at CALL time in bun, not at construction:
+          // naming a path that does not exist YET is legal, and reading it after
+          // something created it succeeds. Caching the constructor-time ENOENT
+          // in these slots made `Bun.file(p)` a permanently-dead handle, so
+          // js/web/fetch/blob-write — which names a file in a fresh temp dir,
+          // fills it through that same handle's .writer(), then reads it back —
+          // rejected with the stale ENOENT instead of returning the bytes.
+          // Re-derive a fresh handle per call and delegate to it; only when the
+          // path is STILL unreadable is the errno the honest answer. EISDIR is
+          // resolved once and kept: `wrapped` would just report it again.
+          const retry = (m, args, onGone) => {
+            if (ioerr !== "ENOENT") return onGone();
+            let f2;
+            try { f2 = wrapped(path, options); } catch (e) { return onGone(); }
+            if (f2.__mbunIoErr) return onGone();
+            return f2[m].apply(f2, args);
+          };
+          slot("text", function () { return retry("text", arguments, () => Promise.reject(mkErr())); });
+          slot("json", function () { return retry("json", arguments, () => Promise.reject(mkErr())); });
+          slot("arrayBuffer", function () { return retry("arrayBuffer", arguments, () => Promise.reject(mkErr())); });
+          slot("bytes", function () { return retry("bytes", arguments, () => Promise.reject(mkErr())); });
+          slot("stream", function () { return retry("stream", arguments, () => new G.ReadableStream({ start(c) { c.error(mkErr()); } })); });
         }
         // bun: .exists() is true only for a regular file — a directory (or missing
         // path) resolves to false. (text/json/arrayBuffer/bytes/stream/slice all
@@ -498,8 +535,25 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
         // bun carries .exists on Blob.prototype, so it is never an own key of a
         // BunFile: keep it off Object.keys()/JSON.stringify().
         slot("exists", () => { try { return Promise.resolve(fsm.statSync(fsPath).isFile()); } catch (e) { return Promise.resolve(false); } });
+        // BunFile.stat()/.unlink()/.delete() (bun.d.ts BunFile): stat resolves a
+        // node fs.Stats, unlink/delete remove the path. They were missing
+        // entirely, so `Bun.file(p).stat()` threw "stat is not a function"
+        // (issue 26647) even though node:fs already answers the same paths.
+        slot("stat", () => { try { return Promise.resolve(isFd ? fsm.fstatSync(fdArg) : fsm.statSync(fsPath)); } catch (e) { return Promise.reject(e); } });
+        const unlinkOne = () => { try { fsm.unlinkSync(fsPath); return Promise.resolve(undefined); } catch (e) { return Promise.reject(e); } };
+        slot("unlink", unlinkOne);
+        slot("delete", unlinkOne);
         // Bun.file(...).writer([opts]) → incremental FileSink over the fd.
         slot("writer", (wopts) => makeFileSink({ path: isFd ? null : fsPath, fd: isFd ? fdArg : -1, isFifo: isFifo, opts: wopts }));
+        // BunFile.write(data) (bun.d.ts BunFile#write) — one-shot overwrite,
+        // resolving the byte count. It was the one writer on BunFile that had no
+        // slot at all, so `Bun.file(p).write(blob)` threw "write is not a
+        // function". Bun.write already carries every accepted data shape
+        // (string / typed array / Blob / BunFile / Response), so delegate.
+        slot("write", (data, wopts) => {
+          try { return Promise.resolve(G.Bun.write(isFd ? fdArg : fsPath, data, wopts)); }
+          catch (e) { return Promise.reject(e); }
+        });
         // A fifo cannot be read by the synchronous Blob loader (open(2)/read(2)
         // would block on the peer); stream it non-blocking instead.
         if (isFifo && !ioerr) slot("stream", (cs) => makeFifoReadStream(fsPath, cs));
@@ -542,11 +596,21 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
             return;
           }
           if (name && typeof name === "object") { options = name; name = options.name; value = options.value; }
-          _name = String(name); this.value = String(value); options = options || {};
+          _name = String(name); options = options || {};
+          // bun stores the value as WTF-8: a LONE surrogate is replaced with
+          // U+FFFD on the way in (both at construction and through the setter),
+          // which is also why appendTo's encodeURIComponent can never throw.
+          let _value = sanitizeCookieValue(String(value));
+          Object.defineProperty(this, "value", { get() { return _value; }, set(v) { _value = sanitizeCookieValue(String(v)); }, enumerable: true, configurable: true });
           Object.defineProperty(this, "name", { get() { return _name; }, set(v) {}, enumerable: true, configurable: true });
           // An explicit empty path ("") is preserved so appendTo omits the Path attribute;
-          // only an absent path defaults to "/".
-          this.domain = options.domain || null; this.path = (options.path === undefined || options.path === null) ? "/" : options.path;
+          // only an absent path defaults to "/". Assigning either attribute later
+          // validates (and leaves the old value in place on rejection), even though
+          // the constructor does not validate the path.
+          let _domain = options.domain || null;
+          let _path = (options.path === undefined || options.path === null) ? "/" : options.path;
+          Object.defineProperty(this, "domain", { get() { return _domain; }, set(v) { const d = v === null || v === undefined ? null : String(v); if (d !== null && !isValidCookieDomain(d)) throw new Error("Invalid cookie domain: contains invalid characters"); _domain = d; }, enumerable: true, configurable: true });
+          Object.defineProperty(this, "path", { get() { return _path; }, set(v) { const p = String(v); if (!isValidCookiePath(p)) throw new Error("Invalid cookie path: contains invalid characters"); _path = p; }, enumerable: true, configurable: true });
           this.secure = !!options.secure; this.httpOnly = !!options.httpOnly;
           this.sameSite = options.sameSite || "lax"; this.maxAge = options.maxAge; this.partitioned = !!options.partitioned;
           const e = options.expires;
@@ -554,6 +618,15 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
           else if (e instanceof Date) { if (isNaN(e.getTime())) throw new Error("expires must be a valid Date (or Number)"); this.expires = e; }
           else if (typeof e === "number") { if (!isFinite(e)) throw new Error("expires must be a valid Number"); this.expires = new Date(e * 1000); }
           else throw new Error("expires must be a valid Date (or Number)");
+          // bun Cookie.cpp validates the name, the domain and sameSite at
+          // construction — a name/domain carrying CTLs, a space, ';' or '=' would
+          // let a caller smuggle extra Set-Cookie attributes. The PATH is
+          // deliberately NOT validated: bun accepts `/; Path=/x` (cookie.test.js
+          // marks its own path-validation test `.failing`), and sameSite is
+          // case-SENSITIVE, so "Lax" is rejected while "lax" is not.
+          if (!isValidCookieName(_name)) throw new Error("Invalid cookie name: contains invalid characters");
+          if (this.domain !== null && this.domain !== undefined && !isValidCookieDomain(String(this.domain))) throw new Error("Invalid cookie domain: contains invalid characters");
+          if (this.sameSite !== "strict" && this.sameSite !== "lax" && this.sameSite !== "none") throw new Error("Invalid sameSite value. Must be 'strict', 'lax', or 'none'");
         }
         isExpired() { if (this.maxAge != null) return this.maxAge <= 0; return this.expires instanceof Date && this.expires.getTime() < Date.now(); }
         serialize() { return this.toString(); }
@@ -601,9 +674,12 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
       // bun Cookie.cpp validators. Names: [!-:<>-~]+
       // (non-empty). Paths: [ -:=-~]* (may be empty).
       // Domains: [a-z0-9.-]*.
+      // Lone (unpaired) surrogate → U+FFFD, matching the WTF-8 conversion bun does
+      // when it stores a cookie value.
+      const sanitizeCookieValue = (s) => s.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, "�");
       const isValidCookieName = (s) => { if (s.length === 0) return false; for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); if (!((c >= 0x21 && c <= 0x3A) || c === 0x3C || (c >= 0x3E && c <= 0x7E))) return false; } return true; };
       const isValidCookiePath = (s) => { for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); if (!((c >= 0x20 && c <= 0x3A) || (c >= 0x3D && c <= 0x7E))) return false; } return true; };
-      const isValidCookieDomain = (s) => { for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); if (!((c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c === 46 || c === 45)) return false; } return true; };
+      const isValidCookieDomain = (s) => { for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); if (!((c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c === 46 || c === 45)) return false; } return true; };
       // ref: bun src/jsc/bindings/CookieMap.{h,cpp} — two ordered lists, not one map.
       // `_orig` mirrors m_originalCookies (parsed from the request's Cookie header);
       // `_mod` mirrors m_modifiedCookies (only what .set()/.delete() touched).
@@ -622,7 +698,11 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
               const i = part.indexOf("="); if (i < 0) continue;
               const name = part.slice(0, i).trim(); if (name === "") continue;
               let value = part.slice(i + 1).trim();
-              if (hasPct) { try { value = decodeURIComponent(value); } catch (e) {} }
+              // A malformed escape (`foo=%1`) DROPS the pair: it neither survives
+              // verbatim (cookie.test.js marks "should return original value on
+              // escape error" `.failing`) nor aborts the whole header
+              // ("should ignore duplicate cookies" parses `foo=%1;bar=bar;foo=boo`).
+              if (hasPct) { try { value = decodeURIComponent(value); } catch (e) { continue; } }
               this._orig.push([name, value]);
             }
           } else if (Array.isArray(init)) {
@@ -774,6 +854,129 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
       return eq(a, b, !!strict, new Map());
     };
     if (typeof Bun.escapeHTML === "undefined") Bun.escapeHTML = (s) => ("" + s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#x27;");
+    // ---- Bun.CSRF (blueprint bun src/csrf/lib.rs; core port: mbun.csrf) -----
+    // Token layout, all big-endian, HMAC'd as one message:
+    //   payload[0..8)   creation timestamp (ms since epoch)
+    //   payload[8..24)  16 random bytes
+    //   payload[24..32) expiresIn (ms; 0 = never)
+    //   digest          HMAC(secret, payload || sessionId)
+    // The wire token is `payload || digest`, encoded base64url (default), base64
+    // or hex. verify() is fail-closed: any decode failure, a short token, an
+    // expired timestamp (by the token's own expiresIn OR the verifier's maxAge),
+    // or a sessionId that differs from the one the token was bound to all return
+    // false rather than throwing. Argument problems (empty token/secret, empty or
+    // non-string sessionId, unknown encoding/algorithm) DO throw.
+    if (typeof Bun.CSRF === "undefined") {
+      const CSRF_DAY_MS = 24 * 60 * 60 * 1000;
+      const CSRF_ALGS = { blake2b256: 1, blake2b512: 1, sha256: 1, sha384: 1, sha512: 1, "sha512-256": 1 };
+      const csrfCrypto = () => {
+        const c = M["crypto"] || M["node:crypto"];
+        if (!c || typeof c.createHmac !== "function") throw new Error("Bun.CSRF requires node:crypto");
+        return c;
+      };
+      let csrfDefaultSecret;
+      const csrfSecret = (secret, required) => {
+        if (secret === undefined || secret === null) {
+          if (required) { const e = new TypeError('The "secret" argument must be of type string.'); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
+          // bun lazily mints one process-wide random secret, so a token minted
+          // by CSRF.generate() verifies with CSRF.verify() in the same process
+          // and nowhere else.
+          if (csrfDefaultSecret === undefined) csrfDefaultSecret = csrfCrypto().randomBytes(32).toString("hex");
+          return csrfDefaultSecret;
+        }
+        if (typeof secret !== "string") { const e = new TypeError('The "secret" argument must be of type string. Received ' + typeof secret); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
+        if (secret.length === 0) { const e = new TypeError('The "secret" argument must not be empty.'); e.code = "ERR_INVALID_ARG_VALUE"; throw e; }
+        return secret;
+      };
+      const csrfCommonOptions = (options) => {
+        const opts = options === undefined || options === null ? {} : options;
+        if (typeof opts !== "object") { const e = new TypeError('The "options" argument must be an object.'); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
+        const encoding = opts.encoding === undefined ? "base64url" : opts.encoding;
+        if (encoding !== "base64" && encoding !== "base64url" && encoding !== "hex") {
+          const e = new TypeError('The "encoding" argument must be one of "base64", "base64url" or "hex". Received ' + String(encoding));
+          e.code = "ERR_INVALID_ARG_VALUE"; throw e;
+        }
+        const algorithm = opts.algorithm === undefined ? "sha256" : opts.algorithm;
+        if (typeof algorithm !== "string" || CSRF_ALGS[algorithm] === undefined) {
+          const e = new TypeError('The "algorithm" argument must be a supported HMAC algorithm. Received ' + String(algorithm));
+          e.code = "ERR_INVALID_ARG_VALUE"; throw e;
+        }
+        let sessionId = opts.sessionId;
+        if (sessionId === undefined || sessionId === null) sessionId = "";
+        else {
+          if (typeof sessionId !== "string") { const e = new TypeError('The "sessionId" argument must be of type string. Received ' + typeof sessionId); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
+          if (sessionId.length === 0) { const e = new TypeError('The "sessionId" argument must not be empty.'); e.code = "ERR_INVALID_ARG_VALUE"; throw e; }
+        }
+        return { opts, encoding, algorithm, sessionId };
+      };
+      const csrfMs = (value, fallback, name) => {
+        if (value === undefined || value === null) return fallback;
+        const ms = Number(value);
+        if (!Number.isFinite(ms) || ms < 0) { const e = new TypeError('The "' + name + '" argument must be a non-negative number. Received ' + String(value)); e.code = "ERR_INVALID_ARG_VALUE"; throw e; }
+        return Math.floor(ms);
+      };
+      const csrfHmac = (secret, algorithm, message) => {
+        const h = csrfCrypto().createHmac(algorithm, secret);
+        h.update(message);
+        return h.digest();
+      };
+      // base64 and base64url share one decoder (bun decodes both alphabets with
+      // the same table), so a hex token handed to the default decoder yields
+      // bytes that simply fail the HMAC check instead of an error.
+      const CSRF_B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+      const csrfDecode = (token, encoding) => {
+        const t = token.replace(/^[\r\n\t \v]+/, "").replace(/[\r\n\t \v]+$/, "");
+        if (encoding === "hex") {
+          if (t.length % 2 !== 0 || /[^0-9a-fA-F]/.test(t)) return null;
+          return Buffer.from(t, "hex");
+        }
+        const out = [];
+        let acc = 0, bits = 0;
+        for (let k = 0; k < t.length; k++) {
+          const c = t[k];
+          if (c === "=") break;
+          let pos = CSRF_B64.indexOf(c);
+          if (pos < 0) { if (c === "-") pos = 62; else if (c === "_") pos = 63; else return null; }
+          acc = (acc << 6) | pos; bits += 6;
+          if (bits >= 8) { bits -= 8; out.push((acc >> bits) & 0xff); }
+        }
+        return Buffer.from(out);
+      };
+      Bun.CSRF = {
+        generate(secret, options) {
+          const key = csrfSecret(secret, false);
+          const { opts, encoding, algorithm, sessionId } = csrfCommonOptions(options);
+          const expiresIn = csrfMs(opts.expiresIn, CSRF_DAY_MS, "expiresIn");
+          const payload = Buffer.alloc(32);
+          payload.writeBigUInt64BE(BigInt(Date.now()), 0);
+          csrfCrypto().randomFillSync(payload, 8, 16);
+          payload.writeBigUInt64BE(BigInt(expiresIn), 24);
+          const digest = csrfHmac(key, algorithm, Buffer.concat([payload, Buffer.from(sessionId, "utf8")]));
+          const token = Buffer.concat([payload, digest]);
+          return encoding === "hex" ? token.toString("hex")
+               : encoding === "base64" ? token.toString("base64")
+               : token.toString("base64url");
+        },
+        verify(token, options) {
+          if (typeof token !== "string") { const e = new TypeError('The "token" argument must be of type string. Received ' + typeof token); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
+          if (token.length === 0) { const e = new TypeError('The "token" argument must not be empty.'); e.code = "ERR_INVALID_ARG_VALUE"; throw e; }
+          const { opts, encoding, algorithm, sessionId } = csrfCommonOptions(options);
+          const key = csrfSecret(opts.secret, false);
+          const maxAge = csrfMs(opts.maxAge, CSRF_DAY_MS, "maxAge");
+          const decoded = csrfDecode(token, encoding);
+          if (decoded === null || decoded.length < 64) return false;
+          const timestamp = Number(decoded.readBigUInt64BE(0));
+          const expiresIn = Number(decoded.readBigUInt64BE(24));
+          const now = Date.now();
+          if (expiresIn > 0 && now > timestamp + expiresIn) return false;
+          if (maxAge > 0 && now > timestamp + maxAge) return false;
+          const expected = csrfHmac(key, algorithm, Buffer.concat([decoded.subarray(0, 32), Buffer.from(sessionId, "utf8")]));
+          const got = decoded.subarray(32);
+          if (got.length !== expected.length) return false;
+          return csrfCrypto().timingSafeEqual(got, expected);
+        },
+      };
+    }
     // Bun.peek (blueprint src/js/builtins/Peek.ts): settled → value, else the
     // promise/value itself. Backed by native promise-slot readers.
     {
@@ -832,18 +1035,81 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
         }
         return quote !== 0 || depth > 0 || text.endsWith(":") || text.endsWith(",") || ["t", "tr", "tru", "f", "fa", "fal", "fals", "n", "nu", "nul"].includes(text);
       };
+      // JSON's whitespace set, NOT String.prototype.trim's: trim() also strips
+      // U+FEFF, which would silently swallow a BOM appearing between two values
+      // (only a BOM at byte 0 is skipped) and turn an invalid line into a valid
+      // one.
+      const isJsonWS = (c) => c === 32 || c === 9 || c === 10 || c === 13;
+      const jsonTrimStart = (t) => { let a = 0; while (a < t.length && isJsonWS(t.charCodeAt(a))) a++; return t.slice(a); };
+      const jsonTrim = (t) => { let a = 0, b = t.length; while (a < b && isJsonWS(t.charCodeAt(a))) a++; while (b > a && isJsonWS(t.charCodeAt(b - 1))) b--; return t.slice(a, b); };
+      // End offset of the first complete {...}/[...] on the line, or -1. bun's
+      // line parser stops after the first value, so `{"a":1}{"b":2}` yields the
+      // first value and reports the remainder as the error.
+      const firstValueEnd = (t) => {
+        const c0 = t.charCodeAt(0);
+        if (c0 !== 123 && c0 !== 91) return -1;
+        let depth = 0, quote = false, escaped = false;
+        for (let k = 0; k < t.length; k++) {
+          const c = t.charCodeAt(k);
+          if (quote) { if (escaped) escaped = false; else if (c === 92) escaped = true; else if (c === 34) quote = false; continue; }
+          if (c === 34) { quote = true; continue; }
+          if (c === 123 || c === 91) depth++;
+          else if (c === 125 || c === 93) { depth--; if (depth === 0) return k + 1; }
+        }
+        return -1;
+      };
+      // JSON.parse materialises `"__proto__"` as an OWN property; bun builds each
+      // object by assignment, where `__proto__` sets THAT object's prototype (and
+      // pollutes nothing else). Reproduce the assignment shape.
+      const applyProtoAssignment = (root) => {
+        const stack = [root];
+        while (stack.length) {
+          const node = stack.pop();
+          if (node === null || typeof node !== "object") continue;
+          const isArray = Array.isArray(node);
+          // Collect children through OWN keys before touching the prototype, so
+          // the walk never enumerates the newly installed prototype's members.
+          const keys = isArray ? null : Object.keys(node);
+          if (isArray) { for (let k = 0; k < node.length; k++) { const v = node[k]; if (v !== null && typeof v === "object") stack.push(v); } }
+          else { for (const k of keys) { const v = node[k]; if (v !== null && typeof v === "object") stack.push(v); } }
+          if (!isArray && Object.prototype.hasOwnProperty.call(node, "__proto__")) {
+            const proto = node["__proto__"];
+            delete node["__proto__"];
+            if (proto === null || typeof proto === "object") { try { Object.setPrototypeOf(node, proto); } catch (e) {} }
+          }
+        }
+        return root;
+      };
+      // The intrinsic %TypedArray%.prototype byteLength/byteOffset getters: a
+      // subclass may override either accessor, and trusting the override would
+      // build an out-of-range view (or read past the backing buffer).
+      // (A DataView is an ArrayBufferView too, but it answers DataView.prototype's
+      // getters, not %TypedArray%.prototype's.)
+      const taProto = Object.getPrototypeOf(Uint8Array.prototype);
+      const taByteLength = Object.getOwnPropertyDescriptor(taProto, "byteLength").get;
+      const taByteOffset = Object.getOwnPropertyDescriptor(taProto, "byteOffset").get;
+      const dvByteLength = Object.getOwnPropertyDescriptor(DataView.prototype, "byteLength").get;
+      const dvByteOffset = Object.getOwnPropertyDescriptor(DataView.prototype, "byteOffset").get;
+      const viewByteLengthOf = (v) => { try { return taByteLength.call(v); } catch (e) { return dvByteLength.call(v); } };
+      const viewByteOffsetOf = (v) => { try { return taByteOffset.call(v); } catch (e) { return dvByteOffset.call(v); } };
       JSONL.parseChunk = (input, start, end) => {
         const bytes = input && ArrayBuffer.isView(input);
-        if (typeof input !== "string" && !bytes) throw inputError(input);
-        if (bytes) G.__mbunCheckAllocLimit(input.byteLength, "text");
-        const length = bytes ? input.byteLength : input.length;
+        // A non-view object (an ArrayBuffer, say) is stringified rather than
+        // rejected; only null/undefined and primitives are a TypeError.
+        if (typeof input !== "string" && !bytes) {
+          if (input === null || input === undefined || typeof input !== "object") throw inputError(input);
+          input = String(input);
+        }
+        const viewByteLength = bytes ? viewByteLengthOf(input) : 0;
+        if (bytes) G.__mbunCheckAllocLimit(viewByteLength, "text");
+        const length = bytes ? viewByteLength : input.length;
         const offset = (value, fallback, negative) => {
           value = value === undefined ? fallback : Number(value);
           return Number.isNaN(value) || value < 0 ? negative : Math.min(length, Number.isFinite(value) ? Math.floor(value) : length);
         };
         let begin = offset(start, 0, 0), finish = offset(end, length, length);
         if (begin > finish) begin = finish;
-        const raw = bytes ? new Uint8Array(input.buffer, input.byteOffset + begin, finish - begin) : null;
+        const raw = bytes ? new Uint8Array(input.buffer, viewByteOffsetOf(input) + begin, finish - begin) : null;
         let text = bytes ? new G.TextDecoder().decode(raw) : input.slice(begin, finish);
         let bom = 0;
         if (bytes && begin === 0 && raw.length >= 3 && raw[0] === 0xef && raw[1] === 0xbb && raw[2] === 0xbf) bom = 3;
@@ -856,12 +1122,23 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
           const hasNewline = newline !== -1;
           const lineEnd = hasNewline ? newline : text.length;
           const line = text.slice(pos, lineEnd);
-          const valueText = line.trim();
+          const valueText = jsonTrim(line);
+          const lead = line.length - jsonTrimStart(line).length;
           if (valueText) {
             try {
-              values.push(JSON.parse(valueText));
-              read = toOffset(pos + line.length - line.trimStart().length + valueText.length);
+              const parsed = JSON.parse(valueText);
+              values.push(valueText.indexOf("__proto__") === -1 ? parsed : applyProtoAssignment(parsed));
+              read = toOffset(pos + lead + valueText.length);
             } catch (e) {
+              // A line holding several concatenated values keeps the first one.
+              const cut = firstValueEnd(valueText);
+              if (cut > 0 && cut < valueText.length) {
+                try {
+                  const head = JSON.parse(valueText.slice(0, cut));
+                  values.push(valueText.indexOf("__proto__") === -1 ? head : applyProtoAssignment(head));
+                  read = toOffset(pos + lead + cut);
+                } catch (_) {}
+              }
               if (hasNewline || !incompleteJSON(valueText)) error = e;
               else done = false;
               break;
@@ -1083,7 +1360,29 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
       // (0x2A) integers, and numbers like `2.`/`.5`. The empty document is invalid
       // (JSON5 requires exactly one value) — bun surfaces that as a parse error.
       const parseJSON5 = (input) => {
-        const s = String(input);
+        if (input === null || input === undefined) {
+          const e = new TypeError('The "input" argument must be of type string, ArrayBuffer, or TypedArray. Received ' +
+            (input === null ? "null" : "undefined"));
+          e.code = "ERR_INVALID_ARG_TYPE";
+          throw e;
+        }
+        // bun takes a string, an ArrayBuffer or any ArrayBufferView and decodes
+        // the bytes as UTF-8. The byte length is bounded by the 2^31-1 string
+        // allocation limit; anything wider is a RangeError, not a panic.
+        let s;
+        if (typeof input === "string") s = input;
+        else if (input instanceof ArrayBuffer || ArrayBuffer.isView(input)
+                 || (typeof SharedArrayBuffer === "function" && input instanceof SharedArrayBuffer)) {
+          const bytes = ArrayBuffer.isView(input)
+            ? new Uint8Array(input.buffer, input.byteOffset, input.byteLength)
+            : new Uint8Array(input);
+          if (bytes.byteLength > 2147483647) {
+            const e = new RangeError('The value of "input.byteLength" is out of range. It must be <= 2147483647. Received ' + bytes.byteLength);
+            e.code = "ERR_OUT_OF_RANGE";
+            throw e;
+          }
+          s = new TextDecoder().decode(bytes);
+        } else s = String(input);
         const n = s.length;
         let i = 0;
         const err = (m) => { throw new SyntaxError("JSON5 Parse error: " + m); };
@@ -1096,7 +1395,7 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
             if (isWS(cc)) { i++; continue; }
             if (cc === 47 /* / */) {
               const d = i + 1 < n ? s.charCodeAt(i + 1) : 0;
-              if (d === 47) { i += 2; while (i < n && s.charCodeAt(i) !== 10) i++; continue; }
+              if (d === 47) { i += 2; while (i < n) { const t = s.charCodeAt(i); if (t === 10 || t === 13 || t === 0x2028 || t === 0x2029) break; i++; } continue; }
               if (d === 42) { const e = s.indexOf("*/", i + 2); if (e === -1) err("Unterminated multi-line comment"); i = e + 2; continue; }
               err("Unexpected character");
             }
@@ -1117,11 +1416,18 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
             const h0 = i;
             while (i < n && isHex(s.charCodeAt(i))) i++;
             if (i === h0) err("Invalid hex number");
+            // bun's loader accumulates a hex integer in a u64, so a literal with
+            // more than 16 significant hex digits overflows and does not parse.
+            if (s.slice(h0, i).replace(/^0+/, "").length > 16) err("Invalid hex number");
             return parseInt(s.slice(h0, i), 16);
           }
           const i0 = i;
           while (i < n && (cc = s.charCodeAt(i)) >= 48 && cc <= 57) i++;
           const intDigits = i - i0;
+          // JSON5 inherits ECMAScript's DecimalIntegerLiteral: a leading 0
+          // followed by another digit is invalid, covering both the legacy octal
+          // (`010`) and "noctal" (`080`) forms.
+          if (intDigits > 1 && s.charCodeAt(i0) === 48) err("Leading zeros are not allowed in JSON5");
           let fracDigits = 0;
           if (i < n && s.charCodeAt(i) === 46) {
             i++;
@@ -1178,7 +1484,9 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
                 out += String.fromCharCode(parseInt(s.slice(i + 1, i + 3), 16));
                 i += 3;
               } else if (e >= 48 && e <= 57) err("Octal escape sequences are not allowed in JSON5");
-              else err("Invalid escape character " + s[i]);
+              // JSON5 IdentityEscape (json5.org #strings): any other character
+              // that is not a decimal digit stands for itself.
+              else { out += s[i]; i++; }
               chunk = i;
               continue;
             }
@@ -1186,13 +1494,49 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
             i++;
           }
         };
+        // \uXXXX at i (i points at the backslash); returns the code unit.
+        const readKeyUnicodeEscape = () => {
+          if (i + 6 > n) err("Invalid unicode escape: expected 4 hex digits");
+          let v = 0;
+          for (let k = i + 2; k < i + 6; k++) { const h = s.charCodeAt(k); if (!isHex(h)) err("Invalid unicode escape: expected 4 hex digits"); v = v * 16 + parseInt(s[k], 16); }
+          i += 6;
+          return v;
+        };
+        // An IdentifierName key may spell any of its characters as \uXXXX
+        // (json5-tests "unicode escaped unquoted key"), so the key is
+        // accumulated rather than sliced out of the source.
         const parseKey = () => {
           const cc = s.charCodeAt(i);
           if (cc === 34 || cc === 39) return parseString();
-          if (isIdStart(cc)) { const start = i; i++; while (i < n && isIdPart(s.charCodeAt(i))) i++; return s.slice(start, i); }
-          if (cc === 92 && s.charCodeAt(i + 1) !== 117) err("Invalid unicode escape: expected 4 hex digits");
-          if (cc === 64) err("Unexpected character");
-          err("Invalid identifier start character");
+          let key = "";
+          if (cc === 92) {
+            if (s.charCodeAt(i + 1) !== 117) err("Invalid unicode escape: expected 4 hex digits");
+            const v = readKeyUnicodeEscape();
+            if (!isIdStart(v)) err("Invalid identifier start character");
+            key = String.fromCharCode(v);
+          } else if (isIdStart(cc)) { key = s[i]; i++; }
+          else if (cc === 64) err("Unexpected character");
+          else err("Invalid identifier start character");
+          while (i < n) {
+            const c2 = s.charCodeAt(i);
+            if (c2 === 92) {
+              if (s.charCodeAt(i + 1) !== 117) err("Invalid unicode escape: expected 4 hex digits");
+              const v = readKeyUnicodeEscape();
+              if (!isIdPart(v)) err("Invalid identifier start character");
+              key += String.fromCharCode(v);
+              continue;
+            }
+            if (!isIdPart(c2)) break;
+            key += s[i]; i++;
+          }
+          // `{ multi-word: 1 }`: a byte that can neither continue the
+          // IdentifierName nor separate it from the ':' is a hard error, not a
+          // missing colon (json5-tests "illegal unquoted key symbol").
+          if (i < n) {
+            const t = s.charCodeAt(i);
+            if (t !== 58 && t !== 47 && t !== 125 && !isWS(t)) err("Unexpected character");
+          }
+          return key;
         };
         const parseObject = () => {
           i++; // {
@@ -1252,6 +1596,7 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
           if (cc === 45 /* - */) {
             i++;
             if (s.startsWith("Infinity", i)) { i += 8; return -Infinity; }
+            if (s.startsWith("NaN", i)) { i += 3; return NaN; }
             const d = i < n ? s.charCodeAt(i) : 0;
             if (i >= n) err("Unexpected end of input");
             if (!((d >= 48 && d <= 57) || d === 46)) err("Unexpected character");
@@ -1260,6 +1605,7 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
           if (cc === 43 /* + */) {
             i++;
             if (s.startsWith("Infinity", i)) { i += 8; return Infinity; }
+            if (s.startsWith("NaN", i)) { i += 3; return NaN; }
             const d = i < n ? s.charCodeAt(i) : 0;
             if (i >= n) err("Unexpected end of input");
             if (!((d >= 48 && d <= 57) || d === 46)) err("Unexpected character");
@@ -2759,6 +3105,13 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
     M["bun:internal-for-testing"].createSocketPair = () => {
       if (typeof G.__mbunCreateSocketPair !== "function") throw new Error("createSocketPair is not supported on this platform");
       return G.__mbunCreateSocketPair();
+    };
+    // memfd_create(size) → fd: an anonymous memory-backed REGULAR file, so
+    // fs.readFileSync sees a real st_size (which /dev/zero cannot provide) and
+    // the synthetic allocation limit can be driven deterministically. Linux only.
+    M["bun:internal-for-testing"].memfd_create = (size) => {
+      if (typeof G.__mbunMemfdCreate !== "function") throw new Error("memfd_create is not supported on this platform");
+      return G.__mbunMemfdCreate(size);
     };
     // fileSinkInternals.liveCount(): live FileSink count (JS-tracked on a global
     // by the Bun.file(...).writer() factory).

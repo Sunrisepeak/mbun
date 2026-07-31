@@ -21,9 +21,9 @@
 // undefined }`). A module with top-level await is compiled to an async wrapper
 // and its returned promise remains observable to evaluate().
 //
-// The classes are only reachable under --experimental-vm-modules, matched
-// through a lazy accessor because the builtins image is evaluated before
-// process.execArgv exists.
+// The classes are NOT gated on --experimental-vm-modules: bun exports them
+// unconditionally, and the corpus reaches them directly under `bun test`, where
+// no execArgv flag can be supplied. See the note at the export site.
 //
 // DEFERRED: evaluate({ timeout }) interruption, cachedData/bytecode, node 26's
 // linkRequests()/instantiate() split, and dynamic import() inside a plain
@@ -46,13 +46,6 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
   const vm = M["vm"];
   if (!vm || !vm.__internal) return;
   const internal = vm.__internal;
-
-  // node only defines vm.Module & friends under --experimental-vm-modules.
-  const flagged = () => {
-    const argv = (G.process && G.process.execArgv) || [];
-    for (const a of argv) if (a === "--experimental-vm-modules") return true;
-    return false;
-  };
 
   const ERR = (code, Ctor, msg) => { const e = new Ctor(msg); e.code = code; return e; };
   const invalidArgTypeHelper = (input) => {
@@ -78,10 +71,14 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
   const kNamespace = Symbol("kNamespace");
   const kExports = Symbol("kExports");
   const kStarExports = Symbol("kStarExports");
+  const kNamedImports = Symbol("kNamedImports");
   const kDeps = Symbol("kDeps");
   const kResolved = Symbol("kResolved");
   const kValues = Symbol("kValues");
   const kRequests = Symbol("kRequests");
+  // The source text a SourceTextModule was built from, kept so createCachedData
+  // can fingerprint it (see :node_vm's cachedData scheme).
+  const kSource = Symbol("kSource");
 
   const kMainContextKey = { __proto__: null };
   const identifierCounters = new WeakMap();
@@ -100,13 +97,51 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
   // through a `with` scope backed by a Proxy: every read re-reads the exporting
   // module, which is what circular graphs and a SyntheticModule.setExport after
   // evaluation depend on.
-  const IMPORT_RE = /(^|[\n;])[ \t]*import[ \t\n]+(?:([^'"]*?)[ \t\n]+from[ \t\n]*)?(['"])((?:\\.|(?!\3)[^\\])*)\3([ \t\n]*(?:with|assert)[ \t\n]*\{[^}]*\})?[ \t]*;?/g;
-  const EXPORT_FROM_RE = /(^|[\n;])[ \t]*export[ \t\n]+(\*[ \t\n]*(?:as[ \t\n]+([\w$]+)[ \t\n]*)?|\{([^}]*)\})[ \t\n]*from[ \t\n]*(['"])((?:\\.|(?!\5)[^\\])*)\5([ \t\n]*(?:with|assert)[ \t\n]*\{[^}]*\})?[ \t]*;?/g;
-  const EXPORT_NAMED_RE = /(^|[\n;])[ \t]*export[ \t\n]*\{([^}]*)\}[ \t]*;?/g;
+  const IMPORT_RE = /(^|[\n;])[ \t]*import[ \t\n]+(?:([^'"]*?)[ \t\n]+from[ \t\n]*)?(['"])((?:\\.|(?!\3)[^\\])*)\3([ \t\n]*(?:with|assert)[ \t\n]*\{[^}]*\})?[ \t]*/g;
+  const EXPORT_FROM_RE = /(^|[\n;])[ \t]*export[ \t\n]+(\*[ \t\n]*(?:as[ \t\n]+([\w$]+)[ \t\n]*)?|\{([^}]*)\})[ \t\n]*from[ \t\n]*(['"])((?:\\.|(?!\5)[^\\])*)\5([ \t\n]*(?:with|assert)[ \t\n]*\{[^}]*\})?[ \t]*/g;
+  const EXPORT_NAMED_RE = /(^|[\n;])[ \t]*export[ \t\n]*\{([^}]*)\}[ \t]*/g;
   const EXPORT_DEFAULT_RE = /(^|[\n;])([ \t]*)export[ \t\n]+default[ \t\n]+/g;
   const EXPORT_DECL_RE = /(^|[\n;])([ \t]*)export[ \t\n]+(?=(?:const|let|var|function|class|async)\b)/g;
   const EXPORT_DECL_NAME_RE =
-    /(^|[\n;])[ \t]*export[ \t\n]+(?:async[ \t\n]+)?(?:const|let|var|function|class)[ \t\n]*\*?[ \t\n]*([\w$]+)/g;
+    /(^|[\n;])[ \t]*export[ \t\n]+(?:async[ \t\n]+)?(const|let|var|function|class)[ \t\n]*\*?[ \t\n]*([\w$]+)/g;
+
+  // `export const a = 1, b = 2;` declares two exports. The regex above only sees
+  // the first declarator, so walk the rest of the declaration list by hand:
+  // top-level commas separate declarators, and the statement ends at a `;` or at
+  // a newline that is not a continuation of a trailing comma.
+  function trailingDeclaratorNames(source, from) {
+    const names = [];
+    let depth = 0;
+    let last = "";
+    let i = from;
+    while (i < source.length) {
+      const c = source.charAt(i);
+      if (c === "'" || c === '"' || c === "`") {
+        ++i;
+        while (i < source.length) {
+          if (source.charAt(i) === "\\") { i += 2; continue; }
+          if (source.charAt(i) === c) { ++i; break; }
+          ++i;
+        }
+        last = "s";
+        continue;
+      }
+      if (c === "(" || c === "[" || c === "{") { ++depth; last = c; ++i; continue; }
+      if (c === ")" || c === "]" || c === "}") { --depth; last = c; ++i; continue; }
+      if (depth === 0 && c === ";") break;
+      if (c === "\n") { if (last !== ",") break; ++i; continue; }
+      if (c === " " || c === "\t" || c === "\r") { ++i; continue; }
+      if (depth === 0 && c === ",") {
+        ++i;
+        const m = /^[ \t\n]*([\w$]+)/.exec(source.slice(i));
+        if (m) { names.push(m[1]); i += m[0].length; last = "n"; } else { last = ","; }
+        continue;
+      }
+      last = c;
+      ++i;
+    }
+    return names;
+  }
 
   function parseAttributes(text) {
     const attributes = { __proto__: null };
@@ -141,7 +176,14 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
     const declNames = [];
     let dm;
     EXPORT_DECL_NAME_RE.lastIndex = 0;
-    while ((dm = EXPORT_DECL_NAME_RE.exec(source)) !== null) declNames.push(dm[2]);
+    while ((dm = EXPORT_DECL_NAME_RE.exec(source)) !== null) {
+      declNames.push(dm[3]);
+      if (dm[2] === "const" || dm[2] === "let" || dm[2] === "var") {
+        for (const extra of trailingDeclaratorNames(source, EXPORT_DECL_NAME_RE.lastIndex)) {
+          declNames.push(extra);
+        }
+      }
+    }
 
     body = body.replace(EXPORT_FROM_RE, (all, lead, what, starAs, clause, q, spec, attrText) => {
       const attributes = parseAttributes(attrText);
@@ -238,8 +280,10 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
     }
     get namespace() {
       const w = brand(this);
-      if (w.status === "unlinked") {
-        throw ERR("ERR_VM_MODULE_STATUS", Error, "Module status must not be unlinked");
+      // node rejects both pre-link states here, and its message names both.
+      if (w.status === "unlinked" || w.status === "linking") {
+        throw ERR("ERR_VM_MODULE_STATUS", Error,
+                  "Module status must not be unlinked or linking");
       }
       return this[kNamespace];
     }
@@ -293,17 +337,23 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
         w = brand(this);
         if (typeof linker !== "function") throw invArgType("linker", "of type function", linker);
         if (w.status !== "unlinked") {
-          throw ERR("ERR_VM_MODULE_STATUS", Error, "Module status must be unlinked");
+          // node distinguishes the two: a link already in flight is a status
+          // error, while a module that has finished linking is ALREADY_LINKED.
+          if (w.status === "linking") {
+            throw ERR("ERR_VM_MODULE_STATUS", Error, "Module status must be unlinked");
+          }
+          throw ERR("ERR_VM_MODULE_ALREADY_LINKED", Error, "Module has already been linked");
         }
       } catch (e) {
         return Promise.reject(e);
       }
       w.status = "linking";
       if (this[kDeps].length === 0) {
-        // Nothing to resolve: settle synchronously rather than through an
-        // extra async hop, so `await mod.link(...)` observes 'linked'.
-        w.status = "linked";
-        return Promise.resolve(undefined);
+        // Nothing to resolve, but do NOT settle synchronously: node's contract is
+        // that an un-awaited `link()` leaves status 'linking'. Flipping to
+        // 'linked' inside the microtask still lets `await mod.link(...)` observe
+        // 'linked', because the awaiting continuation resumes after this callback.
+        return Promise.resolve().then(() => { w.status = "linked"; return undefined; });
       }
       return linkModule(this, linker, new Set()).then(
         () => { w.status = "linked"; return undefined; },
@@ -322,7 +372,30 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
         if (options !== undefined && (typeof options !== "object" || options === null)) {
           throw invArgType("options", "of type object", options);
         }
+        // node validates both evaluate() options as TypeErrors before touching
+        // module state. `timeout` interruption itself is still DEFERRED, but the
+        // argument contract is observable and cheap to honour.
+        if (options !== undefined) {
+          if (options.breakOnSigint !== undefined && typeof options.breakOnSigint !== "boolean") {
+            throw invArgType("options.breakOnSigint", "of type boolean",
+                             options.breakOnSigint, "property");
+          }
+          if (options.timeout !== undefined &&
+              (typeof options.timeout !== "number" || !(options.timeout > 0) ||
+               !Number.isInteger(options.timeout))) {
+            throw ERR("ERR_OUT_OF_RANGE", RangeError,
+                      'The value of "options.timeout" is out of range. ' +
+                      "It must be a positive integer. Received " + String(options.timeout));
+          }
+        }
         if (w.status === "unlinked" || w.status === "linking") {
+          throw ERR("ERR_VM_MODULE_STATUS", Error,
+                    "Module status must be one of linked, evaluated, or errored");
+        }
+        // Re-entrant evaluate(): the module is running its own body right now,
+        // so no evaluation promise exists yet to hand back. (An already-started
+        // top-level-await module has one and returns it below.)
+        if (w.status === "evaluating" && w.evaluatePromise === undefined) {
           throw ERR("ERR_VM_MODULE_STATUS", Error,
                     "Module status must be one of linked, evaluated, or errored");
         }
@@ -338,9 +411,15 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
     }
   }
 
+  // node resolves every request of one module before descending into any of
+  // them: the linker is called for the whole request list of the referrer first,
+  // and only then recursively for each resolved dependency. A depth-first walk
+  // interleaves the two and reports the requests in the wrong order (and can ask
+  // for the same shared dependency twice).
   async function linkModule(mod, linker, seen) {
     if (seen.has(mod)) return;
     seen.add(mod);
+    const resolvedDeps = [];
     for (const dep of mod[kDeps]) {
       const extra = { attributes: dep.attributes, assert: dep.attributes };
       const result = await linker(dep.specifier, mod, extra);
@@ -348,12 +427,47 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
         throw ERR("ERR_VM_MODULE_NOT_MODULE", TypeError,
                   "Provided module is not an instance of Module");
       }
+      // A linker may only return modules from the SAME context as the importer;
+      // node rejects a cross-context resolution rather than linking realms
+      // together. `undefined` is the main context, so compare identity directly.
+      if (result[kWrap].contextObject !== mod[kWrap].contextObject) {
+        throw ERR("ERR_VM_MODULE_DIFFERENT_CONTEXT", Error,
+                  "Linked modules must use the same context");
+      }
+      // Linking onto an already-errored module fails the whole link, carrying the
+      // dependency's own error as `cause` (node sets it so the caller can tell
+      // WHICH dependency broke, not just that linking failed).
+      if (result[kWrap].status === "errored") {
+        const le = ERR("ERR_VM_MODULE_LINK_FAILURE", Error,
+                       "Provided module could not be linked");
+        le.cause = result[kWrap].error;
+        throw le;
+      }
       mod[kResolved].set(dep, result);
+      resolvedDeps.push(result);
+    }
+    for (const result of resolvedDeps) {
       const rw = result[kWrap];
       if (rw.status === "unlinked") {
         rw.status = "linking";
         await linkModule(result, linker, seen);
         rw.status = "linked";
+      }
+    }
+    // Only now are the children linked, so their star re-exports are resolvable
+    // and exportNamesOf() is complete. Importing a name a dependency does not
+    // export is a SYNTAX error in the spec (resolution happens at link time, not
+    // at run time), and node surfaces the engine's SyntaxError with no code.
+    for (const need of mod[kNamedImports] || []) {
+      const target = mod[kResolved].get(need.dep);
+      if (target === undefined) continue;
+      const available = exportNamesOf(target, new Set());
+      for (const name of need.names) {
+        if (!available.includes(name)) {
+          throw new SyntaxError(
+            "The requested module '" + need.dep.specifier +
+            "' does not provide an export named '" + name + "'");
+        }
       }
     }
   }
@@ -370,8 +484,11 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
                   w.identifier + "' that is not linked");
       }
       if (!resolved[kWrap].requestsLinked && resolved[kDeps].length !== 0) {
+        // node names the request that cannot be resolved ON the unlinked module,
+        // not the request that led us to it.
+        const missing = resolved[kDeps][0];
         throw ERR("ERR_VM_MODULE_LINK_FAILURE", Error,
-                  "request for '" + dep.specifier + "' can not be resolved on module '" +
+                  "request for '" + missing.specifier + "' can not be resolved on module '" +
                   resolved[kWrap].identifier + "' that is not linked");
       }
       instantiateModule(resolved, seen);
@@ -417,7 +534,16 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
       const pending = dependencies.some((p) => p && p.__mbunVmAsync === true);
       if (!pending) {
         const result = run();
-        if (result && typeof result.then === "function") {
+        // https://tc39.es/ecma262/#sec-smr-Evaluate: a synthetic module's
+        // evaluation steps settle its promise *immediately* — either resolved
+        // with undefined or rejected with a synchronous throw. Anything the
+        // callback returns, including a promise that later rejects, is not
+        // observable through evaluate(); a rejection surfaces as an unhandled
+        // rejection instead.
+        if (w.synthetic === true) {
+          finish();
+          w.evaluatePromise = Promise.resolve(undefined);
+        } else if (result && typeof result.then === "function") {
           w.evaluatePromise = result.then(finish, fail);
           w.evaluatePromise.__mbunVmAsync = true;
         } else {
@@ -467,7 +593,16 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
   }
 
   function makeNamespace(mod) {
-    return new Proxy({ __proto__: null }, {
+    // A real module namespace carries `Symbol.toStringTag: 'Module'` as a
+    // non-configurable OWN property, and `Reflect.ownKeys` reports it after the
+    // exported names. Define it on the proxy target so the ownKeys /
+    // getOwnPropertyDescriptor traps can report it without breaking the
+    // non-configurability invariant.
+    const target = { __proto__: null };
+    Object.defineProperty(target, Symbol.toStringTag, {
+      value: "Module", writable: false, enumerable: false, configurable: false,
+    });
+    return new Proxy(target, {
       get(t, key) {
         if (key === Symbol.toStringTag) return "Module";
         const getter = lookupExport(mod, key, new Set());
@@ -477,8 +612,15 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
         if (key === Symbol.toStringTag) return true;
         return lookupExport(mod, key, new Set()) !== undefined;
       },
-      ownKeys() { return exportNamesOf(mod, new Set()); },
+      ownKeys() {
+        const keys = exportNamesOf(mod, new Set());
+        keys.push(Symbol.toStringTag);
+        return keys;
+      },
       getOwnPropertyDescriptor(t, key) {
+        if (key === Symbol.toStringTag) {
+          return { value: "Module", writable: false, enumerable: false, configurable: false };
+        }
         const getter = lookupExport(mod, key, new Set());
         if (getter === undefined) return undefined;
         return { value: getter(), writable: true, enumerable: true, configurable: true };
@@ -521,6 +663,7 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
     const contextKey = contextObject === undefined ? kMainContextKey : contextObject;
     mod[kExports] = new Map();
     mod[kStarExports] = [];
+    mod[kNamedImports] = [];
     mod[kDeps] = [];
     mod[kResolved] = new Map();
     mod[kRequests] = [];
@@ -533,6 +676,7 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
       evaluatePromise: undefined,
       dependencyList: undefined,
       requestsLinked: false,
+      synthetic: false,
       hasTopLevelAwait: false,
       run: () => undefined,
     };
@@ -564,7 +708,36 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
       if (contextObject !== undefined && !vm.isContext(contextObject)) {
         throw invArgType("options.context", "a vm.Context", contextObject, "property");
       }
+      // node validates identifier before use; initBase would otherwise coerce a
+      // number through `${identifier}` and silently accept it.
+      if (options.identifier !== undefined && typeof options.identifier !== "string") {
+        throw invArgType("options.identifier", "of type string", options.identifier, "property");
+      }
+      // Real bytecode cachedData is DEFERRED (JSC exposes no equivalent), but the
+      // argument contract is observable, so reject a non-BufferSource up front.
+      if (options.cachedData !== undefined) {
+        const cd = options.cachedData;
+        const ok = cd instanceof ArrayBuffer ||
+                   (typeof SharedArrayBuffer === "function" && cd instanceof SharedArrayBuffer) ||
+                   (cd !== null && typeof cd === "object" && ArrayBuffer.isView(cd));
+        if (!ok) {
+          throw invArgType("options.cachedData",
+                           "an instance of Buffer, TypedArray, or DataView", cd, "property");
+        }
+      }
+      if (options.cachedData !== undefined) {
+        // Unlike vm.Script -- which only reports cachedDataRejected -- a
+        // SourceTextModule handed a cache that does not belong to its source
+        // THROWS. The buffer carries a fingerprint of the source it was produced
+        // from (see :node_vm), so the mismatch is detectable with no bytecode.
+        const cd = options.cachedData;
+        const view = ArrayBuffer.isView(cd) ? cd : new Uint8Array(cd);
+        if (internal.cachedDataRejects(view, sourceText)) {
+          throw ERR("ERR_VM_MODULE_CACHED_DATA_REJECTED", Error, "cachedData buffer was rejected");
+        }
+      }
       initBase(this, contextObject, options.identifier);
+      Object.defineProperty(this, kSource, { value: sourceText, enumerable: false });
 
       const analysis = analyze(sourceText);
       const hasTopLevelAwait = hasSourceTopLevelAwait(sourceText);
@@ -596,6 +769,11 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
 
       const bindings = new Map();
       for (const imp of analysis.imports) {
+        // Record the named bindings so linkModule can verify at link time that
+        // each dependency actually exports them.
+        if (imp.bindings && imp.bindings.length) {
+          this[kNamedImports].push({ dep: imp.dep, names: imp.bindings.map((b) => b[0]) });
+        }
         if (imp.star) {
           bindings.set(imp.star, () => self[kResolved].get(imp.dep)[kNamespace]);
         }
@@ -630,6 +808,9 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
       }
       let metaReady = initMeta === undefined;
       const importCb = options.importModuleDynamically;
+      if (importCb !== undefined && typeof importCb !== "function") {
+        throw invArgType("options.importModuleDynamically", "of type function", importCb, "property");
+      }
       const bridge = {
         scope,
         // node runs initializeImportMeta when the module record is
@@ -647,12 +828,17 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
                       "A dynamic import callback was not specified.");
           }
           const result = await importCb(specifier, self, attrs);
-          if (!isModule(result)) {
-            throw ERR("ERR_VM_MODULE_NOT_MODULE", TypeError,
-                      "Provided module is not an instance of Module");
+          if (isModule(result)) {
+            if (result[kWrap].status !== "evaluated") await result.evaluate();
+            return result[kNamespace];
           }
-          if (result[kWrap].status !== "evaluated") await result.evaluate();
-          return result[kNamespace];
+          // node also accepts an already-evaluated module namespace object.
+          if (result !== null && typeof result === "object" &&
+              result[Symbol.toStringTag] === "Module") {
+            return result;
+          }
+          throw ERR("ERR_VM_MODULE_NOT_MODULE", TypeError,
+                    "Provided module is not an instance of Module");
         },
       };
 
@@ -671,9 +857,14 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
     }
     get moduleRequests() { brand(this); return this[kRequests]; }
     createCachedData() {
-      brand(this);
-      const B = G.Buffer;
-      return B ? B.from("mbun-vm-module-cache ") : new Uint8Array([1]);
+      // V8 can only serialise a module that has not run yet; node surfaces the
+      // rest as ERR_VM_MODULE_CANNOT_CREATE_CACHED_DATA.
+      const st = brand(this).status;
+      if (st === "evaluating" || st === "evaluated" || st === "errored") {
+        throw ERR("ERR_VM_MODULE_CANNOT_CREATE_CACHED_DATA", Error,
+                  "Cached data cannot be created for a module which has been evaluated");
+      }
+      return internal.makeCachedDataBuffer(this[kSource]);
     }
     [inspectCustom](depth, opts, inspect) {
       return inspectModule(this, "SourceTextModule", depth, opts, inspect);
@@ -708,6 +899,23 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
       if (contextObject !== undefined && !vm.isContext(contextObject)) {
         throw invArgType("options.context", "a vm.Context", contextObject, "property");
       }
+      // node validates identifier before use; initBase would otherwise coerce a
+      // number through `${identifier}` and silently accept it.
+      if (options.identifier !== undefined && typeof options.identifier !== "string") {
+        throw invArgType("options.identifier", "of type string", options.identifier, "property");
+      }
+      // Real bytecode cachedData is DEFERRED (JSC exposes no equivalent), but the
+      // argument contract is observable, so reject a non-BufferSource up front.
+      if (options.cachedData !== undefined) {
+        const cd = options.cachedData;
+        const ok = cd instanceof ArrayBuffer ||
+                   (typeof SharedArrayBuffer === "function" && cd instanceof SharedArrayBuffer) ||
+                   (cd !== null && typeof cd === "object" && ArrayBuffer.isView(cd));
+        if (!ok) {
+          throw invArgType("options.cachedData",
+                           "an instance of Buffer, TypedArray, or DataView", cd, "property");
+        }
+      }
       initBase(this, contextObject, options.identifier);
       const values = new Map();
       for (const name of exportNames) {
@@ -716,6 +924,7 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
       }
       Object.defineProperty(this, kValues, { value: values, enumerable: false });
       this[kWrap].status = "linked";
+      this[kWrap].synthetic = true;
       const self = this;
       this[kWrap].run = () => evaluateCallback.call(undefined, self);
     }
@@ -743,20 +952,23 @@ inline constexpr std::string_view kNodeVmModulesJS = R"JS(
     }
   }
 
-  // Lazily gated: the builtins image is evaluated before process.execArgv
-  // exists, so the flag can only be consulted on first access.
+  // NOT gated on --experimental-vm-modules. node hides these behind the flag,
+  // but bun exports them unconditionally (src/js/node/vm.ts's default export
+  // lists Module / SourceTextModule / SyntheticModule with no flag check), and
+  // bun is the reference implementation here. The gate cost
+  // vm/vm-script-fetcher-leak.test.ts, which constructs SourceTextModule
+  // directly under `bun test`, where no execArgv flag can be supplied.
+  //
+  // node's own suite is unaffected: test/common re-spawns any file carrying a
+  // `// Flags:` comment as a child process WITH those flags, so the vm-module
+  // tests already arrive flagged, and none of them assert the classes are
+  // ABSENT without it (test-vm-dynamic-import-callback-missing-flag checks the
+  // ERR_VM_DYNAMIC_IMPORT_CALLBACK_MISSING_FLAG path, not class visibility).
   for (const [name, value] of [["Module", Module],
                                ["SourceTextModule", SourceTextModule],
                                ["SyntheticModule", SyntheticModule]]) {
     Object.defineProperty(vm, name, {
-      get() { return flagged() ? value : undefined; },
-      set(v) {
-        Object.defineProperty(vm, name, {
-          value: v, writable: true, enumerable: true, configurable: true,
-        });
-      },
-      enumerable: true,
-      configurable: true,
+      value, writable: true, enumerable: true, configurable: true,
     });
   }
 })();

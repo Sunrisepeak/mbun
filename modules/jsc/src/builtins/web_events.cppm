@@ -199,6 +199,7 @@ inline constexpr std::string_view kWebEventsJS = R"JS(
     {
       const reg = new Map(); // name -> Set<channel>
       const HANDLER = new WeakMap();
+      const ERRHANDLER = new WeakMap();
       class BroadcastChannel extends G.EventTarget {
         constructor(name) {
           if (arguments.length === 0) throw new TypeError("BroadcastChannel constructor requires a name argument");
@@ -214,6 +215,33 @@ inline constexpr std::string_view kWebEventsJS = R"JS(
           if (prev) this.removeEventListener("message", prev);
           if (typeof f === "function") { HANDLER.set(this, f); this.addEventListener("message", f); }
           else HANDLER.delete(this);
+        }
+        // WHATWG HTML §9.4 declares onmessageerror alongside onmessage; an
+        // unset event handler IDL attribute reads back as null, never undefined.
+        get onmessageerror() { return ERRHANDLER.get(this) || null; }
+        set onmessageerror(f) {
+          const prev = ERRHANDLER.get(this);
+          if (prev) this.removeEventListener("messageerror", prev);
+          if (typeof f === "function") { ERRHANDLER.set(this, f); this.addEventListener("messageerror", f); }
+          else ERRHANDLER.delete(this);
+        }
+        // node lib/internal/worker/io.js BroadcastChannel[inspect.custom] and
+        // bun both print the {name, active} projection through the caller's own
+        // inspect options (so breakLength/compact are honoured), not the private
+        // _name/_closed slots. ref node test-broadcastchannel-custom-inspect.
+        [Symbol.for("nodejs.util.inspect.custom")](depth, options) {
+          if (depth < 0) return this;
+          const opts = Object.assign({}, options, {
+            depth: options && options.depth == null ? null : (options.depth - 1),
+          });
+          let inspect = null;
+          try {
+            const M = G.__mbunNativeModules;
+            const util = M && (M["util"] || M["node:util"]);
+            if (util && typeof util.inspect === "function") inspect = util.inspect;
+          } catch (_) { inspect = null; }
+          const projection = { name: this._name, active: !this._closed };
+          return "BroadcastChannel " + (inspect ? inspect(projection, opts) : "{ name: '" + this._name + "', active: " + !this._closed + " }");
         }
         postMessage(msg) {
           if (this._closed) throw new (G.DOMException || Error)("BroadcastChannel is closed", "InvalidStateError");
@@ -243,6 +271,56 @@ inline constexpr std::string_view kWebEventsJS = R"JS(
           error: orDefault(o.error, null),
         };
       });
+
+    // ---------------------------------------------- bun's remaining globals
+    // bun's own test harness enumerates the globals it guarantees:
+    // test/napi/node-napi-tests/test/common/index.js:341 does an UNGUARDED
+    // `knownGlobals.push(addEventListener, alert, confirm, dispatchEvent,
+    // postMessage, prompt, removeEventListener, Bun, reportError, BuildError,
+    // BuildMessage, HTMLRewriter, ResolveError, ResolveMessage, ErrorEvent,
+    // Worker, onmessage, onerror)` behind `typeof Bun === "object"`. Every name
+    // there resolved on mbun EXCEPT these six, so the reference throws
+    // `ReferenceError: postMessage is not defined` and takes down every file
+    // that requires node's common harness.
+    //
+    // Installed NON-ENUMERABLE on purpose: node's own
+    // compat/node/test/common/index.js leakedGlobals() walks `for (const val in
+    // globalThis)` and reports anything not in its allowlist, so an enumerable
+    // global here would be a new failure across the node corpus.
+    //
+    // BuildError/BuildMessage/ResolveError/ResolveMessage are the class objects
+    // only. mbun's module loader keeps synthesising its instances by setting
+    // `.name` on a plain Error (runtime/module_loading.inc:427,601) -- that path
+    // is deliberately left alone, so nothing that works today changes shape.
+    const defGlobal = (name, value) => {
+      if (name in G) return;
+      Object.defineProperty(G, name, { value, writable: true, enumerable: false, configurable: true });
+    };
+    // Main-thread postMessage. In a worker this is the port back to the parent;
+    // on the main thread bun still exposes the binding, and there is no parent
+    // to deliver to, so a no-op is the honest shape.
+    defGlobal("postMessage", function postMessage() {});
+    // WHATWG reportError: report to the error handler rather than throw
+    // synchronously. Route through the same "uncaught" path as an unhandled
+    // throw so `onerror`/`error` listeners observe it.
+    defGlobal("reportError", function reportError(err) {
+      try {
+        if (typeof G.ErrorEvent === "function" && typeof G.dispatchEvent === "function") {
+          const ev = new G.ErrorEvent("error", {
+            message: (err && err.message) ? String(err.message) : String(err),
+            error: err,
+          });
+          if (G.dispatchEvent(ev) === false) return;
+        }
+      } catch (e) {}
+      G.queueMicrotask(() => { throw err; });
+    });
+    for (const n of ["BuildError", "BuildMessage", "ResolveError", "ResolveMessage"]) {
+      const C = class extends Error {};
+      Object.defineProperty(C, "name", { value: n, configurable: true });
+      Object.defineProperty(C.prototype, "name", { value: n, writable: true, enumerable: false, configurable: true });
+      defGlobal(n, C);
+    }
   } catch (e) {}
 })();
 )JS";

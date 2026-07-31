@@ -144,4 +144,74 @@ export void edit(json::Document& doc, List list, std::span<const NewDependency> 
     }
 }
 
+// What a `remove` edit did, so the caller can reproduce bun's summary lines
+// without re-walking the tree.
+export struct RemoveResult {
+    // At least one of the four dependency lists existed and was a non-empty
+    // object *before* the edit. bun keys its "nothing to remove" bail on this,
+    // not on whether the requested names matched.
+    bool hadAnyDependencies{false};
+    // Requested names actually deleted, in request order.
+    std::vector<std::string> removed{};
+    // No dependency remains in any of the four lists after the edit.
+    bool nowEmpty{true};
+};
+
+// Delete `names` from every dependency list of `doc`, dropping a list that
+// becomes empty.
+//
+// PORT-SOURCE: bun-ref/src/install/PackageManager/PackageJSONEditor.rs
+// `edit_remove` — it scans `DependencyGroup::FOUR` (dependencies,
+// devDependencies, optionalDependencies, peerDependencies), removes the
+// matching properties, and then drops any dependency list left with zero
+// properties so `bun remove` on the last dependency restores the original
+// `{ "name": …, "version": … }` shape rather than leaving `"dependencies": {}`
+// behind (asserted verbatim by test/cli/install/bun-remove.test.ts:141-150).
+export RemoveResult remove(json::Document& doc, std::span<const std::string> names) {
+    RemoveResult result{};
+    if (!doc.root || doc.root->kind != json::Kind::Object) {
+        return result;
+    }
+    json::Value& root{*doc.root};
+
+    constexpr std::array LISTS{List::Dependencies, List::DevDependencies,
+                               List::OptionalDependencies, List::PeerDependencies};
+
+    for (const List list : LISTS) {
+        json::Value* listObject{detail::find_member(root, list_name(list))};
+        if (listObject == nullptr || listObject->kind != json::Kind::Object) {
+            continue;
+        }
+        if (!listObject->members.empty()) {
+            result.hadAnyDependencies = true;
+        }
+        for (const std::string& name : names) {
+            const auto hit{std::ranges::find(listObject->members, name, &json::Member::key)};
+            if (hit == listObject->members.end()) {
+                continue;
+            }
+            listObject->members.erase(hit);
+            if (!std::ranges::contains(result.removed, name)) {
+                result.removed.push_back(name);
+            }
+        }
+    }
+
+    // Second pass: drop the now-empty lists and decide whether anything is left.
+    for (const List list : LISTS) {
+        const std::string_view listName{list_name(list)};
+        const auto member{std::ranges::find(root.members, listName, &json::Member::key)};
+        if (member == root.members.end() || !member->value ||
+            member->value->kind != json::Kind::Object) {
+            continue;
+        }
+        if (member->value->members.empty()) {
+            root.members.erase(member);
+        } else {
+            result.nowEmpty = false;
+        }
+    }
+    return result;
+}
+
 }  // namespace mbun::install::package_json_editor

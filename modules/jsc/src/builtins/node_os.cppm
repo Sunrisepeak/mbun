@@ -347,6 +347,39 @@ inline constexpr std::string_view kNodeOsJS = R"JS(
 
   const tty = { isatty: isatty, ReadStream: ReadStream, WriteStream: WriteStream };
   M["tty"] = M["node:tty"] = tty;
+
+  // node's process.stdout/.stderr ARE tty.WriteStreams when the descriptor is a
+  // terminal, so they carry columns/rows/getWindowSize. mbun's are native
+  // objects that only ever gained write/isTTY/fd, so `process.stdout.columns`
+  // read undefined under a pty -- which is what every "the child sees the
+  // terminal it was given" assertion checks (Bun.Terminal({cols,rows}),
+  // terminal.resize, SIGWINCH). Accessors, not the cached fields node refreshes
+  // on SIGWINCH: a live TIOCGWINSZ is what makes "re-query the window size after
+  // a resize" answer correctly without a signal handler in between.
+  for (const name of ["stdout", "stderr"]) {
+    const strm = G.process && G.process[name];
+    if (!strm || !strm.isTTY || strm.columns !== undefined) continue;
+    const size = () => (ON && typeof ON.ttySize === "function" ? ON.ttySize(strm.fd | 0) : null);
+    try {
+      Object.defineProperty(strm, "columns", { configurable: true, enumerable: true, get() { const s = size(); return s ? s[0] : undefined; } });
+      Object.defineProperty(strm, "rows", { configurable: true, enumerable: true, get() { const s = size(); return s ? s[1] : undefined; } });
+      if (typeof strm.getWindowSize !== "function") strm.getWindowSize = function () { const s = size(); return s ? [s[0], s[1]] : [undefined, undefined]; };
+      // node re-reads the size here and emits 'resize' on a change. The accessors
+      // above already re-read, so this only has to fire the event -- but it must
+      // EXIST: code that wants a fresh size after a resize calls it (and node's
+      // own SIGWINCH handler is what normally does).
+      if (typeof strm._refreshSize !== "function") {
+        let last = null;
+        strm._refreshSize = function () {
+          const s = size();
+          if (!s) return;
+          if (!last || last[0] !== s[0] || last[1] !== s[1]) { last = s; if (typeof strm.emit === "function") strm.emit("resize"); }
+        };
+      }
+      if (typeof strm.getColorDepth !== "function") strm.getColorDepth = WriteStream.prototype.getColorDepth;
+      if (typeof strm.hasColors !== "function") strm.hasColors = WriteStream.prototype.hasColors;
+    } catch (e) {}
+  }
 })();
 )JS";
 

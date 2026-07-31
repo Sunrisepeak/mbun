@@ -81,4 +81,29 @@ inline constexpr Platform HOST_PLATFORM{host_platform()};
 inline constexpr Architecture HOST_ARCHITECTURE{host_architecture()};
 inline constexpr Capability HOST_CAPABILITIES{capabilities_for(HOST_PLATFORM)};
 
+// node's process.platform / process.arch spellings. They live here because
+// they are a naming of the same fact the enums above already carry -- keeping
+// them next to it is what stops a second #ifdef ladder growing elsewhere.
+// Unknown maps to the Linux spelling: node has no "unknown" value, and every
+// target mbun can currently be built for is one of the four above.
+constexpr const char* platform_name(Platform platform) noexcept {
+    switch (platform) {
+    case Platform::Darwin: return "darwin";
+    case Platform::Windows: return "win32";
+    case Platform::FreeBSD: return "freebsd";
+    case Platform::Linux: return "linux";
+    case Platform::Unknown: return "linux";
+    }
+    std::unreachable();
+}
+
+constexpr const char* architecture_name(Architecture architecture) noexcept {
+    switch (architecture) {
+    case Architecture::Aarch64: return "arm64";
+    case Architecture::X86_64: return "x64";
+    case Architecture::Other: return "x64";
+    }
+    std::unreachable();
+}
+
 }  // namespace mbun::platform

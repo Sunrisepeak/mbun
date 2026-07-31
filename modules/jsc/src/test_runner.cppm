@@ -73,6 +73,14 @@ inline constexpr std::string_view HARNESS = R"JS(
   "use strict";
   const G = globalThis;
 
+  // mock.module() has to reach bindings that importers made BEFORE the mock was
+  // registered, so __mbun_link (engine_require_js.inc) must remember its
+  // subscriptions. That bookkeeping is off by default — outside `bun test`
+  // nothing can call mock.module() before a module's importers bind, so the
+  // side table would be pure allocation. Turning it on here scopes the cost to
+  // the test runner.
+  G.__mbun_link_track = true;
+
   // The per-test timeout must fire on REAL wall-clock, immune to userland timer
   // mocks (sinon/jest useFakeTimers replace G.setTimeout, so a test that ticks
   // the fake clock past the timeout would falsely time out — bun's per-test
@@ -108,6 +116,7 @@ inline constexpr std::string_view HARNESS = R"JS(
               timeoutReject: null, errors: [], asyncErr: undefined, todo: 0, pendingAsserts: [],
               sysTime: null, skippedLabel: 0, onlyTests: 0, onlyScopes: 0,
               assertExpected: null, assertHas: false,
+              onFinished: [], innerAfterAll: [], inTest: false, inConcurrent: false,
               snapshots: [], snapCounters: {}, curLabel: "" };
   G.__mbunState = S;
   // ── CI detection (`.only` is refused in CI) ────────────────────────────────
@@ -275,7 +284,20 @@ inline constexpr std::string_view HARNESS = R"JS(
         for (let i = 0; i < ua.length; i++) if (ua[i] !== ub[i]) return false;
         return true;
       }
-      if (strictKeys && Object.getPrototypeOf(a) !== Object.getPrototypeOf(b)) return false;
+      if (strictKeys) {
+        const pa = Object.getPrototypeOf(a), pb = Object.getPrototypeOf(b);
+        // bun/jest strict equality compares the values' TYPE, not the identity of
+        // their prototype object (jest expect-utils `typeEquality`, i.e.
+        // a.constructor === b.constructor): a class instance is never strictly
+        // equal to a plain object, but two objects that merely had distinct
+        // (structurally identical) prototypes installed still are. Prototype
+        // identity would make `JSON.parse('{"__proto__":{...}}')`-shaped values
+        // impossible to assert against an object literal.
+        if (pa !== pb) {
+          if (a.constructor !== b.constructor) return false;
+          if (!deepEqualImpl(pa, pb, strictKeys, seen)) return false;
+        }
+      }
       // Arrays compare by index + length ONLY. bun's Bun__deepEquals
       // (bindings.cpp) walks the array branch reading slots with
       // getIndexWithoutAccessors — a hole, an out-of-range index and an accessor
@@ -317,6 +339,21 @@ inline constexpr std::string_view HARNESS = R"JS(
   function deepEqual(a, b) { return deepEqualImpl(a, b, false, new Map()); }
   function deepEqualStrict(a, b) { return deepEqualImpl(a, b, true, new Map()); }
   function assertionError(msg) { const e = new Error(msg); e.name = "AssertionError"; return e; }
+
+  // Failure message for the call-argument spy matchers. bun/jest print a diff
+  // block ("- Expected" / "+ Received") so a one-field mismatch deep inside a
+  // nested argument is visible; mbun printed only the expected arguments, which
+  // told you nothing about what the mock actually received (issue 10380).
+  // `index` selects which recorded call to diff against (-1 => none recorded).
+  function callDiff(name, expectedArgs, mockFn, index) {
+    const calls = mockFn && mockFn.mock ? mockFn.mock.calls : null;
+    let out = name + "(" + fmt(expectedArgs) + ")\n\n- Expected\n+ Received\n\n- " + fmt(expectedArgs) + "\n";
+    if (!calls) return out + "+ <not a mock function>";
+    if (!(index >= 0) || index >= calls.length) {
+      return out + "+ <" + calls.length + " call" + (calls.length === 1 ? "" : "s") + " recorded>";
+    }
+    return out + "+ " + fmt(calls[index]);
+  }
 
   // `expect(received, label)` (bun expect.rs custom_label): the label REPLACES the
   // matcher hint line of the failure message ("lol!\n\nExpected: ...").
@@ -452,15 +489,42 @@ inline constexpr std::string_view HARNESS = R"JS(
         if (typeof expected !== "string") throw assertionError("toEqualIgnoringWhitespace() requires argument to be a string");
         const strip = (s) => s.replace(/\s/g, "");
         check(typeof received === "string" && strip(received) === strip(expected), () => "toEqualIgnoringWhitespace\n\nExpected: " + fmt(expected) + "\nReceived: " + fmt(received)); return m; },
+      // bun's key matchers (jest-extended surface, expect.classes.ts
+      // toContainKey/toContainKeys/toContainAllKeys/toContainAnyKeys). Ownership
+      // is tested with hasOwnProperty, not `in`: that is what makes a Proxy's
+      // getOwnPropertyDescriptor trap run, so a throwing trap propagates instead
+      // of being silently answered by the `has` trap (issue 11677).
+      toContainKey(key) {
+        if (received === null || received === undefined) throw assertionError("toContainKey() requires the expect(value) to be an object");
+        check(Object.prototype.hasOwnProperty.call(received, key), () => "toContainKey(" + fmt(key) + ")\n\nReceived: " + fmt(received)); return m; },
+      toContainKeys(keys) {
+        if (received === null || received === undefined) throw assertionError("toContainKeys() requires the expect(value) to be an object");
+        if (!Array.isArray(keys)) throw assertionError("toContainKeys() requires the argument to be an array");
+        let ok = true;
+        for (const key of keys) if (!Object.prototype.hasOwnProperty.call(received, key)) { ok = false; break; }
+        check(ok, () => "toContainKeys(" + fmt(keys) + ")\n\nReceived: " + fmt(received)); return m; },
+      toContainAnyKeys(keys) {
+        if (received === null || received === undefined) throw assertionError("toContainAnyKeys() requires the expect(value) to be an object");
+        if (!Array.isArray(keys)) throw assertionError("toContainAnyKeys() requires the argument to be an array");
+        let ok = false;
+        for (const key of keys) if (Object.prototype.hasOwnProperty.call(received, key)) { ok = true; break; }
+        check(ok, () => "toContainAnyKeys(" + fmt(keys) + ")\n\nReceived: " + fmt(received)); return m; },
+      toContainAllKeys(keys) {
+        if (received === null || received === undefined) throw assertionError("toContainAllKeys() requires the expect(value) to be an object");
+        if (!Array.isArray(keys)) throw assertionError("toContainAllKeys() requires the argument to be an array");
+        let ok = true;
+        for (const key of keys) if (!Object.prototype.hasOwnProperty.call(received, key)) { ok = false; break; }
+        if (ok) { const own = Object.keys(received); const want = new Set(keys.map((k) => String(k))); ok = own.length === want.size && own.every((k) => want.has(k)); }
+        check(ok, () => "toContainAllKeys(" + fmt(keys) + ")\n\nReceived: " + fmt(received)); return m; },
       // bun: unconditional pass/fail (respect .not — pass under .not fails, etc).
       pass(msg) { if (arguments.length > 0 && typeof msg !== "string") throw assertionError("Expected message to be a string for 'pass'."); check(true, () => (arguments.length > 0 ? msg : "passes by .pass() assertion")); return m; },
       fail(msg) { if (arguments.length > 0 && typeof msg !== "string") throw assertionError("Expected message to be a string for 'fail'."); check(false, () => (arguments.length > 0 ? msg : "fails by .fail() assertion")); return m; },
       // mock matchers (received is a mock/spy from mock()/spyOn())
       toHaveBeenCalled() { check(!!(received && received.mock && received.mock.calls.length > 0), () => "toHaveBeenCalled"); return m; },
       toHaveBeenCalledTimes(n) { check(!!(received && received.mock) && received.mock.calls.length === n, () => "toHaveBeenCalledTimes(" + n + ")\n\nReceived: " + (received && received.mock ? received.mock.calls.length : "n/a")); return m; },
-      toHaveBeenCalledWith(...a) { let ok = false; if (received && received.mock) for (const call of received.mock.calls) if (deepEqual(call, a)) { ok = true; break; } check(ok, () => "toHaveBeenCalledWith(" + fmt(a) + ")"); return m; },
-      toHaveBeenLastCalledWith(...a) { const c = received && received.mock ? received.mock.calls : []; check(c.length > 0 && deepEqual(c[c.length - 1], a), () => "toHaveBeenLastCalledWith(" + fmt(a) + ")"); return m; },
-      toHaveBeenNthCalledWith(n, ...a) { const c = received && received.mock ? received.mock.calls : []; check(c.length >= n && deepEqual(c[n - 1], a), () => "toHaveBeenNthCalledWith"); return m; },
+      toHaveBeenCalledWith(...a) { let ok = false; if (received && received.mock) for (const call of received.mock.calls) if (deepEqual(call, a)) { ok = true; break; } check(ok, () => callDiff("toHaveBeenCalledWith", a, received, received && received.mock ? received.mock.calls.length - 1 : -1)); return m; },
+      toHaveBeenLastCalledWith(...a) { const c = received && received.mock ? received.mock.calls : []; check(c.length > 0 && deepEqual(c[c.length - 1], a), () => callDiff("toHaveBeenLastCalledWith", a, received, c.length - 1)); return m; },
+      toHaveBeenNthCalledWith(n, ...a) { const c = received && received.mock ? received.mock.calls : []; check(c.length >= n && deepEqual(c[n - 1], a), () => callDiff("toHaveBeenNthCalledWith", a, received, n - 1)); return m; },
       toHaveBeenCalledOnce() { check(!!(received && received.mock) && received.mock.calls.length === 1, () => "toHaveBeenCalledOnce\n\nReceived: " + (received && received.mock ? received.mock.calls.length : "n/a")); return m; },
       // jest-compat aliases. Each maps onto the canonical matcher exactly as bun
       // does in jest.classes.ts:300-337 (`toBeCalled -> toHaveBeenCalled`,
@@ -491,6 +555,7 @@ inline constexpr std::string_view HARNESS = R"JS(
           S.snapCounters = S.snapCounters || {};
           const n = (S.snapCounters[key] = (S.snapCounters[key] || 0) + 1);
           (S.snapshots || (S.snapshots = [])).push({ key: key + " " + n, value: snapSerialize(received, "") });
+          S.snapTotal = (S.snapTotal || 0) + 1;   // bun's summary snapshot tally
         } catch (e) {}
         return m;
       },
@@ -519,9 +584,14 @@ inline constexpr std::string_view HARNESS = R"JS(
     for (const name of Object.keys(S.customMatchers)) {
       m[name] = (...args) => {
         const ctx = { isNot, equals: deepEqual, promise: "", utils: { printReceived: fmt, printExpected: fmt, matcherHint: () => "", stringify: fmt, EXPECTED_COLOR: (s) => s, RECEIVED_COLOR: (s) => s } };
-        const res = S.customMatchers[name].call(ctx, received, ...args) || {};
-        let pass = !!res.pass; if (isNot) pass = !pass;
-        if (!pass) throw assertionError(typeof res.message === "function" ? res.message() : String(res.message || name));
+        const out = S.customMatchers[name].call(ctx, received, ...args);
+        // A matcher may return a promise (`async _m() {}` / `_m: () => Promise`);
+        // bun awaits it and the call site awaits the matcher, so the verdict must
+        // ride the same promise instead of being read off the (pending) object.
+        if (out && typeof out.then === "function") {
+          return out.then((res) => { settleCustom(name, res, isNot); return m; });
+        }
+        settleCustom(name, out, isNot);
         return m;
       };
     }
@@ -553,6 +623,26 @@ inline constexpr std::string_view HARNESS = R"JS(
       }
     };
     return new Proxy({}, { get(_, prop) { return build(prop); } });
+  }
+  // bun expect.rs custom-matcher protocol: the return value MUST be an object
+  // carrying `pass`. Anything else is a bug in the matcher and is reported as
+  // one (bun names the offending matcher in the message; jest does not).
+  function settleCustom(name, res, isNot) {
+    if (res === null || typeof res !== "object" || !("pass" in res)) {
+      let shown;
+      if (res !== null && typeof res === "object") {
+        try { shown = JSON.stringify(res); } catch (e) { shown = String(res); }
+      } else { shown = String(res); }
+      throw assertionError("Unexpected return from matcher function `" + name + "`.\n" +
+        "Matcher functions should return an object in the following format:\n" +
+        "  {message?: string | function, pass: boolean}\n" +
+        "'" + shown + "' was returned");
+    }
+    let pass = !!res.pass; if (isNot) pass = !pass;
+    if (pass) return;
+    if (res.message === undefined || res.message === null)
+      throw assertionError("No message was specified for this matcher.");
+    throw assertionError(typeof res.message === "function" ? String(res.message()) : String(res.message));
   }
   function evalThrow(threw, err, isNot, expected) {
     let pass = threw, detail = "";
@@ -604,11 +694,41 @@ inline constexpr std::string_view HARNESS = R"JS(
   // reads S.customMatchers per-call, so matchers added here apply to every expect().
   expect.extend = function (obj) {
     if (!obj || typeof obj !== "object") throw new TypeError("expect.extend: expected an object of matchers");
-    for (const name of Object.keys(obj)) {
+    // Matchers may live on the prototype chain: `expect.extend(Object.create(base))`
+    // and `expect.extend(new SomeClass())` are both supported by bun, and class
+    // methods are non-enumerable, so neither Object.keys nor for..in finds them.
+    // Own level: enumerable keys only, and every one of them must be callable
+    // (a non-function there is a caller mistake and is reported). Inherited
+    // levels contribute only their function-valued properties -- a module
+    // namespace passed straight through (issue #16312 does
+    // `expect.extend(matchers)`) carries non-enumerable bookkeeping like
+    // __esModule that must not be mistaken for a broken matcher.
+    const names = Object.keys(obj);
+    for (const name of names) {
       if (typeof obj[name] !== "function")
-        throw new TypeError("expect.extend: `" + name + "` is not a valid matcher. Received " + typeof obj[name]);
+        throw new TypeError("expect.extend: `" + name + "` is not a valid matcher. Must be a function, is \"" +
+                            (obj[name] === null ? "null" : typeof obj[name]) + "\"");
     }
-    Object.assign(S.customMatchers, obj);
+    {
+      const seen = new Set(names);
+      let o = Object.getPrototypeOf(obj);
+      while (o && o !== Object.prototype && o !== Function.prototype) {
+        for (const n of Object.getOwnPropertyNames(o)) {
+          if (n === "constructor" || seen.has(n)) continue;
+          seen.add(n);
+          if (typeof obj[n] === "function") names.push(n);
+        }
+        o = Object.getPrototypeOf(o);
+      }
+    }
+    for (const name of names) S.customMatchers[name] = obj[name];
+    // A bunfig `preload` extends the ONE process-wide expect; its matchers must
+    // survive the per-file reset that follows (engine.inc sets the flag around
+    // the preload loop). Matchers a test file registers stay file-scoped.
+    if (G.__mbunInPreload) {
+      if (!S.preloadMatchers) S.preloadMatchers = {};
+      for (const name of names) S.preloadMatchers[name] = obj[name];
+    }
     // bun (expect.rs makeAsymmetricMatchers / expect_static): every extended
     // matcher is ALSO exposed statically on `expect` so `expect.myMatcher(...exp)`
     // builds an asymmetric matcher whose asymmetricMatch(actual) runs the matcher
@@ -616,15 +736,33 @@ inline constexpr std::string_view HARNESS = R"JS(
     // asymmetricMatch unchanged (issue: _toThrowOnMatch). Registering the statics
     // also makes `expect.<name>` defined for the "is my matcher installed?" probe
     // (@testing-library/jest-dom, issue #16312).
-    for (const name of Object.keys(obj)) {
+    for (const name of names) {
       const matcherFn = obj[name];
-      expect[name] = function (...expected) {
-        return asym(name, function (actual) {
-          const ctx = { isNot: false, equals: deepEqual, promise: "", utils: { printReceived: fmt, printExpected: fmt, matcherHint: () => "", stringify: fmt, EXPECTED_COLOR: (s) => s, RECEIVED_COLOR: (s) => s } };
-          const res = matcherFn.call(ctx, actual, ...expected) || {};
-          return !!res.pass;
+      const run = (isNot) => function (...expected) {
+        return asym((isNot ? "not." : "") + name, function (actual) {
+          const ctx = { isNot: isNot, equals: deepEqual, promise: "", utils: { printReceived: fmt, printExpected: fmt, matcherHint: () => "", stringify: fmt, EXPECTED_COLOR: (s) => s, RECEIVED_COLOR: (s) => s } };
+          const out = matcherFn.call(ctx, actual, ...expected);
+          // asymmetricMatch has to answer with a boolean, but a matcher may be
+          // async. Settle it by draining the microtask queue (bun's asymmetric
+          // path likewise reads a settled value); a rejection propagates out of
+          // the enclosing toEqual, which is what the corpus asserts.
+          if (out && typeof out.then === "function") {
+            let state = 0, value, err;
+            out.then((v) => { state = 1; value = v; }, (e) => { state = 2; err = e; });
+            if (G.__mbunDrainMicrotasksNative) { try { G.__mbunDrainMicrotasksNative(); } catch (e) {} }
+            if (state === 2) throw err;
+            if (state === 0) return false;
+            const r = value || {};
+            return isNot ? !r.pass : !!r.pass;
+          }
+          const res = out || {};
+          return isNot ? !res.pass : !!res.pass;
         });
       };
+      expect[name] = run(false);
+      // `expect.not.<custom>(...)` — bun exposes every extended matcher on the
+      // negated namespace too, not just the six built-in asymmetric ones.
+      expect.not[name] = run(true);
     }
     return expect;
   };
@@ -659,7 +797,12 @@ inline constexpr std::string_view HARNESS = R"JS(
     return v != null && (v instanceof ctor || (v.constructor === ctor));
   });
   expect.objectContaining = (obj) => asym("objectContaining", (v) => { if (v == null || typeof v !== "object") return false; for (const k of Object.keys(obj)) { if (!(k in v) || !deepEqual(v[k], obj[k])) return false; } return true; });
-  expect.arrayContaining = (arr) => asym("arrayContaining", (v) => { if (!Array.isArray(v)) return false; return arr.every((x) => v.some((y) => deepEqual(y, x))); });
+  // A Proxy passes IsArray but is not a JSArray. bun's arrayContaining needs a
+  // real one on BOTH sides and reports no match otherwise, rather than reading
+  // through the traps (regression/issue/isArray-proxy-crash, where matching a
+  // Proxy used to be a null deref).
+  const isRealArray = (v) => Array.isArray(v) && !(G.__mbunProxyRegistry && G.__mbunProxyRegistry.has(v));
+  expect.arrayContaining = (arr) => asym("arrayContaining", (v) => { if (!isRealArray(v) || !isRealArray(arr)) return false; return arr.every((x) => v.some((y) => deepEqual(y, x))); });
   expect.stringContaining = (s) => asym("stringContaining", (v) => typeof v === "string" && v.indexOf(s) !== -1);
   expect.stringMatching = (re) => asym("stringMatching", (v) => typeof v === "string" && (re instanceof RegExp ? re.test(v) : v.indexOf(String(re)) !== -1));
   expect.closeTo = (n, d) => asym("closeTo", (v) => typeof v === "number" && Math.abs(v - n) < Math.pow(10, -(d === undefined ? 2 : d)) / 2);
@@ -716,7 +859,7 @@ inline constexpr std::string_view HARNESS = R"JS(
       ret.then(settle, (e) => { dropScope(e); settle(); });
     }
   }
-  function makeTest(mode, only) {
+  function makeTest(mode, only, conc) {
     // Supports test(name, fn) and test(name, options, fn) (the options object —
     // e.g. { timeout, retry } — is recorded but its knobs beyond selection are
     // not yet honored). fn is whichever argument is a function.
@@ -732,6 +875,13 @@ inline constexpr std::string_view HARNESS = R"JS(
       }
       // bun throws at REGISTRATION when a runnable test has no body (todo/skip may omit it).
       if (fn === undefined && mode !== "todo" && mode !== "skip") throw new TypeError("test() expects a function");
+      // `retry` re-runs a FAILING test until it passes; `repeats` re-runs a
+      // PASSING one a fixed number of extra times. They are mutually exclusive
+      // (bun_test.rs validates the option bag at registration, before the test
+      // is queued).
+      if (opts && typeof opts === "object" && opts.retry != null && opts.repeats != null) {
+        throw new Error("Cannot set both retry and repeats");
+      }
       // .only narrows the run set; a todo-depth describe turns its runnable
       // tests into todos. The two are independent and both apply here.
       // ScopeFunctions.rs:506-508 — a focused registrar is refused in CI before
@@ -740,6 +890,7 @@ inline constexpr std::string_view HARNESS = R"JS(
       const isOnly = !!only && !(S.skipDepth > 0);
       if (isOnly) S.onlyTests++;
       S.current.items.push({ type: "test", name: String(name), fn: fn, opts: opts, only: isOnly,
+                             concurrent: !!conc,
                              mode: (S.skipDepth > 0 ? "skip"
                                     : ((S.todoDepth > 0 && mode === "run") ? "todo" : mode)) });
     };
@@ -808,7 +959,7 @@ inline constexpr std::string_view HARNESS = R"JS(
     // execution model) are lazy memoized getters so the chain is fully
     // bidirectional — test.concurrent.skipIf(c) AND test.skipIf(c).concurrent
     // both work — without infinite eager recursion.
-    Object.defineProperty(fn, "concurrent", { configurable: true, get() { const c = decorate(makeTest(mode), mode); Object.defineProperty(fn, "concurrent", { value: c, configurable: true }); return c; } });
+    Object.defineProperty(fn, "concurrent", { configurable: true, get() { const c = decorate(makeTest(mode, false, true), mode); Object.defineProperty(fn, "concurrent", { value: c, configurable: true }); return c; } });
     Object.defineProperty(fn, "serial", { configurable: true, get() { const c = decorate(makeTest(mode), mode); Object.defineProperty(fn, "serial", { value: c, configurable: true }); return c; } });
     return fn;
   }
@@ -855,7 +1006,22 @@ inline constexpr std::string_view HARNESS = R"JS(
   function beforeEach(fn) { S.current.beforeEach.push(fn); }
   function afterEach(fn) { S.current.afterEach.push(fn); }
   function beforeAll(fn) { S.current.beforeAll.push(fn); }
-  function afterAll(fn) { S.current.afterAll.push(fn); }
+  // An afterAll registered while a test BODY is running belongs to that test:
+  // bun runs it right after the body, ahead of the afterEach chain, rather than
+  // deferring it to the end of the enclosing scope (test-on-test-finished.test.ts
+  // "onTestFinished ordering" and test-retry-repeats-basic "retry with inner
+  // afterAll" both pin it, the latter once per retry attempt).
+  function afterAll(fn) { if (S.inTest) S.innerAfterAll.push(fn); else S.current.afterAll.push(fn); }
+  // onTestFinished(cb): a teardown callback scoped to the running test, run after
+  // afterEach in registration order (vitest's API, adopted by bun). Concurrent
+  // tests have no single "current test" to attach to, so bun refuses there.
+  function onTestFinished(fn) {
+    if (S.inConcurrent) {
+      throw new Error("Cannot call onTestFinished() here. It cannot be called inside a concurrent test. Use test.serial or remove test.concurrent.");
+    }
+    if (!S.inTest) throw new Error("Cannot call onTestFinished() here. It can only be called inside a test.");
+    S.onFinished.push(fn);
+  }
 
   // mock / spyOn / jest (minimal — call tracking + implementation override).
   const __allMocks = [];
@@ -884,7 +1050,63 @@ inline constexpr std::string_view HARNESS = R"JS(
     return f;
   }
   // Static helpers on the bun:test `mock` function.
-  mock.module = function (name, factory) { try { const m = factory(); G.__mbunNativeModules = G.__mbunNativeModules || {}; G.__mbunNativeModules[name] = (m && m.default !== undefined && Object.keys(m).length === 1) ? m.default : m; G.__mbunNativeModules["node:" + name] = G.__mbunNativeModules[name]; } catch (e) {} };
+  // mock.module(specifier, factory) — replace a module's exports.
+  //
+  // Three things have to happen, and the corpus pins each one separately:
+  //   1. FUTURE require()/import() of the specifier get the mock. That is the
+  //      __mbunModuleMocks registry, consulted by every require flavour in
+  //      engine_require_js.inc before the resolver runs.
+  //   2. A module that is ALREADY loaded has its exports replaced IN PLACE, so
+  //      that importers which already destructured it (`import { trim } from
+  //      "lodash"`, mock/6874) and re-export chains (mock/6879) observe the new
+  //      value. The value is pushed through the live-binding subscriptions that
+  //      __mbun_link records.
+  //   3. Argument validation throws BEFORE the specifier is resolved. bun's
+  //      resolver can reach the auto-install path and reentrantly tick the event
+  //      loop, so a forgotten callback must not get that far
+  //      (mock-module-non-string.test.ts:"does not run the resolver").
+  mock.module = function (name, factory) {
+    if (typeof name !== "string") throw new TypeError("mock(module, fn) requires a module name string");
+    if (typeof factory !== "function") throw new TypeError("mock(module, fn) requires a function");
+    const dir = G.__mbunTestDir || ".";
+    const key = G.__mbun_mock_key(name, dir);
+    const mocks = G.__mbunModuleMocks || (G.__mbunModuleMocks = new Map());
+    const apply = function (m) {
+      // Native/builtin specifiers keep the existing registry path: `mock.module
+      // ("fs/promises", …)` must reach __mbunNativeModules, which is what
+      // require("node:fs/promises") reads. Unwrapping a lone `default` matches
+      // the shape a builtin's consumers expect.
+      G.__mbunNativeModules = G.__mbunNativeModules || {};
+      const native = (m && m.default !== undefined && Object.keys(m).length === 1) ? m.default : m;
+      G.__mbunNativeModules[name] = native;
+      G.__mbunNativeModules["node:" + name] = native;
+      // A module already in the CommonJS cache is mutated rather than replaced:
+      // its identity is what every existing binding and namespace points at.
+      let live;
+      try { live = G.__mbun_module_cache_get(key); } catch (e) {}
+      if (live !== undefined && live !== null && (typeof live === "object" || typeof live === "function") && m !== null && typeof m === "object") {
+        const subs = G.__mbun_link_subs ? G.__mbun_link_subs.get(live) : undefined;
+        for (const k of Object.keys(m)) {
+          const v = m[k];
+          try { live[k] = v; } catch (e) {}
+          const list = subs ? subs.get(k) : undefined;
+          if (list) for (let i = 0; i < list.length; i++) { try { list[i](v); } catch (e) {} }
+        }
+        mocks.set(key, live);
+      } else {
+        mocks.set(key, m);
+      }
+    };
+    const produced = factory();
+    // An async factory (mock.module("x", async () => …)) registers once it
+    // settles; bun awaits the promise before the mocked import resolves.
+    if (produced !== null && typeof produced === "object" && typeof produced.then === "function") {
+      mocks.set(key, produced);
+      produced.then(apply, function () {});
+    } else {
+      apply(produced);
+    }
+  };
   mock.restore = function () {};
   // clearAllMocks: reset call/result history for every mock (implementations preserved).
   mock.clearAllMocks = function () { for (const f of __allMocks) if (f && typeof f.mockClear === "function") f.mockClear(); };
@@ -1112,7 +1334,10 @@ inline constexpr std::string_view HARNESS = R"JS(
   // set — but the fake-timer entry points are the SAME native functions on both
   // objects (FakeTimers.rs put_timers_fns: every FAKE_TIMERS_FNS entry is put on
   // `vi` and `jest`), each returning `this`.
-  const vi = { fn: mock, mock: function () {}, spyOn: spyOn,
+  // vi.mock IS mock.module in bun (jest.rs routes both to the same native), so
+  // it shares the argument validation and the "mock(module, fn) requires a
+  // function" message mock-module-non-string.test.ts asserts.
+  const vi = { fn: mock, mock: function (m, f) { return mock.module(m, f); }, spyOn: spyOn,
                clearAllMocks: function () { mock.clearAllMocks(); },
                resetAllMocks: function () { mock.resetAllMocks(); },
                restoreAllMocks: function () { mock.restoreAllMocks(); },
@@ -1140,8 +1365,11 @@ inline constexpr std::string_view HARNESS = R"JS(
     return make();
   })();
 
-  G.__mbunBT = { test, it, describe, xdescribe: describe, xit: test.skip, xtest: test.skip, expect,
-                 beforeEach, afterEach, beforeAll, afterAll, mock, spyOn, jest, vi, expectTypeOf,
+  // xdescribe is describe.SKIP, not describe (jest's x-prefix family is the skip
+  // family): aliasing it to plain describe ran every test inside an xdescribe
+  // block, so an `xdescribe` guarding a throwing test failed the file (issue 5228).
+  G.__mbunBT = { test, it, describe, xdescribe: describe.skip, xit: test.skip, xtest: test.skip, expect,
+                 beforeEach, afterEach, beforeAll, afterAll, onTestFinished, mock, spyOn, jest, vi, expectTypeOf,
                  setDefaultTimeout: function () {}, setSystemTime: setSystemTime,
                  spyOn: spyOn };
   // bun exposes the test globals without an explicit import; mirror onto globalThis.
@@ -1243,11 +1471,31 @@ inline constexpr std::string_view HARNESS = R"JS(
       } else failAllIn(item.scope, msg);
     }
   }
+  // Wait for a done() that has not fired yet, WITHOUT declaring a hook/body
+  // complete while its callback is still queued somewhere.
+  //
+  // A microtask spin alone cannot see a done() scheduled with
+  // process.nextTick: the tick queue runs only once the microtask queue is
+  // EXHAUSTED (node's processTicksAndRejections), and awaiting resolved
+  // promises keeps it non-empty for exactly as long as the spin lasts. So the
+  // spin is only the cheap first stage; while the tick queue actually holds
+  // work, yield to the pump instead — every pump phase drains ticks — and
+  // re-check. Getting this wrong is silent and wide: a done-style
+  // `beforeEach` whose callback arrives on a tick was treated as complete, and
+  // every test in the describe then observed its side effects as unapplied
+  // (jsonwebtoken/claim-aud: 60 pass → 17, all "jwt must be provided").
+  async function awaitDone(isSettled) {
+    for (let i = 0; i < 8 && !isSettled(); i++) await Promise.resolve();
+    for (let i = 0; i < 16 && !isSettled() && G.__mbunTickCount && G.__mbunTickCount() > 0; i++) {
+      await new Promise((r) => natSetTimeout(r, 0));
+    }
+  }
   // Run one hook, supporting done-callback style (fn.length >= 1) exactly like
-  // a done-style test body: done() may fire sync, via a microtask, or via a
-  // timer (setImmediate/setTimeout push into __mbunTimers.q, which the C++ pump
-  // drains). Without this, a done-style beforeEach/beforeAll would not be
-  // awaited and the test body would observe its side effects as not-yet-applied.
+  // a done-style test body: done() may fire sync, via a microtask, via the tick
+  // queue, or via a timer (setImmediate/setTimeout push into __mbunTimers.q,
+  // which the C++ pump drains). Without this, a done-style beforeEach/beforeAll
+  // would not be awaited and the test body would observe its side effects as
+  // not-yet-applied.
   function callHook(h) {
     if (typeof h === "function" && h.length >= 1) {
       return new Promise((resolve, reject) => {
@@ -1255,7 +1503,7 @@ inline constexpr std::string_view HARNESS = R"JS(
         const done = (err) => { if (settled) return; settled = true; if (err) reject(err instanceof Error ? err : new Error(String(err))); else resolve(); };
         let r; try { r = h(done); } catch (e) { done(e); return; }
         if (r && typeof r.then === "function") { r.then(() => done(), (e) => done(e)); return; }
-        (async () => { for (let i = 0; i < 8 && !settled; i++) await Promise.resolve(); if (!settled && (!G.__mbunTimers || G.__mbunTimers.q.length === 0)) { settled = true; resolve(); } })();
+        (async () => { await awaitDone(() => settled); if (!settled && (!G.__mbunTimers || G.__mbunTimers.q.length === 0)) { settled = true; resolve(); } })();
       });
     }
     const r = h();
@@ -1280,6 +1528,21 @@ inline constexpr std::string_view HARNESS = R"JS(
     scope.items = kept;
     return kept.length > 0;
   }
+  // Does anything in this subtree survive -t/--test-name-pattern? A describe
+  // whose every test is filtered out by the label must not run its
+  // beforeAll/afterAll: the hooks belong to the tests that run, and a label run
+  // is expected to be silent for the describes it did not select (issue 21177 —
+  // `bun test fixture.ts -t "true is true"` prints only the banner, and a nested
+  // describe three levels deep must not announce itself either).
+  // Without a pattern every scope is runnable, so this is a no-op for a normal run.
+  function scopeHasLabelMatch(scope) {
+    for (const item of scope.items) {
+      if (item.type === "test") {
+        if (G.__mbunNamePattern.test(fullName(scope, item.name))) return true;
+      } else if (!item.scope.skipped && scopeHasLabelMatch(item.scope)) return true;
+    }
+    return false;
+  }
   async function runScope(scope, beChain, aeChain) {
     // A todo scope only *runs* under --todo; otherwise its tests report as
     // `(todo)` without executing any of the scope's hooks (same as describe.skip).
@@ -1289,10 +1552,16 @@ inline constexpr std::string_view HARNESS = R"JS(
     // yields the same visited order because generation walks scopes in the same
     // depth-first sequence this runner does.
     if (S.rand !== null) shuffleWithIndex(S.rand, scope.items);
-    try { for (const h of scope.beforeAll) await callHook(h); }
-    catch (e) {
-      failAllIn(scope, (e && e.message !== undefined) ? String(e.message) : String(e));
-      return;
+    // The tests still have to be walked (each non-match bumps S.skippedLabel,
+    // which is what tells a label-only run from a real one), only the hooks are
+    // gated.
+    const runHooks = !G.__mbunNamePattern || scopeHasLabelMatch(scope);
+    if (runHooks) {
+      try { for (const h of scope.beforeAll) await callHook(h); }
+      catch (e) {
+        failAllIn(scope, (e && e.message !== undefined) ? String(e.message) : String(e));
+        return;
+      }
     }
     const be = beChain.concat(scope.beforeEach);
     const ae = scope.afterEach.concat(aeChain);
@@ -1300,8 +1569,10 @@ inline constexpr std::string_view HARNESS = R"JS(
       if (item.type === "test") await runTest(scope, item, be, ae);
       else await runScope(item.scope, be, ae);
     }
-    try { for (const h of scope.afterAll) await callHook(h); }
-    catch (e) { S.errors.push((e && e.message !== undefined) ? String(e.message) : String(e)); }
+    if (runHooks) {
+      try { for (const h of scope.afterAll) await callHook(h); }
+      catch (e) { S.errors.push((e && e.message !== undefined) ? String(e.message) : String(e)); }
+    }
   }
   async function runTest(scope, t, be, ae) {
     const label = fullName(scope, t.name);
@@ -1323,6 +1594,12 @@ inline constexpr std::string_view HARNESS = R"JS(
       else { S.skip++; S.out.push("(skip) " + label); }
       return;
     }
+    // retry/repeats: an ATTEMPT is the whole beforeEach → body → inner afterAll
+    // → afterEach → onTestFinished sequence, and each re-run repeats all of it
+    // (test-retry-repeats-basic pins `["beforeEach","test-1","afterEach",
+    // "beforeEach","test-2","afterEach"]`). Only the last attempt is reported.
+    let failed = false, msg = "";
+    const attemptOnce = async function () {
     // expect.assertions(n)/hasAssertions() bookkeeping: reset the expectation for
     // this test and snapshot the running expect()-call counter so we can measure
     // how many the body makes (verified after it settles, below).
@@ -1333,7 +1610,8 @@ inline constexpr std::string_view HARNESS = R"JS(
     // failures print the expect() message directly.
     const errMsg = (e) => ((e && e.name === "AssertionError") ? "" : "error: ") +
                           ((e && e.message !== undefined) ? String(e.message) : String(e));
-    let failed = false, msg = "";
+    failed = false; msg = "";
+    S.onFinished = []; S.innerAfterAll = []; S.inTest = true; S.inConcurrent = !!t.concurrent;
     S.asyncErr = undefined;
     S.pendingAsserts = [];
     try {
@@ -1351,11 +1629,12 @@ inline constexpr std::string_view HARNESS = R"JS(
           const done = (err) => { if (settled) return; settled = true; if (err) reject(err instanceof Error ? err : new Error(String(err))); else resolve(); };
           let r; try { r = t.fn(done); } catch (e) { done(e); return; }
           if (r && typeof r.then === "function") { r.then(() => done(), (e) => done(e)); return; }
-          // Body returned synchronously without a promise. Drain a few microtasks;
-          // if done() still hasn't fired AND no timer is pending (which could call
-          // done via the runner's timer pump), treat it as complete (arity-1 arg
-          // that isn't a done callback). If timers ARE pending, wait for them.
-          (async () => { for (let i = 0; i < 8 && !settled; i++) await Promise.resolve(); if (!settled && (!G.__mbunTimers || G.__mbunTimers.q.length === 0)) { settled = true; resolve(); } })();
+          // Body returned synchronously without a promise. Give the pending
+          // done() every queue it could be sitting in (see awaitDone); if it
+          // still hasn't fired AND no timer is pending (which could call done via
+          // the runner's timer pump), treat it as complete (arity-1 arg that
+          // isn't a done callback). If timers ARE pending, wait for them.
+          (async () => { await awaitDone(() => settled); if (!settled && (!G.__mbunTimers || G.__mbunTimers.q.length === 0)) { settled = true; resolve(); } })();
         });
       } else {
         bodyPromise = Promise.resolve().then(() => { const r = t.fn(); return (r && typeof r.then === "function") ? r : undefined; });
@@ -1401,7 +1680,15 @@ inline constexpr std::string_view HARNESS = R"JS(
       // in flight fails the test (bun: async exceptions are attributed to it).
       if (S.asyncErr !== undefined) { const ae2 = S.asyncErr; S.asyncErr = undefined; throw ae2; }
     } catch (e) { failed = true; msg = errMsg(e); }
-    try { for (const h of ae) await callHook(h); }
+    S.inTest = false; S.inConcurrent = false;
+    // Teardown order for one test, pinned by test-on-test-finished.test.ts as
+    // ["test", "inner afterAll", "afterEach", "onTestFinished"]: an afterAll
+    // registered from INSIDE a body belongs to that test (it runs immediately,
+    // not at the end of the scope), the afterEach chain follows, and
+    // onTestFinished callbacks run last — even when the body threw.
+    const teardown = S.innerAfterAll.concat(ae, S.onFinished);
+    S.innerAfterAll = []; S.onFinished = [];
+    try { for (const h of teardown) await callHook(h); }
     catch (e) { if (!failed) { failed = true; msg = errMsg(e); } }
     // expect.assertions(n)/hasAssertions(): a body that settled without failing
     // still fails if it did not make the promised number of expect() calls
@@ -1420,6 +1707,18 @@ inline constexpr std::string_view HARNESS = R"JS(
         failed = true;
         msg = "AssertionError: expected at least one assertion to be called but received none";
       }
+    }
+    };
+    // `retry: N` gives up to N+1 attempts and stops at the first pass; the test
+    // reports the LAST attempt (so a test that finally passes is a pass).
+    // `repeats: N` runs exactly N+1 times and stops at the first failure.
+    const ropts = t.opts || {};
+    const retryN = (typeof ropts.retry === "number" && ropts.retry > 0) ? ropts.retry : 0;
+    const repeatN = (retryN === 0 && typeof ropts.repeats === "number" && ropts.repeats > 0) ? ropts.repeats : 0;
+    const attempts = 1 + retryN + repeatN;
+    for (let i = 0; i < attempts; i++) {
+      await attemptOnce();
+      if (retryN > 0 ? !failed : failed) break;
     }
     if (t.mode === "todo") {  // running under --todo
       if (failed) {
@@ -1464,11 +1763,13 @@ inline constexpr std::string_view HARNESS = R"JS(
     S.root = fresh; S.current = fresh;
     S.pass = 0; S.fail = 0; S.skip = 0; S.expectCalls = 0; S.total = 0; S.todo = 0;
     S.skippedLabel = 0; S.onlyTests = 0; S.onlyScopes = 0;
-    S.out = []; S.customMatchers = {}; S.errors = []; S.pendingAsserts = [];
+    S.out = []; S.customMatchers = Object.assign({}, S.preloadMatchers); S.errors = []; S.pendingAsserts = [];
     S.timeoutReject = null; S.asyncErr = undefined; S.rand = null; S.skipDepth = 0;
+    S.onFinished = []; S.innerAfterAll = []; S.inTest = false; S.inConcurrent = false;
     S.todoDepth = 0;   // a describe.todo left open by a throwing body
     S.sysTime = null;  // a file's fake system time must not leak into the next
     S.snapshots = []; S.snapCounters = {}; S.curLabel = "";  // snapshot state is per-file
+    S.snapTotal = 0; S.snapAdded = 0;                        // …including its tallies
     G.__mbun_describe_pending = 0;  // async describe bodies of the previous file
     ftUninstall();     // a file's fake timers must not leak into the next either
     __allMocks.length = 0;
@@ -1486,6 +1787,10 @@ inline constexpr std::string_view HARNESS = R"JS(
       const snapDir = path.join(path.dirname(G.__filename), "__snapshots__");
       const snapFile = path.join(snapDir, path.basename(G.__filename) + ".snap");
       if (fs.existsSync(snapFile)) return;   // never clobber an existing snapshot
+      // bun's summary reports how many snapshots this run WROTE ("snapshots:
+      // +N added", test_command.rs:2870). Without it a first run looked
+      // indistinguishable from a re-run against an existing .snap (issue 14029).
+      S.snapAdded = (S.snapAdded || 0) + S.snapshots.length;
       fs.mkdirSync(snapDir, { recursive: true });
       const esc = (s) => String(s).replace(/\\/g, "\\\\").replace(/`/g, "\\`").replace(/\$\{/g, "\\${");
       const snaps = S.snapshots.slice().sort((a, b) => a.key < b.key ? -1 : a.key > b.key ? 1 : 0);
@@ -1508,6 +1813,7 @@ inline constexpr std::string_view HARNESS = R"JS(
     G.__mbun_pass = S.pass; G.__mbun_fail = S.fail; G.__mbun_skip = S.skip;
     G.__mbun_todo = S.todo; G.__mbun_skipped_label = S.skippedLabel;
     G.__mbun_expect = S.expectCalls; G.__mbun_total = S.total;
+    G.__mbun_snap_total = S.snapTotal || 0; G.__mbun_snap_added = S.snapAdded || 0;
     G.__mbun_errors = S.errors.length;
     G.__mbun_error_text = S.errors.map((m) => "error: " + m).join("\n");
     G.__mbun_output = S.out.join("\n"); G.__mbun_done = true;
@@ -1650,6 +1956,8 @@ struct RunResult {
     int todo{0};
     int errors{0};       // file-level errors (describe-scope throws, afterAll throws, …)
     int expect_calls{0};
+    int snap_total{0};   // toMatchSnapshot() calls (bun's snapshots.total)
+    int snap_added{0};   // snapshots this run wrote to a new .snap (snapshots.added)
     int total{0};
     int skipped_label{0};  // tests skipped by -t/--test-name-pattern (jest.rs:282)
     std::string body;    // per-test (pass)/(fail)/(skip) lines + failure detail
@@ -1745,6 +2053,21 @@ RunResult run_source(std::string_view js_source, std::string_view dir = ".", boo
     if (auto h{rt::eval(detail::HARNESS)}; !h) {
         r.error = "bun:test harness init failed: " + h.error();
         return r;
+    }
+    // 1a2. The directory mock.module() resolves relative specifiers against.
+    //      bun resolves them against the *caller*, and the caller is the test
+    //      file in every corpus use; taking it from here rather than from a
+    //      stack walk keeps it exact and free.
+    {
+        std::string lit;
+        lit.reserve(dir.size() + 2);
+        lit.push_back('"');
+        for (const char c : dir) {
+            if (c == '"' || c == '\\') lit.push_back('\\');
+            lit.push_back(c);
+        }
+        lit.push_back('"');
+        rt::eval("globalThis.__mbunTestDir=" + lit + ";");
     }
     // 1b. runner flags: --todo makes todo tests run (pass → fail, fail → todo).
     rt::eval(detail::has_cli_flag("--todo") ? "globalThis.__mbunRunTodo=true;"
@@ -1921,10 +2244,41 @@ RunResult run_source(std::string_view js_source, std::string_view dir = ".", boo
                                                                            : "require"};
     const std::string params{std::string{"exports, "} + preq + ", module, " + pfn + ", " + pdn +
                              ", __mbun_esm_require"};
-    const std::string strictPrefix{t.cjs_esm_module ? "\"use strict\";\n" : ""};
-    std::string wrapped{"(function (" + params + ") {\n" + strictPrefix + prepared +
+    // The wrapper prologue stays on the SAME line as the source's first line, so a
+    // frame's reported line is the file's real line. With `{\n` + `"use strict";\n`
+    // every location in the file was reported two lines too low, which was
+    // invisible while the sourceURL was the `<test>` placeholder and actively
+    // misleading once it is a real path. No JS construct has to start a line
+    // (a shebang would, but the transpiler never emits one).
+    const std::string strictPrefix{t.cjs_esm_module ? "\"use strict\";" : ""};
+    std::string wrapped{"(function (" + params + ") {" + strictPrefix + prepared +
                         "\n}).call(globalThis, " + callArgs + ");"};
-    if (auto reg{rt::eval(wrapped, "<test>")}; !reg) {
+    // sourceURL = the test file's real path. Every OTHER module in the run already
+    // gets its path (the CJS loader passes one), so a stack that crosses from a
+    // helper back into the test file used to read
+    //   helper@/abs/path/helper.ts:5:26
+    //   @<test>:6:23
+    // and any harness that locates its own caller by matching a directory prefix
+    // against the frames (bake-harness.ts snapshotCallerLocation) found nothing and
+    // threw "Couldn't find caller location in stack trace" during collection. An
+    // inline/anonymous source has no path, so it keeps the `<test>` placeholder.
+    //
+    // SIZED, so nobody re-derives it: this unblocked collection for the 18
+    // test/bake/dev files that died on that message, and they still do not pass.
+    // Two walls behind it, neither reachable from here:
+    //   1. bake-harness stackTraceFileName() then feeds the frame to
+    //      startsWith(<dir>), which fails on JSC's "@/path:l:c" separator where V8
+    //      writes "at /path:l:c". Removing the "@" means V8-formatting instance
+    //      `.stack` — the SETTLED-not-worth-it rewrite documented at
+    //      builtins/markdown_web.cppm (~5x on error construction, no native route).
+    //   2. Even past that, devTest spawns a bake DevServer:
+    //      Bun.serve() has no `app`/framework option and
+    //      bun:internal-for-testing has no getDevServerDeinitCount. Those 18 files
+    //      are gated on the whole HMR/incremental-bundler subsystem, not on stacks.
+    // So this change is kept for its own sake (correct paths + exact lines in every
+    // test file's frames), not as a step toward the bake corpus.
+    const std::string sourceURL{filename.empty() ? std::string{"<test>"} : std::string{filename}};
+    if (auto reg{rt::eval(wrapped, sourceURL)}; !reg) {
         // Possibly a top-level-await test file (JSC script mode has no TLA): retry
         // with an async wrapper and pump the virtual event loop so module-scope
         // awaits (and the test() collection after them) finish before execution.
@@ -1939,11 +2293,11 @@ RunResult run_source(std::string_view js_source, std::string_view dir = ".", boo
         }
         (void)rt::eval("globalThis.__mbun_collect_done=0;globalThis.__mbun_collect_err=undefined;");
         const std::string awrapped{
-            "(async function (" + params + ") {\n" + strictPrefix + prepared +
+            "(async function (" + params + ") {" + strictPrefix + prepared +
             "\n}).call(globalThis, " + callArgs + ")"
             ".then(function(){globalThis.__mbun_collect_done=1;},"
             "function(e){globalThis.__mbun_collect_err=(e&&e.stack)||String(e);globalThis.__mbun_collect_done=1;});"};
-        if (auto reg2{rt::eval(awrapped, "<test>")}; !reg2) {
+        if (auto reg2{rt::eval(awrapped, sourceURL)}; !reg2) {
             r.error = "test file evaluation error: " + reg.error();  // report the original
             return r;
         }
@@ -2103,6 +2457,8 @@ RunResult run_source(std::string_view js_source, std::string_view dir = ".", boo
     r.todo = as_int(rt::eval_number("globalThis.__mbun_todo||0"));
     r.errors = as_int(rt::eval_number("globalThis.__mbun_errors||0"));
     r.expect_calls = as_int(rt::eval_number("globalThis.__mbun_expect"));
+    r.snap_total = as_int(rt::eval_number("globalThis.__mbun_snap_total||0"));
+    r.snap_added = as_int(rt::eval_number("globalThis.__mbun_snap_added||0"));
     r.total = as_int(rt::eval_number("globalThis.__mbun_total"));
     r.skipped_label = as_int(rt::eval_number("globalThis.__mbun_skipped_label||0"));
     if (auto body{rt::eval_to_string("String(globalThis.__mbun_output)")}) {

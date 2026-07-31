@@ -20,7 +20,7 @@ void expect(bool cond, std::string_view what) {
 }  // namespace
 
 int main() {
-#if defined(__linux__)
+#if !defined(_WIN32)
     using namespace mbun::jsc::runtime;
 
     auto setup = eval(R"MJS(

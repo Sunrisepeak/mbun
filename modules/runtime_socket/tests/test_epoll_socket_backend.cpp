@@ -3,7 +3,7 @@
 // 127.0.0.1: accept dispatch, echo round-trip, EPOLLOUT backpressure flush,
 // peer-close -> on_close, and pause/resume gating of reads. The Connection /
 // Listener state machines are driven with the epoll backend injected.
-#if defined(__linux__)
+#if !defined(_WIN32)
 #include <sys/socket.h>
 #endif
 
@@ -25,11 +25,11 @@ void check(bool condition, std::string_view name) {
     }
 }
 
-#if defined(__linux__)
+#if !defined(_WIN32)
 
 // Bundles the loop + epoll backend + socket backend wiring every test needs.
 struct Fixture {
-    mbun::event_loop::EpollBackend epoll{};
+    mbun::event_loop::HostReadinessBackend epoll{};
     mbun::event_loop::EventLoop loop;
     std::shared_ptr<EpollSocketBackend> backend{};
 
@@ -300,7 +300,7 @@ void test_pause_blocks_data_and_resume_recovers() {
 #else  // !__linux__
 
 void test_deferred_stub() {
-    mbun::event_loop::EpollBackend epoll{};
+    mbun::event_loop::HostReadinessBackend epoll{};
     mbun::event_loop::EventLoop loop{epoll.seam()};
     auto backend{std::make_shared<EpollSocketBackend>(loop, epoll, SocketEvents{})};
     check(!backend->listen(Address::ipv4("127.0.0.1", 0)).has_value(),
@@ -316,7 +316,7 @@ void test_deferred_stub() {
 }  // namespace
 
 int main() {
-#if defined(__linux__)
+#if !defined(_WIN32)
     test_listener_accepts_connection();
     test_echo_round_trip();
     test_backpressure_flush_and_writable();

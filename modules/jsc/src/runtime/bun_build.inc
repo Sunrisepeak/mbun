@@ -360,7 +360,10 @@ inline std::optional<std::string> bun_build_decode_content(JSContextRef ctx, JSV
             data = static_cast<const char*>(JSObjectGetArrayBufferBytesPtr(ctx, obj, nullptr));
             length = JSObjectGetArrayBufferByteLength(ctx, obj, nullptr);
         } else {
+            // BytesPtr answers the BUFFER base, ByteLength is view-relative:
+            // without the offset a subarray is read from the wrong bytes.
             data = static_cast<const char*>(JSObjectGetTypedArrayBytesPtr(ctx, obj, nullptr));
+            if (data != nullptr) data += JSObjectGetTypedArrayByteOffset(ctx, obj, nullptr);
             length = JSObjectGetTypedArrayByteLength(ctx, obj, nullptr);
         }
         if (data == nullptr) {
@@ -1102,65 +1105,121 @@ inline JSValueRef bun_build_run(JSContextRef ctx, JSValueRef configVal) {
 
     // A setup() that threw is an ordinary build failure, not an exception out of
     // Bun.build: `throw: false` callers still expect { success: false, logs }.
+    // MULTI-ENTRY: one chunk per entry point, exactly as `mbun build` already does
+    // (app.cppm run_build loops build_bundle over flags.entryPoints). Without
+    // --splitting bun gives every entry point a SELF-CONTAINED chunk and returns one
+    // artifact per entry (bundler/options.rs default entry naming; a module imported
+    // by two entries is emitted in both), so a single build_bundle over all entries
+    // was wrong twice over: it returned one artifact for N entries, wrote nothing at
+    // all when an outdir was given (the write is gated on entryPaths.size() == 1),
+    // and it merged unrelated entries into one graph — which is how a CSS entry
+    // point listed ALONGSIDE JS entries ("./index.ts", "./index.css") failed with
+    // `a CSS import from a JS module is outside this bundler slice` even though no JS
+    // module imports any CSS. ref: compat/bun/test/regression/issue/22317.test.ts.
+    //
+    // `compile` is excluded: it links exactly ONE entry into an executable (bun
+    // rejects more than one), so it keeps the single-bundle path below.
+    std::vector<mbun::bundler::BundleResult> extraBundles;
     auto built{pluginError ? std::expected<mbun::bundler::BundleResult, mbun::bundler::BuildError>{
                                  std::unexpected(mbun::bundler::BuildError{"", *pluginError, 0})}
-                           : mbun::bundler::build_bundle(entryPoints, files, options)};
+                           : (entryPoints.size() > 1 && !compile.requested
+                                  ? mbun::bundler::build_bundle({entryPoints.front()}, files, options)
+                                  : mbun::bundler::build_bundle(entryPoints, files, options))};
+    if (built && entryPoints.size() > 1 && !compile.requested) {
+        for (std::size_t i{1}; i < entryPoints.size(); ++i) {
+            auto next{mbun::bundler::build_bundle({entryPoints[i]}, files, options)};
+            if (!next) {
+                built = std::unexpected(std::move(next.error()));
+                extraBundles.clear();
+                break;
+            }
+            extraBundles.push_back(std::move(*next));
+        }
+    }
 
     // A chunk that was emitted but could not be written to `outdir` is a build
     // failure: reporting success for a file that does not exist would be a lie.
     std::optional<std::string> writeError;
     std::string path;
-    if (built) {
+    // Applies banner/footer, writes the chunk where the config asked for it and
+    // answers the artifact's `path`. Shared by the first bundle and, for a
+    // multi-entry build, by each of the rest — every entry point gets its own file.
+    auto placeChunk = [&](mbun::bundler::BundleResult& bundle) -> std::string {
         if (!banner.empty() || !footer.empty()) {
-            bun_build_apply_banner_footer(built->code, banner, footer);
+            bun_build_apply_banner_footer(bundle.code, banner, footer);
         }
-        path = built->entryPaths.empty() ? std::string{} : built->entryPaths.front();
+        std::string out{bundle.entryPaths.empty() ? std::string{} : bundle.entryPaths.front()};
         // `compile` replaces the chunk output entirely: the bundle becomes the
         // payload of a single-file executable and the artifact path names it.
         if (compile.requested) {
-            if (auto written{bun_build_write_executable(compile, outdir, path, built->code)}) {
-                path = std::move(*written);
+            if (auto written{bun_build_write_executable(compile, outdir, out, bundle.code)}) {
+                out = std::move(*written);
             } else {
                 writeError = "failed to write the compiled executable";
             }
-        } else if (!outdir.empty() && built->entryPaths.size() == 1) {
+        } else if (!outdir.empty() && bundle.entryPaths.size() == 1) {
             // With an outdir the artifact path is the file actually written to disk.
             // The output file is named after the entry as the CALLER wrote it, not
             // after what it resolved to: an onResolve plugin may rewrite the entry
             // record (`virtual-entry.ts` -> `actual-entry.ts`) and bun still emits
             // `out/virtual-entry.js`. See BundleResult::entryInputs.
-            const std::string nameSource{built->entryInputs.empty() ? path
-                                                                    : built->entryInputs.front()};
+            const std::string nameSource{bundle.entryInputs.empty() ? out
+                                                                    : bundle.entryInputs.front()};
             // Default outbase to the entrypoint's directory so `[dir]` is "" for a
             // single entry, matching bun's common-source-root default.
             const std::string base{outbase.empty()
                                        ? std::filesystem::path{nameSource}.parent_path().string()
                                        : outbase};
             const std::string relName{bun_build_render_naming(
-                entryNaming, nameSource, base, built->cssChunk ? "css" : "js")};
-            if (auto written{bun_build_write_outdir(outdir, relName, built->code)}) {
-                path = std::move(*written);
+                entryNaming, nameSource, base, bundle.cssChunk ? "css" : "js")};
+            if (auto written{bun_build_write_outdir(outdir, relName, bundle.code)}) {
+                out = std::move(*written);
             } else {
                 writeError = std::format("failed to write output to outdir {:?}", outdir);
             }
         }
-    }
-
-    if (built && !writeError) {
+        return out;
+    };
+    // One artifact per emitted chunk, in entry-point order.
+    auto makeArtifact = [&](const mbun::bundler::BundleResult& bundle,
+                            const std::string& chunkPath) -> JSValueRef {
         JSObjectRef artifact{JSObjectMake(ctx, nullptr, nullptr)};
-        set_prop(ctx, artifact, "__code", make_string(ctx, built->code));
-        set_prop(ctx, artifact, "path", make_string(ctx, path));
-        set_prop(ctx, artifact, "size", JSValueMakeNumber(ctx, static_cast<double>(built->code.size())));
-        set_prop(ctx, artifact, "loader", make_string(ctx, built->cssChunk ? "css" : "js"));
+        set_prop(ctx, artifact, "__code", make_string(ctx, bundle.code));
+        set_prop(ctx, artifact, "path", make_string(ctx, chunkPath));
+        set_prop(ctx, artifact, "size",
+                 JSValueMakeNumber(ctx, static_cast<double>(bundle.code.size())));
+        set_prop(ctx, artifact, "loader", make_string(ctx, bundle.cssChunk ? "css" : "js"));
         set_prop(ctx, artifact, "kind", make_string(ctx, "entry-point"));
         set_prop(ctx, artifact, "hash", JSValueMakeNull(ctx));
         set_fn(ctx, artifact, "text", bun_build_artifact_text_cb);
         set_fn(ctx, artifact, "arrayBuffer", bun_build_artifact_array_buffer_cb);
         set_fn(ctx, artifact, "stream", bun_build_artifact_stream_cb);
+        return artifact;
+    };
 
-        const JSValueRef outputs[1]{artifact};
+    // Protected while the loop keeps allocating (every make_string can collect) and
+    // released once the array below owns them.
+    std::vector<JSValueRef> outputs;
+    if (built) {
+        path = placeChunk(*built);
+        outputs.push_back(makeArtifact(*built, path));
+        JSValueProtect(ctx, outputs.back());
+        for (mbun::bundler::BundleResult& extra : extraBundles) {
+            const std::string extraPath{placeChunk(extra)};
+            outputs.push_back(makeArtifact(extra, extraPath));
+            JSValueProtect(ctx, outputs.back());
+        }
+    }
+    const auto releaseOutputs = [&] {
+        for (JSValueRef artifact : outputs) {
+            JSValueUnprotect(ctx, artifact);
+        }
+    };
+
+    if (built && !writeError) {
         set_prop(ctx, result, "success", JSValueMakeBoolean(ctx, true));
-        set_prop(ctx, result, "outputs", JSObjectMakeArray(ctx, 1, outputs, nullptr));
+        set_prop(ctx, result, "outputs",
+                 JSObjectMakeArray(ctx, outputs.size(), outputs.data(), nullptr));
         set_prop(ctx, result, "logs", JSObjectMakeArray(ctx, 0, nullptr, nullptr));
         // The metafile keys inputs by their source path, so build it from the
         // entrypoint's source path — not `path`, which an outdir rewrites to disk.
@@ -1185,6 +1244,7 @@ inline JSValueRef bun_build_run(JSContextRef ctx, JSValueRef configVal) {
         set_prop(ctx, result, "outputs", JSObjectMakeArray(ctx, 0, nullptr, nullptr));
         set_prop(ctx, result, "logs", JSObjectMakeArray(ctx, 1, logs, nullptr));
     }
+    releaseOutputs();
     return result;
 }
 

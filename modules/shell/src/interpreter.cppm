@@ -17,10 +17,14 @@
 module;
 
 #include <cerrno>
+#include <cstring>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <crt_externs.h>  // _NSGetEnviron: Darwin has no writable `environ`
+#endif
 
 export module mbun.shell.interpreter;
 
@@ -28,6 +32,7 @@ import std;
 import mbun.shell.pipeline;
 import mbun.shell.redirection;
 import mbun.shell.execution_plan;
+import mbun.shell.coreutils;
 
 extern "C" char** environ;
 
@@ -138,7 +143,12 @@ public:
 
 namespace detail {
 
-inline void write_all(int fd, std::string_view data) {
+// Returns false when the destination refused some of the bytes (errno is the
+// failing write's). A builtin whose whole job is to emit output has FAILED when
+// that happens — `echo a > /dev/full` is a 1, not a 0 (Builtin.zig routes an
+// IOWriter error to the builtin's exit code) — so the result is reported, not
+// swallowed. Callers writing diagnostics to stderr ignore it, as bun does.
+inline bool write_all(int fd, std::string_view data) {
     std::size_t off{0};
     while (off < data.size()) {
         const ssize_t n = ::write(fd, data.data() + off, data.size() - off);
@@ -146,10 +156,24 @@ inline void write_all(int fd, std::string_view data) {
             if (n < 0 && errno == EINTR) {
                 continue;
             }
-            break;
+            return false;
         }
         off += static_cast<std::size_t>(n);
     }
+    return true;
+}
+
+// A builtin's stdout write failed: report it the way bun's shell does and hand
+// back the exit status the caller must return. `||` in a sequential list keys
+// off exactly this status.
+inline int report_write_error(std::string_view builtin) {
+    const int saved{errno};
+    std::string message{builtin};
+    message += ": write error: ";
+    message += std::strerror(saved);
+    message += '\n';
+    write_all(STDERR_FILENO, message);
+    return 1;
 }
 
 // Open flags for a file redirect action.
@@ -183,6 +207,10 @@ export enum class BuiltinKind : std::uint8_t {
     Test,
     Seq,
     Yes,
+    Ls,
+    Rm,
+    Mv,
+    Cp,
 };
 
 export inline std::optional<BuiltinKind> builtin_kind(std::string_view name) {
@@ -200,6 +228,12 @@ export inline std::optional<BuiltinKind> builtin_kind(std::string_view name) {
     if (name == "[[") return BuiltinKind::Test;
     if (name == "seq") return BuiltinKind::Seq;
     if (name == "yes") return BuiltinKind::Yes;
+    // bun ships its own ls/rm/mv/cp rather than exec'ing coreutils; their message
+    // text and exit codes differ from GNU's (see modules/shell/src/coreutils.cppm).
+    if (name == "ls") return BuiltinKind::Ls;
+    if (name == "rm") return BuiltinKind::Rm;
+    if (name == "mv") return BuiltinKind::Mv;
+    if (name == "cp") return BuiltinKind::Cp;
     return std::nullopt;
 }
 
@@ -445,7 +479,27 @@ private:
         }
         envp.push_back(nullptr);
 
-        ::execvpe(argv[0], argv.data(), envp.data());
+        // execvpe is a glibc extension -- Darwin has no such function, which is
+        // where the macOS CI probe stopped ("no member named 'execvpe'").
+        //
+        // Publishing the environment and calling execvp is NOT identical to it:
+        // execvpe searches the CALLER's PATH, whereas this searches the PATH in
+        // envp. That difference is deliberate here and not in the other four
+        // exec sites (which use mbun::platform::process::exec_path_env to keep
+        // the glibc semantics exactly). A shell is the one caller that wants the
+        // new environment's PATH: POSIX has `PATH=/foo cmd` affect the command
+        // search for that very command, which is what this does.
+        //
+        // On Darwin the process environment is reached through _NSGetEnviron()
+        // rather than a writable `environ` symbol. This runs in the forked child
+        // immediately before exec, so mutating it affects nothing the parent can
+        // observe.
+#if defined(__APPLE__)
+        *::_NSGetEnviron() = envp.data();
+#else
+        environ = envp.data();
+#endif
+        ::execvp(argv[0], argv.data());
         // exec failed.
         detail::write_all(STDERR_FILENO,
                           std::string{stage.argv.front()} + ": command not found\n");
@@ -553,6 +607,14 @@ private:
                 return builtin_seq_(stage);
             case BuiltinKind::Yes:
                 return builtin_yes_(stage);
+            case BuiltinKind::Ls:
+                return coreutils::run_ls(stage.argv);
+            case BuiltinKind::Rm:
+                return coreutils::run_rm(stage.argv);
+            case BuiltinKind::Mv:
+                return coreutils::run_mv(stage.argv);
+            case BuiltinKind::Cp:
+                return coreutils::run_cp(stage.argv);
         }
         return 1;
     }
@@ -907,7 +969,7 @@ private:
             }
         }
         if (!ends_nl && !no_newline) out.push_back('\n');
-        detail::write_all(STDOUT_FILENO, out);
+        if (!detail::write_all(STDOUT_FILENO, out)) return detail::report_write_error("echo");
         return 0;
     }
 

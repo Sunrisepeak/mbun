@@ -99,6 +99,19 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   }
 
   const isView = (v) => ArrayBuffer.isView(v);
+  // The "Received …" tail node's ERR_INVALID_ARG_TYPE puts after the expected
+  // type: primitives are shown as `type <t> (<inspected>)`, everything else as
+  // `an instance of <ctor>`. ref: node lib/internal/errors.js ERR_INVALID_ARG_TYPE.
+  const argRecv = (v) => {
+    if (v === null) return "null";
+    const t = typeof v;
+    if (t === "undefined") return "undefined";
+    if (t === "string") return "type string ('" + v + "')";
+    if (t === "number" || t === "boolean" || t === "bigint") return "type " + t + " (" + String(v) + ")";
+    if (t === "symbol") return "type symbol (" + String(v) + ")";
+    if (t === "function") return "function " + (v.name || "");
+    return "an instance of " + ((v.constructor && v.constructor.name) || "Object");
+  };
   const toBuf = (v, enc) => {
     if (v == null) return Buffer.alloc(0);
     if (typeof v === "string") return Buffer.from(v, enc || "utf8");
@@ -118,6 +131,17 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     let s = String(algo).toLowerCase();
     if (s.startsWith("rsa-")) s = s.slice(4);
     if (s.startsWith("ecdsa-with-")) s = s.slice(11);
+    // OpenSSL's composite SIGNATURE-algorithm long names ("sha256WithRSAEncryption",
+    // "dsaWithSHA1", ...) are accepted by createSign/createVerify and name the
+    // digest half. EVP_get_digestbyname resolves them, so they used to reach the
+    // native layer intact; normalising them here keeps that working while letting
+    // the JS-side digest check recognise them too (bun's crypto.test.ts signs with
+    // all five of these).
+    const withIdx = s.indexOf("with");
+    if (withIdx > 0) {
+      const head = s.slice(0, withIdx);
+      if (head.startsWith("sha") || head.startsWith("md")) { s = head; }
+    }
     // Legacy OpenSSL name: DSS1 is an alias for SHA-1 (DSA signatures).
     if (s === "dss1") s = "sha1";
     return s;
@@ -139,9 +163,19 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     // { key: <JWK object>, format: "jwk", ... } — materialize the JWK to DER up
     // front (private when `d` is present) so the native signer/verifier gets real
     // key bytes. dsaEncoding rides along for EC ieee-p1363 vs der output.
-    if (typeof k === "object" && k.format === "jwk" && k.key != null && typeof k.key === "object") {
+    if (typeof k === "object" && k.format === "jwk") {
+      requireJwkObject(k.key, "key.key");
       const isPriv = k.key.d != null;
       return { data: jwkToDer(k.key, isPriv), passphrase: undefined, dsaEncoding: k.dsaEncoding };
+    }
+    // { key: <bare point/scalar>, format: "raw-*", asymmetricKeyType } — the
+    // same raw encodings createPrivateKey/createPublicKey accept. Without this
+    // branch the bare bytes went straight to the decoder and came back as
+    // "DECODER routines::unsupported".
+    if (typeof k === "object" && k !== null && RAW_FORMATS[k.format] && k.key != null) {
+      const kind = k.format === "raw-public" ? "public" : "private";
+      return { data: rawImport(kind, k), passphrase: undefined,
+        padding: k.padding, saltLength: k.saltLength, dsaEncoding: k.dsaEncoding, context: k.context };
     }
     if (typeof k === "object" && ("key" in k || "pem" in k)) {
       const inner = resolveKey(k.key != null ? k.key : k.pem);
@@ -176,10 +210,24 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   // node lib/internal/crypto/cipher.js: options.oaepHash is validated as a
   // string before reaching the native EVP layer.
   const validateOaepHash = (r) => {
-    if (r.oaepHash !== undefined && typeof r.oaepHash !== "string") {
+    if (r.oaepHash === undefined) return;
+    if (typeof r.oaepHash !== "string") {
       const e = new TypeError('The "options.oaepHash" property must be of type string. Received ' +
         (r.oaepHash === null ? "null" : typeof r.oaepHash));
       e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+    }
+    // A name EVP_get_digestbyname() cannot resolve is EVP_R_INVALID_DIGEST (152)
+    // in node — `error:03000098:digital envelope routines::invalid digest`. The
+    // native bridge left OpenSSL's queue empty for it, so the JS layer saw only
+    // "encryption failed: operation failed" with no .code at all.
+    let known = true;
+    try { C.createHash(r.oaepHash); } catch (_) { known = false; }
+    if (!known) {
+      const e = new Error("error:03000098:digital envelope routines::invalid digest");
+      e.code = "ERR_OSSL_EVP_INVALID_DIGEST";
+      e.reason = "invalid digest";
+      e.library = "digital envelope routines";
+      throw e;
     }
   };
   // node cipher.js: oaepLabel is validated with getArrayBufferOrView when it is
@@ -208,9 +256,18 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   C.privateDecrypt = (key, buffer) => {
     const r = resolveKey(key);
     validateOaepHash(r);
-    // node cipher.js (CVE-2023-46809): RSA_PKCS1_PADDING is rejected for
-    // private decryption.
-    if (r.padding === RSA_PKCS1_PADDING) {
+    // node cipher.js (CVE-2023-46809): RSA_PKCS1_PADDING is rejected for private
+    // decryption -- but only while the linked OpenSSL lacks the implicit-rejection
+    // mitigation. node re-permits it from OpenSSL 3.2, and mbun now links 3.5.1,
+    // which is why test-crypto-rsa-dsa.js:240 expects the call to succeed.
+    // Gated on the reported version so the rule tracks the library rather than
+    // being pinned to the version this file was written against.
+    const __osslMajorMinor = (() => {
+      const v = String((globalThis.process && process.versions && process.versions.openssl) || "");
+      const m = /^(\d+)\.(\d+)/.exec(v);
+      return m ? (Number(m[1]) * 100 + Number(m[2])) : 0;
+    })();
+    if (r.padding === RSA_PKCS1_PADDING && __osslMajorMinor < 302) {
       const e = new TypeError('The property \'options.padding\' is invalid. Received ' + r.padding);
       e.code = "ERR_INVALID_ARG_VALUE"; throw e;
     }
@@ -243,6 +300,19 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
       e.code = "ERR_INVALID_ARG_VALUE"; throw e;
     }
   };
+  // node lib/internal/crypto/sig.js getIntOption(): `padding` and `saltLength`
+  // must survive a `>> 0` round trip, so anything that is not a 32-bit integer —
+  // null, a float, a string — is ERR_INVALID_ARG_VALUE before any key work. The
+  // sign/verify paths previously coerced these straight into the native call.
+  const validateIntOptions = (r) => {
+    for (const name of ["padding", "saltLength"]) {
+      const v = r[name];
+      if (v === undefined || v === (v >> 0)) continue;
+      const e = new TypeError("The property 'options." + name + "' is invalid. Received " +
+        (v === null ? "null" : typeof v === "string" ? "'" + v + "'" : String(v)));
+      e.code = "ERR_INVALID_ARG_VALUE"; throw e;
+    }
+  };
 
   // Context is an Ed448/ML-DSA signing option. The EVP bridge has no context
   // argument, but it must still reject it for every key type that does not
@@ -258,30 +328,55 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   };
 
   // ---- sign / verify (one-shot + streaming) ----
+  // node lib/internal/crypto/sig.js does NOT default the padding in JS: it hands
+  // the native layer `undefined` and lets the key decide, which is why signing
+  // with an rsa-pss key works without naming a padding. Forcing RSA_PKCS1_PADDING
+  // here made EVP_PKEY_CTX_set_rsa_padding fail on every rsa-pss key with
+  // "illegal or unsupported padding mode". 0 is the "unspecified" sentinel (the
+  // real RSA_*_PADDING values are 1..6) and the native side substitutes
+  // RSA_PKCS1_PSS_PADDING for an rsa-pss key, RSA_PKCS1_PADDING otherwise.
+  // Likewise getSaltLength() only defaults to RSA_PSS_SALTLEN_MAX_SIGN when the
+  // caller ASKED for PSS padding; otherwise the salt length is left unset so a
+  // parameter-restricted rsa-pss key keeps its own.
+  const SALTLEN_UNSET = -0x7fffffff;
+  const sigPadding = (r) => (r.padding != null ? r.padding : 0);
+  const sigSaltLen = (r) => {
+    if (r.saltLength != null) return r.saltLength;
+    return r.padding === RSA_PKCS1_PSS_PADDING ? RSA_PSS_SALTLEN_MAX_SIGN : SALTLEN_UNSET;
+  };
+  // node reports an unresolvable digest as "Invalid digest" from the JS layer
+  // before any EVP work; the native bridge said "Unknown digest: <name>", which
+  // no node error ever spells that way. An EMPTY name is legal (Ed25519/Ed448
+  // sign with no prehash).
+  const validateDigestName = (algo) => {
+    const name = digestName(algo);
+    if (name === "") return;
+    try { C.createHash(name); } catch (_) { throw new Error("Invalid digest: " + algo); }
+  };
   const doSign = (algo, data, key) => {
+    validateDigestName(algo);
     const r = resolveKey(key);
     validateDsaEncoding(r);
+    validateIntOptions(r);
     validateSignContext(r);
     try {
       return Buffer.from(AN.sign(digestName(algo), toBuf(data), keyData(r), r.passphrase,
-        r.padding != null ? r.padding : RSA_PKCS1_PADDING,
-        r.saltLength != null ? r.saltLength : RSA_PSS_SALTLEN_MAX_SIGN,
-        r.dsaEncoding || ""));
+        sigPadding(r), sigSaltLen(r), r.dsaEncoding || ""));
     } catch (e) { throw keyErr(e); }
   };
   const doVerify = (algo, data, key, sig) => {
     // Snapshot the data and signature bytes at call time (node reads them before
     // touching the key). A key object with a mutating `passphrase` getter must not
     // be able to change the signature bytes we verify against.
+    validateDigestName(algo);
     const dataBuf = Buffer.from(toBuf(data));
     const sigBuf = Buffer.from(toBuf(sig));
     const r = resolveKey(key);
     validateDsaEncoding(r);
+    validateIntOptions(r);
     try {
       return AN.verify(digestName(algo), dataBuf, keyData(r), r.passphrase, sigBuf,
-        r.padding != null ? r.padding : RSA_PKCS1_PADDING,
-        r.saltLength != null ? r.saltLength : RSA_PSS_SALTLEN_MAX_SIGN,
-        r.dsaEncoding || "");
+        sigPadding(r), sigSaltLen(r), r.dsaEncoding || "");
     } catch (e) { throw keyErr(e); }
   };
   C.sign = (algorithm, data, key, callback) => {
@@ -302,25 +397,66 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   // Sign / Verify stream objects (Writable-ish: update()/sign()/verify()).
   // node exposes these as constructors callable WITHOUT `new` (Sign('sha256')
   // returns a fresh instance) — function form + instanceof guard reproduces that.
+  // node lib/internal/crypto/sig.js: validateString(algorithm) in the Sign/Verify
+  // constructor, validateEncoding+isArrayBufferView on every update(), and
+  // ERR_CRYPTO_SIGN_KEY_REQUIRED for a falsy key. These were all silently
+  // coerced here, so the corpus saw "Missing expected exception" rather than the
+  // argument errors node raises before any OpenSSL work happens.
+  const sigAlgoArg = (algorithm) => {
+    if (typeof algorithm !== "string") {
+      const e = new TypeError('The "algorithm" argument must be of type string.' + " Received " + argRecv(algorithm));
+      e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+    }
+  };
+  const sigDataArg = (data) => {
+    if (typeof data !== "string" && !isView(data) && !(data instanceof ArrayBuffer)) {
+      const e = new TypeError('The "data" argument must be of type string or an instance of Buffer, TypedArray, or DataView.' + " Received " + argRecv(data));
+      e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+    }
+  };
+  // The key half of a sign()/verify() call: a string/view/ArrayBuffer, a
+  // KeyObject/CryptoKey, or an options object carrying one. A bare number,
+  // array or plain object is an argument-type error, not a decode failure.
+  const sigKeyArg = (key) => {
+    if (typeof key === "string" || isView(key) || key instanceof ArrayBuffer) return;
+    if (key !== null && typeof key === "object" && (isKO(key) || "key" in key || "pem" in key)) return;
+    const e = new TypeError('The "key" argument must be of type string or an instance of ' +
+      "ArrayBuffer, Buffer, TypedArray, DataView, KeyObject, or CryptoKey." + " Received " + argRecv(key));
+    e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+  };
   function Sign(algorithm) {
     if (!(this instanceof Sign)) return new Sign(algorithm);
+    sigAlgoArg(algorithm);
+    try { C.createHash(digestName(algorithm)); } catch (_) { throw new Error("Invalid digest: " + algorithm); }
     this._algo = algorithm; this._chunks = [];
   }
-  Sign.prototype.update = function (data, inputEnc) { this._chunks.push(toBuf(data, inputEnc)); return this; };
+  Sign.prototype.update = function (data, inputEnc) { sigDataArg(data); this._chunks.push(toBuf(data, inputEnc)); return this; };
   Sign.prototype.write = function (data, inputEnc) { this.update(data, inputEnc); return true; };
   Sign.prototype.end = function (data, inputEnc) { if (data != null) this.update(data, inputEnc); return this; };
   Sign.prototype.sign = function (key, outputEnc) {
+    if (!key) { const e = new Error("No key provided to sign"); e.code = "ERR_CRYPTO_SIGN_KEY_REQUIRED"; throw e; }
+    sigKeyArg(key);
     const out = doSign(this._algo, Buffer.concat(this._chunks), key);
-    return outputEnc ? out.toString(outputEnc) : out;
+    // node's `"buffer"` is the name of the NO-ENCODING encoding (it is what
+    // getDefaultEncoding() returns), so `.sign(key, 'buffer')` hands back the
+    // Buffer. Passing it to Buffer#toString threw ERR_UNKNOWN_ENCODING instead.
+    return (outputEnc && outputEnc !== "buffer") ? out.toString(outputEnc) : out;
   };
   function Verify(algorithm) {
     if (!(this instanceof Verify)) return new Verify(algorithm);
+    sigAlgoArg(algorithm);
+    try { C.createHash(digestName(algorithm)); } catch (_) { throw new Error("Invalid digest: " + algorithm); }
     this._algo = algorithm; this._chunks = [];
   }
-  Verify.prototype.update = function (data, inputEnc) { this._chunks.push(toBuf(data, inputEnc)); return this; };
+  Verify.prototype.update = function (data, inputEnc) { sigDataArg(data); this._chunks.push(toBuf(data, inputEnc)); return this; };
   Verify.prototype.write = function (data, inputEnc) { this.update(data, inputEnc); return true; };
   Verify.prototype.end = function (data, inputEnc) { if (data != null) this.update(data, inputEnc); return this; };
   Verify.prototype.verify = function (key, signature, sigEnc) {
+    sigKeyArg(key);
+    if (typeof signature !== "string" && !isView(signature) && !(signature instanceof ArrayBuffer)) {
+      const e = new TypeError('The "signature" argument must be an instance of ArrayBuffer, Buffer, TypedArray, or DataView. Received ' + argRecv(signature));
+      e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+    }
     const sig = typeof signature === "string" ? Buffer.from(signature, sigEnc || "hex") : toBuf(signature);
     return doVerify(this._algo, Buffer.concat(this._chunks), key, sig);
   };
@@ -369,6 +505,29 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     }
     return out;
   };
+  // RFC 7518 registers JWK key types for RSA, EC and the OKP curves only. DSA,
+  // DH and RSA-PSS have no JWK representation at all — an RSASSA-PSS key's whole
+  // point is the parameters JWK cannot carry — so node refuses at the export
+  // boundary instead of silently downgrading them to a bare "RSA" document.
+  // ref: node src/crypto/crypto_keys.cc ExportJWKInner (default arm).
+  const JWK_EXPORTABLE = { rsa: 1, ec: 1, ed25519: 1, ed448: 1, x25519: 1, x448: 1 };
+  const jwkUnsupportedType = () => {
+    const e = new Error("Unsupported JWK Key Type.");
+    e.code = "ERR_CRYPTO_JWK_UNSUPPORTED_KEY_TYPE";
+    return e;
+  };
+  // node validates `key.key` with validateObject BEFORE any JWK member is read
+  // (lib/internal/crypto/keys.js prepareAsymmetricKey), so a non-object gets the
+  // argument-shape error, not a JWK-parse one. null, arrays and functions are all
+  // rejected — validateObject's defaults allow none of them.
+  const requireJwkObject = (value, name) => {
+    if (value === null || Array.isArray(value) || typeof value !== "object") {
+      const e = new TypeError('The "' + name + '" property must be of type object. Received ' +
+        argRecv(value));
+      e.code = "ERR_INVALID_ARG_TYPE";
+      throw e;
+    }
+  };
   const jwkToDer = (jwk, isPrivate) => {
     if (jwk == null || typeof jwk !== "object") throw new TypeError("Invalid JWK");
     const parts = { kty: jwk.kty };
@@ -377,6 +536,142 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
       if (typeof jwk[k] === "string") parts[k] = b64uDecode(jwk[k]);
     }
     return Buffer.from(AN.jwkImport(parts, !!isPrivate));
+  };
+
+  // ---- raw-public / raw-private / raw-seed ----
+  // node 24's raw key encodings: the bare public point (or Edwards/Montgomery
+  // public value), the bare private scalar/seed, and — for the PQC families —
+  // the generation seed. There is no PEM/DER container, so the only key types
+  // that can be expressed are EC and the OKP curves; RSA/DSA/DH have no such
+  // canonical short form and node rejects them with
+  // ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS rather than inventing one.
+  // ref: node lib/internal/crypto/keys.js (parseKeyFormat / kRawPublic etc.).
+  const RAW_FORMATS = { "raw-public": 1, "raw-private": 1, "raw-seed": 1 };
+  // The OKP curve names JWK uses, keyed by node's asymmetricKeyType spelling.
+  const OKP_JWK_CRV = { ed25519: "Ed25519", x25519: "X25519", ed448: "Ed448", x448: "X448" };
+  // Key types with a raw form in this build. The PQC families (ml-dsa/ml-kem/
+  // slh-dsa) also have one in node, but they need an OpenSSL >= 3.5 provider
+  // that is absent here, so they never become loadable keys in the first place.
+  const RAW_KEY_TYPES = { ec: 1, ed25519: 1, x25519: 1, ed448: 1, x448: 1 };
+  // Every asymmetric type this build can name. Anything else — including the PQC
+  // types, on an OpenSSL without them — is an unknown asymmetricKeyType.
+  const RAW_ASYM_TYPES = { rsa: 1, "rsa-pss": 1, dsa: 1, dh: 1, ec: 1, ed25519: 1, x25519: 1, ed448: 1, x448: 1 };
+  // node accepts both the NIST and the OpenSSL spelling of a curve; the native
+  // helpers only know the OpenSSL one.
+  const EC_NIST_ALIAS = { "P-256": "prime256v1", "P-384": "secp384r1", "P-521": "secp521r1" };
+  const rawIncompat = (fmt) => {
+    const e = new Error("The selected key format " + fmt + " is not supported for this key type.");
+    e.code = "ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS"; return e;
+  };
+  const rawInvalidCurve = (name) => {
+    const e = new TypeError("Invalid EC curve name: " + name);
+    e.code = "ERR_CRYPTO_INVALID_CURVE"; return e;
+  };
+  const rawInvalidValue = (msg) => {
+    const e = new TypeError(msg); e.code = "ERR_INVALID_ARG_VALUE"; return e;
+  };
+  // `jwk` is the key's JWK view (undefined when the type has no raw form — it is
+  // only computed once the type is known to be expressible, because a DSA key
+  // cannot be serialized as JWK at all).
+  const rawExport = (kind, keyType, osslCurve, jwk, options) => {
+    const fmt = options.format;
+    // A raw private encoding is not a container, so it cannot carry encryption.
+    if (fmt !== "raw-public" && options.passphrase != null) {
+      const e = new Error("The selected key encoding " + fmt + " does not support encryption.");
+      e.code = "ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS"; throw e;
+    }
+    if (!RAW_KEY_TYPES[keyType]) throw rawIncompat(fmt);
+    // Seeds exist only for the PQC families, which this build cannot load.
+    if (fmt === "raw-seed") throw rawIncompat(fmt);
+    if (fmt === "raw-private") {
+      if (kind !== "private") throw rawIncompat(fmt);
+      return Buffer.from(b64uDecode(jwk.d));
+    }
+    if (keyType === "ec") {
+      // node defaults the point encoding to uncompressed. `hybrid` is a real SEC1
+      // form but node does not offer it for raw-public.
+      const t = options.type === undefined ? "uncompressed" : options.type;
+      if (t !== "compressed" && t !== "uncompressed") {
+        throw rawInvalidValue("The property 'options.type' is invalid. Received " +
+          (typeof t === "string" ? "'" + t + "'" : String(t)));
+      }
+      const unc = Buffer.concat([Buffer.from([4]), Buffer.from(b64uDecode(jwk.x)), Buffer.from(b64uDecode(jwk.y))]);
+      if (t === "compressed") return Buffer.from(AN.ecdhConvertKey(osslCurve, unc, true));
+      return unc;
+    }
+    // OKP: the JWK `x` member is already the raw public value.
+    return Buffer.from(b64uDecode(jwk.x));
+  };
+  // Build key material (DER) from raw bytes. `kind` is the container the caller
+  // asked for, which is what makes raw-public-into-createPrivateKey a bad option
+  // value rather than a decode failure.
+  const rawImport = (kind, opts) => {
+    const fmt = opts.format;
+    const type = opts.asymmetricKeyType;
+    if (typeof type !== "string") {
+      const e = new TypeError('The "asymmetricKeyType" argument must be of type string. Received ' +
+        (type === null ? "null" : typeof type));
+      e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+    }
+    if (!RAW_ASYM_TYPES[type]) throw rawInvalidValue("Invalid asymmetricKeyType: '" + type + "'");
+    // Checked before the type's raw support: a public encoding can never yield a
+    // private key, whatever the type is.
+    if (kind === "private" && fmt === "raw-public") {
+      throw rawInvalidValue("The property 'options.format' is invalid. Received 'raw-public'");
+    }
+    if (!RAW_KEY_TYPES[type]) throw rawIncompat(fmt);
+    if (fmt === "raw-seed") throw rawIncompat(fmt);
+    // Raw input is bytes: node does not decode a string here even when an
+    // `encoding` is supplied, because the raw forms are not textual.
+    const key = opts.key;
+    if (!ArrayBuffer.isView(key) && !(key instanceof ArrayBuffer)) {
+      const e = new TypeError('The "key" argument must be an instance of ArrayBuffer, Buffer, TypedArray, or DataView. Received ' +
+        argRecv(key));
+      e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+    }
+    const bytes = Buffer.from(toBuf(key));
+    const toJwkDer = (parts, isPrivate, label) => {
+      try { return Buffer.from(AN.jwkImport(parts, !!isPrivate)); }
+      catch (e) { throw rawInvalidValue("Invalid raw key data for " + label); }
+    };
+    if (type === "ec") {
+      const nc = opts.namedCurve;
+      if (typeof nc !== "string") {
+        const e = new TypeError('The "namedCurve" argument must be of type string. Received ' +
+          (nc === null ? "null" : typeof nc));
+        e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+      }
+      const osslCurve = EC_NIST_ALIAS[nc] || nc;
+      let valid = false;
+      try { valid = !!AN.ecValidCurve(osslCurve); } catch (e) { valid = false; }
+      if (!valid) throw rawInvalidCurve(nc);
+      const jwkCrv = JWK_EC_CURVES[osslCurve];
+      if (!jwkCrv) throw rawInvalidCurve(nc);
+      if (fmt === "raw-public") {
+        // Round-tripping the point through the native converter is what rejects a
+        // truncated point, a point of the wrong curve's width, and a well-formed
+        // prefix whose coordinates are not on the curve.
+        let unc;
+        try { unc = Buffer.from(AN.ecdhConvertKey(osslCurve, bytes, false)); }
+        catch (e) { throw rawInvalidValue("Invalid raw-public key data for curve " + nc); }
+        const half = (unc.length - 1) / 2;
+        return toJwkDer({ kty: "EC", crv: jwkCrv, x: unc.subarray(1, 1 + half), y: unc.subarray(1 + half) },
+                        false, nc);
+      }
+      // raw-private is a fixed-width scalar. Deriving the point also tells us the
+      // curve's field width, and the width check is what stops a P-256 scalar from
+      // being silently accepted as a (numerically smaller) P-384 one.
+      let unc;
+      try { unc = Buffer.from(AN.ecdhPublicFromPrivate(osslCurve, bytes)); }
+      catch (e) { throw rawInvalidValue("Invalid raw-private key data for curve " + nc); }
+      const half = (unc.length - 1) / 2;
+      if (bytes.length !== half) throw rawInvalidValue("Invalid raw-private key data for curve " + nc);
+      return toJwkDer({ kty: "EC", crv: jwkCrv, x: unc.subarray(1, 1 + half), y: unc.subarray(1 + half), d: bytes },
+                      true, nc);
+    }
+    const crv = OKP_JWK_CRV[type];
+    const parts = fmt === "raw-public" ? { kty: "OKP", crv, x: bytes } : { kty: "OKP", crv, d: bytes };
+    return toJwkDer(parts, fmt !== "raw-public", type);
   };
 
   // ---- KeyObject / createPublicKey / createPrivateKey ----
@@ -413,7 +708,25 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   };
   class KeyObject {
     constructor(brand, kind, material, passphrase) {
-      if (brand !== kKObrand) throw new TypeError("Illegal constructor");
+      if (brand !== kKObrand) {
+        // Reached only from user code, where the signature is node's public
+        // `new KeyObject(type, handle)`: the type is validated first, then the
+        // native handle — which is not constructible from JS, so this always
+        // ends in one of the two errors below.
+        // ref: node lib/internal/crypto/keys.js class KeyObject.
+        const type = brand, handle = kind;
+        if (type !== "secret" && type !== "public" && type !== "private") {
+          const e = new TypeError("The argument 'type' is invalid. Received " +
+            (typeof type === "string" ? "'" + type + "'" : String(type)));
+          e.code = "ERR_INVALID_ARG_VALUE"; throw e;
+        }
+        const e = new TypeError('The "handle" argument must be of type object. Received ' +
+          (handle === null ? "null" : handle === undefined ? "undefined"
+            : typeof handle === "string" ? "type string ('" + handle + "')"
+            : typeof handle === "object" ? "an instance of " + ((handle.constructor && handle.constructor.name) || "Object")
+            : "type " + typeof handle + " (" + String(handle) + ")"));
+        e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+      }
       // node's three concrete classes: SecretKeyObject and Public/PrivateKeyObject
       // (both under AsymmetricKeyObject), each owning the accessors that only
       // make sense for it. Constructing through the base and re-pointing the
@@ -433,6 +746,11 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
       const slot = koOf(this);
       // Secret keys: options are optional and default to a Buffer copy.
       if (slot.kind === "secret") {
+        // A symmetric key has no public/private/seed half, so a raw format is a
+        // bad option value rather than an unsupported key type.
+        if (options != null && typeof options === "object" && RAW_FORMATS[options.format]) {
+          throw rawInvalidValue("The property 'options.format' is invalid. Received '" + options.format + "'");
+        }
         if (options != null && typeof options === "object" && options.format === "jwk") {
           return { kty: "oct", k: Buffer.from(toBuf(slot.material)).toString("base64url") };
         }
@@ -444,6 +762,18 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
           (options === null ? "null" : typeof options));
         e.code = "ERR_INVALID_ARG_TYPE"; throw e;
       }
+      // The raw formats are not containers either: resolve the key's type first,
+      // because a type with no raw form (RSA/DSA/DH) must be reported as such and
+      // never reaches the JWK encoder — DSA has no JWK representation at all.
+      if (RAW_FORMATS[options.format]) {
+        const isPublic = slot.kind === "public";
+        let keyType, osslCurve, jwk;
+        try { const info = AN.keyType(slot.material, slot.passphrase, isPublic);
+              keyType = info.type; osslCurve = info.namedCurve; }
+        catch (e) { throw asymParseError(this, e, isPublic); }
+        if (RAW_KEY_TYPES[keyType]) jwk = jwkFromKey(slot.material, slot.passphrase, isPublic);
+        return rawExport(slot.kind, keyType, osslCurve, jwk, options);
+      }
       // format:"jwk" is NOT a PEM/DER encoding — it returns a plain JWK object and
       // cannot carry encryption (cipher/passphrase).
       if (options.format === "jwk") {
@@ -451,10 +781,45 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
           const e = new Error("The selected key encoding jwk does not support encryption.");
           e.code = "ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS"; throw e;
         }
-        return jwkFromKey(slot.material, slot.passphrase, slot.kind === "public");
+        const isPublic = slot.kind === "public";
+        // Resolve the key's type before encoding: an RSA-PSS key would otherwise
+        // serialize as a plain "RSA" JWK, losing exactly the parameters that make
+        // it an RSA-PSS key, and DSA would surface an OpenSSL message with no code.
+        let keyType;
+        try { keyType = AN.keyType(slot.material, slot.passphrase, isPublic).type; }
+        catch (e) { throw asymParseError(this, e, isPublic); }
+        if (!JWK_EXPORTABLE[keyType]) throw jwkUnsupportedType();
+        return jwkFromKey(slot.material, slot.passphrase, isPublic);
       }
       const type = options.type || (slot.kind === "public" ? "spki" : "pkcs8");
       const format = options.format || "pem";
+      // The encoding set is per key kind, so asking a PUBLIC key for a private
+      // container (pkcs8/sec1) is a bad option value rather than an OpenSSL
+      // failure — which is what stops a derived public key from being asked to
+      // hand back private material. ref: node lib/internal/crypto/keys.js
+      // parsePublicKeyEncoding/parsePrivateKeyEncoding.
+      const allowedTypes = slot.kind === "public" ? ["spki", "pkcs1"] : ["pkcs8", "pkcs1", "sec1"];
+      if (allowedTypes.indexOf(type) === -1) {
+        const e = new TypeError("The property 'options.type' is invalid. Received " +
+          (typeof type === "string" ? "'" + type + "'" : String(type)));
+        e.code = "ERR_INVALID_ARG_VALUE"; throw e;
+      }
+      // pkcs1 and sec1 are algorithm-specific containers, not general ones. An
+      // RSA-PSS key written as a PKCS#1 RSAPublicKey would silently shed the
+      // RSASSA-PSS-params that are the whole point of the key, so node calls the
+      // request incompatible rather than letting the encoder produce a lie.
+      // ref: node lib/internal/crypto/keys.js parseKeyType.
+      if (type === "pkcs1" || type === "sec1") {
+        const want = type === "pkcs1" ? "rsa" : "ec";
+        let kt;
+        try { kt = AN.keyType(slot.material, slot.passphrase, slot.kind === "public").type; }
+        catch (e) { throw asymParseError(this, e, slot.kind === "public"); }
+        if (kt !== want) {
+          const e = new Error("The selected key encoding " + type + " can only be used for " +
+            want.toUpperCase() + " keys.");
+          e.code = "ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS"; throw e;
+        }
+      }
       // Encrypting a private key requires a cipher; a passphrase alone throws.
       if (slot.kind === "private" && options.passphrase != null && options.cipher == null) {
         const e = new TypeError("The property 'options.cipher' is invalid. Received undefined");
@@ -500,7 +865,7 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
         : !!(G.CryptoKey && key instanceof G.CryptoKey);
       if (!isCryptoKey) {
         const e = new TypeError('The "key" argument must be an instance of CryptoKey. Received ' +
-          (key === null ? "null" : typeof key));
+          argRecv(key));
         e.code = "ERR_INVALID_ARG_TYPE"; throw e;
       }
       // Bridge into a node KeyObject via the WebCrypto raw export, when reachable.
@@ -572,11 +937,33 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
       return slot && { kind: slot.kind, material: slot.material, passphrase: slot.passphrase };
     },
   });
+  // structuredClone re-mints the key instead of copying it. A KeyObject carries
+  // NO own properties — the whole record lives in koSlots — so a generic
+  // property copy produces something that is `instanceof KeyObject` with an
+  // empty slot: util.types.isKeyObject() says false and every accessor throws
+  // ERR_INVALID_THIS. Rebuilding through the brand gives the clone the same
+  // unforgeable record, which is what node's kClone/kDeserialize pair does.
+  G.__mbunKeyObjectClone = (key) => {
+    const slot = koSlots.get(key);
+    return slot ? mkKO(slot.kind, slot.material, slot.passphrase) : undefined;
+  };
   const makeKeyObject = (kind, key) => {
     if (isKO(key)) return key;
+    // { key: <bytes>, format: "raw-*", asymmetricKeyType, namedCurve } — rebuild
+    // real key material from the bare point/scalar before the normal pipeline.
+    if (key != null && typeof key === "object" && RAW_FORMATS[key.format]) {
+      const der = rawImport(kind, key);
+      // A raw PRIVATE encoding handed to createPublicKey yields the public half,
+      // exactly as passing a private KeyObject would.
+      if (kind === "public" && key.format !== "raw-public") {
+        return mkKO("public", Buffer.from(AN.keyExport(der, "", true, "spki", "der", "", "")), "");
+      }
+      return mkKO(kind, der, "");
+    }
     // { key: <JWK object>, format: "jwk" } → materialize as DER up front so the
     // rest of the pipeline sees ordinary key material (node keys.js).
-    if (key != null && typeof key === "object" && key.format === "jwk" && key.key != null) {
+    if (key != null && typeof key === "object" && key.format === "jwk") {
+      requireJwkObject(key.key, "key.key");
       return mkKO(kind, jwkToDer(key.key, kind === "private"), "");
     }
     const r = resolveKey(key);
@@ -587,7 +974,37 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   // (has a "-----BEGIN" header) keeps the native/passphrase error; binary DER that
   // starts with a SEQUENCE tag (0x30) is a decode failure; anything else has no
   // PEM start line.
-  const asymParseError = (ko, nativeErr) => {
+  // node validates a key descriptor's `format`/`type` BEFORE handing the bytes to
+  // any loader, so a bad descriptor is an ERR_INVALID_ARG_VALUE naming the member,
+  // never an OpenSSL decode error about the bytes. The type table is asymmetric on
+  // purpose: createPrivateKey passes isPublic=false and so rejects 'spki', while
+  // createPublicKey passes isPublic=undefined and accepts every container name,
+  // because a private container is a legitimate source for a public key.
+  // ref: node lib/internal/crypto/keys.js parseKeyFormat / parseKeyType.
+  // The property path is spelled `options.*`, not node 26's `key.*`: both corpora
+  // pin it and they disagree (compat/bun/.../parallel/test-crypto-key-objects.js
+  // wants `options.type`, compat/node/.../test-crypto-key-objects.js wants
+  // `key.type`), and only the bun copy can actually reach green — the node copy is
+  // blocked on two other same-binary conflicts recorded in struck.tsv.
+  const INPUT_KEY_FORMATS = new Set(["pem", "der", "jwk", "raw-public", "raw-private", "raw-seed"]);
+  const inputInvalid = (path, v) => {
+    const e = new TypeError("The property 'options." + path + "' is invalid. Received " +
+      (typeof v === "string" ? "'" + v + "'" : String(v)));
+    e.code = "ERR_INVALID_ARG_VALUE"; return e;
+  };
+  const checkInputEncoding = (v, isPrivate) => {
+    if (v === null || typeof v !== "object" || isKO(v) || !("key" in v)) return;
+    if (v.format !== undefined && !INPUT_KEY_FORMATS.has(v.format)) {
+      throw inputInvalid("format", v.format);
+    }
+    // The raw encodings carry their own `type` vocabulary (compressed /
+    // uncompressed point form), validated where they are decoded.
+    if (v.type === undefined || RAW_FORMATS[v.format]) return;
+    const ok = v.type === "pkcs1" || v.type === "pkcs8" || v.type === "sec1" ||
+               (v.type === "spki" && !isPrivate);
+    if (!ok) throw inputInvalid("type", v.type);
+  };
+  const asymParseError = (ko, nativeErr, wantPublic) => {
     // A failure the native layer already classified (missing passphrase / an
     // OpenSSL error) keeps that classification whatever the container looked like.
     const classified = keyErr(nativeErr);
@@ -596,7 +1013,36 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     const isStr = typeof slot.material === "string";
     const bytes = toBuf(slot.material);
     const head = isStr ? slot.material.slice(0, 64) : Buffer.from(bytes.slice(0, 64)).toString("latin1");
-    if (head.includes("-----BEGIN")) return keyErr(nativeErr); // surface native parse/passphrase error
+    if (head.includes("-----BEGIN")) {
+      const surfaced = keyErr(nativeErr);
+      // A well-formed PEM container the loader still could not turn into a pkey
+      // (unknown algorithm OID — ML-DSA/ML-KEM/SLH-DSA on an OpenSSL < 3.5 — or a
+      // corrupt body) reaches here with a bare mbun message and no .code. node
+      // reports the two OpenSSL failures its own loaders hit for that input:
+      // createPublicKey goes through PEM_read_bio_PUBKEY (EVP "decode error"),
+      // createPrivateKey through OSSL_DECODER ("unsupported"). Keep the original
+      // message and only attach the surface node exposes.
+      if (surfaced && surfaced.code === undefined) {
+        surfaced.code = wantPublic ? "ERR_OSSL_EVP_DECODE_ERROR" : "ERR_OSSL_UNSUPPORTED";
+        surfaced.reason = wantPublic ? "decode error" : "unsupported";
+        surfaced.library = wantPublic ? "digital envelope routines" : "DECODER routines";
+      }
+      return surfaced;
+    }
+    // createPrivateKey has ONE loader on OpenSSL 3: OSSL_DECODER. It is fed the
+    // bytes whatever they look like — empty string, DER that is really a public
+    // key, junk — and every refusal comes back as the same generic "unsupported",
+    // because the decoder cannot say which of its candidate structures the input
+    // failed to be. The PEM-specific "no start line" is a legacy-loader error node
+    // only reports on OpenSSL 1.x / BoringSSL, which this build is not.
+    // ref: node test/parallel/test-crypto-key-objects.js (hasOpenSSL3 arms).
+    if (!wantPublic) {
+      const e = new Error("error:1E08010C:DECODER routines::unsupported");
+      e.code = "ERR_OSSL_UNSUPPORTED";
+      e.reason = "unsupported";
+      e.library = "DECODER routines";
+      return e;
+    }
     if (!isStr && bytes.length > 0 && bytes[0] === 0x30) {
       const e = new Error("error:06000066:public key routines:OPENSSL_internal:DECODE_ERROR");
       e.code = "ERR_OSSL_UNSUPPORTED"; return e;
@@ -612,6 +1058,7 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
         "ArrayBuffer, Buffer, TypedArray, DataView, Object, or CryptoKey. Received an instance of KeyObject");
       e.code = "ERR_INVALID_ARG_TYPE"; throw e;
     }
+    checkInputEncoding(key, true);
     const ko = makeKeyObject("private", key);
     // node/bun validate the material at construction: non-key input throws
     // ERR_OSSL_NO_START_LINE (bun 1.4.0 verified). jsonwebtoken's sign()
@@ -621,10 +1068,39 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
       const slot = koOf(ko);
       info = AN.keyType(slot.material, slot.passphrase, false);
     } catch (e) {
-      throw asymParseError(ko, e);
+      const err = asymParseError(ko, e, false);
+      // LEGACY (PKCS#1/SEC1) encrypted PEM with no passphrase is node's
+      // NEED_PASSPHRASE case: ncrypto's TryParsePrivateKey (deps/ncrypto/
+      // ncrypto.cc) routes `createPrivateKey` through PEM_read_bio_PrivateKey and
+      // maps PEM_R_BAD_PASSWORD_READ to ERR_MISSING_PASSPHRASE, which is the
+      // surface bun reports too (regression/issue/27445). PKCS#8
+      // "BEGIN ENCRYPTED PRIVATE KEY" is NOT this case — it decodes through
+      // OSSL_DECODER, whose refusal is the CRYPTO "interrupted or cancelled"
+      // error that node's own test/parallel/test-crypto-key-objects.js pins for
+      // `dsa_private_encrypted_1025.pem`. The scope is deliberately just this
+      // constructor: sign/verify keep the OpenSSL wording that
+      // test-crypto-keygen-async-*-encrypted.js assert on their sec1 keys.
+      if (err && err.code !== "ERR_MISSING_PASSPHRASE") {
+        const slot = koOf(ko);
+        if (slot.passphrase === undefined || slot.passphrase === null) {
+          const head = typeof slot.material === "string"
+            ? slot.material.slice(0, 256)
+            : Buffer.from(toBuf(slot.material).slice(0, 256)).toString("latin1");
+          if (head.includes("Proc-Type: 4,ENCRYPTED") || head.includes("Proc-Type:4,ENCRYPTED")) {
+            const t = new TypeError("Passphrase required for encrypted key");
+            t.code = "ERR_MISSING_PASSPHRASE"; throw t;
+          }
+        }
+      }
+      throw err;
     }
     // The loader is intent-agnostic: it will parse public-only material (e.g. a
     // PKCS#1 RSAPublicKey) as a pkey. node rejects that with a decode error.
+    // NOT the OpenSSL-3 "DECODER routines::unsupported" node reports here, even
+    // though this build IS OpenSSL 3: compat/bun/test/js/node/crypto/
+    // crypto.key-objects.test.ts:343 pins the BoringSSL spelling for the very same
+    // call and is green (85/0), so the two corpora demand different strings from
+    // one binary with no discriminator between them. Recorded in struck.tsv.
     if (info && info.private === false) {
       const e = new Error("error:06000066:public key routines:OPENSSL_internal:DECODE_ERROR");
       e.code = "ERR_OSSL_UNSUPPORTED"; throw e;
@@ -643,6 +1119,7 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
       const e = new TypeError("Invalid key object type " + slot.kind + ", expected private.");
       e.code = "ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE"; throw e;
     }
+    checkInputEncoding(key, false);
     const ko = makeKeyObject("public", key);
     // Same construction-time validation as createPrivateKey: jsonwebtoken's
     // verify() relies on the throw to fall back to createSecretKey for HS*
@@ -660,7 +1137,7 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
           ? slot.material.slice(0, 64)
           : Buffer.from(toBuf(slot.material).slice(0, 64)).toString("latin1");
         if (head.includes("-----BEGIN CERTIFICATE")) return ko;
-        throw asymParseError(ko, ePub);
+        throw asymParseError(ko, ePub, true);
       }
     }
     return ko;
@@ -746,6 +1223,36 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     options = options || {};
     const penc = options.publicKeyEncoding || {};
     const senc = options.privateKeyEncoding || {};
+    // A raw encoding has no container for the generator to emit, so generate the
+    // pair as key objects and let the raw encoder do the work. Validation of the
+    // encoding pair happens first, so a bad combination throws before keygen.
+    const pubRawEnc = options.publicKeyEncoding && RAW_FORMATS[penc.format] ? penc : null;
+    const privRawEnc = options.privateKeyEncoding && RAW_FORMATS[senc.format] ? senc : null;
+    if (pubRawEnc || privRawEnc) {
+      // Only the public half can be emitted as raw-public, and only the private
+      // half as raw-private/raw-seed.
+      if (pubRawEnc && pubRawEnc.format !== "raw-public") {
+        throw rawInvalidValue("The property 'options.publicKeyEncoding.format' is invalid. Received '" +
+          pubRawEnc.format + "'");
+      }
+      if (privRawEnc && privRawEnc.format === "raw-public") {
+        throw rawInvalidValue("The property 'options.privateKeyEncoding.format' is invalid. Received 'raw-public'");
+      }
+      if (privRawEnc && (privRawEnc.cipher != null || privRawEnc.passphrase != null)) {
+        const e = new Error("The selected key encoding " + privRawEnc.format + " does not support encryption.");
+        e.code = "ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS"; throw e;
+      }
+      if (!RAW_KEY_TYPES[type]) throw rawIncompat(pubRawEnc ? pubRawEnc.format : privRawEnc.format);
+      if (privRawEnc && privRawEnc.format === "raw-seed") throw rawIncompat("raw-seed");
+      const pair = genKeyPair(type, Object.assign({}, options, {
+        publicKeyEncoding: pubRawEnc ? undefined : options.publicKeyEncoding,
+        privateKeyEncoding: privRawEnc ? undefined : options.privateKeyEncoding,
+      }));
+      return {
+        publicKey: pubRawEnc ? pair.publicKey.export(pubRawEnc) : pair.publicKey,
+        privateKey: privRawEnc ? pair.privateKey.export(privRawEnc) : pair.privateKey,
+      };
+    }
     const wantPubObj = !options.publicKeyEncoding;
     const wantPrivObj = !options.privateKeyEncoding;
     // format:"jwk" is not a PEM/DER encoding: node emits a plain JWK object and
@@ -800,8 +1307,11 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     const opts = typeof options === "function" ? undefined : options;
     validateKeyPairType(type);   // synchronous type validation (node throws before async work)
     queueMicrotask(() => {
-      try { const { publicKey, privateKey } = genKeyPair(type, opts); cb(null, publicKey, privateKey); }
-      catch (e) { cb(e); }
+      // Guard only the generation: a `throw` from inside cb() must escape to the
+      // uncaught handler, never come back as a second cb(e) call.
+      let pair;
+      try { pair = genKeyPair(type, opts); } catch (e) { cb(e); return; }
+      cb(null, pair.publicKey, pair.privateKey);
     });
   };
   C.generateKeyPair[Symbol.for("nodejs.util.promisify.custom")] =
@@ -884,6 +1394,14 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
       const prefix = lib === "SSL" ? "" : "OSSL_";
       e.code = "ERR_" + prefix + (lib ? lib + "_" : "") +
         reason.toUpperCase().replaceAll(" ", "_");
+      // node's ThrowCryptoError uses the OpenSSL string VERBATIM as the message;
+      // our native layer prepends a call-site tag ("sign failed: ", "sign init
+      // failed: ", "decryption failed: ") that node never has. Once the error is
+      // recognisably an OpenSSL one, drop the tag — the corpus compares this
+      // message literally (`error:1C8000A5:Provider routines::illegal or
+      // unsupported padding mode`, `error:02000070:rsa routines::digest too big
+      // for rsa key`), and the tag was the whole difference.
+      if (hit[0] !== m) e.message = hit[0];
     }
     return e;
   };
@@ -1074,10 +1592,30 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
 
   // ---- ECDH ----
   const CURVE_NIDS = { secp256k1: "secp256k1", prime256v1: "prime256v1", secp384r1: "secp384r1", secp521r1: "secp521r1" };
+  // Group orders (n) for the curves we expose. OpenSSL rejects a private scalar
+  // outside (0, n) in EC_KEY_set_private_key/EC_KEY_check_key; the native bridge
+  // happily derives the point at infinity instead, so the range test lives here.
+  const CURVE_ORDER = {
+    secp256k1: BigInt("0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141"),
+    prime256v1: BigInt("0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551"),
+    secp384r1: BigInt("0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFC7634D81F4372DDF" +
+                      "581A0DB248B0A77AECEC196ACCC52973"),
+    secp521r1: BigInt("0x01FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF" +
+                      "FFFA51868783BF2F966B7FCC0148F709A5D03BB5C9B8899C47AEBB6FB71E91386409"),
+  };
+  const ecdhCurveArg = (curve) => {
+    // node's ECDH/convertKey both begin with validateString(curve, 'curve'), so a
+    // missing curve is an argument-type error BEFORE the name is looked up.
+    if (typeof curve !== "string") {
+      const e = new TypeError('The "curve" argument must be of type string. Received ' + argRecv(curve));
+      e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+    }
+  };
   // ECDH is a node constructor callable WITHOUT `new` (function form + guard).
   function ECDH(curve) {
     if (!(this instanceof ECDH)) return new ECDH(curve);
-    if (typeof curve !== "string" || !AN.ecValidCurve(curve)) {
+    ecdhCurveArg(curve);
+    if (!AN.ecValidCurve(curve)) {
       throw new TypeError("Invalid EC curve name: " + curve);
     }
     this._curve = curve; this._priv = null; this._pub = null;
@@ -1090,13 +1628,32 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   };
   ECDH.prototype.computeSecret = function (otherPublic, inputEnc, outputEnc) {
     const pub = typeof otherPublic === "string" ? Buffer.from(otherPublic, inputEnc) : toBuf(otherPublic);
-    const sec = Buffer.from(AN.ecdhComputeSecret(this._curve, this._priv, pub));
+    // node derives through EC_KEY_check_key first: a public key that setPublicKey
+    // desynchronised from the private scalar is "Invalid key pair", and only then
+    // is the PEER point rejected as off-curve.
+    // ref: node src/crypto/crypto_ec.cc ECDH::ComputeSecret.
+    if (this._priv != null && this._pub != null) {
+      let derived;
+      try { derived = Buffer.from(AN.ecdhPublicFromPrivate(this._curve, this._priv)); } catch { derived = null; }
+      if (derived && Buffer.compare(derived, Buffer.from(this._pub)) !== 0) {
+        throw new Error("Invalid key pair");
+      }
+    }
+    let sec;
+    try { sec = Buffer.from(AN.ecdhComputeSecret(this._curve, this._priv, pub)); }
+    catch {
+      const e = new Error("Public key is not valid for specified curve");
+      e.code = "ERR_CRYPTO_ECDH_INVALID_PUBLIC_KEY"; throw e;
+    }
     return (outputEnc && outputEnc !== "buffer") ? sec.toString(outputEnc) : sec;
   };
   ECDH.prototype.getPublicKey = function (encoding, format) {
     if (format !== undefined && format !== "compressed" && format !== "uncompressed" && format !== "hybrid") {
       const e = new TypeError("Invalid ECDH format: " + format); e.code = "ERR_CRYPTO_ECDH_INVALID_FORMAT"; throw e;
     }
+    // An ECDH that has neither generated nor been given a key has no point to
+    // encode; node reports that as a plain Error, not a conversion failure.
+    if (this._pub == null) throw new Error("Failed to get ECDH public key");
     let pub;
     if (format === "compressed") pub = Buffer.from(AN.ecdhConvertKey(this._curve, this._pub, true));
     else {
@@ -1106,9 +1663,38 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     }
     return (encoding && encoding !== "buffer") ? pub.toString(encoding) : Buffer.from(pub);
   };
-  ECDH.prototype.getPrivateKey = function (encoding) { return (encoding && encoding !== "buffer") ? this._priv.toString(encoding) : Buffer.from(this._priv); };
-  ECDH.prototype.setPrivateKey = function (key, encoding) { this._priv = typeof key === "string" ? Buffer.from(key, encoding) : toBuf(key); this._pub = Buffer.from(AN.ecdhPublicFromPrivate(this._curve, this._priv)); return this; };
-  ECDH.prototype.setPublicKey = function (key, encoding) { this._pub = typeof key === "string" ? Buffer.from(key, encoding) : toBuf(key); return this; };
+  ECDH.prototype.getPrivateKey = function (encoding) {
+    if (this._priv == null) throw new Error("Failed to get ECDH private key");
+    return (encoding && encoding !== "buffer") ? this._priv.toString(encoding) : Buffer.from(this._priv);
+  };
+  ECDH.prototype.setPrivateKey = function (key, encoding) {
+    const priv = typeof key === "string" ? Buffer.from(key, encoding) : toBuf(key);
+    // Reject a scalar outside (0, n) before touching state: node leaves the
+    // object unchanged when EC_KEY_set_private_key fails, and the corpus asserts
+    // the old key is still readable afterwards.
+    const order = CURVE_ORDER[this._curve];
+    if (order !== undefined) {
+      let n = 0n;
+      for (let i = 0; i < priv.length; i++) n = (n << 8n) | BigInt(priv[i]);
+      if (n <= 0n || n >= order) throw new Error("Private key is not valid for specified curve");
+    }
+    let pub;
+    try { pub = Buffer.from(AN.ecdhPublicFromPrivate(this._curve, priv)); }
+    catch { throw new Error("Private key is not valid for specified curve"); }
+    this._priv = priv; this._pub = pub;
+    return this;
+  };
+  ECDH.prototype.setPublicKey = function (key, encoding) {
+    const raw = typeof key === "string" ? Buffer.from(key, encoding) : toBuf(key);
+    // node stores the point via EC_POINT_oct2point, which rejects anything that
+    // is not a point of THIS curve. Normalising to the uncompressed encoding also
+    // makes the key-pair check in computeSecret a plain byte comparison.
+    let pub;
+    try { pub = Buffer.from(AN.ecdhConvertKey(this._curve, raw, false)); }
+    catch { throw new Error("Failed to convert Buffer to EC_POINT"); }
+    this._pub = pub;
+    return this;
+  };
   // `setPublicKey()` is retained only for compatibility. Node's util.deprecate
   // wrapper warns once even when the underlying key validation then throws.
   const ecdhSetPublicKey = ECDH.prototype.setPublicKey;
@@ -1121,7 +1707,10 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     return ecdhSetPublicKey.call(this, key, encoding);
   };
   ECDH.convertKey = (key, curve, inputEnc, outputEnc, format) => {
-    // node diffiehellman.js convertKey validation order: encoding → curve → format.
+    // node diffiehellman.js convertKey validation order: validateString(curve) →
+    // key/encoding conversion → format → native (which is where the curve NAME is
+    // resolved). The arg-type check therefore precedes "Invalid EC curve name".
+    ecdhCurveArg(curve);
     let pt;
     if (typeof key === "string") {
       const enc = inputEnc || "utf8";
@@ -1131,14 +1720,22 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
         const e = new TypeError("The argument 'encoding' is invalid for data of length " + key.length + ". Received '" + enc + "'");
         e.code = "ERR_INVALID_ARG_VALUE"; throw e;
       }
+    } else if (key == null || !(isView(key) || key instanceof ArrayBuffer)) {
+      const e = new TypeError('The "key" argument must be of type string or an instance of ' +
+        "ArrayBuffer, Buffer, TypedArray, or DataView. Received " + argRecv(key));
+      e.code = "ERR_INVALID_ARG_TYPE"; throw e;
     } else pt = toBuf(key);
     if (typeof C.getCurves === "function" && C.getCurves().indexOf(curve) === -1) {
       const e = new TypeError("Invalid EC curve name"); e.code = "ERR_CRYPTO_INVALID_CURVE"; throw e;
     }
     if (format !== undefined && format !== "compressed" && format !== "uncompressed" && format !== "hybrid") {
-      const e = new Error("Invalid ECDH format: " + format); e.code = "ERR_CRYPTO_ECDH_INVALID_FORMAT"; throw e;
+      const e = new TypeError("Invalid ECDH format: " + format); e.code = "ERR_CRYPTO_ECDH_INVALID_FORMAT"; throw e;
     }
-    const out = Buffer.from(AN.ecdhConvertKey(curve, pt, format === "compressed"));
+    let out;
+    try { out = Buffer.from(AN.ecdhConvertKey(curve, pt, format === "compressed")); }
+    catch { throw new Error("Failed to convert Buffer to EC_POINT"); }
+    // hybrid point: uncompressed X||Y prefixed 0x06 (Y even) / 0x07 (Y odd).
+    if (format === "hybrid") { out = Buffer.from(out); out[0] = 0x06 | (out[out.length - 1] & 1); }
     return (outputEnc && outputEnc !== "buffer") ? out.toString(outputEnc) : out;
   };
   C.ECDH = ECDH;
@@ -1240,7 +1837,10 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     if (typeof primeArg === "number") { self._size = primeArg; self._p = null; }
     else { self._p = dhBufToBig(typeof primeArg === "string" ? Buffer.from(primeArg, primeEnc || undefined) : primeArg); self._size = 0; }
     if (genArg == null) self._g = 2n;
-    else if (typeof genArg === "number") self._g = BigInt(genArg);
+    // "Through a fluke of history, g=0 defaults to DH_GENERATOR (2)" — but only
+    // for the NUMBER overload; a zero-valued generator BUFFER is still rejected.
+    // ref: node test/parallel/test-crypto-dh.js.
+    else if (typeof genArg === "number") self._g = genArg === 0 ? 2n : BigInt(genArg);
     else if (typeof genArg === "string") self._g = dhBufToBig(Buffer.from(genArg, genEnc || "utf8"));
     else self._g = dhBufToBig(genArg);
     self._priv = null; self._pub = null;
@@ -1254,12 +1854,37 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     }
     const a = dhNormArgs(sizeOrKey, keyEncoding, generator, genEncoding);
     if (typeof a.generator === "number" && !Number.isInteger(a.generator)) { const e = new RangeError('The value of "generator" is out of range. It must be an integer. Received ' + a.generator); e.code = "ERR_OUT_OF_RANGE"; throw e; }
+    // node runs the generator through getArrayBufferOrView() when it is neither a
+    // number nor a string, so a boolean/symbol/object/array generator is an
+    // argument-type error and never reaches OpenSSL's bad-generator check.
+    if (a.generator != null && typeof a.generator !== "number" && typeof a.generator !== "string" &&
+        !isView(a.generator) && !(a.generator instanceof ArrayBuffer)) {
+      const e = new TypeError('The "generator" argument must be of type number or string or an instance of ' +
+        "ArrayBuffer, Buffer, TypedArray, or DataView. Received " + argRecv(a.generator));
+      e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+    }
+    // OpenSSL's DH_generate_parameters_ex refuses to build a modulus below
+    // DH_MIN_MODULUS_BITS (512); node surfaces that as ERR_OSSL_DH_MODULUS_TOO_SMALL
+    // rather than silently producing an unusable group.
+    if (typeof a.sizeOrKey === "number" && a.sizeOrKey < 512) {
+      const e = new Error("modulus too small"); e.code = "ERR_OSSL_DH_MODULUS_TOO_SMALL"; throw e;
+    }
     dhInit(this, a.sizeOrKey, a.keyEncoding, a.generator, a.genEncoding);
+    // DH_set0_pqg rejects a generator below 2 (0/1 make the shared secret
+    // constant), which is OpenSSL's DH_BAD_GENERATOR.
+    if (this._g < 2n) { const e = new Error("bad generator"); e.code = "ERR_OSSL_DH_BAD_GENERATOR"; throw e; }
   }
   // node's verifyError exposes DH_check() flags. We flag a too-small or composite
   // modulus as non-zero (matching node for bad user primes); ordinary probable
   // primes of DH size verify clean (0), so we don't require a safe prime here.
   const dhVerifyError = function () {
+    // node's native getter validates the receiver first: a foreign `this` must
+    // raise ERR_INVALID_THIS rather than read a missing field (or crash).
+    if (this == null || (!(this instanceof DiffieHellman) && !(this instanceof DiffieHellmanGroup))) {
+      const e = new TypeError('Value of "this" must be of type DiffieHellman');
+      e.code = "ERR_INVALID_THIS";
+      throw e;
+    }
     const p = this._p;
     if (p == null) return 0;
     const bits = dhBigToBuf(p).length * 8;
@@ -1276,7 +1901,7 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   function DiffieHellmanGroup(name) {
     if (!(this instanceof DiffieHellmanGroup)) return new DiffieHellmanGroup(name);
     const hex = MODP[String(name)];
-    if (!hex) { const e = new Error("Unknown group: " + name); e.code = "ERR_CRYPTO_UNKNOWN_DH_GROUP"; throw e; }
+    if (!hex) { const e = new Error("Unknown DH group"); e.code = "ERR_CRYPTO_UNKNOWN_DH_GROUP"; throw e; }
     this._p = dhBufToBig(Buffer.from(hex, "hex")); this._size = 0; this._g = 2n; this._priv = null; this._pub = null;
   }
   // A named group has no setters (node DiffieHellmanGroup).
@@ -1478,7 +2103,147 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     C.Certificate = Certificate;
   }
 
+  // ---- crypto.diffieHellman(options[, callback]) ----
+  // Stateless (EC)DH over two KeyObjects. Every kind check reads the
+  // unforgeable koSlots record, never the user-replaceable `type` /
+  // `asymmetricKeyType` accessors, which is the whole point of node's
+  // getKeyObjectType / getKeyObjectAsymmetricKeyType internals.
+  // ref: node lib/internal/crypto/diffiehellman.js diffieHellman().
+  const DH_KEY_TYPES = new Set(["dh", "ec", "x448", "x25519"]);
+  // node lib/internal/errors.js ERR_INVALID_ARG_TYPE "Received ..." tail.
+  const dhReceived = (v) => (v === null ? "null"
+    : v === undefined ? "undefined"
+    : typeof v === "object" ? "an instance of " + ((v.constructor && v.constructor.name) || "Object")
+    : "type " + typeof v + " (" + String(v) + ")");
+  const dhAsymType = (slot) => {
+    try { return AN.keyType(slot.material, slot.passphrase, slot.kind === "public").type; }
+    catch (e) { return undefined; }
+  };
+  // The shared secret itself. EC goes through the raw scalar/point primitive;
+  // X25519/X448 derive straight from the DER material (no scalar reaches JS).
+  const dhDerive = (privSlot, pubSlot) => {
+    if (dhAsymType(privSlot) === "ec") {
+      const meta = AN.keyType(privSlot.material, privSlot.passphrase, false);
+      const priv = AN.jwkExport(privSlot.material, privSlot.passphrase, false);
+      const peer = AN.jwkExport(pubSlot.material, pubSlot.passphrase, pubSlot.kind === "public");
+      // jwkExport hands back the affine coordinates; ecdhComputeSecret wants the
+      // uncompressed SEC1 point.
+      const point = Buffer.concat([Buffer.from([4]), toBuf(peer.x), toBuf(peer.y)]);
+      return Buffer.from(AN.ecdhComputeSecret(meta.namedCurve, toBuf(priv.d), point));
+    }
+    return Buffer.from(AN.okpDerive(privSlot.material, pubSlot.material));
+  };
+  const dhPrepare = (key, kind) => (isKO(key) ? koSlots.get(key)
+    : koSlots.get(kind === "private" ? C.createPrivateKey(key) : C.createPublicKey(key)));
+  // node threads an option NAME into preparePublicOrPrivateKey/preparePrivateKey
+  // ('options.publicKey' / 'options.privateKey'), so a bad `format` or `type` on
+  // the nested descriptor is reported as ERR_INVALID_ARG_VALUE naming the exact
+  // property path (keys.js parseKeyFormat / parseKeyType). Without this the bogus
+  // descriptor reached the decoder and surfaced as ERR_OSSL_NO_START_LINE.
+  const DH_KEY_FORMATS = new Set(["pem", "der", "jwk", "raw-public", "raw-private", "raw-seed"]);
+  const dhCheckEncoding = (v, objName, isPublic) => {
+    if (v === null || typeof v !== "object" || isKO(v) || !("key" in v)) return;
+    if (v.format !== undefined && !DH_KEY_FORMATS.has(v.format)) {
+      const e = new TypeError("The property '" + objName + ".format' is invalid. Received " +
+        (typeof v.format === "string" ? "'" + v.format + "'" : String(v.format)));
+      e.code = "ERR_INVALID_ARG_VALUE"; throw e;
+    }
+    if (v.type !== undefined) {
+      const ok = isPublic ? (v.type === "spki" || v.type === "pkcs1")
+                          : (v.type === "pkcs8" || v.type === "pkcs1" || v.type === "sec1");
+      if (!ok) {
+        const e = new TypeError("The property '" + objName + ".type' is invalid. Received " +
+          (typeof v.type === "string" ? "'" + v.type + "'" : String(v.type)));
+        e.code = "ERR_INVALID_ARG_VALUE"; throw e;
+      }
+    }
+  };
+  C.diffieHellman = function diffieHellman(options, callback) {
+    if (options === null || typeof options !== "object" || Array.isArray(options)) {
+      const e = new TypeError('The "options" argument must be of type object. Received ' + dhReceived(options));
+      e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+    }
+    if (callback !== undefined && typeof callback !== "function") {
+      const e = new TypeError('The "callback" argument must be of type function. Received ' + dhReceived(callback));
+      e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+    }
+    const { privateKey, publicKey } = options;
+    // node keeps these as ERR_INVALID_ARG_VALUE rather than letting the key
+    // preparation report a missing argument.
+    if (privateKey == null) {
+      const e = new TypeError("The property 'options.privateKey' is invalid. Received " + String(privateKey));
+      e.code = "ERR_INVALID_ARG_VALUE"; throw e;
+    }
+    if (publicKey == null) {
+      const e = new TypeError("The property 'options.publicKey' is invalid. Received " + String(publicKey));
+      e.code = "ERR_INVALID_ARG_VALUE"; throw e;
+    }
+    const privKO = isKO(privateKey) ? koSlots.get(privateKey) : undefined;
+    if (privKO !== undefined && privKO.kind !== "private") {
+      const e = new TypeError("Invalid key object type " + privKO.kind + ", expected private.");
+      e.code = "ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE"; throw e;
+    }
+    const pubKO = isKO(publicKey) ? koSlots.get(publicKey) : undefined;
+    if (pubKO !== undefined && pubKO.kind !== "public" && pubKO.kind !== "private") {
+      const e = new TypeError("Invalid key object type " + pubKO.kind + ", expected private or public.");
+      e.code = "ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE"; throw e;
+    }
+    if (privKO !== undefined && pubKO !== undefined) {
+      const a = dhAsymType(privKO), b = dhAsymType(pubKO);
+      if (a !== b || !DH_KEY_TYPES.has(a)) {
+        const e = new Error("Incompatible key types for Diffie-Hellman: " + a + " and " + b);
+        e.code = "ERR_CRYPTO_INCOMPATIBLE_KEY"; throw e;
+      }
+    }
+    // node prepares the PUBLIC key first, then the private one, so the property
+    // path a malformed descriptor reports follows that order.
+    dhCheckEncoding(publicKey, "options.publicKey", true);
+    dhCheckEncoding(privateKey, "options.privateKey", false);
+    let secret, failure;
+    try {
+      secret = dhDerive(dhPrepare(privateKey, "private"), dhPrepare(publicKey, "public"));
+    } catch (e) { failure = keyErr(e); }
+    if (callback === undefined) {
+      if (failure !== undefined) throw failure;
+      return secret;
+    }
+    queueMicrotask(() => (failure !== undefined ? callback(failure) : callback(null, secret)));
+    return undefined;
+  };
+
   // ---- X509Certificate ----
+  // Read a KeyObject's record without touching any user-replaceable accessor.
+  const keyObjectSlot = (v) => (isKO(v) ? koSlots.get(v) : undefined);
+  // Minimal DER tag/length reader — enough to walk a Certificate's three
+  // top-level fields. Returns absolute offsets into `buf`.
+  const derTLV = (buf, off) => {
+    const tag = buf[off];
+    let i = off + 1;
+    let len = buf[i++];
+    if ((len & 0x80) !== 0) {
+      const n = len & 0x7f;
+      len = 0;
+      for (let k = 0; k < n; k++) len = (len * 256) + buf[i++];
+    }
+    return { tag, len, start: off, contentStart: i, end: i + len };
+  };
+  // signatureAlgorithm OID (hex of the OID content bytes) → the digest node's
+  // crypto.verify needs. Ed25519/Ed448 carry the digest in the algorithm itself,
+  // so they pass a null digest.
+  const SIG_OID_DIGEST = {
+    "2a864886f70d010104": "md5",     // md5WithRSAEncryption
+    "2a864886f70d010105": "sha1",    // sha1WithRSAEncryption
+    "2a864886f70d01010b": "sha256",  // sha256WithRSAEncryption
+    "2a864886f70d01010c": "sha384",  // sha384WithRSAEncryption
+    "2a864886f70d01010d": "sha512",  // sha512WithRSAEncryption
+    "2a864886f70d01010e": "sha224",  // sha224WithRSAEncryption
+    "2a8648ce3d040301": "sha224",    // ecdsa-with-SHA224
+    "2a8648ce3d040302": "sha256",    // ecdsa-with-SHA256
+    "2a8648ce3d040303": "sha384",    // ecdsa-with-SHA384
+    "2a8648ce3d040304": "sha512",    // ecdsa-with-SHA512
+    "2b6570": null,                  // Ed25519
+    "2b6571": null,                  // Ed448
+  };
   const wildcardMatch = (host, pattern, allowWildcard) => {
     host = host.toLowerCase(); pattern = pattern.toLowerCase();
     if (host === pattern) return true;
@@ -1492,6 +2257,17 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   };
   class X509Certificate {
     constructor(input) {
+      // node internal/crypto/x509.js: a string is buffered, anything that is not
+      // then an ArrayBufferView is ERR_INVALID_ARG_TYPE. `null` reached the
+      // parser here and came back as a bare "Failed to parse X509 certificate",
+      // which is a parse error where node reports an argument-type error.
+      if (typeof input !== "string" && !isView(input) && !(input instanceof ArrayBuffer)) {
+        const e = new TypeError('The "buffer" argument must be of type string or an instance of Buffer, TypedArray, or DataView. Received ' +
+          (input === null ? "null" : input === undefined ? "undefined"
+            : typeof input === "object" ? "an instance of " + ((input.constructor && input.constructor.name) || "Object")
+            : "type " + typeof input + " (" + String(input) + ")"));
+        e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+      }
       this._input = toBuf(input);
       const p = AN.x509parse(this._input);
       this.subject = p.subject || undefined;
@@ -1552,6 +2328,59 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
       if (!(otherCert instanceof X509Certificate)) throw new TypeError("issuer must be a X509Certificate");
       return !!AN.x509checkIssued(this._raw, otherCert._raw);
     }
+    // X509_check_private_key: the certificate's SubjectPublicKeyInfo must be the
+    // public half of `privateKey`. Comparing the two SPKI encodings is the same
+    // test without a second native entry point. The kind comes from the
+    // unforgeable slot, never from the replaceable `type` accessor.
+    checkPrivateKey(privateKey) {
+      const slot = keyObjectSlot(privateKey);
+      if (slot === undefined) {
+        const e = new TypeError('The "privateKey" argument must be an instance of KeyObject.' +
+          " Received " + dhReceived(privateKey));
+        e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+      }
+      if (slot.kind !== "private") {
+        const e = new TypeError("Invalid key object type " + slot.kind + ", expected private.");
+        e.code = "ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE"; throw e;
+      }
+      if (!this._publicKeyPem) return false;
+      try {
+        const mine = Buffer.from(AN.keyExport(slot.material, slot.passphrase, true, "spki", "der", "", ""));
+        const certSlot = keyObjectSlot(C.createPublicKey(this._publicKeyPem));
+        const theirs = Buffer.from(AN.keyExport(certSlot.material, certSlot.passphrase, true, "spki", "der", "", ""));
+        return Buffer.compare(mine, theirs) === 0;
+      } catch (e) { return false; }
+    }
+    // X509_verify: check the certificate signature against an issuer public key.
+    // A Certificate is SEQUENCE { tbsCertificate, signatureAlgorithm, signature },
+    // so the three top-level TLVs give the signed bytes, the digest OID and the
+    // signature; the rest is an ordinary crypto.verify.
+    verify(publicKey) {
+      const slot = keyObjectSlot(publicKey);
+      if (slot === undefined) {
+        const e = new TypeError('The "publicKey" argument must be an instance of KeyObject.' +
+          " Received " + dhReceived(publicKey));
+        e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+      }
+      if (slot.kind !== "public") {
+        const e = new TypeError("Invalid key object type " + slot.kind + ", expected public.");
+        e.code = "ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE"; throw e;
+      }
+      try {
+        const raw = Buffer.from(this._raw);
+        const outer = derTLV(raw, 0);
+        const tbs = derTLV(raw, outer.contentStart);
+        const alg = derTLV(raw, tbs.end);
+        const oid = derTLV(raw, alg.contentStart);
+        const sig = derTLV(raw, alg.end);
+        if (oid.tag !== 0x06) return false;
+        const name = raw.slice(oid.contentStart, oid.end).toString("hex");
+        if (!Object.prototype.hasOwnProperty.call(SIG_OID_DIGEST, name)) return false;
+        // The signature is a BIT STRING; its first content byte is the unused-bit count.
+        return !!C.verify(SIG_OID_DIGEST[name], raw.slice(tbs.start, tbs.end), publicKey,
+                          raw.slice(sig.contentStart + 1, sig.end));
+      } catch (e) { return false; }
+    }
     toString() { return this._input.toString("utf8").includes("BEGIN") ? this._input.toString("utf8") : this._raw.toString("base64"); }
     toJSON() { return this.toString(); }
     toLegacyObject() { return { subject: this.subject, issuer: this.issuer, valid_from: this.validFrom, valid_to: this.validTo, fingerprint: this.fingerprint, fingerprint256: this.fingerprint256, serialNumber: this.serialNumber, subjectaltname: this.subjectAltName, modulus: this.modulus, bits: this.bits }; }
@@ -1574,11 +2403,15 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   // Sign and Verify are Writable-like in node.  The local implementation
   // already has write()/update(); provide the internal write hook as well so
   // its name and callback contract match the inherited stream surface.
+  // node's sig.js _write does NOT trap: `this.update(chunk, encoding); callback()`.
+  // Routing the argument error into callback(error) made a bad chunk look like an
+  // async stream failure, so `assert.throws(() => sign._write(1, 'utf8', cb))` saw
+  // no exception at all.
   Sign.prototype._write = function _write(chunk, encoding, callback) {
-    try { this.update(chunk, encoding); callback(); } catch (error) { callback(error); }
+    this.update(chunk, encoding); callback();
   };
   Verify.prototype._write = function _write(chunk, encoding, callback) {
-    try { this.update(chunk, encoding); callback(); } catch (error) { callback(error); }
+    this.update(chunk, encoding); callback();
   };
   nameMethods(Sign.prototype, ["update", "sign", "_write"]);
   nameMethods(Verify.prototype, ["update", "verify", "_write"]);

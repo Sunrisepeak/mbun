@@ -13,6 +13,11 @@
 // in the NODE_OPTIONS it was handed) wins and nothing is added.
 extern "C" char** environ;
 
+// Defined further down in this partition; spawnSync (above it) needs it to accept
+// a Buffer/TypedArray `input`, which crosses the boundary base64-encoded because
+// it may hold bytes that are not valid UTF-8.
+std::string b64_decode(std::string_view s);
+
 void permission_inject_child_env(std::vector<std::string>& env, bool& haveEnv,
                                  const std::vector<std::string>& argv) {
     if (!gPermission.enabled()) return;
@@ -131,6 +136,11 @@ JSValueRef cp_spawn_sync_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
         if (JSValueIsString(ctx, cwdV)) cwd = val_to_string(ctx, cwdV);
         JSValueRef inV{get_prop(ctx, opt, "input")};
         if (JSValueIsString(ctx, inV)) input = val_to_string(ctx, inV);
+        // node spawn_sync.cc takes `input` as raw bytes; a Buffer/TypedArray must
+        // reach the child unchanged, so the JS layer base64-encodes anything that
+        // is not already a string rather than round-tripping it through UTF-8.
+        JSValueRef inB64V{get_prop(ctx, opt, "inputB64")};
+        if (JSValueIsString(ctx, inB64V)) input = b64_decode(val_to_string(ctx, inB64V));
         JSValueRef envV{get_prop(ctx, opt, "env")};
         if (JSValueIsObject(ctx, envV)) {
             haveEnv = true;
@@ -226,7 +236,7 @@ JSValueRef cp_spawn_sync_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
             std::vector<char*> cenv;
             for (auto& e : envStr) cenv.push_back(const_cast<char*>(e.c_str()));
             cenv.push_back(nullptr);
-            execvpe(file.c_str(), cargv.data(), cenv.data());
+            mbun::platform::process::exec_path_env(file.c_str(), cargv.data(), cenv.data());
         } else {
             execvp(file.c_str(), cargv.data());
         }
@@ -495,7 +505,7 @@ std::string resolve_in_env_path(const std::string& file, const std::vector<std::
         cenv.push_back(nullptr);
         const std::string resolved{resolve_in_env_path(file, o.env)};
         if (!resolved.empty()) execve(resolved.c_str(), cargv.data(), cenv.data());
-        execvpe(file.c_str(), cargv.data(), cenv.data());
+        mbun::platform::process::exec_path_env(file.c_str(), cargv.data(), cenv.data());
     } else {
         execvp(file.c_str(), cargv.data());
     }
@@ -834,6 +844,25 @@ JSValueRef proc_kill_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t 
     }
 #endif
     return JSValueMakeBoolean(ctx, false);
+}
+
+// proc.killErrno(pid, sig) → 0 on success, or libuv's NEGATIVE errno on failure.
+// This is the contract node's process._kill has (lib/internal/process/per_thread.js
+// turns a non-zero return into `new ErrnoException(err, 'kill')`), and the
+// distinction from proc.kill above is not cosmetic: `process.kill(pid, 987)` has
+// to report EINVAL, which a boolean cannot express — the boolean version reported
+// every failure as ESRCH.
+JSValueRef proc_kill_errno_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                              const JSValueRef args[], JSValueRef*) {
+#if !defined(_WIN32)
+    if (argc > 0) {
+        const pid_t pid{static_cast<pid_t>(JSValueToNumber(ctx, args[0], nullptr))};
+        const int sig{argc > 1 ? static_cast<int>(JSValueToNumber(ctx, args[1], nullptr)) : SIGTERM};
+        if (kill(pid, sig) == 0) return JSValueMakeNumber(ctx, 0);
+        return JSValueMakeNumber(ctx, -errno);
+    }
+#endif
+    return JSValueMakeNumber(ctx, -EINVAL);
 }
 
 // ── POSIX signal delivery to JS listeners ──────────────────────────────────

@@ -1,11 +1,41 @@
 // mbun.core.io positioned descriptor I/O benchmark driver.
 // Usage: bench-core-io [minimum-round-ms] [rounds]. Output is one JSON line.
+#if defined(_WIN32)
+import std;
+
+int main() {
+    std::println(stderr,
+                 "bench-core-io: POSIX-only -- it times mbun.core.io against raw "
+                 "::pread/::pwrite, which Windows has no analogue for. Skipped.");
+    return 0;
+}
+#else
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+
+namespace bench_os {
+inline int open_fd(const char* path, int flags) { return ::open(path, flags); }
+inline int close_fd(int fd) { return ::close(fd); }
+inline void* aligned_alloc_bytes(std::size_t alignment, std::size_t size) {
+    return std::aligned_alloc(alignment, size);
+}
+inline void aligned_free_bytes(void* p) { std::free(p); }
+inline constexpr int kCloExec = O_CLOEXEC;
+}  // namespace bench_os
+
+// This driver's whole purpose is to time mbun.core.io AGAINST raw POSIX
+// positioned descriptor I/O -- ::pread/::pwrite on an fd from ::open. Windows has
+// no equivalent of that comparison: positioned I/O there is OVERLAPPED on a
+// HANDLE, and std::filesystem::path::c_str() is wchar_t*, so a "port" would mean
+// inventing a different benchmark and reporting its numbers under the same name.
+//
+// So the driver is POSIX-only and says so at runtime rather than being silently
+// absent or quietly measuring something else. The Windows CI probe reaches this
+// file before anything in the library; this is what lets it move past it.
 
 import std;
 import mbun.core.io;
@@ -28,7 +58,7 @@ public:
         : size_{size} {
         capacity_ = size == 0 ? 0 : ((size + alignment - 1) / alignment) * alignment;
         data_ =
-            size == 0 ? nullptr : static_cast<std::byte*>(std::aligned_alloc(alignment, capacity_));
+            size == 0 ? nullptr : static_cast<std::byte*>(bench_os::aligned_alloc_bytes(alignment, capacity_));
         if (size != 0 && data_ == nullptr) {
             throw std::bad_alloc{};
         }
@@ -46,7 +76,7 @@ public:
           capacity_{std::exchange(other.capacity_, 0)} {}
     AlignedBuffer& operator=(AlignedBuffer&& other) noexcept {
         if (this != &other) {
-            std::free(data_);
+            bench_os::aligned_free_bytes(data_);
             data_ = std::exchange(other.data_, nullptr);
             size_ = std::exchange(other.size_, 0);
             capacity_ = std::exchange(other.capacity_, 0);
@@ -54,7 +84,7 @@ public:
         return *this;
     }
     ~AlignedBuffer() {
-        std::free(data_);
+        bench_os::aligned_free_bytes(data_);
     }
     [[nodiscard]] std::byte* data() noexcept {
         return data_;
@@ -111,10 +141,10 @@ struct SizeState {
 
     ~SizeState() {
         if (rawReader >= 0) {
-            (void)::close(rawReader);
+            (void)bench_os::close_fd(rawReader);
         }
         if (rawWriter >= 0) {
-            (void)::close(rawWriter);
+            (void)bench_os::close_fd(rawWriter);
         }
     }
 };
@@ -160,8 +190,8 @@ SizeState make_state(const std::filesystem::path& directory, std::size_t size) {
     }
     state.reader = std::move(*reader);
     state.writer = std::move(*writer);
-    state.rawReader = ::open(input.c_str(), O_RDONLY | O_CLOEXEC);
-    state.rawWriter = ::open(output.c_str(), O_RDWR | O_CLOEXEC);
+    state.rawReader = bench_os::open_fd(input.c_str(), O_RDONLY | bench_os::kCloExec);
+    state.rawWriter = bench_os::open_fd(output.c_str(), O_RDWR | bench_os::kCloExec);
     if (state.rawReader < 0 || state.rawWriter < 0) {
         fail("open raw descriptors");
     }
@@ -315,3 +345,4 @@ int main(int argc, char* argv[]) {
     std::filesystem::remove_all(directory, error);
     return 0;
 }
+#endif  // !_WIN32

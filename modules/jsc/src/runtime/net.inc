@@ -20,6 +20,63 @@ void net_set_nonblock(int fd) {
     fcntl(fd, F_SETFL, fl | O_NONBLOCK);
 }
 
+// ── AF_UNIX addressing, including paths longer than sun_path ────────────────
+// sockaddr_un.sun_path is a fixed 108 bytes, which an ordinary socket path can
+// exceed: a deep TMPDIR plus a per-test fixture directory gets there without
+// anyone intending it. Refusing outright is wrong, because the socket is still
+// reachable — bun addresses it RELATIVE to an open directory fd instead, via
+// "/proc/self/fd/<dirfd>/<basename>", which is ~18 bytes of prefix no matter how
+// long the real directory is. The dirfd must stay open until after
+// bind()/connect() resolves that path, so ownership is handed to the caller.
+//
+// The fallback is not always available (a >107-byte BASENAME cannot be shortened
+// by any amount of directory indirection — node's test-net-pipe-with-long-path
+// uses a 10000-char one), so `error` still reports EINVAL for those. The code
+// string matters: js_net.cppm's codeOf() scrapes it out of the message.
+struct NetUnixAddr {
+    sockaddr_un addr{};
+    socklen_t len{0};
+    int dirFd{-1};  // caller closes after bind()/connect(); -1 = none needed
+    bool ok{false};
+    std::string error{};
+};
+
+NetUnixAddr net_unix_addr(const std::string& path) {
+    NetUnixAddr out{};
+    out.addr.sun_family = AF_UNIX;
+    constexpr auto cap{sizeof out.addr.sun_path};
+    const auto commit{[&out](const std::string& p) {
+        std::memcpy(out.addr.sun_path, p.data(), p.size());
+        out.len = static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + p.size() + 1);
+        out.ok = true;
+    }};
+    // Abstract-namespace sockets ("\0name") are length-limited too but carry no
+    // filesystem path to reopen, so they take the direct route or fail.
+    if (path.size() < cap) {
+        commit(path);
+        return out;
+    }
+#if defined(__linux__)
+    const auto slash{path.rfind('/')};
+    if (slash != std::string::npos && slash + 1 < path.size() && path.front() != '\0') {
+        const std::string dir{path.substr(0, slash)};
+        const std::string base{path.substr(slash + 1)};
+        const int dirFd{::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC)};
+        if (dirFd >= 0) {
+            const std::string viaProc{"/proc/self/fd/" + std::to_string(dirFd) + "/" + base};
+            if (viaProc.size() < cap) {
+                out.dirFd = dirFd;
+                commit(viaProc);
+                return out;
+            }
+            ::close(dirFd);
+        }
+    }
+#endif
+    out.error = "EINVAL: socket path too long (max " + std::to_string(cap - 1) + " bytes)";
+    return out;
+}
+
 // Per-fd TLS channel (T-TLS.3): memory-BIO engine from mbun.tls over the
 // vendored mbun.openssl ecosystem package (no host libssl). Once a fd is
 // wrapped, ALL its socket IO goes through the tls* callbacks below — the JS
@@ -171,25 +228,26 @@ JSValueRef netn_listen_unix_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::
     if (permission_deny_scope(ctx, exc, mbun::permission::Scope::Net, path))
         return JSValueMakeUndefined(ctx);
     if (path.empty()) return fs_throw(ctx, exc, "net.listenUnix: empty socket path");
-    sockaddr_un addr{};
-    addr.sun_family = AF_UNIX;
-    // sun_path is a fixed 108-byte field. Refuse rather than truncate: a silently
-    // shortened path would bind a socket the caller never asked for.
-    if (path.size() >= sizeof addr.sun_path) {
-        return fs_throw(ctx, exc, "net.listenUnix: socket path too long (max " +
-                                      std::to_string(sizeof addr.sun_path - 1) + " bytes)");
-    }
-    std::memcpy(addr.sun_path, path.data(), path.size());
+    // Never truncates: an over-long path is either re-addressed through a
+    // directory fd or refused outright (see net_unix_addr).
+    NetUnixAddr ua{net_unix_addr(path)};
+    if (!ua.ok) return fs_throw(ctx, exc, "net.listenUnix: " + ua.error);
     // bind() does NOT pre-unlink: Node/libuv (and bun) leave an existing socket
     // file alone so a stale/live path surfaces EADDRINUSE rather than silently
     // stealing it. close()/stop() unlinks the file it created (JS layer).
     const int fd{socket(AF_UNIX, SOCK_STREAM, 0)};
-    if (fd < 0) return fs_throw(ctx, exc, "net.listenUnix: socket() failed");
-    const auto alen{static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + path.size() + 1)};
-    if (bind(fd, reinterpret_cast<sockaddr*>(&addr), alen) != 0 || ::listen(fd, 128) != 0) {
+    if (fd < 0) {
+        if (ua.dirFd >= 0) close(ua.dirFd);
+        return fs_throw(ctx, exc, "net.listenUnix: socket() failed");
+    }
+    const bool bound{bind(fd, reinterpret_cast<sockaddr*>(&ua.addr), ua.len) == 0
+                     && ::listen(fd, 128) == 0};
+    const int bindErrno{errno};
+    if (ua.dirFd >= 0) close(ua.dirFd);  // path already resolved by bind()
+    if (!bound) {
         close(fd);
         return fs_throw(ctx, exc, std::string{"net.listenUnix: bind/listen failed ("} +
-                                      std::strerror(errno) + ")");
+                                      std::strerror(bindErrno) + ")");
     }
     net_set_nonblock(fd);
     net_fds().insert(fd);
@@ -346,19 +404,19 @@ JSValueRef netn_connect_unix_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std:
     if (permission_deny_scope(ctx, exc, mbun::permission::Scope::Net, path))
         return JSValueMakeUndefined(ctx);
     if (path.empty()) return fs_throw(ctx, exc, "net.connectUnix: empty socket path");
-    sockaddr_un addr{};
-    addr.sun_family = AF_UNIX;
-    if (path.size() >= sizeof addr.sun_path) {
-        return fs_throw(ctx, exc, "net.connectUnix: socket path too long (max " +
-                                      std::to_string(sizeof addr.sun_path - 1) + " bytes)");
-    }
-    std::memcpy(addr.sun_path, path.data(), path.size());
+    // Same directory-fd re-addressing as netn_listen_unix_cb: a long path that a
+    // server successfully bound must also be connectable.
+    NetUnixAddr ua{net_unix_addr(path)};
+    if (!ua.ok) return fs_throw(ctx, exc, "net.connectUnix: " + ua.error);
     const int fd{socket(AF_UNIX, SOCK_STREAM, 0)};
-    if (fd < 0) return fs_throw(ctx, exc, "net.connectUnix: socket() failed");
-    const auto alen{static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + path.size() + 1)};
+    if (fd < 0) {
+        if (ua.dirFd >= 0) close(ua.dirFd);
+        return fs_throw(ctx, exc, "net.connectUnix: socket() failed");
+    }
     int rc;
-    do { rc = connect(fd, reinterpret_cast<sockaddr*>(&addr), alen); }
+    do { rc = connect(fd, reinterpret_cast<sockaddr*>(&ua.addr), ua.len); }
     while (rc != 0 && errno == EINTR);
+    if (ua.dirFd >= 0) { const int keep{errno}; close(ua.dirFd); errno = keep; }
     if (rc != 0) {
         // The errno NAME, not a hard-coded ENOENT: connecting to a path that
         // exists but is not a socket is ECONNREFUSED (or ENOTSOCK), and one
@@ -561,6 +619,17 @@ JSValueRef netn_set_sockbuf_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::
     else if (fd >= 0 && which == 5) {
         (void)setsockopt(fd, IPPROTO_IP, IP_TOS, &size, sizeof size);
     }
+    // which == 6: SO_LINGER with a zero timeout, `size` = 0/1. This is the
+    // switch node's tcp_wrap handle.reset() throws before close(2): a lingering
+    // socket closed with l_onoff=1/l_linger=0 sends an RST instead of a FIN, so
+    // the peer's next read(2) fails with ECONNRESET rather than reporting EOF.
+    // Socket.prototype.resetAndDestroy is built on exactly that.
+    else if (fd >= 0 && which == 6) {
+        struct linger lg{};
+        lg.l_onoff = size > 0 ? 1 : 0;
+        lg.l_linger = 0;
+        (void)setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg, sizeof lg);
+    }
 #endif
     return JSValueMakeUndefined(ctx);
 }
@@ -759,6 +828,48 @@ JSValueRef netn_tls_wrap_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
     // and "" leave OpenSSL's own preference in place).
     if (argc > 18) { cfg.dhParams = fs_arg(ctx, argc, args, 18); }
     if (argc > 19) { cfg.ecdhCurve = fs_arg(ctx, argc, args, 19); }
+    // arg 20: caExtra — trust anchors ADDED to the store arg 6 / the platform
+    // default already established. Carries only the chain certificates found
+    // inside the caller's own `pfx` archive; see mbun::tls::Config::caExtra for
+    // why those cannot be routed through arg 6.
+    if (argc > 20) { cfg.caExtra = fs_arg(ctx, argc, args, 20); }
+    // arg 21: node's options.sigalgs, a colon-separated signature-algorithm list
+    // (SecureContext::SetSigalgs). Empty leaves OpenSSL's own list in place.
+    if (argc > 21) { cfg.sigalgs = fs_arg(ctx, argc, args, 21); }
+    // arg 22 (server): the per-servername credentials of tls.Server#addContext,
+    // flattened into one string because this bridge is positional strings only.
+    // Entries are separated by US (0x1f) and their four fields — name, cert PEM,
+    // key PEM, passphrase — by RS (0x1e). Both are control characters no PEM or
+    // DNS name can contain, so the encoding is unambiguous over exactly the
+    // inputs it accepts. A malformed entry is DROPPED rather than guessed at:
+    // presenting the wrong certificate for a name is worse than presenting the
+    // server's default one.
+    if (argc > 22) {
+        const std::string blob{fs_arg(ctx, argc, args, 22)};
+        std::size_t pos{0};
+        while (pos <= blob.size() && !blob.empty()) {
+            const std::size_t end{blob.find('\x1f', pos)};
+            const std::string entry{blob.substr(pos, end == std::string::npos
+                                                        ? std::string::npos
+                                                        : end - pos)};
+            if (!entry.empty()) {
+                std::vector<std::string> f;
+                std::size_t p{0};
+                for (;;) {
+                    const std::size_t e{entry.find('\x1e', p)};
+                    f.push_back(entry.substr(p, e == std::string::npos ? std::string::npos : e - p));
+                    if (e == std::string::npos) break;
+                    p = e + 1;
+                }
+                if (f.size() >= 3 && !f[0].empty() && !f[1].empty() && !f[2].empty()) {
+                    cfg.sniContexts.push_back(mbun::tls::Config::SniCredential{
+                        f[0], f[1], f[2], f.size() > 3 ? f[3] : std::string{}});
+                }
+            }
+            if (end == std::string::npos) break;
+            pos = end + 1;
+        }
+    }
     auto st{std::make_unique<NetTlsState>(
         isServer ? mbun::tls::TlsRole::server : mbun::tls::TlsRole::client, std::move(cfg))};
     if (!st->channel.valid()) {
@@ -927,6 +1038,26 @@ JSValueRef netn_tls_info_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
              make_string(ctx, est ? st.channel.cipher_standard_name() : std::string{}));
     set_prop(ctx, r, "servername", make_string(ctx, st.channel.peer_server_name()));
     set_prop(ctx, r, "authorized", JSValueMakeBoolean(ctx, est && st.channel.verify_ok()));
+    // socket.authorizationError — the X509_V_ERR_* the chain verification ended
+    // on, in node's spelling. Reported whatever rejectUnauthorized was: node
+    // records the code on the socket even when it admits the peer anyway, and a
+    // caller that asked for verification has already been refused by then.
+    {
+        const std::string vcode{st.channel.verify_error_code()};
+        if (est && !vcode.empty()) set_prop(ctx, r, "verifyError", make_string(ctx, vcode));
+    }
+    // getSharedSigalgs() — server side; the signature algorithms both peers
+    // offered. Empty before the handshake completes.
+    if (est) {
+        std::vector<std::string> sig{st.channel.shared_sigalgs()};
+        if (!sig.empty()) {
+            std::vector<JSValueRef> items;
+            items.reserve(sig.size());
+            for (const std::string& s : sig) items.push_back(make_string(ctx, s));
+            set_prop(ctx, r, "sharedSigalgs",
+                     JSObjectMakeArray(ctx, items.size(), items.data(), nullptr));
+        }
+    }
     set_prop(ctx, r, "alpnProtocol", make_string(ctx, est ? st.channel.alpn_protocol() : std::string{}));
     // node's TLSSocket.isSessionReused() — SSL_session_reused. Meaningful on
     // both roles: the client learns its offered session was accepted, the
@@ -963,6 +1094,24 @@ JSValueRef netn_tls_info_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
         if (!pfin.empty()) set_prop(ctx, r, "peerFinished", make_string(ctx, b64_encode(pfin.data(), pfin.size())));
     }
     return r;
+#endif
+}
+
+// net.tlsMaxSendFragment(fd, size) → bool. node's
+// TLSSocket.setMaxSendFragment(size) (SSL_set_max_send_fragment): caps the
+// PLAINTEXT carried by one TLS record. `false` is OpenSSL refusing the size
+// (outside its 512..16384 range), which node returns to the caller verbatim.
+JSValueRef netn_tls_max_send_fragment_cb(JSContextRef ctx, JSObjectRef, JSObjectRef,
+                                         std::size_t argc, const JSValueRef args[], JSValueRef*) {
+#if defined(_WIN32)
+    return JSValueMakeBoolean(ctx, false);
+#else
+    const int fd{argc > 0 ? static_cast<int>(JSValueToNumber(ctx, args[0], nullptr)) : -1};
+    const double size{argc > 1 ? JSValueToNumber(ctx, args[1], nullptr) : 0};
+    const auto found{net_tls().find(fd)};
+    if (found == net_tls().end() || !(size > 0)) return JSValueMakeBoolean(ctx, false);
+    return JSValueMakeBoolean(
+        ctx, found->second->channel.set_max_send_fragment(static_cast<std::size_t>(size)));
 #endif
 }
 

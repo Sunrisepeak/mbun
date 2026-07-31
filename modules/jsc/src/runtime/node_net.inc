@@ -562,7 +562,10 @@ JSValueRef dgramn_membership_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std:
             if (idx == 0) idx = static_cast<unsigned>(std::strtoul(h.c_str(), nullptr, 10));
         }
         mreq.ipv6mr_interface = idx;
-        rc = setsockopt(fd, IPPROTO_IPV6, add ? IPV6_ADD_MEMBERSHIP : IPV6_DROP_MEMBERSHIP,
+        // IPV6_JOIN_GROUP/IPV6_LEAVE_GROUP are the RFC 3493 names. Linux defines
+        // both these and the IPV6_ADD_MEMBERSHIP/IPV6_DROP_MEMBERSHIP aliases to
+        // the same values; Darwin defines only these. Using them needs no #if.
+        rc = setsockopt(fd, IPPROTO_IPV6, add ? IPV6_JOIN_GROUP : IPV6_LEAVE_GROUP,
                         &mreq, sizeof mreq);
     } else {
         ip_mreq mreq{};

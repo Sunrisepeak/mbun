@@ -106,6 +106,22 @@ frozen machine or a silently murdered harness.
   `MBUN_BUILD_SLOTS` (default 1) sets how many may run at once,
   `MBUN_BUILD_WAIT` how long to wait before giving up with exit 75 — it never
   runs the command after giving up.
+- `reclaim_disk.sh` — reclaims regenerable build caches from **stale** agent
+  worktrees: `reclaim_disk.sh --apply`. Dry-run by default. The bounded layer
+  already refuses to start a measurement on a nearly-full disk
+  (`ensure_disk_headroom()`), and that guard is correct — but on 2026-07-29 the
+  box reached **100% with 6.1 GB free of 1.5 TB**, which would have aborted every
+  run of the wave with an error that reads like a runner bug. The cause is
+  structural: each parallel round leaves worktrees behind, each accumulates a
+  `target/` *plus* per-member `modules/*/target/` trees, and nobody owns them
+  (`.claude/worktrees/wt4` alone held 11 GB under `modules/jsc/target`; five
+  stale round-2/round-9 worktrees held 49 GB). Reclaiming only those caches
+  restored 44 GB without touching a line of source. **Staleness is by mtime, not
+  by "is it the current worktree"** — the first cut of the script protected only
+  the current checkout and its dry run promptly offered to delete the five
+  worktrees of the wave then executing. A cache touched within `--stale-hours`
+  (default 24) belongs to somebody, and no agent can see who. Never reclaims
+  source files, the current worktree, or the shared `~/.mcpp/bmi`.
 - `check_conflict_markers.sh` — fails if a tracked file still carries an
   unresolved merge-conflict marker. **Not redundant with the compiler:** mbun's
   builtins embed JavaScript inside C++ raw string literals, so a marker left in
@@ -176,6 +192,93 @@ the run would score the previous binary.
   unless `--install` is passed (bootstrapping through `mbun install` does not
   currently finish for the framework demos).
 
+## Gating a change: use the impact gate, not a full corpus run
+
+`impact_gate.py` derives the corpus files a change can actually reach, from the
+diff, and writes a `--files` list for the runners:
+
+```bash
+python3 tools/integration/impact_gate.py --rev-range HEAD~1..HEAD \
+  --node-run <a node run dir> --bun-run <a bun run dir> \
+  --out /tmp/impact-node.txt --bun-out /tmp/impact-bun.txt
+python3 tools/integration/node_corpus_runner.py --bin auto --files /tmp/impact-node.txt ...
+```
+
+Measured on a real change: **62 node + 58 bun files instead of 6,335** — a 50x
+reduction that still supersets the set built by hand for the same commit. It
+reports which symbols it dropped and why (`open(617)`, `ERR_INVALID_ARG_TYPE(470)`
+appear in too much of the corpus to discriminate).
+
+Two reasons this beats a full run, not just ties it:
+
+- **Cost.** One session spent 19,084 file-executions against a 6,335-file corpus —
+  the whole thing re-run three times — and over half of that was full runs
+  re-confirming what per-file diffs already showed.
+- **Accuracy.** Running 1000+ files concurrently is what produces the load noise
+  that fakes regressions. Measured: 60 files passing idle and failing under load on
+  the *same* binary; a first baseline read 366 failures where the same binary idle
+  reads ~113.
+
+**A clean impact gate is a SCREEN, never a proof, and the tool says so on every
+run.** It finds files that *mention* a changed name; it cannot see coupling with no
+name in the diff. That limitation is real and pinned by the self-test: a genuine
+regression (`test-webstorage-without-sqlite`) sat outside a gate built from its own
+commit, because the coupling ran through `hasSQLite` and the deciding line was a
+comment. Use `--extra-symbol <name>` when you know the surface, and fall back to a
+full run when a change is behavioural (ordering, timing, GC) — saying why.
+
+## The strategy loop
+
+Coverage work is driven by a loop, not by judgement calls that live in one
+session's head. Four artifacts, each with a self-test:
+
+| artifact | role |
+| --- | --- |
+| `wave_planner.py` | reads corpus state + ledger + struck registry + live resources, emits ranked lane assignments with a goal each |
+| `lane_ledger.tsv` | one row per lane, appended only when the result is **integrator-verified**; the throughput model's only input |
+| `struck.tsv` | areas/targets already retired, with the measured cost that retired them |
+| `check_struck.py` | run before dispatching a lane; exits 3 on a hit |
+
+```bash
+# where does 100% actually stand, and what blocks the rest?
+python3 tools/integration/wave_planner.py --coverage \
+  --node-run target/integration/<node-run> --bun-run target/integration/<bun-run>
+
+# what do past lanes say a lane can deliver per hour?
+python3 tools/integration/wave_planner.py --throughput
+
+# plan the next wave (refuses if the box cannot afford it)
+python3 tools/integration/wave_planner.py --plan 5 \
+  --node-run target/integration/<node-run> --bun-run target/integration/<bun-run>
+
+# before dispatching each assignment
+python3 tools/integration/check_struck.py <area terms>
+```
+
+Three properties worth knowing, because each exists in response to something
+that actually went wrong:
+
+- **Goals come from measured throughput, not a constant.** Observed rates spanned
+  25x across two waves (1.4 to 15.0 files/hour), so a flat `+6` was simultaneously
+  trivial for one area and unreachable for another.
+- **`--coverage` separates *actionable* failures from *no-verdict* ones**
+  (timeout / oom / self-skip / environment-blocked) and from struck areas, then
+  states the ceiling if every actionable file landed. Folding timeouts into
+  "fixable" is how a subsystem's density gets overstated.
+- **The resource guard refuses rather than overcommits.** The disk has hit 100%
+  twice, and measuring next to four other lanes turned 113 real failures into 366
+  phantom ones — so a plan reports its disk/memory/cpu budget, caps at 5 lanes,
+  and exits non-zero with the remedy named when it cannot afford the wave.
+
+Two measurement rules the planner prints into every plan, both learned the hard
+way and both cheap to follow:
+
+1. **A BEFORE must correspond to your own branch point** — a frozen run directory
+   whose tree you know, or a build of your own parent commit. Never rebuild to
+   manufacture a baseline; that was the single largest time sink measured.
+2. **A parallel run is a screen, never a verdict.** Re-run any file whose state
+   decides a number serially (`--jobs 1`) before believing it.
+
 ## Self-tests
 
 Every tool has a self-test under `tests/`; run them after touching a runner:
@@ -189,7 +292,13 @@ bash tools/integration/tests/test_smoke_examples.sh
 bash tools/integration/tests/test_worktree_setup.sh
 bash tools/integration/tests/test_build_lock.sh
 bash tools/integration/tests/test_check_conflict_markers.sh
+bash tools/integration/tests/test_reclaim_disk.sh
 bash tools/integration/tests/test_latency_probe.sh
+bash tools/integration/tests/test_wave_planner.sh
+bash tools/integration/tests/test_impact_gate.sh
+bash tools/integration/tests/test_safe_test.sh
+bash tools/integration/tests/test_check_struck.sh
+bash tools/integration/tests/test_tick_order_gate.sh
 bash benchmarks/tools/test-bench3.sh
 ```
 

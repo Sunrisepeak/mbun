@@ -99,7 +99,14 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       if (p.length === 0) return ".";
       const abs = p.charCodeAt(0) === 47, trail = p.charCodeAt(p.length - 1) === 47;
       const out = [];
-      for (const s of p.split("/")) {
+      // Indexed loop, not `for (const s of ...)`: for-of over the split array
+      // re-reads Array.prototype[Symbol.iterator] at call time. path.normalize is
+      // reached by path.join/resolve and therefore by nearly every module load, so
+      // user code that deletes the array iterator (test-require-delete-array-iterator)
+      // would otherwise break path handling runtime-wide.
+      const segs = p.split("/");
+      for (let si = 0; si < segs.length; si++) {
+        const s = segs[si];
         if (s === "" || s === ".") continue;
         if (s === "..") { if (out.length && out[out.length - 1] !== "..") out.pop(); else if (!abs) out.push(".."); }
         else out.push(s);
@@ -363,6 +370,11 @@ inline constexpr char kBootstrapJS_[] = R"JS(
               if (j < len && j !== last) {
                 last = j;
                 while (j < len && !isPathSepW(p.charCodeAt(j))) j++;
+                // `\\?\x` / `\\.\x` keep only the two-char device prefix, so a
+                // root-only device path resolves without a trailing separator
+                // (node >= 24 test-path-resolve). Bun's corpus still expects the
+                // older `\\?\x\` shape — an irreducible cross-corpus conflict,
+                // decided here for node.
                 if (j === len || j !== last) {
                   if (firstPart !== "." && firstPart !== "?") { device = "\\\\" + firstPart + "\\" + p.slice(last, j); rootEnd = j; }
                   else { device = "\\\\" + firstPart; rootEnd = 4; }
@@ -600,7 +612,17 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   // (waitForActual/expectsError/expectsNoError/expectedException). Enriched
   // AssertionError path via makeAErr is opt-in; other assert.* keep using AErr.
   const NO_EXC = Symbol("assert.noException");
-  const isRe = (v) => v instanceof RegExp;
+  // Brand check, not `instanceof`: node's own test uses util.types.isRegExp,
+  // which is realm-independent. A RegExp minted inside a vm context (or any
+  // other realm) has a foreign RegExp.prototype, so `instanceof` misses it and
+  // assert.throws(fn, /re/) silently degrades to an error-object comparison.
+  // Object.prototype.toString reports "[object RegExp]" off the [[RegExpMatcher]]
+  // internal slot, so it crosses realms the way V8's check does.
+  const isRe = (v) => {
+    if (v instanceof RegExp) return true;
+    if (v === null || typeof v !== "object") return false;
+    try { return Object.prototype.toString.call(v) === "[object RegExp]"; } catch (_) { return false; }
+  };
   const isErrCtor = (fn) => { try { return Error.isPrototypeOf(fn); } catch (_) { return false; } };
   const isPromiseLike = (o) => (o instanceof Promise) || (o !== null && typeof o === "object" && typeof o.then === "function" && typeof o.catch === "function");
   function insp(v) {
@@ -755,7 +777,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     throw AErr("ifError got unwanted exception: " + detail, v, null, "ifError", true);
   };
   function assertRegExpMatch(s, re, m, wantMatch) {
-    if (!(re instanceof RegExp)) { const e = new TypeError(`The "regexp" argument must be of type RegExp. Received ${typeof re}`); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
+    if (!isRe(re)) { const e = new TypeError(`The "regexp" argument must be of type RegExp. Received ${typeof re}`); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
     if (typeof s !== "string") { const e = new TypeError(`The "string" argument must be of type string. Received type ${typeof s}`); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
     if (re.test(s) !== wantMatch) throw AErr(m);
   }
@@ -774,7 +796,19 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       let es = seen.get(a);
       if (es) { if (es.has(e)) return true; } else { es = new Set(); seen.set(a, es); }
       es.add(e);
-      if (Array.isArray(e)) { if (!Array.isArray(a)) return false; const used = new Array(a.length).fill(false); for (const ev of e) { let ok = false; for (let j = 0; j < a.length; j++) { if (!used[j] && partial(a[j], ev, seen)) { used[j] = true; ok = true; break; } } if (!ok) return false; } return true; }
+      // The (a, e) memo entry only stands in for a comparison still in flight.
+      // Keeping a failed pair recorded would make a later, identical comparison
+      // short-circuit to "match" (a repeated reference scanned past once must
+      // still be re-compared honestly).
+      const matched = partialInner(a, e, seen);
+      if (!matched) es.delete(e);
+      return matched;
+    };
+    const partialInner = (a, e, seen) => {
+      // Arrays match as an in-order subsequence: every expected element must be
+      // found in `actual` at an index after the previous match, so [4, 2] does
+      // not match [1, 2, 3, 4]. ref node isPartialStrictEqual.
+      if (Array.isArray(e)) { if (!Array.isArray(a)) return false; let i = 0; for (const ev of e) { let ok = false; while (i < a.length) { if (partial(a[i++], ev, seen)) { ok = true; break; } } if (!ok) return false; } return true; }
       if (e instanceof Map) { if (!(a instanceof Map)) return false; for (const [k, v] of e) { if (!a.has(k) || !partial(a.get(k), v, seen)) return false; } return true; }
       if (e instanceof Set) { if (!(a instanceof Set)) return false; for (const v of e) { let ok = false; for (const av of a) if (partial(av, v, seen)) { ok = true; break; } if (!ok) return false; } return true; }
       for (const k of Object.keys(e)) { if (!(k in a) || !partial(a[k], e[k], seen)) return false; }
@@ -829,8 +863,97 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   const PObjectIs = Object.is;
   const PArrayIsArray = Array.isArray;
   const PArrayFrom = Array.from;
+  const PArrayProtoSlice = Array.prototype.slice;
+  const PArrayProtoMap = Array.prototype.map;
   const PJSONStringify = JSON.stringify;
   const PObjectProtoToString = Object.prototype.toString;
+  const PObjectProtoHasOwn = Object.prototype.hasOwnProperty;
+  const PObjectProtoPropIsEnum = Object.prototype.propertyIsEnumerable;
+  const PFuncProtoToString = Function.prototype.toString;
+  // node's getConstructorName: walk the prototype chain for the first own
+  // `constructor` slot holding a *named* function the value is an instance of.
+  // null means the chain ran out (a null-prototype object). ref node
+  // lib/internal/util/inspect.js getConstructorName.
+  function inspectCtorName(v) {
+    let o = v;
+    while (o !== null && o !== undefined) {
+      const d = PObjectGetOwnPropertyDescriptor(o, "constructor");
+      if (d !== undefined && typeof d.value === "function" && d.value.name !== "") {
+        let ok = false;
+        try { ok = v instanceof d.value; } catch (_) { ok = false; }
+        if (ok) return String(d.value.name);
+      }
+      try { o = PObjectGetPrototypeOf(o); } catch (_) { return null; }
+    }
+    return null;
+  }
+  // node tags a function by its *intrinsic* kind, which no later mutation can
+  // move: test-util-inspect re-points a generator's [[Prototype]] at
+  // AsyncFunction.prototype and still expects "[GeneratorFunction …]".  So the
+  // kind is read off Function.prototype.toString source text (immutable, and
+  // the same primordial the class check already used) rather than off the
+  // prototype identity or v.constructor.name, both of which that test moves.
+  function inspectFuncKind(src) {
+    const gen = /^\s*(?:async\s*)?(?:function\s*)?\*/.test(src);
+    const async = /^\s*async[\s*]/.test(src) || (/^\s*async\s*\(/.test(src) && src.indexOf("=>") !== -1);
+    return (async ? "Async" : "") + (gen ? "Generator" : "") + "Function";
+  }
+  const PStripComments = /(\/\/.*?\n)|(\/\*(.|\n)*?\*\/)/g;
+  const PClassRe = /^(\s+[^(]*?)\s*{/;
+  // PORT-SOURCE: compat/node/lib/internal/util/inspect.js (meta, escapeFn,
+  // strEscape, addQuotes).
+  // mbun previously escaped only backslash, newline and the chosen quote, so
+  // util.inspect("abc cde") rendered the raw NUL byte where node writes
+  // 'abc\x00cde'. Every C0 control, DEL, the C1 block and lone surrogates need
+  // escaping (test-process-execve-validation compares the ERR_INVALID_ARG_VALUE
+  // message, which embeds an inspected string, byte for byte).
+  const PInspectMeta = [
+    "\\x00", "\\x01", "\\x02", "\\x03", "\\x04", "\\x05", "\\x06", "\\x07",
+    "\\b", "\\t", "\\n", "\\x0B", "\\f", "\\r", "\\x0E", "\\x0F",
+    "\\x10", "\\x11", "\\x12", "\\x13", "\\x14", "\\x15", "\\x16", "\\x17",
+    "\\x18", "\\x19", "\\x1A", "\\x1B", "\\x1C", "\\x1D", "\\x1E", "\\x1F",
+    "", "", "", "", "", "", "", "\\'", "", "", "", "", "", "", "", "",
+    "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+    "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+    "", "", "", "", "", "", "", "", "", "", "", "", "\\\\", "", "", "",
+    "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+    "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "\\x7F",
+    "\\x80", "\\x81", "\\x82", "\\x83", "\\x84", "\\x85", "\\x86", "\\x87",
+    "\\x88", "\\x89", "\\x8A", "\\x8B", "\\x8C", "\\x8D", "\\x8E", "\\x8F",
+    "\\x90", "\\x91", "\\x92", "\\x93", "\\x94", "\\x95", "\\x96", "\\x97",
+    "\\x98", "\\x99", "\\x9A", "\\x9B", "\\x9C", "\\x9D", "\\x9E", "\\x9F",
+  ];
+  // The two variants differ only in whether the single quote (\x27) is escaped:
+  // when node re-quotes with " or ` there is, by construction, no such quote in
+  // the body, so it is left alone. The surrogate alternatives catch UNPAIRED
+  // surrogates only.
+  const PStrEscRe = /[\x00-\x1f\x27\x5c\x7f-\x9f]|[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g;
+  const PStrEscReSingle = /[\x00-\x1f\x5c\x7f-\x9f]|[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g;
+  const PStrEscFn = (s) => {
+    const c = s.charCodeAt(0);
+    return PInspectMeta.length > c ? PInspectMeta[c] : "\\u" + c.toString(16);
+  };
+  // PORT-SOURCE: compat/node/lib/internal/util/inspect.js — inspectDefaultOptions
+  // .maxArrayLength (100) and its `null → Infinity` normalisation. Every
+  // list-shaped formatter (formatArray, formatTypedArray, formatSet, formatMap,
+  // formatArrayBuffer) renders at most min(max(0, maxArrayLength), length)
+  // entries and appends "... n more item(s)" / "... n more byte(s)".
+  function inspectMaxArrayLength(opts) {
+    const m = opts.maxArrayLength;
+    if (m === null) return Infinity;
+    if (typeof m === "number") return m > 0 ? m : 0;
+    return gInspectDefaultsStore.maxArrayLength;
+  }
+  const inspectRemainingText = (r) => "... " + r + " more item" + (r > 1 ? "s" : "");
+  function inspectIsClassSrc(src) {
+    if (!src.startsWith("class") || !src.endsWith("}")) return false;
+    // Reject a *method* literally named `class` — `({ class() {} }).class`
+    // also stringifies to "class() {}". ref node formatRaw's class guard.
+    const slice = src.slice(5, -1);
+    const bi = slice.indexOf("{");
+    if (bi === -1) return false;
+    return slice.slice(0, bi).indexOf("(") === -1 || PClassRe.test(slice.replace(PStripComments, ""));
+  }
   function inspectValue(v, opts, seen, depth) {
     opts = opts || {}; seen = seen || new Set(); depth = depth || 0;
     const maxDepth = opts.depth === null ? Infinity : (typeof opts.depth === "number" ? opts.depth : 2);
@@ -852,23 +975,78 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     if (t === "bigint") return col(33, 39, String(v) + "n");
     if (t === "boolean") return col(33, 39, String(v));
     if (t === "symbol") return col(32, 39, v.toString());
-    if (t === "string") return col(32, 39, bun ? PJSONStringify(v) : "'" + v.replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\n/g, "\\n") + "'");
+    if (t === "string") {
+      if (bun) return col(32, 39, PJSONStringify(v));
+      // PORT-SOURCE: compat/node/lib/internal/util/inspect.js formatPrimitive —
+      // a string longer than ctx.maxStringLength (default 10000) is sliced and a
+      // "... n more characters" trailer rides OUTSIDE the closing quote. `null`
+      // means Infinity, exactly as ctx normalisation does it. Applied only on the
+      // node layout: Bun.inspect does not cap string length.
+      let trailer = "";
+      {
+        const ms = opts.maxStringLength === null ? Infinity
+          : (typeof opts.maxStringLength === "number" ? opts.maxStringLength
+             : gInspectDefaultsStore.maxStringLength);
+        if (v.length > ms) {
+          const rem = v.length - ms;
+          v = v.slice(0, ms);
+          trailer = "... " + rem + " more character" + (rem > 1 ? "s" : "");
+        }
+      }
+      // ref node lib/internal/util/inspect.js strEscape: the quote is chosen so
+      // the contents need the fewest escapes — single, then double, then
+      // backtick — and only the chosen quote is escaped. Always single-quoting
+      // made util.inspect("'string'") read '\'string\'' where node writes
+      // "'string'".
+      let q = "'";
+      let re = PStrEscRe;
+      if (v.includes("'")) {
+        if (!v.includes('"')) { q = '"'; re = PStrEscReSingle; }
+        else if (!v.includes("`") && !v.includes("${")) { q = "`"; re = PStrEscReSingle; }
+      }
+      return col(32, 39, q + v.replace(re, PStrEscFn) + q) + trailer;
+    }
     if (t === "function") {
       const n = v.name;
-      if (bun) {
-        const s = Function.prototype.toString.call(v);
-        if (s.startsWith("class") || /^class[\s{]/.test(s)) {
-          const base = (s.match(/^class\s+(?:[A-Za-z0-9_$]+\s+)?extends\s+([A-Za-z0-9_$.]+)/) || [])[1];
-          return "[class " + (n || "(anonymous)") + (base ? " extends " + base : "") + "]";
-        }
-        const cn = v.constructor && v.constructor.name;
-        const kind = (cn === "AsyncFunction" || cn === "GeneratorFunction" || cn === "AsyncGeneratorFunction") ? cn : "Function";
-        return n ? "[" + kind + ": " + n + "]" : "[" + kind + "]";
-      }
       // Use Function.prototype.toString (not v.toString()) so a user-defined
       // toString override is never invoked during inspection (test-console-not-
       // call-toString / node util.inspect semantics).
-      const tag = Function.prototype.toString.call(v).startsWith("class") ? "class" : "Function"; return n ? "[" + tag + ": " + n + "]" : "[" + tag + " (anonymous)]";
+      let src = ""; try { src = PFuncProtoToString.call(v); } catch (_) { src = ""; }
+      const ctor = inspectCtorName(v);
+      if (inspectIsClassSrc(src)) {
+        // ref node getClassBase: the superclass name comes from the class's
+        // [[Prototype]] (the real base constructor), not from the source text —
+        // `class X extends (mkBase())` has no readable name in the source.
+        const nm = (PObjectProtoHasOwn.call(v, "name") && n) || "(anonymous)";
+        let out = "class " + nm;
+        if (ctor !== "Function" && ctor !== null) out += " [" + ctor + "]";
+        if (ctor !== null) {
+          const sup = PObjectGetPrototypeOf(v);
+          const supName = sup && sup.name;
+          if (supName) out += " extends " + supName;
+        }
+        if (bun) return "[" + out + "]";
+        let ctag = v[Symbol.toStringTag];
+        if (typeof ctag !== "string" || (ctag !== "" && PObjectProtoPropIsEnum.call(v, Symbol.toStringTag))) ctag = "";
+        if (ctag !== "" && ctag !== ctor) out += " [" + ctag + "]";
+        // node styles a class base with the `special` colour (cyan).
+        // ref lib/internal/util/inspect.js formatValue -> stylize(base, 'special').
+        return col(36, 39, "[" + out + "]");
+      }
+      const kind = inspectFuncKind(src);
+      if (bun) return n ? "[" + kind + ": " + n + "]" : "[" + kind + "]";
+      // ref node getFunctionBase: "[<kind>[ (null prototype)][: name |
+      // (anonymous)]][ <constructor>][ [<toStringTag>]]".
+      let base = "[" + kind;
+      if (ctor === null) base += " (null prototype)";
+      base += (n === "" || n === undefined) ? " (anonymous)" : ": " + n;
+      base += "]";
+      if (ctor !== kind && ctor !== null) base += " " + ctor;
+      let tag = v[Symbol.toStringTag];
+      if (typeof tag !== "string" || (tag !== "" && PObjectProtoPropIsEnum.call(v, Symbol.toStringTag))) tag = "";
+      if (tag !== "" && tag !== ctor) base += " [" + tag + "]";
+      // Same `special` colour as the class branch above.
+      return col(36, 39, base);
     }
     if (seen.has(v)) return "[Circular *1]";
     // nodejs.util.inspect.custom dispatch: an object exposing a callable custom
@@ -922,7 +1100,14 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       const extras = [];
       seen.add(v);
       try {
-        for (const k of PObjectKeys(v)) {
+        // Indexed loop, not `for (const k of ...)`: for-of over a plain array
+        // re-reads Array.prototype[Symbol.iterator] at call time, and this is the
+        // branch that renders an Error — i.e. exactly the path the REPL takes to
+        // report the TypeError raised by code that deleted the array iterator
+        // (test-repl-unsafe-array-iteration).
+        const ownKeys = PObjectKeys(v);
+        for (let ki = 0; ki < ownKeys.length; ki++) {
+          const k = ownKeys[ki];
           if (k === "message" || k === "stack") continue;
           let s;
           try { s = inspectValue(v[k], opts, seen, depth + 1); } catch (e) { continue; }
@@ -963,6 +1148,37 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       if (v instanceof Number) return "[Number: " + Number(v) + "]";
       if (v instanceof Boolean) return "[Boolean: " + Boolean(v) + "]";
       if (v instanceof String) return PJSONStringify(String(v));
+    } else {
+      // PORT-SOURCE: compat/node/lib/internal/util/inspect.js formatRaw's boxed-
+      // primitive bases (formatNumber/formatBigInt/formatBoolean/formatString
+      // under `[Number: …]`). mbun fell through to the generic object branch, so
+      // `new Number(3)` printed "Number {}" and `new String("ab")` printed
+      // "String { '0': 'a', '1': 'b' }" — node hides a String object's index
+      // properties precisely because they are the string.
+      if (v instanceof Number) return col(36, 39, "[Number: " + inspectValue(Number(v), opts, seen, depth) + "]");
+      if (v instanceof Boolean) return col(36, 39, "[Boolean: " + Boolean(v) + "]");
+      if (v instanceof String) return col(36, 39, "[String: " + inspectValue(String(v), opts, seen, depth) + "]");
+      // formatWeakCollection: the entries of a Weak{Map,Set} are unreachable
+      // without the V8 debug API, and node says so rather than printing "{}".
+      if (v instanceof WeakMap) return "WeakMap { <items unknown> }";
+      if (v instanceof WeakSet) return "WeakSet { <items unknown> }";
+      // formatArrayBuffer: node dumps the backing bytes under a [Uint8Contents]
+      // pseudo-key and prints byteLength alongside; a detached buffer prints
+      // "(detached)".
+      if (v instanceof ArrayBuffer ||
+          (typeof SharedArrayBuffer === "function" && v instanceof SharedArrayBuffer)) {
+        const nm = (v instanceof ArrayBuffer) ? "ArrayBuffer" : "SharedArrayBuffer";
+        let bytes = null;
+        try { bytes = new Uint8Array(v); } catch (e) { bytes = null; }
+        if (bytes === null) return nm + " { (detached) }";
+        const abMax = inspectMaxArrayLength(opts);
+        const abShown = bytes.length < abMax ? bytes.length : abMax;
+        let hex = "";
+        for (let bi = 0; bi < abShown; bi++) hex += (bi ? " " : "") + bytes[bi].toString(16).padStart(2, "0");
+        const abRest = bytes.length - abShown;
+        if (abRest > 0) hex += " ... " + abRest + " more byte" + (abRest > 1 ? "s" : "");
+        return nm + " { [Uint8Contents]: <" + hex + ">, byteLength: " + v.byteLength + " }";
+      }
     }
     if (depth > maxDepth) return PArrayIsArray(v) ? "[Array]" : (bun ? "[Object ...]" : "[Object]");
     seen.add(v);
@@ -983,45 +1199,120 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     // line and the closing delimiter its own line too (util.inspect's
     // reduceToSingleString "compact === false" branch).
     const noCompact = opts.compact === false;
+    // mbun rendered EVERY element, so a 1000-element array printed 1000 entries
+    // where node and bun both stop at 100 — and inspecting a huge array cost
+    // O(n) formatting instead of O(maxArrayLength).
+    const maxArrayLength = inspectMaxArrayLength(opts);
+    const remainingText = inspectRemainingText;
     const nodeBlock = (label, items, open, close) => {
       if (!items.length) return label + open + close;
       if (noCompact) return label + open + "\n" + items.map((it) => inner + it).join(",\n") + "\n" + outer + close;
       return label + open + " " + items.join(", ") + " " + close;
     };
     if (PArrayIsArray(v)) {
-      const items = v.map((x) => inspectValue(x, opts, seen, depth + 1));
+      // formatArray: slice first, THEN format — the slice keeps holes (so a
+      // sparse array still renders its empty slots the way it did) while the
+      // elements past the cap are never inspected at all.
+      const valLen = v.length;
+      const shown = valLen < maxArrayLength ? valLen : maxArrayLength;
+      const src = shown < valLen ? PArrayProtoSlice.call(v, 0, shown) : v;
+      const items = PArrayProtoMap.call(src, (x) => inspectValue(x, opts, seen, depth + 1));
+      const remaining = valLen - shown;
+      if (remaining > 0) items.push(remainingText(remaining));
+      if (!bun) {
+        // PORT-SOURCE: compat/node/lib/internal/util/inspect.js
+        // formatSpecialArray — a HOLE is not `undefined`, it is
+        // "<n empty items>". `.map` above preserved holes, so rebuild the run
+        // lengths from the sliced source. mbun printed "[ , 1, , 2 ]", which is
+        // not a shape node ever emits.
+        let sparse = false;
+        for (let hi = 0; hi < shown; hi++) { if (!(hi in src)) { sparse = true; break; } }
+        if (sparse) {
+          const packed = []; let run = 0;
+          const flush = () => { if (run > 0) { packed.push("<" + run + " empty item" + (run > 1 ? "s" : "") + ">"); run = 0; } };
+          for (let hi = 0; hi < shown; hi++) {
+            if (hi in src) { flush(); packed.push(items[hi]); } else run++;
+          }
+          flush();
+          if (remaining > 0) packed.push(items[items.length - 1]);
+          items.length = 0;
+          for (let pi = 0; pi < packed.length; pi++) items.push(packed[pi]);
+        }
+        // NOT ported, and deliberately: formatRaw's kArrayExtrasType tail (an
+        // array's non-index own enumerable keys riding after the elements, as
+        // `[ 1, 2, x: 3 ]`) needs the array's own-key list, and Object.keys of a
+        // dense 100-element array allocates 100 index-key strings. Measured over
+        // 20k inspections of a 100-element array: 67ms -> 200ms, a 3x tax on
+        // EVERY array inspection for a shape almost nothing produces. node reads
+        // it from a V8 native (getOwnNonIndexProperties) that mbun has no
+        // equivalent of; doing it honestly means a C++ own-non-index-keys
+        // binding, not a JS scan.
+      }
       if (!items.length) result = "[]";
       else if (bun) {
         const oneLine = "[ " + items.join(", ") + " ]";
-        const complex = v.some((x) => x !== null && typeof x === "object" && !PArrayIsArray(x));
+        const complex = src.some((x) => x !== null && typeof x === "object" && !PArrayIsArray(x));
         const hasNL = items.some((s) => s.indexOf("\n") >= 0);
         result = (bunCompact || (!complex && !hasNL && oneLine.length <= 72)) ? oneLine : "[\n" + inner + items.join(", ") + "\n" + outer + "]";
       } else result = nodeBlock("", items, "[", "]");
     }
     else if (v instanceof Map) {
-      const items = []; for (const [k, val] of v) items.push(inspectValue(k, opts, seen, depth + 1) + (bun ? ": " : " => ") + inspectValue(val, opts, seen, depth + 1));
+      // Indexed reads instead of `const [k, val] of v`: array destructuring of
+      // each entry pair goes through Array.prototype[Symbol.iterator], which the
+      // corpus deletes on purpose. Map's own iterator stays live and is fine.
+      // formatMap: at most maxArrayLength entries, then "... n more items".
+      const mMax = v.size < maxArrayLength ? v.size : maxArrayLength;
+      const items = []; let mi = 0;
+      for (const pair of v) { if (mi >= mMax) break; mi++; items.push(inspectValue(pair[0], opts, seen, depth + 1) + (bun ? ": " : " => ") + inspectValue(pair[1], opts, seen, depth + 1)); }
+      if (v.size - mMax > 0) items.push(remainingText(v.size - mMax));
       if (bun) result = bunBlock(v.size ? "Map(" + v.size + ") " : "Map ", items);
       else result = nodeBlock("Map(" + v.size + ") ", items, "{", "}");
     }
     else if (v instanceof Set) {
-      const items = []; for (const x of v) items.push(inspectValue(x, opts, seen, depth + 1));
+      // formatSet: same cap as formatArray/formatMap.
+      const sMax = v.size < maxArrayLength ? v.size : maxArrayLength;
+      const items = []; let si = 0;
+      for (const x of v) { if (si >= sMax) break; si++; items.push(inspectValue(x, opts, seen, depth + 1)); }
+      if (v.size - sMax > 0) items.push(remainingText(v.size - sMax));
       if (bun) result = bunBlock(v.size ? "Set(" + v.size + ") " : "Set ", items);
       else result = nodeBlock("Set(" + v.size + ") ", items, "{", "}");
     }
-    else if (ArrayBuffer.isView(v) && !(v instanceof DataView)) { const nm = v.constructor ? v.constructor.name : "TypedArray"; const items = PArrayFrom(v).map(String); result = nm + "(" + v.length + ") [" + (items.length ? " " + items.join(", ") + " " : "") + "]"; }
+    else if (ArrayBuffer.isView(v) && !(v instanceof DataView)) {
+      // formatTypedArray: maxLength = min(max(0, maxArrayLength), length), then
+      // remainingText. Reading element-by-element instead of Array.from also
+      // stops a 1e6-element TypedArray from being materialised as a JS array
+      // just to print its first hundred entries.
+      const nm = v.constructor ? v.constructor.name : "TypedArray";
+      const tLen = v.length;
+      const tMax = tLen < maxArrayLength ? tLen : maxArrayLength;
+      const items = [];
+      for (let ti = 0; ti < tMax; ti++) items.push(String(v[ti]));
+      if (tLen - tMax > 0) items.push(remainingText(tLen - tMax));
+      result = nm + "(" + tLen + ") [" + (items.length ? " " + items.join(", ") + " " : "") + "]";
+    }
     else {
       const keys = PObjectKeys(v); const cn = v.constructor && v.constructor.name; const ctor = (cn && cn !== "Object") ? cn + " " : (PObjectGetPrototypeOf(v) === null ? "[Object: null prototype] " : "");
       // Enumerable symbol-keyed own props render after string keys: bun as
       // `[Symbol(desc)]: v`, node as `Symbol(desc): v`. ref util.inspect.
       const syms = PObjectGetOwnPropertySymbols(v).filter((s) => { const d = PObjectGetOwnPropertyDescriptor(v, s); return d && d.enumerable; });
-      const descVal = (d, key) => (d && (d.get || d.set)) ? (d.get && d.set ? "[Getter/Setter]" : d.get ? "[Getter]" : "[Setter]") : inspectValue(v[key], opts, seen, depth + 1);
+      // node's formatProperty reads desc.value, not value[key] — one property
+      // get per key instead of two, and it is the descriptor's own view.
+      const descVal = (d, key) => (d && (d.get || d.set)) ? (d.get && d.set ? "[Getter/Setter]" : d.get ? "[Getter]" : "[Setter]") : inspectValue(d ? d.value : v[key], opts, seen, depth + 1);
       if (bun) {
         const items = keys.map((k) => bunKey(k) + ": " + descVal(PObjectGetOwnPropertyDescriptor(v, k), k));
-        for (const s of syms) items.push("[" + s.toString() + "]: " + descVal(PObjectGetOwnPropertyDescriptor(v, s), s));
+        // Index loop, not `for (const s of syms)`: for-of over a plain array
+        // reads Array.prototype[Symbol.iterator] at call time.
+        for (let i = 0; i < syms.length; i++) { const s = syms[i]; items.push("[" + s.toString() + "]: " + descVal(PObjectGetOwnPropertyDescriptor(v, s), s)); }
         result = bunBlock(ctor, items);
       } else {
-        const items = keys.map((k) => { const kk = /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(k) ? k : "'" + k + "'"; return kk + ": " + inspectValue(v[k], opts, seen, depth + 1); });
-        for (const s of syms) items.push(s.toString() + ": " + inspectValue(v[s], opts, seen, depth + 1));
+        // PORT-SOURCE: compat/node/lib/internal/util/inspect.js formatProperty —
+        // an ACCESSOR renders as [Getter] / [Setter] / [Getter/Setter]; node
+        // only calls the getter under the `getters` option. mbun's node layout
+        // read v[k] directly, so inspecting a value INVOKED every getter on it
+        // (side effects included) and printed the result where node prints the
+        // label. The bun layout already went through descVal.
+        const items = keys.map((k) => { const kk = /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(k) ? k : "'" + k + "'"; return kk + ": " + descVal(PObjectGetOwnPropertyDescriptor(v, k), k); });
+        for (let i = 0; i < syms.length; i++) { const s = syms[i]; items.push(s.toString() + ": " + descVal(PObjectGetOwnPropertyDescriptor(v, s), s)); }
         result = nodeBlock(ctor, items, "{", "}");
       }
     }
@@ -1199,6 +1490,11 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     determineSpecificType,
     formatList: nodeFormatList,
     addNumericalSeparator,
+    // Stamp node's `${name} [${code}]: ${message}` toString onto an error whose
+    // MESSAGE a partition already formats itself. Exposed so a partition can
+    // adopt the code-in-toString contract (which is what assert.throws(fn,
+    // /ERR_X/) matches on) without also adopting this file's message text.
+    withCodeToString: nodeErrToString,
     ERR_INVALID_ARG_TYPE: nodeArgTypeError,
     ERR_INVALID_ARG_VALUE: nodeArgValueError,
     ERR_OUT_OF_RANGE: nodeRangeError,
@@ -1461,7 +1757,61 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       if (s.indexOf("\u001B") === -1 && s.indexOf("\u009B") === -1) return s;
       return s.replace(kAnsiRe, "");
     },
-    debuglog() { return () => {}; }, debug() { return () => {}; },
+    // PORT-SOURCE: lib/internal/util/debuglog.js (debuglog / debuglogImpl /
+    // emitWarningIfNeeded / initializeDebugEnv).
+    //
+    // The old stub handed back a no-op without ever looking at NODE_DEBUG, so
+    // `NODE_DEBUG=http` produced no trace AND -- the part the corpus actually
+    // pins -- none of the security warning node prints the first time an `http`
+    // or `http2` debug channel is switched on (test-http-debug greps stderr of a
+    // spawned child for it verbatim). The warning is emitted lazily, on the
+    // FIRST call of an ENABLED debug function, which is why the returned
+    // function starts as a thunk that initialises itself.
+    debuglog(set, cb) {
+      const name = String(set).toUpperCase();
+      // node initializeDebugEnv: NODE_DEBUG is a comma/space separated list of
+      // section names in which `*` is a wildcard, compiled into one regexp.
+      const isEnabled = () => {
+        const env = (G.process && G.process.env && G.process.env.NODE_DEBUG) || "";
+        if (!env) return false;
+        const parts = String(env).split(/[,\s]+/);
+        for (let i = 0; i < parts.length; i++) {
+          if (!parts[i]) continue;
+          const pat = parts[i].replace(/[|\\{}()[\]^$+?.]/g, "\\$&").replace(/\*/g, ".*");
+          if (new RegExp("^" + pat + "$", "i").test(name)) return true;
+        }
+        return false;
+      };
+      let impl;
+      const init = () => {
+        if (isEnabled()) {
+          // node emitWarningIfNeeded: only these two channels leak credentials.
+          if (name === "HTTP" || name === "HTTP2") {
+            try {
+              G.process.emitWarning("Setting the NODE_DEBUG environment variable " +
+                "to '" + name.toLowerCase() + "' can expose sensitive " +
+                "data (such as passwords, tokens and authentication headers) " +
+                "in the resulting log.");
+            } catch (e) {}
+          }
+          const pid = (G.process && G.process.pid) || 0;
+          impl = (...args) => {
+            const line = util.format("%s %s: %s\n", name, pid, util.format(...args));
+            try { G.process.stderr.write(line); } catch (e) {}
+          };
+        } else {
+          impl = () => {};
+        }
+        if (typeof cb === "function") cb(impl);
+      };
+      const lazy = (...args) => { if (impl === undefined) init(); impl(...args); };
+      Object.defineProperty(lazy, "enabled", {
+        configurable: true, enumerable: true,
+        get() { if (impl === undefined) init(); return isEnabled(); },
+      });
+      return lazy;
+    },
+    debug(set, cb) { return util.debuglog(set, cb); },
     _extend(a, b) { return Object.assign(a, b); },
     // util.aborted(signal, resource): a promise that settles when `signal`
     // fires, but which does NOT keep `resource` alive — once `resource` is
@@ -1757,54 +2107,219 @@ inline constexpr char kBootstrapJS_[] = R"JS(
              isAsyncFunction: (v) => typeof v === "function" && v.constructor && v.constructor.name === "AsyncFunction" },
     TextEncoder: globalThis.TextEncoder, TextDecoder: globalThis.TextDecoder,
   };
-  // util.MIMEType / MIMEParams (WHATWG): parse "type/subtype;p=v" strings.
-  const MIME_TOKEN_RE = /^[!#$%&'*+\-.^_`|~A-Za-z0-9]+$/;
-  const MIME_INVALID_VALUE_RE = /[^\t -~-ÿ]/;
-  const mimeEncodeValue = (v) => { if (v.length === 0) return '""'; if (MIME_TOKEN_RE.test(v)) return v; return '"' + v.replace(/[\\"]/g, "\\$&") + '"'; };
-  class MIMEParams {
-    constructor() { this._m = new Map(); }
-    get(k) { return this._m.has(k) ? this._m.get(k) : null; }
-    set(k, v) { k = String(k); v = String(v); if (!MIME_TOKEN_RE.test(k)) throw new TypeError("The MIME syntax for a parameter name in " + k + " is invalid"); if (MIME_INVALID_VALUE_RE.test(v)) throw new TypeError("The MIME syntax for a parameter value in " + v + " is invalid"); this._m.set(k, v); }
-    has(k) { return this._m.has(k); }
-    delete(k) { this._m.delete(k); }
-    entries() { return this._m.entries(); }
-    keys() { return this._m.keys(); }
-    values() { return this._m.values(); }
-    [Symbol.iterator]() { return this._m.entries(); }
-    toString() { return Array.from(this._m).map(([k, v]) => k + "=" + mimeEncodeValue(v)).join(";"); }
-    toJSON() { return this.toString(); }
-  }
-  class MIMEType {
-    constructor(input) {
-      const s = String(input); const semi = s.indexOf(";");
-      const essence = (semi < 0 ? s : s.slice(0, semi)).trim().toLowerCase();
-      const slash = essence.indexOf("/");
-      if (slash < 0) throw new TypeError("Invalid MIME type: " + input);
-      this._type = essence.slice(0, slash); this._subtype = essence.slice(slash + 1);
-      this.params = new MIMEParams();
-      // WHATWG mimesniff §parse a MIME type (node internal/mime.js): quoted
-      // values unescape \X, empty values are dropped, first name wins.
-      if (semi >= 0) for (const part of s.slice(semi + 1).split(";")) {
-        const eq = part.indexOf("="); if (eq < 0) continue;
-        const name = part.slice(0, eq).trim().toLowerCase();
-        let raw = part.slice(eq + 1).trim();
-        let val;
-        if (raw.startsWith('"')) {
-          val = ""; let i = 1;
-          for (; i < raw.length && raw[i] !== '"'; i++) { if (raw[i] === "\\" && i + 1 < raw.length) i++; val += raw[i]; }
-        } else val = raw;
-        if (!name || !MIME_TOKEN_RE.test(name) || val === "" || MIME_INVALID_VALUE_RE.test(val)) continue;
-        if (!this.params._m.has(name)) this.params._m.set(name, val);
-      }
+  // util.MIMEType / MIMEParams — a 1:1 port of node lib/internal/mime.js.
+  //
+  // The previous hand-rolled parser split on ';' and trimmed with String.trim(),
+  // which is neither of the two things the WHATWG mimesniff grammar asks for:
+  // "HTTP whitespace" is exactly CR/LF/tab/space (String.trim() also eats \v, \f
+  // and every Unicode space), and a quoted parameter value may legally contain
+  // ';' and '=' so it cannot be found by splitting first. 388 of the 952 WPT
+  // mime-types cases disagreed with it. The port also carries node's
+  // ERR_INVALID_MIME_SYNTAX code, which every failure here previously lacked.
+  const NON_ASCII_RE = /[^\x00-\x7f]/;
+  const NOT_HTTP_TOKEN_CODE_POINT = /[^!#$%&'*+\-.^_`|~A-Za-z0-9]/g;
+  const NOT_HTTP_QUOTED_STRING_CODE_POINT = /[^\t\u0020-~\u0080-\u00FF]/g;
+  const END_BEGINNING_WHITESPACE = /[^\r\n\t ]|$/;
+  const START_ENDING_WHITESPACE = /[\r\n\t ]*$/;
+  const EQUALS_SEMICOLON_OR_END = /[;=]|$/;
+  const QUOTED_VALUE_PATTERN = /^(?:([\\]$)|[\\][\s\S]|[^"])*(?:(")|$)/u;
+  const mimeSyntaxError = (production, str, invalidIndex) => {
+    const e = new TypeError('The MIME syntax for a ' + production + ' in "' + str +
+                            '" is invalid' + (invalidIndex !== -1 ? " at " + invalidIndex : ""));
+    e.code = "ERR_INVALID_MIME_SYNTAX";
+    // node's NodeError renders the code inside the name, and both mime tests
+    // match /ERR_INVALID_MIME_SYNTAX/ against String(err), not against .code.
+    Object.defineProperty(e, "toString", {
+      value() { return "TypeError [ERR_INVALID_MIME_SYNTAX]" + (this.message ? ": " + this.message : ""); },
+      configurable: true, writable: true,
+    });
+    return e;
+  };
+  const mimeToASCIILower = (str) => {
+    if (!NON_ASCII_RE.test(str)) return str.toLowerCase();
+    let result = "";
+    for (let i = 0; i < str.length; i++) {
+      const char = str[i];
+      result += char >= "A" && char <= "Z" ? char.toLowerCase() : char;
     }
-    get type() { return this._type; }
-    set type(v) { v = String(v); if (!MIME_TOKEN_RE.test(v)) throw new TypeError("The MIME syntax for a type in " + v + " is invalid"); this._type = v.toLowerCase(); }
-    get subtype() { return this._subtype; }
-    set subtype(v) { v = String(v); if (!MIME_TOKEN_RE.test(v)) throw new TypeError("The MIME syntax for a subtype in " + v + " is invalid"); this._subtype = v.toLowerCase(); }
-    get essence() { return this._type + "/" + this._subtype; }
-    toString() { const p = this.params.toString(); return this.essence + (p ? ";" + p : ""); }
-    toJSON() { return this.toString(); }
+    return result;
+  };
+  const mimeParseTypeAndSubtype = (str) => {
+    let position = str.search(END_BEGINNING_WHITESPACE);
+    const typeEnd = str.indexOf("/", position);
+    const trimmedType = typeEnd === -1 ? str.slice(position) : str.slice(position, typeEnd);
+    const invalidTypeIndex = trimmedType.search(NOT_HTTP_TOKEN_CODE_POINT);
+    if (trimmedType === "" || invalidTypeIndex !== -1 || typeEnd === -1)
+      throw mimeSyntaxError("type", str, invalidTypeIndex);
+    position = typeEnd + 1;
+    const type = mimeToASCIILower(trimmedType);
+    const subtypeEnd = str.indexOf(";", position);
+    const rawSubtype = subtypeEnd === -1 ? str.slice(position) : str.slice(position, subtypeEnd);
+    position += rawSubtype.length;
+    if (subtypeEnd !== -1) position += 1;
+    const trimmedSubtype = rawSubtype.slice(0, rawSubtype.search(START_ENDING_WHITESPACE));
+    const invalidSubtypeIndex = trimmedSubtype.search(NOT_HTTP_TOKEN_CODE_POINT);
+    if (trimmedSubtype === "" || invalidSubtypeIndex !== -1)
+      throw mimeSyntaxError("subtype", str, invalidSubtypeIndex);
+    return [type, mimeToASCIILower(trimmedSubtype), position];
+  };
+  const mimeRemoveBackslashes = (str) => {
+    let ret = "";
+    let i;
+    // Stop one short: the loop looks ahead one character for the escape.
+    for (i = 0; i < str.length - 1; i++) {
+      const c = str[i];
+      if (c === "\\") { i++; ret += str[i]; } else ret += c;
+    }
+    if (i === str.length - 1) ret += str[i];
+    return ret;
+  };
+  const mimeEscapeQuoteOrSolidus = (str) => {
+    let result = "";
+    for (let i = 0; i < str.length; i++) {
+      const char = str[i];
+      result += (char === '"' || char === "\\") ? "\\" + char : char;
+    }
+    return result;
+  };
+  const mimeEncodeValue = (value) => {
+    if (value.length === 0) return '""';
+    if (value.search(NOT_HTTP_TOKEN_CODE_POINT) === -1) return value;
+    return '"' + mimeEscapeQuoteOrSolidus(value) + '"';
+  };
+  class MIMEParams {
+    #data = new Map();
+    // Parsing is deferred: MIMEType hands over the raw parameter substring and
+    // only pays for it when the params are actually touched.
+    #processed = true;
+    #string = null;
+    static __instantiate(str) {
+      const instance = new MIMEParams();
+      instance.#string = str;
+      instance.#processed = false;
+      return instance;
+    }
+    delete(name) { this.#parse(); this.#data.delete(name); }
+    get(name) { this.#parse(); return this.#data.has(name) ? this.#data.get(name) : null; }
+    has(name) { this.#parse(); return this.#data.has(name); }
+    set(name, value) {
+      this.#parse();
+      name = `${name}`;
+      value = `${value}`;
+      const invalidNameIndex = name.search(NOT_HTTP_TOKEN_CODE_POINT);
+      if (name.length === 0 || invalidNameIndex !== -1)
+        throw mimeSyntaxError("parameter name", name, invalidNameIndex);
+      const invalidValueIndex = value.search(NOT_HTTP_QUOTED_STRING_CODE_POINT);
+      if (invalidValueIndex !== -1)
+        throw mimeSyntaxError("parameter value", value, invalidValueIndex);
+      this.#data.set(name, value);
+    }
+    *entries() { this.#parse(); yield* this.#data.entries(); }
+    *keys() { this.#parse(); yield* this.#data.keys(); }
+    *values() { this.#parse(); yield* this.#data.values(); }
+    toString() {
+      this.#parse();
+      let ret = "";
+      for (const { 0: key, 1: value } of this.#data) {
+        if (ret.length) ret += ";";
+        ret += key + "=" + mimeEncodeValue(value);
+      }
+      return ret;
+    }
+    #parse() {
+      if (this.#processed) return;
+      const paramsMap = this.#data;
+      let position = 0;
+      const str = this.#string;
+      const endOfSource = str.slice(position).search(START_ENDING_WHITESPACE) + position;
+      while (position < endOfSource) {
+        position += str.slice(position).search(END_BEGINNING_WHITESPACE);
+        const afterParameterName = str.slice(position).search(EQUALS_SEMICOLON_OR_END) + position;
+        const parameterString = mimeToASCIILower(str.slice(position, afterParameterName));
+        position = afterParameterName;
+        if (position < endOfSource) {
+          const terminator = str.charAt(position);
+          position += 1;
+          if (terminator === ";") continue;   // parameter without a value
+        }
+        if (position >= endOfSource) break;
+        const char = str.charAt(position);
+        let parameterValue = null;
+        if (char === '"') {
+          position += 1;
+          // $1 = terminated on an unmatched backslash, $2 = terminated on the
+          // closing quote; either way the last character is not part of the value.
+          const insideMatch = QUOTED_VALUE_PATTERN.exec(str.slice(position));
+          position += insideMatch[0].length;
+          const inside = insideMatch[1] || insideMatch[2] ? insideMatch[0].slice(0, -1) : insideMatch[0];
+          parameterValue = mimeRemoveBackslashes(inside);
+          if (insideMatch[1]) parameterValue += "\\";
+        } else {
+          const valueEnd = str.indexOf(";", position);
+          const rawValue = valueEnd === -1 ? str.slice(position) : str.slice(position, valueEnd);
+          position += rawValue.length;
+          const trimmedValue = rawValue.slice(0, rawValue.search(START_ENDING_WHITESPACE));
+          if (trimmedValue === "") continue;
+          parameterValue = trimmedValue;
+        }
+        if (parameterString !== "" &&
+            parameterString.search(NOT_HTTP_TOKEN_CODE_POINT) === -1 &&
+            parameterValue.search(NOT_HTTP_QUOTED_STRING_CODE_POINT) === -1 &&
+            paramsMap.has(parameterString) === false) {
+          paramsMap.set(parameterString, parameterValue);
+        }
+        position++;
+      }
+      this.#data = paramsMap;
+      this.#processed = true;
+    }
   }
+  const MIMEParamsStringify = MIMEParams.prototype.toString;
+  Object.defineProperty(MIMEParams.prototype, Symbol.iterator, {
+    configurable: true, value: MIMEParams.prototype.entries, writable: true,
+  });
+  Object.defineProperty(MIMEParams.prototype, "toJSON", {
+    configurable: true, value: MIMEParamsStringify, writable: true,
+  });
+  const mimeInstantiateParams = MIMEParams.__instantiate;
+  delete MIMEParams.__instantiate;
+  class MIMEType {
+    #type;
+    #subtype;
+    #parameters;
+    constructor(string) {
+      string = `${string}`;
+      const data = mimeParseTypeAndSubtype(string);
+      this.#type = data[0];
+      this.#subtype = data[1];
+      this.#parameters = mimeInstantiateParams(string.slice(data[2]));
+    }
+    get type() { return this.#type; }
+    set type(v) {
+      v = `${v}`;
+      const invalidTypeIndex = v.search(NOT_HTTP_TOKEN_CODE_POINT);
+      if (v.length === 0 || invalidTypeIndex !== -1) throw mimeSyntaxError("type", v, invalidTypeIndex);
+      this.#type = mimeToASCIILower(v);
+    }
+    get subtype() { return this.#subtype; }
+    set subtype(v) {
+      v = `${v}`;
+      const invalidSubtypeIndex = v.search(NOT_HTTP_TOKEN_CODE_POINT);
+      if (v.length === 0 || invalidSubtypeIndex !== -1) throw mimeSyntaxError("subtype", v, invalidSubtypeIndex);
+      this.#subtype = mimeToASCIILower(v);
+    }
+    get essence() { return this.#type + "/" + this.#subtype; }
+    get params() { return this.#parameters; }
+    toString() {
+      let ret = this.#type + "/" + this.#subtype;
+      const paramStr = MIMEParamsStringify.call(this.#parameters);
+      if (paramStr.length) ret += ";" + paramStr;
+      return ret;
+    }
+  }
+  Object.defineProperty(MIMEType.prototype, "toJSON", {
+    configurable: true, value: MIMEType.prototype.toString, writable: true,
+  });
   util.MIMEType = MIMEType; util.MIMEParams = MIMEParams;
   util.inspect.custom = kInspectCustom;
   // node defines defaultOptions as an accessor: the setter validates and
@@ -1958,18 +2473,18 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       if (!events) throw unhandled();
       const errorMonitor = events[kErrorMonitor];
       if (typeof errorMonitor === "function") errorMonitor.apply(emitter, args);
-      else if (errorMonitor) for (const handler of errorMonitor.slice()) handler.apply(emitter, args);
+      else if (errorMonitor) { const c = errorMonitor.slice(); for (let i = 0; i < c.length; i++) c[i].apply(emitter, args); }
       const handlers = events.error;
       if (!handlers) throw unhandled();
       if (typeof handlers === "function") handlers.apply(emitter, args);
-      else for (const handler of handlers.slice()) handler.apply(emitter, args);
+      else { const c = handlers.slice(); for (let i = 0; i < c.length; i++) c[i].apply(emitter, args); }
       return true;
     }
     function addCatch(emitter, promise, type, args) {
       promise.then(undefined, function (err) { queueMicrotask(() => emitUnhandledRejectionOrErr(emitter, err, type, args)); });
     }
     function emitUnhandledRejectionOrErr(emitter, err, type, args) {
-      if (typeof emitter[kRejection] === "function") { emitter[kRejection](err, type, ...args); }
+      if (typeof emitter[kRejection] === "function") { const c = [err, type]; for (let i = 0; i < args.length; i++) c[c.length] = args[i]; emitter[kRejection].apply(emitter, c); }
       else { try { emitter[kCapture] = false; emitter.emit("error", err); } finally { emitter[kCapture] = true; } }
     }
     const emitWithoutRejectionCapture = function emit(type, ...args) {
@@ -1979,7 +2494,12 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       const handlers = events[type];
       if (handlers === undefined) return false;
       if (typeof handlers === "function") handlers.apply(this, args);
-      else for (const handler of handlers.slice()) handler.apply(this, args);
+      // Indexed loop, not for-of: `for (x of arr)` reads
+      // `Array.prototype[Symbol.iterator]` on every emit, so a program that
+      // deleted the array iterator could no longer dispatch ANY multi-listener
+      // event — including the 'line' event readline uses to drive the REPL.
+      // node's lib/events.js uses ArrayPrototypeSlice + ReflectApply for this.
+      else { const c = handlers.slice(); for (let i = 0; i < c.length; i++) c[i].apply(this, args); }
       return true;
     };
     const emitWithRejectionCapture = function emit(type, ...args) {
@@ -1991,9 +2511,12 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       if (typeof handlers === "function") {
         const result = handlers.apply(this, args);
         if (result !== undefined && typeof result?.then === "function" && result.then === Promise.prototype.then) addCatch(this, result, type, args);
-      } else for (const handler of handlers.slice()) {
-        const result = handler.apply(this, args);
-        if (result !== undefined && typeof result?.then === "function" && result.then === Promise.prototype.then) addCatch(this, result, type, args);
+      } else {
+        const c = handlers.slice();
+        for (let i = 0; i < c.length; i++) {
+          const result = c[i].apply(this, args);
+          if (result !== undefined && typeof result?.then === "function" && result.then === Promise.prototype.then) addCatch(this, result, type, args);
+        }
       }
       return true;
     };
@@ -2416,6 +2939,47 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       else if (ev === "readable") { readableMode = true; if (!ended) attach(); }
       return stdin;
     };
+    // `for await (const chunk of process.stdin)` — the canonical way a CLI/TUI
+    // drains piped input. node's Readable gets this from Symbol.asyncIterator;
+    // this stdin is a hand-rolled EventEmitter, so it had none at all and the
+    // for-await threw "undefined is not a function". Subscribe with origOn so
+    // the on() override's implicit resume() does not double-fire, then drive
+    // flowing mode explicitly. ref: regression tui-app-tty-pattern.
+    stdin[Symbol.asyncIterator] = function () {
+      const q = [];
+      let fin = ended || eof, ferr = null, waiter = null, live = true;
+      const wake = () => { const w = waiter; waiter = null; if (w) w(); };
+      const onData = (c) => { q.push(c); wake(); };
+      const onEnd = () => { fin = true; wake(); };
+      const onErr = (e) => { ferr = e; fin = true; wake(); };
+      const cleanup = () => {
+        if (!live) return;
+        live = false;
+        stdin.removeListener("data", onData);
+        stdin.removeListener("end", onEnd);
+        stdin.removeListener("error", onErr);
+      };
+      if (!fin) {
+        origOn("data", onData); origOn("end", onEnd); origOn("error", onErr);
+        stdin.resume();
+      } else {
+        live = false;
+      }
+      return {
+        [Symbol.asyncIterator]() { return this; },
+        next() {
+          const step = () => {
+            if (q.length) return { value: q.shift(), done: false };
+            if (ferr) { const e = ferr; ferr = null; cleanup(); throw e; }
+            if (fin) { cleanup(); return { value: undefined, done: true }; }
+            return new Promise((res) => { waiter = res; }).then(step);
+          };
+          try { return Promise.resolve(step()); } catch (e) { return Promise.reject(e); }
+        },
+        return(v) { cleanup(); return Promise.resolve({ value: v, done: true }); },
+        throw(e) { cleanup(); return Promise.reject(e); },
+      };
+    };
     G.process.stdin = stdin;
     // process.stdout/.stderr are tty.WriteStream/Socket in node & bun, i.e. real
     // EventEmitters: consumers subscribe to "resize"/"error"/"close" on them
@@ -2432,6 +2996,11 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       // a stdio array fell through to "invalid stdio option"
       // (test-child-process-validate-stdio). process.stdin already exposes 0.
       if (typeof strm.fd !== "number") { try { strm.fd = name === "stdout" ? 1 : 2; } catch (e) {} }
+      // node's stdout/stderr are Writables and report `writable === true` for the
+      // whole process lifetime; the native pair carried no such property, so
+      // `process.stdout.writable` read undefined (test-process-execve-throws
+      // checks it as its "the process survived a failed execve" probe).
+      if (typeof strm.writable !== "boolean") { try { strm.writable = true; } catch (e) {} }
       if (typeof strm.on === "function") continue;
       const ee = new EventEmitter();
       for (const k of ["on", "addListener", "prependListener", "once", "off", "removeListener",
@@ -2457,10 +3026,47 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     const body = entries.map((entry, i) => "  " + entry + (i + 1 < entries.length ? "," : "")).join("\n");
     return label + " {\n" + body + " }";
   };
-  const inspectURLSearchParams = (params, options) => inspectURLSearchParamsEntries(
-    "URLSearchParams",
-    params._e.map(([key, value]) => util.inspect(key) + " => " + util.inspect(value)),
-    options,
+  // Bun.inspect renders URLSearchParams as an object block ("key": "value" per
+  // line, trailing comma) where node's util.inspect renders the maplike form
+  // ('key' => 'value'). Both corpora pin their own shape — node
+  // test-whatwg-url-custom-searchparams-inspect asserts the maplike string, bun
+  // test/js/web/url/url.test.ts "prints" asserts the object block nested inside
+  // URL — so the layout follows the __bunStyle flag Bun.inspect sets rather than
+  // replacing one with the other.
+  const inspectURLSearchParamsBun = (params, indent) => {
+    const entries = params._e;
+    if (entries.length === 0) return "URLSearchParams {}";
+    const inner = indent + "  ";
+    // bun renders the .toJSON() projection, so repeated names collapse into one
+    // key whose value is the array of every value under that name (single
+    // occurrence stays a bare string). ref bun test/js/web/html/URLSearchParams
+    // "should support .toJSON". Insertion order follows first occurrence.
+    const order = [];
+    const grouped = new Map();
+    for (const [key, value] of entries) {
+      const k = "" + key;
+      const bucket = grouped.get(k);
+      if (bucket === undefined) { order.push(k); grouped.set(k, ["" + value]); }
+      else bucket.push("" + value);
+    }
+    let body = "";
+    for (const key of order) {
+      const values = grouped.get(key);
+      const rendered = values.length === 1
+        ? JSON.stringify(values[0])
+        : "[ " + values.map((v) => JSON.stringify(v)).join(", ") + " ]";
+      body += inner + JSON.stringify(key) + ": " + rendered + ",\n";
+    }
+    return "URLSearchParams {\n" + body + indent + "}";
+  };
+  const inspectURLSearchParams = (params, options, indent) => (
+    options && options.__bunStyle === true
+      ? inspectURLSearchParamsBun(params, indent || "")
+      : inspectURLSearchParamsEntries(
+          "URLSearchParams",
+          params._e.map(([key, value]) => util.inspect(key) + " => " + util.inspect(value)),
+          options,
+        )
   );
   if (typeof G.URLSearchParams === "undefined") {
     // ref: bun src/jsc/bindings/URLSearchParams.cpp, backed by
@@ -2771,6 +3377,9 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       if (!special) return encodeBySet(host, (_c, n) => n > 0x7f);
       try { host = decodeURIComponent(host); } catch (_) { throw new TypeError("invalid host"); }
       if (host.includes("%")) throw new TypeError("invalid host");
+      // UTS-46 mapping/validation must run BEFORE punycode, or a disallowed
+      // code point gets encoded instead of failing the parse. See `uts46`.
+      { const mapped = uts46(host); if (mapped === null) throw new TypeError("invalid host"); host = mapped; }
       if (/[^\x00-\x7f]/.test(host)) host = puny.toASCII(host);
       return canonicalIPv4(host.toLowerCase());
     };
@@ -2951,7 +3560,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       }
       toString() { return this.href; }
       toJSON() { return this.href; }
-      [Symbol.for("nodejs.util.inspect.custom")]() {
+      [Symbol.for("nodejs.util.inspect.custom")](depth, options) {
         try { void this.href; } catch (_) { return "URL {}"; }
         return "URL {\n" +
           "  href: " + JSON.stringify(this.href) + ",\n" +
@@ -2965,7 +3574,9 @@ inline constexpr char kBootstrapJS_[] = R"JS(
           "  pathname: " + JSON.stringify(this.pathname) + ",\n" +
           "  hash: " + JSON.stringify(this.hash) + ",\n" +
           "  search: " + JSON.stringify(this.search) + ",\n" +
-          "  searchParams: " + inspectURLSearchParams(this.searchParams) + ",\n" +
+          // nested one level in, so a multi-line bun block indents its entries
+          // to 4 and closes its brace at 2.
+          "  searchParams: " + inspectURLSearchParams(this.searchParams, options, "  ") + ",\n" +
           "  toJSON: [Function: toJSON],\n" +
           "  toString: [Function: toString],\n" +
           "}";
@@ -2981,7 +3592,10 @@ inline constexpr char kBootstrapJS_[] = R"JS(
         const custom = value[kInspectCustom];
         return typeof custom === "function" ? custom.call(value, depth, options) : inspectURLSearchParams(value, options);
       }
-      if (value instanceof G.URL) return value[Symbol.for("nodejs.util.inspect.custom")]();
+      if (value instanceof G.URL) {
+        const depth = typeof options?.depth === "number" ? options.depth : 2;
+        return value[Symbol.for("nodejs.util.inspect.custom")](depth, options);
+      }
       return inspectBeforeURL.call(this, value, options);
     };
     for (const k of Object.keys(inspectBeforeURL)) { try { util.inspect[k] = inspectBeforeURL[k]; } catch (_) {} }
@@ -3071,6 +3685,66 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     return { encode, decode, toASCII, toUnicode, ucs2: { decode: ucs2, encode: (a) => String.fromCodePoint(...a) }, version: "2.3.1" };
   })();
   def(["punycode"], puny);
+
+  // ---- UTS-46 (IDNA) validation -- the step that belongs AHEAD of punycode ----
+  // ToASCII is not "punycode-encode every non-ASCII label". UTS-46 first MAPS
+  // and IGNORES code points, and then a label whose mapped form contains a
+  // forbidden domain character is a FAILURE. mbun's punycode encoder was always
+  // correct ("muenchen.de" -> "xn--mnchen-3ya.de") but this step was missing, so
+  // a disallowed character got ENCODED instead of rejected:
+  //   domainToASCII("fail<U+2047>fail.com") -> "xn--failfail-803d.com"
+  // where node returns "" and new URL()/url.parse() throw ERR_INVALID_URL.
+  //
+  // SUBSET IMPLEMENTED -- deliberately not the whole IdnaMappingTable:
+  //   (a) the `ignored` class, removed before anything else, so a host built
+  //       only from them ends up empty and therefore invalid. This is what
+  //       makes url.parse("http://<U+00AD>/bad.com/") throw.
+  //   (b) `mapped`-to-forbidden: a non-ASCII code point whose compatibility
+  //       decomposition (NFKD) contains one of node's forbidden domain
+  //       characters  # % / : ? @ [ \ ] ^ |  is rejected. NFKD is the right
+  //       approximation because UTS-46's `mapped` entries are compatibility-
+  //       derived, and it is exactly the criterion test-url-parse-invalid-input
+  //       generates its own cases from. On this ICU it selects 29 code points
+  //       in 18 ranges -- U+2047..U+2049, U+2100..U+2101, U+2105..U+2106,
+  //       U+2A74, and parts of U+FE13..U+FF5C (so U+2100 -> "a/c" and
+  //       U+FF20 -> "@" are rejected, which the test asserts by name).
+  //       It is derived from the runtime's own normalize() rather than tabled,
+  //       so it cannot go stale against a different ICU.
+  // NOT implemented: the full mapped/deviation tables, CheckBidi, CheckJoiners,
+  // CheckHyphens, VerifyDnsLength, and STD3 rules. Those cost real tables and
+  // nothing in the corpus asks for them.
+  // `require("punycode")` is intentionally left alone: node's punycode module
+  // is plain RFC 3492 with no UTS-46 step, and test-punycode depends on that.
+  const uts46Ignored = /[\u00AD\u034F\u061C\u115F\u1160\u17B4\u17B5\u180B-\u180D\u180F\u200B\u200E\u200F\u202A-\u202E\u2060-\u2064\u206A-\u206F\u3164\uFE00-\uFE0F\uFEFF\uFFA0\uFFF0-\uFFF8]/g;
+  const uts46Forbidden = "#%/:?@[\\]^|";
+  const uts46BadCache = new Map();
+  const uts46BadCp = (cp) => {
+    let v = uts46BadCache.get(cp);
+    if (v === undefined) {
+      v = false;
+      try {
+        const d = String.fromCodePoint(cp).normalize("NFKD");
+        for (const b of uts46Forbidden) if (d.indexOf(b) !== -1) { v = true; break; }
+      } catch (e) {}
+      uts46BadCache.set(cp, v);
+    }
+    return v;
+  };
+  // Returns the domain with UTS-46-ignored code points removed, or null when
+  // the domain must be rejected. Pure-ASCII input is returned untouched, so no
+  // existing ASCII host path can change behaviour.
+  // An ALREADY-empty domain is passed through, not rejected: "file:///tmp/x"
+  // has a legitimately empty host, and callers that do forbid an empty host
+  // (urlValidateHostname, badDomain) already check for it themselves. Only a
+  // NON-empty domain that becomes empty after dropping ignored code points is
+  // a failure -- that is the "http://<U+00AD>/bad.com/" case.
+  const uts46 = (domain) => {
+    const s = String(domain);
+    const d = s.replace(uts46Ignored, "");
+    if (d === "") return s === "" ? "" : null;
+    for (const ch of d) { const cp = ch.codePointAt(0); if (cp >= 0x80 && uts46BadCp(cp)) return null; }
+    return d;
+  };
 
   // ---- node:tty / node:perf_hooks / node:_http_common ----
   def(["tty"], { isatty: () => false, ReadStream: class ReadStream extends EventEmitter { constructor() { super(); this.isTTY = true; this.isRaw = false; } setRawMode() { return this; } ref() {} unref() {} }, WriteStream: class WriteStream extends EventEmitter { constructor() { super(); this.isTTY = true; this.columns = 80; this.rows = 24; } getColorDepth() { return 8; } hasColors() { return true; } clearLine() { return true; } cursorTo() { return true; } getWindowSize() { return [80, 24]; } } });
@@ -3167,7 +3841,8 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       if (!(hostname[0] === "[" && hostname[hostname.length - 1] === "]" && urlIsIpv6(hostname.slice(1, -1)))) throw urlInvalid(input);
       return hostname;
     }
-    let h = hostname;
+    let h = uts46(hostname);
+    if (h === null) throw urlInvalid(input);
     if (/[^\x00-\x7F]/.test(h)) { try { h = puny.toASCII(h); } catch (e) { throw urlInvalid(input); } }
     if (h === "" || /[\x00-\x20#%/:?@\\]/.test(h)) throw urlInvalid(input);
     return h;
@@ -3214,14 +3889,24 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     }
     return urlParse(url, parseQueryString, slashesDenoteHost);
   };
-  let urlWarnInvalidPort = true;
+
   const urlGetHostname = (self, rest, hostname, url) => {
     for (let i = 0; i < hostname.length; ++i) {
       const code = hostname.charCodeAt(i);
       const isValid = code !== 47 /* / */ && code !== 92 /* \ */ && code !== 35 /* # */ && code !== 63 /* ? */ && code !== 58 /* : */;
       if (!isValid) {
         // A leftover ":" here means an invalid (non-numeric) port — the valid
-        // trailing :port was already stripped by parseHost(); node throws.
+        // trailing :port was already stripped by parseHost(); node THROWS.
+        //
+        // CROSS-CORPUS CONFLICT, measured — do not "fix" this to be lenient.
+        // bun's compat/bun/test/js/node/url/url-parse-format.test.js wants node's
+        // older lenient behaviour (emit DEP0170 once, fold the leftover into the
+        // pathname, so `git+ssh://git@github.com:npm/npm` -> hostname
+        // "github.com", pathname "/:npm/npm"). A lane implemented exactly that
+        // and it turned node's `test-url-parse-invalid-input.js` from pass to
+        // FAIL: that file asserts the throw and is green. One bun file gained,
+        // one green node file lost, so it was reverted. There is no caller-side
+        // discriminator here, so `__bunStyle`-style routing does not reach it.
         if (code === 58) { const e = new TypeError("The argument 'url' Invalid port in url. Received " + JSON.stringify(url)); e.code = "ERR_INVALID_ARG_VALUE"; throw e; }
         self.hostname = hostname.slice(0, i);
         return "/" + hostname.slice(i) + rest;
@@ -3273,6 +3958,31 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       if (slashes && !(proto && urlHostlessProtocol[lowerProto])) { rest = rest.slice(2); this.slashes = true; }
     }
     if (!urlHostlessProtocol[lowerProto] && (slashes || (proto && !urlSlashedProtocol[proto]))) {
+      // node lib/url.js:321 -- its host scan drops TAB/LF/CR as it walks and
+      // stops at the first host-ending char, so "http://a\r\"@c\r\nd/e" has
+      // auth "a\"" and host "cd". Everything from that char on is path and is
+      // left alone (the path percent-encodes them: "/\tbc" -> "/%09bc").
+      // mbun replaced node's single scanning loop with indexOf() passes, which
+      // skipped this step; reproduce just the pre-host strip.
+      {
+        let stripped = "", k = 0;
+        for (; k < rest.length; k++) {
+          const c = rest.charCodeAt(k);
+          if (c === 9 || c === 10 || c === 13) continue;
+          // '[' also stops the strip. node itself would keep stripping (real
+          // node v26 parses "https://[\n::1]" as host "[::1]"), but bun's
+          // corpus PINS the stricter reading -- js/node/url/url-parse-ipv6
+          // asserts url.parse("https://[\n::1]") throws, and it is green.
+          // mbun serves both corpora and must not trade a green bun file for a
+          // green node file, so the strip stops at a bracketed literal. The
+          // node case that needs it (test-url-parse-format's
+          // "http://a\r\"...@c\r\nd/e?f") has no brackets, so both hold.
+          if (c === 91 /* [ */) break;
+          if (c === 35 /* # */ || c === 47 /* / */ || c === 63 /* ? */) break;
+          stripped += rest[k];
+        }
+        rest = stripped + rest.slice(k);
+      }
       // host ends at the first of / ? # ; auth may sit left of the last @
       // that appears before that point (http://a@b@c/ → user:a@b host:c)
       let hostEnd = -1;
@@ -3328,17 +4038,30 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     let protocol = this.protocol || "", pathname = this.pathname || "", hash = this.hash || "", host = "", query = "";
     if (this.host) host = auth + this.host;
     else if (this.hostname) {
-      host = auth + (this.hostname.indexOf(":") === -1 ? this.hostname : "[" + this.hostname + "]");
+      // node lib/url.js:655 -- bracket a colon-bearing hostname UNLESS it is
+      // already bracketed (isIpv6Hostname), or format({hostname:"[::]"})
+      // double-wraps to "[[::]]".
+      host = auth + (this.hostname.indexOf(":") === -1 ||
+        (this.hostname.charCodeAt(0) === 91 && this.hostname.charCodeAt(this.hostname.length - 1) === 93)
+        ? this.hostname : "[" + this.hostname + "]");
       if (this.port) host += ":" + this.port;
     }
     if (this.query && typeof this.query === "object" && Object.keys(this.query).length) query = new G.URLSearchParams(this.query).toString();
     let search = this.search || (query && "?" + query) || "";
     if (protocol && protocol[protocol.length - 1] !== ":") protocol += ":";
-    // only slashed protocols get the //; others only if slashes was set
-    if (this.slashes || ((!protocol || urlSlashedProtocol[protocol]) && host.length > 0)) {
-      host = "//" + host;
-      if (pathname && pathname[0] !== "/") pathname = "/" + pathname;
-    } else if (!host) host = "";
+    // only slashed protocols get the //; others only if slashes was set.
+    // Mirrors node lib/url.js exactly (verified against node v26.3.0):
+    //   format({protocol:"file", pathname:"/home/user"}) -> "file:///home/user"
+    //     -- a host-less file: URL still gets the "//" (its own else-branch),
+    //   format({host:"a.com", pathname:"/x"})            -> "a.com/x"
+    //     -- NO "//" when there is no protocol, which the previous
+    //        `!protocol || ...` condition got backwards.
+    if (this.slashes || urlSlashedProtocol[protocol]) {
+      if (this.slashes || host) {
+        if (pathname && pathname[0] !== "/") pathname = "/" + pathname;
+        host = "//" + host;
+      } else if (protocol.slice(0, 4) === "file") host = "//";
+    }
     if (hash && hash[0] !== "#") hash = "#" + hash;
     if (search && search[0] !== "?") search = "?" + search;
     pathname = pathname.replace(/[?#]/g, (m) => encodeURIComponent(m));
@@ -3585,6 +4308,17 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     flush();
     return parts.length === 1 ? parts[0] : Buffer.concat(parts);
   };
+  // WHATWG "file host state": a would-be host that is a Windows drive letter is
+  // not a host at all — it belongs to the path, so `file://C:/x` parses as host
+  // "" + pathname "/C:/x". WTF::URL (the parser behind JSC's global URL) skips
+  // that quirk and yields host "c", which then trips the
+  // ERR_INVALID_FILE_URL_HOST guard below. Normalise the string form before
+  // handing it to the parser. ref: https://url.spec.whatwg.org/#file-host-state
+  // and compat/bun/test/js/node/url/url.test.ts "#16705".
+  const urlFileDriveQuirk = (s) => {
+    const m = /^(file:\/\/)([a-zA-Z])[:|](?:[/\\?#]|$)/i.exec(s);
+    return m ? m[1] + "/" + s.slice(m[1].length) : s;
+  };
   const urlMod = {
     URL: G.URL, URLSearchParams: G.URLSearchParams, Url,
     // node lib/url.js re-exports URLPattern. It is installed by the
@@ -3594,7 +4328,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     // faithful port of node lib/internal/url.js fileURLToPath / getPathFromURL{Win32,Posix}
     fileURLToPath: (path, options) => {
       const windows = options == null ? undefined : options.windows;
-      if (typeof path === "string") path = new G.URL(path);
+      if (typeof path === "string") path = new G.URL(urlFileDriveQuirk(path));
       else if (!urlIsURLLike(path)) { const e = new TypeError('The "path" argument must be of type string or an instance of URL.' + urlArgTypeReceived(path)); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
       if (path.protocol !== "file:") { const e = new TypeError("The URL must be of scheme file"); e.code = "ERR_INVALID_URL_SCHEME"; throw e; }
       const useWin = windows === undefined ? __isWin : windows;
@@ -3625,7 +4359,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     },
     fileURLToPathBuffer: (path, options) => {
       const windows = options == null ? undefined : options.windows;
-      if (typeof path === "string") path = new G.URL(path);
+      if (typeof path === "string") path = new G.URL(urlFileDriveQuirk(path));
       else if (!urlIsURLLike(path)) { const e = new TypeError('The "path" argument must be of type string or an instance of URL.' + urlArgTypeReceived(path)); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
       if (path.protocol !== "file:") { const e = new TypeError("The URL must be of scheme file"); e.code = "ERR_INVALID_URL_SCHEME"; throw e; }
       const useWin = windows === undefined ? __isWin : windows;
@@ -3689,8 +4423,8 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     resolve: (source, relative) => urlParse(source, false, true).resolve(relative),
     resolveObject: (source, relative) => (source ? urlParse(source, false, true).resolveObject(relative) : relative),
     urlToHttpOptions,
-    domainToASCII: (d) => { if (d == null) return d; d = String(d); if (badDomain(d)) return ""; if (d.toLowerCase().split(".").some((l) => /^xn--/i.test(l) && /[^\x00-\x7F]/.test(l))) return ""; try { return puny.toASCII(d.toLowerCase()); } catch (e) { return ""; } },
-    domainToUnicode: (d) => { if (d == null) return d; d = String(d); if (badDomain(d)) return ""; if (d.toLowerCase().split(".").some((l) => /^xn--/i.test(l) && /[^\x00-\x7F]/.test(l))) return ""; try { return puny.toUnicode(d.toLowerCase()); } catch (e) { return ""; } },
+    domainToASCII: (d) => { if (d == null) return d; d = String(d); if (badDomain(d)) return ""; { const m = uts46(d); if (m === null) return ""; d = m; } if (d.toLowerCase().split(".").some((l) => /^xn--/i.test(l) && /[^\x00-\x7F]/.test(l))) return ""; try { return puny.toASCII(d.toLowerCase()); } catch (e) { return ""; } },
+    domainToUnicode: (d) => { if (d == null) return d; d = String(d); if (badDomain(d)) return ""; { const m = uts46(d); if (m === null) return ""; d = m; } if (d.toLowerCase().split(".").some((l) => /^xn--/i.test(l) && /[^\x00-\x7F]/.test(l))) return ""; try { return puny.toUnicode(d.toLowerCase()); } catch (e) { return ""; } },
   };
   def(["url"], urlMod);
 
@@ -4138,6 +4872,618 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     Database.MAX_QUERY_CACHE_SIZE = 20;
     const mod = { __esModule: true, Database, Statement, constants, SQLiteError, default: Database };
     M["bun:sqlite"] = { Database, Statement, constants, SQLiteError, default: mod };
+
+    // ---- node:sqlite -------------------------------------------------------
+    // `bun:sqlite` was fully working while `node:sqlite` threw
+    // ERR_UNKNOWN_BUILTIN_MODULE, so 22 corpus files called
+    // common.skip('missing SQLite') and never ran. That class was invisible for
+    // the whole campaign because self-skips are (correctly) excluded from the
+    // "actionable failure" count, so nothing in the planning loop looked at them.
+    //
+    // This is NOT an alias and NOT a wrapper over bun's Statement: node's binding
+    // semantics differ at almost every point that matters -- rows are
+    // null-prototype objects, `run()` reports the CONNECTION-global
+    // sqlite3_changes/last_insert_rowid (so `COMMIT` echoes the previous INSERT's
+    // counters), unknown named parameters are an ERR_INVALID_STATE rather than a
+    // silent null, unbound parameters ARE a silent null, and every error is a node
+    // error code rather than a SQLiteError. So the classes sit directly on
+    // __mbunSqliteNative and reuse only `parseParams` (the SQL parameter scanner)
+    // from the bun layer above.
+    //
+    // Still deliberately absent, because each needs a native trampoline that does
+    // not exist yet: custom function()/aggregate() (sqlite3_create_function_v2
+    // calling back into JS), session/changeset, backup(), and setAuthorizer().
+    // The files needing those keep failing rather than pretending.
+    {
+      const INT64_HI = 9223372036854775807n, INT64_LO = -9223372036854775808n;
+      const SQLITE_MAX_LIMIT = 0x7fffffff;
+      // sqlite3_db_config verbs node exposes; none has a PRAGMA form.
+      const DBCONFIG_DEFENSIVE = 1010, DBCONFIG_DQS_DML = 1013, DBCONFIG_DQS_DDL = 1014;
+      // sqlite3_limit ids, in the order node's `limits` object lists them.
+      const LIMIT_IDS = [["length", 0], ["sqlLength", 1], ["column", 2], ["exprDepth", 3],
+                         ["compoundSelect", 4], ["vdbeOp", 5], ["functionArg", 6],
+                         ["attach", 7], ["likePatternLength", 8], ["variableNumber", 9],
+                         ["triggerDepth", 10]];
+
+      const mkErr = (Ctor, code, msg) => { const e = new Ctor(msg); e.code = code; return e; };
+      const argTypeErr = (msg) => mkErr(TypeError, "ERR_INVALID_ARG_TYPE", msg);
+      const argValueErr = (msg) => mkErr(TypeError, "ERR_INVALID_ARG_VALUE", msg);
+      const stateErr = (msg) => mkErr(Error, "ERR_INVALID_STATE", msg);
+      const rangeErr = (msg) => mkErr(RangeError, "ERR_OUT_OF_RANGE", msg);
+      // The native bridge throws bun-shaped SQLiteError; node wants
+      // ERR_SQLITE_ERROR with sqlite3_errmsg verbatim plus the EXTENDED result
+      // code and its errstr (which resolves to the primary code's text).
+      const toNodeSqlErr = (e) => {
+        if (e == null || e.name !== "SQLiteError") return e;
+        const n = new Error(e.message);
+        n.code = "ERR_SQLITE_ERROR";
+        if (e.errcode !== undefined) { n.errcode = e.errcode; n.errstr = e.errstr; }
+        return n;
+      };
+      // An authorizer callback runs inside sqlite3_prepare_v2 -- underneath a
+      // JS->C->JS re-entry -- so it cannot throw across the boundary. The wrapper
+      // below is total: it converts every failure into SQLITE_DENY and parks the
+      // real exception here, and `native()` rethrows THAT instead of the
+      // "not authorized" SQLiteError sqlite would otherwise report.
+      let pendingCallbackError = null;
+      const native = (fn) => {
+        try { return fn(); }
+        catch (e) {
+          if (pendingCallbackError !== null) { const p = pendingCallbackError; pendingCallbackError = null; throw p; }
+          throw toNodeSqlErr(e);
+        }
+      };
+
+      const checkBool = (v, label) => {
+        if (typeof v !== "boolean") throw argTypeErr(`The "${label}" argument must be a boolean.`);
+        return v;
+      };
+      const optBool = (o, key, dflt) => {
+        const v = o[key];
+        if (v === undefined) return dflt;
+        return checkBool(v, `options.${key}`);
+      };
+
+      // ---- value binding ----------------------------------------------------
+      // node rejects what SQLite cannot store (undefined, functions, symbols,
+      // regexps, promises, maps, sets, booleans) naming the 1-based parameter
+      // position, and normalizes every ArrayBufferView -- including DataView and
+      // the BigInt/Float views -- to the raw bytes behind it.
+      const bindValue = (v, pos) => {
+        if (v === null) return null;
+        const t = typeof v;
+        if (t === "number" || t === "string") return v;
+        if (t === "bigint") {
+          if (v > INT64_HI || v < INT64_LO) {
+            throw argValueErr(`BigInt value is too large to bind. Received ${v}n`);
+          }
+          return v;
+        }
+        if (ArrayBuffer.isView(v)) {
+          // JSValueGetTypedArrayType does not recognise a DataView, so hand the
+          // bridge a plain Uint8Array over the same bytes in every case.
+          return v instanceof Uint8Array && v.constructor === Uint8Array
+            ? v : new Uint8Array(v.buffer, v.byteOffset, v.byteLength);
+        }
+        throw argTypeErr(`Provided value cannot be bound to SQLite parameter ${pos}.`);
+      };
+
+      // Positions that carry no name ("?" and "?N"), ascending -- these are what
+      // trailing positional arguments bind to, in order.
+      const anonPositions = (parsed) => {
+        const seen = new Set();
+        for (const t of parsed.tokens) if (t.bare === null) seen.add(t.index);
+        return [...seen].sort((a, b) => a - b);
+      };
+
+      // node's bind protocol: an optional leading named-parameters object, then
+      // positional arguments. Missing positions bind NULL (statements are unbound
+      // on every call), which is why an EXPLICIT undefined is an error while an
+      // omitted argument is not.
+      const bindAll = (parsed, args, st) => {
+        const count = parsed.count;
+        const pos = new Array(count).fill(null);
+        let anonStart = 0;
+        const a0 = args[0];
+        if (args.length > 0 && a0 !== null && typeof a0 === "object"
+            && !Array.isArray(a0) && !ArrayBuffer.isView(a0)) {
+          anonStart = 1;
+          for (const key of Object.keys(a0)) {
+            let idx = -1;
+            const c = key.charCodeAt(0);
+            if (c === 36 || c === 58 || c === 64) {          // $ : @
+              for (const t of parsed.tokens) if (t.raw === key) { idx = t.index; break; }
+            } else if (st.allowBare) {
+              let found = null, clash = null;
+              for (const t of parsed.tokens) {
+                if (t.bare !== key) continue;
+                if (found === null) found = t;
+                else if (t.raw !== found.raw && clash === null) clash = t;
+              }
+              if (clash !== null) {
+                throw stateErr(`Cannot create bare named parameter '${key}' because of `
+                               + `conflicting names '${found.raw}' and '${clash.raw}'.`);
+              }
+              if (found !== null) idx = found.index;
+            }
+            if (idx < 0) {
+              if (st.allowUnknown) continue;
+              throw stateErr(`Unknown named parameter '${key}'`);
+            }
+            pos[idx - 1] = bindValue(a0[key], idx);
+          }
+        }
+        const anon = anonPositions(parsed);
+        let n = 0;
+        for (let i = anonStart; i < args.length; i++) {
+          if (n >= anon.length) {
+            // sqlite3_bind_* answers SQLITE_RANGE here; node surfaces it verbatim.
+            const e = new Error("column index out of range");
+            e.code = "ERR_SQLITE_ERROR"; e.errcode = 25; e.errstr = "column index out of range";
+            throw e;
+          }
+          const p = anon[n++];
+          pos[p - 1] = bindValue(args[i], p);
+        }
+        return pos;
+      };
+
+      // ---- row shaping ------------------------------------------------------
+      // Rows are null-prototype objects built with defineProperty, so a column
+      // literally named "__proto__" / "constructor" becomes an own data property
+      // instead of mutating the object.
+      const shapeRow = (cols, types, row, st) => {
+        // returnArrays still goes through readValue: the two flags compose, and
+        // `{ returnArrays: true, readBigInts: true }` must yield [1n, 2n].
+        if (st.returnArrays) return row.map((v, i) => readValue(v, types[i], st));
+        const o = { __proto__: null };
+        for (let i = 0; i < cols.length; i++) {
+          Object.defineProperty(o, cols[i], {
+            value: readValue(row[i], types[i], st),
+            writable: true, enumerable: true, configurable: true,
+          });
+        }
+        return o;
+      };
+      const readValue = (v, type, st) => {
+        if (typeof v !== "number" || type !== "INTEGER") return v;
+        if (st.readBigInts) return BigInt(v);
+        // An int64 past 2^53 already lost precision crossing the bridge as a
+        // double; node refuses to hand back a wrong number.
+        if (!Number.isSafeInteger(v)) {
+          throw rangeErr(`Value is too large to be represented as a JavaScript number: ${v}`);
+        }
+        return v;
+      };
+      const counter = (n, st) => (st.readBigInts ? BigInt(n) : n);
+
+      // A user-defined function's return value, mapped onto what SQLite can
+      // store. A Promise is called out separately because returning one is a
+      // plausible mistake with a very unhelpful generic message.
+      const fnReturnToSql = (r) => {
+        if (r === undefined || r === null) return null;
+        const t = typeof r;
+        if (t === "number" || t === "string") return r;
+        if (t === "bigint") {
+          if (r > INT64_HI || r < INT64_LO) {
+            throw rangeErr("BigInt value is too large to convert to a SQLite value");
+          }
+          return r;
+        }
+        if (ArrayBuffer.isView(r)) {
+          return r instanceof Uint8Array && r.constructor === Uint8Array
+            ? r : new Uint8Array(r.buffer, r.byteOffset, r.byteLength);
+        }
+        if (typeof r.then === "function") {
+          throw mkErr(Error, "ERR_SQLITE_ERROR",
+                      "Asynchronous user-defined functions are not supported");
+        }
+        throw mkErr(Error, "ERR_SQLITE_ERROR",
+                    "Returned JavaScript value cannot be converted to a SQLite value");
+      };
+
+      const ILLEGAL = Symbol("node:sqlite illegal constructor");
+
+      class StatementSyncImpl {
+        #db; #sql; #parsed; #gen = 0;
+        readBigInts; returnArrays; allowBare; allowUnknown; finalized = false;
+        constructor(guard, db, sql, opts) {
+          if (guard !== ILLEGAL) {
+            throw mkErr(TypeError, "ERR_ILLEGAL_CONSTRUCTOR", "Illegal constructor");
+          }
+          this.#db = db; this.#sql = sql; this.#parsed = parseParams(sql);
+          this.readBigInts = opts.readBigInts; this.returnArrays = opts.returnArrays;
+          this.allowBare = opts.allowBare; this.allowUnknown = opts.allowUnknown;
+        }
+        get __sql() { return this.#sql; }
+        #live() {
+          if (this.finalized) throw stateErr("statement has been finalized");
+          this.#db.__need();
+          return this.#db;
+        }
+        #exec(args) {
+          const db = this.#live();
+          this.#gen++;
+          const pos = bindAll(this.#parsed, args, this);
+          this.__lastParams = pos;   // expandedSQL renders these back in
+          return native(() => SQ.run(db.__handle, this.#sql, pos));
+        }
+        run(...a) {
+          const r = this.#exec(a);
+          return { changes: counter(r.changes, this), lastInsertRowid: counter(r.lastInsertRowid, this) };
+        }
+        get(...a) {
+          const r = this.#exec(a);
+          return r.values.length ? shapeRow(r.columns, r.types, r.values[0], this) : undefined;
+        }
+        all(...a) {
+          const r = this.#exec(a);
+          return r.values.map((row) => shapeRow(r.columns, r.types, row, this));
+        }
+        iterate(...a) {
+          const r = this.#exec(a);
+          const st = this, gen = this.#gen;
+          let i = 0;
+          const done = () => ({ __proto__: null, done: true, value: null });
+          const it = {
+            next() {
+              // Any later get/all/run/iterate on the same statement resets the
+              // underlying cursor, which node reports as an invalidated iterator.
+              if (gen !== st.__gen) throw stateErr("The iterator was invalidated");
+              if (i >= r.values.length) return done();
+              return { __proto__: null, done: false,
+                       value: shapeRow(r.columns, r.types, r.values[i++], st) };
+            },
+            return() { i = r.values.length; return done(); },
+            [Symbol.iterator]() { return this; },
+          };
+          // Iterator.prototype gives `instanceof Iterator` and the iterator
+          // helpers (toArray/take/...) node's iterator inherits.
+          if (typeof G.Iterator === "function") Object.setPrototypeOf(it, G.Iterator.prototype);
+          return it;
+        }
+        get __gen() { return this.#gen; }
+        columns() {
+          const db = this.#live();
+          const info = native(() => SQ.columnInfo(db.__handle, this.#sql));
+          return info.map((c) => ({ __proto__: null, column: c.column, database: c.database,
+                                    name: c.name, table: c.table, type: c.type }));
+        }
+        setReadBigInts(v) { this.readBigInts = checkBool(v, "readBigInts"); return undefined; }
+        setReturnArrays(v) { this.returnArrays = checkBool(v, "returnArrays"); return undefined; }
+        setAllowBareNamedParameters(v) {
+          this.allowBare = checkBool(v, "allowBareNamedParameters"); return undefined;
+        }
+        setAllowUnknownNamedParameters(v) {
+          this.allowUnknown = checkBool(v, "enabled"); return undefined;
+        }
+        get sourceSQL() { return this.#sql; }
+        get expandedSQL() {
+          const db = this.#live();
+          return native(() => SQ.expandedSQL(db.__handle, this.#sql, this.__lastParams || []));
+        }
+        [Symbol.dispose]() { this.finalized = true; }
+      }
+      // Direct construction must fail with ERR_ILLEGAL_CONSTRUCTOR, but the class
+      // itself is what `stmt instanceof StatementSync` is checked against.
+      function StatementSync(...a) { return new StatementSyncImpl(...a); }
+      StatementSync.prototype = StatementSyncImpl.prototype;
+      Object.defineProperty(StatementSync, "name", { value: "StatementSync" });
+
+      const decodePath = (p) => {
+        if (typeof p === "string") return p;
+        if (ArrayBuffer.isView(p)) return new TextDecoder().decode(p);
+        if (p instanceof URL || (p && typeof p === "object" && typeof p.href === "string"
+                                 && typeof p.protocol === "string")) {
+          if (p.protocol !== "file:") {
+            throw mkErr(TypeError, "ERR_INVALID_URL_SCHEME", "The URL must be of scheme file:");
+          }
+          return decodeURIComponent(p.pathname);
+        }
+        return null;
+      };
+
+      class DatabaseSyncImpl {
+        #handle = 0; #path; #open = false; #opts; #stmts = new Set(); #limits = null;
+        constructor(path, options) {
+          const decoded = decodePath(path);
+          if (decoded === null || decoded.includes(" ")) {
+            throw argTypeErr("The \"path\" argument must be a string, Uint8Array, or URL "
+                             + "without null bytes.");
+          }
+          if (options !== undefined && (options === null || typeof options !== "object")) {
+            throw argTypeErr("The \"options\" argument must be an object.");
+          }
+          const o = options || {};
+          const opts = {
+            open: optBool(o, "open", true),
+            readOnly: optBool(o, "readOnly", false),
+            enableForeignKeyConstraints: optBool(o, "enableForeignKeyConstraints", true),
+            enableDoubleQuotedStringLiterals: optBool(o, "enableDoubleQuotedStringLiterals", false),
+            defensive: optBool(o, "defensive", true),
+            readBigInts: optBool(o, "readBigInts", false),
+            returnArrays: optBool(o, "returnArrays", false),
+            allowBare: optBool(o, "allowBareNamedParameters", true),
+            allowUnknown: optBool(o, "allowUnknownNamedParameters", false),
+            allowExtension: optBool(o, "allowExtension", false),
+            timeout: 0, limits: null,
+          };
+          if (o.timeout !== undefined) {
+            if (!Number.isInteger(o.timeout)) {
+              throw argTypeErr("The \"options.timeout\" argument must be an integer.");
+            }
+            opts.timeout = o.timeout;
+          }
+          if (o.limits !== undefined) {
+            if (o.limits === null || typeof o.limits !== "object") {
+              throw argTypeErr("The \"options.limits\" argument must be an object.");
+            }
+            const out = [];
+            for (const [name, id] of LIMIT_IDS) {
+              const v = o.limits[name];
+              if (v === undefined) continue;
+              if (!Number.isInteger(v)) {
+                throw argTypeErr(`The "options.limits.${name}" argument must be an integer.`);
+              }
+              if (v < 0) {
+                throw mkErr(RangeError, "ERR_OUT_OF_RANGE",
+                            `The "options.limits.${name}" argument must be non-negative.`);
+              }
+              out.push([id, v]);
+            }
+            opts.limits = out;
+          }
+          this.#path = decoded; this.#opts = opts;
+          if (opts.open) this.#openNow();
+        }
+        #openNow() {
+          this.#handle = native(() => SQ.open(this.#path, this.#opts.readOnly,
+                                              !this.#opts.readOnly));
+          this.#open = true;
+          const o = this.#opts;
+          if (o.timeout > 0) SQ.busyTimeout(this.#handle, o.timeout);
+          // node's defaults differ from SQLite's own on all three of these.
+          SQ.dbConfig(this.#handle, DBCONFIG_DQS_DML, o.enableDoubleQuotedStringLiterals ? 1 : 0);
+          SQ.dbConfig(this.#handle, DBCONFIG_DQS_DDL, o.enableDoubleQuotedStringLiterals ? 1 : 0);
+          SQ.dbConfig(this.#handle, DBCONFIG_DEFENSIVE, o.defensive ? 1 : 0);
+          if (o.enableForeignKeyConstraints) {
+            try { SQ.run(this.#handle, "PRAGMA foreign_keys = ON", []); } catch (e) { /* best effort */ }
+          }
+          if (o.limits) for (const [id, v] of o.limits) SQ.limit(this.#handle, id, v);
+        }
+        __need() {
+          if (!this.#open) throw stateErr("database is not open");
+          return this;
+        }
+        get __handle() { return this.#handle; }
+        get isOpen() { return this.#open; }
+        get isTransaction() {
+          this.__need();
+          return SQ.inTransaction(this.#handle);
+        }
+        open() {
+          if (this.#open) throw stateErr("database is already open");
+          this.#openNow();
+          return undefined;
+        }
+        close() {
+          this.__need();
+          for (const s of this.#stmts) s.finalized = true;
+          this.#stmts.clear();
+          SQ.close(this.#handle);
+          this.#open = false;
+          return undefined;
+        }
+        exec(sql) {
+          this.__need();
+          if (typeof sql !== "string") throw argTypeErr("The \"sql\" argument must be a string.");
+          native(() => SQ.run(this.#handle, sql, []));
+          return undefined;
+        }
+        prepare(sql, options) {
+          this.__need();
+          if (typeof sql !== "string") throw argTypeErr("The \"sql\" argument must be a string.");
+          const o = this.#opts;
+          let readBigInts = o.readBigInts, returnArrays = o.returnArrays;
+          let allowBare = o.allowBare, allowUnknown = o.allowUnknown;
+          if (options !== undefined) {
+            if (options === null || typeof options !== "object") {
+              throw argTypeErr("The \"options\" argument must be an object.");
+            }
+            readBigInts = optBool(options, "readBigInts", readBigInts);
+            returnArrays = optBool(options, "returnArrays", returnArrays);
+            allowBare = optBool(options, "allowBareNamedParameters", allowBare);
+            allowUnknown = optBool(options, "allowUnknownNamedParameters", allowUnknown);
+          }
+          const st = new StatementSyncImpl(ILLEGAL, this, sql,
+                                           { readBigInts, returnArrays, allowBare, allowUnknown });
+          this.#stmts.add(st);
+          return st;
+        }
+        location(dbName) {
+          this.__need();
+          if (dbName !== undefined && typeof dbName !== "string") {
+            throw argTypeErr("The \"dbName\" argument must be a string.");
+          }
+          const f = SQ.filename(this.#handle, dbName === undefined ? "main" : dbName);
+          return f ? f : null;
+        }
+        serialize(dbName) {
+          this.__need();
+          if (dbName !== undefined && typeof dbName !== "string") {
+            throw argTypeErr("The \"dbName\" argument must be a string.");
+          }
+          return native(() => SQ.serialize(this.#handle, dbName === undefined ? "main" : dbName));
+        }
+        deserialize(buffer, options) {
+          this.__need();
+          if (!(buffer instanceof Uint8Array)) {
+            throw argTypeErr("The \"buffer\" argument must be a Uint8Array.");
+          }
+          if (options !== undefined && (options === null || typeof options !== "object")) {
+            throw argTypeErr("The \"options\" argument must be an object.");
+          }
+          const name = options && options.dbName !== undefined ? options.dbName : "main";
+          if (typeof name !== "string") {
+            throw argTypeErr("The \"options.dbName\" argument must be a string.");
+          }
+          if (buffer.length === 0) {
+            throw argValueErr("The \"buffer\" argument must not be empty.");
+          }
+          // Every live statement was compiled against the schema being replaced;
+          // sqlite3_deserialize refuses to run while any is open, and node reports
+          // them as finalized afterwards.
+          for (const s of this.#stmts) s.finalized = true;
+          this.#stmts.clear();
+          native(() => SQ.deserialize(this.#handle, name, buffer));
+          return undefined;
+        }
+        // db.function(name[, options], fn) -- a user-defined SCALAR function.
+        // Arity is fn.length unless varargs, because sqlite resolves overloads by
+        // argument count and a mismatch must produce its own "wrong number of
+        // arguments" error rather than a silent NULL.
+        function(name, optionsOrFn, maybeFn) {
+          this.__need();
+          if (typeof name !== "string") throw argTypeErr("The \"name\" argument must be a string.");
+          let options = {}, fn = optionsOrFn;
+          if (arguments.length >= 3) {
+            options = optionsOrFn; fn = maybeFn;
+            if (options === null || typeof options !== "object") {
+              throw argTypeErr("The \"options\" argument must be an object.");
+            }
+          }
+          if (typeof fn !== "function") {
+            throw argTypeErr("The \"function\" argument must be a function.");
+          }
+          const useBig = optBool(options, "useBigIntArguments", false);
+          const varargs = optBool(options, "varargs", false);
+          const deterministic = optBool(options, "deterministic", false);
+          const directOnly = optBool(options, "directOnly", false);
+          SQ.createFunction(this.#handle, name, varargs ? -1 : fn.length, deterministic,
+                            directOnly, (...a) => {
+            try {
+              for (let i = 0; i < a.length; i++) {
+                const v = a[i];
+                if (typeof v !== "number" || !Number.isInteger(v)) continue;
+                if (useBig) { a[i] = BigInt(v); continue; }
+                // The bridge already flattened int64 to a double; refusing here is
+                // the only honest answer for a value that no longer round-trips.
+                if (!Number.isSafeInteger(v)) {
+                  throw rangeErr(`Value is too large to be represented as a JavaScript number: ${v}`);
+                }
+              }
+              return fnReturnToSql(fn(...a));
+            } catch (e) {
+              // Cannot propagate out of the sqlite3_step trampoline; park it and
+              // let sqlite3_result_error unwind (rolling the statement back).
+              pendingCallbackError = e;
+              throw e;
+            }
+          });
+          return undefined;
+        }
+        setAuthorizer(cb) {
+          this.__need();
+          if (cb === null) { SQ.setAuthorizer(this.#handle, null); return undefined; }
+          if (typeof cb !== "function") {
+            throw argTypeErr("The \"callback\" argument must be a function.");
+          }
+          SQ.setAuthorizer(this.#handle, (action, a1, a2, a3, a4) => {
+            try {
+              const r = cb(action, a1, a2, a3, a4);
+              if (typeof r !== "number" || !Number.isInteger(r)) {
+                pendingCallbackError = new Error(
+                  "Authorizer callback must return an integer authorization code");
+                return 1;
+              }
+              if (r !== 0 && r !== 1 && r !== 2) {
+                pendingCallbackError = new Error(
+                  "Authorizer callback returned a invalid authorization code");
+                return 1;
+              }
+              return r;
+            } catch (e) { pendingCallbackError = e; return 1; }
+          });
+          return undefined;
+        }
+        enableDefensive(v) {
+          this.__need();
+          SQ.dbConfig(this.#handle, DBCONFIG_DEFENSIVE, checkBool(v, "enabled") ? 1 : 0);
+          return undefined;
+        }
+        enableLoadExtension(v) {
+          this.__need();
+          if (!checkBool(v, "allow")) return undefined;
+          throw mkErr(Error, "ERR_LOAD_SQLITE_EXTENSION",
+                      "Cannot load SQLite extensions when the permission model is enabled");
+        }
+        loadExtension() {
+          this.__need();
+          throw mkErr(Error, "ERR_LOAD_SQLITE_EXTENSION",
+                      "Cannot load SQLite extensions when the permission model is enabled");
+        }
+        // Own enumerable accessors, because the corpus asserts Object.keys(limits).
+        get limits() {
+          if (this.#limits !== null) return this.#limits;
+          const self = this;
+          const obj = {};
+          for (const [name, id] of LIMIT_IDS) {
+            Object.defineProperty(obj, name, {
+              enumerable: true, configurable: true,
+              get() { self.__need(); return SQ.limit(self.__handle, id, -1); },
+              set(v) {
+                self.__need();
+                if (typeof v !== "number" || Number.isNaN(v) || v === -Infinity
+                    || (v !== Infinity && !Number.isInteger(v))) {
+                  throw new TypeError("Limit value must be a non-negative integer or Infinity");
+                }
+                if (v < 0) throw new RangeError("Limit value must be non-negative");
+                SQ.limit(self.__handle, id, v === Infinity ? SQLITE_MAX_LIMIT : v);
+              },
+            });
+          }
+          this.#limits = obj;
+          return obj;
+        }
+        [Symbol.dispose]() { if (this.#open) this.close(); }
+        get [Symbol.for("sqlite-type")]() { return "node:sqlite"; }
+      }
+      // node throws ERR_CONSTRUCT_CALL_REQUIRED (not a bare TypeError) when the
+      // constructor is called without `new`, which a class body cannot observe.
+      function DatabaseSync(...a) {
+        if (new.target === undefined) {
+          throw mkErr(TypeError, "ERR_CONSTRUCT_CALL_REQUIRED",
+                      "Cannot call constructor without `new`");
+        }
+        return Reflect.construct(DatabaseSyncImpl, a, new.target);
+      }
+      DatabaseSync.prototype = DatabaseSyncImpl.prototype;
+      Object.defineProperty(DatabaseSync, "name", { value: "DatabaseSync" });
+
+      // bun's constants plus the changeset conflict-resolution verbs node exports.
+      const nodeConstants = Object.assign({}, constants, {
+        SQLITE_CHANGESET_OMIT: 0, SQLITE_CHANGESET_REPLACE: 1, SQLITE_CHANGESET_ABORT: 2,
+        SQLITE_CHANGESET_DATA: 1, SQLITE_CHANGESET_NOTFOUND: 2, SQLITE_CHANGESET_CONFLICT: 3,
+        SQLITE_CHANGESET_CONSTRAINT: 4, SQLITE_CHANGESET_FOREIGN_KEY: 5,
+        // Authorizer verdicts and the full sqlite3_set_authorizer action set.
+        SQLITE_OK: 0, SQLITE_DENY: 1, SQLITE_IGNORE: 2,
+        SQLITE_CREATE_INDEX: 1, SQLITE_CREATE_TABLE: 2, SQLITE_CREATE_TEMP_INDEX: 3,
+        SQLITE_CREATE_TEMP_TABLE: 4, SQLITE_CREATE_TEMP_TRIGGER: 5, SQLITE_CREATE_TEMP_VIEW: 6,
+        SQLITE_CREATE_TRIGGER: 7, SQLITE_CREATE_VIEW: 8, SQLITE_DELETE: 9,
+        SQLITE_DROP_INDEX: 10, SQLITE_DROP_TABLE: 11, SQLITE_DROP_TEMP_INDEX: 12,
+        SQLITE_DROP_TEMP_TABLE: 13, SQLITE_DROP_TEMP_TRIGGER: 14, SQLITE_DROP_TEMP_VIEW: 15,
+        SQLITE_DROP_TRIGGER: 16, SQLITE_DROP_VIEW: 17, SQLITE_INSERT: 18, SQLITE_PRAGMA: 19,
+        SQLITE_READ: 20, SQLITE_SELECT: 21, SQLITE_TRANSACTION: 22, SQLITE_UPDATE: 23,
+        SQLITE_ATTACH: 24, SQLITE_DETACH: 25, SQLITE_ALTER_TABLE: 26, SQLITE_REINDEX: 27,
+        SQLITE_ANALYZE: 28, SQLITE_CREATE_VTABLE: 29, SQLITE_DROP_VTABLE: 30,
+        SQLITE_FUNCTION: 31, SQLITE_SAVEPOINT: 32, SQLITE_COPY: 0, SQLITE_RECURSIVE: 33,
+      });
+
+      M["node:sqlite"] = {
+        __esModule: true, DatabaseSync, StatementSync, constants: nodeConstants,
+        default: { DatabaseSync, StatementSync, constants: nodeConstants },
+      };
+    }
   }
   const timersPromises = {
     setTimeout: (ms, v) => new Promise((r) => G.setTimeout(() => r(v), ms)),
@@ -4163,7 +5509,85 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   def(["readline/promises"], { createInterface: readlineMod.createInterface });
   // node global alias + node:stream/web (WHATWG stream classes as a module)
   if (typeof G.global === "undefined") G.global = G;
-  def(["stream/web"], { get ReadableStream() { return G.ReadableStream; }, get WritableStream() { return G.WritableStream; }, get TransformStream() { return G.TransformStream; }, get TextEncoderStream() { return G.TextEncoderStream; }, get TextDecoderStream() { return G.TextDecoderStream; }, get ByteLengthQueuingStrategy() { return G.ByteLengthQueuingStrategy || class {}; }, get CountQueuingStrategy() { return G.CountQueuingStrategy || class {}; } });
+  // ---- Web Storage: `Storage` + a session-scoped `sessionStorage` ----------
+  // These are gated on SQLite in node (it backs localStorage with a sqlite file),
+  // so declaring process.versions.sqlite makes the corpus REQUIRE them:
+  // test-webstorage-without-sqlite asserts `typeof sessionStorage === 'object'`
+  // and `Object.hasOwn(globalThis, 'sessionStorage')` exactly when hasSQLite, and
+  // test-global expects `sessionStorage` among the ENUMERABLE own global keys
+  // while `Storage` stays non-enumerable. sessionStorage is per-process and never
+  // persisted (node keeps it in an in-memory database), so a Map is the whole
+  // backing store; `localStorage` stays absent because it exists only with
+  // --localstorage-file, which mbun does not accept.
+  if (typeof G.sessionStorage === "undefined") {
+    const kStore = Symbol("Storage store");
+    const kBrand = Symbol("Storage brand");
+    class Storage {
+      constructor(brand) {
+        if (brand !== kBrand) throw new TypeError("Illegal constructor");
+        this[kStore] = new Map();
+      }
+      #map() {
+        const m = this[kStore];
+        if (!(m instanceof Map)) throw new TypeError("Illegal invocation");
+        return m;
+      }
+      get length() { return this.#map().size; }
+      key(n) {
+        const m = this.#map();
+        const i = Number(n) || 0;
+        if (i < 0 || i >= m.size) return null;
+        return [...m.keys()][i];
+      }
+      getItem(k) { const m = this.#map(); k = String(k); return m.has(k) ? m.get(k) : null; }
+      setItem(k, v) { this.#map().set(String(k), String(v)); }
+      removeItem(k) { this.#map().delete(String(k)); }
+      clear() { this.#map().clear(); }
+    }
+    // Named property access (`sessionStorage.foo = 1`) is part of the interface,
+    // and only a Proxy can express it over a Map without leaking own properties.
+    const isApi = (p) => typeof p !== "string"
+      || ["length", "key", "getItem", "setItem", "removeItem", "clear"].includes(p);
+    const target = new Storage(kBrand);
+    const store = target[kStore];
+    const proxy = new Proxy(target, {
+      get(t, p, r) { return isApi(p) ? Reflect.get(t, p, t) : (store.has(p) ? store.get(p) : undefined); },
+      set(t, p, v) { if (isApi(p)) return Reflect.set(t, p, v, t); store.set(p, String(v)); return true; },
+      has(t, p) { return isApi(p) ? Reflect.has(t, p) : store.has(p); },
+      deleteProperty(t, p) { if (isApi(p)) return Reflect.deleteProperty(t, p); store.delete(p); return true; },
+      ownKeys() { return [...store.keys()]; },
+      getOwnPropertyDescriptor(t, p) {
+        if (isApi(p)) return Reflect.getOwnPropertyDescriptor(t, p);
+        if (!store.has(p)) return undefined;
+        return { value: store.get(p), writable: true, enumerable: true, configurable: true };
+      },
+    });
+    Object.defineProperty(G, "Storage", { value: Storage, writable: true, configurable: true, enumerable: false });
+    Object.defineProperty(G, "sessionStorage", { value: proxy, writable: true, configurable: true, enumerable: true });
+  }
+  // node's stream/web.js re-exports the WHATWG globals verbatim (all 17 of
+  // them); exporting only a subset made `require("node:stream/web").X`
+  // undefined for classes that already exist on globalThis, so
+  // `x instanceof ReadableStreamBYOBReader` threw "Right hand side of
+  // instanceof is not an object" (issue 29225). Each name is a live getter so
+  // the module tracks a later global replacement, exactly like node's binding.
+  {
+    const webStreamMod = {};
+    for (const name of [
+      "ReadableStream", "ReadableStreamDefaultReader", "ReadableStreamBYOBReader",
+      "ReadableStreamBYOBRequest", "ReadableByteStreamController",
+      "ReadableStreamDefaultController", "TransformStream",
+      "TransformStreamDefaultController", "WritableStream",
+      "WritableStreamDefaultWriter", "WritableStreamDefaultController",
+      "ByteLengthQueuingStrategy", "CountQueuingStrategy", "TextEncoderStream",
+      "TextDecoderStream", "CompressionStream", "DecompressionStream",
+    ]) {
+      Object.defineProperty(webStreamMod, name, {
+        get() { return G[name]; }, enumerable: true, configurable: true,
+      });
+    }
+    def(["stream/web"], webStreamMod);
+  }
   // ---- async_hooks (synchronous AsyncLocalStorage — correct under a single call
   // stack; no continuation propagation across the virtual-timer loop) ----
   class AsyncLocalStorage {
@@ -4188,7 +5612,29 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     startupSnapshot: { isBuildingSnapshot: () => false, addSerializeCallback: () => {}, addDeserializeCallback: () => {}, setDeserializeMainFunction: () => {} },
   });
   // process.getBuiltinModule (node ≥20.16) — resolves through the builtin table
-  { const gbm = (n) => { n = String(n).replace(/^node:/, ""); return M[n]; };
+  // PORT-SOURCE: compat/node/lib/internal/modules/helpers.js getBuiltinModule +
+  // internal/bootstrap/realm.js BuiltinModule.normalizeRequirableId.
+  // The old one-liner `(n) => M[String(n).replace(/^node:/,"")]` diverged twice:
+  // it coerced instead of validating (so getBuiltinModule(Symbol()) threw a bare
+  // "Cannot convert a symbol" TypeError, not ERR_INVALID_ARG_TYPE), and it
+  // ignored node's rule that some builtins are reachable ONLY through the
+  // `node:` scheme -- `getBuiltinModule("test")` handed back node:test where
+  // node returns undefined. Internal ids ("internal/util") are never requirable
+  // by users either.
+  { const kSchemeOnly = new Set(["test", "test/reporters", "sea", "sqlite", "quic"]);
+    const gbm = function getBuiltinModule(id) {
+      if (typeof id !== "string") {
+        const e = new TypeError('The "id" argument must be of type string. Received ' +
+          (id === null ? "null" : typeof id));
+        e.code = "ERR_INVALID_ARG_TYPE";
+        throw e;
+      }
+      let n = id;
+      if (n.startsWith("node:")) n = n.slice(5);
+      else if (kSchemeOnly.has(n)) return undefined;
+      if (n.startsWith("internal/")) return undefined;
+      return M[n] !== undefined ? M[n] : M[id];
+    };
     if (G.process && !G.process.getBuiltinModule) G.process.getBuiltinModule = gbm;
     else if (!G.process) { let done = false; Object.defineProperty(G, "process", { configurable: true, set(v) { delete G.process; G.process = v; if (v && !v.getBuiltinModule) v.getBuiltinModule = gbm; }, get() { return undefined; } }); } }
   // bun:ffi — shape only (native FFI DEFERRED); files that merely import it load.
@@ -4252,6 +5698,21 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     fullGC: () => (G.__mbunGcNative ? G.__mbunGcNative(true) : 0),
     edenGC: () => (G.__mbunGcNative ? G.__mbunGcNative(false) : 0),
     isRope: () => false, describe: (v) => String(v), describeArray: () => "",
+    // bun BunJSCModule.h jscDescribe/jscDescribeArray — JSC's `describe()`,
+    // i.e. JSValue::dumpInContext(). Only the JSString branch is reproducible
+    // from the C API: JSC prints `String[ (rope)][ (atomic)][ (identifier)]
+    // 8Bit:(<0|1>): <contents>`, and the 8-bit flag is observable through the
+    // same native the internal-for-testing jscInternals surface uses. Atom /
+    // rope state is not observable, so those markers are omitted rather than
+    // guessed; every other value falls back to the String() form above.
+    jscDescribe: (v) => {
+      if (typeof v !== "string") return M["bun:jsc"].describe(v);
+      const N = G.__mbunJscInternalsNative;
+      const is8Bit = N && typeof N.isUTF16String === "function" ? !N.isUTF16String(v) : true;
+      return "String 8Bit:(" + (is8Bit ? 1 : 0) + "): " + v;
+    },
+    jscDescribeArray: (args) => (Array.isArray(args) ? "<Butterfly: (nil); public length: " + args.length +
+                                 "; vector length: " + args.length + ">" : ""),
     serialize: (v) => v, deserialize: (v) => v, drainMicrotasks: () => {},
     getProtectedObjects: () => [], totalCompileTime: () => 0,
     // bun BunJSCModule.h:527 — the calling frame's source origin as a URL.
@@ -4277,6 +5738,21 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   };
   M["bun:internal-for-testing"] = {
     isASANEnabled: () => false,
+    // process.on("memoryPressure") is a Bun extension. Real OS pressure cannot
+    // be induced reliably (Linux PSI triggers need CAP_SYS_RESOURCE before
+    // 6.6), so bun exposes the emit path itself for testing:
+    //   emitMemoryPressure(level)            -> deliver one synthetic event
+    //   isMemoryPressureWatcherInstalled()   -> is the watcher armed?
+    // The watcher's lifetime is exactly "process has at least one
+    // memoryPressure listener": bun arms it on the first listener and disarms
+    // on the last removal, so listenerCount IS the armed state, and an emit
+    // with nothing listening is a no-op rather than an unhandled event.
+    emitMemoryPressure: (level) => {
+      if (G.process && G.process.listenerCount("memoryPressure") > 0)
+        G.process.emit("memoryPressure", level);
+    },
+    isMemoryPressureWatcherInstalled: () =>
+      !!G.process && G.process.listenerCount("memoryPressure") > 0,
     // canonicalizeIP (src/js/internal-for-testing.ts:16 → NodeTLS.cpp
     // Bun__canonicalizeIP): inet_pton/inet_ntop round trip; undefined for a
     // non-IP literal or a CIDR. Same native the node:tls IP-SAN check uses.
@@ -4334,7 +5810,14 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     // socketFaultInjection (blueprint src/js/internal-for-testing.ts:323): available()
     // is false unless built with --socket-fault-injection=on, so the six
     // *-syscall-fault suites self-skip exactly like a release bun.
-    socketFaultInjection: { available: () => false, set: () => false, clear: () => {} },
+    // set()/clear() must THROW when unavailable, not silently no-op: a test that
+    // arms a rule and then asserts on the fault would otherwise pass vacuously.
+    // bun's own wording is asserted on (/not compiled into this build/).
+    socketFaultInjection: {
+      available: () => false,
+      set: () => { throw new Error("socket fault injection is not compiled into this build"); },
+      clear: () => { throw new Error("socket fault injection is not compiled into this build"); },
+    },
     // translateUVErrorToE / translateNtStatusToE (ibid:382/388): Windows-only Rust
     // fns; off-Windows the tests assert they are functions returning undefined.
     translateUVErrorToE: () => undefined,
@@ -4347,6 +5830,12 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     Bun: globalThis.Bun,
     internalSourceMap: globalThis.__mbunSourceMapNative,
     hostedGitInfo: globalThis.__mbunHostedGitInfoNative,
+    // npm `cpu`/`os` allow+block-list matching against the host (blueprint
+    // src/js/internal-for-testing.ts:177/183 → npm.rs Architecture /
+    // OperatingSystem jsFunction*IsMatch). Native so the test surface exercises
+    // the installer's own bitsets, not a second JS approximation.
+    isArchitectureMatch: globalThis.__mbunPlatformMatchNative.isArchitectureMatch,
+    isOperatingSystemMatch: globalThis.__mbunPlatformMatchNative.isOperatingSystemMatch,
     // highlightJavaScript/Redacted attached later (in the highlighter's scope).
     // shellInternals.parse — tagged template over the native mbun.shell parser;
     // interpolations become __bun_<i> JSObjRef markers (bun's own encoding).
@@ -4386,6 +5875,37 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     };
     expectStub.extend = () => {}; expectStub.any = (c) => ({ __any: c }); expectStub.anything = () => ({});
     const hook = () => {};
+    // `mock` is callable outside `bun test`, and so is `mock.module`: bun installs
+    // the same module-override hook on the bun:test namespace regardless of the
+    // runner, and a plain `bun run` script that calls it used to die with
+    // "mock.module is not a function" (issue 11664). The override lands in the
+    // same registry the runner's mock.module writes to, so the module loader
+    // honours it identically in both modes.
+    const runModeMock = (i) => i || (() => {});
+    runModeMock.module = function (name, factory) {
+      // Argument validation is NOT best-effort and must happen BEFORE the
+      // specifier is resolved: bun's resolver can reach the package-manager
+      // auto-install path, which reentrantly ticks the event loop and blocks on
+      // the registry, so a forgotten callback has to throw first
+      // (mock-module-non-string.test.ts "does not run the resolver when callback
+      // is missing" spawns a run-mode script to prove exactly that).
+      if (typeof name !== "string") throw new TypeError("mock(module, fn) requires a module name string");
+      if (typeof factory !== "function") throw new TypeError("mock(module, fn) requires a function");
+      const mod = factory();
+      G.__mbunNativeModules = G.__mbunNativeModules || {};
+      const value = (mod && mod.default !== undefined && Object.keys(mod).length === 1) ? mod.default : mod;
+      G.__mbunNativeModules[name] = value;
+      G.__mbunNativeModules["node:" + name] = value;
+      // Same registry the runner's mock.module writes to, so a file-path or
+      // package specifier is honoured by require()/import() here too.
+      if (typeof G.__mbun_mock_key === "function") {
+        const cwd = (G.process && typeof G.process.cwd === "function") ? G.process.cwd() : ".";
+        (G.__mbunModuleMocks || (G.__mbunModuleMocks = new Map())).set(G.__mbun_mock_key(name, cwd), mod);
+      }
+    };
+    runModeMock.restore = () => {};
+    runModeMock.clearAllMocks = () => {};
+    runModeMock.restoreAllMocks = () => {};
     // setSystemTime IS live outside `bun test` (bun installs the native
     // JSMock__jsSetSystemTime on the module regardless of the runner) — issue
     // 32793 pins the clock from `bun -e`. The Date patch is installed lazily on
@@ -4411,9 +5931,24 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       get() { return G.__mbunBT || { test: noop, it: noop, xit: noop.skip, xtest: noop.skip,
         describe: desc, xdescribe: desc, expect: expectStub,
         jest: { fn: (i) => i || (() => {}), setSystemTime: (v) => { setSystemTime(v); } },
-        mock: (i) => i || (() => {}), spyOn: () => ({ mockRestore() {} }),
+        // `vi` is bun:test's vitest-compat surface and, like `mock`, exists
+        // outside the runner — vi.mock IS mock.module, so a run-mode script gets
+        // the same validation and the same module override.
+        vi: { fn: (i) => i || (() => {}), mock: (m, f) => runModeMock.module(m, f),
+              spyOn: () => ({ mockRestore() {} }),
+              clearAllMocks: () => {}, resetAllMocks: () => {}, restoreAllMocks: () => {} },
+        mock: runModeMock, spyOn: () => ({ mockRestore() {} }),
         setSystemTime: setSystemTime,
         beforeAll: hook, afterAll: hook, beforeEach: hook, afterEach: hook, setDefaultTimeout: hook }; } });
+  }
+
+  // Bun.jest(filename) is bun's programmatic door to the bun:test module (bun
+  // BunObject.zig `jest`), used by jest-compat shims and by `bun -e` snippets
+  // that want expect()/describe() without the runner. Defined outside the
+  // stub guard above so it resolves to the live runner surface under
+  // `bun test` and to the registration-only stub everywhere else.
+  if (G.Bun && typeof G.Bun.jest !== "function") {
+    G.Bun.jest = (_filename) => M["bun:test"];
   }
 
   // ---- fs (real, via __mbunFsNative) ----
@@ -4656,6 +6191,19 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       throw cpEinval("cannot copy " + src + " to a subdirectory of self " + dest, dest);
     return srcStat;
   };
+  // node cp.js runs checkPaths for EVERY entry it descends into, not just the
+  // top-level pair, so a file landing on a same-named destination DIRECTORY is
+  // reported as ERR_FS_CP_NON_DIR_TO_DIR instead of falling through to
+  // copyFile() and surfacing the raw EACCES/EISDIR from the syscall.
+  const cpCheckEntryTypes = (srcStat, destStat, src, dest) => {
+    if (!destStat) return;
+    if (srcStat.isDirectory() && !destStat.isDirectory())
+      throw cpSysErr("ERR_FS_CP_DIR_TO_NON_DIR", "Cannot overwrite directory with non-directory",
+                     "EISDIR", -21, "cannot overwrite non-directory " + dest + " with directory " + src, dest);
+    if (!srcStat.isDirectory() && destStat.isDirectory())
+      throw cpSysErr("ERR_FS_CP_NON_DIR_TO_DIR", "Cannot overwrite non-directory with directory",
+                     "ENOTDIR", -20, "cannot overwrite directory " + dest + " with non-directory " + src, dest);
+  };
   const cpSetDestMode = (dest, srcMode) => { try { F.chmod(dest, srcMode & 0o7777); } catch (e) {} };
   const cpEexist = (dest) =>
     cpSysErr("ERR_FS_CP_EEXIST", "Target already exists", "EEXIST", -17, dest + " already exists", dest);
@@ -4743,6 +6291,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   const cpGetStats = (src, dest, opts) => {
     const srcStat = opts.dereference ? F.stat(src) : F.stat(src, true);
     const destStat = cpStatOrNull(dest, !opts.dereference);
+    cpCheckEntryTypes(srcStat, destStat, src, dest);
     if (srcStat.isDirectory() && opts.recursive) {
       if (!destStat) return cpCopyDir(src, dest, opts, true, srcStat.mode);
       return cpCopyDir(src, dest, opts);
@@ -4802,6 +6351,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   const cpGetStatsAsync = async (src, dest, opts) => {
     const srcStat = opts.dereference ? F.stat(src) : F.stat(src, true);
     const destStat = cpStatOrNull(dest, !opts.dereference);
+    cpCheckEntryTypes(srcStat, destStat, src, dest);
     if (srcStat.isDirectory() && opts.recursive) {
       if (!destStat) return cpCopyDirAsync(src, dest, opts, true, srcStat.mode);
       if (opts.errorOnExist && !opts.force) throw cpEexist(dest);  // cp.js onDir
@@ -5145,7 +6695,14 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     mkdtemp: (pre, o, cb) => { validatePath(pre, "prefix"); fsWarnNonPortableTemplate(pre); const fn = typeof o === "function" ? o : cb; if (typeof fn !== "function") throw fsArgTypeErr("callback", "of type function", fn); fsValidateEncoding(typeof o === "object" || typeof o === "string" ? o : undefined); G.queueMicrotask(() => { try { fn(null, F.mkdtemp(toStr(pre))); } catch (e) { fn(e); } }); },
     // fd-level I/O: real descriptors over mbun.core.io (native pread/pwrite),
     // zero-copy typed-array boundary via __mbunFdNative.
-    openSync: (p, flags, mode) => { validatePath(p); const md = mode == null ? 0o666 : fsParseFileMode(mode, "mode", 0o666); return fdRemember(globalThis.__mbunFdNative.open(toStr(p), flags == null ? "r" : toStr(flags), md), p); },
+    // `flags` may be node's numeric O_* bitmask; __mbunFdNative.open decodes
+    // that itself (io_bindings.inc fdn_open_host), but ONLY if the number
+    // arrives as a number. toStr(577) made the native side read '5' as the
+    // flag letter and hand back a READ-ONLY fd, so every numeric-flag open of a
+    // missing file failed ENOENT instead of creating it. The async `open`
+    // (line ~6616) and `promises.open` (~8394) already passed numbers through;
+    // this was the one route that did not. ref: regression 27974.
+    openSync: (p, flags, mode) => { validatePath(p); const md = mode == null ? 0o666 : fsParseFileMode(mode, "mode", 0o666); return fdRemember(globalThis.__mbunFdNative.open(toStr(p), flags == null ? "r" : (typeof flags === "number" ? flags : toStr(flags)), md), p); },
     closeSync: (fd) => { fsValidateFd(fd); globalThis.__mbunFdNative.close(fd); fdForget(fd); },
     readSync: (fd, buf, off, len, pos) => {
       if (off !== null && typeof off === "object") { const o = off; off = o.offset || 0; len = o.length; pos = o.position; }
@@ -6387,6 +7944,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   G.__mbunFsInternals = { validatePath, validateEncoding: fsValidateEncoding, argTypeErr: fsArgTypeErr,
                           argValueErr: fsArgValueErr, makeCallback: fsMakeCallback, errno: fsErr,
                           validateInteger: fsValidateInteger, rangeErr: fsRangeErr,
+                          Stats, BigIntStats,
                           get FileHandle() { return FileHandle; } };
   // node marks fs.read/fs.write with kCustomPromisifyArgs so promisify(fs.read)
   // resolves to { bytesRead, buffer } rather than the first callback value.
@@ -6587,9 +8145,52 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     return s;
   };
   const fsThrowIfAborted = (s) => { if (s && s.aborted) throw fsAbortErr(s); };
+  // Yield a full loop turn before honouring options.signal. node runs fs work on
+  // the thread pool, so the operation's own completion is a LOOP turn: an abort
+  // scheduled with process.nextTick (or setImmediate) in the turn that started
+  // the call always lands first, and every abort-signal test asserts exactly
+  // that (node test-fs-promises-writefile, -file-handle-writeFile,
+  // -file-handle-append-file; bun abort-signal-leak-read-write-file). mbun does
+  // the work synchronously behind ONE microtask hop, so the abort only used to
+  // win by accident: process.nextTick armed its drain with a promise reaction
+  // queued mid-chain, and that reaction interleaved into the middle of this very
+  // `.then`. Once nextTick drains at the microtask-exhaustion boundary node puts
+  // it at, one microtask hop is no longer enough. FileHandle#readFile below
+  // already yields this way, with the same reasoning. Only signalled calls pay
+  // the turn — an unsignalled writeFile keeps its microtask-only latency.
+  const fsAbortYield = (s) => {
+    if (s === undefined || s === null) return undefined;
+    return new Promise((r) => G.setImmediate(r));
+  };
+  // node's per-isolate symbols (src/node_symbols.cc). The DESCRIPTION is the
+  // name itself — the corpus finds kTransfer by scanning a prototype for the
+  // symbol whose description is 'messaging_transfer_symbol' — and every holder
+  // has to agree on the identity, so they live in one process-wide registry
+  // that internalBinding('symbols') and worker_threads both read.
+  const nodeSymbol = (name) => {
+    const reg = G.__mbunNodeSymbols || (G.__mbunNodeSymbols = { __proto__: null });
+    return reg[name] || (reg[name] = Symbol(name));
+  };
+  const kFhTransfer = nodeSymbol("messaging_transfer_symbol");
+  const kFhTransferList = nodeSymbol("messaging_transfer_list_symbol");
+  const kFhDeserialize = nodeSymbol("messaging_deserialize_symbol");
   class FileHandle {
     constructor(fd) { this._fd = fd; this._closed = false; this._refs = 0; this._events = { __proto__: null }; }
     get fd() { return this._fd; }
+    // node lib/internal/fs/promises.js marks a FileHandle transferable
+    // (markTransferMode(this, false, true)) and moves the DESCRIPTOR through
+    // postMessage(fh, [fh]) rather than cloning the object. The three hooks are
+    // the JSTransferable protocol worker_threads drives; their mere presence on
+    // the prototype is what the corpus overrides to prove the deserializer
+    // cannot be talked into loading arbitrary code
+    // (test-worker-message-port-transfer-fake-js-transferable*).
+    [kFhTransferList]() { return []; }
+    [kFhTransfer]() {
+      const fd = this._fd;
+      this._fd = -1;
+      return { data: { fd: fd }, deserializeInfo: "internal/fs/promises:FileHandle" };
+    }
+    [kFhDeserialize](data) { this._fd = data && data.fd !== undefined ? data.fd : -1; this._closed = false; }
     // node's FileHandle is an EventEmitter (emits "close"); createReadStream /
     // createWriteStream build fd-bound streams that autoClose the handle
     // (fs-leak: FileHandle stream must not leak the descriptor).
@@ -6601,9 +8202,17 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     emit(ev, ...a) { const l = this._events[ev]; if (l) for (const cb of l.slice()) cb(...a); return !!(l && l.length); }
     // node rejects EVERY FileHandle operation after close with EBADF — the
     // handle's fd is -1 and the binding reports a bad descriptor.
+    // Reads `this.fd` — the public GETTER — not the `_fd` slot behind it. node's
+    // own promises layer touches `filehandle.fd` on every operation
+    // (readFileHandle/writeFileHandle/ftruncate all pass `handle.fd` to the
+    // binding), and three corpus files redefine `FileHandle.prototype.fd` to
+    // observe exactly that (test-fs-promises-file-handle-{op,close,aggregate}-
+    // errors install a getter that wraps `close`). Going straight to `_fd` made
+    // the descriptor unobservable, so the override never ran.
     _use(syscall) {
-      if (this._closed || this._fd < 0) throw fsErr("EBADF", syscall || "read");
-      return this._fd;
+      const fd = this.fd;
+      if (this._closed || fd < 0) throw fsErr("EBADF", syscall || "read");
+      return fd;
     }
     // Stream ref-counting: a createReadStream/createWriteStream over this
     // handle keeps it alive until the stream closes (node kRef/kUnref).
@@ -6724,7 +8333,14 @@ inline constexpr char kBootstrapJS_[] = R"JS(
           }
         } catch (e) { if (e && e.code === "ERR_FS_FILE_TOO_LARGE") throw e; }
         const chunks = []; const tmp = Buffer.alloc(65536); let n;
+        // Same synthetic-allocation guard readFileSync carries: a character
+        // device stats as size 0, so this read-to-EOF loop never terminates on
+        // /dev/zero and the process is OOM-killed instead of throwing. It only
+        // began to matter once fs.promises.readFile started routing here.
+        const oomCap = fsOomCap(enc); let total = 0;
         while ((n = fsMod.readSync(fd, tmp, 0, tmp.length, null)) > 0) {
+          total += n;
+          if (total > oomCap) throw fsOomError(fdPathMap.get(fd) || "");
           chunks.push(Buffer.from(tmp.subarray(0, n)));
           // Yield a full loop turn between chunks: node reads through the
           // thread pool, so an abort scheduled with process.nextTick OR
@@ -6742,6 +8358,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       const enc = typeof o === "string" ? o : (o && o.encoding) || "utf8";
       const signal = fsSignalOf(o);
       return Promise.resolve().then(async () => {
+        await fsAbortYield(signal);
         fsThrowIfAborted(signal);
         const fd = this._use("write");
         // node consumes (async) iterables here too (a Readable is the common case).
@@ -6763,7 +8380,8 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     appendFile(data, o) {
       const enc = typeof o === "string" ? o : (o && o.encoding) || "utf8";
       const signal = fsSignalOf(o);
-      return Promise.resolve().then(() => {
+      return Promise.resolve().then(async () => {
+        await fsAbortYield(signal);
         fsThrowIfAborted(signal);
         fsValidateData(data);
         const fd = this._use("write");
@@ -7069,6 +8687,41 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     }
     [Symbol.asyncDispose]() { return this.close(); }
   }
+  // node lib/internal/fs/promises.js handleFdClose(). The path forms of
+  // readFile/writeFile/appendFile/truncate open a FileHandle, run the operation
+  // and then close it — and the CLOSE is awaited as a first-class step, not run
+  // in a `finally`. That distinction is observable three ways, and all three are
+  // asserted by the corpus:
+  //   * op ok  + close throws  -> reject with the CLOSE error
+  //   * op throws + close ok   -> reject with the OP error
+  //   * both throw             -> reject with AggregateError([opError, closeError])
+  // `handle.close()` is looked up on the instance every time on purpose: the
+  // tests install a per-instance `close` from inside the `fd` getter, so a
+  // captured method reference would miss it.
+  // The both-threw case is node's aggregateTwoErrors(closeError, opError)
+  // (lib/internal/errors.js): the OP error leads, supplies the message AND the
+  // `code` of the AggregateError, and an op error that is already an
+  // AggregateError absorbs the close error instead of nesting.
+  const fsAggregateTwoErrors = (closeError, opError) => {
+    if (closeError && opError && closeError !== opError) {
+      if (Array.isArray(opError.errors)) { opError.errors.push(closeError); return opError; }
+      const e = new AggregateError([opError, closeError], opError.message);
+      e.code = opError.code;
+      return e;
+    }
+    return closeError || opError;
+  };
+  const fsHandleFdClose = (opPromise, handle) =>
+    opPromise.then(
+      (result) => handle.close().then(() => result),
+      (opError) => handle.close().then(
+        () => { throw opError; },
+        (closeError) => { throw fsAggregateTwoErrors(closeError, opError); }));
+  // Only a path-shaped argument gets the open/close treatment. A numeric fd is
+  // not something node's promises API accepts at all, but mbun's sync layer has
+  // always tolerated it, so that path stays on the old direct call rather than
+  // turning a working call into an ERR_INVALID_ARG_TYPE.
+  const fsPathIsHandleable = (p) => typeof p !== "number";
   const fsPromises = {
     open: (p, flags, mode) => Promise.resolve().then(() => { validatePath(p); const md = mode == null ? 0o666 : fsParseFileMode(mode, "mode", 0o666); return new FileHandle(fdRemember(globalThis.__mbunFdNative.open(toStr(p), flags == null ? "r" : (typeof flags === "number" ? flags : toStr(flags)), md), p)); }),
     // node fs.promises.readFile: a FileHandle argument reads through the
@@ -7078,11 +8731,15 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       const signal = fsSignalOf(o);
       fsThrowIfAborted(signal);
       if (p && typeof p === "object" && typeof p.readFile === "function") return p.readFile(o);
-      return fsMod.readFileSync(p, o);
+      if (!fsPathIsHandleable(p)) return fsMod.readFileSync(p, o);
+      const flag = (o && typeof o === "object" && o.flag != null) ? o.flag : "r";
+      return fsPromises.open(p, flag, 0o666)
+        .then((fh) => fsHandleFdClose(fh.readFile(o), fh));
     }),
     writeFile: (p, d, o) => Promise.resolve().then(async () => {
       if (p && typeof p === "object" && typeof p.writeFile === "function") return p.writeFile(d, o);
       const signal = fsSignalOf(o);
+      await fsAbortYield(signal);
       fsThrowIfAborted(signal);
       if (d != null && typeof d !== "string" && !ArrayBuffer.isView(d) && !(d instanceof ArrayBuffer) &&
           typeof d[Symbol.asyncIterator] !== "function" && typeof d[Symbol.iterator] !== "function")
@@ -7112,17 +8769,38 @@ inline constexpr char kBootstrapJS_[] = R"JS(
         } finally { FD.close(fd); }
         return;
       }
-      return fsMod.writeFileSync(path2, d, o);
+      if (!fsPathIsHandleable(p)) return fsMod.writeFileSync(path2, d, o);
+      const wFlag = (o && typeof o === "object" && o.flag != null) ? o.flag : "w";
+      const wMode = (o && typeof o === "object" && o.mode != null) ? o.mode : 0o666;
+      // options.flush is an fsync BEFORE the close, so it belongs inside the
+      // operation promise handleFdClose wraps, not after it. fsFlushOf also
+      // REJECTS a non-boolean, which used to come free from writeFileSync —
+      // routing through the handle skipped it (test-fs-write-file-flush).
+      const wFlush = fsFlushOf(o);
+      return fsPromises.open(p, wFlag, wMode).then((fh) => fsHandleFdClose(
+        fh.writeFile(d, o).then(() => (wFlush ? fh.sync() : undefined)), fh));
     }),
     appendFile: (p, d, o) => Promise.resolve().then(() => {
       fsValidateData(d); fsValidateEncoding(o);
       if (p && typeof p === "object" && typeof p.appendFile === "function") return p.appendFile(d, o);
-      return fsMod.appendFileSync(p, d, o);
+      if (!fsPathIsHandleable(p)) return fsMod.appendFileSync(p, d, o);
+      const aFlag = (o && typeof o === "object" && o.flag != null) ? o.flag : "a";
+      const aMode = (o && typeof o === "object" && o.mode != null) ? o.mode : 0o666;
+      const aFlush = fsFlushOf(o);
+      return fsPromises.open(p, aFlag, aMode).then((fh) => fsHandleFdClose(
+        fh.appendFile(d, o).then(() => (aFlush ? fh.sync() : undefined)), fh));
     }),
     mkdir: P((p, o) => { validatePath(p); const [rec, mode] = mkdirOpts(o); return F.mkdir(toStr(p), rec, mode); }),
     rm: P((p, o) => rmImpl(p, o)),
     rmdir: P((p, o) => { validatePath(p); rmdirCheckOpts(o); rmdirImpl(p); }),
-    truncate: P((p, len) => fsMod.truncateSync(p, len)),
+    // node opens 'r+' and truncates through the handle (lib/internal/fs/
+    // promises.js truncate), so a close failure is reportable here too.
+    truncate: (p, len) => Promise.resolve().then(() => {
+      if (!fsPathIsHandleable(p)) return fsMod.truncateSync(p, len);
+      validatePath(p);
+      return fsPromises.open(p, "r+", 0o666)
+        .then((fh) => fsHandleFdClose(fh.truncate(len == null ? 0 : len), fh));
+    }),
     statfs: P((p, o) => fsMod.statfsSync(p, o)),
     // Reuse the public sync path: it owns encoding, recursive traversal, and
     // Dirent conversion. Calling the raw native row here lost every option
@@ -7190,6 +8868,125 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   fsMod.promises = fsPromises;
   M["fs/promises"] = fsPromises;
   M["node:fs/promises"] = fsPromises;
+
+  // ---- async fs: the callback must never run inside the caller's frame ----
+  // PORT-SOURCE: compat/node/lib/fs.js (open/stat/readdir/... all build an
+  // FSReqCallback and hand it to the binding; `req.oncomplete` is invoked by
+  // the loop, so node guarantees two things this runtime was breaking):
+  //   1. the callback NEVER runs before the caller returns, and
+  //   2. it runs after the process.nextTick queue and the microtask queue that
+  //      the calling turn produced — the completion lands in a later loop turn.
+  // Measured on the pre-change binary, ten entry points invoked their callback
+  // synchronously (open, stat, lstat, fstat, appendFile, readdir, unlink,
+  // mkdir, chmod, readlink), so there was never an in-flight window at all.
+  // fs.readFile / fs.writeFile were already fixed this way (see their
+  // G.setImmediate above, added for test-fs-readfile / test-fs-write-file
+  // cancellation); this generalises that fix instead of inventing a mechanism.
+  //
+  // setImmediate, NOT queueMicrotask: process.nextTick has strict priority over
+  // promise microtasks in this runtime, so a microtask-deferred completion
+  // still beats a nextTick queued before it — which is exactly backwards from
+  // node and is what made a nextTick-scheduled abort() lose the race.
+  //
+  // The wrapper defers ONLY a callback that fired synchronously. An entry point
+  // that already schedules its own completion passes straight through, so this
+  // cannot double-defer or re-order anything that was already asynchronous.
+  // Validation still throws out of the caller's frame: `fn` is invoked inline.
+  //
+  // ONE drain for the whole batch, not one setImmediate per call. Two reasons,
+  // and the first is measured: a per-call immediate costs a full pump round
+  // trip each, which made the heaviest fs file in the bun corpus
+  // (js/node/fs/fs.test.ts) 42s -> 54s, +30%, reproducibly, and pushed it past
+  // the runner's default 30s bound. Batching collapses that to one round trip
+  // per turn. The second reason is fidelity: node's poll phase runs every
+  // completion that is ready before the check phase gets a turn, so
+  //   fs.stat(a, cb1); setImmediate(imm); fs.stat(b, cb2);
+  // is cb1, cb2, imm in node — which is what batching produces and what a
+  // per-call immediate got wrong (cb1, imm, cb2).
+  //
+  // The pending requests are registered so process._getActiveRequests() and
+  // getActiveResourcesInfo() can report the in-flight window this creates —
+  // that window is the whole point, and reporting it is what node does.
+  const fsActiveRequests = new Set();
+  G.__mbunFsActiveRequests = fsActiveRequests;
+  const fsCompletionQueue = [];
+  let fsDrainScheduled = false;
+  const fsDrainCompletions = () => {
+    fsDrainScheduled = false;
+    const batch = fsCompletionQueue.splice(0, fsCompletionQueue.length);
+    for (let i = 0; i < batch.length; i += 1) {
+      // node drops the request before running its completion, the same way a
+      // fired Immediate leaves the active set before its callback runs.
+      fsActiveRequests.delete(batch[i].req);
+      try {
+        batch[i].run();
+      } catch (e) {
+        // Each completion is its own loop callback in node, so a throwing one
+        // must not swallow the completions queued behind it: hand the rest back
+        // to a later turn before letting the throw reach uncaughtException.
+        for (let j = i + 1; j < batch.length; j += 1) fsCompletionQueue.push(batch[j]);
+        if (fsCompletionQueue.length > 0) fsScheduleDrain();
+        throw e;
+      }
+    }
+  };
+  const fsScheduleDrain = () => {
+    if (fsDrainScheduled) return;
+    fsDrainScheduled = true;
+    // The RAW host immediate, not setImmediate: an fs completion is not an
+    // Immediate resource, and counting it as one would make
+    // getActiveResourcesInfo() report the drain alongside the requests it is
+    // draining. Falls back while node:timers has not installed yet.
+    const sys = G.__mbunSystemImmediate;
+    if (typeof sys === "function") sys(fsDrainCompletions);
+    else G.setImmediate(fsDrainCompletions);
+  };
+  const fsDeferCompletion = (fn) => function (...args) {
+    let i = args.length - 1;
+    while (i >= 0 && typeof args[i] !== "function") i -= 1;
+    if (i < 0) return fn.apply(this, args);
+    const real = args[i];
+    let inFrame = true, fired = false, out = null;
+    args[i] = function (...r) {
+      // Still inside fn's own call? Capture and replay later. Otherwise the
+      // implementation already deferred, and the completion is passed through.
+      if (inFrame) { fired = true; out = r; return undefined; }
+      return real.apply(this, r);
+    };
+    const ret = fn.apply(this, args);
+    inFrame = false;
+    if (fired) {
+      // The completion carries the async context of the CALL, captured here at
+      // push time — node's rule, and the same thing process.nextTick does a few
+      // hundred lines away in runtime/bindings_install.inc. A batched drain runs
+      // in whatever context the drain is standing in, which is nobody's: without
+      // these two lines AsyncLocalStorage is silently lost across every one of
+      // these callbacks, and a domain cannot catch a throw out of one
+      // (test-domain-implicit-binding, whose stack named fsDrainCompletions).
+      // setTimeout/setImmediate never needed this spelled out because node:timers
+      // does it for them; a private queue has to do it itself.
+      //
+      // Domain first, then the context frame, so the frame is restored around
+      // the domain's error handling too.
+      let done = real;
+      const h = G.__mbunSchedHook;
+      if (h !== undefined && h !== null) done = h(done);
+      const cap = G.__mbunCaptureAsyncContext;
+      if (typeof cap === "function") done = cap(done);
+      const req = { __proto__: null };
+      fsActiveRequests.add(req);
+      fsCompletionQueue.push({ req, run: () => done.apply(undefined, out) });
+      fsScheduleDrain();
+    }
+    return ret;
+  };
+  for (const fsAsyncName of ["open", "stat", "lstat", "fstat", "appendFile",
+                             "readdir", "unlink", "mkdir", "chmod", "readlink",
+                             "fchmod", "lchmod", "chown", "fchown", "lchown"]) {
+    if (typeof fsMod[fsAsyncName] === "function") {
+      fsMod[fsAsyncName] = fsDeferCompletion(fsMod[fsAsyncName]);
+    }
+  }
 
   // ---- string_decoder ----
   class StringDecoder {

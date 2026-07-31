@@ -64,10 +64,46 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
 
     const idOf = (t) => { try { const n = +t; return Number.isSafeInteger(n) ? n : null; } catch (_) { return null; } };
 
+    // node lib/internal/timers.js Timeout: `_idleTimeout` is the *enrolled*
+    // duration (node coerces an absent / out-of-range delay to 1, the same
+    // coercion _checkCountdown warns about) and `_idleStart` the libuv
+    // timestamp the timer was last armed at. Both are read straight off a
+    // handle that internals keep under the private `kTimeout` symbol —
+    // `socket[kTimeout]._idleTimeout` in test-http-client-timeout-on-connect
+    // and test-tls-wrap-timeout, `session[kTimeout]._idleTimeout` in
+    // test-http2-compat-socket — and unenroll (clearTimeout, or the timer
+    // firing) resets `_idleTimeout` to -1, which test-tls-wrap-timeout asserts
+    // from its 'exit' handler.
+    //
+    // Non-enumerable, unlike node's own data properties: mbun's util.inspect
+    // prints every enumerable key of a Timeout and several corpus files pin
+    // that exact output, so making these visible would trade the four files
+    // above for whatever asserts on an inspected timer.
+    const TIMEOUT_MAX = 2147483647;
+    const idleDuration = (ms) => (typeof ms === "number" && ms >= 1 && ms <= TIMEOUT_MAX ? ms : 1);
+    // node's _idleStart is `libuv now` (ms since loop start), which is
+    // monotonic and non-decreasing; process.uptime() is the same clock here.
+    const idleNow = () => { try { return Math.trunc(G.process.uptime() * 1000); } catch (_) { return Date.now(); } };
+    const setIdle = (t, ms) => {
+      try {
+        Object.defineProperty(t, "_idleTimeout", { value: idleDuration(ms), writable: true, enumerable: false, configurable: true });
+        Object.defineProperty(t, "_idleStart", { value: idleNow(), writable: true, enumerable: false, configurable: true });
+      } catch (_) {}
+    };
+
     function initTimer(t, kind, state) {
       if (t === null || typeof t !== "object") return t;
       t[KIND] = kind;
       t[STATE] = state;
+      if (kind !== "immediate") setIdle(t, state.ms);
+      // node's Timeout holds its callback on `_onTimeout`, and listOnTimeout
+      // DROPS a timer whose `_onTimeout` was nulled instead of running it
+      // (lib/internal/timers.js). timers-fixture-unref.js cancels an interval
+      // exactly that way. Non-enumerable for the same reason as _idleTimeout.
+      if (kind !== "immediate" && typeof state.cb === "function" && t._onTimeout === undefined) {
+        try { Object.defineProperty(t, "_onTimeout", { value: state.cb, writable: true, enumerable: false, configurable: true }); }
+        catch (_) {}
+      }
       try {
         Object.defineProperty(t, "constructor", {
           value: kind === "immediate" ? Immediate : Timeout,
@@ -99,15 +135,39 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
         // callback. The native refresh cannot re-arm a fired timer, so always
         // schedule a fresh native timer behind the stable facade object.
         t.refresh = function refresh() {
+          // node refresh() ends in insert(this, this._idleTimeout), and insert()
+          // returns early for a negative msecs -- so refreshing a timer the
+          // caller UNENROLLED (_idleTimeout = -1) does not re-arm it. A timer
+          // that already fired or was cleared also reads -1 here, and node DOES
+          // re-arm that one, so _destroyed is what separates the two cases.
+          if (!t._destroyed && t._idleTimeout < 0) return t;
           state.gen++;
           try { oClearTimeout(state.native); } catch (_) {}
-          state.native = oSetTimeout(state.run, state.ms, ...state.args);
+          state.native = __applySchedule(oSetTimeout, [state.run, state.ms],
+                                        state.args || []);
+          // node Timeout.refresh() re-enrols the handle: _idleStart advances
+          // (test-tls-wrap-timeout asserts the later start is strictly greater)
+          // and a previously unenrolled timer gets its duration back.
+          setIdle(t, state.ms);
           t._destroyed = false;
           const id = idOf(t);
           if (id !== null) registry.set(id, t);
           activeTimeouts.add(t);
           return t;
         };
+      } else if (kind === "interval") {
+        // Same unenrolled-refresh rule for intervals; everything else stays on
+        // the native refresh the "refreshed setInterval should not reschedule
+        // again" case already exercises.
+        const oRefresh = t.refresh;
+        if (typeof oRefresh === "function") {
+          t.refresh = function refresh() {
+            if (!t._destroyed && t._idleTimeout < 0) return t;
+            state.rearmed = true;
+            const r = oRefresh.call(t);
+            return r === undefined ? t : r;
+          };
+        }
       }
       // Native Symbol.dispose clears the host timer directly, bypassing this
       // facade's registry and `_destroyed` lifecycle.  Route it through the
@@ -130,6 +190,8 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
         state.timerHooks.destroy(state.asyncHook);
       }
       t._destroyed = true;
+      // node unenroll(): a cleared or fired Timeout reports _idleTimeout = -1.
+      if (t[KIND] !== "immediate") { try { t._idleTimeout = -1; } catch (_) {} }
       const id = idOf(t);
       if (id !== null) registry.delete(id);
       activeTimeouts.delete(t);
@@ -180,18 +242,40 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
       return cb.apply(thisArg, args);
     };
 
+    // Forward to a native scheduler without ever writing `f(a, ...args)`.
+    //
+    // Spread in a CALL goes through the iterator protocol — it reads
+    // `Array.prototype[Symbol.iterator]` at the moment of the call — while a
+    // rest PARAMETER does not (it is built with CreateArrayFromList) and
+    // `Function.prototype.apply` does not either (CreateListFromArrayLike).
+    // node's timers are written against primordials for exactly this reason,
+    // so `delete Array.prototype[Symbol.iterator]` cannot break scheduling.
+    // mbun's spread version could: the first setTimeout after that deletion
+    // threw `Spread syntax requires ...iterable[Symbol.iterator] to be a
+    // function` out of readline's line handler, which killed the REPL driver
+    // in test-repl-autocomplete / test-repl-history-navigation before they
+    // could restore the intrinsic, and the leaked deletion then took down
+    // test/common/tmpdir's exit-time cleanup.
+    // PORT-SOURCE: node lib/timers.js (ArrayPrototypePush + ReflectApply)
+    const __applySchedule = (fn, head, args) => {
+      const call = head;
+      for (let i = 0; i < args.length; i++) call[call.length] = args[i];
+      return fn.apply(undefined, call);
+    };
+
     const mySetTimeout = function setTimeout(cb, ms, ...args) {
       if (typeof cb !== "function") throw __invalidCb(cb);
       _checkCountdown(ms);
       cb = __sched(cb);
-      const state = { gen: 0, ms, args };
+      const state = { gen: 0, ms, args, cb };
       state.run = function (...a) {
         const g = state.gen;
+        if (state.timer && state.timer._onTimeout === null) { destroyTimer(state.timer); return; }
         try { return __runTimerCallback(state, cb, state.timer, a); }
         // refresh()/clear during the callback bumps gen: skip the destroy.
         finally { if (state.gen === g && state.timer) destroyTimer(state.timer); }
       };
-      const t = oSetTimeout(state.run, ms, ...args);
+      const t = __applySchedule(oSetTimeout, [state.run, ms], args);
       state.timer = t;
       state.native = t;
       return initTimer(t, "timeout", state);
@@ -200,9 +284,27 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
       if (typeof cb !== "function") throw __invalidCb(cb);
       _checkCountdown(ms);
       cb = __sched(cb);
-      const state = { gen: 0, ms, args };
-      state.run = function (...a) { return __runTimerCallback(state, cb, state.timer, a); };
-      const t = oSetInterval(state.run, ms, ...args);
+      const state = { gen: 0, ms, args, cb };
+      state.run = function (...a) {
+        const t = state.timer;
+        // node listOnTimeout drops a timer whose _onTimeout was nulled without
+        // running it, and only re-inserts a repeating timer while its
+        // _idleTimeout is still enrolled -- unenrolling it to -1 from inside the
+        // callback stops the interval. ref: node lib/internal/timers.js.
+        if (t && t._onTimeout === null) { clearNative(t); destroyTimer(t); return; }
+        // A refresh() from inside the callback re-inserts the timer itself, so
+        // node's "don't re-insert an unenrolled repeater" branch cannot reach
+        // it -- it fires once more. `rearmed` reproduces that.
+        state.rearmed = false;
+        try { return __runTimerCallback(state, cb, t, a); }
+        finally { if (t && !t._destroyed && !state.rearmed && t._idleTimeout < 0) { clearNative(t); destroyTimer(t); } }
+      };
+      // Scheduled through __applySchedule, NOT `oSetInterval(state.run, ms,
+      // ...args)`. The spread form reads Array.prototype[Symbol.iterator], and
+      // test-repl-autocomplete / test-repl-history-navigation delete that
+      // intrinsic on purpose -- call-spread here made every setInterval throw
+      // for the rest of the process. Same call, no iterator dependency.
+      const t = __applySchedule(oSetInterval, [state.run, ms], args);
       state.timer = t;
       state.native = t;
       return initTimer(t, "interval", state);
@@ -218,7 +320,7 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
         try { return __runTimerCallback(state, cb, state.timer, a); }
         finally { if (state.gen === g && state.timer) destroyTimer(state.timer); }
       };
-      const t = oSetImmediate(state.run, ...args);
+      const t = __applySchedule(oSetImmediate, [state.run], args);
       state.timer = t;
       state.native = t;
       return initTimer(t, "immediate", state);
@@ -376,6 +478,15 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
     G.setTimeout = mySetTimeout;
     G.setInterval = mySetInterval;
     G.setImmediate = mySetImmediate;
+    // An internal "run this on the next loop turn" with no node-visible
+    // resource attached: the raw host immediate, so it registers no Immediate
+    // in activeImmediates, no async-hook id, and no Timeout facade. node:fs
+    // uses it to drain its completion queue — an fs completion is an
+    // FSREQCALLBACK request, not an Immediate, and getActiveResourcesInfo()
+    // must not report the drain alongside the requests it is draining. Throws
+    // land in the pump's own uncaught channel, the same place __runTimerCallback
+    // sends them.
+    G.__mbunSystemImmediate = function (fn) { return oSetImmediate(fn); };
     G.clearTimeout = myClearTimeout;
     G.clearInterval = myClearInterval;
     G.clearImmediate = myClearImmediate;
@@ -390,6 +501,17 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
           const out = [];
           for (let i = 0; i < activeTimeouts.size; i++) out.push("Timeout");
           for (let i = 0; i < activeImmediates.size; i++) out.push("Immediate");
+          // The other half of node's answer: libuv HANDLES (live sockets and
+          // servers). The registry lives on the global because its producer is
+          // node:net; see builtins/node_process_extra.cppm.
+          const HT = G.__mbunHandleTrack;
+          if (HT) for (const t of HT.types()) out.push(t);
+          // …and libuv REQUESTS. node:fs registers one per async operation
+          // whose completion has not been delivered yet; node reports those as
+          // FSREQCALLBACK (test-process-getactiveresources-track-active-requests
+          // fires 12 fs.open and asserts the count synchronously).
+          const FSR = G.__mbunFsActiveRequests;
+          if (FSR) for (let i = 0; i < FSR.size; i++) out.push("FSREQCALLBACK");
           return out;
         };
       }

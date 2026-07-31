@@ -46,6 +46,10 @@ inline constexpr std::string_view kNodePerfJS = R"JS(
   // the native `.length === 0`. PerformanceMark stays user-constructible (matches
   // WebCore, and performance.mark() uses it).
   const kConstruct = Symbol("PerformanceEntry.construct");
+  // node passes `kEmptyObject` (a frozen null-prototype object) as the default
+  // for every optional options bag, so a polluted `Object.prototype` cannot
+  // inject option values. `options || {}` reads straight through the pollution.
+  const kEmptyObject = Object.freeze(Object.create(null));
   // `detail` is a *structured clone* of the caller's value (WebCore/Node semantics).
   const cloneDetail = (d) => (d == null ? null : (G.structuredClone ? G.structuredClone(d) : d));
   class PerformanceEntry {
@@ -62,9 +66,20 @@ inline constexpr std::string_view kNodePerfJS = R"JS(
       return { name: this.name, entryType: this.entryType, startTime: this.startTime, duration: this.duration };
     }
   }
+  // node's internal entry class for the runtime-specific timelines ("function",
+  // "net", "dns", "gc", "http"). It is *named* but never exported; the only
+  // observable differences from PerformanceEntry are the name and that toJSON()
+  // carries `detail`. ref: node lib/internal/perf/performance_entry.js.
+  class PerformanceNodeEntry extends PerformanceEntry {
+    toJSON() {
+      const o = { name: this.name, entryType: this.entryType, startTime: this.startTime, duration: this.duration };
+      if (this.detail !== undefined) o.detail = this.detail;
+      return o;
+    }
+  }
   class PerformanceMark extends PerformanceEntry {
     constructor(name, options) {
-      const o = options || {};
+      const o = options === undefined || options === null ? kEmptyObject : options;
       super(kConstruct, String(name), "mark", typeof o.startTime === "number" ? o.startTime : perfNow(), 0,
             o.detail !== undefined ? cloneDetail(o.detail) : null);
     }
@@ -232,17 +247,23 @@ inline constexpr std::string_view kNodePerfJS = R"JS(
       const result = new.target !== undefined ? Reflect.construct(fn, args) : fn.apply(this, args);
       const duration = perfNow() - start;
       if (histogram) histogram.record(Math.max(1, Math.round(duration * 1e6)));
-      addEntry(new PerformanceEntry(kConstruct, fn.name, "function", start, duration));
+      // node publishes the call's arguments both as `detail` and as indexed own
+      // properties on the entry (lib/internal/perf/timerify.js).
+      const entry = new PerformanceNodeEntry(kConstruct, fn.name, "function", start, duration, args);
+      for (let i = 0; i < args.length; i++) entry[i] = args[i];
+      addEntry(entry);
       return result;
     }
-    Object.defineProperty(timerified, "length", { value: fn.length, configurable: true });
-    Object.defineProperty(timerified, "name", { value: "timerified " + fn.name, configurable: true });
+    // Null-prototype descriptors: a polluted `Object.prototype.get` would
+    // otherwise turn these into "both accessors and a value" descriptors.
+    Object.defineProperty(timerified, "length", { __proto__: null, value: fn.length, configurable: true });
+    Object.defineProperty(timerified, "name", { __proto__: null, value: "timerified " + fn.name, configurable: true });
     return timerified;
   }
   performanceObj.timerify = timerify;
 
   // ── PerformanceObserver ───────────────────────────────────────────────────
-  const SUPPORTED = ["mark", "measure", "function"];
+  const SUPPORTED = ["mark", "measure", "function", "net", "http"];
   class PerformanceObserver {
     constructor(callback) {
       if (typeof callback !== "function") throw errArgType("callback", "function", callback);
@@ -253,7 +274,7 @@ inline constexpr std::string_view kNodePerfJS = R"JS(
     }
     static get supportedEntryTypes() { return SUPPORTED.slice(); }
     observe(options) {
-      options = options || {};
+      options = options === undefined || options === null ? kEmptyObject : options;
       let types;
       if (Array.isArray(options.entryTypes)) types = options.entryTypes;
       else if (options.type !== undefined) types = [options.type];
@@ -265,6 +286,44 @@ inline constexpr std::string_view kNodePerfJS = R"JS(
     disconnect() { observers.delete(this); this.__types = new Set(); this.__pending = []; }
     takeRecords() { const r = this.__pending; this.__pending = []; return r; }
   }
+
+  // ── runtime timelines (net) ───────────────────────────────────────────────
+  // node only materialises the "net" timeline while an observer is subscribed
+  // (lib/internal/perf/observe.js `hasObserver`), so the socket path pays
+  // nothing in the common case. `net` calls this once a connection completes.
+  function hasObserverFor(type) {
+    for (const obs of observers) if (obs.__types.has(type)) return true;
+    return false;
+  }
+  Object.defineProperty(G, "__mbunPerfNetEntry", {
+    configurable: true, enumerable: false, writable: true,
+    value: (name, startTime, detail) => {
+      if (!hasObserverFor("net")) return;
+      const start = typeof startTime === "number" ? startTime : perfNow();
+      addEntry(new PerformanceNodeEntry(kConstruct, name, "net", start, perfNow() - start, detail));
+    },
+  });
+  // lib/internal/perf/observe.js hasObserver / startPerf / stopPerf, as the
+  // "http" timeline uses them: _http_server.js and _http_client.js stash a
+  // `{ type, name, detail, startTime }` context on the message while an
+  // observer is subscribed and turn it into an entry when the exchange ends.
+  // Same pay-nothing-unless-observed contract as the net timeline above.
+  Object.defineProperty(G, "__mbunPerfHasObserver", {
+    configurable: true, enumerable: false, writable: true,
+    value: (type) => hasObserverFor(type),
+  });
+  Object.defineProperty(G, "__mbunPerfStart", {
+    configurable: true, enumerable: false, writable: true,
+    value: (name, type, detail) => ({ name, type, detail, startTime: perfNow() }),
+  });
+  Object.defineProperty(G, "__mbunPerfStop", {
+    configurable: true, enumerable: false, writable: true,
+    value: (ctx, detail) => {
+      if (!ctx || !hasObserverFor(ctx.type)) return;
+      addEntry(new PerformanceNodeEntry(kConstruct, ctx.name, ctx.type, ctx.startTime,
+        perfNow() - ctx.startTime, Object.assign({}, ctx.detail, detail)));
+    },
+  });
 
   // ── Histogram (RecordableHistogram) ───────────────────────────────────────
   const INIT_MIN_BIG = 9223372036854775807n;
@@ -376,7 +435,7 @@ inline constexpr std::string_view kNodePerfJS = R"JS(
   }
 
   function createHistogram(options) {
-    const opts = options || {};
+    const opts = options === undefined || options === null ? kEmptyObject : options;
     let lowest = 1, highest = Number.MAX_SAFE_INTEGER, figures = 3;
     if (opts.lowest !== undefined) lowest = normNum(opts.lowest, "options.lowest");
     if (opts.highest !== undefined) highest = normNum(opts.highest, "options.highest");
@@ -420,7 +479,7 @@ inline constexpr std::string_view kNodePerfJS = R"JS(
   }
 
   function monitorEventLoopDelay(options) {
-    const opts = options || {};
+    const opts = options === undefined || options === null ? kEmptyObject : options;
     let resolution = 10;
     if (opts.resolution !== undefined) {
       if (typeof opts.resolution !== "number") throw errArgType("options.resolution", "number", opts.resolution);
@@ -487,6 +546,9 @@ inline constexpr std::string_view kNodePerfJS = R"JS(
     PerformanceObserver,
     PerformanceObserverEntryList,
     PerformanceNodeTiming,
+    // node exports the Resource Timing interface from perf_hooks too; the
+    // internal PerformanceNodeEntry class is deliberately *not* exported.
+    PerformanceResourceTiming: G.PerformanceResourceTiming,
     monitorEventLoopDelay,
     createHistogram,
     eventLoopUtilization,

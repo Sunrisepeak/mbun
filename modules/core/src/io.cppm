@@ -27,6 +27,13 @@ module;
 #if defined(__linux__)
 #include <sys/random.h>
 #include <sys/syscall.h>
+#elif defined(__APPLE__)
+// arc4random_buf is declared in <stdlib.h> on Darwin, and the global module
+// fragment above pulls only <cerrno>/<cstdint>/<cstdio>/<cstring>/<limits>.
+// Without this the macOS build fails at the ::arc4random_buf call below with
+// "missing '#include <_stdlib.h>'" -- the first real portability error the
+// macOS CI probe reached, after mcpp and the toolchain resolved cleanly.
+#include <stdlib.h>
 #endif
 #include <sys/types.h>
 #include <unistd.h>
@@ -168,8 +175,16 @@ namespace platform_contract {
     std::unreachable();
 }
 
-[[nodiscard]] constexpr bool uses_nocancel_io(PlatformKind platform) noexcept {
-    return platform == PlatformKind::Darwin;
+// Darwin selects the non-cancellation syscall family, but only on x86_64: the
+// `$NOCANCEL` asm labels are that ABI's convention and Apple silicon's libSystem
+// does not export them. Declaring them on arm64 compiles and then fails at link
+// with `undefined symbol: write$NOCANCEL`, which is where the macOS CI probe
+// stopped. arm64 uses the plain syscalls; they differ only in being
+// cancellation points, and mbun calls pthread_cancel nowhere.
+enum class ArchKind : std::uint8_t { X86_64, Arm64, Other };
+
+[[nodiscard]] constexpr bool uses_nocancel_io(PlatformKind platform, ArchKind arch) noexcept {
+    return platform == PlatformKind::Darwin && arch == ArchKind::X86_64;
 }
 
 [[nodiscard]] constexpr bool positioned_io_retries_eintr(PlatformKind platform) noexcept {
@@ -618,7 +633,16 @@ Result<Metadata> metadata_from_handle(NativeHandle handle) noexcept {
 using NativeHandle = int;
 constexpr NativeHandle INVALID_NATIVE_HANDLE{-1};
 
-#if defined(__APPLE__)
+// The `$NOCANCEL` asm labels are an x86_64 Darwin convention. Apple silicon's
+// libSystem does not export them, so declaring them on arm64 links cleanly at
+// compile time and then fails at link:
+//   ld64.lld: error: undefined symbol: write$NOCANCEL
+// That was the macOS CI probe's second wall, after arc4random_buf. arm64 gets
+// the plain syscalls, which differ only in being cancellation points -- mbun
+// has no pthread_cancel anywhere, so the distinction is unobservable here. The
+// EINTR retry contract these wrap is preserved either way; see the assertions
+// in modules/core/tests/test_core_io.cpp.
+#if defined(__APPLE__) && defined(__x86_64__)
 extern "C" {
 int openat_nocancel(int, const char*, int, ...) __asm__("openat$NOCANCEL");
 ssize_t read_nocancel(int, void*, std::size_t) __asm__("read$NOCANCEL");
@@ -627,6 +651,19 @@ ssize_t pread_nocancel(int, void*, std::size_t, off_t) __asm__("pread$NOCANCEL")
 ssize_t pwrite_nocancel(int, const void*, std::size_t, off_t) __asm__("pwrite$NOCANCEL");
 int close_nocancel(int) __asm__("close$NOCANCEL");
 }
+#elif defined(__APPLE__)
+inline int openat_nocancel(int fd, const char* path, int flags, mode_t mode = 0) {
+    return ::openat(fd, path, flags, mode);
+}
+inline ssize_t read_nocancel(int fd, void* buf, std::size_t n) { return ::read(fd, buf, n); }
+inline ssize_t write_nocancel(int fd, const void* buf, std::size_t n) { return ::write(fd, buf, n); }
+inline ssize_t pread_nocancel(int fd, void* buf, std::size_t n, off_t off) {
+    return ::pread(fd, buf, n, off);
+}
+inline ssize_t pwrite_nocancel(int fd, const void* buf, std::size_t n, off_t off) {
+    return ::pwrite(fd, buf, n, off);
+}
+inline int close_nocancel(int fd) { return ::close(fd); }
 #endif
 
 Timestamp timestamp(std::int64_t seconds, std::int64_t nanoseconds) noexcept {

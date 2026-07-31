@@ -36,6 +36,12 @@ void raise_file_descriptor_limit();
 // Set the runtime switch consumed by process.dlopen when --no-addons is used.
 void set_no_addons_env();
 
+// Set an environment variable of THIS process, overwriting any existing value.
+// The point is inheritance: children spawned afterwards see it, which is how a
+// value resolved once in the parent reaches a process the parent does not
+// otherwise talk to (mbun::app::publish_dialect).
+void set_env_var(const char* name, const char* value);
+
 // Path of the running executable, or nullopt when the platform cannot report it.
 // `bun build --compile` copies these bytes to build the standalone executable,
 // and startup reads them back looking for an embedded program. argv[0] is NOT a
@@ -71,6 +77,14 @@ inline void set_no_addons_env_impl() {
 #endif
 }
 
+inline void set_env_var_impl(const char* name, const char* value) {
+#if defined(_WIN32)
+    (void)::_putenv_s(name, value);
+#else
+    (void)::setenv(name, value, 1);
+#endif
+}
+
 } // namespace detail
 
 void raise_file_descriptor_limit() {
@@ -91,6 +105,11 @@ void raise_file_descriptor_limit() {
 void set_no_addons_env() {
     if constexpr (is_windows) detail::set_no_addons_env_impl();
     else detail::set_no_addons_env_impl();
+}
+
+void set_env_var(const char* name, const char* value) {
+    if (name == nullptr || value == nullptr) return;
+    detail::set_env_var_impl(name, value);
 }
 
 std::optional<std::filesystem::path> self_executable_path() {

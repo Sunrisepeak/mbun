@@ -741,7 +741,23 @@ inline constexpr std::string_view kNodeStreamPipelineJS = R"JS(
       let onreadable;
       let onclose;
       let d;
+      // pipeline() removes the LAST stream's 'error' listener once it completes
+      // without error (lastStreamCleanup, nodejs/node#35452 — the tail keeps
+      // living as `d`'s source, so pipeline must not keep listeners on it). Node
+      // gets away with that because a tail whose body throws is always destroyed
+      // BEFORE pipeline completes: the write side finishes on a nextTick, and
+      // node drains the WHOLE microtask queue before the tick queue, so the
+      // async body's rejection (pure microtasks) always overtakes it. mbun's
+      // process.nextTick arms itself with a promise reaction (runtime/
+      // bindings_install.inc), so a tick scheduled from inside a microtask runs
+      // BEFORE the rest of that microtask chain — the tail's 'finish' lands
+      // first, pipeline declares success, drops its error listener, and the body's
+      // throw then has no listener at all: uncaught, and `d` hangs forever.
+      // So track completion and keep a tail-error path of our own for after it.
+      // ref: test-stream-readable-compose.js "after finishing all readable data".
+      let pipelineFinished = false;
       function onfinished(err) {
+        pipelineFinished = true;
         const cb = onclose;
         onclose = null;
         if (cb) {
@@ -824,6 +840,14 @@ inline constexpr std::string_view kNodeStreamPipelineJS = R"JS(
           });
           tail.on("end", function() {
             d.push(null);
+          });
+          // Only after pipeline() has completed: while it is still running its
+          // own onError owns the error and routing it twice would change which
+          // error wins / when `d` is destroyed.
+          tail.on("error", function(err) {
+            if (pipelineFinished && !d.destroyed) {
+              d.destroy(err);
+            }
           });
           d._read = function() {
             while (true) {
@@ -964,7 +988,18 @@ inline constexpr std::string_view kNodeStreamPipelineJS = R"JS(
 
   R.def("internal/stream.consumers", function (require, module, exports) {
     const JSONParse = JSON.parse;
+    // A second consumer on an already-locked ReadableStream must reject with
+    // ERR_INVALID_STATE. Bun.readableStreamTo* throws a bare TypeError with no
+    // `code`, so guard before delegating.
+    const assertUnlocked = (stream) => {
+      if ($inheritsReadableStream(stream) && stream.locked === true) {
+        const e = new TypeError("Invalid state: The ReadableStream is locked");
+        e.code = "ERR_INVALID_STATE";
+        throw e;
+      }
+    };
     async function blob(stream) {
+      assertUnlocked(stream);
       if ($inheritsReadableStream(stream))
         return Bun.readableStreamToBlob(stream);
       const chunks = [];
@@ -973,12 +1008,14 @@ inline constexpr std::string_view kNodeStreamPipelineJS = R"JS(
       return new Blob(chunks);
     }
     async function arrayBuffer(stream) {
+      assertUnlocked(stream);
       if ($inheritsReadableStream(stream))
         return Bun.readableStreamToArrayBuffer(stream);
       const ret = await blob(stream);
       return ret.arrayBuffer();
     }
     async function bytes(stream) {
+      assertUnlocked(stream);
       if ($inheritsReadableStream(stream))
         return Bun.readableStreamToBytes(stream);
       const ret = await blob(stream);
@@ -988,6 +1025,7 @@ inline constexpr std::string_view kNodeStreamPipelineJS = R"JS(
       return Buffer.from(await arrayBuffer(stream));
     }
     async function text(stream) {
+      assertUnlocked(stream);
       if ($inheritsReadableStream(stream))
         return Bun.readableStreamToText(stream);
       const dec = new TextDecoder;
@@ -995,13 +1033,22 @@ inline constexpr std::string_view kNodeStreamPipelineJS = R"JS(
       for await (const chunk of stream) {
         if (typeof chunk === "string")
           str += chunk;
-        else
+        else {
+          // node's text()/json() validate every chunk, unlike blob()/bytes(),
+          // which stringify through Blob (an object-mode stream legitimately
+          // yields '[object Object]' there). Decoding a non-BufferSource here
+          // would otherwise coerce silently.
+          if (chunk === null || typeof chunk !== "object" || !ArrayBuffer.isView(chunk)) {
+            throw $ERR_INVALID_ARG_TYPE("chunk", ["string", "Buffer", "TypedArray", "DataView"], chunk);
+          }
           str += dec.decode(chunk, { stream: true });
+        }
       }
       str += dec.decode(undefined, { stream: false });
       return str;
     }
     async function json(stream) {
+      assertUnlocked(stream);
       if ($inheritsReadableStream(stream))
         return Bun.readableStreamToJSON(stream);
       const str = await text(stream);

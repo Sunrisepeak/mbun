@@ -3,9 +3,11 @@
 // Exposes the stateful, handle-based incremental codecs (mbun.compress.stream)
 // to the JS layer as extra methods on globalThis.__mbunZlibNative:
 //   streamOpen(kind, windowBits, level, memLevel, strategy, quality, lgwin, mode) → handle
-//   streamProcess(handle, dataB64, flush) → { b64, consumed, streamEnd, ok, message }
+//   streamProcess(handle, dataB64, flush) → { b64, consumed, streamEnd, ok, message, code }
 //   streamDict(handle, dictB64) → bool
 //   streamReset(handle) → bool
+//   streamParams(handle, level, strategy) → bool
+//   streamZstdPledged(handle, size) → bool
 //   streamClose(handle)
 //
 // `kind` is the StreamKind ordinal: 0 deflate, 1 inflate, 2 brotli_enc,
@@ -45,6 +47,7 @@ JSValueRef zlibs_process_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
     set_prop(ctx, out, "streamEnd", JSValueMakeBoolean(ctx, r.stream_end));
     set_prop(ctx, out, "ok", JSValueMakeBoolean(ctx, r.ok));
     set_prop(ctx, out, "message", make_string(ctx, r.message));
+    set_prop(ctx, out, "code", make_string(ctx, r.code));
     return out;
 }
 
@@ -64,6 +67,25 @@ JSValueRef zlibs_reset_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_
     return JSValueMakeBoolean(ctx, mbun::compress::stream_reset(handle));
 }
 
+// streamParams(handle, level, strategy) → bool  (node zlib .params(), deflateParams)
+JSValueRef zlibs_params_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                           const JSValueRef args[], JSValueRef*) {
+    const int handle{zlibn_arg_int(ctx, argc, args, 0, 0)};
+    const int level{zlibn_arg_int(ctx, argc, args, 1, -1)};
+    const int strategy{zlibn_arg_int(ctx, argc, args, 2, 0)};
+    return JSValueMakeBoolean(ctx, mbun::compress::stream_params(handle, level, strategy));
+}
+
+// streamZstdPledged(handle, size) → bool  (node zstd `pledgedSrcSize` option)
+JSValueRef zlibs_zstd_pledged_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                                 const JSValueRef args[], JSValueRef*) {
+    const int handle{zlibn_arg_int(ctx, argc, args, 0, 0)};
+    const double size{argc > 1 ? JSValueToNumber(ctx, args[1], nullptr) : 0.0};
+    return JSValueMakeBoolean(
+        ctx, mbun::compress::stream_zstd_set_pledged_src_size(
+                 handle, static_cast<unsigned long long>(size < 0 ? 0 : size)));
+}
+
 // streamClose(handle)
 JSValueRef zlibs_close_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                           const JSValueRef args[], JSValueRef*) {
@@ -78,5 +100,7 @@ void install_zlib_stream_native(JSContextRef ctx, JSObjectRef zn) {
     set_fn(ctx, zn, "streamProcess", zlibs_process_cb);
     set_fn(ctx, zn, "streamDict", zlibs_dict_cb);
     set_fn(ctx, zn, "streamReset", zlibs_reset_cb);
+    set_fn(ctx, zn, "streamParams", zlibs_params_cb);
+    set_fn(ctx, zn, "streamZstdPledged", zlibs_zstd_pledged_cb);
     set_fn(ctx, zn, "streamClose", zlibs_close_cb);
 }

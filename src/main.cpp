@@ -25,6 +25,16 @@ using namespace mbun::app;
 
 int main(int argc, char* argv[]) {
     mbun::platform::raise_file_descriptor_limit();
+    // process.argv0 — node snapshots the ORIGINAL argv[0] before anything can
+    // rewrite it, and the corpus respawns the runtime through it. Recorded first
+    // so every dispatch below (compiled program, node emulation, run, -e) agrees.
+    if (argc > 0 && argv[0] != nullptr) mbun::jsc::runtime::set_argv0(argv[0]);
+    // The process dialect (node vs bun). Resolved ONCE, here, before any
+    // dispatch, and read afterwards by the C++ dispatch points and by JS
+    // through globalThis.__mbunDialect. See mbun::app::resolve_dialect for the
+    // priority order and modules/jsc/src/runtime.cppm for what it is for.
+    // Published below — the compiled-executable branch publishes its own.
+    const ResolvedDialect resolvedDialect{resolve_dialect(argc, argv)};
     // NODE_PRESERVE_SYMLINKS_MAIN — read before any flag parsing so both the
     // node-emulation path and `run` see it (run_command.rs:2581-2584).
     if (const char* v{std::getenv("NODE_PRESERVE_SYMLINKS_MAIN")};
@@ -45,9 +55,16 @@ int main(int argc, char* argv[]) {
     //    ref: cli/mod.rs, which consults StandaloneModuleGraph.fromExecutable()
     //    before any argument parsing.
     if (const auto embedded{embedded_program()}) {
+        // A compiled executable owns its whole command line, so the SUBCOMMAND
+        // signal cannot be read off it — `./myapp test` is the program's own
+        // argument, not a bun subcommand. Only an EXPLICIT dialect survives
+        // here; otherwise a `bun build --compile` artifact keeps the bun
+        // default, which is what it was built as.
+        publish_dialect(resolvedDialect.explicitly_set ? resolvedDialect : ResolvedDialect{});
         std::vector<std::string_view> embeddedArgs(argv + 1, argv + argc);
         return run_embedded_program(*embedded, argc > 0 ? argv[0] : "mbun", embeddedArgs);
     }
+    publish_dialect(resolvedDialect);
 
     // ── --enable-fips / --force-fips on a non-FIPS OpenSSL → refuse to start.
     //    node ProcessFipsOptions() (src/crypto/crypto_util.cc) asks OpenSSL for a
@@ -73,6 +90,76 @@ int main(int argc, char* argv[]) {
                              argc > 0 ? argv[0] : "mbun");
                 return 1;
             }
+        }
+    }
+
+    // ── --unhandled-rejections=<mode> with an unknown mode → refuse to start.
+    //    node validates the value in EnvironmentOptions::CheckOptions
+    //    (src/node_options.cc) and bails out of bootstrap before any JS runs,
+    //    which is exactly what test-promise-unhandled-flag spawns a child to
+    //    observe. Accepting the bad value instead made that test re-exec itself
+    //    forever (the child ran the test, which spawned another child…), so this
+    //    is also the fix for a corpus hang, not just a message.
+    //    Parsed off the raw command line with the same guards as the FIPS check:
+    //    stop at the first non-option or eval flag so an `-e` program that merely
+    //    mentions the string is not a request.
+    {
+        const auto valid_rejection_mode{[](std::string_view v) {
+            return v == "throw" || v == "strict" || v == "warn" || v == "none" ||
+                   v == "warn-with-error-code";
+        }};
+        for (int i{1}; i < argc; ++i) {
+            const std::string_view a{argv[i]};
+            if (a == "-e" || a == "--eval" || a == "-p" || a == "--print" || a == "-pe" ||
+                a == "-ep") {
+                break;
+            }
+            if (!a.starts_with("-")) break;
+            std::optional<std::string_view> value{};
+            if (a.starts_with("--unhandled-rejections=")) {
+                value = a.substr(std::string_view{"--unhandled-rejections="}.size());
+            } else if (a == "--unhandled-rejections" && i + 1 < argc) {
+                value = std::string_view{argv[++i]};
+            }
+            if (value && !valid_rejection_mode(*value)) {
+                std::println(std::cerr, "{}: invalid value for --unhandled-rejections",
+                             argc > 0 ? argv[0] : "mbun");
+                return 9;
+            }
+        }
+    }
+
+    // ── `--tls-min-v1.3` together with `--tls-max-v1.2` is an EMPTY protocol
+    //    window: the floor is above the ceiling, so no version could ever be
+    //    negotiated. node rejects it during option parsing rather than letting a
+    //    process start that can never complete a handshake.
+    //    PORT-SOURCE: compat/node/src/node_options.cc:206 PerProcessOptions::
+    //    CheckOptions — `if (tls_min_v1_3 && tls_max_v1_2)` pushes
+    //    "either --tls-min-v1.3 or --tls-max-v1.2 can be used, not both", which
+    //    node prints and exits 9 on. The other combinations (min-v1.2 with
+    //    max-v1.3, …) are legal windows and are NOT checked here, exactly as
+    //    node does not check them.
+    //    Same raw-command-line guards as the --unhandled-rejections block above:
+    //    stop at the first non-option or eval flag so an `-e` program that merely
+    //    mentions the strings is not read as a request.
+    {
+        bool minV13{};
+        bool maxV12{};
+        for (int i{1}; i < argc; ++i) {
+            const std::string_view a{argv[i]};
+            if (a == "-e" || a == "--eval" || a == "-p" || a == "--print" || a == "-pe" ||
+                a == "-ep") {
+                break;
+            }
+            if (!a.starts_with("-")) break;
+            if (a == "--tls-min-v1.3") minV13 = true;
+            else if (a == "--tls-max-v1.2") maxV12 = true;
+        }
+        if (minV13 && maxV12) {
+            std::println(std::cerr,
+                         "{}: either --tls-min-v1.3 or --tls-max-v1.2 can be used, not both",
+                         argc > 0 ? argv[0] : "mbun");
+            return 9;
         }
     }
 
@@ -180,6 +267,17 @@ int main(int argc, char* argv[]) {
             args.erase(args.begin());
             continue;
         }
+        // `--dialect=<name>` / `--dialect <name>` — already consumed by
+        // resolve_dialect() above; drop it here so it is not mistaken for a run
+        // target or forwarded to the script.
+        if (args[0].starts_with("--dialect=")) {
+            args.erase(args.begin());
+            continue;
+        }
+        if (args[0] == "--dialect" && args.size() > 1) {
+            args.erase(args.begin(), args.begin() + 2);
+            continue;
+        }
         if (args[0] == "--silent") {
             globalFlags.silent = true;
             args.erase(args.begin());
@@ -198,7 +296,7 @@ int main(int argc, char* argv[]) {
         if (preloadFlag) {
             const bool separateValue{args[0] == "--preload" || args[0] == "--require" ||
                                      args[0] == "-r" || args[0] == "--import"};
-            const std::size_t count{separateValue && args.size() > 1 ? 2 : 1};
+            const std::size_t count{separateValue && args.size() > 1 ? std::size_t{2} : std::size_t{1}};
             args.erase(args.begin(), args.begin() + static_cast<std::ptrdiff_t>(count));
             continue;
         }
@@ -211,6 +309,17 @@ int main(int argc, char* argv[]) {
         if (const std::size_t n{take_valued_flag(args, 0, "--user-agent",
                                                  mbun::jsc::runtime::set_user_agent)};
             n > 0) {
+            args.erase(args.begin(), args.begin() + static_cast<std::ptrdiff_t>(n));
+            continue;
+        }
+        // `--loader .ext:name` / `-l .ext:name` — shared with run/test, not
+        // build-only (see apply_loader_flag).
+        if (const std::size_t n{take_valued_flag(args, 0, "--loader", apply_loader_flag)};
+            n > 0) {
+            args.erase(args.begin(), args.begin() + static_cast<std::ptrdiff_t>(n));
+            continue;
+        }
+        if (const std::size_t n{take_valued_flag(args, 0, "-l", apply_loader_flag)}; n > 0) {
             args.erase(args.begin(), args.begin() + static_cast<std::ptrdiff_t>(n));
             continue;
         }
@@ -291,7 +400,17 @@ int main(int argc, char* argv[]) {
             // (node_process.rs), so `mbun -e <code> foo` puts foo at argv[1],
             // matching node. Emitting "[eval]" there shifted every user arg by one.
             std::vector<std::string> jsArgv{"mbun"};
-            for (std::string_view a : std::span{args}.subspan(2)) jsArgv.emplace_back(a);
+            {
+                // A single leading `--` after the eval string is the option
+                // terminator, not a user argument: node's test-cli-eval.js
+                // runs `--eval <code> -- <args>` and asserts argv.slice(1) is
+                // exactly <args>. Only the FIRST one is consumed — with
+                // `-- --` the second `--` is a real argument.
+                // ref: regression 17294.
+                auto rest{std::span{args}.subspan(2)};
+                if (!rest.empty() && rest[0] == "--") rest = rest.subspan(1);
+                for (std::string_view a : rest) jsArgv.emplace_back(a);
+            }
             mbun::jsc::runtime::set_argv(std::move(jsArgv));
             std::string code{args[1]};
             // `-p`/`--print` prints the expression result.
@@ -342,8 +461,36 @@ int main(int argc, char* argv[]) {
                                args.begin() + static_cast<std::ptrdiff_t>(i + n));
                     continue;
                 }
+                if (const std::size_t n{take_valued_flag(args, i, "--loader", apply_loader_flag)};
+                    n > 0) {
+                    args.erase(args.begin() + static_cast<std::ptrdiff_t>(i),
+                               args.begin() + static_cast<std::ptrdiff_t>(i + n));
+                    continue;
+                }
+                if (const std::size_t n{take_valued_flag(args, i, "-l", apply_loader_flag)};
+                    n > 0) {
+                    args.erase(args.begin() + static_cast<std::ptrdiff_t>(i),
+                               args.begin() + static_cast<std::ptrdiff_t>(i + n));
+                    continue;
+                }
                 if (args[i] == "--if-present") { flags.ifPresent = true; ++i; continue; }
                 if (args[i] == "--workspaces") { flags.workspaces = true; ++i; continue; }
+                // `--filter <pattern>` / `-F <pattern>` (Arguments.rs:325): the
+                // same workspace fan-out as `--workspaces`, narrowed to the
+                // members whose package name matches. Unhandled, "--filter" was
+                // taken as the script name (issue 26207).
+                if ((args[i] == "--filter" || args[i] == "-F") && i + 1 < args.size()) {
+                    flags.workspaces = true;
+                    flags.workspaceFilters.emplace_back(args[i + 1]);
+                    i += 2;
+                    continue;
+                }
+                if (args[i].starts_with("--filter=")) {
+                    flags.workspaces = true;
+                    flags.workspaceFilters.emplace_back(args[i].substr(9));
+                    ++i;
+                    continue;
+                }
                 if (args[i] == "--bun" || args[i] == "-b") { flags.forceUsingBun = true; ++i; continue; }
                 // `--cwd <dir>` / `--cwd=<dir>` — chdir before resolving the target
                 // (Arguments.rs:773). Two-token form was previously unhandled, which
@@ -427,6 +574,8 @@ int main(int argc, char* argv[]) {
         return run_build(std::span{args}.subspan(1));
     case Action::Exec:
         return run_exec(parsed.argument);
+    case Action::Publish:
+        return run_publish(std::span{args}.subspan(1));
     case Action::NotImplemented:
         std::println("mbun: '{}' is planned but not implemented yet", parsed.argument);
         return 1;

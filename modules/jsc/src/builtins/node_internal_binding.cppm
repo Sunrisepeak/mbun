@@ -243,7 +243,9 @@ inline constexpr std::string_view kNodeInternalBindingJS = R"JS(
       fs: mod("fs").constants || {},
       crypto: mod("crypto").constants || {},
       zlib: mod("zlib").constants || {},
-      trace: {},
+      // node src/tracing/trace_event_common.h phase codes; the trace_events
+      // partition of the process blob owns the table (see `phases` there).
+      trace: (G.__mbunTraceEvents && G.__mbunTraceEvents.phases) || {},
       internal: {},
       signals: os.signals || {},
     };
@@ -384,12 +386,19 @@ inline constexpr std::string_view kNodeInternalBindingJS = R"JS(
   // ------------------------------------------------------------- symbols ----
   // node src/node_symbols.cc — per-isolate well-known private symbols. Same
   // reasoning as util.privateSymbols: minted on demand, stable per process.
+  // The description is the NAME, with no prefix: node's V(messaging_transfer_
+  // symbol, "messaging_transfer_symbol") pairs the two, and the corpus finds
+  // kTransfer on a prototype by matching `symbol.description ===
+  // 'messaging_transfer_symbol'` — a "node:" prefix made that search fail.
+  // Backed by the process-wide registry so a symbol handed out here is the SAME
+  // symbol worker_threads and the fs FileHandle use; two independent mints
+  // would be an identity check nothing could ever satisfy.
   factories["symbols"] = () => {
-    const cached = { __proto__: null };
+    const cached = G.__mbunNodeSymbols || (G.__mbunNodeSymbols = { __proto__: null });
     return new Proxy({ __proto__: null }, {
       get(_t, key) {
         if (typeof key !== "string") return undefined;
-        return cached[key] || (cached[key] = Symbol("node:" + key));
+        return cached[key] || (cached[key] = Symbol(key));
       },
       has() { return true; },
     });
@@ -1599,7 +1608,52 @@ inline constexpr std::string_view kNodeInternalBindingJS = R"JS(
   factories["crypto"] = () => {
     const c = mod("crypto");
     const list = (fn) => (typeof fn === "function" ? fn() : []);
+    // node src/crypto/crypto_keys.cc: the KeyObject/CryptoKey base classes are
+    // C++ so that the instances can be transferred between threads, and node's
+    // lib/internal/crypto/keys.js top-levels a call to each factory. Without
+    // them that module throws while loading, and it is loaded transitively by
+    // `internal/crypto/util` and `internal/crypto/webidl` — so the pure-JS
+    // helpers in those modules were unreachable. mbun's `crypto` is native and
+    // never routes through node's key JS, so the base classes only have to
+    // provide the storage contract keys.js drives: a slot tuple stashed on the
+    // instance that the matching `get*Slots` reads back.
+    const kKeyObjectSlots = Symbol("node:KeyObject slots");
+    const kCryptoKeySlots = Symbol("node:CryptoKey slots");
+    const defineSlots = (target, key, slots) => {
+      Object.defineProperty(target, key, { __proto__: null, value: slots });
+      return slots;
+    };
     return {
+      // node's opaque handle to an EVP_PKEY / symmetric secret. keys.js only
+      // uses it for `instanceof` gating and to forward to native jobs.
+      KeyObjectHandle: class KeyObjectHandle {},
+      createNativeKeyObjectClass: (callback) => {
+        class NativeKeyObject {
+          constructor(handle) {
+            defineSlots(this, kKeyObjectSlots,
+              [handle === undefined || handle === null ? undefined : handle.type, handle]);
+          }
+        }
+        return callback(NativeKeyObject);
+      },
+      getKeyObjectSlots: (key) => key[kKeyObjectSlots],
+      createCryptoKeyClass: (callback) => {
+        class NativeCryptoKey {
+          constructor(handle, algorithm, usagesMask, extractable) {
+            defineSlots(this, kCryptoKeySlots,
+              [handle === undefined || handle === null ? undefined : handle.type,
+               extractable, algorithm, usagesMask, handle]);
+          }
+        }
+        return callback(NativeCryptoKey);
+      },
+      getCryptoKeySlots: (key) => key[kCryptoKeySlots],
+      // node src/crypto/crypto_keys.h enums, in declaration order.
+      kKeyTypeSecret: 0, kKeyTypePublic: 1, kKeyTypePrivate: 2,
+      kKeyFormatPEM: 0, kKeyFormatDER: 1, kKeyFormatJWK: 2,
+      kKeyFormatRawPublic: 3, kKeyFormatRawPrivate: 4, kKeyFormatRawSeed: 5,
+      kKeyEncodingPKCS1: 0, kKeyEncodingPKCS8: 1,
+      kKeyEncodingSPKI: 2, kKeyEncodingSEC1: 3,
       getCiphers: () => list(c.getCiphers),
       getCurves: () => list(c.getCurves),
       getHashes: () => list(c.getHashes),
@@ -1750,6 +1804,12 @@ inline constexpr std::string_view kNodeInternalBindingJS = R"JS(
     return strictNs("js_stream", {
       JSStream: class JSStream {
         constructor() {
+          // A JSStream stands in for a node native handle, and node's
+          // structured clone refuses those ("Cannot clone object of unsupported
+          // type." — test-worker-message-port-transfer-native). Without the
+          // mark it cloned into a husk of its five public callback slots and
+          // the postMessage succeeded.
+          if (typeof G.__mbunMarkNativeHostObject === "function") G.__mbunMarkNativeHostObject(this);
           this.onread = undefined;
           this.onreadstart = undefined;
           this.onreadstop = undefined;
@@ -2007,60 +2067,23 @@ inline constexpr std::string_view kNodeInternalBindingJS = R"JS(
   });
 
   // ----------------------------------------------------------- http_parser ----
-  // node src/node_http_parser.cc. The callback-slot indices and the type
-  // constants ARE the protocol between node's lib/_http_common.js and llhttp;
-  // this runtime parses HTTP in its own layer rather than through a JS-visible
-  // parser, so `execute`/`consume` report "not supported" instead of silently
-  // consuming nothing — a parser that swallows bytes is worse than one that
-  // says it cannot.
+  // node src/node_http_parser.cc. There is exactly ONE HTTPParser in node: the
+  // class this binding exports is what lib/_http_common.js recycles AND what
+  // `require('_http_common').HTTPParser` hands to user code, so this returns the
+  // runtime's own incremental parser (js_net.cppm) rather than a second class.
+  // It used to export a stub whose execute()/consume() threw "not supported" —
+  // and because bootstrap ALSO registered an empty `class HTTPParser {}` on
+  // `_http_common`, the real parser was unreachable from JS on every path.
+  //
+  // NOT frozen with strictNs: node's own test-http-parser-lazy-loaded replaces
+  // `binding.HTTPParser` before `_http_common` is first used, which is only
+  // observable if the namespace is writable and the free list reads it lazily.
   factories["http_parser"] = () => {
-    const P = class HTTPParser {
-      constructor() { this[HTTPParser.kOnMessageBegin] = undefined; }
-      initialize() {}
-      close() {}
-      free() {}
-      remove() {}
-      execute() { throw new Error("http_parser.execute is not supported"); }
-      finish() { return undefined; }
-      pause() {} resume() {}
-      consume() { throw new Error("http_parser.consume is not supported"); }
-      unconsume() {}
-      getCurrentBuffer() { return mod("buffer").Buffer.alloc(0); }
-      duration() { return 0; }
-      headersCompleted() { return false; }
-    };
-    // node src/node_http_parser.cc `enum parser_types` + the kOn* callback slots.
-    P.REQUEST = 1;
-    P.RESPONSE = 2;
-    P.kOnMessageBegin = 0;
-    P.kOnHeaders = 1;
-    P.kOnHeadersComplete = 2;
-    P.kOnBody = 3;
-    P.kOnMessageComplete = 4;
-    P.kOnExecute = 5;
-    P.kOnTimeout = 6;
-    P.kLenientNone = 0;
-    P.kLenientHeaders = 1 << 0;
-    P.kLenientChunkedLength = 1 << 1;
-    P.kLenientKeepAlive = 1 << 2;
-    P.kLenientTransferEncoding = 1 << 3;
-    P.kLenientVersion = 1 << 4;
-    P.kLenientDataAfterClose = 1 << 5;
-    P.kLenientOptionalLFAfterCR = 1 << 6;
-    P.kLenientOptionalCRLFAfterChunk = 1 << 7;
-    P.kLenientOptionalCRBeforeLF = 1 << 8;
-    P.kLenientSpacesAfterChunkSize = 1 << 9;
-    P.kLenientAll = (1 << 10) - 1;
-    return strictNs("http_parser", {
+    const P = globalThis.__mbunHttpParser;
+    const ns = {
       HTTPParser: P,
-      methods: [
-        "DELETE", "GET", "HEAD", "POST", "PUT", "CONNECT", "OPTIONS", "TRACE",
-        "COPY", "LOCK", "MKCOL", "MOVE", "PROPFIND", "PROPPATCH", "SEARCH",
-        "UNLOCK", "BIND", "REBIND", "UNBIND", "ACL", "REPORT", "MKACTIVITY",
-        "CHECKOUT", "MERGE", "M-SEARCH", "NOTIFY", "SUBSCRIBE", "UNSUBSCRIBE",
-        "PATCH", "PURGE", "MKCALENDAR", "LINK", "UNLINK", "SOURCE", "QUERY",
-      ],
-      allMethods: [],
+      methods: (P && P.methods) || [],
+      allMethods: (P && P.allMethods) || [],
       ConnectionsList: class ConnectionsList {
         constructor() { this._all = []; }
         all() { return this._all; }
@@ -2068,7 +2091,8 @@ inline constexpr std::string_view kNodeInternalBindingJS = R"JS(
         active() { return []; }
         expired() { return []; }
       },
-    });
+    };
+    return ns;
   };
 
   // ------------------------------------------------------------ signal_wrap ----

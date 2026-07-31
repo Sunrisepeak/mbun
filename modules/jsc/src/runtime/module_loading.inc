@@ -197,6 +197,202 @@
         return primordials_;
     }
 
+    // `--preserve-symlinks` (node CLI): a module's identity is the path it was
+    // reached through, not the link target. It governs BOTH the node_modules
+    // walk-up (resolver::Options::preserve_symlinks) and the module cache key /
+    // __filename below, which is why it is read here rather than baked into
+    // either layer.
+    static bool preserve_symlinks_() {
+        return std::find(gExecArgv.begin(), gExecArgv.end(), "--preserve-symlinks") !=
+               gExecArgv.end();
+    }
+
+    // node's Module._resolveFilename ends in toRealPath() unless
+    // --preserve-symlinks: the module cache is keyed by the file's REAL path, so
+    // one file reached through two different symlinks is ONE module instance.
+    // Without this, `node_modules/moduleA` and
+    // `node_modules/moduleB/node_modules/moduleA -> ../../moduleA` evaluated as
+    // two separate instances, which is precisely the cache blow-out node's
+    // test-module-circular-symlinks exists to catch (a symlink cycle then
+    // recurses instead of terminating on a cache hit).
+    static std::string real_module_path_(const std::string& path) {
+        if (preserve_symlinks_()) {
+            return path;
+        }
+        std::error_code ec;
+        auto c{std::filesystem::canonical(std::filesystem::path{path}, ec)};
+        if (ec) {
+            return path;
+        }
+        return c.string();
+    }
+
+    // node's tryPackage DEP0128: a package.json whose "main" does not resolve,
+    // but whose directory has an index.<ext> to fall back to, LOADS — and warns.
+    // Emitted here rather than inside the resolver because the resolver is the
+    // pure-logic layer and has no process/emitWarning to reach.
+    //
+    // Fires only when the request was for the package/directory itself: node
+    // warns from tryPackage, so an explicit `require('pkg/index.js')` (which
+    // never consults "main") must stay silent. `spec` already naming the
+    // resolved basename is exactly that case, and the guard matters — node's
+    // test harness fails a file for ANY unexpected warning, so a false positive
+    // here is a corpus-wide regression, not a cosmetic one.
+    void maybe_warn_invalid_main_(JSContextRef ctx, const std::string& spec,
+                                  const std::string& path, const std::string& dir) {
+        const std::string base{std::filesystem::path{path}.filename().string()};
+        if (!base.starts_with("index.") || spec.ends_with(base)) {
+            return;
+        }
+        const std::string pkgJson{dir + "/package.json"};
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(pkgJson, ec)) {
+            return;
+        }
+        const std::optional<std::string> text{read_file(pkgJson)};
+        if (!text) {
+            return;
+        }
+        // hasOwnProperty, not a bare `p.main`: a package.json WITHOUT a "main"
+        // is the common case, and a plain read would fall through to
+        // Object.prototype — which user code is allowed to put an accessor on
+        // (test-module-prototype-mutation plants one on exactly this name and
+        // asserts the loader never trips it).
+        const std::string mainField{val_to_string(
+            ctx, eval_("(function(t){try{var p=JSON.parse(t);"
+                       "return (p&&Object.prototype.hasOwnProperty.call(p,'main')&&"
+                       "typeof p.main==='string')?p.main:'';}catch(e){return '';}})(" +
+                           json_quote_(*text) + ")",
+                       nullptr))};
+        if (mainField.empty()) {
+            return;
+        }
+        // node: tryFile(main) || tryExtensions(main) || tryExtensions(main/index).
+        // If any of those would have hit, "main" was fine and there is nothing
+        // to warn about.
+        const std::string mainPath{
+            (std::filesystem::path{dir} / mainField).lexically_normal().string()};
+        static constexpr std::string_view kExts[]{"", ".js", ".json", ".node", ".mjs", ".cjs"};
+        for (const std::string_view ext : kExts) {
+            if (!ext.empty() && std::filesystem::is_regular_file(mainPath + std::string{ext}, ec)) {
+                return;
+            }
+            if (ext.empty() && std::filesystem::is_regular_file(mainPath, ec)) {
+                return;
+            }
+        }
+        for (const std::string_view ext : kExts) {
+            if (ext.empty()) continue;
+            if (std::filesystem::is_regular_file(mainPath + "/index" + std::string{ext}, ec)) {
+                return;
+            }
+        }
+        (void)eval_void(
+            "globalThis.process&&globalThis.process.emitWarning&&globalThis.process.emitWarning(" +
+            json_quote_("Invalid 'main' field in '" + pkgJson + "' of '" + mainField +
+                        "'. Please either fix that or report it to the module author") +
+            ",'DeprecationWarning','DEP0128');");
+    }
+
+    // Call a one-argument global helper installed by kRequireMachineryJs,
+    // returning the argument unchanged if the helper is not there yet (the
+    // loader runs before that prelude is evaluated, for the bootstrap modules).
+    JSValueRef call_global1_(JSContextRef ctx, const char* name, JSValueRef arg) {
+        JSObjectRef fn{
+            JSValueToObject(ctx, get_prop(ctx, JSContextGetGlobalObject(ctx), name), nullptr)};
+        if (fn == nullptr || !JSObjectIsFunction(ctx, fn)) {
+            return arg;
+        }
+        JSValueRef ret{JSObjectCallAsFunction(ctx, fn, nullptr, 1, &arg, nullptr)};
+        return ret == nullptr ? arg : ret;
+    }
+
+    // node's Module._nodeModulePaths, transliterated from
+    // lib/internal/modules/cjs/loader.js (the POSIX branch): walk `from`
+    // backwards and emit `<prefix>/node_modules` at every path separator,
+    // EXCEPT where the segment just scanned is itself `node_modules` (node
+    // walks directories, not node_modules-of-node_modules). The reverse scan
+    // with the `p` counter is node's own, kept verbatim so the two cannot
+    // drift — `module.paths` is a documented surface and several tests compare
+    // it against a hand-written expectation.
+    static std::vector<std::string> node_module_paths_(std::string_view from) {
+        static constexpr std::string_view kNm{"node_modules"};
+        if (from == "/") {
+            return {"/node_modules"};
+        }
+        std::vector<std::string> paths;
+        std::size_t p{0};
+        bool live{true};  // node's `p !== -1`
+        std::size_t last{from.size()};
+        for (std::size_t i{from.size()}; i-- > 0;) {
+            if (from[i] == '/') {
+                if (p != kNm.size()) {
+                    paths.push_back(std::string{from.substr(0, last)} + "/node_modules");
+                }
+                last = i;
+                p = 0;
+                live = true;
+            } else if (live) {
+                // nmChars is `node_modules` REVERSED, so index p counts from the
+                // end of the segment backwards.
+                if (kNm[kNm.size() - 1 - p] == from[i]) {
+                    ++p;
+                } else {
+                    live = false;
+                }
+            }
+        }
+        return paths;
+    }
+
+    // node's updateChildren(parent, child, scan=true): record `child` on the
+    // module that is currently executing. Called for a fresh load AND for a
+    // cache hit (loader.js:1283/1324) — `module.children` is the set of modules
+    // this one pulled in, not the set it caused to be evaluated — with the
+    // dedupe that keeps a second require() of the same module from listing it
+    // twice. Builtins never reach here (require_impl returns them earlier), so
+    // they stay out of the array exactly as node's fixture GH-7131 asserts.
+    void record_child_(JSContextRef ctx, JSObjectRef child) {
+        if (moduleStack_.empty() || child == nullptr) {
+            return;
+        }
+        JSObjectRef parent{moduleStack_.back()};
+        if (parent == child) {
+            return;
+        }
+        JSObjectRef children{JSValueToObject(ctx, get_prop(ctx, parent, "children"), nullptr)};
+        if (children == nullptr || !JSValueIsArray(ctx, children)) {
+            return;
+        }
+        const unsigned n{static_cast<unsigned>(
+            JSValueToNumber(ctx, get_prop(ctx, children, "length"), nullptr))};
+        for (unsigned i{0}; i < n; ++i) {
+            if (JSValueIsStrictEqual(ctx, JSObjectGetPropertyAtIndex(ctx, children, i, nullptr),
+                                     child)) {
+                return;
+            }
+        }
+        JSObjectSetPropertyAtIndex(ctx, children, n, child, nullptr);
+    }
+
+    // node:module's `Module.prototype`, or null before node:module is installed.
+    // A CommonJS `module` is a Module instance in node; `instanceof Module` and
+    // `module.require()` / `module.load()` both depend on the prototype link.
+    JSValueRef module_prototype_(JSContextRef ctx) {
+        JSObjectRef global{JSContextGetGlobalObject(ctx)};
+        JSObjectRef natives{
+            JSValueToObject(ctx, get_prop(ctx, global, "__mbunNativeModules"), nullptr)};
+        if (natives == nullptr) {
+            return nullptr;
+        }
+        JSObjectRef mod{JSValueToObject(ctx, get_prop(ctx, natives, "module"), nullptr)};
+        if (mod == nullptr) {
+            return nullptr;
+        }
+        JSValueRef proto{get_prop(ctx, mod, "prototype")};
+        return (proto != nullptr && JSValueIsObject(ctx, proto)) ? proto : nullptr;
+    }
+
     // The internalBinding() accessor installed by the js_builtins
     // :node_internal_binding partition (non-enumerable, so node's `common`
     // leaked-globals check never sees it).
@@ -326,6 +522,7 @@
                 esm ? mbun::resolver::ResolveKind::Import : mbun::resolver::ResolveKind::Require;
             opts.tsconfig = find_tsconfig_(fromDir);
             opts.node_paths = node_paths_from_env();
+            opts.preserve_symlinks = preserve_symlinks_();
             mbun::jsc::module_loader::ModuleLoader loader{os_fs(), std::move(opts), /*cjs=*/true};
             loaded = loader.load(rspec, fromDir, effTypeAttr);
         }
@@ -451,6 +648,13 @@
             return JSValueMakeUndefined(ctx);
         }
 
+        // Canonicalize before the module identity is computed (node's
+        // _resolveFilename → toRealPath), so __filename/__dirname and the cache
+        // key all agree on ONE name for the file. A `blob:`/`data:` module has
+        // no on-disk path; canonical() fails there and returns it unchanged.
+        if (!blobModule && !path.empty() && path.front() == '/') {
+            path = real_module_path_(path);
+        }
         // Module identity includes the `?query` suffix: `./m` and `./m?a` are
         // distinct instances (each re-evaluated once, keyed separately), matching
         // bun's module-record key. The bare `path` still drives __filename/dir and
@@ -458,12 +662,21 @@
         const std::string cacheKey{query.empty() ? path : path + query};
 
         if (auto inflight{moduleInFlight_.find(cacheKey)}; inflight != moduleInFlight_.end()) {
-            // Cycle re-entry: live-read module.exports (see moduleInFlight_).
-            return get_prop(ctx, inflight->second, "exports");
+            // Cycle re-entry: live-read module.exports (see moduleInFlight_),
+            // through node's getExportsForCircularRequire — the half-built
+            // exports gets the warn-on-miss prototype for the rest of the body.
+            record_child_(ctx, inflight->second);
+            return call_global1_(ctx, "__mbun_circular_exports",
+                                 get_prop(ctx, inflight->second, "exports"));
         }
         if (auto it{moduleCache_.find(cacheKey)}; it != moduleCache_.end()) {
+            if (auto rec{moduleRecord_.find(cacheKey)}; rec != moduleRecord_.end()) {
+                record_child_(ctx, rec->second);
+            }
             return it->second;
         }
+        // Cache miss, so this is the load node would have run tryPackage for.
+        maybe_warn_invalid_main_(ctx, spec, path, parent_dir(path));
 
         // CAP-NAPI: require("./addon.node") → dlopen + Node-API registration
         // (runtime/napi_objects.inc mbun_napi_require_module; blueprint
@@ -483,6 +696,16 @@
                         ctx, "To load Node-API modules, use require() or process.dlopen instead of import.")};
                     JSObjectRef e{JSObjectMakeError(ctx, 1, &m, nullptr)};
                     set_prop(ctx, e, "name", make_string(ctx, "TypeError"));
+                    // No frames: bun raises this from the module loader's LINK
+                    // step, so an uncaught one reports exactly
+                    // "TypeError: To load Node-API modules…" on the first line of
+                    // stderr. mbun lowers `import` to a require() call, so JSC
+                    // would otherwise stamp the importing statement's position on
+                    // the error and the fatal reporter would print that file's
+                    // source-context block (`<file>:<line>` + caret) ABOVE the
+                    // message. Clearing .stack makes the reporter's frame list
+                    // empty, which is its "header only" case.
+                    set_prop(ctx, e, "stack", make_string(ctx, ""));
                     JSObjectRef tctor{JSObjectMake(ctx, nullptr, nullptr)};
                     set_prop(ctx, tctor, "name", make_string(ctx, "TypeError"));
                     set_prop(ctx, e, "constructor", tctor);
@@ -629,6 +852,34 @@
         // internal/bootstrap/realm.js declares its own `internalBinding`, so the
         // same rename guard the other params use applies here too.
         const bool nodeInternal{is_node_internal_module_(spec, path)};
+        // MBUN_DEBUG_INTERNAL_MODULES=1 names every `internal/…` that fell
+        // through to node's OWN vendored lib file instead of resolving to an
+        // mbun builtin.
+        //
+        // This fallback is load-bearing (node's lib modules require each other
+        // through these specifiers), but it is also a standing compatibility
+        // HAZARD and it is completely silent. node's copy runs as a second,
+        // independent implementation: every `Symbol('x')` it mints is a
+        // different symbol from mbun's, and every module-level cache it builds
+        // is a second cache. The result reads as a behavioural gap with no
+        // pointer to its cause — it has already cost two files in http (a fresh
+        // `Symbol('kOutHeaders')` an OutgoingMessage had never heard of) and was
+        // load-bearing for three in worker.
+        //
+        // Measured on w62: node ships 297 internal/* modules; 5 are registered
+        // mbun builtins, 292 take this path. The fix is per module — register an
+        // mbun builtin for `internal/X` wherever mbun implements X natively —
+        // so what a lane needs is to SEE which ones its subsystem is loading.
+        if (nodeInternal) {
+            static const bool trace{[] {
+                const char* v{std::getenv("MBUN_DEBUG_INTERNAL_MODULES")};
+                return v != nullptr && v[0] != '\0' && std::string_view{v} != "0";
+            }()};
+            if (trace) {
+                std::cerr << "[mbun] internal-module fallback: require(" << spec << ") -> " << path
+                          << " (node's own copy; not an mbun builtin)\n";
+            }
+        }
         const char* pprim{declares("primordials") ? "__mbun_pprimordials" : "primordials"};
         const char* pbind{declares("internalBinding") ? "__mbun_pinternalBinding"
                                                      : "internalBinding"};
@@ -678,8 +929,40 @@
                 ? std::string{"\ninitializeDebugEnv(typeof process !== \"undefined\" && process.env"
                               " ? process.env.NODE_DEBUG : \"\");\n"}
                 : std::string{}};
+        // The fs classes a node-internal module exports must be MBUN'S classes,
+        // not the ones node's own file just defined.
+        //
+        // Resolving `internal/x` to node's real `lib/internal/x.js` is what makes
+        // those modules load at all, but it also means the module hands back a
+        // second, parallel definition of every class it declares. mbun's `fs`
+        // never uses those definitions, so an identity check across the two
+        // sides cannot hold: `fs.watchFile(f, {bigint:true})` yields an mbun
+        // BigIntStats while the test's expectation is
+        // `new (require('internal/fs/utils').BigIntStats)(...)`, and
+        // assert.deepStrictEqual compares prototypes — so two objects that print
+        // identically, field for field, still fail. The same split makes
+        // `require('internal/fs/promises').FileHandle` a class mbun never
+        // instantiates, so a test that redefines its prototype patches nothing.
+        //
+        // Re-pointing just the class exports keeps every function node's file
+        // defines (stringToFlags, the validators, the option parsers) while
+        // making the classes the single ones the runtime actually uses. The
+        // constructor signatures are already positional-compatible: mbun's
+        // Stats/BigIntStats take node's exact
+        // (dev, mode, nlink, uid, gid, rdev, blksize, ino, size, blocks, …times)
+        // argument list.
+        const std::string fsIdentitySuffix{
+            spec == "internal/fs/utils"
+                ? std::string{"\nif (typeof module === \"object\" && module.exports && globalThis.__mbunFsInternals) {"
+                              " module.exports.Stats = globalThis.__mbunFsInternals.Stats;"
+                              " module.exports.BigIntStats = globalThis.__mbunFsInternals.BigIntStats; }\n"}
+            : spec == "internal/fs/promises"
+                ? std::string{"\nif (typeof module === \"object\" && module.exports && globalThis.__mbunFsInternals) {"
+                              " module.exports.FileHandle = globalThis.__mbunFsInternals.FileHandle; }\n"}
+                : std::string{}};
         std::string wrapper{std::string{tla ? "(async function (" : "(function ("} + params +
-                            ") {\n" + strictPrefix + metaPrefix + source + debugEnvSuffix + "\n})"};
+                            ") {\n" + strictPrefix + metaPrefix + source + debugEnvSuffix +
+                            fsIdentitySuffix + "\n})"};
         // User CommonJS modules run through the mutable Module.wrapper hook.
         // Keep the extended native wrapper for Node internals (which receive
         // primordials/internalBinding parameters), but honour changed user
@@ -731,7 +1014,51 @@
 
         JSObjectRef moduleObj{JSObjectMake(ctx, nullptr, nullptr)};
         JSObjectRef exportsObj{JSObjectMake(ctx, nullptr, nullptr)};
+        // Detach the record from the prototype chain while its own fields are
+        // installed. JSObjectSetProperty is [[Set]], so an accessor planted on
+        // Object.prototype ('exports', 'main', 'name', 'type', 'imports' — the
+        // exact set test-module-prototype-mutation plants) would RUN instead of
+        // an own property being created, and node's loader is specified not to
+        // touch them: it uses setOwnProperty/ObjectDefineProperty
+        // (cjs/loader.js Module constructor). The C API has no defineProperty,
+        // so removing the chain for the duration is the equivalent.
+        JSValueRef objProto{JSObjectGetPrototype(ctx, moduleObj)};
+        JSObjectSetPrototype(ctx, moduleObj, JSValueMakeNull(ctx));
         set_prop(ctx, moduleObj, "exports", exportsObj);
+        // The rest of node's Module record. Every one of these was missing:
+        // `module` was a bare `{exports}`, so module.id/filename/path/paths/
+        // loaded/children/parent all read undefined for EVERY CommonJS module
+        // in the process (only the top-level module, built separately in
+        // install_cjs_env, had filename/parent).
+        set_prop(ctx, moduleObj, "id", make_string(ctx, path));
+        set_prop(ctx, moduleObj, "filename", make_string(ctx, path));
+        set_prop(ctx, moduleObj, "path", make_string(ctx, dir));
+        set_prop(ctx, moduleObj, "loaded", JSValueMakeBoolean(ctx, false));
+        set_prop(ctx, moduleObj, "children", JSObjectMakeArray(ctx, 0, nullptr, nullptr));
+        set_prop(ctx, moduleObj, "parent",
+                 moduleStack_.empty() ? JSValueMakeNull(ctx)
+                                      : static_cast<JSValueRef>(moduleStack_.back()));
+        {
+            const std::vector<std::string> nm{node_module_paths_(dir)};
+            std::vector<JSValueRef> items;
+            items.reserve(nm.size());
+            for (const auto& p : nm) {
+                items.push_back(make_string(ctx, p));
+            }
+            set_prop(ctx, moduleObj, "paths",
+                     JSObjectMakeArray(ctx, items.size(), items.data(), nullptr));
+        }
+        if (JSValueRef modProto{module_prototype_(ctx)}) {
+            JSObjectSetPrototype(ctx, moduleObj, modProto);
+        } else {
+            JSObjectSetPrototype(ctx, moduleObj, objProto);
+        }
+        // Link into the requiring module's children BEFORE the body runs, so a
+        // module that inspects its own `module.children` mid-cycle sees node's
+        // ordering (loader.js calls updateChildren from the constructor).
+        record_child_(ctx, moduleObj);
+        JSValueProtect(ctx, moduleObj);
+        moduleRecord_[cacheKey] = moduleObj;
 
         // Cache module.exports BEFORE running the body so a circular require sees
         // the (partial) exports object, matching CommonJS semantics. The
@@ -780,6 +1107,12 @@
             callArgc = 9;
         }
         JSValueRef callExc{nullptr};
+        // This module is the `parent` for everything its body requires (node
+        // threads the same relationship explicitly through Module._load's
+        // `parent` argument). The loader is re-entrant, so the stack is that
+        // chain; it is popped on every exit path below, including the throwing
+        // one.
+        moduleStack_.push_back(moduleObj);
         JSValueRef callRet{JSObjectCallAsFunction(ctx, fn, nullptr, callArgc, callArgs, &callExc)};
         if (callExc == nullptr && asyncWrapped && callRet != nullptr) {
             // Pump the module's promise to completion so top-level awaits finish
@@ -816,16 +1149,30 @@
             JSObjectDeleteProperty(ctx, exportsObj, pend, nullptr);
             JSStringRelease(pend);
         }
+        // Body finished: drop the circular-require warning prototype if a cycle
+        // installed one (node does this at the end of Module.prototype.load).
+        (void)call_global1_(ctx, "__mbun_circular_exports_done",
+                            get_prop(ctx, moduleObj, "exports"));
         moduleInFlight_.erase(cacheKey);
+        if (!moduleStack_.empty()) {
+            moduleStack_.pop_back();
+        }
         JSValueUnprotect(ctx, moduleObj);
 
         if (callExc) {
             // Failed module: drop from cache (node re-throws on next require too).
             JSValueUnprotect(ctx, exportsObj);
             moduleCache_.erase(cacheKey);
+            // …and drop the record with it, or the next require() would take the
+            // cache-hit branch's record for a module that never finished.
+            if (auto rec{moduleRecord_.find(cacheKey)}; rec != moduleRecord_.end()) {
+                JSValueUnprotect(ctx, rec->second);
+                moduleRecord_.erase(rec);
+            }
             if (exc) *exc = callExc;
             return JSValueMakeUndefined(ctx);
         }
+        set_prop(ctx, moduleObj, "loaded", JSValueMakeBoolean(ctx, true));
 
         // module.exports may have been reassigned wholesale; re-read + re-cache.
         JSValueRef finalExports{get_prop(ctx, moduleObj, "exports")};

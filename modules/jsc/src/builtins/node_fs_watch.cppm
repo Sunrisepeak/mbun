@@ -38,7 +38,30 @@ inline constexpr std::string_view kNodeFsWatchJS = R"JS(
   const EE = (M["events"] && M["events"].EventEmitter) || (M["node:events"] && M["node:events"].EventEmitter);
   const WN = G.__mbunWatchNative;
 
-  const toStr = (p) => (typeof p === "string" ? p : p && p.pathname !== undefined ? p.pathname : String(p));
+  // node getValidatedPath -> toPathIfFileURL, i.e. internal/url.js
+  // fileURLToPath: a file: URL becomes a real filesystem path, so percent
+  // escapes are DECODED. Reading `.pathname` kept them, so watchFile() on a URL
+  // for ".../space dir/space file.txt" polled a path containing literal "%20"
+  // and every stat came back ENOENT (curr.size === 0 forever).
+  // bun accepts a file: URL *string* here too, and since the shared-StatWatcher
+  // map is keyed on this result, decoding is also what makes watchFile(str) and
+  // watchFile(new URL(str)) collapse onto one watcher.
+  const isFileUrlString = (p) =>
+    typeof p === "string" && p.length > 7 && p.slice(0, 7).toLowerCase() === "file://";
+  const toStr = (p) => {
+    const isUrlObj = p !== null && typeof p === "object" &&
+                     p.pathname !== undefined && p.protocol !== undefined;
+    if (isUrlObj || isFileUrlString(p)) {
+      const U = G.__mbunNativeModules && G.__mbunNativeModules["url"];
+      if (U && typeof U.fileURLToPath === "function") {
+        try { return U.fileURLToPath(p); } catch (e) {}
+      }
+      try { return decodeURIComponent(new G.URL(p).pathname); } catch (e) {}
+    }
+    if (typeof p === "string") return p;
+    if (p && p.pathname !== undefined) return p.pathname;
+    return String(p);
+  };
   // Reuse bootstrap's node validators so watch/watchFile/unwatchFile reject a
   // bad path / encoding / listener with the SAME ERR_* shapes the rest of fs
   // does (ref test-fs-null-bytes, test-fs-assert-encoding-error,
@@ -415,6 +438,12 @@ inline constexpr std::string_view kNodeFsWatchJS = R"JS(
     if (typeof listener === "function") {
       w.removeListener("change", listener);
       if (w.listenerCount("change") > 0) return;
+    } else {
+      // node lib/fs.js unwatchFile: with no listener it drops EVERY 'change'
+      // listener (`stat.removeAllListeners('change')`) and zeroes the ref count.
+      // Stopping the watcher while its listeners were still attached left
+      // watcher.listenerCount('change') === 1 after unwatchFile(file).
+      w.removeAllListeners("change");
     }
     w.stop();
     statWatchers.delete(path);

@@ -149,6 +149,7 @@ private:
     static constexpr int kMaxJsxDepth{1000};
     int depth_{0};
     bool overflowed_{false};
+    std::string tagMismatch_;
 
 public:
     explicit JsxLowerer(std::string_view src, JsxOptions opts = {})
@@ -157,6 +158,11 @@ public:
     // True when a scan bailed out on kMaxJsxDepth rather than on bad syntax, so
     // the parser can report the overflow instead of "Unexpected token in JSX".
     [[nodiscard]] bool overflowed() const { return overflowed_; }
+
+    // Set when a scan bailed out because a close tag named a different element
+    // than the open tag it terminates (`<div></p>`). Empty otherwise; the parser
+    // reports it verbatim so the message names both tags the way bun's does.
+    [[nodiscard]] const std::string& tag_mismatch() const { return tagMismatch_; }
 
     [[nodiscard]] const JsxUsed& used() const { return used_; }
     // The names above. Non-empty only for a JSX file that lowered an element.
@@ -733,14 +739,25 @@ public:
     }
 
     // Parse element children up to (and consuming) the matching close tag.
-    bool jsx_parse_children_(std::size_t& p, std::vector<std::string>& out) {
+    // `openName` is the RAW open-tag name (empty for a `<>` fragment); the close
+    // tag has to spell it identically or the element is a syntax error. Upstream
+    // bun rejects `<div></p>` at parse time (issue #14477) — the mismatch is not
+    // recoverable, so an "accept anything" close would silently mis-lower it.
+    bool jsx_parse_children_(std::size_t& p, std::vector<std::string>& out,
+                             const std::string& openName) {
         const std::size_t n = src_.size();
         while (p < n) {
             char c = src_[p];
             if (c == '<' && p + 1 < n && src_[p + 1] == '/') {
                 p += 2;  // '</'
                 jsx_skip_ws_(p);
-                jsx_scan_name_(p);  // (empty for a fragment close)
+                const std::string closeName = jsx_scan_name_(p);  // (empty for a fragment close)
+                if (closeName != openName) {
+                    tagMismatch_ = "Unexpected closing tag </" + closeName +
+                                   ">, expected </" + openName + "> to match opening tag <" +
+                                   openName + ">";
+                    return false;
+                }
                 jsx_skip_ws_(p);
                 if (p < n && src_[p] == '>') {
                     ++p;
@@ -880,6 +897,7 @@ public:
         // (see jsx_parse_attributes_), so an element's runtime is decided here.
         bool classic = opts_.runtime == JsxRuntime::Classic;
         std::string tag;
+        std::string openName;  // raw open-tag name; "" for `<>` (a fragment closes with `</>`)
         JsxAttrs attrs;
         bool self_closing = false;
         if (p < n && src_[p] == '>') {
@@ -897,6 +915,7 @@ public:
             if (name.empty()) {
                 return false;
             }
+            openName = name;
             tag = jsx_tag_expr_(name);
             // A tag that did NOT become a quoted string is an identifier or a
             // member chain (jsx_tag_expr_:175 draws that line): `<Foo/>` and
@@ -928,7 +947,7 @@ public:
             }
         }
         std::vector<std::string> children;
-        if (!self_closing && !jsx_parse_children_(p, children)) {
+        if (!self_closing && !jsx_parse_children_(p, children, openName)) {
             return false;
         }
         jsx_emit_call_(out, tag, attrs, children, classic);

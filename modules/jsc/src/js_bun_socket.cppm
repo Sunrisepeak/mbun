@@ -86,11 +86,38 @@ export constexpr std::string_view kBunSocketJS = R"JS(
   // on TCP connect and `handshake(sock, success, authError)` on completion.
   if (G.Bun) {
     const call = (fn, ...a) => { if (typeof fn === "function") { try { return fn(...a); } catch (e) {} } };
+    // getpeername() over the live fd. The wrapper object is built BEFORE connect()
+    // completes, so any tuple snapshotted at construction is empty; refreshing it on
+    // the `connect` event is not enough either, because node's Socket only learns its
+    // peer lazily. Reading the kernel on first access is the only form that is
+    // correct inside bun's `open(socket)` callback (test/js/bun/net/tcp-server
+    // "remoteAddress works").
+    const peerOf = (sock) => {
+      try {
+        const fd = sock._fd;
+        if (typeof fd !== "number" || fd < 0 || !NN || typeof NN.peername !== "function") return null;
+        const pn = NN.peername(fd);
+        if (typeof pn !== "string") return null;
+        const i = pn.lastIndexOf(":");
+        if (i < 0) return null;
+        return { address: pn.slice(0, i), port: +pn.slice(i + 1) };
+      } catch (e) { return null; }
+    };
     const bunSockWrap = (sock, handlers, userData, isTls) => {
+      let peerAddress = sock.remoteAddress, peerPort = sock.remotePort;
+      const refreshPeer = () => {
+        if (peerAddress) return;
+        const p = peerOf(sock);
+        if (p) { peerAddress = p.address; peerPort = p.port; }
+      };
       const bs = {
         data: userData,
-        remoteAddress: sock.remoteAddress, localAddress: sock.localAddress,
-        localPort: sock.localPort, remotePort: sock.remotePort,
+        get remoteAddress() { refreshPeer(); return peerAddress; },
+        set remoteAddress(v) { if (v) peerAddress = v; },
+        get remotePort() { refreshPeer(); return peerPort; },
+        set remotePort(v) { if (v) peerPort = v; },
+        localAddress: sock.localAddress,
+        localPort: sock.localPort,
         readyState: "open",
         // TLS surface (bun Socket): populated on handshake; safe defaults before.
         authorized: false, alpnProtocol: null,
@@ -141,7 +168,14 @@ export constexpr std::string_view kBunSocketJS = R"JS(
         let opened = false, settled = false;
         const fireOpen = () => { if (opened) return; opened = true; call(handlers.open, bs); };
         sock.once("connect", () => {
+          // The wrapper is built before the connect completes, so the peer /
+          // local tuple it snapshotted is still empty. Refresh all four here —
+          // bun's client socket reports remoteAddress inside open() (see
+          // test/js/bun/net/tcp-server.test.ts "remoteAddress works").
           bs.remotePort = sock.remotePort;
+          bs.remoteAddress = sock.remoteAddress;
+          bs.localAddress = sock.localAddress;
+          bs.localPort = sock.localPort;
           if (tlsCfg) {
             bs.servername = tlsCfg.servername;
             sock._startTls(tlsCfg);

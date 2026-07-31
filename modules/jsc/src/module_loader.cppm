@@ -105,7 +105,26 @@ std::optional<Loader> loader_from_string(std::string_view name) {
     if (lowered == "file") {
         return Loader::File;
     }
+    // loader.rs LOADER_NAMES `b"napi" => Loader::Napi` (bun also spells the same
+    // loader ".node" in DEFAULT_LOADERS). Reachable through `--loader .x:napi`,
+    // which is the only way a non-".node" extension becomes a Node-API addon.
+    if (lowered == "napi" || lowered == "node") {
+        return Loader::Napi;
+    }
     return std::nullopt;
+}
+
+// Process-wide extension→loader overrides, as installed by `--loader .ext:name`
+// (bun `-l`/`--loader`, Arguments.rs TRANSPILER_PARAMS_ → BundleOptions.loaders).
+// Keys keep their leading dot, exactly as bun stores them.
+//
+// A single process-wide sink for the same reason runtime_jsx_options() is one:
+// the flag is a process input and every module the loader touches shares it.
+// A CLI override BEATS the extension table below — bun's resolver probes the
+// user loader map first (bundler/options.rs:1714 `self.loaders.get(ext)`).
+inline std::map<std::string, Loader, std::less<>>& runtime_loader_overrides() {
+    static std::map<std::string, Loader, std::less<>> overrides{};
+    return overrides;
 }
 
 // Map a resolved path's extension to its loader.
@@ -130,6 +149,11 @@ std::optional<Loader> loader_from_string(std::string_view name) {
 //     as JS where bun would hand back a path — a known gap, see the module note.
 Loader loader_for_path(std::string_view path) {
     const std::string ext{mbun::core::paths::posix::extname(path)};
+    // `--loader .ext:name` wins over the built-in table (options.rs:1714).
+    if (!ext.empty()) {
+        const auto& overrides{runtime_loader_overrides()};
+        if (const auto it{overrides.find(ext)}; it != overrides.end()) return it->second;
+    }
     if (ext == ".js" || ext == ".mjs" || ext == ".cjs") {
         return Loader::Js;
     }
@@ -181,11 +205,14 @@ Loader loader_for_path(std::string_view path) {
     // rather than "any unknown extension → File" because mbun lowers ESM
     // imports to require(), and bun's require() of an unknown extension goes to
     // Ts (code), not File — see the module note above.
+    // `.wasm` belongs to this group too: bun binds the PATH (regression/issue/16476
+    // asserts `import w from "./a.wasm?1"` endsWith "a.wasm"), and feeding the
+    // module's bytes to the JS lexer instead reports "Unterminated string literal".
     if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".gif" || ext == ".webp" ||
         ext == ".avif" || ext == ".bmp" || ext == ".ico" || ext == ".svg" || ext == ".woff" ||
         ext == ".woff2" || ext == ".ttf" || ext == ".otf" || ext == ".eot" || ext == ".mp3" ||
         ext == ".mp4" || ext == ".wav" || ext == ".ogg" || ext == ".webm" || ext == ".pdf" ||
-        ext == ".zip") {
+        ext == ".zip" || ext == ".wasm") {
         return Loader::File;
     }
     return Loader::Js;  // `.file` → js fallback

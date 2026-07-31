@@ -12,6 +12,9 @@ standard    = "c++26"
 # Cross-member: EpollBackend + EventLoop token dispatch drive the epoll socket backend.
 [dependencies]
 event_loop = { path = "../event_loop" }
+# Socket creation/accept/send divergences (SOCK_NONBLOCK, accept4, MSG_NOSIGNAL)
+# live in the platform layer so this module stays plain POSIX.
+platform   = { path = "../platform" }
 
 [indices]
 mbun = { path = "../../mcpp" }

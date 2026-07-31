@@ -1073,6 +1073,52 @@ std::filesystem::path staging_for(const std::filesystem::path& destination,
 
 }  // namespace detail
 
+// The package NAME a non-npm `add` positional resolves to, read out of the
+// target's own package.json. `specifier` is the raw positional
+// (`file:../pkg`, `./pkg`, `link:../pkg`, a bare directory path…) and `root`
+// the directory holding the package.json being edited.
+//
+// PORT-SOURCE: bun-ref/src/install/PackageManager/UpdateRequest.rs:274-286
+// leaves `name = ""` for a Folder/Symlink positional and hashes the LITERAL
+// instead; the real name is back-patched from the resolved package by
+// bun-ref/src/install/lockfile.rs:1267-1283 (`update.matches(dep, ..)` →
+// `update.package_id = package_id`) and only then written as the package.json
+// key by PackageJSONEditor.rs:826-876 (`get_resolved_name`). That indirection
+// exists because bun defers folder resolution to the install pass. mbun's
+// folder resolver is synchronous (`detail::resolve_dependency`, Tag::Folder
+// arm), so the same answer is available up front: for a folder the resolved
+// package IS the target directory, and its name is its package.json "name".
+export std::optional<std::string> folder_positional_name(const std::filesystem::path& root,
+                                                         std::string_view specifier) {
+    using Tag = mbun::install::dependency::Tag;
+    const Tag tag{mbun::install::dependency::infer_tag(specifier)};
+    if (tag != Tag::Folder && tag != Tag::Symlink) {
+        return std::nullopt;
+    }
+    // `parse` needs an alias only to fill Npm/DistTag names; the sentinel keeps
+    // it out of the folder path (UpdateRequest.rs:202 passes `b"@@@"`).
+    auto parsed{mbun::install::dependency::parse("@@@", specifier)};
+    if (!parsed) {
+        return std::nullopt;
+    }
+    const std::string_view relative{tag == Tag::Folder ? parsed->folder : parsed->symlink};
+    std::error_code ec;
+    const std::filesystem::path target{
+        std::filesystem::weakly_canonical(root / std::string{relative}, ec)};
+    if (ec) {
+        return std::nullopt;
+    }
+    auto loaded{detail::load_package_json(target / "package.json", true)};
+    if (!loaded || !loaded->document.root) {
+        return std::nullopt;
+    }
+    const auto* name{loaded->document.root->get("name")};
+    if (name == nullptr || name->str.empty()) {
+        return std::nullopt;
+    }
+    return std::string{name->str};
+}
+
 export InstallResult install_project(const std::filesystem::path& startDirectory,
                                      const InstallOptions& callerOptions = {}) {
     auto rootResult{detail::find_package_root(startDirectory)};

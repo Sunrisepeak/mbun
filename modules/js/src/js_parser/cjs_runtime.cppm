@@ -62,6 +62,56 @@ inline constexpr std::string_view kLiveExportAlias{"__mbun_X"};
 // is nothing to push to, and the getter __mbun_X installed is already live.
 inline constexpr std::string_view kLiveRepushAlias{"__mbun_XP"};
 
+// The post-settle mutation notify, `__mbun_XN(__mbun_g<N>, <assignment>)`.
+//
+// THE HOLE THIS CLOSES. __mbun_X makes `exports.x` a live *pull*: the getter
+// closes over the module-local, so `exports.x` is correct forever. The importer
+// side is a *push*: `let x = g.x` plus an __mbun_link subscription. Those two
+// meet only while the exporter is still evaluating — once it settles,
+// __mbun_link takes its snapshot fast path and no subscription exists at all, so
+// an assignment the exporter performs LATER (from an exported function called
+// back into, which is what a test harness's `beforeAll` does) updates
+// `exports.x` and never reaches the importer's binding. Measured minimal repro:
+// mod.ts `export let x; export function init(){ x = 1 }` + main.ts
+// `import {x, init}` printed `after: undefined` where bun prints `1`, while
+// `import * as ns` already read `1` — proof that the exporter half was already
+// right and only the importer's binding was stale.
+//
+// WHY THIS RATHER THAN REFERENCE REWRITING. esbuild and bun's bundler answer by
+// rewriting every importer-side reference `x` -> `ns.x`, which needs the scope
+// table this erasure parser deliberately does not have (a rewritten reference
+// that was actually a shadowed local, an object-literal shorthand or a binding
+// position is a silent miscompile). Notifying from the *writer* needs no scope
+// analysis at all, because a notify aimed at the wrong binding is HARMLESS: the
+// helper re-reads the value through the MODULE-SCOPE export getter rather than
+// trusting the assigned one, so a wrap that fired for a shadowing local
+// (`export let x; function f(){ let x; x = 1 }`) simply re-publishes the
+// module-level x's unchanged value. Wrong-scope costs a redundant push; it
+// cannot publish a wrong value. That asymmetry is what makes the transform safe
+// without a symbol table, and it is the whole reason this shape was chosen.
+//
+// The value passed through is the ASSIGNMENT EXPRESSION's own value, returned
+// unchanged, so the wrap is transparent in expression position — and because the
+// helper re-reads via `g()` instead of using it, postfix `x++` (whose value is
+// the OLD one) still publishes the new value.
+//
+// COST. Only assignments to a name this module exports live are wrapped, and the
+// helper's fan-out list is only ever allocated when some importer actually
+// subscribed — __mbun_link gates that on the `__mbun_mut` marker the tail emits
+// (kLiveMutMarker), so a module that never reassigns an export costs one
+// property load per import binding and nothing per read.
+inline constexpr std::string_view kLiveNotifyAlias{"__mbun_XN"};
+
+// The non-enumerable `exports.__mbun_mut` marker: the array of export KEYS this
+// module reassigns after their declaration, emitted in the module tail so it is
+// in place before any acyclic importer links. __mbun_link reads it to decide
+// whether a settled export needs a fan-out subscription; absent (the
+// overwhelming majority of modules) it keeps the plain snapshot fast path, so
+// the marker is what stops this feature from taxing every import in the corpus.
+// Non-enumerable because `exports` IS the namespace object — an enumerable
+// property would show up in `Object.keys(ns)`, spread and `for…in`.
+inline constexpr std::string_view kLiveMutMarker{"__mbun_mut"};
+
 // A captured `{ a as b }` specifier: `name` is the in-braces identifier, `alias`
 // the name after `as` (== `name` when there is no `as`). Import reads it as
 // name→binding (`{ name: alias } = g`); export as binding→export (`exports.alias = name`).
@@ -185,7 +235,27 @@ inline std::string build_cjs_import_(std::uint32_t uniq, std::string_view def, s
              g + " ? " + g + ".default : " + g + ";";
     }
     if (!ns.empty()) {
-        s += " const " + std::string{ns} + " = " + g + ";";
+        // `import * as ns from "<cjs>"` — Node's (and bun's) CJS→ESM namespace
+        // always carries a `default` binding whose value is module.exports
+        // itself, on top of the detected named exports. A real CJS module never
+        // assigns one, so attach it here; `js/bun/stream/direct-readable-stream`
+        // reads `React.default.createContext` off a namespace import of the
+        // CommonJS `react` package.
+        //
+        // It is defined **non-enumerably on module.exports** rather than by
+        // copying into a fresh object: a copy would freeze the named bindings at
+        // import time (killing the live-binding behaviour a cycle depends on) and
+        // a Proxy would tax every namespace property read. Non-enumerable keeps
+        // require()'s own view identical — Object.keys / JSON.stringify /
+        // `for…in` over module.exports are unchanged — and the interop tests
+        // (`g.__esModule && "default" in g`) still gate on __esModule, which this
+        // does not add. Skipped when the module already exposes `default` (every
+        // module we transpiled from ESM does) or is non-extensible.
+        const std::string n{ns};
+        s += " const " + n + " = " + g + " && (typeof " + g + " === \"object\" || typeof " + g +
+             " === \"function\") && Object.isExtensible(" + g + ") && !(\"default\" in " + g +
+             ") ? (Object.defineProperty(" + g + ", \"default\", { value: " + g +
+             ", writable: true, configurable: true }), " + g + ") : " + g + ";";
     }
     if (!named.empty()) {
         // ESM named imports are *live bindings*, and a `const {x} = g`

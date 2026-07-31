@@ -1,7 +1,7 @@
 // Real-fd integration vectors for mbun.event_loop.epoll_backend. Scenarios
 // mirror bun uws_sys/Loop.rs semantics: ready-poll token dispatch, timer-aware
 // tick timeout, and us_wakeup_loop interrupting a blocked wait.
-#if defined(__linux__)
+#if !defined(_WIN32)
 #include <sys/socket.h>
 #include <unistd.h>
 #endif
@@ -23,7 +23,7 @@ void check(bool condition, std::string_view name) {
     }
 }
 
-#if defined(__linux__)
+#if !defined(_WIN32)
 
 struct PipePair {
     int readFd{-1};
@@ -50,7 +50,7 @@ struct PipePair {
 };
 
 void test_pipe_readiness_maps_token() {
-    EpollBackend backend{};
+    HostReadinessBackend backend{};
     check(backend.status() == BackendStatus::ready, "epoll backend is ready on linux");
     PipePair pipe{};
     check(pipe.readFd >= 0, "pipe created");
@@ -67,7 +67,7 @@ void test_pipe_readiness_maps_token() {
 }
 
 void test_socketpair_modify_and_dispatch() {
-    EpollBackend backend{};
+    HostReadinessBackend backend{};
     int fds[2]{-1, -1};
     check(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0, "socketpair created");
     // Writable-only interest first: an idle stream socket is writable.
@@ -88,7 +88,7 @@ void test_socketpair_modify_and_dispatch() {
 }
 
 void test_loop_dispatches_fd_events_to_watch() {
-    EpollBackend backend{};
+    HostReadinessBackend backend{};
     PipePair pipe{};
     check(backend.add(pipe.readFd, PollInterest::read, 21), "loop pipe registered");
     EventLoop loop{backend.seam()};
@@ -107,7 +107,7 @@ void test_loop_dispatches_fd_events_to_watch() {
 }
 
 void test_timer_deadline_bounds_poll_wait() {
-    EpollBackend backend{};
+    HostReadinessBackend backend{};
     PipePair pipe{};  // Registered but never written: poll must not block on it.
     check(backend.add(pipe.readFd, PollInterest::read, 5), "quiet pipe registered");
     EventLoop loop{backend.seam()};
@@ -132,7 +132,7 @@ void test_timer_deadline_bounds_poll_wait() {
 }
 
 void test_wake_interrupts_blocked_poll() {
-    EpollBackend backend{};
+    HostReadinessBackend backend{};
     std::thread waker{[&backend] {
         std::this_thread::sleep_for(std::chrono::milliseconds{20});
         backend.wake();
@@ -152,7 +152,7 @@ void test_wake_interrupts_blocked_poll() {
 }
 
 void test_post_from_another_thread_unblocks_run_once() {
-    EpollBackend backend{};
+    HostReadinessBackend backend{};
     EventLoop loop{backend.seam()};
     std::atomic_bool posted{false};
     std::thread producer{[&] {
@@ -171,7 +171,7 @@ void test_post_from_another_thread_unblocks_run_once() {
 #else  // !__linux__
 
 void test_deferred_stub() {
-    EpollBackend backend{};
+    HostReadinessBackend backend{};
     check(backend.status() == BackendStatus::deferred,
           "non-linux epoll backend reports deferred");
     check(!backend.add(0, PollInterest::read, 1), "deferred add refuses registration");
@@ -189,7 +189,7 @@ void test_deferred_stub() {
 }  // namespace
 
 int main() {
-#if defined(__linux__)
+#if !defined(_WIN32)
     test_pipe_readiness_maps_token();
     test_socketpair_modify_and_dispatch();
     test_loop_dispatches_fd_events_to_watch();

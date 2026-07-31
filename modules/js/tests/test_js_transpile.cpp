@@ -657,6 +657,29 @@ void test_exports() {
 // getter per spec: a not-yet-initialised X is read on access rather than in its
 // TDZ, and a later write to X is still observed. One `__mbun_X` per module, in
 // the prelude, and only when some export actually lowered to a call.
+// The post-settle notify helper, present ONLY in a module that reassigns one of
+// its own live exports (see js_parser/cjs_runtime.cppm kLiveNotifyAlias). Kept
+// separate from kLiveHelper because that separation IS the blast-radius claim: a
+// module that never writes an export must lower byte-for-byte as it did before.
+static const std::string kNotifyHelper{
+    " var __mbun_XN = (k, v) => { const d = __mbun_O.getOwnPropertyDescriptor(exports, k);"
+    " if (d && d.get && !d.get.__mbun_subs) { const m = d.get.__mbun_msubs;"
+    " if (m) { const nv = d.get.call(exports);"
+    " for (let i = 0; i < m.length; i++) m[i](nv); } } return v; };"};
+
+// The `exports.__mbun_mut` advert the tail emits for those same modules —
+// __mbun_link reads it to decide which settled slots need a fan-out.
+static std::string mutMarker(std::initializer_list<const char*> keys) {
+    std::string t{"__mbun_O.defineProperty(exports, \"__mbun_mut\", { value: ["};
+    bool first = true;
+    for (const char* k : keys) {
+        if (!first) t += ",";
+        first = false;
+        t += std::string{"\""} + k + "\"";
+    }
+    return t + "], configurable: true });";
+}
+
 static const std::string kLiveHelper{
     " var __mbun_X = (k, g) => { const d = __mbun_O.getOwnPropertyDescriptor(exports, k);"
     " if (d && d.get && d.get.__mbun_subs) { exports[k] = g(); return; } "
@@ -715,7 +738,20 @@ void test_cjs_imports() {
     xpc("import foo from \"./foo\";",
         "const __mbun_i0 = require(\"./foo\", undefined, 1); const foo = __mbun_i0 && __mbun_i0.__esModule && \"default\" in __mbun_i0 ? "
         "__mbun_i0.default : __mbun_i0;");
-    xpc("import * as ns from \"./m\";", "const __mbun_i0 = require(\"./m\", undefined, 1); const ns = __mbun_i0;");
+    // `import * as ns from "<cjs>"` exposes the CJS `default` binding, i.e.
+    // module.exports itself, matching node/bun ESM-CJS interop. It is defined
+    // non-enumerably (no `enumerable: true` below), so require()'s view,
+    // Object.keys and the __esModule interop are all unchanged -- and it is
+    // skipped when the module already has a `default` or is non-extensible.
+    // Behaviour change landed in 7332af2 and measured at bun js/bun 0/17 -> 2/17
+    // green; this golden was left stale by that commit, which is why
+    // `mcpp test -p modules/js` had been failing.
+    xpc("import * as ns from \"./m\";",
+        "const __mbun_i0 = require(\"./m\", undefined, 1); const ns = __mbun_i0 && "
+        "(typeof __mbun_i0 === \"object\" || typeof __mbun_i0 === \"function\") && "
+        "Object.isExtensible(__mbun_i0) && !(\"default\" in __mbun_i0) ? "
+        "(Object.defineProperty(__mbun_i0, \"default\", { value: __mbun_i0, writable: true, "
+        "configurable: true }), __mbun_i0) : __mbun_i0;");
     xpc("import def, { a, b as c } from \"./m\";",
         "const __mbun_i0 = require(\"./m\", undefined, 1); const def = __mbun_i0 && __mbun_i0.__esModule && \"default\" in __mbun_i0 ? "
         "__mbun_i0.default : __mbun_i0; let a = __mbun_i0.a, c = __mbun_i0.b; "
@@ -874,15 +910,28 @@ void test_cjs_exports() {
     xpc("export const { a: { b }, c: [ d ] } = o;",
         esmX + "const { a: { b }, c: [ d ] } = o; __mbun_X(\"b\", () => b); "
                "__mbun_X(\"d\", () => d);" + tail({{"b", "b"}, {"d", "d"}}));
-    // A destructured `let` mutated later reads through the getter, as in bun.
+    // A destructured `let` mutated later reads through the getter, as in bun —
+    // AND the write is wrapped so it reaches importers that already linked. The
+    // getter alone only fixes `exports.mut`; an importer's `let mut` binding was
+    // snapshotted when it linked and has no other way to hear the write.
     xpc("export let { a: mut } = o;\nexport function bump() { mut = 99; }",
-        esmX + "let { a: mut } = o; __mbun_X(\"mut\", () => mut);\n"
-               "function bump() { mut = 99; } __mbun_X(\"bump\", () => bump);" +
-            tail({{"mut", "mut"}, {"bump", "bump"}}));
-    // A binding mutated by a later export'd function still reads through.
+        base + kLiveHelper + kNotifyHelper + "\n" +
+            "let { a: mut } = o; __mbun_X(\"mut\", () => mut);\n"
+            "function bump() { __mbun_XN(\"mut\", mut = 99); } __mbun_X(\"bump\", () => bump);" +
+            tail({{"mut", "mut"}, {"bump", "bump"}}) + mutMarker({"mut"}));
+    // `n++` is wrapped whole, so the value of the expression stays the OLD one
+    // (postfix) while the notify re-reads the new one through the export getter.
     xpc("export let n = 0;\nexport function inc() { n++; }",
-        esmX + "let n = 0; __mbun_X(\"n\", () => n);\nfunction inc() { n++; } "
-               "__mbun_X(\"inc\", () => inc);" + tail({{"n", "n"}, {"inc", "inc"}}));
+        base + kLiveHelper + kNotifyHelper + "\n" +
+            "let n = 0; __mbun_X(\"n\", () => n);\n"
+            "function inc() { __mbun_XN(\"n\", n++); } __mbun_X(\"inc\", () => inc);" +
+            tail({{"n", "n"}, {"inc", "inc"}}) + mutMarker({"n"}));
+    // …and the containment claim itself: a module that exports a mutable binding
+    // but never writes it gets NEITHER the helper nor the marker, i.e. the same
+    // bytes as before this feature existed.
+    xpc("export let untouched = 1;",
+        esmX + "let untouched = 1; __mbun_X(\"untouched\", () => untouched);" +
+            tail({{"untouched", "untouched"}}));
 }
 
 

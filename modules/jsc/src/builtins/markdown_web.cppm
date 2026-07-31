@@ -482,6 +482,13 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
         // when init doesn't override. A Request built from another Request
         // inherits its mode via the init merge above.
         this.redirect = init.redirect || "follow";
+        // Request.cache / Request.mode (spec defaults "default" / "cors"). Both
+        // were absent, so `new Request(url, { cache: "no-store" }).cache` read
+        // undefined (issue 2993). Own enumerable properties, exactly like
+        // `redirect`, so the Object.assign merge above carries them through
+        // `new Request(request)` and clone() below forwards them explicitly.
+        this.cache = init.cache || "default";
+        this.mode = init.mode || "cors";
         this._used = false;
         const norm = G.__mbunNormalizeBody(init.body);
         const body = norm.body;
@@ -585,7 +592,8 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       // refcount a byte body).
       clone() {
         throwIfBodyUnusable(this._body, this._used, this.__st);   // spec step 1
-        const init = { method: this.method, headers: this.headers, signal: this.signal };
+        const init = { method: this.method, headers: this.headers, signal: this.signal,
+                       redirect: this.redirect, cache: this.cache, mode: this.mode };
         if (this._body !== undefined) return new G.Request(this.url, Object.assign({}, init, { body: this._body }));
         if (!isStream(this._stream)) return new G.Request(this.url, init);
         const [mine, theirs] = this._stream.tee();
@@ -612,6 +620,14 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       return s.slice(0, 8) + "-" + s.slice(8, 12) + "-" + s.slice(12, 16) + "-" + s.slice(16, 20) + "-" + s.slice(20);
     };
   }
+  // `mbun -e` republishes builtinModules as globals and deliberately lets
+  // `crypto` overwrite the WebCrypto global (api_impl.inc kBuiltinGlobals), so
+  // inside -e the global `crypto` IS node:crypto. Anything that reaches the
+  // WebCrypto entropy through `G.crypto` therefore calls node:crypto's own
+  // delegating wrapper -- a strict-mode tail call to itself, i.e. a silent
+  // 100% CPU hang, not a throw. Capture the real object once, at bootstrap,
+  // before any shadowing can happen.
+  const webCryptoRoot = G.crypto;
   {
     const CN = G.__mbunCryptoNative;   // native mbun.crypto backend (hash/hmac/pbkdf2/random)
     // SECURITY: FAIL CLOSED. This used to fall back to Math.random() when the
@@ -767,15 +783,54 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       const s = M["stream"] || M["node:stream"];
       return (s && s.Transform) || Transform;
     };
-    function Hash(algo, opts) {
+    // node latches every deprecation by CODE (internal/util.js `codesWarned`), so
+    // a warning fires at most once per process no matter how many times the
+    // deprecated path is taken. Emitting per call made `common.expectWarning`
+    // report "Unexpected extra warning" for any file that built more than one
+    // SHAKE digest.
+    const cryptoCodesWarned = new Set();
+    const emitCryptoDeprecation = (code, msg) => {
+      if (cryptoCodesWarned.has(code)) return;
+      cryptoCodesWarned.add(code);
+      if (G.process && typeof G.process.emitWarning === "function") {
+        G.process.emitWarning(msg, "DeprecationWarning", code);
+      }
+    };
+    // node internal/crypto/hash.js validates options.outputLength with
+    // validateUint32 BEFORE the handle is built, so a bad length is a creation
+    // error rather than a digest-time one.
+    const validateOutputLength = (v) => {
+      if (typeof v !== "number") throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "options.outputLength" property must be of type number.' + invalidArgType(v));
+      if (!Number.isInteger(v)) throw mkErr(RangeError, "ERR_OUT_OF_RANGE", 'The value of "options.outputLength" is out of range. It must be an integer. Received ' + v);
+      if (v < 0 || v > 4294967295) throw mkErr(RangeError, "ERR_OUT_OF_RANGE", 'The value of "options.outputLength" is out of range. It must be >= 0 && <= 4294967295. Received ' + v);
+    };
+    // Natural digest size per algorithm, memoized. Only consulted when an
+    // explicit outputLength was given for a NON-XOF algorithm, which node's
+    // native EVP layer rejects at creation with
+    // ERR_OSSL_EVP_NOT_XOF_OR_INVALID_LENGTH unless it equals the natural size.
+    const naturalDigestLen = new Map();
+    const digestLenOf = (algo) => {
+      const k = NORM(algo);
+      let n = naturalDigestLen.get(k);
+      if (n === undefined) { n = digestBytes(algo, new Uint8Array(0), 0).length; naturalDigestLen.set(k, n); }
+      return n;
+    };
+    // `isCopy` mirrors node's `algorithm instanceof _Hash` branch: a copy takes
+    // its outputLength from the options it was handed (defaulting when absent)
+    // and never re-emits the SHAKE deprecation.
+    function Hash(algo, opts, isCopy) {
       const self = Reflect.construct(streamTransform(), [], Hash);
       self._algo = algo; self._fn = hashFns[NORM(algo)];
-      self._out = opts && typeof opts.outputLength === "number" ? opts.outputLength : -1;  // -1 = native default (XOF); 0 = explicit empty
-      if (NORM(algo).startsWith("shake") && self._out < 0 && G.process &&
-          typeof G.process.emitWarning === "function") {
-        G.process.emitWarning(
-          "Creating SHAKE128/256 digests without an explicit options.outputLength is deprecated.",
-          "DeprecationWarning", "DEP0198");
+      const xofLen = opts !== null && typeof opts === "object" ? opts.outputLength : undefined;
+      if (xofLen !== undefined) validateOutputLength(xofLen);
+      self._out = xofLen === undefined ? -1 : xofLen;  // -1 = native default (XOF); 0 = explicit empty
+      if (self._out >= 0 && !NORM(algo).startsWith("shake") && self._out !== digestLenOf(algo)) {
+        throw mkErr(Error, "ERR_OSSL_EVP_NOT_XOF_OR_INVALID_LENGTH",
+          "Output length " + self._out + " is invalid for " + algo + ", which does not support XOF");
+      }
+      if (!isCopy && NORM(algo).startsWith("shake") && xofLen === undefined) {
+        emitCryptoDeprecation("DEP0198",
+          "Creating SHAKE128/256 digests without an explicit options.outputLength is deprecated.");
       }
       self._chunks = []; self._done = false;
       return self;
@@ -783,7 +838,7 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
     Object.setPrototypeOf(Hash.prototype, Transform.prototype);
     Object.setPrototypeOf(Hash, Transform);
     const joinChunks = function (chunks) { let t = 0; for (const c of chunks) t += c.length; const m = new Uint8Array(t); let o = 0; for (const c of chunks) { m.set(c, o); o += c.length; } return m; };
-    Hash.prototype.update = function (data, enc) { if (this._done) throw new Error("Digest already called"); if (typeof data !== "string" && !ArrayBuffer.isView(data) && !(data instanceof ArrayBuffer)) throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "data" argument must be of type string or an instance of Buffer, TypedArray, or DataView.' + invalidArgType(data)); this._chunks.push(toBytes(data, enc)); return this; };
+    Hash.prototype.update = function (data, enc) { if (this._done) throw mkErr(Error, "ERR_CRYPTO_HASH_FINALIZED", "Digest already called"); if (typeof data !== "string" && !ArrayBuffer.isView(data) && !(data instanceof ArrayBuffer)) throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "data" argument must be of type string or an instance of Buffer, TypedArray, or DataView.' + invalidArgType(data)); this._chunks.push(toBytes(data, enc)); return this; };
     // node's native hash keeps the finalized digest around: the stream path
     // finalizes through the handle (bypassing the JS "already called" guard), and
     // user code may still call digest() afterwards and must get the same bytes
@@ -806,7 +861,7 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       return this._digestBytes;
     };
     Hash.prototype.digest = function (enc) {
-      if (this._done) throw new Error("Digest already called");
+      if (this._done) throw mkErr(Error, "ERR_CRYPTO_HASH_FINALIZED", "Digest already called");
       this._done = true;
       return encode(this._rawDigest(), enc);
     };
@@ -816,7 +871,11 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
     Hash.prototype._flush = function (cb) { this.push(encode(this._rawDigest())); cb(); };
     // node's Hash#copy clones the EVP context, which is gone once digest() ran:
     // copying a finalized hash throws, exactly like update() does.
-    Hash.prototype.copy = function () { if (this._done) throw new Error("Digest already called"); const h = new Hash(this._algo, { outputLength: this._out }); h._chunks = this._chunks.slice(); return h; };
+    // node: `copy(options)` is `new Hash(handle, options)` — the clone's XOF
+    // length comes from the options passed to copy() and NOT from the source, so
+    // `createHash('shake256', { outputLength: 0 }).copy()` digests at the default
+    // length while `.copy({ outputLength: 5 })` overrides a source length of 0.
+    Hash.prototype.copy = function (options) { if (this._done) throw mkErr(Error, "ERR_CRYPTO_HASH_FINALIZED", "Digest already called"); const h = new Hash(this._algo, options, true); h._chunks = this._chunks.slice(); return h; };
     // node exposes the native context under a `kHandle` symbol whose methods must
     // reject a bad `this` with ERR_INVALID_THIS (rather than dereferencing a null
     // native pointer). We mirror that contract with a guarded handle object.
@@ -840,7 +899,7 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
     }
     Object.setPrototypeOf(Hmac.prototype, Transform.prototype);
     Object.setPrototypeOf(Hmac, Transform);
-    Hmac.prototype.update = function (data, enc) { if (this._done) throw new Error("Digest already called"); this._chunks.push(toBytes(data, enc)); return this; };
+    Hmac.prototype.update = function (data, enc) { if (this._done) throw mkErr(Error, "ERR_CRYPTO_HASH_FINALIZED", "Digest already called"); this._chunks.push(toBytes(data, enc)); return this; };
     Hmac.prototype.digest = function (enc) {
       if (this._done) return encode(new Uint8Array(0), enc);   // node resets ctx: re-digest yields empty
       this._done = true; const m = joinChunks(this._chunks);
@@ -851,7 +910,12 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
     };
     Hmac.prototype._transform = function (chunk, e, cb) { this.update(chunk); cb(); };
     Hmac.prototype._flush = function (cb) { this.push(this.digest()); cb(); };
-    function createHash(algo, opts) { if (typeof algo !== "string") throw new TypeError('The "algorithm" argument must be of type string. Received ' + (algo === null ? "null" : typeof algo)); if (!supported(algo)) throw new Error("Digest method not supported"); return new Hash(algo, opts); }
+    // The .code is set inline rather than through mkErr(): mkErr is a `const`
+    // declared BELOW this function declaration, and a hoisted function that
+    // reaches for it is only safe once the module body has run past that line.
+    // An earlier attempt to route createHmac through mkErr was reverted; keep
+    // these two constructors self-contained.
+    function createHash(algo, opts) { if (typeof algo !== "string") { const e = new TypeError('The "algorithm" argument must be of type string. Received ' + (algo === null ? "null" : typeof algo)); e.code = "ERR_INVALID_ARG_TYPE"; throw e; } if (!supported(algo)) throw new Error("Digest method not supported"); return new Hash(algo, opts); }
     // node prepareSecretKey(): the key must be a string, a BufferSource, a
     // *branded* KeyObject, or a CryptoKey. It used to reject only null/undefined,
     // so an arbitrary object — including one wearing KeyObject.prototype with no
@@ -869,7 +933,7 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       if (typeof G.__mbunIsCryptoKey === "function" && G.__mbunIsCryptoKey(key)) return true;
       return false;
     };
-    function createHmac(algo, key, opts) { if (typeof algo !== "string") throw new TypeError('The "hmac" argument must be of type string. Received ' + (algo === null ? "null" : typeof algo)); if (!supported(algo)) throw new Error("Invalid digest: " + algo); if (!validHmacKey(key)) throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "key" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, DataView, KeyObject, or CryptoKey. Received ' + invalidArgTypeRecv(key)); return new Hmac(algo, key, opts); }
+    function createHmac(algo, key, opts) { if (typeof algo !== "string") throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "hmac" argument must be of type string. Received ' + (algo === null ? "null" : typeof algo)); if (!supported(algo)) throw new Error("Invalid digest: " + algo); if (!validHmacKey(key)) throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "key" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, DataView, KeyObject, or CryptoKey. Received ' + invalidArgTypeRecv(key)); return new Hmac(algo, key, opts); }
     // node-style error helpers (message + .code, matching node:crypto).
     const mkErr = (Ctor, code, msg) => { const e = new Ctor(msg); e.code = code; return e; };
     const invalidArgType = (input) => {
@@ -878,6 +942,34 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       if (typeof input === "object") { const n = input.constructor && input.constructor.name; return n ? " Received an instance of " + n : " Received " + String(input); }
       if (typeof input === "string") { let s = input; if (s.length > 28) s = s.slice(0, 25) + "..."; return s.indexOf("'") === -1 ? " Received type string ('" + s + "')" : " Received type string (" + JSON.stringify(s) + ")"; }
       return " Received type " + typeof input + " (" + String(input) + ")";
+    };
+    // node lib/internal/crypto/random.js assertSize(): validateNumber first, then
+    // the range, then a uint32 truncation (which is why randomBytes(101.2) yields
+    // 101 bytes rather than throwing). kMaxPossibleLength is
+    // MathMin(buffer.kMaxLength, 2**31-1); this build's kMaxLength IS 2**31-1, so
+    // the min is that constant. Both errors have to fire BEFORE the callback is
+    // even looked at — node validates the size first and the corpus asserts the
+    // two-argument form throws identically.
+    const kMaxRandomSize = 2147483647;
+    const assertRandomSize = (size) => {
+      if (typeof size !== "number") throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "size" argument must be of type number.' + invalidArgType(size));
+      if (Number.isNaN(size) || size > kMaxRandomSize || size < 0) {
+        throw mkErr(RangeError, "ERR_OUT_OF_RANGE", 'The value of "size" is out of range. It must be >= 0 && <= ' + kMaxRandomSize + '. Received ' + size);
+      }
+      return size >>> 0;
+    };
+    // node util.deprecate() for a constructor: the wrapper forwards `new.target`
+    // so `new C()` and `C()` both behave, inherits statics via the prototype
+    // chain, and shares `.prototype` so instanceof against the wrapper holds.
+    const deprecateCtor = (Ctor, msg, code) => {
+      const wrapper = function (...args) {
+        emitCryptoDeprecation(code, msg);
+        return new.target ? Reflect.construct(Ctor, args, new.target) : Ctor.apply(this, args);
+      };
+      Object.setPrototypeOf(wrapper, Ctor);
+      Object.defineProperty(wrapper, "prototype", { value: Ctor.prototype, writable: false, enumerable: false, configurable: false });
+      Object.defineProperty(wrapper, "name", { value: Ctor.name, configurable: true });
+      return wrapper;
     };
     const isDataInput = (d) => typeof d === "string" || d instanceof Uint8Array || ArrayBuffer.isView(d) || d instanceof ArrayBuffer;
     // crypto.hash(algorithm, data[, outputEncoding]) — one-shot digest (default hex).
@@ -890,6 +982,11 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       let enc, outLen;
       if (outputEncoding !== undefined && outputEncoding !== null && typeof outputEncoding === "object") {
         const oe = outputEncoding.outputEncoding;
+        // An options object that carries neither knob is not an options object,
+        // it is a bad outputEncoding: bun rejects any non-string third argument,
+        // while node's XOF form only ever passes outputEncoding/outputLength.
+        if (oe === undefined && outputEncoding.outputLength === undefined)
+          throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "outputEncoding" argument must be of type string.' + invalidArgType(outputEncoding));
         if (oe !== undefined && typeof oe !== "string") throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "options.outputEncoding" argument must be of type string.' + invalidArgType(oe));
         enc = oe === undefined ? "hex" : oe;
         if (typeof outputEncoding.outputLength === "number") outLen = outputEncoding.outputLength;
@@ -919,7 +1016,7 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       // node requires an explicit string digest (no sha1 default): a missing digest
       // is ERR_INVALID_ARG_TYPE, an unknown one ERR_CRYPTO_INVALID_DIGEST.
       if (typeof digest !== "string") throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "digest" argument must be of type string.' + invalidArgType(digest));
-      if (!supported(digest)) throw mkErr(Error, "ERR_CRYPTO_INVALID_DIGEST", "Invalid digest: " + digest);
+      if (!supported(digest)) throw mkErr(TypeError, "ERR_CRYPTO_INVALID_DIGEST", "Invalid digest: " + digest);
     };
     // hkdf/hkdfSync shared parameter validation (node lib/internal/crypto/hkdf.js).
     // Order (matches node): digest type → ikm type → salt type → info type →
@@ -934,7 +1031,14 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       if (toBytes(info).length > 1024) throw mkErr(RangeError, "ERR_OUT_OF_RANGE", 'The value of "info" is out of range. It must be <= 1024 bytes. Received ' + toBytes(info).length);
       if (typeof keylen !== "number") throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "length" argument must be of type number.' + invalidArgType(keylen));
       if (!Number.isInteger(keylen) || keylen < 0 || keylen > 2147483647) throw mkErr(RangeError, "ERR_OUT_OF_RANGE", 'The value of "length" is out of range. It must be >= 0 && <= 2147483647. Received ' + keylen);
-      if (!supported(digest)) throw mkErr(Error, "ERR_CRYPTO_INVALID_DIGEST", "Invalid digest: " + digest);
+      if (!supported(digest)) throw mkErr(TypeError, "ERR_CRYPTO_INVALID_DIGEST", "Invalid digest: " + digest);
+    };
+    // crypto_asym installs KeyObject onto this same module object later in
+    // bootstrap, so the accessor is resolved lazily at call time.
+    const keyObjectSlot = (v) => {
+      const read = nodeCrypto.__mbunKeyObjectTransferData;
+      if (typeof read !== "function" || v === null || typeof v !== "object") return undefined;
+      return read(v) || undefined;
     };
     const deferCb = (fn) => { (typeof queueMicrotask === "function" ? queueMicrotask : (f) => Promise.resolve().then(f))(fn); };
     // KeyObject instances (real class so instanceof + structured clone work).
@@ -990,11 +1094,12 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
           if (typeof options !== "object" || options === null) throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "options" argument must be of type object.' + invalidArgType(options));
           if (options.disableEntropyCache !== undefined && typeof options.disableEntropyCache !== "boolean") throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "options.disableEntropyCache" property must be of type boolean.' + invalidArgType(options.disableEntropyCache));
         }
-        return G.crypto.randomUUID();
+        return webCryptoRoot.randomUUID();
       },
       // crypto.randomBytes(size[, cb]) — sync return, or async when a callback is
       // given (node passes null as the error on success).
       randomBytes: (n, cb) => {
+        n = assertRandomSize(n);
         if (typeof cb === "function") { const b = rb(n); deferCb(() => cb(null, b)); return; }
         return rb(n);
       },
@@ -1002,14 +1107,17 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       // three literally randomBytes (lib/crypto.js `getRandomBytesAlias`).
       // Still exported, and still called by the corpus (test-domain-crypto).
       pseudoRandomBytes: (n, cb) => {
+        n = assertRandomSize(n);
         if (typeof cb === "function") { const b = rb(n); deferCb(() => cb(null, b)); return; }
         return rb(n);
       },
       prng: (n, cb) => {
+        n = assertRandomSize(n);
         if (typeof cb === "function") { const b = rb(n); deferCb(() => cb(null, b)); return; }
         return rb(n);
       },
       rng: (n, cb) => {
+        n = assertRandomSize(n);
         if (typeof cb === "function") { const b = rb(n); deferCb(() => cb(null, b)); return; }
         return rb(n);
       },
@@ -1032,7 +1140,7 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
         for (let i = 0; i < len; i++) view[off + i] = tmp[i];
         return buf;
       },
-      getRandomValues: (a) => G.crypto.getRandomValues(a),
+      getRandomValues: (a) => webCryptoRoot.getRandomValues(a),
       // crypto.randomUUIDv7([options]) — RFC 9562 UUIDv7: 48-bit big-endian
       // millisecond timestamp, version 7, variant 10xx, remaining bits random.
       randomUUIDv7: (options) => {
@@ -1056,7 +1164,14 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
         for (let i = 0; i < 16; i++) s += b[i].toString(16).padStart(2, "0");
         return s.slice(0, 8) + "-" + s.slice(8, 12) + "-" + s.slice(12, 16) + "-" + s.slice(16, 20) + "-" + s.slice(20);
       },
-      createHash, createHmac, Hash, Hmac,
+      createHash, createHmac,
+      // node lib/crypto.js exports the CONSTRUCTORS through util.deprecate
+      // (DEP0179 / DEP0181) while createHash/createHmac call the undecorated
+      // ones. So `crypto.Hash('sha256')` warns and `crypto.createHash('sha256')`
+      // does not, and `instance instanceof crypto.Hash` still has to hold —
+      // hence the prototype is carried across to the wrapper.
+      Hash: deprecateCtor(Hash, "crypto.Hash constructor is deprecated.", "DEP0179"),
+      Hmac: deprecateCtor(Hmac, "crypto.Hmac constructor is deprecated.", "DEP0181"),
       getHashes: () => ["md5", "sha1", "sha224", "sha256", "sha384", "sha512", "sha512-256", "sha3-224", "sha3-256", "sha3-384", "sha3-512", "shake128", "shake256", "blake2b512", "blake2b256", "blake2s256"],
       // Real PBKDF2 (RFC 2898): native mbun.crypto for supported PRFs, JS otherwise.
       pbkdf2Sync: (password, salt, iterations, keylen, digest) => {
@@ -1082,11 +1197,19 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       // check) + ncrypto.cpp HKDF.
       hkdfSync: (digest, ikm, salt, info, keylen) => {
         validateHkdf(digest, ikm, salt, info, keylen);
-        if (ikm && typeof ikm === "object" && ikm.type !== undefined && typeof ikm.export === "function" && ikm.type !== "secret") {
-          const e = new TypeError("Invalid key object type " + ikm.type + ", expected secret.");
+        // The key kind must come from the unforgeable native record, not from
+        // the `type` accessor, which is a configurable property a caller can
+        // replace (node reads it through getKeyObjectType).
+        const koSlot = keyObjectSlot(ikm);
+        const ikmKind = koSlot !== undefined ? koSlot.kind
+          : (ikm && typeof ikm === "object" && ikm.type !== undefined && typeof ikm.export === "function") ? ikm.type
+          : undefined;
+        if (ikmKind !== undefined && ikmKind !== "secret") {
+          const e = new TypeError("Invalid key object type " + ikmKind + ", expected secret.");
           e.code = "ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE"; throw e;
         }
-        const ikmB = toBytes(ikm), saltB = toBytes(salt), infoB = toBytes(info);
+        const ikmB = koSlot !== undefined ? toBytes(koSlot.material) : toBytes(ikm);
+        const saltB = toBytes(salt), infoB = toBytes(info);
         const prk = new Uint8Array(createHmac(digest, saltB).update(ikmB).digest());
         const hashLen = prk.length;
         const n = Math.ceil(keylen / hashLen);
@@ -1118,7 +1241,15 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
         validatePbkdf2Input(password, salt);
         validatePbkdf2(iterations, keylen, dg);   // synchronous throw on invalid params (incl. missing digest)
         if (typeof fn !== "function") throw mkErr(TypeError, "ERR_INVALID_ARG_TYPE", 'The "callback" argument must be of type function.' + invalidArgType(fn));
-        deferCb(() => { try { const r = nodeCrypto.pbkdf2Sync(password, salt, iterations, keylen, dg); fn(null, r); } catch (e) { fn(e); } });
+        // Only the derivation is guarded: a `throw` from INSIDE fn() must escape
+        // to the uncaught handler (node/domain semantics), not be caught here and
+        // reported back through a SECOND fn(e) call.
+        deferCb(() => {
+          let r;
+          try { r = nodeCrypto.pbkdf2Sync(password, salt, iterations, keylen, dg); }
+          catch (e) { fn(e); return; }
+          fn(null, r);
+        });
       },
       hash: cryptoHash,
       getCurves: () => ["prime256v1", "secp256k1", "secp384r1", "secp521r1"],
@@ -1191,6 +1322,21 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
     // util.promisify(crypto.generateKeyPair)(...) yields the 2-key object.
     nodeCrypto.generateKeyPair[Symbol.for("nodejs.util.promisify.custom")] =
       (type, options) => Promise.resolve({ publicKey: "", privateKey: "" });
+    // node:crypto re-exports the WebCrypto SubtleCrypto as `crypto.subtle`
+    // (an alias for `crypto.webcrypto.subtle`). It matters beyond the node API:
+    // `mbun -e` exposes builtinModules as globals, and `crypto` is deliberately
+    // let through (see api_impl.inc kBuiltinGlobals), so inside `-e` the global
+    // `crypto` IS this module — without the alias, `crypto.subtle` reads
+    // undefined there while it works in a file. The captured reference is used
+    // rather than `globalThis.crypto` precisely because of that shadowing.
+    const webCryptoGlobal = G.crypto;
+    if (webCryptoGlobal && !("subtle" in nodeCrypto)) {
+      Object.defineProperty(nodeCrypto, "subtle", {
+        configurable: true, enumerable: true,
+        get() { return webCryptoGlobal.subtle; },
+        set() {},
+      });
+    }
     def(["crypto"], nodeCrypto);
     // WebCrypto CryptoKey — a real class so instanceof + structured clone work.
     // Only symmetric key generation/export is modeled (AES-*/HMAC raw bits).
@@ -1380,6 +1526,11 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       json() { G.__mbunCheckAllocLimit(this.size, "json"); return Promise.resolve(JSON.parse(td.decode(this._u8))); }
       arrayBuffer() { return Promise.resolve(this._u8.buffer.slice(this._u8.byteOffset, this._u8.byteOffset + this._u8.byteLength)); }
       bytes() { G.__mbunCheckAllocLimit(this.size, "bytes"); return Promise.resolve(new Uint8Array(this._u8)); }
+      // Blob#stat() (bun Blob.rs getStat): a blob backed by BYTES has no file
+      // behind it, so it resolves undefined rather than throwing — only the
+      // *writers* (write/writer/unlink/delete) are read-only errors there.
+      // Bun.file() installs its own `stat` slot, which shadows this one.
+      stat() { return Promise.resolve(undefined); }
       // Slicing walks the part list and keeps sub-views of the parts it
       // overlaps, so `bigBlob.slice(n, n + 1)` costs one byte, not a join of
       // the whole blob.
@@ -1650,7 +1801,7 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
   // "----WebKitFormBoundary" + 32 lowercase hex of a fresh UUID (Blob.rs).
   const fdBoundary = () => {
     const b = new Uint8Array(16);
-    if (G.crypto && G.crypto.getRandomValues) G.crypto.getRandomValues(b);
+    if (webCryptoRoot && webCryptoRoot.getRandomValues) webCryptoRoot.getRandomValues(b);
     else for (let i = 0; i < 16; i++) b[i] = Math.floor(Math.random() * 256);
     let hex = "";
     for (let i = 0; i < 16; i++) hex += b[i].toString(16).padStart(2, "0");
@@ -1787,8 +1938,20 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
         if (v.__isBunFile) { out = copyWithProto(v); memory.set(v, out); return out; }
         if (G.File && v instanceof G.File) { out = new G.File([v._u8 || ""], v.name, { type: v.type, lastModified: v.lastModified }); memory.set(v, out); return out; }
         if (G.Blob && v instanceof G.Blob) { out = new G.Blob(v._u8 ? [v._u8] : [], { type: v.type }); memory.set(v, out); return out; }
-        if (G.CryptoKey && v instanceof G.CryptoKey) { out = copyWithProto(v); memory.set(v, out); return out; }
-        if (nc().KeyObject && v instanceof nc().KeyObject) { out = copyWithProto(v); memory.set(v, out); return out; }
+        // A native CryptoKey has NO own properties -- its state lives in
+        // webcrypto's keyMetadata WeakMap -- so copyWithProto yields a husk
+        // whose every getter throws ERR_INVALID_THIS. Re-mint it instead.
+        if (G.CryptoKey && v instanceof G.CryptoKey) {
+          out = (G.__mbunCryptoKeyClone && G.__mbunCryptoKeyClone(v)) || copyWithProto(v);
+          memory.set(v, out); return out;
+        }
+        // Same husk problem as CryptoKey above: a KeyObject's state lives in
+        // crypto_asym's koSlots WeakMap and the instance has no own properties,
+        // so copyWithProto yields something util.types.isKeyObject() rejects.
+        if (nc().KeyObject && v instanceof nc().KeyObject) {
+          out = (G.__mbunKeyObjectClone && G.__mbunKeyObjectClone(v)) || copyWithProto(v);
+          memory.set(v, out); return out;
+        }
         if (nc().X509Certificate && v instanceof nc().X509Certificate) { out = copyWithProto(v); memory.set(v, out); return out; }
         // node BlockList clones share the underlying rule set (native-handle semantics).
         if (nnet().BlockList && v instanceof nnet().BlockList) { out = Object.create(nnet().BlockList.prototype); out._rules = v._rules; memory.set(v, out); return out; }
@@ -2254,20 +2417,90 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
     G.DOMException = DOMException;
   }
 
+  // ---- QuotaExceededError (WHATWG webidl §QuotaExceededError) ----
+  // A DOMException subclass with a fixed name/code plus the nullable `quota`
+  // and `requested` telemetry attributes. `crypto.getRandomValues` and the
+  // storage APIs throw it, and the corpus asserts `err instanceof
+  // QuotaExceededError`, so it has to be a real global constructor rather than
+  // a DOMException carrying the name.
+  if (typeof G.QuotaExceededError === "undefined" && typeof G.DOMException === "function") {
+    const kQuota = Symbol("quota");
+    const kRequested = Symbol("requested");
+    // `double?`: absent/undefined is null; anything else is a number that must
+    // not be negative (webidl throws RangeError, not TypeError, for that).
+    const toQuotaDouble = (value, label) => {
+      if (value === undefined || value === null) return null;
+      const n = Number(value);
+      if (!(n >= 0)) throw new RangeError(`${label} must be a non-negative number`);
+      return n;
+    };
+    class QuotaExceededError extends G.DOMException {
+      constructor(message, options) {
+        super(message === undefined ? "" : message, "QuotaExceededError");
+        let quota = null, requested = null;
+        if (options !== undefined && options !== null) {
+          if (typeof options !== "object" && typeof options !== "function")
+            throw new TypeError("QuotaExceededErrorOptions is not an object");
+          quota = toQuotaDouble(options.quota, "options.quota");
+          requested = toQuotaDouble(options.requested, "options.requested");
+        }
+        Object.defineProperty(this, kQuota, { value: quota });
+        Object.defineProperty(this, kRequested, { value: requested });
+      }
+      get quota() { return this[kQuota]; }
+      get requested() { return this[kRequested]; }
+      get [Symbol.toStringTag]() { return "QuotaExceededError"; }
+    }
+    G.QuotaExceededError = QuotaExceededError;
+  }
+
   // ---- V8 stack-trace API (Error.captureStackTrace / prepareStackTrace / CallSite) ----
   // JSC stacks are "name@file:line:col"; V8 (node/bun) are "    at name (file:line:col)".
   // Parse JSC lines into CallSite objects, re-format V8-style, and route through
   // Error.prepareStackTrace when the user replaces it (V8 contract). JSC ships a
   // native captureStackTrace but it emits JSC format and ignores
-  // prepareStackTrace — override it. Instance `.stack` stays JSC-format (own
-  // property materialized at construction; needs native work — DEFERRED).
+  // prepareStackTrace — override it.
+  //
+  // Instance `.stack` deliberately stays JSC-format. This is a SETTLED decision,
+  // not a deferral: it was revisited and measured, and the numbers are recorded
+  // here so it does not get re-derived a fourth time.
+  //   * Payoff: converting every `.stack` to V8 format moves **2 files across
+  //     6,335** (node `test-events-uncaught-exception-stack`, bun
+  //     `third_party/express/express.json`). Only the bun one flips on the
+  //     `Name: message` header alone — the node one also asserts `/^ {4}at/` on
+  //     every frame, so a header by itself buys almost nothing.
+  //   * Cost: the only available mechanism is the dormant Proxy over the eight
+  //     Error constructors plus a per-instance lazy-stack arm. Arming it
+  //     globally measured **~5x on error construction** (48ms -> 230ms per 200k
+  //     errors, ~1us each), paid runtime-wide and forever, against 132 corpus
+  //     files already classified `timeout`.
+  //   * No native escape hatch: modules/jsc links a PREBUILT JavaScriptCore
+  //     (no vendored WebKit source in the tree). Bun gets V8-shaped stacks by
+  //     patching ErrorInstance in its own WebKit fork; mbun cannot.
+  // Note this defect is smaller than it looks from the outside: `util.inspect`
+  // synthesizes the header when `.stack` lacks one (see inspectValue's `head`),
+  // so `console.log(err)` already prints "TypeError: msg\n<frames>". Only the
+  // raw `.stack` string differs.
+  // If anyone does revisit: measure a leaner arm FIRST (the 5x is likely
+  // dominated by getOwnPropertyDescriptor + two defineProperty calls per error,
+  // not by the Proxy trap). A cheaper arm changes the whole cost/benefit.
   {
     class CallSite {
-      constructor(name, file, line, col) { this._n = name || null; this._f = file || null; this._l = line; this._c = col; }
+      constructor(name, file, line, col, kind) {
+        this._n = name || null; this._f = file || null; this._l = line; this._c = col;
+        this._k = kind || "";
+        // JSC spells a method frame "Type.method"; V8 splits it across
+        // getTypeName()/getMethodName(). Nothing else about the receiver
+        // survives into a JSC stack string, so anything we cannot read off the
+        // frame name stays null rather than being invented.
+        const dot = this._n === null ? -1 : this._n.lastIndexOf(".");
+        this._t = dot > 0 ? this._n.slice(0, dot) : null;
+        this._m = dot > 0 ? this._n.slice(dot + 1) : null;
+      }
       get [Symbol.toStringTag]() { return "CallSite"; }
       getFunctionName() { return this._n; }
-      getMethodName() { return this._n; }
-      getTypeName() { return null; }
+      getMethodName() { return this._m; }
+      getTypeName() { return this._t; }
       getFileName() { return this._f; }
       getScriptNameOrSourceURL() { return this._f; }
       getLineNumber() { return this._l; }
@@ -2275,13 +2508,16 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       getEnclosingLineNumber() { return this._l; }
       getEnclosingColumnNumber() { return this._c; }
       getEvalOrigin() { return undefined; }
+      // V8 hands the formatter the frame's receiver; a JSC stack string does not
+      // carry it (and V8 itself reports undefined for a strict-mode frame), so
+      // undefined is the honest answer for every frame rather than a fake.
       getThis() { return undefined; }
       getFunction() { return undefined; }
       getPosition() { return 0; }
       getScriptHash() { return ""; }
       getPromiseIndex() { return null; }
-      isEval() { return false; }
-      isNative() { return this._f === "[native code]"; }
+      isEval() { return this._k === "eval"; }
+      isNative() { return this._k === "native"; }
       isConstructor() { return false; }
       isAsync() { return false; }
       isPromiseAll() { return false; }
@@ -2297,13 +2533,18 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
         if (!ln) continue;
         const at = ln.lastIndexOf("@");
         if (at < 0) continue;
-        let name = ln.slice(0, at); if (name === "global code" || name === "module code") name = "";
+        let name = ln.slice(0, at);
+        let kind = "";
+        if (name === "eval code") { kind = "eval"; name = ""; }
+        else if (name === "global code" || name === "module code") name = "";
         const loc = ln.slice(at + 1);
+        if (loc === "[native code]" || loc === "native") kind = "native";
         const m = loc.match(/^(.*):(\d+):(\d+)$/);
-        if (m) out.push(new CallSite(name, m[1], +m[2], +m[3]));
-        else out.push(new CallSite(name, loc || null, undefined, undefined));
+        if (m) out.push(new CallSite(name, m[1], +m[2], +m[3], kind));
+        else out.push(new CallSite(name, loc || null, undefined, undefined, kind));
       }
-      return out;
+      const limit = Error.stackTraceLimit;
+      return typeof limit === "number" && limit >= 0 && out.length > limit ? out.slice(0, limit) : out;
     };
     const header = (err) => {
       let name = "Error", msg = "";
@@ -2316,25 +2557,109 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       if (Array.isArray(frames)) for (const f of frames) s += "\n    at " + String(f);
       return s;
     };
-    Error.prepareStackTrace = defaultPrepare;
-    const desc = Object.getOwnPropertyDescriptor(Error.prototype, "stack");
-    if (desc && typeof desc.get === "function") {
-      const origGet = desc.get, origSet = desc.set;
-      Object.defineProperty(Error.prototype, "stack", {
-        configurable: true,
-        get() {
-          const raw = origGet.call(this);
-          const prep = Error.prepareStackTrace;
-          if (typeof prep === "function" && prep !== defaultPrepare) return prep(this, parseFrames(raw));
-          return defaultPrepare(this, parseFrames(raw));
+    // ── Error.prepareStackTrace ────────────────────────────────────────────
+    // V8 calls the formatter LAZILY, on the first read of `.stack`, and its
+    // return value BECOMES `.stack`. This JSC gives every error an own `stack`
+    // DATA property at construction — there is no `Error.prototype.stack`
+    // accessor to wrap — so laziness has to be installed per instance, at
+    // construction, by re-defining that own property as a getter.
+    //
+    // Doing that for every error unconditionally would tax the whole runtime
+    // for a V8-ism almost nothing uses, and would silently move mbun off the
+    // JSC-format `.stack` it deliberately keeps (see the note above). So the
+    // machinery is DORMANT until someone actually installs a formatter:
+    // `Error.prepareStackTrace` is an accessor whose setter arms it once. Code
+    // that never touches prepareStackTrace sees byte-identical behaviour.
+    const kRaw = Symbol("mbunRawStack");
+    const ownStackDesc = (obj) => {
+      try { return Object.getOwnPropertyDescriptor(obj, "stack"); } catch (e) { return undefined; }
+    };
+    // The raw JSC stack of an error, WITHOUT running any user formatter — used
+    // by everything internal that needs frames (captureStackTrace, the
+    // node_modules call-site probe) so a user formatter can neither observe nor
+    // break mbun's own captures.
+    const rawStack = (err) => {
+      try {
+        if (err !== null && typeof err === "object" && kRaw in err) return err[kRaw];
+        const d = ownStackDesc(err);
+        return d && typeof d.get !== "function" ? d.value : undefined;
+      } catch (e) { return undefined; }
+    };
+    // Published so other builtins that must walk frames WITHOUT triggering a
+    // user formatter can do so (util.getCallSites is contractually one of them:
+    // test-util-getcallsites-preparestacktrace asserts it never calls it).
+    try { G[Symbol.for("mbun.rawErrorStack")] = rawStack; } catch (e) {}
+    // Turn the own data `stack` into V8's lazy accessor. The formatter runs at
+    // most once per error and its result is cached, exactly as V8 memoises.
+    const armLazyStack = (err) => {
+      const d = ownStackDesc(err);
+      if (!d || !d.configurable || typeof d.get === "function") return err;
+      const raw = d.value;
+      let cached, computed = false;
+      try {
+        Object.defineProperty(err, kRaw, { value: raw, configurable: true });
+        Object.defineProperty(err, "stack", {
+          configurable: true,
+          enumerable: false,
+          get() {
+            if (computed) return cached;
+            const prep = Error.prepareStackTrace;
+            // No formatter (or the built-in one): keep the JSC-format string
+            // mbun reports everywhere else. Only a user formatter changes shape.
+            if (typeof prep !== "function" || prep === defaultPrepare) return raw;
+            // Latch BEFORE calling out: the formatter may read `.stack` again
+            // (directly, or via console/inspect), and V8 does not re-enter.
+            computed = true;
+            cached = raw;
+            // A throwing formatter propagates, as in V8; the cached JSC string
+            // stays in place so the next read cannot re-enter the thrower.
+            cached = prep(this, parseFrames(raw));
+            return cached;
+          },
+          set(v) { computed = true; cached = v; },
+        });
+      } catch (e) { /* frozen/sealed error: leave it alone */ }
+      return err;
+    };
+    // Swapping the global error constructors for construct-trapping proxies
+    // preserves identity that a hand-written wrapper would not: `.prototype`,
+    // `instanceof`, `class X extends Error`, and every static (including
+    // captureStackTrace and prepareStackTrace itself) forward to the original.
+    let armed = false;
+    const armErrorConstructors = () => {
+      if (armed) return;
+      armed = true;
+      const handler = {
+        construct(target, args, newTarget) {
+          return armLazyStack(Reflect.construct(target, args, newTarget));
         },
-        set(v) { if (origSet) origSet.call(this, v); else Object.defineProperty(this, "stack", { value: v, writable: true, configurable: true }); },
-      });
-    }
+        apply(target, thisArg, args) {
+          const r = Reflect.apply(target, thisArg, args);
+          return r !== null && typeof r === "object" ? armLazyStack(r) : r;
+        },
+      };
+      for (const name of ["Error", "EvalError", "RangeError", "ReferenceError",
+                          "SyntaxError", "TypeError", "URIError", "AggregateError"]) {
+        const ctor = G[name];
+        if (typeof ctor !== "function") continue;
+        try { G[name] = new Proxy(ctor, handler); } catch (e) { /* non-writable global */ }
+      }
+    };
+    let prepareValue = defaultPrepare;
+    Object.defineProperty(Error, "prepareStackTrace", {
+      configurable: true,
+      enumerable: false,
+      get() { return prepareValue; },
+      set(v) {
+        prepareValue = v;
+        if (typeof v === "function" && v !== defaultPrepare) armErrorConstructors();
+      },
+    });
     Error.captureStackTrace = function (obj, skip) {
-      // capture the raw JSC stack directly (bypass our getter to avoid recursion)
+      // capture the raw JSC stack directly (never through a lazy getter, so a
+      // user formatter cannot recurse into or hijack this internal capture)
       let raw = "", frames = [];
-      try { raw = (desc && desc.get) ? desc.get.call(new Error()) : new Error().stack; } catch (e) {}
+      try { raw = rawStack(new Error()); } catch (e) {}
       frames = parseFrames(raw).slice(1);  // drop the captureStackTrace frame itself
       if (typeof skip === "function" && skip.name) {
         const i = frames.findIndex((f) => f.getFunctionName() === skip.name);

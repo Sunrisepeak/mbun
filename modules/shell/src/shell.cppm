@@ -7,5 +7,6 @@ export import mbun.shell.redirection;
 export import mbun.shell.pipeline;
 export import mbun.shell.execution_plan;
 export import mbun.shell.backend;
+export import mbun.shell.coreutils;
 export import mbun.shell.interpreter;
 export import mbun.shell.tag_template;

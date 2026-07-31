@@ -42,6 +42,7 @@ export module mbun.cli.run_command;
 
 import std;
 import mbun.install.npm.json;
+import mbun.platform;
 import mbun.which;
 
 namespace mbun::cli::run {
@@ -482,11 +483,13 @@ std::string_view signal_name_(int sig) {
 void raise_ignoring_handlers_(int sig) {
     struct ::sigaction sa{};
     sa.sa_handler = SIG_DFL;
-    ::sigemptyset(&sa.sa_mask);
+    // Unqualified: sigemptyset/sigaddset are MACROS on Darwin, so `::sigemptyset`
+    // is a syntax error there. Same reason as modules/crash_handler.
+    sigemptyset(&sa.sa_mask);
     (void)::sigaction(sig, &sa, nullptr);
     ::sigset_t set;
-    ::sigemptyset(&set);
-    ::sigaddset(&set, sig);
+    sigemptyset(&set);
+    sigaddset(&set, sig);
     (void)::sigprocmask(SIG_UNBLOCK, &set, nullptr);
     ::raise(sig);
 }
@@ -494,7 +497,7 @@ void raise_ignoring_handlers_(int sig) {
 // Build a null-delimited env from the current environ plus overrides.
 std::vector<std::string> build_env_(const std::vector<std::pair<std::string, std::string>>& overrides) {
     std::vector<std::string> out;
-    for (char** e = ::environ; e != nullptr && *e != nullptr; ++e) {
+    for (char** e = mbun::platform::process::environ_ptr(); e != nullptr && *e != nullptr; ++e) {
         std::string_view entry{*e};
         std::size_t eq{entry.find('=')};
         std::string_view key{eq == std::string_view::npos ? entry : entry.substr(0, eq)};

@@ -430,7 +430,16 @@ public:
 };
 
 void test_borrowed_buffer_fallback() {
-    std::array<std::byte, 64> storage{};
+    // alignas(16) is load-bearing, not decoration. fixed_allocate_ aligns the
+    // ABSOLUTE address and sets cursor_ = start + size, so `used()` counts any
+    // padding it had to skip. A std::byte array is only alignment-1, and the
+    // exact figures below (used() == 32, then == 0) hold only when the base is
+    // already 16-aligned. That was true by luck of the stack layout on linux
+    // x86_64 and false on macOS arm64, where both checks failed -- a latent
+    // assumption in the test, not a defect in the allocator. Stating the
+    // alignment makes the arithmetic deterministic everywhere; the unaligned
+    // case the failure exposed is covered separately below.
+    alignas(16) std::array<std::byte, 64> storage{};
     FallbackCounts counts{};
     alloc::BufferFallbackAllocator fallback{std::span{storage}, CountingFallback{counts}};
 
@@ -460,6 +469,40 @@ void test_borrowed_buffer_fallback() {
     fallback.reset();
     check(fallback.used() == 0 && fallback.capacity() == storage.size(),
           "borrowed fallback reset preserves capacity");
+}
+
+// The case above was accidentally never exercised until macOS produced it: a
+// borrowed buffer whose base is NOT already aligned to the requested alignment.
+// Asserted as relationships rather than constants, since the padding depends on
+// where the array lands.
+void test_borrowed_buffer_unaligned_base() {
+    alignas(16) std::array<std::byte, 96> backing{};
+    // +1 guarantees a base that cannot satisfy alignment 16 without padding.
+    const std::span<std::byte> storage{backing.data() + 1, backing.size() - 1};
+    FallbackCounts counts{};
+    alloc::BufferFallbackAllocator fallback{storage, CountingFallback{counts}};
+
+    auto* first{static_cast<std::byte*>(fallback.raw_allocate(16, 16, true))};
+    check(first != nullptr && fallback.owns(first) && counts.allocations == 0,
+          "unaligned borrowed buffer still serves from the buffer, not the fallback");
+    if (first == nullptr) {
+        return;
+    }
+    check(reinterpret_cast<std::uintptr_t>(first) % 16 == 0,
+          "unaligned borrowed buffer still returns an aligned pointer");
+
+    const std::size_t pad{static_cast<std::size_t>(first - storage.data())};
+    check(pad > 0 && fallback.used() == pad + 16,
+          "used() accounts for the padding skipped to reach alignment");
+    check(fallback.raw_resize(first, 16, 16, 32) && fallback.used() == pad + 32,
+          "last fixed allocation grows in place from an unaligned base");
+
+    fallback.raw_deallocate(first, 32, 16);
+    check(fallback.used() == pad,
+          "freeing the last fixed allocation rewinds to its start, padding included");
+    fallback.reset();
+    check(fallback.used() == 0 && fallback.capacity() == storage.size(),
+          "reset clears the padding too");
 }
 
 void test_stack_injected_fallback() {
@@ -494,6 +537,7 @@ int main() {
     test_stack_foreign_reset_resize_and_fallback();
     test_stack_zero_size_at_end();
     test_borrowed_buffer_fallback();
+    test_borrowed_buffer_unaligned_base();
     test_stack_injected_fallback();
 
     std::println("test_core_alloc: {} checks, {} failures", gChecks, gFailures);

@@ -1,4 +1,8 @@
-// Linux epoll-backed SocketBackend driving Connection/Listener over real fds.
+// POSIX SocketBackend driving Connection/Listener over real fds, on whichever
+// readiness backend the host has (epoll on linux, kqueue on Darwin/BSD --
+// event_loop::HostReadinessBackend picks). The class name is historical: it
+// was epoll-only until the three genuinely divergent calls (socket() flag
+// bits, accept4, MSG_NOSIGNAL) moved to mbun.platform.socket.
 //
 // PORT-SOURCE:
 //   bun Rust src/uws_sys/us_socket_t.rs (open/pause/resume/shutdown/close and
@@ -14,11 +18,11 @@
 // unsent tail is buffered internally (us_socket_stream_buffer_t equivalent),
 // so the return value is bytes accepted, not bytes on the wire.
 //
-// Non-Linux builds keep the honest DEFERRED stub style of
+// Windows keeps the honest DEFERRED stub style of
 // modules/event_loop/src/epoll_backend.cppm: every operation fails cleanly.
 module;
 
-#if defined(__linux__)
+#if !defined(_WIN32)
 #include <arpa/inet.h>
 #include <cerrno>
 #include <cstddef>  // offsetof for sockaddr_un length
@@ -33,6 +37,7 @@ export module mbun.runtime_socket.epoll_socket_backend;
 
 import std;
 import mbun.event_loop;
+import mbun.platform;
 import mbun.runtime_socket.address;
 import mbun.runtime_socket.backend;
 import mbun.runtime_socket.buffer;
@@ -66,7 +71,7 @@ private:
     };
 
     event_loop::EventLoop& loop_;
-    event_loop::EpollBackend& epoll_;
+    event_loop::HostReadinessBackend& epoll_;
     SocketEvents events_ {};
     std::unordered_map<int, Entry> entries_ {};
     // Process-global token counter: several backends may share one EventLoop
@@ -75,7 +80,7 @@ private:
     inline static std::uint64_t gNextToken { 1 };
 
 public:  // Big Five: references + live fd table, non-copyable/non-movable.
-    EpollSocketBackend(event_loop::EventLoop& loop, event_loop::EpollBackend& epoll,
+    EpollSocketBackend(event_loop::EventLoop& loop, event_loop::HostReadinessBackend& epoll,
                        SocketEvents events)
         : loop_ { loop }
         , epoll_ { epoll }
@@ -87,7 +92,7 @@ public:  // Big Five: references + live fd table, non-copyable/non-movable.
     EpollSocketBackend(EpollSocketBackend&&) = delete;
     EpollSocketBackend& operator=(EpollSocketBackend&&) = delete;
     ~EpollSocketBackend() override {
-#if defined(__linux__)
+#if !defined(_WIN32)
         for (const auto& [fd, entry] : entries_) {
             static_cast<void>(loop_.remove_watch(entry.token));
             if (entry.inEpoll)
@@ -101,7 +106,7 @@ public:  // SocketBackend
     // us_socket_context_listen: socket / SO_REUSEADDR / bind / listen, then
     // register read interest so readiness means "accept queue non-empty".
     std::expected<NativeHandle, BackendError> listen(const Address& address) override {
-#if defined(__linux__)
+#if !defined(_WIN32)
         auto fd { open_socket_(address) };
         if (!fd)
             return std::unexpected { fd.error() };
@@ -135,7 +140,7 @@ public:  // SocketBackend
         return NativeHandle { *fd };
 #else
         static_cast<void>(address);
-        return std::unexpected { deferred_error_() };  // DEFERRED: Linux-only backend.
+        return std::unexpected { deferred_error_() };  // DEFERRED: no Windows backend.
 #endif
     }
 
@@ -145,7 +150,7 @@ public:  // SocketBackend
     // as uSockets. The v4-mapped form of an AF_INET6 peer is deliberately kept
     // verbatim — see PeerAddress in backend.cppm.
     std::optional<PeerAddress> remote_address(NativeHandle handle) override {
-#if defined(__linux__)
+#if !defined(_WIN32)
         ::sockaddr_storage storage {};
         ::socklen_t length { sizeof(storage) };
         if (::getpeername(static_cast<int>(handle), reinterpret_cast<::sockaddr*>(&storage),
@@ -170,14 +175,14 @@ public:  // SocketBackend
         return std::nullopt;
 #else
         static_cast<void>(handle);
-        return std::nullopt;  // DEFERRED: Linux-only backend.
+        return std::nullopt;  // DEFERRED: no Windows backend.
 #endif
     }
 
     // Non-blocking connect; EINPROGRESS arms EPOLLOUT and completion is
     // detected via SO_ERROR in the write-readiness event (us_socket_t open).
     std::expected<NativeHandle, BackendError> connect(const Address& address) override {
-#if defined(__linux__)
+#if !defined(_WIN32)
         auto fd { open_socket_(address) };
         if (!fd)
             return std::unexpected { fd.error() };
@@ -214,7 +219,7 @@ public:  // SocketBackend
     // tail goes into the stream buffer and EPOLLOUT is armed (uws semantics).
     std::expected<std::size_t, BackendError> write(NativeHandle handle,
                                                    std::span<const std::byte> bytes) override {
-#if defined(__linux__)
+#if !defined(_WIN32)
         const int fd { static_cast<int>(handle) };
         const auto found { entries_.find(fd) };
         if (found == entries_.end() || found->second.role == Role::listener)
@@ -228,8 +233,7 @@ public:  // SocketBackend
         }
         std::size_t sent { 0 };
         while (sent < bytes.size()) {
-            const ::ssize_t n { ::send(fd, bytes.data() + sent, bytes.size() - sent,
-                                       MSG_NOSIGNAL) };
+            const ::ssize_t n { platform::net::send_nosignal(fd, bytes.data() + sent, bytes.size() - sent) };
             if (n > 0) {
                 sent += static_cast<std::size_t>(n);
                 continue;
@@ -255,7 +259,7 @@ public:  // SocketBackend
 
     // us_socket_pause/resume: drop or restore EPOLLIN via epoll_ctl.
     bool pause(NativeHandle handle) override {
-#if defined(__linux__)
+#if !defined(_WIN32)
         return set_read_enabled_(static_cast<int>(handle), false);
 #else
         static_cast<void>(handle);
@@ -263,7 +267,7 @@ public:  // SocketBackend
 #endif
     }
     bool resume(NativeHandle handle) override {
-#if defined(__linux__)
+#if !defined(_WIN32)
         return set_read_enabled_(static_cast<int>(handle), true);
 #else
         static_cast<void>(handle);
@@ -273,7 +277,7 @@ public:  // SocketBackend
 
     // us_socket_shutdown: FIN the write side, keep reading until peer close.
     bool shutdown(NativeHandle handle) override {
-#if defined(__linux__)
+#if !defined(_WIN32)
         const int fd { static_cast<int>(handle) };
         return entries_.contains(fd) && ::shutdown(fd, SHUT_WR) == 0;
 #else
@@ -286,7 +290,7 @@ public:  // SocketBackend
     // remote-initiated close (recv == 0 / socket error), matching the tests'
     // "peer closed" contract; a caller-driven close already knows it closed.
     void close(NativeHandle handle) override {
-#if defined(__linux__)
+#if !defined(_WIN32)
         cleanup_(static_cast<int>(handle));
 #else
         static_cast<void>(handle);
@@ -294,7 +298,7 @@ public:  // SocketBackend
     }
 
     void close_after_drain(NativeHandle handle) override {
-#if defined(__linux__)
+#if !defined(_WIN32)
         const int fd { static_cast<int>(handle) };
         const auto found { entries_.find(fd) };
         if (found == entries_.end()) {
@@ -311,7 +315,7 @@ public:  // SocketBackend
 
 public:  // Introspection (us_socket_local_port equivalents; used by tests).
     [[nodiscard]] std::optional<std::uint16_t> local_port(NativeHandle handle) const {
-#if defined(__linux__)
+#if !defined(_WIN32)
         ::sockaddr_storage storage {};
         ::socklen_t length { sizeof(storage) };
         if (::getsockname(static_cast<int>(handle),
@@ -340,7 +344,7 @@ private:
         return BackendError { 0, "DEFERRED: epoll socket backend is Linux-only" };
     }
 
-#if defined(__linux__)
+#if !defined(_WIN32)
 private:
     static constexpr std::size_t READ_CHUNK { 64 * 1024 };
 
@@ -382,7 +386,7 @@ private:
             case AddressFamily::ipv6: domain = AF_INET6; break;
             case AddressFamily::unix: domain = AF_UNIX; break;
         }
-        const int fd { ::socket(domain, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0) };
+        const int fd { platform::net::stream_socket(domain) };
         if (fd < 0)
             return std::unexpected { errno_error_("socket() failed") };
         set_nodelay_(fd);
@@ -521,8 +525,7 @@ private:
     // EAGAIN), register each connection for reads, announce via on_open.
     void accept_ready_(int fd) {
         while (true) {
-            const int accepted { ::accept4(fd, nullptr, nullptr,
-                                           SOCK_NONBLOCK | SOCK_CLOEXEC) };
+            const int accepted { platform::net::accept_stream(fd) };
             if (accepted < 0) {
                 if (errno == EINTR)
                     continue;
@@ -563,7 +566,7 @@ private:
         Entry& entry { found->second };
         while (!entry.writeBuffer.empty()) {
             const auto readable { entry.writeBuffer.readable() };
-            const ::ssize_t n { ::send(fd, readable.data(), readable.size(), MSG_NOSIGNAL) };
+            const ::ssize_t n { platform::net::send_nosignal(fd, readable.data(), readable.size()) };
             if (n > 0) {
                 static_cast<void>(entry.writeBuffer.consume(static_cast<std::size_t>(n)));
                 continue;

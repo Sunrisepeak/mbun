@@ -47,6 +47,20 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
   function writeHttpResponse(sock, res, reqMethod, keepAlive, onFinished) {
     if (!res || typeof res !== "object") res = new G.Response("", { status: 500 });
     const status = res.status || 200;
+    // RFC 9112 §9.6: a server that sends "Connection: close" MUST close the
+    // connection after that response. `Connection` is hop-by-hop, so the header
+    // echo below DROPS the handler's copy and regenerates the token from
+    // `keepAlive` — which is derived from the REQUEST alone. That means the
+    // handler's INTENT has to be captured here, before any of the three body
+    // paths (direct stream / chunked stream / buffered) commits a frame, or the
+    // response advertises keep-alive and the socket goes back in the pool.
+    // 1#connection-option: "close" as one token of a list still closes.
+    if (keepAlive && res.headers && typeof res.headers.get === "function") {
+      let rawConn = null;
+      try { rawConn = res.headers.get("connection"); } catch (e) {}
+      if (rawConn != null && String(rawConn).toLowerCase().split(",").some((t) => t.trim() === "close"))
+        keepAlive = false;
+    }
     const S = G.__mbunStreams;
     if (res._b == null && res._stream != null && S && typeof S.directStreamSource === "function") {
       const source = S.directStreamSource(res._stream);
@@ -383,12 +397,27 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
           const _h = _cd.value.toSetCookieHeaders();
           if (_h && _h.length) _ck = _h;
         }
+        // Snapshot every Sec-WebSocket-* value BEFORE touching opts: reading
+        // opts.data / opts.headers runs arbitrary user getters, and a getter that
+        // mutates req.headers would otherwise change the protocol/extensions this
+        // handshake echoes (bun reads them off the raw request for the same
+        // reason). `key` is already captured above.
+        const _proto = req.headers.get("sec-websocket-protocol") || "";
+        const _ext = req.headers.get("sec-websocket-extensions") || "";
+        const _optHeaders = opts && opts.headers;
+        const _optData = opts ? opts.data : undefined;
+        // Those getters may have re-entered server.upgrade(req) and consumed the
+        // request. The __mbunUpgraded check at the top of this function ran before
+        // they did, so it cannot have seen it: re-check now, or this call performs
+        // a SECOND upgrade on a connection already converted to a WebSocket
+        // (two 'open' events, and the first ServerWebSocket leaked from sock._ws).
+        if (req.__mbunUpgraded || !conns.has(id)) return false;
         const ws = WS.serverUpgrade({
-          key, protocol: req.headers.get("sec-websocket-protocol") || "",
-          headers: opts && opts.headers, setCookies: _ck,
-          extensions: req.headers.get("sec-websocket-extensions") || "",
+          key, protocol: _proto,
+          headers: _optHeaders, setCookies: _ck,
+          extensions: _ext,
           perMessageDeflate: !!handlerRef.ws.perMessageDeflate,
-          data: opts ? opts.data : undefined,
+          data: _optData,
           // ServerWebSocket.remoteAddress is the upgraded socket's peer — the
           // same endpoint requestIP() reports for the upgrade request, since
           // the 101 reuses that connection. ref: bun
@@ -772,10 +801,17 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
           if (!key || String(req.headers.get("upgrade") || "").toLowerCase() !== "websocket") return false;
           if (!handlerRef.ws || typeof handlerRef.ws !== "object")
             throw new Error('Bun.serve(): To enable websocket support, set the "websocket" object in Bun.serve({})');
+          // Same snapshot-then-recheck as the native path above: the opts getters
+          // are user JS that can mutate req.headers or re-enter upgrade(req).
+          const _proto = req.headers.get("sec-websocket-protocol") || "";
+          const _ext = req.headers.get("sec-websocket-extensions") || "";
+          const _optHeaders = o && o.headers;
+          const _optData = o ? o.data : undefined;
+          if (req.__mbunUpgraded || sock.destroyed) return false;
           const ws = WS.serverUpgrade({
-            key, protocol: req.headers.get("sec-websocket-protocol") || "",
-            headers: o && o.headers, data: o ? o.data : undefined,
-            extensions: req.headers.get("sec-websocket-extensions") || "",
+            key, protocol: _proto,
+            headers: _optHeaders, data: _optData,
+            extensions: _ext,
             perMessageDeflate: !!handlerRef.ws.perMessageDeflate,
             server: serverObj, handlers: handlerRef.ws,
             write: (bytes) => { try { sock.write(u8(bytes)); } catch (e) {} },
@@ -1053,12 +1089,32 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
 
   function createHttpServer(o, handler, baseSrv) {
     if (typeof o === "function") { handler = o; o = {}; }
+    // lib/_http_server.js Server: anything that is not a function and not
+    // null/undefined goes through validateObject(options, 'options'), which
+    // rejects a string / number / boolean / ARRAY (test-http-server's first
+    // block walks exactly those four). `o = o || {}` accepted all of them.
+    else if (o !== undefined && o !== null) {
+      if (typeof o !== "object" || Array.isArray(o)) {
+        const e = new TypeError(
+          'The "options" argument must be of type object. Received ' +
+          (Array.isArray(o) ? "an instance of Array" : "type " + typeof o));
+        e.code = "ERR_INVALID_ARG_TYPE";
+        throw e;
+      }
+    }
     o = o || {};
     // lib/_http_server.js storeHTTPOptions keeps `options.highWaterMark` and
     // node's net.Server hands it to every accepted socket, which is where both
     // `req._readableState.highWaterMark` and `res[kHighWaterMark]` come from
     // (test-http-server-options-highwatermark).
-    const srv = baseSrv || new Server({ allowHalfOpen: false, highWaterMark: o.highWaterMark });
+    // lib/_http_server.js Server hands net.Server `noDelay: options.noDelay ?? true`
+    // — an http server disables Nagle on every accepted connection by default,
+    // and `server.noDelay` is readable (test-http-nodelay).
+    const srv = baseSrv || new Server({
+      allowHalfOpen: false,
+      highWaterMark: o.highWaterMark,
+      noDelay: o.noDelay === undefined ? true : o.noDelay,
+    });
     const connEvent = baseSrv ? "secureConnection" : "connection";
     srv._httpConns = new Set();
     const ResponseClass = typeof o.ServerResponse === "function" ? o.ServerResponse : ServerResponse;
@@ -1117,6 +1173,20 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
     const srvLenientHeaders = o.httpValidation === undefined
       ? o.insecureHTTPParser === true
       : (o.httpValidation === "relaxed" || o.httpValidation === "insecure");
+    // lib/_http_server.js Server: `this[kOptimizeEmptyRequests] =
+    // options.optimizeEmptyRequests || false`. A request with no body framing is
+    // then dumped and closed BEFORE the handler runs, so the Readable life cycle
+    // ('data'/'end'/'close') is skipped entirely.
+    if (o.optimizeEmptyRequests !== undefined) {
+      vBool(o.optimizeEmptyRequests, "options.optimizeEmptyRequests");
+    }
+    const optimizeEmptyRequests = o.optimizeEmptyRequests || false;
+    // lib/_http_server.js Server: `this[kUniqueHeaders] =
+    // parseUniqueHeadersOption(options.uniqueHeaders)`, handed to every response.
+    const kUniqueHeadersSym = HI.kUniqueHeaders;
+    const srvUniqueHeaders = typeof HI.parseUniqueHeadersOption === "function"
+      ? HI.parseUniqueHeadersOption(o.uniqueHeaders) : null;
+    if (kUniqueHeadersSym) srv[kUniqueHeadersSym] = srvUniqueHeaders;
     if (o.maxHeaderSize !== undefined) vInt(o.maxHeaderSize, "maxHeaderSize", 0);
     srv.maxHeaderSize = o.maxHeaderSize;
     // lib/_http_server.js storeHTTPOptions: `options.shouldUpgradeCallback`
@@ -1143,6 +1213,19 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
         // An idle keep-alive connection has no message in flight, so neither
         // clock is running (llhttp starts them at on_message_begin).
         if (s.destroyed || s._httpMsgIdle) continue;
+        // Neither clock survives on_message_complete. node's
+        // ConnectionsList::Expired only walks active_connections_, and
+        // node_http_parser.cc on_message_complete does
+        // `Pop(this); PopActive(this); last_message_start_ = 0; Push(this)` --
+        // Push WITHOUT PushActive -- so a connection whose REQUEST is fully
+        // received can no longer expire, however long the handler then takes to
+        // stream the response. A body-less GET completes the moment its head is
+        // parsed, which is why `requestTimeout` was killing a slow streaming
+        // handler with a spurious 408 (node-http-server-timeouts.test.ts).
+        // A brand-new connection that has sent nothing is NOT in this state and
+        // stays expirable: Initialize() does PushActive explicitly, as the DoS
+        // guard for `server.timeout === 0` (its comment says so).
+        if (s._httpMsgBegun && !s._httpMsgOpen) continue;
         const started = s._httpMsgStart || 0;
         if (!started) continue;
         const headersLate = srv.headersTimeout > 0 && !s._httpHeadersDone &&
@@ -1339,6 +1422,17 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
       // asserts it after handing a socket to a worker over IPC). connEvent is
       // 'secureConnection' for https, so this must stay on the dynamic name.
       sock.server = srv;
+      // node lib/_http_server.js connectionListenerInternal:
+      // `socket.setEncoding = socketSetEncoding`, i.e. changing a connection
+      // socket's encoding is refused outright -- the parser needs raw bytes and
+      // RFC 7230 3. framing does not survive a decoder in front of it
+      // (test-http-socket-encoding-error).
+      sock.setEncoding = function socketSetEncoding() {
+        const e = new Error(
+          "Changing the socket encoding is not allowed per RFC7230 Section 3.");
+        e.code = "ERR_HTTP_SOCKET_ENCODING";
+        throw e;
+      };
       // node lib/_http_server.js connectionListenerInternal: `socket.on('error',
       // socketOnError)`. This was a noop, which silently swallowed every error
       // that reached the connection socket by the EVENT path rather than through
@@ -1355,14 +1449,15 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
       // is not equivalent -- it leaves a window where another layer's listener
       // (a TLSSocket's) is the only one, and a later 'write after end' on a
       // pipelined response threw (test-tls-use-after-free-regression).
-      sock.on("error", () => {});
+      const socketOnErrorNoop = () => {};
+      sock.on("error", socketOnErrorNoop);
       const onSockError = (e) => {
         socketOnError(sock, e instanceof Error ? e : mkErr(String((e && e.message) || e), codeOf(e)));
       };
       sock._httpOnError = onSockError;
       sock.on("error", onSockError);
       srv._httpConns.add(sock);
-      sock.once("close", () => {
+      const socketOnClose = () => {
         srv._httpConns.delete(sock);
         // node lib/_http_server.js socketOnClose -> freeParser(parser, null,
         // null). The corpus overwrites `parser.free` to observe exactly this
@@ -1397,6 +1492,16 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
         // test-http-keep-alive-pipeline-max-requests, all three on a `req.on
         // ('end')` that stopped firing.
         const parserAtClose = sock.parser;
+        // node's socketOnClose reaches freeParser -> cleanParser SYNCHRONOUSLY,
+        // so a user 'close' listener already sees the kOn* slots nulled. The
+        // freeParser call below has to stay deferred for the reasons above, but
+        // the callback slots are not what that deferral protects (only
+        // parser.incoming is), so drop them here on node's schedule
+        // (test-http-parser-memory-retention reads parser[kOnTimeout] from inside
+        // the socket's own 'close' handler).
+        if (parserAtClose) {
+          parserAtClose[0] = null; parserAtClose[5] = null; parserAtClose[6] = null;
+        }
         const closeLater = () => {
           if (freeParser && parserAtClose) { try { freeParser(parserAtClose, null, sock); } catch (e) {} }
           abortIncoming();
@@ -1405,7 +1510,8 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
         if (typeof G.setImmediate === "function") G.setImmediate(closeLater);
         else if (G.process && typeof G.process.nextTick === "function") G.process.nextTick(closeLater);
         else closeLater();
-      });
+      };
+      sock.once("close", socketOnClose);
       if (srv.timeout) { try { sock.setTimeout(srv.timeout); } catch (e) {} }
       sock.server = srv;
       sock._httpInFlight = 0;
@@ -1420,14 +1526,15 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
       // lib/_http_server.js socketOnTimeout: the request, the response and the
       // server each get a say; only if none of them claims the event does the
       // connection go away.
-      sock.on("timeout", () => {
+      const socketOnTimeout = () => {
         const inFlightReq = sock._httpIncoming;
         const reqTimeout = inFlightReq && !inFlightReq.complete && inFlightReq.emit("timeout", sock);
         const res = sock._httpMessage;
         const resTimeout = res && res.emit("timeout", sock);
         const serverTimeout = srv.emit("timeout", sock);
         if (!reqTimeout && !resTimeout && !serverTimeout) sock.destroy();
-      });
+      };
+      sock.on("timeout", socketOnTimeout);
       let carry = [];
       let eofSeen = false;
       let requestsCount = 0;
@@ -1508,6 +1615,14 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
       };
 
       const startParser = () => {
+        // llhttp's on_message_begin is where headersTimeout/requestTimeout start
+        // counting, and arming a parser IS that point. Only the socket 'data'
+        // path did this, so a PIPELINED message whose bytes were already buffered
+        // when the previous response finished got re-armed with the connection
+        // still flagged idle -- and setupConnectionsTracking's sweeper skips idle
+        // connections, so an incomplete pipelined head never expired into a 408
+        // (test-http-server-{headers,request}-timeout-pipelining).
+        if (sock._httpMsgIdle) { sock._httpMsgIdle = false; sock._httpMsgStart = Date.now(); }
         const parser = new HttpParser(false);
         if (typeof srv.maxHeadersCount === "number" && srv.maxHeadersCount > 0) {
           parser.maxHeaderPairs = srv.maxHeadersCount << 1;
@@ -1516,7 +1631,21 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
         // lib/_http_server.js connectionListenerInternal: the server's own
         // insecureHTTPParser flag selects llhttp's lenient flags for inbound
         // requests, exactly as the client option does for responses.
-        if (o.insecureHTTPParser || o.httpValidation === "insecure") parser.lenient = true;
+        // `--insecure-http-parser` is a PROCESS-wide default that
+        // lib/_http_common.js isLenient() folds in whenever the server set
+        // neither option; only the per-server options were consulted here, so the
+        // flag did nothing on the server side (test-http-insecure-parser).
+        if (o.insecureHTTPParser === undefined && o.httpValidation === undefined) {
+          if (typeof HI.processInsecureHTTPParser === "function" && HI.processInsecureHTTPParser()) {
+            parser.lenient = true;
+          }
+        }
+        else if (o.insecureHTTPParser || o.httpValidation === "insecure") parser.lenient = true;
+        // httpValidation: 'relaxed' is llhttp's lenient_header_value_relaxed and
+        // ONLY that -- inbound header values may carry control bytes, while
+        // obs-fold and a duplicate Transfer-Encoding stay rejected (which is the
+        // distinction test-http-header-value-relaxed tests 14/16 draw).
+        else if (o.httpValidation === "relaxed") parser.lenientHeaderValues = true;
         sock._httpParser = parser;
         // node keeps ONE parser per connection and republishes it as
         // `socket.parser`; this translation re-arms a fresh parser per message,
@@ -1531,6 +1660,15 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
           parser.socket = sock;
           parser.incoming = null;
           parser.outgoing = null;
+          // node lib/_http_server.js connectionListenerInternal:
+          // `parser[kOnTimeout] = onParserTimeout.bind(undefined, server, socket)`
+          // — the slot the parser's own read timeout fires into, which gives the
+          // server a chance to claim it via 'timeout' before the socket dies.
+          // Slot 6 is HTTPParser.kOnTimeout; freeParser() nulls it again
+          // (test-http-parser-memory-retention reads it in both states).
+          parser[6] = function onParserTimeout() {
+            if (!srv.emit("timeout", sock)) sock.destroy();
+          };
         }
         let im = null;
         let res = null;
@@ -1593,10 +1731,22 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
             const upAt = incoming.indexOf(im);
             if (upAt !== -1) incoming.splice(upAt, 1);
           }
-          // node removes state.onData here; this translation must too, or the
-          // server's own listener keeps the socket looking "already read" to
-          // parkForConsumer and keeps counting toward listenerCount('data').
+          // node lib/_http_server.js onParserExecuteCommon detaches the WHOLE
+          // server listener set before the handover -- onData, onEnd, onClose,
+          // onDrain, socketOnError and socketOnTimeout -- because the raw socket
+          // now belongs to the 'upgrade'/'connect' consumer and none of those
+          // callbacks may fire on it again. Only onData was being removed, so the
+          // handed-over socket still looked "already read" to parkForConsumer and
+          // still carried the server's close/error/timeout handlers;
+          // test-http-connect asserts the exact residual listener counts
+          // (close/drain/data/error/timeout all 0, and 'end' just the one
+          // Readable's own onReadableStreamEnd).
           sock.removeListener("data", onSockData);
+          sock.removeListener("end", socketOnEnd);
+          sock.removeListener("close", socketOnClose);
+          if (sock._httpOnError) { sock.removeListener("error", sock._httpOnError); sock._httpOnError = null; }
+          sock.removeListener("error", socketOnErrorNoop);
+          sock.removeListener("timeout", socketOnTimeout);
           // node onParserExecuteCommon runs unconsume() + freeParser(), which
           // takes the connection OUT of the server's ConnectionsList: an
           // upgraded socket is no longer the http server's to sweep or to close.
@@ -1663,7 +1813,29 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
             // The connection is free again: restart both timeout clocks.
             sock._httpMsgStart = Date.now();
             sock._httpHeadersDone = false;
-            sock._httpMsgIdle = true;
+            // ...but it is only IDLE if nothing is waiting to be parsed. node
+            // keeps one parser per connection, so a pipelined request whose bytes
+            // arrived while the previous response was still in flight has already
+            // begun (on_message_begin) by the time that response finishes.
+            // Flagging the connection idle here made the sweeper skip it, and an
+            // incomplete pipelined head then sat forever instead of expiring into
+            // a 408 (test-http-server-{headers,request}-timeout-pipelining).
+            const armed = sock._httpParser;
+            const armedPending = (armed && !armed.done && armed.buf)
+              ? (armed.buf.length - armed.off) : 0;
+            sock._httpMsgIdle = (carryBytes() + armedPending) === 0;
+            // ...and the same argument applies to the OTHER half of the sweeper's
+            // guard. `_httpMsgOpen` mirrors llhttp on_message_begin/complete, but
+            // it was only ever latched from the socket 'data' handler. Pipelined
+            // bytes that arrived with the PREVIOUS request produce no further
+            // 'data' event, so on_message_complete cleared _httpMsgOpen and
+            // nothing set it again -- leaving `_httpMsgBegun && !_httpMsgOpen`,
+            // which setupConnectionsTracking's sweeper skips outright. node's
+            // node_http_parser.cc on_message_begin does PushActive the moment
+            // llhttp starts the buffered head, so the connection stays expirable
+            // and an incomplete pipelined head becomes a 408
+            // (test-http-server-{headers,request}-timeout-pipelining).
+            if (!sock._httpMsgIdle) { sock._httpMsgBegun = true; sock._httpMsgOpen = true; }
             // Idle keep-alive connection: arm the advertised keep-alive timeout
             // (plus node's buffer) so it cannot pin the loop forever.
             if (srv.keepAliveTimeout > 0 && typeof sock.setTimeout === "function") {
@@ -1758,11 +1930,32 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
             ? connTokens.indexOf("close") === -1
             : connTokens.indexOf("keep-alive") !== -1;
 
+          // node lib/_http_server.js parserOnIncoming:
+          //   const shouldOptimize = server[kOptimizeEmptyRequests] === true &&
+          //                          !hasBodyHeaders(req.headers);
+          //   if (shouldOptimize) { req._dumpAndCloseReadable(); req._read(); }
+          // hasBodyHeaders is `'content-length' in headers ||
+          // 'transfer-encoding' in headers` -- nothing else, so a bodyless
+          // POST/DELETE is optimized too and a `Content-Length: 0` GET is not
+          // (test-http-server-optimize-empty-requests walks all eight shapes).
+          if (optimizeEmptyRequests &&
+              !("content-length" in im.headers) && !("transfer-encoding" in im.headers)) {
+            if (typeof im._dumpAndCloseReadable === "function") im._dumpAndCloseReadable();
+            if (typeof im._read === "function") im._read();
+          }
+
           res = new ResponseClass(im, {
             highWaterMark: sock.writableHighWaterMark,
             rejectNonStandardBodyWrites: srv.rejectNonStandardBodyWrites,
           });
           if (kLenientHeaders && srvLenientHeaders) res[kLenientHeaders] = true;
+          // node lib/_http_server.js parserOnIncoming:
+          // `res[kUniqueHeaders] = server[kUniqueHeaders]`. The client side of
+          // `uniqueHeaders` was wired (ClientRequest reads options.uniqueHeaders)
+          // but the server's never reached its responses, so a listed header sent
+          // as an array went out as repeated lines instead of one '; '-joined line
+          // (test-http-multiple-headers).
+          if (kUniqueHeadersSym && srvUniqueHeaders) res[kUniqueHeadersSym] = srvUniqueHeaders;
           res._keepAliveTimeout = srv.keepAliveTimeout;
           res._maxRequestsPerSocket = srv.maxRequestsPerSocket;
           res.shouldKeepAlive = keepAlive;
@@ -1898,7 +2091,8 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
         else { carry.push(b.slice()); if (!p) rearm(); }
       };
       sock.on("data", onSockData);
-      sock.on("end", () => { eofSeen = true; const p = sock._httpParser; if (p && !p.done) p.eof(); });
+      const socketOnEnd = () => { eofSeen = true; const p = sock._httpParser; if (p && !p.done) p.eof(); };
+      sock.on("end", socketOnEnd);
       startParser();
       pumpCarry();
     });
@@ -2184,6 +2378,14 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
       }
 
       const parser = new HttpParser(true);
+      // `--max-http-header-size` (16 KiB) is the SERVER/request-side knob; bun
+      // says so in as many words and refuses to reuse it here because it
+      // rejects legitimate responses with large Location/Set-Cookie headers.
+      // The fetch client bounds its response head with a generous fixed cap
+      // instead. node:http's own client keeps the node knob (it is asserted by
+      // test-http-max-header-size.js).
+      // PORT-SOURCE: compat/bun/src/http/lib.rs MAX_RESPONSE_HEADER_BUFFER (:3728)
+      parser.maxHeaderSize = 1024 * 1024;
       parser.reqMethod = method;
       const chunks = [];
       const bodyPr = Promise.withResolvers();

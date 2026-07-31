@@ -17,10 +17,18 @@ standard    = "c++26"
 # handshake/read/write surface used here.
 
 
-# Vendored OpenSSL 3.1.5 static backend (no host libssl). See
-# mcpp/pkgs/m/mbun.openssl.lua for the sourcing rationale.
-[dependencies.mbun]
-openssl = "3.1.5+mbun.3"
+# OpenSSL comes from the OFFICIAL registry package compat.openssl, which builds a
+# fully static libcrypto.a + libssl.a FROM SOURCE on both linux and macosx. It
+# replaces the local-index mbun.openssl, whose own header excluded this option on
+# the premise that "mcpp 注册表有 compat.mbedtls，但无 compat.openssl" -- true when
+# that file was written, false now: the registry has since gained it. mbun.openssl
+# wrapped the xim:openssl PREBUILT, which exists only for linux, and that is what
+# stopped the macOS CI probe.
+#
+# This is a 3.1.5 -> 3.5.1 bump, not a drop-in swap, so it is gated on the crypto
+# and TLS corpora rather than assumed compatible.
+[dependencies.compat]
+openssl = "3.5.1"
 
 [indices]
 mbun = { path = "../../mcpp" }

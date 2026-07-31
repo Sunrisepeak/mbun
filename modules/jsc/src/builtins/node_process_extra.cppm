@@ -39,6 +39,9 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
       // Kept in the global symbol registry because the Node-facing `events`
       // and stream partitions are installed in separate builtin payloads.
       const kResistStopPropagation = Symbol.for("nodejs.event_target.resist_stop_propagation");
+      // WHATWG "in passive listener flag": set while a listener registered with
+      // { passive: true } runs, and checked by preventDefault().
+      const kInPassiveListener = Symbol("kInPassiveListener");
       const isTrustedGet = function isTrusted() { return false; };
       class Event {
         get [Symbol.toStringTag]() { return "Event"; }
@@ -68,7 +71,7 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
           this.timeStamp = (G.performance && G.performance.now && G.performance.now()) || 0;
           this[kStopImmediate] = false;
         }
-        preventDefault() { if (this.cancelable) { this.defaultPrevented = true; this.returnValue = false; } }
+        preventDefault() { if (this.cancelable && !this[kInPassiveListener]) { this.defaultPrevented = true; this.returnValue = false; } }
         stopPropagation() { this.cancelBubble = true; }
         stopImmediatePropagation() { this.cancelBubble = true; this[kStopImmediate] = true; }
         composedPath() { return this.currentTarget ? [this.currentTarget] : []; }
@@ -97,22 +100,31 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
         addEventListener(type, callback, options) {
           if (arguments.length < 2) throw new TypeError("2 arguments required");
           if (!this || !this[kListeners]) throw new TypeError("Illegal invocation");  // WebIDL brand check
-          if (callback === null || callback === undefined) return;
           if (typeof callback !== "function" && typeof callback !== "object") throw new TypeError("callback must be an object or function");
           type = String(type);
+          // WHATWG "add an event listener": the options dictionary is converted
+          // (i.e. its getters run) BEFORE the null-callback early return. Bailing
+          // out first meant `options.passive` was never read, which is exactly how
+          // feature detection asks whether passive listeners are supported
+          // (WPT AddEventListenerOptions-passive.html).
           if (typeof options === "boolean") options = { capture: options };
           options = options || {};
           const capture = !!options.capture;
+          const once = !!options.once;
+          const passive = !!options.passive;
+          const resistStopPropagation = !!options[kResistStopPropagation];
+          const signal = options.signal;
+          if (callback === null || callback === undefined) return;
           let list = this[kListeners].get(type);
           if (!list) { list = []; this[kListeners].set(type, list); }
           for (const l of list) if (l.callback === callback && l.capture === capture) return;
-          const rec = { callback, capture, once: !!options.once, passive: !!options.passive, resistStopPropagation: !!options[kResistStopPropagation], removed: false };
-          if (options.signal !== undefined) {
+          const rec = { callback, capture, once, passive, resistStopPropagation, removed: false };
+          if (signal !== undefined) {
             // WebIDL: `signal` is an AbortSignal, so anything else (including
             // null and a bare object with the right shape) is a TypeError.
-            if (!(G.AbortSignal && options.signal instanceof G.AbortSignal))
+            if (!(G.AbortSignal && signal instanceof G.AbortSignal))
               throw new TypeError("The 'signal' option must be an AbortSignal");
-            if (options.signal.aborted) return;
+            if (signal.aborted) return;
             const target = this;
             // The abort algorithm is owned by the *listener*: whichever path
             // removes the listener (removeEventListener, `once` firing, abort
@@ -120,9 +132,9 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
             // signal accumulates dead closures forever
             // (WebCore RegisteredEventListener::m_abortAlgorithm).
             const onAbort = () => target.removeEventListener(type, callback, { capture });
-            rec.signal = options.signal;
+            rec.signal = signal;
             rec.onAbort = onAbort;
-            options.signal.addEventListener("abort", onAbort, { once: true, [kResistStopPropagation]: true });
+            signal.addEventListener("abort", onAbort, { once: true, [kResistStopPropagation]: true });
           }
           list.push(rec);
         }
@@ -163,11 +175,14 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
               if (event[kStopImmediate] && !rec.resistStopPropagation) continue;
               if (rec.removed) continue;
               if (rec.once) this.removeEventListener(event.type, rec.callback, { capture: rec.capture });
+              if (rec.passive) event[kInPassiveListener] = true;
               try {
                 if (typeof rec.callback === "function") rec.callback.call(this, event);
                 else if (rec.callback && typeof rec.callback.handleEvent === "function") rec.callback.handleEvent(event);
               } catch (err) {
                 if (G.reportError) G.reportError(err); else if (G.console && G.console.error) G.console.error(err);
+              } finally {
+                if (rec.passive) event[kInPassiveListener] = false;
               }
             }
           }
@@ -196,6 +211,16 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
         const _g = new EventTarget();
         for (const m of ["addEventListener", "removeEventListener", "dispatchEvent"])
           if (typeof G[m] !== "function") G[m] = EventTarget.prototype[m].bind(_g);
+        // The bound methods hide WHICH target they act on, so nothing could ask
+        // whether the global has a listener for a given type. A worker needs
+        // exactly that: node_worker keeps the IPC channel pinning the event loop
+        // only while some sink is registered, and `self.onmessage = …` is a sink
+        // that lives here rather than on parentPort. Non-enumerable, and read
+        // through the `listeners(type)` introspection hook above.
+        try {
+          Object.defineProperty(G, "__mbunGlobalEventTarget",
+                                { value: _g, enumerable: false, configurable: true });
+        } catch (e) {}
       }
     }
   } catch (e) {}
@@ -404,10 +429,169 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
     if (typeof proc.constrainedMemory !== "function")
       proc.constrainedMemory = function constrainedMemory() { return 0; };
 
+    // node internal/bootstrap/node.js: the pre-streams2 accessor for stdin. It
+    // is not deprecated-with-a-warning, just old, and node's own test fixtures
+    // still use it (test/fixtures/echo.js, which several child_process files
+    // spawn as the echo peer).
+    if (typeof proc.openStdin !== "function") {
+      proc.openStdin = function openStdin() {
+        const stdin = proc.stdin;
+        if (stdin && typeof stdin.resume === "function") stdin.resume();
+        return stdin;
+      };
+    }
+
+    // Fallback only. The real seam is installed with process.kill itself (see
+    // runtime/bindings_install.inc): node's kill() CALLS _kill, so a _kill that
+    // forwards to kill has the dependency backwards and defeats the monkeypatch
+    // its own corpus relies on. This stays for a host without the native
+    // killErrno binding, where an inverted seam still beats no _kill at all.
     if (typeof proc._kill !== "function" && typeof proc.kill === "function") {
       const realKill = proc.kill.bind(proc);
       proc._kill = function _kill(pid, sig) { return realKill(pid, sig); };
     }
+
+    // ---- process.execve (node lib/internal/process/per_thread.js execve) -----
+    // Replace this process image. The syscall half is the native
+    // __mbunProcNative.execve (runtime/process_extended.inc), which owns the
+    // ChildProcess permission gate and the descriptor CLOEXEC pass; everything
+    // node does in JS is done here, in node's order, because the corpus asserts
+    // each message verbatim (test-process-execve-validation).
+    //
+    // node also emits an ExperimentalWarning on every call. Deliberately not
+    // emitted: it is stderr noise on a path whose whole point is that the image
+    // is about to be replaced, and no corpus file asserts it.
+    //
+    // node_worker.cppm overwrites this unconditionally on a worker thread, which
+    // is where ERR_WORKER_UNSUPPORTED_OPERATION comes from.
+    if (typeof proc.execve !== "function") {
+      const PROCN = G.__mbunProcNative;
+      if (PROCN && typeof PROCN.execve === "function") {
+        const argValueError = (name, value, reason) => {
+          if (NE) return NE.ERR_INVALID_ARG_VALUE(name, value, reason);
+          const e = new TypeError(`The argument '${name}' ${reason}. Received ${String(value)}`);
+          e.code = "ERR_INVALID_ARG_VALUE";
+          return e;
+        };
+        // Provide the default so execve.length reports node's 1, as node's own
+        // `function execve(execPath, args = [], env = process.env)` does.
+        proc.execve = function execve(execPath, args, env) {
+          if (args === undefined) args = [];
+          if (env === undefined) env = proc.env;
+          if (proc.platform === "win32" || proc.platform === "os400") {
+            const e = new TypeError("process.execve is unavailable on this platform");
+            e.code = "ERR_FEATURE_UNAVAILABLE_ON_PLATFORM";
+            throw e;
+          }
+          if (typeof execPath !== "string") throw errInvalidArgType("execPath", "string", execPath);
+          if (!Array.isArray(args)) throw errInvalidArgType("args", "Array", args);
+          for (let i = 0; i < args.length; i++) {
+            const arg = args[i];
+            if (typeof arg !== "string" || arg.indexOf("\u0000") !== -1) {
+              throw argValueError(`args[${i}]`, arg, "must be a string without null bytes");
+            }
+          }
+          if (env === null || Array.isArray(env) || typeof env !== "object") {
+            throw errInvalidArgType("env", "Object", env);
+          }
+          const envArray = [];
+          for (const key of Object.keys(env)) {
+            const value = env[key];
+            if (typeof key !== "string" || typeof value !== "string" ||
+                key.indexOf("\u0000") !== -1 || value.indexOf("\u0000") !== -1) {
+              throw argValueError("env", env,
+                "must be an object with string keys and values without null bytes");
+            }
+            envArray.push(key + "=" + value);
+          }
+          return PROCN.execve(execPath, args, envArray);
+        };
+      }
+    }
+
+    // ---- process.loadEnvFile -------------------------------------------------
+    // PORT-SOURCE: compat/node/lib/internal/process/per_thread.js loadEnvFile
+    // (the JS half) + node src/node_dotenv.cc Dotenv::SetEnvironment (the
+    // assignment rule).
+    //
+    // The surface was entirely absent: `typeof process.loadEnvFile ===
+    // "undefined"`, even though the dotenv PARSER already exists natively
+    // (runtime/node_util.inc dotenv_parse_cb, published as util.parseEnv and
+    // already used for --env-file). So this is pure wiring, not new logic --
+    // per the architecture rule the parse stays in C++ and this layer only
+    // reads the file and applies node's assignment semantics.
+    //
+    // Two details the corpus pins (test-process-load-env-file):
+    //   * the no-argument form reads the RELATIVE path ".env", because the
+    //     ENOENT it raises must carry `path: '.env'`, not an absolute path.
+    //   * an existing process.env key WINS over the file. node's SetEnvironment
+    //     only sets keys with no existing value, which is why the fixture pair
+    //     (--env-file=valid.env with BASIC=basic, then loadEnvFile on
+    //     basic-valid.env with BASIC=overriden) must still read "basic".
+    // Reading through fs.readFileSync rather than a fresh native open is also
+    // what puts this call behind the permission model for free: the C++ fs read
+    // gate raises ERR_ACCESS_DENIED/FileSystemRead under --permission.
+    if (typeof proc.loadEnvFile !== "function") {
+      // The default parameter is node's, and is load-bearing: it makes
+      // loadEnvFile.length === 0.
+      const loadEnvFile = function loadEnvFile(path = undefined) {
+        const fs = G.require ? G.require("node:fs") : null;
+        const util = G.require ? G.require("node:util") : null;
+        if (!fs || !util || typeof util.parseEnv !== "function") return;
+        const src = fs.readFileSync(path != null ? path : ".env", "utf8");
+        const parsed = util.parseEnv(src);
+        if (!parsed) return;
+        for (const key of Object.keys(parsed)) {
+          if (proc.env[key] === undefined) proc.env[key] = parsed[key];
+        }
+      };
+      try {
+        Object.defineProperty(proc, "loadEnvFile", {
+          value: loadEnvFile, writable: true, enumerable: true, configurable: true,
+        });
+      } catch (e) {}
+    }
+
+    // ---- process's prototype chain (node internal/bootstrap/node.js) --------
+    // node's `process` is an INSTANCE: its constructor is a function whose
+    // prototype inherits EventEmitter.prototype, and that prototype carries a
+    // `constructor` own property (writable, non-enumerable, configurable).
+    // mbun's process was a plain object whose prototype was Object.prototype, so
+    // `process.constructor` was Object and `Object.getPrototypeOf(process)
+    // instanceof EventEmitter` was false (test-process-prototype).
+    //
+    // Shape only: the emitter METHODS stay own properties of process (they are a
+    // self-contained implementation installed during prelude, before the module
+    // table exists — see runtime/bindings_install.inc), so nothing here changes
+    // which function any process.on/emit call reaches.
+    try {
+      const EE = G.__mbunNativeModules && (G.__mbunNativeModules["events"] || G.__mbunNativeModules["node:events"]);
+      const EEProto = EE && (EE.prototype || (EE.EventEmitter && EE.EventEmitter.prototype));
+      if (EEProto && Object.getPrototypeOf(proc) === Object.prototype) {
+        // Called as a plain function (not `new`), it adopts and RETURNS the
+        // receiver. bun's js/node/process/call-constructor.test.js does
+        //   Object.getPrototypeOf(process.constructor.call({ ...process }))
+        //     === Object.getPrototypeOf(process)
+        // and that file passed before this block existed only by accident: while
+        // process was a plain object its constructor was `Object`, and
+        // `Object.call(x)` returns a fresh {} whose prototype happened to match
+        // process's Object.prototype. A constructor returning undefined breaks it.
+        // Adopting the receiver satisfies bun without changing node's shape
+        // requirement, so both corpora hold.
+        const ProcessCtor = function () {
+          if (this === undefined || this === G) return undefined;
+          if (Object.getPrototypeOf(this) !== ProcessCtor.prototype) {
+            try { Object.setPrototypeOf(this, ProcessCtor.prototype); } catch (e) {}
+          }
+          return this;
+        };
+        Object.defineProperty(ProcessCtor, "name", { value: "process", configurable: true });
+        ProcessCtor.prototype = Object.create(EEProto, {
+          constructor: { value: ProcessCtor, writable: true, enumerable: false, configurable: true },
+        });
+        Object.setPrototypeOf(proc, ProcessCtor.prototype);
+      }
+    } catch (e) {}
 
     if (!Array.isArray(proc.execArgv)) proc.execArgv = [];
 
@@ -514,14 +698,40 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
           get() { return rawGet(); },
           set(code) {
             if (code !== null && code !== undefined) {
-              if (typeof code !== "number") throw errInvalidArgType("code", "number", code);
-              if (!Number.isInteger(code)) throw errOutOfRange("code", "an integer", code);
+              // node internal/bootstrap/node.js: a NUMERIC string is coerced
+              // before validateInteger, so `process.exitCode = '2'` (and
+              // `process.exit('2')`, which routes through this setter) settle 2.
+              // Only a string that does NOT parse as a number keeps its type and
+              // is reported as ERR_INVALID_ARG_TYPE. '' is deliberately excluded:
+              // Number('') is 0, and node rejects it.
+              let value = code;
+              if (typeof code === "string" && code !== "") {
+                const asNum = Number(code);
+                if (!Number.isNaN(asNum)) value = asNum;
+              }
+              if (typeof value !== "number") throw errInvalidArgType("code", "number", value);
+              if (!Number.isInteger(value)) throw errOutOfRange("code", "an integer", value);
+              rawSet(value);
+              return;
             }
             rawSet(code);
           },
         });
       }
     } catch (e) {}
+
+    // node internal/util.js isPendingDeprecation(): a documentation-only
+    // deprecation stays SILENT unless --pending-deprecation is on (either as an
+    // exec argv or via NODE_PENDING_DEPRECATION), and --no-deprecation still
+    // wins over it. Never invert this: the default is silence.
+    const isPendingDeprecation = () => {
+      const argv = proc.execArgv;
+      if (Array.isArray(argv) && argv.includes("--no-deprecation")) return false;
+      if (proc.noDeprecation) return false;
+      if (Array.isArray(argv) && argv.includes("--pending-deprecation")) return true;
+      const env = proc.env;
+      return !!(env && env.NODE_PENDING_DEPRECATION && String(env.NODE_PENDING_DEPRECATION)[0] === "1");
+    };
 
     // ---- process.binding allow/deny list (bun's ProcessBindingMap) ---------
     {
@@ -571,21 +781,9 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
               crypto: (cr && cr.constants) || {},
               zlib: (zl && zl.constants) || {},
               // node's trace-event phase codes (the ASCII letter of each phase).
-              trace: {
-                TRACE_EVENT_PHASE_BEGIN: 66, TRACE_EVENT_PHASE_END: 69,
-                TRACE_EVENT_PHASE_COMPLETE: 88, TRACE_EVENT_PHASE_INSTANT: 73,
-                TRACE_EVENT_PHASE_ASYNC_BEGIN: 83, TRACE_EVENT_PHASE_ASYNC_STEP_INTO: 84,
-                TRACE_EVENT_PHASE_ASYNC_STEP_PAST: 112, TRACE_EVENT_PHASE_ASYNC_END: 70,
-                TRACE_EVENT_PHASE_NESTABLE_ASYNC_BEGIN: 98, TRACE_EVENT_PHASE_NESTABLE_ASYNC_END: 101,
-                TRACE_EVENT_PHASE_NESTABLE_ASYNC_INSTANT: 110, TRACE_EVENT_PHASE_FLOW_BEGIN: 115,
-                TRACE_EVENT_PHASE_FLOW_STEP: 116, TRACE_EVENT_PHASE_FLOW_END: 102,
-                TRACE_EVENT_PHASE_METADATA: 77, TRACE_EVENT_PHASE_COUNTER: 67,
-                TRACE_EVENT_PHASE_SAMPLE: 80, TRACE_EVENT_PHASE_CREATE_OBJECT: 78,
-                TRACE_EVENT_PHASE_SNAPSHOT_OBJECT: 79, TRACE_EVENT_PHASE_DELETE_OBJECT: 68,
-                TRACE_EVENT_PHASE_MEMORY_DUMP: 118, TRACE_EVENT_PHASE_MARK: 82,
-                TRACE_EVENT_PHASE_CLOCK_SYNC: 99, TRACE_EVENT_PHASE_ENTER_CONTEXT: 40,
-                TRACE_EVENT_PHASE_LEAVE_CONTEXT: 41, TRACE_EVENT_PHASE_LINK_IDS: 61,
-              },
+              // Owned by the trace_events partition below so that this shim and
+              // internalBinding("constants") cannot disagree about a phase.
+              trace: (G.__mbunTraceEvents && G.__mbunTraceEvents.phases) || {},
             };
           }
           else if (name === "uv") {
@@ -667,6 +865,39 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
         }
         return (cache[name] = value);
       };
+      // node initializeDeprecations() (pre_execution.js) and node_uv.cc gate
+      // DEP0111/DEP0119 on --pending-deprecation ONLY: process.binding() is
+      // silent by default and must stay that way. Each fires once per process.
+      if (isPendingDeprecation()) {
+        const rawBinding = proc.binding;
+        let bindingWarned = false;
+        proc.binding = function binding(name) {
+          if (!bindingWarned) {
+            bindingWarned = true;
+            proc.emitWarning("process.binding() is deprecated. Please use public APIs instead.",
+                             "DeprecationWarning", "DEP0111");
+          }
+          const mod = rawBinding.call(this, name);
+          // node uv.cc ErrName(): the DEP0119 warning is attached to errname
+          // itself, so it only fires when errname is actually CALLED.
+          if (name === "uv" && mod && typeof mod.errname === "function" && !mod.__mbunErrnameDeprecated) {
+            const rawErrname = mod.errname;
+            let errnameWarned = false;
+            mod.errname = function errname(err) {
+              if (!errnameWarned) {
+                errnameWarned = true;
+                proc.emitWarning(
+                  "Directly calling process.binding('uv').errname(<val>) is being deprecated. " +
+                  "Please make sure to use util.getSystemErrorName() instead.",
+                  "DeprecationWarning", "DEP0119");
+              }
+              return rawErrname.call(this, err);
+            };
+            try { Object.defineProperty(mod, "__mbunErrnameDeprecated", { value: true }); } catch (e) {}
+          }
+          return mod;
+        };
+      }
     }
 
     // ---- process.dlopen ------------------------------------------------------
@@ -690,6 +921,11 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
     if (typeof proc.setgroups !== "function") {
       proc.setgroups = function setgroups(groups) {
         if (!Array.isArray(groups)) throw errInvalidArgType("groups", "Array", groups);
+        // A Proxy passes IsArray but is not a JSArray, and bun's setgroups needs a
+        // real one — it rejects the Proxy with a TypeError rather than reading
+        // through the traps (regression/issue/isArray-proxy-crash). Reaching the
+        // syscall instead surfaced EPERM, which is not a TypeError.
+        if (G.__mbunProxyRegistry && G.__mbunProxyRegistry.has(groups)) throw errInvalidArgType("groups", "Array", groups);
         for (let i = 0; i < groups.length; i++) {
           const g = groups[i];             // accessor getters run here and may throw
           if (typeof g !== "number" || !Number.isInteger(g) || g < 0) {
@@ -767,6 +1003,27 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
       };
       let traceHelperShown = false;
       let disableSet = null;
+      // node reads its warning options from BOTH the command line and
+      // NODE_OPTIONS (src/node_options.cc parses the env var into the same option
+      // store). mbun consulted execArgv only, so `--disable-warning=DEP2` in
+      // NODE_OPTIONS was ignored, and `--no-deprecation` was wired to NOTHING at
+      // all — only the process.noDeprecation *property* was ever consulted
+      // (test-process-warnings covers both).
+      const envOptionTokens = () => {
+        const opts = proc.env && proc.env.NODE_OPTIONS;
+        if (!opts) return [];
+        return String(opts).split(/\s+/).filter((t) => t.length > 0);
+      };
+      let noDeprecationFlag;
+      const noDeprecationOn = () => {
+        if (proc.noDeprecation) return true;
+        if (noDeprecationFlag === undefined) {
+          const argv = proc.execArgv || [];
+          noDeprecationFlag = argv.includes("--no-deprecation") ||
+                              envOptionTokens().includes("--no-deprecation");
+        }
+        return noDeprecationFlag;
+      };
       // V8's Error.stack opens with "Name: message" and renders frames as
       // "    at fn (file:line:col)"; JSC's carries only frames, in its own
       // `fn@file:line:col` syntax. `--trace-warnings` output is read by the
@@ -775,8 +1032,28 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
       const tracedStack = (warning) => {
         const head = (warning.name || "Error") +
                      (warning.message ? ": " + warning.message : "");
+        const lines = String(warning.stack).split("\n");
+        // A warning built by createWarning() below already carries a V8-shaped
+        // stack (Error.captureStackTrace re-renders the frames and prepends
+        // "Name: message"), so it must be passed through rather than parsed as
+        // JSC "fn@loc" — otherwise every line would gain a second "at ".
+        // Recognised by: a head line with no '@' followed only by "at " frames.
+        if (lines.length > 1 && lines[0].indexOf("@") < 0 &&
+            lines.slice(1).every((l) => !l.trim() || l.trim().startsWith("at "))) {
+          const kept = [];
+          for (const raw of lines.slice(1)) {
+            const line = raw.trim();
+            if (!line) continue;
+            const body = line.slice(3);
+            // mbun's CallSite renders a frame with no function name as the bare
+            // location; V8 names the top-level program frame Object.<anonymous>,
+            // which is the shape the corpus greps for (test-worker-execargv).
+            kept.push("    at " + (body.indexOf("(") < 0 ? "Object.<anonymous> (" + body + ")" : body));
+          }
+          return kept.length ? head + "\n" + kept.join("\n") : head;
+        }
         const frames = [];
-        for (const raw of String(warning.stack).split("\n")) {
+        for (const raw of lines) {
           const line = raw.trim();
           if (!line) continue;
           // Last '@': a function name cannot hold one, a file:// URL can.
@@ -800,8 +1077,7 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
         if (hasFlag("--no-warnings")) return;
         if (disableSet === null) {
           disableSet = new Set();
-          const argv = (proc.execArgv || []);
-          for (const a of argv)
+          for (const a of (proc.execArgv || []).concat(envOptionTokens()))
             if (typeof a === "string" && a.startsWith("--disable-warning="))
               disableSet.add(a.slice(18));
         }
@@ -809,7 +1085,7 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
                         (warning.name && disableSet.has(warning.name)))) return;
         if (!(warning instanceof Error)) return;
         const isDeprecation = warning.name === "DeprecationWarning";
-        if (isDeprecation && proc.noDeprecation) return;
+        if (isDeprecation && noDeprecationOn()) return;
         // node sets process.traceProcessWarnings / traceDeprecation from the
         // CLI in per_thread.js; mbun's process object carries neither, so the
         // flags themselves are the source of truth and `--trace-warnings` was
@@ -846,10 +1122,16 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
         e.name = String(type || "Warning");
         if (code !== undefined) e.code = code;
         if (detail !== undefined) e.detail = detail;
+        // node warning.js: ErrorCaptureStackTrace(warning, ctor || emitWarning).
+        // Without it the stack is JSC's raw one, which (a) opens with the
+        // createWarning/emitWarning plumbing frames node deliberately hides and
+        // (b) carries no "Name: message" head, so `assert.match(w.stack, /msg/)`
+        // — the corpus's usual way of inspecting a warning — cannot match.
+        try { Error.captureStackTrace(e, ctor || proc.emitWarning); } catch (err) {}
         return e;
       };
       proc.emitWarning = function emitWarning(warning, type, code, ctor) {
-        if (proc.noDeprecation && type === "DeprecationWarning") return;
+        if (noDeprecationOn() && type === "DeprecationWarning") return;
         let detail;
         if (type !== null && typeof type === "object" && !Array.isArray(type)) {
           ctor = type.ctor;
@@ -865,7 +1147,7 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
         if (typeof warning === "string") warning = createWarning(warning, type, code, ctor, detail);
         else if (!(warning instanceof Error)) throw errInvalidArgType("warning", ["Error", "string"], warning);
         if (warning.name === "DeprecationWarning") {
-          if (proc.noDeprecation) return;
+          if (noDeprecationOn()) return;
           if (proc.throwDeprecation) {
             // Deferred, so warnings emitted earlier in this tick still print —
             // and so the emitWarning CALL does not throw synchronously.
@@ -946,6 +1228,27 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
         let sawCategories = false;
         let sawTraceFlag = false;
         let initialTitle;
+
+        // node src/tracing/trace_event_common.h: every phase is the ASCII code
+        // of the Chrome-trace `ph` letter. internalBinding("constants").trace
+        // and process.binding("constants").trace both publish this table, and
+        // internalBinding("trace_events").trace turns the code back into that
+        // letter -- so all three have to come from one place.
+        const phases = {
+          TRACE_EVENT_PHASE_BEGIN: 66, TRACE_EVENT_PHASE_END: 69,
+          TRACE_EVENT_PHASE_COMPLETE: 88, TRACE_EVENT_PHASE_INSTANT: 73,
+          TRACE_EVENT_PHASE_ASYNC_BEGIN: 83, TRACE_EVENT_PHASE_ASYNC_STEP_INTO: 84,
+          TRACE_EVENT_PHASE_ASYNC_STEP_PAST: 112, TRACE_EVENT_PHASE_ASYNC_END: 70,
+          TRACE_EVENT_PHASE_NESTABLE_ASYNC_BEGIN: 98, TRACE_EVENT_PHASE_NESTABLE_ASYNC_END: 101,
+          TRACE_EVENT_PHASE_NESTABLE_ASYNC_INSTANT: 110, TRACE_EVENT_PHASE_FLOW_BEGIN: 115,
+          TRACE_EVENT_PHASE_FLOW_STEP: 116, TRACE_EVENT_PHASE_FLOW_END: 102,
+          TRACE_EVENT_PHASE_METADATA: 77, TRACE_EVENT_PHASE_COUNTER: 67,
+          TRACE_EVENT_PHASE_SAMPLE: 80, TRACE_EVENT_PHASE_CREATE_OBJECT: 78,
+          TRACE_EVENT_PHASE_SNAPSHOT_OBJECT: 79, TRACE_EVENT_PHASE_DELETE_OBJECT: 68,
+          TRACE_EVENT_PHASE_MEMORY_DUMP: 118, TRACE_EVENT_PHASE_MARK: 82,
+          TRACE_EVENT_PHASE_CLOCK_SYNC: 99, TRACE_EVENT_PHASE_ENTER_CONTEXT: 40,
+          TRACE_EVENT_PHASE_LEAVE_CONTEXT: 41, TRACE_EVENT_PHASE_LINK_IDS: 61,
+        };
 
         const flagValue = (name) => {
           for (let i = 0; i < argv.length; i++) {
@@ -1086,6 +1389,7 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
           } catch (e) {}
         };
         return {
+          phases,
           createTracing, getEnabledCategories, getCategoryEnabledBuffer: categoryBuffer,
           isTraceCategoryEnabled: enabled,
           enableCategories: (categories) => changeCategories(categories, 1),
@@ -1191,8 +1495,14 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
       "--inspect-wait", "--inspect", "--cpu-prof-dir", "--cpu-prof-interval", "--cpu-prof-name",
       "--cpu-prof", "--heap-prof-dir", "--heap-prof-interval", "--heap-prof-name", "--heap-prof",
     ];
+      // Same shape as INSPECTOR_FLAGS: gated on the build feature the test
+      // gates on. test-process-env-allowed-flags-are-documented drops
+      // --icu-data-dir from the documented set unless common.hasIntl, which is
+      // process.config.variables.v8_enable_i18n_support -- true here since
+      // wave 60, so the flag has to be listed or it is "overdocumented".
       const array = proc.features && proc.features.inspector
         ? FLAGS.concat(INSPECTOR_FLAGS) : FLAGS.slice();
+      if (proc.config && proc.config.variables && proc.config.variables.v8_enable_i18n_support) array.push("--icu-data-dir");
       const bare = array.map((f) => f.replace(/^--?/, ""));
       // Kept OUT of the instance: the object is frozen (and class bodies are
       // strict), so caching on `this` would throw on first use.
@@ -1236,6 +1546,143 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
         proc[name] = fn;
       }
     }
+    // ---- libuv handle / request tracking -----------------------------------
+    // node's process._getActiveHandles / _getActiveRequests /
+    // getActiveResourcesInfo report what is currently holding the event loop
+    // open. mbun had all three as []-returning stubs, so a script asking what
+    // keeps it alive saw an idle process even with eight live sockets
+    // (test-process-getactivehandles, -getactiverequests,
+    // -getactiveresources-track-active-handles, -track-active-requests).
+    //
+    // The registry lives on the global rather than in this partition's closure
+    // because the PRODUCER is elsewhere: node:net owns the socket/server handles
+    // (js_net.cppm) and node:timers owns the Timeout/Immediate half — the latter
+    // installs the getActiveResourcesInfo that aggregates both
+    // (builtins/node_timers.cppm).
+    //
+    // A PROVIDER list, not an add/remove pair, because js_net already maintains
+    // the live-handle set this needs (`__mbunNet.items`, added on adopt/listen and
+    // dropped on destroy/close). Reading it is a pure observation of state net
+    // already keeps correct; re-registering the same lifecycle at eight call
+    // sites would be a second copy of it, free to drift.
+    //
+    // Entries are [object, node-wrap-type-name]: _getActiveHandles returns the
+    // objects (the corpus does `handles.includes(client)` with a net.Socket) while
+    // getActiveResourcesInfo returns the type names.
+    {
+      const providers = [];
+      G.__mbunHandleTrack = {
+        addProvider(fn) { if (typeof fn === "function") providers.push(fn); },
+        entries() {
+          const out = [];
+          for (const fn of providers) {
+            let got;
+            try { got = fn(); } catch (e) { continue; }
+            if (got) for (const entry of got) out.push(entry);
+          }
+          return out;
+        },
+        handles() { return G.__mbunHandleTrack.entries().map((e) => e[0]); },
+        types() { return G.__mbunHandleTrack.entries().map((e) => e[1]); },
+      };
+      const getActiveHandles = function _getActiveHandles() { return G.__mbunHandleTrack.handles(); };
+      Object.defineProperty(getActiveHandles, "name", { value: "_getActiveHandles" });
+      proc._getActiveHandles = getActiveHandles;
+      // REQUESTS, the other libuv half. node's are short-lived: an fs operation
+      // holds one from submission until its completion is delivered. node:fs
+      // owns that set (builtins/bootstrap.cppm, __mbunFsActiveRequests) because
+      // it is the producer, exactly as node:net owns the handle set above.
+      // Until the fs callbacks were deferred there was no in-flight window for
+      // this to report, so it could only ever have been the []-stub below.
+      const getActiveRequests = function _getActiveRequests() {
+        const out = [];
+        const reqs = G.__mbunFsActiveRequests;
+        if (reqs) for (const r of reqs) out.push(r);
+        return out;
+      };
+      Object.defineProperty(getActiveRequests, "name", { value: "_getActiveRequests" });
+      proc._getActiveRequests = getActiveRequests;
+    }
+    // ---- process.finalization (node internal/process/finalization.js) -------
+    // A 1:1 port of node's createFinalization(): run a callback for an object at
+    // 'exit' / 'beforeExit', but hold the object WEAKLY so a collected object
+    // silently drops its callback instead of resurrecting it. Two mechanisms do
+    // that together, exactly as node stacks them — a WeakRef whose deref() is
+    // checked before the callback runs, and a FinalizationRegistry that prunes
+    // the ref list once the object is gone (test-process-finalization's
+    // gc-not-close.mjs asserts the callback does NOT run after a gc()).
+    //
+    // Registered listeners are added/removed on demand so a process with nothing
+    // registered carries no 'exit'/'beforeExit' listener of ours.
+    if (proc.finalization === undefined && typeof proc.on === "function") {
+      let registry = null;
+      const refs = { __proto__: null, exit: [], beforeExit: [] };
+      const callRefsToFree = (event) => {
+        for (const ref of refs[event]) {
+          const obj = ref.deref();
+          // GC is non-deterministic, so this can legitimately be undefined.
+          if (obj !== undefined) ref.fn(obj, event);
+        }
+        refs[event] = [];
+      };
+      const functions = {
+        __proto__: null,
+        exit: function onExit() { callRefsToFree("exit"); },
+        beforeExit: function onBeforeExit() { callRefsToFree("beforeExit"); },
+      };
+      const install = (event) => {
+        if (refs[event].length > 0) return;
+        proc.on(event, functions[event]);
+      };
+      const uninstall = (event) => {
+        if (refs[event].length > 0) return;
+        proc.removeListener(event, functions[event]);
+        if (refs.exit.length === 0 && refs.beforeExit.length === 0) registry = null;
+      };
+      const clear = (ref) => {
+        for (const event of ["exit", "beforeExit"]) {
+          const index = refs[event].indexOf(ref);
+          refs[event].splice(index, index + 1);
+          uninstall(event);
+        }
+      };
+      const _register = (event, obj, fn) => {
+        install(event);
+        const ref = new G.WeakRef(obj);
+        ref.fn = fn;
+        if (registry === null) registry = new G.FinalizationRegistry(clear);
+        registry.register(obj, ref);
+        refs[event].push(ref);
+      };
+      // node validateObject(obj, 'obj', kValidateObjectAllowFunction).
+      const validateTarget = (obj) => {
+        if (obj === null || Array.isArray(obj) ||
+            (typeof obj !== "object" && typeof obj !== "function")) {
+          throw errInvalidArgType("obj", "Object", obj);
+        }
+      };
+      const finalization = {
+        register(obj, fn) { validateTarget(obj); _register("exit", obj, fn); },
+        registerBeforeExit(obj, fn) { validateTarget(obj); _register("beforeExit", obj, fn); },
+        unregister(obj) {
+          if (registry === null) return;
+          registry.unregister(obj);
+          for (const event of ["exit", "beforeExit"]) {
+            refs[event] = refs[event].filter((ref) => {
+              const o = ref.deref();
+              return o && o !== obj;
+            });
+            uninstall(event);
+          }
+        },
+      };
+      try {
+        Object.defineProperty(proc, "finalization", {
+          value: finalization, writable: true, enumerable: true, configurable: true,
+        });
+      } catch (e) {}
+    }
+
     const arrayStubs = ["getActiveResourcesInfo", "_getActiveRequests", "_getActiveHandles"];
     for (const name of arrayStubs) {
       if (typeof proc[name] !== "function") {
@@ -1334,9 +1781,15 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
       let captureFn = null;
       proc.setUncaughtExceptionCaptureCallback = function setUncaughtExceptionCaptureCallback(fn) {
         if (fn === null) { captureFn = null; return; }
-        if (typeof fn !== "function") throw errInvalidArgType("fn", "function or null", fn);
+        // node passes the LIST ['Function', 'null'] so its formatter renders
+        // "must be of type function or null"; the flat string "function or null"
+        // was classified as a free-form alternative and lost the "of type"
+        // (test-process-exception-capture-errors compares the message verbatim).
+        if (typeof fn !== "function") throw errInvalidArgType("fn", ["Function", "null"], fn);
         if (captureFn !== null) {
-          const e = new Error("`process.setUncaughtExceptionCaptureCallback()` was called while a capture callback was already active");
+          // internal/errors.js names setupUncaughtExceptionCapture, NOT the public
+          // setUncaughtExceptionCaptureCallback; the corpus matches on it.
+          const e = new Error("`process.setupUncaughtExceptionCapture()` was called while a capture callback was already active");
           e.code = "ERR_UNCAUGHT_EXCEPTION_CAPTURE_ALREADY_SET";
           throw e;
         }
@@ -1385,39 +1838,147 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
     });
 
     // ---- unhandled promise rejection dispatch -------------------------------
-    // The runtime's JSC rejection hook calls this with (reason, promise). node's
-    // escalation order (lib/internal/process/promises.js, mode "throw" — the
-    // default since node 15): deliver to 'unhandledRejection' listeners, else
-    // raise it as an uncaught exception (capture callback, then
-    // 'uncaughtException' listeners). Returning false means nobody claimed it and
-    // the runtime falls back to its own fatal report.
+    // The runtime's JSC rejection hook calls this with (reason, promise). This is
+    // a port of node lib/internal/process/promises.js, INCLUDING its five
+    // --unhandled-rejections modes. Returning false means nobody claimed the
+    // rejection and the runtime falls back to its own fatal report.
     //
-    // The message renders `reason` WITHOUT running user code: node formats it
-    // through v8's ToDetailString, so `{ toString() { ... } }` prints
+    // The mode is read off process.execArgv at the point a rejection is observed
+    // (not snapshotted at startup) for the same reason __mbun_fatal_should_abort
+    // does it: execArgv is populated after the builtins image is evaluated, so a
+    // startup snapshot would silently ignore the command-line flag.
+    //
+    // `noSideEffectsToString` renders `reason` WITHOUT running user code: node
+    // formats it through v8's ToDetailString, so `{ toString() { ... } }` prints
     // "[object Object]" rather than calling the method (js/node/promise/
     // reject-tostring.test.ts asserts exactly that).
+    const noSideEffectsToString = function (reason) {
+      const t = typeof reason;
+      if (t === "string") return reason;
+      if (t === "symbol") return reason.toString();
+      if (t === "bigint") return String(reason);
+      if (reason === null) return "null";
+      if (t === "undefined") return "undefined";
+      if (t === "object" || t === "function") {
+        try { return Object.prototype.toString.call(reason); } catch (e) { return "[object Object]"; }
+      }
+      return String(reason);
+    };
+    // node's isErrorLike: an own `stack` property, NOT `instanceof Error`. A
+    // class that only calls Error.captureStackTrace(this) is rejected as-is and
+    // must NOT be wrapped (test-promise-unhandled-warn asserts the warning stack
+    // still names the function that rejected).
+    const isErrorLike = function (o) {
+      return (typeof o === "object" && o !== null &&
+              Object.prototype.hasOwnProperty.call(o, "stack")) || o instanceof Error;
+    };
+    const unhandledRejectionError = function (reason) {
+      const err = new Error(
+        "This error originated either by throwing inside of an async function " +
+        "without a catch block, or by rejecting a promise which was not handled " +
+        "with .catch(). The promise rejected with the reason \"" +
+        noSideEffectsToString(reason) + "\".");
+      err.code = "ERR_UNHANDLED_REJECTION";
+      // node's UnhandledPromiseRejection sets `name` as an own field, which is
+      // what err.toString() and the corpus's err.name assertions read.
+      Object.defineProperty(err, "name", {
+        value: "UnhandledPromiseRejection", writable: true, configurable: true,
+      });
+      return err;
+    };
+    let lastPromiseId = 0;
+    const emitUnhandledRejectionWarning = function (p, reason, uid) {
+      const warning = new Error(
+        "Unhandled promise rejection. This error originated either by throwing " +
+        "inside of an async function without a catch block, or by rejecting a " +
+        "promise which was not handled with .catch(). To terminate the node " +
+        "process on unhandled promise rejection, use the CLI flag " +
+        "`--unhandled-rejections=strict` (see " +
+        "https://nodejs.org/api/cli.html#cli_unhandled_rejections_mode). " +
+        "(rejection id: " + uid + ")");
+      Object.defineProperty(warning, "name", {
+        value: "UnhandledPromiseRejectionWarning", writable: true, configurable: true,
+      });
+      try {
+        if (isErrorLike(reason)) {
+          warning.stack = reason.stack;
+          p.emitWarning(reason.stack, "UnhandledPromiseRejectionWarning");
+        } else {
+          p.emitWarning(noSideEffectsToString(reason), "UnhandledPromiseRejectionWarning");
+        }
+      } catch (e) {
+        try { p.emitWarning(noSideEffectsToString(reason), "UnhandledPromiseRejectionWarning"); }
+        catch (e2) {}
+      }
+      p.emitWarning(warning);
+    };
+    // getUnhandledRejectionsMode(): the LAST spelling on the command line wins,
+    // matching node's option parser. Both `--flag=value` and `--flag value` are
+    // accepted because execArgv preserves whichever form was typed.
+    const unhandledRejectionsMode = function (p) {
+      let mode = "throw";
+      try {
+        const argv = p.execArgv;
+        if (Array.isArray(argv)) {
+          for (let i = 0; i < argv.length; i++) {
+            const a = argv[i];
+            if (typeof a !== "string") continue;
+            if (a.startsWith("--unhandled-rejections=")) mode = a.slice(23);
+            else if (a === "--unhandled-rejections" && i + 1 < argv.length) mode = argv[i + 1];
+          }
+        }
+      } catch (e) {}
+      return mode;
+    };
+    const raiseUncaught = function (p, err) {
+      const cap = p._mbunUncaughtCaptureCallback;
+      if (typeof cap === "function") { cap(err); return true; }
+      if (p.listenerCount("uncaughtException") > 0) {
+        p.emit("uncaughtException", err, "unhandledRejection");
+        return true;
+      }
+      return false;
+    };
     G.__mbunOnUnhandledRejection = function (reason, promise) {
       try {
         const p = G.process;
         if (!p || typeof p.emit !== "function" || typeof p.listenerCount !== "function") return false;
-        if (p.listenerCount("unhandledRejection") > 0) { p.emit("unhandledRejection", reason, promise); return true; }
-        let err = reason;
-        if (!(reason instanceof Error)) {
-          const t = typeof reason;
-          let s;
-          if (t === "string") s = reason;
-          else if (t === "symbol") s = reason.toString();
-          else if (t === "bigint") s = String(reason);
-          else if (reason === null) s = "null";
-          else if (t === "undefined") s = "undefined";
-          else if (t === "object" || t === "function") { try { s = Object.prototype.toString.call(reason); } catch (e) { s = "[object Object]"; } }
-          else s = String(reason);
-          err = new Error("This error originated either by throwing inside of an async function without a catch block, or by rejecting a promise which was not handled with .catch(). The promise rejected with the reason \"" + s + "\".");
-          err.code = "ERR_UNHANDLED_REJECTION";
+        const uid = ++lastPromiseId;
+        const mode = unhandledRejectionsMode(p);
+        const emitRejection = function () {
+          return p.listenerCount("unhandledRejection") > 0 &&
+                 p.emit("unhandledRejection", reason, promise);
+        };
+        // --unhandled-rejections=none: deliver the event, never warn, never exit.
+        if (mode === "none") { emitRejection(); return true; }
+        // =warn: deliver the event AND always warn (twice: the reason, then the
+        // note explaining where the warning came from).
+        if (mode === "warn") {
+          emitRejection();
+          emitUnhandledRejectionWarning(p, reason, uid);
+          return true;
         }
-        const cap = p._mbunUncaughtCaptureCallback;
-        if (typeof cap === "function") { cap(err); return true; }
-        if (p.listenerCount("uncaughtException") > 0) { p.emit("uncaughtException", err, "unhandledRejection"); return true; }
+        // =warn-with-error-code: warn only when unclaimed, and mark the process
+        // failed without killing it.
+        if (mode === "warn-with-error-code") {
+          if (!emitRejection()) {
+            emitUnhandledRejectionWarning(p, reason, uid);
+            p.exitCode = 1;
+          }
+          return true;
+        }
+        // =strict: raise the uncaught exception FIRST, then still deliver
+        // 'unhandledRejection' (and warn if nothing listened for it).
+        if (mode === "strict") {
+          const err = isErrorLike(reason) ? reason : unhandledRejectionError(reason);
+          if (!raiseUncaught(p, err)) return false;
+          if (!emitRejection()) emitUnhandledRejectionWarning(p, reason, uid);
+          return true;
+        }
+        // =throw (node's default since v15): the event wins; only an unclaimed
+        // rejection escalates to an uncaught exception.
+        if (emitRejection()) return true;
+        return raiseUncaught(p, isErrorLike(reason) ? reason : unhandledRejectionError(reason));
       } catch (e) {}
       return false;
     };
@@ -1571,6 +2132,13 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
   // process.send/'message'/disconnect now that `process` is a full EventEmitter
   // (the plumbing itself lives in the process_web partition).
   try { if (typeof globalThis.__mbunSetupIpcChild === "function") globalThis.__mbunSetupIpcChild(); } catch (e) {}
+  // AFTER the IPC wiring, and only in a worker: node disables the process
+  // operations that are process-global rather than thread-local (chdir, umask,
+  // abort, the setuid family, and the fork() channel). The list is published by
+  // the worker_threads partition, which runs BEFORE this one — installing it
+  // there would have been undone by the process.send that __mbunSetupIpcChild
+  // has only just assigned.
+  try { if (typeof globalThis.__mbunWorkerDisableProcessOps === "function") globalThis.__mbunWorkerDisableProcessOps(); } catch (e) {}
 })();
 )JS";
 
