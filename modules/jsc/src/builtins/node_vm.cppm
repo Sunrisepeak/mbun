@@ -416,7 +416,7 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
 
   const ErrorProtoToString = Error.prototype.toString;
 
-  function decorateVmError(err, code, filename, displayErrors) {
+  function decorateVmError(err, code, filename, displayErrors, lineOffset, columnOffset) {
     if (displayErrors === false) return err;
     if (err === null || typeof err !== "object") return err;
     if (vmDecorated.has(err)) return err;
@@ -432,12 +432,20 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
     const srcLine = `${code}`.split("\n")[line - 1];
     if (typeof srcLine !== "string") return err;
     const col = callSiteColumn(srcLine, typeof err.column === "number" ? err.column : 1);
+    // vm.Script's lineOffset/columnOffset are zero-based source-display
+    // offsets. JSC exposes the unshifted source position, while Node applies
+    // the offsets to the decorated header and first frame.
+    const displayLine = line + (typeof lineOffset === "number" ? lineOffset : 0);
+    const displayColumn = col + (typeof columnOffset === "number" ? columnOffset : 0);
+    const leading = srcLine.match(/^\s*/)[0].length;
     let title;
     try { title = ErrorProtoToString.call(err); } catch (e) { return err; }
     const frames = v8Frames(stack);
     if (frames.length === 0) frames.push("    at <anonymous>");
-    frames[0] = `    at ${filename}:${line}:${col}`;
-    const head = `${filename}:${line}\n${srcLine}\n${" ".repeat(col - 1)}^\n\n`;
+    frames[0] = `    at ${filename}:${displayLine}:${displayColumn}`;
+    // The source excerpt and caret stay relative to the supplied source text;
+    // only the reported filename/line/column frame carries the display offset.
+    const head = `${filename}:${displayLine}\n${srcLine}\n${" ".repeat(leading)}^\n\n`;
     try {
       err.stack = head + title + "\n" + frames.join("\n");
       vmDecorated.add(err);
@@ -730,6 +738,8 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
         validateImportModuleDynamically(options.importModuleDynamically);
 
       this.__filename = filename === undefined ? "evalmachine.<anonymous>" : `${filename}`;
+      this.__lineOffset = lineOffset === undefined ? 0 : lineOffset;
+      this.__columnOffset = columnOffset === undefined ? 0 : columnOffset;
       this.sourceMapURL = parseSourceMapURL(this.__code);
       if (cachedData !== undefined) {
         this.cachedData = cachedData;
@@ -753,7 +763,8 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
         return NVM.runInThis(this.__runCode, this.__filename);
       } catch (err) {
         throw decorateVmError(err, this.__code, this.__filename,
-                              options ? options.displayErrors : undefined);
+                              options ? options.displayErrors : undefined,
+                              this.__lineOffset, this.__columnOffset);
       }
     }
     runInContext(contextifiedObject, options) {
@@ -765,7 +776,8 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
         return evalInContext(rec, this.__runCode, this.__filename);
       } catch (err) {
         throw decorateVmError(err, this.__code, this.__filename,
-                              options ? options.displayErrors : undefined);
+                              options ? options.displayErrors : undefined,
+                              this.__lineOffset, this.__columnOffset);
       }
     }
     runInNewContext(contextObject, options) {
