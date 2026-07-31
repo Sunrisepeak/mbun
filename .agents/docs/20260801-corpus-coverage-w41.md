@@ -172,14 +172,28 @@ target stayed at **1/2**; the bridge was removed and no unverified behavior was
 committed. A future attempt must own the bootstrap assertion/source extraction
 boundary as one slice.
 
+The measured `test-util-callbackify.js` candidate was evaluated and parked
+without a source commit:
+
+- The existing RED was reproduced. A temporary helper probe confirmed that
+  Node's falsy-rejection stack contract needs a `process.processTicksAndRejections`
+  frame, while the C++-owned tick queue exposes host `run`/`runTicks` frames.
+- A narrow temporary stack-frame compatibility experiment moved past that
+  assertion, but the same file then stopped at an independent uncaught-callback
+  fixture count (**9** observed error lines versus **7** expected). That generic
+  nextTick/uncaught stack boundary is broader than callbackify and was not mixed
+  into this lane.
+- The experiment was reverted; the working tree has no callbackify change and no
+  green file is claimed from this evaluation.
+
 ## Next route
 
 1. Keep the native-syntax compatibility gate limited to the two measured
    optimization controls; evaluate additional V8 intrinsics only from their
    own failing corpus evidence.
-2. Evaluate the already measured `test-util-callbackify.js` stack-shape mismatch
-   as the next single-file candidate; keep util format/types/inspect semantics and
-   bootstrap assertion source extraction as separate lanes.
+2. Keep callbackify stack shape parked behind the generic nextTick/uncaught stack
+   boundary; evaluate the already measured `test-util-format.js` constructor-name
+   mismatch as the next single-file candidate.
 3. Keep test-v8 profiler/queryObjects and broad VM wording changes parked until
    ownership is clear.
 

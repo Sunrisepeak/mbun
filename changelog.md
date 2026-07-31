@@ -70,12 +70,16 @@
   `test-whatwg-url-canparse.js` exit 0，绝对 URL 与带 base 的相对 URL smoke 均保持 true；
   `test-process-hrtime.js`、`test-process-hrtime-bigint.js`、`test-util-types.js`、
   `test-runner-snapshot-file-tests.js` 四条 bounded 回归也全绿，未跑全量。
+- `test-util-callbackify.js` 的下一候选评估未提交代码：临时复现确认 falsy rejection
+  需要 `process.processTicksAndRejections` stack frame；窄兼容实验可越过该断言，但随后
+  在 callback throw 的通用 uncaught 路径停在 **9 行 vs 7 行**。这是 generic nextTick/
+  uncaught stack boundary，不与 callbackify 混修；实验已回退，当前没有新增 green。
 - `163a0a3` 将本地敏感信息过滤规则加入 `hagent/agents.md` 及中文同步页；该受保护面
   需要维护者签字，不由 agent 自行合并。PR #36 已同步两轮候选实测和本节点策略。
 
-下一步先处理已量化的 `test-util-callbackify.js` stack-shape 合同；test-runner
-assertion source-position、test-util inspect/format 与 test-v8 profiler/queryObjects
-继续按独立 blocker 管理，不做无证据的跨域扩展。
+下一步先处理已量化的 `test-util-format.js` constructor-name 合同；callbackify
+stack-shape、test-runner assertion source-position、test-util inspect 与 test-v8
+profiler/queryObjects 继续按独立 blocker 管理，不做无证据的跨域扩展。
 
 ## 2026-07-29
 
