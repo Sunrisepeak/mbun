@@ -472,6 +472,21 @@ surface on Linux:
 - 资源保持在约 **44 GiB available memory / 164 MiB swap / 23 GiB free disk**，
   无新构建、无全量 corpus、无临时产物清理。
 
+### W50 spawn-heavy resource profile tooling
+
+- Issue [#37](https://github.com/Sunrisepeak/mbun/issues/37) 记录并脱敏了
+  `spawn-stdin-readable-stream` 的 scope-induced `fork()` 边界；设计记录见
+  `20260801-bounded-resource-profile-design.md`。
+- `1449975` 为 `bun_corpus_runner.py` 增加显式 `--memory-max` /
+  `--tasks-max`，默认仍为 **4G/512**；非默认 profile 强制 `--jobs 1`，summary
+  写入实际 profile，未按文件名自动放宽，也未改 upstream corpus。
+- runner self-test、journal self-test、Python syntax check 均通过。真实
+  `spawn-stdin-readable-stream` 单 lane 使用 `34G/1024` 后为 **1 file green、
+  28/30 pass、0 fail、2 TODO、61 expects**；这是此前默认 profile `27/30`
+  加资源对照后的可复现闭合结果。
+- 本节点无构建、无全量 corpus；高资源 scope 只运行 1 lane，未改变 3–5 lane
+  常规并行策略，资源水位约 **44 GiB available / 164 MiB swap / 23 GiB free disk**。
+
 ## Next route
 
 1. Keep the native-syntax compatibility gate limited to the two measured

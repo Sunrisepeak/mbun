@@ -23,6 +23,11 @@
 - W49 fresh-binary 回归闸门：`events/event-emitter`、`os/os`、
   `timers.promises`、`stream/node-stream-uint8array` 四文件均通过，合计
   **128/128 tests、0 failed、565 expects**；未新增构建、未跑全量。
+- `1449975`（issue #37）为 `bun_corpus_runner.py` 增加显式单 lane resource
+  profile：默认 **4G/512** 不变，非默认 `--memory-max/--tasks-max` 强制
+  `--jobs 1`，并在 summary 记录 profile。真实 stream stdin 文件在
+  `34G/1024` 下为 **28/30 pass、0 fail、2 TODO、61 expects**；self-test 和
+  journal regression 均通过，未构建、未跑全量。
 - `0ddb3f3` 修复 `path.win32.toNamespacedPath` 对裸 namespace root
   (`\\\\?\\foo`) 丢失 Node 要求的尾斜杠；fresh Linux build 后目标文件
   **4/4** 全绿。与 `events/event-emitter` **67/67**、`os/os` **52/52**、
