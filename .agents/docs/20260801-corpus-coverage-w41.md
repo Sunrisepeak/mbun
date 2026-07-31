@@ -333,6 +333,23 @@ The following four-lane Bun native probe kept only two narrow green slices:
   test errors, and mock APIs. It remains parked as a multi-owner test-runner
   boundary rather than a speculative bundle of fixes.
 
+The next single-owner path lane was repaired and rechecked:
+
+- `0ddb3f3` preserves Node's trailing separator for a bare Windows namespace
+  root such as `\\\\?\\foo` in `path.win32.toNamespacedPath`. The narrow fix
+  is limited to namespace-root shapes and leaves UNC, device, drive-root, and
+  ordinary path handling on the existing branches.
+- A fresh Linux build completed successfully. The target Bun file is now
+  green at **4/4 tests**; three unrelated regression lanes stayed green:
+  `events/event-emitter` **67/67**, `os/os` **52/52**, and
+  `timers.promises` **4/4**. The four-file run therefore measured
+  **127/127 tests**, **0 failed**, with **542 expects** across the selected
+  files.
+- The resource gate remained open for this single build: about **43 GiB
+  available memory**, only **41 MiB swap headroom**, and about **24 GiB free
+  disk**. The stale-cache dry-run found approximately **0 MiB** safely
+  reclaimable, so no cleanup was performed and no full corpus run was started.
+
 ## Next route
 
 1. Keep the native-syntax compatibility gate limited to the two measured
@@ -345,6 +362,9 @@ The following four-lane Bun native probe kept only two narrow green slices:
    identified.
 3. Keep test-v8 profiler/queryObjects and broad VM wording changes parked until
    ownership is clear.
+4. Re-measure the adjacent path sample only if it can be done without a new
+   broad build; otherwise prioritize the next one-owner Bun row over zlib's
+   native-handle cluster and test-runner's multi-owner boundary.
 
 No local absolute paths, user names, host names, credentials, private URLs, or
 machine-specific identifiers belong in future comments, commits, PR text, or

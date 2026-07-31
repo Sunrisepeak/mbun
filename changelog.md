@@ -5,6 +5,12 @@
 
 ## 2026-08-01
 
+- `0ddb3f3` 修复 `path.win32.toNamespacedPath` 对裸 namespace root
+  (`\\\\?\\foo`) 丢失 Node 要求的尾斜杠；fresh Linux build 后目标文件
+  **4/4** 全绿。与 `events/event-emitter` **67/67**、`os/os` **52/52**、
+  `timers.promises` **4/4** 组成 4-file bounded 回归，合计 **127/127**、
+  **0 failed**、542 expects；未跑全量 corpus。
+
 ### W41 Linux 优先推进：planner 修复、8 条候选 lane 实测与 Node 近绿切片
 
 - 全量基线沿用 PR #35 合并树：Node **3134/4433 (70.7%)**、Bun
