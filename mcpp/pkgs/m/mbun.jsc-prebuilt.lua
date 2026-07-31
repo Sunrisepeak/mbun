@@ -120,29 +120,42 @@ package = {
                 "-Lbun-webkit/lib",
                 "-lJavaScriptCore", "-lWTF", "-lbmalloc",
                 "-licucore",
-                -- libWTF.a 的 RunLoopBun.cpp 是 bun 给 WTF 打的补丁：它把
-                -- RunLoop 定时器委托给 embedder，六个入口全部声明为
-                -- `extern "C" __attribute__((weak))`，未定义即为 0。
+                -- 产物里 bun 给 JSC/WTF 打的补丁留了一组 embedder 钩子，全部
+                -- 声明为 `extern "C" __attribute__((weak))`：未定义即为 0，由
+                -- 调用点判空。它们不是缺失的实现，非 bun 的 embedder 本就该让
+                -- 它们保持未定义 —— 补桩是违反契约而不是满足它。逐一核对过
+                -- 上游源码，不是照符号名推的：
                 --
-                -- 它们对 mbun 是死代码，不是缺失的实现：调用点只在
-                -- `case Kind::Bun:`，而 Kind 由 Bun__thisThreadHasVM() 决定，
-                -- 后者在 RunLoopBun.cpp 里有默认定义返回 false（→ Generic
-                -- 后端）。只有覆盖了它的 embedder 才会走到 Bun 分支，mbun 没有。
-                -- 上游把这一点写死了：那个默认实现里就是
-                -- `ASSERT(!WTFTimer__create)` —— 非 bun 的 embedder 本就该让
-                -- 这些符号保持未定义。所以这里不能补桩去「实现」它们。
+                --   WTFTimer__*（6，RunLoopBun.cpp）
+                --     调用点只在 `case Kind::Bun:`，Kind 由 Bun__thisThreadHasVM()
+                --     决定，而该函数在同文件里有默认定义返回 false（→ Generic
+                --     后端）。上游把意图写死在那个默认实现的函数体里：
+                --     `ASSERT(!WTFTimer__create)` 等六条。
+                --   Bun__errorInstance__finalize（ErrorInstance.cpp:335）
+                --     `if (Bun__errorInstance__finalize && ...bunErrorData())`
+                --   Bun__reportUnhandledError（JSMicrotask.cpp:2269）
+                --     `if (Bun__reportUnhandledError)`
+                --     为空的后果是该微任务路径上的未处理错误被静默吞掉。这与
+                --     linux 上今天的行为完全一致（同为弱未定义），不是 macOS
+                --     独有的退化。
                 --
-                -- ELF 直接支持弱未定义（linux 因此一直链得过，实测二进制里
-                -- 这六个符号是 `w`）。Mach-O 没有等价语义，ld64 会报
-                -- undefined symbol，所以按符号逐个放行 —— 比
-                -- `-undefined dynamic_lookup` 精确得多：后者会把**任何**拼错的
-                -- 符号一并放过，等到运行期才炸。Mach-O 符号带前导下划线。
+                -- 这就是全集：linux 二进制里 `nm | awk '$1=="w"'` 只有这 8 个，
+                -- 其余弱符号（__gmon_start__、_ITM_*、_ZGTt*）是 glibc/GCC 特有，
+                -- macOS 上不存在。
+                --
+                -- ELF 原生支持弱未定义（linux 因此一直链得过，实测这 8 个是
+                -- `w`，Bun__thisThreadHasVM 是已定义的 `t`）。Mach-O 没有等价
+                -- 语义，所以按符号逐个放行 —— 比 `-undefined dynamic_lookup`
+                -- 精确得多：后者会把**任何**拼错或真的丢失的符号一并放过，把
+                -- 失败推迟到运行期。Mach-O 符号带前导下划线。
                 "-Wl,-U,_WTFTimer__create",
                 "-Wl,-U,_WTFTimer__update",
                 "-Wl,-U,_WTFTimer__deinit",
                 "-Wl,-U,_WTFTimer__isActive",
                 "-Wl,-U,_WTFTimer__secondsUntilTimer",
                 "-Wl,-U,_WTFTimer__cancel",
+                "-Wl,-U,_Bun__errorInstance__finalize",
+                "-Wl,-U,_Bun__reportUnhandledError",
             },
             generated_files = {
                 ["mcpp_jsc_prebuilt_anchor.c"] = "int mcpp_mbun_jsc_prebuilt_anchor(void) { return 0; }\n",
