@@ -26,6 +26,10 @@ import mbun.image.jpeg;
 import mbun.core.io;
 import mbun.core.strings;
 import mbun.css;
+// The platform layer. Strongly platform-dependent primitives live there, not
+// behind #ifdefs at the call site: runtime/process_extended.inc's pty bindings
+// are argument coercion and JS object shaping over mbun::platform::pty.
+import mbun.platform;
 // node's Permission Model (--permission / --allow-*): the scope table, the fs
 // radix matcher and path.resolve. Consulted by every fs/spawn/worker boundary.
 import mbun.permission;

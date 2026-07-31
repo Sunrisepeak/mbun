@@ -85,6 +85,15 @@ constexpr SystemError from_errno(std::int32_t code, SyscallTag syscall = Syscall
     return {classify_errno(code), code, syscall, path};
 }
 
+// The explicit success value. A default-constructed SystemError is deliberately
+// `Unknown`, not `Success` -- "nobody has set this" and "the call worked" must
+// not be the same value, or a forgotten assignment reads as a passing syscall.
+// The consequence is that success has to be stated, which is what this is for.
+constexpr SystemError no_error(SyscallTag syscall = SyscallTag::Unknown,
+                               std::string_view path = {}) noexcept {
+    return {ErrorCode::Success, 0, syscall, path};
+}
+
 // libc-style wrappers return -1 (or the unsigned all-ones sentinel) and put
 // the actual value in TLS. Callers pass the captured TLS value explicitly.
 constexpr SystemError decode_libc_result(std::int64_t result, std::int32_t capturedErrno,

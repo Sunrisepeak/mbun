@@ -515,10 +515,11 @@ JSValueRef proc_spawn_pty_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::si
             (void)!write(errPipe[1], &v, sizeof v);
             _exit(127);
         }};
-        if (setsid() < 0) failFd(errno);
-        if (ioctl(slave, TIOCSCTTY, 0) < 0) failFd(errno);
-        if (dup2(slave, 0) < 0 || dup2(slave, 1) < 0 || dup2(slave, 2) < 0) failFd(errno);
-        if (slave > 2) close(slave);
+        // setsid + TIOCSCTTY + dup2 onto 0/1/2 is the platform layer's job:
+        // it is async-signal-safe there too, and Windows has no equivalent at
+        // all. Non-zero is the errno of the first step that failed.
+        if (const int ptyErr{mbun::platform::pty::attach_controlling_terminal(slave)}; ptyErr != 0)
+            failFd(ptyErr);
         if (!o.cwd.empty() && chdir(o.cwd.c_str()) != 0) failFd(errno);
         std::vector<char*> cargv;
         for (auto& a : argvStr) cargv.push_back(const_cast<char*>(a.c_str()));
@@ -583,52 +584,24 @@ JSValueRef proc_open_pty_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
         const double d{JSValueToNumber(ctx, args[1], nullptr)};
         if (d > 0 && d < 65535) rows = static_cast<unsigned short>(d);
     }
-    const int master{posix_openpt(O_RDWR | O_NOCTTY)};
-    if (master < 0) return fs_throw(ctx, exc, "openPty: posix_openpt() failed");
-    if (grantpt(master) != 0 || unlockpt(master) != 0) { close(master); return fs_throw(ctx, exc, "openPty: grantpt/unlockpt failed"); }
-    char sname[256];
-    if (ptsname_r(master, sname, sizeof sname) != 0) { close(master); return fs_throw(ctx, exc, "openPty: ptsname failed"); }
-    const int slave{open(sname, O_RDWR | O_NOCTTY)};
-    if (slave < 0) { close(master); return fs_throw(ctx, exc, "openPty: open(pts) failed"); }
-    { struct winsize ws{}; ws.ws_col = cols; ws.ws_row = rows; ioctl(master, TIOCSWINSZ, &ws); }
-    // Cooked-mode defaults, verbatim from bun's create_pty_posix — ECHO
-    // included: terminal-spawn.test.ts asserts `localFlags & ECHO` is non-zero
-    // on a freshly constructed Terminal, and terminal.test.ts's enableEcho()
-    // helper only ORs the bit in, so setting it satisfies both.
-    {
-        struct termios t{};
-        if (tcgetattr(slave, &t) == 0) {
-            t.c_iflag = ICRNL | IXON | IXANY | IMAXBEL | BRKINT;
-#if defined(IUTF8)
-            t.c_iflag |= IUTF8;
-#endif
-            t.c_oflag = OPOST | ONLCR;
-            t.c_cflag = CREAD | CS8 | HUPCL;
-            t.c_lflag = ICANON | ISIG | IEXTEN | ECHO | ECHOE | ECHOK | ECHOKE | ECHOCTL;
-            t.c_cc[VEOF] = 4;      t.c_cc[VEOL] = 0;      t.c_cc[VERASE] = 0x7f;
-            t.c_cc[VWERASE] = 23;  t.c_cc[VKILL] = 21;    t.c_cc[VREPRINT] = 18;
-            t.c_cc[VINTR] = 3;     t.c_cc[VQUIT] = 0x1c;  t.c_cc[VSUSP] = 26;
-            t.c_cc[VSTART] = 17;   t.c_cc[VSTOP] = 19;    t.c_cc[VLNEXT] = 22;
-            t.c_cc[VDISCARD] = 15; t.c_cc[VMIN] = 1;      t.c_cc[VTIME] = 0;
-            cfsetispeed(&t, B38400);
-            cfsetospeed(&t, B38400);
-            tcsetattr(slave, TCSANOW, &t);
+    // Creation, the cooked-mode defaults and the CLOEXEC discipline all live in
+    // mbun::platform::pty::open_pty. What stays here is the JS-facing half: the
+    // message text for each failure stage, and the shape of the result object.
+    const auto pty{mbun::platform::pty::open_pty({cols, rows})};
+    if (!pty.ok()) {
+        using Stage = mbun::platform::pty::OpenStage;
+        switch (pty.stage) {
+            case Stage::OpenMaster:   return fs_throw(ctx, exc, "openPty: posix_openpt() failed");
+            case Stage::Unlock:       return fs_throw(ctx, exc, "openPty: grantpt/unlockpt failed");
+            case Stage::ResolveSlave: return fs_throw(ctx, exc, "openPty: ptsname failed");
+            case Stage::OpenSlave:    return fs_throw(ctx, exc, "openPty: open(pts) failed");
+            default:                  return fs_throw(ctx, exc, "openPty: not supported on this platform");
         }
     }
-    const int writeFd{fcntl(master, F_DUPFD, 3)};
-    // CLOEXEC on the master side is load-bearing, not hygiene: a child spawned
-    // onto this pty inherits every non-CLOEXEC descriptor across fork(), so a
-    // surviving copy of the MASTER in the child keeps the pty from ever hanging
-    // up. terminal.close() then closes the parent's copies, no SIGHUP is sent,
-    // and the child runs forever ("closing an inline terminal while a child is
-    // attached terminates the child"). The slave is exempt: the child dup2()s it
-    // onto 0/1/2 (which clears the flag) and closes the original itself.
-    fcntl(master, F_SETFD, FD_CLOEXEC);
-    if (writeFd >= 0) fcntl(writeFd, F_SETFD, FD_CLOEXEC);
     JSObjectRef r{JSObjectMake(ctx, nullptr, nullptr)};
-    set_prop(ctx, r, "master", JSValueMakeNumber(ctx, master));
-    set_prop(ctx, r, "write", JSValueMakeNumber(ctx, writeFd >= 0 ? writeFd : master));
-    set_prop(ctx, r, "slave", JSValueMakeNumber(ctx, slave));
+    set_prop(ctx, r, "master", JSValueMakeNumber(ctx, static_cast<double>(pty.descriptors.master)));
+    set_prop(ctx, r, "write", JSValueMakeNumber(ctx, static_cast<double>(pty.descriptors.write)));
+    set_prop(ctx, r, "slave", JSValueMakeNumber(ctx, static_cast<double>(pty.descriptors.slave)));
     return r;
 }
 
@@ -637,13 +610,13 @@ JSValueRef proc_pty_termios_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::
                                const JSValueRef args[], JSValueRef*) {
     if (argc < 1 || !JSValueIsNumber(ctx, args[0])) return JSValueMakeNull(ctx);
     const int fd{static_cast<int>(JSValueToNumber(ctx, args[0], nullptr))};
-    struct termios t{};
-    if (fd < 0 || tcgetattr(fd, &t) != 0) return JSValueMakeNull(ctx);
+    const auto flags{mbun::platform::pty::termios_flags(fd)};
+    if (!flags) return JSValueMakeNull(ctx);
     JSObjectRef r{JSObjectMake(ctx, nullptr, nullptr)};
-    set_prop(ctx, r, "iflag", JSValueMakeNumber(ctx, static_cast<double>(t.c_iflag)));
-    set_prop(ctx, r, "oflag", JSValueMakeNumber(ctx, static_cast<double>(t.c_oflag)));
-    set_prop(ctx, r, "cflag", JSValueMakeNumber(ctx, static_cast<double>(t.c_cflag)));
-    set_prop(ctx, r, "lflag", JSValueMakeNumber(ctx, static_cast<double>(t.c_lflag)));
+    set_prop(ctx, r, "iflag", JSValueMakeNumber(ctx, static_cast<double>(flags->input)));
+    set_prop(ctx, r, "oflag", JSValueMakeNumber(ctx, static_cast<double>(flags->output)));
+    set_prop(ctx, r, "cflag", JSValueMakeNumber(ctx, static_cast<double>(flags->control)));
+    set_prop(ctx, r, "lflag", JSValueMakeNumber(ctx, static_cast<double>(flags->local)));
     return r;
 }
 
@@ -656,18 +629,13 @@ JSValueRef proc_pty_set_termios_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, s
     const int fd{static_cast<int>(JSValueToNumber(ctx, args[0], nullptr))};
     const int which{static_cast<int>(JSValueToNumber(ctx, args[1], nullptr))};
     const double raw{JSValueToNumber(ctx, args[2], nullptr)};
-    if (fd < 0 || !std::isfinite(raw)) return JSValueMakeBoolean(ctx, false);
-    const auto bits{static_cast<tcflag_t>(static_cast<std::uint32_t>(static_cast<std::int64_t>(raw)))};
-    struct termios t{};
-    if (tcgetattr(fd, &t) != 0) return JSValueMakeBoolean(ctx, false);
-    switch (which) {
-        case 0: t.c_iflag = bits; break;
-        case 1: t.c_oflag = bits; break;
-        case 2: t.c_cflag = bits; break;
-        case 3: t.c_lflag = bits; break;
-        default: return JSValueMakeBoolean(ctx, false);
-    }
-    return JSValueMakeBoolean(ctx, tcsetattr(fd, TCSANOW, &t) == 0);
+    if (fd < 0 || !std::isfinite(raw) || which < 0 || which > 3) return JSValueMakeBoolean(ctx, false);
+    // The 32-bit narrowing is the JS contract, not a platform detail: the JS
+    // side clamps flags to uint32 before calling, and widening it here would
+    // start honouring bits that never reached the terminal before.
+    const auto bits{static_cast<std::uint32_t>(static_cast<std::int64_t>(raw))};
+    const auto field{static_cast<mbun::platform::pty::TermiosField>(which)};
+    return JSValueMakeBoolean(ctx, mbun::platform::pty::set_termios_field(fd, field, bits));
 }
 
 // proc.ptySetRaw(fd, enable) → cfmakeraw() on, cooked defaults back off.
@@ -679,21 +647,7 @@ JSValueRef proc_pty_set_raw_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::
     if (argc < 2) return JSValueMakeBoolean(ctx, false);
     const int fd{static_cast<int>(JSValueToNumber(ctx, args[0], nullptr))};
     const bool enable{JSValueToBoolean(ctx, args[1])};
-    struct termios t{};
-    if (fd < 0 || tcgetattr(fd, &t) != 0) return JSValueMakeBoolean(ctx, false);
-    if (enable) {
-        cfmakeraw(&t);
-    } else {
-        t.c_iflag = ICRNL | IXON | IXANY | IMAXBEL | BRKINT;
-#if defined(IUTF8)
-        t.c_iflag |= IUTF8;
-#endif
-        t.c_oflag = OPOST | ONLCR;
-        t.c_lflag = ICANON | ISIG | IEXTEN | ECHO | ECHOE | ECHOK | ECHOKE | ECHOCTL;
-        t.c_cc[VMIN] = 1;
-        t.c_cc[VTIME] = 0;
-    }
-    return JSValueMakeBoolean(ctx, tcsetattr(fd, TCSANOW, &t) == 0);
+    return JSValueMakeBoolean(ctx, mbun::platform::pty::set_raw_mode(fd, enable));
 }
 
 // proc.ptyResize(fd, cols, rows) → push a new window size to the pty master.
@@ -701,10 +655,9 @@ JSValueRef proc_pty_resize_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::s
                               const JSValueRef args[], JSValueRef*) {
     if (argc >= 3) {
         const int fd{static_cast<int>(JSValueToNumber(ctx, args[0], nullptr))};
-        struct winsize ws{};
-        ws.ws_col = static_cast<unsigned short>(JSValueToNumber(ctx, args[1], nullptr));
-        ws.ws_row = static_cast<unsigned short>(JSValueToNumber(ctx, args[2], nullptr));
-        ioctl(fd, TIOCSWINSZ, &ws);
+        mbun::platform::pty::resize(
+            fd, {static_cast<std::uint16_t>(JSValueToNumber(ctx, args[1], nullptr)),
+                 static_cast<std::uint16_t>(JSValueToNumber(ctx, args[2], nullptr))});
     }
     return JSValueMakeUndefined(ctx);
 }

@@ -21,6 +21,10 @@ debug = false
 [dependencies]
 core     = { path = "../core" }
 css      = { path = "../css" }
+# mbun.platform — the strongly platform-dependent primitives (pty creation and
+# termios, the POSIX syscall backend). runtime/process_extended.inc consumes it
+# so the pty surface carries no terminal headers or platform #ifdefs here.
+platform = { path = "../platform" }
 # node's Permission Model. The decision logic is a separate, engine-free member
 # so it can be unit-tested; this member supplies the syscall boundary that
 # consults it (io_bindings.inc, the spawn bridges, the module loader).
