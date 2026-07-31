@@ -511,7 +511,19 @@
   const nanos = () => (globalThis.Bun && Bun.nanoseconds ? Bun.nanoseconds() : 0);
   p.hrtime = function (prev) {
     const t = nanos(); let s = Math.floor(t / 1e9), n = Math.floor(t % 1e9);
-    if (prev) { s -= prev[0]; n -= prev[1]; if (n < 0) { s -= 1; n += 1e9; } }
+    if (prev !== undefined) {
+      if (!Array.isArray(prev)) {
+        const e = new TypeError('The "time" argument must be an instance of Array. Received type ' + typeof prev + ' (' + String(prev) + ')');
+        e.code = "ERR_INVALID_ARG_TYPE";
+        throw e;
+      }
+      if (prev.length !== 2) {
+        const e = new RangeError('The value of "time" is out of range. It must be 2. Received ' + prev.length);
+        e.code = "ERR_OUT_OF_RANGE";
+        throw e;
+      }
+      s -= prev[0]; n -= prev[1]; if (n < 0) { s -= 1; n += 1e9; }
+    }
     return [s, n];
   };
   p.hrtime.bigint = function () { return BigInt(Math.floor(nanos())); };
