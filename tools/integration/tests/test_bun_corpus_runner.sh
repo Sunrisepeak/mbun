@@ -5,6 +5,9 @@ repo_root=$(cd "$(dirname "$0")/../../.." && pwd)
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
+pass() { printf 'ok   - %s\n' "$1"; }
+fail() { printf 'FAIL - %s\n' "$1"; exit 1; }
+
 cat >"$tmp/fake-mbun" <<'EOF'
 #!/usr/bin/env bash
 case "$2" in
@@ -79,7 +82,33 @@ assert summary["categories"] == {
 }, summary["categories"]
 assert all((root / row["log"]).is_file() for row in rows)
 assert (root / "selected-tests.txt").read_text().splitlines() == [row["path"] for row in rows]
+assert summary["resource_profile"] == {"memory_max": "4G", "tasks_max": 512}
 PY
+
+# --- explicit resource profile is opt-in and single-lane only ----------------
+printf '%s\n' green.test.ts >"$tmp/profile-list.txt"
+python3 "$repo_root/tools/integration/bun_corpus_runner.py" \
+  --bin "$tmp/fake-mbun" --root "$repo_root" --list "$tmp/profile-list.txt" \
+  --allow-missing-node-modules --out "$tmp/profile" --jobs 1 --timeout 1 \
+  --memory-max 34G --tasks-max 1024 >/dev/null
+python3 - "$tmp/profile/summary.json" <<'PY'
+import json, sys
+summary = json.load(open(sys.argv[1]))
+assert summary["resource_profile"] == {"memory_max": "34G", "tasks_max": 1024}
+PY
+pass "an explicit resource profile is recorded in the summary"
+
+set +e
+python3 "$repo_root/tools/integration/bun_corpus_runner.py" \
+  --bin "$tmp/fake-mbun" --root "$repo_root" --list "$tmp/profile-list.txt" \
+  --allow-missing-node-modules --out "$tmp/rejected-profile" --jobs 2 --timeout 1 \
+  --memory-max 34G --tasks-max 1024 >"$tmp/rejected-profile.log" 2>&1
+rc=$?
+set -e
+[ "$rc" -ne 0 ] || fail "an overridden resource profile must reject jobs > 1"
+grep -q -- '--jobs 1' "$tmp/rejected-profile.log" \
+  || fail "the profile rejection must explain the single-lane requirement"
+pass "an overridden resource profile rejects multi-lane fan-out"
 
 mkdir -p "$tmp/corpus/a/b" "$tmp/corpus/a/c" "$tmp/corpus/node_modules/pkg"
 touch "$tmp/corpus/a/b/one.test.ts" "$tmp/corpus/a/b/two.test.js" \

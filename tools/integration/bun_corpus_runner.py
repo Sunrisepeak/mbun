@@ -157,12 +157,19 @@ def log_name(path: str) -> str:
     return f"{digest}-{readable}.log"
 
 
-from bounded_run import BoundedRun, ensure_disk_headroom
+from bounded_run import (
+    DEFAULT_MEMORY_MAX,
+    DEFAULT_TASKS_MAX,
+    BoundedRun,
+    ensure_disk_headroom,
+)
 
 
 def run_one(
     binary: Path, root: Path, output_dir: Path, timeout: float, path: str, spawn_cwd: Path,
     blocked_patterns: list[str] | None = None,
+    memory_max: str = DEFAULT_MEMORY_MAX,
+    tasks_max: int = DEFAULT_TASKS_MAX,
 ) -> Result:
     started = time.monotonic()
     # All resource/safety bounding (systemd scope limits, own session, private
@@ -179,6 +186,8 @@ def run_one(
         [str(binary), "test", str((root / path).resolve())],
         timeout=timeout,
         cwd=spawn_cwd,
+        memory_max=memory_max,
+        tasks_max=tasks_max,
     )
     output = runner.read_output()
     duration_ms = round((time.monotonic() - started) * 1000)
@@ -326,7 +335,12 @@ def journal_load(output_dir: Path) -> dict[str, Result]:
     return done
 
 
-def write_outputs(output_dir: Path, results: list[Result]) -> None:
+def write_outputs(
+    output_dir: Path,
+    results: list[Result],
+    memory_max: str = DEFAULT_MEMORY_MAX,
+    tasks_max: int = DEFAULT_TASKS_MAX,
+) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "selected-tests.txt").write_text(
         "".join(f"{result.path}\n" for result in results), encoding="utf-8"
@@ -348,6 +362,7 @@ def write_outputs(output_dir: Path, results: list[Result]) -> None:
         "ran": sum(result.ran for result in results),
         "expects": sum(result.expects for result in results),
         "categories": dict(sorted(categories.items())),
+        "resource_profile": {"memory_max": memory_max, "tasks_max": tasks_max},
     }
     (output_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps(summary, sort_keys=True))
@@ -375,6 +390,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--timeout", type=float, default=30.0)
     parser.add_argument(
+        "--memory-max", default=DEFAULT_MEMORY_MAX,
+        help="systemd MemoryMax for each file scope (default: %(default)s); "
+             "a non-default profile requires --jobs 1",
+    )
+    parser.add_argument(
+        "--tasks-max", type=int, default=DEFAULT_TASKS_MAX,
+        help="systemd TasksMax for each file scope (default: %(default)s); "
+             "a non-default profile requires --jobs 1",
+    )
+    parser.add_argument(
         "--resume", action="store_true",
         help="skip files already recorded in results.partial.tsv and append to it, "
              "so a killed run continues instead of starting over",
@@ -394,6 +419,12 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     ensure_disk_headroom()
+    if args.jobs < 1:
+        raise SystemExit("--jobs must be positive")
+    if args.tasks_max < 1:
+        raise SystemExit("--tasks-max must be positive")
+    if (args.memory_max != DEFAULT_MEMORY_MAX or args.tasks_max != DEFAULT_TASKS_MAX) and args.jobs != 1:
+        raise SystemExit("an overridden resource profile requires --jobs 1")
     root = args.root.resolve()
     binary = args.bin.resolve()
     output_dir = args.out.resolve()
@@ -435,7 +466,7 @@ def main() -> int:
         with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as executor:
             futures = [
                 executor.submit(run_one, binary, root, output_dir, args.timeout, path, spawn_cwd,
-                                blocked_patterns)
+                                blocked_patterns, args.memory_max, args.tasks_max)
                 for path in pending
             ]
             for future in concurrent.futures.as_completed(futures):
@@ -444,7 +475,7 @@ def main() -> int:
                 results.append(result)
     # Stable order regardless of completion order, so two runs diff cleanly.
     results.sort(key=lambda result: result.path)
-    write_outputs(output_dir, results)
+    write_outputs(output_dir, results, args.memory_max, args.tasks_max)
     return 0
 
 
