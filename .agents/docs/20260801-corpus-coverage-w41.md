@@ -506,6 +506,30 @@ surface on Linux:
   时停止，随后只完成 root 窄构建；无全量 corpus，未删除源码或必要 fresh binary，
   只保留可复核的 bounded 结果。
 
+### W52 Bun.spawn file-backed stdin owner
+
+- Issue [#39](https://github.com/Sunrisepeak/mbun/issues/39) 记录了第二个
+  `process-stdin` owner：`Bun.file()` 被错误降级为匿名 pipe，child 的
+  `typeof process.stdin.ref` 为 `function`，而 regular-file stdin 的 Node
+  对照为 `undefined`；相邻 `stdin: "pipe"` 仍为 `function`。
+- 根因修复分两点：regular-file `Bun.file()` 在 `bun_spawn_stream.cppm` 中先以
+  fd stdio 传给 child，并在 spawn 边界后关闭 parent fd；bootstrap 只对非
+  regular-file fd 0 安装 `ref/unref`。generic Blob、byte、ReadableStream、
+  async iterable 和 keyword stdin 路径没有改动。
+- 首次 root 构建因 `process_web` raw payload 超过 GCC constexpr 字符串长度上限
+  失败；随后按现有 payload 分区规则移到 `bun_spawn_stream.cppm`，root release
+  build 成功，耗时约 **60.26 秒**。这是构建边界处理，不是运行时失败。
+- focused `process-stdin.test.ts` 从 **12/14** 提升到 **13/14、26 expects**；
+  `file does the right thing`、pipe 对照和真实 file-byte smoke 均通过。唯一
+  剩余失败是 stdout WebStream 被重复消费后没有 reject，归入独立 WebStream
+  disturbed/reject owner。
+- W52 四文件 post-fix bounded probe：**126 passed、8 failed、134 ran、3015
+  expects**；修复前为 **125/134、9 failed、3013 expects**。四条既有 green guards
+  保持 **4/4 files、128/128 tests、0 failed、565 expects**。
+- 资源策略保持 root 窄构建、默认 **4G/512** runner 和 bounded lanes；未启动
+  workspace-wide 或全量 corpus。构建与测试期间 swap 仍约 **43 MiB free**、磁盘
+  约 **20 GiB free**，后续新 owner 需继续避免 broad build。
+
 ## Next route
 
 1. Keep the native-syntax compatibility gate limited to the two measured
@@ -524,6 +548,9 @@ surface on Linux:
 5. Keep the two W51 residual `process-stdin` failures parked under their own
    child-stdio/WebStream owners; do not reopen the fixed final-read ordering
    path unless a new regression reproduces it.
+6. Close the child-stdio owner at W52's 13/14 checkpoint; investigate only the
+   remaining WebStream disturbed/reject semantics as the next single owner,
+   with a minimal stream-consumption reproduction before any source change.
 
 No local absolute paths, user names, host names, credentials, private URLs, or
 machine-specific identifiers belong in future comments, commits, PR text, or

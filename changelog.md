@@ -5,6 +5,14 @@
 
 ## 2026-08-01
 
+- `#39` 修复 `Bun.spawn({ stdin: Bun.file(...) })` 将 regular-file stdin 错误降级为
+  anonymous pipe 的问题：child `process.stdin.ref` 从 `function` 对齐为 `undefined`，
+  相邻 pipe contract 保持 `function`，真实 file-byte 读取 smoke 通过。focused
+  `process-stdin.test.ts` **12/14→13/14、26 expects**；W52 四文件复测 **126/134
+  passed、8 failed、3015 expects**，比修复前净增 1。首次 root 构建触及 GCC raw payload
+  constexpr 上限，按分区移出后 release build 约 **60.26 秒** 成功；唯一剩余 stdin
+  红测是独立 stdout WebStream disturbed/reject 语义 owner。四条既有 guards 保持
+  **128/128、0 failed、565 expects**，未跑全量 corpus。
 - `#38` 修复 `process.stdin.read(size)` 在返回最后缓冲字节前同步触发 `end` 的
   时序缺陷：最小 `abcdefgh`/`read(3)` smoke 从 `end` 观察到 `abc,def` 修复为
   `abc,def,gh`。root release build 约 **60 秒**；目标文件从 **11/14** 提升到
