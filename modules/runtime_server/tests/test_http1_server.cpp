@@ -5,7 +5,7 @@
 // GET round-trip, Content-Length body, chunked body, keep-alive reuse +
 // pipelining, Connection: close, 400/404/431 error paths, and a large
 // response driven through EPOLLOUT write backpressure.
-#if defined(__linux__)
+#if !defined(_WIN32)
 #include <arpa/inet.h>
 #include <cerrno>
 #include <fcntl.h>
@@ -34,7 +34,7 @@ void check(bool condition, std::string_view name) {
     }
 }
 
-#if defined(__linux__)
+#if !defined(_WIN32)
 
 struct Fixture {
     mbun::event_loop::HostReadinessBackend epoll {};
@@ -633,7 +633,7 @@ void test_deferred_stub() {
 }  // namespace
 
 int main() {
-#if defined(__linux__)
+#if !defined(_WIN32)
     test_get_round_trip();
     test_post_content_length_echo();
     test_chunked_request_body();

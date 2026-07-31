@@ -1,7 +1,7 @@
 // Real-fd integration vectors for mbun.event_loop.epoll_backend. Scenarios
 // mirror bun uws_sys/Loop.rs semantics: ready-poll token dispatch, timer-aware
 // tick timeout, and us_wakeup_loop interrupting a blocked wait.
-#if defined(__linux__)
+#if !defined(_WIN32)
 #include <sys/socket.h>
 #include <unistd.h>
 #endif
@@ -23,7 +23,7 @@ void check(bool condition, std::string_view name) {
     }
 }
 
-#if defined(__linux__)
+#if !defined(_WIN32)
 
 struct PipePair {
     int readFd{-1};
@@ -189,7 +189,7 @@ void test_deferred_stub() {
 }  // namespace
 
 int main() {
-#if defined(__linux__)
+#if !defined(_WIN32)
     test_pipe_readiness_maps_token();
     test_socketpair_modify_and_dispatch();
     test_loop_dispatches_fd_events_to_watch();

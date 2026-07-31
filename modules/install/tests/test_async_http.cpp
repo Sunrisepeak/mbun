@@ -12,7 +12,7 @@
 //     127.0.0.1 server (no external network): framing, redirects, transport
 //     failures, and — the whole point — that requests actually overlap.
 
-#if defined(__linux__)
+#if !defined(_WIN32)
 #include <cerrno>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -136,7 +136,7 @@ void test_resolver_does_not_cache_failure() {
     check_eq(after.hits - before.hits, std::uint64_t{0}, "resolver-fail: no cache hit served");
 }
 
-#if defined(__linux__)
+#if !defined(_WIN32)
 
 // ── in-process HTTP server ──────────────────────────────────────────────────
 // Unlike test_http_executor's TestServer (which serves one connection at a
@@ -995,12 +995,12 @@ void test_engine_idle_timeout() {
     check_true(elapsed < std::chrono::seconds{5}, "engine-idle: failed in bounded time");
 }
 
-#endif  // __linux__
+#endif  // !_WIN32
 
 }  // namespace
 
 int main() {
-#if defined(__linux__)
+#if !defined(_WIN32)
     test_resolver_numeric_literal();
     test_resolver_ipv6_literal();
     test_resolver_caches_per_host();

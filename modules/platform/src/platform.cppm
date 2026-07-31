@@ -9,4 +9,5 @@ export import mbun.platform.syscall;
 // allowed to include OS headers; everything else in mbun consumes them.
 export import mbun.platform.posix_backend;
 export import mbun.platform.process;
+export import mbun.platform.socket;
 export import mbun.platform.pty;
