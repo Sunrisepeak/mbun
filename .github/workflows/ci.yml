@@ -190,8 +190,16 @@ jobs:
       # the macOS artifact and this toolchain are both libc++, so the whole
       # workspace is attempted. If it turns out otherwise, this is where it
       # shows up, and SKIP_MEMBERS is the same escape hatch linux uses.
+      # timeout-minutes is not boilerplate here: the first run of this step HUNG
+      # rather than failed. modules/event_loop has no macOS readiness backend --
+      # epoll_backend.cppm's non-linux path returns an empty BackendSeam and a
+      # poll() that never reports anything ready (marked DEFERRED in-source), so
+      # anything waiting on socket readiness waits forever. Without a bound the
+      # job sits until GitHub's 6-hour ceiling. 45 minutes is above the observed
+      # cost of compiling every member's tests on this runner.
       - name: Test
         continue-on-error: true
+        timeout-minutes: 45
         run: mcpp test --workspace
 
       # Same example-app boot check the linux gcc lane runs. `find -printf` is
