@@ -287,6 +287,18 @@ A second Bun-native wave used four parallel one-job runners over adjacent
   **229/251 tests** with 22 Bun `test.failing` cases passing in mbun; this is
   not a runtime green file and is retained as a separate classifier result.
 
+A low-cost Bun micro-wave then measured four small subtrees in parallel:
+
+- `os/os.test.js` is green at **52/52 tests** and
+  `stream/node-stream-uint8array.test.ts` is green at **5/5 tests**.
+- `async_hooks/AsyncLocalStorage.test.ts` reached **32/45 tests** with 11
+  failures across async-context propagation, HTTP/HTTP2 cleanup, and plugin
+  loading. `string_decoder/string-decoder.test.js` reached **93/95 tests**;
+  its two failures are large-buffer allocation/range and output-shape edges.
+- This wave used no build and produced only small temporary logs; no cleanup was
+  necessary despite the disk gate. The broad async-context and large-buffer
+  boundaries remain parked behind their own owners.
+
 ## Next route
 
 1. Keep the native-syntax compatibility gate limited to the two measured

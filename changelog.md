@@ -116,6 +116,11 @@
   **11/14** 且另有一个 stale-HUP stdin timeout；`assert/deep-equal` 分类为
   **ahead-of-reference**（229/251，22 个 Bun `test.failing` case 在 mbun 通过），不计 runtime
   green。未跑 Bun 全量。
+- Bun 小型 micro-wave 再获两个稳定 green：`os/os.test.js` **52/52**、
+  `stream/node-stream-uint8array.test.ts` **5/5**。`async_hooks/AsyncLocalStorage` 为
+  **32/45**，失败集中在 async-context propagation、HTTP/HTTP2 cleanup 和 plugin loading；
+  `string_decoder` 为 **93/95**，剩余是大 buffer range 与 output shape。该波次未构建，
+  临时日志很小，无需清理；async-context 与 large-buffer 边界继续独立停车。
 - `163a0a3` 将本地敏感信息过滤规则加入 `hagent/agents.md` 及中文同步页；该受保护面
   需要维护者签字，不由 agent 自行合并。PR #36 已同步两轮候选实测和本节点策略。
 
