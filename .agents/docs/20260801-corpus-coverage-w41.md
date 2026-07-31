@@ -217,6 +217,25 @@ The measured getter-display candidate is now a bounded green slice:
   was started; callbackify, util.format, assertion source-position, and test-v8
   remain separately parked.
 
+The next Node VM probe produced one additional narrow green slice:
+
+- A five-file bounded probe measured `test-vm-create-context-arg.js`,
+  `test-vm-is-context.js`, and `test-vm-options-validation.js` at exit 0;
+  `test-vm-basic.js` and `test-vm-context.js` were the only two RED files in
+  that probe. The latter stopped at one display-error position assertion, not
+  at context isolation or argument validation.
+- `f3a7393` carries `vm.Script`'s validated `lineOffset`/`columnOffset` into
+  Node's decorated error header and first stack frame. The source excerpt and
+  caret remain relative to the original source, matching Node's display-errors
+  contract.
+- A fresh build moved `test-vm-context.js` from exit 1 to exit 0. Five bounded
+  lanes then all exited 0: `test-vm-context.js`,
+  `test-vm-create-context-arg.js`, `test-vm-is-context.js`,
+  `test-vm-options-validation.js`, and the already-green getter target.
+  `test-vm-basic.js` remains RED only on JSC's generic `Parser error` versus
+  Node's token-specific `Unexpected token '}'` message; that parser-boundary
+  mismatch remains isolated rather than receiving a test-specific rewrite.
+
 ## Next route
 
 1. Keep the native-syntax compatibility gate limited to the two measured
@@ -224,8 +243,8 @@ The measured getter-display candidate is now a bounded green slice:
    own failing corpus evidence.
 2. Keep callbackify stack shape, util.format's constructor-name mismatch, and
    assertion source-position parked behind their generic runtime boundaries.
-   Use the next measured Node actionable row only after its owner and expected
-   contract are identified.
+   Treat the VM parser-message mismatch the same way; use the next measured
+   Node actionable row only after its owner and expected contract are identified.
 3. Keep test-v8 profiler/queryObjects and broad VM wording changes parked until
    ownership is clear.
 

@@ -86,6 +86,13 @@
   receiver-sensitive getter value、prototype getter label、root circular marker 与
   multiline layout；`test-util-types.js`、`test-runner-snapshot-file-tests.js`、
   `test-process-hrtime.js` 四条 bounded regression（含目标文件）并行全 exit 0，未跑全量。
+- W41 Node VM 五文件 probe 中，`test-vm-create-context-arg.js`、`test-vm-is-context.js`、
+  `test-vm-options-validation.js` 首轮即 exit 0；`test-vm-context.js` 的唯一 blocker 是
+  display-errors offset。`f3a7393` 将 `vm.Script` 的 `lineOffset`/`columnOffset` 传入
+  decorated error header 与首个 stack frame，并保持 source excerpt/caret 的原始位置；
+  fresh build 后 `test-vm-context.js` **1 → exit 0**。随后 5 条 bounded lane（含 getter
+  回归）并行全 exit 0。`test-vm-basic.js` 仍只剩 JSC 通用 `Parser error` 与 Node
+  `Unexpected token '}'` 的 parser-message 边界，未做 test-specific rewrite。
 - `163a0a3` 将本地敏感信息过滤规则加入 `hagent/agents.md` 及中文同步页；该受保护面
   需要维护者签字，不由 agent 自行合并。PR #36 已同步两轮候选实测和本节点策略。
 
