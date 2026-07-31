@@ -30,6 +30,11 @@ one that matches your task **before** acting — don't re-derive it:
 - **Conventional commits**, one dev-item per commit; prefer separate red/green
   commits.
 - **Target branch.** Open PRs against **`rewrite_bun_in_mcpp`**, never `main`.
+- **Filter local sensitive data.** Before putting diagnostics in code comments,
+  commit metadata, or PR title/body/comments, remove or replace local absolute
+  paths, usernames, hostnames, tokens/credentials, private URLs, environment
+  values, and machine identifiers with generic placeholders. Re-check copied
+  logs and error excerpts before publishing them.
 
 ## Sign every commit to a builder
 

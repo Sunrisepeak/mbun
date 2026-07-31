@@ -25,6 +25,9 @@
   命令(见 [contributing.md](contributing.md#证据))。
 - **conventional commits**,一 commit 一开发项;红绿分离提交更佳。
 - **目标分支。** PR 提交到 **`rewrite_bun_in_mcpp`**,绝不合入 `main`。
+- **过滤本地敏感信息。** 把诊断信息写入代码注释、commit 元数据或 PR 标题/正文/评论前,
+  必须移除或用通用占位符替换本地绝对路径、用户名、主机名、token/凭据、私有 URL、环境值和机器标识。
+  发布复制的日志或错误片段前再次检查。
 
 ## 每个 commit 都署名到构建者
 
