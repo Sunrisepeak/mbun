@@ -623,10 +623,29 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
         this._last = true;
       } else if (!state.trailer && !this._removedContLen && typeof this._contentLength === "number") {
         header += "Content-Length: " + this._contentLength + "\r\n";
-      } else if (!this._removedTE) {
+      } else if (!this._removedTE && !(this._removedContLen && this.req &&
+                 (this.req.httpVersionMajor < 1 || this.req.httpVersionMinor < 1))) {
         header += "Transfer-Encoding: chunked\r\n";
         this.chunkedEncoding = true;
       } else {
+        // PORT-SOURCE: compat/bun/src/js/node/_http_server.ts, the _removedContLen
+        // branch of the native header renderer:
+        //   } else if (res._removedContLen) {
+        //     if (res.useChunkedEncodingByDefault && req.httpVersionMajor >= 1 &&
+        //         req.httpVersionMinor >= 1) forceChunked = true;
+        //     else { closeDelimited = true; res[kMustCloseConnection] = true; }
+        // A SERVER response to an HTTP/1.0 request whose Content-Length was
+        // explicitly REMOVED is close-delimited, never chunk-framed.
+        //
+        // The `_removedContLen` term is load-bearing and is the whole
+        // discriminator between the two corpora -- do not widen it. Gating the
+        // version check on the chunked branch alone regresses node
+        // test-http-1.0-keep-alive.js (measured, --jobs 1): its "keep-alive,
+        // with TE: chunked" case wants the reply CHUNKED so the connection can
+        // stay open, and it never calls removeHeader('Content-Length'). bun's
+        // regression/issue/34415 does call it, on the same HTTP/1.0 + TE input.
+        // `this.req` only exists on ServerResponse, so a ClientRequest is
+        // untouched either way.
         this._last = true;
       }
     }
@@ -984,9 +1003,16 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
     if (reqMsg && (reqMsg.httpVersionMajor < 1 || reqMsg.httpVersionMinor < 1)) {
       // DO NOT set this to `false` to make bun's regression/34415 pass: that
       // was implemented and MEASURED in wave 60 and it costs green node file
-      // test-http-1.0-keep-alive.js (confirmed serially, --jobs 1). bun asserts
-      // its writer never chunk-frames an HTTP/1.0 reply; node asserts the
-      // TE-driven behaviour below. Same input, no caller-side discriminator.
+      // test-http-1.0-keep-alive.js (confirmed serially, --jobs 1) -- zeroing it
+      // here also forces `_last` in _storeHeader's `!useChunkedEncodingByDefault`
+      // branch and drops the `shouldSendKeepAlive` term, which is what that node
+      // test actually asserts. The DISCRIMINATOR the wave-60 note said did not
+      // exist does, but it is NOT the request version on its own: bun keeps
+      // node's value here and refuses to chunk-frame an HTTP/1.0 reply in the
+      // header renderer ONLY when the response's Content-Length was explicitly
+      // removed. See the `_removedContLen &&` guard on _storeHeader's
+      // Transfer-Encoding branch above -- that term is the discriminator, and
+      // dropping it costs test-http-1.0-keep-alive.js exactly as wave 60 said.
       this.useChunkedEncodingByDefault = chunkExpression.test(reqMsg.headers.te);
       this.shouldKeepAlive = false;
     }

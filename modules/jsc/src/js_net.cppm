@@ -2115,7 +2115,15 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
     // per-connection options are armed on the CLIENT HANDLE before the
     // 'connection' listener runs, and the socket caches the same values so its
     // own setNoDelay/setKeepAlive see them as already applied.
+    // (the comment above describes _onconnectionRaw, which is the accept body.)
+    // This wrapper only re-enters the async context listen() was called in
+    // before building and dispatching the accepted socket -- see listen().
     _onconnection(err, clientHandle) {
+      const ctx = this._acceptCtx;
+      if (typeof ctx !== "function") return this._onconnectionRaw(err, clientHandle);
+      return ctx(() => this._onconnectionRaw(err, clientHandle));
+    }
+    _onconnectionRaw(err, clientHandle) {
       if (err || !clientHandle || typeof clientHandle.fd !== "number" || clientHandle.fd < 0) return;
       // Node decides admission while it still owns the accepted handle: a
       // blocked peer or a full server must never reach the `connection`
@@ -2191,6 +2199,19 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       if (this.listening) {
         throw mkErr("Listen method has been called more than once without closing.", "ERR_SERVER_ALREADY_LISTEN");
       }
+      // node creates the server handle in whatever async context called
+      // listen(), so every connection accepted on it -- and therefore every
+      // http 'request' handler layered above it -- inherits that context.
+      // mbun accepted on whatever context happened to be current when the poll
+      // fired, which is none, so an AsyncLocalStorage store established around
+      // server.listen() was invisible inside the request handler (bun
+      // regression/issue/18595 hangs on exactly that: `als.getStore()` is
+      // undefined in the handler and `++store.counter` throws before res.end).
+      // __mbunCaptureAsyncContext returns its argument untouched when no frame
+      // is active, so a server outside AsyncLocalStorage pays nothing.
+      this._acceptCtx = typeof G.__mbunCaptureAsyncContext === "function"
+        ? G.__mbunCaptureAsyncContext((fn) => fn())
+        : null;
       let port = 0, host = null, cb = null, unixPath = null;
       // node lib/internal/validators validatePort (allowZero): every listen form
       // routes its port through this, so an out-of-range value (e.g. -1>>>0) is a
@@ -2942,6 +2963,14 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
   const netConnect = (a) => {
     const opts = (typeof a[0] === "object" && a[0] !== null && !Array.isArray(a[0])) ? a[0] : null;
     const socket = new Socket(opts || undefined);
+    // PORT-SOURCE: compat/bun/src/js/node/net.ts createConnection() --
+    //   const optionsTimeout = options.timeout;
+    //   if (optionsTimeout) socket.setTimeout(optionsTimeout);
+    // net.connect({ timeout }) is an inactivity timer exactly like a later
+    // setTimeout() call. mbun dropped the option silently, so `connect({
+    // timeout: N })` never armed anything -- tls.connect({ timeout }) already
+    // honoured it (js_tls_live.cppm), plain net did not.
+    if (opts && opts.timeout) socket.setTimeout(opts.timeout);
     if (opts && normalizedArgsSymbol() !== null) return socket.connect(normalizeArgs(a));
     return socket.connect(...a);
   };
