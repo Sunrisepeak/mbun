@@ -351,7 +351,7 @@
   // `process.features.inspector` and `process.features.quic` stay false, which is
   // why 178 + 236 files correctly keep skipping -- mbun has neither subsystem, and
   // flipping those booleans would make 414 files run and fail rather than progress.
-  p.versions = { node: "26.3.0", bun: (globalThis.Bun && Bun.version) || "1.3.14", mbun: "2026.07.18.0", v8: "12.4.0", modules: "127", uv: "1.0", openssl: "3.1.5", sqlite: "3.45.1" };
+  p.versions = { node: "26.3.0", bun: (globalThis.Bun && Bun.version) || "1.3.14", mbun: "2026.07.18.0", v8: "12.4.0", modules: "127", uv: "1.0", openssl: "3.5.1", sqlite: "3.45.1" };
   // bun mirrors Bun.revision onto process.revision (bun-test.test.ts asserts
   // process.revision === Bun.revision; verified against bun 1.3.14). Derived from
   // Bun.revision so the two can never drift.

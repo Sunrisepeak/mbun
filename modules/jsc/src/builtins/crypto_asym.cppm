@@ -256,9 +256,18 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   C.privateDecrypt = (key, buffer) => {
     const r = resolveKey(key);
     validateOaepHash(r);
-    // node cipher.js (CVE-2023-46809): RSA_PKCS1_PADDING is rejected for
-    // private decryption.
-    if (r.padding === RSA_PKCS1_PADDING) {
+    // node cipher.js (CVE-2023-46809): RSA_PKCS1_PADDING is rejected for private
+    // decryption -- but only while the linked OpenSSL lacks the implicit-rejection
+    // mitigation. node re-permits it from OpenSSL 3.2, and mbun now links 3.5.1,
+    // which is why test-crypto-rsa-dsa.js:240 expects the call to succeed.
+    // Gated on the reported version so the rule tracks the library rather than
+    // being pinned to the version this file was written against.
+    const __osslMajorMinor = (() => {
+      const v = String((globalThis.process && process.versions && process.versions.openssl) || "");
+      const m = /^(\d+)\.(\d+)/.exec(v);
+      return m ? (Number(m[1]) * 100 + Number(m[2])) : 0;
+    })();
+    if (r.padding === RSA_PKCS1_PADDING && __osslMajorMinor < 302) {
       const e = new TypeError('The property \'options.padding\' is invalid. Received ' + r.padding);
       e.code = "ERR_INVALID_ARG_VALUE"; throw e;
     }
