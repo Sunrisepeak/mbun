@@ -120,6 +120,29 @@ package = {
                 "-Lbun-webkit/lib",
                 "-lJavaScriptCore", "-lWTF", "-lbmalloc",
                 "-licucore",
+                -- libWTF.a 的 RunLoopBun.cpp 是 bun 给 WTF 打的补丁：它把
+                -- RunLoop 定时器委托给 embedder，六个入口全部声明为
+                -- `extern "C" __attribute__((weak))`，未定义即为 0。
+                --
+                -- 它们对 mbun 是死代码，不是缺失的实现：调用点只在
+                -- `case Kind::Bun:`，而 Kind 由 Bun__thisThreadHasVM() 决定，
+                -- 后者在 RunLoopBun.cpp 里有默认定义返回 false（→ Generic
+                -- 后端）。只有覆盖了它的 embedder 才会走到 Bun 分支，mbun 没有。
+                -- 上游把这一点写死了：那个默认实现里就是
+                -- `ASSERT(!WTFTimer__create)` —— 非 bun 的 embedder 本就该让
+                -- 这些符号保持未定义。所以这里不能补桩去「实现」它们。
+                --
+                -- ELF 直接支持弱未定义（linux 因此一直链得过，实测二进制里
+                -- 这六个符号是 `w`）。Mach-O 没有等价语义，ld64 会报
+                -- undefined symbol，所以按符号逐个放行 —— 比
+                -- `-undefined dynamic_lookup` 精确得多：后者会把**任何**拼错的
+                -- 符号一并放过，等到运行期才炸。Mach-O 符号带前导下划线。
+                "-Wl,-U,_WTFTimer__create",
+                "-Wl,-U,_WTFTimer__update",
+                "-Wl,-U,_WTFTimer__deinit",
+                "-Wl,-U,_WTFTimer__isActive",
+                "-Wl,-U,_WTFTimer__secondsUntilTimer",
+                "-Wl,-U,_WTFTimer__cancel",
             },
             generated_files = {
                 ["mcpp_jsc_prebuilt_anchor.c"] = "int mcpp_mbun_jsc_prebuilt_anchor(void) { return 0; }\n",
