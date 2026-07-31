@@ -543,11 +543,13 @@ inline constexpr char kBootstrapJS_[] = R"JS(
         if (resolvedPath.charCodeAt(1) === 92) {
           const c = resolvedPath.charCodeAt(2);
           if (c !== 63 && c !== 46) return "\\\\?\\UNC\\" + resolvedPath.slice(2);
-          // Node treats a bare `\\\\?\\name` namespace root as having a
+          // Bun treats a bare `\\\\?\\name` namespace root as having a
           // trailing separator. JSC's win32 resolver preserves the prefix but
-          // drops that separator, making path.win32.toNamespacedPath diverge.
+          // drops that separator. Node keeps the resolver's no-separator
+          // result, so this is selected by the process dialect rather than by
+          // the caller or the test name.
           const tail = resolvedPath.slice(4);
-          if (c === 63 && tail.length > 0 && tail.indexOf("\\") === -1 && tail.indexOf(":") === -1)
+          if (G.__mbunDialect !== "node" && c === 63 && tail.length > 0 && tail.indexOf("\\") === -1 && tail.indexOf(":") === -1)
             return resolvedPath + "\\";
         }
       } else if (isWinDevRoot(resolvedPath.charCodeAt(0)) && resolvedPath.charCodeAt(1) === 58 && resolvedPath.charCodeAt(2) === 92) {

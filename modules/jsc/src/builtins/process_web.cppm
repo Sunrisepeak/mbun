@@ -1471,7 +1471,8 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   // ---- Console#table (https://console.spec.whatwg.org/#table) --------------
   // Blueprint: bun src/js/builtins/ConsoleObject.ts:180-250 (tableChars +
   // renderRow/table) and :645-739 (the `table` method). Bun centers each cell
-  // within its display-width column; the odd spare space goes on the right.
+  // within its display-width column; Node's cli_table keeps cells left-aligned.
+  // The process dialect selects the native contract without inspecting tests.
   const tableChars = { middleMiddle: "─", rowMiddle: "┼", topRight: "┐", topLeft: "┌", leftMiddle: "├",
                        topMiddle: "┬", bottomRight: "┘", bottomLeft: "└", bottomMiddle: "┴",
                        rightMiddle: "┤", left: "│ ", right: " │", middle: " │ " };
@@ -1482,7 +1483,8 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     for (let i = 0; i < row.length; i++) {
       const cell = row[i];
       const needed = Math.max(0, (widths[i] - tableCellWidth(measure[i])) / 2);
-      out += " ".repeat(needed) + cell + " ".repeat(Math.ceil(needed));
+      if (G.__mbunDialect === "node") out += cell + " ".repeat(Math.max(0, widths[i] - tableCellWidth(measure[i])));
+      else out += " ".repeat(needed) + cell + " ".repeat(Math.ceil(needed));
       if (i !== row.length - 1) out += tableChars.middle;
     }
     return out + tableChars.right;
