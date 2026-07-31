@@ -349,6 +349,11 @@ The next single-owner path lane was repaired and rechecked:
   available memory**, only **41 MiB swap headroom**, and about **24 GiB free
   disk**. The stale-cache dry-run found approximately **0 MiB** safely
   reclaimable, so no cleanup was performed and no full corpus run was started.
+- Reusing the fresh binary, the previously expanded four-file path sample
+  moved from **3/4 files and 9/10 tests** to **4/4 files and 10/10 tests**:
+  `dirname` **3/3**, `is-absolute` **2/2**, `to-namespaced-path` **4/4**, and
+  `win32-exists` **1/1**. This was a no-build confirmation of the adjacent
+  path slice, not a full path-corpus claim.
 
 ## Next route
 

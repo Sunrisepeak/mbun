@@ -10,6 +10,10 @@
   **4/4** 全绿。与 `events/event-emitter` **67/67**、`os/os` **52/52**、
   `timers.promises` **4/4** 组成 4-file bounded 回归，合计 **127/127**、
   **0 failed**、542 expects；未跑全量 corpus。
+- 复用 fresh binary 复跑此前扩展 path 样本，结果由 **3/4 files、9/10 tests**
+  提升为 **4/4 files、10/10 tests**：`dirname` **3/3**、`is-absolute` **2/2**、
+  `to-namespaced-path` **4/4**、`win32-exists` **1/1**；仅做 bounded no-build
+  确认，不宣称完整 path corpus。
 
 ### W41 Linux 优先推进：planner 修复、8 条候选 lane 实测与 Node 近绿切片
 
