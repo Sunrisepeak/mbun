@@ -719,25 +719,27 @@ public:
                     return fail_run_(s.error());
                 }
                 pump_event_loop("0");
-            } else {
-                // ref: node src/node.cc / lib/internal/modules/esm/loader.js —
-                // when the loop drains with the entry module's top-level await
-                // still pending, node warns and leaves with status 13
-                // (ExitCode::kUnsettledTopLevelAwait). mbun reached the same
-                // state and left with 0, so a worker whose entry never settles
-                // reported a clean exit
-                // (test-worker-data-url asserts exitCode === 13 for
-                // `data:text/javascript,await new Promise(()=>{})`).
-                //
-                // This arm is ONLY reachable from the TLA wrapper above: the
-                // script-mode parse already failed, so the entry really is a
-                // module with an unfinished await, not a sync program. The
-                // 'exit' listeners still run (finish_run_ emits them), and an
-                // explicit process.exitCode set by the module before it parked
-                // still wins, because __mbun_run_exit reads the slot back.
-                std::cerr << "Warning: Detected unsettled top-level await at " << absPath << '\n';
-                return finish_run_(13);
             }
+            // NOT node's status 13 (ExitCode::kUnsettledTopLevelAwait), and the
+            // reason is measured, not assumed. node warns and leaves with 13
+            // when the loop drains with the entry module's await still pending;
+            // w66 implemented exactly that and it cost TWO green bun files,
+            // both re-confirmed at --jobs 1
+            // (js/bun/util/bun-isMainThread.test.js expects exitCode 0 from a
+            // program that awaits a Worker "open" event mbun never fires, and
+            // js/web/workers/worker-terminate-lifetime.test.ts asserts stderr
+            // is EMPTY for `bun -e` programs in the same shape). Both were
+            // passing only because this arm leaves with 0.
+            //
+            // Two things have to be true before 13 can land, and neither is a
+            // worker change: (a) mbun must not idle out on a top level that is
+            // legitimately waiting -- the "open" event above is a real liveness
+            // gap that 13 merely makes visible; (b) bun's own exit code for an
+            // unsettled TLA is 0, so this is a cross-corpus behaviour conflict
+            // and belongs on the dialect census in struck.tsv, not here. A
+            // bare `mbun <file>` is node-flavoured, which is exactly the
+            // invocation both bun files use, so dialect dispatch alone does
+            // NOT separate them.
         } else {
             // Top level ran synchronously to completion. Node/bun keep the process
             // alive until the event loop drains: pending setTimeout/setInterval
