@@ -95,6 +95,22 @@ public:
     [[nodiscard]] std::string peer_certificate_pem() const;
     // SSL_get_verify_result == X509_V_OK — node's socket.authorized.
     [[nodiscard]] bool verify_ok() const noexcept;
+    // node's socket.authorizationError: the X509_V_ERR_* the chain verification
+    // ended on, spelled the way node spells it (the macro name minus the
+    // X509_V_ERR_ prefix, e.g. "UNABLE_TO_VERIFY_LEAF_SIGNATURE").
+    // PORT-SOURCE: compat/node/src/crypto/crypto_common.cc X509ErrorCode.
+    // Empty when the chain verified. Reporting this does not decide anything:
+    // whether an unverified peer is admitted is the caller's rejectUnauthorized,
+    // which is enforced before this is ever read.
+    [[nodiscard]] std::string verify_error_code() const;
+    // node's TLSSocket.getSharedSigalgs() — the signature algorithms both peers
+    // offered (SSL_get_shared_sigalgs), in node's "RSA-PSS+SHA384" spelling.
+    // Server side only; empty before the handshake completes.
+    [[nodiscard]] std::vector<std::string> shared_sigalgs() const;
+    // node's TLSSocket.setMaxSendFragment(size) — SSL_set_max_send_fragment.
+    // Returns false when OpenSSL refuses the size (its documented 512..16384
+    // range), which is exactly what node reports to the caller.
+    bool set_max_send_fragment(std::size_t size) noexcept;
     // Negotiated ALPN protocol (SSL_get0_alpn_selected), empty if none.
     [[nodiscard]] std::string alpn_protocol() const;
     // Drain the NSS-format key-material lines OpenSSL has produced so far, each

@@ -833,6 +833,43 @@ JSValueRef netn_tls_wrap_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
     // inside the caller's own `pfx` archive; see mbun::tls::Config::caExtra for
     // why those cannot be routed through arg 6.
     if (argc > 20) { cfg.caExtra = fs_arg(ctx, argc, args, 20); }
+    // arg 21: node's options.sigalgs, a colon-separated signature-algorithm list
+    // (SecureContext::SetSigalgs). Empty leaves OpenSSL's own list in place.
+    if (argc > 21) { cfg.sigalgs = fs_arg(ctx, argc, args, 21); }
+    // arg 22 (server): the per-servername credentials of tls.Server#addContext,
+    // flattened into one string because this bridge is positional strings only.
+    // Entries are separated by US (0x1f) and their four fields — name, cert PEM,
+    // key PEM, passphrase — by RS (0x1e). Both are control characters no PEM or
+    // DNS name can contain, so the encoding is unambiguous over exactly the
+    // inputs it accepts. A malformed entry is DROPPED rather than guessed at:
+    // presenting the wrong certificate for a name is worse than presenting the
+    // server's default one.
+    if (argc > 22) {
+        const std::string blob{fs_arg(ctx, argc, args, 22)};
+        std::size_t pos{0};
+        while (pos <= blob.size() && !blob.empty()) {
+            const std::size_t end{blob.find('\x1f', pos)};
+            const std::string entry{blob.substr(pos, end == std::string::npos
+                                                        ? std::string::npos
+                                                        : end - pos)};
+            if (!entry.empty()) {
+                std::vector<std::string> f;
+                std::size_t p{0};
+                for (;;) {
+                    const std::size_t e{entry.find('\x1e', p)};
+                    f.push_back(entry.substr(p, e == std::string::npos ? std::string::npos : e - p));
+                    if (e == std::string::npos) break;
+                    p = e + 1;
+                }
+                if (f.size() >= 3 && !f[0].empty() && !f[1].empty() && !f[2].empty()) {
+                    cfg.sniContexts.push_back(mbun::tls::Config::SniCredential{
+                        f[0], f[1], f[2], f.size() > 3 ? f[3] : std::string{}});
+                }
+            }
+            if (end == std::string::npos) break;
+            pos = end + 1;
+        }
+    }
     auto st{std::make_unique<NetTlsState>(
         isServer ? mbun::tls::TlsRole::server : mbun::tls::TlsRole::client, std::move(cfg))};
     if (!st->channel.valid()) {
@@ -1001,6 +1038,26 @@ JSValueRef netn_tls_info_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
              make_string(ctx, est ? st.channel.cipher_standard_name() : std::string{}));
     set_prop(ctx, r, "servername", make_string(ctx, st.channel.peer_server_name()));
     set_prop(ctx, r, "authorized", JSValueMakeBoolean(ctx, est && st.channel.verify_ok()));
+    // socket.authorizationError — the X509_V_ERR_* the chain verification ended
+    // on, in node's spelling. Reported whatever rejectUnauthorized was: node
+    // records the code on the socket even when it admits the peer anyway, and a
+    // caller that asked for verification has already been refused by then.
+    {
+        const std::string vcode{st.channel.verify_error_code()};
+        if (est && !vcode.empty()) set_prop(ctx, r, "verifyError", make_string(ctx, vcode));
+    }
+    // getSharedSigalgs() — server side; the signature algorithms both peers
+    // offered. Empty before the handshake completes.
+    if (est) {
+        std::vector<std::string> sig{st.channel.shared_sigalgs()};
+        if (!sig.empty()) {
+            std::vector<JSValueRef> items;
+            items.reserve(sig.size());
+            for (const std::string& s : sig) items.push_back(make_string(ctx, s));
+            set_prop(ctx, r, "sharedSigalgs",
+                     JSObjectMakeArray(ctx, items.size(), items.data(), nullptr));
+        }
+    }
     set_prop(ctx, r, "alpnProtocol", make_string(ctx, est ? st.channel.alpn_protocol() : std::string{}));
     // node's TLSSocket.isSessionReused() — SSL_session_reused. Meaningful on
     // both roles: the client learns its offered session was accepted, the
@@ -1037,6 +1094,24 @@ JSValueRef netn_tls_info_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::siz
         if (!pfin.empty()) set_prop(ctx, r, "peerFinished", make_string(ctx, b64_encode(pfin.data(), pfin.size())));
     }
     return r;
+#endif
+}
+
+// net.tlsMaxSendFragment(fd, size) → bool. node's
+// TLSSocket.setMaxSendFragment(size) (SSL_set_max_send_fragment): caps the
+// PLAINTEXT carried by one TLS record. `false` is OpenSSL refusing the size
+// (outside its 512..16384 range), which node returns to the caller verbatim.
+JSValueRef netn_tls_max_send_fragment_cb(JSContextRef ctx, JSObjectRef, JSObjectRef,
+                                         std::size_t argc, const JSValueRef args[], JSValueRef*) {
+#if defined(_WIN32)
+    return JSValueMakeBoolean(ctx, false);
+#else
+    const int fd{argc > 0 ? static_cast<int>(JSValueToNumber(ctx, args[0], nullptr)) : -1};
+    const double size{argc > 1 ? JSValueToNumber(ctx, args[1], nullptr) : 0};
+    const auto found{net_tls().find(fd)};
+    if (found == net_tls().end() || !(size > 0)) return JSValueMakeBoolean(ctx, false);
+    return JSValueMakeBoolean(
+        ctx, found->second->channel.set_max_send_fragment(static_cast<std::size_t>(size)));
 #endif
 }
 

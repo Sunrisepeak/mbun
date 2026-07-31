@@ -175,6 +175,10 @@ struct TlsChannel::Impl {
     // ceiling is only ever reached by a peer issuing tickets in a loop.
     std::vector<std::vector<std::uint8_t>> newSessions_ {};
     static constexpr std::size_t kNewSessionMax {16};
+    // SERVER: the per-servername credentials the servername callback picks from.
+    // Kept on the Impl (not in the by-value Config setup_ received) because the
+    // callback runs long after setup_ returned, inside SSL_do_handshake.
+    std::vector<Config::SniCredential> sniContexts_ {};
 
     Impl() = default;
 
@@ -232,7 +236,110 @@ struct TlsChannel::Impl {
             }
             i += 1 + sl;
         }
-        return SSL_TLSEXT_ERR_NOACK;
+        // PORT-SOURCE: compat/node/src/crypto/crypto_tls.cc
+        // TLSWrap::SelectALPNCallback — a server that PUBLISHED an ALPN list and
+        // shares nothing with the client answers with the fatal
+        // no_application_protocol alert (RFC 7301 §3.2), it does not fall back
+        // to an un-negotiated connection. NOACK here is only correct for a
+        // server with no list at all, and this callback is not installed then.
+        return SSL_TLSEXT_ERR_ALERT_FATAL;
+    }
+
+    // RFC 6125 §6.4.3 name matching for tls.Server#addContext, restricted to the
+    // shapes node's SNICallback lookup accepts: an exact (case-insensitive)
+    // match, or a leading "*." wildcard that covers EXACTLY ONE label. "*.a.com"
+    // therefore matches "b.a.com" and not "c.b.a.com" — the corpus asserts that
+    // distinction directly (test-tls-sni-server-client).
+    static bool sni_name_matches_(std::string_view pattern, std::string_view name) {
+        const auto ieq {[](std::string_view a, std::string_view b) {
+            if (a.size() != b.size()) return false;
+            for (std::size_t i {0}; i < a.size(); ++i) {
+                const auto ca {static_cast<unsigned char>(a[i])};
+                const auto cb {static_cast<unsigned char>(b[i])};
+                if (std::tolower(ca) != std::tolower(cb)) return false;
+            }
+            return true;
+        }};
+        if (pattern.size() > 2 && pattern[0] == '*' && pattern[1] == '.') {
+            const std::size_t dot {name.find('.')};
+            if (dot == std::string_view::npos) return false;
+            return ieq(pattern.substr(2), name.substr(dot + 1));
+        }
+        return ieq(pattern, name);
+    }
+
+    // SSL_CTX_set_tlsext_servername_callback. PORT-SOURCE:
+    // compat/node/src/crypto/crypto_tls.cc TLSWrap::SelectSNIContextCallback,
+    // which looks the ClientHello's server_name up in the JS-side context map
+    // and swaps the connection's credentials to the match. node swaps a whole
+    // SecureContext (SSL_set_SSL_CTX); every connection here already owns its
+    // own SSL_CTX, so the equivalent is to install the matched certificate and
+    // key on this SSL directly.
+    //
+    // A name with no entry is NOT an error: node leaves the server's default
+    // context in place, and so does this. The callback can only ever choose
+    // among certificates the server operator themselves supplied.
+    static int servername_cb_(SSL* ssl, int* /*al*/, void* arg) {
+        auto* self {static_cast<Impl*>(arg)};
+        if (ssl == nullptr || self == nullptr) return SSL_TLSEXT_ERR_OK;
+        const char* name {::SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name)};
+        if (name == nullptr || *name == '\0') return SSL_TLSEXT_ERR_OK;
+        const std::string_view want {name};
+        const Config::SniCredential* hit {nullptr};
+        // Exact matches win over wildcards, whatever the insertion order was.
+        for (const auto& c : self->sniContexts_) {
+            if (c.name.size() > 1 && c.name[0] == '*') continue;
+            if (sni_name_matches_(c.name, want)) { hit = &c; break; }
+        }
+        if (hit == nullptr) {
+            for (const auto& c : self->sniContexts_) {
+                if (sni_name_matches_(c.name, want)) { hit = &c; break; }
+            }
+        }
+        if (hit == nullptr) return SSL_TLSEXT_ERR_OK;
+        self->use_sni_credential_(ssl, *hit);
+        return SSL_TLSEXT_ERR_OK;
+    }
+
+    // Install one SNI entry's certificate (plus any chain certs that follow it
+    // in the same PEM) and private key on this connection. A failure leaves the
+    // default credentials in place rather than half-applying: an SSL carrying a
+    // certificate whose key did not load cannot complete a handshake at all.
+    void use_sni_credential_(SSL* ssl, const Config::SniCredential& cred) {
+        BIO* cbio {::BIO_new_mem_buf(cred.certificate.data(),
+                                     static_cast<int>(cred.certificate.size()))};
+        if (cbio == nullptr) return;
+        X509* leaf {::PEM_read_bio_X509(cbio, nullptr, nullptr, nullptr)};
+        std::vector<X509*> chain {};
+        if (leaf != nullptr) {
+            X509* extra {nullptr};
+            while ((extra = ::PEM_read_bio_X509(cbio, nullptr, nullptr, nullptr)) != nullptr) {
+                chain.push_back(extra);
+            }
+        }
+        ::BIO_free(cbio);
+
+        std::string pass {cred.passphrase};
+        BIO* kbio {::BIO_new_mem_buf(cred.key.data(), static_cast<int>(cred.key.size()))};
+        EVP_PKEY* key {kbio != nullptr
+                           ? ::PEM_read_bio_PrivateKey(kbio, nullptr, &pem_password_cb, pass.data())
+                           : nullptr};
+        if (kbio != nullptr) ::BIO_free(kbio);
+
+        if (leaf != nullptr && key != nullptr && ::SSL_use_certificate(ssl, leaf) == 1
+            && ::SSL_use_PrivateKey(ssl, key) == 1) {
+            // Replace (not append to) whatever chain the default context had:
+            // the certificate this connection now presents is a different
+            // identity, and its issuer chain is the one in its own PEM.
+            ::SSL_clear_chain_certs(ssl);
+            for (X509* c : chain) ::SSL_add1_chain_cert(ssl, c);
+        }
+        // Any reason OpenSSL queued while probing is not this connection's
+        // failure; leaving it would surface as a stale reason on the next error.
+        ::ERR_clear_error();
+        for (X509* c : chain) ::X509_free(c);
+        if (leaf != nullptr) ::X509_free(leaf);
+        if (key != nullptr) ::EVP_PKEY_free(key);
     }
 
     // Build the length-prefixed ALPN wire form ("\x02h2\x08http/1.1") from names.
@@ -537,6 +644,16 @@ struct TlsChannel::Impl {
                 return false;
             }
         }
+        // sigalgs (node's options.sigalgs, SecureContext::SetSigalgs). Same rule
+        // as `ciphers` and `ecdhCurve`: a list OpenSSL cannot parse is a hard
+        // construction failure, because quietly keeping the default would let
+        // the handshake use a signature algorithm the caller excluded.
+        if (!config.sigalgs.empty()) {
+            if (::SSL_CTX_set1_sigalgs_list(ctx_, config.sigalgs.c_str()) != 1) {
+                fail_("set1_sigalgs_list: unusable sigalgs");
+                return false;
+            }
+        }
         // dhparam: "auto" hands the choice to OpenSSL's RFC 7919 named groups
         // (SSL_CTX_set_dh_auto), which sizes the group to the certificate's key;
         // otherwise a PEM parameter block is loaded verbatim. Without either,
@@ -581,6 +698,15 @@ struct TlsChannel::Impl {
                     ::SSL_CTX_set_alpn_select_cb(ctx_, &Impl::alpn_select_, this);
                 }
             }
+        }
+
+        // SNI dispatch (server). Installed only when the caller actually
+        // registered per-name credentials, so a server without addContext()
+        // keeps OpenSSL's default "ignore server_name" behaviour untouched.
+        if (role_ == TlsRole::server && !config.sniContexts.empty()) {
+            sniContexts_ = std::move(config.sniContexts);
+            ::SSL_CTX_set_tlsext_servername_callback(ctx_, &Impl::servername_cb_);
+            ::SSL_CTX_set_tlsext_servername_arg(ctx_, this);
         }
 
         // Key-material logging. node installs this unconditionally and gates the
@@ -1024,6 +1150,110 @@ bool TlsChannel::verify_ok() const noexcept {
         return false;
     }
     return ::SSL_get_verify_result(impl_->ssl_) == X509_V_OK;
+}
+
+// PORT-SOURCE: compat/node/src/crypto/crypto_common.cc X509ErrorCode — node
+// spells each X509_V_ERR_* as the macro name without the prefix, and falls back
+// to "UNSPECIFIED_VALIDATION_ERROR" for a code it has no case for. Only the
+// codes node itself enumerates are listed; anything else takes that fallback,
+// which is what node does too.
+namespace {
+struct VerifyCodeName {
+    long code;
+    const char* name;
+};
+constexpr VerifyCodeName kVerifyCodeNames[] {
+    {X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT, "UNABLE_TO_GET_ISSUER_CERT"},
+    {X509_V_ERR_UNABLE_TO_GET_CRL, "UNABLE_TO_GET_CRL"},
+    {X509_V_ERR_UNABLE_TO_DECRYPT_CERT_SIGNATURE, "UNABLE_TO_DECRYPT_CERT_SIGNATURE"},
+    {X509_V_ERR_UNABLE_TO_DECRYPT_CRL_SIGNATURE, "UNABLE_TO_DECRYPT_CRL_SIGNATURE"},
+    {X509_V_ERR_UNABLE_TO_DECODE_ISSUER_PUBLIC_KEY, "UNABLE_TO_DECODE_ISSUER_PUBLIC_KEY"},
+    {X509_V_ERR_CERT_SIGNATURE_FAILURE, "CERT_SIGNATURE_FAILURE"},
+    {X509_V_ERR_CRL_SIGNATURE_FAILURE, "CRL_SIGNATURE_FAILURE"},
+    {X509_V_ERR_CERT_NOT_YET_VALID, "CERT_NOT_YET_VALID"},
+    {X509_V_ERR_CERT_HAS_EXPIRED, "CERT_HAS_EXPIRED"},
+    {X509_V_ERR_CRL_NOT_YET_VALID, "CRL_NOT_YET_VALID"},
+    {X509_V_ERR_CRL_HAS_EXPIRED, "CRL_HAS_EXPIRED"},
+    {X509_V_ERR_ERROR_IN_CERT_NOT_BEFORE_FIELD, "ERROR_IN_CERT_NOT_BEFORE_FIELD"},
+    {X509_V_ERR_ERROR_IN_CERT_NOT_AFTER_FIELD, "ERROR_IN_CERT_NOT_AFTER_FIELD"},
+    {X509_V_ERR_ERROR_IN_CRL_LAST_UPDATE_FIELD, "ERROR_IN_CRL_LAST_UPDATE_FIELD"},
+    {X509_V_ERR_ERROR_IN_CRL_NEXT_UPDATE_FIELD, "ERROR_IN_CRL_NEXT_UPDATE_FIELD"},
+    {X509_V_ERR_OUT_OF_MEM, "OUT_OF_MEM"},
+    {X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT, "DEPTH_ZERO_SELF_SIGNED_CERT"},
+    {X509_V_ERR_SELF_SIGNED_CERT_IN_CHAIN, "SELF_SIGNED_CERT_IN_CHAIN"},
+    {X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY, "UNABLE_TO_GET_ISSUER_CERT_LOCALLY"},
+    {X509_V_ERR_UNABLE_TO_VERIFY_LEAF_SIGNATURE, "UNABLE_TO_VERIFY_LEAF_SIGNATURE"},
+    {X509_V_ERR_CERT_CHAIN_TOO_LONG, "CERT_CHAIN_TOO_LONG"},
+    {X509_V_ERR_CERT_REVOKED, "CERT_REVOKED"},
+    {X509_V_ERR_INVALID_CA, "INVALID_CA"},
+    {X509_V_ERR_PATH_LENGTH_EXCEEDED, "PATH_LENGTH_EXCEEDED"},
+    {X509_V_ERR_INVALID_PURPOSE, "INVALID_PURPOSE"},
+    {X509_V_ERR_CERT_UNTRUSTED, "CERT_UNTRUSTED"},
+    {X509_V_ERR_CERT_REJECTED, "CERT_REJECTED"},
+    {X509_V_ERR_HOSTNAME_MISMATCH, "HOSTNAME_MISMATCH"},
+};
+} // namespace
+
+std::string TlsChannel::verify_error_code() const {
+    if (impl_->ssl_ == nullptr) {
+        return {};
+    }
+    const long rc {::SSL_get_verify_result(impl_->ssl_)};
+    if (rc == X509_V_OK) {
+        return {};
+    }
+    for (const auto& e : kVerifyCodeNames) {
+        if (e.code == rc) return e.name;
+    }
+    return "UNSPECIFIED_VALIDATION_ERROR";
+}
+
+std::vector<std::string> TlsChannel::shared_sigalgs() const {
+    std::vector<std::string> out {};
+    if (impl_->ssl_ == nullptr) {
+        return out;
+    }
+    // PORT-SOURCE: compat/node/src/crypto/crypto_tls.cc TLSWrap::GetSharedSigalgs
+    // — SSL_get_shared_sigalgs, rendered as "<sig>+<hash>" with node's own
+    // spelling of the few algorithms OpenSSL names differently (RSA-PSS, EdDSA).
+    const int count {::SSL_get_shared_sigalgs(impl_->ssl_, 0, nullptr, nullptr, nullptr,
+                                              nullptr, nullptr)};
+    for (int i {0}; i < count; ++i) {
+        int signNid {0};
+        int hashNid {0};
+        ::SSL_get_shared_sigalgs(impl_->ssl_, i, &signNid, &hashNid, nullptr, nullptr, nullptr);
+        std::string entry {};
+        switch (signNid) {
+        case EVP_PKEY_RSA: entry = "RSA+"; break;
+        case EVP_PKEY_RSA_PSS: entry = "RSA-PSS+"; break;
+        case EVP_PKEY_DSA: entry = "DSA+"; break;
+        case EVP_PKEY_EC: entry = "ECDSA+"; break;
+        case NID_ED25519: entry = "Ed25519+"; break;
+        case NID_ED448: entry = "Ed448+"; break;
+        default: {
+            const char* sn {::OBJ_nid2sn(signNid)};
+            entry = sn != nullptr ? std::string {sn} + "+" : std::string {"UNDEF+"};
+            break;
+        }
+        }
+        const char* hn {::OBJ_nid2sn(hashNid)};
+        entry += hn != nullptr ? hn : "UNDEF";
+        out.push_back(std::move(entry));
+    }
+    return out;
+}
+
+bool TlsChannel::set_max_send_fragment(std::size_t size) noexcept {
+    if (impl_->ssl_ == nullptr) {
+        return false;
+    }
+    const bool ok {::SSL_set_max_send_fragment(impl_->ssl_, size) == 1};
+    if (!ok) {
+        // OpenSSL queues SSL_R_INVALID_MAX_SEND_FRAGMENT; the caller only sees
+        // `false` (node's return value), so the reason must not linger.
+        ::ERR_clear_error();
+    }
+    return ok;
 }
 
 std::vector<std::string> TlsChannel::take_keylog() {

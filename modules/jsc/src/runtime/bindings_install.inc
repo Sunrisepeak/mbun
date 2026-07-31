@@ -1203,6 +1203,7 @@
         set_fn(ctx_, nn, "tlsTicket", netn_tls_ticket_cb);
         set_fn(ctx_, nn, "tlsExportKeyingMaterial", netn_tls_export_keying_material_cb);
         set_fn(ctx_, nn, "tlsSelfSigned", netn_tls_self_signed_cb);
+        set_fn(ctx_, nn, "tlsMaxSendFragment", netn_tls_max_send_fragment_cb);
         set_prop(ctx_, global, "__mbunNetNative", nn);
         // T-LOOP: Bun.serve over the native epoll event loop (Http1Server on
         // mbun.event_loop; Linux-only — elsewhere this is a no-op and Bun.serve

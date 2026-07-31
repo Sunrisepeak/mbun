@@ -1824,7 +1824,15 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
                    // the caller's own `pfx` archive travel here — routing them
                    // through `ca` would make that the WHOLE store and revoke the
                    // platform anchors (and NODE_EXTRA_CA_CERTS) with it.
-                   o.caExtra || "");
+                   o.caExtra || "",
+                   // sigalgs: node's options.sigalgs, a colon-separated
+                   // signature-algorithm list. "" leaves OpenSSL's own alone.
+                   o.sigalgs || "",
+                   // sniContexts: the SERVER's per-servername credentials
+                   // (tls.Server#addContext), pre-flattened by the tls layer into
+                   // the US/RS-delimited form the native bridge parses. "" is a
+                   // server that registered none, i.e. no SNI dispatch at all.
+                   o.sniContexts || "");
         this._tls = 1;
       } catch (e) { this._fail(e); }
       return this;

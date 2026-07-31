@@ -118,6 +118,28 @@ export struct Config {
     // preference in place. Restricting the group list can only NARROW what is
     // negotiable.
     std::string ecdhCurve {};
+    // node's options.sigalgs — the colon-separated signature-algorithm list
+    // (e.g. "RSA-PSS+SHA384:ed25519") handed to SSL_CTX_set1_sigalgs_list.
+    // PORT-SOURCE: compat/node/src/crypto/crypto_context.cc
+    // SecureContext::SetSigalgs. Empty leaves OpenSSL's own list alone; a list
+    // OpenSSL rejects is a hard construction failure rather than a silent
+    // widening, for the same reason `ciphers` is.
+    std::string sigalgs {};
+    // SERVER: the per-servername credentials node's tls.Server keeps in
+    // `server._contexts` (tls.Server#addContext). The ClientHello's SNI value
+    // picks one; no match leaves the context's own certificate in place, which
+    // is node's behaviour when SNICallback finds nothing.
+    //
+    // These are ADDITIONAL identities the server itself supplied — they never
+    // widen what the server TRUSTS, only which of the operator's own
+    // certificates is presented for a given name.
+    struct SniCredential {
+        std::string name {};        // "a.example.com" or a "*.example.com" wildcard
+        std::string certificate {}; // leaf PEM (+ any chain certs after it)
+        std::string key {};         // its private key PEM
+        std::string passphrase {};  // for an encrypted key; empty = the empty password
+    };
+    std::vector<SniCredential> sniContexts {};
 
     [[nodiscard]] bool has_credentials() const noexcept {
         return !certificate.empty() || !key.empty();

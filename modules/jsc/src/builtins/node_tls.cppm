@@ -543,6 +543,26 @@ inline constexpr std::string_view kNodeTlsJS = R"JS(
         }
       }
     }
+    // PORT-SOURCE: compat/node/src/crypto/crypto_context.cc
+    // SecureContext::SetDHParam — the DH prime is measured at
+    // createSecureContext() time, refused under 1024 bits and warned about
+    // under 2048. Raising it here, rather than at the handshake, is what
+    // test-tls-client-mindhsize's synchronous assert.throws expects, and it is
+    // also the only moment at which refusing costs nothing: past this point a
+    // server is already listening on a group too small to be safe.
+    if (TN && typeof TN.dhParamBits === "function" && options.dhparam != null
+        && options.dhparam !== "auto") {
+      const dhPem = pemText(options.dhparam);
+      if (dhPem.indexOf("BEGIN") !== -1) {
+        let bits = 0;
+        try { bits = TN.dhParamBits(dhPem) | 0; } catch (e) { bits = 0; }
+        if (bits > 0 && bits < 1024)
+          throw ERR_INVALID_ARG_VALUE("options.dhparam", options.dhparam,
+                                      "DH parameter is less than 1024 bits");
+        if (bits >= 1024 && bits < 2048 && G.process && typeof G.process.emitWarning === "function")
+          G.process.emitWarning("DH parameter is less than 2048 bits");
+      }
+    }
     const min = options.minVersion != null ? options.minVersion : DEFAULT_MIN_VERSION;
     const max = options.maxVersion != null ? options.maxVersion : DEFAULT_MAX_VERSION;
     const cas = [];

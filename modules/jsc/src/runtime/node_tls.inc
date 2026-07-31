@@ -126,6 +126,39 @@ inline JSValueRef node_tls_check_cipher_suites_cb(JSContextRef ctx, JSObjectRef,
     return JSValueMakeBoolean(ctx, ok);
 }
 
+// __mbunNodeTlsNative.dhParamBits(pem) → the prime size in bits of a PEM DH
+// parameter block, or 0 when the argument is not one. PORT-SOURCE:
+// compat/node/src/crypto/crypto_context.cc SecureContext::SetDHParam, which
+// reads BN_num_bits(p) and REFUSES anything under 1024 bits at
+// createSecureContext() time ("DH parameter is less than 1024 bits") while only
+// warning between 1024 and 2048. That refusal is a security floor, not a
+// formatting check: a 512-bit group is breakable, and accepting it silently
+// would have every DHE handshake on that server negotiate it. Reporting the
+// size here lets the JS layer raise node's error at node's moment — before a
+// connection exists — instead of discovering it as a handshake failure.
+inline JSValueRef node_tls_dh_param_bits_cb(JSContextRef ctx, JSObjectRef, JSObjectRef,
+                                            std::size_t argc, const JSValueRef argv[],
+                                            JSValueRef*) {
+    if (argc < 1) return JSValueMakeNumber(ctx, 0);
+    const std::string pem{val_to_string(ctx, argv[0])};
+    int bits{0};
+    if (BIO* bio{BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size()))}) {
+        if (EVP_PKEY* params{PEM_read_bio_Parameters(bio, nullptr)}) {
+            BIGNUM* p{nullptr};
+            if (EVP_PKEY_get_bn_param(params, OSSL_PKEY_PARAM_FFC_P, &p) == 1 && p != nullptr) {
+                bits = BN_num_bits(p);
+                BN_free(p);
+            }
+            EVP_PKEY_free(params);
+        }
+        BIO_free(bio);
+    }
+    // A non-DH argument leaves a parse reason queued; it is not an error here
+    // (0 says "not DH parameters"), so it must not surface on a later call.
+    ERR_clear_error();
+    return JSValueMakeNumber(ctx, bits);
+}
+
 // __mbunNodeTlsNative.rootCertificates() → string[] of PEM certificates from the
 // platform trust store — the store mbun actually verifies chains against. node
 // answers tls.rootCertificates from its vendored Mozilla NSS bundle
@@ -251,5 +284,6 @@ inline void install_node_tls_native(JSContextRef ctx, JSObjectRef global) {
     set_fn(ctx, tn, "rootCertificates", node_tls_root_certificates_cb);
     set_fn(ctx, tn, "checkKeyCert", node_tls_check_key_cert_cb);
     set_fn(ctx, tn, "pfxParse", node_tls_pfx_parse_cb);
+    set_fn(ctx, tn, "dhParamBits", node_tls_dh_param_bits_cb);
     set_prop(ctx, global, "__mbunNodeTlsNative", tn);
 }
