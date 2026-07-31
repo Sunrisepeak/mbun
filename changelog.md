@@ -103,6 +103,13 @@
   accessor identity；这些属于 global proxy/interceptor 边界，暂不扩大 mirror rewrite。
   本 checkpoint 共记录 15 个 named VM 文件 exit 0、6 个 distinct RED boundary，仍不替代
   full-corpus score，未跑全量。
+- `aafba81` 修复 `bun_corpus_runner.py` 在 symlinked `compat/bun` worktree 下的发现路径：
+  保留 lexical corpus path，避免 `relative_to(--root)` 在真实共享语料目录上越界；新增
+  symlink regression，修复前 RED、修复后 runner self-test 全绿。真实 Bun `test/js/node`
+  五文件 bounded probe（4 jobs）重复结果为 **2 green / 3 test-failure**，共
+  **198/206 passed tests、8 failed tests**；`net/blocklist-gc` 与 `tls/node-tls-upgrade`
+  green，crypto 为 **196/202**，readline 为可复现的 pause/resume 时序差异，trace-events
+  为 proxy network error wording。未跑 Bun 全量。
 - `163a0a3` 将本地敏感信息过滤规则加入 `hagent/agents.md` 及中文同步页；该受保护面
   需要维护者签字，不由 agent 自行合并。PR #36 已同步两轮候选实测和本节点策略。
 

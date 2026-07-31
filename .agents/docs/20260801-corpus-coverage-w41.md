@@ -254,6 +254,24 @@ from engine-boundary failures without another build:
   distinct RED boundaries were recorded. This is probe data, not a replacement
   for the repository's full-corpus score; no full corpus run was started.
 
+The first bounded Bun-native probe also hardened the measurement path:
+
+- The initial `bun_corpus_runner.py` invocation exposed a harness-only failure:
+  resolving a symlinked `compat/bun` checkout made its discovered files fall
+  outside the lexical `--root`. `aafba81` keeps the discovery path lexical and
+  adds a symlink regression to the runner self-test; the regression is RED
+  before the change and the full self-test is GREEN after it.
+- The repaired runner measured five real `compat/bun/test/js/node` files with
+  four bounded jobs. The repeated result is **2 green files**, **3 test-failure
+  files**, **198/206 passed tests**, and **8 failed tests**. The green files were
+  `test/js/node/net/blocklist-gc.test.ts` and
+  `test/js/node/tls/node-tls-upgrade.test.ts`; the crypto file reached
+  **196/202** with six failures, readline had one timing/stream expectation
+  failure, and trace-events had one proxy-network error expectation failure.
+- No build was needed for the runner fix and no full Bun corpus run was
+  started. The Bun result remains a measured five-file slice, not a new full
+  corpus score.
+
 ## Next route
 
 1. Keep the native-syntax compatibility gate limited to the two measured
