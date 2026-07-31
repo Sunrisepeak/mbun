@@ -190,6 +190,22 @@ jobs:
       # the macOS artifact and this toolchain are both libc++, so the whole
       # workspace is attempted. If it turns out otherwise, this is where it
       # shows up, and SKIP_MEMBERS is the same escape hatch linux uses.
+      # Run the readiness/socket vectors FIRST and on their own. `mcpp test
+      # --workspace` reaches modules/install before it reaches these, and a hang
+      # in install's network tests eats the whole budget, so the three modules
+      # that would actually localise a kqueue fault never get to run. Cheap, and
+      # it answers the only open question: if these pass, the Darwin backend
+      # honours the same contract epoll does and the fault is above it.
+      - name: Test (readiness + socket backends)
+        continue-on-error: true
+        timeout-minutes: 15
+        run: |
+          for m in modules/event_loop modules/runtime_socket modules/runtime_server; do
+            echo "::group::$m"
+            mcpp test -p "$m" || echo "MEMBER FAILED: $m"
+            echo "::endgroup::"
+          done
+
       # timeout-minutes is not boilerplate here: the first run of this step HUNG
       # rather than failed. modules/event_loop has no macOS readiness backend --
       # epoll_backend.cppm's non-linux path returns an empty BackendSeam and a
