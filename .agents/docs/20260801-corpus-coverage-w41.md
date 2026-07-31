@@ -420,6 +420,28 @@ surface on Linux:
   This is a real runtime result for the selected files, not a ported-symbol
   claim; no build or full Bun corpus run was started.
 
+### W41 stream-like spawn stdin：async pipe owner 实测推进
+
+- Wave 46 的四文件基线为 `spawn-stdin-readable-stream` **7/30**、
+  `spawn-streaming-stdout` **1/1**、`spawnSync` **6/16**，另有 broad
+  `spawn.test` 在 30 秒边界超时；四文件合计 **32 passed、10 failed**。
+- `90d895d` 将真实 `ReadableStream` 与 async iterable stdin 接入已有
+  `spawnEx`/`__mbun_io_tick` 路径；reader/iterator 在 child exit 时分别走
+  `cancel()`/`return()`，普通 EOF 仍通过 `stdin.end()` 收口。为绕开
+  `process_web.cppm` 已接近 GCC constexpr 字符串上限，适配器保持在相邻
+  `bun_spawn_stream.cppm` payload 分区。
+- fresh Linux build 成功（约 **61 秒**）。同一四文件 bounded probe（4 jobs、
+  30 秒/文件）后为：stream stdin **27/30 passed、1 failed、2 TODO**，其中
+  两项 async-iterable child-exit 用例已通过；streaming-stdout 仍为 **1/1**、
+  **211 expects**；四文件合计 **34 passed、8 failed、47 ran、288 expects**。
+- stream 文件唯一剩余失败是其 upstream `ReadableStream object type count`
+  的 50-child burst，在 `spawnEx: fork() failed` 处触发 native spawn-burst
+  资源边界；单文件复测仍复现，因此不归因于四 lane 并发，也不继续扩大本
+  owner 的改动。`spawnSync` 与 broad `spawn.test` 维持原有独立 owner。
+- 构建后资源记录约 **44 GiB available memory**、swap 可用约 **163 MiB**、
+  根分区可用约 **23 GiB**；临时构建产物 dry-run 未发现安全可回收量，未做
+  清理，未启动全量 corpus。
+
 ## Next route
 
 1. Keep the native-syntax compatibility gate limited to the two measured
