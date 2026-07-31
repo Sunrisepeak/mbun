@@ -322,6 +322,17 @@ One more no-build Bun standard-module wave kept the same fast lane:
   UTF-16 timer-label formatting and immediate-exception/microtask ordering.
   No runtime-wide timer change was attempted from those two boundaries.
 
+The following four-lane Bun native probe kept only two narrow green slices:
+
+- `dgram/node-dgram.test.js` is green at **3/3 tests** and
+  `module/module-children-concurrent-gc.test.ts` at **1/1**.
+- `v8/v8-date-parser.test.js` reached **2/5 tests**; the failures are JSC date
+  parser semantics, not a broad v8 API absence.
+- `test_runner/node-test.test.ts` reached **1/18 tests**; failures span the
+  already measured `t.assert` surface, test hooks/async scheduling, nested
+  test errors, and mock APIs. It remains parked as a multi-owner test-runner
+  boundary rather than a speculative bundle of fixes.
+
 ## Next route
 
 1. Keep the native-syntax compatibility gate limited to the two measured
