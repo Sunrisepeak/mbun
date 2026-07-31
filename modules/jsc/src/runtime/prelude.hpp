@@ -108,6 +108,17 @@
 #include <JavaScriptCore/Symbol.h>
 #include <JavaScriptCore/WeakHandleOwner.h>
 #include <JavaScriptCore/WeakInlines.h>
+// PORT-SOURCE: compat/bun/src/jsc/bindings/JSCTaskScheduler.cpp,
+// compat/bun/src/jsc/bindings/BunClientData.cpp:110-118.
+// JSC parks post-GC work -- JSFinalizationRegistry cleanup callbacks,
+// Atomics.waitAsync resumptions, async WebAssembly compile completions -- on
+// VM::deferredWorkTimer, a JSRunLoopTimer. mbun never runs WTF's RunLoop on
+// the JS thread, so that timer NEVER fires and the parked work is dropped on
+// the floor forever. bun does not run the RunLoop either; it replaces the
+// timer's dispatch with onAddPendingWork/onScheduleWorkSoon hooks that queue
+// into its own event loop. mbun's equivalent is to drain the timer's task
+// queue from its own pump (see mbun_drain_deferred_work).
+#include <JavaScriptCore/DeferredWorkTimer.h>
 #if !defined(_WIN32)
 #  include <dlfcn.h>  // dlopen/dlsym for .node addon loading
 #endif

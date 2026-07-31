@@ -806,6 +806,26 @@
                        JSC::JSLockHolder locker{vm};
                        vm.heap.collectNow(JSC::Synchronousness::Sync, JSC::CollectionScope::Full);
                        vm.finalizeSynchronousJSExecution();
+                       // NOTE: the collection only PARKS each
+                       // FinalizationRegistry's cleanup on VM::deferredWorkTimer
+                       // -- it does not run it. Draining that queue here, so the
+                       // callback fires before Bun.gc returns, was tried and
+                       // REVERTED: DeferredWorkTimer::doWork ends with an
+                       // unconditional vm.drainMicrotasks(), which turns
+                       // Bun.gc(true) into a microtask checkpoint that bun's
+                       // Bun.gc is not. js/node/zlib/zlib-estimated-size-gc's
+                       // fixture writes with a completion callback and then
+                       // calls Bun.gc(true) twice inside a loop; the callbacks
+                       // started landing mid-loop, its "print OK when the last
+                       // write finishes" counter hit zero twice, and the file
+                       // printed "OK\nOK" -- two green tests lost. Skipping the
+                       // drain when no work is parked does not help either,
+                       // because unrelated pending tickets are usually
+                       // outstanding. The drain points are the two places that
+                       // are already microtask checkpoints -- the native pump
+                       // and __mbunDrainMicrotasksNative -- and every
+                       // collectability test in the corpus awaits between its
+                       // Bun.gc calls, so one of them is always reached.
                    } else {
                        JSGarbageCollect(c);
                    }
@@ -830,7 +850,21 @@
         set_fn(ctx_, global, "__mbunDrainMicrotasksNative",
                [](JSContextRef c, JSObjectRef, JSObjectRef, std::size_t, const JSValueRef[],
                   JSValueRef*) -> JSValueRef {
-                   if (JSC::JSGlobalObject* g{::toJS(c)}) g->vm().drainMicrotasks();
+                   if (JSC::JSGlobalObject* g{::toJS(c)}) {
+                       g->vm().drainMicrotasks();
+                       // Post-GC work parked on VM::deferredWorkTimer (a
+                       // FinalizationRegistry's cleanup, above all) drains here
+                       // as well as in Runtime::drain_microtasks_, because the
+                       // native pump is NOT the only loop: `mbun test` runs the
+                       // test runner's own loop and process_web's timer loop,
+                       // and both checkpoint through this entry point. A file
+                       // that spins `await setImmediate(...); Bun.gc(true);`
+                       // until a finalizer fires (js/node/util/test-aborted)
+                       // never reaches the native pump at all and hung forever.
+                       // This is already a checkpoint by definition, so the
+                       // drain adds no ordering the callers do not expect.
+                       mbun_drain_deferred_work(g->vm());
+                   }
                    return JSValueMakeUndefined(c);
                });
         // node's runMicrotasks(): exhaust the microtask queue and NOTHING else.

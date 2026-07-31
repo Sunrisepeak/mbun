@@ -768,7 +768,16 @@ public:
     // module could not pump its own promise to completion and returned exports
     // that the module body had not filled in yet.
     void drain_microtasks_() {
-        if (JSC::JSGlobalObject* g{::toJS(ctx_)}) g->vm().drainMicrotasks();
+        if (JSC::JSGlobalObject* g{::toJS(ctx_)}) {
+            g->vm().drainMicrotasks();
+            // JSC parks post-GC work (FinalizationRegistry cleanups,
+            // Atomics.waitAsync resumptions, async WebAssembly compiles) on
+            // VM::deferredWorkTimer, a JSRunLoopTimer whose RunLoop mbun never
+            // enters. This pump is one of the timer's two drain points; the
+            // other is __mbunDrainMicrotasksNative, for the loops that run in
+            // JS (`mbun test`, process_web's timers).
+            mbun_drain_deferred_work(g->vm());
+        }
         // CAP-NAPI: GC-time addon finalizers are deferred (Node runs them on
         // the loop, never inside GC); the pump is their drain point.
         mbun_napi_drain_deferred_finalizers();

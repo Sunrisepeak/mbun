@@ -3476,6 +3476,19 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
         proc.stdin.end();
         return proc;
       }
+      // Blob (and Bun.file(), which IS one) stdin — see BLOB-STDIN below.
+      const stdinBlob = !stdinBytes && s.opts.stdin != null &&
+        typeof s.opts.stdin === "object" && typeof s.opts.stdin.arrayBuffer === "function" &&
+        typeof s.opts.stdin.size === "number";
+      if (PN && PN.spawnEx && stdinBlob) {
+        const proc = spawnAsyncBun(s.cmd, { ...s.opts, stdin: "pipe" });
+        const endStdin = () => { try { proc.stdin.end(); } catch (e) {} };
+        s.opts.stdin.arrayBuffer().then((ab) => {
+          try { if (ab && ab.byteLength > 0) proc.stdin.write(new Uint8Array(ab)); } catch (e) {}
+          endStdin();
+        }, endStdin);
+        return proc;
+      }
       // stdin: "pipe" rides the fully async spawnEx/io_tick path too — the old
       // spawnPipes path drains stdout/stderr with BLOCKING reads, which parks
       // the JS thread and starves the virtual event loop (deadlocking a child
@@ -3808,5 +3821,23 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       Bun.cron = Object.assign(function () { throw new Error("Bun.cron scheduling is not implemented yet in mbun"); }, { parse });
     }
 )JS";
+
+// BLOB-STDIN (Bun.spawn, kProcessWebJS above). bun accepts a Blob as `stdin`
+// and hands the child its bytes; Bun.file() returns a Blob, so a file stdin is
+// the same case. mbun recognised only ArrayBuffer/views, so a Blob fell through
+// to the synchronous runNative path, which closes the child's fd 0 without ever
+// writing -- measured, a 64 KiB Blob reached the child as 0 bytes, and every
+// spawn in js/node/module/sourcemap-simd.test.ts (24 tests) died that way.
+//
+// The bytes are only reachable through a promise (Blob.arrayBuffer), so the
+// Blob case rides the same live-pipe path as the byte case and writes when they
+// arrive; the child simply blocks on the read until then, which is what the
+// pipe is for. The test is structural (arrayBuffer + numeric size) rather than
+// `instanceof Blob` on purpose: it must include a BunFile, and must exclude
+// Bun.stdin (a plain object wrapper, not a Blob) and a ReadableStream.
+//
+// The rationale lives out here, in C++, and not beside the code it explains,
+// because kProcessWebJS is 261 KB against GCC's 262144-char constexpr strlen
+// ceiling -- prose inside the raw string is charged against that budget.
 
 }  // namespace mbun::jsc::builtins::detail

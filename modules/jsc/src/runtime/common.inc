@@ -406,3 +406,56 @@ bool permission_deny_scope(JSContextRef ctx, JSValueRef* exc, mbun::permission::
     if (exc != nullptr) *exc = permission_denied_error(ctx, scope, resource);
     return true;
 }
+
+// ── JSC deferred work (post-GC / cross-thread) ──────────────────────────────
+// PORT-SOURCE: compat/bun/src/jsc/bindings/JSCTaskScheduler.cpp
+//
+// JSC does not run a FinalizationRegistry's cleanup callback inside GC. The
+// End phase only MOVES the dead holdings onto the registry, then parks the
+// callback on VM::deferredWorkTimer (JSFinalizationRegistry::
+// finalizeUnconditionally -> scheduleWorkSoon). DeferredWorkTimer is a
+// JSRunLoopTimer, so it only fires when someone runs WTF's RunLoop on the JS
+// thread. mbun runs its OWN pump and never enters that RunLoop, so the parked
+// task sat in DeferredWorkTimer::m_tasks forever: `Bun.gc(true)` cleared
+// WeakRefs (finalizeSynchronousJSExecution bumps the weak version) yet no
+// FinalizationRegistry callback ever ran -- measured 0/8 finalizers after 60
+// forced collections. bun hits the same wall and solves it by REPLACING the
+// timer's dispatch (onScheduleWorkSoon -> its own event loop); the equivalent
+// with a pump we already own is to drain the queue from the pump.
+//
+// Same queue carries Atomics.waitAsync resumptions and async WebAssembly
+// compile completions, so this is not finalizer-specific plumbing.
+//
+// doWork() asserts the caller holds the API lock and calls vm.drainMicrotasks()
+// after each task, so it must run at a point where re-entering JS is legal --
+// i.e. the same places we already drain microtasks, never inside GC itself.
+void mbun_drain_deferred_work(JSC::VM& vm) {
+    // The API lock is NOT optional here, and its absence does not fail loudly.
+    // A parked task calls back into JS (JSFinalizationRegistry::
+    // runFinalizationCleanup invokes the user callback), and JSLock::lock is
+    // what installs vm.atomStringTable() as the CURRENT THREAD's AtomString
+    // table. Compiling/running that callback allocates, an allocation can
+    // trigger a sweep, and the sweep destroys cells (JSC::SymbolTable) holding
+    // AtomStrings interned in the VM's table -- which AtomStringImpl::remove
+    // then looks for in the thread's default table and cannot find:
+    //   RELEASE_ASSERT ... WTFCrashWithInfoImpl, on a string as ordinary as
+    //   "eventName".
+    // The native pump (Runtime::drain_microtasks_) runs OUTSIDE any JS call,
+    // so it holds no lock of its own; JSLock is recursive, so taking it here is
+    // also correct for the caller that already holds one
+    // (__mbunDrainMicrotasksNative, reached from JS).
+    JSC::DeferredWorkTimer* deferred{vm.deferredWorkTimer.ptr()};
+    if (deferred == nullptr) return;
+    // doWork() ends with an unconditional vm.drainMicrotasks(), so it is only
+    // safe where a microtask checkpoint is ALREADY expected. That is why the
+    // callers are exactly the two checkpoints -- the native pump and
+    // __mbunDrainMicrotasksNative -- and why Bun.gc(true) deliberately is not
+    // one (see the note in bindings_install.inc's __mbunGcNative). Skipping
+    // when nothing is parked keeps the hot tick off the timer's lock; a
+    // scheduled task always has a pending ticket, so this cannot hide work.
+    if (!deferred->hasAnyPendingWork()) return;
+    JSC::JSLockHolder locker{vm};
+    // Virtual dispatch through the JSRunLoopTimer base: doWork is the timer's
+    // pure-virtual entry, so this needs no exported symbol.
+    static_cast<JSC::JSRunLoopTimer*>(deferred)->doWork(vm);
+}
