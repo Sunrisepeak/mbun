@@ -168,7 +168,16 @@ The previously published 44.5% was a product of these defects and was never real
 
 ## Limitations
 
-- Linux x86_64 is the primary validated target.
+- Linux x86_64 is the primary validated target: it is the only one the corpus
+  numbers above were measured on, and the only one whose CI runs the workspace
+  unit tests and the example-app smoke.
+- macOS arm64 builds and runs. CI compiles the whole workspace and executes the
+  binary on `macos-latest`; the wider test steps there are still being observed
+  and are not yet gates. The numbers above have not been re-measured on it, so
+  treat them as Linux figures until they are.
+- Windows is not built or tested. The source carries `_WIN32` branches, but
+  nothing has ever been compiled for it here, so that is intent rather than
+  support.
 - JavaScriptCore and native dependencies are built through mcpp packages.
 - Compatibility varies by API, package, and execution mode; passing the demos does not imply full Bun or Node.js compatibility.
 - No prebuilt binary or stable release package is provided yet.
