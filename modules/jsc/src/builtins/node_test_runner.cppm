@@ -280,11 +280,27 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
     // file manager. The standalone runner owns the TestContext, so it creates
     // one manager lazily and shares it across contexts in this process.
     let snapshotRuntime;
+    const snapshotRequire = () => {
+      try {
+        const moduleApi = M["module"] || M["node:module"];
+        const createRequire = moduleApi && moduleApi.createRequire;
+        const file = entryFile();
+        if (typeof createRequire === "function" && typeof file === "string") {
+          return createRequire(file);
+        }
+      } catch (error) {}
+      if (typeof G.require === "function") return G.require;
+      return undefined;
+    };
     const getSnapshotRuntime = () => {
       if (snapshotRuntime !== undefined) return snapshotRuntime;
-      if (typeof G.require !== "function") return undefined;
+      const req = snapshotRequire();
+      if (typeof req !== "function") return undefined;
+      const previousRequire = G.require;
+      const replaceGlobalRequire = previousRequire !== req;
+      if (replaceGlobalRequire) G.require = req;
       try {
-        const snapshotModule = G.require("internal/test_runner/snapshot");
+        const snapshotModule = req("internal/test_runner/snapshot");
         if (!snapshotModule || typeof snapshotModule.SnapshotManager !== "function") return undefined;
         const argvHas = (list, flag) => Array.isArray(list) && list.indexOf(flag) !== -1;
         const processObj = G.process;
@@ -302,6 +318,11 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
         return snapshotRuntime;
       } catch (error) {
         return undefined;
+      } finally {
+        if (replaceGlobalRequire) {
+          if (previousRequire === undefined) delete G.require;
+          else G.require = previousRequire;
+        }
       }
     };
     const snapshotApi = {

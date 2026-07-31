@@ -149,8 +149,15 @@ inline constexpr std::string_view kNodeTestRunJS = R"JS(
                 tapEscape(data.name) + directive + "\n";
           const ms = data.details && data.details.duration_ms !== undefined ? data.details.duration_ms : 0;
           if (data.nesting === 0) duration += ms;
-          yield indent(data.nesting) + "  ---\n" + indent(data.nesting) + "  duration_ms: " + ms + "\n" +
-                indent(data.nesting) + "  ...\n";
+          let detail = indent(data.nesting) + "  ---\n" + indent(data.nesting) +
+            "  duration_ms: " + ms + "\n";
+          if (failed && data.details && data.details.error) {
+            const error = data.details.error;
+            const name = error && typeof error.name === "string" ? error.name : "Error";
+            const message = error && error.message !== undefined ? String(error.message) : String(error);
+            detail += indent(data.nesting) + "  error: " + JSON.stringify(name + ": " + message) + "\n";
+          }
+          yield detail + indent(data.nesting) + "  ...\n";
         } else if (type === "test:diagnostic") {
           yield indent(data.nesting) + "# " + tapEscape(data.message) + "\n";
         }

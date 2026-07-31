@@ -73,23 +73,28 @@ the standalone TestContext:
   `setDefaultSnapshotSerializers()` are exposed.
 - `test-runner-snapshot-file-tests.js` is **1/1 pass**; its validation and
   update/read flows pass.
-- `test-runner-snapshot-tests.js` reaches **32/33 subtests pass**. The remaining
-  subtest exercises the separate multi-file `--test --test-isolation=none` CLI
-  path, which still fails before the fixture tests are collected.
+- The multi-file `--test --test-isolation=none` path now works from an arbitrary
+  temporary cwd: an update/read round reaches **6/6 pass** for both fixture
+  files. The fix discovers the vendored Node `lib` root from the entry file for
+  `internal/*` requests and temporarily anchors the snapshot loader during its
+  one-time builtin-map initialization.
+- Serial `test-runner-snapshot-tests.js` now reaches **33/33 subtests pass**.
+  The TAP reporter includes the failed assertion's structured error message, so
+  the child negative case observes `Missing snapshots` as Node does. A five-lane
+  concurrent probe also hit a shared child-shim `ENOENT`; the serial rerun is
+  the authoritative measurement and the shim race is not counted as a runtime
+  regression.
 - `test-runner-assert.js` now passes the `t.assert` method enumeration and fails
   only on source-expression stack enrichment. No no-op snapshot methods were
   added.
 
 ## Next route
 
-1. Validate the `t.assert` key contract as a standalone runner slice.
-2. Only implement snapshot read/write if the smallest real flow can be proved;
-   do not add no-op methods merely to change enumeration.
-3. Revisit the remaining test-util warning contract separately; do not combine it
+1. Revisit the remaining test-util warning contract separately; do not combine it
    with the completed multi-value promisify slice.
-4. Diagnose the multi-file `--test-isolation=none` CLI and assertion source
-   positions as separate runner/runtime lanes.
-5. Keep test-v8 profiler/queryObjects and broad VM wording changes parked until
+2. Keep assertion source positions as a separate runtime lane because the
+   missing data originates at the JSC internal-binding boundary.
+3. Keep test-v8 profiler/queryObjects and broad VM wording changes parked until
    ownership is clear.
 
 No local absolute paths, user names, host names, credentials, private URLs, or

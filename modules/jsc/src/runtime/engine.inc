@@ -1075,6 +1075,36 @@ public:
         return out;
     }
 
+    // Node's own `internal/*` modules live under the vendored node source's
+    // `lib/` tree, not in a user `node_modules/` directory. The test runner can
+    // be launched from a temporary cwd, so the normal cwd-based package walk
+    // cannot find them. When an internal request originates from a file in the
+    // vendored tree, add that tree's `lib` directory as a resolver root.
+    static std::vector<std::string> node_paths_for_(std::string_view spec,
+                                                    const std::string& fromDir) {
+        std::vector<std::string> out{node_paths_from_env()};
+        if (!spec.starts_with("internal/")) return out;
+
+        std::error_code ec;
+        std::filesystem::path dir{fromDir};
+        if (dir.empty()) return out;
+        if (!dir.is_absolute()) dir = std::filesystem::absolute(dir, ec);
+        if (ec) return out;
+        dir = dir.lexically_normal();
+        for (int depth{0}; depth < 64; ++depth) {
+            const std::filesystem::path lib{dir / "lib"};
+            if (std::filesystem::is_directory(lib / "internal", ec)) {
+                const std::string root{lib.lexically_normal().string()};
+                if (std::ranges::find(out, root) == out.end()) out.emplace_back(root);
+                return out;
+            }
+            const std::filesystem::path parent{dir.parent_path()};
+            if (parent == dir || parent.empty()) break;
+            dir = parent;
+        }
+        return out;
+    }
+
     const mbun::resolver::TsconfigPaths* find_tsconfig_(const std::string& fromDir) {
         std::error_code ec;
         std::filesystem::path d{fromDir};
@@ -1150,7 +1180,7 @@ public:
         mbun::resolver::Options opts;
         opts.kind = esm ? mbun::resolver::ResolveKind::Import : mbun::resolver::ResolveKind::Require;
         opts.tsconfig = find_tsconfig_(fromDir);
-        opts.node_paths = node_paths_from_env();
+        opts.node_paths = node_paths_for_(spec, fromDir);
         mbun::jsc::module_loader::ModuleLoader loader{os_fs(), std::move(opts), /*cjs=*/true};
         mbun::jsc::module_loader::LoadResult loaded{loader.load(base, fromDir)};
         using mbun::jsc::module_loader::LoadStatus;

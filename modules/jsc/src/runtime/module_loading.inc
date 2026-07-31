@@ -521,7 +521,7 @@
             opts.kind =
                 esm ? mbun::resolver::ResolveKind::Import : mbun::resolver::ResolveKind::Require;
             opts.tsconfig = find_tsconfig_(fromDir);
-            opts.node_paths = node_paths_from_env();
+            opts.node_paths = node_paths_for_(spec, fromDir);
             opts.preserve_symlinks = preserve_symlinks_();
             mbun::jsc::module_loader::ModuleLoader loader{os_fs(), std::move(opts), /*cjs=*/true};
             loaded = loader.load(rspec, fromDir, effTypeAttr);

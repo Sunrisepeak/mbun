@@ -32,8 +32,11 @@
 - W41 runner slice 复用 vendored `SnapshotManager`，接通 `t.assert.snapshot()`、
   `t.assert.fileSnapshot()`、`node:test.snapshot` setter、update-snapshots flag 与
   exit-time write。`test-runner-snapshot-file-tests.js` **0/1 → 1/1**；
-  `test-runner-snapshot-tests.js` 变为 **32/33 subtests pass**，剩余 1 项是独立的
-  `--test --test-isolation=none` 多文件 CLI 路径。`test-runner-assert.js` 的 methods
+  `test-runner-snapshot-tests.js` serial 复测为 **33/33 subtests pass**。多文件
+  `--test --test-isolation=none` 从任意临时 cwd 做 update/read round 已达 **6/6**；
+  新增的 loader root discovery 解决了此前 `Snapshot support is unavailable`。
+  TAP reporter 现在输出失败事件的结构化 error message，负向用例也通过；不把五 lane
+  并发时共享 child shim 的一次 `ENOENT` 计为 runtime 回归。`test-runner-assert.js` 的 methods
   枚举断言已通过，剩余 source-expression stack 缺口另行处理；option-validation 与
   RegExp 回归仍各 **1/1**。
 - `163a0a3` 将本地敏感信息过滤规则加入 `hagent/agents.md` 及中文同步页；该受保护面
