@@ -129,3 +129,80 @@ jobs:
             [ -f "$log" ] || continue
             echo "::group::$log"; tail -60 "$log"; echo "::endgroup::"
           done
+
+  # macOS (arm64). Non-blocking while it is a PROBE rather than a gate: the
+  # jsc-prebuilt package's macosx ldflags were derived from the tarball manifest
+  # and carry a standing `TODO(T3.1b): macOS 实机验证` -- they have never been
+  # linked on real hardware. This job is what turns that TODO into a measurement.
+  # Flip continue-on-error off once it is green; a red probe must not be able to
+  # masquerade as a passing gate in the meantime.
+  #
+  # arm64 is not a preference, it is the only option: mcpp's installer publishes
+  # linux-x86_64, linux-aarch64 and macosx-arm64 only, and GitHub's macos-latest
+  # is arm64. There is deliberately no Windows job -- see the note at the bottom
+  # of this file.
+  macos-probe:
+    runs-on: macos-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Cache mcpp home (toolchains + BMI)
+        uses: actions/cache@v4
+        with:
+          path: ~/.mcpp
+          key: mcpp-v3-${{ runner.os }}-macos-arm64-${{ hashFiles('**/mcpp.lock') }}
+          restore-keys: mcpp-v3-${{ runner.os }}-macos-arm64-
+
+      - name: Install mcpp
+        env:
+          MCPP_VERSION: "2026.7.30.3"
+        run: |
+          curl -fsSL https://github.com/mcpp-community/mcpp/releases/latest/download/install.sh | bash
+          echo "$HOME/.mcpp/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Toolchain
+        run: |
+          mcpp --version
+          mcpp toolchain list
+
+      - name: Build
+        run: mcpp build --workspace --verbose
+
+      - name: Smoke
+        run: mcpp run -- --version
+
+# ---------------------------------------------------------------------------
+# Why there is no Windows job.
+#
+# It is not a porting gap in mbun -- it is that the build system does not exist
+# there. mcpp's own installer publishes exactly three targets:
+#
+#   linux-x86_64, linux-aarch64, macosx-arm64
+#
+# and exits with "unsupported platform" for anything else. There is no Windows
+# mcpp release to install, so a windows-latest job cannot reach the first build
+# step, and adding one would only produce a permanently red square that teaches
+# nobody anything.
+#
+# The pieces on OUR side are further along than that suggests, which is worth
+# recording so the blocker is not mistaken for our own backlog:
+#   - mcpp/pkgs/m/mbun.jsc-prebuilt.lua already carries a windows entry with a
+#     real bun-webkit-windows-amd64 URL and sha256, plus ldflags for
+#     JavaScriptCore.lib/WTF.lib/bmalloc.lib and static ICU;
+#   - modules/windows_sys/ exists with handle/process/path/error;
+#   - modules/platform/ has the capability + syscall seam the port would sit on.
+#
+# What genuinely blocks a Windows build, in order:
+#   1. an mcpp release for Windows (upstream, hard blocker);
+#   2. the static-CRT (/MT) alignment already flagged TODO(T3.1b) in the
+#      jsc-prebuilt package;
+#   3. mbun's own POSIX coupling -- measured on this tree: 349 files include
+#      <unistd.h>, 122 touch socket calls, 23 use dlopen, and only 68 files
+#      carry any platform guard at all. That is the work modules/platform is
+#      being made real for.
+#
+# Add the job when (1) lands. Until then this comment is the deliverable.
