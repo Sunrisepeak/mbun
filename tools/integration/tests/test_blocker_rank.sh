@@ -80,4 +80,37 @@ echo "$o" | grep -q 'shared assertion FORM, not a shared cause' \
   || fail "must warn that an assertion wrapper is not a cause"
 pass "the assertion-wrapper caveat is always printed"
 
+# --- bun depth comes from the runner, not from parsed signatures -------------
+# The regex misses a plain bun:test assertion failure entirely. Measured on the
+# real corpus, 495 of 924 non-green files parsed to zero signatures and were
+# dropped, so the near-green FRACTION had a numerator over 429 against a
+# denominator of 924 -- it read 8% and mis-classified the whole corpus as
+# STRUCTURAL, which a wave-66 lane was then briefed on. The runner's own
+# `failed` column needs no parsing and covers every non-green file.
+nb="$tmp/nb"; mkdir -p "$nb/logs"
+{
+  printf 'path\texit_code\tpassed\tfailed\texpects\tran\tclassification\tduration_ms\tlog\n'
+  printf 'compat/bun/test/one.test.ts\t1\t9\t1\t10\t10\ttest-failure\t10\tlogs/one.log\n'
+  printf 'compat/bun/test/three.test.ts\t1\t7\t3\t10\t10\ttest-failure\t10\tlogs/three.log\n'
+  printf 'compat/bun/test/g.test.ts\t0\t1\t0\t1\t1\tgreen\t10\tlogs/g.log\n'
+} > "$nb/results.tsv"
+printf '(fail) plain assertion, no error class\n' > "$nb/logs/one.log"
+printf '(fail) also unparseable\n' > "$nb/logs/three.log"
+printf 'ok\n' > "$nb/logs/g.log"
+
+o=$(python3 "$tool" --run "$nb" --corpus bun --list-near)
+echo "$o" | grep -q 'covering all 2 non-green files' \
+  || fail "bun must measure depth from the runner over every non-green file: $o"
+echo "$o" | grep -qE '1 file\(s\) at <= 1 blocker' \
+  || fail "the 1-failure file must be near-green despite an unparseable log: $o"
+echo "$o" | grep -q 'one.test.ts' || fail "one.test.ts must be listed: $o"
+echo "$o" | grep -q 'three.test.ts' && fail "a 3-failure file must not be near-green: $o"
+pass "bun depth comes from the runner, so an unparseable log is still counted"
+
+# --- node still declares what its parser cannot see --------------------------
+o=$(python3 "$tool" --run "$nrun" --corpus node)
+echo "$o" | grep -q 'records no per-file counts' \
+  || fail "node must state that unparsed files are excluded: $o"
+pass "node declares that its unparsed files are not counted"
+
 printf '\nall blocker_rank self-tests passed\n'

@@ -88,6 +88,46 @@ def signature(line: str) -> str | None:
     return s or None
 
 
+def native_depth(run: Path) -> dict[str, int] | None:
+    """bun only: the runner's own `failed` column IS the blocker depth.
+
+    This exists because the signature parser has a blind spot big enough to
+    invert a strategy decision. `_CAUSE` keys on error classes, ERR_ codes and
+    expect() wrappers -- and a plain `bun:test` assertion failure emits none of
+    them. Measured on the 1902-file run: 495 of 924 non-green files parse to ZERO
+    signatures and are silently dropped, so the near-green FRACTION was computed
+    with a numerator drawn from 429 files over a denominator of 924. That read
+    8% and classified the whole bun corpus STRUCTURAL, which is what a wave-66
+    lane was briefed on. The truth needs no parsing at all: a bun file is green
+    only when every test passes, so `failed` is the depth, and 262 of 769
+    test-failure files fail exactly ONE test -- 34%, an AREA-shaped pool.
+
+    node's runner records no per-file assertion counts, so node still needs the
+    signature parser and keeps its blind spot. Say so rather than implying both
+    corpora are measured the same way.
+    """
+    tsv = run / "results.tsv"
+    if not tsv.exists():
+        tsv = run / "results.partial.tsv"
+    if not tsv.exists():
+        return None
+    out: dict[str, int] = {}
+    with tsv.open() as f:
+        r = csv.reader(f, delimiter="\t")
+        hdr = next(r)
+        if "failed" not in hdr or "classification" not in hdr:
+            return None
+        fi, ci = hdr.index("failed"), hdr.index("classification")
+        for row in r:
+            if len(row) <= max(fi, ci) or row[ci] == "green":
+                continue
+            try:
+                out[row[0]] = int(row[fi] or 0)
+            except ValueError:
+                continue
+    return out or None
+
+
 def load(run: Path, corpus: str) -> tuple[dict[str, str], str]:
     tsv = run / "results.tsv"
     if not tsv.exists():
@@ -140,6 +180,11 @@ def main() -> int:
     scored = {p: s for p, s in per_file.items() if s}
     unparsed = len(per_file) - len(scored)
 
+    # For bun, prefer the runner's own `failed` count over parsed signatures --
+    # see native_depth(). It covers every non-green file instead of the 46% the
+    # regex happens to match.
+    native = native_depth(args.run) if args.corpus == "bun" else None
+
     sole: dict[str, list[str]] = defaultdict(list)
     for p, s in scored.items():
         if len(s) == 1:
@@ -156,12 +201,23 @@ def main() -> int:
     print(f"  {len(per_file)} non-green files, {len(scored)} with a parsed signature "
           f"({unparsed} unparsed -- timeouts/oom/crashes usually leave no cause line)\n")
 
-    near = sorted((p for p, s in scored.items() if len(s) <= args.max_blockers),
-                  key=lambda p: (len(scored[p]), p))
+    if native:
+        near = sorted((p for p, d in native.items() if 0 < d <= args.max_blockers),
+                      key=lambda p: (native[p], p))
+        print(f"  depth source: the runner's `failed` column, covering all "
+              f"{len(native)} non-green files (no parsing)")
+    else:
+        near = sorted((p for p, s in scored.items() if len(s) <= args.max_blockers),
+                      key=lambda p: (len(scored[p]), p))
+        if args.corpus == "node":
+            print(f"  depth source: parsed log signatures -- node's runner records no "
+                  f"per-file counts, so {unparsed} unparsed files are NOT counted below")
     print(f"  {len(near)} file(s) at <= {args.max_blockers} blocker(s) -- these are what a fix can convert")
     if args.list_near:
         for p in near:
-            print(f"    [{len(scored[p])}] {p}  <- {next(iter(scored[p]))[:88]}")
+            depth = native[p] if native else len(scored[p])
+            why = (next(iter(scored[p]))[:88] if p in scored else "(no parsed signature)")
+            print(f"    [{depth}] {p}  <- {why}")
 
     print(f"\n  top signatures by SOLE-blocker count (files a fix actually converts):")
     ranked = sorted(sole.items(), key=lambda kv: -len(kv[1]))[:args.top]
