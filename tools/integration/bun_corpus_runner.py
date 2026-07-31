@@ -403,7 +403,13 @@ def main() -> int:
     else:
         if args.sample_per_group < 1:
             raise SystemExit("--sample-per-group must be positive")
-        paths = discover(root, args.discover.resolve(), args.sample_per_group)
+        # Keep the corpus path lexical during discovery. Worktrees commonly
+        # symlink compat/bun to one shared read-only checkout; resolving that
+        # symlink makes candidate.relative_to(root) fail even though the
+        # user-visible corpus path is still rooted at --root. run_one resolves
+        # the selected file only when spawning it.
+        discover_root = args.discover if args.discover.is_absolute() else root / args.discover
+        paths = discover(root, discover_root, args.sample_per_group)
     if args.max_files is not None:
         if args.max_files < 1:
             raise SystemExit("--max-files must be positive")

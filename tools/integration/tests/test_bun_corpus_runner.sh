@@ -101,6 +101,18 @@ python3 "$repo_root/tools/integration/bun_corpus_runner.py" \
   --sample-per-group 1 --max-files 1 --out "$tmp/capped" --jobs 1 >/dev/null
 test "$(wc -l <"$tmp/capped/selected-tests.txt")" -eq 1
 
+# A worktree's vendored corpus may be a symlink to one shared checkout. The
+# lexical corpus path still belongs under --root, even though resolving it
+# points outside that root; discovery must keep the stable root-relative name.
+mkdir -p "$tmp/symlink-root" "$tmp/symlink-target/a/b"
+touch "$tmp/symlink-target/a/b/symlink.test.ts"
+ln -s "$tmp/symlink-target" "$tmp/symlink-root/corpus"
+python3 "$repo_root/tools/integration/bun_corpus_runner.py" \
+  --bin "$tmp/fake-mbun" --root "$tmp/symlink-root" \
+  --discover "$tmp/symlink-root/corpus" --allow-missing-node-modules \
+  --sample-per-group 1 --out "$tmp/symlink-discovered" --jobs 1 >/dev/null
+grep -Fxq 'corpus/a/b/symlink.test.ts' "$tmp/symlink-discovered/selected-tests.txt"
+
 # --- being MORE correct than bun is not a failure ----------------------------
 # bun marks cases bun itself gets wrong with `test.failing`. When mbun is more
 # correct, that marker passes and the runner prints
