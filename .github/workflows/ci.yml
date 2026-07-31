@@ -200,9 +200,14 @@ jobs:
 #   1. an mcpp release for Windows (upstream, hard blocker);
 #   2. the static-CRT (/MT) alignment already flagged TODO(T3.1b) in the
 #      jsc-prebuilt package;
-#   3. mbun's own POSIX coupling -- measured on this tree: 349 files include
-#      <unistd.h>, 122 touch socket calls, 23 use dlopen, and only 68 files
-#      carry any platform guard at all. That is the work modules/platform is
-#      being made real for.
+#   3. mbun's own POSIX coupling. Measured over the 889 TRACKED, mbun-authored
+#      source files -- not the vendored tree -- this is far smaller than a naive
+#      grep suggests: 16 files include <unistd.h>, 12 include <sys/socket.h>,
+#      10 call dlopen, and 36 already carry a _WIN32 guard. (Grepping modules/
+#      and src/ wholesale returns 349/122/23, but those counts are dominated by
+#      compat/ and the vendored packages under .mcpp/ -- OpenSSL, SQLite, the
+#      JSC prebuilt -- none of which a port touches.) That is the work
+#      modules/platform is being made real for, and it is a much smaller
+#      surface than the raw numbers imply.
 #
 # Add the job when (1) lands. Until then this comment is the deliverable.
