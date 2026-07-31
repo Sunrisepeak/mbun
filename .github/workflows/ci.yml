@@ -130,12 +130,16 @@ jobs:
             echo "::group::$log"; tail -60 "$log"; echo "::endgroup::"
           done
 
-  # macOS (arm64). Non-blocking while it is a PROBE rather than a gate: the
-  # jsc-prebuilt package's macosx ldflags were derived from the tarball manifest
-  # and carry a standing `TODO(T3.1b): macOS 实机验证` -- they have never been
-  # linked on real hardware. This job is what turns that TODO into a measurement.
-  # Flip continue-on-error off once it is green; a red probe must not be able to
-  # masquerade as a passing gate in the meantime.
+  # macOS (arm64). Build and Smoke are now GATES: they went green on 4305e5b8,
+  # which retired the standing `TODO(T3.1b): macOS 实机验证` -- the macosx
+  # ldflags had been derived from the tarball manifest and never linked on real
+  # hardware until then. Job-level continue-on-error is gone with it.
+  #
+  # The steps added after Smoke keep a step-level continue-on-error until they
+  # have actually been observed on macOS. Same reason the job had one: a step
+  # nobody has ever run must not be able to fail a gate on its first attempt,
+  # and it must not be able to pass silently either. Drop each `true` once its
+  # step is green, exactly as this job's own was dropped.
   #
   # arm64 is not a preference, it is the only option: mcpp's installer publishes
   # linux-x86_64, linux-aarch64 and macosx-arm64 only, and GitHub's macos-latest
@@ -143,7 +147,6 @@ jobs:
   # of this file.
   macos-probe:
     runs-on: macos-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
         with:
@@ -181,19 +184,60 @@ jobs:
       - name: Smoke
         run: mcpp run -- --version
 
+      # Workspace unit tests. The linux llvm lane has to skip modules/jsc --
+      # the prebuilt JSC ships libstdc++-ABI symbols there, so a libc++ lane
+      # compiles but cannot link the binding tests. That does not apply here:
+      # the macOS artifact and this toolchain are both libc++, so the whole
+      # workspace is attempted. If it turns out otherwise, this is where it
+      # shows up, and SKIP_MEMBERS is the same escape hatch linux uses.
+      - name: Test
+        continue-on-error: true
+        run: mcpp test --workspace
+
+      # Same example-app boot check the linux gcc lane runs. `find -printf` is
+      # GNU-only and this is BSD find, hence the plainer selector; there is one
+      # mbun binary under target/ either way.
+      - name: Smoke (example apps)
+        continue-on-error: true
+        run: |
+          MBUN="$(find target -type f -name mbun | head -1)"
+          test -n "$MBUN" || { echo "no mbun binary under target/"; exit 1; }
+          python3 tools/integration/smoke_examples.py --bin "$MBUN" \
+            --out target/integration/smoke
+
+      - name: Smoke logs
+        if: always()
+        run: |
+          for log in target/integration/smoke/logs/*.log; do
+            [ -f "$log" ] || continue
+            echo "::group::$log"; tail -40 "$log"; echo "::endgroup::"
+          done
+
 # ---------------------------------------------------------------------------
 # Platform status, measured rather than assumed.
 #
 # linux    the gate. Both toolchains build; gcc additionally runs the workspace
 #          unit tests and the example smoke.
-# macos    arm64 probe (the only macOS target mcpp publishes, and what
-#          macos-latest is). It has cleared four real portability walls so far
-#          -- arc4random_buf's missing <stdlib.h>, the x86_64-only $NOCANCEL asm
-#          labels, glibc's execvpe, and the vendored OpenSSL backend (replaced
-#          by compat.openssl 3.5.1, which does publish macOS).
+# macos    arm64 (the only macOS target mcpp publishes, and what macos-latest
+#          is). GREEN as of 4305e5b8: `mcpp build --workspace` completes and the
+#          binary runs -- `mbun 2026.07.18.0`, zero linker warnings. Build and
+#          Smoke are gates; the steps after them are still measuring.
 #
-#          It now stops OUTSIDE mbun, in the prebuilt: bun-webkit-macos-arm64
-#          ships wtf/RetainRef.h, whose line 30 includes
+#          The walls it cleared, in order, all of them measured rather than
+#          predicted: arc4random_buf's missing <stdlib.h>; the x86_64-only
+#          $NOCANCEL asm labels; glibc's execvpe (now
+#          mbun.platform.process::exec_path_env); the vendored OpenSSL backend
+#          (replaced by compat.openssl 3.5.1, which does publish macOS); two
+#          WTF headers the artifact fails to ship; PlatformEnable.h's
+#          COCOA_WEBM_PLAYER/MEDIA_SOURCE config contradiction; struct stat's
+#          st_*timespec vs st_*tim and the Linux-only statx; _SC_AVPHYS_PAGES;
+#          IPV6_ADD_MEMBERSHIP's Linux-only spelling; sigemptyset being a macro
+#          on Darwin; `environ` not being a linkable symbol; and finally the 8
+#          weak bun-embedder hooks that ELF resolves to null and Mach-O will
+#          not.
+#
+#          The artifact-side gap, kept because it recurs on every pin bump:
+#          bun-webkit-macos-arm64 ships wtf/RetainRef.h, whose line 30 includes
 #          <wtf/cocoa/NSTypeTraits.h> under `#if USE(CF) || defined(__OBJC__)`,
 #          but that header is not in the tarball -- 0 matches across all 3,016
 #          entries, alongside 12 sibling wtf/cocoa/ headers that ARE shipped.
