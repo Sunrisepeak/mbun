@@ -236,6 +236,24 @@ The next Node VM probe produced one additional narrow green slice:
   Node's token-specific `Unexpected token '}'` message; that parser-boundary
   mismatch remains isolated rather than receiving a test-specific rewrite.
 
+The adjacent VM property/context probe then separated a larger green surface
+from engine-boundary failures without another build:
+
+- Five files exited 0: `test-vm-global-get-own.js`, `test-vm-ownkeys.js`,
+  `test-vm-ownpropertynames.js`, `test-vm-ownpropertysymbols.js`, and
+  `test-vm-getters.js`. A second five-file probe added green
+  `test-vm-cross-context.js`, `test-vm-create-and-run-in-context.js`,
+  `test-vm-run-in-new-context.js`, `test-vm-new-script-new-context.js`, and
+  `test-vm-new-script-this-context.js`.
+- The remaining measured failures were kept separate: global setter error
+  wording, global-property enumeration/prototype ownership, and the
+  self-referential accessor identity in `test-vm-property-not-on-sandbox.js`.
+  These require JSC global-proxy/interceptor semantics or engine-specific error
+  information; no broad context mirror rewrite was attempted.
+- Across the VM probes in this checkpoint, 15 named files exited 0 and six
+  distinct RED boundaries were recorded. This is probe data, not a replacement
+  for the repository's full-corpus score; no full corpus run was started.
+
 ## Next route
 
 1. Keep the native-syntax compatibility gate limited to the two measured

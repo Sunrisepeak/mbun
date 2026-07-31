@@ -93,6 +93,16 @@
   fresh build 后 `test-vm-context.js` **1 → exit 0**。随后 5 条 bounded lane（含 getter
   回归）并行全 exit 0。`test-vm-basic.js` 仍只剩 JSC 通用 `Parser error` 与 Node
   `Unexpected token '}'` 的 parser-message 边界，未做 test-specific rewrite。
+- 相邻 VM property/context probe 未需新构建即再确认 10 个文件全 exit 0：
+  `test-vm-global-get-own.js`、`test-vm-ownkeys.js`、`test-vm-ownpropertynames.js`、
+  `test-vm-ownpropertysymbols.js`、`test-vm-getters.js`，以及
+  `test-vm-cross-context.js`、`test-vm-create-and-run-in-context.js`、
+  `test-vm-run-in-new-context.js`、`test-vm-new-script-new-context.js`、
+  `test-vm-new-script-this-context.js`。同波次观察到的独立 RED 是 global setter
+  wording、global property enumeration/prototype ownership，以及 sandbox self-reference
+  accessor identity；这些属于 global proxy/interceptor 边界，暂不扩大 mirror rewrite。
+  本 checkpoint 共记录 15 个 named VM 文件 exit 0、6 个 distinct RED boundary，仍不替代
+  full-corpus score，未跑全量。
 - `163a0a3` 将本地敏感信息过滤规则加入 `hagent/agents.md` 及中文同步页；该受保护面
   需要维护者签字，不由 agent 自行合并。PR #36 已同步两轮候选实测和本节点策略。
 
