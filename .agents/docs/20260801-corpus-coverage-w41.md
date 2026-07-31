@@ -409,6 +409,17 @@ A bounded Node test-runner probe was used to choose the next strategy:
   test-runner work in the port/graft track. No speculative patch or full
   test-runner sweep was started.
 
+A build-free Bun.Terminal coverage checkpoint then confirmed the newer PTY
+surface on Linux:
+
+- Four files were green under four bounded jobs: `terminal.test.ts` **94/94**,
+  `terminal-spawn.test.ts` **16/17** with one declared skip,
+  `terminal-platform-gaps.test.ts` **19/19**, and
+  `spawn/spawn-path.test.ts` **1/1**.
+- The aggregate was **130 passed, 1 declared skip, 0 failed, 336 expects**.
+  This is a real runtime result for the selected files, not a ported-symbol
+  claim; no build or full Bun corpus run was started.
+
 ## Next route
 
 1. Keep the native-syntax compatibility gate limited to the two measured

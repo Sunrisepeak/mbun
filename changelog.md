@@ -32,6 +32,10 @@
 - Node test-runner 4-file triage：`test-runner-get-test-context` **1/1** green；
   `test-runner-cli` 卡 fixture discovery/cwd，`test-runner-diagnostics-channel` 卡
   bindStore/event payload，`test-runner-error-reporter` 卡 reporter failure counts。
+- build-free Bun.Terminal checkpoint：`terminal.test` **94/94**、
+  `terminal-spawn` **16/17**（1 declared skip）、`terminal-platform-gaps` **19/19**、
+  `spawn-path` **1/1**；4 files 合计 **130 passed、1 skip、0 failed、336 expects**，
+  未启动构建或 Bun 全量。
   实测 **1/4 files green**，三者 ownership 不同，维持 port/graft 路线，未做猜测性 patch。
 
 ### W41 Linux 优先推进：planner 修复、8 条候选 lane 实测与 Node 近绿切片
