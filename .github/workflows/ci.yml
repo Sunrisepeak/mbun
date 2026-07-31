@@ -153,8 +153,14 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.mcpp
-          key: mcpp-v3-${{ runner.os }}-macos-arm64-${{ hashFiles('**/mcpp.lock') }}
-          restore-keys: mcpp-v3-${{ runner.os }}-macos-arm64-
+          # v4 (linux stays v3, which is green and has no reason to cold-start).
+          # jsc-prebuilt's install() only just grew a macosx branch; an entry
+          # cached from an earlier probe already has the package installed with
+          # the old no-op hook, and a hook does not re-run for an installed
+          # package -- so restoring v3 here would silently keep the missing
+          # header. Bump this whenever install() changes what it writes.
+          key: mcpp-v4-${{ runner.os }}-macos-arm64-${{ hashFiles('**/mcpp.lock') }}
+          restore-keys: mcpp-v4-${{ runner.os }}-macos-arm64-
 
       - name: Install mcpp
         env:
@@ -175,72 +181,31 @@ jobs:
       - name: Smoke
         run: mcpp run -- --version
 
-  # Windows x86_64. Also a probe, for the same reason as macOS: nothing here has
-  # ever been built on Windows, so this job's purpose is to report where it stops.
-  #
-  # An earlier revision of this file claimed "there is no Windows mcpp release to
-  # install". That was wrong, and the mistake is worth recording: it was inferred
-  # from install.sh's platform switch, which handles linux-x86_64/linux-aarch64/
-  # macosx-arm64 and errors otherwise -- but install.sh is the POSIX installer and
-  # Windows was never going to use it. The release does ship
-  # mcpp-<version>-windows-x86_64.zip, so mcpp is available here; it just installs
-  # from the archive rather than through the shell script.
-  windows-probe:
-    runs-on: windows-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      # Installed the way the README documents, not by hand-unzipping the
-      # release: xlings is the cross-platform installer and ships a PowerShell
-      # entry point (tools/other/quick_install.ps1) alongside the POSIX
-      # quick_install.sh. An earlier revision of this job downloaded and
-      # extracted mcpp-<version>-windows-x86_64.zip directly, which worked but
-      # duplicated logic that xlings already owns per platform.
-      - name: Install xlings
-        shell: pwsh
-        run: |
-          irm https://raw.githubusercontent.com/openxlings/xlings/main/tools/other/quick_install.ps1 | iex
-          # The installer updates the user PATH and prints "restart terminal to
-          # refresh PATH" -- the running session does not see it, which is why an
-          # earlier revision failed with "The term 'xlings' is not recognized".
-          # Publish it to GITHUB_PATH so the next STEP has it; same-step use
-          # cannot work.
-          $home_ = "$env:USERPROFILE\\.xlings"
-          $exe = Get-ChildItem -Recurse -Filter "xlings*.exe" $home_ -ErrorAction SilentlyContinue | Select-Object -First 1
-          if ($null -eq $exe) { Get-ChildItem -Recurse -Depth 3 $home_ | Select-Object -First 40 FullName; throw "xlings executable not found under $home_" }
-          Add-Content $env:GITHUB_PATH $exe.DirectoryName
-
-      - name: Install mcpp
-        shell: pwsh
-        run: xlings install mcpp -y
-
-      - name: Toolchain
-        shell: pwsh
-        run: |
-          mcpp --version
-          mcpp toolchain list
-
-      - name: Build
-        shell: pwsh
-        run: mcpp build --workspace --verbose
-
 # ---------------------------------------------------------------------------
 # Platform status, measured rather than assumed.
 #
 # linux    the gate. Both toolchains build; gcc additionally runs the workspace
 #          unit tests and the example smoke.
 # macos    arm64 probe (the only macOS target mcpp publishes, and what
-#          macos-latest is). It has cleared three real portability walls so far
+#          macos-latest is). It has cleared four real portability walls so far
 #          -- arc4random_buf's missing <stdlib.h>, the x86_64-only $NOCANCEL asm
-#          labels, and glibc's execvpe -- and currently stops at mbun.openssl,
-#          whose vendored-prebuilt backend is DEFERRED for non-linux in
-#          mcpp/pkgs/m/mbun.openssl.lua. That package is OURS, in this repo, so
-#          that is a task and not an external blocker.
-# windows  x86_64 probe. Never built here; the job exists to find out where it
-#          stops rather than to assert anything.
+#          labels, glibc's execvpe, and the vendored OpenSSL backend (replaced
+#          by compat.openssl 3.5.1, which does publish macOS).
+#
+#          It now stops OUTSIDE mbun, in the prebuilt: bun-webkit-macos-arm64
+#          ships wtf/RetainRef.h, which does an unconditional
+#          `#include <wtf/cocoa/NSTypeTraits.h>`, but that header is not in the
+#          tarball -- 0 matches across all 3,016 entries, alongside 12 sibling
+#          wtf/cocoa/ headers that ARE shipped. The include chain reaching it
+#          (StringView.h -> RetainPtr.h -> RetainRef.h) is core WTF, so no JSC
+#          binding can avoid it. mcpp/pkgs/m/mbun.jsc-prebuilt.lua's install()
+#          now supplies the header on macosx; whether that alone clears the wall
+#          is what the next probe run measures, not something asserted here.
+# windows  no job. Deliberately removed rather than left red: mcpp does publish
+#          a Windows release, so this is not a toolchain gap, but nothing here
+#          has ever been built or measured on Windows and a permanently-failing
+#          probe is noise rather than information. Reinstate it when someone
+#          intends to act on what it reports.
 #
 # mbun's own platform coupling is far smaller than a wholesale grep suggests.
 # Over the 889 TRACKED, mbun-authored source files: 16 include <unistd.h>, 12

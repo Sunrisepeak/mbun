@@ -144,12 +144,53 @@ package = {
 import("xim.libxpkg.pkginfo")
 import("xim.libxpkg.log")
 
+-- 上游 macOS 产物漏装的头。RetainRef.h 无条件 `#include <wtf/cocoa/NSTypeTraits.h>`，
+-- 而 macos-arm64 tarball 的 3016 个条目里装了 RetainRef.h、装了 12 个
+-- wtf/cocoa/ 头，唯独没有 NSTypeTraits.h（实查清单，0 匹配）。这条链是
+-- RobinHoodHashTable.h → text/StringHash.h → AtomString.h → StringConcatenate.h
+-- → StringView.h → RetainPtr.h → RetainRef.h，全在核心字符串机制上，任何 JSC
+-- 绑定都会拉到，绕不开。所以按上游原文补回，而不是改 mbun 源码。
+--
+-- 与上游唯一的实质差异在 #else 分支：上游只在 __OBJC__ 下 import Foundation，
+-- 而 `id` 是 ObjC 类型，mbun 的 TU 是纯 C++ 模块（非 .mm），模板声明处就需要
+-- `id` 已声明。<objc/objc.h> 是可在纯 C/C++ 中包含的 C 头，正是为此。
+local NS_TYPE_TRAITS = [[
+#pragma once
+// Supplied by mbun.jsc-prebuilt: absent from the upstream macOS tarball while
+// its only consumer, <wtf/RetainRef.h>, ships and includes it unconditionally.
+// Mirrors Source/WTF/wtf/cocoa/NSTypeTraits.h (WebKit, LGPL-2.1-or-later).
+#include <concepts>
+#include <wtf/Forward.h>
+#include <wtf/Platform.h>
+
+#ifdef __OBJC__
+#import <Foundation/Foundation.h>
+#else
+#include <objc/objc.h>
+#if USE(CF)
+#include <CoreFoundation/CoreFoundation.h>
+#endif
+#endif
+
+namespace WTF {
+
+template<typename T> inline constexpr bool IsNSType = std::convertible_to<T, id>;
+template<typename T> concept NSType = IsNSType<T>;
+
+} // namespace WTF
+
+using WTF::IsNSType;
+using WTF::NSType;
+]]
+
 -- linux：把构建依赖 xim:gcc 的 libstdc++.a 拷入 bun-webkit/lib（供 ldflags
 -- 的 -lstdc++ 解析，路径可移植），并写出 anchor TU——anchor 的缺失正是让
 -- mcpp 在构建前运行本 install() 的触发器（compat.openblas 同款机制）。
--- macosx/windows：anchor 来自 generated_files，mcpp 自足，无需本钩子。
+-- macosx：anchor 来自 generated_files，但本钩子仍需补上游漏装的头（见上）。
+-- windows：anchor 来自 generated_files，无本钩子需求。
 function install()
-    if os.host() ~= "linux" then
+    local host = os.host()
+    if host ~= "linux" and host ~= "macosx" then
         return true
     end
 
@@ -165,6 +206,18 @@ function install()
         if extracted and os.isdir(extracted) then
             os.mv(extracted, wkdir)
         end
+    end
+
+    -- macosx：只补头，不碰 lib（产物 lib/ 已自足，链接系统 libicucore）。
+    -- 幂等：已存在就不覆盖，让上游哪天补齐后自动让位。
+    if host == "macosx" then
+        local header = path.join(wkdir, "include", "wtf", "cocoa", "NSTypeTraits.h")
+        if not os.isfile(header) then
+            os.mkdir(path.directory(header))
+            io.writefile(header, NS_TYPE_TRAITS)
+            log.info("mbun.jsc-prebuilt: supplied missing wtf/cocoa/NSTypeTraits.h")
+        end
+        return true
     end
 
     local libdir = path.join(wkdir, "lib")
