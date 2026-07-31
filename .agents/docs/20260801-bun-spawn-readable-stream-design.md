@@ -41,9 +41,13 @@ The bounded four-file probe measured:
    reader and release it so a pull source cannot keep the parent alive. Mark
    the pump promise handled; an input error must not become an unhandled
    rejection after the child has already closed.
-5. Keep the implementation in the existing JS payload because the behavior is
-   Web Streams reader/prototype/Promise protocol glue. Native process I/O stays
-   in `proc.spawnEx` and `__mbun_io_tick`; no second native pump is introduced.
+5. Keep the implementation in the JS payload because the behavior is Web
+   Streams reader/prototype/Promise protocol glue. The reader pump lives in a
+   small `bun_spawn_stream.cppm` payload immediately after `process_web.cppm`:
+   the latter is already near GCC's 262144-character constexpr string limit.
+   The two payloads are concatenated into the same IIFE and lexical scope.
+   Native process I/O stays in `proc.spawnEx` and `__mbun_io_tick`; no second
+   native pump is introduced.
 
 ## Error and lifecycle behavior
 

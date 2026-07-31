@@ -13,7 +13,7 @@
 - Treat `compat/bun/test/**` as read-only upstream input.
 - Run child-spawning tests only through the bounded integration runner.
 - Use one incremental Linux build at most; do not start a full corpus run.
-- Keep the implementation in `modules/jsc/src/builtins/process_web.cppm`; do not add a second native pump.
+- Keep the dispatch in `modules/jsc/src/builtins/process_web.cppm` and the reader pump in the adjacent `modules/jsc/src/builtins/bun_spawn_stream.cppm`; do not add a second native pump.
 - Commit one development item with `git commit -s` and `Co-authored-by: Codex <codex@openai.com>`.
 - Do not place local absolute paths, usernames, hostnames, credentials, private URLs, environment values, or machine identifiers in tracked text or PR material.
 
@@ -45,13 +45,16 @@ does not become an actionable source failure.
 ### Task 2: Add the minimal stream-input adapter
 
 **Files:**
-- Modify: `modules/jsc/src/builtins/process_web.cppm` near `spawnAsyncBun` and `Bun.spawn`
+- Modify: `modules/jsc/src/builtins/process_web.cppm` near `Bun.spawn`
+- Create: `modules/jsc/src/builtins/bun_spawn_stream.cppm` as the adjacent payload partition
+- Modify: `modules/jsc/src/js_builtins.cppm` to append the new payload immediately after `kProcessWebJS`
 
 **Interfaces:**
 - Consumes: `spawnAsyncBun(cmd, opts)`, `anyToU8(value)`,
   `G.__mbunStreams.isReadableStream(value)`, and `proc.exited`.
 - Produces: `pumpBunReadableStdin(proc, stream)`; it returns no public value and
-  owns a handled internal promise.
+  owns a handled internal promise. The helper is lexically visible to the
+  `Bun.spawn` function because the payloads are concatenated into one IIFE.
 
 - [ ] **Step 1: Validate the stream before creating the child.**
 
@@ -61,7 +64,7 @@ Use `G.__mbunStreams.isReadableStream(value)` to identify the source. If
 `'stdin' ReadableStream has already been used` so the existing upstream
 assertion can observe the Bun-facing error.
 
-- [ ] **Step 2: Implement the handled reader pump.**
+- [ ] **Step 2: Implement the handled reader pump in the split payload.**
 
 Acquire `stream.getReader()`, read one result at a time, and call the existing
 `proc.stdin.write(anyToU8(value))`. Stop on `done`, then call
@@ -121,7 +124,9 @@ partial gain and park the remaining owner.
 **Files:**
 - Modify: `changelog.md`
 - Modify: `.agents/docs/20260801-corpus-coverage-w41.md`
-- Source commit: `modules/jsc/src/builtins/process_web.cppm`
+- Source commit: `modules/jsc/src/builtins/process_web.cppm`,
+  `modules/jsc/src/builtins/bun_spawn_stream.cppm`, and
+  `modules/jsc/src/js_builtins.cppm`
 
 **Interfaces:**
 - Consumes: fresh Task 3 counts and build result.
