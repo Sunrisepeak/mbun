@@ -535,7 +535,26 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       if (toOrig.charCodeAt(toStart) === 92) ++toStart;
       return toOrig.slice(toStart, toEnd);
     },
-    toNamespacedPath(p) { if (typeof p !== "string" || p.length === 0) return p; const resolvedPath = win32.resolve(p); if (resolvedPath.length <= 2) return p; if (resolvedPath.charCodeAt(0) === 92) { if (resolvedPath.charCodeAt(1) === 92) { const c = resolvedPath.charCodeAt(2); if (c !== 63 && c !== 46) return "\\\\?\\UNC\\" + resolvedPath.slice(2); } } else if (isWinDevRoot(resolvedPath.charCodeAt(0)) && resolvedPath.charCodeAt(1) === 58 && resolvedPath.charCodeAt(2) === 92) { return "\\\\?\\" + resolvedPath; } return resolvedPath; },
+    toNamespacedPath(p) {
+      if (typeof p !== "string" || p.length === 0) return p;
+      const resolvedPath = win32.resolve(p);
+      if (resolvedPath.length <= 2) return p;
+      if (resolvedPath.charCodeAt(0) === 92) {
+        if (resolvedPath.charCodeAt(1) === 92) {
+          const c = resolvedPath.charCodeAt(2);
+          if (c !== 63 && c !== 46) return "\\\\?\\UNC\\" + resolvedPath.slice(2);
+          // Node treats a bare `\\\\?\\name` namespace root as having a
+          // trailing separator. JSC's win32 resolver preserves the prefix but
+          // drops that separator, making path.win32.toNamespacedPath diverge.
+          const tail = resolvedPath.slice(4);
+          if (c === 63 && tail.length > 0 && tail.indexOf("\\") === -1 && tail.indexOf(":") === -1)
+            return resolvedPath + "\\";
+        }
+      } else if (isWinDevRoot(resolvedPath.charCodeAt(0)) && resolvedPath.charCodeAt(1) === 58 && resolvedPath.charCodeAt(2) === 92) {
+        return "\\\\?\\" + resolvedPath;
+      }
+      return resolvedPath;
+    },
   };
   path.toNamespacedPath = (p) => p;
   path._makeLong = path.toNamespacedPath;
