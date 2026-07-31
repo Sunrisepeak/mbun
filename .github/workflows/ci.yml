@@ -175,39 +175,67 @@ jobs:
       - name: Smoke
         run: mcpp run -- --version
 
+  # Windows x86_64. Also a probe, for the same reason as macOS: nothing here has
+  # ever been built on Windows, so this job's purpose is to report where it stops.
+  #
+  # An earlier revision of this file claimed "there is no Windows mcpp release to
+  # install". That was wrong, and the mistake is worth recording: it was inferred
+  # from install.sh's platform switch, which handles linux-x86_64/linux-aarch64/
+  # macosx-arm64 and errors otherwise -- but install.sh is the POSIX installer and
+  # Windows was never going to use it. The release does ship
+  # mcpp-<version>-windows-x86_64.zip, so mcpp is available here; it just installs
+  # from the archive rather than through the shell script.
+  windows-probe:
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # Installed the way the README documents, not by hand-unzipping the
+      # release: xlings is the cross-platform installer and ships a PowerShell
+      # entry point (tools/other/quick_install.ps1) alongside the POSIX
+      # quick_install.sh. An earlier revision of this job downloaded and
+      # extracted mcpp-<version>-windows-x86_64.zip directly, which worked but
+      # duplicated logic that xlings already owns per platform.
+      - name: Install xlings + mcpp
+        shell: pwsh
+        run: |
+          irm https://raw.githubusercontent.com/openxlings/xlings/main/tools/other/quick_install.ps1 | iex
+          xlings install mcpp -y
+
+      - name: Toolchain
+        shell: pwsh
+        run: |
+          mcpp --version
+          mcpp toolchain list
+
+      - name: Build
+        shell: pwsh
+        run: mcpp build --workspace --verbose
+
 # ---------------------------------------------------------------------------
-# Why there is no Windows job.
+# Platform status, measured rather than assumed.
 #
-# It is not a porting gap in mbun -- it is that the build system does not exist
-# there. mcpp's own installer publishes exactly three targets:
+# linux    the gate. Both toolchains build; gcc additionally runs the workspace
+#          unit tests and the example smoke.
+# macos    arm64 probe (the only macOS target mcpp publishes, and what
+#          macos-latest is). It has cleared three real portability walls so far
+#          -- arc4random_buf's missing <stdlib.h>, the x86_64-only $NOCANCEL asm
+#          labels, and glibc's execvpe -- and currently stops at mbun.openssl,
+#          whose vendored-prebuilt backend is DEFERRED for non-linux in
+#          mcpp/pkgs/m/mbun.openssl.lua. That package is OURS, in this repo, so
+#          that is a task and not an external blocker.
+# windows  x86_64 probe. Never built here; the job exists to find out where it
+#          stops rather than to assert anything.
 #
-#   linux-x86_64, linux-aarch64, macosx-arm64
+# mbun's own platform coupling is far smaller than a wholesale grep suggests.
+# Over the 889 TRACKED, mbun-authored source files: 16 include <unistd.h>, 12
+# include <sys/socket.h>, 10 call dlopen, and 36 already carry a _WIN32 guard.
+# Grepping modules/ and src/ returns 349/122/23, but those are dominated by
+# compat/ and the vendored packages under .mcpp/ -- OpenSSL, SQLite, the JSC
+# prebuilt -- none of which a port touches.
 #
-# and exits with "unsupported platform" for anything else. There is no Windows
-# mcpp release to install, so a windows-latest job cannot reach the first build
-# step, and adding one would only produce a permanently red square that teaches
-# nobody anything.
-#
-# The pieces on OUR side are further along than that suggests, which is worth
-# recording so the blocker is not mistaken for our own backlog:
-#   - mcpp/pkgs/m/mbun.jsc-prebuilt.lua already carries a windows entry with a
-#     real bun-webkit-windows-amd64 URL and sha256, plus ldflags for
-#     JavaScriptCore.lib/WTF.lib/bmalloc.lib and static ICU;
-#   - modules/windows_sys/ exists with handle/process/path/error;
-#   - modules/platform/ has the capability + syscall seam the port would sit on.
-#
-# What genuinely blocks a Windows build, in order:
-#   1. an mcpp release for Windows (upstream, hard blocker);
-#   2. the static-CRT (/MT) alignment already flagged TODO(T3.1b) in the
-#      jsc-prebuilt package;
-#   3. mbun's own POSIX coupling. Measured over the 889 TRACKED, mbun-authored
-#      source files -- not the vendored tree -- this is far smaller than a naive
-#      grep suggests: 16 files include <unistd.h>, 12 include <sys/socket.h>,
-#      10 call dlopen, and 36 already carry a _WIN32 guard. (Grepping modules/
-#      and src/ wholesale returns 349/122/23, but those counts are dominated by
-#      compat/ and the vendored packages under .mcpp/ -- OpenSSL, SQLite, the
-#      JSC prebuilt -- none of which a port touches.) That is the work
-#      modules/platform is being made real for, and it is a much smaller
-#      surface than the raw numbers imply.
-#
-# Add the job when (1) lands. Until then this comment is the deliverable.
+# modules/platform/ is where the divergence belongs; it now carries a real POSIX
+# backend and owns the pty primitive outright.
