@@ -64,11 +64,17 @@
   `test-util-types.js`、`test-buffer-swap-fast.js`、`test-runner-snapshot-file-tests.js`
   也全部 exit 0。没有重复全量语料；`test-whatwg-url-canparse.js` 的 TypeError
   mismatch 作为下一条独立候选。
+- `800d2a9` 关闭 `URL.canParse()` 单文件 blocker：根因是公共 bootstrap wrapper
+  把所有解析异常都吞成 `false`，零参数所需的 `ERR_MISSING_ARGS` TypeError 因而丢失；
+  不是 internal URL binding 未注册。仅增加参数计数守卫后，fresh build 下
+  `test-whatwg-url-canparse.js` exit 0，绝对 URL 与带 base 的相对 URL smoke 均保持 true；
+  `test-process-hrtime.js`、`test-process-hrtime-bigint.js`、`test-util-types.js`、
+  `test-runner-snapshot-file-tests.js` 四条 bounded 回归也全绿，未跑全量。
 - `163a0a3` 将本地敏感信息过滤规则加入 `hagent/agents.md` 及中文同步页；该受保护面
   需要维护者签字，不由 agent 自行合并。PR #36 已同步两轮候选实测和本节点策略。
 
-下一步先处理 `test-whatwg-url-canparse.js` 的单文件 TypeError 合同；test-runner
-assertion source-position、test-util inspect/callbackify 与 test-v8 profiler/queryObjects
+下一步先处理已量化的 `test-util-callbackify.js` stack-shape 合同；test-runner
+assertion source-position、test-util inspect/format 与 test-v8 profiler/queryObjects
 继续按独立 blocker 管理，不做无证据的跨域扩展。
 
 ## 2026-07-29

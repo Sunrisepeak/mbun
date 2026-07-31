@@ -151,6 +151,19 @@ The next measured slice closed the `process.hrtime` argument contract:
 - This is a targeted runtime result, not a new full-corpus score. The remaining
   `test-whatwg-url-canparse.js` TypeError mismatch stays an independent blocker.
 
+The URL.canParse candidate then closed with a narrow bootstrap fix:
+
+- The failure was in the public `G.URL.canParse` wrapper: its catch-all conversion
+  to `false` swallowed the required zero-argument `ERR_MISSING_ARGS` TypeError.
+  The vendored internal URL implementation was not the live public path for this
+  module shape.
+- `800d2a9` adds only the argument-count guard before the existing parse wrapper.
+  A fresh coordinator build made `test-whatwg-url-canparse.js` exit 0; a direct
+  smoke retained true results for absolute and base-relative URLs.
+- Four bounded regressions also exit 0: `test-process-hrtime.js`,
+  `test-process-hrtime-bigint.js`, `test-util-types.js`, and
+  `test-runner-snapshot-file-tests.js`. No full corpus was rerun.
+
 The assertion source-position probe was also closed as parked for this
 checkpoint. `internalBinding('errors').getErrorSourcePositions()` is not the
 live path for `t.assert.ok`: the public test assertion uses bootstrap-owned
@@ -164,9 +177,9 @@ boundary as one slice.
 1. Keep the native-syntax compatibility gate limited to the two measured
    optimization controls; evaluate additional V8 intrinsics only from their
    own failing corpus evidence.
-2. Evaluate the `test-whatwg-url-canparse.js` TypeError contract as the next
-   single-file candidate; keep callbackify stack shape, util format/types/inspect
-   semantics, and bootstrap assertion source extraction as separate lanes.
+2. Evaluate the already measured `test-util-callbackify.js` stack-shape mismatch
+   as the next single-file candidate; keep util format/types/inspect semantics and
+   bootstrap assertion source extraction as separate lanes.
 3. Keep test-v8 profiler/queryObjects and broad VM wording changes parked until
    ownership is clear.
 
