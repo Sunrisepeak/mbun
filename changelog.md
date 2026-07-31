@@ -3,6 +3,33 @@
 > 只记录**实质进展**（模块落地、测试集通过数变化、性能节点），倒序排列。
 > 格式：`## YYYY-MM-DD` + 条目（关联任务 ID / commit / 测试与性能数据）。
 
+## 2026-08-01
+
+### W41 Linux 优先推进：planner 修复、8 条候选 lane 实测与 Node 近绿切片
+
+- 全量基线沿用 PR #35 合并树：Node **3134/4433 (70.7%)**、Bun
+  **1015/1902 (53.4%)**；planner 识别 Node **425**、Bun **170** 个 actionable
+  文件。本轮没有重复全量语料。
+- `00b1fcc` 修复 `wave_planner.py --throughput` 把 `PENDING` 计划行当作已交付数据的
+  问题；新增回归 fixture，planner self-test 全绿。资源闸门在可用内存约 45 GiB、
+  磁盘约 27 GiB 时将并发上限裁为 5，构建保持单 owner。
+- 首轮 5 lane 实测：Node crypto **0/24**、VM **0/19**、WebCrypto **0/19**；Bun
+  third-party **0/25**（其余 1280 pass、134 fail assertions）和 CLI/run **0/17**
+  （19 pass、258 fail assertions）。二轮 3 lane 实测：Node test-runner **0/30**、
+  test-util **0/12**、test-v8 **0/11**。主要阻塞分别归因于原生算法/可选依赖、运行时
+  所有权、以及未实现的 snapshot/profile/queryObjects API，已动态降权而非盲目扩展。
+- `561a905` 修复 Node `RegExp` 非法 flags 诊断：保留 JSC 原生调用/构造语义，仅在
+  Node 兼容边界恢复 Node 需要的 flags 回显与 `RegExp.prototype.constructor` 身份。
+  `test-runner-string-to-regexp.js` **0/1 → 1/1**；直接调用、`new` 构造、`instanceof`
+  和 constructor identity smoke 均通过。回归对照：`test-runner-option-validation.js`
+  frozen/new 均 **1/1**；两个 inspect 抽样 frozen/new 均 **0/2**，没有新增失败。
+- `163a0a3` 将本地敏感信息过滤规则加入 `hagent/agents.md` 及中文同步页；该受保护面
+  需要维护者签字，不由 agent 自行合并。PR #36 已同步两轮候选实测和本节点策略。
+
+下一步优先实现 test-runner assertion surface 的真实小切片（先验证 `t.assert` 契约，
+再决定 snapshot 读写是否值得投入）；test-util native external 与 test-v8 profiler/query
+objects 暂停，VM 只保留近绿、低共享风险候选。
+
 ## 2026-07-29
 
 ### 推进策略加速：减少全量冻结，切 Node 12-file 长尾吞吐
