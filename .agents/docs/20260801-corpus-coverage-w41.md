@@ -313,6 +313,15 @@ green sample:
 - No new build was started while swap headroom remained critically low. These
   are measured native slices, not full-corpus score changes.
 
+One more no-build Bun standard-module wave kept the same fast lane:
+
+- `timers.promises/timers.promises.test.ts` is green at **4/4 tests**,
+  `perf_hooks/perf_hooks.test.ts` at **8/8**, and
+  `promise/reject-tostring.test.ts` at **1/1**.
+- `timers/node-timers.test.ts` reached **18/20 tests**; its two failures are
+  UTF-16 timer-label formatting and immediate-exception/microtask ordering.
+  No runtime-wide timer change was attempted from those two boundaries.
+
 ## Next route
 
 1. Keep the native-syntax compatibility gate limited to the two measured

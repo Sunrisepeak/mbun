@@ -126,6 +126,10 @@
   `diagnostics_channel` **6/6**（9 tests ran）。扩展样本中 path **3/4 files、9/10 tests**，
   zlib **2/4 files、9/39 tests**；剩余分别归因于 Windows `toNamespacedPath` 尾斜杠和
   zlib native handle lifecycle/API gaps。swap 紧张期间未启动新构建，未跑全量。
+- 后续小型 Bun standard-module wave 再获 3 个 green：`timers.promises` **4/4**、
+  `perf_hooks` **8/8**、`promise/reject-tostring` **1/1**。`timers/node-timers` 为
+  **18/20**，剩余是 UTF-16 timer label 与 immediate exception/microtask ordering；
+  未启动新构建，未跑全量。
 - `163a0a3` 将本地敏感信息过滤规则加入 `hagent/agents.md` 及中文同步页；该受保护面
   需要维护者签字，不由 agent 自行合并。PR #36 已同步两轮候选实测和本节点策略。
 
