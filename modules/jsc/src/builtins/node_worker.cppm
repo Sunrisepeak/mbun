@@ -1261,11 +1261,24 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
     try { return decodeURIComponent(payload); } catch (e) { return payload; }
   };
 
+  // The media type of a data: URL — everything between `data:` and the first
+  // comma, with the parameter list (`;charset=…`) and the `;base64` marker
+  // stripped. An omitted type is `text/plain` per RFC 2397, but node's ESM
+  // loader treats the EMPTY string as "no type given" and falls through to its
+  // JavaScript default, so it is reported as "" here rather than defaulted.
+  const dataUrlMime = (p) => {
+    const comma = p.indexOf(",");
+    if (comma === -1) return "";
+    const meta = p.slice(5, comma);
+    const semi = meta.indexOf(";");
+    return (semi === -1 ? meta : meta.slice(0, semi)).trim();
+  };
+
   // node ERR_WORKER_PATH: a bare specifier is not a worker entry point.
   const workerEntryPath = (filename) => {
     let p = filename;
     if (p !== null && typeof p === "object" && typeof p.href === "string") {
-      if (p.protocol === "data:") return { source: dataUrlSource(p.href) };
+      if (p.protocol === "data:") return { source: dataUrlSource(p.href), mime: dataUrlMime(p.href) };
       if (p.protocol !== "file:") {
         const e = new TypeError("The URL must be of scheme file: Received protocol '" + p.protocol + "'");
         e.code = "ERR_INVALID_URL_SCHEME"; throw e;
@@ -1558,8 +1571,35 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
         isEval = true;
       } else {
         const r = workerEntryPath(filename);
-        if (r.source !== undefined) { entry = writeTempWorker(r.source, tid, ".js"); this._tempFile = entry; isEval = true; }
-        else entry = r.path;
+        if (r.source !== undefined) {
+          // ref: node lib/internal/modules/esm/load.js + translators.js — a
+          // `data:` worker entry goes through the ESM loader, which is what
+          // decides both of the observable behaviours here. mbun used to spill
+          // the payload into a `.js` temp file, i.e. run it as CommonJS, and
+          // that made three of test-worker-data-url's six cases silently
+          // succeed where node fails: a non-JS media type has no module format
+          // at all, `module.exports = {}` is a ReferenceError in a module (but
+          // ordinary CJS in a script), and a rejecting top-level await is a
+          // module-evaluation rejection (but not even parseable as a script).
+          //
+          // The media type is everything before the first `,`, minus any
+          // parameters (`;charset=utf-8`) and the `;base64` marker that
+          // dataUrlSource already consumed.
+          const mt = String(r.mime || "").trim().toLowerCase();
+          if (mt !== "" && mt !== "text/javascript" && mt !== "application/javascript" &&
+              mt !== "text/ecmascript" && mt !== "application/ecmascript") {
+            // Reported as an 'error' on the handle, not thrown from the
+            // constructor: node discovers it inside the worker's own loader.
+            entry = writeTempWorker(
+                "const e = new TypeError(\"Unknown module format: \" + " + JSON.stringify(mt) +
+                    ");\ne.code = 'ERR_UNKNOWN_MODULE_FORMAT';\nthrow e;\n",
+                tid, ".js");
+          } else {
+            entry = writeTempWorker(r.source, tid, ".mjs");
+          }
+          this._tempFile = entry;
+          isEval = true;
+        } else entry = r.path;
       }
       // An entry point that does not RESOLVE is an 'error' event on the parent's
       // handle carrying the module loader's own error (node reports the CJS/ESM

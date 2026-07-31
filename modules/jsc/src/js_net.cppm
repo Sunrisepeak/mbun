@@ -235,6 +235,33 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
   // non-zero, so `server.unref()` really does let the process leave — it used to
   // be a no-op that still pinned the loop, which hung 580 corpus files.
   const NET = (G.__mbunNet = { pending: 0, items: new Set(), stall: 0, serveActive: 0, gen: 0, handles: 0 });
+  // PORT-SOURCE: compat/node/lib/internal/per_context/primordials.js (the idea,
+  // not the file). node's whole internal layer is written against captured
+  // primordials precisely so user code cannot break the runtime by editing a
+  // shared prototype; mbun's builtins are ordinary JS, so a snapshot has to be
+  // taken where it matters. It matters MOST here: __mbunNetDrain runs on every
+  // single pump iteration of every process, so a poisoned Array iterator turns
+  // an unrelated user mutation into a fatal error at shutdown, with a two-frame
+  // "(native)" stack and no way to tell which builtin died. Two corpus files
+  // pin exactly that (test-worker-terminate-source-map redefines
+  // ArrayIteratorPrototype.next, test-require-delete-array-iterator DELETES it
+  // and Array.prototype[Symbol.iterator]).
+  //
+  // Only the Set snapshot is captured, and the consumers below index-loop over
+  // it. `Array.from(set)` was BOTH halves of the problem: it reads
+  // Set.prototype[Symbol.iterator] to walk the source, and the `for…of` over
+  // its result reads Array.prototype[Symbol.iterator] plus %ArrayIteratorProto%
+  // .next. `Set.prototype.forEach` held in a local reads neither.
+  const _setForEach = Set.prototype.forEach;
+  // A fresh array per call ON PURPOSE: _poll() re-entrantly adds to and deletes
+  // from NET.items (a listener accepting a connection, a socket failing), which
+  // is why the old code snapshotted too. Semantics are unchanged; only the walk
+  // is now independent of user-visible prototypes.
+  const netItemsSnapshot = () => {
+    const out = [];
+    _setForEach.call(NET.items, (it) => { out[out.length] = it; });
+    return out;
+  };
   // A handle's loop reference. `refd` is the user's intent (sticky across
   // open/close, as node's uv_ref/uv_unref flag is), `held` whether the count
   // currently carries this handle.
@@ -254,7 +281,9 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
     NET.gen = (NET.gen + 1) | 0;
     for (let pass = 0; pass < 16; pass++) {
       let progress = 0;
-      for (const it of Array.from(NET.items)) {
+      const snap = netItemsSnapshot();
+      for (let si = 0; si < snap.length; si++) {
+        const it = snap[si];
         try { progress += it._poll() | 0; }
         catch (e) {
           // A poll is a node callback boundary: the native reads below already
@@ -280,7 +309,9 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       if (!NET.stall) NET.stall = Date.now();
       if (Date.now() - NET.stall > 5000) {  // 5s with zero progress → wedged
         NET.stall = 0;
-        for (const it of Array.from(NET.items)) {
+        const stalled = netItemsSnapshot();
+        for (let si = 0; si < stalled.length; si++) {
+          const it = stalled[si];
           if (it._pendingOp && it._fail) { try { it._fail(mkErr("The socket connection timed out", "ETIMEDOUT")); } catch (e) {} NET.items.delete(it); }
         }
       } else if (SN && NET.serveActive > 0) { try { SN.tick(2); } catch (e) {} }

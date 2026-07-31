@@ -483,20 +483,52 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     });
   };
 
+  // PORT-SOURCE: compat/node/lib/internal/per_context/primordials.js (the idea).
+  // Same reason as the netItemsSnapshot in js_net.cppm: __mbun_io_tick is on the
+  // pump path of every process that has a child or an IPC channel — which is
+  // EVERY worker child, since mbun runs a worker as a child mbun process — so
+  // walking its state through `[...set]` / `for…of` makes a user edit to
+  // Array.prototype[Symbol.iterator] or %ArrayIteratorPrototype%.next a fatal
+  // error in the runtime rather than in the user's own code.
+  // test-worker-terminate-source-map does exactly that edit, on purpose, to
+  // prove node's shutdown path calls no user JS.
+  const _setForEachP = Set.prototype.forEach;
+  const childSnapshot = () => {
+    const out = [];
+    _setForEachP.call(CHILDREN, (rec) => { out[out.length] = rec; });
+    return out;
+  };
   G.__mbun_io_tick = function () {
     // The Bun.Terminal reactor lives in the :bun_terminal partition, whose text
     // is appended INSIDE this partition's still-open `if (globalThis.Bun)`
     // block -- so its declarations are NOT in this function's scope. It hands
     // itself over on the global instead; reached lazily because this function
     // is installed before that partition has run.
+    //
+    // Snapshotted through _setForEachP, NOT `[...TR.set]`. This function runs on
+    // every pump iteration, so a spread here reads Array.prototype[Symbol.iterator]
+    // on every turn and a program that deletes it kills the runtime at shutdown
+    // with a two-frame (native) stack naming nothing. That is the same defect
+    // this commit fixes for CHILDREN; the terminal set has to obey it too.
     const TR = G.__mbunTerminalReactor;
-    const terms = TR ? [...TR.set] : [];
+    const terms = [];
+    if (TR) _setForEachP.call(TR.set, (t) => { terms[terms.length] = t; });
     if (!CHILDREN.size && SELF_IPC === null && !terms.length) return 0;
-    const recs = [...CHILDREN];
+    // Snapshotted because the drains below add to and delete from CHILDREN.
+    const recs = childSnapshot();
     const readFds = [], readObjs = [];
-    for (const rec of recs) for (const o of rec.outs) if (!o.ended && o.fd >= 0) { readFds.push(o.fd); readObjs.push(o); }
-    for (const rec of recs) if (rec.ipc && !rec.ipc.closed) { readFds.push(rec.ipc.fd); readObjs.push({ ipcRec: rec }); }
-    for (const t of terms) if (!t.closed && t.master >= 0) { readFds.push(t.master); readObjs.push({ term: t }); }
+    for (let ri = 0; ri < recs.length; ri++) {
+      const rec = recs[ri], outs = rec.outs;
+      for (let oi = 0; oi < outs.length; oi++) {
+        const o = outs[oi];
+        if (!o.ended && o.fd >= 0) { readFds.push(o.fd); readObjs.push(o); }
+      }
+    }
+    for (let ri = 0; ri < recs.length; ri++) { const rec = recs[ri]; if (rec.ipc && !rec.ipc.closed) { readFds.push(rec.ipc.fd); readObjs.push({ ipcRec: rec }); } }
+    for (let ti = 0; ti < terms.length; ti++) {
+      const t = terms[ti];
+      if (!t.closed && t.master >= 0) { readFds.push(t.master); readObjs.push({ term: t }); }
+    }
     if (SELF_IPC !== null && !SELF_IPC.ch.closed) { readFds.push(SELF_IPC.ch.fd); readObjs.push({ self: SELF_IPC }); }
     if (readFds.length) {
       const ready = PROC.poll(readFds, 5);
@@ -511,12 +543,18 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     } else {
       PROC.poll([], 2);  // brief real wait while waiting for a child to exit
     }
-    for (const t of terms) TR.flush(t);
-    for (const rec of recs) { flushStdin(rec); for (const w of rec.writers) flushWriter(w); }
-    for (const rec of recs) if (rec.ipc && !rec.ipc.closed) { ipcFlush(rec.ipc); rec.ipcDelivery.flush(); }
+    for (let ti = 0; ti < terms.length; ti++) TR.flush(terms[ti]);
+    for (let ri = 0; ri < recs.length; ri++) {
+      const rec = recs[ri];
+      flushStdin(rec);
+      const ws = rec.writers;
+      for (let wi = 0; wi < ws.length; wi++) flushWriter(ws[wi]);
+    }
+    for (let ri = 0; ri < recs.length; ri++) { const rec = recs[ri]; if (rec.ipc && !rec.ipc.closed) { ipcFlush(rec.ipc); rec.ipcDelivery.flush(); } }
     if (SELF_IPC !== null && !SELF_IPC.ch.closed) { ipcFlush(SELF_IPC.ch); SELF_IPC.delivery.flush(); }
-    for (const rec of recs) reap(rec);
+    for (let ri = 0; ri < recs.length; ri++) reap(recs[ri]);
     let active = 0;
+<<<<<<< HEAD
     for (const rec of recs) { if (rec.done) CHILDREN.delete(rec); else if (!rec.unrefd) active++; }
     // A ref'd Terminal pins the loop the way bun's reader/writer poll does --
     // but ONLY while it can still produce an observable event. A terminal with
@@ -526,6 +564,9 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       if (t.closed) { TR.set.delete(t); continue; }
       if (!t.unrefd && (t.onData || t.onDrain || t.onExit)) active++;
     }
+=======
+    for (let ri = 0; ri < recs.length; ri++) { const rec = recs[ri]; if (rec.done) CHILDREN.delete(rec); else if (!rec.unrefd) active++; }
+>>>>>>> f946842 (fix(runtime): keep the pump primordial-safe and exit 13 on an unsettled TLA)
     // node ref-counts the child-side channel: it pins the loop only while a
     // 'message' or 'disconnect' listener is attached (setupChannel's
     // newListener/removeListener ref counting) — that is what lets

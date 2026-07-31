@@ -719,6 +719,24 @@ public:
                     return fail_run_(s.error());
                 }
                 pump_event_loop("0");
+            } else {
+                // ref: node src/node.cc / lib/internal/modules/esm/loader.js —
+                // when the loop drains with the entry module's top-level await
+                // still pending, node warns and leaves with status 13
+                // (ExitCode::kUnsettledTopLevelAwait). mbun reached the same
+                // state and left with 0, so a worker whose entry never settles
+                // reported a clean exit
+                // (test-worker-data-url asserts exitCode === 13 for
+                // `data:text/javascript,await new Promise(()=>{})`).
+                //
+                // This arm is ONLY reachable from the TLA wrapper above: the
+                // script-mode parse already failed, so the entry really is a
+                // module with an unfinished await, not a sync program. The
+                // 'exit' listeners still run (finish_run_ emits them), and an
+                // explicit process.exitCode set by the module before it parked
+                // still wins, because __mbun_run_exit reads the slot back.
+                std::cerr << "Warning: Detected unsettled top-level await at " << absPath << '\n';
+                return finish_run_(13);
             }
         } else {
             // Top level ran synchronously to completion. Node/bun keep the process
