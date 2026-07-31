@@ -857,6 +857,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   // directly (test-util-primordial-monkeypatching replaces Object.keys with a
   // throwing stub). These aliases are captured at image build time.
   const PObjectKeys = Object.keys;
+  const PObjectGetOwnPropertyNames = Object.getOwnPropertyNames;
   const PObjectGetOwnPropertySymbols = Object.getOwnPropertySymbols;
   const PObjectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
   const PObjectGetPrototypeOf = Object.getPrototypeOf;
@@ -1048,7 +1049,10 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       // Same `special` colour as the class branch above.
       return col(36, 39, base);
     }
-    if (seen.has(v)) return "[Circular *1]";
+    if (seen.has(v)) {
+      if (seen.__mbunRefTarget === undefined) seen.__mbunRefTarget = v;
+      return "[Circular *1]";
+    }
     // nodejs.util.inspect.custom dispatch: an object exposing a callable custom
     // symbol formats itself. Passed (depth, options{stylize,depth}, inspect).
     // ref node lib/internal/util/inspect.js formatValue custom-inspect branch.
@@ -1199,6 +1203,8 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     // line and the closing delimiter its own line too (util.inspect's
     // reduceToSingleString "compact === false" branch).
     const noCompact = opts.compact === false;
+    const breakLength = opts.breakLength === null ? Infinity
+      : (typeof opts.breakLength === "number" ? opts.breakLength : gInspectDefaultsStore.breakLength);
     // mbun rendered EVERY element, so a 1000-element array printed 1000 entries
     // where node and bun both stop at 100 — and inspecting a huge array cost
     // O(n) formatting instead of O(maxArrayLength).
@@ -1206,8 +1212,16 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     const remainingText = inspectRemainingText;
     const nodeBlock = (label, items, open, close) => {
       if (!items.length) return label + open + close;
-      if (noCompact) return label + open + "\n" + items.map((it) => inner + it).join(",\n") + "\n" + outer + close;
-      return label + open + " " + items.join(", ") + " " + close;
+      const oneLine = label + open + " " + items.join(", ") + " " + close;
+      // PORT-SOURCE: compat/node/lib/internal/util/inspect.js
+      // reduceToSingleString — the default compact mode still breaks an object
+      // when its rendered entries exceed breakLength. The previous mbun path
+      // only honored compact:false, keeping deep getter output on one line.
+      // Node reserves a small fixed margin for the surrounding formatter state
+      // before applying its entry-length check; preserve that boundary here so
+      // a 127-character block with the default 128 breakLength is multiline.
+      if (!noCompact && oneLine.length + 10 <= breakLength) return oneLine;
+      return label + open + "\n" + items.map((it) => inner + it).join(",\n") + "\n" + outer + close;
     };
     if (PArrayIsArray(v)) {
       // formatArray: slice first, THEN format — the slice keeps holes (so a
@@ -1297,12 +1311,42 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       const syms = PObjectGetOwnPropertySymbols(v).filter((s) => { const d = PObjectGetOwnPropertyDescriptor(v, s); return d && d.enumerable; });
       // node's formatProperty reads desc.value, not value[key] — one property
       // get per key instead of two, and it is the descriptor's own view.
-      const descVal = (d, key) => (d && (d.get || d.set)) ? (d.get && d.set ? "[Getter/Setter]" : d.get ? "[Getter]" : "[Setter]") : inspectValue(d ? d.value : v[key], opts, seen, depth + 1);
+      const descVal = (d, key, receiver = v) => {
+        if (!d || (!d.get && !d.set)) return inspectValue(d ? d.value : receiver[key], opts, seen, depth + 1);
+        const label = d.get && d.set ? "Getter/Setter" : d.get ? "Getter" : "Setter";
+        const getterMode = opts.getters === true ||
+          (opts.getters === "get" && d.set === undefined) ||
+          (opts.getters === "set" && d.set !== undefined);
+        if (!d.get || !getterMode) return "[" + label + "]";
+        try {
+          const got = d.get.call(receiver);
+          if (got !== null && typeof got === "object") return "[" + label + "] " + inspectValue(got, opts, seen, depth + 1);
+          return "[" + label + ": " + inspectValue(got, opts, seen, depth + 1) + "]";
+        } catch (e) {
+          return "[" + label + ": <Inspection threw (" + inspectValue(e, opts, seen, depth + 1) + ")>]";
+        }
+      };
+      const protoGetters = [];
+      if (opts.showHidden) {
+        const known = new Set(keys);
+        let proto = PObjectGetPrototypeOf(v), layers = 0;
+        while (proto !== null && layers++ < 3) {
+          const pd = PObjectGetOwnPropertyDescriptor(proto, "constructor");
+          if (pd && typeof pd.value === "function" && pd.value.name === "Object") break;
+          for (const key of PObjectGetOwnPropertyNames(proto)) {
+            if (key === "constructor" || known.has(key)) continue;
+            const d = PObjectGetOwnPropertyDescriptor(proto, key);
+            if (d && (d.get || d.set)) { protoGetters.push([key, d]); known.add(key); }
+          }
+          proto = PObjectGetPrototypeOf(proto);
+        }
+      }
       if (bun) {
         const items = keys.map((k) => bunKey(k) + ": " + descVal(PObjectGetOwnPropertyDescriptor(v, k), k));
         // Index loop, not `for (const s of syms)`: for-of over a plain array
         // reads Array.prototype[Symbol.iterator] at call time.
         for (let i = 0; i < syms.length; i++) { const s = syms[i]; items.push("[" + s.toString() + "]: " + descVal(PObjectGetOwnPropertyDescriptor(v, s), s)); }
+        for (const [key, d] of protoGetters) items.push("[" + key + "]: " + descVal(d, key, v));
         result = bunBlock(ctor, items);
       } else {
         // PORT-SOURCE: compat/node/lib/internal/util/inspect.js formatProperty —
@@ -1313,8 +1357,13 @@ inline constexpr char kBootstrapJS_[] = R"JS(
         // label. The bun layout already went through descVal.
         const items = keys.map((k) => { const kk = /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(k) ? k : "'" + k + "'"; return kk + ": " + descVal(PObjectGetOwnPropertyDescriptor(v, k), k); });
         for (let i = 0; i < syms.length; i++) { const s = syms[i]; items.push(s.toString() + ": " + descVal(PObjectGetOwnPropertyDescriptor(v, s), s)); }
+        for (const [key, d] of protoGetters) items.push("[" + key + "]: " + descVal(d, key, v));
         result = nodeBlock(ctor, items, "{", "}");
       }
+    }
+    if (!bun && seen.__mbunRefTarget === v) {
+      result = "<ref *1> " + result;
+      delete seen.__mbunRefTarget;
     }
     seen.delete(v);
     return result;
