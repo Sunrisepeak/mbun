@@ -276,6 +276,47 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
       },
     };
 
+    // node lib/internal/test_runner/snapshot.js already provides the snapshot
+    // file manager. The standalone runner owns the TestContext, so it creates
+    // one manager lazily and shares it across contexts in this process.
+    let snapshotRuntime;
+    const getSnapshotRuntime = () => {
+      if (snapshotRuntime !== undefined) return snapshotRuntime;
+      if (typeof G.require !== "function") return undefined;
+      try {
+        const snapshotModule = G.require("internal/test_runner/snapshot");
+        if (!snapshotModule || typeof snapshotModule.SnapshotManager !== "function") return undefined;
+        const argvHas = (list, flag) => Array.isArray(list) && list.indexOf(flag) !== -1;
+        const processObj = G.process;
+        const updateSnapshots = argvHas(processObj && processObj.argv, "--test-update-snapshots") ||
+          argvHas(processObj && processObj.execArgv, "--test-update-snapshots");
+        const manager = new snapshotModule.SnapshotManager(updateSnapshots);
+        const assertion = manager.createAssert();
+        const fileAssertion = manager.createFileAssert();
+        if (processObj && typeof processObj.on === "function") {
+          processObj.on("exit", () => {
+            try { manager.writeSnapshotFiles(); } catch (error) { processObj.exitCode = 1; }
+          });
+        }
+        snapshotRuntime = { snapshotModule, assertion, fileAssertion };
+        return snapshotRuntime;
+      } catch (error) {
+        return undefined;
+      }
+    };
+    const snapshotApi = {
+      setResolveSnapshotPath(...a) {
+        const runtime = getSnapshotRuntime();
+        if (!runtime) throw new Error("Snapshot support is unavailable");
+        return runtime.snapshotModule.setResolveSnapshotPath(...a);
+      },
+      setDefaultSnapshotSerializers(...a) {
+        const runtime = getSnapshotRuntime();
+        if (!runtime) throw new Error("Snapshot support is unavailable");
+        return runtime.snapshotModule.setDefaultSnapshotSerializers(...a);
+      },
+    };
+
     // node exposes the context of the innermost running test/suite; mbun's
     // standalone runner is strictly sequential, so one slot is enough (it also
     // survives an await/setImmediate inside the body, which is what
@@ -789,12 +830,19 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
       const assert = assertMod();
       const bound = {};
       if (assert) {
+        const uncopiedKeys = new Set(["AssertionError", "strict", "Assert", "options"]);
         for (const key of Object.keys(assert)) {
+          if (uncopiedKeys.has(key)) continue;
           const value = assert[key];
           if (typeof value !== "function") continue;
           bound[key] = counted(function (...a) { return value.apply(assert, a); });
         }
         bound.ok = counted(function (...a) { return assert.ok.apply(assert, a); });
+      }
+      const snapshot = getSnapshotRuntime();
+      if (snapshot) {
+        bound.snapshot = counted(function (...a) { return snapshot.assertion.apply(context, a); });
+        bound.fileSnapshot = counted(function (...a) { return snapshot.fileAssertion.apply(context, a); });
       }
       // Custom assertions registered through node:test's `assert.register` are
       // bound to the TestContext (`this` === t) and count towards t.plan().
@@ -1102,6 +1150,7 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
       mock: makeMock(),
       run: () => state.chain,
       assert: testAssert,
+      snapshot: snapshotApi,
       getTestContext,
     };
 
@@ -1145,6 +1194,7 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
     });
     // node:test's own exports, independent of which runner is in charge.
     nodeTest.assert = testAssert;
+    nodeTest.snapshot = snapshotApi;
     nodeTest.getTestContext = () => (useDelegate() ? undefined : getTestContext());
     nodeTest.default = nodeTest;
     M["test"] = nodeTest;

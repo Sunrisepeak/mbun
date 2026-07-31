@@ -29,6 +29,13 @@
   `{"first":5,"second":17}`；`test-fs-readv-promisify.js` 保持 **1/1**。完整
   `test-util-promisify.js` 仍为 **0/1 file green**，剩余是独立 warning-contract 缺口，
   原 custom-args 断言不再出现；不把该文件计为新增 green。
+- W41 runner slice 复用 vendored `SnapshotManager`，接通 `t.assert.snapshot()`、
+  `t.assert.fileSnapshot()`、`node:test.snapshot` setter、update-snapshots flag 与
+  exit-time write。`test-runner-snapshot-file-tests.js` **0/1 → 1/1**；
+  `test-runner-snapshot-tests.js` 变为 **32/33 subtests pass**，剩余 1 项是独立的
+  `--test --test-isolation=none` 多文件 CLI 路径。`test-runner-assert.js` 的 methods
+  枚举断言已通过，剩余 source-expression stack 缺口另行处理；option-validation 与
+  RegExp 回归仍各 **1/1**。
 - `163a0a3` 将本地敏感信息过滤规则加入 `hagent/agents.md` 及中文同步页；该受保护面
   需要维护者签字，不由 agent 自行合并。PR #36 已同步两轮候选实测和本节点策略。
 

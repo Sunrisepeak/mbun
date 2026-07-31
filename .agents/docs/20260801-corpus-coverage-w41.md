@@ -64,6 +64,22 @@ The next coordinator build also repaired one isolated `util.promisify` contract:
 - The fresh build kept `test-runner-option-validation.js` and
   `test-runner-string-to-regexp.js` at **1/1** each.
 
+The following runner slice wires the existing vendored `SnapshotManager` into
+the standalone TestContext:
+
+- `t.assert.snapshot()` and `t.assert.fileSnapshot()` now use one per-process
+  manager, including update/read mode and exit-time writes.
+- `node:test.snapshot.setResolveSnapshotPath()` and
+  `setDefaultSnapshotSerializers()` are exposed.
+- `test-runner-snapshot-file-tests.js` is **1/1 pass**; its validation and
+  update/read flows pass.
+- `test-runner-snapshot-tests.js` reaches **32/33 subtests pass**. The remaining
+  subtest exercises the separate multi-file `--test --test-isolation=none` CLI
+  path, which still fails before the fixture tests are collected.
+- `test-runner-assert.js` now passes the `t.assert` method enumeration and fails
+  only on source-expression stack enrichment. No no-op snapshot methods were
+  added.
+
 ## Next route
 
 1. Validate the `t.assert` key contract as a standalone runner slice.
@@ -71,7 +87,9 @@ The next coordinator build also repaired one isolated `util.promisify` contract:
    do not add no-op methods merely to change enumeration.
 3. Revisit the remaining test-util warning contract separately; do not combine it
    with the completed multi-value promisify slice.
-4. Keep test-v8 profiler/queryObjects and broad VM wording changes parked until
+4. Diagnose the multi-file `--test-isolation=none` CLI and assertion source
+   positions as separate runner/runtime lanes.
+5. Keep test-v8 profiler/queryObjects and broad VM wording changes parked until
    ownership is clear.
 
 No local absolute paths, user names, host names, credentials, private URLs, or
