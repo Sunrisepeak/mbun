@@ -4,8 +4,23 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fcntl.h>
+#if defined(_WIN32)
+// Windows has no <sys/mman.h> or <unistd.h>. This driver benchmarks raw
+// descriptor I/O against mbun.core.io, and the CRT's low-level _open/_close/
+// _O_* provide the same descriptor model. MADV_HUGEPAGE does not exist here and
+// its call site is already guarded by #if defined(MADV_HUGEPAGE), so the hint
+// simply does not apply. Found by the Windows CI probe, which reaches this file
+// before anything in the library.
+#include <io.h>
+#define open  _open
+#define close _close
+#ifndef O_CLOEXEC
+#define O_CLOEXEC 0  // no fork() to leak into; _O_NOINHERIT is the near analogue
+#endif
+#else
 #include <sys/mman.h>
 #include <unistd.h>
+#endif
 
 import std;
 import mbun.core.io;
