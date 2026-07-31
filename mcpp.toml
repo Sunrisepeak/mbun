@@ -29,6 +29,7 @@ ldflags = ["-Wl,--export-dynamic"]
 
 [dependencies]
 jsc      = { path = "modules/jsc" }
+platform = { path = "modules/platform" }
 semver   = { path = "modules/semver" }
 crypto   = { path = "modules/crypto" }
 which    = { path = "modules/which" }

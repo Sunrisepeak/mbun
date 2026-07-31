@@ -27,6 +27,11 @@ module;
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+// Darwin has no writable `environ` symbol to link against; the process
+// environment is reached through this accessor instead.
+#include <crt_externs.h>
+#endif
 #endif
 
 export module mbun.platform.process;
@@ -40,6 +45,11 @@ export namespace mbun::platform::process {
 // contains no '/', exactly as execvp defines it.
 int exec_path_env(const char* file, char* const argv[], char* const envp[]) noexcept;
 
+// The process environment as a NULL-terminated char** -- `environ` where that
+// symbol exists, and Darwin's accessor where it does not. Returns nullptr on a
+// target with no such concept.
+char** environ_ptr() noexcept;
+
 }  // namespace mbun::platform::process
 
 namespace mbun::platform::process {
@@ -51,6 +61,8 @@ int exec_path_env(const char*, char* const[], char* const[]) noexcept {
     return -1;
 }
 
+char** environ_ptr() noexcept { return nullptr; }
+
 #elif defined(__linux__)
 
 // glibc has the real thing; using it keeps Linux behaviour bit-identical to
@@ -58,6 +70,8 @@ int exec_path_env(const char*, char* const[], char* const[]) noexcept {
 int exec_path_env(const char* file, char* const argv[], char* const envp[]) noexcept {
     return ::execvpe(file, argv, envp);
 }
+
+char** environ_ptr() noexcept { return ::environ; }
 
 #else
 
@@ -129,6 +143,14 @@ int exec_path_env(const char* file, char* const argv[], char* const envp[]) noex
 
     errno = bestErrno;
     return -1;
+}
+
+char** environ_ptr() noexcept {
+#if defined(__APPLE__)
+    return *::_NSGetEnviron();
+#else
+    return ::environ;
+#endif
 }
 
 #endif
