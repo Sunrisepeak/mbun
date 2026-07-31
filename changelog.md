@@ -5,6 +5,15 @@
 
 ## 2026-08-01
 
+- `#40` 修复 `Bun.spawn({ stdout: "pipe" })` 的 custom readable adapter 在
+  `Response(proc.stdout)` 消费后仍允许重复 `text()` 的问题：direct helper、async
+  iterator 和 `pipeTo` 现在共享一次性 consumed 状态，重复消费返回
+  `ReadableStream has already been used`。`process-stdin.test.ts` 从 **13/14** 提升到
+  **14/14、27 expects**；4-file adapter lane 为 **28/46 passed、18 failed、410
+  expects**，其中 10 个 stdout conversion checks 全通过，18 个剩余失败集中在既有
+  `ReadableStream.prototype.*` wrong-this 断言；四条既有 green guards 保持
+  **128/128、0 failed、565 expects**。root release build 约 **60.21 秒**，未跑全量
+  corpus。
 - `#39` 修复 `Bun.spawn({ stdin: Bun.file(...) })` 将 regular-file stdin 错误降级为
   anonymous pipe 的问题：child `process.stdin.ref` 从 `function` 对齐为 `undefined`，
   相邻 pipe contract 保持 `function`，真实 file-byte 读取 smoke 通过。focused

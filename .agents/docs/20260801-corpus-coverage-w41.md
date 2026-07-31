@@ -530,6 +530,29 @@ surface on Linux:
   workspace-wide 或全量 corpus。构建与测试期间 swap 仍约 **43 MiB free**、磁盘
   约 **20 GiB free**，后续新 owner 需继续避免 broad build。
 
+### W53 Bun.spawn stdout disturbed/reject owner
+
+- Issue [#40](https://github.com/Sunrisepeak/mbun/issues/40) 记录了 W52 留下的
+  最后一个 `process-stdin` 红测：`new Response(proc.stdout).text()` 消费 custom
+  stdout adapter 后，第二次 `proc.stdout.text()` 错误地再次 resolve。最小 smoke
+  同时确认 direct helper 二次消费、async iterator 后 helper、`pipeTo` 后 helper
+  都缺少共享的 used-state；native `ReadableStream` 的 `consumerUsableError`
+  已有对应语义。
+- `04214b1` 在 `bun_spawn_stream.cppm` 的 payload 分区中只包装 live subprocess
+  readable adapter，为 `text/bytes/arrayBuffer/blob/json`、async iterator 与
+  `pipeTo` 共用一次 claim；generic Blob stdin 与已有 pipe/stream 路径不变，避免
+  再次扩大接近 constexpr 上限的 `process_web` payload。
+- focused `process-stdin.test.ts` 从 **13/14、26 expects** 提升到 **14/14、27
+  expects**，成为本轮第一个 focused green；4-file adapter lane 使用默认
+  **4G/512、4 jobs**，结果为 **28/46 passed、18 failed、410 expects**。其中
+  `readablestream-helpers` 的 10 个 Bun.spawn conversion checks 全通过，18 个
+  wrong-this failures 是该文件既有的 `ReadableStream.prototype.*` contract，
+  未混入本 owner；`spawn-streaming-stdout` 与 `spawn-streaming-stdin` 均 green。
+- 四条既有 guards 复测仍为 **4/4 files、128/128 tests、0 failed、565 expects**。
+  root release build 成功，耗时约 **60.21 秒**；未启动 workspace-wide build，未跑
+  全量 corpus。资源策略继续保持 3–5 个 bounded lanes；本轮只在一个 adapter lane
+  中使用 4 jobs，并继续回避 swap/disk 低水位下的并发构建。
+
 ## Next route
 
 1. Keep the native-syntax compatibility gate limited to the two measured
@@ -548,9 +571,11 @@ surface on Linux:
 5. Keep the two W51 residual `process-stdin` failures parked under their own
    child-stdio/WebStream owners; do not reopen the fixed final-read ordering
    path unless a new regression reproduces it.
-6. Close the child-stdio owner at W52's 13/14 checkpoint; investigate only the
-   remaining WebStream disturbed/reject semantics as the next single owner,
-   with a minimal stream-consumption reproduction before any source change.
+6. Close the child-stdio and stdout disturbed/reject owners at W53's **14/14**
+   checkpoint; do not reopen either path without a new minimal reproduction.
+7. Select the next task only from a measured one-owner Bun/Node near-green row;
+   keep 3–5 bounded lanes, record per-file pass/fail/expect counts, and defer
+   full-corpus runs and broad builds while swap or disk headroom remains low.
 
 No local absolute paths, user names, host names, credentials, private URLs, or
 machine-specific identifiers belong in future comments, commits, PR text, or
