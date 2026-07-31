@@ -554,19 +554,16 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     if (SELF_IPC !== null && !SELF_IPC.ch.closed) { ipcFlush(SELF_IPC.ch); SELF_IPC.delivery.flush(); }
     for (let ri = 0; ri < recs.length; ri++) reap(recs[ri]);
     let active = 0;
-<<<<<<< HEAD
-    for (const rec of recs) { if (rec.done) CHILDREN.delete(rec); else if (!rec.unrefd) active++; }
+    for (let ri = 0; ri < recs.length; ri++) { const rec = recs[ri]; if (rec.done) CHILDREN.delete(rec); else if (!rec.unrefd) active++; }
     // A ref'd Terminal pins the loop the way bun's reader/writer poll does --
     // but ONLY while it can still produce an observable event. A terminal with
     // no data/drain/exit callback can never call back into JS, so pinning for
     // it could only turn "the script finished" into a hang.
-    for (const t of terms) {
+    for (let ti = 0; ti < terms.length; ti++) {
+      const t = terms[ti];
       if (t.closed) { TR.set.delete(t); continue; }
       if (!t.unrefd && (t.onData || t.onDrain || t.onExit)) active++;
     }
-=======
-    for (let ri = 0; ri < recs.length; ri++) { const rec = recs[ri]; if (rec.done) CHILDREN.delete(rec); else if (!rec.unrefd) active++; }
->>>>>>> f946842 (fix(runtime): keep the pump primordial-safe and exit 13 on an unsettled TLA)
     // node ref-counts the child-side channel: it pins the loop only while a
     // 'message' or 'disconnect' listener is attached (setupChannel's
     // newListener/removeListener ref counting) — that is what lets
