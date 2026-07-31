@@ -31,6 +31,47 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
 (function () {
   const G = globalThis;
 
+  // JSC's RegExp constructor omits the offending flags from its SyntaxError,
+  // while node includes them (for example, `Invalid flags supplied to RegExp
+  // constructor 'gg'.`). Keep the native constructor and call semantics, but
+  // normalize only that diagnostic at the node compatibility boundary. This
+  // is consumed by node's internal/test_runner/utils convertStringToRegExp()
+  // and by other Node APIs that surface the same constructor error.
+  try {
+    const NativeRegExp = G.RegExp;
+    if (typeof NativeRegExp === "function" && !G.__mbunRegExpErrorCompat) {
+      const normalizeRegExpError = (error, args) => {
+        if (!error || error.name !== "SyntaxError" ||
+            error.message !== "Invalid flags supplied to RegExp constructor." ||
+            typeof args[1] !== "string") return;
+        // ERR_INVALID_ARG_VALUE appends the sentence terminator after the
+        // reason, so this inner diagnostic deliberately has no final period.
+        try { error.message = "Invalid flags supplied to RegExp constructor '" + args[1] + "'"; } catch (e) {}
+      };
+      const CompatRegExp = new Proxy(NativeRegExp, {
+        apply(target, receiver, args) {
+          try { return Reflect.apply(target, receiver, args); }
+          catch (error) { normalizeRegExpError(error, args); throw error; }
+        },
+        construct(target, args, newTarget) {
+          try { return Reflect.construct(target, args, newTarget); }
+          catch (error) { normalizeRegExpError(error, args); throw error; }
+        },
+      });
+      Object.defineProperty(G, "RegExp", {
+        value: CompatRegExp, writable: true, configurable: true, enumerable: false,
+      });
+      // The native prototype is intentionally shared by the proxy target and
+      // wrapper, so keep the standard constructor identity observable too.
+      Object.defineProperty(NativeRegExp.prototype, "constructor", {
+        value: CompatRegExp, writable: true, configurable: true, enumerable: false,
+      });
+      Object.defineProperty(G, "__mbunRegExpErrorCompat", {
+        value: true, writable: false, configurable: true, enumerable: false,
+      });
+    }
+  } catch (e) {}
+
   // ------------------------------------------------ EventTarget / Event shim
   try {
     if (typeof G.EventTarget !== "function") {
