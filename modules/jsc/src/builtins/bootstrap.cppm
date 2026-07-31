@@ -3002,7 +3002,10 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       const buf = G.Buffer.from(all.subarray(0, count));
       rbuf = count < all.length ? [G.Buffer.from(all.subarray(count))] : [];
       syncReadableLength();
-      if (eof && !rbuf.length) emitEnd();
+      // Return the final bytes before publishing `end`. Callers record the
+      // value returned by read() after this function returns; emitting here
+      // would let the end listener observe an incomplete consumer buffer.
+      if (eof && !rbuf.length) G.process.nextTick(emitEnd);
       return stdin._enc ? buf.toString(stdin._enc) : buf;
     };
     stdin.destroy = () => { detach(); ended = true; eof = true; stdin.destroyed = true; stdin.readable = false; stdin.emit("close"); return stdin; };
