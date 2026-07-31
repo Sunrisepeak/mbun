@@ -144,12 +144,20 @@ package = {
 import("xim.libxpkg.pkginfo")
 import("xim.libxpkg.log")
 
--- 上游 macOS 产物漏装的头。RetainRef.h 无条件 `#include <wtf/cocoa/NSTypeTraits.h>`，
--- 而 macos-arm64 tarball 的 3016 个条目里装了 RetainRef.h、装了 12 个
--- wtf/cocoa/ 头，唯独没有 NSTypeTraits.h（实查清单，0 匹配）。这条链是
--- RobinHoodHashTable.h → text/StringHash.h → AtomString.h → StringConcatenate.h
--- → StringView.h → RetainPtr.h → RetainRef.h，全在核心字符串机制上，任何 JSC
--- 绑定都会拉到，绕不开。所以按上游原文补回，而不是改 mbun 源码。
+-- 上游 macOS 产物漏装的头。macos-arm64 tarball 的 3016 个条目里装了
+-- RetainRef.h、装了 12 个 wtf/cocoa/ 头，唯独没有 NSTypeTraits.h（实查清单，
+-- 0 匹配）。升级 pin 无用：bun 自己钉的 4895f45d（3017 条）与上游最新
+-- 45e21dc0（3037 条）同样是 0 匹配，缺口不随版本消失。
+--
+-- RetainRef.h:30 的 `#include <wtf/cocoa/NSTypeTraits.h>` 受
+-- `#if USE(CF) || defined(__OBJC__)` 守卫（不是无条件——早期判断有误）。我们
+-- 命中是因为 prebuilt 自带的 Platform.h 里 USE(CF) 为真。关掉 USE(CF) 不是
+-- 选项：它由产物的 Platform.h 决定，与已编译好的 JSC/WTF 静态库共享，单方面
+-- 翻转等于和 libs 的假设不一致。
+--
+-- 触发链 RobinHoodHashTable.h → text/StringHash.h → AtomString.h →
+-- StringConcatenate.h → StringView.h → RetainPtr.h → RetainRef.h 落在核心字符串
+-- 机制上，任何 JSC 绑定都会拉到。所以按上游原文补回，而不是改 mbun 源码。
 --
 -- 与上游唯一的实质差异在 #else 分支：上游只在 __OBJC__ 下 import Foundation，
 -- 而 `id` 是 ObjC 类型，mbun 的 TU 是纯 C++ 模块（非 .mm），模板声明处就需要

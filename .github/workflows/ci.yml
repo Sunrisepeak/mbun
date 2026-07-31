@@ -193,14 +193,24 @@ jobs:
 #          by compat.openssl 3.5.1, which does publish macOS).
 #
 #          It now stops OUTSIDE mbun, in the prebuilt: bun-webkit-macos-arm64
-#          ships wtf/RetainRef.h, which does an unconditional
-#          `#include <wtf/cocoa/NSTypeTraits.h>`, but that header is not in the
-#          tarball -- 0 matches across all 3,016 entries, alongside 12 sibling
-#          wtf/cocoa/ headers that ARE shipped. The include chain reaching it
-#          (StringView.h -> RetainPtr.h -> RetainRef.h) is core WTF, so no JSC
-#          binding can avoid it. mcpp/pkgs/m/mbun.jsc-prebuilt.lua's install()
-#          now supplies the header on macosx; whether that alone clears the wall
-#          is what the next probe run measures, not something asserted here.
+#          ships wtf/RetainRef.h, whose line 30 includes
+#          <wtf/cocoa/NSTypeTraits.h> under `#if USE(CF) || defined(__OBJC__)`,
+#          but that header is not in the tarball -- 0 matches across all 3,016
+#          entries, alongside 12 sibling wtf/cocoa/ headers that ARE shipped.
+#          We satisfy the guard because the prebuilt's own Platform.h has
+#          USE(CF) on, and turning that off is not ours to do: it is shared with
+#          the already-compiled JSC/WTF archives. The chain reaching it
+#          (StringView.h -> RetainPtr.h -> RetainRef.h) is core WTF.
+#
+#          Bumping the pin does not help -- the header is absent from bun's own
+#          pinned 4895f45d (3,017 entries) and from upstream latest 45e21dc0
+#          (3,037) too. Bun's sources and build scripts never name RetainRef.h
+#          or NSTypeTraits.h; how its macOS build avoids the chain was not
+#          established here, and is not guessed at.
+#
+#          mcpp/pkgs/m/mbun.jsc-prebuilt.lua's install() now supplies the header
+#          on macosx; whether that alone clears the wall is what the next probe
+#          run measures, not something asserted here.
 # windows  no job. Deliberately removed rather than left red: mcpp does publish
 #          a Windows release, so this is not a toolchain gap, but nothing here
 #          has ever been built or measured on Windows and a permanently-failing
