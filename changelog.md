@@ -18,6 +18,11 @@
   原实现误用了 Node CLI table 的左对齐规则。`console-table-iterators` 从 **0/1**
   提升为 **1/1**；fresh-build 4-file 回归（含 path/events/os）合计 **124/124**、
   **0 failed**、537 expects。
+- 随后 4-file triage probe（无新构建）将下一批 owner 分开：`url-parse-format`
+  **4/6**（1 failure + 1 TODO，invalid-port 与已绿 Node 合同冲突，停车）、
+  `process-stdin` **11/14**（3 个独立 stdin stream 行为差异）、`v8-date-parser`
+  **2/5**（3 个 JSC date-parser semantics 差异）；该 probe 合计 **17/26 passed**、
+  **8 failed**，不做跨 owner 混修。
 
 ### W41 Linux 优先推进：planner 修复、8 条候选 lane 实测与 Node 近绿切片
 

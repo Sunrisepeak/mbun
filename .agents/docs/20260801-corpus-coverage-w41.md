@@ -367,6 +367,21 @@ The next measured console owner also closed with one narrow runtime change:
   `os/os` **52/52**; the four-file run measured **124/124 tests**, **0 failed**,
   and **537 expects**.
 
+A four-file triage probe then separated the next candidates without another
+build:
+
+- `url/url-parse-format.test.js` reached **4/6 tests** with one failure and
+  one TODO. Its invalid-port expectation conflicts with the already-green
+  Node invalid-input contract, so the existing cross-corpus conflict remains
+  parked rather than routing on test identity.
+- `process/process-stdin.test.ts` reached **11/14 tests**; the three failures
+  are distinct stdin stream behaviors (file helper output, paused data
+  delivery, and explicit read pull semantics), not one formatting owner.
+- `v8/v8-date-parser.test.js` reached **2/5 tests**; all three failures are
+  JSC date-parser semantic differences. The four-file probe measured
+  **17/26 tests passed**, **8 failed**, with the console target already closed
+  in the preceding fresh-build wave.
+
 ## Next route
 
 1. Keep the native-syntax compatibility gate limited to the two measured
