@@ -258,6 +258,21 @@ def throughput(ledger: list[dict[str, str]],
     stats: dict[str, dict[str, float]] = {}
     excluded = excluded or {}
     for corpus in {row.get("corpus", "") for row in ledger}:
+        # Planned rows are written to the shared ledger before a lane runs.
+        # They intentionally carry PENDING in the measured columns and must
+        # not reach either rate calculation or the aggregate totals.
+        verified = []
+        for row in ledger:
+            if row.get("corpus") != corpus:
+                continue
+            try:
+                minutes = float(row.get("minutes", 0) or 0)
+                float(row.get("delivered", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if minutes > 0:
+                verified.append(row)
+
         def _bust(r: dict[str, str]) -> bool:
             try:
                 got = float(r.get("delivered", 0) or 0)
@@ -265,9 +280,9 @@ def throughput(ledger: list[dict[str, str]],
                 return False
             return got <= 0 and bool(is_struck(r.get("area", ""), excluded))
 
-        rows = [r for r in ledger if r.get("corpus") == corpus and not _bust(r)]
+        rows = [r for r in verified if not _bust(r)]
         if not rows:
-            rows = [r for r in ledger if r.get("corpus") == corpus]
+            rows = verified
         rates = []
         for r in rows:
             try:
