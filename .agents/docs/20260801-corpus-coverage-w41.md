@@ -397,6 +397,18 @@ The cross-corpus guard then caught and isolated two dialect conflicts:
   separate `_times` private-field gap. Neither is counted as a new regression
   from the dialect patch.
 
+A bounded Node test-runner probe was used to choose the next strategy:
+
+- `test-runner-get-test-context.js` passed **1/1**.
+- `test-runner-cli.js` failed at fixture discovery/cwd resolution;
+  `test-runner-diagnostics-channel.js` failed on bindStore/event payload
+  propagation; and `test-runner-error-reporter.js` failed on reporter failure
+  counts. These are three different ownership boundaries, not one cheap
+  formatting fix.
+- The probe therefore measured **1/4 files green** and keeps the remaining
+  test-runner work in the port/graft track. No speculative patch or full
+  test-runner sweep was started.
+
 ## Next route
 
 1. Keep the native-syntax compatibility gate limited to the two measured
