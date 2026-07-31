@@ -1470,10 +1470,8 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   // follows the target stream's isTTY. ref bun src/js/node/console.ts formatWithOptions.
   // ---- Console#table (https://console.spec.whatwg.org/#table) --------------
   // Blueprint: bun src/js/builtins/ConsoleObject.ts:180-250 (tableChars +
-  // renderRow/table, itself node's lib/internal/cli_table.js) and :645-739 (the
-  // `table` method, itself node lib/internal/cli_table.js). Cells are LEFT-aligned:
-  // node pads each cell on the RIGHT to the column's display width (the leading/
-  // trailing single space come from tableChars.left/middle/right).
+  // renderRow/table) and :645-739 (the `table` method). Bun centers each cell
+  // within its display-width column; the odd spare space goes on the right.
   const tableChars = { middleMiddle: "─", rowMiddle: "┼", topRight: "┐", topLeft: "┌", leftMiddle: "├",
                        topMiddle: "┬", bottomRight: "┘", bottomLeft: "└", bottomMiddle: "┴",
                        rightMiddle: "┤", left: "│ ", right: " │", middle: " │ " };
@@ -1483,7 +1481,8 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     let out = tableChars.left;
     for (let i = 0; i < row.length; i++) {
       const cell = row[i];
-      out += cell + " ".repeat(Math.max(0, widths[i] - tableCellWidth(measure[i])));
+      const needed = Math.max(0, (widths[i] - tableCellWidth(measure[i])) / 2);
+      out += " ".repeat(needed) + cell + " ".repeat(Math.ceil(needed));
       if (i !== row.length - 1) out += tableChars.middle;
     }
     return out + tableChars.right;
