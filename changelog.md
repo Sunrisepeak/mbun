@@ -23,6 +23,12 @@
   `process-stdin` **11/14**（3 个独立 stdin stream 行为差异）、`v8-date-parser`
   **2/5**（3 个 JSC date-parser semantics 差异）；该 probe 合计 **17/26 passed**、
   **8 failed**，不做跨 owner 混修。
+- 首轮 Node guard 暴露了两个真实方言冲突：Node table cell 左对齐、Node bare
+  namespace root 无尾斜杠。`cea1bc4` 复用既有进程级 `__mbunDialect` 做分流；fresh
+  build 后 Bun 4-file guard 仍为 **124/124**，Node `test-path-makelong`、
+  `test-path-resolve` 与 Node custom smoke 均通过。Node `test-console-table` 剩余为
+  独立 Map-iterator Key/Values shape gap，`test-console` 剩余为 `_times` 私有字段 gap，
+  不计为本 patch 回归。
 
 ### W41 Linux 优先推进：planner 修复、8 条候选 lane 实测与 Node 近绿切片
 

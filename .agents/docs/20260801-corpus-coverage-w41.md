@@ -382,6 +382,21 @@ build:
   **17/26 tests passed**, **8 failed**, with the console target already closed
   in the preceding fresh-build wave.
 
+The cross-corpus guard then caught and isolated two dialect conflicts:
+
+- The initial Node guard exposed the expected opposite contracts: Node's table
+  cells are left-aligned and Node's bare namespace root has no trailing slash.
+  `cea1bc4` routes these two choices through the existing process-level
+  `__mbunDialect`; it does not inspect test paths or weaken either corpus.
+- After a fresh build, Bun's four-file guard remained **124/124 tests green**.
+  Node `test-path-makelong.js` and `test-path-resolve.js` both passed, and a
+  bounded Node custom smoke confirmed left-aligned table rows plus the
+  no-trailing-slash namespace result.
+- The broader Node `test-console-table.js` guard still stops at its separate
+  Map-iterator Key/Values shape gap; `test-console.js` still stops at the
+  separate `_times` private-field gap. Neither is counted as a new regression
+  from the dialect patch.
+
 ## Next route
 
 1. Keep the native-syntax compatibility gate limited to the two measured
