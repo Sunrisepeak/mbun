@@ -487,6 +487,25 @@ surface on Linux:
 - 本节点无构建、无全量 corpus；高资源 scope 只运行 1 lane，未改变 3–5 lane
   常规并行策略，资源水位约 **44 GiB available / 164 MiB swap / 23 GiB free disk**。
 
+### W51 process.stdin final read/end ordering
+
+- Issue [#38](https://github.com/Sunrisepeak/mbun/issues/38) 记录了一个单一
+  `process.stdin` owner：无 `readable` listener 的 `read(3)` 在返回最后的 `gh`
+  之前同步触发 `end`，使 `end` listener 只能看到 `['abc', 'def']`，而调用方
+  最终实际收到 `['abc', 'def', 'gh']`。
+- `bootstrap.cppm` 只将最后一次 `emitEnd()` 放到当前 `read()` 返回后的
+  `process.nextTick`，不改变 EOF、readable buffer 或 close 语义。root `mcpp build`
+  成功，release 构建耗时约 **60 秒**。
+- focused `process-stdin.test.ts` 从既有 **11/14** 提升到 **12/14**，**24 expects**；
+  `read(n)` 目标通过，剩余两项明确为不同 owner：`Bun.file()` child stdin 的
+  ref 形态，以及 stdout WebStream 的 disturbed/reject 语义。
+- W48 四文件 triage 在新 binary 上为 **36 passed、8 failed、45 ran、355 expects**，
+  相比 **35/45、9 failed** 净增一条通过；四条既有 green guards 保持
+  **4/4 files、128/128 tests、0 failed、565 expects**，使用默认 **4G/512、4 jobs**。
+- 资源保护：一次 workspace-wide 构建在 swap 降至约 **43 MiB**、磁盘约 **20 GiB**
+  时停止，随后只完成 root 窄构建；无全量 corpus，未删除源码或必要 fresh binary，
+  只保留可复核的 bounded 结果。
+
 ## Next route
 
 1. Keep the native-syntax compatibility gate limited to the two measured
@@ -502,6 +521,9 @@ surface on Linux:
 4. Re-measure the adjacent path sample only if it can be done without a new
    broad build; otherwise prioritize the next one-owner Bun row over zlib's
    native-handle cluster and test-runner's multi-owner boundary.
+5. Keep the two W51 residual `process-stdin` failures parked under their own
+   child-stdio/WebStream owners; do not reopen the fixed final-read ordering
+   path unless a new regression reproduces it.
 
 No local absolute paths, user names, host names, credentials, private URLs, or
 machine-specific identifiers belong in future comments, commits, PR text, or

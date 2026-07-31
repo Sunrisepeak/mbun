@@ -5,6 +5,14 @@
 
 ## 2026-08-01
 
+- `#38` 修复 `process.stdin.read(size)` 在返回最后缓冲字节前同步触发 `end` 的
+  时序缺陷：最小 `abcdefgh`/`read(3)` smoke 从 `end` 观察到 `abc,def` 修复为
+  `abc,def,gh`。root release build 约 **60 秒**；目标文件从 **11/14** 提升到
+  **12/14、24 expects**，W48 四文件复测为 **36/45 passed、8 failed、355 expects**。
+  剩余两项属于 `Bun.file()` child stdin ref 形态与 stdout WebStream disturbed
+  语义两个独立 owner；四条既有 green guards 保持 **128/128、0 failed、565 expects**。
+  资源水位触发后停止 workspace-wide 构建，仅保留 root 窄构建和 bounded 验证，未跑
+  全量 corpus。
 - `90d895d` 将 Bun `spawn` 的 `ReadableStream` 与 async iterable stdin 接入已有
   异步 pipe 路径，补上 child-exit 时 reader `cancel()` / iterator `return()` 收口。
   fresh Linux build 后，`spawn-stdin-readable-stream` 从 **7/30** 提升到
