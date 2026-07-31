@@ -23,6 +23,12 @@
   `test-runner-string-to-regexp.js` **0/1 → 1/1**；直接调用、`new` 构造、`instanceof`
   和 constructor identity smoke 均通过。回归对照：`test-runner-option-validation.js`
   frozen/new 均 **1/1**；两个 inspect 抽样 frozen/new 均 **0/2**，没有新增失败。
+- 当前 coordinator 又完成 `util.promisify` 的 `customPromisifyArgs` 语义切片：loader
+  将 vendored `internal/util` 的私有 symbol 归一到进程级 identity，bootstrap public
+  `util.promisify` 依据字段名组装多值 callback 结果。direct smoke 输出
+  `{"first":5,"second":17}`；`test-fs-readv-promisify.js` 保持 **1/1**。完整
+  `test-util-promisify.js` 仍为 **0/1 file green**，剩余是独立 warning-contract 缺口，
+  原 custom-args 断言不再出现；不把该文件计为新增 green。
 - `163a0a3` 将本地敏感信息过滤规则加入 `hagent/agents.md` 及中文同步页；该受保护面
   需要维护者签字，不由 agent 自行合并。PR #36 已同步两轮候选实测和本节点策略。
 

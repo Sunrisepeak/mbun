@@ -1649,7 +1649,24 @@ inline constexpr char kBootstrapJS_[] = R"JS(
         Object.defineProperty(c, kCustom, { value: c, enumerable: false, writable: false, configurable: true });
         return c;
       }
-      const p = function (...a) { return new Promise((res, rej) => { fn.call(this, ...a, (e, v) => (e ? rej(e) : res(v))); }); };
+      // The vendored internal/util module is loaded separately from this
+      // bootstrap-owned public module. Its private symbol is normalized at the
+      // loader boundary to this process-wide key before callers can observe it.
+      const argumentNames = fn[Symbol.for("nodejs.util.promisify.customArgs")];
+      const p = function (...a) {
+        return new Promise((res, rej) => {
+          fn.call(this, ...a, (e, ...values) => {
+            if (e) return rej(e);
+            if (argumentNames !== undefined && values.length > 1) {
+              const obj = {};
+              for (let i = 0; i < argumentNames.length; ++i)
+                obj[argumentNames[i]] = values[i];
+              return res(obj);
+            }
+            return res(values[0]);
+          });
+        });
+      };
       Object.defineProperty(p, kCustom, { value: p, enumerable: false, writable: false, configurable: true });
       // node promisify() copies `original`'s prototype and own descriptors onto
       // the wrapper, so `name` / `length` and any decoration survive.

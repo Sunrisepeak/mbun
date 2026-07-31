@@ -51,13 +51,26 @@ Evidence:
   both **0/2**, so those pre-existing inspect failures were not counted as
   regressions.
 
+The next coordinator build also repaired one isolated `util.promisify` contract:
+
+- `internal/util`'s private `customPromisifyArgs` identity is normalized at the
+  loader boundary; the public bootstrap implementation now maps multiple
+  callback values to the named object.
+- Direct smoke with a function decorated by the internal symbol produced
+  `{"first":5,"second":17}`.
+- `test-fs-readv-promisify.js` is **1/1 pass** after the build.
+- `test-util-promisify.js` remains **0/1 file green** because two independent
+  warning-contract checks still fail; its custom-args assertion no longer fails.
+- The fresh build kept `test-runner-option-validation.js` and
+  `test-runner-string-to-regexp.js` at **1/1** each.
+
 ## Next route
 
 1. Validate the `t.assert` key contract as a standalone runner slice.
 2. Only implement snapshot read/write if the smallest real flow can be proved;
    do not add no-op methods merely to change enumeration.
-3. Revisit test-util only where a native-owned object can be identified without
-   spoofable JS markers.
+3. Revisit the remaining test-util warning contract separately; do not combine it
+   with the completed multi-value promisify slice.
 4. Keep test-v8 profiler/queryObjects and broad VM wording changes parked until
    ownership is clear.
 

@@ -960,9 +960,20 @@
                 ? std::string{"\nif (typeof module === \"object\" && module.exports && globalThis.__mbunFsInternals) {"
                               " module.exports.FileHandle = globalThis.__mbunFsInternals.FileHandle; }\n"}
                 : std::string{}};
+        // The public util implementation is bootstrap-owned, while Node's
+        // customPromisifyArgs symbol is exported by this vendored module. Keep
+        // one identity across the two implementations without modifying the
+        // upstream compatibility source.
+        const std::string internalUtilSuffix{
+            spec == "internal/util"
+                ? std::string{"\nif (typeof module === \"object\" && module.exports && "
+                              "module.exports.customPromisifyArgs !== undefined) { "
+                              "module.exports.customPromisifyArgs = "
+                              "Symbol.for(\"nodejs.util.promisify.customArgs\"); }\n"}
+                : std::string{}};
         std::string wrapper{std::string{tla ? "(async function (" : "(function ("} + params +
                             ") {\n" + strictPrefix + metaPrefix + source + debugEnvSuffix +
-                            fsIdentitySuffix + "\n})"};
+                            fsIdentitySuffix + internalUtilSuffix + "\n})"};
         // User CommonJS modules run through the mutable Module.wrapper hook.
         // Keep the extended native wrapper for Node internals (which receive
         // primordials/internalBinding parameters), but honour changed user
