@@ -1655,7 +1655,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       const argumentNames = fn[Symbol.for("nodejs.util.promisify.customArgs")];
       const p = function (...a) {
         return new Promise((res, rej) => {
-          fn.call(this, ...a, (e, ...values) => {
+          const result = fn.call(this, ...a, (e, ...values) => {
             if (e) return rej(e);
             if (argumentNames !== undefined && values.length > 1) {
               const obj = {};
@@ -1665,6 +1665,10 @@ inline constexpr char kBootstrapJS_[] = R"JS(
             }
             return res(values[0]);
           });
+          if (util.types.isPromise(result)) {
+            process.emitWarning("Calling promisify on a function that returns a Promise is likely a mistake.",
+                                "DeprecationWarning", "DEP0174");
+          }
         });
       };
       Object.defineProperty(p, kCustom, { value: p, enumerable: false, writable: false, configurable: true });

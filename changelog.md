@@ -27,8 +27,9 @@
   将 vendored `internal/util` 的私有 symbol 归一到进程级 identity，bootstrap public
   `util.promisify` 依据字段名组装多值 callback 结果。direct smoke 输出
   `{"first":5,"second":17}`；`test-fs-readv-promisify.js` 保持 **1/1**。完整
-  `test-util-promisify.js` 仍为 **0/1 file green**，剩余是独立 warning-contract 缺口，
-  原 custom-args 断言不再出现；不把该文件计为新增 green。
+  `test-util-promisify.js` 的 custom-args 断言不再出现；随后 bootstrap wrapper
+  保留原函数返回值并补发 `DEP0174`，该文件现为 **1/1 file green**，warning
+  expectations 与 `test-fs-readv-promisify.js` **1/1** 均通过。
 - W41 runner slice 复用 vendored `SnapshotManager`，接通 `t.assert.snapshot()`、
   `t.assert.fileSnapshot()`、`node:test.snapshot` setter、update-snapshots flag 与
   exit-time write。`test-runner-snapshot-file-tests.js` **0/1 → 1/1**；

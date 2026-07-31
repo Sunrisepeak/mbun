@@ -88,13 +88,25 @@ the standalone TestContext:
   only on source-expression stack enrichment. No no-op snapshot methods were
   added.
 
+The remaining `util.promisify` warning contract is now a separate green slice:
+
+- The public bootstrap wrapper now retains the original callback-style
+  function's return value and emits Node's `DEP0174` deprecation warning when
+  that value is a Promise. The existing custom-promisify path is unchanged.
+- The original corpus file `test-util-promisify.js` is **1/1 file pass**; both
+  warning expectations fire, and the earlier custom-argument assertions remain
+  covered by the separate readv test.
+- The regression `test-fs-readv-promisify.js` remains **1/1 pass**.
+- A three-lane bounded regression probe kept
+  `test-runner-snapshot-file-tests.js` at **7/7 assertions** and
+  `test-runner-option-validation.js` at **12/12 assertions** while the
+  promisify wrapper changed. No full corpus run was started.
+
 ## Next route
 
-1. Revisit the remaining test-util warning contract separately; do not combine it
-   with the completed multi-value promisify slice.
-2. Keep assertion source positions as a separate runtime lane because the
+1. Keep assertion source positions as a separate runtime lane because the
    missing data originates at the JSC internal-binding boundary.
-3. Keep test-v8 profiler/queryObjects and broad VM wording changes parked until
+2. Keep test-v8 profiler/queryObjects and broad VM wording changes parked until
    ownership is clear.
 
 No local absolute paths, user names, host names, credentials, private URLs, or
