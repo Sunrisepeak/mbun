@@ -27,6 +27,13 @@ module;
 #if defined(__linux__)
 #include <sys/random.h>
 #include <sys/syscall.h>
+#elif defined(__APPLE__)
+// arc4random_buf is declared in <stdlib.h> on Darwin, and the global module
+// fragment above pulls only <cerrno>/<cstdint>/<cstdio>/<cstring>/<limits>.
+// Without this the macOS build fails at the ::arc4random_buf call below with
+// "missing '#include <_stdlib.h>'" -- the first real portability error the
+// macOS CI probe reached, after mcpp and the toolchain resolved cleanly.
+#include <stdlib.h>
 #endif
 #include <sys/types.h>
 #include <unistd.h>
