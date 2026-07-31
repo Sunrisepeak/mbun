@@ -79,12 +79,19 @@
   依赖 V8 internal `getConstructorName` 在 null prototype 后恢复原 constructor，mbun 的
   JS-only inspect 无该信息。需要全局 setPrototypeOf tracking 或 engine seam，故不做推测性
   wrapper；当前没有新增 green。
+- `a93a26d` 关闭已量化的 getter-display blocker：Node inspector 现在在 `showHidden` 下收集
+  用户原型链 accessor，按 `getters` 选项以原 receiver 调用 getter，并恢复循环根对象的
+  `<ref *1>` 标记；默认 Node layout 同时遵守 `breakLength` 折行边界。
+  `test-util-inspect-getters-accessing-this.js` fresh build 后 **0 → exit 0**，覆盖
+  receiver-sensitive getter value、prototype getter label、root circular marker 与
+  multiline layout；`test-util-types.js`、`test-runner-snapshot-file-tests.js`、
+  `test-process-hrtime.js` 四条 bounded regression（含目标文件）并行全 exit 0，未跑全量。
 - `163a0a3` 将本地敏感信息过滤规则加入 `hagent/agents.md` 及中文同步页；该受保护面
   需要维护者签字，不由 agent 自行合并。PR #36 已同步两轮候选实测和本节点策略。
 
-下一步先处理已量化的 `test-util-inspect-getters-accessing-this.js` getter-display 合同；
-callbackify stack-shape、util.format constructor-name、test-runner assertion source-position
-与 test-v8 profiler/queryObjects 继续按独立 blocker 管理，不做无证据的跨域扩展。
+下一步继续按 Node actionable rows 做单文件评估；callbackify stack-shape、util.format
+constructor-name、test-runner assertion source-position 与 test-v8 profiler/queryObjects
+继续按独立 blocker 管理，不做无证据的跨域扩展。
 
 ## 2026-07-29
 

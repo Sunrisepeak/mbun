@@ -199,15 +199,33 @@ analysis:
   engine-level seam, so no speculative global wrapper was added and no green file
   is claimed from this evaluation.
 
+The measured getter-display candidate is now a bounded green slice:
+
+- `a93a26d` makes the public Node inspector collect up to three user-defined
+  prototype accessor layers under `showHidden`, invoke getters only when the
+  requested `getters` mode allows it, preserve the receiver as `this`, and
+  render returned objects with Node's getter label. It also restores the root
+  circular-reference marker and applies the default `breakLength` boundary to
+  the Node object layout.
+- A fresh coordinator build moved
+  `test-util-inspect-getters-accessing-this.js` from the measured RED to exit
+  0. The first getter assertion, receiver-sensitive value, root `<ref *1>`
+  marker, and multiline layout all match the corpus contract.
+- Four bounded regressions ran concurrently and all exited 0:
+  `test-util-types.js`, `test-runner-snapshot-file-tests.js`,
+  `test-process-hrtime.js`, and the getter target itself. No full corpus run
+  was started; callbackify, util.format, assertion source-position, and test-v8
+  remain separately parked.
+
 ## Next route
 
 1. Keep the native-syntax compatibility gate limited to the two measured
    optimization controls; evaluate additional V8 intrinsics only from their
    own failing corpus evidence.
-2. Keep callbackify stack shape and util.format's constructor-name mismatch parked
-   behind their generic runtime boundaries; evaluate the already measured
-   `test-util-inspect-getters-accessing-this.js` getter-display semantics as the
-   next single-file candidate.
+2. Keep callbackify stack shape, util.format's constructor-name mismatch, and
+   assertion source-position parked behind their generic runtime boundaries.
+   Use the next measured Node actionable row only after its owner and expected
+   contract are identified.
 3. Keep test-v8 profiler/queryObjects and broad VM wording changes parked until
    ownership is clear.
 
