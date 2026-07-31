@@ -413,6 +413,51 @@ JSValueRef osn_ttysize_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_
     return JSObjectMakeArray(ctx, 2, items, nullptr);
 }
 
+// ── stdin termios restore at exit (libuv uv_tty_reset_mode) ─────────────────
+// A process that leaves a terminal in raw mode leaves the USER's shell in raw
+// mode: libuv snapshots the descriptor's termios the first time a mode change
+// is made and restores it from an atexit hook. node inherits that for free;
+// mbun did not, so a `bun -e 'process.stdin.setRawMode(true)'` under a pty left
+// ICANON/ECHO cleared for whoever owned the pty afterwards -- which is exactly
+// what "child that called setRawMode restores termios on exit" observes from
+// the parent side, and what makes an interactive TUI wreck the terminal it
+// crashed out of.
+//
+// The snapshot is taken at INSTALL time when stdin is a terminal, not at the
+// first setRawMode: the "interactive wrapper" case restores a cooked state the
+// process itself never set (the mode was changed out from under it), which only
+// a startup snapshot can produce. PORT-SOURCE: libuv src/unix/tty.c
+// uv_tty_reset_mode + bun's bun_restore_stdio.
+struct TtyStartupMode {
+    struct termios saved {};
+    bool valid{false};
+};
+inline TtyStartupMode& tty_startup_mode() {
+    static TtyStartupMode m;
+    return m;
+}
+inline void tty_restore_startup_mode() {
+    TtyStartupMode& m{tty_startup_mode()};
+    if (!m.valid) return;
+    m.valid = false;  // restore exactly once, even if exit runs twice
+    (void)::tcsetattr(STDIN_FILENO, TCSANOW, &m.saved);
+}
+inline void tty_capture_startup_mode() {
+    TtyStartupMode& m{tty_startup_mode()};
+    // Gated on stdout being a terminal too. A pipeline PRODUCER (stdout is a
+    // pipe, stdin happens to share a tty device with an interactive program)
+    // must NOT write a stale cooked snapshot back on the way out: that is the
+    // `less` case, where the exiting producer would clobber the raw mode the
+    // live foreground program set. bun draws the same line in bun_restore_stdio,
+    // and "pipeline producer exit does not clobber raw mode on shared tty
+    // device" is the regression test for it.
+    if (m.valid || ::isatty(STDIN_FILENO) != 1 || ::isatty(STDOUT_FILENO) != 1) return;
+    if (::tcgetattr(STDIN_FILENO, &m.saved) != 0) return;
+    m.valid = true;
+    static bool registered{false};
+    if (!registered) { registered = true; std::atexit(tty_restore_startup_mode); }
+}
+
 // setRawMode(fd, flag) → 0 on success, else the positive errno. termios cbreak
 // mirror of libuv uv_tty_set_mode(UV_TTY_MODE_RAW).
 JSValueRef osn_setrawmode_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
@@ -453,6 +498,7 @@ void install_node_os_native(JSContextRef ctx, JSObjectRef global) {
     set_fn(ctx, on, "isatty", osn_isatty_cb);
     set_fn(ctx, on, "ttySize", osn_ttysize_cb);
     set_fn(ctx, on, "setRawMode", osn_setrawmode_cb);
+    tty_capture_startup_mode();
     set_prop(ctx, global, "__mbunOsNative", on);
 }
 

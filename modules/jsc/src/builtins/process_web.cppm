@@ -39,6 +39,9 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
 
   // Active async children; __mbun_io_tick drives every entry each pump turn.
   const CHILDREN = (G.__mbunChildren = G.__mbunChildren || new Set());
+  // Live Bun.Terminal pseudo-terminals, polled by the same __mbun_io_tick pass.
+  // Declared and driven in the :bun_terminal partition (a Terminal is not a
+  // child: it has no pid to reap and outlives any process attached to it).
   const decodeEnc = (bytes, enc) => Buffer.from(bytes).toString(enc === "utf-8" ? "utf8" : enc);
 
   // A child's stdout/stderr. `Readable` is lexically the bootstrap load-order
@@ -481,11 +484,19 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   };
 
   G.__mbun_io_tick = function () {
-    if (!CHILDREN.size && SELF_IPC === null) return 0;
+    // The Bun.Terminal reactor lives in the :bun_terminal partition, whose text
+    // is appended INSIDE this partition's still-open `if (globalThis.Bun)`
+    // block -- so its declarations are NOT in this function's scope. It hands
+    // itself over on the global instead; reached lazily because this function
+    // is installed before that partition has run.
+    const TR = G.__mbunTerminalReactor;
+    const terms = TR ? [...TR.set] : [];
+    if (!CHILDREN.size && SELF_IPC === null && !terms.length) return 0;
     const recs = [...CHILDREN];
     const readFds = [], readObjs = [];
     for (const rec of recs) for (const o of rec.outs) if (!o.ended && o.fd >= 0) { readFds.push(o.fd); readObjs.push(o); }
     for (const rec of recs) if (rec.ipc && !rec.ipc.closed) { readFds.push(rec.ipc.fd); readObjs.push({ ipcRec: rec }); }
+    for (const t of terms) if (!t.closed && t.master >= 0) { readFds.push(t.master); readObjs.push({ term: t }); }
     if (SELF_IPC !== null && !SELF_IPC.ch.closed) { readFds.push(SELF_IPC.ch.fd); readObjs.push({ self: SELF_IPC }); }
     if (readFds.length) {
       const ready = PROC.poll(readFds, 5);
@@ -493,18 +504,28 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
         if (!ready[i]) continue;
         const o = readObjs[i];
         if (o.ipcRec) drainChildIpc(o.ipcRec);
+        else if (o.term) TR.drain(o.term);
         else if (o.self) o.self.drain();
         else drainOut(o);
       }
     } else {
       PROC.poll([], 2);  // brief real wait while waiting for a child to exit
     }
+    for (const t of terms) TR.flush(t);
     for (const rec of recs) { flushStdin(rec); for (const w of rec.writers) flushWriter(w); }
     for (const rec of recs) if (rec.ipc && !rec.ipc.closed) { ipcFlush(rec.ipc); rec.ipcDelivery.flush(); }
     if (SELF_IPC !== null && !SELF_IPC.ch.closed) { ipcFlush(SELF_IPC.ch); SELF_IPC.delivery.flush(); }
     for (const rec of recs) reap(rec);
     let active = 0;
     for (const rec of recs) { if (rec.done) CHILDREN.delete(rec); else if (!rec.unrefd) active++; }
+    // A ref'd Terminal pins the loop the way bun's reader/writer poll does --
+    // but ONLY while it can still produce an observable event. A terminal with
+    // no data/drain/exit callback can never call back into JS, so pinning for
+    // it could only turn "the script finished" into a hang.
+    for (const t of terms) {
+      if (t.closed) { TR.set.delete(t); continue; }
+      if (!t.unrefd && (t.onData || t.onDrain || t.onExit)) active++;
+    }
     // node ref-counts the child-side channel: it pins the loop only while a
     // 'message' or 'disconnect' listener is attached (setupChannel's
     // newListener/removeListener ref counting) — that is what lets
@@ -3392,51 +3413,6 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       }
       return proc;
     };
-    // Bun.spawn({terminal}) — run the child under a pseudo-terminal (Bun.Terminal).
-    // The master fd is pumped by the same __mbun_io_tick reactor as spawnEx: reads
-    // deliver child output to terminal.data(t, chunk); writes queue through the
-    // non-blocking stdin path; child reap fires terminal.exit(). proc.terminal
-    // exposes write/close/resize. Ref: bun-ref subprocess.rs get_terminal +
-    // Terminal.rs (POSIX openpty; stdio 0/1/2 = slave).
-    const spawnTerminal = (cmd, opts) => {
-      const term = opts.terminal || {};
-      const cols = typeof term.cols === "number" && term.cols > 0 ? term.cols : 80;
-      const rows = typeof term.rows === "number" && term.rows > 0 ? term.rows : 24;
-      const h = PN.spawnPty(cmd[0], cmd, { cwd: opts.cwd ? toStr(opts.cwd) : undefined, env: opts.env && typeof opts.env === "object" ? opts.env : (G.process && G.process.env) || undefined, cols, rows });
-      if (h.errno != null) { const code = ERRNO[h.errno] || ("errno " + h.errno); const e = new Error("spawn " + cmd[0] + " " + code); e.code = code; e.errno = -1; e.syscall = "spawn " + cmd[0]; throw e; }
-      let exitResolve; const exitedP = new Promise((r) => (exitResolve = r));
-      const proc = { pid: h.pid, exitCode: null, signalCode: null, killed: false, exited: exitedP, ref() {}, unref() {}, resourceUsage() { return __mbunResourceUsage(); } };
-      const rec = { cp: null, pid: h.pid, outs: [], writers: [], stdinFd: h.write, stdinBuf: [], stdinEnded: false, stdinClosed: false, exited: false, closed: false, done: false, code: null, signal: null };
-      const terminalObj = {
-        cols, rows,
-        write(d) { const u = anyToU8(d); rec.stdinBuf.push({ data: u, off: 0, cb: null }); return u.length; },
-        resize(c, r) { if (typeof PN.ptyResize === "function") PN.ptyResize(h.master, c | 0, r | 0); this.cols = c | 0; this.rows = r | 0; },
-        flush() {},
-        close() { rec.stdinEnded = true; },
-        [Symbol.dispose]() { rec.stdinEnded = true; },
-      };
-      const ptyStream = {
-        __data: (bytes) => { if (typeof term.data === "function") { try { term.data(terminalObj, bytes); } catch (e) {} } },
-        __end: () => {},
-      };
-      PN.setNonBlock(h.master);
-      rec.outs.push({ fd: h.master, stream: ptyStream, ended: false });
-      rec.cp = { emit: (ev, code, signal) => {
-        if (ev === "exit") { proc.exitCode = signal ? null : code; proc.signalCode = signal || null; }
-        else if (ev === "close") {
-          proc.exitCode = signal ? null : code; proc.signalCode = signal || null;
-          if (typeof term.exit === "function") { try { term.exit(terminalObj, proc.exitCode, proc.signalCode); } catch (e) {} }
-          exitResolve(proc.exitCode);
-        }
-      }, stdin: null };
-      proc.terminal = terminalObj;
-      proc.stdin = null; proc.stdout = null; proc.stderr = null;
-      proc.kill = function (sig) { const s = bunMapSig(sig); PN.kill(h.pid, s); this.killed = true; return true; };
-      proc[Symbol.dispose] = function () { try { this.kill(); } catch (e) {} };
-      proc[Symbol.asyncDispose] = function () { try { this.kill(); } catch (e) {} return exitedP; };
-      CHILDREN.add(rec);
-      return proc;
-    };
     // `signal` must be an AbortSignal; bun rejects anything else up front
     // (js/bun/spawn/spawn-signal "AbortSignal args validation").
     const validateSignalOpt = (sg) => {
@@ -3450,7 +3426,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     Bun.spawn = function (a, b) {
       const s = spawnArgs(a, b);
       validateSignalOpt(s.opts.signal);
-      if (s.opts.terminal && PN && PN.spawnPty) return spawnTerminal(s.cmd, s.opts);
+      if (s.opts.terminal && PN && PN.spawnPty && PN.openPty) return spawnTerminal(s.cmd, s.opts);
       // A byte stdin payload must use the live pipe path. The synchronous
       // fallback only forwards string input, so Bun.spawn({ stdin: Buffer })
       // used to close the child's fd 0 without writing the bytes first.

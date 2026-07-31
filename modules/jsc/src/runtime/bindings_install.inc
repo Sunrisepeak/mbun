@@ -964,6 +964,11 @@
         set_fn(ctx_, pn, "execve", proc_execve_cb);
         set_fn(ctx_, pn, "spawnPty", proc_spawn_pty_cb);
         set_fn(ctx_, pn, "ptyResize", proc_pty_resize_cb);
+        // Bun.Terminal: a pty that exists without a child (runtime/process_extended.inc).
+        set_fn(ctx_, pn, "openPty", proc_open_pty_cb);
+        set_fn(ctx_, pn, "ptyTermios", proc_pty_termios_cb);
+        set_fn(ctx_, pn, "ptySetTermios", proc_pty_set_termios_cb);
+        set_fn(ctx_, pn, "ptySetRaw", proc_pty_set_raw_cb);
         set_fn(ctx_, pn, "poll", proc_poll_cb);
         set_fn(ctx_, pn, "ids", proc_ids_cb);
         set_fn(ctx_, pn, "setCredential", proc_set_credential_cb);

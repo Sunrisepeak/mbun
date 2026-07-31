@@ -457,15 +457,16 @@ JSValueRef proc_groups_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_
     return JSObjectMakeArray(ctx, values.size(), values.data(), nullptr);
 }
 
-// ── proc.spawnPty: fork a child under a fresh pseudo-terminal (Bun.spawn's
-// `terminal` option / Bun.Terminal). Returns { pid, master, write } — `master`
-// is the read end of the pty master, `write` a dup of it for the terminal.write
-// queue (independent close). Ref: bun-ref src/runtime/api/bun/Terminal.rs
-// create_pty_posix (openpty → dup master into read/write fds; cooked-mode
-// termios defaults on the slave; child dup2s the slave onto 0/1/2 after
-// setsid+TIOCSCTTY). We use POSIX posix_openpt/grantpt/unlockpt/ptsname (all in
-// libc, no libutil dlopen) instead of openpty. Exec failures cross a CLOEXEC
-// status pipe exactly like spawnEx.
+// ── proc.spawnPty(file, argv, { ..., slave }): fork a child onto an EXISTING
+// pseudo-terminal and return { pid } (or { errno }). The pty itself is created
+// by proc.openPty below and owned by a Bun.Terminal, which is the only shape
+// bun has: `Bun.spawn({terminal})` either borrows a live Terminal or builds one
+// from an options object first, so there is exactly one pty implementation and
+// one owner of the fds. `slave` stays open in the parent (the Terminal holds
+// it) so the pty survives this child.
+// The child setsid()s, claims the slave as its controlling terminal with
+// TIOCSCTTY and dup2s it onto 0/1/2; exec failures cross a CLOEXEC status pipe
+// exactly like spawnEx. Ref: bun-ref src/runtime/api/bun/Terminal.rs.
 JSValueRef proc_spawn_pty_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                              const JSValueRef args[], JSValueRef* exc) {
     std::string file{fs_arg(ctx, argc, args, 0)};
@@ -486,34 +487,27 @@ JSValueRef proc_spawn_pty_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::si
     // permission_deny_spawn also handles mbun's worker-as-subprocess case.
     if (permission_deny_spawn(ctx, exc, file, o.env)) return JSValueMakeUndefined(ctx);
     permission_inject_child_env(o.env, o.haveEnv, argvStr);
-    unsigned short cols{80}, rows{24};
+    // `slave` — the descriptor of the pty this child is being attached to. It
+    // belongs to a Bun.Terminal (bun js_bun_spawn_bindings.rs:823
+    // `existing_terminal`), which also owns the window size, so nothing about
+    // the pty is configured here.
+    int slave{-1};
     if (argc > 2 && JSValueIsObject(ctx, args[2])) {
         JSObjectRef opt{JSValueToObject(ctx, args[2], nullptr)};
-        JSValueRef c{get_prop(ctx, opt, "cols")};
-        if (JSValueIsNumber(ctx, c)) { double d{JSValueToNumber(ctx, c, nullptr)}; if (d > 0 && d < 65535) cols = static_cast<unsigned short>(d); }
-        JSValueRef rw{get_prop(ctx, opt, "rows")};
-        if (JSValueIsNumber(ctx, rw)) { double d{JSValueToNumber(ctx, rw, nullptr)}; if (d > 0 && d < 65535) rows = static_cast<unsigned short>(d); }
+        JSValueRef sv{get_prop(ctx, opt, "slave")};
+        if (JSValueIsNumber(ctx, sv)) { double d{JSValueToNumber(ctx, sv, nullptr)}; if (d >= 0) slave = static_cast<int>(d); }
     }
-
-    const int master{posix_openpt(O_RDWR | O_NOCTTY)};
-    if (master < 0) return fs_throw(ctx, exc, "spawnPty: posix_openpt() failed");
-    if (grantpt(master) != 0 || unlockpt(master) != 0) { close(master); return fs_throw(ctx, exc, "spawnPty: grantpt/unlockpt failed"); }
-    char sname[256];
-    if (ptsname_r(master, sname, sizeof sname) != 0) { close(master); return fs_throw(ctx, exc, "spawnPty: ptsname failed"); }
-    const int slave{open(sname, O_RDWR | O_NOCTTY)};
-    if (slave < 0) { close(master); return fs_throw(ctx, exc, "spawnPty: open(pts) failed"); }
-    { struct winsize ws{}; ws.ws_col = cols; ws.ws_row = rows; ioctl(master, TIOCSWINSZ, &ws); }
+    if (slave < 0) return fs_throw(ctx, exc, "spawnPty: no pty slave descriptor (opts.slave)");
 
     int errPipe[2];
-    if (pipe(errPipe) != 0) { close(master); close(slave); return fs_throw(ctx, exc, "spawnPty: pipe() failed"); }
+    if (pipe(errPipe) != 0) return fs_throw(ctx, exc, "spawnPty: pipe() failed");
     fcntl(errPipe[0], F_SETFD, FD_CLOEXEC);
     fcntl(errPipe[1], F_SETFD, FD_CLOEXEC);
 
     const pid_t pid{fork()};
-    if (pid < 0) { close(master); close(slave); close(errPipe[0]); close(errPipe[1]); return fs_throw(ctx, exc, "spawnPty: fork() failed"); }
+    if (pid < 0) { close(errPipe[0]); close(errPipe[1]); return fs_throw(ctx, exc, "spawnPty: fork() failed"); }
     if (pid == 0) {  // ── child ──
         close(errPipe[0]);
-        close(master);
         { sigset_t ss; sigemptyset(&ss); sigprocmask(SIG_SETMASK, &ss, nullptr);
           for (int s = 1; s < NSIG; ++s) signal(s, SIG_DFL); }
         const auto failFd{[&](int e) {
@@ -543,7 +537,9 @@ JSValueRef proc_spawn_pty_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::si
     }
     // ── parent ──
     close(errPipe[1]);
-    close(slave);  // child owns the slave; the parent only reads/writes the master
+    // The slave is NOT closed here: it belongs to the Bun.Terminal that owns
+    // this pty, which keeps it open so the pty survives the child and can host
+    // the next one.
     std::int32_t childErr{0};
     ssize_t n;
     do { n = read(errPipe[0], &childErr, sizeof childErr); } while (n < 0 && errno == EINTR);
@@ -552,18 +548,152 @@ JSValueRef proc_spawn_pty_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::si
     if (n == static_cast<ssize_t>(sizeof childErr)) {  // pre-exec/exec failure
         int status{0};
         waitpid(pid, &status, 0);
-        close(master);
         set_prop(ctx, r, "errno", JSValueMakeNumber(ctx, childErr));
         return r;
     }
-    // A second fd onto the same master lets the read side (drainOut) and the
-    // write side (terminal.write queue) be closed independently — no double
-    // close of one fd number that the OS may have recycled.
-    const int writeFd{fcntl(master, F_DUPFD, 3)};
     set_prop(ctx, r, "pid", JSValueMakeNumber(ctx, static_cast<double>(pid)));
+    return r;
+}
+
+// ── Bun.Terminal's PTY primitives ───────────────────────────────────────────
+// spawnPty above creates a pty AND forks in one step, which is all
+// `Bun.spawn({terminal: {...}})` needs. `new Bun.Terminal({...})` is the other
+// half of the same API: a pty that exists on its own, before (and after) any
+// child is attached to it. These three entry points are that half — creation,
+// termios access, and raw mode — so the JS class stays a thin wrapper over the
+// syscalls rather than re-deriving terminal semantics.
+//
+// PORT-SOURCE: compat/bun/src/runtime/api/bun/Terminal.rs create_pty_posix
+// (:922) for the cooked-mode defaults, get_termios/set_termios (:1302) for the
+// flag accessors, and bun_core::tty::State for raw mode.
+
+// proc.openPty(cols, rows) → { master, write, slave }.
+// `master` is the read side and the ioctl/termios handle; `write` is a second
+// descriptor onto the same master so the read and write sides can be closed
+// independently (same reason spawnPty dups it); `slave` stays open in this
+// process so the pty does not collapse when an attached child exits.
+JSValueRef proc_open_pty_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                            const JSValueRef args[], JSValueRef* exc) {
+    unsigned short cols{80}, rows{24};
+    if (argc > 0 && JSValueIsNumber(ctx, args[0])) {
+        const double d{JSValueToNumber(ctx, args[0], nullptr)};
+        if (d > 0 && d < 65535) cols = static_cast<unsigned short>(d);
+    }
+    if (argc > 1 && JSValueIsNumber(ctx, args[1])) {
+        const double d{JSValueToNumber(ctx, args[1], nullptr)};
+        if (d > 0 && d < 65535) rows = static_cast<unsigned short>(d);
+    }
+    const int master{posix_openpt(O_RDWR | O_NOCTTY)};
+    if (master < 0) return fs_throw(ctx, exc, "openPty: posix_openpt() failed");
+    if (grantpt(master) != 0 || unlockpt(master) != 0) { close(master); return fs_throw(ctx, exc, "openPty: grantpt/unlockpt failed"); }
+    char sname[256];
+    if (ptsname_r(master, sname, sizeof sname) != 0) { close(master); return fs_throw(ctx, exc, "openPty: ptsname failed"); }
+    const int slave{open(sname, O_RDWR | O_NOCTTY)};
+    if (slave < 0) { close(master); return fs_throw(ctx, exc, "openPty: open(pts) failed"); }
+    { struct winsize ws{}; ws.ws_col = cols; ws.ws_row = rows; ioctl(master, TIOCSWINSZ, &ws); }
+    // Cooked-mode defaults, verbatim from bun's create_pty_posix — ECHO
+    // included: terminal-spawn.test.ts asserts `localFlags & ECHO` is non-zero
+    // on a freshly constructed Terminal, and terminal.test.ts's enableEcho()
+    // helper only ORs the bit in, so setting it satisfies both.
+    {
+        struct termios t{};
+        if (tcgetattr(slave, &t) == 0) {
+            t.c_iflag = ICRNL | IXON | IXANY | IMAXBEL | BRKINT;
+#if defined(IUTF8)
+            t.c_iflag |= IUTF8;
+#endif
+            t.c_oflag = OPOST | ONLCR;
+            t.c_cflag = CREAD | CS8 | HUPCL;
+            t.c_lflag = ICANON | ISIG | IEXTEN | ECHO | ECHOE | ECHOK | ECHOKE | ECHOCTL;
+            t.c_cc[VEOF] = 4;      t.c_cc[VEOL] = 0;      t.c_cc[VERASE] = 0x7f;
+            t.c_cc[VWERASE] = 23;  t.c_cc[VKILL] = 21;    t.c_cc[VREPRINT] = 18;
+            t.c_cc[VINTR] = 3;     t.c_cc[VQUIT] = 0x1c;  t.c_cc[VSUSP] = 26;
+            t.c_cc[VSTART] = 17;   t.c_cc[VSTOP] = 19;    t.c_cc[VLNEXT] = 22;
+            t.c_cc[VDISCARD] = 15; t.c_cc[VMIN] = 1;      t.c_cc[VTIME] = 0;
+            cfsetispeed(&t, B38400);
+            cfsetospeed(&t, B38400);
+            tcsetattr(slave, TCSANOW, &t);
+        }
+    }
+    const int writeFd{fcntl(master, F_DUPFD, 3)};
+    // CLOEXEC on the master side is load-bearing, not hygiene: a child spawned
+    // onto this pty inherits every non-CLOEXEC descriptor across fork(), so a
+    // surviving copy of the MASTER in the child keeps the pty from ever hanging
+    // up. terminal.close() then closes the parent's copies, no SIGHUP is sent,
+    // and the child runs forever ("closing an inline terminal while a child is
+    // attached terminates the child"). The slave is exempt: the child dup2()s it
+    // onto 0/1/2 (which clears the flag) and closes the original itself.
+    fcntl(master, F_SETFD, FD_CLOEXEC);
+    if (writeFd >= 0) fcntl(writeFd, F_SETFD, FD_CLOEXEC);
+    JSObjectRef r{JSObjectMake(ctx, nullptr, nullptr)};
     set_prop(ctx, r, "master", JSValueMakeNumber(ctx, master));
     set_prop(ctx, r, "write", JSValueMakeNumber(ctx, writeFd >= 0 ? writeFd : master));
+    set_prop(ctx, r, "slave", JSValueMakeNumber(ctx, slave));
     return r;
+}
+
+// proc.ptyTermios(fd) → { iflag, oflag, cflag, lflag } | null when fd is dead.
+JSValueRef proc_pty_termios_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                               const JSValueRef args[], JSValueRef*) {
+    if (argc < 1 || !JSValueIsNumber(ctx, args[0])) return JSValueMakeNull(ctx);
+    const int fd{static_cast<int>(JSValueToNumber(ctx, args[0], nullptr))};
+    struct termios t{};
+    if (fd < 0 || tcgetattr(fd, &t) != 0) return JSValueMakeNull(ctx);
+    JSObjectRef r{JSObjectMake(ctx, nullptr, nullptr)};
+    set_prop(ctx, r, "iflag", JSValueMakeNumber(ctx, static_cast<double>(t.c_iflag)));
+    set_prop(ctx, r, "oflag", JSValueMakeNumber(ctx, static_cast<double>(t.c_oflag)));
+    set_prop(ctx, r, "cflag", JSValueMakeNumber(ctx, static_cast<double>(t.c_cflag)));
+    set_prop(ctx, r, "lflag", JSValueMakeNumber(ctx, static_cast<double>(t.c_lflag)));
+    return r;
+}
+
+// proc.ptySetTermios(fd, which, bits) — which: 0=iflag 1=oflag 2=cflag 3=lflag.
+// Read-modify-write so the other three fields and c_cc survive, exactly like
+// bun's set_termios_flag.
+JSValueRef proc_pty_set_termios_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                                   const JSValueRef args[], JSValueRef*) {
+    if (argc < 3) return JSValueMakeBoolean(ctx, false);
+    const int fd{static_cast<int>(JSValueToNumber(ctx, args[0], nullptr))};
+    const int which{static_cast<int>(JSValueToNumber(ctx, args[1], nullptr))};
+    const double raw{JSValueToNumber(ctx, args[2], nullptr)};
+    if (fd < 0 || !std::isfinite(raw)) return JSValueMakeBoolean(ctx, false);
+    const auto bits{static_cast<tcflag_t>(static_cast<std::uint32_t>(static_cast<std::int64_t>(raw)))};
+    struct termios t{};
+    if (tcgetattr(fd, &t) != 0) return JSValueMakeBoolean(ctx, false);
+    switch (which) {
+        case 0: t.c_iflag = bits; break;
+        case 1: t.c_oflag = bits; break;
+        case 2: t.c_cflag = bits; break;
+        case 3: t.c_lflag = bits; break;
+        default: return JSValueMakeBoolean(ctx, false);
+    }
+    return JSValueMakeBoolean(ctx, tcsetattr(fd, TCSANOW, &t) == 0);
+}
+
+// proc.ptySetRaw(fd, enable) → cfmakeraw() on, cooked defaults back off.
+// bun keeps the pre-raw termios in the Terminal so a restore is exact; the
+// saved copy lives on the JS object here for the same reason (`saved` is the
+// object ptyTermios returned before raw mode was entered).
+JSValueRef proc_pty_set_raw_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
+                               const JSValueRef args[], JSValueRef*) {
+    if (argc < 2) return JSValueMakeBoolean(ctx, false);
+    const int fd{static_cast<int>(JSValueToNumber(ctx, args[0], nullptr))};
+    const bool enable{JSValueToBoolean(ctx, args[1])};
+    struct termios t{};
+    if (fd < 0 || tcgetattr(fd, &t) != 0) return JSValueMakeBoolean(ctx, false);
+    if (enable) {
+        cfmakeraw(&t);
+    } else {
+        t.c_iflag = ICRNL | IXON | IXANY | IMAXBEL | BRKINT;
+#if defined(IUTF8)
+        t.c_iflag |= IUTF8;
+#endif
+        t.c_oflag = OPOST | ONLCR;
+        t.c_lflag = ICANON | ISIG | IEXTEN | ECHO | ECHOE | ECHOK | ECHOKE | ECHOCTL;
+        t.c_cc[VMIN] = 1;
+        t.c_cc[VTIME] = 0;
+    }
+    return JSValueMakeBoolean(ctx, tcsetattr(fd, TCSANOW, &t) == 0);
 }
 
 // proc.ptyResize(fd, cols, rows) → push a new window size to the pty master.

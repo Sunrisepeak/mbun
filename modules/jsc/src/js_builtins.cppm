@@ -8,6 +8,7 @@ export module mbun.jsc.js_builtins;
 import std;
 export import :bootstrap;
 export import :process_web;
+export import :bun_terminal;
 export import :async_hooks;
 export import :yaml_flow;
 export import :yaml_block_markdown;
@@ -78,6 +79,11 @@ namespace mbun::jsc::builtins {
 export inline const std::string kNodeBuiltinsJS =
     std::string {detail::kBootstrapJS}
         .append(detail::kProcessWebJS)
+        // Bun.Terminal: split out of :process_web only because that partition's
+        // constexpr payload had reached GCC's 262144-character strlen ceiling.
+        // It must stay immediately after it -- same scope, and __mbun_io_tick
+        // (defined there) drives TERMINALS (declared here).
+        .append(detail::kBunTerminalJS)
         .append(detail::kAsyncHooksJS)
         .append(detail::kYamlFlowJS)
         .append(detail::kYamlBlockMarkdownJS)
