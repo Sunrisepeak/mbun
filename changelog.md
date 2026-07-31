@@ -15,6 +15,11 @@
   **28 pass、2 TODO、0 fail**，确认不是 stdin 源适配回归，而是默认 runner
   `4G/512` profile 的测量边界。未跑全量 corpus，`spawnSync` 与 broad `spawn.test`
   继续停车。
+- W48 无构建近绿筛选：Bun `process-stdin` **11/14**、`node-timers` **18/20**、
+  `url-parse-format` **4/6**、`v8-date-parser` **2/5**，四文件合计 **35/45 passed、
+  9 failed、355 expects**；Node `test-vm-context.js` **1/1 file green**，
+  callbackify/util.format/vm-basic 各自卡 stack、inspect constructor label、JSC
+  parser message。红测 ownership 分散，未混修、未新增构建、未跑全量。
 - `0ddb3f3` 修复 `path.win32.toNamespacedPath` 对裸 namespace root
   (`\\\\?\\foo`) 丢失 Node 要求的尾斜杠；fresh Linux build 后目标文件
   **4/4** 全绿。与 `events/event-emitter` **67/67**、`os/os` **52/52**、

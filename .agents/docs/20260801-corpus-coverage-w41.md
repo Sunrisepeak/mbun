@@ -445,6 +445,23 @@ surface on Linux:
   根分区可用约 **23 GiB**；临时构建产物 dry-run 未发现安全可回收量，未做
   清理，未启动全量 corpus。
 
+### W48 Linux 无构建近绿筛选：Bun/Node owner 再分流
+
+- Bun 四文件 bounded probe（4 jobs、30 秒/文件）合计 **35/45 tests passed**、
+  **9 failed、355 expects**：`process-stdin` **11/14**（paused data、file
+  helper、explicit read 三个 stdin 语义缺口），`node-timers` **18/20**（UTF-16
+  timer label 与 exception/microtask ordering），`url-parse-format` **4/6**
+  （invalid-port 方言冲突），`v8-date-parser` **2/5**（JSC date parser semantics）。
+- Node 四文件 bounded probe 为 **1/4 files pass**：`test-vm-context.js` 已绿；
+  `test-util-callbackify.js` 剩余 `processTicksAndRejections` stack shape，
+  `test-util-format.js` 剩余 null-prototype object 的 constructor label，
+  `test-vm-basic.js` 剩余 JSC `Parser error` 与 Node token-specific message
+  差异。三条红测 ownership 不同，本轮不做跨 owner 混修或新构建。
+- 策略调整：保留 stream stdin 的 source checkpoint；资源 profile 作为独立
+  runner/tooling owner，W48 的 Node/Bun 红测分别停车到 stack/inspect/parser/
+  dialect 专项；下一轮只从可由单一运行时边界闭合的近绿项选任务，继续维持
+  3–5 个 bounded lanes，暂不跑全量 corpus。
+
 ## Next route
 
 1. Keep the native-syntax compatibility gate limited to the two measured
