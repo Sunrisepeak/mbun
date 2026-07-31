@@ -199,11 +199,23 @@ jobs:
       # quick_install.sh. An earlier revision of this job downloaded and
       # extracted mcpp-<version>-windows-x86_64.zip directly, which worked but
       # duplicated logic that xlings already owns per platform.
-      - name: Install xlings + mcpp
+      - name: Install xlings
         shell: pwsh
         run: |
           irm https://raw.githubusercontent.com/openxlings/xlings/main/tools/other/quick_install.ps1 | iex
-          xlings install mcpp -y
+          # The installer updates the user PATH and prints "restart terminal to
+          # refresh PATH" -- the running session does not see it, which is why an
+          # earlier revision failed with "The term 'xlings' is not recognized".
+          # Publish it to GITHUB_PATH so the next STEP has it; same-step use
+          # cannot work.
+          $home_ = "$env:USERPROFILE\\.xlings"
+          $exe = Get-ChildItem -Recurse -Filter "xlings*.exe" $home_ -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($null -eq $exe) { Get-ChildItem -Recurse -Depth 3 $home_ | Select-Object -First 40 FullName; throw "xlings executable not found under $home_" }
+          Add-Content $env:GITHUB_PATH $exe.DirectoryName
+
+      - name: Install mcpp
+        shell: pwsh
+        run: xlings install mcpp -y
 
       - name: Toolchain
         shell: pwsh
