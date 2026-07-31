@@ -102,11 +102,31 @@ The remaining `util.promisify` warning contract is now a separate green slice:
   `test-runner-option-validation.js` at **12/12 assertions** while the
   promisify wrapper changed. No full corpus run was started.
 
+A follow-up low-risk `node:util` probe used five parallel bounded lanes. Five
+files exited successfully: `test-util-getcallsites.js`,
+`test-util-getcallsites-preparestacktrace.js`, `test-util-stripvtcontrolcharacters.js`,
+`test-util-types-exists.js`, and `test-util-parse-env.js`. The nearby
+`test-util-callbackify.js` lane stayed red on one stack-shape expectation
+(`processTicksAndRejections`), while `test-util-format.js`,
+`test-util-types.js`, and `test-util-inspect-getters-accessing-this.js` each
+hit one distinct semantic blocker. Those three were not changed speculatively.
+
+The assertion source-position probe was also closed as parked for this
+checkpoint. `internalBinding('errors').getErrorSourcePositions()` is not the
+live path for `t.assert.ok`: the public test assertion uses bootstrap-owned
+`AErr`. A narrow internal-binding bridge was built and measured twice, but the
+target stayed at **1/2**; the bridge was removed and no unverified behavior was
+committed. A future attempt must own the bootstrap assertion/source extraction
+boundary as one slice.
+
 ## Next route
 
-1. Keep assertion source positions as a separate runtime lane because the
-   missing data originates at the JSC internal-binding boundary.
-2. Keep test-v8 profiler/queryObjects and broad VM wording changes parked until
+1. Prefer the five measured green util files as the next coverage accounting
+   checkpoint; do not infer a new full-corpus score from them.
+2. Keep callbackify stack shape, util format/types/inspect semantics, and
+   bootstrap assertion source extraction as separate lanes with explicit
+   ownership.
+3. Keep test-v8 profiler/queryObjects and broad VM wording changes parked until
    ownership is clear.
 
 No local absolute paths, user names, host names, credentials, private URLs, or

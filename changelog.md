@@ -40,6 +40,14 @@
   并发时共享 child shim 的一次 `ENOENT` 计为 runtime 回归。`test-runner-assert.js` 的 methods
   枚举断言已通过，剩余 source-expression stack 缺口另行处理；option-validation 与
   RegExp 回归仍各 **1/1**。
+- warning 节点后的低风险 `node:util` probe 采用 5 条并行 bounded lane：
+  `test-util-getcallsites.js`、`test-util-getcallsites-preparestacktrace.js`、
+  `test-util-stripvtcontrolcharacters.js`、`test-util-types-exists.js`、
+  `test-util-parse-env.js` 均 exit 0。`test-util-callbackify.js` 仍为单个
+  `processTicksAndRejections` stack-shape 断言失败；`test-util-format.js`、
+  `test-util-types.js`、`test-util-inspect-getters-accessing-this.js` 各有独立
+  语义 blocker，未做推测性修改。`t.assert` source-position 进一步确认走
+  bootstrap `AErr` live path，未验证的 internal-binding bridge 已移除并 parked。
 - `163a0a3` 将本地敏感信息过滤规则加入 `hagent/agents.md` 及中文同步页；该受保护面
   需要维护者签字，不由 agent 自行合并。PR #36 已同步两轮候选实测和本节点策略。
 
