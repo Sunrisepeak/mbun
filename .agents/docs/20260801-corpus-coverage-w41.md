@@ -186,14 +186,28 @@ without a source commit:
 - The experiment was reverted; the working tree has no callbackify change and no
   green file is claimed from this evaluation.
 
+The measured `test-util-format.js` candidate was also parked after root-cause
+analysis:
+
+- The RED is the null-prototype class label: mbun reports
+  `[Object: null prototype] {}`, while Node reports `[Foo: null prototype] {}`.
+- Node's vendored inspect path delegates this case to the V8 internal
+  `getConstructorName`, which can recover the original instance constructor after
+  `Object.setPrototypeOf(value, null)`. The current JS-only `inspectCtorName` has
+  no equivalent information and correctly sees only the null prototype.
+- Recovering that name would require global `Object.setPrototypeOf` tracking or an
+  engine-level seam, so no speculative global wrapper was added and no green file
+  is claimed from this evaluation.
+
 ## Next route
 
 1. Keep the native-syntax compatibility gate limited to the two measured
    optimization controls; evaluate additional V8 intrinsics only from their
    own failing corpus evidence.
-2. Keep callbackify stack shape parked behind the generic nextTick/uncaught stack
-   boundary; evaluate the already measured `test-util-format.js` constructor-name
-   mismatch as the next single-file candidate.
+2. Keep callbackify stack shape and util.format's constructor-name mismatch parked
+   behind their generic runtime boundaries; evaluate the already measured
+   `test-util-inspect-getters-accessing-this.js` getter-display semantics as the
+   next single-file candidate.
 3. Keep test-v8 profiler/queryObjects and broad VM wording changes parked until
    ownership is clear.
 

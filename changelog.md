@@ -74,12 +74,17 @@
   需要 `process.processTicksAndRejections` stack frame；窄兼容实验可越过该断言，但随后
   在 callback throw 的通用 uncaught 路径停在 **9 行 vs 7 行**。这是 generic nextTick/
   uncaught stack boundary，不与 callbackify 混修；实验已回退，当前没有新增 green。
+- `test-util-format.js` 也完成根因评估但不提交代码：`Object.setPrototypeOf(new Foo(), null)`
+  的输出为 `[Object: null prototype] {}` 而非 Node 的 `[Foo: null prototype] {}`；Node
+  依赖 V8 internal `getConstructorName` 在 null prototype 后恢复原 constructor，mbun 的
+  JS-only inspect 无该信息。需要全局 setPrototypeOf tracking 或 engine seam，故不做推测性
+  wrapper；当前没有新增 green。
 - `163a0a3` 将本地敏感信息过滤规则加入 `hagent/agents.md` 及中文同步页；该受保护面
   需要维护者签字，不由 agent 自行合并。PR #36 已同步两轮候选实测和本节点策略。
 
-下一步先处理已量化的 `test-util-format.js` constructor-name 合同；callbackify
-stack-shape、test-runner assertion source-position、test-util inspect 与 test-v8
-profiler/queryObjects 继续按独立 blocker 管理，不做无证据的跨域扩展。
+下一步先处理已量化的 `test-util-inspect-getters-accessing-this.js` getter-display 合同；
+callbackify stack-shape、util.format constructor-name、test-runner assertion source-position
+与 test-v8 profiler/queryObjects 继续按独立 blocker 管理，不做无证据的跨域扩展。
 
 ## 2026-07-29
 
