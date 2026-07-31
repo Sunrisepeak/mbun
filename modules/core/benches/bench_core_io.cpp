@@ -1,38 +1,23 @@
 // mbun.core.io positioned descriptor I/O benchmark driver.
 // Usage: bench-core-io [minimum-round-ms] [rounds]. Output is one JSON line.
+#if defined(_WIN32)
+import std;
+
+int main() {
+    std::println(stderr,
+                 "bench-core-io: POSIX-only -- it times mbun.core.io against raw "
+                 "::pread/::pwrite, which Windows has no analogue for. Skipped.");
+    return 0;
+}
+#else
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <fcntl.h>
-#if defined(_WIN32)
-// Windows has no <sys/mman.h> or <unistd.h>. The CRT's low-level _open/_close
-// give the same descriptor model this driver benchmarks against mbun.core.io.
-// MADV_HUGEPAGE does not exist here and its call site is already behind
-// #if defined(MADV_HUGEPAGE), so that hint simply does not apply.
-//
-// Deliberately inline wrappers and NOT `#define open _open`: the macro form was
-// tried first and rewrote `io::File::open` into `io::File::_open` at every call
-// site, because an object-like #define does not respect scope. Same reason
-// std::aligned_alloc is wrapped rather than macro-substituted -- MSVC's CRT has
-// no aligned_alloc at all (free() cannot release _aligned_malloc memory, so the
-// release side has to match too).
-#include <io.h>
-#include <malloc.h>
-#else
 #include <sys/mman.h>
 #include <unistd.h>
-#endif
 
 namespace bench_os {
-#if defined(_WIN32)
-inline int open_fd(const char* path, int flags) { return ::_open(path, flags); }
-inline int close_fd(int fd) { return ::_close(fd); }
-inline void* aligned_alloc_bytes(std::size_t alignment, std::size_t size) {
-    return ::_aligned_malloc(size, alignment);
-}
-inline void aligned_free_bytes(void* p) { ::_aligned_free(p); }
-inline constexpr int kCloExec = 0;  // no fork() to leak into; _O_NOINHERIT is the analogue
-#else
 inline int open_fd(const char* path, int flags) { return ::open(path, flags); }
 inline int close_fd(int fd) { return ::close(fd); }
 inline void* aligned_alloc_bytes(std::size_t alignment, std::size_t size) {
@@ -40,8 +25,17 @@ inline void* aligned_alloc_bytes(std::size_t alignment, std::size_t size) {
 }
 inline void aligned_free_bytes(void* p) { std::free(p); }
 inline constexpr int kCloExec = O_CLOEXEC;
-#endif
 }  // namespace bench_os
+
+// This driver's whole purpose is to time mbun.core.io AGAINST raw POSIX
+// positioned descriptor I/O -- ::pread/::pwrite on an fd from ::open. Windows has
+// no equivalent of that comparison: positioned I/O there is OVERLAPPED on a
+// HANDLE, and std::filesystem::path::c_str() is wchar_t*, so a "port" would mean
+// inventing a different benchmark and reporting its numbers under the same name.
+//
+// So the driver is POSIX-only and says so at runtime rather than being silently
+// absent or quietly measuring something else. The Windows CI probe reaches this
+// file before anything in the library; this is what lets it move past it.
 
 import std;
 import mbun.core.io;
@@ -351,3 +345,4 @@ int main(int argc, char* argv[]) {
     std::filesystem::remove_all(directory, error);
     return 0;
 }
+#endif  // !_WIN32
