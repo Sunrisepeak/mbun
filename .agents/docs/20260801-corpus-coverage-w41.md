@@ -272,6 +272,21 @@ The first bounded Bun-native probe also hardened the measurement path:
   started. The Bun result remains a measured five-file slice, not a new full
   corpus score.
 
+A second Bun-native wave used four parallel one-job runners over adjacent
+`test/js/node` subtrees:
+
+- `events/event-emitter.test.ts` is green at **67/67 tests**.
+- `console/console-table-iterators.test.ts` is a one-test snapshot formatting
+  failure; `url/url-parse-format.test.js` is a one-test invalid-port diagnostic
+  failure.
+- `process/process-stdin.test.ts` reached **11/14 tests** with three stdin
+  behavior failures; one adjacent stale-HUP stdin file timed out at the bounded
+  limit. These are kept as process/stream ownership boundaries, not counted as
+  green.
+- `assert/deep-equal.test.ts` was classified **ahead-of-reference** at
+  **229/251 tests** with 22 Bun `test.failing` cases passing in mbun; this is
+  not a runtime green file and is retained as a separate classifier result.
+
 ## Next route
 
 1. Keep the native-syntax compatibility gate limited to the two measured
@@ -280,7 +295,8 @@ The first bounded Bun-native probe also hardened the measurement path:
 2. Keep callbackify stack shape, util.format's constructor-name mismatch, and
    assertion source-position parked behind their generic runtime boundaries.
    Treat the VM parser-message mismatch the same way; use the next measured
-   Node actionable row only after its owner and expected contract are identified.
+   Node or Bun actionable row only after its owner and expected contract are
+   identified.
 3. Keep test-v8 profiler/queryObjects and broad VM wording changes parked until
    ownership is clear.
 

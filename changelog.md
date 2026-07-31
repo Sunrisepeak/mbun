@@ -110,10 +110,16 @@
   **198/206 passed tests、8 failed tests**；`net/blocklist-gc` 与 `tls/node-tls-upgrade`
   green，crypto 为 **196/202**，readline 为可复现的 pause/resume 时序差异，trace-events
   为 proxy network error wording。未跑 Bun 全量。
+- Bun 第二波保持 4 个并行 runner、每个 1 job，继续获得一个稳定 green：
+  `events/event-emitter.test.ts` **67/67**。相邻 `console-table-iterators` 为单一 snapshot
+  对齐差异，`url-parse-format` 为 invalid-port diagnostic 差异，`process-stdin` 为
+  **11/14** 且另有一个 stale-HUP stdin timeout；`assert/deep-equal` 分类为
+  **ahead-of-reference**（229/251，22 个 Bun `test.failing` case 在 mbun 通过），不计 runtime
+  green。未跑 Bun 全量。
 - `163a0a3` 将本地敏感信息过滤规则加入 `hagent/agents.md` 及中文同步页；该受保护面
   需要维护者签字，不由 agent 自行合并。PR #36 已同步两轮候选实测和本节点策略。
 
-下一步继续按 Node actionable rows 做单文件评估；callbackify stack-shape、util.format
+下一步继续按 Node/Bun actionable rows 做单文件评估；callbackify stack-shape、util.format
 constructor-name、test-runner assertion source-position 与 test-v8 profiler/queryObjects
 继续按独立 blocker 管理，不做无证据的跨域扩展。
 
