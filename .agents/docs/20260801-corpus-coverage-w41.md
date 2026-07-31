@@ -126,6 +126,21 @@ internal `JSStream` test handle:
   `test-util-parse-env.js`, `test-util-promisify.js`, and
   `test-runner-snapshot-file-tests.js`.
 
+The V8-native-syntax blocker was isolated to optimization-only controls rather
+than type semantics:
+
+- Under the explicit `--allow-natives-syntax` flag only, the runtime accepts
+  `%PrepareFunctionForOptimization(...)` and `%OptimizeFunctionOnNextCall(...)`
+  as no-ops. JSC has no equivalent V8 optimizer controls; ordinary processes
+  retain the native `eval` path.
+- `test-util-types.js` now exits 0 and exercises the complete type-predicate
+  matrix, including the JSStream external value.
+- Three parallel fast-call regressions also exit 0:
+  `test-buffer-swap-fast.js`, `test-timers-fast-calls.js`, and
+  `test-os-fast.js`. `test-whatwg-url-canparse.js` remains red on an unrelated
+  missing TypeError, and `test-process-hrtime.js` remains red on an unrelated
+  argument-validation mismatch.
+
 The assertion source-position probe was also closed as parked for this
 checkpoint. `internalBinding('errors').getErrorSourcePositions()` is not the
 live path for `t.assert.ok`: the public test assertion uses bootstrap-owned
@@ -136,9 +151,9 @@ boundary as one slice.
 
 ## Next route
 
-1. Keep the external-value slice additive, but treat V8 native syntax in
-   `test-util-types.js` as a separate runtime/parser lane rather than widening
-   the current fix.
+1. Keep the native-syntax compatibility gate limited to the two measured
+   optimization controls; evaluate additional V8 intrinsics only from their
+   own failing corpus evidence.
 2. Keep callbackify stack shape, util format/types/inspect semantics, and
    bootstrap assertion source extraction as separate lanes with explicit
    ownership.

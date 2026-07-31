@@ -53,6 +53,11 @@
   误判为 External。`test-util-types.js` 已越过原先的 `undefined`/`isExternal` blocker，
   继续停在 `%PrepareFunctionForOptimization` 的 V8 native-syntax 解析差异，仍不计
   新增 green；5 个 util/promisify/snapshot 回归 lane 全部 exit 0。
+- `e6e1740` 在显式 `--allow-natives-syntax` 下将两个优化控制 intrinsic
+  （`%PrepareFunctionForOptimization`、`%OptimizeFunctionOnNextCall`）按 JSC 的真实能力
+  作为 no-op 接受，普通进程不改变 eval 路径。`test-util-types.js` 现 exit 0，
+  `test-buffer-swap-fast.js`、`test-timers-fast-calls.js`、`test-os-fast.js` 三条并行
+  回归也 exit 0；URL.canParse 与 process.hrtime 的失败分别保留为独立 blocker。
 - `163a0a3` 将本地敏感信息过滤规则加入 `hagent/agents.md` 及中文同步页；该受保护面
   需要维护者签字，不由 agent 自行合并。PR #36 已同步两轮候选实测和本节点策略。
 
