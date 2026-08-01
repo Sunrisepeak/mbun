@@ -201,6 +201,28 @@ the observed Linux limits; the coordinator owns the only root build.
 | W251 | Node process exec/argv/umask plain-script leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain symlink execPath, child argv[0], and full umask read/write/error guards; no source owner |
 | W252 | Bun base64/highlighter/UUID leaves | 3 | 2/3 green; 28 passed / 11 failed / 39 ran / 575 expects; 0 timeout; no build | retain base64url 5/5 and highlighter 16/16; park randomUUIDv7 timestamp validation, rollover/order, and counter-seeding owners |
 | W253 | Node events/listener plain-script leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain EventEmitter eventNames/listenerCount semantics and EventSource-disabled global guard; no source owner |
+| W254 | Bun test-runner hook/scope leaves | 3 | 2/3 green; 15 passed / 11 failed / 26 ran / 21 expects; 0 timeout; no build | retain nested-describes 3/3 and onTestFinished 12/12; park failure-skip nested child-runner empty-output owner |
+
+## W254 Bun test-runner hook/scope leaf probe
+
+The bounded three-job Bun selector covered `nested-describes.test.ts`,
+`failure-skip.test.ts`, and `test-on-test-finished.test.ts`. It measured
+**2/3 files green**, with **15 passed / 11 failed / 26 ran / 21 expects / 0
+runner timeouts**. Per-file durations were 199–1402ms.
+
+`nested-describes.test.ts` passed all 3 tests for nested scope execution and
+`test-on-test-finished.test.ts` passed all 12 tests for ordering, async
+callbacks, concurrent-test rejection, and failing-test cleanup.
+
+`failure-skip.test.ts` had 0/11 outer tests pass: every snapshot received an
+empty child-runner stdout instead of its expected hook trace. The failures
+share one nested child-runner/fixture-output integration owner; hook ordering
+was not treated as independently disproven and no mixed fix was attempted.
+
+No source or upstream fixture change was made. The selector reused the
+coordinator binary through `tools/integration/bun_corpus_runner.py` with
+three bounded jobs, a 30-second per-file timeout, and missing Node modules
+allowed. No full corpus, build, or workspace-wide test was run.
 
 ## W253 Node events/listener plain-script probe
 

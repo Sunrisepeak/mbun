@@ -5,6 +5,7 @@
 
 ## 2026-08-01
 
+- W254 fresh Bun test-runner hook/scope leaf probe（3 jobs、复用现有 coordinator binary、无构建）**2/3 files green、15 passed、11 failed、26 ran、21 expects、0 runner timeout**：nested-describes **3/3**、onTestFinished **12/12**；failure-skip 外层 **0/11**，全部收到空 child stdout，收敛为 nested child-runner/fixture output owner。单文件耗时 199–1402ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W253 fresh Node events/listener plain-script probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：EventEmitter eventNames/listenerCount 与 EventSource-disabled global guard 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 200–201ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W252 fresh Bun base64/highlighter/UUID leaf probe（3 jobs、复用现有 coordinator binary、无构建）**2/3 files green、28 passed、11 failed、39 ran、575 expects、0 runner timeout**：base64url **5/5**、highlighter **16/16**；randomUUIDv7 **7/18**，失败拆为 timestamp validation/error-shape、12-bit rollover/order、旧 timestamp ordering、counter seeding 四个 owner。单文件耗时 252–855ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W251 fresh Node process exec/argv/umask plain-script probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：symlink execPath、child argv[0]、umask read/write restoration 与 invalid object/string validation 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 198–298ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
