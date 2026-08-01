@@ -440,6 +440,27 @@ inline constexpr std::string_view kNodeUtilExtraJS = R"JS(
       });
     }
 
+    // WHATWG URL setters consume WebIDL USVString values in Node. Normalize
+    // values before entering the native setter so ToString and lone-surrogate
+    // normalization match the WebIDL USVString conversion.
+    if (G.__mbunDialect === "node" && G.URL && G.URL.prototype &&
+        typeof util.toUSVString === "function") {
+      for (const key of ["href", "protocol", "username", "password", "host", "hostname", "port", "pathname", "search", "hash"]) {
+        const descriptor = Object.getOwnPropertyDescriptor(G.URL.prototype, key);
+        if (!descriptor || typeof descriptor.set !== "function") continue;
+        const setter = descriptor.set;
+        Object.defineProperty(G.URL.prototype, key, {
+          get: descriptor.get,
+          set(value) {
+            if (typeof value === "symbol") throw new TypeError("Cannot convert a Symbol value to a string");
+            return setter.call(this, util.toUSVString(String(value)));
+          },
+          configurable: descriptor.configurable,
+          enumerable: descriptor.enumerable,
+        });
+      }
+    }
+
     // ---- util.getCallSites (node >= 22.9) ---------------------------------
     // node lib/internal/util.js: returns the current call stack as objects
     // { functionName, scriptId, scriptName, lineNumber, column }, most recent

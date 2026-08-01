@@ -622,6 +622,25 @@ surface on Linux:
   run remained red. No full corpus or workspace-wide build was performed, and
   no new issue was mixed into the parser cluster.
 
+### W64 Node URL setter USVString owner
+
+- Issue [#47](https://github.com/Sunrisepeak/mbun/issues/47) isolates the
+  remaining URL setter contract: Node applies WebIDL `USVString` conversion
+  to URL setters, while the native path rejected lone surrogates and accepted
+  Symbol/object values with the wrong observable behavior.
+- The Node-only wrapper in `modules/jsc/src/builtins/node_util_extra.cppm`
+  now applies JavaScript `ToString`, rejects Symbols with the Node TypeError,
+  and normalizes lone surrogates through `util.toUSVString` for `href`,
+  `protocol`, `username`, `password`, `host`, `hostname`, `port`, `pathname`,
+  `search`, and `hash`. Bun behavior and the parked parser path are unchanged.
+- Focused `test-whatwg-url-custom-setters.js`: **1/1 pass**. The five-file
+  bounded regression used **5 jobs** and measured **4/5 files pass**: setter,
+  transcode, URL inspect, and Buffer.fill are green; URL custom parsing remains
+  the W63 parked failure with the same native message mismatch.
+- The final root release build passed in **60.86 seconds**. No full corpus or
+  workspace-wide build was started; resource policy remains serialized builds
+  plus 3–5 bounded test lanes.
+
 ### W59 Node buffer leaf sample
 
 - W59 使用 Node corpus runner 的默认 bounded profile、**3 jobs**。首批五个文件为

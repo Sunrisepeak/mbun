@@ -5,6 +5,13 @@
 
 ## 2026-08-01
 
+- `#47` 修复 Node URL setter 的 WebIDL `USVString` 边界：`href`、`protocol`、
+  `username`、`password`、`host`、`hostname`、`port`、`pathname`、`search`、
+  `hash` 现在先执行 JavaScript `ToString`，拒绝 Symbol，并将 lone surrogate
+  归一化为 U+FFFD；Bun 方言与已停车的 URL parser 路径保持不变。root release build
+  **60.86 秒**；focused setter **1/1 pass**，五文件 bounded regression（5 jobs）为
+  **4/5 files pass**，唯一失败仍是 W63 已记录的 URL custom-parsing message/parser
+  owner；未跑全量 corpus。
 - `#44` 新增 Node 方言 `buffer.transcode` 模块导出，覆盖 Node corpus 使用的
   utf8/latin1/ascii/utf16le/ucs2 编码转换，并将 latin1/ascii 不可表示字符替换为
   `?`；Bun 方言仍保持 `buffer.transcode` 与 `Buffer.transcode` 为 `undefined`。
