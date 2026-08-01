@@ -104,6 +104,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W154 | Node URLSearchParams getter leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five getter/iterator leaves; no source owner |
 | W155 | Node querystring/URL query leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five query leaves; no source owner |
 | W156 | Node util low-coupling leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five util leaves; no source owner |
+| W157 | Node Buffer numeric read/write leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five Buffer numeric leaves; no source owner |
 
 ## W133 Bun.Terminal green cluster
 
@@ -469,6 +470,18 @@ The bounded three-job selector covered `util.deprecate`, `util.inherits`,
 `util.types`, type-existence helpers, and VT control-character stripping. All
 **5/5 files passed**, with **0 failures and 0 timeouts**. Per-file durations
 were 165–350ms.
+
+No source or upstream fixture change was made. The selector used the existing
+coordinator binary through `tools/integration/node_corpus_runner.py` with
+three bounded jobs and a 30-second per-file timeout. No full corpus or
+workspace-wide test was run; the selector and raw runner output were removed
+after recording the result.
+
+## W157 Node Buffer numeric green cluster
+
+The bounded three-job selector covered signed and unsigned integer reads,
+floating-point reads, and signed and unsigned integer writes. All **5/5 files
+passed**, with **0 failures and 0 timeouts**. Per-file durations were 164–201ms.
 
 No source or upstream fixture change was made. The selector used the existing
 coordinator binary through `tools/integration/node_corpus_runner.py` with
