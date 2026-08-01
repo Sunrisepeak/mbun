@@ -221,6 +221,26 @@ the observed Linux limits; the coordinator owns the only root build.
 | W271 | Bun Buffer/process/module leaves | 3 | 2/3 green; 9 passed / 5 failed / 14 ran / 21 expects; 0 timeout; no build | retain UTF-16 Buffer and Module options.paths; park process.nextTick input/args/order/repeat owners |
 | W272 | Node querystring pure-contract leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain escape coercion/URI errors, multi-character separators, and non-finite maxKeys behavior; no source owner |
 | W273 | Bun Buffer safety/bounds leaves | 3 | 2/3 green; 47 passed / 2 failed / 49 ran / 82 expects; 0 timeout; no build | retain indexOf detach and compare bounds; park Buffer.fill string-branch encoding coercion owner |
+| W274 | Node module/constants plain-script leaves | 3 | 2/3 pass; 1 fail; 0 timeout; no build | retain `module.isBuiltin` and `builtinModules`; park internal/public constants mapping owner |
+
+## W274 Node module/constants plain-script leaf probe
+
+The bounded three-job Node selector covered `test-module-isBuiltin.js`,
+`test-module-builtin.js`, and `test-constants.js`. It measured **2/3
+file-level passes**, **1 failure**, and **0 runner timeouts**. Per-file
+durations were 200–298ms.
+
+`test-module-isBuiltin.js` and `test-module-builtin.js` passed. The constants
+fixture failed at its first internal/public mapping comparison: an internal
+constant had value `1` while the corresponding public `constants` entry was
+`undefined`. This is one constants-export mapping owner; no module-loader or
+mixed compatibility change was attempted.
+
+No source or upstream fixture change was made. The selector reused the
+coordinator binary through `tools/integration/node_corpus_runner.py` with
+three bounded jobs and a 30-second per-file timeout. No full corpus, build,
+or workspace-wide test was run. The Node corpus runner reports only file-level
+status for these plain scripts, so no synthetic subtest count was added.
 
 ## W273 Bun Buffer safety/bounds leaf probe
 
