@@ -48,6 +48,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W98 | Bun standard-module/API leaf probe | 5 | 4/5 files green; 161 passed / 1 ahead-of-reference / 165 ran / 100536 expects | retain four green leaves; classify `require`'s passing `test.failing` case as ahead-of-reference, no source owner |
 | W99 | Bun fs/streams/spawn/DNS/URL leaves | 5 + DNS isolated rerun | initial 4/5 green; 108 passed / 1 failed / 109 ran / 355 expects; DNS isolated 1/1 green with 69/69 | retain four stable leaves; DNS public-answer variance is external, no source owner |
 | W100 | Node fs/promises FileHandle leaves | 5 | 5/5 files pass; no build | retain five green leaves; no source owner |
+| W101 | Node module loader / CLI entry leaves | 5 | pre-fix 3/5 pass + 1 skipped + 1 fail; post-fix 4/5 pass + 1 skipped; W100 regression 5/5 pass | issue #56; preserve `Module.runMain()` as the Node preload entry hook |
 
 ## W96 delivered slice
 
@@ -156,6 +157,31 @@ build. The selected `fs/promises` FileHandle leaves were close-errors,
 aggregate-errors, pull, readFile, and writer. All **5/5 files passed**; no
 upstream fixture changed and no source owner was opened. This extends W93's
 green chmod/stat/truncate/write/sync set without rerunning the full fs subtree.
+
+## W101 Node Module.runMain preload hook
+
+W101 selected five module-loader leaves with five bounded jobs: builtin
+identity, createRequire, readonly/wrapper behavior, and the CLI
+`runMain` monkey-patch fixture. The pre-fix result was **3/5 files pass**,
+**1 skipped** (Windows-only), and **1 failed**. The failure was isolated to
+the native entry dispatch: `--require` loaded the preload, but the main file
+was evaluated directly, so a preload replacing `Module.runMain` never ran.
+
+Issue [#56](https://github.com/Sunrisepeak/mbun/issues/56) landed in commit
+`f296040`. For a Node-dialect entry with preloads, the runtime now calls
+`Module.runMain()` after preload execution; Bun continues through its existing
+entry wrapper. This restores the observable Node hook without changing the
+upstream fixture.
+
+Evidence from the fresh coordinator build:
+
+- `bash tools/integration/build_or_die.sh` — pass.
+- W101 rerun — **4/5 files pass**, **1 skipped**, **0 failed**; the skipped
+  fixture is Windows-only.
+- W100 FileHandle regression selector — **5/5 files pass**.
+
+No upstream fixture changed, no full corpus/workspace-wide test was run, and
+the temporary selectors/output were cleaned after verification.
 
 ## Delivered slice
 

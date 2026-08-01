@@ -5,6 +5,11 @@
 
 ## 2026-08-01
 
+- W101 issue [#56](https://github.com/Sunrisepeak/mbun/issues/56) 修复 Node CLI preload 的 `Module.runMain` 入口钩子：
+  pre-fix 五文件 module-loader probe 为 **3/5 pass、1 skipped、1 failed**，根因是 preload 已执行但 native
+  entry 直接评估主文件，导致 `runMain` monkey-patch 不可观察；`f296040` 让 Node 方言且存在 preload 时经过
+  `Module.runMain()`，Bun 入口保持原路径。fresh serialized build 后 W101 为 **4/5 pass、1 skipped、0 failed**，
+  W100 FileHandle regression **5/5 pass**；未修改上游 fixture，未跑全量 corpus。
 - W100 fresh Node `fs/promises` FileHandle leaf probe（5 jobs、复用现有 binary、无构建）**5/5 files pass**：
   close-errors、aggregate-errors、pull、readFile、writer 全部通过。作为 W93 chmod/stat/truncate/write/sync
   之后的扩展 guard，未发现 source owner；未修改上游 fixture，未跑全量 fs/corpus。
