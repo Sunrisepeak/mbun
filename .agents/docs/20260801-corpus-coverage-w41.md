@@ -709,6 +709,27 @@ surface on Linux:
 - No full corpus or workspace-wide build was started. Keep the three green
   process leaves as coverage guards and continue from a fresh one-owner row.
 
+### W69 Bun module loader probe parked
+
+- A fresh five-file Bun-native probe used **5 bounded jobs** and reused the
+  current Linux binary; no source change or build was needed. The sample was
+  module resolve paths, module metadata, custom require extensions, and two
+  sourcemap files.
+- The runner measured **2 green files, 46 passed, 17 failed, 63 ran, 158
+  expects**. `module-resolve-filename-paths` was **6/6** and
+  `module-sourcemap` was **3/3** green.
+- `node-module-module` reached **21/30** with failures across builtin list
+  size, overridden resolve/require hooks, builtin cache/export shape, and
+  Module.runMain/children. `require-extensions` reached **3/10** with custom
+  loader and extension mutation failures. These are separate loader owners.
+- `sourcemap` reached **13/14**; the sole failure is the missing
+  `Could not decode sourcemap` warning in an entry runtime error stack. The
+  `node:module SourceMap` class itself passed its API/VLQ cases, while the
+  runtime warning/stack integration has no narrow existing owner. Park this
+  with the loader cluster rather than changing the class or global error path.
+- No full corpus or workspace-wide build was started. Keep the two green
+  module guards and choose the next fresh one-owner row.
+
 ### W59 Node buffer leaf sample
 
 - W59 使用 Node corpus runner 的默认 bounded profile、**3 jobs**。首批五个文件为

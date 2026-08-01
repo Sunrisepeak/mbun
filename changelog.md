@@ -5,6 +5,11 @@
 
 ## 2026-08-01
 
+- W69 fresh Bun module-loader probe（5 jobs、复用当前 Linux binary、无构建）测得 **2
+  green files、46 passed、17 failed、63 ran、158 expects**。module resolve paths **6/6**、
+  node:module SourceMap API **3/3** 全绿；Module hooks/children、require.extensions
+  和 entry sourcemap warning/stack 分别属于多 owner loader cluster，未做猜测性修复。
+  未跑全量 corpus。
 - W68 fresh Bun process probe（5 jobs、复用当前 Linux binary、无构建）测得 **3 green
   files、30 passed、6 failed、36 ran、131 expects**。`process-args`、`process-on`、
   invalid-UTF-16 stdio 全绿；`process-exitCode-with-exit.js` 确认为需要数值 argv 的
