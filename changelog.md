@@ -5,6 +5,13 @@
 
 ## 2026-08-01
 
+- `#41` 修复 `ReadableStream.prototype` 的 `text/json/bytes/arrayBuffer/blob` 对非法
+  receiver 不同步执行 brand check 的问题：现在同步抛出 `ERR_INVALID_THIS`，valid
+  stream 的 Promise、locked、used 语义保持不变。`readablestream-helpers.test.ts`
+  从 **12/30、18 failed** 提升到 **30/30、0 failed、43 expects**；W54 六文件
+  bounded lane 合计 **172/172 tests、0 failed、635 expects**。root release build
+  约 **60.50 秒**，未跑全量 corpus；资源约 **44 GiB available、43 MiB swap free、
+  20 GiB disk free**，继续暂停 broad build。
 - `#40` 修复 `Bun.spawn({ stdout: "pipe" })` 的 custom readable adapter 在
   `Response(proc.stdout)` 消费后仍允许重复 `text()` 的问题：direct helper、async
   iterator 和 `pipeTo` 现在共享一次性 consumed 状态，重复消费返回

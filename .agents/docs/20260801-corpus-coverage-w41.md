@@ -553,6 +553,25 @@ surface on Linux:
   全量 corpus。资源策略继续保持 3–5 个 bounded lanes；本轮只在一个 adapter lane
   中使用 4 jobs，并继续回避 swap/disk 低水位下的并发构建。
 
+### W54 ReadableStream conversion-helper brand owner
+
+- Issue [#41](https://github.com/Sunrisepeak/mbun/issues/41) 记录了 adapter lane
+  暴露的独立 contract：`ReadableStream.prototype.text/json/bytes` 对非法 receiver
+  返回 rejected Promise，`blob` 还在 brand check 前读取 receiver 属性；Node/Bun
+  原生 contract 要求同步 `ERR_INVALID_THIS`。
+- `a8a6c05` 在 `js_streams.cppm` 为五个 conversion helper 复用已有
+  `isReadableStream()` brand predicate，非法 receiver 立即抛出
+  `Value of "this" must be of type ReadableStream`，valid stream 的消费与
+  locked/used Promise 错误路径不变。
+- `readablestream-helpers.test.ts` 从 **12/30、18 failed** 提升到 **30/30、0
+  failed、43 expects**。W54 六文件 bounded lane 使用默认 **4G/512、4 jobs**，合计
+  **6/6 files green、172/172 tests、0 failed、635 expects**；额外最小 smoke 验证
+  五个方法对非法 receiver 都同步给出 `ERR_INVALID_THIS`，valid `text` 与
+  `arrayBuffer` 仍正常转换。
+- root release build 成功，耗时约 **60.50 秒**；未启动 workspace-wide build，未跑
+  全量 corpus。当前资源约 **44 GiB available memory、43 MiB swap free、20 GiB
+  free disk**，继续暂停 broad build，仅保留 bounded lane。
+
 ## Next route
 
 1. Keep the native-syntax compatibility gate limited to the two measured
@@ -568,12 +587,10 @@ surface on Linux:
 4. Re-measure the adjacent path sample only if it can be done without a new
    broad build; otherwise prioritize the next one-owner Bun row over zlib's
    native-handle cluster and test-runner's multi-owner boundary.
-5. Keep the two W51 residual `process-stdin` failures parked under their own
-   child-stdio/WebStream owners; do not reopen the fixed final-read ordering
-   path unless a new regression reproduces it.
-6. Close the child-stdio and stdout disturbed/reject owners at W53's **14/14**
-   checkpoint; do not reopen either path without a new minimal reproduction.
-7. Select the next task only from a measured one-owner Bun/Node near-green row;
+5. Keep the fixed W51 final-read ordering, W52 file-backed stdin, W53 stdout
+   disturbed/reject, and W54 conversion-helper brand owners closed; reopen only
+   with a new minimal reproduction.
+6. Select the next task only from a measured one-owner Bun/Node near-green row;
    keep 3–5 bounded lanes, record per-file pass/fail/expect counts, and defer
    full-corpus runs and broad builds while swap or disk headroom remains low.
 
