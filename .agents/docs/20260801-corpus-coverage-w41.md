@@ -61,6 +61,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W111 | Node child_process basic contract leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five green leaves; keep fork/IPC and timeout/kill owners separate |
 | W112 | Node child_process adjacent contract leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five green leaves; park IPC backlog/handle and signal-race owners |
 | W113 | Node process environment/runtime leaves | 5 | 4/5 pass; 1 fail; 0 timeout; TZ failure reproduced at 1 job / 60s | issue #59; retain four green leaves, park existing-Date timezone cache invalidation |
+| W114 | Node streams writable/readable basic leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five green leaves; no source owner |
 
 ## W113 process feature triage
 
