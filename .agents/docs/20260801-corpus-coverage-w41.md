@@ -161,6 +161,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W211 | Bun Node crypto leaves | 5 | 5/5 green; 72 passed / 0 failed / 72 ran / 383 expects; 0 timeout; no build | retain LazyHash, one-shot hash/verify, RSA sign variants, X509 subclass, and random API leaves; no source owner |
 | W212 | Node DNS contract leaves | 5 | 3/5 pass; 2 fail; 0 timeout; no build | retain getServer, lookup option validation, setServers type checks; park dns/promises ENODATA constant and maxTimeout error-shape owners |
 | W213 | Bun VM/TLS/zlib leaves | 3 | 2/3 green; 5 passed / 3 failed / 8 ran / 262 expects; 0 timeout; no build | retain vm-sourceURL and Node TLS internals; park zlib native handle `write` exposure owner; no source/fixture change |
+| W214 | Bun process/TLS/HTTP leaves | 3 | 1/3 green; 4 passed / 2 failed / 6 ran / 6 expects; 0 timeout; no build | retain process stdio stack-limit guard; park TLS `allowHalfOpen` propagation and HTTP internal-handle bootstrap owners |
 
 ## W133 Bun.Terminal green cluster
 
@@ -168,6 +169,26 @@ The bounded three-job selector covered the core terminal contract, explicit
 POSIX/Windows platform gaps, and terminal subprocess integration. All **3/3
 files were green**, reaching **129 passed / 0 failed / 130 ran / 334 expects**.
 Per-file durations were 1.233–3.694s, with no timeout.
+
+No source or upstream fixture change was made. The selector used the existing
+coordinator binary through `tools/integration/bun_corpus_runner.py` with three
+bounded jobs, a 30-second per-file timeout, and missing Node modules allowed.
+No full corpus or workspace-wide test was run; the selector and raw runner
+output were removed after recording the result.
+
+## W214 Bun process/TLS/HTTP owner split
+
+The bounded three-job selector covered process stdio lazy initialization near
+the stack limit, TLSSocket `allowHalfOpen` handling over a Duplex, and the
+NodeHTTPResponse ondata re-registration leak guard. It reached **1/3 files
+green: 4 passed / 2 failed / 6 ran / 6 expects / 0 timeouts**; per-file
+durations were 235–686ms.
+
+`process-stdio-stack-overflow.test.ts` was **4/4**. The TLS leaf received
+`allowHalfOpen: true` where Node expects `false`; the HTTP leak fixture stopped
+at bootstrap because its internal handle was unavailable, before the leak
+assertion. These are separate option-propagation and internal-handle bootstrap
+owners.
 
 No source or upstream fixture change was made. The selector used the existing
 coordinator binary through `tools/integration/bun_corpus_runner.py` with three
