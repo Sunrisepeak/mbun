@@ -165,6 +165,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W215 | Bun TLS leaves | 3 | 3/3 green; 7 passed / 0 failed / 7 ran / 33 expects; 0 timeout; no build | retain rootCertificates immutability, no-cipher-match error shape, and createSecureContext argument validation; no source owner |
 | W216 | Bun VM leak/integration leaves | 3 | 2/3 green; 5 passed / 1 failed / 6 ran / 1 expect; 0 timeout; no build | retain vm-script-fetcher and vm.Script leak guards; park happy-dom DOM integration owner |
 | W217 | Node assert owner-split leaves | 3 | 0/3 pass; 3 fail; 0 timeout; no build | park assert.Assert constructor, Error cause deep-equality message/stack, and TypedArray/ArrayBuffer deepEqual semantics as separate owners |
+| W218 | Node console plain-script leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain console replacement/recovery, primitive throw output, and inspect-toString guards; no source owner |
 
 ## W133 Bun.Terminal green cluster
 
@@ -198,6 +199,21 @@ The first cwd-relative selector was rejected before dispatch and ran zero
 tests; it was corrected to repository-root-relative paths before the measured
 probe. No source or upstream fixture change was made. The final selector used
 the existing coordinator binary through `tools/integration/node_corpus_runner.py`
+with three bounded jobs and a 30-second per-file timeout. No full corpus or
+workspace-wide test was run; the selector and raw runner output were removed
+after recording the result.
+
+## W218 Node console green cluster
+
+The bounded three-job Node selector covered console replacement and recovery,
+primitive-throw output handling, and the `util.inspect` no-`toString` guard.
+All **3/3 files passed**, with **0 failures and 0 timeouts**; per-file durations
+were 199–200ms.
+
+These are upstream plain scripts, so the Node runner's file-level clean-exit
+classification is the authoritative result rather than a synthetic subtest
+count. No source or upstream fixture change was made. The selector used the
+existing coordinator binary through `tools/integration/node_corpus_runner.py`
 with three bounded jobs and a 30-second per-file timeout. No full corpus or
 workspace-wide test was run; the selector and raw runner output were removed
 after recording the result.
