@@ -873,7 +873,7 @@ struct TlsChannel::Impl {
         X509_STORE* store {::SSL_CTX_get_cert_store(ctx_)};
         int added {0};
         X509* cert {nullptr};
-        while ((cert = ::PEM_read_bio_X509(bio, nullptr, nullptr, nullptr)) != nullptr) {
+        while ((cert = ::PEM_read_bio_X509_AUX(bio, nullptr, nullptr, nullptr)) != nullptr) {
             if (::X509_STORE_add_cert(store, cert) == 1) {
                 ++added;
             }

@@ -1991,6 +1991,22 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
           // the engine, so the session it produces has to be picked up here —
           // the EOF branch below can destroy this socket before the next poll.
           if (this._sessionWanted) this._drainSessions();
+          // TLS 1.3 can finish the client's side of the handshake before the
+          // server validates a requested client certificate. A fatal alert may
+          // therefore arrive after `_tls` became established; tlsRead reports
+          // that alert as an empty read/EOF, so probe tlsStep once more to
+          // surface the native ERR_SSL_* instead of silently clean-closing.
+          if ((r === "" || r === null) && this._tls === 2 && NN.tlsStep && NN.tlsError) {
+            let hs = 1;
+            try { hs = NN.tlsStep(this._fd); } catch (e) { hs = -1; }
+            if (hs < 0) {
+              let info = null;
+              try { info = NN.tlsError(this._fd); } catch (e) {}
+              this._fail(mkErr((info && info.message) || "TLS handshake failed",
+                               (info && info.code) || "ERR_TLS_HANDSHAKE"));
+              return 1;
+            }
+          }
           if (r === "") break;
           progress++;
           if (r === null) {

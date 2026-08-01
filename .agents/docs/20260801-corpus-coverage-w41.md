@@ -299,6 +299,9 @@ the observed Linux limits; the coordinator owns the only root build.
 | W349 | Node EventEmitter.on watermark metadata source fix | 5 Node + 5 Node regression + 1 Bun narrow guard | pre 4/5 pass + 1 fail; post target 5/5 pass and W348 regression 5/5 pass; Bun 10/10 passed / 0 failed / 10 ran / 15 expects; 0 timeout; one no-cache release rebuild | expose `nodejs.watermarkData` size/low/high/isPaused getters on async iterators; retain TTY/readline guards; no upstream-fixture change |
 | W350 | Node trace_events leaf probe | 5 | 4/5 pass; 1 skipped; 0 fail; 0 timeout; no build; 5 fresh | retain category/none/process-exit/promises leaves; park inspector-disabled dynamic-enable skip; no source owner |
 | W351 | Node EventEmitter.on invalid-argument source fix | 5 Node + 1 Bun narrow guard | pre 4/5 pass + 1 fail; focused post 8/8 invalid-argument assertions; full file advances to a separate EventTarget owner; W348 regression 5/5; Bun 10/10 passed / 0 failed / 10 ran / 15 expects; no timeout; five bounded no-cache builds | align invalid emitter/options/null/symbol/dotted-error validation in `bootstrap.cppm`; park EventTarget realm owner; no upstream-fixture change |
+| W353 | Node TLS CLI version-dispatch leaf probe | 5 | 5/5 pass; 0 fail; 0 timeout; no source change; five bounded jobs | retain the five `--tls-{min,max}-version` CLI guards; no source owner |
+| W354 | Node fs FileHandle pull/writer/error leaves | 5 | 5/5 pass; 0 fail; 0 timeout; one bounded five-job runner | retain pull/pullSync/writer/aggregate/close error guards; no source owner |
+| W355 | Node TLS client-auth verification source fix | 5 Node + 5 Node regression | pre 4/5 pass with certificate-error mismatches; post target 5/5 pass and W348 regression 5/5 pass; 0 timeout; two serial release rebuilds for final source minimization | normalize server-side client-chain errors, accept trusted PEM certificate entries, and surface late TLS1.3 fatal alerts; no upstream-fixture change |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -1317,6 +1320,46 @@ this worktree because its `bun:test` environment stopped before tests while
 resolving `internal/event_target`; it is not counted as a runtime regression or
 green result. No upstream fixture or `compat/` assertion changed, and no full
 corpus/workspace-wide test was run.
+
+## W353 Node TLS CLI version-dispatch leaf probe
+
+The fresh five-job selector covered the five CLI version controls
+`--tls-max-v1.2`, `--tls-max-v1.3`, `--tls-min-v1.1`, `--tls-min-v1.2`, and
+`--tls-min-v1.3`. All **5/5 files passed**, with **0 failures** and **0 runner
+timeouts**. The first attempt used the wrong argument position and produced
+startup errors; it was discarded rather than counted. The corrected command
+placed the CLI flag before the test script and produced the final result. No
+source or upstream fixture changed, and no full corpus was run.
+
+## W354 Node fs FileHandle leaf probe
+
+The fresh five-job selector covered FileHandle `pull`, `pullSync`, writer, and
+aggregate/close error paths. It measured **5/5 file-level passes**, **0
+failures**, and **0 runner timeouts**. The inventory entry was stale for this
+selection, so the result was retained as green coverage without a speculative
+source change. No full corpus or workspace-wide test was run.
+
+## W355 Node TLS client-auth verification source fix
+
+The fresh five-file TLS selector initially measured **4/5 passes**. The first
+failure showed that a server-side rejected client certificate chain surfaced
+the raw X509 code instead of Node's `ECONNRESET` / `socket hang up` contract.
+Focused reproduction then exposed two adjacent parts of the same TLS owner:
+trusted PEM entries using `BEGIN TRUSTED CERTIFICATE`, and a TLS 1.3 fatal
+certificate-required alert arriving after the client side had already entered
+the established state.
+
+The source fix is limited to three runtime owners: `js_tls_live.cppm` maps
+server-side client-certificate verification failures to the Node peer-reset
+shape; `openssl.cpp` loads CA PEM blocks with `PEM_read_bio_X509_AUX`; and
+`js_net.cppm` probes `tlsStep`/`tlsError` after an established TLS read reports
+EOF so the late native alert is emitted instead of becoming a clean close. No
+`compat/` test or assertion was changed.
+
+After the final serial release rebuild (**59.59 seconds**), W355 measured
+**5/5 file-level passes**, **0 failures**, and **0 runner timeouts**. The W348
+TTY/readline five-file regression remained **5/5 passes**. Verification stayed
+bounded to the selected files; no full corpus or workspace-wide test was run.
 
 ## Coverage novelty audit correction after W323
 

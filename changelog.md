@@ -48,6 +48,19 @@
   selector **5/5 pass**，W348 TTY/readline 回归 **5/5 pass**，Bun 原生
   `EventEmitter.on` 窄 guard **10/10 passed、0 failed、15 expects**。未修改
   `compat/`、未跑全量 corpus。
+- W353 Node TLS CLI version-dispatch leaf probe：修正 CLI 参数位置后，五个
+  `--tls-{min,max}-version` 控制文件 **5/5 pass、0 fail、0 timeout**；首个错误
+  参数位置的启动错误未计入结果。无 source/fixture 改动，未跑全量 corpus。
+- W354 Node fs FileHandle leaf probe：`pull`、`pullSync`、writer 以及 aggregate/close
+  error 五个真实 Node 文件 **5/5 pass、0 fail、0 timeout**；旧 inventory 条目确认
+  为 stale，未做 speculative source 改动。
+- W355 Node TLS client-auth verification source fix：初始五文件 selector **4/5
+  pass**，失败定位为服务端客户端证书链错误的 Node `ECONNRESET` 映射、trusted PEM
+  CA block 解析和 TLS1.3 late fatal alert 三个同一 TLS owner 的边界。分别在
+  `modules/jsc/src/js_tls_live.cppm`、`modules/tls/src/openssl.cpp`、
+  `modules/jsc/src/js_net.cppm` 做最小修复；最终串行 release rebuild **59.59s**，
+  W355 **5/5 pass、0 fail、0 timeout**，W348 回归 **5/5 pass**。未修改 `compat/`，
+  未跑全量 corpus。
 
 ## 2026-08-01
 
