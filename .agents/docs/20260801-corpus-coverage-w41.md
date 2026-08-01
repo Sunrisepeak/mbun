@@ -220,6 +220,28 @@ the observed Linux limits; the coordinator owns the only root build.
 | W270 | Bun module/Buffer/DOMException leaves | 3 | 2/3 green; 8 passed / 1 failed / 9 ran / 44 expects; 0 timeout; no build | retain Buffer and DOMException leaves; park `node:missing` built-in error contract |
 | W271 | Bun Buffer/process/module leaves | 3 | 2/3 green; 9 passed / 5 failed / 14 ran / 21 expects; 0 timeout; no build | retain UTF-16 Buffer and Module options.paths; park process.nextTick input/args/order/repeat owners |
 | W272 | Node querystring pure-contract leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain escape coercion/URI errors, multi-character separators, and non-finite maxKeys behavior; no source owner |
+| W273 | Bun Buffer safety/bounds leaves | 3 | 2/3 green; 47 passed / 2 failed / 49 ran / 82 expects; 0 timeout; no build | retain indexOf detach and compare bounds; park Buffer.fill string-branch encoding coercion owner |
+
+## W273 Bun Buffer safety/bounds leaf probe
+
+The bounded three-job Bun selector covered `buffer-copy-fill-detach.test.ts`,
+`buffer-indexOf-detach.test.ts`, and `buffer-compare-bounds.test.ts`. It
+measured **2/3 files green**, **47 passed / 2 failed / 49 ran / 82 expects**,
+and **0 runner timeouts**. The runner used the default bounded profile of **4G
+memory / 512 tasks**; per-file durations were 198–2708ms.
+
+`buffer-indexOf-detach.test.ts` and `buffer-compare-bounds.test.ts` were fully
+green at **13/13** each. `buffer-copy-fill-detach.test.ts` passed **21/23**;
+its two failures are the same Buffer.fill string-branch owner: when the
+encoding argument is an object with a detaching/resizing `toString`, mbun
+rejects it as a non-string instead of coercing it and preserving the expected
+post-detach/post-resize behavior. All other copy/fill crash, resize, ordering,
+and ordinary-argument guards in the file passed.
+
+No source or upstream fixture change was made. The selector reused the
+coordinator binary through `tools/integration/bun_corpus_runner.py` with
+three bounded jobs, a 30-second per-file timeout, and missing Node modules
+allowed. No full corpus, build, or workspace-wide test was run.
 
 ## W272 Node querystring pure-contract plain-script leaf probe
 
