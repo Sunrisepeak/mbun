@@ -278,6 +278,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W328 | Node Buffer deprecation/encoding/zero-fill leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build; 5 fresh | retain all five Buffer guards; no source owner |
 | W329 | Node HTTP/HTTPS/MessageEvent/WebCrypto/console leaves | 5 | 3/5 pass; 2 fail; 0 timeout; no build; 5 fresh | retain HTTP/HTTPS/MessageEvent; park WebCrypto class identity and global-console warning-order owners |
 | W330 | Node perf_hooks/performance contract leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build; 5 fresh | retain timerify/global/measure guards; park resource-timing BigInt validation owner |
+| W331 | Node perf_hooks/performance continuation leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build; 5 fresh | retain timerify and async-function guards; park nodeTiming milestone-order owner |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -815,6 +816,26 @@ resource-timing argument-validation owner. No source or upstream-fixture
 changes, full corpus, or workspace-wide build were made. After the run,
 resources showed about **46 GiB available memory**, **0 B free swap**, and
 **16 GiB free disk at 99% usage**. Temporary runner output is cleaned
+immediately and the next wave remains resource-gated.
+
+## W331 Node perf_hooks/performance continuation leaves
+
+The bounded five-job Node selector covered five fresh continuation files after
+filename/stem and semantic-owner review: `test-perf-hooks-timerify-basic.js`,
+`test-perf-hooks-timerify-constructor.js`,
+`test-perf-hooks-timerify-error.js`, `test-performance-nodetiming.js`, and
+`test-performance-function-async.js`. The runner measured **4/5 file-level
+passes**, **1 failure**, **0 runner timeouts**, and **197–348 ms** per file. The
+Node runner reports file-level status only; no assertion-level pass total is
+inferred.
+
+The three timerify guards and the async-function timerify guard passed and are
+retained. `test-performance-nodetiming.js` failed on the strict milestone
+ordering assertion `nodeTiming.v8Start > nodeTiming.nodeStart`; this is parked
+as one nodeTiming initialization/order owner. No source or upstream-fixture
+changes, full corpus, or workspace-wide build were made. After the run,
+resources showed about **46 GiB available memory**, **24 KiB free swap**, and
+**15 GiB free disk at 99% usage**. Temporary runner output is cleaned
 immediately and the next wave remains resource-gated.
 
 ## Coverage novelty audit correction after W323
