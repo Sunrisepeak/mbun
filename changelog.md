@@ -5,6 +5,13 @@
 
 ## 2026-08-02
 
+- W405 Node HTTP/2 autoselect readable-buffer source fix：修复自定义 `net.Socket` 在
+  `readable` 监听初始化时通过 `read(0)` 误消费 `_rq` 的问题；现在 `read(0)` 保持非消费，`read(3)`
+  只返回请求长度并保留余量，缓存数据到达时按下一轮时序通知 `readable`。focused 文件从 **1/1
+  timeout** 到 **1/1 pass**；W403 五文件回归 **5/5 pass**；W404 selector **4/5 pass、1 timeout**，仅剩
+  独立 trailer-size stalled exchange；额外 HTTP/2 socket guard **4/5 pass**，唯一失败为既有 timer-inspect
+  owner；serial release build **59.05s**。未修改 upstream fixture、未跑全量 corpus。
+
 - W404 Node HTTP/2 initial SETTINGS ACK accounting source fix：`ServerHttp2Session` 现在把初始 SETTINGS
   frame 计入 `pendingSettingsAck`，`maxOutstandingSettings: 2` 在第二次 application `settings()` 时
   正确触发 `ERR_HTTP2_MAX_PENDING_SETTINGS_ACK`。focused 文件从 **1/1 timeout** 到 **1/1 pass**；W404

@@ -602,7 +602,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
         // that receives bytes before anything reads used to DROP them.
         this._dataSink = null;
         this._rq = null; this._rqLen = 0; this._rqPaused = false; this._rqEnd = false;
-        this._flowing = null; this._holdForReader = false;
+        this._flowing = null; this._holdForReader = false; this._readablePending = false;
       // node net.Socket({ onread }): the socket reads INTO the caller's buffer
       // and hands that exact object back, so `buf === sockBuf` holds and no
       // per-chunk allocation happens (test-net-onread-static-buffer). `buffer`
@@ -688,6 +688,10 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       // node's Readable.on('data') resumes the stream unless it was explicitly
       // paused (`if (state.flowing !== false) this.resume()`).
       this.on("newListener", (ev) => {
+        if (ev === "readable") {
+          if (this._rq && this._rq.length) this._scheduleReadable();
+          return;
+        }
         if (ev !== "data") return;
         if (this._flowing !== false) this._flowing = true;
         if (this._rq && this._rq.length) G.queueMicrotask(() => this._flushRq());
@@ -1201,13 +1205,32 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
     ref() { this._refd = true; NET.hold(this); return this; }
     unref() { this._refd = false; NET.release(this); return this; }
     hasRef() { return this._refd !== false; }
-    // stream.Readable#read: nothing is buffered by this transport (chunks go
-    // straight out as 'data'), except bytes handed back through unshift().
+    // stream.Readable#read: consume the unshift and parked queues in order.
+    // `read(0)` is a probe used by Readable's readable-listener setup and must
+    // never consume the bytes that cause the later 'readable' notification.
     read(n) {
+      if (n === 0) return null;
       const q = this._unshiftQ;
-      if (q && q.length) { this._unshiftQ = null; return q.length === 1 ? q[0] : (G.Buffer ? G.Buffer.concat(q) : q[0]); }
+      if (q && q.length) {
+        const all = q.length === 1 ? q[0] : (G.Buffer ? G.Buffer.concat(q) : q[0]);
+        const take = n === undefined || n === null || n < 0 ? all.length : Math.min(n, all.length);
+        if (take < all.length) {
+          this._unshiftQ = [all.subarray(take)];
+          return all.subarray(0, take);
+        }
+        this._unshiftQ = null;
+        return all;
+      }
       const r = this._rq;
       if (r && r.length) {
+        const all = r.length === 1 ? r[0] : (G.Buffer ? G.Buffer.concat(r) : r[0]);
+        const take = n === undefined || n === null || n < 0 ? all.length : Math.min(n, all.length);
+        if (take < all.length) {
+          this._rq = [all.subarray(take)];
+          this._rqLen = all.length - take;
+          this._readableState.length = this._rqLen;
+          return all.subarray(0, take);
+        }
         this._rq = null; this._rqLen = 0; this._readableState.length = 0;
         this._holdForReader = false;
         if (this._rqPaused) { this._rqPaused = false; this._paused = false; }
@@ -1220,7 +1243,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
             this.emit("end");
           });
         }
-        return r.length === 1 ? r[0] : (G.Buffer ? G.Buffer.concat(r) : r[0]);
+        return all;
       }
       return null;
     }
@@ -1425,6 +1448,15 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       return ((NET.gen - this._rqGen) | 0) <= 1;
     }
     _hasReader() { return !!(this._onread || this._dataSink || this._flowing === true || this.listenerCount("data") > 0); }
+    _scheduleReadable() {
+      if (this._readablePending || !this._rq || !this._rq.length) return;
+      this._readablePending = true;
+      G.queueMicrotask(() => {
+        this._readablePending = false;
+        if (this.destroyed || !this._rq || !this._rq.length || this.listenerCount("readable") === 0) return;
+        this.emit("readable");
+      });
+    }
     _deliver(chunk) {
       if (this._onread) { this._onreadPush(chunk); return; }
       if (this._dataSink) { this._dataSink(chunk); return; }
@@ -1436,6 +1468,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
         // Readable stops pulling once the buffer passes the high-water mark;
         // without this an unread socket would buffer the peer without bound.
         if (this._rqLen >= this._hwm && !this._paused) { this._paused = true; this._rqPaused = true; }
+        this._scheduleReadable();
         return;
       }
       this._emitData(chunk);

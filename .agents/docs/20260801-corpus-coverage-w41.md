@@ -350,6 +350,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W402 | Node HTTP/2 `unknownProtocol` Duplex identity source fix | 5 | baseline selector 4/5 pass + 1 fail; focused target 1/1 fail → 1/1 pass; post selector 5/5 pass, 0 fail, 0 timeout; Bun fake-timer regression 5/5 green, 8 passed / 0 failed / 8 ran / 10 expects; serial release build 59.29s | connect the custom `net.Socket` prototype to `stream.Duplex.prototype` while preserving its reactor-specific methods; no upstream fixture change |
 | W403 | Node HTTP/2 delayed request/GOAWAY ready-edge source fix | 5 | baseline selector 4/5 pass + 1 fail; focused target 1/1 fail → 1/1 pass; post selector 5/5 pass, 0 fail, 0 timeout; W402 HTTP/2 regression 5/5 pass, 0 fail, 0 timeout; Bun fake-timer guard 4 green + 1 no-tests, 43 passed / 0 failed / 43 ran / 98 expects; serial release builds 58.98s + 59.16s + 59.29s | defer cleartext HTTP/2 ready handling to the next I/O turn so `request()` + `close()` preserves Node's `ERR_HTTP2_GOAWAY_SESSION` timing; no upstream fixture change |
 | W404 | Node HTTP/2 initial SETTINGS ACK accounting source fix | 5 | baseline selector 2/5 pass + 3 timeout; focused target 1/1 timeout → 1/1 pass; post selector 3/5 pass + 2 timeout; W403 regression 5/5 pass, W402 regression 5/5 pass; serial release build 59.50s | count the server's initial SETTINGS frame in `pendingSettingsAck` so `maxOutstandingSettings: 2` trips on the second application settings call; park autoselect and trailer-size stalled exchanges as separate owners |
+| W405 | Node HTTP/2 autoselect readable-buffer source fix | 5 | focused target 1/1 timeout → 1/1 pass; W403 five-file regression 5/5 pass; W404 post selector 4/5 pass + 1 timeout; five HTTP/2 socket guards 4/5 pass + 1 known timeout-inspect failure; serial release build 59.05s | keep `read(0)` as a non-consuming probe, bound `read(3)` to the requested bytes, and notify `readable` listeners when parked socket data arrives; retain the independent trailer-size and timeout-inspect owners |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -1908,6 +1909,28 @@ settings fix. The W403 five-file regression stayed **5/5 pass** and the W402
 five-file regression stayed **5/5 pass**. One serial release build took
 **59.50s**. No upstream fixture changed and no full corpus/workspace-wide test
 ran.
+
+## W405 Node HTTP/2 autoselect readable-buffer source fix
+
+The W405 target, `test-http2-autoselect-protocol.js`, initially stalled after
+both raw loopback sockets entered the test's `socket.read(3)` retry path. A
+minimal net reproduction isolated the interaction: mbun's custom Socket
+inherits Node's `stream.Duplex`, whose `readable` listener setup calls
+`read(0)` on the next tick. The custom `read()` treated that probe as a real
+read and cleared `_rq` before the scheduled `readable` event could observe it.
+
+`js_net.cppm` now keeps `read(0)` non-consuming, returns only the requested
+prefix for bounded reads such as `read(3)`, preserves the remaining queue, and
+emits one deferred `readable` notification when parked bytes are available.
+The minimal primitive then reported `initial null` followed by `readable PRI`,
+and the focused autoselect file moved from **1/1 timeout** to **1/1 pass**.
+The W403 five-file regression remained **5/5 pass**. The W404 post selector is
+now **4/5 pass, 1 timeout**: autoselect is green and only the independent
+server-trailer-size exchange remains stalled. Five additional HTTP/2 socket
+guards measured **4/5 pass**; the sole failure was the pre-existing
+`test-http2-socket-proxy.js` timer-inspection owner. The serial release build
+took **59.05s**. No upstream fixture changed and no full corpus/workspace-wide
+test ran.
 
 ## W401 Node fs flush revalidation
 
