@@ -109,6 +109,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W159 | Node assert deep-comparison leaves | 5 | 2/5 pass; 3 fail; 0 timeout; no build | retain assert-fail/if-error; park deep/partial/typed-array assertion owners separately |
 | W160 | Bun Web URL/Response/clone leaves | 4 | 2/3 executable files green; 131 passed / 1 failed / 148 ran / 842 expects; 16 Linux-inapplicable skips; 0 timeout | retain URLSearchParams and structured-clone-fastpath; park Response FileRef snapshot root mismatch; exclude Windows URL skips |
 | W161 | Bun WebStreams leak/fast-path leaves | 4 | 4/4 green; 15 passed / 0 failed / 15 ran / 23 expects; 0 timeout; no build | retain all four leaves; mark native-source-onclose as slow but bounded |
+| W162 | Bun WebStreams compression/large surface | 3 | 1/3 green; 159 passed / 13 failed / 172 ran / 350 expects; 0 timeout; no build | retain compression 11/11; park streams-leak and streams.test multi-owner failures |
 
 ## W133 Bun.Terminal green cluster
 
@@ -787,6 +788,23 @@ coordinator binary through `tools/integration/bun_corpus_runner.py` with three
 bounded jobs, a 30-second per-file timeout, and missing Node modules allowed.
 No full corpus or workspace-wide test was run; the selector and raw runner
 output were removed after recording the result.
+
+## W162 Bun WebStreams owner split
+
+The bounded three-job selector covered compression, stream leak guards, and the
+larger WebStreams contract file. It reached **1/3 files green**, with **159
+passed / 13 failed / 172 ran / 350 expects** and **0 timeouts**. Compression
+was fully green (**11/11**). The two `streams-leak` failures split between
+native pull-buffer behavior and memory accounting. The 11 failures in
+`streams.test.js` span error shape/stack, string-allocation-limit wording,
+read batching, controller state, foreign-realm construction, and async
+iterator reentrancy. These remain parked as separate owners.
+
+No source or upstream fixture change was made. The selector used the existing
+coordinator binary through `tools/integration/bun_corpus_runner.py` with
+three bounded jobs, a 30-second per-file timeout, and missing Node modules
+allowed. No full corpus or workspace-wide test was run; the selector and raw
+runner output were removed after recording the result.
 
 ## W119 Node assert owner triage
 
