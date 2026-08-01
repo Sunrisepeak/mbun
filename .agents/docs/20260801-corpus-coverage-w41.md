@@ -205,6 +205,24 @@ the observed Linux limits; the coordinator owns the only root build.
 | W255 | Bun retry/jest-each/fake-timers leaves | 3 | 2/3 green; 40 passed / 4 failed / 44 ran / 61 expects; 0 timeout; no build | retain jest-each 25/25 and retry/repeats 12/12; park fake-timers Intl clock-format and child-eval `jest.useFakeTimers` owners |
 | W256 | Node fs/http/url plain-script leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain TypedArray `fs.promises.writeFile`, HTTP header name/value validation, and invalid `file:` URL path guards; no source owner |
 | W257 | Bun mock.module/re-export leaves | 3 | 2/3 green; 6 passed / 6 failed / 13 ran / 32 expects; 0 timeout; no build | retain re-export mocks 2/2 and non-existent-specifier 1/1; split mock-module async, restore identity, relative-file, and cache/update owners |
+| W258 | Node child-process stdio/destroy leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain stdio inherit/flush and child destroy state guards; no source owner |
+
+## W258 Node child-process stdio/destroy plain-script leaf probe
+
+The bounded three-job Node selector covered
+`test-child-process-stdio-inherit.js`, `test-child-process-flush-stdio.js`,
+and `test-child-process-destroy.js`. It measured **3/3 file-level passes**,
+**0 failures**, and **0 runner timeouts**. Per-file durations were 199–352ms.
+
+The probe retained child stdio inheritance, flush behavior for readable and
+writable stdio, and destroy/kill state transitions. The Node corpus runner
+reports only file-level status for these plain scripts, so no synthetic
+subtest count was added.
+
+No source or upstream fixture change was made. The selector reused the
+coordinator binary through `tools/integration/node_corpus_runner.py` with
+three bounded jobs and a 30-second per-file timeout. No full corpus, build,
+or workspace-wide test was run.
 
 ## W257 Bun mock.module/re-export leaf probe
 
