@@ -289,6 +289,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W339 | Bun small Linux regression leaves | 5 | 5/5 green; 8 passed / 0 failed / 8 ran / 32 expects; 0 timeout; no build; 5 fresh | retain all five regression guards; no source owner |
 | W340 | Node dgram continuation leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build; 5 fresh | retain bind-error-repeat, connected-send, ref, and unref guards; park connected-port validation message owner |
 | W341 | Node dgram error/options leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build; 5 fresh | retain send-error, callback-recursion, broadcast, and TTL guards; park socket-buffer-size error-rendering owner |
+| W342 | Bun Linux regression/parser/filesystem leaves | 5 | 4/5 green; 11 passed / 3 failed / 14 ran / 48 expects; 0 timeout; no build; 5 fresh | retain module-extensions, WebSocket-cookie, Dirent, and console-format guards; park HTML-entrypoint parser/build owner |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -1058,6 +1059,29 @@ change was made. No full corpus or workspace-wide build was run. After the
 run, resources showed about **46 GiB available memory**, **396 KiB free swap**,
 and **16 GiB free disk at 99% usage**. Temporary runner output is cleaned
 immediately and the next wave remains resource-gated.
+
+## W342 Bun Linux regression/parser/filesystem leaves
+
+The bounded five-job Bun selector covered five fresh small regression files
+after filename/stem and narrow semantic-owner review:
+`test/regression/issue/22929-module-extensions-asi.test.ts`,
+`test/regression/issue/23474.test.ts`,
+`test/regression/issue/23569.test.ts`,
+`test/regression/issue/24129.test.ts`, and
+`test/regression/issue/24234.test.ts`. Using the real Bun harness and existing
+Linux binary, the runner measured **4/5 green files**, **11 passed / 3 failed /
+14 ran / 48 expects**, **0 runner timeouts**, and **236–789 ms** per file.
+
+The Module `_extensions` ASI regression, WebSocket upgrade-cookie behavior,
+unknown/FIFO `fs.Dirent` checks, and `console.log("%j")` formatting passed and
+are retained. The HTML entrypoint file failed all three executed cases: both
+`--no-bundle` diagnostics and the bundled build returned an `Unterminated
+regular expression` error instead of the fixture's expected HTML build
+behavior. This is parked as one HTML-entrypoint parser/build owner. No source
+or upstream-fixture change was made. No full corpus or workspace-wide build
+was run. After the run, resources showed about **46 GiB available memory**,
+**472 KiB free swap**, and **16 GiB free disk at 99% usage**. Temporary runner
+output is cleaned immediately and the next wave remains resource-gated.
 
 ## Coverage novelty audit correction after W323
 
