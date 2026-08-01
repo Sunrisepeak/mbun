@@ -5,6 +5,7 @@
 
 ## 2026-08-01
 
+- W195 fresh Bun resolver import/meta probe（3 jobs、复用现有 coordinator binary、无构建）**1/5 files green、42 passed、28 failed、70 ran、82 expects、0 timeout**：import-meta-resolve 15/15 全绿；其余停车在 import.meta path、empty-module shape、CJS __esModule 三个 owners。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W194 fresh Bun JSC/resolve/transpiler probe（3 jobs、复用现有 coordinator binary、无构建）**3/5 files green、39 passed、73 failed、130 ran、286 expects、0 timeout**：native constructor identity 4/4、string-noAtomize 1/1、bun.lock 1/1；REPL transform 与 TypeScript type-export 分别停车在 parser/output 与 bytecode/compile owners。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W193 fresh Bun low-coupling probe（3 jobs、复用现有 coordinator binary、无构建）**3/5 files green、323 passed、12 failed、604 ran、2302 expects、0 timeout**：direct-readable 269 pass/268 skip、libuv error-name 1 pass/1 skip、histogram 38 pass；两份 internal sourcemap 分别停车在 path/UTF-8 与 astral/long-line/cache owners。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W192 fresh Bun parser/cron adjacent probe（3 jobs、复用现有 coordinator binary、无构建）**3/5 files green、464 passed、78 failed、578 ran、755 expects、0 timeout**：JSON5 suite 113/113、JSONC suite 319/319、TLS segment guard 1 pass/1 skip；cron.test 与 in-process-cron 分别停车在 registration/parse mixed owner 与未实现 scheduler。未修改 source/fixture，未跑全量 corpus/workspace-wide test。

@@ -142,6 +142,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W192 | Bun parser/cron adjacent leaves | 5 | 3/5 green; 464 passed / 78 failed / 578 ran / 755 expects; 0 timeout; no build | retain TLS-segment-size and JSON5/JSONC suites; park cron scheduling plus cron alias/validation owners separately |
 | W193 | Bun low-coupling stream/source-map/system leaves | 5 | 3/5 green; 323 passed / 12 failed / 604 ran / 2302 expects; 0 timeout; no build | retain direct-readable, libuv error-name, histogram; park source-map path/UTF-8 and internal-source-map owners separately |
 | W194 | Bun JSC/resolve/transpiler leaves | 5 | 3/5 green; 39 passed / 73 failed / 130 ran / 286 expects; 0 timeout; no build | retain native-constructor, string-noAtomize, bun-lock; park REPL transform and bytecode/type-export owners separately |
+| W195 | Bun resolver import/meta leaves | 5 | 1/5 green; 42 passed / 28 failed / 70 ran / 82 expects; 0 timeout; no build | retain import-meta-resolve; park import.meta path, empty-module shape, and CJS __esModule owners separately |
 
 ## W133 Bun.Terminal green cluster
 
@@ -1020,6 +1021,25 @@ file splits between destructuring/parser failures and REPL-output behavior.
 The type-export file is dominated by the explicit `--bytecode` unavailable
 compile path plus related compile cases. These are separate owners; no source
 or upstream fixture change was made and no mixed fix was attempted.
+
+The selector used the existing coordinator binary through
+`tools/integration/bun_corpus_runner.py` with three bounded jobs, a 30-second
+per-file timeout, and missing Node modules allowed. No full corpus or
+workspace-wide test was run; the selector and raw runner output were removed
+after recording the result.
+
+## W195 Bun resolver import/meta owner split
+
+The bounded three-job selector covered `import.meta`, `import.meta.resolve`,
+empty-file/empty-sqlite imports, CJS `__esModule` annotations, and ESM/CJS
+module shape behavior. It reached **1/5 files green**, with **42 passed**, **28
+failed**, **70 ran**, **82 expects**, and **0 timeouts**.
+
+`import-meta-resolve.test.mjs` was fully green (**15/15**). The remaining
+failures split into three owners: import.meta relative-vs-absolute filename
+semantics, empty-file/empty-sqlite module shape, and CJS `__esModule` export
+annotation/setter behavior. No source or upstream fixture change was made and
+no mixed fix was attempted.
 
 The selector used the existing coordinator binary through
 `tools/integration/bun_corpus_runner.py` with three bounded jobs, a 30-second
