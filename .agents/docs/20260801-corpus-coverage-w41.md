@@ -281,6 +281,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W331 | Node perf_hooks/performance continuation leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build; 5 fresh | retain timerify and async-function guards; park nodeTiming milestone-order owner |
 | W332 | Bun low-coupling Linux leaves | 5 | 2/5 green; 4 passed / 4 failed / 8 ran / 17 expects; 0 timeout; no build; 5 fresh | retain RuntimeError/data-URL module; park namespace pollution, no-addons diagnostic, and glibc symbol owners |
 | W333 | Node error/internal-contract leaves | 5 | 1/5 pass; 4 fail; 0 timeout; no build; 5 fresh | retain bad-Unicode parser; park accessor brands, constants shape, stack limit, and SystemError dialect owners |
+| W334 | Node process lifecycle/propagation leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build; 5 fresh | retain beforeExit throw, binding allowlist, execArgv, and uncaught-monitor guards; park beforeExit reentry owner |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -887,6 +888,27 @@ upstream-fixture changes, full corpus, or workspace-wide build were made.
 After the run, resources showed about **46 GiB available memory**, **48 KiB
 free swap**, and **15 GiB free disk at 99% usage**. Temporary runner output is
 cleaned immediately and the next wave remains resource-gated.
+
+## W334 Node process lifecycle/propagation leaves
+
+The bounded five-job Node selector covered five fresh process files after
+filename/stem and narrow semantic-owner review:
+`test-process-beforeexit-throw-exit.js`, `test-process-beforeexit.js`,
+`test-process-binding-internalbinding-allowlist.js`,
+`test-process-exec-argv.js`, and `test-process-uncaught-exception-monitor.js`.
+The runner measured **4/5 file-level passes**, **1 failure**, **0 runner
+timeouts**, and **230–849 ms** per file. The Node runner reports file-level
+status only; no assertion-level pass total is inferred.
+
+The beforeExit-throw/exit, internalBinding allowlist, execArgv propagation,
+and uncaughtExceptionMonitor guards passed and are retained. The ordinary
+beforeExit lifecycle file failed because the `tryRepeatedTimer` callback was
+expected once but was observed zero times after the timer/listen re-entry
+sequence; this is parked as one beforeExit event-loop re-entry owner. No
+source or upstream-fixture changes, full corpus, or workspace-wide build were
+made. After the run, resources showed about **46 GiB available memory**,
+**52 KiB free swap**, and **14 GiB free disk at 100% usage**. Temporary runner
+output is cleaned immediately and the next wave remains resource-gated.
 
 ## Coverage novelty audit correction after W323
 
