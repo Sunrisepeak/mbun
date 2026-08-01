@@ -965,6 +965,11 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       // loopback/wildcard (as reported by an IPv6-defaulted server.address())
       // dials the v4 loopback, which the v4-mapped INADDR_ANY listener accepts.
       const dialHost = (host === "::1" || host === "::" || host === "::0") ? "127.0.0.1" : host;
+      // The transport remains IPv4-backed for this legacy fast path, but an
+      // explicit IPv6 family still has a logical peer address that callers must
+      // observe. Keep the wire path stable while preserving Node's address
+      // family contract for net.Socket and the TLS wrapper above it.
+      const logicalDialHost = host === "localhost" && optArg && optArg.family === 6 ? "::1" : host;
       // node's lookupAndConnect announces EVERY name resolution it performs on
       // 'lookup', and "localhost" is a resolution like any other. It is the one
       // non-literal host kept on the synchronous fast path above (net.inc
@@ -1029,7 +1034,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
         }
         if (this.destroyed) { this.connecting = false; return; }
         this.pending = false; this.connecting = false;
-        adoptClientPeer(this, fd, host, isIPv6(host) ? "IPv6" : "IPv4", port, unixPath, dialHost !== host);
+        adoptClientPeer(this, fd, logicalDialHost, isIPv6(logicalDialHost) ? "IPv6" : "IPv4", port, unixPath, dialHost !== logicalDialHost);
         this._flushPreConnect(null); this._applyDeferredSockOpts();
         // Bytes held back by the `connecting` guard in _flush go out now.
         this._flush();

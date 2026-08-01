@@ -5,6 +5,13 @@
 
 ## 2026-08-02
 
+- W374 Node IPv6/TLS address-family source fix：五文件回归 selector 基线 **4/5 pass、1 fail、
+  0 timeout**。失败先定位为 `localhost + family: 6` 的逻辑 peer 被 v4 bridge 覆盖，随后定位到
+  TLS informational NID 查询残留 `ERR_OSSL_UNKNOWN_NID`。`modules/jsc/src/js_net.cppm` 保留
+  `::1` 逻辑 peer，`modules/tls/src/openssl.cpp` 在 `shared_sigalgs()`/`ephemeral_key_info()`
+  后清理 OpenSSL error queue；三次增量 release build **59.65s、3.65s、3.61s** 后 W374
+  **5/5 pass、0 fail、0 timeout**，W371/W372 回归各 **5/5 pass**。未修改 upstream fixture，
+  未跑全量 corpus。
 - W373 Node `net` `ipv6Only` source fix：W373 基线 **4/5 pass、1 fail、0 timeout**，失败证明
   `Server.listen({ host: "::", ipv6Only: true })` 只在 JS 层记录选项，native 仍创建 AF_INET
   listener。`modules/jsc/src/js_net.cppm` 透传该选项，`modules/jsc/src/runtime/net.inc`

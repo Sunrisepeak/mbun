@@ -320,6 +320,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W371 | Node net low-coupling green slice | 5 | 5/5 pass; 0 fail; 0 timeout | retain all five net leaves; no source owner |
 | W372 | Node net lifecycle green slice | 5 | 5/5 pass; 0 fail; 0 timeout | retain all five lifecycle leaves; no source owner |
 | W373 | Node net `ipv6Only` source fix | 5 | pre 4/5 pass + 1 fail; post 5/5 pass; W371/W372 regressions 5/5; one serial release rebuild | pass `ipv6Only` through the native bridge and bind AF_INET6 with `IPV6_V6ONLY`; no fixture change |
+| W374 | Node IPv6/TLS address-family source fix | 5 | pre 4/5 pass + 1 fail; post 5/5 pass; W371/W372 regressions 5/5; three incremental release rebuilds | preserve logical IPv6 peer metadata on the localhost fast path and clear informational OpenSSL unknown-NID errors; no fixture change |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -1576,6 +1577,25 @@ bridge and preserves IPv6 hosts when `ipv6Only` is set. `modules/jsc/src/runtime
 creates an AF_INET6 listener and enables `IPV6_V6ONLY` for that path. After one
 serial release build (**59.71s**), W373 measured **5/5 passes, 0 failures, and
 0 timeout**; the W371 and W372 five-file regressions each remained **5/5
+passes**. No upstream fixture changed and no full corpus/workspace-wide test
+ran.
+
+## W374 Node IPv6/TLS address-family source fix
+
+The five-file IPv6 regression selector initially measured **4/5 passes, 1
+failure, and 0 timeout**. The failing `test-tls-connect-address-family.js`
+first exposed that the localhost IPv6-family fast path reported the v4 bridge
+address instead of the logical `::1` peer. Preserving that logical peer without
+changing the existing wire/timing path then exposed a stale OpenSSL
+`ERR_OSSL_UNKNOWN_NID` left by informational TLS NID queries when the server
+closed.
+
+`modules/jsc/src/js_net.cppm` now preserves the logical IPv6 peer for
+`localhost` with `family: 6`. `modules/tls/src/openssl.cpp` clears the
+thread-local OpenSSL error queue after `shared_sigalgs()` and
+`ephemeral_key_info()` informational NID lookups. After three incremental
+release builds (**59.65s, 3.65s, and 3.61s**), W374 measured **5/5 passes, 0
+failures, and 0 timeout**; W371 and W372 regressions each remained **5/5
 passes**. No upstream fixture changed and no full corpus/workspace-wide test
 ran.
 

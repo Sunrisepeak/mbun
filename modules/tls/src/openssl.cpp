@@ -1322,6 +1322,11 @@ std::vector<std::string> TlsChannel::shared_sigalgs() const {
         entry += hn != nullptr ? hn : "UNDEF";
         out.push_back(std::move(entry));
     }
+    // OBJ_nid2sn reports an unknown signature/hash NID through OpenSSL's
+    // thread-local error queue. This query is informational; leaving that
+    // reason queued makes a later clean-close SSL_read look like a handshake
+    // failure (ERR_OSSL_UNKNOWN_NID).
+    ::ERR_clear_error();
     return out;
 }
 
@@ -1500,6 +1505,9 @@ EphemeralKeyInfo TlsChannel::ephemeral_key_info() const {
     }
     }
     ::EVP_PKEY_free(key);
+    // Informational NID lookup above may leave ERR_R_UNSUPPORTED/unknown-nid
+    // on OpenSSL's queue; it must not become a later transport error.
+    ::ERR_clear_error();
     return info;
 }
 
