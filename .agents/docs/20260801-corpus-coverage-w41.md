@@ -291,6 +291,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W341 | Node dgram error/options leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build; 5 fresh | retain send-error, callback-recursion, broadcast, and TTL guards; park socket-buffer-size error-rendering owner |
 | W342 | Bun Linux regression/parser/filesystem leaves | 5 | 4/5 green; 11 passed / 3 failed / 14 ran / 48 expects; 0 timeout; no build; 5 fresh | retain module-extensions, WebSocket-cookie, Dirent, and console-format guards; park HTML-entrypoint parser/build owner |
 | W343 | Node readline/TTY leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build; 5 fresh | retain CSI, keypress, stdin-end, and stdin-pipe guards; park TTY backwards-API forwarding owner |
+| W344 | Bun Linux loader/build/network/REPL leaves | 5 | 5/5 green; 8 passed / 0 failed / 8 ran / 21 expects; 0 timeout; no build; 5 fresh | retain DCE syntax, tsconfig paths, deferred node import, CONNECT pipelining, and REPL startup guards; no source owner |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -1105,6 +1106,27 @@ No full corpus or workspace-wide build was run. After the run, resources
 showed about **47 GiB available memory**, **528 KiB free swap**, and **16 GiB
 free disk at 99% usage**. Temporary runner output is cleaned immediately and
 the next wave remains resource-gated.
+
+## W344 Bun Linux loader/build/network/REPL leaves
+
+The bounded five-job Bun selector covered five fresh small regression files
+after filename/stem and narrow semantic-owner review:
+`test/regression/issue/25609.test.ts`,
+`test/regression/issue/25622.test.ts`,
+`test/regression/issue/25707.test.ts`,
+`test/regression/issue/25862.test.ts`, and
+`test/regression/issue/26058.test.ts`. Using the real Bun harness and existing
+Linux binary, the runner measured **5/5 green files**, **8 passed / 0 failed /
+8 ran / 21 expects**, **0 runner timeouts**, and **287–589 ms** per file.
+
+All five guards passed: dead-code-elimination syntax validity, child tsconfig
+path replacement, deferred CJS dynamic `node:` import resolution, pipelined
+HTTP CONNECT head delivery, and REPL startup without package-resolution
+output. No source or upstream-fixture changes, full corpus, or workspace-wide
+build were made. After the run, resources showed about **47 GiB available
+memory**, **600 KiB free swap**, and **16 GiB free disk at 99% usage**.
+Temporary runner output is cleaned immediately and the next wave remains
+resource-gated.
 
 ## Coverage novelty audit correction after W323
 
