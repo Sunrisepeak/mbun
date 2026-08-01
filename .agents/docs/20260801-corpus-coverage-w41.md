@@ -202,6 +202,30 @@ the observed Linux limits; the coordinator owns the only root build.
 | W252 | Bun base64/highlighter/UUID leaves | 3 | 2/3 green; 28 passed / 11 failed / 39 ran / 575 expects; 0 timeout; no build | retain base64url 5/5 and highlighter 16/16; park randomUUIDv7 timestamp validation, rollover/order, and counter-seeding owners |
 | W253 | Node events/listener plain-script leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain EventEmitter eventNames/listenerCount semantics and EventSource-disabled global guard; no source owner |
 | W254 | Bun test-runner hook/scope leaves | 3 | 2/3 green; 15 passed / 11 failed / 26 ran / 21 expects; 0 timeout; no build | retain nested-describes 3/3 and onTestFinished 12/12; park failure-skip nested child-runner empty-output owner |
+| W255 | Bun retry/jest-each/fake-timers leaves | 3 | 2/3 green; 40 passed / 4 failed / 44 ran / 61 expects; 0 timeout; no build | retain jest-each 25/25 and retry/repeats 12/12; park fake-timers Intl clock-format and child-eval `jest.useFakeTimers` owners |
+
+## W255 Bun retry/jest-each/fake-timers leaf probe
+
+The bounded three-job Bun selector covered `test-retry-repeats-basic.test.ts`,
+`jest-each.test.ts`, and `test-timers.test.ts`. It measured **2/3 files
+green**, with **40 passed / 4 failed / 44 ran / 61 expects / 0 runner
+timeouts**. Per-file durations were 200–652ms.
+
+`jest-each.test.ts` passed all 25 tests, covering parameter formatting,
+callback parameters, object cases, `describe.each`, and generated test names.
+`test-retry-repeats-basic.test.ts` passed all 12 tests, covering retry and
+repeat counts, hook order, `onTestFinished`, and inner `afterAll` behavior.
+
+`test-timers.test.ts` passed 3/7 tests. One failure showed
+`Intl.DateTimeFormat().format()` remaining on the real current date after the
+fake clock was set. Three failures came from child evaluations expecting
+`jest.useFakeTimers()` to complete and print `ok`, but the API was unavailable
+there. The two groups were kept as separate owners; no mixed fix was attempted.
+
+No source or upstream fixture change was made. The selector reused the
+coordinator binary through `tools/integration/bun_corpus_runner.py` with three
+bounded jobs, a 30-second per-file timeout, and missing Node modules allowed.
+No full corpus, build, or workspace-wide test was run.
 
 ## W254 Bun test-runner hook/scope leaf probe
 
