@@ -340,6 +340,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W391 | Node `performance.nodeTiming` milestone source fix | 5 | target pre 1/1 fail; post target 1/1 pass; performance selector 4/5 pass, 1 fail, 0 timeout; W390 observer and W389 uvMetricsInfo remain green; Bun regression 5/5 green; serial build 58.82s | provide ordered startup milestones, dynamic loop start/exit, duration, idleTime, and constant startTime; park the remaining GC callback owner |
 | W392 | Node `PerformanceObserver` forced-GC entry source fix | 5 | target 1/1 pass; performance selector 5/5 pass, 0 fail, 0 timeout; Bun fake-timer regression 5/5 green, 8 passed / 0 failed / 8 ran / 10 expects; serial release build 58.98s | publish a forced major-GC entry after the real `Bun.gc(true)` path and accept `gc` observation; no upstream fixture change |
 | W393 | Node TLS `allowHalfOpen` transport source fix | 5 | pre 2/5 pass + 3 fail; target 1/1 pass; post selector 3/5 pass + 2 fail, 0 timeout; Bun fake-timer regression 5/5 green, 8 passed / 0 failed / 8 ran / 10 expects; serial release build 57.70s | propagate `tls.connect({ allowHalfOpen })` to its hidden transport; park keepAlive/noDelay teardown and raw TLS close-order owners separately |
+| W394 | Node TLS close_notify/RST teardown source fix | 5 | target pre 1/1 fail; post target 1/1 pass; five-file TLS selector 4/5 pass + 1 fail, 0 timeout; Bun fake-timer regression 5/5 green, 8 passed / 0 failed / 8 ran / 10 expects; two serial release builds 57.35s + 57.43s | classify RST/EPIPE after local TLS shutdown as EOF while preserving unsignalled reset errors; park raw TLS close-order owner separately |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -1836,6 +1837,25 @@ milestone-order owners remain. The five-file Bun fake-timer regression stayed
 **5/5 green, 8 passed, 0 failed, 8 ran, 10 expects** after the serialized release
 build (**59.06s**). No upstream fixture changed and no full corpus/workspace-wide
 test ran.
+
+## W394 Node TLS close_notify/RST teardown source fix
+
+The keepAlive/noDelay TLS target still failed after W393 because the server
+had already sent TLS `close_notify`, but the client immediately called
+`destroy()`. The native shuttle classified the resulting server-side
+`ECONNRESET` as a read failure. A first narrow guard covered only the socket
+read; the same reproduction showed that pending close-notify ciphertext could
+also fail its write with `EPIPE`/`ECONNRESET`.
+
+`net.inc` now tracks that local TLS shutdown was requested and treats those
+post-shutdown read/write reset variants as EOF, while leaving resets on a
+connection that has not sent close-notify as errors. The focused keepAlive/
+noDelay file moved from **1/1 failure** to **1/1 pass**. The five-file TLS
+selector moved from **3/5 pass, 2 fail** to **4/5 pass, 1 fail, 0 timeout**;
+only raw TLS close-order remains. The five-file Bun fake-timer regression
+remained **5/5 green, 8 passed, 0 failed, 8 ran, 10 expects**. Two serialized
+release builds took **57.35s** and **57.43s**. No upstream fixture changed and
+no full corpus/workspace-wide test ran.
 
 ## W393 Node TLS `allowHalfOpen` transport source fix
 

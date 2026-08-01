@@ -5,6 +5,13 @@
 
 ## 2026-08-02
 
+- W394 Node TLS close_notify/RST teardown source fix：`tls.Server` 已发送本地 close_notify 后，
+  client 立即 `destroy()` 产生的 server-side `ECONNRESET`/pending close-notify `EPIPE` 不再被误报
+  为 read failure；未发送本地 shutdown 的 reset 仍保留为 error。focused keepAlive/noDelay 文件从
+  **1/1 failure** 到 **1/1 pass**；五文件 TLS selector 从 W393 的 **3/5 pass、2 fail** 提升到
+  **4/5 pass、1 fail、0 timeout**，仅剩 raw TLS close-order owner；Bun fake-timer 回归 **5/5
+  green、8 passed、0 failed、8 ran、10 expects**；两次 serial release build **57.35s、57.43s**。
+  未修改 upstream fixture、未跑全量 corpus。
 - W393 Node TLS `allowHalfOpen` transport source fix：修复 `tls.connect({ allowHalfOpen: true })`
   的隐藏 plaintext transport 硬编码为 false，导致收到对端 FIN 后提前关闭写侧、丢失 deferred
   `Bye`。focused 文件从 **1/1 failure** 到 **1/1 pass**；五文件 TLS selector 从 W375 的

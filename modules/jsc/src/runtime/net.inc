@@ -87,6 +87,7 @@ struct NetTlsState {
     std::string pendingOut{};  // ciphertext the socket refused (EAGAIN tail)
     bool sockEof{false};
     bool failed{false};
+    bool shutdownSent{false};
     std::string error{};
     explicit NetTlsState(mbun::tls::TlsRole role, mbun::tls::Config cfg)
         : channel{role, std::move(cfg)} {}
@@ -752,6 +753,11 @@ bool net_tls_shuttle(int fd, NetTlsState& st) {
         }
         if (n == 0) { st.sockEof = true; break; }
         if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+        // Once this side has sent TLS close_notify, a peer that immediately
+        // destroys its socket may surface as ECONNRESET instead of a final
+        // FIN. Node treats that as the orderly end of our already-closed
+        // write side; only unsignalled resets remain read failures.
+        if (errno == ECONNRESET && st.shutdownSent) { st.sockEof = true; break; }
         st.failed = true;
         st.error = std::string{"socket read: "} + std::strerror(errno);
         return false;
@@ -766,6 +772,9 @@ bool net_tls_shuttle(int fd, NetTlsState& st) {
         if (w > 0) { st.pendingOut.erase(0, static_cast<std::size_t>(w)); continue; }
         if (w < 0 && errno == EINTR) continue;
         if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+        if (w < 0 && st.shutdownSent && (errno == EPIPE || errno == ECONNRESET)) {
+            st.pendingOut.clear(); st.sockEof = true; break;
+        }
         st.failed = true;
         st.error = std::string{"socket write: "} + std::strerror(errno);
         return false;
@@ -1047,6 +1056,7 @@ JSValueRef netn_tls_close_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::si
         if (found != net_tls().end()) {
             NetTlsState& st{*found->second};
             if (!st.failed) {
+                st.shutdownSent = true;
                 st.channel.shutdown();
                 net_tls_shuttle(fd, st);
             }
