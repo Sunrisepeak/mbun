@@ -233,6 +233,26 @@ the observed Linux limits; the coordinator owns the only root build.
 | W283 | Node module entry/global-path leaves | 3 | 2/3 pass; 1 fail; 0 timeout; no build | retain NODE_PATH and main-extension leaves; park copied-child HOME/global-path resolution owner |
 | W284 | Bun HTTP timeout/cork/TLS leaves | 3 | 3/3 green; 16 passed / 0 failed / 16 ran / 46 expects; 0 timeout; no build | retain timeout lifecycle, nested-cork isolation, and TLS identity guards; no source owner |
 | W285 | Node circular-loader/require-error leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build | retain circular warning/symlink, invalid-package, and Unicode-path leaves; park JSON parse filename diagnostic owner |
+| W286 | Node require boundary leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain node-prefix/cache, NUL, exception-reload, empty-main, and deleted-directory resolution guards; no source owner |
+
+## W286 Node require boundary leaf probe
+
+The bounded **five-job** Node selector covered `test-require-empty-main.js`,
+`test-require-enoent-dir.js`, `test-require-exceptions.js`,
+`test-require-node-prefix.js`, and `test-require-nul.js`. It measured **5/5
+file-level passes**, **0 failures**, and **0 runner timeouts**. Per-file
+durations were 249–255ms.
+
+The selector passed empty-package-main fallback, resolution after a dependency
+directory is deleted, repeated throwing-module loads, `node:` prefix/cache
+bypass behavior, and NUL-byte rejection. These are isolated require-path and
+error-contract leaves with no new source owner.
+
+No source or upstream fixture change was made. The selector reused the
+coordinator binary through `tools/integration/node_corpus_runner.py` with
+**five bounded jobs** and a 30-second per-file timeout. No full corpus, build,
+or workspace-wide test was run. The Node corpus runner reports only file-level
+status for these plain scripts, so no synthetic subtest count was added.
 
 ## W285 Node circular-loader/require-error leaf probe
 
