@@ -5,6 +5,7 @@
 
 ## 2026-08-01
 
+- W193 fresh Bun low-coupling probe（3 jobs、复用现有 coordinator binary、无构建）**3/5 files green、323 passed、12 failed、604 ran、2302 expects、0 timeout**：direct-readable 269 pass/268 skip、libuv error-name 1 pass/1 skip、histogram 38 pass；两份 internal sourcemap 分别停车在 path/UTF-8 与 astral/long-line/cache owners。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W192 fresh Bun parser/cron adjacent probe（3 jobs、复用现有 coordinator binary、无构建）**3/5 files green、464 passed、78 failed、578 ran、755 expects、0 timeout**：JSON5 suite 113/113、JSONC suite 319/319、TLS segment guard 1 pass/1 skip；cron.test 与 in-process-cron 分别停车在 registration/parse mixed owner 与未实现 scheduler。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W191 fresh Bun util probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files green、105 passed、0 failed、106 ran、1 skipped、409 expects、0 timeout**：password、xxHash、error name/code、sleepSync、invalid pathToFileURL 全部通过；password 单文件 8.789s，其余 198–264ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W190 fresh Bun parser/API probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files green、719/719 tests passed、0 failed、0 timeout、5324 expects**：cron-parse、INI、JSON5、JSONC、JSONL 全部通过；单文件耗时 465ms–4.166s。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。

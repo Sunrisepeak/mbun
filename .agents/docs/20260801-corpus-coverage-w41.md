@@ -140,6 +140,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W190 | Bun parser/API leaves | 5 | 5/5 green; 719/719 tests; 0 failed; 0 timeout; 5324 expects; no build | retain all five cron/INI/JSON5/JSONC/JSONL leaves; no source owner |
 | W191 | Bun util low-coupling leaves | 5 | 5/5 green; 105 passed / 0 failed / 106 ran / 1 skipped / 409 expects; 0 timeout; no build | retain all five password/hash/error/sleep/path leaves; no source owner |
 | W192 | Bun parser/cron adjacent leaves | 5 | 3/5 green; 464 passed / 78 failed / 578 ran / 755 expects; 0 timeout; no build | retain TLS-segment-size and JSON5/JSONC suites; park cron scheduling plus cron alias/validation owners separately |
+| W193 | Bun low-coupling stream/source-map/system leaves | 5 | 3/5 green; 323 passed / 12 failed / 604 ran / 2302 expects; 0 timeout; no build | retain direct-readable, libuv error-name, histogram; park source-map path/UTF-8 and internal-source-map owners separately |
 
 ## W133 Bun.Terminal green cluster
 
@@ -975,6 +976,29 @@ while `cron.test.ts` combines registration/removal/execution gaps with a
 separate parse nickname/validation owner (**31 pass / 51 fail / 35 skip**).
 No source or upstream fixture change was made and no new issue was opened from
 this mixed measurement.
+
+The selector used the existing coordinator binary through
+`tools/integration/bun_corpus_runner.py` with three bounded jobs, a 30-second
+per-file timeout, and missing Node modules allowed. No full corpus or
+workspace-wide test was run; the selector and raw runner output were removed
+after recording the result.
+
+## W193 Bun low-coupling owner split
+
+The bounded three-job selector covered direct Readable stream behavior,
+internal source-map roundtrips, internal source-map stack mapping, libuv error
+name conversion, and perf-hooks histograms. It reached **3/5 files green**,
+with **323 passed**, **12 failed**, **604 ran**, **2302 expects**, and **0
+timeouts**.
+
+The retained green files were direct-readable (**269 pass / 268 skip / 0 fail
+/ 537 ran / 440 expects**), libuv error-name (**1 pass / 1 skip / 0 fail / 2
+ran / 1 expect**), and histogram (**38 pass / 0 fail / 38 ran**). The two
+source-map files remain separate owners: roundtrip failures combine relative
+path/source-root normalization with truncated-UTF-8 mapping, while the
+internal-source-map failures combine astral inline-snapshot positions,
+long-line mapping, cache eviction, and stack-path shape. No source or upstream
+fixture change was made and no mixed fix was attempted.
 
 The selector used the existing coordinator binary through
 `tools/integration/bun_corpus_runner.py` with three bounded jobs, a 30-second
