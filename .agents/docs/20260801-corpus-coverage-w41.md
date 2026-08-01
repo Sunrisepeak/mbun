@@ -290,6 +290,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W340 | Node dgram continuation leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build; 5 fresh | retain bind-error-repeat, connected-send, ref, and unref guards; park connected-port validation message owner |
 | W341 | Node dgram error/options leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build; 5 fresh | retain send-error, callback-recursion, broadcast, and TTL guards; park socket-buffer-size error-rendering owner |
 | W342 | Bun Linux regression/parser/filesystem leaves | 5 | 4/5 green; 11 passed / 3 failed / 14 ran / 48 expects; 0 timeout; no build; 5 fresh | retain module-extensions, WebSocket-cookie, Dirent, and console-format guards; park HTML-entrypoint parser/build owner |
+| W343 | Node readline/TTY leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build; 5 fresh | retain CSI, keypress, stdin-end, and stdin-pipe guards; park TTY backwards-API forwarding owner |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -1082,6 +1083,28 @@ or upstream-fixture change was made. No full corpus or workspace-wide build
 was run. After the run, resources showed about **46 GiB available memory**,
 **472 KiB free swap**, and **16 GiB free disk at 99% usage**. Temporary runner
 output is cleaned immediately and the next wave remains resource-gated.
+
+## W343 Node readline/TTY leaves
+
+The bounded five-job Node selector covered five fresh readline/TTY files after
+filename/stem and narrow semantic-owner review:
+`test-tty-backwards-api.js`, `test-tty-stdin-end.js`,
+`test-tty-stdin-pipe.js`, `test-readline-csi.js`, and
+`test-readline-emit-keypress-events.js`. The runner measured **4/5 file-level
+passes**, **1 failure**, **0 runner timeouts**, and **249–350 ms** per file.
+The Node runner reports file-level status only; no assertion-level pass total
+is inferred.
+
+The readline CSI escape/argument contract, explicit keypress event parsing,
+stdin end safety, and stdin pipe lifecycle guards passed and are retained. The
+TTY backwards-API file failed because the `WriteStream` methods did not invoke
+the mocked readline forwarding functions or callbacks (the fixture expected
+two calls per method but observed zero). This is parked as one TTY
+backwards-API forwarding owner; no source or upstream-fixture change was made.
+No full corpus or workspace-wide build was run. After the run, resources
+showed about **47 GiB available memory**, **528 KiB free swap**, and **16 GiB
+free disk at 99% usage**. Temporary runner output is cleaned immediately and
+the next wave remains resource-gated.
 
 ## Coverage novelty audit correction after W323
 
