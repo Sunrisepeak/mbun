@@ -5,6 +5,11 @@
 
 ## 2026-08-01
 
+- W74 fresh Node events/stream/assert/console leaf probe（5 jobs、复用当前 Linux binary、无构建）
+  测得 **4 green files、136 passed、2 failed、138 ran、279 expects**。event-emitter、
+  node-stream-uint8array、assert TypedArray deep-equal、console table iterator 全绿；
+  `node-timers` 的失败分成 JSC UTF-16 字符串表示与 immediate 异常后的 microtask 调度两个
+  owner，停车不混修。未修改上游 fixture，未跑全量 corpus。
 - W73 fresh Node crypto probe 先以 **5 jobs** 测得 **4 green files、33 passed、2 failed、35
   ran、85 expects**；HMAC、invalid-this、lazyhash、HKDF 全绿，`crypto-random` 的 sync/async
   `checkPrime` 失败都来自同一参数快照 owner。Issue [#49](https://github.com/Sunrisepeak/mbun/issues/49)

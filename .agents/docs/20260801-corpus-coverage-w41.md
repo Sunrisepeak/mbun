@@ -806,6 +806,22 @@ surface on Linux:
   were performed. Keep the five green crypto leaves as guards and choose the
   next fresh one-owner row.
 
+### W74 Node events/stream/assert/console leaf probe parked
+
+- A fresh five-file Node leaf probe used **5 bounded jobs** and reused the
+  current Linux binary; no source change or build was needed. It measured
+  **4 green files, 136 passed, 2 failed, 138 ran, 279 expects**.
+- `event-emitter` (**67/67**), `node-stream-uint8array` (**5/5**),
+  `assert-typedarray-deepequal` (**45/45**), and
+  `console-table-iterators` (**1/1**) were green and are retained as guards.
+- `node-timers` reached **18/20**. Its two failures are separate owners: a
+  JSC UTF-16 string representation assertion in `clearTimeout`, and
+  immediate-exception/microtask ordering in a spawned fixture. No mixed fix
+  was attempted and no issue was opened for the multi-owner file.
+- No upstream fixture changes, no full corpus, and no workspace-wide build
+  were performed. Continue with a fresh one-owner row under the 3–5 lane
+  policy.
+
 ### W59 Node buffer leaf sample
 
 - W59 使用 Node corpus runner 的默认 bounded profile、**3 jobs**。首批五个文件为
