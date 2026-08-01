@@ -238,6 +238,25 @@ the observed Linux limits; the coordinator owns the only root build.
 | W288 | Node resolver/require flag leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain import resilience, dot resolution, guarded ESM require, process identity, and invalid resolve-path validation; no source owner |
 | W289 | Node resolver/extension/symlink leaves | 5 | 3/5 pass; 2 fail; 0 timeout; no build | retain symlinked-peer, invalid-main, and relative-path guards; park extension-over-directory and require.resolve fixture lookup owners |
 | W290 | Node module metadata/extension leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build | retain module children/stat/version and extension-main guards; merge same-filename-as-dir into the W289 extension-over-directory precedence owner |
+| W291 | Bun Base64/Buffer/console/encoding leaves | 5 | 5/5 green; 38 passed / 0 failed / 40 ran / 118 expects; 0 timeout; no build | retain all five Bun guards; no source owner |
+
+## W291 Bun Base64/Buffer/console/encoding leaf probe
+
+The bounded five-job Bun selector covered Base64, Buffer bounds and metadata,
+console constructor stack recovery, and Deno encoding leaves. It measured
+**5/5 green files**, **38 passed / 0 failed / 40 ran / 118 expects**, and **0
+runner timeouts**. Per-file durations were **200–300 ms**.
+
+`encoding.test.ts` measured **21 passed / 0 failed / 23 ran / 41 expects**;
+`buffer-compare-bounds.test.ts` measured **13 / 0 / 13 / 17**;
+`buffer-inspectmaxbytes.test.ts` measured **1 / 0 / 1 / 5**;
+`console-constructor-exception.test.ts` measured **1 / 0 / 1 / 4**; and
+`atob.test.js` measured **2 / 0 / 2 / 51**. All five guards are retained as
+green coverage with no source or upstream-fixture changes.
+
+The selector used the bounded five-job Bun runner with a 30-second per-file
+timeout, the existing coordinator binary, and missing Node modules allowed.
+No full corpus, build, or workspace-wide test was run.
 
 ## W290 Node module metadata/extension leaf probe
 
