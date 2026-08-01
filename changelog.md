@@ -11,6 +11,11 @@
   root release build **60.12 秒**；focused `test-icu-transcode.js` **1/1 pass**，
   目标文件加 10 个 Buffer/Node guards **11/11 files pass**。五文件 fresh probe
   由 **1/5** 提升为 **2/5 pass**，其余三个 URL 文件为独立 owner；未跑全量 corpus。
+- `#45` 修复 Node URL custom-inspect 边界：单引号字段与 Node 顺序、`showHidden`
+  的 URLContext、动态子类名和 depth-zero 输出均对齐，Bun 输出保持不变。root
+  release build **60.24 秒**；focused URL inspect **1/1 pass**，含 transcode、URL
+  inspect、URL parsing、URL setters、Buffer.fill 的五文件候选集为 **3/5 pass**，
+  后两个 URL 文件仍是独立 owner；未跑全量 corpus。
 - `#43` 修复 Node `Buffer.prototype.fill` 的三个同入口 contract：hex 填充值现在
   拒绝奇数长度/非法字符并返回 `ERR_INVALID_ARG_VALUE`，非字符串 encoding 返回
   `ERR_INVALID_ARG_TYPE`，伪造 `length` 与 TypedArray 实长不一致时返回

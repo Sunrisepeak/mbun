@@ -591,6 +591,23 @@ surface on Linux:
   Bun-dialect smoke kept both transcode exports `undefined`. Root release build
   passed in **60.12 seconds**. No full corpus or workspace-wide build was run.
 
+### W62 Node URL custom-inspect owner
+
+- The W61 five-file candidate set had three URL/Buffer owners after transcode:
+  URL custom inspect, URL custom parsing, and URL custom setters. The inspect
+  failure was isolated to the existing Node URL custom-inspect hook: JSON
+  double quotes, visible `toJSON`/`toString`, missing `showHidden` context, and
+  a fixed `URL` header.
+- Issue [#45](https://github.com/Sunrisepeak/mbun/issues/45) changes only the
+  Node-dialect custom inspector in `node_util_extra.cppm`: Node quote/field
+  order, hidden URLContext, dynamic subclass name, and depth-zero output. Bun
+  output and generic URL parser/setter paths are unchanged.
+- Focused `test-whatwg-url-custom-inspect.js`: **1/1 pass**. The complete
+  five-file candidate set moved to **3/5 pass**: transcode, URL inspect, and
+  Buffer.fill green; custom parsing and custom setters remain parked as
+  independent owners. Root release build passed in **60.24 seconds**. No full
+  corpus or workspace-wide build was run.
+
 ### W59 Node buffer leaf sample
 
 - W59 使用 Node corpus runner 的默认 bounded profile、**3 jobs**。首批五个文件为

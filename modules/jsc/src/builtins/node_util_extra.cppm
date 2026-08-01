@@ -377,6 +377,69 @@ inline constexpr std::string_view kNodeUtilExtraJS = R"JS(
       return new Map(uvMap);
     };
 
+    // Node's URL custom inspector is a compatibility boundary, not a generic
+    // URL parser change. The native URL hook uses JSON quoting and exposes
+    // implementation methods; Node shows inspect-quoted fields and only adds
+    // its internal context when showHidden is requested.
+    if (G.__mbunDialect === "node" && G.URL && G.URL.prototype) {
+      const urlInspectSymbol = Symbol.for("nodejs.util.inspect.custom");
+      const inspectURL = function inspectURL(depth, options) {
+        const opts = options || {};
+        const name = this.constructor && this.constructor.name ? this.constructor.name : "URL";
+        if (depth !== undefined && depth <= 0) return name + " {}";
+        const quote = (value) => util.inspect(value, { colors: !!opts.colors });
+        const href = String(this.href);
+        const protocol = String(this.protocol);
+        const username = String(this.username);
+        const password = String(this.password);
+        const hostname = String(this.hostname);
+        const port = String(this.port);
+        const hostStart = href.indexOf("@");
+        const authorityStart = href.indexOf("//") + 2;
+        const hostIndex = hostStart >= 0 ? hostStart : authorityStart;
+        const usernameEnd = username ? href.indexOf(":", authorityStart) : -1;
+        const hostEnd = hostIndex + (hostStart >= 0 ? 1 : 0) + hostname.length;
+        const pathnameStart = hostEnd + (port ? port.length + 1 : 0);
+        const searchStart = href.indexOf("?");
+        const hashStart = href.indexOf("#");
+        let out = name + " {\n";
+        out += "  href: " + quote(this.href) + ",\n";
+        out += "  origin: " + quote(this.origin) + ",\n";
+        out += "  protocol: " + quote(this.protocol) + ",\n";
+        out += "  username: " + quote(this.username) + ",\n";
+        out += "  password: " + quote(this.password) + ",\n";
+        out += "  host: " + quote(this.host) + ",\n";
+        out += "  hostname: " + quote(this.hostname) + ",\n";
+        out += "  port: " + quote(this.port) + ",\n";
+        out += "  pathname: " + quote(this.pathname) + ",\n";
+        out += "  search: " + quote(this.search) + ",\n";
+        out += "  searchParams: " + util.inspect(this.searchParams, opts) + ",\n";
+        out += "  hash: " + quote(this.hash);
+        if (opts.showHidden) {
+          const schemeType = protocol === "http:" ? 1 : protocol === "https:" ? 2 : 0;
+          out += ",\n  Symbol(context): URLContext {\n";
+          out += "    href: " + quote(this.href) + ",\n";
+          out += "    protocol_end: " + protocol.length + ",\n";
+          out += "    username_end: " + usernameEnd + ",\n";
+          out += "    host_start: " + hostIndex + ",\n";
+          out += "    host_end: " + hostEnd + ",\n";
+          out += "    pathname_start: " + pathnameStart + ",\n";
+          out += "    search_start: " + searchStart + ",\n";
+          out += "    hash_start: " + hashStart + ",\n";
+          out += "    port: " + (port ? Number(port) : -1) + ",\n";
+          out += "    scheme_type: " + schemeType + ",\n";
+          out += "    [hasPort]: [Getter],\n";
+          out += "    [hasSearch]: [Getter],\n";
+          out += "    [hasHash]: [Getter]\n";
+          out += "  }";
+        }
+        return out + "\n}";
+      };
+      Object.defineProperty(G.URL.prototype, urlInspectSymbol, {
+        value: inspectURL, configurable: true, writable: true,
+      });
+    }
+
     // ---- util.getCallSites (node >= 22.9) ---------------------------------
     // node lib/internal/util.js: returns the current call stack as objects
     // { functionName, scriptId, scriptName, lineNumber, column }, most recent
