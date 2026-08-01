@@ -136,7 +136,8 @@ the observed Linux limits; the coordinator owns the only root build.
 | W186 | Node Writable final/error leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five abort/final/error/writev leaves; no source owner |
 | W187 | Node Readable basic leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five constructor/data/encoding/readable-event leaves; no source owner |
 | W188 | Node Readable event/end leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five end/error/event/flow leaves; no source owner |
-| W189 | Node Readable readiness leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five emission/readiness/pause leaves; no source owner |
+| W189 | Node Readable readiness leaves | 5 | 5/5 pass; 4 fresh green + 1 prior guard reconfirmed; 0 fail; 0 timeout; no build | retain four newly measured leaves; keep no-unneeded-readable as a reconfirmed W115 guard |
+| W190 | Bun parser/API leaves | 5 | 5/5 green; 719/719 tests; 0 failed; 0 timeout; 5324 expects; no build | retain all five cron/INI/JSON5/JSONC/JSONL leaves; no source owner |
 
 ## W133 Bun.Terminal green cluster
 
@@ -919,13 +920,29 @@ after recording the result.
 The bounded three-job selector covered emitted-readable timing, needReadable
 behavior, suppression of unnecessary readable events, pause/resume, and a
 single readable event. All **5/5 files passed**, with **0 failures and 0
-timeouts**. Per-file durations were 165–250ms.
+timeouts**. Per-file durations were 165–250ms. Four files were fresh new
+coverage; `test-stream-readable-no-unneeded-readable.js` was already green in
+W115 and is recorded here as a reconfirmed guard, not a new increment.
 
 No source or upstream fixture change was made. The selector used the existing
 coordinator binary through `tools/integration/node_corpus_runner.py` with
 three bounded jobs and a 30-second per-file timeout. No full corpus or
 workspace-wide test was run; the selector and raw runner output were removed
 after recording the result.
+
+## W190 Bun parser/API green cluster
+
+The bounded three-job selector covered `Bun.cron.parse`, INI parsing, JSON5
+parsing, JSONC parsing, and JSONL parsing. All **5/5 files were green**, with
+**719/719 tests passed**, **0 failed**, **0 timed out**, and **5324 expects**.
+Per-file durations were 465ms–4.166s; the INI suite was the slowest at 4.166s
+but remained well inside the 30-second bound.
+
+No source or upstream fixture change was made. The selector used the existing
+coordinator binary through `tools/integration/bun_corpus_runner.py` with three
+bounded jobs, a 30-second per-file timeout, and missing Node modules allowed.
+No full corpus or workspace-wide test was run; the selector and raw runner
+output were removed after recording the result.
 
 ## W132 Node VM and WebStreams owner split
 

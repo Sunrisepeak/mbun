@@ -5,6 +5,8 @@
 
 ## 2026-08-01
 
+- W190 fresh Bun parser/API probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files green、719/719 tests passed、0 failed、0 timeout、5324 expects**：cron-parse、INI、JSON5、JSONC、JSONL 全部通过；单文件耗时 465ms–4.166s。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W189 correction：5/5 files pass、0 fail、0 timeout，但 `test-stream-readable-no-unneeded-readable.js` 已在 W115 通过；本轮实际新增 **4 个** Readable readiness 文件，另 1 个为历史 guard 复核。
 - W189 fresh Node Readable readiness probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：emitted-readable、needReadable、no-unneeded-readable、pause/resume、single readable event 全部通过；单文件耗时 165–250ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W188 fresh Node Readable event/end probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：end-destroyed、ended、error-end、readable event、flow recursion 全部通过；单文件耗时 164–248ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W187 fresh Node Readable basic probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：constructor、data 中追加 chunk、default encoding、didRead、short-stream readable emission 全部通过；单文件耗时 164–199ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
