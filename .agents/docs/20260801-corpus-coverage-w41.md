@@ -212,6 +212,25 @@ the observed Linux limits; the coordinator owns the only root build.
 | W262 | Node crypto Certificate/DH/keygen leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain Certificate fixture parsing/API, `modp2` Diffie-Hellman group, and empty-passphrase keygen no-prompt guards; no source owner |
 | W263 | Node stream append/backpressure/order leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain Readable data-time append, backpressure completion, and push ordering; no source owner |
 | W264 | Bun spyMatchers/pretty-format/test.failing leaves | 3 | 1/3 green; 130 passed / 24 failed / 159 ran / 494 expects; 0 timeout; no build | retain pretty-format 1/1; retain spyMatchers 124 pass + 5 todo; park matcher error/argument semantics and test.failing message/timeout owners |
+| W265 | Node fs append/rename/stream-type leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain appendFileSync data/mode/FD behavior, rename type guards, and WriteStream option TypeErrors; no source owner |
+
+## W265 Node fs append/rename/stream-type plain-script leaf probe
+
+The bounded three-job Node selector covered `test-fs-append-file-sync.js`,
+`test-fs-rename-type-check.js`, and
+`test-fs-write-stream-throw-type-error.js`. It measured **3/3 file-level
+passes**, **0 failures**, and **0 runner timeouts**. Per-file durations were
+199–201ms.
+
+The probe retained synchronous append behavior for text, buffers, modes, and
+file descriptors; rename argument type validation; and createWriteStream
+invalid-options TypeErrors. The Node corpus runner reports only file-level
+status for these plain scripts, so no synthetic subtest count was added.
+
+No source or upstream fixture change was made. The selector reused the
+coordinator binary through `tools/integration/node_corpus_runner.py` with
+three bounded jobs and a 30-second per-file timeout. No full corpus, build,
+or workspace-wide test was run.
 
 ## W264 Bun spyMatchers/pretty-format/test.failing leaf probe
 

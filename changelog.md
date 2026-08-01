@@ -5,6 +5,7 @@
 
 ## 2026-08-01
 
+- W265 fresh Node fs append/rename/stream-type plain-script leaf probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：appendFileSync data/mode/FD、rename type guards 与 WriteStream invalid-options TypeErrors 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 199–201ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W264 fresh Bun spyMatchers/pretty-format/test.failing leaf probe（3 jobs、复用现有 coordinator binary、无构建）**1/3 files green、130 passed、24 failed、159 ran、494 expects、0 runner timeout**：pretty-format **1/1**；spyMatchers **124 pass + 5 todo**；test.failing **5/8**，失败拆为 matcher error/argument semantics、expected-failure format、non-function message 与 missing `jest.setTimeout` owners。单文件耗时 197–750ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W263 fresh Node stream append/backpressure/order plain-script leaf probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：Readable data-time append、Writable backpressure 与 Readable push ordering 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 182–183ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W262 fresh Node crypto Certificate/DH/keygen plain-script leaf probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：Certificate fixture/API、`modp2` Diffie-Hellman 与 empty-passphrase keygen no-prompt 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 202–252ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
