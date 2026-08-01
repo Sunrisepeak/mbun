@@ -5,6 +5,8 @@
 
 ## 2026-08-01
 
+- W225 fresh Node Buffer read/string probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：basic reads、toString range/coercion、JSON Buffer serialization 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 199–200ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W224 fresh Node Buffer write probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：generic write encoding/range、Double BE/LE、UInt BE/LE offset/OOB 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 200–201ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W223 fresh Node Buffer float probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：Float32/Float64 BE/LE read/write 与 OOB/range guards 全部 clean-exit；Node runner 按 file-level 计数，单文件均 199ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W222 fresh Node Buffer numeric probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：signed/unsigned integer reads、signed integer writes 的 OOB/type/range 与 endianness 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 201–202ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W221 fresh Node Buffer continuation probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：bad hex、BigInt64/BigUInt64 endian/range、ArrayBuffer sharing/offset/length 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时均约 200ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。

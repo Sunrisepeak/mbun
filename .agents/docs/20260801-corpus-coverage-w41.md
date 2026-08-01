@@ -171,6 +171,8 @@ the observed Linux limits; the coordinator owns the only root build.
 | W221 | Node Buffer continuation leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain bad-hex handling, BigInt64/BigUInt64 endian/range, and ArrayBuffer sharing/offset/length guards; no source owner |
 | W222 | Node Buffer numeric leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain signed/unsigned reads and signed writes across OOB/type/range/endianness guards; no source owner |
 | W223 | Node Buffer float leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain Float32/Float64 BE/LE read/write and OOB/range guards; no source owner |
+| W224 | Node Buffer write leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain generic encoding/range, Double BE/LE, and UInt BE/LE write guards; no source owner |
+| W225 | Node Buffer read/string leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain basic reads, toString range/coercion, and JSON serialization guards; no source owner |
 
 ## W133 Bun.Terminal green cluster
 
@@ -213,6 +215,34 @@ after recording the result.
 The bounded three-job Node selector covered Float32 and Float64 big/little
 endian reads and writes, including out-of-bounds and range guards. All **3/3
 files passed**, with **0 failures and 0 timeouts**; each file took 199ms.
+
+These upstream files are plain scripts, so the Node runner's file-level
+clean-exit classification is the authoritative result. No source or upstream
+fixture change was made. The selector used the existing coordinator binary
+through `tools/integration/node_corpus_runner.py` with three bounded jobs and a
+30-second per-file timeout. No full corpus or workspace-wide test was run; the
+selector and raw runner output were removed after recording the result.
+
+## W224 Node Buffer write green cluster
+
+The bounded three-job Node selector covered generic encoding/range writes,
+Double big/little endian writes, and UInt big/little endian offset/OOB writes.
+All **3/3 files passed**, with **0 failures and 0 timeouts**; per-file
+durations were 200–201ms.
+
+These upstream files are plain scripts, so the Node runner's file-level
+clean-exit classification is the authoritative result. No source or upstream
+fixture change was made. The selector used the existing coordinator binary
+through `tools/integration/node_corpus_runner.py` with three bounded jobs and a
+30-second per-file timeout. No full corpus or workspace-wide test was run; the
+selector and raw runner output were removed after recording the result.
+
+## W225 Node Buffer read/string green cluster
+
+The bounded three-job Node selector covered basic numeric reads, `toString`
+range/coercion and empty boundaries, and JSON Buffer serialization. All **3/3
+files passed**, with **0 failures and 0 timeouts**; per-file durations were
+199–200ms.
 
 These upstream files are plain scripts, so the Node runner's file-level
 clean-exit classification is the authoritative result. No source or upstream
