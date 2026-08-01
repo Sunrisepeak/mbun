@@ -5,6 +5,7 @@
 
 ## 2026-08-01
 
+- W179 fresh Node stream pipeline probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：basic pipeline、listeners、empty-string、Duplex、async-iterator pipelines 全部通过；单文件耗时 165ms–1.183s。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W178 fresh Node stream iterator probe（3 jobs、复用现有 coordinator binary、无构建）**4/5 files pass、1 fail、0 timeout**：iterator push、sync/async sources、validation 通过；readable interop 唯一失败为 Buffer vs Uint8Array deep-strict identity/shape mismatch，停车为 typed-array interop owner。单文件耗时 265–365ms，未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W177 fresh Node stream encoding/buffer probe（3 jobs、复用现有 coordinator binary、无构建）**4/5 files pass、1 fail、0 timeout**：Readable HWM zero/default encoding、Writable clear buffer/null 全部通过；stream-wrap-encoding 唯一失败为 callback count mismatch，停车为 stream-wrap callback owner。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W176 fresh Node stream/Web strategy probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：Readable↔Web termination、Readable strategy option、Writable default encoding、stream default HWM 全部通过；单文件耗时 165–333ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
