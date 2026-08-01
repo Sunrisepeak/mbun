@@ -58,6 +58,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W108 | Bun Node-net constructor/server leaves | 5 | pre 2/5 green, 147 passed / 20 failed / 175 ran / 300 expects; post 2/5 green, 152 passed / 15 failed / 175 ran / 301 expects | issue #58; retain two green leaves, park node-net multi-owner failures and matcher-only gaps |
 | W109 | Node TLS constructor/default-option leaves | 5 | 3/5 pass; 1 fail; 1 timeout; isolated timeout reproduced at one job / 60s | park TLS pauseOnConnect propagation and silent socket-default timeout as separate owners |
 | W110 | Bun util low-coupling leaves | 5 | 5/5 green; 57 passed / 0 failed / 57 ran / 966 expects; no build | retain all five green leaves; no source owner |
+| W111 | Node child_process basic contract leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five green leaves; keep fork/IPC and timeout/kill owners separate |
 
 ## W96 delivered slice
 
