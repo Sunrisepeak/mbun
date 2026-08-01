@@ -86,6 +86,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W136 | Bun Web Encoding leaves | 5 | 4/5 green; 82 passed / 34 failed / 116 ran / 10777 expects; 0 timeout; no build | retain four encoding leaves; park CJK decoder behind missing legacy-label support |
 | W137 | Node path pure-contract leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five path leaves; no source owner |
 | W138 | Node os pure-contract leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five os leaves; no source owner |
+| W139 | Bun Web Abort leaves | 3 | 3/3 green; 15 passed / 0 failed / 15 ran / 27 expects; 0 timeout; no build | retain all three abort leaves; no source owner |
 
 ## W133 Bun.Terminal green cluster
 
@@ -183,6 +184,19 @@ coordinator binary through `tools/integration/node_corpus_runner.py` with
 three bounded jobs and a 30-second per-file timeout. No full corpus or
 workspace-wide test was run; the selector and raw runner output were removed
 after recording the result.
+
+## W139 Bun Web Abort green cluster
+
+The bounded three-job selector covered the base Abort contract, AbortController
+GC reason handling, and AbortSignal event-listener leak behavior. All **3/3
+files were green**, reaching **15 passed / 0 failed / 15 ran / 27 expects** with
+no timeout. Per-file durations were 298–800ms.
+
+No source or upstream fixture change was made. The selector used the existing
+coordinator binary through `tools/integration/bun_corpus_runner.py` with three
+bounded jobs, a 30-second per-file timeout, and missing Node modules allowed.
+No full corpus or workspace-wide test was run; the selector and raw runner
+output were removed after recording the result.
 
 ## W132 Node VM and WebStreams owner split
 

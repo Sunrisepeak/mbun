@@ -5,6 +5,7 @@
 
 ## 2026-08-01
 
+- W139 fresh Bun Web Abort cluster（3 jobs、复用现有 coordinator binary、无构建）**3/3 files green、15 passed、0 failed、15 ran、27 expects、0 timeout**：Abort 基础 contract、AbortController GC reason、AbortSignal listener leak 全部通过；单文件耗时 298–800ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W138 fresh Node os pure-contract cluster（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：checked-function、signal constants、EOL、homedir fallback、userinfo getter errors 全部通过；单文件耗时 199–349ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W137 fresh Node path pure-contract cluster（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：basename、dirname、extname、isabsolute、zero-length strings 全部通过；单文件耗时 164–200ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W136 fresh Bun Web Encoding probe（3 jobs、复用现有 coordinator binary、无构建）**4/5 files green、82 passed、34 failed、116 ran、10777 expects、0 timeout**：bad chunks、single-byte decoder、TextEncoder、TextEncoderStream 全部通过；CJK decoder 34 个 case 均因缺少 Shift_JIS/EUC-JP/Big5/EUC-KR/GBK/GB18030/ISO-2022-JP legacy encoding label 支持而失败，停车为宽编码 subsystem owner。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
