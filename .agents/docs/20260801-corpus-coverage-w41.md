@@ -218,6 +218,29 @@ the observed Linux limits; the coordinator owns the only root build.
 | W268 | Node DNS lookup/order/type leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain lookup promise stub, result-order controls, and resolveNs type guards; no source owner |
 | W269 | Node DNS lookup/resolver leaves | 3 | 2/3 pass; 1 fail; 0 timeout; no build | retain lookupService and malformed resolveAny guards; park invalid-hostname/all-mode sync validation owner |
 | W270 | Bun module/Buffer/DOMException leaves | 3 | 2/3 green; 8 passed / 1 failed / 9 ran / 44 expects; 0 timeout; no build | retain Buffer and DOMException leaves; park `node:missing` built-in error contract |
+| W271 | Bun Buffer/process/module leaves | 3 | 2/3 green; 9 passed / 5 failed / 14 ran / 21 expects; 0 timeout; no build | retain UTF-16 Buffer and Module options.paths; park process.nextTick input/args/order/repeat owners |
+
+## W271 Bun Buffer/process/module leaf probe
+
+The bounded three-job Bun selector covered `buffer-utf16.test.ts`,
+`process-nexttick.test.js`, and `module-resolve-filename-paths.test.js`. It
+measured **2/3 files green**, **9 passed / 5 failed / 14 ran / 21 expects**, and
+**0 runner timeouts**. The runner used the default bounded profile of **4G
+memory / 512 tasks**; per-file durations were 199–248ms.
+
+`buffer-utf16.test.ts` passed **1/1**, and
+`module-resolve-filename-paths.test.js` passed **6/6**, including package and
+relative resolution through `options.paths` plus invalid-paths validation.
+`process-nexttick.test.js` passed **2/7** and failed 5 tests: non-function
+input validation, callback argument forwarding, `process.nextTick` versus
+`queueMicrotask` ordering, and high-volume/repeated scheduling behavior. The
+AsyncLocalStorage interaction in that file passed. These are separate
+process-scheduler owners; no mixed fix was attempted.
+
+No source or upstream fixture change was made. The selector reused the
+coordinator binary through `tools/integration/bun_corpus_runner.py` with
+three bounded jobs, a 30-second per-file timeout, and missing Node modules
+allowed. No full corpus, build, or workspace-wide test was run.
 
 ## W270 Bun module/Buffer/DOMException leaf probe
 
