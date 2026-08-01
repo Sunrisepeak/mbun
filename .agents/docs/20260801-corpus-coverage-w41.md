@@ -138,6 +138,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W188 | Node Readable event/end leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five end/error/event/flow leaves; no source owner |
 | W189 | Node Readable readiness leaves | 5 | 5/5 pass; 4 fresh green + 1 prior guard reconfirmed; 0 fail; 0 timeout; no build | retain four newly measured leaves; keep no-unneeded-readable as a reconfirmed W115 guard |
 | W190 | Bun parser/API leaves | 5 | 5/5 green; 719/719 tests; 0 failed; 0 timeout; 5324 expects; no build | retain all five cron/INI/JSON5/JSONC/JSONL leaves; no source owner |
+| W191 | Bun util low-coupling leaves | 5 | 5/5 green; 105 passed / 0 failed / 106 ran / 1 skipped / 409 expects; 0 timeout; no build | retain all five password/hash/error/sleep/path leaves; no source owner |
 
 ## W133 Bun.Terminal green cluster
 
@@ -937,6 +938,20 @@ parsing, JSONC parsing, and JSONL parsing. All **5/5 files were green**, with
 **719/719 tests passed**, **0 failed**, **0 timed out**, and **5324 expects**.
 Per-file durations were 465ms–4.166s; the INI suite was the slowest at 4.166s
 but remained well inside the 30-second bound.
+
+No source or upstream fixture change was made. The selector used the existing
+coordinator binary through `tools/integration/bun_corpus_runner.py` with three
+bounded jobs, a 30-second per-file timeout, and missing Node modules allowed.
+No full corpus or workspace-wide test was run; the selector and raw runner
+output were removed after recording the result.
+
+## W191 Bun util green cluster
+
+The bounded three-job selector covered password hashing, xxHash vectors, native
+error name/code preservation, `sleepSync`, and invalid-input `pathToFileURL`.
+All **5/5 files were green**, with **105 passed**, **0 failed**, **106 ran**,
+**1 skipped**, and **409 expects**. `password.test.ts` was the slowest file at
+8.789s; the other files took 198–264ms, with no timeout.
 
 No source or upstream fixture change was made. The selector used the existing
 coordinator binary through `tools/integration/bun_corpus_runner.py` with three
