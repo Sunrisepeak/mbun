@@ -253,6 +253,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W303 | Bun/Deno Fetch/URL API leaves | 5 | 5/5 green; 80 passed / 0 failed / 85 ran / 245 expects; 0 timeout; no build | retain all five Fetch/URL guards; no source owner |
 | W304 | Node events/path continuation leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build | retain AbortListener, getEventListeners, relative, and zero-length path guards; park uncaughtException stack rendering owner |
 | W305 | Bun/Deno Event/Performance/URL/crypto leaves | 5 | 4/5 green; 63 passed / 0 failed / 68 ran / 287 expects; 1 all-skipped; 0 timeout; no build | retain four green guards; record Deno V8 error file as an all-skipped corpus entry |
+| W306 | Bun/Deno abort/encoding/Event/Fetch body leaves | 5 | 5/5 green; 46 passed / 0 failed / 51 ran / 118 expects; 5 skipped; 0 timeout; no build | retain all five files; keep encoding and Fetch body skips as bounded capability gaps |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -272,6 +273,30 @@ not a source owner. There were no source or upstream-fixture changes.
 The selector used the bounded five-job Bun runner with a 30-second per-file
 timeout, the existing coordinator binary, and missing Node modules allowed.
 No full corpus, build, or workspace-wide test was run.
+
+## W306 Bun/Deno abort/encoding/Event/Fetch body leaf probe
+
+The bounded five-job Bun selector covered five previously unrecorded Deno
+leaves: `abort-controller`, `encoding`, `custom-event`, `event-target`, and
+Fetch `body`. It measured **5/5 green files**, **46 passed / 0 failed / 51
+ran / 118 expects**, and **0 runner timeouts**. Five individual tests were
+skipped: two in `encoding`, one in `event-target`, and two multipart cases in
+Fetch `body`; no test failed.
+
+Per-file results were: `abort-controller` **6 / 0 / 6 / 15** with no skips;
+`encoding` **21 / 0 / 23 / 41** with 2 skips; `custom-event` **2 / 0 / 2 /
+8** with no skips; `event-target` **14 / 0 / 15 / 43** with 1 skip; and Fetch
+`body` **3 / 0 / 5 / 11** with 2 skips. Durations were **200–250 ms** per
+file. The five files remain useful green coverage; the skipped cases are
+recorded as capability/test-environment gaps rather than source failures.
+
+This was a measurement-only wave: no source or upstream-fixture changes, no
+full corpus, and no workspace-wide build. The existing coordinator binary
+was used with a 30-second per-file timeout and missing Node modules allowed.
+Resource recheck after the run showed about **44 GiB available memory**, only
+about **32 MiB free swap**, and about **17 GiB free disk at 99% usage**; the
+temporary runner output was therefore scheduled for immediate cleanup and no
+build was started.
 
 ## W304 Node events/path continuation leaf probe
 
