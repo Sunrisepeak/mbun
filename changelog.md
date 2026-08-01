@@ -5,6 +5,14 @@
 
 ## 2026-08-02
 
+- W403 Node HTTP/2 delayed request/GOAWAY ready-edge source fix：修复 loopback `net.connect()` 在同一
+  microtask 发布连接、抢在测试 `setImmediate(client.close())` 之前的问题；cleartext HTTP/2 ready
+  edge 现在延迟到下一轮 I/O，delayed-request 的 `ERR_HTTP2_GOAWAY_SESSION` 时序与 Node 一致。
+  focused 文件从 **1/1 failure** 到 **1/1 pass**；W403 五文件 HTTP/2 selector **5/5 pass、0 fail、0
+  timeout**；W402 HTTP/2 回归 **5/5 pass**；Bun fake-timer guard **4 green + 1 no-tests、43 passed、0
+  failed、43 ran、98 expects**；三次 serial release build **58.98s、59.16s、59.29s**，后者为最终验证状态。
+  未修改 upstream fixture、未跑全量 corpus。
+
 - W402 Node HTTP/2 `unknownProtocol` Duplex identity source fix：HTTP/2-only TLS server 的
   `unknownProtocol` event 现在传出同时满足 `instanceof stream.Duplex` 的自定义 `net.Socket`，保留
   reactor-specific socket methods。focused 文件从 **1/1 failure** 到 **1/1 pass**；五文件 HTTP/2

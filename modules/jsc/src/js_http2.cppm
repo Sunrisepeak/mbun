@@ -1875,7 +1875,18 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
         delete netOpts.signal;
         const sock = typeof net.connect === "function" ? net.connect(netOpts) : new net.Socket();
         this._rawSocket = sock;
-        sock.on("connect", () => { self.alpnProtocol = "h2c"; self._onSocketReady(); });
+        // net.connect() can report a loopback connection synchronously in the
+        // mbun transport. Node never exposes Http2Session#connect from inside
+        // http2.connect(), though: callers must be able to attach the
+        // listener before the handshake runs. Deferring the ready edge by an
+        // I/O turn keeps request()+close() in the pre-connect state, where Node
+        // reports ERR_HTTP2_GOAWAY_SESSION for the pending request
+        // (test-http2-goaway-delayed-request).
+        sock.on("connect", () => {
+          self.alpnProtocol = "h2c";
+          const nextTurn = typeof G.setImmediate === "function" ? G.setImmediate : G.queueMicrotask;
+          nextTurn(() => self._onSocketReady());
+        });
         sock.on("data", (d) => self._onData(d));
         sock.on("error", (e) => self._onSocketError(e));
         sock.on("close", () => self._onSocketClose());

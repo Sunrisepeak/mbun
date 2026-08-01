@@ -348,6 +348,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W400 | Node HTTP/2 error-code mapping revalidation | 5 | five-file candidate selector 5/5 pass, 0 fail, 0 timeout | inventory entry is stale for this slice; no source owner |
 | W401 | Node fs flush revalidation | 5 | `writeFile/appendFile` flush pair plus three fs guards 5/5 pass, 0 fail, 0 timeout | inventory entry is stale for this slice; no source owner |
 | W402 | Node HTTP/2 `unknownProtocol` Duplex identity source fix | 5 | baseline selector 4/5 pass + 1 fail; focused target 1/1 fail → 1/1 pass; post selector 5/5 pass, 0 fail, 0 timeout; Bun fake-timer regression 5/5 green, 8 passed / 0 failed / 8 ran / 10 expects; serial release build 59.29s | connect the custom `net.Socket` prototype to `stream.Duplex.prototype` while preserving its reactor-specific methods; no upstream fixture change |
+| W403 | Node HTTP/2 delayed request/GOAWAY ready-edge source fix | 5 | baseline selector 4/5 pass + 1 fail; focused target 1/1 fail → 1/1 pass; post selector 5/5 pass, 0 fail, 0 timeout; W402 HTTP/2 regression 5/5 pass, 0 fail, 0 timeout; Bun fake-timer guard 4 green + 1 no-tests, 43 passed / 0 failed / 43 ran / 98 expects; serial release builds 58.98s + 59.16s + 59.29s | defer cleartext HTTP/2 ready handling to the next I/O turn so `request()` + `close()` preserves Node's `ERR_HTTP2_GOAWAY_SESSION` timing; no upstream fixture change |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -1861,6 +1862,28 @@ from **4/5 pass, 1 fail** to **5/5 pass, 0 fail, 0 timeout**. The five-file Bun
 fake-timer regression remained **5/5 green, 8 passed, 0 failed, 8 ran, 10
 expects**. The serial release build took **59.29s**. No upstream fixture
 changed and no full corpus/workspace-wide test ran.
+
+## W403 Node HTTP/2 delayed request/GOAWAY ready-edge source fix
+
+The W403 five-file HTTP/2 state selector initially measured **4/5 passes, 1
+failure, and 0 timeouts**. The isolated failure was
+`test-http2-goaway-delayed-request.js`: mbun's loopback `net.connect()` can
+publish `connect` during the same microtask that completes the native dial, so
+the HTTP/2 handshake ran before the test's `setImmediate(() => client.close())`.
+The pending request was therefore treated as ready and never received Node's
+required `ERR_HTTP2_GOAWAY_SESSION` error.
+
+`js_http2.cppm` now defers the cleartext HTTP/2 ready edge through
+`setImmediate`, preserving Node's observable ordering while leaving the
+reactor-specific socket path unchanged. The focused file moved from **1/1
+failure** to **1/1 pass**. The W403 selector moved to **5/5 pass, 0 failure, 0
+timeout**. The W402 five-file HTTP/2 regression remained **5/5 pass**, with **0
+failure and 0 timeout**. The Bun fake-timer guard measured **4 green + 1
+no-tests**, with **43 passed, 0 failed, 43 ran, and 98 expects**. Three serial
+release builds took **58.98s**, **59.16s**, and **59.29s**; the latter is the
+final verified source state after the stale-binary guard required a rebuild for
+a comment-only source mtime change. No upstream fixture changed and no full
+corpus/workspace-wide test ran.
 
 ## W401 Node fs flush revalidation
 
