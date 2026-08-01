@@ -787,6 +787,25 @@ surface on Linux:
   21 passed, 0 failed, 21 ran, 44 expects**. The upstream fixture remains
   read-only; no full corpus or workspace-wide build was started.
 
+### W73 Node crypto leaf coverage and checkPrime snapshot owner
+
+- A fresh five-file Node crypto probe used **5 bounded jobs** and reused the
+  current Linux binary before the fix. It measured **4 green files, 33
+  passed, 2 failed, 35 ran, 85 expects**; HMAC algorithm validation,
+  invalid-this handling, lazy hash, and HKDF callback-null behavior were
+  already green.
+- Both failures were in `crypto-random.test.ts`: sync and async `checkPrime`
+  must snapshot candidate bytes before evaluating the `options.checks` getter,
+  and must read that getter exactly once. Issue [#49](https://github.com/Sunrisepeak/mbun/issues/49)
+  owns this single `crypto_asym.cppm` argument-order owner.
+- `b2b5bae` copies normalized candidate bytes before option evaluation and
+  stores `options.checks` in one local read. Root release build completed in
+  **60.40s**. The same five-file bounded regression is now **5/5 files green,
+  35 passed, 0 failed, 35 ran, 87 expects**.
+- No upstream fixture changes, no full corpus, and no workspace-wide build
+  were performed. Keep the five green crypto leaves as guards and choose the
+  next fresh one-owner row.
+
 ### W59 Node buffer leaf sample
 
 - W59 使用 Node corpus runner 的默认 bounded profile、**3 jobs**。首批五个文件为

@@ -5,6 +5,12 @@
 
 ## 2026-08-01
 
+- W73 fresh Node crypto probe 先以 **5 jobs** 测得 **4 green files、33 passed、2 failed、35
+  ran、85 expects**；HMAC、invalid-this、lazyhash、HKDF 全绿，`crypto-random` 的 sync/async
+  `checkPrime` 失败都来自同一参数快照 owner。Issue [#49](https://github.com/Sunrisepeak/mbun/issues/49)
+  的最小修复由 `b2b5bae` 落地：先复制 candidate bytes，再只读取一次 `options.checks`；root
+  release build **60.40 秒**。同一五文件 bounded regression 现为 **5/5 files green、35
+  passed、0 failed、35 ran、87 expects**。未修改上游 fixture，未跑全量 corpus。
 - W72 fresh Bun child-process probe 先以 **5 jobs** 测得 **4 green files、20 passed、1
   failed、21 ran、44 expects**，根因定位到未 `listen()` 的 `net.Server`（`_fd === -1`）传给
   `child.send()` 时错误进入 `ERR_INVALID_HANDLE_TYPE`；Node 对照为返回 `true` 且 callback
