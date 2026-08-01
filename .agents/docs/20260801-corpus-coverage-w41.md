@@ -277,6 +277,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W327 | Node timer clear/refresh/tampering leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build; 5 fresh | retain all five timer guards; no source owner |
 | W328 | Node Buffer deprecation/encoding/zero-fill leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build; 5 fresh | retain all five Buffer guards; no source owner |
 | W329 | Node HTTP/HTTPS/MessageEvent/WebCrypto/console leaves | 5 | 3/5 pass; 2 fail; 0 timeout; no build; 5 fresh | retain HTTP/HTTPS/MessageEvent; park WebCrypto class identity and global-console warning-order owners |
+| W330 | Node perf_hooks/performance contract leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build; 5 fresh | retain timerify/global/measure guards; park resource-timing BigInt validation owner |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -792,6 +793,29 @@ source or upstream-fixture changes, full corpus, or workspace-wide build were
 made. After the run, resources showed about **46 GiB available memory**, **2.3
 MiB free swap**, and **17 GiB free disk at 99% usage**. Temporary runner output
 is cleaned immediately and the next wave remains resource-gated.
+
+## W330 Node perf_hooks/performance contract leaves
+
+The bounded five-job Node selector covered five fresh `perf_hooks` and
+Performance files after filename/stem and semantic-owner review:
+`test-perf-hooks-timerify-invalid-args.js`,
+`test-perf-hooks-timerify-return-value.js`, `test-performance-global.js`,
+`test-performance-measure-detail.js`, and
+`test-performance-resourcetimingbuffersize.js`. The runner measured **4/5
+file-level passes**, **1 failure**, **0 runner timeouts**, and **199–201 ms** per
+file. The Node runner reports file-level status only; no assertion-level pass
+total is inferred.
+
+The two `timerify` guards, global `performance` binding, and `measure` detail
+observer guard passed and are retained. The resource-timing file stopped at
+the first invalid-input assertion because
+`performance.setResourceTimingBufferSize(1n)` did not throw the expected
+BigInt `TypeError` with `ERR_INVALID_ARG_TYPE`; this is parked as one
+resource-timing argument-validation owner. No source or upstream-fixture
+changes, full corpus, or workspace-wide build were made. After the run,
+resources showed about **46 GiB available memory**, **0 B free swap**, and
+**16 GiB free disk at 99% usage**. Temporary runner output is cleaned
+immediately and the next wave remains resource-gated.
 
 ## Coverage novelty audit correction after W323
 
