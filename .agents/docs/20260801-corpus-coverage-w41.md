@@ -111,6 +111,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W161 | Bun WebStreams leak/fast-path leaves | 4 | 4/4 green; 15 passed / 0 failed / 15 ran / 23 expects; 0 timeout; no build | retain all four leaves; mark native-source-onclose as slow but bounded |
 | W162 | Bun WebStreams compression/large surface | 3 | 1/3 green; 159 passed / 13 failed / 172 ran / 350 expects; 0 timeout; no build | retain compression 11/11; park streams-leak and streams.test multi-owner failures |
 | W163 | Node fs pure-contract leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build | retain constants/mkdir/mkdtemp/open-flags; park fs.promises.access stack-shape owner |
+| W164 | Node fs I/O pure-contract leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five read/write leaves; no source owner |
 
 ## W133 Bun.Terminal green cluster
 
@@ -546,6 +547,18 @@ open-flags behavior. It reached **4/5 files passed**, with **1 failure and 0
 timeouts**. Constants, mkdir, mkdtemp, and open-flags stayed green. The access
 failure was limited to the expected async stack shape for
 `fs.promises.access()` and is parked as an error-stack owner.
+
+No source or upstream fixture change was made. The selector used the existing
+coordinator binary through `tools/integration/node_corpus_runner.py` with
+three bounded jobs and a 30-second per-file timeout. No full corpus or
+workspace-wide test was run; the selector and raw runner output were removed
+after recording the result.
+
+## W164 Node fs I/O green cluster
+
+The bounded three-job selector covered read, zero-length read, optional-argument
+writeSync, appendFileSync, and the readFile UTF-8 fast path. All **5/5 files
+passed**, with **0 failures and 0 timeouts**. Per-file durations were 165–265ms.
 
 No source or upstream fixture change was made. The selector used the existing
 coordinator binary through `tools/integration/node_corpus_runner.py` with
