@@ -5,6 +5,11 @@
 
 ## 2026-08-01
 
+- W89 fresh Bun Node-inspector probe（5 jobs、复用 W85 binary、无构建）测得 **4/5 files green、34
+  passed、27 failed、64 ran、131 expects**：`inspector.test` **5/5**、diagnostics channel **6/9**、
+  perf hooks **8/8**、timers promises **4/4**；`inspector-profiler` 为 **11 passed / 27 failed / 38 ran**。
+  失败跨 Session 状态、Profiler enable/start/stop 和 unsupported-method，源码核对确认当前
+  `process.features.inspector=false` 且缺少 inspector/profiler 子系统，停车不做猜测性修复。
 - W88 fresh Bun Node-fs directory/Stats leaf probe（5 jobs、复用 W85 binary、无构建）确认 **5/5
   files green、52 passed、0 failed、55 ran、138 expects**：`dir` **23/23**、`fs-mkdir` **21/24**、
   async-iterator writeFile **2/2**、Stats constructor **3/3**、Stats truncate **3/3**。这是对旧

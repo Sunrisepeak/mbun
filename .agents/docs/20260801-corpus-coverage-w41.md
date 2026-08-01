@@ -36,6 +36,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W86 | Bun Buffer completion guards | 5 | 4/5 green; 25 passed / 6 failed / 31 ran | park concat multi-owner; preserve four green guards |
 | W87 | Bun Node-fs leaves | 5 | 5/5 green; 46 passed / 0 failed / 70 ran / 92 expects | fresh confirmation; no source owner |
 | W88 | Bun Node-fs directory/Stats leaves | 5 | 5/5 green; 52 passed / 0 failed / 55 ran / 138 expects | fresh confirmation of narrow fs leaves; no source owner |
+| W89 | Bun Node-inspector probe | 5 | 4/5 green; 34 passed / 27 failed / 64 ran / 131 expects | park inspector-profiler behind missing inspector/profiler subsystem |
 
 ## Delivered slice
 
@@ -1053,6 +1054,23 @@ surface on Linux:
 - No full corpus or workspace-wide build was performed. The next route remains
   a fresh one-owner Bun/Node leaf, with 3–5 bounded lanes while swap and disk
   headroom remain low.
+
+### W89 Bun Node-inspector probe parked
+
+- A fresh five-file Bun standard-module probe reused the W85 binary with **5
+  bounded jobs** and no build. It measured **4/5 files green, 34 passed, 27
+  failed, 64 ran, 131 expects**.
+- `inspector.test` was **5/5**, diagnostics channel **6/9**, perf hooks **8/8**,
+  and timers promises **4/4**. `inspector-profiler` reached **11 passed / 27
+  failed / 38 ran**; the failures cover Session connected-state checks,
+  profiler enable/start/stop return and state contracts, and unsupported-method
+  errors.
+- A narrow source check confirmed the current runtime advertises
+  `process.features.inspector` as false and has no inspector/profiler
+  implementation owner in the JSC builtins. This is a missing subsystem
+  boundary, not a safe error-text or one-method patch; it is parked without a
+  speculative issue or source change. No upstream fixture changes, full corpus,
+  or workspace-wide build were performed.
 
 ### W59 Node buffer leaf sample
 
