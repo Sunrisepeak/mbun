@@ -128,6 +128,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W178 | Node stream iterator leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build | retain four iterator leaves; park Buffer/Uint8Array readable-interop owner |
 | W179 | Node stream pipeline leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five pipeline leaves; no source owner |
 | W180 | Node stream advanced leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build | retain compose/consumers/duplexpair/promises; park finished callback owner |
+| W181 | Node Readable/Web BYOB leaves | 4 | 4/4 pass; 0 fail; 0 timeout; no build | retain all four BYOB/Web bridge leaves; no source owner |
 
 ## W133 Bun.Terminal green cluster
 
@@ -795,6 +796,19 @@ DuplexPair, and finished behavior. It reached **4/5 files passed**, with
 **1 failure and 0 timeouts**. Compose, consumers, DuplexPair, and promises
 stayed green. The finished leaf failed only on an expected callback count and
 is parked as a separate finished-callback owner.
+
+No source or upstream fixture change was made. The selector used the existing
+coordinator binary through `tools/integration/node_corpus_runner.py` with
+three bounded jobs and a 30-second per-file timeout. No full corpus or
+workspace-wide test was run; the selector and raw runner output were removed
+after recording the result.
+
+## W181 Node Readable/Web BYOB green cluster
+
+The bounded three-job selector covered Readable-to-Web BYOB behavior, BYOB
+termination, the Readable-to-Web module path, and the server-response bridge.
+All **4/4 files passed**, with **0 failures and 0 timeouts**. Per-file
+durations were 200ms–2.259s.
 
 No source or upstream fixture change was made. The selector used the existing
 coordinator binary through `tools/integration/node_corpus_runner.py` with
