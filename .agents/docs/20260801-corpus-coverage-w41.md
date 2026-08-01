@@ -574,14 +574,18 @@ surface on Linux:
 
 ### W59 Node buffer leaf sample
 
-- W59 使用 Node corpus runner 的默认 bounded profile、**3 jobs**，无构建、无全量
-  corpus。首批 `test-buffer-ascii`、`test-buffer-badhex`、`test-buffer-compare`、
-  `test-buffer-isascii` 为 **4/5 file-level pass**；相邻
-  `test-buffer-arraybuffer`、`test-buffer-bytelength`、`test-buffer-equals`、
-  `test-buffer-includes`、`test-buffer-indexof` 为 **5/5 pass**。
-- 合计 **10 files、9 pass、1 fail**。唯一失败 `test-buffer-constants.js` 的断言是
-  `MAX_STRING_LENGTH + 1` 应抛 `RangeError`，当前运行时未抛；证据指向通用 JSC
-  String capacity，而非 Buffer leaf API，停车避免为了单文件改全局字符串语义。
+- W59 使用 Node corpus runner 的默认 bounded profile、**3 jobs**。首批五个文件为
+  **4/5 pass**，第二批五个文件为 **5/5 pass**，第三批五个文件在修复前为
+  **4/5 pass**；因此完整样本修复前为 **13/15 pass、2 failed**。
+- Issue [#43](https://github.com/Sunrisepeak/mbun/issues/43) 负责同一
+  `Buffer.prototype.fill` 入口的三个 Node contract：hex 奇数/非法字符的
+  `ERR_INVALID_ARG_VALUE`、非字符串 encoding 的 `ERR_INVALID_ARG_TYPE`，以及
+  伪造 `length` 时的 `ERR_BUFFER_OUT_OF_BOUNDS`。修复仅位于
+  `modules/jsc/src/builtins/node_buffer_extra.cppm`，上游测试保持只读。
+- root release build 成功，耗时 **60.70 秒**；focused fill + 9 guards 为
+  **10/10 files pass**，完整 W59 复测为 **14/15 files pass**。唯一失败仍是
+  `test-buffer-constants.js` 的通用 JSC String capacity 边界，不归入 Buffer.fill
+  owner。未跑全量 corpus，未启动 workspace-wide build。
 
 ### W58 JSON5/YAML parser sample
 

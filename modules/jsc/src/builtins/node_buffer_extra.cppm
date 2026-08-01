@@ -98,6 +98,9 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
       e.code = "ERR_UNKNOWN_ENCODING";
       return e;
     };
+    const typedArrayLengthGetter = Object.getOwnPropertyDescriptor(
+      Object.getPrototypeOf(Uint8Array.prototype), "length").get;
+    const typedArrayLength = (value) => typedArrayLengthGetter.call(value);
     // WTF::String::MaxLength (== INT32_MAX). Decoding a buffer whose output
     // would exceed it must throw ERR_STRING_TOO_LONG *before* any allocation
     // (jsc/bindings/JSBuffer.cpp:jsBufferToStringFromBytes); otherwise a 2 GiB
@@ -600,6 +603,7 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
       // write extent. The real write range is re-clamped against a single
       // post-coercion length read right before the fill (TOCTOU guard).
       const limit = buf.length;
+      if (limit !== typedArrayLength(buf)) throw errBufferOOB();
 
       // Node only reinterprets a string offset/end as the encoding when the
       // fill value is itself a string; the offset-slot branch also drops end.
@@ -614,15 +618,15 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
         }
       }
 
-      // 1. Encoding parse FIRST (string value only). Coercing an object
-      // encoding runs its toString — the first user-JS-visible call, which
-      // may detach/resize buf; the post-coercion clamp below catches that.
+      // 1. Encoding parse FIRST (string value only). Node rejects non-string
+      // encoding values rather than coercing them; the post-coercion clamp
+      // below still catches user-visible effects from the fill value itself.
       let normalized = "utf8";
       if (typeof value === "string") {
         let encStr;
         if (encoding === undefined || encoding === null) encStr = undefined;
         else if (typeof encoding === "string") encStr = encoding.length ? encoding : undefined;
-        else encStr = String(encoding);
+        else throw errArgType("encoding", "string", encoding);
         if (encStr !== undefined) {
           normalized = normalizeEncoding(encStr);
           if (normalized === undefined) throw errUnknownEncoding(encStr);
@@ -649,6 +653,17 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
       // 4. Value coercion per branch (may detach/resize via valueOf/toString).
       let pattern;
       if (typeof value === "string") {
+        if (normalized === "hex") {
+          const invalidHex = () => {
+            const err = new TypeError("The argument 'value' is invalid");
+            err.code = "ERR_INVALID_ARG_VALUE";
+            return err;
+          };
+          if ((value.length & 1) !== 0) throw invalidHex();
+          for (let i = 0; i < value.length; i++) {
+            if (hexVal(value.charCodeAt(i)) < 0) throw invalidHex();
+          }
+        }
         if (value.length === 0) pattern = 0;
         else if (value.length === 1 && (normalized === "utf8" || normalized === "latin1" || normalized === "binary" || normalized === "ascii")) {
           const code = value.charCodeAt(0);
@@ -675,6 +690,7 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
       // 5. Post-coercion clamp: re-read length once, after every side effect,
       // and fold a detach (length 0) or shrink into the range.
       const postLimit = buf.length;
+      if (postLimit !== typedArrayLength(buf)) throw errBufferOOB();
       if (off > postLimit) off = postLimit;
       if (e > postLimit) e = postLimit;
       if (off >= e) return buf;

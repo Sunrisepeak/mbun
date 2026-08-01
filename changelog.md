@@ -5,6 +5,13 @@
 
 ## 2026-08-01
 
+- `#43` 修复 Node `Buffer.prototype.fill` 的三个同入口 contract：hex 填充值现在
+  拒绝奇数长度/非法字符并返回 `ERR_INVALID_ARG_VALUE`，非字符串 encoding 返回
+  `ERR_INVALID_ARG_TYPE`，伪造 `length` 与 TypedArray 实长不一致时返回
+  `ERR_BUFFER_OUT_OF_BOUNDS`。root release build **60.70 秒**；focused fill + 9
+  Buffer guards **10/10 pass**，完整 W59 15 文件样本由 **13/15** 提升为
+  **14/15 pass**。剩余 `test-buffer-constants.js` 是独立 JSC String capacity
+  边界，未扩大为全局 String 修改；未跑全量 corpus。
 - W59 Node buffer leaf sample（默认 bounded profile、**3 jobs**，无构建/全量）测得
   首批 `test-buffer-ascii`、`badhex`、`compare`、`isascii` **4/5 pass**，相邻
   `arraybuffer`、`bytelength`、`equals`、`includes`、`indexof` **5/5 pass**；合计
