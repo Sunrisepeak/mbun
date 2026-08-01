@@ -68,6 +68,15 @@
   目标文件 **1/1 pass**，W356 selector **2/4 pass、1 fail、1 timeout**，W355 五文件
   回归 **5/5 pass**。剩余 unknownProtocol `Duplex` 身份和 TLS socket timeout 分别
   停车，未修改 `compat/`、未跑全量 corpus。
+- W357 Node HTTP/2 error-code mapping leaf probe：inventory 中六个真实文件全部
+  **6/6 pass、0 fail、0 timeout**（五个 bounded jobs 加一个单文件边界复测），确认该
+  条目 stale；无 source/fixture 改动，未跑全量 corpus。
+- W358 Node TLS session-ticket/resumption source fix：初始五文件 **3/5 pass**；
+  `modules/jsc/src/js_tls_live.cppm` 过滤 resumed connection 的错误 session event，
+  `modules/tls/src/openssl.cpp` 稳定首个 issued/offered ticket 的返回值。最终原 selector
+  **4/5 pass**，三文件 follow-up **2/3 pass**，唯一两个失败分别停车在 cluster session
+  sharing/OpenSSL code 和 HTTPS Agent alt-name 文案；W355 回归 **5/5 pass**。最终增量
+  release rebuild **6.04s**，未修改 `compat/`、未跑全量 corpus。
 
 ## 2026-08-01
 

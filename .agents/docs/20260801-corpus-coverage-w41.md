@@ -303,6 +303,8 @@ the observed Linux limits; the coordinator owns the only root build.
 | W354 | Node fs FileHandle pull/writer/error leaves | 5 | 5/5 pass; 0 fail; 0 timeout; one bounded five-job runner | retain pull/pullSync/writer/aggregate/close error guards; no source owner |
 | W355 | Node TLS client-auth verification source fix | 5 Node + 5 Node regression | pre 4/5 pass with certificate-error mismatches; post target 5/5 pass and W348 regression 5/5 pass; 0 timeout; two serial release rebuilds for final source minimization | normalize server-side client-chain errors, accept trusted PEM certificate entries, and surface late TLS1.3 fatal alerts; no upstream-fixture change |
 | W356 | Node HTTP/2 TLS servername authority owner | 4 | pre 1/4 pass, 2 fail, 1 timeout; post focused authority file 1/1 pass and selector 2/4 pass, 1 fail, 1 timeout; one release rebuild; W355 regression 5/5 pass | include `options.servername` in the client `:authority`; park unknownProtocol `Duplex` identity and TLS socket timeout as separate owners |
+| W357 | Node HTTP/2 error-code mapping leaf probe | 6 | 6/6 pass; 0 fail; 0 timeout; no build; six fresh files | retain six `ERR_HTTP2_*` mapping guards; inventory entry is stale; no source owner |
+| W358 | Node TLS session-ticket/resumption source fix | 8 Node + 5 Node regression | pre 3/5 pass; post session target 4/5 pass and follow-up 2/3 pass; 2 independent failures parked; 0 timeout; two incremental release builds; W355 regression 5/5 pass | suppress resumed-session event forwarding and stabilize first/offered ticket reporting; park cluster session sharing and HTTPS Agent message owners |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -1384,6 +1386,38 @@ file measured **1/1 pass**. The complete W356 selector measured **2/4 passes**,
 separate owners rather than mixed into this fix. The current W355 five-file
 regression remained **5/5 passes**. No full corpus or workspace-wide test was
 run.
+
+## W357 Node HTTP/2 error-code mapping leaf probe
+
+The fresh inventory family covered six HTTP/2 files whose recorded cause was
+mechanical `ERR_HTTP2_*` mapping. Five bounded jobs measured **5/5 passes**, and
+the sixth file's bounded single-file run also passed. The complete family is
+therefore **6/6 file-level passes**, **0 failures**, and **0 timeouts**. The
+inventory entry is stale for these files; no source change or upstream fixture
+change was justified, and no full corpus was run.
+
+## W358 Node TLS session-ticket/resumption source fix
+
+The first five-file session/ticket selector measured **3/5 passes**. The
+`test-tls-ticket.js` failure was isolated with event counts: resumed TLS
+connections were forwarding a newly issued ticket as a new `session` event,
+and `getTLSTicket()` could move from the first ticket to a later TLS 1.3 ticket.
+The cluster file also exposed independent cross-process session sharing and
+OpenSSL error-code owners, so it was not mixed into the fix.
+
+The source fix spans `modules/jsc/src/js_tls_live.cppm` and
+`modules/tls/src/openssl.cpp`: resumed connections no longer forward their
+post-handshake ticket as a new-session event; the native layer caches the first
+issued ticket and the ticket offered for a resumed handshake, and
+`getTLSTicket()` returns the stable Node-compatible value. No upstream fixture
+or `compat/` assertion changed.
+
+After the final incremental release rebuild (**6.04 seconds**), the original
+session selector measured **4/5 passes**, with only the independent cluster
+file failing. Three additional fresh HTTPS/session files measured **2/3
+passes**; the remaining failure is an HTTPS Agent certificate alt-name message
+owner. The current W355 TLS verification regression remained **5/5 passes**.
+No full corpus or workspace-wide test was run.
 
 ## Coverage novelty audit correction after W323
 

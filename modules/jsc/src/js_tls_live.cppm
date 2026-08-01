@@ -542,7 +542,14 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
       // point JS can observe: nothing cached before the first event (so
       // getSession() is still the live handshake session, the TLS 1.3 dummy
       // included), then the session that event carried.
-      transport.on("session", (session) => { self._lastSession = session; self.emit("session", session); });
+      transport.on("session", (session) => {
+        // Node emits `session` only for a newly established session. OpenSSL
+        // may issue a post-handshake ticket after a resumed connection too,
+        // but forwarding that ticket makes every resumed socket look new.
+        if (self._sessionReused) return;
+        self._lastSession = session;
+        self.emit("session", session);
+      });
       if (self._sessionWanted) transport._sessionWanted = true;
       // node's TLSSocket is a net.Socket over a real connection, so it emits
       // 'connect' when the TCP leg lands (before the handshake) and 'ready'

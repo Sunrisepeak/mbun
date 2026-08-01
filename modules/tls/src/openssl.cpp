@@ -175,6 +175,14 @@ struct TlsChannel::Impl {
     // ceiling is only ever reached by a peer issuing tickets in a loop.
     std::vector<std::vector<std::uint8_t>> newSessions_ {};
     static constexpr std::size_t kNewSessionMax {16};
+    // The ticket offered for a resumed client handshake. OpenSSL may replace
+    // SSL_get_session() with a freshly issued post-handshake ticket, while
+    // Node's getTLSTicket() continues to expose the ticket that was reused.
+    std::vector<std::uint8_t> resumedTicket_ {};
+    // The first ticket issued on this connection. OpenSSL may advance the
+    // current SSL_SESSION when a later TLS 1.3 ticket arrives, but Node keeps
+    // the ticket observed by the first `session` callback stable.
+    std::vector<std::uint8_t> firstTicket_ {};
     // SERVER: the per-servername credentials the servername callback picks from.
     // Kept on the Impl (not in the by-value Config setup_ received) because the
     // callback runs long after setup_ returned, inside SSL_do_handshake.
@@ -199,6 +207,13 @@ struct TlsChannel::Impl {
         unsigned char* out {der.data()};
         if (::i2d_SSL_SESSION(session, &out) <= 0) return 0;
         self->newSessions_.push_back(std::move(der));
+        if (self->firstTicket_.empty()) {
+            const unsigned char* ticket {nullptr};
+            std::size_t ticketLen {0};
+            ::SSL_SESSION_get0_ticket(session, &ticket, &ticketLen);
+            if (ticket != nullptr && ticketLen > 0)
+                self->firstTicket_.assign(ticket, ticket + ticketLen);
+        }
         return 0;
     }
 
@@ -773,6 +788,12 @@ struct TlsChannel::Impl {
                 SSL_SESSION* prior {::d2i_SSL_SESSION(
                     nullptr, &p, static_cast<long>(config.sessionDer.size()))};
                 if (prior != nullptr) {
+                    const unsigned char* ticket {nullptr};
+                    std::size_t ticketLen {0};
+                    ::SSL_SESSION_get0_ticket(prior, &ticket, &ticketLen);
+                    if (ticket != nullptr && ticketLen > 0) {
+                        resumedTicket_.assign(ticket, ticket + ticketLen);
+                    }
                     ::SSL_set_session(ssl_, prior);
                     ::SSL_SESSION_free(prior);
                 } else {
@@ -1511,6 +1532,10 @@ std::vector<std::uint8_t> TlsChannel::tls_ticket() const {
     if (impl_->ssl_ == nullptr) {
         return out;
     }
+    if (::SSL_session_reused(impl_->ssl_) == 1 && !impl_->resumedTicket_.empty()) {
+        return impl_->resumedTicket_;
+    }
+    if (!impl_->firstTicket_.empty()) return impl_->firstTicket_;
     SSL_SESSION* session {::SSL_get_session(impl_->ssl_)};
     if (session == nullptr) {
         return out;
