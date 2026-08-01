@@ -911,6 +911,19 @@ surface on Linux:
 - No upstream fixture changes, no full corpus, and no workspace-wide build
   were performed.
 
+### W81 Node console/zlib leaf probe parked on mixed zlib failures
+
+- A fresh five-file Node console/zlib probe used **5 bounded jobs** and reused
+  the current Linux binary; no source change or build was needed. It measured
+  **4 green files, 390 passed, 12 failed, 404 ran, 480 expects**.
+- `console-constructor-exception` (**1/1**), `console` (**7/7**), zlib
+  `leak` (**8/8**), and `zlib-reset-race` (**3/3**) were green. `zlib.test`
+  reached **371/385**; its 12 failures span invalid raw data, libdeflate
+  level validation, chunk/output bounds, and async buffer lifetime. No single
+  safe owner was inferred, so no mixed zlib patch was attempted.
+- No upstream fixture changes, no full corpus, and no workspace-wide build
+  were performed.
+
 ### W59 Node buffer leaf sample
 
 - W59 使用 Node corpus runner 的默认 bounded profile、**3 jobs**。首批五个文件为

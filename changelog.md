@@ -5,6 +5,11 @@
 
 ## 2026-08-01
 
+- W81 fresh Node console/zlib probe（5 jobs、复用当前 Linux binary、无构建）测得 **4 green
+  files、390 passed、12 failed、404 ran、480 expects**。console constructor/core、zlib leak、
+  reset-race 全绿；`zlib.test` 的失败跨 invalid raw data、libdeflate level validation、
+  chunk/output bounds、async buffer lifetime 多个 owner，未混修。未修改上游 fixture，未跑全量
+  corpus。
 - W80 fresh Node zlib probe（5 jobs、复用当前 Linux binary、无构建）测得 **3 green files、17
   passed、30 failed、47 ran、64 expects**。bytesWritten、deflate-streaming、zlib.kMaxLength
   全绿；handle-bounds 与 onerror-reentrancy 的失败跨 native handle bounds/writeState、缺失
