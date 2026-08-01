@@ -5,6 +5,7 @@
 
 ## 2026-08-01
 
+- W163 fresh Node fs pure-contract probe（3 jobs、复用现有 coordinator binary、无构建）**4/5 files pass、1 fail、0 timeout**：fs.constants、mkdir、mkdtemp、open-flags 通过；fs.promises.access 唯一失败为 expected async stack shape，停车为 error-stack owner。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W162 fresh Bun WebStreams compression/large probe（3 jobs、复用现有 coordinator binary、无构建）**1/3 files green、159 passed、13 failed、172 ran、350 expects、0 timeout**：compression **11/11** 通过；streams-leak 失败分为 native pull-buffer 与 memory accounting，streams.test 11 个失败横跨 error shape/stack、string allocation limit、batching、controller、foreign-realm、async iterator owners，均停车未混修。
 - W161 fresh Bun WebStreams probe（3 jobs、复用现有 coordinator binary、无构建）**4/4 files green、15 passed、0 failed、15 ran、23 expects、0 timeout**：readable-stream Blob consumption、sync pull fast path、TransformStream leak、native-source close 全部通过；单文件耗时 200ms–4.121s，native-source close 标记为慢但 bounded guard。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W160 fresh Bun Web URL/Response/clone probe（3 jobs、复用现有 coordinator binary、无构建）**2/3 executable files green、131 passed、1 failed、148 ran、842 expects、0 timeout**：URLSearchParams **17/17** 与 structured-clone-fastpath **92/92** 通过；Response **22/23**，唯一失败为 FileRef print-size snapshot 的相对路径根差异；Windows URL 文件 Linux 下 **16/16 skipped**，不计入 green denominator。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
