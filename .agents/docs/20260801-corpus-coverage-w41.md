@@ -1468,6 +1468,36 @@ authorization result, the `Invalid SNI context` error mapping, and the
 offline ClientHello path for a directly constructed `TLSSocket`. Verification
 stayed bounded; no full corpus or workspace-wide test was run.
 
+## W361 Node fs near-green triage parked
+
+The fresh five-job selector covered five Linux Node fs leaves and measured
+**4/5 file-level passes, 1 failure, and 0 runner timeouts**. The four green
+files were `test-fs-error-messages.js`, `test-fs-readfile.js`,
+`test-fs-truncate.js`, and `test-fs-write-file.js`.
+
+The remaining `test-fs-readdir-stack-overflow.js` failure is the JSC engine's
+generic `RangeError.message`, including a trailing period, rather than an fs
+syscall owner. The caught error has its own message property, while Bun-native
+tests require the period in the same engine dialect; a global text replacement
+would regress Bun. This owner is parked without a speculative runtime change.
+No upstream fixture changed and no full corpus/workspace-wide test ran.
+
+## W362 Node dns/promises constant source fix
+
+The fresh five-job DNS selector initially measured **3/5 file-level passes,
+1 failure, and 1 timeout**. `test-dns-promises-exists.js` was the narrow
+failure: `dns/promises` shared the `dns.promises` object but did not expose the
+Node DNS error-code constants. `test-dns-resolveany.js` timed out in both the
+five-job run and an isolated one-job/60-second confirmation, so it remains a
+separate DNS packet/liveness owner.
+
+`modules/jsc/src/js_dns.cppm` now copies the Node DNS error-code constants onto
+the shared `dnsPromises` object. After the serialized build, the selector
+measured **4/5 passes, 0 failures, and 1 timeout**; the constants file changed
+from fail to pass, and the three adjacent promise/server leaves stayed green.
+No upstream fixture changed. Verification remained bounded to the selector and
+single timeout confirmation; no full corpus/workspace-wide test ran.
+
 ## Coverage novelty audit correction after W323
 
 A post-wave audit found that older ledger sections record many files by

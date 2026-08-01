@@ -90,6 +90,15 @@
   `undefined`。重建后目标 HTTPS Agent SNI 文件 **1/1 pass**，SNI context 回归 **1/1
   pass**，selector **2/5 pass、3 fail、0 timeout**；剩余为 SNICallback 授权、invalid
   context 错误映射和离线 ClientHello 三个独立 owner。未修改 `compat/`、未跑全量 corpus。
+- W361 Node fs near-green triage：五文件 Linux selector **4/5 pass、1 fail、0 timeout**；
+  `test-fs-readdir-stack-overflow.js` 的唯一失败属于 JSC 通用 `RangeError.message`
+  句点差异，且错误对象持有 own message；Bun 原生测试要求带句点，未做危险的全局文本替换，
+  owner 停车。未修改 source/fixture，未跑全量 corpus。
+- W362 Node `dns/promises` constant source fix：五文件基线 **3/5 pass、1 fail、1 timeout**；
+  `modules/jsc/src/js_dns.cppm` 将 Node DNS error-code constants 补到共享的
+  `dnsPromises` 对象，`test-dns-promises-exists.js` 从 fail 变为 pass。串行构建后 selector
+  **4/5 pass、0 fail、1 timeout**；`test-dns-resolveany.js` 在并行 30s 与单文件 60s
+  复测均 timeout，保留为独立 packet/liveness owner。未修改 `compat/`、未跑全量 corpus。
 
 ## 2026-08-01
 
