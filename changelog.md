@@ -5,6 +5,10 @@
 
 ## 2026-08-01
 
+- W104 fresh Bun Node process/stdio leaf probe（5 jobs、复用 W101 binary、无构建）**5/5 files green、39 passed、0
+  failed、39 ran、93 expects**：memoryPressure **5/5**、signal listener count **3/3**、process constructor **2/2**、
+  setgroups/hrtime accessor guard **5/5**、invalid UTF-16 stdout/stderr **24/24**。未发现 source owner，未修改上游
+  fixture，未跑全量 corpus。
 - W103 fresh Bun `node:module`/SourceMap leaf probe（5 jobs、复用 W101 binary、无构建）测得 **3/5 files green、44
   passed、10 failed、54 ran、142 expects**：`module-resolve-filename-paths` **6/6**、`module-sourcemap` **3/3**、
   `module-children-concurrent-gc` **1/1** 全绿。`node-module-module` 为 **21 passed / 9 failed / 30 ran / 102

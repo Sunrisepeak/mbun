@@ -51,6 +51,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W101 | Node module loader / CLI entry leaves | 5 | pre-fix 3/5 pass + 1 skipped + 1 fail; post-fix 4/5 pass + 1 skipped; W100 regression 5/5 pass | issue #56; preserve `Module.runMain()` as the Node preload entry hook |
 | W102 | Node module introspection / lookup leaves | 5 | 4/5 files pass; 1 fail; no build | retain four green leaves; park `require.extensions` custom-loader integration |
 | W103 | Bun `node:module` / SourceMap leaves | 5 | 3/5 files green; 44 passed / 10 failed / 54 ran / 142 expects; no build | retain three green leaves; park split CJS-loader and malformed-sourcemap diagnostic owners |
+| W104 | Bun Node process / stdio leaves | 5 | 5/5 files green; 39 passed / 0 failed / 39 ran / 93 expects; no build | retain all five green leaves; no source owner |
 
 ## W96 delivered slice
 
@@ -227,6 +228,27 @@ issue or mixed fix was opened from W103.
 
 No upstream fixture changed, no build or full corpus/workspace-wide test was
 run, and the temporary selector/output were cleaned after verification.
+
+## W104 Bun Node process and stdio leaves
+
+W104 used five bounded jobs and the W101 coordinator binary without a build.
+The selected Linux-focused leaves covered synthetic `memoryPressure`, signal
+listener install/remove/reinstall, callable process construction, accessor
+guards for `setgroups`/`hrtime`, and invalid UTF-16 writes to stdout/stderr.
+All **5/5 files passed**, with **39/39 tests**, **0 failures**, and **93
+expects**.
+
+Per-file results:
+
+- `process-memory-pressure.test.ts`: **5/5**, 10 expects;
+- `process-signal-listener-count.test.ts`: **3/3**, 10 expects;
+- `call-constructor.test.js`: **2/2**, 1 expect;
+- `process-array-accessor-crash.test.ts`: **5/5**, 6 expects;
+- `process-stdio-invalid-utf16.test.ts`: **24/24**, 66 expects.
+
+No source owner was opened, no upstream fixture changed, no build or full
+corpus/workspace-wide test was run, and the temporary selector/output were
+cleaned after verification.
 
 ## Delivered slice
 
