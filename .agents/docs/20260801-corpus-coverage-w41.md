@@ -265,9 +265,9 @@ the observed Linux limits; the coordinator owns the only root build.
 | W315 | Node process/console lifecycle green cluster | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five process/console lifecycle guards; no source owner |
 | W316 | Node process.env contract leaves | 5 | 3/5 pass; 1 fail; 1 skipped; 0 timeout; no build | retain three env guards; record inspector skip and split load-env-file cwd/diagnostic owners |
 | W317 | Node console/stdio/finalization green cluster | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five console/stdio/finalization guards; no source owner |
-| W318 | Node process identity/active-handle and console color leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five process/console guards; no source owner |
+| W318 | Node process identity/active-handle and console color leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build; 4 fresh + 1 revalidation | retain four fresh guards; revalidate `test-process-execve-validation.js` already recorded in W113 |
 | W319 | Node active-resources/priority/console leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five resource/priority/console guards; no source owner |
-| W320 | Bun util object/encoding/timer/path leaves | 5 | 4/5 green; 20 passed / 1 failed / 21 ran / 236 expects; 0 timeout; no build | retain four green leaves; park missing `hasNonReifiedStatic` internal-helper owner |
+| W320 | Bun util object/encoding/timer/path leaves | 5 | 4/5 green; 20 passed / 1 failed / 21 ran / 236 expects; 0 timeout; no build; 1 fresh + 4 revalidations | retain fresh `sleepSync`; revalidate four historical Bun guards and retain the known helper owner |
 | W321 | Node warning/identity contract leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five warning/identity guards; no source owner |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
@@ -558,21 +558,23 @@ remains resource-gated.
 
 ## W318 Node process identity/active-handle and console color leaves
 
-The bounded five-job Node selector covered five previously unrecorded files:
-`test-process-execve-validation.js`, `test-process-euid-egid.js`,
-`test-process-getactivehandles.js`, `test-process-getactiverequests.js`, and
-`test-console-tty-colors.js`. The runner measured **5/5 file-level passes**,
-**0 failures**, **0 runner timeouts**, and **198–249 ms** per file. The Node
-runner reports file-level status only; no assertion-level pass total is
-inferred.
+The bounded five-job Node selector covered five selected files: four were fresh
+at the time of the run, while `test-process-execve-validation.js` was already
+recorded by W113 and is a revalidation. The other files were
+`test-process-euid-egid.js`, `test-process-getactivehandles.js`,
+`test-process-getactiverequests.js`, and `test-console-tty-colors.js`. The
+runner measured **5/5 file-level passes**, **0 failures**, **0 runner
+timeouts**, and **198–249 ms** per file. The Node runner reports file-level
+status only; no assertion-level pass total is inferred.
 
-All five process/console guards passed and are retained. There were no source
-or upstream-fixture changes, no full corpus, and no workspace-wide build. An
-unrelated external package installation remained active during the probe but
-was not touched. After the run, resources remained at about **44 GiB available
-memory**, about **1.5 MiB free swap**, and about **17 GiB free disk at 99% usage**.
-Temporary runner output is cleaned immediately and the next wave remains
-resource-gated.
+Four fresh process/console guards passed and are retained. The repeated
+`test-process-execve-validation.js` pass is retained as a W113 revalidation.
+There were no source or upstream-fixture changes, no full corpus, and no
+workspace-wide build. An unrelated external package installation remained
+active during the probe but was not touched. After the run, resources remained
+at about **44 GiB available memory**, about **1.5 MiB free swap**, and about
+**17 GiB free disk at 99% usage**. Temporary runner output is cleaned
+immediately and the next wave remains resource-gated.
 
 ## W319 Node active-resources/priority/console leaves
 
@@ -594,19 +596,23 @@ remains resource-gated.
 
 ## W320 Bun util object/encoding/timer/path leaves
 
-The bounded five-job Bun selector covered five previously unrecorded files:
-`BunObject.test.ts`, `escapeRegExp.test.ts`, `sleepSync.test.ts`,
-`toUTF16Alloc.test.ts`, and `which.test.ts`. It measured **4/5 green files**,
-**20 passed / 1 failed / 21 ran / 236 expects**, **0 runner timeouts**, and
-**200–306 ms** per file. The four green files are retained.
+The bounded five-job Bun selector covered five selected files. A basename audit
+of the historical ledger shows four revalidations: `BunObject.test.ts` was
+already recorded in W78, `escapeRegExp.test.ts` and `which.test.ts` in W57,
+and `toUTF16Alloc.test.ts` in W56. Only `sleepSync.test.ts` is a new file
+entry from this wave. The run measured **4/5 green files**, **20 passed / 1
+failed / 21 ran / 236 expects**, **0 runner timeouts**, and **200–306 ms** per
+file. The four green files include the fresh `sleepSync` guard and three
+historical green revalidations.
 
 `BunObject.test.ts` passed its `require("bun")` and dynamic-import checks but
 its `hasNonReifiedStatic` check could not run because the internal test helper
-was unavailable. This is parked as one internal-helper/API owner; no source or
-upstream-fixture changes were made. No full corpus or workspace-wide build was
-run. After the run, resources remained at about **44 GiB available memory**,
-**1.6 MiB free swap**, and **17 GiB free disk at 99% usage**. Temporary runner
-output is cleaned immediately and the next wave remains resource-gated.
+was unavailable. This revalidates the W78 internal-helper/API owner; no source
+or upstream-fixture changes were made. No full corpus or workspace-wide build
+was run. After the run, resources remained at about **44 GiB available
+memory**, **1.6 MiB free swap**, and **17 GiB free disk at 99% usage**.
+Temporary runner output is cleaned immediately and the next wave remains
+resource-gated.
 
 ## W321 Node warning/identity contract leaves
 
@@ -625,6 +631,18 @@ workspace-wide build was run. After the run, resources remained at about
 **43 GiB available memory**, **1.6 MiB free swap**, and **17 GiB free disk at
 99% usage**. Temporary runner output is cleaned immediately and the next wave
 remains resource-gated.
+
+## Coverage novelty audit correction after W321
+
+A post-wave audit found that older ledger sections record many files by
+basename rather than full relative path. The prior candidate check searched
+only for the full path, so W318 repeated one W113 file and W320 repeated four
+historical Bun files. Their measured runner results remain valid, but the
+incremental-new-file counts are corrected above: W318 is **4 fresh + 1
+revalidation** and W320 is **1 fresh + 4 revalidations**. No source, fixture,
+build, or test behavior changed. Future selection gates use basename matches
+against the entire ledger, including historical sections, before a file is
+called fresh.
 
 ## W304 Node events/path continuation leaf probe
 
