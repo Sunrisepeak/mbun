@@ -93,6 +93,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W143 | Node timers basic leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five timer leaves; no source owner |
 | W144 | Bun Web console basic leaves | 4 | 2/4 green; 3 passed / 7 failed / 10 ran / 15 expects; 0 timeout; no build | retain UTF-16/recursive; park console.log and console.timeLog multi-owner formatting gaps |
 | W145 | Node timers adjacent leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build | retain four leaves; park non-integer delay callback-order owner |
+| W146 | Bun Web Request leaves | 3 | 2/3 green; 14 passed / 6 failed / 20 ran / 24 expects; 0 timeout; no build | retain request-subclass; retain clone-leak only as slow stress; park request-method heapStats NaN owner |
 
 ## W133 Bun.Terminal green cluster
 
@@ -304,6 +305,26 @@ coordinator binary through `tools/integration/node_corpus_runner.py` with
 three bounded jobs and a 30-second per-file timeout. No full corpus or
 workspace-wide test was run; the selector and raw runner output were removed
 after recording the result.
+
+## W146 Bun Web Request owner split
+
+The bounded three-job selector covered Request method memory behavior, Request
+subclass getter dispatch, and Request clone leak behavior. It reached **2/3
+files green**, with **14 passed / 6 failed / 20 ran / 24 expects / 0 timeouts**.
+`request-subclass.test.ts` passed in 199ms and `request-clone-leak.test.ts`
+passed all **12/12** checks but took **21.240s**, so the latter is retained as
+a slow stress guard and excluded from the default fast lane.
+
+`request-method-getter.test.ts` failed all **6/6** checks because the observed
+heap metric was `NaN`. This is a memory-accounting/heapStats owner, not a safe
+Request method wrapper fix, so it is parked without a speculative source
+change or issue.
+
+No source or upstream fixture change was made. The selector used the existing
+coordinator binary through `tools/integration/bun_corpus_runner.py` with three
+bounded jobs, a 30-second per-file timeout, and missing Node modules allowed.
+No full corpus or workspace-wide test was run; the selector and raw runner
+output were removed after recording the result.
 
 ## W132 Node VM and WebStreams owner split
 

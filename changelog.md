@@ -5,6 +5,7 @@
 
 ## 2026-08-01
 
+- W146 fresh Bun Web Request probe（3 jobs、复用现有 coordinator binary、无构建）**2/3 files green、14 passed、6 failed、20 ran、24 expects、0 timeout**：Request subclass 2/2 通过；clone-leak 12/12 通过但耗时 21.240s，标记 slow stress 不进入 fast lane；request-method-getter 6/6 因 heapStats 为 NaN 失败，停车为 memory-accounting owner。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W145 fresh Node timers adjacent probe（3 jobs、复用现有 coordinator binary、无构建）**4/5 files pass、1 fail、0 timeout**：API refs、clearTimeout/interval equivalence、setImmediate、callback this 通过；non-integer delay 回调顺序为 1,4,3,2，Node 期望 1,2,3,4，停车为 fractional-delay ordering owner。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W144 fresh Bun Web console basic probe（3 jobs、复用现有 coordinator binary、无构建）**2/4 files green、3 passed、7 failed、10 ran、15 expects、0 timeout**：UTF-16 与 recursive formatting 通过；`console.log` 失败横跨 snapshot/formatting、long-array cutoff、console.group stack、SharedArrayBuffer，`console.timeLog` 失败横跨 timing/log format，均为多 owner 停车。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W143 fresh Node timers basic cluster（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：args、clear null/object、invalid clear、zero timeout 全部通过；单文件耗时 165–350ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
