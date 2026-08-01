@@ -5,6 +5,13 @@
 
 ## 2026-08-02
 
+- W377 Node ResourceTiming buffer source fix：ResourceTiming 目标从 **0/1** 推进到 **1/1 pass**；
+  五文件 performance selector 从 **2/5 pass、3 fail、0 timeout** 提升到 **3/5 pass、2 fail、0
+  timeout**。`modules/jsc/src/builtins/node_perf.cppm` 补齐 bounded resource buffer、
+  `resourcetimingbufferfull` overflow event、resize/clear 及 callback 后 promotion/discard；目标文件
+  五-job 与 **1/1 串行复核**均通过。剩余 `uvMetricsInfo()`、GC observer 为独立 owner，W375 TLS
+  回归保持 **2/5 pass、3 fail、0 timeout**；serial release build **59.24s**，未修改 upstream
+  fixture、未跑全量 corpus。
 - W376 Node performance timeline source fix：五文件 selector 从 **1/5 pass、4 fail、0 timeout**
   推进到 **2/5 pass、3 fail、0 timeout**。`modules/jsc/src/builtins/node_perf.cppm` 让
   `getEntries*()` 按 `startTime` 稳定排序，并将缺失参数错误对齐为 Node 的

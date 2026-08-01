@@ -134,6 +134,10 @@ inline constexpr std::string_view kNodePerfJS = R"JS(
 
   const buffer = [];
   const observers = new Set();
+  const resourceTimingListeners = new Set();
+  let resourceTimingBufferSize = 250;
+  let resourceTimingOverflow = null;
+  let resourceTimingBufferFullScheduled = false;
 
   function resolveTime(v) {
     if (typeof v === "number") return v;
@@ -167,6 +171,34 @@ inline constexpr std::string_view kNodePerfJS = R"JS(
   function addEntry(entry) { buffer.push(entry); notifyObservers(entry); }
   function timelineEntries(entries) {
     return entries.slice().sort((a, b) => a.startTime - b.startTime);
+  }
+  function resourceEntries() { return buffer.filter((entry) => entry.entryType === "resource"); }
+  function scheduleResourceTimingBufferFull() {
+    if (resourceTimingBufferFullScheduled) return;
+    resourceTimingBufferFullScheduled = true;
+    queueMicrotask(() => {
+      resourceTimingBufferFullScheduled = false;
+      const event = { type: "resourcetimingbufferfull" };
+      for (const listener of [...resourceTimingListeners]) {
+        try { listener.call(performanceObj, event); } catch (_) {}
+      }
+      if (typeof performanceObj.onresourcetimingbufferfull === "function") {
+        try { performanceObj.onresourcetimingbufferfull.call(performanceObj, event); } catch (_) {}
+      }
+      if (resourceTimingOverflow !== null && resourceEntries().length < resourceTimingBufferSize)
+        addEntry(resourceTimingOverflow);
+      resourceTimingOverflow = null;
+    });
+  }
+  function addResourceTiming(timingInfo, requestedUrl) {
+    const startTime = typeof timingInfo?.startTime === "number" ? timingInfo.startTime : 0;
+    const endTime = typeof timingInfo?.endTime === "number" ? timingInfo.endTime : startTime;
+    const entry = new PerformanceNodeEntry(kConstruct, String(requestedUrl), "resource", startTime, endTime - startTime);
+    if (resourceEntries().length < resourceTimingBufferSize) addEntry(entry);
+    else {
+      if (resourceTimingOverflow === null) resourceTimingOverflow = entry;
+      scheduleResourceTimingBufferFull();
+    }
   }
 
   const performanceObj = {
@@ -216,9 +248,21 @@ inline constexpr std::string_view kNodePerfJS = R"JS(
       for (let i = buffer.length - 1; i >= 0; i--)
         if (buffer[i].entryType === "measure" && (name === undefined || buffer[i].name === String(name))) buffer.splice(i, 1);
     },
-    clearResourceTimings() {},
-    setResourceTimingBufferSize() {},
-    markResourceTiming() {},
+    clearResourceTimings() {
+      for (let i = buffer.length - 1; i >= 0; i--)
+        if (buffer[i].entryType === "resource") buffer.splice(i, 1);
+    },
+    setResourceTimingBufferSize(maxSize) {
+      if (typeof maxSize === "number" && Number.isFinite(maxSize) && maxSize >= 0)
+        resourceTimingBufferSize = Math.trunc(maxSize);
+    },
+    markResourceTiming(timingInfo, requestedUrl) { addResourceTiming(timingInfo, requestedUrl); },
+    addEventListener(type, listener) {
+      if (type === "resourcetimingbufferfull" && typeof listener === "function") resourceTimingListeners.add(listener);
+    },
+    removeEventListener(type, listener) {
+      if (type === "resourcetimingbufferfull") resourceTimingListeners.delete(listener);
+    },
     eventLoopUtilization() { return { idle: 0, active: 0, utilization: 0 }; },
     onresourcetimingbufferfull: null,
     nodeTiming: new PerformanceNodeTiming(),

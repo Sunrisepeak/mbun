@@ -323,6 +323,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W374 | Node IPv6/TLS address-family source fix | 5 | pre 4/5 pass + 1 fail; post 5/5 pass; W371/W372 regressions 5/5; three incremental release rebuilds | preserve logical IPv6 peer metadata on the localhost fast path and clear informational OpenSSL unknown-NID errors; no fixture change |
 | W375 | Node TLS socket option/close triage | 5 | 2/5 pass; 3 fail; 0 timeout; serial confirmation 3/3 fail; no build | retain HWM and socket half-open guards; park TLS data-half-close, keepalive/noDelay reset, and raw net/TLS close-order owners separately |
 | W376 | Node performance timeline source fix | 5 | pre 1/5 pass + 4 fail; post 2/5 pass + 3 fail; timeline target 1/1 pass serially; W375 TLS regression 2/5 pass + 3 fail; three serial release builds | sort performance entries by `startTime` and align missing-argument TypeError shape; park ResourceTiming callback, uvMetricsInfo, and GC observer owners separately |
+| W377 | Node ResourceTiming buffer source fix | 5 | pre 2/5 pass + 3 fail; post 3/5 pass + 2 fail; ResourceTiming target 1/1 serially; W375 TLS regression 2/5 pass + 3 fail; one serial release build (59.24s) | implement bounded resource entries, overflow event, resize, clear, and promotion semantics; park uvMetricsInfo and GC observer owners separately |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -1635,6 +1636,26 @@ the deciding timeline file passed both in the five-job run and in a separate
 **1/1 serial confirmation**. The remaining ResourceTiming buffer-full,
 `uvMetricsInfo()`, and GC observer failures remain separate owners. W375's
 five-file TLS regression stayed at **2/5 pass, 3 failures, and 0 timeout**.
+
+No upstream fixture changed and no full corpus/workspace-wide test ran.
+
+## W377 Node ResourceTiming buffer source fix
+
+W376's performance selector left ResourceTiming as the clearest remaining
+single owner: `markResourceTiming()`, buffer sizing, clearing, and the
+`resourcetimingbufferfull` event were empty implementations in
+`modules/jsc/src/builtins/node_perf.cppm`. The focused target was stable at
+**0/1** before the change.
+
+The source now maintains a bounded resource-entry buffer, queues one overflow
+entry while dispatching the buffer-full event, supports `clearResourceTimings()`
+and `setResourceTimingBufferSize()`, and promotes or discards the queued entry
+according to the post-callback capacity. After one serial release build
+(**59.24s**), the full five-file W377 selector moved from **2/5 pass, 3
+failures, 0 timeout** to **3/5 pass, 2 failures, 0 timeout**. The deciding
+ResourceTiming file passed in the five-job wave and in a separate **1/1 serial
+confirmation**. Remaining failures are `uvMetricsInfo()` and GC observer
+owners; W375 TLS remained **2/5 pass, 3 failures, 0 timeout**.
 
 No upstream fixture changed and no full corpus/workspace-wide test ran.
 
