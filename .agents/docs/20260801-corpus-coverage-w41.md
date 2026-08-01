@@ -258,6 +258,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W308 | Node console/path leaf probe | 5 | 4/5 pass; 1 fail; 0 timeout; no build | retain console-clear, console-instance, path-isabsolute, and path-join; park diagnostics-channel callback delivery |
 | W309 | Node console/process contract leaves | 5 | 4/5 pass; 1 skipped; 0 fail; 0 timeout; no build | retain four console/process guards; record process-config as a Linux environment skip |
 | W310 | Node process/console builtin leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build | retain four guards; park process.getBuiltinModule node:test identity owner |
+| W311 | Bun util low-coupling green cluster | 5 | 5/5 green; 12 passed / 0 failed / 12 ran / 438 expects; 0 timeout; no build | retain all five Bun util guards; no source owner |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -397,6 +398,26 @@ workspace-wide build. After the run, resources showed about **45 GiB
 available memory**, about **1.1 MiB free swap**, and about **17 GiB free disk at
 99% usage**; temporary runner output is cleaned immediately and the next wave
 remains resource-gated.
+
+## W311 Bun util low-coupling green cluster
+
+The bounded five-job Bun selector covered five previously unrecorded util
+files: `bun-isMainThread`, `arraybuffersink`, `error-code-mirror`,
+`exotic-global-mutable-prototype`, and `peek`. It measured **5/5 green files**,
+**12 passed / 0 failed / 12 ran / 438 expects**, **0 skips**, and **0 runner
+timeouts**. Per-file durations were **199–804 ms**.
+
+Per-file results were: `arraybuffersink.test.ts` **6 / 0 / 6 / 418**;
+`bun-isMainThread.test.js` **1 / 0 / 1 / 3**;
+`error-code-mirror.test.ts` **2 / 0 / 2 / 3**;
+`exotic-global-mutable-prototype.test.ts` **1 / 0 / 1 / 2**; and
+`peek.test.ts` **2 / 0 / 2 / 12**. All five remain green coverage with no
+source or upstream-fixture changes and no inferred owner. No full corpus or
+workspace-wide build was run.
+
+After the run, resources showed about **45 GiB available memory**, about **1.2
+MiB free swap**, and about **17 GiB free disk at 99% usage**. Temporary runner
+output is cleaned immediately and the next wave remains resource-gated.
 
 ## W304 Node events/path continuation leaf probe
 
