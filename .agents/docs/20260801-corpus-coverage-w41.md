@@ -250,6 +250,25 @@ the observed Linux limits; the coordinator owns the only root build.
 | W300 | Node util/styleText/os/url leaves | 5 | 4/5 pass; 1 skip; 0 fail; 0 timeout; no build | retain util sleep, hex styleText, URL deprecation, and userinfo guards; record regular styleText as a TTY harness skip |
 | W301 | Node util/VM/encoding continuation leaves | 5 | 2/5 pass; 3 fail; 0 timeout; no build | retain signal exit-code and TextDecoder guards; split VM namespace inspect, internal symbol enumerability, and promisify custom-name owners |
 | W302 | Node URL continuation leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five URL parse/format/brand guards; no source owner |
+| W303 | Bun/Deno Fetch/URL API leaves | 5 | 5/5 green; 80 passed / 0 failed / 85 ran / 245 expects; 0 timeout; no build | retain all five Fetch/URL guards; no source owner |
+
+## W303 Bun/Deno Fetch/URL API leaf probe
+
+The bounded five-job Bun selector covered Deno Fetch headers, Blob, Request,
+Response, and URLSearchParams APIs. It measured **5/5 green files**, **80
+passed / 0 failed / 85 ran / 245 expects**, and **0 runner timeouts**.
+Per-file durations were **286–293 ms**.
+
+`headers.test.ts` measured **26 passed / 0 failed / 27 ran / 122 expects**;
+`blob.test.ts` measured **9 / 0 / 10 / 16**;
+`response.test.ts` measured **8 / 0 / 9 / 24**;
+`request.test.ts` measured **5 / 0 / 7 / 7**; and
+`urlsearchparams.test.ts` measured **32 / 0 / 32 / 76**. All five guards are
+retained as green coverage with no source or upstream-fixture changes.
+
+The selector used the bounded five-job Bun runner with a 30-second per-file
+timeout, the existing coordinator binary, and missing Node modules allowed.
+No full corpus, build, or workspace-wide test was run.
 
 ## W302 Node URL continuation leaf probe
 
