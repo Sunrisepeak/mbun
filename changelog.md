@@ -5,6 +5,12 @@
 
 ## 2026-08-01
 
+- W97 issue [#55](https://github.com/Sunrisepeak/mbun/issues/55) 修复 Node HTTP/2 connect AbortSignal teardown：fresh
+  五文件 Node probe 从 **4/5 pass** 变为 **5/5 pass**。根因是 transport signal 与 session teardown 竞态让
+  pending request 收到 `ABORT_ERR`，而 Node 要求 session 保留 `AbortError`、request 收到
+  `ERR_HTTP2_STREAM_CANCEL`；`ed9c854` 让 session 单独消费 signal，并在 abort teardown 中取消 streams，普通
+  session destroy 保持原语义。W96 Node regression **5/5 pass**，W95 Bun HTTP/2/Worker regression **5/5 green、
+  8 passed、0 failed、8 ran、8 expects**。fresh build 通过，未修改上游 fixture，未跑全量 corpus。
 - W96 issue [#54](https://github.com/Sunrisepeak/mbun/issues/54) 修复 Node HTTP/2 RST lifecycle：fresh five-file
   Node probe 从 **4/5 pass** 变为 **5/5 pass**。根因是 client reset path 在错误前没有结束 readable、server
   收到非零 peer RST 只 finish 而没有进入 `ERR_HTTP2_STREAM_ERROR`；`fa2373e` 让 client `end` 在错误前完成，

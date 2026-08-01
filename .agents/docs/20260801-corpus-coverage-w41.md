@@ -44,6 +44,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W94 | Bun HTTP/2/Worker staged leaves | 5 | pre-fix 4/5 green; 7 passed / 1 failed / 8 ran / 6 expects | issue #53; isolate reserved-push DATA state |
 | W95 | Bun HTTP/2/Worker staged regression | 5 | post-fix 5/5 green; 8 passed / 0 failed / 8 ran / 8 expects | issue #53 landed; retain all five guards |
 | W96 | Node HTTP/2 RST lifecycle | 5 Node + 5 Bun guards | pre-fix Node 4/5 pass; post-fix Node 5/5 pass; Bun 5/5 green, 8 passed / 0 failed / 8 ran / 8 expects | issue #54; align readable end and non-zero peer-RST error delivery |
+| W97 | Node HTTP/2 connect-abort teardown | 5 Node + 5 Node/Bun regression guards | pre-fix Node 4/5 pass; post-fix 5/5 pass; W96 Node 5/5 pass; W95 Bun 5/5 green, 8 passed / 0 failed / 8 ran / 8 expects | issue #55; preserve session AbortError while canceling streams with `ERR_HTTP2_STREAM_CANCEL` |
 
 ## W96 delivered slice
 
@@ -74,6 +75,37 @@ Evidence from the fresh coordinator build:
 - The standalone lifecycle smoke observed client `end`, client/server stream
   errors, close callback, and `_destroy()` exactly once. It is diagnostic only
   and is not counted as corpus coverage.
+
+No upstream fixture changed and no full corpus/workspace-wide test was run.
+
+## W97 delivered slice
+
+W97 selected five adjacent Node HTTP/2 teardown paths: stream destroy before
+connect, session destroy, session close before stream close, shutdown before
+connect, and upload rejection. The fresh pre-fix result was **4/5 files pass**;
+`test-http2-client-destroy.js` failed because a connect-level AbortSignal made
+the pending request receive `ABORT_ERR` instead of Node's
+`ERR_HTTP2_STREAM_CANCEL`.
+
+Issue [#55](https://github.com/Sunrisepeak/mbun/issues/55) landed in commit
+`ed9c854`:
+
+- the client session consumes the connect AbortSignal exactly once and removes
+  it from the underlying net/tls option copy;
+- an aborted session still emits `AbortError` / `ABORT_ERR`, while all streams
+  in that session are torn down with the pending-stream cancellation error;
+- ordinary session teardown keeps its previous open-stream behavior.
+
+Evidence from the fresh coordinator build:
+
+- `bash tools/integration/build_or_die.sh` — pass.
+- W97 Node selector — **5/5 files pass** after the fix.
+- W96 Node HTTP/2 regression selector — **5/5 files pass**.
+- W95 Bun HTTP/2/Worker regression selector — **5/5 files green**, **8
+  passed / 0 failed / 8 ran / 8 expects**.
+- Plain and secure connect-abort smoke both observed session `ABORT_ERR` and
+  request `ERR_HTTP2_STREAM_CANCEL`; the bounded corpus selector is the
+  authoritative result.
 
 No upstream fixture changed and no full corpus/workspace-wide test was run.
 
