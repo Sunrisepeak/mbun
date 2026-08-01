@@ -30,6 +30,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | 2 | Node test-runner | 30 | 0 green, 30 fail | keep; snapshot surface is the clearest seam |
 | 2 | Node test-util | 12 | 0 green, 12 fail | keep only low-risk isolated APIs |
 | 2 | Node test-v8 | 11 | 0 green, 11 fail | park; profiler/queryObjects/startup snapshot ownership |
+| W83 | Bun/Node path | 5 Bun + 1 Node guard | pre 4/5 Bun green; post 5/5 Bun green; Node 1/1 | issue #50; dialect-only error-text fix |
 
 ## Delivered slice
 
@@ -933,6 +934,29 @@ surface on Linux:
 - The zero `expect()` count is a runner metric, not missing assertions: the
   upstream files use Node's assert APIs. No upstream fixture changes, no full
   corpus, and no workspace-wide build were performed.
+
+### W83 Bun path format dialect fix
+
+- The fresh five-file Bun path probe used **5 bounded jobs**. Before the source
+  change it measured **4/5 files green, 15 passed, 1 failed, 16 ran, 9
+  expects**. The sole failure was `path.format(null)`: the Bun corpus expects
+  `The "pathObject" property must be of type object, got object`, while the
+  shared validator emitted Node's `The "pathObject" argument must be of type
+  object. Received null` form.
+- Issue [#50](https://github.com/Sunrisepeak/mbun/issues/50) isolated the
+  owner. Commit `7f6af93` makes only this invalid-object message dispatch on
+  `globalThis.__mbunDialect`; Node keeps the existing `nodeArgTypeError()`
+  path, and Bun restores its compatibility wording. The release build passed
+  in **60.34 seconds**.
+- After the change, W83 measured **5/5 files green, 16 passed, 0 failed, 16
+  ran, 9 expects**. The combined W82/W83 ten-file guard measured **10/10
+  green, 29 passed, 0 failed, 29 ran**; Node's
+  `test-path-parse-format.js` was independently **1/1 pass**. No upstream
+  fixture changes and no full corpus were performed.
+- Resource checkpoint around the build: approximately **43 GiB available
+  memory, 48 MiB free swap, and 20 GiB free disk**. The run stayed within the
+  serialized build lock and five-job bounded runner; no workspace-wide build
+  was started.
 
 ### W59 Node buffer leaf sample
 

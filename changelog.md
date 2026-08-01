@@ -5,6 +5,14 @@
 
 ## 2026-08-01
 
+- W83 fresh Bun Node-path probe（5 jobs）先测得 **4/5 files green、15 passed、1 failed、16 ran、9
+  expects**；唯一失败是 `path.format(null)` 的 Bun 方言错误文案。Issue [#50](https://github.com/Sunrisepeak/mbun/issues/50)
+  的最小修复由 `7f6af93` 落地：Bun dialect 保留 `property + typeof` 文案，Node dialect 保留
+  `Received ...` 文案；release build **60.34 秒**。修复后 W83 为 **5/5 files green、16
+  passed、0 failed、16 ran、9 expects**；与 W82 合并的 10-file path guard 为 **10/10
+  green、29 passed、0 failed、29 ran**，Node `test-path-parse-format.js` 亦为 **1/1 pass**。
+  未修改上游 fixture，未跑全量 corpus；构建期间记录 swap 仅约 48 MiB 可用、磁盘约 20 GiB
+  可用，继续保持串行构建与 bounded runner。
 - W82 fresh Node path leaf probe（5 jobs、复用当前 Linux binary、无构建）新增 **5/5 files
   green、13 passed、0 failed、13 ran、0 expect() calls**：basename、dirname、extname、
   isAbsolute、join 全绿；0 expect 是因为上游使用 Node assert，不代表缺少断言。未修改
