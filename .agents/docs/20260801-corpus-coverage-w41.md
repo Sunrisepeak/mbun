@@ -208,6 +208,25 @@ the observed Linux limits; the coordinator owns the only root build.
 | W258 | Node child-process stdio/destroy leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain stdio inherit/flush and child destroy state guards; no source owner |
 | W259 | Node child-process IPC/exec leaves | 3 | 2/3 pass; 1 fail; 0 timeout; no build | retain disconnect async/self-termination and exec encoding; park IPC server-handle transfer owner |
 | W260 | Bun hooks/custom matcher/mock-fn leaves | 3 | 2/3 green; 78 passed / 34 failed / 113 ran / 20472 expects; 0 timeout; no build | retain expect-extend 28/28 and jest-hooks 17 pass + 1 todo; park mock-fn metadata/this, call bookkeeping, missing APIs, reset/restore, and spyOn owners |
+| W261 | Node Buffer iterator/read/allocation leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain Buffer iterator variants, read boundary/error guards, and negative allocation validation; no source owner |
+
+## W261 Node Buffer iterator/read/allocation plain-script leaf probe
+
+The bounded three-job Node selector covered `test-buffer-iterator.js`,
+`test-buffer-read.js`, and `test-buffer-no-negative-allocation.js`. It measured
+**3/3 file-level passes**, **0 failures**, and **0 runner timeouts**. Per-file
+durations were 200–201ms.
+
+The probe retained Buffer iterator behavior across values and offsets, read
+boundary/error handling, and negative/NaN allocation validation across the
+safe and unsafe allocation APIs. The Node corpus runner reports only
+file-level status for these plain scripts, so no synthetic subtest count was
+added.
+
+No source or upstream fixture change was made. The selector reused the
+coordinator binary through `tools/integration/node_corpus_runner.py` with
+three bounded jobs and a 30-second per-file timeout. No full corpus, build,
+or workspace-wide test was run.
 
 ## W260 Bun hooks/custom matcher/mock-fn leaf probe
 

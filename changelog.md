@@ -5,6 +5,7 @@
 
 ## 2026-08-01
 
+- W261 fresh Node Buffer iterator/read/allocation plain-script leaf probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：Buffer iterator variants、read boundary/error guards 与 negative/NaN allocation validation 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 200–201ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W260 fresh Bun hooks/custom matcher/mock-fn leaf probe（3 jobs、复用现有 coordinator binary、无构建）**2/3 files green、78 passed、34 failed、113 ran、20,472 expects、0 runner timeout**：expect-extend **28/28**、jest-hooks **17 pass + 1 todo**；mock-fn **33/67**，失败聚焦 metadata/this、call bookkeeping、missing APIs、reset/restore 与 spyOn owners。单文件耗时 182–232ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W259 fresh Node child-process IPC/exec plain-script leaf probe（3 jobs、复用现有 coordinator binary、无构建）**2/3 files pass、1 fail、0 timeout**：disconnect async/self-termination 与 exec encoding 全部 clean-exit；send-return-boolean 因 IPC server-handle transfer unsupported TypeError 收敛为单一 owner。Node runner 按 file-level 计数，单文件耗时 201–602ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W258 fresh Node child-process stdio/destroy plain-script leaf probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：child stdio inherit/flush 与 destroy/kill state transitions 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 199–352ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
