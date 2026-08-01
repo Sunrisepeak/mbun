@@ -5,6 +5,7 @@
 
 ## 2026-08-01
 
+- W173 fresh Node stream basic probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：Duplex、Readable state、Writable properties、string pushes、TypedArray chunks 全部通过；单文件耗时 199–316ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W172 fresh Bun I/O probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files green、53 passed、0 failed、53 ran、1728 expects、0 timeout**：FileSink **46/46**（1.160s）、ArrayBufferSink **6/6**、Bun.file.exists **1/1** 全部通过；未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W171 fresh Node fs directory/stat probe（3 jobs、复用现有 coordinator binary、无构建）**4/4 executable files pass、1 MacOS-only skip、0 fail、0 timeout**：opendir、readdir entry types、symlink entry types、stat 通过；readdir-buffer 明确 MacOS-only，未计入 green denominator。可执行文件耗时 165–352ms，未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W170 fresh Node fs vector/copy/truncate probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：readv、writev、writevSync、copyfile、truncateSync 全部通过；单文件耗时 165–265ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
