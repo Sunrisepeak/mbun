@@ -849,6 +849,21 @@ surface on Linux:
   were performed. Keep the four assertion guards and leave the multi-semantic
   deep-equality matrix split for a later measured owner.
 
+### W77 Node crypto leaf probe parked on external-memory owner
+
+- A fresh five-file Node crypto probe used **5 bounded jobs** and reused the
+  current Linux binary; no source change or build was needed. It measured
+  **4 green files, 51 passed, 8 failed, 59 ran, 344 expects**.
+- `crypto-sign-regression` (**1/1**), `x509` (**14/14**), `scrypt` (**1/1**),
+  and `crypto-oneshot` (**35/35**) were green. `crypto-extra-memory` had
+  **0/8** green tests: all failures are `heapStats().extraMemorySize` deltas
+  for SecretKey, asymmetric keys, Hash/Hmac/Cipher, ECDH, Sign, and Verify.
+- The failures share the JSC GC/native-wrapper external-memory accounting
+  boundary, not one crypto algorithm. No mixed crypto patch was attempted;
+  keep the four green leaves and park this architectural owner.
+- No upstream fixture changes, no full corpus, and no workspace-wide build
+  were performed.
+
 ### W59 Node buffer leaf sample
 
 - W59 使用 Node corpus runner 的默认 bounded profile、**3 jobs**。首批五个文件为

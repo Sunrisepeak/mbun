@@ -5,6 +5,11 @@
 
 ## 2026-08-01
 
+- W77 fresh Node crypto probe（5 jobs、复用当前 Linux binary、无构建）测得 **4 green files、51
+  passed、8 failed、59 ran、344 expects**。sign regression、X509、scrypt、oneshot 全绿；
+  `crypto-extra-memory` 的 8 个失败均是 `heapStats().extraMemorySize` 未反映 SecretKey、
+  asymmetric key、Hash/Hmac/Cipher、ECDH、Sign、Verify 的 native wrapper external-memory，
+  属 JSC GC/native accounting 架构 owner，未混修。未修改上游 fixture，未跑全量 corpus。
 - W76 fresh Node assert leaf probe（5 jobs、复用当前 Linux binary、无构建）测得 **4 green +
   1 ahead-of-reference、275 passed、22 failed、297 ran、451 expects**。doesNotMatch、match、
   promise、assert spec 四个文件全绿；`deep-equal` 的 22 个失败均为上游 `test.failing` 且
