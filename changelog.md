@@ -5,6 +5,12 @@
 
 ## 2026-08-01
 
+- W59 Node buffer leaf sample（默认 bounded profile、**3 jobs**，无构建/全量）测得
+  首批 `test-buffer-ascii`、`badhex`、`compare`、`isascii` **4/5 pass**，相邻
+  `arraybuffer`、`bytelength`、`equals`、`includes`、`indexof` **5/5 pass**；合计
+  **9/10 files pass**。唯一失败 `test-buffer-constants.js` 是
+  `MAX_STRING_LENGTH + 1` 未触发 `RangeError`，指向通用 JSC 字符串容量边界，未为
+  单文件猜测性修改全局 String 行为。未跑全量 corpus。
 - W58 parser sample（默认 **4G/512、3 jobs**，复用已有 fresh binary，无构建）新增
   JSON5 扩展 **321/321**、JSON5 官方 suite **113/113**、YAML block-scalar matrix
   **1084/1084**，合计 **3/4 files green、1521/1530 tests passed、9 failed、1809

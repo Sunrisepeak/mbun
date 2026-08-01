@@ -572,6 +572,17 @@ surface on Linux:
   全量 corpus。当前资源约 **44 GiB available memory、43 MiB swap free、20 GiB
   free disk**，继续暂停 broad build，仅保留 bounded lane。
 
+### W59 Node buffer leaf sample
+
+- W59 使用 Node corpus runner 的默认 bounded profile、**3 jobs**，无构建、无全量
+  corpus。首批 `test-buffer-ascii`、`test-buffer-badhex`、`test-buffer-compare`、
+  `test-buffer-isascii` 为 **4/5 file-level pass**；相邻
+  `test-buffer-arraybuffer`、`test-buffer-bytelength`、`test-buffer-equals`、
+  `test-buffer-includes`、`test-buffer-indexof` 为 **5/5 pass**。
+- 合计 **10 files、9 pass、1 fail**。唯一失败 `test-buffer-constants.js` 的断言是
+  `MAX_STRING_LENGTH + 1` 应抛 `RangeError`，当前运行时未抛；证据指向通用 JSC
+  String capacity，而非 Buffer leaf API，停车避免为了单文件改全局字符串语义。
+
 ### W58 JSON5/YAML parser sample
 
 - W58 复用已有 fresh binary，默认 **4G/512、3 jobs**，无构建、无全量 corpus。三个
@@ -652,11 +663,11 @@ surface on Linux:
    identified.
 3. Keep test-v8 profiler/queryObjects and broad VM wording changes parked until
    ownership is clear.
-4. Keep the W56 Bun.Glob, W57 green builtin/util slices, and W58 JSON5/YAML parser
-   sample closed unless a new minimal reproduction reopens them. Keep GFM,
-   stripANSI, and import-attributes parked behind their multiple owners; prioritize
-   the next one-owner Bun row over zlib's native-handle cluster and test-runner's
-   multi-owner boundary.
+4. Keep the W56 Bun.Glob, W57 green builtin/util slices, W58 JSON5/YAML parser
+   sample, and W59 Node buffer leaves closed unless a new minimal reproduction
+   reopens them. Keep GFM, stripANSI, import-attributes, and buffer constants
+   parked behind their generic or multiple owners; prioritize the next one-owner
+   Bun row over zlib's native-handle cluster and test-runner's multi-owner boundary.
 5. Keep the fixed W51 final-read ordering, W52 file-backed stdin, W53 stdout
    disturbed/reject, and W54 conversion-helper brand owners closed; reopen only
    with a new minimal reproduction.
