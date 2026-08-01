@@ -655,6 +655,21 @@ surface on Linux:
   was started; the next route remains a fresh one-owner Node/Bun near-green
   measurement under the 3–5 lane resource policy.
 
+### W66 Bun util and parse_args leaf coverage
+
+- A fresh five-file Bun-native probe used **5 bounded jobs** and reused the
+  current Linux binary; no source change or build was needed. The selected
+  leaves covered MIME APIs, both `parse_args` files, AbortSignal resource
+  handling, and the exact MIME fixture.
+- Four files were green: **128 passed, 0 failed, 128 ran, 273 expects**.
+  `mime-api`, `parse_args/default-args`, `parse_args/parse-args`, and
+  `test-aborted` all passed. `util/exact/mime-test.js` exited successfully but
+  registered **0 tests** and is classified `no-tests`, not green coverage.
+- This checkpoint adds module-level coverage without changing the runtime or
+  conflating no-test fixtures with passing tests. No full corpus or
+  workspace-wide build was started; continue with a fresh one-owner row and
+  3–5 bounded lanes.
+
 ### W59 Node buffer leaf sample
 
 - W59 使用 Node corpus runner 的默认 bounded profile、**3 jobs**。首批五个文件为

@@ -5,6 +5,10 @@
 
 ## 2026-08-01
 
+- W66 fresh Bun util/parse_args leaf probe（5 jobs、复用当前 Linux binary、无构建）为
+  **4/5 files green、128 passed、0 failed、128 ran、273 expects**：MIME API、两个
+  `parse_args` 文件和 AbortSignal 全绿；`util/exact/mime-test.js` 为 **no-tests**，
+  未将成功退出误计为 coverage。未跑全量 corpus。
 - W65 fresh Bun URL API leaf probe（5 jobs、复用当前 Linux binary、无构建）新增 **5/5
   files green、135 passed、0 failed、137 ran、130 expects**：`url-parse-query`、
   `url-format`、`url-format-whatwg`、`url-domain-ascii-unicode`、
