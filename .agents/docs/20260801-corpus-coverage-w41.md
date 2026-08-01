@@ -248,6 +248,30 @@ the observed Linux limits; the coordinator owns the only root build.
 | W298 | Node path/os continuation leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five path/os guards; no source owner |
 | W299 | Bun Blob/stream/event/body leaf probe | 5 | 5/5 green; 47 passed / 0 failed / 50 ran / 119 expects; 0 timeout; no build | retain all five Bun/Deno guards; no source owner |
 | W300 | Node util/styleText/os/url leaves | 5 | 4/5 pass; 1 skip; 0 fail; 0 timeout; no build | retain util sleep, hex styleText, URL deprecation, and userinfo guards; record regular styleText as a TTY harness skip |
+| W301 | Node util/VM/encoding continuation leaves | 5 | 2/5 pass; 3 fail; 0 timeout; no build | retain signal exit-code and TextDecoder guards; split VM namespace inspect, internal symbol enumerability, and promisify custom-name owners |
+
+## W301 Node util/VM/encoding continuation leaf probe
+
+The bounded five-job Node selector covered signal-to-exit-code conversion,
+internal util symbols, VM namespace inspection, TextDecoder, and custom
+promisify names. It measured **2/5 file-level passes**, **3 failures**, and
+**0 runner timeouts**. Per-file durations were **231–382 ms**.
+
+`test-util-convert-signal-to-exit-code.mjs` and
+`test-util-text-decoder.js` passed.
+
+`test-util-inspect-namespace.js` failed on the VM namespace inspection shape:
+the runtime returned a generic null-prototype object rather than the expected
+Module namespace representation. `test-util-internal.js` failed because the
+private arrow-message symbol appeared in `Reflect.ownKeys()` where the test
+expects it to remain hidden. `test-util-promisify-custom-names.mjs` failed
+because the custom-promisified `fs.exists` function name was empty instead of
+`exists`. These are three separate focused owners. There were no source or
+upstream-fixture changes.
+
+The selector used the bounded five-job Node runner with a 30-second per-file
+timeout. No full corpus, build, or workspace-wide test was run; the Node
+runner reports file-level status only.
 
 ## W300 Node util/styleText/os/url leaf probe
 
