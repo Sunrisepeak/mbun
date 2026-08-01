@@ -91,6 +91,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W141 | Node events basic leaves | 5 | 3/5 pass; 2 fail; 0 timeout; no build | retain CustomEvent/list/listener-count; park AbortSignal max-listener default and events.once error-code owners |
 | W142 | Node string_decoder leaves | 3 | 2/3 pass; 1 fail; 0 timeout; no build | retain end/fuzz; park StringDecoder.prototype.write invalid-this brand owner |
 | W143 | Node timers basic leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five timer leaves; no source owner |
+| W144 | Bun Web console basic leaves | 4 | 2/4 green; 3 passed / 7 failed / 10 ran / 15 expects; 0 timeout; no build | retain UTF-16/recursive; park console.log and console.timeLog multi-owner formatting gaps |
 
 ## W133 Bun.Terminal green cluster
 
@@ -265,6 +266,25 @@ coordinator binary through `tools/integration/node_corpus_runner.py` with
 three bounded jobs and a 30-second per-file timeout. No full corpus or
 workspace-wide test was run; the selector and raw runner output were removed
 after recording the result.
+
+## W144 Bun Web console owner split
+
+The bounded three-job selector covered UTF-16 logging, ordinary console.log,
+recursive formatting, and console.timeLog. It reached **2/4 files green**, with
+**3 passed / 7 failed / 10 ran / 15 expects / 0 timeouts**. The green files were
+the UTF-16 and recursive-formatting leaves; their durations were 299–401ms.
+
+`console-log.test.ts` had four failures spanning snapshot/formatting output,
+long-array cutoff, console.group stack formatting, and SharedArrayBuffer
+rendering. `console-timeLog.test.ts` had three failures spanning elapsed-time
+output and logging format. These are multiple owners, so both files are parked
+without a speculative source change or issue.
+
+No source or upstream fixture change was made. The selector used the existing
+coordinator binary through `tools/integration/bun_corpus_runner.py` with three
+bounded jobs, a 30-second per-file timeout, and missing Node modules allowed.
+No full corpus or workspace-wide test was run; the selector and raw runner
+output were removed after recording the result.
 
 ## W132 Node VM and WebStreams owner split
 
