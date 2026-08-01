@@ -256,6 +256,14 @@ public:
         if (auto r{eval_void(js)}; !r) {
             return r;
         }
+        // Node's internal/event_target module loads only after the builtin image
+        // is assembled. Let the node-process partition repair its
+        // NodeEventTarget/Event realm boundary once top-level require exists.
+        if (auto r{eval_void(
+                "if (typeof globalThis.__mbunPatchNodeEventTarget === 'function') "
+                "globalThis.__mbunPatchNodeEventTarget(globalThis.require);")}; !r) {
+            return r;
+        }
         // Finish the entry Module from C++: `paths` reuses the loader's own
         // transliteration of Module._nodeModulePaths, and the entry becomes the
         // root of the parent chain so top-level require()s land in

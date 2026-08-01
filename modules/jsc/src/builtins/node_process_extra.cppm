@@ -31,6 +31,56 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
 (function () {
   const G = globalThis;
 
+  // `internal/event_target` and the engine's native Web Event can be separate
+  // realms during builtin initialization. NodeEventTarget's dispatch path is
+  // strict about its own Event brand, so install a post-loader bridge that
+  // converts a native Web Event into the matching internal event only at that
+  // boundary. The hook is invoked after the top-level require is installed.
+  try {
+    Object.defineProperty(G, "__mbunPatchNodeEventTarget", {
+      value: function patchNodeEventTarget(req) {
+        if (typeof req !== "function" || G.__mbunNodeEventTargetPatched) return;
+        let internal;
+        try { internal = req("internal/event_target"); } catch (e) { return; }
+        const NativeEvent = G.Event;
+        const InternalEvent = internal && internal.Event;
+        const NodeEventTarget = internal && internal.NodeEventTarget;
+        if (typeof NativeEvent !== "function" || typeof InternalEvent !== "function" ||
+            !NodeEventTarget || !NodeEventTarget.prototype) return;
+        const dispatchEvent = NodeEventTarget.prototype.dispatchEvent;
+        if (typeof dispatchEvent !== "function") return;
+        Object.defineProperty(NodeEventTarget.prototype, "dispatchEvent", {
+          value: function dispatchEventCompat(event) {
+            if (event instanceof NativeEvent && !(event instanceof InternalEvent)) {
+              event = new InternalEvent(event.type, {
+                bubbles: event.bubbles,
+                cancelable: event.cancelable,
+                composed: event.composed,
+              });
+            }
+            return Reflect.apply(dispatchEvent, this, [event]);
+          },
+          writable: true, configurable: true, enumerable: true,
+        });
+        Object.defineProperty(G, "__mbunNodeEventTargetPatched", {
+          value: true, writable: false, configurable: true, enumerable: false,
+        });
+        let abortController;
+        try { abortController = req("internal/abort_controller"); } catch (e) { return; }
+        if (abortController && typeof abortController.AbortController === "function" &&
+            typeof abortController.AbortSignal === "function") {
+          Object.defineProperty(G, "AbortController", {
+            value: abortController.AbortController, writable: true, configurable: true, enumerable: false,
+          });
+          Object.defineProperty(G, "AbortSignal", {
+            value: abortController.AbortSignal, writable: true, configurable: true, enumerable: false,
+          });
+        }
+      },
+      writable: false, configurable: true, enumerable: false,
+    });
+  } catch (e) {}
+
   // JSC's RegExp constructor omits the offending flags from its SyntaxError,
   // while node includes them (for example, `Invalid flags supplied to RegExp
   // constructor 'gg'.`). Keep the native constructor and call semantics, but

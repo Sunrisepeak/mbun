@@ -35,6 +35,21 @@ one that matches your task **before** acting — don't re-derive it:
   paths, usernames, hostnames, tokens/credentials, private URLs, environment
   values, and machine identifiers with generic placeholders. Re-check copied
   logs and error excerpts before publishing them.
+- **Batch PR updates.** Do not post a comment for every small probe or local
+  edit. Publish one concise update at a meaningful milestone: a real source
+  change, a bounded verification wave, a blocker/strategy change, or a
+  resource-safety event. Include quantitative evidence and the next direction;
+  combine adjacent results into one comment whenever possible.
+- **Keep commits substantive.** A normal development commit must contain the
+  source or test implementation that advances the task; update `changelog.md`
+  or handoff docs in the same commit when useful. Docs-only commits are
+  reserved for explicitly requested policy/design/handoff changes or a
+  maintainer request, and must explain their purpose rather than recording
+  every intermediate probe.
+- **Bounded parallel waves.** When the user specifies a per-round parallelism,
+  use it for independent bounded tasks (currently 5–8 for this work), while
+  reducing concurrency if memory, swap, or disk safety requires it and
+  reporting that adjustment.
 
 ## Sign every commit to a builder
 

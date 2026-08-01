@@ -27,6 +27,14 @@
   0 fail、0 timeout**；skip 是 upstream inspector-disabled guard，promise tracing
   的 intentional child rejection diagnostic 不影响成功退出。未发现 source owner，
   未构建、未跑全量 corpus。
+- W352 Node EventTarget/AbortSignal realm source fix：初始 W351 残留为 **4/5
+  pass、1 fail、0 timeout**，失败先落在 `NodeEventTarget` 的 Event brand，继而暴露
+  `AbortSignal` internal listener-map 边界。`node_process_extra.cppm` 加入延迟到
+  top-level `require` 之后的 Node realm bridge，`engine.inc` 负责调用并在缺少
+  internals 时安全跳过；最终 W352 selector **5/5 pass、0 fail、0 timeout**，W348
+  TTY/readline 回归 **5/5 pass、0 timeout**。最终 no-cache release build **88.49s**；
+  未修改 `compat/`、未跑全量 corpus，Bun guard 因当前 bun:test 环境无法解析
+  `internal/event_target` 未纳入计数。
 - W351 Node `EventEmitter.on` invalid-argument source fix：初始 selector **4/5
   pass、1 fail、0 timeout**；`modules/jsc/src/builtins/bootstrap.cppm` 补齐无效
   emitter、`null` options、Symbol 安全错误构造和 dotted-name `ERR_INVALID_ARG_TYPE`

@@ -1290,6 +1290,34 @@ embedded bootstrap payload. No `compat/` test or assertion was changed, no
 full corpus was run, and the residual EventTarget owner is parked for a
 separate bounded task.
 
+## W352 Node EventTarget/AbortSignal realm source fix
+
+The fresh five-job W352 selector reproduced the W351 residual with **4/5
+passes**, **1 failure**, and **0 runner timeouts**. The failing
+`test-events-on-async-iterator.js` first stopped at `NodeEventTarget` rejecting
+the global `Event` instance because the native Web constructor and
+`internal/event_target` used different brands. After that boundary was bridged,
+the same file advanced to the next internal `AbortSignal` listener-map check;
+the two failures were one Node web/internal realm owner, not independent API
+contracts.
+
+The source fix keeps builtin initialization lazy: `node_process_extra.cppm`
+registers a hook, and `runtime/engine.inc` invokes it only after top-level
+`require` exists. The hook converts a native Web Event at
+`NodeEventTarget.dispatchEvent`, aligns Node's `AbortController`/`AbortSignal`
+constructors, and treats missing Node internals as a no-op for Bun-only
+contexts. An eager initialization variant caused **5/5 bounded timeouts** and
+was reverted before acceptance.
+
+After the final no-cache release build (**88.49 seconds**), W352 measured
+**5/5 file-level passes**, **0 failures**, and **0 runner timeouts**. The W348
+TTY/readline regression remained **5/5 passes** under the same five-job bound.
+The attempted Bun-native EventEmitter guard could not produce assertion data in
+this worktree because its `bun:test` environment stopped before tests while
+resolving `internal/event_target`; it is not counted as a runtime regression or
+green result. No upstream fixture or `compat/` assertion changed, and no full
+corpus/workspace-wide test was run.
+
 ## Coverage novelty audit correction after W323
 
 A post-wave audit found that older ledger sections record many files by
