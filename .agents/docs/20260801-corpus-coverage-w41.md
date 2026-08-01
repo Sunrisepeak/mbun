@@ -232,6 +232,29 @@ the observed Linux limits; the coordinator owns the only root build.
 | W282 | Node module wrap/wrapper/deprecation leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain CJS wrapper child-process probes and `module.parent` setter deprecation guard; no source owner |
 | W283 | Node module entry/global-path leaves | 3 | 2/3 pass; 1 fail; 0 timeout; no build | retain NODE_PATH and main-extension leaves; park copied-child HOME/global-path resolution owner |
 | W284 | Bun HTTP timeout/cork/TLS leaves | 3 | 3/3 green; 16 passed / 0 failed / 16 ran / 46 expects; 0 timeout; no build | retain timeout lifecycle, nested-cork isolation, and TLS identity guards; no source owner |
+| W285 | Node circular-loader/require-error leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build | retain circular warning/symlink, invalid-package, and Unicode-path leaves; park JSON parse filename diagnostic owner |
+
+## W285 Node circular-loader/require-error leaf probe
+
+The bounded **five-job** Node selector covered
+`test-module-circular-dependency-warning.js`,
+`test-module-circular-symlinks.js`, `test-require-invalid-package.js`,
+`test-require-json.js`, and `test-require-unicode.js`. It measured **4/5
+file-level passes**, **1 failure**, and **0 runner timeouts**. Per-file
+durations were 200–251ms.
+
+`test-module-circular-dependency-warning.js`,
+`test-module-circular-symlinks.js`, `test-require-invalid-package.js`, and
+`test-require-unicode.js` passed. `test-require-json.js` failed at its first
+invalid-JSON assertion: the reference expects the error message to include the
+fixture path, while mbun returned only a generic JSON parse message. This is a
+narrow JSON diagnostic owner; no source or upstream fixture change was made.
+
+The selector reused the coordinator binary through
+`tools/integration/node_corpus_runner.py` with **five bounded jobs** and a
+30-second per-file timeout. No full corpus, build, or workspace-wide test was
+run. The Node corpus runner reports only file-level status for these plain
+scripts, so no synthetic subtest count was added.
 
 ## W284 Bun HTTP timeout/cork/TLS leaf probe
 
