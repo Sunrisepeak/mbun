@@ -235,6 +235,27 @@ the observed Linux limits; the coordinator owns the only root build.
 | W285 | Node circular-loader/require-error leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build | retain circular warning/symlink, invalid-package, and Unicode-path leaves; park JSON parse filename diagnostic owner |
 | W286 | Node require boundary leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain node-prefix/cache, NUL, exception-reload, empty-main, and deleted-directory resolution guards; no source owner |
 | W287 | Bun util inspect/fs metadata leaves | 5 | 4/5 green; 61 passed / 1 failed / 62 ran / 130 expects; 0 timeout; no build | retain Bun/custom inspect, birthtime, and cp symlink guards; park proxy inspect trap owner |
+| W288 | Node resolver/require flag leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain import resilience, dot resolution, guarded ESM require, process identity, and invalid resolve-path validation; no source owner |
+
+## W288 Node resolver/require flag leaf probe
+
+The bounded **five-job** Node selector covered
+`test-require-delete-array-iterator.js`, `test-require-dot.js`,
+`test-require-mjs.js`, `test-require-process.js`, and
+`test-require-resolve-invalid-paths.js`. It measured **5/5 file-level passes**,
+**0 failures**, and **0 runner timeouts**. Per-file durations were 284–384ms.
+
+The selector passed dynamic import after deleting the Array iterator prototype,
+dot-module resolution and `NODE_PATH` behavior, the
+`--no-experimental-require-module` ESM rejection contract, `require('process')`
+identity, and non-string `require.resolve()` path validation. These are
+isolated resolver/require leaves with no new source owner.
+
+No source or upstream fixture change was made. The selector reused the
+coordinator binary through `tools/integration/node_corpus_runner.py` with
+**five bounded jobs** and a 30-second per-file timeout. No full corpus, build,
+or workspace-wide test was run. The Node corpus runner reports only file-level
+status for these plain scripts, so no synthetic subtest count was added.
 
 ## W287 Bun util inspect/fs metadata leaf probe
 
