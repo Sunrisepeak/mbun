@@ -285,6 +285,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W335 | Node timer API leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build; 5 fresh | retain all five timer API guards; no source owner |
 | W336 | Node assert/DNS validation leaves | 5 | 3/5 pass; 2 fail; 0 timeout; no build; 5 fresh | retain ESM/CJS, Myers, and DNS guards; park async-thenable and first-line assertion-message owners |
 | W337 | Node HTTP contract leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build; 5 fresh | retain all five HTTP method/port/validation/header guards; no source owner |
+| W338 | Node dgram local UDP contract leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build; 5 fresh | retain all five dgram close/type/send/address/empty-packet guards; no source owner |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -972,6 +973,25 @@ upstream-fixture changes, full corpus, or workspace-wide build were made. After
 the run, resources showed about **46 GiB available memory**, **272 KiB free
 swap**, and **16 GiB free disk at 99% usage**. Temporary runner output is
 cleaned immediately and the next wave remains resource-gated.
+
+## W338 Node dgram local UDP contract leaves
+
+The bounded five-job Node selector covered five fresh dgram files after
+filename/stem and narrow semantic-owner review:
+`test-dgram-close-is-not-callback.js`, `test-dgram-createSocket-type.js`,
+`test-dgram-send-bad-arguments.js`, `test-dgram-send-address-types.js`, and
+`test-dgram-send-empty-array.js`. The runner measured **5/5 file-level passes**,
+**0 failures**, **0 runner timeouts**, and **285–337 ms** per file. The Node
+runner reports file-level status only; no assertion-level pass total is
+inferred.
+
+All five local UDP guards passed: non-function close callback handling, socket
+type and buffer-option validation, send argument/range validation, address
+type validation, and empty datagram delivery. No source or upstream-fixture
+changes, full corpus, or workspace-wide build were made. After the run,
+resources showed about **46 GiB available memory**, **296 KiB free swap**, and
+**16 GiB free disk at 99% usage**. Temporary runner output is cleaned
+immediately and the next wave remains resource-gated.
 
 ## Coverage novelty audit correction after W323
 
