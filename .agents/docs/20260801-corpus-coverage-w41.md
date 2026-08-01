@@ -115,6 +115,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W165 | Node fs error/read leaves | 5 | 3/3 executable pass; 2 Linux-inapplicable skips; 0 fail; 0 timeout; no build | retain all three executable leaves; exclude two Windows-only skips |
 | W166 | Bun util/file low-coupling leaves | 4 | 3/4 green; 28 passed / 4 failed / 32 ran / 73 expects; 0 timeout; no build | retain fileUrl/bun-file-read/concat; reconfirm Bun.file async-stack and JSON-message owners |
 | W167 | Node fs delete/error leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five delete/path-error leaves; no source owner |
+| W168 | Bun util error/ANSI leaves | 4 | 2/4 green; 50 passed / 203 failed / 253 ran / 261 expects; 0 timeout; no build | retain error-code-mirror/exotic-global; park reportError printer and wrapAnsi multi-owner failures |
 
 ## W133 Bun.Terminal green cluster
 
@@ -611,6 +612,23 @@ coordinator binary through `tools/integration/node_corpus_runner.py` with
 three bounded jobs and a 30-second per-file timeout. No full corpus or
 workspace-wide test was run; the selector and raw runner output were removed
 after recording the result.
+
+## W168 Bun util owner split
+
+The bounded three-job selector covered error-code mirroring, mutable global
+prototype behavior, reportError output, and ANSI wrapping. It reached **2/4
+files green**, with **50 passed / 203 failed / 253 ran / 261 expects** and
+**0 timeouts**. The green leaves were error-code-mirror (**2/2**) and
+exotic-global-mutable-prototype (**1/1**). ReportError failures split across
+native error-printer output/stack and lone-surrogate handling; wrapAnsi failures
+span word wrapping, width accounting, and ANSI escape composition. These are
+parked as separate broad owners.
+
+No source or upstream fixture change was made. The selector used the existing
+coordinator binary through `tools/integration/bun_corpus_runner.py` with
+three bounded jobs, a 30-second per-file timeout, and missing Node modules
+allowed. No full corpus or workspace-wide test was run; the selector and raw
+runner output were removed after recording the result.
 
 ## W132 Node VM and WebStreams owner split
 

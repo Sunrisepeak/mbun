@@ -5,6 +5,7 @@
 
 ## 2026-08-01
 
+- W168 fresh Bun util error/ANSI probe（3 jobs、复用现有 coordinator binary、无构建）**2/4 files green、50 passed、203 failed、253 ran、261 expects、0 timeout**：error-code-mirror **2/2**、exotic-global-mutable-prototype **1/1** 通过；reportError 失败横跨 native error-printer output/stack 与 lone-surrogate handling，wrapAnsi 失败横跨 wrapping、width accounting、ANSI composition，均停车未混修。
 - W167 fresh Node fs delete/error probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：rename/unlink type validation、rmdir not-found/file-target errors、mkdir/rmdir lifecycle 全部通过；单文件耗时 164–249ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W166 fresh Bun util/file probe（3 jobs、复用现有 coordinator binary、无构建）**3/4 files green、28 passed、4 failed、32 ran、73 expects、0 timeout**：fileUrl **20/20**、Bun.file read **1/1**、concat **5/5** 通过；bun-file broad file 的 4 个失败复现已停车的 async-stack 与 empty-JSON-message owners，未开新 issue 或混修。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W165 fresh Node fs error/read probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 executable files pass、2 Windows-only skips、0 fail、0 timeout**：empty read、readfile error、readlink type validation 通过；两个 Windows-only invalid-path leaves 在 Linux 明确 skip，不计入 green denominator。可执行文件耗时 165–350ms，未修改 source/fixture，未跑全量 corpus/workspace-wide test。
