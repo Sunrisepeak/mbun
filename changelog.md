@@ -5,6 +5,7 @@
 
 ## 2026-08-01
 
+- W199 fresh Node Duplex/destroy/finalization probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：Duplex destroy、readable end、base Duplex、stream destroy、finished default path 全部通过；单文件耗时 198–265ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W198 fresh Node Duplex probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：Duplex from、props、readable/writable、writable-finished、end 全部通过；单文件耗时 165–283ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W197 fresh Node Readable boundary probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：unshift、unimplemented `_read`、next-no-null、object multi-push、destroy 全部通过；单文件耗时 165–265ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W196 fresh Node Readable readiness/encoding probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：readable-then-resume、readingMore、resume HWM/scheduled、existing-buffer encoding 全部通过；单文件耗时 165–200ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
