@@ -670,6 +670,26 @@ surface on Linux:
   workspace-wide build was started; continue with a fresh one-owner row and
   3–5 bounded lanes.
 
+### W67 Bun worker_threads triage parked
+
+- A fresh five-file Bun-native probe used **5 bounded jobs** and reused the
+  current Linux binary; no source change or build was needed. The sample was
+  `worker-thread-id`, `worker-top-level-await`, `worker-shutdown-post-leak`,
+  `worker-async-dispose`, and `worker-transfer-list`.
+- The runner measured **2 green files, 8 passed, 3 failed, 12 ran, 13
+  expects**; one additional file was `all-skipped`. `worker-async-dispose`
+  and `worker-transfer-list` were fully green. The direct worker-thread-id
+  entry is a fixture-style file and fails without its parent worker context,
+  so it is not an independent runtime owner.
+- `worker-top-level-await` reproduced serially at **4/6 tests pass, 2 fail**.
+  Both failures are the same unsettled-TLA exit-code 13 contract. The existing
+  engine evidence and prior rollback show that applying Node's status 13 in the
+  shared path removes two Bun green files and exposes a separate worker-open
+  liveness gap; this remains parked as a cross-corpus/liveness boundary, with
+  no speculative source patch or mixed issue.
+- No full corpus or workspace-wide build was started. Continue with a fresh
+  one-owner row under the 3–5 lane policy.
+
 ### W59 Node buffer leaf sample
 
 - W59 使用 Node corpus runner 的默认 bounded profile、**3 jobs**。首批五个文件为

@@ -5,6 +5,12 @@
 
 ## 2026-08-01
 
+- W67 fresh Bun `worker_threads` triage（5 jobs、复用当前 Linux binary、无构建）测得
+  **2 green files、8 passed、3 failed、12 ran、13 expects**，另有 1 个 all-skipped。
+  `worker-async-dispose` 与 `worker-transfer-list` 全绿；`worker-thread-id` 是缺少
+  parent worker context 的 fixture-style entry；`worker-top-level-await` 串行复测为
+  **4/6 pass、2 fail**，同属 unsettled-TLA exit-code 13 与 worker liveness 的跨
+  corpus owner，按既有实测停车，未做猜测性 source patch。未跑全量 corpus。
 - W66 fresh Bun util/parse_args leaf probe（5 jobs、复用当前 Linux binary、无构建）为
   **4/5 files green、128 passed、0 failed、128 ran、273 expects**：MIME API、两个
   `parse_args` 文件和 AbortSignal 全绿；`util/exact/mime-test.js` 为 **no-tests**，
