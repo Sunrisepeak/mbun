@@ -5,6 +5,10 @@
 
 ## 2026-08-01
 
+- W75 fresh Bun util leaf probe（5 jobs、复用当前 Linux binary、无构建）新增 **5/5 files
+  green、13 passed、0 failed、13 ran、24 expects**：file exists、Bun.concat、error-code
+  mirror、error-name preservation 和 file-type detection 全绿。未修改上游 fixture，未跑
+  全量 corpus。
 - W74 fresh Node events/stream/assert/console leaf probe（5 jobs、复用当前 Linux binary、无构建）
   测得 **4 green files、136 passed、2 failed、138 ran、279 expects**。event-emitter、
   node-stream-uint8array、assert TypedArray deep-equal、console table iterator 全绿；

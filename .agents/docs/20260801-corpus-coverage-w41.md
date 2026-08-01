@@ -822,6 +822,17 @@ surface on Linux:
   were performed. Continue with a fresh one-owner row under the 3–5 lane
   policy.
 
+### W75 Bun util leaf coverage
+
+- A fresh five-file Bun-native util probe used **5 bounded jobs** and reused
+  the current Linux binary; no source change or build was needed. All **5/5
+  files** were green: **13 passed, 0 failed, 13 ran, 24 expects**.
+- The guards cover Bun file existence, `Bun.concat`, error-code mirroring,
+  error-name preservation, and file-type detection. Keep them as cheap Bun
+  leaves while selecting the next fresh candidate.
+- No upstream fixture changes, no full corpus, and no workspace-wide build
+  were performed.
+
 ### W59 Node buffer leaf sample
 
 - W59 使用 Node corpus runner 的默认 bounded profile、**3 jobs**。首批五个文件为
