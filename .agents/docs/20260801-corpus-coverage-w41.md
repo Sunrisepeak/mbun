@@ -156,6 +156,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W206 | Bun Web/Atomics/URLPattern leaves | 5 | 4/5 green; 447 passed / 12 failed / 459 ran / 6375 expects; 0 timeout; no build | retain explicit-resource-management, nationalized, SHA-3, and Atomics; park URLPattern parser/URL-base/Unicode owners |
 | W207 | Node diagnostics_channel leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain has-subscribers, object/channel pub-sub, symbol channel, and sync-unsubscribe leaves; no source owner |
 | W208 | Node events lifecycle leaves | 4 | 2/4 pass; 2 fail; 0 timeout; no build | retain addAbortListener and static getEventListeners; park async-iterator invalid-argument code and uncaught-exception stack-shape owners |
+| W209 | Bun Node Buffer/DOM/crypto leaves | 5 | 5/5 green; 17 passed / 0 failed / 17 ran / 74 expects; 0 timeout; no build | retain Buffer Symbol.toPrimitive/resolveObjectURL, DOMException, crypto invalid-this, and HKDF leaves; no source owner |
 
 ## W133 Bun.Terminal green cluster
 
@@ -1250,6 +1251,21 @@ header. These remain separate owners; no mixed fix was attempted.
 No source or upstream fixture change was made. The selector used the existing
 coordinator binary through `tools/integration/node_corpus_runner.py` with
 three bounded jobs and a 30-second per-file timeout. No full corpus or
+workspace-wide test was run; the selector and raw runner output were removed
+after recording the result.
+
+## W209 Bun Node Buffer/DOM/crypto green cluster
+
+The bounded three-job selector covered Buffer `Symbol.toPrimitive`,
+`buffer.resolveObjectURL`, Node DOMException behavior, native crypto invalid
+receivers, and HKDF callback/key-object contracts. All **5/5 files were green**:
+**17 passed / 0 failed / 17 ran / 74 expects / 0 timeouts**. Per-file durations
+were 165–300ms.
+
+No source or upstream fixture change was made and no single failing owner was
+found. The selector used the existing coordinator binary through
+`tools/integration/bun_corpus_runner.py` with three bounded jobs, a 30-second
+per-file timeout, and missing Node modules allowed. No full corpus or
 workspace-wide test was run; the selector and raw runner output were removed
 after recording the result.
 
