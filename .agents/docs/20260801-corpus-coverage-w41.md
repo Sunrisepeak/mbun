@@ -307,6 +307,19 @@ the observed Linux limits; the coordinator owns the only root build.
 | W358 | Node TLS session-ticket/resumption source fix | 8 Node + 5 Node regression | pre 3/5 pass; post session target 4/5 pass and follow-up 2/3 pass; 2 independent failures parked; 0 timeout; two incremental release builds; W355 regression 5/5 pass | suppress resumed-session event forwarding and stabilize first/offered ticket reporting; park cluster session sharing and HTTPS Agent message owners |
 | W359 | Node TLS hostname/CN diagnostic source fix | 5 Node + 1 Node regression | pre 2/5 pass, 3 fail; post 3/5 pass, 2 independent failures parked; 0 timeout; one serial incremental release build; focused target 1/1 and W355 diagnostic regression 1/1 pass | recover the client leaf from the peer chain when direct lookup is unavailable, restoring Node's CN-specific hostname mismatch message; park HTTPS Agent SNI propagation and TLS SNI error mapping |
 | W360 | Node TLS server-side no-SNI value source fix | 5 Node + 1 Node regression | pre 1/5 pass, 4 fail; post 2/5 pass, 3 independent failures parked; 0 timeout; one serial release rebuild; focused target 1/1 and SNI-context regression 1/1 pass | expose `false` for a server-side TLSSocket with no ClientHello SNI, preserving `undefined` for an unset client-side option; park SNICallback authorization, invalid-context error mapping, and offline ClientHello callback owners |
+| W361 | Node fs near-green triage parked | 5 | 4/5 pass; 1 fail; 0 timeout | park JSC generic stack-overflow wording; no global message rewrite |
+| W362 | Node dns/promises constant source fix | 5 | pre 3/5 pass, 1 fail, 1 timeout; post 4/5 pass, 0 fail, 1 timeout; one serialized release rebuild | expose Node DNS error constants on shared `dns.promises`; park resolveAny packet/liveness timeout |
+| W363 | Node HTTP low-coupling green slice | 5 | 5/5 pass; 0 fail; 0 timeout | retain five HTTP guards; no source owner |
+| W364 | Node DNS timeout/backoff source fix | 5 | pre 2/5 pass, 1 fail, 2 timeout; post 3/5 pass, 0 fail, 2 timeout; three serialized release builds | format DNS local errors with Node codes and cap resolver retry backoff; park channel-cancel liveness |
+| W365 | Bun HTTP corrected bounded slice | 5 | 1/5 green; 8 passed / 4 failed / 12 ran / 0 timeout | park three missing optional dependencies and node-http backpressure/liveness; exclude mistaken auto-binary dispatch |
+| W366 | Bun util bounded slice | 5 | 5/5 green; 171 passed / 1 ahead-of-reference / 172 ran / 4101 expects | retain all five util leaves; no source owner |
+| W367 | Bun crypto bounded slice | 5 | 4/5 green; 10 passed / 8 failed / 18 ran / 78 expects | retain four crypto leaves; park generic external-memory accounting |
+| W368 | Node HTTP capture/pause slice | 5 | 3/5 pass; 0 fail; 2 timeout | retain three HTTP leaves; park capture-rejection and no-read/no-dump liveness |
+| W369 | Node fs stack-overflow triage | 5 | 4/5 pass; 1 fail; 0 timeout | park JSC generic `RangeError` wording; no global message rewrite |
+| W370 | Node TLS callback/context triage | 5 | 2/5 pass; 3 fail; 0 timeout | park JS callback-inside-handshake, empty-context mapping, and deferred TLS owners |
+| W371 | Node net low-coupling green slice | 5 | 5/5 pass; 0 fail; 0 timeout | retain all five net leaves; no source owner |
+| W372 | Node net lifecycle green slice | 5 | 5/5 pass; 0 fail; 0 timeout | retain all five lifecycle leaves; no source owner |
+| W373 | Node net `ipv6Only` source fix | 5 | pre 4/5 pass + 1 fail; post 5/5 pass; W371/W372 regressions 5/5; one serial release rebuild | pass `ipv6Only` through the native bridge and bind AF_INET6 with `IPV6_V6ONLY`; no fixture change |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -1524,6 +1537,47 @@ failures, and 2 timeouts**. `test-dns-resolver-max-timeout.js` now passes and
 reports **timeout1=3504ms, timeout2=1502ms**; `test-dns-promises-exists.js`
 also passed as a focused regression. The two channel-cancel timeouts remain
 parked. No upstream fixture or full corpus changed.
+
+## W365–W372 bounded triage and green coverage
+
+The corrected W365 Bun HTTP run measured **1/5 files green, 8 passed, 4 failed,
+12 ran, and 0 timeout**. The first dispatch used an invalid automatic binary
+selector and was excluded from evidence. The corrected failures split into
+three missing optional dependency loads and one node-http backpressure/liveness
+owner; no source change was justified.
+
+W366 Bun util measured **5/5 files green, 171 passed, 1 ahead-of-reference,
+172 ran, and 4101 expects**. W367 Bun crypto measured **4/5 files green, 10
+passed, 8 failed, 18 ran, and 78 expects**; the eight failures are the generic
+crypto external-memory accounting surface and remain parked. W368 Node HTTP
+measured **3/5 passes, 0 failures, and 2 timeouts**; capture-rejection and
+no-read/no-dump remain separate liveness owners.
+
+W369 Node fs measured **4/5 passes, 1 failure, and 0 timeout**. Its only
+failure is the JSC generic stack-overflow `RangeError` wording, so no global
+message rewrite was attempted. W370 Node TLS measured **2/5 passes, 3
+failures, and 0 timeout**; the remaining failures require callback execution
+inside the TLS handshake, empty-context error mapping, or the deferred TLS
+transport, and were not mixed into a speculative patch.
+
+W371 and W372 each measured **5/5 passes, 0 failures, and 0 timeouts** across
+their five-file Node net selectors. These green results were retained locally
+until a source checkpoint rather than committed as standalone documentation.
+
+## W373 Node net `ipv6Only` source fix
+
+The fresh five-file Node net selector initially measured **4/5 passes, 1
+failure, and 0 timeout**. `test-net-listen-ipv6only.js` exposed that the JS
+server recorded `ipv6Only` but the native bridge still created an AF_INET
+listener, allowing the IPv4 probe to connect to an IPv6-only server.
+
+`modules/jsc/src/js_net.cppm` now passes the option through the native listen
+bridge and preserves IPv6 hosts when `ipv6Only` is set. `modules/jsc/src/runtime/net.inc`
+creates an AF_INET6 listener and enables `IPV6_V6ONLY` for that path. After one
+serial release build (**59.71s**), W373 measured **5/5 passes, 0 failures, and
+0 timeout**; the W371 and W372 five-file regressions each remained **5/5
+passes**. No upstream fixture changed and no full corpus/workspace-wide test
+ran.
 
 ## Coverage novelty audit correction after W323
 

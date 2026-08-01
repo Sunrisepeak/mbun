@@ -164,6 +164,51 @@ JSValueRef netn_listen_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_
         return JSValueMakeUndefined(ctx);
     const auto port{static_cast<std::uint16_t>(
         argc > 1 ? JSValueToNumber(ctx, args[1], nullptr) : 0)};
+    const bool ipv6Only{argc > 3 && JSValueToBoolean(ctx, args[3]) && host.find(':') != std::string::npos};
+    if (ipv6Only) {
+        sockaddr_in6 addr{};
+        addr.sin6_family = AF_INET6;
+        addr.sin6_port = htons(port);
+        if (host == "::" || host == "::0" || host == "*") {
+            addr.sin6_addr = in6addr_any;
+        } else if (inet_pton(AF_INET6, host.c_str(), &addr.sin6_addr) != 1) {
+            return fs_throw(ctx, exc, "net.listen: invalid address '" + host + "'");
+        }
+        const int fd{socket(AF_INET6, SOCK_STREAM, 0)};
+        if (fd < 0) return fs_throw(ctx, exc, "net.listen: socket() failed");
+        const int one{1};
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+        setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof one);
+        if (argc > 2 && JSValueToBoolean(ctx, args[2])) {
+#ifdef SO_REUSEPORT
+            if (setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one) != 0) {
+                const int saved{errno};
+                close(fd);
+                return fs_throw(ctx, exc, std::string{"net.listen: SO_REUSEPORT failed ("} +
+                                              net_errno_name(saved) + ": " + std::strerror(saved) + ")");
+            }
+#else
+            close(fd);
+            return fs_throw(ctx, exc, "net.listen: SO_REUSEPORT failed (ENOTSUP: not supported)");
+#endif
+        }
+        if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof addr) != 0 ||
+            ::listen(fd, 128) != 0) {
+            const int saved{errno};
+            close(fd);
+            return fs_throw(ctx, exc, std::string{"net.listen: bind/listen failed ("} +
+                                          net_errno_name(saved) + ": " + std::strerror(saved) + ")");
+        }
+        sockaddr_in6 bound{};
+        socklen_t blen{sizeof bound};
+        getsockname(fd, reinterpret_cast<sockaddr*>(&bound), &blen);
+        net_set_nonblock(fd);
+        net_fds().insert(fd);
+        JSObjectRef r{JSObjectMake(ctx, nullptr, nullptr)};
+        set_prop(ctx, r, "fd", JSValueMakeNumber(ctx, fd));
+        set_prop(ctx, r, "port", JSValueMakeNumber(ctx, ntohs(bound.sin6_port)));
+        return r;
+    }
     sockaddr_in addr{};
     if (!net_parse_addr(host, port, addr)) {
         return fs_throw(ctx, exc, "net.listen: invalid address '" + host + "'");

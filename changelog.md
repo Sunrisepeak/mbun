@@ -5,6 +5,20 @@
 
 ## 2026-08-02
 
+- W373 Node `net` `ipv6Only` source fix：W373 基线 **4/5 pass、1 fail、0 timeout**，失败证明
+  `Server.listen({ host: "::", ipv6Only: true })` 只在 JS 层记录选项，native 仍创建 AF_INET
+  listener。`modules/jsc/src/js_net.cppm` 透传该选项，`modules/jsc/src/runtime/net.inc`
+  在该路径创建 AF_INET6 并启用 `IPV6_V6ONLY`；串行 release build **59.71s** 后 W373
+  **5/5 pass、0 fail、0 timeout**，W371/W372 回归各 **5/5 pass**。未修改 upstream fixture，
+  未跑全量 corpus。
+- W371/W372 Node net 绿色覆盖：两个相邻五文件 selector 均为 **5/5 pass、0 fail、0 timeout**；
+  结果保留到源码 checkpoint，未拆成 docs-only commit。
+- W365–W370 bounded triage：W365 修正 selector 后 **1/5 green、8 passed、4 failed、12 ran、
+  0 timeout**；W366 Bun util **5/5 green、171 passed、1 ahead、172 ran、4101 expects**；
+  W367 Bun crypto **4/5 green、10 passed、8 failed、18 ran、78 expects**；W368 Node HTTP
+  **3/5 pass、0 fail、2 timeout**；W369 Node fs **4/5 pass、1 fail、0 timeout**；W370 Node TLS
+  **2/5 pass、3 fail、0 timeout**。缺失依赖、liveness、JSC 通用错误文案、TLS callback/engine
+  等 owner 已分别停车，未做 speculative source patch。
 - W346 Node readline Unicode line-separator source fix：W345 基线为 **4/5
   file-level pass、1 fail、0 timeout**；`modules/jsc/src/builtins/node_readline.cppm`
   的 `lineEnding` 正则只识别 CR/LF，导致 U+2028/U+2029 留在同一行。最小修复将

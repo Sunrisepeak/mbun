@@ -2429,10 +2429,10 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       // the Bun.serve ":: default" convention already used above.
       if (host == null) host = "::";
       const isV6 = host.indexOf(":") !== -1;
-      const bindHost = host === "::1" ? "127.0.0.1" : host;  // v6 loopback → v4 bind
+      const bindHost = host === "::1" && !this._ipv6Only ? "127.0.0.1" : host;  // v6 loopback → v4 bind
       if (cb) this.once("listening", cb);
       let lh;
-      try { lh = NN.listen(bindHost, port, !!this._reusePort); }
+      try { lh = NN.listen(bindHost, port, !!this._reusePort, !!this._ipv6Only); }
       catch (e) {
         if (isAccessDenied(e)) throw e;
         const err = listenError(e, host, port);
