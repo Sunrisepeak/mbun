@@ -187,6 +187,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W237 | Bun Node stream leaves | 2 | 1/2 green; 92 passed / 6 failed / 104 ran / 165 expects; 0 runner timeout; no build | retain Uint8Array stream guards; park stdin subprocess, Web/Node cancellation reasons, Bun.serve direct sink, and gated resolve.paths owners |
 | W238 | Node stream lifecycle leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain Readable Web termination, Writable cork-buffer accounting, and Duplex end/half-open guards; no source owner |
 | W239 | Node stream pipeline/state leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain pipeline listener cleanup/uncaught delivery, Writable needDrain, and writableCorked transitions; no source owner |
+| W240 | Node stream state/destroy leaves | 2 | 2/2 pass; 0 fail; 0 timeout; no build | retain Readable pause/resume/backpressure and Writable destroy/error/custom-destroy lifecycle guards; no source owner |
 
 ## W133 Bun.Terminal green cluster
 
@@ -293,6 +294,19 @@ upstream files are plain scripts, so file-level clean exit is authoritative.
 No source or fixture change was made, and no full corpus or workspace-wide test
 was run; the selector and raw runner output were removed after recording the
 result.
+
+## W240 Node stream state/destroy green cluster
+
+The bounded three-job Node selector covered repeated Readable pause/resume with
+drain/backpressure behavior and Writable normal/error/custom-destroy lifecycle
+ordering. Both fresh files passed (**2/2**, **0 failures**, **0 timeouts**) with
+per-file durations of 198–199ms; two fresh files were sufficient after
+excluding already-recorded stream leaves.
+
+These plain upstream scripts were classified at file-level clean exit. No
+source or upstream fixture change was made, and no full corpus or workspace-wide
+test was run; the selector and raw runner output were removed after recording
+the result.
 
 ## W239 Node stream pipeline/state green cluster
 

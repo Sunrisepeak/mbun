@@ -5,6 +5,7 @@
 
 ## 2026-08-01
 
+- W240 fresh Node stream state/destroy leaf probe（3 jobs、复用现有 coordinator binary、无构建）**2/2 files pass、0 fail、0 timeout**：Readable pause/resume/backpressure、Writable destroy/error/custom-destroy lifecycle 全部 clean-exit，单文件耗时 198–199ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W239 fresh Node stream pipeline/state leaf probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：pipeline listener cleanup/uncaught delivery、Writable needDrain、writableCorked transitions 全部 clean-exit，单文件耗时 198–299ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W238 fresh Node stream lifecycle leaf probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：Readable Web termination、Writable cork-buffer accounting、Duplex end/half-open 全部 clean-exit，单文件耗时 198–200ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W237 fresh Bun Node stream probe（3 jobs、复用现有 coordinator binary、无构建）**1/2 files green、92 passed、6 failed、104 ran、165 expects、0 runner timeout**：Uint8Array stream 5/5；广义 stream 87/99，失败拆为 stdin subprocess、Web/Node cancellation reason、Bun.serve direct sink、gated require.resolve.paths owners，广义文件约 8.2s。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
