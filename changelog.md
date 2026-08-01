@@ -5,6 +5,7 @@
 
 ## 2026-08-01
 
+- W110 fresh Bun util low-coupling probe（3 jobs、复用 W108 fresh binary、无构建）**5/5 files green、57 passed、0 failed、57 ran、966 expects**：`escapeHTML`、`escapeRegExp`、`fileURL`、`hash`、`sleepSync` 全部通过。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W109 fresh Node TLS constructor/default-option probe（3 jobs、复用 W108 fresh binary、无构建）**3/5 files pass、
   1 fail、1 timeout**：server identity、no-host connect、boolean option validation 通过；parent constructor
   只剩 accepted TLS socket 的 pauseOnConnect 传递问题；socket default options 无输出超时。该 timeout
