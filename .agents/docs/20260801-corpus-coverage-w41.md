@@ -178,6 +178,8 @@ the observed Linux limits; the coordinator owns the only root build.
 | W228 | Node crypto/WebCrypto leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain KeyObject own-key, AES-GCM empty-payload, and short-tag rejection guards; no source owner |
 | W229 | Bun Node URL/path leaves | 3 | 3/3 green; 4 passed / 0 failed / 5 ran / 2 expects; 0 timeout; no build | retain path parse/format and zero-length guards plus legacy URL query-object prototype guard; one URL TODO remains; no source owner |
 | W230 | Bun Node path/URL leaves | 3 | 3/3 green; 8 passed / 0 failed / 8 ran / 0 expects; 0 timeout; no build | retain basename/extname platform cases and WHATWG URL format; no source owner |
+| W231 | Bun Node util/events/string_decoder leaves | 3 | 3/3 green; 214 passed / 0 failed / 214 ran / 6538 expects; 0 timeout; no build | retain EventEmitter, StringDecoder, and util.types green cluster; no source owner |
+| W232 | Node string/events/URL leaves | 3 | 1/3 pass; 2 fail; 0 timeout; no build | retain URL query parsing; park events.once invalid-option error code and StringDecoder forged-receiver ERR_INVALID_THIS owners |
 
 ## W133 Bun.Terminal green cluster
 
@@ -284,6 +286,32 @@ upstream files are plain scripts, so file-level clean exit is authoritative.
 No source or fixture change was made, and no full corpus or workspace-wide test
 was run; the selector and raw runner output were removed after recording the
 result.
+
+## W232 Node string/events/URL owner split
+
+The bounded three-job Node selector covered StringDecoder receiver validation,
+`events.once` option errors, and legacy `url.parse` query handling. **1/3 files
+passed**, with **2 failures and 0 timeouts**; per-file durations were 198–401ms.
+
+The URL query leaf passed. `events.once` invalid options produced an error
+without the expected `ERR_INVALID_ARG_TYPE` code, while a forged
+`StringDecoder.prototype.write` receiver did not throw the expected
+`ERR_INVALID_THIS`. Both are focused API semantic owners; no source or
+upstream fixture change was made, and no full corpus or workspace-wide test was
+run. The selector and raw runner output were removed after recording the
+result.
+
+## W231 Bun Node util/events/string_decoder green cluster
+
+The bounded three-job Bun selector covered EventEmitter lifecycle/async/error
+handling, StringDecoder encoding and partial-sequence state, and `util.types`
+brand/cross-import checks. All **3/3 files were green**, reaching **214 passed /
+0 failed / 214 ran / 6538 expects** with **0 timeouts**; per-file durations were
+200–451ms.
+
+No source or upstream fixture change was made, and no full corpus or
+workspace-wide test was run; the selector and raw runner output were removed
+after recording the result.
 
 ## W230 Bun Node path/URL green cluster
 

@@ -5,6 +5,8 @@
 
 ## 2026-08-01
 
+- W232 fresh Node string/events/URL leaf probe（3 jobs、复用现有 coordinator binary、无构建）**1/3 files pass、2 fail、0 timeout**：url.parse query clean-exit；events.once invalid options 缺少预期 `ERR_INVALID_ARG_TYPE` code，StringDecoder forged receiver 未抛 `ERR_INVALID_THIS`，收敛为两个 API semantic owners。单文件耗时 198–401ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W231 fresh Bun Node util/events/string_decoder probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files green、214 passed、0 failed、214 ran、6538 expects、0 timeout**：EventEmitter 67、StringDecoder 95、util.types 52 全部 clean-exit，单文件耗时 200–451ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W230 fresh Bun Node path/URL leaf probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files green、8 passed、0 failed、8 ran、0 expects、0 timeout**：path.basename 4/4、path.extname 3/3、WHATWG url.format 1/1 全部 clean-exit，单文件约 200ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W229 fresh Bun Node URL/path leaf probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files green、4 passed、0 failed、5 ran、2 expects、0 timeout**：path.parse/format、zero-length path、legacy url.parse query-object guard clean-exit；URL 文件保留 1 个 upstream TODO。首个 querystring 候选因 Bun runner 正确判定 no-tests 而排除。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W228 fresh Node crypto/WebCrypto leaf probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：KeyObject own-key guard、AES-GCM empty-payload round-trip、short-tag `OperationError` rejection 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 199–200ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
