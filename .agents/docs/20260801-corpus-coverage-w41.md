@@ -173,6 +173,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W223 | Node Buffer float leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain Float32/Float64 BE/LE read/write and OOB/range guards; no source owner |
 | W224 | Node Buffer write leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain generic encoding/range, Double BE/LE, and UInt BE/LE write guards; no source owner |
 | W225 | Node Buffer read/string leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain basic reads, toString range/coercion, and JSON serialization guards; no source owner |
+| W226 | Node crypto leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain cipher encoding validation, getCipherInfo lookup/type/range, and RSA-OAEP empty-payload guards; no source owner |
 
 ## W133 Bun.Terminal green cluster
 
@@ -243,6 +244,20 @@ The bounded three-job Node selector covered basic numeric reads, `toString`
 range/coercion and empty boundaries, and JSON Buffer serialization. All **3/3
 files passed**, with **0 failures and 0 timeouts**; per-file durations were
 199–200ms.
+
+These upstream files are plain scripts, so the Node runner's file-level
+clean-exit classification is the authoritative result. No source or upstream
+fixture change was made. The selector used the existing coordinator binary
+through `tools/integration/node_corpus_runner.py` with three bounded jobs and a
+30-second per-file timeout. No full corpus or workspace-wide test was run; the
+selector and raw runner output were removed after recording the result.
+
+## W226 Node crypto green cluster
+
+The bounded three-job Node selector covered cipher encoding validation,
+`getCipherInfo` lookup/type/range behavior, and RSA-OAEP empty-payload
+round-trips. All **3/3 files passed**, with **0 failures and 0 timeouts**;
+per-file durations were 231–233ms.
 
 These upstream files are plain scripts, so the Node runner's file-level
 clean-exit classification is the authoritative result. No source or upstream
