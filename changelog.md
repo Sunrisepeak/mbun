@@ -5,6 +5,7 @@
 
 ## 2026-08-01
 
+- W189 fresh Node Readable readiness probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：emitted-readable、needReadable、no-unneeded-readable、pause/resume、single readable event 全部通过；单文件耗时 165–250ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W188 fresh Node Readable event/end probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：end-destroyed、ended、error-end、readable event、flow recursion 全部通过；单文件耗时 164–248ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W187 fresh Node Readable basic probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：constructor、data 中追加 chunk、default encoding、didRead、short-stream readable emission 全部通过；单文件耗时 164–199ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W186 fresh Node Writable final/error probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：abort、final throw、finish-destroyed、write error、writev-finish 全部通过；单文件耗时 164–200ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
