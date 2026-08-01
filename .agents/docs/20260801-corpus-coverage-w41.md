@@ -69,6 +69,28 @@ the observed Linux limits; the coordinator owns the only root build.
 | W119 | Node assert/buffer/diagnostics/encoding/http leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build | issue #61; retain four green leaves, park missing `assert.Assert` export/constructor as one owner |
 | W120 | Bun util encoding/memory/promise/worker leaves | 5 | 5/5 green; 15 passed / 0 failed / 15 ran / 43 expects; no build | retain all five green leaves; no source owner |
 | W121 | Node HTTP/FS/UDP/zlib leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build | retain four green leaves; park zlib weak-handle memory accounting after a bounded zero-delta reproduction |
+| W122 | Bun util file/stream leaves | 5 | 4/5 green; 12 passed / 2 failed / 14 ran / 432 expects; no build | issue #62; retain four green leaves, park `readableStreamToArrayBuffer` intrinsic Promise plumbing |
+
+## W122 Bun readableStreamToArrayBuffer owner triage
+
+The bounded three-job selector covered Bun.file offset reads, fd-backed reads,
+ArrayBufferSink, file MIME type, and `readableStreamToArrayBuffer`. The result
+was **4/5 files green**, **12 passed**, **2 failed**, **14 ran**, and **432
+expects**. The four file/FD/MIME/sink leaves are retained.
+
+The only failure was `readablestreamtoarraybuffer.test.ts`: both tests patch
+`Promise.prototype.then` and observe **6 calls** from mbun. Node/Bun expect zero
+calls for a synchronous stream start and one observable adoption call for an
+async start. This is one intrinsic Promise-plumbing owner, not two unrelated
+stream failures. Issue
+[#62](https://github.com/Sunrisepeak/mbun/issues/62) records the sanitized
+reproduction and keeps the fix scoped to that API.
+
+No source or upstream fixture change was made. The selector used the existing
+coordinator binary through `tools/integration/bun_corpus_runner.py` with three
+bounded jobs, a 30-second per-file timeout, and missing Node modules allowed.
+No full corpus or workspace-wide test was run; the selector and raw runner
+output were removed after recording the result.
 
 ## W121 Node zlib metric triage
 
