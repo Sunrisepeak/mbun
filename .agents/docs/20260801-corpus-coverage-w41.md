@@ -251,6 +251,27 @@ the observed Linux limits; the coordinator owns the only root build.
 | W301 | Node util/VM/encoding continuation leaves | 5 | 2/5 pass; 3 fail; 0 timeout; no build | retain signal exit-code and TextDecoder guards; split VM namespace inspect, internal symbol enumerability, and promisify custom-name owners |
 | W302 | Node URL continuation leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five URL parse/format/brand guards; no source owner |
 | W303 | Bun/Deno Fetch/URL API leaves | 5 | 5/5 green; 80 passed / 0 failed / 85 ran / 245 expects; 0 timeout; no build | retain all five Fetch/URL guards; no source owner |
+| W304 | Node events/path continuation leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build | retain AbortListener, getEventListeners, relative, and zero-length path guards; park uncaughtException stack rendering owner |
+
+## W304 Node events/path continuation leaf probe
+
+The bounded five-job Node selector covered AbortListener registration,
+`getEventListeners`, uncaught-exception stack formatting, path relative
+resolution, and zero-length path semantics. It measured **4/5 file-level
+passes**, **1 failure**, and **0 runner timeouts**. Per-file durations were
+**283–387 ms**.
+
+`test-events-add-abort-listener.mjs`,
+`test-events-static-geteventlisteners.js`, `test-path-relative.js`, and
+`test-path-zero-length-strings.js` passed. The
+`test-events-uncaught-exception-stack.js` failure was limited to stack
+rendering: the first stack line included a call-site prefix where the test
+expects the plain `Error` line. This is a focused stack-format owner. There
+were no source or upstream-fixture changes.
+
+The selector used the bounded five-job Node runner with a 30-second per-file
+timeout. No full corpus, build, or workspace-wide test was run; the Node
+runner reports file-level status only.
 
 ## W303 Bun/Deno Fetch/URL API leaf probe
 
