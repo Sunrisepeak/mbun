@@ -50,6 +50,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W100 | Node fs/promises FileHandle leaves | 5 | 5/5 files pass; no build | retain five green leaves; no source owner |
 | W101 | Node module loader / CLI entry leaves | 5 | pre-fix 3/5 pass + 1 skipped + 1 fail; post-fix 4/5 pass + 1 skipped; W100 regression 5/5 pass | issue #56; preserve `Module.runMain()` as the Node preload entry hook |
 | W102 | Node module introspection / lookup leaves | 5 | 4/5 files pass; 1 fail; no build | retain four green leaves; park `require.extensions` custom-loader integration |
+| W103 | Bun `node:module` / SourceMap leaves | 5 | 3/5 files green; 44 passed / 10 failed / 54 ran / 142 expects; no build | retain three green leaves; park split CJS-loader and malformed-sourcemap diagnostic owners |
 
 ## W96 delivered slice
 
@@ -196,6 +197,33 @@ fixture, which installs mutable `require.extensions` handlers. The current
 `node:module` implementation documents custom `require.extensions` loader
 integration as deferred native CJS-loader work, so this remains parked without
 an issue or speculative source change.
+
+No upstream fixture changed, no build or full corpus/workspace-wide test was
+run, and the temporary selector/output were cleaned after verification.
+
+## W103 Bun node:module and SourceMap leaves
+
+W103 used five bounded jobs and the W101 coordinator binary without a build.
+The selected files covered the public `node:module` surface, `options.paths`
+resolution, SourceMap construction, malformed-map handling, and the concurrent
+GC children guard. The aggregate result was **3/5 files green**, **44 passed**,
+**10 failed**, **54 ran**, and **142 expects**.
+
+The stable green files were:
+
+- `module-resolve-filename-paths.test.js`: **6/6**, 10 expects;
+- `module-sourcemap.test.js`: **3/3**, 6 expects;
+- `module-children-concurrent-gc.test.ts`: **1/1**, 2 expects.
+
+The two non-green files have separate owners. `node-module-module.test.js`
+reported **21 passed / 9 failed / 30 ran / 102 expects**, spanning builtin
+inventory, overridden `_resolveFilename`/`Module.prototype.require`, builtin
+cache export shape, `Module.runMain`, and children-tree semantics. The
+standalone `sourcemap.test.js` reported **13 passed / 1 failed / 14 ran / 22
+expects**: the malformed inline map did not emit the expected decode warning
+while preserving the unmapped stack. Current native CJS hook and source-map
+stack/diagnostic integration are separate deferred surfaces, so no speculative
+issue or mixed fix was opened from W103.
 
 No upstream fixture changed, no build or full corpus/workspace-wide test was
 run, and the temporary selector/output were cleaned after verification.

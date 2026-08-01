@@ -5,6 +5,13 @@
 
 ## 2026-08-01
 
+- W103 fresh Bun `node:module`/SourceMap leaf probe（5 jobs、复用 W101 binary、无构建）测得 **3/5 files green、44
+  passed、10 failed、54 ran、142 expects**：`module-resolve-filename-paths` **6/6**、`module-sourcemap` **3/3**、
+  `module-children-concurrent-gc` **1/1** 全绿。`node-module-module` 为 **21 passed / 9 failed / 30 ran / 102
+  expects**，失败跨 builtin inventory、`_resolveFilename`/`Module.prototype.require` override、builtin cache export、
+  `Module.runMain` 和 children tree；`sourcemap` 为 **13 passed / 1 failed / 14 ran / 22 expects**，唯一失败是
+  malformed inline map 未输出预期 decode warning。两个失败 owner 分离且属于 deferred CJS/source-map integration，
+  不混修、不猜测性开 issue；未修改上游 fixture，未跑全量 corpus。
 - W102 fresh Node `node:module` introspection/lookup probe（5 jobs、复用 W101 binary、无构建）测得 **4/5 files pass、1
   failed**：module version、`Module._stat`、builtin list、relative lookup 全绿；multi-extensions 依赖可变的
   `require.extensions` custom loader，而当前 CJS loader 已明确将该集成列为 deferred，停车不混修。未修改上游
