@@ -245,6 +245,22 @@ the observed Linux limits; the coordinator owns the only root build.
 | W295 | Node path/query/url/events leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build | retain path identity, querystring, URL invalid-input, and CustomEvent guards; park events.on invalid-argument error-code shape |
 | W296 | Bun fetch/encoding/timer leaf probe | 5 | 5/5 green; 70 passed / 0 failed / 70 ran / 85 expects; 0 timeout; no build | retain all five Bun guards; no source owner |
 | W297 | Bun fetch/blob/timer ownership probe | 5 | 3/5 green; 24 passed / 1 failed / 25 ran / 54 expects; 1 runner timeout; no build | retain three Blob guards; park fetch-gzip timeout and setInterval cancellation owners |
+| W298 | Node path/os continuation leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five path/os guards; no source owner |
+
+## W298 Node path/os continuation leaf probe
+
+The bounded five-job Node selector continued the path/os slice with basename,
+dirname, extname, home-directory fallback, and checked syscall-error leaves.
+It measured **5/5 file-level passes**, **0 failures**, and **0 runner
+timeouts**. Per-file durations were **201–350 ms**.
+
+`test-path-basename.js`, `test-path-dirname.js`, `test-path-extname.js`,
+`test-os-homedir-no-envvar.js`, and `test-os-checked-function.js` all passed.
+There were no source or upstream-fixture changes.
+
+The selector used the bounded five-job Node runner with a 30-second per-file
+timeout. No full corpus, build, or workspace-wide test was run; the Node
+runner reports file-level status only.
 
 ## W297 Bun fetch/blob/timer ownership probe
 
