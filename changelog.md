@@ -5,6 +5,17 @@
 
 ## 2026-08-02
 
+- W389 Node `uvMetricsInfo` source fix：`node_perf.cppm` 现在暴露
+  `PerformanceNodeTiming.uvMetricsInfo`，`node_internal_binding.cppm` 使用同一 live
+  timer/check loop counter，不再固定返回全零。目标 Node 文件从失败变为 **1/1 pass**；五文件
+  performance selector 为 **2/5 pass、3 fail、0 timeout**，剩余失败仍是 GC callback、observer
+  参数校验和 timing 顺序三个独立 owner。W387 Bun fake-timer 回归保持 **5/5 green、8 passed、0
+  failed、8 ran、10 expects**；serial release build **59.24s**，未修改 upstream fixture、未跑
+  全量 corpus。
+- W388 Node performance 五文件窄 triage：修复前 **1/5 pass、4 fail、0 timeout**，将
+  `nodeTiming.uvMetricsInfo` 缺失与其余三个性能 owner 分离；没有扩大到全量 performance corpus。
+- W387 Bun fake-timer sinon leaf revalidation：五文件、**5 jobs**，结果 **5/5 green、8 passed、0
+  failed、8 ran、10 expects、0 timeout**，作为后续运行时改动的回归 guard。
 - W386 Bun fake-timer hrtime precision source fix：`modules/jsc/src/test_runner.cppm` 让
   `process.hrtime()`/`.bigint()` 读取 fake clock，以十进制纳秒截断避免浮点 round-off，并让
   fake `Date.now()` 保持整数。W385 五文件 selector 从 **3 green、1 no-tests、1 failure、36

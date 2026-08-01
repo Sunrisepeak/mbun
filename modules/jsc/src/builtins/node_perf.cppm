@@ -92,6 +92,15 @@ inline constexpr std::string_view kNodePerfJS = R"JS(
     }
   }
 
+  // process_web advances this counter once per timer/check phase. Reuse that
+  // loop-turn gauge for the uv_metrics_info-compatible Node surface instead of
+  // exposing the property without a live event-loop value.
+  function uvMetricsInfo() {
+    const timers = G.__mbunTimers;
+    const loopCount = timers && Number.isSafeInteger(timers.batch) ? timers.batch : 0;
+    return { loopCount, events: 0, eventsWaiting: 0 };
+  }
+
   // ── PerformanceNodeTiming ────────────────────────────────────────────────
   class PerformanceNodeTiming extends PerformanceEntry {
     constructor() {
@@ -108,6 +117,7 @@ inline constexpr std::string_view kNodePerfJS = R"JS(
     set startTime(_v) {}
     get duration() { return perfNow(); }
     set duration(_v) {}
+    get uvMetricsInfo() { return uvMetricsInfo(); }
     toJSON() {
       return {
         name: "node", entryType: "node", startTime: this.startTime, duration: this.duration,

@@ -333,6 +333,9 @@ the observed Linux limits; the coordinator owns the only root build.
 | W384 | Node process fresh leaves | 5 | 5/5 pass, 0 timeout | retain process exit/env/execve coverage; no source owner |
 | W385 | Bun high-resolution fake-timer leaf probe | 5 | 3 green / 1 no-tests / 1 failure; 36 passed / 7 failed / 43 ran / 98 expects / 0 timeout | isolate issue-207 to fake `process.hrtime` and fractional clock rounding; retain four other fake-timer leaves |
 | W386 | Bun fake-timer hrtime precision source fix | 5 | pre 3 green / 1 no-tests / 1 failure / 36 passed / 7 failed / 43 ran / 98 expects; post 4 green / 1 no-tests / 0 failure / 43 passed / 43 ran / 98 expects; W382 regression 3 green / 2 no-tests / 49 passed / 49 ran / 44 expects; incremental build 15.14s | connect `process.hrtime`/`.bigint()` to the fake clock, use decimal nanosecond truncation, and floor fake `Date.now()` |
+| W387 | Bun fake-timer sinon leaf revalidation | 5 | 5/5 green; 8 passed / 0 failed / 8 ran / 10 expects / 0 timeout | retain the fake-timer surface as a green guard; no new source owner |
+| W388 | Node performance five-file triage | 5 | pre 1/5 pass; post 2/5 pass; target `uvMetricsInfo` 1/1 pass; 3 remaining failures are independent GC/observer/timeline owners; 0 timeout | close only the `nodeTiming.uvMetricsInfo` owner and keep the other performance failures separate |
+| W389 | Node `uvMetricsInfo` source fix | 5 | serial release build 59.24s; target 1/1 pass; post selector 2/5 pass, 3 fail, 0 timeout; W387 regression 5/5 green | expose `PerformanceNodeTiming.uvMetricsInfo` and make internal binding read the live timer/check loop counter; no upstream fixture change |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -1788,6 +1791,32 @@ After an incremental release build (**15.14s**), the W385 selector measured
 runner timeout**. The W382 five-file Bun regression remained **3 green, 2
 no-tests, 0 failure**, with **49 passed, 49 ran, 44 expects**. No upstream
 fixture changed and no full corpus/workspace-wide test ran.
+
+## W387 Bun fake-timer sinon leaf revalidation
+
+The five-file fake-timer sinon selector ran with **5 bounded jobs** and remained
+**5/5 green**, with **8 passed, 0 failed, 8 ran, 10 expects, and 0 runner
+timeout**. This was a regression guard for the adjacent performance change; it
+did not justify another source edit or a docs-only checkpoint.
+
+## W388 Node performance five-file triage
+
+The fresh five-file performance selector measured **1/5 pass** before the
+change. The narrow failure was `nodeTiming.uvMetricsInfo` being absent; the
+other three failures were independent GC callback, observer option validation,
+and timing-order owners. No full performance-corpus run was attempted.
+
+## W389 Node `uvMetricsInfo` source fix
+
+`modules/jsc/src/builtins/node_perf.cppm` now exposes
+`PerformanceNodeTiming.uvMetricsInfo`, and
+`modules/jsc/src/builtins/node_internal_binding.cppm` uses the same live
+timer/check loop counter instead of a fixed array. The target Node file passed
+**1/1** after the fix. The five-file post selector measured **2/5 pass, 3 fail,
+0 timeout**; the three remaining failures stayed isolated to the W388 owners.
+The W387 Bun fake-timer guard remained **5/5 green** after a serialized release
+build (**59.24s**). No upstream fixture changed and no full corpus/workspace-wide
+test ran.
 
 ## Coverage novelty audit correction after W323
 

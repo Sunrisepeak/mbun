@@ -885,7 +885,11 @@ inline constexpr std::string_view kNodeInternalBindingJS = R"JS(
       observerCounts: new Uint32Array(8),
       now: () => (perf.performance ? perf.performance.now() : Date.now() - origin),
       loopIdleTime: () => 0,
-      uvMetricsInfo: () => [0, 0, 0],
+      uvMetricsInfo: () => {
+        const timers = G.__mbunTimers;
+        const loopCount = timers && Number.isSafeInteger(timers.batch) ? timers.batch : 0;
+        return [loopCount, 0, 0];
+      },
       markBootstrapComplete() {},
       setupObservers() {},
       installGarbageCollectionTracking() {},
