@@ -5,6 +5,7 @@
 
 ## 2026-08-01
 
+- W131 fresh Node VM/URL/WHATWG probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：VM indexed/global assignment、legacy URL query、IDN ASCII/Unicode、URLSearchParams invalid-this 全部通过；单文件耗时 164–215ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W130 Node REPL focused probe（3 jobs、复用现有 coordinator binary、无构建）**1/3 pass、1 fail、1 timeout**：multiline navigation 281ms 通过；autolibs 182ms 失败，主 REPL 在 30s bound 超时；两条非绿路径均先报 `RegExp.$N getters require RegExp constructor as |this|`，直接 bounded `RegExp.$1` probe 复现同一 TypeError，issue [#65](https://github.com/Sunrisepeak/mbun/issues/65) 已创建。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W129 corpus-specific Bun/Node probe（Bun 3 jobs + Node 3 jobs、复用现有 coordinator binary、无构建）**2/3 valid files green**：Node net closed-socket、domain uncaught-exception **2/2 pass**，248–250ms；Bun console iterator **0 passed / 17 failed / 17 ran / 0 timeout**，根因收敛为 `for await (const line of console)` 缺失 async iterator/input contract，issue [#64](https://github.com/Sunrisepeak/mbun/issues/64) 已创建。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W128 Node worker/message-port probe（3 jobs、复用现有 coordinator binary、无构建）初始 **4/5 pass、1 timeout**；`test-worker-message-port-message-before-close.js` 经 1 job/60s 隔离复测通过，耗时 **57.762s**，确认是 slow stress leaf 而非稳定 hang；其余四个叶子耗时 165–651ms。最终保留 **5/5 pass**，但该 10,000-message race 不进入默认 30s 快速 lane。未修改 source/fixture，未跑全量 corpus/workspace-wide test。

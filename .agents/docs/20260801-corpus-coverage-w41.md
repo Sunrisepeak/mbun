@@ -78,6 +78,21 @@ the observed Linux limits; the coordinator owns the only root build.
 | W128 | Node worker/message-port leaves | 5 | initial 4/5 pass + 1 timeout at 30s; isolated 1 job / 60s confirmation 5/5 pass, slow leaf 57.762s; no build | retain all five, mark MessagePort race as slow stress leaf and exclude it from the default 30s fast lane |
 | W129 | Bun console iterator + Node net/domain leaves | 3 | 2/3 valid files green; Bun 0 passed / 17 failed / 17 ran, Node 2/2 pass; no build | issue #64; retain both Node leaves, park missing Bun console async iterator/input contract |
 | W130 | Node REPL focused leaves | 3 | 1/3 pass; 1 fail; 1 timeout at 30s; no build; direct probe reproduced shared RegExp owner | issue #65; retain multiline navigation, park REPL/autolibs behind RegExp.$N static getter binding |
+| W131 | Node VM/URL/WHATWG leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five green leaves; no source owner |
+
+## W131 Node VM and URL green leaves
+
+The bounded three-job selector covered VM indexed properties, VM global
+assignment, legacy URL query parsing, IDN ASCII/Unicode conversion, and
+`URLSearchParams.prototype.forEach` invalid-this validation. All **5/5 files
+passed**, with **0 failures** and **0 timeouts**; per-file durations were
+164–215ms.
+
+No source or upstream fixture change was made. The selector used the existing
+coordinator binary through `tools/integration/node_corpus_runner.py` with
+three bounded jobs and a 30-second per-file timeout. No full corpus or
+workspace-wide test was run; the selector and raw runner output were removed
+after recording the result.
 
 ## W130 Node REPL owner triage
 
