@@ -269,6 +269,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W319 | Node active-resources/priority/console leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five resource/priority/console guards; no source owner |
 | W320 | Bun util object/encoding/timer/path leaves | 5 | 4/5 green; 20 passed / 1 failed / 21 ran / 236 expects; 0 timeout; no build; 1 fresh + 4 revalidations | retain fresh `sleepSync`; revalidate four historical Bun guards and retain the known helper owner |
 | W321 | Node warning/identity contract leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five warning/identity guards; no source owner |
+| W322 | Node active-resource lifetime/signal/title leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build; 5 fresh | retain all five active-resource/signal/title guards; no source owner |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -631,6 +632,25 @@ workspace-wide build was run. After the run, resources remained at about
 **43 GiB available memory**, **1.6 MiB free swap**, and **17 GiB free disk at
 99% usage**. Temporary runner output is cleaned immediately and the next wave
 remains resource-gated.
+
+## W322 Node active-resource lifetime/signal/title leaves
+
+The bounded five-job Node selector covered five genuinely fresh files after a
+basename audit of the entire ledger: `test-process-getactiveresources-track-interval-lifetime.js`,
+`test-process-getactiveresources-track-multiple-timers.js`,
+`test-process-getactiveresources-track-timer-lifetime.js`,
+`test-process-remove-all-signal-listeners.js`, and
+`test-process-title-cli.js`. The runner measured **5/5 file-level passes**,
+**0 failures**, **0 runner timeouts**, and **281–388 ms** per file. The Node
+runner reports file-level status only; no assertion-level pass total is
+inferred.
+
+All five active-resource lifetime, signal cleanup, and CLI title guards passed
+and are retained. The bounded title test emitted only its expected flag-check
+note. There were no source or upstream-fixture changes, no full corpus, and no
+workspace-wide build. After the run, resources showed about **44 GiB available
+memory**, **1.7 MiB free swap**, and **17 GiB free disk at 99% usage**. Temporary
+runner output is cleaned immediately and the next wave remains resource-gated.
 
 ## Coverage novelty audit correction after W321
 
