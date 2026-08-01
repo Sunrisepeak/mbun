@@ -213,6 +213,24 @@ the observed Linux limits; the coordinator owns the only root build.
 | W263 | Node stream append/backpressure/order leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain Readable data-time append, backpressure completion, and push ordering; no source owner |
 | W264 | Bun spyMatchers/pretty-format/test.failing leaves | 3 | 1/3 green; 130 passed / 24 failed / 159 ran / 494 expects; 0 timeout; no build | retain pretty-format 1/1; retain spyMatchers 124 pass + 5 todo; park matcher error/argument semantics and test.failing message/timeout owners |
 | W265 | Node fs append/rename/stream-type leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain appendFileSync data/mode/FD behavior, rename type guards, and WriteStream option TypeErrors; no source owner |
+| W266 | Node HTTP framing/status/listening leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain no-content-length framing, statusMessage behavior, and server listening transitions; no source owner |
+
+## W266 Node HTTP framing/status/listening plain-script leaf probe
+
+The bounded three-job Node selector covered `test-http-no-content-length.js`,
+`test-http-status-message.js`, and `test-http-listening.js`. It measured **3/3
+file-level passes**, **0 failures**, and **0 runner timeouts**. Per-file
+durations were 200–250ms.
+
+The probe retained HTTP response framing without an explicit Content-Length,
+status-message behavior over a local connection, and server `listening` state
+transitions. The Node corpus runner reports only file-level status for these
+plain scripts, so no synthetic subtest count was added.
+
+No source or upstream fixture change was made. The selector reused the
+coordinator binary through `tools/integration/node_corpus_runner.py` with
+three bounded jobs and a 30-second per-file timeout. No full corpus, build,
+or workspace-wide test was run.
 
 ## W265 Node fs append/rename/stream-type plain-script leaf probe
 
