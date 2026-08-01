@@ -329,6 +329,10 @@ the observed Linux limits; the coordinator owns the only root build.
 | W380 | Node child-process stdio fresh leaves | 5 | 5/5 pass in the 5-job wave; no timeout | retain stdio/pipe coverage; fd 1 raw-write remains a separate bounded-buffer owner |
 | W381 | Bun run-mode fake-timers source fix | 5 | pre 2 green / 2 no-tests / 1 failure / 45 passed / 4 failed / 49 ran / 38 expects; post 2 green / 2 no-tests / 1 failure / 48 passed / 1 failed / 49 ran / 41 expects; Node W379/W380 regression 10/10 pass; serial build 59.24s | implement queue-backed `Bun.jest().jest.useFakeTimers()` in run mode; park Intl.DateTimeFormat formatting as the remaining independent failure |
 | W382 | Bun fake-timer Intl default-format source fix | 5 | pre 2 green / 2 no-tests / 1 failure / 48 passed / 1 failed / 49 ran / 41 expects; post 3 green / 2 no-tests / 0 failure / 49 passed / 49 ran / 44 expects; Node regression 10/10 pass; incremental build 15.23s | wrap the configurable `Intl.DateTimeFormat.prototype.format` accessor only while fake timers are active and restore the exact descriptor afterward |
+| W383 | Node HTTP fresh leaves | 5 | two fresh five-file selectors, 10/10 pass, 0 timeout | retain HTTP client/header/timeout coverage; no source owner |
+| W384 | Node process fresh leaves | 5 | 5/5 pass, 0 timeout | retain process exit/env/execve coverage; no source owner |
+| W385 | Bun high-resolution fake-timer leaf probe | 5 | 3 green / 1 no-tests / 1 failure; 36 passed / 7 failed / 43 ran / 98 expects / 0 timeout | isolate issue-207 to fake `process.hrtime` and fractional clock rounding; retain four other fake-timer leaves |
+| W386 | Bun fake-timer hrtime precision source fix | 5 | pre 3 green / 1 no-tests / 1 failure / 36 passed / 7 failed / 43 ran / 98 expects; post 4 green / 1 no-tests / 0 failure / 43 passed / 43 ran / 98 expects; W382 regression 3 green / 2 no-tests / 49 passed / 49 ran / 44 expects; incremental build 15.14s | connect `process.hrtime`/`.bigint()` to the fake clock, use decimal nanosecond truncation, and floor fake `Date.now()` |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -1745,6 +1749,45 @@ The focused timer file moved from **6/7 pass, 1 failure, 24 expects** to
 0 failure**, with **49 passed, 49 ran, 44 expects, and 0 runner timeout**.
 The W379/W380 Node fs and child-process regression selector remained **10/10
 pass**. No upstream fixture changed and no full corpus/workspace-wide test ran.
+
+## W383 Node HTTP fresh leaves
+
+Two fresh five-file Node HTTP selectors covered default headers, header-array
+forms, immediate client errors, request options, timeout options, response
+timeouts, set-timeout transitions, and keepalive delay. Both bounded five-job
+selectors passed **5/5**, for **10/10 pass** with no timeout. No source owner was
+found and no upstream fixture changed.
+
+## W384 Node process fresh leaves
+
+The fresh five-file process selector covered exit-code validation, exit handler
+delivery, groups, environment behavior, and execve error validation. It passed
+**5/5** with **5 bounded jobs** and no timeout. No source owner was found and no
+upstream fixture changed.
+
+## W385 Bun high-resolution fake-timer leaf probe
+
+The five-file fake-timer selector measured **3 green, 1 no-tests, and 1
+test-failure**, with **36 passed, 7 failed, 43 ran, 98 expects, and 0 runner
+timeout**. The base fake-timer file passed **30/30**, issue-1852 passed **1/1**,
+and issue-187 passed **2/2**. The only failure was issue-207: all seven failed
+assertions were high-resolution `process.hrtime` and fractional `clock.now`
+rounding cases, making it one time-source owner rather than five unrelated
+failures.
+
+## W386 Bun fake-timer hrtime precision source fix
+
+`modules/jsc/src/test_runner.cppm` now routes `process.hrtime()` and
+`process.hrtime.bigint()` through the fake clock, converts decimal millisecond
+ticks to truncated nanoseconds without binary floating-point round-off, and
+keeps fake `Date.now()` integer-valued. It restores the original hrtime
+functions when fake timers are disabled.
+
+After an incremental release build (**15.14s**), the W385 selector measured
+**4 green, 1 no-tests, 0 failure**, with **43 passed, 43 ran, 98 expects, and 0
+runner timeout**. The W382 five-file Bun regression remained **3 green, 2
+no-tests, 0 failure**, with **49 passed, 49 ran, 44 expects**. No upstream
+fixture changed and no full corpus/workspace-wide test ran.
 
 ## Coverage novelty audit correction after W323
 

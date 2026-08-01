@@ -5,6 +5,20 @@
 
 ## 2026-08-02
 
+- W386 Bun fake-timer hrtime precision source fix：`modules/jsc/src/test_runner.cppm` 让
+  `process.hrtime()`/`.bigint()` 读取 fake clock，以十进制纳秒截断避免浮点 round-off，并让
+  fake `Date.now()` 保持整数。W385 五文件 selector 从 **3 green、1 no-tests、1 failure、36
+  passed、7 failed、43 ran、98 expects** 到 **4 green、1 no-tests、0 failure、43 passed、43 ran、98
+  expects、0 timeout**；W382 回归 **3 green、2 no-tests、49 passed、49 ran、44 expects**。incremental
+  release build **15.14s**，未修改 upstream fixture、未跑全量 corpus。
+- W385 Bun high-resolution fake-timer leaf probe：五文件 bounded selector **3 green、1 no-tests、1
+  failure**，**36 passed、7 failed、43 ran、98 expects、0 timeout**；失败全部集中在 sinon issue-207
+  的 `process.hrtime`/fractional clock rounding，base fake-timers **30/30**、issue-1852 **1/1**、
+  issue-187 **2/2** 通过，未做 speculative 修改。
+- W384 Node process fresh leaves：五文件 selector **5/5 pass、0 timeout**，覆盖 exit-code、exit
+  handler、groups、env 与 execve validation；无 source owner，未跑全量 corpus。
+- W383 Node HTTP fresh leaves：两个五文件 bounded selector 合计 **10/10 pass、0 timeout**，覆盖
+  client/header/error/timeout/keepalive leaves；无 source owner，未跑全量 corpus。
 - W382 Bun fake-timer Intl default-format source fix：W381 的唯一 Intl owner 已关闭；
   `modules/jsc/src/test_runner.cppm` 在 fake-timer 生命周期内包装 configurable 的
   `Intl.DateTimeFormat.prototype.format` accessor，仅在缺省日期参数时注入 fake Date，并在

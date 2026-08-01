@@ -1171,9 +1171,38 @@ inline constexpr std::string_view HARNESS = R"JS(
   // Timespec::EPOCH); `FT.dateOffset` is the wall-clock base so that
   // Date.now() === FT.dateOffset + FT.now (CurrentTime::set's date_now_offset).
   const FT = { on: false, now: 0, dateOffset: 0, seq: 0, queue: [], saved: null, savedPerfNow: null,
-    savedIntlProto: null, savedIntlFormat: null };
+    savedHrtime: null, savedHrtimeBigint: null, savedIntlProto: null, savedIntlFormat: null };
   // Mirror the fake clock onto the Date override installed above.
-  function ftSync() { S.sysTime = FT.dateOffset + FT.now; }
+  function ftSync() { S.sysTime = Math.floor(FT.dateOffset + FT.now); }
+  // Keep sub-millisecond ticks exact without routing decimal milliseconds through
+  // binary floating-point multiplication. The first six fractional decimal
+  // digits are nanoseconds because the input unit is milliseconds; later digits
+  // are truncated, matching Bun's high-resolution timer contract.
+  function ftNanos() {
+    const raw = String(FT.now);
+    const negative = raw.startsWith("-");
+    const text = negative ? raw.slice(1) : raw;
+    const parts = text.split(".");
+    const whole = BigInt(parts[0] || "0") * 1000000n;
+    const fraction = BigInt(((parts[1] || "") + "000000").slice(0, 6) || "0");
+    const value = whole + fraction;
+    return negative ? -value : value;
+  }
+  function ftHrtime(prev) {
+    let ns = ftNanos();
+    let sec = ns / 1000000000n;
+    let nano = ns % 1000000000n;
+    if (nano < 0n) { sec -= 1n; nano += 1000000000n; }
+    if (prev !== undefined) {
+      if (!Array.isArray(prev)) throw new TypeError("The time argument must be an instance of Array");
+      if (prev.length !== 2) throw new RangeError("The value of time is out of range. It must be 2");
+      sec -= BigInt(Math.trunc(prev[0]));
+      nano -= BigInt(Math.trunc(prev[1]));
+      if (nano < 0n) { sec -= 1n; nano += 1000000000n; }
+      if (nano >= 1000000000n) { sec += nano / 1000000000n; nano %= 1000000000n; }
+    }
+    return [Number(sec), Number(nano)];
+  }
   // FakeTimers.rs:234-242 error_unless_fake_timers — every accessor except
   // useFakeTimers/useRealTimers/isFakeTimers throws while inactive.
   function ftRequireActive() {
@@ -1253,6 +1282,17 @@ inline constexpr std::string_view HARNESS = R"JS(
       FT.savedPerfNow = perf.now;
       perf.now = function () { return FT.now; };
     }
+    // process.hrtime is another high-resolution view of the same fake clock.
+    // Leaving it on Bun.nanoseconds() mixes real time with fake Date/performance
+    // and reintroduces decimal round-off for sub-millisecond ticks.
+    const proc = G.process;
+    if (proc && typeof proc.hrtime === "function") {
+      FT.savedHrtime = proc.hrtime;
+      FT.savedHrtimeBigint = proc.hrtime.bigint;
+      const fakeHrtime = function (prev) { return ftHrtime(prev); };
+      fakeHrtime.bigint = function () { return ftNanos(); };
+      proc.hrtime = fakeHrtime;
+    }
     // Intl.DateTimeFormat.prototype.format is an accessor whose native getter
     // asks the engine for the current wall clock when called without a value.
     // A fake Date wrapper does not alter that native clock, so Bun's
@@ -1285,6 +1325,12 @@ inline constexpr std::string_view HARNESS = R"JS(
     if (FT.savedPerfNow) {
       try { G.performance.now = FT.savedPerfNow; } catch (e) {}
       FT.savedPerfNow = null;
+    }
+    if (FT.savedHrtime) {
+      G.process.hrtime = FT.savedHrtime;
+      if (FT.savedHrtimeBigint) G.process.hrtime.bigint = FT.savedHrtimeBigint;
+      FT.savedHrtime = null;
+      FT.savedHrtimeBigint = null;
     }
     if (FT.savedIntlProto && FT.savedIntlFormat) {
       Object.defineProperty(FT.savedIntlProto, "format", FT.savedIntlFormat);
