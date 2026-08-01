@@ -236,6 +236,27 @@ the observed Linux limits; the coordinator owns the only root build.
 | W286 | Node require boundary leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain node-prefix/cache, NUL, exception-reload, empty-main, and deleted-directory resolution guards; no source owner |
 | W287 | Bun util inspect/fs metadata leaves | 5 | 4/5 green; 61 passed / 1 failed / 62 ran / 130 expects; 0 timeout; no build | retain Bun/custom inspect, birthtime, and cp symlink guards; park proxy inspect trap owner |
 | W288 | Node resolver/require flag leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain import resilience, dot resolution, guarded ESM require, process identity, and invalid resolve-path validation; no source owner |
+| W289 | Node resolver/extension/symlink leaves | 5 | 3/5 pass; 2 fail; 0 timeout; no build | retain symlinked-peer, invalid-main, and relative-path guards; park extension-over-directory and require.resolve fixture lookup owners |
+
+## W289 Node resolver/extension/symlink leaf probe
+
+The bounded five-job Node selector covered resolver, extension precedence, and
+symlinked-module leaves. It measured **3/5 file-level passes**, **2
+failures**, and **0 runner timeouts**. Per-file durations were **197–349 ms**.
+
+`test-module-symlinked-peer-modules.js`,
+`test-require-invalid-main-no-exports.js`, and
+`test-require-resolve-opts-paths-relative.js` passed.
+`test-require-extension-over-directory.js` failed because directory-versus-
+extension resolution did not select the same expected module. This is a
+narrow extension-precedence owner. `test-require-resolve.js` failed when its
+fixture's default `bar` module could not be resolved from the expected fixture
+lookup location. This is a separate `require.resolve` fixture-lookup owner.
+There were no source or upstream-fixture changes.
+
+The selector used the bounded five-job Node runner with a 30-second per-file
+timeout. No full corpus, build, or workspace-wide test was run; the Node
+runner reports file-level status only.
 
 ## W288 Node resolver/require flag leaf probe
 
