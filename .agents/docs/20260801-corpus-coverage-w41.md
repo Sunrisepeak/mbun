@@ -864,6 +864,24 @@ surface on Linux:
 - No upstream fixture changes, no full corpus, and no workspace-wide build
   were performed.
 
+### W78 Bun file/util leaf probe parked on Bun object internals
+
+- A fresh five-file Bun-native util/file probe used **5 bounded jobs** and
+  reused the current Linux binary; no source change or build was needed. It
+  measured **4 green files, 27 passed, 1 failed, 28 ran, 227 expects**.
+- `bun-file-fd-read` (**3/3**), `bun-file-read` (**1/1**),
+  `bun-isMainThread` (**1/1**), and `fileUrl` (**20/20**) were green.
+- `BunObject` reached **2/3**: its only failure is the missing
+  `bun:internal-for-testing.hasNonReifiedStatic` helper used to check Bun's
+  lazy static-property reification before/after spreading the Bun object.
+  This is a Bun object/bootstrap-internals owner, not a file API regression;
+  it is parked without a test-specific shim.
+- The probe emitted a local environment dump while printing the Bun object;
+  that temporary output was deleted and no environment values, paths, or
+  identifiers were copied into project docs, commits, or PR text.
+- No upstream fixture changes, no full corpus, and no workspace-wide build
+  were performed.
+
 ### W59 Node buffer leaf sample
 
 - W59 使用 Node corpus runner 的默认 bounded profile、**3 jobs**。首批五个文件为

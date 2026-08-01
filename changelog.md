@@ -5,6 +5,12 @@
 
 ## 2026-08-01
 
+- W78 fresh Bun file/util leaf probe（5 jobs、复用当前 Linux binary、无构建）测得 **4 green
+  files、27 passed、1 failed、28 ran、227 expects**。bun-file-fd-read、bun-file-read、
+  bun-isMainThread、fileUrl 全绿；`BunObject` 唯一失败是缺少
+  `bun:internal-for-testing.hasNonReifiedStatic` 的 Bun object/bootstrap lazy-static helper，
+  属内部 owner，未做 test-specific shim。探测产生的本地环境 dump 已删除，未复制到文档、
+  commit 或 PR；未修改上游 fixture，未跑全量 corpus。
 - W77 fresh Node crypto probe（5 jobs、复用当前 Linux binary、无构建）测得 **4 green files、51
   passed、8 failed、59 ran、344 expects**。sign regression、X509、scrypt、oneshot 全绿；
   `crypto-extra-memory` 的 8 个失败均是 `heapStats().extraMemorySize` 未反映 SecretKey、
