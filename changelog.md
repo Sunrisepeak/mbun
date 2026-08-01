@@ -5,6 +5,9 @@
 
 ## 2026-08-01
 
+- W105 fresh Node process identity/timing leaf probe（5 jobs、复用 W101 binary、无构建）**5/5 files pass**：`argv[0]`、
+  `uptime`、symlinked `execPath`、`ppid`、Linux `O_NOATIME` 全部通过。未发现 source owner，未修改上游 fixture，
+  未跑全量 corpus。
 - W104 fresh Bun Node process/stdio leaf probe（5 jobs、复用 W101 binary、无构建）**5/5 files green、39 passed、0
   failed、39 ran、93 expects**：memoryPressure **5/5**、signal listener count **3/3**、process constructor **2/2**、
   setgroups/hrtime accessor guard **5/5**、invalid UTF-16 stdout/stderr **24/24**。未发现 source owner，未修改上游

@@ -52,6 +52,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W102 | Node module introspection / lookup leaves | 5 | 4/5 files pass; 1 fail; no build | retain four green leaves; park `require.extensions` custom-loader integration |
 | W103 | Bun `node:module` / SourceMap leaves | 5 | 3/5 files green; 44 passed / 10 failed / 54 ran / 142 expects; no build | retain three green leaves; park split CJS-loader and malformed-sourcemap diagnostic owners |
 | W104 | Bun Node process / stdio leaves | 5 | 5/5 files green; 39 passed / 0 failed / 39 ran / 93 expects; no build | retain all five green leaves; no source owner |
+| W105 | Node process identity / timing leaves | 5 | 5/5 files pass; no build | retain all five green leaves; no source owner |
 
 ## W96 delivered slice
 
@@ -249,6 +250,16 @@ Per-file results:
 No source owner was opened, no upstream fixture changed, no build or full
 corpus/workspace-wide test was run, and the temporary selector/output were
 cleaned after verification.
+
+## W105 Node process identity and timing leaves
+
+W105 used five bounded jobs and the W101 coordinator binary without a build.
+The selected leaves covered `process.argv[0]`, `process.uptime()`, symlinked
+`process.execPath`, parent-process identity, and Linux `fs.constants.O_NOATIME`.
+All **5/5 files passed** with no source owner or upstream fixture change.
+
+No build or full corpus/workspace-wide test was run, and the temporary
+selector/output were cleaned after verification.
 
 ## Delivered slice
 
