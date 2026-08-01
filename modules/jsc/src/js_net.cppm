@@ -2971,6 +2971,16 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
     } catch (e) { return Cls; }
     return wrapper;
   };
+  // node's net.Socket is a stream.Duplex. This implementation keeps its
+  // reactor-specific constructor and methods, but must still expose the
+  // standard Duplex prototype for consumers such as http2's unknownProtocol
+  // event (which checks `socket instanceof stream.Duplex`). Keep the custom
+  // methods ahead of Duplex while inheriting the stream brand and fallbacks.
+  const streamModule = M["stream"] || M["node:stream"];
+  const StreamDuplex = streamModule && streamModule.Duplex;
+  if (typeof StreamDuplex === "function" && StreamDuplex.prototype) {
+    try { Object.setPrototypeOf(Socket.prototype, StreamDuplex.prototype); } catch (e) {}
+  }
   const ServerW = callable(Server);
   const SocketW = callable(Socket);
 

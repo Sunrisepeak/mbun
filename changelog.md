@@ -5,6 +5,14 @@
 
 ## 2026-08-02
 
+- W402 Node HTTP/2 `unknownProtocol` Duplex identity source fix：HTTP/2-only TLS server 的
+  `unknownProtocol` event 现在传出同时满足 `instanceof stream.Duplex` 的自定义 `net.Socket`，保留
+  reactor-specific socket methods。focused 文件从 **1/1 failure** 到 **1/1 pass**；五文件 HTTP/2
+  selector 从 **4/5 pass、1 fail** 提升到 **5/5 pass、0 fail、0 timeout**；Bun fake-timer 回归
+  **5/5 green、8 passed、0 failed、8 ran、10 expects**；serial release build **59.29s**。W399
+  SNI callback triage **1/5 pass、4 fail**、W400 HTTP/2 error-code revalidation **5/5 pass**、W401
+  fs flush revalidation **5/5 pass** 均已分别记录；未修改 upstream fixture、未跑全量 corpus。
+
 - W398 Node ResourceTiming buffer-size validation source fix：`performance.setResourceTimingBufferSize()`
   现在对 BigInt/Symbol 抛出 Node-compatible `ERR_INVALID_ARG_TYPE`，其他 invalid non-number 值重置
   为 zero，合法 finite nonnegative number 截断为整数。focused ResourceTiming 文件从 **1/1 failure**

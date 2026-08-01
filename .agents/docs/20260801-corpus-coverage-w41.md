@@ -344,6 +344,10 @@ the observed Linux limits; the coordinator owns the only root build.
 | W395 | Node TLS close callback ordering source fix | 5 | target pre 1/1 fail; post target 1/1 pass; five-file TLS selector 5/5 pass, 0 fail, 0 timeout; Bun fake-timer regression 5/5 green, 8 passed / 0 failed / 8 ran / 10 expects; serial release build 59.09s | defer no-error TLS transport close through two immediate phases so close callbacks follow the current check phase |
 | W396 | Node TLS empty-SNI-context error mapping source fix | 5 | pre 3/5 pass + 2 fail; target 1/1 fail → 1/1 pass; post SNI selector 4/5 pass + 1 fail, 0 timeout; Bun fake-timer regression 5/5 green, 8 passed / 0 failed / 8 ran / 10 expects; incremental release build 3.58s | map the exact no-credentials server `ERR_SSL_NO_SHARED_CIPHER` reason to Node's `no suitable signature algorithm` message; park offline SNICallback callback owner |
 | W398 | Node ResourceTiming buffer-size validation source fix | 5 | baseline performance selector 4/5 pass + 1 fail; target 1/1 fail → 1/1 pass; post selector 5/5 pass, 0 fail, 0 timeout; Bun fake-timer regression 5/5 green, 8 passed / 0 failed / 8 ran / 10 expects; three serial release builds 57.34s + 59.01s + 59.15s | reject BigInt/Symbol with Node-compatible `ERR_INVALID_ARG_TYPE` messages, reset invalid non-number values to zero, and truncate valid finite nonnegative numbers; no upstream fixture change |
+| W399 | Node TLS SNI callback/ClientHello owner triage | 5 | selector 1/5 pass + 4 fail, 0 timeout; `snicallback-error` passed, remaining callback/ClientHello cases stayed independent | park the JS↔OpenSSL callback architecture owner and the separate certificate-chain mismatch; no speculative build |
+| W400 | Node HTTP/2 error-code mapping revalidation | 5 | five-file candidate selector 5/5 pass, 0 fail, 0 timeout | inventory entry is stale for this slice; no source owner |
+| W401 | Node fs flush revalidation | 5 | `writeFile/appendFile` flush pair plus three fs guards 5/5 pass, 0 fail, 0 timeout | inventory entry is stale for this slice; no source owner |
+| W402 | Node HTTP/2 `unknownProtocol` Duplex identity source fix | 5 | baseline selector 4/5 pass + 1 fail; focused target 1/1 fail → 1/1 pass; post selector 5/5 pass, 0 fail, 0 timeout; Bun fake-timer regression 5/5 green, 8 passed / 0 failed / 8 ran / 10 expects; serial release build 59.29s | connect the custom `net.Socket` prototype to `stream.Duplex.prototype` while preserving its reactor-specific methods; no upstream fixture change |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -1840,6 +1844,45 @@ milestone-order owners remain. The five-file Bun fake-timer regression stayed
 **5/5 green, 8 passed, 0 failed, 8 ran, 10 expects** after the serialized release
 build (**59.06s**). No upstream fixture changed and no full corpus/workspace-wide
 test ran.
+
+## W402 Node HTTP/2 `unknownProtocol` Duplex identity source fix
+
+The W402 HTTP/2 fallback selector isolated one remaining failure:
+`unknownProtocol` delivered mbun's custom `net.Socket`, but the object was not
+an instance of Node's `stream.Duplex`. The other four selected HTTP/2 files
+passed, so this was a type-identity owner rather than an ALPN or fallback
+protocol failure.
+
+`js_net.cppm` now links the custom Socket prototype to the loaded
+`stream.Duplex.prototype`, leaving the reactor-specific constructor and socket
+methods ahead of the inherited stream fallbacks. The focused fallback file
+moved from **1/1 failure** to **1/1 pass**. The five-file HTTP/2 selector moved
+from **4/5 pass, 1 fail** to **5/5 pass, 0 fail, 0 timeout**. The five-file Bun
+fake-timer regression remained **5/5 green, 8 passed, 0 failed, 8 ran, 10
+expects**. The serial release build took **59.29s**. No upstream fixture
+changed and no full corpus/workspace-wide test ran.
+
+## W401 Node fs flush revalidation
+
+The bounded W401 wave rechecked the two Node `writeFile/appendFile` flush
+files together with three established fs guards. All **5/5 files passed**, with
+**0 failures and 0 timeouts**; the inventory's flush entry is stale for the
+current binary, so no source change was made.
+
+## W400 Node HTTP/2 error-code mapping revalidation
+
+The bounded W400 wave rechecked five files from the inventory's HTTP/2
+error-code mapping cluster. All **5/5 files passed**, with **0 failures and 0
+timeouts**; this slice has no current source owner and no build was needed.
+
+## W399 Node TLS SNI callback/ClientHello owner triage
+
+The bounded W399 five-file SNI wave measured **1/5 pass, 4 failures, and 0
+timeouts**. The validation-only `snicallback-error` file passed. The remaining
+cases require a real JS `SNICallback` bridge into the OpenSSL ClientHello
+callback; one additional result is a separate certificate-chain/handshake
+owner. This is an architectural boundary, so it remains parked without a
+speculative source change or full rebuild.
 
 ## W398 Node ResourceTiming buffer-size validation source fix
 
