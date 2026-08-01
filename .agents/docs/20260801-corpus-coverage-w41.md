@@ -275,6 +275,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W325 | Node eval/global/instanceof/WHATWG URL leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build; 5 fresh | retain all five pure-contract guards; no source owner |
 | W326 | Node fs/fs.promises contract leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build; 5 fresh | retain all five fs/fs.promises guards; no source owner |
 | W327 | Node timer clear/refresh/tampering leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build; 5 fresh | retain all five timer guards; no source owner |
+| W328 | Node Buffer deprecation/encoding/zero-fill leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build; 5 fresh | retain all five Buffer guards; no source owner |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -751,6 +752,24 @@ no workspace-wide build. After the run, resources showed about **46 GiB
 available memory**, **2.2 MiB free swap**, and **17 GiB free disk at 99% usage**.
 Temporary runner output is cleaned immediately and the next wave remains
 resource-gated.
+
+## W328 Node Buffer deprecation/encoding/zero-fill leaves
+
+The bounded five-job Node selector covered five fresh Buffer files after
+filename/stem and semantic-owner review: `test-buffer-of-no-deprecation.js`,
+`test-buffer-new.js`, `test-buffer-zero-fill.js`,
+`test-buffer-zero-fill-reset.js`, and `test-buffer-isencoding.js`. The runner
+measured **5/5 file-level passes**, **0 failures**, **0 runner timeouts**, and
+**235–288 ms** per file. The Node runner reports file-level status only; no
+assertion-level pass total is inferred.
+
+All five Buffer deprecation, constructor validation, zero-fill, allocator-reset,
+and encoding-recognition guards passed and are retained. The deprecated Buffer
+cases emitted expected DEP0005 warnings only. There were no source or
+upstream-fixture changes, no full corpus, and no workspace-wide build. After the
+run, resources showed about **46 GiB available memory**, **2.3 MiB free swap**,
+and **17 GiB free disk at 99% usage**. Temporary runner output is cleaned
+immediately and the next wave remains resource-gated.
 
 ## Coverage novelty audit correction after W323
 
