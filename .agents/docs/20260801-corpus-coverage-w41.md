@@ -41,6 +41,8 @@ the observed Linux limits; the coordinator owns the only root build.
 | W91 | Bun Node-net leaves | 5 | 3/5 green; 5 passed / 1 failed / 7 ran / 15 expects; one no-tests stress fixture | retain three green net leaves; park autoSelectFamily liveness |
 | W92 | Bun/Node fs/promises AbortError owner | 5 Bun + 3 Node guards | Bun target 24 passed / 5 failed / 34 ran; 4 Bun guards green; Node 2/3 pass | issue #52; focused message fix landed, remaining fs/promises owners parked |
 | W93 | Node fs/promises FileHandle leaves | 5 | 5/5 files pass; no build | retain FileHandle coverage after W92 fix; no source owner |
+| W94 | Bun HTTP/2/Worker staged leaves | 5 | pre-fix 4/5 green; 7 passed / 1 failed / 8 ran / 6 expects | issue #53; isolate reserved-push DATA state |
+| W95 | Bun HTTP/2/Worker staged regression | 5 | post-fix 5/5 green; 8 passed / 0 failed / 8 ran / 8 expects | issue #53 landed; retain all five guards |
 
 ## Delivered slice
 
@@ -1141,6 +1143,30 @@ surface on Linux:
   found no new source owner and required no fixture change or issue. No full
   corpus or workspace-wide build was performed; temporary selector and output
   data were removed.
+
+### W94 Bun HTTP/2/Worker staged probe before fix
+
+- A fresh five-file Bun probe used **5 bounded jobs** and the existing binary;
+  it measured **4/5 files green, 7 passed, 1 failed, 8 ran, 6 expects**.
+- HTTP/2 late-RST (**2/2**) and streams-rehash (**3/3**) were green, as were
+  Worker SharedArrayBuffer (**1/1**) and transfer-terminate (**1/1**). The
+  single red file was the reserved-push DATA refusal case, which timed out
+  before observing `RST_STREAM(STREAM_CLOSED)`.
+- Narrow source inspection showed the client parser created the pushed stream
+  but forwarded DATA before response HEADERS. Issue [#53](https://github.com/Sunrisepeak/mbun/issues/53)
+  captured that one state-machine owner; no mixed HTTP/2 patch was attempted.
+
+### W95 Bun HTTP/2/Worker staged regression after #53
+
+- Commit `fa7b12b` adds only the reserved-push guard in the client DATA path:
+  before response HEADERS, it sends `STREAM_CLOSED`, closes the stream, and
+  keeps the session available for later frames.
+- The serialized fresh build completed. The same five-file probe with **5
+  bounded jobs** measured **5/5 files green, 8 passed, 0 failed, 8 ran, 8
+  expects**. The former push-refusal timeout is now **1/1**, while late-RST,
+  streams-rehash, SharedArrayBuffer, and transfer-terminate remain green.
+- No upstream fixture changes, full corpus, or workspace-wide build were
+  performed; temporary selectors and outputs were removed.
 
 ### W59 Node buffer leaf sample
 

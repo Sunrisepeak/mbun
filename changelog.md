@@ -5,6 +5,13 @@
 
 ## 2026-08-01
 
+- W95 issue [#53](https://github.com/Sunrisepeak/mbun/issues/53) 修复 HTTP/2 reserved push stream 的 DATA
+  状态：W94 的 **4/5 files green、7 passed、1 failed、8 ran、6 expects** 经 fresh serialized build 后变为
+  **5/5 files green、8 passed、0 failed、8 ran、8 expects**。仅在 client DATA path 对 response HEADERS 前的
+  pushed stream 发送 `STREAM_CLOSED` 并保持 session 可处理后续 PING；HTTP/2 late-RST、streams-rehash、
+  Worker SAB 与 transfer-terminate guards 均保持通过，未修改上游 fixture，未跑全量 corpus。
+- W94 fresh Bun HTTP/2/Worker staged probe（5 jobs、无构建）测得 **4/5 files green、7 passed、1 failed、8
+  ran、6 expects**；唯一失败是 reserved-push DATA refusal 3.5 秒 timeout，已由 #53 单 owner 定位。
 - W93 fresh Node `fs/promises` FileHandle leaf probe（5 jobs、复用 W92 binary、无构建）**5/5 files pass**：
   chmod、stat、truncate、write、sync 全部通过。作为 W92 AbortError 修复后的 Node-side guard，未发现
   新 source owner，未修改 fixture，未跑全量 corpus。
