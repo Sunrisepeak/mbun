@@ -56,6 +56,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W106 | Node process exitCode validation leaves | 5 | pre-fix 4/5 pass; post-fix 5/5 pass; issue #57; fresh serialized build | retain all five leaves; keep exitCode owner closed unless a new reproduction reopens it |
 | W107 | Node net low-coupling leaves | 5 | 5/5 files pass; no build | retain all five green net leaves; no source owner |
 | W108 | Bun Node-net constructor/server leaves | 5 | pre 2/5 green, 147 passed / 20 failed / 175 ran / 300 expects; post 2/5 green, 152 passed / 15 failed / 175 ran / 301 expects | issue #58; retain two green leaves, park node-net multi-owner failures and matcher-only gaps |
+| W109 | Node TLS constructor/default-option leaves | 5 | 3/5 pass; 1 fail; 1 timeout; isolated timeout reproduced at one job / 60s | park TLS pauseOnConnect propagation and silent socket-default timeout as separate owners |
 
 ## W96 delivered slice
 
@@ -330,6 +331,27 @@ Post-fix evidence from a fresh serialized build:
   real constructor identity to satisfy it would diverge from Bun/Node and is
   parked.
 - W107 Node net regression selector — **5/5 files pass**.
+
+No upstream fixture changed, no full corpus/workspace-wide test was run, and
+temporary selectors/output were cleaned after verification.
+
+## W109 Node TLS constructor and default-option leaves
+
+W109 reused the W108 fresh binary and ran five bounded jobs without a build.
+The selector measured **3/5 files pass**, **1 fail**, and **1 timeout**:
+
+- TLS server identity checking, no-host connect, and boolean option validation
+  passed;
+- 'test-tls-server-parent-constructor-options.js' failed only when an accepted
+  TLS socket expected pauseOnConnect to remain true;
+- 'test-tls-socket-default-options.js' produced no test output and timed out.
+  A one-job, 60-second isolated rerun reproduced the same silent timeout, so
+  it is not counted as a parallel-load flake.
+
+The two non-green results have different owners and no source change was made:
+the pauseOnConnect path needs TLS accepted-socket propagation analysis, while
+the silent timeout needs a bounded fixture/liveness investigation. No
+speculative issue was opened.
 
 No upstream fixture changed, no full corpus/workspace-wide test was run, and
 temporary selectors/output were cleaned after verification.

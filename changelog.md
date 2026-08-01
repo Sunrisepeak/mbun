@@ -5,6 +5,10 @@
 
 ## 2026-08-01
 
+- W109 fresh Node TLS constructor/default-option probe（3 jobs、复用 W108 fresh binary、无构建）**3/5 files pass、
+  1 fail、1 timeout**：server identity、no-host connect、boolean option validation 通过；parent constructor
+  只剩 accepted TLS socket 的 pauseOnConnect 传递问题；socket default options 无输出超时。该 timeout
+  以 1 job/60s 隔离复测仍复现，未创建猜测性 issue，未修改 source/fixture，未跑全量 corpus。
 - W108 issue [#58](https://github.com/Sunrisepeak/mbun/issues/58) 推进 Bun
   Node-net constructor/server shape：pre-fix **2/5 files green、147 passed / 20 failed /
   175 ran / 300 expects**；1d755dc 修复 callable constructor parent、_connections、
