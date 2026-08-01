@@ -117,6 +117,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W167 | Node fs delete/error leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five delete/path-error leaves; no source owner |
 | W168 | Bun util error/ANSI leaves | 4 | 2/4 green; 50 passed / 203 failed / 253 ran / 261 expects; 0 timeout; no build | retain error-code-mirror/exotic-global; park reportError printer and wrapAnsi multi-owner failures |
 | W169 | Node fs/promises basic leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build | retain four green leaves; park readfile zero-byte-liar child-fixture callback owner |
+| W170 | Node fs vector/copy/truncate leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five vector/copy/truncate leaves; no source owner |
 
 ## W133 Bun.Terminal green cluster
 
@@ -639,6 +640,18 @@ files passed**, with **1 failure and 0 timeouts**. The four green leaves were
 the exists, fd-backed readfile, statfs validation, and writefile contracts.
 The basic readfile failure was the known zero-byte-liar child-fixture callback
 count mismatch, not a newly isolated fs/promises source owner.
+
+No source or upstream fixture change was made. The selector used the existing
+coordinator binary through `tools/integration/node_corpus_runner.py` with
+three bounded jobs and a 30-second per-file timeout. No full corpus or
+workspace-wide test was run; the selector and raw runner output were removed
+after recording the result.
+
+## W170 Node fs vector/copy green cluster
+
+The bounded three-job selector covered readv, writev, writevSync, copyfile,
+and truncateSync behavior. All **5/5 files passed**, with **0 failures and 0
+timeouts**. Per-file durations were 165–265ms.
 
 No source or upstream fixture change was made. The selector used the existing
 coordinator binary through `tools/integration/node_corpus_runner.py` with
