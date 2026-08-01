@@ -227,6 +227,27 @@ the observed Linux limits; the coordinator owns the only root build.
 | W277 | Node module cache/lookup-path leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain module cache, relative lookup, and node_modules path contract leaves; no source owner |
 | W278 | Node module createRequire/cache/prototype leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain multibyte createRequire, cache injection, and prototype-safety leaves; no source owner |
 | W279 | Bun crypto invalid-this/lazyhash/HKDF leaves | 3 | 3/3 green; 8 passed / 0 failed / 8 ran / 24 expects; 0 timeout; no build | retain invalid-this safety, lazy hash inheritance, and HKDF callback/KeyObject guards; no source owner |
+| W280 | Node module warning/source-map API leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain deprecation-warning and `Module.setSourceMapsSupport` argument-contract leaves; no source owner |
+
+## W280 Node module warning/source-map API leaf probe
+
+The bounded three-job Node selector covered `test-module-loading-deprecated.js`,
+`test-module-parent-deprecation.js`, and `test-module-setsourcemapssupport.js`.
+It measured **3/3 file-level passes**, **0 failures**, and **0 runner
+timeouts**. Per-file durations were 197–300ms.
+
+`test-module-loading-deprecated.js` passed the `DEP0128` invalid-main warning
+contract; `test-module-parent-deprecation.js` passed the pending-deprecation
+`DEP0144` warning and `module.parent` value contract; and
+`test-module-setsourcemapssupport.js` passed invalid top-level and option-value
+argument validation. These are isolated warning/API leaves with no new source
+owner.
+
+No source or upstream fixture change was made. The selector reused the
+coordinator binary through `tools/integration/node_corpus_runner.py` with
+three bounded jobs and a 30-second per-file timeout. No full corpus, build,
+or workspace-wide test was run. The Node corpus runner reports only file-level
+status for these plain scripts, so no synthetic subtest count was added.
 
 ## W279 Bun crypto invalid-this/lazyhash/HKDF leaf probe
 
