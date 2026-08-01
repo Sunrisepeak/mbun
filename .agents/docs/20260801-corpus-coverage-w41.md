@@ -730,6 +730,20 @@ surface on Linux:
 - No full corpus or workspace-wide build was started. Keep the two green
   module guards and choose the next fresh one-owner row.
 
+### W70 Bun filesystem leaf coverage
+
+- A fresh five-file Bun-native probe used **5 bounded jobs** and reused the
+  current Linux binary; no source change or build was needed. The sample was
+  `fs/dir`, `fs-mkdir`, `fs-promises-writeFile-async-iterator`,
+  `fs-stats-constructor`, and `fs-stats-truncate`.
+- All **5/5 files** were green: **52 passed, 0 failed, 55 ran, 138 expects**.
+  This adds filesystem leaves across directory operations, mkdir validation,
+  async-iterator writes, and Stats construction/truncation without touching
+  the broader fs error or platform-specific clusters.
+- No full corpus or workspace-wide build was started. Keep these five files as
+  bounded filesystem guards and continue with a fresh one-owner row under the
+  3–5 lane policy.
+
 ### W59 Node buffer leaf sample
 
 - W59 使用 Node corpus runner 的默认 bounded profile、**3 jobs**。首批五个文件为

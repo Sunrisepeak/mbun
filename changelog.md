@@ -5,6 +5,9 @@
 
 ## 2026-08-01
 
+- W70 fresh Bun filesystem leaf probe（5 jobs、复用当前 Linux binary、无构建）新增 **5/5
+  files green、52 passed、0 failed、55 ran、138 expects**：目录、mkdir、async-iterator
+  writeFile、Stats constructor/truncate 全绿。未跑全量 corpus。
 - W69 fresh Bun module-loader probe（5 jobs、复用当前 Linux binary、无构建）测得 **2
   green files、46 passed、17 failed、63 ran、158 expects**。module resolve paths **6/6**、
   node:module SourceMap API **3/3** 全绿；Module hooks/children、require.extensions
