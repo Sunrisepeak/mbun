@@ -5,6 +5,7 @@
 
 ## 2026-08-01
 
+- W150 fresh Bun Blob focused cluster（3 jobs、复用现有 coordinator binary、无构建）**4/4 files green、27 passed、0 failed、27 ran、62 expects、0 timeout**：array fast path、copy-on-write、file-name ownership、blob.write 全部通过；单文件耗时 165–350ms。首次错误目录 selector 在 dispatch 前被路径校验拒绝，未计入结果；未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W149 fresh Bun Fetch/Web basic cluster（3 jobs、复用现有 coordinator binary、无构建）**4/4 files green、27 passed、0 failed、27 ran、40 expects、0 timeout**：Body mixin errors、FormData Content-Length、wire header case、UTF-8 BOM 全部通过；单文件耗时 200–216ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W148 fresh Node path namespace/glob probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：path glob、path.posix identity、path.win32 identity 全部通过；单文件耗时 198–200ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W147 fresh Node path adjacent probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：join、normalize、relative 全部通过；单文件耗时 198–199ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。

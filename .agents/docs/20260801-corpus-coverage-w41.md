@@ -97,6 +97,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W147 | Node path adjacent pure leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain join/normalize/relative; no source owner |
 | W148 | Node path namespace/glob leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain glob and posix/win32 identity guards; no source owner |
 | W149 | Bun Fetch/Web basic leaves | 4 | 4/4 green; 27 passed / 0 failed / 27 ran / 40 expects; 0 timeout; no build | retain all four Fetch/Web leaves; no source owner |
+| W150 | Bun Blob focused leaves | 4 | 4/4 green; 27 passed / 0 failed / 27 ran / 62 expects; 0 timeout; no build | retain all four Blob leaves; no source owner |
 
 ## W133 Bun.Terminal green cluster
 
@@ -365,6 +366,23 @@ coordinator binary through `tools/integration/bun_corpus_runner.py` with three
 bounded jobs, a 30-second per-file timeout, and missing Node modules allowed.
 No full corpus or workspace-wide test was run; the selector and raw runner
 output were removed after recording the result.
+
+## W150 Bun Blob green cluster
+
+The bounded three-job selector covered the Blob array fast path, copy-on-write,
+file-name ownership, and blob.write validation. All **4/4 files were green**,
+reaching **27 passed / 0 failed / 27 ran / 62 expects** with no timeout.
+Per-file durations were 165–350ms.
+
+The first selector version used an incorrect directory prefix and was rejected
+by path validation before dispatch; it is excluded from coverage data. The
+corrected selector used the existing coordinator binary through
+`tools/integration/bun_corpus_runner.py` with three bounded jobs, a 30-second
+per-file timeout, and missing Node modules allowed.
+
+No source or upstream fixture change was made. No full corpus or
+workspace-wide test was run; the selector and raw runner output were removed
+after recording the result.
 
 ## W132 Node VM and WebStreams owner split
 
