@@ -5,6 +5,17 @@
 
 ## 2026-08-02
 
+- W376 Node performance timeline source fix：五文件 selector 从 **1/5 pass、4 fail、0 timeout**
+  推进到 **2/5 pass、3 fail、0 timeout**。`modules/jsc/src/builtins/node_perf.cppm` 让
+  `getEntries*()` 按 `startTime` 稳定排序，并将缺失参数错误对齐为 Node 的
+  `ERR_MISSING_ARGS` `TypeError`；决定性 timeline 文件五-job 运行及 **1/1 串行复核**均通过。
+  W375 TLS 回归保持 **2/5 pass、3 fail、0 timeout**。剩余 ResourceTiming、`uvMetricsInfo()`、
+  GC observer 为独立 owner；三次串行 release build，未修改 upstream fixture、未跑全量 corpus。
+- W375 Node TLS socket option/close triage：五文件 selector **2/5 pass、3 fail、0 timeout**；其中
+  HWM 与 socket `allowHalfOpen` guard 通过。三个失败分别在 **1 job** 串行复核中稳定重现：connect
+  half-open 的延迟 `Bye` 数据收尾、keepalive/noDelay teardown reset、raw net/TLS close 顺序。
+  三者不是一个安全的 option-forwarding owner，暂不 speculative 修改源码，未构建、未修改 upstream
+  fixture、未跑全量 corpus。
 - W374 Node IPv6/TLS address-family source fix：五文件回归 selector 基线 **4/5 pass、1 fail、
   0 timeout**。失败先定位为 `localhost + family: 6` 的逻辑 peer 被 v4 bridge 覆盖，随后定位到
   TLS informational NID 查询残留 `ERR_OSSL_UNKNOWN_NID`。`modules/jsc/src/js_net.cppm` 保留

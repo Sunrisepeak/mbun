@@ -30,7 +30,7 @@ inline constexpr std::string_view kNodePerfJS = R"JS(
   const M = G.__mbunNativeModules || (G.__mbunNativeModules = {});
   const NS = () => (G.Bun && G.Bun.nanoseconds ? G.Bun.nanoseconds() : 0);
 
-  const err = (code, msg) => { const e = new (code === "ERR_INVALID_ARG_TYPE" ? TypeError : RangeError)(msg); e.code = code; return e; };
+  const err = (code, msg) => { const e = new (code === "ERR_INVALID_ARG_TYPE" || code === "ERR_MISSING_ARGS" ? TypeError : RangeError)(msg); e.code = code; return e; };
   const errArgType = (name, expected, actual) =>
     err("ERR_INVALID_ARG_TYPE", 'The "' + name + '" argument must be ' +
         (Array.isArray(expected) ? "one of type " + expected.join(", ") : "of type " + expected) +
@@ -165,6 +165,9 @@ inline constexpr std::string_view kNodePerfJS = R"JS(
   }
 
   function addEntry(entry) { buffer.push(entry); notifyObservers(entry); }
+  function timelineEntries(entries) {
+    return entries.slice().sort((a, b) => a.startTime - b.startTime);
+  }
 
   const performanceObj = {
     get timeOrigin() { return timeOrigin; },
@@ -195,12 +198,16 @@ inline constexpr std::string_view kNodePerfJS = R"JS(
       addEntry(entry);
       return entry;
     },
-    getEntries() { return buffer.slice(); },
+    getEntries() { return timelineEntries(buffer); },
     getEntriesByName(name, type) {
+      if (arguments.length === 0) throw err("ERR_MISSING_ARGS", 'The "name" argument must be specified');
       name = String(name);
-      return buffer.filter((e) => e.name === name && (type === undefined || e.entryType === type));
+      return timelineEntries(buffer.filter((e) => e.name === name && (type === undefined || e.entryType === type)));
     },
-    getEntriesByType(type) { return buffer.filter((e) => e.entryType === type); },
+    getEntriesByType(type) {
+      if (arguments.length === 0) throw err("ERR_MISSING_ARGS", 'The "type" argument must be specified');
+      return timelineEntries(buffer.filter((e) => e.entryType === type));
+    },
     clearMarks(name) {
       for (let i = buffer.length - 1; i >= 0; i--)
         if (buffer[i].entryType === "mark" && (name === undefined || buffer[i].name === String(name))) buffer.splice(i, 1);

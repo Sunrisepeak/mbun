@@ -321,6 +321,8 @@ the observed Linux limits; the coordinator owns the only root build.
 | W372 | Node net lifecycle green slice | 5 | 5/5 pass; 0 fail; 0 timeout | retain all five lifecycle leaves; no source owner |
 | W373 | Node net `ipv6Only` source fix | 5 | pre 4/5 pass + 1 fail; post 5/5 pass; W371/W372 regressions 5/5; one serial release rebuild | pass `ipv6Only` through the native bridge and bind AF_INET6 with `IPV6_V6ONLY`; no fixture change |
 | W374 | Node IPv6/TLS address-family source fix | 5 | pre 4/5 pass + 1 fail; post 5/5 pass; W371/W372 regressions 5/5; three incremental release rebuilds | preserve logical IPv6 peer metadata on the localhost fast path and clear informational OpenSSL unknown-NID errors; no fixture change |
+| W375 | Node TLS socket option/close triage | 5 | 2/5 pass; 3 fail; 0 timeout; serial confirmation 3/3 fail; no build | retain HWM and socket half-open guards; park TLS data-half-close, keepalive/noDelay reset, and raw net/TLS close-order owners separately |
+| W376 | Node performance timeline source fix | 5 | pre 1/5 pass + 4 fail; post 2/5 pass + 3 fail; timeline target 1/1 pass serially; W375 TLS regression 2/5 pass + 3 fail; three serial release builds | sort performance entries by `startTime` and align missing-argument TypeError shape; park ResourceTiming callback, uvMetricsInfo, and GC observer owners separately |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -1598,6 +1600,43 @@ release builds (**59.65s, 3.65s, and 3.61s**), W374 measured **5/5 passes, 0
 failures, and 0 timeout**; W371 and W372 regressions each remained **5/5
 passes**. No upstream fixture changed and no full corpus/workspace-wide test
 ran.
+
+## W375 Node TLS socket option/close triage
+
+The fresh five-file TLS selector used **5 bounded jobs** and measured **2/5
+passes, 3 failures, and 0 timeout**. `test-tls-connect-hwm-option.js` and
+`test-tls-socket-allow-half-open-option.js` passed. The three failures were
+reconfirmed independently with **1 job each**: the connect half-open case
+ended with an empty payload instead of the deferred `Bye`, the keepalive/
+noDelay case surfaced a connection reset during teardown, and the raw
+net/TLS close case observed the net close event before the expected deferred
+callback.
+
+These are three distinct TLS stream-lifecycle owners rather than one safe
+option-forwarding patch, so W375 is parked without a speculative source change
+or rebuild. No upstream fixture changed and no full corpus/workspace-wide test
+ran.
+
+## W376 Node performance timeline source fix
+
+The fresh five-file performance selector initially measured **1/5 pass, 4
+failures, and 0 timeout**. `test-performance-measure.js` passed; the timeline
+file first failed because measures were returned in creation order rather than
+`startTime` order. After the first narrow source change, the same file exposed
+the adjacent missing-argument error constructor contract, which was fixed in
+the same `node_perf.cppm` owner.
+
+`modules/jsc/src/builtins/node_perf.cppm` now sorts `getEntries*()` results by
+`startTime`, preserves stable ordering for equal timestamps, and raises
+Node-shaped `ERR_MISSING_ARGS` `TypeError`s when `getEntriesByName()` or
+`getEntriesByType()` is called without its required argument. After three
+serial release builds, W376 measured **2/5 pass, 3 failures, and 0 timeout**;
+the deciding timeline file passed both in the five-job run and in a separate
+**1/1 serial confirmation**. The remaining ResourceTiming buffer-full,
+`uvMetricsInfo()`, and GC observer failures remain separate owners. W375's
+five-file TLS regression stayed at **2/5 pass, 3 failures, and 0 timeout**.
+
+No upstream fixture changed and no full corpus/workspace-wide test ran.
 
 ## Coverage novelty audit correction after W323
 
