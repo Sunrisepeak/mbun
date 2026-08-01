@@ -231,6 +231,28 @@ the observed Linux limits; the coordinator owns the only root build.
 | W281 | Bun crypto KeyObject/RSA/X509 leaves | 3 | 2/3 green; 118 passed / 1 failed / 142 ran / 1016 expects; 0 timeout; no build | retain KeyObject and X509 green clusters; park RSA PKCS#1 private-decrypt rejection owner |
 | W282 | Node module wrap/wrapper/deprecation leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain CJS wrapper child-process probes and `module.parent` setter deprecation guard; no source owner |
 | W283 | Node module entry/global-path leaves | 3 | 2/3 pass; 1 fail; 0 timeout; no build | retain NODE_PATH and main-extension leaves; park copied-child HOME/global-path resolution owner |
+| W284 | Bun HTTP timeout/cork/TLS leaves | 3 | 3/3 green; 16 passed / 0 failed / 16 ran / 46 expects; 0 timeout; no build | retain timeout lifecycle, nested-cork isolation, and TLS identity guards; no source owner |
+
+## W284 Bun HTTP timeout/cork/TLS leaf probe
+
+The bounded three-job Bun selector covered `client-timeout-error.test.ts`,
+`node-http-nested-cork.test.ts`, and `node-https-checkServerIdentity.test.ts`.
+It measured **3/3 files green**, **16 passed / 0 failed / 16 ran / 46 expects**,
+and **0 runner timeouts**. Per-file durations were 333–1486ms under the
+bounded 4G/512-task resource profile.
+
+`client-timeout-error.test.ts` passed **2/2 tests / 4 expects** for timeout
+emission, explicit timeout clearing, and request lifecycle; the nested-cork
+security matrix passed **10/10 tests / 30 expects** with no cross-socket data
+bleed across Node HTTP and Bun.serve write/yield patterns; and
+`node-https-checkServerIdentity.test.ts` passed **4/4 tests / 12 expects** for
+hostname mismatch errors, Subject-CN fallback, custom identity checks, and
+client-certificate request behavior.
+
+No source or upstream fixture change was made. The selector reused the
+coordinator binary through `tools/integration/bun_corpus_runner.py` with
+three bounded jobs, a 30-second per-file timeout, and missing Node modules
+allowed. No full corpus, build, or workspace-wide test was run.
 
 ## W283 Node module entry/global-path leaf probe
 
