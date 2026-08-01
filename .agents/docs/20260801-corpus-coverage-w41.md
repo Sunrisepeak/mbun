@@ -92,6 +92,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W142 | Node string_decoder leaves | 3 | 2/3 pass; 1 fail; 0 timeout; no build | retain end/fuzz; park StringDecoder.prototype.write invalid-this brand owner |
 | W143 | Node timers basic leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five timer leaves; no source owner |
 | W144 | Bun Web console basic leaves | 4 | 2/4 green; 3 passed / 7 failed / 10 ran / 15 expects; 0 timeout; no build | retain UTF-16/recursive; park console.log and console.timeLog multi-owner formatting gaps |
+| W145 | Node timers adjacent leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build | retain four leaves; park non-integer delay callback-order owner |
 
 ## W133 Bun.Terminal green cluster
 
@@ -285,6 +286,24 @@ coordinator binary through `tools/integration/bun_corpus_runner.py` with three
 bounded jobs, a 30-second per-file timeout, and missing Node modules allowed.
 No full corpus or workspace-wide test was run; the selector and raw runner
 output were removed after recording the result.
+
+## W145 Node timers adjacent owner split
+
+The bounded three-job selector covered timer API refs, clearTimeout/interval
+equivalence, setImmediate, non-integer delays, and callback `this` behavior.
+It reached **4/5 files passed**, with **1 failure and 0 timeouts**; per-file
+durations were 167–251ms.
+
+The four non-failing leaves are retained. `test-timers-non-integer-delay.js`
+reported callback order **1,4,3,2** where Node expects **1,2,3,4**. This is a
+single fractional-delay ordering owner and is parked without a speculative
+source change or issue.
+
+No source or upstream fixture change was made. The selector used the existing
+coordinator binary through `tools/integration/node_corpus_runner.py` with
+three bounded jobs and a 30-second per-file timeout. No full corpus or
+workspace-wide test was run; the selector and raw runner output were removed
+after recording the result.
 
 ## W132 Node VM and WebStreams owner split
 
