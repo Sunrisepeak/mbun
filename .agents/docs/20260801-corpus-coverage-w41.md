@@ -224,6 +224,26 @@ the observed Linux limits; the coordinator owns the only root build.
 | W274 | Node module/constants plain-script leaves | 3 | 2/3 pass; 1 fail; 0 timeout; no build | retain `module.isBuiltin` and `builtinModules`; park internal/public constants mapping owner |
 | W275 | Node module/punycode plain-script leaves | 3 | 2/3 pass; 1 fail; 0 timeout; no build | retain createRequire and invalid-module loading guards; park punycode invalid-input message owner |
 | W276 | Bun crypto HMAC/PBKDF2/ECDH leaves | 3 | 3/3 green; 126 passed / 0 failed / 126 ran / 226 expects; 0 timeout; no build | retain RFC/vector HMAC, PBKDF2 validation/derivation, and ECDH conversion/secret guards; no source owner |
+| W277 | Node module cache/lookup-path leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain module cache, relative lookup, and node_modules path contract leaves; no source owner |
+
+## W277 Node module cache/lookup-path leaf probe
+
+The bounded three-job Node selector covered `test-module-cache.js`,
+`test-module-relative-lookup.js`, and `test-module-nodemodulepaths.js`. It
+measured **3/3 file-level passes**, **0 failures**, and **0 runner timeouts**.
+Per-file durations were 199–200ms.
+
+`test-module-cache.js` passed its temporary JSON-module cache contract;
+`test-module-relative-lookup.js` passed relative lookup-path resolution; and
+`test-module-nodemodulepaths.js` passed the POSIX/Windows node_modules path
+contract checks. The three files are isolated module-loader leaves with no new
+source owner.
+
+No source or upstream fixture change was made. The selector reused the
+coordinator binary through `tools/integration/node_corpus_runner.py` with
+three bounded jobs and a 30-second per-file timeout. No full corpus, build,
+or workspace-wide test was run. The Node corpus runner reports only file-level
+status for these plain scripts, so no synthetic subtest count was added.
 
 ## W276 Bun crypto HMAC/PBKDF2/ECDH leaf probe
 
