@@ -63,6 +63,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W113 | Node process environment/runtime leaves | 5 | 4/5 pass; 1 fail; 0 timeout; TZ failure reproduced at 1 job / 60s | issue #59; retain four green leaves, park existing-Date timezone cache invalidation |
 | W114 | Node streams writable/readable basic leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five green leaves; no source owner |
 | W115 | Node streams event-order/pipe leaves | 5 | 4/5 pass; 1 fail; 0 timeout; TickObject failure reproduced at 1 job / 60s | issue #60; retain four green leaves, park callback-less Writable tick scheduling |
+| W116 | Node streams state/encoding leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five green leaves; no source owner |
 
 ## W115 streams owner triage
 
