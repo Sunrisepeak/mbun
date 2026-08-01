@@ -338,10 +338,23 @@ inline constexpr std::string_view kNodeOsJS = R"JS(
       this.columns = s[0]; this.rows = s[1]; this.emit("resize");
     }
   };
-  WriteStream.prototype.clearLine = function () { return true; };
-  WriteStream.prototype.clearScreenDown = function () { return true; };
-  WriteStream.prototype.cursorTo = function () { return true; };
-  WriteStream.prototype.moveCursor = function () { return true; };
+  const readlineCompat = () => M["readline"] || M["node:readline"];
+  WriteStream.prototype.clearLine = function (dir, callback) {
+    const rl = readlineCompat();
+    return rl && typeof rl.clearLine === "function" ? rl.clearLine(this, dir, callback) : true;
+  };
+  WriteStream.prototype.clearScreenDown = function (callback) {
+    const rl = readlineCompat();
+    return rl && typeof rl.clearScreenDown === "function" ? rl.clearScreenDown(this, callback) : true;
+  };
+  WriteStream.prototype.cursorTo = function (x, y, callback) {
+    const rl = readlineCompat();
+    return rl && typeof rl.cursorTo === "function" ? rl.cursorTo(this, x, y, callback) : true;
+  };
+  WriteStream.prototype.moveCursor = function (dx, dy, callback) {
+    const rl = readlineCompat();
+    return rl && typeof rl.moveCursor === "function" ? rl.moveCursor(this, dx, dy, callback) : true;
+  };
   // Write-only stream: async iteration completes immediately (node parity).
   WriteStream.prototype[Symbol.asyncIterator] = function () { return { next() { return Promise.resolve({ value: undefined, done: true }); }, [Symbol.asyncIterator]() { return this; } }; };
 

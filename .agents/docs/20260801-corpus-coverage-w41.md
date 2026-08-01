@@ -295,6 +295,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W345 | Node readline continuation leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build; 5 fresh; TERM=xterm rerun | retain no-trailing-newline, recursive-write, raw-mode, and cursor-position guards; park Unicode line-separator owner |
 | W346 | Node readline Unicode line-separator source fix | 5 | pre 4/5 pass + 1 fail; post target 1/1 pass and bounded regression 5/5 pass; 0 timeout; one release rebuild | add U+2028/U+2029 to `lineEnding`; retain all five readline guards; no upstream-fixture change |
 | W347 | Node/Bun dgram port-message source fix | 5 Node + 1 Bun | pre Node 4/5 pass + 1 fail; post Node 5/5 pass; Bun 3/3 passed / 0 failed / 3 ran / 4 expects; 0 timeout; one release rebuild | change only `allowZero=false` wording from `>= 1` to `> 0`; retain dgram guards; no upstream-fixture change |
+| W348 | Node TTY WriteStream forwarding source fix | 5 Node + 1 Bun narrow guard | pre Node 4/5 pass + 1 fail; post Node 5/5 pass; Bun narrow guard 19/19 passed / 0 failed / 19 ran / 88 expects; 0 timeout; one no-cache release rebuild | forward four `WriteStream` cursor methods to readline; retain adjacent TTY/readline guards; no upstream-fixture change |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -1192,6 +1193,33 @@ as evidence: three Node-style files were correctly classified as `no-tests`,
 and a separate port-occupation/membership fixture had two unrelated failures;
 the selector was replaced with the Bun-native guard. No `compat/` test or
 assertion was changed, and no full corpus or workspace-wide test was run.
+
+## W348 Node TTY WriteStream forwarding source fix
+
+The W343 failure was reproduced first with the current coordinator binary: the
+bounded five-job Node selector measured **4/5 file-level passes**, **1 failure**,
+and **0 runner timeouts**. `test-tty-backwards-api.js` observed zero calls to
+the four mocked readline helpers, while the fixture requires each
+`WriteStream` method to forward its stream, arguments, and callback. The source
+owner was localized to the four stub methods in
+`modules/jsc/src/builtins/node_os.cppm`.
+
+The minimal fix keeps the existing fallback behavior but forwards
+`clearLine`, `clearScreenDown`, `cursorTo`, and `moveCursor` through the loaded
+`readline`/`node:readline` module. No `compat/` test or assertion was changed.
+After one no-cache release rebuild (**90.53 seconds**), the same Node selector
+measured **5/5 passes** and **0 runner timeouts**. The Bun-native
+`readline.node.test.ts` file still has unrelated `readline.Interface` failures
+(54 passed / 25 failed / 79 ran); the direct owner guard for the four forwarded
+readline APIs measured **19 passed / 0 failed / 19 ran / 88 expects**. The
+bounded Bun runner used jobs=5 and a 30-second file limit; no full corpus or
+workspace-wide test was run.
+
+This is the third W41 source-fix checkpoint. PR updates remain grouped by
+source checkpoints; individual probe results stay in this ledger. After the
+run, resources showed about **42 GiB available memory**, **4 MiB free swap**,
+and **16 GiB free disk at 99% usage**. Temporary runner output and selectors
+are removed before commit.
 
 ## Coverage novelty audit correction after W323
 

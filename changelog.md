@@ -16,6 +16,13 @@
   不一致。`modules/jsc/src/js_dgram.cppm` 仅修正 `allowZero=false` 分支；重建后
   Node dgram selector **5/5 pass、0 timeout**，Bun 原生 `node:dgram` guard **3/3
   passed、0 failed、4 expects**。未修改 `compat/` 上游测试，未跑全量 corpus。
+- W348 Node TTY `WriteStream` forwarding source fix：W343 基线为 **4/5 pass、1
+  fail、0 timeout**，`test-tty-backwards-api.js` 中四个 readline forwarding
+  方法均未调用 mock。`modules/jsc/src/builtins/node_os.cppm` 现将
+  `clearLine`、`clearScreenDown`、`cursorTo`、`moveCursor` 转发到 readline；
+  no-cache release rebuild 后 Node selector **5/5 pass、0 timeout**，Bun 原生
+  窄 guard **19/19 passed、0 failed、88 expects**。Bun 整文件的 25 个
+  `readline.Interface` 失败保持单独记录，未修改 `compat/`、未跑全量 corpus。
 
 ## 2026-08-01
 
