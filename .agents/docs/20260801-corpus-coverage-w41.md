@@ -272,6 +272,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W322 | Node active-resource lifetime/signal/title leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build; 5 fresh | retain all five active-resource/signal/title guards; no source owner |
 | W323 | Bun FileSink/loader/path/ANSI leaves | 5 | 4/5 green; 60 passed / 20 failed / 81 ran / 1351 expects; 0 timeout; 2 fresh + 3 revalidations | retain fresh `bun-file-windows` and `text-loader`; revalidate W168/W172/W191 owners |
 | W324 | Node process metadata/warning/SourceMap leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build; 5 fresh | retain four warning/SourceMap/resource guards; park process.config metadata-shape owner |
+| W325 | Node eval/global/instanceof/WHATWG URL leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build; 5 fresh | retain all five pure-contract guards; no source owner |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -694,6 +695,23 @@ upstream-fixture changes, full corpus, or workspace-wide build were made. After
 the run, resources showed about **44 GiB available memory**, **1.8 MiB free
 swap**, and **17 GiB free disk at 99% usage**. Temporary runner output is
 cleaned immediately and the next wave remains resource-gated.
+
+## W325 Node eval/global/instanceof/WHATWG URL leaves
+
+The bounded five-job Node selector covered five fresh pure-contract files after
+filename/stem and semantic-owner review: `test-eval.js`,
+`test-global-domexception.js`, `test-global-encoder.js`, `test-instanceof.js`,
+and `test-whatwg-url-custom-href-side-effect.js`. The runner measured **5/5
+file-level passes**, **0 failures**, **0 runner timeouts**, and **235–288 ms**
+per file. The Node runner reports file-level status only; no assertion-level
+pass total is inferred.
+
+All five eval policy, global constructor/encoder identity, instanceof, and
+WHATWG URL state-preservation guards passed and are retained. There were no
+source or upstream-fixture changes, no full corpus, and no workspace-wide
+build. After the run, resources showed about **44 GiB available memory**,
+**1.8 MiB free swap**, and **17 GiB free disk at 99% usage**. Temporary runner
+output is cleaned immediately and the next wave remains resource-gated.
 
 ## Coverage novelty audit correction after W323
 
