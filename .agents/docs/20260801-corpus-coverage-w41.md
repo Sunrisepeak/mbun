@@ -190,6 +190,26 @@ the observed Linux limits; the coordinator owns the only root build.
 | W240 | Node stream state/destroy leaves | 2 | 2/2 pass; 0 fail; 0 timeout; no build | retain Readable pause/resume/backpressure and Writable destroy/error/custom-destroy lifecycle guards; no source owner |
 | W241 | Bun Node HTTP leaf probe | 3 | 2/3 green; 7 passed / 1 failed / 8 ran / 13 expects; 0 timeout; no build | retain maxHeaderSize and HTTP primordials; park proxy-agent CR/LF host validation owner |
 | W242 | Bun spawn/mock leaves | 3 | 3/3 green; 11 passed / 0 failed / 11 ran / 45 expects; 0 timeout; no build | retain spoofed spawn-array length, disposable mock restore, and mock.module validation/resolver short-circuit guards; no source owner |
+| W243 | Bun Web Fetch/Response leaves | 3 | 3/3 green; 86 passed / 0 failed / 86 ran / 192 expects; 0 timeout; no build | retain Response constructor/redirect/clone, body-used errors, and fetch option-conversion/no-send guards; no source owner |
+
+## W243 Bun Web Fetch/Response leaf probe
+
+The bounded three-job Bun selector covered `response.test.ts`,
+`body-mixin-errors.test.ts`, and `fetch-args.test.ts`. All **3/3 files were
+green**, with **86 passed / 0 failed / 86 ran / 192 expects / 0 runner
+timeouts**. Per-file durations were 182–283ms.
+
+`response.test.ts` passed all 23 tests covering empty and initialized
+responses, redirect status/URL/header behavior, stack-overflow handling, and
+clone body locking/readability. `body-mixin-errors.test.ts` passed both
+Response and Request body-used TypeError guards. `fetch-args.test.ts` passed
+all 61 tests covering Request subclasses, deferred option-conversion
+rejections, invalid-request no-send guards, and getter/error propagation.
+
+No source or upstream fixture change was made. The selector reused the
+coordinator binary through `tools/integration/bun_corpus_runner.py` with
+three bounded jobs, a 30-second per-file timeout, and missing Node modules
+allowed. No full corpus, build, or workspace-wide test was run.
 
 ## W242 Bun spawn/mock leaf probe
 
