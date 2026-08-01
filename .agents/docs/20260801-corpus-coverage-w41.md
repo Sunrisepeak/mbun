@@ -34,6 +34,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W84 | Bun Node-path continuation | 5 | 5/5 green; 88 passed / 0 failed / 89 ran | retain as green path coverage; no source owner |
 | W85 | Bun os/string_decoder | 5 | pre 3 green + 1 skipped; post 4 green + 1 skipped; 149 passed / 0 failed / 150 ran | issue #51; dialect-aware Buffer ceiling |
 | W86 | Bun Buffer completion guards | 5 | 4/5 green; 25 passed / 6 failed / 31 ran | park concat multi-owner; preserve four green guards |
+| W87 | Bun Node-fs leaves | 5 | 5/5 green; 46 passed / 0 failed / 70 ran / 92 expects | fresh confirmation; no source owner |
 
 ## Delivered slice
 
@@ -1021,6 +1022,20 @@ surface on Linux:
   cluster; no source patch or new issue was opened.
 - This is a guard result, not a new full Buffer-suite score. No upstream
   fixture changes, no full corpus, and no workspace-wide build were performed.
+
+### W87 Bun Node-fs leaf confirmation
+
+- A fresh five-file Bun filesystem probe reused the W85 binary with **5 bounded
+  jobs** and no build. It measured **5/5 files green, 46 passed, 0 failed, 70
+  ran, 92 expects**.
+- `fs.glob` was **27/27**, `fs-path-length` **11/11**, Linux birthtime **5/5**,
+  cp symlink target **2/2**, and recursive readdir error-leak **1/1**. The
+  path-length file ran 35 cases and the readdir leak guard completed in the
+  bounded runner without a timeout.
+- This wave intentionally refreshed older inventory claims rather than treating
+  them as current facts. All five remain green, no single source owner surfaced,
+  and no issue or patch was needed. No upstream fixture changes, no full corpus,
+  and no workspace-wide build were performed.
 
 ### W59 Node buffer leaf sample
 

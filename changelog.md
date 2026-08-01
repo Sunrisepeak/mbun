@@ -5,6 +5,11 @@
 
 ## 2026-08-01
 
+- W87 fresh Bun Node-fs leaf probe（5 jobs、复用当前 Linux binary、无构建）确认 **5/5 files
+  green、46 passed、0 failed、70 ran、92 expects**：fs.glob **27/27**、fs-path-length
+  **11/11**、Linux birthtime **5/5**、cp symlink target **2/2**、recursive readdir error leak
+  **1/1**。旧记录经 fresh evidence 复核，未发现 source owner；未修改上游 fixture，未跑全量
+  corpus。
 - W86 Buffer completion regression guard（5 jobs、复用 W85 binary、无构建）测得 **4 green
   files、25 passed、6 failed、31 ran、46 expects**。compare-bounds、from-encoding-leak、
   inspectmaxbytes、utf16 全绿；`buffer-concat` 的 6 个失败跨 OOM 错误形状、resizable shrink
