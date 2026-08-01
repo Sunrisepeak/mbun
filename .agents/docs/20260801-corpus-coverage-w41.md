@@ -297,6 +297,8 @@ the observed Linux limits; the coordinator owns the only root build.
 | W347 | Node/Bun dgram port-message source fix | 5 Node + 1 Bun | pre Node 4/5 pass + 1 fail; post Node 5/5 pass; Bun 3/3 passed / 0 failed / 3 ran / 4 expects; 0 timeout; one release rebuild | change only `allowZero=false` wording from `>= 1` to `> 0`; retain dgram guards; no upstream-fixture change |
 | W348 | Node TTY WriteStream forwarding source fix | 5 Node + 1 Bun narrow guard | pre Node 4/5 pass + 1 fail; post Node 5/5 pass; Bun narrow guard 19/19 passed / 0 failed / 19 ran / 88 expects; 0 timeout; one no-cache release rebuild | forward four `WriteStream` cursor methods to readline; retain adjacent TTY/readline guards; no upstream-fixture change |
 | W349 | Node EventEmitter.on watermark metadata source fix | 5 Node + 5 Node regression + 1 Bun narrow guard | pre 4/5 pass + 1 fail; post target 5/5 pass and W348 regression 5/5 pass; Bun 10/10 passed / 0 failed / 10 ran / 15 expects; 0 timeout; one no-cache release rebuild | expose `nodejs.watermarkData` size/low/high/isPaused getters on async iterators; retain TTY/readline guards; no upstream-fixture change |
+| W350 | Node trace_events leaf probe | 5 | 4/5 pass; 1 skipped; 0 fail; 0 timeout; no build; 5 fresh | retain category/none/process-exit/promises leaves; park inspector-disabled dynamic-enable skip; no source owner |
+| W351 | Node EventEmitter.on invalid-argument source fix | 5 Node + 1 Bun narrow guard | pre 4/5 pass + 1 fail; focused post 8/8 invalid-argument assertions; full file advances to a separate EventTarget owner; W348 regression 5/5; Bun 10/10 passed / 0 failed / 10 ran / 15 expects; no timeout; five bounded no-cache builds | align invalid emitter/options/null/symbol/dotted-error validation in `bootstrap.cppm`; park EventTarget realm owner; no upstream-fixture change |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -1246,6 +1248,47 @@ native `EventEmitter.on` narrow guard measured **10 passed / 0 failed / 10 ran /
 workspace-wide test was run. This is the fourth W41 source-fix checkpoint;
 individual probes remain in this ledger and PR updates stay grouped by source
 checkpoint.
+
+## W350 Node trace_events leaf probe
+
+The bounded five-job Node selector covered five previously unrecorded
+`trace_events` leaves: category enablement, no-category behavior, dynamic
+process enablement, process-exit handling, and promise rejection tracing. The
+current coordinator binary measured **4/5 file-level passes**, **1 skipped**,
+**0 failures**, and **0 runner timeouts**. The skipped dynamic-enable file is
+explicitly inspector-disabled by its upstream guard; the promise-tracing child
+emits its intentional unhandled-rejection diagnostic but exits and validates
+successfully. No source owner was found, no build was run, and no full corpus
+was started.
+
+## W351 Node EventEmitter.on invalid-argument source fix
+
+The five-job W351 selector reproduced a known events contract gap with **4/5
+passes**, **1 failure**, and **0 runner timeouts**. The failure initially
+reported a missing `ERR_INVALID_ARG_TYPE` code for `on({}, "foo")`. Focused
+diagnostics then isolated the complete owner chain in the bootstrap
+`EventEmitter.on` compatibility layer:
+
+- invalid emitters fell through to a native `addEventListener` TypeError;
+- `null` options were incorrectly treated as omitted via `options ?? {}`;
+- symbol values could throw during error-message interpolation;
+- dotted names and expected `Error` types used non-Node error wording.
+
+The minimal source changes in `modules/jsc/src/builtins/bootstrap.cppm` add the
+missing emitter validation, default only `undefined`, use safe `String(value)`
+conversion, and match Node's property/instance wording. The exact focused Node
+reproduction now passes **8/8 invalid-argument assertions**. The full upstream
+file progresses past this owner but still stops at a separate
+`EventTarget`/`Event` realm validation owner; that residual failure is not
+counted as fixed. The W348 five-file TTY/readline regression remains **5/5
+passes**, and the Bun-native `EventEmitter.on` guard remains **10 passed / 0
+failed / 10 ran / 15 expects**.
+
+This checkpoint required five serialized no-cache release builds (**93–103
+seconds each**) because the incremental path did not reliably invalidate the
+embedded bootstrap payload. No `compat/` test or assertion was changed, no
+full corpus was run, and the residual EventTarget owner is parked for a
+separate bounded task.
 
 ## Coverage novelty audit correction after W323
 

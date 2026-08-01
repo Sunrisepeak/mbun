@@ -2501,7 +2501,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     // Node's NodeError bakes the code into toString(): "TypeError [ERR_x]: msg".
     // assert.throws(fn, /ERR_x/) matches on String(err), so it must appear there.
     const addCodeToName = (e, code) => { const base = e.name; Object.defineProperty(e, "toString", { value() { return `${base} [${code}]${this.message ? ": " + this.message : ""}`; }, configurable: true, writable: true }); return e; };
-    const ERR_INVALID_ARG_TYPE = (name, type, value) => { const e = new TypeError(`The "${name}" argument must be of type ${type}. Received ${value}`); e.code = "ERR_INVALID_ARG_TYPE"; return addCodeToName(e, "ERR_INVALID_ARG_TYPE"); };
+    const ERR_INVALID_ARG_TYPE = (name, type, value) => { const label = name.includes(".") ? "property" : "argument"; const requirement = type === "Error" ? "an instance of Error" : `of type ${type}`; const e = new TypeError(`The "${name}" ${label} must be ${requirement}. Received ${String(value)}`); e.code = "ERR_INVALID_ARG_TYPE"; return addCodeToName(e, "ERR_INVALID_ARG_TYPE"); };
     const ERR_OUT_OF_RANGE = (name, range, value) => { const e = new RangeError(`The "${name}" argument is out of range. It must be ${range}. Received ${value}`); e.code = "ERR_OUT_OF_RANGE"; return addCodeToName(e, "ERR_OUT_OF_RANGE"); };
     const ERR_UNHANDLED_ERROR = (rendered, context) => { const e = new Error(`Unhandled error. (${rendered})`); e.code = "ERR_UNHANDLED_ERROR"; e.context = context; return addCodeToName(e, "ERR_UNHANDLED_ERROR"); };
     const checkListener = (l) => { if (typeof l !== "function") throw ERR_INVALID_ARG_TYPE("listener", "function", l); };
@@ -2726,7 +2726,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     EventEmitterPrototype.eventNames = function eventNames() { return this._eventsCount > 0 ? Reflect.ownKeys(this._events) : []; };
 
     function eventTargetAgnosticRemoveListener(emitter, name, listener, flags) { if (typeof emitter.removeListener === "function") emitter.removeListener(name, listener); else emitter.removeEventListener(name, listener, flags); }
-    function eventTargetAgnosticAddListener(emitter, name, listener, flags) { if (typeof emitter.on === "function") { if (flags?.once) emitter.once(name, listener); else emitter.on(name, listener); } else emitter.addEventListener(name, listener, flags); }
+    function eventTargetAgnosticAddListener(emitter, name, listener, flags) { if (typeof emitter.on === "function") { if (flags?.once) emitter.once(name, listener); else emitter.on(name, listener); } else if (typeof emitter.addEventListener === "function") emitter.addEventListener(name, listener, flags); else throw ERR_INVALID_ARG_TYPE("emitter", "EventEmitter", emitter); }
 
     function addAbortListener(signal, listener) {
       if (signal === undefined) throw ERR_INVALID_ARG_TYPE("signal", "AbortSignal", signal);
@@ -2757,7 +2757,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     const AsyncIteratorPrototype = Object.getPrototypeOf(Object.getPrototypeOf(async function* () {}).prototype);
     const createIterResult = (value, done) => ({ value, done });
     function on(emitter, event, options) {
-      options = options ?? {};
+      options = options === undefined ? {} : options;
       validateObject(options, "options");
       const signal = options.signal;
       validateAbortSignal(signal, "options.signal");

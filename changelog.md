@@ -23,6 +23,16 @@
   no-cache release rebuild 后 Node selector **5/5 pass、0 timeout**，Bun 原生
   窄 guard **19/19 passed、0 failed、88 expects**。Bun 整文件的 25 个
   `readline.Interface` 失败保持单独记录，未修改 `compat/`、未跑全量 corpus。
+- W350 Node `trace_events` leaf probe：5 个 fresh 文件中 **4/5 pass、1 skipped、
+  0 fail、0 timeout**；skip 是 upstream inspector-disabled guard，promise tracing
+  的 intentional child rejection diagnostic 不影响成功退出。未发现 source owner，
+  未构建、未跑全量 corpus。
+- W351 Node `EventEmitter.on` invalid-argument source fix：初始 selector **4/5
+  pass、1 fail、0 timeout**；`modules/jsc/src/builtins/bootstrap.cppm` 补齐无效
+  emitter、`null` options、Symbol 安全错误构造和 dotted-name `ERR_INVALID_ARG_TYPE`
+  文案。精确 Node focused guard **8/8**，W348 回归 **5/5**，Bun 原生 guard
+  **10/10 passed、0 failed、15 expects**。完整 upstream 文件剩余一个独立
+  EventTarget realm owner，未修改 `compat/`、未跑全量 corpus。
 - W349 Node `EventEmitter.on` watermark metadata source fix：fresh selector 首次
   为 **4/5 pass、1 fail、0 timeout**，失败是 async iterator 缺少
   `Symbol.for("nodejs.watermarkData")`。`modules/jsc/src/builtins/bootstrap.cppm`
