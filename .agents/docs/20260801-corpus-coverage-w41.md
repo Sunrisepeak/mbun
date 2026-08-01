@@ -690,6 +690,25 @@ surface on Linux:
 - No full corpus or workspace-wide build was started. Continue with a fresh
   one-owner row under the 3–5 lane policy.
 
+### W68 Bun process leaf probe and fixture triage
+
+- A fresh five-file Bun-native probe used **5 bounded jobs** and reused the
+  current Linux binary; no source change or build was needed. The sample was
+  `process-nexttick`, `process-args`, `process-exitCode-with-exit`,
+  `process-on`, and `process-stdio-invalid-utf16`.
+- The runner measured **3 green files, 30 passed, 6 failed, 36 ran, 131
+  expects**. The green files were `process-args` (**1/1, 50 expects**),
+  `process-on` (**3/3, 5 expects**), and invalid-UTF-16 stdio
+  (**24/24, 66 expects**).
+- `process-exitCode-with-exit.js` is a fixture-style entry: direct `bun test`
+  invocation leaves a non-numeric final argv and produces NaN, while a direct
+  smoke with an explicit numeric argument prints `PASS`; it is not an
+  exitCode setter owner. `process-nexttick` reached **2/7 tests pass** with
+  callback validation, queue ordering, and repeated scheduling failures, so
+  it remains a multi-owner process boundary.
+- No full corpus or workspace-wide build was started. Keep the three green
+  process leaves as coverage guards and continue from a fresh one-owner row.
+
 ### W59 Node buffer leaf sample
 
 - W59 使用 Node corpus runner 的默认 bounded profile、**3 jobs**。首批五个文件为

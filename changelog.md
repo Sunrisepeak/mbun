@@ -5,6 +5,12 @@
 
 ## 2026-08-01
 
+- W68 fresh Bun process probe（5 jobs、复用当前 Linux binary、无构建）测得 **3 green
+  files、30 passed、6 failed、36 ran、131 expects**。`process-args`、`process-on`、
+  invalid-UTF-16 stdio 全绿；`process-exitCode-with-exit.js` 确认为需要数值 argv 的
+  fixture（显式传入数值后 direct smoke 输出 `PASS`）；`process-nexttick` 的失败分散
+  在 callback validation、queue ordering、repeated scheduling，多 owner 停车。未跑
+  全量 corpus。
 - W67 fresh Bun `worker_threads` triage（5 jobs、复用当前 Linux binary、无构建）测得
   **2 green files、8 passed、3 failed、12 ran、13 expects**，另有 1 个 all-skipped。
   `worker-async-dispose` 与 `worker-transfer-list` 全绿；`worker-thread-id` 是缺少
