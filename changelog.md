@@ -5,6 +5,8 @@
 
 ## 2026-08-01
 
+- W228 fresh Node crypto/WebCrypto leaf probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：KeyObject own-key guard、AES-GCM empty-payload round-trip、short-tag `OperationError` rejection 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 199–200ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W227 fresh Node crypto leaf probe（3 jobs、复用现有 coordinator binary、无构建）**2/3 files pass、1 fail、0 timeout**：HKDF 与 KeyObject brand-check clean-exit；randomFill 在字符串 offset 校验断言处失败，收敛为 crypto.randomFill* offset/size type-validation owner。Node runner 按 file-level 计数，单文件耗时 198–300ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W226 fresh Node crypto leaf probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：cipher encoding validation、getCipherInfo lookup/type/range、RSA-OAEP empty payload 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 231–233ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W225 fresh Node Buffer read/string probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：basic reads、toString range/coercion、JSON Buffer serialization 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 199–200ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W224 fresh Node Buffer write probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：generic write encoding/range、Double BE/LE、UInt BE/LE offset/OOB 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 200–201ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。

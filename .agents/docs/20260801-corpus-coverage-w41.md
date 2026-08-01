@@ -174,6 +174,8 @@ the observed Linux limits; the coordinator owns the only root build.
 | W224 | Node Buffer write leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain generic encoding/range, Double BE/LE, and UInt BE/LE write guards; no source owner |
 | W225 | Node Buffer read/string leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain basic reads, toString range/coercion, and JSON serialization guards; no source owner |
 | W226 | Node crypto leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain cipher encoding validation, getCipherInfo lookup/type/range, and RSA-OAEP empty-payload guards; no source owner |
+| W227 | Node crypto leaves | 3 | 2/3 pass; 1 fail; 0 timeout; no build | retain HKDF and KeyObject brand-check leaves; park randomFill offset/size type validation owner |
+| W228 | Node crypto/WebCrypto leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain KeyObject own-key, AES-GCM empty-payload, and short-tag rejection guards; no source owner |
 
 ## W133 Bun.Terminal green cluster
 
@@ -264,6 +266,33 @@ clean-exit classification is the authoritative result. No source or upstream
 fixture change was made. The selector used the existing coordinator binary
 through `tools/integration/node_corpus_runner.py` with three bounded jobs and a
 30-second per-file timeout. No full corpus or workspace-wide test was run; the
+selector and raw runner output were removed after recording the result.
+
+## W227 Node crypto partial cluster
+
+The bounded three-job Node selector covered HKDF sync/async and input-boundary
+behavior, KeyObject native-brand and forged-prototype guards, and random-fill
+argument validation. **2/3 files passed**, with **1 failure and 0 timeouts**;
+per-file durations were 198–300ms.
+
+HKDF and KeyObject brand-check passed cleanly. The random leaf stopped at the
+upstream assertion that `randomFillSync` rejects a string `offset`, identifying
+a focused `crypto.randomFill*` offset/size type-validation owner. These
+upstream files are plain scripts, so file-level clean exit is authoritative.
+No source or fixture change was made, and no full corpus or workspace-wide test
+was run; the selector and raw runner output were removed after recording the
+result.
+
+## W228 Node crypto/WebCrypto green cluster
+
+The bounded three-job Node selector covered KeyObject own-string/Symbol key
+guards after metadata access, AES-GCM WebCrypto empty-payload round-trip, and
+short-tag decrypt rejection. All **3/3 files passed**, with **0 failures and 0
+timeouts**; per-file durations were 199–200ms.
+
+These upstream files are plain scripts, so the Node runner's file-level
+clean-exit classification is authoritative. No source or upstream fixture
+change was made, and no full corpus or workspace-wide test was run; the
 selector and raw runner output were removed after recording the result.
 
 ## W222 Node Buffer numeric green cluster
