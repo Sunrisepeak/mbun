@@ -274,6 +274,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W324 | Node process metadata/warning/SourceMap leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build; 5 fresh | retain four warning/SourceMap/resource guards; park process.config metadata-shape owner |
 | W325 | Node eval/global/instanceof/WHATWG URL leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build; 5 fresh | retain all five pure-contract guards; no source owner |
 | W326 | Node fs/fs.promises contract leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build; 5 fresh | retain all five fs/fs.promises guards; no source owner |
+| W327 | Node timer clear/refresh/tampering leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build; 5 fresh | retain all five timer guards; no source owner |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -731,6 +732,25 @@ no source or upstream-fixture changes, no full corpus, and no workspace-wide
 build. After the run, resources showed about **46 GiB available memory**,
 **2.2 MiB free swap**, and **17 GiB free disk at 99% usage**. Temporary runner
 output is cleaned immediately and the next wave remains resource-gated.
+
+## W327 Node timer clear/refresh/tampering leaves
+
+The bounded five-job Node selector covered five fresh timer files after
+filename/stem and semantic-owner review: `test-timers-clearImmediate.js`,
+`test-timers-clear-object-does-not-throw-error.js`,
+`test-timers-clear-null-does-not-throw-error.js`,
+`test-timers-process-tampering.js`, and
+`test-timers-refresh-in-callback.js`. The runner measured **5/5 file-level
+passes**, **0 failures**, **0 runner timeouts**, and **253–257 ms** per file.
+The Node runner reports file-level status only; no assertion-level pass total is
+inferred.
+
+All five timer clear, refresh, and process-tampering guards passed and are
+retained. There were no source or upstream-fixture changes, no full corpus, and
+no workspace-wide build. After the run, resources showed about **46 GiB
+available memory**, **2.2 MiB free swap**, and **17 GiB free disk at 99% usage**.
+Temporary runner output is cleaned immediately and the next wave remains
+resource-gated.
 
 ## Coverage novelty audit correction after W323
 
