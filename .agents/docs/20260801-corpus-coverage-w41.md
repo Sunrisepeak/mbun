@@ -264,6 +264,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W314 | Bun util mmap/hash/CSRF/file/concat leaves | 5 | 4/5 green; 50 passed / 8 failed / 58 ran / 200 expects; 0 timeout; no build | retain four green util guards; park missing Bun.mmap API owner |
 | W315 | Node process/console lifecycle green cluster | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five process/console lifecycle guards; no source owner |
 | W316 | Node process.env contract leaves | 5 | 3/5 pass; 1 fail; 1 skipped; 0 timeout; no build | retain three env guards; record inspector skip and split load-env-file cwd/diagnostic owners |
+| W317 | Node console/stdio/finalization green cluster | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five console/stdio/finalization guards; no source owner |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -529,6 +530,25 @@ was attempted.
 There were no source or upstream-fixture changes, no full corpus, and no
 workspace-wide build. After the run, resources showed about **44 GiB
 available memory**, about **1.4 MiB free swap**, and about **17 GiB free disk at
+99% usage**. Temporary runner output is cleaned immediately and the next wave
+remains resource-gated.
+
+## W317 Node console/stdio/finalization green cluster
+
+The bounded five-job Node selector covered five previously unrecorded files:
+`test-console-log-stdio-broken-dest.js`, `test-console-sync-write-error.js`,
+`test-process-external-stdio-close.js`,
+`test-process-external-stdio-close-spawn.js`, and
+`test-process-finalization.mjs`. The runner measured **5/5 file-level passes**,
+**0 failures**, **0 runner timeouts**, and **287–1992 ms** per file. The Node
+runner reports file-level status only; no assertion-level pass total is
+inferred.
+
+All five console/stdio/finalization guards passed and are retained. There were
+no source or upstream-fixture changes, no full corpus, and no workspace-wide
+build. An unrelated external package installation remained active during the
+probe but was not touched. After the run, resources showed about **44 GiB
+available memory**, about **1.5 MiB free swap**, and about **17 GiB free disk at
 99% usage**. Temporary runner output is cleaned immediately and the next wave
 remains resource-gated.
 
