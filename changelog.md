@@ -5,6 +5,7 @@
 
 ## 2026-08-01
 
+- W197 fresh Node Readable boundary probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：unshift、unimplemented `_read`、next-no-null、object multi-push、destroy 全部通过；单文件耗时 165–265ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W196 fresh Node Readable readiness/encoding probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：readable-then-resume、readingMore、resume HWM/scheduled、existing-buffer encoding 全部通过；单文件耗时 165–200ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W195 fresh Bun resolver import/meta probe（3 jobs、复用现有 coordinator binary、无构建）**1/5 files green、42 passed、28 failed、70 ran、82 expects、0 timeout**：import-meta-resolve 15/15 全绿；其余停车在 import.meta path、empty-module shape、CJS __esModule 三个 owners。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W194 fresh Bun JSC/resolve/transpiler probe（3 jobs、复用现有 coordinator binary、无构建）**3/5 files green、39 passed、73 failed、130 ran、286 expects、0 timeout**：native constructor identity 4/4、string-noAtomize 1/1、bun.lock 1/1；REPL transform 与 TypeScript type-export 分别停车在 parser/output 与 bytecode/compile owners。未修改 source/fixture，未跑全量 corpus/workspace-wide test。

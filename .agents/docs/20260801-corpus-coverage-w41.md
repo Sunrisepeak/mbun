@@ -144,6 +144,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W194 | Bun JSC/resolve/transpiler leaves | 5 | 3/5 green; 39 passed / 73 failed / 130 ran / 286 expects; 0 timeout; no build | retain native-constructor, string-noAtomize, bun-lock; park REPL transform and bytecode/type-export owners separately |
 | W195 | Bun resolver import/meta leaves | 5 | 1/5 green; 42 passed / 28 failed / 70 ran / 82 expects; 0 timeout; no build | retain import-meta-resolve; park import.meta path, empty-module shape, and CJS __esModule owners separately |
 | W196 | Node Readable readiness/encoding leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five readable/resume/encoding leaves; no source owner |
+| W197 | Node Readable boundary leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five unshift/read/object/destroy leaves; no source owner |
 
 ## W133 Bun.Terminal green cluster
 
@@ -1054,6 +1055,19 @@ The bounded three-job selector covered readable-then-resume, reading-more
 state, resume high-water-mark behavior, scheduled resume, and setting encoding
 over existing buffers. All **5/5 files passed**, with **0 failures and 0
 timeouts**. Per-file durations were 165–200ms.
+
+No source or upstream fixture change was made. The selector used the existing
+coordinator binary through `tools/integration/node_corpus_runner.py` with
+three bounded jobs and a 30-second per-file timeout. No full corpus or
+workspace-wide test was run; the selector and raw runner output were removed
+after recording the result.
+
+## W197 Node Readable boundary green cluster
+
+The bounded three-job selector covered unshift behavior, an unimplemented
+`_read` guard, next-without-null behavior, asynchronous object-mode multi-push,
+and destroy handling. All **5/5 files passed**, with **0 failures and 0
+timeouts**. Per-file durations were 165–265ms.
 
 No source or upstream fixture change was made. The selector used the existing
 coordinator binary through `tools/integration/node_corpus_runner.py` with
