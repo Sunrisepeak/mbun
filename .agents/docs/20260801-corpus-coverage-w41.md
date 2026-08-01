@@ -343,6 +343,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W394 | Node TLS close_notify/RST teardown source fix | 5 | target pre 1/1 fail; post target 1/1 pass; five-file TLS selector 4/5 pass + 1 fail, 0 timeout; Bun fake-timer regression 5/5 green, 8 passed / 0 failed / 8 ran / 10 expects; two serial release builds 57.35s + 57.43s | classify RST/EPIPE after local TLS shutdown as EOF while preserving unsignalled reset errors; park raw TLS close-order owner separately |
 | W395 | Node TLS close callback ordering source fix | 5 | target pre 1/1 fail; post target 1/1 pass; five-file TLS selector 5/5 pass, 0 fail, 0 timeout; Bun fake-timer regression 5/5 green, 8 passed / 0 failed / 8 ran / 10 expects; serial release build 59.09s | defer no-error TLS transport close through two immediate phases so close callbacks follow the current check phase |
 | W396 | Node TLS empty-SNI-context error mapping source fix | 5 | pre 3/5 pass + 2 fail; target 1/1 fail → 1/1 pass; post SNI selector 4/5 pass + 1 fail, 0 timeout; Bun fake-timer regression 5/5 green, 8 passed / 0 failed / 8 ran / 10 expects; incremental release build 3.58s | map the exact no-credentials server `ERR_SSL_NO_SHARED_CIPHER` reason to Node's `no suitable signature algorithm` message; park offline SNICallback callback owner |
+| W398 | Node ResourceTiming buffer-size validation source fix | 5 | baseline performance selector 4/5 pass + 1 fail; target 1/1 fail → 1/1 pass; post selector 5/5 pass, 0 fail, 0 timeout; Bun fake-timer regression 5/5 green, 8 passed / 0 failed / 8 ran / 10 expects; three serial release builds 57.34s + 59.01s + 59.15s | reject BigInt/Symbol with Node-compatible `ERR_INVALID_ARG_TYPE` messages, reset invalid non-number values to zero, and truncate valid finite nonnegative numbers; no upstream fixture change |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -1839,6 +1840,22 @@ milestone-order owners remain. The five-file Bun fake-timer regression stayed
 **5/5 green, 8 passed, 0 failed, 8 ran, 10 expects** after the serialized release
 build (**59.06s**). No upstream fixture changed and no full corpus/workspace-wide
 test ran.
+
+## W398 Node ResourceTiming buffer-size validation source fix
+
+The remaining W330 ResourceTiming parameter owner was
+`performance.setResourceTimingBufferSize()`. Node rejects BigInt and Symbol
+arguments with `ERR_INVALID_ARG_TYPE` messages instead of silently retaining
+the previous buffer size. Other invalid non-number values reset the size to
+zero; valid finite nonnegative numbers are truncated to an integer.
+
+`node_perf.cppm` now implements those argument branches. The focused
+ResourceTiming file moved from **1/1 failure** to **1/1 pass**. The five-file
+Node performance selector moved from **4/5 pass, 1 fail** to **5/5 pass, 0
+fail, 0 timeout**. The five-file Bun fake-timer regression was **5/5 green,
+8 passed, 0 failed, 8 ran, 10 expects**. Three serial release builds took
+**57.34s, 59.01s, and 59.15s**. No upstream fixture changed and no full
+corpus/workspace-wide test ran.
 
 ## W396 Node TLS empty-SNI-context error mapping source fix
 

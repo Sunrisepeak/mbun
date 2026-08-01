@@ -5,6 +5,13 @@
 
 ## 2026-08-02
 
+- W398 Node ResourceTiming buffer-size validation source fix：`performance.setResourceTimingBufferSize()`
+  现在对 BigInt/Symbol 抛出 Node-compatible `ERR_INVALID_ARG_TYPE`，其他 invalid non-number 值重置
+  为 zero，合法 finite nonnegative number 截断为整数。focused ResourceTiming 文件从 **1/1 failure**
+  到 **1/1 pass**；五文件 Node performance selector 从 **4/5 pass、1 fail** 提升到 **5/5 pass、0
+  fail、0 timeout**；Bun fake-timer 回归 **5/5 green、8 passed、0 failed、8 ran、10 expects**；三次
+  serial release build **57.34s、59.01s、59.15s**。未修改 upstream fixture、未跑全量 corpus。
+
 - W396 Node TLS empty-SNI-context error mapping source fix：server context 没有 certificate/key 且
   OpenSSL 返回精确 `ERR_SSL_NO_SHARED_CIPHER` 时，映射为 Node 要求的 `no suitable signature
   algorithm`，其他 cipher/reset 错误不改。focused 文件从 **1/1 failure** 到 **1/1 pass**；五文件

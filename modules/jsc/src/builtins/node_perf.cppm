@@ -311,8 +311,13 @@ inline constexpr std::string_view kNodePerfJS = R"JS(
         if (buffer[i].entryType === "resource") buffer.splice(i, 1);
     },
     setResourceTimingBufferSize(maxSize) {
+      if (typeof maxSize === "bigint")
+        throw err("ERR_INVALID_ARG_TYPE", "maxSize is a BigInt and cannot be converted to a number.");
+      if (typeof maxSize === "symbol")
+        throw err("ERR_INVALID_ARG_TYPE", "maxSize is a Symbol and cannot be converted to a number.");
       if (typeof maxSize === "number" && Number.isFinite(maxSize) && maxSize >= 0)
         resourceTimingBufferSize = Math.trunc(maxSize);
+      else resourceTimingBufferSize = 0;
     },
     markResourceTiming(timingInfo, requestedUrl) { addResourceTiming(timingInfo, requestedUrl); },
     addEventListener(type, listener) {
