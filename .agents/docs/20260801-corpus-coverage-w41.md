@@ -257,6 +257,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W307 | Bun globals/archive/console/crypto leaf probe | 5 | 2/5 green; 72 passed / 118 failed / 191 ran / 212 expects; 1 skipped; 0 runner timeout; no build | retain inspect-table and cipheriv; park Archive API, console iterator, and split globals owners |
 | W308 | Node console/path leaf probe | 5 | 4/5 pass; 1 fail; 0 timeout; no build | retain console-clear, console-instance, path-isabsolute, and path-join; park diagnostics-channel callback delivery |
 | W309 | Node console/process contract leaves | 5 | 4/5 pass; 1 skipped; 0 fail; 0 timeout; no build | retain four console/process guards; record process-config as a Linux environment skip |
+| W310 | Node process/console builtin leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build | retain four guards; park process.getBuiltinModule node:test identity owner |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -374,6 +375,28 @@ changes were made, and no full corpus or workspace-wide build was run.
 After the run, resources showed about **45 GiB available memory**, about **1.1
 MiB free swap**, and about **17 GiB free disk at 99% usage**. The temporary
 runner output is cleaned immediately and the next wave remains resource-gated.
+
+## W310 Node process/console builtin leaf probe
+
+The bounded five-job Node selector covered five previously unrecorded files:
+`test-process-get-builtin.mjs`, `test-process-default.js`,
+`test-process-chdir-errormessage.js`, `test-process-env-symbols.js`, and
+`test-console-formatTime.js`. It measured **4/5 file-level passes**, **1
+failure**, **0 runner timeouts**, and **198–349 ms** per file. The Node runner
+reports file-level status only; no assertion-level pass total is inferred.
+
+`test-process-default.js`, `test-process-chdir-errormessage.js`,
+`test-process-env-symbols.js`, and `test-console-formatTime.js` passed. The
+only failure, `test-process-get-builtin.mjs`, found that the returned
+`node:test` namespace had the expected structure but was not reference-equal
+to the imported namespace. This is one builtin-module identity/cache owner;
+no mixed process or console patch was attempted.
+
+There were no source or upstream-fixture changes, no full corpus, and no
+workspace-wide build. After the run, resources showed about **45 GiB
+available memory**, about **1.1 MiB free swap**, and about **17 GiB free disk at
+99% usage**; temporary runner output is cleaned immediately and the next wave
+remains resource-gated.
 
 ## W304 Node events/path continuation leaf probe
 
