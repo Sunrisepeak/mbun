@@ -207,6 +207,31 @@ the observed Linux limits; the coordinator owns the only root build.
 | W257 | Bun mock.module/re-export leaves | 3 | 2/3 green; 6 passed / 6 failed / 13 ran / 32 expects; 0 timeout; no build | retain re-export mocks 2/2 and non-existent-specifier 1/1; split mock-module async, restore identity, relative-file, and cache/update owners |
 | W258 | Node child-process stdio/destroy leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain stdio inherit/flush and child destroy state guards; no source owner |
 | W259 | Node child-process IPC/exec leaves | 3 | 2/3 pass; 1 fail; 0 timeout; no build | retain disconnect async/self-termination and exec encoding; park IPC server-handle transfer owner |
+| W260 | Bun hooks/custom matcher/mock-fn leaves | 3 | 2/3 green; 78 passed / 34 failed / 113 ran / 20472 expects; 0 timeout; no build | retain expect-extend 28/28 and jest-hooks 17 pass + 1 todo; park mock-fn metadata/this, call bookkeeping, missing APIs, reset/restore, and spyOn owners |
+
+## W260 Bun hooks/custom matcher/mock-fn leaf probe
+
+The bounded three-job Bun selector covered `jest-hooks.test.ts`,
+`expect-extend.test.js`, and `mock-fn.test.js`. It measured **2/3 files
+green**, with **78 passed / 34 failed / 113 ran / 20,472 expects / 0 runner
+timeouts**. Per-file durations were 182–232ms.
+
+`expect-extend.test.js` passed all 28 tests with 20,088 expects, covering
+custom matcher context, asymmetric matchers, async results, invalid matcher
+errors, prototypes/classes, and intensive use. `jest-hooks.test.ts` passed 17
+tests with 1 todo and no failures, covering nested, async, and done-callback
+hook ordering.
+
+`mock-fn.test.js` passed 33/67 tests and failed 34. The failures cluster around
+mock metadata/invalid-this behavior, return and call bookkeeping, missing
+`withImplementation`/`getMockImplementation`/`invocationCallOrder` APIs,
+reset/restore behavior, and `spyOn` identity/indexed-property semantics. No
+mixed fix was attempted.
+
+No source or upstream fixture change was made. The selector reused the
+coordinator binary through `tools/integration/bun_corpus_runner.py` with
+three bounded jobs, a 30-second per-file timeout, and missing Node modules
+allowed. No full corpus, build, or workspace-wide test was run.
 
 ## W259 Node child-process IPC/exec plain-script leaf probe
 
