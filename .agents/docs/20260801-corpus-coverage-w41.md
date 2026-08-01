@@ -70,6 +70,20 @@ the observed Linux limits; the coordinator owns the only root build.
 | W120 | Bun util encoding/memory/promise/worker leaves | 5 | 5/5 green; 15 passed / 0 failed / 15 ran / 43 expects; no build | retain all five green leaves; no source owner |
 | W121 | Node HTTP/FS/UDP/zlib leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build | retain four green leaves; park zlib weak-handle memory accounting after a bounded zero-delta reproduction |
 | W122 | Bun util file/stream leaves | 5 | 4/5 green; 12 passed / 2 failed / 14 ran / 432 expects; no build | issue #62; retain four green leaves, park `readableStreamToArrayBuffer` intrinsic Promise plumbing |
+| W123 | Node fs error/HTTP lifecycle leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five green leaves; no source owner |
+
+## W123 Node fs and HTTP green leaves
+
+The bounded three-job selector covered WriteStream option validation, two
+`cpSync` error contracts, HTTP responses without Content-Length, and HTTP agent
+timeout handling. All **5/5 files passed**, with **0 failures** and **0
+timeouts**; per-file durations were 215–265ms.
+
+No source or upstream fixture change was made. The selector used the existing
+coordinator binary through `tools/integration/node_corpus_runner.py` with three
+bounded jobs and a 30-second per-file timeout. No full corpus or workspace-wide
+test was run; the selector and raw runner output were removed after recording
+the result.
 
 ## W122 Bun readableStreamToArrayBuffer owner triage
 
