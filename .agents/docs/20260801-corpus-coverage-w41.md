@@ -203,6 +203,26 @@ the observed Linux limits; the coordinator owns the only root build.
 | W253 | Node events/listener plain-script leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain EventEmitter eventNames/listenerCount semantics and EventSource-disabled global guard; no source owner |
 | W254 | Bun test-runner hook/scope leaves | 3 | 2/3 green; 15 passed / 11 failed / 26 ran / 21 expects; 0 timeout; no build | retain nested-describes 3/3 and onTestFinished 12/12; park failure-skip nested child-runner empty-output owner |
 | W255 | Bun retry/jest-each/fake-timers leaves | 3 | 2/3 green; 40 passed / 4 failed / 44 ran / 61 expects; 0 timeout; no build | retain jest-each 25/25 and retry/repeats 12/12; park fake-timers Intl clock-format and child-eval `jest.useFakeTimers` owners |
+| W256 | Node fs/http/url plain-script leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain TypedArray `fs.promises.writeFile`, HTTP header name/value validation, and invalid `file:` URL path guards; no source owner |
+
+## W256 Node fs/http/url plain-script leaf probe
+
+The bounded three-job Node selector covered
+`test-fs-promises-writefile-typedarray.js`, `test-http-header-validators.js`,
+and `test-url-invalid-file-url-path-input.js`. It measured **3/3 file-level
+passes**, **0 failures**, and **0 runner timeouts**. Per-file durations were
+199–250ms.
+
+The probe retained TypedArray write support through `fs.promises.writeFile`,
+HTTP header-name/value validation including invalid-character cases, and
+invalid `file:` URL path rejection. The Node corpus runner reports only
+file-level status for these plain scripts, so no synthetic subtest count was
+added.
+
+No source or upstream fixture change was made. The selector reused the
+coordinator binary through `tools/integration/node_corpus_runner.py` with
+three bounded jobs and a 30-second per-file timeout. No full corpus, build,
+or workspace-wide test was run.
 
 ## W255 Bun retry/jest-each/fake-timers leaf probe
 
