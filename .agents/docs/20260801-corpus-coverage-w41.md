@@ -98,6 +98,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W148 | Node path namespace/glob leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain glob and posix/win32 identity guards; no source owner |
 | W149 | Bun Fetch/Web basic leaves | 4 | 4/4 green; 27 passed / 0 failed / 27 ran / 40 expects; 0 timeout; no build | retain all four Fetch/Web leaves; no source owner |
 | W150 | Bun Blob focused leaves | 4 | 4/4 green; 27 passed / 0 failed / 27 ran / 62 expects; 0 timeout; no build | retain all four Blob leaves; no source owner |
+| W151 | Node URL format/property leaves | 5 | 3/5 pass; 2 fail; 0 timeout; no build | retain fileURL/path and format leaves; park URL invalid-this and descriptor-enumerability owners |
 
 ## W133 Bun.Terminal green cluster
 
@@ -381,6 +382,27 @@ corrected selector used the existing coordinator binary through
 per-file timeout, and missing Node modules allowed.
 
 No source or upstream fixture change was made. No full corpus or
+workspace-wide test was run; the selector and raw runner output were removed
+after recording the result.
+
+## W151 Node URL owner split
+
+The bounded three-job selector covered fileURL-to-path conversion, invalid URL
+format input, WHATWG formatting, invalid receivers, and URL property
+descriptors. It reached **3/5 files passed**, with **2 failures and 0
+timeouts**; per-file durations were 167–253ms. The green leaves were
+`test-url-fileurltopath.js`, `test-url-format-invalid-input.js`, and
+`test-url-format-whatwg.js`.
+
+The two failures are independent. `test-whatwg-url-invalidthis.js` found that
+URL prototype methods invoked with an invalid receiver did not throw the
+required TypeError. `test-whatwg-url-properties.js` found a URL method
+descriptor with `enumerable: false` where Node expects `true`. Both are parked
+without speculative source changes or issues.
+
+No source or upstream fixture change was made. The selector used the existing
+coordinator binary through `tools/integration/node_corpus_runner.py` with
+three bounded jobs and a 30-second per-file timeout. No full corpus or
 workspace-wide test was run; the selector and raw runner output were removed
 after recording the result.
 
