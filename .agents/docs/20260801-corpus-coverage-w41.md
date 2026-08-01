@@ -182,6 +182,8 @@ the observed Linux limits; the coordinator owns the only root build.
 | W232 | Node string/events/URL leaves | 3 | 1/3 pass; 2 fail; 0 timeout; no build | retain URL query parsing; park events.once invalid-option error code and StringDecoder forged-receiver ERR_INVALID_THIS owners |
 | W233 | Node path/querystring/URL leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain path parse/format, querystring, and legacy URL parse/format leaves; no source owner |
 | W234 | Bun Node util leaves | 3 | 2/3 green; 297 passed / 2 failed / 300 ran / 559 expects; 0 timeout; no build | retain promisify/callbackify; park util.styleText ANSI colorization under runner color policy |
+| W235 | Node timers leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain zero-timeout arguments, clearImmediate cancellation, and timer callback receiver/argument guards; no source owner |
+| W236 | Bun timers leaves | 3 | 1 counted file; 18 passed / 2 failed / 20 ran / 31 expects; 0 runner timeout; 2 no-tests excluded; no build | park UTF-16 timer-id classification and immediate-exception fixture subprocess owners |
 
 ## W133 Bun.Terminal green cluster
 
@@ -288,6 +290,31 @@ upstream files are plain scripts, so file-level clean exit is authoritative.
 No source or fixture change was made, and no full corpus or workspace-wide test
 was run; the selector and raw runner output were removed after recording the
 result.
+
+## W236 Bun timers partial cluster
+
+The initial bounded three-job Bun selector included one Bun timers suite and
+two Node-style plain scripts. The latter were correctly classified as
+`no-tests` and excluded. The authoritative counted result was **1/1 file, 18
+passed / 2 failed / 20 ran / 31 expects**, with **0 runner timeouts**; the
+counted file completed in 784ms.
+
+The failures were a UTF-16 timer-id string-classification mismatch and an
+immediate-exception fixture subprocess contract mismatch. No source or
+upstream fixture change was made, and no full corpus or workspace-wide test was
+run; selector and raw runner output were removed after recording the result.
+
+## W235 Node timers green cluster
+
+The bounded three-job Node selector covered zero-timeout and interval argument
+delivery/cancellation, repeated `clearImmediate`, and timeout/immediate/
+interval callback receiver semantics. All **3/3 files passed**, with **0
+failures and 0 timeouts**; per-file durations were 198–199ms.
+
+These plain upstream scripts were classified at file-level clean exit. No
+source or upstream fixture change was made, and no full corpus or workspace-wide
+test was run; the selector and raw runner output were removed after recording
+the result.
 
 ## W234 Bun Node util partial cluster
 
