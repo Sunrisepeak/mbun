@@ -66,6 +66,29 @@ the observed Linux limits; the coordinator owns the only root build.
 | W116 | Node streams state/encoding leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five green leaves; no source owner |
 | W117 | Bun util UUID/cookie/width/error leaves | 5 | 2/5 green; 288 passed / 54 failed / 360 ran / 1297 expects; no build | retain cookie + UUIDv5; park UUIDv7 validation/monotonicity, stringWidth ANSI/unicode, inspect-error source diagnostics as separate owners |
 | W118 | Bun util encoding/file/error/path leaves | 5 | 5/5 green; 15 passed / 0 failed / 16 ran / 559 expects; no build | retain all five green leaves; no source owner |
+| W119 | Node assert/buffer/diagnostics/encoding/http leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build | issue #61; retain four green leaves, park missing `assert.Assert` export/constructor as one owner |
+
+## W119 Node assert owner triage
+
+The bounded three-job selector covered Node `assert`, Buffer negative-allocation
+validation, diagnostics-channel tracing, TextDecoder `ignoreBOM`, and HTTP
+header validators. The result was **4/5 files pass**, **1 fail**, and **0
+timeouts**, with per-file durations of 165–251ms. The four passing leaves are
+retained.
+
+The only failure was `test-assert-class.js`: all 12 subtests fail from the same
+missing surface. A minimal bounded probe reports
+`typeof require("assert").Assert === "undefined"`; calling `assert.Assert()`
+produces a `TypeError` without a code, while Node exposes the constructor and
+reports `ERR_CONSTRUCT_CALL_REQUIRED` when called without `new`. Issue
+[#61](https://github.com/Sunrisepeak/mbun/issues/61) records the sanitized
+reproduction and suspected Node assert export/implementation owner.
+
+No source or upstream fixture change was made. The selector used the existing
+coordinator binary through `tools/integration/node_corpus_runner.py` with three
+bounded jobs and a 30-second per-file timeout. No full corpus or workspace-wide
+test was run; the selector and raw runner output were removed after recording
+the result.
 
 ## W117 Bun util owner triage
 
