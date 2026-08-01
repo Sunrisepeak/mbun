@@ -206,6 +206,28 @@ the observed Linux limits; the coordinator owns the only root build.
 | W256 | Node fs/http/url plain-script leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain TypedArray `fs.promises.writeFile`, HTTP header name/value validation, and invalid `file:` URL path guards; no source owner |
 | W257 | Bun mock.module/re-export leaves | 3 | 2/3 green; 6 passed / 6 failed / 13 ran / 32 expects; 0 timeout; no build | retain re-export mocks 2/2 and non-existent-specifier 1/1; split mock-module async, restore identity, relative-file, and cache/update owners |
 | W258 | Node child-process stdio/destroy leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain stdio inherit/flush and child destroy state guards; no source owner |
+| W259 | Node child-process IPC/exec leaves | 3 | 2/3 pass; 1 fail; 0 timeout; no build | retain disconnect async/self-termination and exec encoding; park IPC server-handle transfer owner |
+
+## W259 Node child-process IPC/exec plain-script leaf probe
+
+The bounded three-job Node selector covered
+`test-child-process-disconnect.js`, `test-child-process-send-returns-boolean.js`,
+and `test-child-process-exec-encoding.js`. It measured **2/3 file-level
+passes**, **1 failure**, and **0 runner timeouts**. Per-file durations were
+201–602ms.
+
+`test-child-process-disconnect.js` and `test-child-process-exec-encoding.js`
+both clean-exited, retaining deferred disconnect/self-termination behavior
+and string/Buffer encoding behavior for `exec()` output.
+
+`test-child-process-send-returns-boolean.js` failed when the first IPC send
+with a server handle threw an unsupported-handle `TypeError` instead of
+entering the expected boolean/backlog sequence. This is tracked as one IPC
+server-handle transfer owner; no mixed fix was attempted.
+
+The Node corpus runner reports only file-level status for these plain scripts,
+so no synthetic subtest count was added. No source or upstream fixture change
+was made. No full corpus, build, or workspace-wide test was run.
 
 ## W258 Node child-process stdio/destroy plain-script leaf probe
 

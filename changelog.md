@@ -5,6 +5,7 @@
 
 ## 2026-08-01
 
+- W259 fresh Node child-process IPC/exec plain-script leaf probe（3 jobs、复用现有 coordinator binary、无构建）**2/3 files pass、1 fail、0 timeout**：disconnect async/self-termination 与 exec encoding 全部 clean-exit；send-return-boolean 因 IPC server-handle transfer unsupported TypeError 收敛为单一 owner。Node runner 按 file-level 计数，单文件耗时 201–602ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W258 fresh Node child-process stdio/destroy plain-script leaf probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：child stdio inherit/flush 与 destroy/kill state transitions 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 199–352ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W257 fresh Bun mock.module/re-export leaf probe（3 jobs、复用现有 coordinator binary、无构建）**2/3 files green、6 passed、6 failed、13 ran、32 expects、0 runner timeout**：re-export mocks **2/2**、non-existent-specifier **1/1**；mock-module 外层 **3/10** executable pass、6 fail、1 todo，拆为 async mock、restore identity、relative-file mock、cache/update 四个 owner。单文件耗时 184–187ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W256 fresh Node fs/http/url plain-script leaf probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：TypedArray `fs.promises.writeFile`、HTTP header name/value validation 与 invalid `file:` URL path rejection 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 199–250ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
