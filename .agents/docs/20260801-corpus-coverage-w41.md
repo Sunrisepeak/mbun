@@ -191,6 +191,27 @@ the observed Linux limits; the coordinator owns the only root build.
 | W241 | Bun Node HTTP leaf probe | 3 | 2/3 green; 7 passed / 1 failed / 8 ran / 13 expects; 0 timeout; no build | retain maxHeaderSize and HTTP primordials; park proxy-agent CR/LF host validation owner |
 | W242 | Bun spawn/mock leaves | 3 | 3/3 green; 11 passed / 0 failed / 11 ran / 45 expects; 0 timeout; no build | retain spoofed spawn-array length, disposable mock restore, and mock.module validation/resolver short-circuit guards; no source owner |
 | W243 | Bun Web Fetch/Response leaves | 3 | 3/3 green; 86 passed / 0 failed / 86 ran / 192 expects; 0 timeout; no build | retain Response constructor/redirect/clone, body-used errors, and fetch option-conversion/no-send guards; no source owner |
+| W244 | Bun test matcher leaves | 3 | 3/3 green; 45 passed / 0 failed / 45 ran / 92 expects; 0 timeout; no build | retain expect labels, expect.assertions failure accounting, and toHaveReturnedWith/toHaveLastReturnedWith guards; no source owner |
+
+## W244 Bun test matcher leaf probe
+
+The bounded three-job Bun selector covered `expect-label.test.ts`,
+`expect-assertions.test.ts`, and `expect/toHaveReturnedWith.test.ts`. All
+**3/3 files were green**, with **45 passed / 0 failed / 45 ran / 92 expects /
+0 runner timeouts**. Per-file durations were 199–350ms.
+
+`expect-label.test.ts` passed all 3 tests for labeled `toBe`/`toEqual`
+diagnostics and non-string labels. `expect-assertions.test.ts` passed its
+outer 1-test guard; its child runner intentionally produced **0 pass / 5
+fail** for the under-asserted sync, async, callback, `setImmediate`, and
+`queueMicrotask` cases, confirming the expected failure accounting. The
+41-test return matcher file passed all `toHaveReturnedWith` and
+`toHaveLastReturnedWith` success, failure, edge, and comparison cases.
+
+No source or upstream fixture change was made. The selector reused the
+coordinator binary through `tools/integration/bun_corpus_runner.py` with
+three bounded jobs, a 30-second per-file timeout, and missing Node modules
+allowed. No full corpus, build, or workspace-wide test was run.
 
 ## W243 Bun Web Fetch/Response leaf probe
 

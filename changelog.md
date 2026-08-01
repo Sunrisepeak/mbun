@@ -5,6 +5,7 @@
 
 ## 2026-08-01
 
+- W244 fresh Bun test matcher leaf probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files green、45 passed、0 failed、45 ran、92 expects、0 runner timeout**：expect label 3/3、expect.assertions 外层守卫 1/1（子 runner 按设计 0 pass/5 fail 验证欠断言失败计数）、toHaveReturnedWith/toHaveLastReturnedWith 41/41 全部通过，单文件耗时 199–350ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W243 fresh Bun Web Fetch/Response leaf probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files green、86 passed、0 failed、86 ran、192 expects、0 runner timeout**：Response constructor/redirect/clone 23/23、body-used TypeError 2/2、fetch option conversion/no-send 61/61 全部通过，单文件耗时 182–283ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W242 fresh Bun spawn/mock leaf probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files green、11 passed、0 failed、11 ran、45 expects、0 runner timeout**：spawn 伪造 u32 上限数组长度 3/3、mock disposable/restore 3/3、mock.module 参数校验与 resolver short-circuit 5/5 全部通过，单文件耗时 199–350ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W241 fresh Bun Node HTTP leaf probe（3 jobs、复用现有 coordinator binary、无构建）**2/3 files green、7 passed、1 failed、8 ran、13 expects、0 runner timeout**：`node-http-maxHeaderSize` 4/4、HTTP primordials 1/1；`node-http-proxy-url` 2/3，唯一失败为 proxy agent 对 CR/LF host 未返回预期 `ERR_INVALID_CHAR`，收敛为 host-validation owner。单文件耗时 251–652ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
