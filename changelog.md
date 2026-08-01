@@ -5,6 +5,7 @@
 
 ## 2026-08-01
 
+- W156 fresh Node util low-coupling probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：util.deprecate、util.inherits、util.types、type-existence helpers、VT control-character stripping 全部通过；单文件耗时 165–350ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W155 fresh Node querystring/URL query probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：querystring encode/escape、非有限 `maxKeys`、多字符 separator、legacy URL query parsing 全部通过；单文件耗时 164–200ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W154 fresh Node URLSearchParams getter probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：get、getAll、has、keys、values 全部通过；单文件耗时 165–201ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W153 fresh Node URL utility probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：pathToFileURL、revokeObjectURL 参数校验、urlToHttpOptions 全部通过；单文件耗时 199–252ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
