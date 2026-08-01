@@ -572,6 +572,22 @@ surface on Linux:
   全量 corpus。当前资源约 **44 GiB available memory、43 MiB swap free、20 GiB
   free disk**，继续暂停 broad build，仅保留 bounded lane。
 
+### W55 fresh inventory refresh and Bun CSS triage
+
+- W55 首先复测了 inventory 指向的 Node fs owner：FileHandle
+  `pull/pullSync/writer/aggregate-errors/close-errors/op-errors` **6/6 pass**；随后
+  flush、AbortSignal 与 WHATWG URL 组合的 `append-file-flush`、`write-file-flush`、
+  `readfile`、`write-file`、`whatwg-url` **5/5 pass**。两组共 **11/11 pass**，说明旧
+  inventory 条目已 stale，本轮没有为它们创建 issue 或 source patch。
+- 为验证 Bun 侧最高价值的可单层入口，测量了 5 个真实引用 `cssInternals` 的文件，
+  使用默认 **4G/512、5 jobs**：**1/5 files green、6/15 tests passed、9 failed、
+  30 expects**。`custom-pseudo-ident-escape` **4/4** 已绿；其余失败分别落在
+  缺失 `cssInternals._test`、angle 非有限数值序列化、attribute-selector parser、
+  nested-selector expansion，不能由一个安全 wrapper 闭合。
+- 结论：不把旧 inventory 当作当前事实，不对 CSS `~12-file` cluster 做跨 owner
+  混修；下一轮必须从 fresh bounded measurement 选单一 owner。W55 无构建、无全量
+  corpus，资源策略继续保持 3–5 jobs，并在 swap/disk 低水位时只做小型 probe。
+
 ## Next route
 
 1. Keep the native-syntax compatibility gate limited to the two measured
@@ -590,9 +606,11 @@ surface on Linux:
 5. Keep the fixed W51 final-read ordering, W52 file-backed stdin, W53 stdout
    disturbed/reject, and W54 conversion-helper brand owners closed; reopen only
    with a new minimal reproduction.
-6. Select the next task only from a measured one-owner Bun/Node near-green row;
-   keep 3–5 bounded lanes, record per-file pass/fail/expect counts, and defer
-   full-corpus runs and broad builds while swap or disk headroom remains low.
+6. Treat old inventory entries as hypotheses only: refresh the named files before
+   dispatching a fix. Select the next task only from a fresh one-owner Bun/Node
+   near-green row; keep 3–5 bounded lanes, record per-file pass/fail/expect counts,
+   and defer full-corpus runs and broad builds while swap or disk headroom remains
+   low.
 
 No local absolute paths, user names, host names, credentials, private URLs, or
 machine-specific identifiers belong in future comments, commits, PR text, or

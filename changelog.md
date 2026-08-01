@@ -5,6 +5,12 @@
 
 ## 2026-08-01
 
+- W55 fresh-binary triage 更新路线：Node fs inventory 中 FileHandle 6 文件与
+  flush/AbortSignal/WHATWG URL 5 文件均已 **11/11 pass**，确认旧 inventory 不能直接
+  作为当前 owner 来源；Bun CSS `cssInternals` 5 文件 bounded probe 为 **1/5 files
+  green、6/15 tests passed、9 failed、30 expects**，失败分裂为 `_test` 缺失、angle
+  序列化、attribute-selector parser、nested expansion 四个 owner，按 TOO_BIG/多 owner
+  规则停车。未新增构建、未跑全量 corpus。
 - `#41` 修复 `ReadableStream.prototype` 的 `text/json/bytes/arrayBuffer/blob` 对非法
   receiver 不同步执行 brand check 的问题：现在同步抛出 `ERR_INVALID_THIS`，valid
   stream 的 Promise、locked、used 语义保持不变。`readablestream-helpers.test.ts`
