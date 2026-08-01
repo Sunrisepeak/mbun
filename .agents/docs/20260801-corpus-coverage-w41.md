@@ -153,6 +153,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W203 | Node pipe error/flow leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain error-handling/error-unhandled/flow-after-unpipe; treat flow/multiple-pipes as W182-adjacent reconfirmation until historical file mapping is rechecked |
 | W204 | Node pipeline/pipe cleanup leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain async-iterator/duplex/listeners/empty-string pipeline and pipe-cleanup leaves; no source owner |
 | W205 | Node stream state/lifecycle leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain asyncDispose, readableListening, setEncoding(null), unpipe-resume, and Writable ending-state leaves; no source owner |
+| W206 | Bun Web/Atomics/URLPattern leaves | 5 | 4/5 green; 447 passed / 12 failed / 459 ran / 6375 expects; 0 timeout; no build | retain explicit-resource-management, nationalized, SHA-3, and Atomics; park URLPattern parser/URL-base/Unicode owners |
 
 ## W133 Bun.Terminal green cluster
 
@@ -1196,6 +1197,27 @@ found. The selector used the existing coordinator binary through
 `tools/integration/node_corpus_runner.py` with three bounded jobs and a
 30-second per-file timeout. No full corpus or workspace-wide test was run; the
 selector and raw runner output were removed after recording the result.
+
+## W206 Bun Web/Atomics/URLPattern owner split
+
+The first W206 selector used paths relative to the Bun test working directory,
+which produced **5 harness load-errors / 0 tests ran**; that dispatch is
+excluded from coverage. The corrected selector used repository-root-relative
+paths and reached **4/5 files green**, with **447 passed / 12 failed / 459 ran /
+6375 expects / 0 timeouts**.
+
+The green files were explicit resource management (**4/4**), nationalized
+AbortController (**2/2**), WebCrypto SHA-3 (**17/17**), and Atomics
+(**28/28**). URLPattern reached **396 passed / 12 failed / 408 ran / 6227
+expects**. Its failures span non-ASCII protocol/path URL parsing, invalid
+pattern/port validation, base-URL wildcard serialization, and Unicode regexp
+set matching; they remain parked as separate URLPattern owners.
+
+No source or upstream fixture change was made. The corrected selector used the
+existing coordinator binary through `tools/integration/bun_corpus_runner.py`
+with three bounded jobs, a 30-second per-file timeout, and missing Node modules
+allowed. No full corpus or workspace-wide test was run; both selectors and raw
+runner output were removed after recording the result.
 
 ## W132 Node VM and WebStreams owner split
 
