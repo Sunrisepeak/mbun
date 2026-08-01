@@ -5,6 +5,7 @@
 
 ## 2026-08-01
 
+- W202 fresh Node pipeline/finished probe（3 jobs、复用现有 coordinator binary、无构建）**3/5 files pass、2 fail、0 timeout**：queued-end-destroy 与 uncaught pipeline 通过；pipeline-process 停车在 child command invocation，finished-async-local-storage 停车在 AsyncContextFrame/enabled-hooks owner。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W201 fresh Node pipe continuation probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：deadlock、manual-resume、needDrain、object-mode bridge、without-listenerCount 全部通过；单文件耗时 165–281ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W200 fresh Node pipe/backpressure probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：after-end、await-drain、manual-resume、push-while-write、cleanup-pause 全部通过；单文件耗时 166–185ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W199 fresh Node Duplex/destroy/finalization probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：Duplex destroy、readable end、base Duplex、stream destroy、finished default path 全部通过；单文件耗时 198–265ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。

@@ -149,6 +149,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W199 | Node Duplex/destroy/finalization leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five Duplex/destroy/finished leaves; no source owner |
 | W200 | Node pipe/backpressure leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five after-end/drain/cleanup leaves; no source owner |
 | W201 | Node pipe continuation leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five deadlock/resume/drain/object/listener leaves; no source owner |
+| W202 | Node pipeline/finished leaves | 5 | 3/5 pass; 2 fail; 0 timeout; no build | retain queued-end-destroy and uncaught; park child-command pipeline and AsyncContextFrame owners |
 
 ## W133 Bun.Terminal green cluster
 
@@ -1130,6 +1131,25 @@ coordinator binary through `tools/integration/node_corpus_runner.py` with
 three bounded jobs and a 30-second per-file timeout. No full corpus or
 workspace-wide test was run; the selector and raw runner output were removed
 after recording the result.
+
+## W202 Node pipeline/finished owner split
+
+The bounded three-job selector covered pipeline process execution, queued end
+while destroying, uncaught pipeline errors, finished async-local-storage
+behavior, and the finished `bindAsyncResource` path. It reached **3/5 files
+passed**, with **2 failures and 0 timeouts**.
+
+The queued-end-destroy and uncaught pipeline leaves passed. The
+`pipeline-process` failure is a child-command invocation/exit owner. The
+`finished-async-local-storage` failure occurs at the AsyncContextFrame or
+enabled-hooks prerequisite before the finished assertion, so it remains a
+separate async-context owner. No source or upstream fixture change was made
+and no mixed fix was attempted.
+
+The selector used the existing coordinator binary through
+`tools/integration/node_corpus_runner.py` with three bounded jobs and a
+30-second per-file timeout. No full corpus or workspace-wide test was run; the
+selector and raw runner output were removed after recording the result.
 
 ## W132 Node VM and WebStreams owner split
 
