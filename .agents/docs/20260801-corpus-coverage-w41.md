@@ -271,6 +271,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W321 | Node warning/identity contract leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five warning/identity guards; no source owner |
 | W322 | Node active-resource lifetime/signal/title leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build; 5 fresh | retain all five active-resource/signal/title guards; no source owner |
 | W323 | Bun FileSink/loader/path/ANSI leaves | 5 | 4/5 green; 60 passed / 20 failed / 81 ran / 1351 expects; 0 timeout; 2 fresh + 3 revalidations | retain fresh `bun-file-windows` and `text-loader`; revalidate W168/W172/W191 owners |
+| W324 | Node process metadata/warning/SourceMap leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build; 5 fresh | retain four warning/SourceMap/resource guards; park process.config metadata-shape owner |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -672,6 +673,26 @@ and whitespace/newline wrapping owners already parked by W168. No source or
 upstream-fixture changes, full corpus, or workspace-wide build were made.
 After the run, resources showed about **44 GiB available memory**, **1.7 MiB
 free swap**, and **17 GiB free disk at 99% usage**. Temporary runner output is
+cleaned immediately and the next wave remains resource-gated.
+
+## W324 Node process metadata/warning/SourceMap leaves
+
+The bounded five-job Node selector covered five fresh files after the filename
+and semantic-owner audit: `test-process-constrained-memory.js`,
+`test-process-setsourcemapsenabled.js`, `test-process-redirect-warnings.js`,
+`test-process-redirect-warnings-env.js`, and `test-process-versions.js`. It
+measured **4/5 file-level passes**, **1 failure**, **0 runner timeouts**, and
+**199–654 ms** per file. The Node runner reports file-level status only; no
+assertion-level pass total is inferred.
+
+The constrained-memory, SourceMap argument validation, and both warning
+redirection guards passed and are retained. `test-process-versions.js` failed
+before its version assertions because `process.config.variables` lacks the
+Node metadata field `node_builtin_shareable_builtins`; this is one process.config
+metadata-shape owner, not a version-vector assertion result. No source or
+upstream-fixture changes, full corpus, or workspace-wide build were made. After
+the run, resources showed about **44 GiB available memory**, **1.8 MiB free
+swap**, and **17 GiB free disk at 99% usage**. Temporary runner output is
 cleaned immediately and the next wave remains resource-gated.
 
 ## Coverage novelty audit correction after W323
