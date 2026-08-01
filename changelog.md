@@ -5,6 +5,7 @@
 
 ## 2026-08-01
 
+- W183 fresh Node Transform probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：callback-twice、final sync、object-mode falsey、HWM 0、destroy 全部通过；单文件耗时 166–201ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W182 fresh Node stream pipe probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：pipe cleanup、events/flow、多 destination、same destination twice 全部通过；单文件耗时 164–250ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W181 fresh Node Readable/Web BYOB probe（3 jobs、复用现有 coordinator binary、无构建）**4/4 files pass、0 fail、0 timeout**：Readable-to-Web BYOB、BYOB termination、Readable-to-Web module、server-response bridge 全部通过；单文件耗时 200ms–2.259s。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W180 fresh Node stream advanced probe（3 jobs、复用现有 coordinator binary、无构建）**4/5 files pass、1 fail、0 timeout**：compose、consumers、DuplexPair、promises 通过；finished 唯一失败为 callback count mismatch，停车为 finished-callback owner。单文件耗时 164–398ms，未修改 source/fixture，未跑全量 corpus/workspace-wide test。

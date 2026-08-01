@@ -130,6 +130,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W180 | Node stream advanced leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build | retain compose/consumers/duplexpair/promises; park finished callback owner |
 | W181 | Node Readable/Web BYOB leaves | 4 | 4/4 pass; 0 fail; 0 timeout; no build | retain all four BYOB/Web bridge leaves; no source owner |
 | W182 | Node stream pipe leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five pipe cleanup/event/flow leaves; no source owner |
+| W183 | Node Transform leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five Transform callback/final/object/HWM leaves; no source owner |
 
 ## W133 Bun.Terminal green cluster
 
@@ -822,6 +823,19 @@ after recording the result.
 The bounded three-job selector covered pipe cleanup, pipe events and flow,
 multiple destinations, and piping the same destination twice. All **5/5 files
 passed**, with **0 failures and 0 timeouts**. Per-file durations were 164–250ms.
+
+No source or upstream fixture change was made. The selector used the existing
+coordinator binary through `tools/integration/node_corpus_runner.py` with
+three bounded jobs and a 30-second per-file timeout. No full corpus or
+workspace-wide test was run; the selector and raw runner output were removed
+after recording the result.
+
+## W183 Node Transform green cluster
+
+The bounded three-job selector covered callback-twice handling, synchronous
+finalization, falsey object-mode values, zero HWM, and destroy behavior. All
+**5/5 files passed**, with **0 failures and 0 timeouts**. Per-file durations
+were 166–201ms.
 
 No source or upstream fixture change was made. The selector used the existing
 coordinator binary through `tools/integration/node_corpus_runner.py` with
