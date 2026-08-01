@@ -43,6 +43,39 @@ the observed Linux limits; the coordinator owns the only root build.
 | W93 | Node fs/promises FileHandle leaves | 5 | 5/5 files pass; no build | retain FileHandle coverage after W92 fix; no source owner |
 | W94 | Bun HTTP/2/Worker staged leaves | 5 | pre-fix 4/5 green; 7 passed / 1 failed / 8 ran / 6 expects | issue #53; isolate reserved-push DATA state |
 | W95 | Bun HTTP/2/Worker staged regression | 5 | post-fix 5/5 green; 8 passed / 0 failed / 8 ran / 8 expects | issue #53 landed; retain all five guards |
+| W96 | Node HTTP/2 RST lifecycle | 5 Node + 5 Bun guards | pre-fix Node 4/5 pass; post-fix Node 5/5 pass; Bun 5/5 green, 8 passed / 0 failed / 8 ran / 8 expects | issue #54; align readable end and non-zero peer-RST error delivery |
+
+## W96 delivered slice
+
+W96 started with a fresh five-file Node HTTP/2 probe. Four files passed; the
+only failure was `test-http2-client-rststream-before-connect.js`, where the
+client readable `end` event and server-side `ERR_HTTP2_STREAM_ERROR` were both
+missing from the RST lifecycle. A tiny standalone reproduction confirmed that
+the client `_destroy()` hook itself was called once, so the owner was narrowed
+to RST event ordering rather than stream destruction dispatch.
+
+Issue [#54](https://github.com/Sunrisepeak/mbun/issues/54) landed in commit
+`fa2373e`:
+
+- `modules/jsc/src/js_http2.cppm` now ends the readable side before delivering
+  the client reset error, with destruction deferred until the readable
+  next-tick completion.
+- `modules/jsc/src/js_http2_part2.cppm` routes non-zero server-side peer resets
+  through `_destroy`, preserving `ERR_HTTP2_STREAM_ERROR`; CANCEL remains a
+  non-error destroy.
+
+Evidence from the fresh coordinator build:
+
+- `bash tools/integration/build_or_die.sh` — pass.
+- W96 Node selector — **5/5 files pass** after the fix; the four pre-existing
+  green files stayed green.
+- Adjacent Bun HTTP/2/Worker selector — **5/5 files green**, **8 passed / 0
+  failed / 8 ran / 8 expects**.
+- The standalone lifecycle smoke observed client `end`, client/server stream
+  errors, close callback, and `_destroy()` exactly once. It is diagnostic only
+  and is not counted as corpus coverage.
+
+No upstream fixture changed and no full corpus/workspace-wide test was run.
 
 ## Delivered slice
 

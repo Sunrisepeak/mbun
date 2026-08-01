@@ -5,6 +5,12 @@
 
 ## 2026-08-01
 
+- W96 issue [#54](https://github.com/Sunrisepeak/mbun/issues/54) 修复 Node HTTP/2 RST lifecycle：fresh five-file
+  Node probe 从 **4/5 pass** 变为 **5/5 pass**。根因是 client reset path 在错误前没有结束 readable、server
+  收到非零 peer RST 只 finish 而没有进入 `ERR_HTTP2_STREAM_ERROR`；`fa2373e` 让 client `end` 在错误前完成，
+  并让 server non-zero reset 经过 `_destroy`，CANCEL 保持 non-error destroy。相邻 Bun HTTP/2/Worker 五文件
+  guard 保持 **5/5 green、8 passed、0 failed、8 ran、8 expects**；fresh build 通过。未修改上游 fixture，未跑
+  全量 corpus；原始本地路径和环境信息未进入文档、commit 或 PR。
 - W95 issue [#53](https://github.com/Sunrisepeak/mbun/issues/53) 修复 HTTP/2 reserved push stream 的 DATA
   状态：W94 的 **4/5 files green、7 passed、1 failed、8 ran、6 expects** 经 fresh serialized build 后变为
   **5/5 files green、8 passed、0 failed、8 ran、8 expects**。仅在 client DATA path 对 response HEADERS 前的
