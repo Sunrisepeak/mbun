@@ -267,6 +267,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W317 | Node console/stdio/finalization green cluster | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five console/stdio/finalization guards; no source owner |
 | W318 | Node process identity/active-handle and console color leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five process/console guards; no source owner |
 | W319 | Node active-resources/priority/console leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five resource/priority/console guards; no source owner |
+| W320 | Bun util object/encoding/timer/path leaves | 5 | 4/5 green; 20 passed / 1 failed / 21 ran / 236 expects; 0 timeout; no build | retain four green leaves; park missing `hasNonReifiedStatic` internal-helper owner |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -589,6 +590,22 @@ workspace-wide build. After the run, resources remained at about **44 GiB
 available memory**, about **1.5 MiB free swap**, and about **16 GiB free disk at
 99% usage**. Temporary runner output is cleaned immediately and the next wave
 remains resource-gated.
+
+## W320 Bun util object/encoding/timer/path leaves
+
+The bounded five-job Bun selector covered five previously unrecorded files:
+`BunObject.test.ts`, `escapeRegExp.test.ts`, `sleepSync.test.ts`,
+`toUTF16Alloc.test.ts`, and `which.test.ts`. It measured **4/5 green files**,
+**20 passed / 1 failed / 21 ran / 236 expects**, **0 runner timeouts**, and
+**200–306 ms** per file. The four green files are retained.
+
+`BunObject.test.ts` passed its `require("bun")` and dynamic-import checks but
+its `hasNonReifiedStatic` check could not run because the internal test helper
+was unavailable. This is parked as one internal-helper/API owner; no source or
+upstream-fixture changes were made. No full corpus or workspace-wide build was
+run. After the run, resources remained at about **44 GiB available memory**,
+**1.6 MiB free swap**, and **17 GiB free disk at 99% usage**. Temporary runner
+output is cleaned immediately and the next wave remains resource-gated.
 
 ## W304 Node events/path continuation leaf probe
 
