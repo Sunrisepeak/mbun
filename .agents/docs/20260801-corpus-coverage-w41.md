@@ -76,6 +76,25 @@ the observed Linux limits; the coordinator owns the only root build.
 | W126 | Bun util + Node HTTP mixed leaves | 5 | corrected split-run: 4/5 files green; Bun 350 passed / 53 failed / 403 ran / 54616 expects, Node 2/2 pass; no build | retain indexOfLine, Bun.main, and two Node HTTP leaves; park CryptoHasher HMAC/unsupported-algorithm owners separately |
 | W127 | Bun console + Node HTTP/net leaves | 5 | 4/5 valid files green; Bun 31 passed / 2 failed / 34 ran / 84 expects, Node 3/3 pass; no build | issue #63; retain console.write and all Node leaves, park console.table alignment policy |
 | W128 | Node worker/message-port leaves | 5 | initial 4/5 pass + 1 timeout at 30s; isolated 1 job / 60s confirmation 5/5 pass, slow leaf 57.762s; no build | retain all five, mark MessagePort race as slow stress leaf and exclude it from the default 30s fast lane |
+| W129 | Bun console iterator + Node net/domain leaves | 3 | 2/3 valid files green; Bun 0 passed / 17 failed / 17 ran, Node 2/2 pass; no build | issue #64; retain both Node leaves, park missing Bun console async iterator/input contract |
+
+## W129 console iterator owner triage
+
+The corpus-specific selectors covered one Bun console iterator file and two
+Node lifecycle leaves. The valid result was **2/3 files green**: the Node
+closed-socket and domain uncaught-exception files both passed in 248–250ms.
+The Bun file reached **0 passed / 17 failed / 17 ran**, with no timeout.
+
+All Bun failures share one owner. Its child fixture uses
+`for await (const line of console)`, but mbun reports an undefined-function
+TypeError at that input loop and returns empty output for static, streaming,
+and repeated-iterator cases. Issue
+[#64](https://github.com/Sunrisepeak/mbun/issues/64) records the sanitized
+console async-iterator/input reproduction.
+
+No source or upstream fixture change was made. No full corpus or workspace-wide
+test was run; selectors and raw runner output were removed after recording the
+result.
 
 ## W128 Node worker stress confirmation
 
