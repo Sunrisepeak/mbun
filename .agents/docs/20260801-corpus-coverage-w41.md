@@ -294,6 +294,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W344 | Bun Linux loader/build/network/REPL leaves | 5 | 5/5 green; 8 passed / 0 failed / 8 ran / 21 expects; 0 timeout; no build; 5 fresh | retain DCE syntax, tsconfig paths, deferred node import, CONNECT pipelining, and REPL startup guards; no source owner |
 | W345 | Node readline continuation leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build; 5 fresh; TERM=xterm rerun | retain no-trailing-newline, recursive-write, raw-mode, and cursor-position guards; park Unicode line-separator owner |
 | W346 | Node readline Unicode line-separator source fix | 5 | pre 4/5 pass + 1 fail; post target 1/1 pass and bounded regression 5/5 pass; 0 timeout; one release rebuild | add U+2028/U+2029 to `lineEnding`; retain all five readline guards; no upstream-fixture change |
+| W347 | Node/Bun dgram port-message source fix | 5 Node + 1 Bun | pre Node 4/5 pass + 1 fail; post Node 5/5 pass; Bun 3/3 passed / 0 failed / 3 ran / 4 expects; 0 timeout; one release rebuild | change only `allowZero=false` wording from `>= 1` to `> 0`; retain dgram guards; no upstream-fixture change |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -1172,6 +1173,25 @@ targeted selector used `TERM=xterm`, a 30-second per-file bound, and jobs=5;
 no full corpus or workspace-wide test was run. This is the first W41
 source-fix checkpoint; later PR updates should summarize substantive
 checkpoints rather than each measurement wave.
+
+## W347 Node/Bun dgram port-message source fix
+
+The W340 connected-dgram failure was reproduced first with the current
+coordinator binary: the bounded five-job Node selector measured **4/5
+file-level passes**, **1 failure**, and **0 runner timeouts**. The only failure
+was `test-dgram-connect.js` comparing `Port should be >= 1 and < 65536` with
+Node's `Port should be > 0 and < 65536` contract. The owner was localized to
+`modules/jsc/src/js_dgram.cppm` `validatePort`; the fix changes only the
+`allowZero=false` lower-bound wording and leaves the accepted range unchanged.
+
+After one release rebuild, the same Node selector measured **5/5 passes** and
+**0 runner timeouts**. A correct Bun-native `node:dgram` entry
+(`compat/bun/test/js/node/dgram/node-dgram.test.js`) measured **3 passed / 0
+failed / 3 ran / 4 expects**. An exploratory mixed Bun selector was not used
+as evidence: three Node-style files were correctly classified as `no-tests`,
+and a separate port-occupation/membership fixture had two unrelated failures;
+the selector was replaced with the Bun-native guard. No `compat/` test or
+assertion was changed, and no full corpus or workspace-wide test was run.
 
 ## Coverage novelty audit correction after W323
 

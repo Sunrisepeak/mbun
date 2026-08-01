@@ -11,6 +11,11 @@
   两个 Unicode 行终止符纳入同一分隔逻辑；重建后目标文件 **1/1 pass**，同面邻接
   回归（no-trailing-newline、recursive-writes、set-raw-mode、position，加目标文件）
   **5/5 pass、0 timeout**。未修改 `compat/` 上游测试，未跑全量 corpus。
+- W347 Node dgram port-message source fix：W340 基线为 **4/5 pass、1 fail、0
+  timeout**，失败是 `ERR_SOCKET_BAD_PORT` 的 `>= 1` 文案与 Node 要求的 `> 0`
+  不一致。`modules/jsc/src/js_dgram.cppm` 仅修正 `allowZero=false` 分支；重建后
+  Node dgram selector **5/5 pass、0 timeout**，Bun 原生 `node:dgram` guard **3/3
+  passed、0 failed、4 expects**。未修改 `compat/` 上游测试，未跑全量 corpus。
 
 ## 2026-08-01
 
