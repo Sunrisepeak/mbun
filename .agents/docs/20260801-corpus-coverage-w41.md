@@ -147,6 +147,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W197 | Node Readable boundary leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five unshift/read/object/destroy leaves; no source owner |
 | W198 | Node Duplex leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five Duplex from/props/readable-writable/end leaves; no source owner |
 | W199 | Node Duplex/destroy/finalization leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five Duplex/destroy/finished leaves; no source owner |
+| W200 | Node pipe/backpressure leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five after-end/drain/cleanup leaves; no source owner |
 
 ## W133 Bun.Terminal green cluster
 
@@ -1096,6 +1097,19 @@ The bounded three-job selector covered Duplex destroy, Duplex readable end,
 base Duplex behavior, stream destroy, and the finished default path. All **5/5
 files passed**, with **0 failures and 0 timeouts**. Per-file durations were
 198–265ms.
+
+No source or upstream fixture change was made. The selector used the existing
+coordinator binary through `tools/integration/node_corpus_runner.py` with
+three bounded jobs and a 30-second per-file timeout. No full corpus or
+workspace-wide test was run; the selector and raw runner output were removed
+after recording the result.
+
+## W200 Node pipe/backpressure green cluster
+
+The bounded three-job selector covered piping after end, await-drain,
+manual-resume drain handling, pushing while writing, and cleanup pause
+behavior. All **5/5 files passed**, with **0 failures and 0 timeouts**.
+Per-file durations were 166–185ms.
 
 No source or upstream fixture change was made. The selector used the existing
 coordinator binary through `tools/integration/node_corpus_runner.py` with
