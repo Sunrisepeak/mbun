@@ -77,6 +77,22 @@ the observed Linux limits; the coordinator owns the only root build.
 | W127 | Bun console + Node HTTP/net leaves | 5 | 4/5 valid files green; Bun 31 passed / 2 failed / 34 ran / 84 expects, Node 3/3 pass; no build | issue #63; retain console.write and all Node leaves, park console.table alignment policy |
 | W128 | Node worker/message-port leaves | 5 | initial 4/5 pass + 1 timeout at 30s; isolated 1 job / 60s confirmation 5/5 pass, slow leaf 57.762s; no build | retain all five, mark MessagePort race as slow stress leaf and exclude it from the default 30s fast lane |
 | W129 | Bun console iterator + Node net/domain leaves | 3 | 2/3 valid files green; Bun 0 passed / 17 failed / 17 ran, Node 2/2 pass; no build | issue #64; retain both Node leaves, park missing Bun console async iterator/input contract |
+| W130 | Node REPL focused leaves | 3 | 1/3 pass; 1 fail; 1 timeout at 30s; no build; direct probe reproduced shared RegExp owner | issue #65; retain multiline navigation, park REPL/autolibs behind RegExp.$N static getter binding |
+
+## W130 Node REPL owner triage
+
+The bounded three-job selector covered the main REPL, autoloaded libraries, and
+multiline navigation. `test-repl-multiline-navigation.js` passed in 281ms;
+`test-repl-autolibs.js` failed in 182ms; and `test-repl.js` timed out at the
+30-second bound after its first `message` evaluation.
+
+Both non-green paths first report
+`RegExp.$N getters require RegExp constructor as |this|`. A direct bounded
+probe reading `RegExp.$1` reproduces the same TypeError without REPL, so this
+is parked as one RegExp static getter receiver owner rather than two REPL
+owners. Issue [#65](https://github.com/Sunrisepeak/mbun/issues/65) records the
+sanitized reproduction. No source or upstream fixture change was made, and no
+full corpus or workspace-wide test was run.
 
 ## W129 console iterator owner triage
 
