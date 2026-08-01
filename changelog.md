@@ -99,6 +99,15 @@
   `dnsPromises` 对象，`test-dns-promises-exists.js` 从 fail 变为 pass。串行构建后 selector
   **4/5 pass、0 fail、1 timeout**；`test-dns-resolveany.js` 在并行 30s 与单文件 60s
   复测均 timeout，保留为独立 packet/liveness owner。未修改 `compat/`、未跑全量 corpus。
+- W363 Node HTTP low-coupling green slice：五文件 Linux selector **5/5 pass、0 fail、0
+  timeout**，覆盖 invalid transfer-encoding、empty write、local address、immediate
+  client error 与 response close；无 source/fixture 改动，未跑全量 HTTP corpus。
+- W364 Node DNS timeout/backoff source fix：五文件基线 **2/5 pass、1 fail、2 timeout**；
+  `modules/jsc/src/js_dns.cppm` 接入共享 Node error formatter，`modules/jsc/src/runtime/dns.inc`
+  与 `modules/dns/src/client.cppm` 传递并实现 `maxTimeout` 的 exponential retry/backoff
+  cap。最终 selector **3/5 pass、0 fail、2 timeout**，目标文件打印
+  `timeout1=3504ms, timeout2=1502ms`；两个 channel-cancel timeout 保留为独立 liveness
+  owner。`test-dns-promises-exists.js` focused regression pass，未跑全量 corpus。
 
 ## 2026-08-01
 

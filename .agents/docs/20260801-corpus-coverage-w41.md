@@ -1498,6 +1498,33 @@ from fail to pass, and the three adjacent promise/server leaves stayed green.
 No upstream fixture changed. Verification remained bounded to the selector and
 single timeout confirmation; no full corpus/workspace-wide test ran.
 
+## W363 Node HTTP low-coupling green slice
+
+The fresh five-job selector covered invalid transfer-encoding framing, empty
+string writes, local-address reporting, immediate client errors, and response
+close behavior. All **5/5 files passed**, with **0 failures** and **0 runner
+timeouts**. No source or upstream fixture change was needed; this is retained
+as a Linux HTTP guard without rerunning the full HTTP corpus.
+
+## W364 Node DNS timeout/backoff source fix
+
+The fresh five-job selector initially measured **2/5 passes, 1 failure, and 2
+timeouts**. The stable failure was `Resolver({ maxTimeout })` validation: the
+DNS-local error objects had the correct code property but did not include the
+code in `String(error)`, so Node's regex assertion could not see
+`ERR_OUT_OF_RANGE`/`ERR_INVALID_ARG_TYPE`. The two timeout files are separate
+channel-cancel liveness owners.
+
+The source fix uses the shared Node error formatter in
+`modules/jsc/src/js_dns.cppm`. It also threads `maxTimeout` into
+`modules/jsc/src/runtime/dns.inc` and `modules/dns/src/client.cppm`, applying
+exponential retry backoff while capping each retry when a maximum is supplied.
+After three serialized builds, the final selector measured **3/5 passes, 0
+failures, and 2 timeouts**. `test-dns-resolver-max-timeout.js` now passes and
+reports **timeout1=3504ms, timeout2=1502ms**; `test-dns-promises-exists.js`
+also passed as a focused regression. The two channel-cancel timeouts remain
+parked. No upstream fixture or full corpus changed.
+
 ## Coverage novelty audit correction after W323
 
 A post-wave audit found that older ledger sections record many files by

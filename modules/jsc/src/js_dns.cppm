@@ -101,9 +101,12 @@ export constexpr std::string_view kDnsJS = R"JS(
     const e = new TypeError('The "' + name + '" ' + kind + " " + determinerText +
       ". Received " + specificType(actual));
     e.code = "ERR_INVALID_ARG_TYPE";
-    return e;
+    const NE = G.__mbunNodeErrors;
+    return NE ? NE.withCodeToString(e, "ERR_INVALID_ARG_TYPE") : e;
   };
   const outOfRange = (name, range, actual) => {
+    const NE = G.__mbunNodeErrors;
+    if (NE) return NE.ERR_OUT_OF_RANGE(name, range, actual);
     const e = new RangeError('The value of "' + name + '" is out of range. It must be ' +
       range + ". Received " + specificType(actual));
     e.code = "ERR_OUT_OF_RANGE";
@@ -298,7 +301,7 @@ export constexpr std::string_view kDnsJS = R"JS(
   // strings) plus its timeout/tries are threaded to the native record transport;
   // absent/empty means /etc/resolv.conf + the transport defaults, which is what
   // the module-level dns.resolve* uses. ref: runtime/dns.inc dnsn_resolve_cb.
-  const rawResolve = (host, type, callback, servers, timeout, tries, channel) => {
+  const rawResolve = (host, type, callback, servers, timeout, tries, maxTimeout, channel) => {
     const CW = cares();
     const query = "query" + type[0] + type.slice(1).toLowerCase();
     const handle = channel || (typeof CW.ChannelWrap === "function"
@@ -320,7 +323,8 @@ export constexpr std::string_view kDnsJS = R"JS(
     if (DN && DN.resolve) DN.resolve(String(host), TYPE_CODES[type] | 0, callback,
                                      servers && servers.length ? servers : undefined,
                                      typeof timeout === "number" ? timeout : undefined,
-                                     typeof tries === "number" ? tries : undefined);
+                                     typeof tries === "number" ? tries : undefined,
+                                     typeof maxTimeout === "number" ? maxTimeout : undefined);
     else soon(() => callback({ error: "ENOTIMP" }));
   };
 
@@ -559,7 +563,7 @@ export constexpr std::string_view kDnsJS = R"JS(
     rawResolve(host, type, (r) => {
       if (r && r.error) reject(nodeError(r.error, rr, host));
       else resolve(r);
-    }, servers, res && res._timeout, res && res._tries, res && res._handle);
+    }, servers, res && res._timeout, res && res._tries, res && res._maxTimeout, res && res._handle);
   });
 
   const promiseReverse = (ip) => new Promise((resolve, reject) => {
