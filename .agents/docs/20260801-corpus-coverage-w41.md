@@ -46,6 +46,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W96 | Node HTTP/2 RST lifecycle | 5 Node + 5 Bun guards | pre-fix Node 4/5 pass; post-fix Node 5/5 pass; Bun 5/5 green, 8 passed / 0 failed / 8 ran / 8 expects | issue #54; align readable end and non-zero peer-RST error delivery |
 | W97 | Node HTTP/2 connect-abort teardown | 5 Node + 5 Node/Bun regression guards | pre-fix Node 4/5 pass; post-fix 5/5 pass; W96 Node 5/5 pass; W95 Bun 5/5 green, 8 passed / 0 failed / 8 ran / 8 expects | issue #55; preserve session AbortError while canceling streams with `ERR_HTTP2_STREAM_CANCEL` |
 | W98 | Bun standard-module/API leaf probe | 5 | 4/5 files green; 161 passed / 1 ahead-of-reference / 165 ran / 100536 expects | retain four green leaves; classify `require`'s passing `test.failing` case as ahead-of-reference, no source owner |
+| W99 | Bun fs/streams/spawn/DNS/URL leaves | 5 + DNS isolated rerun | initial 4/5 green; 108 passed / 1 failed / 109 ran / 355 expects; DNS isolated 1/1 green with 69/69 | retain four stable leaves; DNS public-answer variance is external, no source owner |
 
 ## W96 delivered slice
 
@@ -125,6 +126,26 @@ passed / 1 ahead-of-reference / 3 todo / 13 ran**: its only failure is a Bun
 than the reference rather than treated as an implementation regression.
 
 No source owner was opened from W98, no upstream fixture changed, and no full
+corpus/workspace-wide test was run.
+
+## W99 Bun cross-subsystem leaf coverage
+
+W99 used five bounded jobs and the same binary without a build. The initial
+five-file result was **4/5 files green**, **108 passed**, **1 failed**, **109
+ran**, and **355 expects**. The stable green leaves were:
+
+- `spawn/null-byte-injection.test.ts`: **20/20**;
+- `fs/fs-leak.test.js`: **4/4**;
+- `streams/pipeTo-signal-leak.test.ts`: **2/2**;
+- `web/url/url.test.ts`: **14/14**.
+
+`node-dns.test.js` reached **68/69** in the 5-job probe. Its only failure was
+the expected IPv6 address for a public DNS name differing from the answer
+returned by the resolver. An isolated 1-job rerun reached **69/69**; a second
+five-job rerun reproduced the external answer variance. This is not a stable
+runtime owner, so DNS stays parked without a source change.
+
+No upstream fixture changed, no issue was opened, and no full
 corpus/workspace-wide test was run.
 
 ## Delivered slice

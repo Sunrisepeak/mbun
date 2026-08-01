@@ -5,6 +5,11 @@
 
 ## 2026-08-01
 
+- W99 fresh Bun fs/streams/spawn/DNS/URL leaf probe（5 jobs、无构建）初测 **4/5 files green、108 passed、1 failed、
+  109 ran、355 expects**：spawn null-byte **20/20**、fs leak **4/4**、pipeTo signal leak **2/2**、URL **14/14**。
+  DNS 为 **68/69**，唯一失败是公共域名返回的 IPv6 地址与 fixture 固定值不同；同文件 1-job isolated rerun
+  为 **69/69**，第二次 5-job 复跑再次出现 answer variance，判定为外部 DNS 波动，不改 runtime。未修改上游
+  fixture，未跑全量 corpus。
 - W98 fresh Bun standard-module/API leaf probe（5 jobs、复用 W97 binary、无构建）测得 **4/5 files green、161
   passed、1 ahead-of-reference、165 ran、100536 expects**：sleep **2/2**、Deno URLSearchParams **32/32**、Node
   X509 **14/14**、TextDecoder **104/104**；`resolve/require` 为 **9 passed / 1 ahead-of-reference / 3 todo /
