@@ -244,6 +244,30 @@ the observed Linux limits; the coordinator owns the only root build.
 | W294 | Node path/os/url pure-contract leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five path/os/url guards; no source owner |
 | W295 | Node path/query/url/events leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build | retain path identity, querystring, URL invalid-input, and CustomEvent guards; park events.on invalid-argument error-code shape |
 | W296 | Bun fetch/encoding/timer leaf probe | 5 | 5/5 green; 70 passed / 0 failed / 70 ran / 85 expects; 0 timeout; no build | retain all five Bun guards; no source owner |
+| W297 | Bun fetch/blob/timer ownership probe | 5 | 3/5 green; 24 passed / 1 failed / 25 ran / 54 expects; 1 runner timeout; no build | retain three Blob guards; park fetch-gzip timeout and setInterval cancellation owners |
+
+## W297 Bun fetch/blob/timer ownership probe
+
+The bounded five-job Bun selector covered gzip fetch decoding, Blob ownership
+and copy-on-write, Blob array fast paths, and setInterval cancellation. It
+measured **3/5 green files**, **24 passed / 1 failed / 25 ran / 54 expects**,
+and **1 runner timeout**. Per-file durations were **250–33170 ms**.
+
+`blob-array-fast-path.test.ts` measured **11 passed / 0 failed / 11 ran / 13
+expects**; `blob-cow.test.ts` measured **5 / 0 / 5 / 21**; and
+`blob-file-name-ownership.test.ts` measured **1 / 0 / 1 / 3**. These three
+ownership/fast-path guards are retained as green coverage.
+
+`fetch-gzip.test.ts` did not complete within the 30-second per-file runner
+limit and is parked as a gzip fetch liveness/timeout owner. The
+`setInterval.test.js` file measured **7 passed / 1 failed / 8 ran / 17
+expects**; the failure was the cancellation-after-scheduling case. This is a
+separate timer cancellation owner. There were no source or upstream-fixture
+changes.
+
+The selector used the bounded five-job Bun runner with a 30-second per-file
+timeout, the existing coordinator binary, and missing Node modules allowed.
+No full corpus, build, or workspace-wide test was run.
 
 ## W296 Bun fetch/encoding/timer leaf probe
 
