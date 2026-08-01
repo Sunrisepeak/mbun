@@ -188,6 +188,26 @@ the observed Linux limits; the coordinator owns the only root build.
 | W238 | Node stream lifecycle leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain Readable Web termination, Writable cork-buffer accounting, and Duplex end/half-open guards; no source owner |
 | W239 | Node stream pipeline/state leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain pipeline listener cleanup/uncaught delivery, Writable needDrain, and writableCorked transitions; no source owner |
 | W240 | Node stream state/destroy leaves | 2 | 2/2 pass; 0 fail; 0 timeout; no build | retain Readable pause/resume/backpressure and Writable destroy/error/custom-destroy lifecycle guards; no source owner |
+| W241 | Bun Node HTTP leaf probe | 3 | 2/3 green; 7 passed / 1 failed / 8 ran / 13 expects; 0 timeout; no build | retain maxHeaderSize and HTTP primordials; park proxy-agent CR/LF host validation owner |
+
+## W241 Bun Node HTTP leaf probe
+
+The bounded three-job Bun selector covered `node-http-maxHeaderSize`,
+`node-http-primoridals`, and `node-http-proxy-url`. It measured **2/3 files
+green**, with **7 passed / 1 failed / 8 ran / 13 expects / 0 runner
+timeouts**. Per-file durations were 251–652ms.
+
+`node-http-maxHeaderSize` passed all 4 tests, including runtime header limits
+and `--max-http-header-size` child-process validation. The HTTP primordials
+guard passed its 1 test while replacing global `Request`, `Response`,
+`Headers`, and `Blob`. The proxy URL file passed its 2 nested subprocess
+checks, but its CR/LF host validation check received `no-error` instead of
+`ERR_INVALID_CHAR`; keep that as a focused proxy-agent host-validation owner.
+
+No source or upstream fixture change was made. The selector reused the
+coordinator binary through `tools/integration/bun_corpus_runner.py` with
+three bounded jobs, a 30-second per-file timeout, and missing Node modules
+allowed. No full corpus, build, or workspace-wide test was run.
 
 ## W133 Bun.Terminal green cluster
 
