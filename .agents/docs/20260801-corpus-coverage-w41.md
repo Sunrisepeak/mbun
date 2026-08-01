@@ -99,6 +99,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W149 | Bun Fetch/Web basic leaves | 4 | 4/4 green; 27 passed / 0 failed / 27 ran / 40 expects; 0 timeout; no build | retain all four Fetch/Web leaves; no source owner |
 | W150 | Bun Blob focused leaves | 4 | 4/4 green; 27 passed / 0 failed / 27 ran / 62 expects; 0 timeout; no build | retain all four Blob leaves; no source owner |
 | W151 | Node URL format/property leaves | 5 | 3/5 pass; 2 fail; 0 timeout; no build | retain fileURL/path and format leaves; park URL invalid-this and descriptor-enumerability owners |
+| W152 | Bun Fetch body/cyclic leaves | 3 | 3/3 green; 6 passed / 0 failed / 6 ran / 8 expects; 0 timeout; no build | retain all three body/cyclic leaves; no source owner |
 
 ## W133 Bun.Terminal green cluster
 
@@ -405,6 +406,21 @@ coordinator binary through `tools/integration/node_corpus_runner.py` with
 three bounded jobs and a 30-second per-file timeout. No full corpus or
 workspace-wide test was run; the selector and raw runner output were removed
 after recording the result.
+
+## W152 Bun Fetch body/cyclic green cluster
+
+The bounded three-job selector covered async-iterator body safety and cyclic
+Request/Response stream references. All **3/3 files were green**, reaching
+**6 passed / 0 failed / 6 ran / 8 expects** with no timeout. Per-file durations
+were 253–404ms.
+
+Both cyclic-reference files' heapStats checks passed, so this probe did not
+reproduce the W146 Request method `NaN` memory-accounting owner. No source or
+upstream fixture change was made. The selector used the existing coordinator
+binary through `tools/integration/bun_corpus_runner.py` with three bounded
+jobs, a 30-second per-file timeout, and missing Node modules allowed.
+No full corpus or workspace-wide test was run; the selector and raw runner
+output were removed after recording the result.
 
 ## W132 Node VM and WebStreams owner split
 

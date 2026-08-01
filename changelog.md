@@ -5,6 +5,7 @@
 
 ## 2026-08-01
 
+- W152 fresh Bun Fetch body/cyclic cluster（3 jobs、复用现有 coordinator binary、无构建）**3/3 files green、6 passed、0 failed、6 ran、8 expects、0 timeout**：async-iterator body、Request cyclic、Response cyclic 全部通过；heapStats 未复现 W146 的 NaN owner；单文件耗时 253–404ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W151 fresh Node URL format/property probe（3 jobs、复用现有 coordinator binary、无构建）**3/5 files pass、2 fail、0 timeout**：fileURL/path、format invalid input、WHATWG format 通过；URL invalid-this 未抛 TypeError，URL method descriptor enumerable 为 false vs Node true，两个独立 owner 停车。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W150 fresh Bun Blob focused cluster（3 jobs、复用现有 coordinator binary、无构建）**4/4 files green、27 passed、0 failed、27 ran、62 expects、0 timeout**：array fast path、copy-on-write、file-name ownership、blob.write 全部通过；单文件耗时 165–350ms。首次错误目录 selector 在 dispatch 前被路径校验拒绝，未计入结果；未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W149 fresh Bun Fetch/Web basic cluster（3 jobs、复用现有 coordinator binary、无构建）**4/4 files green、27 passed、0 failed、27 ran、40 expects、0 timeout**：Body mixin errors、FormData Content-Length、wire header case、UTF-8 BOM 全部通过；单文件耗时 200–216ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
