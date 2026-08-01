@@ -192,6 +192,26 @@ the observed Linux limits; the coordinator owns the only root build.
 | W242 | Bun spawn/mock leaves | 3 | 3/3 green; 11 passed / 0 failed / 11 ran / 45 expects; 0 timeout; no build | retain spoofed spawn-array length, disposable mock restore, and mock.module validation/resolver short-circuit guards; no source owner |
 | W243 | Bun Web Fetch/Response leaves | 3 | 3/3 green; 86 passed / 0 failed / 86 ran / 192 expects; 0 timeout; no build | retain Response constructor/redirect/clone, body-used errors, and fetch option-conversion/no-send guards; no source owner |
 | W244 | Bun test matcher leaves | 3 | 3/3 green; 45 passed / 0 failed / 45 ran / 92 expects; 0 timeout; no build | retain expect labels, expect.assertions failure accounting, and toHaveReturnedWith/toHaveLastReturnedWith guards; no source owner |
+| W245 | Node console/process plain-script leaves | 3 | 2/3 pass; 1 fail; 0 timeout; no build | retain console.count and process.uptime; park Console group multiline-object pretty-print/indentation owner |
+
+## W245 Node console/process plain-script probe
+
+The bounded three-job Node selector covered `test-console-count.js`,
+`test-console-group.js`, and `test-process-uptime.js`. It measured **2/3 files
+pass, 1/3 fail, and 0 timeouts**; the Node runner reports these plain scripts
+as file-level pass/fail units, so no synthetic subtest or expect totals are
+reported. Per-file durations were 198–250ms.
+
+`test-console-count.js` and `test-process-uptime.js` exited cleanly.
+`test-console-group.js` reached its multiline object indentation assertion:
+the observed output kept the object on one line, while Node expects a
+property-per-line indented rendering. Keep this as one Console formatting
+owner; no mixed console patch was attempted.
+
+No source or upstream fixture change was made. The selector reused the
+coordinator binary through `tools/integration/node_corpus_runner.py` with
+three bounded jobs and a 30-second per-file timeout. No full corpus, build,
+or workspace-wide test was run.
 
 ## W244 Bun test matcher leaf probe
 
