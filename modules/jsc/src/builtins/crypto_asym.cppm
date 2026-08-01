@@ -2032,10 +2032,14 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
       else if (!isBufferSource(candidate)) {
         throw argType("candidate", "an instance of ArrayBuffer, TypedArray, Buffer, DataView, or bigint", candidate);
       }
+      // Node's CheckPrimeJob captures candidate bytes before reading the
+      // options object, whose `checks` getter may mutate the original view.
+      const candidateBytes = Buffer.from(toBuf(candidate));
       vObject(options, "options");
-      const checks = options.checks === undefined ? 0 : options.checks;
+      const checksValue = options.checks;
+      const checks = checksValue === undefined ? 0 : checksValue;
       vInt32Prop(checks, "options.checks", 0);
-      return { candidate: toBuf(candidate), checks };
+      return { candidate: candidateBytes, checks };
     };
     C.checkPrimeSync = (candidate, options) => {
       const a = checkArgs(candidate, options === undefined ? {} : options);
