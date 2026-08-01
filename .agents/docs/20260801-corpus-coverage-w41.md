@@ -164,6 +164,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W214 | Bun process/TLS/HTTP leaves | 3 | 1/3 green; 4 passed / 2 failed / 6 ran / 6 expects; 0 timeout; no build | retain process stdio stack-limit guard; park TLS `allowHalfOpen` propagation and HTTP internal-handle bootstrap owners |
 | W215 | Bun TLS leaves | 3 | 3/3 green; 7 passed / 0 failed / 7 ran / 33 expects; 0 timeout; no build | retain rootCertificates immutability, no-cipher-match error shape, and createSecureContext argument validation; no source owner |
 | W216 | Bun VM leak/integration leaves | 3 | 2/3 green; 5 passed / 1 failed / 6 ran / 1 expect; 0 timeout; no build | retain vm-script-fetcher and vm.Script leak guards; park happy-dom DOM integration owner |
+| W217 | Node assert owner-split leaves | 3 | 0/3 pass; 3 fail; 0 timeout; no build | park assert.Assert constructor, Error cause deep-equality message/stack, and TypedArray/ArrayBuffer deepEqual semantics as separate owners |
 
 ## W133 Bun.Terminal green cluster
 
@@ -177,6 +178,29 @@ coordinator binary through `tools/integration/bun_corpus_runner.py` with three
 bounded jobs, a 30-second per-file timeout, and missing Node modules allowed.
 No full corpus or workspace-wide test was run; the selector and raw runner
 output were removed after recording the result.
+
+## W217 Node assert owner split
+
+The bounded three-job Node selector covered Assert class destructuring,
+Error `cause` deep equality, and TypedArray/ArrayBuffer deep equality. The
+file-level runner result was **0/3 pass: 3 failures / 0 timeouts**; per-file
+durations were 199–1604ms. This runner reports Node corpus files as pass/fail
+units because the upstream files are plain scripts, so no subtest pass count is
+invented here.
+
+The Assert class file stops because `assert.Assert` is not a constructor. The
+Error-cause file reaches comparison but differs in Node's expected diagnostic
+message/stack formatting. The TypedArray file reaches its loose/not-equal
+cases but several expected `AssertionError` throws do not occur. These are
+separate owners; no mixed assertion patch was attempted.
+
+The first cwd-relative selector was rejected before dispatch and ran zero
+tests; it was corrected to repository-root-relative paths before the measured
+probe. No source or upstream fixture change was made. The final selector used
+the existing coordinator binary through `tools/integration/node_corpus_runner.py`
+with three bounded jobs and a 30-second per-file timeout. No full corpus or
+workspace-wide test was run; the selector and raw runner output were removed
+after recording the result.
 
 ## W216 Bun VM leak/integration owner split
 
