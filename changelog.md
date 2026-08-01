@@ -5,6 +5,7 @@
 
 ## 2026-08-01
 
+- W263 fresh Node stream append/backpressure/order plain-script leaf probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：Readable data-time append、Writable backpressure 与 Readable push ordering 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 182–183ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W262 fresh Node crypto Certificate/DH/keygen plain-script leaf probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：Certificate fixture/API、`modp2` Diffie-Hellman 与 empty-passphrase keygen no-prompt 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 202–252ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W261 fresh Node Buffer iterator/read/allocation plain-script leaf probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：Buffer iterator variants、read boundary/error guards 与 negative/NaN allocation validation 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 200–201ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W260 fresh Bun hooks/custom matcher/mock-fn leaf probe（3 jobs、复用现有 coordinator binary、无构建）**2/3 files green、78 passed、34 failed、113 ran、20,472 expects、0 runner timeout**：expect-extend **28/28**、jest-hooks **17 pass + 1 todo**；mock-fn **33/67**，失败聚焦 metadata/this、call bookkeeping、missing APIs、reset/restore 与 spyOn owners。单文件耗时 182–232ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。

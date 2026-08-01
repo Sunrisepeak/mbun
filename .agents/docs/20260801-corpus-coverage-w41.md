@@ -210,6 +210,24 @@ the observed Linux limits; the coordinator owns the only root build.
 | W260 | Bun hooks/custom matcher/mock-fn leaves | 3 | 2/3 green; 78 passed / 34 failed / 113 ran / 20472 expects; 0 timeout; no build | retain expect-extend 28/28 and jest-hooks 17 pass + 1 todo; park mock-fn metadata/this, call bookkeeping, missing APIs, reset/restore, and spyOn owners |
 | W261 | Node Buffer iterator/read/allocation leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain Buffer iterator variants, read boundary/error guards, and negative allocation validation; no source owner |
 | W262 | Node crypto Certificate/DH/keygen leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain Certificate fixture parsing/API, `modp2` Diffie-Hellman group, and empty-passphrase keygen no-prompt guards; no source owner |
+| W263 | Node stream append/backpressure/order leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain Readable data-time append, backpressure completion, and push ordering; no source owner |
+
+## W263 Node stream append/backpressure/order plain-script leaf probe
+
+The bounded three-job Node selector covered
+`test-stream-readable-add-chunk-during-data.js`, `test-stream-backpressure.js`,
+and `test-stream-push-order.js`. It measured **3/3 file-level passes**, **0
+failures**, and **0 runner timeouts**. Per-file durations were 182–183ms.
+
+The probe retained adding data during a Readable `data` event, Writable
+backpressure completion, and deterministic Readable push ordering. The Node
+corpus runner reports only file-level status for these plain scripts, so no
+synthetic subtest count was added.
+
+No source or upstream fixture change was made. The selector reused the
+coordinator binary through `tools/integration/node_corpus_runner.py` with
+three bounded jobs and a 30-second per-file timeout. No full corpus, build,
+or workspace-wide test was run.
 
 ## W262 Node crypto Certificate/DH/keygen plain-script leaf probe
 
