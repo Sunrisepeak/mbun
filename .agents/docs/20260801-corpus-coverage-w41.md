@@ -107,6 +107,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W157 | Node Buffer numeric read/write leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five Buffer numeric leaves; no source owner |
 | W158 | Node Buffer compare/copy leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five Buffer compare/copy leaves; no source owner |
 | W159 | Node assert deep-comparison leaves | 5 | 2/5 pass; 3 fail; 0 timeout; no build | retain assert-fail/if-error; park deep/partial/typed-array assertion owners separately |
+| W160 | Bun Web URL/Response/clone leaves | 4 | 2/3 executable files green; 131 passed / 1 failed / 148 ran / 842 expects; 16 Linux-inapplicable skips; 0 timeout | retain URLSearchParams and structured-clone-fastpath; park Response FileRef snapshot root mismatch; exclude Windows URL skips |
 
 ## W133 Bun.Terminal green cluster
 
@@ -517,6 +518,23 @@ coordinator binary through `tools/integration/node_corpus_runner.py` with
 three bounded jobs and a 30-second per-file timeout. No full corpus or
 workspace-wide test was run; the selector and raw runner output were removed
 after recording the result.
+
+## W160 Bun Web owner split
+
+The bounded three-job selector covered Bun URLSearchParams, structured-clone
+fast paths, Response behavior, and the platform-specific Windows URL file.
+Among the **3 executable files**, **2/3 were green**; the aggregate was **131
+passed / 1 failed / 148 ran / 842 expects**, with **0 timeouts**. The green
+files were URLSearchParams (**17/17**) and structured-clone-fastpath
+(**92/92**). Response reached **22/23**, with one `FileRef` print-size
+snapshot mismatch caused by a different relative path root. The Windows URL
+file had **16/16 skipped** on Linux and is excluded from the green denominator.
+
+No source or upstream fixture change was made. The selector used the existing
+coordinator binary through `tools/integration/bun_corpus_runner.py` with
+three bounded jobs, a 30-second per-file timeout, and missing Node modules
+allowed. No full corpus or workspace-wide test was run; the selector and raw
+runner output were removed after recording the result.
 
 ## W132 Node VM and WebStreams owner split
 
