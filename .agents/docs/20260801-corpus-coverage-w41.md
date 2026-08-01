@@ -189,6 +189,26 @@ the observed Linux limits; the coordinator owns the only root build.
 | W239 | Node stream pipeline/state leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain pipeline listener cleanup/uncaught delivery, Writable needDrain, and writableCorked transitions; no source owner |
 | W240 | Node stream state/destroy leaves | 2 | 2/2 pass; 0 fail; 0 timeout; no build | retain Readable pause/resume/backpressure and Writable destroy/error/custom-destroy lifecycle guards; no source owner |
 | W241 | Bun Node HTTP leaf probe | 3 | 2/3 green; 7 passed / 1 failed / 8 ran / 13 expects; 0 timeout; no build | retain maxHeaderSize and HTTP primordials; park proxy-agent CR/LF host validation owner |
+| W242 | Bun spawn/mock leaves | 3 | 3/3 green; 11 passed / 0 failed / 11 ran / 45 expects; 0 timeout; no build | retain spoofed spawn-array length, disposable mock restore, and mock.module validation/resolver short-circuit guards; no source owner |
+
+## W242 Bun spawn/mock leaf probe
+
+The bounded three-job Bun selector covered `spawn-large-array-length`,
+`mock-disposable`, and `mock-module-non-string`. All **3/3 files were green**,
+with **11 passed / 0 failed / 11 ran / 45 expects / 0 runner timeouts**.
+Per-file durations were 199–350ms.
+
+`spawn-large-array-length` passed all 3 tests for spoofed near-u32-max command
+array lengths and the normal-array control. `mock-disposable` passed all 3
+tests for `spyOn`/`mock` disposal and automatic prototype restoration.
+`mock-module-non-string` passed all 5 tests covering non-string argument
+validation, valid string mocking, malformed specifiers, missing callbacks,
+and resolver short-circuit behavior.
+
+No source or upstream fixture change was made. The selector reused the
+coordinator binary through `tools/integration/bun_corpus_runner.py` with
+three bounded jobs, a 30-second per-file timeout, and missing Node modules
+allowed. No full corpus, build, or workspace-wide test was run.
 
 ## W241 Bun Node HTTP leaf probe
 
