@@ -283,6 +283,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W333 | Node error/internal-contract leaves | 5 | 1/5 pass; 4 fail; 0 timeout; no build; 5 fresh | retain bad-Unicode parser; park accessor brands, constants shape, stack limit, and SystemError dialect owners |
 | W334 | Node process lifecycle/propagation leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build; 5 fresh | retain beforeExit throw, binding allowlist, execArgv, and uncaught-monitor guards; park beforeExit reentry owner |
 | W335 | Node timer API leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build; 5 fresh | retain all five timer API guards; no source owner |
+| W336 | Node assert/DNS validation leaves | 5 | 3/5 pass; 2 fail; 0 timeout; no build; 5 fresh | retain ESM/CJS, Myers, and DNS guards; park async-thenable and first-line assertion-message owners |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -930,6 +931,27 @@ workspace-wide build were made. After the run, resources showed about **46 GiB
 available memory**, **60 KiB free swap**, and **16 GiB free disk at 99% usage**.
 Temporary runner output is cleaned immediately and the next wave remains
 resource-gated.
+
+## W336 Node assert/DNS validation leaves
+
+The bounded five-job Node selector covered five fresh files after
+filename/stem and narrow semantic-owner review: `test-assert-async.js`,
+`test-assert-first-line.js`, `test-assert-esm-cjs-message-verify.js`,
+`test-assert-myers-diff.js`, and `test-dns-setlocaladdress.js`. The runner
+measured **3/5 file-level passes**, **2 failures**, **0 runner timeouts**, and
+**248–349 ms** per file. The Node runner reports file-level status only; no
+assertion-level pass total is inferred.
+
+The ESM/CJS assertion-message comparison, Myers diff input-size boundary, and
+DNS `setLocalAddress` validation guards passed and are retained. The async
+assertion file failed in a thenable/validation expectation, while the
+first-line assertion file produced only the generic falsy-expression message
+instead of including the source line; these are parked as two separate
+assert async-contract and assertion-source-rendering owners. No source or
+upstream-fixture changes, full corpus, or workspace-wide build were made.
+After the run, resources showed about **46 GiB available memory**, **244 KiB
+free swap**, and **16 GiB free disk at 99% usage**. Temporary runner output is
+cleaned immediately and the next wave remains resource-gated.
 
 ## Coverage novelty audit correction after W323
 
