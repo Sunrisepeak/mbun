@@ -296,6 +296,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W346 | Node readline Unicode line-separator source fix | 5 | pre 4/5 pass + 1 fail; post target 1/1 pass and bounded regression 5/5 pass; 0 timeout; one release rebuild | add U+2028/U+2029 to `lineEnding`; retain all five readline guards; no upstream-fixture change |
 | W347 | Node/Bun dgram port-message source fix | 5 Node + 1 Bun | pre Node 4/5 pass + 1 fail; post Node 5/5 pass; Bun 3/3 passed / 0 failed / 3 ran / 4 expects; 0 timeout; one release rebuild | change only `allowZero=false` wording from `>= 1` to `> 0`; retain dgram guards; no upstream-fixture change |
 | W348 | Node TTY WriteStream forwarding source fix | 5 Node + 1 Bun narrow guard | pre Node 4/5 pass + 1 fail; post Node 5/5 pass; Bun narrow guard 19/19 passed / 0 failed / 19 ran / 88 expects; 0 timeout; one no-cache release rebuild | forward four `WriteStream` cursor methods to readline; retain adjacent TTY/readline guards; no upstream-fixture change |
+| W349 | Node EventEmitter.on watermark metadata source fix | 5 Node + 5 Node regression + 1 Bun narrow guard | pre 4/5 pass + 1 fail; post target 5/5 pass and W348 regression 5/5 pass; Bun 10/10 passed / 0 failed / 10 ran / 15 expects; 0 timeout; one no-cache release rebuild | expose `nodejs.watermarkData` size/low/high/isPaused getters on async iterators; retain TTY/readline guards; no upstream-fixture change |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -1220,6 +1221,31 @@ source checkpoints; individual probe results stay in this ledger. After the
 run, resources showed about **42 GiB available memory**, **4 MiB free swap**,
 and **16 GiB free disk at 99% usage**. Temporary runner output and selectors
 are removed before commit.
+
+## W349 Node EventEmitter.on watermark metadata source fix
+
+The fresh five-job Node selector covered five previously unrecorded readline
+leaves: async-iterator backpressure, async-iterator destroy, carriage-return
+chunking, input error handling, and undefined output columns. The current
+coordinator binary measured **4/5 file-level passes**, **1 failure**, and **0
+runner timeouts**. The only failure was
+`test-readline-async-iterators-backpressure.js`: the async iterator returned by
+`EventEmitter.on()` had no `Symbol.for("nodejs.watermarkData")`, so the fixture
+could not observe the configured high-water mark.
+
+The source owner was localized to the single `on()` implementation in
+`modules/jsc/src/builtins/bootstrap.cppm`. The fix adds Node-compatible lazy
+getters for `size`, `low`, `high`, and `isPaused`; it does not alter queueing,
+pause/resume thresholds, or the upstream fixture.
+
+After one no-cache release rebuild (**93.53 seconds**), the same W349 selector
+measured **5/5 passes** and **0 runner timeouts**. The five-file W348
+TTY/readline regression selector also remained **5/5 passes**, and the Bun
+native `EventEmitter.on` narrow guard measured **10 passed / 0 failed / 10 ran /
+15 expects**. No `compat/` test or assertion was changed, and no full corpus or
+workspace-wide test was run. This is the fourth W41 source-fix checkpoint;
+individual probes remain in this ledger and PR updates stay grouped by source
+checkpoint.
 
 ## Coverage novelty audit correction after W323
 

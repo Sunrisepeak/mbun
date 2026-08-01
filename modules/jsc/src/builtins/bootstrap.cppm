@@ -2778,6 +2778,12 @@ inline constexpr char kBootstrapJS_[] = R"JS(
         return() { return closeHandler(); },
         throw(err) { if (!err || !(err instanceof Error)) throw ERR_INVALID_ARG_TYPE("EventEmitter.AsyncIterator", "Error", err); errorHandler(err); },
         [Symbol.asyncIterator]() { return this; },
+        [Symbol.for("nodejs.watermarkData")]: {
+          get size() { return size; },
+          get low() { return lowWatermark; },
+          get high() { return highWatermark; },
+          get isPaused() { return paused; },
+        },
       }, AsyncIteratorPrototype);
       const { addEventListener, removeAll } = listenersController();
       addEventListener(emitter, event, options[kFirstEventParam] ? eventHandler : function (...args) { return eventHandler(args); });

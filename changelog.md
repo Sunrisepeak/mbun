@@ -23,6 +23,13 @@
   no-cache release rebuild 后 Node selector **5/5 pass、0 timeout**，Bun 原生
   窄 guard **19/19 passed、0 failed、88 expects**。Bun 整文件的 25 个
   `readline.Interface` 失败保持单独记录，未修改 `compat/`、未跑全量 corpus。
+- W349 Node `EventEmitter.on` watermark metadata source fix：fresh selector 首次
+  为 **4/5 pass、1 fail、0 timeout**，失败是 async iterator 缺少
+  `Symbol.for("nodejs.watermarkData")`。`modules/jsc/src/builtins/bootstrap.cppm`
+  现提供 `size/low/high/isPaused` getter；no-cache release rebuild 后目标
+  selector **5/5 pass**，W348 TTY/readline 回归 **5/5 pass**，Bun 原生
+  `EventEmitter.on` 窄 guard **10/10 passed、0 failed、15 expects**。未修改
+  `compat/`、未跑全量 corpus。
 
 ## 2026-08-01
 
