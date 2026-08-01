@@ -85,6 +85,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W135 | Bun spawn/io low-coupling leaves | 5 | 3/5 green; 58 passed / 14 failed / 75 ran / 1391 expects; 0 timeout; no build | retain exit-code, empty stdin, kill-signal; park Bun.write and spawnSync multi-owner failures |
 | W136 | Bun Web Encoding leaves | 5 | 4/5 green; 82 passed / 34 failed / 116 ran / 10777 expects; 0 timeout; no build | retain four encoding leaves; park CJK decoder behind missing legacy-label support |
 | W137 | Node path pure-contract leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five path leaves; no source owner |
+| W138 | Node os pure-contract leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five os leaves; no source owner |
 
 ## W133 Bun.Terminal green cluster
 
@@ -163,6 +164,19 @@ output were removed after recording the result.
 The bounded three-job selector covered basename, dirname, extname, absolute
 path detection, and zero-length string behavior. All **5/5 files passed**, with
 **0 failures and 0 timeouts**. Per-file durations were 164–200ms.
+
+No source or upstream fixture change was made. The selector used the existing
+coordinator binary through `tools/integration/node_corpus_runner.py` with
+three bounded jobs and a 30-second per-file timeout. No full corpus or
+workspace-wide test was run; the selector and raw runner output were removed
+after recording the result.
+
+## W138 Node os green cluster
+
+The bounded three-job selector covered checked-function validation, signal
+constants, EOL, homedir fallback without an environment override, and userinfo
+getter errors. All **5/5 files passed**, with **0 failures and 0 timeouts**.
+Per-file durations were 199–349ms.
 
 No source or upstream fixture change was made. The selector used the existing
 coordinator binary through `tools/integration/node_corpus_runner.py` with
