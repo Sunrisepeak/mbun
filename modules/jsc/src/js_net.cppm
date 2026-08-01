@@ -1684,7 +1684,11 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       // `socket.listenerCount('close') === 0` on the detached socket
       // (test-http-connect). It also runs synchronously here, as node's does,
       // rather than a microtask later.
-      if (this._server && this._server._conns) { try { this._server._conns.delete(this); } catch (e) {} }
+      if (this._server && this._server._conns) {
+        try {
+          if (this._server._conns.delete(this)) this._server._connections--;
+        } catch (e) {}
+      }
       // Emission goes through EE.prototype (emitOn, line ~1609) rather than
       // `this.emit`: http2 hands out a Proxy over the session for
       // `session.socket`, and node's proxy THROWS on reading `emit` at all
@@ -2066,6 +2070,15 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
         e.code = "ERR_INVALID_ARG_TYPE"; throw e;
       }
       this._opts = opts || {};
+      // Node publishes these compatibility fields in addition to the live Set
+      // and sticky ref state used by mbun's reactor. Keep the public shape
+      // observable without making the reactor depend on the aliases.
+      this._connections = 0;
+      this._unref = false;
+      this._usingWorkers = false;
+      this.highWaterMark = typeof this._opts.highWaterMark === "number"
+        ? this._opts.highWaterMark
+        : (G.process && G.process.platform === "win32" ? 16 * 1024 : HWM);
       // node net.Server publishes both construction options as own properties;
       // tls.Server inherits them through net.Server.call(this, options, …), and
       // test-tls-server-parent-constructor-options reads them directly.
@@ -2197,6 +2210,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       // first byte is read (it may pass the fd elsewhere first).
       if (this._opts.pauseOnConnect) sock.pause();
       this._conns.add(sock);
+      this._connections++;
       this.emit("connection", sock);
       // node onconnection() publishes 'net.server.socket' right after the
       // 'connection' event.
@@ -2487,6 +2501,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
             // when the first byte is read (it may pass the fd elsewhere first).
             if (this._opts.pauseOnConnect) sock.pause();
             this._conns.add(sock);
+            this._connections++;
             this.emit("connection", sock);
             if (netServerSocketChannel.hasSubscribers) netServerSocketChannel.publish({ socket: sock });
           };
@@ -2567,6 +2582,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
     }
     ref() {
       this._refd = true;
+      this._unref = false;
       // A round-robin server has no descriptor of its own: the faux handle's
       // ref()/unref() (a keep-alive interval) is what holds the worker's loop.
       if (this._clusterHandle && typeof this._clusterHandle.ref === "function") this._clusterHandle.ref();
@@ -2575,6 +2591,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
     }
     unref() {
       this._refd = false;
+      this._unref = true;
       if (this._clusterHandle && typeof this._clusterHandle.unref === "function") this._clusterHandle.unref();
       NET.release(this);
       return this;
@@ -2616,6 +2633,17 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
     if (event === "connection" && sock && typeof sock.destroy === "function") sock.destroy(err);
     else this.emit("error", err);
   };
+
+  // Bun's net.Server surface publishes its public prototype methods as
+  // enumerable assignments. Keep the class implementation while matching
+  // that observable shape for prototype-object assertions.
+  for (const name of ["ref", "unref", "close", "address", "getConnections", "listen"]) {
+    const descriptor = Object.getOwnPropertyDescriptor(Server.prototype, name);
+    if (descriptor && typeof descriptor.value === "function") {
+      descriptor.enumerable = true;
+      Object.defineProperty(Server.prototype, name, descriptor);
+    }
+  }
 
   // ref: bun src/runtime/node/net/BlockList.rs and src/js/node/net.ts. Keep
   // addresses in network-order bytes so subnet checks do not depend on host
@@ -2904,7 +2932,11 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       return Reflect.construct(Cls, args);
     };
     try {
-      Object.setPrototypeOf(wrapper, Cls);
+      // The exported callable constructor must inherit from the same parent
+      // as the implementation class. Pointing it at Cls made
+      // net.Server.__proto__ equal the private implementation class instead
+      // of EventEmitter, which Node exposes as the constructor parent.
+      Object.setPrototypeOf(wrapper, Object.getPrototypeOf(Cls));
       wrapper.prototype = Cls.prototype;
       Object.defineProperty(wrapper, "name", { value: Cls.name, configurable: true });
       Object.defineProperty(wrapper, "length", { value: Cls.length, configurable: true });

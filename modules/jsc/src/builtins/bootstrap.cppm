@@ -2538,6 +2538,11 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     EventEmitterPrototype._events = undefined;
     EventEmitterPrototype._eventsCount = 0;
     EventEmitterPrototype._maxListeners = undefined;
+    for (const name of ["_events", "_eventsCount", "_maxListeners"]) {
+      const descriptor = Object.getOwnPropertyDescriptor(EventEmitterPrototype, name);
+      descriptor.enumerable = false;
+      Object.defineProperty(EventEmitterPrototype, name, descriptor);
+    }
     EventEmitterPrototype[kCapture] = false;
     EventEmitterPrototype.constructor = EventEmitter;
 
