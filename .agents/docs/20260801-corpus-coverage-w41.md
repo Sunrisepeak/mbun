@@ -778,10 +778,14 @@ surface on Linux:
   behavior. Issue [#48](https://github.com/Sunrisepeak/mbun/issues/48) tracks
   the smallest branch: treat this no-descriptor server as a plain message,
   while retaining rejection for genuinely unsupported handles.
-- No fix was attempted in this wave and the upstream fixture remains
-  read-only. No full corpus or workspace-wide build was started; the next
-  implementation checkpoint must add a focused red/green runtime guard and
-  preserve the existing fd-passing path.
+- Issue #48 was fixed in `d390ad7`: `child_process.send()` now recognizes an
+  actual unlistened `net.Server` and sends the message without a
+  `NODE_HANDLE` frame, while fake or unsupported handles still return
+  `ERR_INVALID_HANDLE_TYPE`. The root release build completed in **60.59s**.
+- The focused guard moved from **1/1 failed** to **1/1 green**. The complete
+  W72 five-file regression with **5 bounded jobs** is now **5/5 files green,
+  21 passed, 0 failed, 21 ran, 44 expects**. The upstream fixture remains
+  read-only; no full corpus or workspace-wide build was started.
 
 ### W59 Node buffer leaf sample
 

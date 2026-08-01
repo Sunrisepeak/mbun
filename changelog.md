@@ -5,13 +5,13 @@
 
 ## 2026-08-01
 
-- W72 fresh Bun child-process probe（5 jobs、复用当前 Linux binary、无构建）测得 **4
-  green files、20 passed、1 failed、21 ran、44 expects**。send callback、stdio、exec 和
-  rlimit-nofile 四个文件全绿；`child_process_ipc` 只多出
-  `uncaughtException ERR_INVALID_HANDLE_TYPE`。根因已缩小到未 `listen()` 的
-  `net.Server`（`_fd === -1`）传给 `child.send()` 时的 no-descriptor 分支，Node 对照为
-  返回 `true` 且 callback 为 `null`；已登记 issue [#48](https://github.com/Sunrisepeak/mbun/issues/48)，
-  下一 checkpoint 只加窄 red/green guard 和最小实现。未修改上游 fixture，未跑全量 corpus。
+- W72 fresh Bun child-process probe 先以 **5 jobs** 测得 **4 green files、20 passed、1
+  failed、21 ran、44 expects**，根因定位到未 `listen()` 的 `net.Server`（`_fd === -1`）传给
+  `child.send()` 时错误进入 `ERR_INVALID_HANDLE_TYPE`；Node 对照为返回 `true` 且 callback
+  为 `null`。Issue [#48](https://github.com/Sunrisepeak/mbun/issues/48) 的最小修复已由
+  `d390ad7` 落地，root release build **60.59 秒**；focused IPC **1/1**，完整 W72 回归
+  **5/5 files green、21 passed、0 failed、21 ran、44 expects**，fake/unsupported handle
+  仍保留 `ERR_INVALID_HANDLE_TYPE`。未修改上游 fixture，未跑全量 corpus。
 - W71 fresh Bun HTTP probe（5 jobs、复用当前 Linux binary、无构建）测得 **3 green
   files、22 passed、13 failed、35 ran、68 expects**。numeric headers、response
   setTimeout/unref、early-hints 全绿；HTTPParser 与 transfer-encoding/trailer 的
