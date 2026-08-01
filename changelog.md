@@ -5,6 +5,7 @@
 
 ## 2026-08-01
 
+- W143 fresh Node timers basic cluster（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：args、clear null/object、invalid clear、zero timeout 全部通过；单文件耗时 165–350ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W142 fresh Node string_decoder probe（3 jobs、复用现有 coordinator binary、无构建）**2/3 files pass、1 fail、0 timeout**：string-decoder-end 与 fuzz 通过；主 contract 仅在脱离实例调用 `StringDecoder.prototype.write` 时缺少 Node 要求的 `ERR_INVALID_THIS`，停车为 private-brand owner。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W141 fresh Node events basic probe（3 jobs、复用现有 coordinator binary、无构建）**3/5 files pass、2 fail、0 timeout**：CustomEvent、events list、listener-count 通过；`getMaxListeners(AbortSignal)` 默认值 10 vs Node 0，`events.once` invalid-argument error 缺少 `ERR_INVALID_ARG_TYPE` code，两个独立 owner 暂停。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W140 fresh Bun Web timers basic cluster（3 jobs、复用现有 coordinator binary、无构建）**4/4 files green、12 passed、0 failed、12 ran、58 expects、0 timeout**：setImmediate、setImmediate2、performance、performance-entries 全部通过；单文件耗时 166ms–1.709s。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。

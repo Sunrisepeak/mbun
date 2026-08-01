@@ -90,6 +90,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W140 | Bun Web timers basic leaves | 4 | 4/4 green; 12 passed / 0 failed / 12 ran / 58 expects; 0 timeout; no build | retain all four timer leaves; no source owner |
 | W141 | Node events basic leaves | 5 | 3/5 pass; 2 fail; 0 timeout; no build | retain CustomEvent/list/listener-count; park AbortSignal max-listener default and events.once error-code owners |
 | W142 | Node string_decoder leaves | 3 | 2/3 pass; 1 fail; 0 timeout; no build | retain end/fuzz; park StringDecoder.prototype.write invalid-this brand owner |
+| W143 | Node timers basic leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five timer leaves; no source owner |
 
 ## W133 Bun.Terminal green cluster
 
@@ -245,6 +246,19 @@ file failed only when `StringDecoder.prototype.write` was invoked without a
 decoder instance: Node requires an `ERR_INVALID_THIS` error, while the current
 runtime did not throw. This is a single private-brand/invalid-this owner and is
 parked without a speculative source change or issue.
+
+No source or upstream fixture change was made. The selector used the existing
+coordinator binary through `tools/integration/node_corpus_runner.py` with
+three bounded jobs and a 30-second per-file timeout. No full corpus or
+workspace-wide test was run; the selector and raw runner output were removed
+after recording the result.
+
+## W143 Node timers green cluster
+
+The bounded three-job selector covered timer argument forwarding, clearing
+null/object handles, invalid clear inputs, and zero-timeout behavior. All
+**5/5 files passed**, with **0 failures and 0 timeouts**. Per-file durations
+were 165–350ms.
 
 No source or upstream fixture change was made. The selector used the existing
 coordinator binary through `tools/integration/node_corpus_runner.py` with
