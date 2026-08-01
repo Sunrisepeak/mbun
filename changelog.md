@@ -5,6 +5,11 @@
 
 ## 2026-08-01
 
+- W98 fresh Bun standard-module/API leaf probe（5 jobs、复用 W97 binary、无构建）测得 **4/5 files green、161
+  passed、1 ahead-of-reference、165 ran、100536 expects**：sleep **2/2**、Deno URLSearchParams **32/32**、Node
+  X509 **14/14**、TextDecoder **104/104**；`resolve/require` 为 **9 passed / 1 ahead-of-reference / 3 todo /
+  13 ran**，唯一 failure 是 Bun `test.failing` 标记的用例在 mbun 中通过，按“比参考实现更正确”记录，不做
+  猜测性修复。未修改上游 fixture，未跑全量 corpus。
 - W97 issue [#55](https://github.com/Sunrisepeak/mbun/issues/55) 修复 Node HTTP/2 connect AbortSignal teardown：fresh
   五文件 Node probe 从 **4/5 pass** 变为 **5/5 pass**。根因是 transport signal 与 session teardown 竞态让
   pending request 收到 `ABORT_ERR`，而 Node 要求 session 保留 `AbortError`、request 收到

@@ -45,6 +45,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W95 | Bun HTTP/2/Worker staged regression | 5 | post-fix 5/5 green; 8 passed / 0 failed / 8 ran / 8 expects | issue #53 landed; retain all five guards |
 | W96 | Node HTTP/2 RST lifecycle | 5 Node + 5 Bun guards | pre-fix Node 4/5 pass; post-fix Node 5/5 pass; Bun 5/5 green, 8 passed / 0 failed / 8 ran / 8 expects | issue #54; align readable end and non-zero peer-RST error delivery |
 | W97 | Node HTTP/2 connect-abort teardown | 5 Node + 5 Node/Bun regression guards | pre-fix Node 4/5 pass; post-fix 5/5 pass; W96 Node 5/5 pass; W95 Bun 5/5 green, 8 passed / 0 failed / 8 ran / 8 expects | issue #55; preserve session AbortError while canceling streams with `ERR_HTTP2_STREAM_CANCEL` |
+| W98 | Bun standard-module/API leaf probe | 5 | 4/5 files green; 161 passed / 1 ahead-of-reference / 165 ran / 100536 expects | retain four green leaves; classify `require`'s passing `test.failing` case as ahead-of-reference, no source owner |
 
 ## W96 delivered slice
 
@@ -108,6 +109,23 @@ Evidence from the fresh coordinator build:
   authoritative result.
 
 No upstream fixture changed and no full corpus/workspace-wide test was run.
+
+## W98 Bun leaf coverage
+
+W98 used five bounded jobs and the W97 coordinator binary without a build. The
+selected files were Bun sleep, Deno URLSearchParams, Node X509, TextDecoder,
+and Bun require resolution. The result was **4/5 files green**, **161 passed**,
+**1 ahead-of-reference**, **165 ran**, and **100,536 expects**.
+
+The four green files were `sleep.test.ts` (**2/2**),
+`urlsearchparams.test.ts` (**32/32**), `x509.test.ts` (**14/14**), and
+`text-decoder.test.js` (**104/104**). `resolve/require.test.ts` reached **9
+passed / 1 ahead-of-reference / 3 todo / 13 ran**: its only failure is a Bun
+`test.failing` case that now passes in mbun, so it is recorded as more correct
+than the reference rather than treated as an implementation regression.
+
+No source owner was opened from W98, no upstream fixture changed, and no full
+corpus/workspace-wide test was run.
 
 ## Delivered slice
 
