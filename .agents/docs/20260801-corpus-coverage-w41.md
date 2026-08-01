@@ -64,6 +64,34 @@ the observed Linux limits; the coordinator owns the only root build.
 | W114 | Node streams writable/readable basic leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five green leaves; no source owner |
 | W115 | Node streams event-order/pipe leaves | 5 | 4/5 pass; 1 fail; 0 timeout; TickObject failure reproduced at 1 job / 60s | issue #60; retain four green leaves, park callback-less Writable tick scheduling |
 | W116 | Node streams state/encoding leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five green leaves; no source owner |
+| W117 | Bun util UUID/cookie/width/error leaves | 5 | 2/5 green; 288 passed / 54 failed / 360 ran / 1297 expects; no build | retain cookie + UUIDv5; park UUIDv7 validation/monotonicity, stringWidth ANSI/unicode, inspect-error source diagnostics as separate owners |
+
+## W117 Bun util owner triage
+
+The bounded three-job selector covered `cookie.test.js`, UUIDv5 and UUIDv7
+generation, `stringWidth.test.ts`, and `inspect-error.test.js`. The result was
+**2/5 files green**, **288 passed**, **54 failed**, **360 ran**, and **1297
+expects**. Cookie (**101/101**) and UUIDv5 (**40/40**) are retained as green
+leaves.
+
+The remaining failures are intentionally parked as separate owners:
+
+- UUIDv7 reached **7 passed / 11 failed / 18 ran**. Failures cover 12-bit
+  counter rollover, timestamp validation, explicit older timestamps, and
+  pseudo-random counter seeding; this is broader than one monotonicity branch.
+- `stringWidth.test.ts` reached **139 passed / 34 failed / 173 ran**. Failures
+  span C1/ST control-sequence stripping, ANSI consistency, fuzzer-like input,
+  UTF-16 bulk width, combining marks, Jamo, and Unicode 16/17 width behavior.
+- `inspect-error.test.js` reached **1 passed / 9 failed / 10 ran**. Failures
+  span Bun rich source-context formatting, cause/error snapshots,
+  BuildMessage, source-map location properties, and long-file diagnostics.
+
+No source or upstream fixture change was made. The selector used the existing
+coordinator binary through `tools/integration/bun_corpus_runner.py` with three
+bounded jobs, a 30-second per-file timeout, and missing Node modules allowed.
+No full corpus or workspace-wide test was run. The raw runner output was
+discarded after extracting sanitized counts; local absolute paths and machine
+details were not copied into this record.
 
 ## W115 streams owner triage
 
