@@ -229,6 +229,25 @@ the observed Linux limits; the coordinator owns the only root build.
 | W279 | Bun crypto invalid-this/lazyhash/HKDF leaves | 3 | 3/3 green; 8 passed / 0 failed / 8 ran / 24 expects; 0 timeout; no build | retain invalid-this safety, lazy hash inheritance, and HKDF callback/KeyObject guards; no source owner |
 | W280 | Node module warning/source-map API leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain deprecation-warning and `Module.setSourceMapsSupport` argument-contract leaves; no source owner |
 | W281 | Bun crypto KeyObject/RSA/X509 leaves | 3 | 2/3 green; 118 passed / 1 failed / 142 ran / 1016 expects; 0 timeout; no build | retain KeyObject and X509 green clusters; park RSA PKCS#1 private-decrypt rejection owner |
+| W282 | Node module wrap/wrapper/deprecation leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain CJS wrapper child-process probes and `module.parent` setter deprecation guard; no source owner |
+
+## W282 Node module wrap/wrapper/deprecation leaf probe
+
+The bounded three-job Node selector covered
+`test-module-parent-setter-deprecation.js`, `test-module-wrap.js`, and
+`test-module-wrapper.js`. It measured **3/3 file-level passes**, **0 failures**,
+and **0 runner timeouts**. Per-file durations were 299–300ms.
+
+`test-module-parent-setter-deprecation.js` passed the pending-deprecation
+`DEP0144` warning and setter path; both `test-module-wrap.js` and
+`test-module-wrapper.js` passed their child-process CommonJS wrapper fixture
+probes. These are isolated loader/deprecation leaves with no new source owner.
+
+No source or upstream fixture change was made. The selector reused the
+coordinator binary through `tools/integration/node_corpus_runner.py` with
+three bounded jobs and a 30-second per-file timeout. No full corpus, build,
+or workspace-wide test was run. The Node corpus runner reports only file-level
+status for these plain scripts, so no synthetic subtest count was added.
 
 ## W281 Bun crypto KeyObject/RSA/X509 leaf probe
 
