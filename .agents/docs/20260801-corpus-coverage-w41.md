@@ -215,6 +215,27 @@ the observed Linux limits; the coordinator owns the only root build.
 | W265 | Node fs append/rename/stream-type leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain appendFileSync data/mode/FD behavior, rename type guards, and WriteStream option TypeErrors; no source owner |
 | W266 | Node HTTP framing/status/listening leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain no-content-length framing, statusMessage behavior, and server listening transitions; no source owner |
 | W267 | Node DNS promises/error-shape leaves | 3 | 1/3 pass; 2 fail; 0 timeout; no build | retain resolve-promises; park dns/promises `NODATA` export and memory-error stack-shape owners |
+| W268 | Node DNS lookup/order/type leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain lookup promise stub, result-order controls, and resolveNs type guards; no source owner |
+
+## W268 Node DNS lookup/order/type plain-script leaf probe
+
+The bounded three-job Node selector covered `test-dns-lookup-promises.js`,
+`test-dns-resolvens-typeerror.js`, and `test-dns-set-default-order.js`. It
+measured **3/3 file-level passes**, **0 failures**, and **0 runner timeouts**.
+Per-file durations were 198–450ms.
+
+`test-dns-lookup-promises.js` passed its c-ares stubbed positive and `ENOMEM`
+rejection paths for promise lookup and lookup-all. The `resolveNs` invalid-name
+and invalid-callback checks passed, as did default-result-order validation and
+the `verbatim`/`ipv4first`/`ipv6first` propagation checks across callback and
+promise lookup APIs. These are three isolated green DNS leaves with no newly
+identified runtime owner.
+
+No source or upstream fixture change was made. The selector reused the
+coordinator binary through `tools/integration/node_corpus_runner.py` with
+three bounded jobs and a 30-second per-file timeout. No full corpus, build,
+or workspace-wide test was run. The Node corpus runner reports only file-level
+status for these plain scripts, so no synthetic subtest count was added.
 
 ## W267 Node DNS promises/error-shape plain-script leaf probe
 
