@@ -286,6 +286,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W336 | Node assert/DNS validation leaves | 5 | 3/5 pass; 2 fail; 0 timeout; no build; 5 fresh | retain ESM/CJS, Myers, and DNS guards; park async-thenable and first-line assertion-message owners |
 | W337 | Node HTTP contract leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build; 5 fresh | retain all five HTTP method/port/validation/header guards; no source owner |
 | W338 | Node dgram local UDP contract leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build; 5 fresh | retain all five dgram close/type/send/address/empty-packet guards; no source owner |
+| W339 | Bun small Linux regression leaves | 5 | 5/5 green; 8 passed / 0 failed / 8 ran / 32 expects; 0 timeout; no build; 5 fresh | retain all five regression guards; no source owner |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -992,6 +993,26 @@ changes, full corpus, or workspace-wide build were made. After the run,
 resources showed about **46 GiB available memory**, **296 KiB free swap**, and
 **16 GiB free disk at 99% usage**. Temporary runner output is cleaned
 immediately and the next wave remains resource-gated.
+
+## W339 Bun small Linux regression leaves
+
+The bounded five-job Bun selector covered five fresh small regression files
+after filename/stem and narrow semantic-owner review:
+`test/regression/issue/hashbang-still-works.test.ts`,
+`test/regression/issue/utf16-encoding-crash.test.ts`,
+`test/regression/issue/comma-operator-this-binding.test.ts`,
+`test/regression/issue/yaml-parse-syntax-error.test.ts`, and
+`test/regression/issue/19107.test.ts`. Using the real Bun harness and existing
+binary, the runner measured **5/5 green files**, **8 passed / 0 failed / 8 ran /
+32 expects**, **0 runner timeouts**, and **198–450 ms** per file.
+
+All five guards passed: hashbang/lexer bounds, UTF-16/ucs2 file decoding,
+comma-operator `this` binding, YAML `SyntaxError` shape, and the no-crash
+regression. No source or upstream-fixture changes, full corpus, or
+workspace-wide build were made. After the run, resources showed about **46 GiB
+available memory**, **356 KiB free swap**, and **16 GiB free disk at 99% usage**.
+Temporary runner output is cleaned immediately and the next wave remains
+resource-gated.
 
 ## Coverage novelty audit correction after W323
 
