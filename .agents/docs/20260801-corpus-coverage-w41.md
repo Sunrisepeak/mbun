@@ -276,6 +276,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W326 | Node fs/fs.promises contract leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build; 5 fresh | retain all five fs/fs.promises guards; no source owner |
 | W327 | Node timer clear/refresh/tampering leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build; 5 fresh | retain all five timer guards; no source owner |
 | W328 | Node Buffer deprecation/encoding/zero-fill leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build; 5 fresh | retain all five Buffer guards; no source owner |
+| W329 | Node HTTP/HTTPS/MessageEvent/WebCrypto/console leaves | 5 | 3/5 pass; 2 fail; 0 timeout; no build; 5 fresh | retain HTTP/HTTPS/MessageEvent; park WebCrypto class identity and global-console warning-order owners |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -770,6 +771,27 @@ upstream-fixture changes, no full corpus, and no workspace-wide build. After the
 run, resources showed about **46 GiB available memory**, **2.3 MiB free swap**,
 and **17 GiB free disk at 99% usage**. Temporary runner output is cleaned
 immediately and the next wave remains resource-gated.
+
+## W329 Node HTTP/HTTPS/MessageEvent/WebCrypto/console leaves
+
+The bounded five-job Node selector covered five fresh files after
+filename/stem and semantic-owner review: `test-http-client-invalid-path.js`,
+`test-https-agent-constructor.js`, `test-messageevent-brandcheck.js`,
+`test-global-webcrypto-classes.js`, and `test-global-console-exists.js`. The
+runner measured **3/5 file-level passes**, **2 failures**, **0 runner timeouts**,
+and **231–431 ms** per file. The Node runner reports file-level status only;
+no assertion-level pass total is inferred.
+
+The HTTP invalid-path, HTTPS Agent constructor, and MessageEvent receiver-brand
+guards passed and are retained. `test-global-webcrypto-classes.js` failed on
+global-versus-internal `Crypto` constructor identity, parked as one WebCrypto
+class-export owner. `test-global-console-exists.js` failed because the warning
+handler observed the monkeypatched stderr write count before the expected
+default warning write, parked as one global-console warning-order owner. No
+source or upstream-fixture changes, full corpus, or workspace-wide build were
+made. After the run, resources showed about **46 GiB available memory**, **2.3
+MiB free swap**, and **17 GiB free disk at 99% usage**. Temporary runner output
+is cleaned immediately and the next wave remains resource-gated.
 
 ## Coverage novelty audit correction after W323
 
