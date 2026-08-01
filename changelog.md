@@ -5,6 +5,13 @@
 
 ## 2026-08-02
 
+- W396 Node TLS empty-SNI-context error mapping source fix：server context 没有 certificate/key 且
+  OpenSSL 返回精确 `ERR_SSL_NO_SHARED_CIPHER` 时，映射为 Node 要求的 `no suitable signature
+  algorithm`，其他 cipher/reset 错误不改。focused 文件从 **1/1 failure** 到 **1/1 pass**；五文件
+  SNI selector 从 **3/5 pass、2 fail** 提升到 **4/5 pass、1 fail、0 timeout**，仅剩 offline
+  Duplex `SNICallback` callback owner；Bun fake-timer 回归 **5/5 green、8 passed、0 failed、8
+  ran、10 expects**；incremental release build **3.58s**。未修改 upstream fixture、未跑全量
+  corpus。
 - W395 Node TLS close callback ordering source fix：raw transport 升级为 TLS 后无 error destroy 的
   `close` 现在跨过当前 check phase，再于下一 immediate phase 发出，符合 Node close callbacks
   晚于当前 `setImmediate` 的顺序。focused close-order 文件从 **1/1 failure** 到 **1/1 pass**；

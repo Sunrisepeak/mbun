@@ -342,6 +342,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W393 | Node TLS `allowHalfOpen` transport source fix | 5 | pre 2/5 pass + 3 fail; target 1/1 pass; post selector 3/5 pass + 2 fail, 0 timeout; Bun fake-timer regression 5/5 green, 8 passed / 0 failed / 8 ran / 10 expects; serial release build 57.70s | propagate `tls.connect({ allowHalfOpen })` to its hidden transport; park keepAlive/noDelay teardown and raw TLS close-order owners separately |
 | W394 | Node TLS close_notify/RST teardown source fix | 5 | target pre 1/1 fail; post target 1/1 pass; five-file TLS selector 4/5 pass + 1 fail, 0 timeout; Bun fake-timer regression 5/5 green, 8 passed / 0 failed / 8 ran / 10 expects; two serial release builds 57.35s + 57.43s | classify RST/EPIPE after local TLS shutdown as EOF while preserving unsignalled reset errors; park raw TLS close-order owner separately |
 | W395 | Node TLS close callback ordering source fix | 5 | target pre 1/1 fail; post target 1/1 pass; five-file TLS selector 5/5 pass, 0 fail, 0 timeout; Bun fake-timer regression 5/5 green, 8 passed / 0 failed / 8 ran / 10 expects; serial release build 59.09s | defer no-error TLS transport close through two immediate phases so close callbacks follow the current check phase |
+| W396 | Node TLS empty-SNI-context error mapping source fix | 5 | pre 3/5 pass + 2 fail; target 1/1 fail → 1/1 pass; post SNI selector 4/5 pass + 1 fail, 0 timeout; Bun fake-timer regression 5/5 green, 8 passed / 0 failed / 8 ran / 10 expects; incremental release build 3.58s | map the exact no-credentials server `ERR_SSL_NO_SHARED_CIPHER` reason to Node's `no suitable signature algorithm` message; park offline SNICallback callback owner |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -1838,6 +1839,24 @@ milestone-order owners remain. The five-file Bun fake-timer regression stayed
 **5/5 green, 8 passed, 0 failed, 8 ran, 10 expects** after the serialized release
 build (**59.06s**). No upstream fixture changed and no full corpus/workspace-wide
 test ran.
+
+## W396 Node TLS empty-SNI-context error mapping source fix
+
+The W360 SNI slice had two failures. For `test-tls-empty-sni-context.js`, the
+server-side runtime emitted OpenSSL's `ERR_SSL_NO_SHARED_CIPHER` with
+`no shared cipher` when the selected SNI context had no certificate/key. Node
+reports this no-credentials condition as `no suitable signature algorithm`;
+the client alert code was already correct.
+
+`modules/tls/src/openssl.cpp` now remembers whether a server context began
+with credentials and applies this message mapping only for the exact
+server/no-credentials/no-shared-cipher case. The focused file moved from
+**1/1 failure** to **1/1 pass**. The five-file SNI selector moved from **3/5
+pass, 2 fail** to **4/5 pass, 1 fail, 0 timeout**; the remaining failure is
+the independent offline Duplex `SNICallback` callback owner. The five-file Bun
+fake-timer regression remained **5/5 green, 8 passed, 0 failed, 8 ran, 10
+expects**. The incremental release build took **3.58s**. No upstream fixture
+changed and no full corpus/workspace-wide test ran.
 
 ## W395 Node TLS close callback ordering source fix
 

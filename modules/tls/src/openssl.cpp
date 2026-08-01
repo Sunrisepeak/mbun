@@ -216,6 +216,7 @@ struct TlsChannel::Impl {
     BIO* wbio_ {nullptr}; // SSL -> network (ciphertext to send)
     HandshakeState state_ {HandshakeState::not_started};
     IoWant want_ {IoWant::none};
+    bool serverHasCredentials_ {false};
     bool shutdownSent_ {false};
     bool shutdownDone_ {false};
     std::string error_ {};
@@ -542,6 +543,11 @@ struct TlsChannel::Impl {
                 return;
             }
         }
+        if (role_ == TlsRole::server && !serverHasCredentials_
+            && errorCode_ == "ERR_SSL_NO_SHARED_CIPHER") {
+            error_ = "no suitable signature algorithm";
+            return;
+        }
         error_ = std::string {where};
         if (!detail.empty()) {
             error_ += ": ";
@@ -603,6 +609,7 @@ struct TlsChannel::Impl {
 
     bool setup_(Config config) {
         ensure_library();
+        serverHasCredentials_ = role_ == TlsRole::server && config.has_credentials();
         ctx_ = ::SSL_CTX_new(role_ == TlsRole::client ? ::TLS_client_method()
                                                       : ::TLS_server_method());
         if (ctx_ == nullptr) {
