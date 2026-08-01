@@ -270,6 +270,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W320 | Bun util object/encoding/timer/path leaves | 5 | 4/5 green; 20 passed / 1 failed / 21 ran / 236 expects; 0 timeout; no build; 1 fresh + 4 revalidations | retain fresh `sleepSync`; revalidate four historical Bun guards and retain the known helper owner |
 | W321 | Node warning/identity contract leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five warning/identity guards; no source owner |
 | W322 | Node active-resource lifetime/signal/title leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build; 5 fresh | retain all five active-resource/signal/title guards; no source owner |
+| W323 | Bun FileSink/loader/path/ANSI leaves | 5 | 4/5 green; 60 passed / 20 failed / 81 ran / 1351 expects; 0 timeout; 2 fresh + 3 revalidations | retain fresh `bun-file-windows` and `text-loader`; revalidate W168/W172/W191 owners |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -652,7 +653,28 @@ workspace-wide build. After the run, resources showed about **44 GiB available
 memory**, **1.7 MiB free swap**, and **17 GiB free disk at 99% usage**. Temporary
 runner output is cleaned immediately and the next wave remains resource-gated.
 
-## Coverage novelty audit correction after W321
+## W323 Bun FileSink/loader/path/ANSI leaves
+
+The bounded five-job Bun selector covered five selected files. A second audit
+found semantic historical aliases beyond filename matching: `pathToFileURL-invalid.test.ts`
+revalidates the W191 invalid-input `pathToFileURL` guard, `filesink.test.ts`
+revalidates the W172 FileSink cluster, and `wrapAnsi.npm.test.ts` revalidates
+the W168 wrapAnsi owner split. `bun-file-windows.test.ts` and
+`text-loader.test.ts` are the two genuinely fresh file entries. The run
+measured **4/5 green files**, **60 passed / 20 failed / 81 ran / 1351 expects**,
+**0 runner timeouts**, and **199–1855 ms** per file.
+
+The fresh Windows `/dev/null` file-handle guard passed **3/3**, and the fresh
+text-loader guard passed **7/7**. FileSink revalidated **46/46**; the
+pathToFileURL revalidation passed **1/2**; and wrapAnsi revalidated **3/23**,
+with its 20 failures spanning ANSI escape-token segmentation, width/Unicode,
+and whitespace/newline wrapping owners already parked by W168. No source or
+upstream-fixture changes, full corpus, or workspace-wide build were made.
+After the run, resources showed about **44 GiB available memory**, **1.7 MiB
+free swap**, and **17 GiB free disk at 99% usage**. Temporary runner output is
+cleaned immediately and the next wave remains resource-gated.
+
+## Coverage novelty audit correction after W323
 
 A post-wave audit found that older ledger sections record many files by
 basename rather than full relative path. The prior candidate check searched
@@ -662,7 +684,11 @@ incremental-new-file counts are corrected above: W318 is **4 fresh + 1
 revalidation** and W320 is **1 fresh + 4 revalidations**. No source, fixture,
 build, or test behavior changed. Future selection gates use basename matches
 against the entire ledger, including historical sections, before a file is
-called fresh.
+called fresh. W323 also showed that semantic aliases must be reviewed: basename
+and stem matching alone did not connect `pathToFileURL-invalid` to W191,
+`FileSink` to W172, or `wrapAnsi` to W168. Future selection gates therefore
+combine filename/stem matching with a narrow owner/category alias review before
+calling a file fresh.
 
 ## W304 Node events/path continuation leaf probe
 
