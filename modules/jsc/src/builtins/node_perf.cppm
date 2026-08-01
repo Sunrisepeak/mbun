@@ -35,6 +35,16 @@ inline constexpr std::string_view kNodePerfJS = R"JS(
     err("ERR_INVALID_ARG_TYPE", 'The "' + name + '" argument must be ' +
         (Array.isArray(expected) ? "one of type " + expected.join(", ") : "of type " + expected) +
         ". Received " + (typeof actual));
+  const errArgTypeValue = (name, expected, actual) => {
+    const type = typeof actual;
+    if (actual === null || actual === undefined)
+      return err("ERR_INVALID_ARG_TYPE", 'The "' + name + '" argument must be of type ' + expected + ". Received " + actual);
+    if (type === "function")
+      return err("ERR_INVALID_ARG_TYPE", 'The "' + name + '" argument must be of type ' + expected + ". Received function " + (actual.name || ""));
+    const inspected = type === "string" ? "'" + actual + "'" : String(actual);
+    return err("ERR_INVALID_ARG_TYPE", 'The "' + name + '" argument must be of type ' +
+      expected + ". Received type " + type + " (" + inspected + ")");
+  };
   const errRange = (name, range, actual) =>
     err("ERR_OUT_OF_RANGE", 'The value of "' + name + '" is out of range. It must be ' + range + ". Received " + String(actual));
 
@@ -335,11 +345,20 @@ inline constexpr std::string_view kNodePerfJS = R"JS(
     }
     static get supportedEntryTypes() { return SUPPORTED.slice(); }
     observe(options) {
-      options = options === undefined || options === null ? kEmptyObject : options;
+      if (options === undefined) options = kEmptyObject;
+      if (options === null || typeof options !== "object") throw errArgTypeValue("options", "object", options);
+      const hasEntryTypes = options.entryTypes !== undefined;
+      const hasType = options.type !== undefined;
+      if (!hasEntryTypes && !hasType)
+        throw err("ERR_MISSING_ARGS", 'The "options.entryTypes" and "options.type" arguments must be specified');
+      if (hasEntryTypes && !Array.isArray(options.entryTypes))
+        throw errArgType("options.entryTypes", "string[]", options.entryTypes);
+      if (hasEntryTypes && hasType && options.entryTypes != null && options.type != null)
+        throw err("ERR_INVALID_ARG_VALUE", 'The "options.entryTypes" argument cannot be set with "options.type" together');
       let types;
       if (Array.isArray(options.entryTypes)) types = options.entryTypes;
       else if (options.type !== undefined) types = [options.type];
-      else return;
+      else types = [];
       if (Array.isArray(options.entryTypes)) this.__types = new Set();
       for (const t of types) if (SUPPORTED.indexOf(t) !== -1) this.__types.add(t);
       observers.add(this);

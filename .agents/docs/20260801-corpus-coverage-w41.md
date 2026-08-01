@@ -336,6 +336,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W387 | Bun fake-timer sinon leaf revalidation | 5 | 5/5 green; 8 passed / 0 failed / 8 ran / 10 expects / 0 timeout | retain the fake-timer surface as a green guard; no new source owner |
 | W388 | Node performance five-file triage | 5 | pre 1/5 pass; post 2/5 pass; target `uvMetricsInfo` 1/1 pass; 3 remaining failures are independent GC/observer/timeline owners; 0 timeout | close only the `nodeTiming.uvMetricsInfo` owner and keep the other performance failures separate |
 | W389 | Node `uvMetricsInfo` source fix | 5 | serial release build 59.24s; target 1/1 pass; post selector 2/5 pass, 3 fail, 0 timeout; W387 regression 5/5 green | expose `PerformanceNodeTiming.uvMetricsInfo` and make internal binding read the live timer/check loop counter; no upstream fixture change |
+| W390 | Node `PerformanceObserver.observe()` validation source fix | 5 | target pre 1/1 fail on invalid-argument message; post target 1/1 pass; performance selector 3/5 pass, 2 fail, 0 timeout; Bun W387 regression 5/5 green; serial build 59.06s | validate the options object, required observation selector, entryTypes array, and mutually exclusive selectors; park GC callback and milestone-order owners |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -1816,6 +1817,21 @@ timer/check loop counter instead of a fixed array. The target Node file passed
 0 timeout**; the three remaining failures stayed isolated to the W388 owners.
 The W387 Bun fake-timer guard remained **5/5 green** after a serialized release
 build (**59.24s**). No upstream fixture changed and no full corpus/workspace-wide
+test ran.
+
+## W390 Node `PerformanceObserver.observe()` validation source fix
+
+The remaining observer failure was a narrow validation mismatch: primitive options
+and invalid `entryTypes` returned without throwing, and the primitive error omitted
+Node's received-value detail. `modules/jsc/src/builtins/node_perf.cppm` now validates
+the options object, requires `entryTypes` or `type`, rejects non-array `entryTypes`,
+and reports the mutually exclusive selector case with the Node error code.
+
+The focused Node file moved from **1/1 failure** to **1/1 pass**. The five-file
+performance selector is now **3/5 pass, 2 fail, 0 timeout**; only GC callback and
+milestone-order owners remain. The five-file Bun fake-timer regression stayed
+**5/5 green, 8 passed, 0 failed, 8 ran, 10 expects** after the serialized release
+build (**59.06s**). No upstream fixture changed and no full corpus/workspace-wide
 test ran.
 
 ## Coverage novelty audit correction after W323

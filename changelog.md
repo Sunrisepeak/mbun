@@ -5,6 +5,12 @@
 
 ## 2026-08-02
 
+- W390 Node `PerformanceObserver.observe()` validation source fix：`node_perf.cppm` 补齐 options
+  object、`entryTypes`/`type` 必选、数组类型和互斥校验，并补上 Node received-value 错误文案。
+  focused Node 文件从 **1/1 failure** 到 **1/1 pass**；五文件 performance selector 为 **3/5 pass、2
+  fail、0 timeout**，剩余为 GC callback 与 milestone 顺序两个独立 owner。Bun fake-timer 五文件
+  回归保持 **5/5 green、8 passed、0 failed、8 ran、10 expects**；serial release build **59.06s**，
+  未修改 upstream fixture、未跑全量 corpus。
 - W389 Node `uvMetricsInfo` source fix：`node_perf.cppm` 现在暴露
   `PerformanceNodeTiming.uvMetricsInfo`，`node_internal_binding.cppm` 使用同一 live
   timer/check loop counter，不再固定返回全零。目标 Node 文件从失败变为 **1/1 pass**；五文件
