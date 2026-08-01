@@ -114,6 +114,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W164 | Node fs I/O pure-contract leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five read/write leaves; no source owner |
 | W165 | Node fs error/read leaves | 5 | 3/3 executable pass; 2 Linux-inapplicable skips; 0 fail; 0 timeout; no build | retain all three executable leaves; exclude two Windows-only skips |
 | W166 | Bun util/file low-coupling leaves | 4 | 3/4 green; 28 passed / 4 failed / 32 ran / 73 expects; 0 timeout; no build | retain fileUrl/bun-file-read/concat; reconfirm Bun.file async-stack and JSON-message owners |
+| W167 | Node fs delete/error leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five delete/path-error leaves; no source owner |
 
 ## W133 Bun.Terminal green cluster
 
@@ -597,6 +598,19 @@ coordinator binary through `tools/integration/bun_corpus_runner.py` with
 three bounded jobs, a 30-second per-file timeout, and missing Node modules
 allowed. No full corpus or workspace-wide test was run; the selector and raw
 runner output were removed after recording the result.
+
+## W167 Node fs delete/error green cluster
+
+The bounded three-job selector covered rename and unlink type validation,
+rmdir not-found and file-target errors, and mkdir/rmdir lifecycle behavior.
+All **5/5 files passed**, with **0 failures and 0 timeouts**. Per-file
+durations were 164–249ms.
+
+No source or upstream fixture change was made. The selector used the existing
+coordinator binary through `tools/integration/node_corpus_runner.py` with
+three bounded jobs and a 30-second per-file timeout. No full corpus or
+workspace-wide test was run; the selector and raw runner output were removed
+after recording the result.
 
 ## W132 Node VM and WebStreams owner split
 
