@@ -426,7 +426,9 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
       this.authorized = false;
       this.authorizationError = null;
       this.alpnProtocol = null;
-      this.servername = options.servername || undefined;
+      // Node exposes false on a server-side TLSSocket when the ClientHello
+      // carries no SNI; an unset client-side option remains undefined.
+      this.servername = options.isServer ? false : (options.servername || undefined);
       this._secureEstablished = false;
       this._securePending = true;
       this.secureConnecting = !options.isServer;

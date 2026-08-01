@@ -306,6 +306,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W357 | Node HTTP/2 error-code mapping leaf probe | 6 | 6/6 pass; 0 fail; 0 timeout; no build; six fresh files | retain six `ERR_HTTP2_*` mapping guards; inventory entry is stale; no source owner |
 | W358 | Node TLS session-ticket/resumption source fix | 8 Node + 5 Node regression | pre 3/5 pass; post session target 4/5 pass and follow-up 2/3 pass; 2 independent failures parked; 0 timeout; two incremental release builds; W355 regression 5/5 pass | suppress resumed-session event forwarding and stabilize first/offered ticket reporting; park cluster session sharing and HTTPS Agent message owners |
 | W359 | Node TLS hostname/CN diagnostic source fix | 5 Node + 1 Node regression | pre 2/5 pass, 3 fail; post 3/5 pass, 2 independent failures parked; 0 timeout; one serial incremental release build; focused target 1/1 and W355 diagnostic regression 1/1 pass | recover the client leaf from the peer chain when direct lookup is unavailable, restoring Node's CN-specific hostname mismatch message; park HTTPS Agent SNI propagation and TLS SNI error mapping |
+| W360 | Node TLS server-side no-SNI value source fix | 5 Node + 1 Node regression | pre 1/5 pass, 4 fail; post 2/5 pass, 3 independent failures parked; 0 timeout; one serial release rebuild; focused target 1/1 and SNI-context regression 1/1 pass | expose `false` for a server-side TLSSocket with no ClientHello SNI, preserving `undefined` for an unset client-side option; park SNICallback authorization, invalid-context error mapping, and offline ClientHello callback owners |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -1444,6 +1445,28 @@ reports OpenSSL's `no shared cipher` text. The W355
 `test-tls-friendly-error-message.js` diagnostic regression measured **1/1
 pass**. Verification stayed bounded to the selector and focused regression;
 no full corpus or workspace-wide test was run.
+
+## W360 Node TLS server-side no-SNI value source fix
+
+The fresh five-file SNI selector initially measured **1/5 pass**, **4
+failures**, and **0 runner timeouts**. The direct SNI context selection file
+passed. The HTTPS Agent file failed only on the final request with an empty
+`servername`: the server-side `TLSSocket.servername` was `undefined`, while
+Node exposes `false` when the ClientHello carries no SNI.
+
+The source fix is one runtime initialization branch in
+`modules/jsc/src/js_tls_live.cppm`: server-side sockets now start with
+`servername === false`, while client-side sockets retain the existing
+`undefined` value when no option was supplied. No upstream fixture or
+`compat/` assertion changed.
+
+After the serial release rebuild, the focused HTTPS Agent SNI file measured
+**1/1 pass**, the SNI context regression measured **1/1 pass**, and the full
+W360 selector measured **2/5 passes**, **3 failures**, and **0 runner
+timeouts**. The remaining failures are separate owners: SNICallback's client
+authorization result, the `Invalid SNI context` error mapping, and the
+offline ClientHello path for a directly constructed `TLSSocket`. Verification
+stayed bounded; no full corpus or workspace-wide test was run.
 
 ## Coverage novelty audit correction after W323
 

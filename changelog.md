@@ -84,6 +84,12 @@
   timeout**；HTTPS Agent SNI 传播和 TLS SNI `no shared cipher` 文案保留为两个独立 owner。
   W355 `test-tls-friendly-error-message.js` 回归 **1/1 pass**。未修改 `compat/`、未跑全量
   corpus。
+- W360 Node TLS server-side no-SNI value source fix：五文件 SNI selector 基线 **1/5
+  pass、4 fail、0 timeout**；`modules/jsc/src/js_tls_live.cppm` 让无 ClientHello SNI 的
+  server-side `TLSSocket.servername` 暴露为 `false`，client-side 未设置选项仍为
+  `undefined`。重建后目标 HTTPS Agent SNI 文件 **1/1 pass**，SNI context 回归 **1/1
+  pass**，selector **2/5 pass、3 fail、0 timeout**；剩余为 SNICallback 授权、invalid
+  context 错误映射和离线 ClientHello 三个独立 owner。未修改 `compat/`、未跑全量 corpus。
 
 ## 2026-08-01
 
