@@ -228,6 +228,32 @@ the observed Linux limits; the coordinator owns the only root build.
 | W278 | Node module createRequire/cache/prototype leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain multibyte createRequire, cache injection, and prototype-safety leaves; no source owner |
 | W279 | Bun crypto invalid-this/lazyhash/HKDF leaves | 3 | 3/3 green; 8 passed / 0 failed / 8 ran / 24 expects; 0 timeout; no build | retain invalid-this safety, lazy hash inheritance, and HKDF callback/KeyObject guards; no source owner |
 | W280 | Node module warning/source-map API leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain deprecation-warning and `Module.setSourceMapsSupport` argument-contract leaves; no source owner |
+| W281 | Bun crypto KeyObject/RSA/X509 leaves | 3 | 2/3 green; 118 passed / 1 failed / 142 ran / 1016 expects; 0 timeout; no build | retain KeyObject and X509 green clusters; park RSA PKCS#1 private-decrypt rejection owner |
+
+## W281 Bun crypto KeyObject/RSA/X509 leaf probe
+
+The bounded three-job Bun selector covered `crypto.key-objects.test.ts`,
+`crypto-rsa.test.js`, and `x509-subclass.test.ts`. It measured **2/3 files
+green**, **118 passed / 1 failed / 142 ran / 1016 expects**, and **0 runner
+timeouts**. Per-file durations were 198–903ms under the bounded 4G/512-task
+resource profile.
+
+`crypto.key-objects.test.ts` was green with **85 passed, 0 failed, 108 ran,
+917 expects**, plus **22 skipped** and **1 todo**; it covers secret/public/
+private KeyObject creation, JWK/PEM conversion, encryption/signing, and
+validation. `x509-subclass.test.ts` was green with **12 passed / 0 failed /
+12 ran / 34 expects**, covering prototype/subclass behavior and `checkIssued`.
+
+`crypto-rsa.test.js` reached **21 passed / 1 failed / 22 ran / 65 expects**.
+The single failure is the `RSA_PKCS1_PADDING` private-decrypt guard: the
+reference expects `ERR_INVALID_ARG_VALUE`, while mbun did not throw. This is a
+narrow RSA padding-policy owner; no source or upstream fixture change was
+made.
+
+The selector reused the coordinator binary through
+`tools/integration/bun_corpus_runner.py` with three bounded jobs, a 30-second
+per-file timeout, and missing Node modules allowed. No full corpus, build, or
+workspace-wide test was run.
 
 ## W280 Node module warning/source-map API leaf probe
 
