@@ -5,6 +5,7 @@
 
 ## 2026-08-01
 
+- W165 fresh Node fs error/read probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 executable files pass、2 Windows-only skips、0 fail、0 timeout**：empty read、readfile error、readlink type validation 通过；两个 Windows-only invalid-path leaves 在 Linux 明确 skip，不计入 green denominator。可执行文件耗时 165–350ms，未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W164 fresh Node fs I/O pure-contract probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：read、zero-length read、writeSync optional params、appendFileSync、readFile UTF-8 fast path 全部通过；单文件耗时 165–265ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W163 fresh Node fs pure-contract probe（3 jobs、复用现有 coordinator binary、无构建）**4/5 files pass、1 fail、0 timeout**：fs.constants、mkdir、mkdtemp、open-flags 通过；fs.promises.access 唯一失败为 expected async stack shape，停车为 error-stack owner。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W162 fresh Bun WebStreams compression/large probe（3 jobs、复用现有 coordinator binary、无构建）**1/3 files green、159 passed、13 failed、172 ran、350 expects、0 timeout**：compression **11/11** 通过；streams-leak 失败分为 native pull-buffer 与 memory accounting，streams.test 11 个失败横跨 error shape/stack、string allocation limit、batching、controller、foreign-realm、async iterator owners，均停车未混修。

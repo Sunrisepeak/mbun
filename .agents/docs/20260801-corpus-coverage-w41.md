@@ -112,6 +112,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W162 | Bun WebStreams compression/large surface | 3 | 1/3 green; 159 passed / 13 failed / 172 ran / 350 expects; 0 timeout; no build | retain compression 11/11; park streams-leak and streams.test multi-owner failures |
 | W163 | Node fs pure-contract leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build | retain constants/mkdir/mkdtemp/open-flags; park fs.promises.access stack-shape owner |
 | W164 | Node fs I/O pure-contract leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five read/write leaves; no source owner |
+| W165 | Node fs error/read leaves | 5 | 3/3 executable pass; 2 Linux-inapplicable skips; 0 fail; 0 timeout; no build | retain all three executable leaves; exclude two Windows-only skips |
 
 ## W133 Bun.Terminal green cluster
 
@@ -559,6 +560,20 @@ after recording the result.
 The bounded three-job selector covered read, zero-length read, optional-argument
 writeSync, appendFileSync, and the readFile UTF-8 fast path. All **5/5 files
 passed**, with **0 failures and 0 timeouts**. Per-file durations were 165–265ms.
+
+No source or upstream fixture change was made. The selector used the existing
+coordinator binary through `tools/integration/node_corpus_runner.py` with
+three bounded jobs and a 30-second per-file timeout. No full corpus or
+workspace-wide test was run; the selector and raw runner output were removed
+after recording the result.
+
+## W165 Node fs error/read green cluster
+
+The bounded three-job selector covered empty-file reads, readfile errors,
+readlink type validation, and two invalid-path cases. The **3 executable files
+all passed** with **0 failures and 0 timeouts**. The remaining two files were
+explicitly Windows-only and skipped on Linux; they are excluded from the green
+denominator. Executable per-file durations were 165–350ms.
 
 No source or upstream fixture change was made. The selector used the existing
 coordinator binary through `tools/integration/node_corpus_runner.py` with
