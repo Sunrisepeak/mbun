@@ -84,6 +84,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W134 | Node HTTP low-coupling leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five HTTP leaves; no source owner |
 | W135 | Bun spawn/io low-coupling leaves | 5 | 3/5 green; 58 passed / 14 failed / 75 ran / 1391 expects; 0 timeout; no build | retain exit-code, empty stdin, kill-signal; park Bun.write and spawnSync multi-owner failures |
 | W136 | Bun Web Encoding leaves | 5 | 4/5 green; 82 passed / 34 failed / 116 ran / 10777 expects; 0 timeout; no build | retain four encoding leaves; park CJK decoder behind missing legacy-label support |
+| W137 | Node path pure-contract leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five path leaves; no source owner |
 
 ## W133 Bun.Terminal green cluster
 
@@ -156,6 +157,18 @@ coordinator binary through `tools/integration/bun_corpus_runner.py` with three
 bounded jobs, a 30-second per-file timeout, and missing Node modules allowed.
 No full corpus or workspace-wide test was run; the selector and raw runner
 output were removed after recording the result.
+
+## W137 Node path green cluster
+
+The bounded three-job selector covered basename, dirname, extname, absolute
+path detection, and zero-length string behavior. All **5/5 files passed**, with
+**0 failures and 0 timeouts**. Per-file durations were 164–200ms.
+
+No source or upstream fixture change was made. The selector used the existing
+coordinator binary through `tools/integration/node_corpus_runner.py` with
+three bounded jobs and a 30-second per-file timeout. No full corpus or
+workspace-wide test was run; the selector and raw runner output were removed
+after recording the result.
 
 ## W132 Node VM and WebStreams owner split
 
