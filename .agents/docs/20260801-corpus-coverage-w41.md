@@ -123,6 +123,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W173 | Node stream basic leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five Duplex/Readable/Writable leaves; no source owner |
 | W174 | Node stream error/end leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five invalid-chunk/finished/end leaves; no source owner |
 | W175 | Node stream state/event leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five Readable/Writable state leaves; no source owner |
+| W176 | Node stream/Web strategy leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five Web termination/strategy/HWM leaves; no source owner |
 
 ## W133 Bun.Terminal green cluster
 
@@ -722,6 +723,19 @@ after recording the result.
 The bounded three-job selector covered Writable ended and needDrain state,
 Readable data and readable events, and isPaused behavior. All **5/5 files
 passed**, with **0 failures and 0 timeouts**. Per-file durations were 165–200ms.
+
+No source or upstream fixture change was made. The selector used the existing
+coordinator binary through `tools/integration/node_corpus_runner.py` with
+three bounded jobs and a 30-second per-file timeout. No full corpus or
+workspace-wide test was run; the selector and raw runner output were removed
+after recording the result.
+
+## W176 Node stream/Web strategy green cluster
+
+The bounded three-job selector covered ReadableStream termination through Web
+bridges, Readable strategy options, Writable default encoding, and the global
+stream high-water-mark setting. All **5/5 files passed**, with **0 failures and
+0 timeouts**. Per-file durations were 165–333ms.
 
 No source or upstream fixture change was made. The selector used the existing
 coordinator binary through `tools/integration/node_corpus_runner.py` with

@@ -5,6 +5,7 @@
 
 ## 2026-08-01
 
+- W176 fresh Node stream/Web strategy probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：Readable↔Web termination、Readable strategy option、Writable default encoding、stream default HWM 全部通过；单文件耗时 165–333ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W175 fresh Node stream state/event probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：Writable ended/needDrain、Readable data/readable events、isPaused 全部通过；单文件耗时 165–200ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W174 fresh Node stream error/end probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：readable/writable invalid chunks、writable finished、end-of-streams、Duplex end 全部通过；单文件耗时 165–230ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W173 fresh Node stream basic probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：Duplex、Readable state、Writable properties、string pushes、TypedArray chunks 全部通过；单文件耗时 199–316ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
