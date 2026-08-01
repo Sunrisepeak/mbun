@@ -279,6 +279,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W329 | Node HTTP/HTTPS/MessageEvent/WebCrypto/console leaves | 5 | 3/5 pass; 2 fail; 0 timeout; no build; 5 fresh | retain HTTP/HTTPS/MessageEvent; park WebCrypto class identity and global-console warning-order owners |
 | W330 | Node perf_hooks/performance contract leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build; 5 fresh | retain timerify/global/measure guards; park resource-timing BigInt validation owner |
 | W331 | Node perf_hooks/performance continuation leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build; 5 fresh | retain timerify and async-function guards; park nodeTiming milestone-order owner |
+| W332 | Bun low-coupling Linux leaves | 5 | 2/5 green; 4 passed / 4 failed / 8 ran / 17 expects; 0 timeout; no build; 5 fresh | retain RuntimeError/data-URL module; park namespace pollution, no-addons diagnostic, and glibc symbol owners |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -837,6 +838,31 @@ changes, full corpus, or workspace-wide build were made. After the run,
 resources showed about **46 GiB available memory**, **24 KiB free swap**, and
 **15 GiB free disk at 99% usage**. Temporary runner output is cleaned
 immediately and the next wave remains resource-gated.
+
+## W332 Bun low-coupling Linux leaves
+
+The bounded five-job Bun selector covered five fresh low-coupling files after
+filename/stem and narrow semantic-owner review:
+`test/js/bun/namespace-prototype-pollution.test.ts`,
+`test/js/bun/runtime-error.test.ts`, `test/js/node/string-module.test.js`,
+`test/js/node/no-addons.test.ts`, and `test/js/bun/symbols.test.ts`. Using the
+existing binary and the real Bun harness, the runner measured **2/5 green
+files**, **4 passed / 4 failed / 8 ran / 17 expects**, **0 runner timeouts**, and
+**231–431 ms** per file.
+
+`runtime-error` (**1/1**) and `string-module` (**3/3**) passed and are retained.
+The namespace test failed because the imported namespace inherited the
+`Object.prototype` function; `no-addons` failed before the expected disabled-
+addon diagnostic because `process.dlopen()` reported its two-argument
+validation error; and `symbols` failed its two Linux ELF checks because the
+current binary exposes glibc symbols newer than the test's compatibility floor
+and exits non-zero. These are three separate owners: module namespace
+prototype isolation, `process.dlopen` validation/diagnostic ordering, and
+Linux binary compatibility metadata. No source or upstream-fixture changes,
+full corpus, or workspace-wide build were made. After the run, resources
+showed about **46 GiB available memory**, **40 KiB free swap**, and **15 GiB
+free disk at 99% usage**. Temporary runner output is cleaned immediately and
+the next wave remains resource-gated.
 
 ## Coverage novelty audit correction after W323
 
