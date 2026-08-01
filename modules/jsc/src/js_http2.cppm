@@ -2257,6 +2257,14 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
           this._lastProcStreamId = streamId;
           this._localWindow -= len;
           if (stream) {
+            // A PUSH_PROMISE reserves the stream until response HEADERS arrive.
+            // DATA in that interval is a stream-state error: refuse it with
+            // STREAM_CLOSED, but keep the session alive for later frames.
+            if (stream.pushed === true && !stream._responseEmitted) {
+              this.streams.delete(streamId);
+              http2StreamClose(stream, constants.NGHTTP2_STREAM_CLOSED);
+              return true;
+            }
             if (data.length) stream._pushData(data);
             // maintain flow-control windows so large bodies keep flowing
             if (len > 0) { this._windowUpdate(0, len); this._windowUpdate(streamId, len); }
