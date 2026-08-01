@@ -223,6 +223,28 @@ the observed Linux limits; the coordinator owns the only root build.
 | W273 | Bun Buffer safety/bounds leaves | 3 | 2/3 green; 47 passed / 2 failed / 49 ran / 82 expects; 0 timeout; no build | retain indexOf detach and compare bounds; park Buffer.fill string-branch encoding coercion owner |
 | W274 | Node module/constants plain-script leaves | 3 | 2/3 pass; 1 fail; 0 timeout; no build | retain `module.isBuiltin` and `builtinModules`; park internal/public constants mapping owner |
 | W275 | Node module/punycode plain-script leaves | 3 | 2/3 pass; 1 fail; 0 timeout; no build | retain createRequire and invalid-module loading guards; park punycode invalid-input message owner |
+| W276 | Bun crypto HMAC/PBKDF2/ECDH leaves | 3 | 3/3 green; 126 passed / 0 failed / 126 ran / 226 expects; 0 timeout; no build | retain RFC/vector HMAC, PBKDF2 validation/derivation, and ECDH conversion/secret guards; no source owner |
+
+## W276 Bun crypto HMAC/PBKDF2/ECDH leaf probe
+
+The bounded three-job Bun selector covered `crypto.hmac.test.ts`,
+`pbkdf2.test.ts`, and `ecdh.test.ts`. It measured **3/3 files green**,
+**126 passed / 0 failed / 126 ran / 226 expects**, and **0 runner timeouts**.
+The runner used the default bounded profile of **4G memory / 512 tasks**; per-
+file durations were 200–202ms.
+
+`crypto.hmac.test.ts` passed **74/74**, including RFC 2202/4231 vectors,
+KeyObject keys, streaming/finalization, and invalid digest/option guards.
+`pbkdf2.test.ts` passed **38/38**, covering known derivations and invalid
+keylen/iteration/digest inputs. `ecdh.test.ts` passed **14/14**, covering
+supported curves, key formats, shared-secret agreement, conversion, and
+invalid-key/private-key states. This is a high-value green crypto cluster with
+no newly identified source owner.
+
+No source or upstream fixture change was made. The selector reused the
+coordinator binary through `tools/integration/bun_corpus_runner.py` with
+three bounded jobs, a 30-second per-file timeout, and missing Node modules
+allowed. No full corpus, build, or workspace-wide test was run.
 
 ## W275 Node module/punycode plain-script leaf probe
 
