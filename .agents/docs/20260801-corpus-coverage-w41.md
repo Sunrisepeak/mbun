@@ -263,6 +263,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W313 | Node console/process/path guard leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build | retain four process/path guards; park console.dir revoked-Proxy inspection owner |
 | W314 | Bun util mmap/hash/CSRF/file/concat leaves | 5 | 4/5 green; 50 passed / 8 failed / 58 ran / 200 expects; 0 timeout; no build | retain four green util guards; park missing Bun.mmap API owner |
 | W315 | Node process/console lifecycle green cluster | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five process/console lifecycle guards; no source owner |
+| W316 | Node process.env contract leaves | 5 | 3/5 pass; 1 fail; 1 skipped; 0 timeout; no build | retain three env guards; record inspector skip and split load-env-file cwd/diagnostic owners |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -505,6 +506,31 @@ changes, no full corpus, and no workspace-wide build. After the run, resources
 showed about **44 GiB available memory**, about **1.4 MiB free swap**, and about
 **17 GiB free disk at 99% usage**. Temporary runner output is cleaned
 immediately and the next wave remains resource-gated.
+
+## W316 Node process.env contract leaf probe
+
+The bounded five-job Node selector covered five previously unrecorded files:
+`test-process-load-env-file.js`, `test-process-env-delete.js`,
+`test-process-env-deprecation.js`, `test-process-env-ignore-getter-setter.js`,
+and `test-process-env-sideeffects.js`. It measured **3/5 file-level passes**,
+**1 failure**, **1 skip**, **0 runner timeouts**, and **248–801 ms** per file.
+The Node runner reports file-level status only; no assertion-level pass total is
+inferred.
+
+`test-process-env-delete.js`, `test-process-env-deprecation.js`, and
+`test-process-env-ignore-getter-setter.js` passed. The
+`test-process-env-sideeffects.js` entry was skipped because V8 inspector is
+disabled in this Linux runtime. `test-process-load-env-file.js` failed two
+subtests: the missing-`.env` case is coupled to the runner working directory
+and expected fixture layout, while the permission case has a separate error
+diagnostic/regex mismatch. These remain two owners; no mixed process.env patch
+was attempted.
+
+There were no source or upstream-fixture changes, no full corpus, and no
+workspace-wide build. After the run, resources showed about **44 GiB
+available memory**, about **1.4 MiB free swap**, and about **17 GiB free disk at
+99% usage**. Temporary runner output is cleaned immediately and the next wave
+remains resource-gated.
 
 ## W304 Node events/path continuation leaf probe
 
