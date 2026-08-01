@@ -572,6 +572,22 @@ surface on Linux:
   全量 corpus。当前资源约 **44 GiB available memory、43 MiB swap free、20 GiB
   free disk**，继续暂停 broad build，仅保留 bounded lane。
 
+### W57 fresh Bun built-in probes
+
+- W57 使用默认 **4G/512、3 jobs**，无构建、无全量 corpus。第一批五文件为
+  `ini/ini`、`jsonl/jsonl-parse`、`jsonc/jsonc`、Markdown heading IDs 和
+  `md/gfm-compat`：前四个分别为 **62/62、269/269、43/43、17/17**，GFM 为
+  **47/62**，15 个失败。失败证据分成 table interruption/column-count/escaping、
+  autolink 特殊字符、单波浪线删除线和 entity-like suffix，至少四个 owner，未建
+  混合修复 issue。
+- 第二批 cookie 四文件与 `cron/cron-parse` 全绿：**5/5 files、138/138 tests、0
+  failed、667 expects**。两批合计 **10 files、576/591 tests passed、15 failed、5479
+  expects**，其中 **9/10 files green**；失败全部来自 GFM，cookie/cron/ini/JSON/heading
+  结果可作为下一轮 guard 或已交付覆盖数据。
+- 结论：GFM 是多 owner Markdown cluster，暂时停车；下一任务继续从 fresh bounded
+  measurement 选单一 Bun/Node near-green row，不因 9 个 green 文件而 speculative
+  改动 parser。
+
 ### W56 Bun.Glob path-boundary owner
 
 - W56 先纠正了一次候选路径选择错误：错误的 `compat/bun/...` 前缀只触发了
@@ -621,8 +637,9 @@ surface on Linux:
    identified.
 3. Keep test-v8 profiler/queryObjects and broad VM wording changes parked until
    ownership is clear.
-4. Keep the W56 Bun.Glob path-boundary owner closed unless a new minimal
-   reproduction reopens it; prioritize the next one-owner Bun row over zlib's
+4. Keep the W56 Bun.Glob path-boundary owner and W57 cookie/cron/ini/JSON/heading
+   slices closed unless a new minimal reproduction reopens them. Keep GFM parked
+   behind its multiple owners; prioritize the next one-owner Bun row over zlib's
    native-handle cluster and test-runner's multi-owner boundary.
 5. Keep the fixed W51 final-read ordering, W52 file-backed stdin, W53 stdout
    disturbed/reject, and W54 conversion-helper brand owners closed; reopen only
