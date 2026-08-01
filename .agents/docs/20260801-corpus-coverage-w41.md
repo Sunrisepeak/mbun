@@ -280,6 +280,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W330 | Node perf_hooks/performance contract leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build; 5 fresh | retain timerify/global/measure guards; park resource-timing BigInt validation owner |
 | W331 | Node perf_hooks/performance continuation leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build; 5 fresh | retain timerify and async-function guards; park nodeTiming milestone-order owner |
 | W332 | Bun low-coupling Linux leaves | 5 | 2/5 green; 4 passed / 4 failed / 8 ran / 17 expects; 0 timeout; no build; 5 fresh | retain RuntimeError/data-URL module; park namespace pollution, no-addons diagnostic, and glibc symbol owners |
+| W333 | Node error/internal-contract leaves | 5 | 1/5 pass; 4 fail; 0 timeout; no build; 5 fresh | retain bad-Unicode parser; park accessor brands, constants shape, stack limit, and SystemError dialect owners |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -863,6 +864,29 @@ full corpus, or workspace-wide build were made. After the run, resources
 showed about **46 GiB available memory**, **40 KiB free swap**, and **15 GiB
 free disk at 99% usage**. Temporary runner output is cleaned immediately and
 the next wave remains resource-gated.
+
+## W333 Node error/internal-contract leaves
+
+The bounded five-job Node selector covered five fresh files after
+filename/stem and narrow semantic-owner review: `test-errors-systemerror.js`,
+`test-errors-hide-stack-frames.js`, `test-accessor-properties.js`,
+`test-binding-constants.js`, and `test-bad-unicode.js`. The runner measured
+**1/5 file-level pass**, **4 failures**, **0 runner timeouts**, and
+**198–350 ms** per file. The Node runner reports file-level status only; no
+assertion-level pass total is inferred.
+
+`test-bad-unicode.js` passed and is retained. The four failures are separated
+as follows: accessor getters did not reject incompatible receivers; internal
+constants exposed an extra `os.signals` key; `Error.stackTraceLimit` was 100
+instead of the expected 10 while checking hidden stack frames; and the empty
+`SystemError` context used a JSC-style error message instead of Node's
+`Cannot read properties of undefined (reading 'syscall')` wording. These are
+four independent owners: accessor brand checks, constants shape, stack-limit
+initialization, and SystemError error-text dialect. No source or
+upstream-fixture changes, full corpus, or workspace-wide build were made.
+After the run, resources showed about **46 GiB available memory**, **48 KiB
+free swap**, and **15 GiB free disk at 99% usage**. Temporary runner output is
+cleaned immediately and the next wave remains resource-gated.
 
 ## Coverage novelty audit correction after W323
 
