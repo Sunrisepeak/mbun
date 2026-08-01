@@ -200,6 +200,25 @@ the observed Linux limits; the coordinator owns the only root build.
 | W250 | Node process queue/mask/CPU plain-script leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain nextTick uncaught propagation, umask mask coercion, and cpuUsage result/argument guards; no source owner |
 | W251 | Node process exec/argv/umask plain-script leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain symlink execPath, child argv[0], and full umask read/write/error guards; no source owner |
 | W252 | Bun base64/highlighter/UUID leaves | 3 | 2/3 green; 28 passed / 11 failed / 39 ran / 575 expects; 0 timeout; no build | retain base64url 5/5 and highlighter 16/16; park randomUUIDv7 timestamp validation, rollover/order, and counter-seeding owners |
+| W253 | Node events/listener plain-script leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain EventEmitter eventNames/listenerCount semantics and EventSource-disabled global guard; no source owner |
+
+## W253 Node events/listener plain-script probe
+
+The bounded three-job Node selector covered `test-events-list.js`,
+`test-events-listener-count-with-listener.js`, and
+`test-eventsource-disabled.js`. All **3/3 files passed**, with **0 failures
+and 0 timeouts**. The Node runner reports these plain scripts as file-level
+pass/fail units, so no synthetic subtest or expect totals are reported.
+Per-file durations were 200–201ms.
+
+The passing guards cover EventEmitter `eventNames()` ordering and Symbol
+names, listener-count filtering by function, and the disabled global
+`EventSource` contract.
+
+No source or upstream fixture change was made. The selector reused the
+coordinator binary through `tools/integration/node_corpus_runner.py` with
+three bounded jobs and a 30-second per-file timeout. No full corpus, build,
+or workspace-wide test was run.
 
 ## W252 Bun base64/highlighter/UUID leaf probe
 

@@ -5,6 +5,7 @@
 
 ## 2026-08-01
 
+- W253 fresh Node events/listener plain-script probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：EventEmitter eventNames/listenerCount 与 EventSource-disabled global guard 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 200–201ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W252 fresh Bun base64/highlighter/UUID leaf probe（3 jobs、复用现有 coordinator binary、无构建）**2/3 files green、28 passed、11 failed、39 ran、575 expects、0 runner timeout**：base64url **5/5**、highlighter **16/16**；randomUUIDv7 **7/18**，失败拆为 timestamp validation/error-shape、12-bit rollover/order、旧 timestamp ordering、counter seeding 四个 owner。单文件耗时 252–855ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W251 fresh Node process exec/argv/umask plain-script probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：symlink execPath、child argv[0]、umask read/write restoration 与 invalid object/string validation 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 198–298ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W250 fresh Node process queue/mask/CPU plain-script probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：nextTick callback/error propagation、umask mask coercion、cpuUsage result/argument validation 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 200–251ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
