@@ -197,6 +197,24 @@ the observed Linux limits; the coordinator owns the only root build.
 | W247 | Node util.deprecate/inspect plain-script leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain deprecate code validation/one-time warning behavior and inspect primordial isolation; no source owner |
 | W248 | Node console assignment/error plain-script leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain primitive console replacement/self-assignment and Console primitive-write failure guards; no source owner |
 | W249 | Node process identity/memory plain-script leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain process.ppid child relation, process.release LTS/version contract, and availableMemory numeric guard; no source owner |
+| W250 | Node process queue/mask/CPU plain-script leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain nextTick uncaught propagation, umask mask coercion, and cpuUsage result/argument guards; no source owner |
+
+## W250 Node process queue/mask/CPU plain-script probe
+
+The bounded three-job Node selector covered `test-process-next-tick.js`,
+`test-process-umask-mask.js`, and `test-process-cpuUsage.js`. All **3/3 files
+passed**, with **0 failures and 0 timeouts**. The Node runner reports these
+plain scripts as file-level pass/fail units, so no synthetic subtest or expect
+totals are reported. Per-file durations were 200–251ms.
+
+The passing guards cover `process.nextTick` callback/error propagation,
+numeric and octal-string `process.umask` mask handling, and `process.cpuUsage`
+result shape plus invalid argument validation.
+
+No source or upstream fixture change was made. The selector reused the
+coordinator binary through `tools/integration/node_corpus_runner.py` with
+three bounded jobs and a 30-second per-file timeout. No full corpus, build,
+or workspace-wide test was run.
 
 ## W249 Node process identity/memory plain-script probe
 
