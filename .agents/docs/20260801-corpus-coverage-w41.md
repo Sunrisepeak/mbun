@@ -54,6 +54,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W104 | Bun Node process / stdio leaves | 5 | 5/5 files green; 39 passed / 0 failed / 39 ran / 93 expects; no build | retain all five green leaves; no source owner |
 | W105 | Node process identity / timing leaves | 5 | 5/5 files pass; no build | retain all five green leaves; no source owner |
 | W106 | Node process exitCode validation leaves | 5 | pre-fix 4/5 pass; post-fix 5/5 pass; issue #57; fresh serialized build | retain all five leaves; keep exitCode owner closed unless a new reproduction reopens it |
+| W107 | Node net low-coupling leaves | 5 | 5/5 files pass; no build | retain all five green net leaves; no source owner |
 
 ## W96 delivered slice
 
@@ -286,6 +287,16 @@ Evidence from the fresh coordinator build:
 
 No upstream fixture changed, no full corpus/workspace-wide test was run, and
 temporary selectors/output were cleaned after verification.
+
+## W107 Node net low-coupling leaves
+
+W107 reused the fresh W106 coordinator binary and ran five bounded jobs without
+a build. The selected leaves covered IPv4 classification, argument
+normalization, Socket construction, listening state, and local address/port
+reporting. All **5/5 files passed**; no source owner or issue was opened.
+
+No upstream fixture changed, no full corpus/workspace-wide test was run, and
+the temporary selectors/output were cleaned after verification.
 
 ## Delivered slice
 

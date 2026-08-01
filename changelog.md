@@ -5,6 +5,9 @@
 
 ## 2026-08-01
 
+- W107 fresh Node net low-coupling leaf probe（3 jobs、复用 W106 fresh binary、无构建）**5/5 files pass**：
+  IPv4 classification、argument normalization、Socket constructor、listening state、本地 address/port
+  全部通过。未发现 source owner，未修改上游 fixture，未跑全量 corpus/workspace-wide test。
 - W106 issue [#57](https://github.com/Sunrisepeak/mbun/issues/57) 修复 Node
   process.exitCode contract：pre-fix 五文件 selector 为 **4/5 pass**；92dd963
   让 exitCode 不可配置、为 Node 方言补精确的删除错误文本，并使 invalid
