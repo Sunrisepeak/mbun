@@ -494,6 +494,22 @@ public:
         }
         (void)eval_void("Object.defineProperty(globalThis,'__mbunInPreload',"
                         "{value:false,writable:true,enumerable:false,configurable:true});");
+
+        // Node starts the main entry through Module.runMain after --require
+        // modules have loaded. Keep that dispatch point observable so a
+        // preload can apply the legacy runMain monkey-patch supported by
+        // internal/main/run_main_module.js. Bun continues through the native
+        // entry wrapper below, and Node entries without preloads keep the
+        // existing path because there is no user hook to observe.
+        if (gDialect == mbun::jsc::runtime::Dialect::Node && !gPreloads.empty()) {
+            if (auto r{eval_void("require('module').runMain(" + json_quote_(absPath) + ");",
+                                 absPath)};
+                !r) {
+                return fail_run_(r.error());
+            }
+            pump_event_loop("0");
+            return finish_run_(0);
+        }
         std::string js{source};
         bool tla{false};
         // `// @bun` pragma (after an optional hashbang line): the entry is already
