@@ -5,6 +5,7 @@
 
 ## 2026-08-01
 
+- W154 fresh Node URLSearchParams getter probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：get、getAll、has、keys、values 全部通过；单文件耗时 165–201ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W153 fresh Node URL utility probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：pathToFileURL、revokeObjectURL 参数校验、urlToHttpOptions 全部通过；单文件耗时 199–252ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W152 fresh Bun Fetch body/cyclic cluster（3 jobs、复用现有 coordinator binary、无构建）**3/3 files green、6 passed、0 failed、6 ran、8 expects、0 timeout**：async-iterator body、Request cyclic、Response cyclic 全部通过；heapStats 未复现 W146 的 NaN owner；单文件耗时 253–404ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W151 fresh Node URL format/property probe（3 jobs、复用现有 coordinator binary、无构建）**3/5 files pass、2 fail、0 timeout**：fileURL/path、format invalid input、WHATWG format 通过；URL invalid-this 未抛 TypeError，URL method descriptor enumerable 为 false vs Node true，两个独立 owner 停车。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
