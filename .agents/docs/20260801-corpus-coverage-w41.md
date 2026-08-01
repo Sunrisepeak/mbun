@@ -132,6 +132,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W182 | Node stream pipe leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five pipe cleanup/event/flow leaves; no source owner |
 | W183 | Node Transform leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five Transform callback/final/object/HWM leaves; no source owner |
 | W184 | Node Writable leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five constructor/final/destroy/write leaves; no source owner |
+| W185 | Node Writable adjacent leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five encoding/end/state/callback leaves; no source owner |
 
 ## W133 Bun.Terminal green cluster
 
@@ -850,6 +851,19 @@ The bounded three-job selector covered Writable constructor method settings,
 asynchronous finalization, final/destroy ordering, destroy lifecycle, and write
 callback errors. All **5/5 files passed**, with **0 failures and 0 timeouts**.
 Per-file durations were 165–201ms.
+
+No source or upstream fixture change was made. The selector used the existing
+coordinator binary through `tools/integration/node_corpus_runner.py` with
+three bounded jobs and a 30-second per-file timeout. No full corpus or
+workspace-wide test was run; the selector and raw runner output were removed
+after recording the result.
+
+## W185 Node Writable adjacent green cluster
+
+The bounded three-job selector covered default-encoding changes, end callback
+errors, repeated end calls, finished-state reporting, and duplicate write
+callbacks. All **5/5 files passed**, with **0 failures and 0 timeouts**.
+Per-file durations were 164–249ms.
 
 No source or upstream fixture change was made. The selector used the existing
 coordinator binary through `tools/integration/node_corpus_runner.py` with

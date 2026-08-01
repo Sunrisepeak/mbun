@@ -5,6 +5,7 @@
 
 ## 2026-08-01
 
+- W185 fresh Node Writable-adjacent probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：default encoding、end callback errors、重复 end、finished state、duplicate write callback 全部通过；单文件耗时 164–249ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W184 fresh Node Writable probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：constructor method settings、final async/destroy、destroy lifecycle、write callback error 全部通过；单文件耗时 165–201ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W183 fresh Node Transform probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：callback-twice、final sync、object-mode falsey、HWM 0、destroy 全部通过；单文件耗时 166–201ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W182 fresh Node stream pipe probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：pipe cleanup、events/flow、多 destination、same destination twice 全部通过；单文件耗时 164–250ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
