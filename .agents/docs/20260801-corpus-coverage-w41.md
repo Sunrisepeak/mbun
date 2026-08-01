@@ -68,6 +68,29 @@ the observed Linux limits; the coordinator owns the only root build.
 | W118 | Bun util encoding/file/error/path leaves | 5 | 5/5 green; 15 passed / 0 failed / 16 ran / 559 expects; no build | retain all five green leaves; no source owner |
 | W119 | Node assert/buffer/diagnostics/encoding/http leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build | issue #61; retain four green leaves, park missing `assert.Assert` export/constructor as one owner |
 | W120 | Bun util encoding/memory/promise/worker leaves | 5 | 5/5 green; 15 passed / 0 failed / 15 ran / 43 expects; no build | retain all five green leaves; no source owner |
+| W121 | Node HTTP/FS/UDP/zlib leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build | retain four green leaves; park zlib weak-handle memory accounting after a bounded zero-delta reproduction |
+
+## W121 Node zlib metric triage
+
+The bounded three-job selector covered `test-http-agent-false.js`,
+`test-http-listening.js`, `test-dgram-blocklist.js`, `test-fs-buffer.js`, and
+`test-zlib-unused-weak.js`. Four files passed; the zlib file was the only
+failure, with **4/5 pass**, **1 fail**, and **0 timeouts**. The four passing
+leaves are retained.
+
+The zlib assertion measures the external-memory delta before and after creating
+100 gzip handles and after GC. A minimal bounded probe reproduces
+`before=0`, `afterCreation=0`, and `afterGC=0`, so the failure is a zero-denominator
+`process.memoryUsage().external` accounting/GC metric owner rather than a
+single zlib operation error. It is parked without a speculative issue or
+source change until the memory accounting contract is isolated from zlib handle
+lifetime.
+
+No source or upstream fixture change was made. The selector used the existing
+coordinator binary through `tools/integration/node_corpus_runner.py` with three
+bounded jobs and a 30-second per-file timeout. No full corpus or workspace-wide
+test was run; the selector and raw runner output were removed after recording
+the result.
 
 ## W120 Bun util green leaves
 
