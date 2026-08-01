@@ -5,6 +5,7 @@
 
 ## 2026-08-01
 
+- W192 fresh Bun parser/cron adjacent probe（3 jobs、复用现有 coordinator binary、无构建）**3/5 files green、464 passed、78 failed、578 ran、755 expects、0 timeout**：JSON5 suite 113/113、JSONC suite 319/319、TLS segment guard 1 pass/1 skip；cron.test 与 in-process-cron 分别停车在 registration/parse mixed owner 与未实现 scheduler。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W191 fresh Bun util probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files green、105 passed、0 failed、106 ran、1 skipped、409 expects、0 timeout**：password、xxHash、error name/code、sleepSync、invalid pathToFileURL 全部通过；password 单文件 8.789s，其余 198–264ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W190 fresh Bun parser/API probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files green、719/719 tests passed、0 failed、0 timeout、5324 expects**：cron-parse、INI、JSON5、JSONC、JSONL 全部通过；单文件耗时 465ms–4.166s。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W189 correction：5/5 files pass、0 fail、0 timeout，但 `test-stream-readable-no-unneeded-readable.js` 已在 W115 通过；本轮实际新增 **4 个** Readable readiness 文件，另 1 个为历史 guard 复核。

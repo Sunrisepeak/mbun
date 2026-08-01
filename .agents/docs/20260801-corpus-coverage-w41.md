@@ -139,6 +139,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W189 | Node Readable readiness leaves | 5 | 5/5 pass; 4 fresh green + 1 prior guard reconfirmed; 0 fail; 0 timeout; no build | retain four newly measured leaves; keep no-unneeded-readable as a reconfirmed W115 guard |
 | W190 | Bun parser/API leaves | 5 | 5/5 green; 719/719 tests; 0 failed; 0 timeout; 5324 expects; no build | retain all five cron/INI/JSON5/JSONC/JSONL leaves; no source owner |
 | W191 | Bun util low-coupling leaves | 5 | 5/5 green; 105 passed / 0 failed / 106 ran / 1 skipped / 409 expects; 0 timeout; no build | retain all five password/hash/error/sleep/path leaves; no source owner |
+| W192 | Bun parser/cron adjacent leaves | 5 | 3/5 green; 464 passed / 78 failed / 578 ran / 755 expects; 0 timeout; no build | retain TLS-segment-size and JSON5/JSONC suites; park cron scheduling plus cron alias/validation owners separately |
 
 ## W133 Bun.Terminal green cluster
 
@@ -958,6 +959,28 @@ coordinator binary through `tools/integration/bun_corpus_runner.py` with three
 bounded jobs, a 30-second per-file timeout, and missing Node modules allowed.
 No full corpus or workspace-wide test was run; the selector and raw runner
 output were removed after recording the result.
+
+## W192 Bun parser/cron owner split
+
+The bounded three-job selector covered the JSON5 conformance suite, JSONC
+JSONTestSuite, cron API/parse behavior, in-process cron hot reload, and the
+static TLS segment-size guard. It reached **3/5 files green**, with **464
+passed**, **78 failed**, **578 ran**, **755 expects**, and **0 timeouts**.
+The green files were the TLS segment-size guard (**1 pass, 1 skip**), JSON5
+conformance (**113/113**), and JSONC JSONTestSuite (**319/319**).
+
+The two cron files remain split rather than mixed: `in-process-cron.test.ts`
+hits the explicit missing Bun.cron scheduling surface (**0 pass / 27 fail**),
+while `cron.test.ts` combines registration/removal/execution gaps with a
+separate parse nickname/validation owner (**31 pass / 51 fail / 35 skip**).
+No source or upstream fixture change was made and no new issue was opened from
+this mixed measurement.
+
+The selector used the existing coordinator binary through
+`tools/integration/bun_corpus_runner.py` with three bounded jobs, a 30-second
+per-file timeout, and missing Node modules allowed. No full corpus or
+workspace-wide test was run; the selector and raw runner output were removed
+after recording the result.
 
 ## W132 Node VM and WebStreams owner split
 
