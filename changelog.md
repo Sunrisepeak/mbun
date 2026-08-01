@@ -5,6 +5,7 @@
 
 ## 2026-08-01
 
+- W257 fresh Bun mock.module/re-export leaf probe（3 jobs、复用现有 coordinator binary、无构建）**2/3 files green、6 passed、6 failed、13 ran、32 expects、0 runner timeout**：re-export mocks **2/2**、non-existent-specifier **1/1**；mock-module 外层 **3/10** executable pass、6 fail、1 todo，拆为 async mock、restore identity、relative-file mock、cache/update 四个 owner。单文件耗时 184–187ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W256 fresh Node fs/http/url plain-script leaf probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：TypedArray `fs.promises.writeFile`、HTTP header name/value validation 与 invalid `file:` URL path rejection 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 199–250ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W255 fresh Bun retry/jest-each/fake-timers leaf probe（3 jobs、复用现有 coordinator binary、无构建）**2/3 files green、40 passed、4 failed、44 ran、61 expects、0 runner timeout**：jest-each **25/25**、retry/repeats **12/12**；test-timers **3/7**，失败收敛为 Intl fake-clock 日期格式与 child-eval 缺少 `jest.useFakeTimers` 两个 owner。单文件耗时 200–652ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W254 fresh Bun test-runner hook/scope leaf probe（3 jobs、复用现有 coordinator binary、无构建）**2/3 files green、15 passed、11 failed、26 ran、21 expects、0 runner timeout**：nested-describes **3/3**、onTestFinished **12/12**；failure-skip 外层 **0/11**，全部收到空 child stdout，收敛为 nested child-runner/fixture output owner。单文件耗时 199–1402ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。

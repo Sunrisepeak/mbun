@@ -204,6 +204,30 @@ the observed Linux limits; the coordinator owns the only root build.
 | W254 | Bun test-runner hook/scope leaves | 3 | 2/3 green; 15 passed / 11 failed / 26 ran / 21 expects; 0 timeout; no build | retain nested-describes 3/3 and onTestFinished 12/12; park failure-skip nested child-runner empty-output owner |
 | W255 | Bun retry/jest-each/fake-timers leaves | 3 | 2/3 green; 40 passed / 4 failed / 44 ran / 61 expects; 0 timeout; no build | retain jest-each 25/25 and retry/repeats 12/12; park fake-timers Intl clock-format and child-eval `jest.useFakeTimers` owners |
 | W256 | Node fs/http/url plain-script leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain TypedArray `fs.promises.writeFile`, HTTP header name/value validation, and invalid `file:` URL path guards; no source owner |
+| W257 | Bun mock.module/re-export leaves | 3 | 2/3 green; 6 passed / 6 failed / 13 ran / 32 expects; 0 timeout; no build | retain re-export mocks 2/2 and non-existent-specifier 1/1; split mock-module async, restore identity, relative-file, and cache/update owners |
+
+## W257 Bun mock.module/re-export leaf probe
+
+The bounded three-job Bun selector covered `mock-module.test.ts`,
+`mock/6879/6879.test.ts`, and `mock-module-resolve-log.test.ts`. It measured
+**2/3 files green**, with **6 passed / 6 failed / 13 ran / 32 expects / 0
+runner timeouts**. Per-file durations were 184–187ms.
+
+`mock/6879/6879.test.ts` passed both tests for export-list and named re-export
+mocking. `mock-module-resolve-log.test.ts` passed its single regression test
+for a non-existent specifier being mocked without a resolver crash.
+
+`mock-module.test.ts` passed 3/10 executable tests, with 6 failures and 1
+todo. The failures split into four owners: async mock result was `undefined`
+instead of 123; `mock.restore` did not restore the original spy identity;
+relative file and file-URL mocks failed for two non-existent paths; and later
+local/package mock updates retained 42 instead of the expected 43. No mixed
+fix was attempted.
+
+No source or upstream fixture change was made. The selector reused the
+coordinator binary through `tools/integration/bun_corpus_runner.py` with
+three bounded jobs, a 30-second per-file timeout, and missing Node modules
+allowed. No full corpus, build, or workspace-wide test was run.
 
 ## W256 Node fs/http/url plain-script leaf probe
 
