@@ -5,6 +5,7 @@
 
 ## 2026-08-01
 
+- W219 fresh Node Buffer plain-script probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：isUtf8 valid/invalid input、Buffer.byteLength 类型/编码边界、Buffer.compare offset/range 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 232–285ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W218 fresh Node console plain-script probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：console 被非对象替换后恢复、primitive throw 写入、util.inspect 不调用函数 toString 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 199–200ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W217 fresh Node assert owner-split probe（3 jobs、复用现有 coordinator binary、无构建）**0/3 files pass、3 fail、0 timeout**：Assert class destructuring 停在 `assert.Assert` constructor 缺失；Error cause deep-equality 停在 Node message/stack formatting；TypedArray/ArrayBuffer deepEqual 停在预期 AssertionError 未抛出。Node runner 仅做 file-level 计数，未虚构子测试数量；单文件耗时 199–1604ms。首次使用 cwd-relative selector 被 runner 前置校验拒绝、0 tests 未计入，随后改为 root-relative selector 执行。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W216 fresh Bun VM leak/integration probe（3 jobs、复用现有 coordinator binary、无构建）**2/3 files green、5 passed、1 failed、6 ran、1 expect、0 timeout**：`vm-script-fetcher-leak` 4/4 与 `script-leak` 1/1 通过；happy-dom VM 复现停在缺少 `ParentNodeUtility.getElementByTagName` 的 DOM integration owner。单文件耗时 182–887ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
