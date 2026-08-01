@@ -194,6 +194,25 @@ the observed Linux limits; the coordinator owns the only root build.
 | W244 | Bun test matcher leaves | 3 | 3/3 green; 45 passed / 0 failed / 45 ran / 92 expects; 0 timeout; no build | retain expect labels, expect.assertions failure accounting, and toHaveReturnedWith/toHaveLastReturnedWith guards; no source owner |
 | W245 | Node console/process plain-script leaves | 3 | 2/3 pass; 1 fail; 0 timeout; no build | retain console.count and process.uptime; park Console group multiline-object pretty-print/indentation owner |
 | W246 | Node console/util plain-script leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain Console method-constructor guards, stdio setter routing, and util.inherits chains; no source owner |
+| W247 | Node util.deprecate/inspect plain-script leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain deprecate code validation/one-time warning behavior and inspect primordial isolation; no source owner |
+
+## W247 Node util.deprecate/inspect plain-script probe
+
+The bounded three-job Node selector covered
+`test-util-deprecate-invalid-code.js`, `test-util-deprecate.js`, and
+`test-util-primordial-monkeypatching.js`. All **3/3 files passed**, with
+**0 failures and 0 timeouts**. The Node runner reports these plain scripts as
+file-level pass/fail units, so no synthetic subtest or expect totals are
+reported. Per-file durations were 199–349ms.
+
+The passing guards cover invalid `util.deprecate` code validation, one-time
+deprecation warning and prototype behavior, and `util.inspect` remaining
+stable while `Object.keys` is monkeypatched. No source owner was exposed.
+
+No source or upstream fixture change was made. The selector reused the
+coordinator binary through `tools/integration/node_corpus_runner.py` with
+three bounded jobs and a 30-second per-file timeout. No full corpus, build,
+or workspace-wide test was run.
 
 ## W246 Node console/util plain-script probe
 
