@@ -288,6 +288,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W338 | Node dgram local UDP contract leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build; 5 fresh | retain all five dgram close/type/send/address/empty-packet guards; no source owner |
 | W339 | Bun small Linux regression leaves | 5 | 5/5 green; 8 passed / 0 failed / 8 ran / 32 expects; 0 timeout; no build; 5 fresh | retain all five regression guards; no source owner |
 | W340 | Node dgram continuation leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build; 5 fresh | retain bind-error-repeat, connected-send, ref, and unref guards; park connected-port validation message owner |
+| W341 | Node dgram error/options leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build; 5 fresh | retain send-error, callback-recursion, broadcast, and TTL guards; park socket-buffer-size error-rendering owner |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -1035,6 +1036,28 @@ full corpus or workspace-wide build was run. After the run, resources showed
 about **45 GiB available memory**, **372 KiB free swap**, and **16 GiB free
 disk at 99% usage**. Temporary runner output is cleaned immediately and the
 next wave remains resource-gated.
+
+## W341 Node dgram error/options leaves
+
+The bounded five-job Node selector covered five fresh dgram files after
+filename/stem and narrow semantic-owner review:
+`test-dgram-send-error.js`, `test-dgram-send-callback-recursive.js`,
+`test-dgram-setBroadcast.js`, `test-dgram-setTTL.js`, and
+`test-dgram-socket-buffer-size.js`. The runner measured **4/5 file-level
+passes**, **1 failure**, **0 runner timeouts**, and **250–353 ms** per file.
+The Node runner reports file-level status only; no assertion-level pass total
+is inferred.
+
+The send-error propagation, recursive callback scheduling, broadcast option,
+and TTL validation/setting guards passed and are retained. The socket buffer
+size file failed in its exact `ERR_SOCKET_BUFFER_SIZE` `inspect()` comparison:
+the runtime error includes the core message and stack-shaped output but does
+not match Node's `SystemError` detail rendering and fields. This is parked as
+one socket-buffer-size error-rendering owner; no source or upstream-fixture
+change was made. No full corpus or workspace-wide build was run. After the
+run, resources showed about **46 GiB available memory**, **396 KiB free swap**,
+and **16 GiB free disk at 99% usage**. Temporary runner output is cleaned
+immediately and the next wave remains resource-gated.
 
 ## Coverage novelty audit correction after W323
 
