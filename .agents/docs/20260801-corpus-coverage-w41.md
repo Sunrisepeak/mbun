@@ -186,6 +186,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W236 | Bun timers leaves | 3 | 1 counted file; 18 passed / 2 failed / 20 ran / 31 expects; 0 runner timeout; 2 no-tests excluded; no build | park UTF-16 timer-id classification and immediate-exception fixture subprocess owners |
 | W237 | Bun Node stream leaves | 2 | 1/2 green; 92 passed / 6 failed / 104 ran / 165 expects; 0 runner timeout; no build | retain Uint8Array stream guards; park stdin subprocess, Web/Node cancellation reasons, Bun.serve direct sink, and gated resolve.paths owners |
 | W238 | Node stream lifecycle leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain Readable Web termination, Writable cork-buffer accounting, and Duplex end/half-open guards; no source owner |
+| W239 | Node stream pipeline/state leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain pipeline listener cleanup/uncaught delivery, Writable needDrain, and writableCorked transitions; no source owner |
 
 ## W133 Bun.Terminal green cluster
 
@@ -292,6 +293,18 @@ upstream files are plain scripts, so file-level clean exit is authoritative.
 No source or fixture change was made, and no full corpus or workspace-wide test
 was run; the selector and raw runner output were removed after recording the
 result.
+
+## W239 Node stream pipeline/state green cluster
+
+The bounded three-job Node selector covered pipeline listener cleanup and
+uncaught error delivery, Writable `needDrain` state across buffered writes, and
+`writableCorked` nested cork/uncork transitions. All **3/3 files passed**, with
+**0 failures and 0 timeouts**; per-file durations were 198–299ms.
+
+These plain upstream scripts were classified at file-level clean exit. No
+source or upstream fixture change was made, and no full corpus or workspace-wide
+test was run; the selector and raw runner output were removed after recording
+the result.
 
 ## W238 Node stream lifecycle green cluster
 
