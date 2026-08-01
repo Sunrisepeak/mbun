@@ -259,6 +259,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W309 | Node console/process contract leaves | 5 | 4/5 pass; 1 skipped; 0 fail; 0 timeout; no build | retain four console/process guards; record process-config as a Linux environment skip |
 | W310 | Node process/console builtin leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build | retain four guards; park process.getBuiltinModule node:test identity owner |
 | W311 | Bun util low-coupling green cluster | 5 | 5/5 green; 12 passed / 0 failed / 12 ran / 438 expects; 0 timeout; no build | retain all five Bun util guards; no source owner |
+| W312 | Bun util error/file/unsafe/report/fuzzy leaves | 5 | 3/5 green; 9 passed / 155 failed / 164 ran / 30 expects; 0 timeout; no build | retain error-name, file-type, unsafe; park Promise.resolve intrinsic and split reportError owners |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -418,6 +419,29 @@ workspace-wide build was run.
 After the run, resources showed about **45 GiB available memory**, about **1.2
 MiB free swap**, and about **17 GiB free disk at 99% usage**. Temporary runner
 output is cleaned immediately and the next wave remains resource-gated.
+
+## W312 Bun util error/file/unsafe/report/fuzzy leaf probe
+
+The bounded five-job Bun selector covered five previously unrecorded util
+files: `error-name-preservation`, `file-type`, `unsafe`, `reportError`, and
+`fuzzy-wuzzy`. It measured **3/5 green files**, **9 passed / 155 failed / 164
+ran / 30 expects**, **0 skips**, and **0 runner timeouts**. Per-file durations
+were **236–486 ms**.
+
+The retained green files were `error-name-preservation.test.ts` at **3 / 0 /
+3 / 6**, `file-type.test.ts` at **2 / 0 / 2 / 3**, and `unsafe.test.js` at **4 /
+0 / 4 / 18**. `fuzzy-wuzzy.test.ts` reached **0 / 153 / 153 / 0** because
+every case encountered the same missing `Promise.resolve` intrinsic; this is
+parked as one runtime/intrinsic owner rather than 153 independent failures.
+`reportError.test.ts` reached **0 / 2 / 2 / 3**; its failures split into an
+error-printer snapshot-format mismatch and a lone-surrogate printer position
+contract, so no mixed fix was attempted.
+
+There were no source or upstream-fixture changes, no full corpus, and no
+workspace-wide build. After the run, resources showed about **45 GiB
+available memory**, about **1.3 MiB free swap**, and about **17 GiB free disk at
+99% usage**. Temporary runner output is cleaned immediately and the next wave
+remains resource-gated.
 
 ## W304 Node events/path continuation leaf probe
 
