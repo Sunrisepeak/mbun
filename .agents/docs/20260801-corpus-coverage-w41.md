@@ -226,6 +226,28 @@ the observed Linux limits; the coordinator owns the only root build.
 | W276 | Bun crypto HMAC/PBKDF2/ECDH leaves | 3 | 3/3 green; 126 passed / 0 failed / 126 ran / 226 expects; 0 timeout; no build | retain RFC/vector HMAC, PBKDF2 validation/derivation, and ECDH conversion/secret guards; no source owner |
 | W277 | Node module cache/lookup-path leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain module cache, relative lookup, and node_modules path contract leaves; no source owner |
 | W278 | Node module createRequire/cache/prototype leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain multibyte createRequire, cache injection, and prototype-safety leaves; no source owner |
+| W279 | Bun crypto invalid-this/lazyhash/HKDF leaves | 3 | 3/3 green; 8 passed / 0 failed / 8 ran / 24 expects; 0 timeout; no build | retain invalid-this safety, lazy hash inheritance, and HKDF callback/KeyObject guards; no source owner |
+
+## W279 Bun crypto invalid-this/lazyhash/HKDF leaf probe
+
+The bounded three-job Bun selector covered
+`crypto-invalid-this.test.ts`, `crypto-lazyhash.test.ts`, and
+`hkdf-callback-null.test.ts`. It measured **3/3 files green**, **8 passed / 0
+failed / 8 ran / 24 expects**, and **0 runner timeouts**. Per-file durations
+were 198–203ms under the bounded 4G/512-task resource profile.
+
+`crypto-invalid-this.test.ts` passed **3/3** tests and **9/9 expects** for
+invalid receivers on native HMAC and DiffieHellmanGroup accessors;
+`crypto-lazyhash.test.ts` passed **2/2** tests and **2/2 expects** for the
+Transform inheritance contract; and `hkdf-callback-null.test.ts` passed
+**3/3** tests and **13/13 expects** for callback-null and secret-KeyObject
+validation. This is a compact green crypto guard cluster with no new source
+owner.
+
+No source or upstream fixture change was made. The selector reused the
+coordinator binary through `tools/integration/bun_corpus_runner.py` with
+three bounded jobs, a 30-second per-file timeout, and missing Node modules
+allowed. No full corpus, build, or workspace-wide test was run.
 
 ## W278 Node module createRequire/cache/prototype leaf probe
 
