@@ -3,6 +3,15 @@
 > 只记录**实质进展**（模块落地、测试集通过数变化、性能节点），倒序排列。
 > 格式：`## YYYY-MM-DD` + 条目（关联任务 ID / commit / 测试与性能数据）。
 
+## 2026-08-02
+
+- W346 Node readline Unicode line-separator source fix：W345 基线为 **4/5
+  file-level pass、1 fail、0 timeout**；`modules/jsc/src/builtins/node_readline.cppm`
+  的 `lineEnding` 正则只识别 CR/LF，导致 U+2028/U+2029 留在同一行。最小修复将
+  两个 Unicode 行终止符纳入同一分隔逻辑；重建后目标文件 **1/1 pass**，同面邻接
+  回归（no-trailing-newline、recursive-writes、set-raw-mode、position，加目标文件）
+  **5/5 pass、0 timeout**。未修改 `compat/` 上游测试，未跑全量 corpus。
+
 ## 2026-08-01
 
 - W266 fresh Node HTTP framing/status/listening plain-script leaf probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：no-content-length framing、statusMessage 与 server listening transitions 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 200–250ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。

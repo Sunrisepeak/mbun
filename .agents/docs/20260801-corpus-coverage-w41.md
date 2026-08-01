@@ -293,6 +293,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W343 | Node readline/TTY leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build; 5 fresh | retain CSI, keypress, stdin-end, and stdin-pipe guards; park TTY backwards-API forwarding owner |
 | W344 | Bun Linux loader/build/network/REPL leaves | 5 | 5/5 green; 8 passed / 0 failed / 8 ran / 21 expects; 0 timeout; no build; 5 fresh | retain DCE syntax, tsconfig paths, deferred node import, CONNECT pipelining, and REPL startup guards; no source owner |
 | W345 | Node readline continuation leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build; 5 fresh; TERM=xterm rerun | retain no-trailing-newline, recursive-write, raw-mode, and cursor-position guards; park Unicode line-separator owner |
+| W346 | Node readline Unicode line-separator source fix | 5 | pre 4/5 pass + 1 fail; post target 1/1 pass and bounded regression 5/5 pass; 0 timeout; one release rebuild | add U+2028/U+2029 to `lineEnding`; retain all five readline guards; no upstream-fixture change |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -1152,6 +1153,25 @@ workspace-wide build was run. After the rerun, resources showed about **47 GiB
 available memory**, **1 MiB free swap**, and **16 GiB free disk at 99% usage**.
 Temporary runner output is cleaned immediately and the next wave remains
 resource-gated.
+
+## W346 Node readline Unicode line-separator source fix
+
+The W345 failure was reproduced first with the existing coordinator binary:
+`test-readline-line-separators.js` measured **1/1 file-level failure** and
+reported `89<U+2028>ABC<U+2029>DEF` as one line instead of six expected lines.
+The source owner was localized to the `lineEnding` regular expression in
+`modules/jsc/src/builtins/node_readline.cppm`; it matched CR/LF but not U+2028
+or U+2029. The minimal source fix adds both Unicode line terminators to that
+regular expression. No `compat/` test or assertion was changed.
+
+After one release rebuild, the focused acceptance run measured **1/1 pass**.
+The bounded five-job adjacent regression measured **5/5 file-level passes** and
+**0 runner timeouts** for the target plus no-trailing-newline,
+recursive-writes, set-raw-mode, and cursor-position readline guards. The
+targeted selector used `TERM=xterm`, a 30-second per-file bound, and jobs=5;
+no full corpus or workspace-wide test was run. This is the first W41
+source-fix checkpoint; later PR updates should summarize substantive
+checkpoints rather than each measurement wave.
 
 ## Coverage novelty audit correction after W323
 
