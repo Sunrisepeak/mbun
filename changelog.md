@@ -5,6 +5,9 @@
 
 ## 2026-08-01
 
+- W100 fresh Node `fs/promises` FileHandle leaf probe（5 jobs、复用现有 binary、无构建）**5/5 files pass**：
+  close-errors、aggregate-errors、pull、readFile、writer 全部通过。作为 W93 chmod/stat/truncate/write/sync
+  之后的扩展 guard，未发现 source owner；未修改上游 fixture，未跑全量 fs/corpus。
 - W99 fresh Bun fs/streams/spawn/DNS/URL leaf probe（5 jobs、无构建）初测 **4/5 files green、108 passed、1 failed、
   109 ran、355 expects**：spawn null-byte **20/20**、fs leak **4/4**、pipeTo signal leak **2/2**、URL **14/14**。
   DNS 为 **68/69**，唯一失败是公共域名返回的 IPv6 地址与 fixture 固定值不同；同文件 1-job isolated rerun

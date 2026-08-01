@@ -47,6 +47,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W97 | Node HTTP/2 connect-abort teardown | 5 Node + 5 Node/Bun regression guards | pre-fix Node 4/5 pass; post-fix 5/5 pass; W96 Node 5/5 pass; W95 Bun 5/5 green, 8 passed / 0 failed / 8 ran / 8 expects | issue #55; preserve session AbortError while canceling streams with `ERR_HTTP2_STREAM_CANCEL` |
 | W98 | Bun standard-module/API leaf probe | 5 | 4/5 files green; 161 passed / 1 ahead-of-reference / 165 ran / 100536 expects | retain four green leaves; classify `require`'s passing `test.failing` case as ahead-of-reference, no source owner |
 | W99 | Bun fs/streams/spawn/DNS/URL leaves | 5 + DNS isolated rerun | initial 4/5 green; 108 passed / 1 failed / 109 ran / 355 expects; DNS isolated 1/1 green with 69/69 | retain four stable leaves; DNS public-answer variance is external, no source owner |
+| W100 | Node fs/promises FileHandle leaves | 5 | 5/5 files pass; no build | retain five green leaves; no source owner |
 
 ## W96 delivered slice
 
@@ -147,6 +148,14 @@ runtime owner, so DNS stays parked without a source change.
 
 No upstream fixture changed, no issue was opened, and no full
 corpus/workspace-wide test was run.
+
+## W100 Node FileHandle leaf coverage
+
+W100 used five bounded jobs and the existing coordinator binary without a
+build. The selected `fs/promises` FileHandle leaves were close-errors,
+aggregate-errors, pull, readFile, and writer. All **5/5 files passed**; no
+upstream fixture changed and no source owner was opened. This extends W93's
+green chmod/stat/truncate/write/sync set without rerunning the full fs subtree.
 
 ## Delivered slice
 
