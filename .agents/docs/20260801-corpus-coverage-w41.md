@@ -260,6 +260,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W310 | Node process/console builtin leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build | retain four guards; park process.getBuiltinModule node:test identity owner |
 | W311 | Bun util low-coupling green cluster | 5 | 5/5 green; 12 passed / 0 failed / 12 ran / 438 expects; 0 timeout; no build | retain all five Bun util guards; no source owner |
 | W312 | Bun util error/file/unsafe/report/fuzzy leaves | 5 | 3/5 green; 9 passed / 155 failed / 164 ran / 30 expects; 0 timeout; no build | retain error-name, file-type, unsafe; park Promise.resolve intrinsic and split reportError owners |
+| W313 | Node console/process/path guard leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build | retain four process/path guards; park console.dir revoked-Proxy inspection owner |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -439,6 +440,29 @@ contract, so no mixed fix was attempted.
 
 There were no source or upstream-fixture changes, no full corpus, and no
 workspace-wide build. After the run, resources showed about **45 GiB
+available memory**, about **1.3 MiB free swap**, and about **17 GiB free disk at
+99% usage**. Temporary runner output is cleaned immediately and the next wave
+remains resource-gated.
+
+## W313 Node console/process/path guard leaf probe
+
+The bounded five-job Node selector covered five previously unrecorded files:
+`test-console-issue-43095.js`, `test-process-binding-util.js`,
+`test-process-chdir.js`, `test-process-constants-noatime.js`, and
+`test-path-posix-relative-on-windows.js`. It measured **4/5 file-level passes**,
+**1 failure**, **0 runner timeouts**, and **280–282 ms** per file. The Node
+runner reports file-level status only; no assertion-level pass total is
+inferred.
+
+`test-process-binding-util.js`, `test-process-chdir.js`,
+`test-process-constants-noatime.js`, and `test-path-posix-relative-on-windows.js`
+passed. The only failure, `test-console-issue-43095.js`, reached the
+`console.dir` path with an already revoked Proxy and threw the revoked-Proxy
+TypeError instead of completing the diagnostic print. This is one console
+inspection/error-handling owner; no mixed process or path patch was attempted.
+
+There were no source or upstream-fixture changes, no full corpus, and no
+workspace-wide build. After the run, resources showed about **44 GiB
 available memory**, about **1.3 MiB free swap**, and about **17 GiB free disk at
 99% usage**. Temporary runner output is cleaned immediately and the next wave
 remains resource-gated.
