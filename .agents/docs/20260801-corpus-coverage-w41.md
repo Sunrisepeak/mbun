@@ -256,6 +256,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W306 | Bun/Deno abort/encoding/Event/Fetch body leaves | 5 | 5/5 green; 46 passed / 0 failed / 51 ran / 118 expects; 5 skipped; 0 timeout; no build | retain all five files; keep encoding and Fetch body skips as bounded capability gaps |
 | W307 | Bun globals/archive/console/crypto leaf probe | 5 | 2/5 green; 72 passed / 118 failed / 191 ran / 212 expects; 1 skipped; 0 runner timeout; no build | retain inspect-table and cipheriv; park Archive API, console iterator, and split globals owners |
 | W308 | Node console/path leaf probe | 5 | 4/5 pass; 1 fail; 0 timeout; no build | retain console-clear, console-instance, path-isabsolute, and path-join; park diagnostics-channel callback delivery |
+| W309 | Node console/process contract leaves | 5 | 4/5 pass; 1 skipped; 0 fail; 0 timeout; no build | retain four console/process guards; record process-config as a Linux environment skip |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -352,6 +353,27 @@ workspace-wide build. After the run, resources showed about **46 GiB
 available memory**, about **768 KiB free swap**, and about **18 GiB free disk at
 99% usage**; the temporary runner output is cleaned and the next wave remains
 resource-gated.
+
+## W309 Node console/process contract leaf probe
+
+The bounded five-job Node selector covered five previously unrecorded files:
+`test-console-not-call-toString.js`, `test-console-with-frozen-intrinsics.js`,
+`test-process-prototype.js`, `test-process-config.js`, and
+`test-process-features.js`. The runner measured **4/5 file-level passes**, **1
+skip**, **0 failures**, **0 runner timeouts**, and **197–199 ms** per file.
+The Node runner reports file-level status only; no assertion-level pass total is
+inferred.
+
+`test-console-not-call-toString.js`, `test-console-with-frozen-intrinsics.js`,
+`test-process-features.js`, and `test-process-prototype.js` passed. The
+`test-process-config.js` entry was explicitly skipped because the Linux corpus
+environment does not provide `config.gypi`; it is recorded as an environment
+coverage boundary rather than a runtime failure. No source or upstream-fixture
+changes were made, and no full corpus or workspace-wide build was run.
+
+After the run, resources showed about **45 GiB available memory**, about **1.1
+MiB free swap**, and about **17 GiB free disk at 99% usage**. The temporary
+runner output is cleaned immediately and the next wave remains resource-gated.
 
 ## W304 Node events/path continuation leaf probe
 
