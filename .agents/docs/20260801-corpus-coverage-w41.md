@@ -214,6 +214,27 @@ the observed Linux limits; the coordinator owns the only root build.
 | W264 | Bun spyMatchers/pretty-format/test.failing leaves | 3 | 1/3 green; 130 passed / 24 failed / 159 ran / 494 expects; 0 timeout; no build | retain pretty-format 1/1; retain spyMatchers 124 pass + 5 todo; park matcher error/argument semantics and test.failing message/timeout owners |
 | W265 | Node fs append/rename/stream-type leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain appendFileSync data/mode/FD behavior, rename type guards, and WriteStream option TypeErrors; no source owner |
 | W266 | Node HTTP framing/status/listening leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain no-content-length framing, statusMessage behavior, and server listening transitions; no source owner |
+| W267 | Node DNS promises/error-shape leaves | 3 | 1/3 pass; 2 fail; 0 timeout; no build | retain resolve-promises; park dns/promises `NODATA` export and memory-error stack-shape owners |
+
+## W267 Node DNS promises/error-shape plain-script leaf probe
+
+The bounded three-job Node selector covered `test-dns-promises-exists.js`,
+`test-dns-resolve-promises.js`, and `test-dns-memory-error.js`. It measured
+**1/3 file-level pass**, **2 failures**, and **0 runner timeouts**. Per-file
+durations were 199–299ms.
+
+`test-dns-resolve-promises.js` passed. `test-dns-promises-exists.js` failed
+because `dnsPromises.NODATA` was `undefined` while the reference value was
+`dns.NODATA === 'ENODATA'`. `test-dns-memory-error.js` failed on the expected
+second stack-frame shape (`/^ {4}at Object/`). These remain two independent
+runtime owners: the `dns/promises` constant surface and Node-shaped error-stack
+formatting; no mixed fix was attempted.
+
+No source or upstream fixture change was made. The selector reused the
+coordinator binary through `tools/integration/node_corpus_runner.py` with
+three bounded jobs and a 30-second per-file timeout. No full corpus, build,
+or workspace-wide test was run. The two failing owners are parked for a
+separate minimal reproduction; the passing resolver-promises leaf is retained.
 
 ## W266 Node HTTP framing/status/listening plain-script leaf probe
 
