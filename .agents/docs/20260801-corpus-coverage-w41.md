@@ -287,6 +287,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W337 | Node HTTP contract leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build; 5 fresh | retain all five HTTP method/port/validation/header guards; no source owner |
 | W338 | Node dgram local UDP contract leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build; 5 fresh | retain all five dgram close/type/send/address/empty-packet guards; no source owner |
 | W339 | Bun small Linux regression leaves | 5 | 5/5 green; 8 passed / 0 failed / 8 ran / 32 expects; 0 timeout; no build; 5 fresh | retain all five regression guards; no source owner |
+| W340 | Node dgram continuation leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build; 5 fresh | retain bind-error-repeat, connected-send, ref, and unref guards; park connected-port validation message owner |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -1013,6 +1014,27 @@ workspace-wide build were made. After the run, resources showed about **46 GiB
 available memory**, **356 KiB free swap**, and **16 GiB free disk at 99% usage**.
 Temporary runner output is cleaned immediately and the next wave remains
 resource-gated.
+
+## W340 Node dgram continuation leaves
+
+The bounded five-job Node selector covered five fresh dgram files after
+filename/stem and narrow semantic-owner review:
+`test-dgram-connect.js`, `test-dgram-connect-send-default-host.js`,
+`test-dgram-bind-error-repeat.js`, `test-dgram-ref.js`, and
+`test-dgram-unref.js`. The runner measured **4/5 file-level passes**, **1
+failure**, **0 runner timeouts**, and **199–250 ms** per file. The Node runner
+reports file-level status only; no assertion-level pass total is inferred.
+
+The repeated-bind warning guard, connected-send payload/default-target guard,
+and ref/unref handle-lifecycle guards passed and are retained. The connected
+socket lifecycle file failed only in its invalid-port message comparison: the
+runtime reported the `>= 1` wording with the received port value, while the
+Node fixture expects the `> 0` wording. This is parked as one connected-port
+validation-message owner; no source or upstream-fixture change was made. No
+full corpus or workspace-wide build was run. After the run, resources showed
+about **45 GiB available memory**, **372 KiB free swap**, and **16 GiB free
+disk at 99% usage**. Temporary runner output is cleaned immediately and the
+next wave remains resource-gated.
 
 ## Coverage novelty audit correction after W323
 
