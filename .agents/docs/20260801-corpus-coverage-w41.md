@@ -158,6 +158,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W208 | Node events lifecycle leaves | 4 | 2/4 pass; 2 fail; 0 timeout; no build | retain addAbortListener and static getEventListeners; park async-iterator invalid-argument code and uncaught-exception stack-shape owners |
 | W209 | Bun Node Buffer/DOM/crypto leaves | 5 | 5/5 green; 17 passed / 0 failed / 17 ran / 74 expects; 0 timeout; no build | retain Buffer Symbol.toPrimitive/resolveObjectURL, DOMException, crypto invalid-this, and HKDF leaves; no source owner |
 | W210 | Node dgram UDP lifecycle leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain address, asyncDispose, default bind address, AbortSignal close, and bytes-length leaves; no source owner |
+| W211 | Bun Node crypto leaves | 5 | 5/5 green; 72 passed / 0 failed / 72 ran / 383 expects; 0 timeout; no build | retain LazyHash, one-shot hash/verify, RSA sign variants, X509 subclass, and random API leaves; no source owner |
 
 ## W133 Bun.Terminal green cluster
 
@@ -1282,6 +1283,21 @@ found. The selector used the existing coordinator binary through
 `tools/integration/node_corpus_runner.py` with three bounded jobs and a
 30-second per-file timeout. No full corpus or workspace-wide test was run; the
 selector and raw runner output were removed after recording the result.
+
+## W211 Bun Node crypto green cluster
+
+The bounded three-job selector covered LazyHash prototype behavior, one-shot
+hash/verify contracts, RSA digest variants, X509 subclassing, and random API
+argument/bounds behavior. All **5/5 files were green**: **72 passed / 0 failed /
+72 ran / 383 expects / 0 timeouts**. Per-file durations were 170–1423ms; the
+random API stress leaf was the slowest but remained well inside the bound.
+
+No source or upstream fixture change was made and no single failing owner was
+found. The selector used the existing coordinator binary through
+`tools/integration/bun_corpus_runner.py` with three bounded jobs, a 30-second
+per-file timeout, and missing Node modules allowed. No full corpus or
+workspace-wide test was run; the selector and raw runner output were removed
+after recording the result.
 
 ## W132 Node VM and WebStreams owner split
 
