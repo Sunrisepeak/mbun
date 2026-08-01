@@ -225,6 +225,26 @@ the observed Linux limits; the coordinator owns the only root build.
 | W275 | Node module/punycode plain-script leaves | 3 | 2/3 pass; 1 fail; 0 timeout; no build | retain createRequire and invalid-module loading guards; park punycode invalid-input message owner |
 | W276 | Bun crypto HMAC/PBKDF2/ECDH leaves | 3 | 3/3 green; 126 passed / 0 failed / 126 ran / 226 expects; 0 timeout; no build | retain RFC/vector HMAC, PBKDF2 validation/derivation, and ECDH conversion/secret guards; no source owner |
 | W277 | Node module cache/lookup-path leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain module cache, relative lookup, and node_modules path contract leaves; no source owner |
+| W278 | Node module createRequire/cache/prototype leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain multibyte createRequire, cache injection, and prototype-safety leaves; no source owner |
+
+## W278 Node module createRequire/cache/prototype leaf probe
+
+The bounded three-job Node selector covered
+`test-module-create-require-multibyte.js`, `test-module-prototype-mutation.js`,
+and `test-require-cache.js`. It measured **3/3 file-level passes**, **0
+failures**, and **0 runner timeouts**. Per-file durations were 231–233ms.
+
+`test-module-create-require-multibyte.js` passed createRequire resolution for
+multibyte fixture paths; `test-module-prototype-mutation.js` passed module
+loading with guarded `Object.prototype` accessors; and `test-require-cache.js`
+passed injected cache entries for relative and builtin module requests. These
+are isolated module-loader contract leaves with no new source owner.
+
+No source or upstream fixture change was made. The selector reused the
+coordinator binary through `tools/integration/node_corpus_runner.py` with
+three bounded jobs and a 30-second per-file timeout. No full corpus, build,
+or workspace-wide test was run. The Node corpus runner reports only file-level
+status for these plain scripts, so no synthetic subtest count was added.
 
 ## W277 Node module cache/lookup-path leaf probe
 
