@@ -222,6 +222,26 @@ the observed Linux limits; the coordinator owns the only root build.
 | W272 | Node querystring pure-contract leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain escape coercion/URI errors, multi-character separators, and non-finite maxKeys behavior; no source owner |
 | W273 | Bun Buffer safety/bounds leaves | 3 | 2/3 green; 47 passed / 2 failed / 49 ran / 82 expects; 0 timeout; no build | retain indexOf detach and compare bounds; park Buffer.fill string-branch encoding coercion owner |
 | W274 | Node module/constants plain-script leaves | 3 | 2/3 pass; 1 fail; 0 timeout; no build | retain `module.isBuiltin` and `builtinModules`; park internal/public constants mapping owner |
+| W275 | Node module/punycode plain-script leaves | 3 | 2/3 pass; 1 fail; 0 timeout; no build | retain createRequire and invalid-module loading guards; park punycode invalid-input message owner |
+
+## W275 Node module/punycode plain-script leaf probe
+
+The bounded three-job Node selector covered `test-punycode.js`,
+`test-module-create-require.js`, and `test-module-loading-error.js`. It
+measured **2/3 file-level passes**, **1 failure**, and **0 runner timeouts**.
+Per-file durations were 199–300ms.
+
+`test-module-create-require.js` and `test-module-loading-error.js` passed.
+`test-punycode.js` stopped at its first invalid-input assertion: the reference
+expects `RangeError: Invalid input`, while mbun produced `RangeError: invalid`.
+This is a narrow punycode error-message owner; later invalid-input cases in the
+file were not counted after the first assertion failure.
+
+No source or upstream fixture change was made. The selector reused the
+coordinator binary through `tools/integration/node_corpus_runner.py` with
+three bounded jobs and a 30-second per-file timeout. No full corpus, build,
+or workspace-wide test was run. The Node corpus runner reports only file-level
+status for these plain scripts, so no synthetic subtest count was added.
 
 ## W274 Node module/constants plain-script leaf probe
 
