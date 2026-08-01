@@ -1773,6 +1773,29 @@ void test_scan() {
     std::filesystem::remove_all(base, ec);
 }
 
+void test_path_boundaries() {
+    using mbun::glob::scan;
+    using mbun::glob::ScanOptions;
+
+    const auto tooLong{std::make_error_code(std::errc::filename_too_long)};
+    std::error_code patternEc;
+    const std::string oversizedPattern(mbun::glob::MAX_PATH_BYTES + 1, 'x');
+    const auto patternMatches{scan(oversizedPattern, ScanOptions{}, &patternEc)};
+    ++gChecks;
+    if (patternEc != tooLong || !patternMatches.empty()) {
+        report_failure("scan rejects an oversized pattern with ENAMETOOLONG");
+    }
+
+    std::error_code cwdEc;
+    ScanOptions oversizedCwd{};
+    oversizedCwd.cwd.assign(mbun::glob::MAX_PATH_BYTES + 1, 'x');
+    const auto cwdMatches{scan("*", oversizedCwd, &cwdEc)};
+    ++gChecks;
+    if (cwdEc != tooLong || !cwdMatches.empty()) {
+        report_failure("scan rejects an oversized directory path with ENAMETOOLONG");
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -1781,6 +1804,7 @@ int main() {
     test_very_long_path();
     test_brace_fixtures();
     test_scan();
+    test_path_boundaries();
 
     if (gFailures > MAX_FAILURE_PRINTS) {
         std::println("  ... {} more failures not shown", gFailures - MAX_FAILURE_PRINTS);
