@@ -243,6 +243,26 @@ the observed Linux limits; the coordinator owns the only root build.
 | W293 | Node loader/symlink continuation leaves | 5 | 3/5 pass; 2 fail; 0 timeout; no build | retain entry-point and trailing-slash guards; split custom multi-extension selection from preserve-symlinks cache identity |
 | W294 | Node path/os/url pure-contract leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five path/os/url guards; no source owner |
 | W295 | Node path/query/url/events leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build | retain path identity, querystring, URL invalid-input, and CustomEvent guards; park events.on invalid-argument error-code shape |
+| W296 | Bun fetch/encoding/timer leaf probe | 5 | 5/5 green; 70 passed / 0 failed / 70 ran / 85 expects; 0 timeout; no build | retain all five Bun guards; no source owner |
+
+## W296 Bun fetch/encoding/timer leaf probe
+
+The bounded five-job Bun selector covered fetch header casing, UTF-8 BOM
+handling, Performance entries, setImmediate event-loop progress, and
+TextDecoderStream. It measured **5/5 green files**, **70 passed / 0 failed /
+70 ran / 85 expects**, and **0 runner timeouts**. Per-file durations were
+**200–1702 ms**.
+
+`text-decoder-stream.test.ts` measured **44 passed / 0 failed / 44 ran / 50
+expects**; `headers-case.test.ts` measured **3 / 0 / 3 / 9**;
+`utf8-bom.test.ts` measured **21 / 0 / 21 / 23**;
+`performance-entries.test.ts` measured **1 / 0 / 1 / 2**; and
+`setImmediate2.test.ts` measured **1 / 0 / 1 / 1**. All five guards are
+retained as green coverage with no source or upstream-fixture changes.
+
+The selector used the bounded five-job Bun runner with a 30-second per-file
+timeout, the existing coordinator binary, and missing Node modules allowed.
+No full corpus, build, or workspace-wide test was run.
 
 ## W295 Node path/query/url/events leaf probe
 
