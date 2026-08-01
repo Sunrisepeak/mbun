@@ -302,6 +302,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W353 | Node TLS CLI version-dispatch leaf probe | 5 | 5/5 pass; 0 fail; 0 timeout; no source change; five bounded jobs | retain the five `--tls-{min,max}-version` CLI guards; no source owner |
 | W354 | Node fs FileHandle pull/writer/error leaves | 5 | 5/5 pass; 0 fail; 0 timeout; one bounded five-job runner | retain pull/pullSync/writer/aggregate/close error guards; no source owner |
 | W355 | Node TLS client-auth verification source fix | 5 Node + 5 Node regression | pre 4/5 pass with certificate-error mismatches; post target 5/5 pass and W348 regression 5/5 pass; 0 timeout; two serial release rebuilds for final source minimization | normalize server-side client-chain errors, accept trusted PEM certificate entries, and surface late TLS1.3 fatal alerts; no upstream-fixture change |
+| W356 | Node HTTP/2 TLS servername authority owner | 4 | pre 1/4 pass, 2 fail, 1 timeout; post focused authority file 1/1 pass and selector 2/4 pass, 1 fail, 1 timeout; one release rebuild; W355 regression 5/5 pass | include `options.servername` in the client `:authority`; park unknownProtocol `Duplex` identity and TLS socket timeout as separate owners |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -1360,6 +1361,29 @@ After the final serial release rebuild (**59.59 seconds**), W355 measured
 **5/5 file-level passes**, **0 failures**, and **0 runner timeouts**. The W348
 TTY/readline five-file regression remained **5/5 passes**. Verification stayed
 bounded to the selected files; no full corpus or workspace-wide test was run.
+
+## W356 Node HTTP/2 TLS servername authority source fix
+
+The fresh four-file selector covered three TLS/HTTP2 verification leaves and
+one previously timed-out TLS socket file. The baseline measured **1/4 passes**,
+**2 failures**, and **1 timeout**. `test-http2-serve-file.js` was already
+green. `test-http2-create-client-secure-session.js` failed only for the custom
+`options.servername` case: the generated `:authority` retained the URL host
+instead of the requested server name. `test-http2-https-fallback.js` exposed a
+separate `unknownProtocol` socket `Duplex` identity owner, and
+`test-tls-socket-default-options.js` retained its independent timeout.
+
+The source fix in `modules/jsc/src/js_http2.cppm` makes the client authority
+follow Node's `options.servername || host` rule while preserving the existing
+IPv6/default-port handling when no custom server name is supplied. No upstream
+fixture or `compat/` assertion changed.
+
+After one serial release rebuild (**60.44 seconds**), the focused authority
+file measured **1/1 pass**. The complete W356 selector measured **2/4 passes**,
+**1 failure**, and **1 timeout**; the two remaining outcomes are parked as
+separate owners rather than mixed into this fix. The current W355 five-file
+regression remained **5/5 passes**. No full corpus or workspace-wide test was
+run.
 
 ## Coverage novelty audit correction after W323
 

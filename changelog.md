@@ -61,6 +61,13 @@
   `modules/jsc/src/js_net.cppm` 做最小修复；最终串行 release rebuild **59.59s**，
   W355 **5/5 pass、0 fail、0 timeout**，W348 回归 **5/5 pass**。未修改 `compat/`，
   未跑全量 corpus。
+- W356 Node HTTP/2 TLS servername authority source fix：四文件基线为 **1/4 pass、
+  2 fail、1 timeout**；`test-http2-create-client-secure-session.js` 的失败定位为
+  自定义 `options.servername` 未进入 `:authority`。`modules/jsc/src/js_http2.cppm`
+  现按 Node 的 `options.servername || host` 规则生成 authority；重建 **60.44s** 后
+  目标文件 **1/1 pass**，W356 selector **2/4 pass、1 fail、1 timeout**，W355 五文件
+  回归 **5/5 pass**。剩余 unknownProtocol `Duplex` 身份和 TLS socket timeout 分别
+  停车，未修改 `compat/`、未跑全量 corpus。
 
 ## 2026-08-01
 

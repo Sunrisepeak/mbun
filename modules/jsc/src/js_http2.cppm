@@ -1794,7 +1794,10 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
       // Only the default-port case is rebuilt here; keeping `u.host` otherwise
       // preserves the bracketed form of an IPv6 literal, which node's
       // `host`-based formula would flatten to `::1:8080`.
-      this._authorityName = u.port ? u.host : u.host + ":" + port;
+      const authorityServername = options && options.servername ? String(options.servername) : "";
+      this._authorityName = authorityServername
+        ? authorityServername + ":" + port
+        : (u.port ? u.host : u.host + ":" + port);
       // node connect(): `host = authority.hostname; if (host[0] === '[') host =
       // host.slice(1, -1)`. A URL keeps an IPv6 literal in its bracketed form,
       // and neither net.connect nor tls.connect accepts the brackets — the
