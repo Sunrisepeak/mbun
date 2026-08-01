@@ -284,6 +284,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W334 | Node process lifecycle/propagation leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build; 5 fresh | retain beforeExit throw, binding allowlist, execArgv, and uncaught-monitor guards; park beforeExit reentry owner |
 | W335 | Node timer API leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build; 5 fresh | retain all five timer API guards; no source owner |
 | W336 | Node assert/DNS validation leaves | 5 | 3/5 pass; 2 fail; 0 timeout; no build; 5 fresh | retain ESM/CJS, Myers, and DNS guards; park async-thenable and first-line assertion-message owners |
+| W337 | Node HTTP contract leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build; 5 fresh | retain all five HTTP method/port/validation/header guards; no source owner |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -951,6 +952,25 @@ assert async-contract and assertion-source-rendering owners. No source or
 upstream-fixture changes, full corpus, or workspace-wide build were made.
 After the run, resources showed about **46 GiB available memory**, **244 KiB
 free swap**, and **16 GiB free disk at 99% usage**. Temporary runner output is
+cleaned immediately and the next wave remains resource-gated.
+
+## W337 Node HTTP contract leaves
+
+The bounded five-job Node selector covered five fresh HTTP files after
+filename/stem and narrow semantic-owner review: `test-http-methods.js`,
+`test-http-default-port.js`, `test-http-hostname-typechecking.js`,
+`test-http-invalid-urls.js`, and `test-http-header-value-relaxed.js`. The
+runner measured **5/5 file-level passes**, **0 failures**, **0 runner
+timeouts**, and **198 ms–4.263 s** per file. The Node runner reports file-level
+status only; no assertion-level pass total is inferred.
+
+All five HTTP guards passed: method table exposure, local HTTP/HTTPS default
+port routing, host/hostname type validation, invalid URL rejection, and strict
+versus relaxed header-value handling. The default-port HTTPS fixture was the
+slowest at **4.263 s**, still below the 30-second per-file bound. No source or
+upstream-fixture changes, full corpus, or workspace-wide build were made. After
+the run, resources showed about **46 GiB available memory**, **272 KiB free
+swap**, and **16 GiB free disk at 99% usage**. Temporary runner output is
 cleaned immediately and the next wave remains resource-gated.
 
 ## Coverage novelty audit correction after W323
