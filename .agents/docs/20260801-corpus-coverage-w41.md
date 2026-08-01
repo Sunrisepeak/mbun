@@ -265,6 +265,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W315 | Node process/console lifecycle green cluster | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five process/console lifecycle guards; no source owner |
 | W316 | Node process.env contract leaves | 5 | 3/5 pass; 1 fail; 1 skipped; 0 timeout; no build | retain three env guards; record inspector skip and split load-env-file cwd/diagnostic owners |
 | W317 | Node console/stdio/finalization green cluster | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five console/stdio/finalization guards; no source owner |
+| W318 | Node process identity/active-handle and console color leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five process/console guards; no source owner |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -551,6 +552,24 @@ probe but was not touched. After the run, resources showed about **44 GiB
 available memory**, about **1.5 MiB free swap**, and about **17 GiB free disk at
 99% usage**. Temporary runner output is cleaned immediately and the next wave
 remains resource-gated.
+
+## W318 Node process identity/active-handle and console color leaves
+
+The bounded five-job Node selector covered five previously unrecorded files:
+`test-process-execve-validation.js`, `test-process-euid-egid.js`,
+`test-process-getactivehandles.js`, `test-process-getactiverequests.js`, and
+`test-console-tty-colors.js`. The runner measured **5/5 file-level passes**,
+**0 failures**, **0 runner timeouts**, and **198–249 ms** per file. The Node
+runner reports file-level status only; no assertion-level pass total is
+inferred.
+
+All five process/console guards passed and are retained. There were no source
+or upstream-fixture changes, no full corpus, and no workspace-wide build. An
+unrelated external package installation remained active during the probe but
+was not touched. After the run, resources remained at about **44 GiB available
+memory**, about **1.5 MiB free swap**, and about **17 GiB free disk at 99% usage**.
+Temporary runner output is cleaned immediately and the next wave remains
+resource-gated.
 
 ## W304 Node events/path continuation leaf probe
 
