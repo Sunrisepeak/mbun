@@ -150,6 +150,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W200 | Node pipe/backpressure leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five after-end/drain/cleanup leaves; no source owner |
 | W201 | Node pipe continuation leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five deadlock/resume/drain/object/listener leaves; no source owner |
 | W202 | Node pipeline/finished leaves | 5 | 3/5 pass; 2 fail; 0 timeout; no build | retain queued-end-destroy and uncaught; park child-command pipeline and AsyncContextFrame owners |
+| W203 | Node pipe error/flow leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain error-handling/error-unhandled/flow-after-unpipe; treat flow/multiple-pipes as W182-adjacent reconfirmation until historical file mapping is rechecked |
 
 ## W133 Bun.Terminal green cluster
 
@@ -1150,6 +1151,24 @@ The selector used the existing coordinator binary through
 `tools/integration/node_corpus_runner.py` with three bounded jobs and a
 30-second per-file timeout. No full corpus or workspace-wide test was run; the
 selector and raw runner output were removed after recording the result.
+
+## W203 Node pipe error/flow green cluster
+
+The bounded three-job selector covered pipe error handling, unhandled pipe
+errors, flow after unpipe, flow, and multiple pipes. All **5/5 files passed**,
+with **0 failures and 0 timeouts**. Per-file durations were 165–282ms.
+
+The error-handling, error-unhandled, and flow-after-unpipe leaves are retained
+as the clearest fresh additions. W182 already described the neighboring pipe
+events/flow and multiple-destination cluster, so `flow.js` and
+`multiple-pipes.js` are recorded as reconfirmations until the historical W182
+selector mapping is recovered; this wave does not claim five unique new files.
+
+No source or upstream fixture change was made. The selector used the existing
+coordinator binary through `tools/integration/node_corpus_runner.py` with
+three bounded jobs and a 30-second per-file timeout. No full corpus or
+workspace-wide test was run; the selector and raw runner output were removed
+after recording the result.
 
 ## W132 Node VM and WebStreams owner split
 
